@@ -111,27 +111,27 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   isBit r.mu
   assertZero ((1 - r.signed) * r.isNegative)
   -- interactions, in the order of `bus_interactions`
-  Bitwise.Msb16.pullIf r.signed (r.in3, r.isNegative)
-  Bitwise.ByteAlu.pullIf left ⟨(opselAND : F p), r.shiftAmount, 15, r.bitShift⟩
-  Bitwise.ByteAlu.pullIf right ⟨(opselAND : F p), 256 - 16 * r.zbs - r.shiftAmount, 15, r.bitShift⟩
-  Bitwise.Zero.pullIf r.mu (r.bitShift, r.zbs)
+  Bitwise.Msb16.pullUpTo muMax r.signed (r.in3, r.isNegative)
+  Bitwise.ByteAlu.pullUpTo muMax left ⟨(opselAND : F p), r.shiftAmount, 15, r.bitShift⟩
+  Bitwise.ByteAlu.pullUpTo muMax right ⟨(opselAND : F p), 256 - 16 * r.zbs - r.shiftAmount, 15, r.bitShift⟩
+  Bitwise.Zero.pullUpTo muMax r.mu (r.bitShift, r.zbs)
   Bitwise.Hwsl.pullIf (1 - r.zbs) ⟨r.in0, r.bitShift, r.x0, r.y0⟩
   Bitwise.Hwsl.pullIf (1 - r.zbs) ⟨r.in1, r.bitShift, r.x1, r.y1⟩
   Bitwise.Hwsl.pullIf (1 - r.zbs) ⟨r.in2, r.bitShift, r.x2, r.y2⟩
   Bitwise.Hwsl.pullIf (1 - r.zbs) ⟨r.in3, r.bitShift, r.x3, r.y3⟩
   Bitwise.Hwsl.pullIf (1 - r.zbs) ⟨extension, r.bitShift, r.x4, extension - r.x4⟩
-  Bitwise.ByteAlu.pullIf r.mu
+  Bitwise.ByteAlu.pullUpTo muMax r.mu
     ⟨(opselAND : F p), r.shiftAmount, 48 - 32 * r.wordInstr, 48 - 48 * r.ls0 - 32 * r.ls1 - 16 * r.ls2⟩
   Alu.channel.emitUpTo muMax r.mu
     ⟨r.in0 + 65536 * r.in1, r.in2 + 65536 * r.in3,
       r.shiftAmount + 256 * r.shiftB1 + 65536 * r.shiftH1, r.shiftHigh,
       5 + r.wordInstr + 32 * r.signed + 64 * r.direction, r.out0, r.out1⟩
   Bitwise.AreBytes.pull (r.shiftAmount, r.shiftB1)
-  Bitwise.IsHalf.pullIf r.mu r.shiftH1
-  Bitwise.IsHalf.pullIf r.mu r.in0
-  Bitwise.IsHalf.pullIf r.mu r.in1
-  Bitwise.IsHalf.pullIf r.mu r.in2
-  Bitwise.IsHalf.pullIf r.mu r.in3
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.shiftH1
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.in0
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.in1
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.in2
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.in3
 
 lemma eval_shiftedPoly_1 (env : Environment (F p))
     (mu d l0 l1 l2 e x0 x1 x2 x3 x4 y0 y1 y2 y3 : Expression (F p)) :
@@ -300,9 +300,11 @@ theorem soundness :
       -- each pull owes a multiplicity of 0 or 1, and the inactive push owes nothing
       constructorm* _ ∧ _
       all_goals first
-        | exact hsb
-        | exact hleft
-        | exact hdb
+        -- the counted pulls owe `mult = 0 ∨ CountUpTo muMax mult`, which a bit satisfies
+        | exact eq_zero_or_countUpTo hsb
+        | exact eq_zero_or_countUpTo hleft
+        | exact eq_zero_or_countUpTo hdb
+        -- HWSL stays on `toRaw`, where the bit itself is what the pull owes
         | exact hzb'
         | (left; rfl)
         | (intro h; exact absurd rfl h)
@@ -318,12 +320,12 @@ theorem soundness :
     have hl2 := IsBool.val_lt_two hl2b
     have honehot := onehot_of_isBool hl0b hl1b hl2b hl3b
     obtain ⟨hsA, hB1⟩ := h_ab
-    obtain ⟨-, hzbs_eq⟩ := h_zero rfl
-    have hH1 := h_h1 rfl
-    have hi0 := h_in0 rfl
-    have hi1 := h_in1 rfl
-    have hi2 := h_in2 rfl
-    have hi3 := h_in3 rfl
+    obtain ⟨-, hzbs_eq⟩ := h_zero countUpTo_one
+    have hH1 := h_h1 countUpTo_one
+    have hi0 := h_in0 countUpTo_one
+    have hi1 := h_in1 countUpTo_one
+    have hi2 := h_in2 countUpTo_one
+    have hi3 := h_in3 countUpTo_one
     have h15 : (15 : F p).val = 15 := val_ofNat 15 (by norm_num)
     have h02ne : (0 : F p) ≠ 2 := by
       intro h
@@ -342,11 +344,11 @@ theorem soundness :
         else (16 - input_shiftAmount.val % 16) % 16 := by
       rcases hdb with hd0 | hd1
       · rw [hd0]; simp only [ZMod.val_zero, ite_true]
-        obtain ⟨-, -, hand | ⟨h02, -⟩⟩ := h_balL (by rw [hd0]; norm_num)
+        obtain ⟨-, -, hand | ⟨h02, -⟩⟩ := h_balL (countUpTo_of_eq_one (by rw [hd0]; norm_num))
         · rw [hand, h15, ShiftCore.and15]
         · exact absurd h02 h02ne
       · rw [hd1]; simp only [val_one_eq, one_ne_zero, ite_false]
-        obtain ⟨hx, -, hand | ⟨h02, -⟩⟩ := h_balR (by rw [hd1])
+        obtain ⟨hx, -, hand | ⟨h02, -⟩⟩ := h_balR (countUpTo_of_eq_one (by rw [hd1]))
         · rw [h15, ShiftCore.and15] at hand
           rw [← ZMod.natCast_zmod_val input_shiftAmount] at hx hand
           rcases hzb with hz0 | hz1
@@ -370,7 +372,7 @@ theorem soundness :
         have : input_isNegative = 0 := by simpa using h_neg
         rw [this, ZMod.val_zero]
       · rw [hs1]; simp only [val_one_eq, ite_true]
-        exact (h_msb (by rw [hs1])).2
+        exact (h_msb (countUpTo_of_eq_one (by rw [hs1]))).2
     have hn2 : input_isNegative.val < 2 := by rw [hn]; split_ifs <;> omega
     have hext : (65535 * input_isNegative).val = 65535 * input_isNegative.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
@@ -426,7 +428,7 @@ theorem soundness :
     have hL : 16 * (input_ls1.val + 2 * input_ls2.val
           + 3 * (1 - input_ls0.val - input_ls1.val - input_ls2.val))
         = input_shiftAmount.val &&& (48 - 32 * input_wordInstr.val) := by
-      obtain ⟨-, -, hand | ⟨h02, -⟩⟩ := h_lsb rfl
+      obtain ⟨-, -, hand | ⟨h02, -⟩⟩ := h_lsb countUpTo_one
       · have hmask : (48 - 32 * input_wordInstr).val = 48 - 32 * input_wordInstr.val := by
           rcases hwb with hw0 | hw1
           · rw [hw0]; simp only [mul_zero, sub_zero, ZMod.val_zero]; exact val_ofNat 48 (by norm_num)
@@ -497,11 +499,13 @@ theorem soundness :
     -- each pull owes a multiplicity of 0 or 1
     constructorm* _ ∧ _
     all_goals try first
-      | exact hsb
-      | exact hleft
-      | exact hdb
+      -- the counted pulls: a bit satisfies the disjunction, and μ is 1 on an active row
+      | exact eq_zero_or_countUpTo hsb
+      | exact eq_zero_or_countUpTo hleft
+      | exact eq_zero_or_countUpTo hdb
+      | exact Or.inr countUpTo_one
+      -- HWSL is still `toRaw`
       | exact hzb'
-      | (right; rfl)
     -- what remains is the ALU push
     intro _ hin1lo hin1hi hin2lo hin2hi
     -- the flag byte, read as a natural
@@ -676,17 +680,22 @@ theorem completeness :
           rw [(ZMod.val_eq_zero _).mp hn]; ring
         · rw [hs]; ring
       · -- MSB16[in[3]] when signed
-        intro hs1
+        intro hs1'
+        have hs1 : input_signed = 1 := eq_one_of_countUpTo hsb hs1'
         rw [hs1, val_one_eq, ite_eq_left rfl] at hn
         exact ⟨hi3, hn⟩
       · -- BYTE_ALU[AND, shift, 15] when left
-        intro h
+        intro h'
+        have hleftb : IsBool (1 - input_direction) := by
+          rcases hdb with hd | hd <;> simp [hd, IsBool]
+        have h : (1 : F p) - input_direction = 1 := eq_one_of_countUpTo hleftb h'
         have hd0 : input_direction = 0 := by linear_combination -h
         rw [hd0, ZMod.val_zero, ite_eq_left rfl] at hb
         refine ⟨hsA, by rw [h15]; norm_num, Or.inl ?_⟩
         rw [h15, ShiftCore.and15, hb]
       · -- BYTE_ALU[AND, 256 − 16·zbs − shift, 15] when right
-        intro hd1
+        intro hd1'
+        have hd1 : input_direction = 1 := eq_one_of_countUpTo hdb hd1'
         rw [hd1, val_one_eq, ite_eq_right one_ne_zero] at hb
         rcases hzb with hz | hz
         · have hbne : input_bitShift.val ≠ 0 := fun h0 => by
@@ -777,7 +786,7 @@ theorem completeness :
       subst hmu hd hs hw hz hneg hx0 hx1 hx2 hx3 hx4 hy0 hy1 hy2 hy3 hl0 hl1 hl2 hout0 hout1 hsA hB1
       refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
       · try simp only [eval_shiftedPoly_1, eval_shiftedPoly_2, eval_shiftedPoly_3, eval_shiftedPoly_4]
-        simp [circuit_norm, h_input, shiftedPoly]
+        simp [circuit_norm, h_input, shiftedPoly, not_countUpTo_zero]
 
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
@@ -803,7 +812,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       -- each pull owes a multiplicity of 0 or 1
       constructorm* _ ∧ _ <;>
         rcases hmb with hm | hm <;> rcases hdb with hd | hd <;> rcases hzb with hz | hz <;>
-          rcases hsb with hs | hs <;> simp_all
+          rcases hsb with hs | hs <;> simp_all [countUpTo_one, not_countUpTo_zero]
 
   soundness := soundness
   ProverAssumptions r _ _ := Honest r ∨ Padding r

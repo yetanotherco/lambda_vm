@@ -56,17 +56,17 @@ theorem core {a0 a1 b0 b1 d0 d1 d2 d3 c0 c1 : ℕ}
 
 def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   -- IS_HALF[diff[i]], IS_BIT<invert>
-  Bitwise.IsHalf.pullIf r.mu r.diff0
-  Bitwise.IsHalf.pullIf r.mu r.diff1
-  Bitwise.IsHalf.pullIf r.mu r.diff2
-  Bitwise.IsHalf.pullIf r.mu r.diff3
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.diff0
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.diff1
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.diff2
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.diff3
   isBit r.invert
   -- SUB<diff; a, b>: the carries of b + diff = a are bits
   let diffLo := r.diff0 + 65536 * r.diff1
   let diffHi := r.diff2 + 65536 * r.diff3
   sub ⟨r.a0, r.a1⟩ ⟨r.b0, r.b1⟩ ⟨diffLo, diffHi⟩
   -- ZERO[Σ diff[i]] -> eq
-  Bitwise.Zero.pullIf r.mu (r.diff0 + r.diff1 + r.diff2 + r.diff3, r.eq)
+  Bitwise.Zero.pullUpTo muMax r.mu (r.diff0 + r.diff1 + r.diff2 + r.diff3, r.eq)
   -- res = eq xor invert
   assertZero (r.res + 2 * r.eq * r.invert - r.eq - r.invert)
   -- μ : Bit (no deduplication)
@@ -103,11 +103,11 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     constructor
     · intro channel h; tauto
     · intro env h
-      -- each pull owes a multiplicity of 0 or 1: μ is a bit. The ALU bus is the counted
-      -- channel now, so each clause is `pulled channel = ALU ∨ IsBool μ` and the right
-      -- disjunct is the one that holds; the pulls here are IS_HALF and ZERO, not ALU.
+      -- every bus here is counted now, so each clause is `pulled channel = ALU ∨ (μ = 0 ∨
+      -- CountUpTo muMax μ)`; the pulls are IS_HALF and ZERO, not ALU, so the right disjunct is
+      -- the one that holds, and a bit satisfies it.
       have hb := mul_one_sub_eq_zero_iff.mp h.2.2.2.2
-      and_intros <;> exact Or.inr hb
+      and_intros <;> exact Or.inr (eq_zero_or_countUpTo hb)
 
   soundness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, dword, Alu.channel,
@@ -118,11 +118,11 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     subst h1
     have hib : IsBool input_invert := mul_one_sub_eq_zero_iff.mp h_i
     have hi_2 := IsBool.val_lt_two hib
-    have hd0 := h_d0 rfl
-    have hd1 := h_d1 rfl
-    have hd2 := h_d2 rfl
-    have hd3 := h_d3 rfl
-    obtain ⟨-, heq⟩ := h_z rfl
+    have hd0 := h_d0 countUpTo_one
+    have hd1 := h_d1 countUpTo_one
+    have hd2 := h_d2 countUpTo_one
+    have hd3 := h_d3 countUpTo_one
+    obtain ⟨-, heq⟩ := h_z countUpTo_one
     -- the equality bit, from the pulled guarantees and the SUB carries
     have key : input_a0.val < 2^32 → input_a1.val < 2^32 → input_b0.val < 2^32 →
         input_b1.val < 2^32 →
@@ -163,7 +163,9 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       rw [hres', heq_cast, hiv] <;>
       simp only [eqBit] <;>
       split_ifs <;> (try norm_num) <;> omega
-    refine ⟨fun _ => key, by simp, by simp, by simp, by simp, by simp, ?_⟩
+    -- the five counted pulls owe `μ = 0 ∨ CountUpTo muMax μ`, and μ is 1 on an active row
+    refine ⟨fun _ => key, Or.inr countUpTo_one, Or.inr countUpTo_one, Or.inr countUpTo_one,
+      Or.inr countUpTo_one, Or.inr countUpTo_one, ?_⟩
     intro _ ha0 ha1 hb0 hb1
     -- the flag byte, read as a natural
     have hflagsV : (3 + 64 * input_invert : F p).val = 3 + 64 * input_invert.val :=

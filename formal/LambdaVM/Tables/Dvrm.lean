@@ -51,6 +51,7 @@ open Bitwise (IsHalf Zero)
 abbrev IsHalfC : RawChannel (F p) := Bitwise.IsHalf.counted muMax
 /-- `ZERO` and the `ALU` bus, likewise counted: every pull of a DVRM row fires with the sum. -/
 abbrev ZeroC : RawChannel (F p) := Bitwise.Zero.counted muMax
+abbrev Msb16C : RawChannel (F p) := Bitwise.Msb16.counted muMax
 abbrev AluC : RawChannel (F p) := Alu.channelC
 
 /-- Four 16-bit halves: the `DWordHL` of the spec. The row groups its operands this way rather
@@ -486,15 +487,18 @@ theorem soundness :
   have hsignRb : IsBool input_signR := by
     rcases hsignedb with h | h
     · rw [h] at h_sgnR0; simp only [sub_zero, one_mul] at h_sgnR0; exact Or.inl h_sgnR0
-    · obtain ⟨hb, hv⟩ := h_sgnR h; exact isBool_of_val_lt_two (by omega)
+    · obtain ⟨hb, hv⟩ := h_sgnR (countUpTo_of_eq_one h)
+      exact isBool_of_val_lt_two (by omega)
   have hsignDb : IsBool input_signD := by
     rcases hsignedb with h | h
     · rw [h] at h_sgnD0; simp only [sub_zero, one_mul] at h_sgnD0; exact Or.inl h_sgnD0
-    · obtain ⟨hb, hv⟩ := h_sgnD h; exact isBool_of_val_lt_two (by omega)
+    · obtain ⟨hb, hv⟩ := h_sgnD (countUpTo_of_eq_one h)
+      exact isBool_of_val_lt_two (by omega)
   have hsignNb : IsBool input_signN := by
     rcases hsignedb with h | h
     · rw [h] at h_sgnN0; simp only [sub_zero, one_mul] at h_sgnN0; exact Or.inl h_sgnN0
-    · obtain ⟨hb, hv⟩ := h_sgnN h; exact isBool_of_val_lt_two (by omega)
+    · obtain ⟨hb, hv⟩ := h_sgnN (countUpTo_of_eq_one h)
+      exact isBool_of_val_lt_two (by omega)
   have hsnsrb : IsBool input_signNSubR := mul_one_sub_eq_zero_iff.mp h_snsr
   -- `ARE_BYTES[μ_q, μ_r]` makes the sum of the two multiplicities a small natural
   have hsumval : (input_muQ + input_muR).val = input_muQ.val + input_muR.val :=
@@ -510,7 +514,7 @@ theorem soundness :
       | exact Or.inl hmu
       | exact eq_zero_or_countUpTo hsignRb
       | exact eq_zero_or_countUpTo hsignDb
-      | exact hsignedb
+      | exact eq_zero_or_countUpTo hsignedb
       | exact fun h => absurd hzq h
       | exact fun h => absurd hzr h
   -- an active row: the sum is a count of at most `muMax`, so every range check delivers
@@ -615,7 +619,7 @@ theorem soundness :
     rcases hsignedb with h | h
     · rw [h] at h_sgnN0; simp only [sub_zero, one_mul] at h_sgnN0
       exact Or.inl ⟨by rw [h, ZMod.val_zero], by rw [h_sgnN0, ZMod.val_zero]⟩
-    · exact Or.inr ⟨by rw [h, val_one_eq], (h_sgnN h).2⟩
+    · exact Or.inr ⟨by rw [h, val_one_eq], (h_sgnN (countUpTo_of_eq_one h)).2⟩
   have hsignRval : input_signR.val
       = if input_signed.val = 1 ∧
           2^63 ≤ MulCore.ofHalves4 input_r_x0.val input_r_x1.val input_r_x2.val input_r_x3.val
@@ -624,7 +628,7 @@ theorem soundness :
     rcases hsignedb with h | h
     · rw [h] at h_sgnR0; simp only [sub_zero, one_mul] at h_sgnR0
       exact Or.inl ⟨by rw [h, ZMod.val_zero], by rw [h_sgnR0, ZMod.val_zero]⟩
-    · exact Or.inr ⟨by rw [h, val_one_eq], (h_sgnR h).2⟩
+    · exact Or.inr ⟨by rw [h, val_one_eq], (h_sgnR (countUpTo_of_eq_one h)).2⟩
   have hsignDval : input_signD.val
       = if input_signed.val = 1 ∧
           2^63 ≤ MulCore.ofHalves4 input_d_x0.val input_d_x1.val input_d_x2.val input_d_x3.val
@@ -633,7 +637,7 @@ theorem soundness :
     rcases hsignedb with h | h
     · rw [h] at h_sgnD0; simp only [sub_zero, one_mul] at h_sgnD0
       exact Or.inl ⟨by rw [h, ZMod.val_zero], by rw [h_sgnD0, ZMod.val_zero]⟩
-    · exact Or.inr ⟨by rw [h, val_one_eq], (h_sgnD h).2⟩
+    · exact Or.inr ⟨by rw [h, val_one_eq], (h_sgnD (countUpTo_of_eq_one h)).2⟩
   clear h_sgnN h_sgnN0 h_sgnR h_sgnR0 h_sgnD h_sgnD0 h_sgb
   -- `abs_r` and `abs_d`, from the two `NEG` templates
   obtain ⟨hARlo, hARhi, hARval⟩ := abs_val hr0 hr1 hr2 hr3 hsignRb
@@ -858,7 +862,8 @@ theorem soundness :
     .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount,
-    hsignedb, hsignedb, hsignedb,
+    eq_zero_or_countUpTo hsignedb, eq_zero_or_countUpTo hsignedb,
+    eq_zero_or_countUpTo hsignedb,
     .inr hcount,
     fun _ => divrem_guarantees (s := input_signed.val) (rm := 0) hsigned2 (by norm_num)
       (by simp [hdv]) (by omega) (by omega) (by rw [hQw, hNw, hDw]; exact hQR.1),
@@ -1315,7 +1320,8 @@ theorem completeness :
       hsv2 hsq2 (by norm_num) (by omega) (by omega) (by omega) ?_
     rw [hfm, hDVeq, hQVeq, hhigh]
   · -- `SIGN` on the numerator
-    intro h1
+    intro h1'
+    have h1 : input_signed = 1 := eq_one_of_countUpTo hsgb h1'
     have hv : ZMod.val input_signed = 1 := by rw [h1]; exact val_one_eq
     refine ⟨hn3, ?_⟩
     rw [hsnv]
@@ -1327,7 +1333,8 @@ theorem completeness :
       rw [show input_signN = 0 by rw [← ZMod.val_eq_zero, hsnv, ite_eq_right (fun hc => hne hc.1)],
         mul_zero]
     · rw [h, sub_self, zero_mul]
-  · intro h1
+  · intro h1'
+    have h1 : input_signed = 1 := eq_one_of_countUpTo hsgb h1'
     have hv : ZMod.val input_signed = 1 := by rw [h1]; exact val_one_eq
     refine ⟨hr3, ?_⟩
     rw [hsrv]
@@ -1339,7 +1346,8 @@ theorem completeness :
       rw [show input_signR = 0 by rw [← ZMod.val_eq_zero, hsrv, ite_eq_right (fun hc => hne hc.1)],
         mul_zero]
     · rw [h, sub_self, zero_mul]
-  · intro h1
+  · intro h1'
+    have h1 : input_signed = 1 := eq_one_of_countUpTo hsgb h1'
     have hv : ZMod.val input_signed = 1 := by rw [h1]; exact val_one_eq
     refine ⟨hd3, ?_⟩
     rw [hsdv]
@@ -1408,7 +1416,7 @@ spellings of `ALU` and of `ZERO` have to be declared. -/
 theorem requirementsChannelsLawful : ∀ (input : Var Row (F p)) (offset : ℕ),
     ((main input).operations offset).RequirementsChannelsLawful
       elaborated.channelsWithGuarantees
-      [AluC, IsHalfC, ZeroC, Bitwise.Msb16.toRaw, Bitwise.AreBytes.toRaw] := by
+      [AluC, IsHalfC, ZeroC, Msb16C, Bitwise.AreBytes.toRaw] := by
   intro input offset
   apply requirementsChannelsLawful_of_shallowChannels_subset
   · -- the chip has no subcircuits
@@ -1425,7 +1433,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   elaborated
   Spec r _ _ := RowSpec r
   channelsWithRequirements :=
-    [AluC, IsHalfC, ZeroC, Bitwise.Msb16.toRaw, Bitwise.AreBytes.toRaw]
+    [AluC, IsHalfC, ZeroC, Msb16C, Bitwise.AreBytes.toRaw]
 
   requirementsChannelsLawful := requirementsChannelsLawful
   soundness := soundness

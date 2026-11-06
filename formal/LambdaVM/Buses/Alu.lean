@@ -153,12 +153,4 @@ on this one, the same way it agrees on one `muMax`. The AIR does not see the dif
 `export/` is unchanged by the choice. -/
 abbrev channelC : RawChannel (F p) := channel.counted muMax
 
-/-- Instance search runs at reducible transparency and does not get from `channelC` to the
-`Channel.counted` instance on its own, so name it here once rather than at every ensemble that
-finishes this bus. -/
-instance : (channelC : RawChannel (F p)).ConsistentUpTo
-    (Balance.logUpUpTo (F := F p) muMax).pullBound := by
-  simp only [Balance.logUpUpTo_pullBound]
-  infer_instance
-
 end LambdaVM.Alu

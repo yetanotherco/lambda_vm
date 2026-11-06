@@ -34,6 +34,61 @@ def pushStatic {Message : TypeMap} [ProvableType Message] (slc : StaticLookupCha
     exact (slc.guarantees_iff _).mpr (List.getElem_mem _)
   completeness := by circuit_proof_start
 
+/-- The same provider on `slc.toChannel.counted muMax`. A chip that pulls a bus with a
+multiplicity needs the counted channel, and `unique_channel_names` forbids the provider from
+serving the other spelling of the same bus, so the provider has to follow. The proof does not
+change at all: a push owes `mult ≠ 0 → Guarantees` on the counted channel exactly as on `toRaw`,
+and only a pull is treated differently. -/
+def countedPushStatic {Message : TypeMap} [ProvableType Message]
+    (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
+    GeneralFormalCircuit (F p) (fields slc.table.length) unit where
+  name := slc.name
+  main mults := do
+    let _ ← Circuit.mapFinRange slc.table.length fun i =>
+      slc.toChannel.emitUpTo muMax mults[i] (const slc.table[i])
+  channelsWithRequirements := [slc.toChannel.counted muMax]
+  Spec _ _ _ := True
+  soundness := by
+    circuit_proof_start
+    intro i _
+    exact (slc.guarantees_iff _).mpr (List.getElem_mem _)
+  completeness := by circuit_proof_start
+
+@[circuit_norm]
+lemma countedPushStatic_channelsWithGuarantees {Message : TypeMap} [ProvableType Message]
+    (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
+    (countedPushStatic slc).channelsWithGuarantees = [] := by
+  simp [circuit_norm, countedPushStatic]
+
+@[circuit_norm]
+lemma countedPushStatic_channelsWithRequirements {Message : TypeMap} [ProvableType Message]
+    (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
+    (countedPushStatic slc).channelsWithRequirements = [slc.toChannel.counted muMax] := rfl
+
+/-- The counted provider as a component. -/
+def countedPushStaticComponent {Message : TypeMap} [ProvableType Message]
+    (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] : Component (F p) where
+  circuit := countedPushStatic slc
+  generation := .demand {
+    channel := slc.toChannel
+    trigger := .pull
+    input _ := pure (fromElements (Vector.replicate slc.table.length .multiplicity)) }
+
+@[circuit_norm] lemma countedPushStaticComponent_channelsWithGuarantees {Message : TypeMap}
+    [ProvableType Message] (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
+    (countedPushStaticComponent slc).circuit.channelsWithGuarantees = [] :=
+  countedPushStatic_channelsWithGuarantees slc
+@[circuit_norm] lemma countedPushStaticComponent_channelsWithRequirements {Message : TypeMap}
+    [ProvableType Message] (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
+    (countedPushStaticComponent slc).circuit.channelsWithRequirements =
+      [slc.toChannel.counted muMax] := rfl
+@[circuit_norm] lemma countedPushStaticComponent_circuit {Message : TypeMap}
+    [ProvableType Message] (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
+    (countedPushStaticComponent slc).circuit = countedPushStatic slc := rfl
+@[circuit_norm] lemma countedPushStatic_name {Message : TypeMap} [ProvableType Message]
+    (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
+    (countedPushStatic slc).name = slc.name := rfl
+
 /-- The provider has no pulls, and requires only its own channel. -/
 @[circuit_norm]
 lemma pushStatic_channelsWithGuarantees {Message : TypeMap} [ProvableType Message]
@@ -85,8 +140,9 @@ def eqComponent : Component (F p) where
 @[circuit_norm] lemma zeroTable_name : Bitwise.zeroTable.name = "ZERO" := rfl
 @[circuit_norm] lemma alu_name : Alu.channel.name = "ALU" := rfl
 @[circuit_norm] lemma eqComponent_channelsWithGuarantees :
-    eqComponent.circuit.channelsWithGuarantees = [Bitwise.IsHalf.toRaw, Bitwise.IsHalf.toRaw,
-      Bitwise.IsHalf.toRaw, Bitwise.IsHalf.toRaw, Bitwise.Zero.toRaw] := rfl
+    eqComponent.circuit.channelsWithGuarantees =
+      [Bitwise.IsHalf.counted muMax, Bitwise.IsHalf.counted muMax, Bitwise.IsHalf.counted muMax,
+        Bitwise.IsHalf.counted muMax, Bitwise.Zero.counted muMax] := rfl
 @[circuit_norm] lemma eqComponent_channelsWithRequirements :
     eqComponent.circuit.channelsWithRequirements = [Alu.channelC] := rfl
 
@@ -103,28 +159,34 @@ nothing here, since `logUpUpTo` is the balance counted pulls were introduced for
 `LtStaged` already uses. -/
 def eqLookup : SoundEnsemble (F p) unit (Balance.logUpUpTo muMax) :=
   SoundEnsemble.empty (F p) unit (Balance.logUpUpTo muMax)
-  |>.addChannel Bitwise.IsHalf.toRaw
-  |>.addTable (pushStaticComponent Bitwise.isHalfTable)
-      (by rw [pushStaticComponent_channelsWithGuarantees]; exact List.nil_subset _)
-      (by rw [pushStaticComponent_channelsWithRequirements]; simp [circuit_norm])
-  |>.markFinished Bitwise.IsHalf.toRaw
-  |>.addChannel Bitwise.Zero.toRaw
-  |>.addTable (pushStaticComponent Bitwise.zeroTable)
-      (by rw [pushStaticComponent_channelsWithGuarantees]; exact List.nil_subset _)
-      (by rw [pushStaticComponent_channelsWithRequirements]; simp [circuit_norm])
-  |>.markFinished Bitwise.Zero.toRaw
+  |>.addChannel (Bitwise.IsHalf.counted muMax)
+  |>.addTable (countedPushStaticComponent Bitwise.isHalfTable)
+      (by rw [countedPushStaticComponent_channelsWithGuarantees]; exact List.nil_subset _)
+      (by rw [countedPushStaticComponent_channelsWithRequirements]; simp [circuit_norm])
+  |>.markFinished (Bitwise.IsHalf.counted muMax)
+  |>.addChannel (Bitwise.Zero.counted muMax)
+  |>.addTable (countedPushStaticComponent Bitwise.zeroTable)
+      (by rw [countedPushStaticComponent_channelsWithGuarantees]; exact List.nil_subset _)
+      (by
+        rw [countedPushStaticComponent_channelsWithRequirements]
+        simp [circuit_norm]
+        -- both buses are counted now, so the names are what tells them apart
+        intro h
+        have := congrArg RawChannel.name h
+        simp [Channel.counted] at this)
+  |>.markFinished (Bitwise.Zero.counted muMax)
   |>.addChannel Alu.channelC
   |>.addTable eqComponent
       (by rw [eqComponent_channelsWithGuarantees]; simp [circuit_norm])
       (by
-        -- the ALU bus is the counted channel, so the name mismatch has to go through
-        -- `Channel.counted` as well as `Channel.toRaw`
+        -- every bus here is counted now, so all three sides are `Channel.counted` and the
+        -- mismatch is read off the names alone
         rw [eqComponent_channelsWithRequirements]
         simp only [circuit_norm, Alu.channelC]
         all_goals (and_intros <;>
           (intro h
            have := congrArg RawChannel.name h
-           simp [Channel.counted, Channel.toRaw, alu_name] at this)))
+           simp [Channel.counted, alu_name] at this)))
   |>.markFinished Alu.channelC
 
 /-- Lookup soundness, concretely: if the constraints of every table hold, every channel has few
