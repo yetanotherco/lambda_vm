@@ -194,8 +194,16 @@ Result on `main` after that merge, 2026-10-28:
   times, `MSB16` three times, `ZERO` six times, `ALU` five) all agree with
   `dvrm.rs`. That `ZERO` count follows the Rust code and not its module comment,
   which says the bus is sent five times while the code emits six: two per `NEG`
-  template, plus `overflow` and `div_by_zero`. `lean_diff_dvrm` is not written
-  yet, so this chip is by inspection.
+  template, plus `overflow` and `div_by_zero`. `lean_diff_dvrm` checks all of
+  it, with division by zero and the signed overflow `−2^63 / −1` named among
+  the cases rather than left to the random ones, and one repeated operation
+  asked for both results so the row carries `μ_q > 1` and `μ_r > 1`.
+
+Every modelled chip now has a test here. The three that landed without one,
+BYTEWISE, MUL and DVRM, were at parity by inspection until the tests were
+written, and writing them found two real differences: BYTEWISE sent the
+`ARE_BYTES` pair in the other order, and MUL's four convolutions were the
+negation of what `mul.rs` emits.
 
 The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
 `μ·(1 − μ)` in EQ, which is why the Lean bit constraints use the spec's form.

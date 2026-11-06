@@ -596,3 +596,64 @@ fn lean_diff_mul() {
         "[MUL] interactions differ"
     );
 }
+
+#[test]
+fn lean_diff_dvrm() {
+    use crate::tables::dvrm::{
+        DvrmConstraints, DvrmOperation, bus_interactions, cols, generate_dvrm_trace,
+    };
+    let mut rng = SplitMix64(0x4F);
+    let mut ops = Vec::new();
+    for &n in &EDGE {
+        for &d in &EDGE {
+            for signed in [false, true] {
+                // `wants_remainder` is what makes one chip serve DIV and REM, and DIVU and REMU.
+                for wants_remainder in [false, true] {
+                    ops.push((DvrmOperation::new(n, d, signed), wants_remainder));
+                }
+            }
+        }
+    }
+    // The two cases the chip special-cases, named rather than left to chance: division by zero,
+    // where the quotient is forced to 2^64 - 1, and the signed overflow -2^63 / -1, which wraps.
+    for &(n, d, signed) in &[
+        (7u64, 0u64, false),
+        (7, 0, true),
+        (i64::MIN as u64, u64::MAX, true),
+        (i64::MIN as u64, 1, true),
+    ] {
+        for wants_remainder in [false, true] {
+            ops.push((DvrmOperation::new(n, d, signed), wants_remainder));
+        }
+    }
+    for _ in 0..512 {
+        ops.push((
+            DvrmOperation::new(rng.next_u64(), rng.next_u64(), rng.next_u64() & 1 == 1),
+            rng.next_u64() & 1 == 1,
+        ));
+    }
+    // As in MUL: repeats on one operation asking for both results, so the row carries `μ_q > 1`
+    // and `μ_r > 1` and the range checks fire with their sum.
+    for _ in 0..200 {
+        let op = DvrmOperation::new(0x0123_4567_89AB_CDEF, 0x0000_0000_1234_5678, true);
+        ops.push((op.clone(), false));
+        ops.push((op, true));
+    }
+    let trace = generate_dvrm_trace(&ops);
+    let report = compare(
+        "DVRM",
+        &load_lean("dvrm"),
+        &DvrmConstraints,
+        &bus_interactions(),
+        cols::NUM_COLUMNS,
+        &rows_of(&trace, cols::NUM_COLUMNS),
+    );
+    assert!(
+        report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(),
+        "[DVRM] constraints differ"
+    );
+    assert!(
+        report.lean_interacts_unmatched.is_empty() && report.rust_interacts_unmatched.is_empty(),
+        "[DVRM] interactions differ"
+    );
+}
