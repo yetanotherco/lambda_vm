@@ -110,7 +110,7 @@ templates, the eight halves of its result, and the four `IS_B20` carries. -/
       [Alu.channelC, MUL.IsHalfC, MUL.IsB20C] := rfl
 @[circuit_norm] lemma dvrmComponent_requirements :
     dvrmComponent.circuit.channelsWithRequirements =
-      [DVRM.AluC, DVRM.IsHalfC, DVRM.ZeroC, DVRM.Msb16C, Bitwise.AreBytes.toRaw] := rfl
+      [DVRM.AluC, DVRM.IsHalfC, DVRM.ZeroC] := rfl
 
 def ensemble : Ensemble (F p) unit where
   tables :=
@@ -385,5 +385,94 @@ theorem mul_staged : mulComponent.StagedRequirementsOn finished := by
     simp only [mulComponent_requirements, Alu.channelC, MUL.IsHalfC, MUL.IsB20C,
       List.mem_cons, List.not_mem_nil, or_false, not_or]
     and_intros <;> channel_ne
+
+/-! ## DVRM
+
+The chip at the top of the ensemble: it pulls `LT` and `MUL` answers off the `ALU` bus and pushes
+`DIVREM` answers back onto it, which is the whole reason the bus is staged by message class.
+
+Its multiplicities come in three kinds, and only one of them is the row's `mu = mu_q + mu_r` that
+`ARE_BYTES` bounds. The `ARE_BYTES` pull itself fires with a literal `1`, and the four `ZERO`
+pulls that `NEG` inlines fire with a sign flag, which is a bit only because `MSB16` says so. The
+first kind is `Mul.lean`'s argument again; the second is met in `Dvrm.lean`; the third is why
+`MSB16` has to be finished before `ZERO`. -/
+
+/-- DVRM's thirty-three pulls, in the order `DVRM.main` emits them: the `ARE_BYTES` that bounds
+`mu`, the eight halves of the operands, the borrowed `LT` answer, the four `ZERO` of the two `NEG`
+templates and the one that decides overflow, the eight halves of the remainder and of `n - r`, the
+two borrowed `MUL` answers, the four halves of the quotient, the three `MSB16` of the `SIGN`
+templates, and the `ZERO` that decides division by zero. The two `DIVREM` pushes are not here: a
+pull guarantee is vacuous on a push. -/
+@[circuit_norm] lemma dvrmComponent_guarantees :
+    dvrmComponent.circuit.channelsWithGuarantees =
+      [Bitwise.AreBytes.toRaw,
+       DVRM.IsHalfC, DVRM.IsHalfC, DVRM.IsHalfC, DVRM.IsHalfC,
+       DVRM.IsHalfC, DVRM.IsHalfC, DVRM.IsHalfC, DVRM.IsHalfC,
+       DVRM.AluC,
+       DVRM.ZeroC, DVRM.ZeroC, DVRM.ZeroC, DVRM.ZeroC, DVRM.ZeroC,
+       DVRM.IsHalfC, DVRM.IsHalfC, DVRM.IsHalfC, DVRM.IsHalfC,
+       DVRM.IsHalfC, DVRM.IsHalfC, DVRM.IsHalfC, DVRM.IsHalfC,
+       DVRM.AluC, DVRM.AluC,
+       DVRM.IsHalfC, DVRM.IsHalfC, DVRM.IsHalfC, DVRM.IsHalfC,
+       DVRM.Msb16C, DVRM.Msb16C, DVRM.Msb16C,
+       DVRM.ZeroC] := rfl
+
+/-- The one normalization that opens a `DVRM` row: the component down to its interactions, the
+chip down to its templates, and every bus down to its table. Written once because the three
+obligations below each need all of it, and leaving any of it out leaves a goal that looks like a
+missing lemma and is really a missing `simp` argument. -/
+macro "dvrm_norm" loc:(Lean.Parser.Tactic.location)? : tactic =>
+  `(tactic| (set_option linter.unusedSimpArgs false in
+             simp (config := { decide := true }) [circuit_norm, Component.rowOperations,
+               dvrmComponent, DVRM.circuit, DVRM.elaborated, DVRM.main, areBytes, isBit, sign,
+               neg, DVRM.word, DVRM.fill, DVRM.IsHalfC, DVRM.ZeroC, DVRM.AluC, Alu.channel,
+               Alu.channelC, Bitwise.AreBytes, Bitwise.IsHalf, Bitwise.Msb16, Bitwise.Zero,
+               Bitwise.areBytesTable, Bitwise.isHalfTable, Bitwise.msb16Table, Bitwise.zeroTable,
+               StaticLookupChannel.toChannel] $(loc)?))
+
+/-- DVRM's sixteen `IS_HALF` pulls all carry `mu`, so `ARE_BYTES` bounds them, exactly as it does
+for `MUL`. -/
+theorem dvrm_requirementsAfter_isHalf {earlier : List (RawChannel (F p))}
+    (h_ab : Bitwise.AreBytes.toRaw ∈ earlier) :
+    dvrmComponent.RequirementsAfter DVRM.IsHalfC earlier := by
+  rintro table h_comp - constraints guarantees row hrow
+  have gab := guarantees _ h_ab row hrow
+  cases table
+  simp only at h_comp
+  subst h_comp
+  simp only [Component.channelGuarantees_iff, Component.channelRequirements_iff] at gab ⊢
+  dvrm_norm at gab ⊢
+  have hm := mul_mu_count gab.1.1 gab.1.2
+  simp (config := { decide := true }) [hm]
+  and_intros <;> channel_ne
+
+/-- DVRM's six `ZERO` pulls do not all carry `mu`: the two `NEG` templates pull twice each under a
+sign flag. The flag is a bit because `MSB16` returned it, which is why this obligation needs
+`MSB16` finished as well as `ARE_BYTES`, and why `MSB16` sits below `ZERO` in `finished`. -/
+theorem dvrm_requirementsAfter_zero {earlier : List (RawChannel (F p))}
+    (h_ab : Bitwise.AreBytes.toRaw ∈ earlier) (h_ms : DVRM.Msb16C ∈ earlier) :
+    dvrmComponent.RequirementsAfter DVRM.ZeroC earlier := by
+  rintro table h_comp - constraints guarantees row hrow
+  have gab := guarantees _ h_ab row hrow
+  have gms := guarantees _ h_ms row hrow
+  have hc := constraints row hrow
+  cases table
+  simp only at h_comp
+  subst h_comp
+  rw [Component.constraintsHold_iff] at hc
+  simp only [Component.channelGuarantees_iff] at gms
+  simp only [Component.rowOperations, dvrmComponent, DVRM.circuit] at hc gms
+  have hsigns := DVRM.isBool_signs hc gms
+  clear hc gms
+  simp only [Component.channelGuarantees_iff, Component.channelRequirements_iff] at gab ⊢
+  dvrm_norm at gab hsigns ⊢
+  have hm := mul_mu_count gab.1.1 gab.1.2
+  simp (config := { decide := true }) [hm]
+  and_intros
+  all_goals try channel_ne
+  -- what is left is the two flags `NEG` pulls under, `sign_r` and `sign_d`
+  all_goals first
+    | exact eq_zero_or_countUpTo hsigns.2.1
+    | exact eq_zero_or_countUpTo hsigns.2.2
 
 end LambdaVM.Ensembles.DvrmStaged
