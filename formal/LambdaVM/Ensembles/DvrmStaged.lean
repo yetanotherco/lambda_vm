@@ -5,6 +5,7 @@ public import LambdaVM.Tables.Mul
 public import LambdaVM.Tables.Dvrm
 public import LambdaVM.Ensembles.EqLookup
 public import LambdaVM.Buses.Canonical
+public import LambdaVM.Ensembles.LtStaged
 public import Clean.Air.StagedChannels
 
 @[expose] public section
@@ -46,9 +47,10 @@ def demandOnAlu (Input : TypeMap) [ProvableType Input] : WitnessGeneration.Gener
     trigger := .pull
     input _ := pure (fromElements (Vector.replicate (size Input) .multiplicity)) }
 
-def ltComponent : Component (F p) where
-  circuit := LT.circuit
-  generation := demandOnAlu _
+/-- LT's component is the one `LtStaged` already built, so that its counted-pull argument --
+that `μ` is a count because the chip's own `ARE_BYTES[μ, 0]` pull says so -- applies here
+instead of being written again. The two agree: both answer the demand on the ALU bus. -/
+abbrev ltComponent : Component (F p) := LtStaged.ltComponent
 
 def mulComponent : Component (F p) where
   circuit := MUL.circuit
@@ -68,6 +70,22 @@ def dvrmComponent : Component (F p) where
 @[circuit_norm] lemma msb16Table_name : Bitwise.msb16Table.name = "MSB16" := rfl
 @[circuit_norm] lemma isB20Table_name : Bitwise.isB20Table.name = "IS_B20" := rfl
 @[circuit_norm] lemma areBytesTable_name : Bitwise.areBytesTable.name = "ARE_BYTES" := rfl
+@[circuit_norm] lemma byteAluTable_name : Bitwise.byteAluTable.name = "BYTE_ALU" := rfl
+@[circuit_norm] lemma hwslTable_name : Bitwise.hwslTable.name = "HWSL" := rfl
+
+/-- Two buses are different channels when their names differ, which is the only way to tell
+`counted` apart from `counted`: the other two fields are closures into `Prop`. -/
+macro "channel_ne" : tactic =>
+  `(tactic| (intro h
+             have := congrArg RawChannel.name h
+             -- the list covers every bus of the model, so at any one site most of it is
+             -- unused; that is the point of having it in one place
+             set_option linter.unusedSimpArgs false in
+             simp [Channel.counted, Channel.toRaw, Alu.channel, StaticLookupChannel.toChannel,
+               Bitwise.AreBytes, Bitwise.IsHalf, Bitwise.Msb16, Bitwise.IsB20, Bitwise.Zero,
+               Bitwise.ByteAlu, Bitwise.Hwsl, Bitwise.areBytesTable, Bitwise.isHalfTable,
+               Bitwise.msb16Table, Bitwise.isB20Table, Bitwise.zeroTable, Bitwise.byteAluTable,
+               Bitwise.hwslTable] at this))
 
 @[circuit_norm] lemma ltComponent_guarantees :
     ltComponent.circuit.channelsWithGuarantees = [Bitwise.AreBytes.toRaw, LT.IsHalfC, LT.IsHalfC,
@@ -213,5 +231,52 @@ theorem stagedRequirementsOn_of_no_guarantees {component : Component (F p)}
   | _ :: rest =>
     ⟨Component.requirementsAfterOn_of_guarantees_subset (by simp [h]),
      stagedRequirementsOn_of_no_guarantees h rest⟩
+
+/-- LT receives on `ARE_BYTES`, `IS_HALF` and `MSB16` only, so once those three are finished it
+owes whatever soundness gives it. -/
+theorem lt_guarantees_in {earlier : List (Stage (F p))}
+    (hab : ({ channel := Bitwise.AreBytes.toRaw } : Stage (F p)) ∈ earlier)
+    (hih : ({ channel := Bitwise.IsHalf.counted muMax } : Stage (F p)) ∈ earlier)
+    (hms : ({ channel := Bitwise.Msb16.counted muMax } : Stage (F p)) ∈ earlier) :
+    ∀ c ∈ ltComponent.circuit.channelsWithGuarantees, ∀ msg : Array (F p),
+      ∃ s ∈ earlier, s.channel = c ∧ s.cls msg := by
+  intro c hc msg
+  simp only [ltComponent_guarantees, List.mem_cons, List.not_mem_nil, or_false] at hc
+  rcases hc with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+  · exact ⟨_, hab, rfl, rfl⟩
+  all_goals first
+    | exact ⟨_, hih, rfl, rfl⟩
+    | exact ⟨_, hms, rfl, rfl⟩
+
+/-- LT's nine obligations. Five stages are buses it does not require, so it owes nothing there.
+On the two `ALU` stages everything it receives is already finished. The two that carry weight are
+`IS_HALF` and `MSB16`, where the counted pull's bound comes from `ARE_BYTES`, finished last. -/
+theorem lt_staged : ltComponent.StagedRequirementsOn finished := by
+  have easy : ∀ {earlier : List (Stage (F p))} (stage : Stage (F p)),
+      ({ channel := Bitwise.AreBytes.toRaw } : Stage (F p)) ∈ earlier →
+      ({ channel := Bitwise.IsHalf.counted muMax } : Stage (F p)) ∈ earlier →
+      ({ channel := Bitwise.Msb16.counted muMax } : Stage (F p)) ∈ earlier →
+      ltComponent.RequirementsAfterOn stage earlier :=
+    fun _ hab hih hms =>
+      Component.requirementsAfterOn_of_guarantees_subset (lt_guarantees_in hab hih hms)
+  have counted : ∀ {c : RawChannel (F p)}, (c = LT.IsHalfC ∨ c = LT.Msb16C) →
+      ∀ {earlier : List (Stage (F p))},
+      ({ channel := Bitwise.AreBytes.toRaw } : Stage (F p)) ∈ earlier →
+      ltComponent.RequirementsAfterOn { channel := c } earlier := by
+    intro c hc earlier hab
+    refine Component.requirementsAfterOn_of_requirementsAfter
+      (LtStaged.lt_requirementsAfter_counted hc (List.mem_singleton_self _)) ?_
+    intro c' hc'
+    simp only [List.mem_singleton] at hc'
+    exact ⟨_, hc' ▸ hab, rfl, fun _ => rfl⟩
+  refine ⟨easy _ (by simp) (by simp) (by simp),
+    easy _ (by simp) (by simp) (by simp),
+    ?_, ?_, counted (.inr rfl) (by simp), counted (.inl rfl) (by simp),
+    ?_, ?_, ?_, trivial⟩
+  all_goals
+    refine Component.requirementsAfterOn_of_not_mem _ ?_
+    simp only [LtStaged.ltComponent_requirements, Alu.channelC, LT.IsHalfC, LT.Msb16C,
+      List.mem_cons, List.not_mem_nil, or_false, not_or]
+    and_intros <;> channel_ne
 
 end LambdaVM.Ensembles.DvrmStaged
