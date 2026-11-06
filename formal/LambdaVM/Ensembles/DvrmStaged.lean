@@ -92,9 +92,22 @@ macro "channel_ne" : tactic =>
       LT.Msb16C, LT.Msb16C, LT.IsHalfC, LT.IsHalfC, LT.IsHalfC, LT.IsHalfC] := rfl
 @[circuit_norm] lemma ltComponent_requirements :
     ltComponent.circuit.channelsWithRequirements = [Alu.channelC, LT.IsHalfC, LT.Msb16C] := rfl
+/-- MUL's twenty-three pulls, in the order `MUL.main` emits them: the `ARE_BYTES` that bounds
+its two multiplicities, the eight halves of its operands, the two `MSB16` of the `SIGN`
+templates, the eight halves of its result, and the four `IS_B20` carries. -/
+@[circuit_norm] lemma mulComponent_guarantees :
+    mulComponent.circuit.channelsWithGuarantees =
+      [Bitwise.AreBytes.toRaw,
+       MUL.IsHalfC, MUL.IsHalfC, MUL.IsHalfC, MUL.IsHalfC,
+       MUL.IsHalfC, MUL.IsHalfC, MUL.IsHalfC, MUL.IsHalfC,
+       MUL.Msb16C, MUL.Msb16C,
+       MUL.IsHalfC, MUL.IsHalfC, MUL.IsHalfC, MUL.IsHalfC,
+       MUL.IsHalfC, MUL.IsHalfC, MUL.IsHalfC, MUL.IsHalfC,
+       MUL.IsB20C, MUL.IsB20C, MUL.IsB20C, MUL.IsB20C] := rfl
+
 @[circuit_norm] lemma mulComponent_requirements :
     mulComponent.circuit.channelsWithRequirements =
-      [Alu.channelC, MUL.IsHalfC, MUL.IsB20C, MUL.Msb16C, Bitwise.AreBytes.toRaw] := rfl
+      [Alu.channelC, MUL.IsHalfC, MUL.IsB20C, MUL.Msb16C] := rfl
 @[circuit_norm] lemma dvrmComponent_requirements :
     dvrmComponent.circuit.channelsWithRequirements =
       [DVRM.AluC, DVRM.IsHalfC, DVRM.ZeroC, DVRM.Msb16C, Bitwise.AreBytes.toRaw] := rfl
