@@ -28,7 +28,6 @@ soundness theorem or global row theorem.
 #print axioms LambdaVM.BYTEWISE.circuit
 #print axioms LambdaVM.MUL.circuit
 #print axioms LambdaVM.DVRM.circuit
-#print axioms LambdaVM.Counted.Demo.circuit
 
 -- The ensembles.
 #print axioms LambdaVM.Ensembles.eq_rows_correct
@@ -49,7 +48,3 @@ soundness theorem or global row theorem.
 #print axioms LambdaVM.Bitwise.isB20Table
 #print axioms LambdaVM.Bitwise.msb8Table
 
--- This model's own counted channel: the instance that closes the gap under a bounded balance,
--- and the counterexample showing the gap is real without one.
-#print axioms LambdaVM.Counted.consistentUpTo
-#print axioms LambdaVM.Counted.not_consistent

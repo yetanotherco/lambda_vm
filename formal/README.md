@@ -243,33 +243,6 @@ After PR #1016 a deduplicated row pulls its range checks with multiplicity `μ`,
 `μ` a byte. Clean's typed channel grants the guarantee to a pull of multiplicity
 `1` only, and requires every pull to carry `0` or `1`; any other nonzero
 multiplicity is a requirement the row cannot meet.
-`LambdaVM/Channels/Counted.lean` is this model's own generalisation. It is **not**
-the channel LT pulls on — that one is the fork's `Channel.counted`, whose
-semantics differ; see the comparison at the end of this section.
-
-- `counted N channel` grants the guarantee to a pull of `1, …, N` and charges
-  every other nonzero interaction, mirroring `Channel.toRaw`. `pullIf`/`emit`
-  are the circuit operations, with `ExplicitCircuits` instances so elaboration
-  works.
-- `exists_push_of_pull` and `consistent` are Clean's lemmas for this channel.
-  Their balance premise is `N · length < char F`. Clean's `BalancedInteractions`
-  carries no length bound of its own: the bound is the `fits` of the `Balance`
-  the ensemble is checked against, and reaches soundness as the
-  `InteractionsFit` premise of `TableSoundness`. For `Balance.logUp`, `fits` is
-  `count < char F`.
-- `not_consistent` shows that Clean's `BalancedInteractions` is too weak a
-  premise for a counted channel (the field-sum premise of `consistent` cannot be
-  replaced by it): for `2 ≤ N ≤ 255`
-  over Goldilocks, one pull of `N` and one pull of `1` on a message outside the
-  table satisfy `BalancedInteractions` — Clean counts the pull of `N` as a push
-  of the message, so the pull of `1` is matched — while the counted channel
-  reads both as pulls and the guarantee of the second is false. So
-  `RawChannel.Consistent` is false and the channel cannot be finished in a
-  `SoundEnsemble`. With `N = 1` the channel is `Normal`, as in Clean.
-- `Demo.circuit` is the shape of a dedup row: `ARE_BYTES[μ, 0]` then a counted
-  `IS_HALF` pull with multiplicity `μ`. The counted channel sits in
-  `channelsWithRequirements`: an out-of-range `μ` is only ruled out by the byte
-  guarantee, which lawfulness does not see but soundness does.
 
 Counted pulls in the LT model need two things Clean main lacks:
 
@@ -380,19 +353,14 @@ or a counted analogue of it, behind LT's three range checks, and this branch
 has neither. What `LtStaged` does establish is that the staged finishing order
 admits counted pulls, which is what it was written for.
 
-`Channels/Counted.lean` above predates the fork, and its `counted` is a different
-channel from the fork's, not a copy. They part on what a pull of an out-of-range
-multiplicity costs:
-
-| | out-of-range pull |
-|---|---|
-| this file | `mult ≠ 0 → ¬ IsPull N mult → Guarantees` — charged like a push: the row must justify the message |
-| the fork (`Channel.counted`) | `mult = 0 ∨ CountUpTo N mult` — forbidden: a range obligation the row must discharge |
-
-LT is on the fork's. This file's channel has one consumer,
-`Demo.circuit`, and keeping it is deliberate: its `not_consistent` is the reason
-the fork's balance carries the `N * count` bound, and its `consistentUpTo` shows
-the channel is consistent under the fork's `BalancedUpTo N`. Nothing else uses it.
+A prototype of the counted channel lived in `LambdaVM/Channels/Counted.lean`
+until the fork carried the real one. Its `not_consistent` is why the fork's
+balance bounds `N * count` rather than `count`, and that argument is now
+`Channel.counted_not_consistent` in the fork. The prototype is gone. It built
+its own `RawChannel` under the same bus names as Clean's and with a weaker pull
+requirement, so it was a second spelling of every counted bus sitting in the
+build with no user: the standing invitation to the split this model has already
+paid for on three buses.
 
 Moving LT onto the counted channel has one structural cost: **LT cannot share an
 ensemble with EQ or SHIFT.** `Channel.counted` keeps the base channel's name
@@ -403,7 +371,7 @@ pull through `pullIf`, are two different `RawChannel`s both called `IS_HALF`, an
 the same. A combined ensemble would have to put EQ and SHIFT on the counted
 channel too, at `N = 1`; the pinned fork has no lemma collapsing `Channel.counted
 1` to the plain channel, so that is a proof obligation, not a rename. No ensemble
-here needs it yet: `LtStaged` and `CountedSameBus` hold LT and its toy MIN only.
+here needs it yet: `LtStaged` holds LT only.
 
 ## What is intentionally not proven
 
