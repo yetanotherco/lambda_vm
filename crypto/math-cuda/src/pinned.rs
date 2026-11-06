@@ -244,17 +244,63 @@ pub fn lock_pool() -> Option<PoolLocked> {
     Some(report)
 }
 
-/// The pool's bytes not handed out yet: resident (the driver faulted them in)
-/// and spoken for, the memory a block's later allocations take instead of
-/// growing the heap. A decision on the host's memory that forecasts that
-/// growth takes these off its reading, or it counts them twice. 0 without a
-/// pool.
+/// The pool's bytes no allocation holds: resident from the lock on (the driver
+/// faulted them in) and spoken for, the memory a block's later allocations take
+/// instead of growing the heap. That is the part never handed out and the
+/// part the arenas hold free (handed out, then freed, or kept between their
+/// extents). A decision on the host's memory that forecasts that growth takes
+/// these off its reading, or it counts them twice. 0 without a pool.
 pub fn unused_bytes() -> u64 {
     if !POOL_READY.load(Ordering::Acquire) {
         return 0;
     }
-    let len = POOL_LEN.load(Ordering::Relaxed);
-    len.saturating_sub(CURSOR.load(Ordering::Relaxed).min(len)) as u64
+    let len = POOL_LEN.load(Ordering::Relaxed) as u64;
+    let held = live_bytes().unwrap_or(CURSOR.load(Ordering::Relaxed) as u64);
+    len.saturating_sub(held.min(len))
+}
+
+/// What the arenas' allocations hold of the pool now, from jemalloc's own
+/// figures (refreshed first); `None` where jemalloc keeps none (built without
+/// its statistics) or the arenas were never made.
+fn live_bytes() -> Option<u64> {
+    let arenas = arenas_if_made()?;
+    // SAFETY: `epoch` takes and gives back a `u64`; each statistic is a
+    // `size_t`, and every name is NUL-terminated.
+    unsafe {
+        let mut epoch = 1u64;
+        let mut len = std::mem::size_of::<u64>();
+        if jem::mallctl(
+            c"epoch".as_ptr(),
+            (&raw mut epoch).cast(),
+            &mut len,
+            (&raw mut epoch).cast(),
+            len,
+        ) != 0
+        {
+            return None;
+        }
+        let mut held = 0u64;
+        for id in arenas.ids {
+            for kind in ["small", "large"] {
+                let name =
+                    std::ffi::CString::new(format!("stats.arenas.{id}.{kind}.allocated")).ok()?;
+                let mut bytes = 0usize;
+                let mut len = std::mem::size_of::<usize>();
+                if jem::mallctl(
+                    name.as_ptr(),
+                    (&raw mut bytes).cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                ) != 0
+                {
+                    return None;
+                }
+                held += bytes as u64;
+            }
+        }
+        Some(held)
+    }
 }
 
 static POOL_TRIED: AtomicBool = AtomicBool::new(false);
@@ -282,6 +328,10 @@ pub struct Stats {
     /// The most bytes allocated in a scope and not yet uploaded at once: about
     /// what a pool that is reused after each upload would have to hold.
     pub pending_most: u64,
+    /// What the arenas' allocations hold of the pool now, from jemalloc's own
+    /// figures; `None` where it keeps none (then [`unused_bytes`] reads the
+    /// pool less what was ever handed out).
+    pub held_bytes: Option<u64>,
 }
 
 pub fn stats() -> Stats {
@@ -294,6 +344,7 @@ pub fn stats() -> Stats {
         upload_bytes: UPLOAD_BYTES.load(Ordering::Relaxed),
         upload_pinned: UPLOAD_PINNED.load(Ordering::Relaxed),
         pending_most: PENDING_MOST.load(Ordering::Relaxed),
+        held_bytes: live_bytes(),
     }
 }
 
@@ -345,9 +396,15 @@ struct Arenas {
 /// The arenas, made at the first scope with the pool locked; `None` when
 /// jemalloc would not make them.
 fn arenas() -> Option<&'static Arenas> {
-    static ARENAS_MADE: OnceLock<Option<Arenas>> = OnceLock::new();
     ARENAS_MADE.get_or_init(make_arenas).as_ref()
 }
+
+/// The arenas when a scope made them already, without making them.
+fn arenas_if_made() -> Option<&'static Arenas> {
+    ARENAS_MADE.get().and_then(Option::as_ref)
+}
+
+static ARENAS_MADE: OnceLock<Option<Arenas>> = OnceLock::new();
 
 fn make_arenas() -> Option<Arenas> {
     // SAFETY: each control is read or written with a value of its own type
@@ -843,20 +900,21 @@ mod tests {
     }
 
     #[test]
-    fn the_unused_pool_shrinks_as_the_arenas_take_it() {
+    fn the_unused_pool_leaves_out_what_an_allocation_holds() {
         let _ = on();
-        let before = unused_bytes();
-        assert!(before > 0 && before <= 2 << 30);
+        let len = POOL_LEN.load(Ordering::Relaxed) as u64;
         let bytes = 32 << 20;
         let taken = {
             let _scope = scope(bytes);
             take(bytes)
         };
-        assert!(unused_bytes() < before, "the arenas took from the pool");
-        assert_eq!(
-            unused_bytes(),
-            (POOL_LEN.load(Ordering::Relaxed) - CURSOR.load(Ordering::Relaxed)) as u64
-        );
+        // From jemalloc's figures where it keeps them, else from what was
+        // handed out; either way the allocation held is not unused. (Other
+        // tests allocate beside this one, so only the bound is exact.)
+        if let Some(held) = live_bytes() {
+            assert!(held >= bytes as u64, "the arenas hold it: {held}");
+        }
+        assert!(unused_bytes() <= len - bytes as u64);
         give(taken, bytes);
     }
 

@@ -82,6 +82,7 @@ pub fn stats() -> Option<Stats> {
             upload_bytes: s.upload_bytes,
             upload_pinned: s.upload_pinned,
             pending_most: s.pending_most,
+            held_bytes: s.held_bytes,
         });
     }
     None
@@ -103,4 +104,7 @@ pub struct Stats {
     pub upload_pinned: u64,
     /// The most bytes allocated for the card and not yet uploaded at once.
     pub pending_most: u64,
+    /// What allocations hold of the pool now; `None` where the allocator keeps
+    /// no figures.
+    pub held_bytes: Option<u64>,
 }

@@ -2309,7 +2309,7 @@ impl BlockStamps {
         if let Some(p) = self.pinned {
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             out.push_str(&format!(
-                "BLOCK PINNED POOL: on · {:.2} GiB, {:.2} locked in {:.3}s before the prove · handed out {:.2} GiB, then {:.2} GiB pageable once spent · phase A's uploads {:.2} of {:.2} GiB from the pool ({:.0} %) · at most {:.2} GiB allocated and not yet uploaded\n",
+                "BLOCK PINNED POOL: on · {:.2} GiB, {:.2} locked in {:.3}s before the prove · handed out {:.2} GiB, then {:.2} GiB pageable once spent · phase A's uploads {:.2} of {:.2} GiB from the pool ({:.0} %) · at most {:.2} GiB allocated and not yet uploaded · held at phase A's end {}\n",
                 gib(p.pool_bytes),
                 gib(p.locked_bytes),
                 p.lock_seconds,
@@ -2319,6 +2319,8 @@ impl BlockStamps {
                 gib(p.upload_bytes),
                 if p.upload_bytes > 0 { 100.0 * p.upload_pinned as f64 / p.upload_bytes as f64 } else { 0.0 },
                 gib(p.pending_most),
+                p.held_bytes
+                    .map_or("unread".to_string(), |b| format!("{:.2} GiB", gib(b))),
             ));
         } else {
             out.push_str("BLOCK PINNED POOL: off\n");
@@ -3823,8 +3825,13 @@ fn prove_block_whir_inner(
     // (only the streamed one stamps it for the report).
     if let Some(p) = multilinear::pinned::stats() {
         eprintln!(
-            "BLOCK PINNED POOL USED: {} of {} upload bytes from the pool · {} bytes handed out · {} pageable once spent",
-            p.upload_pinned, p.upload_bytes, p.carved_bytes, p.spilled_bytes
+            "BLOCK PINNED POOL USED: {} of {} upload bytes from the pool · {} bytes handed out · {} pageable once spent · held now {}",
+            p.upload_pinned,
+            p.upload_bytes,
+            p.carved_bytes,
+            p.spilled_bytes,
+            p.held_bytes
+                .map_or("unread".to_string(), |b| format!("{b} bytes"))
         );
     }
     proved
