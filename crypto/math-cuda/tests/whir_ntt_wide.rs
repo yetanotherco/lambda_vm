@@ -1,4 +1,4 @@
-//! The WHIR encoding's wide NTT (`LAMBDA_VM_WHIR_NTT_WIDE`: passes of up to
+//! The WHIR encoding's wide NTT (the default: passes of up to
 //! 10 levels, three instead of four at the production 2^28) encodes the
 //! 8-level plan's codeword: the same field values — word for word once canonicalised, since a
 //! different pass split multiplies by different twist factors and may leave a

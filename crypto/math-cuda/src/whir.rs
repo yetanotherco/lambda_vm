@@ -2438,10 +2438,6 @@ fn mobius(
 // coefficients — and so the codeword and its tree — are the same words.
 // ---------------------------------------------------------------------------
 
-/// The wide transform runs by default; `LAMBDA_VM_WHIR_MOBIUS_WIDE=0` (or
-/// `off`) keeps the five-pass one. Read once per process.
-pub const MOBIUS_WIDE_ENV: &str = "LAMBDA_VM_WHIR_MOBIUS_WIDE";
-
 /// Levels the contiguous wide pass takes: 2^11 elements are 16 KiB of shared
 /// memory, half of them updated a level, one per thread of 1,024.
 const MOBIUS_WIDE_LOW: u32 = 11;
@@ -2451,32 +2447,18 @@ const MOBIUS_WIDE_TILE: u32 = 8;
 const MOBIUS_WIDE_TILE_BYTES: u32 = (1 << MOBIUS_WIDE_TILE) * (MOBIUS_TILE_COLS + 1) * 8;
 
 thread_local! {
-    /// Per-thread override of [`MOBIUS_WIDE_ENV`], for parity tests that run
+    /// Per-thread override of the wide transform, for parity tests that run
     /// both transforms in one process. See [`with_mobius_wide`].
     static MOBIUS_WIDE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// `LAMBDA_VM_WHIR_MOBIUS_WIDE`'s value read: empty, `0` or `off` keep the
-/// five-pass transform; anything else (unset included) is the wide one.
-pub fn mobius_wide_setting(value: Option<&str>) -> bool {
-    !matches!(value.map(str::trim), Some("" | "0" | "off"))
-}
-
-/// Whether the calling thread's WHIR encodings take the wide Möbius transform.
+/// Whether the calling thread's WHIR encodings take the wide Möbius transform:
+/// always, but under a [`with_mobius_wide`] that holds the five-pass one (a
+/// stack below `2^11` takes the five-pass one either way).
 pub fn mobius_wide_enabled() -> bool {
-    if let Some(on) = MOBIUS_WIDE_OVERRIDE.with(std::cell::Cell::get) {
-        return on;
-    }
-    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENV.get_or_init(|| {
-        let on = mobius_wide_setting(std::env::var(MOBIUS_WIDE_ENV).ok().as_deref());
-        if on {
-            eprintln!(
-                "[gpu] WHIR Möbius: wide, three passes, the stack gathered (the default; {MOBIUS_WIDE_ENV}=0 keeps five)"
-            );
-        }
-        on
-    })
+    MOBIUS_WIDE_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or(true)
 }
 
 /// Run `f` with the wide transform forced on or off for the calling thread.
@@ -2501,7 +2483,12 @@ pub fn mobius_wide_gathers() -> u64 {
     MOBIUS_WIDE_GATHERS.load(Ordering::Relaxed)
 }
 
-/// The fused encoding (`LAMBDA_VM_WHIR_MOBIUS_FUSED`) folds the low Möbius levels into
+thread_local! {
+    /// Per-thread override of the fused encoding. See [`with_mobius_fused`].
+    static MOBIUS_FUSED_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the calling thread's WHIR encodings fold the low Möbius levels into
 /// the NTT's first pass: a first-pass block stages `2^(12 − log_blowup)`
 /// consecutive coefficients ([`crate::lde_cm::fused_mobius_levels`]), exactly
 /// the levels the wide transform's contiguous pass runs, so that pass goes.
@@ -2510,37 +2497,12 @@ pub fn mobius_wide_gathers() -> u64 {
 /// values are today's — the order of the subtractions changes, so a word's
 /// representation may not be. Where it does not apply (the legacy encoding,
 /// a stack the first pass holds whole) the encoding is the wide transform's
-/// or the five-pass one. On by default; `LAMBDA_VM_WHIR_MOBIUS_FUSED=0` (or
-/// `off`) runs every Möbius level in the transform. Read once per process.
-pub const MOBIUS_FUSED_ENV: &str = "LAMBDA_VM_WHIR_MOBIUS_FUSED";
-
-thread_local! {
-    /// Per-thread override of [`MOBIUS_FUSED_ENV`]. See [`with_mobius_fused`].
-    static MOBIUS_FUSED_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
-/// `LAMBDA_VM_WHIR_MOBIUS_FUSED`'s value read: empty, `0` or `off` do not
-/// fuse; anything else (unset included) does.
-pub fn mobius_fused_setting(value: Option<&str>) -> bool {
-    !matches!(value.map(str::trim), Some("" | "0" | "off"))
-}
-
-/// Whether the calling thread's WHIR encodings fold the low Möbius levels into
-/// the NTT.
+/// or the five-pass one. Always, but under a [`with_mobius_fused`] that runs
+/// every Möbius level in the transform.
 pub fn mobius_fused_enabled() -> bool {
-    if let Some(on) = MOBIUS_FUSED_OVERRIDE.with(std::cell::Cell::get) {
-        return on;
-    }
-    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENV.get_or_init(|| {
-        let on = mobius_fused_setting(std::env::var(MOBIUS_FUSED_ENV).ok().as_deref());
-        if on {
-            eprintln!(
-                "[gpu] WHIR Möbius: fused, the low levels in the NTT's first pass (the default; {MOBIUS_FUSED_ENV}=0 runs them in the transform)"
-            );
-        }
-        on
-    })
+    MOBIUS_FUSED_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or(true)
 }
 
 /// Run `f` with the fused encoding forced on or off for the calling thread.
@@ -2567,8 +2529,8 @@ pub fn mobius_fused_encodes() -> u64 {
 
 /// The Möbius level the fused encoding of a `2^log_evals` stack at spacing
 /// `2^log_blowup` starts its strided passes at — the levels below it run in
-/// the NTT's first pass — or `None` where it does not apply: the knob off, the
-/// legacy encoding, or no strided level left.
+/// the NTT's first pass — or `None` where it does not apply: a test's override
+/// off, the legacy encoding, or no strided level left.
 fn mobius_fused_levels(log_evals: u64, log_blowup: usize) -> Option<u32> {
     if !mobius_fused_enabled() || !crate::lde_cm::engine_enabled() {
         return None;
@@ -2752,32 +2714,16 @@ fn mobius_wide_gathered(
 
 #[cfg(test)]
 mod mobius_wide_tests {
-    use super::mobius_wide_setting;
+    use super::{mobius_fused_enabled, mobius_wide_enabled, with_mobius_fused, with_mobius_wide};
 
-    /// The wide transform unless the knob says `0`, `off` or nothing.
+    /// The wide and fused transforms run unless a test's override holds them
+    /// off, and the override ends with its closure.
     #[test]
-    fn the_wide_mobius_runs_unless_zero() {
-        assert!(
-            mobius_wide_setting(None),
-            "the default is the wide transform"
-        );
-        assert!(mobius_wide_setting(Some("1")));
-        assert!(mobius_wide_setting(Some("on")));
-        assert!(!mobius_wide_setting(Some("0")));
-        assert!(!mobius_wide_setting(Some(" 0")));
-        assert!(!mobius_wide_setting(Some("off")));
-        assert!(!mobius_wide_setting(Some("")));
-    }
-
-    /// Fusing unless the knob says `0`, `off` or nothing.
-    #[test]
-    fn the_fused_mobius_runs_unless_zero() {
-        use super::mobius_fused_setting;
-        assert!(mobius_fused_setting(None), "the default fuses");
-        assert!(mobius_fused_setting(Some("1")));
-        assert!(!mobius_fused_setting(Some("0")));
-        assert!(!mobius_fused_setting(Some("off")));
-        assert!(!mobius_fused_setting(Some("")));
+    fn the_wide_and_fused_mobius_run_unless_overridden() {
+        assert!(mobius_wide_enabled() && mobius_fused_enabled());
+        assert!(!with_mobius_wide(false, mobius_wide_enabled));
+        assert!(!with_mobius_fused(false, mobius_fused_enabled));
+        assert!(mobius_wide_enabled() && mobius_fused_enabled());
     }
 }
 

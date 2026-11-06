@@ -39,7 +39,7 @@
 //! life of the process, outside the VRAM ledger (512 MiB for a `2^27`
 //! codeword, 2 GiB for `2^29`). The encoding takes passes of up to 10 levels
 //! ([`plan_wide`]): three passes at the production `2^28` instead of four
-//! ([`NTT_WIDE_ENV`]`=0` keeps [`plan`]'s). Every pass is bound by memory
+//! ([`with_ntt_wide`] holds [`plan`]'s for a parity test). Every pass is bound by memory
 //! bandwidth, so the passes are the cost; the trace LDEs keep [`plan`].
 //!
 //! It is the default wherever it applies ([`engine_enabled`]). The legacy path
@@ -127,41 +127,18 @@ pub fn codewords_encoded() -> u64 {
     CODEWORDS_ENCODED.load(Ordering::Relaxed)
 }
 
-/// The WHIR encoding's transform ([`spread_ntt_column`]) runs in
-/// [`plan_wide`]'s passes of up to 10 levels by default;
-/// `LAMBDA_VM_WHIR_NTT_WIDE=0` (or `off`) keeps [`plan`]'s passes of up to 8.
-/// The codeword's values are the same either way; only a value's
-/// non-canonical representation may differ, as between this engine and the
-/// legacy one. Read once per process.
-pub const NTT_WIDE_ENV: &str = "LAMBDA_VM_WHIR_NTT_WIDE";
-
 thread_local! {
-    /// Per-thread override of [`NTT_WIDE_ENV`], for parity tests that run
-    /// both plans in one process. See [`with_ntt_wide`].
+    /// Per-thread override of the wide plan, for parity tests that run both
+    /// plans in one process. See [`with_ntt_wide`].
     static NTT_WIDE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// `LAMBDA_VM_WHIR_NTT_WIDE`'s value read: empty, `0` or `off` keep the
-/// 8-level plan; anything else (unset included) is the wide plan.
-pub fn ntt_wide_setting(value: Option<&str>) -> bool {
-    !matches!(value.map(str::trim), Some("" | "0" | "off"))
-}
-
-/// Whether the calling thread's WHIR encodings take [`plan_wide`].
+/// Whether the calling thread's WHIR encodings take [`plan_wide`]: always, but
+/// under a [`with_ntt_wide`] that holds [`plan`]'s passes of up to 8. The
+/// codeword's values are the same either way; only a value's non-canonical
+/// representation may differ, as between this engine and the legacy one.
 pub fn ntt_wide_enabled() -> bool {
-    if let Some(on) = NTT_WIDE_OVERRIDE.with(Cell::get) {
-        return on;
-    }
-    static ENV: OnceLock<bool> = OnceLock::new();
-    *ENV.get_or_init(|| {
-        let on = ntt_wide_setting(std::env::var(NTT_WIDE_ENV).ok().as_deref());
-        if on {
-            eprintln!(
-                "[gpu] WHIR NTT: wide, passes of up to 10 levels (the default; {NTT_WIDE_ENV}=0 keeps passes of up to 8)"
-            );
-        }
-        on
-    })
+    NTT_WIDE_OVERRIDE.with(Cell::get).unwrap_or(true)
 }
 
 /// Run `f` with the wide plan forced on or off for the calling thread.
@@ -233,8 +210,8 @@ pub(crate) fn plan(l: u32) -> Vec<u32> {
 /// of 9 and 10 levels (`ntt_cm_dit_k9`, `_k10`).
 pub(crate) const WIDE_MAX_K: u32 = 10;
 
-/// Pass sizes for the WHIR encoding's length-`2^l` transform under
-/// [`NTT_WIDE_ENV`]: `ceil(l / 10)` passes of 4..=10 levels, within one of
+/// Pass sizes for the WHIR encoding's length-`2^l` transform
+/// ([`ntt_wide_enabled`]): `ceil(l / 10)` passes of 4..=10 levels, within one of
 /// each other — `[10, 9, 9]` at `2^28`. Where that is as many passes as
 /// [`plan`] it is [`plan`]. Mirrored by the host KAT's `plan_wide`.
 pub(crate) fn plan_wide(l: u32) -> Vec<u32> {
@@ -606,7 +583,7 @@ pub(crate) fn fused_mobius_levels(log_n: u32, log_blowup: u32) -> u32 {
 /// The spread is the first pass's load, so the padding is never stored or
 /// read, and the transform is `ceil(log_n / 8)` passes instead of the spread
 /// pass, the fused 8-level pass and one 5-level tile per five levels above it
-/// — `ceil(log_n / 10)` under [`NTT_WIDE_ENV`] ([`plan_wide`]).
+/// — `ceil(log_n / 10)` under [`plan_wide`], the default.
 /// `src` (`2^(log_n - log_blowup)` values) and `dst` (`2^log_n`) must not
 /// overlap. Nothing synchronises.
 ///
@@ -815,18 +792,14 @@ mod tests {
         }
     }
 
-    /// The wide plan unless the knob says `0`, `off` or nothing.
+    /// The wide plan unless a test's override holds the 8-level one, and the
+    /// override ends with its closure.
     #[test]
-    fn the_wide_ntt_runs_unless_zero() {
-        assert!(ntt_wide_setting(None), "the default is the wide plan");
-        assert!(ntt_wide_setting(Some("1")));
-        assert!(ntt_wide_setting(Some("on")));
-        assert!(!ntt_wide_setting(Some("0")));
-        assert!(!ntt_wide_setting(Some(" 0")));
-        assert!(!ntt_wide_setting(Some("off")));
-        assert!(!ntt_wide_setting(Some("")));
+    fn the_wide_ntt_runs_unless_overridden() {
+        assert!(ntt_wide_enabled(), "the default is the wide plan");
         assert!(with_ntt_wide(true, ntt_wide_enabled));
         assert!(!with_ntt_wide(false, ntt_wide_enabled));
+        assert!(ntt_wide_enabled());
     }
 
     /// Every (s, k) window the driver launches: DIT ascending from s = 0, DIF

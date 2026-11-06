@@ -1,5 +1,5 @@
 //! The WHIR encoding's wide Möbius transform
-//! (`LAMBDA_VM_WHIR_MOBIUS_WIDE`: three passes instead of five, and the
+//! (the default: three passes instead of five, and the
 //! stack gathered from its parts instead of copied into a zeroed buffer)
 //! encodes the five-pass transform's codeword, word for word, from every
 //! source a commit takes. The encoding's other two knobs (the fused low

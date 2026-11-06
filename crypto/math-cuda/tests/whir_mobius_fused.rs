@@ -1,5 +1,5 @@
 //! The WHIR encoding with its low Möbius levels folded into the NTT's first
-//! pass (`LAMBDA_VM_WHIR_MOBIUS_FUSED=1`: the strided levels first, the first
+//! pass (the default, `whir::with_mobius_fused`: the strided levels first, the first
 //! of them gathering the stack, then the low `12 − log_blowup` levels on the
 //! coefficients the NTT's first pass stages) encodes today's codeword: the same
 //! field values — word for word once canonicalised, since the subtractions run

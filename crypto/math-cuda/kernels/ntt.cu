@@ -138,7 +138,7 @@ extern "C" __global__ void mobius_tile(uint64_t *x, uint64_t base, uint32_t k_le
 
 // ---------------------------------------------------------------------------
 // ★ The Möbius transform in three passes instead of five (the WHIR encoding's
-// default, `LAMBDA_VM_WHIR_MOBIUS_WIDE`; `src/whir.rs` `mobius_wide`). Each element
+// default from 2^11; `src/whir.rs` `mobius_wide`). Each element
 // takes exactly the operations, in exactly the level order, that
 // `mobius_low_levels` / `mobius_tile` give it — the element with the level's
 // bit set loses its partner — so the words are theirs bit for bit. Two kernels:
@@ -150,8 +150,8 @@ extern "C" __global__ void mobius_tile(uint64_t *x, uint64_t base, uint32_t k_le
 //                     2^k rows × 32 columns, each of the 1,024 threads holding
 //                     2^k / 32 rows (dynamic shared memory up to 66 KiB); with
 //                     `parts` it gathers the stack the same way (the fused
-//                     encoding, `LAMBDA_VM_WHIR_MOBIUS_FUSED`, whose low
-//                     levels run in the NTT's first pass, starts here).
+//                     encoding, whose low levels run in the NTT's first
+//                     pass, starts here).
 // ---------------------------------------------------------------------------
 
 #define MOBIUS_WIDE_LOG 11
