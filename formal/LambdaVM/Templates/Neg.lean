@@ -2,6 +2,8 @@ module
 
 public import LambdaVM.Templates.Add
 public import LambdaVM.Tables.Bitwise
+public import LambdaVM.Mu
+public import Clean.Air.CountedChannel
 
 @[expose] public section
 
@@ -71,19 +73,28 @@ lemma val_wl {a b : F p} (ha : a.val < 2^16) (hb : b.val < 2^16) :
 
 end Neg
 
-/-- `NEG<neg; x>` under `cond`: two `ZERO` lookups reading the carries of `x + neg = 0`. -/
+/-- `NEG<neg; x>` under `cond`: two `ZERO` lookups reading the carries of `x + neg = 0`.
+
+The pulls go to `Zero.counted muMax` rather than `Zero.toRaw` even though `cond` is a bit and
+`toRaw` would take it. DVRM is the only caller, and it also pulls `ZERO` with a multiplicity that
+reaches `muMax` for its overflow and division-by-zero checks; two spellings would be two
+`RawChannel`s named `"ZERO"`, which `unique_channel_names` rejects, and no ensemble could then
+finish the bus with DVRM in it. It is the same agreement the model makes on `Alu.channelC`, and
+like that one it is invisible in the AIR: the interaction is the same multiplicity and the same
+message either way. -/
 @[circuit_norm]
 def neg (cond x0 x1 x2 x3 : Expression (F p)) (n : DWordWL (Expression (F p))) :
     Circuit (F p) Unit := do
-  Zero.pullIf cond (x0 + x1, 1 - Add.carry0 (Neg.toWL x0 x1 x2 x3) n Neg.zeroWL)
-  Zero.pullIf cond (x0 + x1 + x2 + x3, 1 - Add.carry1 (Neg.toWL x0 x1 x2 x3) n Neg.zeroWL)
+  Zero.pullUpTo muMax cond (x0 + x1, 1 - Add.carry0 (Neg.toWL x0 x1 x2 x3) n Neg.zeroWL)
+  Zero.pullUpTo muMax cond (x0 + x1 + x2 + x3, 1 - Add.carry1 (Neg.toWL x0 x1 x2 x3) n Neg.zeroWL)
 
 -- Circuit inference does not unfold user wrappers; bridge it to its body.
 instance (cond x0 x1 x2 x3 : Expression (F p)) (n : DWordWL (Expression (F p))) :
     ExplicitCircuit (neg cond x0 x1 x2 x3 n) :=
   .of_eq (circuit' := do
-      Zero.pullIf cond (x0 + x1, 1 - Add.carry0 (Neg.toWL x0 x1 x2 x3) n Neg.zeroWL)
-      Zero.pullIf cond (x0 + x1 + x2 + x3, 1 - Add.carry1 (Neg.toWL x0 x1 x2 x3) n Neg.zeroWL))
+      Zero.pullUpTo muMax cond (x0 + x1, 1 - Add.carry0 (Neg.toWL x0 x1 x2 x3) n Neg.zeroWL)
+      Zero.pullUpTo muMax cond
+        (x0 + x1 + x2 + x3, 1 - Add.carry1 (Neg.toWL x0 x1 x2 x3) n Neg.zeroWL))
     rfl (by infer_explicit_circuit)
 
 /-! The template as a stand-alone assertion, to pin down its meaning. -/
@@ -119,18 +130,20 @@ def circuit : FormalAssertion (F p) Inputs where
     obtain ⟨cond, x0, x1, x2, x3, nlo, nhi⟩ := input_var
     simp only [circuit_norm, neg, isBit, zeroTable]
     intro env hc
-    exact mul_one_sub_eq_zero_iff.mp hc
+    -- both pulls carry the same `cond`, so `simp` leaves one obligation
+    exact eq_zero_or_countUpTo (mul_one_sub_eq_zero_iff.mp hc)
 
   soundness := by
     circuit_proof_start [neg, isBit, zeroTable, Neg.toWL, Neg.zeroWL, Neg.dwordHL, dword,
       Add.carry0, Add.carry1]
     obtain ⟨hcond, hx0, hx1, hx2, hx3, hnlo, hnhi⟩ := h_assumptions
     obtain ⟨h_bool, h_p0, h_p1⟩ := h_holds
-    refine ⟨?_, mul_one_sub_eq_zero_iff.mp h_bool⟩
+    refine ⟨?_, eq_zero_or_countUpTo (mul_one_sub_eq_zero_iff.mp h_bool)⟩
     intro hne
-    have h1 : input_cond = 1 := (mul_one_sub_eq_zero_iff.mp h_bool).resolve_left hne
-    obtain ⟨-, hlo⟩ := h_p0 h1
-    obtain ⟨-, hhi⟩ := h_p1 h1
+    have hcount : Channel.CountUpTo muMax input_cond :=
+      (eq_zero_or_countUpTo (mul_one_sub_eq_zero_iff.mp h_bool)).resolve_left hne
+    obtain ⟨-, hlo⟩ := h_p0 hcount
+    obtain ⟨-, hhi⟩ := h_p1 hcount
     -- each lookup flag is `1 − carry`, so each carry is `0` or `1` by the table's guarantee
     obtain ⟨c0, hc0def, hc0val⟩ : ∃ c0 : F p,
         c0 = (input_x0 + 65536 * input_x1 + input_neg_lo - 0) * inv32 ∧
@@ -177,7 +190,7 @@ def circuit : FormalAssertion (F p) Inputs where
     have hsum4 := Neg.val_sum4 hx0 hx1 hx2 hx3
     rcases hcond with rfl | rfl
     · -- an inactive row owes nothing: both lookups are disabled
-      refine ⟨by simp, ?_, ?_⟩ <;> intro h1 <;> simp at h1
+      refine ⟨by simp, ?_, ?_⟩ <;> intro h1 <;> exact absurd h1 not_countUpTo_zero
     -- an active row: the spec fixes `neg`, so `ADD`'s converse gives both carries
     have hspec := h_spec one_ne_zero
     have hsum : (dword (input_x0 + 65536 * input_x1) (input_x2 + 65536 * input_x3)

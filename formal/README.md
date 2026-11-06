@@ -282,8 +282,13 @@ since the chip receives on its pulls and owes on its pushes, so ordering the
 `Ensemble.tableSoundness_of_stagedOn` finishes one bus in two classes of
 messages, which is how a puller and a pusher of one bus are ordered.
 
-That ensemble is not written yet, but the obstacle to it is gone. The bus used to
-be two `RawChannel`s under one name: the five chips that push used
+That ensemble is not written yet, but the two obstacles to it are gone. Both were
+the same bug on a different bus: a chip pulling with a multiplicity above `1` has
+to use the counted channel, a chip pulling under a bit could use either, and the
+two spellings are different `RawChannel`s carrying one name.
+
+On `ALU` the bus used to be two `RawChannel`s under one name: the five chips
+that push used
 `Alu.channel.toRaw`, which admits only `0` or `1` on a pull, while DVRM's
 multiplicity reaches 510 and had to pull on `Alu.channel.counted muMax`.
 `unique_channel_names` rejects that pair, so no ensemble could hold DVRM and
@@ -300,6 +305,16 @@ asks for `ConsistentUpTo balance.pullBound`, so `EqLookup` is now stated for
 `Balance.logUpUpTo muMax` rather than for an arbitrary balance. That is the one
 real cost, and every ensemble that finishes this bus inherits it; `LtStaged`
 already used that balance.
+
+`ZERO` was split the same way and is settled the same way. DVRM pulls it six
+times: twice directly, with a multiplicity that reaches `muMax`, and four more
+through its two `NEG` templates, which pulled `Zero.toRaw` under a sign bit.
+Those four now pull `Zero.counted muMax` too. A bit satisfies what the counted
+channel asks, `mult = 0 ∨ CountUpTo muMax mult`, and `Mu.lean` carries the five
+lemmas that translate between the two shapes, next to `muMax` because any chip
+moving a conditional pull onto a counted channel needs them. `export/` is
+byte-identical again. The cost was five proof sites in `Dvrm.lean`, all of the
+same kind: `NEG`'s guarantee is now read off a count rather than off `sign = 1`.
 
 That is not an end-to-end LT theorem. `TableSoundness` is one premise of a
 sound ensemble, not the conclusion: it reads `witness.Assumptions →

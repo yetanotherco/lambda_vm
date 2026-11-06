@@ -508,8 +508,8 @@ theorem soundness :
     all_goals first
       | exact fun h => absurd hmu h
       | exact Or.inl hmu
-      | exact hsignRb
-      | exact hsignDb
+      | exact eq_zero_or_countUpTo hsignRb
+      | exact eq_zero_or_countUpTo hsignDb
       | exact hsignedb
       | exact fun h => absurd hzq h
       | exact fun h => absurd hzr h
@@ -637,9 +637,11 @@ theorem soundness :
   clear h_sgnN h_sgnN0 h_sgnR h_sgnR0 h_sgnD h_sgnD0 h_sgb
   -- `abs_r` and `abs_d`, from the two `NEG` templates
   obtain ⟨hARlo, hARhi, hARval⟩ := abs_val hr0 hr1 hr2 hr3 hsignRb
-    (fun h => (h_nr0 h).2) (fun h => (h_nr1 h).2) h_ar0 h_ar1
+    (fun h => (h_nr0 (countUpTo_of_eq_one h)).2)
+    (fun h => (h_nr1 (countUpTo_of_eq_one h)).2) h_ar0 h_ar1
   obtain ⟨hADlo, hADhi, hADval⟩ := abs_val hd0 hd1 hd2 hd3 hsignDb
-    (fun h => (h_nd0 h).2) (fun h => (h_nd1 h).2) h_ad0 h_ad1
+    (fun h => (h_nd0 (countUpTo_of_eq_one h)).2)
+    (fun h => (h_nd1 (countUpTo_of_eq_one h)).2) h_ad0 h_ad1
   clear h_nr0 h_nr1 h_ar0 h_ar1 h_nd0 h_nd1 h_ad0 h_ad1
   have hARcond : dword input_absR_lo input_absR_hi
       = if input_signed.val = 1 ∧
@@ -851,7 +853,8 @@ theorem soundness :
   exact ⟨fun _ => hQR,
     .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount, .inr hcount,
-    hsignRb, hsignRb, hsignDb, hsignDb,
+    eq_zero_or_countUpTo hsignRb, eq_zero_or_countUpTo hsignRb,
+    eq_zero_or_countUpTo hsignDb, eq_zero_or_countUpTo hsignDb,
     .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount,
@@ -1133,13 +1136,7 @@ theorem completeness :
       pr0, pr1, pr2, pr3, pdz, pov, parlo, parhi, padlo, padhi, pm0, pm1, pm2, pm3,
       psm, psn, psd, psq, psr, pmq, pmr, circuit_norm]
     -- a zero multiplicity is not a count, so every counted pull's obligation is vacuous
-    have hnc : ¬ Channel.CountUpTo muMax (0 : F p) := by
-      rintro ⟨k, hk1, hk2, hk⟩
-      have hv : ((k : ℕ) : F p).val = k :=
-        val_natCast_of_lt_two_pow_40 (by simp only [muMax] at hk2; omega)
-      rw [← hk, ZMod.val_zero] at hv
-      omega
-    norm_num [hnc]
+    norm_num [not_countUpTo_zero]
   have hveq : ∀ a b : F p, ZMod.val a = ZMod.val b → a = b := fun a b h => by
     rw [← ZMod.natCast_zmod_val a, ← ZMod.natCast_zmod_val b, h]
   have hsv2 : ZMod.val input_signed < 2 := IsBool.val_lt_two hsgb
@@ -1185,13 +1182,19 @@ theorem completeness :
   have hfm := val_fill hsm2
   have hfr := val_fill hsr2
   have hfn := val_fill hsn2
-  -- a negative operand's absolute value is its two's complement
-  have hnegR : input_signR = 1 →
+  -- a negative operand's absolute value is its two's complement. The `NEG` pulls are counted,
+  -- so the hypothesis arrives as a count rather than as `sign = 1`; for a bit the two say the
+  -- same thing.
+  have hnegR : Channel.CountUpTo muMax input_signR →
       ZMod.val input_absR_lo + 2^32 * ZMod.val input_absR_hi = (2^64 - RV) % 2^64 := fun h1 => by
-    rw [harv]; exact har1 (by rw [← hsrv, h1]; exact val_one_eq)
-  have hnegD : input_signD = 1 →
+    rw [harv]
+    exact har1 (by
+      rw [← hsrv, eq_one_of_countUpTo (isBool_of_val_lt_two hsr2) h1]; exact val_one_eq)
+  have hnegD : Channel.CountUpTo muMax input_signD →
       ZMod.val input_absD_lo + 2^32 * ZMod.val input_absD_hi = (2^64 - DV) % 2^64 := fun h1 => by
-    rw [hadv]; exact had1 (by rw [← hsdv, h1]; exact val_one_eq)
+    rw [hadv]
+    exact had1 (by
+      rw [← hsdv, eq_one_of_countUpTo (isBool_of_val_lt_two hsd2) h1]; exact val_one_eq)
   -- the 128-bit addition `extended(n − r) + extended(r) = extended(n)`, limb by limb
   have hadd' : ∃ k : ℕ,
       ZMod.val (input_nSubR_x0 + 65536 * input_nSubR_x1)
@@ -1405,8 +1408,7 @@ spellings of `ALU` and of `ZERO` have to be declared. -/
 theorem requirementsChannelsLawful : ∀ (input : Var Row (F p)) (offset : ℕ),
     ((main input).operations offset).RequirementsChannelsLawful
       elaborated.channelsWithGuarantees
-      [AluC, IsHalfC, ZeroC, Bitwise.Zero.toRaw,
-        Bitwise.Msb16.toRaw, Bitwise.AreBytes.toRaw] := by
+      [AluC, IsHalfC, ZeroC, Bitwise.Msb16.toRaw, Bitwise.AreBytes.toRaw] := by
   intro input offset
   apply requirementsChannelsLawful_of_shallowChannels_subset
   · -- the chip has no subcircuits
@@ -1423,8 +1425,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   elaborated
   Spec r _ _ := RowSpec r
   channelsWithRequirements :=
-    [AluC, IsHalfC, ZeroC, Bitwise.Zero.toRaw,
-      Bitwise.Msb16.toRaw, Bitwise.AreBytes.toRaw]
+    [AluC, IsHalfC, ZeroC, Bitwise.Msb16.toRaw, Bitwise.AreBytes.toRaw]
 
   requirementsChannelsLawful := requirementsChannelsLawful
   soundness := soundness
