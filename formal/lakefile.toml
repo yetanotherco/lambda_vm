@@ -6,12 +6,12 @@ autoImplicit = false
 relaxedAutoImplicit = false
 
 # Clean from the counted-pulls branch of the yetanotherco fork (on Clean main f3abad7c): pulls of
-# multiplicity up to N and soundness by finishing order. Mathlib and CompPoly come in through
-# Clean's manifest.
+# multiplicity up to N and soundness by finishing order, plus the four review fixes that answer
+# the audit of that branch. Mathlib and CompPoly come in through Clean's manifest.
 [[require]]
 name = "Clean"
 git = "https://github.com/yetanotherco/clean"
-rev = "1cf67e24816808b880aa6af8592047cf42546efc"
+rev = "73309694ae33279094597f7f3f819fb8a3439620"
 
 [[lean_lib]]
 name = "LambdaVM"
