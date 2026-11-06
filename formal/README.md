@@ -282,14 +282,24 @@ since the chip receives on its pulls and owes on its pushes, so ordering the
 `Ensemble.tableSoundness_of_stagedOn` finishes one bus in two classes of
 messages, which is how a puller and a pusher of one bus are ordered.
 
-That ensemble is not written yet, and it needs the two names for the `ALU` bus
-resolved first. The five chips that push use `Alu.channel.toRaw`, which requires
-every pull to carry `0` or `1`; DVRM's multiplicity reaches 510, so it has to
-pull on `Alu.channel.counted muMax`. Those are two different `RawChannel`s under
-one name, which `unique_channel_names` rejects, so no ensemble can hold DVRM and
-another ALU chip at once. Moving the five pushers to the counted channel leaves
-`export/` byte-identical — the channel is a choice in the Lean model, invisible
-in the AIR — but it does change proofs.
+That ensemble is not written yet, but the obstacle to it is gone. The bus used to
+be two `RawChannel`s under one name: the five chips that push used
+`Alu.channel.toRaw`, which admits only `0` or `1` on a pull, while DVRM's
+multiplicity reaches 510 and had to pull on `Alu.channel.counted muMax`.
+`unique_channel_names` rejects that pair, so no ensemble could hold DVRM and
+another ALU chip at once. `Alu.channelC` is now the single channel for the whole
+model, pushers and pullers alike, the same way `muMax` is a single constant.
+
+The move is free in the AIR and cheap in the proofs. `emitUpTo` and `pushIf`
+build the same interaction but for the channel they name, so `export/` is
+byte-identical and the differential tests do not notice. A push requires
+`mult ≠ 0 → Guarantees` on either channel, so no chip owes anything new. What
+changed is six lawfulness proofs, which need `Alu.channelC` unfolded before a
+name mismatch can be read off it, and the balance: finishing a counted channel
+asks for `ConsistentUpTo balance.pullBound`, so `EqLookup` is now stated for
+`Balance.logUpUpTo muMax` rather than for an arbitrary balance. That is the one
+real cost, and every ensemble that finishes this bus inherits it; `LtStaged`
+already used that balance.
 
 That is not an end-to-end LT theorem. `TableSoundness` is one premise of a
 sound ensemble, not the conclusion: it reads `witness.Assumptions →

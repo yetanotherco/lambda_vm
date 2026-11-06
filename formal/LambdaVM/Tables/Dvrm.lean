@@ -51,7 +51,7 @@ open Bitwise (IsHalf Zero)
 abbrev IsHalfC : RawChannel (F p) := Bitwise.IsHalf.counted muMax
 /-- `ZERO` and the `ALU` bus, likewise counted: every pull of a DVRM row fires with the sum. -/
 abbrev ZeroC : RawChannel (F p) := Bitwise.Zero.counted muMax
-abbrev AluC : RawChannel (F p) := Alu.channel.counted muMax
+abbrev AluC : RawChannel (F p) := Alu.channelC
 
 /-- Four 16-bit halves: the `DWordHL` of the spec. The row groups its operands this way rather
 than holding 34 flat fields, because `deriving ProvableStruct` does not reach that many
@@ -173,9 +173,9 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   Zero.pullUpTo muMax mu (r.d.x0 + r.d.x1 + r.d.x2 + r.d.x3, r.divByZero)
   -- output: ALU[n, d, opsel(DIVREM) + 32·signed (+128)] -> q, r
   let dvFlags := 8 + 32 * r.signed
-  Alu.channel.pushIf r.muQ
+  Alu.channel.emitUpTo muMax r.muQ
     ⟨en0, en1, word r.d.x0 r.d.x1, word r.d.x2 r.d.x3, dvFlags, word r.q.x0 r.q.x1, word r.q.x2 r.q.x3⟩
-  Alu.channel.pushIf r.muR
+  Alu.channel.emitUpTo muMax r.muR
     ⟨en0, en1, word r.d.x0 r.d.x1, word r.d.x2 r.d.x3, dvFlags + 128, er0, er1⟩
 
 /-! ## What a row means -/
@@ -1405,7 +1405,7 @@ spellings of `ALU` and of `ZERO` have to be declared. -/
 theorem requirementsChannelsLawful : ∀ (input : Var Row (F p)) (offset : ℕ),
     ((main input).operations offset).RequirementsChannelsLawful
       elaborated.channelsWithGuarantees
-      [AluC, Alu.channel.toRaw, IsHalfC, ZeroC, Bitwise.Zero.toRaw,
+      [AluC, IsHalfC, ZeroC, Bitwise.Zero.toRaw,
         Bitwise.Msb16.toRaw, Bitwise.AreBytes.toRaw] := by
   intro input offset
   apply requirementsChannelsLawful_of_shallowChannels_subset
@@ -1423,7 +1423,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   elaborated
   Spec r _ _ := RowSpec r
   channelsWithRequirements :=
-    [AluC, Alu.channel.toRaw, IsHalfC, ZeroC, Bitwise.Zero.toRaw,
+    [AluC, IsHalfC, ZeroC, Bitwise.Zero.toRaw,
       Bitwise.Msb16.toRaw, Bitwise.AreBytes.toRaw]
 
   requirementsChannelsLawful := requirementsChannelsLawful

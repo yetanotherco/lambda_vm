@@ -122,7 +122,7 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   Bitwise.Hwsl.pullIf (1 - r.zbs) ⟨extension, r.bitShift, r.x4, extension - r.x4⟩
   Bitwise.ByteAlu.pullIf r.mu
     ⟨(opselAND : F p), r.shiftAmount, 48 - 32 * r.wordInstr, 48 - 48 * r.ls0 - 32 * r.ls1 - 16 * r.ls2⟩
-  Alu.channel.pushIf r.mu
+  Alu.channel.emitUpTo muMax r.mu
     ⟨r.in0 + 65536 * r.in1, r.in2 + 65536 * r.in3,
       r.shiftAmount + 256 * r.shiftB1 + 65536 * r.shiftH1, r.shiftHigh,
       5 + r.wordInstr + 32 * r.signed + 64 * r.direction, r.out0, r.out1⟩
@@ -784,12 +784,12 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   main
   elaborated
   Spec r _ _ := RowSpec r
-  channelsWithRequirements := [Alu.channel.toRaw]
+  channelsWithRequirements := [Alu.channelC]
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨in0, in1, in2, in3, shiftAmount, direction, signed, wordInstr, out0, out1, isNegative,
       bitShift, zbs, x0, x1, x2, x3, x4, y0, y1, y2, y3, ls0, ls1, ls2, mu, shiftB1, shiftH1,
       shiftHigh⟩ := input_var
-    simp only [circuit_norm, main, isBit, Alu.channel, Bitwise.isHalfTable, Bitwise.msb16Table,
+    simp only [circuit_norm, main, Alu.channelC, isBit, Alu.channel, Bitwise.isHalfTable, Bitwise.msb16Table,
       Bitwise.byteAluTable, opselAND, opselOR, opselXOR, Bitwise.zeroTable, Bitwise.hwslTable, Bitwise.areBytesTable]
     constructor
     · intro channel h; tauto

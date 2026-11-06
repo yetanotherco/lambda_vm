@@ -106,7 +106,7 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   Bitwise.IsHalf.pullUpTo muMax r.mu r.lhsSubRhs2
   Bitwise.IsHalf.pullUpTo muMax r.mu r.lhsSubRhs3
   -- output: ALU[lhs, rhs, opsel(LT) + 32·signed + 64·invert] -> [res, 0], μ times
-  Alu.channel.pushIf r.mu
+  Alu.channel.emitUpTo muMax r.mu
     ⟨r.lhs0, lhsHi, r.rhs0, rhsHi, 4 + 32 * r.signed + 64 * r.invert, r.res, 0⟩
 
 lemma ltRaw_lt_two {s L R : ℕ} : ltRaw s L R < 2 := by
@@ -174,11 +174,11 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   name := "LT"
   main
   Spec r _ _ := RowSpec r
-  channelsWithRequirements := [Alu.channel.toRaw, IsHalfC, Msb16C]
+  channelsWithRequirements := [Alu.channelC, IsHalfC, Msb16C]
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨lhs0, lhs1, lhs2, rhs0, rhs1, rhs2, signed, lt, lhsSubRhs0, lhsSubRhs1, lhsSubRhs2,
       lhsSubRhs3, lhsMsb, rhsMsb, invert, res, mu⟩ := input_var
-    simp only [circuit_norm, main, isBit, sub, add, Add.carry0, Add.carry1, IsHalfC, Msb16C,
+    simp only [circuit_norm, main, Alu.channelC, isBit, sub, add, Add.carry0, Add.carry1, IsHalfC, Msb16C,
       Bitwise.IsHalf, Bitwise.Msb16, Bitwise.AreBytes]
     intro channel h
     tauto

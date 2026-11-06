@@ -72,7 +72,7 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   -- μ : Bit (no deduplication)
   isBit r.mu
   -- output: ALU[a, b, opsel(EQ) + 64·invert] -> [res, 0]
-  Alu.channel.pushIf r.mu ⟨r.a0, r.a1, r.b0, r.b1, 3 + 64 * r.invert, r.res, 0⟩
+  Alu.channel.emitUpTo muMax r.mu ⟨r.a0, r.a1, r.b0, r.b1, 3 + 64 * r.invert, r.res, 0⟩
 
 /-- The honest prover's row, as `generate_eq_trace` fills it. -/
 def Honest (r : Row (F p)) : Prop :=
@@ -95,16 +95,19 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   name := "EQ"
   main
   Spec r _ _ := RowSpec r
-  channelsWithRequirements := [Alu.channel.toRaw]
+  channelsWithRequirements := [Alu.channelC]
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨a0, a1, b0, b1, invert, res, diff0, diff1, diff2, diff3, eq, mu⟩ := input_var
-    simp only [circuit_norm, main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel,
+    simp only [circuit_norm, main, Alu.channelC, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel,
       Bitwise.isHalfTable, Bitwise.zeroTable]
     constructor
     · intro channel h; tauto
     · intro env h
-      -- each pull owes a multiplicity of 0 or 1: μ is a bit
-      exact mul_one_sub_eq_zero_iff.mp h.2.2.2.2
+      -- each pull owes a multiplicity of 0 or 1: μ is a bit. The ALU bus is the counted
+      -- channel now, so each clause is `pulled channel = ALU ∨ IsBool μ` and the right
+      -- disjunct is the one that holds; the pulls here are IS_HALF and ZERO, not ALU.
+      have hb := mul_one_sub_eq_zero_iff.mp h.2.2.2.2
+      and_intros <;> exact Or.inr hb
 
   soundness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, dword, Alu.channel,

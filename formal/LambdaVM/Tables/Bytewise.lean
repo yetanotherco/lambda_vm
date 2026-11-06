@@ -221,7 +221,7 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   ByteAlu.pullUpTo muMax r.mu ⟨r.op, r.a6, r.b6, r.res6⟩
   ByteAlu.pullUpTo muMax r.mu ⟨r.op, r.a7, r.b7, r.res7⟩
   -- ALU[res; a, b, op], pushed μ times, operands and result re-limbed to `DWordWL`
-  Alu.channel.pushIf r.mu
+  Alu.channel.emitUpTo muMax r.mu
     ⟨word r.a0 r.a1 r.a2 r.a3, word r.a4 r.a5 r.a6 r.a7,
      word r.b0 r.b1 r.b2 r.b3, word r.b4 r.b5 r.b6 r.b7,
      r.op,
@@ -297,12 +297,12 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   name := "BYTEWISE"
   main
   Spec r _ _ := RowSpec r
-  channelsWithRequirements := [Alu.channel.toRaw, ByteAluC, Bitwise.AreBytes.toRaw]
+  channelsWithRequirements := [Alu.channelC, ByteAluC, Bitwise.AreBytes.toRaw]
 
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7, op,
       res0, res1, res2, res3, res4, res5, res6, res7, mu⟩ := input_var
-    simp only [circuit_norm, main, areBytes, word, ByteAluC, Bitwise.ByteAlu, Bitwise.AreBytes,
+    simp only [circuit_norm, main, Alu.channelC, areBytes, word, ByteAluC, Bitwise.ByteAlu, Bitwise.AreBytes,
       Alu.channel]
     intro channel h
     tauto

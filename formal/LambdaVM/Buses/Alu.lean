@@ -2,6 +2,8 @@ module
 
 public import LambdaVM.Field
 public import LambdaVM.AluOp
+public import LambdaVM.Mu
+public import Clean.Air.CountedChannel
 
 @[expose] public section
 
@@ -137,5 +139,26 @@ def Guarantees (m : Msg (F p)) : Prop :=
 def channel : Channel (F p) Msg where
   name := "ALU"
   Guarantees m _ := Guarantees m
+
+/-- The ALU bus as the one `RawChannel` every chip here uses, pushers and pullers alike.
+
+`Channel.counted N` is a different `RawChannel` for each `N`, and `Channel.toRaw` is a
+different one again, all three carrying the name `"ALU"`. A chip that pushes could use
+`toRaw`, since a push is unrestricted there, but DVRM pulls this bus with a multiplicity
+that reaches `muMax`, and a pull on `toRaw` has to carry `0` or `1`. Two `RawChannel`s
+under one name is not a soundness hole, because `unique_channel_names` rejects it, but it
+means no ensemble can hold DVRM together with another ALU chip. So the whole model agrees
+on this one, the same way it agrees on one `muMax`. The AIR does not see the difference:
+`emitUpTo` and `pushIf` build the same interaction but for the channel they name, so
+`export/` is unchanged by the choice. -/
+abbrev channelC : RawChannel (F p) := channel.counted muMax
+
+/-- Instance search runs at reducible transparency and does not get from `channelC` to the
+`Channel.counted` instance on its own, so name it here once rather than at every ensemble that
+finishes this bus. -/
+instance : (channelC : RawChannel (F p)).ConsistentUpTo
+    (Balance.logUpUpTo (F := F p) muMax).pullBound := by
+  simp only [Balance.logUpUpTo_pullBound]
+  infer_instance
 
 end LambdaVM.Alu

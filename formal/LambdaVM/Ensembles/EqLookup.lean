@@ -88,15 +88,21 @@ def eqComponent : Component (F p) where
     eqComponent.circuit.channelsWithGuarantees = [Bitwise.IsHalf.toRaw, Bitwise.IsHalf.toRaw,
       Bitwise.IsHalf.toRaw, Bitwise.IsHalf.toRaw, Bitwise.Zero.toRaw] := rfl
 @[circuit_norm] lemma eqComponent_channelsWithRequirements :
-    eqComponent.circuit.channelsWithRequirements = [Alu.channel.toRaw] := rfl
+    eqComponent.circuit.channelsWithRequirements = [Alu.channelC] := rfl
 
 instance : NeZero Bitwise.isHalfTable.table.length :=
   ⟨by simp [Bitwise.isHalfTable, Bitwise.rows, Bitwise.numRows]⟩
 instance : NeZero Bitwise.zeroTable.table.length :=
   ⟨by simp [Bitwise.zeroTable, Bitwise.rows, Bitwise.numRows]⟩
 
-def eqLookup (balance : Balance (F p)) : SoundEnsemble (F p) unit balance :=
-  SoundEnsemble.empty (F p) unit balance
+/-- The ensemble is stated for `Balance.logUpUpTo muMax` rather than for any balance, because
+the ALU bus is the counted channel: finishing it asks for `ConsistentUpTo balance.pullBound`,
+and a counted channel is consistent only up to its own `N`. Every ensemble that finishes this
+bus inherits that, which is the price of the model agreeing on one ALU channel. It costs
+nothing here, since `logUpUpTo` is the balance counted pulls were introduced for and the one
+`LtStaged` already uses. -/
+def eqLookup : SoundEnsemble (F p) unit (Balance.logUpUpTo muMax) :=
+  SoundEnsemble.empty (F p) unit (Balance.logUpUpTo muMax)
   |>.addChannel Bitwise.IsHalf.toRaw
   |>.addTable (pushStaticComponent Bitwise.isHalfTable)
       (by rw [pushStaticComponent_channelsWithGuarantees]; exact List.nil_subset _)
@@ -107,25 +113,33 @@ def eqLookup (balance : Balance (F p)) : SoundEnsemble (F p) unit balance :=
       (by rw [pushStaticComponent_channelsWithGuarantees]; exact List.nil_subset _)
       (by rw [pushStaticComponent_channelsWithRequirements]; simp [circuit_norm])
   |>.markFinished Bitwise.Zero.toRaw
-  |>.addChannel Alu.channel.toRaw
+  |>.addChannel Alu.channelC
   |>.addTable eqComponent
       (by rw [eqComponent_channelsWithGuarantees]; simp [circuit_norm])
-      (by rw [eqComponent_channelsWithRequirements]; simp [circuit_norm])
-  |>.markFinished Alu.channel.toRaw
+      (by
+        -- the ALU bus is the counted channel, so the name mismatch has to go through
+        -- `Channel.counted` as well as `Channel.toRaw`
+        rw [eqComponent_channelsWithRequirements]
+        simp only [circuit_norm, Alu.channelC]
+        all_goals (and_intros <;>
+          (intro h
+           have := congrArg RawChannel.name h
+           simp [Channel.counted, Channel.toRaw, alu_name] at this)))
+  |>.markFinished Alu.channelC
 
 /-- Lookup soundness, concretely: if the constraints of every table hold, every channel has few
 enough interactions for the balance check, and every channel balances, then every EQ row with
 `μ = 1` and range-checked operands carries the equality bit. -/
-theorem eq_rows_correct {balance : Balance (F p)}
-    (witness : EnsembleWitness (eqLookup balance).ensemble)
-    (hc : witness.Constraints) (hfit : witness.InteractionsFit balance)
-    (hb : witness.Balanced balance) :
+theorem eq_rows_correct
+    (witness : EnsembleWitness (eqLookup).ensemble)
+    (hc : witness.Constraints) (hfit : witness.InteractionsFit (Balance.logUpUpTo muMax))
+    (hb : witness.Balanced (Balance.logUpUpTo muMax)) :
     ∀ table ∈ witness.tables, table.component = eqComponent →
       ∀ row ∈ table.table, EQ.RowSpec (valueFromOffset EQ.Row 0 (table.environment row)) := by
-  have hsound : (eqLookup balance).ensemble.TableSoundness balance :=
+  have hsound : (eqLookup).ensemble.TableSoundness (Balance.logUpUpTo muMax) :=
     Ensemble.tableSoundness_of_soundChannels
-      ⟨(eqLookup balance).finished, (eqLookup balance).finished_subset,
-        (eqLookup balance).soundChannels⟩
+      ⟨(eqLookup).finished, (eqLookup).finished_subset,
+        (eqLookup).soundChannels⟩
   -- no component assumes anything
   have hassume : witness.Assumptions := by
     intro table htable row _
