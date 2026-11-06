@@ -1517,46 +1517,27 @@ impl CardFill {
     }
 }
 
-/// `LAMBDA_VM_BLOCK_CARD_FILL`: a comma list of `keccak_rnd`, `cpu`, `memw_r`,
-/// `memw_a`, `load`, `store`, `memw` and `shift` (each at most once) has the
-/// card fill those families' tables from
-/// the records their rows come from as their groups upload them ([`CardFill`]);
-/// `on` is every family, `off` none (the host builds every table). Unset or
-/// empty is [`CardFill::DEFAULT`]: every family in a build with the card's
-/// kernels, nothing without; `keccak_rnd,cpu,memw_r` is the earlier default
-/// (no row family), the rollback, and `keccak_rnd` alone KECCAK_RND's fill
-/// only. Where the card declines the room, a host reader fills them on the
-/// host. The tables' words, and so the proof's bytes, are the same. Anything
-/// else refuses the prove.
+/// `LAMBDA_VM_BLOCK_CARD_FILL`: `on` has the card fill every family's tables
+/// ([`CardFill`]: KECCAK_RND, CPU, MEMW_R and the five row families) from the
+/// records their rows come from as their groups upload them, `off` none (the
+/// host builds every table). Unset or empty is [`CardFill::DEFAULT`]: every
+/// family in a build with the card's kernels, nothing without. Where the card
+/// declines the room, a host reader fills them on the host. The tables' words,
+/// and so the proof's bytes, are the same. Anything else refuses the prove.
 pub(crate) fn block_card_fill() -> Result<CardFill, Error> {
     parse_card_fill(std::env::var("LAMBDA_VM_BLOCK_CARD_FILL").ok().as_deref())
 }
 
 /// [`block_card_fill`]'s reading of its variable.
 fn parse_card_fill(value: Option<&str>) -> Result<CardFill, Error> {
-    let refused = |v: &str| {
-        Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_CARD_FILL={v}: off (the host builds every table), on (the card \
-             fills every family it can) or a comma list of {}",
-            CardFill::NAMES.join(", ")
-        ))
-    };
     match value.map(str::trim) {
         None | Some("") => Ok(CardFill::DEFAULT),
         Some("off") => Ok(CardFill::default()),
         Some("on") => Ok(CardFill::EVERY),
-        Some(v) => {
-            let mut fill = CardFill::default();
-            for name in v.split(',').map(str::trim) {
-                let Some(at) = CardFill::NAMES.iter().position(|n| *n == name) else {
-                    return Err(refused(v));
-                };
-                if std::mem::replace(fill.flags()[at], true) {
-                    return Err(refused(v));
-                }
-            }
-            Ok(fill)
-        }
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_CARD_FILL={v}: off (the host builds every table) or on (the card \
+             fills every family it can)"
+        ))),
     }
 }
 
@@ -8784,8 +8765,7 @@ mod walkers_knob_tests {
     use executor::vm::memory::StoreKind;
 
     use super::{
-        CardFill, Error, RowFamilies, parse_card_fill, parse_records_drop, parse_walkers,
-        records_admission,
+        CardFill, Error, parse_card_fill, parse_records_drop, parse_walkers, records_admission,
     };
 
     /// Streamed chunks are held as records only with live regeneration to drop
@@ -8878,113 +8858,38 @@ mod walkers_knob_tests {
         }
     }
 
-    /// `LAMBDA_VM_BLOCK_CARD_FILL`: a comma list of `keccak_rnd`, `cpu`,
-    /// `memw_r` and the row families has the card fill those families, `on`
-    /// every one, `off` none;
-    /// unset or empty is every family with the card's kernels and nothing
-    /// without; any other word, a family twice or an empty item refuses the
-    /// prove.
+    /// `LAMBDA_VM_BLOCK_CARD_FILL`: `on` has the card fill every family, `off`
+    /// none; unset or empty is every family with the card's kernels and
+    /// nothing without; any other word refuses the prove.
     #[test]
-    fn the_card_fill_knob_takes_off_on_and_families_and_refuses_anything_else() {
-        let fill = |keccak_rnd, cpu, memw_r| CardFill {
-            keccak_rnd,
-            cpu,
-            memw_r,
-            rows: RowFamilies::NONE,
-        };
+    fn the_card_fill_knob_takes_off_and_on_and_refuses_anything_else() {
+        let none = CardFill::default();
         let every = CardFill::EVERY;
-        let rows = |rows| CardFill {
-            rows,
-            ..fill(false, false, false)
-        };
-        let some = |memw_a, load, store, memw, shift| RowFamilies {
-            memw_a,
-            load,
-            store,
-            memw,
-            shift,
-        };
         let card = cfg!(feature = "cuda");
-        let default = if card {
-            every
-        } else {
-            fill(false, false, false)
-        };
+        let default = if card { every } else { none };
         for (value, want) in [
             (None, default),
             (Some(""), default),
             (Some(" "), default),
-            (Some("off"), fill(false, false, false)),
-            (Some(" off "), fill(false, false, false)),
+            (Some("off"), none),
+            (Some(" off "), none),
             (Some("on"), every),
             (Some(" on\n"), every),
-            (Some("memw_a"), rows(some(true, false, false, false, false))),
-            (Some("load"), rows(some(false, true, false, false, false))),
-            (Some("store"), rows(some(false, false, true, false, false))),
-            (Some("memw"), rows(some(false, false, false, true, false))),
-            (Some("shift"), rows(some(false, false, false, false, true))),
-            (
-                Some("load,memw_a"),
-                rows(some(true, true, false, false, false)),
-            ),
-            (Some("shift,store,memw,load,memw_a"), rows(RowFamilies::ALL)),
-            (Some("keccak_rnd"), fill(true, false, false)),
-            (Some("cpu"), fill(false, true, false)),
-            (Some("memw_r"), fill(false, false, true)),
-            (Some("cpu,memw_r"), fill(false, true, true)),
-            (Some("keccak_rnd,cpu,memw_r"), fill(true, true, true)),
-            (Some(" memw_r , keccak_rnd "), fill(true, false, true)),
         ] {
             assert_eq!(parse_card_fill(value).ok(), Some(want), "{value:?}");
         }
-        assert_eq!(fill(false, false, false).name(), "off");
-        // ★ Unset is exactly the gated configuration's words with a card
-        // (every family: KECCAK_RND, CPU, MEMW_R and the five row families),
-        // nothing without; the earlier default's words (no row family) are
-        // the rollback, and `keccak_rnd` alone KECCAK_RND's fill only.
-        let gated =
-            parse_card_fill(Some("keccak_rnd,cpu,memw_r,memw_a,load,store,memw,shift")).ok();
-        let rollback = parse_card_fill(Some("keccak_rnd,cpu,memw_r")).ok();
-        let keccak_rnd = parse_card_fill(Some("keccak_rnd")).ok();
-        if card {
-            assert_eq!(Some(CardFill::DEFAULT), gated, "unset with a card");
-            assert_eq!(CardFill::DEFAULT.name(), every.name());
-        } else {
-            assert_eq!(
-                CardFill::DEFAULT,
-                fill(false, false, false),
-                "unset without a card"
-            );
-        }
-        assert_eq!(rollback, Some(fill(true, true, true)), "the rollback");
-        assert!(
-            !fill(true, true, true).rows.any(),
-            "the rollback: no row family"
-        );
-        assert_eq!(
-            keccak_rnd,
-            Some(fill(true, false, false)),
-            "KECCAK_RND alone"
-        );
+        // ★ Unset is every family (KECCAK_RND, CPU, MEMW_R and the five row
+        // families) with a card, nothing without.
+        assert_eq!(CardFill::DEFAULT, default);
         assert_eq!(
             CardFill::DEFAULT.rows.any(),
             card,
             "the row families by default with the card's kernels"
         );
-        assert_eq!(fill(true, false, true).name(), "keccak_rnd,memw_r");
-        assert_eq!(fill(true, true, true).name(), "keccak_rnd,cpu,memw_r");
+        assert_eq!(none.name(), "off");
         assert_eq!(
             every.name(),
             "keccak_rnd,cpu,memw_r,memw_a,load,store,memw,shift"
-        );
-        assert_eq!(
-            parse_card_fill(Some(&every.name())).ok(),
-            Some(every),
-            "the name reads back"
-        );
-        assert_eq!(
-            rows(some(false, true, false, false, true)).name(),
-            "load,shift"
         );
         for value in [
             "1",
@@ -8994,19 +8899,11 @@ mod walkers_knob_tests {
             "yes",
             "true",
             "on,off",
-            "kr",
-            "cpu,cpu",
-            "cpu,",
-            ",memw_r",
-            "CPU",
-            "keccak_rnd,on",
-            "cpu memw_r",
-            "memw_a,memw_a",
+            "keccak_rnd",
+            "cpu,memw_r",
+            "keccak_rnd,cpu,memw_r",
+            "keccak_rnd,cpu,memw_r,memw_a,load,store,memw,shift",
             "MEMW_A",
-            "loads",
-            "store,shift,store",
-            "stores",
-            "memw_w",
         ] {
             let refused = parse_card_fill(Some(value));
             assert!(
