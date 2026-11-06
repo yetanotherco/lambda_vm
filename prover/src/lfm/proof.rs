@@ -532,16 +532,12 @@ pub(crate) fn lfm_airs(
 
 /// The per-domain constants each table's prove would build on first use
 /// inside the card window, built before it instead
-/// (`stark::prover::warm_prove_constants`), and under `LFM_WARM_FIRST_PROVE`
-/// the DEEP's whole LDE cosets on the card
+/// (`stark::prover::warm_prove_constants`), and the DEEP's whole LDE cosets
+/// on the card
 /// (`stark::prover::warm_deep_coset_points`). All are cached for the process
 /// as the prove caches them, so no value moves.
 pub(crate) fn warm_before_hold(airs: &LfmAirs, traces: &mut LfmTraces) {
     let constants = stark::prover::warm_prove_constants_enabled();
-    let cosets = super::first_prove_warm::on();
-    if !constants && !cosets {
-        return;
-    }
     let pairs = airs.air_trace_pairs(traces);
     let tables: Vec<_> = pairs
         .iter()
@@ -550,9 +546,7 @@ pub(crate) fn warm_before_hold(airs: &LfmAirs, traces: &mut LfmTraces) {
     if constants {
         stark::prover::warm_prove_constants(&tables);
     }
-    if cosets {
-        stark::prover::warm_deep_coset_points(&tables);
-    }
+    stark::prover::warm_deep_coset_points(&tables);
 }
 
 /// The merge the process format asks of `program` (`LAMBDA_VM_ZF_LFM_MERGE`),

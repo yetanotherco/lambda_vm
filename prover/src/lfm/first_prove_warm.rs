@@ -1,5 +1,4 @@
-//! The recursion tree's first prove warmed up beside the base
-//! (`LFM_WARM_FIRST_PROVE`; on by default, `=0` turns it off).
+//! The recursion tree's first prove warmed up beside the base.
 //!
 //! The tree's first prove pays three first-use costs on the tree's critical
 //! path, with the card idle or waiting:
@@ -12,7 +11,7 @@
 //! - the staging pairs' pinned allocations, made inside the first artifact
 //!   build's and the first prove's card windows.
 //!
-//! On, the early leaf's thread makes the staging pairs when it starts and,
+//! The early leaf's thread makes the staging pairs when it starts and,
 //! after its fill, warms the first two for its own tables from an AIR set built
 //! from shape-only artifacts (`registry::census_artifacts_merged`: every height,
 //! chunk and merge the real artifacts have, every root zero). Every prove also
@@ -21,7 +20,7 @@
 //! never by a root, so no proof byte moves.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use stark::proof::options::{OneRowMode, ProofOptions};
 
@@ -32,42 +31,6 @@ use super::trace::LfmTraces;
 /// The staging pairs made ahead: what the tree made on first use at both block
 /// sizes, as measured (`W3 STAGING AT END: staging pairs 4 of 8`).
 pub const STAGING_PAIRS: usize = 4;
-
-/// `LFM_WARM_FIRST_PROVE` as given: on when unset, `1` or `on`; off when
-/// empty, `0` or `off`; any other value is an error.
-fn setting(value: Option<&str>) -> bool {
-    match value.map(str::trim) {
-        Some("" | "0" | "off") => false,
-        None | Some("1" | "on") => true,
-        Some(other) => {
-            panic!("LFM_WARM_FIRST_PROVE must be `0`, `1`, `off` or `on`, got `{other}`")
-        }
-    }
-}
-
-/// Runtime override of [`on`]: 0 = the environment's choice, 1 = off, 2 = on.
-static OVERRIDE: AtomicU8 = AtomicU8::new(0);
-
-/// Force the warm-up on, off, or back to the environment (tests).
-pub fn set(on: Option<bool>) {
-    let v = match on {
-        None => 0,
-        Some(false) => 1,
-        Some(true) => 2,
-    };
-    OVERRIDE.store(v, Ordering::Relaxed);
-}
-
-/// Whether the warm-up is on (the environment read once).
-pub fn on() -> bool {
-    match OVERRIDE.load(Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
-    }
-    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENV.get_or_init(|| setting(std::env::var("LFM_WARM_FIRST_PROVE").ok().as_deref()))
-}
 
 static PAIRS_MADE: AtomicU64 = AtomicU64::new(0);
 static PAIRS_NS: AtomicU64 = AtomicU64::new(0);
@@ -161,9 +124,6 @@ pub fn line() -> String {
         .map(|s| format!("{s:.3}"))
         .collect::<Vec<_>>()
         .join(" ");
-    if !on() {
-        return format!("off · prove prep s [{preps}]");
-    }
     let early = EARLY_AT.load(Ordering::Relaxed);
     format!(
         "on · staging pairs made {} in {:.3} s · early leaf warmed {} tables, {} DEEP cosets in {:.3} s, by {} · prove prep s [{preps}]",
@@ -183,23 +143,6 @@ pub fn line() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// On by default: unset, `1` or `on`; off for empty, `0` or `off`.
-    #[test]
-    fn the_knob_is_on_unless_zero_or_off() {
-        for off in [Some(""), Some("0"), Some("off"), Some(" 0 ")] {
-            assert!(!setting(off), "{off:?}");
-        }
-        for on in [None, Some("1"), Some("on"), Some(" 1 ")] {
-            assert!(setting(on), "{on:?}");
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "LFM_WARM_FIRST_PROVE must be")]
-    fn an_unknown_value_is_refused() {
-        setting(Some("yes"));
-    }
 
     /// The shape-only artifacts the warm-up builds its AIR set from carry every
     /// height, chunk list, chip set and merge a real build has; only roots and

@@ -2174,11 +2174,9 @@ pub fn prove_whir_block_tree(
                             let handle = std::thread::spawn(move || -> Result<EarlyOut, String> {
                                 let started = t0.elapsed().as_secs_f64();
                                 // The staging pairs the tree's first card holds
-                                // would allocate, made now, beside the base
-                                // (`LFM_WARM_FIRST_PROVE`).
-                                let staging = super::first_prove_warm::on().then(|| {
-                                    std::thread::spawn(super::first_prove_warm::prewarm_staging)
-                                });
+                                // would allocate, made now, beside the base.
+                                let staging =
+                                    std::thread::spawn(super::first_prove_warm::prewarm_staging);
                                 let t = std::time::Instant::now();
                                 let hasher =
                                     program.program.hasher(<BlockFamily as ProofFamily>::SOCKET);
@@ -2195,28 +2193,23 @@ pub fn prove_whir_block_tree(
                                 }
                                 // And the rest of what its prove builds on first
                                 // use: the per-domain prove constants and the
-                                // DEEP's LDE cosets (`LFM_WARM_FIRST_PROVE`).
-                                // A warm-up that fails leaves the prove to build
-                                // what it needs, as with the knob off; the line
-                                // says so.
-                                if super::first_prove_warm::on() {
-                                    match super::first_prove_warm::warm(
-                                        &program.program,
-                                        filled.traces_mut(),
-                                        &wrap,
-                                        hasher,
-                                    ) {
-                                        Ok(_) => super::first_prove_warm::note_early(
-                                            t0.elapsed().as_secs_f64(),
-                                        ),
-                                        Err(e) => eprintln!(
-                                            "W3 FIRST PROVE WARM: early leaf {k}'s warm-up refused: {e}"
-                                        ),
-                                    }
+                                // DEEP's LDE cosets. A warm-up that fails leaves
+                                // the prove to build what it needs; the line says
+                                // so.
+                                match super::first_prove_warm::warm(
+                                    &program.program,
+                                    filled.traces_mut(),
+                                    &wrap,
+                                    hasher,
+                                ) {
+                                    Ok(_) => super::first_prove_warm::note_early(
+                                        t0.elapsed().as_secs_f64(),
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "W3 FIRST PROVE WARM: early leaf {k}'s warm-up refused: {e}"
+                                    ),
                                 }
-                                if let Some(h) = staging
-                                    && h.join().is_err()
-                                {
+                                if staging.join().is_err() {
                                     eprintln!("W3 FIRST PROVE WARM: the staging warm-up panicked");
                                 }
                                 Ok((filled, arena, started, secs))
