@@ -3804,6 +3804,41 @@ fn prove_block_whir_inner(
             pool.locked, pool.bytes, pool.seconds
         );
     }
+    let proved = prove_block_whir_body(
+        elf_bytes,
+        private_inputs,
+        proof_options,
+        format,
+        options,
+        deviations,
+        on_statement,
+        on_group,
+        lead,
+    );
+    // What the pool served this process so far, whichever path the prove took
+    // (only the streamed one stamps it for the report).
+    if let Some(p) = multilinear::pinned::stats() {
+        eprintln!(
+            "BLOCK PINNED POOL USED: {} of {} upload bytes from the pool · {} bytes handed out · {} pageable once spent",
+            p.upload_pinned, p.upload_bytes, p.carved_bytes, p.spilled_bytes
+        );
+    }
+    proved
+}
+
+/// [`prove_block_whir_inner`] once the pool is locked.
+#[allow(clippy::too_many_arguments)]
+fn prove_block_whir_body(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    deviations: &Deviations,
+    on_statement: StatementObserver<'_>,
+    on_group: GroupObserver<'_>,
+    lead: Option<&PhaseBLead>,
+) -> Result<(BlockWhirProof, BlockStamps), Error> {
     let mut stamps = BlockStamps::default();
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
