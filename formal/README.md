@@ -150,12 +150,10 @@ enforces, on every PR:
   `lt.rs`.
 - BITWISE: same size, all 2^20 rows, 656 sampled rows and 8 channels (10 Rust
   receivers), exact match.
-- BYTEWISE: 0 constraints and 10 interactions, over 26 columns. `Export.lean`
-  emits `export/bytewise.json`, and the column count and the three buses agree
-  with `bytewise.rs` (`cols::NUM_COLUMNS = 26`, `BusId::AreBytes`,
-  `BusId::ByteAlu`, `BusId::Alu`). The `lean_diff_bytewise` test that would
-  compare the constraints row by row is not written yet, so this chip is the one
-  entry above whose match is by inspection rather than by the differential check.
+- BYTEWISE: 0 constraints and 10 interactions, over 26 columns, exact match.
+  `lean_diff_bytewise` feeds repeated operations so the rows carry `μ > 1` and
+  one of them crosses `MU_MAX` into two rows, which is the only way to exercise
+  the counted pull this chip is built on.
 
 The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
 `μ·(1 − μ)` in EQ, which is why the Lean bit constraints use the spec's form.

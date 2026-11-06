@@ -208,8 +208,10 @@ def word (x0 x1 x2 x3 : Expression (F p)) : Expression (F p) :=
   x0 + 256 * x1 + 65536 * x2 + 16777216 * x3
 
 def main (r : Var Row (F p)) : Circuit (F p) Unit := do
-  -- IS_BYTE<1, μ>: what makes every BYTE_ALU pull below a counted pull of at most `muMax`
-  isByte 1 r.mu
+  -- ARE_BYTES[μ, 0]: what makes every BYTE_ALU pull below a counted pull of at most `muMax`.
+  -- Spelt as `bytewise.rs` and `lt.rs` send it, operand first, rather than as `IS_BYTE<1, μ>`,
+  -- which is the same statement but the other message and so a different bus entry.
+  areBytes r.mu 0
   -- BYTE_ALU[op, a[i], b[i]] -> res[i], pulled μ times, for i = 0 … 7
   ByteAlu.pullUpTo muMax r.mu ⟨r.op, r.a0, r.b0, r.res0⟩
   ByteAlu.pullUpTo muMax r.mu ⟨r.op, r.a1, r.b1, r.res1⟩
@@ -301,16 +303,16 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7, op,
       res0, res1, res2, res3, res4, res5, res6, res7, mu⟩ := input_var
-    simp only [circuit_norm, main, isByte, word, ByteAluC, Bitwise.ByteAlu, Bitwise.AreBytes,
+    simp only [circuit_norm, main, areBytes, word, ByteAluC, Bitwise.ByteAlu, Bitwise.AreBytes,
       Alu.channel]
     intro channel h
     tauto
 
   soundness := by
-    circuit_proof_start [main, isByte, word, Alu.channel, Alu.Guarantees, RowSpec,
+    circuit_proof_start [main, areBytes, word, Alu.channel, Alu.Guarantees, RowSpec,
       Row.aVal, Row.bVal, Row.resVal, Bits.ofBytes, dword, Bitwise.areBytesTable,
       Bitwise.byteAluTable]
-    obtain ⟨⟨-, hmu⟩, g0, g1, g2, g3, g4, g5, g6, g7⟩ := h_holds
+    obtain ⟨⟨hmu, -⟩, g0, g1, g2, g3, g4, g5, g6, g7⟩ := h_holds
     -- an inactive row owes nothing: no lookup fires and nothing is pushed
     by_cases h0 : input_mu = 0
     · simp [h0]
@@ -393,12 +395,12 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   ProverAssumptions r _ _ := Honest r
 
   completeness := by
-    circuit_proof_start [main, isByte, word, Alu.channel, Alu.Guarantees, Honest,
+    circuit_proof_start [main, areBytes, word, Alu.channel, Alu.Guarantees, Honest,
       Bitwise.areBytesTable, Bitwise.byteAluTable]
     obtain ⟨hmu, ha0, ha1, ha2, ha3, ha4, ha5, ha6, ha7,
       hb0, hb1, hb2, hb3, hb4, hb5, hb6, hb7, hop,
       hr0, hr1, hr2, hr3, hr4, hr5, hr6, hr7⟩ := h_assumptions
-    exact ⟨⟨by simp, hmu⟩,
+    exact ⟨⟨hmu, by simp⟩,
       fun _ => ⟨ha0, hb0, guarantee_of_appOf hop hr0⟩,
       fun _ => ⟨ha1, hb1, guarantee_of_appOf hop hr1⟩,
       fun _ => ⟨ha2, hb2, guarantee_of_appOf hop hr2⟩,
