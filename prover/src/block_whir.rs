@@ -816,34 +816,6 @@ fn decision_bytes(reading: &HostReading, allocator: Option<u64>, now: bool) -> u
     }
 }
 
-/// `LAMBDA_VM_BLOCK_DROP`: unset, empty or `partial` (the default) drops,
-/// once live regeneration arms, each table phase B can rebuild only while the
-/// policy wants it out, on what the host holds now, and purges the dropped
-/// tables' pages so the reading falls
-/// ([`multilinear_block::BlockRegen::partial`], [`DropPurges`]); `all` drops
-/// every such table, those already parked with them (the old default, kept
-/// as the rollback). Anything else refuses the prove. The proof is the same.
-fn block_drop() -> Result<DropMode, Error> {
-    parse_drop(std::env::var("LAMBDA_VM_BLOCK_DROP").ok().as_deref())
-}
-
-/// What live regeneration drops once armed ([`block_drop`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DropMode {
-    All,
-    Partial,
-}
-
-fn parse_drop(value: Option<&str>) -> Result<DropMode, Error> {
-    match value.map(str::trim) {
-        None | Some("" | "partial") => Ok(DropMode::Partial),
-        Some("all") => Ok(DropMode::All),
-        Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_DROP={v}: all or partial"
-        ))),
-    }
-}
-
 /// `LAMBDA_VM_BLOCK_KEEP_CELLS_G`: partial drops' keep budget at arming, in G
 /// main cells committed ([`multilinear_block::BlockRegen::keep_cells`]). Once
 /// live regeneration arms, the tables phase B can rebuild that were committed
@@ -1100,17 +1072,6 @@ const FINISH_GROWTH_PER_CYCLE: f64 = 30.08 * (1u64 << 30) as f64 / 612.3e6;
 fn hand_off_need(hwm: u64, cycles: u64, target: u64) -> u64 {
     let forecast = hwm.saturating_add((FINISH_GROWTH_PER_CYCLE * cycles as f64) as u64);
     forecast.saturating_sub(pressure_line(target))
-}
-
-/// `LAMBDA_VM_BLOCK_HAND_OFF`: `auto` (and unset) decides the hand-off at the
-/// walk's end ([`hand_off_need`]); `off` never hands off (the parked tables
-/// stay on the host until the rule arms). Anything else is `auto`.
-fn hand_off_from_env() -> bool {
-    parse_hand_off(std::env::var("LAMBDA_VM_BLOCK_HAND_OFF").ok().as_deref())
-}
-
-fn parse_hand_off(value: Option<&str>) -> bool {
-    value.map(str::trim) != Some("off")
 }
 
 /// The `auto` rule for one committed table of `bytes` packed bytes, whether
@@ -5557,7 +5518,6 @@ fn prove_streamed(
     // the host (`always`: every one). The streamed chunks are placed first, in
     // hand-out order, so the table at block index `t` is the `t`-th chunk
     // handed out when there was one.
-    let drop_mode = block_drop()?;
     let keep_cells = block_keep_cells()?;
     let keep_below = block_keep_below()?;
     let live_regen = regen_recorder
@@ -5581,12 +5541,15 @@ fn prove_streamed(
                 regen_mode == regen::RegenMode::Always,
             )
         })
-        .map(|regen| match drop_mode {
-            DropMode::Partial => regen
+        // Once armed, it drops each table phase B can rebuild only while the
+        // policy wants it out, on what the host holds now, and purges the
+        // dropped tables' pages so the reading falls
+        // ([`multilinear_block::BlockRegen::partial`], [`DropPurges`]).
+        .map(|regen| {
+            regen
                 .partial()
                 .keep_cells(keep_cells)
-                .keep_below(keep_below),
-            DropMode::All => regen,
+                .keep_below(keep_below)
         });
     if let (Some(regen), Some(pause)) = (&live_regen, deviations.streamed_drop_delay) {
         regen.delay_drops(0, pause);
@@ -5662,7 +5625,8 @@ fn prove_streamed(
     // closed groups may wait behind one another, their cells count as
     // committed ([`group_queue::arming_cells`]). Partial drops, once armed,
     // weigh what the host holds now, and purge what they dropped.
-    let drop_purges = (drop_mode == DropMode::Partial && live_regen.is_some())
+    let drop_purges = live_regen
+        .is_some()
         .then(|| DropPurges::new(crate::alloc_purge::purge_now));
     let wanted: std::sync::Arc<multilinear_block::SpillWanted> = {
         let host_most = std::sync::Arc::clone(&host_most);
@@ -6102,9 +6066,7 @@ fn prove_streamed(
                 // The walk is done and the block's size known: when the
                 // finish's forecast passes the pressure share, live
                 // regeneration arms now, before its hump builds.
-                if let Some(spill) = walk_spill.as_ref().filter(|_| {
-                    deviations.hand_off_all || hand_off_from_env()
-                }) {
+                if let Some(spill) = walk_spill.as_ref() {
                     let hwm = HostReading::now().hwm;
                     let cycles = (window_stamps.windows as u64).saturating_mul(window as u64);
                     let need = if deviations.hand_off_all {
@@ -7673,8 +7635,8 @@ pub(crate) fn verify_block_whir_traced(
 mod memory_target_tests {
     use super::{
         CgroupValue, HostReading, MEMORY_RESERVE_PER_G, cgroup_memory, drop_wanted, hand_off_need,
-        memory_reserve_bytes, memory_short, memory_target_from, no_disk_room, parse_hand_off,
-        parse_reserve_per_g, parse_target_gib, parse_tree_drop, pressure_line, renamed_knob,
+        memory_reserve_bytes, memory_short, memory_target_from, no_disk_room, parse_reserve_per_g,
+        parse_target_gib, parse_tree_drop, pressure_line, renamed_knob,
     };
     use crate::alloc_purge::{NoDisk, has_room};
 
@@ -8008,17 +7970,6 @@ mod memory_target_tests {
         assert_eq!(parse_tree_drop(Some("4,4")), TreeDrop::uniform(4));
         assert_eq!(parse_tree_drop(Some("x")), default);
         assert_eq!(parse_tree_drop(Some("6,5,1")), default);
-    }
-
-    /// `LAMBDA_VM_BLOCK_HAND_OFF`: unset, `auto` or anything else decides at
-    /// the walk's end; `off` never hands off.
-    #[test]
-    fn the_hand_off_knob_reads_off_only() {
-        assert!(parse_hand_off(None));
-        assert!(parse_hand_off(Some("auto")));
-        assert!(parse_hand_off(Some(" on ")));
-        assert!(!parse_hand_off(Some("off")));
-        assert!(!parse_hand_off(Some(" off ")));
     }
 }
 
@@ -9175,31 +9126,12 @@ mod drop_tests {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
     use super::{
-        BLOCK_KEEP_BELOW, DROP_PURGE_BYTES, DropMode, DropPurges, HostReading, decision_bytes,
-        parse_drop, parse_keep_below, parse_keep_cells,
+        BLOCK_KEEP_BELOW, DROP_PURGE_BYTES, DropPurges, HostReading, decision_bytes,
+        parse_keep_below, parse_keep_cells,
     };
     use crate::alloc_purge::Purge;
 
     const G: u64 = 1 << 30;
-
-    /// `LAMBDA_VM_BLOCK_DROP`: unset, empty or `partial` drops only what the
-    /// policy wants out once armed (the default); `all` everything; any other
-    /// word refuses.
-    #[test]
-    fn the_drop_knob_defaults_to_partial_takes_all_and_refuses_anything_else() {
-        for (value, mode) in [
-            (None, DropMode::Partial),
-            (Some(""), DropMode::Partial),
-            (Some(" partial "), DropMode::Partial),
-            (Some("all"), DropMode::All),
-            (Some(" all "), DropMode::All),
-        ] {
-            assert_eq!(parse_drop(value).ok(), Some(mode), "{value:?}");
-        }
-        for value in ["some", "1", "on", "partly"] {
-            assert!(parse_drop(Some(value)).is_err(), "{value}");
-        }
-    }
 
     /// `LAMBDA_VM_BLOCK_KEEP_CELLS_G`: unset, empty or `off` is no keep budget
     /// (the default); a G-cell count above 0 is the budget in main cells; any
