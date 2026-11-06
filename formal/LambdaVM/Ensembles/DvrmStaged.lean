@@ -560,4 +560,274 @@ theorem dvrm_stageQuery {earlier : List (Stage (F p))}
              rcases hflags.1 with h | h <;>
                simp (config := { decide := true }) [circuit_norm, divremFlags, h] at hcls)
 
+/-- The same projection for a pull, which is the direction that carries the weight: `DVRM`'s
+three borrowed answers have to be shown *not* to be `DIVREM` messages, since that is what puts
+them in the stage finished before this one. -/
+lemma isDivrem_pulled (env : Environment (F p)) (N : ℕ) (ch : Channel (F p) Alu.Msg)
+    (mult a b c d fl e g : Expression (F p)) :
+    IsDivrem (AbstractInteraction.eval env
+      (Channel.pulledUpTo N ch mult ⟨a, b, c, d, fl, e, g⟩)).msg
+      = divremFlags.contains (Expression.eval env fl) := by
+  simp [IsDivrem, AbstractInteraction.eval, Channel.pulledUpTo, circuit_norm,
+    explicit_provable_type]
+  rw [Vector.getElem_append_right (by omega) (by omega),
+      Vector.getElem_append_right (by omega) (by omega),
+      Vector.getElem_append_right (by omega) (by omega),
+      Vector.getElem_append_right (by omega) (by omega),
+      Vector.getElem_append_left (by omega)]
+  simp
+
+/-- A push of nonzero multiplicity makes the row's `mu` nonzero, and so makes every counted pull
+of that row active. Both multiplicities are bytes, so their sum vanishes only when both do; this
+is the step that turns "this push is not suppressed" into "this row's lookups answered". -/
+lemma mu_count_of_ne_zero {a b : F p} (ha : a.val < 256) (hb : b.val < 256)
+    (h : a ≠ 0 ∨ b ≠ 0) : Channel.CountUpTo muMax (a + b) := by
+  have hsum : (a + b).val = a.val + b.val :=
+    val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+  have hne : a + b ≠ 0 := by
+    intro hz
+    rw [hz, ZMod.val_zero] at hsum
+    rcases h with h | h
+    · exact h ((ZMod.val_eq_zero a).mp (by omega))
+    · exact h ((ZMod.val_eq_zero b).mp (by omega))
+  exact Channel.countUpTo_of_val hne (by simp only [hsum, muMax]; omega)
+
+/-! The opcodes `DVRM` borrows are never `DIVREM`'s. `LT`'s is the literal `4`; `MUL`'s is
+`7 + 32 * signed + 64 * sign_q` and the same plus `128` for the high half, which with both flags
+bits gives `{7, 39, 71, 103}` and `{135, 167, 199, 231}` -- close to `{8, 40, 136, 168}` and never
+equal to it. The flags stay abstract here on purpose: inside these three lemmas `s` and `q` are
+variables, so a case split rewrites them directly, where at the use site the same terms come
+wrapped in a `ProvableStruct` projection that `simp` normalizes the other way. -/
+lemma not_isDivrem_lt {env : Environment (F p)} :
+    (!divremFlags.contains (Expression.eval env (4 : Expression (F p)))) = true := by
+  simp (config := { decide := true }) [circuit_norm, divremFlags]
+
+lemma not_isDivrem_mul {env : Environment (F p)} {s q : Expression (F p)}
+    (hs : IsBool (Expression.eval env s)) (hq : IsBool (Expression.eval env q)) :
+    (!divremFlags.contains (Expression.eval env (7 + 32 * s + 64 * q))) = true := by
+  rcases hs with h1 | h1 <;> rcases hq with h2 | h2 <;>
+    simp (config := { decide := true }) [circuit_norm, divremFlags, h1, h2]
+
+lemma not_isDivrem_mulHi {env : Environment (F p)} {s q : Expression (F p)}
+    (hs : IsBool (Expression.eval env s)) (hq : IsBool (Expression.eval env q)) :
+    (!divremFlags.contains (Expression.eval env (7 + 32 * s + 64 * q + 128))) = true := by
+  rcases hs with h1 | h1 <;> rcases hq with h2 | h2 <;>
+    simp (config := { decide := true }) [circuit_norm, divremFlags, h1, h2]
+
+/-- A whole-channel stage, read at one row: what the ensemble hands over as a fact about every
+interaction of the table becomes a fact about the operations of this row. -/
+theorem dvrm_rowChannelGuarantees {earlier : List (Stage (F p))}
+    {table : Table (F p)} (h_comp : table.component = dvrmComponent)
+    (guarantees : ∀ s ∈ earlier, table.GuaranteesOn s)
+    {row : Array (F p)} (hrow : row ∈ table.table)
+    {c : RawChannel (F p)} (hc : ({ channel := c } : Stage (F p)) ∈ earlier) :
+    dvrmComponent.rowOperations.ChannelGuarantees c (table.environment row) := by
+  have h1 : table.ChannelGuarantees c :=
+    (Table.channelGuarantees_iff_forall _ _).mpr fun j hj => guarantees _ hc j hj rfl
+  have h2 := h1 row hrow
+  rw [h_comp] at h2
+  simp only [Component.channelGuarantees_iff] at h2
+  exact h2
+
+/-- Every guarantee of one row, once its two sign flags are known to be bits.
+
+This is the step the `DIVREM` stage needs and the only place the message classes do real work.
+Twenty-nine of the thirty-three pulls are on whole-channel stages and come straight from the
+ensemble. The two pushes receive nothing, a pull guarantee being vacuous on a push. The three
+left are the `ALU` answers the chip borrows, and they are covered by the query stage exactly
+because their opcodes are not `DIVREM`'s -- which is what `hs` and `hq` are for.
+
+The three are dispatched by position rather than by `first`, because a failed `exact` on a goal
+of the form `(!divremFlags.contains e) = true` sends the unifier into `ZMod`'s decidable equality
+and costs more than the proof it was looking for. -/
+theorem dvrm_fullGuarantees {earlier : List (Stage (F p))}
+    (h_ab : ({ channel := Bitwise.AreBytes.toRaw } : Stage (F p)) ∈ earlier)
+    (h_ih : ({ channel := DVRM.IsHalfC } : Stage (F p)) ∈ earlier)
+    (h_ze : ({ channel := DVRM.ZeroC } : Stage (F p)) ∈ earlier)
+    (h_ms : ({ channel := DVRM.Msb16C } : Stage (F p)) ∈ earlier)
+    (h_q : stageQuery ∈ earlier)
+    {table : Table (F p)} (h_comp : table.component = dvrmComponent)
+    (guarantees : ∀ s ∈ earlier, table.GuaranteesOn s)
+    {row : Array (F p)} (hrow : row ∈ table.table)
+    (hs : IsBool (Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).signed))
+    (hq : IsBool (Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).signQ)) :
+    dvrmComponent.rowOperations.FullGuarantees (table.environment row) := by
+  have whole : ∀ {c : RawChannel (F p)}, ({ channel := c } : Stage (F p)) ∈ earlier →
+      dvrmComponent.rowOperations.ChannelGuarantees c (table.environment row) :=
+    fun hc => dvrm_rowChannelGuarantees h_comp guarantees hrow hc
+  have query : ∀ j ∈ dvrmComponent.rowOperations.interactions, j.channel = Alu.channelC →
+      (!IsDivrem ((j.eval (table.environment row)).msg)) = true →
+      j.Guarantees (table.environment row) := by
+    intro j hj hc1 hc2
+    have h1 := guarantees _ h_q
+    rw [Table.GuaranteesOn, Table.forall_interactionsWith_iff] at h1
+    rw [← h_comp, ← Component.interactions_eq] at hj
+    exact AbstractInteraction.eval_guarantees.mp (h1 row hrow j hj hc1 hc2)
+  intro j hj
+  have hmemj := hj
+  simp only [circuit_norm, Component.rowOperations, dvrmComponent, DVRM.circuit,
+    DVRM.elaborated, DVRM.main, areBytes, isBit, sign, neg, DVRM.word, DVRM.fill] at hj
+  repeat' rcases hj with rfl | hj
+  all_goals try (first
+    | exact whole h_ih _ hmemj rfl
+    | exact whole h_ze _ hmemj rfl
+    | exact whole h_ms _ hmemj rfl
+    | exact whole h_ab _ hmemj rfl
+    | (simp only [circuit_norm]; done))
+  -- the three borrowed answers, in the order `main` pulls them: `LT`, then `MUL` low and high
+  · exact query _ hmemj rfl (by rw [isDivrem_pulled]; exact not_isDivrem_lt)
+  · exact query _ hmemj rfl (by rw [isDivrem_pulled]; exact not_isDivrem_mul hs hq)
+  · exact query _ hmemj rfl (by rw [isDivrem_pulled]; exact not_isDivrem_mulHi hs hq)
+
+/-- Soundness at one row: its guarantees give its requirements. The two sign flags are the only
+thing the caller has to supply, and it supplies them from the chip's own constraints plus
+`ZERO`'s answer. -/
+theorem dvrm_rowRequirements {earlier : List (Stage (F p))}
+    (h_ab : ({ channel := Bitwise.AreBytes.toRaw } : Stage (F p)) ∈ earlier)
+    (h_ih : ({ channel := DVRM.IsHalfC } : Stage (F p)) ∈ earlier)
+    (h_ze : ({ channel := DVRM.ZeroC } : Stage (F p)) ∈ earlier)
+    (h_ms : ({ channel := DVRM.Msb16C } : Stage (F p)) ∈ earlier)
+    (h_q : stageQuery ∈ earlier)
+    {table : Table (F p)} (h_comp : table.component = dvrmComponent)
+    (assumptions : table.Assumptions) (constraints : table.Constraints)
+    (guarantees : ∀ s ∈ earlier, table.GuaranteesOn s)
+    {row : Array (F p)} (hrow : row ∈ table.table)
+    (hs : IsBool (Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).signed))
+    (hq : IsBool (Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).signQ)) :
+    dvrmComponent.rowOperations.FullRequirements (table.environment row) := by
+  have hc := constraints row hrow
+  rw [h_comp] at hc
+  have hca := Table.circuitAssumptions_of_assumptions _ assumptions row hrow
+  rw [h_comp] at hca
+  exact (Component.requirements_iff _).mp
+    (Component.weakSoundness hca hc
+      ((Component.guarantees_iff _).mpr
+        (dvrm_fullGuarantees h_ab h_ih h_ze h_ms h_q h_comp guarantees hrow hs hq))).2
+
+/-- `DVRM`'s obligation on the `DIVREM` class, the last stage to finish and the one its two
+pushes live in. A push owes the `ALU` guarantee whenever its multiplicity is nonzero, which is
+soundness, which needs every guarantee the row has -- including the three borrowed `ALU` answers,
+which only the query stage can supply, and only because the row's opcodes are not `DIVREM`'s.
+
+That chain is why the stage needs `mu_q` or `mu_r` nonzero to begin with. It gives `mu` nonzero,
+which makes the counted pulls active, which makes `ZERO` answer, which makes `overflow` a bit,
+which with `IS_BIT` on `signed` pins `sign_q` -- and only then are the borrowed opcodes known.
+When both multiplicities are zero the push is suppressed and there is nothing to prove. -/
+theorem dvrm_stageDivrem {earlier : List (Stage (F p))}
+    (h_ab : ({ channel := Bitwise.AreBytes.toRaw } : Stage (F p)) ∈ earlier)
+    (h_ih : ({ channel := DVRM.IsHalfC } : Stage (F p)) ∈ earlier)
+    (h_ze : ({ channel := DVRM.ZeroC } : Stage (F p)) ∈ earlier)
+    (h_ms : ({ channel := DVRM.Msb16C } : Stage (F p)) ∈ earlier)
+    (h_q : stageQuery ∈ earlier) :
+    dvrmComponent.RequirementsAfterOn stageDivrem earlier := by
+  apply requirementsAfterOn_of_rows
+  intro table h_comp assumptions constraints guarantees row hrow i hi hchan hcls
+  have gn := dvrm_rowChannelGuarantees h_comp guarantees hrow h_ab
+  have hbytes := DVRM.bytes_mu gn
+  dvrm_norm at gn
+  have hc := constraints row hrow
+  rw [h_comp, Component.constraintsHold_iff] at hc
+  simp only [Component.rowOperations, dvrmComponent, DVRM.circuit] at hc
+  have hflags := DVRM.flags_of_constraints hc
+  clear hc
+  have ovf : Channel.CountUpTo muMax
+      (Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).muQ +
+        Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).muR) →
+      IsBool (Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).overflow) :=
+    fun h => DVRM.isBool_overflow h (dvrm_rowChannelGuarantees h_comp guarantees hrow h_ze)
+  have reqOf : IsBool (Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).signed) →
+      IsBool (Expression.eval (table.environment row) (varFromOffset DVRM.Row 0).signQ) →
+      dvrmComponent.rowOperations.FullRequirements (table.environment row) :=
+    fun hs hq => dvrm_rowRequirements h_ab h_ih h_ze h_ms h_q h_comp assumptions constraints
+      guarantees hrow hs hq
+  have hmem := hi
+  simp only [stageDivrem] at hchan hcls
+  dvrm_norm at hi
+  repeat' rcases hi with rfl | hi
+  all_goals try (simp only [circuit_norm] at hchan
+                 refine absurd hchan ?_
+                 channel_ne
+                 done)
+  all_goals try (simp only [circuit_norm]
+                 exact mul_mu_count gn.1.1 gn.1.2)
+  all_goals (
+    intro hmult
+    exact (reqOf hflags.1 (DVRM.isBool_signQ hflags.1
+      (ovf (mu_count_of_ne_zero hbytes.1 hbytes.2
+        (by first | exact Or.inl hmult | exact Or.inr hmult))) hflags.2) _ hmem) hmult)
+
+/-- DVRM's nine obligations. Five stages are buses it does not require. `IS_HALF` and `ZERO` are
+counted pulls, bounded by `ARE_BYTES` and, for the sign flags `NEG` pulls under, by `MSB16`. The
+two that carry the weight are the `ALU` stages, and they are why the bus is split: the queries
+DVRM borrows finish first, and the `DIVREM` answers it pushes finish last. -/
+theorem dvrm_staged : dvrmComponent.StagedRequirementsOn finished := by
+  have counted : ∀ {c : RawChannel (F p)} {ecs : List (RawChannel (F p))},
+      dvrmComponent.RequirementsAfter c ecs →
+      ∀ {earlier : List (Stage (F p))},
+      (∀ c' ∈ ecs, ({ channel := c' } : Stage (F p)) ∈ earlier) →
+      dvrmComponent.RequirementsAfterOn { channel := c } earlier := by
+    intro c ecs h earlier hmem
+    exact Component.requirementsAfterOn_of_requirementsAfter h
+      fun c' hc' => ⟨_, hmem c' hc', rfl, fun _ => rfl⟩
+  refine ⟨dvrm_stageDivrem (by simp) (by simp) (by simp) (by simp) (by simp),
+    dvrm_stageQuery (by simp),
+    counted (dvrm_requirementsAfter_zero
+      (earlier := [Bitwise.AreBytes.toRaw, DVRM.Msb16C]) (by simp) (by simp)) (by simp),
+    ?_, ?_,
+    counted (dvrm_requirementsAfter_isHalf
+      (earlier := [Bitwise.AreBytes.toRaw]) (by simp)) (by simp),
+    ?_, ?_, ?_, trivial⟩
+  all_goals
+    refine Component.requirementsAfterOn_of_not_mem _ ?_
+    simp only [dvrmComponent_requirements, DVRM.AluC, DVRM.IsHalfC, DVRM.ZeroC,
+      List.mem_cons, List.not_mem_nil, or_false, not_or]
+    and_intros <;> channel_ne
+
+/-- Every table of the ensemble meets its spec.
+
+This is the first use of `Ensemble.tableSoundness_of_stagedOn` anywhere: ordering whole channels
+cannot hold this ensemble, because `DVRM` both pulls from `ALU` and pushes to it, so the bus
+would have to be finished before itself. Splitting it by message class breaks the cycle, and
+nothing else in the model needed that until `DVRM` arrived. -/
+theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
+  apply Ensemble.tableSoundness_of_stagedOn finished rfl finished_channels covered consistent
+  intro component h
+  simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at h
+  rcases h with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+  · exact stagedRequirementsOn_of_no_guarantees
+      (pushStaticComponent_channelsWithGuarantees _) _
+  iterate 4
+    exact stagedRequirementsOn_of_no_guarantees
+      (countedPushStaticComponent_channelsWithGuarantees _) _
+  · exact lt_staged
+  · exact mul_staged
+  · exact dvrm_staged
+
+/-- Table soundness, concretely: if the constraints of every table hold, every channel has few
+enough interactions for the balance check, and every channel balances, then every `DVRM` row
+means what the chip says it means -- the quotient and remainder of its two operands, signed or
+unsigned, with the division-by-zero and overflow cases the spec names.
+
+The eight components assume nothing, so the ensemble's `Assumptions` are free. -/
+theorem dvrm_rows_correct
+    (witness : EnsembleWitness ensemble)
+    (hc : witness.Constraints) (hfit : witness.InteractionsFit (Balance.logUpUpTo muMax))
+    (hb : witness.Balanced (Balance.logUpUpTo muMax)) :
+    ∀ table ∈ witness.tables, table.component = dvrmComponent →
+      ∀ row ∈ table.table, DVRM.RowSpec (valueFromOffset DVRM.Row 0 (table.environment row)) := by
+  have hassume : witness.Assumptions := by
+    intro table htable row _
+    have hmem := witness.component_mem_tables_of_mem htable
+    simp only [ensemble, circuit_norm, List.mem_cons, List.not_mem_nil, or_false] at hmem
+    obtain ⟨comp, tbl, data, uw, ll, frm, dc⟩ := table
+    simp only at hmem
+    rcases hmem with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> trivial
+  have hspec := (tableSoundness witness hassume hc hfit hb).2
+  intro table htable hcomp row hrow
+  have := hspec table htable row hrow
+  obtain ⟨comp, tbl, data, uw, ll, frm, dc⟩ := table
+  simp only at hcomp
+  subst hcomp
+  exact this
+
 end LambdaVM.Ensembles.DvrmStaged

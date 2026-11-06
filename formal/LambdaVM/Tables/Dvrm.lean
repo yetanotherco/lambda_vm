@@ -1471,6 +1471,35 @@ theorem flags_of_constraints {env : Environment (F p)} {input : Var Row (F p)} {
   obtain ⟨hs,-,-,-,-,-,hq,-,-,-,-,-,-,-,-,-,-,-,-⟩ := hc
   exact ⟨mul_one_sub_eq_zero_iff.mp hs, hq⟩
 
+/-- The row's two multiplicities are bytes, which is the chip's own `ARE_BYTES` pull saying so.
+Stated here, in the chip's own spelling, so an ensemble can feed it to the counting lemmas
+without first normalizing a thirty-three-fold conjunction. -/
+theorem bytes_mu {env : Environment (F p)} {input : Var Row (F p)} {offset : ℕ}
+    (g : ((main input).operations offset).ChannelGuarantees Bitwise.AreBytes.toRaw env) :
+    (Expression.eval env input.muQ).val < 256 ∧ (Expression.eval env input.muR).val < 256 := by
+  simp only [circuit_norm, main, isBit, sign, neg, areBytes, Bitwise.AreBytes,
+    Bitwise.areBytesTable, StaticLookupChannel.toChannel, forall_eq_or_imp, forall_eq] at g
+  exact g.1
+
+/-- The quotient's sign is a bit once `overflow` is one, which is what `ZERO` says. -/
+lemma isBool_signQ {signed overflow signQ : F p} (hb : IsBool signed) (ho : IsBool overflow)
+    (h : signed * (1 - overflow) - signQ = 0) : IsBool signQ := by
+  have hq : signQ = signed * (1 - overflow) := by linear_combination -h
+  rcases hb with rfl | rfl <;> rcases ho with rfl | rfl <;> rw [hq] <;> simp [IsBool]
+
+/-- `overflow` is a bit, which the chip never says: it is the answer `ZERO` returned, and the
+answer only arrives when the pull is active, which is what `hmu` carries. The `obtain` reads the
+thirty-three pulls in the order `main` emits them, where the overflow check is the fifteenth. -/
+theorem isBool_overflow {env : Environment (F p)} {input : Var Row (F p)} {offset : ℕ}
+    (hmu : Channel.CountUpTo muMax
+      (Expression.eval env input.muQ + Expression.eval env input.muR))
+    (g : ((main input).operations offset).ChannelGuarantees ZeroC env) :
+    IsBool (Expression.eval env input.overflow) := by
+  simp only [circuit_norm, main, isBit, sign, neg, ZeroC, Bitwise.Zero,
+    StaticLookupChannel.toChannel, forall_eq_or_imp, forall_eq] at g
+  obtain ⟨-,-,-,-,-,-,-,-,-,-,-,-,-,-,gov,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-⟩ := g
+  exact Bitwise.isBool_of_zero (gov hmu)
+
 /-- A sign flag is a bit: zero on an unsigned row by the chip's own constraint, and otherwise the
 top bit `MSB16` returned. -/
 lemma isBool_sign {signed x s : F p} (hb : IsBool signed) (hz : (1 - signed) * s = 0)
