@@ -1,0 +1,217 @@
+module
+
+public import LambdaVM.Tables.Lt
+public import LambdaVM.Tables.Mul
+public import LambdaVM.Tables.Dvrm
+public import LambdaVM.Ensembles.EqLookup
+public import LambdaVM.Buses.Canonical
+public import Clean.Air.StagedChannels
+
+@[expose] public section
+
+/-!
+# The DVRM ensemble
+
+Eight components: the five providers of the static lookups DVRM's dependency cone needs, and
+the three chips LT, MUL and DVRM.
+
+DVRM is the first chip that both receives and owes on the same bus. It pulls `ALU` three times,
+once for a `LT` comparison (`|r| < |d|`) and twice for `MUL` products (`d·q = n − r`), and pushes
+`ALU` twice with its own `DIVREM` results. Ordering whole channels cannot express that: `ALU`
+would have to be finished both before and after DVRM. Ordering *stages* can, a stage being a
+channel together with a class of its messages, so the `DIVREM` messages are finished after the
+`LT` and `MUL` ones. That is what `Ensemble.tableSoundness_of_stagedOn` is for, and this is its
+only user in either repo.
+
+The two classes are read off the `flags` field of the message, which carries the `alu_op`
+descriptor: `opselDIVREM = 8` for what DVRM pushes, `opselLT = 4` and `opselMUL = 7` for what it
+pulls.
+-/
+
+namespace LambdaVM.Ensembles.DvrmStaged
+open Air.Flat
+
+instance : NeZero Bitwise.areBytesTable.table.length :=
+  ⟨by simp [Bitwise.areBytesTable, Bitwise.rows, Bitwise.numRows]⟩
+instance : NeZero Bitwise.msb16Table.table.length :=
+  ⟨by simp [Bitwise.msb16Table, Bitwise.rows, Bitwise.numRows]⟩
+instance : NeZero Bitwise.isB20Table.table.length :=
+  ⟨by simp [Bitwise.isB20Table, Bitwise.rows, Bitwise.numRows]⟩
+
+/-- Witness generation is not what this ensemble is about; every chip answers the demand on the
+bus it pushes. -/
+def demandOnAlu (Input : TypeMap) [ProvableType Input] : WitnessGeneration.Generation (F p) Input :=
+  .demand {
+    channel := Alu.channel
+    trigger := .pull
+    input _ := pure (fromElements (Vector.replicate (size Input) .multiplicity)) }
+
+def ltComponent : Component (F p) where
+  circuit := LT.circuit
+  generation := demandOnAlu _
+
+def mulComponent : Component (F p) where
+  circuit := MUL.circuit
+  generation := demandOnAlu _
+
+def dvrmComponent : Component (F p) where
+  circuit := DVRM.circuit
+  generation := demandOnAlu _
+
+@[circuit_norm] lemma ltComponent_circuit : ltComponent.circuit = LT.circuit := rfl
+@[circuit_norm] lemma mulComponent_circuit : mulComponent.circuit = MUL.circuit := rfl
+@[circuit_norm] lemma dvrmComponent_circuit : dvrmComponent.circuit = DVRM.circuit := rfl
+
+@[circuit_norm] lemma lt_name : LT.circuit.name = "LT" := rfl
+@[circuit_norm] lemma mul_name : MUL.circuit.name = "MUL" := rfl
+@[circuit_norm] lemma dvrm_name : DVRM.circuit.name = "DVRM" := rfl
+@[circuit_norm] lemma msb16Table_name : Bitwise.msb16Table.name = "MSB16" := rfl
+@[circuit_norm] lemma isB20Table_name : Bitwise.isB20Table.name = "IS_B20" := rfl
+@[circuit_norm] lemma areBytesTable_name : Bitwise.areBytesTable.name = "ARE_BYTES" := rfl
+
+@[circuit_norm] lemma ltComponent_guarantees :
+    ltComponent.circuit.channelsWithGuarantees = [Bitwise.AreBytes.toRaw, LT.IsHalfC, LT.IsHalfC,
+      LT.Msb16C, LT.Msb16C, LT.IsHalfC, LT.IsHalfC, LT.IsHalfC, LT.IsHalfC] := rfl
+@[circuit_norm] lemma ltComponent_requirements :
+    ltComponent.circuit.channelsWithRequirements = [Alu.channelC, LT.IsHalfC, LT.Msb16C] := rfl
+@[circuit_norm] lemma mulComponent_requirements :
+    mulComponent.circuit.channelsWithRequirements =
+      [Alu.channelC, MUL.IsHalfC, MUL.IsB20C, MUL.Msb16C, Bitwise.AreBytes.toRaw] := rfl
+@[circuit_norm] lemma dvrmComponent_requirements :
+    dvrmComponent.circuit.channelsWithRequirements =
+      [DVRM.AluC, DVRM.IsHalfC, DVRM.ZeroC, DVRM.Msb16C, Bitwise.AreBytes.toRaw] := rfl
+
+def ensemble : Ensemble (F p) unit where
+  tables :=
+    [ pushStaticComponent Bitwise.areBytesTable
+    , countedPushStaticComponent Bitwise.isHalfTable
+    , countedPushStaticComponent Bitwise.msb16Table
+    , countedPushStaticComponent Bitwise.isB20Table
+    , countedPushStaticComponent Bitwise.zeroTable
+    , ltComponent, mulComponent, dvrmComponent ]
+  unique_names := by
+    simp [circuit_norm, pushStaticComponent, countedPushStaticComponent, pushStatic,
+      countedPushStatic, ltComponent, mulComponent, dvrmComponent, LT.circuit, MUL.circuit,
+      DVRM.circuit, Bitwise.areBytesTable, Bitwise.isHalfTable, Bitwise.msb16Table,
+      Bitwise.isB20Table, Bitwise.zeroTable]
+  -- the model's bus list, which is what `Buses/Canonical.lean` checks the chips against. Two
+  -- of its eight, `BYTE_ALU` and `HWSL`, are not touched here; a channel with no interaction
+  -- balances for free, and `finished` only has to be a subset.
+  channels := Buses.modelChannels
+  unique_channel_names := Buses.modelChannels_unique_names
+  -- the three chips are exactly what `model_channels_agree` says; the five providers push one
+  -- bus each and pull none
+  tables_channels := by
+    intro table h
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at h
+    obtain ⟨hlt, -, -, -, hmul, hdvrm⟩ := Buses.model_channels_agree
+    rcases h with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+    -- the five providers push one bus each and pull none
+    iterate 5
+      simp only [GeneralFormalCircuit.channels, pushStaticComponent_channelsWithGuarantees,
+        pushStaticComponent_channelsWithRequirements,
+        countedPushStaticComponent_channelsWithGuarantees,
+        countedPushStaticComponent_channelsWithRequirements]
+      simp [Buses.modelChannels]
+    -- the three chips are what the guard already checked
+    · exact hlt
+    · exact hmul
+    · exact hdvrm
+  verifier_channels := by simp [circuit_norm]
+
+/-! ## The two classes of `ALU` messages
+
+An `Alu.Msg` is seven field elements and `flags` is the fifth, so the class is read off
+`msg[4]`. DVRM pushes `opselDIVREM + 32 * signed`, and the same again `+ 128` for the
+remainder half, which is four values. LT pushes `opselLT + 32 * signed + 64 * invert` and MUL
+`opselMUL + 32 * lhsSigned + 64 * rhsSigned (+ 128)`, none of which are among them. -/
+
+/-- The four flag bytes DVRM writes. -/
+def divremFlags : List (F p) := [8, 40, 136, 168]
+
+/-- The `DIVREM` class: what DVRM pushes. -/
+def IsDivrem (msg : Array (F p)) : Bool := divremFlags.contains (msg.getD 4 0)
+
+/-- What DVRM pushes, finished last. -/
+def stageDivrem : Stage (F p) := { channel := Alu.channelC, cls := IsDivrem }
+
+/-- What DVRM pulls: the `LT` and `MUL` results, finished before it. -/
+def stageQuery : Stage (F p) := { channel := Alu.channelC, cls := fun msg => !IsDivrem msg }
+
+/-- Finishing order, newest first. The `ALU` bus is split in two, which is the whole point:
+DVRM receives on `stageQuery` and owes on `stageDivrem`, so one has to come after the other
+and a whole-channel order cannot say that. -/
+def finished : List (Stage (F p)) :=
+  [ stageDivrem
+  , stageQuery
+  , { channel := Bitwise.Zero.counted muMax }
+  , { channel := Bitwise.IsB20.counted muMax }
+  , { channel := Bitwise.Msb16.counted muMax }
+  , { channel := Bitwise.IsHalf.counted muMax }
+  , { channel := Bitwise.ByteAlu.counted muMax }
+  , { channel := Bitwise.Hwsl.toRaw }
+  , { channel := Bitwise.AreBytes.toRaw } ]
+
+theorem finished_channels : ∀ s ∈ finished, s.channel ∈ ensemble.channels := by
+  intro s hs
+  simp only [finished, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+    simp [ensemble, Buses.modelChannels, stageDivrem, stageQuery]
+
+theorem consistent : ∀ s ∈ finished,
+    s.channel.ConsistentUpTo (Balance.logUpUpTo (F := F p) muMax).pullBound := by
+  intro s hs
+  simp only [finished, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+    first
+      | exact inferInstance
+      | (show (Alu.channelC : RawChannel (F p)).ConsistentUpTo _; exact inferInstance)
+
+/-- Every bus of the model is the channel of a finished stage, and `ALU` of two whose classes
+between them hold every message. `BYTE_ALU` and `HWSL` are here only so that this reads off
+`modelChannels` rather than off a hand-written list of what each chip receives on: the guard
+already proved the chips stay inside that list, and those two are the entries no chip of this
+ensemble touches. -/
+theorem modelChannel_covered (c : RawChannel (F p)) (hc : c ∈ Buses.modelChannels)
+    (msg : Array (F p)) : ∃ s ∈ finished, s.channel = c ∧ s.cls msg := by
+  simp only [Buses.modelChannels, List.mem_cons, List.not_mem_nil, or_false] at hc
+  rcases hc with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+  · -- `ALU`: a message is `DIVREM` or it is not, and there is a stage for each
+    by_cases h : IsDivrem msg
+    · exact ⟨stageDivrem, by simp [finished], rfl, h⟩
+    · exact ⟨stageQuery, by simp [finished], rfl, by simp [stageQuery, h]⟩
+  -- the rest are whole-channel stages, in the order `modelChannels` lists them
+  · exact ⟨{ channel := Bitwise.AreBytes.toRaw }, by simp [finished], rfl, rfl⟩
+  · exact ⟨{ channel := Bitwise.ByteAlu.counted muMax }, by simp [finished], rfl, rfl⟩
+  · exact ⟨{ channel := Bitwise.Hwsl.toRaw }, by simp [finished], rfl, rfl⟩
+  · exact ⟨{ channel := Bitwise.IsB20.counted muMax }, by simp [finished], rfl, rfl⟩
+  · exact ⟨{ channel := Bitwise.IsHalf.counted muMax }, by simp [finished], rfl, rfl⟩
+  · exact ⟨{ channel := Bitwise.Msb16.counted muMax }, by simp [finished], rfl, rfl⟩
+  · exact ⟨{ channel := Bitwise.Zero.counted muMax }, by simp [finished], rfl, rfl⟩
+
+/-- Every pull of every table lands in a finished stage. This is `tables_channels` composed
+with the covering above, so it costs nothing beyond what the guard already proved: no list of
+what each chip receives on is written out here. -/
+theorem covered : ∀ component ∈ ensemble.tables,
+    ∀ c ∈ component.circuit.channelsWithGuarantees, ∀ msg,
+      ∃ s ∈ finished, s.channel = c ∧ s.cls msg := by
+  intro component h c hc msg
+  refine modelChannel_covered c ?_ msg
+  exact ensemble.tables_channels component h (List.mem_append_left _ hc)
+
+/-! ## Staged requirements
+
+`Component.StagedRequirementsOn` walks the finishing order and asks, at each stage, that the
+component's requirements there follow from its guarantees on everything finished before. -/
+
+/-- A component that receives no guarantee owes nothing anywhere: its requirements are already
+unconditional. That is the five providers, which push their table and pull nothing. -/
+theorem stagedRequirementsOn_of_no_guarantees {component : Component (F p)}
+    (h : component.circuit.channelsWithGuarantees = []) :
+    ∀ stages : List (Stage (F p)), component.StagedRequirementsOn stages
+  | [] => trivial
+  | _ :: rest =>
+    ⟨Component.requirementsAfterOn_of_guarantees_subset (by simp [h]),
+     stagedRequirementsOn_of_no_guarantees h rest⟩
+
+end LambdaVM.Ensembles.DvrmStaged

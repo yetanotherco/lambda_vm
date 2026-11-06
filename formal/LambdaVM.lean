@@ -22,3 +22,4 @@ public import LambdaVM.Tables.Dvrm
 public import LambdaVM.Ensembles.EqLookup
 public import LambdaVM.Ensembles.LtStaged
 public import LambdaVM.Buses.Canonical
+public import LambdaVM.Ensembles.DvrmStaged
