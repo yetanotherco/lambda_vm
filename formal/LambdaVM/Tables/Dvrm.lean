@@ -1407,6 +1407,30 @@ theorem requirementsChannelsLawful_of_shallowChannels_subset {F : Type} [FiniteF
   rw [Operations.shallowChannels_eq_interactions_map]
   exact List.mem_map.mpr ⟨i, hi, rfl⟩
 
+/-- The same, for a declared list that need not hold every channel the circuit touches. A
+channel left out has to be one the circuit receives on, and its interactions have to meet their
+requirement here rather than at an ensemble.
+
+This is what lets a chip stop deferring a bus whose requirement is unconditional. It matters
+because the bus that bounds every counted multiplicity, `ARE_BYTES`, has to finish first in any
+ensemble, and whatever declares a requirement on it would have to discharge that with nothing
+finished before -- which only soundness can do, and soundness wants every guarantee the chip
+has. A chip that defers `ARE_BYTES` can therefore not sit in such an ensemble at all. -/
+theorem requirementsChannelsLawful_of_cover {F : Type} [FiniteField F]
+    {ops : Operations F} {guarantees requirements : List (RawChannel F)}
+    (h_subcircuits : ops.subcircuitChannelsWithRequirements ⊆ requirements)
+    (h_cover : ∀ channel ∈ ops.shallowChannels,
+      channel ∈ guarantees ∨ channel ∈ requirements)
+    (h_local : ∀ env, ConstraintsHold.Shallow env ops →
+      ∀ i ∈ ops.shallowInteractions, i.channel ∉ requirements → i.Requirements env) :
+    ops.RequirementsChannelsLawful guarantees requirements := by
+  refine ⟨h_subcircuits, h_cover, fun env hc => ?_⟩
+  rw [Operations.inChannelsOrRequirements_iff_forall_mem]
+  intro i hi
+  by_cases h : i.channel ∈ requirements
+  · exact Or.inl h
+  · exact Or.inr (h_local env hc i hi h)
+
 /-- The chip touches seven raw channels. `pullUpTo` puts the range checks and the three borrowed
 `ALU` messages on the *counted* channels `IsHalfC`, `ZeroC` and `AluC`, while `Channel.pushIf`
 (the two `DIVREM` pushes) and `Channel.pullIf` (the `ZERO` pulls inlined from `neg`, and the
