@@ -1,33 +1,36 @@
-//! Host memory the card reads at DMA speed: jemalloc arenas whose pages are
-//! page-locked, for the buffers a group's upload reads.
+//! Host memory the card reads at DMA speed: a pool of page-locked memory,
+//! locked once before any prove, and jemalloc arenas that hand it out for the
+//! buffers a group's upload reads.
 //!
 //! A copy from pageable memory crosses the driver's own staging buffer on the
-//! calling thread: on a block's commit that is ≈ 4 GB/s, and a group's upload
-//! takes longer than the commit beside it. From page-locked memory the same
-//! copy is a DMA the call only queues. A buffer page-locked after it is written
-//! pays the lock and the unlock on every use; here the memory is locked once,
-//! when an arena of ours takes it from the system, and jemalloc hands it out
-//! again and again.
+//! calling thread, and on a block's commit it takes longer than the commit
+//! beside it. From page-locked memory the same copy is a DMA the call only
+//! queues. Locking memory is serialized across the process and holds every
+//! other thread's driver calls while it runs, so it is done once, up front
+//! ([`lock_pool`]), and never while a prove runs: the arenas hand out the pool
+//! and, once it is spent, plain pageable memory, which is slower and never
+//! wrong.
 //!
-//! With `LAMBDA_VM_PINNED_PRODUCER=1` (read once; off by default), a producer
-//! allocates a buffer the card will read inside [`scope`]: the thread is bound
-//! to one of [`ARENAS`] arenas of ours for that allocation alone, and the
-//! buffer is an ordinary allocation of the global allocator, freed the same
-//! way. Under another global allocator the binding moves nothing. Only
-//! allocations of at least [`MIN_BYTES`] bind, above the thread cache, so no
-//! small block of ours is handed to code outside a scope.
+//! With `LAMBDA_VM_PINNED_POOL_GIB=<n>` (read once; unset or 0 is off) and the
+//! pool locked, a producer allocates a buffer the card will read inside
+//! [`scope`]: the thread is bound to one of [`ARENAS`] arenas of ours for that
+//! allocation alone, and the buffer is an ordinary allocation of the global
+//! allocator, freed the same way. Under another global allocator the binding
+//! moves nothing. Only allocations of at least [`MIN_BYTES`] bind, above the
+//! thread cache, so no small block of ours is handed to code outside a scope.
 //!
-//! The arenas' hooks take each extent from jemalloc's default hooks, touch its
-//! pages and page-lock it before jemalloc hands any of it out. They never
-//! purge, decommit or unmap it, and never merge two extents locked apart. They
-//! allocate nothing (their bookkeeping is atomics in statics), so jemalloc is
-//! never re-entered. Page-locking needs the CUDA context: an extent taken
-//! before the backend is up stays pageable, which is slower, never wrong.
+//! The arenas' hooks carve each extent from the pool, or take it from
+//! jemalloc's default hooks once the pool is spent. They never purge,
+//! decommit or unmap an extent, and never merge two extents that lie in
+//! different pieces of the pool (each piece is locked apart). They allocate
+//! nothing and lock nothing (their bookkeeping is atomics in statics), so
+//! jemalloc is never re-entered and no driver call waits on them.
 //!
 //! A copy from or into page-locked memory returns before the DMA ends, where
 //! one through pageable memory returns after it. The buffers made here are
 //! read on the card only by a group's upload, which synchronizes its stream
-//! before it returns.
+//! before it returns. Their pages must never be handed back to the OS
+//! (`madvise`) while locked: a caller that would checks [`is_pinned`] first.
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -44,39 +47,50 @@ pub const ARENAS: usize = 8;
 /// The smallest allocation that binds: above any thread cache.
 pub const MIN_BYTES: usize = 1 << 20;
 
-/// The most an arena takes from the system at once (`retain_grow_limit`): one
-/// page-lock stays short, and an arena holds at most this much it has not
-/// handed out.
-pub const GROW_LIMIT: usize = 256 << 20;
+/// The most an arena asks of its hooks at once (`retain_grow_limit`): what a
+/// piece can lose at its end to a request that does not fit.
+pub const GROW_LIMIT: usize = 64 << 20;
 
-/// The extents the hooks keep track of; past this many, an extent is left
-/// pageable (at [`GROW_LIMIT`] each that is terabytes).
+/// The pool is locked a piece at a time; an extent never spans two pieces.
+pub const PIECE: usize = 1 << 30;
+
+/// The extents the hooks keep track of; past this many, an extent the
+/// default hooks made is not recorded (and can merge with nothing).
 const MAX_CHUNKS: usize = 1 << 14;
 
-/// Whether producers allocate inside the arenas: `LAMBDA_VM_PINNED_PRODUCER=1`.
+/// The pool's size, `LAMBDA_VM_PINNED_POOL_GIB` GiB; 0 is off.
+pub fn pool_gib() -> usize {
+    *POOL_GIB.get_or_init(|| {
+        std::env::var("LAMBDA_VM_PINNED_POOL_GIB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+static POOL_GIB: OnceLock<usize> = OnceLock::new();
+
+/// Whether the pool is asked for.
 pub fn enabled() -> bool {
-    *ENABLED
-        .get_or_init(|| std::env::var("LAMBDA_VM_PINNED_PRODUCER").is_ok_and(|v| v.trim() == "1"))
+    pool_gib() > 0
 }
 
-static ENABLED: OnceLock<bool> = OnceLock::new();
-
-/// Turns the arenas on in a test process that has not read the knob yet;
-/// whether they are on.
+/// Sets the pool's size in a test process that has not read the knob yet;
+/// the size it has.
 #[doc(hidden)]
-pub fn enable_for_tests() -> bool {
-    let _ = ENABLED.set(true);
-    enabled()
+pub fn set_pool_gib_for_tests(gib: usize) -> usize {
+    let _ = POOL_GIB.set(gib);
+    pool_gib()
 }
 
-/// Whether an allocation of `bytes` binds, with the knob `on`.
-fn binds(bytes: usize, on: bool) -> bool {
-    on && bytes >= MIN_BYTES
+/// Whether an allocation of `bytes` binds, with the pool `ready`.
+fn binds(bytes: usize, ready: bool) -> bool {
+    ready && bytes >= MIN_BYTES
 }
 
 /// A thread bound to one of the arenas until it drops; the thread's own arena
-/// again after. Inert when the allocation is small, the knob is off or the
-/// arenas could not be made.
+/// again after. Inert when the allocation is small, the pool is not locked or
+/// the arenas could not be made.
 #[must_use]
 pub struct Scope(Option<u32>);
 
@@ -90,10 +104,9 @@ impl Drop for Scope {
 
 /// Binds this thread to one of the arenas for an allocation of `bytes`.
 pub fn scope(bytes: usize) -> Scope {
-    if !binds(bytes, enabled()) {
+    if !binds(bytes, POOL_READY.load(Ordering::Acquire)) {
         return Scope(None);
     }
-    warm();
     let Some(arenas) = arenas() else {
         return Scope(None);
     };
@@ -102,21 +115,28 @@ pub fn scope(bytes: usize) -> Scope {
     }
     let mine = arenas.ids[thread_slot() % ARENAS];
     match thread_arena() {
-        Some(previous) if set_thread_arena(mine) => Scope(Some(previous)),
+        Some(previous) if set_thread_arena(mine) => {
+            let now = PENDING.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+            PENDING_MOST.fetch_max(now, Ordering::Relaxed);
+            Scope(Some(previous))
+        }
         _ => Scope(None),
     }
 }
 
 /// `bytes` from `ptr` going to the card: counted, and counted as page-locked
-/// when they lie in one locked extent.
+/// when they lie in the pool.
 pub fn note_upload(ptr: *const u8, bytes: usize) {
     UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-    if enabled() && is_pinned(ptr, bytes) {
+    if POOL_READY.load(Ordering::Acquire) && is_pinned(ptr, bytes) {
         UPLOAD_PINNED.fetch_add(bytes as u64, Ordering::Relaxed);
+        let _ = PENDING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| {
+            Some(p.saturating_sub(bytes as u64))
+        });
     }
 }
 
-/// Whether `bytes` from `ptr` lie in one extent the hooks page-locked.
+/// Whether `bytes` from `ptr` lie in one locked piece of the pool.
 pub fn is_pinned(ptr: *const u8, bytes: usize) -> bool {
     let at = ptr as usize;
     chunk_of(at).is_some_and(|k| {
@@ -137,46 +157,156 @@ pub fn driver_has_locked(ptr: *const u8) -> bool {
     }
 }
 
-/// What the arenas did so far in this process.
+/// What locking the pool took ([`lock_pool`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoolLocked {
+    /// Bytes asked for, and bytes of the pieces the driver locked.
+    pub bytes: u64,
+    pub locked: u64,
+    pub pieces: usize,
+    /// Pieces the driver refused (left pageable).
+    pub refused: usize,
+    /// Wall seconds, mapping and locking.
+    pub seconds: f64,
+}
+
+/// Locks the pool, once: `LAMBDA_VM_PINNED_POOL_GIB` GiB of fresh memory,
+/// locked a [`PIECE`] at a time (the driver faults the pages in as it locks
+/// them). `None` when the knob is off, the card is not up, or the pool was
+/// locked already. Call it before any prove: while it runs, every other
+/// thread's driver calls wait.
+pub fn lock_pool() -> Option<PoolLocked> {
+    let gib = pool_gib();
+    if gib == 0 || POOL_TRIED.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    if LOCK.load(Ordering::Acquire) == 0 {
+        let backend = crate::device::backend().ok()?;
+        let context = backend.ctx.cu_ctx();
+        // SAFETY: the context is the backend's, alive for the process.
+        if unsafe { sys::cuCtxSetCurrent(context) } != sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        CONTEXT.store(context, Ordering::Release);
+    }
+    let t = Instant::now();
+    let bytes = gib.checked_mul(1 << 30)?;
+    let layout = std::alloc::Layout::from_size_align(bytes, 2 << 20).ok()?;
+    // SAFETY: a non-zero size; the pool is never freed (its pieces stay locked
+    // and handed out for the process's life).
+    let base = unsafe { std::alloc::alloc(layout) };
+    if base.is_null() {
+        return None;
+    }
+    let mut report = PoolLocked {
+        bytes: bytes as u64,
+        ..PoolLocked::default()
+    };
+    for at in (0..bytes).step_by(PIECE) {
+        let len = PIECE.min(bytes - at);
+        // SAFETY: inside the pool's allocation.
+        let piece = unsafe { base.add(at) };
+        let locked = lock(piece, len);
+        let k = NCHUNKS.fetch_add(1, Ordering::AcqRel);
+        if k < MAX_CHUNKS {
+            let chunk = &CHUNKS[k];
+            chunk.base.store(piece as usize, Ordering::Relaxed);
+            chunk.len.store(len, Ordering::Relaxed);
+            chunk.pinned.store(locked, Ordering::Relaxed);
+            chunk.pool.store(true, Ordering::Relaxed);
+            chunk.ready.store(true, Ordering::Release);
+        }
+        report.pieces += 1;
+        if locked {
+            report.locked += len as u64;
+        } else {
+            report.refused += 1;
+        }
+    }
+    report.seconds = t.elapsed().as_secs_f64();
+    POOL_BASE.store(base as usize, Ordering::Relaxed);
+    POOL_LEN.store(bytes, Ordering::Relaxed);
+    POOL_LOCKED.store(report.locked, Ordering::Relaxed);
+    LOCK_NANOS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    POOL_READY.store(true, Ordering::Release);
+    Some(report)
+}
+
+static POOL_TRIED: AtomicBool = AtomicBool::new(false);
+static POOL_READY: AtomicBool = AtomicBool::new(false);
+static POOL_BASE: AtomicUsize = AtomicUsize::new(0);
+static POOL_LEN: AtomicUsize = AtomicUsize::new(0);
+/// Bytes of the pool handed out so far: it is handed out front to back, once.
+static CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+/// What the pool did so far in this process.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
-    /// Extents page-locked, and their bytes.
-    pub chunks: u64,
-    pub pinned_bytes: u64,
-    /// Extents left pageable (taken before the backend was up, or refused),
-    /// and how many the driver refused.
-    pub pageable_bytes: u64,
-    pub refused: u64,
-    /// Seconds in the hooks: touching the pages and locking them, and the
-    /// locking alone.
-    pub hook_seconds: f64,
+    /// The pool's bytes, and those the driver locked.
+    pub pool_bytes: u64,
+    pub locked_bytes: u64,
+    /// Seconds locking it took.
     pub lock_seconds: f64,
-    /// Bytes [`note_upload`] saw, and how many of them were page-locked.
+    /// Bytes of the pool the arenas took, and bytes they took from the default
+    /// hooks once it was spent (pageable).
+    pub carved_bytes: u64,
+    pub spilled_bytes: u64,
+    /// Bytes [`note_upload`] saw, and how many of them came from the pool.
     pub upload_bytes: u64,
     pub upload_pinned: u64,
+    /// The most bytes allocated in a scope and not yet uploaded at once: about
+    /// what a pool that is reused after each upload would have to hold.
+    pub pending_most: u64,
 }
 
 pub fn stats() -> Stats {
     Stats {
-        chunks: PINNED_CHUNKS.load(Ordering::Relaxed),
-        pinned_bytes: PINNED_BYTES.load(Ordering::Relaxed),
-        pageable_bytes: PAGEABLE_BYTES.load(Ordering::Relaxed),
-        refused: REFUSED.load(Ordering::Relaxed),
-        hook_seconds: HOOK_NANOS.load(Ordering::Relaxed) as f64 * 1e-9,
+        pool_bytes: POOL_LEN.load(Ordering::Relaxed) as u64,
+        locked_bytes: POOL_LOCKED.load(Ordering::Relaxed),
         lock_seconds: LOCK_NANOS.load(Ordering::Relaxed) as f64 * 1e-9,
+        carved_bytes: CURSOR.load(Ordering::Relaxed) as u64,
+        spilled_bytes: SPILLED_BYTES.load(Ordering::Relaxed),
         upload_bytes: UPLOAD_BYTES.load(Ordering::Relaxed),
         upload_pinned: UPLOAD_PINNED.load(Ordering::Relaxed),
+        pending_most: PENDING_MOST.load(Ordering::Relaxed),
     }
 }
 
-static PINNED_CHUNKS: AtomicU64 = AtomicU64::new(0);
-static PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
-static PAGEABLE_BYTES: AtomicU64 = AtomicU64::new(0);
-static REFUSED: AtomicU64 = AtomicU64::new(0);
-static HOOK_NANOS: AtomicU64 = AtomicU64::new(0);
+static POOL_LOCKED: AtomicU64 = AtomicU64::new(0);
 static LOCK_NANOS: AtomicU64 = AtomicU64::new(0);
+static SPILLED_BYTES: AtomicU64 = AtomicU64::new(0);
 static UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static UPLOAD_PINNED: AtomicU64 = AtomicU64::new(0);
+static PENDING: AtomicU64 = AtomicU64::new(0);
+static PENDING_MOST: AtomicU64 = AtomicU64::new(0);
+
+/// An extent of `size` bytes at `alignment` from the pool, inside one piece;
+/// `None` once the pool cannot give it.
+fn carve(size: usize, alignment: usize) -> Option<usize> {
+    let (base, len) = (
+        POOL_BASE.load(Ordering::Relaxed),
+        POOL_LEN.load(Ordering::Relaxed),
+    );
+    if size > PIECE || len == 0 {
+        return None;
+    }
+    let align = alignment.max(1);
+    let mut cursor = CURSOR.load(Ordering::Relaxed);
+    loop {
+        let mut at = (base + cursor).next_multiple_of(align) - base;
+        let piece_end = (at / PIECE + 1) * PIECE;
+        if at + size > piece_end {
+            at = (base + piece_end).next_multiple_of(align) - base;
+        }
+        if at + size > len {
+            return None;
+        }
+        match CURSOR.compare_exchange_weak(cursor, at + size, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return Some(base + at),
+            Err(now) => cursor = now,
+        }
+    }
+}
 
 // ── The arenas ──────────────────────────────────────────────────────────────
 
@@ -187,8 +317,8 @@ struct Arenas {
     tcache_max: usize,
 }
 
-/// The arenas, made at the first scope with the knob on; `None` when jemalloc
-/// would not make them.
+/// The arenas, made at the first scope with the pool locked; `None` when
+/// jemalloc would not make them.
 fn arenas() -> Option<&'static Arenas> {
     static ARENAS_MADE: OnceLock<Option<Arenas>> = OnceLock::new();
     ARENAS_MADE.get_or_init(make_arenas).as_ref()
@@ -238,7 +368,7 @@ fn make_arenas() -> Option<Arenas> {
                 return None;
             }
             // Only where jemalloc retains what it maps (Linux); elsewhere
-            // each extent is mapped at its own size and there is no limit.
+            // each extent is asked for at its own size and there is no limit.
             let name = std::ffi::CString::new(format!("arena.{id}.retain_grow_limit")).ok()?;
             let mut limit = GROW_LIMIT;
             let _ = jem::mallctl(
@@ -310,42 +440,17 @@ fn thread_slot() -> usize {
     })
 }
 
-// ── Page-locking ────────────────────────────────────────────────────────────
+// ── Page-locking (the pool's, once) ─────────────────────────────────────────
 
-/// The context page-locking runs under, once [`warm`] found the backend up.
+/// The context the pool is locked under.
 static CONTEXT: AtomicPtr<sys::CUctx_st> = AtomicPtr::new(std::ptr::null_mut());
 
-/// Makes page-locking possible from inside a hook once the backend is up:
-/// resolves the driver entry points the hooks call (resolving allocates, and a
-/// hook must not), then publishes the context.
-fn warm() {
-    if !CONTEXT.load(Ordering::Acquire).is_null() {
-        return;
-    }
-    let Some(backend) = crate::device::backend_if_ready() else {
-        return;
-    };
-    let context = backend.ctx.cu_ctx();
-    // SAFETY: the context is the backend's, alive for the process; a null
-    // pointer of zero bytes is refused by the driver and only resolves the
-    // entry point.
-    unsafe {
-        let _ = sys::cuCtxSetCurrent(context);
-        let _ = sys::cuMemHostRegister_v2(std::ptr::null_mut(), 0, 0);
-        let _ = sys::cuMemHostUnregister(std::ptr::null_mut());
-    }
-    CONTEXT.store(context, Ordering::Release);
-}
-
-/// How an extent is page-locked: the driver, or a test's stand-in. `None`
-/// before the driver can (the backend not up yet), else whether it did.
-type Lock = fn(*mut u8, usize) -> Option<bool>;
-type Unlock = fn(*mut u8);
+/// How a piece is page-locked: the driver, or a test's stand-in.
+type Lock = fn(*mut u8, usize) -> bool;
 
 static LOCK: AtomicUsize = AtomicUsize::new(0);
-static UNLOCK: AtomicUsize = AtomicUsize::new(0);
 
-fn lock(ptr: *mut u8, len: usize) -> Option<bool> {
+fn lock(ptr: *mut u8, len: usize) -> bool {
     match LOCK.load(Ordering::Acquire) {
         0 => driver_lock(ptr, len),
         // SAFETY: only `set_lock` stores here, and it stores a `Lock`.
@@ -353,52 +458,32 @@ fn lock(ptr: *mut u8, len: usize) -> Option<bool> {
     }
 }
 
-fn unlock(ptr: *mut u8) {
-    match UNLOCK.load(Ordering::Acquire) {
-        0 => driver_unlock(ptr),
-        // SAFETY: only `set_lock` stores here, and it stores an `Unlock`.
-        f => unsafe { std::mem::transmute::<usize, Unlock>(f)(ptr) },
-    }
-}
-
 /// A stand-in for the driver's page-locking, for tests without a card.
 #[doc(hidden)]
-pub fn set_lock(lock: Lock, unlock: Unlock) {
+pub fn set_lock(lock: Lock) {
     LOCK.store(lock as usize, Ordering::Release);
-    UNLOCK.store(unlock as usize, Ordering::Release);
 }
 
-fn driver_lock(ptr: *mut u8, len: usize) -> Option<bool> {
+fn driver_lock(ptr: *mut u8, len: usize) -> bool {
     let context = CONTEXT.load(Ordering::Acquire);
-    if context.is_null() {
-        return None;
-    }
-    // SAFETY: `ptr..ptr + len` is an extent jemalloc's default hooks just
-    // mapped, committed and not yet handed out; the context is the backend's.
-    Some(unsafe {
+    // SAFETY: `ptr..ptr + len` is a piece of the pool's own allocation, which
+    // is never freed; the context is the backend's.
+    unsafe {
         sys::cuCtxSetCurrent(context) == sys::CUresult::CUDA_SUCCESS
             && sys::cuMemHostRegister_v2(ptr.cast(), len, sys::CU_MEMHOSTREGISTER_PORTABLE)
                 == sys::CUresult::CUDA_SUCCESS
-    })
-}
-
-fn driver_unlock(ptr: *mut u8) {
-    let context = CONTEXT.load(Ordering::Acquire);
-    // SAFETY: `ptr` is the base of a range `driver_lock` registered.
-    unsafe {
-        let _ = sys::cuCtxSetCurrent(context);
-        let _ = sys::cuMemHostUnregister(ptr.cast());
     }
 }
 
 // ── The extents ─────────────────────────────────────────────────────────────
 
-/// An extent the hooks took from the system: where, how long, and whether it
-/// is page-locked. `ready` publishes the other three.
+/// An extent the hooks hand jemalloc from: a piece of the pool, or one the
+/// default hooks made. `ready` publishes the other four.
 struct Chunk {
     base: AtomicUsize,
     len: AtomicUsize,
     pinned: AtomicBool,
+    pool: AtomicBool,
     ready: AtomicBool,
 }
 
@@ -408,6 +493,7 @@ impl Chunk {
             base: AtomicUsize::new(0),
             len: AtomicUsize::new(0),
             pinned: AtomicBool::new(false),
+            pool: AtomicBool::new(false),
             ready: AtomicBool::new(false),
         }
     }
@@ -429,7 +515,7 @@ fn chunk_of(at: usize) -> Option<usize> {
 }
 
 /// Whether two adjacent extents may become one: only inside one chunk, so no
-/// extent ever spans two ranges locked apart (or a locked and a pageable one).
+/// extent ever spans two pieces locked apart (or the pool and pageable memory).
 fn may_merge(a: usize, b_end: usize) -> bool {
     match (chunk_of(a), chunk_of(b_end - 1)) {
         (Some(x), Some(y)) => x == y,
@@ -459,11 +545,8 @@ static HOOKS: Hooks = Hooks(std::cell::UnsafeCell::new(jem::extent_hooks_t {
     merge: Some(hook_merge),
 }));
 
-/// jemalloc's own hooks, which map and unmap for ours.
+/// jemalloc's own hooks, which map memory once the pool is spent.
 static DEFAULT_HOOKS: AtomicPtr<jem::extent_hooks_t> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Touching stride: the smallest page any host here uses.
-const TOUCH: usize = 4096;
 
 unsafe extern "C" fn hook_alloc(
     _hooks: *mut jem::extent_hooks_t,
@@ -474,11 +557,23 @@ unsafe extern "C" fn hook_alloc(
     commit: *mut bool,
     arena_ind: u32,
 ) -> *mut c_void {
-    let t = Instant::now();
+    // An extent where jemalloc asks for it is never in the pool.
+    if new_addr.is_null()
+        && let Some(at) = carve(size, alignment)
+    {
+        // SAFETY: jemalloc's out-parameters. The pool's bytes are handed out
+        // once, as the driver left them when it faulted them in: zeroed and
+        // committed.
+        unsafe {
+            *zero = true;
+            *commit = true;
+        }
+        return at as *mut c_void;
+    }
     let defaults = DEFAULT_HOOKS.load(Ordering::Acquire);
     // SAFETY: the default table is jemalloc's static one, and its `alloc` is
-    // called with the arguments jemalloc gave this one; a locked page must be
-    // committed, so committing is asked for.
+    // called with the arguments jemalloc gave this one; committed memory is
+    // asked for, as the hooks never commit later.
     let ptr = unsafe {
         let Some(alloc) = defaults.as_ref().and_then(|d| d.alloc) else {
             return std::ptr::null_mut();
@@ -489,47 +584,19 @@ unsafe extern "C" fn hook_alloc(
     if ptr.is_null() {
         return ptr;
     }
+    SPILLED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
     let k = NCHUNKS.fetch_add(1, Ordering::AcqRel);
-    // SAFETY: `commit` is jemalloc's out-parameter, just written.
-    let committed = unsafe { *commit };
-    let pinned = k < MAX_CHUNKS && committed && {
-        // SAFETY: the extent is `size` committed bytes no one else has yet;
-        // a byte rewritten with its own value leaves it as it was, zeroed or
-        // not.
-        unsafe {
-            let base = ptr.cast::<u8>();
-            for at in (0..size).step_by(TOUCH) {
-                let p = base.add(at);
-                p.write_volatile(p.read_volatile());
-            }
-        }
-        let l = Instant::now();
-        let locked = lock(ptr.cast(), size);
-        LOCK_NANOS.fetch_add(l.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        if locked == Some(false) {
-            REFUSED.fetch_add(1, Ordering::Relaxed);
-        }
-        locked == Some(true)
-    };
     if k < MAX_CHUNKS {
         let chunk = &CHUNKS[k];
         chunk.base.store(ptr as usize, Ordering::Relaxed);
         chunk.len.store(size, Ordering::Relaxed);
-        chunk.pinned.store(pinned, Ordering::Relaxed);
         chunk.ready.store(true, Ordering::Release);
     }
-    if pinned {
-        PINNED_CHUNKS.fetch_add(1, Ordering::Relaxed);
-        PINNED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
-    } else {
-        PAGEABLE_BYTES.fetch_add(size as u64, Ordering::Relaxed);
-    }
-    HOOK_NANOS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     ptr
 }
 
-/// Kept: a locked range is never handed back to the system while the process
-/// lives (jemalloc retains it and reuses it).
+/// Kept: neither the pool nor the default hooks' extents go back to the
+/// system while the process lives (jemalloc retains them and reuses them).
 unsafe extern "C" fn hook_dalloc(
     _hooks: *mut jem::extent_hooks_t,
     _addr: *mut c_void,
@@ -540,8 +607,8 @@ unsafe extern "C" fn hook_dalloc(
     true
 }
 
-/// Only an arena's destruction, which nothing here asks for: the chunk is
-/// unlocked as a whole before any of it is unmapped.
+/// Only an arena's destruction, which nothing here asks for: the pool stays,
+/// and an extent the default hooks made goes back through them.
 unsafe extern "C" fn hook_destroy(
     _hooks: *mut jem::extent_hooks_t,
     addr: *mut c_void,
@@ -549,10 +616,8 @@ unsafe extern "C" fn hook_destroy(
     committed: bool,
     arena_ind: u32,
 ) {
-    if let Some(k) = chunk_of(addr as usize)
-        && CHUNKS[k].pinned.swap(false, Ordering::AcqRel)
-    {
-        unlock(CHUNKS[k].base.load(Ordering::Relaxed) as *mut u8);
+    if chunk_of(addr as usize).is_some_and(|k| CHUNKS[k].pool.load(Ordering::Acquire)) {
+        return;
     }
     let defaults = DEFAULT_HOOKS.load(Ordering::Acquire);
     // SAFETY: as for `hook_alloc`'s call of the default table.
@@ -613,17 +678,21 @@ mod tests {
 
     static LOCKED: AtomicU64 = AtomicU64::new(0);
 
-    fn fake_lock(_ptr: *mut u8, len: usize) -> Option<bool> {
+    fn fake_lock(_ptr: *mut u8, len: usize) -> bool {
         LOCKED.fetch_add(len as u64, Ordering::Relaxed);
-        Some(true)
+        true
     }
 
-    fn fake_unlock(_ptr: *mut u8) {}
-
-    /// The knob on and the driver stood in for, in this test process.
+    /// A 2 GiB pool locked by a stand-in for the driver, in this test process.
     fn on() -> &'static Arenas {
-        let _ = ENABLED.set(true);
-        set_lock(fake_lock, fake_unlock);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            set_lock(fake_lock);
+            assert_eq!(set_pool_gib_for_tests(2), 2);
+            let locked = lock_pool().expect("the pool");
+            assert_eq!((locked.pieces, locked.refused), (2, 0));
+            assert_eq!(locked.locked, 2 << 30);
+        });
         arenas().expect("the arenas")
     }
 
@@ -640,8 +709,20 @@ mod tests {
         unsafe { jem::sdallocx(ptr, bytes, 0) };
     }
 
+    const PAGE: usize = 4096;
+
     #[test]
-    fn a_large_allocation_in_a_scope_is_page_locked_and_one_outside_is_not() {
+    fn the_pool_is_locked_once_and_only_when_asked() {
+        let _ = on();
+        assert_eq!(LOCKED.load(Ordering::Relaxed), 2 << 30);
+        assert!(lock_pool().is_none(), "a second lock");
+        assert!(!binds(1 << 30, false));
+        assert!(!binds(MIN_BYTES - 1, true));
+        assert!(binds(MIN_BYTES, true));
+    }
+
+    #[test]
+    fn a_large_allocation_in_a_scope_comes_from_the_pool_and_one_outside_does_not() {
         let arenas = on();
         let bytes = 8 << 20;
         let inside = {
@@ -653,16 +734,8 @@ mod tests {
         assert!(is_pinned(inside.cast(), bytes));
         assert!(!arenas.ids.contains(&arena_of(outside)));
         assert!(!is_pinned(outside.cast(), bytes));
-        assert!(LOCKED.load(Ordering::Relaxed) >= bytes as u64);
         give(inside, bytes);
         give(outside, bytes);
-    }
-
-    #[test]
-    fn the_knob_off_binds_nothing() {
-        assert!(!binds(1 << 30, false));
-        assert!(!binds(MIN_BYTES - 1, true));
-        assert!(binds(MIN_BYTES, true));
     }
 
     #[test]
@@ -697,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn a_freed_block_stays_locked_through_a_purge_and_serves_the_next() {
+    fn a_freed_block_stays_in_the_pool_through_a_purge_and_serves_the_next() {
         let arenas = on();
         let bytes = 16 << 20;
         let first = {
@@ -729,26 +802,32 @@ mod tests {
     }
 
     #[test]
-    fn merges_stay_inside_one_chunk() {
+    fn an_extent_never_spans_two_pieces() {
         let _ = on();
-        let bytes = 4 << 20;
-        let a = {
-            let _scope = scope(bytes);
-            take(bytes)
-        };
-        let k = chunk_of(a as usize).expect("a's chunk");
-        let (base, len) = (
-            CHUNKS[k].base.load(Ordering::Relaxed),
-            CHUNKS[k].len.load(Ordering::Relaxed),
-        );
-        assert!(may_merge(base, base + len));
-        assert!(!may_merge(base, base + len + 1));
-        assert!(!may_merge(base - 1, base + 1));
-        give(a, bytes);
+        let base = POOL_BASE.load(Ordering::Relaxed);
+        for size in [PAGE, 3 << 20, 64 << 20, 200 << 20] {
+            let at = carve(size, PAGE).expect("room in the pool");
+            assert_eq!(
+                (at - base) / PIECE,
+                (at + size - 1 - base) / PIECE,
+                "{size}"
+            );
+            assert!(is_pinned(at as *const u8, size));
+        }
+        assert!(carve(PIECE + 1, PAGE).is_none(), "larger than a piece");
     }
 
     #[test]
-    fn uploads_are_counted_and_the_locked_ones_apart() {
+    fn merges_stay_inside_one_piece() {
+        let _ = on();
+        let base = POOL_BASE.load(Ordering::Relaxed);
+        assert!(may_merge(base, base + PIECE));
+        assert!(!may_merge(base, base + PIECE + 1));
+        assert!(!may_merge(base + PIECE - 1, base + PIECE + 1));
+    }
+
+    #[test]
+    fn uploads_are_counted_and_the_pools_apart() {
         let _ = on();
         let bytes = 2 << 20;
         let locked = {
@@ -762,6 +841,7 @@ mod tests {
         let after = stats();
         assert!(after.upload_bytes >= before.upload_bytes + 2 * bytes as u64);
         assert!(after.upload_pinned >= before.upload_pinned + bytes as u64);
+        assert!(after.pending_most >= bytes as u64);
         give(locked, bytes);
         give(plain, bytes);
     }

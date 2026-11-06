@@ -1918,7 +1918,10 @@ fn return_list_pages<T>(list: &mut Vec<T>) -> Result<u64, i32> {
     let start = list.as_mut_ptr() as usize;
     let end = start + list.capacity() * std::mem::size_of::<T>();
     let (lo, hi) = (start.next_multiple_of(page), end / page * page);
-    if hi <= lo {
+    // A list in the page-locked pool keeps its pages: the driver holds them
+    // locked, and a page handed back would come back as another page than the
+    // one the driver reads.
+    if hi <= lo || multilinear::pinned::is_pinned(start as *const u8, end - start) {
         return Ok(0);
     }
     // SAFETY: [lo, hi) lies inside the list's own allocation, which the caller

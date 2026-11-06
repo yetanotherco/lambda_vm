@@ -1985,6 +1985,31 @@ pub fn prove_whir_block_tree(
     // `LAMBDA_VM_ALLOC_WATERMARK`: freed pages back to the OS inside a phase,
     // only where the host is short (`alloc_purge`).
     let watermark = crate::alloc_purge::start_watermark(block_whir::memory_target_bytes());
+    // `LAMBDA_VM_BACKEND_BEFORE_PROVE=1`: the card set up before the prove's
+    // clock, as a long-lived prover has it, instead of beside the prove's
+    // start. `LAMBDA_VM_PINNED_POOL_GIB`: the page-locked pool locked here,
+    // after the card and before the clock, once (every driver call waits
+    // while it runs).
+    if std::env::var("LAMBDA_VM_BACKEND_BEFORE_PROVE").is_ok_and(|v| v.trim() == "1") {
+        let t = std::time::Instant::now();
+        multilinear::gpu::set_up_device();
+        sink.line(&format!(
+            "W3 BACKEND BEFORE PROVE: up in {:.3}s",
+            t.elapsed().as_secs_f64()
+        ));
+    }
+    if let Some(pool) = multilinear::pinned::lock_pool() {
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        sink.line(&format!(
+            "W3 PINNED POOL: {:.2} GiB, {:.2} locked in {:.3}s ({:.3} s/GiB) · {} pieces, {} refused",
+            gib(pool.bytes),
+            gib(pool.locked),
+            pool.seconds,
+            pool.seconds / gib(pool.bytes).max(1e-9),
+            pool.pieces,
+            pool.refused,
+        ));
+    }
     let t0 = std::time::Instant::now();
     // The wall clock at the prove's start, to place a box's memory samples.
     sink.line(&format!(

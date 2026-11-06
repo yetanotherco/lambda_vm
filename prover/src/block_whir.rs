@@ -1838,7 +1838,7 @@ pub struct BlockStamps {
     /// Phase B stamped its driver thread's schedstat a group turn
     /// ([`phase_b_sched_from_env`]; each group's [`GroupStamps::sched_b`]).
     pub phase_b_sched: bool,
-    /// The page-locked arenas at phase A's end, when they are on
+    /// The page-locked pool at phase A's end, when it is asked for
     /// ([`multilinear::pinned`]).
     pub pinned: Option<multilinear::pinned::Stats>,
 }
@@ -2305,20 +2305,19 @@ impl BlockStamps {
         if let Some(p) = self.pinned {
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             out.push_str(&format!(
-                "BLOCK PINNED PRODUCER: on · {} extents page-locked, {:.2} GiB, in {:.3}s ({:.3}s locking, {:.3} s/GiB) · left pageable {:.2} GiB ({} refused) · phase A's uploads {:.2} of {:.2} GiB from page-locked memory ({:.0} %)\n",
-                p.chunks,
-                gib(p.pinned_bytes),
-                p.hook_seconds,
+                "BLOCK PINNED POOL: on · {:.2} GiB, {:.2} locked in {:.3}s before the prove · handed out {:.2} GiB, then {:.2} GiB pageable once spent · phase A's uploads {:.2} of {:.2} GiB from the pool ({:.0} %) · at most {:.2} GiB allocated and not yet uploaded\n",
+                gib(p.pool_bytes),
+                gib(p.locked_bytes),
                 p.lock_seconds,
-                if p.pinned_bytes > 0 { p.lock_seconds / gib(p.pinned_bytes) } else { 0.0 },
-                gib(p.pageable_bytes),
-                p.refused,
+                gib(p.carved_bytes),
+                gib(p.spilled_bytes),
                 gib(p.upload_pinned),
                 gib(p.upload_bytes),
                 if p.upload_bytes > 0 { 100.0 * p.upload_pinned as f64 / p.upload_bytes as f64 } else { 0.0 },
+                gib(p.pending_most),
             ));
         } else {
-            out.push_str("BLOCK PINNED PRODUCER: off\n");
+            out.push_str("BLOCK PINNED POOL: off\n");
         }
         if !self.open_split.is_empty() {
             let parts: Vec<String> = self
@@ -3796,6 +3795,15 @@ fn prove_block_whir_inner(
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
 ) -> Result<(BlockWhirProof, BlockStamps), Error> {
+    // The page-locked pool (`LAMBDA_VM_PINNED_POOL_GIB`), locked once in the
+    // process: a caller that locked it before its own clock (the block tree)
+    // finds it locked; any other has it locked here, before the build.
+    if let Some(pool) = multilinear::pinned::lock_pool() {
+        eprintln!(
+            "BLOCK PINNED POOL LOCKED: {} of {} bytes in {:.3}s at the prove's entry",
+            pool.locked, pool.bytes, pool.seconds
+        );
+    }
     let mut stamps = BlockStamps::default();
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 

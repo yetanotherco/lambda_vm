@@ -1,5 +1,5 @@
-//! The packed tables written straight into page-locked memory
-//! (`LAMBDA_VM_PINNED_PRODUCER=1`): every packer's buffer lies in a range the
+//! The packed tables written straight into the page-locked pool
+//! (`LAMBDA_VM_PINNED_POOL_GIB`): every packer's buffer lies in a range the
 //! driver has page-locked, and a group's upload of it puts the same words on
 //! the card.
 
@@ -39,12 +39,19 @@ fn row_major(columns: &[Vec<u64>]) -> Vec<u64> {
 #[test]
 fn every_packer_writes_into_page_locked_memory_and_the_upload_reads_the_same_words() {
     if math_cuda::device::backend().is_err() {
-        eprintln!("PINNED PRODUCER TEST: SKIPPED, no device");
+        eprintln!("PINNED POOL TEST: SKIPPED, no device");
         return;
     }
-    assert!(
-        math_cuda::pinned::enable_for_tests(),
-        "the knob was read off already"
+    assert_eq!(
+        math_cuda::pinned::set_pool_gib_for_tests(2),
+        2,
+        "the knob was read already"
+    );
+    let pool = math_cuda::pinned::lock_pool().expect("the pool locked");
+    assert_eq!(
+        (pool.pieces, pool.refused),
+        (2, 0),
+        "the driver locked both pieces"
     );
     let rows = 1 << 16;
     let widths = [1u8, 2, 4, 8, 8, 4, 2, 1, 8, 8];
@@ -112,8 +119,8 @@ fn every_packer_writes_into_page_locked_memory_and_the_upload_reads_the_same_wor
         "the words on the card"
     );
     eprintln!(
-        "PINNED PRODUCER TEST: on the card · {} extents locked, {:.1} MiB",
-        after.chunks,
-        after.pinned_bytes as f64 / (1u64 << 20) as f64
+        "PINNED POOL TEST: on the card · {:.1} MiB of the pool handed out, locked in {:.3}s",
+        after.carved_bytes as f64 / (1u64 << 20) as f64,
+        pool.seconds
     );
 }

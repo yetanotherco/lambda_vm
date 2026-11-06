@@ -1778,12 +1778,18 @@ impl WalkOutputs {
             let scaled = (len as u128 * cpu_ops as u128 / sizes.cycles as u128) as usize;
             scaled + scaled / 8 + 16
         };
-        out.memw.register_rows = Vec::with_capacity(size(sizes.register_rows));
-        out.memw.aligned = Vec::with_capacity(size(sizes.aligned));
-        out.memw.general = Vec::with_capacity(size(sizes.general));
-        out.load_ops = Vec::with_capacity(size(sizes.load));
+        // The lists the card fills its tables from (MEMW_R, MEMW_A, MEMW, LOAD,
+        // SHIFT): from the page-locked pool when it is on, as a group's upload
+        // reads them.
+        fn for_the_card<T>(n: usize) -> Vec<T> {
+            multilinear::pinned::with_pinned(n * std::mem::size_of::<T>(), || Vec::with_capacity(n))
+        }
+        out.memw.register_rows = for_the_card(size(sizes.register_rows));
+        out.memw.aligned = for_the_card(size(sizes.aligned));
+        out.memw.general = for_the_card(size(sizes.general));
+        out.load_ops = for_the_card(size(sizes.load));
         out.lt_ops = Vec::with_capacity(size(sizes.lt));
-        out.shift_ops = Vec::with_capacity(size(sizes.shift));
+        out.shift_ops = for_the_card(size(sizes.shift));
         out
     }
 
