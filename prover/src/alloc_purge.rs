@@ -93,7 +93,16 @@ const BUILT_IN: Option<AllocatorHooks> = None;
 /// The allocator's statistics, when the binary's hooks (or the lib's test
 /// build) can read them.
 pub fn stats() -> Option<AllocStats> {
-    hooks().and_then(|h| (h.stats)())
+    // The page-locked pool's arenas count in jemalloc's resident bytes what
+    // they hold free, which no purge returns (their hooks refuse every one)
+    // and which is room for the block's later allocations: off, as the host's
+    // readings take the pool's free part off.
+    hooks().and_then(|h| (h.stats)()).map(|mut s| {
+        s.resident = s
+            .resident
+            .saturating_sub(multilinear::pinned::arena_free_bytes() as usize);
+        s
+    })
 }
 
 /// What one purge did.

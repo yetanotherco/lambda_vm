@@ -775,9 +775,14 @@ impl HostReading {
             CgroupValue::Stat("inactive_file"),
             CgroupValue::Stat("total_inactive_file"),
         );
+        // The page-locked pool's free part is resident from its lock on, and is
+        // the room the block's later allocations take: every reading of the
+        // host (the drop rule's, the walk's hand-off) counts it once, as it is
+        // taken ([`multilinear::pinned::unused_pool_bytes`]).
+        let unused = multilinear::pinned::unused_pool_bytes();
         Self {
-            hwm: hwm.unwrap_or(0),
-            charged: charged.unwrap_or(0),
+            hwm: hwm.unwrap_or(0).saturating_sub(unused),
+            charged: charged.unwrap_or(0).saturating_sub(unused),
             inactive_file: inactive_file.unwrap_or(0),
         }
     }
@@ -788,12 +793,10 @@ impl HostReading {
     /// less its inactive file pages (the kubelet's measure). Page cache the
     /// kernel would give back first is not counted; active file pages are,
     /// and the target's 10 GiB margin covers them. The page-locked pool's
-    /// unused part is not counted either: resident since its lock, it is the
-    /// room the forecast's growth takes ([`multilinear::pinned::unused_pool_bytes`]).
+    /// free part is not counted either (taken off as the reading is made).
     fn bytes(&self) -> u64 {
         self.hwm
             .max(self.charged.saturating_sub(self.inactive_file))
-            .saturating_sub(multilinear::pinned::unused_pool_bytes())
     }
 
     /// What the host holds now: the cgroup's working set and the allocator's
@@ -802,7 +805,6 @@ impl HostReading {
     fn now_bytes(&self, allocator: Option<u64>) -> u64 {
         self.charged
             .saturating_sub(self.inactive_file)
-            .saturating_sub(multilinear::pinned::unused_pool_bytes())
             .max(allocator.unwrap_or(0))
     }
 }
@@ -3821,6 +3823,9 @@ fn prove_block_whir_inner(
         on_group,
         lead,
     );
+    // The base is proved: the pool's free bytes are no longer room for its
+    // allocations, and later readings (the recursion's) count them again.
+    multilinear::pinned::retire_netting();
     // What the pool served this process so far, whichever path the prove took
     // (only the streamed one stamps it for the report).
     if let Some(p) = multilinear::pinned::stats() {

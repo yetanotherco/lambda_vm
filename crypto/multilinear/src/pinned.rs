@@ -39,6 +39,22 @@ pub fn unused_pool_bytes() -> u64 {
     0
 }
 
+/// What the page-locked pool's arenas hold free: in the allocator's resident
+/// figure, returned by no purge. 0 without a pool.
+pub fn arena_free_bytes() -> u64 {
+    #[cfg(feature = "cuda")]
+    return math_cuda::pinned::arena_free_bytes();
+    #[cfg(not(feature = "cuda"))]
+    0
+}
+
+/// The block's prove is over: from now on the host's readings count the
+/// pool's free bytes as the memory they are.
+pub fn retire_netting() {
+    #[cfg(feature = "cuda")]
+    math_cuda::pinned::retire_netting();
+}
+
 /// What locking the pool took.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PoolLocked {

@@ -251,13 +251,63 @@ pub fn lock_pool() -> Option<PoolLocked> {
 /// extents). A decision on the host's memory that forecasts that growth takes
 /// these off its reading, or it counts them twice. 0 without a pool.
 pub fn unused_bytes() -> u64 {
-    if !POOL_READY.load(Ordering::Acquire) {
+    if !netting() {
         return 0;
     }
     let len = POOL_LEN.load(Ordering::Relaxed) as u64;
     let held = live_bytes().unwrap_or(CURSOR.load(Ordering::Relaxed) as u64);
     len.saturating_sub(held.min(len))
 }
+
+/// What the arenas hold of the pool and no allocation does (resident in
+/// jemalloc's figures, and no purge returns it: the hooks refuse every one).
+/// A reading of the allocator's resident bytes takes it off as the host's
+/// readings take [`unused_bytes`] off. 0 without a pool, after
+/// [`retire_netting`], or where jemalloc keeps no figures.
+pub fn arena_free_bytes() -> u64 {
+    if !netting() {
+        return 0;
+    }
+    let (Some(arenas), Some(live)) = (arenas_if_made(), live_bytes()) else {
+        return 0;
+    };
+    let mut resident = 0u64;
+    for id in arenas.ids {
+        let Ok(name) = std::ffi::CString::new(format!("stats.arenas.{id}.resident")) else {
+            return 0;
+        };
+        let mut bytes = 0usize;
+        let mut len = std::mem::size_of::<usize>();
+        // SAFETY: the statistic is a `size_t`; the name is NUL-terminated.
+        let rc = unsafe {
+            jem::mallctl(
+                name.as_ptr(),
+                (&raw mut bytes).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return 0;
+        }
+        resident += bytes as u64;
+    }
+    resident.saturating_sub(live)
+}
+
+/// The block's prove is over: the pool's free bytes stop being room for its
+/// allocations (nothing after the base allocates from it), so the host's
+/// readings count them again, as the memory they are.
+pub fn retire_netting() {
+    NETTING_RETIRED.store(true, Ordering::Release);
+}
+
+fn netting() -> bool {
+    POOL_READY.load(Ordering::Acquire) && !NETTING_RETIRED.load(Ordering::Acquire)
+}
+
+static NETTING_RETIRED: AtomicBool = AtomicBool::new(false);
 
 /// What the arenas' allocations hold of the pool now, from jemalloc's own
 /// figures (refreshed first); `None` where jemalloc keeps none (built without
@@ -916,6 +966,18 @@ mod tests {
         }
         assert!(unused_bytes() <= len - bytes as u64);
         give(taken, bytes);
+    }
+
+    #[test]
+    fn the_netting_retires_with_the_prove() {
+        let _ = on();
+        let len = POOL_LEN.load(Ordering::Relaxed) as u64;
+        assert!(arena_free_bytes() <= len);
+        retire_netting();
+        // Process-wide: any test reading these after this one reads 0, which
+        // every bound they assert allows.
+        assert_eq!(unused_bytes(), 0);
+        assert_eq!(arena_free_bytes(), 0);
     }
 
     #[test]
