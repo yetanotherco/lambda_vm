@@ -118,9 +118,39 @@ fn every_packer_writes_into_page_locked_memory_and_the_upload_reads_the_same_wor
         columns,
         "the words on the card"
     );
+
+    // A walk's list, sized over its length, gives the tail back in place: the
+    // same words where they were, still page-locked, the capacity its length.
+    let mut list: Vec<u64> =
+        multilinear::pinned::with_pinned(32 << 20, || Vec::with_capacity(4 << 20));
+    list.extend(0..3u64 << 20);
+    let at = list.as_ptr();
+    locked("a walk's list", bytemuck_bytes(&list));
+    assert_eq!(multilinear::pinned::shrink(&mut list), 8 << 20, "the tail");
+    assert_eq!(list.as_ptr(), at, "in place");
+    assert_eq!(list.capacity(), list.len());
+    locked("a walk's list, shrunk", bytemuck_bytes(&list));
+    assert!(list.iter().copied().eq(0..3u64 << 20), "its words");
+    let shrunk = math_cuda::pinned::stats();
+    assert!(
+        shrunk.shrinks >= 1 && shrunk.shrink_moved == 0,
+        "{shrunk:?}"
+    );
+    // A list outside the pool keeps its capacity.
+    let mut plain: Vec<u64> = Vec::with_capacity(4 << 20);
+    plain.extend(0..3u64 << 20);
+    assert_eq!(multilinear::pinned::shrink(&mut plain), 0);
+    assert_eq!(plain.capacity(), 4 << 20);
+
     eprintln!(
         "PINNED POOL TEST: on the card · {:.1} MiB of the pool handed out, locked in {:.3}s",
         after.carved_bytes as f64 / (1u64 << 20) as f64,
         pool.seconds
     );
+}
+
+/// A list's words as the bytes they lie in.
+fn bytemuck_bytes(list: &[u64]) -> &[u8] {
+    // SAFETY: `u64` has no padding, and the bytes live as long as `list`.
+    unsafe { std::slice::from_raw_parts(list.as_ptr().cast(), std::mem::size_of_val(list)) }
 }

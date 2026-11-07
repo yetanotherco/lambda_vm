@@ -17,6 +17,20 @@ pub fn with_pinned<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// A list in the page-locked pool gives its capacity past its length back,
+/// once nothing grows it: pool it would hold and never write. In place, so it
+/// stays page-locked; a list outside the pool is left as it is. The bytes
+/// given back; 0 without the card.
+pub fn shrink<T>(list: &mut Vec<T>) -> u64 {
+    #[cfg(feature = "cuda")]
+    return math_cuda::pinned::shrink(list);
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = list;
+        0
+    }
+}
+
 /// Whether `bytes` from `ptr` lie in the page-locked pool: memory whose pages
 /// must not be handed back to the OS while the driver holds them locked.
 pub fn is_pinned(ptr: *const u8, bytes: usize) -> bool {
@@ -99,6 +113,11 @@ pub fn stats() -> Option<Stats> {
             upload_pinned: s.upload_pinned,
             pending_most: s.pending_most,
             held_bytes: s.held_bytes,
+            requested_bytes: s.requested_bytes,
+            usable_bytes: s.usable_bytes,
+            shrinks: s.shrinks,
+            shrunk_bytes: s.shrunk_bytes,
+            shrink_moved: s.shrink_moved,
         });
     }
     None
@@ -123,4 +142,13 @@ pub struct Stats {
     /// What allocations hold of the pool now; `None` where the allocator keeps
     /// no figures.
     pub held_bytes: Option<u64>,
+    /// Bytes the producers asked of the pool, and the size classes they were
+    /// given (lists at their lengths once shrunk).
+    pub requested_bytes: u64,
+    pub usable_bytes: u64,
+    /// Lists that gave their untouched tail back ([`shrink`]), the bytes, and
+    /// how many the allocator moved out of the pool instead.
+    pub shrinks: u64,
+    pub shrunk_bytes: u64,
+    pub shrink_moved: u64,
 }

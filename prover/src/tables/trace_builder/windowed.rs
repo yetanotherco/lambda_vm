@@ -1568,6 +1568,9 @@ fn walk_window(
         )?;
     }
     *sizes = WalkSizes::of(&walk, logs.len());
+    // Lists from the page-locked pool hold their sizing's slack: back to the
+    // pool, as the window is walked.
+    walk.give_back_tails();
     Ok(WalkedWindow {
         cpu_ops,
         walk,

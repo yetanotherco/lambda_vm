@@ -1793,6 +1793,18 @@ impl WalkOutputs {
         out
     }
 
+    /// [`Self::for_walk_sized`]'s lists in the page-locked pool, walked: each
+    /// gives its capacity past its length back to the pool
+    /// ([`multilinear::pinned::shrink`]), as nothing grows it after its window.
+    /// Lists outside the pool keep theirs.
+    pub(crate) fn give_back_tails(&mut self) {
+        multilinear::pinned::shrink(&mut self.memw.register_rows);
+        multilinear::pinned::shrink(&mut self.memw.aligned);
+        multilinear::pinned::shrink(&mut self.memw.general);
+        multilinear::pinned::shrink(&mut self.load_ops);
+        multilinear::pinned::shrink(&mut self.shift_ops);
+    }
+
     /// The bytes its lists take on the heap (capacities, not lengths).
     pub(crate) fn heap_bytes(&self) -> usize {
         self.memw.heap_bytes()

@@ -118,6 +118,8 @@ pub fn scope(bytes: usize) -> Scope {
         Some(previous) if set_thread_arena(mine) => {
             let now = PENDING.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
             PENDING_MOST.fetch_max(now, Ordering::Relaxed);
+            REQUESTED.fetch_add(bytes as u64, Ordering::Relaxed);
+            USABLE.fetch_add(usable(bytes), Ordering::Relaxed);
             Scope(Some(previous))
         }
         _ => Scope(None),
@@ -248,15 +250,96 @@ pub fn lock_pool() -> Option<PoolLocked> {
 /// faulted them in) and spoken for, the memory a block's later allocations take
 /// instead of growing the heap. That is the part never handed out and the
 /// part the arenas hold free (handed out, then freed, or kept between their
-/// extents). A decision on the host's memory that forecasts that growth takes
-/// these off its reading, or it counts them twice. 0 without a pool.
+/// extents), and what their allocations hold past what was asked of them
+/// ([`touched`]), which pageable memory would not have faulted in. A decision
+/// on the host's memory that forecasts that growth takes these off its
+/// reading, or it counts them twice. 0 without a pool.
 pub fn unused_bytes() -> u64 {
     if !netting() {
         return 0;
     }
     let len = POOL_LEN.load(Ordering::Relaxed) as u64;
-    let held = live_bytes().unwrap_or(CURSOR.load(Ordering::Relaxed) as u64);
+    let held = live_bytes()
+        .map(touched)
+        .unwrap_or(CURSOR.load(Ordering::Relaxed) as u64);
     len.saturating_sub(held.min(len))
+}
+
+/// What `live` bytes of the arenas' allocations would hold of pageable
+/// memory: the part their producers asked for. jemalloc rounds a large
+/// allocation up to its size class (up to a quarter over), and every page of
+/// the pool is resident from its lock on, so `live` counts the rounding that
+/// pageable memory never faults in. The rounding is the arenas' own so far,
+/// asked against given ([`scope`], [`shrink`]).
+fn touched(live: u64) -> u64 {
+    touched_of(
+        live,
+        REQUESTED.load(Ordering::Relaxed),
+        USABLE.load(Ordering::Relaxed),
+    )
+}
+
+/// `live` at `requested` of every `usable` byte; `live` itself before any
+/// allocation, or where the figures read no rounding.
+fn touched_of(live: u64, requested: u64, usable: u64) -> u64 {
+    if usable == 0 || requested >= usable {
+        return live;
+    }
+    (live as u128 * requested as u128 / usable as u128) as u64
+}
+
+/// The bytes jemalloc gives an allocation of `bytes` (its size class).
+fn usable(bytes: usize) -> u64 {
+    // SAFETY: `nallocx` only computes a size.
+    match unsafe { jem::nallocx(bytes, 0) } {
+        0 => bytes as u64,
+        n => n as u64,
+    }
+}
+
+/// The least tail [`shrink`] gives back: below it a list keeps its capacity.
+pub const SHRINK_LEAST: usize = 64 << 10;
+
+/// A list in the pool gives its untouched tail back once nothing grows it:
+/// the capacity past its length is pool it holds and never writes, which
+/// pageable memory would never fault in. Shrunk in place (jemalloc splits the
+/// extent, and the tail goes back to the list's arena as free pool), it then
+/// holds its length's size class. A list outside the pool, or with less than
+/// [`SHRINK_LEAST`] past its length, is left as it is. The bytes given back.
+pub fn shrink<T>(list: &mut Vec<T>) -> u64 {
+    let size = std::mem::size_of::<T>();
+    let old = list.capacity() * size;
+    let len = list.len() * size;
+    if size == 0
+        || old - len < SHRINK_LEAST
+        || !POOL_READY.load(Ordering::Acquire)
+        || !is_pinned(list.as_ptr().cast(), old)
+    {
+        return 0;
+    }
+    let before = list.as_ptr();
+    list.shrink_to_fit();
+    let after = list.capacity() * size;
+    let in_place = after > 0 && list.as_ptr() == before;
+    // The list asked for `old` bytes; now for its length, or for nothing of
+    // the pool where the allocator moved it out (or freed an empty one).
+    let sub = |at: &AtomicU64, bytes: u64| {
+        let _ = at.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(bytes))
+        });
+    };
+    sub(&REQUESTED, old as u64);
+    sub(&USABLE, usable(old));
+    if in_place {
+        REQUESTED.fetch_add(after as u64, Ordering::Relaxed);
+        USABLE.fetch_add(usable(after), Ordering::Relaxed);
+    } else if after > 0 {
+        SHRINK_MOVED.fetch_add(1, Ordering::Relaxed);
+    }
+    let back = (old - after) as u64;
+    SHRINKS.fetch_add(1, Ordering::Relaxed);
+    SHRUNK_BYTES.fetch_add(back, Ordering::Relaxed);
+    back
 }
 
 /// What the arenas hold of the pool and no allocation does (resident in
@@ -268,7 +351,7 @@ pub fn arena_free_bytes() -> u64 {
     if !netting() {
         return 0;
     }
-    let (Some(arenas), Some(live)) = (arenas_if_made(), live_bytes()) else {
+    let (Some(arenas), Some(live)) = (arenas_if_made(), live_bytes().map(touched)) else {
         return 0;
     };
     let mut resident = 0u64;
@@ -382,6 +465,15 @@ pub struct Stats {
     /// figures; `None` where it keeps none (then [`unused_bytes`] reads the
     /// pool less what was ever handed out).
     pub held_bytes: Option<u64>,
+    /// Bytes the scopes asked for and the size classes jemalloc gave them
+    /// ([`touched`]), lists at their lengths once shrunk.
+    pub requested_bytes: u64,
+    pub usable_bytes: u64,
+    /// Lists [`shrink`] gave a tail back, the bytes, and how many of them the
+    /// allocator moved out of the pool instead of shrinking in place.
+    pub shrinks: u64,
+    pub shrunk_bytes: u64,
+    pub shrink_moved: u64,
 }
 
 pub fn stats() -> Stats {
@@ -395,6 +487,11 @@ pub fn stats() -> Stats {
         upload_pinned: UPLOAD_PINNED.load(Ordering::Relaxed),
         pending_most: PENDING_MOST.load(Ordering::Relaxed),
         held_bytes: live_bytes(),
+        requested_bytes: REQUESTED.load(Ordering::Relaxed),
+        usable_bytes: USABLE.load(Ordering::Relaxed),
+        shrinks: SHRINKS.load(Ordering::Relaxed),
+        shrunk_bytes: SHRUNK_BYTES.load(Ordering::Relaxed),
+        shrink_moved: SHRINK_MOVED.load(Ordering::Relaxed),
     }
 }
 
@@ -405,6 +502,11 @@ static UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static UPLOAD_PINNED: AtomicU64 = AtomicU64::new(0);
 static PENDING: AtomicU64 = AtomicU64::new(0);
 static PENDING_MOST: AtomicU64 = AtomicU64::new(0);
+static REQUESTED: AtomicU64 = AtomicU64::new(0);
+static USABLE: AtomicU64 = AtomicU64::new(0);
+static SHRINKS: AtomicU64 = AtomicU64::new(0);
+static SHRUNK_BYTES: AtomicU64 = AtomicU64::new(0);
+static SHRINK_MOVED: AtomicU64 = AtomicU64::new(0);
 
 /// An extent of `size` bytes at `alignment` from the pool, inside one piece;
 /// `None` once the pool cannot give it.
@@ -978,6 +1080,61 @@ mod tests {
         // every bound they assert allows.
         assert_eq!(unused_bytes(), 0);
         assert_eq!(arena_free_bytes(), 0);
+    }
+
+    #[test]
+    fn a_tail_goes_back_to_the_pool_in_place() {
+        let arenas = on();
+        let bytes = 32 << 20;
+        let taken = {
+            let _scope = scope(bytes);
+            take(bytes)
+        };
+        let arena = arena_of(taken);
+        assert!(arenas.ids.contains(&arena));
+        // What `Vec::shrink_to_fit` asks of jemalloc: the same block, split,
+        // its head still in the pool and its tail free in the same arena.
+        let kept = 24 << 20;
+        // SAFETY: `taken` is a live allocation of jemalloc's.
+        let shrunk = unsafe { jem::rallocx(taken, kept, 0) };
+        assert_eq!(shrunk, taken, "shrunk in place");
+        // SAFETY: as above.
+        assert_eq!(unsafe { jem::sallocx(shrunk, 0) }, kept);
+        assert!(is_pinned(shrunk.cast(), kept));
+        let next = {
+            let _scope = scope(8 << 20);
+            take(8 << 20)
+        };
+        assert!(is_pinned(next.cast(), 8 << 20));
+        give(shrunk, kept);
+        give(next, 8 << 20);
+    }
+
+    /// The pool's held bytes count what the producers asked for: jemalloc's
+    /// size classes round a large allocation up (33 MiB and a byte is given
+    /// 40), and the rounding is no memory a pageable allocation faults in.
+    #[test]
+    fn the_held_pool_counts_what_was_asked_not_its_size_classes() {
+        let _ = on();
+        assert_eq!(usable(32 << 20), 32 << 20);
+        assert_eq!(usable((33 << 20) + 1), 40 << 20);
+        assert_eq!(touched_of(40, 33, 40), 33);
+        assert_eq!(touched_of(40, 0, 0), 40, "nothing asked yet");
+        assert_eq!(touched_of(40, 50, 40), 40, "never above what is held");
+        let (asked, given) = (
+            REQUESTED.load(Ordering::Relaxed),
+            USABLE.load(Ordering::Relaxed),
+        );
+        let bytes = (33 << 20) + 1;
+        let taken = {
+            let _scope = scope(bytes);
+            take(bytes)
+        };
+        // Other tests allocate beside this one: only the bounds are exact.
+        assert!(REQUESTED.load(Ordering::Relaxed) >= asked + bytes as u64);
+        assert!(USABLE.load(Ordering::Relaxed) >= given + (40 << 20));
+        assert!(touched(40 << 20) < 40 << 20);
+        give(taken, bytes);
     }
 
     #[test]
