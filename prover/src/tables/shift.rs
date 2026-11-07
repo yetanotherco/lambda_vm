@@ -22,6 +22,7 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
 // =========================================================================
@@ -103,21 +104,48 @@ pub mod cols {
 // Trace generation
 // =========================================================================
 
-/// A single SHIFT operation (hashable for deduplication).
+/// A single SHIFT operation (hashable for deduplication). `#[repr(C)]`, its
+/// fields ordered so it stays 24 bytes: a chunk's ops are the records the card
+/// fills its SHIFT table from ([`card_ops`]).
+#[repr(C)]
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ShiftOperation {
+    /// Full shift amount `arg2` (the unified ALU bus carries this as in2).
+    pub shift_amount: u64,
     /// Input value as 4 halfwords (DWordHL)
     pub in_halves: [u16; 4],
     /// Shift amount low byte (used by the computation; effective = mod 32/64).
     pub shift: u8,
-    /// Full shift amount `arg2` (the unified ALU bus carries this as in2).
-    pub shift_amount: u64,
     /// 0 = left, 1 = right
     pub direction: bool,
     /// Whether arithmetic (signed) right shift
     pub signed: bool,
     /// Whether 32-bit (word) instruction
     pub word_instr: bool,
+}
+
+// The walk keeps one per shift: keep it at 24 bytes.
+const _: () = assert!(std::mem::size_of::<ShiftOperation>() == 24);
+
+/// SHIFT ops as the card's SHIFT fill reads them
+/// (`multilinear::records::ShiftOp`): the same bytes.
+pub(crate) fn card_ops(ops: &[ShiftOperation]) -> &[multilinear::records::ShiftOp] {
+    use multilinear::records::ShiftOp;
+    use std::mem::{align_of, offset_of, size_of};
+    const _: () = {
+        assert!(size_of::<ShiftOperation>() == size_of::<ShiftOp>());
+        assert!(align_of::<ShiftOperation>() == align_of::<ShiftOp>());
+        assert!(offset_of!(ShiftOperation, shift_amount) == offset_of!(ShiftOp, shift_amount));
+        assert!(offset_of!(ShiftOperation, in_halves) == offset_of!(ShiftOp, in_halves));
+        assert!(offset_of!(ShiftOperation, shift) == offset_of!(ShiftOp, shift));
+        assert!(offset_of!(ShiftOperation, direction) == offset_of!(ShiftOp, direction));
+        assert!(offset_of!(ShiftOperation, signed) == offset_of!(ShiftOp, signed));
+        assert!(offset_of!(ShiftOperation, word_instr) == offset_of!(ShiftOp, word_instr));
+    };
+    // SAFETY: both are `#[repr(C)]` with the same fields in the same order
+    // (asserted above); the flags are `bool`s, 0 or 1, read as `u8`s, and no
+    // reader looks at the padding after them.
+    unsafe { std::slice::from_raw_parts(ops.as_ptr() as *const ShiftOp, ops.len()) }
 }
 
 impl ShiftOperation {
@@ -353,65 +381,79 @@ struct ShiftAux {
 pub fn generate_shift_trace(
     operations: &[ShiftOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_shift_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths SHIFT traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_shift_trace`] in `form` (`tables::gpack`).
+pub fn generate_shift_trace_as(
+    operations: &[ShiftOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_shift_trace_segments_as(&[operations], form)
+}
+
+/// [`generate_shift_trace_as`] over `segments`, the operations one after another: a
+/// chunk handed out as the window parts it lies in.
+pub(crate) fn generate_shift_trace_segments_as(
+    segments: &[&[ShiftOperation]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
     // No deduplication: each operation gets its own row with μ=1.
     // Spec declares μ: Bit.
-    let num_rows = operations.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    let num_rows = len.next_power_of_two().max(4);
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
+            let aux = op.compute_aux();
 
-    for (row_idx, op) in operations.iter().enumerate() {
-        let aux = op.compute_aux();
+            // Input columns
+            table.set_halves(row_idx, cols::IN_0, &op.in_halves);
+            table.set_byte(row_idx, cols::SHIFT_AMOUNT, op.shift);
+            // High bits of the full shift amount (for the ALU bus in2 = arg2).
+            table.set_byte(
+                row_idx,
+                cols::SHIFT_B1,
+                ((op.shift_amount >> 8) & 0xFF) as u8,
+            );
+            table.set_half(
+                row_idx,
+                cols::SHIFT_H1,
+                ((op.shift_amount >> 16) & 0xFFFF) as u16,
+            );
+            table.set_word(row_idx, cols::SHIFT_HIGH, (op.shift_amount >> 32) as u32);
+            table.set_bool(row_idx, cols::DIRECTION, op.direction);
+            table.set_bool(row_idx, cols::SIGNED, op.signed);
+            table.set_bool(row_idx, cols::WORD_INSTR, op.word_instr);
 
-        // Input columns
-        table.set_halves(row_idx, cols::IN_0, &op.in_halves);
-        table.set_byte(row_idx, cols::SHIFT_AMOUNT, op.shift);
-        // High bits of the full shift amount (for the ALU bus in2 = arg2).
-        table.set_byte(
-            row_idx,
-            cols::SHIFT_B1,
-            ((op.shift_amount >> 8) & 0xFF) as u8,
-        );
-        table.set_half(
-            row_idx,
-            cols::SHIFT_H1,
-            ((op.shift_amount >> 16) & 0xFFFF) as u16,
-        );
-        table.set_word(row_idx, cols::SHIFT_HIGH, (op.shift_amount >> 32) as u32);
-        table.set_bool(row_idx, cols::DIRECTION, op.direction);
-        table.set_bool(row_idx, cols::SIGNED, op.signed);
-        table.set_bool(row_idx, cols::WORD_INSTR, op.word_instr);
+            // Output columns
+            table.set_words(row_idx, cols::OUT_0, &aux.out);
 
-        // Output columns
-        table.set_words(row_idx, cols::OUT_0, &aux.out);
+            // Auxiliary columns
+            table.set_bool(row_idx, cols::IS_NEGATIVE, aux.is_negative);
+            table.set_byte(row_idx, cols::BIT_SHIFT, aux.bit_shift);
+            table.set_bool(row_idx, cols::ZBS, aux.zbs);
 
-        // Auxiliary columns
-        table.set_bool(row_idx, cols::IS_NEGATIVE, aux.is_negative);
-        table.set_byte(row_idx, cols::BIT_SHIFT, aux.bit_shift);
-        table.set_bool(row_idx, cols::ZBS, aux.zbs);
+            table.set_halves(row_idx, cols::X_0, &aux.x);
+            table.set_halves(row_idx, cols::Y_0, &aux.y);
+            for i in 0..3 {
+                table.set_bool(row_idx, cols::LIMB_SHIFT_RAW[i], aux.limb_shift[i]);
+            }
+            // limb_shift[3] is virtual: not stored in the trace
 
-        table.set_halves(row_idx, cols::X_0, &aux.x);
-        table.set_halves(row_idx, cols::Y_0, &aux.y);
-        for i in 0..3 {
-            table.set_bool(row_idx, cols::LIMB_SHIFT_RAW[i], aux.limb_shift[i]);
+            // μ = 1 for all active rows (Bit)
+            table.set_bool(row_idx, cols::MU, true);
         }
-        // limb_shift[3] is virtual: not stored in the trace
 
-        // μ = 1 for all active rows (Bit)
-        table.set_bool(row_idx, cols::MU, true);
-    }
-
-    // Padding rows: set ZBS=1 per spec. All other columns remain 0.
-    // μ=0 so C13 (limb_shift encoding) is inactive. left=right=0 so shifted=0,
-    // making C14 (out=shifted) trivially satisfied regardless of limb_shift.
-    for row_idx in operations.len()..num_rows {
-        table.set_bool(row_idx, cols::ZBS, true);
-    }
-
-    trace
+        // Padding rows: set ZBS=1 per spec. All other columns remain 0.
+        // μ=0 so C13 (limb_shift encoding) is inactive. left=right=0 so shifted=0,
+        // making C14 (out=shifted) trivially satisfied regardless of limb_shift.
+        for row_idx in len..num_rows {
+            table.set_bool(row_idx, cols::ZBS, true);
+        }
+    })
 }
 
 // =========================================================================

@@ -42,6 +42,9 @@ pub const MIN_PROOF_OPTIONS: ProofOptions = ProofOptions {
     coset_offset: 3,
     grinding_factor: 1,
     fri_final_poly_log_degree: 7,
+    // The RV64 guest verifies the LEGACY format, named here rather
+    // than inherited from a default.
+    format: stark::proof::options::ProofFormat::LEGACY,
 };
 
 /// The recursion verifier's build presets. Each fixes the guest's
@@ -73,8 +76,14 @@ impl Preset {
     ];
 
     /// The fixed `ProofOptions` this preset's guest verifies with.
+    ///
+    /// ★ Always the LEGACY proof format ([`ProofFormat::LEGACY`](stark::proof::options::ProofFormat::LEGACY)),
+    /// stamped explicitly: the RV64 guest's archived verifier is
+    /// not threaded with the ZF format levers, so its presets name the format
+    /// it was built for instead of inheriting the process's production format
+    /// ([`crate::zf_format::ZfFormat::DEFAULT`]).
     pub fn options(&self) -> ProofOptions {
-        match self {
+        let mut options = match self {
             Preset::Min => MIN_PROOF_OPTIONS,
             Preset::Blowup2 => crate::GoldilocksCubicProofOptions::with_blowup(2)
                 .expect("blowup=2 is always valid"),
@@ -82,7 +91,9 @@ impl Preset {
                 .expect("blowup=4 is always valid"),
             Preset::Blowup8 => crate::GoldilocksCubicProofOptions::with_blowup(8)
                 .expect("blowup=8 is always valid"),
-        }
+        };
+        options.format = stark::proof::options::ProofFormat::LEGACY;
+        options
     }
 
     /// Artifact stem under `executor/program_artifacts/recursion/`
@@ -194,7 +205,12 @@ pub fn encode_continuation_guest_input(
 }
 
 /// Domain tag for [`program_id`].
-const PROGRAM_ID_TAG: &[u8] = b"LAMBDAVM_PROGRAM_ID_V1";
+/// Domain tag for the attestation's program id.
+///
+/// `pub(crate)` so the LFM emitter binds the same literal instead of
+/// duplicating it — the precedent `CONTINUATION_EPOCH_TAG` set in R1e. 22 bytes,
+/// so it is `≡ 2 (mod 4)` and every machine value folded after it is spliced.
+pub(crate) const PROGRAM_ID_TAG: &[u8] = b"LAMBDAVM_PROGRAM_ID_V1";
 
 /// [`program_id`] from a precomputed ELF digest and entry point — the guest
 /// path, sharing one full-ELF Keccak pass with the verify-side statement
@@ -260,6 +276,23 @@ pub fn program_id_from_elf(
     ))
 }
 
+/// The RV64 recursion guest verifies the LEGACY proof format only: its
+/// presets fix the options at build time and
+/// name the legacy format, and the archived verifier it runs is not threaded
+/// with the ZF format levers. Any other format — including the production
+/// default [`crate::zf_format::ZfFormat::DEFAULT`] — must never reach it, so
+/// both guest entry points refuse one up front instead of verifying a proof
+/// under a format the guest was not built for.
+fn require_legacy_format(proof_options: &ProofOptions) -> Result<(), Error> {
+    if proof_options.has_legacy_format() {
+        Ok(())
+    } else {
+        Err(Error::Execution(String::from(
+            "the recursion guest verifies legacy-format proofs only (every ZF format lever off)",
+        )))
+    }
+}
+
 /// Verify the guest's private-input blob ([`encode_guest_input`]) in place and,
 /// on success, produce the attestation bytes the recursion guest commits:
 /// `program_id(elf, roots) || inner_public_output`. `Ok(None)` means the
@@ -274,6 +307,7 @@ pub fn verify_and_attest_blob(
     blob: &[u8],
     proof_options: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
+    require_legacy_format(proof_options)?;
     let verification = crate::verify_recursion_blob(blob, proof_options)?;
     if !verification.ok {
         return Ok(None);
@@ -308,6 +342,8 @@ pub fn verify_continuation_and_attest(
     proof_options: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
     use rkyv::rancor::Error as RkyvError;
+
+    require_legacy_format(proof_options)?;
 
     let archive_bytes = crate::recursion_archive_bytes(blob).ok_or_else(|| {
         Error::Execution(String::from(

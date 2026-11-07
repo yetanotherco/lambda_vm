@@ -11,5 +11,6 @@ pub mod reference;
 pub mod reference_field;
 
 mod curve_tests;
+mod ecrec_tests;
 mod lib_tests;
 mod witness_tests;

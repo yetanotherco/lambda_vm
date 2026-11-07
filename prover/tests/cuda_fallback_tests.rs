@@ -80,7 +80,10 @@ fn gpu_fri_fault_falls_back_to_cpu() {
 /// Batch-invert CPU fallback: when `compute_and_invert_denoms_ext3_dev`
 /// errors, `try_compute_and_invert_inv_denoms_dev` must return None so the
 /// caller (R3 OOD in `trace.rs` or R4 DEEP in `prover.rs`) builds inv_denoms
-/// on CPU and the remaining GPU path keeps running.
+/// on CPU and the remaining GPU path keeps running. The fully resident R4 DEEP
+/// inverts inside its own kernel by default and never reaches that entry
+/// point, so there the faults land on R3's inversions (R4's buffered path takes
+/// them under `LAMBDA_VM_DEEP_INV_LEGACY=1`).
 ///
 /// The injection fires the Nth time the math-cuda entry point is reached,
 /// across all tables. We assert that the fault really fired, that the
@@ -229,8 +232,8 @@ fn gpu_barycentric_fault_recovers_device_only_trace() {
 }
 
 /// R4 DEEP cliff recovery: with every math-cuda DEEP composition dispatch
-/// failing (sticky — the fully-resident arm and both mixed arms must all
-/// decline in the same prove), R4 falls back to the host DEEP loop, which
+/// failing (sticky — the fully-resident arms, fused and buffered, and both
+/// mixed arms must all decline in the same prove), R4 falls back to the host DEEP loop, which
 /// reads the host trace AND the host part evals — both empty under
 /// device-only. The recovery must download both from the resident handles
 /// instead of hard-aborting, and the proof must verify.

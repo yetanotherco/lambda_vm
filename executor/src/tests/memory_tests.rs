@@ -139,3 +139,101 @@ fn test_misaligned_load_store_overflow_errors() {
         MemoryError::AddressOverflow
     ));
 }
+
+/// The paged store answers every access as the word map does: loads and
+/// stores of every width, aligned or not, across 64 KiB pages, in the low and
+/// top directories and between them, the overflow refusals at the top of the
+/// address space, `load_bytes`, the private input, and `iter_bytes` (as a set:
+/// the two iterate in different orders).
+#[test]
+fn the_paged_store_is_the_word_map() {
+    use crate::vm::memory::StoreKind;
+
+    const PAGE: u64 = 1 << 16;
+    let mut pages = Memory::with_store(StoreKind::Pages);
+    let mut words = Memory::with_store(StoreKind::Words);
+    pages.store_private_inputs(vec![7u8; 70_001]).unwrap();
+    words.store_private_inputs(vec![7u8; 70_001]).unwrap();
+
+    let spots = [
+        0,
+        3 * PAGE - 3,
+        0x1_0000_0000 - 2,
+        (1 << 33) - 5,
+        1 << 33,
+        0x8000_0000_0000_0000 - 3,
+        u64::MAX - (1 << 33) - 2,
+        u64::MAX - (1 << 33) + 6,
+        u64::MAX - 9,
+        u64::MAX - 1,
+    ];
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let same = |a: Result<u64, MemoryError>, b: Result<u64, MemoryError>, what: &str| match (a, b) {
+        (Ok(a), Ok(b)) => assert_eq!(a, b, "{what}"),
+        (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}"), "{what}"),
+        (a, b) => panic!("{what}: {a:?} vs {b:?}"),
+    };
+    for _ in 0..200_000 {
+        let r = next();
+        let addr = spots[(r % spots.len() as u64) as usize].wrapping_add((r >> 8) % 24);
+        let value = next();
+        let what = format!("op {} at {addr:#x}", (r >> 16) % 10);
+        match (r >> 16) % 10 {
+            0 => {
+                pages.store_byte(addr, value as u8);
+                words.store_byte(addr, value as u8);
+            }
+            1 => same(
+                pages.store_half(addr, value as u16).map(|_| 0),
+                words.store_half(addr, value as u16).map(|_| 0),
+                &what,
+            ),
+            2 => same(
+                pages.store_word(addr, value as u32).map(|_| 0),
+                words.store_word(addr, value as u32).map(|_| 0),
+                &what,
+            ),
+            3 => same(
+                pages.store_doubleword(addr, value).map(|_| 0),
+                words.store_doubleword(addr, value).map(|_| 0),
+                &what,
+            ),
+            4 => assert_eq!(pages.load_byte(addr), words.load_byte(addr), "{what}"),
+            5 => same(
+                pages.load_half(addr).map(u64::from),
+                words.load_half(addr).map(u64::from),
+                &what,
+            ),
+            6 => same(
+                pages.load_word(addr).map(u64::from),
+                words.load_word(addr).map(u64::from),
+                &what,
+            ),
+            7 | 8 => same(
+                pages.load_doubleword(addr),
+                words.load_doubleword(addr),
+                &what,
+            ),
+            _ => {
+                let len = value % 40;
+                match (pages.load_bytes(addr, len), words.load_bytes(addr, len)) {
+                    (Ok(a), Ok(b)) => assert_eq!(a, b, "{what}"),
+                    (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}"), "{what}"),
+                    (a, b) => panic!("{what}: {a:?} vs {b:?}"),
+                }
+            }
+        }
+    }
+    let mut a: Vec<(u64, u8)> = pages.iter_bytes().collect();
+    let mut b: Vec<(u64, u8)> = words.iter_bytes().collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    assert_eq!(a.len(), b.len(), "the words written");
+    assert!(a == b, "the bytes written");
+}

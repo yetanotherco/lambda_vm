@@ -43,6 +43,7 @@ where
         num_transition: usize,
         offsets: &[usize],
         logup_table_offset: &FieldElement<FieldExtension>,
+        row_stride: usize,
     ) -> Vec<FieldElement<FieldExtension>> {
         let is_uniform = zerofier_data.is_uniform();
         let num_base = air.num_base_transition_constraints();
@@ -64,11 +65,14 @@ where
         // buffers are row-major) — no per-row gather copy.
         // Per-row evaluation, shared by the parallel and sequential paths below:
         // borrow the rows, evaluate transition constraints, accumulate with zerofiers.
-        let eval_row = |i: usize,
+        // `j` indexes the output (and `boundary_evaluation`); the LDE row it
+        // evaluates is `j * row_stride` (the whole coset at stride 1).
+        let eval_row = |j: usize,
                         boundary: FieldElement<FieldExtension>,
                         transition_buf: &mut [FieldElement<FieldExtension>],
                         base_buf: &mut [FieldElement<Field>]|
          -> FieldElement<FieldExtension> {
+            let i = j * row_stride;
             let rows = RowFrame::from_lde(lde_trace, i, offsets);
 
             let ctx = TransitionEvaluationContext::new_prover(
@@ -174,6 +178,12 @@ where
         }
     }
 
+    /// The composition-polynomial evaluations `H` at every `row_stride`-th
+    /// point of the LDE coset (`lde_size / row_stride` values; the whole coset
+    /// at stride 1). A stride `s` evaluates on the sub-coset `g·⟨ωˢ⟩`, which is
+    /// what the degree-2 split needs when the blowup leaves room (see
+    /// `Prover::composition_eval_stride`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn evaluate(
         &self,
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -182,11 +192,17 @@ where
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
         rap_challenges: &[FieldElement<FieldExtension>],
+        row_stride: usize,
     ) -> Vec<FieldElement<FieldExtension>>
     where
         Field: 'static,
         FieldExtension: 'static,
     {
+        let lde_len = domain.lde_roots_of_unity_coset.len();
+        assert!(
+            row_stride >= 1 && lde_len.is_multiple_of(row_stride),
+            "the composition row stride must divide the LDE size"
+        );
         let boundary_constraints = &self.boundary_constraints;
         // Per-step inverse zerofier vectors, cached in the (process-shared)
         // domain: constraints sharing a step get the same Arc.
@@ -215,6 +231,7 @@ where
                     &zerofier_data,
                     &boundary_zerofiers_inverse_evaluations,
                     false,
+                    row_stride,
                 )
             {
                 // SAFETY: the TypeId gate established `FieldExtension ==
@@ -246,13 +263,14 @@ where
         // instead of pre-computing all boundary_polys_evaluations.
         // This eliminates N_constraints × LDE_size intermediate allocations.
         #[cfg(feature = "parallel")]
-        let boundary_eval_iter = (0..domain.lde_roots_of_unity_coset.len()).into_par_iter();
+        let boundary_eval_iter = (0..lde_len / row_stride).into_par_iter();
         #[cfg(not(feature = "parallel"))]
-        let boundary_eval_iter = 0..domain.lde_roots_of_unity_coset.len();
+        let boundary_eval_iter = 0..lde_len / row_stride;
 
         let b_constraints = &boundary_constraints.constraints;
         let boundary_evaluation: Vec<_> = boundary_eval_iter
-            .map(|domain_index| {
+            .map(|j| {
+                let domain_index = j * row_stride;
                 b_constraints
                     .iter()
                     .zip(boundary_coefficients)
@@ -288,6 +306,7 @@ where
             num_transition,
             offsets,
             &self.logup_table_offset,
+            row_stride,
         )
     }
 
@@ -309,6 +328,7 @@ where
         zerofier_data: &ZerofierEvaluations<Field>,
         boundary_z_inv: &[std::sync::Arc<Vec<FieldElement<Field>>>],
         keep: bool,
+        row_stride: usize,
     ) -> Option<crate::constraint_ir::gpu_interp::GpuComposition>
     where
         Field: 'static,
@@ -362,6 +382,7 @@ where
             // column from the process-wide resident `GpuBaseVec` cache (no
             // flattened host copy of num_boundary × lde_size, no re-upload).
             b_z_inv: boundary_z_inv,
+            row_stride,
         };
 
         let next_step = lde_trace.lde_step_size; // == blowup_factor (single-row steps)
@@ -382,9 +403,11 @@ where
     }
 
     /// GPU composition path keeping `H` resident on device, for the on-device
-    /// degree-2 decomposition. `None` → the caller runs [`Self::evaluate`]
-    /// (the host path) instead.
+    /// degree-2 decomposition, at every `row_stride`-th LDE row (as
+    /// [`Self::evaluate`]). `None` → the caller runs [`Self::evaluate`] (the
+    /// host path) instead.
     #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn evaluate_dev(
         &self,
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -393,6 +416,7 @@ where
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
         rap_challenges: &[FieldElement<FieldExtension>],
+        row_stride: usize,
     ) -> Option<math_cuda::constraint_interp::GpuCompH>
     where
         Field: 'static,
@@ -414,6 +438,7 @@ where
             &zerofier_data,
             &boundary_zerofiers_inverse_evaluations,
             true,
+            row_stride,
         )? {
             crate::constraint_ir::gpu_interp::GpuComposition::Dev(h) => Some(h),
             crate::constraint_ir::gpu_interp::GpuComposition::Host(_) => None,

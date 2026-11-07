@@ -1,11 +1,13 @@
 [workspace]
 
-# Thin LTO measurably lowers executed guest cycles (~2.3% on the committed
-# ethrex_bench fixtures) at a small ELF-size cost, which is free in this VM
-# (execution is priced per executed instruction, not by ELF size). Cargo's
-# release default is lto = false / codegen-units = 16.
+# Whole-program optimisation: fat LTO over one codegen unit. On mainnet block
+# 25475471 the guest executes 5.5 % fewer instructions than with thin LTO and 16
+# units (one unit alone gives 4.8 %), and the ELF is smaller; the guest build
+# takes about three times as long. Execution is priced per executed instruction,
+# not by ELF size. Cargo's release default is lto = false / codegen-units = 16.
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 
 [package]
 name = "ethrex"
@@ -13,6 +15,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# The runtime's `memcpy`, `memmove` and `memset` are the copy accelerator's stubs
+# (syscalls/src/entrypoint.rs). The `fast-memcpy` feature would keep them in software.
 lambda-vm-syscalls = { path = "../../../../syscalls" }
 # LambdaVM crypto provider (keccak + ECSM-accelerated ecrecover), defined in the
 # lambda_vm repo and injected in src/main.rs — so crypto changes stay in our repo
@@ -52,3 +56,54 @@ ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev 
 # Exact pin: must match the fixture writer (tooling/ethrex-fixtures) and the
 # executor test reader so the rkyv ProgramInput layout stays consistent.
 rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
+
+# Every ethrex crate of this guest is built from yetanotherco/ethrex, branch
+# lambda-vm/guest-opt-8: the pinned rev above plus guest-speed commits, none of
+# which changes a result or ProgramInput, so the fixture writer and the native test
+# reference stay on the pin (each commit carries the tests that compare it with the
+# code it replaces). In order:
+# - jump destinations as a bitmap, and the traced jump out of line; ethrex main's
+#   #7119 (MLOAD / MSTORE and the memory accessors without repeated checks);
+# - U256 big-endian conversions with a 13-instruction byte swap (no Zbb), and the
+#   transactions, receipts and withdrawals roots built from pairs in key order;
+# - from the round-12 guest work: RLP integers and lengths from their significant
+#   bytes; grouped nibble packing; witness nodes decoded in place, resident trie
+#   nodes walked by reference, branch preimages in one pass; the EVM stack
+#   allocated zeroed with single bounds checks; DIV / MOD specialised by divisor
+#   width; the jump-destination analysis made progressive and shared by Code
+#   clones (it replaces the eager bitmap), with a lock-free check inside the
+#   scanned prefix; memory expansion skipped when covered, and zero limbs of
+#   memory words not byte-swapped;
+# - a branch's hash children decoded straight into the node; committed EVM
+#   checkpoints merged into the larger set; the RLP encoder's payload buffer
+#   started at 256 bytes; embedded witness nodes decoded without the shared-pointer
+#   pool;
+# - precompile checks rejected by the address prefix; calldata zero bytes counted
+#   a word at a time; the witness state's lookup maps hashed instead of ordered;
+#   warm addresses and storage slots kept in one journaled set for the whole
+#   transaction;
+# - LOG topics converted a word at a time; a cached account found with one
+#   probe; call frames and checkpoint substates moved instead of swapped;
+# - the witness state leaked at the end of a zkVM run instead of dropped; no
+#   dirty-path bookkeeping in tries over an in-memory backend; receipt blooms ORed
+#   a word at a time;
+# - a failed opcode's error kept in the VM (handlers take one argument); the
+#   program counter stepped as a pointer into the bytecode.
+# On mainnet block 25475471 the guest executes 203.12 M instructions without the
+# patch's later commits and 130.58 M with all of them and this repo's guest-side
+# changes. Ethrex main has carried an equivalent bitmap since 3ca8bc23 (#7095)
+# and #7119 since 007882a8; it has none of the rest.
+#
+# All eight crates are patched together: patching only the two that changed would
+# leave two copies of ethrex-crypto in the graph. scripts/set_ethrex_rev.sh checks
+# that the fork's base below is the pinned rev and refuses to move the pin past it.
+# ethrex-fork-base: 797df5540c7d35cafd69b6971a74b2a49c67d1dd
+[patch."https://github.com/lambdaclass/ethrex.git"]
+ethrex-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "03c0fbd6b4266039c002fb08c00a861aa182cd19" }
+ethrex-crypto = { git = "https://github.com/yetanotherco/ethrex.git", rev = "03c0fbd6b4266039c002fb08c00a861aa182cd19" }
+ethrex-guest-program = { git = "https://github.com/yetanotherco/ethrex.git", rev = "03c0fbd6b4266039c002fb08c00a861aa182cd19" }
+ethrex-l2-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "03c0fbd6b4266039c002fb08c00a861aa182cd19" }
+ethrex-levm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "03c0fbd6b4266039c002fb08c00a861aa182cd19" }
+ethrex-rlp = { git = "https://github.com/yetanotherco/ethrex.git", rev = "03c0fbd6b4266039c002fb08c00a861aa182cd19" }
+ethrex-trie = { git = "https://github.com/yetanotherco/ethrex.git", rev = "03c0fbd6b4266039c002fb08c00a861aa182cd19" }
+ethrex-vm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "03c0fbd6b4266039c002fb08c00a861aa182cd19" }

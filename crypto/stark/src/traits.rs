@@ -7,8 +7,10 @@ use math::field::{
 };
 
 use crate::{
-    constraint_ir::ConstraintProgram, constraints::builder::ConstraintMeta, domain::Domain,
-    lookup::BusPublicInputs,
+    constraint_ir::ConstraintProgram,
+    constraints::builder::ConstraintMeta,
+    domain::Domain,
+    lookup::{BusInteraction, BusPublicInputs},
 };
 
 use super::{
@@ -171,6 +173,20 @@ pub trait AIR: Send + Sync {
         0
     }
 
+    /// The table's bus interactions, in declaration order.
+    ///
+    /// Shape-only consumers (profiling, cost models) read this; the proving
+    /// path consumes the `LogUpLayout` built from the same list.
+    fn bus_interactions(&self) -> &[BusInteraction] {
+        &[]
+    }
+
+    /// Highest degree among this table's transition constraints, counting both
+    /// the table's own constraints and the framework-emitted LogUp ones.
+    fn max_constraint_degree(&self) -> usize {
+        1
+    }
+
     /// Returns true if this AIR has preprocessed (precomputed) columns.
     ///
     /// Preprocessed tables have columns that are fully deterministic and known
@@ -192,6 +208,35 @@ pub trait AIR: Send + Sync {
     /// Only meaningful if `is_preprocessed()` returns true.
     fn precomputed_commitment(&self) -> Commitment {
         [0u8; 32]
+    }
+
+    /// The hardcoded commitment to the precomputed columns under the trace
+    /// trees' leaf `layout` (S2). The root depends on the layout (a one-row
+    /// leaf hashes different bytes), so each layout has its own trust anchor.
+    ///
+    /// `None` = this AIR has no root for `layout`: the prover refuses to prove
+    /// and the verifier rejects (never a silent recompute, never
+    /// the other layout's root). The default serves today's layout only.
+    /// Only meaningful if `is_preprocessed()` returns true.
+    fn precomputed_commitment_for(
+        &self,
+        layout: crate::leaf_layout::LeafLayout,
+    ) -> Option<Commitment> {
+        match layout {
+            crate::leaf_layout::LeafLayout::RowPair => Some(self.precomputed_commitment()),
+            crate::leaf_layout::LeafLayout::Row => None,
+        }
+    }
+
+    /// The precomputed columns themselves, `0..num_precomputed_columns()`.
+    ///
+    /// Empty unless `is_preprocessed()`. The univariate path never needs these
+    /// — it compares [`precomputed_commitment`](Self::precomputed_commitment)
+    /// against the proof's root — but the multilinear one has no separate root
+    /// to compare, so it checks the claimed openings against these directly.
+    /// Generating them is the same work recomputing that commitment costs.
+    fn precomputed_columns(&self) -> Vec<Vec<FieldElement<Self::Field>>> {
+        Vec::new()
     }
 
     fn num_auxiliary_rap_columns(&self) -> usize {
@@ -270,15 +315,46 @@ pub trait AIR: Send + Sync {
     /// prefix (its length is `num_base_transition_constraints()`).
     fn constraints_meta(&self) -> &[ConstraintMeta];
 
-    /// The lazily captured flat IR ([`ConstraintProgram`]) of every transition
-    /// constraint, for the CPU interpreter and the GPU kernel.
+    /// The flat IR ([`ConstraintProgram`]) of every transition constraint, for
+    /// the CPU interpreter and the GPU kernel — captured on demand unless a
+    /// pre-captured program was supplied (see
+    /// [`Self::precaptured_constraint_program`]).
     ///
-    /// GUEST-SAFETY: capture hash-conses, so the verify/recursion path must
-    /// NEVER call this — only the prover, GPU lowering, and tests do. The
-    /// default panics precisely so any accidental verify-path use is caught;
-    /// AIRs that support capture override it with a cached (`OnceLock`) build.
+    /// GUEST-SAFETY: this MAY capture, and capture hash-conses, so the
+    /// verify/recursion path must never call it — only the prover, GPU
+    /// lowering, and tests do. The default panics precisely so any accidental
+    /// verify-path use is caught; AIRs that support capture override it with a
+    /// cached (`OnceLock`) build.
+    ///
+    /// The prohibition is on CAPTURE, not on constraint programs as such: a
+    /// program serialized at build time is ordinary data, and consuming one is
+    /// allowed anywhere. That path is
+    /// [`Self::precaptured_constraint_program`].
     fn constraint_program(&self) -> &ConstraintProgram<Self::Field, Self::FieldExtension> {
         unimplemented!("constraint_program is not available for this AIR")
+    }
+
+    /// A pre-captured constraint program supplied at build time, if this AIR was
+    /// given one; `None` otherwise.
+    ///
+    /// GUEST-SAFETY: unlike [`Self::constraint_program`], this NEVER captures
+    /// under any circumstance — it is a borrow of data handed to the AIR at
+    /// construction, so it is safe on the verify/recursion path. That is the
+    /// entire distinction between the two methods, and it is why they are
+    /// separate rather than one method with a flag: an accidental verify-path
+    /// call to the capturing one still hits the panic above.
+    ///
+    /// `None` is not an error — it means nobody supplied an artifact, and the
+    /// caller must fall back to the compiled folder. A caller that needs a
+    /// program on a guest path must treat `None` as fatal itself, because
+    /// falling back to `constraint_program()` there would reintroduce capture.
+    ///
+    /// See [`ConstraintArtifact`](crate::constraint_ir::ConstraintArtifact) for
+    /// the serialized form and for what validating one does and does not prove.
+    fn precaptured_constraint_program(
+        &self,
+    ) -> Option<&ConstraintProgram<Self::Field, Self::FieldExtension>> {
+        None
     }
 
     fn boundary_constraints(

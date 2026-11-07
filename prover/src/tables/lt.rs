@@ -30,8 +30,9 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{
-    BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op, dedup_rows,
+    BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op, dedup_rows_of,
 };
 
 // =========================================================================
@@ -158,52 +159,75 @@ impl LtOperation {
 /// Duplicate operations (same lhs, rhs, signed, invert) are merged into a single
 /// row with their multiplicities summed, split at
 /// [`MU_MAX`](crate::tables::types::MU_MAX) (see
-/// [`dedup_rows`]). The table is then padded
+/// [`dedup_rows`](crate::tables::types::dedup_rows)). The table is then padded
 /// to the next power of 2.
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let unique_ops = dedup_rows(operations);
+    generate_lt_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths LT traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_lt_trace`] in `form` (`tables::gpack`).
+pub fn generate_lt_trace_as(
+    operations: &[LtOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_lt_trace_segments_as(&[operations], form)
+}
+
+/// [`generate_lt_trace_as`] over `segments`, the operations one after another
+/// (deduplicated as their concatenation): a chunk handed out as the window
+/// parts it lies in.
+pub(crate) fn generate_lt_trace_segments_as(
+    segments: &[&[LtOperation]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    // Deduplicate operations: (lhs, rhs, signed) -> multiplicity, split at `MU_MAX`.
+    lt_trace_of_rows(&dedup_rows_of(segments.iter().flat_map(|s| s.iter())), form)
+}
+
+/// The LT trace of `unique_ops`, the rows [`generate_lt_trace_segments_as`]
+/// deduplicates its operations into, in `form`.
+pub(crate) fn lt_trace_of_rows(
+    unique_ops: &[(LtOperation, u64)],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
+            // Store input columns
+            table.set_dword_hhw(row_idx, cols::LHS_0, op.lhs);
+            table.set_dword_hhw(row_idx, cols::RHS_0, op.rhs);
+            table.set_bool(row_idx, cols::SIGNED, op.signed);
 
-    for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
-        // Store input columns
-        table.set_dword_hhw(row_idx, cols::LHS_0, op.lhs);
-        table.set_dword_hhw(row_idx, cols::RHS_0, op.rhs);
-        table.set_bool(row_idx, cols::SIGNED, op.signed);
+            // Compute lt result
+            let lt = op.compute_lt();
+            table.set_bool(row_idx, cols::LT, lt);
 
-        // Compute lt result
-        let lt = op.compute_lt();
-        table.set_bool(row_idx, cols::LT, lt);
+            // Compute lhs_sub_rhs = lhs - rhs (wrapping)
+            // Note: We compute this as a 64-bit wrapping subtraction
+            let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
 
-        // Compute lhs_sub_rhs = lhs - rhs (wrapping)
-        // Note: We compute this as a 64-bit wrapping subtraction
-        let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
+            // Store lhs_sub_rhs as DWordHL: [Half, Half, Half, Half]
+            table.set_dword_hl(row_idx, cols::LHS_SUB_RHS_0, lhs_sub_rhs);
 
-        // Store lhs_sub_rhs as DWordHL: [Half, Half, Half, Half]
-        table.set_dword_hl(row_idx, cols::LHS_SUB_RHS_0, lhs_sub_rhs);
+            // Compute MSBs (bit 63 of each value)
+            let lhs_msb = (op.lhs >> 63) & 1;
+            let rhs_msb = (op.rhs >> 63) & 1;
+            table.set_u64(row_idx, cols::LHS_MSB, lhs_msb);
+            table.set_u64(row_idx, cols::RHS_MSB, rhs_msb);
 
-        // Compute MSBs (bit 63 of each value)
-        let lhs_msb = (op.lhs >> 63) & 1;
-        let rhs_msb = (op.rhs >> 63) & 1;
-        table.set_u64(row_idx, cols::LHS_MSB, lhs_msb);
-        table.set_u64(row_idx, cols::RHS_MSB, rhs_msb);
+            // ALU-bus fields: invert + the inverted output.
+            table.set_bool(row_idx, cols::INVERT, op.invert);
+            table.set_bool(row_idx, cols::OUT, op.compute_out());
 
-        // ALU-bus fields: invert + the inverted output.
-        table.set_bool(row_idx, cols::INVERT, op.invert);
-        table.set_bool(row_idx, cols::OUT, op.compute_out());
-
-        // All LT lookups go through the unified ALU bus → single multiplicity.
-        table.set_u64(row_idx, cols::MU, *multiplicity);
-    }
-
-    trace
+            // All LT lookups go through the unified ALU bus → single multiplicity.
+            table.set_u64(row_idx, cols::MU, *multiplicity);
+        }
+    })
 }
 
 // =========================================================================

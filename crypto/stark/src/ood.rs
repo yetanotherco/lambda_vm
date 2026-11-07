@@ -223,6 +223,11 @@ impl OodLayout {
         }
     }
 
+    /// Rows in the full OOD grid: one DEEP point `z·gʳ` per row.
+    pub fn num_eval_points(&self) -> usize {
+        self.num_eval_points
+    }
+
     /// Rows per offset block.
     pub fn step_size(&self) -> usize {
         self.step_size

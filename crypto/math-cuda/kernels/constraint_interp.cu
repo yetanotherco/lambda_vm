@@ -376,6 +376,11 @@ extern "C" __global__ void constraint_interp_kernel(
 // full mul on its embedding), z_inv is the cyclic base transition-zerofier
 // inverse, and the boundary term reads the resident trace at column `b_col[b]`
 // (main or aux).
+//
+// `row_stride` evaluates H on a sub-coset of the LDE coset: output row `out`
+// is LDE row `out * row_stride`, for `num_rows / row_stride` output rows. Every
+// read (trace frame, z_inv, boundary z_b_inv) uses the LDE row, so stride 1 is
+// the full-coset evaluation unchanged.
 extern "C" __global__ void constraint_composition_kernel(
     // output: one H(row) per LDE row
     Fe3 *__restrict__ d_h,
@@ -397,6 +402,7 @@ extern "C" __global__ void constraint_composition_kernel(
     uint64_t aux_stride,
     uint64_t next_step,
     uint64_t num_rows,
+    uint64_t row_stride,
     // transition accumulation
     const Fe3 *__restrict__ d_beta_trans, // [num_roots]
     const uint64_t *__restrict__ d_z_inv, // [z_len], cyclic
@@ -425,7 +431,9 @@ extern "C" __global__ void constraint_composition_kernel(
     u.alpha = d_alpha_powers;
     u.offset = *d_table_offset;
 
-    for (uint64_t row = task_offset; row < num_rows; row += num_threads) {
+    uint64_t num_out = num_rows / row_stride;
+    for (uint64_t out = task_offset; out < num_out; out += num_threads) {
+        uint64_t row = out * row_stride;
         eval_program_row(vb, ve, vstride, d_nodes, num_nodes, u, row, next_step, num_rows, d_main,
                          main_stride, d_aux, aux_stride);
 
@@ -463,30 +471,33 @@ extern "C" __global__ void constraint_composition_kernel(
             h = ext3::add(h, ext3::mul(zb, bp));
         }
 
-        d_h[row] = h;
+        d_h[out] = h;
     }
 }
 
 // ============================================================================
-// Degree-2 quotient decomposition, pointwise on the LDE coset:
+// Degree-2 quotient decomposition, pointwise on the coset `h` was evaluated on:
 //   H0[i] = two_inv  * (h[i] + h[i+n])
-//   H1[i] = inv_2x[i] * (h[i] - h[i+n])
+//   H1[i] = inv_2x[i * inv_stride] * (h[i] - h[i+n])
 // Reads the interleaved ext3 composition evals `h` (2n rows); writes the two
 // halves in slab layout (3 base slabs per half, `slab_stride` u64 each; rows
-// n.. stay zero as the LDE zero-pad).
+// n.. stay zero as the LDE zero-pad). `inv_stride` is the sub-coset stride `h`
+// was evaluated at: `inv_2x` holds 1/(2x) for the full LDE coset's first half,
+// so the sub-coset's point i is its entry i * inv_stride (1 on the full coset).
 extern "C" __global__ void decompose_d2_ext3(
     const uint64_t *__restrict__ h,
     const uint64_t *__restrict__ inv_2x,
     uint64_t two_inv,
     uint64_t n,
     uint64_t slab_stride,
+    uint64_t inv_stride,
     uint64_t *__restrict__ out) {
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (uint64_t)gridDim.x * blockDim.x) {
         Fe3 x = ext3::make(h[i * 3], h[i * 3 + 1], h[i * 3 + 2]);
         Fe3 y = ext3::make(h[(i + n) * 3], h[(i + n) * 3 + 1], h[(i + n) * 3 + 2]);
         Fe3 h0 = ext3::mul_base(ext3::add(x, y), two_inv);
-        Fe3 h1 = ext3::mul_base(ext3::sub(x, y), inv_2x[i]);
+        Fe3 h1 = ext3::mul_base(ext3::sub(x, y), inv_2x[i * inv_stride]);
         out[0 * slab_stride + i] = h0.a;
         out[1 * slab_stride + i] = h0.b;
         out[2 * slab_stride + i] = h0.c;

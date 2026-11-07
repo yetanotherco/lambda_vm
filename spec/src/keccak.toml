@@ -37,10 +37,31 @@ pad = ["*", 8, ["arr",
 ]]
 
 [[variables.multiplicity]]
+name = "μ_p"
+type = "Bit"
+desc = "permutation row (the table's `MU_P`)"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ_s"
+type = "Bit"
+desc = "sponge row (the table's `MU_S`; its constraints are in keccak_sponge.toml)"
+pad = 0
+
+[[variables.multiplicity]]
 name = "μ"
 type = "Bit"
-desc = ""
+desc = "real row of either mode (the table's `MU`, read by the block cuts)"
 pad = 0
+
+[[constraint_groups]]
+name = "mode"
+
+[[constraints.mode]]
+kind = "arith"
+constraint = "`μ` is the sum of the mode bits, so a row is in at most one mode"
+poly = ["-", "μ", ["+", "μ_p", "μ_s"]]
+ref = "keccak:c:mode_sum"
 
 [[constraint_groups]]
 name = "output"
@@ -49,7 +70,7 @@ name = "output"
 kind = "interaction"
 tag = "ECALL"
 input = ["timestamp", ["cast", ["-", ["^", 2, 64], 2], "DWordWL"]]
-multiplicity = ["-", "μ"]
+multiplicity = ["-", "μ_p"]
 
 [[constraint_groups]]
 name = "mem"
@@ -59,7 +80,7 @@ kind = "interaction"
 tag = "MEMW"
 input = [1, ["cast", ["*", 2, 10], "DWordWL"], "addr", "timestamp", 1, 0, 0]
 output = "addr"
-multiplicity = "μ"
+multiplicity = "μ_p"
 ref = "keccak:c:read_addr"
 
 [[constraints.mem]]
@@ -75,7 +96,7 @@ kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", ["idx", ["idx", "state_ptr", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
-multiplicity = "μ"
+multiplicity = "μ_p"
 
 [[constraints.mem]]
 kind = "interaction"
@@ -83,7 +104,7 @@ tag = "MEMW"
 input = [0, ["cast", ["idx", ["idx", "state_ptr", "x"], "y"], "DWordWL"], ["idx", ["idx", "output_state", "x"], "y"], "timestamp", 0, 0, 1]
 output = ["idx", ["idx", "input_state", "x"], "y"]
 iters = [["x", 0, 4], ["y", 0, 4]]
-multiplicity = "μ"
+multiplicity = "μ_p"
 ref = "keccak:c:load_store_state"
 
 [[constraint_groups]]
@@ -93,10 +114,10 @@ name = "round"
 kind = "interaction"
 tag = "KECCAK"
 input = ["timestamp", 0, "input_state"]
-multiplicity = "μ"
+multiplicity = ["+", "μ_p", "μ_s"]
 
 [[constraints.round]]
 kind = "interaction"
 tag = "KECCAK"
 input = ["timestamp", 24, "output_state"]
-multiplicity = ["-", "μ"]
+multiplicity = ["-", ["+", "μ_p", "μ_s"]]

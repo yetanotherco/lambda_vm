@@ -207,6 +207,29 @@ extern "C" __global__ void grind_search(const uint64_t *inner_lanes,
 // `c` is the contiguous slab `[c*col_stride .. c*col_stride + num_rows]`. The
 // remaining `col_stride - num_rows` entries (if any) are ignored.
 // ---------------------------------------------------------------------------
+__device__ __forceinline__ void hash_base_row(const uint64_t *columns_base_ptr,
+                                              uint64_t col_stride,
+                                              uint64_t num_cols,
+                                              uint64_t row,
+                                              uint8_t *out32) {
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+
+    uint32_t rate_pos = 0;
+    for (uint64_t c = 0; c < num_cols; ++c) {
+        uint64_t v = columns_base_ptr[c * col_stride + row];
+        // Canonicalise to match `canonical_u64().to_be_bytes()` on host.
+        uint64_t canon = goldilocks::canonical(v);
+        // The on-disk leaf bytes are canon.to_be_bytes(). Keccak reads those
+        // as a LE lane, which equals bswap64(canon).
+        uint64_t lane = bswap64(canon);
+        absorb_lane(st, rate_pos, lane);
+    }
+
+    finalize_keccak256(st, rate_pos, out32);
+}
+
 extern "C" __global__ void keccak256_leaves_base_batched(
     const uint64_t *columns_base_ptr,
     uint64_t col_stride,
@@ -220,23 +243,55 @@ extern "C" __global__ void keccak256_leaves_base_batched(
     // Bit-reverse the row index so we read columns at `br` but write the hashed
     // leaf at `tid` — matching the CPU per-row `commit_bit_reversed(.., 1)`.
     uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+    hash_base_row(columns_base_ptr, col_stride, num_cols, br,
+                  hashed_leaves_out + tid * 32);
+}
+
+// ---------------------------------------------------------------------------
+// Goldilocks BASE-FIELD strided-coset leaf hashing.
+//
+// Leaf `j` hashes `codeword[j + t * num_leaves]` for `t` in `[0, block)`, in
+// coset order — the fold block a WHIR query opens. Rows are read in natural
+// order, not bit-reversed: the codeword's own index order is what the fold
+// pairs, so there is no permutation between the two.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void keccak256_leaves_base_coset(
+    const uint64_t *codeword,
+    uint64_t num_leaves,
+    uint64_t block,
+    uint8_t *hashed_leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    // A coset is a stride of `num_leaves`, which is exactly `block` slabs of
+    // that stride read at the same offset.
+    hash_base_row(codeword, num_leaves, block, tid, hashed_leaves_out + tid * 32);
+}
+
+// Leaf hashing for an ext3 codeword's fold blocks: leaf `j` hashes
+// `codeword[j + t·num_leaves]` for `t` in `[0, block)`, each element as its
+// three components in canonical big-endian order — what
+// `FieldElement::<Ext3>::write_bytes_be` streams, and what the base-field
+// coset kernel does one component at a time.
+extern "C" __global__ void keccak256_leaves_ext3_coset(const uint64_t *__restrict__ codeword,
+                                                       uint64_t num_leaves, uint64_t block,
+                                                       uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
 
     uint64_t st[25];
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 25; ++i) st[i] = 0;
 
     uint32_t rate_pos = 0;
-    for (uint64_t c = 0; c < num_cols; ++c) {
-        uint64_t v = columns_base_ptr[c * col_stride + br];
-        // Canonicalise to match `canonical_u64().to_be_bytes()` on host.
-        uint64_t canon = goldilocks::canonical(v);
-        // The on-disk leaf bytes are canon.to_be_bytes(). Keccak reads those
-        // as a LE lane, which equals bswap64(canon).
-        uint64_t lane = bswap64(canon);
-        absorb_lane(st, rate_pos, lane);
+    for (uint64_t t = 0; t < block; ++t) {
+        const uint64_t *at = codeword + (tid + t * num_leaves) * 3;
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(at[k])));
+        }
     }
-
-    finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);
+    finalize_keccak256(st, rate_pos, out + tid * 32);
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +459,37 @@ extern "C" __global__ void keccak_fri_leaves_ext3(
     for (int i = 0; i < 3; ++i) {
         uint64_t canon = goldilocks::canonical(right[i]);
         absorb_lane(st, rate_pos, bswap64(canon));
+    }
+
+    finalize_keccak256(st, rate_pos, leaves_out + tid * 32);
+}
+
+// ---------------------------------------------------------------------------
+// FRI GROUP-leaf hashing (S3, higher-arity committed FRI layers).
+//
+// Leaf `tid` hashes the `group` consecutive ext3 values
+// `evals[tid*group .. (tid+1)*group]` of an interleaved eval vector — the
+// `3*group` contiguous u64s at `evals_interleaved + tid*group*3` — each value
+// as its three components in canonical big-endian order. That is the host
+// `Batched` leaf over the group (`hash_data_from_slices(group, [])`), and at
+// `group = 2` exactly `keccak_fri_leaves_ext3`'s byte stream. No bit reversal.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void keccak_fri_group_leaves_ext3(
+    const uint64_t *evals_interleaved,  // 3 * num_leaves * group u64s
+    uint64_t num_leaves,
+    uint64_t group,                      // ext3 values per leaf (2^d)
+    uint8_t *leaves_out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+    uint32_t rate_pos = 0;
+
+    const uint64_t *g = evals_interleaved + tid * group * 3;
+    for (uint64_t i = 0; i < 3 * group; ++i) {
+        absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(g[i])));
     }
 
     finalize_keccak256(st, rate_pos, leaves_out + tid * 32);
@@ -594,6 +680,46 @@ extern "C" __global__ void keccak256_leaves_base_row_major_row_pair_range(
     }
     for (uint64_t c = col_start; c < col_end; ++c) {
         absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(row_1[c])));
+    }
+    finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);
+}
+
+// ---------------------------------------------------------------------------
+// Row-major ONE-ROW leaf hashing (S2, rows_per_leaf = 1).
+//
+// Leaf `tid` hashes the single row `reverse_index(tid)` (bit reversal over
+// `log_num_rows` bits), columns `[col_start, col_end)` of the contiguous
+// row-major buffer (`data + br * m`, `m` the full row stride), as canonical
+// big-endian lanes. `num_leaves = num_rows`. Byte layout equals the CPU
+// `commit_rows_bit_reversed_subset_with(data, m, col_start, col_end, 1)`; the
+// whole row (`[0, m)`) is `commit_rows_bit_reversed_with(data, m, 1)`.
+//
+// NOT the row-pair kernels at another width: those read rows `brev(2·tid)` and
+// `brev(2·tid + 1)` over `log_num_rows` bits, which is a different row set,
+// so one row per leaf needs its own read pattern.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void keccak256_leaves_base_row_major_row_range(
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t col_start,
+    uint64_t col_end,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+
+    uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+    const uint64_t *row = data + br * m;
+
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+
+    uint32_t rate_pos = 0;
+    for (uint64_t c = col_start; c < col_end; ++c) {
+        absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(row[c])));
     }
     finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);
 }

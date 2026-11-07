@@ -344,3 +344,62 @@ extern "C" __global__ void invert_total_ext3(
     out[1] = r.b;
     out[2] = r.c;
 }
+
+// ---------------------------------------------------------------------------
+// 8. invert_denoms_rowwise_ext3_k<K>
+//
+// The same output as `compute_denoms_ext3` followed by the six-kernel batch
+// inverse — `inv_out[(k * n + i) * 3 ..]` = 1 / (sign-dependent `x[i]`, `z[k]`
+// denominator), `DenomSign` as in (1) — in ONE pass: thread `i` builds row
+// `i`'s K denominators and inverts them in registers with one base-field
+// inversion (`ext3_inv.cuh`). No prefix/suffix scratch, no recursion over block
+// totals, no host-side or one-thread Fermat step.
+//
+// `zero_flag` (nullable) is set when a row's denominator product is zero, so a
+// debug caller can keep the scan path's invertibility guard.
+// ---------------------------------------------------------------------------
+#include "ext3_inv.cuh"
+
+template <int K>
+__device__ __forceinline__ void invert_denoms_rowwise_body(const uint64_t *__restrict__ x_base,
+                                                           const uint64_t *__restrict__ z_scalars,
+                                                           uint64_t n, uint64_t denom_sign,
+                                                           uint64_t *__restrict__ inv_out,
+                                                           uint32_t *zero_flag) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint64_t x = x_base[i];
+    ext3::Fe3 d[K];
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        d[k] = denom_sign == 0 ? ext3_inv::z_minus_x(x, z_scalars + 3 * k)
+                               : ext3_inv::x_minus_z(x, z_scalars + 3 * k);
+    }
+    uint64_t product = ext3_inv::batch_inv<K>(d);
+    if (zero_flag != nullptr && goldilocks::canonical(product) == 0) atomicOr(zero_flag, 1u);
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        uint64_t *out = inv_out + ((uint64_t)k * n + i) * 3;
+        out[0] = d[k].a;
+        out[1] = d[k].b;
+        out[2] = d[k].c;
+    }
+}
+
+#define INVERT_DENOMS_ROWWISE(K)                                                                  \
+    extern "C" __global__ void invert_denoms_rowwise_ext3_k##K(                                   \
+        const uint64_t *__restrict__ x_base, const uint64_t *__restrict__ z_scalars, uint64_t n,  \
+        uint64_t denom_sign, uint64_t *__restrict__ inv_out, uint32_t *zero_flag) {               \
+        invert_denoms_rowwise_body<K>(x_base, z_scalars, n, denom_sign, inv_out, zero_flag);      \
+    }
+
+// K up to the barycentric multi kernels' cap (BARY_MAX_EVAL_POINTS = 8) covers
+// every R3 shape; R4 asks for 1 + num_eval_points.
+INVERT_DENOMS_ROWWISE(1)
+INVERT_DENOMS_ROWWISE(2)
+INVERT_DENOMS_ROWWISE(3)
+INVERT_DENOMS_ROWWISE(4)
+INVERT_DENOMS_ROWWISE(5)
+INVERT_DENOMS_ROWWISE(6)
+INVERT_DENOMS_ROWWISE(7)
+INVERT_DENOMS_ROWWISE(8)

@@ -1,0 +1,8 @@
+[workspace]
+
+[package]
+name = "continuation-fixture-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

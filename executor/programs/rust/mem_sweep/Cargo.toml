@@ -1,0 +1,15 @@
+[workspace]
+
+# The ethrex guest's release profile, so the routines swept here are compiled as that
+# guest's are.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[package]
+name = "mem_sweep"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lambda-vm-syscalls = { path = "../../../../syscalls" }

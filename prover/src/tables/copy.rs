@@ -136,6 +136,7 @@ use executor::vm::instruction::execution::{
     DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_GAP, DMA_MEMSET_SYSCALL_NUMBER,
 };
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 /// `write(2)`, the one ECALL number this chip serves that is not an extension.
@@ -266,66 +267,94 @@ impl CopyOperation {
 pub fn generate_copy_trace(
     ops: &[CopyOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let n = ops.len();
-    let num_rows = n.next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_copy_trace_as(ops, TraceForm::Wide)
+}
 
-    for (row_idx, op) in ops.iter().enumerate() {
-        let width = u64::from(op.width);
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+/// The widths COPY traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
 
-        for (column, &byte) in cols::VALUE.iter().zip(&op.value) {
-            table.set_byte(row_idx, *column, byte);
+/// [`generate_copy_trace`] in `form` (`tables::gpack`).
+pub fn generate_copy_trace_as(
+    ops: &[CopyOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_copy_rows_as(ops, ops.len().next_power_of_two().max(4), form)
+}
+
+/// Whether [`generate_copy_rows_as`] in `form` writes its rows packed, with no
+/// 64-bit table on the way: in [`TraceForm::Narrow`] once an earlier COPY
+/// trace of this process left its widths (`tables::gpack`).
+pub(crate) fn rows_written_packed(form: TraceForm) -> bool {
+    matches!(
+        super::gpack::Plan::new(form, &WIDTHS, cols::NUM_COLUMNS),
+        super::gpack::Plan::Write(_)
+    )
+}
+
+/// A COPY table of `num_rows` rows in `form`: `ops` (at most `num_rows`, a row
+/// each), then the padding rows. A row reads its own op alone and the padding
+/// rows are constants, so rows `[k·R, (k+1)·R)` of the whole padded table are
+/// this over the ops in that range with `num_rows = R`: the block's cut of the
+/// whole table, built on its own. A call's rows may straddle two tables: they
+/// chain only through the CopyNext bus, keyed by the call's timestamp and the
+/// running `(src, dst, count)`.
+pub fn generate_copy_rows_as(
+    ops: &[CopyOperation],
+    num_rows: usize,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    debug_assert!(ops.len() <= num_rows);
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in ops.iter().enumerate() {
+            let width = u64::from(op.width);
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+
+            for (column, &byte) in cols::VALUE.iter().zip(&op.value) {
+                table.set_byte(row_idx, *column, byte);
+            }
+
+            table.set_dword_wl(row_idx, cols::SRC_0, op.src);
+            table.set_dword_hl(row_idx, cols::SRC_INCR_0, op.src.wrapping_add(width));
+
+            table.set_dword_wl(row_idx, cols::DST_0, op.dst);
+            table.set_dword_hl(row_idx, cols::DST_INCR_0, op.dst.wrapping_add(width));
+
+            table.set_dword_wl(row_idx, cols::COUNT_0, op.count);
+            table.set_dword_hl(row_idx, cols::COUNT_DECR_0, op.count.wrapping_sub(width));
+
+            table.set_dword_hl(row_idx, cols::DST_RES_0, op.dst_res());
+
+            table.set_bool(row_idx, cols::FIRST, op.first);
+            table.set_bool(row_idx, cols::END, op.end);
+            table.set_bool(row_idx, cols::SINGLE, op.width == 1);
+            table.set_fe(row_idx, cols::MU, FE::one());
+
+            let is_set = op.functionality == Functionality::Set;
+            let is_write = op.functionality == Functionality::Write;
+            table.set_bool(row_idx, cols::IS_SET, is_set);
+            table.set_bool(row_idx, cols::IS_WRITE, is_write);
+            table.set_bool(row_idx, cols::FIRST_WRITE, op.first && is_write);
+
+            // `mu - count_borrows[1]`: the row copies unless it is the degenerate
+            // zero-length row, which is the only one that borrows out of `count - step`.
+            let copies = op.count != 0;
+            table.set_bool(row_idx, cols::MU_COM, copies && is_write);
+            table.set_bool(
+                row_idx,
+                cols::MU_COM_WIDE,
+                copies && is_write && op.width == 8,
+            );
         }
 
-        table.set_dword_wl(row_idx, cols::SRC_0, op.src);
-        table.set_dword_hl(row_idx, cols::SRC_INCR_0, op.src.wrapping_add(width));
-
-        table.set_dword_wl(row_idx, cols::DST_0, op.dst);
-        table.set_dword_hl(row_idx, cols::DST_INCR_0, op.dst.wrapping_add(width));
-
-        table.set_dword_wl(row_idx, cols::COUNT_0, op.count);
-        table.set_dword_hl(row_idx, cols::COUNT_DECR_0, op.count.wrapping_sub(width));
-
-        table.set_dword_hl(row_idx, cols::DST_RES_0, op.dst_res());
-
-        table.set_bool(row_idx, cols::FIRST, op.first);
-        table.set_bool(row_idx, cols::END, op.end);
-        table.set_bool(row_idx, cols::SINGLE, op.width == 1);
-        table.set_fe(row_idx, cols::MU, FE::one());
-
-        let is_set = op.functionality == Functionality::Set;
-        let is_write = op.functionality == Functionality::Write;
-        table.set_bool(row_idx, cols::IS_SET, is_set);
-        table.set_bool(row_idx, cols::IS_WRITE, is_write);
-        table.set_bool(row_idx, cols::FIRST_WRITE, op.first && is_write);
-
-        // `mu - count_borrows[1]`: the row copies unless it is the degenerate
-        // zero-length row, which is the only one that borrows out of `count - step`.
-        let copies = op.count != 0;
-        table.set_bool(row_idx, cols::MU_COM, copies && is_write);
-        table.set_bool(
-            row_idx,
-            cols::MU_COM_WIDE,
-            copies && is_write && op.width == 8,
-        );
-    }
-
-    for row_idx in n..num_rows {
-        // `single = 0` on padding, so `step = 8` and the three unconditional ADD
-        // relations close with `count = src_incr = dst_incr = 8` and everything else
-        // zero. Both borrows are then zero, so no padding row touches the memory bus.
-        table.set_fe(row_idx, cols::COUNT_0, FE::from(8u64));
-        table.set_fe(row_idx, cols::SRC_INCR_0, FE::from(8u64));
-        table.set_fe(row_idx, cols::DST_INCR_0, FE::from(8u64));
-    }
-
-    trace
+        for row_idx in ops.len()..num_rows {
+            // `single = 0` on padding, so `step = 8` and the three unconditional ADD
+            // relations close with `count = src_incr = dst_incr = 8` and everything else
+            // zero. Both borrows are then zero, so no padding row touches the memory bus.
+            table.set_fe(row_idx, cols::COUNT_0, FE::from(8u64));
+            table.set_fe(row_idx, cols::SRC_INCR_0, FE::from(8u64));
+            table.set_fe(row_idx, cols::DST_INCR_0, FE::from(8u64));
+        }
+    })
 }
 
 /// `-1 / 2^32`, `-1 / 2^16` and friends, for the two borrows of `count - step`.
