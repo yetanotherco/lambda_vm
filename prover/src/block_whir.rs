@@ -749,6 +749,11 @@ struct HostReading {
     /// Its inactive file pages (`memory.stat`'s `inactive_file`, or v1's
     /// `total_inactive_file`): the page cache the kernel reclaims first.
     inactive_file: u64,
+    /// The peak and the charge as read, the page-locked pool's free part
+    /// included: the memory the host really holds ([`Self::real_bytes`]).
+    /// Without a pool, `hwm` and `charged` themselves.
+    raw_hwm: u64,
+    raw_charged: u64,
 }
 
 impl HostReading {
@@ -780,10 +785,13 @@ impl HostReading {
         // host (the drop rule's, the walk's hand-off) counts it once, as it is
         // taken ([`multilinear::pinned::unused_pool_bytes`]).
         let unused = multilinear::pinned::unused_pool_bytes();
+        let (raw_hwm, raw_charged) = (hwm.unwrap_or(0), charged.unwrap_or(0));
         Self {
-            hwm: hwm.unwrap_or(0).saturating_sub(unused),
-            charged: charged.unwrap_or(0).saturating_sub(unused),
+            hwm: raw_hwm.saturating_sub(unused),
+            charged: raw_charged.saturating_sub(unused),
             inactive_file: inactive_file.unwrap_or(0),
+            raw_hwm,
+            raw_charged,
         }
     }
 
@@ -799,6 +807,16 @@ impl HostReading {
             .max(self.charged.saturating_sub(self.inactive_file))
     }
 
+    /// [`Self::bytes`] with the page-locked pool's free part counted: what the
+    /// host really holds. The netted reading forecasts as if that part will
+    /// take the block's later allocations, which only the pool's own
+    /// allocations can; this one is what the cgroup's limit sees. The same as
+    /// [`Self::bytes`] without a pool.
+    fn real_bytes(&self) -> u64 {
+        self.raw_hwm
+            .max(self.raw_charged.saturating_sub(self.inactive_file))
+    }
+
     /// What the host holds now: the cgroup's working set and the allocator's
     /// resident bytes (`allocator`), the larger. Unlike [`Self::bytes`] it
     /// falls when a purge hands freed pages back.
@@ -807,6 +825,13 @@ impl HostReading {
             .saturating_sub(self.inactive_file)
             .max(allocator.unwrap_or(0))
     }
+}
+
+/// What the host really holds now ([`HostReading::real_bytes`]), for a card
+/// test that sets a target against it.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn host_real_bytes_now() -> u64 {
+    HostReading::now().real_bytes()
 }
 
 /// The host's bytes a drop decision weighs: its peak ([`HostReading::bytes`]),
@@ -1096,6 +1121,75 @@ fn drop_wanted(
         .saturating_add(memory_reserve_bytes(cells, per_g))
         .saturating_add(bytes)
         > target
+}
+
+/// The `auto` rule's verdict on one committed table of `bytes`, and the
+/// real-memory guard's, `(rule, guard)`: the rule forecasts from `host`, the
+/// netted reading ([`decision_bytes`]), with `extra` once live regeneration
+/// has armed; the guard wants the table out when what the host really holds
+/// ([`real_decision_bytes`]), with the table and `extra`, is already past
+/// `target`. The rule takes the page-locked pool's free part as room for the
+/// block's later allocations, which only the pool's own allocations can use;
+/// the guard keeps the cgroup's limit in sight. Without a pool the two
+/// readings are one and the rule adds its reserve to it, so the guard never
+/// wants a table the rule keeps.
+#[allow(clippy::too_many_arguments)]
+fn auto_wants(
+    reading: &HostReading,
+    host: u64,
+    now: bool,
+    extra: u64,
+    target: u64,
+    per_g: f64,
+    cells: u64,
+    bytes: u64,
+) -> (bool, bool) {
+    let rule = drop_wanted(target, per_g, cells, bytes, || host.saturating_add(extra));
+    let guard = real_decision_bytes(reading, now)
+        .saturating_add(bytes)
+        .saturating_add(extra)
+        > target;
+    (rule, guard)
+}
+
+/// What the host really holds, the page-locked pool's free part counted, in
+/// the decision's own terms ([`decision_bytes`]): the peak
+/// ([`HostReading::real_bytes`]), or under armed partial drops the cgroup's
+/// working set now. Never above [`decision_bytes`] of the same reading
+/// without a pool.
+fn real_decision_bytes(reading: &HostReading, now: bool) -> u64 {
+    if now {
+        reading.raw_charged.saturating_sub(reading.inactive_file)
+    } else {
+        reading.real_bytes()
+    }
+}
+
+/// The walk's hand-off by the real-memory guard: what the host really holds
+/// at the walk's end (the peak, the pool's free part counted) past the
+/// pressure line, whatever the forecast; 0 under it. Without a pool it never
+/// asks more than [`hand_off_need`] of the same peak.
+fn real_hand_off_need(raw_hwm: u64, target: u64) -> u64 {
+    raw_hwm.saturating_sub(pressure_line(target))
+}
+
+/// The real-memory guard's account over a prove: the most the host really
+/// held at a decision, and the decisions it alone made (a table out, or the
+/// walk's hand-off, that the netted reading would have kept).
+#[derive(Default)]
+struct RealGuard {
+    most: std::sync::atomic::AtomicU64,
+    alone: std::sync::atomic::AtomicU64,
+}
+
+impl RealGuard {
+    fn note(&self, real: u64, alone: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.most.fetch_max(real, Relaxed);
+        if alone {
+            self.alone.fetch_add(1, Relaxed);
+        }
+    }
 }
 
 impl BlockOptions {
@@ -1818,6 +1912,9 @@ pub struct BlockStamps {
     /// With live regeneration: the rule it decided by, and the largest host
     /// reading it decided on (the `BLOCK DROPS` line).
     pub drops: Option<String>,
+    /// With live regeneration: the decisions the real-memory guard alone made
+    /// ([`auto_wants`], [`real_hand_off_need`]); 0 without a pool.
+    pub real_guard_alone: u64,
     /// With [`BlockOptions::regen`] set to regenerate: what the regenerator
     /// did, and its `BLOCK REGEN` lines (printed as phase B ends, not in
     /// [`Self::report`]).
@@ -5592,6 +5689,10 @@ fn prove_streamed(
     // (#1013's `Spill::host_most`).
     let host_most: std::sync::Arc<std::sync::Mutex<Option<HostReading>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
+    // And what the host really held, with the decisions the real-memory guard
+    // alone made ([`auto_wants`]).
+    let real_guard = std::sync::Arc::new(RealGuard::default());
+    let hand_off_guard = std::sync::Arc::clone(&real_guard);
     // With live regeneration the allocator's two boundary purges wait for the
     // resident set to come within the regeneration window of the pressure line.
     let room = no_disk_room(live_regen.is_some(), target);
@@ -5616,6 +5717,7 @@ fn prove_streamed(
         .then(|| DropPurges::new(crate::alloc_purge::purge_now));
     let wanted: std::sync::Arc<multilinear_block::SpillWanted> = {
         let host_most = std::sync::Arc::clone(&host_most);
+        let real_guard = std::sync::Arc::clone(&real_guard);
         let armed = live_regen.clone();
         let purges = drop_purges.clone();
         let reserve = regen::regen_reserve_bytes();
@@ -5630,7 +5732,7 @@ fn prove_streamed(
                     *most = Some(reading);
                 }
             }
-            note_pressure_past(reading.bytes(), target);
+            note_pressure_past(reading.real_bytes(), target);
             let is_armed = armed.as_ref().is_some_and(|r| r.is_armed());
             let extra = if is_armed { reserve } else { 0 };
             let now = purges.is_some() && is_armed;
@@ -5639,7 +5741,9 @@ fn prove_streamed(
                 .flatten()
                 .map(|s| s.resident as u64);
             let host = decision_bytes(&reading, allocator, now);
-            let out = drop_wanted(target, per_g, cells, bytes, || host.saturating_add(extra));
+            let (rule, guard) = auto_wants(&reading, host, now, extra, target, per_g, cells, bytes);
+            real_guard.note(reading.real_bytes(), guard && !rule);
+            let out = rule || guard;
             if out && let Some(purges) = &purges {
                 purges.dropped(bytes);
             }
@@ -6026,19 +6130,28 @@ fn prove_streamed(
                 // finish's forecast passes the pressure share, live
                 // regeneration arms now, before its hump builds.
                 if let Some(spill) = walk_spill.as_ref() {
-                    let hwm = HostReading::now().hwm;
+                    let reading = HostReading::now();
+                    let hwm = reading.hwm;
                     let cycles = (window_stamps.windows as u64).saturating_mul(window as u64);
+                    let forecast = hand_off_need(hwm, cycles, target);
+                    let real = real_hand_off_need(reading.raw_hwm, target);
+                    hand_off_guard.note(reading.real_bytes(), real > 0 && forecast == 0);
                     let need = if deviations.hand_off_all {
                         u64::MAX
                     } else {
-                        hand_off_need(hwm, cycles, target)
+                        forecast.max(real)
                     };
                     if need > 0 {
                         crate::alloc_purge::note_memory_pressure();
                         let armed = spill.hand_off(need);
                         let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+                        let really = if reading.raw_hwm > hwm {
+                            format!(" (really {:.2} GiB, the page-locked pool counted)", g(reading.raw_hwm))
+                        } else {
+                            String::new()
+                        };
                         eprintln!(
-                            "BLOCK HAND-OFF: at the walk's end ({windows_done:.2} s), VmHWM {:.2} GiB + \
+                            "BLOCK HAND-OFF: at the walk's end ({windows_done:.2} s), VmHWM {:.2} GiB{really} + \
                              {:.2} for {:.1} M cycles walked is past {:.2} GiB ({}/{} of the target) by {} · \
                              live regeneration armed: {}",
                             g(hwm),
@@ -6541,7 +6654,7 @@ fn prove_streamed(
         // Phase A's freed pages back to the OS before phase B allocates: when
         // the block's memory is short (`note_pressure_past`, read once more
         // here), or as `LAMBDA_VM_ALLOC_PURGE` names it.
-        note_pressure_past(HostReading::now().bytes(), target);
+        note_pressure_past(HostReading::now().real_bytes(), target);
         crate::alloc_purge::purge_point("phase-a");
         // The shadow regenerator starts here, beside the rest of the prove; it
         // drops nothing, and any exit of the prove stops and joins it.
@@ -7007,6 +7120,25 @@ fn prove_streamed(
             let host = match *host_most.lock().unwrap_or_else(|e| e.into_inner()) {
                 Some(h) => format!(" · host at most {:.2} GiB", g(h.bytes())),
                 None => String::new(),
+            };
+            // With the page-locked pool, what the host really held beside it
+            // and what the real-memory guard alone decided (said only when the
+            // pool hid some of the host).
+            use std::sync::atomic::Ordering::Relaxed;
+            let real_most = real_guard.most.load(Relaxed);
+            stamps.real_guard_alone = real_guard.alone.load(Relaxed);
+            let netted_most = host_most
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map_or(0, |h| h.bytes());
+            let host = if real_most > netted_most {
+                format!(
+                    "{host} · really {:.2} GiB, the page-locked pool counted · the real-memory guard alone decided {}",
+                    g(real_most),
+                    stamps.real_guard_alone
+                )
+            } else {
+                host
             };
             stamps.drops = Some(format!(
                 "live regeneration decides as `auto` (target {:.1} GiB){host}",
@@ -7590,9 +7722,10 @@ pub(crate) fn verify_block_whir_traced(
 #[cfg(test)]
 mod memory_target_tests {
     use super::{
-        CgroupValue, HostReading, MEMORY_RESERVE_PER_G, cgroup_memory, drop_wanted, hand_off_need,
-        memory_reserve_bytes, memory_short, memory_target_from, no_disk_room, parse_reserve_per_g,
-        parse_target_gib, parse_tree_drop, pressure_line, renamed_knob,
+        CgroupValue, HostReading, MEMORY_RESERVE_PER_G, auto_wants, cgroup_memory, decision_bytes,
+        drop_wanted, hand_off_need, memory_reserve_bytes, memory_short, memory_target_from,
+        no_disk_room, parse_reserve_per_g, parse_target_gib, parse_tree_drop, pressure_line,
+        real_decision_bytes, real_hand_off_need, renamed_knob,
     };
     use crate::alloc_purge::{NoDisk, has_room};
 
@@ -7745,6 +7878,7 @@ mod memory_target_tests {
             hwm,
             charged,
             inactive_file,
+            ..HostReading::default()
         };
         assert_eq!(
             reading(24_680_000_000, 40_580_000_000, 15_180_000_000).bytes(),
@@ -7753,6 +7887,137 @@ mod memory_target_tests {
         assert_eq!(reading(0, 4 * GIB, 6 * GIB).bytes(), 0);
         assert_eq!(reading(30 * GIB, 40 * GIB, 15 * GIB).bytes(), 30 * GIB);
         assert_eq!(reading(0, 120 * GIB, 0).bytes(), 120 * GIB);
+    }
+
+    /// A reading the page-locked pool hid `hidden` bytes of: `hwm` and
+    /// `charged` netted, the raw figures with them.
+    fn pooled(hwm: u64, charged: u64, inactive_file: u64, hidden: u64) -> HostReading {
+        HostReading {
+            hwm,
+            charged,
+            inactive_file,
+            raw_hwm: hwm + hidden,
+            raw_charged: charged + hidden,
+        }
+    }
+
+    /// ★ Without a pool the real-memory guard decides nothing: the rule reads
+    /// the same bytes and adds its reserve, so the guard never wants a table
+    /// out that the rule keeps, peak or partial reading, armed or not; the
+    /// walk's hand-off never asks more; and the real reading is the rule's.
+    #[test]
+    fn the_real_memory_guard_decides_nothing_without_a_pool() {
+        let gib = |g: f64| (g * GIB as f64) as u64;
+        let mut cases = 0;
+        for hwm in [0, gib(20.0), gib(54.2), gib(92.0), gib(108.5), gib(140.0)] {
+            for charged in [0, gib(30.0), gib(61.0), gib(109.0), gib(150.0)] {
+                for inactive_file in [0, gib(2.0), gib(40.0)] {
+                    let reading = pooled(hwm, charged, inactive_file, 0);
+                    assert_eq!(reading.real_bytes(), reading.bytes());
+                    for target in [0, gib(54.0), gib(108.5), u64::MAX] {
+                        for cycles in [0u64, 300_000_000, 600_000_000] {
+                            assert!(
+                                real_hand_off_need(reading.raw_hwm, target)
+                                    <= hand_off_need(reading.hwm, cycles, target)
+                            );
+                        }
+                        for (now, allocator) in [
+                            (false, None),
+                            (true, None),
+                            (true, Some(gib(70.0))),
+                            (true, Some(0)),
+                        ] {
+                            let host = decision_bytes(&reading, allocator, now);
+                            assert!(real_decision_bytes(&reading, now) <= host);
+                            for extra in [0, gib(10.0)] {
+                                for cells in [0, 10_000_000_000, 30_000_000_000] {
+                                    for bytes in [0, 64 << 20, gib(2.0)] {
+                                        let (rule, guard) = auto_wants(
+                                            &reading,
+                                            host,
+                                            now,
+                                            extra,
+                                            target,
+                                            MEMORY_RESERVE_PER_G,
+                                            cells,
+                                            bytes,
+                                        );
+                                        assert!(
+                                            rule || !guard,
+                                            "hwm {hwm} charged {charged} inactive {inactive_file} \
+                                             target {target} now {now} {allocator:?} extra {extra} \
+                                             cells {cells} bytes {bytes}"
+                                        );
+                                        cases += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 10_000, "{cases}");
+    }
+
+    /// ★ With the pool hiding its free part, the guard wants a table out the
+    /// rule keeps once what the host really holds passes the target: the rule
+    /// reads 80 GiB and forecasts 91.9 against 108.5, while the host holds
+    /// 105 GiB and the table and the armed reserve take it to 109.25. The
+    /// walk's hand-off likewise, from a real peak past the pressure line with a
+    /// netted one under it. The large block's own readings (61 GiB netted,
+    /// 88 GiB really, armed) stay under both, so the guard keeps out of it.
+    #[test]
+    fn the_real_memory_guard_arms_where_the_pool_hides_the_host() {
+        let gib = |g: f64| (g * GIB as f64) as u64;
+        let target = gib(108.5);
+        let reading = pooled(gib(80.0), gib(80.0), 0, gib(25.0));
+        for now in [false, true] {
+            let host = decision_bytes(&reading, None, now);
+            let (rule, guard) = auto_wants(
+                &reading,
+                host,
+                now,
+                gib(4.0),
+                target,
+                MEMORY_RESERVE_PER_G,
+                1_000_000_000,
+                gib(0.25),
+            );
+            assert!(!rule && guard, "now {now}: rule {rule} guard {guard}");
+        }
+        // Under the target the guard keeps it too.
+        let host = decision_bytes(&reading, None, false);
+        let (rule, guard) = auto_wants(
+            &reading,
+            host,
+            false,
+            0,
+            target,
+            MEMORY_RESERVE_PER_G,
+            1_000_000_000,
+            gib(0.25),
+        );
+        assert!(!rule && !guard);
+        // The walk's end: 70 GiB netted forecasts under the line, 95 really
+        // held is past it.
+        assert_eq!(hand_off_need(gib(70.0), 100_000_000, target), 0);
+        assert!(real_hand_off_need(gib(95.0), target) > 0);
+        // The large block (25481021) with a 56 GiB pool, armed: neither.
+        let large = pooled(gib(59.1), gib(61.0), 0, gib(27.0));
+        let host = decision_bytes(&large, None, false);
+        let (rule, guard) = auto_wants(
+            &large,
+            host,
+            false,
+            gib(10.0),
+            target,
+            MEMORY_RESERVE_PER_G,
+            29_000_000_000,
+            64 << 20,
+        );
+        assert!(!guard, "the guard on the large: rule {rule}");
+        assert_eq!(real_hand_off_need(gib(86.7), target), 0);
     }
 
     /// The target is the smaller of the cgroup limit and `MemTotal`, less
@@ -9078,11 +9343,13 @@ mod drop_tests {
             hwm: 66 * G,
             charged: 65 * G,
             inactive_file: G,
+            ..HostReading::default()
         };
         let after = HostReading {
             hwm: 66 * G,
             charged: 49 * G,
             inactive_file: G,
+            ..HostReading::default()
         };
         assert_eq!(decision_bytes(&before, Some(60 * G), true), 64 * G);
         assert_eq!(decision_bytes(&after, Some(44 * G), true), 48 * G);

@@ -2235,6 +2235,65 @@ fn live_regeneration_proves_the_same_bytes() {
     }
 }
 
+/// ★ The real-memory guard arms where the page-locked pool hides the host. A
+/// 24 GiB pool is locked at the prove's entry, and the target sits 16 GiB
+/// above what the host held before it. The netted reading (the pool's free
+/// part taken off) with the rule's reserve stays under that target; what the
+/// host really holds, the pool counted, passes it by about 8 GiB. The guard
+/// alone sends tables out (or hands the walk's parked tables off), live
+/// regeneration arms, every dropped table comes back, and the proof verifies
+/// with the plain prove's partition. It must be the process's first prove: the
+/// pool's netting ends with it.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "box: needs a card and 24 GiB to lock"]
+fn the_real_memory_guard_arms_where_the_pool_hides_the_host() {
+    use crate::block_whir::regen::RegenMode;
+    if math_cuda::device::backend().is_err() {
+        eprintln!("REAL MEMORY GUARD TEST: SKIPPED, no device");
+        return;
+    }
+    assert_eq!(
+        math_cuda::pinned::set_pool_gib_for_tests(24),
+        24,
+        "the knob was read already"
+    );
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let before = block_whir::host_real_bytes_now();
+    let target = before + (16u64 << 30);
+    let (proof, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Auto,
+        Deviations {
+            memory_target: Some(target),
+            ..Deviations::default()
+        },
+    )
+    .expect("prove");
+    let pinned = stamps.pinned.expect("the pool's stats");
+    assert_eq!(pinned.locked_bytes, 24 << 30, "the pool locked whole");
+    let r = stamps.regen.as_ref().expect("live regeneration's readout");
+    let lines = r.lines.join("\n");
+    eprintln!(
+        "REAL MEMORY GUARD TEST: before {before} target {target} · {:?} · alone {}\n{lines}",
+        stamps.drops, stamps.real_guard_alone
+    );
+    assert!(
+        stamps.real_guard_alone > 0,
+        "the guard decided nothing alone: {:?}\n{lines}",
+        stamps.drops
+    );
+    assert!(lines.contains("armed at"), "nothing armed\n{lines}");
+    assert!(r.dropped > 0, "nothing dropped\n{lines}");
+    assert_eq!(r.regenerated, r.dropped, "every table back\n{lines}");
+    assert!(verify(&proof, &elf, &format));
+    let (plain, _) =
+        regenerated(&elf, &format, RegenMode::Off, Deviations::default()).expect("prove");
+    assert_eq!(proof.groups, plain.groups, "the partition");
+}
+
 /// Without live regeneration nothing leaves the host, even where the `auto`
 /// rule would want every table out (a target of 0): there is no rule to arm,
 /// no drops line, and the proof is the same bytes.
