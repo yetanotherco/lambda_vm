@@ -1,16 +1,19 @@
 #import "/meta.typ": et, aside, rj
 
 // Spaces and instances
-#let (programSpace, program) = ($cal(F)$, $f$)
+#let (programSpace, program, splitPrograms) = ($cal(F)$, $f$, $F$)
 #let (inputSpace, input) = ($II$, $bb(i)$)
 #let (instanceSpace, instance, instance2) = ($XX$, $bb(x)$, $bb(y)$)
 #let (witnessSpace, witness) = ($WW$, $bb(w)$)
 #let (proofSpace, proof) = ($bb(Pi)$, $pi$)
+#let (record, recordSpace) = ($bb(r)$, $Re$)
+#let inputMap = $d$
 
 #let (commitmentSpace, commitment) = ($cal(C)$, $bb(c)$)
 #let commit(x) = $dash(#x)$
 #let comm(x) = $commit(#x)$
 #let comm2(x) = $hat(#x)$
+#let cksum = math.serif("cksum")
 
 #let hash = $H$
 
@@ -19,6 +22,7 @@
 
 #let verifierSpace = $cal(V)$
 #let (prove, verify) = ($italic(p)$, $italic(v)$)
+#let recurse = $nu$
 
 // Mathematical symbols
 #let (zero, one) = ($0$, $1$)
@@ -27,13 +31,99 @@
 #let prob = $PP$
 #let to = math.arrow.r
 
-#set list(marker: [---])
+// #set list(marker: [---])
+#rj[Context and motivation]
 
-= Proof recursion <proof-recursion>
+= Definitions
+For an NP language $language$, we let $relation_language$ (or just $relation$ if the language is clear from context),
+denote a set of instance-witness pairs $(instance, witness)$ such that $instance in language iff exists witness: (instance, witness) in relation_language$.
+A proof system $(prove, verify)$ for a relation $relation$ consists of two functions $prove(instance, witness) mapsto proof$ and $verify(instance, proof) mapsto (instance in^? language)$,
+where we assume the proof system to be complete and sound.
+
+= Splitting programs
 Let $BB := { zero, one }$ denote the boolean set and let 
-$programSpace := {program: inputSpace times witnessSpace to BB}$ denote 
-the set of functions mapping the (public) input space $inputSpace$ and (private) 
-witness space $witnessSpace$ to this set.
+$programSpace_inputSpace := {program: inputSpace to BB}$ denote 
+the set of decision functions on $inputSpace$.
+We wish to decompose a function $program in programSpace_inputSpace$ into separate parts $program_i$ such that
+the original function outputs $one$ if and only if all individual parts $program_i$ output $one$.
+For a function $program in programSpace_inputSpace$, we define a _split of $program$_ to be the pair $(splitPrograms, inputMap)$,
+where $splitPrograms subset.eq {(program_i, inputMap_i) | program_i in programSpace_inputSpace, inputMap_i : inputSpace -> inputSpace}$, such that:
+$ 
+program compose inputMap = display(product_((program_i, inputMap_i) in splitPrograms)) program_(i) compose inputMap_(i).
+$
+Here, the maps $inputMap$ and $inputMap_i$ are introduced to enable working with languages that, while not containing the exact same strings,
+represent the same underlying concepts.
+For instance, in the context of this specification, one may consider a language such as "RISC-V ELF binaries that output exactly the number 42",
+which would contain very large strings, but is morally equivalent to the language of short fixed-length strings "the sha256 hash of a RISC-V ELF binary that outputs exactly the number 42".
+Different decision functions (or later, proof systems) may benefit from different representations or digests of the same concept,
+so that is integrated through these functions.
+
+== Proofs for split programs
+A split of a decision function can equivalently be interpreted as defining a language
+by the intersection of a set of other languages $language = inter.big_i { inputMap(input) | inputMap_(i)(input) in language_i}$.
+In that spirit, we wish to construct a proof system $(prove, verify)$ for a decision function $program in programSpace_inputSpace$
+from proof systems $(prove_i, verify_i)$ for a split $({(program_i, inputMap_i)}_i, inputMap)$ of $program$ and a proof system
+$(prove_inputMap, verify_inputMap)$ for the $inputMap$ relation.
+
+Letting the combined proof be the concatenations of the individual proofs for the split functions is a promising start,
+but it fails to account for the $inputMap$ and $inputMap_i$ maps.
+To address this insufficiency, we additionally need to prove that each $prove_i$ received an instance from the same input to $inputMap_i$.
+We do this by introducing a _checksum_ $cksum(x)$, and assuming derived proof systems $(prove'_(i), verify'_(i))$
+for the languages $language'_i = {(inputMap_(i)(input) || cksum(input)) | inputMap_(i)(input) in language_i}$ where we can verify that the instance matches a given checksum.#footnote[
+  These derived proof systems are in general not guaranteed to be close to the original proof system, but in most cases, including those we care about, they can be.
+]
+Now we can write $
+prove(instance, (input, (witness_i)_i)) &= (cksum(input), prove_(inputMap)(instance, input), (inputMap_(i)(input), prove_(inputMap_i)(inputMap_(i)(input), input), prove'_(i)(inputMap_(i)(input), witness_i))_i)\
+verify(instance, s, proof_inputMap, (instance_i, proof_(inputMap_i), proof_i)_i) &= and.big_i (verify_(inputMap_i)(instance_i, proof_(inputMap_i)) and verify'_(i)(instance_i || s, proof_i)) and verify_(inputMap)(instance, proof_inputMap)
+$
+and, depending on the choice of checksum, be confident that the sub-proofs all attest to the same instance.
+Hence, $(prove, verify)$, as defined, is itself a valid proof system proving membership of the intersection language $language$.
+
+For pratical instantiations, where we let the $inputMap_i$ maps be a succinct commitment to the witness that is use by $(prove'_i, verify'_i)$,
+the purpose of $proof_(inputMap_i)$ is subsumed directly by $proof_i$, and needs not be separately proven or verified.
+By choosing $inputMap = (inputMap_i)_i$, and hence $instance = (instance_0, instance_1, ...)$, we can simplify further, and not require a separate $proof_d$ either.
+Such a simplified proof system would look as follows.
+$
+  prove((instance_i)_i, (witness_i)_i) &= (cksum(input), (prove'_(i)(instance_i, witness_i))_i)\
+  verify((instance_i)_i, s, (proof_i)_i) &= and.big_i verify'_(i)(instance_i || s, proof_i).
+$
+
+
+= Proof recursion
+Consider a succinct proof system $(prove, verify)$ for the language $language = {(comm(program), input) | program in programSpace_inputSpace, input in inputSpace, program(input) = 1}$,
+where $comm(program) in commitmentSpace$ is a short digest or identifier for $program$.
+Then we can define the function $recurse(comm(program), input)$ to decide whether there exists a proof $pi = prove(comm(program), input, witness)$ such that $verify(comm(program), input, pi) = 1$.
+As such $(comm(recurse), comm(program), input) in language$, and it can be proven by $prove$ with $proof$ as part of the witness $witness_1$.#footnote[
+  This requires that $inputSpace$ is closed under prepending $comm(program)$, so e.g. $inputSpace = union.big_i commitmentSpace^i times inputSpace'$.
+]
+Since we consider the proof system to be succinct, we expect that $|proof| < |witness|$, and so $|prove(comm(recurse), comm(program), input, witness_1)| < |proof|$,
+reducing the proof size (and commonly the verification time required).#footnote[
+  This is not guaranteed since it is still possible that $|witness_1| > |witness|$.
+  But shrinking proof size often also leads to reducing verification time, which would also reduce the size of the witness.
+]
+By repeating the approach, this effect can be enhanced further: $|prove(comm(recurse), comm(recurse), comm(program), input, witness_2)| < |prove(comm(recurse), comm(program), input, witness_1)|$.
+This general idea of proving the existence of a proof, is known as _proof recursion_.
+
+The recursion approached described above suffers from a drawback however: the instance size grows linearly with the number of recursion layers.
+However, the instance has a very regular structure, so instead, one may define $
+  verify'(n, comm(recurse'), comm(program), input, proof) = cases(
+    verify(comm(program), input, proof) "if" n = 0,
+    verify'(recurse(n - 1, comm(recurse'), comm(program), input), proof) "otherwise"
+  ),
+$ and $recurse'$ analogously.
+
+= Split recursion
+#rj[Combining the two sections]
+#rj[Introduce verifier/proof transformation with record if needed to make better splits possible]
+#rj[Should consider the instances to be the VK, or at least just the succinct commitments to the program/input]
+#rj[Concrete instantiations of the checksum]
+...
+
+
+
+#line(length: 100%)
+#rj[Previous version still below for reference during the rewrite]
+= Proof recursion <proof-recursion>
 We define the instance space $instanceSpace := programSpace times inputSpace tilde.equiv {program: witnessSpace to BB}$;
 program-input pairs $(program, input) in instanceSpace$ 
 are henceforth referred to as _function instances_, or simply _instances_.
@@ -144,7 +234,6 @@ $comm(instance)$, since $comm(verify')$ can often be precomputed.
 ]
 
 = Split verification <split-verification>
-#let (record, recordSpace) = ($bb(r)$, $Re$)
 
 Proof recursion involves executing the verification algorithm _inside_ the VM.
 In practice, we find that the set of operations utilized for verification differs vastly from
