@@ -352,6 +352,63 @@ impl TsShadow {
         }
     }
 
+    /// The cells of `len > 0` bytes from `address` when they lie in one flat
+    /// region, with the flat page numbers of the first and the last.
+    #[inline(always)]
+    fn flat_run(&self, address: u64, len: u64) -> Option<(*mut u32, usize, usize)> {
+        let last = address.checked_add(len - 1)?;
+        let inside = last < self.layout.low_end || address >= self.layout.high_base;
+        if !inside {
+            return None;
+        }
+        let cell = self.flat(address)?;
+        Some((cell, self.flat_page(address), self.flat_page(last)))
+    }
+
+    /// Stamps the `len` bytes from `address` (wrapping) with `ts`.
+    #[inline(always)]
+    pub fn fill(&mut self, address: u64, len: u64, ts: u32) {
+        if len == 0 {
+            return;
+        }
+        let Some((cell, first, last)) = self.flat_run(address, len) else {
+            return self.fill_slow(address, len, ts);
+        };
+        for page in first..=last {
+            if self.stamped[page / 64] >> (page % 64) & 1 == 0 {
+                self.stamped[page / 64] |= 1 << (page % 64);
+                self.pages.push(page as u64);
+            }
+        }
+        // SAFETY: `len` cells inside one live region (`flat_run`), held
+        // exclusively.
+        unsafe { std::slice::from_raw_parts_mut(cell, len as usize) }.fill(ts);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill_slow(&mut self, address: u64, len: u64, ts: u32) {
+        for k in 0..len {
+            self.set(address.wrapping_add(k), ts);
+        }
+    }
+
+    /// Appends the timestamps of the `len` bytes from `address` (wrapping)
+    /// to `out`.
+    #[inline]
+    pub fn extend_into(&self, address: u64, len: u64, out: &mut Vec<u32>) {
+        if len == 0 {
+            return;
+        }
+        match self.flat_run(address, len) {
+            // SAFETY: `len` cells inside one live region (`flat_run`).
+            Some((cell, _, _)) => {
+                out.extend_from_slice(unsafe { std::slice::from_raw_parts(cell, len as usize) })
+            }
+            None => out.extend((0..len).map(|k| self.get(address.wrapping_add(k)))),
+        }
+    }
+
     /// The timestamps of the eight bytes from `address` (wrapping).
     #[inline(always)]
     fn get8(&self, address: u64) -> [u32; 8] {
@@ -789,9 +846,7 @@ impl History {
     /// A load's or store's stamp: its first `count` bytes at `ts`.
     #[inline(always)]
     pub(crate) fn after_access(&mut self, address: u64, count: u8, ts: u64) {
-        for k in 0..u64::from(count) {
-            self.shadow.set(address.wrapping_add(k), ts as u32);
-        }
+        self.shadow.fill(address, u64::from(count), ts as u32);
     }
 
     /// Every byte an ECALL's walk touches, before the call, as a side group.
@@ -805,11 +860,15 @@ impl History {
         let first = w.ranges.len() as u32;
         ecall_accesses(log_before, cells, ts, |address, len, _| {
             let start = w.values.len() as u32;
-            for k in 0..len {
-                let at = address.wrapping_add(k);
-                w.values.push(memory.load_byte(at));
-                w.ts.push(shadow.get(at));
+            let from = w.values.len();
+            if len > 0 && address.checked_add(len - 1).is_some() {
+                w.values.resize(from + len as usize, 0);
+                memory.read_range(address, &mut w.values[from..]);
+            } else {
+                w.values
+                    .extend((0..len).map(|k| memory.load_byte(address.wrapping_add(k))));
             }
+            shadow.extend_into(address, len, &mut w.ts);
             w.ranges.push(SideRange {
                 addr: address,
                 start,
@@ -837,9 +896,7 @@ impl History {
         let shadow = &mut self.shadow;
         ecall_accesses(log, cells_before, ts, |address, len, stamp| {
             if let Some(at) = stamp {
-                for k in 0..len {
-                    shadow.set(address.wrapping_add(k), at as u32);
-                }
+                shadow.fill(address, len, at as u32);
             }
         });
     }

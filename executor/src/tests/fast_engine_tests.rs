@@ -831,3 +831,62 @@ fn history_mode_refuses_past_its_clock() {
         Some(10)
     );
 }
+
+// The shadow's range stamps and reads are the byte-by-byte ones: ranges on
+// and across page edges, the flat regions' edges, the paged store between
+// them and the top of the space (wrapping); every page a stamp reaches is
+// listed among the stamped pages, and no other.
+#[test]
+fn the_shadows_ranges_are_its_bytes() {
+    use crate::vm::history::TsShadow;
+    use crate::vm::memory::PAGE_SIZE;
+    use std::collections::{BTreeMap, BTreeSet};
+    let page = PAGE_SIZE as u64;
+    for layout in LAYOUTS {
+        let mut shadow = TsShadow::new(layout).unwrap();
+        let mut model: BTreeMap<u64, u32> = BTreeMap::new();
+        let starts = [
+            0,
+            page - 3,
+            3 * page - 1,
+            layout.low_end - 5,
+            layout.low_end - 1,
+            layout.high_base - 2,
+            layout.high_base,
+            layout.high_base + page - 4,
+            u64::MAX - 6,
+            u64::MAX,
+        ];
+        let mut ts = 10u32;
+        for &start in &starts {
+            for len in [1u64, 2, 7, 8, 200] {
+                // A read first: the bytes before the stamp, as the model has them.
+                let mut got = Vec::new();
+                shadow.extend_into(start, len, &mut got);
+                let want: Vec<u32> = (0..len)
+                    .map(|k| model.get(&start.wrapping_add(k)).copied().unwrap_or(0))
+                    .collect();
+                assert_eq!(got, want, "{layout:?}: read {start:#x}+{len}");
+                shadow.fill(start, len, ts);
+                for k in 0..len {
+                    model.insert(start.wrapping_add(k), ts);
+                }
+                ts += 4;
+            }
+        }
+        for (&address, &want) in &model {
+            assert_eq!(shadow.get(address), want, "{layout:?}: {address:#x}");
+            for k in [1u64, 2, 9] {
+                let near = address.wrapping_add(k);
+                assert_eq!(
+                    shadow.get(near),
+                    model.get(&near).copied().unwrap_or(0),
+                    "{layout:?}: {near:#x}"
+                );
+            }
+        }
+        let listed: BTreeSet<u64> = shadow.pages().into_iter().map(|(base, _)| base).collect();
+        let reached: BTreeSet<u64> = model.keys().map(|a| a & !(page - 1)).collect();
+        assert_eq!(listed, reached, "{layout:?}: the stamped pages");
+    }
+}
