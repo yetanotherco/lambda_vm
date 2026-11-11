@@ -140,7 +140,9 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   -- prod: raw_product[i] is the convolution of the sign-extended operands. Written
   -- `raw_product - convolution`, the way `mul.rs` emits it and the way the `constraint` field of
   -- `spec/src/mul.toml` reads it. Its `poly` field there is the negation of its own `constraint`,
-  -- the one place in the spec that breaks the left-hand-side-first convention EQ and SHIFT follow.
+  -- one of the two places in the spec that break the left-hand-side-first convention EQ and SHIFT
+  -- follow. `dvrm.toml:267-268` is the other, and it produced no divergence only because both
+  -- implementations happened to follow the `poly` there rather than the prose.
   let le4 := 65535 * r.lhsNeg
   let re4 := 65535 * r.rhsNeg
   assertZero (r.raw0 - rawE 0 r.lhs0 r.lhs1 r.lhs2 r.lhs3 le4 le4 le4 le4
