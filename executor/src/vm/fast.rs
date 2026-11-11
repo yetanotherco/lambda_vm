@@ -456,7 +456,7 @@ impl FastExecutor {
         let logs = &mut self.logs;
         let mut pc = self.pc;
         let result = loop {
-            if pc == 0 || logs.len() >= limit {
+            if pc == 0 || RecordSink::cycles(logs) >= limit {
                 break Ok(());
             }
             // A misaligned `pc` rotates its low bits to the top: out of range,
@@ -470,12 +470,12 @@ impl FastExecutor {
             match fast_cycle(op, pc, regs, memory) {
                 Some(log) => {
                     pc = log.next_pc;
-                    logs.push(log);
+                    logs.record(log);
                 }
                 None => match reference_cycle(pc, regs, memory, instructions) {
                     Ok(log) => {
                         pc = log.next_pc;
-                        logs.push(log);
+                        logs.record(log);
                     }
                     Err(e) => break Err(e),
                 },
@@ -483,6 +483,29 @@ impl FastExecutor {
         };
         self.pc = pc;
         result
+    }
+}
+
+/// Where the run's per-cycle records go: the one place the loop writes a
+/// record, apart from the dispatch arms (which only compute the cycle's
+/// [`Log`]). Today a window buffer of 40-byte logs; a wider record (the log
+/// plus what the cycle overwrote) would be another sink fed from here.
+trait RecordSink {
+    /// Records one cycle.
+    fn record(&mut self, log: Log);
+    /// The cycles recorded so far in this window.
+    fn cycles(&self) -> usize;
+}
+
+impl RecordSink for Vec<Log> {
+    #[inline(always)]
+    fn record(&mut self, log: Log) {
+        self.push(log);
+    }
+
+    #[inline(always)]
+    fn cycles(&self) -> usize {
+        self.len()
     }
 }
 
