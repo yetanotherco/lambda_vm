@@ -7,7 +7,7 @@ use std::sync::Arc;
 use executor::elf::Elf;
 use executor::vm::execution::{Executor, InstructionCache};
 use executor::vm::fast::FastExecutor;
-use executor::vm::history::{UNIFORM, WindowHistory};
+use executor::vm::history::{ECALL, NO_ACCESS, WindowHistory};
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 
@@ -220,36 +220,32 @@ fn tamper_with(
 ) -> bool {
     // A store's old bytes are its MEMW row's old values (a load's row takes
     // the loaded value, its old bytes are never read).
-    let stores = |h: &WindowHistory, nth: usize| {
+    // The index in `accesses` of the `nth` uniform one (of a store's, with
+    // `stores`).
+    let uniform_access = |h: &WindowHistory, nth: usize, stores: bool| {
         h.extras
             .iter()
             .zip(logs)
-            .enumerate()
-            .filter(|(_, (e, log))| {
-                e.side == UNIFORM
-                    && matches!(code.get(log.current_pc), Some(Instruction::Store { .. }))
+            .filter(|(e, log)| {
+                e.side != NO_ACCESS
+                    && e.side & ECALL == 0
+                    && h.accesses[e.side as usize].mixed == NO_ACCESS
+                    && (!stores
+                        || matches!(code.get(log.current_pc), Some(Instruction::Store { .. })))
             })
             .nth(nth)
-            .map(|(i, _)| i)
-    };
-    let uniform = |h: &WindowHistory, nth: usize| {
-        h.extras
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.side == UNIFORM)
-            .nth(nth)
-            .map(|(i, _)| i)
+            .map(|(e, _)| e.side as usize)
     };
     match tamper {
         Tamper::LaterAccess { window, nth } if k >= window => {
-            if let Some(i) = uniform(history, nth) {
-                history.extras[i].ts += 1;
+            if let Some(i) = uniform_access(history, nth, false) {
+                history.accesses[i].ts += 1;
                 return true;
             }
         }
         Tamper::OtherValue { window, nth } if k >= window => {
-            if let Some(i) = stores(history, nth) {
-                history.extras[i].old ^= 0x5a;
+            if let Some(i) = uniform_access(history, nth, true) {
+                history.accesses[i].old ^= 0x5a;
                 return true;
             }
         }

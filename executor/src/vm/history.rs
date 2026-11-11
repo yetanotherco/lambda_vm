@@ -11,11 +11,13 @@
 //! [`ecall_accesses`] restate them here), and writes, beside each cycle's
 //! [`Log`], what the walk will read in that cycle:
 //!
-//! - a load or store: the eight bytes at its address and their timestamps
-//!   ([`HistExtra`], 40 bytes beside the 40-byte log); eight timestamps that
-//!   differ go to the window's [`WindowHistory::mixed`] list (32 bytes);
+//! - every cycle: its register accesses' old timestamps and where its memory
+//!   accesses are ([`HistExtra`], 16 bytes beside the 40-byte log);
+//! - a load or store: the eight bytes at its address and their timestamp
+//!   ([`MemAccess`], 24 bytes); eight timestamps that differ go to the
+//!   window's [`WindowHistory::mixed`] list (32 bytes);
 //! - an ECALL: every byte the walk touches, with its value and timestamp before
-//!   the call, as side ranges;
+//!   the call, as side ranges, and its chip's register cells;
 //! - each window: the register cells at its start.
 //!
 //! Timestamps are the walk's: cycle `c` is at `4·c + 4`, its accesses at that
@@ -53,44 +55,48 @@ pub fn cycle_timestamp(cycle: u64) -> u64 {
     cycle * 4 + 4
 }
 
-/// No memory access this cycle.
+/// No memory access this cycle ([`HistExtra::side`]); a load or store whose
+/// eight bytes share one old timestamp ([`MemAccess::mixed`]).
 pub const NO_ACCESS: u32 = u32::MAX;
-/// A load or store whose eight bytes share one old timestamp: `addr`, `old`
-/// and `ts` say it all.
-pub const UNIFORM: u32 = u32::MAX - 1;
-/// A load or store whose eight bytes' old timestamps differ: `addr` and `old`
-/// as for [`UNIFORM`], `ts` the index of the eight timestamps in
-/// [`WindowHistory::mixed`].
-pub const MIXED: u32 = u32::MAX - 2;
+/// [`HistExtra::side`] of an ECALL: this bit and the ECALL's number in the
+/// window.
+pub const ECALL: u32 = 1 << 31;
 
-/// What a cycle's walk reads besides its log: the 24 bytes after the 40-byte
-/// [`Log`] in the 64-byte record.
+/// What a cycle's walk reads besides its log: 16 bytes beside the 40-byte
+/// [`Log`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct HistExtra {
-    /// A load's or store's address (the eight bytes from it are the walk's).
-    pub addr: u64,
-    /// Those eight bytes before the cycle, little-endian.
-    pub old: u64,
-    /// Their timestamp before the cycle (with [`UNIFORM`]), or the index of
-    /// their eight timestamps in [`WindowHistory::mixed`] (with [`MIXED`]).
-    pub ts: u32,
-    /// [`NO_ACCESS`], [`UNIFORM`], [`MIXED`], or the index of the cycle's
-    /// [`SideGroup`] (an ECALL's bytes).
-    pub side: u32,
     /// The old timestamps of the cycle's `rs1` (the pc's for JAL and AUIPC),
     /// `rs2` and `rd` accesses, in the walk's order (an `rd` that is also
     /// `rs1` finds `rs1`'s stamp); 0 where the cycle makes none.
     pub regs_ts: [u32; 3],
-    /// [`NO_ACCESS`], or the index of the cycle's group in
-    /// [`WindowHistory::reg_groups`]: an ECALL chip's register accesses
-    /// beyond `rs1` (x10 to x13 and the commit index x254), their cells
-    /// before the call.
-    pub reg_side: u32,
+    /// [`NO_ACCESS`]; a load's or store's index in
+    /// [`WindowHistory::accesses`]; or [`ECALL`] and the ECALL's number `k`
+    /// in the window: its bytes are `groups[k]`, its chip's register cells
+    /// (x10 to x13 and the commit index x254, before the call)
+    /// `reg_groups[k]`.
+    pub side: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<HistExtra>() == 40);
-const _: () = assert!(std::mem::size_of::<Log>() + std::mem::size_of::<HistExtra>() == 80);
+/// A load or store: the eight bytes from its address before the cycle and
+/// their timestamp.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct MemAccess {
+    /// The access's address (the eight bytes from it are the walk's).
+    pub addr: u64,
+    /// Those eight bytes before the cycle, little-endian.
+    pub old: u64,
+    /// Their timestamp before the cycle, when they share one.
+    pub ts: u32,
+    /// [`NO_ACCESS`] when they share one; else the index of their eight
+    /// timestamps in [`WindowHistory::mixed`].
+    pub mixed: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<HistExtra>() == 16);
+const _: () = assert!(std::mem::size_of::<MemAccess>() == 24);
 
 /// A register's cell before an access: x0 to x31, or 254 for the commit index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,16 +164,18 @@ pub struct WindowHistory {
     pub first: u64,
     pub registers: Option<RegisterCells>,
     pub extras: Vec<HistExtra>,
+    /// The loads and stores, in order.
+    pub accesses: Vec<MemAccess>,
     /// The old timestamps of the loads' and stores' eight bytes where they
-    /// differ ([`MIXED`]), one entry such an access.
+    /// differ ([`MemAccess::mixed`]), one entry such an access.
     pub mixed: Vec<[u32; 8]>,
-    /// ECALLs' memory: `ranges[first..first + count]` for each group.
+    /// ECALLs' memory, one group an ECALL: `ranges[first..first + count]`.
     pub groups: Vec<SideGroup>,
     pub ranges: Vec<SideRange>,
     pub values: Vec<u8>,
     pub ts: Vec<u32>,
-    /// ECALLs' register accesses ([`HistExtra::reg_side`]): `reg_cells[first..
-    /// first + count]` for each group.
+    /// ECALLs' register accesses, one group an ECALL: `reg_cells[first..
+    /// first + count]`.
     pub reg_groups: Vec<SideGroup>,
     pub reg_cells: Vec<RegAccess>,
 }
@@ -176,6 +184,7 @@ impl WindowHistory {
     /// The bytes it takes on the heap.
     pub fn heap_bytes(&self) -> usize {
         self.extras.capacity() * std::mem::size_of::<HistExtra>()
+            + self.accesses.capacity() * std::mem::size_of::<MemAccess>()
             + self.mixed.capacity() * std::mem::size_of::<[u32; 8]>()
             + self.groups.capacity() * std::mem::size_of::<SideGroup>()
             + self.ranges.capacity() * std::mem::size_of::<SideRange>()
@@ -187,12 +196,13 @@ impl WindowHistory {
 
     /// Cycle `i`'s ECALL register accesses (empty for any other cycle).
     pub fn cycle_registers(&self, i: usize) -> &[RegAccess] {
-        match self.extras[i].reg_side {
+        match self.extras[i].side {
             NO_ACCESS => &[],
-            group => {
-                let g = self.reg_groups[group as usize];
+            side if side & ECALL != 0 => {
+                let g = self.reg_groups[(side & !ECALL) as usize];
                 &self.reg_cells[g.first as usize..(g.first + g.count) as usize]
             }
+            _ => &[],
         }
     }
 
@@ -200,22 +210,21 @@ impl WindowHistory {
     /// window reads before the cycle, in order (a byte two ranges hold, once
     /// a range).
     pub fn cycle_cells(&self, i: usize, mut cell: impl FnMut(u64, u8, u32)) {
-        let extra = self.extras[i];
-        match extra.side {
+        match self.extras[i].side {
             NO_ACCESS => {}
-            UNIFORM => {
-                for (k, byte) in extra.old.to_le_bytes().into_iter().enumerate() {
-                    cell(extra.addr.wrapping_add(k as u64), byte, extra.ts);
+            side if side & ECALL == 0 => {
+                let a = self.accesses[side as usize];
+                let mixed = (a.mixed != NO_ACCESS).then(|| &self.mixed[a.mixed as usize]);
+                for (k, byte) in a.old.to_le_bytes().into_iter().enumerate() {
+                    cell(
+                        a.addr.wrapping_add(k as u64),
+                        byte,
+                        mixed.map_or(a.ts, |ts| ts[k]),
+                    );
                 }
             }
-            MIXED => {
-                let ts = &self.mixed[extra.ts as usize];
-                for (k, byte) in extra.old.to_le_bytes().into_iter().enumerate() {
-                    cell(extra.addr.wrapping_add(k as u64), byte, ts[k]);
-                }
-            }
-            group => {
-                let g = self.groups[group as usize];
+            side => {
+                let g = self.groups[(side & !ECALL) as usize];
                 for r in &self.ranges[g.first as usize..(g.first + g.count) as usize] {
                     for k in 0..r.len as usize {
                         let at = r.start as usize + k;
@@ -744,9 +753,9 @@ pub(crate) struct History {
     /// ([`crate::vm::fast::FastExecutor::recycle_extras`]).
     pub(crate) spare_extras: Option<Vec<HistExtra>>,
     /// The side lists' lengths in the last window handed out
-    /// ([`History::take_window`]): `mixed`, `groups`, `ranges`, `values`
-    /// (and `ts`), `reg_groups`, `reg_cells`.
-    last_sides: [usize; 6],
+    /// ([`History::take_window`]): `accesses`, `mixed`, `groups`, `ranges`,
+    /// `values` (and `ts`), `reg_groups`, `reg_cells`.
+    last_sides: [usize; 7],
 }
 
 impl History {
@@ -756,7 +765,7 @@ impl History {
             cells: RegisterCells::at_start(entry_point),
             window: WindowHistory::default(),
             spare_extras: None,
-            last_sides: [0; 6],
+            last_sides: [0; 7],
         })
     }
 
@@ -771,12 +780,20 @@ impl History {
             }
             _ => Vec::with_capacity(capacity),
         };
-        let [mixed, groups, ranges, values, reg_groups, reg_cells] =
-            self.last_sides.map(|n| n + n / 4);
+        let [
+            accesses,
+            mixed,
+            groups,
+            ranges,
+            values,
+            reg_groups,
+            reg_cells,
+        ] = self.last_sides.map(|n| n + n / 4);
         self.window = WindowHistory {
             first,
             registers: Some(self.cells),
             extras,
+            accesses: Vec::with_capacity(accesses),
             mixed: Vec::with_capacity(mixed),
             groups: Vec::with_capacity(groups),
             ranges: Vec::with_capacity(ranges),
@@ -792,6 +809,7 @@ impl History {
     pub(crate) fn take_window(&mut self) -> WindowHistory {
         let w = std::mem::take(&mut self.window);
         self.last_sides = [
+            w.accesses.len(),
             w.mixed.len(),
             w.groups.len(),
             w.ranges.len(),
@@ -802,10 +820,11 @@ impl History {
         w
     }
 
-    /// The eight bytes from `address` before a load or store: one record, and
-    /// their eight timestamps in [`WindowHistory::mixed`] when they differ.
+    /// The eight bytes from `address` before a load or store: one
+    /// [`MemAccess`], and their eight timestamps in [`WindowHistory::mixed`]
+    /// when they differ. Returns the cycle's [`HistExtra::side`].
     #[inline(always)]
-    pub(crate) fn before_access<M: GuestMemory>(&mut self, memory: &M, address: u64) -> HistExtra {
+    pub(crate) fn before_access<M: GuestMemory>(&mut self, memory: &M, address: u64) -> u32 {
         let old = if address <= u64::MAX - 7 {
             u64::from_le_bytes(memory.read_n::<8>(address))
         } else {
@@ -814,25 +833,20 @@ impl History {
             }))
         };
         let ts = self.shadow.get8(address);
-        if ts.iter().all(|&t| t == ts[0]) {
-            return HistExtra {
-                addr: address,
-                old,
-                ts: ts[0],
-                side: UNIFORM,
-                ..HistExtra::default()
-            };
-        }
-        let mixed = &mut self.window.mixed;
-        let at = mixed.len() as u32;
-        mixed.push(ts);
-        HistExtra {
+        let w = &mut self.window;
+        let mixed = if ts.iter().all(|&t| t == ts[0]) {
+            NO_ACCESS
+        } else {
+            w.mixed.push(ts);
+            w.mixed.len() as u32 - 1
+        };
+        w.accesses.push(MemAccess {
             addr: address,
             old,
-            ts: at,
-            side: MIXED,
-            ..HistExtra::default()
-        }
+            ts: ts[0],
+            mixed,
+        });
+        w.accesses.len() as u32 - 1
     }
 
     /// A load's or store's stamp: its first `count` bytes at `ts`.
@@ -841,13 +855,14 @@ impl History {
         self.shadow.fill(address, u64::from(count), ts as u32);
     }
 
-    /// Every byte an ECALL's walk touches, before the call, as a side group.
+    /// Every byte an ECALL's walk touches, before the call, as the window's
+    /// next group (empty for none). Returns the cycle's [`HistExtra::side`].
     pub(crate) fn before_ecall<M: GuestMemory>(
         &mut self,
         memory: &M,
         log_before: &Log,
         ts: u64,
-    ) -> HistExtra {
+    ) -> u32 {
         let (shadow, cells, w) = (&self.shadow, &self.cells, &mut self.window);
         let first = w.ranges.len() as u32;
         ecall_accesses(log_before, cells, ts, |address, len, _| {
@@ -868,35 +883,21 @@ impl History {
             });
         });
         let count = w.ranges.len() as u32 - first;
-        if count == 0 {
-            return HistExtra {
-                side: NO_ACCESS,
-                ..HistExtra::default()
-            };
-        }
-        let group = w.groups.len() as u32;
         w.groups.push(SideGroup { first, count });
-        HistExtra {
-            side: group,
-            ..HistExtra::default()
-        }
+        ECALL | (w.groups.len() as u32 - 1)
     }
 
     /// An ECALL's register accesses after [`step_registers`]: its chip's
-    /// cells before them go to the window's `reg_cells` as one group, whose
-    /// index it returns ([`NO_ACCESS`] for none).
+    /// cells before them go to the window's `reg_cells` as its group (empty
+    /// for none), the same number as its memory group.
     #[cold]
     #[inline(never)]
-    pub(crate) fn ecall_registers(&mut self, log: &Log, ts: u64) -> u32 {
+    pub(crate) fn ecall_registers(&mut self, log: &Log, ts: u64) {
         let w = &mut self.window;
         let first = w.reg_cells.len() as u32;
         ecall_registers(&mut self.cells, log, ts, &mut w.reg_cells);
         let count = w.reg_cells.len() as u32 - first;
-        if count == 0 {
-            return NO_ACCESS;
-        }
         w.reg_groups.push(SideGroup { first, count });
-        w.reg_groups.len() as u32 - 1
     }
 
     /// An ECALL's stamps, in the walk's order, from the register cells

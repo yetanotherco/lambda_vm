@@ -77,19 +77,19 @@ fn main() {
                     .resume_history(window)
                     .expect("the run")
                     .map(|(logs, h)| {
-                        side_bytes += h.heap_bytes() - h.extras.capacity() * 40;
+                        side_bytes += h.heap_bytes()
+                            - h.extras.capacity()
+                                * std::mem::size_of::<executor::vm::history::HistExtra>();
                         if diag {
-                            use executor::vm::history::{MIXED, NO_ACCESS, UNIFORM};
-                            let count = |f: &dyn Fn(u32) -> bool| {
-                                h.extras.iter().filter(|e| f(e.side)).count()
-                            };
+                            use executor::vm::history::NO_ACCESS;
+                            let mixed = h.accesses.iter().filter(|a| a.mixed != NO_ACCESS).count();
                             eprintln!(
                                 "ENGINES TIME SIDES: cycles {} uniform {} mixed {} ecalls {} \
                                  ecall bytes {} register cells {}",
                                 h.extras.len(),
-                                count(&|s| s == UNIFORM),
-                                count(&|s| s == MIXED),
-                                count(&|s| s != NO_ACCESS && s != UNIFORM && s != MIXED),
+                                h.accesses.len() - mixed,
+                                mixed,
+                                h.groups.len(),
                                 h.values.len(),
                                 h.reg_cells.len(),
                             );

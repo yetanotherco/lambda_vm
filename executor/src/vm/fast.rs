@@ -510,7 +510,7 @@ impl FastExecutor {
             } else {
                 None
             };
-            let extra = if uses.mem > 0 {
+            let side = if uses.mem > 0 {
                 history.before_access(memory, address)
             } else if uses.ecall {
                 let a7 = regs[17];
@@ -527,10 +527,7 @@ impl FastExecutor {
                 };
                 history.before_ecall(memory, &provisional, ts)
             } else {
-                HistExtra {
-                    side: NO_ACCESS,
-                    ..HistExtra::default()
-                }
+                NO_ACCESS
             };
             let log = match fast_cycle(op, pc, regs, memory) {
                 Some(log) => log,
@@ -545,14 +542,11 @@ impl FastExecutor {
             if let Some(before) = &cells_before {
                 history.after_ecall(&log, before, ts);
             }
-            let mut extra = extra;
-            extra.regs_ts = step_registers(&mut history.cells, uses, &log, ts);
-            extra.reg_side = if uses.ecall {
-                history.ecall_registers(&log, ts)
-            } else {
-                NO_ACCESS
-            };
-            history.window.extras.push(extra);
+            let regs_ts = step_registers(&mut history.cells, uses, &log, ts);
+            if uses.ecall {
+                history.ecall_registers(&log, ts);
+            }
+            history.window.extras.push(HistExtra { regs_ts, side });
             pc = log.next_pc;
             logs.record(log);
             cycle += 1;
