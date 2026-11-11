@@ -1044,7 +1044,7 @@ impl HistoryOverlay {
         let Some(i) = (timestamp / 4)
             .checked_sub(1 + self.history.first)
             .map(|i| i as usize)
-            .filter(|&i| i < self.history.extras.len() && timestamp % 4 == 0)
+            .filter(|&i| i < self.history.extras.len() && timestamp.is_multiple_of(4))
         else {
             return;
         };
