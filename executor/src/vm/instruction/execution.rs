@@ -1,7 +1,7 @@
 use crate::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
-    memory::{Memory, MemoryError},
+    memory::{GuestMemory, MemoryError},
     registers::Registers,
 };
 
@@ -513,7 +513,7 @@ impl SyscallNumbers {
 }
 
 /// Reads a 256-bit little-endian value as four doublewords at `addr + 8i`.
-fn load_u256_le(memory: &Memory, addr: u64) -> Result<[u8; 32], MemoryError> {
+fn load_u256_le<M: GuestMemory>(memory: &M, addr: u64) -> Result<[u8; 32], MemoryError> {
     let mut out = [0u8; 32];
     for i in 0..4 {
         let dw = memory.load_doubleword(addr + (i as u64) * 8)?;
@@ -523,7 +523,11 @@ fn load_u256_le(memory: &Memory, addr: u64) -> Result<[u8; 32], MemoryError> {
 }
 
 /// Writes a 256-bit little-endian value as four doublewords at `addr + 8i`.
-fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(), MemoryError> {
+fn store_u256_le<M: GuestMemory>(
+    memory: &mut M,
+    addr: u64,
+    bytes: &[u8; 32],
+) -> Result<(), MemoryError> {
     for i in 0..4 {
         let mut dw = [0u8; 8];
         dw.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
@@ -588,13 +592,97 @@ fn addr_limb_ok(addr: u64, max_offset: u64) -> bool {
     (addr % LOW_LIMB) + max_offset < LOW_LIMB
 }
 
+/// The address a load or store of `offset` from a register holding `base`
+/// reaches.
+#[inline(always)]
+pub(crate) fn effective_address(base: u64, offset: i32) -> u64 {
+    (base as i64).wrapping_add(offset as i64) as u64
+}
+
+/// The target of a branch or jump `offset` bytes from `pc`.
+#[inline(always)]
+pub(crate) fn pc_relative(pc: u64, offset: i32) -> u64 {
+    (pc as i64).wrapping_add(offset as i64) as u64
+}
+
+/// The target of a JALR from a register holding `base`: the sum with its low
+/// bit cleared.
+#[inline(always)]
+pub(crate) fn jalr_target(base: u64, offset: i32) -> u64 {
+    (((base as i64).wrapping_add(offset as i64)) & !1) as u64
+}
+
+/// The value LUI writes: RV64 sign-extends the 32-bit result to 64 bits.
+#[inline(always)]
+pub(crate) fn lui_value(imm: u32) -> u64 {
+    (imm as i32) as i64 as u64
+}
+
+/// The value AUIPC writes: `pc` plus the sign-extended immediate.
+#[inline(always)]
+pub(crate) fn auipc_value(pc: u64, imm: u32) -> u64 {
+    pc.wrapping_add((imm as i32) as i64 as u64)
+}
+
+/// The value a load of `width` at `addr` writes to its register, with RV64's
+/// sign or zero extension.
+#[inline(always)]
+pub(crate) fn load_value<M: GuestMemory>(
+    memory: &M,
+    width: LoadStoreWidth,
+    addr: u64,
+) -> Result<u64, MemoryError> {
+    Ok(match width {
+        // RV64: LB sign-extends to 64 bits
+        LoadStoreWidth::Byte => (memory.load_byte(addr) as i8) as i64 as u64,
+        // RV64: LH sign-extends to 64 bits
+        LoadStoreWidth::Half => (memory.load_half(addr)? as i16) as i64 as u64,
+        // RV64: LW sign-extends to 64 bits
+        LoadStoreWidth::Word => (memory.load_word(addr)? as i32) as i64 as u64,
+        // RV64: LD loads 64 bits
+        LoadStoreWidth::DoubleWord => memory.load_doubleword(addr)?,
+        // RV64: LBU zero-extends to 64 bits
+        LoadStoreWidth::ByteUnsigned => memory.load_byte(addr) as u64,
+        // RV64: LHU zero-extends to 64 bits
+        LoadStoreWidth::HalfUnsigned => memory.load_half(addr)? as u64,
+        // RV64: LWU zero-extends to 64 bits
+        LoadStoreWidth::WordUnsigned => memory.load_word(addr)? as u64,
+    })
+}
+
+/// A store of `width` of the register value `value` at `addr`.
+#[inline(always)]
+pub(crate) fn store_value<M: GuestMemory>(
+    memory: &mut M,
+    width: LoadStoreWidth,
+    addr: u64,
+    value: u64,
+) -> Result<(), ExecutionError> {
+    match width {
+        LoadStoreWidth::Byte => memory.store_byte(addr, (value & 0xFF) as u8),
+        LoadStoreWidth::Half => memory.store_half(addr, (value & 0xFFFF) as u16)?,
+        LoadStoreWidth::Word => memory.store_word(addr, value as u32)?,
+        LoadStoreWidth::DoubleWord => memory.store_doubleword(addr, value)?,
+        LoadStoreWidth::ByteUnsigned => {
+            return Err(ExecutionError::StoreBytesUnsignedNotSupported);
+        }
+        LoadStoreWidth::HalfUnsigned => {
+            return Err(ExecutionError::StoreHalfUnsignedNotSupported);
+        }
+        LoadStoreWidth::WordUnsigned => {
+            return Err(ExecutionError::StoreWordUnsignedNotSupported);
+        }
+    }
+    Ok(())
+}
+
 impl Instruction {
     /// Runs the given instruction and returns its execution log
-    pub fn run(
+    pub fn run<M: GuestMemory>(
         self,
         pc: &mut u64,
         registers: &mut Registers,
-        memory: &mut Memory,
+        memory: &mut M,
     ) -> Result<Log, ExecutionError> {
         let log = self.execute(*pc, registers, memory)?;
         *pc = log.next_pc;
@@ -602,11 +690,11 @@ impl Instruction {
     }
 
     /// Executes the given instruction returning the new value of pc, the register to be updated and the new value of said register
-    fn execute(
+    pub(crate) fn execute<M: GuestMemory>(
         self,
         pc: u64,
         registers: &mut Registers,
-        memory: &mut Memory,
+        memory: &mut M,
     ) -> Result<Log, ExecutionError> {
         Ok(match self {
             Instruction::ArithImm { dst, src, imm, op } => {
@@ -647,7 +735,7 @@ impl Instruction {
             }
             Instruction::JumpAndLinkRegister { dst, base, offset } => {
                 let base_value = registers.read(base)?;
-                let new_pc = (((base_value as i64).wrapping_add(offset as i64)) & !1) as u64;
+                let new_pc = jalr_target(base_value, offset);
                 registers.write(dst, pc.wrapping_add(REGULAR_PC_UPDATE))?;
                 Log {
                     current_pc: pc,
@@ -661,7 +749,7 @@ impl Instruction {
                 registers.write(dst, pc.wrapping_add(REGULAR_PC_UPDATE))?;
                 Log {
                     current_pc: pc,
-                    next_pc: (pc as i64).wrapping_add(offset as i64) as u64,
+                    next_pc: pc_relative(pc, offset),
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: pc.wrapping_add(REGULAR_PC_UPDATE),
@@ -675,32 +763,8 @@ impl Instruction {
             } => {
                 let read_value = registers.read(src)?;
                 let base = registers.read(base)?;
-                let addr = (base as i64).wrapping_add(offset as i64) as u64;
-                match width {
-                    LoadStoreWidth::Byte => {
-                        let value = read_value & 0xFF;
-                        memory.store_byte(addr, value as u8);
-                    }
-                    LoadStoreWidth::Half => {
-                        let value = read_value & 0xFFFF;
-                        memory.store_half(addr, value as u16)?;
-                    }
-                    LoadStoreWidth::Word => {
-                        memory.store_word(addr, read_value as u32)?;
-                    }
-                    LoadStoreWidth::DoubleWord => {
-                        memory.store_doubleword(addr, read_value)?;
-                    }
-                    LoadStoreWidth::ByteUnsigned => {
-                        return Err(ExecutionError::StoreBytesUnsignedNotSupported);
-                    }
-                    LoadStoreWidth::HalfUnsigned => {
-                        return Err(ExecutionError::StoreHalfUnsignedNotSupported);
-                    }
-                    LoadStoreWidth::WordUnsigned => {
-                        return Err(ExecutionError::StoreWordUnsignedNotSupported);
-                    }
-                };
+                let addr = effective_address(base, offset);
+                store_value(memory, width, addr, read_value)?;
                 Log {
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
@@ -716,23 +780,8 @@ impl Instruction {
                 width,
             } => {
                 let base = registers.read(base)?;
-                let addr = (base as i64).wrapping_add(offset as i64) as u64;
-                let value = match width {
-                    // RV64: LB sign-extends to 64 bits
-                    LoadStoreWidth::Byte => (memory.load_byte(addr) as i8) as i64 as u64,
-                    // RV64: LH sign-extends to 64 bits
-                    LoadStoreWidth::Half => (memory.load_half(addr)? as i16) as i64 as u64,
-                    // RV64: LW sign-extends to 64 bits
-                    LoadStoreWidth::Word => (memory.load_word(addr)? as i32) as i64 as u64,
-                    // RV64: LD loads 64 bits
-                    LoadStoreWidth::DoubleWord => memory.load_doubleword(addr)?,
-                    // RV64: LBU zero-extends to 64 bits
-                    LoadStoreWidth::ByteUnsigned => memory.load_byte(addr) as u64,
-                    // RV64: LHU zero-extends to 64 bits
-                    LoadStoreWidth::HalfUnsigned => memory.load_half(addr)? as u64,
-                    // RV64: LWU zero-extends to 64 bits
-                    LoadStoreWidth::WordUnsigned => memory.load_word(addr)? as u64,
-                };
+                let addr = effective_address(base, offset);
+                let value = load_value(memory, width, addr)?;
                 registers.write(dst, value)?;
                 Log {
                     current_pc: pc,
@@ -750,7 +799,7 @@ impl Instruction {
             } => {
                 let (a, b) = (registers.read(src1)?, registers.read(src2)?);
                 let new_pc = if cond.apply(a, b) {
-                    (pc as i64).wrapping_add(offset as i64) as u64
+                    pc_relative(pc, offset)
                 } else {
                     pc.wrapping_add(REGULAR_PC_UPDATE)
                 };
@@ -763,8 +812,7 @@ impl Instruction {
                 }
             }
             Instruction::LoadUpperImm { dst, imm } => {
-                // RV64: LUI sign-extends the 32-bit result to 64 bits
-                let value = (imm as i32) as i64 as u64;
+                let value = lui_value(imm);
                 registers.write(dst, value)?;
                 Log {
                     current_pc: pc,
@@ -775,8 +823,7 @@ impl Instruction {
                 }
             }
             Instruction::AddUpperImmToPc { dst, imm } => {
-                // RV64: AUIPC adds sign-extended imm to PC
-                let value = pc.wrapping_add((imm as i32) as i64 as u64);
+                let value = auipc_value(pc, imm);
                 registers.write(dst, value)?;
                 Log {
                     current_pc: pc,
@@ -1187,7 +1234,7 @@ impl Instruction {
                         // hot-path ecall while preserving snapshot semantics.
                         let mut bytes = [0u8; DMA_MEMCPY_MAX_BYTES as usize];
                         let bytes = &mut bytes[..n as usize];
-                        if memory.paths().dma_bulk {
+                        if memory.dma_bulk() {
                             // The whole source, then the whole destination: the
                             // bytes and the words marked written are the byte
                             // loop's below.
@@ -1231,7 +1278,7 @@ impl Instruction {
                             return Err(ExecutionError::DmaMemsetBadGap { src, dst });
                         }
 
-                        if memory.paths().dma_bulk {
+                        if memory.dma_bulk() {
                             // With `dst = src + 8` the forward byte walk below
                             // reads, at step `i >= 8`, the byte it wrote at step
                             // `i - 8`: the destination is the first
@@ -1326,7 +1373,8 @@ impl Instruction {
 
 impl ArithOp {
     /// 64-bit arithmetic operations (RV64I base)
-    fn apply(&self, a: i64, b: i64) -> i64 {
+    #[inline(always)]
+    pub(crate) fn apply(&self, a: i64, b: i64) -> i64 {
         match self {
             ArithOp::Add => a.wrapping_add(b),
             ArithOp::Sub => a.wrapping_sub(b),
@@ -1381,7 +1429,8 @@ impl ArithOp {
     }
 
     /// 32-bit arithmetic operations with sign extension (RV64 W-suffix)
-    fn apply_word(&self, a: i32, b: i32) -> Result<i32, ExecutionError> {
+    #[inline(always)]
+    pub(crate) fn apply_word(&self, a: i32, b: i32) -> Result<i32, ExecutionError> {
         Ok(match self {
             ArithOp::Add => a.wrapping_add(b),
             ArithOp::Sub => a.wrapping_sub(b),
@@ -1427,7 +1476,8 @@ impl ArithOp {
 }
 
 impl Comparison {
-    fn apply(&self, a: u64, b: u64) -> bool {
+    #[inline(always)]
+    pub(crate) fn apply(&self, a: u64, b: u64) -> bool {
         match self {
             Comparison::Equal => a == b,
             Comparison::NotEqual => a != b,

@@ -8,7 +8,7 @@ use crate::{
             execution::ExecutionError,
         },
         logs::Log,
-        memory::{ExecPaths, Memory, MemoryError, StoreKind, U64HashMap},
+        memory::{ExecPaths, GuestMemory, Memory, MemoryError, StoreKind, U64HashMap},
         registers::Registers,
     },
 };
@@ -124,6 +124,22 @@ impl Executor {
         &self.memory
     }
 
+    /// The run's state replaced: `pc`, the registers, and a memory holding
+    /// `snapshot`'s bytes and the public output `public_output` (on this
+    /// executor's access paths). The program stays. What a check re-executes
+    /// a window of another engine's run from.
+    pub fn restore(
+        &mut self,
+        pc: u64,
+        registers: Registers,
+        snapshot: &crate::vm::memory::MemorySnapshot,
+        public_output: Vec<u8>,
+    ) {
+        self.memory = Memory::from_snapshot(snapshot, public_output, self.memory.paths());
+        self.registers = registers;
+        self.pc = pc;
+    }
+
     /// Resume execution, running at most `limit` cycles, and return the logs
     /// produced. Returns None when the program is finished.
     pub fn resume_with_limit(&mut self, limit: usize) -> Result<Option<&[Log]>, ExecutorError> {
@@ -134,17 +150,12 @@ impl Executor {
         self.logs.clear();
 
         while self.pc != 0 && self.logs.len() < limit {
-            if !self.pc.is_multiple_of(4) {
-                return Err(ExecutorError::InstructionAddressMisaligned(self.pc));
-            }
-            let instruction = match self.instructions.get(self.pc) {
-                Some(&instr) => instr,
-                None => {
-                    let next_instruction = self.memory.load_word(self.pc)?;
-                    Instruction::parse(next_instruction)?
-                }
-            };
-            let log = instruction.run(&mut self.pc, &mut self.registers, &mut self.memory)?;
+            let log = step(
+                &mut self.pc,
+                &mut self.registers,
+                &mut self.memory,
+                &self.instructions,
+            )?;
             self.logs.push(log);
         }
 
@@ -241,7 +252,34 @@ impl Executor {
     }
 }
 
-fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result<(), MemoryError> {
+/// One cycle: the instruction at `pc` (from the decoded segments, else
+/// decoded from the word in memory) executed, `pc` moved on. The reference
+/// executor's whole loop body; the fast engine's for every instruction it
+/// does not run itself.
+#[inline(always)]
+pub(crate) fn step<M: GuestMemory>(
+    pc: &mut u64,
+    registers: &mut Registers,
+    memory: &mut M,
+    instructions: &InstructionCache,
+) -> Result<Log, ExecutorError> {
+    if !pc.is_multiple_of(4) {
+        return Err(ExecutorError::InstructionAddressMisaligned(*pc));
+    }
+    let instruction = match instructions.get(*pc) {
+        Some(&instr) => instr,
+        None => {
+            let next_instruction = memory.load_word(*pc)?;
+            Instruction::parse(next_instruction)?
+        }
+    };
+    Ok(instruction.run(pc, registers, memory)?)
+}
+
+pub(crate) fn load_program<M: GuestMemory>(
+    segments: &[crate::elf::Segment],
+    memory: &mut M,
+) -> Result<(), MemoryError> {
     for segment in segments {
         for (i, inst) in segment.values.iter().enumerate() {
             let addr = segment.base_addr + (i as u64 * 4);
@@ -353,6 +391,13 @@ impl InstructionCache {
             return None;
         }
         segment.instructions.get((byte_offset / 4) as usize)
+    }
+
+    /// Each decoded segment's base address and instructions.
+    pub(crate) fn segments(&self) -> impl Iterator<Item = (u64, &[Instruction])> {
+        self.segments
+            .iter()
+            .map(|s| (s.base_addr, s.instructions.as_slice()))
     }
 
     pub fn instruction_count(&self) -> usize {

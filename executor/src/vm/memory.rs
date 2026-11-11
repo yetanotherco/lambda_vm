@@ -158,8 +158,8 @@ enum Store {
     Words(U64HashMap<[u8; 4]>),
 }
 
-const PAGE_BITS: u32 = 16;
-const PAGE_SIZE: usize = 1 << PAGE_BITS;
+pub(crate) const PAGE_BITS: u32 = 16;
+pub(crate) const PAGE_SIZE: usize = 1 << PAGE_BITS;
 const PAGE_MASK: u64 = PAGE_SIZE as u64 - 1;
 /// The highest page number.
 const LAST_PAGE: u64 = u64::MAX >> PAGE_BITS;
@@ -174,7 +174,46 @@ struct Page {
     written: Box<[u64]>,
 }
 
+/// [`Pages::refresh`] of a page already held: the chunks copied in place when
+/// no snapshot shares the page, else the page replaced by a fresh copy.
+fn refresh_shared(
+    arc: &mut Arc<Page>,
+    source: &[u8],
+    chunks: u16,
+    fresh: &impl Fn(u16) -> Arc<Page>,
+) {
+    const CHUNK: usize = PAGE_SIZE / 16;
+    match Arc::get_mut(arc) {
+        Some(page) => {
+            for i in (0..16).filter(|i| chunks >> i & 1 == 1) {
+                let range = i * CHUNK..(i + 1) * CHUNK;
+                page.bytes[range.clone()].copy_from_slice(&source[range]);
+            }
+            page.mark_chunks(chunks);
+        }
+        None => {
+            let mut page = fresh(chunks);
+            // The marks the page had stay marked.
+            if let Some(new) = Arc::get_mut(&mut page) {
+                for (mine, old) in new.written.iter_mut().zip(arc.written.iter()) {
+                    *mine |= old;
+                }
+            }
+            *arc = page;
+        }
+    }
+}
+
 impl Page {
+    /// Every word of the 4 KiB chunks set in `chunks` marked written.
+    fn mark_chunks(&mut self, chunks: u16) {
+        // 1024 words a chunk: 16 mark words.
+        let per_chunk = self.written.len() / 16;
+        for i in (0..16).filter(|i| chunks >> i & 1 == 1) {
+            self.written[i * per_chunk..(i + 1) * per_chunk].fill(u64::MAX);
+        }
+    }
+
     fn new() -> Self {
         Self {
             bytes: vec![0u8; PAGE_SIZE].into_boxed_slice(),
@@ -202,7 +241,7 @@ impl Page {
 /// snapshot still holds before changing it ([`Arc::make_mut`]): a snapshot
 /// keeps reading the bytes of its moment.
 #[derive(Clone, Default)]
-struct Pages {
+pub(crate) struct Pages {
     low: Vec<Option<Arc<Page>>>,
     high: Vec<Option<Arc<Page>>>,
     other: std::collections::BTreeMap<u64, Arc<Page>>,
@@ -221,7 +260,7 @@ impl std::fmt::Debug for Pages {
 
 impl Pages {
     /// The bytes the pages and the directories take on the heap.
-    fn heap_bytes(&self) -> usize {
+    pub(crate) fn heap_bytes(&self) -> usize {
         let page = std::mem::size_of::<Page>() + PAGE_SIZE + PAGE_SIZE / 4 / 64 * 8;
         let pages = self
             .low
@@ -292,9 +331,61 @@ impl Pages {
         (directory(&self.low, &now.low) + directory(&self.high, &now.high) + other) * page
     }
 
+    /// Page `number` brought up to date with `source`, the page's whole
+    /// current contents, for the 4 KiB chunks set in `chunks` (bit `i` for
+    /// bytes `4096·i..4096·(i + 1)`): the chunks are copied into the page when
+    /// no snapshot shares it, and otherwise the page is replaced by a copy of
+    /// all of `source`, the snapshot keeping the old one. Each copied chunk's
+    /// words are marked written. Returns whether the page is new.
+    ///
+    /// What the fast engine's flat memory publishes its window-start states
+    /// through: `source` is the flat memory's copy of the page.
+    pub(crate) fn refresh(&mut self, number: u64, source: &[u8], chunks: u16) -> bool {
+        debug_assert_eq!(source.len(), PAGE_SIZE);
+        let fresh = |chunks: u16| {
+            let mut page = Page {
+                bytes: source.to_vec().into_boxed_slice(),
+                written: vec![0u64; PAGE_SIZE / 4 / 64].into_boxed_slice(),
+            };
+            page.mark_chunks(chunks);
+            Arc::new(page)
+        };
+        let slot = if number < DIRECTORY_PAGES {
+            let index = number as usize;
+            if self.low.len() <= index {
+                self.low.resize_with(index + 1, || None);
+            }
+            &mut self.low[index]
+        } else if LAST_PAGE - number < DIRECTORY_PAGES {
+            let index = (LAST_PAGE - number) as usize;
+            if self.high.len() <= index {
+                self.high.resize_with(index + 1, || None);
+            }
+            &mut self.high[index]
+        } else {
+            let entry = self.other.entry(number);
+            let new = matches!(entry, std::collections::btree_map::Entry::Vacant(_));
+            let arc = entry.or_insert_with(|| fresh(chunks));
+            if !new {
+                refresh_shared(arc, source, chunks, &fresh);
+            }
+            return new;
+        };
+        match slot {
+            None => {
+                *slot = Some(fresh(chunks));
+                true
+            }
+            Some(arc) => {
+                refresh_shared(arc, source, chunks, &fresh);
+                false
+            }
+        }
+    }
+
     /// The bytes at `address..` into `out`; the range must not wrap.
     #[inline]
-    fn read(&self, address: u64, out: &mut [u8]) {
+    pub(crate) fn read(&self, address: u64, out: &mut [u8]) {
         let mut done = 0;
         while done < out.len() {
             let at = address + done as u64;
@@ -310,7 +401,7 @@ impl Pages {
 
     /// `data` at `address..`; the range must not wrap.
     #[inline]
-    fn write(&mut self, address: u64, data: &[u8]) {
+    pub(crate) fn write(&mut self, address: u64, data: &[u8]) {
         let mut done = 0;
         while done < data.len() {
             let at = address + done as u64;
@@ -408,11 +499,291 @@ impl Memory {
         }
     }
 
+    /// A memory holding the bytes of `snapshot` and the public output
+    /// `public_output`, on the given paths: a run's state restored to go on
+    /// from (the fast engine's shadow check re-executes a window from it).
+    pub fn from_snapshot(
+        snapshot: &MemorySnapshot,
+        public_output: Vec<u8>,
+        paths: ExecPaths,
+    ) -> Self {
+        Self {
+            store: snapshot.store.clone(),
+            public_output,
+            paths,
+        }
+    }
+
     /// The access paths this memory takes.
     pub fn paths(&self) -> ExecPaths {
         self.paths
     }
 
+    /// The bytes the memory takes on the heap: its pages (or the word map's
+    /// slots, an entry and a control byte each) and the public output.
+    pub fn heap_bytes(&self) -> usize {
+        let store = match &self.store {
+            Store::Pages(pages) => pages.heap_bytes(),
+            Store::Words(cells) => cells.capacity() * (std::mem::size_of::<(u64, [u8; 4])>() + 1),
+        };
+        store + self.public_output.capacity()
+    }
+
+    /// The memory as it is now, kept while the run goes on: the pages are
+    /// shared, and a later write copies a page the snapshot holds before
+    /// changing it, so the snapshot keeps reading this moment's bytes. Cheap
+    /// for the pages store (one count per page); the words store copies its
+    /// map.
+    pub fn snapshot(&self) -> MemorySnapshot {
+        MemorySnapshot {
+            store: self.store.clone(),
+        }
+    }
+
+    pub fn load_byte(&self, address: u64) -> u8 {
+        GuestMemory::load_byte(self, address)
+    }
+
+    pub fn store_byte(&mut self, address: u64, value: u8) {
+        GuestMemory::store_byte(self, address, value)
+    }
+
+    /// Iterate over all stored bytes as `(address, value)` pairs. Bytes are
+    /// stored in 4-byte words; each word ever written yields its four byte
+    /// addresses. Used to snapshot memory at an epoch boundary.
+    pub fn iter_bytes(&self) -> Box<dyn Iterator<Item = (u64, u8)> + '_> {
+        match &self.store {
+            Store::Pages(pages) => Box::new(pages.iter_bytes()),
+            Store::Words(cells) => Box::new(cells.iter().flat_map(|(&addr, bytes)| {
+                bytes
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, &b)| (addr + i as u64, b))
+            })),
+        }
+    }
+
+    pub fn load_word(&self, address: u64) -> Result<u32, MemoryError> {
+        GuestMemory::load_word(self, address)
+    }
+
+    pub fn store_word(&mut self, address: u64, value: u32) -> Result<(), MemoryError> {
+        GuestMemory::store_word(self, address, value)
+    }
+
+    /// Load a doubleword (64-bit) from memory - for LD instruction
+    pub fn load_doubleword(&self, address: u64) -> Result<u64, MemoryError> {
+        GuestMemory::load_doubleword(self, address)
+    }
+
+    /// Store a doubleword (64-bit) to memory - for SD instruction
+    pub fn store_doubleword(&mut self, address: u64, value: u64) -> Result<(), MemoryError> {
+        GuestMemory::store_doubleword(self, address, value)
+    }
+
+    pub fn load_half(&self, address: u64) -> Result<u16, MemoryError> {
+        GuestMemory::load_half(self, address)
+    }
+
+    pub fn store_half(&mut self, address: u64, value: u16) -> Result<(), MemoryError> {
+        GuestMemory::store_half(self, address, value)
+    }
+
+    /// Append `length` bytes from guest memory starting at `address` to the
+    /// public output ([`GuestMemory::commit_public_output`]).
+    pub fn commit_public_output(&mut self, address: u64, length: u64) -> Result<(), MemoryError> {
+        GuestMemory::commit_public_output(self, address, length)
+    }
+
+    pub fn read_return_value(&self) -> Result<Vec<u8>, MemoryError> {
+        Ok(self.public_output.clone())
+    }
+
+    /// Pre-loads private input bytes ([`GuestMemory::store_private_inputs`]).
+    pub fn store_private_inputs(&mut self, inputs: Vec<u8>) -> Result<(), MemoryError> {
+        GuestMemory::store_private_inputs(self, inputs)
+    }
+
+    pub fn load_bytes(&self, addr: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
+        GuestMemory::load_bytes(self, addr, len)
+    }
+
+    /// [`GuestMemory::set_bytes_aligned`].
+    #[cfg(test)]
+    pub(crate) fn set_bytes_aligned(
+        &mut self,
+        addr: u64,
+        inputs: &[u8],
+    ) -> Result<(), MemoryError> {
+        GuestMemory::set_bytes_aligned(self, addr, inputs)
+    }
+}
+
+/// What the instruction semantics need of a guest memory: the executor's
+/// [`Memory`] and the fast engine's flat memory both implement it, so every
+/// access check, every ecall and its refusals are written once, here and in
+/// the instruction semantics, for both.
+///
+/// An implementation supplies the raw byte moves (fixed-width and ranges,
+/// none of which may wrap past `2^64`) and the public output; the provided
+/// methods add the RISC-V widths and the address checks on top.
+pub trait GuestMemory {
+    /// `N` bytes at `address..`; the range must not wrap.
+    fn read_n<const N: usize>(&self, address: u64) -> [u8; N];
+
+    /// `data` at `address..`; the range must not wrap.
+    fn write_n<const N: usize>(&mut self, address: u64, data: [u8; N]);
+
+    /// The bytes at `address..` into `out`; the range must not wrap.
+    fn read_range(&self, address: u64, out: &mut [u8]);
+
+    /// `data` at `address..`; the range must not wrap.
+    fn write_range(&mut self, address: u64, data: &[u8]);
+
+    /// The bytes committed so far.
+    fn public_output(&self) -> &[u8];
+
+    /// Appends committed bytes.
+    fn extend_public_output(&mut self, bytes: &[u8]);
+
+    /// Whether the DMA ecalls move their range in one read and one write
+    /// ([`ExecPaths::dma_bulk`]) rather than a byte at a time. Both write the
+    /// same bytes.
+    fn dma_bulk(&self) -> bool;
+
+    #[inline(always)]
+    fn load_byte(&self, address: u64) -> u8 {
+        self.read_n::<1>(address)[0]
+    }
+
+    #[inline(always)]
+    fn store_byte(&mut self, address: u64, value: u8) {
+        self.write_n::<1>(address, [value]);
+    }
+
+    #[inline(always)]
+    fn load_half(&self, address: u64) -> Result<u16, MemoryError> {
+        if !address.is_multiple_of(2) {
+            address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
+        }
+        // A 2-aligned half never leaves its word, so it cannot wrap.
+        Ok(u16::from_le_bytes(self.read_n::<2>(address)))
+    }
+
+    #[inline(always)]
+    fn store_half(&mut self, address: u64, value: u16) -> Result<(), MemoryError> {
+        if !address.is_multiple_of(2) {
+            address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
+        }
+        self.write_n::<2>(address, value.to_le_bytes());
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn load_word(&self, address: u64) -> Result<u32, MemoryError> {
+        // A 4-aligned word cannot wrap.
+        if !address.is_multiple_of(4) {
+            address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
+        }
+        Ok(u32::from_le_bytes(self.read_n::<4>(address)))
+    }
+
+    #[inline(always)]
+    fn store_word(&mut self, address: u64, value: u32) -> Result<(), MemoryError> {
+        if !address.is_multiple_of(4) {
+            address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
+        }
+        self.write_n::<4>(address, value.to_le_bytes());
+        Ok(())
+    }
+
+    /// Load a doubleword (64-bit) from memory - for LD instruction
+    #[inline(always)]
+    fn load_doubleword(&self, address: u64) -> Result<u64, MemoryError> {
+        // An 8-aligned doubleword cannot wrap.
+        if !address.is_multiple_of(8) {
+            address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
+        }
+        Ok(u64::from_le_bytes(self.read_n::<8>(address)))
+    }
+
+    /// Store a doubleword (64-bit) to memory - for SD instruction
+    #[inline(always)]
+    fn store_doubleword(&mut self, address: u64, value: u64) -> Result<(), MemoryError> {
+        if !address.is_multiple_of(8) {
+            address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
+        }
+        self.write_n::<8>(address, value.to_le_bytes());
+        Ok(())
+    }
+
+    /// Append `length` bytes from guest memory starting at `address` to the
+    /// public output. The COPY chip's commit rows concatenate calls via the
+    /// running `x254` index, and the trace builder collects their bytes into
+    /// `VmProof.public_output`; this method maintains the executor's view
+    /// of the same byte stream so `read_return_value` matches.
+    fn commit_public_output(&mut self, address: u64, length: u64) -> Result<(), MemoryError> {
+        let new_total = (self.public_output().len() as u64)
+            .checked_add(length)
+            .ok_or(MemoryError::CommitSizeExceeded)?;
+        if new_total > MAX_PUBLIC_OUTPUT_TOTAL_SIZE {
+            return Err(MemoryError::CommitSizeExceeded);
+        }
+        let bytes = self.load_bytes(address, length)?;
+        self.extend_public_output(&bytes);
+        Ok(())
+    }
+
+    /// Pre-loads private input bytes at `PRIVATE_INPUT_START_INDEX` as a
+    /// 4-byte LE length prefix followed by the raw data. The guest reads these
+    /// bytes directly via normal RISC-V loads (ZisK-style memory-mapped input).
+    fn store_private_inputs(&mut self, inputs: Vec<u8>) -> Result<(), MemoryError> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        if inputs.len() as u64 > MAX_PRIVATE_INPUT_SIZE {
+            return Err(MemoryError::PrivateInputSizeExceeded);
+        }
+        let len_u32 =
+            u32::try_from(inputs.len()).map_err(|_| MemoryError::PrivateInputSizeExceeded)?;
+        self.store_word(PRIVATE_INPUT_START_INDEX, len_u32)?;
+        self.set_bytes_aligned(
+            PRIVATE_INPUT_START_INDEX + PRIVATE_INPUT_LENGTH_PREFIX_BYTES as u64,
+            &inputs,
+        )?;
+        Ok(())
+    }
+
+    fn load_bytes(&self, addr: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
+        addr.checked_add(len).ok_or(MemoryError::AddressOverflow)?;
+        let len_usize = usize::try_from(len).map_err(|_| MemoryError::AllocationFailed)?;
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(len_usize)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        result.resize(len_usize, 0);
+        self.read_range(addr, &mut result);
+        Ok(result)
+    }
+
+    /// Helper method to store a given input at an aligned address. It may also overwrite existing bytes with zero if inputs is not divisible by 4
+    /// Should only be used to write to public output and private input where these limitations are not a problem
+    fn set_bytes_aligned(&mut self, addr: u64, inputs: &[u8]) -> Result<(), MemoryError> {
+        if !addr.is_multiple_of(4) {
+            return Err(MemoryError::UnalignedAccess);
+        }
+        let whole = inputs.len() - inputs.len() % 4;
+        self.write_range(addr, &inputs[..whole]);
+        if whole < inputs.len() {
+            let mut last = [0u8; 4];
+            last[..inputs.len() - whole].copy_from_slice(&inputs[whole..]);
+            self.write_range(addr + whole as u64, &last);
+        }
+        Ok(())
+    }
+}
+
+impl GuestMemory for Memory {
     /// `N` bytes at `address..`; the range must not wrap. With
     /// [`ExecPaths::fixed_access`] and the pages store, an access inside one
     /// page is one lookup and a fixed-width copy; any other access takes the
@@ -458,181 +829,26 @@ impl Memory {
 
     /// The bytes at `address..` into `out`, in one pass over the pages they
     /// span; the range must not wrap.
-    pub(crate) fn read_range(&self, address: u64, out: &mut [u8]) {
+    fn read_range(&self, address: u64, out: &mut [u8]) {
         self.store.read(address, out);
     }
 
     /// `data` at `address..`, in one pass over the pages it spans; the range
     /// must not wrap.
-    pub(crate) fn write_range(&mut self, address: u64, data: &[u8]) {
+    fn write_range(&mut self, address: u64, data: &[u8]) {
         self.store.write(address, data);
     }
 
-    /// The bytes the memory takes on the heap: its pages (or the word map's
-    /// slots, an entry and a control byte each) and the public output.
-    pub fn heap_bytes(&self) -> usize {
-        let store = match &self.store {
-            Store::Pages(pages) => pages.heap_bytes(),
-            Store::Words(cells) => cells.capacity() * (std::mem::size_of::<(u64, [u8; 4])>() + 1),
-        };
-        store + self.public_output.capacity()
+    fn public_output(&self) -> &[u8] {
+        &self.public_output
     }
 
-    /// The memory as it is now, kept while the run goes on: the pages are
-    /// shared, and a later write copies a page the snapshot holds before
-    /// changing it, so the snapshot keeps reading this moment's bytes. Cheap
-    /// for the pages store (one count per page); the words store copies its
-    /// map.
-    pub fn snapshot(&self) -> MemorySnapshot {
-        MemorySnapshot {
-            store: self.store.clone(),
-        }
+    fn extend_public_output(&mut self, bytes: &[u8]) {
+        self.public_output.extend_from_slice(bytes);
     }
 
-    pub fn load_byte(&self, address: u64) -> u8 {
-        self.read_n::<1>(address)[0]
-    }
-
-    pub fn store_byte(&mut self, address: u64, value: u8) {
-        self.write_n::<1>(address, [value]);
-    }
-
-    /// Iterate over all stored bytes as `(address, value)` pairs. Bytes are
-    /// stored in 4-byte words; each word ever written yields its four byte
-    /// addresses. Used to snapshot memory at an epoch boundary.
-    pub fn iter_bytes(&self) -> Box<dyn Iterator<Item = (u64, u8)> + '_> {
-        match &self.store {
-            Store::Pages(pages) => Box::new(pages.iter_bytes()),
-            Store::Words(cells) => Box::new(cells.iter().flat_map(|(&addr, bytes)| {
-                bytes
-                    .iter()
-                    .enumerate()
-                    .map(move |(i, &b)| (addr + i as u64, b))
-            })),
-        }
-    }
-
-    pub fn load_word(&self, address: u64) -> Result<u32, MemoryError> {
-        // A 4-aligned word cannot wrap.
-        if !address.is_multiple_of(4) {
-            address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
-        }
-        Ok(u32::from_le_bytes(self.read_n::<4>(address)))
-    }
-
-    pub fn store_word(&mut self, address: u64, value: u32) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(4) {
-            address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
-        }
-        self.write_n::<4>(address, value.to_le_bytes());
-        Ok(())
-    }
-
-    /// Load a doubleword (64-bit) from memory - for LD instruction
-    pub fn load_doubleword(&self, address: u64) -> Result<u64, MemoryError> {
-        // An 8-aligned doubleword cannot wrap.
-        if !address.is_multiple_of(8) {
-            address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
-        }
-        Ok(u64::from_le_bytes(self.read_n::<8>(address)))
-    }
-
-    /// Store a doubleword (64-bit) to memory - for SD instruction
-    pub fn store_doubleword(&mut self, address: u64, value: u64) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(8) {
-            address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
-        }
-        self.write_n::<8>(address, value.to_le_bytes());
-        Ok(())
-    }
-
-    pub fn load_half(&self, address: u64) -> Result<u16, MemoryError> {
-        if !address.is_multiple_of(2) {
-            address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
-        }
-        // A 2-aligned half never leaves its word, so it cannot wrap.
-        Ok(u16::from_le_bytes(self.read_n::<2>(address)))
-    }
-
-    pub fn store_half(&mut self, address: u64, value: u16) -> Result<(), MemoryError> {
-        if !address.is_multiple_of(2) {
-            address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
-        }
-        self.write_n::<2>(address, value.to_le_bytes());
-        Ok(())
-    }
-
-    /// Append `length` bytes from guest memory starting at `address` to the
-    /// public output. The COPY chip's commit rows concatenate calls via the
-    /// running `x254` index, and the trace builder collects their bytes into
-    /// `VmProof.public_output`; this method maintains the executor's view
-    /// of the same byte stream so `read_return_value` matches.
-    pub fn commit_public_output(&mut self, address: u64, length: u64) -> Result<(), MemoryError> {
-        let new_total = (self.public_output.len() as u64)
-            .checked_add(length)
-            .ok_or(MemoryError::CommitSizeExceeded)?;
-        if new_total > MAX_PUBLIC_OUTPUT_TOTAL_SIZE {
-            return Err(MemoryError::CommitSizeExceeded);
-        }
-        let bytes = self.load_bytes(address, length)?;
-        self.public_output.extend_from_slice(&bytes);
-        Ok(())
-    }
-
-    pub fn read_return_value(&self) -> Result<Vec<u8>, MemoryError> {
-        Ok(self.public_output.clone())
-    }
-
-    /// Pre-loads private input bytes at `PRIVATE_INPUT_START_INDEX` as a
-    /// 4-byte LE length prefix followed by the raw data. The guest reads these
-    /// bytes directly via normal RISC-V loads (ZisK-style memory-mapped input).
-    pub fn store_private_inputs(&mut self, inputs: Vec<u8>) -> Result<(), MemoryError> {
-        if inputs.is_empty() {
-            return Ok(());
-        }
-        if inputs.len() as u64 > MAX_PRIVATE_INPUT_SIZE {
-            return Err(MemoryError::PrivateInputSizeExceeded);
-        }
-        let len_u32 =
-            u32::try_from(inputs.len()).map_err(|_| MemoryError::PrivateInputSizeExceeded)?;
-        self.store_word(PRIVATE_INPUT_START_INDEX, len_u32)?;
-        self.set_bytes_aligned(
-            PRIVATE_INPUT_START_INDEX + PRIVATE_INPUT_LENGTH_PREFIX_BYTES as u64,
-            &inputs,
-        )?;
-        Ok(())
-    }
-
-    pub fn load_bytes(&self, addr: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
-        addr.checked_add(len).ok_or(MemoryError::AddressOverflow)?;
-        let len_usize = usize::try_from(len).map_err(|_| MemoryError::AllocationFailed)?;
-        let mut result = Vec::new();
-        result
-            .try_reserve_exact(len_usize)
-            .map_err(|_| MemoryError::AllocationFailed)?;
-        result.resize(len_usize, 0);
-        self.store.read(addr, &mut result);
-        Ok(result)
-    }
-
-    /// Helper method to store a given input at an aligned address. It may also overwrite existing bytes with zero if inputs is not divisible by 4
-    /// Should only be used to write to public output and private input where these limitations are not a problem
-    pub(crate) fn set_bytes_aligned(
-        &mut self,
-        addr: u64,
-        inputs: &[u8],
-    ) -> Result<(), MemoryError> {
-        if !addr.is_multiple_of(4) {
-            return Err(MemoryError::UnalignedAccess);
-        }
-        let whole = inputs.len() - inputs.len() % 4;
-        self.store.write(addr, &inputs[..whole]);
-        if whole < inputs.len() {
-            let mut last = [0u8; 4];
-            last[..inputs.len() - whole].copy_from_slice(&inputs[whole..]);
-            self.store.write(addr + whole as u64, &last);
-        }
-        Ok(())
+    fn dma_bulk(&self) -> bool {
+        self.paths.dma_bulk
     }
 }
 
@@ -643,10 +859,67 @@ pub struct MemorySnapshot {
 }
 
 impl MemorySnapshot {
+    /// A snapshot of the given pages (the fast engine's published state).
+    pub(crate) fn from_pages(pages: Pages) -> Self {
+        Self {
+            store: Store::Pages(pages),
+        }
+    }
+
     /// The bytes at `address..` into `out`, as they were at the snapshot; the
     /// range must not wrap.
     pub fn read(&self, address: u64, out: &mut [u8]) {
         self.store.read(address, out);
+    }
+
+    /// A digest of every byte the snapshot holds, by address: equal for two
+    /// snapshots that read alike at every address, whichever store or pages
+    /// hold them (a zero byte and an absent one count the same). For checks
+    /// that two runs published the same memory.
+    pub fn content_digest(&self) -> u64 {
+        // Order-independent: a sum over the non-zero 4-byte words.
+        fn mix(address: u64, word: u32) -> u64 {
+            let mut z = address
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(u64::from(word).wrapping_mul(0xD6E8_FEB8_6659_FD93));
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        let mut digest = 0u64;
+        match &self.store {
+            Store::Pages(pages) => {
+                let low = pages
+                    .low
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(n, page)| Some((n as u64, page.as_deref()?)));
+                let high = pages
+                    .high
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, page)| Some((LAST_PAGE - i as u64, page.as_deref()?)));
+                let other = pages.other.iter().map(|(&n, page)| (n, &**page));
+                for (number, page) in low.chain(high).chain(other) {
+                    for (i, word) in page.bytes.chunks_exact(4).enumerate() {
+                        let word = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                        if word != 0 {
+                            digest = digest
+                                .wrapping_add(mix((number << PAGE_BITS) + 4 * i as u64, word));
+                        }
+                    }
+                }
+            }
+            Store::Words(cells) => {
+                for (&address, bytes) in cells {
+                    let word = u32::from_le_bytes(*bytes);
+                    if word != 0 {
+                        digest = digest.wrapping_add(mix(address, word));
+                    }
+                }
+            }
+        }
+        digest
     }
 
     /// The byte at `address`, as it was at the snapshot.
