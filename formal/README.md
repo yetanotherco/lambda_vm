@@ -313,11 +313,11 @@ entries of a real `StaticLookupChannel` and proves the guarantee from
 membership in the table, so `eq_rows_correct` discharges `witness.Assumptions`
 outright — "no component assumes anything" — and states a conclusion about
 rows: every EQ row with `μ = 1` and range-checked operands carries the
-equality bit. There is no `lt_rows_correct`. Writing one needs `pushStatic`,
-or a counted analogue of it, behind LT's three range checks. The counted
-analogue now exists — `countedPushStatic`, written for the DVRM ensemble below,
-which puts all five of its providers on real static tables — so
-`lt_rows_correct` is writable and merely unwritten. What `LtStaged` does
+equality bit. `LtStaged` has no `lt_rows_correct` of its own: writing one there
+needs `pushStatic`, or a counted analogue of it, behind LT's three range checks.
+The counted analogue now exists — `countedPushStatic`, written for the DVRM
+ensemble below, which puts all five of its providers on real static tables — and
+`lt_rows_correct` is stated there, about that ensemble. What `LtStaged` does
 establish is that the staged finishing order admits counted pulls, which is what
 it was written for.
 
@@ -399,6 +399,14 @@ whose channels balance, every `DVRM` row carries the quotient and remainder of
 its two operands, signed or unsigned, with the division-by-zero and overflow
 cases the spec names. That is the shape `eq_rows_correct` has and `LtStaged`
 still lacks.
+
+`lt_rows_correct` is the same conclusion read at `ltComponent`, which is one of
+the eight. It costs nothing beyond the statement, since the providers that
+answer LT's three range checks are the same static tables: every `LT` row of
+this ensemble carries the comparison bit its operands determine. It is stated
+about this ensemble, which asks `MUL` and `DVRM` to balance as well; the
+narrower statement, about `LT` and its three providers alone, still needs
+`LtStaged` to move off the providers that assume their own answers.
 
 Two general facts came out of this and belong in Clean rather than here:
 `requirementsChannelsLawful_of_cover`, which lets a chip not declare every
