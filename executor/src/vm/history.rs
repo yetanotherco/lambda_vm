@@ -676,6 +676,9 @@ pub(crate) struct History {
     pub(crate) shadow: TsShadow,
     pub(crate) cells: RegisterCells,
     pub(crate) window: WindowHistory,
+    /// A buffer for a later window's extras, given back or prepared
+    /// ([`crate::vm::fast::FastExecutor::recycle_extras`]).
+    pub(crate) spare_extras: Option<Vec<HistExtra>>,
 }
 
 impl History {
@@ -684,15 +687,23 @@ impl History {
             shadow: TsShadow::new(layout)?,
             cells: RegisterCells::at_start(entry_point),
             window: WindowHistory::default(),
+            spare_extras: None,
         })
     }
 
     /// Starts a window at cycle `first`.
     pub(crate) fn begin(&mut self, first: u64, capacity: usize) {
+        let extras = match self.spare_extras.take() {
+            Some(mut extras) if extras.capacity() == capacity => {
+                extras.clear();
+                extras
+            }
+            _ => Vec::with_capacity(capacity),
+        };
         self.window = WindowHistory {
             first,
             registers: Some(self.cells),
-            extras: Vec::with_capacity(capacity),
+            extras,
             ..WindowHistory::default()
         };
     }

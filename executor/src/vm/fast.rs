@@ -455,6 +455,13 @@ impl FastExecutor {
         })
     }
 
+    /// Sets the cycles run so far (a test reaches the history's clock limit
+    /// without running to it).
+    #[cfg(test)]
+    pub(crate) fn set_cycles(&mut self, cycles: u64) {
+        self.cycles = cycles;
+    }
+
     /// The register cells now, as the walk holds them (history mode).
     pub fn history_registers(&self) -> Option<RegisterCells> {
         self.history.as_ref().map(|h| h.cells)
@@ -619,6 +626,15 @@ impl FastExecutor {
     /// window written into a buffer given back.
     pub fn recycle(&mut self, buffer: Vec<Log>) {
         self.spare = Some(buffer);
+    }
+
+    /// A buffer for a later window's history extras (history mode): used
+    /// when it holds exactly one window, as [`FastExecutor::recycle`] for the
+    /// logs.
+    pub fn recycle_extras(&mut self, buffer: Vec<HistExtra>) {
+        if let Some(history) = &mut self.history {
+            history.spare_extras = Some(buffer);
+        }
     }
 
     /// The return values, as [`Executor::finish`](super::execution::Executor::finish).

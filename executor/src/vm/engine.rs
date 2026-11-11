@@ -5,7 +5,7 @@
 use super::{
     execution::{Executor, ExecutorError, ReturnValues},
     fast::FastExecutor,
-    history::{HistoryFinal, WindowHistory},
+    history::{HistExtra, HistoryFinal, WindowHistory},
     logs::Log,
     memory::{GuestMemory, MemorySnapshot},
     registers::Registers,
@@ -125,6 +125,13 @@ impl Engine {
         match self {
             Self::Reference(_) => None,
             Self::Fast(e) => e.take_history_final(),
+        }
+    }
+
+    /// [`FastExecutor::recycle_extras`] (the reference keeps no history).
+    pub fn recycle_extras(&mut self, buffer: Vec<HistExtra>) {
+        if let Self::Fast(e) = self {
+            e.recycle_extras(buffer);
         }
     }
 

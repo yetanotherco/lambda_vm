@@ -55,6 +55,32 @@ pub(crate) fn next_buffer(spare: &mut Option<Vec<Log>>, window: usize) -> Vec<Lo
     }
 }
 
+/// A buffer of `n` items whose memory is already written (so its pages are
+/// faulted in), empty: what a helper thread prepares so a run's next window
+/// is not written into fresh memory.
+pub fn prefaulted<T: Copy>(n: usize, fill: T) -> Vec<T> {
+    let mut buffer = Vec::with_capacity(n);
+    for slot in buffer.spare_capacity_mut() {
+        slot.write(fill);
+    }
+    buffer
+}
+
+/// [`prefaulted`] for logs.
+pub fn prefaulted_logs(n: usize) -> Vec<Log> {
+    let mut buffer: Vec<Log> = Vec::with_capacity(n);
+    for slot in buffer.spare_capacity_mut() {
+        slot.write(Log {
+            current_pc: 0,
+            next_pc: 0,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        });
+    }
+    buffer
+}
+
 const _: () = {
     assert!(std::mem::size_of::<Log>() == 40);
     assert!(std::mem::align_of::<Log>() == 8);

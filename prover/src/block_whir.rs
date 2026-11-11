@@ -2015,6 +2015,27 @@ fn parse_exec_recycle_logs(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
+/// `LAMBDA_VM_EXEC_PREFAULT=1`: a helper thread prepares the executor's next
+/// window buffers (logs, and the history's extras in record mode) already
+/// written, so the executor does not fault fresh pages in as it writes a
+/// window; the card fill holds the buffers it sent long after (so they are
+/// never free to reuse in time). Unset, empty or `0`: off. Anything else
+/// refuses the prove. The logs are the same.
+pub(crate) fn exec_prefault() -> Result<bool, Error> {
+    parse_exec_prefault(std::env::var("LAMBDA_VM_EXEC_PREFAULT").ok().as_deref())
+}
+
+/// [`exec_prefault`]'s reading of its variable.
+fn parse_exec_prefault(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_EXEC_PREFAULT={v}: 1 (pre-faulted window buffers) or 0"
+        ))),
+    }
+}
+
 /// `LAMBDA_VM_EXEC_HISTORY=1`: record mode. The fast engine keeps the walk's
 /// access history and writes it beside each window's logs; the walkers read
 /// it instead of a lean pass's entries, the executor's window-start snapshots
@@ -5956,6 +5977,27 @@ fn prove_streamed(
                 if history {
                     executor.enable_history().map_err(failed)?;
                 }
+                // Pre-faulted window buffers from a helper, two ahead.
+                let prefault = exec_prefault()?.then(|| {
+                    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+                    let n = window.min(1 << 22);
+                    std::thread::spawn(move || {
+                        loop {
+                            let logs = executor::vm::logs::prefaulted_logs(n);
+                            let extras = history.then(|| {
+                                executor::vm::logs::prefaulted(
+                                    n,
+                                    executor::vm::history::HistExtra::default(),
+                                )
+                            });
+                            if tx.send((logs, extras)).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    rx
+                });
+                let mut prefaulted = 0usize;
                 // The windows sent, while someone downstream still holds them.
                 let mut sent: Option<std::collections::VecDeque<std::sync::Arc<Vec<_>>>> =
                     exec_recycle_logs()?.then(Default::default);
@@ -5997,6 +6039,16 @@ fn prove_streamed(
                         if let Some(buffer) = back {
                             recycled += 1;
                             executor.recycle(buffer);
+                        }
+                    }
+                    // The next window's buffers, when the helper has them ready.
+                    if let Some(ready) = &prefault
+                        && let Ok((logs, extras)) = ready.try_recv()
+                    {
+                        prefaulted += 1;
+                        executor.recycle(logs);
+                        if let Some(extras) = extras {
+                            executor.recycle_extras(extras);
                         }
                     }
                     // A sampled window's start, for the shadow check.
@@ -6074,6 +6126,13 @@ fn prove_streamed(
                 }
                 let executed = start.elapsed().as_secs_f64();
                 drop(executor);
+                if prefault.is_some() {
+                    eprintln!(
+                        "BLOCK EXECUTOR PREFAULT: {prefaulted} of {} windows given pre-faulted buffers",
+                        own.windows
+                    );
+                }
+                drop(prefault);
                 if sent.is_some() {
                     eprintln!(
                         "BLOCK EXECUTOR RECYCLE: {recycled} of {} windows written into a buffer taken back",
@@ -8863,7 +8922,18 @@ mod producer_report_tests {
         BLOCK_LAYOUT_AHEAD, BLOCK_LAYOUT_WORKERS, BLOCK_WINDOW_LOG2, BlockOptions, BlockStamps,
         ExecutorStamps, ProducerStamps, StreamTable, parse_window_log2,
     };
-    use super::{parse_exec_history, parse_exec_history_check, parse_exec_recycle_logs};
+    use super::{
+        parse_exec_history, parse_exec_history_check, parse_exec_prefault, parse_exec_recycle_logs,
+    };
+
+    /// `LAMBDA_VM_EXEC_PREFAULT`: off unless `1`; anything else refused.
+    #[test]
+    fn prefault_is_off_unless_asked() {
+        assert!(!parse_exec_prefault(None).unwrap());
+        assert!(!parse_exec_prefault(Some("0")).unwrap());
+        assert!(parse_exec_prefault(Some("1")).unwrap());
+        assert!(parse_exec_prefault(Some("yes")).is_err());
+    }
 
     /// `LAMBDA_VM_EXEC_HISTORY`: off unless `1`; its re-walk period a count.
     #[test]

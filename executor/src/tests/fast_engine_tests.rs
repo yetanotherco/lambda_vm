@@ -777,3 +777,57 @@ fn a_recycled_buffer_takes_the_next_window() {
         );
     }
 }
+
+// History mode writes a window's extras into a buffer given back (or
+// prepared pre-faulted) when it holds exactly one window.
+#[test]
+fn a_prepared_extras_buffer_takes_a_window() {
+    use crate::vm::history::HistExtra;
+    use crate::vm::logs::{prefaulted, prefaulted_logs};
+    let elf = looping_program();
+    let window = 300;
+    let mut fast = FastExecutor::new(&elf, vec![]).unwrap();
+    fast.enable_history().unwrap();
+    let (mut windows, mut reused) = (0, 0);
+    loop {
+        let extras = prefaulted(window, HistExtra::default());
+        let at = extras.as_ptr();
+        assert_eq!((extras.len(), extras.capacity()), (0, window));
+        fast.recycle_extras(extras);
+        fast.recycle(prefaulted_logs(window));
+        let Some((_, history)) = fast.resume_history(window).unwrap() else {
+            break;
+        };
+        windows += 1;
+        reused += usize::from(history.extras.as_ptr() == at);
+    }
+    assert!(windows >= 8);
+    assert_eq!(reused, windows);
+}
+
+// History mode's u32 timestamps refuse, never wrap: a run reaching the cycle
+// whose accesses would pass 2^32 stops with an error (whatever the prover's
+// clock override says: the executor refuses before any record is written).
+#[test]
+fn history_mode_refuses_past_its_clock() {
+    use crate::vm::history::HISTORY_MAX_CYCLES;
+    let elf = looping_program();
+    let mut fast = FastExecutor::new(&elf, vec![]).unwrap();
+    fast.enable_history().unwrap();
+    fast.set_cycles(HISTORY_MAX_CYCLES - 2);
+    let refused = fast
+        .resume_history(10)
+        .map(|w| w.map(|(logs, _)| logs.len()));
+    assert!(
+        matches!(&refused, Err(ExecutorError::History(m)) if m.contains("past the")),
+        "{refused:?}"
+    );
+    // Below the limit, the same run goes on.
+    let mut fast = FastExecutor::new(&elf, vec![]).unwrap();
+    fast.enable_history().unwrap();
+    fast.set_cycles(HISTORY_MAX_CYCLES - 20);
+    assert_eq!(
+        fast.resume_history(10).unwrap().map(|(logs, _)| logs.len()),
+        Some(10)
+    );
+}
