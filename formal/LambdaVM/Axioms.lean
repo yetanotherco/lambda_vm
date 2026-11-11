@@ -38,6 +38,7 @@ soundness theorem or global row theorem.
 #print axioms LambdaVM.Ensembles.LtStaged.tableSoundness
 #print axioms LambdaVM.Ensembles.DvrmStaged.tableSoundness
 #print axioms LambdaVM.Ensembles.DvrmStaged.dvrm_rows_correct
+#print axioms LambdaVM.Ensembles.DvrmStaged.lt_rows_correct
 
 -- The templates the chips are built from. They are `FormalAssertion`s that nothing above
 -- reaches, so without these lines a `sorry` in one of them would pass the check.
