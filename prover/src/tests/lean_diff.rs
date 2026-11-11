@@ -163,6 +163,13 @@ fn lean_interaction_at(i: &LeanInteract, row: &[FE]) -> (u64, FE, Vec<FE>) {
 // Matching
 // =============================================================================
 
+/// FNV-1a of the label: a seed that differs between tables.
+fn seed_of(label: &str) -> u64 {
+    label.bytes().fold(0xCBF2_9CE4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+    })
+}
+
 fn random_rows(num_cols: usize, seed: u64) -> Vec<Vec<FE>> {
     let mut rng = SplitMix64(seed);
     (0..TRIALS)
@@ -216,7 +223,7 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
     let (prog, _) = cb.finish(num_base_from_meta(&meta));
 
     // Fingerprints over random rows.
-    let rows = random_rows(num_cols, 0xC1EA_0000 ^ label.len() as u64);
+    let rows = random_rows(num_cols, seed_of(label));
     let lean_fp: Vec<Vec<u64>> = lean
         .asserts
         .iter()

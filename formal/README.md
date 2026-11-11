@@ -94,6 +94,11 @@ skipped there. The sign of an interaction comes from its direction: a Rust
 sender is Clean's pull and counts `−m`, a receiver is Clean's push and counts
 `+m`.
 
+BITWISE is not exported or diff-checked: `Bitwise.lean` is the precomputed
+table and its buses as static lookup channels, not a row circuit, so it has no
+asserts or interacts to compare. Its row function is a hand transcription of
+`generate_bitwise_row` and is not mechanically checked against it.
+
 The models follow the multiplicity constraints of PR #1016, merged 2026-10-23.
 Result on `main` after that merge, 2026-10-28:
 

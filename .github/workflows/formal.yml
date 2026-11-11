@@ -32,15 +32,15 @@ jobs:
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
       # Clean and CompPoly are compiled from source; Mathlib comes from its own cache below.
+      # One entry per toolchain and manifest: the cache holds the dependency builds, and
+      # LambdaVM itself is rebuilt on top of them.
       - name: Cache Lake builds
         uses: actions/cache@v4
         with:
           path: |
             formal/.lake
             !formal/.lake/packages/mathlib
-          key: lake-${{ hashFiles('formal/lean-toolchain', 'formal/lake-manifest.json') }}-${{ github.sha }}
-          restore-keys: |
-            lake-${{ hashFiles('formal/lean-toolchain', 'formal/lake-manifest.json') }}-
+          key: lake-${{ hashFiles('formal/lean-toolchain', 'formal/lake-manifest.json') }}
 
       - name: Fetch Mathlib binaries
         run: lake exe cache get
@@ -52,3 +52,9 @@ jobs:
         run: |
           lake env lean --run LambdaVM/Export.lean
           git diff --exit-code -- export
+          untracked=$(git ls-files --others --exclude-standard -- export)
+          if [ -n "$untracked" ]; then
+            echo "export files not committed:"
+            echo "$untracked"
+            exit 1
+          fi
