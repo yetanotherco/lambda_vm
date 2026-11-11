@@ -1508,11 +1508,12 @@ impl Walker<'_> {
 
     /// [`Self::walk`] of logs it may keep: a build whose CPU chunks the card
     /// fills keeps them with the window ([`WindowedTraceBuilder::keeps_logs`]);
-    /// any other lets them go here.
-    pub fn walk_owned(&mut self, logs: Vec<Log>) -> Result<WalkedWindow, Error> {
+    /// any other lets them go here. The logs come owned or shared.
+    pub fn walk_owned(&mut self, logs: impl Into<Arc<Vec<Log>>>) -> Result<WalkedWindow, Error> {
+        let logs = logs.into();
         let mut walked = self.walk(&logs)?;
         if self.keep_logs {
-            walked.keep_logs(Arc::new(logs));
+            walked.keep_logs(logs);
         }
         Ok(walked)
     }

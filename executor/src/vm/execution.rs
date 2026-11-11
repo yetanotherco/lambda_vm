@@ -52,6 +52,8 @@ pub struct Executor {
     pc: u64,
     pub instructions: InstructionCache,
     logs: Vec<Log>,
+    /// A handed-out window's buffer given back ([`Executor::recycle`]).
+    spare: Option<Vec<Log>>,
 }
 
 impl Executor {
@@ -85,6 +87,7 @@ impl Executor {
             pc: program.entry_point,
             instructions,
             logs: Vec::with_capacity(CHUNK_SIZE),
+            spare: None,
         })
     }
 
@@ -187,12 +190,21 @@ impl Executor {
         if self.resume_with_limit(limit)?.is_none() {
             return Ok(None);
         }
-        let mut logs = std::mem::replace(&mut self.logs, Vec::with_capacity(window));
+        let next = crate::vm::logs::next_buffer(&mut self.spare, window);
+        let mut logs = std::mem::replace(&mut self.logs, next);
         // A full window already fills its buffer; the first (the executor's
         // own buffer, sized before the window was known) and the last (the
         // run ended early) may not.
         logs.shrink_to_fit();
         Ok(Some(logs))
+    }
+
+    /// Gives back a buffer [`Executor::resume_owned`] handed out, once its
+    /// logs are no longer needed: the next window is written into it (when it
+    /// holds a whole window) instead of into fresh memory. The logs are the
+    /// same either way.
+    pub fn recycle(&mut self, buffer: Vec<Log>) {
+        self.spare = Some(buffer);
     }
 
     fn get_return_values(&self) -> Result<ReturnValues, ExecutorError> {

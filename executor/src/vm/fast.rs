@@ -336,6 +336,8 @@ pub struct FastExecutor {
     /// The decoded segments, for the reference cycle.
     instructions: InstructionCache,
     logs: Vec<Log>,
+    /// A handed-out window's buffer given back ([`FastExecutor::recycle`]).
+    spare: Option<Vec<Log>>,
 }
 
 impl FastExecutor {
@@ -370,6 +372,7 @@ impl FastExecutor {
             memory,
             instructions,
             logs: Vec::with_capacity(super::execution::CHUNK_SIZE),
+            spare: None,
         })
     }
 
@@ -421,9 +424,16 @@ impl FastExecutor {
         if self.resume_with_limit(limit)?.is_none() {
             return Ok(None);
         }
-        let mut logs = std::mem::replace(&mut self.logs, Vec::with_capacity(window));
+        let next = super::logs::next_buffer(&mut self.spare, window);
+        let mut logs = std::mem::replace(&mut self.logs, next);
         logs.shrink_to_fit();
         Ok(Some(logs))
+    }
+
+    /// [`Executor::recycle`](super::execution::Executor::recycle): the next
+    /// window written into a buffer given back.
+    pub fn recycle(&mut self, buffer: Vec<Log>) {
+        self.spare = Some(buffer);
     }
 
     /// The return values, as [`Executor::finish`](super::execution::Executor::finish).

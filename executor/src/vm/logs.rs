@@ -42,6 +42,19 @@ pub struct Log {
     pub dst_val: u64,
 }
 
+/// The buffer for a run's next window of `window` logs: `spare`, emptied,
+/// when it holds exactly that many (a window's buffer handed back for reuse,
+/// whose pages are already in memory), else a new one.
+pub(crate) fn next_buffer(spare: &mut Option<Vec<Log>>, window: usize) -> Vec<Log> {
+    match spare.take() {
+        Some(mut buffer) if buffer.capacity() == window => {
+            buffer.clear();
+            buffer
+        }
+        _ => Vec::with_capacity(window),
+    }
+}
+
 const _: () = {
     assert!(std::mem::size_of::<Log>() == 40);
     assert!(std::mem::align_of::<Log>() == 8);

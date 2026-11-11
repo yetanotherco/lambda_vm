@@ -93,6 +93,14 @@ impl Engine {
         }
     }
 
+    /// Gives back a handed-out window's buffer for the next window.
+    pub fn recycle(&mut self, buffer: Vec<Log>) {
+        match self {
+            Self::Reference(e) => e.recycle(buffer),
+            Self::Fast(e) => e.recycle(buffer),
+        }
+    }
+
     /// The memory as it is now.
     pub fn snapshot(&mut self) -> MemorySnapshot {
         match self {

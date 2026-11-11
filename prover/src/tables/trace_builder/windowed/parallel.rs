@@ -411,10 +411,12 @@ impl ParallelWalk {
 /// state the walk holds before the run's last window, which is returned (the
 /// finish walks it as usual). The builder must not have walked a window yet.
 /// The first error anywhere stops every thread and is returned; a walker that
-/// panics is an error.
-pub fn walk_windows(
+/// panics is an error. A window's logs come owned (`Vec<Log>`) or shared
+/// (`Arc<Vec<Log>>`, e.g. by an executor that takes the buffer back once
+/// the walk lets it go).
+pub fn walk_windows<W: Into<Arc<Vec<Log>>> + Send>(
     builder: &mut WindowedTraceBuilder<'_>,
-    windows: Receiver<(Vec<Log>, Option<MemorySnapshot>)>,
+    windows: Receiver<(W, Option<MemorySnapshot>)>,
     walkers: usize,
     absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
 ) -> Result<ParallelWalk, Error> {
@@ -423,9 +425,9 @@ pub fn walk_windows(
 
 /// [`walk_windows`], each job numbered `number(k)` for the run's window `k`:
 /// a test numbers them wrong to show the absorbing side refuses it.
-fn walk_numbered(
+fn walk_numbered<W: Into<Arc<Vec<Log>>> + Send>(
     builder: &mut WindowedTraceBuilder<'_>,
-    windows: Receiver<(Vec<Log>, Option<MemorySnapshot>)>,
+    windows: Receiver<(W, Option<MemorySnapshot>)>,
     walkers: usize,
     number: fn(u32) -> u32,
     mut absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
@@ -620,13 +622,13 @@ fn walk_numbered(
 /// last: it is not handed out, and the job before it is followed by the
 /// finish's state.
 #[allow(clippy::too_many_arguments)]
-fn pass_thread(
+fn pass_thread<W: Into<Arc<Vec<Log>>>>(
     decode: Arc<DecodeTable>,
     start_registers: &RegisterState,
     image: &PagedMem<u8>,
     lean: bool,
     key: u64,
-    windows: Receiver<(Vec<Log>, Option<MemorySnapshot>)>,
+    windows: Receiver<(W, Option<MemorySnapshot>)>,
     number: fn(u32) -> u32,
     jobs: SyncSender<Ticket>,
     permits: SyncSender<()>,
@@ -640,6 +642,7 @@ fn pass_thread(
     let (mut k, mut first, mut busy, mut entries, mut most) = (0u32, 0usize, 0.0, 0usize, 0usize);
     let (mut sent, mut state_secs, mut boundaries) = (false, 0.0, 0u64);
     for (logs, start) in windows {
+        let logs: Arc<Vec<Log>> = logs.into();
         sent = true;
         let start = Arc::new(start.ok_or_else(|| {
             Error::Prover("the executor sent a window without its memory".into())
@@ -664,7 +667,7 @@ fn pass_thread(
                     state: Arc::clone(&state),
                 });
             }
-            last = Some((Arc::new(logs), state, registers));
+            last = Some((logs, state, registers));
             continue;
         }
         pass.begin(k)?;
@@ -690,7 +693,7 @@ fn pass_thread(
             job: WindowJob {
                 window: number(k),
                 first,
-                logs: Arc::new(logs),
+                logs,
                 start,
                 registers,
                 entries: window_entries,

@@ -735,3 +735,45 @@ fn the_shadow_knob_names_a_period() {
     assert_eq!(ShadowCheck::every_from_value(Some("16")), Ok(Some(16)));
     assert!(ShadowCheck::every_from_value(Some("often")).is_err());
 }
+
+// A window's buffer given back is written into again two windows later
+// (the next window's buffer is set aside when a window is handed out), on
+// both engines, and the logs are those of a run that never recycles.
+#[test]
+fn a_recycled_buffer_takes_the_next_window() {
+    let elf = looping_program();
+    let window = 300;
+    for kind in [EngineKind::Reference, EngineKind::Fast] {
+        let mut plain = Engine::new(kind, &elf, vec![]).unwrap();
+        let mut recycling = Engine::new(kind, &elf, vec![]).unwrap();
+        let (mut windows, mut reused) = (0, 0);
+        let mut given_back: std::collections::VecDeque<*const Log> = Default::default();
+        loop {
+            let want = plain.resume_owned(window).unwrap();
+            let got = recycling.resume_owned(window).unwrap();
+            let (Some(want), Some(got)) = (want, got) else {
+                break;
+            };
+            windows += 1;
+            assert_eq!(
+                want.iter().map(record).collect::<Vec<_>>(),
+                got.iter().map(record).collect::<Vec<_>>(),
+                "{kind:?} window {windows}"
+            );
+            if given_back.len() == 2 && given_back.pop_front() == Some(got.as_ptr()) {
+                reused += 1;
+            }
+            if got.len() == window {
+                given_back.push_back(got.as_ptr());
+                recycling.recycle(got);
+            }
+        }
+        assert!(windows >= 8, "{kind:?}: {windows} windows");
+        // Every window from the third on but the last (shorter, its buffer
+        // new) is written into a buffer given back.
+        assert!(
+            reused >= windows - 3,
+            "{kind:?}: {reused} of {windows} windows reused"
+        );
+    }
+}

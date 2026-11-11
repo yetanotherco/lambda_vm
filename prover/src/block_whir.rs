@@ -1995,6 +1995,26 @@ pub struct ProducerStamps {
     pub worker_recv: f64,
 }
 
+/// `LAMBDA_VM_EXEC_RECYCLE_LOGS=1`: the streamed prove's executor takes back
+/// each window's log buffer once the walk and the card fill have let it go,
+/// and writes a later window into it rather than into fresh memory (whose
+/// first touch faults its pages in). Unset, empty or `0`: off. Anything else
+/// refuses the prove. The logs are the same either way.
+pub(crate) fn exec_recycle_logs() -> Result<bool, Error> {
+    parse_exec_recycle_logs(std::env::var("LAMBDA_VM_EXEC_RECYCLE_LOGS").ok().as_deref())
+}
+
+/// [`exec_recycle_logs`]'s reading of its variable.
+fn parse_exec_recycle_logs(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_EXEC_RECYCLE_LOGS={v}: 1 (take window log buffers back) or 0"
+        ))),
+    }
+}
+
 /// The streamed build's executor thread, its own work apart from its waits
 /// ([`BlockStamps::executor`]); with `send` ([`ProducerStamps::executor_send`])
 /// they add up to the thread's span. A measurement; it changes nothing.
@@ -5839,8 +5859,11 @@ fn prove_streamed(
             use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk;
             // with walkers, each window with the memory at its start.
+            // The logs shared, so that with `LAMBDA_VM_EXEC_RECYCLE_LOGS`
+            // the executor can take a window's buffer back once every other
+            // holder has let it go.
             let (ltx, lrx) = std::sync::mpsc::sync_channel::<(
-                Vec<executor::vm::logs::Log>,
+                std::sync::Arc<Vec<executor::vm::logs::Log>>,
                 Option<executor::vm::memory::MemorySnapshot>,
             )>(2);
             let executor = scope.spawn(move || -> Result<(f64, ExecutorStamps), Error> {
@@ -5868,16 +5891,42 @@ fn prove_streamed(
                     .map(|every| ShadowCheck::new(program, every))
                     .transpose()
                     .map_err(failed)?;
+                // The windows sent, while someone downstream still holds them.
+                let mut sent: Option<std::collections::VecDeque<std::sync::Arc<Vec<_>>>> =
+                    exec_recycle_logs()?.then(Default::default);
+                let mut recycled = 0usize;
                 own.setup = t.elapsed().as_secs_f64();
                 eprintln!(
-                    "BLOCK EXECUTOR ENGINE: {} · shadow check {}",
+                    "BLOCK EXECUTOR ENGINE: {} · shadow check {} · log buffers {}",
                     kind.name(),
                     shadow_every.map_or("off".to_string(), |n| format!("every {n} windows")),
+                    if sent.is_some() { "recycled" } else { "fresh" },
                 );
                 let mut at_start = (walkers > 0).then(|| executor.snapshot());
                 let mut cycles = 0u64;
                 loop {
                     let t = Instant::now();
+                    // The buffers nobody else holds any more: the oldest goes
+                    // back to the executor, the rest are freed.
+                    if let Some(sent) = &mut sent {
+                        let mut back = None;
+                        sent.retain_mut(|logs| {
+                            if std::sync::Arc::strong_count(logs) > 1 {
+                                return true;
+                            }
+                            // Only this list holds it: nobody can take another
+                            // share now, so the unwrap below cannot fail.
+                            let held = std::mem::take(logs);
+                            if back.is_none() {
+                                back = std::sync::Arc::try_unwrap(held).ok();
+                            }
+                            false
+                        });
+                        if let Some(buffer) = back {
+                            recycled += 1;
+                            executor.recycle(buffer);
+                        }
+                    }
                     // A sampled window's start, for the shadow check.
                     let sampled = match &shadow {
                         Some(check) if check.samples(own.windows) => Some(WindowStart {
@@ -5913,6 +5962,10 @@ fn prove_streamed(
                     }
                     let next = (walkers > 0).then(|| executor.snapshot());
                     let start = std::mem::replace(&mut at_start, next);
+                    let logs = std::sync::Arc::new(logs);
+                    if let Some(sent) = &mut sent {
+                        sent.push_back(std::sync::Arc::clone(&logs));
+                    }
                     own.windows += 1;
                     own.handoff += ran.elapsed().as_secs_f64();
                     if let Some(ledger) = ledger {
@@ -5931,6 +5984,13 @@ fn prove_streamed(
                 }
                 let executed = start.elapsed().as_secs_f64();
                 drop(executor);
+                if sent.is_some() {
+                    eprintln!(
+                        "BLOCK EXECUTOR RECYCLE: {recycled} of {} windows written into a buffer taken back",
+                        own.windows
+                    );
+                }
+                drop(sent);
                 if let Some(check) = shadow {
                     let counts = check.finish().map_err(Error::Execution)?;
                     eprintln!(
@@ -6098,7 +6158,8 @@ fn prove_streamed(
                             // One window held back: only the run's last window
                             // is `finish`'s, and it is the last only once the
                             // executor stops.
-                            let mut held: Option<Vec<executor::vm::logs::Log>> = None;
+                            let mut held: Option<std::sync::Arc<Vec<executor::vm::logs::Log>>> =
+                                None;
                             loop {
                                 let t = Instant::now();
                                 let Ok((logs, _)) = lrx.recv() else {
@@ -6122,7 +6183,10 @@ fn prove_streamed(
                                     ProducerWaits::add(&waits.walker_send, t);
                                 }
                             }
-                            held.ok_or_else(|| {
+                            held.map(|last| {
+                                std::sync::Arc::try_unwrap(last).unwrap_or_else(|last| (*last).clone())
+                            })
+                            .ok_or_else(|| {
                                 Error::Execution("the run executed no cycle".to_string())
                             })
                         });
@@ -8704,10 +8768,21 @@ mod rest_order_tests {
 
 #[cfg(test)]
 mod producer_report_tests {
+    use super::parse_exec_recycle_logs;
     use super::{
         BLOCK_LAYOUT_AHEAD, BLOCK_LAYOUT_WORKERS, BLOCK_WINDOW_LOG2, BlockOptions, BlockStamps,
         ExecutorStamps, ProducerStamps, StreamTable, parse_window_log2,
     };
+
+    /// `LAMBDA_VM_EXEC_RECYCLE_LOGS`: off unless `1`; anything else refused.
+    #[test]
+    fn log_recycling_is_off_unless_asked() {
+        assert!(!parse_exec_recycle_logs(None).unwrap());
+        assert!(!parse_exec_recycle_logs(Some("")).unwrap());
+        assert!(!parse_exec_recycle_logs(Some("0")).unwrap());
+        assert!(parse_exec_recycle_logs(Some(" 1 ")).unwrap());
+        assert!(parse_exec_recycle_logs(Some("yes")).is_err());
+    }
 
     /// Production lays the streamed chunks out on six workers with eight
     /// chunks ahead (nine unpacked at most): a permit per worker and three
