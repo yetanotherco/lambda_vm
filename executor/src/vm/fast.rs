@@ -503,7 +503,13 @@ impl FastExecutor {
                 let (u, address) = fetched_use(pc, regs, memory, instructions);
                 (STEP, u, address)
             };
-            let cells_before = uses.ecall.then_some(history.cells);
+            // Only an ECALL needs the cells before it (a 0.5 KiB copy; an
+            // eager copy every cycle cost ≈ 0.9 s on the median block).
+            let cells_before = if uses.ecall {
+                Some(history.cells)
+            } else {
+                None
+            };
             let extra = if uses.mem > 0 {
                 history.before_access(memory, address)
             } else if uses.ecall {
