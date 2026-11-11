@@ -861,4 +861,34 @@ theorem lt_rows_correct
   subst hcomp
   exact this
 
+/-- The same conclusion at `MUL`, which completes the three chips of this ensemble. Its two byte
+multiplicities are bounded by its own `ARE_BYTES` pull and its range checks are answered by the
+same static tables, so this is again `dvrm_rows_correct` read at a different component: every
+`MUL` row of a witness whose constraints hold, whose channels carry few enough interactions for
+the balance check and whose channels balance holds the 128-bit product of its two operands, each
+read as signed or unsigned by its own flag.
+
+With this one, every chip of the ensemble concludes about its rows and no component assumes
+anything. -/
+theorem mul_rows_correct
+    (witness : EnsembleWitness ensemble)
+    (hc : witness.Constraints) (hfit : witness.InteractionsFit (Balance.logUpUpTo muMax))
+    (hb : witness.Balanced (Balance.logUpUpTo muMax)) :
+    ∀ table ∈ witness.tables, table.component = mulComponent →
+      ∀ row ∈ table.table, MUL.RowSpec (valueFromOffset MUL.Row 0 (table.environment row)) := by
+  have hassume : witness.Assumptions := by
+    intro table htable row _
+    have hmem := witness.component_mem_tables_of_mem htable
+    simp only [ensemble, circuit_norm, List.mem_cons, List.not_mem_nil, or_false] at hmem
+    obtain ⟨comp, tbl, data, uw, ll, frm, dc⟩ := table
+    simp only at hmem
+    rcases hmem with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> trivial
+  have hspec := (tableSoundness witness hassume hc hfit hb).2
+  intro table htable hcomp row hrow
+  have := hspec table htable row hrow
+  obtain ⟨comp, tbl, data, uw, ll, frm, dc⟩ := table
+  simp only at hcomp
+  subst hcomp
+  exact this
+
 end LambdaVM.Ensembles.DvrmStaged
