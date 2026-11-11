@@ -20,6 +20,11 @@
 use super::{
     execution::{ExecutorError, InstructionCache, ReturnValues, load_program, step},
     flat_memory::{FlatLayout, FlatMemory},
+    history::{
+        HISTORY_MAX_CYCLES, HistExtra, History, HistoryFinal, NO_ACCESS, RegUse, RegisterCells,
+        WindowHistory, cycle_timestamp, step_registers,
+    },
+    instruction::execution::{BLAKE3_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER},
     instruction::{
         decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
         execution::{
@@ -338,6 +343,13 @@ pub struct FastExecutor {
     logs: Vec<Log>,
     /// A handed-out window's buffer given back ([`FastExecutor::recycle`]).
     spare: Option<Vec<Log>>,
+    /// The cycles run so far.
+    cycles: u64,
+    /// History mode ([`FastExecutor::enable_history`]): the history, and
+    /// each op's register and memory use (`None` where no instruction is
+    /// decoded: found as the reference cycle finds it).
+    history: Option<Box<History>>,
+    uses: Box<[Option<RegUse>]>,
 }
 
 impl FastExecutor {
@@ -373,7 +385,161 @@ impl FastExecutor {
             instructions,
             logs: Vec::with_capacity(super::execution::CHUNK_SIZE),
             spare: None,
+            cycles: 0,
+            history: None,
+            uses: Box::new([]),
         })
+    }
+
+    /// Turns history mode on: from now on the engine keeps every byte's and
+    /// register's last-access timestamp by the walk's rules and writes the
+    /// history beside the logs ([`FastExecutor::resume_history`]). Before the
+    /// first cycle only.
+    pub fn enable_history(&mut self) -> Result<(), ExecutorError> {
+        if self.cycles > 0 || self.history.is_some() {
+            return Err(ExecutorError::History(
+                "history mode starts before the first cycle".into(),
+            ));
+        }
+        self.history = Some(Box::new(History::new(self.memory.layout(), self.pc)?));
+        self.uses = (0..self.ops.len() as u64)
+            .map(|i| self.instructions.get(self.ops_base + 4 * i).map(RegUse::of))
+            .collect();
+        Ok(())
+    }
+
+    /// [`FastExecutor::resume_owned`] in history mode: the window's logs and
+    /// its [`WindowHistory`].
+    pub fn resume_history(
+        &mut self,
+        limit: usize,
+    ) -> Result<Option<(Vec<Log>, WindowHistory)>, ExecutorError> {
+        let window = limit.min(MAX_RESERVED_LOGS);
+        if self.pc == 0 {
+            return Ok(None);
+        }
+        if self.history.is_none() {
+            return Err(ExecutorError::History("history mode is off".into()));
+        }
+        if self.logs.capacity() < window {
+            self.logs.clear();
+            self.logs.reserve_exact(window);
+        }
+        self.logs.clear();
+        let first = self.cycles;
+        if let Some(history) = &mut self.history {
+            history.begin(first, window);
+        }
+        self.run_history(limit)?;
+        if self.logs.is_empty() {
+            return Ok(None);
+        }
+        let next = super::logs::next_buffer(&mut self.spare, window);
+        let mut logs = std::mem::replace(&mut self.logs, next);
+        logs.shrink_to_fit();
+        let history = match &mut self.history {
+            Some(h) => std::mem::take(&mut h.window),
+            None => WindowHistory::default(),
+        };
+        Ok(Some((logs, history)))
+    }
+
+    /// History mode's end: the memory and every byte's timestamp after the
+    /// last cycle (history mode ends with it).
+    pub fn take_history_final(&mut self) -> Option<HistoryFinal> {
+        let history = self.history.take()?;
+        Some(HistoryFinal {
+            memory: self.memory.snapshot(),
+            shadow: history.shadow,
+        })
+    }
+
+    /// The register cells now, as the walk holds them (history mode).
+    pub fn history_registers(&self) -> Option<RegisterCells> {
+        self.history.as_ref().map(|h| h.cells)
+    }
+
+    /// [`FastExecutor::run`] keeping the history.
+    #[inline(never)]
+    fn run_history(&mut self, limit: usize) -> Result<(), ExecutorError> {
+        let Some(history) = self.history.as_deref_mut() else {
+            return Err(ExecutorError::History("history mode is off".into()));
+        };
+        let ops = &*self.ops;
+        let uses = &*self.uses;
+        let base = self.ops_base;
+        let regs = &mut self.regs;
+        let memory = &mut self.memory;
+        let instructions = &self.instructions;
+        let logs = &mut self.logs;
+        let mut pc = self.pc;
+        let mut cycle = self.cycles;
+        let result = loop {
+            if pc == 0 || RecordSink::cycles(logs) >= limit {
+                break Ok(());
+            }
+            if cycle > HISTORY_MAX_CYCLES {
+                break Err(ExecutorError::History(format!(
+                    "cycle {cycle} is past the {HISTORY_MAX_CYCLES} a history's timestamps hold"
+                )));
+            }
+            let ts = cycle_timestamp(cycle);
+            let index = pc.wrapping_sub(base).rotate_right(2);
+            let (op, uses, address) = if index < ops.len() as u64
+                && let Some(u) = uses[index as usize]
+            {
+                let op = ops[index as usize];
+                let address = effective_address(regs[op.rs1 as usize & 31], op.imm);
+                (op, u, address)
+            } else {
+                let (u, address) = fetched_use(pc, regs, memory, instructions);
+                (STEP, u, address)
+            };
+            let cells_before = uses.ecall.then_some(history.cells);
+            let extra = if uses.mem > 0 {
+                history.before_access(memory, address)
+            } else if uses.ecall {
+                let a7 = regs[17];
+                let provisional = Log {
+                    current_pc: pc,
+                    next_pc: 0,
+                    src1_val: a7,
+                    src2_val: match a7 {
+                        64 => regs[11],
+                        n if n == KECCAK_SYSCALL_NUMBER || n == BLAKE3_SYSCALL_NUMBER => regs[10],
+                        _ => 0,
+                    },
+                    dst_val: if a7 == 64 { regs[12] } else { 0 },
+                };
+                history.before_ecall(memory, &provisional, ts)
+            } else {
+                HistExtra {
+                    side: NO_ACCESS,
+                    ..HistExtra::default()
+                }
+            };
+            let log = match fast_cycle(op, pc, regs, memory) {
+                Some(log) => log,
+                None => match reference_cycle(pc, regs, memory, instructions) {
+                    Ok(log) => log,
+                    Err(e) => break Err(e),
+                },
+            };
+            if uses.mem > 0 {
+                history.after_access(address, uses.mem, ts);
+            }
+            if let Some(before) = &cells_before {
+                history.after_ecall(&log, before, ts);
+            }
+            step_registers(&mut history.cells, uses, &log, ts);
+            history.window.extras.push(extra);
+            pc = log.next_pc;
+            logs.record(log);
+            cycle += 1;
+        };
+        self.pc = pc;
+        self.cycles = cycle;
+        result
     }
 
     /// Current program counter (0 once the program has halted).
@@ -454,6 +620,7 @@ impl FastExecutor {
         let memory = &mut self.memory;
         let instructions = &self.instructions;
         let logs = &mut self.logs;
+        let before = RecordSink::cycles(logs);
         let mut pc = self.pc;
         let result = loop {
             if pc == 0 || RecordSink::cycles(logs) >= limit {
@@ -481,6 +648,7 @@ impl FastExecutor {
                 },
             }
         };
+        self.cycles += (RecordSink::cycles(logs) - before) as u64;
         self.pc = pc;
         result
     }
@@ -507,6 +675,39 @@ impl RecordSink for Vec<Log> {
     fn cycles(&self) -> usize {
         self.len()
     }
+}
+
+/// The register and memory use of the instruction at `pc` outside the
+/// decoded ops, found as the reference cycle finds it, and a load's or
+/// store's address; the default (no use) where the cycle will fail.
+#[cold]
+#[inline(never)]
+fn fetched_use(
+    pc: u64,
+    regs: &[u64; 32],
+    memory: &FlatMemory,
+    instructions: &InstructionCache,
+) -> (RegUse, u64) {
+    if !pc.is_multiple_of(4) {
+        return (RegUse::default(), 0);
+    }
+    let instruction = match instructions.get(pc) {
+        Some(&i) => i,
+        None => match GuestMemory::load_word(memory, pc)
+            .ok()
+            .and_then(|w| Instruction::parse(w).ok())
+        {
+            Some(i) => i,
+            None => return (RegUse::default(), 0),
+        },
+    };
+    let address = match instruction {
+        Instruction::Load { base, offset, .. } | Instruction::Store { base, offset, .. } => {
+            effective_address(regs[base as usize & 31], offset)
+        }
+        _ => 0,
+    };
+    (RegUse::of(&instruction), address)
 }
 
 /// One cycle through the reference's [`step`], on these registers and

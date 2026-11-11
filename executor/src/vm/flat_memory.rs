@@ -77,11 +77,11 @@ impl FlatLayout {
         }
     }
 
-    fn low_len(self) -> usize {
+    pub(crate) fn low_len(self) -> usize {
         self.low_end as usize
     }
 
-    fn high_len(self) -> usize {
+    pub(crate) fn high_len(self) -> usize {
         0u64.wrapping_sub(self.high_base) as usize
     }
 }
@@ -92,9 +92,9 @@ const _: () = assert!(
 );
 
 /// A flat host region, zero until written.
-struct Region {
-    ptr: *mut u8,
-    len: usize,
+pub(crate) struct Region {
+    pub(crate) ptr: *mut u8,
+    pub(crate) len: usize,
 }
 
 // The region is owned memory with no interior sharing: moving it to another
@@ -105,7 +105,7 @@ impl Region {
     /// `len` bytes of zeroed address space. On Unix an anonymous private
     /// mapping, so untouched pages cost nothing and come back zero; a heap
     /// allocation elsewhere.
-    fn new(len: usize) -> Result<Self, MemoryError> {
+    pub(crate) fn new(len: usize) -> Result<Self, MemoryError> {
         #[cfg(unix)]
         {
             // SAFETY: an anonymous mapping of a fresh range, no file, no

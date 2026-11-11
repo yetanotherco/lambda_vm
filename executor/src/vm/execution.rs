@@ -455,4 +455,6 @@ pub enum ExecutorError {
     MemoryError(#[from] MemoryError),
     #[error("Instruction address misaligned: {0:#018x}")]
     InstructionAddressMisaligned(u64),
+    #[error("History mode: {0}")]
+    History(String),
 }

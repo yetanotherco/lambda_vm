@@ -263,3 +263,56 @@ fn a_block_runs_alike() {
         ran.cycles
     );
 }
+
+/// History mode (`FastExecutor::enable_history`) changes no log: every asm
+/// and Rust guest and an ethrex fixture write the reference's logs, window by
+/// window, with the history kept (one history extra a log).
+#[test]
+fn history_mode_writes_the_same_logs() {
+    let mut runs: Vec<(String, Elf, Vec<u8>)> = Vec::new();
+    for dir in ["./program_artifacts/asm", "./program_artifacts/rust"] {
+        runs.extend(elfs(dir).into_iter().map(|(n, e)| (n, e, Vec::new())));
+    }
+    let ethrex = Elf::load(&std::fs::read("./program_artifacts/rust/ethrex.elf").unwrap()).unwrap();
+    runs.push((
+        "ethrex_simple_tx".into(),
+        ethrex,
+        std::fs::read("./tests/ethrex_simple_tx.bin").unwrap(),
+    ));
+    for (name, program, input) in &runs {
+        let (Ok(mut reference), Ok(mut fast)) = (
+            Executor::new(program, input.clone()),
+            FastExecutor::new(program, input.clone()),
+        ) else {
+            continue;
+        };
+        fast.enable_history().unwrap();
+        let mut cycles = 0usize;
+        loop {
+            let want = reference
+                .resume_with_limit(1 << 14)
+                .map(|l| l.map(|l| l.iter().map(record).collect::<Vec<_>>()))
+                .map_err(|e| error(&e));
+            let got = fast
+                .resume_history(1 << 14)
+                .map(|w| {
+                    w.map(|(logs, history)| {
+                        assert_eq!(history.extras.len(), logs.len(), "{name}");
+                        logs.iter().map(record).collect::<Vec<_>>()
+                    })
+                })
+                .map_err(|e| error(&e));
+            match (&want, &got) {
+                (Ok(Some(w)), Ok(Some(g))) => assert!(w == g, "{name}: window at cycle {cycles}"),
+                _ => {
+                    assert_eq!(want.is_ok(), got.is_ok(), "{name}: {want:?} {got:?}");
+                    break;
+                }
+            }
+            cycles += want.unwrap().unwrap().len();
+            if cycles >= 40_000_000 {
+                break;
+            }
+        }
+    }
+}
