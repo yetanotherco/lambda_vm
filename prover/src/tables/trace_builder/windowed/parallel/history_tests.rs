@@ -183,10 +183,16 @@ enum Tamper {
         window: usize,
         nth: usize,
     },
-    /// The first side cell of the first window from `window` that has one,
-    /// one timestamp later.
+    /// The first ECALL side cell of the first window from `window` that has
+    /// one, one timestamp later.
     LaterEcallCell {
         window: usize,
+    },
+    /// Byte `byte` of the first load or store with differing old timestamps
+    /// of the first window from `window` that has one, one timestamp later.
+    LaterMixedCell {
+        window: usize,
+        byte: usize,
     },
     /// Window `window` starting with x5 one larger.
     Register {
@@ -250,6 +256,12 @@ fn tamper_with(
         Tamper::LaterEcallCell { window } if k >= window => {
             if let Some(ts) = history.ts.first_mut() {
                 *ts += 1;
+                return true;
+            }
+        }
+        Tamper::LaterMixedCell { window, byte } if k >= window => {
+            if let Some(ts) = history.mixed.first_mut() {
+                ts[byte] += 1;
                 return true;
             }
         }
@@ -442,6 +454,16 @@ fn a_wrong_history_is_refused() {
             1,
         ),
         ("test_copy_ecalls", Tamper::LaterEcallCell { window: 1 }, 1),
+        (
+            "misalign_ld",
+            Tamper::LaterMixedCell { window: 1, byte: 0 },
+            1,
+        ),
+        (
+            "misalign_sd",
+            Tamper::LaterMixedCell { window: 1, byte: 7 },
+            1,
+        ),
         ("all_loadstore_32", Tamper::Register { window: 2 }, 1),
         ("all_loadstore_32", Tamper::Register { window: 2 }, 0),
         (

@@ -44,6 +44,8 @@ fn main() {
     };
     let rounds: usize = args.get(5).map_or(3, |r| r.parse().expect("a round count"));
     let window = 1usize << 20;
+    // `ENGINES_TIME_SIDES=1`: each window's accesses by kind (history mode).
+    let diag = std::env::var("ENGINES_TIME_SIDES").is_ok_and(|v| v == "1");
     let mut totals = Vec::new();
     for round in 0..rounds {
         let t = Instant::now();
@@ -76,6 +78,22 @@ fn main() {
                     .expect("the run")
                     .map(|(logs, h)| {
                         side_bytes += h.heap_bytes() - h.extras.capacity() * 40;
+                        if diag {
+                            use executor::vm::history::{MIXED, NO_ACCESS, UNIFORM};
+                            let count = |f: &dyn Fn(u32) -> bool| {
+                                h.extras.iter().filter(|e| f(e.side)).count()
+                            };
+                            eprintln!(
+                                "ENGINES TIME SIDES: cycles {} uniform {} mixed {} ecalls {} \
+                                 ecall bytes {} register cells {}",
+                                h.extras.len(),
+                                count(&|s| s == UNIFORM),
+                                count(&|s| s == MIXED),
+                                count(&|s| s != NO_ACCESS && s != UNIFORM && s != MIXED),
+                                h.values.len(),
+                                h.reg_cells.len(),
+                            );
+                        }
                         extras_held.push_back(h.extras);
                         logs
                     })
@@ -120,7 +138,7 @@ fn main() {
         let total = t.elapsed().as_secs_f64();
         totals.push(total);
         println!(
-            "ENGINES TIME: round {round} engine {} buffers {} setup {setup:.3} execute {execute:.3} \
+            "ENGINES TIME: round {round} engine {} buffers {} setup {setup:.5} execute {execute:.5} \
              hand-off {handoff:.3} total {total:.3} cycles {cycles} logs {digest:016x} output {} bytes \
              side lists {:.1} MiB",
             kind.name(),

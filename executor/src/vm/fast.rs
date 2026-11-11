@@ -438,7 +438,7 @@ impl FastExecutor {
         let mut logs = std::mem::replace(&mut self.logs, next);
         logs.shrink_to_fit();
         let history = match &mut self.history {
-            Some(h) => std::mem::take(&mut h.window),
+            Some(h) => h.take_window(),
             None => WindowHistory::default(),
         };
         Ok(Some((logs, history)))
@@ -503,7 +503,7 @@ impl FastExecutor {
                 let (u, address) = fetched_use(pc, regs, memory, instructions);
                 (STEP, u, address)
             };
-            let cells_before = uses.ecall.then_some(history.cells);
+            let cells_before = uses.ecall.then(|| history.cells);
             let extra = if uses.mem > 0 {
                 history.before_access(memory, address)
             } else if uses.ecall {

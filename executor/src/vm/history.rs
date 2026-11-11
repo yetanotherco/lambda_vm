@@ -12,8 +12,8 @@
 //! [`Log`], what the walk will read in that cycle:
 //!
 //! - a load or store: the eight bytes at its address and their timestamps
-//!   ([`HistExtra`]: the 40-byte log and these 24 bytes are the 64-byte record);
-//!   eight timestamps that differ go to the window's side lists;
+//!   ([`HistExtra`], 40 bytes beside the 40-byte log); eight timestamps that
+//!   differ go to the window's [`WindowHistory::mixed`] list (32 bytes);
 //! - an ECALL: every byte the walk touches, with its value and timestamp before
 //!   the call, as side ranges;
 //! - each window: the register cells at its start.
@@ -58,6 +58,10 @@ pub const NO_ACCESS: u32 = u32::MAX;
 /// A load or store whose eight bytes share one old timestamp: `addr`, `old`
 /// and `ts` say it all.
 pub const UNIFORM: u32 = u32::MAX - 1;
+/// A load or store whose eight bytes' old timestamps differ: `addr` and `old`
+/// as for [`UNIFORM`], `ts` the index of the eight timestamps in
+/// [`WindowHistory::mixed`].
+pub const MIXED: u32 = u32::MAX - 2;
 
 /// What a cycle's walk reads besides its log: the 24 bytes after the 40-byte
 /// [`Log`] in the 64-byte record.
@@ -68,11 +72,11 @@ pub struct HistExtra {
     pub addr: u64,
     /// Those eight bytes before the cycle, little-endian.
     pub old: u64,
-    /// Their timestamp before the cycle (with [`UNIFORM`]).
+    /// Their timestamp before the cycle (with [`UNIFORM`]), or the index of
+    /// their eight timestamps in [`WindowHistory::mixed`] (with [`MIXED`]).
     pub ts: u32,
-    /// [`NO_ACCESS`], [`UNIFORM`], or the index of the cycle's
-    /// [`SideGroup`] (an ECALL's bytes, or a load's or store's eight bytes
-    /// whose timestamps differ).
+    /// [`NO_ACCESS`], [`UNIFORM`], [`MIXED`], or the index of the cycle's
+    /// [`SideGroup`] (an ECALL's bytes).
     pub side: u32,
     /// The old timestamps of the cycle's `rs1` (the pc's for JAL and AUIPC),
     /// `rs2` and `rd` accesses, in the walk's order (an `rd` that is also
@@ -154,6 +158,10 @@ pub struct WindowHistory {
     pub first: u64,
     pub registers: Option<RegisterCells>,
     pub extras: Vec<HistExtra>,
+    /// The old timestamps of the loads' and stores' eight bytes where they
+    /// differ ([`MIXED`]), one entry such an access.
+    pub mixed: Vec<[u32; 8]>,
+    /// ECALLs' memory: `ranges[first..first + count]` for each group.
     pub groups: Vec<SideGroup>,
     pub ranges: Vec<SideRange>,
     pub values: Vec<u8>,
@@ -168,6 +176,7 @@ impl WindowHistory {
     /// The bytes it takes on the heap.
     pub fn heap_bytes(&self) -> usize {
         self.extras.capacity() * std::mem::size_of::<HistExtra>()
+            + self.mixed.capacity() * std::mem::size_of::<[u32; 8]>()
             + self.groups.capacity() * std::mem::size_of::<SideGroup>()
             + self.ranges.capacity() * std::mem::size_of::<SideRange>()
             + self.values.capacity()
@@ -197,6 +206,12 @@ impl WindowHistory {
             UNIFORM => {
                 for (k, byte) in extra.old.to_le_bytes().into_iter().enumerate() {
                     cell(extra.addr.wrapping_add(k as u64), byte, extra.ts);
+                }
+            }
+            MIXED => {
+                let ts = &self.mixed[extra.ts as usize];
+                for (k, byte) in extra.old.to_le_bytes().into_iter().enumerate() {
+                    cell(extra.addr.wrapping_add(k as u64), byte, ts[k]);
                 }
             }
             group => {
@@ -679,6 +694,10 @@ pub(crate) struct History {
     /// A buffer for a later window's extras, given back or prepared
     /// ([`crate::vm::fast::FastExecutor::recycle_extras`]).
     pub(crate) spare_extras: Option<Vec<HistExtra>>,
+    /// The side lists' lengths in the last window handed out
+    /// ([`History::take_window`]): `mixed`, `groups`, `ranges`, `values`
+    /// (and `ts`), `reg_groups`, `reg_cells`.
+    last_sides: [usize; 6],
 }
 
 impl History {
@@ -688,10 +707,13 @@ impl History {
             cells: RegisterCells::at_start(entry_point),
             window: WindowHistory::default(),
             spare_extras: None,
+            last_sides: [0; 6],
         })
     }
 
-    /// Starts a window at cycle `first`.
+    /// Starts a window at cycle `first`. Its side lists start with room for
+    /// what the last window's took, and a quarter more, so they rarely grow
+    /// (a grown list is copied whole).
     pub(crate) fn begin(&mut self, first: u64, capacity: usize) {
         let extras = match self.spare_extras.take() {
             Some(mut extras) if extras.capacity() == capacity => {
@@ -700,16 +722,39 @@ impl History {
             }
             _ => Vec::with_capacity(capacity),
         };
+        let [mixed, groups, ranges, values, reg_groups, reg_cells] =
+            self.last_sides.map(|n| n + n / 4);
         self.window = WindowHistory {
             first,
             registers: Some(self.cells),
             extras,
-            ..WindowHistory::default()
+            mixed: Vec::with_capacity(mixed),
+            groups: Vec::with_capacity(groups),
+            ranges: Vec::with_capacity(ranges),
+            values: Vec::with_capacity(values),
+            ts: Vec::with_capacity(values),
+            reg_groups: Vec::with_capacity(reg_groups),
+            reg_cells: Vec::with_capacity(reg_cells),
         };
     }
 
-    /// The eight bytes from `address` before a load or store: one record, or
-    /// a side group when their timestamps differ.
+    /// The window written, handed out; the next one's side lists are sized
+    /// from it.
+    pub(crate) fn take_window(&mut self) -> WindowHistory {
+        let w = std::mem::take(&mut self.window);
+        self.last_sides = [
+            w.mixed.len(),
+            w.groups.len(),
+            w.ranges.len(),
+            w.values.len(),
+            w.reg_groups.len(),
+            w.reg_cells.len(),
+        ];
+        w
+    }
+
+    /// The eight bytes from `address` before a load or store: one record, and
+    /// their eight timestamps in [`WindowHistory::mixed`] when they differ.
     #[inline(always)]
     pub(crate) fn before_access<M: GuestMemory>(&mut self, memory: &M, address: u64) -> HistExtra {
         let old = if address <= u64::MAX - 7 {
@@ -729,24 +774,14 @@ impl History {
                 ..HistExtra::default()
             };
         }
-        let w = &mut self.window;
-        let group = w.groups.len() as u32;
-        w.groups.push(SideGroup {
-            first: w.ranges.len() as u32,
-            count: 1,
-        });
-        w.ranges.push(SideRange {
-            addr: address,
-            start: w.values.len() as u32,
-            len: 8,
-        });
-        w.values.extend_from_slice(&old.to_le_bytes());
-        w.ts.extend_from_slice(&ts);
+        let mixed = &mut self.window.mixed;
+        let at = mixed.len() as u32;
+        mixed.push(ts);
         HistExtra {
             addr: address,
             old,
-            ts: 0,
-            side: group,
+            ts: at,
+            side: MIXED,
             ..HistExtra::default()
         }
     }
