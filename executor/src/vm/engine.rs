@@ -52,7 +52,7 @@ impl EngineKind {
 
 /// A run on either engine.
 pub enum Engine {
-    Reference(Executor),
+    Reference(Box<Executor>),
     Fast(Box<FastExecutor>),
 }
 
@@ -64,7 +64,9 @@ impl Engine {
         private_inputs: Vec<u8>,
     ) -> Result<Self, ExecutorError> {
         Ok(match kind {
-            EngineKind::Reference => Self::Reference(Executor::new(program, private_inputs)?),
+            EngineKind::Reference => {
+                Self::Reference(Box::new(Executor::new(program, private_inputs)?))
+            }
             EngineKind::Fast => Self::Fast(Box::new(FastExecutor::new(program, private_inputs)?)),
         })
     }

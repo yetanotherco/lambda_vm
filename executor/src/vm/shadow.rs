@@ -102,7 +102,7 @@ impl ShadowCheck {
 
     /// Whether window `window` is sampled.
     pub fn samples(&self, window: usize) -> bool {
-        window % self.every == 0
+        window.is_multiple_of(self.every)
     }
 
     /// Hands a sampled window to the check: its start, the logs the run
