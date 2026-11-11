@@ -25,7 +25,9 @@
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
+use executor::vm::engine::{Engine, EngineKind};
 use executor::vm::execution::Executor;
+use executor::vm::shadow::{ShadowCheck, WindowStart};
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
 use multilinear::whir_chain::{ArgueFormat, ChainConfig, GroupFold};
@@ -5850,14 +5852,46 @@ fn prove_streamed(
                     ..ExecutorStamps::default()
                 };
                 let t = Instant::now();
-                let mut executor = Executor::new(program, private_inputs.to_vec())
-                    .map_err(|e| Error::Execution(format!("{e}")))?;
+                let failed =
+                    |e: executor::vm::execution::ExecutorError| Error::Execution(format!("{e}"));
+                // The interpreter (`LAMBDA_VM_EXEC_ENGINE`), and on the fast
+                // one the sampled re-execution by the reference
+                // (`LAMBDA_VM_EXEC_SHADOW`).
+                let kind = EngineKind::from_env().map_err(Error::Execution)?;
+                let mut executor =
+                    Engine::new(kind, program, private_inputs.to_vec()).map_err(failed)?;
+                let shadow_every = match kind {
+                    EngineKind::Fast => ShadowCheck::every_from_env().map_err(Error::Execution)?,
+                    EngineKind::Reference => None,
+                };
+                let mut shadow = shadow_every
+                    .map(|every| ShadowCheck::new(program, every))
+                    .transpose()
+                    .map_err(failed)?;
                 own.setup = t.elapsed().as_secs_f64();
-                let mut at_start = (walkers > 0).then(|| executor.memory().snapshot());
+                eprintln!(
+                    "BLOCK EXECUTOR ENGINE: {} · shadow check {}",
+                    kind.name(),
+                    shadow_every.map_or("off".to_string(), |n| format!("every {n} windows")),
+                );
+                let mut at_start = (walkers > 0).then(|| executor.snapshot());
+                let mut cycles = 0u64;
                 loop {
                     let t = Instant::now();
-                    let failed = |e: executor::vm::execution::ExecutorError| {
-                        Error::Execution(format!("{e}"))
+                    // A sampled window's start, for the shadow check.
+                    let sampled = match &shadow {
+                        Some(check) if check.samples(own.windows) => Some(WindowStart {
+                            window: own.windows,
+                            first_cycle: cycles,
+                            pc: executor.pc(),
+                            registers: executor.registers(),
+                            memory: match &at_start {
+                                Some(snapshot) => snapshot.clone(),
+                                None => executor.snapshot(),
+                            },
+                            public_output: executor.public_output().to_vec(),
+                        }),
+                        _ => None,
                     };
                     // `ran`: the window executed.
                     let (logs, ran) = (
@@ -5868,7 +5902,16 @@ fn prove_streamed(
                     let Some(logs) = logs else {
                         break;
                     };
-                    let next = (walkers > 0).then(|| executor.memory().snapshot());
+                    cycles += logs.len() as u64;
+                    if let Some(check) = &mut shadow {
+                        if let Some(start) = sampled {
+                            check.submit(start, &logs, executor.pc(), executor.registers());
+                        }
+                        if let Some(mismatch) = check.failure() {
+                            return Err(Error::Execution(mismatch));
+                        }
+                    }
+                    let next = (walkers > 0).then(|| executor.snapshot());
                     let start = std::mem::replace(&mut at_start, next);
                     own.windows += 1;
                     own.handoff += ran.elapsed().as_secs_f64();
@@ -5878,7 +5921,7 @@ fn prove_streamed(
                         ledger.logs.fetch_add(bytes, Relaxed);
                         ledger
                             .exec
-                            .store(executor.memory().heap_bytes() + bytes, Relaxed);
+                            .store(executor.heap_bytes() + bytes, Relaxed);
                     }
                     let t = Instant::now();
                     if ltx.send((logs, start)).is_err() {
@@ -5888,6 +5931,13 @@ fn prove_streamed(
                 }
                 let executed = start.elapsed().as_secs_f64();
                 drop(executor);
+                if let Some(check) = shadow {
+                    let counts = check.finish().map_err(Error::Execution)?;
+                    eprintln!(
+                        "BLOCK EXECUTOR SHADOW: {} windows re-executed and equal · {} skipped (the check busy)",
+                        counts.checked, counts.skipped
+                    );
+                }
                 if let Some(ledger) = ledger {
                     ledger.exec.store(0, Relaxed);
                     ledger.line("executor done");
