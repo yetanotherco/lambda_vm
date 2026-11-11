@@ -2036,10 +2036,13 @@ fn parse_exec_history(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
-/// `LAMBDA_VM_EXEC_HISTORY_CHECK=N`: in record mode, every `N`-th window is
-/// walked again from the start cells its history gives and must emit the
-/// same lists (`1`: every window, with the boundary sums). Unset, empty or
-/// `0`: none. Anything else refuses the prove.
+/// `LAMBDA_VM_EXEC_HISTORY_CHECK=N`: in record mode, a check thread runs
+/// today's lean pass over every window (its own timestamps and registers,
+/// from the logs) and re-walks every `N`-th window as today's walkers do, from
+/// the pass's entries and the executor's memory at the window's start; the
+/// history's starting registers, first cells and the walkers' lists must
+/// agree with it. Unset, empty or `0`: no check thread. Anything else refuses
+/// the prove.
 pub(crate) fn exec_history_check() -> Result<usize, Error> {
     parse_exec_history_check(
         std::env::var("LAMBDA_VM_EXEC_HISTORY_CHECK")
@@ -6011,6 +6014,11 @@ fn prove_streamed(
                         }),
                         _ => None,
                     };
+                    // Record mode's check: a re-walked window's start memory.
+                    let check_start = (history
+                        && history_check > 0
+                        && own.windows.is_multiple_of(history_check))
+                    .then(|| executor.snapshot());
                     // `ran`: the window executed.
                     let (logs, ran) = if history {
                         let window = executor.resume_history(window).map_err(failed)?;
@@ -6055,7 +6063,7 @@ fn prove_streamed(
                     let t = Instant::now();
                     let sent_window = parallel::ExecWindow {
                         logs,
-                        start,
+                        start: if history { check_start } else { start },
                         history: window_history.map(Box::new),
                         last: end.map(Box::new),
                     };

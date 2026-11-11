@@ -74,10 +74,27 @@ pub struct HistExtra {
     /// [`SideGroup`] (an ECALL's bytes, or a load's or store's eight bytes
     /// whose timestamps differ).
     pub side: u32,
+    /// The old timestamps of the cycle's `rs1` (the pc's for JAL and AUIPC),
+    /// `rs2` and `rd` accesses, in the walk's order (an `rd` that is also
+    /// `rs1` finds `rs1`'s stamp); 0 where the cycle makes none.
+    pub regs_ts: [u32; 3],
+    /// [`NO_ACCESS`], or the index of the cycle's group in
+    /// [`WindowHistory::reg_groups`]: an ECALL chip's register accesses
+    /// beyond `rs1` (x10 to x13 and the commit index x254), their cells
+    /// before the call.
+    pub reg_side: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<HistExtra>() == 24);
-const _: () = assert!(std::mem::size_of::<Log>() + std::mem::size_of::<HistExtra>() == 64);
+const _: () = assert!(std::mem::size_of::<HistExtra>() == 40);
+const _: () = assert!(std::mem::size_of::<Log>() + std::mem::size_of::<HistExtra>() == 80);
+
+/// A register's cell before an access: x0 to x31, or 254 for the commit index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegAccess {
+    pub reg: u8,
+    pub value: u64,
+    pub ts: u32,
+}
 
 /// A cycle's side ranges: `ranges[first..first + count]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +158,10 @@ pub struct WindowHistory {
     pub ranges: Vec<SideRange>,
     pub values: Vec<u8>,
     pub ts: Vec<u32>,
+    /// ECALLs' register accesses ([`HistExtra::reg_side`]): `reg_cells[first..
+    /// first + count]` for each group.
+    pub reg_groups: Vec<SideGroup>,
+    pub reg_cells: Vec<RegAccess>,
 }
 
 impl WindowHistory {
@@ -151,6 +172,19 @@ impl WindowHistory {
             + self.ranges.capacity() * std::mem::size_of::<SideRange>()
             + self.values.capacity()
             + self.ts.capacity() * 4
+            + self.reg_groups.capacity() * std::mem::size_of::<SideGroup>()
+            + self.reg_cells.capacity() * std::mem::size_of::<RegAccess>()
+    }
+
+    /// Cycle `i`'s ECALL register accesses (empty for any other cycle).
+    pub fn cycle_registers(&self, i: usize) -> &[RegAccess] {
+        match self.extras[i].reg_side {
+            NO_ACCESS => &[],
+            group => {
+                let g = self.reg_groups[group as usize];
+                &self.reg_cells[g.first as usize..(g.first + g.count) as usize]
+            }
+        }
     }
 
     /// Calls `cell(address, value, timestamp)` for every byte cycle `i` of the
@@ -199,6 +233,9 @@ impl WindowHistory {
 pub struct HistoryFinal {
     pub memory: MemorySnapshot,
     pub shadow: TsShadow,
+    /// The register cells after the last cycle: what HALT's register reads
+    /// find.
+    pub registers: RegisterCells,
 }
 
 /// A `u32` timestamp a byte: flat over the engine's flat regions (lazily
@@ -432,17 +469,30 @@ impl RegUse {
 
 /// The register cells after a cycle, by the walk's rules: `r1` read at `ts`,
 /// `r2` at `ts + 1`, `rd` written at `ts + 2`, the pc at `ts + 1` (an ECALL's
-/// next pc is the one after it, a halt's included); then an ECALL's own.
-pub fn step_registers(cells: &mut RegisterCells, uses: RegUse, log: &Log, ts: u64) {
+/// next pc is the one after it, a halt's included); then an ECALL's own,
+/// whose cells before the call go to `ecall_cells`. Returns the old
+/// timestamps of the `r1`, `r2` and `rd` accesses (0 for none).
+pub fn step_registers(
+    cells: &mut RegisterCells,
+    uses: RegUse,
+    log: &Log,
+    ts: u64,
+    ecall_cells: &mut Vec<RegAccess>,
+) -> [u32; 3] {
+    let mut old = [0u32; 3];
     if uses.r1 == 255 {
+        old[0] = cells.pc.1 as u32;
         cells.pc = (log.current_pc, ts);
     } else if uses.r1 != 0 {
+        old[0] = cells.regs[usize::from(uses.r1 & 31)].1 as u32;
         cells.write(uses.r1, log.src1_val, ts);
     }
     if uses.r2 != 0 {
+        old[1] = cells.regs[usize::from(uses.r2 & 31)].1 as u32;
         cells.write(uses.r2, log.src2_val, ts + 1);
     }
     if uses.rd != 0 {
+        old[2] = cells.regs[usize::from(uses.rd & 31)].1 as u32;
         cells.write(uses.rd, log.dst_val, ts + 2);
     }
     let next = if uses.ecall {
@@ -452,20 +502,38 @@ pub fn step_registers(cells: &mut RegisterCells, uses: RegUse, log: &Log, ts: u6
     };
     cells.pc = (next, ts + 1);
     if uses.ecall {
-        ecall_registers(cells, log, ts);
+        ecall_registers(cells, log, ts, ecall_cells);
     }
+    old
 }
 
 /// An ECALL's register cells, as the walk writes them.
-fn ecall_registers(cells: &mut RegisterCells, log: &Log, ts: u64) {
+fn ecall_registers(cells: &mut RegisterCells, log: &Log, ts: u64, before: &mut Vec<RegAccess>) {
     let number = log.src1_val;
-    let keep = |cells: &mut RegisterCells, reg: u8, at: u64| {
+    let note = |before: &mut Vec<RegAccess>, cells: &RegisterCells, reg: u8| {
+        let (value, at) = cells.regs[usize::from(reg & 31)];
+        before.push(RegAccess {
+            reg,
+            value,
+            ts: at as u32,
+        });
+    };
+    let keep = |cells: &mut RegisterCells, before: &mut Vec<RegAccess>, reg: u8, at: u64| {
+        note(before, cells, reg);
         let value = cells.value(reg);
         cells.write(reg, value, at);
     };
     match number {
         64 => {
             let (buf, count) = (log.src2_val, log.dst_val);
+            for reg in [10, 11, 12] {
+                note(before, cells, reg);
+            }
+            before.push(RegAccess {
+                reg: 254,
+                value: u64::from(cells.index.0),
+                ts: cells.index.1 as u32,
+            });
             cells.write(10, count, ts);
             cells.write(11, buf, ts);
             cells.write(12, count, ts);
@@ -477,25 +545,27 @@ fn ecall_registers(cells: &mut RegisterCells, log: &Log, ts: u64) {
             || n == HINT_SYSCALL_NUMBER =>
         {
             for reg in [10, 11, 12] {
-                keep(cells, reg, ts);
+                keep(cells, before, reg, ts);
             }
         }
-        n if n == KECCAK_SYSCALL_NUMBER || n == BLAKE3_SYSCALL_NUMBER => keep(cells, 10, ts),
+        n if n == KECCAK_SYSCALL_NUMBER || n == BLAKE3_SYSCALL_NUMBER => {
+            keep(cells, before, 10, ts)
+        }
         n if n == BLAKE3_ABSORB_SYSCALL_NUMBER => {
             for reg in [10, 11, 12, 13] {
-                keep(cells, reg, ts);
+                keep(cells, before, reg, ts);
             }
         }
         n if n == ECSM_SYSCALL_NUMBER => {
-            keep(cells, 11, ts);
-            keep(cells, 12, ts + 1);
-            keep(cells, 10, ts + 2);
+            keep(cells, before, 11, ts);
+            keep(cells, before, 12, ts + 1);
+            keep(cells, before, 10, ts + 2);
         }
         n if n == ECREC_SYSCALL_NUMBER => {
-            keep(cells, 11, ts);
-            keep(cells, 12, ts + 1);
-            keep(cells, 10, ts + 2);
-            keep(cells, 13, ts + 1);
+            keep(cells, before, 11, ts);
+            keep(cells, before, 12, ts + 1);
+            keep(cells, before, 10, ts + 2);
+            keep(cells, before, 13, ts + 1);
         }
         _ => {}
     }
@@ -645,6 +715,7 @@ impl History {
                 old,
                 ts: ts[0],
                 side: UNIFORM,
+                ..HistExtra::default()
             };
         }
         let w = &mut self.window;
@@ -665,6 +736,7 @@ impl History {
             old,
             ts: 0,
             side: group,
+            ..HistExtra::default()
         }
     }
 

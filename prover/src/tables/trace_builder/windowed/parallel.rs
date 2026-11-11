@@ -98,7 +98,8 @@ struct WindowJob {
     /// Each byte it touches and the byte's timestamp before it.
     entries: Arc<Vec<(u64, u64)>>,
     /// Record mode: the window's history (no entries, no start memory), and
-    /// whether the window is walked again from its start state as a check.
+    /// whether the check thread re-walks it (its walker then sends the
+    /// digest of what it emitted, [`WalkSettings::digests`]).
     history: Option<Arc<WindowHistory>>,
     recheck: bool,
 }
@@ -112,9 +113,9 @@ struct WalkSettings {
     key: u64,
     /// Keep each window's logs with it ([`WindowedTraceBuilder::keeps_logs`]).
     keep_logs: bool,
-    /// Record mode with every window rechecked: the rechecks add up the
-    /// windows' boundaries as a walk from entries does.
-    record_sums: bool,
+    /// Record mode's check: where a walker sends the digest of a rechecked
+    /// window's lists ([`check_thread`]).
+    digests: Option<Mutex<std::sync::mpsc::Sender<(u32, u64)>>>,
 }
 
 /// One byte's cell hashed for the windows' boundary sums, under the run's
@@ -191,15 +192,14 @@ impl WindowWalker {
     }
 
     /// Walks a record-mode `job` from its history: no seeding, no window
-    /// state. A rechecked job is then walked again from the start state its
-    /// history gives (its bytes' first cells, seeded as entries), and the two
-    /// walks must emit the same lists. Refuses the window if a cycle read a
-    /// byte its history does not hold.
+    /// state. Refuses the window if a cycle read a byte, or found a register
+    /// cell, other than its history gives. A rechecked job's lists go, as a
+    /// digest, to the check thread, which walks the window again from an
+    /// independent start state ([`check_thread`]).
     fn walk_record(
         &mut self,
         job: &WindowJob,
         history: &Arc<WindowHistory>,
-        image: &PagedMem<u8>,
     ) -> Result<(WalkedWindow, u64), Error> {
         let Some(cells) = &history.registers else {
             return Err(Error::Prover(format!(
@@ -229,108 +229,19 @@ impl WindowWalker {
         }
         if self.record.take_missing() {
             return Err(Error::Prover(format!(
-                "window {}: the walk read a byte the executor's history does not hold",
+                "window {}: the walk read a byte, or found a register cell, other than the \
+                 executor's history gives",
                 job.window
             )));
         }
         self.seeded = false;
-        if job.recheck {
-            let first = history.first_touches();
-            if job.first == 0 && first.iter().any(|&(_, _, ts)| ts != 0) {
-                return Err(Error::Prover(format!(
-                    "window {}: the run's first window touches a byte its history stamps \
-                     before the run",
-                    job.window
-                )));
-            }
-            let t = Instant::now();
-            let seeded = self.seed_cells(job, &first, image)?;
-            self.seeding = t.elapsed().as_secs_f64();
-            let mut registers = register_state(cells);
-            let again = walk_window(
-                &s.decode,
-                s.lookups,
-                s.batch,
-                &mut self.sizes,
-                &mut self.memory,
-                &mut registers,
-                job.first,
-                &job.logs,
-            )?;
-            if self.memory.take_missing() {
-                return Err(Error::Prover(format!(
-                    "window {}: walked again from its history's start cells, it read a byte \
-                     they do not hold",
-                    job.window
-                )));
-            }
-            if again.emitted_digest() != walked.emitted_digest() {
-                return Err(Error::Prover(format!(
-                    "window {}: walked from the executor's history it emits other lists than \
-                     walked from its start state",
-                    job.window
-                )));
-            }
-            if registers.regs != self.registers.regs
-                || registers.index_register != self.registers.index_register
-                || registers.pc_register != self.registers.pc_register
-            {
-                return Err(Error::Prover(format!(
-                    "window {}: walked again it ends with other registers",
-                    job.window
-                )));
-            }
-            self.seeded = true;
-            if s.record_sums {
-                let key = s.key;
-                let ended = first.iter().fold(0u64, |sum, &(address, _, _)| {
-                    let (value, ts) = self.memory.cells.get(address);
-                    sum.wrapping_add(cell_hash(key, address, ts, value))
-                });
-                return Ok((walked, ended.wrapping_sub(seeded)));
-            }
+        if job.recheck
+            && let Some(digests) = &s.digests
+            && let Ok(digests) = digests.lock()
+        {
+            let _ = digests.send((job.window, walked.emitted_digest()));
         }
         Ok((walked, 0))
-    }
-
-    /// [`Self::seed`] from cells with their values (a history's first
-    /// touches) rather than entries and a snapshot. Refuses a cell stamped 0
-    /// whose value is not `image`'s.
-    fn seed_cells(
-        &mut self,
-        job: &WindowJob,
-        cells: &[(u64, u8, u64)],
-        image: &PagedMem<u8>,
-    ) -> Result<u64, Error> {
-        for &address in &self.touched {
-            self.memory.write_byte(address, 0, ABSENT);
-        }
-        let mut pages: Vec<u64> = cells.iter().map(|&(a, _, _)| page_of(a)).collect();
-        pages.sort_unstable();
-        pages.dedup();
-        let last = std::mem::replace(&mut self.pages, pages);
-        let now = &self.pages;
-        self.memory.cells.retain_pages(|base| {
-            now.binary_search(&base).is_ok() || last.binary_search(&base).is_ok()
-        });
-        self.memory.hot = NO_PAGE;
-        self.touched.clear();
-        let mut seeded = 0u64;
-        for &(address, value, ts) in cells {
-            if ts == 0 && value != image.get(address) {
-                return Err(Error::Prover(format!(
-                    "window {}: the byte at {address:#x} has timestamp 0 in the history but \
-                     holds {value}, not the image's {}",
-                    job.window,
-                    image.get(address)
-                )));
-            }
-            self.memory.write_byte(address, value, ts);
-            self.touched.push(address);
-            seeded = seeded.wrapping_add(cell_hash(self.settings.key, address, ts, value));
-        }
-        self.memory.take_missing();
-        Ok(seeded)
     }
 
     /// Walks `job` from its entries into fresh lists, with its boundary sum:
@@ -343,7 +254,7 @@ impl WindowWalker {
         image: &PagedMem<u8>,
     ) -> Result<(WalkedWindow, u64), Error> {
         if let Some(history) = &job.history {
-            return self.walk_record(job, history, image);
+            return self.walk_record(job, history);
         }
         self.seeded = true;
         let t = Instant::now();
@@ -500,12 +411,8 @@ enum After {
         registers: RegisterState,
         state: Arc<MemoryState>,
     },
-    /// Record mode: the next window's starting registers and, for a
-    /// rechecked window, the next window's first cells (its bytes before it).
-    NextHistory {
-        registers: RegisterState,
-        cells: Option<Arc<Vec<(u64, u8, u64)>>>,
-    },
+    /// Record mode: the next window's starting registers.
+    NextHistory { registers: RegisterState },
 }
 
 impl WindowWalker {
@@ -535,21 +442,7 @@ impl WindowWalker {
                 self.check_exit_into(job, &registers, &state)?
             }
             After::Finish { registers, .. } => self.check_registers(job, &registers)?,
-            After::NextHistory { registers, cells } => {
-                self.check_registers(job, &registers)?;
-                if let Some(cells) = cells.filter(|_| self.seeded) {
-                    for &(address, value, ts) in cells.iter() {
-                        let held = self.memory.cells.get(address);
-                        if held.1 != ABSENT && held != (value, ts) {
-                            return Err(Error::Prover(format!(
-                                "window {}: it ends with {held:?} at {address:#x}, the next \
-                                 window's history starts from ({value}, {ts})",
-                                job.window
-                            )));
-                        }
-                    }
-                }
-            }
+            After::NextHistory { registers } => self.check_registers(job, &registers)?,
         }
         busy += t.elapsed().as_secs_f64();
         Ok((walked, busy, boundary))
@@ -663,11 +556,12 @@ pub fn walk_windows_with<W: Into<ExecWindow> + Send>(
 /// history ([`ExecWindow::history`]) and is walked from it, with no lean
 /// pass, no entries, no start memory and no window state; the run's last
 /// window brings the run's end ([`ExecWindow::last`]), from which the
-/// finish's state is built. The walk's own boundary and byte exit checks need
-/// a window state, so they are made only on the windows `recheck` samples
-/// (every `recheck`-th, from the first; 0: none), which are walked again from
-/// their start cells and must emit the same lists; every window's registers
-/// are checked against the next one's.
+/// finish's state is built. Every window's end registers are checked against
+/// the next one's start, and each cycle's register accesses against the
+/// walk's cells. With `recheck` > 0 a check thread re-derives the history
+/// independently ([`check_thread`]): the lean pass over every window, and
+/// every `recheck`-th window (which must come with its start memory)
+/// re-walked from the pass's entries, its lists compared with its walker's.
 #[cfg(test)]
 pub fn walk_windows_from_history<W: Into<ExecWindow> + Send>(
     builder: &mut WindowedTraceBuilder<'_>,
@@ -691,13 +585,16 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
 ) -> Result<ParallelWalk, Error> {
     assert!(walkers >= 1, "walk_windows needs a walker");
     debug_assert_eq!(builder.cycles, 0, "walk_windows starts the run");
+    // Record mode's check: the walkers' digests of the rechecked windows.
+    let recheck = record.unwrap_or(0);
+    let (digest_tx, digest_rx) = std::sync::mpsc::channel::<(u32, u64)>();
     let settings = Arc::new(WalkSettings {
         decode: Arc::clone(&builder.decode),
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
         key: std::collections::hash_map::RandomState::new().hash_one(0u64),
         keep_logs: builder.keeps_logs(),
-        record_sums: record == Some(1),
+        digests: (recheck > 0).then(|| Mutex::new(digest_tx)),
     });
     let key = settings.key;
     let start_registers = builder.register_state.clone();
@@ -714,15 +611,22 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                 );
             let (permit_tx, permit_rx) = sync_channel::<()>(walkers + 2);
             let decode = Arc::clone(&settings.decode);
+            // Record mode's check thread, fed every window in order.
+            let (check_tx, check_rx) = sync_channel::<CheckWindow>(4);
+            let check = (recheck > 0).then(|| {
+                let (settings, registers) = (Arc::clone(&settings), start_registers.clone());
+                scope.spawn(move || check_thread(settings, &registers, image, check_rx))
+            });
+            let check_tx = check.is_some().then_some(check_tx);
             let pass = scope.spawn(move || match record {
                 Some(recheck) => record_thread(
                     &start_registers,
                     image,
                     lean,
-                    key,
                     windows,
                     number,
                     recheck,
+                    check_tx,
                     job_tx,
                     permit_tx,
                 ),
@@ -836,6 +740,37 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
             let end = pass
                 .join()
                 .map_err(|_| Error::Prover("the lean pass panicked".into()))?;
+            // Record mode's check: its re-walks against the walkers' digests.
+            if let Some(check) = check {
+                let checked = check
+                    .join()
+                    .map_err(|_| Error::Prover("the history check panicked".into()))
+                    .and_then(|walked| walked);
+                let compared = checked.and_then(|walked| {
+                    let mut got: std::collections::HashMap<u32, u64> =
+                        digest_rx.try_iter().collect();
+                    for (window, digest) in walked {
+                        match got.remove(&window) {
+                            Some(d) if d == digest => {}
+                            Some(_) => {
+                                return Err(Error::Prover(format!(
+                                    "window {window}: walked from the executor's history it emits \
+                                     other lists than walked from the lean pass's entries"
+                                )));
+                            }
+                            None => {
+                                return Err(Error::Prover(format!(
+                                    "window {window}: re-walked, but its walker sent no digest"
+                                )));
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+                if let Err(e) = compared {
+                    failure.get_or_insert(e);
+                }
+            }
             // The cause, not its knock-on: this thread's own error first, then
             // the pass's, then a walker's.
             match (failure, end) {
@@ -1001,20 +936,20 @@ fn pass_thread<W: Into<ExecWindow>>(
 }
 
 /// Record mode's thread in place of the pass ([`walk_windows_from_history`]):
-/// each window handed out as a job with its history as it arrives; what
-/// follows each job sent once the next window arrives (its registers and, for
-/// a rechecked job, its first cells). The window that halts is the run's
-/// last: the finish's state is built from the run's end it brings, undoing
-/// what the window itself touched.
+/// each window handed out as a job with its history as it arrives, and (with
+/// a check) passed on to the check thread ([`check_thread`]); what follows
+/// each job, the next window's registers, sent once that window arrives. The
+/// window that halts is the run's last: the finish's state is built from the
+/// run's end it brings, undoing what the window itself touched.
 #[allow(clippy::too_many_arguments)]
 fn record_thread<W: Into<ExecWindow>>(
     start_registers: &RegisterState,
     image: &PagedMem<u8>,
     lean: bool,
-    key: u64,
     windows: Receiver<W>,
     number: fn(u32) -> u32,
     recheck: usize,
+    check: Option<SyncSender<CheckWindow>>,
     jobs: SyncSender<Ticket>,
     permits: SyncSender<()>,
 ) -> Result<PassEnd, Error> {
@@ -1022,18 +957,17 @@ fn record_thread<W: Into<ExecWindow>>(
         Error::Prover(WALKERS_STOPPED.into())
     }
     let mut last: Option<(Arc<Vec<Log>>, Arc<MemoryState>, RegisterState)> = None;
-    // The previous job's follow-up, and whether it is rechecked.
-    let mut waiting: Option<(SyncSender<After>, bool)> = None;
+    // The previous job's follow-up.
+    let mut waiting: Option<SyncSender<After>> = None;
     let (mut k, mut first, mut busy, mut state_secs) = (0u32, 0usize, 0.0, 0.0);
-    let mut boundaries = 0u64;
     let no_memory = Arc::new(executor::vm::memory::Memory::default().snapshot());
     let mut sent = false;
     for window in windows {
         let ExecWindow {
             logs,
+            start,
             history,
             last: end,
-            ..
         } = window.into();
         sent = true;
         if last.is_some() {
@@ -1068,27 +1002,39 @@ fn record_thread<W: Into<ExecWindow>>(
         }
         let t = Instant::now();
         let halts = logs.last().is_some_and(|log| log.next_pc == 0);
-        if let Some((after, rechecked)) = waiting.take() {
-            if halts {
-                // Sent below, with the finish's state.
-                waiting = Some((after, rechecked));
-            } else {
-                let cells = rechecked.then(|| Arc::new(history.first_touches()));
-                let _ = after.send(After::NextHistory {
-                    registers: registers.clone(),
-                    cells,
-                });
-            }
+        let rechecked = recheck > 0 && !halts && (k as usize).is_multiple_of(recheck);
+        if let Some(check) = &check {
+            let start = match (rechecked, start) {
+                (true, Some(start)) => Some(Arc::new(start)),
+                (true, None) => {
+                    return Err(Error::Prover(format!(
+                        "record mode: window {k} is re-walked but came without its start memory"
+                    )));
+                }
+                (false, _) => None,
+            };
+            // The check thread gone (an error there) does not stop the walk:
+            // its join reports it.
+            let _ = check.send(CheckWindow {
+                window: k,
+                first,
+                logs: Arc::clone(&logs),
+                start,
+                history: Arc::clone(&history),
+                last: halts,
+            });
+        }
+        if !halts && let Some(after) = waiting.take() {
+            let _ = after.send(After::NextHistory {
+                registers: registers.clone(),
+            });
         }
         if halts {
             let end = end.ok_or_else(|| {
                 Error::Prover("record mode: the run's last window came without its end".into())
             })?;
             let state = Arc::new(finish_state(&end, &history, image, lean));
-            if recheck == 1 {
-                boundaries = state_boundaries(&state, image, key);
-            }
-            if let Some((after, _)) = waiting.take() {
+            if let Some(after) = waiting.take() {
                 let _ = after.send(After::Finish {
                     registers: registers.clone(),
                     state: Arc::clone(&state),
@@ -1100,7 +1046,6 @@ fn record_thread<W: Into<ExecWindow>>(
             continue;
         }
         busy += t.elapsed().as_secs_f64();
-        let rechecked = recheck > 0 && (k as usize).is_multiple_of(recheck);
         let (after_tx, after_rx) = sync_channel(1);
         permits.send(()).map_err(stopped)?;
         let cycles = logs.len();
@@ -1118,7 +1063,7 @@ fn record_thread<W: Into<ExecWindow>>(
             after: after_rx,
         })
         .map_err(stopped)?;
-        waiting = Some((after_tx, rechecked));
+        waiting = Some(after_tx);
         first += cycles;
         k += 1;
     }
@@ -1140,24 +1085,106 @@ fn record_thread<W: Into<ExecWindow>>(
         state_secs,
         entries: 0,
         most_entries: 0,
-        boundaries,
+        boundaries: 0,
     })
 }
 
-/// The run's side of the windows' boundary sums in record mode
-/// ([`cell_hash`]): every byte stamped before the run's last window (its
-/// cell in `state` other than the image's at timestamp 0) less its cell at
-/// the run's start. A byte a window touched but never stamped holds its
-/// starting cell and adds nothing, on either side.
-fn state_boundaries(state: &MemoryState, image: &PagedMem<u8>, key: u64) -> u64 {
-    state
-        .cells
-        .iter()
-        .filter(|&(_, (_, ts))| ts > 0)
-        .fold(0u64, |sum, (address, (value, ts))| {
-            sum.wrapping_add(cell_hash(key, address, ts, value))
-                .wrapping_sub(cell_hash(key, address, 0, image.get(address)))
-        })
+/// A window as record mode's check thread takes it.
+struct CheckWindow {
+    window: u32,
+    first: usize,
+    logs: Arc<Vec<Log>>,
+    /// The executor's memory at the window's start, for a re-walked window.
+    start: Option<Arc<MemorySnapshot>>,
+    history: Arc<WindowHistory>,
+    /// The run's last window (the finish's): only its registers are checked.
+    last: bool,
+}
+
+/// Record mode's check: a history re-derived independently of the
+/// executor's. Today's lean pass runs over every window in order (its own
+/// timestamps and register cells, from the logs alone); every window's
+/// starting registers must be the history's. A window that comes with its
+/// start memory is re-walked as today's walkers walk it — from the pass's
+/// entries and that memory, on a seeded window state — after its entries
+/// (addresses and timestamps) and their values are compared with the
+/// history's first cells; returns each re-walked window's digest
+/// ([`WalkedWindow::emitted_digest`]) for the caller to compare with what its
+/// walker emitted from the history.
+fn check_thread(
+    settings: Arc<WalkSettings>,
+    start_registers: &RegisterState,
+    image: &PagedMem<u8>,
+    windows: Receiver<CheckWindow>,
+) -> Result<Vec<(u32, u64)>, Error> {
+    let mut pass = LeanPass::new(Arc::clone(&settings.decode), start_registers)?;
+    let mut walker = WindowWalker::new(settings);
+    let mut walked = Vec::new();
+    for w in windows {
+        let registers = pass.registers();
+        let history = w.history.registers.as_ref().map(register_state);
+        if !history.is_some_and(|h| {
+            h.regs == registers.regs
+                && h.index_register == registers.index_register
+                && h.pc_register == registers.pc_register
+        }) {
+            return Err(Error::Prover(format!(
+                "window {}: the history's starting registers are not the lean pass's",
+                w.window
+            )));
+        }
+        if w.last {
+            break;
+        }
+        pass.begin(w.window)?;
+        pass.pass(&w.logs, w.first)?;
+        let entries = pass.take_entries();
+        let Some(start) = w.start else {
+            continue;
+        };
+        let mut mine: Vec<(u64, u64)> = entries.clone();
+        let theirs = w.history.first_touches();
+        for &(address, value, _) in &theirs {
+            if value != start.load_byte(address) {
+                return Err(Error::Prover(format!(
+                    "window {}: the history's value before it at {address:#x} is not the \
+                     executor's memory's",
+                    w.window
+                )));
+            }
+        }
+        let mut theirs: Vec<(u64, u64)> = theirs.into_iter().map(|(a, _, t)| (a, t)).collect();
+        mine.sort_unstable();
+        theirs.sort_unstable();
+        if mine != theirs {
+            return Err(Error::Prover(format!(
+                "window {}: the history's first cells are not the lean pass's entries",
+                w.window
+            )));
+        }
+        let job = WindowJob {
+            window: w.window,
+            first: w.first,
+            logs: w.logs,
+            start,
+            registers,
+            entries: Arc::new(entries),
+            history: None,
+            recheck: false,
+        };
+        let (window, _) = walker.walk(&job, image)?;
+        if walker.registers.regs != pass.registers().regs
+            || walker.registers.index_register != pass.registers().index_register
+            || walker.registers.pc_register != pass.registers().pc_register
+        {
+            return Err(Error::Prover(format!(
+                "window {}: re-walked, it ends with other registers than the lean pass's",
+                w.window
+            )));
+        }
+        walked.push((w.window, window.emitted_digest()));
+    }
+    Ok(walked)
 }
 
 /// The walk's memory state at the start of the run's last window, from the

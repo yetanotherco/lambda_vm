@@ -102,8 +102,16 @@ fn history_is_the_lean_passs(name: &str, program: &Elf, input: &[u8], window: us
             regs_equal(&registers, &pass.registers()),
             "{name}/{window}: window {k}'s starting registers"
         );
-        // The last window is the finish's; the pass passes every other.
+        // The last window is the finish's; the pass passes every other. After
+        // it, the cells HALT reads are the run end's.
         if logs.last().is_some_and(|l| l.next_pc == 0) {
+            pass.begin(k).expect("a window");
+            pass.pass(&want, first).expect("the pass");
+            let end = fast.take_history_final().expect("the run's end");
+            assert!(
+                regs_equal(&register_state(&end.registers), &pass.registers()),
+                "{name}/{window}: the register cells at the end"
+            );
             break;
         }
         pass.begin(k).expect("a window");
@@ -184,6 +192,17 @@ enum Tamper {
     Register {
         window: usize,
     },
+    /// The `nth` cycle reading `rs1` of the first window from `window` that
+    /// has one, its old timestamp one later.
+    RegisterTs {
+        window: usize,
+        nth: usize,
+    },
+    /// The first ECALL register cell of the first window from `window` that
+    /// has one, one timestamp later.
+    EcallRegister {
+        window: usize,
+    },
 }
 
 fn tamper_with(
@@ -240,6 +259,23 @@ fn tamper_with(
                 return true;
             }
         }
+        Tamper::RegisterTs { window, nth } if k >= window => {
+            if let Some(e) = history
+                .extras
+                .iter_mut()
+                .filter(|e| e.regs_ts[0] > 0)
+                .nth(nth)
+            {
+                e.regs_ts[0] += 1;
+                return true;
+            }
+        }
+        Tamper::EcallRegister { window } if k >= window => {
+            if let Some(cell) = history.reg_cells.first_mut() {
+                cell.ts += 1;
+                return true;
+            }
+        }
         _ => {}
     }
     false
@@ -269,7 +305,13 @@ fn walked_from_history(
             fast.enable_history().expect("history mode");
             let code = InstructionCache::new(&program.data).expect("the program decodes");
             let mut k = 0;
-            while let Some((logs, mut history)) = fast.resume_history(window).expect("the run") {
+            loop {
+                // A re-walked window comes with its start memory.
+                let start = (recheck > 0 && k % recheck == 0).then(|| fast.snapshot());
+                let Some((logs, mut history)) = fast.resume_history(window).expect("the run")
+                else {
+                    break;
+                };
                 // The first window from the tamper's that it applies to, but
                 // the run's last: the finish walks that one from a state its
                 // own history starts (see `finish_state`).
@@ -284,7 +326,7 @@ fn walked_from_history(
                     .flatten();
                 let sent = tx.send(ExecWindow {
                     logs: Arc::new(logs),
-                    start: None,
+                    start,
                     history: Some(Box::new(history)),
                     last,
                 });
@@ -401,6 +443,13 @@ fn a_wrong_history_is_refused() {
         ("test_copy_ecalls", Tamper::LaterEcallCell { window: 1 }, 1),
         ("all_loadstore_32", Tamper::Register { window: 2 }, 1),
         ("all_loadstore_32", Tamper::Register { window: 2 }, 0),
+        (
+            "all_loadstore_32",
+            Tamper::RegisterTs { window: 1, nth: 2 },
+            0,
+        ),
+        ("test_copy_ecalls", Tamper::EcallRegister { window: 1 }, 0),
+        ("test_commit_split", Tamper::EcallRegister { window: 0 }, 0),
     ];
     for (name, tamper, recheck) in cases {
         let (program, _) = run(name);

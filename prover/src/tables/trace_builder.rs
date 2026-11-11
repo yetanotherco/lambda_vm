@@ -1023,6 +1023,8 @@ pub(crate) struct HistoryOverlay {
     ranges: Vec<(u64, u64, usize)>,
     values: Vec<u8>,
     timestamps: Vec<u64>,
+    /// The cycle being walked, its index in the window.
+    cycle: Option<usize>,
 }
 
 impl HistoryOverlay {
@@ -1032,7 +1034,60 @@ impl HistoryOverlay {
             ranges: Vec::new(),
             values: Vec::new(),
             timestamps: Vec::new(),
+            cycle: None,
         }
+    }
+
+    /// Whether the cycle's register accesses find, in the walk's register
+    /// cells, the old timestamps its history gives: `rs1`, `rs2` and `rd` in
+    /// the walk's order (each finds the stamps of the ones before it in the
+    /// cycle), and an ECALL chip's accesses (x10 to x13, the commit index),
+    /// cells and all. Checked before the cycle's own accesses.
+    fn registers_match(&self, op: &CpuOp<'_>, registers: &RegisterState) -> bool {
+        let Some(i) = self.cycle else {
+            return false;
+        };
+        let extra = self.history.extras[i];
+        let f = &op.decode.fields;
+        let ts = op.timestamp;
+        let before = |r: u8| {
+            if r == 255 {
+                registers.pc_register.1
+            } else {
+                registers.regs[usize::from(r & 31)].1
+            }
+        };
+        let r1 = (f.read_register1 && f.rs1 != 0).then_some(f.rs1);
+        let r2 = (f.read_register2 && f.rs2 != 0).then_some(f.rs2);
+        let rd = (f.write_register && f.rd != 0).then_some(f.rd);
+        let want = [
+            r1.map_or(0, before),
+            r2.map_or(0, |r| if r1 == Some(r) { ts } else { before(r) }),
+            rd.map_or(0, |r| {
+                if r2 == Some(r) {
+                    ts + 1
+                } else if r1 == Some(r) {
+                    ts
+                } else {
+                    before(r)
+                }
+            }),
+        ];
+        if want.iter().any(|&t| t > u64::from(u32::MAX)) || want.map(|t| t as u32) != extra.regs_ts
+        {
+            return false;
+        }
+        self.history.cycle_registers(i).iter().all(|c| {
+            let (value, at) = if c.reg == 254 {
+                (
+                    u64::from(registers.index_register.0),
+                    registers.index_register.1,
+                )
+            } else {
+                registers.regs[usize::from(c.reg & 31)]
+            };
+            (value, at) == (c.value, u64::from(c.ts))
+        })
     }
 
     /// The cells of the cycle at `timestamp`: none for a timestamp outside
@@ -1041,6 +1096,7 @@ impl HistoryOverlay {
         self.ranges.clear();
         self.values.clear();
         self.timestamps.clear();
+        self.cycle = None;
         let Some(i) = (timestamp / 4)
             .checked_sub(1 + self.history.first)
             .map(|i| i as usize)
@@ -1048,6 +1104,7 @@ impl HistoryOverlay {
         else {
             return;
         };
+        self.cycle = Some(i);
         let (ranges, values, timestamps) =
             (&mut self.ranges, &mut self.values, &mut self.timestamps);
         let mut last: Option<u64> = None;
@@ -2046,9 +2103,13 @@ fn walk_cpu_ops<const REST: bool>(
 
     for op in cpu_ops {
         let op = decode.op(op);
-        // Record mode: the cycle's cells from the executor's history.
+        // Record mode: the cycle's cells from the executor's history, its
+        // register accesses checked against the walk's cells.
         if let Some(overlay) = memory_state.overlay.as_deref_mut() {
             overlay.begin(op.timestamp);
+            if !overlay.registers_match(&op, register_state) {
+                memory_state.missing.store(true, Relaxed);
+            }
         }
         // Word (`*W`) instructions delegate to the CPU32 table (built in program
         // order; its register accesses are still emitted via the shared register
