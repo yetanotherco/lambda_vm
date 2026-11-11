@@ -46,6 +46,7 @@ fn edges() -> Vec<u64> {
         u64::MAX,
         u64::MAX - 7,
         u64::MAX - 0x800,
+        0u64.wrapping_sub(0x1000),
         0u64.wrapping_sub(16),
     ];
     for layout in LAYOUTS {
@@ -56,6 +57,9 @@ fn edges() -> Vec<u64> {
             layout.high_base,
             layout.high_base - 3,
             layout.high_base + 0x7FC,
+            // A chunk's and a page's edge inside the high region.
+            layout.high_base + 0x1000,
+            layout.high_base + 0x1_0000,
         ]);
     }
     edges
