@@ -503,7 +503,7 @@ impl FastExecutor {
                 let (u, address) = fetched_use(pc, regs, memory, instructions);
                 (STEP, u, address)
             };
-            let cells_before = uses.ecall.then(|| history.cells);
+            let cells_before = uses.ecall.then_some(history.cells);
             let extra = if uses.mem > 0 {
                 history.before_access(memory, address)
             } else if uses.ecall {
