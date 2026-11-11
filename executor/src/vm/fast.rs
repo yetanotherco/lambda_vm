@@ -22,8 +22,7 @@ use super::{
     flat_memory::{FlatLayout, FlatMemory},
     history::{
         HISTORY_MAX_CYCLES, HistExtra, History, HistoryFinal, NO_ACCESS, RegUse, RegisterCells,
-        SideGroup,
-        WindowHistory, cycle_timestamp, step_registers,
+        SideGroup, WindowHistory, cycle_timestamp, step_registers,
     },
     instruction::execution::{BLAKE3_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER},
     instruction::{
