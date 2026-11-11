@@ -8,8 +8,9 @@ Exports the operations of each modeled chip as JSON, for the differential check 
 Rust prover (`prover/src/tests/lean_diff.rs`). Variables are numbered in `Row` field order,
 which is the Rust column order.
 
-BITWISE has no row circuit: its export is a sample of the table, the precomputed columns of
-`Bitwise.row i` and the message every static lookup channel serves at row `i`.
+BITWISE has no row circuit: its export is the table size, the size of every static lookup
+channel, and a sample of the table: the precomputed columns of `Bitwise.row i` and the message
+every channel serves at row `i`.
 -/
 
 open Lean LambdaVM
@@ -42,7 +43,7 @@ meta def channelJson {M : TypeMap} [ProvableType M] (slc : StaticLookupChannel (
     match table[perRow * i + k]? with
     | some m => (toElements m).toList.map fun e : F p => e.val
     | none => []
-  Json.mkObj [("channel", slc.name), ("messages", toJson messages)]
+  Json.mkObj [("channel", slc.name), ("size", table.size), ("messages", toJson messages)]
 
 meta def exportBitwise : IO Unit := do
   let indices := bitwiseIndices
@@ -55,7 +56,8 @@ meta def exportBitwise : IO Unit := do
     channelJson Bitwise.zeroTable 1 indices,
     channelJson Bitwise.hwslTable 1 indices,
     channelJson Bitwise.byteAluTable 3 indices]
-  let json := Json.mkObj [("name", "bitwise"), ("indices", toJson indices),
+  let json := Json.mkObj [("name", "bitwise"), ("numRows", Bitwise.numRows),
+    ("indices", toJson indices),
     ("rows", Json.arr (indices.map (rowJson ∘ Bitwise.row)).toArray),
     ("channels", Json.arr channels.toArray)]
   IO.FS.writeFile "export/bitwise.json" json.compress

@@ -166,7 +166,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       simp only [eqBit] <;>
       split_ifs <;> (try norm_num) <;> omega
     refine ⟨fun _ => key, by simp, by simp, by simp, by simp, by simp, ?_⟩
-    intro _ ha0 ha1 hb0 hb1
+    intro _
     -- the flag byte, read as a natural
     have hflagsV : (3 + 64 * input_invert : F p).val = 3 + 64 * input_invert.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
@@ -178,7 +178,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     · -- nor the SHIFT clause
       intro w s d hw hs hd hflags
       exfalso; rw [hflagsV] at hflags; simp only [opselSHIFT] at hflags; omega
-    intro i hi hflags
+    intro i hi hflags ha0 ha1 hb0 hb1
     rw [hflagsV] at hflags; simp only [opselEQ] at hflags
     rw [key ha0 ha1 hb0 hb1, show input_invert.val = i by omega]
 

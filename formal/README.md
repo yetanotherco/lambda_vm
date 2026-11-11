@@ -25,9 +25,10 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   Clean main replaced its own `StaticLookupChannel` by `Air.Flat.Lookup`, whose
   rows are witness programs of the row index, so the structure lives here.
 - `LambdaVM/Buses/` — the buses that are not static tables. `Alu.lean` is the
-  unified ALU bus: message layout as in `BusId::Alu`, the caller's `IS_WORD`
-  assumptions on both operands as hypotheses, and one `Guarantees` clause per
-  `opsel` (LT, EQ and SHIFT). The flag byte is read as a natural, so a chip
+  unified ALU bus: message layout as in `BusId::Alu` and one `Guarantees` clause
+  per `opsel` (LT, EQ and SHIFT), each taking as hypotheses the `IS_WORD`
+  assumptions of its chip's spec (LT: the low words; EQ: all four words; SHIFT:
+  none). The flag byte is read as a natural, so a chip
   pushing with one `opsel` discharges the other clauses by `omega`.
 - `LambdaVM/Tables/` — one file per chip. `Bitwise.lean` transcribes the
   precomputed row function of `prover/src/tables/bitwise.rs` and defines each bus
@@ -54,9 +55,10 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   every EQ row with `μ = 1` and range-checked operands carries the equality
   bit. The ensemble has no ALU consumer yet (the CPU is not modelled), so
   balance on the ALU channel forces `μ = 0` on every EQ row and the theorem is
-  trivially true. What it shows today is that IS_HALF → ZERO → EQ compose under
-  Clean's ordered-channel soundness; it says something about active rows once a
-  component pulls from ALU.
+  trivially true. That IS_HALF → ZERO → EQ compose is shown by `eqLookup`
+  itself, which only type-checks as a `SoundEnsemble` because every channel is
+  finished before the tables that pull from it; the theorem says something
+  about active rows once a component pulls from ALU.
 - `LambdaVM/Tables/ShiftCore.lean` and `Shift.lean` — the SHIFT chip. `ShiftCore`
   is the two-phase shift argument of `spec/src/shift.toml` on naturals (HWSL
   per limb, then whole limbs, left and right, logical and arithmetic), ending in
@@ -89,9 +91,10 @@ that they are the same polynomials and the same bus interactions is mechanical:
    every `assert` as an expression tree and every `interact` with its channel,
    direction, multiplicity and message, variables numbered in Rust column order.
    Multiplicities are nonnegative; the direction carries the sign. It also writes
-   `export/bitwise.json`, a sample of the BITWISE table (every `z` with edge
-   bytes, the last row, 256 pseudo-random rows): the precomputed columns of each
-   row and the message every static lookup channel serves there.
+   `export/bitwise.json`: the size of the BITWISE table and of every static
+   lookup channel, and a sample of the table (every `z` with edge bytes, the
+   last row, 256 pseudo-random rows) with the precomputed columns of each row
+   and the message every channel serves there.
 2. `prover/src/tests/lean_diff.rs` is the prover test that reads them:
    `cargo test -p lambda-vm-prover lean_diff -- --nocapture`.
 
@@ -102,9 +105,11 @@ that every Lean constraint vanishes on honest traces from `generate_*_trace`,
 padding rows included; the Lean-only constraints of the documented deltas are
 skipped there. The sign of an interaction comes from its direction: a Rust
 sender is Clean's pull and counts `−m`, a receiver is Clean's push and counts
-`+m`. For BITWISE the test compares the sampled rows with `generate_bitwise_row`
-and each channel's messages with the receivers of `bitwise::bus_interactions()`
-on the same bus.
+`+m`. For BITWISE the test checks the table and channel sizes, compares the
+sampled rows with `generate_bitwise_row` and each channel's messages with the
+receivers of `bitwise::bus_interactions()` on the same bus, and checks all 2^20
+rows of `generate_bitwise_row` against a Rust transcription of `Bitwise.row`
+that the sampled rows pin to the Lean export.
 
 The models follow the multiplicity constraints of PR #1016, merged 2026-10-23.
 Result on `main` after that merge, 2026-10-28:
@@ -115,7 +120,8 @@ Result on `main` after that merge, 2026-10-28:
   only in Lean, `ARE_BYTES[μ, 0]` with multiplicity one exists only in Rust.
   The test pins both by content, and its trace has deduplicated rows (`μ ≥ 2`),
   where the Lean-only constraint fails as expected.
-- BITWISE: 657 sampled rows and 8 channels (10 Rust receivers), exact match.
+- BITWISE: same size, all 2^20 rows, 657 sampled rows and 8 channels (10 Rust
+  receivers), exact match.
 
 The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
 `μ·(1 − μ)` in EQ, which is why the Lean bit constraints use the spec's form.

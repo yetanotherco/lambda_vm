@@ -65,25 +65,29 @@ def shiftResult (word signed direction x s : ℕ) : ℕ :=
   else if signed = 0 then x >>> k
   else sra64 x k
 
-/-- What a puller learns. The caller must have range-checked both words of both operands
-(the chips' `IS_WORD` assumptions). One clause per `opsel`, selected by the flag byte read
-as a natural. -/
+/-- What a puller learns. One clause per `opsel`, selected by the flag byte read as a natural.
+Each clause takes as hypotheses exactly the `[[assumptions]]` of its chip's spec: the words the
+caller must have range-checked. The words a chip range-checks itself need no hypothesis. -/
 def Guarantees (m : Msg (F p)) : Prop :=
-  m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
-    -- LT (spec/src/lt.toml): flags = opsel(LT) + 32·signed + 64·invert, out = [res, 0]
-    (∀ s i : ℕ, s < 2 → i < 2 → m.flags.val = opselLT + 32 * s + 64 * i →
-      m.outHi = 0 ∧
-      m.outLo = ((ltBit s i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p)) ∧
-    -- EQ (spec/src/eq.toml): flags = opsel(EQ) + 64·invert, out = [res, 0]
-    (∀ i : ℕ, i < 2 → m.flags.val = opselEQ + 64 * i →
-      m.outHi = 0 ∧
-      m.outLo = ((eqBit i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p)) ∧
-    -- SHIFT (spec/src/shift.toml): flags = opsel(SHIFT) + word_instr + 32·signed + 64·direction,
-    -- only the low byte of the shift amount matters
-    (∀ w s d : ℕ, w < 2 → s < 2 → d < 2 →
-      m.flags.val = opselSHIFT + w + 32 * s + 64 * d →
-      m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
-      dword m.outLo m.outHi = shiftResult w s d (dword m.in1Lo m.in1Hi) (m.in2Lo.val % 256))
+  -- LT (spec/src/lt.toml): flags = opsel(LT) + 32·signed + 64·invert, out = [res, 0];
+  -- assumes `IS_WORD[lhs[0]]`, `IS_WORD[rhs[0]]` (LT range-checks the high halves)
+  (∀ s i : ℕ, s < 2 → i < 2 → m.flags.val = opselLT + 32 * s + 64 * i →
+    m.in1Lo.val < 2^32 → m.in2Lo.val < 2^32 →
+    m.outHi = 0 ∧
+    m.outLo = ((ltBit s i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p)) ∧
+  -- EQ (spec/src/eq.toml): flags = opsel(EQ) + 64·invert, out = [res, 0];
+  -- assumes `IS_WORD[a[i]]`, `IS_WORD[b[i]]`
+  (∀ i : ℕ, i < 2 → m.flags.val = opselEQ + 64 * i →
+    m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
+    m.outHi = 0 ∧
+    m.outLo = ((eqBit i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p)) ∧
+  -- SHIFT (spec/src/shift.toml): flags = opsel(SHIFT) + word_instr + 32·signed + 64·direction;
+  -- no assumptions (SHIFT range-checks `in` and the low bytes of the shift amount itself),
+  -- only the low byte of the shift amount matters
+  (∀ w s d : ℕ, w < 2 → s < 2 → d < 2 →
+    m.flags.val = opselSHIFT + w + 32 * s + 64 * d →
+    m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+    dword m.outLo m.outHi = shiftResult w s d (dword m.in1Lo m.in1Hi) (m.in2Lo.val % 256))
 
 def channel : Channel (F p) Msg where
   name := "ALU"

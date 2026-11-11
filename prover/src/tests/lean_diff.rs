@@ -8,10 +8,13 @@
 //! (Schwartz–Zippel over [`TRIALS`] rows). It also checks that the Lean
 //! constraints vanish on honest Rust traces, padding rows included.
 //!
-//! `formal/export/bitwise.json` is a sample of the Lean BITWISE table: the
-//! precomputed columns of sampled rows and the message each static lookup
-//! channel serves there, checked against `generate_bitwise_row` and the
-//! receivers of `bitwise::bus_interactions()`.
+//! `formal/export/bitwise.json` holds the size of the Lean BITWISE table and of
+//! each static lookup channel, and a sample of the table: the precomputed
+//! columns of sampled rows and the message each channel serves there, checked
+//! against `generate_bitwise_row` and the receivers of
+//! `bitwise::bus_interactions()`. Every one of the 2^20 rows is also checked
+//! against a transcription of the Lean row function, pinned to the Lean export
+//! on the sampled rows.
 //!
 //! Run with `cargo test -p lambda-vm-prover lean_diff -- --nocapture`.
 
@@ -558,10 +561,37 @@ fn lean_diff_shift() {
     );
 }
 
+/// `Bitwise.row i` of `formal/LambdaVM/Tables/Bitwise.lean`, transcribed: `rowOf` on
+/// `i % 2^8`, `i / 2^8 % 2^8`, `i / 2^16 % 16`, with the Lean `sll`/`sllc` and their `z = 0` case.
+fn lean_bitwise_row(i: usize) -> [u64; 11] {
+    let (x, y, z) = (
+        (i % (1 << 8)) as u64,
+        (i / (1 << 8) % (1 << 8)) as u64,
+        (i / (1 << 16) % 16) as u64,
+    );
+    let h = x + (1 << 8) * y;
+    let sll = if z == 0 { h } else { (h << z) % (1 << 16) };
+    let sllc = if z == 0 { 0 } else { h >> (16 - z) };
+    let zero = u64::from(x == 0 && y == 0 && z == 0);
+    [
+        x,
+        y,
+        z,
+        x & y,
+        x | y,
+        x ^ y,
+        x / (1 << 7),
+        h / (1 << 15),
+        zero,
+        sll,
+        sllc,
+    ]
+}
+
 #[test]
 fn lean_diff_bitwise() {
     use crate::tables::bitwise::{
-        NUM_PRECOMPUTED_COLS, bus_interactions, cols, generate_bitwise_row,
+        NUM_PRECOMPUTED_COLS, NUM_ROWS, bus_interactions, cols, generate_bitwise_row,
     };
     let json = load_export("bitwise");
     let as_u64s = |v: &Value| -> Vec<u64> {
@@ -581,6 +611,21 @@ fn lean_diff_bitwise() {
         indices.len(),
         "[BITWISE] one row per index"
     );
+    assert_eq!(
+        json["numRows"].as_u64().expect("numRows") as usize,
+        NUM_ROWS,
+        "[BITWISE] table size"
+    );
+
+    // All 2^20 rows: Rust against the transcribed Lean row function, which the sampled
+    // rows below pin to the Lean export.
+    for i in 0..NUM_ROWS {
+        assert_eq!(
+            generate_bitwise_row(i),
+            lean_bitwise_row(i),
+            "[BITWISE] row {i}"
+        );
+    }
 
     // The precomputed columns of every sampled row.
     let rust_rows: Vec<Vec<FE>> = indices
@@ -589,6 +634,11 @@ fn lean_diff_bitwise() {
         .map(|(&i, lean)| {
             let rust = generate_bitwise_row(i);
             assert_eq!(as_u64s(lean), rust.to_vec(), "[BITWISE] row {i}");
+            assert_eq!(
+                as_u64s(lean),
+                lean_bitwise_row(i).to_vec(),
+                "[BITWISE] transcription of the Lean row function, row {i}"
+            );
             let mut row = vec![FE::zero(); cols::NUM_COLUMNS];
             for (c, v) in rust.iter().enumerate().take(NUM_PRECOMPUTED_COLS) {
                 row[c] = FE::from(*v);
@@ -618,7 +668,18 @@ fn lean_diff_bitwise() {
         let rust = receivers
             .get(&bus)
             .unwrap_or_else(|| panic!("[BITWISE] no Rust receiver for {name}"));
+        // One table entry per row and receiver: BYTE_ALU serves three per row.
+        assert_eq!(
+            ch["size"].as_u64().expect("size") as usize,
+            NUM_ROWS * rust.len(),
+            "[BITWISE] size of {name}"
+        );
         let messages = ch["messages"].as_array().expect("messages");
+        assert_eq!(
+            messages.len(),
+            indices.len(),
+            "[BITWISE] {name}: one message list per sampled row"
+        );
         for ((&i, row), lean) in indices.iter().zip(&rust_rows).zip(messages) {
             let mut lean: Vec<Vec<u64>> = lean
                 .as_array()
@@ -649,7 +710,7 @@ fn lean_diff_bitwise() {
         "[BITWISE] Lean channels vs Rust receivers"
     );
     println!(
-        "[BITWISE] {} rows, {} channels, {} receivers: exact match",
+        "[BITWISE] {NUM_ROWS} rows against the row function, {} sampled rows, {} channels, {} receivers: exact match",
         indices.len(),
         seen.len(),
         interactions.len()

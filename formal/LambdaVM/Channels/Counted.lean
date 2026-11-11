@@ -17,9 +17,11 @@ the requirement, as a push.
 
 The price is in the balance premise. `exists_push_of_pull` needs `N · length < char F`. Clean's
 `BalancedInteractions` only matches pulls of multiplicity `1`, and counts a pull of any other
-nonzero multiplicity as a push; `not_consistent` shows the gap is real: for `N ≥ 2` the counted
-channel is not `Consistent`, so it cannot be finished in a `SoundEnsemble` until that premise
-carries the bound. With `N = 1` everything coincides (`counted 1 channel` is `Normal`).
+nonzero multiplicity as a push; `not_consistent` shows the gap is real: over Goldilocks, for
+`2 ≤ N ≤ 255` and a channel with some message whose guarantee is false, the counted channel is
+not `Consistent`, so it cannot be finished in a `SoundEnsemble` until that premise carries the
+bound. With `N = 1` the counted channel is `Normal`, hence `Consistent`; it is still a channel of
+its own, not `channel.toRaw`.
 -/
 
 namespace LambdaVM.Counted
@@ -220,7 +222,7 @@ example (channel : Channel F Message) : (counted 1 channel).Consistent := inferI
 
 end LambdaVM.Counted
 
-/-! ## `N ≥ 2` is not `Consistent` under Clean's balance premise -/
+/-! ## `2 ≤ N ≤ 255` is not `Consistent` under Clean's balance premise (over Goldilocks) -/
 
 namespace LambdaVM.Counted
 variable {Message : TypeMap} [ProvableType Message]

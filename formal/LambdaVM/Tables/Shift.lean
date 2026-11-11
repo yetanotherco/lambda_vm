@@ -503,7 +503,7 @@ theorem soundness :
       | exact hzb'
       | (right; rfl)
     -- what remains is the ALU push
-    intro _ hin1lo hin1hi hin2lo hin2hi
+    intro _
     -- the flag byte, read as a natural
     have hflagsV : (5 + input_wordInstr + 32 * input_signed + 64 * input_direction : F p).val
         = 5 + input_wordInstr.val + 32 * input_signed.val + 64 * input_direction.val :=

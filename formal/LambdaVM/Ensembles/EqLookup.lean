@@ -16,8 +16,9 @@ equality bit.
 
 BITWISE is idealized by `pushStatic`: one provider row whose columns are the multiplicities of
 every table entry. Nothing pulls from ALU yet (the CPU is not modelled), so balance on the ALU
-channel forces `μ = 0` on every EQ row and `eq_rows_correct` is trivially true. Today it shows
-that the chain composes; it constrains active rows once a component pulls from ALU.
+channel forces `μ = 0` on every EQ row and `eq_rows_correct` is trivially true. That the chain
+composes is shown by `eqLookup` type-checking as a `SoundEnsemble`, not by the theorem; the
+theorem constrains active rows once a component pulls from ALU.
 -/
 
 namespace LambdaVM.Ensembles

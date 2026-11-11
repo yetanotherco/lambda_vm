@@ -258,13 +258,13 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       | (subst hlt'; norm_num at hres'; simp [hAv, hBv, hC, hres'])
     refine ⟨fun _ hl0 hr0 => key _ _ rfl rfl hl0 hr0, by simp, by simp, by simp, by simp, by simp,
       by simp, by simp, by simp, ?_⟩
-    intro _ hl0 hlhi hr0 hrhi
+    intro _
     -- the flag byte, read as a natural
     have hflagsV : (4 + 32 * input_signed + 64 * input_invert : F p).val
         = 4 + 32 * input_signed.val + 64 * input_invert.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
     refine ⟨?_, ?_, ?_⟩
-    · intro s i hs hi hflags
+    · intro s i hs hi hflags hl0 hr0
       rw [hflagsV] at hflags; simp only [opselLT] at hflags
       rw [key s i (by omega) (by omega) hl0 hr0, hval_lhsHi, hval_rhsHi]
     · -- the EQ clause does not apply: opsel(LT) + 32·s + 64·i ≠ opsel(EQ) + 64·i'
