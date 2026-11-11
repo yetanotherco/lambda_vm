@@ -403,7 +403,7 @@ theorem soundness :
     (by rw [← hraw0]; omega) (by rw [← hraw1]; omega) (by rw [← hraw2]; omega)
     (by rw [← hraw3]; omega)
   rw [hextL, hextR] at hprod
-  -- the whole meaning of the row
+  -- the 128-bit product, which both halves of the row spec are read off
   have hkey : MulCore.ofHalves4 input_lo0.val input_lo1.val input_lo2.val input_lo3.val
       + 2^64 * MulCore.ofHalves4 input_hi0.val input_hi1.val input_hi2.val input_hi3.val
       = (Alu.ext128 input_lhsSigned.val (MulCore.ofHalves4 input_lhs0.val input_lhs1.val
@@ -445,10 +445,8 @@ theorem soundness :
     .inr hcount, .inr hcount, ?_, ?_⟩
   · -- the `high = 0` message: the low 64 bits of the product, the MUL clause at `high = 0`
     intro _
-    refine Alu.Guarantees.of_mul (h := 0) hls2 hrs2 (by norm_num) ?_ fun _ _ _ _ => ?_
-    · exact val_eq_of_eq_natCast
-        (by simp only [opselMUL, mul_zero, add_zero]; push_cast; simp only [ZMod.natCast_zmod_val])
-        (by simp only [opselMUL]; omega)
+    refine Alu.Guarantees.of_mul (high := 0) hls2 hrs2 (by norm_num) ?_ fun _ _ _ _ => ?_
+    · flag_byte
     · dsimp only [dword]
       refine ⟨by omega, by omega, ?_⟩
       rw [hLval, hRval, hmul0, hv0, hv1]
@@ -456,10 +454,8 @@ theorem soundness :
       ring
   · -- the `high = 1` message: the high 64 bits of the product, the MUL clause at `high = 1`
     intro _
-    refine Alu.Guarantees.of_mul (h := 1) hls2 hrs2 (by norm_num) ?_ fun _ _ _ _ => ?_
-    · exact val_eq_of_eq_natCast
-        (by simp only [opselMUL, mul_one]; push_cast; simp only [ZMod.natCast_zmod_val])
-        (by simp only [opselMUL]; omega)
+    refine Alu.Guarantees.of_mul (high := 1) hls2 hrs2 (by norm_num) ?_ fun _ _ _ _ => ?_
+    · flag_byte
     · dsimp only [dword]
       refine ⟨by omega, by omega, ?_⟩
       rw [hLval, hRval, hmul1, hv2, hv3]

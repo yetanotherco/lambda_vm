@@ -410,7 +410,7 @@ lemma prod128_of_halves {lo0 lo1 h : F p} {s M : ℕ} (hs : h.val = (2^32 - 1) *
   simp only [dword] at hlo hhi ⊢
   omega
 
-/-! ### The `ALU` bus, one lemma per clause the chip uses -/
+/-! ### The `LT` pull, read unsigned -/
 
 /-- The `LT` clause at `opsel(LT)` with both flag bits clear: the output is the comparison bit
 of the two operands, read unsigned. -/
@@ -419,38 +419,9 @@ lemma lt_of_guarantees {a0 a1 b0 b1 o : F p} (ha0 : a0.val < 2^32) (ha1 : a1.val
     (h : Alu.Guarantees (⟨a0, a1, b0, b1, 4, o, 0⟩ : Alu.Msg (F p))) :
     o = ((if dword a0 a1 < dword b0 b1 then 1 else 0 : ℕ) : F p) := by
   obtain ⟨-, ho⟩ := h.lt ha0 ha1 hb0 hb1 (s := 0) (i := 0) (by norm_num) (by norm_num)
-    (by rw [val_ofNat 4 (by norm_num)]; simp [opselLT])
+    (by flag_byte)
   dsimp only at ho
-  have hL : dword a0 a1 < 2^64 := by simp only [dword]; omega
-  have hR : dword b0 b1 < 2^64 := by simp only [dword]; omega
-  have hu := Alu.ult_ofNat_iff hL hR
-  have hbit : Alu.ltBit 0 0 (dword a0 a1) (dword b0 b1)
-      = if dword a0 a1 < dword b0 b1 then 1 else 0 := by
-    unfold Alu.ltBit Alu.ltRaw
-    by_cases hc : dword a0 a1 < dword b0 b1
-    · rw [ite_eq_right (by norm_num : ¬ (0:ℕ) = 1), ite_eq_left (hu.mpr hc), ite_eq_left hc]
-      norm_num
-    · rw [ite_eq_right (by norm_num : ¬ (0:ℕ) = 1), ite_eq_right (fun hx => hc (hu.mp hx)),
-        ite_eq_right hc]
-      norm_num
-  rw [ho, hbit]
-
-/-- The `MUL` clause at `opsel(MUL) + 32·ls + 64·rs + 128·high`. -/
-lemma mul_of_guarantees {a0 a1 b0 b1 o0 o1 f : F p} {ls rs hi : ℕ}
-    (ha0 : a0.val < 2^32) (ha1 : a1.val < 2^32) (hb0 : b0.val < 2^32) (hb1 : b1.val < 2^32)
-    (hls : ls < 2) (hrs : rs < 2) (hhi : hi < 2) (hf : f.val = 7 + 32 * ls + 64 * rs + 128 * hi)
-    (h : Alu.Guarantees (⟨a0, a1, b0, b1, f, o0, o1⟩ : Alu.Msg (F p))) :
-    dword o0 o1 = Alu.mulResult ls rs hi (dword a0 a1) (dword b0 b1) :=
-  (h.mul ha0 ha1 hb0 hb1 hls hrs hhi (by rw [hf]; simp only [opselMUL])).2.2
-
-/-- What a `DIVREM` pusher owes: at `opsel(DIVREM) + 32·signed + 128·rem` no other clause of the
-bus can fire, and that one says the output is `Alu.divremResult` of the operands. -/
-lemma divrem_guarantees {a0 a1 b0 b1 o0 o1 f : F p} {s rm : ℕ} (hs : s < 2) (hrm : rm < 2)
-    (hf : f.val = 8 + 32 * s + 128 * rm) (ho0 : o0.val < 2^32) (ho1 : o1.val < 2^32)
-    (hout : dword o0 o1 = Alu.divremResult s rm (dword a0 a1) (dword b0 b1)) :
-    Alu.Guarantees (⟨a0, a1, b0, b1, f, o0, o1⟩ : Alu.Msg (F p)) :=
-  Alu.Guarantees.of_divrem hs hrm (by rw [hf]; simp only [opselDIVREM]) fun _ _ _ _ =>
-    ⟨ho0, ho1, hout⟩
+  rw [ho, Alu.ltBit_unsigned (by simp only [dword]; omega) (by simp only [dword]; omega)]
 
 theorem soundness :
     GeneralFormalCircuit.Soundness (F p) (Input := Row) (Output := unit) main (fun _ _ => True)
@@ -719,19 +690,13 @@ theorem soundness :
       exact absurd heq (by norm_num)
   clear h_sgeq
   -- the two `MUL` pulls: `d · q` is the 128-bit product that `n − r` names
-  have hfl : (7 + 32 * input_signed + 64 * input_signQ : F p).val
-      = 7 + 32 * input_signed.val + 64 * input_signQ.val :=
-    val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-  have hfl1 : (7 + 32 * input_signed + 64 * input_signQ + 128 : F p).val
-      = 7 + 32 * input_signed.val + 64 * input_signQ.val + 128 :=
-    val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-  have hlow := mul_of_guarantees (ls := input_signed.val) (rs := input_signQ.val) (hi := 0)
-    (by omega) (by omega) (by omega) (by omega) hsigned2 hsignQ2 (by norm_num)
-    (by simp [hfl]) (h_mulA hcount)
-  have hhigh := mul_of_guarantees (ls := input_signed.val) (rs := input_signQ.val) (hi := 1)
-    (by omega) (by omega) (by omega) (by omega) hsigned2 hsignQ2 (by norm_num)
-    (by simp [hfl1]) (h_mulB hcount)
-  clear h_mulA h_mulB hfl hfl1
+  have hlow := (Alu.Guarantees.mul (h_mulA hcount) (by dsimp only; omega) (by dsimp only; omega)
+    (by dsimp only; omega) (by dsimp only; omega) hsigned2 hsignQ2 (high := 0) (by norm_num)
+    (by flag_byte)).2.2
+  have hhigh := (Alu.Guarantees.mul (h_mulB hcount) (by dsimp only; omega) (by dsimp only; omega)
+    (by dsimp only; omega) (by dsimp only; omega) hsigned2 hsignQ2 (high := 1) (by norm_num)
+    (by flag_byte)).2.2
+  clear h_mulA h_mulB
   rw [show ∀ ls rs x y : ℕ, Alu.mulResult ls rs 0 x y
       = (Alu.ext128 ls x * Alu.ext128 rs y) % 2^128 % 2^64 from
     fun _ _ _ _ => by simp [Alu.mulResult], hDw, hQw] at hlow
@@ -835,10 +800,6 @@ theorem soundness :
     (ofHalves4_lt hs0 hs1 hs2 hs3)
     hdbzval hqdbz hrsgn hltfact haddfact hmulfact
   clear hdbzval hqdbz hrsgn hltfact haddfact hmulfact hSw
-  have hdv : (8 + 32 * input_signed : F p).val = 8 + 32 * input_signed.val :=
-    val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-  have hdv1 : (8 + 32 * input_signed + 128 : F p).val = 8 + 32 * input_signed.val + 128 :=
-    val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
   exact ⟨fun _ => ⟨hq0, hq1, hq2, hq3, hr0, hr1, hr2, hr3, hQR.1, hQR.2⟩,
     .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount, .inr hcount,
@@ -850,10 +811,10 @@ theorem soundness :
     eq_zero_or_countUpTo hsignedb, eq_zero_or_countUpTo hsignedb,
     eq_zero_or_countUpTo hsignedb,
     .inr hcount,
-    fun _ => divrem_guarantees (s := input_signed.val) (rm := 0) hsigned2 (by norm_num)
-      (by simp [hdv]) (by omega) (by omega) (by rw [hQw, hNw, hDw]; exact hQR.1),
-    fun _ => divrem_guarantees (s := input_signed.val) (rm := 1) hsigned2 (by norm_num)
-      (by simp [hdv1]) (by omega) (by omega) (by rw [hRw, hNw, hDw]; exact hQR.2)⟩
+    fun _ => Alu.Guarantees.of_divrem hsigned2 (rm := 0) (by norm_num) (by flag_byte)
+      fun _ _ _ _ => by dsimp only; exact ⟨by omega, by omega, by rw [hQw, hNw, hDw]; exact hQR.1⟩,
+    fun _ => Alu.Guarantees.of_divrem hsigned2 (rm := 1) (by norm_num) (by flag_byte)
+      fun _ _ _ _ => by dsimp only; exact ⟨by omega, by omega, by rw [hRw, hNw, hDw]; exact hQR.2⟩⟩
 
 /-- The value of a sign-extension word `fill s`, for a bit `s`. -/
 lemma val_fill {s : F p} (hs : s.val < 2) :
@@ -951,23 +912,11 @@ lemma alu_lt_message {rlo rhi dlo dhi dz : F p} {data : ProverData (F p)}
     (hdlo : dlo.val < 2^32) (hdhi : dhi.val < 2^32) (hdz : dz.val < 2)
     (hbit : (if rlo.val + 2^32 * rhi.val < dlo.val + 2^32 * dhi.val then 1 else 0) = 1 - dz.val) :
     Alu.channel.Guarantees ⟨rlo, rhi, dlo, dhi, 4, 1 - dz, 0⟩ data := by
-  have hflags : (4 : F p).val = 4 := val_ofNat 4 (by norm_num)
-  have hlt : ∀ L R : ℕ, L < 2^64 → R < 2^64 →
-      Alu.ltBit 0 0 L R = if L < R then 1 else 0 := by
-    intro L R hL hR
-    have hu := Alu.ult_ofNat_iff hL hR
-    by_cases h : L < R
-    · simp [Alu.ltBit, Alu.ltRaw, hu.mpr h, h]
-    · have hf : (BitVec.ofNat 64 L).ult (BitVec.ofNat 64 R) = false := by
-        rcases Bool.eq_false_or_eq_true ((BitVec.ofNat 64 L).ult (BitVec.ofNat 64 R)) with h' | h'
-        · exact absurd (hu.mp h') h
-        · exact h'
-      simp [Alu.ltBit, Alu.ltRaw, hf, h]
   show Alu.Guarantees _
-  refine Alu.Guarantees.of_lt (s := 0) (i := 0) (by norm_num) (by norm_num)
-    (by simp [hflags, opselLT]) fun _ _ _ _ => ⟨rfl, ?_⟩
+  refine Alu.Guarantees.of_lt (s := 0) (i := 0) (by norm_num) (by norm_num) (by flag_byte)
+    fun _ _ _ _ => ⟨rfl, ?_⟩
   dsimp only [dword]
-  rw [hlt _ _ (by omega) (by omega), hbit]
+  rw [Alu.ltBit_unsigned (by omega) (by omega), hbit]
   rcases eq_zero_or_one_of_val hdz with ⟨h, hv⟩ | ⟨h, hv⟩ <;> rw [hv, h] <;> norm_num
 
 /-- **A `MUL` message a row pulls.** Its flag byte is `opsel(MUL)` plus the two sign bits and the
