@@ -64,7 +64,9 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   first global theorem: for any witness whose constraints hold and whose
   channels balance, every EQ row with `μ = 1` and range-checked operands
   carries the equality bit. The lookup argument is what turns the pulled range
-  checks into facts. `LtStaged.lean` is the counted-pulls ensemble (see below).
+  checks into facts. `LtStaged.lean` is the counted-pulls ensemble, and
+  `DvrmStaged.lean` the one that orders a single bus by class of message (both
+  below).
 - `LambdaVM/Tables/ShiftCore.lean` and `Shift.lean` — the SHIFT chip. `ShiftCore`
   is the two-phase shift argument of `spec/shift.typ` on naturals (HWSL
   per limb, then whole limbs, left and right, logical and arithmetic), ending in
@@ -259,10 +261,11 @@ since the chip receives on its pulls and owes on its pushes, so ordering the
 `Ensemble.tableSoundness_of_stagedOn` finishes one bus in two classes of
 messages, which is how a puller and a pusher of one bus are ordered.
 
-That ensemble is not written yet, but the two obstacles to it are gone. Both were
-the same bug on a different bus: a chip pulling with a multiplicity above `1` has
-to use the counted channel, a chip pulling under a bit could use either, and the
-two spellings are different `RawChannel`s carrying one name.
+That ensemble is `Ensembles/DvrmStaged.lean`, written once the two obstacles to
+it were gone. Both were the same bug on a different bus: a chip pulling with a
+multiplicity above `1` has to use the counted channel, a chip pulling under a
+bit could use either, and the two spellings are different `RawChannel`s carrying
+one name.
 
 On `ALU` the bus used to be two `RawChannel`s under one name: the five chips
 that push used
@@ -311,9 +314,12 @@ membership in the table, so `eq_rows_correct` discharges `witness.Assumptions`
 outright — "no component assumes anything" — and states a conclusion about
 rows: every EQ row with `μ = 1` and range-checked operands carries the
 equality bit. There is no `lt_rows_correct`. Writing one needs `pushStatic`,
-or a counted analogue of it, behind LT's three range checks, and this branch
-has neither. What `LtStaged` does establish is that the staged finishing order
-admits counted pulls, which is what it was written for.
+or a counted analogue of it, behind LT's three range checks. The counted
+analogue now exists — `countedPushStatic`, written for the DVRM ensemble below,
+which puts all five of its providers on real static tables — so
+`lt_rows_correct` is writable and merely unwritten. What `LtStaged` does
+establish is that the staged finishing order admits counted pulls, which is what
+it was written for.
 
 A prototype of the counted channel lived in `LambdaVM/Channels/Counted.lean`
 until the fork carried the real one. Its `not_consistent` is why the fork's
@@ -348,6 +354,69 @@ ensemble over all six chips, and `modelChannels_unique_names` is its `unique_cha
 
 `ARE_BYTES` and `HWSL` are the two buses on `toRaw`: the first is pulled with multiplicity
 `1` everywhere, in the model and in the prover, and the second has a single puller.
+
+## The DVRM ensemble
+
+`Ensembles/DvrmStaged.lean` is eight components: the five providers of the
+static lookups DVRM's dependency cone needs, and the chips LT, MUL and DVRM. It
+is the only user of `Ensemble.tableSoundness_of_stagedOn` in either repository.
+
+DVRM is the first chip that both receives and owes on one bus. It pulls `ALU`
+three times, once for an `LT` comparison (`|r| < |d|`) and twice for `MUL`
+products (`d·q = n − r`), and pushes `ALU` twice with its own `DIVREM` results.
+A finishing order over whole channels cannot say that: `ALU` would have to
+finish both before and after DVRM. A `Stage` is a channel together with a class
+of its messages, and the class is read off `flags`, the fifth element of an
+`Alu.Msg`, which carries the `alu_op` descriptor. `divremFlags` is
+`[8, 40, 136, 168]`, the four bytes DVRM writes; `stageQuery` is the
+complement, where the `LT` and `MUL` answers live. The nine entries of
+`finished` end with `stageQuery` and then `stageDivrem`.
+
+The `staged` premise is 27 obligations, nine stages for each of the three
+chips. Five of each chip's nine are buses it does not require, and are vacuous.
+
+The chain behind `dvrm_stageDivrem` is the content; the rest is plumbing. If
+`muQ ≠ 0` then `mu ≠ 0`, so the counted pulls are active; `ZERO` answers, which
+is what makes `overflow` a bit; with `IS_BIT signed` that fixes
+`signQ = signed·(1 − overflow)`, so the flag byte of the three `ALU` pulls is
+`7 + 32·signed + 64·signQ ∈ {7, 39, 71, 103}`, which does not meet
+`divremFlags`. The pulls are therefore in the query class, which has already
+finished, and soundness at the row gives the guarantee of the push. If
+`muQ = 0` the push is suppressed and nothing is owed, which is where the case
+split goes.
+
+That chain is also why `MSB16` has to finish before `ZERO`. DVRM's
+multiplicities come in three kinds: `mu = muQ + muR`, bounded by its own
+`ARE_BYTES` pull; the literal `1` of that pull, which is already a bit; and the
+sign flags, with which each `NEG` template pulls `ZERO` twice. The chip does not
+constrain those flags to be bits. They are bits because `MSB16` returned them.
+
+`dvrm_rows_correct` is what the ensemble is for. The eight components assume
+nothing, so `witness.Assumptions` is discharged here rather than left to the
+caller, and the conclusion is about rows: for any witness whose constraints
+hold, whose channels carry few enough interactions for the balance check and
+whose channels balance, every `DVRM` row carries the quotient and remainder of
+its two operands, signed or unsigned, with the division-by-zero and overflow
+cases the spec names. That is the shape `eq_rows_correct` has and `LtStaged`
+still lacks.
+
+Two general facts came out of this and belong in Clean rather than here:
+`requirementsChannelsLawful_of_cover`, which lets a chip not declare every
+channel it touches, and `requirementsAfterOn_of_rows`, which reads a stage's
+obligation one row and one interaction at a time. They sit in `Dvrm.lean` and
+`DvrmStaged.lean` for now.
+
+The row facts the chip does not state on its own live in `Dvrm.lean`, where the
+goals are small and legible: `bytes_mu`, `flags_of_constraints`,
+`isBool_overflow` and `isBool_signs`. The ensemble only plugs them in. Three
+costs are worth not rediscovering. Heartbeats are per declaration, which is why
+`dvrm_fullGuarantees` and `dvrm_rowRequirements` are two theorems and not one.
+An `exact` that fails on `(!divremFlags.contains e) = true` sends the unifier
+into decidable equality of `ZMod p` at a 64-bit modulus, so the three `ALU`
+pulls are dispatched by position rather than through `first`, which took that
+proof from a timeout to four seconds. And `tauto` over a context holding the
+whole conjunction of the chip's constraints cost more than the rest of its
+branch; naming the disjunct and clearing the conjunction took it from 15s to 9s.
 
 ## Known differences from the Rust prover
 
