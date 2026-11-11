@@ -1004,6 +1004,76 @@ struct MemoryState {
     /// holds such cells (the bytes its entries did not seed), so a run walked
     /// whole never sets it.
     missing: AtomicBool,
+    /// Record mode ([`HistoryOverlay`]): every access goes to the cycle's
+    /// cells the executor's history gives, none to `cells`.
+    overlay: Option<Box<HistoryOverlay>>,
+}
+
+/// A window walked from the executor's history (record mode): the cells each
+/// cycle reads before it, as the executor wrote them
+/// ([`executor::vm::history::WindowHistory`]). The walk starts each cycle
+/// with exactly those cells ([`HistoryOverlay::begin`]); its writes change
+/// them for the rest of the cycle and are then dropped, as the next cycle's
+/// cells already hold their effect. A byte the cycle's cells do not hold is
+/// missing, as a byte a window's entries do not hold.
+pub(crate) struct HistoryOverlay {
+    history: Arc<executor::vm::history::WindowHistory>,
+    /// The cycle's cells: `(address, length, first index)` ranges over
+    /// `values` and `timestamps`.
+    ranges: Vec<(u64, u64, usize)>,
+    values: Vec<u8>,
+    timestamps: Vec<u64>,
+}
+
+impl HistoryOverlay {
+    pub(crate) fn new(history: Arc<executor::vm::history::WindowHistory>) -> Self {
+        Self {
+            history,
+            ranges: Vec::new(),
+            values: Vec::new(),
+            timestamps: Vec::new(),
+        }
+    }
+
+    /// The cells of the cycle at `timestamp`: none for a timestamp outside
+    /// the window.
+    fn begin(&mut self, timestamp: u64) {
+        self.ranges.clear();
+        self.values.clear();
+        self.timestamps.clear();
+        let Some(i) = (timestamp / 4)
+            .checked_sub(1 + self.history.first)
+            .map(|i| i as usize)
+            .filter(|&i| i < self.history.extras.len() && timestamp % 4 == 0)
+        else {
+            return;
+        };
+        let (ranges, values, timestamps) =
+            (&mut self.ranges, &mut self.values, &mut self.timestamps);
+        let mut last: Option<u64> = None;
+        self.history.cycle_cells(i, |address, value, ts| {
+            // Consecutive bytes extend the range; a jump starts one.
+            if last.is_some_and(|a| a.wrapping_add(1) == address)
+                && let Some(r) = ranges.last_mut()
+            {
+                r.1 += 1;
+            } else {
+                ranges.push((address, 1, values.len()));
+            }
+            last = Some(address);
+            values.push(value);
+            timestamps.push(u64::from(ts));
+        });
+    }
+
+    /// The index of `address`'s cell, the first range holding it.
+    #[inline]
+    fn find(&self, address: u64) -> Option<usize> {
+        self.ranges
+            .iter()
+            .find(|&&(base, len, _)| address.wrapping_sub(base) < len)
+            .map(|&(base, _, at)| at + address.wrapping_sub(base) as usize)
+    }
 }
 
 /// No page: page bases are multiples of the page size, so never odd.
@@ -1020,6 +1090,7 @@ impl MemoryState {
             lean: false,
             hot: NO_PAGE,
             missing: AtomicBool::new(false),
+            overlay: None,
         }
     }
 
@@ -1038,6 +1109,7 @@ impl MemoryState {
             lean: false,
             hot: NO_PAGE,
             missing: AtomicBool::new(false),
+            overlay: None,
         }
     }
 
@@ -1049,6 +1121,7 @@ impl MemoryState {
             lean: false,
             hot: NO_PAGE,
             missing: AtomicBool::new(false),
+            overlay: None,
         }
     }
 
@@ -1059,6 +1132,15 @@ impl MemoryState {
 
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
     fn read_byte(&self, address: u64) -> MemoryCell {
+        if let Some(overlay) = &self.overlay {
+            return match overlay.find(address) {
+                Some(i) => (overlay.values[i], overlay.timestamps[i]),
+                None => {
+                    self.missing.store(true, Relaxed);
+                    (0, ABSENT)
+                }
+            };
+        }
         let cell = self.cells.get(address);
         if cell.1 == ABSENT {
             self.missing.store(true, Relaxed);
@@ -1080,6 +1162,16 @@ impl MemoryState {
 
     /// Write a byte to memory with the given timestamp.
     fn write_byte(&mut self, address: u64, value: u8, timestamp: u64) {
+        if let Some(overlay) = &mut self.overlay {
+            match overlay.find(address) {
+                Some(i) => {
+                    overlay.values[i] = value;
+                    overlay.timestamps[i] = timestamp;
+                }
+                None => self.missing.store(true, Relaxed),
+            }
+            return;
+        }
         if self.lean {
             let (base, off) = PagedMem::<MemoryCell>::page_of(address);
             let index = self.page_or_insert(base);
@@ -1125,6 +1217,14 @@ impl MemoryState {
     fn read_bytes(&mut self, base_address: u64, count: usize) -> ([u32; 8], [u64; 8]) {
         let mut values = [0u32; 8];
         let mut timestamps = [0u64; 8];
+        if self.overlay.is_some() {
+            for i in 0..count {
+                let (val, ts) = self.read_byte(base_address.wrapping_add(i as u64));
+                values[i] = val as u32;
+                timestamps[i] = ts;
+            }
+            return (values, timestamps);
+        }
         if let Some((base, off)) = self.one_page(base_address, count) {
             // A page never allocated reads the fill throughout, as `read_byte`.
             if let Some(index) = self.page(base) {
@@ -1153,6 +1253,13 @@ impl MemoryState {
 
     /// Write multiple bytes from a value.
     fn write_bytes(&mut self, base_address: u64, value: u64, count: usize, timestamp: u64) {
+        if self.overlay.is_some() {
+            for i in 0..count {
+                let byte = ((value >> (i * 8)) & 0xFF) as u8;
+                self.write_byte(base_address.wrapping_add(i as u64), byte, timestamp);
+            }
+            return;
+        }
         if let Some((base, off)) = self.one_page(base_address, count) {
             let index = self.page_or_insert(base);
             for i in 0..count {
@@ -1939,6 +2046,10 @@ fn walk_cpu_ops<const REST: bool>(
 
     for op in cpu_ops {
         let op = decode.op(op);
+        // Record mode: the cycle's cells from the executor's history.
+        if let Some(overlay) = memory_state.overlay.as_deref_mut() {
+            overlay.begin(op.timestamp);
+        }
         // Word (`*W`) instructions delegate to the CPU32 table (built in program
         // order; its register accesses are still emitted via the shared register
         // collector below so the MEMW table balances).

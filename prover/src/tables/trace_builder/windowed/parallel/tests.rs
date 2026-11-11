@@ -64,6 +64,7 @@ fn walked_from_entries(
         batch: builder.walk_batch,
         key: 0x5eed_1234_abcd_0042,
         keep_logs: builder.keeps_logs(),
+        record_sums: false,
     });
     let mut pass = LeanPass::new(Arc::clone(&builder.decode), &builder.register_state)?;
     let mut executor =
@@ -93,6 +94,8 @@ fn walked_from_entries(
             start,
             registers,
             entries: Arc::new(pass.take_entries()),
+            history: None,
+            recheck: false,
         });
         first += cycles;
     }
@@ -766,7 +769,7 @@ fn numbered_on_a_thread(
                         }
                     }
                 });
-                walk_numbered(&mut builder, rx, walkers, number, |_, _, _| Ok(()))
+                walk_numbered(&mut builder, rx, walkers, number, None, |_, _, _| Ok(()))
             })
             .map(|_| ())
         });

@@ -1448,6 +1448,46 @@ pub struct WalkedWindow {
 }
 
 impl WalkedWindow {
+    /// A digest of everything the window's walk emitted, its CPU ops and
+    /// every list, through their `Debug` forms: two walks that emit the same
+    /// give the same digest. For the record mode's sampled re-walk.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn emitted_digest(&self) -> u64 {
+        use std::fmt::Write as _;
+        use std::hash::Hasher as _;
+        struct Digest(std::collections::hash_map::DefaultHasher);
+        impl std::fmt::Write for Digest {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0.write(s.as_bytes());
+                Ok(())
+            }
+        }
+        let mut d = Digest(std::collections::hash_map::DefaultHasher::new());
+        let w = &self.walk;
+        let _ = write!(
+            d,
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            self.cpu_ops,
+            w.memw.register_rows,
+            w.memw.aligned,
+            w.memw.general,
+            w.load_ops,
+            w.lt_ops,
+            w.shift_ops,
+            w.bitwise_ops,
+            w.keccak_ops,
+            w.blake3_ops,
+            w.blake3_absorb_ops,
+            w.cpu32_ops,
+            w.ecsm_ops,
+            w.ecdas_ops,
+            w.copy_ops,
+            w.hint_ops,
+            w.ecrec_ops,
+        );
+        d.0.finish()
+    }
+
     /// The bytes its lists take on the heap (capacities), its logs included.
     pub fn heap_bytes(&self) -> usize {
         super::vec_heap_bytes(&self.cpu_ops)
