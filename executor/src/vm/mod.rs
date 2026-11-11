@@ -6,3 +6,4 @@ pub mod instruction;
 pub mod logs;
 pub mod memory;
 pub mod registers;
+pub mod shadow;

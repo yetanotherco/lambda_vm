@@ -626,3 +626,112 @@ fn the_engine_wrapper_runs_either_engine_alike() {
         .collect();
     assert_eq!(outputs[0], outputs[1]);
 }
+
+/// A program long enough for a few windows: a store-and-load loop.
+fn looping_program() -> Elf {
+    let body = [
+        i(0x13, 0, 0, 0, 5),   // addi t0, x0, 0
+        i(0x13, 500, 0, 0, 6), // addi t1, x0, 500
+        s(0, 5, 3, 3),         // sd t0, 0(gp)
+        i(0x03, 0, 3, 3, 7),   // ld t2, 0(gp)
+        i(0x13, 8, 3, 0, 3),   // addi gp, gp, 8
+        i(0x13, 1, 5, 0, 5),   // addi t0, t0, 1
+        b(-16, 6, 5, 4),       // blt t0, t1, -16
+    ];
+    let mut regs = vec![0u64; 31];
+    regs[2] = 0x2_0000; // gp
+    program(0x1000, &regs, &[], &body)
+}
+
+/// Runs `elf` on the fast engine in windows of `window`, handing every
+/// sampled window to `shadow` with its logs passed through `tamper`.
+fn shadowed_run(
+    elf: &Elf,
+    window: usize,
+    shadow: &mut crate::vm::shadow::ShadowCheck,
+    mut tamper: impl FnMut(usize, &mut Vec<Log>, &mut [u64; 32]),
+) -> usize {
+    let mut fast = FastExecutor::new(elf, vec![]).unwrap();
+    let (mut n, mut cycles) = (0, 0u64);
+    loop {
+        let start = crate::vm::shadow::WindowStart {
+            window: n,
+            first_cycle: cycles,
+            pc: fast.pc(),
+            registers: fast.registers(),
+            memory: fast.snapshot(),
+            public_output: fast.memory().public_output_bytes().to_vec(),
+        };
+        let Some(mut logs) = fast.resume_owned(window).unwrap() else {
+            break;
+        };
+        cycles += logs.len() as u64;
+        if shadow.samples(n) {
+            let mut regs = fast.registers().to_array();
+            tamper(n, &mut logs, &mut regs);
+            shadow.submit(
+                start,
+                &logs,
+                fast.pc(),
+                crate::vm::registers::Registers::from_array(&regs),
+            );
+        }
+        n += 1;
+    }
+    n
+}
+
+// The shadow check finds an honest run equal, window after window.
+#[test]
+fn the_shadow_check_passes_an_honest_run() {
+    use crate::vm::shadow::ShadowCheck;
+    let elf = looping_program();
+    let mut shadow = ShadowCheck::new(&elf, 2).unwrap();
+    let windows = shadowed_run(&elf, 300, &mut shadow, |_, _, _| {});
+    assert!(windows >= 8, "{windows} windows");
+    let counts = shadow.finish().unwrap();
+    assert!(counts.checked >= 1);
+    assert_eq!(counts.checked + counts.skipped, windows.div_ceil(2));
+}
+
+// The shadow check catches one value changed in one log, and a register
+// changed after the window, naming the cycle.
+#[test]
+fn the_shadow_check_catches_a_changed_log_or_register() {
+    use crate::vm::shadow::ShadowCheck;
+    let elf = looping_program();
+    for field in 0..6 {
+        let mut shadow = ShadowCheck::new(&elf, 1_000).unwrap();
+        // Sample window 0 only: the tampered one.
+        shadowed_run(&elf, 300, &mut shadow, |n, logs, regs| {
+            if n != 0 {
+                return;
+            }
+            match field {
+                0 => logs[17].current_pc ^= 4,
+                1 => logs[17].next_pc ^= 1,
+                2 => logs[17].src1_val ^= 1 << 40,
+                3 => logs[17].src2_val ^= 1,
+                4 => logs[17].dst_val ^= 1,
+                _ => regs[7] ^= 1,
+            }
+        });
+        let failure = shadow
+            .finish()
+            .expect_err("the check passed a changed window");
+        let cycle = if field < 5 { "cycle 17)" } else { "cycle 300)" };
+        assert!(failure.contains(cycle), "field {field}: {failure}");
+    }
+}
+
+// The shadow knob: unset, empty or 0 is off, a count is a period, anything
+// else refused.
+#[test]
+fn the_shadow_knob_names_a_period() {
+    use crate::vm::shadow::ShadowCheck;
+    assert_eq!(ShadowCheck::every_from_value(None), Ok(None));
+    assert_eq!(ShadowCheck::every_from_value(Some("")), Ok(None));
+    assert_eq!(ShadowCheck::every_from_value(Some("0")), Ok(None));
+    assert_eq!(ShadowCheck::every_from_value(Some("16")), Ok(Some(16)));
+    assert!(ShadowCheck::every_from_value(Some("often")).is_err());
+}
