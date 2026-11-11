@@ -400,13 +400,18 @@ its two operands, signed or unsigned, with the division-by-zero and overflow
 cases the spec names. That is the shape `eq_rows_correct` has and `LtStaged`
 still lacks.
 
-`lt_rows_correct` is the same conclusion read at `ltComponent`, which is one of
-the eight. It costs nothing beyond the statement, since the providers that
-answer LT's three range checks are the same static tables: every `LT` row of
-this ensemble carries the comparison bit its operands determine. It is stated
-about this ensemble, which asks `MUL` and `DVRM` to balance as well; the
-narrower statement, about `LT` and its three providers alone, still needs
-`LtStaged` to move off the providers that assume their own answers.
+`lt_rows_correct` and `mul_rows_correct` are the same conclusion read at the
+other two chips, and cost nothing beyond their statements: the providers that
+answer LT's and MUL's range checks are the same static tables. Every `LT` row of
+this ensemble carries the comparison bit its operands determine, and every `MUL`
+row holds the 128-bit product of its two operands, each read as signed or
+unsigned by its own flag. **Every chip of this ensemble concludes about its rows,
+and no component assumes anything.**
+
+All three are stated about this ensemble, which asks all of `LT`, `MUL` and
+`DVRM` to balance together. The narrower statement, about one chip and its own
+providers alone, still needs `LtStaged` to move off the providers that assume
+their own answers.
 
 Two general facts came out of this and belong in Clean rather than here:
 `requirementsChannelsLawful_of_cover`, which lets a chip not declare every
