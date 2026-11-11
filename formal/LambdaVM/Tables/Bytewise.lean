@@ -131,12 +131,13 @@ def Honest (r : Row (F p)) : Prop :=
   r.res6.val = BytewiseCore.appOf r.op.val r.a6.val r.b6.val ∧
   r.res7.val = BytewiseCore.appOf r.op.val r.a7.val r.b7.val
 
-/-- What an active row establishes: the result is the selected bitwise operation of the two
-64-bit operands, and its eight columns are bytes, so they are determined, the way
-`SHIFT.RowSpec` bounds `out0` and `out1`. The operand ranges are not hypotheses here —
-`BYTE_ALU` supplies them. -/
+/-- What an active row establishes: `op` is AND, OR or XOR, the result is that bitwise operation
+of the two 64-bit operands, and its eight columns are bytes, so they are determined, the way
+`SHIFT.RowSpec` bounds `out0` and `out1`. `op` is stated because `appOf` reads any other value as
+XOR. The operand ranges are not hypotheses here — `BYTE_ALU` supplies them. -/
 def RowSpec (r : Row (F p)) : Prop :=
   r.mu ≠ 0 →
+    (r.op.val = opselAND ∨ r.op.val = opselOR ∨ r.op.val = opselXOR) ∧
     r.res0.val < 2^8 ∧ r.res1.val < 2^8 ∧ r.res2.val < 2^8 ∧ r.res3.val < 2^8 ∧
     r.res4.val < 2^8 ∧ r.res5.val < 2^8 ∧ r.res6.val < 2^8 ∧ r.res7.val < 2^8 ∧
     r.resVal = BytewiseCore.appOf r.op.val r.aVal r.bVal
@@ -262,7 +263,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     have wb1 := val_word hb4 hb5 hb6 hb7
     have wr0 := val_word hr0 hr1 hr2 hr3
     have wr1 := val_word hr4 hr5 hr6 hr7
-    refine ⟨fun _ => ⟨hr0, hr1, hr2, hr3, hr4, hr5, hr6, hr7, hspec⟩,
+    refine ⟨fun _ => ⟨hop, hr0, hr1, hr2, hr3, hr4, hr5, hr6, hr7, hspec⟩,
       .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
       .inr hcount, .inr hcount, .inr hcount, ?_⟩
     -- the push: `op` is AND, OR or XOR, and the clause of that one becomes all of them
@@ -283,7 +284,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   ProverAssumptions r _ _ := Honest r
 
   completeness := by
-    circuit_proof_start [main, areBytes, word, Alu.channel, Alu.Guarantees, Honest,
+    circuit_proof_start [main, areBytes, word, Alu.channel, Honest,
       Bitwise.areBytesTable, Bitwise.byteAluTable]
     obtain ⟨hmu, ha0, ha1, ha2, ha3, ha4, ha5, ha6, ha7,
       hb0, hb1, hb2, hb3, hb4, hb5, hb6, hb7, hop,

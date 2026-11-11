@@ -183,15 +183,12 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     -- the push: the EQ clause of the bus, which `Guarantees.of_eq` turns into all of them
     intro _
     refine Alu.Guarantees.of_eq hi_2 ?_ fun ha0 ha1 hb0 hb1 => ⟨rfl, key ha0 ha1 hb0 hb1⟩
-    -- the flag byte, read as a natural
-    exact val_eq_of_eq_natCast
-      (by simp only [opselEQ]; push_cast; simp only [ZMod.natCast_zmod_val])
-      (by simp only [opselEQ]; omega)
+    flag_byte
 
   ProverAssumptions r _ _ := Honest r ∨ Padding r
 
   completeness := by
-    circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel, Alu.Guarantees,
+    circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel,
       Bitwise.isHalfTable, Bitwise.zeroTable, Honest, Padding, dword]
     rcases h_assumptions with ⟨hmu, hib, ha0, ha1, hb0, hb1, hd0, hd1, hd2, hd3, hsum, heq, hres⟩ |
       ⟨pmu, pinv, pres, peq, pa0, pa1, pb0, pb1, pd0, pd1, pd2, pd3⟩

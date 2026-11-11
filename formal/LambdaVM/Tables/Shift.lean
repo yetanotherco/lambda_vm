@@ -510,10 +510,7 @@ theorem soundness :
     -- the push: the SHIFT clause of the bus, which `Guarantees.of_shift` turns into all of them
     intro _
     refine Alu.Guarantees.of_shift hw2 hs2 hd2 ?_ fun _ _ _ _ => ?_
-    · -- the flag byte, read as a natural
-      exact val_eq_of_eq_natCast
-        (by simp only [opselSHIFT]; push_cast; simp only [ZMod.natCast_zmod_val])
-        (by simp only [opselSHIFT]; omega)
+    · flag_byte
     · -- the operands as the bus reads them
       have hv1 : (input_in0 + 65536 * input_in1).val = input_in0.val + 65536 * input_in1.val :=
         val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
@@ -535,7 +532,7 @@ theorem soundness :
 theorem completeness :
     GeneralFormalCircuit.Completeness (F p) (Input := Row) (Output := unit) main
       (fun r _ _ => Honest r ∨ Padding r) (fun _ _ _ => True) := by
-    circuit_proof_start [main, isBit, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table,
+    circuit_proof_start [main, isBit, Alu.channel, Bitwise.isHalfTable, Bitwise.msb16Table,
       Bitwise.byteAluTable, opselAND, opselOR, opselXOR, Bitwise.zeroTable, Bitwise.hwslTable, Bitwise.areBytesTable, Honest,
       Padding, shiftedOf]
     rcases h_assumptions with

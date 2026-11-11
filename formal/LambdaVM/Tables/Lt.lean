@@ -267,17 +267,14 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     -- the push: the LT clause of the bus, which `Guarantees.of_lt` turns into all of them
     intro _
     refine Alu.Guarantees.of_lt hs_2 hi_2 ?_ fun hl0 _ hr0 _ => ⟨rfl, ?_⟩
-    · -- the flag byte, read as a natural
-      exact val_eq_of_eq_natCast
-        (by simp only [opselLT]; push_cast; simp only [ZMod.natCast_zmod_val])
-        (by simp only [opselLT]; omega)
+    · flag_byte
     · simp only [dword]
       rw [key _ _ rfl rfl hl0 hr0, hval_lhsHi, hval_rhsHi]
 
   ProverAssumptions r _ _ := Honest r
 
   completeness := by
-    circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel, Alu.Guarantees,
+    circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel,
       Bitwise.isHalfTable, Bitwise.msb16Table, Bitwise.areBytesTable, Honest, Row.lhsVal, Row.rhsVal]
     obtain ⟨hmu, hsb, hib, hl0, hl1, hl2, hr0, hr1, hr2, hs0, hs1, hs2, hs3, hsum, hlm, hrm, hlt, hres⟩ :=
       h_assumptions

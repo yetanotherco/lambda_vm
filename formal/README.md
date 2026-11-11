@@ -39,12 +39,14 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   unified ALU bus: message layout as in `BusId::Alu`, the caller's `IS_WORD`
   assumptions on both operands as hypotheses, and one `Guarantees` clause per
   `opsel` (AND, OR and XOR for BYTEWISE, then EQ, LT, SHIFT, MUL and DIVREM),
-  which is now every value `alu_op` takes in `types.rs`. The flag byte
-  is read as a natural, and no two clauses share a flag value. A chip builds
-  `Guarantees` from the clause of its own `opsel` with `Guarantees.of_lt`,
-  `of_mul` and the rest, which refute the other clauses once, and a puller reads
-  one clause with `Guarantees.lt`, `Guarantees.mul` and the rest, so neither
-  depends on the position of a clause in the conjunction.
+  which is now every value `alu_op` takes in `types.rs`. The flag byte is read
+  as a natural, and no two clauses share a flag value. `Guarantees.of_lt`,
+  `of_mul` and the rest build `Guarantees` from one clause and refute the other
+  clauses once: a pusher uses them in soundness, and a puller in completeness,
+  where Clean asks the honest prover to show that every message it pulls is
+  true. A puller reads one clause back with `Guarantees.lt`, `Guarantees.mul`
+  and the rest, so no chip depends on the position of a clause in the
+  conjunction.
 - `LambdaVM/Tables/` — one file per chip. `Bitwise.lean` transcribes the
   precomputed row function of `prover/src/tables/bitwise.rs` and defines each bus
   the table serves as a `StaticLookupChannel` (read through `toChannel`), with
@@ -82,15 +84,15 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   `AND`, `OR` and `XOR` of two 64-bit operands, looked up one byte triple at a
   time in `BYTE_ALU` with a common `op` and pushed on the `ALU` bus with the
   operands re-limbed to `DWordWL`. `BytewiseCore` is the arithmetic on naturals,
-  the way `ShiftCore` is for SHIFT, and `BytewiseCore.compose` is the part behind
-  the re-limbing: an operation that acts on each bit independently commutes with
-  reading bytes as a little-endian number, so the eight byte results assemble
-  into the operation on the whole values. `op` is never constrained — `BYTE_ALU`
-  only has rows for the three operations, so the lookup is the range check — and
-  the operand bytes are not assumed either, since that same guarantee supplies
-  them, which is why soundness needs no assumption at all. `IS_BYTE[μ]` is a
-  constraint of the chip, which is what makes the eight pulls counted pulls of
-  multiplicity at most 255.
+  the way `ShiftCore` is for SHIFT, and `BytewiseCore.compose` is the part
+  behind the re-limbing: an operation that acts on each bit independently
+  commutes with reading bytes as a little-endian number, so the eight byte
+  results assemble into the operation on the whole values. `op` is never
+  constrained — `BYTE_ALU` only has rows for the three operations, so the lookup
+  is the range check — and the operand bytes are not assumed either, since that
+  same guarantee supplies them, which is why soundness needs no assumption at
+  all. `IS_BYTE[μ]` is a constraint of the chip, which is what makes the eight
+  pulls counted pulls of multiplicity at most 255.
 - `LambdaVM/Tables/MulCore.lean` and `Mul.lean` — the MUL chip, the 128-bit
   product of two 64-bit operands, each read as signed or unsigned by its own
   flag, so one chip serves `MUL`, `MULH`, `MULHU` and `MULHSU`. `MulCore` is the
@@ -397,8 +399,8 @@ sign flags, with which each `NEG` template pulls `ZERO` twice. The chip does not
 constrain those flags to be bits. They are bits because `MSB16` returned them.
 
 `dvrm_rows_correct` is what the ensemble is for. The eight components assume
-nothing, so `rows_correct_of` discharges `witness.Assumptions` rather than
-leaving it to the caller, and the conclusion is about rows: for any witness
+nothing, so `component_rows_correct` discharges `witness.Assumptions` rather
+than leaving it to the caller, and the conclusion is about rows: for any witness
 whose constraints hold, whose channels carry few enough interactions for the
 balance check and whose channels balance, every `DVRM` row carries the quotient
 and remainder of its two operands, signed or unsigned, with the division-by-zero
@@ -406,10 +408,10 @@ and overflow cases the spec names. That is the shape `eq_rows_correct` has and
 `LtStaged` still lacks.
 
 `lt_rows_correct` and `mul_rows_correct` are the same conclusion,
-`rows_correct_of`, read at the other two chips, and cost nothing beyond their
-statements: the providers that answer LT's and MUL's range checks are the same
-static tables. Every `LT` row of this ensemble carries the comparison bit its
-operands determine, and every `MUL` row holds the low and high halves of the
+`component_rows_correct`, read at the other two chips, and cost nothing beyond
+their statements: the providers that answer LT's and MUL's range checks are the
+same static tables. Every `LT` row of this ensemble carries the comparison bit
+its operands determine, and every `MUL` row holds the low and high halves of the
 128-bit product of its two operands, each read as signed or unsigned by its own
 flag. **Every chip of this ensemble concludes about its rows, and no component
 assumes anything.**

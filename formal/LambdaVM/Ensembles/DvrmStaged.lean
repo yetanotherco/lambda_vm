@@ -808,7 +808,7 @@ channel has few enough interactions for the balance check, and every channel bal
 every row of every table of component `c` meets `c`'s spec. The eight components assume
 nothing, so the ensemble's `Assumptions` are free. The three theorems below are this one read at
 `DVRM`, `LT` and `MUL`. -/
-theorem rows_correct_of {c : Component (F p)}
+theorem component_rows_correct {c : Component (F p)}
     (witness : EnsembleWitness ensemble)
     (hc : witness.Constraints) (hfit : witness.InteractionsFit (Balance.logUpUpTo muMax))
     (hb : witness.Balanced (Balance.logUpUpTo muMax)) :
@@ -839,33 +839,32 @@ theorem dvrm_rows_correct
     (hb : witness.Balanced (Balance.logUpUpTo muMax)) :
     ∀ table ∈ witness.tables, table.component = dvrmComponent →
       ∀ row ∈ table.table, DVRM.RowSpec (valueFromOffset DVRM.Row 0 (table.environment row)) :=
-  rows_correct_of witness hc hfit hb
+  component_rows_correct witness hc hfit hb
 
 /-- The same conclusion at `LT`: every `LT` row carries the comparison bit its operands
 determine.
 
-This is the `lt_rows_correct` the counted-pulls section of the README calls writable and
-unwritten. It is stated about *this* ensemble, which asks `MUL` and `DVRM` to balance as well; the
-narrower statement, about `LT` and its three providers alone, needs `LtStaged` to move off the
-providers that assume their own answers. -/
+It is stated about *this* ensemble, which asks `MUL` and `DVRM` to balance as well; the narrower
+statement, about `LT` and its three providers alone, needs `LtStaged` to move off the providers
+that assume their own answers. -/
 theorem lt_rows_correct
     (witness : EnsembleWitness ensemble)
     (hc : witness.Constraints) (hfit : witness.InteractionsFit (Balance.logUpUpTo muMax))
     (hb : witness.Balanced (Balance.logUpUpTo muMax)) :
     ∀ table ∈ witness.tables, table.component = ltComponent →
       ∀ row ∈ table.table, LT.RowSpec (valueFromOffset LT.Row 0 (table.environment row)) :=
-  rows_correct_of witness hc hfit hb
+  component_rows_correct witness hc hfit hb
 
 /-- The same conclusion at `MUL`, which completes the three chips of this ensemble: every `MUL`
 row holds the low and high halves of the 128-bit product of its two operands, each read as
-signed or unsigned by its own flag. With this one, every chip of the ensemble concludes about its rows and no component
-assumes anything. -/
+signed or unsigned by its own flag. With this one, every chip of the ensemble concludes about its
+rows and no component assumes anything. -/
 theorem mul_rows_correct
     (witness : EnsembleWitness ensemble)
     (hc : witness.Constraints) (hfit : witness.InteractionsFit (Balance.logUpUpTo muMax))
     (hb : witness.Balanced (Balance.logUpUpTo muMax)) :
     ∀ table ∈ witness.tables, table.component = mulComponent →
       ∀ row ∈ table.table, MUL.RowSpec (valueFromOffset MUL.Row 0 (table.environment row)) :=
-  rows_correct_of witness hc hfit hb
+  component_rows_correct witness hc hfit hb
 
 end LambdaVM.Ensembles.DvrmStaged

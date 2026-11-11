@@ -32,7 +32,7 @@ soundness theorem or global row theorem.
 #print axioms LambdaVM.Ensembles.eq_rows_correct
 #print axioms LambdaVM.Ensembles.LtStaged.tableSoundness
 #print axioms LambdaVM.Ensembles.DvrmStaged.tableSoundness
-#print axioms LambdaVM.Ensembles.DvrmStaged.rows_correct_of
+#print axioms LambdaVM.Ensembles.DvrmStaged.component_rows_correct
 #print axioms LambdaVM.Ensembles.DvrmStaged.dvrm_rows_correct
 #print axioms LambdaVM.Ensembles.DvrmStaged.lt_rows_correct
 #print axioms LambdaVM.Ensembles.DvrmStaged.mul_rows_correct

@@ -12,7 +12,8 @@ public import Clean.Air.CountedChannel
 
 `ALU[out; in1, in2, flags]`: operands and result travel as `(lo32, hi32)` pairs, `flags`
 carries the `alu_op` descriptor plus per-chip flag bits. Every ALU chip pushes to this
-channel; the CPU pulls. Each chip adds the clause of `Guarantees` for its own `opsel`.
+channel, and the CPU and DVRM pull from it (DVRM pulls `LT` and `MUL`). Each pushing chip adds
+the clause of `Guarantees` for its own `opsel`.
 -/
 
 namespace LambdaVM.Alu
@@ -49,6 +50,16 @@ lemma slt_ofNat_iff {L R : ℕ} (hL : L < 2^64) (hR : R < 2^64) :
 /-- LT result: `(lhs < rhs) xor invert`. -/
 def ltBit (signed invert L R : ℕ) : ℕ :=
   if ltRaw signed L R = invert then 0 else 1
+
+/-- The unsigned, uninverted `LT` bit is plain `<` on values below `2⁶⁴`. -/
+lemma ltBit_unsigned {L R : ℕ} (hL : L < 2^64) (hR : R < 2^64) :
+    ltBit 0 0 L R = if L < R then 1 else 0 := by
+  have hu := ult_ofNat_iff hL hR
+  by_cases h : L < R
+  · simp [ltBit, ltRaw, hu.mpr h, h]
+  · have hf : (BitVec.ofNat 64 L).ult (BitVec.ofNat 64 R) = false :=
+      Bool.eq_false_iff.mpr fun h' => h (hu.mp h')
+    simp [ltBit, ltRaw, hf, h]
 
 /-- EQ result: `(a = b) xor invert`. -/
 def eqBit (invert A B : ℕ) : ℕ :=
@@ -94,9 +105,9 @@ def divremResult (signed rem a b : ℕ) : ℕ :=
   else ((if rem = 1 then (sgn64 signed a).tmod (sgn64 signed b)
     else (sgn64 signed a).tdiv (sgn64 signed b)) % 2^64).toNat
 
-/-- What a puller learns. The caller must have range-checked both words of both operands
-(the chips' `IS_WORD` assumptions). One clause per `opsel`, selected by the flag byte read
-as a natural. -/
+/-- What a puller learns in soundness, and what an honest puller must show in completeness. The
+caller must have range-checked both words of both operands (the chips' `IS_WORD` assumptions).
+One clause per `opsel`, selected by the flag byte read as a natural. -/
 def Guarantees (m : Msg (F p)) : Prop :=
   m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
     -- LT (spec/lt.typ): flags = opsel(LT) + 32·signed + 64·invert, out = [res, 0]
@@ -125,10 +136,11 @@ def Guarantees (m : Msg (F p)) : Prop :=
       m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
       dword m.outLo m.outHi = dword m.in1Lo m.in1Hi ^^^ dword m.in2Lo m.in2Hi) ∧
     -- MUL (spec/mul.typ): flags = opsel(MUL) + 32·lhs_signed + 64·rhs_signed + 128·high
-    (∀ ls rs h : ℕ, ls < 2 → rs < 2 → h < 2 →
-      m.flags.val = opselMUL + 32 * ls + 64 * rs + 128 * h →
+    (∀ ls rs high : ℕ, ls < 2 → rs < 2 → high < 2 →
+      m.flags.val = opselMUL + 32 * ls + 64 * rs + 128 * high →
       m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
-      dword m.outLo m.outHi = mulResult ls rs h (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi)) ∧
+      dword m.outLo m.outHi
+        = mulResult ls rs high (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi)) ∧
     -- DIVREM (spec/dvrm.typ): flags = opsel(DIVREM) + 32·signed + 128·rem
     (∀ s rm : ℕ, s < 2 → rm < 2 →
       m.flags.val = opselDIVREM + 32 * s + 128 * rm →
@@ -141,10 +153,25 @@ def Guarantees (m : Msg (F p)) : Prop :=
 `Guarantees` is a conjunction with one clause per `opsel`, so reaching a clause by its position
 breaks every time a clause is added. These lemmas name each clause instead.
 
-A pusher builds `Guarantees` from the clause of its own `opsel` with `Guarantees.of_*`: the
-other clauses do not apply, since no two of them share a `flags` value, and the lemma refutes
-them once here rather than in every chip. A puller reads its clause back with
-`Guarantees.lt`, `Guarantees.mul` and the rest. -/
+`Guarantees.of_*` builds `Guarantees` from the clause of one `opsel`: the other clauses do not
+apply, since no two of them share a `flags` value, and the lemma refutes them once here rather
+than in every chip. A pusher needs it in soundness, for every message it pushes. A puller needs it
+in completeness, because Clean asks the honest prover to show that every message it pulls is true
+(`ConstraintsHold.Completeness` holds each pull to its `Guarantees`). In soundness a puller reads
+its clause back with `Guarantees.lt`, `Guarantees.mul` and the rest. -/
+
+/-- Closes the flag-byte goal `(opsel + c·b + …).val = opsel + c·b.val + …` that
+`Guarantees.of_*` and the readers leave, with every bit column `b` known to be below `2`. -/
+macro "flag_byte" : tactic =>
+  `(tactic| exact val_eq_of_eq_natCast
+    (by
+      simp only [opselAND, opselOR, opselXOR, opselEQ, opselLT, opselSHIFT, opselMUL, opselDIVREM,
+        mul_zero, add_zero, mul_one]
+      push_cast
+      try simp only [ZMod.natCast_zmod_val])
+    (by
+      simp only [opselAND, opselOR, opselXOR, opselEQ, opselLT, opselSHIFT, opselMUL, opselDIVREM]
+      omega))
 
 section Clauses
 
@@ -156,8 +183,8 @@ private lemma opsel_values :
       opselMUL = 7 ∧ opselDIVREM = 8 :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
-/-- Opens `Guarantees` and refutes every clause whose flag value cannot match the pusher's, which
-leaves only the pusher's own clause, with its flag variables and equation introduced. -/
+/-- Opens `Guarantees` and refutes every clause whose flag value cannot match the message's,
+which leaves only the clause being built, with its flag variables and equation introduced. -/
 local macro "other_clauses" : tactic =>
   `(tactic| (
     obtain ⟨_, _, _, _, _, _, _, _⟩ := opsel_values
@@ -225,17 +252,18 @@ theorem Guarantees.of_xor (hf : m.flags.val = opselXOR)
   other_clauses
   exact h h1 h2 h3 h4
 
-theorem Guarantees.of_mul {ls rs h : ℕ} (hls : ls < 2) (hrs : rs < 2) (hh : h < 2)
-    (hf : m.flags.val = opselMUL + 32 * ls + 64 * rs + 128 * h)
-    (hc : m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
+theorem Guarantees.of_mul {ls rs high : ℕ} (hls : ls < 2) (hrs : rs < 2) (hhigh : high < 2)
+    (hf : m.flags.val = opselMUL + 32 * ls + 64 * rs + 128 * high)
+    (h : m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
       m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
-      dword m.outLo m.outHi = mulResult ls rs h (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi)) :
+      dword m.outLo m.outHi
+        = mulResult ls rs high (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi)) :
     Guarantees m := by
   intro h1 h2 h3 h4
   other_clauses
-  rename_i ls' rs' h' hls' hrs' hh' hf'
-  obtain ⟨rfl, rfl, rfl⟩ : ls' = ls ∧ rs' = rs ∧ h' = h := by omega
-  exact hc h1 h2 h3 h4
+  rename_i ls' rs' high' hls' hrs' hhigh' hf'
+  obtain ⟨rfl, rfl, rfl⟩ : ls' = ls ∧ rs' = rs ∧ high' = high := by omega
+  exact h h1 h2 h3 h4
 
 theorem Guarantees.of_divrem {s rm : ℕ} (hs : s < 2) (hrm : rm < 2)
     (hf : m.flags.val = opselDIVREM + 32 * s + 128 * rm)
@@ -288,11 +316,12 @@ theorem Guarantees.xor (hf : m.flags.val = opselXOR) :
       dword m.outLo m.outHi = dword m.in1Lo m.in1Hi ^^^ dword m.in2Lo m.in2Hi :=
   (hg h1 h2 h3 h4).2.2.2.2.2.1 hf
 
-theorem Guarantees.mul {ls rs h : ℕ} (hls : ls < 2) (hrs : rs < 2) (hh : h < 2)
-    (hf : m.flags.val = opselMUL + 32 * ls + 64 * rs + 128 * h) :
+theorem Guarantees.mul {ls rs high : ℕ} (hls : ls < 2) (hrs : rs < 2) (hhigh : high < 2)
+    (hf : m.flags.val = opselMUL + 32 * ls + 64 * rs + 128 * high) :
     m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
-      dword m.outLo m.outHi = mulResult ls rs h (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) :=
-  (hg h1 h2 h3 h4).2.2.2.2.2.2.1 ls rs h hls hrs hh hf
+      dword m.outLo m.outHi
+        = mulResult ls rs high (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) :=
+  (hg h1 h2 h3 h4).2.2.2.2.2.2.1 ls rs high hls hrs hhigh hf
 
 theorem Guarantees.divrem {s rm : ℕ} (hs : s < 2) (hrm : rm < 2)
     (hf : m.flags.val = opselDIVREM + 32 * s + 128 * rm) :
