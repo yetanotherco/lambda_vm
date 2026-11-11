@@ -107,7 +107,7 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   Bitwise.IsHalf.pullUpTo muMax r.mu r.lhsSubRhs3
   -- output: ALU[lhs, rhs, opsel(LT) + 32·signed + 64·invert] -> [res, 0], μ times
   Alu.channel.emitUpTo muMax r.mu
-    ⟨r.lhs0, lhsHi, r.rhs0, rhsHi, 4 + 32 * r.signed + 64 * r.invert, r.res, 0⟩
+    ⟨r.lhs0, lhsHi, r.rhs0, rhsHi, (opselLT : F p) + 32 * r.signed + 64 * r.invert, r.res, 0⟩
 
 lemma ltRaw_lt_two {s L R : ℕ} : ltRaw s L R < 2 := by
   unfold ltRaw; split_ifs <;> omega
@@ -185,7 +185,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
 
   soundness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, Row.lhsVal, Row.rhsVal,
-      dword, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table, Bitwise.areBytesTable]
+      dword, Alu.channel, Bitwise.isHalfTable, Bitwise.msb16Table, Bitwise.areBytesTable]
     obtain ⟨⟨h_mu, -⟩, h_l1, h_r1, h_s, h_i, h_lm, h_rm, h_lt, h_res, h_c0, h_c1, h_s0, h_s1, h_s2,
       h_s3⟩ := h_holds
     -- with μ = 0 every requirement is vacuous
@@ -264,30 +264,15 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       | (subst hlt'; norm_num at hres'; simp [hAv, hBv, hC, hres'])
     refine ⟨fun _ hl0 hr0 => key _ _ rfl rfl hl0 hr0, .inr hcount, .inr hcount, .inr hcount,
       .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, ?_⟩
-    intro _ hl0 hlhi hr0 hrhi
-    -- the flag byte, read as a natural
-    have hflagsV : (4 + 32 * input_signed + 64 * input_invert : F p).val
-        = 4 + 32 * input_signed.val + 64 * input_invert.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    refine ⟨?_, ?_, ?_,
-      -- nor the three BYTEWISE clauses: opsel(AND | OR | XOR) is below opsel(LT)
-      fun hflags => by exfalso; rw [hflagsV] at hflags; simp only [opselAND] at hflags; omega,
-      fun hflags => by exfalso; rw [hflagsV] at hflags; simp only [opselOR] at hflags; omega,
-      fun hflags => by exfalso; rw [hflagsV] at hflags; simp only [opselXOR] at hflags; omega,
-      -- nor MUL: opsel(MUL) + 32·ls + 64·rs + 128·h ≡ 7 (mod 32), opsel(LT) + 32·s + 64·i ≡ 4
-      fun ls rs hg hls hrs hhg hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselMUL = 7 := rfl; omega,
-      fun s rm hs hrm hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselDIVREM = 8 := rfl; omega⟩
-    · intro s i hs hi hflags
-      rw [hflagsV] at hflags; simp only [opselLT] at hflags
-      rw [key s i (by omega) (by omega) hl0 hr0, hval_lhsHi, hval_rhsHi]
-    · -- the EQ clause does not apply: opsel(LT) + 32·s + 64·i ≠ opsel(EQ) + 64·i'
-      intro i hi hflags
-      exfalso; rw [hflagsV] at hflags; simp only [opselEQ] at hflags; omega
-    · -- nor the SHIFT clause: opsel(SHIFT) + w + 32·s + 64·d ≡ 5 or 6 (mod 32)
-      intro w s d hw hs hd hflags
-      exfalso; rw [hflagsV] at hflags; simp only [opselSHIFT] at hflags; omega
+    -- the push: the LT clause of the bus, which `Guarantees.of_lt` turns into all of them
+    intro _
+    refine Alu.Guarantees.of_lt hs_2 hi_2 ?_ fun hl0 _ hr0 _ => ⟨rfl, ?_⟩
+    · -- the flag byte, read as a natural
+      exact val_eq_of_eq_natCast
+        (by simp only [opselLT]; push_cast; simp only [ZMod.natCast_zmod_val])
+        (by simp only [opselLT]; omega)
+    · simp only [dword]
+      rw [key _ _ rfl rfl hl0 hr0, hval_lhsHi, hval_rhsHi]
 
   ProverAssumptions r _ _ := Honest r
 

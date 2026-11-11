@@ -125,7 +125,7 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   Alu.channel.emitUpTo muMax r.mu
     ⟨r.in0 + 65536 * r.in1, r.in2 + 65536 * r.in3,
       r.shiftAmount + 256 * r.shiftB1 + 65536 * r.shiftH1, r.shiftHigh,
-      5 + r.wordInstr + 32 * r.signed + 64 * r.direction, r.out0, r.out1⟩
+      (opselSHIFT : F p) + r.wordInstr + 32 * r.signed + 64 * r.direction, r.out0, r.out1⟩
   Bitwise.AreBytes.pull (r.shiftAmount, r.shiftB1)
   Bitwise.IsHalf.pullUpTo muMax r.mu r.shiftH1
   Bitwise.IsHalf.pullUpTo muMax r.mu r.in0
@@ -274,7 +274,7 @@ instance elaborated : ElaboratedCircuit (F p) Row unit main := by elaborate_circ
 theorem soundness :
     GeneralFormalCircuit.Soundness (F p) (Input := Row) (Output := unit) main (fun _ _ => True)
       (fun r _ _ => RowSpec r) := by
-    circuit_proof_start [main, isBit, RowSpec, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable,
+    circuit_proof_start [main, isBit, RowSpec, Alu.channel, Bitwise.isHalfTable,
       Bitwise.msb16Table, Bitwise.byteAluTable, opselAND, opselOR, opselXOR, Bitwise.zeroTable, Bitwise.hwslTable,
       Bitwise.areBytesTable]
     obtain ⟨h_dm, h_zx0, h_zx1, h_zx2, h_zx3, h_zx4, h_zy0, h_zy1, h_zy2, h_zy3,
@@ -507,34 +507,14 @@ theorem soundness :
       -- HWSL is still `toRaw`
       | exact hzb'
     -- what remains is the ALU push
-    intro _ hin1lo hin1hi hin2lo hin2hi
-    -- the flag byte, read as a natural
-    have hflagsV : (5 + input_wordInstr + 32 * input_signed + 64 * input_direction : F p).val
-        = 5 + input_wordInstr.val + 32 * input_signed.val + 64 * input_direction.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    refine ⟨?_, ?_, ?_,
-      -- nor the three BYTEWISE clauses: opsel(AND | OR | XOR) is below opsel(SHIFT)
-      fun hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselAND = 0 := rfl; omega,
-      fun hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselOR = 1 := rfl; omega,
-      fun hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselXOR = 2 := rfl; omega,
-      -- nor MUL: 7 (mod 32) against opsel(SHIFT) + w ≡ 5 or 6
-      fun ls rs hg hls hrs hhg hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselMUL = 7 := rfl; omega,
-      fun s rm hs hrm hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselDIVREM = 8 := rfl; omega⟩
-    · -- not LT: 5 + w + 32 s + 64 d ≠ 4 + 32 s' + 64 i (mod 32)
-      intro s i hs hi hflags
-      exfalso; rw [hflagsV] at hflags; simp only [opselLT] at hflags; omega
-    · -- not EQ
-      intro i hi hflags
-      exfalso; rw [hflagsV] at hflags; simp only [opselEQ] at hflags; omega
-    · intro w s d hw hs hd hflags
-      rw [hflagsV] at hflags; simp only [opselSHIFT] at hflags
-      obtain ⟨rfl, rfl, rfl⟩ : input_wordInstr.val = w ∧ input_signed.val = s ∧
-        input_direction.val = d := by omega
+    -- the push: the SHIFT clause of the bus, which `Guarantees.of_shift` turns into all of them
+    intro _
+    refine Alu.Guarantees.of_shift hw2 hs2 hd2 ?_ fun _ _ _ _ => ?_
+    · -- the flag byte, read as a natural
+      exact val_eq_of_eq_natCast
+        (by simp only [opselSHIFT]; push_cast; simp only [ZMod.natCast_zmod_val])
+        (by simp only [opselSHIFT]; omega)
+    · -- the operands as the bus reads them
       have hv1 : (input_in0 + 65536 * input_in1).val = input_in0.val + 65536 * input_in1.val :=
         val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
       have hv2 : (input_in2 + 65536 * input_in3).val = input_in2.val + 65536 * input_in3.val :=
@@ -549,7 +529,7 @@ theorem soundness :
           = input_shiftAmount.val := by
         rw [hv3]; omega
       rw [hin1, hin2]
-      exact ⟨key.1, key.2.1, key.2.2⟩
+      exact key
 
 
 theorem completeness :

@@ -14,6 +14,7 @@ public import LambdaVM.Buses.Alu
 public import LambdaVM.Tables.Lt
 public import LambdaVM.Tables.Eq
 public import LambdaVM.Tables.Shift
+public import LambdaVM.Tables.BytewiseCore
 public import LambdaVM.Tables.Bytewise
 public import LambdaVM.Tables.MulCore
 public import LambdaVM.Tables.Mul

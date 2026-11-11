@@ -154,7 +154,7 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   assertZero (r.raw3 - rawE 3 r.lhs0 r.lhs1 r.lhs2 r.lhs3 le4 le4 le4 le4
     r.rhs0 r.rhs1 r.rhs2 r.rhs3 re4 re4 re4 re4)
   -- output: ALU[lhs, rhs, opsel(MUL) + 32·lhs_signed + 64·rhs_signed (+128)] -> lo, hi
-  let flags := 7 + 32 * r.lhsSigned + 64 * r.rhsSigned
+  let flags := (opselMUL : F p) + 32 * r.lhsSigned + 64 * r.rhsSigned
   Alu.channel.emitUpTo muMax r.muLo
     ⟨word r.lhs0 r.lhs1, word r.lhs2 r.lhs3, word r.rhs0 r.rhs1, word r.rhs2 r.rhs3,
      flags, res0, res1⟩
@@ -178,12 +178,16 @@ def Row.hiVal (r : Row (F p)) : ℕ :=
   MulCore.ofHalves4 r.hi0.val r.hi1.val r.hi2.val r.hi3.val
 
 /-- An active row holds the 128-bit product of its two operands, each read as signed or unsigned
-by its own flag. This is the whole meaning of the chip; everything else in the row is the
-apparatus that computes it. -/
+by its own flag: `lo` is its low half and `hi` its high half, the two `MUL` results of
+`Alu.mulResult`. The halves of both are 16-bit limbs, so the result columns are determined, the
+way `SHIFT.RowSpec` bounds `out0` and `out1`. This is the whole meaning of the chip; everything
+else in the row is the apparatus that computes it. -/
 def RowSpec (r : Row (F p)) : Prop :=
   r.muLo + r.muHi ≠ 0 →
-    r.loVal + 2^64 * r.hiVal
-      = (Alu.ext128 r.lhsSigned.val r.lhsVal * Alu.ext128 r.rhsSigned.val r.rhsVal) % 2^128
+    r.lo0.val < 2^16 ∧ r.lo1.val < 2^16 ∧ r.lo2.val < 2^16 ∧ r.lo3.val < 2^16 ∧
+    r.hi0.val < 2^16 ∧ r.hi1.val < 2^16 ∧ r.hi2.val < 2^16 ∧ r.hi3.val < 2^16 ∧
+    r.loVal = Alu.mulResult r.lhsSigned.val r.rhsSigned.val 0 r.lhsVal r.rhsVal ∧
+    r.hiVal = Alu.mulResult r.lhsSigned.val r.rhsSigned.val 1 r.lhsVal r.rhsVal
 
 /-- The honest prover's row, as `dedup_mul_rows` and the trace generator of `mul.rs` fill it:
 byte multiplicities, bit sign flags, half limbs throughout, the two sign bits `SIGN` computes,
@@ -239,7 +243,7 @@ theorem soundness :
     GeneralFormalCircuit.Soundness (F p) (Input := Row) (Output := unit) main (fun _ _ => True)
       (fun r _ _ => RowSpec r) := by
   circuit_proof_start [main, areBytes, isBit, sign, word, rawE, RowSpec, Row.lhsVal, Row.rhsVal,
-    Row.loVal, Row.hiVal, Alu.channel, Alu.Guarantees, dword, Bitwise.areBytesTable,
+    Row.loVal, Row.hiVal, Alu.channel, dword, Bitwise.areBytesTable,
     Bitwise.isHalfTable, Bitwise.isB20Table, Bitwise.msb16Table]
   obtain ⟨⟨hmuLo, hmuHi⟩, h_ls, h_rs, h_l0, h_l1, h_l2, h_l3, h_r0, h_r1, h_r2, h_r3,
     h_sgnL, h_negL, h_sgnR, h_negR, h_lo0, h_lo1, h_lo2, h_lo3, h_hi0, h_hi1, h_hi2, h_hi3,
@@ -433,59 +437,34 @@ theorem soundness :
       + 2^32 * (input_rhs2 + 65536 * input_rhs3).val
       = MulCore.ofHalves4 input_rhs0.val input_rhs1.val input_rhs2.val input_rhs3.val := by
     simp only [MulCore.ofHalves4, hu2, hu3]; ring
-  refine ⟨fun _ => hkey, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
+  refine ⟨fun _ => ⟨hlo0, hlo1, hlo2, hlo3, hhi0, hhi1, hhi2, hhi3, hmul0.symm, hmul1.symm⟩,
+    .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount, .inr hcount, .inr hcount, eq_zero_or_countUpTo hlsb,
     eq_zero_or_countUpTo hrsb, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount, .inr hcount, ?_, ?_⟩
-  · -- the `high = 0` message: the low 64 bits of the product
-    intro _ _ _ _ _
-    have hflags : (7 + 32 * input_lhsSigned + 64 * input_rhsSigned : F p).val
-        = 7 + 32 * input_lhsSigned.val + 64 * input_rhsSigned.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    refine ⟨fun s i hs hi h => by
-        exfalso; rw [hflags] at h; simp only [opselLT] at h; omega,
-      fun i hi h => by exfalso; rw [hflags] at h; simp only [opselEQ] at h; omega,
-      fun w s d hw hs hd h => by
-        exfalso; rw [hflags] at h; simp only [opselSHIFT] at h; omega,
-      fun h => by exfalso; rw [hflags] at h; simp only [opselAND] at h; omega,
-      fun h => by exfalso; rw [hflags] at h; simp only [opselOR] at h; omega,
-      fun h => by exfalso; rw [hflags] at h; simp only [opselXOR] at h; omega, ?_,
-      fun s rm hs hrm h => by
-        exfalso; rw [hflags] at h; simp only [opselDIVREM] at h; omega⟩
-    intro ls rs hgh hls hrs hh h
-    rw [hflags] at h
-    simp only [opselMUL] at h
-    obtain ⟨rfl, rfl, rfl⟩ : ls = input_lhsSigned.val ∧ rs = input_rhsSigned.val ∧ hgh = 0 := by
-      omega
-    refine ⟨by omega, by omega, ?_⟩
-    rw [hLval, hRval, hmul0, hv0, hv1]
-    simp only [MulCore.ofHalves4]
-    ring
-  · -- the `high = 1` message: the high 64 bits of the product
-    intro _ _ _ _ _
-    have hflags : (7 + 32 * input_lhsSigned + 64 * input_rhsSigned + 128 : F p).val
-        = 7 + 32 * input_lhsSigned.val + 64 * input_rhsSigned.val + 128 :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    refine ⟨fun s i hs hi h => by
-        exfalso; rw [hflags] at h; simp only [opselLT] at h; omega,
-      fun i hi h => by exfalso; rw [hflags] at h; simp only [opselEQ] at h; omega,
-      fun w s d hw hs hd h => by
-        exfalso; rw [hflags] at h; simp only [opselSHIFT] at h; omega,
-      fun h => by exfalso; rw [hflags] at h; simp only [opselAND] at h; omega,
-      fun h => by exfalso; rw [hflags] at h; simp only [opselOR] at h; omega,
-      fun h => by exfalso; rw [hflags] at h; simp only [opselXOR] at h; omega, ?_,
-      fun s rm hs hrm h => by
-        exfalso; rw [hflags] at h; simp only [opselDIVREM] at h; omega⟩
-    intro ls rs hgh hls hrs hh h
-    rw [hflags] at h
-    simp only [opselMUL] at h
-    obtain ⟨rfl, rfl, rfl⟩ : ls = input_lhsSigned.val ∧ rs = input_rhsSigned.val ∧ hgh = 1 := by
-      omega
-    refine ⟨by omega, by omega, ?_⟩
-    rw [hLval, hRval, hmul1, hv2, hv3]
-    simp only [MulCore.ofHalves4]
-    ring
+  · -- the `high = 0` message: the low 64 bits of the product, the MUL clause at `high = 0`
+    intro _
+    refine Alu.Guarantees.of_mul (h := 0) hls2 hrs2 (by norm_num) ?_ fun _ _ _ _ => ?_
+    · exact val_eq_of_eq_natCast
+        (by simp only [opselMUL, mul_zero, add_zero]; push_cast; simp only [ZMod.natCast_zmod_val])
+        (by simp only [opselMUL]; omega)
+    · dsimp only [dword]
+      refine ⟨by omega, by omega, ?_⟩
+      rw [hLval, hRval, hmul0, hv0, hv1]
+      simp only [MulCore.ofHalves4]
+      ring
+  · -- the `high = 1` message: the high 64 bits of the product, the MUL clause at `high = 1`
+    intro _
+    refine Alu.Guarantees.of_mul (h := 1) hls2 hrs2 (by norm_num) ?_ fun _ _ _ _ => ?_
+    · exact val_eq_of_eq_natCast
+        (by simp only [opselMUL, mul_one]; push_cast; simp only [ZMod.natCast_zmod_val])
+        (by simp only [opselMUL]; omega)
+    · dsimp only [dword]
+      refine ⟨by omega, by omega, ?_⟩
+      rw [hLval, hRval, hmul1, hv2, hv3]
+      simp only [MulCore.ofHalves4]
+      ring
 
 /-- **The honest carries, on naturals.** From the limb bounds, the two sign bits and the product
 equation an honest row satisfies, the four carries of the chain exist, each below `2^20` — the

@@ -136,6 +136,175 @@ def Guarantees (m : Msg (F p)) : Prop :=
       dword m.outLo m.outHi
         = divremResult s rm (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi))
 
+/-! ## One clause at a time
+
+`Guarantees` is a conjunction with one clause per `opsel`, so reaching a clause by its position
+breaks every time a clause is added. These lemmas name each clause instead.
+
+A pusher builds `Guarantees` from the clause of its own `opsel` with `Guarantees.of_*`: the
+other clauses do not apply, since no two of them share a `flags` value, and the lemma refutes
+them once here rather than in every chip. A puller reads its clause back with
+`Guarantees.lt`, `Guarantees.mul` and the rest. -/
+
+section Clauses
+
+variable {m : Msg (F p)}
+
+/-- The `opsel` constants as numerals, so that `omega` can compare flag values. -/
+private lemma opsel_values :
+    opselAND = 0 ∧ opselOR = 1 ∧ opselXOR = 2 ∧ opselEQ = 3 ∧ opselLT = 4 ∧ opselSHIFT = 5 ∧
+      opselMUL = 7 ∧ opselDIVREM = 8 :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Opens `Guarantees` and refutes every clause whose flag value cannot match the pusher's, which
+leaves only the pusher's own clause, with its flag variables and equation introduced. -/
+local macro "other_clauses" : tactic =>
+  `(tactic| (
+    obtain ⟨_, _, _, _, _, _, _, _⟩ := opsel_values
+    and_intros <;> intros <;> try (exfalso; omega)))
+
+theorem Guarantees.of_lt {s i : ℕ} (hs : s < 2) (hi : i < 2)
+    (hf : m.flags.val = opselLT + 32 * s + 64 * i)
+    (h : m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
+      m.outHi = 0 ∧
+      m.outLo = ((ltBit s i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p)) :
+    Guarantees m := by
+  intro h1 h2 h3 h4
+  other_clauses
+  rename_i s' i' hs' hi' hf'
+  obtain ⟨rfl, rfl⟩ : s' = s ∧ i' = i := by omega
+  exact h h1 h2 h3 h4
+
+theorem Guarantees.of_eq {i : ℕ} (hi : i < 2) (hf : m.flags.val = opselEQ + 64 * i)
+    (h : m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
+      m.outHi = 0 ∧
+      m.outLo = ((eqBit i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p)) :
+    Guarantees m := by
+  intro h1 h2 h3 h4
+  other_clauses
+  rename_i i' hi' hf'
+  obtain rfl : i' = i := by omega
+  exact h h1 h2 h3 h4
+
+theorem Guarantees.of_shift {w s d : ℕ} (hw : w < 2) (hs : s < 2) (hd : d < 2)
+    (hf : m.flags.val = opselSHIFT + w + 32 * s + 64 * d)
+    (h : m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
+      m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = shiftResult w s d (dword m.in1Lo m.in1Hi) (m.in2Lo.val % 256)) :
+    Guarantees m := by
+  intro h1 h2 h3 h4
+  other_clauses
+  rename_i w' s' d' hw' hs' hd' hf'
+  obtain ⟨rfl, rfl, rfl⟩ : w' = w ∧ s' = s ∧ d' = d := by omega
+  exact h h1 h2 h3 h4
+
+theorem Guarantees.of_and (hf : m.flags.val = opselAND)
+    (h : m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
+      m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = dword m.in1Lo m.in1Hi &&& dword m.in2Lo m.in2Hi) :
+    Guarantees m := by
+  intro h1 h2 h3 h4
+  other_clauses
+  exact h h1 h2 h3 h4
+
+theorem Guarantees.of_or (hf : m.flags.val = opselOR)
+    (h : m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
+      m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = dword m.in1Lo m.in1Hi ||| dword m.in2Lo m.in2Hi) :
+    Guarantees m := by
+  intro h1 h2 h3 h4
+  other_clauses
+  exact h h1 h2 h3 h4
+
+theorem Guarantees.of_xor (hf : m.flags.val = opselXOR)
+    (h : m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
+      m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = dword m.in1Lo m.in1Hi ^^^ dword m.in2Lo m.in2Hi) :
+    Guarantees m := by
+  intro h1 h2 h3 h4
+  other_clauses
+  exact h h1 h2 h3 h4
+
+theorem Guarantees.of_mul {ls rs h : ℕ} (hls : ls < 2) (hrs : rs < 2) (hh : h < 2)
+    (hf : m.flags.val = opselMUL + 32 * ls + 64 * rs + 128 * h)
+    (hc : m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
+      m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = mulResult ls rs h (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi)) :
+    Guarantees m := by
+  intro h1 h2 h3 h4
+  other_clauses
+  rename_i ls' rs' h' hls' hrs' hh' hf'
+  obtain ⟨rfl, rfl, rfl⟩ : ls' = ls ∧ rs' = rs ∧ h' = h := by omega
+  exact hc h1 h2 h3 h4
+
+theorem Guarantees.of_divrem {s rm : ℕ} (hs : s < 2) (hrm : rm < 2)
+    (hf : m.flags.val = opselDIVREM + 32 * s + 128 * rm)
+    (h : m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
+      m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi
+        = divremResult s rm (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi)) :
+    Guarantees m := by
+  intro h1 h2 h3 h4
+  other_clauses
+  rename_i s' rm' hs' hrm' hf'
+  obtain ⟨rfl, rfl⟩ : s' = s ∧ rm' = rm := by omega
+  exact h h1 h2 h3 h4
+
+section Read
+
+variable (hg : Guarantees m) (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
+  (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
+include hg h1 h2 h3 h4
+
+theorem Guarantees.lt {s i : ℕ} (hs : s < 2) (hi : i < 2)
+    (hf : m.flags.val = opselLT + 32 * s + 64 * i) :
+    m.outHi = 0 ∧
+      m.outLo = ((ltBit s i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p) :=
+  (hg h1 h2 h3 h4).1 s i hs hi hf
+
+theorem Guarantees.eq {i : ℕ} (hi : i < 2) (hf : m.flags.val = opselEQ + 64 * i) :
+    m.outHi = 0 ∧
+      m.outLo = ((eqBit i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p) :=
+  (hg h1 h2 h3 h4).2.1 i hi hf
+
+theorem Guarantees.shift {w s d : ℕ} (hw : w < 2) (hs : s < 2) (hd : d < 2)
+    (hf : m.flags.val = opselSHIFT + w + 32 * s + 64 * d) :
+    m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = shiftResult w s d (dword m.in1Lo m.in1Hi) (m.in2Lo.val % 256) :=
+  (hg h1 h2 h3 h4).2.2.1 w s d hw hs hd hf
+
+theorem Guarantees.and (hf : m.flags.val = opselAND) :
+    m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = dword m.in1Lo m.in1Hi &&& dword m.in2Lo m.in2Hi :=
+  (hg h1 h2 h3 h4).2.2.2.1 hf
+
+theorem Guarantees.or (hf : m.flags.val = opselOR) :
+    m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = dword m.in1Lo m.in1Hi ||| dword m.in2Lo m.in2Hi :=
+  (hg h1 h2 h3 h4).2.2.2.2.1 hf
+
+theorem Guarantees.xor (hf : m.flags.val = opselXOR) :
+    m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = dword m.in1Lo m.in1Hi ^^^ dword m.in2Lo m.in2Hi :=
+  (hg h1 h2 h3 h4).2.2.2.2.2.1 hf
+
+theorem Guarantees.mul {ls rs h : ℕ} (hls : ls < 2) (hrs : rs < 2) (hh : h < 2)
+    (hf : m.flags.val = opselMUL + 32 * ls + 64 * rs + 128 * h) :
+    m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = mulResult ls rs h (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) :=
+  (hg h1 h2 h3 h4).2.2.2.2.2.2.1 ls rs h hls hrs hh hf
+
+theorem Guarantees.divrem {s rm : ℕ} (hs : s < 2) (hrm : rm < 2)
+    (hf : m.flags.val = opselDIVREM + 32 * s + 128 * rm) :
+    m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi
+        = divremResult s rm (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) :=
+  (hg h1 h2 h3 h4).2.2.2.2.2.2.2 s rm hs hrm hf
+
+end Read
+
+end Clauses
+
 def channel : Channel (F p) Msg where
   name := "ALU"
   Guarantees m _ := Guarantees m

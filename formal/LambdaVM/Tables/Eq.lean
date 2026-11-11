@@ -72,7 +72,8 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   -- μ : Bit (no deduplication)
   isBit r.mu
   -- output: ALU[a, b, opsel(EQ) + 64·invert] -> [res, 0]
-  Alu.channel.emitUpTo muMax r.mu ⟨r.a0, r.a1, r.b0, r.b1, 3 + 64 * r.invert, r.res, 0⟩
+  Alu.channel.emitUpTo muMax r.mu
+    ⟨r.a0, r.a1, r.b0, r.b1, (opselEQ : F p) + 64 * r.invert, r.res, 0⟩
 
 /-- An active row, as `generate_eq_trace` fills one per operation.
 
@@ -124,7 +125,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
 
   soundness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, dword, Alu.channel,
-      Alu.Guarantees, Bitwise.isHalfTable, Bitwise.zeroTable]
+      Bitwise.isHalfTable, Bitwise.zeroTable]
     obtain ⟨h_d0, h_d1, h_d2, h_d3, h_i, h_c0, h_c1, h_z, h_res, h_mu⟩ := h_holds
     rcases mul_one_sub_eq_zero_iff.mp h_mu with h0 | h1
     · subst h0; simp
@@ -179,30 +180,13 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     -- the five counted pulls owe `μ = 0 ∨ CountUpTo muMax μ`, and μ is 1 on an active row
     refine ⟨fun _ => key, Or.inr countUpTo_one, Or.inr countUpTo_one, Or.inr countUpTo_one,
       Or.inr countUpTo_one, Or.inr countUpTo_one, ?_⟩
-    intro _ ha0 ha1 hb0 hb1
+    -- the push: the EQ clause of the bus, which `Guarantees.of_eq` turns into all of them
+    intro _
+    refine Alu.Guarantees.of_eq hi_2 ?_ fun ha0 ha1 hb0 hb1 => ⟨rfl, key ha0 ha1 hb0 hb1⟩
     -- the flag byte, read as a natural
-    have hflagsV : (3 + 64 * input_invert : F p).val = 3 + 64 * input_invert.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    refine ⟨?_, ?_, ?_,
-      -- nor the three BYTEWISE clauses: opsel(AND | OR | XOR) is below opsel(EQ)
-      fun hflags => by exfalso; rw [hflagsV] at hflags; simp only [opselAND] at hflags; omega,
-      fun hflags => by exfalso; rw [hflagsV] at hflags; simp only [opselOR] at hflags; omega,
-      fun hflags => by exfalso; rw [hflagsV] at hflags; simp only [opselXOR] at hflags; omega,
-      -- nor MUL: 7 (mod 32) against opsel(EQ) + 64·i ≡ 3
-      fun ls rs hg hls hrs hhg hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselMUL = 7 := rfl; omega,
-      fun s rm hs hrm hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselDIVREM = 8 := rfl; omega⟩
-    · -- the LT clause does not apply: opsel(EQ) + 64·i ≠ opsel(LT) + 32·s + 64·i'
-      intro s i hs hi hflags
-      exfalso; rw [hflagsV] at hflags; simp only [opselLT] at hflags; omega
-    swap
-    · -- nor the SHIFT clause
-      intro w s d hw hs hd hflags
-      exfalso; rw [hflagsV] at hflags; simp only [opselSHIFT] at hflags; omega
-    intro i hi hflags
-    rw [hflagsV] at hflags; simp only [opselEQ] at hflags
-    rw [key ha0 ha1 hb0 hb1, show input_invert.val = i by omega]
+    exact val_eq_of_eq_natCast
+      (by simp only [opselEQ]; push_cast; simp only [ZMod.natCast_zmod_val])
+      (by simp only [opselEQ]; omega)
 
   ProverAssumptions r _ _ := Honest r ∨ Padding r
 
