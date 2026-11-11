@@ -13,6 +13,12 @@ ecsm = { path = "../crypto/ecsm" }
 # `compute_hint` runs in every proving execution of a hint-using guest.
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "expose-field"] }
 
+# The fast engine's flat guest memory maps its regions anonymously (lazily
+# zeroed, unmapped on drop) rather than through the global allocator, which
+# could hand back a reused range it would then have to zero in full.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 proptest = "1.9"
 # Test-only: the guest-side syscall crate re-declares the `hint` selectors as `usize`

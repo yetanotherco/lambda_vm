@@ -4,6 +4,7 @@ pub mod dma_tests;
 pub mod ecrec_tests;
 pub mod ecsm_tests;
 pub mod exec_paths_tests;
+pub mod fast_engine_tests;
 pub mod flamegraph_tests;
 pub mod hint_tests;
 pub mod keccak_tests;

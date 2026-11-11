@@ -598,6 +598,7 @@ dependencies = [
  "ecsm",
  "k256",
  "lambda-vm-syscalls",
+ "libc",
  "proptest",
  "rustc-demangle",
  "serde",
