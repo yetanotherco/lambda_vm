@@ -366,7 +366,8 @@ fn walked_from_history(
 }
 
 /// ★ Walked from the executor's history on 1, 2 and 3 threads, at window
-/// lengths 1, 7 and 33, rechecking every window or none, the windows build
+/// lengths 1, 7, 33 and 4096 (a run in one window: the finish's state from
+/// the run's end alone), checked or not, the windows build
 /// the whole-run tables.
 #[test]
 fn windows_walked_from_history_build_the_whole_run_tables() {
@@ -374,7 +375,7 @@ fn windows_walked_from_history_build_the_whole_run_tables() {
     for name in PROGRAMS {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
-        for window in [1, 7, 33] {
+        for window in [1, 7, 33, 4096] {
             for (walkers, recheck) in [(1, 0), (2, 1), (3, 0), (3, 2)] {
                 let traces = walked_from_history(
                     &program,
