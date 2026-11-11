@@ -11,10 +11,12 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
 
 - `LambdaVM/Field.lean` — Goldilocks as the base field (`F p`), with the size
   facts Clean's gadgets ask for. Primality comes from CompPoly's Pratt certificate.
-- `LambdaVM/Templates/` — the constraint templates of the spec as helpers the
-  chips call (`isBit`, `isByte`, `areBytes`, `add`, `sub`), each with a
-  `FormalAssertion` whose `Spec` is the template's meaning taken from its
-  `spec/*.typ` page: `IsBit.circuit`, `IsByteCheck.circuit`, `Add.circuit`.
+- `LambdaVM/Templates/` — the constraint templates of the spec as helpers
+  (`isBit`, `isByte`, `areBytes`, `add`, `sub`), each with a `FormalAssertion`
+  whose `Spec` is the template's meaning taken from `spec/src/*.toml`:
+  `IsBit.circuit`, `IsByteCheck.circuit`, `AreBytesCheck.circuit`, `Add.circuit`.
+  The chips call `isBit`, `add` and `sub`; no chip calls `isByte` or `areBytes`
+  yet (SHIFT pulls `ARE_BYTES` directly).
 - `LambdaVM/AluOp.lean` — the `alu_op` descriptors of `types.rs`, one enumeration
   for the `opsel` of BYTE_ALU and the low bits of the ALU flag byte.
 - `LambdaVM/StaticLookup.lean` — `StaticLookupChannel`: a table the verifier
@@ -31,27 +33,32 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   precomputed row function of `prover/src/tables/bitwise.rs` and defines each bus
   the table serves as a `StaticLookupChannel` (read through `toChannel`), with
   the semantic `Guarantees` proven equivalent to table membership. `Lt.lean` is
-  the LT chip: the row circuit mirrors `lt.rs` (constraints and interactions, in
-  order), `core` is the
-  arithmetic argument of `spec/lt.typ` on naturals, `Honest` is the row
+  the LT chip: the row circuit has the constraints and interactions of `lt.rs`
+  (in the spec's order, except the `μ` delta below), `core` is the
+  arithmetic argument of `spec/src/lt.toml` on naturals, `Honest` is the row
   `generate_lt_trace` produces, `RowSpec` is what an active row establishes, and
   the `GeneralFormalCircuit` proves that a row that pulls its range checks
   satisfies `RowSpec` and pushes a correct ALU result (soundness) and that an
-  honest row satisfies everything (completeness). `Eq.lean` is the EQ chip in the
+  honest row satisfies everything (completeness), for rows with `μ ∈ {0, 1}`
+  only (see "Known differences"). `Eq.lean` is the EQ chip in the
   same shape: the `sub` template, four IS_HALF pulls, a ZERO pull on the sum of
-  the halves, `res = eq xor invert`; its `μ` is a bit, as in the spec and `eq.rs`.
+  the halves, `res = eq xor invert`; its `μ` is a bit, as in the spec and `eq.rs`. Completeness covers
+  the honest row and the all-zero padding row.
 
 - `LambdaVM/Ensembles/` — tables wired together through their channels.
   `EqLookup.lean` is the first one: `pushStatic` is the provider side of any
   static lookup channel (its row is the vector of multiplicities, the role of
   the `μ` columns of BITWISE), and `eqLookup` chains the IS_HALF provider, the
-  ZERO provider and the EQ chip in dependency order. `eq_rows_correct` is the
-  first global theorem: for any witness whose constraints hold and whose
-  channels balance, every EQ row with `μ = 1` and range-checked operands
-  carries the equality bit. The lookup argument is what turns the pulled range
-  checks into facts.
+  ZERO provider and the EQ chip in dependency order. `eq_rows_correct` states
+  that, for any witness whose constraints hold and whose channels balance,
+  every EQ row with `μ = 1` and range-checked operands carries the equality
+  bit. The ensemble has no ALU consumer yet (the CPU is not modelled), so
+  balance on the ALU channel forces `μ = 0` on every EQ row and the theorem is
+  trivially true. What it shows today is that IS_HALF → ZERO → EQ compose under
+  Clean's ordered-channel soundness; it says something about active rows once a
+  component pulls from ALU.
 - `LambdaVM/Tables/ShiftCore.lean` and `Shift.lean` — the SHIFT chip. `ShiftCore`
-  is the two-phase shift argument of `spec/shift.typ` on naturals (HWSL
+  is the two-phase shift argument of `spec/src/shift.toml` on naturals (HWSL
   per limb, then whole limbs, left and right, logical and arithmetic), ending in
   `ShiftCore.main`, which takes exactly the facts the row gives (decoded
   `bit_shift`, one-hot `limb_shift`, sign bit, HWSL outputs or their `zbs`
@@ -81,7 +88,10 @@ that they are the same polynomials and the same bus interactions is mechanical:
 1. `lake env lean --run LambdaVM/Export.lean` writes `export/{lt,eq,shift}.json`:
    every `assert` as an expression tree and every `interact` with its channel,
    direction, multiplicity and message, variables numbered in Rust column order.
-   Multiplicities are nonnegative; the direction carries the sign.
+   Multiplicities are nonnegative; the direction carries the sign. It also writes
+   `export/bitwise.json`, a sample of the BITWISE table (every `z` with edge
+   bytes, the last row, 256 pseudo-random rows): the precomputed columns of each
+   row and the message every static lookup channel serves there.
 2. `prover/src/tests/lean_diff.rs` is the prover test that reads them:
    `cargo test -p lambda-vm-prover lean_diff -- --nocapture`.
 
@@ -92,12 +102,9 @@ that every Lean constraint vanishes on honest traces from `generate_*_trace`,
 padding rows included; the Lean-only constraints of the documented deltas are
 skipped there. The sign of an interaction comes from its direction: a Rust
 sender is Clean's pull and counts `−m`, a receiver is Clean's push and counts
-`+m`.
-
-BITWISE is not exported or diff-checked: `Bitwise.lean` is the precomputed
-table and its buses as static lookup channels, not a row circuit, so it has no
-asserts or interacts to compare. Its row function is a hand transcription of
-`generate_bitwise_row` and is not mechanically checked against it.
+`+m`. For BITWISE the test compares the sampled rows with `generate_bitwise_row`
+and each channel's messages with the receivers of `bitwise::bus_interactions()`
+on the same bus.
 
 The models follow the multiplicity constraints of PR #1016, merged 2026-10-23.
 Result on `main` after that merge, 2026-10-28:
@@ -105,7 +112,10 @@ Result on `main` after that merge, 2026-10-28:
 - EQ: 5 constraints and 6 interactions, exact match.
 - SHIFT: 22 constraints and 17 interactions, exact match.
 - LT: exact match except the two documented deltas: `μ·(1 − μ) = 0` exists
-  only in Lean, `ARE_BYTES[μ, 0]` exists only in Rust.
+  only in Lean, `ARE_BYTES[μ, 0]` with multiplicity one exists only in Rust.
+  The test pins both by content, and its trace has deduplicated rows (`μ ≥ 2`),
+  where the Lean-only constraint fails as expected.
+- BITWISE: 657 sampled rows and 8 channels (10 Rust receivers), exact match.
 
 The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
 `μ·(1 − μ)` in EQ, which is why the Lean bit constraints use the spec's form.
@@ -132,7 +142,9 @@ multiplicity is a requirement the row cannot meet.
   the ensemble is checked against, and reaches soundness as the
   `InteractionsFit` premise of `TableSoundness`. For `Balance.logUp`, `fits` is
   `count < char F`.
-- `not_consistent` proves the premise cannot be weakened: for `2 ≤ N ≤ 255`
+- `not_consistent` shows that Clean's `BalancedInteractions` is too weak a
+  premise for a counted channel (the field-sum premise of `consistent` cannot be
+  replaced by it): for `2 ≤ N ≤ 255`
   over Goldilocks, one pull of `N` and one pull of `1` on a message outside the
   table satisfy `BalancedInteractions` — Clean counts the pull of `N` as a push
   of the message, so the pull of `1` is matched — while the counted channel
@@ -165,7 +177,9 @@ Until then LT keeps `μ ∈ {0, 1}` (see below).
   model keeps `μ` a bit. Every chip whose `μ` the spec types as `Byte` (MUL,
   DVRM, BRANCH, BYTEWISE) will need the same treatment.
 - The `spec/` copy in this repository lags the `spec/main` branch; the spec the
-  models follow is the branch (EQ's `μ` is `Bit` with `IS_BIT[μ]` there).
+  models follow is that branch at `2eaf1f080` (EQ's `μ` is `Bit` with
+  `IS_BIT[μ]` there). Constraints are cited from `spec/src/*.toml`, which the
+  `.typ` pages render.
 
 ## Building
 

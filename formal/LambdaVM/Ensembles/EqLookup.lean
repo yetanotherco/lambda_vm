@@ -11,7 +11,13 @@ public import Clean.Air.OrderedChannel
 Three components and three channels, in dependency order: the provider of `IS_HALF`, the
 provider of `ZERO`, the EQ chip. Every channel is finished before the next table that pulls
 from it, so Clean's ordered-channel soundness applies: in any witness whose constraints hold
-and whose channels balance, every EQ row with `μ = 1` computes the equality bit.
+and whose channels balance, every EQ row with `μ = 1` and range-checked operands computes the
+equality bit.
+
+BITWISE is idealized by `pushStatic`: one provider row whose columns are the multiplicities of
+every table entry. Nothing pulls from ALU yet (the CPU is not modelled), so balance on the ALU
+channel forces `μ = 0` on every EQ row and `eq_rows_correct` is trivially true. Today it shows
+that the chain composes; it constrains active rows once a component pulls from ALU.
 -/
 
 namespace LambdaVM.Ensembles
@@ -115,7 +121,8 @@ def eqLookup (balance : Balance (F p)) : SoundEnsemble (F p) unit balance :=
 
 /-- Lookup soundness, concretely: if the constraints of every table hold, every channel has few
 enough interactions for the balance check, and every channel balances, then every EQ row with
-`μ = 1` and range-checked operands carries the equality bit. -/
+`μ = 1` and range-checked operands carries the equality bit. Without an ALU consumer in the
+ensemble no such row exists (see the module header), so the statement is trivially true for now. -/
 theorem eq_rows_correct {balance : Balance (F p)}
     (witness : EnsembleWitness (eqLookup balance).ensemble)
     (hc : witness.Constraints) (hfit : witness.InteractionsFit balance)

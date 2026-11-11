@@ -6,7 +6,7 @@ public import Clean.Gadgets.Boolean
 @[expose] public section
 
 /-!
-# IS_BIT (spec/is_bit.typ)
+# IS_BIT (spec/src/is_bit.toml)
 
 Constraint template: when `cond ≠ 0`, `X` must lie in `{0, 1}`.
 Single constraint: `cond · X · (1 − X) = 0`. Chips use the unconditional form `isBit`

@@ -9,7 +9,7 @@ public import Mathlib.Tactic.LinearCombination
 @[expose] public section
 
 /-!
-# EQ (spec/eq.typ)
+# EQ (spec/src/eq.toml)
 
 One row per equality test `res = (a = b) xor invert`. Columns follow `prover/src/tables/eq.rs`:
 `a`, `b` as `DWordWL` (two words), `diff = a − b` as four halves, the `eq` bit, `res`, `μ`.
@@ -85,6 +85,11 @@ def Honest (r : Row (F p)) : Prop :=
     = dword r.a0 r.a1 ∧
   r.eq.val = (if dword r.a0 r.a1 = dword r.b0 r.b1 then 1 else 0) ∧
   r.res.val = eqBit r.invert.val (dword r.a0 r.a1) (dword r.b0 r.b1)
+
+/-- A padding row of `generate_eq_trace`: every column zero. -/
+def Padding (r : Row (F p)) : Prop :=
+  r.a0 = 0 ∧ r.a1 = 0 ∧ r.b0 = 0 ∧ r.b1 = 0 ∧ r.invert = 0 ∧ r.res = 0 ∧
+  r.diff0 = 0 ∧ r.diff1 = 0 ∧ r.diff2 = 0 ∧ r.diff3 = 0 ∧ r.eq = 0 ∧ r.mu = 0
 
 /-- What an active row establishes: with range-checked operands, `res` is the equality bit. -/
 def RowSpec (r : Row (F p)) : Prop :=
@@ -177,13 +182,18 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     rw [hflagsV] at hflags; simp only [opselEQ] at hflags
     rw [key ha0 ha1 hb0 hb1, show input_invert.val = i by omega]
 
-  ProverAssumptions r _ _ := Honest r
+  ProverAssumptions r _ _ := Honest r ∨ Padding r
 
   completeness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel, Alu.Guarantees,
-      Bitwise.isHalfTable, Bitwise.zeroTable, Honest, dword]
-    obtain ⟨hmu, hib, ha0, ha1, hb0, hb1, hd0, hd1, hd2, hd3, hsum, heq, hres⟩ := h_assumptions
-    -- the halves of diff as words
+      Bitwise.isHalfTable, Bitwise.zeroTable, Honest, Padding, dword]
+    rcases h_assumptions with ⟨hmu, hib, ha0, ha1, hb0, hb1, hd0, hd1, hd2, hd3, hsum, heq, hres⟩ |
+      ⟨ha0, ha1, hb0, hb1, hi, hr, hd0, hd1, hd2, hd3, he, hmu⟩
+    swap
+    · -- a padding row: μ = 0 switches off every pull and the push
+      subst ha0 ha1 hb0 hb1 hi hr hd0 hd1 hd2 hd3 he hmu
+      simp [circuit_norm]
+    -- an active row; the halves of diff as words
     have hval_lo : (input_diff0 + 65536 * input_diff1).val
         = input_diff0.val + 65536 * input_diff1.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)

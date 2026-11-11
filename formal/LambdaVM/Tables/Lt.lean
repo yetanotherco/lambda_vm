@@ -9,7 +9,7 @@ public import Mathlib.Tactic.LinearCombination
 @[expose] public section
 
 /-!
-# LT (spec/lt.typ)
+# LT (spec/src/lt.toml)
 
 One row per `(lhs, rhs, signed, invert)` comparison. Columns follow `prover/src/tables/lt.rs`:
 `lhs`/`rhs` as `DWordHHW` limbs (word, half, half), `lhs_sub_rhs` as four halves, the two
@@ -145,7 +145,8 @@ lemma res_constraint {lt invert res : F p} {ltv iv : ℕ}
   rcases (by omega : ltv = 0 ∨ ltv = 1) with rfl | rfl <;>
   rcases (by omega : iv = 0 ∨ iv = 1) with rfl | rfl <;> norm_num
 
-/-- The honest prover's row, as `generate_lt_trace` fills it. -/
+/-- The honest prover's row, as `generate_lt_trace` fills it when no operation repeats
+(`μ ∈ {0, 1}`); a deduplicated row with `μ ≥ 2` is outside this model (see README). -/
 def Honest (r : Row (F p)) : Prop :=
   IsBool r.mu ∧ IsBool r.signed ∧ IsBool r.invert ∧
   r.lhs0.val < 2^32 ∧ r.lhs1.val < 2^16 ∧ r.lhs2.val < 2^16 ∧

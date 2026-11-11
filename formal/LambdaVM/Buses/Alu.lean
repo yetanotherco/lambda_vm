@@ -56,7 +56,7 @@ def eqBit (invert A B : ℕ) : ℕ :=
 def sra64 (x k : ℕ) : ℕ :=
   if x < 2^63 then x >>> k else ((x + (2^128 - 2^64)) >>> k) % 2^64
 
-/-- `SHIFT` result (spec/shift.typ): the shift amount is reduced mod 32 for word instructions
+/-- `SHIFT` result (spec/src/shift.toml): the shift amount is reduced mod 32 for word instructions
 and mod 64 otherwise; `direction` picks left (0) or right (1); `signed` picks the arithmetic
 right shift. Word results are not sign-extended here (the CPU does that). -/
 def shiftResult (word signed direction x s : ℕ) : ℕ :=
@@ -70,15 +70,15 @@ def shiftResult (word signed direction x s : ℕ) : ℕ :=
 as a natural. -/
 def Guarantees (m : Msg (F p)) : Prop :=
   m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
-    -- LT (spec/lt.typ): flags = opsel(LT) + 32·signed + 64·invert, out = [res, 0]
+    -- LT (spec/src/lt.toml): flags = opsel(LT) + 32·signed + 64·invert, out = [res, 0]
     (∀ s i : ℕ, s < 2 → i < 2 → m.flags.val = opselLT + 32 * s + 64 * i →
       m.outHi = 0 ∧
       m.outLo = ((ltBit s i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p)) ∧
-    -- EQ (spec/eq.typ): flags = opsel(EQ) + 64·invert, out = [res, 0]
+    -- EQ (spec/src/eq.toml): flags = opsel(EQ) + 64·invert, out = [res, 0]
     (∀ i : ℕ, i < 2 → m.flags.val = opselEQ + 64 * i →
       m.outHi = 0 ∧
       m.outLo = ((eqBit i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p)) ∧
-    -- SHIFT (spec/shift.typ): flags = opsel(SHIFT) + word_instr + 32·signed + 64·direction,
+    -- SHIFT (spec/src/shift.toml): flags = opsel(SHIFT) + word_instr + 32·signed + 64·direction,
     -- only the low byte of the shift amount matters
     (∀ w s d : ℕ, w < 2 → s < 2 → d < 2 →
       m.flags.val = opselSHIFT + w + 32 * s + 64 * d →

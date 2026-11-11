@@ -7,7 +7,7 @@ public import LambdaVM.StaticLookup
 @[expose] public section
 
 /-!
-# BITWISE (spec/bitwise.typ)
+# BITWISE (spec/src/bitwise.toml)
 
 Preprocessed table with one row per `(X, Y, Z) ∈ Byte × Byte × B4`, indexed by
 `i = X + 2^8·Y + 2^16·Z`, exactly as `generate_bitwise_row` in `prover/src/tables/bitwise.rs`.

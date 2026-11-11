@@ -9,7 +9,7 @@ public import Mathlib.Tactic.LinearCombination
 @[expose] public section
 
 /-!
-# SHIFT (spec/shift.typ)
+# SHIFT (spec/src/shift.toml)
 
 One row per shift. Columns follow `prover/src/tables/shift.rs`: `in` as four halves, the low
 byte of the shift amount plus its upper limbs for the ALU bus, the three flags, `out` as two

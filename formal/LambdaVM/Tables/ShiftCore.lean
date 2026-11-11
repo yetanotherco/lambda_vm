@@ -8,7 +8,7 @@ public import LambdaVM.Tables.Bitwise
 /-!
 # The arithmetic of the SHIFT chip, on naturals
 
-`spec/shift.typ` shifts in two phases: by `bit_shift < 16` bits inside each 16-bit limb using
+`spec/src/shift.toml` shifts in two phases: by `bit_shift < 16` bits inside each 16-bit limb using
 the `HWSL` lookup, then by whole limbs using the one-hot `limb_shift`. These lemmas prove that
 the limb recombination the chip constrains equals the shift of the 64-bit value.
 -/
@@ -17,8 +17,7 @@ namespace LambdaVM.ShiftCore
 open Alu (shiftResult sra64)
 open Bitwise (sll sllc)
 
-/-- `HWSL` as in BITWISE: `(h << z) mod 2^16` and `h >> (16 − z)`, with the `z = 0` convention. -/
-
+/-- The 64-bit value of four 16-bit limbs. -/
 def limbs (a0 a1 a2 a3 : ℕ) : ℕ := a0 + 65536 * a1 + 2^32 * a2 + 2^48 * a3
 
 theorem and15 (s : ℕ) : s &&& 15 = s % 16 := by

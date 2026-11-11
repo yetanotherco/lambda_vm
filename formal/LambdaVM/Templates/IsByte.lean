@@ -6,13 +6,13 @@ public import LambdaVM.Templates.IsBit
 @[expose] public section
 
 /-!
-# IS_BYTE / ARE_BYTES (spec/is_byte.typ)
+# IS_BYTE / ARE_BYTES (spec/src/is_byte.toml)
 
 `IS_BYTE<cond, X>` is one interaction `ARE_BYTES[0, X]` with multiplicity `cond`;
 `ARE_BYTES<X, Y>` is the unconditional two-byte form (the CPU sends it on every row).
-Both are macros expanded inline in the chips that use them: `cond` is a flag that the chip
-itself constrains to be boolean, and a conditional interaction needs that constraint in the
-same circuit to be lawful.
+Both are helpers a chip expands inline: `cond` is a flag that the chip itself constrains to be
+boolean, and a conditional interaction needs that constraint in the same circuit to be lawful.
+No chip of this model calls them yet: SHIFT pulls `ARE_BYTES` directly.
 -/
 
 namespace LambdaVM
