@@ -541,16 +541,11 @@ impl RegUse {
 
 /// The register cells after a cycle, by the walk's rules: `r1` read at `ts`,
 /// `r2` at `ts + 1`, `rd` written at `ts + 2`, the pc at `ts + 1` (an ECALL's
-/// next pc is the one after it, a halt's included); then an ECALL's own,
-/// whose cells before the call go to `ecall_cells`. Returns the old
+/// next pc is the one after it, a halt's included). An ECALL's own register
+/// accesses come after these ([`History::ecall_registers`]). Returns the old
 /// timestamps of the `r1`, `r2` and `rd` accesses (0 for none).
-pub fn step_registers(
-    cells: &mut RegisterCells,
-    uses: RegUse,
-    log: &Log,
-    ts: u64,
-    ecall_cells: &mut Vec<RegAccess>,
-) -> [u32; 3] {
+#[inline(always)]
+pub fn step_registers(cells: &mut RegisterCells, uses: RegUse, log: &Log, ts: u64) -> [u32; 3] {
     let mut old = [0u32; 3];
     if uses.r1 == 255 {
         old[0] = cells.pc.1 as u32;
@@ -573,9 +568,6 @@ pub fn step_registers(
         log.next_pc
     };
     cells.pc = (next, ts + 1);
-    if uses.ecall {
-        ecall_registers(cells, log, ts, ecall_cells);
-    }
     old
 }
 
@@ -888,6 +880,23 @@ impl History {
             side: group,
             ..HistExtra::default()
         }
+    }
+
+    /// An ECALL's register accesses after [`step_registers`]: its chip's
+    /// cells before them go to the window's `reg_cells` as one group, whose
+    /// index it returns ([`NO_ACCESS`] for none).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn ecall_registers(&mut self, log: &Log, ts: u64) -> u32 {
+        let w = &mut self.window;
+        let first = w.reg_cells.len() as u32;
+        ecall_registers(&mut self.cells, log, ts, &mut w.reg_cells);
+        let count = w.reg_cells.len() as u32 - first;
+        if count == 0 {
+            return NO_ACCESS;
+        }
+        w.reg_groups.push(SideGroup { first, count });
+        w.reg_groups.len() as u32 - 1
     }
 
     /// An ECALL's stamps, in the walk's order, from the register cells

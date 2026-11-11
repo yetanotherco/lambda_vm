@@ -22,7 +22,7 @@ use super::{
     flat_memory::{FlatLayout, FlatMemory},
     history::{
         HISTORY_MAX_CYCLES, HistExtra, History, HistoryFinal, NO_ACCESS, RegUse, RegisterCells,
-        SideGroup, WindowHistory, cycle_timestamp, step_registers,
+        WindowHistory, cycle_timestamp, step_registers,
     },
     instruction::execution::{BLAKE3_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER},
     instruction::{
@@ -539,24 +539,12 @@ impl FastExecutor {
             if let Some(before) = &cells_before {
                 history.after_ecall(&log, before, ts);
             }
-            let first_reg = history.window.reg_cells.len() as u32;
             let mut extra = extra;
-            extra.regs_ts = step_registers(
-                &mut history.cells,
-                uses,
-                &log,
-                ts,
-                &mut history.window.reg_cells,
-            );
-            let count = history.window.reg_cells.len() as u32 - first_reg;
-            extra.reg_side = if count == 0 {
-                NO_ACCESS
+            extra.regs_ts = step_registers(&mut history.cells, uses, &log, ts);
+            extra.reg_side = if uses.ecall {
+                history.ecall_registers(&log, ts)
             } else {
-                history.window.reg_groups.push(SideGroup {
-                    first: first_reg,
-                    count,
-                });
-                history.window.reg_groups.len() as u32 - 1
+                NO_ACCESS
             };
             history.window.extras.push(extra);
             pc = log.next_pc;
