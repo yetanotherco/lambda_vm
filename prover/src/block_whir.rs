@@ -2015,6 +2015,51 @@ fn parse_exec_recycle_logs(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
+/// `LAMBDA_VM_EXEC_HISTORY=1`: record mode. The fast engine keeps the walk's
+/// access history and writes it beside each window's logs; the walkers read
+/// it instead of a lean pass's entries, the executor's window-start snapshots
+/// and window states ([`parallel::walk_windows_from_history`]). Needs the
+/// fast engine (`LAMBDA_VM_EXEC_ENGINE=fast`) and walkers. Unset, empty or
+/// `0`: off. Anything else refuses the prove. The tables are the same.
+pub(crate) fn exec_history() -> Result<bool, Error> {
+    parse_exec_history(std::env::var("LAMBDA_VM_EXEC_HISTORY").ok().as_deref())
+}
+
+/// [`exec_history`]'s reading of its variable.
+fn parse_exec_history(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_EXEC_HISTORY={v}: 1 (the walkers read the executor's history) or 0"
+        ))),
+    }
+}
+
+/// `LAMBDA_VM_EXEC_HISTORY_CHECK=N`: in record mode, every `N`-th window is
+/// walked again from the start cells its history gives and must emit the
+/// same lists (`1`: every window, with the boundary sums). Unset, empty or
+/// `0`: none. Anything else refuses the prove.
+pub(crate) fn exec_history_check() -> Result<usize, Error> {
+    parse_exec_history_check(
+        std::env::var("LAMBDA_VM_EXEC_HISTORY_CHECK")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`exec_history_check`]'s reading of its variable.
+fn parse_exec_history_check(value: Option<&str>) -> Result<usize, Error> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(0),
+        Some(v) => v.parse().map_err(|_| {
+            Error::Prover(format!(
+                "LAMBDA_VM_EXEC_HISTORY_CHECK={v}: a window count (0: no re-walk)"
+            ))
+        }),
+    }
+}
+
 /// The streamed build's executor thread, its own work apart from its waits
 /// ([`BlockStamps::executor`]); with `send` ([`ProducerStamps::executor_send`])
 /// they add up to the thread's span. A measurement; it changes nothing.
@@ -5855,6 +5900,23 @@ fn prove_streamed(
             card_fill.name(),
             admission.err().unwrap_or("while the host has room")
         );
+        // Record mode: the fast engine writes the walk's history, the walkers
+        // read it.
+        let history = exec_history()?;
+        let history_check = exec_history_check()?;
+        if history {
+            if EngineKind::from_env().map_err(Error::Execution)? != EngineKind::Fast {
+                return Err(Error::Prover(
+                    "LAMBDA_VM_EXEC_HISTORY=1 needs the fast engine (LAMBDA_VM_EXEC_ENGINE=fast)"
+                        .into(),
+                ));
+            }
+            if walkers == 0 {
+                return Err(Error::Prover(
+                    "LAMBDA_VM_EXEC_HISTORY=1 needs walkers (LAMBDA_VM_BLOCK_WALKERS)".into(),
+                ));
+            }
+        }
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk;
@@ -5862,10 +5924,7 @@ fn prove_streamed(
             // The logs shared, so that with `LAMBDA_VM_EXEC_RECYCLE_LOGS`
             // the executor can take a window's buffer back once every other
             // holder has let it go.
-            let (ltx, lrx) = std::sync::mpsc::sync_channel::<(
-                std::sync::Arc<Vec<executor::vm::logs::Log>>,
-                Option<executor::vm::memory::MemorySnapshot>,
-            )>(2);
+            let (ltx, lrx) = std::sync::mpsc::sync_channel::<parallel::ExecWindow>(2);
             let executor = scope.spawn(move || -> Result<(f64, ExecutorStamps), Error> {
                 if let Some(ledger) = ledger {
                     ledger.thread("executor");
@@ -5891,18 +5950,28 @@ fn prove_streamed(
                     .map(|every| ShadowCheck::new(program, every))
                     .transpose()
                     .map_err(failed)?;
+                if history {
+                    executor.enable_history().map_err(failed)?;
+                }
                 // The windows sent, while someone downstream still holds them.
                 let mut sent: Option<std::collections::VecDeque<std::sync::Arc<Vec<_>>>> =
                     exec_recycle_logs()?.then(Default::default);
                 let mut recycled = 0usize;
                 own.setup = t.elapsed().as_secs_f64();
                 eprintln!(
-                    "BLOCK EXECUTOR ENGINE: {} · shadow check {} · log buffers {}",
+                    "BLOCK EXECUTOR ENGINE: {} · shadow check {} · log buffers {} · history {}",
                     kind.name(),
                     shadow_every.map_or("off".to_string(), |n| format!("every {n} windows")),
                     if sent.is_some() { "recycled" } else { "fresh" },
+                    if history {
+                        format!("written (re-walk every {history_check} windows, 0 none)")
+                    } else {
+                        "off".to_string()
+                    },
                 );
-                let mut at_start = (walkers > 0).then(|| executor.snapshot());
+                // Window-start snapshots for the walkers; none in record mode.
+                let snapshots = walkers > 0 && !history;
+                let mut at_start = snapshots.then(|| executor.snapshot());
                 let mut cycles = 0u64;
                 loop {
                     let t = Instant::now();
@@ -5943,12 +6012,15 @@ fn prove_streamed(
                         _ => None,
                     };
                     // `ran`: the window executed.
-                    let (logs, ran) = (
-                        executor.resume_owned(window).map_err(failed)?,
-                        Instant::now(),
-                    );
+                    let (logs, ran) = if history {
+                        let window = executor.resume_history(window).map_err(failed)?;
+                        (window.map(|(logs, h)| (logs, Some(h))), Instant::now())
+                    } else {
+                        let logs = executor.resume_owned(window).map_err(failed)?;
+                        (logs.map(|logs| (logs, None)), Instant::now())
+                    };
                     own.run += (ran - t).as_secs_f64();
-                    let Some(logs) = logs else {
+                    let Some((logs, window_history)) = logs else {
                         break;
                     };
                     cycles += logs.len() as u64;
@@ -5960,8 +6032,12 @@ fn prove_streamed(
                             return Err(Error::Execution(mismatch));
                         }
                     }
-                    let next = (walkers > 0).then(|| executor.snapshot());
+                    let next = snapshots.then(|| executor.snapshot());
                     let start = std::mem::replace(&mut at_start, next);
+                    // Record mode's last window carries the run's end.
+                    let end = (history && executor.pc() == 0)
+                        .then(|| executor.take_history_final())
+                        .flatten();
                     let logs = std::sync::Arc::new(logs);
                     if let Some(sent) = &mut sent {
                         sent.push_back(std::sync::Arc::clone(&logs));
@@ -5977,7 +6053,13 @@ fn prove_streamed(
                             .store(executor.heap_bytes() + bytes, Relaxed);
                     }
                     let t = Instant::now();
-                    if ltx.send((logs, start)).is_err() {
+                    let sent_window = parallel::ExecWindow {
+                        logs,
+                        start,
+                        history: window_history.map(Box::new),
+                        last: end.map(Box::new),
+                    };
+                    if ltx.send(sent_window).is_err() {
                         break;
                     }
                     ProducerWaits::add(&waits.executor_send, t);
@@ -6093,10 +6175,11 @@ fn prove_streamed(
                     // the walk's start to the first window, then between
                     // windows (the `accumulator recv-wait` term).
                     let mut idle_from = Instant::now();
-                    let report = parallel::walk_windows(
+                    let report = parallel::walk_windows_with(
                         &mut builder,
                         lrx,
                         walkers,
+                        history.then_some(history_check),
                         |accumulator, walked, states| {
                             ProducerWaits::add(&waits.accumulator_recv, idle_from);
                             // The walked windows wait in the walk's reorder
@@ -6162,7 +6245,7 @@ fn prove_streamed(
                                 None;
                             loop {
                                 let t = Instant::now();
-                                let Ok((logs, _)) = lrx.recv() else {
+                                let Ok(parallel::ExecWindow { logs, .. }) = lrx.recv() else {
                                     break;
                                 };
                                 ProducerWaits::add(&waits.walker_recv, t);
@@ -8768,11 +8851,23 @@ mod rest_order_tests {
 
 #[cfg(test)]
 mod producer_report_tests {
-    use super::parse_exec_recycle_logs;
     use super::{
         BLOCK_LAYOUT_AHEAD, BLOCK_LAYOUT_WORKERS, BLOCK_WINDOW_LOG2, BlockOptions, BlockStamps,
         ExecutorStamps, ProducerStamps, StreamTable, parse_window_log2,
     };
+    use super::{parse_exec_history, parse_exec_history_check, parse_exec_recycle_logs};
+
+    /// `LAMBDA_VM_EXEC_HISTORY`: off unless `1`; its re-walk period a count.
+    #[test]
+    fn history_mode_is_off_unless_asked() {
+        assert!(!parse_exec_history(None).unwrap());
+        assert!(!parse_exec_history(Some("0")).unwrap());
+        assert!(parse_exec_history(Some("1")).unwrap());
+        assert!(parse_exec_history(Some("on")).is_err());
+        assert_eq!(parse_exec_history_check(None).unwrap(), 0);
+        assert_eq!(parse_exec_history_check(Some("16")).unwrap(), 16);
+        assert!(parse_exec_history_check(Some("often")).is_err());
+    }
 
     /// `LAMBDA_VM_EXEC_RECYCLE_LOGS`: off unless `1`; anything else refused.
     #[test]

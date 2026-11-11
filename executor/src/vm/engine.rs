@@ -5,6 +5,7 @@
 use super::{
     execution::{Executor, ExecutorError, ReturnValues},
     fast::FastExecutor,
+    history::{HistoryFinal, WindowHistory},
     logs::Log,
     memory::{GuestMemory, MemorySnapshot},
     registers::Registers,
@@ -92,6 +93,38 @@ impl Engine {
         match self {
             Self::Reference(e) => e.resume_owned(limit),
             Self::Fast(e) => e.resume_owned(limit),
+        }
+    }
+
+    /// Turns the fast engine's history mode on
+    /// ([`FastExecutor::enable_history`]); the reference has none.
+    pub fn enable_history(&mut self) -> Result<(), ExecutorError> {
+        match self {
+            Self::Reference(_) => Err(ExecutorError::History(
+                "history mode needs the fast engine".into(),
+            )),
+            Self::Fast(e) => e.enable_history(),
+        }
+    }
+
+    /// [`FastExecutor::resume_history`].
+    pub fn resume_history(
+        &mut self,
+        limit: usize,
+    ) -> Result<Option<(Vec<Log>, WindowHistory)>, ExecutorError> {
+        match self {
+            Self::Reference(_) => Err(ExecutorError::History(
+                "history mode needs the fast engine".into(),
+            )),
+            Self::Fast(e) => e.resume_history(limit),
+        }
+    }
+
+    /// [`FastExecutor::take_history_final`].
+    pub fn take_history_final(&mut self) -> Option<HistoryFinal> {
+        match self {
+            Self::Reference(_) => None,
+            Self::Fast(e) => e.take_history_final(),
         }
     }
 

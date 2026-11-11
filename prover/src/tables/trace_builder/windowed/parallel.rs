@@ -637,6 +637,7 @@ impl ParallelWalk {
 /// panics is an error. A window's logs come owned (`Vec<Log>`) or shared
 /// (`Arc<Vec<Log>>`, e.g. by an executor that takes the buffer back once
 /// the walk lets it go).
+#[cfg(test)]
 pub fn walk_windows<W: Into<ExecWindow> + Send>(
     builder: &mut WindowedTraceBuilder<'_>,
     windows: Receiver<W>,
@@ -644,6 +645,18 @@ pub fn walk_windows<W: Into<ExecWindow> + Send>(
     absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
 ) -> Result<ParallelWalk, Error> {
     walk_numbered(builder, windows, walkers, |k| k, None, absorb)
+}
+
+/// [`walk_windows`] (`record` `None`) or [`walk_windows_from_history`]
+/// (`Some(recheck)`), as a caller's setting picks.
+pub fn walk_windows_with<W: Into<ExecWindow> + Send>(
+    builder: &mut WindowedTraceBuilder<'_>,
+    windows: Receiver<W>,
+    walkers: usize,
+    record: Option<usize>,
+    absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
+) -> Result<ParallelWalk, Error> {
+    walk_numbered(builder, windows, walkers, |k| k, record, absorb)
 }
 
 /// [`walk_windows`] in record mode: each window comes with the executor's
@@ -655,6 +668,7 @@ pub fn walk_windows<W: Into<ExecWindow> + Send>(
 /// (every `recheck`-th, from the first; 0: none), which are walked again from
 /// their start cells and must emit the same lists; every window's registers
 /// are checked against the next one's.
+#[cfg(test)]
 pub fn walk_windows_from_history<W: Into<ExecWindow> + Send>(
     builder: &mut WindowedTraceBuilder<'_>,
     windows: Receiver<W>,
