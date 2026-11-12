@@ -171,6 +171,15 @@ fn configs() -> Vec<(&'static str, Configure)> {
              real row",
             Box::new(|b| cut(b, CutPadding::LastTable)),
         ),
+        (
+            "dropped, LT's memory comparisons merged",
+            Box::new(|b| b.drop_streamed_ops().expect("before any window").lt_merge()),
+        ),
+        (
+            "dropped, KECCAK_RND at the finish, cuts, packed, written packed, cut at the last \
+             real row, LT's memory comparisons merged",
+            Box::new(|b| cut(b, CutPadding::LastTable).lt_merge()),
+        ),
     ]
 }
 
@@ -1005,6 +1014,64 @@ fn with_bitwise_from_tables_phase_bs_lt_jobs_build_the_tables_again() {
         }
     }
     assert!(rebuilt > 0, "no LT table built again");
+}
+
+/// ★ The mutant on the block's path: the sliding finish builds LT's
+/// tables from merged rows ([`WindowedTraceBuilder::lt_merge`]) and counts
+/// BITWISE's lookups from each table's rows as it is built. Counted from the
+/// map's rows instead (`lt_merge_count_fault`), every table but BITWISE is the
+/// same word for word and BITWISE's is not, in some build: BITWISE then answers
+/// μ bounds no LT row sends, so the bus that balances on the honest tables
+/// (`lt_merge_tests`) cannot. The honest stream is the monolithic finish's,
+/// whose count is the collectors' (`configs`' merged rows).
+#[test]
+fn with_bitwise_from_tables_a_map_count_under_merged_tables_moves_bitwise() {
+    let max_rows = MaxRowsConfig::small();
+    let (mut moved, mut from_tables) = (0usize, 0usize);
+    for name in [
+        "all_instructions_64",
+        "misalign_sd",
+        "test_keccak_multi",
+        "test_commit_split",
+    ] {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            let honest: Configure = Box::new(|b| {
+                b.drop_streamed_ops()
+                    .expect("before any window")
+                    .lt_merge()
+                    .bitwise_from_tables()
+                    .slide_rest()
+            });
+            let (builder, last) = pushed(&program, &logs, &max_rows, window, honest.as_ref());
+            let (header, good, _) = streamed(builder, last, usize::MAX);
+            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                honest(b).lt_merge_count_fault()
+            });
+            let (_, bad, _) = streamed(builder, last, usize::MAX);
+            let what = format!("{name} window {window}");
+            assert_eq!(good.len(), bad.len(), "{what}: the tables");
+            from_tables += usize::from(header.bitwise_from_tables);
+            let at = |emitted: &[Emitted], position: usize| {
+                emitted
+                    .iter()
+                    .find(|e| e.position == position)
+                    .and_then(|e| e.table.as_ref())
+                    .map(shape_and_words)
+            };
+            for position in 1..good.len() {
+                assert!(
+                    at(&good, position) == at(&bad, position),
+                    "{what}: table {position}"
+                );
+            }
+            moved += usize::from(at(&good, 0) != at(&bad, 0));
+        }
+    }
+    if cfg!(feature = "parallel") {
+        assert!(from_tables > 0, "no stream counted from the tables");
+        assert!(moved > 0, "the map's count never moved BITWISE");
+    }
 }
 
 /// Synthetic units that sleep: unit `slow` takes `long` ms, the others `short`;

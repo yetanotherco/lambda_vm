@@ -32,7 +32,7 @@ pub(super) fn run(name: &str) -> (Elf, Vec<Log>) {
 }
 
 /// A table as (columns, rows, words row-major), held packed or wide.
-fn shape_and_words(t: &Table) -> (usize, usize, Vec<u64>) {
+pub(super) fn shape_and_words(t: &Table) -> (usize, usize, Vec<u64>) {
     match t.narrow_main() {
         Some(packed) => {
             let columns: Vec<Vec<u64>> = (0..packed.cols()).map(|c| packed.column(c)).collect();
@@ -52,7 +52,7 @@ fn shape_and_words(t: &Table) -> (usize, usize, Vec<u64>) {
 }
 
 /// Every table of a build, named, and what the statement reads off it.
-fn contents(t: &Traces) -> Vec<(String, String)> {
+pub(super) fn contents(t: &Traces) -> Vec<(String, String)> {
     let lists: [(&str, &[Table]); 21] = [
         ("CPU", &t.cpus),
         ("MEMW_R", &t.memw_registers),

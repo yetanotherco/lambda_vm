@@ -984,6 +984,8 @@ mod finish_tests;
 pub(crate) mod gate;
 #[cfg(test)]
 mod lean_walk_tests;
+#[cfg(test)]
+mod lt_merge_tests;
 mod windowed;
 use blocks::{BlockVec, block_len};
 use compact_branch::CompactBranch;

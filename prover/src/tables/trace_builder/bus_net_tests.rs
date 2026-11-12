@@ -30,7 +30,7 @@ const OUTSIDE: [BusId; 4] = [
     BusId::Decode,
 ];
 
-fn multiplicity(m: &Multiplicity, g: &dyn Fn(usize) -> FE) -> FE {
+pub(super) fn multiplicity(m: &Multiplicity, g: &dyn Fn(usize) -> FE) -> FE {
     match m {
         Multiplicity::One => FE::one(),
         Multiplicity::Column(c) => g(*c),
