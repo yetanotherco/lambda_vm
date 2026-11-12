@@ -1,4 +1,5 @@
-//! ★ Rank 1 S1 on the card (`math_cuda::card_rows`, `LAMBDA_VM_CARD_ROWS`): a
+//! ★ The card-built rows' upload on the card (`math_cuda::card_rows`,
+//! `LAMBDA_VM_CARD_ROWS`): a
 //! group's upload in the knob's `order` (every copy, then every kernel) and
 //! `derive` (CPU logs kept on the card; LOAD and STORE derived from them)
 //! writes the words today's upload writes, group by group, in the hand-out's
@@ -160,8 +161,8 @@ fn card_rows_uploads_write_todays_words_forwards_and_backwards() {
 /// The mutant on groups that derive: each program's chunks in one group, so
 /// its own CPU tables hold every derived row's cycle. Each family alone
 /// (LOAD, then STORE) must derive a table and move a group: other words, or
-/// the group declined. (s1b's version used groups of 8 in hand-out order,
-/// where no table derived, so it could not fail.)
+/// the group declined. (Groups of 8 in hand-out order derive no table, so a
+/// mutant there could not fail.)
 #[test]
 fn a_derived_rows_cycle_read_one_late_changes_words_or_declines_the_group() {
     let _reset = Reset::new();

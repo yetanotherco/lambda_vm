@@ -4463,7 +4463,7 @@ impl<'a> RecordsUp<'a> {
 
 /// A table's records as the card's fill takes them; `None` where the card
 /// fills no table of that shape.
-/// `LAMBDA_VM_CARD_ROWS` (rank 1, S1): `Some` with the block's report line
+/// `LAMBDA_VM_CARD_ROWS` (the card-built rows): `Some` with the block's report line
 /// unless the knob is `off` (unset is `order`); `None` without the card.
 pub fn card_rows_report() -> Option<String> {
     #[cfg(feature = "cuda")]

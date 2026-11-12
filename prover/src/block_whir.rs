@@ -4046,7 +4046,7 @@ fn prove_block_whir_inner(
             pool.locked, pool.bytes, pool.seconds
         );
     }
-    // `LAMBDA_VM_CARD_ROWS` (rank 1, S1): the card keeps no logs from
+    // `LAMBDA_VM_CARD_ROWS` (the card-built rows): the card keeps no logs from
     // another prove, keeps this one's only until it ends, and the line below
     // counts this one's uploads alone.
     multilinear::gpu::card_rows_begin();

@@ -1,5 +1,4 @@
-//! Rank 1, stage S1 (`thoughts/zf/gap3/D-CARDROWS-FABLE.md` §7, with probe
-//! K0b's lessons, `I-CARDPROBE.md`): a group's upload under
+//! A group's upload under
 //! `LAMBDA_VM_CARD_ROWS` (read once). Unset is `order`; `0` or `off` is the
 //! upload as it was before (`DeviceColumns::upload_tables_today`), byte for
 //! byte and call for call. Every mode writes the same words.
@@ -8,7 +7,8 @@
 //!   sync and the one check readback the upload already makes. Today each
 //!   records table's copy waits, in stream order, for the table before it to
 //!   be filled; beside a running commit each such wait costs up to what the
-//!   commit has queued ahead (k002: today's upload took 2.03 commit periods).
+//!   commit has queued ahead (a probe beside a looping commit measured the
+//!   table-by-table upload at about two commit periods, this order at 1.3).
 //! - `derive`: `order`, and the card keeps the CPU chunks' logs it receives
 //!   (an LRU cache of whole CPU tables, `LAMBDA_VM_CARD_ROWS_CACHE_MIB`,
 //!   default 1024, each entry promised to the backend's ledger), fills a CPU
@@ -67,8 +67,9 @@ pub enum Mode {
 
 impl Mode {
     /// The knob's reading: unset (or empty) or `order` is [`Mode::Order`],
-    /// the default (s1b: whole block −0.76 / −0.96 s large with order /
-    /// derive, ≈ 0 median, never slower); `0` or `off` is [`Mode::Off`];
+    /// the default (measured on whole blocks: −0.76 s on a large one with
+    /// order, −0.96 s with derive, about 0 on a median one, never slower);
+    /// `0` or `off` is [`Mode::Off`];
     /// `derive` or `1` is [`Mode::Derive`]. Anything else is refused.
     pub fn parse(word: Option<&str>) -> Result<Self, String> {
         match word.map(str::trim) {

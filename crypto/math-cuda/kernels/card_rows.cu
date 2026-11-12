@@ -1,14 +1,13 @@
-// Rank 1, stage S1 (`thoughts/zf/gap3/D-CARDROWS-FABLE.md` §7; `src/card_rows.rs`):
-// a group's LOAD or STORE tables derived on the card from the CPU logs it
-// already holds, instead of filled from records the host made. Loaded by
+// The card-built LOAD and STORE rows (`src/card_rows.rs`): a group's LOAD or
+// STORE tables derived on the card from the CPU logs it already holds, instead of filled from records the host made. Loaded by
 // `src/card_rows.rs` and launched only under `LAMBDA_VM_CARD_ROWS=derive`.
 //
 // Each row is written with the words `fill.cu`'s `fill_load` and
 // `fill_store` write for the same op (the same writers and columns, included
 // below), from the op's cycle's log and DECODE row, as the walk makes the op
-// (`CpuOperation::from_log` for the register values). Probe K0 held these
-// rules to today's walk on a real block's chunks (`I-CARDPROBE.md`, k001 and
-// k002: 0 words differ).
+// (`CpuOperation::from_log` for the register values). A probe held these
+// rules to the walk on a real block's chunks: the card's rows and the host's
+// fill of the walk's rows were the same words.
 
 #include "fill.cu"
 
@@ -125,7 +124,7 @@ __device__ __forceinline__ void store_row(const LogC *logs, uint64_t first, uint
 }  // namespace derive
 
 // ---------------------------------------------------------------------------
-// Rank 1 S1 (`src/card_rows.rs`): a group's LOAD (`store` 0) or STORE tables
+// `src/card_rows.rs`'s derived tables: a group's LOAD (`store` 0) or STORE tables
 // derived from the CPU logs the card already holds. Each table names its
 // rows' cycles (`cycles`, one a row, the global cycle); a row's log is found
 // in the cached CPU chunks (`entries`, ascending by first cycle, disjoint).
