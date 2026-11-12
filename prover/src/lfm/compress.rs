@@ -28,7 +28,8 @@ use super::compiler::LfmProgram;
 use super::per_table_aggregator::{ChildShape, DerivedChild, declare_leg_arenas, emit_leg};
 use super::whir_block::{WhirBlockPlan, derived_of, finish_program, top_claims};
 use super::wlfm::{
-    WlfmArtifacts, WlfmBuild, WlfmProof, WlfmRate, build_wlfm, prove_wlfm, verify_wlfm,
+    WlfmArtifacts, WlfmBuild, WlfmProof, WlfmRate, build_wlfm, build_wlfm_on_host, prove_wlfm,
+    verify_wlfm,
 };
 use super::word::LfmWord;
 use crate::hash_pin::{BlockFamily, ProofFamily};
@@ -111,15 +112,29 @@ pub fn top_child(
 }
 
 /// ★ C1's program and build at `rate`, for the top `top`: ONE derivation for
-/// the prover and the verifier.
+/// the prover and the verifier (whose prepared commits run on the host,
+/// `on_host`).
 pub fn build_compress(
     top: &DerivedChild,
     layout: BlockLayout,
     rate: WlfmRate,
 ) -> Result<CompressBuild, String> {
+    build_compress_with(top, layout, rate, false)
+}
+
+fn build_compress_with(
+    top: &DerivedChild,
+    layout: BlockLayout,
+    rate: WlfmRate,
+    on_host: bool,
+) -> Result<CompressBuild, String> {
     let program = compress_program(top, layout)?;
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
-    let build = build_wlfm(&program, hasher, rate)?;
+    let build = if on_host {
+        build_wlfm_on_host(&program, hasher, rate)?
+    } else {
+        build_wlfm(&program, hasher, rate)?
+    };
     Ok(CompressBuild { program, build })
 }
 
@@ -146,7 +161,7 @@ pub fn verify_compressed(
 
 /// C1's artifacts as a verifier derives them for `plan`: the top program's
 /// artifacts under `wrap_opts`, its shape at the top layout, C1 over it at
-/// `rate`.
+/// `rate`, its prepared stacks committed on the host.
 pub fn compressed_artifacts(
     plan: &WhirBlockPlan,
     wrap_opts: &crate::ProofOptions,

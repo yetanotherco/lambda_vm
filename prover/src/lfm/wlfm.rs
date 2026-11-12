@@ -54,7 +54,9 @@ use stark::multilinear_table::batched::VerifierChecks;
 use stark::multilinear_table::{BatchedArgue, CommittedTable, MultiProof, TableStatement};
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
-use crate::block_whir::{GroupPrepared, PreparedColumns, commit_groups, group_stacks};
+use crate::block_whir::{
+    GroupPrepared, PreparedColumns, commit_groups, commit_groups_on_host, group_stacks,
+};
 use crate::multilinear_prove::{layout_of, stacks};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::zf_format::ZfFormat;
@@ -332,14 +334,36 @@ pub fn check_coverage(
     Ok(())
 }
 
-/// ★ Builds a program's artifacts and the prover's prepared stacks at `rate`.
+/// ★ Builds a program's artifacts and the prover's prepared stacks at `rate`,
+/// the prepared commits on the card where there is one: the PROVER's build.
 ///
 /// ONE derivation for both sides: the prover and every verifier of this program
-/// take the groups, the stacks' roots, layouts and domains from here.
+/// take the groups, the stacks' roots, layouts and domains from here; a
+/// verifier commits on the host ([`build_wlfm_on_host`]).
 pub fn build_wlfm(
     program: &LfmProgram,
     hasher: HasherKind,
     rate: WlfmRate,
+) -> Result<WlfmBuild, String> {
+    build_wlfm_with(program, hasher, rate, false)
+}
+
+/// [`build_wlfm`] with every prepared commit on the host: the VERIFIER's
+/// build, so no card kernel is on its acceptance path (the block verifier's
+/// rule since the joint round-0 trees, `block_whir::commit_groups_on_host`).
+pub fn build_wlfm_on_host(
+    program: &LfmProgram,
+    hasher: HasherKind,
+    rate: WlfmRate,
+) -> Result<WlfmBuild, String> {
+    build_wlfm_with(program, hasher, rate, true)
+}
+
+fn build_wlfm_with(
+    program: &LfmProgram,
+    hasher: HasherKind,
+    rate: WlfmRate,
+    on_host: bool,
 ) -> Result<WlfmBuild, String> {
     // The mask with `BITWISE` dropped where nothing sends it: the default, as a
     // constant (`for_program_with_hasher` reads it from the environment).
@@ -403,7 +427,9 @@ pub fn build_wlfm(
     // ⛔ THE CARD, as `program_census::build_artifacts_counted` holds it for a
     // STARK build: the prepared commits run on the device, so concurrent
     // siblings serialize them. Inert unless a driver armed the permit.
-    let committed = {
+    let committed = if on_host {
+        commit_groups_on_host::<WlfmHash>(stacks, &config).map_err(|e| format!("{e:?}"))?
+    } else {
         let _card = super::device_permit::hold_labeled("build_artifacts");
         commit_groups::<WlfmHash>(stacks, &config).map_err(|e| format!("{e:?}"))?
     };
