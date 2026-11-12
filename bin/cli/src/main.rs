@@ -538,6 +538,12 @@ enum Commands {
         /// As `prove-block --leaves`.
         #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
         leaves: String,
+
+        /// As `prove-block --trees`, except that unset under `--base b3` reads
+        /// `each`: one tree a run is defined for Poseidon1's joint leaf only,
+        /// so a named `one` beside the BLAKE3 base is refused.
+        #[arg(long, value_parser = ["each", "one"])]
+        trees: Option<String>,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -699,7 +705,17 @@ fn main() -> ExitCode {
             group,
             blowup,
             leaves,
-        } => cmd_prove_block_base(elf, input, output, &base, &group, &blowup, &leaves),
+            trees,
+        } => cmd_prove_block_base(
+            elf,
+            input,
+            output,
+            &base,
+            &group,
+            &blowup,
+            &leaves,
+            trees.as_deref(),
+        ),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
     }
 }
@@ -1272,6 +1288,7 @@ type FormatChoices = (
 /// `prove-block-base`: the block's base proof alone, under `base`, then its
 /// host verification. The process declares base-only first
 /// (`prover::base_only`), so its recursion entry points refuse to run.
+#[allow(clippy::too_many_arguments)]
 fn cmd_prove_block_base(
     elf_path: PathBuf,
     input_path: Option<PathBuf>,
@@ -1280,6 +1297,7 @@ fn cmd_prove_block_base(
     group: &str,
     blowup: &str,
     leaves: &str,
+    trees: Option<&str>,
 ) -> ExitCode {
     use prover::lfm::whir_block_tree::{WhirTreeConfig, base_line, group_setting};
     use stark::proof::options::BaseFormat;
@@ -1296,7 +1314,8 @@ fn cmd_prove_block_base(
         eprintln!("LAMBDA_VM_WHIR_GROUP is the harness's knob: give the CLI --group instead");
         return ExitCode::FAILURE;
     }
-    let (blowup, order) = match install_block_format_with_base(blowup, leaves, base) {
+    let (blowup, order, round0) = match install_block_format_with_base(blowup, leaves, trees, base)
+    {
         Ok(choices) => choices,
         Err(e) => {
             eprintln!("{e}");
@@ -1335,16 +1354,17 @@ fn cmd_prove_block_base(
         (
             cfg.format.zf.base,
             cfg.format.zf.whir_blowup,
-            cfg.format.zf.whir_leaves
+            cfg.format.zf.whir_leaves,
+            cfg.format.zf.whir_trees
         ),
-        (base, blowup.factor(), order),
+        (base, blowup.factor(), order, round0),
         "the base's format is the installed one"
     );
     let opts = prover::lfm::proof::block_base_options();
     eprintln!("{}", base_line(&cfg.format.zf.base));
     eprintln!(
-        "BLOCK BASE ONLY: base {:?} · group {group} · blowup {blowup} · leaves {leaves} · no \
-         recursion in this process",
+        "BLOCK BASE ONLY: base {:?} · group {group} · blowup {blowup} · leaves {leaves} · trees \
+         {round0:?} · no recursion in this process",
         cfg.format.zf.base.hash
     );
     #[cfg(feature = "cuda")]
@@ -1434,15 +1454,39 @@ fn vm_hwm() -> Option<String> {
         .map(|l| l["VmHWM:".len()..].trim().to_string())
 }
 
+/// `prove-block-base`'s `--trees`: [`round0_choice`], except that unset reads
+/// `each` under a base other than Poseidon1 (one tree a run is defined for
+/// Poseidon1's joint leaf only). A named `one` there passes through, for the
+/// install to refuse by name.
+fn base_round0_choice(
+    trees: Option<&str>,
+    leaves: prover::zf_format::LeafOrder,
+    hash: stark::config::CommitmentHash,
+) -> Result<prover::zf_format::Round0Trees, String> {
+    match (trees, hash) {
+        (None, stark::config::CommitmentHash::Poseidon1) | (Some(_), _) => {
+            round0_choice(trees, leaves)
+        }
+        (None, _) => Ok(prover::zf_format::Round0Trees::Each),
+    }
+}
+
 /// [`install_block_format`] with the base `base` in place of the family's:
-/// `prove-block-base` alone calls it, after declaring base-only.
+/// `prove-block-base` alone calls it, after declaring base-only. `--trees`
+/// unset reads `each` under a base other than Poseidon1, whose joint leaf is
+/// the only one a run's tree has; a named `one` there is refused by the install.
 fn install_block_format_with_base(
     blowup: &str,
     leaves: &str,
+    trees: Option<&str>,
     base: stark::proof::options::BaseFormat,
-) -> Result<(prover::zf_format::WhirBlowup, prover::zf_format::LeafOrder), String> {
-    use prover::zf_format::{ENV_WHIR_BLOWUP, ENV_WHIR_LEAVES, ZfFormat};
-    for (knob, flag) in [(ENV_WHIR_BLOWUP, "--blowup"), (ENV_WHIR_LEAVES, "--leaves")] {
+) -> Result<FormatChoices, String> {
+    use prover::zf_format::{ENV_WHIR_BLOWUP, ENV_WHIR_LEAVES, ENV_WHIR_TREES, ZfFormat};
+    for (knob, flag) in [
+        (ENV_WHIR_BLOWUP, "--blowup"),
+        (ENV_WHIR_LEAVES, "--leaves"),
+        (ENV_WHIR_TREES, "--trees"),
+    ] {
         if std::env::var_os(knob).is_some() {
             return Err(format!(
                 "{knob} is the harness's knob: give the CLI {flag} instead"
@@ -1451,15 +1495,18 @@ fn install_block_format_with_base(
     }
     let blowup = prover::lfm::whir_block_tree::blowup_setting(Some(blowup))?;
     let leaves = prover::lfm::whir_block_tree::leaves_setting(Some(leaves))?;
+    let trees = base_round0_choice(trees, leaves, base.hash)?;
     let format = ZfFormat {
         whir_blowup: blowup.factor(),
         whir_leaves: leaves,
+        whir_trees: trees,
         base,
         ..ZfFormat::from_env()?
     };
     format.check_leaves()?;
+    format.check_trees()?;
     ZfFormat::install(format)?;
-    Ok((blowup, leaves))
+    Ok((blowup, leaves, trees))
 }
 
 /// `prove-block`'s process format: the environment's ZF knobs with the
@@ -2919,6 +2966,42 @@ mod tests {
         for cmd in [&prove[..], &verify[..]] {
             assert!(!ok(&[cmd, &["--base", "b3"]].concat()));
         }
+    }
+
+    /// `prove-block-base --trees`: unset is the format's default under the
+    /// Poseidon1 base and `each` under BLAKE3 (no joint leaf there); a named
+    /// word is taken as given; anything else does not parse.
+    #[test]
+    fn the_base_only_command_reads_its_round0_trees_by_base() {
+        use prover::zf_format::{LeafOrder, Round0Trees, ZfFormat};
+        use stark::config::CommitmentHash;
+        let base = ["cli", "prove-block-base", "guest.elf"];
+        for word in ["each", "one"] {
+            assert!(Cli::try_parse_from([&base[..], &["--trees", word]].concat()).is_ok());
+        }
+        assert!(Cli::try_parse_from([&base[..], &["--trees", "two"]].concat()).is_err());
+        let choice = base_round0_choice;
+        assert_eq!(
+            choice(None, LeafOrder::Coset, CommitmentHash::Poseidon1),
+            Ok(ZfFormat::DEFAULT.whir_trees)
+        );
+        assert_eq!(
+            choice(None, LeafOrder::Coset, CommitmentHash::Blake3),
+            Ok(Round0Trees::Each)
+        );
+        assert_eq!(
+            choice(None, LeafOrder::Natural, CommitmentHash::Poseidon1),
+            Ok(Round0Trees::Each)
+        );
+        assert_eq!(
+            choice(Some("one"), LeafOrder::Coset, CommitmentHash::Blake3),
+            Ok(Round0Trees::One),
+            "passed through for the install to refuse"
+        );
+        assert_eq!(
+            choice(Some("each"), LeafOrder::Coset, CommitmentHash::Poseidon1),
+            Ok(Round0Trees::Each)
+        );
     }
 
     /// The posture sets exactly the knobs the environment leaves unset.
