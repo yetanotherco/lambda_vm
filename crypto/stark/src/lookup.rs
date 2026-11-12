@@ -1413,8 +1413,10 @@ pub enum Multiplicity {
 impl Multiplicity {
     /// Evaluate the multiplicity expression to a field element. `get_col(i)`
     /// must return the value of main column `i` at the row being evaluated.
+    ///
+    /// Public so the prover's `lean_diff` test can evaluate multiplicities on a row.
     #[inline]
-    fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
+    pub fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
     where
         F: IsField,
         G: Fn(usize) -> FieldElement<F>,
