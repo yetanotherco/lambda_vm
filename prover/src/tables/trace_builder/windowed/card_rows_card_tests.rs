@@ -22,14 +22,22 @@ use super::card_records_card_tests::{mismatches, records_chunks};
 use crate::tables::MaxRowsConfig;
 use crate::tests::windowed_builder_tests::run;
 
-/// The knob back and the cache empty however the test ends.
+/// Logs kept across groups (as inside a block's prove) while it lives; the
+/// knob back and the cache empty however the test ends.
 struct Reset;
+
+impl Reset {
+    fn new() -> Self {
+        card_rows::begin();
+        Self
+    }
+}
 
 impl Drop for Reset {
     fn drop(&mut self) {
         card_rows::FAULT_CYCLE_SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
         card_rows::set_mode_override(None);
-        card_rows::clear();
+        card_rows::end();
     }
 }
 
@@ -101,7 +109,7 @@ fn compare(groups: &[Vec<&Records>], what: &str) -> card_rows::Stats {
 
 #[test]
 fn card_rows_uploads_write_todays_words_forwards_and_backwards() {
-    let _reset = Reset;
+    let _reset = Reset::new();
     let max_rows = MaxRowsConfig {
         load: 1 << 2,
         store: 1 << 2,
@@ -131,6 +139,14 @@ fn card_rows_uploads_write_todays_words_forwards_and_backwards() {
             }
         }
     }
+    // Outside a block's prove nothing is kept past a group.
+    card_rows::end();
+    let (program, _) = run("all_loadstore_32");
+    let chunks = records_chunks(&program, &[], &max_rows, 7, (0, None), true);
+    let groups = grouped(&chunks, 8);
+    let outside = stores(&groups, &[0], Mode::Derive);
+    assert!(outside[0].1.is_some(), "a group outside a block declined");
+    assert_eq!(card_rows::held(), (0, 0), "logs kept outside a block");
     println!(
         "CARD ROWS SMALL: tables derived {derived} · CPU tables from the cache {hits} · kept {kept}"
     );
@@ -142,7 +158,7 @@ fn card_rows_uploads_write_todays_words_forwards_and_backwards() {
 
 #[test]
 fn a_derived_rows_cycle_read_one_late_changes_words_or_declines_the_group() {
-    let _reset = Reset;
+    let _reset = Reset::new();
     let max_rows = MaxRowsConfig {
         load: 1 << 2,
         store: 1 << 2,
@@ -184,7 +200,7 @@ fn a_derived_rows_cycle_read_one_late_changes_words_or_declines_the_group() {
 #[test]
 #[ignore = "card: a box test (BLOCK_WHIR_ELF, BLOCK_WHIR_INPUT)"]
 fn card_rows_on_a_real_block_write_todays_words() {
-    let _reset = Reset;
+    let _reset = Reset::new();
     let elf =
         std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF")).expect("the ELF");
     let input =

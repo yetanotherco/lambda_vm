@@ -4485,11 +4485,17 @@ pub fn card_reserved_peak() -> Option<u64> {
     }
 }
 
-/// The card-rows cache emptied and its counters zeroed (a block's start and
-/// end). Nothing without the card.
-pub fn card_rows_clear() {
+/// A block's prove starts: the card-rows cache emptied, its counters zeroed,
+/// and CPU logs kept from here to [`card_rows_end`]. Nothing without the card.
+pub fn card_rows_begin() {
     #[cfg(feature = "cuda")]
-    math_cuda::card_rows::clear();
+    math_cuda::card_rows::begin();
+}
+
+/// A block's prove ended: nothing more kept, the cache emptied.
+pub fn card_rows_end() {
+    #[cfg(feature = "cuda")]
+    math_cuda::card_rows::end();
 }
 
 #[cfg(feature = "cuda")]

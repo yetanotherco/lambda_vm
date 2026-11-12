@@ -219,9 +219,13 @@ fn add(counter: &AtomicU64, n: u64) {
 // The cache of CPU tables' logs.
 // ---------------------------------------------------------------------------
 
-/// A CPU table's logs on the card: cycles `[first, first + n)`.
+/// A CPU table's logs on the card: cycles `[first, first + n)`, copied from
+/// the host buffer at `host` (its first piece's address): a table is served
+/// from the cache only when its own logs lie there, so a copy of them that
+/// differs (a test's fault, a regenerated window) is never taken for them.
 struct Entry {
     n: usize,
+    host: usize,
     logs: CudaSlice<LogC>,
     decode: Arc<CardDecode>,
     /// The upload that last read it.
@@ -244,6 +248,25 @@ struct Cache {
 }
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+
+/// Whether uploads keep CPU logs past their own group: only between a
+/// block's [`begin`] and [`end`]. Outside one, a group still derives its
+/// LOAD and STORE tables from its own CPU tables' logs, and keeps nothing.
+static KEEPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A block's prove starts: the cache emptied, the counters zeroed, and logs
+/// kept from here to [`end`].
+pub fn begin() {
+    clear();
+    KEEPING.store(true, Ordering::Relaxed);
+}
+
+/// A block's prove ended: nothing more is kept, and the cache is emptied.
+pub fn end() {
+    KEEPING.store(false, Ordering::Relaxed);
+    let mut cache = lock();
+    *cache = None;
+}
 
 fn lock() -> std::sync::MutexGuard<'static, Option<Cache>> {
     CACHE
@@ -485,13 +508,19 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 rows,
             }) if derive => {
                 let n: usize = logs.iter().map(|p| p.len()).sum();
+                let host = host_of(logs);
                 group_cpu.insert(*first_cycle, n as u64);
                 match &group_decode {
                     None => group_decode = Some(Arc::clone(decode)),
                     Some(d) => decode_mixed |= !Arc::ptr_eq(d, decode),
                 }
                 match cache.entries.get_mut(first_cycle) {
-                    Some(e) if e.n == n && Arc::ptr_eq(&e.decode, decode) && n <= *rows => {
+                    Some(e)
+                        if e.n == n
+                            && e.host == host
+                            && Arc::ptr_eq(&e.decode, decode)
+                            && n <= *rows =>
+                    {
                         e.tick = tick;
                         Plan::CpuHit(*first_cycle)
                     }
@@ -816,6 +845,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
             let TableUpload::Records(RecordsInput::Cpu {
                 first_cycle,
                 decode,
+                logs,
                 ..
             }) = table
             else {
@@ -836,7 +866,17 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
             else {
                 continue;
             };
-            keep(cache, be, *first_cycle, n, slice, Arc::clone(decode), tick);
+            let host = host_of(logs);
+            keep(
+                cache,
+                be,
+                *first_cycle,
+                n,
+                host,
+                slice,
+                Arc::clone(decode),
+                tick,
+            );
         }
     }
     drop(guard);
@@ -847,20 +887,33 @@ fn records_len<T>(pieces: &[&[T]]) -> usize {
     pieces.iter().map(|p| p.len()).sum()
 }
 
-/// `logs` (cycles `[first, first + n)`) kept in the cache, entries this upload
-/// did not read let go, least recently read first, to make room within the
-/// budget and the ledger. Not kept when no room is made.
+/// The address of a table's first log on the host (0 for none).
+fn host_of(logs: &[&[LogC]]) -> usize {
+    logs.iter()
+        .find(|p| !p.is_empty())
+        .map_or(0, |p| p.as_ptr() as usize)
+}
+
+/// `logs` (cycles `[first, first + n)`, from the host buffer at `host`)
+/// kept in the cache, entries this upload did not read let go, least recently
+/// read first, to make room within the budget and the ledger. Not kept
+/// outside a block ([`begin`]), nor when no room is made.
+#[allow(clippy::too_many_arguments)]
 fn keep(
     cache: &mut Cache,
     be: &crate::device::Backend,
     first: u64,
     n: usize,
+    host: usize,
     logs: CudaSlice<LogC>,
     decode: Arc<CardDecode>,
     tick: u64,
 ) {
     let bytes = (n * std::mem::size_of::<LogC>()) as u64;
-    if bytes > budget_bytes() || cache.entries.contains_key(&first) {
+    if !KEEPING.load(Ordering::Relaxed)
+        || bytes > budget_bytes()
+        || cache.entries.contains_key(&first)
+    {
         return;
     }
     while cache.bytes + bytes > budget_bytes() {
@@ -886,6 +939,7 @@ fn keep(
         first,
         Entry {
             n,
+            host,
             logs,
             decode,
             tick,
