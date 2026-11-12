@@ -64,6 +64,9 @@ enum Walk {
     Owned,
     /// On this many threads, from the windows' entries.
     Threads(usize),
+    /// Record mode: on this many threads, from the fast engine's history,
+    /// every `recheck`-th window re-walked (0: none).
+    History(usize, usize),
 }
 
 /// The run of `program` by windows of `window` cycles, dropping its streamed
@@ -133,6 +136,51 @@ fn built(
             .expect("the walk");
             report.last
         }
+        Walk::History(walkers, recheck) => {
+            use executor::vm::fast::FastExecutor;
+            let (tx, rx) = std::sync::mpsc::sync_channel::<super::parallel::ExecWindow>(2);
+            let report = std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let mut fast = FastExecutor::new(program, Vec::new()).expect("the fast engine");
+                    fast.enable_history().expect("history mode");
+                    let mut k = 0usize;
+                    loop {
+                        let start = (recheck > 0 && k % recheck == 0).then(|| fast.snapshot());
+                        let Some((logs, history)) = fast.resume_history(window).expect("the run")
+                        else {
+                            break;
+                        };
+                        let last = (fast.pc() == 0)
+                            .then(|| fast.take_history_final().map(Box::new))
+                            .flatten();
+                        let sent = tx.send(super::parallel::ExecWindow {
+                            logs: Arc::new(logs),
+                            start,
+                            history: Some(Box::new(history)),
+                            last,
+                        });
+                        if sent.is_err() {
+                            break;
+                        }
+                        k += 1;
+                    }
+                });
+                super::parallel::walk_windows_from_history(
+                    &mut builder,
+                    rx,
+                    walkers,
+                    recheck,
+                    |accumulator, w, _| {
+                        without += usize::from(w.cpu_ops.is_empty() && w.cycles > 0);
+                        jobs.extend(accumulator.absorb(w));
+                        Ok(())
+                    },
+                )
+            })
+            .expect("the walk");
+            assert!(report.from_history);
+            report.last
+        }
     };
     let chunks: Vec<StreamedChunk> = jobs.into_iter().map(|j| unheld(j.generate())).collect();
     let mut traces = builder.finish(&last).expect("the last window");
@@ -142,7 +190,8 @@ fn built(
     (traces, without)
 }
 
-/// ★ Without the CPU list, through the split walker and on 1 and 3 threads,
+/// ★ Without the CPU list, through the split walker, on 1 and 3 threads and in
+/// record mode (from the fast engine's history, rechecked or not),
 /// at windows of 1, 7 and 33 cycles, whatever the room admits (every CPU
 /// chunk, none: each filled on the host from its rebuilt ops, every other),
 /// the windows build the whole-run tables, and their walkers kept no list.
@@ -154,14 +203,20 @@ fn without_the_cpu_list_the_windows_build_the_whole_run_tables() {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);
         for window in [1, 7, 33] {
-            for walk in [Walk::Owned, Walk::Threads(1), Walk::Threads(3)] {
+            for walk in [
+                Walk::Owned,
+                Walk::Threads(1),
+                Walk::Threads(3),
+                Walk::History(1, 0),
+                Walk::History(3, 2),
+            ] {
                 for (what, room) in rooms() {
                     let (traces, without) =
                         built(&program, &logs, &max_rows, window, walk, room, true, true);
                     same_traces(&reference, &traces);
                     let body = (logs.len() - 1) / window;
                     assert!(
-                        without == body || matches!(walk, Walk::Threads(_)),
+                        without == body || !matches!(walk, Walk::Owned),
                         "{name}/{window} {walk:?} {what}: {without} of {body} windows listless"
                     );
                     assert!(
