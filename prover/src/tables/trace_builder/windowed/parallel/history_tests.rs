@@ -263,7 +263,7 @@ fn tamper_with(
         }
         Tamper::Register { window } if k >= window => {
             if let Some(cells) = &mut history.registers {
-                cells.regs[5].0 += 1;
+                cells.regs[5].0 = cells.regs[5].0.wrapping_add(1);
                 return true;
             }
         }
