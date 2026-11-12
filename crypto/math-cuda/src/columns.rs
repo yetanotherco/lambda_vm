@@ -47,16 +47,16 @@ pub fn upload_kernel_times() -> ((u64, f64), (u64, f64)) {
 }
 
 /// One table's upload timed on its stream: the events either side of it.
-struct TableClock {
+pub(crate) struct TableClock {
     records: bool,
     start: cudarc::driver::CudaEvent,
-    done: cudarc::driver::CudaEvent,
+    pub(crate) done: cudarc::driver::CudaEvent,
 }
 
 impl TableClock {
     /// Events on `stream`, the first recorded now; `None` when uploads are not
     /// timed or an event cannot be made.
-    fn start(stream: &Arc<CudaStream>, records: bool) -> Option<Self> {
+    pub(crate) fn start(stream: &Arc<CudaStream>, records: bool) -> Option<Self> {
         if !timed_uploads() {
             return None;
         }
@@ -72,7 +72,7 @@ impl TableClock {
     }
 
     /// Adds the span to the totals, once the stream ran it.
-    fn add(self) {
+    pub(crate) fn add(self) {
         use std::sync::atomic::Ordering::Relaxed;
         let Ok(ms) = self.start.elapsed_ms(&self.done) else {
             return;

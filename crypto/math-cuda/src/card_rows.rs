@@ -36,7 +36,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 
-use crate::columns::{DeviceColumns, TableUpload};
+use crate::columns::{DeviceColumns, TableClock, TableUpload};
 use crate::device::{DeviceReservation, alloc_or_trim, backend};
 use crate::fill::{
     CardDecode, CpuLogsOnCard, FillChecks, LoadOpC, LogC, RecordsInput, Staged, StoreOpC,
@@ -773,20 +773,30 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
         .collect();
 
     // ---- pass 2: every kernel ----
+    // `LAMBDA_VM_CARD_UPLOAD_TIMES=1` times each kernel here (its copy was
+    // made in pass 1), and a derived family's launch as one table.
+    let mut clocks = Vec::new();
     for ((table, s), &offset) in tables.iter().zip(&staged).zip(&offsets) {
         match table {
             TableUpload::Wide(_) => {}
             TableUpload::Narrow(packed) => {
                 let (rows, cols) = (packed.rows(), packed.cols());
                 let mut slab = buffer.slice_mut(offset..offset + rows * cols);
+                let clock = TableClock::start(&stream, false);
                 crate::narrow::widen_col_major_into(&stream, be, *packed, rows, cols, &mut slab)
                     .ok()?;
+                clocks.extend(clock.filter(|c| c.done.record(&stream).is_ok()));
             }
             TableUpload::Records(records) => {
                 let Some(s) = s else { continue };
+                if matches!(s, Staged::Elsewhere) {
+                    continue;
+                }
                 let (rows, cols) = (records.rows(), records.cols());
                 let mut slab = buffer.slice_mut(offset..offset + rows * cols);
+                let clock = TableClock::start(&stream, true);
                 crate::fill::launch_staged(&stream, s, rows, &mut slab, &mut checks).ok()?;
+                clocks.extend(clock.filter(|c| c.done.record(&stream).is_ok()));
             }
         }
     }
@@ -809,6 +819,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 block_dim: (ROW_BLOCK, 1, 1),
                 shared_mem_bytes: 0,
             };
+            let clock = TableClock::start(&stream, true);
             // SAFETY: the descriptors name buffers alive until the stream
             // is synchronized below: the cache's entries (kept by the lock
             // and this upload's tick), this group's copies, the store.
@@ -828,11 +839,13 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                     .launch(config)
             };
             kernels_ok &= launched.is_ok();
+            clocks.extend(clock.filter(|c| c.done.record(&stream).is_ok()));
         }
     } else if derived_any {
         kernels_ok = false;
     }
     stream.synchronize().ok()?;
+    clocks.into_iter().for_each(TableClock::add);
     if !kernels_ok || !checks.passed(&stream).ok()? {
         add(&counters().declined, 1);
         crate::device::note_device_fallback();
