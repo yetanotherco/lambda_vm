@@ -4347,6 +4347,9 @@ struct RecordsUp<'a> {
     cols: usize,
     fill: crate::records::RecordsFill<'a>,
     decode: Option<std::sync::Arc<math_cuda::fill::CardDecode>>,
+    /// A CPU table's records, shared: what the card-rows cache keeps alive
+    /// while it holds their logs (`math_cuda::card_rows`).
+    hold: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     logs: Vec<&'a [math_cuda::fill::LogC]>,
     registers: Vec<&'a [math_cuda::fill::RegRowC]>,
     aligned: Vec<&'a [math_cuda::fill::AlignedRowC]>,
@@ -4424,6 +4427,7 @@ impl<'a> RecordsUp<'a> {
             cols: records.cols(),
             fill: RecordsFill::KeccakRnd { ops: &[], skip: 0 },
             decode: None,
+            hold: None,
             logs: Vec::new(),
             registers: Vec::new(),
             aligned: Vec::new(),
@@ -4436,6 +4440,7 @@ impl<'a> RecordsUp<'a> {
             RecordsFill::KeccakRnd { .. } => {}
             RecordsFill::Cpu { logs, decode, .. } => {
                 up.decode = Some(decode.on_card()?);
+                up.hold = Some(std::sync::Arc::new(records.clone()));
                 // SAFETY: five `u64`s in the same order (asserted above).
                 up.logs = unsafe { cast::<CpuLog, LogC>(logs) };
             }
@@ -4526,6 +4531,7 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
             logs: &up.logs,
             decode: up.decode.as_ref()?,
             first_cycle: *first_cycle,
+            hold: up.hold.as_ref(),
             rows: up.rows,
         },
         RecordsFill::MemwR { .. } => RecordsInput::MemwR {

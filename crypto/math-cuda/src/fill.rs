@@ -603,13 +603,15 @@ pub enum RecordsInput<'a> {
     },
     /// CPU's `rows` rows: one a log of `logs`' pieces in order, read with its
     /// row of `decode` at the table's own timestamps; then the padding rows.
-    /// `first_cycle` is the first log's cycle in the run: the key the
-    /// card-rows cache holds the logs by ([`crate::card_rows`]); the fill
-    /// itself does not read it.
+    /// `first_cycle` is the first log's cycle in the run, and `hold` the
+    /// records the logs belong to: the card-rows cache keys its copy of the
+    /// logs by the first and keeps the second alive while it holds them
+    /// ([`crate::card_rows`]). The fill itself reads neither.
     Cpu {
         logs: &'a [&'a [LogC]],
         decode: &'a Arc<CardDecode>,
         first_cycle: u64,
+        hold: Option<&'a Arc<dyn std::any::Any + Send + Sync>>,
         rows: usize,
     },
     /// MEMW_R's `rows` rows: `records`' pieces in order, then zero rows.

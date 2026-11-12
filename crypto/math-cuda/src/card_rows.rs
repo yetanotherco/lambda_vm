@@ -220,12 +220,16 @@ fn add(counter: &AtomicU64, n: u64) {
 // ---------------------------------------------------------------------------
 
 /// A CPU table's logs on the card: cycles `[first, first + n)`, copied from
-/// the host buffer at `host` (its first piece's address): a table is served
-/// from the cache only when its own logs lie there, so a copy of them that
-/// differs (a test's fault, a regenerated window) is never taken for them.
+/// the logs whose [`Identity`] it records, with those logs' records held
+/// alive (`hold`) for as long as the entry lives.
 struct Entry {
     n: usize,
-    host: usize,
+    identity: Identity,
+    /// The records the logs were copied from: while the entry lives, their
+    /// buffers can be neither freed nor handed back to the executor
+    /// (`Arc::try_unwrap` fails on a shared buffer), so no other logs can
+    /// come to lie at the address the identity names.
+    _hold: Arc<dyn std::any::Any + Send + Sync>,
     logs: CudaSlice<LogC>,
     decode: Arc<CardDecode>,
     /// The upload that last read it.
@@ -506,9 +510,10 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 decode,
                 first_cycle,
                 rows,
+                ..
             }) if derive => {
                 let n: usize = logs.iter().map(|p| p.len()).sum();
-                let host = host_of(logs);
+                let identity = Identity::of(logs);
                 group_cpu.insert(*first_cycle, n as u64);
                 match &group_decode {
                     None => group_decode = Some(Arc::clone(decode)),
@@ -517,7 +522,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 match cache.entries.get_mut(first_cycle) {
                     Some(e)
                         if e.n == n
-                            && e.host == host
+                            && e.identity == identity
                             && Arc::ptr_eq(&e.decode, decode)
                             && n <= *rows =>
                     {
@@ -859,6 +864,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 first_cycle,
                 decode,
                 logs,
+                hold: Some(hold),
                 ..
             }) = table
             else {
@@ -879,17 +885,12 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
             else {
                 continue;
             };
-            let host = host_of(logs);
-            keep(
-                cache,
-                be,
-                *first_cycle,
-                n,
-                host,
-                slice,
-                Arc::clone(decode),
-                tick,
-            );
+            let kept = Kept {
+                identity: Identity::of(logs),
+                hold: Arc::clone(hold),
+                decode: Arc::clone(decode),
+            };
+            keep(cache, be, *first_cycle, n, slice, kept, tick);
         }
     }
     drop(guard);
@@ -900,26 +901,88 @@ fn records_len<T>(pieces: &[&[T]]) -> usize {
     pieces.iter().map(|p| p.len()).sum()
 }
 
-/// The address of a table's first log on the host (0 for none).
-fn host_of(logs: &[&[LogC]]) -> usize {
-    logs.iter()
-        .find(|p| !p.is_empty())
-        .map_or(0, |p| p.as_ptr() as usize)
+/// What a CPU table's logs are taken to be when the cache is asked for them:
+/// how many, where on the host each piece starts and ends, and a fingerprint
+/// of their contents. A held entry serves a table only when all of it is
+/// equal ([`Identity::of`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    pub n: usize,
+    /// Each piece's host address and length.
+    pub pieces: Vec<(usize, usize)>,
+    pub print: u64,
 }
 
-/// `logs` (cycles `[first, first + n)`, from the host buffer at `host`)
-/// kept in the cache, entries this upload did not read let go, least recently
-/// read first, to make room within the budget and the ledger. Not kept
-/// outside a block ([`begin`]), nor when no room is made.
-#[allow(clippy::too_many_arguments)]
+/// Logs a fingerprint reads: every log's first and last 64, and at most
+/// this many more, evenly spaced, five words each.
+pub const PRINT_SAMPLES: usize = 4096;
+
+impl Identity {
+    pub fn of(logs: &[&[LogC]]) -> Self {
+        let n: usize = logs.iter().map(|p| p.len()).sum();
+        let pieces = logs
+            .iter()
+            .map(|p| (p.as_ptr() as usize, p.len()))
+            .collect();
+        Self {
+            n,
+            pieces,
+            print: fingerprint(logs, n),
+        }
+    }
+}
+
+/// A sampled fingerprint of `n` logs in `logs`' pieces (a mix of the count,
+/// the first and last 64 logs, and up to [`PRINT_SAMPLES`] logs evenly
+/// spaced between, every word of each). Not a hash of every byte: the
+/// identity's addresses and the entry's held records are what make a stale
+/// hit impossible; the fingerprint catches logs rewritten in place.
+pub fn fingerprint(logs: &[&[LogC]], n: usize) -> u64 {
+    let at = |mut i: usize| -> Option<&LogC> {
+        for p in logs {
+            if i < p.len() {
+                return p.get(i);
+            }
+            i -= p.len();
+        }
+        None
+    };
+    let mut h = 0x9e37_79b9_7f4a_7c15u64 ^ n as u64;
+    let mut mix = |w: u64| {
+        h = (h ^ w).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+    };
+    let stride = (n / PRINT_SAMPLES).max(1);
+    let edges = (0..n.min(64)).chain(n.saturating_sub(64)..n);
+    for i in edges.chain((64..n.saturating_sub(64)).step_by(stride)) {
+        if let Some(l) = at(i) {
+            mix(i as u64);
+            for w in [l.current_pc, l.next_pc, l.src1_val, l.src2_val, l.dst_val] {
+                mix(w);
+            }
+        }
+    }
+    h
+}
+
+/// What an entry keeps besides the logs on the card.
+struct Kept {
+    identity: Identity,
+    hold: Arc<dyn std::any::Any + Send + Sync>,
+    decode: Arc<CardDecode>,
+}
+
+/// `logs` (cycles `[first, first + n)`) kept in the cache, entries this
+/// upload did not read let go, least recently read first, to make room within
+/// the budget and the ledger. Not kept outside a block ([`begin`]), nor when
+/// no room is made.
 fn keep(
     cache: &mut Cache,
     be: &crate::device::Backend,
     first: u64,
     n: usize,
-    host: usize,
     logs: CudaSlice<LogC>,
-    decode: Arc<CardDecode>,
+    kept: Kept,
     tick: u64,
 ) {
     let bytes = (n * std::mem::size_of::<LogC>()) as u64;
@@ -952,9 +1015,10 @@ fn keep(
         first,
         Entry {
             n,
-            host,
+            identity: kept.identity,
+            _hold: kept.hold,
             logs,
-            decode,
+            decode: kept.decode,
             tick,
             _room: room,
         },
@@ -997,6 +1061,54 @@ mod tests {
         assert!(cycles_of(&[&[op(6)][..]]).is_none());
         assert!(cycles_of(&[&[op(4 * (1u64 << 32) + 4)][..]]).is_none());
         assert!(cycles_of::<LoadOpC>(&[]).is_none());
+    }
+
+    fn logs(n: u64) -> Vec<LogC> {
+        (0..n)
+            .map(|i| LogC {
+                current_pc: 4 * i,
+                next_pc: 4 * i + 4,
+                src1_val: i,
+                src2_val: 2 * i,
+                dst_val: 3 * i,
+            })
+            .collect()
+    }
+
+    /// The cache's mutant at the level of its key: the same buffer, at the
+    /// same address with the same length, holding other logs, is another
+    /// identity, so a held entry cannot serve it. (The cache itself cannot be
+    /// handed that case without writing through a shared buffer: an entry
+    /// holds its records alive, so nothing else can lie at its address.)
+    #[test]
+    fn the_same_address_with_other_logs_is_another_identity() {
+        let n = 3 * PRINT_SAMPLES as u64 + 777;
+        let mut v = logs(n);
+        let held = Identity::of(&[&v[..]]);
+        let addr = v.as_ptr();
+        assert_eq!(Identity::of(&[&v[..]]), held, "the same logs: a hit");
+        // The first and the last log are always read; so is every
+        // `stride`-th between (the sampled ones).
+        let stride = (v.len() / PRINT_SAMPLES).max(1);
+        for at in [0, v.len() - 1, 64 + 5 * stride] {
+            v[at].dst_val ^= 1;
+            let now = Identity::of(&[&v[..]]);
+            assert_eq!(v.as_ptr(), addr);
+            assert_eq!(now.pieces, held.pieces, "same address, same length");
+            assert_ne!(now, held, "log {at} rewritten in place must miss");
+            v[at].dst_val ^= 1;
+        }
+        // Every log rewritten (a test's fault on a CPU chunk's values).
+        for l in v.iter_mut() {
+            l.src1_val ^= 0xdead;
+        }
+        assert_ne!(Identity::of(&[&v[..]]), held);
+        // The same logs elsewhere (a regenerated window): another address.
+        let copy = logs(n);
+        assert_ne!(Identity::of(&[&copy[..]]), held);
+        // The same logs cut into other pieces: another identity too.
+        let (a, b) = copy.split_at(1000);
+        assert_ne!(Identity::of(&[a, b]), Identity::of(&[&copy[..]]));
     }
 
     #[test]
