@@ -96,12 +96,6 @@ lemma row_index {x y z : ℕ} (hx : x < 2^8) (hy : y < 2^8) (hz : z < 16) :
   have h3 : index x y z / 2^16 % 16 = z := by unfold index; omega
   simp only [row, h1, h2, h3]
 
-/-- Everything in the table is below `2^20 < p`, so casting to the field is injective. -/
-lemma lt_p_of_lt_two_pow_20 {n : ℕ} (h : n < 2^20) : n < p := lt_trans h (by decide)
-
-lemma val_natCast_of_lt_two_pow_20 {n : ℕ} (h : n < 2^20) : ((n : F p)).val = n :=
-  ZMod.val_natCast_of_lt (lt_p_of_lt_two_pow_20 h)
-
 /-! ## Range-check channels -/
 
 /-- `ARE_BYTES[X, Y]` (`BusId::AreBytes`): both values are bytes. -/
@@ -118,8 +112,8 @@ def areBytesTable : StaticLookupChannel (F p) fieldPair where
       · rw [row_index hx hy (by norm_num)]; exact ZMod.natCast_zmod_val x
       · rw [row_index hx hy (by norm_num)]; exact ZMod.natCast_zmod_val y
     · rintro ⟨r, ⟨i, _, rfl⟩, rfl, rfl⟩
-      exact ⟨by rw [val_natCast_of_lt_two_pow_20 (by linarith [row_x_lt i])]; exact row_x_lt i,
-             by rw [val_natCast_of_lt_two_pow_20 (by linarith [row_y_lt i])]; exact row_y_lt i⟩
+      exact ⟨by rw [val_natCast_of_lt_two_pow_40 (by linarith [row_x_lt i])]; exact row_x_lt i,
+             by rw [val_natCast_of_lt_two_pow_40 (by linarith [row_y_lt i])]; exact row_y_lt i⟩
 
 abbrev AreBytes : Channel (F p) fieldPair := areBytesTable.toChannel
 
@@ -141,7 +135,7 @@ def isHalfTable : StaticLookupChannel (F p) field where
       exact ZMod.natCast_zmod_val h
     · rintro ⟨r, ⟨i, _, rfl⟩, rfl⟩
       have := row_x_lt i; have := row_y_lt i
-      rw [val_natCast_of_lt_two_pow_20 (by omega)]; omega
+      rw [val_natCast_of_lt_two_pow_40 (by omega)]; omega
 
 abbrev IsHalf : Channel (F p) field := isHalfTable.toChannel
 
@@ -163,7 +157,7 @@ def isB20Table : StaticLookupChannel (F p) field where
       exact ZMod.natCast_zmod_val v
     · rintro ⟨r, ⟨i, _, rfl⟩, rfl⟩
       have := row_x_lt i; have := row_y_lt i; have := row_z_lt i
-      rw [val_natCast_of_lt_two_pow_20 (by omega)]; omega
+      rw [val_natCast_of_lt_two_pow_40 (by omega)]; omega
 
 abbrev IsB20 : Channel (F p) field := isB20Table.toChannel
 
@@ -191,7 +185,7 @@ def msb8Table : StaticLookupChannel (F p) fieldPair where
         rw [← hm]; exact ZMod.natCast_zmod_val m
     · rintro ⟨r, ⟨i, _, rfl⟩, rfl, rfl⟩
       have := row_x_lt i
-      rw [val_natCast_of_lt_two_pow_20 (by omega), val_natCast_of_lt_two_pow_20 (by rw [row_msb8]; omega),
+      rw [val_natCast_of_lt_two_pow_40 (by omega), val_natCast_of_lt_two_pow_40 (by rw [row_msb8]; omega),
         row_msb8]
       exact ⟨this, rfl⟩
 
@@ -219,7 +213,7 @@ def msb16Table : StaticLookupChannel (F p) fieldPair where
         exact ZMod.natCast_zmod_val m
     · rintro ⟨r, ⟨i, _, rfl⟩, rfl, rfl⟩
       have := row_x_lt i; have := row_y_lt i
-      rw [val_natCast_of_lt_two_pow_20 (by omega), val_natCast_of_lt_two_pow_20 (by rw [row_msb16]; omega),
+      rw [val_natCast_of_lt_two_pow_40 (by omega), val_natCast_of_lt_two_pow_40 (by rw [row_msb16]; omega),
         row_msb16]
       exact ⟨by omega, rfl⟩
 
@@ -250,11 +244,11 @@ def zeroTable : StaticLookupChannel (F p) fieldPair where
         split_ifs <;> simp
     · rintro ⟨r, ⟨i, _, rfl⟩, rfl, rfl⟩
       have := row_x_lt i; have := row_y_lt i; have := row_z_lt i
-      rw [val_natCast_of_lt_two_pow_20 (by omega), row_zero]
+      rw [val_natCast_of_lt_two_pow_40 (by omega), row_zero]
       refine ⟨by omega, ?_⟩
       have hn : (((row i).x + 2^8 * (row i).y + 2^16 * (row i).z : ℕ) : F p) = 0 ↔
           ((row i).x = 0 ∧ (row i).y = 0 ∧ (row i).z = 0) := by
-        rw [← ZMod.val_eq_zero, val_natCast_of_lt_two_pow_20 (by omega)]; omega
+        rw [← ZMod.val_eq_zero, val_natCast_of_lt_two_pow_40 (by omega)]; omega
       simp only [hn]
       split_ifs <;> simp
 
@@ -311,13 +305,13 @@ def byteAluTable : StaticLookupChannel (F p) ByteAluMsg where
     · rintro ⟨r, ⟨i, _, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl, rfl⟩⟩
       all_goals
         have hx := row_x_lt i; have hy := row_y_lt i
-        rw [val_natCast_of_lt_two_pow_20 (by omega), val_natCast_of_lt_two_pow_20 (by omega)]
+        rw [val_natCast_of_lt_two_pow_40 (by omega), val_natCast_of_lt_two_pow_40 (by omega)]
         refine ⟨hx, hy, ?_⟩
-      · left; rw [row_and, val_natCast_of_lt_two_pow_20 (by linarith [and_lt_256 (x := (row i).x) hy])]
+      · left; rw [row_and, val_natCast_of_lt_two_pow_40 (by linarith [and_lt_256 (x := (row i).x) hy])]
         simp
-      · right; left; rw [row_or, val_natCast_of_lt_two_pow_20 (by linarith [or_lt_256 hx hy])]
+      · right; left; rw [row_or, val_natCast_of_lt_two_pow_40 (by linarith [or_lt_256 hx hy])]
         simp
-      · right; right; rw [row_xor, val_natCast_of_lt_two_pow_20 (by linarith [xor_lt_256 hx hy])]
+      · right; right; rw [row_xor, val_natCast_of_lt_two_pow_40 (by linarith [xor_lt_256 hx hy])]
         simp
 
 abbrev ByteAlu : Channel (F p) ByteAluMsg := byteAluTable.toChannel
@@ -360,8 +354,8 @@ def hwslTable : StaticLookupChannel (F p) HwslMsg where
         rw [row_sll, sll_eq hh]; exact Nat.mod_lt _ (by norm_num)
       have hsllc_lt : (row i).sllc < 2^16 := by
         rw [row_sllc, sllc_eq hh]; exact (Nat.shiftRight_le _ _).trans_lt hh
-      rw [val_natCast_of_lt_two_pow_20 (by omega), val_natCast_of_lt_two_pow_20 (by omega),
-        val_natCast_of_lt_two_pow_20 (by omega), val_natCast_of_lt_two_pow_20 (by omega),
+      rw [val_natCast_of_lt_two_pow_40 (by omega), val_natCast_of_lt_two_pow_40 (by omega),
+        val_natCast_of_lt_two_pow_40 (by omega), val_natCast_of_lt_two_pow_40 (by omega),
         row_sll, row_sllc, sll_eq hh, sllc_eq hh]
       exact ⟨hh, hz, rfl, rfl⟩
 

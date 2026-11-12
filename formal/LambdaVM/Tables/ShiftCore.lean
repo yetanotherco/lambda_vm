@@ -31,6 +31,18 @@ theorem and48 {s : ℕ} (hs : s < 256) : s &&& 48 = 16 * (s / 16 % 4) := by
 theorem and16 {s : ℕ} (hs : s < 256) : s &&& 16 = 16 * (s / 16 % 2) := by
   interval_cases s <;> decide
 
+/-- The `limb_shift` mask `48 − 32·w` picks the limb index of the shift amount. -/
+theorem and_mask {s w : ℕ} (hs : s < 256) (hw : w < 2) :
+    s &&& (48 - 32 * w) = 16 * (s / 16 % (4 - 2 * w)) := by
+  rcases (by omega : w = 0 ∨ w = 1) with rfl | rfl
+  · simpa using and48 hs
+  · simpa using and16 hs
+
+/-- The shift amount reduced mod 32 or 64, split into limb index and bit shift. -/
+theorem mod_word {s w : ℕ} (hw : w < 2) :
+    s % (if w = 1 then 32 else 64) = 16 * (s / 16 % (4 - 2 * w)) + s % 16 := by
+  rcases (by omega : w = 0 ∨ w = 1) with rfl | rfl <;> simp <;> omega
+
 /-- Left shift: phase 1 (`bit_shift = b`) and phase 2 (`limb_shift = L`) together. -/
 theorem leftShift {i0 i1 i2 i3 b L : ℕ}
     (h0 : i0 < 65536) (h1 : i1 < 65536) (h2 : i2 < 65536) (h3 : i3 < 65536)
@@ -134,11 +146,7 @@ theorem main {d sg w s i0 i1 i2 i3 l0 l1 l2 b n x0 x1 x2 x3 x4 y0 y1 y2 y3 : ℕ
     limbs sh.1 sh.2.1 sh.2.2.1 sh.2.2.2 = shiftResult w sg d (limbs i0 i1 i2 i3) s := by
   intro sh
   -- the one-hot index and the shift amount
-  have hmask : s &&& (48 - 32 * w) = 16 * (s / 16 % (4 - 2 * w)) := by
-    rcases (by omega : w = 0 ∨ w = 1) with rfl | rfl
-    · simpa using and48 hs
-    · simpa using and16 hs
-  rw [hmask] at hL
+  rw [and_mask hs hw] at hL
   have hn2 : n < 2 := by rw [hn]; split_ifs <;> omega
   have he : 65535 * n = 0 ∨ 65535 * n = 65535 := by omega
   have hX : limbs i0 i1 i2 i3 < 2^64 := by unfold limbs; omega
@@ -149,8 +157,7 @@ theorem main {d sg w s i0 i1 i2 i3 l0 l1 l2 b n x0 x1 x2 x3 x4 y0 y1 y2 y3 : ℕ
     have hb16 : s % 16 < 16 := Nat.mod_lt _ (by norm_num)
     have core := leftShift h0 h1 h2 h3 hb16 (L := l1 + 2 * l2 + 3 * (1 - l0 - l1 - l2)) (by omega)
     simp only at core
-    have hk : s % (if w = 1 then 32 else 64) = 16 * (s / 16 % (4 - 2 * w)) + s % 16 := by
-      rcases (by omega : w = 0 ∨ w = 1) with rfl | rfl <;> simp <;> omega
+    have hk := mod_word (s := s) hw
     have hLv : s / 16 % (4 - 2 * w) = l1 + 2 * l2 + 3 * (1 - l0 - l1 - l2) := by omega
     rcases (by omega : (l0 = 1 ∧ l1 = 0 ∧ l2 = 0) ∨ (l0 = 0 ∧ l1 = 1 ∧ l2 = 0) ∨
         (l0 = 0 ∧ l1 = 0 ∧ l2 = 1) ∨ (l0 = 0 ∧ l1 = 0 ∧ l2 = 0)) with
@@ -173,8 +180,7 @@ theorem main {d sg w s i0 i1 i2 i3 l0 l1 l2 b n x0 x1 x2 x3 x4 y0 y1 y2 y3 : ℕ
     simp only at p2
     obtain ⟨hs0, hs1, hs2, hs3, hsh⟩ := p2
     rw [hir, rightCompose hX hr (by omega) he] at hsh
-    have hk : s % (if w = 1 then 32 else 64) = 16 * (s / 16 % (4 - 2 * w)) + s % 16 := by
-      rcases (by omega : w = 0 ∨ w = 1) with rfl | rfl <;> simp <;> omega
+    have hk := mod_word (s := s) hw
     -- the result as the shift of the sign-extended value
     have hres : shiftResult w sg 1 (limbs i0 i1 i2 i3) s
         = ((limbs i0 i1 i2 i3 + 65535 * n * (2^64 + 2^80 + 2^96 + 2^112))

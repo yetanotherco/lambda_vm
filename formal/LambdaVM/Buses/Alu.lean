@@ -58,7 +58,10 @@ def sra64 (x k : ℕ) : ℕ :=
 
 /-- `SHIFT` result (spec/src/shift.toml): the shift amount is reduced mod 32 for word instructions
 and mod 64 otherwise; `direction` picks left (0) or right (1); `signed` picks the arithmetic
-right shift. Word results are not sign-extended here (the CPU does that). -/
+right shift. Word results are not sign-extended here (the CPU does that). For `word = 1` the
+shift still acts on all 64 bits of `x`, so for a right shift the caller must pass `x` with its
+high word already zero-extended (logical) or sign-extended (arithmetic); otherwise bits of the
+high word shift into the low 32 bits of the result. -/
 def shiftResult (word signed direction x s : ℕ) : ℕ :=
   let k := s % (if word = 1 then 32 else 64)
   if direction = 0 then (x <<< k) % 2^64

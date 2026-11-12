@@ -175,6 +175,12 @@ lemma shiftedPoly_cast {d l0 l1 l2 e x0 x1 x2 x3 x4 y0 y1 y2 y3 : ℕ} (hd : d �
   push_cast [Nat.cast_sub hd, Nat.cast_sub h1, Nat.cast_sub h2, Nat.cast_sub h3]
   refine ⟨by ring, by ring, by ring, by ring⟩
 
+/-- The `limb_shift` mask `48 − 32·w` on a boolean `w`, as a natural. -/
+lemma mask_val {w : F p} (hw : w = 0 ∨ w = 1) : (48 - 32 * w).val = 48 - 32 * w.val := by
+  rcases hw with rfl | rfl
+  · simp only [mul_zero, sub_zero, ZMod.val_zero]; exact val_ofNat 48 (by norm_num)
+  · norm_num; exact val_ofNat 16 (by norm_num)
+
 /-- What an active row establishes: `out` is `in` shifted by the low byte of the amount. -/
 def RowSpec (r : Row (F p)) : Prop :=
   r.mu = 1 →
@@ -222,7 +228,8 @@ def Honest (r : Row (F p)) : Prop :=
   r.out0.val = (shiftedOf r).1 + 65536 * (shiftedOf r).2.1 ∧
   r.out1.val = (shiftedOf r).2.2.1 + 65536 * (shiftedOf r).2.2.2
 
-/-- A padding row: everything zero except `zbs = 1`. -/
+/-- A padding row: `zbs = 1` and the columns below zero. `in`, `bitShift`, `shiftH1` and
+`shiftHigh` are left free, so this covers more rows than the all-zero Rust padding row. -/
 def Padding (r : Row (F p)) : Prop :=
   r.mu = 0 ∧ r.direction = 0 ∧ r.signed = 0 ∧ r.wordInstr = 0 ∧ r.zbs = 1 ∧
   r.isNegative = 0 ∧ r.x0 = 0 ∧ r.x1 = 0 ∧ r.x2 = 0 ∧ r.x3 = 0 ∧ r.x4 = 0 ∧
@@ -427,10 +434,7 @@ theorem soundness :
           + 3 * (1 - input_ls0.val - input_ls1.val - input_ls2.val))
         = input_shiftAmount.val &&& (48 - 32 * input_wordInstr.val) := by
       obtain ⟨-, -, hand | ⟨h02, -⟩⟩ := h_lsb rfl
-      · have hmask : (48 - 32 * input_wordInstr).val = 48 - 32 * input_wordInstr.val := by
-          rcases hwb with hw0 | hw1
-          · rw [hw0]; simp only [mul_zero, sub_zero, ZMod.val_zero]; exact val_ofNat 48 (by norm_num)
-          · rw [hw1]; norm_num; exact val_ofNat 16 (by norm_num)
+      · have hmask := mask_val hwb
         have henc : (48 - 48 * input_ls0 - 32 * input_ls1 - 16 * input_ls2).val
             = 48 - 48 * input_ls0.val - 32 * input_ls1.val - 16 * input_ls2.val := by
           rcases hl0b with h0 | h0 <;> rcases hl1b with h1 | h1 <;> rcases hl2b with h2 | h2 <;>
@@ -740,18 +744,10 @@ theorem completeness :
         · rw [hdiff, hext, hx4, hsub]; exact sllc_eq (by omega)
       · -- BYTE_ALU[AND, shift, mask]
         intro _
-        have hmask : (48 - 32 * input_wordInstr).val = 48 - 32 * input_wordInstr.val := by
-          rcases hwb with hw0 | hw0
-          · rw [hw0]; simp only [mul_zero, sub_zero, ZMod.val_zero]; exact val_ofNat 48 (by norm_num)
-          · rw [hw0]; norm_num; exact val_ofNat 16 (by norm_num)
+        have hmask := mask_val hwb
         refine ⟨hsA, by rw [hmask]; omega, Or.inl ?_⟩
         rw [hmask]
-        have hand : input_shiftAmount.val &&& (48 - 32 * input_wordInstr.val)
-            = 16 * (input_shiftAmount.val / 16 % (4 - 2 * input_wordInstr.val)) := by
-          rcases (by omega : input_wordInstr.val = 0 ∨ input_wordInstr.val = 1) with h | h
-          · rw [h]; simpa using ShiftCore.and48 hsA
-          · rw [h]; simpa using ShiftCore.and16 hsA
-        rw [hand]
+        rw [ShiftCore.and_mask (w := input_wordInstr.val) hsA (by omega)]
         rw [eq_natCast_of_val hl0, eq_natCast_of_val hl1, eq_natCast_of_val hl2]
         rcases (by omega : input_shiftAmount.val / 16 % (4 - 2 * input_wordInstr.val) = 0 ∨
             input_shiftAmount.val / 16 % (4 - 2 * input_wordInstr.val) = 1 ∨
@@ -769,6 +765,7 @@ theorem completeness :
 
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
+  name := "SHIFT"
   main
   elaborated
   Spec r _ _ := RowSpec r

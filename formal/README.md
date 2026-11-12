@@ -72,7 +72,7 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
 
 - Precompute the `ElaboratedCircuit` instance (`instance elaborated := by
   elaborate_circuit`) and pass it explicitly; without it every proof of a
-  38-operation circuit times out at elaboration.
+  39-operation circuit times out at elaboration.
 - Keep large row polynomials folded behind a definition (`shiftedPoly`) with a
   lemma that pushes `Expression.eval` inside, and bridge to the natural-number
   version with one cast lemma.
@@ -92,9 +92,9 @@ that they are the same polynomials and the same bus interactions is mechanical:
    direction, multiplicity and message, variables numbered in Rust column order.
    Multiplicities are nonnegative; the direction carries the sign. It also writes
    `export/bitwise.json`: the size of the BITWISE table and of every static
-   lookup channel, and a sample of the table (every `z` with edge bytes, the
-   last row, 256 pseudo-random rows) with the precomputed columns of each row
-   and the message every channel serves there.
+   lookup channel, and a sample of the table (every `z` with edge bytes, which
+   includes the last row, and 256 pseudo-random rows) with the precomputed
+   columns of each row and the message every channel serves there.
 2. `prover/src/tests/lean_diff.rs` is the prover test that reads them:
    `cargo test -p lambda-vm-prover lean_diff -- --nocapture`.
 
@@ -120,7 +120,7 @@ Result on `main` after that merge, 2026-10-28:
   only in Lean, `ARE_BYTES[μ, 0]` with multiplicity one exists only in Rust.
   The test pins both by content, and its trace has deduplicated rows (`μ ≥ 2`),
   where the Lean-only constraint fails as expected.
-- BITWISE: same size, all 2^20 rows, 657 sampled rows and 8 channels (10 Rust
+- BITWISE: same size, all 2^20 rows, 656 sampled rows and 8 channels (10 Rust
   receivers), exact match.
 
 The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
@@ -182,6 +182,8 @@ Until then LT keeps `μ ∈ {0, 1}` (see below).
   multiplicity exactly 1, so until the counted pulls above land upstream the
   model keeps `μ` a bit. Every chip whose `μ` the spec types as `Byte` (MUL,
   DVRM, BRANCH, BYTEWISE) will need the same treatment.
+- `isByte` sends `ARE_BYTES[X, 0]`, as every single-byte check in the prover
+  does; `spec/src/is_byte.toml` writes `[0, X]`.
 - The `spec/` copy in this repository lags the `spec/main` branch; the spec the
   models follow is that branch at `2eaf1f080` (EQ's `μ` is `Bit` with
   `IS_BIT[μ]` there). Constraints are cited from `spec/src/*.toml`, which the

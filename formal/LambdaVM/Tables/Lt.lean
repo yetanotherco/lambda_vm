@@ -165,6 +165,7 @@ def RowSpec (r : Row (F p)) : Prop :=
     r.res = ((ltBit r.signed.val r.invert.val r.lhsVal r.rhsVal : ℕ) : F p)
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
+  name := "LT"
   main
   Spec r _ _ := RowSpec r
   channelsWithRequirements := [Alu.channel.toRaw]

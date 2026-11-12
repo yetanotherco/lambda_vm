@@ -22,14 +22,14 @@ meta def exportCircuit (name : String) {Row : TypeMap} [ProvableType Row]
   IO.FS.writeFile s!"export/{name}.json" (json.pretty 100)
   IO.println s!"wrote export/{name}.json"
 
-/-- BITWISE rows to sample: every `z` with edge bytes for `x` and `y`, the last row, and
-pseudo-random rows. -/
+/-- BITWISE rows to sample: every `z` with edge bytes for `x` and `y` (the last row
+included), and pseudo-random rows. -/
 meta def bitwiseIndices : List ℕ :=
   let edge := [0, 1, 0x7F, 0x80, 0xFF]
   let grid := (List.range 16).flatMap fun z =>
     edge.flatMap fun y => edge.map fun x => Bitwise.index x y z
   let random := (List.range 256).map fun k => (k * 2654435761 + 12345) % Bitwise.numRows
-  grid ++ [Bitwise.numRows - 1] ++ random
+  grid ++ random
 
 meta def rowJson (r : Bitwise.Row) : Json :=
   toJson [r.x, r.y, r.z, r.and, r.or, r.xor, r.msb8, r.msb16, r.zero, r.sll, r.sllc]

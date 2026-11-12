@@ -129,18 +129,28 @@ fn load_lean(name: &str) -> LeanCircuit {
 
 /// Clean channel name → Lambda VM `BusId` (see `tables/types.rs`).
 fn bus_id_of(channel: &str) -> u64 {
-    match channel {
-        "ARE_BYTES" => 0,
-        "IS_HALF" => 1,
-        "IS_B20" => 2,
-        "MSB8" => 6,
-        "MSB16" => 7,
-        "ZERO" => 8,
-        "HWSL" => 9,
-        "BYTE_ALU" => 24,
-        "ALU" => 25,
+    let bus = match channel {
+        "ARE_BYTES" => BusId::AreBytes,
+        "IS_HALF" => BusId::IsHalfword,
+        "IS_B20" => BusId::IsB20,
+        "MSB8" => BusId::Msb8,
+        "MSB16" => BusId::Msb16,
+        "ZERO" => BusId::Zero,
+        "HWSL" => BusId::Hwsl,
+        "BYTE_ALU" => BusId::ByteAlu,
+        "ALU" => BusId::Alu,
         other => panic!("unknown channel {other}"),
-    }
+    };
+    bus as u64
+}
+
+/// Padding rows are the rows with `μ = 0`; the honest-row checks cover them only if the
+/// trace has some.
+fn assert_has_padding(label: &str, honest: &[Vec<FE>], mu: usize) {
+    assert!(
+        honest.iter().any(|r| r[mu] == FE::zero()),
+        "[{label}] the trace has padding rows"
+    );
 }
 
 // =============================================================================
@@ -390,6 +400,7 @@ fn lean_diff_lt() {
     let lean = load_lean("lt");
     let interactions = bus_interactions();
     let honest = rows_of(&trace, cols::NUM_COLUMNS);
+    assert_has_padding("LT", &honest, cols::MU);
     let report = compare(
         "LT",
         &lean,
@@ -480,13 +491,15 @@ fn lean_diff_eq() {
         ops.push(EqOperation::new(a, b, rng.next_u64() & 1 == 1));
     }
     let trace = generate_eq_trace(&ops);
+    let honest = rows_of(&trace, cols::NUM_COLUMNS);
+    assert_has_padding("EQ", &honest, cols::MU);
     let report = compare(
         "EQ",
         &load_lean("eq"),
         &EqConstraints,
         &bus_interactions(),
         cols::NUM_COLUMNS,
-        &rows_of(&trace, cols::NUM_COLUMNS),
+        &honest,
     );
     assert!(
         report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(),
@@ -543,13 +556,15 @@ fn lean_diff_shift() {
         ));
     }
     let trace = generate_shift_trace(&ops);
+    let honest = rows_of(&trace, cols::NUM_COLUMNS);
+    assert_has_padding("SHIFT", &honest, cols::MU);
     let report = compare(
         "SHIFT",
         &load_lean("shift"),
         &ShiftConstraints,
         &bus_interactions(),
         cols::NUM_COLUMNS,
-        &rows_of(&trace, cols::NUM_COLUMNS),
+        &honest,
     );
     assert!(
         report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(),
