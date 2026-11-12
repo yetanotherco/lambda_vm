@@ -195,7 +195,8 @@ pub(crate) struct DeferredEcrec {
 enum DeferState {
     Queued,
     Running,
-    Done(Result<ResolvedEcrec, String>),
+    /// Boxed: the witness is ≈ 3 KB, the other states nothing.
+    Done(Box<Result<ResolvedEcrec, String>>),
     Taken,
 }
 
@@ -291,7 +292,7 @@ impl DeferredEcrec {
             *state = DeferState::Running;
         }
         let out = self.compute();
-        *self.lock() = DeferState::Done(out);
+        *self.lock() = DeferState::Done(Box::new(out));
         self.done.notify_all();
     }
 
@@ -315,7 +316,7 @@ impl DeferredEcrec {
                     state = self.done.wait(state).unwrap_or_else(|e| e.into_inner());
                 }
                 DeferState::Done(out) => {
-                    return Self::taken(out, self.timestamp, t.elapsed().as_secs_f64());
+                    return Self::taken(*out, self.timestamp, t.elapsed().as_secs_f64());
                 }
                 DeferState::Taken => {
                     return Err(crate::Error::Prover(format!(
