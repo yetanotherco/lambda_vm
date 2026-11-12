@@ -52,6 +52,7 @@ fn configs() -> [(&'static str, MaxRowsConfig); 3] {
 /// dropping its streamed ops, the walkers counting where they make the rows,
 /// split (walker and accumulator) or through `push`, the hand-out's counting
 /// on a thread of its own or not; and the windows its walkers counted.
+#[allow(clippy::too_many_arguments)]
 fn made_build(
     program: &executor::elf::Elf,
     logs: &[executor::vm::logs::Log],
