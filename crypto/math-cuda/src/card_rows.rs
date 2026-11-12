@@ -1,7 +1,8 @@
 //! Rank 1, stage S1 (`thoughts/zf/gap3/D-CARDROWS-FABLE.md` §7, with probe
 //! K0b's lessons, `I-CARDPROBE.md`): a group's upload under
-//! `LAMBDA_VM_CARD_ROWS` (read once; unset, `0` or `off` is today's path,
-//! byte for byte and call for call).
+//! `LAMBDA_VM_CARD_ROWS` (read once). Unset is `order`; `0` or `off` is the
+//! upload as it was before (`DeviceColumns::upload_tables_today`), byte for
+//! byte and call for call. Every mode writes the same words.
 //!
 //! - `order`: every copy of the group first, then every kernel, then the one
 //!   sync and the one check readback the upload already makes. Today each
@@ -55,21 +56,24 @@ const DEFAULT_CACHE_MIB: u64 = 1024;
 /// What a group's upload does ([`CARD_ROWS_ENV`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Today's upload.
+    /// The upload as it was before this knob: each table's copy, then its
+    /// kernel, table by table.
     Off,
-    /// Every copy, then every kernel.
+    /// Every copy, then every kernel: the default.
     Order,
     /// [`Mode::Order`], CPU logs kept on the card, LOAD and STORE derived.
     Derive,
 }
 
 impl Mode {
-    /// The knob's reading: unset, `0` or `off` is [`Mode::Off`]; `order`;
-    /// `derive` or `1`. Anything else is refused.
+    /// The knob's reading: unset (or empty) or `order` is [`Mode::Order`],
+    /// the default (s1b: whole block −0.76 / −0.96 s large with order /
+    /// derive, ≈ 0 median, never slower); `0` or `off` is [`Mode::Off`];
+    /// `derive` or `1` is [`Mode::Derive`]. Anything else is refused.
     pub fn parse(word: Option<&str>) -> Result<Self, String> {
         match word.map(str::trim) {
-            None | Some("") | Some("0") | Some("off") => Ok(Self::Off),
-            Some("order") => Ok(Self::Order),
+            None | Some("") | Some("order") => Ok(Self::Order),
+            Some("0") | Some("off") => Ok(Self::Off),
             Some("derive") | Some("1") => Ok(Self::Derive),
             Some(other) => Err(format!(
                 "{CARD_ROWS_ENV}={other}: expected off, order or derive"
@@ -90,7 +94,8 @@ impl Mode {
 static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
 /// The mode this process uploads in. An unknown word is reported once and
-/// read as [`Mode::Off`]; the block's report line names the mode in force.
+/// read as [`Mode::Off`], the upload as it was; the block's report line
+/// names the mode in force.
 pub fn mode() -> Mode {
     match OVERRIDE.load(Ordering::Relaxed) {
         1 => return Mode::Off,
@@ -103,7 +108,7 @@ pub fn mode() -> Mode {
         || match Mode::parse(std::env::var(CARD_ROWS_ENV).ok().as_deref()) {
             Ok(mode) => mode,
             Err(e) => {
-                eprintln!("[gpu] {e}; the upload stays off");
+                eprintln!("[gpu] {e}; the upload is as it was (off)");
                 Mode::Off
             }
         },
@@ -1053,8 +1058,9 @@ mod tests {
 
     #[test]
     fn the_knob_reads_off_order_and_derive_and_refuses_the_rest() {
-        assert_eq!(Mode::parse(None), Ok(Mode::Off));
-        assert_eq!(Mode::parse(Some("")), Ok(Mode::Off));
+        // Unset is the default, order.
+        assert_eq!(Mode::parse(None), Ok(Mode::Order));
+        assert_eq!(Mode::parse(Some("")), Ok(Mode::Order));
         assert_eq!(Mode::parse(Some("0")), Ok(Mode::Off));
         assert_eq!(Mode::parse(Some("off")), Ok(Mode::Off));
         assert_eq!(Mode::parse(Some("order")), Ok(Mode::Order));
