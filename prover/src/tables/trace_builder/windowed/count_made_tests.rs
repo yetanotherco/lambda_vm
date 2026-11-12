@@ -193,3 +193,64 @@ fn counting_where_made_applies_only_to_a_build_that_drops_its_ops() {
     traces.insert_streamed(chunks).expect("placeholders");
     same_traces(&reference, &traces);
 }
+
+/// The windowed build of `program`'s run over windows of `window` cycles,
+/// split, dropping its streamed ops, with LT's memory comparisons merged
+/// (`lt_merge`); with `levers`, also the ECREC witnesses deferred and the rows
+/// counted where made (the accumulator routing).
+fn merged_build(
+    program: &executor::elf::Elf,
+    logs: &[executor::vm::logs::Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    levers: bool,
+) -> Traces {
+    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
+        .expect("the builder")
+        .drop_streamed_ops()
+        .expect("before the first window")
+        .lt_merge()
+        .defer_ecrec_witnesses(levers)
+        .count_where_made(levers)
+        .route_where_made(false);
+    assert_eq!(builder.counts_where_made(), levers);
+    let body = logs.len() - 1;
+    let cut = body - body % window;
+    let mut chunks = Vec::new();
+    for w in logs[..cut].chunks(window) {
+        let (mut walker, mut accumulator) = builder.split();
+        let walked = walker.walk(w).expect("a window");
+        chunks.extend(
+            accumulator
+                .absorb(walked)
+                .into_iter()
+                .map(|job| job.generate()),
+        );
+    }
+    let mut traces = builder.finish(&logs[cut..]).expect("the finish");
+    traces.insert_streamed(chunks).expect("placeholders");
+    traces
+}
+
+/// ★ The three levers stacked: with LT's memory comparisons merged, the ECREC
+/// witnesses deferred and the rows counted where made build what the merge
+/// alone builds, table for table, at the small chunks and at one op a chunk.
+#[test]
+fn the_levers_stack_on_the_lt_merge() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    for (_, max_rows) in configs() {
+        for name in [
+            "test_ecrec",
+            "test_ecsm",
+            "all_instructions_64",
+            "test_memw_split_ts",
+        ] {
+            let (program, logs) = run(name);
+            for window in [7, 33] {
+                let reference = merged_build(&program, &logs, &max_rows, window, false);
+                let stacked = merged_build(&program, &logs, &max_rows, window, true);
+                same_traces(&reference, &stacked);
+            }
+        }
+    }
+}
