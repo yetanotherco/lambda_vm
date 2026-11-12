@@ -297,6 +297,18 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
 /// on the curve with canonical coordinates, whichever root its `y` is (`k_le` is `k`'s
 /// bytes). The ECDSA-recovery call builds its two chains with it.
 pub(crate) fn witness_for_point(k: &BigUint, g: &AffinePoint, k_le: &[u8; 32]) -> EcsmWitness {
+    witness_for_point_in(k, g, k_le, true)
+}
+
+/// [`witness_for_point`], its steps built in parallel (`parallel`, with the
+/// `parallel` feature) or one after another on the calling thread. The same
+/// witness either way.
+pub(crate) fn witness_for_point_in(
+    k: &BigUint,
+    g: &AffinePoint,
+    k_le: &[u8; 32],
+    parallel: bool,
+) -> EcsmWitness {
     let (k, g) = (k.clone(), g.clone());
 
     let p_big = BigInt::from(p());
@@ -350,15 +362,25 @@ pub(crate) fn witness_for_point(k: &BigUint, g: &AffinePoint, k_le: &[u8; 32]) -
     // Steps are independent witnesses (each builds its own λ/quotient/carry data
     // from one StepPts), so they parallelize freely when rayon is available.
     #[cfg(feature = "parallel")]
-    let steps = steps_pts
-        .par_iter()
-        .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
-        .collect();
+    let steps = if parallel {
+        steps_pts
+            .par_iter()
+            .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
+            .collect()
+    } else {
+        steps_pts
+            .iter()
+            .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
+            .collect()
+    };
     #[cfg(not(feature = "parallel"))]
-    let steps = steps_pts
-        .iter()
-        .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
-        .collect();
+    let steps = {
+        let _ = parallel;
+        steps_pts
+            .iter()
+            .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
+            .collect()
+    };
 
     EcsmWitness {
         x_g: xg_b,

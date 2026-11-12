@@ -30,7 +30,7 @@ use num_bigint::{BigInt, BigUint};
 use crate::curve::{AffinePoint, StepPts, msb_position};
 use crate::witness::{
     build_step, carries_x2, carries_yg, conv, ext64, limb_carries, shifted_quotient, to_le_33,
-    witness_for_point,
+    witness_for_point, witness_for_point_in,
 };
 use crate::{B, EcdasStep, P_BYTES, R_BYTES, n, p, to_le_32};
 
@@ -382,6 +382,27 @@ fn product_relation(
 /// Computes the ECREC witness for one call: the inputs exactly as read from memory
 /// (`r ‖ s` and `z` big-endian), and `parity` (0 or 1).
 pub fn compute_ecrec_witness(sig_be: &[u8; 64], msg_be: &[u8; 32], parity: u8) -> EcrecWitness {
+    compute_ecrec_witness_in(sig_be, msg_be, parity, true)
+}
+
+/// [`compute_ecrec_witness`] with every step on the calling thread: no
+/// parallel loop, so a thread pool's worker that runs it never waits in one
+/// (and never takes up other work there, deepening its stack). The same
+/// witness.
+pub fn compute_ecrec_witness_serial(
+    sig_be: &[u8; 64],
+    msg_be: &[u8; 32],
+    parity: u8,
+) -> EcrecWitness {
+    compute_ecrec_witness_in(sig_be, msg_be, parity, false)
+}
+
+fn compute_ecrec_witness_in(
+    sig_be: &[u8; 64],
+    msg_be: &[u8; 32],
+    parity: u8,
+    parallel: bool,
+) -> EcrecWitness {
     let r_le = le_of_be(&sig_be[..32]);
     let s_le = le_of_be(&sig_be[32..]);
     let z_le = le_of_be(msg_be);
@@ -435,8 +456,8 @@ pub fn compute_ecrec_witness(sig_be: &[u8; 64], msg_be: &[u8; 32], parity: u8) -
     let g = affine(&k256::AffinePoint::GENERATOR).expect("G is not the identity");
     let u1_le = to_le_32(&rec.u1);
     let u2_le = to_le_32(&rec.u2);
-    let chain1 = witness_for_point(&rec.u1, &g, &u1_le);
-    let chain2 = witness_for_point(&rec.u2, rp, &u2_le);
+    let chain1 = witness_for_point_in(&rec.u1, &g, &u1_le, parallel);
+    let chain2 = witness_for_point_in(&rec.u2, rp, &u2_le, parallel);
     assert_eq!(
         (chain1.x_r, chain1.y_r),
         (to_le_32(&rec.a.x), to_le_32(&rec.a.y)),

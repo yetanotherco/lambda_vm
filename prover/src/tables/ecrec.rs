@@ -180,8 +180,17 @@ pub(crate) fn take_ecdas_ops(witness: &mut EcrecWitness, t: u64) -> Vec<EcdasOpe
 /// One ECREC call's witness and ECDAS rows, computed off the walk: the walk
 /// writes the key it recovered on its own (`ecsm::ecrecover`) and goes on,
 /// and the witness (the scalars, the curve relations and the two chains, the
-/// call's ≈ 29 ms) is computed on the pool, or by the finish if the pool has
-/// not started it. Whoever starts it computes it; the other waits for it.
+/// call's ≈ 29 ms) is computed on a pool of its own ([`witness_pool`]), or by
+/// the finish if the pool has not started it. Whoever starts it computes it;
+/// the other waits for it.
+///
+/// The witness is built serially (`ecsm::compute_ecrec_witness_serial`): a
+/// pool worker that ran the parallel build waited in its loop's joins, and a
+/// waiting worker takes up other queued work, the next call's witness among
+/// it, one inside the other on its stack. With a block's 330–518 calls queued
+/// at once those chains grew past a worker's stack now and then (three block
+/// proves in about 25 aborted). Serially, a job holds one witness's frames and waits
+/// for nothing.
 pub(crate) struct DeferredEcrec {
     sig: [u8; 64],
     msg: [u8; 32],
@@ -206,6 +215,61 @@ pub(crate) struct ResolvedEcrec {
     pub(crate) witness: EcrecWitness,
     pub(crate) rows: Vec<CompactEcdasOp>,
     pub(crate) secs: f64,
+}
+
+/// The threads deferred ECREC witnesses are computed on: as many as the
+/// machine's cores, at most 16, each with an 8 MiB stack, apart from the
+/// global pool (whose workers wait in the prover's joins). `None` when it
+/// cannot be built (the finish then computes every witness).
+#[cfg(feature = "parallel")]
+fn witness_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .stack_size(8 << 20)
+            .thread_name(|i| format!("ecrec-witness-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// How deep deferred witnesses run inside one another on a thread: one, by
+/// construction (each is built serially); a test reads the deepest seen.
+#[cfg(test)]
+pub(crate) mod nesting {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    thread_local! {
+        static DEPTH: Cell<usize> = const { Cell::new(0) };
+    }
+    static DEEPEST: AtomicUsize = AtomicUsize::new(0);
+
+    /// Held while a witness is computed.
+    pub(crate) struct Entered;
+
+    pub(crate) fn enter() -> Entered {
+        let depth = DEPTH.with(|d| {
+            d.set(d.get() + 1);
+            d.get()
+        });
+        DEEPEST.fetch_max(depth, Ordering::SeqCst);
+        Entered
+    }
+
+    impl Drop for Entered {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+
+    /// The deepest nesting seen in this process.
+    pub(crate) fn deepest() -> usize {
+        DEEPEST.load(Ordering::SeqCst)
+    }
 }
 
 impl std::fmt::Debug for DeferredEcrec {
@@ -237,13 +301,16 @@ impl DeferredEcrec {
             done: std::sync::Condvar::new(),
         });
         let job = std::sync::Arc::clone(&call);
-        rayon::spawn(move || {
-            // Nobody else holds it (a re-walked window, dropped): nothing will
-            // take it.
-            if std::sync::Arc::strong_count(&job) > 1 {
-                job.run_if_queued();
-            }
-        });
+        // Without its pool the finish computes it.
+        if let Some(pool) = witness_pool() {
+            pool.spawn(move || {
+                // Nobody else holds it (a re-walked window, dropped): nothing
+                // will take it.
+                if std::sync::Arc::strong_count(&job) > 1 {
+                    job.run_if_queued();
+                }
+            });
+        }
         call
     }
 
@@ -260,8 +327,10 @@ impl DeferredEcrec {
     /// and returned as its message).
     fn compute(&self) -> Result<ResolvedEcrec, String> {
         let t = std::time::Instant::now();
+        #[cfg(test)]
+        let _nest = nesting::enter();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut witness = ecsm::compute_ecrec_witness(&self.sig, &self.msg, self.parity);
+            let mut witness = ecsm::compute_ecrec_witness_serial(&self.sig, &self.msg, self.parity);
             let rows = take_ecdas_ops(&mut witness, self.timestamp)
                 .iter()
                 .map(CompactEcdasOp::from_op)

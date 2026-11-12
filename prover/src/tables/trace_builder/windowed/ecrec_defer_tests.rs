@@ -339,3 +339,51 @@ fn a_windowed_build_deferring_the_ecrec_witnesses_builds_the_whole_run_tables() 
         }
     }
 }
+
+/// The serial witness a deferred call is built with is the witness.
+#[test]
+fn the_serial_witness_is_the_witness() {
+    for bail in [false, true] {
+        let (sig, msg) = inputs(bail);
+        let (sig, msg): ([u8; 64], [u8; 32]) = (sig.try_into().unwrap(), msg.try_into().unwrap());
+        assert_eq!(
+            dbg(&::ecsm::compute_ecrec_witness_serial(&sig, &msg, 0)),
+            dbg(&::ecsm::compute_ecrec_witness(&sig, &msg, 0)),
+            "bail {bail}"
+        );
+    }
+}
+
+/// ★ Deferred witnesses never run inside one another on a thread (a block
+/// prove's stack overflows): many calls queued at once, taken from inside the global pool's
+/// parallel loops (whose workers take up queued work while they wait), each is
+/// computed at depth one, and each gives the computed call's rows.
+#[test]
+fn deferred_witnesses_never_run_inside_one_another() {
+    use rayon::prelude::*;
+    let (_, _, want_rows, _) = call(400, false, false);
+    let want = dbg(&compact(&want_rows));
+    let (sig, msg) = inputs(false);
+    let (sig, msg): ([u8; 64], [u8; 32]) = (sig.try_into().unwrap(), msg.try_into().unwrap());
+    let calls: Vec<_> = (0..96)
+        .map(|_| crate::tables::ecrec::DeferredEcrec::spawn(sig, msg, 0, 400))
+        .collect();
+    let got: Vec<String> = calls
+        .par_iter()
+        .map(|c| {
+            // A nested parallel loop around each take, as the prover's are.
+            let (a, b) = rayon::join(
+                || dbg(&c.take().expect("the witness").0.rows),
+                || (0..1000u64).into_par_iter().sum::<u64>(),
+            );
+            assert_eq!(b, 499_500);
+            a
+        })
+        .collect();
+    assert!(got.iter().all(|g| *g == want), "every call's rows");
+    assert_eq!(
+        crate::tables::ecrec::nesting::deepest(),
+        1,
+        "a deferred witness ran inside another"
+    );
+}

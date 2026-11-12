@@ -26,8 +26,8 @@ use num_bigint::BigUint;
 
 pub use curve::{AffinePoint, recover_y_canonical, replay_double_and_add};
 pub use ecrec::{
-    ECREC_STATUS_BAIL, ECREC_STATUS_KEY, EcrecWitness, compute_ecrec_witness, ecdas_add_step,
-    ecdas_chain, ecrecover, generator_le,
+    ECREC_STATUS_BAIL, ECREC_STATUS_KEY, EcrecWitness, compute_ecrec_witness,
+    compute_ecrec_witness_serial, ecdas_add_step, ecdas_chain, ecrecover, generator_le,
 };
 pub use witness::{EcdasStep, EcsmWitness, compute_witness};
 
