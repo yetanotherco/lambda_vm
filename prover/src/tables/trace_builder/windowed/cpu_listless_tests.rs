@@ -145,7 +145,8 @@ fn built(
                     fast.enable_history().expect("history mode");
                     let mut k = 0usize;
                     loop {
-                        let start = (recheck > 0 && k % recheck == 0).then(|| fast.snapshot());
+                        let start =
+                            (recheck > 0 && k.is_multiple_of(recheck)).then(|| fast.snapshot());
                         let Some((logs, history)) = fast.resume_history(window).expect("the run")
                         else {
                             break;
