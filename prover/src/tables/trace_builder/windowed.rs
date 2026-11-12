@@ -1310,6 +1310,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             own_counts,
             made_counts,
             walked_rows,
+            route_made,
             finish_keccak_rnd_rows,
             finish_cut_rows,
             pack_finished,
@@ -1365,10 +1366,28 @@ impl<'a> WindowedTraceBuilder<'a> {
             Some(mut kept) => {
                 // The walkers' counts, added to the run's; the finish counts
                 // each tail from the first row they did not count.
-                let mut made_counts = made_counts;
-                made_counts.push(own_counts);
-                for counts in made_counts {
-                    counts.add_into(&mut counted.histogram, kept.decode.table())?;
+                if walked_rows.on {
+                    let t = std::time::Instant::now();
+                    let walkers = made_counts.len() + 1;
+                    let mut made_counts = made_counts;
+                    made_counts.push(own_counts);
+                    for counts in made_counts {
+                        counts.add_into(&mut counted.histogram, kept.decode.table())?;
+                    }
+                    eprintln!(
+                        "BLOCK WALK COUNTS: the walkers counted {} CPU ops, {} MEMW_R, {} MEMW_A and \
+                         {} SHIFT rows · routed by {} · {walkers} walkers' counts added in {:.3}s",
+                        walked_rows.cpu,
+                        walked_rows.memw_register,
+                        walked_rows.memw_aligned,
+                        walked_rows.shift,
+                        if route_made {
+                            "the walkers"
+                        } else {
+                            "the accumulator"
+                        },
+                        t.elapsed().as_secs_f64()
+                    );
                 }
                 let not_out = |rows: usize, chunks: usize, max: usize, table: &str| {
                     rows.checked_sub(chunks * max).ok_or_else(|| {
