@@ -46,7 +46,8 @@ use super::{
 /// access, `4·c + 6`, must fit a `u32`.
 pub const HISTORY_MAX_CYCLES: u64 = (1 << 30) - 2;
 
-/// The knob that turns history mode on (`1`).
+/// The knob of history mode: `1` on, `0` off; the block prove reads it unset as
+/// on, on the fast engine with walkers.
 pub const HISTORY_KNOB: &str = "LAMBDA_VM_EXEC_HISTORY";
 
 /// The walk's timestamp of cycle `cycle`.

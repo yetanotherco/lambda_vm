@@ -2076,23 +2076,80 @@ fn parse_exec_prefault(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
-/// `LAMBDA_VM_EXEC_HISTORY=1`: record mode. The fast engine keeps the walk's
-/// access history and writes it beside each window's logs; the walkers read
-/// it instead of a lean pass's entries, the executor's window-start snapshots
-/// and window states ([`parallel::walk_windows_from_history`]). Needs the
-/// fast engine (`LAMBDA_VM_EXEC_ENGINE=fast`) and walkers. Unset, empty or
-/// `0`: off. Anything else refuses the prove. The tables are the same.
-pub(crate) fn exec_history() -> Result<bool, Error> {
-    parse_exec_history(std::env::var("LAMBDA_VM_EXEC_HISTORY").ok().as_deref())
+/// The block prove's interpreter and whether it runs in record mode, from
+/// `LAMBDA_VM_EXEC_ENGINE` and `LAMBDA_VM_EXEC_HISTORY`, the build having
+/// `walkers` walkers. In record mode the fast engine keeps the walk's access
+/// history and writes it beside each window's logs; the walkers read it
+/// instead of a lean pass's entries, the executor's window-start snapshots and
+/// window states ([`parallel::walk_windows_from_history`]). The tables are the
+/// same either way.
+///
+/// - Both unset (or empty): record mode on the fast engine, the default.
+/// - `LAMBDA_VM_EXEC_HISTORY=0`: no record mode, on the engine
+///   `LAMBDA_VM_EXEC_ENGINE` names, the reference when it is unset (the walk
+///   from the lean pass's entries).
+/// - `LAMBDA_VM_EXEC_ENGINE=reference`, the history unset: no record mode.
+/// - `LAMBDA_VM_EXEC_HISTORY=1`: record mode, refused on the reference engine
+///   and without walkers.
+/// - No walkers (`LAMBDA_VM_BLOCK_WALKERS=0`), the history unset: no record
+///   mode, on the engine named (the reference when unset).
+///
+/// Any other value of either refuses the prove.
+pub(crate) fn exec_mode(walkers: usize) -> Result<(EngineKind, bool), Error> {
+    exec_mode_from(
+        std::env::var(executor::vm::engine::ENGINE_KNOB)
+            .ok()
+            .as_deref(),
+        std::env::var("LAMBDA_VM_EXEC_HISTORY").ok().as_deref(),
+        walkers,
+    )
 }
 
-/// [`exec_history`]'s reading of its variable.
-fn parse_exec_history(value: Option<&str>) -> Result<bool, Error> {
+/// [`exec_mode`] of the two variables' values.
+fn exec_mode_from(
+    engine: Option<&str>,
+    history: Option<&str>,
+    walkers: usize,
+) -> Result<(EngineKind, bool), Error> {
+    let engine = match engine.map(str::trim) {
+        None | Some("") => None,
+        named => Some(EngineKind::from_value(named).map_err(Error::Execution)?),
+    };
+    match parse_exec_history(history)? {
+        Some(false) => Ok((engine.unwrap_or(EngineKind::Reference), false)),
+        Some(true) => {
+            if engine == Some(EngineKind::Reference) {
+                return Err(Error::Prover(
+                    "LAMBDA_VM_EXEC_HISTORY=1 needs the fast engine (LAMBDA_VM_EXEC_ENGINE=fast \
+                     or unset)"
+                        .into(),
+                ));
+            }
+            if walkers == 0 {
+                return Err(Error::Prover(
+                    "LAMBDA_VM_EXEC_HISTORY=1 needs walkers (LAMBDA_VM_BLOCK_WALKERS)".into(),
+                ));
+            }
+            Ok((EngineKind::Fast, true))
+        }
+        None if engine == Some(EngineKind::Reference) || walkers == 0 => {
+            Ok((engine.unwrap_or(EngineKind::Reference), false))
+        }
+        None => Ok((EngineKind::Fast, true)),
+    }
+}
+
+/// `LAMBDA_VM_EXEC_HISTORY`'s value: `Some(true)` for `1`, `Some(false)` for
+/// `0`, `None` when unset or empty ([`exec_mode`]'s default); anything else
+/// is refused.
+fn parse_exec_history(value: Option<&str>) -> Result<Option<bool>, Error> {
     match value.map(str::trim) {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
+        None | Some("") => Ok(None),
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
         Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_EXEC_HISTORY={v}: 1 (the walkers read the executor's history) or 0"
+            "LAMBDA_VM_EXEC_HISTORY={v}: 1 (the walkers read the executor's history), 0 (they \
+             do not) or unset (the default: 1 on the fast engine with walkers)"
         ))),
     }
 }
@@ -5977,21 +6034,8 @@ fn prove_streamed(
         );
         // Record mode: the fast engine writes the walk's history, the walkers
         // read it.
-        let history = exec_history()?;
+        let (kind, history) = exec_mode(walkers)?;
         let history_check = exec_history_check()?;
-        if history {
-            if EngineKind::from_env().map_err(Error::Execution)? != EngineKind::Fast {
-                return Err(Error::Prover(
-                    "LAMBDA_VM_EXEC_HISTORY=1 needs the fast engine (LAMBDA_VM_EXEC_ENGINE=fast)"
-                        .into(),
-                ));
-            }
-            if walkers == 0 {
-                return Err(Error::Prover(
-                    "LAMBDA_VM_EXEC_HISTORY=1 needs walkers (LAMBDA_VM_BLOCK_WALKERS)".into(),
-                ));
-            }
-        }
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk;
@@ -6011,10 +6055,9 @@ fn prove_streamed(
                 let t = Instant::now();
                 let failed =
                     |e: executor::vm::execution::ExecutorError| Error::Execution(format!("{e}"));
-                // The interpreter (`LAMBDA_VM_EXEC_ENGINE`), and on the fast
-                // one the sampled re-execution by the reference
+                // The interpreter ([`exec_mode`]), and on the fast one the
+                // sampled re-execution by the reference
                 // (`LAMBDA_VM_EXEC_SHADOW`).
-                let kind = EngineKind::from_env().map_err(Error::Execution)?;
                 let mut executor =
                     Engine::new(kind, program, private_inputs.to_vec()).map_err(failed)?;
                 let shadow_every = match kind {
@@ -8977,7 +9020,8 @@ mod producer_report_tests {
         ExecutorStamps, ProducerStamps, StreamTable, parse_window_log2,
     };
     use super::{
-        parse_exec_history, parse_exec_history_check, parse_exec_prefault, parse_exec_recycle_logs,
+        exec_mode_from, parse_exec_history, parse_exec_history_check, parse_exec_prefault,
+        parse_exec_recycle_logs,
     };
 
     /// `LAMBDA_VM_EXEC_PREFAULT`: off unless `1`; anything else refused.
@@ -8989,12 +9033,36 @@ mod producer_report_tests {
         assert!(parse_exec_prefault(Some("yes")).is_err());
     }
 
-    /// `LAMBDA_VM_EXEC_HISTORY`: off unless `1`; its re-walk period a count.
+    /// Record mode on the fast engine unless `LAMBDA_VM_EXEC_HISTORY=0`, the
+    /// reference engine named, or no walkers; `1` with the reference engine
+    /// or no walkers refused; any other value refused; the check's re-walk
+    /// period a count.
     #[test]
-    fn history_mode_is_off_unless_asked() {
-        assert!(!parse_exec_history(None).unwrap());
-        assert!(!parse_exec_history(Some("0")).unwrap());
-        assert!(parse_exec_history(Some("1")).unwrap());
+    fn history_mode_is_on_unless_turned_off() {
+        use executor::vm::engine::EngineKind::{Fast, Reference};
+        for (engine, history, walkers, want) in [
+            (None, None, 4, Some((Fast, true))),
+            (Some(""), Some(" "), 4, Some((Fast, true))),
+            (Some("fast"), None, 4, Some((Fast, true))),
+            (None, Some("1"), 4, Some((Fast, true))),
+            (Some("fast"), Some("1"), 1, Some((Fast, true))),
+            (None, Some("0"), 4, Some((Reference, false))),
+            (Some("fast"), Some("0"), 4, Some((Fast, false))),
+            (Some("reference"), None, 4, Some((Reference, false))),
+            (Some("reference"), Some("0"), 4, Some((Reference, false))),
+            (None, None, 0, Some((Reference, false))),
+            (Some("fast"), None, 0, Some((Fast, false))),
+            (Some("reference"), Some("1"), 4, None),
+            (None, Some("1"), 0, None),
+            (None, Some("on"), 4, None),
+            (Some("turbo"), None, 4, None),
+        ] {
+            let got = exec_mode_from(engine, history, walkers).ok();
+            assert_eq!(got, want, "{engine:?} {history:?} {walkers} walkers");
+        }
+        assert_eq!(parse_exec_history(None).unwrap(), None);
+        assert_eq!(parse_exec_history(Some("0")).unwrap(), Some(false));
+        assert_eq!(parse_exec_history(Some("1")).unwrap(), Some(true));
         assert!(parse_exec_history(Some("on")).is_err());
         assert_eq!(parse_exec_history_check(None).unwrap(), 0);
         assert_eq!(parse_exec_history_check(Some("16")).unwrap(), 16);

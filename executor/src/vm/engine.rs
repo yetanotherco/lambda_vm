@@ -1,7 +1,9 @@
 //! Which interpreter runs the guest: the reference [`Executor`] or the
-//! [`FastExecutor`], chosen by `LAMBDA_VM_EXEC_ENGINE` (`reference`, the
-//! default, or `fast`). Both write the same logs and publish the same
-//! window-start memory; [`Engine`] gives a caller one type for either.
+//! [`FastExecutor`], named by `LAMBDA_VM_EXEC_ENGINE` (`reference` or `fast`;
+//! [`EngineKind::from_env`] reads unset as `reference`, while the block prove
+//! picks its own default, the fast engine in record mode). Both write the same
+//! logs and publish the same window-start memory; [`Engine`] gives a caller one
+//! type for either.
 use super::{
     execution::{Executor, ExecutorError, ReturnValues},
     fast::FastExecutor,
