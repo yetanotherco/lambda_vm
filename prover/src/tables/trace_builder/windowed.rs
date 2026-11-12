@@ -263,6 +263,8 @@ pub struct WindowedTraceBuilder<'a> {
     cut_padding: CutPadding,
     /// The cycles the walker collects and walks at a time ([`walk_batch`]).
     walk_batch: usize,
+    /// [`Self::defer_ecrec_witnesses`].
+    defer_ecrec: bool,
     /// The last walked window's list lengths, to size the next window's lists
     /// ([`walk_sized`]).
     walk_sizes: WalkSizes,
@@ -537,6 +539,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             gpack: false,
             cut_padding: CutPadding::from_env()?,
             walk_batch: walk_batch(),
+            defer_ecrec: ecrec_deferred(),
             walk_sizes: WalkSizes::default(),
             setup: SetupStamps {
                 image: image_secs,
@@ -642,6 +645,18 @@ impl<'a> WindowedTraceBuilder<'a> {
     #[cfg(test)]
     pub(crate) fn walk_batch(mut self, n: usize) -> Self {
         self.walk_batch = n;
+        self
+    }
+
+    /// The walkers hand each ECREC call's witness (its scalars, curve
+    /// relations and two chains) to the pool and walk on, writing the key they
+    /// recover themselves; the finish takes the witnesses before it builds a
+    /// table (`true`); or they compute it in the walk (`false`). Whatever
+    /// `LAMBDA_VM_ECREC_DEFER` says; the tables are the same. The run's last
+    /// window, walked by the finish, computes its own. Without the `parallel`
+    /// feature it changes nothing.
+    pub fn defer_ecrec_witnesses(mut self, on: bool) -> Self {
+        self.defer_ecrec = on;
         self
     }
 
@@ -1409,6 +1424,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 lookups: !self.lean.lookups,
                 keep_logs: self.keeps_logs(),
                 batch: self.walk_batch,
+                defer_ecrec: self.defer_ecrec,
                 sizes: &mut self.walk_sizes,
                 memory_state: &mut self.memory_state,
                 register_state: &mut self.register_state,
@@ -1517,6 +1533,8 @@ pub struct Walker<'b> {
     keep_logs: bool,
     /// The cycles collected and walked at a time (`0`: the whole window).
     batch: usize,
+    /// [`WindowedTraceBuilder::defer_ecrec_witnesses`].
+    defer_ecrec: bool,
     /// The last window's list lengths ([`walk_sized`]).
     sizes: &'b mut WalkSizes,
     memory_state: &'b mut MemoryState,
@@ -1534,6 +1552,7 @@ impl Walker<'_> {
             self.decode,
             self.lookups,
             self.batch,
+            self.defer_ecrec,
             self.sizes,
             self.memory_state,
             self.register_state,
@@ -1572,6 +1591,7 @@ fn walk_window(
     decode: &DecodeTable,
     lookups: bool,
     batch: usize,
+    defer_ecrec: bool,
     sizes: &mut WalkSizes,
     memory: &mut MemoryState,
     registers: &mut RegisterState,
@@ -1599,13 +1619,14 @@ fn walk_window(
     for part in logs.chunks(batch) {
         let from = cpu_ops.len();
         super::collect_cpu_ops_into(part, decode, first + from, &mut cpu_ops)?;
-        collect_ops_from_cpu_into(
+        super::collect_window_ops_into(
             &cpu_ops[from..],
             decode,
             memory,
             registers,
             &mut walk,
             lookups,
+            defer_ecrec,
         )?;
     }
     *sizes = WalkSizes::of(&walk, logs.len());
@@ -2095,6 +2116,15 @@ impl<T> Segments<T> {
 fn route_fused() -> bool {
     static FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FUSED.get_or_init(|| !std::env::var("LAMBDA_VM_ROUTE_FUSED").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// Whether the walkers hand each ECREC call's witness to the pool
+/// (`LAMBDA_VM_ECREC_DEFER=1`) or compute it in the walk (unset or `0`), for
+/// [`WindowedTraceBuilder::defer_ecrec_witnesses`]'s default. Read once. The
+/// tables are the same.
+fn ecrec_deferred() -> bool {
+    static DEFER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEFER.get_or_init(|| std::env::var("LAMBDA_VM_ECREC_DEFER").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Whether the walker sizes a window's streamed lists from the last window's
@@ -3846,6 +3876,9 @@ pub(crate) mod head_log;
 
 #[cfg(test)]
 mod regen_tests;
+
+#[cfg(test)]
+mod ecrec_defer_tests;
 
 #[cfg(test)]
 mod tail_tests;

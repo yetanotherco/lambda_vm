@@ -166,6 +166,7 @@ impl Setup {
             lookups: self.lookups,
             keep_logs: false,
             batch: self.batch,
+            defer_ecrec: false,
             sizes: &mut sizes,
             memory_state: memory,
             register_state: registers,

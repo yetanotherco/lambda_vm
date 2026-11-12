@@ -235,6 +235,14 @@ impl EcrecWitness {
         }
     }
 
+    /// A witness still to be computed: the inputs as read from memory
+    /// (little-endian limbs) and every other field zero, shaped as a bail. The
+    /// prover holds one where it computes the call's witness later; no table
+    /// may be built from it.
+    pub fn unresolved(r: [u8; 32], s: [u8; 32], z: [u8; 32], parity: u8) -> Self {
+        Self::bail(r, s, z, parity & 1)
+    }
+
     /// The status byte the call writes.
     pub fn status(&self) -> u8 {
         if self.ok {

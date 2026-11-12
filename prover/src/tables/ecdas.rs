@@ -80,6 +80,41 @@ pub struct EcdasOperation {
     pub step: EcdasStep,
 }
 
+/// The `op` byte of the one row a walk lists in place of a deferred ECREC
+/// call's ECDAS rows ([`EcdasOperation::deferred_ecrec`]). No real row has it:
+/// a step doubles (0) or adds (1).
+const DEFERRED_ECREC_OP: u8 = u8::MAX;
+
+impl EcdasOperation {
+    /// The row that stands, in the walk's ECDAS list, for the rows of the ECREC
+    /// call at `timestamp` whose witness is computed later: the finish puts
+    /// the call's rows in its place before any ECDAS table is built
+    /// (`trace_builder::resolve_deferred_ecrec`).
+    pub(crate) fn deferred_ecrec(timestamp: u64) -> Self {
+        Self {
+            timestamp,
+            step: EcdasStep {
+                x_a: [0; 32],
+                y_a: [0; 32],
+                x_g: [0; 32],
+                y_g: [0; 32],
+                round: 0,
+                op: DEFERRED_ECREC_OP,
+                next_op: 0,
+                lambda: [0; 32],
+                x_r: [0; 32],
+                y_r: [0; 32],
+                q0: [0; 33],
+                q1: [0; 33],
+                q2: [0; 33],
+                c0: [0; 64],
+                c1: [0; 64],
+                c2: [0; 64],
+            },
+        }
+    }
+}
+
 // =========================================================================
 // Trace generation
 // =========================================================================
@@ -150,6 +185,10 @@ pub(crate) fn generate_ecdas_rows_of<R: Sync>(
         for (row_idx, row) in rows.iter().enumerate() {
             let op = op(row);
             let s = &op.step;
+            debug_assert_ne!(
+                s.op, DEFERRED_ECREC_OP,
+                "a deferred ECREC call's row reached the ECDAS table"
+            );
 
             table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
             table.set_bytes(row_idx, cols::XG, &s.x_g);
@@ -297,6 +336,12 @@ impl CompactEcdasOp {
                 c2,
             },
         }
+    }
+
+    /// The call's timestamp when the row stands for a deferred ECREC call's
+    /// rows ([`EcdasOperation::deferred_ecrec`]), `None` for a real row.
+    pub(crate) fn deferred_ecrec(&self) -> Option<u64> {
+        (self.op == DEFERRED_ECREC_OP).then_some(self.timestamp)
     }
 
     /// Whether the row keeps its carries as they are.

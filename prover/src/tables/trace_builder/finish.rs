@@ -1013,10 +1013,12 @@ impl<'a> FinishPlan<'a> {
             store_ops,
             cpu32_ops,
             ecsm_ops,
-            ecdas_ops,
+            mut ecdas_ops,
             hint_ops,
-            ecrec_ops,
+            mut ecrec_ops,
         } = ops;
+        // The ECREC witnesses the walkers handed to the pool, in place.
+        super::resolve_deferred_ecrec(&mut ecdas_ops, &mut ecrec_ops)?;
 
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)

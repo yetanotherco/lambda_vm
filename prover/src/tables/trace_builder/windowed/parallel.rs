@@ -109,6 +109,8 @@ struct WalkSettings {
     decode: Arc<DecodeTable>,
     lookups: bool,
     batch: usize,
+    /// [`WindowedTraceBuilder::defer_ecrec_witnesses`].
+    defer_ecrec: bool,
     /// The run's key for [`cell_hash`].
     key: u64,
     /// Keep each window's logs with it ([`WindowedTraceBuilder::keeps_logs`]).
@@ -216,6 +218,7 @@ impl WindowWalker {
             &s.decode,
             s.lookups,
             s.batch,
+            s.defer_ecrec,
             &mut self.sizes,
             &mut self.record,
             &mut self.registers,
@@ -266,6 +269,7 @@ impl WindowWalker {
             &s.decode,
             s.lookups,
             s.batch,
+            s.defer_ecrec,
             &mut self.sizes,
             &mut self.memory,
             &mut self.registers,
@@ -592,6 +596,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         decode: Arc::clone(&builder.decode),
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
+        defer_ecrec: builder.defer_ecrec,
         key: std::collections::hash_map::RandomState::new().hash_one(0u64),
         keep_logs: builder.keeps_logs(),
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),

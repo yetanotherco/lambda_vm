@@ -126,6 +126,39 @@ impl<T> BlockVec<T> {
         self.blocks.iter().flat_map(|block| block.iter())
     }
 
+    /// The elements, in order, to change in place.
+    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.blocks.iter_mut().flat_map(|block| block.iter_mut())
+    }
+
+    /// The list with each element replaced by what `f` pushes for it (none,
+    /// itself, or several), in order, laid out as this one was: a list built
+    /// whole ([`Self::from_vec`]) as one block again, any other in blocks of
+    /// its block length, appended as [`Self::push`] appends (so a list pushed
+    /// element by element comes out as if pushed with the new elements). Each
+    /// block is freed once it is read. The first error `f` returns stops it.
+    pub(super) fn rebuilt<E>(
+        mut self,
+        mut f: impl FnMut(T, &mut Vec<T>) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        if self.blocks.len() <= 1 && self.block == self.len.max(1) {
+            let mut out = Vec::with_capacity(self.len);
+            for x in self.blocks.pop_front().unwrap_or_default() {
+                f(x, &mut out)?;
+            }
+            return Ok(Self::from_vec(out));
+        }
+        let mut out = Self::new(self.block);
+        let mut made = Vec::new();
+        while let Some(block) = self.blocks.pop_front() {
+            for x in block {
+                f(x, &mut made)?;
+                out.extend(made.drain(..));
+            }
+        }
+        Ok(out)
+    }
+
     /// The list as the segments it is the concatenation of.
     pub(super) fn segments(&self) -> Segmented<'_, T> {
         Segmented {

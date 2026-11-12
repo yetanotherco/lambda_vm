@@ -54,7 +54,21 @@ fn walked_from_entries(
     dropped: bool,
     tamper: Tamper,
 ) -> Result<Traces, Error> {
-    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)?;
+    walked_from_entries_with(program, max_rows, window, dropped, tamper, false)
+}
+
+/// [`walked_from_entries`], the walkers deferring the ECREC witnesses
+/// (`defer_ecrec`, [`WindowedTraceBuilder::defer_ecrec_witnesses`]) or not.
+fn walked_from_entries_with(
+    program: &Elf,
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    dropped: bool,
+    tamper: Tamper,
+    defer_ecrec: bool,
+) -> Result<Traces, Error> {
+    let mut builder =
+        WindowedTraceBuilder::new(program, &[], max_rows)?.defer_ecrec_witnesses(defer_ecrec);
     if dropped {
         builder = builder.drop_streamed_ops()?;
     }
@@ -62,6 +76,7 @@ fn walked_from_entries(
         decode: Arc::clone(&builder.decode),
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
+        defer_ecrec: builder.defer_ecrec,
         key: 0x5eed_1234_abcd_0042,
         keep_logs: builder.keeps_logs(),
         digests: None,
@@ -203,6 +218,33 @@ fn windows_walked_from_their_entries_build_the_whole_run_tables() {
                 let traces =
                     walked_from_entries(&program, &max_rows, window.max(1), dropped, Tamper::None)
                         .unwrap_or_else(|e| panic!("{name}, window {window}: {e:?}"));
+                same_traces(&reference, &traces);
+            }
+        }
+    }
+}
+
+/// ★ Walked from their entries with the ECREC witnesses deferred, at every
+/// window length, the handed-out ops kept or dropped, the windows build the
+/// whole-run tables.
+#[test]
+fn windows_walked_from_their_entries_deferring_ecrec_build_the_whole_run_tables() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    let max_rows = MaxRowsConfig::small();
+    for name in ["test_ecrec", "test_ecsm"] {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, &max_rows);
+        for window in [1, 7, 33, logs.len()] {
+            for dropped in [false, true] {
+                let traces = walked_from_entries_with(
+                    &program,
+                    &max_rows,
+                    window.max(1),
+                    dropped,
+                    Tamper::None,
+                    true,
+                )
+                .unwrap_or_else(|e| panic!("{name}, window {window}: {e:?}"));
                 same_traces(&reference, &traces);
             }
         }

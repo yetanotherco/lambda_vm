@@ -31,6 +31,7 @@ use executor::vm::instruction::execution::ECREC_SYSCALL_NUMBER;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::ecdas::{CompactEcdasOp, EcdasOperation};
 use super::ecsm::{CARRY_OFFSET_X2, CARRY_OFFSET_YG, point_coord_busvalues};
 use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
@@ -135,6 +136,11 @@ pub struct EcrecOperation {
     pub addr_sig: u64,
     pub addr_msg: u64,
     pub witness: EcrecWitness,
+    /// A walk that hands the witness to the pool ([`DeferredEcrec`]) holds it
+    /// here until the finish takes it (`trace_builder::resolve_deferred_ecrec`);
+    /// `witness` is then [`EcrecWitness::unresolved`] with the key and status
+    /// the walk wrote. `None` once the witness is in `witness`.
+    pub(crate) pending: Option<std::sync::Arc<DeferredEcrec>>,
 }
 
 impl EcrecOperation {
@@ -142,6 +148,195 @@ impl EcrecOperation {
     pub(crate) fn steps_heap_bytes(&self) -> usize {
         (self.witness.chain1.capacity() + self.witness.chain2.capacity())
             * std::mem::size_of::<EcdasStep>()
+    }
+}
+
+/// The ECDAS rows of the call at `t` whose witness is `witness`, moved out of
+/// it: the first chain at `t`, the second at `t + CHAIN2_KEY`, the final
+/// addition at `t + ADD_KEY`. The witness keeps none.
+pub(crate) fn take_ecdas_ops(witness: &mut EcrecWitness, t: u64) -> Vec<EcdasOperation> {
+    let mut ecdas_ops = Vec::new();
+    for (steps, at) in [
+        (std::mem::take(&mut witness.chain1), t),
+        (
+            std::mem::take(&mut witness.chain2),
+            t.wrapping_add_signed(CHAIN2_KEY),
+        ),
+    ] {
+        ecdas_ops.extend(steps.into_iter().map(|step| EcdasOperation {
+            timestamp: at,
+            step,
+        }));
+    }
+    if let Some(step) = witness.add.take() {
+        ecdas_ops.push(EcdasOperation {
+            timestamp: t.wrapping_add_signed(ADD_KEY),
+            step,
+        });
+    }
+    ecdas_ops
+}
+
+/// One ECREC call's witness and ECDAS rows, computed off the walk: the walk
+/// writes the key it recovered on its own (`ecsm::ecrecover`) and goes on,
+/// and the witness (the scalars, the curve relations and the two chains, the
+/// call's ≈ 29 ms) is computed on the pool, or by the finish if the pool has
+/// not started it. Whoever starts it computes it; the other waits for it.
+pub(crate) struct DeferredEcrec {
+    sig: [u8; 64],
+    msg: [u8; 32],
+    parity: u8,
+    timestamp: u64,
+    state: std::sync::Mutex<DeferState>,
+    done: std::sync::Condvar,
+}
+
+/// Where a [`DeferredEcrec`] is.
+enum DeferState {
+    Queued,
+    Running,
+    Done(Result<ResolvedEcrec, String>),
+    Taken,
+}
+
+/// A deferred call's witness, its ECDAS rows (compact, as the run's list
+/// holds them) and the seconds it took to compute.
+pub(crate) struct ResolvedEcrec {
+    pub(crate) witness: EcrecWitness,
+    pub(crate) rows: Vec<CompactEcdasOp>,
+    pub(crate) secs: f64,
+}
+
+impl std::fmt::Debug for DeferredEcrec {
+    /// Its inputs only: two walks that defer the same call print the same.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredEcrec")
+            .field("timestamp", &self.timestamp)
+            .field("parity", &self.parity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeferredEcrec {
+    /// The call at `timestamp` on `sig`, `msg` and `parity`, its witness
+    /// queued on the pool.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn spawn(
+        sig: [u8; 64],
+        msg: [u8; 32],
+        parity: u8,
+        timestamp: u64,
+    ) -> std::sync::Arc<Self> {
+        let call = std::sync::Arc::new(Self {
+            sig,
+            msg,
+            parity,
+            timestamp,
+            state: std::sync::Mutex::new(DeferState::Queued),
+            done: std::sync::Condvar::new(),
+        });
+        let job = std::sync::Arc::clone(&call);
+        rayon::spawn(move || {
+            // Nobody else holds it (a re-walked window, dropped): nothing will
+            // take it.
+            if std::sync::Arc::strong_count(&job) > 1 {
+                job.run_if_queued();
+            }
+        });
+        call
+    }
+
+    /// The call's timestamp.
+    pub(crate) fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, DeferState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The witness and rows, computed here (a panic in the witness caught
+    /// and returned as its message).
+    fn compute(&self) -> Result<ResolvedEcrec, String> {
+        let t = std::time::Instant::now();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut witness = ecsm::compute_ecrec_witness(&self.sig, &self.msg, self.parity);
+            let rows = take_ecdas_ops(&mut witness, self.timestamp)
+                .iter()
+                .map(CompactEcdasOp::from_op)
+                .collect();
+            (witness, rows)
+        }))
+        .map(|(witness, rows)| ResolvedEcrec {
+            witness,
+            rows,
+            secs: t.elapsed().as_secs_f64(),
+        })
+        .map_err(|panic| {
+            panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a panic".to_string())
+        })
+    }
+
+    /// The pool's job: computes the witness unless someone already started.
+    fn run_if_queued(&self) {
+        {
+            let mut state = self.lock();
+            if !matches!(*state, DeferState::Queued) {
+                return;
+            }
+            *state = DeferState::Running;
+        }
+        let out = self.compute();
+        *self.lock() = DeferState::Done(out);
+        self.done.notify_all();
+    }
+
+    /// The witness and rows, taken: computed here if the pool has not started
+    /// them, waited for if it is computing them. With the seconds it waited.
+    pub(crate) fn take(&self) -> Result<(ResolvedEcrec, f64), crate::Error> {
+        let t = std::time::Instant::now();
+        let mut state = self.lock();
+        loop {
+            match std::mem::replace(&mut *state, DeferState::Taken) {
+                DeferState::Queued => {
+                    // Running: the pool's job, when it comes, finds it started.
+                    *state = DeferState::Running;
+                    drop(state);
+                    let out = self.compute();
+                    *self.lock() = DeferState::Taken;
+                    return Self::taken(out, self.timestamp, 0.0);
+                }
+                DeferState::Running => {
+                    *state = DeferState::Running;
+                    state = self.done.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+                DeferState::Done(out) => {
+                    return Self::taken(out, self.timestamp, t.elapsed().as_secs_f64());
+                }
+                DeferState::Taken => {
+                    return Err(crate::Error::Prover(format!(
+                        "the ECREC call at {}: its witness was taken twice",
+                        self.timestamp
+                    )));
+                }
+            }
+        }
+    }
+
+    fn taken(
+        out: Result<ResolvedEcrec, String>,
+        timestamp: u64,
+        waited: f64,
+    ) -> Result<(ResolvedEcrec, f64), crate::Error> {
+        out.map(|r| (r, waited)).map_err(|e| {
+            crate::Error::Prover(format!(
+                "the ECREC call at {timestamp}: its witness failed: {e}"
+            ))
+        })
     }
 }
 

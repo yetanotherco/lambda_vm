@@ -59,6 +59,7 @@ fn op(sig: &[u8; 64], msg: &[u8; 32], parity: u8) -> EcrecOperation {
         addr_sig: 0x2000,
         addr_msg: 0x3000,
         witness: compute_ecrec_witness(sig, msg, parity),
+        pending: None,
     }
 }
 

@@ -2046,7 +2046,40 @@ fn collect_ops_from_cpu_into(
     out: &mut WalkOutputs,
     lookups: bool,
 ) -> Result<(), Error> {
-    walk_cpu_ops::<true>(cpu_ops, decode, memory_state, register_state, out, lookups)
+    walk_cpu_ops::<true>(
+        cpu_ops,
+        decode,
+        memory_state,
+        register_state,
+        out,
+        lookups,
+        false,
+    )
+}
+
+/// [`collect_ops_from_cpu_into`] for a window of a windowed build: with
+/// `defer_ecrec` each ECREC call's witness is computed off the walk
+/// ([`collect_ecrec_ops`]), and the run's lists hold it pending until the
+/// finish ([`resolve_deferred_ecrec`]).
+#[inline]
+fn collect_window_ops_into(
+    cpu_ops: &[CpuOperation],
+    decode: &DecodeTable,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+    out: &mut WalkOutputs,
+    lookups: bool,
+    defer_ecrec: bool,
+) -> Result<(), Error> {
+    walk_cpu_ops::<true>(
+        cpu_ops,
+        decode,
+        memory_state,
+        register_state,
+        out,
+        lookups,
+        defer_ecrec,
+    )
 }
 
 /// The regeneration walk (D-REGEN §2.5): [`collect_ops_from_cpu_into`] without
@@ -2062,7 +2095,15 @@ fn collect_streamed_ops_from_cpu_into(
     register_state: &mut RegisterState,
     out: &mut WalkOutputs,
 ) -> Result<(), Error> {
-    walk_cpu_ops::<false>(cpu_ops, decode, memory_state, register_state, out, false)
+    walk_cpu_ops::<false>(
+        cpu_ops,
+        decode,
+        memory_state,
+        register_state,
+        out,
+        false,
+        false,
+    )
 }
 
 /// The walk's one body: with `REST` every list ([`collect_ops_from_cpu_into`]),
@@ -2075,6 +2116,7 @@ fn walk_cpu_ops<const REST: bool>(
     register_state: &mut RegisterState,
     out: &mut WalkOutputs,
     lookups: bool,
+    defer_ecrec: bool,
 ) -> Result<(), Error> {
     let WalkOutputs {
         memw,
@@ -2377,7 +2419,7 @@ fn walk_cpu_ops<const REST: bool>(
         // two chains and its final addition).
         if op.ecall_ecrec()
             && let Some((ecrec_memw, ecrec_op, ecrec_ecdas)) =
-                collect_ecrec_ops(op, memory_state, register_state)
+                collect_ecrec_ops(op, memory_state, register_state, REST && defer_ecrec)
         {
             memw.extend_ops(ecrec_memw);
             if REST {
@@ -2739,6 +2781,14 @@ pub(crate) const FORGED_ECREC_R: [u8; 32] = {
     le
 };
 
+/// Whether [`FORGE_ECREC_SWAPPED_CHAINS`] forges the call on `sig` (its
+/// witness is then computed in the walk, so the forgery reaches the key).
+#[cfg(test)]
+fn forges_ecrec(sig: &[u8; 64]) -> bool {
+    let r: [u8; 32] = std::array::from_fn(|i| sig[31 - i]);
+    FORGE_ECREC_SWAPPED_CHAINS.load(std::sync::atomic::Ordering::SeqCst) && r == FORGED_ECREC_R
+}
+
 /// Applies [`FORGE_ECREC_SWAPPED_CHAINS`] to a computed witness.
 #[cfg(test)]
 fn forge_ecrec_swapped_chains(w: &mut ::ecsm::EcrecWitness) {
@@ -2785,10 +2835,19 @@ pub(crate) fn swap_ecrec_chains(w: &mut ::ecsm::EcrecWitness) {
 /// `T + 1`; `x10` register read and the output writes (9 doublewords: the key,
 /// then the status) at `T + 2`. The ECDAS rows: the first chain at `T`, the
 /// second at `T + 1`, the final addition at `T + 2`.
+///
+/// With `defer` (and the `parallel` feature) the walk recovers the key itself
+/// (`ecsm::ecrecover`, what it writes) and hands the rest of the witness to the
+/// pool ([`ecrec::DeferredEcrec`]): the ECREC op then holds it pending and the
+/// ECDAS ops are one row that stands for the call's
+/// ([`ecdas::EcdasOperation::deferred_ecrec`]), until
+/// [`resolve_deferred_ecrec`] puts them in place. A call that bails is never
+/// deferred.
 fn collect_ecrec_ops(
     op: CpuOp<'_>,
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
+    defer: bool,
 ) -> Option<(
     Vec<MemwOperation>,
     ecrec::EcrecOperation,
@@ -2811,9 +2870,7 @@ fn collect_ecrec_ops(
     if memory_state.is_missing() {
         return None;
     }
-    let mut witness = ::ecsm::compute_ecrec_witness(&sig, &msg, parity as u8);
-    #[cfg(test)]
-    forge_ecrec_swapped_chains(&mut witness);
+    let (mut witness, pending) = ecrec_witness_or_deferred(&sig, &msg, parity as u8, t, defer);
 
     let mut memw_ops = Vec::with_capacity(25);
     let mut reg_read = |reg: u8, at: u64, memw_ops: &mut Vec<MemwOperation>| {
@@ -2861,34 +2918,139 @@ fn collect_ecrec_ops(
         memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
-    // The ECDAS rows move out of the witness; the ECREC op keeps none.
-    let mut ecdas_ops: Vec<ecdas::EcdasOperation> = Vec::new();
-    for (steps, at) in [
-        (std::mem::take(&mut witness.chain1), t),
-        (
-            std::mem::take(&mut witness.chain2),
-            t.wrapping_add_signed(ecrec::CHAIN2_KEY),
-        ),
-    ] {
-        ecdas_ops.extend(steps.into_iter().map(|step| ecdas::EcdasOperation {
-            timestamp: at,
-            step,
-        }));
-    }
-    if let Some(step) = witness.add.take() {
-        ecdas_ops.push(ecdas::EcdasOperation {
-            timestamp: t.wrapping_add_signed(ecrec::ADD_KEY),
-            step,
-        });
-    }
+    // The ECDAS rows move out of the witness; the ECREC op keeps none. A
+    // deferred call's are one row standing for them.
+    let ecdas_ops = if pending.is_some() {
+        vec![ecdas::EcdasOperation::deferred_ecrec(t)]
+    } else {
+        ecrec::take_ecdas_ops(&mut witness, t)
+    };
     let ecrec_op = ecrec::EcrecOperation {
         timestamp: t,
         addr_out,
         addr_sig,
         addr_msg,
         witness,
+        pending,
     };
     Some((memw_ops, ecrec_op, ecdas_ops))
+}
+
+/// The ECREC call's witness at `t`, computed here; or, with `defer`, the key
+/// and status alone ([`::ecsm::EcrecWitness::unresolved`] with them set) and the
+/// rest queued on the pool. Bails, a build without the `parallel` feature, and
+/// (under test) the call the forgery switch forges are computed here.
+fn ecrec_witness_or_deferred(
+    sig: &[u8; 64],
+    msg: &[u8; 32],
+    parity: u8,
+    t: u64,
+    defer: bool,
+) -> (
+    ::ecsm::EcrecWitness,
+    Option<std::sync::Arc<ecrec::DeferredEcrec>>,
+) {
+    #[cfg(test)]
+    let defer = defer && !forges_ecrec(sig);
+    #[cfg(feature = "parallel")]
+    if defer && let Some((x_be, y_be)) = ::ecsm::ecrecover(sig, msg, parity) {
+        let le = |be: &[u8]| -> [u8; 32] { std::array::from_fn(|i| be[31 - i]) };
+        let mut witness =
+            ::ecsm::EcrecWitness::unresolved(le(&sig[..32]), le(&sig[32..]), le(msg), parity);
+        witness.ok = true;
+        witness.x_q = le(&x_be);
+        witness.y_q = le(&y_be);
+        let pending = ecrec::DeferredEcrec::spawn(*sig, *msg, parity, t);
+        return (witness, Some(pending));
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = (defer, t);
+    let witness = ::ecsm::compute_ecrec_witness(sig, msg, parity);
+    #[cfg(test)]
+    let witness = {
+        let mut witness = witness;
+        forge_ecrec_swapped_chains(&mut witness);
+        witness
+    };
+    (witness, None)
+}
+
+/// Completes the ECREC calls a walk deferred ([`collect_ecrec_ops`] with
+/// `defer`), in the run's lists: each pending op takes its witness (waiting for
+/// the pool, or computing it here), and each row standing for a call's ECDAS
+/// rows is replaced by them, in place, so the lists are the ones a walk
+/// without deferring makes. The ECDAS list keeps its layout (its block length,
+/// or one block when it was built whole). Refuses lists whose standing rows and
+/// pending ops do not pair up one for one in order (by timestamp), and a
+/// witness whose key or status is not the one the walk wrote. Lists with no
+/// pending op are left as they are, unread past the ECREC ops.
+fn resolve_deferred_ecrec(
+    ecdas_ops: &mut BlockVec<ecdas::CompactEcdasOp>,
+    ecrec_ops: &mut BlockVec<ecrec::EcrecOperation>,
+) -> Result<(), Error> {
+    if !ecrec_ops.iter().any(|op| op.pending.is_some()) {
+        return Ok(());
+    }
+    let t = std::time::Instant::now();
+    let (mut calls, mut waited, mut busy) = (0usize, 0.0f64, 0.0f64);
+    let mut rows_by_call = std::collections::VecDeque::new();
+    for op in ecrec_ops.iter_mut() {
+        let Some(pending) = op.pending.take() else {
+            continue;
+        };
+        if pending.timestamp() != op.timestamp {
+            return Err(Error::Prover(format!(
+                "the ECREC call at {}: its deferred witness is the call at {}'s",
+                op.timestamp,
+                pending.timestamp()
+            )));
+        }
+        let (resolved, wait) = pending.take()?;
+        let w = &resolved.witness;
+        if w.status() != op.witness.status() || w.x_q != op.witness.x_q || w.y_q != op.witness.y_q {
+            return Err(Error::Prover(format!(
+                "the ECREC call at {}: its witness's key is not the key the walk wrote",
+                op.timestamp
+            )));
+        }
+        op.witness = resolved.witness;
+        rows_by_call.push_back((op.timestamp, resolved.rows));
+        calls += 1;
+        waited += wait;
+        busy += resolved.secs;
+    }
+    let mut rows = 0usize;
+    let list = std::mem::replace(ecdas_ops, BlockVec::new(1));
+    *ecdas_ops = list.rebuilt(|row, out| {
+        let Some(at) = row.deferred_ecrec() else {
+            out.push(row);
+            return Ok(());
+        };
+        match rows_by_call.pop_front() {
+            Some((call, call_rows)) if call == at => {
+                rows += call_rows.len();
+                out.extend(call_rows);
+                Ok(())
+            }
+            other => Err(Error::Prover(format!(
+                "the ECDAS row standing for the ECREC call at {at} meets {}",
+                other.map_or("no deferred call".to_string(), |(call, _)| format!(
+                    "the deferred call at {call}"
+                ))
+            ))),
+        }
+    })?;
+    if let Some((call, _)) = rows_by_call.front() {
+        return Err(Error::Prover(format!(
+            "the deferred ECREC call at {call} has no ECDAS row standing for it"
+        )));
+    }
+    build_stamps::mark("p0 ecrec joined");
+    eprintln!(
+        "BLOCK ECREC DEFERRED: {calls} calls · {rows} ECDAS rows · witnesses {busy:.2}s (summed) · the finish waited {waited:.3}s · joined in {:.3}s",
+        t.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// The register accesses one copy ecall makes, all at the raw ECALL timestamp.
@@ -10096,6 +10258,7 @@ mod ecrec_ops_tests {
             super::CpuOp::new(&decode, &op),
             &mut memory_state,
             &mut register_state,
+            false,
         )
         .expect("the operands are held");
         assert_eq!(memw.len(), 25);
