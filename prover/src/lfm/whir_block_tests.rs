@@ -3216,6 +3216,55 @@ fn the_whir_block_tree_on_a_real_block() {
         t.elapsed().as_secs_f64()
     );
     assert!(ok, "the block proof must verify");
+    // Off the clock, under `LAMBDA_VM_BLOCK_COMPRESS`: C1's proof verified as
+    // the compressed block's verifier does over this run's plan, a tampered
+    // one refused, and the shipped files' bytes both ways.
+    if let Some(c1) = &run.compressed {
+        use super::compress::{compressed_artifacts, verify_compressed_against};
+        use super::whir_block_tree::{WhirBlockCompressedProof, WhirBlockTreeProof};
+        let t = std::time::Instant::now();
+        let artifacts = compressed_artifacts(plan, &wrap, c1.rate).expect("C1's artifacts derive");
+        let derive = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let honest = verify_compressed_against(plan, &artifacts, &c1.proof);
+        let check = t.elapsed().as_secs_f64();
+        let mut tampered = c1.proof.clone();
+        tampered.commit_ood[0] += FEE::one();
+        let refused = verify_compressed_against(plan, &artifacts, &tampered).is_err();
+        let mut reworded = c1.proof.clone();
+        reworded.public_words[0].1[0] += FE::from(1u64);
+        let refused_words = verify_compressed_against(plan, &artifacts, &reworded).is_err();
+        let top_copy = super::proof::LfmProof {
+            proof: top.proof.clone(),
+            public_words: top.public_words.clone(),
+        };
+        let top_file = WhirBlockTreeProof::new(run.statement.clone(), top_copy)
+            .to_bytes()
+            .expect("the top's file")
+            .len();
+        let c1_file = WhirBlockCompressedProof::new(run.statement.clone(), c1.proof.clone())
+            .to_bytes()
+            .expect("the compressed file")
+            .len();
+        let c1_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&c1.proof)
+            .expect("serialize C1")
+            .len();
+        println!(
+            "W3 COMPRESS VERIFY: {} (C1 derived in {derive:.2}s, checked in {check:.3}s) · tampered answer refused {refused} · tampered word refused {refused_words}",
+            if honest.is_ok() {
+                "ACCEPTED"
+            } else {
+                "REJECTED"
+            }
+        );
+        println!(
+            "W3 COMPRESS BYTES: shipped file {c1_file} B compressed vs {top_file} B top ({:.3}×) · C1 proof {c1_bytes} B · blowup {}",
+            c1_file as f64 / top_file as f64,
+            c1.rate.factor()
+        );
+        honest.unwrap_or_else(|e| panic!("the compressed block must verify: {e}"));
+        assert!(refused && refused_words, "a tampered C1 proof is refused");
+    }
     // Off the clock: the top's rows and padded heights by chip, emitted again
     // from its children's shapes, and its LANES rows against 2^19 — the chips a
     // wider top must keep under the LFM proofs' bits bound.
@@ -4513,4 +4562,109 @@ fn split_prepared_stack_refuses_a_forgery_in_its_last_chain(argue: ArgueFormat) 
                     .any(|&(kk, ii, w)| kk == k && ii == 0 && w >= 2)
         })
     });
+}
+
+/// ★ C1 over a small block's top (`LAMBDA_VM_BLOCK_COMPRESS`'s step): the
+/// compressed proof verifies against the plan's derived top; a tampered C1
+/// proof (an answer, a word), the same proof under another block, and the same
+/// proof under another rate are refused; and C1 does not execute over a
+/// tampered top: a changed word of the top's arena, or a top whose claimed word
+/// differs from what it proved.
+#[test]
+#[ignore = "proves a small block's tree and C1 over its top; box tier"]
+fn the_compressed_block_verifies_and_refuses_tampering() {
+    use super::compress::{
+        build_compress, compressed_artifacts, prove_compress, top_child, verify_compressed,
+        verify_compressed_against,
+    };
+    use super::wlfm::WlfmRate;
+    let _permit = super::device_permit::serial_for_test();
+    let format = small_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let wrap = aggregation_wrap_options();
+    let plan = plan_of(&elf, &proof, &format, Some(2));
+    let (top, _) = compose(&plan, &proof, "C1").expect("the honest tree proves");
+    let top_artifacts = plan.derive_top(&wrap).expect("the top derives");
+    let child = top_child(&plan, &top_artifacts, &wrap).expect("the top's shape");
+    let c = build_compress(&child, plan.top_layout(), WlfmRate::Sixteen).expect("C1 builds");
+    assert_eq!(c.build.artifacts.config.log_blowup, 4);
+    let harvested = super::harvest::harvest_child_under::<BlockFamily>(
+        top_artifacts.clone(),
+        wrap.clone(),
+        &top,
+    )
+    .expect("the top harvests");
+    let arena = super::harvest::try_child_arena_words(&harvested).expect("the top's arena");
+    let t = std::time::Instant::now();
+    let c1 = prove_compress(&c, &arena).expect("C1 proves over the honest top");
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&c1)
+        .expect("C1 serializes")
+        .len();
+    let top_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&top.proof)
+        .expect("the top serializes")
+        .len();
+    println!(
+        "C1 SMALL: proved in {:.2}s · Q {} · C1 {bytes} B vs top {top_bytes} B",
+        t.elapsed().as_secs_f64(),
+        c.build.artifacts.config.num_queries
+    );
+    assert_eq!(
+        c1.public_words, top.public_words,
+        "C1 republishes the top's words"
+    );
+    verify_compressed(&plan, &wrap, WlfmRate::Sixteen, &c1)
+        .unwrap_or_else(|e| panic!("the compressed block verifies: {e}"));
+
+    // Tampered C1 proofs.
+    let artifacts = compressed_artifacts(&plan, &wrap, WlfmRate::Sixteen).expect("C1's artifacts");
+    let mut answer = c1.clone();
+    answer.commit_ood[0] += FEE::one();
+    assert!(
+        verify_compressed_against(&plan, &artifacts, &answer).is_err(),
+        "answer"
+    );
+    for w in 0..c1.public_words.len() {
+        let mut word = c1.clone();
+        word.public_words[w].1[0] += FE::from(1u64);
+        assert!(
+            verify_compressed_against(&plan, &artifacts, &word).is_err(),
+            "word {w}"
+        );
+    }
+    let mut opening = c1.clone();
+    opening.prepared.clear();
+    assert!(
+        verify_compressed_against(&plan, &artifacts, &opening).is_err(),
+        "prepared"
+    );
+    // Another rate: the verifier's constant, never the proof's.
+    assert!(
+        verify_compressed(&plan, &wrap, WlfmRate::Four, &c1).is_err(),
+        "a blowup-16 C1 under a blowup-4 verifier"
+    );
+    // Another block's plan: another statement, so another top and another C1.
+    let other = other_format();
+    let (other_elf, other_proof) = small_block("test_commit_4", &other);
+    let other_plan = plan_of(&other_elf, &other_proof, &other, Some(2));
+    assert_ne!(other_plan.id(), plan.id(), "the two blocks' plans differ");
+    assert!(
+        verify_compressed(&other_plan, &wrap, WlfmRate::Sixteen, &c1).is_err(),
+        "C1 under another block"
+    );
+
+    // A tampered top: C1 does not execute.
+    let mut words = arena.clone();
+    let last = words.len() - 1;
+    let mid = words[last].len() / 2;
+    words[last][mid][0] += FE::from(1u64);
+    assert!(
+        prove_compress(&c, &words).is_err(),
+        "a changed word of the top's proof"
+    );
+    let mut claimed = arena.clone();
+    claimed[0][0][0] += FE::from(1u64);
+    assert!(
+        prove_compress(&c, &claimed).is_err(),
+        "a changed claimed word of the top"
+    );
 }

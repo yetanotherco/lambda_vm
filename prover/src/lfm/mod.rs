@@ -27,6 +27,9 @@ pub mod chips;
 pub mod chunking;
 pub mod commit;
 pub mod compiler;
+/// The block's compression step: one W-LFM proof of the top's verification.
+#[cfg(feature = "parallel")]
+pub mod compress;
 pub mod constraints;
 pub mod deep;
 pub mod device_permit;

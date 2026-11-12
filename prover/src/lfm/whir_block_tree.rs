@@ -239,6 +239,10 @@ pub struct WhirTreeConfig {
     /// first. Or (0, the control) phase B keeps its own order and the tree
     /// takes the leaves in index order. Prover-only: the bytes are the same.
     pub leaf_first: bool,
+    /// `LAMBDA_VM_BLOCK_COMPRESS` ([`super::compress::compress_setting`];
+    /// default off): after the top, one compression proof of the top's
+    /// verification (C1) at this rate, which then ships instead of the top.
+    pub compress: Option<super::wlfm::WlfmRate>,
 }
 
 /// A count knob: unset is `None`; anything but a count is an error.
@@ -517,6 +521,7 @@ impl WhirTreeConfig {
             exec_early: count_knob("W3_EXEC_EARLY")?.is_none_or(|v| v != 0),
             node_times: count_knob("W3_NODE_TIMES")? == Some(1),
             leaf_first: count_knob("W3_LEAF_FIRST")?.is_none_or(|v| v != 0),
+            compress: super::compress::compress_from_env()?,
         })
     }
 
@@ -1516,6 +1521,7 @@ pub(crate) fn prove_tree_pipelined(
     dataflow: bool,
     stream_top: Option<&std::sync::OnceLock<bool>>,
     exec_early: bool,
+    top_handoff: Option<&TopHandoff>,
     say: &(dyn Fn(&str) + Sync),
 ) -> Result<
     (
@@ -1594,6 +1600,19 @@ pub(crate) fn prove_tree_pipelined(
                 plan, &shape, &built, &programs, &slots, &wrap, words, t_tree, node_pipe, budget,
             )
         });
+        // The top's artifacts to the compression step as soon as they are
+        // built. The builder fails every slot it leaves empty, so this waiter
+        // always returns.
+        if let Some(handoff) = top_handoff {
+            let top = slots.last().and_then(|level| level.first());
+            outer.spawn(move || {
+                let got = match top {
+                    Some(slot) => slot.wait().map(|node| node.artifacts.clone()),
+                    None => Err("the tree has no top slot".to_string()),
+                };
+                let _ = handoff.artifacts.0.set(got);
+            });
+        }
         let each_from = std::thread::scope(|scope| {
             // 1. the leaves' artifacts, one after another on this thread: each
             // build holds the card throughout (armed), so building them as
@@ -1818,11 +1837,20 @@ pub(crate) fn prove_tree_pipelined(
         .collect::<Result<_, String>>()?;
     let mut level_proofs: Vec<Vec<LfmProof>> = Vec::with_capacity(results.len());
     let mut below_end = 0.0f64;
+    let n_levels = results.len();
     for (lv, level) in results.into_iter().enumerate() {
         let proved: Vec<ProvedProgram> = level
             .into_iter()
             .map(Published::take)
             .collect::<Result<_, String>>()?;
+        // The top's words as a parent's arena reads them, for C1.
+        if let (Some(handoff), true, [top]) = (top_handoff, lv + 1 == n_levels, proved.as_slice()) {
+            let arena = try_child_arena_words(&top.child)?;
+            *handoff
+                .arena
+                .lock()
+                .map_err(|_| "the top's arena slot is poisoned")? = Some(arena);
+        }
         let mut times = Vec::with_capacity(proved.len());
         let mut programs = Vec::with_capacity(proved.len());
         for (j, p) in proved.iter().enumerate() {
@@ -1875,6 +1903,24 @@ pub(crate) fn prove_tree_pipelined(
     Ok((timings, proofs, early_out, each_from))
 }
 
+/// What the tree hands the compression step (C1) when the driver asks for it:
+/// the top's artifacts as soon as its builder publishes them (before the top
+/// is proved, so C1's program and build go on beside the top's prove), and
+/// the top's arena words once the top is proved.
+pub(crate) struct TopHandoff {
+    pub(crate) artifacts: Published<super::registry::LfmArtifacts>,
+    pub(crate) arena: std::sync::Mutex<Option<Vec<Vec<LfmWord>>>>,
+}
+
+impl TopHandoff {
+    pub(crate) fn new() -> Self {
+        Self {
+            artifacts: Published::new(),
+            arena: std::sync::Mutex::new(None),
+        }
+    }
+}
+
 // ================================ the driver ==============================
 
 /// The whole block's walls, in seconds.
@@ -1887,6 +1933,12 @@ pub struct WhirTreeTimes {
     pub whole: f64,
     /// The readouts printed between the base and the tree (on the clock).
     pub readouts: f64,
+}
+
+/// The compression step's proof (C1) and the rate it was proved at.
+pub struct CompressedTop {
+    pub rate: super::wlfm::WlfmRate,
+    pub proof: super::wlfm::WlfmProof,
 }
 
 /// The early leaf's readout: its index, its arena (for the harness's check
@@ -1902,6 +1954,8 @@ pub struct WhirTreeRun {
     /// Every proof of the tree with its artifacts, level by level, the top
     /// last.
     pub proofs: Vec<(super::registry::LfmArtifacts, LfmProof)>,
+    /// C1 over the top, under `LAMBDA_VM_BLOCK_COMPRESS`: what ships then.
+    pub compressed: Option<CompressedTop>,
     pub times: WhirTreeTimes,
     /// The base proof (the harness verifies it, and the early leaf's arena
     /// against it, off the clock).
@@ -2452,22 +2506,45 @@ pub fn prove_whir_block_tree(
     let tree_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
-    let (timings, proofs, early_out, each_from) = prove_tree_pipelined(
-        &plan,
-        &proof,
-        programs,
-        tree_budget.as_ref(),
-        siblings,
-        beside,
-        cfg.leaves_each,
-        early,
-        leaf_first,
-        node_pipe.as_ref(),
-        dataflow,
-        stream_top.then_some(&top_streamed),
-        exec_early,
-        &|line: &str| sink.line(line),
-    )
+    // `LAMBDA_VM_BLOCK_COMPRESS`: C1's program and W-LFM build on a thread of
+    // their own from the moment the top's artifacts are built, beside the
+    // top's prove; C1 itself proves after the top.
+    let handoff = cfg.compress.map(|_| TopHandoff::new());
+    let c1_built: Published<(super::compress::CompressBuild, f64, f64)> = Published::new();
+    let (timings, proofs, early_out, each_from) = std::thread::scope(|scope| {
+        if let (Some(rate), Some(handoff)) = (cfg.compress, handoff.as_ref()) {
+            let (plan, c1_built) = (&plan, &c1_built);
+            scope.spawn(move || {
+                let _fail = FailEmpty(std::slice::from_ref(c1_built), "the C1 builder stopped");
+                let built = (|| -> Result<_, String> {
+                    let top = handoff.artifacts.wait()?;
+                    let tb = std::time::Instant::now();
+                    let wrap = aggregation_wrap_options();
+                    let child = super::compress::top_child(plan, top, &wrap)?;
+                    let c = super::compress::build_compress(&child, plan.top_layout(), rate)?;
+                    Ok((c, tb.elapsed().as_secs_f64(), t.elapsed().as_secs_f64()))
+                })();
+                let _ = c1_built.0.set(built);
+            });
+        }
+        prove_tree_pipelined(
+            &plan,
+            &proof,
+            programs,
+            tree_budget.as_ref(),
+            siblings,
+            beside,
+            cfg.leaves_each,
+            early,
+            leaf_first,
+            node_pipe.as_ref(),
+            dataflow,
+            stream_top.then_some(&top_streamed),
+            exec_early,
+            handoff.as_ref(),
+            &|line: &str| sink.line(line),
+        )
+    })
     .map_err(|e| format!("the tree proves: {e}"))?;
     if let Some(b) = &tree_budget {
         sink.line(&format!(
@@ -2476,6 +2553,43 @@ pub fn prove_whir_block_tree(
         ));
     }
     let tree = t.elapsed().as_secs_f64();
+    // C1 after the top, on the clock: its build (begun beside the tree) waited
+    // for, then executed over the top's words and proved.
+    let compressed = match (cfg.compress, handoff) {
+        (Some(rate), Some(handoff)) => {
+            let built = c1_built
+                .take()
+                .map_err(|e| format!("C1's program and build: {e}"))?;
+            let (c, build_secs, built_at) = built;
+            let arena = handoff
+                .arena
+                .into_inner()
+                .map_err(|_| "the top's arena slot is poisoned")?
+                .ok_or("the tree handed over no top arena")?;
+            let tc = std::time::Instant::now();
+            let c1 = super::compress::prove_compress(&c, &arena)
+                .map_err(|e| format!("C1 proves: {e}"))?;
+            let c1_secs = tc.elapsed().as_secs_f64();
+            let split = super::proof::take_prove_split().map_or("no split".to_string(), |p| {
+                format!(
+                    "execute {:.2} fill {:.2} prove {:.2}",
+                    p.execute, p.fill, p.multi_prove
+                )
+            });
+            let a = &c.build.artifacts;
+            sink.line(&format!(
+                "W3 COMPRESS: C1 at blowup {} · Q {} · groups {:?} · prepared stacks {} · tables 2^{:?} · built in {build_secs:.2}s (done@{built_at:.2}, top proved@{tree:.2}, waited {:.2}s) · C1 {c1_secs:.2}s after the top ({split})",
+                rate.factor(),
+                a.config.num_queries,
+                a.sizes,
+                a.stacks.len(),
+                a.table_num_vars,
+                (built_at - tree).max(0.0),
+            ));
+            Some(CompressedTop { rate, proof: c1 })
+        }
+        _ => None,
+    };
     let whole = t0.elapsed().as_secs_f64();
     for (lv, level) in timings.iter().enumerate() {
         let programs: Vec<String> = level
@@ -2651,6 +2765,7 @@ pub fn prove_whir_block_tree(
     Ok(WhirTreeRun {
         statement: proof.statement().to_owned(),
         proofs,
+        compressed,
         times: WhirTreeTimes {
             base,
             tree,
@@ -2763,6 +2878,106 @@ impl WhirBlockTreeProof {
         }
         Ok(proof)
     }
+}
+
+/// Which tree a proof file holds: the WHIR block tree compressed by C1
+/// ([`super::compress`]). Another tag than [`PIPELINE_WHIR`], so neither
+/// verifier reads the other's file as its own.
+pub const PIPELINE_WHIR_COMPRESSED: u8 = 2;
+
+/// A whole W3 block's proof compressed (`LAMBDA_VM_BLOCK_COMPRESS`): the
+/// block's statement and C1's proof over the top. As for
+/// [`WhirBlockTreeProof`], nothing here is a format parameter: the rate C1 is
+/// checked at is the verifier's constant ([`super::compress::COMPRESS_RATE`]).
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct WhirBlockCompressedProof {
+    magic: [u8; 8],
+    version: u32,
+    pipeline: u8,
+    pub table_num_vars: Vec<u8>,
+    pub runtime_page_ranges: Vec<crate::RuntimePageRange>,
+    pub table_counts: crate::TableCounts,
+    pub public_output: Vec<u8>,
+    pub num_private_input_pages: usize,
+    pub groups: Vec<Vec<u32>>,
+    pub compressed: super::wlfm::WlfmProof,
+}
+
+impl WhirBlockCompressedProof {
+    /// The file for a W3 block's statement and C1's proof.
+    pub fn new(statement: block_whir::OwnedBlockStatement, c1: super::wlfm::WlfmProof) -> Self {
+        Self {
+            magic: PROOF_MAGIC,
+            version: PROOF_VERSION,
+            pipeline: PIPELINE_WHIR_COMPRESSED,
+            table_num_vars: statement.table_num_vars,
+            runtime_page_ranges: statement.runtime_page_ranges,
+            table_counts: statement.table_counts,
+            public_output: statement.public_output,
+            num_private_input_pages: statement.num_private_input_pages,
+            groups: statement.groups,
+            compressed: c1,
+        }
+    }
+
+    /// The claimed statement.
+    pub fn statement(&self) -> block_whir::BlockStatement<'_> {
+        block_whir::BlockStatement {
+            table_num_vars: &self.table_num_vars,
+            runtime_page_ranges: &self.runtime_page_ranges,
+            table_counts: &self.table_counts,
+            public_output: &self.public_output,
+            num_private_input_pages: self.num_private_input_pages,
+            groups: &self.groups,
+        }
+    }
+
+    /// The file's bytes.
+    pub fn to_bytes(&self) -> Result<rkyv::util::AlignedVec, String> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(self).map_err(|e| format!("serialize: {e}"))
+    }
+
+    /// A file read back: refused unless it is this layout's compressed W3
+    /// block. `bytes` must be aligned for rkyv (an `AlignedVec`).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let proof = rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
+            .map_err(|e| format!("not a compressed W3 block proof file: {e}"))?;
+        if proof.magic != PROOF_MAGIC {
+            return Err("not a block proof file (magic)".to_string());
+        }
+        if proof.version != PROOF_VERSION {
+            return Err(format!(
+                "block proof file version {}, this build reads {PROOF_VERSION}",
+                proof.version
+            ));
+        }
+        if proof.pipeline != PIPELINE_WHIR_COMPRESSED {
+            return Err(format!(
+                "the file holds pipeline {}, not the compressed WHIR block tree",
+                proof.pipeline
+            ));
+        }
+        Ok(proof)
+    }
+}
+
+/// ★ A compressed W3 block proof file verified: the plan derived from the
+/// trusted ELF and the claimed statement under the pinned presets (as
+/// [`verify_whir_block_tree_proof`]), C1 built over the derived top at
+/// [`super::compress::COMPRESS_RATE`], and the file's C1 proof checked against
+/// it and to claim the block. No format choice is the caller's or the file's.
+pub fn verify_whir_block_compressed_proof(
+    elf_bytes: &[u8],
+    proof: &WhirBlockCompressedProof,
+) -> Result<(), String> {
+    let presets = super::whir_block::pinned_verifier_presets(BlockFormat::pinned().group);
+    let plan = super::whir_block::verifier_plan(elf_bytes, proof.statement(), &presets)?;
+    super::compress::verify_compressed(
+        &plan,
+        &presets.wrap_options,
+        super::compress::COMPRESS_RATE,
+        &proof.compressed,
+    )
 }
 
 /// ★ A W3 block proof file verified: [`super::whir_block::verify_block_tree`]
@@ -3100,6 +3315,96 @@ mod tests {
         );
     }
 
+    /// The synthetic statement with an empty C1 proof, as a compressed file.
+    fn synthetic_compressed() -> WhirBlockCompressedProof {
+        let tree = synthetic_proof();
+        let statement = tree.statement().to_owned();
+        let c1 = super::super::wlfm::WlfmProof {
+            proof: stark::multilinear_table::MultiProof {
+                roots: vec![[3u8; 32]],
+                tables: vec![],
+                columns: vec![],
+                preprocessed: None,
+            },
+            argues: vec![],
+            prepared: vec![],
+            commit_ood: vec![],
+            public_words: tree.top_public_words.clone(),
+        };
+        WhirBlockCompressedProof::new(statement, c1)
+    }
+
+    /// The compressed file reads back what was written; another tag, version
+    /// or magic is refused; and neither file is read as the other.
+    #[test]
+    fn the_compressed_file_round_trips_and_the_two_files_refuse_each_other() {
+        let proof = synthetic_compressed();
+        let bytes = proof.to_bytes().expect("serializes");
+        let back = WhirBlockCompressedProof::from_bytes(&bytes).expect("reads back");
+        assert_eq!(
+            format!("{:?}", back.statement()),
+            format!("{:?}", proof.statement())
+        );
+        assert_eq!(back.compressed.public_words, proof.compressed.public_words);
+        assert_eq!(back.compressed.proof.roots, proof.compressed.proof.roots);
+        for (what, tamper) in [
+            (
+                "pipeline",
+                (|p: &mut WhirBlockCompressedProof| p.pipeline = PIPELINE_WHIR)
+                    as fn(&mut WhirBlockCompressedProof),
+            ),
+            ("version", |p| p.version = PROOF_VERSION + 1),
+            ("magic", |p| p.magic[0] ^= 1),
+        ] {
+            let mut other = synthetic_compressed();
+            tamper(&mut other);
+            let bytes = other.to_bytes().expect("serializes");
+            assert!(
+                WhirBlockCompressedProof::from_bytes(&bytes).is_err(),
+                "a compressed file with another {what} is refused"
+            );
+        }
+        assert!(
+            WhirBlockTreeProof::from_bytes(&bytes).is_err(),
+            "the tree verifier refuses a compressed file"
+        );
+        let tree = synthetic_proof().to_bytes().expect("serializes");
+        assert!(
+            WhirBlockCompressedProof::from_bytes(&tree).is_err(),
+            "the compressed verifier refuses the tree's file"
+        );
+        assert_ne!(PIPELINE_WHIR, PIPELINE_WHIR_COMPRESSED);
+    }
+
+    /// The compressed block's verifier takes its rate from the code: its body
+    /// names [`super::super::compress::COMPRESS_RATE`] and reads neither the
+    /// environment nor the file for a format.
+    #[test]
+    fn the_compressed_verifier_pins_its_rate() {
+        let src = include_str!("whir_block_tree.rs");
+        let at = src
+            .find("\npub fn verify_whir_block_compressed_proof(")
+            .expect("the compressed verifier");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
+        assert!(body.contains("super::compress::COMPRESS_RATE"), "{body}");
+        for forbidden in ["env::var", "compress_from_env", "ZfFormat::global", ".rate"] {
+            assert!(
+                !body.contains(forbidden),
+                "the verifier reads `{forbidden}`"
+            );
+        }
+        let compress = include_str!("compress.rs");
+        let verify = &compress[compress
+            .find("\npub fn verify_compressed(")
+            .expect("verify_compressed")..];
+        for forbidden in ["env::var", "compress_from_env", "ZfFormat::global"] {
+            assert!(
+                !verify.contains(forbidden),
+                "compress.rs's verifiers read `{forbidden}`"
+            );
+        }
+    }
+
     /// Only the production tree is at the presets: the plan's leaf count, the
     /// block fan-in and the production argue.
     #[test]
@@ -3122,6 +3427,7 @@ mod tests {
             exec_early: true,
             node_times: false,
             leaf_first: true,
+            compress: None,
         };
         assert!(production.at_presets());
         let off = |f: fn(&mut WhirTreeConfig)| {

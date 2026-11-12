@@ -1545,6 +1545,13 @@ fn finish(b: LfmBuilder) -> Result<LfmProgram, String> {
     Ok(program)
 }
 
+/// A tree program's builder compiled and validated, as every program of the
+/// tree is ([`super::compress`]'s C1 too).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn finish_program(b: LfmBuilder) -> Result<LfmProgram, String> {
+    finish(b)
+}
+
 /// Whether `words`, a top proof's published words, claim the block: the plan's
 /// id and the public output, in the top layout. The state is bound across the
 /// children by the nodes.
