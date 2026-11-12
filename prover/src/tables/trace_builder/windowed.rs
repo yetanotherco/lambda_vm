@@ -701,13 +701,14 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// the window from its logs, rebuilt a batch at a time; a CPU chunk is
     /// handed out as its logs, its ops rebuilt from them only where the host
     /// fills it (the card declined the room), and the finish rebuilds its
-    /// tail's. Or they keep the list (`false`). Whatever
-    /// `LAMBDA_VM_WALK_NO_CPU_LIST` says (`1` drops it; off by default); the
-    /// tables are the same. It takes effect only where the card fills CPU from
-    /// the logs ([`Self::card_fill_streamed`] with `cpu`), the walkers count
-    /// where they make the rows ([`Self::counts_where_made`]) and the
-    /// accumulator routes in one pass (see [`Self::cpu_listless`]); a window
-    /// whose walker kept its list anyway is routed from it.
+    /// tail's (`true`, the default). Or they keep the list (`false`). Whatever
+    /// `LAMBDA_VM_WALK_NO_CPU_LIST` says (`0` keeps it); the tables are the
+    /// same. It takes effect only where the card fills CPU from the logs
+    /// ([`Self::card_fill_streamed`] with `cpu`), the walkers count where they
+    /// make the rows ([`Self::counts_where_made`]) and the accumulator routes
+    /// in one pass (see [`Self::cpu_listless`]). A window whose walker kept its
+    /// list anyway is routed from it, and from it on the run keeps the list
+    /// (its logs checked against its ops chunk by chunk, as without the mode).
     pub fn drop_cpu_list(mut self, on: bool) -> Self {
         self.cpu_listless = on;
         self
@@ -1483,7 +1484,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                     kept.cpu.push(ops);
                     kept.listless = false;
                 }
-                kept.append(last);
+                kept.append(last, &decode);
                 let (cpu_ops, walk, rest, decode_trace) = kept.into_run();
                 super::build_stamps::mark("p0 concatenate");
                 let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state);
@@ -2162,7 +2163,7 @@ impl Accumulator<'_> {
             // Nothing else reads the in-walk lookups; MEMW_R's rows are
             // counted as their chunks leave.
             drop(std::mem::take(&mut window.walk.bitwise_ops));
-            kept.append(window);
+            kept.append(window, self.decode);
             *self.route_secs += t.elapsed().as_secs_f64();
             let t = std::time::Instant::now();
             let counter = self
@@ -2519,13 +2520,14 @@ fn route_fused() -> bool {
     *FUSED.get_or_init(|| !std::env::var("LAMBDA_VM_ROUTE_FUSED").is_ok_and(|v| v.trim() == "0"))
 }
 
-/// Whether the walkers keep no CPU list (`LAMBDA_VM_WALK_NO_CPU_LIST=1`) or
-/// keep it (unset or anything else): [`WindowedTraceBuilder::drop_cpu_list`]'s
-/// default. Read once. The tables are the same.
+/// Whether the walkers keep no CPU list (unset, or anything but `0`: the
+/// default) or keep it (`LAMBDA_VM_WALK_NO_CPU_LIST=0`):
+/// [`WindowedTraceBuilder::drop_cpu_list`]'s default. Read once. The tables
+/// are the same.
 fn cpu_list_dropped() -> bool {
     static DROPPED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DROPPED
-        .get_or_init(|| std::env::var("LAMBDA_VM_WALK_NO_CPU_LIST").is_ok_and(|v| v.trim() == "1"))
+        .get_or_init(|| !std::env::var("LAMBDA_VM_WALK_NO_CPU_LIST").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// Whether the walkers count where they make the rows (unset, or anything but
@@ -2953,15 +2955,42 @@ impl Kept {
     /// tail's, when they are kept. A window without them, or with other than
     /// one log a CPU op, puts the logs out of step for good: every CPU chunk
     /// from then on is filled on the host.
-    fn append(&mut self, window: WalkedWindow) {
+    fn append(&mut self, window: WalkedWindow, decode: &DecodeTable) {
         let WalkedWindow {
             cpu_ops,
-            first: _,
+            first,
             cycles,
             walk,
             logs,
             made: _,
         } = window;
+        // A window whose walker kept its list: the run goes back to the list
+        // from here, the tail's ops rebuilt from its logs, and its logs
+        // checked against its ops chunk by chunk as without the mode.
+        if self.listless && !cpu_ops.is_empty() {
+            self.listless = false;
+            let logs_tail = self.logs.as_mut().map_or(0, |tail| tail.len);
+            if logs_tail > 0 {
+                let segments = self
+                    .logs
+                    .as_mut()
+                    .map(|tail| tail.take_segments(logs_tail))
+                    .unwrap_or(Segments { parts: Vec::new() });
+                match ops_of_logs(&segments, first - logs_tail, decode) {
+                    Ok(ops) => {
+                        self.cpu.push(ops);
+                        if let Some(tail) = self.logs.as_mut() {
+                            for (part, range) in segments.parts {
+                                tail.push(part[range].to_vec());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.listless_broken.get_or_insert(format!("{e}"));
+                    }
+                }
+            }
+        }
         if self.listless {
             // Its logs stand for its CPU ops (any list its walker kept goes).
             match (self.logs.as_mut(), logs) {
