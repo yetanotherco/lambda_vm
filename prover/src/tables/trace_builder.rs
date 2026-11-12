@@ -992,7 +992,7 @@ use compact_branch::CompactBranch;
 use compact_bytewise::CompactBytewise;
 use compact_eq::CompactEq;
 #[cfg(feature = "parallel")]
-pub(crate) use finish::hand_on_order;
+pub(crate) use finish::hand_on_order_first;
 pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
 #[cfg(test)]
 pub(crate) use windowed::DECODE_TRACE_DELAY;
@@ -6924,6 +6924,13 @@ pub struct StreamSkip {
     /// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES=0` rolls it back). Elsewhere it
     /// changes nothing. The tables are the same; their order is not.
     pub bitwise_from_tables: bool,
+    /// With the slide, KECCAK_RND's tables are handed on before every other
+    /// table, in their AIR order, and the rest after them as without it
+    /// (`LAMBDA_VM_BLOCK_KECCAK_RND_FIRST=1` on the block), so the card can
+    /// commit them while the tables they would wait behind are built. The
+    /// tables are the same; the groups they are packed into, and so the
+    /// proof's bytes, are not. In waves it changes nothing.
+    pub keccak_rnd_first: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table
     /// phase's counts, its

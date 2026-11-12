@@ -1426,6 +1426,31 @@ fn parse_bitwise_from_tables(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
+/// `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST`: `1` has the streamed finish, when it
+/// slides, hand KECCAK_RND's tables on before every other table
+/// ([`WindowedTraceBuilder::keccak_rnd_first`]), so the card commits them while
+/// the tables before them in AIR order are built. Unset, empty or `0` (the
+/// default): AIR order. Anything else refuses the prove. The tables are the
+/// same; the groups they are packed into, and so the proof's bytes, are not;
+/// the verifier takes any partition the statement declares.
+fn block_keccak_rnd_first() -> Result<bool, Error> {
+    parse_keccak_rnd_first(
+        std::env::var("LAMBDA_VM_BLOCK_KECCAK_RND_FIRST")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_keccak_rnd_first(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_KECCAK_RND_FIRST={v}: 1 (KECCAK_RND's tables handed on first) or 0"
+        ))),
+    }
+}
+
 fn parse_rest_bitwise_last(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
         None | Some("" | "0") => Ok(false),
@@ -4741,14 +4766,16 @@ enum RestIn {
 
 /// The rest's tables as they stream in, checked against the run's AIRs: each
 /// the next AIR in the order the finish hands them on (AIR order, or BITWISE
-/// last: [`crate::tables::trace_builder::RestHeader::bitwise_last`]), a
+/// last: [`crate::tables::trace_builder::RestHeader::bitwise_last`], with
+/// KECCAK_RND's first:
+/// [`crate::tables::trace_builder::RestHeader::keccak_rnd_first`]), a
 /// streamed chunk's slot or a table of that AIR's width, and every AIR
 /// reached. A table's height is checked where it is laid
 /// out ([`layout_of`]).
 struct RestOrder {
     widths: Vec<usize>,
     /// The positions in the order the finish hands them on
-    /// ([`crate::tables::trace_builder::hand_on_order`]).
+    /// ([`crate::tables::trace_builder::hand_on_order_first`]).
     due: Vec<usize>,
     next: usize,
 }
@@ -4756,9 +4783,19 @@ struct RestOrder {
 impl RestOrder {
     /// The rest's tables of `widths` columns, due in AIR order, or with the
     /// first (BITWISE) after every other when `bitwise_last`.
+    #[cfg(test)]
     fn new(widths: Vec<usize>, bitwise_last: bool) -> Self {
-        let due =
-            crate::tables::trace_builder::hand_on_order(widths.len(), bitwise_last.then_some(0));
+        Self::with_first(widths, &[], bitwise_last)
+    }
+
+    /// [`Self::new`], with the positions `first` (ascending) due before every
+    /// other ([`crate::tables::trace_builder::hand_on_order_first`]).
+    fn with_first(widths: Vec<usize>, first: &[usize], bitwise_last: bool) -> Self {
+        let due = crate::tables::trace_builder::hand_on_order_first(
+            widths.len(),
+            first,
+            bitwise_last.then_some(0),
+        );
         Self {
             widths,
             due,
@@ -4800,6 +4837,26 @@ impl RestOrder {
         }
         Ok(())
     }
+}
+
+/// The rest's positions of KECCAK_RND's tables, the order the finish hands them
+/// on in when it hands them first: their range among the chunked tables
+/// ([`chunked_table_ranges`]), each checked to name a KECCAK_RND AIR.
+fn keccak_rnd_positions(counts: &TableCounts, names: &[&str]) -> Result<Vec<usize>, Error> {
+    let range = chunked_table_ranges(counts)
+        .into_iter()
+        .find(|(name, ..)| *name == "KECCAK_RND")
+        .map(|(_, range, _)| range)
+        .ok_or_else(|| Error::Prover("no KECCAK_RND range among the chunked tables".into()))?;
+    for p in range.clone() {
+        let name = names.get(p);
+        if !name.is_some_and(|n| n.starts_with("KECCAK_RND")) {
+            return Err(Error::Prover(format!(
+                "KECCAK_RND goes first, but the rest's table {p} is {name:?}"
+            )));
+        }
+    }
+    Ok(range.collect())
 }
 
 /// A table before the run's AIR order exists: a streamed chunk, or a table of
@@ -5600,14 +5657,32 @@ fn lay_out_rest_streamed<'a>(
     });
     marks.push(("airs", at()));
     let refs = airs.air_refs();
-    let mut order = RestOrder::new(
+    let first = if header.keccak_rnd_first {
+        let names: Vec<&str> = refs.iter().map(|air| air.name()).collect();
+        keccak_rnd_positions(&header.table_counts, &names)?
+    } else {
+        Vec::new()
+    };
+    let mut order = RestOrder::with_first(
         refs.iter().map(|air| air.trace_layout().0).collect(),
+        &first,
         header.bitwise_last,
     );
     if header.bitwise_last && refs.first().map(|air| air.name()) != Some("BITWISE") {
         return Err(Error::Prover(
             "the rest's BITWISE goes last, but BITWISE is not the rest's first table".into(),
         ));
+    }
+    if header.keccak_rnd_first {
+        eprintln!(
+            "BLOCK REST ORDER: KECCAK_RND first · {} table(s) at [{}]",
+            first.len(),
+            first
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     }
     let mut timed: Vec<(usize, f64)> = Vec::new();
     let mut laid_at: Vec<(usize, f64)> = Vec::new();
@@ -5972,6 +6047,7 @@ fn prove_streamed(
     crate::with_block_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
         let bitwise_last = deviations.rest_bitwise_last || block_rest_bitwise_last()?;
+        let keccak_rnd_first = block_keccak_rnd_first()?;
         let from_tables = match deviations.bitwise_from_tables {
             Some(from_tables) => from_tables,
             None => block_bitwise_from_tables()?,
@@ -6295,6 +6371,9 @@ fn prove_streamed(
                 }
                 if from_tables {
                     builder = builder.bitwise_from_tables();
+                }
+                if keccak_rnd_first {
+                    builder = builder.keccak_rnd_first();
                 }
                 builder = builder.slide_rest();
                 builder = builder.keccak_rnd_form(format.keccak_rnd);
@@ -9010,6 +9089,128 @@ mod rest_order_tests {
             format!("{err:?}").contains("came where table 0 was due"),
             "{err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod keccak_rnd_first_tests {
+    use super::{RestOrder, keccak_rnd_positions, parse_keccak_rnd_first};
+
+    fn counts(copy: usize, keccak: usize, keccak_rnd: usize) -> crate::TableCounts {
+        crate::TableCounts {
+            cpu: 1,
+            lt: 0,
+            memw: 0,
+            memw_aligned: 0,
+            load: 0,
+            mul: 0,
+            dvrm: 0,
+            shift: 0,
+            branch: 0,
+            memw_register: 0,
+            eq: 0,
+            bytewise: 0,
+            store: 0,
+            cpu32: 0,
+            keccak,
+            keccak_rnd,
+            ecsm: 0,
+            ecdas: 0,
+            hint: 0,
+            copy,
+            blake3: 1,
+            is_wh: 1,
+            ecrec: 0,
+        }
+    }
+
+    /// The rest's AIR names for `counts`, as far as KECCAK_RND's tables and
+    /// one table past them: the five fixed tables, COPY, KECCAK, KECCAK_RND.
+    fn names(copy: usize, keccak: usize, keccak_rnd: usize) -> Vec<String> {
+        ["BITWISE", "DECODE", "KECCAK_RC", "REGISTER", "HALT"]
+            .iter()
+            .map(|n| n.to_string())
+            .chain((0..copy).map(|i| format!("COPY[{i}]")))
+            .chain((0..keccak).map(|i| format!("KECCAK[{i}]")))
+            .chain((0..keccak_rnd).map(|i| format!("KECCAK_RND[{i}]")))
+            .chain(["ECSM[0]".to_string()])
+            .collect()
+    }
+
+    /// KECCAK_RND's positions follow the five fixed tables, COPY's and
+    /// KECCAK's; a name in that range that is not KECCAK_RND's, or a range
+    /// past the AIRs, is refused.
+    #[test]
+    fn keccak_rnd_positions_are_its_range_and_name_its_airs() {
+        let owned = names(4, 1, 3);
+        let n: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert_eq!(
+            keccak_rnd_positions(&counts(4, 1, 3), &n).ok(),
+            Some(vec![10, 11, 12])
+        );
+        assert_eq!(
+            keccak_rnd_positions(&counts(4, 1, 0), &n).ok(),
+            Some(Vec::new()),
+            "no KECCAK_RND table"
+        );
+        // One COPY table fewer in the counts: the range starts at a KECCAK.
+        let err = keccak_rnd_positions(&counts(3, 1, 3), &n).expect_err("off by one");
+        assert!(format!("{err:?}").contains("table 9"), "{err:?}");
+        let mut wrong = n.clone();
+        wrong[11] = "ECSM[0]";
+        let err = keccak_rnd_positions(&counts(4, 1, 3), &wrong).expect_err("a stray name");
+        assert!(format!("{err:?}").contains("table 11"), "{err:?}");
+        let err = keccak_rnd_positions(&counts(4, 1, 3), &n[..12]).expect_err("past the AIRs");
+        assert!(format!("{err:?}").contains("table 12"), "{err:?}");
+    }
+
+    /// With KECCAK_RND's positions first and BITWISE last, the rest is due in
+    /// that order: it is taken, AIR order is refused at the first KECCAK_RND
+    /// table's turn, and without `first` a KECCAK_RND table early is refused.
+    #[test]
+    fn with_keccak_rnd_first_the_rest_is_due_with_keccak_rnd_first() {
+        let widths = vec![21, 6, 38, 38, 17, 9];
+        let mut o = RestOrder::with_first(widths.clone(), &[3, 4], true);
+        for (position, width) in [
+            (3, Some(38)),
+            (4, None),
+            (1, Some(6)),
+            (2, Some(38)),
+            (5, Some(9)),
+            (0, Some(21)),
+        ] {
+            o.admit(position, width).expect("KECCAK_RND first");
+        }
+        o.finish().expect("every AIR reached");
+        let mut o = RestOrder::with_first(widths.clone(), &[3, 4], true);
+        let err = o.admit(1, Some(6)).expect_err("3 is due");
+        assert!(
+            format!("{err:?}").contains("came where table 3 was due"),
+            "{err:?}"
+        );
+        let mut o = RestOrder::with_first(widths, &[], true);
+        let err = o.admit(3, Some(38)).expect_err("1 is due");
+        assert!(
+            format!("{err:?}").contains("came where table 1 was due"),
+            "{err:?}"
+        );
+    }
+
+    /// `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST`: off (AIR order) unless `1`; any
+    /// other word refuses.
+    #[test]
+    fn the_keccak_rnd_first_knob_is_off_by_default_and_on_at_1() {
+        for (value, on) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some(" 1 "), true),
+        ] {
+            assert_eq!(parse_keccak_rnd_first(value).ok(), Some(on), "{value:?}");
+        }
+        for value in ["on", "true", "2", "first", "KECCAK_RND"] {
+            assert!(parse_keccak_rnd_first(Some(value)).is_err(), "{value}");
+        }
     }
 }
 

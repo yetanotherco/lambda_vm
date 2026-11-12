@@ -26,12 +26,17 @@ pub(crate) struct RestHeader {
     /// AIRs can be built before its tables are.
     pub(crate) cpu_heights: Vec<usize>,
     /// The rest is handed on in AIR order but BITWISE, which comes after every
-    /// other ([`StreamSkip::bitwise_last`], [`hand_on_order`]): the order the
+    /// other ([`StreamSkip::bitwise_last`], [`hand_on_order_first`]): the order the
     /// layout admits.
     pub(crate) bitwise_last: bool,
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables, counted as
     /// each is built ([`StreamSkip::bitwise_from_tables`]), BITWISE last.
     pub(crate) bitwise_from_tables: bool,
+    /// KECCAK_RND's tables are handed on before every other, in their AIR
+    /// order, then the rest as [`Self::bitwise_last`] says
+    /// ([`StreamSkip::keccak_rnd_first`], [`hand_on_order_first`]): the order
+    /// the layout admits.
+    pub(crate) keccak_rnd_first: bool,
 }
 
 impl RestHeader {
@@ -1457,6 +1462,7 @@ impl<'a> FinishPlan<'a> {
                 cpu_heights,
                 bitwise_last: false,
                 bitwise_from_tables: false,
+                keccak_rnd_first: false,
             },
             cut_line,
             cpu_decoded,
@@ -1473,6 +1479,12 @@ impl<'a> FinishPlan<'a> {
     /// multiplicities beside the rest's builds and slides.
     pub(crate) fn hand_bitwise_last(&mut self) {
         self.header.bitwise_last = true;
+    }
+
+    /// The rest handed on with KECCAK_RND's tables before every other
+    /// ([`RestHeader::keccak_rnd_first`]): for a sliding finish.
+    pub(crate) fn hand_keccak_rnd_first(&mut self) {
+        self.header.keccak_rnd_first = true;
     }
 
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables as each is
@@ -2052,6 +2064,7 @@ impl<'a> FinishPlan<'a> {
             cpu_heights: _,
             bitwise_last: _,
             bitwise_from_tables: _,
+            keccak_rnd_first: _,
         } = header;
         let traces = Traces {
             cpus,
@@ -3280,11 +3293,16 @@ impl<'a> FinishPlan<'a> {
     ) -> Result<Option<RestRegen>, Error> {
         // BITWISE is the rest's first table: its position is 0.
         let last = (slide && self.header.bitwise_last).then_some(0);
+        let keccak_rnd_first = slide && self.header.keccak_rnd_first;
         let (units, regen, side) = match self.units_keeping(keep) {
             Ok((units, regen, side)) => (Ok(units), regen, side),
             Err(e) => (Err(e), None, None),
         };
-        emit_streamed_units(units, gate, send, slide, last, side)?;
+        let first = match &units {
+            Ok(units) if keccak_rnd_first => positions_of(units, family("KECCAK_RND")),
+            _ => Vec::new(),
+        };
+        emit_streamed_units_ordered(units, gate, send, slide, &first, last, side)?;
         Ok(regen)
     }
 }
@@ -3295,6 +3313,7 @@ impl<'a> FinishPlan<'a> {
 /// every other table and `side` run beside the builds ([`Side`]; `last` then
 /// starts only once it is due): an error stops the gate, so it reaches every
 /// waiter, and is returned.
+#[cfg(test)]
 fn emit_streamed_units<'a>(
     units: Result<Vec<Unit<'a>>, Error>,
     gate: &gate::ByteGate,
@@ -3303,9 +3322,24 @@ fn emit_streamed_units<'a>(
     last: Option<usize>,
     side: Option<Side<'a>>,
 ) -> Result<(), Error> {
+    emit_streamed_units_ordered(units, gate, send, slide, &[], last, side)
+}
+
+/// [`emit_streamed_units`], sliding with the positions `first` (ascending)
+/// handed on before every other, in their order ([`hand_on_order_first`]).
+/// In waves `first` is ignored: AIR order.
+fn emit_streamed_units_ordered<'a>(
+    units: Result<Vec<Unit<'a>>, Error>,
+    gate: &gate::ByteGate,
+    send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+    slide: bool,
+    first: &[usize],
+    last: Option<usize>,
+    side: Option<Side<'a>>,
+) -> Result<(), Error> {
     #[cfg(feature = "parallel")]
     let result = if slide {
-        emit_units_sliding(units, gate, send, last, side)
+        emit_units_sliding(units, gate, send, first, last, side)
     } else {
         if let Some(side) = side {
             side();
@@ -3314,7 +3348,7 @@ fn emit_streamed_units<'a>(
     };
     #[cfg(not(feature = "parallel"))]
     let result = {
-        let _ = (slide, last);
+        let _ = (slide, first, last);
         if let Some(side) = side {
             side();
         }
@@ -3468,7 +3502,7 @@ struct FamilyBuild {
 /// ([`gate::ByteGate::with_build`]; by default the budget, which the gate
 /// already implies), so a larger gate can hold more built tables for the
 /// packer without building more of them at once. With `last`, that table is
-/// handed on after every other ([`hand_on_order`]) and numbered at the gate in
+/// handed on after every other ([`hand_on_order_first`]) and numbered at the gate in
 /// that order; it still starts first when the gate admits it, and otherwise
 /// starts once it is due, without holding back the tables after it. With
 /// `side` (run on a thread of its own while the tables build), `last` starts
@@ -3478,6 +3512,7 @@ fn emit_units_sliding<'a>(
     units: Result<Vec<Unit<'a>>, Error>,
     gate: &gate::ByteGate,
     send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+    first: &[usize],
     last: Option<usize>,
     side: Option<Side<'a>>,
 ) -> Result<(), Error> {
@@ -3491,7 +3526,7 @@ fn emit_units_sliding<'a>(
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(side));
             });
         }
-        slide_units(units, gate, send, last, last_waits)
+        slide_units(units, gate, send, first, last, last_waits)
     })
 }
 
@@ -3501,6 +3536,7 @@ fn slide_units(
     units: Vec<Unit<'_>>,
     gate: &gate::ByteGate,
     send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+    first: &[usize],
     last: Option<usize>,
     last_waits: bool,
 ) -> Result<(), Error> {
@@ -3509,9 +3545,10 @@ fn slide_units(
     // Built, not yet handed on, by AIR position (`Some(None)`: a streamed
     // chunk's slot).
     let mut ready: Vec<Option<Option<Table>>> = (0..total).map(|_| None).collect();
-    // The positions in the order they are handed on: AIR order, but `last`
-    // after every other ([`hand_on_order`]).
-    let order = hand_on_order(total, last);
+    // The positions in the order they are handed on: AIR order, but `first`
+    // before every other and `last` after every other
+    // ([`hand_on_order_first`]).
+    let order = hand_on_order_first(total, first, last);
     // Each table's number at the gate: its place among the tables in that
     // order, the order the packer places and releases them in.
     let mut numbers = vec![0usize; total];
@@ -3526,8 +3563,14 @@ fn slide_units(
     let (mut sent, mut building) = (0usize, 0usize);
     // The estimated bytes of the tables building now.
     let mut building_bytes = 0usize;
-    let mut units: std::collections::VecDeque<(usize, Unit<'_>)> =
-        units.into_iter().enumerate().collect();
+    // Started in the order they are handed on, but `last` first (it still
+    // starts first when the gate admits it): without `first`, AIR order.
+    let mut slots: Vec<Option<Unit<'_>>> = units.into_iter().map(Some).collect();
+    let mut units: std::collections::VecDeque<(usize, Unit<'_>)> = last
+        .into_iter()
+        .chain(order.iter().copied().filter(|&p| Some(p) != last))
+        .filter_map(|p| Some((p, slots.get_mut(p)?.take()?)))
+        .collect();
     // `last`'s table when the gate did not admit it as it came: the tables
     // after it start meanwhile, and it is tried again before them, and goes
     // once it is due.
@@ -3654,14 +3697,51 @@ fn slide_units(
     })
 }
 
-/// The order the sliding finish hands the rest's `total` positions on in: AIR
-/// order, with `last` (BITWISE's, when the finish counts it beside the rest's
-/// builds and hands it on last: [`StreamSkip::bitwise_last`]) after every other.
+/// [`hand_on_order_first`] without `first`: AIR order, `last` after every
+/// other.
+#[cfg(test)]
 pub(crate) fn hand_on_order(total: usize, last: Option<usize>) -> Vec<usize> {
+    hand_on_order_first(total, &[], last)
+}
+
+/// The order the sliding finish hands the rest's `total` positions on in:
+/// the positions `first` (KECCAK_RND's, when the finish hands them on first:
+/// [`StreamSkip::keccak_rnd_first`]) in their order, then AIR order without
+/// `first` and `last`, then `last` (BITWISE's, when the finish counts it
+/// beside the rest's builds and hands it on last: [`StreamSkip::bitwise_last`]).
+/// Positions past `total`, repeats, and `last` are dropped from `first`, so
+/// the order is always a permutation of `0..total`.
+pub(crate) fn hand_on_order_first(
+    total: usize,
+    first: &[usize],
+    last: Option<usize>,
+) -> Vec<usize> {
     let last = last.filter(|&p| p < total);
-    (0..total)
-        .filter(|&p| Some(p) != last)
-        .chain(last)
+    let mut early = vec![false; total];
+    let mut order = Vec::with_capacity(total);
+    for &p in first {
+        if Some(p) != last
+            && let Some(seen) = early.get_mut(p)
+            && !*seen
+        {
+            *seen = true;
+            order.push(p);
+        }
+    }
+    order.extend((0..total).filter(|&p| early.get(p) == Some(&false) && Some(p) != last));
+    order.extend(last);
+    order
+}
+
+/// The positions of `units` of `family` ([`FAMILIES`]), ascending.
+fn positions_of(units: &[Unit<'_>], family: usize) -> Vec<usize> {
+    units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| match unit {
+            Unit::Streamed { family: f } | Unit::Build { family: f, .. } => *f == family,
+        })
+        .map(|(p, _)| p)
         .collect()
 }
 

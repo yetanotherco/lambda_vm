@@ -1066,6 +1066,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// The rest handed on with KECCAK_RND's tables before every other when
+    /// the finish slides ([`StreamSkip::keccak_rnd_first`]). The tables are
+    /// the same; their order, and so the groups, are not.
+    pub fn keccak_rnd_first(mut self) -> Self {
+        self.emitted.keccak_rnd_first = true;
+        self
+    }
+
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables counted
     /// from each table's rows as it is built, phase 4 beside the rest's builds
     /// and BITWISE handed on last ([`StreamSkip::bitwise_from_tables`]), when
@@ -1286,6 +1294,9 @@ impl<'a> WindowedTraceBuilder<'a> {
         }
         if from_tables {
             plan.count_bitwise_from_tables();
+        }
+        if skip.keccak_rnd_first && slide && cfg!(feature = "parallel") {
+            plan.hand_keccak_rnd_first();
         }
         let mut send = match on_header(plan.header().clone()) {
             Ok(send) => send,

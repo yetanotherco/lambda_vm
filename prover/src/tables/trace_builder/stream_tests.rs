@@ -20,7 +20,9 @@ use executor::vm::logs::Log;
 
 use super::super::gate::ByteGate;
 use super::super::*;
-use super::{Emitted, FAMILIES, Job, Unit, emit_streamed_units, hand_on_order};
+use super::{
+    Emitted, FAMILIES, Job, Unit, emit_streamed_units, hand_on_order, hand_on_order_first,
+};
 use crate::tables::MaxRowsConfig;
 use crate::test_utils::asm_elf_bytes;
 
@@ -880,6 +882,158 @@ fn with_bitwise_last_the_sliding_stream_hands_bitwise_on_last() {
             }
         }
     }
+}
+
+/// ★ With KECCAK_RND's tables handed on first
+/// ([`WindowedTraceBuilder::keccak_rnd_first`]) and BITWISE last, the sliding
+/// stream hands on the monolithic finish's tables word for word, each at its
+/// AIR position and each once (the same tables as a set), KECCAK_RND's first
+/// at exactly the positions the layout expects them
+/// ([`crate::block_whir::chunked_table_ranges`] of the header's counts), then
+/// the rest in AIR order, BITWISE last, under a header that says so: every
+/// configuration, windows of 7 and 1000 cycles, budgets of one byte and none,
+/// and one table building at once. In waves the order stays AIR order.
+#[test]
+fn with_keccak_rnd_first_the_sliding_stream_hands_keccak_rnd_on_first() {
+    let max_rows = MaxRowsConfig::small();
+    let mut reordered_with_tables = 0usize;
+    for name in ["test_keccak_multi", "all_instructions_64"] {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            for (config, configure) in &configs() {
+                let (builder, last) =
+                    pushed(&program, &logs, &max_rows, window, configure.as_ref());
+                let want = air_order(&builder.finish(last).expect("the monolithic finish"))
+                    .into_iter()
+                    .map(|t| t.map(shape_and_words))
+                    .collect::<Vec<_>>();
+                for (slide, budget, build) in [
+                    (true, 1usize, None),
+                    (true, usize::MAX, None),
+                    (true, usize::MAX, Some(1)),
+                    (false, usize::MAX, None),
+                ] {
+                    let what = format!(
+                        "{name} window {window} {config} slide {slide} budget {budget} build \
+                         {build:?}"
+                    );
+                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                        let b = configure(b).rest_bitwise_last().keccak_rnd_first();
+                        if slide { b.slide_rest() } else { b }
+                    });
+                    let (header, got, _) = streamed_capped(builder, last, budget, build);
+                    let reordered = slide && cfg!(feature = "parallel");
+                    assert_eq!(header.keccak_rnd_first, reordered, "{what}: the header");
+                    let first: Vec<usize> = if reordered {
+                        crate::block_whir::chunked_table_ranges(&header.table_counts)
+                            .into_iter()
+                            .find(|(family, ..)| *family == "KECCAK_RND")
+                            .map(|(_, range, _)| range.collect())
+                            .expect("KECCAK_RND's range")
+                    } else {
+                        Vec::new()
+                    };
+                    let positions: Vec<usize> = got.iter().map(|e| e.position).collect();
+                    assert_eq!(
+                        positions,
+                        hand_on_order_first(want.len(), &first, reordered.then_some(0)),
+                        "{what}: the hand-on order"
+                    );
+                    let mut seen = positions.clone();
+                    seen.sort_unstable();
+                    assert_eq!(
+                        seen,
+                        (0..want.len()).collect::<Vec<_>>(),
+                        "{what}: every table once"
+                    );
+                    for e in &got {
+                        assert!(
+                            e.table.as_ref().map(shape_and_words) == want[e.position],
+                            "{what}: table {}",
+                            e.position
+                        );
+                    }
+                    if reordered && got.iter().take(first.len()).any(|e| e.table.is_some()) {
+                        reordered_with_tables += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        reordered_with_tables > 0 || !cfg!(feature = "parallel"),
+        "no stream handed a KECCAK_RND table on first"
+    );
+}
+
+/// Handed on first under a one-byte budget, with BITWISE last, the tables go
+/// one at a time in the order `first`, AIR order, BITWISE, and the stream
+/// completes (a named timeout, not a hang, if the gate's lowest-pending rule
+/// and the start order disagreed); without `first` the order is
+/// [`hand_on_order`]'s.
+#[test]
+#[cfg(feature = "parallel")]
+fn tables_handed_on_first_stream_under_a_one_byte_budget() {
+    use std::sync::atomic::AtomicUsize;
+    for (first, want) in [
+        (vec![3, 4], vec![3, 4, 1, 2, 5, 0]),
+        (vec![5], vec![5, 1, 2, 3, 4, 0]),
+        (Vec::new(), vec![1, 2, 3, 4, 5, 0]),
+    ] {
+        let done = within(30, move || {
+            let (now, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let gate = ByteGate::new(1);
+            let mut order = Vec::new();
+            let result = super::emit_streamed_units_ordered(
+                Ok(counting_units(6, 5, &now, &most)),
+                &gate,
+                &mut |e: Emitted| {
+                    gate.release(order.len());
+                    order.push(e.position);
+                    Ok(())
+                },
+                true,
+                &first,
+                Some(0),
+                None,
+            );
+            result.map(|()| (order, most.into_inner()))
+        });
+        let (order, most) = done
+            .expect("tables handed on first must not deadlock a one-byte budget")
+            .expect("the stream");
+        assert_eq!(order, want, "the order");
+        assert_eq!(most, 1, "one table at a time");
+    }
+}
+
+/// The order is `first`, then AIR order, then `last`, always a permutation:
+/// without `first` it is [`hand_on_order`]'s, and positions past the end,
+/// repeats and `last` itself are dropped from `first`.
+#[test]
+fn the_hand_on_order_puts_first_first_and_last_last() {
+    assert_eq!(
+        hand_on_order_first(8, &[3, 4, 5], Some(0)),
+        vec![3, 4, 5, 1, 2, 6, 7, 0]
+    );
+    assert_eq!(
+        hand_on_order_first(8, &[3, 4, 5], None),
+        vec![3, 4, 5, 0, 1, 2, 6, 7]
+    );
+    for last in [None, Some(0), Some(7), Some(9)] {
+        assert_eq!(
+            hand_on_order_first(8, &[], last),
+            hand_on_order(8, last),
+            "{last:?}"
+        );
+    }
+    let odd = hand_on_order_first(6, &[4, 4, 0, 9, 2], Some(0));
+    assert_eq!(
+        odd,
+        vec![4, 2, 1, 3, 5, 0],
+        "repeats, past the end and last dropped"
+    );
+    assert_eq!(hand_on_order_first(0, &[0], Some(0)), Vec::<usize>::new());
 }
 
 /// ★ With BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables
