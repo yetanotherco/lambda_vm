@@ -6878,11 +6878,12 @@ pub struct StreamSkip {
     /// The LT tables the table phase builds make the rows of the timestamp
     /// comparisons phase 3 derives from MEMW and MEMW_A ops by merging equal
     /// neighbours instead of through a map ([`lt_chunk_rows`]); the CPU's,
-    /// DVRM's and HINT's comparisons keep their map (`LAMBDA_VM_BLOCK_LT_MERGE=1`
-    /// on the block). The chunks are the same; their rows, and so LT's tables
-    /// and BITWISE's multiplicities, are not, while every op's μ summed over
-    /// LT's rows is. With [`Self::concat_lt`] the derived ops are in one list
-    /// with the others and nothing merges. `false`: today's rows.
+    /// DVRM's and HINT's comparisons keep their map (the block's prove sets it
+    /// unless `LAMBDA_VM_BLOCK_LT_MERGE=0`). The chunks are the same; their
+    /// rows, and so LT's tables and BITWISE's multiplicities, are not, while
+    /// every op's μ summed over LT's rows is. With [`Self::concat_lt`] the
+    /// derived ops are in one list with the others and nothing merges.
+    /// `false` (a builder's default): the map's rows.
     pub lt_merge: bool,
     /// A test's fault: with [`Self::lt_merge`], LT's tables are built from the
     /// merged rows but every count of their per-row lookups reads the map's
