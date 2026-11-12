@@ -571,3 +571,57 @@ fn with_the_merge_every_inner_bus_balances_and_a_map_count_does_not() {
         "no build caught the map's count under merged tables"
     );
 }
+
+/// ★ A MEMW op's comparisons are `old_timestamp[i] < timestamp` for each of
+/// its `width` bytes (MEMW-C4…C7), in byte order; a MEMW_A row's is its one
+/// pair. LT's memory list fed pairs ([`CompactLt::extend_pairs`]) holds the
+/// ops fed whole would ([`CompactLt::extend`]), compact or raw.
+#[test]
+fn a_memory_accesss_comparisons_are_its_bytes_pairs() {
+    let mut ops = Vec::new();
+    for (k, width) in [1u8, 2, 4, 8].into_iter().enumerate() {
+        let ts = 1_000 + 10 * k as u64;
+        let op = MemwOperation {
+            base_address: 0x1000 + 8 * k as u64,
+            timestamp: ts,
+            old_timestamp: std::array::from_fn(|i| ts - 1 - i as u64),
+            value: [0; 8],
+            old: [0; 8],
+            is_register: false,
+            width,
+            is_read: k % 2 == 0,
+        };
+        let want: Vec<(u64, u64)> = (0..width as u64).map(|i| (ts - 1 - i, ts)).collect();
+        assert_eq!(
+            memw_lt_pairs(&op).collect::<Vec<_>>(),
+            want,
+            "width {width}"
+        );
+        ops.push(op);
+    }
+    let derived = collect_lt_from_memw(&ops);
+    let pairs: Vec<(u64, u64)> = ops.iter().flat_map(memw_lt_pairs).collect();
+    assert_eq!(derived.len(), 1 + 2 + 4 + 8);
+    assert!(
+        derived
+            .iter()
+            .zip(&pairs)
+            .all(|(op, &(old, ts))| *op == LtOperation::new(old, ts, false))
+    );
+    for (mut whole, mut fed) in [
+        (CompactLt::default(), CompactLt::default()),
+        (
+            CompactLt::with_block_bytes(40),
+            CompactLt::with_block_bytes(40),
+        ),
+        (CompactLt::raw(), CompactLt::raw()),
+    ] {
+        whole.extend(&derived);
+        fed.extend_pairs(pairs.iter().copied());
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        whole.expand_into(0, whole.len(), &mut a);
+        fed.expand_into(0, fed.len(), &mut b);
+        assert_eq!(a, derived);
+        assert_eq!(b, derived);
+    }
+}

@@ -26,8 +26,8 @@ use std::time::Instant;
 
 use super::super::{
     CompactLt, CpuOperation, LtOperation, MemwOperation, RegRow, ShiftOperation, bitwise,
-    collect_bitwise_from_lt_ops, collect_bitwise_from_memw_aligned, collect_lt_from_memw,
-    collect_lt_from_memw_aligned, lt_row_lookups,
+    collect_bitwise_from_lt_ops, collect_bitwise_from_memw_aligned, lt_row_lookups,
+    memw_aligned_lt_pair, memw_lt_pairs,
 };
 use super::{Segments, StreamTable};
 use crate::Error;
@@ -83,8 +83,7 @@ pub(super) fn count_memw_aligned(
             histogram.add_ops(&collect_bitwise_from_memw_aligned(rows));
         }
         if let Some(lt) = lt.as_deref_mut() {
-            let derived = collect_lt_from_memw_aligned(rows);
-            lt.extend(&derived);
+            lt.extend_pairs(rows.iter().map(memw_aligned_lt_pair));
         }
     }
 }
@@ -93,7 +92,7 @@ pub(super) fn count_memw_aligned(
 pub(super) fn count_memw(ops: &Segments<MemwOperation>, lt: Option<&mut CompactLt>) {
     if let Some(lt) = lt {
         for part in ops.slices() {
-            lt.extend(&collect_lt_from_memw(part));
+            lt.extend_pairs(part.iter().flat_map(memw_lt_pairs));
         }
     }
 }

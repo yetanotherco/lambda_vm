@@ -4138,51 +4138,35 @@ fn collect_blake3_memw_ops(
 /// Returns: Vec of LT operations
 fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
     let mut lt_ops = Vec::with_capacity(memw_ops.len() * 8);
-
-    for memw_op in memw_ops {
-        // MEMW-C4: old_timestamp[0] < timestamp (all accesses)
-        lt_ops.push(LtOperation::new(
-            memw_op.old_timestamp[0],
-            memw_op.timestamp,
-            false,
-        ));
-
-        // MEMW-C5: old_timestamp[1] < timestamp (width >= 2)
-        if memw_op.width >= 2 {
-            lt_ops.push(LtOperation::new(
-                memw_op.old_timestamp[1],
-                memw_op.timestamp,
-                false,
-            ));
-        }
-
-        // MEMW-C6: old_timestamp[2,3] < timestamp (width >= 4)
-        if memw_op.width >= 4 {
-            lt_ops.push(LtOperation::new(
-                memw_op.old_timestamp[2],
-                memw_op.timestamp,
-                false,
-            ));
-            lt_ops.push(LtOperation::new(
-                memw_op.old_timestamp[3],
-                memw_op.timestamp,
-                false,
-            ));
-        }
-
-        // MEMW-C7: old_timestamp[4..7] < timestamp (width == 8)
-        if memw_op.width == 8 {
-            for i in 4..8 {
-                lt_ops.push(LtOperation::new(
-                    memw_op.old_timestamp[i],
-                    memw_op.timestamp,
-                    false,
-                ));
-            }
-        }
-    }
-
+    lt_ops.extend(
+        memw_ops
+            .iter()
+            .flat_map(memw_lt_pairs)
+            .map(|(old, ts)| LtOperation::new(old, ts, false)),
+    );
     lt_ops
+}
+
+/// One MEMW op's timestamp comparisons `(old timestamp, timestamp)`, each
+/// `old < timestamp`, in its checks' order: MEMW-C4 `old_timestamp[0]` (every
+/// access), MEMW-C5 `[1]` (width ≥ 2), MEMW-C6 `[2]`, `[3]` (width ≥ 4), MEMW-C7
+/// `[4..8]` (width 8). The pairs [`collect_lt_from_memw`] makes its LT ops of
+/// and the hand-out appends to LT's memory list ([`CompactLt::extend_pairs`]).
+pub(crate) fn memw_lt_pairs(op: &MemwOperation) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let n = 1
+        + usize::from(op.width >= 2)
+        + 2 * usize::from(op.width >= 4)
+        + 4 * usize::from(op.width == 8);
+    op.old_timestamp[..n]
+        .iter()
+        .map(move |&old| (old, op.timestamp))
+}
+
+/// One MEMW_A row's timestamp comparison `(old timestamp, timestamp)`: the pair
+/// [`collect_lt_from_memw_aligned`] makes its LT op of and the hand-out appends
+/// to LT's memory list ([`CompactLt::extend_pairs`]).
+pub(crate) fn memw_aligned_lt_pair(op: &memw_aligned::AlignedRow) -> (u64, u64) {
+    (op.old_timestamp(), op.timestamp())
 }
 
 /// Collects LT operations from MEMW_A for timestamp ordering.
@@ -4194,7 +4178,10 @@ fn collect_lt_from_memw_aligned(memw_aligned_ops: &[memw_aligned::AlignedRow]) -
     // aligned address is 2^64-N, and 2^64-N+(N-1) = 2^64-1, so no u64 overflow.
     memw_aligned_ops
         .iter()
-        .map(|op| LtOperation::new(op.old_timestamp(), op.timestamp(), false))
+        .map(|op| {
+            let (old, ts) = memw_aligned_lt_pair(op);
+            LtOperation::new(old, ts, false)
+        })
         .collect()
 }
 
@@ -7625,9 +7612,29 @@ impl CompactLt {
     }
 
     /// Append `ops` (each with `signed` and `invert` false).
+    #[cfg(test)]
     pub(crate) fn extend(&mut self, ops: &[LtOperation]) {
+        self.extend_pairs(ops.iter().map(|op| {
+            debug_assert!(
+                !op.signed && !op.invert,
+                "a compact LT op is unsigned, not inverted"
+            );
+            (op.lhs, op.rhs)
+        }));
+    }
+
+    /// Append the timestamp comparisons `(old timestamp, timestamp)`, each the
+    /// LT op `old < timestamp` (unsigned, not inverted), in order: the one way
+    /// a memory access's comparisons enter LT's memory lists, whose rows
+    /// [`lt_chunk_rows`] makes for both the tables and the counts of their
+    /// per-row lookups ([`StreamSkip::lt_merge`]).
+    pub(crate) fn extend_pairs(&mut self, pairs: impl IntoIterator<Item = (u64, u64)>) {
         if let Some(raw) = &mut self.raw {
-            raw.extend_from_slice(ops);
+            raw.extend(
+                pairs
+                    .into_iter()
+                    .map(|(old, ts)| LtOperation::new(old, ts, false)),
+            );
             return;
         }
         fn put(out: &mut Vec<u8>, mut v: u64) {
@@ -7639,11 +7646,7 @@ impl CompactLt {
         }
         let zigzag = |d: u64| (d << 1) ^ ((d as i64 >> 63) as u64);
         let block_bytes = self.block_bytes();
-        for op in ops {
-            debug_assert!(
-                !op.signed && !op.invert,
-                "a compact LT op is unsigned, not inverted"
-            );
+        for (old, ts) in pairs {
             // Room for the op in the last block: grown as a `Vec` grows up to a
             // block's bytes, else a new block, allocated whole.
             let room = self
@@ -7672,9 +7675,9 @@ impl CompactLt {
                 self.index
                     .push((block as u32, last.len() as u32, self.last_rhs));
             }
-            put(last, zigzag(op.rhs.wrapping_sub(self.last_rhs)));
-            put(last, zigzag(op.rhs.wrapping_sub(op.lhs)));
-            self.last_rhs = op.rhs;
+            put(last, zigzag(ts.wrapping_sub(self.last_rhs)));
+            put(last, zigzag(ts.wrapping_sub(old)));
+            self.last_rhs = ts;
             self.len += 1;
         }
     }
