@@ -21,8 +21,9 @@ use super::compiler::{LfmProgram, compile};
 use super::hash::HasherKind;
 use super::wlfm::{
     WLFM_B4_QUERIES, WLFM_B16_STACK, WlfmBuild, WlfmHash, WlfmProof, WlfmRate,
-    absorb_wlfm_statement, build_wlfm, check_coverage, execute_and_fill_unmerged, prove_wlfm,
-    prove_wlfm_traces, test_format, verify_wlfm, verify_wlfm_with, wlfm_config,
+    absorb_wlfm_statement, build_wlfm, build_wlfm_on_host, check_coverage,
+    execute_and_fill_unmerged, prove_wlfm, prove_wlfm_traces, test_format, verify_wlfm,
+    verify_wlfm_with, wlfm_config,
 };
 use super::word::LfmWord;
 
@@ -165,6 +166,28 @@ fn the_blowup_16_arm_round_trips_and_is_another_identity() {
         verify_wlfm(&two.artifacts, &proof, &proof.public_words).is_err(),
         "a blowup-16 proof is refused at blowup 2"
     );
+}
+
+/// The verifier's host-committed build is the prover's: the same prepared
+/// roots and identity, and the prover's proof verifies against it. On a card
+/// build this compares the card's prepared commit with the host's.
+#[test]
+fn the_host_build_is_the_provers_build() {
+    let _unground = test_format::set(None);
+    let program = honest();
+    for rate in [WlfmRate::Two, WlfmRate::Sixteen] {
+        let prover = build(&program, rate);
+        let host = build_wlfm_on_host(&program, HASHER, rate)
+            .unwrap_or_else(|e| panic!("the host build: {e}"));
+        assert_eq!(
+            prover.artifacts.derived_roots(),
+            host.artifacts.derived_roots()
+        );
+        assert_eq!(prover.artifacts.program_id, host.artifacts.program_id);
+        let proof = prove(&program, &prover);
+        verify_wlfm(&host.artifacts, &proof, &proof.public_words)
+            .unwrap_or_else(|e| panic!("the proof verifies against the host build: {e}"));
+    }
 }
 
 /// [`WLFM_B4_QUERIES`] is the fewest queries that keep the unique-decoding
