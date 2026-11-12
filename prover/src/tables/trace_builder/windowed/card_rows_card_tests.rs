@@ -70,9 +70,9 @@ fn grouped(chunks: &[(StreamTable, usize, Records)], size: usize) -> Vec<Vec<&Re
 }
 
 /// Every group in `order` and `derive`, forwards and backwards, against
-/// today's: the words differing in each (0 everywhere), and the counters of
-/// the derive mode's two passes.
-fn compare(groups: &[Vec<&Records>], what: &str) -> card_rows::Stats {
+/// today's: the words differing in each (0 everywhere). Returns the counters
+/// of the derive mode's two passes and today's stores, group by group.
+fn compare(groups: &[Vec<&Records>], what: &str) -> (card_rows::Stats, Vec<Vec<Vec<u64>>>) {
     let forwards: Vec<usize> = (0..groups.len()).collect();
     let backwards: Vec<usize> = (0..groups.len()).rev().collect();
     card_rows::clear();
@@ -106,7 +106,11 @@ fn compare(groups: &[Vec<&Records>], what: &str) -> card_rows::Stats {
             derive_stats = s;
         }
     }
-    derive_stats
+    let today = today
+        .into_iter()
+        .map(|(_, store)| store.expect("today's store"))
+        .collect();
+    (derive_stats, today)
 }
 
 #[test]
@@ -130,7 +134,7 @@ fn card_rows_uploads_write_todays_words_forwards_and_backwards() {
             let chunks = records_chunks(&program, &[], &max_rows, window, (0, None), true);
             for size in [3usize, 8] {
                 let groups = grouped(&chunks, size);
-                let s = compare(
+                let (s, _) = compare(
                     &groups,
                     &format!("{name}, window {window}, groups of {size}"),
                 );
@@ -158,67 +162,14 @@ fn card_rows_uploads_write_todays_words_forwards_and_backwards() {
     );
 }
 
-/// The mutant on groups that derive: each program's chunks in one group, so
-/// its own CPU tables hold every derived row's cycle. Each family alone
-/// (LOAD, then STORE) must derive a table and move a group: other words, or
-/// the group declined. (Groups of 8 in hand-out order derive no table, so a
-/// mutant there could not fail.)
-#[test]
-fn a_derived_rows_cycle_read_one_late_changes_words_or_declines_the_group() {
-    let _reset = Reset::new();
-    let max_rows = MaxRowsConfig {
-        load: 1 << 2,
-        store: 1 << 2,
-        ..MaxRowsConfig::small()
-    };
-    for (family, bit) in [("LOAD", 1u8), ("STORE", 2u8)] {
-        let (mut derived, mut moved, mut groups) = (0u64, 0usize, 0usize);
-        for name in [
-            "all_loadstore_32",
-            "misalign_ld",
-            "misalign_sd",
-            "all_instructions_64",
-        ] {
-            let (program, _) = run(name);
-            let chunks = records_chunks(&program, &[], &max_rows, 7, (0, None), true);
-            let groups_of = grouped(&chunks, chunks.len().max(1));
-            card_rows::FAULT_CYCLE_SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
-            card_rows::clear();
-            let today = stores(&groups_of, &[0], Mode::Off);
-            card_rows::clear();
-            card_rows::FAULT_FAMILIES.store(bit, std::sync::atomic::Ordering::Relaxed);
-            card_rows::FAULT_CYCLE_SHIFT.store(1, std::sync::atomic::Ordering::Relaxed);
-            let faulted = stores(&groups_of, &[0], Mode::Derive);
-            let s = card_rows::stats();
-            derived += if bit == 1 {
-                s.derived_load
-            } else {
-                s.derived_store
-            };
-            groups += 1;
-            moved += usize::from(match (&faulted[0].1, &today[0].1) {
-                (None, _) => true,
-                (Some(got), Some(want)) => mismatches(got, want).0 > 0,
-                (Some(_), None) => false,
-            });
-        }
-        card_rows::FAULT_CYCLE_SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
-        card_rows::FAULT_FAMILIES.store(0, std::sync::atomic::Ordering::Relaxed);
-        println!(
-            "CARD ROWS MUTANT {family} cycle read one late: {moved} of {groups} groups moved · {family} tables derived {derived}"
-        );
-        assert!(
-            derived > 0,
-            "{family}: no table derived, the mutant cannot bite"
-        );
-        assert!(moved > 0, "{family}: the mutant moved no group");
-    }
-}
-
 /// The real block (`BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`) at the production
 /// heights: the hand-out's chunks up to its first LOAD and STORE chunks and
 /// `CARD_ROWS_EXTRA_CHUNKS` (default 24) more, in groups of ten in hand-out
-/// order and then backwards, in each mode against today's.
+/// order and then backwards, in each mode against today's. Then the mutant
+/// on the same groups and passes: in LOAD alone, then in STORE alone, each
+/// derived row's cycle read one late. Each family must derive a table and
+/// move a group (other words, or the group declined): the passes above
+/// derive both families here, which small programs' chunks do not.
 #[test]
 #[ignore = "card: a box test (BLOCK_WHIR_ELF, BLOCK_WHIR_INPUT)"]
 fn card_rows_on_a_real_block_write_todays_words() {
@@ -259,7 +210,7 @@ fn card_rows_on_a_real_block_write_todays_words() {
         t.elapsed().as_secs_f64()
     );
     let groups = grouped(chunks, 10);
-    let s = compare(&groups, "the real block");
+    let (s, today) = compare(&groups, "the real block");
     println!(
         "CARD ROWS REAL VERDICT: 0 words differ in {} groups × 3 passes · derived LOAD {} STORE {} · as records LOAD {} STORE {} · CPU from the cache {} · kept {} · let go {}",
         groups.len(),
@@ -275,4 +226,42 @@ fn card_rows_on_a_real_block_write_todays_words() {
         s.derived_load > 0 && s.derived_store > 0,
         "no LOAD or STORE table derived on the real block"
     );
+
+    // The mutant: the derive passes again (forwards from an empty cache, then
+    // backwards with it warm), each derived row's cycle read one late in one
+    // family at a time.
+    let forwards: Vec<usize> = (0..groups.len()).collect();
+    let backwards: Vec<usize> = (0..groups.len()).rev().collect();
+    for (family, bit) in [("LOAD", 1u8), ("STORE", 2u8)] {
+        card_rows::clear();
+        card_rows::FAULT_FAMILIES.store(bit, std::sync::atomic::Ordering::Relaxed);
+        card_rows::FAULT_CYCLE_SHIFT.store(1, std::sync::atomic::Ordering::Relaxed);
+        let mut moved = 0usize;
+        let mut uploads = 0usize;
+        for order in [&forwards, &backwards] {
+            for (g, got) in stores(&groups, order, Mode::Derive) {
+                uploads += 1;
+                moved += usize::from(match got {
+                    None => true,
+                    Some(got) => mismatches(&got, &today[g]).0 > 0,
+                });
+            }
+        }
+        let after = card_rows::stats();
+        card_rows::FAULT_CYCLE_SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
+        card_rows::FAULT_FAMILIES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let derived = if bit == 1 {
+            after.derived_load
+        } else {
+            after.derived_store
+        };
+        println!(
+            "CARD ROWS MUTANT {family} cycle read one late: {moved} of {uploads} groups moved · {family} tables derived {derived}"
+        );
+        assert!(
+            derived > 0,
+            "{family}: no table derived, the mutant cannot bite"
+        );
+        assert!(moved > 0, "{family}: the mutant moved no group");
+    }
 }
