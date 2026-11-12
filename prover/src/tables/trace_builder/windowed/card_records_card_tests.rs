@@ -27,7 +27,7 @@ use super::{RecordsRoom, RowFamilies, Segments, StreamTable, WindowedTraceBuilde
 use crate::tables::MaxRowsConfig;
 use crate::tests::windowed_builder_tests::run;
 
-fn always() -> RecordsRoom {
+pub(super) fn always() -> RecordsRoom {
     Arc::new(|_| true)
 }
 
@@ -35,7 +35,7 @@ fn always() -> RecordsRoom {
 /// the run of `program` hands out as records, by windows of `window` cycles,
 /// from the hand-out of window `from` on and through `windows` windows walked
 /// (all of them: `None`): `(family, index, records)`.
-fn records_chunks(
+pub(super) fn records_chunks(
     program: &Elf,
     input: &[u8],
     max_rows: &MaxRowsConfig,
@@ -83,7 +83,7 @@ fn records_chunks(
 }
 
 /// The group's store, column by column, as the card holds it.
-fn uploaded(tables: &[TableColumns<'_, F>]) -> Vec<Vec<u64>> {
+pub(super) fn uploaded(tables: &[TableColumns<'_, F>]) -> Vec<Vec<u64>> {
     upload_tables(tables)
         .expect("the card takes the group")
         .download()
@@ -91,7 +91,7 @@ fn uploaded(tables: &[TableColumns<'_, F>]) -> Vec<Vec<u64>> {
 }
 
 /// Mismatched words between two stores, and the first.
-fn mismatches(got: &[Vec<u64>], want: &[Vec<u64>]) -> (usize, Option<(usize, usize)>) {
+pub(super) fn mismatches(got: &[Vec<u64>], want: &[Vec<u64>]) -> (usize, Option<(usize, usize)>) {
     let mut count = 0;
     let mut first = None;
     assert_eq!(got.len(), want.len(), "the columns");

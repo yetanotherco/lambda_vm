@@ -424,6 +424,11 @@ pub struct CardDecode {
 }
 
 impl CardDecode {
+    /// The entries, the runs and their count, as a kernel takes them.
+    pub(crate) fn parts(&self) -> (&CudaSlice<DecodeEntryC>, &CudaSlice<DecodeRunC>, u32) {
+        (&self.entries, &self.runs, self.nruns)
+    }
+
     /// `entries` and `runs` on `stream`. Refused unless the runs are ascending
     /// and disjoint and every row they name is an entry.
     pub fn upload(
@@ -598,9 +603,13 @@ pub enum RecordsInput<'a> {
     },
     /// CPU's `rows` rows: one a log of `logs`' pieces in order, read with its
     /// row of `decode` at the table's own timestamps; then the padding rows.
+    /// `first_cycle` is the first log's cycle in the run: the key the
+    /// card-rows cache holds the logs by ([`crate::card_rows`]); the fill
+    /// itself does not read it.
     Cpu {
         logs: &'a [&'a [LogC]],
-        decode: &'a CardDecode,
+        decode: &'a Arc<CardDecode>,
+        first_cycle: u64,
         rows: usize,
     },
     /// MEMW_R's `rows` rows: `records`' pieces in order, then zero rows.
@@ -724,7 +733,7 @@ pub(crate) struct FillChecks {
 
 impl FillChecks {
     /// The counter of logs with no DECODE row, zeroed on `stream` at first use.
-    fn missing(&mut self, stream: &Arc<CudaStream>) -> Result<&mut CudaSlice<u64>> {
+    pub(crate) fn missing(&mut self, stream: &Arc<CudaStream>) -> Result<&mut CudaSlice<u64>> {
         if self.missing.is_none() {
             self.missing = Some(stream.alloc_zeros::<u64>(1)?);
         }
@@ -863,7 +872,9 @@ pub(crate) fn fill_col_major_into(
             let ops_dev = upload(stream, ops)?;
             launch_keccak_rnd(stream, &m.keccak_rnd_in, &ops_dev, nops, skip, rows, dst)
         }
-        RecordsInput::Cpu { logs, decode, rows } => {
+        RecordsInput::Cpu {
+            logs, decode, rows, ..
+        } => {
             let n = records.len() as u64;
             let logs_dev = upload_pieces(stream, logs)?;
             let height = rows as u64;
@@ -933,6 +944,122 @@ pub(crate) fn fill_col_major_into(
             let records_dev = upload_pieces(stream, pieces)?;
             launch_rows(stream, &m.memw, &records_dev, records.len(), rows, dst)
         }
+    }
+}
+
+/// A CPU table's logs on the card: copied up for this table, or a CPU chunk
+/// the card-rows cache holds ([`crate::card_rows`]), by its address.
+pub(crate) enum CpuLogsOnCard {
+    Owned(CudaSlice<LogC>),
+    Cached(u64),
+}
+
+/// A table's records already on the card, its kernel not yet launched: the
+/// first half of [`fill_col_major_into`], so a group's upload can make every
+/// copy before any kernel ([`crate::card_rows`]). [`launch_staged`] is the
+/// second half; the two together write what [`fill_col_major_into`] writes.
+pub(crate) enum Staged<'a> {
+    KeccakRnd {
+        ops: CudaSlice<KeccakOpInC>,
+        nops: u32,
+        skip: usize,
+    },
+    Cpu {
+        logs: CpuLogsOnCard,
+        n: usize,
+        decode: &'a CardDecode,
+    },
+    MemwR(CudaSlice<RegRowC>, usize),
+    MemwA(CudaSlice<AlignedRowC>, usize),
+    Load(CudaSlice<LoadOpC>, usize),
+    Store(CudaSlice<StoreOpC>, usize),
+    Shift(CudaSlice<ShiftOpC>, usize),
+    Memw(CudaSlice<MemwOpC>, usize),
+    /// Written by another launch (a derived table, [`crate::card_rows`]):
+    /// nothing to launch here.
+    Elsewhere,
+}
+
+/// `records` copied up on `stream`, as [`fill_col_major_into`] copies them;
+/// no kernel launched.
+pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> Result<Staged<'a>> {
+    let n = records.len();
+    Ok(match records {
+        RecordsInput::KeccakRnd { ops, skip, .. } => Staged::KeccakRnd {
+            nops: u32::try_from(ops.len()).map_err(|_| crate::invalid_value())?,
+            ops: upload(stream, ops)?,
+            skip,
+        },
+        RecordsInput::Cpu { logs, decode, .. } => Staged::Cpu {
+            logs: CpuLogsOnCard::Owned(upload_pieces(stream, logs)?),
+            n,
+            decode: decode.as_ref(),
+        },
+        RecordsInput::MemwR { records, .. } => Staged::MemwR(upload_pieces(stream, records)?, n),
+        RecordsInput::MemwA { records, .. } => Staged::MemwA(upload_pieces(stream, records)?, n),
+        RecordsInput::Load { records, .. } => Staged::Load(upload_pieces(stream, records)?, n),
+        RecordsInput::Store { records, .. } => Staged::Store(upload_pieces(stream, records)?, n),
+        RecordsInput::Shift { records, .. } => Staged::Shift(upload_pieces(stream, records)?, n),
+        RecordsInput::Memw { records, .. } => Staged::Memw(upload_pieces(stream, records)?, n),
+    })
+}
+
+/// A staged table's kernel into `dst` (`rows × cols` words), on `stream`:
+/// the second half of [`fill_col_major_into`], its checks into `checks`.
+pub(crate) fn launch_staged(
+    stream: &Arc<CudaStream>,
+    staged: &Staged<'_>,
+    rows: usize,
+    dst: &mut CudaViewMut<u64>,
+    checks: &mut FillChecks,
+) -> Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
+    let m = module()?;
+    match staged {
+        Staged::KeccakRnd { ops, nops, skip } => {
+            #[cfg(feature = "test-faults")]
+            let skip = &(*skip + fault_records_skip());
+            launch_keccak_rnd(stream, &m.keccak_rnd_in, ops, *nops, *skip, rows, dst)
+        }
+        Staged::Cpu { logs, n, decode } => {
+            let (n, height) = (*n as u64, rows as u64);
+            let missing = checks.missing(stream)?;
+            let config = LaunchConfig {
+                grid_dim: (row_grid(rows, CPU_BLOCK)?, 1, 1),
+                block_dim: (CPU_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                let mut launch = stream.launch_builder(&m.cpu);
+                match logs {
+                    CpuLogsOnCard::Owned(slice) => launch.arg(slice),
+                    CpuLogsOnCard::Cached(at) => launch.arg(at),
+                };
+                launch
+                    .arg(&n)
+                    .arg(&decode.entries)
+                    .arg(&decode.runs)
+                    .arg(&decode.nruns)
+                    .arg(&height)
+                    .arg(&mut *dst)
+                    .arg(missing)
+                    .launch(config)?;
+            }
+            #[cfg(feature = "test-faults")]
+            if let Some(pair) = fault_cpu_swap() {
+                swap_columns(stream, dst, rows, pair)?;
+            }
+            Ok(())
+        }
+        Staged::MemwR(records, n) => launch_rows(stream, &m.memw_r, records, *n, rows, dst),
+        Staged::MemwA(records, n) => launch_rows(stream, &m.memw_a, records, *n, rows, dst),
+        Staged::Load(records, n) => launch_rows(stream, &m.load, records, *n, rows, dst),
+        Staged::Store(records, n) => launch_rows(stream, &m.store, records, *n, rows, dst),
+        Staged::Shift(records, n) => launch_rows(stream, &m.shift, records, *n, rows, dst),
+        Staged::Memw(records, n) => launch_rows(stream, &m.memw, records, *n, rows, dst),
+        Staged::Elsewhere => Ok(()),
     }
 }
 

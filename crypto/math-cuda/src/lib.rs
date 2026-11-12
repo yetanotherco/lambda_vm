@@ -31,6 +31,7 @@ pub mod argue_fused;
 pub mod argue_probe;
 pub mod barycentric;
 pub mod blake3;
+pub mod card_rows;
 pub mod columns;
 pub mod constraint_interp;
 pub mod deep;

@@ -4458,6 +4458,40 @@ impl<'a> RecordsUp<'a> {
 
 /// A table's records as the card's fill takes them; `None` where the card
 /// fills no table of that shape.
+/// `LAMBDA_VM_CARD_ROWS` (rank 1, S1): `Some` with the block's report line
+/// while the knob is on; `None` when it is off or without the card.
+pub fn card_rows_report() -> Option<String> {
+    #[cfg(feature = "cuda")]
+    {
+        (math_cuda::card_rows::mode() != math_cuda::card_rows::Mode::Off)
+            .then(math_cuda::card_rows::report_line)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
+}
+
+/// The most the backend's ledger has promised at once in this process
+/// (`math_cuda::device::reserved_high_water`); `None` without the card.
+pub fn card_reserved_peak() -> Option<u64> {
+    #[cfg(feature = "cuda")]
+    {
+        Some(math_cuda::device::reserved_high_water())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
+}
+
+/// The card-rows cache emptied and its counters zeroed (a block's start and
+/// end). Nothing without the card.
+pub fn card_rows_clear() {
+    #[cfg(feature = "cuda")]
+    math_cuda::card_rows::clear();
+}
+
 #[cfg(feature = "cuda")]
 fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsInput<'a>> {
     use crate::records::{KeccakRndOp, RecordsFill};
@@ -4482,9 +4516,10 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
         },
         // The CPU table writes its own timestamps: the first cycle is the
         // records' (their digest and host fill), not the card's.
-        RecordsFill::Cpu { .. } => RecordsInput::Cpu {
+        RecordsFill::Cpu { first_cycle, .. } => RecordsInput::Cpu {
             logs: &up.logs,
-            decode: up.decode.as_deref()?,
+            decode: up.decode.as_ref()?,
+            first_cycle: *first_cycle,
             rows: up.rows,
         },
         RecordsFill::MemwR { .. } => RecordsInput::MemwR {

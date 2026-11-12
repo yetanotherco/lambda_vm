@@ -4046,6 +4046,9 @@ fn prove_block_whir_inner(
             pool.locked, pool.bytes, pool.seconds
         );
     }
+    // `LAMBDA_VM_CARD_ROWS` (rank 1, S1): the card keeps no logs from
+    // another prove, and the line below counts this one's uploads alone.
+    multilinear::gpu::card_rows_clear();
     let proved = prove_block_whir_body(
         elf_bytes,
         private_inputs,
@@ -4057,6 +4060,13 @@ fn prove_block_whir_inner(
         on_group,
         lead,
     );
+    if let Some(line) = multilinear::gpu::card_rows_report() {
+        eprintln!("{line}");
+    }
+    if let Some(peak) = multilinear::gpu::card_reserved_peak() {
+        eprintln!("BLOCK CARD LEDGER PEAK: {peak} B promised at most in this process");
+    }
+    multilinear::gpu::card_rows_clear();
     // The base is proved: the pool's free bytes are no longer room for its
     // allocations, and later readings (the recursion's) count them again.
     multilinear::pinned::retire_netting();

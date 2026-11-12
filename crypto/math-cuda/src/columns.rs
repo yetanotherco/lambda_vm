@@ -193,6 +193,30 @@ impl DeviceColumns {
     /// at their bytes and is filled there, into the same run. `None` as for
     /// [`Self::upload`], or when a packed table is too big for one launch.
     pub fn upload_tables(tables: &[TableUpload<'_>]) -> Option<Self> {
+        // `LAMBDA_VM_CARD_ROWS`: off (unset) is the upload below, untouched.
+        if crate::card_rows::mode() != crate::card_rows::Mode::Off {
+            return crate::card_rows::upload_tables(tables);
+        }
+        Self::upload_tables_today(tables)
+    }
+
+    /// The store of what [`crate::card_rows`]'s upload wrote.
+    pub(crate) fn from_parts(
+        stream: Arc<CudaStream>,
+        buffer: CudaSlice<u64>,
+        spans: Vec<(usize, usize)>,
+        room: DeviceReservation,
+    ) -> Self {
+        Self {
+            stream,
+            buffer: Arc::new(buffer),
+            spans,
+            _room: room,
+        }
+    }
+
+    /// [`Self::upload_tables`] as it is with `LAMBDA_VM_CARD_ROWS` off.
+    pub(crate) fn upload_tables_today(tables: &[TableUpload<'_>]) -> Option<Self> {
         let total: usize = tables.iter().map(TableUpload::cells).sum();
         if total == 0
             || tables.iter().any(|table| {

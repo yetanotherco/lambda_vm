@@ -4158,6 +4158,9 @@ mod card_records_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod card_records_card_tests;
 
+#[cfg(all(test, feature = "cuda"))]
+mod card_rows_card_tests;
+
 // The serial stage of a run walked a window per thread.
 #[cfg(feature = "parallel")]
 mod lean_pass;
