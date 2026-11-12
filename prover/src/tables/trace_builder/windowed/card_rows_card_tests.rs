@@ -36,6 +36,7 @@ impl Reset {
 impl Drop for Reset {
     fn drop(&mut self) {
         card_rows::FAULT_CYCLE_SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
+        card_rows::FAULT_FAMILIES.store(0, std::sync::atomic::Ordering::Relaxed);
         card_rows::set_mode_override(None);
         card_rows::end();
     }
@@ -156,6 +157,11 @@ fn card_rows_uploads_write_todays_words_forwards_and_backwards() {
     );
 }
 
+/// The mutant on groups that derive: each program's chunks in one group, so
+/// its own CPU tables hold every derived row's cycle. Each family alone
+/// (LOAD, then STORE) must derive a table and move a group: other words, or
+/// the group declined. (s1b's version used groups of 8 in hand-out order,
+/// where no table derived, so it could not fail.)
 #[test]
 fn a_derived_rows_cycle_read_one_late_changes_words_or_declines_the_group() {
     let _reset = Reset::new();
@@ -164,33 +170,48 @@ fn a_derived_rows_cycle_read_one_late_changes_words_or_declines_the_group() {
         store: 1 << 2,
         ..MaxRowsConfig::small()
     };
-    let (program, _) = run("all_loadstore_32");
-    let chunks = records_chunks(&program, &[], &max_rows, 7, (0, None), true);
-    let groups = grouped(&chunks, 8);
-    let order: Vec<usize> = (0..groups.len()).collect();
-    card_rows::clear();
-    let today = stores(&groups, &order, Mode::Off);
-    card_rows::clear();
-    card_rows::FAULT_CYCLE_SHIFT.store(1, std::sync::atomic::Ordering::Relaxed);
-    let faulted = stores(&groups, &order, Mode::Derive);
-    let s = card_rows::stats();
-    let moved = faulted
-        .iter()
-        .zip(&today)
-        .filter(|((_, got), (_, want))| match (got, want) {
-            (None, _) => true,
-            (Some(got), Some(want)) => mismatches(got, want).0 > 0,
-            (Some(_), None) => false,
-        })
-        .count();
-    println!(
-        "CARD ROWS MUTANT cycle read one late: {moved} of {} groups moved · derived {} · declined {}",
-        groups.len(),
-        s.derived_load + s.derived_store,
-        s.declined
-    );
-    assert!(s.derived_load + s.derived_store > 0, "nothing derived");
-    assert!(moved > 0, "the mutant moved no group");
+    for (family, bit) in [("LOAD", 1u8), ("STORE", 2u8)] {
+        let (mut derived, mut moved, mut groups) = (0u64, 0usize, 0usize);
+        for name in [
+            "all_loadstore_32",
+            "misalign_ld",
+            "misalign_sd",
+            "all_instructions_64",
+        ] {
+            let (program, _) = run(name);
+            let chunks = records_chunks(&program, &[], &max_rows, 7, (0, None), true);
+            let groups_of = grouped(&chunks, chunks.len().max(1));
+            card_rows::FAULT_CYCLE_SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
+            card_rows::clear();
+            let today = stores(&groups_of, &[0], Mode::Off);
+            card_rows::clear();
+            card_rows::FAULT_FAMILIES.store(bit, std::sync::atomic::Ordering::Relaxed);
+            card_rows::FAULT_CYCLE_SHIFT.store(1, std::sync::atomic::Ordering::Relaxed);
+            let faulted = stores(&groups_of, &[0], Mode::Derive);
+            let s = card_rows::stats();
+            derived += if bit == 1 {
+                s.derived_load
+            } else {
+                s.derived_store
+            };
+            groups += 1;
+            moved += usize::from(match (&faulted[0].1, &today[0].1) {
+                (None, _) => true,
+                (Some(got), Some(want)) => mismatches(got, want).0 > 0,
+                (Some(_), None) => false,
+            });
+        }
+        card_rows::FAULT_CYCLE_SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
+        card_rows::FAULT_FAMILIES.store(0, std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "CARD ROWS MUTANT {family} cycle read one late: {moved} of {groups} groups moved · {family} tables derived {derived}"
+        );
+        assert!(
+            derived > 0,
+            "{family}: no table derived, the mutant cannot bite"
+        );
+        assert!(moved > 0, "{family}: the mutant moved no group");
+    }
 }
 
 /// The real block (`BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`) at the production

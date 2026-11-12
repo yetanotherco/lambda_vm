@@ -23,9 +23,10 @@
 //! whose cycle is not held, or whose log is not that family's op, is counted
 //! into the upload's check, which declines the group (its readers take the
 //! host's columns, as for a CPU log with no DECODE row). The cache is
-//! emptied at a block's start and end ([`clear`]) and only ever holds a
-//! table's logs while every upload that read them has synchronized: uploads
-//! under this knob take the cache's lock for their whole length.
+//! emptied at a block's start and end ([`begin`], [`end`]) and only ever
+//! holds a table's logs while every upload that read them has synchronized:
+//! `derive`'s uploads take the cache's lock for their whole length (`order`'s
+//! take none).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -122,9 +123,15 @@ pub fn set_mode_override(mode: Option<Mode>) {
 }
 
 /// A card test's mutant: each derived row's cycle read this many cycles late
-/// (0: none). The test must see other words, or the group declined.
+/// (0: none), in the families [`FAULT_FAMILIES`] names. The test must see
+/// other words, or the group declined.
 #[doc(hidden)]
 pub static FAULT_CYCLE_SHIFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The families [`FAULT_CYCLE_SHIFT`] moves: bit 0 LOAD, bit 1 STORE (0:
+/// both).
+#[doc(hidden)]
+pub static FAULT_FAMILIES: AtomicU8 = AtomicU8::new(0);
 
 fn budget_bytes() -> u64 {
     static BYTES: OnceLock<u64> = OnceLock::new();
@@ -489,8 +496,14 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
     {
         return None;
     }
-    let mut guard = lock();
-    let cache = guard.get_or_insert_with(Cache::default);
+    // Only `derive` reads and writes the cache: `order` takes no lock, so its
+    // uploads overlap as today's do.
+    let mut local = Cache::default();
+    let mut guard = (mode == Mode::Derive).then(lock);
+    let cache = match guard.as_mut() {
+        Some(held) => held.get_or_insert_with(Cache::default),
+        None => &mut local,
+    };
     cache.tick += 1;
     let tick = cache.tick;
     let derive = mode == Mode::Derive;
@@ -579,7 +592,9 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 continue;
             };
             let shift = FAULT_CYCLE_SHIFT.load(Ordering::Relaxed);
-            if shift != 0 {
+            let families = FAULT_FAMILIES.load(Ordering::Relaxed);
+            let this = if store { 2 } else { 1 };
+            if shift != 0 && (families == 0 || families & this != 0) {
                 cycles.iter_mut().for_each(|c| *c = c.wrapping_add(shift));
             }
             if !all_one || !covers(&held, lo, hi) {
