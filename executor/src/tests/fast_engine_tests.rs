@@ -832,6 +832,33 @@ fn history_mode_refuses_past_its_clock() {
     );
 }
 
+// History mode's last cycle is `HISTORY_MAX_CYCLES` (counted from 0), so a run
+// holds `2^30 − 1` cycles: that cycle runs, its accesses' timestamps (up to two
+// past its own) fit a `u32`, and the next cycle, whose own timestamp would not,
+// is refused.
+#[test]
+fn history_mode_runs_its_last_cycle_and_refuses_the_next() {
+    use crate::vm::history::{HISTORY_MAX_CYCLES, cycle_timestamp};
+    assert_eq!(HISTORY_MAX_CYCLES + 1, (1 << 30) - 1);
+    assert!(cycle_timestamp(HISTORY_MAX_CYCLES) + 2 <= u64::from(u32::MAX));
+    assert!(cycle_timestamp(HISTORY_MAX_CYCLES + 1) > u64::from(u32::MAX));
+    let elf = looping_program();
+    let mut fast = FastExecutor::new(&elf, vec![]).unwrap();
+    fast.enable_history().unwrap();
+    fast.set_cycles(HISTORY_MAX_CYCLES);
+    let last = fast.resume_history(1).unwrap();
+    let (logs, history) = last.expect("the last cycle runs");
+    assert_eq!((logs.len(), history.extras.len()), (1, 1));
+    assert_eq!(history.first, HISTORY_MAX_CYCLES);
+    let next = fast
+        .resume_history(1)
+        .map(|w| w.map(|(logs, _)| logs.len()));
+    assert!(
+        matches!(&next, Err(ExecutorError::History(m)) if m.contains("past the")),
+        "{next:?}"
+    );
+}
+
 // The shadow's range stamps and reads are the byte-by-byte ones: ranges on
 // and across page edges, the flat regions' edges, the paged store between
 // them and the top of the space (wrapping); every page a stamp reaches is

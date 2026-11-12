@@ -9069,6 +9069,16 @@ mod producer_report_tests {
         assert!(parse_exec_history_check(Some("often")).is_err());
     }
 
+    /// Record mode, the default, holds as many cycles as the block holds CPU
+    /// rows: the history's last cycle (counted from 0) is the last row's.
+    #[test]
+    fn record_mode_holds_the_cpu_row_bound() {
+        assert_eq!(
+            executor::vm::history::HISTORY_MAX_CYCLES + 1,
+            crate::tables::cpu::MAX_CPU_ROWS
+        );
+    }
+
     /// `LAMBDA_VM_EXEC_RECYCLE_LOGS`: off unless `1`; anything else refused.
     #[test]
     fn log_recycling_is_off_unless_asked() {

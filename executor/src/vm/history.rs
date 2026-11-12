@@ -42,8 +42,10 @@ use super::{
     registers::STACK_TOP,
 };
 
-/// The most cycles a run in history mode takes: its last cycle's latest
-/// access, `4·c + 6`, must fit a `u32`.
+/// The last cycle a run in history mode may take, counted from 0: cycle `c`'s
+/// latest access, `4·c + 6`, must fit a `u32`. A run then holds at most
+/// `HISTORY_MAX_CYCLES + 1 = 2^30 − 1` cycles, the block's bound on CPU rows
+/// (the prover's `MAX_CPU_ROWS`, whose last row's accesses reach `4·N + 2`).
 pub const HISTORY_MAX_CYCLES: u64 = (1 << 30) - 2;
 
 /// The knob of history mode: `1` on, `0` off; the block prove reads it unset as
