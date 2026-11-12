@@ -6916,6 +6916,13 @@ pub(crate) struct PreCounted {
     /// list it derives from the ops left.
     pub(crate) memw_lt: CompactLt,
     pub(crate) memw_aligned_lt: CompactLt,
+    /// How many of the CPU tail's first ops had DECODE's lookups counted
+    /// where they were made (`WindowedTraceBuilder::count_where_made`), and of
+    /// the MEMW_A and SHIFT (the walk's segment) tails' first rows their
+    /// BITWISE lookups: the finish counts from there. Zero otherwise.
+    pub(crate) cpu_decoded: usize,
+    pub(crate) memw_aligned_rows: usize,
+    pub(crate) shift_rows: usize,
 }
 
 impl PreCounted {
@@ -7868,45 +7875,67 @@ fn route_ops_one_pass(
     decode: &DecodeTable,
     cpu32_ops: &[cpu32::Cpu32Operation],
 ) -> RoutedSegments {
-    let mut branch_ops = Vec::new();
-    let mut mul_filter = Vec::new();
-    let mut dvrm_filter = Vec::new();
-    let mut eq_ops = Vec::new();
-    let mut bytewise_ops = Vec::new();
-    let mut store_ops = Vec::new();
+    let mut router = CpuRouter::default();
     for op in cpu_ops {
-        let op = decode.op(op);
+        router.push(decode.op(op));
+    }
+    router.finish(cpu32_ops)
+}
+
+/// [`route_ops_one_pass`] op by op: each CPU op pushed goes to every segment
+/// whose filter it passes, in the order pushed; [`Self::finish`] then routes
+/// the CPU32 ops and what the DVRM ops imply. Pushed a window's CPU ops in
+/// order, in any batches, it gives the segments `route_ops_one_pass` gives
+/// over them.
+#[derive(Default)]
+struct CpuRouter {
+    branch_ops: Vec<BranchOperation>,
+    mul_filter: Vec<(MulOperation, bool)>,
+    dvrm_filter: Vec<(DvrmOperation, bool)>,
+    eq_ops: Vec<eq::EqOperation>,
+    bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    store_ops: Vec<store::StoreOperation>,
+}
+
+impl CpuRouter {
+    /// Routes one CPU op into the segments its filters pick.
+    #[inline]
+    fn push(&mut self, op: CpuOp<'_>) {
         let f = &op.decode.fields;
         if op.branch_cond() {
-            branch_ops.push(route_branch(op));
+            self.branch_ops.push(route_branch(op));
         }
         if !f.word_instr {
             if f.is_mul() {
-                mul_filter.push(route_mul(op));
+                self.mul_filter.push(route_mul(op));
             }
             if f.is_divrem() {
-                dvrm_filter.push(route_dvrm(op));
+                self.dvrm_filter.push(route_dvrm(op));
             }
             if f.is_eq() {
-                eq_ops.push(route_eq(op));
+                self.eq_ops.push(route_eq(op));
             }
             if f.is_and() || f.is_or() || f.is_xor() {
-                bytewise_ops.push(route_bytewise(op));
+                self.bytewise_ops.push(route_bytewise(op));
             }
         }
         if f.is_store() {
-            store_ops.push(route_store(op));
+            self.store_ops.push(route_store(op));
         }
     }
-    route_from_cpu_segments(
-        branch_ops,
-        mul_filter,
-        dvrm_filter,
-        eq_ops,
-        bytewise_ops,
-        store_ops,
-        cpu32_ops,
-    )
+
+    /// The segments, with the CPU32 ops' dispatch and the DVRM-implied ops.
+    fn finish(self, cpu32_ops: &[cpu32::Cpu32Operation]) -> RoutedSegments {
+        route_from_cpu_segments(
+            self.branch_ops,
+            self.mul_filter,
+            self.dvrm_filter,
+            self.eq_ops,
+            self.bytewise_ops,
+            self.store_ops,
+            cpu32_ops,
+        )
+    }
 }
 
 /// [`route_ops_one_pass`] appended to the run's `segments` in place (no

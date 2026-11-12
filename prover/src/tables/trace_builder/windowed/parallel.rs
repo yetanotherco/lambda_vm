@@ -47,7 +47,7 @@ use executor::vm::memory::MemorySnapshot;
 use super::super::{ABSENT, HistoryOverlay, MemoryState, NO_PAGE, RegisterState, WalkSizes};
 use super::head_log;
 use super::lean_pass::LeanPass;
-use super::{Accumulator, WalkedWindow, WindowedTraceBuilder, walk_window};
+use super::{Accumulator, WalkCounts, WalkedWindow, WindowedTraceBuilder, walk_window};
 use crate::Error;
 use crate::paged_mem::PagedMem;
 use crate::tables::decode::DecodeTable;
@@ -111,6 +111,9 @@ struct WalkSettings {
     batch: usize,
     /// [`WindowedTraceBuilder::defer_ecrec_witnesses`].
     defer_ecrec: bool,
+    /// The walkers count where they make the rows
+    /// ([`WindowedTraceBuilder::counts_where_made`]).
+    count_made: bool,
     /// The run's key for [`cell_hash`].
     key: u64,
     /// Keep each window's logs with it ([`WindowedTraceBuilder::keeps_logs`]).
@@ -168,6 +171,14 @@ struct WindowWalker {
     /// Whether `memory` holds the last window's walk (a record-mode window
     /// rechecked, or any window walked from its entries).
     seeded: bool,
+    /// What it counted of the rows it made, over its windows
+    /// ([`WalkSettings::count_made`]); `None` when it counts none.
+    counts: Option<WalkCounts>,
+}
+
+/// A walker's counts, when the walk counts where it makes the rows.
+fn settings_counts(settings: &WalkSettings) -> Option<WalkCounts> {
+    settings.count_made.then(WalkCounts::default)
 }
 
 /// The state page holding `address`.
@@ -181,7 +192,6 @@ impl WindowWalker {
         memory.cells = PagedMem::new((0, ABSENT));
         memory.lean = true;
         Self {
-            settings,
             sizes: WalkSizes::default(),
             memory,
             registers: RegisterState::new(0),
@@ -190,6 +200,8 @@ impl WindowWalker {
             seeding: 0.0,
             record: MemoryState::new(),
             seeded: false,
+            counts: settings_counts(&settings),
+            settings,
         }
     }
 
@@ -219,6 +231,7 @@ impl WindowWalker {
             s.lookups,
             s.batch,
             s.defer_ecrec,
+            self.counts.as_mut(),
             &mut self.sizes,
             &mut self.record,
             &mut self.registers,
@@ -270,6 +283,7 @@ impl WindowWalker {
             s.lookups,
             s.batch,
             s.defer_ecrec,
+            self.counts.as_mut(),
             &mut self.sizes,
             &mut self.memory,
             &mut self.registers,
@@ -597,6 +611,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
         defer_ecrec: builder.defer_ecrec,
+        count_made: builder.counts_where_made(),
         key: std::collections::hash_map::RandomState::new().hash_one(0u64),
         keep_logs: builder.keeps_logs(),
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),
@@ -604,7 +619,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
     let key = settings.key;
     let start_registers = builder.register_state.clone();
     let lean = builder.lean.memory;
-    let (end, walk_secs, held_most, state_bytes) = {
+    let (end, walk_secs, held_most, state_bytes, counts) = {
         let (mut accumulator, image) = builder.accumulator_and_image();
         let (job_tx, job_rx) = sync_channel::<Ticket>(walkers);
         let job_rx = Mutex::new(job_rx);
@@ -686,6 +701,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                             stopped = true;
                         }
                     }
+                    walker.counts
                 }));
             }
             drop(done_tx);
@@ -737,9 +753,13 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
             // On a failure the other threads see their channels close.
             drop(done_rx);
             drop(permit_rx);
+            let mut counts = Vec::with_capacity(walkers);
             for thread in threads {
-                if thread.join().is_err() {
-                    failure.get_or_insert(Error::Prover("a walker thread panicked".into()));
+                match thread.join() {
+                    Ok(mine) => counts.extend(mine),
+                    Err(_) => {
+                        failure.get_or_insert(Error::Prover("a walker thread panicked".into()));
+                    }
                 }
             }
             let end = pass
@@ -791,7 +811,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                 }
                 (None, Ok(end)) => {
                     check_boundaries(boundaries, end.boundaries)?;
-                    Ok((end, walk_secs, held_most, state_bytes))
+                    Ok((end, walk_secs, held_most, state_bytes, counts))
                 }
             }
         })?
@@ -808,6 +828,8 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         most_entries,
         boundaries: _,
     } = end;
+    // The walkers' counts, for the finish to add.
+    builder.made_counts.extend(counts);
     let state = Arc::try_unwrap(state)
         .map_err(|_| Error::Prover("the finish's state is still shared".into()))?;
     builder.install_walked(state, registers, first, windows, walk_secs);
@@ -1124,6 +1146,8 @@ fn check_thread(
 ) -> Result<Vec<(u32, u64)>, Error> {
     let mut pass = LeanPass::new(Arc::clone(&settings.decode), start_registers)?;
     let mut walker = WindowWalker::new(settings);
+    // Its re-walks are compared, not counted.
+    walker.counts = None;
     let mut walked = Vec::new();
     for w in windows {
         let registers = pass.registers();

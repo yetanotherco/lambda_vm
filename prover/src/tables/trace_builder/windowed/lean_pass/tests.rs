@@ -167,6 +167,7 @@ impl Setup {
             keep_logs: false,
             batch: self.batch,
             defer_ecrec: false,
+            counts: None,
             sizes: &mut sizes,
             memory_state: memory,
             register_state: registers,

@@ -70,16 +70,18 @@ pub(super) fn count_memw_register(
     }
 }
 
-/// A MEMW_A chunk's BITWISE lookups, and its phase-3 LT ops into `lt` (none
-/// when the MEMW-derived LT ops are streamed).
+/// A MEMW_A chunk's BITWISE lookups into `histogram` (none when its walker
+/// counted them), and its phase-3 LT ops into `lt` (none when the
+/// MEMW-derived LT ops are streamed).
 pub(super) fn count_memw_aligned(
     ops: &Segments<memw_aligned::AlignedRow>,
-    histogram: &mut bitwise::BitwiseHistogram,
+    mut histogram: Option<&mut bitwise::BitwiseHistogram>,
     mut lt: Option<&mut CompactLt>,
 ) {
     for rows in ops.slices() {
-        let lookups = collect_bitwise_from_memw_aligned(rows);
-        histogram.add_ops(&lookups);
+        if let Some(histogram) = histogram.as_deref_mut() {
+            histogram.add_ops(&collect_bitwise_from_memw_aligned(rows));
+        }
         if let Some(lt) = lt.as_deref_mut() {
             let derived = collect_lt_from_memw_aligned(rows);
             lt.extend(&derived);
@@ -122,7 +124,8 @@ pub(super) fn count_shift(
 pub(super) enum CountWork {
     Cpu(Segments<CpuOperation>),
     MemwRegister(Segments<RegRow>),
-    MemwAligned(Segments<memw_aligned::AlignedRow>),
+    /// With whether its BITWISE lookups are still to count.
+    MemwAligned(Segments<memw_aligned::AlignedRow>, bool),
     Memw(Segments<MemwOperation>),
     Lt(Segments<LtOperation>),
     Shift(Segments<ShiftOperation>),
@@ -184,10 +187,10 @@ impl Counts {
                 count_memw_register(&rows, &mut self.histogram);
                 StreamTable::MemwRegister
             }
-            CountWork::MemwAligned(ops) => {
+            CountWork::MemwAligned(ops, lookups) => {
                 count_memw_aligned(
                     &ops,
-                    &mut self.histogram,
+                    lookups.then_some(&mut self.histogram),
                     (!stream_memw_lt).then_some(&mut self.memw_aligned_lt),
                 );
                 StreamTable::MemwAligned

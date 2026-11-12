@@ -72,9 +72,9 @@ use super::super::gpack::TraceForm;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
     BlockVec, CollectedOps, CutPadding, MemoryState, MemwBuckets, PreCounted, RegisterState,
-    RoutedBlocks, StreamSkip, Traces, WalkLean, WalkOutputs, WalkSizes, bitwise, block_len,
-    build_initial_image_paged, build_traces, collect_halt_ops, collect_ops_from_cpu_into,
-    route_ops, route_ops_one_pass,
+    RoutedBlocks, RoutedSegments, StreamSkip, Traces, WalkLean, WalkOutputs, WalkSizes, bitwise,
+    block_len, build_initial_image_paged, build_traces, collect_halt_ops,
+    collect_ops_from_cpu_into, route_ops, route_ops_one_pass,
 };
 use crate::Error;
 use crate::paged_mem::PagedMem;
@@ -265,6 +265,15 @@ pub struct WindowedTraceBuilder<'a> {
     walk_batch: usize,
     /// [`Self::defer_ecrec_witnesses`].
     defer_ecrec: bool,
+    /// [`Self::count_where_made`].
+    count_made: bool,
+    /// The split walker's counts ([`Self::count_where_made`]).
+    own_counts: WalkCounts,
+    /// The counts of the walkers of a run walked from its entries or its
+    /// history, as each walker thread ended.
+    made_counts: Vec<WalkCounts>,
+    /// The rows of each table its walkers counted ([`Self::count_where_made`]).
+    walked_rows: WalkedRows,
     /// The last walked window's list lengths, to size the next window's lists
     /// ([`walk_sized`]).
     walk_sizes: WalkSizes,
@@ -528,6 +537,9 @@ impl<'a> WindowedTraceBuilder<'a> {
                 last_ecall: None,
                 memw_lt: super::CompactLt::default(),
                 memw_aligned_lt: super::CompactLt::default(),
+                cpu_decoded: 0,
+                memw_aligned_rows: 0,
+                shift_rows: 0,
             },
             stamps: WindowStamps::default(),
             stream_memw_lt: false,
@@ -540,6 +552,10 @@ impl<'a> WindowedTraceBuilder<'a> {
             cut_padding: CutPadding::from_env()?,
             walk_batch: walk_batch(),
             defer_ecrec: ecrec_deferred(),
+            count_made: counted_where_made(),
+            own_counts: WalkCounts::default(),
+            made_counts: Vec::new(),
+            walked_rows: WalkedRows::default(),
             walk_sizes: WalkSizes::default(),
             setup: SetupStamps {
                 image: image_secs,
@@ -658,6 +674,32 @@ impl<'a> WindowedTraceBuilder<'a> {
     pub fn defer_ecrec_witnesses(mut self, on: bool) -> Self {
         self.defer_ecrec = on;
         self
+    }
+
+    /// The walkers route each batch of CPU ops into the window's segments and
+    /// count what the table phase would count of the rows they make — the
+    /// CPU, LOAD, MEMW_R, MEMW_A and SHIFT rows' BITWISE lookups and the CPU
+    /// ops' DECODE lookups — while the batch is in their cache (`true`),
+    /// instead of the accumulator routing each window and the hand-out's
+    /// counting reading each chunk back (`false`). Whatever
+    /// `LAMBDA_VM_WALK_COUNT` says; the tables are the same. It takes effect
+    /// only where the accumulator would route in one pass and count the
+    /// in-walk lookups itself, under [`Self::drop_streamed_ops`], without
+    /// [`Self::stream_memw_lt`] (see [`Self::counts_where_made`]); the run's
+    /// last window, walked by the finish, is counted by the finish.
+    pub fn count_where_made(mut self, on: bool) -> Self {
+        self.count_made = on;
+        self
+    }
+
+    /// Whether the walkers count where the rows are made: asked for, and the
+    /// build is one it applies to ([`Self::count_where_made`]).
+    pub(crate) fn counts_where_made(&self) -> bool {
+        self.count_made
+            && self.kept.is_some()
+            && self.lean.lookups
+            && self.lean.route
+            && !self.stream_memw_lt
     }
 
     /// Collects the next window of the run's logs (not the last one: that is
@@ -1233,6 +1275,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             cpu_ops,
             walk,
             logs: None,
+            made: None,
         };
         super::build_stamps::mark("p0 last window");
         let Self {
@@ -1247,9 +1290,12 @@ impl<'a> WindowedTraceBuilder<'a> {
             mut windows,
             segments,
             emitted,
-            counted,
+            mut counted,
             kept,
             stream_memw_lt,
+            own_counts,
+            made_counts,
+            walked_rows,
             finish_keccak_rnd_rows,
             finish_cut_rows,
             pack_finished,
@@ -1303,6 +1349,47 @@ impl<'a> WindowedTraceBuilder<'a> {
                 (ops, decode_trace, emitted, counted)
             }
             Some(mut kept) => {
+                // The walkers' counts, added to the run's; the finish counts
+                // each tail from the first row they did not count.
+                let mut made_counts = made_counts;
+                made_counts.push(own_counts);
+                for counts in made_counts {
+                    counts.add_into(&mut counted.histogram, kept.decode.table())?;
+                }
+                let not_out = |rows: usize, chunks: usize, max: usize, table: &str| {
+                    rows.checked_sub(chunks * max).ok_or_else(|| {
+                        Error::Prover(format!(
+                            "{chunks} {table} chunks of {max} were handed out but its walkers \
+                             counted only {rows} rows"
+                        ))
+                    })
+                };
+                if walked_rows.missing > 0 {
+                    return Err(Error::Prover(format!(
+                        "{} windows came to be absorbed without their walker's counts",
+                        walked_rows.missing
+                    )));
+                }
+                let walked_counts = if walked_rows.on {
+                    Some((
+                        not_out(walked_rows.cpu, emitted.cpu, max_rows.cpu, "CPU")?,
+                        not_out(
+                            walked_rows.memw_register,
+                            emitted.memw_register,
+                            max_rows.memw_register,
+                            "MEMW_R",
+                        )?,
+                        not_out(
+                            walked_rows.memw_aligned,
+                            emitted.memw_aligned,
+                            max_rows.memw_aligned,
+                            "MEMW_A",
+                        )?,
+                        not_out(walked_rows.shift, emitted.shift, max_rows.shift, "SHIFT")?,
+                    ))
+                } else {
+                    None
+                };
                 // The last window's ops, its in-walk lookups and its MEMW
                 // ops' LT ops are all still to count, as the tails are.
                 kept.append(last);
@@ -1334,9 +1421,14 @@ impl<'a> WindowedTraceBuilder<'a> {
                     )?,
                     ..emitted
                 };
+                let (cpu_decoded, memw_register_rows, memw_aligned_rows, shift_rows) =
+                    walked_counts.unwrap_or_default();
                 let pre = PreCounted {
                     bitwise_ops: 0,
-                    memw_register_rows: 0,
+                    memw_register_rows,
+                    cpu_decoded,
+                    memw_aligned_rows,
+                    shift_rows,
                     ..counted
                 };
                 (ops, decode_trace, skip, pre)
@@ -1389,6 +1481,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// with and builds the finish's state from.
     #[cfg(feature = "parallel")]
     fn accumulator_and_image(&mut self) -> (Accumulator<'_>, &PagedMem<u8>) {
+        self.walked_rows.on = self.counts_where_made();
         (
             Accumulator {
                 lean: self.lean,
@@ -1406,6 +1499,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 card: self.card_fill_streamed.as_ref(),
                 card_stamps: &mut self.stamps.card_fill,
                 count: &mut self.count,
+                walked: &mut self.walked_rows,
             },
             &self.image,
         )
@@ -1418,6 +1512,8 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// what [`push_jobs`](Self::push_jobs) builds; afterwards
     /// [`finish`](Self::finish) takes the last window as usual.
     pub fn split(&mut self) -> (Walker<'_>, Accumulator<'_>) {
+        let made = self.counts_where_made();
+        self.walked_rows.on = made;
         (
             Walker {
                 decode: &self.decode,
@@ -1425,6 +1521,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 keep_logs: self.keeps_logs(),
                 batch: self.walk_batch,
                 defer_ecrec: self.defer_ecrec,
+                counts: made.then_some(&mut self.own_counts),
                 sizes: &mut self.walk_sizes,
                 memory_state: &mut self.memory_state,
                 register_state: &mut self.register_state,
@@ -1448,6 +1545,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 card: self.card_fill_streamed.as_ref(),
                 card_stamps: &mut self.stamps.card_fill,
                 count: &mut self.count,
+                walked: &mut self.walked_rows,
             },
         )
     }
@@ -1461,6 +1559,9 @@ pub struct WalkedWindow {
     cpu_ops: Vec<super::CpuOperation>,
     walk: WalkOutputs,
     logs: Option<Arc<Vec<Log>>>,
+    /// Its routing, made by its walker, which counted its rows
+    /// ([`WindowedTraceBuilder::count_where_made`]); `None` otherwise.
+    made: Option<WindowMade>,
 }
 
 impl WalkedWindow {
@@ -1535,6 +1636,9 @@ pub struct Walker<'b> {
     batch: usize,
     /// [`WindowedTraceBuilder::defer_ecrec_witnesses`].
     defer_ecrec: bool,
+    /// What it counts of the rows it makes
+    /// ([`WindowedTraceBuilder::count_where_made`]); `None` when it counts none.
+    counts: Option<&'b mut WalkCounts>,
     /// The last window's list lengths ([`walk_sized`]).
     sizes: &'b mut WalkSizes,
     memory_state: &'b mut MemoryState,
@@ -1553,6 +1657,7 @@ impl Walker<'_> {
             self.lookups,
             self.batch,
             self.defer_ecrec,
+            self.counts.as_deref_mut(),
             self.sizes,
             self.memory_state,
             self.register_state,
@@ -1592,6 +1697,7 @@ fn walk_window(
     lookups: bool,
     batch: usize,
     defer_ecrec: bool,
+    mut counts: Option<&mut WalkCounts>,
     sizes: &mut WalkSizes,
     memory: &mut MemoryState,
     registers: &mut RegisterState,
@@ -1616,8 +1722,14 @@ fn walk_window(
         0 => logs.len().max(1),
         n => n,
     };
+    // Counting where the rows are made: the window's routing, and its last
+    // ECALL.
+    let mut made = counts
+        .is_some()
+        .then(|| (super::CpuRouter::default(), None));
     for part in logs.chunks(batch) {
         let from = cpu_ops.len();
+        let marks = BatchMarks::of(&walk);
         super::collect_cpu_ops_into(part, decode, first + from, &mut cpu_ops)?;
         super::collect_window_ops_into(
             &cpu_ops[from..],
@@ -1628,16 +1740,139 @@ fn walk_window(
             lookups,
             defer_ecrec,
         )?;
+        if let (Some(counts), Some((router, last_ecall))) = (counts.as_deref_mut(), made.as_mut()) {
+            counts.count_batch(decode, &cpu_ops[from..], &walk, marks, router, last_ecall);
+        }
     }
     *sizes = WalkSizes::of(&walk, logs.len());
     // Lists from the page-locked pool hold their sizing's slack: back to the
     // pool, as the window is walked.
     walk.give_back_tails();
+    let made = made.map(|(router, last_ecall)| WindowMade {
+        routed: router.finish(&walk.cpu32_ops),
+        last_ecall,
+    });
     Ok(WalkedWindow {
         cpu_ops,
         walk,
         logs: None,
+        made,
     })
+}
+
+/// Where a batch's rows start in each list a walker counts
+/// ([`WalkCounts::count_batch`]).
+#[derive(Clone, Copy)]
+struct BatchMarks {
+    register_rows: usize,
+    aligned: usize,
+    load: usize,
+    shift: usize,
+}
+
+impl BatchMarks {
+    fn of(walk: &WalkOutputs) -> Self {
+        Self {
+            register_rows: walk.memw.register_rows.len(),
+            aligned: walk.memw.aligned.len(),
+            load: walk.load_ops.len(),
+            shift: walk.shift_ops.len(),
+        }
+    }
+}
+
+/// What a walker counts of the rows it makes, summed over every window it
+/// walks ([`WindowedTraceBuilder::count_where_made`]): BITWISE's lookups of
+/// its CPU, LOAD, MEMW_R, MEMW_A and SHIFT rows and DECODE's lookups of its
+/// CPU ops. Sums, so the builder adds every walker's at the end.
+#[derive(Default)]
+pub(crate) struct WalkCounts {
+    /// Allocated at the first count (80 MiB).
+    histogram: Option<bitwise::BitwiseHistogram>,
+    /// DECODE's lookups, by row.
+    decode_rows: Vec<u64>,
+}
+
+impl WalkCounts {
+    /// One batch's: `cpu_ops`, its CPU ops, each routed into `router` and its
+    /// last ECALL into `last_ecall`; and the rows `walk` gained from `marks`
+    /// on.
+    fn count_batch(
+        &mut self,
+        decode: &DecodeTable,
+        cpu_ops: &[super::CpuOperation],
+        walk: &WalkOutputs,
+        marks: BatchMarks,
+        router: &mut super::CpuRouter,
+        last_ecall: &mut Option<(u64, u64)>,
+    ) {
+        let histogram = self
+            .histogram
+            .get_or_insert_with(bitwise::BitwiseHistogram::new);
+        for raw in cpu_ops {
+            let op = decode.op(raw);
+            op.count_bitwise_into(histogram);
+            router.push(op);
+            let row = raw.decode_row as usize;
+            if row >= self.decode_rows.len() {
+                self.decode_rows.resize(row + 1, 0);
+            }
+            self.decode_rows[row] += 1;
+            if op.decode.fields.ecall {
+                *last_ecall = Some((raw.timestamp, raw.next_pc));
+            }
+        }
+        for op in &walk.load_ops[marks.load..] {
+            op.count_bitwise_into(histogram);
+        }
+        memw_register::collect_bitwise_from_memw_register(
+            &walk.memw.register_rows[marks.register_rows..],
+            histogram,
+        );
+        histogram.add_ops(&super::collect_bitwise_from_memw_aligned(
+            &walk.memw.aligned[marks.aligned..],
+        ));
+        histogram.add_ops(&shift::collect_bitwise_from_shift(
+            &walk.shift_ops[marks.shift..],
+        ));
+    }
+
+    /// Adds these counts to the run's: `histogram`, and DECODE's trace.
+    fn add_into(
+        self,
+        histogram: &mut bitwise::BitwiseHistogram,
+        decode_trace: &mut Table,
+    ) -> Result<(), Error> {
+        if let Some(mine) = self.histogram {
+            histogram.merge(&mine);
+        }
+        decode::add_row_counts(decode_trace, &self.decode_rows).map_err(|row| {
+            Error::Prover(format!(
+                "a walker counted DECODE row {row}, which DECODE's trace lacks"
+            ))
+        })
+    }
+}
+
+/// A window's routing and its last ECALL, made by its walker
+/// ([`WindowedTraceBuilder::count_where_made`]).
+pub(crate) struct WindowMade {
+    routed: RoutedSegments,
+    last_ecall: Option<(u64, u64)>,
+}
+
+/// The rows of each table the walkers counted, over the windows absorbed:
+/// where the finish's counts of each tail start.
+#[derive(Clone, Copy, Debug, Default)]
+struct WalkedRows {
+    /// The walkers count every window ([`WindowedTraceBuilder::counts_where_made`]).
+    on: bool,
+    /// Windows absorbed under `on` that came without their walker's counts.
+    missing: usize,
+    cpu: usize,
+    memw_register: usize,
+    memw_aligned: usize,
+    shift: usize,
 }
 
 /// The accumulating half of a split builder ([`WindowedTraceBuilder::split`]).
@@ -1662,6 +1897,8 @@ pub struct Accumulator<'b> {
     card_stamps: &'b mut CardFillStamps,
     /// Where the hand-out's counting runs.
     count: &'b mut CountMode,
+    /// [`WindowedTraceBuilder::walked_rows`].
+    walked: &'b mut WalkedRows,
 }
 
 impl Accumulator<'_> {
@@ -1720,11 +1957,31 @@ impl Accumulator<'_> {
             self.emitted.memw_lt_done += walk.memw.general.len();
             self.emitted.memw_aligned_lt_done += walk.memw.aligned.len();
         }
+        // Routed and counted by its walker: the routing appended; the CPU,
+        // LOAD, MEMW_R, MEMW_A and SHIFT rows noted as counted.
+        let made = window.made.take();
+        let counted_by_walker = self.walked.on;
+        if counted_by_walker && made.is_none() {
+            // Refused at the finish: its rows would go uncounted.
+            self.walked.missing += 1;
+        }
+        if let Some(made) = made.as_ref() {
+            let walk = &window.walk;
+            self.walked.cpu += window.cpu_ops.len();
+            self.walked.memw_register += walk.memw.register_rows.len();
+            self.walked.memw_aligned += walk.memw.aligned.len();
+            self.walked.shift += walk.shift_ops.len();
+            if made.last_ecall.is_some() {
+                self.counted.last_ecall = made.last_ecall;
+            }
+        }
         // The table phase's dominant BITWISE source, counted now: from the CPU
         // and LOAD ops when the walk left the lookups out (the list is then
         // empty), from the list otherwise. The one-pass routing appends to the
         // run's segments and counts the CPU ops' lookups as it goes.
-        if self.lean.route && self.lean.lookups && route_fused() {
+        if let Some(made) = made {
+            self.segments.append(made.routed);
+        } else if self.lean.route && self.lean.lookups && route_fused() {
             super::route_ops_into(
                 &window.cpu_ops,
                 self.decode,
@@ -1748,7 +2005,7 @@ impl Accumulator<'_> {
                     .for_each(|op| self.decode.op(op).count_bitwise_into(histogram));
             }
         }
-        if self.lean.lookups {
+        if self.lean.lookups && !counted_by_walker {
             let histogram = &mut self.counted.histogram;
             window
                 .walk
@@ -1771,6 +2028,7 @@ impl Accumulator<'_> {
             let jobs = tail_jobs(
                 self.max_rows,
                 self.stream_memw_lt,
+                counted_by_walker,
                 self.decode,
                 kept,
                 self.segments,
@@ -2116,6 +2374,15 @@ impl<T> Segments<T> {
 fn route_fused() -> bool {
     static FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FUSED.get_or_init(|| !std::env::var("LAMBDA_VM_ROUTE_FUSED").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// Whether the walkers route and count where they make the rows
+/// (`LAMBDA_VM_WALK_COUNT=1`) or the accumulator and the hand-out's counting
+/// do (unset or `0`), for [`WindowedTraceBuilder::count_where_made`]'s
+/// default. Read once. The tables are the same.
+fn counted_where_made() -> bool {
+    static MADE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MADE.get_or_init(|| std::env::var("LAMBDA_VM_WALK_COUNT").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Whether the walkers hand each ECREC call's witness to the pool
@@ -2530,6 +2797,7 @@ impl Kept {
             cpu_ops,
             walk,
             logs,
+            made: _,
         } = window;
         if let Some(tail) = self.logs.as_mut() {
             match logs {
@@ -2801,6 +3069,7 @@ fn memw_register_chunk_ops(
 fn tail_jobs(
     m: &crate::tables::MaxRowsConfig,
     stream_memw_lt: bool,
+    walker_counted: bool,
     decode_table: &Arc<DecodeTable>,
     kept: &mut Kept,
     segments: &mut RoutedBlocks,
@@ -2845,6 +3114,8 @@ fn tail_jobs(
         let taken = t.elapsed().as_secs_f64();
         let t = Instant::now();
         match counter {
+            // Its walker counted its DECODE lookups and ECALLs.
+            _ if walker_counted => {}
             Some(counter) => counter.send(CountWork::Cpu(ops.clone())),
             None => {
                 decode::count_rows(
@@ -2880,6 +3151,7 @@ fn tail_jobs(
         let taken = t.elapsed().as_secs_f64();
         let t = Instant::now();
         match counter {
+            _ if walker_counted => {}
             Some(counter) => counter.send(CountWork::MemwRegister(rows.clone())),
             None => handout_count::count_memw_register(&rows, &mut counted.histogram),
         }
@@ -2907,11 +3179,13 @@ fn tail_jobs(
         m.memw_aligned,
         e.memw_aligned,
         |ops| {
+            // Its walker counted its BITWISE lookups; its LT ops are still
+            // to derive.
             match counter {
-                Some(counter) => counter.send(CountWork::MemwAligned(ops.clone())),
+                Some(counter) => counter.send(CountWork::MemwAligned(ops.clone(), !walker_counted)),
                 None => handout_count::count_memw_aligned(
                     &ops,
-                    &mut counted.histogram,
+                    (!walker_counted).then_some(&mut counted.histogram),
                     (!stream_memw_lt).then_some(&mut counted.memw_aligned_lt),
                 ),
             }
@@ -2978,6 +3252,7 @@ fn tail_jobs(
         e.shift,
         |ops| {
             match counter {
+                _ if walker_counted => {}
                 Some(counter) => counter.send(CountWork::Shift(ops.clone())),
                 None => handout_count::count_shift(&ops, &mut counted.histogram),
             }
@@ -3879,6 +4154,9 @@ mod regen_tests;
 
 #[cfg(test)]
 mod ecrec_defer_tests;
+
+#[cfg(test)]
+mod count_made_tests;
 
 #[cfg(test)]
 mod tail_tests;

@@ -170,6 +170,9 @@ pub(super) struct FinishPlan<'a> {
     header: RestHeader,
     /// [`Self::cut_line`].
     cut_line: Option<String>,
+    /// How many of the CPU ops' first ones had DECODE's lookups counted where
+    /// they were made ([`PreCounted::cpu_decoded`]): DECODE counts the rest.
+    cpu_decoded: usize,
 }
 
 /// The lists phase 4 counts the BITWISE lookups of ([`count_bitwise`]).
@@ -279,6 +282,23 @@ fn count_bitwise(
     let lt_ops = lt.segments();
     let branch_segments = branch_ops.segments();
     let bytewise_segments = bytewise_ops.segments();
+    // The MEMW_A and SHIFT rows their walkers counted where they made them
+    // ([`PreCounted::memw_aligned_rows`], [`PreCounted::shift_rows`]): the rest.
+    let (aligned_counted, shift_counted) = pre
+        .as_ref()
+        .map_or((0, 0), |pre| (pre.memw_aligned_rows, pre.shift_rows));
+    let memw_aligned_ops = &memw_aligned_ops[aligned_counted.min(memw_aligned_ops.len())..];
+    let shift_parts: Vec<&[ShiftOperation]> = {
+        let mut skip = shift_counted;
+        shift_ops
+            .parts()
+            .filter_map(|part| {
+                let from = skip.min(part.len());
+                skip -= from;
+                (from < part.len()).then(|| &part[from..])
+            })
+            .collect()
+    };
     // The per-source bitwise collectors are all pure functions of their inputs, and the
     // BITWISE multiplicities are order-independent (they ride a permutation-invariant bus),
     // so every source can be collected in parallel and the per-worker histograms summed in
@@ -378,7 +398,11 @@ fn count_bitwise(
         }
         starts.push(("SHIFT", collectors.len()));
         let shift_slice = p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk);
-        for slice in shift_ops.parts().flat_map(|part| part.chunks(shift_slice)) {
+        for slice in shift_parts
+            .iter()
+            .copied()
+            .flat_map(|part| part.chunks(shift_slice))
+        {
             collectors.push(Box::new(move |h| {
                 h.add_ops(&shift::collect_bitwise_from_shift(slice))
             }));
@@ -493,7 +517,7 @@ fn count_bitwise(
                 }
             }),
             Box::new(|h| {
-                for part in shift_ops.parts() {
+                for part in &shift_parts {
                     h.add_ops(&shift::collect_bitwise_from_shift(part))
                 }
             }),
@@ -1115,6 +1139,7 @@ impl<'a> FinishPlan<'a> {
             };
 
         let streamed_last_ecall = pre.as_ref().and_then(|pre| pre.last_ecall);
+        let cpu_decoded = pre.as_ref().map_or(0, |pre| pre.cpu_decoded);
         // IS_WH's rows from the `IS_WH` sends of every `IS_WHH` caller (today only
         // KECCAK's state pointers), deduplicated once and shared by its BITWISE
         // lookups and its table, so the two read the same rows by construction.
@@ -1393,6 +1418,7 @@ impl<'a> FinishPlan<'a> {
                 bitwise_from_tables: false,
             },
             cut_line,
+            cpu_decoded,
         })
     }
 
@@ -1471,6 +1497,7 @@ impl<'a> FinishPlan<'a> {
             register_final_state,
             header,
             cut_line: _,
+            cpu_decoded,
         } = self;
         let bitwise_histogram = match bitwise {
             BitwiseCount::Counted(histogram) => histogram,
@@ -1691,7 +1718,9 @@ impl<'a> FinishPlan<'a> {
         // independently.
         let gen_decode = move || {
             let mut decode = decode_trace;
-            let rows = cpu_ops_ref.iter().map(|op| op.decode_row as usize);
+            let rows = cpu_ops_ref[cpu_decoded.min(cpu_ops_ref.len())..]
+                .iter()
+                .map(|op| op.decode_row as usize);
             let padding = std::iter::repeat_n(decode_table.padding_row(), num_padding_rows);
             decode::count_rows(&mut decode, rows.chain(padding));
             packed_if(pack, decode)
@@ -2296,6 +2325,7 @@ impl<'a> FinishPlan<'a> {
             register_final_state,
             header,
             cut_line: _,
+            cpu_decoded,
         } = self;
         let pack = skip.pack;
         let gpack = pack && skip.gpack;
@@ -2414,7 +2444,9 @@ impl<'a> FinishPlan<'a> {
                 rows: decode_trace.num_rows(),
                 job: Box::new(move || {
                     let mut decode = decode_trace;
-                    let rows = cpu_ops.iter().map(|op| op.decode_row as usize);
+                    let rows = cpu_ops[cpu_decoded.min(cpu_ops.len())..]
+                        .iter()
+                        .map(|op| op.decode_row as usize);
                     let padding = std::iter::repeat_n(decode_table.padding_row(), num_padding_rows);
                     decode::count_rows(&mut decode, rows.chain(padding));
                     Ok(packed_if(pack, decode))

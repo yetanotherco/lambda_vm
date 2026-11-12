@@ -303,7 +303,7 @@ fn walked_from_history(
     tamper: Tamper,
 ) -> Result<Traces, Error> {
     walked_from_history_with(
-        program, input, max_rows, window, walkers, recheck, tamper, false,
+        program, input, max_rows, window, walkers, recheck, tamper, false, false,
     )
 }
 
@@ -319,10 +319,12 @@ fn walked_from_history_with(
     recheck: usize,
     tamper: Tamper,
     defer_ecrec: bool,
+    count_made: bool,
 ) -> Result<Traces, Error> {
     let mut builder = WindowedTraceBuilder::new(program, input, max_rows)?
         .drop_streamed_ops()?
-        .defer_ecrec_witnesses(defer_ecrec);
+        .defer_ecrec_witnesses(defer_ecrec)
+        .count_where_made(count_made);
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
     let mut chunks = Vec::new();
     let tampered = std::sync::atomic::AtomicBool::new(false);
@@ -444,11 +446,48 @@ fn windows_walked_from_history_deferring_ecrec_build_the_whole_run_tables() {
                     recheck,
                     Tamper::None,
                     true,
+                    false,
                 )
                 .unwrap_or_else(|e| {
                     panic!("{name}, window {window}, {walkers} walkers, recheck {recheck}: {e:?}")
                 });
                 same_traces(&reference, &traces);
+            }
+        }
+    }
+}
+
+/// ★ Walked from the executor's history with the walkers routing and counting
+/// where they make the rows, on 1 and 3 threads, rechecked or not, at the
+/// small chunks and at chunks of four rows, the windows build the whole-run
+/// tables (the check's re-walk counts nothing).
+#[test]
+fn windows_walked_from_history_counting_where_made_build_the_whole_run_tables() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
+        for name in PROGRAMS {
+            let (program, logs) = run(name);
+            let reference = whole(&program, &logs, &max_rows);
+            for window in [1, 7, 33, 4096] {
+                for (walkers, recheck) in [(1, 0), (3, 1)] {
+                    let traces = walked_from_history_with(
+                        &program,
+                        &[],
+                        &max_rows,
+                        window,
+                        walkers,
+                        recheck,
+                        Tamper::None,
+                        false,
+                        true,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{name}, window {window}, {walkers} walkers, recheck {recheck}: {e:?}"
+                        )
+                    });
+                    same_traces(&reference, &traces);
+                }
             }
         }
     }

@@ -84,6 +84,24 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         mut ecrec_ops,
     } = ops;
     super::resolve_deferred_ecrec(&mut ecdas_ops, &mut ecrec_ops)?;
+    // The CPU, MEMW_A and SHIFT rows counted where they were made
+    // ([`PreCounted::cpu_decoded`], `memw_aligned_rows`, `shift_rows`): the
+    // counts below read the rest.
+    let (cpu_decoded, aligned_counted, shift_counted) = pre.as_ref().map_or((0, 0, 0), |pre| {
+        (pre.cpu_decoded, pre.memw_aligned_rows, pre.shift_rows)
+    });
+    let aligned_uncounted = &memw_aligned_ops[aligned_counted.min(memw_aligned_ops.len())..];
+    let shift_uncounted: Vec<&[ShiftOperation]> = {
+        let mut skip = shift_counted;
+        shift_ops
+            .parts()
+            .filter_map(|part| {
+                let from = skip.min(part.len());
+                skip -= from;
+                (from < part.len()).then(|| &part[from..])
+            })
+            .collect()
+    };
 
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
@@ -263,7 +281,11 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             }));
         }
         let shift_slice = p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk);
-        for slice in shift_ops.parts().flat_map(|part| part.chunks(shift_slice)) {
+        for slice in shift_uncounted
+            .iter()
+            .copied()
+            .flat_map(|part| part.chunks(shift_slice))
+        {
             collectors.push(Box::new(move |h| {
                 h.add_ops(&shift::collect_bitwise_from_shift(slice))
             }));
@@ -295,7 +317,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             }));
         }
         for slice in
-            memw_aligned_ops.chunks(p4_slice_len(P4Source::MemwAligned, mul_chunk, dvrm_chunk))
+            aligned_uncounted.chunks(p4_slice_len(P4Source::MemwAligned, mul_chunk, dvrm_chunk))
         {
             collectors.push(Box::new(move |h| {
                 h.add_ops(&collect_bitwise_from_memw_aligned(slice))
@@ -354,7 +376,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
                 }
             }),
             Box::new(|h| {
-                for part in shift_ops.parts() {
+                for part in &shift_uncounted {
                     h.add_ops(&shift::collect_bitwise_from_shift(part))
                 }
             }),
@@ -377,7 +399,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
                     h.add_ops(&op.collect_bitwise_ops());
                 }
             }),
-            Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(aligned_uncounted))),
             Box::new(|h| {
                 for part in keccak_ops.parts() {
                     h.add_ops(&collect_bitwise_from_keccak(part))
@@ -748,7 +770,9 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     // independently.
     let gen_decode = move || {
         let mut decode = decode_trace;
-        let rows = cpu_ops_ref.iter().map(|op| op.decode_row as usize);
+        let rows = cpu_ops_ref[cpu_decoded.min(cpu_ops_ref.len())..]
+            .iter()
+            .map(|op| op.decode_row as usize);
         let padding = std::iter::repeat_n(decode_table.padding_row(), num_padding_rows);
         decode::count_rows(&mut decode, rows.chain(padding));
         packed_if(pack, decode)
