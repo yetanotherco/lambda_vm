@@ -8102,6 +8102,20 @@ fn route_ops_into(
     histogram: &mut bitwise::BitwiseHistogram,
 ) {
     let dvrm_before = segments.dvrm_filter.len();
+    route_cpu_ops_into(cpu_ops, decode, segments, histogram);
+    route_window_tail_into(cpu32_ops, segments, dvrm_before);
+}
+
+/// [`route_ops_into`]'s pass over the CPU ops alone, appending to the run's
+/// segments: called on a window's CPU ops in order, in any batches, then
+/// [`route_window_tail_into`] once, it routes as `route_ops_into` routes the
+/// window.
+fn route_cpu_ops_into(
+    cpu_ops: &[CpuOperation],
+    decode: &DecodeTable,
+    segments: &mut RoutedBlocks,
+    histogram: &mut bitwise::BitwiseHistogram,
+) {
     for op in cpu_ops {
         let op = decode.op(op);
         op.count_bitwise_into(histogram);
@@ -8131,6 +8145,16 @@ fn route_ops_into(
             segments.store_ops.push(route_store(op));
         }
     }
+}
+
+/// The rest of [`route_ops_into`] once a window's CPU ops are routed: its
+/// CPU32 ops' dispatch and what its DVRM ops imply (`dvrm_before`: the DVRM
+/// segment's length before the window).
+fn route_window_tail_into(
+    cpu32_ops: &[cpu32::Cpu32Operation],
+    segments: &mut RoutedBlocks,
+    dvrm_before: usize,
+) {
     // As `route_from_cpu_segments`, over this window's part of each list.
     let (mut shift_cpu32, mut mul_cpu32, mut dvrm_cpu32) = (Vec::new(), Vec::new(), Vec::new());
     for c in cpu32_ops {

@@ -82,6 +82,7 @@ fn walked_from_entries_with(
         batch: builder.walk_batch,
         defer_ecrec: builder.defer_ecrec,
         count_made: builder.counts_where_made(),
+        listless: builder.cpu_listless(),
         key: 0x5eed_1234_abcd_0042,
         keep_logs: builder.keeps_logs(),
         digests: None,

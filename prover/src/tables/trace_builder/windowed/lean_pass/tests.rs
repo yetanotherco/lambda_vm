@@ -171,6 +171,7 @@ impl Setup {
             batch: self.batch,
             defer_ecrec: self.defer_ecrec,
             counts: None,
+            listless: false,
             sizes: &mut sizes,
             memory_state: memory,
             register_state: registers,

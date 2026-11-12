@@ -114,6 +114,9 @@ struct WalkSettings {
     /// The walkers count where they make the rows
     /// ([`WindowedTraceBuilder::counts_where_made`]).
     count_made: bool,
+    /// A walker that keeps the window's logs keeps no CPU list
+    /// ([`WindowedTraceBuilder::cpu_listless`]).
+    listless: bool,
     /// The run's key for [`cell_hash`].
     key: u64,
     /// Keep each window's logs with it ([`WindowedTraceBuilder::keeps_logs`]).
@@ -232,6 +235,7 @@ impl WindowWalker {
             s.batch,
             s.defer_ecrec,
             self.counts.as_mut(),
+            !(s.keep_logs && s.listless),
             &mut self.sizes,
             &mut self.record,
             &mut self.registers,
@@ -284,6 +288,7 @@ impl WindowWalker {
             s.batch,
             s.defer_ecrec,
             self.counts.as_mut(),
+            !(s.keep_logs && s.listless),
             &mut self.sizes,
             &mut self.memory,
             &mut self.registers,
@@ -612,6 +617,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         batch: builder.walk_batch,
         defer_ecrec: builder.defer_ecrec,
         count_made: builder.counts_where_made(),
+        listless: builder.cpu_listless(),
         key: std::collections::hash_map::RandomState::new().hash_one(0u64),
         keep_logs: builder.keeps_logs(),
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),

@@ -267,6 +267,8 @@ pub struct WindowedTraceBuilder<'a> {
     defer_ecrec: bool,
     /// [`Self::count_where_made`].
     count_made: bool,
+    /// [`Self::drop_cpu_list`].
+    cpu_listless: bool,
     /// The split walker's counts ([`Self::count_where_made`]).
     own_counts: WalkCounts,
     /// The counts of the walkers of a run walked from its entries or its
@@ -553,6 +555,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             walk_batch: walk_batch(),
             defer_ecrec: ecrec_deferred(),
             count_made: counted_where_made(),
+            cpu_listless: cpu_list_dropped(),
             own_counts: WalkCounts::default(),
             made_counts: Vec::new(),
             walked_rows: WalkedRows::default(),
@@ -691,6 +694,35 @@ impl<'a> WindowedTraceBuilder<'a> {
     pub fn count_where_made(mut self, on: bool) -> Self {
         self.count_made = on;
         self
+    }
+
+    /// The walkers keep no list of a window's CPU ops (`true`): each batch's
+    /// ops live in one buffer the walker reuses, and the accumulator routes
+    /// the window from its logs, rebuilt a batch at a time; a CPU chunk is
+    /// handed out as its logs, its ops rebuilt from them only where the host
+    /// fills it (the card declined the room), and the finish rebuilds its
+    /// tail's. Or they keep the list (`false`). Whatever
+    /// `LAMBDA_VM_WALK_NO_CPU_LIST` says (`1` drops it; off by default); the
+    /// tables are the same. It takes effect only where the card fills CPU from
+    /// the logs ([`Self::card_fill_streamed`] with `cpu`), the walkers count
+    /// where they make the rows ([`Self::counts_where_made`]) and the
+    /// accumulator routes in one pass (see [`Self::cpu_listless`]); a window
+    /// whose walker kept its list anyway is routed from it.
+    pub fn drop_cpu_list(mut self, on: bool) -> Self {
+        self.cpu_listless = on;
+        self
+    }
+
+    /// Whether the walkers keep no CPU list: asked for, and the build is one
+    /// it applies to ([`Self::drop_cpu_list`]).
+    pub(crate) fn cpu_listless(&self) -> bool {
+        self.cpu_listless
+            && self.counts_where_made()
+            && self
+                .card_fill_streamed
+                .as_ref()
+                .is_some_and(|card| card.cpu.is_some())
+            && route_fused()
     }
 
     /// Whether the walkers count where the rows are made: asked for, and the
@@ -1271,6 +1303,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         self.join_handout_count()?;
         // The last window may halt: it is walked here, not by the `Walker`.
         let decode = &self.decode;
+        let first = self.cycles;
         let cpu_ops = super::collect_cpu_ops_from(logs, decode, self.cycles)?;
         self.cycles += logs.len();
         let mut walk = WalkOutputs::with_capacity(cpu_ops.len());
@@ -1292,7 +1325,9 @@ impl<'a> WindowedTraceBuilder<'a> {
         self.segments
             .append(route(&cpu_ops, &self.decode, &walk.cpu32_ops));
         let last = WalkedWindow {
+            cycles: cpu_ops.len(),
             cpu_ops,
+            first,
             walk,
             logs: None,
             made: None,
@@ -1426,6 +1461,22 @@ impl<'a> WindowedTraceBuilder<'a> {
                 };
                 // The last window's ops, its in-walk lookups and its MEMW
                 // ops' LT ops are all still to count, as the tails are.
+                // Without the CPU list, the tail's ops rebuilt from its logs.
+                if kept.listless {
+                    if let Some(e) = kept.listless_broken.take() {
+                        return Err(Error::Prover(format!("the run without its CPU list: {e}")));
+                    }
+                    let logs = kept.logs.take().map_or_else(
+                        || Segments { parts: Vec::new() },
+                        |mut tail| {
+                            let n = tail.len;
+                            tail.take_segments(n)
+                        },
+                    );
+                    let ops = ops_of_logs(&logs, emitted.cpu * max_rows.cpu, &decode)?;
+                    kept.cpu.push(ops);
+                    kept.listless = false;
+                }
                 kept.append(last);
                 let (cpu_ops, walk, rest, decode_trace) = kept.into_run();
                 super::build_stamps::mark("p0 concatenate");
@@ -1516,6 +1567,10 @@ impl<'a> WindowedTraceBuilder<'a> {
     #[cfg(feature = "parallel")]
     fn accumulator_and_image(&mut self) -> (Accumulator<'_>, &PagedMem<u8>) {
         self.walked_rows.on = self.counts_where_made();
+        let listless = self.cpu_listless();
+        if let Some(kept) = self.kept.as_mut() {
+            kept.listless = listless;
+        }
         (
             Accumulator {
                 lean: self.lean,
@@ -1548,6 +1603,10 @@ impl<'a> WindowedTraceBuilder<'a> {
     pub fn split(&mut self) -> (Walker<'_>, Accumulator<'_>) {
         let made = self.counts_where_made();
         self.walked_rows.on = made;
+        let listless = self.cpu_listless();
+        if let Some(kept) = self.kept.as_mut() {
+            kept.listless = listless;
+        }
         (
             Walker {
                 decode: &self.decode,
@@ -1556,6 +1615,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 batch: self.walk_batch,
                 defer_ecrec: self.defer_ecrec,
                 counts: made.then_some(&mut self.own_counts),
+                listless,
                 sizes: &mut self.walk_sizes,
                 memory_state: &mut self.memory_state,
                 register_state: &mut self.register_state,
@@ -1590,7 +1650,11 @@ impl<'a> WindowedTraceBuilder<'a> {
 /// ([`WindowedTraceBuilder::card_fill_streamed`]), the executor's logs it was
 /// walked from.
 pub struct WalkedWindow {
+    /// Empty when its walker kept no list ([`WindowedTraceBuilder::drop_cpu_list`]).
     cpu_ops: Vec<super::CpuOperation>,
+    /// Its first cycle and its cycles.
+    first: usize,
+    cycles: usize,
     walk: WalkOutputs,
     logs: Option<Arc<Vec<Log>>>,
     /// Its routing, made by its walker, which counted its rows
@@ -1654,7 +1718,7 @@ impl WalkedWindow {
 
     /// Its cycles.
     pub fn cycles(&self) -> usize {
-        self.cpu_ops.len()
+        self.cycles
     }
 }
 
@@ -1673,6 +1737,9 @@ pub struct Walker<'b> {
     /// What it counts of the rows it makes
     /// ([`WindowedTraceBuilder::count_where_made`]); `None` when it counts none.
     counts: Option<&'b mut WalkCounts>,
+    /// [`WindowedTraceBuilder::cpu_listless`]: a window whose logs it keeps
+    /// ([`Self::walk_owned`]) keeps no CPU list.
+    listless: bool,
     /// The last window's list lengths ([`walk_sized`]).
     sizes: &'b mut WalkSizes,
     memory_state: &'b mut MemoryState,
@@ -1685,6 +1752,11 @@ pub struct Walker<'b> {
 impl Walker<'_> {
     /// Walks the next window (not the run's last) into fresh lists.
     pub fn walk(&mut self, logs: &[Log]) -> Result<WalkedWindow, Error> {
+        self.walk_listing(logs, true)
+    }
+
+    /// [`Self::walk`], keeping the window's CPU list (`list`) or not.
+    fn walk_listing(&mut self, logs: &[Log], list: bool) -> Result<WalkedWindow, Error> {
         let t = std::time::Instant::now();
         let walked = walk_window(
             self.decode,
@@ -1692,6 +1764,7 @@ impl Walker<'_> {
             self.batch,
             self.defer_ecrec,
             self.counts.as_deref_mut(),
+            list,
             self.sizes,
             self.memory_state,
             self.register_state,
@@ -1709,7 +1782,7 @@ impl Walker<'_> {
     /// any other lets them go here. The logs come owned or shared.
     pub fn walk_owned(&mut self, logs: impl Into<Arc<Vec<Log>>>) -> Result<WalkedWindow, Error> {
         let logs = logs.into();
-        let mut walked = self.walk(&logs)?;
+        let mut walked = self.walk_listing(&logs, !(self.keep_logs && self.listless))?;
         if self.keep_logs {
             walked.keep_logs(logs);
         }
@@ -1732,6 +1805,7 @@ fn walk_window(
     batch: usize,
     defer_ecrec: bool,
     mut counts: Option<&mut WalkCounts>,
+    list: bool,
     sizes: &mut WalkSizes,
     memory: &mut MemoryState,
     registers: &mut RegisterState,
@@ -1742,7 +1816,11 @@ fn walk_window(
     if logs.iter().any(|log| log.next_pc == 0) {
         return Err(Error::HaltInNonFinalEpoch);
     }
-    let mut cpu_ops = Vec::with_capacity(logs.len());
+    let mut cpu_ops = Vec::with_capacity(if list {
+        logs.len()
+    } else {
+        batch_len(batch, logs.len())
+    });
     // Without `lookups`, the accumulator counts them (`absorb`).
     let mut walk = if walk_sized() {
         WalkOutputs::for_walk_sized(logs.len(), lookups, sizes)
@@ -1758,12 +1836,18 @@ fn walk_window(
     };
     // Counting where the rows are made: the window's last ECALL.
     let mut made = counts.is_some().then_some(None);
+    // Without the list, each batch's ops in one buffer, reused.
+    let mut from = 0usize;
     for part in logs.chunks(batch) {
-        let from = cpu_ops.len();
+        let start = if list { cpu_ops.len() } else { 0 };
+        if !list {
+            cpu_ops.clear();
+        }
         let marks = BatchMarks::of(&walk);
         super::collect_cpu_ops_into(part, decode, first + from, &mut cpu_ops)?;
+        from += part.len();
         super::collect_window_ops_into(
-            &cpu_ops[from..],
+            &cpu_ops[start..],
             decode,
             memory,
             registers,
@@ -1772,7 +1856,7 @@ fn walk_window(
             defer_ecrec,
         )?;
         if let (Some(counts), Some(last_ecall)) = (counts.as_deref_mut(), made.as_mut()) {
-            counts.count_batch(decode, &cpu_ops[from..], &walk, marks, last_ecall);
+            counts.count_batch(decode, &cpu_ops[start..], &walk, marks, last_ecall);
         }
     }
     *sizes = WalkSizes::of(&walk, logs.len());
@@ -1780,12 +1864,25 @@ fn walk_window(
     // pool, as the window is walked.
     walk.give_back_tails();
     let made = made.map(|last_ecall| WindowMade { last_ecall });
+    if !list {
+        cpu_ops = Vec::new();
+    }
     Ok(WalkedWindow {
         cpu_ops,
+        first,
+        cycles: logs.len(),
         walk,
         logs: None,
         made,
     })
+}
+
+/// The cycles of a walk's batch (`batch`, `0`: the whole window of `cycles`).
+fn batch_len(batch: usize, cycles: usize) -> usize {
+    match batch {
+        0 => cycles.max(1),
+        n => n.min(cycles.max(1)),
+    }
 }
 
 /// Where a batch's rows start in each list a walker counts
@@ -1942,7 +2039,7 @@ impl Accumulator<'_> {
     pub fn absorb_counted(&mut self, window: WalkedWindow) -> (Vec<ChunkJob>, [usize; 8]) {
         let walk = &window.walk;
         let mut added = [
-            window.cpu_ops.len(),
+            window.cycles,
             walk.memw.register_rows.len(),
             walk.memw.aligned.len(),
             walk.memw.general.len(),
@@ -1990,7 +2087,7 @@ impl Accumulator<'_> {
         }
         if let Some(made) = made.as_ref() {
             let walk = &window.walk;
-            self.walked.cpu += window.cpu_ops.len();
+            self.walked.cpu += window.cycles;
             self.walked.memw_register += walk.memw.register_rows.len();
             self.walked.memw_aligned += walk.memw.aligned.len();
             self.walked.shift += walk.shift_ops.len();
@@ -2002,7 +2099,26 @@ impl Accumulator<'_> {
         // and LOAD ops when the walk left the lookups out (the list is then
         // empty), from the list otherwise. The one-pass routing appends to the
         // run's segments and counts the CPU ops' lookups as it goes.
-        if self.lean.route && self.lean.lookups && route_fused() {
+        if window.cpu_ops.len() != window.cycles {
+            // Its walker kept no CPU list: routed from its logs, a batch at a
+            // time ([`WindowedTraceBuilder::drop_cpu_list`]).
+            let routed = match window.logs.as_deref() {
+                Some(logs) => route_from_logs(
+                    logs,
+                    window.first,
+                    self.decode,
+                    &window.walk.cpu32_ops,
+                    self.segments,
+                    &mut self.counted.histogram,
+                ),
+                None => Err(Error::Prover(
+                    "a window without its CPU list came without its logs".to_string(),
+                )),
+            };
+            if let (Err(e), Some(kept)) = (routed, self.kept.as_deref_mut()) {
+                kept.listless_broken.get_or_insert(format!("{e}"));
+            }
+        } else if self.lean.route && self.lean.lookups && route_fused() {
             super::route_ops_into(
                 &window.cpu_ops,
                 self.decode,
@@ -2397,6 +2513,15 @@ fn route_fused() -> bool {
     *FUSED.get_or_init(|| !std::env::var("LAMBDA_VM_ROUTE_FUSED").is_ok_and(|v| v.trim() == "0"))
 }
 
+/// Whether the walkers keep no CPU list (`LAMBDA_VM_WALK_NO_CPU_LIST=1`) or
+/// keep it (unset or anything else): [`WindowedTraceBuilder::drop_cpu_list`]'s
+/// default. Read once. The tables are the same.
+fn cpu_list_dropped() -> bool {
+    static DROPPED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DROPPED
+        .get_or_init(|| std::env::var("LAMBDA_VM_WALK_NO_CPU_LIST").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Whether the walkers count where they make the rows (unset, or anything but
 /// `0`: the default) or leave it to the hand-out's counting
 /// (`LAMBDA_VM_WALK_COUNT=0`): [`WindowedTraceBuilder::count_where_made`]'s
@@ -2613,6 +2738,13 @@ struct Kept {
     rest: KeptRest,
     /// DECODE with the lookups of the CPU ops handed out counted.
     decode: DecodeTrace,
+    /// [`WindowedTraceBuilder::cpu_listless`]: `cpu` holds nothing, the CPU
+    /// chunks are cut from `logs` (every window's), and the finish rebuilds
+    /// the tail's ops from them.
+    listless: bool,
+    /// Under `listless`, what went wrong: a window without its logs, or logs
+    /// that did not decode again. Refused at the finish.
+    listless_broken: Option<String>,
 }
 
 /// The walk lists a run keeps whole to its end, each appended window by
@@ -2733,6 +2865,8 @@ impl Kept {
             shift: Tail::new(),
             rest: KeptRest::new(max_rows),
             decode,
+            listless: false,
+            listless_broken: None,
         }
     }
 
@@ -2816,11 +2950,22 @@ impl Kept {
     fn append(&mut self, window: WalkedWindow) {
         let WalkedWindow {
             cpu_ops,
+            first: _,
+            cycles,
             walk,
             logs,
             made: _,
         } = window;
-        if let Some(tail) = self.logs.as_mut() {
+        if self.listless {
+            // Its logs stand for its CPU ops (any list its walker kept goes).
+            match (self.logs.as_mut(), logs) {
+                (Some(tail), Some(logs)) if logs.len() == cycles => tail.push_shared(logs),
+                _ => {
+                    self.listless_broken
+                        .get_or_insert_with(|| "a window came without its logs".to_string());
+                }
+            }
+        } else if let Some(tail) = self.logs.as_mut() {
             match logs {
                 Some(logs) if logs.len() == cpu_ops.len() => tail.push_shared(logs),
                 _ => self.logs = None,
@@ -2842,7 +2987,9 @@ impl Kept {
             hint_ops,
             ecrec_ops,
         } = walk;
-        self.cpu.push(cpu_ops);
+        if !self.listless {
+            self.cpu.push(cpu_ops);
+        }
         self.register_rows.push(memw.register_rows);
         self.aligned.push(memw.aligned);
         self.general.push(memw.general);
@@ -2877,6 +3024,8 @@ impl Kept {
             shift,
             rest,
             decode,
+            listless: _,
+            listless_broken: _,
         } = self;
         let mut walk = WalkOutputs::with_capacity(0);
         walk.memw = MemwBuckets {
@@ -2939,6 +3088,83 @@ fn logs_in_step(
 /// (`logs`, its cycles' logs, in step with the ops) while the host has room,
 /// its ops otherwise. A chunk held as records carries its spent ops for the
 /// thread that lays it out to let go of.
+/// The CPU ops of `logs`, the cycles from `first_cycle` on, as the walk makes
+/// them ([`super::collect_cpu_ops_into`]).
+fn ops_of_logs(
+    logs: &Segments<Log>,
+    first_cycle: usize,
+    decode: &DecodeTable,
+) -> Result<Vec<super::CpuOperation>, Error> {
+    let mut out = Vec::with_capacity(logs.len());
+    for part in logs.slices() {
+        let at = first_cycle + out.len();
+        super::collect_cpu_ops_into(part, decode, at, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// A window's routing from its logs ([`super::route_ops_into`] over the ops
+/// its walker did not keep): each batch's ops rebuilt into one buffer,
+/// routed, then the window's CPU32 and DVRM tail.
+fn route_from_logs(
+    logs: &[Log],
+    first: usize,
+    decode: &DecodeTable,
+    cpu32_ops: &[super::cpu32::Cpu32Operation],
+    segments: &mut RoutedBlocks,
+    histogram: &mut bitwise::BitwiseHistogram,
+) -> Result<(), Error> {
+    let dvrm_before = segments.dvrm_filter.len();
+    let batch = walk_batch().max(1);
+    let mut ops = Vec::with_capacity(batch.min(logs.len()));
+    let mut at = first;
+    for part in logs.chunks(batch) {
+        ops.clear();
+        super::collect_cpu_ops_into(part, decode, at, &mut ops)?;
+        at += part.len();
+        super::route_cpu_ops_into(&ops, decode, segments, histogram);
+    }
+    super::route_window_tail_into(cpu32_ops, segments, dvrm_before);
+    Ok(())
+}
+
+/// A full CPU chunk cut from its logs alone (no CPU list,
+/// [`WindowedTraceBuilder::drop_cpu_list`]): as its logs for the card while
+/// the host has room, its ops rebuilt from them for the host to fill it
+/// otherwise.
+fn cpu_chunk_from_logs(
+    logs: Segments<Log>,
+    index: usize,
+    rows: usize,
+    decode_table: &Arc<DecodeTable>,
+    card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
+) -> Result<ChunkOps, Error> {
+    let first_cycle = index * rows;
+    if let Some((card, stamps)) = card
+        && let Some(decode) = card.cpu.as_ref()
+    {
+        if card.admits(logs.op_bytes(), (StreamTable::Cpu, index), stamps) {
+            let records = CpuLogRecords::new(logs.clone(), first_cycle as u64, Arc::clone(decode));
+            #[cfg(test)]
+            let records = records.map(|r| match card.fault {
+                0 => r,
+                by => r.with_register_values_xored(by),
+            });
+            if let Some(records) = records {
+                stamps.cpu[0] += 1;
+                stamps.records_bytes += multilinear::records::TableRecords::bytes(&records);
+                return Ok(ChunkOps::CpuRecords {
+                    records,
+                    spent: Segments { parts: Vec::new() },
+                });
+            }
+        }
+        stamps.cpu[1] += 1;
+    }
+    let ops = ops_of_logs(&logs, first_cycle, decode_table)?;
+    Ok(ChunkOps::Cpu(Segments::one(ops), Arc::clone(decode_table)))
+}
+
 fn cpu_chunk_ops(
     ops: Segments<super::CpuOperation>,
     logs: Option<Segments<Log>>,
@@ -3128,6 +3354,35 @@ fn tail_jobs(
                 $done += 1;
             }
         }};
+    }
+    // Without the CPU list: each chunk is its logs.
+    while kept.listless && kept.logs.as_ref().is_some_and(|tail| tail.len >= m.cpu) {
+        let t = Instant::now();
+        let Some(logs) = kept.logs.as_mut().map(|tail| tail.take_segments(m.cpu)) else {
+            break;
+        };
+        let taken = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let ops = match cpu_chunk_from_logs(
+            logs,
+            e.cpu,
+            m.cpu,
+            decode_table,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+        ) {
+            Ok(ops) => ops,
+            Err(err) => {
+                kept.listless_broken.get_or_insert(format!("{err}"));
+                ChunkOps::Cpu(Segments { parts: Vec::new() }, Arc::clone(decode_table))
+            }
+        };
+        stamps.note(StreamTable::Cpu, taken, t.elapsed().as_secs_f64(), 0);
+        jobs.push(ChunkJob {
+            table: StreamTable::Cpu,
+            index: e.cpu,
+            ops,
+        });
+        e.cpu += 1;
     }
     while kept.cpu.len >= m.cpu {
         let t = Instant::now();
@@ -4181,6 +4436,9 @@ mod ecrec_defer_tests;
 
 #[cfg(test)]
 mod count_made_tests;
+
+#[cfg(all(test, feature = "parallel"))]
+mod cpu_listless_tests;
 
 #[cfg(test)]
 mod tail_tests;
