@@ -5226,10 +5226,15 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
 /// thread of its own verifies with the same partition, tables and statement,
 /// its bytes equal under the deterministic grind; with the CPU and MEMW_R
 /// chunks held as records or filled on the host, laid out inline and on
-/// workers. The thread ran only where asked, and counted chunks.
+/// workers. The thread ran only where asked. It counted chunks, unless the
+/// walkers count the rows where they make them (`LAMBDA_VM_WALK_COUNT`, on
+/// unless `0`): then it is handed no CPU, MEMW_R or SHIFT chunk, and only
+/// MEMW_A, MEMW and LT chunks a run hands out, which a small one may not.
 #[test]
 fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
+    use crate::tables::trace_builder::StreamTable;
     let _fills = records_fill_lock();
+    let walkers_count = !std::env::var("LAMBDA_VM_WALK_COUNT").is_ok_and(|v| v.trim() == "0");
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
         rkyv::to_bytes::<rkyv::rancor::Error>(p)
@@ -5272,6 +5277,19 @@ fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
                     assert!(verify(&proof, &elf, &format), "{what}, thread {on_thread}");
                     match (on_thread, stamps.windows.count_thread) {
                         (false, None) => {}
+                        (true, Some(c)) if walkers_count => {
+                            for table in [
+                                StreamTable::Cpu,
+                                StreamTable::MemwRegister,
+                                StreamTable::Shift,
+                            ] {
+                                assert_eq!(
+                                    c.chunks[table.position()],
+                                    0,
+                                    "{what}: the thread counted {table:?} chunks the walkers counted"
+                                );
+                            }
+                        }
                         (true, Some(c)) => assert!(
                             c.chunks.iter().sum::<usize>() > 0,
                             "{what}: the thread counted no chunk"
