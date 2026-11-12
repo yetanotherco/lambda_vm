@@ -1474,6 +1474,12 @@ impl<'a> WindowedTraceBuilder<'a> {
                         },
                     );
                     let ops = ops_of_logs(&logs, emitted.cpu * max_rows.cpu, &decode)?;
+                    eprintln!(
+                        "BLOCK CPU LIST: none kept by the walkers · {} CPU chunks cut from their \
+                         logs · the tail's {} ops rebuilt from its logs",
+                        emitted.cpu,
+                        ops.len()
+                    );
                     kept.cpu.push(ops);
                     kept.listless = false;
                 }
