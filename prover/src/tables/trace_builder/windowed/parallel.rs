@@ -114,8 +114,6 @@ struct WalkSettings {
     /// The walkers count where they make the rows
     /// ([`WindowedTraceBuilder::counts_where_made`]).
     count_made: bool,
-    /// They route too ([`WindowedTraceBuilder::route_where_made`]).
-    route_made: bool,
     /// The run's key for [`cell_hash`].
     key: u64,
     /// Keep each window's logs with it ([`WindowedTraceBuilder::keeps_logs`]).
@@ -180,9 +178,7 @@ struct WindowWalker {
 
 /// A walker's counts, when the walk counts where it makes the rows.
 fn settings_counts(settings: &WalkSettings) -> Option<WalkCounts> {
-    settings
-        .count_made
-        .then(|| WalkCounts::new(settings.route_made))
+    settings.count_made.then(WalkCounts::default)
 }
 
 /// The state page holding `address`.
@@ -616,7 +612,6 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         batch: builder.walk_batch,
         defer_ecrec: builder.defer_ecrec,
         count_made: builder.counts_where_made(),
-        route_made: builder.route_made,
         key: std::collections::hash_map::RandomState::new().hash_one(0u64),
         keep_logs: builder.keeps_logs(),
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),

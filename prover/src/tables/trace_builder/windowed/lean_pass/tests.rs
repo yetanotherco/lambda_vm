@@ -148,6 +148,9 @@ struct Setup {
     decode: Arc<DecodeTable>,
     lookups: bool,
     batch: usize,
+    /// The builder's: a window walked from its entries emits what the
+    /// builder's own walker emits, deferred ECREC calls included.
+    defer_ecrec: bool,
 }
 
 impl Setup {
@@ -166,7 +169,7 @@ impl Setup {
             lookups: self.lookups,
             keep_logs: false,
             batch: self.batch,
-            defer_ecrec: false,
+            defer_ecrec: self.defer_ecrec,
             counts: None,
             sizes: &mut sizes,
             memory_state: memory,
@@ -238,6 +241,7 @@ fn side_by_side(name: &str, elf: &Elf, window: usize, drop: bool) -> Seen {
         decode: Arc::clone(&builder.decode),
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
+        defer_ecrec: builder.defer_ecrec,
     };
     let mut pass = LeanPass::new(Arc::clone(&builder.decode), &builder.register_state)
         .expect("the pass starts");

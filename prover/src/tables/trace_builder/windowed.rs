@@ -72,9 +72,9 @@ use super::super::gpack::TraceForm;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
     BlockVec, CollectedOps, CutPadding, MemoryState, MemwBuckets, PreCounted, RegisterState,
-    RoutedBlocks, RoutedSegments, StreamSkip, Traces, WalkLean, WalkOutputs, WalkSizes, bitwise,
-    block_len, build_initial_image_paged, build_traces, collect_halt_ops,
-    collect_ops_from_cpu_into, route_ops, route_ops_one_pass,
+    RoutedBlocks, StreamSkip, Traces, WalkLean, WalkOutputs, WalkSizes, bitwise, block_len,
+    build_initial_image_paged, build_traces, collect_halt_ops, collect_ops_from_cpu_into,
+    route_ops, route_ops_one_pass,
 };
 use crate::Error;
 use crate::paged_mem::PagedMem;
@@ -267,8 +267,6 @@ pub struct WindowedTraceBuilder<'a> {
     defer_ecrec: bool,
     /// [`Self::count_where_made`].
     count_made: bool,
-    /// [`Self::route_where_made`].
-    route_made: bool,
     /// The split walker's counts ([`Self::count_where_made`]).
     own_counts: WalkCounts,
     /// The counts of the walkers of a run walked from its entries or its
@@ -554,9 +552,8 @@ impl<'a> WindowedTraceBuilder<'a> {
             cut_padding: CutPadding::from_env()?,
             walk_batch: walk_batch(),
             defer_ecrec: ecrec_deferred(),
-            count_made: counted_where_made() != WalkCountKnob::Off,
-            route_made: counted_where_made() == WalkCountKnob::RowsAndRoute,
-            own_counts: WalkCounts::new(counted_where_made() == WalkCountKnob::RowsAndRoute),
+            count_made: counted_where_made(),
+            own_counts: WalkCounts::default(),
             made_counts: Vec::new(),
             walked_rows: WalkedRows::default(),
             walk_sizes: WalkSizes::default(),
@@ -668,10 +665,11 @@ impl<'a> WindowedTraceBuilder<'a> {
     }
 
     /// The walkers hand each ECREC call's witness (its scalars, curve
-    /// relations and two chains) to the pool and walk on, writing the key they
-    /// recover themselves; the finish takes the witnesses before it builds a
-    /// table (`true`); or they compute it in the walk (`false`). Whatever
-    /// `LAMBDA_VM_ECREC_DEFER` says; the tables are the same. The run's last
+    /// relations and two chains) to a pool of its own and walk on, writing the
+    /// key they recover themselves; the finish takes the witnesses before it
+    /// builds a table (`true`, the default); or they compute it in the walk
+    /// (`false`). Whatever `LAMBDA_VM_ECREC_DEFER` says; the tables are the
+    /// same. The run's last
     /// window, walked by the finish, computes its own. Without the `parallel`
     /// feature it changes nothing.
     pub fn defer_ecrec_witnesses(mut self, on: bool) -> Self {
@@ -679,30 +677,19 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
-    /// The walkers route each batch of CPU ops into the window's segments and
-    /// count what the table phase would count of the rows they make — the
-    /// CPU, LOAD, MEMW_R, MEMW_A and SHIFT rows' BITWISE lookups and the CPU
-    /// ops' DECODE lookups — while the batch is in their cache (`true`),
-    /// instead of the accumulator routing each window and the hand-out's
-    /// counting reading each chunk back (`false`). Whatever
-    /// `LAMBDA_VM_WALK_COUNT` says; the tables are the same. It takes effect
+    /// The walkers count what the table phase would count of the rows they
+    /// make — the LOAD, MEMW_R, MEMW_A and SHIFT rows' BITWISE lookups and
+    /// the CPU ops' DECODE lookups — while the batch is in their cache
+    /// (`true`, the default), instead of the hand-out's counting reading each
+    /// chunk back (`false`); the accumulator routes the CPU ops and counts
+    /// their lookups either way. Whatever `LAMBDA_VM_WALK_COUNT` says; the
+    /// tables are the same. It takes effect
     /// only where the accumulator would route in one pass and count the
     /// in-walk lookups itself, under [`Self::drop_streamed_ops`], without
     /// [`Self::stream_memw_lt`] (see [`Self::counts_where_made`]); the run's
     /// last window, walked by the finish, is counted by the finish.
     pub fn count_where_made(mut self, on: bool) -> Self {
         self.count_made = on;
-        self
-    }
-
-    /// Under [`Self::count_where_made`], the walkers also route each batch's
-    /// CPU ops and count their BITWISE lookups (`true`), or leave both to the
-    /// accumulator, which reads the window's CPU ops for its routing anyway
-    /// (`false`). Whatever `LAMBDA_VM_WALK_COUNT` says (`1` routes, `2` does
-    /// not); the tables are the same.
-    pub fn route_where_made(mut self, on: bool) -> Self {
-        self.route_made = on;
-        self.own_counts.route = on;
         self
     }
 
@@ -1329,7 +1316,6 @@ impl<'a> WindowedTraceBuilder<'a> {
             own_counts,
             made_counts,
             walked_rows,
-            route_made,
             finish_keccak_rnd_rows,
             finish_cut_rows,
             pack_finished,
@@ -1395,16 +1381,12 @@ impl<'a> WindowedTraceBuilder<'a> {
                     }
                     eprintln!(
                         "BLOCK WALK COUNTS: the walkers counted {} CPU ops, {} MEMW_R, {} MEMW_A and \
-                         {} SHIFT rows · routed by {} · {walkers} walkers' counts added in {:.3}s",
+                         {} SHIFT rows · routed by the accumulator · {walkers} walkers' counts added in \
+                         {:.3}s",
                         walked_rows.cpu,
                         walked_rows.memw_register,
                         walked_rows.memw_aligned,
                         walked_rows.shift,
-                        if route_made {
-                            "the walkers"
-                        } else {
-                            "the accumulator"
-                        },
                         t.elapsed().as_secs_f64()
                     );
                 }
@@ -1774,11 +1756,8 @@ fn walk_window(
         0 => logs.len().max(1),
         n => n,
     };
-    // Counting where the rows are made: the window's routing, and its last
-    // ECALL.
-    let mut made = counts
-        .as_deref()
-        .map(|counts| (counts.route.then(super::CpuRouter::default), None));
+    // Counting where the rows are made: the window's last ECALL.
+    let mut made = counts.is_some().then_some(None);
     for part in logs.chunks(batch) {
         let from = cpu_ops.len();
         let marks = BatchMarks::of(&walk);
@@ -1792,25 +1771,15 @@ fn walk_window(
             lookups,
             defer_ecrec,
         )?;
-        if let (Some(counts), Some((router, last_ecall))) = (counts.as_deref_mut(), made.as_mut()) {
-            counts.count_batch(
-                decode,
-                &cpu_ops[from..],
-                &walk,
-                marks,
-                router.as_mut(),
-                last_ecall,
-            );
+        if let (Some(counts), Some(last_ecall)) = (counts.as_deref_mut(), made.as_mut()) {
+            counts.count_batch(decode, &cpu_ops[from..], &walk, marks, last_ecall);
         }
     }
     *sizes = WalkSizes::of(&walk, logs.len());
     // Lists from the page-locked pool hold their sizing's slack: back to the
     // pool, as the window is walked.
     walk.give_back_tails();
-    let made = made.map(|(router, last_ecall)| WindowMade {
-        routed: router.map(|router| router.finish(&walk.cpu32_ops)),
-        last_ecall,
-    });
+    let made = made.map(|last_ecall| WindowMade { last_ecall });
     Ok(WalkedWindow {
         cpu_ops,
         walk,
@@ -1844,36 +1813,23 @@ impl BatchMarks {
 /// walks ([`WindowedTraceBuilder::count_where_made`]): BITWISE's lookups of
 /// its CPU, LOAD, MEMW_R, MEMW_A and SHIFT rows and DECODE's lookups of its
 /// CPU ops. Sums, so the builder adds every walker's at the end.
+#[derive(Default)]
 pub(crate) struct WalkCounts {
     /// Allocated at the first count (80 MiB).
     histogram: Option<bitwise::BitwiseHistogram>,
     /// DECODE's lookups, by row.
     decode_rows: Vec<u64>,
-    /// It routes the CPU ops and counts their BITWISE lookups too
-    /// ([`WindowedTraceBuilder::route_where_made`]).
-    pub(super) route: bool,
 }
 
 impl WalkCounts {
-    /// Nothing counted yet; routing with `route`.
-    pub(super) fn new(route: bool) -> Self {
-        Self {
-            histogram: None,
-            decode_rows: Vec::new(),
-            route,
-        }
-    }
-
-    /// One batch's: `cpu_ops`, its CPU ops, each routed into `router` with
-    /// its BITWISE lookups counted (with a router), and its last ECALL into
-    /// `last_ecall`; and the rows `walk` gained from `marks` on.
+    /// One batch's: `cpu_ops`, its CPU ops' DECODE lookups and its last ECALL
+    /// into `last_ecall`; and the rows `walk` gained from `marks` on.
     fn count_batch(
         &mut self,
         decode: &DecodeTable,
         cpu_ops: &[super::CpuOperation],
         walk: &WalkOutputs,
         marks: BatchMarks,
-        mut router: Option<&mut super::CpuRouter>,
         last_ecall: &mut Option<(u64, u64)>,
     ) {
         let histogram = self
@@ -1881,10 +1837,6 @@ impl WalkCounts {
             .get_or_insert_with(bitwise::BitwiseHistogram::new);
         for raw in cpu_ops {
             let op = decode.op(raw);
-            if let Some(router) = router.as_deref_mut() {
-                op.count_bitwise_into(histogram);
-                router.push(op);
-            }
             let row = raw.decode_row as usize;
             if row >= self.decode_rows.len() {
                 self.decode_rows.resize(row + 1, 0);
@@ -1926,11 +1878,9 @@ impl WalkCounts {
     }
 }
 
-/// A window's routing and its last ECALL, made by its walker
+/// A window's last ECALL, found by its walker, which counted its rows
 /// ([`WindowedTraceBuilder::count_where_made`]).
 pub(crate) struct WindowMade {
-    /// `None` when the accumulator routes ([`WindowedTraceBuilder::route_where_made`]).
-    routed: Option<RoutedSegments>,
     last_ecall: Option<(u64, u64)>,
 }
 
@@ -2052,9 +2002,7 @@ impl Accumulator<'_> {
         // and LOAD ops when the walk left the lookups out (the list is then
         // empty), from the list otherwise. The one-pass routing appends to the
         // run's segments and counts the CPU ops' lookups as it goes.
-        if let Some(routed) = made.and_then(|made| made.routed) {
-            self.segments.append(routed);
-        } else if self.lean.route && self.lean.lookups && route_fused() {
+        if self.lean.route && self.lean.lookups && route_fused() {
             super::route_ops_into(
                 &window.cpu_ops,
                 self.decode,
@@ -2449,42 +2397,22 @@ fn route_fused() -> bool {
     *FUSED.get_or_init(|| !std::env::var("LAMBDA_VM_ROUTE_FUSED").is_ok_and(|v| v.trim() == "0"))
 }
 
-/// Whether the walkers count where they make the rows and route
-/// (`LAMBDA_VM_WALK_COUNT=1`), count only (`2`), or leave both to the
-/// accumulator and the hand-out's counting (unset or `0`): the defaults of
-/// [`WindowedTraceBuilder::count_where_made`] and
-/// [`WindowedTraceBuilder::route_where_made`]. Read once. The tables are the
-/// same.
-fn counted_where_made() -> WalkCountKnob {
-    static MADE: std::sync::OnceLock<WalkCountKnob> = std::sync::OnceLock::new();
-    *MADE.get_or_init(|| {
-        match std::env::var("LAMBDA_VM_WALK_COUNT")
-            .as_deref()
-            .map(str::trim)
-        {
-            Ok("1") => WalkCountKnob::RowsAndRoute,
-            Ok("2") => WalkCountKnob::Rows,
-            _ => WalkCountKnob::Off,
-        }
-    })
+/// Whether the walkers count where they make the rows (unset, or anything but
+/// `0`: the default) or leave it to the hand-out's counting
+/// (`LAMBDA_VM_WALK_COUNT=0`): [`WindowedTraceBuilder::count_where_made`]'s
+/// default. Read once. The tables are the same.
+fn counted_where_made() -> bool {
+    static MADE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MADE.get_or_init(|| !std::env::var("LAMBDA_VM_WALK_COUNT").is_ok_and(|v| v.trim() == "0"))
 }
 
-/// `LAMBDA_VM_WALK_COUNT`: unset or `0` off, `1` the walkers count the rows
-/// and route, `2` they count the rows and the accumulator routes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WalkCountKnob {
-    Off,
-    Rows,
-    RowsAndRoute,
-}
-
-/// Whether the walkers hand each ECREC call's witness to the pool
-/// (`LAMBDA_VM_ECREC_DEFER=1`) or compute it in the walk (unset or `0`), for
-/// [`WindowedTraceBuilder::defer_ecrec_witnesses`]'s default. Read once. The
-/// tables are the same.
+/// Whether the walkers hand each ECREC call's witness to a pool (unset, or
+/// anything but `0`: the default) or compute it in the walk
+/// (`LAMBDA_VM_ECREC_DEFER=0`): [`WindowedTraceBuilder::defer_ecrec_witnesses`]'s
+/// default. Read once. The tables are the same.
 fn ecrec_deferred() -> bool {
     static DEFER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DEFER.get_or_init(|| std::env::var("LAMBDA_VM_ECREC_DEFER").is_ok_and(|v| v.trim() == "1"))
+    *DEFER.get_or_init(|| !std::env::var("LAMBDA_VM_ECREC_DEFER").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// Whether the walker sizes a window's streamed lists from the last window's

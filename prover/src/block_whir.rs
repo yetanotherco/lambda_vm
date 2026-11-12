@@ -1334,11 +1334,11 @@ fn lt_concat() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
 }
 
-/// `LAMBDA_VM_BLOCK_LT_MERGE`: `1` makes the rows of the LT tables the finish
-/// builds from the memory accesses' timestamp comparisons by merging equal
-/// neighbours instead of through a map ([`WindowedTraceBuilder::lt_merge`]);
-/// unset, empty or `0` keeps today's rows (the default). Any other value
-/// refuses the prove. LT's rows and BITWISE's multiplicities change, so the
+/// `LAMBDA_VM_BLOCK_LT_MERGE`: unset, empty or `1` (the default) makes the
+/// rows of the LT tables the finish builds from the memory accesses' timestamp
+/// comparisons by merging equal neighbours instead of through a map
+/// ([`WindowedTraceBuilder::lt_merge`]); `0` keeps the map's rows. Any other
+/// value refuses the prove. LT's rows and BITWISE's multiplicities change, so the
 /// proof's bytes do; what it proves does not.
 fn lt_merge() -> Result<bool, Error> {
     lt_merge_from(std::env::var("LAMBDA_VM_BLOCK_LT_MERGE").ok().as_deref())
@@ -1347,25 +1347,27 @@ fn lt_merge() -> Result<bool, Error> {
 /// [`lt_merge`]'s reading of its variable.
 fn lt_merge_from(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
-        None | Some("") | Some("0") => Ok(false),
-        Some("1") => Ok(true),
+        None | Some("") | Some("1") => Ok(true),
+        Some("0") => Ok(false),
         Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_LT_MERGE={v}: 1 (LT's memory comparisons merged with their \
-             neighbours) or 0 (today's rows)"
+            "LAMBDA_VM_BLOCK_LT_MERGE={v}: 1 or unset (LT's memory comparisons merged with \
+             their neighbours) or 0 (the map's rows)"
         ))),
     }
 }
 
 #[cfg(test)]
 mod lt_merge_knob_tests {
-    /// Unset, empty and `0` are today's rows, `1` the merge, anything else is
-    /// refused (an error, not a silent default).
+    /// Unset, empty and `1` are the merge (the default), `0` the map's rows,
+    /// anything else is refused (an error, not a silent default).
     #[test]
-    fn the_lt_merge_knob_is_off_unless_one_and_refuses_the_rest() {
-        for off in [None, Some(""), Some(" "), Some("0"), Some(" 0 ")] {
+    fn the_lt_merge_knob_is_on_unless_zero_and_refuses_the_rest() {
+        for on in [None, Some(""), Some(" "), Some("1"), Some(" 1 ")] {
+            assert!(super::lt_merge_from(on).expect("on"), "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0 ")] {
             assert!(!super::lt_merge_from(off).expect("off"), "{off:?}");
         }
-        assert!(super::lt_merge_from(Some("1")).expect("on"));
         for bad in ["2", "on", "true", "yes", "-1"] {
             assert!(super::lt_merge_from(Some(bad)).is_err(), "{bad}");
         }

@@ -52,7 +52,6 @@ fn configs() -> [(&'static str, MaxRowsConfig); 3] {
 /// dropping its streamed ops, the walkers counting where they make the rows,
 /// split (walker and accumulator) or through `push`, the hand-out's counting
 /// on a thread of its own or not; and the windows its walkers counted.
-#[allow(clippy::too_many_arguments)]
 fn made_build(
     program: &executor::elf::Elf,
     logs: &[executor::vm::logs::Log],
@@ -60,7 +59,6 @@ fn made_build(
     window: usize,
     split: bool,
     count_thread: bool,
-    route: bool,
     tamper: bool,
 ) -> (Result<Traces, crate::Error>, usize) {
     let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
@@ -68,8 +66,7 @@ fn made_build(
         .count_handout_on_thread(count_thread)
         .drop_streamed_ops()
         .expect("before the first window")
-        .count_where_made(true)
-        .route_where_made(route);
+        .count_where_made(true);
     assert!(builder.counts_where_made(), "the build counts where made");
     let body = logs.len() - 1;
     let cut = body - body % window;
@@ -101,8 +98,7 @@ fn made_build(
     (traces, counted)
 }
 
-/// ★ Counted where the rows are made, routed there or by the accumulator,
-/// through the split and through `push`, the hand-out's counting on its thread
+/// ★ Counted where the rows are made, through the split and through `push`, the hand-out's counting on its thread
 /// or not, at every window length and the three chunk sizes, the windows
 /// build the whole-run tables.
 #[test]
@@ -113,13 +109,9 @@ fn counting_where_made_builds_the_whole_run_tables() {
             let (program, logs) = run(name);
             let reference = whole(&program, &logs, &max_rows);
             for window in [1, 7, 33, 1000] {
-                for (split, count_thread, route) in [
-                    (true, true, true),
-                    (true, false, true),
-                    (false, true, true),
-                    (true, true, false),
-                    (false, false, false),
-                ] {
+                for (split, count_thread) in
+                    [(true, true), (true, false), (false, true), (false, false)]
+                {
                     let (traces, counted) = made_build(
                         &program,
                         &logs,
@@ -127,13 +119,10 @@ fn counting_where_made_builds_the_whole_run_tables() {
                         window,
                         split,
                         count_thread,
-                        route,
                         false,
                     );
                     let traces = traces.unwrap_or_else(|e| {
-                        panic!(
-                            "{what} {name}, window {window}, split {split}, route {route}: {e:?}"
-                        )
+                        panic!("{what} {name}, window {window}, split {split}: {e:?}")
                     });
                     same_traces(&reference, &traces);
                     let body = (logs.len() - 1) / window;
@@ -158,7 +147,6 @@ fn a_window_without_its_walkers_counts_is_refused() {
         7,
         true,
         false,
-        true,
         true,
     );
     assert!(counted > 0);
@@ -211,8 +199,7 @@ fn merged_build(
         .expect("before the first window")
         .lt_merge()
         .defer_ecrec_witnesses(levers)
-        .count_where_made(levers)
-        .route_where_made(false);
+        .count_where_made(levers);
     assert_eq!(builder.counts_where_made(), levers);
     let body = logs.len() - 1;
     let cut = body - body % window;
