@@ -125,6 +125,13 @@ pub fn take_prove_split() -> Option<ProveSplit> {
     LAST_PROVE_SPLIT.with(|c| c.take())
 }
 
+/// Record `split` as this thread's most recent prove: what a prover other than
+/// the STARK one (the W-LFM one, `wlfm`) reports through [`take_prove_split`].
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn record_prove_split(split: ProveSplit) {
+    LAST_PROVE_SPLIT.with(|c| c.set(Some(split)));
+}
+
 #[derive(Debug)]
 pub enum LfmProveError {
     Exec(LfmExecError),
@@ -278,6 +285,23 @@ pub(crate) fn lfm_fill_executed(
     hasher: HasherKind,
     execute_secs: f64,
 ) -> LfmFilled {
+    // The process format's merge (`LAMBDA_VM_ZF_LFM_MERGE`), filled straight
+    // into the merged tables. Only where the copy happens rides on it: the
+    // proof takes its layout from the artifacts, and a set filled under
+    // another one is laid out again before the card (`prove_traces_under`).
+    let plan = process_merge_plan(program);
+    lfm_fill_executed_under(program, execution, hasher, execute_secs, &plan)
+}
+
+/// [`lfm_fill_executed`] under the merge `plan`: the W-LFM prover's fill takes
+/// every chip unmerged (an empty plan), whatever the process format says.
+pub(crate) fn lfm_fill_executed_under(
+    program: &LfmProgram,
+    execution: LfmExecution,
+    hasher: HasherKind,
+    execute_secs: f64,
+    plan: &super::merge::MergePlan,
+) -> LfmFilled {
     let LfmExecution {
         records,
         public_words,
@@ -291,11 +315,7 @@ pub(crate) fn lfm_fill_executed(
     drop(memory);
 
     let t = Instant::now();
-    // The process format's merge (`LAMBDA_VM_ZF_LFM_MERGE`), filled straight
-    // into the merged tables. Only where the copy happens rides on it: the
-    // proof takes its layout from the artifacts, and a set filled under
-    // another one is laid out again before the card (`prove_traces_under`).
-    let traces = build_traces_with_merge(program, &records, hasher, &process_merge_plan(program));
+    let traces = build_traces_with_merge(program, &records, hasher, plan);
     let fill_secs = t.elapsed().as_secs_f64();
     // Same reason, larger: the records are what the fill consumes, and they are
     // dead the moment it returns. The traces it produced are the live set from
@@ -324,6 +344,30 @@ impl LfmFilled {
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn traces_mut(&mut self) -> &mut LfmTraces {
         &mut self.traces
+    }
+
+    /// The traces, the published words, the hasher they were filled for, and
+    /// the execute and fill seconds with the execute's split: what a prover
+    /// other than [`Self::prove`] (the W-LFM one, `wlfm`) consumes.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        LfmTraces,
+        Vec<(u32, LfmWord)>,
+        HasherKind,
+        f64,
+        f64,
+        super::executor::ExecSplit,
+    ) {
+        (
+            self.traces,
+            self.public_words,
+            self.hasher,
+            self.execute_secs,
+            self.fill_secs,
+            self.exec_split,
+        )
     }
 
     /// The card half of [`lfm_prove_with_residency`]: prove the filled traces
