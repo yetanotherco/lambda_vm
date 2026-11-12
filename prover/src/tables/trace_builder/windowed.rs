@@ -988,6 +988,25 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// `finish` makes the rows of the LT tables it builds from the comparisons
+    /// of MEMW and MEMW_A ops by merging equal neighbours instead of through a
+    /// map ([`StreamSkip::lt_merge`]). LT's tables, and so BITWISE's
+    /// multiplicities, change; each LT op's μ summed over LT's rows does not.
+    /// The streamed LT chunks (the CPU's comparisons) are as before.
+    pub fn lt_merge(mut self) -> Self {
+        self.emitted.lt_merge = true;
+        self
+    }
+
+    /// [`Self::lt_merge`] with a test's fault: the per-row lookups of LT's
+    /// tables counted from the map's rows ([`StreamSkip::lt_merge_count_fault`]).
+    #[cfg(test)]
+    pub(crate) fn lt_merge_count_fault(mut self) -> Self {
+        self.emitted.lt_merge = true;
+        self.emitted.lt_merge_count_fault = true;
+        self
+    }
+
     /// `finish` counts the deduplicating tables' per-row lookups on the whole
     /// pool ([`StreamSkip::p4_rows`]). The tables are the same.
     pub fn p4_rows_on_pool(mut self) -> Self {

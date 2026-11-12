@@ -599,6 +599,26 @@ pub fn dedup_rows_of<'a, T: std::hash::Hash + Eq + Clone + 'a>(
     rows
 }
 
+/// Rows of operations by merging equal neighbours, with no map: each op joins
+/// the row before it when that row holds the same op below [`MU_MAX`], and
+/// starts a row otherwise. An op that comes back after another starts a new
+/// row, so the rows can be more than [`dedup_rows_of`]'s, but each op's μ
+/// summed over its rows is the same: the multiset a lookup receiver puts on
+/// its bus. The rows are a function of the ops and their order alone, so the
+/// same ops in the same order give the same rows. Appended to `rows`, merging
+/// with its last row: a list handed over a slice at a time merges as one.
+pub fn merge_rows_into<'a, T: Eq + Clone + 'a>(
+    rows: &mut Vec<(T, u64)>,
+    operations: impl Iterator<Item = &'a T>,
+) {
+    for op in operations {
+        match rows.last_mut() {
+            Some((last, mu)) if *mu < MU_MAX && last == op => *mu += 1,
+            _ => rows.push((op.clone(), 1)),
+        }
+    }
+}
+
 // =========================================================================
 // ALU operation descriptors
 // =========================================================================

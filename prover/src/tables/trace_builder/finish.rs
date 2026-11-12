@@ -99,6 +99,21 @@ impl LtLists {
         ]);
         Segmented { parts }
     }
+
+    /// The parts of [`Self::segments`] that hold the comparisons phase 3
+    /// derived from MEMW and MEMW_A ops (the four after the walk's), when
+    /// `merge` ([`StreamSkip::lt_merge`]); `None` otherwise. With
+    /// [`StreamSkip::concat_lt`] those four are empty: nothing merges.
+    fn merged_parts(&self, merge: bool) -> LtMergedParts {
+        let walk = self.walk.parts().count();
+        merge.then_some(walk..walk + 4)
+    }
+
+    /// The rows of LT's table of ops `start..end` ([`lt_chunk_rows`]): what
+    /// its table is built from and its per-row lookups are counted from.
+    fn rows(&self, start: usize, end: usize, merge: bool) -> Vec<(LtOperation, u64)> {
+        lt_chunk_rows(&self.segments(), &self.merged_parts(merge), start, end)
+    }
 }
 
 /// How many tables a chunked list of `len` ops makes at `max` ops a table, the
@@ -219,6 +234,8 @@ struct P4Mode {
     from_tables: bool,
     /// Which byte checks KECCAK_RND sends ([`StreamSkip::keccak_rnd_form`]).
     keccak_rnd_form: keccak_rnd::KeccakRndForm,
+    /// LT's per-row lookups are counted from merged rows ([`lt_count_merge`]).
+    lt_merge: bool,
 }
 
 impl P4Mode {
@@ -229,8 +246,20 @@ impl P4Mode {
             direct: skip.p4_direct,
             from_tables: false,
             keccak_rnd_form: skip.keccak_rnd_form,
+            lt_merge: lt_count_merge(skip),
         }
     }
+}
+
+/// Whether LT's per-row lookups are counted from merged rows: the tables'
+/// rule ([`StreamSkip::lt_merge`]), but the map's under a test's fault
+/// ([`StreamSkip::lt_merge_count_fault`]).
+fn lt_count_merge(skip: &StreamSkip) -> bool {
+    #[cfg(test)]
+    if skip.lt_merge_count_fault {
+        return false;
+    }
+    skip.lt_merge
 }
 
 /// PAGE's BITWISE lookups, from the initial image and the memory state.
@@ -277,9 +306,11 @@ fn count_bitwise(
                 direct,
                 from_tables,
                 keccak_rnd_form,
+                lt_merge,
             },
     } = lists;
     let lt_ops = lt.segments();
+    let lt_merged = lt.merged_parts(lt_merge);
     let branch_segments = branch_ops.segments();
     let bytewise_segments = bytewise_ops.segments();
     // The MEMW_A and SHIFT rows their walkers counted where they made them
@@ -593,9 +624,11 @@ fn count_bitwise(
         .into_iter()
         .filter(|_| !rows_on_pool && !from_tables)
     {
-        let lt_ops = &lt_ops;
+        let (lt_ops, lt_merged) = (&lt_ops, &lt_merged);
         collectors.push(Box::new(move |h| {
-            h.add_ops(&lt_row_lookups(lt_ops.range(start, end).iter()))
+            h.add_ops(&lt_rows_lookups(&lt_chunk_rows(
+                lt_ops, lt_merged, start, end,
+            )))
         }));
     }
     starts.push(("BRANCH_ROWS", collectors.len()));
@@ -619,8 +652,16 @@ fn count_bitwise(
         }));
     }
     let count_rows = || {
-        (rows_on_pool && !from_tables)
-            .then(|| count_row_lookups(&lt_ops, &branch_segments, &bytewise_segments, max_rows, by))
+        (rows_on_pool && !from_tables).then(|| {
+            count_row_lookups(
+                &lt_ops,
+                &lt_merged,
+                &branch_segments,
+                &bytewise_segments,
+                max_rows,
+                by,
+            )
+        })
     };
     // Without a row count there is no `BLOCK P4 ROWS` line to say the
     // collectors' walls on: one that says why.
@@ -1615,14 +1656,20 @@ impl<'a> FinishPlan<'a> {
                 packed_by(pack, |ops| load::generate_load_trace_as(ops, form)),
             )
         };
+        // Each table from its rows ([`lt_chunk_rows`]), the rows its per-row
+        // lookups were counted from.
+        let lt_merged = lt.merged_parts(skip.lt_merge);
         let gen_lts = || {
-            chunk_and_generate_segmented(
-                &lt_ops,
+            chunk_and_generate_ranges(
+                lt_ops.len(),
                 max_rows.lt,
                 skip.lt,
                 skip.tails,
                 true,
-                packed_by(pack, |ops| lt::generate_lt_trace_as(ops, form)),
+                |start, end| {
+                    let rows = lt_chunk_rows(&lt_ops, &lt_merged, start, end);
+                    packed_if(pack, lt::lt_trace_of_rows(&rows, form))
+                },
             )
         };
         let gen_shifts = || {
@@ -2618,6 +2665,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         drop(cpu_ops);
         let lt = Arc::clone(&shared.lt);
+        LT_ROWS_BUILT.reset();
         units.extend(lt_units(
             &lt,
             max_rows.lt,
@@ -2625,6 +2673,7 @@ impl<'a> FinishPlan<'a> {
             pack,
             form,
             from_tables.clone(),
+            true,
         )?);
         if let Some(regen) = regen.as_mut() {
             regen.lt = Some(Arc::clone(&lt));
@@ -2809,8 +2858,45 @@ impl<'a> FinishPlan<'a> {
     }
 }
 
+/// LT's real rows and ops the finish's LT units built (phase B's rebuilds
+/// not counted), for the `p5 LT rows` mark: a measurement.
+struct LtRowsBuilt {
+    rows: std::sync::atomic::AtomicUsize,
+    ops: std::sync::atomic::AtomicUsize,
+}
+
+impl LtRowsBuilt {
+    fn reset(&self) {
+        self.rows.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.ops.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn add(&self, rows: usize, ops: usize) {
+        self.rows
+            .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+        self.ops
+            .fetch_add(ops, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The mark: rows, ops and rows an op.
+    fn mark(&self) -> String {
+        let rows = self.rows.load(std::sync::atomic::Ordering::Relaxed);
+        let ops = self.ops.load(std::sync::atomic::Ordering::Relaxed);
+        format!(
+            "p5 LT rows {rows} of {ops} ops ({:.4} an op),",
+            rows as f64 / ops.max(1) as f64
+        )
+    }
+}
+
+static LT_ROWS_BUILT: LtRowsBuilt = LtRowsBuilt {
+    rows: std::sync::atomic::AtomicUsize::new(0),
+    ops: std::sync::atomic::AtomicUsize::new(0),
+};
+
 /// LT's units: a streamed chunk's slot for each chunk the windows handed out,
-/// then the list's cuts of `rows` rows.
+/// then the list's cuts of `rows` rows. `count`: the finish's own (its rows
+/// noted for the `p5 LT rows` mark), not phase B's rebuild.
 fn lt_units<'a>(
     lt: &std::sync::Arc<LtLists>,
     rows: usize,
@@ -2818,6 +2904,7 @@ fn lt_units<'a>(
     pack: bool,
     form: TraceForm,
     from_tables: Option<std::sync::Arc<FromTables>>,
+    count: bool,
 ) -> Result<Vec<Unit<'a>>, Error> {
     chunked_units(
         family("LT"),
@@ -2829,11 +2916,18 @@ fn lt_units<'a>(
         |start, end| {
             let lt = std::sync::Arc::clone(lt);
             let from_tables = from_tables.clone();
+            let (merge, count_merge) = (skip.lt_merge, lt_count_merge(skip));
             Box::new(move || {
-                let rows = dedup_rows(&lt.segments().range(start, end));
+                // The table and its lookups from one list of rows (a test's
+                // fault counts another).
+                let rows = lt.rows(start, end, merge);
+                if count {
+                    LT_ROWS_BUILT.add(rows.len(), end - start);
+                }
                 if let Some(tables) = &from_tables {
                     let mut plane = bitwise::BitwisePlane::new();
-                    count_lt_table_lookups(&rows, &mut plane);
+                    let other = (count_merge != merge).then(|| lt.rows(start, end, count_merge));
+                    count_lt_table_lookups(other.as_deref().unwrap_or(&rows), &mut plane);
                     tables.add(&plane)?;
                 }
                 Ok(packed_if(pack, lt::lt_trace_of_rows(&rows, form)))
@@ -2909,7 +3003,15 @@ impl RestRegen {
                     .lt
                     .take()
                     .ok_or_else(|| Error::Prover("LT's lists were taken already".into()))?;
-                lt_units(&lt, self.lt_rows, &self.skip, self.pack, self.form, None)?
+                lt_units(
+                    &lt,
+                    self.lt_rows,
+                    &self.skip,
+                    self.pack,
+                    self.form,
+                    None,
+                    false,
+                )?
             }
         };
         Ok(units
@@ -3546,6 +3648,7 @@ fn slide_units(
                 ));
             }
         }
+        build_stamps::mark(&LT_ROWS_BUILT.mark());
         build_stamps::mark("p5 end");
         Ok(())
     })

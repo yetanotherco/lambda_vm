@@ -1334,6 +1334,44 @@ fn lt_concat() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
 }
 
+/// `LAMBDA_VM_BLOCK_LT_MERGE`: `1` makes the rows of the LT tables the finish
+/// builds from the memory accesses' timestamp comparisons by merging equal
+/// neighbours instead of through a map ([`WindowedTraceBuilder::lt_merge`]);
+/// unset, empty or `0` keeps today's rows (the default). Any other value
+/// refuses the prove. LT's rows and BITWISE's multiplicities change, so the
+/// proof's bytes do; what it proves does not.
+fn lt_merge() -> Result<bool, Error> {
+    lt_merge_from(std::env::var("LAMBDA_VM_BLOCK_LT_MERGE").ok().as_deref())
+}
+
+/// [`lt_merge`]'s reading of its variable.
+fn lt_merge_from(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_LT_MERGE={v}: 1 (LT's memory comparisons merged with their \
+             neighbours) or 0 (today's rows)"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod lt_merge_knob_tests {
+    /// Unset, empty and `0` are today's rows, `1` the merge, anything else is
+    /// refused (an error, not a silent default).
+    #[test]
+    fn the_lt_merge_knob_is_off_unless_one_and_refuses_the_rest() {
+        for off in [None, Some(""), Some(" "), Some("0"), Some(" 0 ")] {
+            assert!(!super::lt_merge_from(off).expect("off"), "{off:?}");
+        }
+        assert!(super::lt_merge_from(Some("1")).expect("on"));
+        for bad in ["2", "on", "true", "yes", "-1"] {
+            assert!(super::lt_merge_from(Some(bad)).is_err(), "{bad}");
+        }
+    }
+}
+
 /// `LAMBDA_VM_BLOCK_P4_BESIDE=1`: the streamed finish counts the BITWISE
 /// lookups in BITWISE's own table's job, so the slide starts the tables after
 /// it while it counts ([`WindowedTraceBuilder::p4_beside`]); off by default.
@@ -6188,6 +6226,9 @@ fn prove_streamed(
                 }
                 if lt_concat() {
                     builder = builder.concat_lt();
+                }
+                if lt_merge()? {
+                    builder = builder.lt_merge();
                 }
                 builder = builder.p4_rows_on_pool().p4_lookups_direct();
                 if p4_beside() {

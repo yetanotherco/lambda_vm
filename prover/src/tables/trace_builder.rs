@@ -69,7 +69,9 @@ use super::page::{self, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::store;
-use super::types::{GoldilocksExtension, GoldilocksField, dedup_rows, dedup_rows_of};
+use super::types::{
+    GoldilocksExtension, GoldilocksField, dedup_rows, dedup_rows_of, merge_rows_into,
+};
 use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
@@ -535,7 +537,7 @@ mod row_count_tests {
             }
             for by in [RowCount::Map, RowCount::Parts] {
                 let mut counted = bitwise::BitwiseHistogram::new();
-                count_row_lookups(&lt_s, &branch_s, &bytewise_s, &max_rows, by)
+                count_row_lookups(&lt_s, &None, &branch_s, &bytewise_s, &max_rows, by)
                     .bump_into(&mut counted);
                 assert!(counted == lists, "{n} ops, {rows} a chunk, {by:?}");
             }
@@ -592,7 +594,14 @@ mod row_count_tests {
             for (start, end) in list_chunks(bytewise.len(), max_rows.bytewise) {
                 lists.add_ops(&bytewise_row_lookups(&bytewise_s.range(start, end)));
             }
-            let counts = count_row_lookups(&lt_s, &branch_s, &bytewise_s, &max_rows, RowCount::Map);
+            let counts = count_row_lookups(
+                &lt_s,
+                &None,
+                &branch_s,
+                &bytewise_s,
+                &max_rows,
+                RowCount::Map,
+            );
             let mut counted = bitwise::BitwiseHistogram::new();
             counts.bump_into(&mut counted);
             assert!(counted == lists, "{n} ops, {rows} a chunk");
@@ -628,8 +637,14 @@ mod row_count_tests {
             assert!(counts.line().starts_with("BLOCK P4 ROWS: LT "));
             // By parts: the same multiplicities and distinct ops, never more
             // bytes than a whole chunk's map.
-            let parts =
-                count_row_lookups(&lt_s, &branch_s, &bytewise_s, &max_rows, RowCount::Parts);
+            let parts = count_row_lookups(
+                &lt_s,
+                &None,
+                &branch_s,
+                &bytewise_s,
+                &max_rows,
+                RowCount::Parts,
+            );
             let mut by_parts = bitwise::BitwiseHistogram::new();
             parts.bump_into(&mut by_parts);
             assert!(by_parts == lists, "{n} ops, {rows} a chunk, by parts");
@@ -686,8 +701,22 @@ mod row_count_tests {
         let max_rows = crate::tables::MaxRowsConfig::uniform(n);
         let (lt_s, branch_s, bytewise_s) =
             (one_block(&lt), one_block(&branch), one_block(&bytewise));
-        let map = count_row_lookups(&lt_s, &branch_s, &bytewise_s, &max_rows, RowCount::Map);
-        let parts = count_row_lookups(&lt_s, &branch_s, &bytewise_s, &max_rows, RowCount::Parts);
+        let map = count_row_lookups(
+            &lt_s,
+            &None,
+            &branch_s,
+            &bytewise_s,
+            &max_rows,
+            RowCount::Map,
+        );
+        let parts = count_row_lookups(
+            &lt_s,
+            &None,
+            &branch_s,
+            &bytewise_s,
+            &max_rows,
+            RowCount::Parts,
+        );
         let (mut a, mut b) = (
             bitwise::BitwiseHistogram::new(),
             bitwise::BitwiseHistogram::new(),
@@ -4364,14 +4393,64 @@ fn for_each_lt_lookup(lt_ops: &[LtOperation], mut emit: impl FnMut(BitwiseOperat
 pub(crate) fn lt_row_lookups<'a>(
     chunk: impl Iterator<Item = &'a LtOperation>,
 ) -> Vec<BitwiseOperation> {
+    lt_rows_lookups(&dedup_rows_of(chunk))
+}
+
+/// LT's per-row lookup over one table's rows `(op, μ)`: IS_BYTE[μ] | 1 once a
+/// row, and once a padding row (μ = 0), as [`lt::lt_trace_of_rows`] lays the
+/// rows out.
+pub(crate) fn lt_rows_lookups(rows: &[(LtOperation, u64)]) -> Vec<BitwiseOperation> {
     let mu_byte = |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
-    let rows = dedup_rows_of(chunk);
     let mut lookups: Vec<BitwiseOperation> = rows.iter().map(|(_, mu)| mu_byte(*mu)).collect();
     lookups.extend(std::iter::repeat_n(
         mu_byte(0),
         chunk_padding_rows(rows.len()),
     ));
     lookups
+}
+
+/// The parts of a segmented LT list ([`Segmented`]) that hold the timestamp
+/// comparisons phase 3 derives from memory accesses (MEMW's and MEMW_A's),
+/// whose rows are made by merging equal neighbours
+/// ([`StreamSkip::lt_merge`]); `None`: every op of a chunk goes through one
+/// map, as always.
+pub(crate) type LtMergedParts = Option<std::ops::Range<usize>>;
+
+/// The rows of LT ops `start..end` of `list`, one table's: the one row builder
+/// of every LT table a finish builds (and builds again in phase B) and of every
+/// count of their per-row lookup `ARE_BYTES[μ, 0]`, so the two cannot drift
+/// apart. Without merged parts, [`dedup_rows`] of the range, as always. With
+/// them, the ops of the other parts (the CPU's comparisons, which do repeat
+/// across a run, DVRM's and HINT's) go through one map, and the merged parts'
+/// ops are merged with their equal neighbours in list order
+/// ([`merge_rows_into`]), their rows after the map's. Every row's μ is in
+/// 1..=MU_MAX either way, and each op's μ summed over the chunk's rows is its
+/// count in the chunk. The rows are a function of the list and the range.
+fn lt_chunk_rows(
+    list: &Segmented<'_, LtOperation>,
+    merged: &LtMergedParts,
+    start: usize,
+    end: usize,
+) -> Vec<(LtOperation, u64)> {
+    let Some(merged) = merged else {
+        return dedup_rows(&list.range(start, end));
+    };
+    let mut mapped: Vec<LtOperation> = Vec::new();
+    let mut rows: Vec<(LtOperation, u64)> = Vec::new();
+    list.for_each_part_slice(start, end, ROW_SCAN_BLOCK, &mut |part, ops| {
+        if merged.contains(&part) {
+            if rows.capacity() == 0 {
+                // About 0.57 rows an op on a block's memory comparisons.
+                rows.reserve((end - start) * 5 / 8 + 16);
+            }
+            merge_rows_into(&mut rows, ops.iter());
+        } else {
+            mapped.extend_from_slice(ops);
+        }
+    });
+    let mut out = dedup_rows(&mapped);
+    out.append(&mut rows);
+    out
 }
 
 /// Collects bitwise lookups from MUL operations (MSB16 for sign bits).
@@ -5305,9 +5384,12 @@ enum RowChunk {
 /// ([`list_chunks`] at `max_rows`), counted on the whole pool, a chunk a task,
 /// with no list of lookups and no histogram per task: the same multiplicities
 /// as folding [`lt_row_lookups`], [`branch_row_lookups`] and
-/// [`bytewise_row_lookups`] of each chunk into the histogram.
+/// [`bytewise_row_lookups`] of each chunk into the histogram. With LT's
+/// merged parts (`lt_merged`), each LT chunk's rows are [`lt_chunk_rows`]'s,
+/// the rows its table is built from.
 fn count_row_lookups(
     lt: &Segmented<'_, LtOperation>,
+    lt_merged: &LtMergedParts,
     branch: &Segmented<'_, BranchOperation>,
     bytewise: &Segmented<'_, bytewise::BytewiseOperation>,
     max_rows: &crate::tables::MaxRowsConfig,
@@ -5344,6 +5426,23 @@ fn count_row_lookups(
         let mut counts = RowCounts::new();
         let copied = std::cell::Cell::new(false);
         let (kind, ops, size) = match *task {
+            RowChunk::Lt(start, end) if lt_merged.is_some() => {
+                let rows = lt_chunk_rows(lt, lt_merged, start, end);
+                for (_, mu) in &rows {
+                    counts.single[*mu as usize] += 1;
+                }
+                counts.single[0] += chunk_padding_rows(rows.len()) as u64;
+                let ratio = rows.len() as f64 / (end - start).max(1) as f64;
+                counts.scans[0] = RowScan {
+                    chunks: 1,
+                    ops: end - start,
+                    distinct: rows.len(),
+                    least: ratio,
+                    most: ratio,
+                    ..RowScan::default()
+                };
+                (0, end - start, std::mem::size_of::<LtOperation>())
+            }
             RowChunk::Lt(start, end) => {
                 let mut scan = RowScan::default();
                 let rows = count_rows(
@@ -6787,6 +6886,20 @@ pub struct StreamSkip {
     /// the segments, `LAMBDA_VM_BLOCK_LT_CONCAT=1` on the block). The tables
     /// are the same.
     pub concat_lt: bool,
+    /// The LT tables the table phase builds make the rows of the timestamp
+    /// comparisons phase 3 derives from MEMW and MEMW_A ops by merging equal
+    /// neighbours instead of through a map ([`lt_chunk_rows`]); the CPU's,
+    /// DVRM's and HINT's comparisons keep their map (`LAMBDA_VM_BLOCK_LT_MERGE=1`
+    /// on the block). The chunks are the same; their rows, and so LT's tables
+    /// and BITWISE's multiplicities, are not, while every op's μ summed over
+    /// LT's rows is. With [`Self::concat_lt`] the derived ops are in one list
+    /// with the others and nothing merges. `false`: today's rows.
+    pub lt_merge: bool,
+    /// A test's fault: with [`Self::lt_merge`], LT's tables are built from the
+    /// merged rows but every count of their per-row lookups reads the map's
+    /// rows, so BITWISE answers lookups no table sends.
+    #[cfg(test)]
+    pub lt_merge_count_fault: bool,
     /// Phase 4 counts the deduplicating tables' per-row lookups (LT, BRANCH,
     /// BYTEWISE) on the whole pool, a chunk a task, counts only
     /// ([`count_row_lookups`]), instead of each chunk's list of lookups among
@@ -7364,9 +7477,21 @@ impl<'a, T: Clone> Segmented<'a, T> {
         block: usize,
         f: &mut dyn FnMut(&[T]),
     ) -> bool {
+        self.for_each_part_slice(start, end, block, &mut |_, ops| f(ops))
+    }
+
+    /// [`Self::for_each_slice`], each slice handed over with the index of the
+    /// part it lies in.
+    fn for_each_part_slice(
+        &self,
+        start: usize,
+        end: usize,
+        block: usize,
+        f: &mut dyn FnMut(usize, &[T]),
+    ) -> bool {
         let (mut at, mut pieces, mut compact) = (0usize, 0usize, false);
         let mut buf: Vec<T> = Vec::new();
-        for part in &self.parts {
+        for (index, part) in self.parts.iter().enumerate() {
             let (lo, hi) = (at, at + part.len());
             at = hi;
             if lo >= end {
@@ -7378,7 +7503,7 @@ impl<'a, T: Clone> Segmented<'a, T> {
             let (a, b) = (start.max(lo) - lo, end.min(hi) - lo);
             pieces += 1;
             match part {
-                Part::Ops(ops) => f(&ops[a..b]),
+                Part::Ops(ops) => f(index, &ops[a..b]),
                 Part::Compact(c) => {
                     compact = true;
                     let mut k = a;
@@ -7386,7 +7511,7 @@ impl<'a, T: Clone> Segmented<'a, T> {
                         let e = (k + block.max(1)).min(b);
                         buf.clear();
                         c.expand_into(k, e, &mut buf);
-                        f(&buf);
+                        f(index, &buf);
                         k = e;
                     }
                 }
@@ -7629,7 +7754,21 @@ fn chunk_and_generate_segmented<T: Clone + Sync>(
     optional: bool,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
-    let len = ops.len();
+    chunk_and_generate_ranges(ops.len(), max_rows, skip, tails, optional, |start, end| {
+        generate(&ops.range(start, end))
+    })
+}
+
+/// [`chunk_and_generate_segmented`]'s chunks of a list of `len` ops, each
+/// table made by `generate` from its range `start..end` of the list.
+fn chunk_and_generate_ranges(
+    len: usize,
+    max_rows: usize,
+    skip: usize,
+    tails: bool,
+    optional: bool,
+    generate: impl Fn(usize, usize) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let max_rows = max_rows.max(1);
     let chunks: Vec<(usize, usize)> = (0..len.div_ceil(max_rows))
         .map(|k| (k * max_rows, ((k + 1) * max_rows).min(len)))
@@ -7656,13 +7795,17 @@ fn chunk_and_generate_segmented<T: Clone + Sync>(
         (skip, chunks[skip..].to_vec())
     };
     let mut tables: Vec<_> = (0..placeholders).map(|_| streamed_placeholder()).collect();
-    tables.extend(generate_chunks_with(
-        chunks,
-        |&(start, end): &(usize, usize), generate: &dyn Fn(&[T]) -> TraceTable<_, _>| {
-            generate(&ops.range(start, end))
-        },
-        generate,
-    )?);
+    #[cfg(feature = "parallel")]
+    let built: Vec<_> = chunks
+        .into_par_iter()
+        .map(|(start, end)| generate(start, end))
+        .collect();
+    #[cfg(not(feature = "parallel"))]
+    let built: Vec<_> = chunks
+        .into_iter()
+        .map(|(start, end)| generate(start, end))
+        .collect();
+    tables.extend(built);
     Ok(tables)
 }
 
