@@ -303,7 +303,7 @@ fn walked_from_history(
     tamper: Tamper,
 ) -> Result<Traces, Error> {
     walked_from_history_with(
-        program, input, max_rows, window, walkers, recheck, tamper, false, false,
+        program, input, max_rows, window, walkers, recheck, tamper, false, None,
     )
 }
 
@@ -319,12 +319,13 @@ fn walked_from_history_with(
     recheck: usize,
     tamper: Tamper,
     defer_ecrec: bool,
-    count_made: bool,
+    count_made: Option<bool>,
 ) -> Result<Traces, Error> {
     let mut builder = WindowedTraceBuilder::new(program, input, max_rows)?
         .drop_streamed_ops()?
         .defer_ecrec_witnesses(defer_ecrec)
-        .count_where_made(count_made);
+        .count_where_made(count_made.is_some())
+        .route_where_made(count_made == Some(true));
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
     let mut chunks = Vec::new();
     let tampered = std::sync::atomic::AtomicBool::new(false);
@@ -446,7 +447,7 @@ fn windows_walked_from_history_deferring_ecrec_build_the_whole_run_tables() {
                     recheck,
                     Tamper::None,
                     true,
-                    false,
+                    None,
                 )
                 .unwrap_or_else(|e| {
                     panic!("{name}, window {window}, {walkers} walkers, recheck {recheck}: {e:?}")
@@ -464,7 +465,11 @@ fn windows_walked_from_history_deferring_ecrec_build_the_whole_run_tables() {
 #[test]
 fn windows_walked_from_history_counting_where_made_build_the_whole_run_tables() {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
+    // Routed by the walkers at the small chunks, by the accumulator at four rows.
+    for (max_rows, route) in [
+        (MaxRowsConfig::small(), true),
+        (MaxRowsConfig::uniform(4), false),
+    ] {
         for name in PROGRAMS {
             let (program, logs) = run(name);
             let reference = whole(&program, &logs, &max_rows);
@@ -479,7 +484,7 @@ fn windows_walked_from_history_counting_where_made_build_the_whole_run_tables() 
                         recheck,
                         Tamper::None,
                         false,
-                        true,
+                        Some(route),
                     )
                     .unwrap_or_else(|e| {
                         panic!(

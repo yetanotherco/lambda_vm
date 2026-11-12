@@ -54,13 +54,14 @@ fn walked_from_entries(
     dropped: bool,
     tamper: Tamper,
 ) -> Result<Traces, Error> {
-    walked_from_entries_with(program, max_rows, window, dropped, tamper, false, false)
+    walked_from_entries_with(program, max_rows, window, dropped, tamper, false, None)
 }
 
 /// [`walked_from_entries`], the walkers deferring the ECREC witnesses
 /// (`defer_ecrec`, [`WindowedTraceBuilder::defer_ecrec_witnesses`]) or not, and
 /// counting where they make the rows (`count_made`,
-/// [`WindowedTraceBuilder::count_where_made`]) or not.
+/// [`WindowedTraceBuilder::count_where_made`]: `Some(route)`, routing there
+/// too or not) or not.
 fn walked_from_entries_with(
     program: &Elf,
     max_rows: &MaxRowsConfig,
@@ -68,11 +69,12 @@ fn walked_from_entries_with(
     dropped: bool,
     tamper: Tamper,
     defer_ecrec: bool,
-    count_made: bool,
+    count_made: Option<bool>,
 ) -> Result<Traces, Error> {
     let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)?
         .defer_ecrec_witnesses(defer_ecrec)
-        .count_where_made(count_made);
+        .count_where_made(count_made.is_some())
+        .route_where_made(count_made == Some(true));
     if dropped {
         builder = builder.drop_streamed_ops()?;
     }
@@ -82,6 +84,7 @@ fn walked_from_entries_with(
         batch: builder.walk_batch,
         defer_ecrec: builder.defer_ecrec,
         count_made: builder.counts_where_made(),
+        route_made: builder.route_made,
         key: 0x5eed_1234_abcd_0042,
         keep_logs: builder.keeps_logs(),
         digests: None,
@@ -249,7 +252,7 @@ fn windows_walked_from_their_entries_deferring_ecrec_build_the_whole_run_tables(
                     dropped,
                     Tamper::None,
                     true,
-                    false,
+                    None,
                 )
                 .unwrap_or_else(|e| panic!("{name}, window {window}: {e:?}"));
                 same_traces(&reference, &traces);
@@ -265,7 +268,11 @@ fn windows_walked_from_their_entries_deferring_ecrec_build_the_whole_run_tables(
 #[test]
 fn windows_walked_from_their_entries_counting_where_made_build_the_whole_run_tables() {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
-    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
+    // Routed by the walkers at the small chunks, by the accumulator at four rows.
+    for (max_rows, route) in [
+        (MaxRowsConfig::small(), true),
+        (MaxRowsConfig::uniform(4), false),
+    ] {
         for name in PROGRAMS {
             let (program, logs) = run(name);
             let reference = whole(&program, &logs, &max_rows);
@@ -278,7 +285,7 @@ fn windows_walked_from_their_entries_counting_where_made_build_the_whole_run_tab
                         dropped,
                         Tamper::None,
                         false,
-                        true,
+                        Some(route),
                     )
                     .unwrap_or_else(|e| panic!("{name}, window {window}: {e:?}"));
                     same_traces(&reference, &traces);

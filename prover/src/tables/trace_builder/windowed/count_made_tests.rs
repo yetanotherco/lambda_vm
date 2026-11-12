@@ -59,6 +59,7 @@ fn made_build(
     window: usize,
     split: bool,
     count_thread: bool,
+    route: bool,
     tamper: bool,
 ) -> (Result<Traces, crate::Error>, usize) {
     let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
@@ -66,7 +67,8 @@ fn made_build(
         .count_handout_on_thread(count_thread)
         .drop_streamed_ops()
         .expect("before the first window")
-        .count_where_made(true);
+        .count_where_made(true)
+        .route_where_made(route);
     assert!(builder.counts_where_made(), "the build counts where made");
     let body = logs.len() - 1;
     let cut = body - body % window;
@@ -98,9 +100,10 @@ fn made_build(
     (traces, counted)
 }
 
-/// ★ Routed and counted where the rows are made, through the split and through
-/// `push`, the hand-out's counting on its thread or not, at every window
-/// length and the three chunk sizes, the windows build the whole-run tables.
+/// ★ Counted where the rows are made, routed there or by the accumulator,
+/// through the split and through `push`, the hand-out's counting on its thread
+/// or not, at every window length and the three chunk sizes, the windows
+/// build the whole-run tables.
 #[test]
 fn counting_where_made_builds_the_whole_run_tables() {
     let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
@@ -109,7 +112,13 @@ fn counting_where_made_builds_the_whole_run_tables() {
             let (program, logs) = run(name);
             let reference = whole(&program, &logs, &max_rows);
             for window in [1, 7, 33, 1000] {
-                for (split, count_thread) in [(true, true), (true, false), (false, true)] {
+                for (split, count_thread, route) in [
+                    (true, true, true),
+                    (true, false, true),
+                    (false, true, true),
+                    (true, true, false),
+                    (false, false, false),
+                ] {
                     let (traces, counted) = made_build(
                         &program,
                         &logs,
@@ -117,10 +126,13 @@ fn counting_where_made_builds_the_whole_run_tables() {
                         window,
                         split,
                         count_thread,
+                        route,
                         false,
                     );
                     let traces = traces.unwrap_or_else(|e| {
-                        panic!("{what} {name}, window {window}, split {split}: {e:?}")
+                        panic!(
+                            "{what} {name}, window {window}, split {split}, route {route}: {e:?}"
+                        )
                     });
                     same_traces(&reference, &traces);
                     let body = (logs.len() - 1) / window;
@@ -145,6 +157,7 @@ fn a_window_without_its_walkers_counts_is_refused() {
         7,
         true,
         false,
+        true,
         true,
     );
     assert!(counted > 0);
