@@ -345,6 +345,12 @@ fn memw_register_is_half_lookup(ts_lo: u32, old_ts_lo: u32) -> BitwiseOperation 
 /// via the shared [`memw_register_is_half_lookup`] helper (the same lookup the
 /// MEMW_R trace fill uses), one per row. No intermediate op vector: register
 /// rows number in the tens of millions and the histogram is the only consumer.
+/// One row's IsHalfword lookup from its timestamp's and old timestamp's low
+/// words (what [`collect_bitwise_from_memw_register`] bumps a row).
+pub(crate) fn count_bitwise_lookup(ts_lo: u32, old_ts_lo: u32, hist: &mut BitwiseHistogram) {
+    hist.bump(memw_register_is_half_lookup(ts_lo, old_ts_lo));
+}
+
 pub(crate) fn collect_bitwise_from_memw_register(rows: &[RegRow], hist: &mut BitwiseHistogram) {
     for r in rows {
         hist.bump(memw_register_is_half_lookup(
