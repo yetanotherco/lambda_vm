@@ -20,7 +20,6 @@ lambda-vm-prover tests::block_whir_tests::the_shadow_regenerates_every_streamed_
 lambda-vm-prover tests::block_whir_tests::gpack_moves_no_byte  # 629 s
 lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_dropped_ops_proves_and_verifies  # 627 s
 lambda-vm-prover tests::block_whir_tests::streamed_records_chunks_drop_as_records_and_come_back  # 597 s
-lambda-vm-prover tests::block_whir_tests::a_deeper_group_queue_moves_no_byte_of_the_proof  # 532 s
 lambda-vm-prover tests::block_whir_tests::parked_records_need_live_regeneration  # 483 s
 lambda-vm-prover tests::block_whir_tests::without_live_regeneration_every_table_is_held  # not timed: two of the three proves of the 470 s test it replaced
 lambda-vm-prover tests::block_whir_tests::streamed_records_chunks_kept_are_never_dropped  # 460 s
