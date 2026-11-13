@@ -1802,6 +1802,59 @@ fn the_leaf_query_is_the_verifiers_both_ways() {
     verify(LeafQuery::Lean, &top_lean).expect("the lean tree under its own check");
 }
 
+/// ★ MEMW_A's timestamp order through the block's recursion, both ways: a
+/// block whose MEMW_A rows carry the step's limbs (the production form, on
+/// the windowed build it needs) and the same program in the LT form each
+/// prove to a top their own verifier accepts, and each verifier refuses the
+/// other's tree: the leaves interpret the block's AIRs from the verifier's
+/// format, so the programs the top is checked against are the form's.
+#[test]
+#[ignore = "proves two small blocks and their trees; box tier"]
+fn the_memw_a_form_is_the_trees_both_ways() {
+    use crate::tables::memw_aligned::MemwAlignedOrder;
+    let _permit = super::device_permit::serial_for_test();
+    // At blowup 4 ([`at_blowup_4`]), as the other small trees.
+    let lt = at_blowup_4(small_format());
+    assert_eq!(lt.memw_aligned, MemwAlignedOrder::Lt);
+    let limbs = lt.with_memw_aligned(MemwAlignedOrder::Limbs);
+    let (elf, by_lt) = small_block("test_commit_4", &lt);
+    let (_, by_limbs) = small_block_cut("test_commit_4", &limbs, |o| o.window_log2 = Some(3));
+    let opts = ProofOptions::default_test_options();
+    let wrap = aggregation_wrap_options();
+    let (top_lt, _) =
+        compose(&plan_of(&elf, &by_lt, &lt, None), &by_lt, "LT").expect("the LT tree proves");
+    let (top_limbs, _) = compose(&plan_of(&elf, &by_limbs, &limbs, None), &by_limbs, "LIMBS")
+        .expect("the limbs' tree proves");
+    let verify = |format: &BlockFormat, proof: &BlockWhirProof, top: &LfmProof| {
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            format,
+            proof.statement(),
+            None,
+            BLOCK_FAN_IN,
+            &wrap,
+            top,
+        )
+    };
+    verify(&lt, &by_lt, &top_lt).expect("the LT tree under its own form");
+    verify(&limbs, &by_limbs, &top_limbs).expect("the limbs' tree under its own form");
+    assert!(
+        verify(&limbs, &by_lt, &top_lt).is_err(),
+        "the LT tree under the limbs' form"
+    );
+    assert!(
+        verify(&lt, &by_limbs, &top_limbs).is_err(),
+        "the limbs' tree under the LT form"
+    );
+    println!(
+        "MEMW_A TREE BOTH WAYS: LT {} groups, limbs {} groups · each accepted under its form, \
+         refused under the other",
+        by_lt.groups.len(),
+        by_limbs.groups.len()
+    );
+}
+
 // ============================== the real block ============================
 
 /// A node builder that stops leaves an error in every slot it had not

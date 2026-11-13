@@ -839,3 +839,153 @@ fn a_limbs_row_lays_out_counts_and_asks_lt_as_its_form_says() {
         assert_eq!(limbs.lt_pair(), None);
     }
 }
+
+// =============================================================================
+// The range bus the limbs rest on
+// =============================================================================
+
+/// Every `IS_HALF` sender of the production block's tables, as
+/// `(table, multiplicity)`: the block AIR set under the pinned format, one
+/// table of each family.
+fn half_word_senders() -> Vec<(String, String)> {
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let counts = crate::TableCounts {
+        cpu: 1,
+        lt: 1,
+        memw: 1,
+        memw_aligned: 1,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 1,
+        memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        copy: 1,
+        blake3: 1,
+        is_wh: 1,
+        ecrec: 1,
+    };
+    let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &[],
+        0,
+        1 << 20,
+    )
+    .expect("pages");
+    let inputs =
+        crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("the AIR inputs");
+    let format = crate::block_whir::BlockFormat::pinned();
+    let airs = crate::block_airs(
+        &program,
+        &opts,
+        &pages,
+        &counts,
+        &inputs,
+        format.keccak_rnd,
+        format.memw_aligned,
+    );
+    let mut senders: Vec<(String, String)> = airs
+        .air_refs()
+        .iter()
+        .flat_map(|air| {
+            let family = air.name().split('[').next().unwrap_or("").to_string();
+            air.bus_interactions()
+                .iter()
+                .filter(|i| i.bus_id == BusId::IsHalfword as u64 && i.is_sender)
+                .map(|i| (family.clone(), format!("{:?}", i.multiplicity)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    senders.sort();
+    senders.dedup();
+    senders
+}
+
+/// ★ The range bus the limbs rest on takes no negative weight: every `IS_HALF`
+/// sender of the production block's tables, by table and multiplicity, is
+/// the review's census (a constant 1, a column or a sum constrained to a bit,
+/// or a multiplicity bounded by a lookup of weight 1). A new sender, or a
+/// sender's weight changed, fails here, to be classified before it lands: the
+/// limbs' 16-bit bound is only as good as this bus's.
+#[test]
+fn every_half_word_sender_weighs_one_a_bit_or_a_bounded_count() {
+    let senders = half_word_senders();
+    for (table, m) in &senders {
+        println!("IS_HALF SENDER {table}: {m}");
+    }
+    let mu_sum = format!("{:?}", Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE));
+    assert!(
+        senders.contains(&("MEMW_A".to_string(), mu_sum)),
+        "MEMW_A's limbs at μ_read + μ_write"
+    );
+    let pinned: Vec<(String, String)> = PINNED_HALF_WORD_SENDERS
+        .iter()
+        .map(|(t, m, _)| (t.to_string(), m.to_string()))
+        .collect();
+    assert_eq!(senders, pinned, "the IS_HALF senders moved: classify them");
+}
+
+/// [`every_half_word_sender_weighs_one_a_bit_or_a_bounded_count`]'s census:
+/// `(table, multiplicity, why it is never negative)`, read in each table's
+/// constraints and interactions.
+const PINNED_HALF_WORD_SENDERS: &[(&str, &str, &str)] = &[
+    ("BLAKE3", "Column(3218)", "a bit column"),
+    ("BLAKE3", "Column(3219)", "a bit column"),
+    ("BLAKE3", "Column(3220)", "a bit column"),
+    ("BLAKE3", "Column(3221)", "a bit column"),
+    ("BLAKE3", "Column(3222)", "a bit column"),
+    (
+        "BRANCH",
+        "Column(13)",
+        "μ, a byte by ARE_BYTES[μ, 0] at weight 1",
+    ),
+    ("COPY", "Column(36)", "a bit column"),
+    ("COPY", "Column(38)", "a bit column"),
+    ("CPU", "One", "the constant 1"),
+    ("CPU32", "Column(37)", "a bit column"),
+    (
+        "DVRM",
+        "Sum(32, 33)",
+        "μ_q + μ_r, each a byte by ARE_BYTES at weight 1",
+    ),
+    ("ECDAS", "Column(520)", "a bit column"),
+    ("ECREC", "Column(10)", "a bit column"),
+    ("ECSM", "Column(666)", "a bit column"),
+    ("EQ", "Column(11)", "a bit column"),
+    ("IS_WH", "Column(3)", "μ, 20 bits by IS_B20 at weight 1"),
+    ("KECCAK", "Column(486)", "a bit column"),
+    ("KECCAK", "Column(487)", "a bit column"),
+    ("KECCAK", "Column(489)", "a bit column"),
+    (
+        "LT",
+        "Column(16)",
+        "μ, a byte by ARE_BYTES[μ, 0] at weight 1",
+    ),
+    (
+        "MEMW_A",
+        "Sum(27, 28)",
+        "μ_read + μ_write, a bit (IS_BIT on the sum)",
+    ),
+    (
+        "MEMW_R",
+        "Sum(8, 9)",
+        "μ_read + μ_write, a bit (IS_BIT on the sum)",
+    ),
+    (
+        "MUL",
+        "Sum(24, 25)",
+        "μ_lo + μ_hi, each a byte by ARE_BYTES at weight 1",
+    ),
+    ("SHIFT", "Column(25)", "a bit column"),
+];
