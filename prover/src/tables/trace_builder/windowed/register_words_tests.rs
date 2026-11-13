@@ -424,3 +424,84 @@ fn a_words_chunks_rows_are_in_cycle_order() {
     }
     assert!(out_of_order.is_empty(), "{out_of_order:#?}");
 }
+
+/// The finish of a words-mode run of `program` (windows of 7 cycles, two
+/// walkers, `room`), every chunk generated and its records read on the way
+/// (their fill and host fill): what the finish says.
+fn finish_of(
+    program: &Elf,
+    max_rows: &MaxRowsConfig,
+    room: RecordsRoom,
+) -> Result<(), crate::Error> {
+    use executor::vm::fast::FastExecutor;
+    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
+        .and_then(WindowedTraceBuilder::drop_streamed_ops)
+        .and_then(|b| b.card_fill_streamed(room, true, true))
+        .and_then(WindowedTraceBuilder::card_writes_words)
+        .expect("the builder")
+        .count_where_made(true);
+    let mut jobs: Vec<ChunkJob> = Vec::new();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<super::parallel::ExecWindow>(2);
+    let report = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut fast = FastExecutor::new(program, Vec::new()).expect("the fast engine");
+            fast.enable_history().expect("history mode");
+            while let Some((logs, history)) = fast.resume_history(7).expect("the run") {
+                let last = (fast.pc() == 0)
+                    .then(|| fast.take_history_final().map(Box::new))
+                    .flatten();
+                let sent = tx.send(super::parallel::ExecWindow {
+                    logs: Arc::new(logs),
+                    start: None,
+                    history: Some(Box::new(history)),
+                    last,
+                });
+                if sent.is_err() {
+                    break;
+                }
+            }
+        });
+        super::parallel::walk_windows_from_history(&mut builder, rx, 2, 0, |a, w, _| {
+            jobs.extend(a.absorb(w));
+            Ok(())
+        })
+    })
+    .expect("the walk");
+    for job in jobs {
+        let mut chunk = job.generate();
+        if let Some(records) = chunk.trace.take_records_main() {
+            let _ = records.fill();
+            let _ = records.host_fill();
+            let _ = records.digest();
+        }
+    }
+    builder.finish(&report.last).map(|_| ())
+}
+
+/// ★ A words-mode run one of whose windows comes without its logs (a test
+/// fault: the accumulator drops every window's logs after the first) is
+/// refused at its finish, whatever the room, and nothing panics on the way:
+/// the chunks whose rows cannot be decoded go out empty or as records whose
+/// readers get no rows. The same run with its logs finishes.
+#[test]
+fn a_words_run_without_a_windows_logs_is_refused_at_its_finish() {
+    use super::super::register_words::DROP_LOGS;
+    let max_rows = MaxRowsConfig::small();
+    for name in ["test_keccak_multi", "all_instructions_64"] {
+        let (program, _) = run(name);
+        for (what, room) in rooms() {
+            DROP_LOGS.with(|d| d.set(true));
+            let refused = finish_of(&program, &max_rows, room);
+            DROP_LOGS.with(|d| d.set(false));
+            match refused {
+                Err(crate::Error::Prover(e)) => assert!(
+                    e.starts_with("words mode:"),
+                    "{name}, room {what}: refused for another reason: {e}"
+                ),
+                other => panic!("{name}, room {what}: not refused: {other:?}"),
+            }
+        }
+        finish_of(&program, &max_rows, Arc::new(|_| true))
+            .expect("with its logs, the run finishes");
+    }
+}

@@ -186,8 +186,9 @@ impl TableRecords for CpuLogRecords {
 /// ([`TableRecords::ecall_cycles`]).
 pub(crate) struct RegisterRowRecords {
     /// Its rows: as given, or decoded from `words` the first time a host
-    /// reader asks.
-    rows: std::sync::OnceLock<Segments<RegRow>>,
+    /// reader asks (an error when they cannot be: the run is then refused at
+    /// its finish, and the readers here get no rows, never a panic).
+    rows: std::sync::OnceLock<Result<Segments<RegRow>, String>>,
     ecalls: Option<Arc<[u32]>>,
     /// Words mode: the chunk as the walk wrote it, and the program's DECODE
     /// rows its rows decode with.
@@ -201,7 +202,7 @@ impl RegisterRowRecords {
     pub(crate) fn new(rows: Segments<RegRow>) -> Result<Self, Segments<RegRow>> {
         if whole_table(rows.len()) {
             Ok(Self {
-                rows: std::sync::OnceLock::from(rows),
+                rows: std::sync::OnceLock::from(Ok(rows)),
                 ecalls: None,
                 words: None,
             })
@@ -220,23 +221,26 @@ impl RegisterRowRecords {
         }
     }
 
-    /// Its rows (decoded once, in words mode).
-    fn rows_held(&self) -> &Segments<RegRow> {
-        self.rows.get_or_init(|| {
-            let (chunk, decode) = self.words.as_ref().expect("rows or words");
-            let rows = chunk
-                .decode(decode, 0..chunk.len())
-                .unwrap_or_else(|e| panic!("a MEMW_R chunk's words: {e}"));
-            Segments::one(rows)
-        })
+    /// Its rows (decoded once, in words mode), or why they cannot be.
+    fn rows_held(&self) -> Result<&Segments<RegRow>, &str> {
+        self.rows
+            .get_or_init(|| match self.words.as_ref() {
+                Some((chunk, decode)) => chunk
+                    .decode(decode, 0..chunk.len())
+                    .map(Segments::one)
+                    .map_err(|e| format!("a MEMW_R chunk's words: {e}")),
+                None => Err("a MEMW_R chunk with neither rows nor words".to_string()),
+            })
+            .as_ref()
+            .map_err(String::as_str)
     }
 
     /// Its row count, without decoding.
     fn len(&self) -> usize {
         match (&self.words, self.rows.get()) {
             (Some((chunk, _)), _) => chunk.len(),
-            (None, Some(rows)) => rows.len(),
-            (None, None) => 0,
+            (None, Some(Ok(rows))) => rows.len(),
+            (None, _) => 0,
         }
     }
 
@@ -253,8 +257,13 @@ impl RegisterRowRecords {
 
     /// The rows back.
     pub(crate) fn into_rows(self) -> Segments<RegRow> {
-        self.rows_held();
-        self.rows.into_inner().expect("decoded above")
+        // None when they cannot be decoded: the regenerated chunk's digest
+        // then differs and its slot refuses it.
+        let _ = self.rows_held();
+        match self.rows.into_inner() {
+            Some(Ok(rows)) => rows,
+            _ => Segments { parts: Vec::new() },
+        }
     }
 }
 
@@ -286,7 +295,8 @@ impl TableRecords for RegisterRowRecords {
         RecordsFill::MemwR {
             rows: self
                 .rows_held()
-                .slices()
+                .map(Segments::slices)
+                .unwrap_or_default()
                 .into_iter()
                 .map(memw_register::card_rows)
                 .collect(),
@@ -301,7 +311,7 @@ impl TableRecords for RegisterRowRecords {
 
     fn host_fill(&self) -> Option<NarrowColumns> {
         let mut trace = memw_register::generate_memw_register_trace_from_rows_segments_as(
-            &self.rows_held().slices(),
+            &self.rows_held().ok()?.slices(),
             TraceForm::Narrow,
         );
         // Written packed, except in a build that holds every trace wide.
@@ -311,9 +321,9 @@ impl TableRecords for RegisterRowRecords {
 
     fn return_pages(&mut self) -> PagesReturned {
         match (self.rows.get_mut(), self.words.as_mut()) {
-            (Some(rows), _) => rows.return_pages(),
+            (Some(Ok(rows)), _) => rows.return_pages(),
             (None, Some((chunk, _))) => chunk.words.return_pages(),
-            (None, None) => PagesReturned::default(),
+            _ => PagesReturned::default(),
         }
     }
 
@@ -340,21 +350,26 @@ impl TableRecords for RegisterRowRecords {
         from: usize,
         to: usize,
     ) -> Vec<multilinear::records::RegisterRow> {
+        // Rows that cannot be decoded come back short: the card's fill then
+        // refuses the table, and the run is refused at its finish.
         let Some((chunk, decode)) = self.words.as_ref() else {
             return self
                 .rows_held()
-                .slices()
-                .into_iter()
-                .flat_map(memw_register::card_rows)
-                .skip(from)
-                .take(to - from)
-                .copied()
-                .collect();
+                .map(|rows| {
+                    rows.slices()
+                        .into_iter()
+                        .flat_map(memw_register::card_rows)
+                        .skip(from)
+                        .take(to - from)
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default();
         };
-        let rows = chunk
+        chunk
             .decode(decode, from..to)
-            .unwrap_or_else(|e| panic!("a MEMW_R chunk's words: {e}"));
-        memw_register::card_rows(&rows).to_vec()
+            .map(|rows| memw_register::card_rows(&rows).to_vec())
+            .unwrap_or_default()
     }
 }
 

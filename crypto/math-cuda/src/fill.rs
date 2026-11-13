@@ -942,6 +942,10 @@ pub(crate) fn fill_col_major_into(
         RecordsInput::MemwRWords { rows, decode, .. } => {
             let n = records.len();
             let decoded = decode(0, n);
+            // Rows that could not be decoded come back short: refused.
+            if decoded.len() != n {
+                return Err(crate::invalid_value());
+            }
             let records_dev = upload_pieces(stream, &[&decoded[..]])?;
             launch_rows(stream, &m.memw_r, &records_dev, n, rows, dst)
         }
@@ -1033,7 +1037,11 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
         },
         RecordsInput::MemwR { records, .. } => Staged::MemwR(upload_pieces(stream, records)?, n),
         RecordsInput::MemwRWords { decode, .. } => {
-            Staged::MemwR(upload_pieces(stream, &[&decode(0, n)[..]])?, n)
+            let decoded = decode(0, n);
+            if decoded.len() != n {
+                return Err(crate::invalid_value());
+            }
+            Staged::MemwR(upload_pieces(stream, &[&decoded[..]])?, n)
         }
         RecordsInput::MemwA { records, .. } => Staged::MemwA(upload_pieces(stream, records)?, n),
         RecordsInput::Load { records, .. } => Staged::Load(upload_pieces(stream, records)?, n),
