@@ -83,7 +83,6 @@ fn tower() -> <H as WhirHash>::Sponge {
 
 struct Opened {
     layout: StackedLayout,
-    columns: Vec<Mle<F>>,
     roots: Vec<Commitment>,
     domain: Domain<F>,
     points: Vec<Vec<EE>>,
@@ -124,7 +123,6 @@ fn open(polys: usize, cfg: &ChainConfig, seed: u64) -> Result<Opened, Error> {
     )?;
     Ok(Opened {
         layout,
-        columns,
         roots,
         domain: stacked.domain().clone(),
         points,
@@ -187,8 +185,10 @@ fn bytes(proof: &StackedProof<F, Ext>) -> usize {
 /// the per-polynomial split.
 #[test]
 fn one_tree_a_run_is_admitted_under_blake3() {
-    assert!(H::JOINT_LEAF && P1Whir::JOINT_LEAF);
-    assert!(!KeccakWhir::JOINT_LEAF && !RpxWhir::JOINT_LEAF);
+    const {
+        assert!(H::JOINT_LEAF && P1Whir::JOINT_LEAF);
+        assert!(!KeccakWhir::JOINT_LEAF && !RpxWhir::JOINT_LEAF);
+    }
     assert!(check_round0_trees::<H>(&one().format).is_ok());
     assert!(check_round0_trees::<H>(&each().format).is_ok());
     for refused in [
