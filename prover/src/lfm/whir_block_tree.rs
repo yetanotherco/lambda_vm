@@ -166,9 +166,6 @@ pub struct WhirTreeConfig {
     /// `W3_FAN_IN` ([`BLOCK_FAN_IN`] by default): another fan-in is another
     /// tree than the production verifier derives.
     pub fan_in: usize,
-    /// `W3_EXEC_BESIDE_ARTIFACTS=0|1` (default 1): the leaves execute and fill
-    /// while their artifacts are built, or (0, the control) after all of them.
-    pub beside: bool,
     /// `W3_LEAF_ARTIFACTS_EACH=0|1` (default 0): the leaves' artifacts are
     /// published all at once after the last is built while every leaf's
     /// program is there, and each as it is built from the first leaf whose
@@ -216,23 +213,10 @@ pub struct WhirTreeConfig {
     pub format: BlockFormat,
     /// The base's options: production, with the `BLOCK_WHIR_*` knobs.
     pub options: BlockOptions,
-    /// `W3_NODE_PIPE=0|1` (default 1): the nodes' programs and artifacts built
-    /// on a pool of `W3_EMIT_THREADS` threads of their own (default 4), each
-    /// level proving as its own nodes arrive; or (0, the control) one after
-    /// another on one thread, level 1 waiting for the whole tree's builds.
-    pub node_pipe: Option<usize>,
-    /// `W3_DATAFLOW=0|1` (default 1): each node proves as soon as its own
-    /// children are proved, or (0, the control) once its whole level below is.
-    pub dataflow: bool,
-    /// `W3_STREAM_TOP=0|1` (default 1): when a child is still unproved as the
-    /// top node can execute, the top executes each child's share as that child
-    /// is proved; otherwise, and at 0 (the control), all of it after the last.
-    pub stream_top: bool,
-    /// `W3_EXEC_EARLY=0|1` (default 1): a node executes and fills from its
-    /// program as soon as the builder emits it, and only its prove waits for
-    /// its artifacts; or (0, the control) it executes once its artifacts are
-    /// built too.
-    pub exec_early: bool,
+    /// `W3_EMIT_THREADS` (4 by default): the nodes' programs and artifacts
+    /// are built on a pool of this many threads of their own, each level
+    /// proving as its own nodes arrive.
+    pub emit_threads: usize,
     /// `W3_NODE_TIMES=1`: the per-program stamps readout after the tree.
     pub node_times: bool,
     /// `W3_LEAF_FIRST=0|1` (default 1): with the early leaf on, the planner
@@ -453,7 +437,6 @@ impl WhirTreeConfig {
         let leaves = count_knob("W3_LEAVES")?;
         let siblings = count_knob("W3_SIBLINGS")?.unwrap_or(3);
         let fan_in = count_knob("W3_FAN_IN")?.unwrap_or(BLOCK_FAN_IN);
-        let beside = count_knob("W3_EXEC_BESIDE_ARTIFACTS")?.is_none_or(|v| v != 0);
         let leaves_each = count_knob("W3_LEAF_ARTIFACTS_EACH")? == Some(1);
         let early_on = count_knob("W3_LEAF_DURING_PHASE_B")?.is_none_or(|v| v != 0);
         let early_leaves = early_leaves_setting(count_knob("W3_EARLY_LEAVES")?)?;
@@ -541,15 +524,11 @@ impl WhirTreeConfig {
             wire: compress_wire,
             c2: compress2,
         } = super::compress::compress_plan_from_env()?;
-        let node_pipe = count_knob("W3_NODE_PIPE")?
-            .is_none_or(|v| v != 0)
-            .then(|| count_knob("W3_EMIT_THREADS").map(|t| t.unwrap_or(4).max(1)))
-            .transpose()?;
+        let emit_threads = count_knob("W3_EMIT_THREADS")?.unwrap_or(4).max(1);
         Ok(Self {
             leaves,
             siblings,
             fan_in,
-            beside,
             leaves_each,
             program_budget: super::program_budget::setting_from_env()?,
             early_on,
@@ -559,10 +538,7 @@ impl WhirTreeConfig {
             argue,
             format,
             options,
-            node_pipe,
-            dataflow: count_knob("W3_DATAFLOW")?.is_none_or(|v| v != 0),
-            stream_top: count_knob("W3_STREAM_TOP")?.is_none_or(|v| v != 0),
-            exec_early: count_knob("W3_EXEC_EARLY")?.is_none_or(|v| v != 0),
+            emit_threads,
             node_times: count_knob("W3_NODE_TIMES")? == Some(1),
             leaf_first: count_knob("W3_LEAF_FIRST")?.is_none_or(|v| v != 0),
             compress,
@@ -1140,14 +1116,13 @@ pub(crate) fn build_levels<'l, C: Sync, A: Send, E: Send + Sync, P: Send, N: Sen
 /// program `budget` each node is admitted in prove order before it is emitted
 /// ([`TreeBudget`]), its permit travelling with its program.
 ///
-/// With `pool` (`W3_NODE_PIPE`, on by default) a level's programs are emitted
-/// together on the pool's threads — the builder's own, not the global pool, on
-/// which a prover's join could steal an emission and leave the card idle
-/// (#1013's FAST 454) — and this thread builds each one's artifacts (holding
-/// the card) as it arrives; each level proves as its own nodes arrive. Without
-/// it, one after another on this thread (the control: the builder before,
-/// whose whole tree level 1 then waits for — at the median 32 s of serial
-/// builds holding level 0 open 10.7 s past its last proof, BIG 565 / 568).
+/// A level's programs are emitted together on `pool`'s threads — the
+/// builder's own, not the global pool, on which a prover's join could steal an
+/// emission and leave the card idle (#1013's FAST 454) — and this thread
+/// builds each one's artifacts (holding the card) as it arrives; each level
+/// proves as its own nodes arrive. (Built one after another on one thread
+/// instead, level 1 waited for the whole tree: at the median 32 s of serial
+/// builds held level 0 open 10.7 s past its last proof, BIG 565 / 568.)
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_nodes(
     plan: &WhirBlockPlan,
@@ -1158,7 +1133,7 @@ pub(crate) fn build_nodes(
     wrap: &crate::ProofOptions,
     words: usize,
     t_tree: std::time::Instant,
-    pool: Option<&rayon::ThreadPool>,
+    pool: &rayon::ThreadPool,
     budget: Option<&TreeBudget>,
 ) {
     type Emitted = (NodeProgram, (std::sync::Arc<Admitted>, f64));
@@ -1225,7 +1200,7 @@ pub(crate) fn build_nodes(
                 built_at: t_tree.elapsed().as_secs_f64(),
             })
         },
-        pool,
+        Some(pool),
     );
 }
 
@@ -1500,8 +1475,8 @@ pub(crate) fn tree_children(
 /// order (none for a leaf), to wait for as it needs them ([`wait_all`]), so a
 /// node whose children are done proves while the rest of the level below still
 /// does — and one that streams can start on its first child. With
-/// `barrier` (the control, `W3_DATAFLOW=0`), a node first waits for the whole
-/// level below, as level-by-level proving did. A failed or panicking prove
+/// `barrier` (a test's control), a node first waits for the whole level
+/// below, as level-by-level proving did. A failed or panicking prove
 /// leaves an error in its slot and so in every slot above it; every slot still
 /// empty when this returns or unwinds gets one.
 pub(crate) fn prove_dataflow<R: Send + Sync>(
@@ -1618,9 +1593,8 @@ pub(crate) fn execute_streamed_with<R: Send + Sync>(
 /// One node of the tree: its execute and fill (`execute`) from its program as
 /// soon as the builder has emitted it, and its prove (`prove`) only once its
 /// OWN artifacts are in its slot — the program in `programs[lv − 1][j]`, the
-/// artifacts in `slots[lv − 1][j]`. With `early` off (the control,
-/// `W3_EXEC_EARLY=0`), the execute also waits for the artifacts, as when one
-/// slot held both. The artifacts are a card hold that queues behind the
+/// artifacts in `slots[lv − 1][j]`. With `early` off (a test's control), the
+/// execute also waits for the artifacts, as when one slot held both. The artifacts are a card hold that queues behind the
 /// proves below (BIG 617: the top's came 0.12-0.15 s after its last child
 /// although its program was emitted 0.03-2.1 s before it).
 pub(crate) fn node_flow<E, N, F, R>(
@@ -1641,8 +1615,7 @@ pub(crate) fn node_flow<E, N, F, R>(
 }
 
 /// Whether the top streams: only if a child is still unproved when the top can
-/// execute (its program emitted; with `W3_EXEC_EARLY=0`, its artifacts built
-/// too). With every child already proved there is nothing to stream behind,
+/// execute (its program emitted). With every child already proved there is nothing to stream behind,
 /// and the streamed path (its forward pass, then a wave per child) costs more
 /// than one whole execution: at 1× the top's artifacts come after its last
 /// child, and streaming it anyway cost 0.19 s (BIG 617 / 618). A failed child
@@ -1699,14 +1672,13 @@ pub(crate) fn wait_all<'r, R>(kids: &[&'r Published<R>]) -> Result<Vec<&'r R>, S
 ///    admitted under the budget, then published to its slot as it is built, a
 ///    node over leaves once its own leaves' artifacts are, beside
 /// 3. every program proved `siblings` at a time, leaves first, each harvested
-///    without its verify ([`prove_dataflow`]): with `beside`, each leaf
-///    executes and fills its traces while the artifacts are built (neither
-///    reads them) and waits for its own only to prove; without, it waits for
-///    every leaf's first (the order before, `W3_EXEC_BESIDE_ARTIFACTS=0`); each
-///    node as soon as its own children are proved and its program is in its
-///    slot — with `dataflow` off (the control), once its whole level below is
-///    proved; without `node_pipe` (that control), once the builder has built
-///    the whole tree.
+///    without its verify ([`prove_dataflow`]): each leaf executes and fills
+///    its traces while the artifacts are built (neither reads them) and waits
+///    for its own only to prove; each node as soon as its own children are
+///    proved and its program is in its slot, executing and filling from its
+///    program as it is emitted ([`node_flow`]); the top streams its children
+///    when one is still unproved as it can execute ([`top_streams`]), its
+///    choice kept in `top_streamed`.
 ///
 /// Each program's prover claims it as it takes it and lets it go once it is
 /// done with it — a leaf once proved, a node once filled (its artifacts' build
@@ -1730,14 +1702,11 @@ pub(crate) fn prove_tree_pipelined(
     leaves: Vec<Published<ProgramSlot>>,
     budget: Option<&TreeBudget>,
     siblings: usize,
-    beside: bool,
     leaves_each: bool,
     early: Vec<EarlyLeaf>,
     early_first: bool,
-    node_pipe: Option<&rayon::ThreadPool>,
-    dataflow: bool,
-    stream_top: Option<&std::sync::OnceLock<bool>>,
-    exec_early: bool,
+    node_pipe: &rayon::ThreadPool,
+    top_streamed: &std::sync::OnceLock<bool>,
     top_handoff: Option<&TopHandoff>,
     base_end: f64,
     in_tree_ahead: usize,
@@ -1909,11 +1878,6 @@ pub(crate) fn prove_tree_pipelined(
                         }
                         None => {
                             let arenas = block_leaf_arena(plan, proof, k)?;
-                            if !beside {
-                                for slot in &built {
-                                    slot.wait()?;
-                                }
-                            }
                             let program = program.get()?;
                             lfm_execute_and_fill(
                                 &program.program,
@@ -1949,13 +1913,6 @@ pub(crate) fn prove_tree_pipelined(
                         times,
                     });
                 }
-                // The control of the node pipeline: no node proves before
-                // the whole tree is built, as when the builder joined level 0.
-                if node_pipe.is_none() {
-                    for slot in slots.iter().flatten() {
-                        slot.wait()?;
-                    }
-                }
                 // Execute and fill from the program as soon as it is
                 // emitted, prove once the node's own artifacts are built
                 // ([`node_flow`]); traces filled under the socket its hash
@@ -1965,7 +1922,7 @@ pub(crate) fn prove_tree_pipelined(
                     &programs,
                     &slots,
                     at,
-                    exec_early,
+                    true,
                     |emitted: &NodeProgram| -> Result<_, String> {
                         let t = std::time::Instant::now();
                         // This prover takes the node's program; once filled,
@@ -1977,13 +1934,10 @@ pub(crate) fn prove_tree_pipelined(
                         // The top streams only if a child is still unproved
                         // now that it can execute; the choice is kept for
                         // the readout.
-                        let streamed = match stream_top {
-                            Some(chose) if at.lv == shape.len() => {
-                                let streams = top_streams(kids);
-                                let _ = chose.set(streams);
-                                streams
-                            }
-                            _ => false,
+                        let streamed = at.lv == shape.len() && {
+                            let streams = top_streams(kids);
+                            let _ = top_streamed.set(streams);
+                            streams
                         };
                         let filled = if streamed {
                             execute_streamed(&program.program, &emitted.child_arenas, kids, hasher)
@@ -2034,7 +1988,7 @@ pub(crate) fn prove_tree_pipelined(
                 )
             };
             let target = block_whir::memory_target_bytes();
-            prove_dataflow(&shape, &order, &results, siblings, !dataflow, |at, kids| {
+            prove_dataflow(&shape, &order, &results, siblings, false, |at, kids| {
                 let proved = prove_one(at, kids);
                 // The level's last program: its freed pages back to the OS
                 // before the levels above go on, where the host is short.
@@ -2276,11 +2230,10 @@ pub fn prove_whir_block_tree(
     cfg: &WhirTreeConfig,
     sink: &dyn WhirTreeSink,
 ) -> Result<WhirTreeRun, String> {
-    let (leaves, siblings, fan_in, beside, early_on, leaf_emitters) = (
+    let (leaves, siblings, fan_in, early_on, leaf_emitters) = (
         cfg.leaves,
         cfg.siblings,
         cfg.fan_in,
-        cfg.beside,
         cfg.early_on,
         cfg.leaf_emitters,
     );
@@ -2384,9 +2337,8 @@ pub fn prove_whir_block_tree(
     // The tree programs' budget (`LAMBDA_VM_TREE_PROGRAM_BUDGET`): against the
     // memory target, which `LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB` moves too, `auto`'s
     // room line at `LAMBDA_VM_TREE_PROGRAM_BUDGET_SHARE` of it, the host read
-    // as `LAMBDA_VM_TREE_PROGRAM_BUDGET_READING` says (less what a purge could
-    // return, unless it says `resident`); `off` emits every leaf beside phase
-    // B, as before.
+    // less what a purge could return; `off` emits every leaf beside phase B,
+    // as before.
     let budget = match cfg.program_budget {
         super::program_budget::BudgetSetting::Off => None,
         setting => Some(super::program_budget::ProgramBudget::new(
@@ -2395,7 +2347,7 @@ pub fn prove_whir_block_tree(
                 block_whir::memory_target_bytes(),
                 super::program_budget::share_from_env()?,
             ),
-            super::program_budget::reading_from_env()?,
+            super::program_budget::READING_DEFAULT,
         )),
     };
     // The leaves offered to phase B (`W3_LEAF_FIRST`), and when.
@@ -2649,11 +2601,9 @@ pub fn prove_whir_block_tree(
                                     Some(secs);
                                 let wrap = super::proof::aggregation_wrap_options();
                                 // Its tables' domains and twiddles, warm before
-                                // the tree's first card hold (`LFM_WARM_DOMAINS`).
-                                if super::domain_warm::on() {
-                                    super::domain_warm::warm(filled.traces(), &wrap);
-                                    super::domain_warm::note_early(t0.elapsed().as_secs_f64());
-                                }
+                                // the tree's first card hold ([`super::domain_warm`]).
+                                super::domain_warm::warm(filled.traces(), &wrap);
+                                super::domain_warm::note_early(t0.elapsed().as_secs_f64());
                                 // And the rest of what its prove builds on first
                                 // use: the per-domain prove constants and the
                                 // DEEP's LDE cosets. A warm-up that fails leaves
@@ -2938,17 +2888,11 @@ pub fn prove_whir_block_tree(
     // The readouts above run on the clock, between the base and the tree: a
     // prover prints none of them, so the whole block is also given without.
     let readouts = t0.elapsed().as_secs_f64() - base;
-    let node_pipe = match cfg.node_pipe {
-        Some(threads) => Some(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .thread_name(|i| format!("w3-emit-{i}"))
-                .build()
-                .map_err(|e| format!("the node builder's pool: {e}"))?,
-        ),
-        None => None,
-    };
-    let (dataflow, stream_top, exec_early) = (cfg.dataflow, cfg.stream_top, cfg.exec_early);
+    let node_pipe = rayon::ThreadPoolBuilder::new()
+        .num_threads(cfg.emit_threads)
+        .thread_name(|i| format!("w3-emit-{i}"))
+        .build()
+        .map_err(|e| format!("the node builder's pool: {e}"))?;
     let top_streamed = std::sync::OnceLock::new();
     let t = std::time::Instant::now();
     let tree_unix = std::time::SystemTime::now()
@@ -3006,14 +2950,11 @@ pub fn prove_whir_block_tree(
             programs,
             tree_budget.as_ref(),
             siblings,
-            beside,
             cfg.leaves_each,
             early,
             leaf_first,
-            node_pipe.as_ref(),
-            dataflow,
-            stream_top.then_some(&top_streamed),
-            exec_early,
+            &node_pipe,
+            &top_streamed,
             handoff.as_ref(),
             base,
             // Several early leaves: up to `siblings − 1` leaves the tree still has
@@ -3207,48 +3148,16 @@ pub fn prove_whir_block_tree(
         }
     }
     sink.line(&format!(
-        "W3 STREAM TOP: {}",
-        if stream_top {
-            "on (while a child is unproved as its program arrives, the top executes each child's share as that child is proved)"
-        } else {
-            "off (the top executes after its last child)"
-        }
-    ));
-    sink.line(&format!(
-        "W3 EXEC EARLY: {}",
-        if exec_early {
-            "on (a node executes and fills from its program as it is emitted; only its prove waits for its artifacts)"
-        } else {
-            "off (a node executes once its program and its artifacts are both built)"
-        }
-    ));
-    sink.line(&format!(
         "W3 TOP EXECUTE: {}",
-        match (stream_top, top_streamed.get()) {
-            (false, _) => "whole (streaming off)",
-            (true, Some(true)) =>
-                "streamed (a child was still unproved when the top could execute)",
-            (true, Some(false)) => "whole (every child was proved before the top could execute)",
-            (true, None) => "unknown (the top never chose)",
+        match top_streamed.get() {
+            Some(true) => "streamed (a child was still unproved when the top could execute)",
+            Some(false) => "whole (every child was proved before the top could execute)",
+            None => "unknown (the top never chose)",
         }
     ));
     sink.line(&format!(
-        "W3 DATAFLOW: {}",
-        if dataflow {
-            "on (each node proves as soon as its own children are proved)"
-        } else {
-            "off (each node waits for its whole level below)"
-        }
-    ));
-    sink.line(&format!(
-        "W3 NODE PIPE: {}",
-        match &node_pipe {
-            Some(pool) => format!(
-                "on ({} builder threads; each level proves as its own nodes arrive)",
-                pool.current_num_threads()
-            ),
-            None => "off (one builder thread; level 1 waits for the whole tree)".to_string(),
-        }
+        "W3 NODE PIPE: {} builder threads; each level proves as its own nodes arrive",
+        node_pipe.current_num_threads()
     ));
     // How the leaves' artifacts were published ([`publish_each`]), when the
     // first leaf was proved and the first node over the leaves had its
@@ -3286,7 +3195,7 @@ pub fn prove_whir_block_tree(
         stark::trace::main_dev_producer_calls()
     ));
     sink.line(&format!(
-        "W3 RECURSION: {:.2}s after the base (tree {tree:.2}s) · whole block {whole:.2}s · whole excl. harness readouts {:.2}s (readouts {readouts:.2}s) · leaves execute beside their artifacts {beside}",
+        "W3 RECURSION: {:.2}s after the base (tree {tree:.2}s) · whole block {whole:.2}s · whole excl. harness readouts {:.2}s (readouts {readouts:.2}s)",
         whole - base,
         whole - readouts
     ));
@@ -5453,7 +5362,6 @@ mod tests {
             leaves: None,
             siblings: 3,
             fan_in: BLOCK_FAN_IN,
-            beside: true,
             leaves_each: false,
             program_budget: super::super::program_budget::BudgetSetting::Auto,
             early_on: true,
@@ -5463,10 +5371,7 @@ mod tests {
             argue: BlockFormat::production().argue,
             format: BlockFormat::production(),
             options: BlockOptions::production(),
-            node_pipe: Some(4),
-            dataflow: true,
-            stream_top: true,
-            exec_early: true,
+            emit_threads: 4,
             node_times: false,
             leaf_first: true,
             compress: super::super::compress::DEFAULT_PLAN.rate,

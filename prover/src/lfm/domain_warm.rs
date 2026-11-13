@@ -1,15 +1,16 @@
-//! The recursion proofs' domains and twiddles built ahead of their card holds
-//! (on by default; `LFM_WARM_DOMAINS=0` or `off` turns it off).
+//! The recursion proofs' domains and twiddles built ahead of their card holds.
 //!
 //! A recursion proof builds each table length's domain and twiddles on first
 //! use, inside `multi_prove`, under the exclusive card permit: the first proof
 //! of a process holds the card for about 0.3 s of host work while the next
-//! proof waits for it. On, the early leaf's thread warms its tables' lengths
+//! proof waits for it. Instead, the early leaf's thread warms its tables' lengths
 //! beside phase B, and every proof warms its own lengths before it takes the
 //! card; `multi_prove` then finds them in the cache. The cached values are the
-//! ones a proof builds for itself, so no proof byte moves.
+//! ones a proof builds for itself, so no proof byte moves. Measured against
+//! building them on first use: the median and the large block's recursion were
+//! 0.17 s and 0.62 s shorter, with ≈ 0.2 GiB more host memory at the base's
+//! peak.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use stark::proof::options::ProofOptions;
@@ -26,19 +27,6 @@ static EARLY_BYTES: AtomicU64 = AtomicU64::new(0);
 /// When the early leaf's lengths were warmed, in seconds on the tree's clock
 /// (the bits of an `f64`; `u64::MAX` for never).
 static EARLY_AT: AtomicU64 = AtomicU64::new(u64::MAX);
-
-/// `LFM_WARM_DOMAINS` as given: on unless `0` or `off`. On, the median and the
-/// large block's recursion were 0.17 s and 0.62 s shorter, with no proof byte
-/// moved and ≈ 0.2 GiB more host memory at the base's peak.
-fn setting(value: Option<&str>) -> bool {
-    !matches!(value.map(str::trim), Some("0" | "off"))
-}
-
-/// Whether the warm-up is on, read once.
-pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| setting(std::env::var("LFM_WARM_DOMAINS").ok().as_deref()))
-}
 
 /// The shortest table length warmed: the LFM's padded heights start at 4 rows,
 /// and a shorter table (a one-row chip) costs nothing to build at its prove.
@@ -105,10 +93,6 @@ pub(crate) fn note_early(at: f64) {
 
 /// What the warm-up did this process, for a harness's line.
 pub fn line() -> String {
-    if !on() {
-        return "off (LFM_WARM_DOMAINS=0; the default builds the recursion proofs' domains and twiddles before their card holds)"
-            .to_string();
-    }
     let early = EARLY_AT.load(Ordering::Relaxed);
     let gib = |b: &AtomicU64| b.load(Ordering::Relaxed) as f64 / (1u64 << 30) as f64;
     format!(
@@ -128,17 +112,6 @@ pub fn line() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// On by default: unset, empty or `1` warms; `0` or `off` does not.
-    #[test]
-    fn the_knob_is_on_unless_zero_or_off() {
-        for on in [None, Some(""), Some("1"), Some(" 1 ")] {
-            assert!(setting(on), "{on:?}");
-        }
-        for off in [Some("0"), Some("off"), Some(" 0 ")] {
-            assert!(!setting(off), "{off:?}");
-        }
-    }
 
     /// ★ A proof's table lengths are built once and found after: the second
     /// warm builds nothing (the proof's own `multi_prove` lookups then hit,

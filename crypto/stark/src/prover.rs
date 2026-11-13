@@ -925,13 +925,13 @@ pub fn composition_subcoset_tables() -> u64 {
     COMPOSITION_SUBCOSET_TABLES.load(Ordering::Relaxed)
 }
 
-/// Runtime override of the sub-coset composition evaluation: 0 = follow the
-/// environment, 1 = forced off, 2 = forced on.
+/// Runtime override of the sub-coset composition evaluation: 0 = the default
+/// (on), 1 = forced off, 2 = forced on.
 static COMPOSITION_SUBCOSET_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
 /// Force the sub-coset composition evaluation on (`Some(true)`), off
-/// (`Some(false)`), or back to the environment's choice (`None`). It changes
+/// (`Some(false)`), or back to the default (`None`, on). It changes
 /// how the prover computes the composition parts, never their values: the
 /// proof bytes are the same either way.
 pub fn set_composition_subcoset(on: Option<bool>) {
@@ -944,21 +944,10 @@ pub fn set_composition_subcoset(on: Option<bool>) {
 }
 
 /// Whether a degree-2 composition is evaluated on the `2n`-point sub-coset
-/// instead of the whole LDE coset. On by default;
-/// `LAMBDA_VM_COMPOSITION_SUBCOSET=0` turns it off (an A/B knob — the proof
-/// bytes do not depend on it).
+/// instead of the whole LDE coset. On unless a test forces it off
+/// ([`set_composition_subcoset`]); the proof bytes do not depend on it.
 pub(crate) fn composition_subcoset_enabled() -> bool {
-    match COMPOSITION_SUBCOSET_OVERRIDE.load(Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
-    }
-    static ENV: OnceLock<bool> = OnceLock::new();
-    *ENV.get_or_init(|| {
-        std::env::var("LAMBDA_VM_COMPOSITION_SUBCOSET")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    COMPOSITION_SUBCOSET_OVERRIDE.load(Ordering::Relaxed) != 1
 }
 
 /// The LDE-row stride the composition polynomial `H` is evaluated at.
@@ -1059,12 +1048,13 @@ where
     (d, t)
 }
 
-/// Runtime override of [`warm_prove_constants_enabled`]: 0 = the environment's
-/// choice, 1 = off, 2 = on.
+/// Runtime override of [`warm_prove_constants_enabled`]: 0 = the default (on),
+/// 1 = off, 2 = on.
 static WARM_PROVE_CONSTANTS_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
-/// Force [`warm_prove_constants_enabled`] on, off, or back to the environment.
+/// Force [`warm_prove_constants_enabled`] on, off, or back to the default (a
+/// test's control).
 pub fn set_warm_prove_constants(on: Option<bool>) {
     let v = match on {
         None => 0,
@@ -1078,20 +1068,10 @@ pub fn set_warm_prove_constants(on: Option<bool>) {
 /// per-domain constants a table's prove builds on first use warmed beforehand
 /// ([`warm_prove_constants`]), and the composition drain routed through the
 /// staging pairs rather than the growing pinned slab. Neither changes a value:
-/// the proof bytes are the same. On by default;
-/// `LAMBDA_VM_WARM_PROVE_CONSTANTS=0` turns both off (an A/B knob).
+/// the proof bytes are the same. On unless a test turns it off
+/// ([`set_warm_prove_constants`]).
 pub fn warm_prove_constants_enabled() -> bool {
-    match WARM_PROVE_CONSTANTS_OVERRIDE.load(Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
-    }
-    static ENV: OnceLock<bool> = OnceLock::new();
-    *ENV.get_or_init(|| {
-        std::env::var("LAMBDA_VM_WARM_PROVE_CONSTANTS")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    WARM_PROVE_CONSTANTS_OVERRIDE.load(Ordering::Relaxed) != 1
 }
 
 /// Constants [`warm_prove_constants`] built or uploaded so far, process-wide.

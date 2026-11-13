@@ -189,32 +189,14 @@ fn check_writes_and_reads(program: &LfmProgram) -> Result<(), LfmViolation> {
     Ok(())
 }
 
-/// Check 4 recounts reads in a table indexed by address ([`ReadCounts`]) by
-/// default; `LFM_VALIDATE_DENSE_COUNTS=0` restores the hash map (the rollback).
-/// The same counts, so the same verdict and the same first violation; only the
-/// time differs. The map was ≈ 0.8 s of a 1.2 s node emission (laptop
-/// instrument `node_emit_timing_tests`), and on the box the dense recount took
-/// the median block's recursion down 0.27 s and the tree verify from 7.96 to
-/// 3.77 s.
-pub const DENSE_COUNTS_ENV: &str = "LFM_VALIDATE_DENSE_COUNTS";
-
-/// Whether [`DENSE_COUNTS_ENV`] is on, read once.
-pub fn dense_counts() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| parse_dense_counts(std::env::var(DENSE_COUNTS_ENV).ok().as_deref()))
-}
-
-/// [`DENSE_COUNTS_ENV`]'s value: unset, empty or `1` on (the default); `0`
-/// off; anything else refused.
-pub fn parse_dense_counts(value: Option<&str>) -> bool {
-    match value {
-        None | Some("") | Some("1") => true,
-        Some("0") => false,
-        Some(other) => panic!("{DENSE_COUNTS_ENV} must be `0` or `1`, got `{other}`"),
-    }
-}
-
 /// Check 4's independent recount of every address's reads.
+///
+/// A prove recounts in a table indexed by address (`Dense`); the hash map
+/// (`Map`) stays as the tests' oracle. The same counts, so the same verdict
+/// and the same first violation; only the time differs. The map was ≈ 0.8 s
+/// of a 1.2 s node emission (laptop instrument `node_emit_timing_tests`), and
+/// on the box the dense recount took the median block's recursion down 0.27 s
+/// and the tree verify from 7.96 to 3.77 s.
 ///
 /// `Dense` holds one count per allocated address. Check 1 runs first and
 /// refuses any read or write outside `0..num_addrs`, so every read it counts is
@@ -261,7 +243,7 @@ impl ReadCounts {
 
 /// Check 4: every write's `mult` equals an independent recount of its reads.
 fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
-    check_multiplicities_with(program, dense_counts())
+    check_multiplicities_with(program, true)
 }
 
 /// [`check_multiplicities`] with the recount's form named.
@@ -709,8 +691,8 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
     c
 }
 
-/// [`validate`] with check 4's recount named rather than read from
-/// [`DENSE_COUNTS_ENV`], test-only.
+/// [`validate`] with check 4's recount named (a prove uses the dense one),
+/// test-only.
 #[cfg(test)]
 fn validate_with(program: &LfmProgram, dense: bool) -> Result<(), LfmViolation> {
     check_writes_and_reads(program)?;
@@ -814,14 +796,5 @@ mod dense_count_tests {
             );
             assert_eq!(validate_with(bad, true), map, "tamper {k}");
         }
-    }
-
-    #[test]
-    fn the_dense_counts_knob_is_on_by_default_and_zero_rolls_back() {
-        assert!(parse_dense_counts(None));
-        assert!(parse_dense_counts(Some("")));
-        assert!(parse_dense_counts(Some("1")));
-        assert!(!parse_dense_counts(Some("0")));
-        assert!(std::panic::catch_unwind(|| parse_dense_counts(Some("yes"))).is_err());
     }
 }
