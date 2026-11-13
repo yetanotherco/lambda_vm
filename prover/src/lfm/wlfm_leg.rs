@@ -417,7 +417,13 @@ pub fn emit_wlfm_leg(
         sum = b.eadd(sum, share);
     }
     let target = emit_public_balance(b, &publics, z, alpha);
-    b.assert_eq_ext(sum, target);
+    #[cfg(test)]
+    let closed = faults::get() != faults::Fault::SkipClosure;
+    #[cfg(not(test))]
+    let closed = true;
+    if closed {
+        b.assert_eq_ext(sum, target);
+    }
     b.set_arena_len(arena, at);
     Ok(LegCells {
         publics,
@@ -530,6 +536,9 @@ pub(crate) mod faults {
         /// Each group's opening reads its answers from a fresh hint, not the
         /// front's cells.
         FreshAnswerHint,
+        /// The closure's assert (the tables' shares against the words'
+        /// `LfmPublic` balance) left out.
+        SkipClosure,
     }
 
     std::thread_local! {
