@@ -69,8 +69,12 @@ def shiftResult (word signed direction x s : ℕ) : ℕ :=
   else sra64 x k
 
 /-- `opsel` of MIN: a toy operation for the counted-pulls PoC, not an RV64IM op. It has the shape
-of DIVREM: its chip pulls LT on this bus and pushes its own result on the same bus. -/
-def opselMIN : ℕ := 7
+of DIVREM: its chip pulls LT on this bus and pushes its own result on the same bus.
+
+The value is deliberately outside the prover's `alu_op` enum (`prover/src/tables/types.rs`, which
+ends at `MUL = 7`, `DIVREM = 8`), so the toy cannot collide with a real opsel once MUL and DIVREM
+are modelled on this bus. -/
+def opselMIN : ℕ := 9
 
 /-- What a puller learns. One clause per `opsel`, selected by the flag byte read as a natural.
 Each clause takes as hypotheses exactly the `[[assumptions]]` of its chip's spec: the words the

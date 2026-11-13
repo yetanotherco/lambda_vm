@@ -32,7 +32,7 @@ def main (r : Var MinToy.Row (F p)) : Circuit (F p) Unit := do
   assertZero (r.out0 - (r.lt * r.a0 + (1 - r.lt) * r.b0))
   assertZero (r.out1 - (r.lt * r.a1 + (1 - r.lt) * r.b1))
   -- ALU[a, b, opsel(MIN)] -> out, μ times
-  Alu.channel.emitUpTo muMax r.mu ⟨r.a0, r.a1, r.b0, r.b1, 7, r.out0, r.out1⟩
+  Alu.channel.emitUpTo muMax r.mu ⟨r.a0, r.a1, r.b0, r.b1, 9, r.out0, r.out1⟩
 
 /-- The honest prover's row: `μ` a byte, `lt` the comparison and `out` the selected operand. -/
 def Honest (r : MinToy.Row (F p)) : Prop :=
@@ -60,9 +60,9 @@ def circuit : GeneralFormalCircuit (F p) MinToy.Row unit where
       Channel.countUpTo_of_val h0 (by simp only [muMax]; omega)
     refine ⟨.inr hcount, fun _ => ?_⟩
     have h4 : (4 : F p).val = 4 := by simpa using MinToy.val_lit 4 (by norm_num)
-    have h7 : (7 : F p).val = 7 := by simpa using MinToy.val_lit 7 (by norm_num)
+    have h9 : (9 : F p).val = 9 := by simpa using MinToy.val_lit 9 (by norm_num)
     obtain ⟨hLT, -⟩ := h_pull hcount
-    rw [h7]
+    rw [h9]
     refine ⟨fun s i hs hi h => by simp only [opselLT] at h; omega,
       fun i hi h => by simp only [opselEQ] at h; omega,
       fun w s d hw hs hd h => by simp only [opselSHIFT] at h; omega,
@@ -153,7 +153,7 @@ lemma msg_eval_array {M : TypeMap} [ProvableType M] (env : Environment (F p))
 
 lemma isMinMsg_eval (env : Environment (F p)) (m : Alu.Msg (Expression (F p))) :
     isMinMsg (Array.map (fun x => Expression.eval env x) (toElements m).toArray) =
-      decide ((eval env m).flags = 7) := by
+      decide ((eval env m).flags = 9) := by
   rw [show (fun x => Expression.eval env x) = Expression.eval env from rfl, msg_eval_array,
     isMinMsg_toElements]
 
