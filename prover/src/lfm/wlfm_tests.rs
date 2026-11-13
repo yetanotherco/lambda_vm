@@ -21,21 +21,21 @@ use super::builder::{Cell, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
 use super::hash::HasherKind;
 use super::wlfm::{
-    WLFM_B4_QUERIES, WLFM_B16_STACK, WlfmBuild, WlfmHash, WlfmLevers, WlfmPrep, WlfmProof,
-    WlfmRate, absorb_wlfm_statement, build_wlfm, build_wlfm_on_host, build_wlfm_under,
+    WLFM_B4_QUERIES, WLFM_B16_STACK, WLFM_B64_STACK, WlfmBuild, WlfmHash, WlfmLevers, WlfmPrep,
+    WlfmProof, WlfmRate, absorb_wlfm_statement, build_wlfm, build_wlfm_on_host, build_wlfm_under,
     check_coverage, execute_and_fill_unmerged, prove_wlfm, prove_wlfm_traces, test_format,
-    verify_wlfm, verify_wlfm_with, wlfm_config,
+    verify_wlfm, verify_wlfm_with, wlfm_config, wlfm_config_under,
 };
 use super::word::LfmWord;
 
-const HASHER: HasherKind = HasherKind::Poseidon1W16;
+pub(super) const HASHER: HasherKind = HasherKind::Poseidon1W16;
 
 fn word(seed: u64) -> [FE; 4] {
     core::array::from_fn(|i| FE::from(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ i as u64))
 }
 
 /// The fixture's arena: four arbitrary words.
-fn arenas() -> Vec<Vec<LfmWord>> {
+pub(super) fn arenas() -> Vec<Vec<LfmWord>> {
     vec![(0..4u64).map(|i| word(1_000 + i)).collect()]
 }
 
@@ -70,7 +70,7 @@ fn program(y: u64) -> LfmProgram {
     compile(b.finish())
 }
 
-fn honest() -> LfmProgram {
+pub(super) fn honest() -> LfmProgram {
     program(9)
 }
 
@@ -78,7 +78,7 @@ fn forged() -> LfmProgram {
     program(10)
 }
 
-fn build(program: &LfmProgram, rate: WlfmRate) -> WlfmBuild {
+pub(super) fn build(program: &LfmProgram, rate: WlfmRate) -> WlfmBuild {
     build_wlfm(program, HASHER, rate).unwrap_or_else(|e| panic!("the W-LFM build: {e}"))
 }
 
@@ -99,7 +99,7 @@ fn proof_bytes(proof: &WlfmProof) -> usize {
         .len()
 }
 
-fn prove(program: &LfmProgram, build: &WlfmBuild) -> WlfmProof {
+pub(super) fn prove(program: &LfmProgram, build: &WlfmBuild) -> WlfmProof {
     prove_wlfm(program, build, &arenas()).unwrap_or_else(|e| panic!("the W-LFM prove: {e}"))
 }
 
@@ -183,6 +183,78 @@ fn the_blowup_16_arm_round_trips_and_is_another_identity() {
     assert!(
         verify_wlfm(&two.artifacts, &proof, &proof.public_words).is_err(),
         "a blowup-16 proof is refused at blowup 2"
+    );
+}
+
+/// The blowup-64 arm (the second compression step's rate) under the 2^24
+/// stack, and its query-grind lever: `None` is the format's grind and today's
+/// config at every rate; a set grind moves the query count by the production
+/// rule. At a 2^23 stack (six rounds under first6 + 4s, charged log2 6):
+/// grind 18 runs Q 39, 22 runs 37, 26 runs 36, each ≥ 128 + log2 6 bits at
+/// the Johnson bound.
+#[test]
+fn the_blowup_64_arm_and_its_grind_follow_the_production_rule() {
+    use multilinear::whir_chain::FinalPoly;
+    let shapes = [(1usize, 23usize)];
+    let at = |grind| wlfm_config_under(WlfmRate::SixtyFour, FinalPoly::Off, None, grind, &shapes);
+    let today = at(None);
+    assert_eq!(today.log_blowup, 6);
+    assert_eq!(today.format.stack.get(), WLFM_B64_STACK);
+    assert_eq!(
+        today.grind.query,
+        crate::zf_format::PRODUCTION_WHIR_GRIND_BITS
+    );
+    assert_eq!(
+        today,
+        at(Some(crate::zf_format::PRODUCTION_WHIR_GRIND_BITS))
+    );
+    let johnson = -(0.125f64 + 1.0 / 300.0).log2();
+    for (grind, q) in [(18u8, 39usize), (22, 37), (26, 36)] {
+        let c = at(Some(grind));
+        assert_eq!(c.grind.query, grind);
+        assert_eq!(c.num_queries, q, "grind {grind}");
+        let bits = q as f64 * johnson + f64::from(grind);
+        assert!(bits >= 128.0 + 6f64.log2(), "grind {grind}: {bits}");
+        assert!((q - 1) as f64 * johnson + f64::from(grind) < 128.0 + 6f64.log2());
+    }
+    for rate in [
+        WlfmRate::Two,
+        WlfmRate::Four,
+        WlfmRate::Sixteen,
+        WlfmRate::SixtyFour,
+    ] {
+        assert_eq!(
+            wlfm_config(rate, &shapes),
+            wlfm_config_under(rate, FinalPoly::Off, None, None, &shapes)
+        );
+    }
+}
+
+/// The blowup-64 arm round-trips under the second step's levers (evaluated
+/// columns, the byte-minimising schedule) with its grind set, and the grind
+/// is part of the identity: a proof at one grind is refused by the other's
+/// artifacts.
+#[test]
+fn the_blowup_64_arm_round_trips_and_its_grind_is_another_identity() {
+    let _unground = test_format::set(None);
+    let program = honest();
+    let levers = |grind| WlfmLevers {
+        grind,
+        ..super::compress::folds_levers(WlfmPrep::Evaluated)
+    };
+    let g22 = under(&program, WlfmRate::SixtyFour, levers(Some(22)));
+    let g26 = under(&program, WlfmRate::SixtyFour, levers(Some(26)));
+    assert_eq!(g22.artifacts.config.log_blowup, 6);
+    assert_ne!(g22.artifacts.program_id, g26.artifacts.program_id);
+    let proof = prove(&program, &g22);
+    verify_wlfm(&g22.artifacts, &proof, &proof.public_words)
+        .unwrap_or_else(|e| panic!("the blowup-64 proof must verify: {e}"));
+    assert!(verify_wlfm(&g26.artifacts, &proof, &proof.public_words).is_err());
+    let mut restated = g22.artifacts.clone();
+    restated.grind = None;
+    assert!(
+        verify_wlfm(&restated, &proof, &proof.public_words).is_err(),
+        "artifacts restating the config without its grind"
     );
 }
 
@@ -583,7 +655,7 @@ fn the_evaluated_rule_refuses_a_short_resized_changed_or_mixed_binding() {
 // The final polynomial (the chains stop committing once few variables remain)
 // =============================================================================
 
-fn under(program: &LfmProgram, rate: WlfmRate, levers: WlfmLevers) -> WlfmBuild {
+pub(super) fn under(program: &LfmProgram, rate: WlfmRate, levers: WlfmLevers) -> WlfmBuild {
     build_wlfm_under(program, HASHER, rate, levers, false)
         .unwrap_or_else(|e| panic!("the W-LFM build under {levers:?}: {e}"))
 }
@@ -593,6 +665,7 @@ fn final_levers(prep: WlfmPrep) -> WlfmLevers {
         prep,
         final_poly: multilinear::whir_chain::FinalPoly::Vars(6),
         fold: None,
+        grind: None,
     }
 }
 
@@ -738,6 +811,7 @@ fn the_compact_encoding_round_trips_every_wlfm_proof_and_is_smaller() {
                         prep,
                         final_poly,
                         fold: None,
+                        grind: None,
                     },
                 );
                 let proof = prove(&program, &build);
@@ -856,6 +930,7 @@ fn the_dedup_encoding_round_trips_every_wlfm_proof() {
                     prep,
                     final_poly: FinalPoly::Vars(6),
                     fold: None,
+                    grind: None,
                 },
                 super::compress::folds_levers(prep),
             ] {

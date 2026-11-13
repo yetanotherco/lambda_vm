@@ -186,6 +186,7 @@ pub const fn folds_levers(prep: WlfmPrep) -> WlfmLevers {
         prep,
         final_poly: FinalPoly::Vars(COMPRESS_FOLDS_FINAL_VARS),
         fold: Some(COMPRESS_FOLDS_FOLD),
+        grind: None,
     }
 }
 
@@ -225,6 +226,7 @@ pub fn compress_levers_from_env(compress: Option<WlfmRate>) -> Result<WlfmLevers
             prep,
             final_poly,
             fold: None,
+            grind: None,
         }
     };
     if compress.is_none() && levers != WlfmLevers::DEFAULT {

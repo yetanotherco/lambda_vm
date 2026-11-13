@@ -3361,6 +3361,7 @@ pub fn verify_whir_block_compressed_compact_proof(
             prep: super::compress::COMPRESS_PREP,
             final_poly: super::compress::COMPRESS_FINAL,
             fold: None,
+            grind: None,
         },
     )
 }
@@ -3378,6 +3379,7 @@ pub fn verify_whir_block_compressed_compact_evaluated_proof(
             prep: super::wlfm::WlfmPrep::Evaluated,
             final_poly: super::compress::COMPRESS_FINAL,
             fold: None,
+            grind: None,
         },
     )
 }
@@ -3397,6 +3399,7 @@ pub fn verify_whir_block_compressed_compact_final_proof(
                 super::compress::COMPRESS_FINAL_VARS,
             ),
             fold: None,
+            grind: None,
         },
     )
 }
@@ -3416,6 +3419,7 @@ pub fn verify_whir_block_compressed_compact_evaluated_final_proof(
                 super::compress::COMPRESS_FINAL_VARS,
             ),
             fold: None,
+            grind: None,
         },
     )
 }
@@ -3453,6 +3457,7 @@ pub fn verify_whir_block_compressed_proof(
             prep: super::compress::COMPRESS_PREP,
             final_poly: super::compress::COMPRESS_FINAL,
             fold: None,
+            grind: None,
         },
         &proof.compressed,
     )
@@ -3480,6 +3485,7 @@ pub fn verify_whir_block_compressed_evaluated_proof(
             prep: super::wlfm::WlfmPrep::Evaluated,
             final_poly: super::compress::COMPRESS_FINAL,
             fold: None,
+            grind: None,
         },
         &proof.compressed,
     )
@@ -3507,6 +3513,7 @@ pub fn verify_whir_block_compressed_final_proof(
                 super::compress::COMPRESS_FINAL_VARS,
             ),
             fold: None,
+            grind: None,
         },
         &proof.compressed,
     )
@@ -3531,6 +3538,7 @@ pub fn verify_whir_block_compressed_evaluated_final_proof(
                 super::compress::COMPRESS_FINAL_VARS,
             ),
             fold: None,
+            grind: None,
         },
         &proof.compressed,
     )
@@ -3973,6 +3981,7 @@ mod tests {
                     prep: WlfmPrep::Stacked,
                     final_poly: six,
                     fold: None,
+                    grind: None,
                 },
                 PIPELINE_WHIR_COMPRESSED_FINAL,
                 verify_whir_block_compressed_final_proof,
@@ -3982,6 +3991,7 @@ mod tests {
                     prep: WlfmPrep::Evaluated,
                     final_poly: six,
                     fold: None,
+                    grind: None,
                 },
                 PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL,
                 verify_whir_block_compressed_evaluated_final_proof,
@@ -4035,6 +4045,7 @@ mod tests {
                     prep: WlfmPrep::Stacked,
                     final_poly: six,
                     fold: None,
+                    grind: None,
                 },
                 PIPELINE_WHIR_COMPRESSED_COMPACT_FINAL,
                 verify_whir_block_compressed_compact_final_proof,
@@ -4044,6 +4055,7 @@ mod tests {
                     prep: WlfmPrep::Evaluated,
                     final_poly: six,
                     fold: None,
+                    grind: None,
                 },
                 PIPELINE_WHIR_COMPRESSED_COMPACT_EVALUATED_FINAL,
                 verify_whir_block_compressed_compact_evaluated_final_proof,
@@ -4095,6 +4107,7 @@ mod tests {
                     prep: WlfmPrep::Stacked,
                     final_poly: six,
                     fold: None,
+                    grind: None,
                 }),
                 PIPELINE_WHIR_COMPRESSED_DEDUP_FINAL,
             ),
@@ -4103,6 +4116,7 @@ mod tests {
                     prep: WlfmPrep::Evaluated,
                     final_poly: six,
                     fold: None,
+                    grind: None,
                 }),
                 PIPELINE_WHIR_COMPRESSED_DEDUP_EVALUATED_FINAL,
             ),
@@ -4190,6 +4204,7 @@ mod tests {
                 prep: WlfmPrep::Stacked,
                 final_poly: FinalPoly::Vars(4),
                 fold: None,
+                grind: None,
             })
             .is_err()
         );
