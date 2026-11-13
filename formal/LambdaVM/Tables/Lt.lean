@@ -153,8 +153,10 @@ lemma res_constraint {lt invert res : F p} {ltv iv : ℕ}
   rcases (by omega : ltv = 0 ∨ ltv = 1) with rfl | rfl <;>
   rcases (by omega : iv = 0 ∨ iv = 1) with rfl | rfl <;> norm_num
 
-/-- The honest prover's row, as `generate_lt_trace` fills it when no operation repeats
-(`μ ∈ {0, 1}`); a deduplicated row with `μ ≥ 2` is outside this model (see README). -/
+/-- The honest prover's row, as `generate_lt_trace` fills it, for any byte multiplicity
+`μ ∈ [0, 255]`: a deduplicated row answering the same query several times is inside this
+model, and so is the padding row. This is completeness of the row circuit; the Rust
+generator that fills the trace is not formalized. -/
 def Honest (r : Row (F p)) : Prop :=
   r.mu.val < 2^8 ∧ IsBool r.signed ∧ IsBool r.invert ∧
   r.lhs0.val < 2^32 ∧ r.lhs1.val < 2^16 ∧ r.lhs2.val < 2^16 ∧
