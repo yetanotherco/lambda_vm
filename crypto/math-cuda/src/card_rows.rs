@@ -1022,7 +1022,9 @@ struct WordsPlan {
 /// [`WordsPlan`] of a table's `words` (pieces in order) against the CPU
 /// tables `held` (first cycle, count; ascending): the cycles not held form
 /// index ranges, found by binary search (a table's words are in cycle order),
-/// and decoded with `decode`.
+/// and decoded with `decode`. `None` (the table goes up as its decoded rows,
+/// today's fill) when no row's cycle is held: the card then holds no log the
+/// kernel could read, and a launch with no logs would decline the group.
 fn plan_words(
     words: &[&[u64]],
     whole: &[&[RegRowC]],
@@ -1100,6 +1102,9 @@ fn plan_words(
         if s < e {
             ranges.push((s, e));
         }
+    }
+    if ranges.iter().map(|&(s, e)| e - s).sum::<usize>() == n {
+        return None;
     }
     let mut extra = Vec::new();
     let mut markers_decoded = 0usize;
@@ -2013,6 +2018,46 @@ mod tests {
     }
 
     /// The rule, row by row: CPU tables of 8 cycles, an ECALL at cycle 10.
+    /// A row `(cycle, slot)`'s word, its old timestamp the slot before.
+    fn word(cycle: u64, slot: u64) -> u64 {
+        let ts = 4 * cycle + 4 + slot;
+        ts | (ts - 1) << 32
+    }
+
+    /// The words' plan: the rows of cycles no held CPU table covers are
+    /// decoded and sent whole, found by binary search over pieces; a table
+    /// none of whose cycles is held is not planned (it goes up as its decoded
+    /// rows), so no launch is made without logs.
+    #[test]
+    fn a_words_tables_unheld_rows_are_decoded_and_a_table_with_none_held_is_not_planned() {
+        // Cycles 0..20, two rows a cycle, one marker (run index 9) at cycle 5.
+        let mut words: Vec<u64> = (0..20).flat_map(|c| [word(c, 0), word(c, 1)]).collect();
+        words[10] = 9 << 32;
+        let whole = [RegRowC {
+            timestamp: 4 * 5 + 4,
+            ..RegRowC::default()
+        }];
+        let decoded = std::sync::Mutex::new(Vec::new());
+        let decode = |from: usize, to: usize| {
+            decoded.lock().expect("the calls").push((from, to));
+            vec![RegRowC::default(); to - from]
+        };
+        let (a, b) = words.split_at(7);
+        let plan = plan_words(&[a, b], &[&whole], 9, &[(8, 4)], &decode).expect("planned");
+        // Cycles 0..8 and 12..20 unheld: rows 0..16 and 24..40.
+        assert_eq!(plan.ranges, vec![(0, 16), (24, 40)]);
+        assert_eq!(plan.extra.len(), 32);
+        assert_eq!(plan.markers_decoded, 1);
+        assert_eq!((plan.n, plan.n_whole, plan.span), (40, 1, (0, 19)));
+        assert_eq!(*decoded.lock().expect("the calls"), vec![(0, 16), (24, 40)]);
+        // Every cycle held: nothing decoded.
+        let all = plan_words(&[&words], &[&whole], 9, &[(0, 32)], &decode).expect("planned");
+        assert!(all.ranges.is_empty() && all.extra.is_empty());
+        // No cycle held (a group before any CPU table's logs): not planned.
+        assert!(plan_words(&[&words], &[&whole], 9, &[(40, 8)], &decode).is_none());
+        assert!(plan_words(&[&words], &[&whole], 9, &[], &decode).is_none());
+    }
+
     /// Every plan that builds a table from the logs launches the kernels (a
     /// MEMW_R table built from words alone in its group included), and no
     /// other plan does.
