@@ -102,6 +102,9 @@ pub mod wire;
 /// The block tree's LFM programs proved by the block's own WHIR prover.
 #[cfg(feature = "parallel")]
 pub mod wlfm;
+/// The in-guest verifier of one W-LFM proof (the second compression step's leg).
+#[cfg(feature = "parallel")]
+pub mod wlfm_leg;
 pub mod word;
 
 pub use airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
@@ -242,6 +245,8 @@ mod whir_table_tests;
 mod whir_transcript_kat_tests;
 #[cfg(test)]
 mod whir_transcript_replay_tests;
+#[cfg(all(test, feature = "parallel"))]
+mod wlfm_leg_tests;
 #[cfg(all(test, feature = "parallel"))]
 mod wlfm_tests;
 // ★ Test-only: the dependency-structure measurement that prices a parallel

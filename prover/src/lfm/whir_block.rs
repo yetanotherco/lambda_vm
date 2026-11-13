@@ -1407,7 +1407,7 @@ impl WhirBlockPlan {
 /// The round-0 trees a run of polynomials (`run`) is committed under, as a
 /// range of the stack's `trees` (`stacked_eval::round0_trees`): one a
 /// polynomial, or a joint run's one.
-fn run_trees(
+pub(crate) fn run_trees(
     trees: &[std::ops::Range<usize>],
     run: &std::ops::Range<usize>,
 ) -> std::ops::Range<usize> {
@@ -1839,8 +1839,8 @@ fn verify_top_of(
 // ================================ the leaf ================================
 
 /// Some tables' layouts and buses, owned, for [`TableShape`]s to borrow.
-struct Shapes<'a> {
-    layouts: Vec<TableLayout<'a, GoldilocksField, GoldilocksExtension>>,
+pub(crate) struct Shapes<'a> {
+    pub(crate) layouts: Vec<TableLayout<'a, GoldilocksField, GoldilocksExtension>>,
     buses: Vec<Vec<InteractionShape<GoldilocksExtension>>>,
 }
 
@@ -1852,7 +1852,7 @@ type DynAir<'a> = dyn stark::traits::AIR<
 
 impl<'a> Shapes<'a> {
     /// The layouts of `tables` (AIR indices) at their stated shapes.
-    fn build(
+    pub(crate) fn build(
         refs: &[&'a DynAir<'a>],
         shapes: &[(usize, usize)],
         tables: &[usize],
@@ -1885,7 +1885,7 @@ impl<'a> Shapes<'a> {
         Ok(Self { layouts, buses })
     }
 
-    fn table_shapes(&self) -> Vec<TableShape<'_>> {
+    pub(crate) fn table_shapes(&self) -> Vec<TableShape<'_>> {
         self.layouts
             .iter()
             .zip(&self.buses)
@@ -1902,7 +1902,10 @@ impl<'a> Shapes<'a> {
     /// The batched argue's plan over these tables, the host's own
     /// [`stark::multilinear_table::argue_plan`] at the format's cap: the bins
     /// are part of the transcript, so the leaf never restates them.
-    fn argue_plan(&self, planning: BatchedPlanning) -> stark::multilinear_table::ArguePlan {
+    pub(crate) fn argue_plan(
+        &self,
+        planning: BatchedPlanning,
+    ) -> stark::multilinear_table::ArguePlan {
         let shapes: Vec<stark::multilinear_table::ArgueShape> = self
             .layouts
             .iter()
@@ -1914,7 +1917,7 @@ impl<'a> Shapes<'a> {
 
 /// The batched argue's planning constants when the block's format batches its
 /// groups: its bin cap and its GKR packing, both the format's.
-fn batched_cap(
+pub(crate) fn batched_cap(
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<Option<BatchedPlanning>, String> {
     use multilinear::whir_chain::ArgueFormat;
@@ -1934,7 +1937,7 @@ fn batched_cap(
 /// how a table's interactions are laid into trees (the host's
 /// `argue_plan_packed`, called, never restated).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BatchedPlanning {
+pub(crate) struct BatchedPlanning {
     bin_log_cells: u8,
     pack: multilinear::whir_chain::GkrPack,
 }
@@ -2699,7 +2702,7 @@ pub fn group_arena_words(
 
 /// One opening's chains: per chain (a run of [`ChainShape::chains`]) its final
 /// value, then its rounds at the run's shape.
-fn push_chains(
+pub(crate) fn push_chains(
     words: &mut Vec<LfmWord>,
     opening: &multilinear::stacked_eval::StackedProof<GoldilocksField, GoldilocksExtension>,
     polys: usize,
