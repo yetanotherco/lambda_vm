@@ -15,6 +15,7 @@ lambda-vm-prover lfm::algebraic_transcript::tests::the_machine_regroups_bytes_ex
 lambda-vm-prover tests::block_whir_tests::split_keccak_and_ecsm_calls_are_keyed_on_the_bus  # 832 s
 lambda-vm-prover lfm::algebraic_commit::tests::the_emitted_leaf_and_parent_equal_the_host_backend  # 822 s
 lambda-vm-prover tests::block_whir_tests::live_regeneration_proves_the_same_bytes  # 769 s
+lambda-vm-prover tests::block_whir_tests::a_block_proves_at_the_hosts_memory_target  # not timed: two proves of live_regeneration_proves_the_same_bytes's block
 lambda-vm-prover tests::block_whir_tests::the_rest_in_waves_and_the_finish_packed_move_no_byte  # 717 s
 lambda-vm-prover tests::block_whir_tests::the_shadow_regenerates_every_streamed_chunk_and_moves_no_byte  # 640 s
 lambda-vm-prover tests::block_whir_tests::gpack_moves_no_byte  # 629 s
