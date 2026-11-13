@@ -227,12 +227,29 @@ pub fn build_artifacts_counted_under<S: stark::config::StarkHash>(
     // side by side on the host BEFORE the card is taken: a copy of the parts'
     // groups, which has no business inside the hold. Nothing without a merge.
     let plan = super::registry::merge_plan_for(program, options);
-    let merged = super::merge::merged_groups(program, &plan);
+    // `LAMBDA_VM_LFM_PREP_PINNED` ([`super::prep_pinned`]): a leaf's groups may
+    // have been laid out and page-locked beside the base. The merged groups are
+    // used only when laid out under this very plan; otherwise they are laid
+    // out here, as without the knob. `None` at once when the knob is off.
+    let prepared = super::prep_pinned::take(program);
+    let ready = prepared.as_ref().and_then(|p| p.merged_for(&plan));
+    if let Some(p) = prepared.as_ref() {
+        super::prep_pinned::note_use(ready.is_some(), p.has_merged());
+    }
+    let fresh = match ready {
+        Some(_) => None,
+        None => Some(super::merge::merged_groups(program, &plan)),
+    };
+    let merged: &[super::compiler::ColumnGroup] = match (ready, fresh.as_deref()) {
+        (Some(m), _) | (None, Some(m)) => m,
+        (None, None) => &[],
+    };
     let artifacts = {
         let _card = super::device_permit::hold_labeled("build_artifacts");
-        super::registry::build_artifacts_merged_under::<S>(program, options, hasher, &plan, &merged)
+        super::registry::build_artifacts_merged_under::<S>(program, options, hasher, &plan, merged)
     };
-    drop(merged);
+    drop(fresh);
+    super::prep_pinned::release(prepared);
     let build_nanos = t.elapsed().as_nanos();
     lock().record(artifacts.program_id, build_nanos);
     artifacts
