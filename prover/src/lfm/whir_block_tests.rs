@@ -4844,6 +4844,39 @@ fn compressed2_block_case(grind: u8) {
     let a2 = &c2b.build.artifacts;
     assert_eq!(a2.config.log_blowup, 6);
     assert_eq!(a2.config.grind.query, grind);
+    // C1's and C2's programs by chip and their stacked main cells: what decides
+    // each one's stack height (and so its codeword), read off the clock.
+    for (name, program, a) in [
+        ("C1", &c.program, &c.build.artifacts),
+        ("C2", &c2b.program, a2),
+    ] {
+        let airs = a.airs();
+        let shapes = a.shapes(&airs);
+        let tables: Vec<String> = airs
+            .air_refs()
+            .iter()
+            .zip(&shapes)
+            .map(|(air, &(width, num_vars))| format!("{} {width}x2^{num_vars}", air.name()))
+            .collect();
+        let cells: usize = shapes
+            .iter()
+            .map(|&(width, num_vars)| width << num_vars)
+            .sum();
+        let (layouts, _) = crate::multilinear_prove::stacks(&shapes, &a.sizes, &a.config)
+            .expect("the artifacts' stacks");
+        let stacks: Vec<String> = layouts
+            .iter()
+            .map(|l| format!("{}x2^{}", l.num_polys(), l.n_stack()))
+            .collect();
+        println!(
+            "{name} ROWS: {:?} · tables {} · main cells {cells} (2^{:.3}) · stacks {} · blowup {}",
+            super::whir_chain::ChipRows::of(program),
+            tables.join(", "),
+            (cells as f64).log2(),
+            stacks.join(" "),
+            a.rate.factor()
+        );
+    }
     let t = std::time::Instant::now();
     let c2 = prove_compress2(&c2b, &c.build.artifacts, layout, &c1).expect("C2 proves over C1");
     let prove_secs = t.elapsed().as_secs_f64();
