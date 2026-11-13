@@ -28,6 +28,7 @@ fn one_group() -> BlockFormat {
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
     }
 }
 
@@ -46,6 +47,7 @@ fn many_groups() -> BlockFormat {
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
     }
 }
 
@@ -3300,6 +3302,7 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
         &counts,
         &inputs,
         crate::tables::keccak_rnd::KeccakRndForm::Full,
+        crate::tables::memw_aligned::MemwAlignedOrder::Lt,
     );
     let (fractions, len) = airs
         .air_refs()

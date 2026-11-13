@@ -111,7 +111,8 @@ static_assert(offsetof(KeccakOpInC, input) == 8, "KeccakOpInC field order");
 // One MEMW_A row (`memw_aligned.rs`, `AlignedRow`): the access's base address,
 // timestamp and shared old timestamp, its value and old value packed in a
 // word each (eight bytes for a memory access, the two 32-bit halves for a
-// register access), its width, and flags 0 or 1.
+// register access), its width, and flags 0 or 1 (`limbs`: the row's columns
+// 25 and 26 are the step's 16-bit limbs, not the old timestamp).
 struct AlignedRowC {
     uint64_t base_address;
     uint64_t timestamp;
@@ -121,10 +122,12 @@ struct AlignedRowC {
     uint8_t width;
     uint8_t is_read;
     uint8_t is_register;
+    uint8_t limbs;
 };
 static_assert(sizeof(AlignedRowC) == 48, "AlignedRowC is 48 bytes");
 static_assert(offsetof(AlignedRowC, width) == 40, "AlignedRowC field order");
 static_assert(offsetof(AlignedRowC, is_register) == 42, "AlignedRowC field order");
+static_assert(offsetof(AlignedRowC, limbs) == 43, "AlignedRowC field order");
 
 // One LOAD op (`load.rs`, `LoadOperation`): the base address, the timestamp,
 // the width, whether it sign-extends (0 or 1) and the result's eight bytes.
@@ -277,6 +280,8 @@ constexpr uint32_t WRITE4 = 15;
 constexpr uint32_t WRITE8 = 16;
 constexpr uint32_t OLD = 17;  // 8 columns
 constexpr uint32_t OLD_TIMESTAMP_0 = 25;
+constexpr uint32_t STEP_0 = 25;  // the limbs' form: the step's limbs in 25 and 26
+constexpr uint32_t STEP_1 = 26;
 constexpr uint32_t MU_READ = 27;
 constexpr uint32_t MU_WRITE = 28;
 constexpr uint32_t NUM_COLUMNS = 29;
@@ -322,7 +327,15 @@ extern "C" __global__ void fill_memw_a(const AlignedRowC *rows, uint64_t n, uint
     w.word(c::WRITE4, r.width == 4);
     w.word(c::WRITE8, r.width == 8);
     fill::aligned_elements(w, c::OLD, r.old, is_register);
-    w.dword_wl(c::OLD_TIMESTAMP_0, r.old_timestamp);
+    if (r.limbs != 0) {
+        // `step_limbs`: timestamp − old_timestamp − 1 = d0 + 2^16·d1. The walk's
+        // routing gave this row a step in 1..2^32 on one high word.
+        const uint64_t d = r.timestamp - r.old_timestamp - 1;
+        w.word(c::STEP_0, d & 0xFFFFull);
+        w.word(c::STEP_1, (d >> 16) & 0xFFFFull);
+    } else {
+        w.dword_wl(c::OLD_TIMESTAMP_0, r.old_timestamp);
+    }
     w.word(c::MU_READ, r.is_read != 0);
     w.word(c::MU_WRITE, r.is_read == 0);
 }

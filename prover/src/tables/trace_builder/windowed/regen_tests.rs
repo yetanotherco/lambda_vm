@@ -82,7 +82,11 @@ fn the_regeneration_walk_is_the_walk_on_its_streamed_lists() {
                     .expect("the CPU ops");
                 cycles += part.len();
                 let [(full_mem, full_reg), (lite_mem, lite_reg)] = &mut states;
-                let mut full = WalkOutputs::for_walk(cpu_ops.len(), false);
+                let mut full = WalkOutputs::for_walk(
+                    cpu_ops.len(),
+                    false,
+                    crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+                );
                 collect_ops_from_cpu_into(
                     &cpu_ops,
                     &artifacts.decode,
@@ -92,7 +96,11 @@ fn the_regeneration_walk_is_the_walk_on_its_streamed_lists() {
                     false,
                 )
                 .expect("the walk");
-                let mut lite = WalkOutputs::for_walk(cpu_ops.len(), false);
+                let mut lite = WalkOutputs::for_walk(
+                    cpu_ops.len(),
+                    false,
+                    crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+                );
                 collect_streamed_ops_from_cpu_into(
                     &cpu_ops,
                     &artifacts.decode,

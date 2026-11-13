@@ -103,6 +103,7 @@ pub mod lt_bus_tests;
 pub mod lt_multiplicity_poc;
 #[cfg(test)]
 pub mod lt_tests;
+pub mod memw_aligned_limbs_tests;
 #[cfg(test)]
 pub mod memw_aligned_tests;
 #[cfg(test)]

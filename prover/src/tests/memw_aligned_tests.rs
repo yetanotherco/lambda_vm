@@ -13,7 +13,10 @@ fn test_memw_aligned_trace_generation() {
             .with_old([0; 8], [100; 8]),
     ];
 
-    let rows: Vec<AlignedRow> = ops.iter().map(AlignedRow::from_memw).collect();
+    let rows: Vec<AlignedRow> = ops
+        .iter()
+        .map(|op| AlignedRow::from_memw(op, MemwAlignedOrder::Lt))
+        .collect();
     let trace = generate_memw_aligned_trace(&rows);
     assert_eq!(trace.num_cols(), cols::NUM_COLUMNS);
     assert!(trace.num_rows() >= 2);
@@ -68,8 +71,19 @@ fn an_aligned_row_keeps_its_ops_elements() {
                 .with_old(old, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
         );
     }
-    for op in &ops {
-        let row = AlignedRow::from_memw(op);
+    for (op, order) in ops
+        .iter()
+        .flat_map(|op| [(op, MemwAlignedOrder::Lt), (op, MemwAlignedOrder::Limbs)])
+        .filter(|(op, order)| {
+            *order == MemwAlignedOrder::Lt || step_fits_limbs(op.old_timestamp[0], op.timestamp)
+        })
+    {
+        let row = AlignedRow::from_memw(op, order);
+        assert_eq!(row.limbs(), order == MemwAlignedOrder::Limbs);
+        assert_eq!(
+            row.lt_pair(),
+            (order == MemwAlignedOrder::Lt).then_some((op.old_timestamp[0], op.timestamp))
+        );
         assert_eq!(row.value(), op.value, "{op:?}");
         assert_eq!(row.old(), op.old, "{op:?}");
         assert_eq!(row.old_timestamp(), op.old_timestamp[0]);

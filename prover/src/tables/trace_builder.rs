@@ -62,7 +62,7 @@ use super::load::{self, LoadOperation};
 use super::local_to_global;
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
-use super::memw_aligned;
+use super::memw_aligned::{self, MemwAlignedOrder};
 use super::memw_register::{self, RegRow};
 use super::mul::{self, MulOperation};
 use super::page::{self, PageConfig};
@@ -1682,12 +1682,19 @@ enum MemwRoute {
 }
 
 /// The single classification used everywhere a `MemwOperation` is routed to a
-/// table, so the routing cannot drift between them.
+/// table, so the routing cannot drift between them. Under
+/// [`MemwAlignedOrder::Limbs`] an aligned access goes to MEMW_A only when its
+/// step is two 16-bit limbs on one high word
+/// ([`memw_aligned::step_fits_limbs`]); any other goes to MEMW, which keeps the
+/// full comparison.
 #[inline]
-fn classify_memw(op: &MemwOperation) -> MemwRoute {
+fn classify_memw(op: &MemwOperation, order: MemwAlignedOrder) -> MemwRoute {
     if is_register_op(op) {
         MemwRoute::Register
-    } else if is_aligned_op(op) {
+    } else if is_aligned_op(op)
+        && (order == MemwAlignedOrder::Lt
+            || memw_aligned::step_fits_limbs(op.old_timestamp[0], op.timestamp))
+    {
         MemwRoute::Aligned
     } else {
         MemwRoute::General
@@ -1716,15 +1723,20 @@ struct MemwBuckets {
     /// Words mode (`LAMBDA_VM_CARD_ROWS=words`): the register rows as words
     /// and whole rows instead of `register_rows`, which then stays empty.
     words: Option<Box<register_words::WordState>>,
+    /// The run's MEMW_A form: what [`classify_memw`] routes by and how each
+    /// aligned row is laid out (the block format's; the per-table STARK's
+    /// [`MemwAlignedOrder::Lt`] by default).
+    order: MemwAlignedOrder,
 }
 
 impl MemwBuckets {
-    fn with_register_capacity(n: usize) -> Self {
+    fn with_register_capacity(n: usize, order: MemwAlignedOrder) -> Self {
         Self {
             register_rows: Vec::with_capacity(n),
             aligned: Vec::new(),
             general: Vec::new(),
             words: None,
+            order,
         }
     }
 
@@ -1747,12 +1759,14 @@ impl MemwBuckets {
 
     #[inline]
     fn push(&mut self, op: MemwOperation) {
-        match classify_memw(&op) {
+        match classify_memw(&op, self.order) {
             MemwRoute::Register => match self.words.as_deref_mut() {
                 Some(words) => words.push(RegRow::from_memw(&op)),
                 None => self.register_rows.push(RegRow::from_memw(&op)),
             },
-            MemwRoute::Aligned => self.aligned.push(memw_aligned::AlignedRow::from_memw(&op)),
+            MemwRoute::Aligned => self
+                .aligned
+                .push(memw_aligned::AlignedRow::from_memw(&op, self.order)),
             MemwRoute::General => self.general.push(op),
         }
     }
@@ -1893,7 +1907,8 @@ fn collect_ops_from_cpu(
     ),
     Error,
 > {
-    let mut out = WalkOutputs::with_capacity(cpu_ops.len());
+    // The per-table STARK's and the whole-run build's MEMW_A form.
+    let mut out = WalkOutputs::with_capacity(cpu_ops.len(), MemwAlignedOrder::Lt);
     collect_ops_from_cpu_into(
         cpu_ops,
         decode,
@@ -1958,16 +1973,17 @@ pub(crate) struct WalkOutputs {
 }
 
 impl WalkOutputs {
-    /// Sized for a walk over `cpu_ops` CPU ops, as the one-call walk sizes it.
-    fn with_capacity(cpu_ops: usize) -> Self {
-        Self::for_walk(cpu_ops, true)
+    /// Sized for a walk over `cpu_ops` CPU ops, as the one-call walk sizes it,
+    /// its MEMW_A rows in `order`.
+    fn with_capacity(cpu_ops: usize, order: MemwAlignedOrder) -> Self {
+        Self::for_walk(cpu_ops, true, order)
     }
 
     /// [`Self::with_capacity`], with no room for the in-walk lookups when the
     /// walk leaves them out (`lookups` false, see [`collect_ops_from_cpu_into`]).
-    fn for_walk(cpu_ops: usize, lookups: bool) -> Self {
+    fn for_walk(cpu_ops: usize, lookups: bool, order: MemwAlignedOrder) -> Self {
         Self {
-            memw: MemwBuckets::with_register_capacity(cpu_ops * 3),
+            memw: MemwBuckets::with_register_capacity(cpu_ops * 3, order),
             load_ops: Vec::with_capacity(cpu_ops / 8 + 1),
             lt_ops: Vec::with_capacity(cpu_ops / 10 + 1),
             shift_ops: Vec::with_capacity(cpu_ops / 10 + 1),
@@ -1987,8 +2003,13 @@ impl WalkOutputs {
     /// [`Self::for_walk`] with the streamed lists sized from an earlier walk's
     /// lengths per cycle (`sizes`, an eighth over), so a window's lists are
     /// allocated once instead of grown from empty or from a fixed guess.
-    pub(crate) fn for_walk_sized(cpu_ops: usize, lookups: bool, sizes: &WalkSizes) -> Self {
-        let mut out = Self::for_walk(cpu_ops, lookups);
+    pub(crate) fn for_walk_sized(
+        cpu_ops: usize,
+        lookups: bool,
+        sizes: &WalkSizes,
+        order: MemwAlignedOrder,
+    ) -> Self {
+        let mut out = Self::for_walk(cpu_ops, lookups, order);
         if sizes.cycles == 0 {
             return out;
         }
@@ -4185,26 +4206,27 @@ pub(crate) fn memw_lt_pairs(op: &MemwOperation) -> impl Iterator<Item = (u64, u6
         .map(move |&old| (old, op.timestamp))
 }
 
-/// One MEMW_A row's timestamp comparison `(old timestamp, timestamp)`: the pair
+/// One MEMW_A row's timestamp comparison `(old timestamp, timestamp)`, if it
+/// asks LT for one ([`memw_aligned::AlignedRow::lt_pair`]: a
+/// [`MemwAlignedOrder::Limbs`] row proves its order itself): the pair
 /// [`collect_lt_from_memw_aligned`] makes its LT op of and the hand-out appends
 /// to LT's memory list ([`CompactLt::extend_pairs`]).
-pub(crate) fn memw_aligned_lt_pair(op: &memw_aligned::AlignedRow) -> (u64, u64) {
-    (op.old_timestamp(), op.timestamp())
+pub(crate) fn memw_aligned_lt_pair(op: &memw_aligned::AlignedRow) -> Option<(u64, u64)> {
+    op.lt_pair()
 }
 
 /// Collects LT operations from MEMW_A for timestamp ordering.
 ///
-/// Each aligned operation has a single old_timestamp < timestamp check.
+/// Each aligned operation in [`MemwAlignedOrder::Lt`] has a single
+/// old_timestamp < timestamp check; one in [`MemwAlignedOrder::Limbs`] none.
 fn collect_lt_from_memw_aligned(memw_aligned_ops: &[memw_aligned::AlignedRow]) -> Vec<LtOperation> {
     // Address overflow LT checks (R1-R3 in MEMW) are intentionally absent.
     // Alignment guarantees addr + (width-1) never wraps: the largest width-N
     // aligned address is 2^64-N, and 2^64-N+(N-1) = 2^64-1, so no u64 overflow.
     memw_aligned_ops
         .iter()
-        .map(|op| {
-            let (old, ts) = memw_aligned_lt_pair(op);
-            LtOperation::new(old, ts, false)
-        })
+        .filter_map(memw_aligned_lt_pair)
+        .map(|(old, ts)| LtOperation::new(old, ts, false))
         .collect()
 }
 
@@ -4234,8 +4256,11 @@ fn is_aligned_op(op: &MemwOperation) -> bool {
 
 /// Collects bitwise lookups from MEMW_A operations.
 ///
-/// Per operation:
+/// Per operation, in the order of its interactions
+/// ([`memw_aligned::bus_interactions_for`]):
 /// - 1 IS_HALF for alignment check: IS_HALF[base_address[0] + mask]
+/// - a [`MemwAlignedOrder::Limbs`] row: 2 IS_HALF, the step's limbs
+///   (IS_HALF[d0], IS_HALF[d1])
 ///
 /// IS_HALF[base_address[i]] for i ∈ [0, 1] and IS_WORD[base_address[2]] are
 /// assumptions — the caller's (CPU's) responsibility.
@@ -4264,9 +4289,38 @@ fn collect_bitwise_from_memw_aligned(ops: &[memw_aligned::AlignedRow]) -> Vec<Bi
             x,
             y,
         ));
+        if op.limbs() {
+            let (d0, d1) = op.step_limbs();
+            for limb in [d0, d1] {
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    limb as u8,
+                    (limb >> 8) as u8,
+                ));
+            }
+        }
     }
 
     bitwise_ops
+}
+
+/// A test's view of the routing: the table [`classify_memw`] sends `op` to
+/// under `order`.
+#[cfg(test)]
+pub(crate) fn route_for_test(op: &MemwOperation, order: MemwAlignedOrder) -> &'static str {
+    match classify_memw(op, order) {
+        MemwRoute::Register => "MEMW_R",
+        MemwRoute::Aligned => "MEMW_A",
+        MemwRoute::General => "MEMW",
+    }
+}
+
+/// A test's view of [`collect_bitwise_from_memw_aligned`].
+#[cfg(test)]
+pub(crate) fn bitwise_of_memw_aligned_for_test(
+    ops: &[memw_aligned::AlignedRow],
+) -> Vec<BitwiseOperation> {
+    collect_bitwise_from_memw_aligned(ops)
 }
 
 // =============================================================================
@@ -6964,6 +7018,10 @@ pub struct StreamSkip {
     /// format's): BITWISE counts those and no others. The default is today's
     /// table.
     pub keccak_rnd_form: KeccakRndForm,
+    /// How MEMW_A proves its timestamp order ([`MemwAlignedOrder`], the block
+    /// format's): what the walk routes by and lays each aligned row out in, so
+    /// what BITWISE and LT count of it. The default is the per-table STARK's.
+    pub memw_aligned_order: MemwAlignedOrder,
 }
 
 /// How the tables a block cuts at a fixed number of rows (KECCAK_RND, KECCAK,
@@ -8369,6 +8427,7 @@ fn collect_all_ops(
         aligned: memw_aligned_ops,
         general: memw_ops,
         words: _,
+        order: _,
     } = memw;
 
     let RoutedSegments {

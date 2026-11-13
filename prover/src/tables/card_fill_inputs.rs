@@ -32,7 +32,7 @@ use super::gpack::{Trace, TraceForm};
 use super::keccak_rnd::{self, KeccakRoundOperation, generate_keccak_rnd_rows_as};
 use super::load::{self, LoadOperation};
 use super::memw::{self, MemwOperation};
-use super::memw_aligned::{self, AlignedRow};
+use super::memw_aligned::{self, AlignedRow, MemwAlignedOrder};
 use super::memw_register::{RegRow, generate_memw_register_trace_from_rows_as};
 use super::shift::{self, ShiftOperation};
 use super::store::{self, StoreOperation};
@@ -315,6 +315,7 @@ pub(crate) fn aligned_record(row: &AlignedRow) -> AlignedRowC {
         width: r.width,
         is_read: r.is_read,
         is_register: r.is_register,
+        limbs: r.limbs,
     }
 }
 
@@ -503,6 +504,45 @@ pub(crate) fn memw_a_rows(seed: u64, n: usize) -> Vec<AlignedRow> {
         .collect()
 }
 
+/// `n` aligned rows from `seed` in the limbs' form
+/// ([`MemwAlignedOrder::Limbs`]): [`memw_a_rows`]' accesses with each old
+/// timestamp on its timestamp's high word (zero, or random every third row),
+/// the steps the window's edges in turn (1, 2^16, 2^16 + 1, 2^32 − 1) and
+/// random between.
+pub(crate) fn memw_a_limb_rows(seed: u64, n: usize) -> Vec<AlignedRow> {
+    let mut rng = seed;
+    let edges = [1u64, 1 << 16, (1 << 16) + 1, (1 << 32) - 1];
+    (0..n)
+        .map(|i| {
+            let width = 1u8 << (i % 4);
+            let is_register = i % 3 == 1;
+            let hi = if i % 3 == 2 {
+                splitmix(&mut rng) >> 32
+            } else {
+                0
+            };
+            let step = match edges.get(i / 2) {
+                Some(&edge) if i % 2 == 0 => edge,
+                _ => 1 + splitmix(&mut rng) % ((1 << 32) - 1),
+            };
+            let ts_lo = step + splitmix(&mut rng) % ((1 << 32) - step);
+            let (timestamp, old_timestamp) = ((hi << 32) | ts_lo, (hi << 32) | (ts_lo - step));
+            assert!(memw_aligned::step_fits_limbs(old_timestamp, timestamp));
+            AlignedRow::from_parts(
+                splitmix(&mut rng) & !7,
+                timestamp,
+                old_timestamp,
+                splitmix(&mut rng),
+                splitmix(&mut rng),
+                width,
+                splitmix(&mut rng) & 1 == 1,
+                is_register,
+            )
+            .in_order(MemwAlignedOrder::Limbs)
+        })
+        .collect()
+}
+
 /// `n` load ops from `seed`: widths 1, 2, 4 and 8 in turn, signed or not, the
 /// result's bytes random (so each width's sign bit is set in some op and clear
 /// in another).
@@ -617,9 +657,12 @@ const KAT_MEMW_R_HEIGHT: usize = 16;
 const KAT_CPU_LOGS: usize = 29;
 const KAT_CPU_HEIGHT: usize = 32;
 const KAT_CPU_FIRST_CYCLE: u64 = (1 << 30) - 20;
-/// The known-answer MEMW_A and LOAD tables: rows, then zero rows.
+/// The known-answer MEMW_A and LOAD tables: rows, then zero rows; MEMW_A in
+/// each of its forms (the old timestamp, the step's limbs).
 const KAT_MEMW_A_ROWS: usize = 13;
 const KAT_MEMW_A_HEIGHT: usize = 16;
+const KAT_MEMW_A_LIMB_ROWS: usize = 13;
+const KAT_MEMW_A_LIMB_HEIGHT: usize = 16;
 const KAT_LOAD_OPS: usize = 19;
 const KAT_LOAD_HEIGHT: usize = 32;
 /// The known-answer STORE, SHIFT and MEMW tables: ops, then padding rows.
@@ -757,7 +800,7 @@ pub(crate) fn host_kat_vectors() -> String {
     );
     for c in rows.iter().map(aligned_record) {
         s += &format!(
-            "    {{{}ull, {}ull, {}ull, {}ull, {}ull, {}, {}, {}}},\n",
+            "    {{{}ull, {}ull, {}ull, {}ull, {}ull, {}, {}, {}, {}}},\n",
             c.base_address,
             c.timestamp,
             c.old_timestamp,
@@ -765,11 +808,45 @@ pub(crate) fn host_kat_vectors() -> String {
             c.old,
             c.width,
             c.is_read,
-            c.is_register
+            c.is_register,
+            c.limbs
         );
     }
     s += "};\n// Column-major: column c's rows from c * KAT_MEMW_A_HEIGHT.\n";
     s += "inline const uint64_t KAT_MEMW_A_WORDS[] = {\n";
+    s += &c_list(&u64s(words), 6);
+    s += "};\n\n";
+
+    // MEMW_A in the limbs' form.
+    let rows = memw_a_limb_rows(0x4D41_4C42, KAT_MEMW_A_LIMB_ROWS);
+    let words = col_major(&memw_a_host(&rows, TraceForm::Wide));
+    assert_eq!(
+        words.len(),
+        KAT_MEMW_A_LIMB_HEIGHT * math_cuda::fill::MEMW_A_COLUMNS
+    );
+    s += &format!(
+        "// MEMW_A in the limbs' form: {KAT_MEMW_A_LIMB_ROWS} rows, then zero rows to \
+         {KAT_MEMW_A_LIMB_HEIGHT}.\n\
+         inline constexpr uint64_t KAT_MEMW_A_LIMB_N = {KAT_MEMW_A_LIMB_ROWS};\n\
+         inline constexpr uint64_t KAT_MEMW_A_LIMB_HEIGHT = {KAT_MEMW_A_LIMB_HEIGHT};\n\
+         inline const AlignedRowC KAT_MEMW_A_LIMB_ROWS[KAT_MEMW_A_LIMB_N] = {{\n"
+    );
+    for c in rows.iter().map(aligned_record) {
+        s += &format!(
+            "    {{{}ull, {}ull, {}ull, {}ull, {}ull, {}, {}, {}, {}}},\n",
+            c.base_address,
+            c.timestamp,
+            c.old_timestamp,
+            c.value,
+            c.old,
+            c.width,
+            c.is_read,
+            c.is_register,
+            c.limbs
+        );
+    }
+    s += "};\n// Column-major: column c's rows from c * KAT_MEMW_A_LIMB_HEIGHT.\n";
+    s += "inline const uint64_t KAT_MEMW_A_LIMB_WORDS[] = {\n";
     s += &c_list(&u64s(words), 6);
     s += "};\n\n";
 
@@ -1078,7 +1155,7 @@ mod tests {
         assert_eq!((write.is_read, write.address, write.old_ts_lo), (0, 0, 8));
     }
 
-    /// An aligned row's record: its fields, and its first 43 bytes as
+    /// An aligned row's record: its fields, and its first 44 bytes as
     /// uploaded (the rest is padding no kernel reads).
     #[test]
     fn an_aligned_row_encodes_field_for_field() {
@@ -1102,9 +1179,10 @@ mod tests {
             width: 4,
             is_read: 1,
             is_register: 0,
+            limbs: 0,
         };
         assert_eq!(c, want);
-        let bytes = field_bytes(&row, 43);
+        let bytes = field_bytes(&row, 44);
         let words: Vec<u64> = bytes[..40]
             .chunks_exact(8)
             .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
@@ -1119,9 +1197,13 @@ mod tests {
                 u64::MAX
             ]
         );
-        assert_eq!(bytes[40..43], [4, 1, 0]);
+        assert_eq!(bytes[40..44], [4, 1, 0, 0]);
         let register = AlignedRow::from_parts(0, 9, 8, 0, 0, 8, false, true);
-        assert_eq!(field_bytes(&register, 43)[40..43], [8, 0, 1]);
+        assert_eq!(field_bytes(&register, 44)[40..44], [8, 0, 1, 0]);
+        // A row in the limbs' form: its flag is byte 43.
+        let limbs = register.in_order(MemwAlignedOrder::Limbs);
+        assert_eq!(field_bytes(&limbs, 44)[40..44], [8, 0, 1, 1]);
+        assert_eq!(aligned_record(&limbs).limbs, 1);
     }
 
     /// A load op's record: its fields, and its first 26 bytes as uploaded

@@ -30,6 +30,7 @@ fn one_group(argue: ArgueFormat) -> BlockFormat {
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
     }
 }
 
@@ -48,6 +49,7 @@ fn many_groups(argue: ArgueFormat) -> BlockFormat {
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
     }
 }
 
@@ -665,6 +667,7 @@ fn the_card_argues_the_hosts_bytes() {
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
     };
     for name in ["all_instructions_64", "test_keccak", "test_ecsm"] {
         let (program, elf, mut traces) = fixed_traces(name, &MaxRowsConfig::default(), 16);

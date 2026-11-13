@@ -146,7 +146,8 @@ pub struct KeccakOpInC {
 
 /// One MEMW_A row (the prover's `AlignedRow`): the base address, timestamp and
 /// shared old timestamp, the value and old value packed a word each, the
-/// width, and flags 0 or 1.
+/// width, and flags 0 or 1 (`limbs`: columns 25 and 26 hold the step's 16-bit
+/// limbs instead of the old timestamp).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AlignedRowC {
@@ -158,6 +159,7 @@ pub struct AlignedRowC {
     pub width: u8,
     pub is_read: u8,
     pub is_register: u8,
+    pub limbs: u8,
 }
 
 /// One LOAD op (the prover's `LoadOperation`): the base address, the
@@ -234,6 +236,7 @@ const _: () = {
     assert!(size_of::<AlignedRowC>() == 48);
     assert!(offset_of!(AlignedRowC, width) == 40);
     assert!(offset_of!(AlignedRowC, is_register) == 42);
+    assert!(offset_of!(AlignedRowC, limbs) == 43);
     assert!(size_of::<LoadOpC>() == 32);
     assert!(offset_of!(LoadOpC, is_signed) == 17);
     assert!(offset_of!(LoadOpC, res) == 18);

@@ -912,8 +912,9 @@ impl BlockAirInputs {
 }
 
 /// A block's AIRs: every table of `table_counts`, HALT included, the CPU
-/// tables at `inputs`' heights, REGISTER's FINI pinned to the halted file and
-/// KECCAK_RND's byte checks as `keccak_rnd` sends them (the block format's).
+/// tables at `inputs`' heights, REGISTER's FINI pinned to the halted file,
+/// KECCAK_RND's byte checks as `keccak_rnd` sends them and MEMW_A's timestamp
+/// order in `memw_aligned`'s form (the block format's).
 pub(crate) fn block_airs(
     program: &Elf,
     opts: &ProofOptions,
@@ -921,6 +922,7 @@ pub(crate) fn block_airs(
     table_counts: &TableCounts,
     inputs: &BlockAirInputs,
     keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
+    memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
 ) -> VmAirs {
     let mut airs = VmAirs::new(
         program,
@@ -940,6 +942,16 @@ pub(crate) fn block_airs(
                 Box::new(
                     crate::test_utils::create_keccak_rnd_air_for(opts, keccak_rnd)
                         .with_name(&format!("KECCAK_RND[{i}]")),
+                ) as VmAir
+            })
+            .collect();
+    }
+    if memw_aligned != crate::tables::memw_aligned::MemwAlignedOrder::Lt {
+        airs.memw_aligneds = (0..airs.memw_aligneds.len())
+            .map(|i| {
+                Box::new(
+                    crate::test_utils::create_memw_aligned_air_for(opts, memw_aligned)
+                        .with_name(&format!("MEMW_A[{i}]")),
                 ) as VmAir
             })
             .collect();

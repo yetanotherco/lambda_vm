@@ -166,6 +166,7 @@ impl Setup {
         let (mut sizes, mut cycles, mut windows, mut secs) = (WalkSizes::default(), first, 0, 0.0);
         Walker {
             decode: &self.decode,
+            order: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
             lookups: self.lookups,
             keep_logs: false,
             batch: self.batch,

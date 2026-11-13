@@ -89,10 +89,7 @@ use crate::tables::lt::{
 use crate::tables::memw::{
     MemwConstraints, bus_interactions as memw_bus_interactions, cols as memw_cols,
 };
-use crate::tables::memw_aligned::{
-    MemwAlignedConstraints, bus_interactions as memw_aligned_bus_interactions,
-    cols as memw_aligned_cols,
-};
+use crate::tables::memw_aligned::{MemwAlignedConstraints, cols as memw_aligned_cols};
 use crate::tables::memw_register::{
     MemwRegisterConstraints, bus_interactions as memw_register_bus_interactions,
     cols as memw_register_cols,
@@ -897,18 +894,44 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> ConcreteVmAir<MemwConstr
     )
 }
 
-/// Create MEMW_A (aligned) AIR with constraints and bus interactions.
+/// Create MEMW_A (aligned) AIR with constraints and bus interactions: the
+/// timestamp order by an LT lookup, the per-table STARK's form.
 pub fn create_memw_aligned_air(
     proof_options: &ProofOptions,
 ) -> ConcreteVmAir<MemwAlignedConstraints> {
+    create_memw_aligned_air_for(
+        proof_options,
+        crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+    )
+}
+
+/// [`create_memw_aligned_air`] with the timestamp order in `order`'s form:
+/// the same columns and constraints, its interactions
+/// ([`crate::tables::memw_aligned::bus_interactions_for`]).
+///
+/// Each form is its own prototype in [`air_prototype_cache`], whose key is the
+/// name: under one name the interactions must be a pure function of the
+/// table, or the first form built in a process would be served for the other.
+/// The limbs' prototype is cached as `MEMW_A~limbs` and its clone named
+/// `MEMW_A`, as today's.
+pub fn create_memw_aligned_air_for(
+    proof_options: &ProofOptions,
+    order: crate::tables::memw_aligned::MemwAlignedOrder,
+) -> ConcreteVmAir<MemwAlignedConstraints> {
+    use crate::tables::memw_aligned::MemwAlignedOrder;
+    let cached = match order {
+        MemwAlignedOrder::Lt => "MEMW_A",
+        MemwAlignedOrder::Limbs => "MEMW_A~limbs",
+    };
     build_air(
         memw_aligned_cols::NUM_COLUMNS,
-        memw_aligned_bus_interactions(),
+        crate::tables::memw_aligned::bus_interactions_for(order),
         proof_options,
         1,
         MemwAlignedConstraints,
-        "MEMW_A",
+        cached,
     )
+    .with_name("MEMW_A")
 }
 
 /// Create MEMW_R (register) AIR with constraints and bus interactions.

@@ -25,6 +25,7 @@ use multilinear::records::Records;
 use super::card_records::{CardDecode, CpuLogRecords};
 use super::{RecordsRoom, RowFamilies, Segments, StreamTable, WindowedTraceBuilder};
 use crate::tables::MaxRowsConfig;
+use crate::tables::memw_aligned::MemwAlignedOrder;
 use crate::tests::windowed_builder_tests::run;
 
 pub(super) fn always() -> RecordsRoom {
@@ -43,7 +44,29 @@ pub(super) fn records_chunks(
     (from, windows): (usize, Option<usize>),
     rows: bool,
 ) -> Vec<(StreamTable, usize, Records)> {
+    records_chunks_in(
+        program,
+        input,
+        max_rows,
+        window,
+        (from, windows),
+        rows,
+        MemwAlignedOrder::Lt,
+    )
+}
+
+/// [`records_chunks`] with MEMW_A's rows in `order`'s form.
+pub(super) fn records_chunks_in(
+    program: &Elf,
+    input: &[u8],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    (from, windows): (usize, Option<usize>),
+    rows: bool,
+    order: MemwAlignedOrder,
+) -> Vec<(StreamTable, usize, Records)> {
     let mut builder = WindowedTraceBuilder::new(program, input, max_rows)
+        .and_then(|b| b.memw_aligned_order(order))
         .and_then(WindowedTraceBuilder::drop_streamed_ops)
         .and_then(|b| b.card_fill_streamed(always(), true, true))
         .and_then(|b| {
@@ -172,9 +195,10 @@ fn row_family(records: &Records) -> Option<(usize, usize)> {
 const ROW_FAMILIES: [&str; 5] = ["MEMW_A", "LOAD", "STORE", "MEMW", "SHIFT"];
 
 /// Every row family's chunks of four rows, so that the small programs fill
-/// several, their rows in one window part or many: MEMW_A's, LOAD's,
-/// STORE's and SHIFT's (no small program makes four MEMW ops; the synthetic
-/// MEMW chunk below is MEMW's).
+/// several, their rows in one window part or many: MEMW_A's (in both of its
+/// forms: the step's limbs, or the old timestamp), LOAD's, STORE's and
+/// SHIFT's (no small program makes four MEMW ops; the synthetic MEMW chunk
+/// below is MEMW's).
 #[test]
 fn the_card_fills_row_family_chunks_from_their_rows_as_the_host_does() {
     let max_rows = MaxRowsConfig {
@@ -187,29 +211,44 @@ fn the_card_fills_row_family_chunks_from_their_rows_as_the_host_does() {
     };
     // Per family: chunks filled, and those in more than one piece.
     let mut filled = [[0usize; 2]; 5];
-    for name in [
-        "all_instructions_64",
-        "test_keccak_multi",
-        "all_loadstore_32",
-        "test_blake3",
-    ] {
-        let (program, _) = run(name);
-        for window in [1, 7, 33] {
-            for (table, index, records) in
-                records_chunks(&program, &[], &max_rows, window, (0, None), true)
-            {
-                let Some((family, pieces)) = row_family(&records) else {
-                    continue;
-                };
-                check(
-                    &format!("{name}, window {window}, {table:?}[{index}]"),
-                    &records,
-                );
-                filled[family][0] += 1;
-                filled[family][1] += usize::from(pieces > 1);
+    // MEMW_A's limbs' chunks, and those in more than one piece.
+    let mut limbs = [0usize; 2];
+    for order in [MemwAlignedOrder::Lt, MemwAlignedOrder::Limbs] {
+        for name in [
+            "all_instructions_64",
+            "test_keccak_multi",
+            "all_loadstore_32",
+            "test_blake3",
+        ] {
+            let (program, _) = run(name);
+            for window in [1, 7, 33] {
+                for (table, index, records) in
+                    records_chunks_in(&program, &[], &max_rows, window, (0, None), true, order)
+                {
+                    let Some((family, pieces)) = row_family(&records) else {
+                        continue;
+                    };
+                    check(
+                        &format!("{name}, window {window}, {order:?}, {table:?}[{index}]"),
+                        &records,
+                    );
+                    if order == MemwAlignedOrder::Limbs {
+                        if table == StreamTable::MemwAligned {
+                            limbs[0] += 1;
+                            limbs[1] += usize::from(pieces > 1);
+                        }
+                        continue;
+                    }
+                    filled[family][0] += 1;
+                    filled[family][1] += usize::from(pieces > 1);
+                }
             }
         }
     }
+    assert!(
+        limbs[0] > 0 && limbs[1] > 0,
+        "MEMW_A's limbs' chunks: {limbs:?}"
+    );
     // No small program makes four MEMW ops (the synthetic MEMW chunk below
     // covers MEMW), and a STORE chunk is always one piece (its hand-out cuts
     // one list).
@@ -493,7 +532,9 @@ fn the_card_fills_a_real_blocks_row_family_chunks_as_the_host_does() {
     let options = crate::block_whir::BlockOptions::production();
     let window = 1usize << options.window_log2.expect("the block streams");
     let t = std::time::Instant::now();
+    // MEMW_A's rows in the production form (the step's limbs).
     let mut builder = WindowedTraceBuilder::new(&program, &input, &options.max_rows)
+        .and_then(|b| b.memw_aligned_order(crate::block_whir::BlockFormat::pinned().memw_aligned))
         .and_then(WindowedTraceBuilder::drop_streamed_ops)
         .and_then(|b| b.card_fill_streamed(always(), false, false))
         .and_then(|b| b.card_fill_streamed_rows(RowFamilies::ALL))
