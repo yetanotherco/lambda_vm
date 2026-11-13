@@ -800,6 +800,7 @@ impl ZfFormat {
             // The block's too (`BlockFormat::chain_config` stamps
             // `whir_trees`): only its groups' chains are grouped.
             round0: Round0Trees::Each,
+            final_poly: multilinear::whir_chain::FinalPoly::Off,
         }
     }
 
@@ -2078,6 +2079,7 @@ mod tests {
                 group: multilinear::whir_chain::GroupFold::PerPoly,
                 leaves: multilinear::whir_chain::LeafOrder::Natural,
                 round0: multilinear::whir_chain::Round0Trees::Each,
+                final_poly: multilinear::whir_chain::FinalPoly::Off,
             },
         };
         let opt_out = parse(&[
