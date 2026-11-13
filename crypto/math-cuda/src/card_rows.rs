@@ -1122,6 +1122,17 @@ fn plan_words(
     })
 }
 
+/// Whether a group's plans build any table on the card from the logs it
+/// holds (LOAD or STORE derived, MEMW_R built from a plan or from words):
+/// then its cached logs go up as descriptors and the derive kernels launch.
+/// A table planned so and never launched would keep whatever its store held.
+fn launches_from_logs(plans: &[Plan]) -> bool {
+    plans.iter().any(|p| match p {
+        Plan::Derived { .. } | Plan::Registers(_) | Plan::Words(_) => true,
+        Plan::Wide | Plan::Narrow | Plan::Records | Plan::CpuHit(_) => false,
+    })
+}
+
 /// A group's upload under [`Mode::Order`], [`Mode::Derive`] or
 /// [`Mode::Registers`] ([`DeviceColumns::upload_tables`] calls it). `None` as
 /// today's: the card declines and every reader takes the host's columns.
@@ -1538,9 +1549,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
     // The derived launches' descriptors: the cache's entries and this group's
     // CPU tables' logs, ascending; each family's tables.
     let mut kernels_ok = true;
-    let derived_any = plans
-        .iter()
-        .any(|p| matches!(p, Plan::Derived { .. } | Plan::Registers(_)));
+    let derived_any = launches_from_logs(&plans);
     let mut entry_descs: Vec<CachedLogsC> = Vec::new();
     let mut table_descs: [Vec<RowsTableC>; 2] = [Vec::new(), Vec::new()];
     let mut register_descs: Vec<RegistersTableC> = Vec::new();
@@ -2004,6 +2013,39 @@ mod tests {
     }
 
     /// The rule, row by row: CPU tables of 8 cycles, an ECALL at cycle 10.
+    /// Every plan that builds a table from the logs launches the kernels (a
+    /// MEMW_R table built from words alone in its group included), and no
+    /// other plan does.
+    #[test]
+    fn every_table_built_from_the_logs_launches_the_kernels() {
+        let words = || {
+            Plan::Words(WordsPlan {
+                ranges: Vec::new(),
+                extra: Vec::new(),
+                n_whole: 0,
+                whole_base: 7,
+                n: 4,
+                span: (0, 0),
+                markers_decoded: 0,
+            })
+        };
+        assert!(launches_from_logs(&[Plan::Records, words()]));
+        assert!(launches_from_logs(&[words()]));
+        assert!(launches_from_logs(&[Plan::Registers(
+            RegisterPlan::default()
+        )]));
+        assert!(launches_from_logs(&[Plan::Derived {
+            store: false,
+            cycles: Vec::new()
+        }]));
+        assert!(!launches_from_logs(&[
+            Plan::Wide,
+            Plan::Narrow,
+            Plan::Records,
+            Plan::CpuHit(0)
+        ]));
+    }
+
     #[test]
     fn a_register_row_crosses_as_its_timestamps_only_where_the_logs_give_the_rest() {
         let held = [(0u64, 8u64), (8, 8), (16, 8)];
