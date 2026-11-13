@@ -5,6 +5,12 @@
 //! or any CUDA error — and the caller runs the host path. A dispatch that
 //! succeeded is counted, so a bench can tell a GPU number from a CPU one
 //! wearing its label.
+//!
+//! The kill switches (`LAMBDA_VM_NO_GPU_SUMCHECK`, `_WHIR_FOLD`, `_MLE_EVAL`,
+//! `_GKR`, `_COLUMNS`, `_FACTORS`, `_WHIR_COMMIT`, `_OPEN`) are presence-based:
+//! a set word turns its host path on whatever its value, so
+//! `LAMBDA_VM_NO_GPU_OPEN=0` forces the host openings too. Unset a word to
+//! leave its device path on. Each is read once per process.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

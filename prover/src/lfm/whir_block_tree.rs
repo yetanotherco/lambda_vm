@@ -493,16 +493,17 @@ impl WhirTreeConfig {
             options.layout_workers = n;
         }
         // `BLOCK_WHIR_LAYOUT_AHEAD=k` bounds the chunks unpacked at k + 1;
-        // `none` lifts the bound (the reverted version, BIG 390).
+        // `none` lifts the bound (the reverted version); anything else
+        // refuses the prove.
         match std::env::var("BLOCK_WHIR_LAYOUT_AHEAD")
             .as_deref()
             .map(str::trim)
         {
             Ok("none") => options.layout_ahead = None,
             Ok(k) => {
-                if let Ok(k) = k.parse() {
-                    options.layout_ahead = Some(k);
-                }
+                options.layout_ahead = Some(k.parse().map_err(|_| {
+                    format!("BLOCK_WHIR_LAYOUT_AHEAD is a count or `none`, got `{k}`")
+                })?);
             }
             Err(_) => {}
         }

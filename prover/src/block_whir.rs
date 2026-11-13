@@ -196,35 +196,54 @@ pub const BLOCK_TREE_DROP_LEVELS_DEVICE: usize = 8;
 
 /// `LAMBDA_VM_BLOCK_TREE_DROP_LEVELS`: `<device>` or `<device>,<host>`, the
 /// levels a retired tree drops ([`multilinear::whir_commit::TreeDrop`]);
-/// unset or unreadable, [`BLOCK_TREE_DROP_LEVELS_DEVICE`] and
+/// unset or empty, [`BLOCK_TREE_DROP_LEVELS_DEVICE`] and
 /// [`BLOCK_TREE_DROP_LEVELS`]. A knob a RAM-adaptive policy can set; the proof
-/// does not depend on it.
+/// does not depend on it. A value it cannot read is the default here and
+/// refuses the prove ([`tree_drop_refusal`]), so a mistyped value never runs
+/// as the default unnoticed.
 pub fn tree_drop_from_env() -> multilinear::whir_commit::TreeDrop {
     parse_tree_drop(
         std::env::var("LAMBDA_VM_BLOCK_TREE_DROP_LEVELS")
             .ok()
             .as_deref(),
     )
+    .unwrap_or(TREE_DROP_DEFAULT)
 }
 
-fn parse_tree_drop(value: Option<&str>) -> multilinear::whir_commit::TreeDrop {
-    let default = multilinear::whir_commit::TreeDrop {
-        device: BLOCK_TREE_DROP_LEVELS_DEVICE,
-        host: BLOCK_TREE_DROP_LEVELS,
-    };
+/// The prove's refusal of a `LAMBDA_VM_BLOCK_TREE_DROP_LEVELS` value
+/// [`tree_drop_from_env`] cannot read.
+fn tree_drop_refusal() -> Result<(), Error> {
+    parse_tree_drop(
+        std::env::var("LAMBDA_VM_BLOCK_TREE_DROP_LEVELS")
+            .ok()
+            .as_deref(),
+    )
+    .map(|_| ())
+    .map_err(Error::Prover)
+}
+
+/// [`tree_drop_from_env`] unset.
+const TREE_DROP_DEFAULT: multilinear::whir_commit::TreeDrop = multilinear::whir_commit::TreeDrop {
+    device: BLOCK_TREE_DROP_LEVELS_DEVICE,
+    host: BLOCK_TREE_DROP_LEVELS,
+};
+
+fn parse_tree_drop(value: Option<&str>) -> Result<multilinear::whir_commit::TreeDrop, String> {
     let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
-        return default;
+        return Ok(TREE_DROP_DEFAULT);
     };
     let mut parts = value.split(',').map(|p| p.trim().parse::<usize>().ok());
     match (parts.next().flatten(), parts.next(), parts.next()) {
-        (Some(device), None, None) => multilinear::whir_commit::TreeDrop {
+        (Some(device), None, None) => Ok(multilinear::whir_commit::TreeDrop {
             device,
-            host: default.host,
-        },
+            host: TREE_DROP_DEFAULT.host,
+        }),
         (Some(device), Some(Some(host)), None) => {
-            multilinear::whir_commit::TreeDrop { device, host }
+            Ok(multilinear::whir_commit::TreeDrop { device, host })
         }
-        _ => default,
+        _ => Err(format!(
+            "LAMBDA_VM_BLOCK_TREE_DROP_LEVELS={value}: <card levels> or <card levels>,<host levels>"
+        )),
     }
 }
 
@@ -6066,6 +6085,8 @@ fn prove_streamed(
         Some(setting) => setting,
         None => group_queue::setting()?,
     };
+    // A tree-drop value the options could not read refuses the prove.
+    tree_drop_refusal()?;
     let queue_rule = group_queue::Rule::of(queue_setting, room, regen::AHEAD_CAP);
     let queue_stats = std::sync::Arc::new(group_queue::Stats::default());
     // The host is read at each decision: the `auto` rule decides on it and the
@@ -8761,23 +8782,27 @@ mod memory_target_tests {
         assert!(hand_off_need(gib(40.0), windows(285), small) > 0);
     }
 
-    /// `LAMBDA_VM_BLOCK_TREE_DROP_LEVELS`: unset is 8 on the card and 4 on the
-    /// host; `<card>` or `<card>,<host>` sets them; anything else is the
-    /// default.
+    /// `LAMBDA_VM_BLOCK_TREE_DROP_LEVELS`: unset or empty is 8 on the card and
+    /// 4 on the host; `<card>` or `<card>,<host>` sets them; anything else is
+    /// refused.
     #[test]
-    fn the_tree_drop_knob_reads_card_then_host() {
+    fn the_tree_drop_knob_reads_card_then_host_and_refuses_the_rest() {
         use multilinear::whir_commit::TreeDrop;
         let default = TreeDrop { device: 8, host: 4 };
-        assert_eq!(parse_tree_drop(None), default);
-        assert_eq!(parse_tree_drop(Some("")), default);
-        assert_eq!(parse_tree_drop(Some("6")), TreeDrop { device: 6, host: 4 });
+        assert_eq!(parse_tree_drop(None), Ok(default));
+        assert_eq!(parse_tree_drop(Some("")), Ok(default));
+        assert_eq!(
+            parse_tree_drop(Some("6")),
+            Ok(TreeDrop { device: 6, host: 4 })
+        );
         assert_eq!(
             parse_tree_drop(Some(" 6 , 5 ")),
-            TreeDrop { device: 6, host: 5 }
+            Ok(TreeDrop { device: 6, host: 5 })
         );
-        assert_eq!(parse_tree_drop(Some("4,4")), TreeDrop::uniform(4));
-        assert_eq!(parse_tree_drop(Some("x")), default);
-        assert_eq!(parse_tree_drop(Some("6,5,1")), default);
+        assert_eq!(parse_tree_drop(Some("4,4")), Ok(TreeDrop::uniform(4)));
+        for bad in ["x", "6,5,1", "6,", ",4", "-1", "6;5"] {
+            assert!(parse_tree_drop(Some(bad)).is_err(), "{bad} must be refused");
+        }
     }
 }
 
