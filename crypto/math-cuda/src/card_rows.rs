@@ -793,10 +793,14 @@ pub fn plan_registers(
         .flatten()
 }
 
+/// A MEMW_R table as [`plan_registers_many`] takes it: its rows' pieces in
+/// order, and its ECALL cycles.
+pub type RegisterTable<'a> = (&'a [&'a [RegRowC]], &'a [u32]);
+
 /// [`plan_registers`] of each table, their parts planned on the planning
 /// pool's threads together; and the seconds those threads spent, summed.
 pub fn plan_registers_many(
-    tables: &[(&[&[RegRowC]], &[u32])],
+    tables: &[RegisterTable<'_>],
     held: &[(u64, u64)],
     faults: u32,
 ) -> (Vec<Option<RegisterPlan>>, f64) {
@@ -1113,7 +1117,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
         // MEMW_R's tables that came with their ECALL cycles, planned together
         // on the planning pool: each row as its timestamps where the logs the
         // card will hold give the rest, else whole ([`plan_registers`]).
-        let wanted: Vec<(usize, &[&[RegRowC]], &[u32])> = if registers && all_one {
+        let wanted: Vec<(usize, RegisterTable<'_>)> = if registers && all_one {
             tables
                 .iter()
                 .enumerate()
@@ -1122,7 +1126,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                         records,
                         rows,
                         ecall_cycles: Some(ecalls),
-                    }) if records_len(records) == *rows => Some((i, *records, *ecalls)),
+                    }) if records_len(records) == *rows => Some((i, (*records, *ecalls))),
                     _ => None,
                 })
                 .collect()
@@ -1133,15 +1137,11 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
             let held: Vec<(u64, u64)> = held.iter().map(|(&first, &n)| (first, n)).collect();
             let faults = FAULT_REGISTERS.load(Ordering::Relaxed) & !KERNEL_FAULTS;
             let clock = std::time::Instant::now();
-            let inputs: Vec<(&[&[RegRowC]], &[u32])> =
-                wanted.iter().map(|&(_, rows, ecalls)| (rows, ecalls)).collect();
+            let inputs: Vec<RegisterTable<'_>> = wanted.iter().map(|&(_, table)| table).collect();
             let (planned, secs) = plan_registers_many(&inputs, &held, faults);
             add(&counters().plan_ns, (secs * 1e9) as u64);
-            add(
-                &counters().plan_wall_ns,
-                clock.elapsed().as_nanos() as u64,
-            );
-            for (&(i, _, _), plan) in wanted.iter().zip(planned) {
+            add(&counters().plan_wall_ns, clock.elapsed().as_nanos() as u64);
+            for (&(i, _), plan) in wanted.iter().zip(planned) {
                 let Some(plan) = plan else { continue };
                 let (lo, hi) = plan.span;
                 for (&first, e) in cache.entries.range_mut(..=hi) {
@@ -1782,12 +1782,12 @@ mod tests {
         let held = [(0u64, 8u64), (8, 8), (16, 8)];
         let ecalls = [10u32];
         let rows = [
-            reg(ts(2, 0), ts(1, 2)),   // a read: word
-            reg(ts(2, 2), ts(2, 0)),   // a write, old this cycle's rs1: word
-            reg(ts(5, 2), ts(3, 1)),   // a write, old in its table: word
-            reg(ts(9, 2), ts(6, 0)),   // a write, old before its table (8)
-            reg(ts(10, 0), ts(9, 2)),  // the ECALL's own row
-            reg(ts(10, 0), ts(4, 1)),  // its handler's rows
+            reg(ts(2, 0), ts(1, 2)),  // a read: word
+            reg(ts(2, 2), ts(2, 0)),  // a write, old this cycle's rs1: word
+            reg(ts(5, 2), ts(3, 1)),  // a write, old in its table: word
+            reg(ts(9, 2), ts(6, 0)),  // a write, old before its table (8)
+            reg(ts(10, 0), ts(9, 2)), // the ECALL's own row
+            reg(ts(10, 0), ts(4, 1)), // its handler's rows
             RegRowC {
                 is_read: 0,
                 ..reg(ts(10, 1), ts(10, 0))
@@ -1820,12 +1820,15 @@ mod tests {
         assert_eq!(plan.span, (2, 22));
 
         // The host mutants: the rows the card cannot read go as words.
-        let start = plan_registers(&[&rows[..]], &held, &ecalls, REGISTER_FAULT_START)
-            .expect("planned");
-        assert_ne!(start.words[3] as u32, WHOLE_ROW, "before its table, as a word");
+        let start =
+            plan_registers(&[&rows[..]], &held, &ecalls, REGISTER_FAULT_START).expect("planned");
+        assert_ne!(
+            start.words[3] as u32, WHOLE_ROW,
+            "before its table, as a word"
+        );
         assert_eq!(start.why.before_table, 0);
-        let ecall = plan_registers(&[&rows[..]], &held, &ecalls, REGISTER_FAULT_ECALL)
-            .expect("planned");
+        let ecall =
+            plan_registers(&[&rows[..]], &held, &ecalls, REGISTER_FAULT_ECALL).expect("planned");
         for r in [4, 5, 8] {
             assert_ne!(ecall.words[r] as u32, WHOLE_ROW, "row {r} as a word");
         }
@@ -1870,7 +1873,10 @@ mod tests {
         check_words(&rows, &one);
         // Each ECALL cycle's two rows; the write after it reads its own
         // cycle's `rs1`, a read the ECALL did not make.
-        assert_eq!(one.why.ecall, 2 * ecalls.iter().filter(|&&c| c >= 1).count() as u64);
+        assert_eq!(
+            one.why.ecall,
+            2 * ecalls.iter().filter(|&&c| c >= 1).count() as u64
+        );
         // The first write of the second table reads the cycle before it.
         assert_eq!(one.why.before_table, 0);
         let (a, b) = rows.split_at(PLAN_PART + 12345);
