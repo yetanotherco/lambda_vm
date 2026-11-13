@@ -37,6 +37,8 @@ pub mod uni_skip;
 pub mod virtual_poly;
 pub mod whir;
 #[cfg(test)]
+mod whir_b3_each_pin_tests;
+#[cfg(test)]
 mod whir_cap_tests;
 pub mod whir_chain;
 pub mod whir_commit;
