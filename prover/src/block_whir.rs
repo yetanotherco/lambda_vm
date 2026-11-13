@@ -1426,13 +1426,13 @@ fn parse_bitwise_from_tables(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
-/// `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST`: `1` has the streamed finish, when it
-/// slides, hand KECCAK_RND's tables on before every other table
-/// ([`WindowedTraceBuilder::keccak_rnd_first`]), so the card commits them while
-/// the tables before them in AIR order are built. Unset, empty or `0` (the
-/// default): AIR order. Anything else refuses the prove. The tables are the
-/// same; the groups they are packed into, and so the proof's bytes, are not;
-/// the verifier takes any partition the statement declares.
+/// `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST`: unset, empty or `1` (the default) has
+/// the streamed finish, when it slides, hand KECCAK_RND's tables on before
+/// every other table ([`WindowedTraceBuilder::keccak_rnd_first`]), so the card
+/// commits them while the tables before them in AIR order are built. `0`: AIR
+/// order. Anything else refuses the prove. The tables are the same; the groups
+/// they are packed into, and so the proof's bytes, are not; the verifier takes
+/// any partition the statement declares.
 fn block_keccak_rnd_first() -> Result<bool, Error> {
     parse_keccak_rnd_first(
         std::env::var("LAMBDA_VM_BLOCK_KECCAK_RND_FIRST")
@@ -1443,8 +1443,8 @@ fn block_keccak_rnd_first() -> Result<bool, Error> {
 
 fn parse_keccak_rnd_first(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
+        None | Some("" | "1") => Ok(true),
+        Some("0") => Ok(false),
         Some(v) => Err(Error::Prover(format!(
             "LAMBDA_VM_BLOCK_KECCAK_RND_FIRST={v}: 1 (KECCAK_RND's tables handed on first) or 0"
         ))),
@@ -3735,6 +3735,11 @@ pub(crate) struct Deviations {
     /// (`Some(false)`), instead of what `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`
     /// says (`None`; [`block_bitwise_from_tables`]).
     pub bitwise_from_tables: Option<bool>,
+    /// KECCAK_RND's tables handed on first (`Some(true)`) or the rest in AIR
+    /// order (`Some(false)`), instead of what
+    /// `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST` says (`None`;
+    /// [`block_keccak_rnd_first`]).
+    pub keccak_rnd_first: Option<bool>,
     /// The hand-out's counting on a thread of its own (`Some(true)`) or on
     /// the accumulator's (`Some(false)`), instead of what
     /// `LAMBDA_VM_HANDOUT_COUNT_THREAD` says (`None`;
@@ -6047,7 +6052,10 @@ fn prove_streamed(
     crate::with_block_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
         let bitwise_last = deviations.rest_bitwise_last || block_rest_bitwise_last()?;
-        let keccak_rnd_first = block_keccak_rnd_first()?;
+        let keccak_rnd_first = match deviations.keccak_rnd_first {
+            Some(first) => first,
+            None => block_keccak_rnd_first()?,
+        };
         let from_tables = match deviations.bitwise_from_tables {
             Some(from_tables) => from_tables,
             None => block_bitwise_from_tables()?,
@@ -9196,15 +9204,16 @@ mod keccak_rnd_first_tests {
         );
     }
 
-    /// `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST`: off (AIR order) unless `1`; any
-    /// other word refuses.
+    /// `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST`: on (KECCAK_RND first) unless `0`,
+    /// which keeps AIR order; any other word refuses.
     #[test]
-    fn the_keccak_rnd_first_knob_is_off_by_default_and_on_at_1() {
+    fn the_keccak_rnd_first_knob_is_on_by_default_and_off_at_0() {
         for (value, on) in [
-            (None, false),
-            (Some(""), false),
-            (Some("0"), false),
+            (None, true),
+            (Some(""), true),
             (Some(" 1 "), true),
+            (Some("0"), false),
+            (Some(" 0 "), false),
         ] {
             assert_eq!(parse_keccak_rnd_first(value).ok(), Some(on), "{value:?}");
         }

@@ -6925,11 +6925,11 @@ pub struct StreamSkip {
     /// changes nothing. The tables are the same; their order is not.
     pub bitwise_from_tables: bool,
     /// With the slide, KECCAK_RND's tables are handed on before every other
-    /// table, in their AIR order, and the rest after them as without it
-    /// (`LAMBDA_VM_BLOCK_KECCAK_RND_FIRST=1` on the block), so the card can
-    /// commit them while the tables they would wait behind are built. The
-    /// tables are the same; the groups they are packed into, and so the
-    /// proof's bytes, are not. In waves it changes nothing.
+    /// table, in their AIR order, and the rest after them as without it (the
+    /// block's default; `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST=0` rolls it back),
+    /// so the card can commit them while the tables they would wait behind
+    /// are built. The tables are the same; the groups they are packed into,
+    /// and so the proof's bytes, are not. In waves it changes nothing.
     pub keccak_rnd_first: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table

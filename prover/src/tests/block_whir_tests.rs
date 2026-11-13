@@ -2796,8 +2796,8 @@ fn a_streamed_block_laid_out_on_three_threads_packs_the_same_groups() {
 }
 
 /// ★ With BITWISE handed on last ([`Deviations::rest_bitwise_last`], as
-/// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1`), the streamed rest is packed in AIR
-/// order but BITWISE (AIR index 0), which comes after every other table: the
+/// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1`), the streamed rest is packed in its
+/// hand-on order but BITWISE (AIR index 0), which comes after every other table: the
 /// partition moves, the tables and their counts do not, and the proof verifies
 /// under the unchanged verifier. Without it BITWISE leads the rest, as today.
 #[test]
@@ -2909,6 +2909,83 @@ fn bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies() {
     assert_ne!(
         rollback.groups, from_tables.groups,
         "the rollback's partition"
+    );
+}
+
+/// ★ KECCAK_RND's tables handed on first ([`Deviations::keccak_rnd_first`],
+/// the block's default; `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST=0` rolls it back):
+/// every KECCAK_RND table is packed before DECODE, the first table of the rest
+/// in AIR order, and in the rollback every one after it. The partition moves,
+/// the tables and their counts do not, and both proofs verify under the
+/// unchanged verifier. The default is the knob on.
+#[test]
+fn keccak_rnd_first_is_the_default_moves_the_partition_and_verifies() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    assert!(o.rest_streams(), "the rest streams");
+    let proved = |what: &str, keccak_rnd_first: Option<bool>| {
+        let proof = prove_with(
+            &elf,
+            &format,
+            &o,
+            &Deviations {
+                keccak_rnd_first,
+                ..Deviations::default()
+            },
+        );
+        assert!(verify(&proof, &elf, &format), "{what}");
+        proof
+    };
+    let default = proved("the default", None);
+    let first = proved("KECCAK_RND first", Some(true));
+    let rollback = proved("the rollback", Some(false));
+    let opts = ProofOptions::default_test_options();
+    let frame = block_whir::block_frame(default.statement(), &elf, &opts, &format).expect("frame");
+    let names: Vec<String> = frame
+        .airs
+        .air_refs()
+        .iter()
+        .map(|air| air.name().to_string())
+        .collect();
+    let keccak_rnd: Vec<u32> = (0..names.len())
+        .filter(|&i| names[i].starts_with("KECCAK_RND"))
+        .map(|i| i as u32)
+        .collect();
+    let decode = names
+        .iter()
+        .position(|n| n == "DECODE")
+        .expect("a DECODE table") as u32;
+    assert!(
+        keccak_rnd.len() > 1,
+        "{} KECCAK_RND tables",
+        keccak_rnd.len()
+    );
+    let flat = |p: &BlockWhirProof| p.groups.iter().flatten().copied().collect::<Vec<u32>>();
+    let at = |order: &[u32], t: u32| order.iter().position(|&x| x == t).expect("in a group");
+    let before_decode = |p: &BlockWhirProof| {
+        let order = flat(p);
+        let d = at(&order, decode);
+        keccak_rnd.iter().filter(|&&t| at(&order, t) < d).count()
+    };
+    assert_eq!(before_decode(&default), keccak_rnd.len(), "the default");
+    assert_eq!(before_decode(&first), keccak_rnd.len(), "KECCAK_RND first");
+    assert_eq!(before_decode(&rollback), 0, "the rollback: AIR order");
+    assert_eq!(default.groups, first.groups, "the default's partition");
+    assert_ne!(
+        rollback.groups, default.groups,
+        "the partition did not move"
+    );
+    let sorted = |p: &BlockWhirProof| {
+        let mut v = flat(p);
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(sorted(&rollback), sorted(&default), "the same tables");
+    assert_eq!(
+        format!("{:?}", rollback.table_counts),
+        format!("{:?}", default.table_counts)
     );
 }
 
