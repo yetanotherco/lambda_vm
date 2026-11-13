@@ -968,7 +968,8 @@ fn the_dedup_encoding_round_trips_every_wlfm_proof() {
 /// `C1 ROWS` lines), synthetic values (the cost does not read them) — whole,
 /// then split on one stacked polynomial of the same height into the lift
 /// (Möbius + bit-reversed gather), the encode (host NTT + bit-reverse) and the
-/// tree (leaf gather + Poseidon1 + nodes). Prints `PREP COMMIT` lines.
+/// tree (leaf gather + Poseidon1 + nodes). Prints `PREP COMMIT` lines with
+/// the roots' first 8 bytes: the inputs are seeded, so two builds' roots compare.
 #[test]
 #[ignore = "a measurement of the verifier's host prepared commit"]
 fn probe_the_host_prepared_commit_by_step() {
@@ -1027,9 +1028,20 @@ fn probe_the_host_prepared_commit_by_step() {
         let whole = t.elapsed().as_secs_f64();
         let layout = committed[0].commitment.layout().clone();
         let (n, polys) = (layout.n_stack(), layout.num_polys());
+        let roots: String = committed
+            .iter()
+            .flat_map(|g| g.roots.iter())
+            .map(|r| {
+                r[..8]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         drop(committed);
         println!(
-            "PREP COMMIT {name}: prepared cells {cells} (2^{:.3}) · stacks {polys}x2^{n} · group_stacks {stacked:.3}s · commit_groups_on_host {whole:.3}s",
+            "PREP COMMIT {name}: prepared cells {cells} (2^{:.3}) · stacks {polys}x2^{n} · group_stacks {stacked:.3}s · commit_groups_on_host {whole:.3}s · roots {roots}",
             (cells as f64).log2()
         );
         // The split, on one stacked polynomial of the same height.
@@ -1053,9 +1065,13 @@ fn probe_the_host_prepared_commit_by_step() {
         )
         .expect("the tree");
         let hashed = t.elapsed().as_secs_f64();
+        let split_root: String = tree.root()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         drop(tree);
         println!(
-            "PREP COMMIT {name} SPLIT (one 2^{n} polynomial, {polys} in the stack): lift {lift:.3}s · encode {enc:.3}s · tree {hashed:.3}s · sum {:.3}s",
+            "PREP COMMIT {name} SPLIT (one 2^{n} polynomial, {polys} in the stack): lift {lift:.3}s · encode {enc:.3}s · tree {hashed:.3}s · sum {:.3}s · root {split_root}",
             lift + enc + hashed
         );
     }
