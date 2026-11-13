@@ -631,17 +631,13 @@ pub struct BlockOptions {
 }
 
 /// The host's memory target, against which live regeneration's `auto` rule
-/// arms ([`drop_wanted`]): `LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB` (read under its
-/// old name, `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB`, while the new one is unset),
-/// else the smaller of the cgroup's memory limit (v2 or v1, [`cgroup_memory`])
+/// arms ([`drop_wanted`]): `LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB`
+/// ([`memory_target_knob`]; its old name refuses the prove,
+/// [`regen::refuse_removed_spill_words`]), else the smaller of the cgroup's memory limit (v2 or v1, [`cgroup_memory`])
 /// and `MemTotal`, less 10 GiB ([`memory_target_from`]) (#1013's
 /// `spill_target_bytes` @ 035aef5d6).
 pub fn memory_target_bytes() -> u64 {
-    if let Some(bytes) = parse_target_gib(renamed_knob(
-        |name| std::env::var(name).ok(),
-        "LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB",
-        "LAMBDA_VM_BLOCK_SPILL_TARGET_GIB",
-    )) {
+    if let Some(bytes) = memory_target_knob(|name| std::env::var(name).ok()) {
         return bytes;
     }
     let limit = cgroup_memory(
@@ -659,11 +655,10 @@ pub fn memory_target_bytes() -> u64 {
     memory_target_from(limit, mem_total)
 }
 
-/// A knob's value in `env` under `name`, else under `old`, the name it had
-/// while the block had a disk store: the old name is still read for one
-/// release.
-fn renamed_knob(env: impl Fn(&str) -> Option<String>, name: &str, old: &str) -> Option<String> {
-    env(name).or_else(|| env(old))
+/// `LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB` in `env` as bytes ([`parse_target_gib`]).
+/// Its old name is not read here: set, it refuses the prove.
+fn memory_target_knob(env: impl Fn(&str) -> Option<String>) -> Option<u64> {
+    parse_target_gib(env("LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB"))
 }
 
 /// The memory target's knob in GiB as bytes; unset, or not a finite number
@@ -5698,7 +5693,7 @@ fn prove_streamed(
     // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
     // it — its chunks generated packed. The disk store's knob, which used to
     // turn it off, refuses the prove when set.
-    regen::refuse_spill_knob(std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref())?;
+    regen::refuse_removed_spill_words(|name| std::env::var(name).ok())?;
     let regen_mode = match options.regen {
         Some(mode) => mode,
         None => regen::regen_mode()?,
@@ -5805,7 +5800,6 @@ fn prove_streamed(
             regen_mode,
             live_regen.is_some(),
             std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref(),
-            std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref(),
         )
     );
     let target = deviations.memory_target.unwrap_or_else(memory_target_bytes);
@@ -8030,18 +8024,18 @@ mod memory_target_tests {
     use super::{
         CgroupValue, HostReading, MEMORY_RESERVE_PER_G, auto_wants, cgroup_memory, decision_bytes,
         drop_wanted, hand_off_need, memory_reserve_bytes, memory_short, memory_target_from,
-        no_disk_room, parse_reserve_per_g, parse_target_gib, parse_tree_drop, pressure_line,
-        real_decision_bytes, real_hand_off_need, renamed_knob,
+        memory_target_knob, no_disk_room, parse_reserve_per_g, parse_target_gib, parse_tree_drop,
+        pressure_line, real_decision_bytes, real_hand_off_need,
     };
     use crate::alloc_purge::{NoDisk, has_room};
 
     const GIB: u64 = 1 << 30;
 
-    /// The memory target's knob is read under its new name, and under the
-    /// name it had with the disk store while the new one is unset; its value is
-    /// GiB above 0, else the machine's.
+    /// The memory target's knob is read under its name only (its old name
+    /// refuses the prove, [`super::regen::refuse_removed_spill_words`]); its
+    /// value is GiB above 0, else the machine's.
     #[test]
-    fn the_renamed_knob_still_reads_its_old_name() {
+    fn the_memory_target_knob_reads_its_name_only() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |name: &str| {
                 pairs
@@ -8050,30 +8044,15 @@ mod memory_target_tests {
                     .map(|(_, v)| v.to_string())
             }
         };
-        let (new, old) = (
-            "LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB",
-            "LAMBDA_VM_BLOCK_SPILL_TARGET_GIB",
-        );
-        assert_eq!(renamed_knob(env(&[]), new, old), None);
+        assert_eq!(memory_target_knob(env(&[])), None);
         assert_eq!(
-            renamed_knob(
-                env(&[("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB", "108.28")]),
-                new,
-                old
-            ),
-            Some("108.28".to_string())
+            memory_target_knob(env(&[("LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB", "54")])),
+            Some(54 * GIB)
         );
         assert_eq!(
-            renamed_knob(
-                env(&[
-                    ("LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB", "54"),
-                    ("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB", "108.28"),
-                ]),
-                new,
-                old
-            ),
-            Some("54".to_string()),
-            "the new name wins"
+            memory_target_knob(env(&[("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB", "108.28")])),
+            None,
+            "the old name sets nothing"
         );
         assert_eq!(
             parse_target_gib(Some(" 2.5 ".to_string())),
