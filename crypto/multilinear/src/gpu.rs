@@ -4338,6 +4338,10 @@ pub enum TableColumns<'a, F: math::field::traits::IsField> {
     Records(&'a crate::records::Records),
 }
 
+/// A MEMW_R table's host decode of rows `from..to` (words mode).
+#[cfg(feature = "cuda")]
+type WordsDecode<'a> = dyn Fn(usize, usize) -> Vec<math_cuda::fill::RegRowC> + Sync + 'a;
+
 /// A table's records as the card's fill reads them, before they go up: the
 /// fill, and a CPU table's DECODE rows on the card ([`records_input`] borrows
 /// both).
@@ -4354,6 +4358,15 @@ struct RecordsUp<'a> {
     registers: Vec<&'a [math_cuda::fill::RegRowC]>,
     /// A MEMW_R table's ECALL cycles ([`crate::records::Records::ecall_cycles`]).
     ecall_cycles: Option<&'a [u32]>,
+    /// Words mode: a MEMW_R table as the walk wrote it
+    /// ([`crate::records::Records::register_words`]), its whole rows as the
+    /// card's struct, and its host decode.
+    words: Option<(
+        Vec<&'a [u64]>,
+        Vec<&'a [math_cuda::fill::RegRowC]>,
+        u64,
+        Box<WordsDecode<'a>>,
+    )>,
     aligned: Vec<&'a [math_cuda::fill::AlignedRowC]>,
     loads: Vec<&'a [math_cuda::fill::LoadOpC]>,
     stores: Vec<&'a [math_cuda::fill::StoreOpC]>,
@@ -4423,6 +4436,46 @@ impl<'a> RecordsUp<'a> {
                 .map(|p| unsafe { core::slice::from_raw_parts(p.as_ptr() as *const C, p.len()) })
                 .collect()
         }
+        // Words mode: a MEMW_R table held as words goes up as them, its rows
+        // not decoded (the card builds them).
+        if math_cuda::card_rows::builds_words()
+            && let Some(w) = records.register_words()
+        {
+            let whole = unsafe { cast::<RegisterRow, RegRowC>(&w.whole) };
+            let decode: Box<WordsDecode<'a>> = Box::new(move |from, to| {
+                records
+                    .decode_register_rows(from, to)
+                    .into_iter()
+                    .map(|r| RegRowC {
+                        timestamp: r.timestamp,
+                        val0: r.val0,
+                        val1: r.val1,
+                        old0: r.old0,
+                        old1: r.old1,
+                        old_ts_lo: r.old_ts_lo,
+                        address: r.address,
+                        is_read: r.is_read,
+                        pad: r.pad,
+                    })
+                    .collect()
+            });
+            return Some(Self {
+                rows: records.rows(),
+                cols: records.cols(),
+                fill: RecordsFill::MemwR { rows: Vec::new() },
+                decode: None,
+                hold: None,
+                logs: Vec::new(),
+                registers: Vec::new(),
+                ecall_cycles: None,
+                words: Some((w.words, whole, w.whole_base, decode)),
+                aligned: Vec::new(),
+                loads: Vec::new(),
+                stores: Vec::new(),
+                shifts: Vec::new(),
+                memws: Vec::new(),
+            });
+        }
         let fill = records.fill();
         let mut up = Self {
             rows: records.rows(),
@@ -4433,6 +4486,7 @@ impl<'a> RecordsUp<'a> {
             logs: Vec::new(),
             registers: Vec::new(),
             ecall_cycles: None,
+            words: None,
             aligned: Vec::new(),
             loads: Vec::new(),
             stores: Vec::new(),
@@ -4509,6 +4563,19 @@ pub fn card_rows_builds_registers() -> bool {
     }
 }
 
+/// Whether the walk writes MEMW_R's register rows as words for the card to
+/// build them from (`LAMBDA_VM_CARD_ROWS=words`). `false` without the card.
+pub fn card_rows_builds_words() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::card_rows::builds_words()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
 /// A block's prove starts: the card-rows cache emptied, its counters zeroed,
 /// and CPU logs kept from here to [`card_rows_end`]. Nothing without the card.
 pub fn card_rows_begin() {
@@ -4553,6 +4620,16 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
             hold: up.hold.as_ref(),
             rows: up.rows,
         },
+        RecordsFill::MemwR { .. } if up.words.is_some() => {
+            let (words, whole, whole_base, decode) = up.words.as_ref()?;
+            RecordsInput::MemwRWords {
+                words,
+                whole,
+                whole_base: *whole_base,
+                rows: up.rows,
+                decode: &**decode,
+            }
+        }
         RecordsFill::MemwR { .. } => RecordsInput::MemwR {
             records: &up.registers,
             rows: up.rows,

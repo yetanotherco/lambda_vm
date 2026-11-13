@@ -232,8 +232,11 @@ struct RegistersTableC {
     uint64_t *out;
     // The launch's rows before this table's.
     uint64_t before;
+    // The run index of `whole`'s first row: a marker's high half less this
+    // indexes `whole` (0 for a table the host planned).
+    uint64_t whole_base;
 };
-static_assert(sizeof(RegistersTableC) == 48, "RegistersTableC is 48 bytes");
+static_assert(sizeof(RegistersTableC) == 56, "RegistersTableC is 56 bytes");
 
 // A card test's mutants (`src/card_rows.rs`, `FAULT_REGISTERS`): `rs2`'s row
 // read as `rs1`'s; a write's old value read as the written value of `old`'s
@@ -301,7 +304,7 @@ extern "C" __global__ void derive_registers_from_cache(
     const uint64_t word = t.words[r];
     if ((uint32_t)word == 0) {
         // A row that crossed whole.
-        const RegRowC x = t.whole[word >> 32];
+        const RegRowC x = t.whole[(word >> 32) - t.whole_base];
         derive::register_row(w, x.address, x.timestamp,
                               (uint64_t)x.val0 | ((uint64_t)x.val1 << 32),
                               (uint64_t)x.old0 | ((uint64_t)x.old1 << 32), x.old_ts_lo,

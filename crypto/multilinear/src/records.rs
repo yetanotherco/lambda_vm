@@ -595,6 +595,30 @@ pub trait TableRecords: Send + Sync + std::fmt::Debug {
     fn ecall_cycles(&self) -> Option<&[u32]> {
         None
     }
+
+    /// A MEMW_R chunk held as the 8-byte words the card builds its rows from
+    /// (`math_cuda::card_rows`, `LAMBDA_VM_CARD_ROWS=words`); `None` (the
+    /// default) for rows and every other family. [`Self::fill`] still gives
+    /// the rows, decoded.
+    fn register_words(&self) -> Option<RegisterWords<'_>> {
+        None
+    }
+
+    /// Rows `from..to` of a MEMW_R chunk, decoded on the host (the rows the
+    /// card cannot build); empty for every other family.
+    fn decode_register_rows(&self, from: usize, to: usize) -> Vec<RegisterRow> {
+        let _ = (from, to);
+        Vec::new()
+    }
+}
+
+/// A MEMW_R chunk as words ([`TableRecords::register_words`]): a word a row,
+/// `timestamp | old_timestamp << 32`, or a marker (low half 0) whose high half
+/// is the run index of its row in `whole` (the first at `whole_base`).
+pub struct RegisterWords<'a> {
+    pub words: Vec<&'a [u64]>,
+    pub whole: Vec<&'a [RegisterRow]>,
+    pub whole_base: u64,
 }
 
 /// A table's records, shared: two are equal when they fill the same table
@@ -640,6 +664,16 @@ impl Records {
     /// [`TableRecords::ecall_cycles`].
     pub fn ecall_cycles(&self) -> Option<&[u32]> {
         self.0.ecall_cycles()
+    }
+
+    /// [`TableRecords::register_words`].
+    pub fn register_words(&self) -> Option<RegisterWords<'_>> {
+        self.0.register_words()
+    }
+
+    /// [`TableRecords::decode_register_rows`].
+    pub fn decode_register_rows(&self, from: usize, to: usize) -> Vec<RegisterRow> {
+        self.0.decode_register_rows(from, to)
     }
 
     /// Lets the records go, first handing their buffers' pages back to the

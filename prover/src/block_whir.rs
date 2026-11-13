@@ -6315,6 +6315,24 @@ fn prove_streamed(
                     // rows from the CPU logs, and needs each chunk's ECALL
                     // cycles, which the walkers read from the executor's
                     // history. Without record mode MEMW_R goes up as records.
+                    // `LAMBDA_VM_CARD_ROWS=words`: the walkers write MEMW_R's rows
+                    // as words the card builds them from. Needs record mode (the
+                    // ECALL cycles from the history) and the CPU logs kept; without
+                    // them MEMW_R goes up as rows, as today.
+                    if multilinear::gpu::card_rows_builds_words() {
+                        let words = card_fill.memw_r && history && walkers > 0 && builder.keeps_logs();
+                        if words {
+                            builder = builder.card_writes_words()?;
+                        }
+                        eprintln!(
+                            "BLOCK CARD ROWS WORDS: {}",
+                            if words {
+                                "the walkers write MEMW_R's rows as words"
+                            } else {
+                                "off (no record mode, MEMW_R not held as records, or no CPU logs kept): MEMW_R goes up as rows"
+                            }
+                        );
+                    }
                     if multilinear::gpu::card_rows_builds_registers() {
                         let marks = card_fill.memw_r && history && walkers > 0;
                         if marks {
@@ -7304,7 +7322,8 @@ fn prove_streamed(
         early_gate.store(true, std::sync::atomic::Ordering::Release);
         // `LAMBDA_VM_CARD_ROWS=registers`: the card-built rows' counters as
         // phase B starts (the block's end line holds both phases).
-        if multilinear::gpu::card_rows_builds_registers()
+        if (multilinear::gpu::card_rows_builds_registers()
+            || multilinear::gpu::card_rows_builds_words())
             && let Some(line) = multilinear::gpu::card_rows_report()
         {
             eprintln!(

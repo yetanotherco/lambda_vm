@@ -84,6 +84,7 @@ mod compact_bytewise;
 mod compact_eq;
 #[cfg(test)]
 mod keccak256_tests;
+pub(crate) mod register_words;
 #[cfg(test)]
 mod direct_count_tests {
     //! The direct counts of LT's and KECCAK's lookups against the lists the
@@ -1712,6 +1713,9 @@ struct MemwBuckets {
     register_rows: Vec<RegRow>,
     aligned: Vec<memw_aligned::AlignedRow>,
     general: Vec<MemwOperation>,
+    /// Words mode (`LAMBDA_VM_CARD_ROWS=words`): the register rows as words
+    /// and whole rows instead of `register_rows`, which then stays empty.
+    words: Option<Box<register_words::WordState>>,
 }
 
 impl MemwBuckets {
@@ -1720,7 +1724,19 @@ impl MemwBuckets {
             register_rows: Vec::with_capacity(n),
             aligned: Vec::new(),
             general: Vec::new(),
+            words: None,
         }
+    }
+
+    /// Words mode from here: `capacity` words, the window `window`.
+    fn into_words(&mut self, window: register_words::WordWindow, capacity: usize) {
+        self.register_rows = Vec::new();
+        self.words = Some(Box::new(register_words::WordState::new(window, capacity)));
+    }
+
+    /// The register rows made, in either form.
+    fn register_len(&self) -> usize {
+        self.register_rows.len() + self.words.as_ref().map_or(0, |w| w.words.len())
     }
 
     fn heap_bytes(&self) -> usize {
@@ -1732,7 +1748,10 @@ impl MemwBuckets {
     #[inline]
     fn push(&mut self, op: MemwOperation) {
         match classify_memw(&op) {
-            MemwRoute::Register => self.register_rows.push(RegRow::from_memw(&op)),
+            MemwRoute::Register => match self.words.as_deref_mut() {
+                Some(words) => words.push(RegRow::from_memw(&op)),
+                None => self.register_rows.push(RegRow::from_memw(&op)),
+            },
             MemwRoute::Aligned => self.aligned.push(memw_aligned::AlignedRow::from_memw(&op)),
             MemwRoute::General => self.general.push(op),
         }
@@ -1802,9 +1821,13 @@ impl MemwSink for MemwBuckets {
         // `old_ts` (always true here by construction). If it passes, fill a RegRow
         // directly; otherwise fall back to the general/aligned MemwOperation path.
         if reg_ts_delta_in_range(timestamp, old_ts) {
-            self.register_rows.push(RegRow::new(
+            let row = RegRow::new(
                 reg_addr, timestamp, val[0], val[1], old[0], old[1], old_ts, is_read,
-            ));
+            );
+            match self.words.as_deref_mut() {
+                Some(words) => words.push(row),
+                None => self.register_rows.push(row),
+            }
         } else {
             let op = build_reg_fallback(reg_addr, val, old, timestamp, old_ts, is_read);
             debug_assert!(!is_register_op(&op), "reg fallback must not be MEMW_R");
@@ -8338,6 +8361,7 @@ fn collect_all_ops(
         register_rows: memw_register_rows,
         aligned: memw_aligned_ops,
         general: memw_ops,
+        words: _,
     } = memw;
 
     let RoutedSegments {

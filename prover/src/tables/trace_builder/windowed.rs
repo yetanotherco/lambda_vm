@@ -999,6 +999,48 @@ impl<'a> WindowedTraceBuilder<'a> {
         self.kept.as_ref().is_some_and(|kept| kept.ecalls.is_some())
     }
 
+    /// Words mode (`LAMBDA_VM_CARD_ROWS=words`): with
+    /// [`Self::card_fill_streamed`] holding MEMW_R chunks as records and the
+    /// CPU logs kept, each record-mode walker writes its window's register
+    /// rows as the 8-byte words the card builds rows from
+    /// ([`super::register_words`]), and every host reader of a chunk's rows
+    /// decodes them from the logs. Windows walked without the history give
+    /// their rows whole. Before the first window only. The tables are the
+    /// same.
+    pub fn card_writes_words(mut self) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "card_writes_words after a window was walked".to_string(),
+            ));
+        }
+        if !self.card_fill_streamed.as_ref().is_some_and(|c| c.memw_r) {
+            return Err(Error::Prover(
+                "card_writes_words: card_fill_streamed with MEMW_R first".to_string(),
+            ));
+        }
+        if !self.keeps_logs() {
+            return Err(Error::Prover(
+                "card_writes_words: a build that keeps the CPU logs".to_string(),
+            ));
+        }
+        let Some(kept) = self.kept.as_mut() else {
+            return Err(Error::Prover(
+                "card_writes_words: a build that drops its streamed ops".to_string(),
+            ));
+        };
+        kept.words = Some(KeptWords::new());
+        Ok(self)
+    }
+
+    /// Whether the walkers write words ([`Self::card_writes_words`]): the CPU
+    /// tables' length in cycles, which bounds where a word's old access lies.
+    pub fn writes_words(&self) -> Option<usize> {
+        self.kept
+            .as_ref()
+            .is_some_and(|kept| kept.words.is_some())
+            .then_some(self.max_rows.cpu)
+    }
+
     /// A test's fault: with [`Self::card_fill_streamed`], each CPU chunk held
     /// as its logs has every log's first source value (`src1_val`) and
     /// written value (`dst_val`) XORed with `by` (the CPU table writes its own
@@ -1521,7 +1563,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                     kept.listless = false;
                 }
                 kept.append(last, &decode);
-                let (cpu_ops, walk, rest, decode_trace) = kept.into_run();
+                let (cpu_ops, walk, rest, decode_trace) = kept.into_run(&decode);
                 super::build_stamps::mark("p0 concatenate");
                 let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state);
                 super::build_stamps::mark("p0 assemble");
@@ -1822,6 +1864,7 @@ impl Walker<'_> {
             self.register_state,
             *self.cycles,
             logs,
+            None,
         )?;
         *self.cycles += logs.len();
         *self.walk_secs += t.elapsed().as_secs_f64();
@@ -1863,6 +1906,7 @@ fn walk_window(
     registers: &mut RegisterState,
     first: usize,
     logs: &[Log],
+    words: Option<super::register_words::WordWindow>,
 ) -> Result<WalkedWindow, Error> {
     // As a whole-run build: only the last cycle may halt.
     if logs.iter().any(|log| log.next_pc == 0) {
@@ -1879,6 +1923,9 @@ fn walk_window(
     } else {
         WalkOutputs::for_walk(logs.len(), lookups)
     };
+    if let Some(window) = words {
+        walk.memw.into_words(window, logs.len() * 3);
+    }
     // The walk is a left fold over the CPU ops: walking each batch right
     // after collecting it gives the window's lists, with the batch's ops
     // still in cache instead of read back from the whole window's list.
@@ -1943,6 +1990,9 @@ fn batch_len(batch: usize, cycles: usize) -> usize {
 #[derive(Clone, Copy)]
 struct BatchMarks {
     register_rows: usize,
+    /// Words mode: the words and whole rows made so far.
+    words: usize,
+    whole: usize,
     aligned: usize,
     load: usize,
     shift: usize,
@@ -1952,6 +2002,8 @@ impl BatchMarks {
     fn of(walk: &WalkOutputs) -> Self {
         Self {
             register_rows: walk.memw.register_rows.len(),
+            words: walk.memw.words.as_ref().map_or(0, |w| w.words.len()),
+            whole: walk.memw.words.as_ref().map_or(0, |w| w.whole.len()),
             aligned: walk.memw.aligned.len(),
             load: walk.load_ops.len(),
             shift: walk.shift_ops.len(),
@@ -2003,6 +2055,9 @@ impl WalkCounts {
             &walk.memw.register_rows[marks.register_rows..],
             histogram,
         );
+        if let Some(words) = walk.memw.words.as_deref() {
+            words.count_bitwise_from(marks.words, marks.whole, histogram);
+        }
         histogram.add_ops(&super::collect_bitwise_from_memw_aligned(
             &walk.memw.aligned[marks.aligned..],
         ));
@@ -2093,7 +2148,7 @@ impl Accumulator<'_> {
         let walk = &window.walk;
         let mut added = [
             window.cycles,
-            walk.memw.register_rows.len(),
+            walk.memw.register_len(),
             walk.memw.aligned.len(),
             walk.memw.general.len(),
             walk.load_ops.len(),
@@ -2141,7 +2196,7 @@ impl Accumulator<'_> {
         if let Some(made) = made.as_ref() {
             let walk = &window.walk;
             self.walked.cpu += window.cycles;
-            self.walked.memw_register += walk.memw.register_rows.len();
+            self.walked.memw_register += walk.memw.register_len();
             self.walked.memw_aligned += walk.memw.aligned.len();
             self.walked.shift += walk.shift_ops.len();
             if made.last_ecall.is_some() {
@@ -2823,6 +2878,188 @@ impl EcallTail {
     }
 }
 
+/// The register rows in words mode ([`WindowedTraceBuilder::card_writes_words`]):
+/// the run's words and whole rows not yet handed out, where its markers lie,
+/// and the logs of the windows a chunk still to leave may decode from.
+struct KeptWords {
+    words: Tail<u64>,
+    whole: Tail<super::RegRow>,
+    /// Each marker's place among the run's words, ascending.
+    markers: VecDeque<u64>,
+    /// The windows' logs (first cycle, logs), ascending.
+    logs: VecDeque<(u64, Arc<Vec<Log>>)>,
+    /// Words and whole rows appended, and handed out, since the run began.
+    words_in: u64,
+    whole_in: u64,
+    words_out: u64,
+    whole_out: u64,
+    /// A window came without its logs: its rows cannot be decoded, so words
+    /// mode cannot hand the run out. Refused at the finish.
+    broken: Option<String>,
+}
+
+impl KeptWords {
+    fn new() -> Self {
+        Self {
+            words: Tail::new(),
+            whole: Tail::new(),
+            markers: VecDeque::new(),
+            logs: VecDeque::new(),
+            words_in: 0,
+            whole_in: 0,
+            words_out: 0,
+            whole_out: 0,
+            broken: None,
+        }
+    }
+
+    /// A walked window's register rows, in run order: its words (markers set
+    /// to their whole rows' run indices), or its rows as whole rows when its
+    /// walker wrote rows.
+    fn append(
+        &mut self,
+        first: u64,
+        words: Option<Box<super::register_words::WordState>>,
+        rows: Vec<super::RegRow>,
+        logs: Option<Arc<Vec<Log>>>,
+    ) {
+        // Only a window walked as words needs its logs: rows from a walker
+        // without words cross whole.
+        let as_words = words.is_some();
+        let mut state = match words {
+            Some(state) => *state,
+            None => {
+                // Rows from a walker without words: each crosses whole.
+                let mut state = super::register_words::WordState::new(
+                    super::register_words::WordWindow::new(first, 0, 1, []),
+                    rows.len(),
+                );
+                for row in rows {
+                    state.push_whole(row);
+                }
+                state
+            }
+        };
+        if state.words.is_empty() {
+            return;
+        }
+        match logs {
+            Some(logs) => self.logs.push_back((first, logs)),
+            None if as_words => {
+                self.broken.get_or_insert_with(|| {
+                    format!("window at cycle {first} came without its logs")
+                });
+            }
+            None => {}
+        }
+        super::register_words::set_markers(&mut state, self.whole_in);
+        self.markers.extend(
+            state
+                .markers
+                .iter()
+                .map(|&at| self.words_in + u64::from(at)),
+        );
+        self.words_in += state.words.len() as u64;
+        self.whole_in += state.whole.len() as u64;
+        self.words.push(state.words);
+        self.whole.push(state.whole);
+    }
+
+    /// The next `n` words as a chunk: its words, its whole rows (the first at
+    /// run index `whole_base`), and the logs its rows decode from.
+    fn take(&mut self, n: usize) -> WordChunk {
+        let (words, _) = self.words.take_counted(n);
+        let end = self.words_out + n as u64;
+        let mut k = 0usize;
+        while self.markers.front().is_some_and(|&at| at < end) {
+            self.markers.pop_front();
+            k += 1;
+        }
+        let whole = if k > 0 {
+            self.whole.take_counted(k).0
+        } else {
+            Segments { parts: Vec::new() }
+        };
+        let whole_base = self.whole_out;
+        self.words_out = end;
+        self.whole_out += k as u64;
+        let (lo, hi) =
+            super::register_words::cycle_span(&words.slices(), &whole.slices(), whole_base);
+        let logs: Vec<(u64, Arc<Vec<Log>>)> = self
+            .logs
+            .iter()
+            .filter(|(f, l)| *f <= hi && lo < f + l.len() as u64)
+            .map(|(f, l)| (*f, Arc::clone(l)))
+            .collect();
+        // The next chunk's rows start at this one's last cycle or later, and
+        // a word's old access lies in its own window.
+        while self
+            .logs
+            .front()
+            .is_some_and(|(f, l)| f + (l.len() as u64) <= hi)
+        {
+            self.logs.pop_front();
+        }
+        WordChunk {
+            words,
+            whole,
+            whole_base,
+            logs,
+        }
+    }
+}
+
+/// A MEMW_R chunk in words mode: its words, the whole rows its markers name
+/// (the first at run index `whole_base`), and the logs of the windows its
+/// rows lie in (shared with the CPU tail and records).
+pub(crate) struct WordChunk {
+    pub(crate) words: Segments<u64>,
+    pub(crate) whole: Segments<super::RegRow>,
+    pub(crate) whole_base: u64,
+    pub(crate) logs: Vec<(u64, Arc<Vec<Log>>)>,
+}
+
+impl WordChunk {
+    pub(crate) fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    /// The bytes it holds (words and whole rows; the logs are shared).
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.words.op_bytes() + self.whole.op_bytes()
+    }
+
+    /// The walk's rows back, decoded from the logs
+    /// ([`super::register_words::decode_rows`]); `range` of its words only.
+    pub(crate) fn decode(
+        &self,
+        decode: &DecodeTable,
+        range: std::ops::Range<usize>,
+    ) -> Result<Vec<super::RegRow>, Error> {
+        let words = self.words.slices();
+        let flat: Vec<u64>;
+        let pieces: Vec<&[u64]> = if range == (0..self.len()) {
+            words
+        } else {
+            flat = words
+                .iter()
+                .flat_map(|p| p.iter())
+                .copied()
+                .skip(range.start)
+                .take(range.len())
+                .collect();
+            vec![&flat[..]]
+        };
+        super::register_words::decode_rows(
+            &pieces,
+            &self.whole.slices(),
+            self.whole_base,
+            &self.logs,
+            decode,
+        )
+    }
+}
+
 /// The run so far under [`WindowedTraceBuilder::drop_streamed_ops`].
 struct Kept {
     cpu: Tail<super::CpuOperation>,
@@ -2836,6 +3073,9 @@ struct Kept {
     /// their chunks; `None` without, and from a window that came without
     /// them.
     ecalls: Option<EcallTail>,
+    /// Words mode ([`WindowedTraceBuilder::card_writes_words`]): the register
+    /// rows as words and whole rows, in place of `register_rows`.
+    words: Option<KeptWords>,
     aligned: Tail<memw_aligned::AlignedRow>,
     general: Tail<super::MemwOperation>,
     load: Tail<super::LoadOperation>,
@@ -2967,6 +3207,7 @@ impl Kept {
             logs: None,
             register_rows: Tail::new(),
             ecalls: None,
+            words: None,
             aligned: Tail::new(),
             general: Tail::new(),
             load: Tail::new(),
@@ -3093,6 +3334,8 @@ impl Kept {
                 }
             }
         }
+        // Words mode decodes a chunk's rows from its windows' logs (shared).
+        let logs_for_words = self.words.as_ref().and(logs.as_ref()).map(Arc::clone);
         if self.listless {
             // Its logs stand for its CPU ops (any list its walker kept goes).
             match (self.logs.as_mut(), logs) {
@@ -3133,7 +3376,10 @@ impl Kept {
         if !self.listless {
             self.cpu.push(cpu_ops);
         }
-        self.register_rows.push(memw.register_rows);
+        match self.words.as_mut() {
+            Some(kept) => kept.append(first as u64, memw.words, memw.register_rows, logs_for_words),
+            None => self.register_rows.push(memw.register_rows),
+        }
         self.aligned.push(memw.aligned);
         self.general.push(memw.general);
         self.load.push(load_ops);
@@ -3155,12 +3401,16 @@ impl Kept {
 
     /// The run's lists with the handed-out ops left out (the streamed tables'
     /// tails in a walk's lists, the others in blocks), and DECODE.
-    fn into_run(self) -> (Vec<super::CpuOperation>, WalkOutputs, KeptRest, Table) {
+    fn into_run(
+        self,
+        decode_table: &DecodeTable,
+    ) -> (Vec<super::CpuOperation>, WalkOutputs, KeptRest, Table) {
         let Kept {
             cpu,
             logs: _,
             register_rows,
             ecalls: _,
+            words,
             aligned,
             general,
             load,
@@ -3172,10 +3422,25 @@ impl Kept {
             listless_broken: _,
         } = self;
         let mut walk = WalkOutputs::with_capacity(0);
+        // Words mode: the run's last register rows, decoded from the logs.
+        let register_rows = match words {
+            Some(mut words) => {
+                if let Some(e) = &words.broken {
+                    panic!("words mode: {e}");
+                }
+                let n = words.words.len;
+                let chunk = words.take(n);
+                chunk
+                    .decode(decode_table, 0..chunk.len())
+                    .unwrap_or_else(|e| panic!("the run's last MEMW_R rows: {e}"))
+            }
+            None => register_rows.into_vec(),
+        };
         walk.memw = MemwBuckets {
-            register_rows: register_rows.into_vec(),
+            register_rows,
             aligned: aligned.into_vec(),
             general: general.into_vec(),
+            words: None,
         };
         walk.load_ops = load.into_vec();
         walk.lt_ops = lt.into_vec();
@@ -3452,6 +3717,36 @@ fn memw_register_chunk_ops(
     }
 }
 
+/// A full MEMW_R chunk in words mode, as handed out: held as its words (the
+/// card builds the rows) while the card fills MEMW_R and has room; otherwise
+/// its rows, decoded from the logs, to be filled on the host as today's.
+fn memw_register_words_chunk_ops(
+    chunk: WordChunk,
+    decode: &Arc<DecodeTable>,
+    index: usize,
+    card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
+) -> ChunkOps {
+    let decoded = |chunk: &WordChunk| {
+        let rows = chunk
+            .decode(decode, 0..chunk.len())
+            .unwrap_or_else(|e| panic!("MEMW_R chunk {index}: {e}"));
+        ChunkOps::MemwRegister(Segments::one(rows))
+    };
+    let Some((card, stamps)) = card.filter(|(card, _)| card.memw_r) else {
+        return decoded(&chunk);
+    };
+    let bytes = chunk.held_bytes();
+    if !card_records::whole_table(chunk.len())
+        || !card.admits(bytes, (StreamTable::MemwRegister, index), stamps)
+    {
+        stamps.memw_r[1] += 1;
+        return decoded(&chunk);
+    }
+    stamps.memw_r[0] += 1;
+    stamps.records_bytes += bytes;
+    ChunkOps::MemwRegisterRecords(RegisterRowRecords::from_words(chunk, Arc::clone(decode)))
+}
+
 /// [`chunk_jobs`] under [`WindowedTraceBuilder::drop_streamed_ops`]: every full
 /// chunk taken out of the tails, and what the table phase reads from its ops
 /// counted as it leaves (`counted`, and DECODE in `kept`), each timed into
@@ -3567,6 +3862,42 @@ fn tail_jobs(
             ops,
         });
         e.cpu += 1;
+    }
+    while let Some(words) = kept
+        .words
+        .as_mut()
+        .filter(|words| words.words.len >= m.memw_register)
+    {
+        let t = Instant::now();
+        let chunk = words.take(m.memw_register);
+        let taken = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        if !walker_counted {
+            for (w, whole) in [(chunk.words.slices(), chunk.whole.slices())] {
+                let words: Vec<u64> = w.iter().flat_map(|p| p.iter()).copied().collect();
+                let whole: Vec<super::RegRow> =
+                    whole.iter().flat_map(|p| p.iter()).copied().collect();
+                super::register_words::count_bitwise(&words, &whole, &mut counted.histogram);
+            }
+        }
+        let ops = memw_register_words_chunk_ops(
+            chunk,
+            decode_table,
+            e.memw_register,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+        );
+        stamps.note(
+            StreamTable::MemwRegister,
+            taken,
+            t.elapsed().as_secs_f64(),
+            0,
+        );
+        jobs.push(ChunkJob {
+            table: StreamTable::MemwRegister,
+            index: e.memw_register,
+            ops,
+        });
+        e.memw_register += 1;
     }
     while kept.register_rows.len >= m.memw_register {
         let t = Instant::now();
@@ -3865,6 +4196,7 @@ fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOut
             register_rows,
             aligned,
             general,
+            words: None,
         },
         load_ops: load,
         lt_ops: lt,
@@ -4169,6 +4501,7 @@ fn assemble(
         register_rows: mut memw_register_rows,
         aligned: mut memw_aligned_ops,
         general: mut memw_ops,
+        words: _,
     } = memw;
     // HALT's register ops land at the end of their buckets, as in
     // `collect_all_ops`.
@@ -4401,6 +4734,7 @@ impl RegenBuilder {
             mut register_rows,
             mut aligned,
             mut general,
+            words: _,
         } = walk.memw;
         #[cfg_attr(not(test), allow(unused_mut))]
         let (mut load, mut lt, mut shift) = (walk.load_ops, walk.lt_ops, walk.shift_ops);
@@ -4588,6 +4922,8 @@ mod count_made_tests;
 
 #[cfg(all(test, feature = "parallel"))]
 mod cpu_listless_tests;
+#[cfg(test)]
+mod register_words_tests;
 
 #[cfg(test)]
 mod tail_tests;
