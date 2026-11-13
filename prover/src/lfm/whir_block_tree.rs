@@ -1324,6 +1324,18 @@ pub(crate) fn early_leaf_fits(
     })
 }
 
+/// How many early leaves the planner may start: `early_leaves`
+/// (`W3_EARLY_LEAVES`) when phase B led at least two leaves, else one, the
+/// single early leaf's path exactly (with fewer led, the other leaves complete
+/// with phase B's last groups).
+pub(crate) fn early_room(early_leaves: usize, led: usize) -> usize {
+    if early_leaves > 1 && led >= 2 {
+        early_leaves
+    } else {
+        1
+    }
+}
+
 /// `order` with the leaves `first` taken before the others, in `first`'s
 /// order ([`early_leaf_first`] for each, the last first); with one leaf it is
 /// [`early_leaf_first`].
@@ -1734,6 +1746,9 @@ pub(crate) fn prove_tree_pipelined(
         .map(|l| l.arities.iter().map(|_| Published::new()).collect())
         .collect();
 
+    // The tree's own leaves go ahead only when there are several early ones;
+    // with one, the order is the single early leaf's.
+    let in_tree_ahead = if early_n > 1 { in_tree_ahead } else { 0 };
     let order = early_leaves_order(tree_order(leaves.len(), &shape), &first, in_tree_ahead);
     let results: Vec<Vec<Published<ProvedProgram>>> = std::iter::once(leaves.len())
         .chain(shape.iter().map(|l| l.arities.len()))
@@ -2476,7 +2491,15 @@ pub fn prove_whir_block_tree(
                             block_roots = msg.roots;
                             block_answers = msg.commit_ood;
                         }
-                        if early.len() >= early_leaves || done >= plan.num_groups() {
+                        // More than one early leaf only when phase B led several
+                        // leaves: with fewer (no valid order) the other leaves
+                        // complete with phase B's last groups, so the single
+                        // early leaf's path is kept exactly.
+                        let room = early_room(
+                            early_leaves,
+                            lead_ref.taken().map_or(0, |t| t.leaves.len()),
+                        );
+                        if early.len() >= room || done >= plan.num_groups() {
                             continue;
                         }
                         let partition = plan.partition();
@@ -4382,6 +4405,22 @@ mod tests {
         // Every leaf early: their order.
         let o = early_leaves_order(base.clone(), &[3, 2, 1, 0], 2);
         assert_eq!(&o[..4], &[leaf(3), leaf(2), leaf(1), leaf(0)]);
+    }
+
+    /// Several early leaves only when phase B led several leaves; otherwise
+    /// (no valid order, or one leaf led) the single early leaf.
+    #[test]
+    fn several_early_leaves_only_when_phase_b_led_several() {
+        assert_eq!(early_room(EARLY_LEAVES_DEFAULT, 4), EARLY_LEAVES_DEFAULT);
+        assert_eq!(early_room(EARLY_LEAVES_DEFAULT, 2), EARLY_LEAVES_DEFAULT);
+        assert_eq!(early_room(EARLY_LEAVES_DEFAULT, 1), 1);
+        assert_eq!(
+            early_room(EARLY_LEAVES_DEFAULT, 0),
+            1,
+            "no valid order: the single early leaf"
+        );
+        assert_eq!(early_room(1, 4), 1, "the control");
+        assert_eq!(early_room(3, 3), 3);
     }
 
     #[test]
