@@ -35,7 +35,11 @@
 //   9. the Möbius levels fused into the first pass (F_MOBIUS): the encoding's
 //      other Möbius levels on the host, then the fused transform, against the
 //      whole Möbius transform on the host then today's spread transform, in
-//      both plans, spacings 1..16, edge words planted.
+//      both plans, spacings 1..64, edge words planted;
+//  10. the spread rule (`lde_cm::spread_supports`): spacings 32 and 64 are taken
+//      only where the first pass holds them (k >= lb), and the rule is
+//      load-bearing — past it, the replayed transform is not the DFT.
+// Sections 6, 7 and 9 run every spacing the rule admits, 1..64.
 //
 // WHAT IT DOES NOT COVER: whether nvcc accepts the file, and everything about
 // execution — grid sizing, shared-memory size, races the replay order cannot
@@ -605,6 +609,13 @@ void test_coeff_form() {
     }
 }
 
+// The engine's spread rule (`lde_cm::spread_supports`): spacing 2^lb fits a
+// transform whose first pass (`ks[0]` levels) holds a whole spacing — up to
+// 2^4 at every size, up to 2^6 where that pass has at least lb levels.
+bool spread_fits(unsigned log_n, unsigned lb, const std::vector<unsigned> &ks) {
+    return lb <= log_n && (lb <= 4 || (lb <= 6 && lb <= ks[0]));
+}
+
 // 6. The single-column spread transform the WHIR commit's encoding runs
 // (`lde_cm::spread_ntt_column`): position B·q of the DIT input is src[q], the
 // rest zero, no weights — the legacy `lift_spread` then the DIT body. A DIT with
@@ -613,7 +624,8 @@ void test_coeff_form() {
 void test_spread_transform() {
     const std::vector<u64> fwd = root_table(false);
     for (unsigned log_n = 4; log_n <= 11; ++log_n) {
-        for (unsigned lb = 0; lb <= 4 && lb <= log_n; ++lb) {
+        for (unsigned lb = 0; lb <= 6; ++lb) {
+            if (!spread_fits(log_n, lb, plan(log_n))) continue;
             const u64 N = (u64)1 << log_n;
             const unsigned log_c = log_n - lb;
             const u64 n = (u64)1 << log_c;
@@ -677,7 +689,8 @@ std::vector<u64> edge_words(u64 n) {
 // pinned by 2. and 6. — at every size up to 2^20 where the plans differ.
 void test_wide_spread_transform() {
     for (unsigned log_n = 4; log_n <= 12; ++log_n) {
-        for (unsigned lb = 0; lb <= 4 && lb <= log_n; ++lb) {
+        for (unsigned lb = 0; lb <= 6; ++lb) {
+            if (!spread_fits(log_n, lb, plan_wide(log_n))) continue;
             const unsigned log_c = log_n - lb;
             const u64 n = (u64)1 << log_c, N = (u64)1 << log_n;
             const std::vector<u64> src = edge_words(n);
@@ -694,7 +707,8 @@ void test_wide_spread_transform() {
         const std::vector<unsigned> today = plan(log_n), wide = plan_wide(log_n);
         if (today == wide) continue;
         ++differing;
-        for (unsigned lb : {0u, 1u, 2u, 4u}) {
+        for (unsigned lb : {0u, 1u, 2u, 4u, 5u, 6u}) {
+            if (!spread_fits(log_n, lb, today) || !spread_fits(log_n, lb, wide)) continue;
             const u64 n = (u64)1 << (log_n - lb);
             const std::vector<u64> src = edge_words(n);
             const std::vector<u64> want = spread_transform(src, log_n, lb, today);
@@ -770,8 +784,9 @@ void tile_layout_k() {
 // [0, F); the oracle runs every level, then today's transform.
 void test_fused_mobius() {
     for (unsigned log_n = 4; log_n <= 20; ++log_n) {
-        for (unsigned lb : {0u, 1u, 2u, 4u}) {
+        for (unsigned lb : {0u, 1u, 2u, 4u, 5u, 6u}) {
             if (lb > log_n || (log_n > 13 && log_n < 17 && lb != 1)) continue;
+            if (!spread_fits(log_n, lb, plan(log_n))) continue;
             const unsigned log_c = log_n - lb;
             const std::vector<u64> src = edge_words((u64)1 << log_c);
             std::vector<u64> full = src;
@@ -779,6 +794,7 @@ void test_fused_mobius() {
             const std::vector<u64> want = spread_transform(full, log_n, lb, plan(log_n));
             for (bool wide : {false, true}) {
                 const std::vector<unsigned> ks = wide ? plan_wide(log_n) : plan(log_n);
+                if (!spread_fits(log_n, lb, ks)) continue;
                 const unsigned f = ks[0] + pass_log_t(log_n, 0, ks[0]) - lb;
                 std::vector<u64> part = src;
                 host_mobius(part, f, log_c);
@@ -801,6 +817,31 @@ void test_fused_mobius() {
     CHECK(!eq_canon(spread_transform(part, log_n, lb, plan(log_n)),
                     spread_transform(full, log_n, lb, plan(log_n)), &where),
           "the unfused partial transform equals the codeword: the check cannot fail");
+}
+
+// 10. The spread rule at spacings 32 and 64. Every production encode size
+// (2^20..2^32) admits both in both plans; a short first pass does not, and
+// there the replayed transform is not the DFT — the rule is what keeps such a
+// shape on the legacy path.
+void test_spread_rule() {
+    for (unsigned log_n = 20; log_n <= 32; ++log_n)
+        for (unsigned lb : {5u, 6u}) {
+            CHECK(spread_fits(log_n, lb, plan(log_n)), "2^%u at spacing 2^%u: today's plan refuses", log_n, lb);
+            CHECK(spread_fits(log_n, lb, plan_wide(log_n)), "2^%u at spacing 2^%u: the wide plan refuses",
+                  log_n, lb);
+        }
+    CHECK(plan(9) == std::vector<unsigned>({5, 4}), "plan(9) is not [5, 4]");
+    CHECK(!spread_fits(9, 6, plan(9)), "2^9 at spacing 2^6 fits a 5-level first pass");
+    CHECK(spread_fits(9, 5, plan(9)), "2^9 at spacing 2^5 does not fit a 5-level first pass");
+    for (unsigned lb : {6u}) {
+        const unsigned log_n = 9, log_c = log_n - lb;
+        const std::vector<u64> src = edge_words((u64)1 << log_c);
+        std::vector<u64> y((u64)1 << log_n, 0);
+        for (u64 j = 0; j < ((u64)1 << log_c); ++j) y[j] = src[rev(j, log_c)];
+        size_t where = 0;
+        CHECK(!eq_canon(spread_transform(src, log_n, lb, plan(log_n)), naive_dft(y, log_n, false), &where),
+              "2^9 at spacing 2^6 past the rule equals the DFT: the rule's bound is not load-bearing");
+    }
 }
 
 void test_tile_layout() {
@@ -837,6 +878,8 @@ int main() {
     std::printf("+ tile layout: %d checks, %d failures\n", g_checks, g_failures);
     test_fused_mobius();
     std::printf("+ fused Möbius: %d checks, %d failures\n", g_checks, g_failures);
+    test_spread_rule();
+    std::printf("+ spread rule: %d checks, %d failures\n", g_checks, g_failures);
     if (g_failures) {
         std::printf("NTT_CM HOST KAT: FAILED (%d of %d)\n", g_failures, g_checks);
         return 1;

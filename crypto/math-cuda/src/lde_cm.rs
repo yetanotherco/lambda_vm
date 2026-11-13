@@ -167,9 +167,16 @@ pub fn wide_codewords_encoded() -> u64 {
 /// thread, so a transform needs at least 2^4 of them.
 pub const MIN_LOG_N: u32 = 4;
 
-/// Largest blowup the fused spread covers: the first forward pass must hold a
-/// whole coset of `B` spread positions (`B <= 2^k`, `k >= 4`).
+/// Largest blowup the fused spread covers at EVERY transform size: the first
+/// forward pass must hold a whole coset of `B` spread positions (`B <= 2^k`),
+/// and the shortest first pass is `k = 4`.
 pub const MAX_LOG_BLOWUP: u32 = 4;
+
+/// Largest spacing [`spread_ntt_column`] takes where the transform's first
+/// pass is long enough to hold it ([`spread_supports`]): `2^6`, the WHIR
+/// encoding's blowup 64. Every encode of `2^20` positions or more has a first
+/// pass of at least 6 levels in either plan.
+pub const MAX_SPREAD_LOG_BLOWUP: u32 = 6;
 
 /// Whether an `n`-row, blowup-`b` LDE fits the engine's shapes. Callers take
 /// the legacy path otherwise.
@@ -183,14 +190,19 @@ pub fn supports(n: usize, blowup: usize) -> bool {
 }
 
 /// Whether a length-`2^log_n` transform of an input spread at spacing
-/// `2^log_blowup` fits [`spread_ntt_column`]: the first pass must hold a whole
-/// spacing (`2^log_blowup <= 2^k`, `k >= 4`). Spacing 1 (`log_blowup = 0`) is a
-/// plain transform of a bit-reversed input.
+/// `2^log_blowup` fits [`spread_ntt_column`] in the plan in force on the
+/// calling thread: the first pass must hold a whole spacing (`2^log_blowup <=
+/// 2^k`) — always up to [`MAX_LOG_BLOWUP`], and up to
+/// [`MAX_SPREAD_LOG_BLOWUP`] where the first pass has at least `log_blowup`
+/// levels (the spread stage tests a position's low `log_blowup` bits inside
+/// one first-pass sub-transform). Spacing 1 (`log_blowup = 0`) is a plain
+/// transform of a bit-reversed input. A shape outside takes the legacy path.
 pub fn spread_supports(log_n: u32, log_blowup: u32) -> bool {
     log_n >= MIN_LOG_N
         && log_n <= GoldilocksField::TWO_ADICITY as u32
-        && log_blowup <= MAX_LOG_BLOWUP
         && log_blowup <= log_n
+        && (log_blowup <= MAX_LOG_BLOWUP
+            || (log_blowup <= MAX_SPREAD_LOG_BLOWUP && log_blowup <= spread_plan(log_n)[0]))
 }
 
 /// Pass sizes for a length-`2^l` transform: `ceil(l / 8)` passes of 4..=8
@@ -890,11 +902,32 @@ mod tests {
         assert!(spread_supports(24, 2), "the WHIR production shape");
         assert!(spread_supports(8, 4));
         assert!(!spread_supports(3, 0), "transform below 2^4");
-        assert!(
-            !spread_supports(20, 5),
-            "spacing beyond one first-pass tile"
-        );
         assert!(!spread_supports(33, 2), "beyond the two-adicity");
+        // Spacings 32 and 64 where the first pass holds them, in both plans:
+        // every encode of 2^20 positions or more, the WHIR blowup-64 encodes.
+        for wide in [false, true] {
+            with_ntt_wide(wide, || {
+                for log_n in 20..=32 {
+                    for lb in [5, 6] {
+                        assert!(
+                            spread_supports(log_n, lb),
+                            "2^{log_n} at 2^{lb}, wide {wide}"
+                        );
+                    }
+                }
+                assert!(!spread_supports(30, 7), "spacing beyond the widened bound");
+            });
+        }
+        // ... and not where a first pass is shorter: today's plan of 2^9 is
+        // [5, 4], so spacing 64 stays on the legacy path and 32 does not.
+        with_ntt_wide(false, || {
+            assert_eq!(plan(9), vec![5, 4]);
+            assert!(!spread_supports(9, 6), "2^9 at 2^6: a 5-level first pass");
+            assert!(
+                spread_supports(9, 5),
+                "2^9 at 2^5: a 5-level first pass holds it"
+            );
+        });
     }
 
     #[test]
