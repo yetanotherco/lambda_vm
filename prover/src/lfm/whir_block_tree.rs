@@ -1325,6 +1325,43 @@ pub(crate) fn early_leaves_first(order: Vec<TreeAt>, first: &[usize]) -> Vec<Tre
         .fold(order, |order, &k| early_leaf_first(order, Some(k)))
 }
 
+/// The tree's order with several early leaves: up to `in_tree_ahead` of the
+/// leaves the tree still executes (not in `early`), in their order, then the
+/// early leaves in `early`'s order, then the other leaves. A leaf the tree
+/// executes needs a worker for its whole execute + fill before its prove, while
+/// an early leaf is ready and needs only the card; taking the early ones first
+/// (on the large block, three early leaves on three workers) left the last leaf's
+/// execute waiting 1.8 s for a worker. With `in_tree_ahead` 0 it is
+/// [`early_leaves_first`]. The nodes keep their places after every leaf.
+pub(crate) fn early_leaves_order(
+    order: Vec<TreeAt>,
+    early: &[usize],
+    in_tree_ahead: usize,
+) -> Vec<TreeAt> {
+    if in_tree_ahead == 0 {
+        return early_leaves_first(order, early);
+    }
+    let leaves: Vec<TreeAt> = order.iter().copied().filter(|t| t.lv == 0).collect();
+    let rest: Vec<TreeAt> = order.iter().copied().filter(|t| t.lv != 0).collect();
+    let in_tree: Vec<TreeAt> = leaves
+        .iter()
+        .copied()
+        .filter(|t| !early.contains(&t.j))
+        .collect();
+    let ahead = in_tree.len().min(in_tree_ahead);
+    let early_at: Vec<TreeAt> = early
+        .iter()
+        .filter_map(|&j| leaves.iter().copied().find(|t| t.j == j))
+        .collect();
+    in_tree[..ahead]
+        .iter()
+        .copied()
+        .chain(early_at)
+        .chain(in_tree[ahead..].iter().copied())
+        .chain(rest)
+        .collect()
+}
+
 /// `W3 LEAF FIRST`: whether the leaves were offered to phase B and when, what
 /// phase B did with them (the turn it read the offer, the leaf it led with and
 /// how many groups it moved) and which leaf was early.
@@ -1644,6 +1681,7 @@ pub(crate) fn prove_tree_pipelined(
     exec_early: bool,
     top_handoff: Option<&TopHandoff>,
     base_end: f64,
+    in_tree_ahead: usize,
     say: &(dyn Fn(&str) + Sync),
 ) -> Result<
     (
@@ -1687,7 +1725,7 @@ pub(crate) fn prove_tree_pipelined(
         .map(|l| l.arities.iter().map(|_| Published::new()).collect())
         .collect();
 
-    let order = early_leaves_first(tree_order(leaves.len(), &shape), &first);
+    let order = early_leaves_order(tree_order(leaves.len(), &shape), &first, in_tree_ahead);
     let results: Vec<Vec<Published<ProvedProgram>>> = std::iter::once(leaves.len())
         .chain(shape.iter().map(|l| l.arities.len()))
         .map(|n| (0..n).map(|_| Published::new()).collect())
@@ -2864,6 +2902,15 @@ pub fn prove_whir_block_tree(
             exec_early,
             handoff.as_ref(),
             base,
+            // Several early leaves: up to `siblings − 1` leaves the tree still has
+            // to execute are taken before the early ones, so their execute starts
+            // with the tree while the remaining worker keeps the card on the ready
+            // early leaves ([`early_leaves_order`]). One early leaf: today's order.
+            if cfg.early_leaves > 1 {
+                siblings.saturating_sub(1)
+            } else {
+                0
+            },
             &|line: &str| sink.line(line),
         )
     })
@@ -4287,6 +4334,44 @@ mod tests {
             early_leaf_fits(15.0, 40, Some((1.0, 0)), Some(10.0), 100, 60),
             None
         );
+    }
+
+    /// With several early leaves, up to `in_tree_ahead` leaves the tree still
+    /// executes go first, then the early ones in completion order, then the
+    /// rest; 0 is the early-first order; the nodes stay after every leaf.
+    #[test]
+    fn the_leaves_left_to_the_tree_start_their_execute_first() {
+        use super::super::per_table_aggregator::Level;
+        let shape = vec![
+            Level {
+                arities: vec![3, 1],
+            },
+            Level { arities: vec![2] },
+        ];
+        let base = tree_order(4, &shape);
+        let leaf = |j| TreeAt { lv: 0, j };
+        // The large block's case: early 0, 3, 1; leaf 2 left to the tree; 3 workers.
+        let o = early_leaves_order(base.clone(), &[0, 3, 1], 2);
+        assert_eq!(&o[..4], &[leaf(2), leaf(0), leaf(3), leaf(1)]);
+        assert_eq!(&o[4..], &base[4..]);
+        // More leaves left to the tree than room ahead: the rest follow the early ones.
+        let shape8 = vec![
+            Level {
+                arities: vec![4, 4],
+            },
+            Level { arities: vec![2] },
+        ];
+        let base8 = tree_order(8, &shape8);
+        let o = early_leaves_order(base8.clone(), &[5, 1], 2);
+        let js: Vec<usize> = o[..8].iter().map(|t| t.j).collect();
+        assert_eq!(js, vec![0, 2, 5, 1, 3, 4, 6, 7]);
+        assert_eq!(
+            early_leaves_order(base.clone(), &[0, 3, 1], 0),
+            early_leaves_first(base.clone(), &[0, 3, 1])
+        );
+        // Every leaf early: their order.
+        let o = early_leaves_order(base.clone(), &[3, 2, 1, 0], 2);
+        assert_eq!(&o[..4], &[leaf(3), leaf(2), leaf(1), leaf(0)]);
     }
 
     #[test]
