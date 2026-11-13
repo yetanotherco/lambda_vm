@@ -6,7 +6,7 @@ public import Mathlib.Tactic.LinearCombination
 @[expose] public section
 
 /-!
-# ADD and SUB (spec/add.typ)
+# ADD and SUB (spec/src/add.toml)
 
 Constraint templates on `DWordWL` operands. `ADD<cond; lhs, rhs> = sum` has two virtual
 carries, `carry[0] = 2⁻³²·(lhs[0] + rhs[0] − sum[0])` and

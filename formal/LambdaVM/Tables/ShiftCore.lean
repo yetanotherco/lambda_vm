@@ -8,7 +8,7 @@ public import LambdaVM.Tables.Bitwise
 /-!
 # The arithmetic of the SHIFT chip, on naturals
 
-`spec/shift.typ` shifts in two phases: by `bit_shift < 16` bits inside each 16-bit limb using
+`spec/src/shift.toml` shifts in two phases: by `bit_shift < 16` bits inside each 16-bit limb using
 the `HWSL` lookup, then by whole limbs using the one-hot `limb_shift`. These lemmas prove that
 the limb recombination the chip constrains equals the shift of the 64-bit value.
 -/
@@ -17,8 +17,7 @@ namespace LambdaVM.ShiftCore
 open Alu (shiftResult sra64)
 open Bitwise (sll sllc)
 
-/-- `HWSL` as in BITWISE: `(h << z) mod 2^16` and `h >> (16 − z)`, with the `z = 0` convention. -/
-
+/-- The 64-bit value of four 16-bit limbs. -/
 def limbs (a0 a1 a2 a3 : ℕ) : ℕ := a0 + 65536 * a1 + 2^32 * a2 + 2^48 * a3
 
 theorem and15 (s : ℕ) : s &&& 15 = s % 16 := by
@@ -31,6 +30,18 @@ theorem and48 {s : ℕ} (hs : s < 256) : s &&& 48 = 16 * (s / 16 % 4) := by
 
 theorem and16 {s : ℕ} (hs : s < 256) : s &&& 16 = 16 * (s / 16 % 2) := by
   interval_cases s <;> decide
+
+/-- The `limb_shift` mask `48 − 32·w` picks the limb index of the shift amount. -/
+theorem and_mask {s w : ℕ} (hs : s < 256) (hw : w < 2) :
+    s &&& (48 - 32 * w) = 16 * (s / 16 % (4 - 2 * w)) := by
+  rcases (by omega : w = 0 ∨ w = 1) with rfl | rfl
+  · simpa using and48 hs
+  · simpa using and16 hs
+
+/-- The shift amount reduced mod 32 or 64, split into limb index and bit shift. -/
+theorem mod_word {s w : ℕ} (hw : w < 2) :
+    s % (if w = 1 then 32 else 64) = 16 * (s / 16 % (4 - 2 * w)) + s % 16 := by
+  rcases (by omega : w = 0 ∨ w = 1) with rfl | rfl <;> simp <;> omega
 
 /-- Left shift: phase 1 (`bit_shift = b`) and phase 2 (`limb_shift = L`) together. -/
 theorem leftShift {i0 i1 i2 i3 b L : ℕ}
@@ -135,37 +146,32 @@ theorem main {d sg w s i0 i1 i2 i3 l0 l1 l2 b n x0 x1 x2 x3 x4 y0 y1 y2 y3 : ℕ
     limbs sh.1 sh.2.1 sh.2.2.1 sh.2.2.2 = shiftResult w sg d (limbs i0 i1 i2 i3) s := by
   intro sh
   -- the one-hot index and the shift amount
-  have hmask : s &&& (48 - 32 * w) = 16 * (s / 16 % (4 - 2 * w)) := by
-    rcases (by omega : w = 0 ∨ w = 1) with rfl | rfl
-    · simpa using and48 hs
-    · simpa using and16 hs
-  rw [hmask] at hL
+  rw [and_mask hs hw] at hL
   have hn2 : n < 2 := by rw [hn]; split_ifs <;> omega
   have he : 65535 * n = 0 ∨ 65535 * n = 65535 := by omega
   have hX : limbs i0 i1 i2 i3 < 2^64 := by unfold limbs; omega
   rcases (by omega : d = 0 ∨ d = 1) with rfl | rfl
   · -- left shift: `shifted` is the if-form of `leftShift` with `L` the one-hot index
-    simp only [if_true] at hb
+    simp only [ite_true] at hb
     subst hb
     have hb16 : s % 16 < 16 := Nat.mod_lt _ (by norm_num)
     have core := leftShift h0 h1 h2 h3 hb16 (L := l1 + 2 * l2 + 3 * (1 - l0 - l1 - l2)) (by omega)
     simp only at core
-    have hk : s % (if w = 1 then 32 else 64) = 16 * (s / 16 % (4 - 2 * w)) + s % 16 := by
-      rcases (by omega : w = 0 ∨ w = 1) with rfl | rfl <;> simp <;> omega
+    have hk := mod_word (s := s) hw
     have hLv : s / 16 % (4 - 2 * w) = l1 + 2 * l2 + 3 * (1 - l0 - l1 - l2) := by omega
     rcases (by omega : (l0 = 1 ∧ l1 = 0 ∧ l2 = 0) ∨ (l0 = 0 ∧ l1 = 1 ∧ l2 = 0) ∨
         (l0 = 0 ∧ l1 = 0 ∧ l2 = 1) ∨ (l0 = 0 ∧ l1 = 0 ∧ l2 = 0)) with
       ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ <;>
     · simp only [shifted, sh, hx0, hx1, hx2, hx3, hx4, hy0, hy1, hy2, hy3]
       norm_num at core hLv ⊢
-      simp only [shiftResult, if_true]
+      simp only [shiftResult, ite_true]
       rw [hk, hLv]
       norm_num at core ⊢
       by_cases hz : s % 16 = 0
       · simpa [sll, sllc, hz] using core
       · simpa [sll, sllc, hz] using core
   · -- right shift: phase 1, phase 2, and their composition
-    simp only [one_ne_zero, if_false] at hb
+    simp only [one_ne_zero, ite_false] at hb
     have hr : s % 16 < 16 := Nat.mod_lt _ (by norm_num)
     have p1 := rightIntra h0 h1 h2 h3 hr hb he
     simp only at p1
@@ -174,28 +180,27 @@ theorem main {d sg w s i0 i1 i2 i3 l0 l1 l2 b n x0 x1 x2 x3 x4 y0 y1 y2 y3 : ℕ
     simp only at p2
     obtain ⟨hs0, hs1, hs2, hs3, hsh⟩ := p2
     rw [hir, rightCompose hX hr (by omega) he] at hsh
-    have hk : s % (if w = 1 then 32 else 64) = 16 * (s / 16 % (4 - 2 * w)) + s % 16 := by
-      rcases (by omega : w = 0 ∨ w = 1) with rfl | rfl <;> simp <;> omega
+    have hk := mod_word (s := s) hw
     -- the result as the shift of the sign-extended value
     have hres : shiftResult w sg 1 (limbs i0 i1 i2 i3) s
         = ((limbs i0 i1 i2 i3 + 65535 * n * (2^64 + 2^80 + 2^96 + 2^112))
             >>> (16 * (s / 16 % (4 - 2 * w)) + s % 16)) % 2^64 := by
-      simp only [shiftResult, one_ne_zero, if_false]
+      simp only [shiftResult, one_ne_zero, ite_false]
       rw [hk]
       have hX63 : limbs i0 i1 i2 i3 < 2^63 ↔ i3 < 32768 := by unfold limbs; omega
       rcases (by omega : sg = 0 ∨ sg = 1) with rfl | rfl
-      · simp only [if_true, zero_ne_one, if_false] at hn ⊢
+      · simp only [ite_true, zero_ne_one, ite_false] at hn ⊢
         subst hn
         simp only [mul_zero, zero_mul, add_zero]
         rw [Nat.mod_eq_of_lt (lt_of_le_of_lt (Nat.shiftRight_le _ _) hX)]
-      · simp only [if_true, one_ne_zero, if_false] at hn ⊢
+      · simp only [ite_true, one_ne_zero, ite_false] at hn ⊢
         subst hn
         rcases (by omega : i3 / 32768 = 0 ∨ i3 / 32768 = 1) with h | h
         · have hlt : limbs i0 i1 i2 i3 < 2^63 := hX63.mpr (by omega)
-          rw [h]; simp only [mul_zero, zero_mul, add_zero, sra64, if_pos hlt]
+          rw [h]; simp only [mul_zero, zero_mul, add_zero, sra64, ite_eq_left hlt]
           rw [Nat.mod_eq_of_lt (lt_of_le_of_lt (Nat.shiftRight_le _ _) hX)]
         · have hge : ¬ limbs i0 i1 i2 i3 < 2^63 := by rw [hX63]; omega
-          rw [h]; simp only [sra64, if_neg hge]
+          rw [h]; simp only [sra64, ite_eq_right hge]
           norm_num
     rw [hres]
     have hLv : s / 16 % (4 - 2 * w) = l1 + 2 * l2 + 3 * (1 - l0 - l1 - l2) := by omega

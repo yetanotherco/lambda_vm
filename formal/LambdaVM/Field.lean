@@ -108,16 +108,9 @@ lemma val_sub_of_val_lt {a b : ℕ} (ha : a < 2^40) (hb : b < 2^40)
       have := congrArg ZMod.val h0
       rw [val_natCast_of_lt_two_pow_40 (by omega), ZMod.val_zero] at this
       omega
-    rw [if_neg hne, val_natCast_of_lt_two_pow_40 (by omega)] at h
+    rw [ite_eq_right hne, val_natCast_of_lt_two_pow_40 (by omega)] at h
     have hp : 2^41 < p := by decide
     omega
-
-/-- A requirement `¬ -e = -1 → ¬ e = 0 → P` is vacuous for a boolean `e`. -/
-lemma req_vacuous {e : F p} (h : IsBool e) {P : Prop} : ¬ -e = -1 → ¬ e = 0 → P := by
-  intro h1 h0
-  rcases h with rfl | rfl
-  · exact absurd rfl h0
-  · exact absurd rfl h1
 
 lemma val_neg_two : (-2 : F p).val = p - 2 := by
   have h2 : (2 : F p) ≠ 0 := by
@@ -125,7 +118,7 @@ lemma val_neg_two : (-2 : F p).val = p - 2 := by
     have := congrArg ZMod.val h
     rw [val_ofNat 2 (by norm_num), ZMod.val_zero] at this
     omega
-  rw [ZMod.neg_val, if_neg h2, val_ofNat 2 (by norm_num)]
+  rw [ZMod.neg_val, ite_eq_right h2, val_ofNat 2 (by norm_num)]
 
 /-- Three bits whose complement `1 − l0 − l1 − l2` is also a bit are at most one-hot. -/
 lemma onehot_of_isBool {l0 l1 l2 : F p} (h0 : IsBool l0) (h1 : IsBool l1) (h2 : IsBool l2)
@@ -141,13 +134,5 @@ lemma onehot_of_isBool {l0 l1 l2 : F p} (h0 : IsBool l0) (h1 : IsBool l1) (h2 : 
 
 lemma eq_natCast_of_val {x : F p} {n : ℕ} (h : x.val = n) : x = (n : F p) := by
   rw [← h, ZMod.natCast_zmod_val]
-
-/-- A conditional interaction whose multiplicity is a bit (`μ·(1 − μ) = 0`) never has an
-active requirement. -/
-lemma requirement_vacuous {mu : F p} (h : mu * (1 - mu) = 0) (hne1 : ¬ -mu = -1) (hne0 : ¬ mu = 0) :
-    False := by
-  rcases mul_one_sub_eq_zero_iff.mp h with h0 | h1
-  · exact hne0 h0
-  · exact hne1 (by rw [h1])
 
 end LambdaVM

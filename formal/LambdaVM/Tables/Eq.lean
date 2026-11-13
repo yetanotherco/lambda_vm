@@ -9,7 +9,7 @@ public import Mathlib.Tactic.LinearCombination
 @[expose] public section
 
 /-!
-# EQ (spec/eq.typ)
+# EQ (spec/src/eq.toml)
 
 One row per equality test `res = (a = b) xor invert`. Columns follow `prover/src/tables/eq.rs`:
 `a`, `b` as `DWordWL` (two words), `diff = a − b` as four halves, the `eq` bit, `res`, `μ`.
@@ -86,12 +86,18 @@ def Honest (r : Row (F p)) : Prop :=
   r.eq.val = (if dword r.a0 r.a1 = dword r.b0 r.b1 then 1 else 0) ∧
   r.res.val = eqBit r.invert.val (dword r.a0 r.a1) (dword r.b0 r.b1)
 
+/-- A padding row of `generate_eq_trace`: every column zero. -/
+def Padding (r : Row (F p)) : Prop :=
+  r.a0 = 0 ∧ r.a1 = 0 ∧ r.b0 = 0 ∧ r.b1 = 0 ∧ r.invert = 0 ∧ r.res = 0 ∧
+  r.diff0 = 0 ∧ r.diff1 = 0 ∧ r.diff2 = 0 ∧ r.diff3 = 0 ∧ r.eq = 0 ∧ r.mu = 0
+
 /-- What an active row establishes: with range-checked operands, `res` is the equality bit. -/
 def RowSpec (r : Row (F p)) : Prop :=
   r.mu = 1 → r.a0.val < 2^32 → r.a1.val < 2^32 → r.b0.val < 2^32 → r.b1.val < 2^32 →
     r.res = ((eqBit r.invert.val (dword r.a0 r.a1) (dword r.b0 r.b1) : ℕ) : F p)
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
+  name := "EQ"
   main
   Spec r _ _ := RowSpec r
   channelsWithRequirements := [Alu.channel.toRaw]
@@ -102,9 +108,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     constructor
     · intro channel h; tauto
     · intro env h
-      refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;>
-      · intro hne1 hne0
-        exact (requirement_vacuous h.2.2.2.2 hne1 hne0).elim
+      -- each pull owes a multiplicity of 0 or 1: μ is a bit
+      exact mul_one_sub_eq_zero_iff.mp h.2.2.2.2
 
   soundness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, dword, Alu.channel,
@@ -161,7 +166,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       simp only [eqBit] <;>
       split_ifs <;> (try norm_num) <;> omega
     refine ⟨fun _ => key, by simp, by simp, by simp, by simp, by simp, ?_⟩
-    intro _ _ ha0 ha1 hb0 hb1
+    intro _
     -- the flag byte, read as a natural
     have hflagsV : (3 + 64 * input_invert : F p).val = 3 + 64 * input_invert.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
@@ -173,17 +178,22 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     · -- nor the SHIFT clause
       intro w s d hw hs hd hflags
       exfalso; rw [hflagsV] at hflags; simp only [opselSHIFT] at hflags; omega
-    intro i hi hflags
+    intro i hi hflags ha0 ha1 hb0 hb1
     rw [hflagsV] at hflags; simp only [opselEQ] at hflags
     rw [key ha0 ha1 hb0 hb1, show input_invert.val = i by omega]
 
-  ProverAssumptions r _ _ := Honest r
+  ProverAssumptions r _ _ := Honest r ∨ Padding r
 
   completeness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel, Alu.Guarantees,
-      Bitwise.isHalfTable, Bitwise.zeroTable, Honest, dword]
-    obtain ⟨hmu, hib, ha0, ha1, hb0, hb1, hd0, hd1, hd2, hd3, hsum, heq, hres⟩ := h_assumptions
-    -- the halves of diff as words
+      Bitwise.isHalfTable, Bitwise.zeroTable, Honest, Padding, dword]
+    rcases h_assumptions with ⟨hmu, hib, ha0, ha1, hb0, hb1, hd0, hd1, hd2, hd3, hsum, heq, hres⟩ |
+      ⟨ha0, ha1, hb0, hb1, hi, hr, hd0, hd1, hd2, hd3, he, hmu⟩
+    swap
+    · -- a padding row: μ = 0 switches off every pull and the push
+      subst ha0 ha1 hb0 hb1 hi hr hd0 hd1 hd2 hd3 he hmu
+      simp [circuit_norm]
+    -- an active row; the halves of diff as words
     have hval_lo : (input_diff0 + 65536 * input_diff1).val
         = input_diff0.val + 65536 * input_diff1.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)

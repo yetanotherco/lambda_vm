@@ -9,7 +9,7 @@ public import Mathlib.Tactic.LinearCombination
 @[expose] public section
 
 /-!
-# LT (spec/lt.typ)
+# LT (spec/src/lt.toml)
 
 One row per `(lhs, rhs, signed, invert)` comparison. Columns follow `prover/src/tables/lt.rs`:
 `lhs`/`rhs` as `DWordHHW` limbs (word, half, half), `lhs_sub_rhs` as four halves, the two
@@ -145,7 +145,8 @@ lemma res_constraint {lt invert res : F p} {ltv iv : ℕ}
   rcases (by omega : ltv = 0 ∨ ltv = 1) with rfl | rfl <;>
   rcases (by omega : iv = 0 ∨ iv = 1) with rfl | rfl <;> norm_num
 
-/-- The honest prover's row, as `generate_lt_trace` fills it. -/
+/-- The honest prover's row, as `generate_lt_trace` fills it when no operation repeats
+(`μ ∈ {0, 1}`); a deduplicated row with `μ ≥ 2` is outside this model (see README). -/
 def Honest (r : Row (F p)) : Prop :=
   IsBool r.mu ∧ IsBool r.signed ∧ IsBool r.invert ∧
   r.lhs0.val < 2^32 ∧ r.lhs1.val < 2^16 ∧ r.lhs2.val < 2^16 ∧
@@ -164,6 +165,7 @@ def RowSpec (r : Row (F p)) : Prop :=
     r.res = ((ltBit r.signed.val r.invert.val r.lhsVal r.rhsVal : ℕ) : F p)
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
+  name := "LT"
   main
   Spec r _ _ := RowSpec r
   channelsWithRequirements := [Alu.channel.toRaw]
@@ -175,9 +177,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     constructor
     · intro channel h; tauto
     · intro env h
-      refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
-      · intro hne1 hne0
-        exact (requirement_vacuous h.1 hne1 hne0).elim
+      -- each pull owes a multiplicity of 0 or 1: μ is a bit
+      exact mul_one_sub_eq_zero_iff.mp h.1
 
   soundness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, Row.lhsVal, Row.rhsVal,
@@ -258,13 +259,13 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       | (subst hlt'; norm_num at hres'; simp [hAv, hBv, hC, hres'])
     refine ⟨fun _ hl0 hr0 => key _ _ rfl rfl hl0 hr0, by simp, by simp, by simp, by simp, by simp,
       by simp, by simp, by simp, ?_⟩
-    intro _ _ hl0 hlhi hr0 hrhi
+    intro _
     -- the flag byte, read as a natural
     have hflagsV : (4 + 32 * input_signed + 64 * input_invert : F p).val
         = 4 + 32 * input_signed.val + 64 * input_invert.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
     refine ⟨?_, ?_, ?_⟩
-    · intro s i hs hi hflags
+    · intro s i hs hi hflags hl0 hr0
       rw [hflagsV] at hflags; simp only [opselLT] at hflags
       rw [key s i (by omega) (by omega) hl0 hr0, hval_lhsHi, hval_rhsHi]
     · -- the EQ clause does not apply: opsel(LT) + 32·s + 64·i ≠ opsel(EQ) + 64·i'
