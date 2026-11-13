@@ -42,6 +42,7 @@ use digest::Digest;
 use math::field::element::FieldElement;
 use math::field::traits::IsPrimeField;
 use multilinear::stacked_eval::StackedProof;
+use multilinear::mle::Mle;
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{ArgueFormat, ChainConfig};
@@ -126,6 +127,23 @@ impl WlfmRate {
     }
 }
 
+/// How a W-LFM proof binds its program's instruction columns (the tables'
+/// preprocessed prefixes): a verifier constant, named by both sides and folded
+/// into the identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WlfmPrep {
+    /// One prepared stack a group, committed from the program and opened at
+    /// each table's reduced point: what a parent that verifies the proof
+    /// in-guest needs, since it cannot hold the columns. Today's format.
+    Stacked,
+    /// The verifier holds the columns (it derived the program) and evaluates
+    /// each prefix at its table's reduced point itself against the values the
+    /// main opening gives: no prepared commit, no prepared opening. Only for a
+    /// proof whose verifier is the host (the last proof of the pipeline),
+    /// D-COMPRESS lever L1.
+    Evaluated,
+}
+
 /// The stack cap at [`WlfmRate::Sixteen`]: a grouped chain lives on
 /// `H_{n + m + lb}`, and Goldilocks' two-adicity (32) leaves `32 − 4 − 2 = 26`
 /// stacked variables at blowup 16 and the widest index; the default 27 would
@@ -196,7 +214,13 @@ pub struct WlfmArtifacts {
     /// Tables per group ([`stark::multilinear_block::block_groups`]).
     pub sizes: Vec<usize>,
     pub config: ChainConfig,
+    /// How the instruction columns are bound.
+    pub prep: WlfmPrep,
+    /// Under [`WlfmPrep::Stacked`]: the prepared stacks. Empty otherwise.
     pub stacks: Vec<WlfmStack>,
+    /// Under [`WlfmPrep::Evaluated`]: each table's preprocessed prefix, as the
+    /// verifier evaluates it (empty for a table with none). Empty otherwise.
+    pub evaluated: Vec<Vec<Mle<F>>>,
     pub program_id: Commitment,
 }
 
@@ -345,7 +369,7 @@ pub fn build_wlfm(
     hasher: HasherKind,
     rate: WlfmRate,
 ) -> Result<WlfmBuild, String> {
-    build_wlfm_with(program, hasher, rate, false)
+    build_wlfm_under(program, hasher, rate, WlfmPrep::Stacked, false)
 }
 
 /// [`build_wlfm`] with every prepared commit on the host: the VERIFIER's
@@ -356,13 +380,17 @@ pub fn build_wlfm_on_host(
     hasher: HasherKind,
     rate: WlfmRate,
 ) -> Result<WlfmBuild, String> {
-    build_wlfm_with(program, hasher, rate, true)
+    build_wlfm_under(program, hasher, rate, WlfmPrep::Stacked, true)
 }
 
-fn build_wlfm_with(
+/// [`build_wlfm`] at `rate` with the instruction columns bound per `prep`,
+/// the prepared commits (under [`WlfmPrep::Stacked`]) on the host when
+/// `on_host` (a verifier's build).
+pub fn build_wlfm_under(
     program: &LfmProgram,
     hasher: HasherKind,
     rate: WlfmRate,
+    prep: WlfmPrep,
     on_host: bool,
 ) -> Result<WlfmBuild, String> {
     // The mask with `BITWISE` dropped where nothing sends it: the default, as a
@@ -423,6 +451,35 @@ fn build_wlfm_with(
         .filter(|&(_, (_, &count))| count > 0)
         .map(|(table, (group, _))| (table, group_columns(group)))
         .collect();
+    if prep == WlfmPrep::Evaluated {
+        let mut evaluated: Vec<Vec<Mle<F>>> = vec![Vec::new(); counts.len()];
+        for (table, cols) in columns {
+            evaluated[table] = cols
+                .into_iter()
+                .map(|c| Mle::new(c).map_err(|e| format!("a preprocessed column: {e:?}")))
+                .collect::<Result<_, _>>()?;
+        }
+        check_evaluated(&counts, &table_num_vars, &evaluated)?;
+        let mut artifacts = WlfmArtifacts {
+            rate,
+            hasher,
+            chip_set,
+            hash_chunks,
+            table_num_vars,
+            counts,
+            sizes,
+            config,
+            prep,
+            stacks: Vec::new(),
+            evaluated,
+            program_id: [0u8; 32],
+        };
+        artifacts.program_id = wlfm_program_id(&artifacts);
+        return Ok(WlfmBuild {
+            artifacts,
+            stacks: Vec::new(),
+        });
+    }
     let stacks = group_stacks(columns, &group_lists).map_err(|e| format!("{e:?}"))?;
     // ⛔ THE CARD, as `program_census::build_artifacts_counted` holds it for a
     // STARK build: the prepared commits run on the device, so concurrent
@@ -457,7 +514,9 @@ fn build_wlfm_with(
         counts,
         sizes,
         config,
+        prep,
         stacks,
+        evaluated: Vec::new(),
         program_id: [0u8; 32],
     };
     artifacts.program_id = wlfm_program_id(&artifacts);
@@ -465,6 +524,45 @@ fn build_wlfm_with(
         artifacts,
         stacks: committed,
     })
+}
+
+/// ⛔ THE EVALUATED RULE ([`WlfmPrep::Evaluated`]): every table holds exactly
+/// its AIR's count of preprocessed columns, each over the table's height. One
+/// rule for the build and the verifier: a table whose prefix the verifier does
+/// not evaluate in full is a table whose program columns nothing binds.
+pub fn check_evaluated(
+    counts: &[usize],
+    table_num_vars: &[u8],
+    evaluated: &[Vec<Mle<F>>],
+) -> Result<(), String> {
+    if evaluated.len() != counts.len() || table_num_vars.len() != counts.len() {
+        return Err(format!(
+            "{} evaluated prefixes and {} heights for {} tables",
+            evaluated.len(),
+            table_num_vars.len(),
+            counts.len()
+        ));
+    }
+    for (table, ((&count, &num_vars), cols)) in counts
+        .iter()
+        .zip(table_num_vars)
+        .zip(evaluated)
+        .enumerate()
+    {
+        if cols.len() != count {
+            return Err(format!(
+                "table {table} has {count} preprocessed columns and the verifier evaluates {}",
+                cols.len()
+            ));
+        }
+        if let Some(c) = cols.iter().find(|c| c.num_vars() != num_vars as usize) {
+            return Err(format!(
+                "table {table} is 2^{num_vars} rows and a preprocessed column 2^{}",
+                c.num_vars()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A Merkle cap policy as two bytes: a variant tag and its height.
@@ -532,6 +630,19 @@ pub fn wlfm_program_id(a: &WlfmArtifacts) -> Commitment {
     }
     // The rest of the format, whole: a lever added later moves the identity.
     h.update(format!("{:?}", c.format).as_bytes());
+    // Under the evaluated binding there are no roots to fold: the columns
+    // themselves, every value. (The stacked binding's identity is unchanged.)
+    if a.prep == WlfmPrep::Evaluated {
+        h.update(b"EVALUATED");
+        for cols in &a.evaluated {
+            h.update((cols.len() as u64).to_le_bytes());
+            for col in cols {
+                for v in col.evals() {
+                    h.update(F::canonical(v.value()).to_le_bytes());
+                }
+            }
+        }
+    }
     h.finalize().into()
 }
 
@@ -634,6 +745,16 @@ pub(crate) fn prove_wlfm_traces(
                 .iter()
                 .zip(&build.stacks[s].columns[at..at + n])
             {
+                if column.as_slice() != pinned.evals() {
+                    return Err(format!(
+                        "{}: a preprocessed column is not the program's",
+                        air.name()
+                    ));
+                }
+            }
+        }
+        if check_prefix && artifacts.prep == WlfmPrep::Evaluated {
+            for (column, pinned) in columns.iter().zip(&artifacts.evaluated[t]) {
                 if column.as_slice() != pinned.evals() {
                     return Err(format!(
                         "{}: a preprocessed column is not the program's",
@@ -780,7 +901,24 @@ fn verifier_frame(artifacts: &WlfmArtifacts, airs: &LfmAirs) -> Result<VerifierF
         .iter()
         .map(|s| (s.group, s.tables.as_slice()))
         .collect();
-    check_coverage(&artifacts.counts, &artifacts.sizes, &plan)?;
+    match artifacts.prep {
+        WlfmPrep::Stacked => {
+            if !artifacts.evaluated.is_empty() {
+                return Err("stacked artifacts carry evaluated columns".into());
+            }
+            check_coverage(&artifacts.counts, &artifacts.sizes, &plan)?;
+        }
+        WlfmPrep::Evaluated => {
+            if !artifacts.stacks.is_empty() {
+                return Err("evaluated artifacts carry prepared stacks".into());
+            }
+            check_evaluated(
+                &artifacts.counts,
+                &artifacts.table_num_vars,
+                &artifacts.evaluated,
+            )?;
+        }
+    }
     let (layouts, domains) =
         stacks(&shapes, &artifacts.sizes, &artifacts.config).map_err(|e| format!("{e:?}"))?;
     Ok((shapes, layouts, domains))
@@ -831,7 +969,13 @@ pub(crate) fn verify_wlfm_with(
     let statements: Vec<TableStatement<'_, F, E>> = table_layouts
         .iter()
         .zip(&artifacts.counts)
-        .map(|(layout, &count)| layout.statement_with_prepared_prefix(count))
+        .enumerate()
+        .map(|(t, (layout, &count))| match artifacts.prep {
+            WlfmPrep::Stacked => layout.statement_with_prepared_prefix(count),
+            // The verifier's own columns: their count is the AIR's
+            // (`check_evaluated`), and each is checked at the table's point.
+            WlfmPrep::Evaluated => layout.statement_with_preprocessed(&artifacts.evaluated[t]),
+        })
         .collect();
     let checks_of: Vec<BlockPreparedCheck<'_, F>> = artifacts
         .stacks
