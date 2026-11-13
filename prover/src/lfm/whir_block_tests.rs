@@ -3243,15 +3243,31 @@ fn the_whir_block_tree_on_a_real_block() {
             .to_bytes()
             .expect("the top's file")
             .len();
-        let c1_file = WhirBlockCompressedProof::for_levers(
+        let file = WhirBlockCompressedProof::for_levers(
             run.statement.clone(),
             c1.proof.clone(),
             c1.levers,
         )
-        .expect("a tagged lever setting")
-        .to_bytes()
-        .expect("the compressed file")
-        .len();
+        .expect("a tagged lever setting");
+        let rkyv_file = file.to_bytes().expect("the compressed file").len();
+        // The compact twin, written and read back: the decoded proof is the
+        // proof (it re-encodes to the same bytes) and it verifies.
+        let t = std::time::Instant::now();
+        let compact = file.to_compact_bytes().expect("the compact file");
+        let encode_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
+        let back = WhirBlockCompressedProof::from_compact_bytes(&compact).expect("reads back");
+        let decode_ms = t.elapsed().as_secs_f64() * 1e3;
+        // The same values: the compact bytes are canonical.
+        let same = super::wire::encode(&back.compressed) == super::wire::encode(&c1.proof);
+        let decoded_ok = verify_compressed_against(plan, &artifacts, &back.compressed).is_ok();
+        println!(
+            "W3 COMPRESS WIRE: rkyv file {rkyv_file} B · compact file {} B · tag {} · decoded verifies {decoded_ok} · same proof {same} · encode {encode_ms:.1} ms decode {decode_ms:.1} ms",
+            compact.len(),
+            back.pipeline()
+        );
+        assert!(decoded_ok && same, "the compact file carries the proof");
+        let c1_file = if c1.compact { compact.len() } else { rkyv_file };
         let c1_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&c1.proof)
             .expect("serialize C1")
             .len();
@@ -3264,13 +3280,19 @@ fn the_whir_block_tree_on_a_real_block() {
             }
         );
         println!(
-            "W3 COMPRESS BYTES: shipped file {c1_file} B compressed vs {top_file} B top ({:.3}×) · C1 proof {c1_bytes} B · blowup {} · binding {:?} · prepared openings {} · final {:?} · tag {}",
+            "W3 COMPRESS BYTES: shipped file {c1_file} B compressed vs {top_file} B top ({:.3}×) · C1 proof {c1_bytes} B · blowup {} · binding {:?} · prepared openings {} · final {:?} · tag {} · wire {}",
             c1_file as f64 / top_file as f64,
             c1.rate.factor(),
             c1.levers.prep,
             c1.proof.prepared.len(),
             c1.levers.final_poly,
             super::whir_block_tree::compressed_pipeline_of(c1.levers).unwrap_or(0)
+                + if c1.compact {
+                    super::whir_block_tree::PIPELINE_COMPACT_OFFSET
+                } else {
+                    0
+                },
+            if c1.compact { "compact" } else { "rkyv" }
         );
         honest.unwrap_or_else(|e| panic!("the compressed block must verify: {e}"));
         assert!(refused && refused_words, "a tampered C1 proof is refused");
@@ -4662,6 +4684,16 @@ fn compressed_block_case(levers: super::wlfm::WlfmLevers) {
     );
     verify_compressed(&plan, &wrap, WlfmRate::Sixteen, levers, &c1)
         .unwrap_or_else(|e| panic!("the compressed block verifies: {e}"));
+    // Its compact bytes decode to the same proof, which verifies.
+    let compact = super::wire::encode(&c1);
+    let back = super::wire::decode(&compact).expect("the compact bytes decode");
+    assert_eq!(super::wire::encode(&back), compact);
+    verify_compressed(&plan, &wrap, WlfmRate::Sixteen, levers, &back)
+        .unwrap_or_else(|e| panic!("the decoded compressed block verifies: {e}"));
+    println!(
+        "C1 SMALL WIRE: rkyv {bytes} B · compact {} B",
+        compact.len()
+    );
 
     // Tampered C1 proofs.
     let artifacts =

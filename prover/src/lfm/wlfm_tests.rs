@@ -713,3 +713,71 @@ fn only_an_opted_in_wlfm_proof_stops_at_a_final_polynomial() {
     }
     assert_eq!(WlfmLevers::DEFAULT.final_poly, FinalPoly::Off);
 }
+
+// =============================================================================
+// The compact wire encoding
+// =============================================================================
+
+/// ★ Every W-LFM proof the levers make — blowup 2 and 16, both bindings, with
+/// and without the final polynomial — decodes from its compact bytes to the
+/// same proof (the same canonical bytes), which verifies,
+/// and the compact bytes are fewer than rkyv's.
+#[test]
+fn the_compact_encoding_round_trips_every_wlfm_proof_and_is_smaller() {
+    use multilinear::whir_chain::FinalPoly;
+    let _unground = test_format::set(None);
+    let program = honest();
+    for rate in [WlfmRate::Two, WlfmRate::Sixteen] {
+        for prep in [WlfmPrep::Stacked, WlfmPrep::Evaluated] {
+            for final_poly in [FinalPoly::Off, FinalPoly::Vars(6)] {
+                let build = under(&program, rate, WlfmLevers { prep, final_poly });
+                let proof = prove(&program, &build);
+                let bytes = super::wire::encode(&proof);
+                let back = super::wire::decode(&bytes)
+                    .unwrap_or_else(|e| panic!("{rate:?} {prep:?} {final_poly:?}: {e}"));
+                // The same values: the compact bytes are canonical (rkyv's are
+                // not: a field element may sit unreduced in memory).
+                assert_eq!(super::wire::encode(&back), bytes);
+                verify_wlfm(&build.artifacts, &back, &back.public_words)
+                    .unwrap_or_else(|e| panic!("the decoded proof verifies: {e}"));
+                println!(
+                    "WIRE {rate:?} {prep:?} {final_poly:?}: compact {} B vs rkyv {} B",
+                    bytes.len(),
+                    proof_bytes(&proof)
+                );
+                assert!(
+                    bytes.len() < proof_bytes(&proof),
+                    "{} compact vs {} rkyv",
+                    bytes.len(),
+                    proof_bytes(&proof)
+                );
+            }
+        }
+    }
+}
+
+/// The decoder takes exactly one proof's bytes: a trailing byte, any
+/// truncation, and a changed value that decodes are refused or verify false.
+#[test]
+fn the_compact_decoder_refuses_trailing_truncated_and_tampered_bytes() {
+    let _unground = test_format::set(None);
+    let program = honest();
+    let build = build(&program, WlfmRate::Sixteen);
+    let proof = prove(&program, &build);
+    let bytes = super::wire::encode(&proof);
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(super::wire::decode(&trailing).is_err());
+    for cut in [0, 1, bytes.len() / 3, bytes.len() / 2, bytes.len() - 1] {
+        assert!(super::wire::decode(&bytes[..cut]).is_err(), "cut at {cut}");
+    }
+    // One byte flipped in the last field element (a public word's lane):
+    // either refused by the decoder or refused by the verifier.
+    let mut flipped = bytes.clone();
+    let at = bytes.len() - 3;
+    flipped[at] ^= 1;
+    match super::wire::decode(&flipped) {
+        Err(_) => {}
+        Ok(p) => assert!(verify_wlfm(&build.artifacts, &p, &p.public_words).is_err()),
+    }
+}
