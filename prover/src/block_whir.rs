@@ -6311,6 +6311,24 @@ fn prove_streamed(
                     if card_fill.rows.any() {
                         builder = builder.card_fill_streamed_rows(card_fill.rows)?;
                     }
+                    // `LAMBDA_VM_CARD_ROWS=registers`: the card builds MEMW_R's
+                    // rows from the CPU logs, and needs each chunk's ECALL
+                    // cycles, which the walkers read from the executor's
+                    // history. Without record mode MEMW_R goes up as records.
+                    if multilinear::gpu::card_rows_builds_registers() {
+                        let marks = card_fill.memw_r && history && walkers > 0;
+                        if marks {
+                            builder = builder.card_marks_ecalls()?;
+                        }
+                        eprintln!(
+                            "BLOCK CARD ROWS REGISTERS: {}",
+                            if marks {
+                                "MEMW_R's chunks go out with their ECALL cycles"
+                            } else {
+                                "off (no record mode, or MEMW_R not held as records): MEMW_R goes up as records"
+                            }
+                        );
+                    }
                     #[cfg(test)]
                     if deviations.card_fill_streamed_fault > 0 {
                         builder =
@@ -7284,6 +7302,16 @@ fn prove_streamed(
         }
         // Phase B starts: an early start's windows go to their phase-B sizes.
         early_gate.store(true, std::sync::atomic::Ordering::Release);
+        // `LAMBDA_VM_CARD_ROWS=registers`: the card-built rows' counters as
+        // phase B starts (the block's end line holds both phases).
+        if multilinear::gpu::card_rows_builds_registers()
+            && let Some(line) = multilinear::gpu::card_rows_report()
+        {
+            eprintln!(
+                "BLOCK CARD ROWS AT PHASE B START: {}",
+                line.trim_start_matches("BLOCK CARD ROWS: ")
+            );
+        }
         let phase_b_start = Instant::now();
         let phase_b_unix = stark::prove_split::epoch_secs();
         stamps.phase_b_order = order.clone();

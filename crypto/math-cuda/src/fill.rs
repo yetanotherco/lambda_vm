@@ -615,9 +615,14 @@ pub enum RecordsInput<'a> {
         rows: usize,
     },
     /// MEMW_R's `rows` rows: `records`' pieces in order, then zero rows.
+    /// `ecall_cycles`, when the run's history gave them: the ECALL cycles
+    /// (ascending) from 2^14 + 1 cycles before the first row's cycle to the
+    /// last row's, which the card-built register rows read
+    /// ([`crate::card_rows`]). The fill itself does not read them.
     MemwR {
         records: &'a [&'a [RegRowC]],
         rows: usize,
+        ecall_cycles: Option<&'a [u32]>,
     },
     /// MEMW_A's `rows` rows: `records`' pieces in order, then zero rows.
     MemwA {
@@ -907,6 +912,7 @@ pub(crate) fn fill_col_major_into(
         RecordsInput::MemwR {
             records: pieces,
             rows,
+            ..
         } => {
             let records_dev = upload_pieces(stream, pieces)?;
             launch_rows(stream, &m.memw_r, &records_dev, records.len(), rows, dst)
