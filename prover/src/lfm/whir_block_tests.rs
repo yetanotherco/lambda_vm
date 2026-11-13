@@ -3224,7 +3224,7 @@ fn the_whir_block_tree_on_a_real_block() {
         use super::whir_block_tree::{WhirBlockCompressedProof, WhirBlockTreeProof};
         let t = std::time::Instant::now();
         let artifacts =
-            compressed_artifacts(plan, &wrap, c1.rate, c1.prep).expect("C1's artifacts derive");
+            compressed_artifacts(plan, &wrap, c1.rate, c1.levers).expect("C1's artifacts derive");
         let derive = t.elapsed().as_secs_f64();
         let t = std::time::Instant::now();
         let honest = verify_compressed_against(plan, &artifacts, &c1.proof);
@@ -3243,11 +3243,15 @@ fn the_whir_block_tree_on_a_real_block() {
             .to_bytes()
             .expect("the top's file")
             .len();
-        let c1_file =
-            WhirBlockCompressedProof::for_binding(run.statement.clone(), c1.proof.clone(), c1.prep)
-                .to_bytes()
-                .expect("the compressed file")
-                .len();
+        let c1_file = WhirBlockCompressedProof::for_levers(
+            run.statement.clone(),
+            c1.proof.clone(),
+            c1.levers,
+        )
+        .expect("a tagged lever setting")
+        .to_bytes()
+        .expect("the compressed file")
+        .len();
         let c1_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&c1.proof)
             .expect("serialize C1")
             .len();
@@ -3260,11 +3264,13 @@ fn the_whir_block_tree_on_a_real_block() {
             }
         );
         println!(
-            "W3 COMPRESS BYTES: shipped file {c1_file} B compressed vs {top_file} B top ({:.3}×) · C1 proof {c1_bytes} B · blowup {} · binding {:?} · prepared openings {}",
+            "W3 COMPRESS BYTES: shipped file {c1_file} B compressed vs {top_file} B top ({:.3}×) · C1 proof {c1_bytes} B · blowup {} · binding {:?} · prepared openings {} · final {:?} · tag {}",
             c1_file as f64 / top_file as f64,
             c1.rate.factor(),
-            c1.prep,
-            c1.proof.prepared.len()
+            c1.levers.prep,
+            c1.proof.prepared.len(),
+            c1.levers.final_poly,
+            super::whir_block_tree::compressed_pipeline_of(c1.levers).unwrap_or(0)
         );
         honest.unwrap_or_else(|e| panic!("the compressed block must verify: {e}"));
         assert!(refused && refused_words, "a tampered C1 proof is refused");
@@ -4577,7 +4583,7 @@ fn split_prepared_stack_refuses_a_forgery_in_its_last_chain(argue: ArgueFormat) 
 #[test]
 #[ignore = "proves a small block's tree and C1 over its top; box tier"]
 fn the_compressed_block_verifies_and_refuses_tampering() {
-    compressed_block_case(super::wlfm::WlfmPrep::Stacked);
+    compressed_block_case(super::wlfm::WlfmLevers::DEFAULT);
 }
 
 /// ★ The same under the evaluated binding (`LAMBDA_VM_BLOCK_COMPRESS_EVAL`):
@@ -4587,15 +4593,31 @@ fn the_compressed_block_verifies_and_refuses_tampering() {
 #[test]
 #[ignore = "proves a small block's tree and C1 over its top twice; box tier"]
 fn the_evaluated_compressed_block_verifies_and_refuses_tampering() {
-    compressed_block_case(super::wlfm::WlfmPrep::Evaluated);
+    compressed_block_case(super::wlfm::WlfmLevers::with_prep(
+        super::wlfm::WlfmPrep::Evaluated,
+    ));
 }
 
-fn compressed_block_case(prep: super::wlfm::WlfmPrep) {
+/// ★ The same with C1's chains stopping at the final polynomial
+/// (`LAMBDA_VM_BLOCK_COMPRESS_FINAL`): verifies, refuses every tamper the
+/// stacked case does, and is refused by the verifier without the final
+/// polynomial.
+#[test]
+#[ignore = "proves a small block's tree and C1 over its top; box tier"]
+fn the_final_polynomial_compressed_block_verifies_and_refuses_tampering() {
+    compressed_block_case(super::wlfm::WlfmLevers {
+        prep: super::wlfm::WlfmPrep::Stacked,
+        final_poly: multilinear::whir_chain::FinalPoly::Vars(super::compress::COMPRESS_FINAL_VARS),
+    });
+}
+
+fn compressed_block_case(levers: super::wlfm::WlfmLevers) {
     use super::compress::{
         build_compress, compressed_artifacts, prove_compress, top_child, verify_compressed,
         verify_compressed_against,
     };
-    use super::wlfm::{WlfmPrep, WlfmRate};
+    use super::wlfm::{WlfmLevers, WlfmPrep, WlfmRate};
+    let prep = levers.prep;
     let _permit = super::device_permit::serial_for_test();
     let format = small_format();
     let (elf, proof) = small_block("test_commit_4", &format);
@@ -4604,9 +4626,14 @@ fn compressed_block_case(prep: super::wlfm::WlfmPrep) {
     let (top, _) = compose(&plan, &proof, "C1").expect("the honest tree proves");
     let top_artifacts = plan.derive_top(&wrap).expect("the top derives");
     let child = top_child(&plan, &top_artifacts, &wrap).expect("the top's shape");
-    let c = build_compress(&child, plan.top_layout(), WlfmRate::Sixteen, prep).expect("C1 builds");
+    let c =
+        build_compress(&child, plan.top_layout(), WlfmRate::Sixteen, levers).expect("C1 builds");
     assert_eq!(c.build.artifacts.config.log_blowup, 4);
     assert_eq!(c.build.artifacts.prep, prep);
+    assert_eq!(
+        c.build.artifacts.config.format.final_poly,
+        levers.final_poly
+    );
     let harvested = super::harvest::harvest_child_under::<BlockFamily>(
         top_artifacts.clone(),
         wrap.clone(),
@@ -4623,21 +4650,22 @@ fn compressed_block_case(prep: super::wlfm::WlfmPrep) {
         .expect("the top serializes")
         .len();
     println!(
-        "C1 SMALL: proved in {:.2}s · Q {} · binding {prep:?} · prepared openings {} · C1 {bytes} B vs top {top_bytes} B",
+        "C1 SMALL: proved in {:.2}s · Q {} · binding {prep:?} · final {:?} · prepared openings {} · C1 {bytes} B vs top {top_bytes} B",
         t.elapsed().as_secs_f64(),
         c.build.artifacts.config.num_queries,
+        levers.final_poly,
         c1.prepared.len()
     );
     assert_eq!(
         c1.public_words, top.public_words,
         "C1 republishes the top's words"
     );
-    verify_compressed(&plan, &wrap, WlfmRate::Sixteen, prep, &c1)
+    verify_compressed(&plan, &wrap, WlfmRate::Sixteen, levers, &c1)
         .unwrap_or_else(|e| panic!("the compressed block verifies: {e}"));
 
     // Tampered C1 proofs.
     let artifacts =
-        compressed_artifacts(&plan, &wrap, WlfmRate::Sixteen, prep).expect("C1's artifacts");
+        compressed_artifacts(&plan, &wrap, WlfmRate::Sixteen, levers).expect("C1's artifacts");
     let mut answer = c1.clone();
     answer.commit_ood[0] += FEE::one();
     assert!(
@@ -4670,7 +4698,10 @@ fn compressed_block_case(prep: super::wlfm::WlfmPrep) {
                 &child,
                 plan.top_layout(),
                 WlfmRate::Sixteen,
-                WlfmPrep::Stacked,
+                WlfmLevers {
+                    prep: WlfmPrep::Stacked,
+                    ..levers
+                },
             )
             .expect("the stacked C1 builds");
             let twin = prove_compress(&stacked, &arena).expect("the stacked C1 proves");
@@ -4679,7 +4710,17 @@ fn compressed_block_case(prep: super::wlfm::WlfmPrep) {
                 "a stacked C1 under the evaluated verifier"
             );
             assert!(
-                verify_compressed(&plan, &wrap, WlfmRate::Sixteen, WlfmPrep::Stacked, &c1).is_err(),
+                verify_compressed(
+                    &plan,
+                    &wrap,
+                    WlfmRate::Sixteen,
+                    WlfmLevers {
+                        prep: WlfmPrep::Stacked,
+                        ..levers
+                    },
+                    &c1
+                )
+                .is_err(),
                 "an evaluated C1 under the stacked verifier"
             );
             let mut added = c1.clone();
@@ -4690,9 +4731,23 @@ fn compressed_block_case(prep: super::wlfm::WlfmPrep) {
             );
         }
     }
+    // Another final polynomial: the verifier's constant, never the proof's.
+    if levers.final_poly != multilinear::whir_chain::FinalPoly::Off {
+        assert!(
+            verify_compressed(
+                &plan,
+                &wrap,
+                WlfmRate::Sixteen,
+                WlfmLevers::with_prep(prep),
+                &c1
+            )
+            .is_err(),
+            "a final-polynomial C1 under the verifier without one"
+        );
+    }
     // Another rate: the verifier's constant, never the proof's.
     assert!(
-        verify_compressed(&plan, &wrap, WlfmRate::Four, prep, &c1).is_err(),
+        verify_compressed(&plan, &wrap, WlfmRate::Four, levers, &c1).is_err(),
         "a blowup-16 C1 under a blowup-4 verifier"
     );
     // Another block's plan: another statement, so another top and another C1.
@@ -4701,7 +4756,7 @@ fn compressed_block_case(prep: super::wlfm::WlfmPrep) {
     let other_plan = plan_of(&other_elf, &other_proof, &other, Some(2));
     assert_ne!(other_plan.id(), plan.id(), "the two blocks' plans differ");
     assert!(
-        verify_compressed(&other_plan, &wrap, WlfmRate::Sixteen, prep, &c1).is_err(),
+        verify_compressed(&other_plan, &wrap, WlfmRate::Sixteen, levers, &c1).is_err(),
         "C1 under another block"
     );
 

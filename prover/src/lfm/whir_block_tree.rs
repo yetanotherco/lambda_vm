@@ -243,9 +243,10 @@ pub struct WhirTreeConfig {
     /// default off): after the top, one compression proof of the top's
     /// verification (C1) at this rate, which then ships instead of the top.
     pub compress: Option<super::wlfm::WlfmRate>,
-    /// `LAMBDA_VM_BLOCK_COMPRESS_EVAL` ([`super::compress::compress_prep_setting`];
-    /// default off, stacked): how C1 binds its instruction columns.
-    pub compress_prep: super::wlfm::WlfmPrep,
+    /// `LAMBDA_VM_BLOCK_COMPRESS_EVAL` and `LAMBDA_VM_BLOCK_COMPRESS_FINAL`
+    /// ([`super::compress::compress_levers_from_env`]; default off): how C1
+    /// binds its instruction columns and where its chains stop committing.
+    pub compress_levers: super::wlfm::WlfmLevers,
 }
 
 /// A count knob: unset is `None`; anything but a count is an error.
@@ -503,7 +504,7 @@ impl WhirTreeConfig {
         // tables, the finish's tables packed as they are built.
         block_whir::rest_layout_from_env(&mut options);
         let compress = super::compress::compress_from_env()?;
-        let compress_prep = super::compress::compress_prep_from_env(compress)?;
+        let compress_levers = super::compress::compress_levers_from_env(compress)?;
         let node_pipe = count_knob("W3_NODE_PIPE")?
             .is_none_or(|v| v != 0)
             .then(|| count_knob("W3_EMIT_THREADS").map(|t| t.unwrap_or(4).max(1)))
@@ -527,7 +528,7 @@ impl WhirTreeConfig {
             node_times: count_knob("W3_NODE_TIMES")? == Some(1),
             leaf_first: count_knob("W3_LEAF_FIRST")?.is_none_or(|v| v != 0),
             compress,
-            compress_prep,
+            compress_levers,
         })
     }
 
@@ -1945,7 +1946,7 @@ pub struct WhirTreeTimes {
 /// binds its instruction columns.
 pub struct CompressedTop {
     pub rate: super::wlfm::WlfmRate,
-    pub prep: super::wlfm::WlfmPrep,
+    pub levers: super::wlfm::WlfmLevers,
     pub proof: super::wlfm::WlfmProof,
 }
 
@@ -2533,7 +2534,7 @@ pub fn prove_whir_block_tree(
                         &child,
                         plan.top_layout(),
                         rate,
-                        cfg.compress_prep,
+                        cfg.compress_levers,
                     )?;
                     Ok((c, tb.elapsed().as_secs_f64(), t.elapsed().as_secs_f64()))
                 })();
@@ -2591,10 +2592,11 @@ pub fn prove_whir_block_tree(
             });
             let a = &c.build.artifacts;
             sink.line(&format!(
-                "W3 COMPRESS: C1 at blowup {} · Q {} · binding {:?} · groups {:?} · prepared stacks {} · tables 2^{:?} · built in {build_secs:.2}s (done@{built_at:.2}, top proved@{tree:.2}, waited {:.2}s) · C1 {c1_secs:.2}s after the top ({split})",
+                "W3 COMPRESS: C1 at blowup {} · Q {} · binding {:?} · final {:?} · groups {:?} · prepared stacks {} · tables 2^{:?} · built in {build_secs:.2}s (done@{built_at:.2}, top proved@{tree:.2}, waited {:.2}s) · C1 {c1_secs:.2}s after the top ({split})",
                 rate.factor(),
                 a.config.num_queries,
                 a.prep,
+                a.final_poly,
                 a.sizes,
                 a.stacks.len(),
                 a.table_num_vars,
@@ -2602,7 +2604,7 @@ pub fn prove_whir_block_tree(
             ));
             Some(CompressedTop {
                 rate,
-                prep: cfg.compress_prep,
+                levers: cfg.compress_levers,
                 proof: c1,
             })
         }
@@ -2917,6 +2919,33 @@ pub fn compressed_pipeline(prep: super::wlfm::WlfmPrep) -> u8 {
     }
 }
 
+/// The compressed tree with C1's chains stopping at a final polynomial of
+/// [`super::compress::COMPRESS_FINAL_VARS`] variables
+/// (`LAMBDA_VM_BLOCK_COMPRESS_FINAL`), C1 stacked.
+pub const PIPELINE_WHIR_COMPRESSED_FINAL: u8 = 4;
+
+/// The same with C1's instruction columns evaluated.
+pub const PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL: u8 = 5;
+
+/// The compressed file's tag for C1 under `levers`; refused for a lever
+/// setting no verifier takes.
+pub fn compressed_pipeline_of(levers: super::wlfm::WlfmLevers) -> Result<u8, String> {
+    use super::wlfm::WlfmPrep;
+    use multilinear::whir_chain::FinalPoly;
+    match (levers.prep, levers.final_poly) {
+        (prep, FinalPoly::Off) => Ok(compressed_pipeline(prep)),
+        (WlfmPrep::Stacked, FinalPoly::Vars(super::compress::COMPRESS_FINAL_VARS)) => {
+            Ok(PIPELINE_WHIR_COMPRESSED_FINAL)
+        }
+        (WlfmPrep::Evaluated, FinalPoly::Vars(super::compress::COMPRESS_FINAL_VARS)) => {
+            Ok(PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL)
+        }
+        (_, other) => Err(format!(
+            "no compressed verifier takes C1's chains at {other:?}"
+        )),
+    }
+}
+
 /// A whole W3 block's proof compressed (`LAMBDA_VM_BLOCK_COMPRESS`): the
 /// block's statement and C1's proof over the top. As for
 /// [`WhirBlockTreeProof`], nothing here is a format parameter: the rate C1 is
@@ -2962,6 +2991,27 @@ impl WhirBlockCompressedProof {
         }
     }
 
+    /// The file for C1's proof under `levers`, tagged for that setting's
+    /// verifier ([`compressed_pipeline_of`]).
+    pub fn for_levers(
+        statement: block_whir::OwnedBlockStatement,
+        c1: super::wlfm::WlfmProof,
+        levers: super::wlfm::WlfmLevers,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            magic: PROOF_MAGIC,
+            version: PROOF_VERSION,
+            pipeline: compressed_pipeline_of(levers)?,
+            table_num_vars: statement.table_num_vars,
+            runtime_page_ranges: statement.runtime_page_ranges,
+            table_counts: statement.table_counts,
+            public_output: statement.public_output,
+            num_private_input_pages: statement.num_private_input_pages,
+            groups: statement.groups,
+            compressed: c1,
+        })
+    }
+
     /// The claimed statement.
     pub fn statement(&self) -> block_whir::BlockStatement<'_> {
         block_whir::BlockStatement {
@@ -2993,8 +3043,8 @@ impl WhirBlockCompressedProof {
                 proof.version
             ));
         }
-        if proof.pipeline != PIPELINE_WHIR_COMPRESSED
-            && proof.pipeline != PIPELINE_WHIR_COMPRESSED_EVALUATED
+        if !(PIPELINE_WHIR_COMPRESSED..=PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL)
+            .contains(&proof.pipeline)
         {
             return Err(format!(
                 "the file holds pipeline {}, not the compressed WHIR block tree",
@@ -3039,7 +3089,10 @@ pub fn verify_whir_block_compressed_proof(
         &plan,
         &presets.wrap_options,
         super::compress::COMPRESS_RATE,
-        super::compress::COMPRESS_PREP,
+        super::wlfm::WlfmLevers {
+            prep: super::compress::COMPRESS_PREP,
+            final_poly: super::compress::COMPRESS_FINAL,
+        },
         &proof.compressed,
     )
 }
@@ -3062,7 +3115,59 @@ pub fn verify_whir_block_compressed_evaluated_proof(
         &plan,
         &presets.wrap_options,
         super::compress::COMPRESS_RATE,
-        super::wlfm::WlfmPrep::Evaluated,
+        super::wlfm::WlfmLevers {
+            prep: super::wlfm::WlfmPrep::Evaluated,
+            final_poly: super::compress::COMPRESS_FINAL,
+        },
+        &proof.compressed,
+    )
+}
+
+/// ★ The final-polynomial arm's compressed W3 block verifier
+/// (`LAMBDA_VM_BLOCK_COMPRESS_FINAL`): [`verify_whir_block_compressed_proof`]
+/// with C1's chains stopping at a final polynomial of
+/// [`super::compress::COMPRESS_FINAL_VARS`] variables, a constant of this
+/// function. Its tag ([`PIPELINE_WHIR_COMPRESSED_FINAL`]) is checked first.
+pub fn verify_whir_block_compressed_final_proof(
+    elf_bytes: &[u8],
+    proof: &WhirBlockCompressedProof,
+) -> Result<(), String> {
+    require_compressed_tag(proof, PIPELINE_WHIR_COMPRESSED_FINAL)?;
+    let presets = super::whir_block::pinned_verifier_presets(BlockFormat::pinned().group);
+    let plan = super::whir_block::verifier_plan(elf_bytes, proof.statement(), &presets)?;
+    super::compress::verify_compressed(
+        &plan,
+        &presets.wrap_options,
+        super::compress::COMPRESS_RATE,
+        super::wlfm::WlfmLevers {
+            prep: super::compress::COMPRESS_PREP,
+            final_poly: multilinear::whir_chain::FinalPoly::Vars(
+                super::compress::COMPRESS_FINAL_VARS,
+            ),
+        },
+        &proof.compressed,
+    )
+}
+
+/// ★ Both levers: C1's instruction columns evaluated and its chains stopping
+/// at the final polynomial; tag [`PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL`].
+pub fn verify_whir_block_compressed_evaluated_final_proof(
+    elf_bytes: &[u8],
+    proof: &WhirBlockCompressedProof,
+) -> Result<(), String> {
+    require_compressed_tag(proof, PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL)?;
+    let presets = super::whir_block::pinned_verifier_presets(BlockFormat::pinned().group);
+    let plan = super::whir_block::verifier_plan(elf_bytes, proof.statement(), &presets)?;
+    super::compress::verify_compressed(
+        &plan,
+        &presets.wrap_options,
+        super::compress::COMPRESS_RATE,
+        super::wlfm::WlfmLevers {
+            prep: super::wlfm::WlfmPrep::Evaluated,
+            final_poly: multilinear::whir_chain::FinalPoly::Vars(
+                super::compress::COMPRESS_FINAL_VARS,
+            ),
+        },
         &proof.compressed,
     )
 }
@@ -3477,44 +3582,88 @@ mod tests {
         assert_ne!(PIPELINE_WHIR, PIPELINE_WHIR_COMPRESSED_EVALUATED);
     }
 
-    /// Each compressed verifier refuses the other's tag before it reads the
-    /// ELF or the statement: with no ELF at all, the refusal is the tag's.
+    /// Each compressed verifier refuses every other compressed tag before it
+    /// reads the ELF or the statement (with no ELF at all, the refusal is the
+    /// tag's), and passes its own tag's gate. A lever setting no verifier
+    /// takes has no tag.
     #[test]
     fn each_compressed_verifier_refuses_the_others_tag_up_front() {
-        use super::super::wlfm::WlfmPrep;
+        use super::super::wlfm::{WlfmLevers, WlfmPrep};
+        use multilinear::whir_chain::FinalPoly;
         let stacked = synthetic_compressed();
-        let evaluated = WhirBlockCompressedProof::for_binding(
-            stacked.statement().to_owned(),
-            stacked.compressed.clone(),
-            WlfmPrep::Evaluated,
-        );
-        let tag_refusal = |r: Result<(), String>, theirs: u8, ours: u8| {
-            let e = r.expect_err("refused");
-            assert!(
-                e.contains(&format!(
-                    "the file holds pipeline {theirs}, and this verifier reads pipeline {ours}"
-                )),
-                "{e}"
-            );
+        let six = FinalPoly::Vars(super::super::compress::COMPRESS_FINAL_VARS);
+        type Verifier = fn(&[u8], &WhirBlockCompressedProof) -> Result<(), String>;
+        let arms: [(WlfmLevers, u8, Verifier); 4] = [
+            (
+                WlfmLevers::DEFAULT,
+                PIPELINE_WHIR_COMPRESSED,
+                verify_whir_block_compressed_proof,
+            ),
+            (
+                WlfmLevers::with_prep(WlfmPrep::Evaluated),
+                PIPELINE_WHIR_COMPRESSED_EVALUATED,
+                verify_whir_block_compressed_evaluated_proof,
+            ),
+            (
+                WlfmLevers {
+                    prep: WlfmPrep::Stacked,
+                    final_poly: six,
+                },
+                PIPELINE_WHIR_COMPRESSED_FINAL,
+                verify_whir_block_compressed_final_proof,
+            ),
+            (
+                WlfmLevers {
+                    prep: WlfmPrep::Evaluated,
+                    final_poly: six,
+                },
+                PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL,
+                verify_whir_block_compressed_evaluated_final_proof,
+            ),
+        ];
+        let file = |levers| {
+            WhirBlockCompressedProof::for_levers(
+                stacked.statement().to_owned(),
+                stacked.compressed.clone(),
+                levers,
+            )
+            .expect("a tagged setting")
         };
-        tag_refusal(
-            verify_whir_block_compressed_proof(&[], &evaluated),
-            PIPELINE_WHIR_COMPRESSED_EVALUATED,
-            PIPELINE_WHIR_COMPRESSED,
-        );
-        tag_refusal(
-            verify_whir_block_compressed_evaluated_proof(&[], &stacked),
-            PIPELINE_WHIR_COMPRESSED,
-            PIPELINE_WHIR_COMPRESSED_EVALUATED,
-        );
-        // Its own tag passes the gate: the refusal is then something else.
-        for e in [
-            verify_whir_block_compressed_proof(&[], &stacked),
-            verify_whir_block_compressed_evaluated_proof(&[], &evaluated),
-        ] {
-            let e = e.expect_err("no ELF");
-            assert!(!e.contains("and this verifier reads pipeline"), "{e}");
+        for (levers, tag, _) in &arms {
+            let f = file(*levers);
+            assert_eq!(f.pipeline(), *tag);
+            let back = WhirBlockCompressedProof::from_bytes(&f.to_bytes().expect("serializes"))
+                .expect("reads back");
+            assert_eq!(back.pipeline(), *tag);
         }
+        assert_eq!(
+            WhirBlockCompressedProof::new(
+                stacked.statement().to_owned(),
+                stacked.compressed.clone()
+            )
+            .pipeline(),
+            PIPELINE_WHIR_COMPRESSED
+        );
+        for (_, ours, verify) in &arms {
+            for (levers, theirs, _) in &arms {
+                let e = verify(&[], &file(*levers)).expect_err("no ELF");
+                let tag_refusal = format!(
+                    "the file holds pipeline {theirs}, and this verifier reads pipeline {ours}"
+                );
+                if theirs == ours {
+                    assert!(!e.contains("and this verifier reads pipeline"), "{e}");
+                } else {
+                    assert!(e.contains(&tag_refusal), "{e}");
+                }
+            }
+        }
+        assert!(
+            compressed_pipeline_of(WlfmLevers {
+                prep: WlfmPrep::Stacked,
+                final_poly: FinalPoly::Vars(4),
+            })
+            .is_err()
+        );
     }
 
     /// The compressed block's verifier takes its rate from the code: its body
@@ -3536,10 +3685,12 @@ mod tests {
         let forbidden_in_verifiers = [
             "env::var",
             "compress_from_env",
-            "compress_prep_from_env",
+            "compress_levers_from_env",
             "ZfFormat::global",
             ".rate",
             ".prep",
+            ".levers",
+            ".final_poly",
         ];
         for forbidden in forbidden_in_verifiers {
             assert!(
@@ -3565,6 +3716,38 @@ mod tests {
                 "the evaluated verifier reads `{forbidden}`"
             );
         }
+        // The final-polynomial arms: their tag first, the width a constant.
+        for (name, tag, prep) in [
+            (
+                "verify_whir_block_compressed_final_proof",
+                "PIPELINE_WHIR_COMPRESSED_FINAL",
+                "super::compress::COMPRESS_PREP",
+            ),
+            (
+                "verify_whir_block_compressed_evaluated_final_proof",
+                "PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL",
+                "WlfmPrep::Evaluated",
+            ),
+        ] {
+            let at = src
+                .find(&format!("\npub fn {name}("))
+                .unwrap_or_else(|| panic!("{name}"));
+            let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
+            assert!(
+                body.contains(&format!("require_compressed_tag(proof, {tag})?")),
+                "{body}"
+            );
+            for needed in [
+                "super::compress::COMPRESS_RATE",
+                "super::compress::COMPRESS_FINAL_VARS",
+                prep,
+            ] {
+                assert!(body.contains(needed), "{name} names {needed}");
+            }
+            for forbidden in forbidden_in_verifiers {
+                assert!(!body.contains(forbidden), "{name} reads `{forbidden}`");
+            }
+        }
         let compress = include_str!("compress.rs");
         let verify = &compress[compress
             .find("\npub fn verify_compressed(")
@@ -3572,7 +3755,7 @@ mod tests {
         for forbidden in [
             "env::var",
             "compress_from_env",
-            "compress_prep_from_env",
+            "compress_levers_from_env",
             "ZfFormat::global",
         ] {
             assert!(
@@ -3605,7 +3788,7 @@ mod tests {
             node_times: false,
             leaf_first: true,
             compress: None,
-            compress_prep: super::super::wlfm::WlfmPrep::Stacked,
+            compress_levers: super::super::wlfm::WlfmLevers::DEFAULT,
         };
         assert!(production.at_presets());
         let off = |f: fn(&mut WhirTreeConfig)| {
