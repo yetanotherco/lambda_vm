@@ -311,6 +311,26 @@ fn the_limbs_form_replaces_the_lt_lookup_and_nothing_else() {
     }
 }
 
+/// MEMW keeps its eight LT lookups (one an old timestamp, `MEMW-C4…C7`): the
+/// receiver of every aligned access the limbs' routing refuses (two high
+/// words, or not later) and of every unaligned or mixed-timestamp access, with
+/// the full comparison. Its 26 interactions are today's.
+#[test]
+fn memw_keeps_its_eight_lt_lookups() {
+    use crate::tables::types::alu_op;
+    let memw = crate::tables::memw::bus_interactions();
+    assert_eq!(memw.len(), 26);
+    let lt = memw
+        .iter()
+        .filter(|i| {
+            i.bus_id == BusId::Alu as u64
+                && i.is_sender
+                && i.values.get(2) == Some(&BusValue::constant(alu_op::LT as u64))
+        })
+        .count();
+    assert_eq!(lt, 8, "one LT lookup an old timestamp");
+}
+
 /// Each form is its own AIR prototype: built in any order in one process, the
 /// limbs' AIR has 21 interactions and LT's 20, both named `MEMW_A`, with the
 /// same columns and constraints.
