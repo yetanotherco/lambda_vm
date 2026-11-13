@@ -4124,6 +4124,17 @@ fn prove_block_whir_inner(
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
 ) -> Result<(BlockWhirProof, BlockStamps), Error> {
+    // The measurement-only register-shape probe (`crate::regs_probe`): a
+    // misspelt knob proves nothing, and a probed prove says so first.
+    if crate::regs_probe::check()? {
+        eprintln!(
+            "REGS PROBE: on ({}=1) · the CPU rows' register accesses make no MEMW_R row · CPU \
+             {} columns, {} interactions · MEASUREMENT ONLY: this proof does not verify",
+            crate::regs_probe::ENV,
+            crate::tables::cpu::num_columns(),
+            crate::tables::cpu::bus_interactions(0).len(),
+        );
+    }
     // The page-locked pool (`LAMBDA_VM_PINNED_POOL_GIB`), locked once in the
     // process: a caller that locked it before its own clock (the block tree)
     // finds it locked; any other has it locked here, before the build.

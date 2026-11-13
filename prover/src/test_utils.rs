@@ -46,9 +46,7 @@ use crate::tables::branch::{
 use crate::tables::bytewise::{
     bus_interactions as bytewise_bus_interactions, cols as bytewise_cols,
 };
-use crate::tables::cpu::{
-    CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
-};
+use crate::tables::cpu::{CpuOperation, bus_interactions as cpu_bus_interactions};
 use crate::tables::cpu32::{
     Cpu32Constraints, bus_interactions as cpu32_bus_interactions, cols as cpu32_cols,
 };
@@ -791,7 +789,7 @@ fn build_air_maybe_cached<CS: ConstraintSet<F, E> + Clone + Send + Sync + 'stati
 pub fn create_cpu_air(proof_options: &ProofOptions, ts_base: u64) -> ConcreteVmAir<CpuConstraints> {
     let full_table = crate::tables::cpu::TIMESTAMP_STRIDE * crate::tables::max_rows::CPU as u64;
     build_air_maybe_cached(
-        cpu_cols::NUM_COLUMNS,
+        crate::tables::cpu::num_columns(),
         cpu_bus_interactions(ts_base),
         proof_options,
         1,

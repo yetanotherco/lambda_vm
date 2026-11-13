@@ -27,6 +27,7 @@ pub mod multilinear_prove;
 mod paged_mem;
 pub use stark::profile_markers;
 pub mod recursion;
+pub mod regs_probe;
 #[cfg(feature = "shape-profile")]
 pub mod shape_profile;
 mod statement;
