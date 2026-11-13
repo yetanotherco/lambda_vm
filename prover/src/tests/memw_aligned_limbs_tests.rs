@@ -146,7 +146,7 @@ fn limbs_accept(old_lo: FE, old_hi: u64, ts_lo: FE, ts_hi: u64) -> bool {
 }
 
 // =============================================================================
-// The real LT chip (the breaker's probe of the review, re-pointed here)
+// The real LT chip, a row of its own layout
 // =============================================================================
 
 /// A row of the real LT layout claiming unsigned `(a0, a_hi) < (b0, b_hi)` is
@@ -934,7 +934,7 @@ fn half_word_senders() -> Vec<(String, String)> {
 
 /// ★ The range bus the limbs rest on takes no negative weight: every `IS_HALF`
 /// sender of the production block's tables, by table and multiplicity, is
-/// the review's census (a constant 1, a column or a sum constrained to a bit,
+/// one of three kinds (a constant 1, a column or a sum constrained to a bit,
 /// or a multiplicity bounded by a lookup of weight 1). A new sender, or a
 /// sender's weight changed, fails here, to be classified before it lands: the
 /// limbs' 16-bit bound is only as good as this bus's.
