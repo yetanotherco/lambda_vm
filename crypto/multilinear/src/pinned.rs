@@ -152,3 +152,91 @@ pub struct Stats {
     pub shrunk_bytes: u64,
     pub shrink_moved: u64,
 }
+
+/// A buffer page-locked where it lies ([`register_in_place`]); undo it with
+/// [`unregister_in_place`] before the buffer is freed or moved.
+#[derive(Debug, Default)]
+#[must_use = "undo it with `unregister_in_place` before the buffer is freed"]
+pub struct InPlace {
+    #[cfg(feature = "cuda")]
+    inner: math_cuda::registered::Registered,
+    /// Bytes locked, pieces the driver refused, and the seconds it took.
+    pub bytes: u64,
+    pub refused: usize,
+    pub seconds: f64,
+}
+
+/// Page-locks `bytes` from `ptr` in place, a piece at a time, so an upload
+/// from them goes to the card as direct DMAs instead of through the staging
+/// buffers ([`math_cuda::registered`]). The bytes uploaded do not change.
+/// Without the `cuda` feature or a card, nothing is locked. Every other
+/// thread's driver calls wait while a piece is locked.
+///
+/// The caller keeps the buffer alive and unmoved until it has handed the
+/// result to [`unregister_in_place`], and registers no buffer twice.
+pub fn register_in_place(ptr: *const u8, bytes: usize) -> InPlace {
+    #[cfg(feature = "cuda")]
+    {
+        let inner = math_cuda::registered::register(ptr, bytes);
+        let (bytes, refused, seconds) = (inner.bytes, inner.refused, inner.seconds);
+        InPlace {
+            inner,
+            bytes,
+            refused,
+            seconds,
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ptr, bytes);
+        InPlace::default()
+    }
+}
+
+/// Undoes [`register_in_place`]; call it once no upload from the buffer is in
+/// flight (every upload that reads a registered buffer returns after its DMA).
+pub fn unregister_in_place(r: InPlace) {
+    #[cfg(feature = "cuda")]
+    math_cuda::registered::unregister(r.inner);
+    #[cfg(not(feature = "cuda"))]
+    let _ = r;
+}
+
+/// The in-place registrations' counters ([`math_cuda::registered::Stats`]);
+/// all zero without the `cuda` feature.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InPlaceStats {
+    pub registered_bytes: u64,
+    pub register_seconds: f64,
+    pub refused_pieces: u64,
+    pub unregister_seconds: f64,
+    /// Bytes uploaded as direct DMAs from registered buffers, and the uploads.
+    pub direct_bytes: u64,
+    pub direct_calls: u64,
+    /// Pieces registered now.
+    pub pieces_now: usize,
+}
+
+pub fn in_place_stats() -> InPlaceStats {
+    #[cfg(feature = "cuda")]
+    {
+        let s = math_cuda::registered::stats();
+        InPlaceStats {
+            registered_bytes: s.registered_bytes,
+            register_seconds: s.register_seconds,
+            refused_pieces: s.refused_pieces,
+            unregister_seconds: s.unregister_seconds,
+            direct_bytes: s.direct_bytes,
+            direct_calls: s.direct_calls,
+            pieces_now: s.pieces_now,
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    InPlaceStats::default()
+}
+
+/// Zeroes the in-place registrations' counters (not the registrations).
+pub fn reset_in_place_stats() {
+    #[cfg(feature = "cuda")]
+    math_cuda::registered::reset_stats();
+}

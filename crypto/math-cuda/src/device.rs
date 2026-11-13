@@ -2368,6 +2368,17 @@ pub fn htod_staged<T: cudarc::driver::DeviceRepr>(
     if std::mem::size_of_val(src_host) == 0 {
         return Ok(());
     }
+    // A source page-locked in place ([`crate::registered`]) skips the staging
+    // copy: the same bytes to the same offsets, as direct DMAs. With nothing
+    // registered (the default) this is one atomic load.
+    if crate::registered::any()
+        && let Some(plan) = crate::registered::direct_plan(
+            src_host.as_ptr() as *const u8,
+            std::mem::size_of_val(src_host),
+        )
+    {
+        return htod_direct(stream, src_host, dst, &plan);
+    }
     // Whole elements per chunk, so a `T` never straddles two buffers.
     let chunk_elems = STAGED_CHUNK_BYTES / elem_size.max(1);
 
@@ -2418,6 +2429,48 @@ pub fn htod_staged<T: cudarc::driver::DeviceRepr>(
         elem_off += this_elems;
         k += 1;
     }
+    Ok(())
+}
+
+/// [`htod_staged`] for a source page-locked in place: each segment of `plan`
+/// ([`crate::registered::direct_plan`]) one `cuMemcpyHtoDAsync` straight from
+/// the source, then the stream synchronized, so the call returns with every
+/// byte landed, as the staged path's caller may free the source on return.
+fn htod_direct<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    src_host: &[T],
+    dst: &mut cudarc::driver::CudaViewMut<'_, T>,
+    plan: &[crate::registered::Segment],
+) -> Result<()> {
+    use cudarc::driver::DevicePtrMut;
+    let be = backend()?;
+    be.ctx.bind_to_thread()?;
+    // SAFETY: as in `htod_staged`: `dst.len() >= src_host.len()` (asserted by
+    // the caller), and every segment lies inside the source's byte range.
+    let (dst_base, _record) = dst.device_ptr_mut(stream);
+    let mut drain = DrainOnErr {
+        stream,
+        armed: false,
+    };
+    let src = src_host.as_ptr() as *const u8;
+    for s in plan {
+        // SAFETY: `s.off + s.len <= size_of_val(src_host)` by the plan's
+        // construction; the source stays alive until the synchronize below.
+        let r = unsafe {
+            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst_base + s.off as u64,
+                src.add(s.off) as *const core::ffi::c_void,
+                s.len,
+                stream.cu_stream(),
+            )
+            .result()
+        };
+        drain.armed = true;
+        r?;
+    }
+    stream.synchronize()?;
+    drain.armed = false;
+    crate::registered::note_direct(std::mem::size_of_val(src_host));
     Ok(())
 }
 
