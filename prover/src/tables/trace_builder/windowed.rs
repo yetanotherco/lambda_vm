@@ -3787,11 +3787,12 @@ fn memw_register_words_chunk_ops(
         return decoded(&chunk);
     }
     stamps.memw_r[0] += 1;
-    stamps.records_bytes += bytes;
-    (
-        ChunkOps::MemwRegisterRecords(RegisterRowRecords::from_words(chunk, Arc::clone(decode))),
-        None,
-    )
+    // Counted as the records' bytes, as every family's are and as their
+    // release counts them (`TableRecords::bytes`: the rows the words stand
+    // for, so the digest is the rows'); the room above saw the bytes held.
+    let records = RegisterRowRecords::from_words(chunk, Arc::clone(decode));
+    stamps.records_bytes += multilinear::records::TableRecords::bytes(&records);
+    (ChunkOps::MemwRegisterRecords(records), None)
 }
 
 /// [`chunk_jobs`] under [`WindowedTraceBuilder::drop_streamed_ops`]: every full
