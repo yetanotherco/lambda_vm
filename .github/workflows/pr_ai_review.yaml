@@ -31,7 +31,7 @@ jobs:
         github.event.pull_request.head.repo.full_name == github.repository
       )
     # Re-pin to the release tag's commit once yetanotherco/actions releases pr_review_multi.yml.
-    uses: yetanotherco/actions/.github/workflows/pr_review_multi.yml@608b0eb7edac8a6c9b3ac2d74eafe354c2599b54 # feat/multi-model-review
+    uses: yetanotherco/actions/.github/workflows/pr_review_multi.yml@704413fc1627536ebb9e12e658f42953bf5396af # feat/multi-model-review
     permissions:
       contents: read
       pull-requests: write

@@ -7,7 +7,8 @@ threat_model = "threat_model.md"
 # Areas are Cargo packages (dirs with a Cargo.toml), else the first `unit_depth` path components.
 unit_depth = 2
 
-# Soundness-critical code: units touching these get all lanes.
+# Soundness-critical code. Files not listed are reviewed as sensitive too (default_sensitive is on and
+# low_risk is empty), so every part gets every reviewer; this list orders the review of a large PR.
 sensitive = [
   "prover/**",                 # AIR tables, constraints, LogUp/bus, trace generation, recursion.rs
   "crypto/stark/**",           # STARK prover and verifier, FRI, transcript
@@ -44,7 +45,17 @@ test_globs = [
   "crypto/math/fuzz/**",
 ]
 
+# Reviewers for parts with no sensitive file (only used if low_risk or default_sensitive = false makes
+# some files non-sensitive).
 nonsensitive_lanes = ["claude", "gpt", "kimi"]
 
-# Order of review under --pr-budget, after "sensitive first".
-priority = ["crypto/stark/**", "prover/src/constraints/**", "prover/**", "**/*recursion*", "crypto/**", "formal/**"]
+# Parts matching these are reviewed first and, in a split PR, get twice the per-reviewer budget: keep
+# the list to the code where a bug breaks soundness.
+priority = [
+  "crypto/stark/src/**",
+  "prover/src/constraints/**",
+  "prover/src/tables/**",
+  "prover/src/recursion*",
+  "executor/src/vm/**",
+  "syscalls/src/**",
+]
