@@ -5008,6 +5008,9 @@ pub(crate) mod head_log;
 mod regen_tests;
 
 #[cfg(test)]
+mod clock_census_tests;
+
+#[cfg(test)]
 mod ecrec_defer_tests;
 
 #[cfg(test)]
