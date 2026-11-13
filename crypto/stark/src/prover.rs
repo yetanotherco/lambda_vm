@@ -3993,7 +3993,7 @@ pub trait IsStarkProver<
         let z_scalars: Vec<FieldElement<FieldExtension>> =
             core::iter::once(z_power).chain(z_shifted).collect();
         // The rows invert their own denominators, so there is no inverse
-        // buffer; `LAMBDA_VM_DEEP_INV_LEGACY=1` keeps the buffered kernel.
+        // buffer; the legacy path (`math_cuda::deep_inv`) keeps the buffered kernel.
         if math_cuda::deep_inv::rowwise_enabled()
             && let Some(dw) =
                 crate::gpu_lde::try_deep_composition_gpu_fused_keep::<Field, FieldExtension>(

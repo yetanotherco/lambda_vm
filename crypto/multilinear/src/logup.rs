@@ -240,7 +240,7 @@ pub fn input_plan<E: IsField + 'static>(
 
 /// The input layer and the tree above it, written straight from the table's
 /// resident base columns ([`crate::gpu::input_layer_tree_from_columns`]),
-/// under `LAMBDA_VM_ARGUE_GKR_INPUT`. `None` when the columns are not on the
+/// under `gpu::argue_gkr_input`. `None` when the columns are not on the
 /// card, a side reads a public factor, or the card declines — the caller then
 /// takes today's path.
 pub fn resident_tree_from_columns<F: IsField + 'static, E: IsField + 'static>(

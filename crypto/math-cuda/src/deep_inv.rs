@@ -7,35 +7,17 @@
 //! ([`crate::deep::deep_composition_ext3_fused_keep`]), and the single-point
 //! OOD sums run row-chunked like the multi-point ones ([`crate::barycentric`]).
 //!
-//! `LAMBDA_VM_DEEP_INV_LEGACY=1` sends all three back to the legacy path — the
-//! six-kernel global scan, the buffered DEEP kernel, one block per OOD column —
-//! an A/B and rollback switch, not a tuning knob: both compute the same field
-//! elements, so the same roots and proofs. Read once per process.
+//! The legacy paths — the six-kernel global scan, the buffered DEEP kernel,
+//! one block per OOD column — stay for the shapes the row-wise kernels do not
+//! take and as the parity tests' oracle (`tests/deep_inv_parity.rs`): both
+//! compute the same field elements, so the same roots and proofs.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The legacy switch. Only `1` selects the legacy path; the banner
-/// [`rowwise_enabled`] prints says which one a process took.
-pub const LEGACY_ENV: &str = "LAMBDA_VM_DEEP_INV_LEGACY";
-
-/// Whether this process inverts the DEEP and OOD denominators row-wise.
+/// Whether the DEEP and OOD denominators are inverted row-wise: always, where
+/// the row-wise kernels apply.
 pub fn rowwise_enabled() -> bool {
-    static ENV: OnceLock<bool> = OnceLock::new();
-    *ENV.get_or_init(|| {
-        let legacy = std::env::var(LEGACY_ENV).is_ok_and(|v| v == "1");
-        // One line per process, so every box log states which path it ran.
-        eprintln!(
-            "[gpu] DEEP/OOD denominators: {}",
-            if legacy {
-                "the legacy scan, buffered DEEP, one block per OOD column \
-                 (LAMBDA_VM_DEEP_INV_LEGACY=1)"
-            } else {
-                "inverted row-wise, in the DEEP kernel itself, OOD sums row-chunked"
-            }
-        );
-        !legacy
-    })
+    true
 }
 
 static ROWWISE_INVERSIONS: AtomicU64 = AtomicU64::new(0);

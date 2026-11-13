@@ -15,7 +15,7 @@
 //! allocator's evictor before the opening). In each, the cap costs no extra
 //! tree build: `tree_builds` rises by one per call, or by none when a kept
 //! whole tree serves it. SERVED and EVICTED run in both retention modes
-//! (`LFM_WHIR_WHOLE_TREES`, forced).
+//! (`whir::whole_trees`, forced).
 
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField as F;
@@ -36,7 +36,7 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     DEVICE_GLOBALS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// `LFM_WHIR_WHOLE_TREES` forced for one test, and the environment's setting
+/// `whir::whole_trees` forced for one test, and the environment's setting
 /// restored when this drops, on a panic too.
 struct WholeTrees;
 

@@ -287,7 +287,7 @@ fn a_weight_built_all_at_once_matches_one_share_at_a_time() {
 /// Columns evaluated together against the same columns evaluated one at a
 /// time, which is what the batched fold replaces.
 ///
-/// The short shapes are the ones `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` sends here:
+/// The short shapes are the ones `gpu::argue_device_columns` sends here:
 /// under 2^16 rows, from a handful of columns to past the widest precompile's
 /// 1,480, and two chunks of `CHUNK_BUDGET_BYTES` at the tallest (102 columns
 /// of 2^15 rows fill one).

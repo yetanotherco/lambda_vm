@@ -36,7 +36,7 @@ fn point(n: usize, seed: u64) -> Vec<EE> {
         .collect()
 }
 
-// ── S1a: the zerocheck batches on demand (`LAMBDA_VM_ARGUE_LEAN_PROGRAM`) ────
+// ── S1a: the zerocheck batches on demand (`gpu::argue_lean_program`) ────
 
 pub(crate) type VmAir = Box<dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>>;
 

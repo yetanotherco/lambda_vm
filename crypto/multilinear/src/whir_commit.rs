@@ -1665,7 +1665,7 @@ where
     /// A codeword the device kept has no tree here — only its root. The device
     /// keeps the tree past the commit, inside the codeword's promise and
     /// evictable (`math_cuda::whir`: whole by default, or its leaf layer under
-    /// `LFM_WHIR_WHOLE_TREES=0`), and rebuilds what an eviction took. Bringing
+    /// `whir::whole_trees` off), and rebuilds what an eviction took. Bringing
     /// it home would cost ten times the rehash, because a pageable copy of half
     /// a gigabyte is the slowest thing in the commit. What a proof wants of a
     /// tree is a kilobyte per query.

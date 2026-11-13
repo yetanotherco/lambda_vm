@@ -1244,10 +1244,10 @@ where
     // is built — same factors, same (z, alpha, beta) — only when, so a prebuilt
     // tree yields byte-for-byte the same proof as building it here now.
     // The tree where the factors reside, the lift timed on its own.
-    // Under `LAMBDA_VM_ARGUE_GKR_INPUT` (D-BATCH M1-2) the input layer is
+    // Under `gpu::argue_gkr_input` (D-BATCH M1-2) the input layer is
     // written from the resident base columns; the factors are still lifted, for
     // the zerocheck.
-    // With no lift (`LAMBDA_VM_ARGUE_NO_LIFT`, M1-2's second half) a tree written
+    // With no lift (`gpu::argue_no_lift`, M1-2's second half) a tree written
     // from the columns needs no factors at all: they are lifted later only if
     // the zerocheck needs them.
     let no_lift = multilinear::gpu::argue_no_lift();
@@ -1260,9 +1260,6 @@ where
         }
         let lift = tick();
         let resident = table.trace.reside_from_columns();
-        if let Some(factors) = resident.as_ref() {
-            factors.tree_sync();
-        }
         lap(&split::TREE_LIFT, lift);
         let from_columns = (multilinear::gpu::argue_gkr_input() && resident.is_some())
             .then(|| logup::resident_tree_from_columns(&interactions, &table.trace))
@@ -1307,7 +1304,7 @@ where
     let betas = multilinear_air::beta_powers(beta, shape.num_roots());
     let zerocheck = Rule::compiled(shape.degree() + 1, shape.program(&betas, weight_r)?);
 
-    // Under `LAMBDA_VM_ARGUE_DEVICE_TABLES` the weights go as their points and
+    // Under `gpu::argue_device_tables` the weights go as their points and
     // the card builds them where the zerocheck folds them; the host builds them
     // only if the card turns the rounds down.
     let weights = if multilinear::gpu::argue_device_tables() {
@@ -1318,22 +1315,21 @@ where
             Weight::Table(eq_mle(&bus.row_point)?),
         ]
     };
-    // D-ARGUE stage 1 (`LAMBDA_VM_ARGUE_FUSED`, on by default; `=0` is today's
-    // rounds): the same batch, described for the fused rounds — its constraint
-    // part in the base field. A table whose part is not (a constant with an
-    // extension limb) runs today's rounds.
-    let constraints = (multilinear::gpu_fused::argue_fused()
-        && multilinear::gpu_fused::fused_takes_width(table.num_committed_columns()))
-    .then(|| {
-        multilinear::fused::Constraints::<F>::from_extension(
-            &shape.steps_as_ops(),
-            shape.root_steps(),
-            shape.selector_of_root(),
-            shape.degree(),
-        )
-        .ok()
-    })
-    .flatten();
+    // D-ARGUE stage 1 (the fused rounds, on by default; a test's override runs
+    // today's rounds): the same batch, described for the fused rounds — its
+    // constraint part in the base field. A table whose part is not (a constant
+    // with an extension limb) runs today's rounds.
+    let constraints = multilinear::gpu_fused::argue_fused()
+        .then(|| {
+            multilinear::fused::Constraints::<F>::from_extension(
+                &shape.steps_as_ops(),
+                shape.root_steps(),
+                shape.selector_of_root(),
+                shape.degree(),
+            )
+            .ok()
+        })
+        .flatten();
     // With no lift, the fused rounds read the base columns; a table they cannot
     // read that way (a shifted factor, a public table above the base field, no
     // fused description) is lifted here, as it would have been.
@@ -2674,7 +2670,7 @@ mod tests {
     }
 
     /// The same three tables at a height where the claim reduce's
-    /// columns-on-the-card knob (`LAMBDA_VM_ARGUE_DEVICE_COLUMNS`) has work to
+    /// columns-on-the-card knob (`gpu::argue_device_columns`) has work to
     /// move: CPU is 2^14 rows of 5 columns and ADD 2^14 of 4 — exactly 2^16
     /// cells, the threshold — so a card values both once they are resident,
     /// while MUL, 2^13 of 4, stays on the host either way. Every column is
@@ -2747,15 +2743,15 @@ mod tests {
         nolift: u64,
     }
 
-    /// The argue knobs an arm runs under: `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`,
-    /// `LAMBDA_VM_ARGUE_DEVICE_TABLES`, `LAMBDA_VM_ARGUE_LEAN_PROGRAM`.
+    /// The argue knobs an arm runs under: `gpu::argue_device_columns`,
+    /// `gpu::argue_device_tables`, `gpu::argue_lean_program`.
     ///
     /// Under `program` every batch counts as big, so these small tables take
     /// the path the VM's four big batches do
     /// ([`the_tall_batches_hold_fewer_values_on_demand`]).
     ///
-    /// `fused` is D-ARGUE stage 1 (`LAMBDA_VM_ARGUE_FUSED` with
-    /// `LAMBDA_VM_ARGUE_INT_NODES`, on by default in production): off, the
+    /// `fused` is D-ARGUE stage 1 (`gpu_fused::argue_fused` with
+    /// `sumcheck::int_nodes`, on by default in production): off, the
     /// zerocheck takes today's rounds — the path every other knob here acts on.
     #[derive(Clone, Copy, Debug, Default)]
     struct Knobs {
@@ -2889,7 +2885,7 @@ mod tests {
         multilinear::gpu::reserve_budget() > 0
     }
 
-    /// ★ `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` moves no byte of the proof. The tall
+    /// ★ `gpu::argue_device_columns` moves no byte of the proof. The tall
     /// tables proved with the knob off and on give the same canonical bytes,
     /// table by table and whole, the same transcript after them and the same
     /// next challenge, and both verify.
@@ -3009,8 +3005,8 @@ mod tests {
         );
     }
 
-    /// ★ `LAMBDA_VM_ARGUE_DEVICE_TABLES` moves no byte of the proof, alone or
-    /// with `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`: the same canonical bytes table by
+    /// ★ `gpu::argue_device_tables` moves no byte of the proof, alone or
+    /// with `gpu::argue_device_columns`: the same canonical bytes table by
     /// table and whole, the same transcript and next challenge, and each proof
     /// verifies.
     ///
@@ -3680,7 +3676,7 @@ mod tests {
         eprintln!("argue fused: the wrong coefficient was refused: {verdict:?}");
     }
 
-    /// ★ `LAMBDA_VM_ARGUE_GKR_GRUEN` (D-ARGUE S1-3) moves no byte of the proof,
+    /// ★ `gkr_gruen::argue_gkr_gruen` (D-ARGUE S1-3) moves no byte of the proof,
     /// alone, beside the fused zerocheck (the production default), and with
     /// every other argue knob: the same canonical bytes, table by table and
     /// whole, the same transcript and next challenge, and every proof verifies.
@@ -3769,7 +3765,7 @@ mod tests {
         }
     }
 
-    /// ★ `LAMBDA_VM_ARGUE_GKR_INPUT` (D-BATCH M1-2) moves no byte of the proof,
+    /// ★ `gpu::argue_gkr_input` (D-BATCH M1-2) moves no byte of the proof,
     /// alone and with the production defaults beside it (the fused zerocheck and
     /// the Gruen layers): the same canonical bytes, table by table and whole, the
     /// same transcript and next challenge, and every proof verifies. On a device
@@ -3961,7 +3957,7 @@ mod tests {
         }
     }
 
-    /// ★ `LAMBDA_VM_ARGUE_LEAN_PROGRAM` moves no byte of the proof, alone or with
+    /// ★ `gpu::argue_lean_program` moves no byte of the proof, alone or with
     /// every other argue knob: the same canonical bytes, transcript and next
     /// challenge, and every proof verifies.
     ///

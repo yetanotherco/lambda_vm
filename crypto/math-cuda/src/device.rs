@@ -1849,52 +1849,33 @@ impl Drop for DrainOnErr<'_> {
 
 // ── Per-transfer, double-buffered pinned staging ─────────────────────────────
 
-/// The opt-out from per-transfer staging. `1` sends the row-major commit's trace
-/// upload and its retained-LDE download through the shared per-worker slab of
-/// [`htod_via`] / [`async_dtoh_via`]; anything else (the default) gives each of
-/// those transfers a staging pair of its own ([`htod_staged`],
-/// [`dtoh_staged_into`]).
-///
-/// ⛔ WHY PAIRS. The per-table scheduler's driver threads are not rayon workers,
-/// so [`Backend::worker_slot`] sends every one of them to slot 0. Through the
-/// shared slab every driver stages through ONE slab, one single-buffered chunk at
-/// a time, and a driver copying a retained LDE out holds that slab's mutex for
-/// the whole host copy while the others queue with the card idle. The slab also
-/// grows to the largest retained LDE's next power of two and never shrinks, which
-/// is pinned host memory for the rest of the process.
-pub const STAGING_SHARED_SLAB_ENV: &str = "LAMBDA_VM_STAGING_SHARED_SLAB";
-
+// Per-transfer staging: the row-major commit's trace upload and its
+// retained-LDE download each take a staging pair of their own
+// ([`htod_staged`], [`dtoh_staged_into`]) rather than the shared per-worker
+// slab of [`htod_via`] / [`async_dtoh_via`], which a test's
+// [`set_staging_pairs_override`] can still select.
+//
+// ⛔ WHY PAIRS. The per-table scheduler's driver threads are not rayon workers,
+// so [`Backend::worker_slot`] sends every one of them to slot 0. Through the
+// shared slab every driver stages through ONE slab, one single-buffered chunk at
+// a time, and a driver copying a retained LDE out holds that slab's mutex for
+// the whole host copy while the others queue with the card idle. The slab also
+// grows to the largest retained LDE's next power of two and never shrinks, which
+// is pinned host memory for the rest of the process.
 thread_local! {
     /// The calling thread's override of [`staging_pairs_enabled`], so one test
-    /// process can run both paths. `None` reads the environment.
+    /// process can run both paths. `None` is the default, pairs.
     static STAGING_PAIRS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether the calling thread stages the row-major commit's transfers through
-/// pairs: its override if set, else unless [`STAGING_SHARED_SLAB_ENV`] is `1`.
-/// The environment is read once per process and named once on stderr, so every
-/// log states which staging it ran.
+/// pairs: its override if set, else yes.
 pub fn staging_pairs_enabled() -> bool {
-    if let Some(on) = STAGING_PAIRS_OVERRIDE.with(|o| o.get()) {
-        return on;
-    }
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let shared = std::env::var(STAGING_SHARED_SLAB_ENV).is_ok_and(|v| v == "1");
-        eprintln!(
-            "[gpu] transfer staging: {}",
-            if shared {
-                "the shared per-worker slab (LAMBDA_VM_STAGING_SHARED_SLAB=1)"
-            } else {
-                "per-transfer pinned pairs"
-            }
-        );
-        !shared
-    })
+    STAGING_PAIRS_OVERRIDE.with(|o| o.get()).unwrap_or(true)
 }
 
 /// Force [`staging_pairs_enabled`] on the calling thread; `None` restores the
-/// environment's answer.
+/// default.
 pub fn set_staging_pairs_override(on: Option<bool>) {
     STAGING_PAIRS_OVERRIDE.with(|o| o.set(on));
 }
@@ -2149,58 +2130,29 @@ pub fn staging_totals() -> StagingTotals {
     }
 }
 
-/// How a preprocessed commit brings its precomputed tree's node buffer to the
-/// host on a tree-cache miss. Unset or `staged` (the default): through a
-/// staging pair ([`dtoh_staged_uncounted`]) straight into the host tree's node
-/// vector, with the multiplicity tree queued behind the last chunk. `legacy`
-/// or `pageable` (the opt-out): one pageable copy into a zeroed byte vector,
-/// converted to nodes at the end of the commit — the path before the knob
-/// existed. The nodes are the same bytes either way; only the transfer
-/// differs. #1013's median 25475471 recursion took 2.9 s (ULTRA) and 6.3 s
-/// (RYZEN) less staged (I-COPIES §6, §8).
-pub const TREE_DOWNLOAD_ENV: &str = "LAMBDA_VM_TREE_DOWNLOAD";
-
+// How a preprocessed commit brings its precomputed tree's node buffer to the
+// host on a tree-cache miss: through a staging pair
+// ([`dtoh_staged_uncounted`]) straight into the host tree's node vector, with
+// the multiplicity tree queued behind the last chunk. A test's
+// [`set_tree_download_override`] can still take the pageable path: one
+// pageable copy into a zeroed byte vector, converted to nodes at the end of
+// the commit. The nodes are the same bytes either way; only the transfer
+// differs. #1013's median 25475471 recursion took 2.9 s (ULTRA) and 6.3 s
+// (RYZEN) less staged (I-COPIES §6, §8).
 thread_local! {
     /// The calling thread's override of [`tree_download_staged`], so one test
-    /// process can run both paths. `None` reads the environment.
+    /// process can run both paths. `None` is the default, staged.
     static TREE_DOWNLOAD_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether the calling thread downloads precomputed trees staged: its override
-/// if set, else [`TREE_DOWNLOAD_ENV`], read once per process and named once on
-/// stderr, so every log states which download it ran.
+/// if set, else yes.
 pub fn tree_download_staged() -> bool {
-    if let Some(on) = TREE_DOWNLOAD_OVERRIDE.with(|o| o.get()) {
-        return on;
-    }
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let (staged, why) = tree_download_setting(std::env::var(TREE_DOWNLOAD_ENV).ok().as_deref());
-        eprintln!(
-            "[gpu] precomputed-tree download: {} ({why})",
-            if staged { "staged" } else { "pageable" }
-        );
-        staged
-    })
-}
-
-/// [`TREE_DOWNLOAD_ENV`]'s value read: whether it selects the staged download,
-/// and how the value was taken. An unknown value keeps the default (staged)
-/// and says so, rather than failing a prove over a typo.
-fn tree_download_setting(value: Option<&str>) -> (bool, String) {
-    match value.map(str::trim) {
-        None => (true, format!("{TREE_DOWNLOAD_ENV} unset, the default")),
-        Some("staged") => (true, format!("{TREE_DOWNLOAD_ENV}=staged")),
-        Some(v @ ("legacy" | "pageable")) => (false, format!("{TREE_DOWNLOAD_ENV}={v}")),
-        Some(v) => (
-            true,
-            format!("{TREE_DOWNLOAD_ENV}={v:?} is not staged, legacy or pageable: the default"),
-        ),
-    }
+    TREE_DOWNLOAD_OVERRIDE.with(|o| o.get()).unwrap_or(true)
 }
 
 /// Force [`tree_download_staged`] on the calling thread; `None` restores the
-/// environment's answer.
+/// default.
 pub fn set_tree_download_override(on: Option<bool>) {
     TREE_DOWNLOAD_OVERRIDE.with(|o| o.set(on));
 }
@@ -2273,24 +2225,20 @@ pub fn tree_download_totals() -> TreeDownloadTotals {
 
 #[cfg(test)]
 mod tree_download_tests {
-    use super::{TreeDownloadTotals, tree_download_setting};
+    use super::{TreeDownloadTotals, set_tree_download_override, tree_download_staged};
 
-    /// The staged download is the default: unset, `staged` and anything
-    /// unknown select it; only `legacy` and `pageable` opt out, and the reason
-    /// names the value.
+    /// The staged download is the default; a thread's override takes either
+    /// path and `None` restores the default.
     #[test]
-    fn staged_is_the_default_and_only_legacy_or_pageable_opt_out() {
-        let (on, why) = tree_download_setting(None);
-        assert!(on, "unset must select the staged download");
-        assert!(why.contains("the default"), "{why}");
-        assert!(tree_download_setting(Some("staged")).0);
-        assert!(tree_download_setting(Some(" staged ")).0);
-        assert!(!tree_download_setting(Some("legacy")).0);
-        assert!(!tree_download_setting(Some(" legacy ")).0);
-        assert!(!tree_download_setting(Some("pageable")).0);
-        let (on, why) = tree_download_setting(Some("legcay"));
-        assert!(on, "an unknown value keeps the default");
-        assert!(why.contains("\"legcay\""), "{why}");
+    fn staged_is_the_default() {
+        assert!(
+            tree_download_staged(),
+            "the default must be the staged download"
+        );
+        set_tree_download_override(Some(false));
+        assert!(!tree_download_staged());
+        set_tree_download_override(None);
+        assert!(tree_download_staged());
     }
 
     #[test]
@@ -2400,7 +2348,7 @@ fn staging_line(pairs: usize, (slab_bytes, slabs, busy): (u64, usize, usize)) ->
 /// whoever refills one — this call two chunks on, or the pair's next borrower on
 /// any stream — waits on that event first.
 ///
-/// Under [`STAGING_SHARED_SLAB_ENV`] the upload takes [`htod_via`] instead.
+/// Under a test's [`set_staging_pairs_override`] the upload takes [`htod_via`] instead.
 pub fn htod_staged<T: cudarc::driver::DeviceRepr>(
     stream: &Arc<CudaStream>,
     src_host: &[T],

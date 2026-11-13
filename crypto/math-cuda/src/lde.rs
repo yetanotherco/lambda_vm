@@ -10,7 +10,7 @@
 //! On-device steps, picks a stream from the shared pool so rayon-parallel
 //! callers overlap on the GPU. Twiddles are cached in the backend.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cudarc::driver::sys;
 use cudarc::driver::{
@@ -593,17 +593,9 @@ fn permute_runs_to_col_major(
     Ok(())
 }
 
-/// `LAMBDA_VM_LDE_TRANSPOSE_UNBATCHED=1` issues the run pass as one
-/// device-to-device copy per run instead of `cuMemcpyBatchAsync` batches.
-/// Same bytes either way; a measurement and diagnostic knob only.
-fn transpose_copies_batched() -> bool {
-    static BATCHED: OnceLock<bool> = OnceLock::new();
-    *BATCHED.get_or_init(|| std::env::var_os("LAMBDA_VM_LDE_TRANSPOSE_UNBATCHED").is_none())
-}
-
 /// Issues run copies on the device: a batch is one `cuMemcpyBatchAsync`
 /// (source access in stream order, both sides device memory), or one
-/// `cuMemcpyDtoDAsync` per run when unbatched or for a single copy. The
+/// `cuMemcpyDtoDAsync` for a single copy. The
 /// caller keeps the context bound to this thread and both pointers valid
 /// while the copier lives.
 struct DeviceRunCopier<'a> {
@@ -612,7 +604,6 @@ struct DeviceRunCopier<'a> {
     buf: sys::CUdeviceptr,
     scratch: sys::CUdeviceptr,
     run_bytes: usize,
-    batched: bool,
     dsts: Vec<sys::CUdeviceptr>,
     srcs: Vec<sys::CUdeviceptr>,
     sizes: Vec<usize>,
@@ -632,7 +623,7 @@ impl RunCopier for DeviceRunCopier<'_> {
         if copies.is_empty() {
             return Ok(());
         }
-        if !self.batched || copies.len() == 1 {
+        if copies.len() == 1 {
             for &(dst, src) in copies {
                 // SAFETY: both addresses lie inside allocations the caller
                 // keeps alive (`buf`, `scratch`), each run is `run_bytes`
@@ -763,7 +754,6 @@ fn transpose_lde_in_place(
             buf: buf_ptr,
             scratch: scratch_ptr,
             run_bytes: rows_per_block * 8,
-            batched: transpose_copies_batched(),
             dsts: Vec::with_capacity(cols + 1),
             srcs: Vec::with_capacity(cols + 1),
             sizes: Vec::with_capacity(cols + 1),
@@ -1858,7 +1848,7 @@ fn download_precomputed_then<X>(
 /// the tail — the exact `MerkleTree::from_precomputed_nodes` layout) because
 /// it feeds the process-wide host tree cache; it is only built when
 /// `build_precomputed` is true (the caller skips it on a cache hit). How it
-/// travels is [`crate::device::TREE_DOWNLOAD_ENV`]'s choice; the nodes are the
+/// travels is [`crate::device::tree_download_staged`]'s choice; the nodes are the
 /// same bytes either way. The multiplicity tree stays resident in `handle.tree` — openings
 /// gather its paths on device.
 ///

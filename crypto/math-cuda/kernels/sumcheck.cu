@@ -74,7 +74,7 @@ __device__ __forceinline__ void store_slot(uint64_t *slots, uint64_t stride, uin
 // The program's value at cube index `j`, with every factor extended to the
 // interpolation node `t`: `f(j) + t·(f(j + half) − f(j))`.
 //
-// `INT` (D-ARGUE S1-1, `LAMBDA_VM_ARGUE_INT_NODES`): the node is a base-field
+// `INT` (D-ARGUE S1-1, `sumcheck::int_nodes`): the node is a base-field
 // integer `(k, 0, 0)` — every round's nodes are `1..=D` — so `t·(hi − lo)` is
 // the componentwise `k·(hi − lo)`: three products where the full multiply
 // spends nine. The same value; the host only takes this variant when every

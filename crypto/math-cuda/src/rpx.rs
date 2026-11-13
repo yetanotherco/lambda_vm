@@ -492,7 +492,7 @@ pub(crate) fn launch_fri_leaves_ext3(
 /// wider than the block, where per-level launch overhead dominates the work.
 ///
 /// The walk is [`TreeWalk::from_switch`]'s: the half-warp levels and tail by
-/// default, a thread per parent under `LAMBDA_VM_RPX_WARP_MERKLE=0` — the same
+/// default, a thread per parent under `rpx_paths::warp_merkle` off — the same
 /// nodes, byte for byte.
 pub(crate) fn build_inner_tree_levels(
     stream: &CudaStream,

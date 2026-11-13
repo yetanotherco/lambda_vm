@@ -1,5 +1,5 @@
 //! The claim reduce's column values on the card, against the host they replace
-//! (`LAMBDA_VM_ARGUE_DEVICE_COLUMNS`).
+//! (`gpu::argue_device_columns`).
 //!
 //! ```text
 //! cargo test --release -p multilinear --features cuda,parallel --test argue_device_columns -- --test-threads=1

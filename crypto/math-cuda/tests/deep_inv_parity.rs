@@ -16,8 +16,8 @@
 //!   column `barycentric_*_one_block_with_dev_inv_denoms`, at a nonzero offset
 //!   into a multi-point buffer.
 //!
-//! Every test names both of its paths, so none reads the process setting
-//! (`LAMBDA_VM_DEEP_INV_LEGACY`); `tests/deep_inv_setting.rs` does.
+//! Every test names both of its paths, so none reads what production takes
+//! (`math_cuda::deep_inv`); `tests/deep_inv_setting.rs` does.
 //!
 //! Needs a GPU, like every test in this directory.
 

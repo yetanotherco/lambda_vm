@@ -82,7 +82,7 @@
 // compile-time bit set. 0 is `goldilocks::mul` for every product and square,
 // and every kernel in a cubin uses `RPX_PERMUTE_VARIANT`. build.rs compiles this
 // file twice: `rpx_v0.cubin` at 0 and `rpx_v5.cubin` at 5 (limb multiply,
-// `square_n` unrolled), the default; `LAMBDA_VM_RPX_LIMB_PERMUTE=0` loads the
+// `square_n` unrolled), the default; `rpx_paths::limb_permute` off loads the
 // former (math-cuda `rpx_paths`). The bits:
 //   RPX_V_LIMB_MUL     products through `mul_limb` (32-bit limbs, carry chains);
 //   RPX_V_LIMB_SQR     squarings through `sqr_limb` (three limb products);

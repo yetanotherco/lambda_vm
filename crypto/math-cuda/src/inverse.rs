@@ -289,9 +289,8 @@ pub enum DenomSign {
 /// stays on device (no PCIe traffic beyond the small `z_scalars` upload).
 ///
 /// Up to [`ROWWISE_MAX_K`] denominators per row this is one row-wise kernel
-/// ([`invert_denoms_rowwise_dev`]); above that, or under
-/// `LAMBDA_VM_DEEP_INV_LEGACY=1` ([`crate::deep_inv`]), the six-kernel global
-/// scan ([`compute_and_invert_denoms_ext3_scan_dev`]). The same layout and the
+/// ([`invert_denoms_rowwise_dev`]); above that, or on the legacy path
+/// ([`crate::deep_inv`]), the six-kernel global scan ([`compute_and_invert_denoms_ext3_scan_dev`]). The same layout and the
 /// same field elements either way.
 pub fn compute_and_invert_denoms_ext3_dev(
     x_lde_dev: &CudaSlice<u64>,

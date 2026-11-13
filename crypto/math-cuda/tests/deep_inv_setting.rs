@@ -1,22 +1,19 @@
-//! The DEEP/OOD denominators follow the process setting: inverted row-wise and
-//! summed row-chunked by default, the legacy scan and one block per column
-//! under `LAMBDA_VM_DEEP_INV_LEGACY=1` (`math_cuda::deep_inv::LEGACY_ENV`).
+//! The DEEP/OOD denominators take the row-wise paths in production: inverted
+//! row-wise and summed row-chunked.
 //!
 //! ```text
 //! cargo test --release -p math-cuda --test deep_inv_setting -- --nocapture
-//! LAMBDA_VM_DEEP_INV_LEGACY=1 cargo test --release -p math-cuda --test deep_inv_setting -- --nocapture
 //! ```
 //!
 //! The parity tests name both paths per call (`tests/deep_inv_parity.rs`), so
-//! none of them reads the setting; this one does. It is its own binary with one
-//! test, so the process-wide counters move for its two calls alone, and the
-//! once-per-process `[gpu] DEEP/OOD denominators: …` banner is printed by its
-//! first call (visible under `--nocapture`).
+//! none of them reads what production takes; this one does. It is its own
+//! binary with one test, so the process-wide counters move for its two calls
+//! alone.
 
 use std::sync::Arc;
 
 use math_cuda::barycentric::barycentric_ext3_on_device_with_dev_inv_denoms;
-use math_cuda::deep_inv::{LEGACY_ENV, chunked_ood_sums, rowwise_inversions};
+use math_cuda::deep_inv::{chunked_ood_sums, rowwise_inversions};
 use math_cuda::device::backend;
 use math_cuda::inverse::{DenomSign, compute_and_invert_denoms_ext3_dev};
 use math_cuda::lde::GpuLdeExt3;
@@ -26,9 +23,7 @@ use rand_chacha::ChaCha8Rng;
 const P: u64 = 0xFFFF_FFFF_0000_0001;
 
 #[test]
-fn the_denominators_follow_the_process_setting() {
-    let setting = std::env::var(LEGACY_ENV).unwrap_or_else(|_| "<unset>".into());
-    let legacy = setting == "1";
+fn the_denominators_take_the_row_wise_paths() {
     let mut rng = ChaCha8Rng::seed_from_u64(7);
     let mut elem = || rng.r#gen::<u64>() % P;
     let be = backend().expect("cuda backend");
@@ -71,7 +66,7 @@ fn the_denominators_follow_the_process_setting() {
     stream.synchronize().expect("sync");
 
     println!(
-        "deep_inv_setting: {LEGACY_ENV}={setting}: the inversion took the {}, the OOD sum took {}",
+        "deep_inv_setting: the inversion took the {}, the OOD sum took {}",
         if rowwise == 1 {
             "row-wise kernel"
         } else {
@@ -83,14 +78,6 @@ fn the_denominators_follow_the_process_setting() {
             "one block per column"
         },
     );
-    assert_eq!(
-        rowwise,
-        u64::from(!legacy),
-        "{LEGACY_ENV}={setting}: the inversion did not follow the process setting"
-    );
-    assert_eq!(
-        chunked,
-        u64::from(!legacy),
-        "{LEGACY_ENV}={setting}: the OOD sum did not follow the process setting"
-    );
+    assert_eq!(rowwise, 1, "the inversion did not take the row-wise kernel");
+    assert_eq!(chunked, 1, "the OOD sum did not take the chunked kernel");
 }

@@ -1,5 +1,5 @@
 //! A table's GKR input layer written from its resident base columns against
-//! today's, from the lifted factors, on the card (`LAMBDA_VM_ARGUE_GKR_INPUT`,
+//! today's, from the lifted factors, on the card (`gpu::argue_gkr_input`,
 //! D-BATCH M1-2).
 //!
 //! ```text

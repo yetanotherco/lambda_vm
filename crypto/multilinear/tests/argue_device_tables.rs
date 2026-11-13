@@ -1,5 +1,5 @@
 //! The argument's challenge tables on the card, against the host they replace
-//! (`LAMBDA_VM_ARGUE_DEVICE_TABLES`): the zerocheck's `eq` weights, and the
+//! (`gpu::argue_device_tables`): the zerocheck's `eq` weights, and the
 //! claim reduce's shift tables and batched columns.
 //!
 //! ```text
@@ -352,9 +352,9 @@ fn transcript() -> DefaultTranscript<Ext> {
 struct Arm {
     /// The epoch's columns and the table's factors on the card.
     resident: bool,
-    /// `LAMBDA_VM_ARGUE_DEVICE_TABLES`: the weights go as points.
+    /// `gpu::argue_device_tables`: the weights go as points.
     tables: bool,
-    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`.
+    /// `gpu::argue_device_columns`.
     columns: bool,
     /// Programs, which a device runs, or closures.
     compiled: bool,

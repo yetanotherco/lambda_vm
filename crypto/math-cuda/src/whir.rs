@@ -296,8 +296,6 @@ pub fn retention_futile() -> (u64, u64, bool) {
     )
 }
 
-/// The switch [`keep_futile`] reads.
-const KEEP_FUTILE_ENV: &str = "LFM_WHIR_KEEP_FUTILE";
 /// Keep. Job 246 (A B B A on the block): the whole run −1.25 s and the openings'
 /// tree rebuilds −1.39 s, with no layer evicted. The argue's peak in epochs 3–5
 /// rose by the layers it kept, to 25,034 of the 25,688 MiB budget.
@@ -322,32 +320,21 @@ const KEEP_FUTILE_DEFAULT: bool = true;
 /// answer it got without this switch; only the layers a failing request would
 /// have taken with it stay.
 ///
-/// `LFM_WHIR_KEEP_FUTILE` unset or `1` keeps them (the default); `0` evicts
-/// them as before the switch; any other value aborts. Read once and printed
-/// once; a test forces it with [`force_keep_futile`].
+/// [`KEEP_FUTILE_DEFAULT`] keeps them; a test forces either way with
+/// [`force_keep_futile`].
 fn keep_futile() -> bool {
     match KEEP_FUTILE_FORCED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| {
-                crate::rpx_paths::read(
-                    KEEP_FUTILE_ENV,
-                    KEEP_FUTILE_DEFAULT,
-                    "WHIR retention: a budget miss the leaf layers cannot cover keeps them",
-                    "WHIR retention: a budget miss evicts leaf layers even when they cannot cover it",
-                )
-            })
-        }
+        _ => KEEP_FUTILE_DEFAULT,
     }
 }
 
 static KEEP_FUTILE_FORCED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// Overrides `LFM_WHIR_KEEP_FUTILE` for the whole process — for a test that
-/// takes a futile miss both ways in one binary. `None` restores the
-/// environment's setting. Not for production callers.
+/// Overrides [`keep_futile`] for the whole process — for a test that takes a
+/// futile miss both ways in one binary. `None` restores the default. Not for
+/// production callers.
 #[doc(hidden)]
 pub fn force_keep_futile(on: Option<bool>) {
     KEEP_FUTILE_FORCED.store(
@@ -368,8 +355,6 @@ pub fn retention_whole() -> (bool, u64) {
     (whole_trees(), WHOLE_TREE_SERVES.load(Ordering::Relaxed))
 }
 
-/// The switch [`whole_trees`] reads.
-const WHOLE_TREES_ENV: &str = "LFM_WHIR_WHOLE_TREES";
 /// Whole trees. Job 248 (A B B A on the block): the whole run −1.00 s, the base
 /// −0.90 s, the openings' tree rebuilds −0.82 s; 952 openings served a kept
 /// tree, and epoch 4's argue evicted two kept trees. The argue's peaks in
@@ -388,32 +373,21 @@ const WHOLE_TREES_DEFAULT: bool = true;
 /// the evictor under pressure, whole — so a request it can cover still gets its
 /// bytes, and fallbacks cannot rise. The worst case is the old rebuild.
 ///
-/// `LFM_WHIR_WHOLE_TREES` unset or `1` keeps whole trees (the default); `0`
-/// keeps leaf layers, as before the switch; any other value aborts. Read once
-/// and printed once; a test forces it with [`force_whole_trees`].
+/// [`WHOLE_TREES_DEFAULT`] keeps whole trees; a test forces either way with
+/// [`force_whole_trees`].
 fn whole_trees() -> bool {
     match WHOLE_TREES_FORCED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| {
-                crate::rpx_paths::read(
-                    WHOLE_TREES_ENV,
-                    WHOLE_TREES_DEFAULT,
-                    "WHIR retention: whole trees, the inner levels kept with the leaves",
-                    "WHIR retention: leaf layers, the inner levels rebuilt at each opening",
-                )
-            })
-        }
+        _ => WHOLE_TREES_DEFAULT,
     }
 }
 
 static WHOLE_TREES_FORCED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// Overrides `LFM_WHIR_WHOLE_TREES` for the whole process — for a test that
-/// opens the same codeword both ways in one binary. `None` restores the
-/// environment's setting. Not for production callers.
+/// Overrides [`whole_trees`] for the whole process — for a test that opens the
+/// same codeword both ways in one binary. `None` restores the default. Not for
+/// production callers.
 #[doc(hidden)]
 pub fn force_whole_trees(on: Option<bool>) {
     WHOLE_TREES_FORCED.store(
@@ -754,9 +728,8 @@ mod futile_miss_tests {
         );
     }
 
-    /// ★ The default keeps the layers through a futile miss (job 246). Going
-    /// back is `LFM_WHIR_KEEP_FUTILE=0` at run time; a change here moves the
-    /// default for every run, and must fail this first.
+    /// ★ The default keeps the layers through a futile miss (job 246). A
+    /// change here moves the default for every run, and must fail this first.
     #[test]
     fn the_default_keeps_the_layers_through_a_futile_miss() {
         assert!(
@@ -774,9 +747,8 @@ mod futile_miss_tests {
 mod whole_tree_tests {
     use super::tree_bytes;
 
-    /// ★ The default keeps whole trees (job 248). Going back is
-    /// `LFM_WHIR_WHOLE_TREES=0` at run time; a change here moves every run's
-    /// default, and must fail this first.
+    /// ★ The default keeps whole trees (job 248). A change here moves every
+    /// run's default, and must fail this first.
     #[test]
     fn the_default_keeps_whole_trees() {
         let default = super::WHOLE_TREES_DEFAULT;
@@ -2093,7 +2065,8 @@ fn spread_encode(
     {
         // The same spread and transform in the column engine's ceil(log_n / 8)
         // passes, the spread fused into the first one, and no twiddle table
-        // (see `lde_cm`). `LAMBDA_VM_LDE_LEGACY=1` takes the branch below.
+        // (see `lde_cm`). A test's `lde_cm::with_engine(false, ..)` takes the
+        // branch below.
         let src = coeffs.device_ptr(stream).0;
         let dst = x.device_ptr(stream).0;
         crate::lde_cm::spread_ntt_column(
@@ -2308,36 +2281,19 @@ pub const fn encode_successor_transient_bytes(log_out: usize, log_evals: usize) 
 }
 
 /// Whether a chain's first successor is encoded from its bound message
-/// ([`encode_successor`]) when `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR` does not say
-/// otherwise. Either way proves the same values.
+/// ([`encode_successor`]) rather than folded from the committed codeword.
+/// Either way proves the same values.
 ///
 /// On: the fold reads the whole `2^(n+blowup)` base codeword, the encode a
-/// `2^(n−k)` message (I-COPIES §12). `=0` is the way back.
+/// `2^(n−k)` message (I-COPIES §12). A test's override folds.
 pub const ENCODE_SUCCESSOR_DEFAULT: bool = true;
-
-/// `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR`'s value read: `0` folds, `1` encodes,
-/// unset or anything else is [`ENCODE_SUCCESSOR_DEFAULT`].
-pub fn encode_successor_setting(value: Option<&str>) -> bool {
-    match value.map(str::trim) {
-        Some("0") => false,
-        Some("1") => true,
-        _ => ENCODE_SUCCESSOR_DEFAULT,
-    }
-}
 
 #[cfg(test)]
 mod encode_successor_tests {
-    use super::encode_successor_setting;
-
-    /// The first successor is encoded unless the knob says `0`.
+    /// The first successor is encoded by default.
     #[test]
-    fn the_first_successor_is_encoded_by_default_and_zero_folds() {
-        assert!(encode_successor_setting(None), "the default encodes");
-        assert!(encode_successor_setting(Some("1")));
-        assert!(!encode_successor_setting(Some("0")), "the way back");
-        assert!(!encode_successor_setting(Some(" 0 ")));
-        assert!(encode_successor_setting(Some("")));
-        assert!(encode_successor_setting(Some("off")), "only 0 opts out");
+    fn the_first_successor_is_encoded_by_default() {
+        const { assert!(super::ENCODE_SUCCESSOR_DEFAULT) };
     }
 }
 

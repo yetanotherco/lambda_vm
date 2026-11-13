@@ -354,7 +354,7 @@ pub static GROUPED_TREES: Counter = Counter::new();
 /// Columns the argument's claim reduces valued on the CARD, in one batched
 /// evaluation per table — beside [`COLUMNS_ON_HOST`], the ones walked on the
 /// host one at a time. The pair is the mechanism line of
-/// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`: the knob moves columns from the second to
+/// `gpu::argue_device_columns`: the knob moves columns from the second to
 /// the first, and their sum is the prove's committed width either way — short
 /// of it only by a tall table the card refused, whose columns then go to the
 /// device one at a time and count in neither.
@@ -367,7 +367,7 @@ pub static COLUMNS_ON_HOST: Counter = Counter::new();
 pub static COLUMNS_XCHECKED: Counter = Counter::new();
 
 /// Challenge tables the card built for the argument
-/// (`LAMBDA_VM_ARGUE_DEVICE_TABLES`): the zerocheck's `eq` weights and the claim
+/// (`gpu::argue_device_tables`): the zerocheck's `eq` weights and the claim
 /// reduce's shift tables and batched columns — each one the host would have
 /// built on the pool and uploaded. Zero with the knob off: the mechanism line
 /// of that knob's A/B.
@@ -423,7 +423,7 @@ pub static GKR_REBUILDS: Counter = Counter::new();
 /// Rounds the host finished after them.
 pub static GKR_TAIL_ROUNDS: Counter = Counter::new();
 /// Of [`GKR_LAYERS`], the ones that ran Gruen's rounds
-/// (`LAMBDA_VM_ARGUE_GKR_GRUEN`, D-ARGUE S1-3) — the mechanism line of that knob.
+/// (`gkr_gruen::argue_gkr_gruen`, D-ARGUE S1-3) — the mechanism line of that knob.
 pub static GKR_GRUEN: Counter = Counter::new();
 /// Of [`GKR_GRUEN`], the ones `LAMBDA_VM_ARGUE_GKR_GRUEN_XCHECK` compared with
 /// today's rounds and found equal.
@@ -528,9 +528,7 @@ pub static REST_TABLES: Counter = Counter::new();
 // Of [`REST_TREE`], split — the factors lifted, the input layer's programs
 // lowered and written, the levels folded, the output read. The card runs the
 // first three asynchronously, so their host times say where the host waited,
-// not what the card spent; under `LAMBDA_VM_ARGUE_TREE_SYNC=1` (a diagnostic,
-// never a measurement of the wall) each part waits for its own kernels, and the
-// parts then say what the card spent on each.
+// not what the card spent.
 
 /// The factors lifted from the columns into the extension.
 pub static TREE_LIFT: Slot = Slot::new();
@@ -543,22 +541,12 @@ pub static TREE_FOLD: Slot = Slot::new();
 /// The output fraction read back.
 pub static TREE_OUTPUT: Slot = Slot::new();
 /// Trees whose input layer was written from the base columns
-/// (`LAMBDA_VM_ARGUE_GKR_INPUT`).
+/// (`gpu::argue_gkr_input`).
 pub static TREE_FROM_COLUMNS: Counter = Counter::new();
 /// Tables whose factors stayed base columns, with no lift
-/// (`LAMBDA_VM_ARGUE_NO_LIFT`), and of them the ones lifted after all.
+/// (`gpu::argue_no_lift`), and of them the ones lifted after all.
 pub static NO_LIFT: Counter = Counter::new();
 pub static LATE_LIFT: Counter = Counter::new();
-
-/// Whether the tree's parts wait for their own kernels
-/// (`LAMBDA_VM_ARGUE_TREE_SYNC`, with the split on): a diagnostic.
-pub fn tree_sync() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    enabled()
-        && *ON.get_or_init(|| {
-            std::env::var("LAMBDA_VM_ARGUE_TREE_SYNC").is_ok_and(|v| !v.is_empty() && v != "0")
-        })
-}
 
 /// A prove's tree region, split: seconds per part.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -694,7 +682,7 @@ pub fn lap(slot: &Slot, start: Option<Instant>) -> f64 {
 //
 // A big batch holds so many values a thread that its first rounds run a few
 // thousand threads (`gpu::LEAN_ABOVE_SLOTS`): the head's widest ran 8,096 at
-// 94 ms a launch. `LAMBDA_VM_ARGUE_LEAN_PROGRAM` trades held values for steps,
+// 94 ms a launch. `gpu::argue_lean_program` trades held values for steps,
 // which buys threads in the early rounds and costs steps in the late ones,
 // where a round is a handful of threads walking the program. These say which
 // rounds paid. Timed with [`tick`], as the GKR regions are.
@@ -716,7 +704,7 @@ pub static ZC_TAIL: Slot = Slot::new();
 /// Zerocheck sessions over a big batch.
 pub static ZC_BIG: Counter = Counter::new();
 /// Of [`ZC_BIG`], the ones whose program ran on demand — the mechanism line of
-/// `LAMBDA_VM_ARGUE_LEAN_PROGRAM`.
+/// `gpu::argue_lean_program`.
 pub static ZC_LEAN: Counter = Counter::new();
 /// Of [`ZC_LEAN`], the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round
 /// against today's program over the same factors, and found equal.
@@ -726,7 +714,7 @@ pub static ZC_BIG_EARLY_ROUNDS: Counter = Counter::new();
 /// The rounds in [`ZC_BIG_LATE`].
 pub static ZC_BIG_LATE_ROUNDS: Counter = Counter::new();
 /// Zerocheck sessions that ran D-ARGUE stage 1's fused rounds
-/// (`gpu_fused`, `LAMBDA_VM_ARGUE_FUSED`), their device rounds' time, and the
+/// (`gpu_fused`, `gpu_fused::argue_fused`), their device rounds' time, and the
 /// sessions the fused rounds declined before round 0 (today's ran).
 pub static ZC_FUSED: Counter = Counter::new();
 pub static ZC_FUSED_TIME: Slot = Slot::new();
@@ -1093,15 +1081,13 @@ pub struct ProverSplit {
     /// The device GKR layers, split — [`GkrSplit`].
     pub gkr: GkrSplit,
     /// The zerocheck rounds, split — [`ZerocheckSplit`] — and the knob they
-    /// ran under (`LAMBDA_VM_ARGUE_LEAN_PROGRAM`).
+    /// ran under (`gpu::argue_lean_program`).
     pub zerocheck: ZerocheckSplit,
     pub lean_program: bool,
     /// The per-table rest, split — [`RestSplit`] — and each table's census.
     pub rest: RestSplit,
-    /// The tree region, split — [`TreeSplit`] — and whether its parts waited
-    /// for their kernels.
+    /// The tree region, split — [`TreeSplit`].
     pub tree: TreeSplit,
-    pub tree_sync: bool,
     pub air_census: Vec<AirCensus>,
 }
 
@@ -1308,15 +1294,14 @@ impl ProverSplit {
         )
     }
     /// The tree line: `ARGUE TREE #k: lift · write (lower) · fold · output ·
-    /// of tree T (ms) || sync on|off` — [`TreeSplit`] beside the region it
-    /// splits.
+    /// of tree T (ms)` — [`TreeSplit`] beside the region it splits.
     pub fn tree_line(&self) -> String {
         let t = &self.tree;
         let ms = |secs: f64| secs * 1e3;
         format!(
             "ARGUE TREE {who}{tainted}: lift {lift:.2} · write {write:.2} (lower {lower:.2}) · fold \
-             {fold:.2} · output {output:.2} · of tree {tree:.2} (ms) || sync {sync} || from the \
-             columns {from_columns} · no lift {no_lift} (late {late_lift})",
+             {fold:.2} · output {output:.2} · of tree {tree:.2} (ms) || from the columns \
+             {from_columns} · no lift {no_lift} (late {late_lift})",
             who = self.who(),
             tainted = if self.overlapped {
                 " ⛔OVERLAPPED"
@@ -1329,7 +1314,6 @@ impl ProverSplit {
             fold = ms(t.fold),
             output = ms(t.output),
             tree = ms(self.rest.tree),
-            sync = if self.tree_sync { "on" } else { "off" },
             from_columns = t.from_columns,
             no_lift = t.no_lift,
             late_lift = t.late_lift,
@@ -1495,7 +1479,6 @@ pub fn push_prover(mut rec: ProverSplit) {
         .unwrap_or_default();
     rec.rest = RestSplit::take();
     rec.tree = TreeSplit::take();
-    rec.tree_sync = tree_sync();
     rec.air_census = AIRS
         .lock()
         .map(|mut h| std::mem::take(&mut *h))
@@ -2178,7 +2161,7 @@ mod tests {
         assert_eq!(
             epoch.tree_line(),
             "ARGUE TREE #3: lift 10.00 · write 50.00 (lower 20.00) · fold 40.00 · output 1.00 · of \
-             tree 120.00 (ms) || sync off || from the columns 0 · no lift 0 (late 0)"
+             tree 120.00 (ms) || from the columns 0 · no lift 0 (late 0)"
         );
     }
 

@@ -1,6 +1,6 @@
 //! ★★ H4's result of record, and what replaced it — a commitment keeps its tree
 //! INSIDE ITS PROMISE: the whole tree by default, its leaf layer under
-//! `LFM_WHIR_WHOLE_TREES=0`, and nothing of a tree outside the room it grew.
+//! `whir::whole_trees` off, and nothing of a tree outside the room it grew.
 //!
 //! ⛔ H4's finding stands and is not edited away below: keeping the whole node
 //! array LOST, measured on the card at about +15 s, because its trees sat
@@ -133,7 +133,7 @@ fn commit_on_device(
         .expect("device commit (needs a GPU)")
 }
 
-/// `LFM_WHIR_WHOLE_TREES` forced for one test — whole trees or leaf layers —
+/// `whir::whole_trees` forced for one test — whole trees or leaf layers —
 /// and the environment's setting restored when this drops, on a panic too.
 /// Every test that asserts a count or a byte figure that depends on what is
 /// kept runs both ways under it, rather than at whatever the default is.
@@ -167,7 +167,7 @@ fn kept_bytes(num_vars: usize, log_folding: usize, whole: bool) -> u64 {
 /// held, and a tree built at an opening only when no whole tree is kept.
 ///
 /// This is the cost H4 tried to remove, asserted as integers in both retention
-/// modes. With leaf layers (`LFM_WHIR_WHOLE_TREES=0`) each opening builds its
+/// modes. With leaf layers (`whir::whole_trees` off) each opening builds its
 /// own tree on the kept layer: `tree_builds` climbs, `leaf_passes` stays at 1.
 /// With whole trees (the default) each opening is served the kept tree: both
 /// stay at 1. A 2 in `leaf_passes` is the retention not working in either mode;
@@ -924,7 +924,7 @@ fn a_budget_miss_evicts_a_retained_layer_and_the_reserve_succeeds() {
     drop(_hog);
 }
 
-/// ⛔ A MISS THE LAYERS CANNOT COVER KEEPS THEM UNDER `LFM_WHIR_KEEP_FUTILE`, AND
+/// ⛔ A MISS THE LAYERS CANNOT COVER KEEPS THEM UNDER `whir::keep_futile`, AND
 /// MOVES NO PATH EITHER WAY.
 ///
 /// The budget is filled to leave half a layer free, and the request asks for
@@ -1035,7 +1035,7 @@ fn a_miss_the_layers_cannot_cover_keeps_them_and_moves_no_path() {
     }
 }
 
-/// ⛔ A WHOLE TREE KEPT UNDER `LFM_WHIR_WHOLE_TREES` SERVES ITS OPENINGS AND
+/// ⛔ A WHOLE TREE KEPT UNDER `whir::whole_trees` SERVES ITS OPENINGS AND
 /// MOVES NO BYTE; EVICTED, THE NEXT OPENING BUILDS THE SAME TREE AND KEEPS IT
 /// WHOLE AGAIN.
 ///

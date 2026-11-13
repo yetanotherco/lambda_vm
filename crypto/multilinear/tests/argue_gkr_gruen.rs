@@ -1,5 +1,5 @@
 //! A device GKR layer's rounds with Gruen's split against today's, on the card
-//! (`LAMBDA_VM_ARGUE_GKR_GRUEN`, D-ARGUE S1-3).
+//! (`gkr_gruen::argue_gkr_gruen`, D-ARGUE S1-3).
 //!
 //! ```text
 //! cargo test --release -p multilinear --features cuda,parallel --test argue_gkr_gruen -- --test-threads=1

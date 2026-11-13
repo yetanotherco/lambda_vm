@@ -1057,7 +1057,7 @@ fn a_proof_made_with_the_fused_rounds_verifies() {
     }
 }
 
-/// ★ S1-1 on today's kernel (`LAMBDA_VM_ARGUE_INT_NODES`): the device rounds
+/// ★ S1-1 on today's kernel (`sumcheck::int_nodes`): the device rounds
 /// with integer nodes send today's messages (the Q1 tables at 2^10, fused off).
 #[cfg(feature = "cuda")]
 #[test]

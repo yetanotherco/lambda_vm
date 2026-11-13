@@ -144,7 +144,7 @@ enum Room {
     /// there is no card.
     Own,
     /// The group's room, held from its first commit to its last opening, across
-    /// the argument between them (`LAMBDA_VM_NO_WHIR_ROOM_PARK`). Never read:
+    /// the argument between them (`gpu::room_park`). Never read:
     /// holding it is the promise.
     Held(#[allow(dead_code)] crate::gpu::DeviceRoom),
     /// Given back when the commits ended; the openings take it again
@@ -163,7 +163,7 @@ enum Turn {
 
 /// What a group's room promises for `turn`: the working set the kernels that
 /// run it allocate beside the codewords ([`crate::gpu::room_turns_for`]), or
-/// one base codeword whatever the turn under `LAMBDA_VM_NO_WHIR_ROOM_RESIZE`.
+/// one base codeword whatever the turn under `gpu::room_resize`.
 fn room_bytes(layout: &StackedLayout, config: &ChainConfig, staged: bool, turn: Turn) -> u64 {
     let resize = crate::gpu::room_resize();
     crate::gpu::note_room_sized(resize);
@@ -333,7 +333,7 @@ where
         // named term rather than as a surprise. A commitment that is opened
         // keeps its whole tree by default — `(2·num_leaves − 1) × 32` ≈
         // `C · 2^(6−k)` bytes at fold width `k`, HALF a base codeword at the
-        // production `k = 4` — or, under `LFM_WHIR_WHOLE_TREES=0`, its leaf
+        // production `k = 4` — or, under `whir::whole_trees` off, its leaf
         // layer alone, `C · 2^(5−k)`, a quarter. So a group of `n` commitments
         // holds up to `n · C/2` more than the codewords alone. It is not
         // reserved here, because the width is not known until the tree is

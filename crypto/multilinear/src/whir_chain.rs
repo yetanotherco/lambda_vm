@@ -78,7 +78,7 @@ pub use crate::whir_commit::LeafOrder;
 /// [`Error::CosetSuccessorNotEncoded`] names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnencodedSuccessor {
-    /// `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` (or a test's override): the fold
+    /// `gpu::encode_successor_in_effect` off (or a test's override): the fold
     /// was chosen.
     KnobOff,
     /// The opening's factors were built on the host — the card declined the
@@ -1761,7 +1761,7 @@ where
 
     /// The successor a `levels`-level fold of `codeword` would make, encoded
     /// from the message these rounds bound — on a device, when the factors and
-    /// the codeword are both there, unless `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`.
+    /// the codeword are both there, unless `gpu::encode_successor_in_effect` off.
     /// `None` is the fold's turn.
     fn encode_successor<C: IsField>(
         &mut self,
@@ -2405,7 +2405,7 @@ where
         // the field is the only thing the two cases differ in — and a codeword
         // the device holds is folded where it is. The first one, the widest,
         // is encoded from the message the rounds just bound instead: the same
-        // codeword (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` folds it).
+        // codeword (`gpu::encode_successor_in_effect` off folds it).
         let __wc_fold = crate::whir_split::mark();
         let (folded, folded_domain) = match &current {
             Current::Base(held) => match factors.encode_successor(held.codeword(), k) {
