@@ -181,10 +181,240 @@ fn round_with(
 
 /// ★ The permutation: 4 full, 22 partial, 4 full rounds.
 ///
-/// The textbook form (a dense round each time), not Plonky3's sparse
-/// partial-round decomposition — the known answers are reproduced by both.
+/// With `std`, the partial rounds run in the sparse form ([`fast`]): the same
+/// permutation by fewer multiplications, pinned to [`permute_textbook`] by
+/// the known answers and by random-input equality. Without `std` (a guest),
+/// the textbook form.
 pub fn permute(state: [Fp; STATE_FELTS]) -> [Fp; STATE_FELTS] {
+    #[cfg(feature = "std")]
+    return fast::permute(fast::tables(), state);
+    #[cfg(not(feature = "std"))]
+    return permute_textbook(state);
+}
+
+/// The textbook form: every round dense (constants, S-box, the full MDS), the
+/// definition the sparse form is checked against.
+pub fn permute_textbook(state: [Fp; STATE_FELTS]) -> [Fp; STATE_FELTS] {
     permute_with(&ROUND_CONSTANTS, mds, state)
+}
+
+/// The partial rounds' sparse form (the Poseidon paper's Appendix B), derived
+/// once from [`ROUND_CONSTANTS`] and the MDS — nothing is a new constant.
+///
+/// Two rewrites, each an identity on the permutation:
+///
+/// 1. **Constants.** A partial round adds `c` to every lane, S-boxes lane 0,
+///    then multiplies by `M`. The lanes 1.. of `c` pass the S-box untouched, so
+///    `M·(S(s + c₀e₀) + c_tail) = M·S(s + c₀e₀) + M·c_tail`: the round keeps
+///    only its lane-0 constant and hands `M·c_tail` to the next round's. The
+///    last partial round hands its carry to the first full round after.
+/// 2. **The linear layers.** Write `N = M·diag(1, A_prev)` as
+///    `diag(1, A)·B` with `A = N̂` (the lower-right 15 × 15 block) and `B`
+///    sparse: `[[n₀₀, n_w], [A⁻¹·n_v, I]]`. A lane-0-only round commutes with
+///    `diag(1, A)`, so that factor moves into the next round's `N`; each round
+///    applies only its sparse `B` (≈ 2t multiplications instead of t²), and the
+///    last round's `diag(1, A)` is applied once. `A` is invertible: it is a
+///    product of square submatrices of an MDS matrix.
+#[cfg(feature = "std")]
+pub(crate) mod fast {
+    use super::{
+        Fp, HALF_FULL_ROUNDS, MDS_MATRIX, NUM_ROUNDS, PARTIAL_ROUNDS, ROUND_CONSTANTS, STATE_FELTS,
+        mds, sbox,
+    };
+
+    const T1: usize = STATE_FELTS - 1;
+
+    /// One partial round's sparse layer `B = [[m00, w], [v, I]]`.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Sparse {
+        pub(crate) m00: u64,
+        pub(crate) w: [u64; T1],
+        pub(crate) v: [u64; T1],
+    }
+
+    /// Everything the sparse form reads.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Tables {
+        /// Each partial round's lane-0 constant.
+        pub(crate) lane0: [u64; PARTIAL_ROUNDS],
+        pub(crate) sparse: Vec<Sparse>,
+        /// The last partial round's `diag(1, A)`, lanes 1..
+        pub(crate) tail: [[u64; T1]; T1],
+        /// The full rounds' constants in round order, the first round after
+        /// the partial ones carrying the partial rounds' constants.
+        pub(crate) full: [[Fp; STATE_FELTS]; 2 * HALF_FULL_ROUNDS],
+    }
+
+    static TABLES: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
+
+    /// The tables, derived on first use.
+    pub(crate) fn tables() -> &'static Tables {
+        TABLES.get_or_init(derive)
+    }
+
+    fn m(i: usize, j: usize) -> Fp {
+        Fp::from(MDS_MATRIX[i][j])
+    }
+
+    /// `A·x = b` over the field by Gauss–Jordan elimination; `A` invertible.
+    fn solve(a: &[[Fp; T1]; T1], b: &[Fp; T1]) -> [Fp; T1] {
+        let mut aug: Vec<Vec<Fp>> = (0..T1)
+            .map(|i| {
+                let mut row = a[i].to_vec();
+                row.push(b[i]);
+                row
+            })
+            .collect();
+        for col in 0..T1 {
+            let pivot = (col..T1)
+                .find(|&r| aug[r][col] != Fp::zero())
+                .expect("a square submatrix of an MDS matrix is invertible");
+            aug.swap(col, pivot);
+            let inv = aug[col][col].inv().expect("a nonzero pivot");
+            for x in aug[col].iter_mut() {
+                *x *= inv;
+            }
+            let pivot_row = aug[col].clone();
+            for (r, row) in aug.iter_mut().enumerate() {
+                if r != col && row[col] != Fp::zero() {
+                    let f = row[col];
+                    for (x, p) in row.iter_mut().zip(&pivot_row).skip(col) {
+                        *x = *x - f * p;
+                    }
+                }
+            }
+        }
+        core::array::from_fn(|i| aug[i][T1])
+    }
+
+    pub(crate) fn derive() -> Tables {
+        let first = HALF_FULL_ROUNDS;
+        // 1. Constants, carried forward.
+        let mut carry = [Fp::zero(); STATE_FELTS];
+        let mut lane0 = [Fp::zero(); PARTIAL_ROUNDS];
+        for (r, slot) in lane0.iter_mut().enumerate() {
+            let e: [Fp; STATE_FELTS] =
+                core::array::from_fn(|i| Fp::from(ROUND_CONSTANTS[first + r][i]) + carry[i]);
+            *slot = e[0];
+            let mut tail = e;
+            tail[0] = Fp::zero();
+            carry = mds(&tail);
+        }
+        let after: [Fp; STATE_FELTS] = core::array::from_fn(|i| {
+            Fp::from(ROUND_CONSTANTS[first + PARTIAL_ROUNDS][i]) + carry[i]
+        });
+        // 2. The linear layers, factored.
+        let mut prev = [[Fp::zero(); T1]; T1];
+        for (i, row) in prev.iter_mut().enumerate() {
+            row[i] = Fp::one();
+        }
+        let mut sparse = Vec::with_capacity(PARTIAL_ROUNDS);
+        for _ in 0..PARTIAL_ROUNDS {
+            // N = M·diag(1, prev).
+            let n = |i: usize, j: usize| -> Fp {
+                if j == 0 {
+                    m(i, 0)
+                } else {
+                    (0..T1).fold(Fp::zero(), |acc, k| acc + m(i, 1 + k) * prev[k][j - 1])
+                }
+            };
+            let a: [[Fp; T1]; T1] =
+                core::array::from_fn(|i| core::array::from_fn(|j| n(1 + i, 1 + j)));
+            let nv: [Fp; T1] = core::array::from_fn(|i| n(1 + i, 0));
+            let v = solve(&a, &nv);
+            sparse.push(Sparse {
+                m00: n(0, 0).canonical(),
+                w: core::array::from_fn(|j| n(0, 1 + j).canonical()),
+                v: core::array::from_fn(|j| v[j].canonical()),
+            });
+            prev = a;
+        }
+        debug_assert_eq!(first + PARTIAL_ROUNDS + HALF_FULL_ROUNDS, NUM_ROUNDS);
+        Tables {
+            lane0: core::array::from_fn(|r| lane0[r].canonical()),
+            sparse,
+            tail: core::array::from_fn(|i| core::array::from_fn(|j| prev[i][j].canonical())),
+            full: core::array::from_fn(|k| {
+                if k == HALF_FULL_ROUNDS {
+                    after
+                } else {
+                    let r = if k < HALF_FULL_ROUNDS {
+                        k
+                    } else {
+                        k + PARTIAL_ROUNDS
+                    };
+                    core::array::from_fn(|i| Fp::from(ROUND_CONSTANTS[r][i]))
+                }
+            }),
+        }
+    }
+
+    // ---- raw Goldilocks arithmetic on `u64` words (any `u64`, not only
+    // canonical ones): one reduction per sum of products, not per product.
+
+    /// `2^64 mod p`.
+    const EPSILON: u64 = 0xFFFF_FFFF;
+
+    /// A `u128` reduced to a word congruent mod `p` (not necessarily below
+    /// `p`): `x_lo + x_hi·2^64`, `2^64 ≡ 2^32 − 1`, `2^96 ≡ −1`.
+    #[inline(always)]
+    fn reduce128(x: u128) -> u64 {
+        let (lo, hi) = (x as u64, (x >> 64) as u64);
+        let (hi_hi, hi_lo) = (hi >> 32, hi & EPSILON);
+        let (mut t0, borrow) = lo.overflowing_sub(hi_hi);
+        if borrow {
+            t0 = t0.wrapping_sub(EPSILON);
+        }
+        let (r, carry) = t0.overflowing_add(hi_lo * EPSILON);
+        r.wrapping_add(EPSILON * u64::from(carry))
+    }
+
+    /// `Σ a_j·b_j` over raw words with the products' low and high words summed
+    /// apart, one reduction at the end.
+    #[inline(always)]
+    fn dot(a: &[u64], b: &[Fp]) -> Fp {
+        let (mut lo, mut hi) = (0u128, 0u128);
+        for (x, y) in a.iter().zip(b) {
+            let p = u128::from(*x) * u128::from(*y.value());
+            lo += u128::from(p as u64);
+            hi += p >> 64;
+        }
+        // hi·2^64 ≡ hi·(2^32 − 1); hi < 2^68, so its reduction times ε < 2^96.
+        Fp::from(reduce128(
+            lo + u128::from(reduce128(hi)) * u128::from(EPSILON),
+        ))
+    }
+
+    #[inline(always)]
+    fn full_round(rc: &[Fp; STATE_FELTS], s: &mut [Fp; STATE_FELTS]) {
+        for (v, c) in s.iter_mut().zip(rc) {
+            *v = sbox(&(*v + c));
+        }
+        *s = mds(s);
+    }
+
+    /// ★ The permutation in the sparse form, over `t` (the tests' mutation
+    /// seam: production passes [`tables`]).
+    pub(crate) fn permute(t: &Tables, state: [Fp; STATE_FELTS]) -> [Fp; STATE_FELTS] {
+        let mut s = state;
+        for rc in &t.full[..HALF_FULL_ROUNDS] {
+            full_round(rc, &mut s);
+        }
+        for (c0, b) in t.lane0.iter().zip(&t.sparse) {
+            let x0 = sbox(&(s[0] + Fp::from(*c0)));
+            let new0 = Fp::from(b.m00) * x0 + dot(&b.w, &s[1..]);
+            for j in 0..T1 {
+                s[1 + j] += Fp::from(b.v[j]) * x0;
+            }
+            s[0] = new0;
+        }
+        let rest: [Fp; T1] = core::array::from_fn(|i| dot(&t.tail[i], &s[1..]));
+        s[1..].copy_from_slice(&rest);
+        for rc in &t.full[HALF_FULL_ROUNDS..] {
+            full_round(rc, &mut s);
+        }
+        s
+    }
 }
 
 /// The same permutation with the Grain Cauchy MDS — the alternative instance
