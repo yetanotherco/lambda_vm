@@ -4352,6 +4352,8 @@ struct RecordsUp<'a> {
     hold: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     logs: Vec<&'a [math_cuda::fill::LogC]>,
     registers: Vec<&'a [math_cuda::fill::RegRowC]>,
+    /// A MEMW_R table's ECALL cycles ([`crate::records::Records::ecall_cycles`]).
+    ecall_cycles: Option<&'a [u32]>,
     aligned: Vec<&'a [math_cuda::fill::AlignedRowC]>,
     loads: Vec<&'a [math_cuda::fill::LoadOpC]>,
     stores: Vec<&'a [math_cuda::fill::StoreOpC]>,
@@ -4430,6 +4432,7 @@ impl<'a> RecordsUp<'a> {
             hold: None,
             logs: Vec::new(),
             registers: Vec::new(),
+            ecall_cycles: None,
             aligned: Vec::new(),
             loads: Vec::new(),
             stores: Vec::new(),
@@ -4446,7 +4449,8 @@ impl<'a> RecordsUp<'a> {
             }
             // SAFETY: the same fields in the same order (asserted above).
             RecordsFill::MemwR { rows } => {
-                up.registers = unsafe { cast::<RegisterRow, RegRowC>(rows) }
+                up.registers = unsafe { cast::<RegisterRow, RegRowC>(rows) };
+                up.ecall_cycles = records.ecall_cycles();
             }
             RecordsFill::MemwA { rows } => {
                 up.aligned = unsafe { cast::<AlignedRow, AlignedRowC>(rows) }
@@ -4487,6 +4491,21 @@ pub fn card_reserved_peak() -> Option<u64> {
     #[cfg(not(feature = "cuda"))]
     {
         None
+    }
+}
+
+/// Whether the card builds MEMW_R's register rows
+/// (`LAMBDA_VM_CARD_ROWS=registers`): a block's build then hands its MEMW_R
+/// chunks out with their ECALL cycles, when its run has a history. `false`
+/// without the card.
+pub fn card_rows_builds_registers() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::card_rows::builds_registers()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
     }
 }
 
@@ -4537,6 +4556,7 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
         RecordsFill::MemwR { .. } => RecordsInput::MemwR {
             records: &up.registers,
             rows: up.rows,
+            ecall_cycles: up.ecall_cycles,
         },
         RecordsFill::MemwA { .. } => RecordsInput::MemwA {
             records: &up.aligned,
