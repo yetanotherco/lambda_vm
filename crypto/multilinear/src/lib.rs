@@ -49,6 +49,8 @@ pub mod whir_eval;
 mod whir_group_tests;
 pub mod whir_hash;
 #[cfg(test)]
+mod whir_joint_tree_b3_tests;
+#[cfg(test)]
 mod whir_joint_tree_soundness_tests;
 #[cfg(test)]
 mod whir_joint_tree_tests;
@@ -227,7 +229,7 @@ pub enum Error {
     /// format that does not group its polynomials, or a hash with no joint
     /// leaf. Refused before a tree is built or a proof is read.
     #[error(
-        "one round-0 tree a run needs grouped chains and Poseidon1 trees (group {group:?}, hash {hash})"
+        "one round-0 tree a run needs grouped chains and a hash with a joint leaf (group {group:?}, hash {hash})"
     )]
     JointTreeUnsupported {
         group: whir_chain::GroupFold,

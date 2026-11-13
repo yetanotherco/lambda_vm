@@ -719,14 +719,15 @@ pub const FOLD_WORD_ONE_TREE: u64 = 1 << 45;
 /// at the run's one position set. [`One`](Self::One) commits a run of `P' ≥ 2`
 /// polynomials as ONE tree whose leaf at block `j` hashes the run's `P'`
 /// blocks `j`, laid end to end, under a tag that carries the block count
-/// (`poseidon1_stark::joint_leaf_capacity`); a query opens one leaf and one
-/// path. A run of one polynomial keeps its own tree either way.
+/// (`poseidon1_stark::joint_leaf_capacity`, or under 7-round BLAKE3 the
+/// prefix of `crypto::merkle_tree::backends::blake3_joint`); a query opens one
+/// leaf and one path. A run of one polynomial keeps its own tree either way.
 ///
 /// ★ A FORMAT VALUE, NOT A HINT. A verifier-side constant like the rest of
 /// [`ChainFormat`], bound into the statement through
 /// [`ChainConfig::fold_word`] ([`FOLD_WORD_ONE_TREE`]), never read from a
-/// proof. It needs [`GroupFold::Indexed`] and Poseidon1 trees
-/// ([`check_round0_trees`]).
+/// proof. It needs [`GroupFold::Indexed`] and Poseidon1 or 7-round BLAKE3
+/// trees ([`check_round0_trees`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Round0Trees {
     /// One round-0 tree a polynomial. Today's format.
@@ -738,16 +739,12 @@ pub enum Round0Trees {
 
 /// Refuses a [`Round0Trees::One`] format that has no joint tree to build: one
 /// that does not group its polynomials ([`GroupFold::Indexed`]), or whose hash
-/// has no joint leaf ([`WhirHash::joint_leaf`]: Poseidon1's alone). Called
-/// before a round-0 tree is built and before a proof is read.
+/// has no joint leaf ([`WhirHash::JOINT_LEAF`]: Poseidon1's and 7-round
+/// BLAKE3's). Called before a round-0 tree is built and before a proof is read.
 pub fn check_round0_trees<H: WhirHash>(format: &ChainFormat) -> Result<(), Error> {
     match format.round0 {
         Round0Trees::Each => Ok(()),
-        Round0Trees::One
-            if format.group == GroupFold::Indexed && H::DEVICE == DeviceHashKey::Poseidon1 =>
-        {
-            Ok(())
-        }
+        Round0Trees::One if format.group == GroupFold::Indexed && H::JOINT_LEAF => Ok(()),
         Round0Trees::One => Err(Error::JointTreeUnsupported {
             group: format.group,
             hash: H::NAME,
