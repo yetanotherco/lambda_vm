@@ -564,10 +564,62 @@ fn committed_tables<'a>(
 // Prove, verify
 // =========================================================================
 
-/// Seconds of a block prove, by phase.
+/// Seconds of a block prove, by phase, and the card's tree counters at its
+/// start, after phase A and after phase B.
 struct BlockSecs {
     commit: f64,
     phase_b: f64,
+    trees: [TreeCounts; 3],
+}
+
+/// The card's WHIR tree counters, process-wide (`math_cuda::whir`): trees
+/// assembled, leaf passes, whole trees and leaf layers kept or refused, and
+/// openings a kept whole tree served. A retire whose tree was not kept builds
+/// it again, so phase A's builds above one a commitment are retires paying a
+/// rebuild.
+#[derive(Clone, Copy, Debug, Default)]
+struct TreeCounts {
+    builds: u64,
+    leaf_passes: u64,
+    kept: u64,
+    refused: u64,
+    whole_serves: u64,
+}
+
+impl TreeCounts {
+    #[cfg(feature = "cuda")]
+    fn now() -> Self {
+        let (kept, refused, ..) = math_cuda::whir::retention_report();
+        TreeCounts {
+            builds: math_cuda::whir::tree_builds(),
+            leaf_passes: math_cuda::whir::leaf_hash_calls(),
+            kept,
+            refused,
+            whole_serves: math_cuda::whir::retention_whole().1,
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn now() -> Self {
+        TreeCounts::default()
+    }
+
+    fn since(self, before: TreeCounts) -> TreeCounts {
+        TreeCounts {
+            builds: self.builds - before.builds,
+            leaf_passes: self.leaf_passes - before.leaf_passes,
+            kept: self.kept - before.kept,
+            refused: self.refused - before.refused,
+            whole_serves: self.whole_serves - before.whole_serves,
+        }
+    }
+
+    fn words(self) -> String {
+        format!(
+            "builds {} · leaf passes {} · kept {} · refused {} · whole-tree serves {}",
+            self.builds, self.leaf_passes, self.kept, self.refused, self.whole_serves
+        )
+    }
 }
 
 /// Phase A then phase B under `Hs`, the tables moved in.
@@ -586,6 +638,7 @@ where
     let options = BlockOptions::production();
     let mut transcript = <Hs as WhirHash>::sponge();
     absorb_statement(&mut transcript, frame);
+    let start = TreeCounts::now();
     let t = std::time::Instant::now();
     let block = BlockCommitted::commit::<Hs, <Hs as WhirHash>::Sponge>(
         tables,
@@ -597,6 +650,7 @@ where
     )
     .map_err(|e| format!("commit: {e:?}"))?;
     let commit = t.elapsed().as_secs_f64();
+    let after_a = TreeCounts::now();
     let t = std::time::Instant::now();
     let order: Vec<usize> = (0..frame.sizes.len()).collect();
     let proved = multilinear_block::block_prove_in_order::<F, E, <Hs as WhirHash>::Sponge, Hs>(
@@ -613,7 +667,15 @@ where
     )
     .map_err(|e| format!("prove: {e:?}"))?;
     let phase_b = t.elapsed().as_secs_f64();
-    Ok((proved, BlockSecs { commit, phase_b }))
+    let trees = [start, after_a, TreeCounts::now()];
+    Ok((
+        proved,
+        BlockSecs {
+            commit,
+            phase_b,
+            trees,
+        },
+    ))
 }
 
 fn prove_block(
@@ -1172,6 +1234,14 @@ fn block_run(
         .map(|s| s.upload_paid + s.commit + s.argue + s.open_paid)
         .sum();
     let largest = stamps.iter().map(|s| s.cells).max().unwrap_or(1).max(1);
+    let [t0, ta, tb] = phases.trees;
+    eprintln!(
+        "LVP TREES: {run_label} · log_n {log_n} · polys {} · groups {} || phase A {} || phase B {}",
+        stamps.iter().map(|s| s.polys).sum::<usize>(),
+        stamps.len(),
+        ta.since(t0).words(),
+        tb.since(ta).words()
+    );
     let peak_s = peak.map_or("-".to_string(), |b| {
         format!(
             "{:.2} GiB · {:.2} B a main cell · {:.2} B a cell of the largest group",
