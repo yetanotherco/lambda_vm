@@ -49,6 +49,44 @@ pub const SHIFT_COLUMNS: usize = 29;
 pub const MEMW_COLUMNS: usize = 49;
 /// CPU's columns (`cpu::cols::NUM_COLUMNS`).
 pub const CPU_COLUMNS: usize = 37;
+
+/// The prover's measurement-only register-shape probe
+/// (`prover::regs_probe::ENV`): its proofs never verify. Under it a CPU table
+/// has [`CPU_PROBE_COLUMNS`] zero columns after the kernel's [`CPU_COLUMNS`].
+pub const REGS_PROBE_ENV: &str = "LAMBDA_VM_PROBE_REGS_SHAPE";
+/// The zero columns the register-shape probe adds to a CPU table
+/// (`prover::regs_probe::EXTRA_CPU_COLUMNS`).
+pub const CPU_PROBE_COLUMNS: usize = 5;
+
+/// The zero columns a CPU table carries after the kernel's: [`CPU_PROBE_COLUMNS`]
+/// when [`REGS_PROBE_ENV`] is `1` (read once), else none. The prover refuses
+/// any other word before a fill runs.
+pub fn cpu_extra_columns() -> usize {
+    static EXTRA: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *EXTRA.get_or_init(
+        || match std::env::var(REGS_PROBE_ENV).ok().as_deref().map(str::trim) {
+            Some("1") => CPU_PROBE_COLUMNS,
+            _ => 0,
+        },
+    )
+}
+
+/// A CPU table's probe columns ([`cpu_extra_columns`]) zeroed in `dst`
+/// (`rows × (CPU_COLUMNS + extra)` words, column-major), on `stream`. Nothing
+/// without the probe.
+fn zero_cpu_extra_columns(
+    stream: &Arc<CudaStream>,
+    dst: &mut CudaViewMut<u64>,
+    rows: usize,
+) -> Result<()> {
+    let extra = cpu_extra_columns();
+    if extra == 0 {
+        return Ok(());
+    }
+    ensure_eq!(dst.len(), rows * (CPU_COLUMNS + extra), "the table's words");
+    stream.memset_zeros(&mut dst.slice_mut(CPU_COLUMNS * rows..))?;
+    Ok(())
+}
 /// KECCAK_RND's columns (`keccak_rnd::cols::NUM_COLUMNS`).
 pub const KECCAK_RND_COLUMNS: usize = 1480;
 /// Rows a keccak operation fills.
@@ -686,7 +724,7 @@ impl RecordsInput<'_> {
     pub fn cols(&self) -> usize {
         match self {
             Self::KeccakRnd { .. } => KECCAK_RND_COLUMNS,
-            Self::Cpu { .. } => CPU_COLUMNS,
+            Self::Cpu { .. } => CPU_COLUMNS + cpu_extra_columns(),
             Self::MemwR { .. } => MEMW_R_COLUMNS,
             Self::MemwA { .. } => MEMW_A_COLUMNS,
             Self::Load { .. } => LOAD_COLUMNS,
@@ -898,6 +936,7 @@ pub(crate) fn fill_col_major_into(
                         shared_mem_bytes: 0,
                     })?;
             }
+            zero_cpu_extra_columns(stream, dst, rows)?;
             #[cfg(feature = "test-faults")]
             if let Some(pair) = fault_cpu_swap() {
                 swap_columns(stream, dst, rows, pair)?;
@@ -1049,6 +1088,7 @@ pub(crate) fn launch_staged(
                     .arg(missing)
                     .launch(config)?;
             }
+            zero_cpu_extra_columns(stream, dst, rows)?;
             #[cfg(feature = "test-faults")]
             if let Some(pair) = fault_cpu_swap() {
                 swap_columns(stream, dst, rows, pair)?;
