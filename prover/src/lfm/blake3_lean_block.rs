@@ -100,7 +100,7 @@ impl Commits {
 }
 
 // =========================================================================
-// The tables, column by column
+// The tables, wide or narrow
 // =========================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,28 +111,124 @@ enum Kind {
     Mirror,
 }
 
+/// How the host holds a table's columns until the card takes them: a
+/// prover's choice, not the proof's (`Narrowing`'s rule: the proof is the same
+/// byte for byte).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hold {
+    /// As field elements, eight bytes a cell.
+    Wide,
+    /// Packed from the start, each column at the bytes its largest value needs
+    /// ([`multilinear::narrow::NarrowColumns`]); the card widens them.
+    Narrow,
+}
+
+impl Hold {
+    fn parse(name: &str) -> Self {
+        match name {
+            "wide" => Hold::Wide,
+            "narrow" => Hold::Narrow,
+            other => panic!("unknown holding {other} (wide, narrow)"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Hold::Wide => "wide",
+            Hold::Narrow => "narrow",
+        }
+    }
+}
+
+/// One table's columns as the host holds them.
+enum Held {
+    Wide(Vec<Vec<FE>>),
+    Narrow(multilinear::narrow::NarrowColumns),
+}
+
+impl Held {
+    /// Row-major rows of `width` cells, held as `hold` says.
+    fn from_rows(data: &[FE], width: usize, hold: Hold) -> Self {
+        match hold {
+            Hold::Wide => Held::Wide(transpose(data, width)),
+            Hold::Narrow => {
+                let words: Vec<u64> = data.iter().map(|f| *f.value()).collect();
+                Held::Narrow(
+                    multilinear::narrow::NarrowColumns::pack_row_major(&words, width)
+                        .expect("whole rows"),
+                )
+            }
+        }
+    }
+
+    fn from_trace(t: &TraceTable<F, E>, hold: Hold) -> Self {
+        match hold {
+            Hold::Wide => Held::Wide(t.columns_main()),
+            Hold::Narrow => {
+                let cols: Vec<Vec<u64>> = t
+                    .columns_main()
+                    .iter()
+                    .map(|c| c.iter().map(|f| *f.value()).collect())
+                    .collect();
+                let refs: Vec<&[u64]> = cols.iter().map(Vec::as_slice).collect();
+                Held::Narrow(multilinear::narrow::NarrowColumns::pack(&refs).expect("one height"))
+            }
+        }
+    }
+
+    fn cols(&self) -> usize {
+        match self {
+            Held::Wide(c) => c.len(),
+            Held::Narrow(p) => p.cols(),
+        }
+    }
+
+    fn rows(&self) -> usize {
+        match self {
+            Held::Wide(c) => c.first().map_or(0, Vec::len),
+            Held::Narrow(p) => p.rows(),
+        }
+    }
+
+    /// Column `c` as field elements.
+    fn column(&self, c: usize) -> Vec<FE> {
+        match self {
+            Held::Wide(cols) => cols[c].clone(),
+            Held::Narrow(p) => p.column(c).into_iter().map(FE::from).collect(),
+        }
+    }
+
+    /// The bytes the host holds for the table's cells.
+    fn bytes(&self) -> usize {
+        match self {
+            Held::Wide(c) => c.iter().map(|c| c.len() * 8).sum(),
+            Held::Narrow(p) => p.data().len(),
+        }
+    }
+}
+
 /// Every table of a block in table order (round chunks, head chunks, the byte
-/// table, the mirror), each as its columns.
+/// table, the mirror), each held as its run's [`Hold`] says.
 struct Chunked {
     kinds: Vec<Kind>,
-    columns: Vec<Vec<Vec<FE>>>,
+    tables: Vec<Held>,
     digests: Vec<[u32; 8]>,
 }
 
 impl Chunked {
-    /// The probe's traces as they are (one head table), columns copied out.
-    fn from_traces(t: &Traces) -> Self {
+    /// The probe's traces as they are (one head table).
+    fn from_traces(t: &Traces, hold: Hold) -> Self {
         let mut kinds = vec![Kind::Round; t.rounds.len()];
         kinds.extend([Kind::Head, Kind::Xor, Kind::Mirror]);
-        let columns = t
+        let tables = t
             .rounds
             .iter()
             .chain([&t.head, &t.table, &t.mirror])
-            .map(TraceTable::columns_main)
+            .map(|t| Held::from_trace(t, hold))
             .collect();
         Chunked {
             kinds,
-            columns,
+            tables,
             digests: t.digests.clone(),
         }
     }
@@ -143,6 +239,40 @@ impl Chunked {
 
     fn rounds(&self) -> usize {
         self.kinds.iter().filter(|&&k| k == Kind::Round).count()
+    }
+
+    /// `(cells, host bytes)` of the tables of `kind`.
+    fn census(&self, kind: Kind) -> (usize, usize) {
+        self.kinds
+            .iter()
+            .zip(&self.tables)
+            .filter(|(k, _)| **k == kind)
+            .fold((0, 0), |(c, b), (_, t)| {
+                (c + t.rows() * t.cols(), b + t.bytes())
+            })
+    }
+
+    /// Bytes a cell by kind and in all, as held: `LVP HELD` words.
+    fn held_line(&self) -> String {
+        let mut parts = Vec::new();
+        let (mut cells, mut bytes) = (0usize, 0usize);
+        for (kind, name) in [
+            (Kind::Round, "round"),
+            (Kind::Head, "head"),
+            (Kind::Xor, "byte table"),
+            (Kind::Mirror, "mirror"),
+        ] {
+            let (c, b) = self.census(kind);
+            cells += c;
+            bytes += b;
+            parts.push(format!("{name} {:.3}", b as f64 / c.max(1) as f64));
+        }
+        format!(
+            "{} · all {:.3} B a cell · {:.2} GiB held",
+            parts.join(" · "),
+            bytes as f64 / cells.max(1) as f64,
+            gib(bytes as u64)
+        )
     }
 }
 
@@ -176,10 +306,10 @@ fn fill_op(
 
 /// The probe's honest tables for `ops`, built one round chunk at a time so the
 /// host never holds a chunk's rows twice: each chunk is filled row by row,
-/// turned into columns and its rows let go. Round chunks of at most
+/// held as `hold` says and its rows let go. Round chunks of at most
 /// 2^`chunk_log` rows (`build_traces`' cut), head chunks of at most
 /// 2^`head_chunk_log`.
-fn build_chunked(ops: &[LeanOp], chunk_log: u32, head_chunk_log: u32) -> Chunked {
+fn build_chunked(ops: &[LeanOp], chunk_log: u32, head_chunk_log: u32, hold: Hold) -> Chunked {
     use std::collections::BTreeMap;
     const W: usize = round::NUM_COLUMNS;
     const HW: usize = head::NUM_COLUMNS;
@@ -213,7 +343,7 @@ fn build_chunked(ops: &[LeanOp], chunk_log: u32, head_chunk_log: u32) -> Chunked
         }
     }
     let mut kinds = Vec::new();
-    let mut columns = Vec::new();
+    let mut tables = Vec::new();
     for (&s, &size) in starts.iter().zip(&sizes) {
         let e = s + size;
         let mut data = zeroed_fe_vec(size * W);
@@ -265,30 +395,22 @@ fn build_chunked(ops: &[LeanOp], chunk_log: u32, head_chunk_log: u32) -> Chunked
             }
         }
         kinds.push(Kind::Round);
-        columns.push(transpose(&data, W));
+        tables.push(Held::from_rows(&data, W, hold));
     }
+    // The head's chunks are runs of its rows.
     let head_chunk = head_rows.min(1usize << head_chunk_log);
-    let mut head_columns = transpose(&head_data, HW);
-    drop(head_data);
-    let chunks = head_rows / head_chunk;
-    let mut heads: Vec<Vec<Vec<FE>>> = (0..chunks).map(|_| Vec::with_capacity(HW)).collect();
-    for col in head_columns.iter_mut() {
-        for (c, head) in heads.iter_mut().enumerate() {
-            head.push(col[c * head_chunk..(c + 1) * head_chunk].to_vec());
-        }
-        *col = Vec::new();
-    }
-    for head in heads {
+    for rows in head_data.chunks(head_chunk * HW) {
         kinds.push(Kind::Head);
-        columns.push(head);
+        tables.push(Held::from_rows(rows, HW, hold));
     }
+    drop(head_data);
     kinds.push(Kind::Xor);
-    columns.push(lean::table_trace(&hist).columns_main());
+    tables.push(Held::from_trace(&lean::table_trace(&hist), hold));
     kinds.push(Kind::Mirror);
-    columns.push(mirror_trace(ops, &digests).columns_main());
+    tables.push(Held::from_trace(&mirror_trace(ops, &digests), hold));
     Chunked {
         kinds,
-        columns,
+        tables,
         digests,
     }
 }
@@ -366,23 +488,19 @@ struct Frame {
 
 fn frame(airs: &BlockAirs, c: &Chunked, commits: Commits) -> Result<Frame, String> {
     let refs = airs.refs();
-    if refs.len() != c.columns.len() {
-        return Err(format!(
-            "{} AIRs for {} tables",
-            refs.len(),
-            c.columns.len()
-        ));
+    if refs.len() != c.tables.len() {
+        return Err(format!("{} AIRs for {} tables", refs.len(), c.tables.len()));
     }
     let mut shapes = Vec::with_capacity(refs.len());
     let mut prep = Vec::with_capacity(refs.len());
-    for (air, cols) in refs.iter().zip(&c.columns) {
+    for (air, held) in refs.iter().zip(&c.tables) {
         let width = air.trace_layout().0;
-        let rows = cols.first().map_or(0, Vec::len);
-        if cols.len() != width || !rows.is_power_of_two() || cols.iter().any(|c| c.len() != rows) {
+        let rows = held.rows();
+        if held.cols() != width || !rows.is_power_of_two() {
             return Err(format!(
                 "{}: {} columns of {rows} rows for a {width}-column AIR",
                 air.name(),
-                cols.len()
+                held.cols()
             ));
         }
         shapes.push((width, rows.trailing_zeros() as usize));
@@ -392,9 +510,8 @@ fn frame(airs: &BlockAirs, c: &Chunked, commits: Commits) -> Result<Frame, Strin
             0
         };
         prep.push(
-            cols[..count]
-                .iter()
-                .map(|c| Mle::new(c.clone()).map_err(|e| format!("{}: {e:?}", air.name())))
+            (0..count)
+                .map(|col| Mle::new(held.column(col)).map_err(|e| format!("{}: {e:?}", air.name())))
                 .collect::<Result<Vec<_>, _>>()?,
         );
     }
@@ -420,7 +537,7 @@ fn absorb_statement<T: IsTranscript<E>>(transcript: &mut T, frame: &Frame) {
     }
 }
 
-/// The block's tables, their columns moved in.
+/// The block's tables, their columns moved in, wide or narrow as held.
 fn committed_tables<'a>(
     airs: &'a BlockAirs,
     c: Chunked,
@@ -428,12 +545,17 @@ fn committed_tables<'a>(
 ) -> Result<Vec<CommittedTable<'a, F, E>>, String> {
     airs.refs()
         .into_iter()
-        .zip(c.columns)
+        .zip(c.tables)
         .zip(&frame.shapes)
-        .map(|((air, mut columns), &(width, num_vars))| {
+        .map(|((air, held), &(width, num_vars))| {
             let layout = layout_of(air, width, num_vars).map_err(|e| format!("{e:?}"))?;
-            CommittedTable::from_layout(layout, |col| core::mem::take(&mut columns[col as usize]))
-                .map_err(|e| format!("{}: {e:?}", air.name()))
+            match held {
+                Held::Wide(mut columns) => CommittedTable::from_layout(layout, |col| {
+                    core::mem::take(&mut columns[col as usize])
+                }),
+                Held::Narrow(packed) => CommittedTable::from_narrow(layout, packed),
+            }
+            .map_err(|e| format!("{}: {e:?}", air.name()))
         })
         .collect()
 }
@@ -573,7 +695,7 @@ fn block_round_trip_with(
 ) -> Result<bool, String> {
     let mut t = build_traces(ops, &spec);
     mutate(&mut t);
-    let c = Chunked::from_traces(&t);
+    let c = Chunked::from_traces(&t, Hold::Wide);
     let airs = BlockAirs::of(&c, spec.drops);
     let mut f = frame(&airs, &c, prover)?;
     let tables = committed_tables(&airs, c, &f)?;
@@ -608,7 +730,7 @@ fn block_round_trip(
 #[test]
 fn the_lean_tables_prove_and_verify_through_the_block_prover() {
     let ops = probe_ops(64);
-    let c = Chunked::from_traces(&build_traces(&ops, &Spec::default()));
+    let c = Chunked::from_traces(&build_traces(&ops, &Spec::default()), Hold::Wide);
     let airs = BlockAirs::of(&c, Drops::default());
     let f = frame(&airs, &c, Commits::P1).expect("a frame");
     assert_eq!(
@@ -668,7 +790,7 @@ fn a_proof_under_one_hash_rejects_under_the_other() {
 }
 
 /// The chunked build is the probe's build, table for table, with the head cut
-/// into chunks.
+/// into chunks; held narrow, every column holds the same values.
 #[test]
 fn the_chunked_build_is_the_probes_build() {
     let ops = mixed_ops(100, 7);
@@ -677,48 +799,143 @@ fn the_chunked_build_is_the_probes_build() {
         ..Spec::default()
     };
     let t = build_traces(&ops, &spec);
-    let whole = Chunked::from_traces(&t);
-    // Head whole: the same tables exactly.
-    let same = build_chunked(&ops, 5, 20);
-    assert_eq!(same.kinds, whole.kinds);
-    assert_eq!(same.columns, whole.columns);
-    assert_eq!(same.digests, whole.digests);
+    let wide = |c: &Chunked| -> Vec<Vec<Vec<FE>>> {
+        c.tables
+            .iter()
+            .map(|h| (0..h.cols()).map(|col| h.column(col)).collect())
+            .collect()
+    };
+    let whole = Chunked::from_traces(&t, Hold::Wide);
+    let whole_cols = wide(&whole);
+    // Head whole: the same tables exactly, wide and narrow.
+    for hold in [Hold::Wide, Hold::Narrow] {
+        let same = build_chunked(&ops, 5, 20, hold);
+        assert_eq!(same.kinds, whole.kinds, "{hold:?}");
+        assert_eq!(wide(&same), whole_cols, "{hold:?}");
+        assert_eq!(same.digests, whole.digests, "{hold:?}");
+    }
+    let narrow = build_chunked(&ops, 5, 20, Hold::Narrow);
+    assert!(
+        narrow.tables.iter().all(|h| matches!(h, Held::Narrow(_))),
+        "a narrow build holds every table narrow"
+    );
+    println!(
+        "LVP HELD (laptop, 100 compressions): {}",
+        narrow.held_line()
+    );
     // Head in chunks of 2^4 rows: the same head, cut.
-    let cut = build_chunked(&ops, 5, 4);
+    let cut = build_chunked(&ops, 5, 4, Hold::Wide);
     assert_eq!(cut.heads(), 128 / 16);
+    let cut_cols = wide(&cut);
     let heads: Vec<&Vec<Vec<FE>>> = cut
         .kinds
         .iter()
-        .zip(&cut.columns)
+        .zip(&cut_cols)
         .filter(|(k, _)| **k == Kind::Head)
         .map(|(_, c)| c)
         .collect();
-    let head = &whole.columns[whole.rounds()];
+    let head = &whole_cols[whole.rounds()];
     for col in 0..head::NUM_COLUMNS {
         let joined: Vec<FE> = heads.iter().flat_map(|h| h[col].iter().copied()).collect();
         assert_eq!(joined, head[col], "head column {col}");
     }
-    assert_eq!(
-        &cut.columns[..cut.rounds()],
-        &whole.columns[..whole.rounds()]
-    );
-    let n = cut.columns.len();
-    assert_eq!(
-        &cut.columns[n - 2..],
-        &whole.columns[whole.columns.len() - 2..]
-    );
+    assert_eq!(&cut_cols[..cut.rounds()], &whole_cols[..whole.rounds()]);
+    let n = cut_cols.len();
+    assert_eq!(&cut_cols[n - 2..], &whole_cols[whole_cols.len() - 2..]);
 }
 
 /// The head in chunks proves and verifies.
 #[test]
 fn the_chunked_head_proves_and_verifies() {
-    let c = build_chunked(&probe_ops(40), 6, 3);
+    let c = build_chunked(&probe_ops(40), 6, 3, Hold::Wide);
     assert!(c.heads() > 1);
     let airs = BlockAirs::of(&c, Drops::default());
     let f = frame(&airs, &c, Commits::B3).expect("a frame");
     let tables = committed_tables(&airs, c, &f).expect("tables");
     let (proved, _) = prove_block(tables, &f, PhaseBOverlap::Off).expect("prove");
     assert_eq!(verify_block(&airs, &f, &proved), Ok(()));
+}
+
+/// A block proof's bytes: the proof, the batched argues, the prepared
+/// openings and the commit-time answers, each serialized, in that order.
+fn proof_bytes(proved: &BlockProved<F, E>) -> Vec<u8> {
+    let (proof, argues, prepared, _, commit_ood) = proved;
+    let mut out = Vec::new();
+    for part in [
+        rkyv::to_bytes::<rkyv::rancor::Error>(proof).expect("the proof serializes"),
+        rkyv::to_bytes::<rkyv::rancor::Error>(argues).expect("the argues serialize"),
+        rkyv::to_bytes::<rkyv::rancor::Error>(prepared).expect("the openings serialize"),
+        rkyv::to_bytes::<rkyv::rancor::Error>(commit_ood).expect("the answers serialize"),
+    ] {
+        out.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        out.extend_from_slice(&part);
+    }
+    out
+}
+
+/// One prove of `ops`' tables held as `hold`, verified: the proof's bytes.
+fn proved_bytes(
+    ops: &[LeanOp],
+    chunk_log: u32,
+    head_chunk_log: u32,
+    commits: Commits,
+    hold: Hold,
+    overlap: PhaseBOverlap,
+) -> Vec<u8> {
+    let c = build_chunked(ops, chunk_log, head_chunk_log, hold);
+    let airs = BlockAirs::of(&c, Drops::default());
+    let f = frame(&airs, &c, commits).expect("a frame");
+    let tables = committed_tables(&airs, c, &f).expect("tables");
+    let (proved, _) = prove_block(tables, &f, overlap).expect("prove");
+    assert_eq!(
+        verify_block(&airs, &f, &proved),
+        Ok(()),
+        "{commits:?} {hold:?}"
+    );
+    proof_bytes(&proved)
+}
+
+/// ★ The ID row: narrow and wide holdings prove the same bytes, under both
+/// hashes, beside a control (wide twice) that shows the prove is repeatable.
+/// The grind may take any valid nonce, so the bytes repeat only under
+/// `LAMBDA_VM_DETERMINISTIC_GRIND` (smallest nonce first), read once a process.
+#[test]
+#[ignore = "needs LAMBDA_VM_DETERMINISTIC_GRIND=1, run alone"]
+fn narrow_and_wide_prove_the_same_bytes() {
+    assert!(
+        crypto::grinding::deterministic(),
+        "export LAMBDA_VM_DETERMINISTIC_GRIND=1"
+    );
+    let ops = probe_ops(40);
+    for commits in [Commits::B3, Commits::P1] {
+        let wide = proved_bytes(&ops, 6, 3, commits, Hold::Wide, PhaseBOverlap::Off);
+        let again = proved_bytes(&ops, 6, 3, commits, Hold::Wide, PhaseBOverlap::Off);
+        let narrow = proved_bytes(&ops, 6, 3, commits, Hold::Narrow, PhaseBOverlap::Off);
+        assert_eq!(wide, again, "{commits:?}: the control, wide twice");
+        assert_eq!(wide, narrow, "{commits:?}: narrow against wide");
+        println!(
+            "LVP ID (laptop): commits {} · {} bytes · {}",
+            commits.name(),
+            wide.len(),
+            &blake3::hash(&wide).to_hex()[..16]
+        );
+    }
+}
+
+/// The narrow path's own negative: a narrow table whose committed values the
+/// verifier's preprocessed columns contradict is rejected, as the wide one is.
+#[test]
+fn a_narrow_table_against_a_wrong_preprocessed_column_rejects() {
+    let c = build_chunked(&probe_ops(12), 6, 3, Hold::Narrow);
+    let airs = BlockAirs::of(&c, Drops::default());
+    let mut f = frame(&airs, &c, Commits::B3).expect("a frame");
+    let tables = committed_tables(&airs, c, &f).expect("tables");
+    let (proved, _) = prove_block(tables, &f, PhaseBOverlap::Off).expect("prove");
+    let xor = f.prep.len() - 2;
+    let mut col = f.prep[xor][table::X].evals().to_vec();
+    col[7] += FE::one();
+    f.prep[xor][table::X] = Mle::new(col).expect("same height");
+    assert!(verify_block(&airs, &f, &proved).is_err());
 }
 
 /// The box's shapes group as the job registers them: 2^17 compressions one
@@ -902,10 +1119,18 @@ fn group_kinds(kinds: &[Kind], sizes: &[usize]) -> Vec<String> {
 
 /// One timed block prove: the tables built and moved in first (untimed), then
 /// phase A and phase B under the pool's high-water, then the host verify.
-fn block_run(ops: &[LeanOp], commits: Commits, overlap: &str, label: &str, log_n: u32) -> f64 {
+fn block_run(
+    ops: &[LeanOp],
+    commits: Commits,
+    hold: Hold,
+    overlap: &str,
+    label: &str,
+    log_n: u32,
+) -> f64 {
     let b = std::time::Instant::now();
-    let c = build_chunked(ops, lean::MAX_CHUNK_LOG, HEAD_CHUNK_LOG);
+    let c = build_chunked(ops, lean::MAX_CHUNK_LOG, HEAD_CHUNK_LOG, hold);
     let kinds = c.kinds.clone();
+    let held = c.held_line();
     let airs = BlockAirs::of(&c, Drops::default());
     let f = frame(&airs, &c, commits).expect("the frame");
     let tables = committed_tables(&airs, c, &f).expect("the block's tables");
@@ -914,9 +1139,15 @@ fn block_run(ops: &[LeanOp], commits: Commits, overlap: &str, label: &str, log_n
     let group_kinds = group_kinds(&kinds, &f.sizes);
     // The STARK arm's clock: from before the pool's trim to after it.
     eprintln!(
-        "LVP RUN BEGIN: arm block · commits {} · overlap {overlap} · run {label} · log_n {log_n} · \
-         tables built in {build_s:.2} s (untimed)",
-        commits.name()
+        "LVP RUN BEGIN: arm block · commits {} · hold {} · overlap {overlap} · run {label} · log_n \
+         {log_n} · tables built in {build_s:.2} s (untimed)",
+        commits.name(),
+        hold.name()
+    );
+    eprintln!(
+        "LVP HELD: commits {} · hold {} · run {label} · log_n {log_n} · B a cell: {held}",
+        commits.name(),
+        hold.name()
     );
     let start = std::time::Instant::now();
     let (r, peak) = pool_peak(|| prove_block(tables, &f, overlap_of(overlap)));
@@ -927,8 +1158,9 @@ fn block_run(ops: &[LeanOp], commits: Commits, overlap: &str, label: &str, log_n
     let vsecs = v.elapsed().as_secs_f64();
     let stamps = &proved.3;
     let run_label = format!(
-        "run {label} · commits {} · overlap {overlap}",
-        commits.name()
+        "run {label} · commits {} · hold {} · overlap {overlap}",
+        commits.name(),
+        hold.name()
     );
     for (g, s) in stamps.iter().enumerate() {
         eprintln!("{}", group_line(&run_label, g, s, &group_kinds[g]));
@@ -949,11 +1181,12 @@ fn block_run(ops: &[LeanOp], commits: Commits, overlap: &str, label: &str, log_n
         )
     });
     eprintln!(
-        "LVP RESULT: arm block · commits {} · overlap {overlap} · run {label} · log_n {log_n} · \
-         compressions {} · groups {} · main cells {main} · prove {secs:.3} s (commit {:.3} · phase \
-         B {:.3}) · group terms {terms:.3} s · rest {:.3} s · µs a compression {:.3} · pool peak \
-         {peak_s} · verify {vsecs:.2} s · {}",
+        "LVP RESULT: arm block · commits {} · hold {} · overlap {overlap} · run {label} · log_n \
+         {log_n} · compressions {} · groups {} · main cells {main} · prove {secs:.3} s (commit {:.3} \
+         · phase B {:.3}) · group terms {terms:.3} s · rest {:.3} s · µs a compression {:.3} · pool \
+         peak {peak_s} · verify {vsecs:.2} s · {}",
         commits.name(),
+        hold.name(),
         1u64 << log_n,
         f.sizes.len(),
         phases.commit,
@@ -1009,8 +1242,9 @@ fn digests_are_blake3(ops: &[LeanOp], digests: &[[u32; 8]]) -> (usize, usize) {
 /// below.
 ///
 /// Knobs (env): `LVP_LOGN` (default `17,19`), `LVP_RUNS` (default 3, after one
-/// untimed warm-up of every arm), `LVP_COMMITS` (the block arms' commitments,
-/// default `p1`; `p1`, `p1each`, `b3`), `LVP_OVERLAPS` (the block arms'
+/// untimed warm-up of every arm), `LVP_COMMITS` (the block arms, each
+/// `commits[:hold]`, default `p1`; commits `p1`, `p1each`, `b3`; hold `wide`,
+/// the default, or `narrow`), `LVP_OVERLAPS` (the block arms'
 /// phase-B overlaps, default `pinned,on`), `LVP_STARK` (the STARK control's
 /// arms at 2^17 and below, default `p1,b3`; empty for none). Timed run `r`
 /// takes the arms in their listed order when `r` is odd and reversed when it is
@@ -1032,18 +1266,21 @@ fn lvp_the_lean_tables_through_the_block_prover_on_the_card() {
         .ok()
         .map(|s| s.parse().expect("LVP_RUNS: an integer"))
         .unwrap_or(3);
-    let commits: Vec<Commits> = env_list("LVP_COMMITS", "p1")
+    let commits: Vec<(Commits, Hold)> = env_list("LVP_COMMITS", "p1")
         .iter()
-        .map(|s| Commits::parse(s))
+        .map(|s| match s.split_once(':') {
+            Some((c, h)) => (Commits::parse(c), Hold::parse(h)),
+            None => (Commits::parse(s), Hold::Wide),
+        })
         .collect();
     let overlaps = env_list("LVP_OVERLAPS", "pinned,on");
     for o in &overlaps {
         overlap_of(o);
     }
     let stark_arms = env_list("LVP_STARK", "p1,b3");
-    let arms: Vec<(Commits, String)> = commits
+    let arms: Vec<(Commits, Hold, String)> = commits
         .iter()
-        .flat_map(|&c| overlaps.iter().map(move |o| (c, o.clone())))
+        .flat_map(|&(c, h)| overlaps.iter().map(move |o| (c, h, o.clone())))
         .collect();
     let block_config = BlockFormat::pinned().chain_config(&[(1, 20)]);
     eprintln!(
@@ -1065,7 +1302,7 @@ fn lvp_the_lean_tables_through_the_block_prover_on_the_card() {
         threads(),
         commits
             .iter()
-            .map(|c| c.name())
+            .map(|(c, h)| format!("{}:{}", c.name(), h.name()))
             .collect::<Vec<_>>()
             .join(","),
         overlaps.join(","),
@@ -1076,7 +1313,7 @@ fn lvp_the_lean_tables_through_the_block_prover_on_the_card() {
         let ops = mixed_ops(n, 0x5EED_0000 + u64::from(log_n));
         {
             let b = std::time::Instant::now();
-            let c = build_chunked(&ops, lean::MAX_CHUNK_LOG, HEAD_CHUNK_LOG);
+            let c = build_chunked(&ops, lean::MAX_CHUNK_LOG, HEAD_CHUNK_LOG, Hold::Narrow);
             let build_s = b.elapsed().as_secs_f64();
             let (parents, leaves) = digests_are_blake3(&ops, &c.digests);
             eprintln!(
@@ -1121,8 +1358,8 @@ fn lvp_the_lean_tables_through_the_block_prover_on_the_card() {
                 stark_run(arm, "warm");
             }
         }
-        for (c, o) in &arms {
-            block_run(&ops, *c, o, "warm", log_n);
+        for (c, h, o) in &arms {
+            block_run(&ops, *c, *h, o, "warm", log_n);
         }
         for run in 1..=runs {
             let label = format!("{run}");
@@ -1131,14 +1368,71 @@ fn lvp_the_lean_tables_through_the_block_prover_on_the_card() {
                     stark_run(arm, &label);
                 }
             }
-            let mut order: Vec<&(Commits, String)> = arms.iter().collect();
+            let mut order: Vec<&(Commits, Hold, String)> = arms.iter().collect();
             if run % 2 == 0 {
                 order.reverse();
             }
-            for (c, o) in order {
-                block_run(&ops, *c, o, &label, log_n);
+            for (c, h, o) in order {
+                block_run(&ops, *c, *h, o, &label, log_n);
             }
         }
     }
     eprintln!("LVP DONE");
+}
+
+/// ★ The ID row on the card (box, `--features cuda`): the lean tables of
+/// 2^`LVP_ID_LOGN` compressions (default 19) proved wide, wide again (the
+/// control) and narrow under each of `LVP_ID_COMMITS` (default `b3,p1`), the
+/// phase-B overlap `pinned`, every proof verified. One `LVP ID` line a hash
+/// with the three proofs' digests; the test fails unless all three are the
+/// same bytes. The card's grind may take any valid nonce, so this runs only
+/// under `LAMBDA_VM_DETERMINISTIC_GRIND` (smallest nonce first).
+#[test]
+#[ignore]
+fn lvp_narrow_and_wide_prove_the_same_bytes_on_the_card() {
+    assert!(
+        crypto::grinding::deterministic(),
+        "export LAMBDA_VM_DETERMINISTIC_GRIND=1"
+    );
+    let log_n: u32 = std::env::var("LVP_ID_LOGN")
+        .ok()
+        .map(|s| s.parse().expect("LVP_ID_LOGN: an integer"))
+        .unwrap_or(19);
+    let ops = mixed_ops(1 << log_n, 0x5EED_0000 + u64::from(log_n));
+    let deterministic = std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some();
+    let mut all_same = true;
+    for name in env_list("LVP_ID_COMMITS", "b3,p1") {
+        let commits = Commits::parse(&name);
+        let digest = |hold: Hold| {
+            let bytes = proved_bytes(
+                &ops,
+                lean::MAX_CHUNK_LOG,
+                HEAD_CHUNK_LOG,
+                commits,
+                hold,
+                PhaseBOverlap::Pinned,
+            );
+            (bytes.len(), blake3::hash(&bytes).to_hex()[..16].to_string())
+        };
+        let wide = digest(Hold::Wide);
+        let again = digest(Hold::Wide);
+        let narrow = digest(Hold::Narrow);
+        let control = wide == again;
+        let same = wide == narrow;
+        all_same &= control && same;
+        eprintln!(
+            "LVP ID: commits {} · log_n {log_n} · deterministic grind {deterministic} · wide {} ({} \
+             bytes) · wide again {} · narrow {} ({} bytes) · control {} · narrow {}",
+            commits.name(),
+            wide.1,
+            wide.0,
+            again.1,
+            narrow.1,
+            narrow.0,
+            if control { "SAME" } else { "DIFFER" },
+            if same { "SAME" } else { "DIFFER" },
+        );
+    }
+    eprintln!("LVP ID DONE");
+    assert!(all_same, "narrow and wide must prove the same bytes");
 }
