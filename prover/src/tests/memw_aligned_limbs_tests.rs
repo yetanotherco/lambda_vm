@@ -1081,8 +1081,9 @@ const CPU_FED: [BusId; 3] = [BusId::Ecall, BusId::Cpu32, BusId::MemoryOp];
 /// constant 0. So the limbs, which do not range-check the shared high word,
 /// see the clock's 0 on every row a sender can make (how a table's rows that do
 /// not receive from the CPU carry the column — COPY's, KECCAK's and BLAKE3's
-/// chains — is the AIR reading of the review, R-PHASEA-JUDGE §3; the pin
-/// records the chain buses beside it). Pinned: a sender that changes its high
+/// chains, which carry it from a first row that received it from the CPU — is
+/// read in those tables' constraints, not here; the pin records the chain
+/// buses beside it). Pinned: a sender that changes its high
 /// word, or the source it receives it from, fails here, and the limbs' form is
 /// to be reviewed again before it lands.
 #[cfg(feature = "parallel")]
