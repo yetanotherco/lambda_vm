@@ -2705,6 +2705,45 @@ pub fn prove_whir_block_tree(
     for note in &fit_notes {
         sink.line(&format!("W3 EARLY LEAF KEPT: {note}"));
     }
+    // Several leaves asked for: which led, and the rebuilt groups that decide it
+    // (a leaf leads only when its rebuilt groups are next in their class).
+    if cfg.early_leaves > 1
+        && let Some(t) = lead.taken()
+    {
+        let partition = plan.partition();
+        let owner = |g: usize| {
+            (0..partition.num_leaves())
+                .find(|&k| partition.leaf(k).contains(&g))
+                .map_or("-".to_string(), |k| k.to_string())
+        };
+        let rebuilt = if t.rebuilt.is_empty() {
+            "none".to_string()
+        } else {
+            t.rebuilt
+                .iter()
+                .map(|&(g, c)| format!("{g} (class {c}, leaf {})", owner(g)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let n = partition.num_leaves();
+        sink.line(&format!(
+            "W3 EARLY ORDER: phase B led {} of {n} leaves [{}] · rebuilt groups to come: {rebuilt} · {}",
+            t.leaves.len(),
+            t.leaves
+                .iter()
+                .map(|k| k.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if t.leaves.len() + 1 >= n {
+                "every leaf but the last led".to_string()
+            } else {
+                format!(
+                    "NO VALID ORDER for the other {} leaves: their rebuilt groups are not next in their class",
+                    n - t.leaves.len()
+                )
+            }
+        ));
+    }
     sink.line(&format!(
         "W3 TREE PROGRAM BUDGET: {}",
         match &tree_budget {
