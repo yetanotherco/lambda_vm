@@ -239,20 +239,19 @@ pub struct WhirTreeConfig {
     /// first. Or (0, the control) phase B keeps its own order and the tree
     /// takes the leaves in index order. Prover-only: the bytes are the same.
     pub leaf_first: bool,
-    /// `LAMBDA_VM_BLOCK_COMPRESS` ([`super::compress::compress_setting`];
-    /// default off): after the top, one compression proof of the top's
-    /// verification (C1) at this rate, which then ships instead of the top.
+    /// `LAMBDA_VM_BLOCK_COMPRESS` (the four compression fields are
+    /// [`super::compress::compress_plan`]'s; default
+    /// [`super::compress::DEFAULT_PLAN`], `=0` the rollback): after the top,
+    /// one compression proof of the top's verification (C1) at this rate,
+    /// which then ships instead of the top.
     pub compress: Option<super::wlfm::WlfmRate>,
-    /// `LAMBDA_VM_BLOCK_COMPRESS_EVAL` and `LAMBDA_VM_BLOCK_COMPRESS_FINAL`
-    /// ([`super::compress::compress_levers_from_env`]; default off): how C1
-    /// binds its instruction columns and where its chains stop committing.
+    /// `LAMBDA_VM_BLOCK_COMPRESS_EVAL`, `_FINAL` and `_FOLDS`: how C1 binds
+    /// its instruction columns and where its chains stop committing.
     pub compress_levers: super::wlfm::WlfmLevers,
-    /// `LAMBDA_VM_BLOCK_COMPRESS_WIRE` ([`super::compress::compress_wire_setting`];
-    /// default off): ship the compressed file in the compact wire encoding.
+    /// `LAMBDA_VM_BLOCK_COMPRESS_WIRE`: the shipped file's encoding.
     pub compress_wire: super::wire::WireFormat,
-    /// `LAMBDA_VM_BLOCK_COMPRESS2` ([`super::compress::compress2_setting`];
-    /// default off): after C1, a second compression proof C2 that verifies
-    /// C1 in-guest, at this query grind; what ships then.
+    /// `LAMBDA_VM_BLOCK_COMPRESS2`: after C1, a second compression proof C2
+    /// that verifies C1 in-guest, at this query grind; what ships then.
     pub compress2: Option<u8>,
 }
 
@@ -510,10 +509,12 @@ impl WhirTreeConfig {
         // waves) and the bytes it builds at once, KECCAK_RND built as its
         // tables, the finish's tables packed as they are built.
         block_whir::rest_layout_from_env(&mut options);
-        let compress = super::compress::compress_from_env()?;
-        let compress_levers = super::compress::compress_levers_from_env(compress)?;
-        let compress_wire = super::compress::compress_wire_from_env(compress)?;
-        let compress2 = super::compress::compress2_from_env(compress, compress_levers)?;
+        let super::compress::CompressPlan {
+            rate: compress,
+            levers: compress_levers,
+            wire: compress_wire,
+            c2: compress2,
+        } = super::compress::compress_plan_from_env()?;
         let node_pipe = count_knob("W3_NODE_PIPE")?
             .is_none_or(|v| v != 0)
             .then(|| count_knob("W3_EMIT_THREADS").map(|t| t.unwrap_or(4).max(1)))
@@ -3132,6 +3133,117 @@ pub const COMPRESSED2_G26_DEDUP: Compressed2Format = Compressed2Format {
     wire: super::wire::WireFormat::Dedup,
 };
 
+/// Which compressed file a run ships, as a verifier names it: C1's (its
+/// levers and encoding) or C2's (its grind and encoding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShippedFormat {
+    C1(CompressedFormat),
+    C2(Compressed2Format),
+}
+
+impl ShippedFormat {
+    /// The file a run under `plan` ships; `None` without compression (the
+    /// top's file).
+    pub fn of(plan: super::compress::CompressPlan) -> Option<Self> {
+        plan.rate?;
+        Some(match plan.c2 {
+            Some(grind) => Self::C2(Compressed2Format {
+                grind,
+                wire: plan.wire,
+            }),
+            None => Self::C1(CompressedFormat {
+                levers: plan.levers,
+                wire: plan.wire,
+            }),
+        })
+    }
+
+    /// The file's tag.
+    pub fn tag(&self) -> Result<u8, String> {
+        match self {
+            Self::C1(format) => format.tag(),
+            Self::C2(format) => format.tag(),
+        }
+    }
+
+    /// The file's encoding.
+    pub fn wire(&self) -> super::wire::WireFormat {
+        match self {
+            Self::C1(format) => format.wire,
+            Self::C2(format) => format.wire,
+        }
+    }
+}
+
+/// ★ The file a run ships by default ([`super::compress::DEFAULT_PLAN`]): what
+/// `cli verify-block` verifies unless told the top's file.
+pub const DEFAULT_SHIPPED: ShippedFormat = match super::compress::DEFAULT_COMPRESS2 {
+    Some(grind) => ShippedFormat::C2(Compressed2Format {
+        grind,
+        wire: super::compress::DEFAULT_WIRE,
+    }),
+    None => ShippedFormat::C1(CompressedFormat {
+        levers: super::compress::DEFAULT_C1_LEVERS,
+        wire: super::compress::DEFAULT_WIRE,
+    }),
+};
+
+/// A shipped file's bytes read back in `format`'s encoding (the CALLER'S
+/// constant): the rkyv reader for an rkyv format, the compact reader otherwise.
+/// The verifier checks the tag after.
+pub fn read_shipped(
+    bytes: &[u8],
+    format: ShippedFormat,
+) -> Result<WhirBlockCompressedProof, String> {
+    match format.wire() {
+        super::wire::WireFormat::Rkyv => WhirBlockCompressedProof::from_bytes(bytes),
+        _ => WhirBlockCompressedProof::from_compact_bytes(bytes),
+    }
+}
+
+/// ★ A shipped W3 block file verified as `format` — the CALLER'S constant,
+/// never the file's: C1's verifier ([`verify_whir_block_compressed_as`]) or
+/// C2's ([`verify_whir_block_compressed2_as`]), each checking the file's tag
+/// first.
+pub fn verify_whir_block_shipped_as(
+    elf_bytes: &[u8],
+    proof: &WhirBlockCompressedProof,
+    format: ShippedFormat,
+) -> Result<(), String> {
+    match format {
+        ShippedFormat::C1(format) => verify_whir_block_compressed_as(elf_bytes, proof, format),
+        ShippedFormat::C2(format) => verify_whir_block_compressed2_as(elf_bytes, proof, format),
+    }
+}
+
+impl CompressedTop {
+    /// The plan this run proved under.
+    pub fn plan(&self) -> super::compress::CompressPlan {
+        super::compress::CompressPlan {
+            rate: Some(self.rate),
+            levers: self.levers,
+            wire: self.wire,
+            c2: self.c2.as_ref().map(|c2| c2.grind),
+        }
+    }
+
+    /// The file this run ships for `statement`, and its bytes: C2's when C2
+    /// ran, C1's otherwise, in the run's encoding.
+    pub fn shipped(
+        &self,
+        statement: block_whir::OwnedBlockStatement,
+    ) -> Result<(ShippedFormat, rkyv::util::AlignedVec), String> {
+        let format = ShippedFormat::of(self.plan()).ok_or("a compressed run ships a file")?;
+        let file = match &self.c2 {
+            Some(c2) => WhirBlockCompressedProof::for_c2(statement, c2.proof.clone(), c2.grind)?,
+            None => {
+                WhirBlockCompressedProof::for_levers(statement, self.proof.clone(), self.levers)?
+            }
+        };
+        Ok((format, file.to_wire_bytes(self.wire)?))
+    }
+}
+
 /// ★ A twice-compressed W3 block file verified as `format` — the CALLER'S
 /// constant, never the file's: the file's tag must be `format`'s before
 /// anything else is read; then the plan is derived from the trusted ELF and
@@ -4534,6 +4646,39 @@ mod tests {
         }
     }
 
+    /// The default shipped format is the default plan's file, its tag one a
+    /// verifier reads, and the rollback plan ships no compressed file.
+    #[test]
+    fn the_default_shipped_file_is_the_default_plans() {
+        use super::super::compress::{DEFAULT_PLAN, UNCOMPRESSED_PLAN};
+        assert_eq!(ShippedFormat::of(DEFAULT_PLAN), Some(DEFAULT_SHIPPED));
+        assert_eq!(ShippedFormat::of(UNCOMPRESSED_PLAN), None);
+        let tag = DEFAULT_SHIPPED.tag().expect("a verifier reads it");
+        assert!((2..=25).contains(&tag));
+        let c1 = synthetic_compressed();
+        let file = match DEFAULT_SHIPPED {
+            ShippedFormat::C2(f) => WhirBlockCompressedProof::for_c2(
+                c1.statement().to_owned(),
+                c1.compressed.clone(),
+                f.grind,
+            ),
+            ShippedFormat::C1(f) => WhirBlockCompressedProof::for_levers(
+                c1.statement().to_owned(),
+                c1.compressed.clone(),
+                f.levers,
+            ),
+        }
+        .expect("a tagged file");
+        let bytes = file
+            .to_wire_bytes(DEFAULT_SHIPPED.wire())
+            .expect("the shipped bytes");
+        let back = read_shipped(&bytes, DEFAULT_SHIPPED).expect("reads back");
+        assert_eq!(back.pipeline(), tag);
+        let e = verify_whir_block_shipped_as(&[], &back, DEFAULT_SHIPPED).expect_err("no ELF");
+        assert!(!e.contains("and this verifier reads pipeline"), "{e}");
+        assert!(WhirBlockTreeProof::from_bytes(&bytes).is_err());
+    }
+
     /// The twice-compressed verifier takes C2's rate, levers and C1's from
     /// the code: its body checks the caller's tag first and reads neither the
     /// environment nor the file for a format; `verify_compressed2` derives C1
@@ -4767,10 +4912,10 @@ mod tests {
             exec_early: true,
             node_times: false,
             leaf_first: true,
-            compress: None,
-            compress_levers: super::super::wlfm::WlfmLevers::DEFAULT,
-            compress_wire: super::super::wire::WireFormat::Rkyv,
-            compress2: None,
+            compress: super::super::compress::DEFAULT_PLAN.rate,
+            compress_levers: super::super::compress::DEFAULT_PLAN.levers,
+            compress_wire: super::super::compress::DEFAULT_PLAN.wire,
+            compress2: super::super::compress::DEFAULT_PLAN.c2,
         };
         assert!(production.at_presets());
         let off = |f: fn(&mut WhirTreeConfig)| {

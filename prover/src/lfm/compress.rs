@@ -14,43 +14,46 @@
 //! ([`super::whir_block::top_claims`]) is checked on C1's words unchanged.
 //! There is no bus to close and no sibling to bind: the top closed the bus.
 //!
-//! # Off by default
+//! # On by default
 //!
-//! `LAMBDA_VM_BLOCK_COMPRESS` ([`compress_setting`]) unset is today's pipeline
-//! byte for byte: no program is emitted, no proof is made, the top ships. Set,
-//! the prover adds C1 after the top; the file it ships is another pipeline
-//! (`whir_block_tree::WhirBlockCompressedProof`), whose verifier takes the rate
-//! as its own constant ([`COMPRESS_RATE`]), never from the proof.
+//! The block ships a compressed file: [`DEFAULT_PLAN`] is what a run proves
+//! when no knob says otherwise ([`compress_plan`]): C1 after the top, C2 after
+//! C1 when [`DEFAULT_COMPRESS2`] names a grind, the file in
+//! [`DEFAULT_WIRE`]'s encoding. Each knob's off word is the rollback:
+//! `LAMBDA_VM_BLOCK_COMPRESS=0` is the uncompressed pipeline (no program
+//! emitted, no proof made, the top's file ships). The file is another
+//! pipeline (`whir_block_tree::WhirBlockCompressedProof`), whose verifier takes
+//! the rates and levers as its own constants ([`COMPRESS_RATE`],
+//! [`COMPRESS2_RATE`]), never from the proof.
 //!
 //! # How C1 binds its own program
 //!
 //! C1's proof is the pipeline's last, verified on the host, which derives C1's
-//! program anyway. `LAMBDA_VM_BLOCK_COMPRESS_EVAL` ([`compress_prep_setting`];
-//! default off) proves it under [`WlfmPrep::Evaluated`]: the verifier evaluates
-//! C1's instruction columns itself, so the proof carries no prepared chain.
-//! Unset is [`WlfmPrep::Stacked`], today's C1 byte for byte; the pinned
-//! verifier checks [`COMPRESS_PREP`], the evaluated arm has its own verifier.
+//! program anyway. `LAMBDA_VM_BLOCK_COMPRESS_EVAL` ([`compress_prep_setting`])
+//! proves it under [`WlfmPrep::Evaluated`]: the verifier evaluates C1's
+//! instruction columns itself, so the proof carries no prepared chain. C1's
+//! levers default to [`DEFAULT_C1_LEVERS`] (stacked when C2 verifies C1
+//! in-guest); any C1 lever word sets all three; each file names its verifier.
 //!
 //! # Where C1's chains stop committing
 //!
-//! `LAMBDA_VM_BLOCK_COMPRESS_FINAL` ([`compress_final_setting`]; default off)
-//! proves C1's chains under [`FinalPoly::Vars`]([`COMPRESS_FINAL_VARS`]): each
+//! `LAMBDA_VM_BLOCK_COMPRESS_FINAL` ([`compress_final_setting`]) proves C1's
+//! chains under [`FinalPoly::Vars`]([`COMPRESS_FINAL_VARS`]): each
 //! chain sends its folded polynomial once at most that many variables remain,
 //! instead of committing and opening the rounds that would fold it to a
-//! constant. Unset is today's chains. Its files have verifiers of their own.
+//! constant. Its files have verifiers of their own.
 //!
 //! # The second step (C2)
 //!
-//! `LAMBDA_VM_BLOCK_COMPRESS2` ([`compress2_setting`]; default off) adds a
-//! second W-LFM proof after C1: a program whose one child is C1's proof, which
+//! `LAMBDA_VM_BLOCK_COMPRESS2` ([`compress2_setting`]; default
+//! [`DEFAULT_COMPRESS2`], none: opt-in) adds a second W-LFM proof after C1: a program whose one child is C1's proof, which
 //! it verifies in-guest ([`super::wlfm_leg`]) and whose words it republishes
 //! in order, so its words are still the top's. C1 then stays in-guest
 //! checkable (stacked binding, today's chains: any C1 lever knob is refused)
 //! and C2 — the proof that ships, verified on the host — takes the format
 //! levers: blowup 64 ([`COMPRESS2_RATE`]), the verifier's own columns, the
 //! byte-minimising schedule, and a query grind of 22 or 26 bits
-//! ([`compress2_levers`]). Unset is today's pipeline, C1 and its files byte
-//! for byte.
+//! ([`compress2_levers`]). `LAMBDA_VM_BLOCK_COMPRESS2=0` ships C1's file.
 
 use super::block_node::BlockLayout;
 use super::builder::LfmBuilder;
@@ -74,13 +77,14 @@ pub const COMPRESS_ENV: &str = "LAMBDA_VM_BLOCK_COMPRESS";
 /// verifier, never read from a proof or the environment.
 pub const COMPRESS_RATE: WlfmRate = WlfmRate::Sixteen;
 
-/// [`COMPRESS_ENV`]'s value: unset, `0` or `off` is no compression (the
-/// default); `1` or `16` is C1 at blowup 16 ([`COMPRESS_RATE`]); `2` and `4`
-/// are C1 at those rates, measurement arms whose files no pinned verifier
-/// takes. Anything else is refused.
+/// [`COMPRESS_ENV`]'s value: unset is [`DEFAULT_COMPRESS`]; `0` or `off` is
+/// no compression (the rollback: the top's file ships); `1` or `16` is C1 at
+/// blowup 16 ([`COMPRESS_RATE`]); `2` and `4` are C1 at those rates,
+/// measurement arms whose files no pinned verifier takes. Anything else is
+/// refused.
 pub fn compress_setting(value: Option<&str>) -> Result<Option<WlfmRate>, String> {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
-        None => Ok(None),
+        None => Ok(DEFAULT_COMPRESS),
         Some(v) => match v.as_str() {
             "" | "0" | "off" => Ok(None),
             "1" | "16" => Ok(Some(WlfmRate::Sixteen)),
@@ -91,11 +95,6 @@ pub fn compress_setting(value: Option<&str>) -> Result<Option<WlfmRate>, String>
             )),
         },
     }
-}
-
-/// [`compress_setting`] of the process's environment.
-pub fn compress_from_env() -> Result<Option<WlfmRate>, String> {
-    compress_setting(std::env::var(COMPRESS_ENV).ok().as_deref())
 }
 
 /// The knob that proves C1 with its instruction columns evaluated by the
@@ -153,10 +152,11 @@ pub fn compress_final_setting(value: Option<&str>) -> Result<FinalPoly, String> 
 /// ([`super::wire`]): C1's proof without archive headers.
 pub const COMPRESS_WIRE_ENV: &str = "LAMBDA_VM_BLOCK_COMPRESS_WIRE";
 
-/// [`COMPRESS_WIRE_ENV`]'s value: unset, `0` or `off` is the rkyv file (the
-/// default); `1`, `on` or `compact` is the compact file; `2` or `dedup` is the
-/// compact file with repeated Merkle siblings sent once. Anything else is
-/// refused.
+/// [`COMPRESS_WIRE_ENV`]'s word: `0` or `off` is the rkyv file; `1`, `on` or
+/// `compact` is the compact file; `2` or `dedup` is the compact file with
+/// repeated Merkle siblings sent once. Anything else is refused. No word
+/// (`None`) parses as the rkyv file; [`compress_plan`] gives an unset knob
+/// [`DEFAULT_WIRE`] when the run compresses.
 pub fn compress_wire_setting(value: Option<&str>) -> Result<WireFormat, String> {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
         None => Ok(WireFormat::Rkyv),
@@ -169,18 +169,6 @@ pub fn compress_wire_setting(value: Option<&str>) -> Result<WireFormat, String> 
             )),
         },
     }
-}
-
-/// [`compress_wire_setting`] of the process's environment, refused when it is
-/// set with no compression step to ship.
-pub fn compress_wire_from_env(compress: Option<WlfmRate>) -> Result<WireFormat, String> {
-    let compact = compress_wire_setting(std::env::var(COMPRESS_WIRE_ENV).ok().as_deref())?;
-    if compress.is_none() && compact != WireFormat::Rkyv {
-        return Err(format!(
-            "{COMPRESS_WIRE_ENV} encodes C1's file, and {COMPRESS_ENV} adds no C1"
-        ));
-    }
-    Ok(compact)
 }
 
 /// The knob that proves C1's chains on the byte-minimising schedule: every
@@ -219,39 +207,6 @@ pub fn compress_folds_setting(value: Option<&str>) -> Result<bool, String> {
     }
 }
 
-/// C1's format levers from the process's environment
-/// ([`compress_prep_setting`], [`compress_final_setting`],
-/// [`compress_folds_setting`]), refused when one is set with no compression
-/// step to apply it to, or when both chain levers are (the schedule sets its
-/// own final polynomial).
-pub fn compress_levers_from_env(compress: Option<WlfmRate>) -> Result<WlfmLevers, String> {
-    let prep = compress_prep_setting(std::env::var(COMPRESS_EVAL_ENV).ok().as_deref())?;
-    let final_poly = compress_final_setting(std::env::var(COMPRESS_FINAL_ENV).ok().as_deref())?;
-    let folds = compress_folds_setting(std::env::var(COMPRESS_FOLDS_ENV).ok().as_deref())?;
-    if folds && final_poly != FinalPoly::Off {
-        return Err(format!(
-            "{COMPRESS_FOLDS_ENV} sets C1's final polynomial itself; unset {COMPRESS_FINAL_ENV}"
-        ));
-    }
-    let levers = if folds {
-        folds_levers(prep)
-    } else {
-        WlfmLevers {
-            prep,
-            final_poly,
-            fold: None,
-            grind: None,
-        }
-    };
-    if compress.is_none() && levers != WlfmLevers::DEFAULT {
-        return Err(format!(
-            "{COMPRESS_EVAL_ENV}, {COMPRESS_FINAL_ENV} and {COMPRESS_FOLDS_ENV} shape C1, and \
-             {COMPRESS_ENV} adds no C1"
-        ));
-    }
-    Ok(levers)
-}
-
 /// The knob that adds the second compression step C2 over C1.
 pub const COMPRESS2_ENV: &str = "LAMBDA_VM_BLOCK_COMPRESS2";
 
@@ -274,9 +229,11 @@ pub const fn compress2_levers(grind: u8) -> WlfmLevers {
     }
 }
 
-/// [`COMPRESS2_ENV`]'s value: unset, `0` or `off` is no second step (the
-/// default); `1` or `22` is C2 at a 22-bit query grind; `26` at 26 bits.
-/// Anything else is refused.
+/// [`COMPRESS2_ENV`]'s word: `0` or `off` is no second step (the rollback:
+/// C1's file ships); `1` or `22` is C2 at a 22-bit query grind; `26` at 26
+/// bits. Anything else is refused. No word (`None`) parses as no step;
+/// [`compress_plan`] gives an unset knob [`DEFAULT_COMPRESS2`] when C1 runs
+/// at its default.
 pub fn compress2_setting(value: Option<&str>) -> Result<Option<u8>, String> {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
         None => Ok(None),
@@ -291,18 +248,9 @@ pub fn compress2_setting(value: Option<&str>) -> Result<Option<u8>, String> {
     }
 }
 
-/// [`compress2_setting`] of the process's environment, refused unless C1 is
-/// on at [`COMPRESS_RATE`] with today's levers (`c1_levers`): C2 verifies C1
-/// in-guest, which checks a stacked C1 on today's chains only.
-pub fn compress2_from_env(
-    compress: Option<WlfmRate>,
-    c1_levers: WlfmLevers,
-) -> Result<Option<u8>, String> {
-    let grind = compress2_setting(std::env::var(COMPRESS2_ENV).ok().as_deref())?;
-    compress2_checked(grind, compress, c1_levers)
-}
-
-/// [`compress2_from_env`]'s rule on a parsed setting.
+/// The rule on a C2 word: refused unless C1 is on at [`COMPRESS_RATE`] with
+/// today's levers (`c1_levers`), since C2 verifies C1 in-guest, which checks
+/// a stacked C1 on today's chains only.
 pub fn compress2_checked(
     grind: Option<u8>,
     compress: Option<WlfmRate>,
@@ -322,6 +270,143 @@ pub fn compress2_checked(
         }
     }
     Ok(grind)
+}
+
+/// The compression a run adds when no knob says otherwise: C1 at blowup 16.
+pub const DEFAULT_COMPRESS: Option<WlfmRate> = Some(COMPRESS_RATE);
+
+/// C2's query grind when no knob says otherwise; `None` ships C1's file.
+/// C2 is opt-in (`LAMBDA_VM_BLOCK_COMPRESS2=22|26`): its tail after C1 is
+/// ≈ 1.9 s on the median block, against ≈ 0.6 s for C1.
+pub const DEFAULT_COMPRESS2: Option<u8> = None;
+
+/// C1's levers when no C1 lever knob is set: today's when C2 verifies C1
+/// in-guest, else the one-step format (the evaluated columns on the
+/// byte-minimising schedule).
+pub const DEFAULT_C1_LEVERS: WlfmLevers = match DEFAULT_COMPRESS2 {
+    Some(_) => WlfmLevers::DEFAULT,
+    None => folds_levers(WlfmPrep::Evaluated),
+};
+
+/// The shipped file's encoding when no knob says otherwise and the run
+/// compresses: compact, with repeated Merkle siblings sent once.
+pub const DEFAULT_WIRE: WireFormat = WireFormat::Dedup;
+
+/// The compression a block run proves and ships: C1's rate (none: the top's
+/// file ships) and levers, C2's grind (none: C1's file ships), and the file's
+/// encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressPlan {
+    pub rate: Option<WlfmRate>,
+    pub levers: WlfmLevers,
+    pub wire: WireFormat,
+    pub c2: Option<u8>,
+}
+
+/// What a run proves and ships with no compression knob set.
+pub const DEFAULT_PLAN: CompressPlan = CompressPlan {
+    rate: DEFAULT_COMPRESS,
+    levers: DEFAULT_C1_LEVERS,
+    wire: DEFAULT_WIRE,
+    c2: DEFAULT_COMPRESS2,
+};
+
+/// The rollback plan (`LAMBDA_VM_BLOCK_COMPRESS=0`): no compression, the
+/// top's file.
+pub const UNCOMPRESSED_PLAN: CompressPlan = CompressPlan {
+    rate: None,
+    levers: WlfmLevers::DEFAULT,
+    wire: WireFormat::Rkyv,
+    c2: None,
+};
+
+/// ★ The run's compression from its knobs, read through `lookup` (the
+/// process environment in production, a map in tests). Every knob unset is
+/// [`DEFAULT_PLAN`]. A set knob wins over the defaults:
+///
+/// - `LAMBDA_VM_BLOCK_COMPRESS=0` is [`UNCOMPRESSED_PLAN`]; any other
+///   compression word beside it is refused.
+/// - Any C1 lever word (`_EVAL`, `_FINAL`, `_FOLDS`) sets all three (unset
+///   ones off) and, with `LAMBDA_VM_BLOCK_COMPRESS2` unset, drops C2's default
+///   (C2 verifies only a C1 with today's levers); `_FOLDS` and `_FINAL` refuse
+///   each other.
+/// - `LAMBDA_VM_BLOCK_COMPRESS2` set to a grind needs C1 at blowup 16 with
+///   today's levers; `0` ships C1's file, whose levers are then
+///   [`DEFAULT_C1_LEVERS`] unless a lever word says otherwise.
+/// - `LAMBDA_VM_BLOCK_COMPRESS_WIRE` unset is [`DEFAULT_WIRE`] when the run
+///   compresses, the rkyv file otherwise.
+pub fn compress_plan(lookup: impl Fn(&str) -> Option<String>) -> Result<CompressPlan, String> {
+    let rate = compress_setting(lookup(COMPRESS_ENV).as_deref())?;
+    let words = [COMPRESS_EVAL_ENV, COMPRESS_FINAL_ENV, COMPRESS_FOLDS_ENV].map(&lookup);
+    let lever_words = words.iter().any(Option::is_some);
+    let prep = compress_prep_setting(words[0].as_deref())?;
+    let final_poly = compress_final_setting(words[1].as_deref())?;
+    let folds = compress_folds_setting(words[2].as_deref())?;
+    if folds && final_poly != FinalPoly::Off {
+        return Err(format!(
+            "{COMPRESS_FOLDS_ENV} sets C1's final polynomial itself; unset {COMPRESS_FINAL_ENV}"
+        ));
+    }
+    let explicit = if folds {
+        folds_levers(prep)
+    } else {
+        WlfmLevers {
+            prep,
+            final_poly,
+            fold: None,
+            grind: None,
+        }
+    };
+    if rate.is_none() && explicit != WlfmLevers::DEFAULT {
+        return Err(format!(
+            "{COMPRESS_EVAL_ENV}, {COMPRESS_FINAL_ENV} and {COMPRESS_FOLDS_ENV} shape C1, and \
+             {COMPRESS_ENV} adds no C1"
+        ));
+    }
+    let c2_word = lookup(COMPRESS2_ENV);
+    let c2 = match &c2_word {
+        Some(word) => {
+            let c1_levers = if lever_words {
+                explicit
+            } else {
+                WlfmLevers::DEFAULT
+            };
+            compress2_checked(compress2_setting(Some(word))?, rate, c1_levers)?
+        }
+        None if rate == Some(COMPRESS_RATE) && !lever_words => DEFAULT_COMPRESS2,
+        None => None,
+    };
+    let levers = if lever_words {
+        explicit
+    } else if c2.is_none() && rate == Some(COMPRESS_RATE) {
+        DEFAULT_C1_LEVERS
+    } else {
+        WlfmLevers::DEFAULT
+    };
+    let wire = match lookup(COMPRESS_WIRE_ENV) {
+        Some(word) => {
+            let wire = compress_wire_setting(Some(&word))?;
+            if rate.is_none() && wire != WireFormat::Rkyv {
+                return Err(format!(
+                    "{COMPRESS_WIRE_ENV} encodes the compressed file, and {COMPRESS_ENV} adds no C1"
+                ));
+            }
+            wire
+        }
+        None if rate.is_some() => DEFAULT_WIRE,
+        None => WireFormat::Rkyv,
+    };
+    Ok(CompressPlan {
+        rate,
+        levers,
+        wire,
+        c2,
+    })
+}
+
+/// [`compress_plan`] over the process's environment.
+pub fn compress_plan_from_env() -> Result<CompressPlan, String> {
+    compress_plan(|name| std::env::var(name).ok())
 }
 
 /// Emits C1 into `b`: the top's arenas, its leg, and every published word of
@@ -538,11 +623,11 @@ pub fn verify_compressed2(
 mod tests {
     use super::*;
 
-    /// The second step's knob is off unless set, refuses nonsense, needs C1
-    /// at blowup 16 with today's levers, and its levers are the evaluated
-    /// columns on the byte-minimising schedule at the grind.
+    /// The second step's word parses, refuses nonsense, needs C1 at blowup 16
+    /// with today's levers, and its levers are the evaluated columns on the
+    /// byte-minimising schedule at the grind.
     #[test]
-    fn the_compress2_knob_is_off_unless_set_and_refuses_nonsense() {
+    fn the_compress2_word_parses_and_refuses_nonsense() {
         assert_eq!(compress2_setting(None), Ok(None));
         for off in ["", "0", "off", " OFF "] {
             assert_eq!(compress2_setting(Some(off)), Ok(None), "{off:?}");
@@ -580,9 +665,91 @@ mod tests {
         assert_eq!(COMPRESS2_GRINDS, [22, 26]);
     }
 
+    fn plan(words: &[(&str, &str)]) -> Result<CompressPlan, String> {
+        compress_plan(|name| {
+            words
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
+    /// ★ No knob is the default plan, and each knob's off word rolls its step
+    /// back: no compression at all, or C1's file without C2.
     #[test]
-    fn the_compress_knob_is_off_unless_set_and_refuses_nonsense() {
-        assert_eq!(compress_setting(None), Ok(None));
+    fn the_default_plan_and_each_knobs_rollback() {
+        assert_eq!(plan(&[]), Ok(DEFAULT_PLAN));
+        assert_eq!(DEFAULT_PLAN.rate, Some(COMPRESS_RATE));
+        assert_eq!(DEFAULT_PLAN.wire, WireFormat::Dedup);
+        if let Some(grind) = DEFAULT_PLAN.c2 {
+            assert!(COMPRESS2_GRINDS.contains(&grind));
+            assert_eq!(
+                DEFAULT_PLAN.levers,
+                WlfmLevers::DEFAULT,
+                "C2 verifies C1 in-guest"
+            );
+        } else {
+            assert_eq!(DEFAULT_PLAN.levers, folds_levers(WlfmPrep::Evaluated));
+        }
+        for off in ["0", "off", ""] {
+            assert_eq!(
+                plan(&[(COMPRESS_ENV, off)]),
+                Ok(UNCOMPRESSED_PLAN),
+                "{off:?}"
+            );
+        }
+        // C2 rolled back: C1's file, C1 at its default levers for a file the
+        // host verifies.
+        let c1_only = plan(&[(COMPRESS2_ENV, "0")]).expect("C1 alone");
+        assert_eq!(c1_only.c2, None);
+        assert_eq!(c1_only.rate, Some(COMPRESS_RATE));
+        assert_eq!(c1_only.levers, DEFAULT_C1_LEVERS);
+        // The encoding rolled back: the rkyv file.
+        assert_eq!(
+            plan(&[(COMPRESS_WIRE_ENV, "0")]).map(|p| p.wire),
+            Ok(WireFormat::Rkyv)
+        );
+    }
+
+    /// A set knob wins over the defaults: a C1 lever word drops C2's default
+    /// and sets all three levers; an explicit grind needs today's C1; a
+    /// compression word beside `LAMBDA_VM_BLOCK_COMPRESS=0` is refused.
+    #[test]
+    fn a_set_knob_wins_over_the_default_plan() {
+        let eval = plan(&[(COMPRESS_EVAL_ENV, "1")]).expect("C1 evaluated");
+        assert_eq!(eval.c2, None);
+        assert_eq!(eval.levers, WlfmLevers::with_prep(WlfmPrep::Evaluated));
+        let folds = plan(&[(COMPRESS_FOLDS_ENV, "1")]).expect("C1 on the schedule");
+        assert_eq!(folds.levers, folds_levers(WlfmPrep::Stacked));
+        assert_eq!(folds.c2, None);
+        for grind in ["22", "26"] {
+            let p = plan(&[(COMPRESS2_ENV, grind)]).expect("C2 at a grind");
+            assert_eq!(p.c2, Some(grind.parse().unwrap()));
+            assert_eq!(p.levers, WlfmLevers::DEFAULT);
+            assert!(plan(&[(COMPRESS2_ENV, grind), (COMPRESS_EVAL_ENV, "1")]).is_err());
+            assert!(plan(&[(COMPRESS2_ENV, grind), (COMPRESS_ENV, "0")]).is_err());
+            assert!(plan(&[(COMPRESS2_ENV, grind), (COMPRESS_ENV, "4")]).is_err());
+        }
+        assert!(plan(&[(COMPRESS_FOLDS_ENV, "1"), (COMPRESS_FINAL_ENV, "1")]).is_err());
+        for word in [COMPRESS_EVAL_ENV, COMPRESS_FOLDS_ENV, COMPRESS_FINAL_ENV] {
+            assert!(plan(&[(COMPRESS_ENV, "0"), (word, "1")]).is_err(), "{word}");
+            assert!(plan(&[(COMPRESS_ENV, "0"), (word, "0")]).is_ok(), "{word}");
+        }
+        assert!(plan(&[(COMPRESS_ENV, "0"), (COMPRESS_WIRE_ENV, "dedup")]).is_err());
+        assert_eq!(
+            plan(&[(COMPRESS_ENV, "0"), (COMPRESS2_ENV, "0")]),
+            Ok(UNCOMPRESSED_PLAN)
+        );
+        // A measurement rate keeps today's C1 and no C2.
+        let four = plan(&[(COMPRESS_ENV, "4")]).expect("C1 at blowup 4");
+        assert_eq!((four.levers, four.c2), (WlfmLevers::DEFAULT, None));
+        assert!(plan(&[(COMPRESS2_ENV, "18")]).is_err());
+    }
+
+    #[test]
+    fn the_compress_knob_is_on_unless_set_off_and_refuses_nonsense() {
+        assert_eq!(compress_setting(None), Ok(DEFAULT_COMPRESS));
+        assert_eq!(DEFAULT_COMPRESS, Some(WlfmRate::Sixteen));
         for off in ["", "0", "off", " OFF "] {
             assert_eq!(compress_setting(Some(off)), Ok(None), "{off:?}");
         }
@@ -660,9 +827,9 @@ mod tests {
         );
     }
 
-    /// The compact-file knob is off unless set and refuses nonsense.
+    /// The file-encoding word parses and refuses nonsense.
     #[test]
-    fn the_compress_wire_knob_is_off_unless_set_and_refuses_nonsense() {
+    fn the_compress_wire_word_parses_and_refuses_nonsense() {
         assert_eq!(compress_wire_setting(None), Ok(WireFormat::Rkyv));
         for off in ["", "0", "off", " OFF "] {
             assert_eq!(compress_wire_setting(Some(off)), Ok(WireFormat::Rkyv));

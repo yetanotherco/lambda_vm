@@ -82,7 +82,10 @@ match the value used during proving.
 ### Prove a block
 
 Prove a whole block as a recursion tree: the block's WHIR base proof, the leaves that verify its groups, the nodes
-and the top. A consumer verifies the one top proof against the ELF with `verify-block`. Needs a CUDA build
+and the top, then the compression step after the top (C1: an LFM program that verifies the top, proved by the
+block's WHIR prover at blowup 16 with the verifier's own instruction columns, fold 5 and a final polynomial). The
+file it writes is the compressed one: one WHIR proof (≈ 450 KB on a median block, against ≈ 5.4 MB for the top's
+file) that carries the block's statement and the top's words. A consumer verifies it against the ELF with `verify-block`. Needs a CUDA build
 (`cargo build --release -p cli --features cuda`).
 
 ```sh
@@ -95,6 +98,7 @@ cli prove-block <PROGRAM.elf> --input <BLOCK.bin> -o block.proof [--time] [--dig
 | `-o, --output <FILE>` | Output path for the block proof. Required. |
 | `--time` | Print the whole run's wall, base to top node. |
 | `--digest` | Print the blake3 digest of the top proof's bytes. |
+| `--tree-file` | Write the tree's top file instead of the compressed one (no compression proved). |
 
 stdout carries the public output and the requested numbers; the run's progress lines go to stderr.
 
@@ -106,6 +110,11 @@ prove and verify under the same environment. The binary compiles in jemalloc's n
 leaf count, fan-in and argue format are the block verifier's; `W3_LEAVES`, `W3_FAN_IN` and `BLOCK_WHIR_ARGUE`
 (harness arms) are refused.
 
+The compressed file's format is the CLI's constant (`whir_block_tree::DEFAULT_SHIPPED`), and it is proved at the
+pinned format only (every format flag at its default). The compression knobs (`LAMBDA_VM_BLOCK_COMPRESS*`,
+`prover/src/lfm/compress.rs`) default to that format; a knob that makes another file is refused. To ship the top's
+file, at any format flags, give `--tree-file` (and `verify-block --tree-file`).
+
 ### Verify a block
 
 ```sh
@@ -113,8 +122,10 @@ cli verify-block <block.proof> <PROGRAM.elf> [--time]
 ```
 
 Derives the block's recursion plan and top program from the ELF and the proof's claimed statement under the block
-presets, verifies the top proof against that program, and checks it claims the ELF's id and the output. Prints the
-public output. Returns exit code `0` on success, `1` on failure.
+presets, then the compression programs over the derived top (never from the file), verifies the compressed proof
+against the last of them, and checks it claims the ELF's id and the output. The file is read and verified as the
+CLI's compressed format; its tag must be that format's. Prints the public output. Returns exit code `0` on success,
+`1` on failure. `--tree-file` verifies a top's file (`prove-block --tree-file`) under the format flags given.
 
 ### Count Elements
 
