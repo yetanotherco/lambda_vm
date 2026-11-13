@@ -70,8 +70,7 @@ fn walked(program: &Elf, max_rows: &MaxRowsConfig, window: usize) -> Walked {
         scope.spawn(move || {
             let mut fast = FastExecutor::new(program, Vec::new()).expect("the fast engine");
             fast.enable_history().expect("history mode");
-            while let Some((window_logs, history)) = fast.resume_history(window).expect("the run")
-            {
+            while let Some((window_logs, history)) = fast.resume_history(window).expect("the run") {
                 logs.lock()
                     .expect("the logs")
                     .extend_from_slice(&window_logs);
@@ -163,7 +162,9 @@ fn check(name: &str, run: &Walked, held: &[(u64, u64)], tally: &mut Tally) {
             continue;
         };
         tally.planned += 1;
-        let RegisterPlan { words, whole, why, .. } = &plan;
+        let RegisterPlan {
+            words, whole, why, ..
+        } = &plan;
         tally.why = WholeRows {
             ecall: tally.why.ecall + why.ecall,
             after_ecall: tally.why.after_ecall + why.after_ecall,
@@ -240,7 +241,12 @@ fn the_card_built_register_rows_are_the_walks_rows() {
             let cpu = max_rows.cpu as u64;
             let tables = walked.logs.len() as u64 / cpu;
             let held: Vec<(u64, u64)> = (0..tables).map(|k| (k * cpu, cpu)).collect();
-            check(&format!("{name}, window {window}"), &walked, &held, &mut tally);
+            check(
+                &format!("{name}, window {window}"),
+                &walked,
+                &held,
+                &mut tally,
+            );
             // Every other CPU table: their rows cross whole.
             let some: Vec<(u64, u64)> = held.iter().copied().step_by(2).collect();
             check(
@@ -252,7 +258,10 @@ fn the_card_built_register_rows_are_the_walks_rows() {
         }
     }
     println!("REGISTER RULE: {tally:?} · half held {sparse:?}");
-    assert!(tally.planned > 0 && tally.built > 0, "no row built: {tally:?}");
+    assert!(
+        tally.planned > 0 && tally.built > 0,
+        "no row built: {tally:?}"
+    );
     let w = tally.why;
     assert!(
         w.ecall > 0 && w.after_ecall > 0 && w.before_table > 0,
@@ -310,7 +319,9 @@ fn raw<T: Copy>(v: &[T]) -> &[u8] {
 }
 
 fn put(out: &mut Vec<u8>, words: &[u64]) {
-    words.iter().for_each(|w| out.extend_from_slice(&w.to_le_bytes()));
+    words
+        .iter()
+        .for_each(|w| out.extend_from_slice(&w.to_le_bytes()));
 }
 
 fn put_plan(out: &mut Vec<u8>, plan: &RegisterPlan) {
