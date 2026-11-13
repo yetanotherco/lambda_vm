@@ -222,11 +222,11 @@ def minComponent : Component (F p) where
 /-- The ALU messages of MIN: read as an ALU message, the flag field is `opsel(MIN)`. -/
 def isMinMsg (msg : Array (F p)) : Bool :=
   if h : msg.size = size Alu.Msg then
-    decide ((fromElements (⟨msg, h⟩ : Vector (F p) (size Alu.Msg)) : Alu.Msg (F p)).flags = 7)
+    decide ((fromElements (⟨msg, h⟩ : Vector (F p) (size Alu.Msg)) : Alu.Msg (F p)).flags = 9)
   else false
 
 lemma isMinMsg_toElements (m : Alu.Msg (F p)) :
-    isMinMsg (toElements m).toArray = decide (m.flags = 7) := by
+    isMinMsg (toElements m).toArray = decide (m.flags = 9) := by
   simp [isMinMsg, ProvableType.fromElements_toElements]
 
 /-- The message of an evaluated interaction, as the evaluated typed message. -/

@@ -34,8 +34,8 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   -- out = lt ? a : b
   assertZero (r.out0 - (r.lt * r.a0 + (1 - r.lt) * r.b0))
   assertZero (r.out1 - (r.lt * r.a1 + (1 - r.lt) * r.b1))
-  -- ALU[a, b, opsel(MIN)] -> out
-  Alu.channel.pushIf r.mu ⟨r.a0, r.a1, r.b0, r.b1, 7, r.out0, r.out1⟩
+  -- ALU[a, b, opsel(MIN) = 9] -> out
+  Alu.channel.pushIf r.mu ⟨r.a0, r.a1, r.b0, r.b1, 9, r.out0, r.out1⟩
 
 lemma val_lit (n : ℕ) (h : n < 2^40) : ((n : F p)).val = n :=
   ZMod.val_natCast_of_lt (lt_p_of_lt_two_pow_40 h)
@@ -55,10 +55,10 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     obtain ⟨-, h_pull, h_o0, h_o1⟩ := h_holds
     intro _
     have h4 : (4 : F p).val = 4 := by simpa using val_lit 4 (by norm_num)
-    have h7 : (7 : F p).val = 7 := by simpa using val_lit 7 (by norm_num)
+    have h9 : (9 : F p).val = 9 := by simpa using val_lit 9 (by norm_num)
     obtain ⟨hLT, -⟩ := h_pull
-    rw [h7]
-    -- only the MIN clause applies to flags = 7; it carries its own `IS_WORD` hypotheses
+    rw [h9]
+    -- only the MIN clause applies to flags = opsel(MIN); it carries its own `IS_WORD` hypotheses
     refine ⟨fun s i hs hi h => by simp only [opselLT] at h; omega,
       fun i hi h => by simp only [opselEQ] at h; omega,
       fun w s d hw hs hd h => by simp only [opselSHIFT] at h; omega,
