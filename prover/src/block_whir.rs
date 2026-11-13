@@ -3928,6 +3928,9 @@ pub struct LeadTaken {
     /// first); one leaf unless the lead was made for more
     /// ([`PhaseBLead::leading`]).
     pub leaves: Vec<usize>,
+    /// The groups still to come that phase B rebuilds, with their class, as
+    /// the lead found them.
+    pub rebuilt: Vec<(usize, usize)>,
     /// Phase B's order as it was taken.
     pub order: Vec<usize>,
 }
@@ -3983,6 +3986,10 @@ impl PhaseBLead {
             after,
             leaf: led_leaves.first().copied(),
             leaves: led_leaves,
+            rebuilt: rest
+                .iter()
+                .filter_map(|&g| classes.get(g).copied().flatten().map(|c| (g, c)))
+                .collect(),
             moved,
             order: order[..=p]
                 .iter()
@@ -4002,13 +4009,31 @@ impl PhaseBLead {
 /// groups in `rest` go first, in their order; the others keep theirs. Returns
 /// the leaf, the groups moved and the new `rest`, or `None` when no leaf can
 /// lead. The result is a permutation of `rest`.
+#[cfg(test)]
 pub(crate) fn lead_order(
     leaves: &[Vec<usize>],
     rest: &[usize],
     classes: &[Option<usize>],
     cells: &[u64],
 ) -> Option<(usize, Vec<usize>, Vec<usize>)> {
+    lead_order_with(leaves, rest, classes, cells, false)
+}
+
+/// [`lead_order`], and with `class_next` a leaf with rebuilt groups to come may
+/// lead too, when they are, class by class, the next ones `rest` takes of their
+/// class: every group of that class in `rest` with a lower index is the leaf's
+/// own. Its groups then go first and each class still goes in group order (the
+/// regenerators deposit in that order). Without `class_next` it is
+/// [`lead_order`]'s rule: no rebuilt group to come at all.
+pub(crate) fn lead_order_with(
+    leaves: &[Vec<usize>],
+    rest: &[usize],
+    classes: &[Option<usize>],
+    cells: &[u64],
+    class_next: bool,
+) -> Option<(usize, Vec<usize>, Vec<usize>)> {
     let to_come: std::collections::BTreeSet<usize> = rest.iter().copied().collect();
+    let class = |g: usize| classes.get(g).copied().flatten();
     let cell = |g: usize| cells.get(g).copied().unwrap_or(0);
     let (leaf, _) = leaves
         .iter()
@@ -4019,10 +4044,19 @@ pub(crate) fn lead_order(
                 .copied()
                 .filter(|g| to_come.contains(g))
                 .collect();
-            let rebuilt = left
-                .iter()
-                .any(|&g| classes.get(g).copied().flatten().is_some());
-            (!rebuilt && !left.is_empty()).then(|| (k, left.iter().map(|&g| cell(g)).sum::<u64>()))
+            let rebuilt = left.iter().any(|&g| class(g).is_some());
+            // With `class_next`: each of the leaf's rebuilt groups to come has
+            // only the leaf's own groups of its class below it in `rest`.
+            let next_of_class = || {
+                left.iter().all(|&g| match class(g) {
+                    None => true,
+                    Some(c) => rest
+                        .iter()
+                        .all(|&h| h >= g || class(h) != Some(c) || groups.contains(&h)),
+                })
+            };
+            let may = !rebuilt || (class_next && next_of_class());
+            (may && !left.is_empty()).then(|| (k, left.iter().map(|&g| cell(g)).sum::<u64>()))
         })
         .min_by_key(|&(k, cost)| (cost, k))?;
     let mine: std::collections::BTreeSet<usize> = leaves[leaf].iter().copied().collect();
@@ -4054,7 +4088,9 @@ pub(crate) fn lead_order_n(
     let mut left = rest.to_vec();
     while led.len() < n {
         // A leaf already led has no group left in `left`, so it cannot lead again.
-        let Some((leaf, mine, _)) = lead_order(leaves, &left, classes, cells) else {
+        // Leading several, a leaf whose rebuilt groups are next in their class may
+        // lead too ([`lead_order_with`]); one is today's rule exactly.
+        let Some((leaf, mine, _)) = lead_order_with(leaves, &left, classes, cells, n > 1) else {
             break;
         };
         left.retain(|g| !mine.contains(g));
@@ -8818,11 +8854,16 @@ mod lead_order_tests {
         // More than there are leaves: all of them, once each.
         let (led, ..) = lead_order_n(&leaves, &rest, &none, &cells, 9).expect("leads");
         assert_eq!(led, vec![2, 0, 1]);
-        // A rebuilt group to come: that leaf is skipped; each class keeps order.
+        // Rebuilt groups to come: a leaf leads only when its rebuilt groups are
+        // next in their class, given the leaves before it; each class keeps
+        // group order.
         let classes = [None, None, None, None, Some(1), Some(0), Some(1), Some(0)];
         let leaves = vec![vec![0, 6], vec![1, 2], vec![3, 5, 7], vec![4]];
         let (led, _, now) = lead_order_n(&leaves, &rest, &classes, &cells, 4).expect("leads");
-        assert_eq!(led, vec![1], "only leaf 1 has no rebuilt group to come");
+        // Leaf 3 first (10 cells; its group 4 is class 1's first); then leaf 0
+        // (11 cells; its group 6 is class 1's next once 4 is gone), leaf 1 (20)
+        // and leaf 2 (21; 5 and 7 are all of class 0).
+        assert_eq!(led, vec![3, 0, 1, 2]);
         let mut sorted = now.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, rest, "a permutation");
@@ -8833,6 +8874,91 @@ mod lead_order_tests {
             );
         }
         assert_eq!(lead_order_n(&leaves, &[], &classes, &cells, 3), None);
+    }
+
+    /// The single lead keeps today's rule: a rebuilt group to come bars a leaf
+    /// even when it is next in its class; leading several, such a leaf may lead,
+    /// one whose rebuilt group has a lower one of its class elsewhere may not;
+    /// over many random cases every class stays in group order and the result
+    /// is a permutation.
+    #[test]
+    fn a_leaf_may_lead_when_its_rebuilt_groups_are_next_in_their_class() {
+        let cells = [1u64; 8];
+        let classes = [None, None, None, None, Some(0), Some(0), Some(0), None];
+        let rest: Vec<usize> = (0..8).collect();
+        // Leaf 0 holds group 4, the class's first; leaf 1 holds 6, behind leaf 2's 5.
+        let leaves = vec![vec![0, 4], vec![1, 6], vec![2, 5], vec![3, 7]];
+        assert_eq!(
+            lead_order(&leaves, &rest, &classes, &cells).map(|x| x.0),
+            Some(3)
+        );
+        assert_eq!(
+            lead_order_n(&leaves, &rest, &classes, &cells, 1).map(|x| x.0),
+            Some(vec![3])
+        );
+        let (led, _, now) = lead_order_n(&leaves, &rest, &classes, &cells, 4).expect("leads");
+        assert_eq!(
+            led,
+            vec![0, 2, 1, 3],
+            "by cells, each when its rebuilt group is next"
+        );
+        assert_eq!(by_class(&now, &classes, 0), vec![4, 5, 6]);
+        // Two rebuilt groups of one class held crosswise by two leaves: neither
+        // can go first, so only the plain leaves lead.
+        let classes = [None, None, Some(0), Some(0), Some(0), Some(0)];
+        let leaves = vec![vec![0], vec![2, 5], vec![3, 4], vec![1]];
+        let (led, _, now) =
+            lead_order_n(&leaves, &(0..6).collect::<Vec<_>>(), &classes, &[1; 6], 4)
+                .expect("leads");
+        assert_eq!(
+            led,
+            vec![0, 3],
+            "leaves 1 and 2 interlock: no class order puts either first"
+        );
+        assert_eq!(by_class(&now, &classes, 0), vec![2, 3, 4, 5]);
+        // Random cases: a permutation, and every class in group order.
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..500 {
+            let n = 4 + (next() % 12) as usize;
+            let classes: Vec<Option<usize>> = (0..n)
+                .map(|_| match next() % 4 {
+                    0 => Some(0),
+                    1 => Some(1),
+                    _ => None,
+                })
+                .collect();
+            let k = 1 + (next() % 4) as usize;
+            let mut leaves = vec![Vec::new(); k];
+            for g in 0..n {
+                leaves[(next() % k as u64) as usize].push(g);
+            }
+            let cells: Vec<u64> = (0..n).map(|_| 1 + next() % 9).collect();
+            let start = (next() % n as u64) as usize;
+            let rest: Vec<usize> = (start..n).collect();
+            for lead_n in 1..=k {
+                if let Some((_, moved, now)) =
+                    lead_order_n(&leaves, &rest, &classes, &cells, lead_n)
+                {
+                    let mut sorted = now.clone();
+                    sorted.sort_unstable();
+                    assert_eq!(sorted, rest, "a permutation");
+                    assert!(now.starts_with(&moved));
+                    for c in 0..2 {
+                        let order = by_class(&now, &classes, c);
+                        assert!(
+                            order.windows(2).all(|w| w[0] < w[1]),
+                            "class {c} in order: {now:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A lead made for several leaves records them all, the first as `leaf`.
