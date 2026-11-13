@@ -145,8 +145,7 @@ pub enum WlfmPrep {
     /// The verifier holds the columns (it derived the program) and evaluates
     /// each prefix at its table's reduced point itself against the values the
     /// main opening gives: no prepared commit, no prepared opening. Only for a
-    /// proof whose verifier is the host (the last proof of the pipeline),
-    /// D-COMPRESS lever L1.
+    /// proof whose verifier is the host (the last proof of the pipeline).
     Evaluated,
 }
 
