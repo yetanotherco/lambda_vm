@@ -58,7 +58,6 @@ use crate::{
 use stark::config::CommitmentHash;
 use stark::proof::options::{BaseFormat, CapPolicy};
 
-pub(crate) mod group_queue;
 mod memlog;
 pub mod regen;
 
@@ -1844,9 +1843,6 @@ pub struct BlockStamps {
     /// did, and its `BLOCK REGEN` lines (printed as phase B ends, not in
     /// [`Self::report`]).
     pub regen: Option<regen::RegenStamps>,
-    /// A streamed build's `BLOCK GROUP QUEUE` line ([`group_queue::line`],
-    /// printed as phase A ends, not in [`Self::report`]).
-    pub group_queue: Option<String>,
     /// A streamed build's `BLOCK HEAD` lines ([`head_log`], printed as phase A
     /// ends, not in [`Self::report`]); empty unless the head was stamped.
     pub head: Vec<String>,
@@ -3603,12 +3599,6 @@ pub(crate) struct Deviations {
     /// The host's memory target, in bytes, instead of the machine's
     /// ([`memory_target_bytes`]): 0 makes the `auto` rule want every table out.
     pub memory_target: Option<u64>,
-    /// How many closed groups may wait for phase A, instead of the knob
-    /// ([`group_queue::setting`]).
-    pub group_queue: Option<group_queue::Setting>,
-    /// A pause as phase A takes each closed group, so that at a test's size
-    /// the packer closes groups faster than phase A takes them.
-    pub group_take_pause: Option<std::time::Duration>,
     /// On the whole-run path, the traces edited after their cuts and before
     /// the proof, as a prover of other tables would.
     pub tamper_traces: Option<fn(&mut Traces)>,
@@ -4737,7 +4727,7 @@ struct Packer<'a> {
     open_shapes: Vec<(usize, usize)>,
     open_keys: Vec<Key>,
     group_keys: Vec<Vec<Key>>,
-    out: group_queue::Out<Vec<CommittedTable<'a, F, E>>>,
+    out: std::sync::mpsc::SyncSender<Vec<CommittedTable<'a, F, E>>>,
     cap: multilinear::whir_chain::StackVars,
     max_polys: usize,
     /// The most groups the statement may declare: the group past it is
@@ -4810,15 +4800,7 @@ impl<'a> Packer<'a> {
         let t = Instant::now();
         let sent = self
             .out
-            .send(std::mem::take(&mut self.open), |group| {
-                group_queue::Weight {
-                    bytes: memlog::group_bytes(group) as u64,
-                    cells: group
-                        .iter()
-                        .map(|table| (table.num_committed_columns() as u64) << table.num_vars())
-                        .sum(),
-                }
-            })
+            .send(std::mem::take(&mut self.open))
             .map_err(|_| Error::Prover("phase A stopped".into()));
         self.blocked += t.elapsed().as_secs_f64();
         sent
@@ -5839,23 +5821,13 @@ fn prove_streamed(
     // resident set to come within the regeneration window of the pressure line.
     let room = no_disk_room(live_regen.is_some(), target);
     crate::alloc_purge::note_no_disk(room);
-    // And closed groups may wait for phase A behind one another while the
-    // host has that room, at most a regeneration window of them
-    // ([`group_queue`]); by default one waits.
-    let queue_setting = match deviations.group_queue {
-        Some(setting) => setting,
-        None => group_queue::setting()?,
-    };
     // A tree-drop value the options could not read refuses the prove.
     tree_drop_refusal()?;
-    let queue_rule = group_queue::Rule::of(queue_setting, room, regen::AHEAD_CAP);
-    let queue_stats = std::sync::Arc::new(group_queue::Stats::default());
     // The host is read at each decision: the `auto` rule decides on it and the
     // purge's pressure is noted from it (`note_pressure_past`).
-    // Once live regeneration has armed, its phase-B reserve counts. While
-    // closed groups may wait behind one another, their cells count as
-    // committed ([`group_queue::arming_cells`]). Partial drops, once armed,
-    // weigh what the host holds now, and purge what they dropped.
+    // Once live regeneration has armed, its phase-B reserve counts. Partial
+    // drops, once armed, weigh what the host holds now, and purge what they
+    // dropped.
     let drop_purges = live_regen
         .is_some()
         .then(|| DropPurges::new(crate::alloc_purge::purge_now));
@@ -5866,9 +5838,7 @@ fn prove_streamed(
         let purges = drop_purges.clone();
         let reserve = regen::regen_reserve_bytes();
         let per_g = memory_reserve_per_g();
-        let waiting = std::sync::Arc::clone(&queue_stats);
         std::sync::Arc::new(move |_kept, cells, bytes| {
-            let cells = group_queue::arming_cells(queue_rule, &waiting, cells);
             let reading = HostReading::now();
             {
                 let mut most = host_most.lock().unwrap_or_else(|e| e.into_inner());
@@ -6683,15 +6653,8 @@ fn prove_streamed(
                 ))
             });
 
+            // One closed group waits for phase A; the packer holds the next.
             let (gtx, grx) = std::sync::mpsc::sync_channel::<Vec<CommittedTable<'_, F, E>>>(1);
-            let (group_out, queued) = match queue_rule {
-                None => (group_queue::Out::Channel(gtx), None),
-                Some(rule) => {
-                    let (out, groups) =
-                        group_queue::queue(rule, std::sync::Arc::clone(&queue_stats));
-                    (group_queue::Out::Queue(out), Some(groups))
-                }
-            };
             let stream_airs = &stream_airs;
             let run_airs = &run_airs;
             let layout = scope.spawn(move || -> Result<Laid, Error> {
@@ -6703,7 +6666,7 @@ fn prove_streamed(
                     open_shapes: Vec::new(),
                     open_keys: Vec::new(),
                     group_keys: Vec::new(),
-                    out: group_out,
+                    out: gtx,
                     cap,
                     max_polys: format.group_polys,
                     max_groups: format.max_groups,
@@ -6899,10 +6862,7 @@ fn prove_streamed(
 
             // A memory log: a group leaves the channel as the committer takes
             // it.
-            let groups = match queued {
-                Some(groups) => group_queue::In::Queue(groups),
-                None => group_queue::In::Channel(grx.iter()),
-            };
+            let groups = grx.iter();
             let block = if deviations.host_only {
                 // The trace alone: each closed group counted and dropped as
                 // it comes, nothing committed.
@@ -6931,9 +6891,6 @@ fn prove_streamed(
                         if let Some(ledger) = ledger {
                             ledger.sent.fetch_sub(memlog::group_bytes(group), Relaxed);
                         }
-                        if let Some(pause) = deviations.group_take_pause {
-                            std::thread::sleep(pause);
-                        }
                     }),
                     &commit_config,
                     options.drop_levels,
@@ -6945,9 +6902,6 @@ fn prove_streamed(
             };
             (block, builder.join(), layout.join(), executor.join())
         });
-        let queue_line = group_queue::line(queue_setting, queue_rule, &queue_stats);
-        eprintln!("{queue_line}");
-        stamps.group_queue = Some(queue_line);
         stamps.head = head_log::take_lines();
         for line in &stamps.head {
             eprintln!("{line}");
@@ -9327,26 +9281,20 @@ mod producer_report_tests {
 
 #[cfg(test)]
 mod packer_tests {
-    use std::sync::Arc;
     use std::time::Instant;
 
-    use super::{Key, Packer, StreamAirs, group_queue, table_of};
+    use super::{Key, Packer, StreamAirs, table_of};
     use crate::tables::gpack::TraceForm;
     use crate::tables::lt::{self, LtOperation};
     use crate::tables::trace_builder::StreamTable;
     use multilinear::whir_chain::StackVars;
     use stark::proof::options::ProofOptions;
 
-    /// The packer closes the same groups from the same tables, and phase A is
-    /// handed them in the same order, whatever lets a closed group wait: the
-    /// channel of one, or the queue with no bytes, one byte or all the bytes
-    /// to wait in, taken slowly.
+    /// The packer closes every table into groups in order, and phase A, taking
+    /// slowly through the channel of one, is handed those groups in that
+    /// order.
     #[test]
-    fn the_packer_closes_the_same_groups_whatever_waits() {
-        group_queue::within_a_minute("the packer", packs_alike);
-    }
-
-    fn packs_alike() {
+    fn the_packer_hands_phase_a_its_groups_in_order() {
         let opts = ProofOptions::default_test_options();
         let airs = StreamAirs::new(
             &opts,
@@ -9357,7 +9305,7 @@ mod packer_tests {
         let air = airs.of(StreamTable::Lt).expect("LT's AIR is the family's");
         // Tables of 4, 8 and 16 rows, in an order that makes uneven groups.
         let heights: Vec<usize> = (0..60).map(|k| [3, 5, 12, 2][k * 7 % 4]).collect();
-        let pack = |out: group_queue::Out<_>| -> Vec<Vec<usize>> {
+        let pack = |out: std::sync::mpsc::SyncSender<_>| -> Vec<Vec<usize>> {
             let mut packer = Packer {
                 open: Vec::new(),
                 open_shapes: Vec::new(),
@@ -9401,8 +9349,9 @@ mod packer_tests {
                 .collect()
         };
         // What phase A is handed: each group's tables by their heights.
-        let take = |groups: group_queue::In<'_, Vec<_>>| -> Vec<Vec<usize>> {
+        let take = |groups: std::sync::mpsc::Receiver<Vec<_>>| -> Vec<Vec<usize>> {
             groups
+                .iter()
                 .map(
                     |group: Vec<stark::multilinear_table::CommittedTable<'_, _, _>>| {
                         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -9413,11 +9362,8 @@ mod packer_tests {
         };
         let (packed, taken) = std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            let taker = scope.spawn(move || take(group_queue::In::Channel(rx.iter())));
-            (
-                pack(group_queue::Out::Channel(tx)),
-                taker.join().expect("the taker"),
-            )
+            let taker = scope.spawn(move || take(rx));
+            (pack(tx), taker.join().expect("the taker"))
         });
         assert!(packed.len() >= 4, "{} groups", packed.len());
         assert_eq!(packed.concat(), (0..heights.len()).collect::<Vec<_>>());
@@ -9425,42 +9371,6 @@ mod packer_tests {
             taken.iter().map(Vec::len).collect::<Vec<_>>(),
             packed.iter().map(Vec::len).collect::<Vec<_>>()
         );
-        for budget in [0, 1, u64::MAX] {
-            let stats = Arc::new(group_queue::Stats::default());
-            let (queued, handed) = std::thread::scope(|scope| {
-                let (tx, rx) =
-                    group_queue::queue(group_queue::Rule::Bytes(budget), Arc::clone(&stats));
-                let taker = scope.spawn(move || take(group_queue::In::Queue(rx)));
-                (
-                    pack(group_queue::Out::Queue(tx)),
-                    taker.join().expect("the taker"),
-                )
-            });
-            assert_eq!(queued, packed, "budget {budget}: the groups");
-            assert_eq!(handed, taken, "budget {budget}: what phase A is handed");
-        }
-        // With every byte to wait in and nobody taking, every group waits at
-        // once: the drops then count the main cells of all but the first, each
-        // committed column's rows, as phase A's commit counts a table's.
-        let stats = Arc::new(group_queue::Stats::default());
-        let rule = group_queue::Rule::Bytes(u64::MAX);
-        let (tx, rx) = group_queue::queue(rule, Arc::clone(&stats));
-        assert_eq!(pack(group_queue::Out::Queue(tx)), packed);
-        let counted = group_queue::arming_cells(Some(rule), &stats, 0);
-        let cells: Vec<u64> = rx
-            .map(
-                |group: Vec<stark::multilinear_table::CommittedTable<'_, _, _>>| {
-                    group
-                        .iter()
-                        .map(|table| (table.num_committed_columns() as u64) << table.num_vars())
-                        .sum()
-                },
-            )
-            .collect();
-        assert_eq!(cells.len(), packed.len());
-        assert!(counted > 0);
-        assert_eq!(counted, cells[1..].iter().sum::<u64>());
-        assert_eq!(group_queue::arming_cells(Some(rule), &stats, 0), 0);
     }
 }
 
