@@ -800,8 +800,8 @@ fn the_routing_gives_the_limbs_only_a_step_that_fits() {
 fn a_limbs_row_lays_out_counts_and_asks_lt_as_its_form_says() {
     for (old, ts) in [(1u64, 2u64), (4, 4 + HALF), (1, (1 << 32) - 1), (36, 100)] {
         let op = aligned_op(old, ts);
-        let lt = AlignedRow::from_memw(&op, MemwAlignedOrder::Lt);
-        let limbs = AlignedRow::from_memw(&op, MemwAlignedOrder::Limbs);
+        let lt = AlignedRow::from_memw(&op, MemwAlignedOrder::Lt).expect("LT takes any order");
+        let limbs = AlignedRow::from_memw(&op, MemwAlignedOrder::Limbs).expect("the step fits");
         let (d0, d1) = step_limbs(old, ts);
         assert_eq!(u64::from(d0) + (u64::from(d1) << 16), ts - old - 1);
 

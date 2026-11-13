@@ -189,11 +189,21 @@ pub(crate) struct AlignedRow {
 }
 
 impl AlignedRow {
-    /// The row of an op [`super::trace_builder`] routed to MEMW_A in `order`
-    /// (under [`MemwAlignedOrder::Limbs`] only an op whose step
-    /// [`step_fits_limbs`]: the routing's predicate).
+    /// The row of an op [`super::trace_builder`] routed to MEMW_A in `order`.
+    /// Under [`MemwAlignedOrder::Limbs`] an op whose step does not fit
+    /// ([`step_fits_limbs`], the routing's own predicate) is refused with the
+    /// reason, never laid out with wrapped limbs: the routing admits none, so
+    /// a refusal is a prover bug, and the walk returns it as an error.
     #[inline]
-    pub(crate) fn from_memw(op: &MemwOperation, order: MemwAlignedOrder) -> Self {
+    pub(crate) fn from_memw(op: &MemwOperation, order: MemwAlignedOrder) -> Result<Self, String> {
+        let limbs = order == MemwAlignedOrder::Limbs;
+        if limbs && !step_fits_limbs(op.old_timestamp[0], op.timestamp) {
+            return Err(format!(
+                "a MEMW_A row in the limbs' form needs a step in 1..2^32 on one high word, \
+                 not {:#x} → {:#x}",
+                op.old_timestamp[0], op.timestamp
+            ));
+        }
         let pack = |elements: &[u32; 8]| -> u64 {
             if op.is_register {
                 elements[0] as u64 | (elements[1] as u64) << 32
@@ -212,17 +222,13 @@ impl AlignedRow {
             width: op.width,
             is_read: op.is_read,
             is_register: op.is_register,
-            limbs: order == MemwAlignedOrder::Limbs,
+            limbs,
         };
         debug_assert!(
             row.value() == op.value && row.old() == op.old,
             "a MEMW_A op's elements do not fit its row: {op:?}"
         );
-        debug_assert!(
-            !row.limbs || step_fits_limbs(row.old_timestamp, row.timestamp),
-            "the routing gave MEMW_A's limbs an access whose step does not fit: {op:?}"
-        );
-        row
+        Ok(row)
     }
 
     #[inline]

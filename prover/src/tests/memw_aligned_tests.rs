@@ -15,7 +15,7 @@ fn test_memw_aligned_trace_generation() {
 
     let rows: Vec<AlignedRow> = ops
         .iter()
-        .map(|op| AlignedRow::from_memw(op, MemwAlignedOrder::Lt))
+        .map(|op| AlignedRow::from_memw(op, MemwAlignedOrder::Lt).expect("LT's form takes it"))
         .collect();
     let trace = generate_memw_aligned_trace(&rows);
     assert_eq!(trace.num_cols(), cols::NUM_COLUMNS);
@@ -78,7 +78,7 @@ fn an_aligned_row_keeps_its_ops_elements() {
             *order == MemwAlignedOrder::Lt || step_fits_limbs(op.old_timestamp[0], op.timestamp)
         })
     {
-        let row = AlignedRow::from_memw(op, order);
+        let row = AlignedRow::from_memw(op, order).expect("a step the form takes");
         assert_eq!(row.limbs(), order == MemwAlignedOrder::Limbs);
         assert_eq!(
             row.lt_pair(),
