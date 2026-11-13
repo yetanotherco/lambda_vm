@@ -57,6 +57,7 @@ pub mod p1w16_chip;
 pub mod p1w16_emit;
 pub mod p1w16_socket;
 pub mod per_table_aggregator;
+pub(crate) mod prep_pinned;
 pub mod preprocessed;
 pub mod program_budget;
 pub mod program_census;
