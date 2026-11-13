@@ -21,7 +21,13 @@
 //      least one table.
 // Every cell starts as a sentinel, so a cell no thread writes is a mismatch.
 //
-// WHAT IT DOES NOT: nvcc, the grid, the launch over several tables, timing.
+//   3. words mode (`LAMBDA_VM_CARD_ROWS=words`): the same runs walked as words; each
+//      chunk's words as the walk wrote them, its markers' rows at their run index
+//      less the table's `whole_base` (at least one table past the run's first
+//      whole rows), against the host fill of its decoded rows; the two kernel
+//      mutants on them.
+// WHAT IT DOES NOT: nvcc, the grid, the launch over several tables, timing,
+// the upload's choice to launch (a unit test in `src/card_rows.rs`).
 // That is the card test's (`card_rows_card_tests`).
 //
 // Build and run (from the repository root):
@@ -95,10 +101,11 @@ constexpr uint64_t SENTINEL = 0xdeadbeefcafef00dull;
 std::pair<uint64_t, unsigned long long> replay(const std::vector<CachedLogsC> &entries,
                                                const std::vector<DecodeEntryC> &dec,
                                                const std::vector<DecodeRunC> &runs,
-                                               const Table &t, const Plan &plan, uint32_t fault) {
+                                               const Table &t, const Plan &plan, uint32_t fault,
+                                               uint64_t whole_base = 0) {
     std::vector<uint64_t> out(t.height * memw_r_cols::NUM_COLUMNS, SENTINEL);
     const RegistersTableC table{plan.words.data(), plan.whole.data(), plan.words.size(), t.height,
-                                out.data(), 0};
+                                out.data(), 0, whole_base};
     unsigned long long check = 0;
     for (uint64_t i = 0; i < plan.words.size(); ++i) {
         blockIdx.x = 0;
@@ -133,13 +140,14 @@ int main(int argc, char **argv) {
         if (std::fread(r.bytes.data(), 1, r.bytes.size(), f) != r.bytes.size()) return 2;
         std::fclose(f);
     }
-    if (r.bytes.size() < 8 || std::memcmp(r.bytes.data(), "CRREG001", 8) != 0) {
+    if (r.bytes.size() < 8 || std::memcmp(r.bytes.data(), "CRREG002", 8) != 0) {
         std::fprintf(stderr, "not register-row vectors\n");
         return 2;
     }
     r.at = 8;
     const uint64_t cases = r.u64();
-    uint64_t tables = 0, rows = 0, failures = 0;
+    uint64_t tables = 0, rows = 0, failures = 0, words_tables = 0, words_based = 0;
+    uint64_t words_applies[2] = {0, 0}, words_moved[2] = {0, 0};
     // Per mutant: tables it applies to, tables it moved.
     uint64_t applies[4] = {0, 0, 0, 0}, moved[4] = {0, 0, 0, 0};
     const char *names[4] = {"rs2 read as rs1", "old value read whatever its slot",
@@ -194,6 +202,38 @@ int main(int argc, char **argv) {
                 moved[2 + f] += m.first != 0 || m.second != 0;
             }
         }
+        // Words mode: the tables as the walk wrote them, their markers' high
+        // halves run indices from `whole_base`.
+        const uint64_t nwords = r.u64();
+        for (uint64_t k = 0; k < nwords; ++k) {
+            Table t;
+            const uint64_t n = r.u64(), cells = r.u64(), base = r.u64();
+            t.height = n;
+            t.plan.words = r.records<uint64_t>(n);
+            t.plan.whole = r.records<RegRowC>(r.u64());
+            t.want = r.records<uint64_t>(cells);
+            if (cells != n * memw_r_cols::NUM_COLUMNS) {
+                std::fprintf(stderr, "case %llu words table %llu: malformed\n", (unsigned long long)c,
+                             (unsigned long long)k);
+                return 2;
+            }
+            ++words_tables;
+            words_based += base > 0;
+            rows += n;
+            const auto clean = replay(entries, dec, runs, t, t.plan, 0, base);
+            if (clean.first != 0 || clean.second != 0) {
+                ++failures;
+                std::printf("FAIL case %llu words table %llu (base %llu): %llu cells differ, check %llu\n",
+                            (unsigned long long)c, (unsigned long long)k, (unsigned long long)base,
+                            (unsigned long long)clean.first, clean.second);
+            }
+            const uint32_t kernel_faults[2] = {REGISTER_FAULT_SLOT, REGISTER_FAULT_VALUE_AT};
+            for (int f = 0; f < 2; ++f) {
+                const auto m = replay(entries, dec, runs, t, t.plan, kernel_faults[f], base);
+                ++words_applies[f];
+                words_moved[f] += m.first != 0 || m.second != 0;
+            }
+        }
     }
     if (r.at != r.bytes.size()) {
         std::fprintf(stderr, "%zu bytes left over\n", r.bytes.size() - r.at);
@@ -205,8 +245,16 @@ int main(int argc, char **argv) {
                     (unsigned long long)moved[f], (unsigned long long)applies[f]);
         bites &= moved[f] > 0;
     }
-    std::printf("REGISTER KAT: %llu tables, %llu rows, %llu failed · mutants %s\n",
-                (unsigned long long)tables, (unsigned long long)rows,
+    for (int f = 0; f < 2; ++f) {
+        std::printf("MUTANT words, %s: moved %llu of %llu tables\n", names[f],
+                    (unsigned long long)words_moved[f], (unsigned long long)words_applies[f]);
+        bites &= words_moved[f] > 0;
+    }
+    const bool words_ok = words_tables >= 2 && words_based > 0;
+    std::printf("REGISTER KAT: %llu tables, %llu as words (%llu with a run index past 0), %llu rows, %llu "
+                "failed · mutants %s\n",
+                (unsigned long long)tables, (unsigned long long)words_tables,
+                (unsigned long long)words_based, (unsigned long long)rows,
                 (unsigned long long)failures, bites ? "all bite" : "NOT all bite");
-    return failures == 0 && bites && tables > 0 ? 0 : 1;
+    return failures == 0 && bites && tables > 0 && words_ok ? 0 : 1;
 }
