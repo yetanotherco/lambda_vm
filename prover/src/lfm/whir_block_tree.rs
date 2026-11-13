@@ -597,6 +597,12 @@ pub(crate) struct Admitted<P = LfmProgram> {
     permit: Option<super::program_budget::Permit>,
 }
 
+impl super::prep_pinned::HoldsProgram for Admitted<LfmProgram> {
+    fn program(&self) -> &LfmProgram {
+        &self.program
+    }
+}
+
 /// One program's place from its emission to its proof: shared by its
 /// artifacts' build and its execute, and let go once its proof is done, which
 /// frees the program (with the last of its users) and gives its bytes back to
@@ -2388,6 +2394,10 @@ pub fn prove_whir_block_tree(
     let leaf_first = cfg.leaf_first && early_on;
     let (lead_ref, offered_ref) = (&lead, &offered_at);
     let (elf_ref, opts_ref, format_ref) = (elf, &opts, &format);
+    // `LAMBDA_VM_LFM_PREP_PINNED`: each leaf's preprocessed groups made ready
+    // for the card on a helper as its program is emitted ([`super::prep_pinned`]).
+    let prep = super::prep_pinned::Session::start()?;
+    let prep_tx = prep.sender();
     let (proved, pre) = std::thread::scope(|scope| {
         let pre = scope.spawn(move || -> Result<Planned, String> {
             let (statement, roots) = rx
@@ -2448,6 +2458,13 @@ pub fn prove_whir_block_tree(
                     &mut |k| {
                         if k == 0 {
                             first = Some(t0.elapsed().as_secs_f64());
+                        }
+                        if let Some(tx) = &prep_tx
+                            && let Some(Ok(slot)) = programs[k].0.get()
+                            && let Ok(held) = slot.get()
+                        {
+                            let _ = tx
+                                .send(held as std::sync::Arc<dyn super::prep_pinned::HoldsProgram>);
                         }
                     },
                 )?;
@@ -3226,6 +3243,7 @@ pub fn prove_whir_block_tree(
     if let Some(w) = watermark {
         sink.line(&w.finish());
     }
+    sink.line(&prep.finish());
     if proofs.is_empty() {
         return Err("the tree has no top".to_string());
     }
