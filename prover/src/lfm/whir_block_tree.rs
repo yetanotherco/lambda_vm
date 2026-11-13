@@ -197,6 +197,14 @@ pub struct WhirTreeConfig {
     /// phase B finished while another group was still to come executes and
     /// fills right then, or (0, the control) with the others after the base.
     pub early_on: bool,
+    /// `W3_EARLY_LEAVES=<n>` (default 1): with the early leaf on and the leaves
+    /// offered to phase B (`W3_LEAF_FIRST`), phase B leads with the groups of
+    /// up to `n` leaves, one leaf after another ([`block_whir::PhaseBLead::leading`]),
+    /// and each of them that completes while a group is still to come executes
+    /// and fills right then, on a thread of its own, host only; the tree takes
+    /// them first, in the order they completed. 1 is today's single early leaf.
+    /// Prover-only: the bytes are the same.
+    pub early_leaves: usize,
     /// `W3_LEAF_EMITTERS` ([`LEAF_EMITTERS`] by default): how many of the
     /// leaves' programs are emitted at once beside phase B, in leaf order,
     /// each published as it is ready while the planner takes phase B's groups;
@@ -253,6 +261,20 @@ pub struct WhirTreeConfig {
     /// `LAMBDA_VM_BLOCK_COMPRESS2`: after C1, a second compression proof C2
     /// that verifies C1 in-guest, at this query grind; what ships then.
     pub compress2: Option<u8>,
+}
+
+/// `W3_EARLY_LEAVES`: unset is 1 (today's single early leaf); 0 is refused,
+/// since `W3_LEAF_DURING_PHASE_B=0` is the knob that turns early leaves off.
+fn early_leaves_setting(knob: Option<usize>) -> Result<usize, String> {
+    match knob {
+        None => Ok(1),
+        Some(0) => Err(
+            "W3_EARLY_LEAVES=0: a count of at least 1 (W3_LEAF_DURING_PHASE_B=0 turns the early \
+             leaf off)"
+                .to_string(),
+        ),
+        Some(n) => Ok(n),
+    }
 }
 
 /// A count knob: unset is `None`; anything but a count is an error.
@@ -418,6 +440,7 @@ impl WhirTreeConfig {
         let beside = count_knob("W3_EXEC_BESIDE_ARTIFACTS")?.is_none_or(|v| v != 0);
         let leaves_each = count_knob("W3_LEAF_ARTIFACTS_EACH")? == Some(1);
         let early_on = count_knob("W3_LEAF_DURING_PHASE_B")?.is_none_or(|v| v != 0);
+        let early_leaves = early_leaves_setting(count_knob("W3_EARLY_LEAVES")?)?;
         let leaf_emitters = leaf_emitters_setting(count_knob("W3_LEAF_EMITTERS")?);
         let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
             Ok("batched") => match count_knob("BLOCK_WHIR_ARGUE_CAP")? {
@@ -527,6 +550,7 @@ impl WhirTreeConfig {
             leaves_each,
             program_budget: super::program_budget::setting_from_env()?,
             early_on,
+            early_leaves,
             leaf_emitters,
             argue,
             format,
@@ -1245,6 +1269,16 @@ pub(crate) fn early_leaf_first(mut order: Vec<TreeAt>, first: Option<usize>) -> 
     order
 }
 
+/// `order` with the leaves `first` taken before the others, in `first`'s
+/// order ([`early_leaf_first`] for each, the last first); with one leaf it is
+/// [`early_leaf_first`].
+pub(crate) fn early_leaves_first(order: Vec<TreeAt>, first: &[usize]) -> Vec<TreeAt> {
+    first
+        .iter()
+        .rev()
+        .fold(order, |order, &k| early_leaf_first(order, Some(k)))
+}
+
 /// `W3 LEAF FIRST`: whether the leaves were offered to phase B and when, what
 /// phase B did with them (the turn it read the offer, the leaf it led with and
 /// how many groups it moved) and which leaf was early.
@@ -1253,7 +1287,7 @@ fn leaf_first_line(
     offered_at: Option<f64>,
     stated_at: f64,
     taken: Option<block_whir::LeadTaken>,
-    early: Option<usize>,
+    early: &[usize],
 ) -> String {
     if !on {
         return "W3 LEAF FIRST: off (phase B in its own order; the tree takes the leaves in index \
@@ -1266,10 +1300,22 @@ fn leaf_first_line(
     let phase_b = match taken {
         None => "phase B ended before it read them".to_string(),
         Some(t) => match t.leaf {
-            Some(leaf) => format!(
+            Some(leaf) if t.leaves.len() <= 1 => format!(
                 "phase B read them at its turn {} ({:.2}s in) and moved leaf {leaf}'s {} groups next",
                 t.turn,
                 t.after,
+                t.moved.len()
+            ),
+            Some(_) => format!(
+                "phase B read them at its turn {} ({:.2}s in) and moved leaves {}' {} groups next, \
+                 leaf by leaf",
+                t.turn,
+                t.after,
+                t.leaves
+                    .iter()
+                    .map(|k| k.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 t.moved.len()
             ),
             None => format!(
@@ -1279,10 +1325,20 @@ fn leaf_first_line(
             ),
         },
     };
+    let early = match early {
+        [] => "early leaf none".to_string(),
+        [k] => format!("early leaf {k}"),
+        ks => format!(
+            "early leaves {}",
+            ks.iter()
+                .map(|k| k.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
     format!(
-        "W3 LEAF FIRST: on · leaves offered at {offered} · {phase_b} · early leaf {} (taken first by \
-         the tree)",
-        early.map_or("none".to_string(), |k| k.to_string())
+        "W3 LEAF FIRST: on · leaves offered at {offered} · {phase_b} · {early} (taken first by the \
+         tree)"
     )
 }
 
@@ -1534,7 +1590,7 @@ pub(crate) fn prove_tree_pipelined(
     siblings: usize,
     beside: bool,
     leaves_each: bool,
-    early: Option<EarlyLeaf>,
+    early: Vec<EarlyLeaf>,
     early_first: bool,
     node_pipe: Option<&rayon::ThreadPool>,
     dataflow: bool,
@@ -1551,9 +1607,18 @@ pub(crate) fn prove_tree_pipelined(
     ),
     String,
 > {
-    // With `early_first` (`W3_LEAF_FIRST`), the early leaf is taken first.
-    let first = early.as_ref().map(|e| e.leaf).filter(|_| early_first);
+    // With `early_first` (`W3_LEAF_FIRST`), the early leaves are taken first,
+    // in the order they completed.
+    let first: Vec<usize> = if early_first {
+        early.iter().map(|e| e.leaf).collect()
+    } else {
+        Vec::new()
+    };
+    let early_n = early.len();
     let early = std::sync::Mutex::new(early);
+    // Every early leaf's stamps, for the `W3 EARLY LEAVES` line.
+    let early_stamps: std::sync::Mutex<Vec<(usize, f64, f64, f64)>> =
+        std::sync::Mutex::new(Vec::new());
     let early_out: std::sync::Mutex<Option<(usize, Vec<Vec<LfmWord>>, f64, f64, f64)>> =
         std::sync::Mutex::new(None);
     let wrap = aggregation_wrap_options();
@@ -1575,7 +1640,7 @@ pub(crate) fn prove_tree_pipelined(
         .map(|l| l.arities.iter().map(|_| Published::new()).collect())
         .collect();
 
-    let order = early_leaf_first(tree_order(leaves.len(), &shape), first);
+    let order = early_leaves_first(tree_order(leaves.len(), &shape), &first);
     let results: Vec<Vec<Published<ProvedProgram>>> = std::iter::once(leaves.len())
         .chain(shape.iter().map(|l| l.arities.len()))
         .map(|n| (0..n).map(|_| Published::new()).collect())
@@ -1671,11 +1736,9 @@ pub(crate) fn prove_tree_pipelined(
                     program.claim();
                     let ahead = {
                         let mut slot = early.lock().map_err(|_| "the early slot is poisoned")?;
-                        if slot.as_ref().is_some_and(|e| e.leaf == k) {
-                            slot.take()
-                        } else {
-                            None
-                        }
+                        slot.iter()
+                            .position(|e| e.leaf == k)
+                            .map(|at| slot.remove(at))
                     };
                     let t = std::time::Instant::now();
                     let filled = match ahead {
@@ -1684,10 +1747,17 @@ pub(crate) fn prove_tree_pipelined(
                                 .handle
                                 .join()
                                 .map_err(|_| format!("leaf {k}: the early executor panicked"))??;
-                            *early_out
+                            early_stamps
                                 .lock()
-                                .map_err(|_| "the early readout is poisoned")? =
-                                Some((k, arena, e.complete_at, started, secs));
+                                .map_err(|_| "the early stamps are poisoned")?
+                                .push((k, e.complete_at, started, secs));
+                            // The harness checks the first early leaf's arena.
+                            let mut out = early_out
+                                .lock()
+                                .map_err(|_| "the early readout is poisoned")?;
+                            if out.is_none() {
+                                *out = Some((k, arena, e.complete_at, started, secs));
+                            }
                             filled
                         }
                         None => {
@@ -1916,6 +1986,23 @@ pub(crate) fn prove_tree_pipelined(
             proofs.push((slot.take()?.artifacts, lfm));
         }
     }
+    if early_n > 1 {
+        let mut stamps = early_stamps
+            .into_inner()
+            .map_err(|_| "the early stamps are poisoned")?;
+        stamps.sort_by(|a, b| a.1.total_cmp(&b.1));
+        say(&format!(
+            "W3 EARLY LEAVES: {} · {}",
+            stamps.len(),
+            stamps
+                .iter()
+                .map(|(k, at, started, secs)| format!(
+                    "leaf {k} complete at {at:.2}s, execute + fill from {started:.2}s for {secs:.2}s"
+                ))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        ));
+    }
     let early_out = early_out
         .into_inner()
         .map_err(|_| "the early readout is poisoned")?;
@@ -2022,7 +2109,7 @@ type Planned = (
     f64,
     Option<f64>,
     f64,
-    Option<EarlyLeaf>,
+    Vec<EarlyLeaf>,
 );
 
 /// ★ W3 on a real block, run the way a prover runs it:
@@ -2164,7 +2251,8 @@ pub fn prove_whir_block_tree(
         )),
     };
     // The leaves offered to phase B (`W3_LEAF_FIRST`), and when.
-    let lead = block_whir::PhaseBLead::default();
+    let lead = block_whir::PhaseBLead::leading(cfg.early_leaves);
+    let early_leaves = cfg.early_leaves;
     let offered_at = std::sync::Mutex::new(None::<f64>);
     let leaf_first = cfg.leaf_first && early_on;
     let (lead_ref, offered_ref) = (&lead, &offered_at);
@@ -2244,11 +2332,12 @@ pub fn prove_whir_block_tree(
             let (looped, emitted) = std::thread::scope(|inner| {
                 let emitter = beside
                     .map(|(permits, threads)| inner.spawn(move || emit_leaves(permits, threads)));
-                let looped = (|| -> Result<Option<EarlyLeaf>, String> {
+                let looped = (|| -> Result<Vec<EarlyLeaf>, String> {
                     // The groups as phase B finishes them (none unless `early_on`):
-                    // the first leaf complete while a group is still to come runs
-                    // its execute + fill now, on a thread of its own.
-                    let mut early = None;
+                    // each leaf complete while a group is still to come, up to
+                    // `W3_EARLY_LEAVES` of them, runs its execute + fill now, on a
+                    // thread of its own; the first also warms the first prove.
+                    let mut early: Vec<EarlyLeaf> = Vec::new();
                     let mut words: Vec<Option<Vec<LfmWord>>> =
                         (0..plan.num_groups()).map(|_| None).collect();
                     let mut block_roots = Vec::new();
@@ -2270,14 +2359,16 @@ pub fn prove_whir_block_tree(
                             block_roots = msg.roots;
                             block_answers = msg.commit_ood;
                         }
-                        if early.is_some() || done >= plan.num_groups() {
+                        if early.len() >= early_leaves || done >= plan.num_groups() {
                             continue;
                         }
                         let partition = plan.partition();
                         let complete = (0..partition.num_leaves())
+                            .filter(|&k| early.iter().all(|e| e.leaf != k))
                             .find(|&k| partition.leaf(k).iter().all(|&g| words[g].is_some()))
                             .filter(|&k| k < upto);
                         if let Some(k) = complete {
+                            let first = early.is_empty();
                             let groups: Vec<Vec<LfmWord>> = partition
                                 .leaf(k)
                                 .iter()
@@ -2290,6 +2381,18 @@ pub fn prove_whir_block_tree(
                             let program = slot.get()?;
                             let handle = std::thread::spawn(move || -> Result<EarlyOut, String> {
                                 let started = t0.elapsed().as_secs_f64();
+                                if !first {
+                                    // A later early leaf: its execute + fill only;
+                                    // the first one warmed what a prove builds once.
+                                    let t = std::time::Instant::now();
+                                    let hasher = program
+                                        .program
+                                        .hasher(<BlockFamily as ProofFamily>::SOCKET);
+                                    let filled =
+                                        lfm_execute_and_fill(&program.program, &arena, hasher)
+                                            .map_err(|e| format!("early leaf {k}: {e:?}"))?;
+                                    return Ok((filled, arena, started, t.elapsed().as_secs_f64()));
+                                }
                                 // The staging pairs the tree's first card holds
                                 // would allocate, made now, beside the base.
                                 let staging =
@@ -2331,7 +2434,7 @@ pub fn prove_whir_block_tree(
                                 }
                                 Ok((filled, arena, started, secs))
                             });
-                            early = Some(EarlyLeaf {
+                            early.push(EarlyLeaf {
                                 leaf: k,
                                 complete_at: msg.at,
                                 handle,
@@ -2484,7 +2587,7 @@ pub fn prove_whir_block_tree(
         *offered_at.lock().unwrap_or_else(|e| e.into_inner()),
         stated_at,
         lead.taken(),
-        early.as_ref().map(|e| e.leaf),
+        &early.iter().map(|e| e.leaf).collect::<Vec<_>>(),
     ));
     sink.line(&format!(
         "W3 TREE PROGRAM BUDGET: {}",
@@ -3971,6 +4074,31 @@ mod tests {
     /// unchanged. Proved over it, with one worker (inline) or two, every
     /// program proves, and one worker takes the early leaf first.
     #[test]
+    fn the_early_leaves_are_taken_first_in_the_order_they_completed() {
+        let shape = vec![super::super::per_table_aggregator::Level {
+            arities: vec![3, 2],
+        }];
+        let base = tree_order(5, &shape);
+        let leaf = |j| TreeAt { lv: 0, j };
+        let led = early_leaves_first(base.clone(), &[3, 1]);
+        assert_eq!(&led[..5], &[leaf(3), leaf(1), leaf(0), leaf(2), leaf(4)]);
+        assert_eq!(
+            &led[5..],
+            &base[5..],
+            "the nodes keep their order, after every leaf"
+        );
+        assert_eq!(early_leaves_first(base.clone(), &[]), base);
+        assert_eq!(
+            early_leaves_first(base.clone(), &[2]),
+            early_leaf_first(base.clone(), Some(2)),
+            "one early leaf is the single case"
+        );
+        assert_eq!(early_leaves_setting(None), Ok(1));
+        assert_eq!(early_leaves_setting(Some(3)), Ok(3));
+        assert!(early_leaves_setting(Some(0)).is_err());
+    }
+
+    #[test]
     fn the_early_leaf_is_taken_first() {
         use super::super::per_table_aggregator::Level;
         let shape = vec![
@@ -4902,6 +5030,7 @@ mod tests {
             leaves_each: false,
             program_budget: super::super::program_budget::BudgetSetting::Auto,
             early_on: true,
+            early_leaves: 1,
             leaf_emitters: Some(LEAF_EMITTERS),
             argue: BlockFormat::production().argue,
             format: BlockFormat::production(),
