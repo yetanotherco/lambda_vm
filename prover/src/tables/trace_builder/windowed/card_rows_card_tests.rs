@@ -1,5 +1,6 @@
 //! ★ The card-built rows' upload on the card (`math_cuda::card_rows`,
-//! `LAMBDA_VM_CARD_ROWS`): a
+//! `LAMBDA_VM_CARD_ROWS`); `registers` (MEMW_R's rows built from the logs) at
+//! the end of the file: a
 //! group's upload in the knob's `order` (every copy, then every kernel) and
 //! `derive` (CPU logs kept on the card; LOAD and STORE derived from them)
 //! writes the words today's upload writes, group by group, in the hand-out's
@@ -38,6 +39,7 @@ impl Drop for Reset {
     fn drop(&mut self) {
         card_rows::FAULT_CYCLE_SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
         card_rows::FAULT_FAMILIES.store(0, std::sync::atomic::Ordering::Relaxed);
+        card_rows::FAULT_REGISTERS.store(0, std::sync::atomic::Ordering::Relaxed);
         card_rows::set_mode_override(None);
         card_rows::end();
     }
@@ -263,5 +265,279 @@ fn card_rows_on_a_real_block_write_todays_words() {
             "{family}: no table derived, the mutant cannot bite"
         );
         assert!(moved > 0, "{family}: the mutant moved no group");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `registers`: MEMW_R's rows built on the card from the CPU logs it holds.
+// ---------------------------------------------------------------------------
+
+/// The absorbing side's word for "enough windows" ([`history_chunks`]).
+const ENOUGH: &str = "card rows test: enough windows walked";
+
+/// Every chunk a record-mode run of `program` hands out as records (every
+/// row family's too), MEMW_R's with their ECALL cycles
+/// ([`WindowedTraceBuilder::card_marks_ecalls`]): windows of `window` cycles
+/// walked from the fast engine's history on two walkers, through `windows`
+/// windows absorbed (all of them: `None`), in hand-out order.
+fn history_chunks(
+    program: &Elf,
+    input: &[u8],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    windows: Option<usize>,
+) -> Vec<(StreamTable, usize, Records)> {
+    use super::parallel::{ExecWindow, walk_windows_from_history};
+    use super::{RowFamilies, WindowedTraceBuilder};
+    use executor::vm::fast::FastExecutor;
+    let mut builder = WindowedTraceBuilder::new(program, input, max_rows)
+        .and_then(WindowedTraceBuilder::drop_streamed_ops)
+        .and_then(|b| b.card_fill_streamed(std::sync::Arc::new(|_| true), true, true))
+        .and_then(|b| b.card_fill_streamed_rows(RowFamilies::ALL))
+        .and_then(WindowedTraceBuilder::card_marks_ecalls)
+        .expect("the builder");
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
+    let mut held = Vec::new();
+    let walked = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut fast = FastExecutor::new(program, input.to_vec()).expect("the fast engine");
+            fast.enable_history().expect("history mode");
+            while let Some((logs, history)) = fast.resume_history(window).expect("the run") {
+                let last = (fast.pc() == 0)
+                    .then(|| fast.take_history_final().map(Box::new))
+                    .flatten();
+                let sent = tx.send(ExecWindow {
+                    logs: std::sync::Arc::new(logs),
+                    start: None,
+                    history: Some(Box::new(history)),
+                    last,
+                });
+                if sent.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut absorbed = 0usize;
+        walk_windows_from_history(&mut builder, rx, 2, 0, |accumulator, walked, _| {
+            for job in accumulator.absorb(walked) {
+                let (table, index) = (job.table, job.index);
+                if !job.is_records() {
+                    continue;
+                }
+                let mut chunk = job.generate();
+                if let Some(records) = chunk.trace.take_records_main() {
+                    held.push((table, index, records));
+                }
+            }
+            absorbed += 1;
+            if windows.is_some_and(|n| absorbed >= n) {
+                return Err(crate::Error::Prover(ENOUGH.to_string()));
+            }
+            Ok(())
+        })
+    });
+    match walked {
+        Ok(_) => {}
+        Err(crate::Error::Prover(e)) if e == ENOUGH => {}
+        Err(e) => panic!("the record-mode walk: {e:?}"),
+    }
+    held
+}
+
+/// The groups uploaded in [`Mode::Registers`], forwards from an empty cache
+/// and then backwards with it warm, against today's upload: the words
+/// differing in each (0 everywhere). Returns the counters at the passes' end
+/// and today's stores.
+fn compare_registers(
+    groups: &[Vec<&Records>],
+    what: &str,
+) -> (card_rows::Stats, Vec<Vec<Vec<u64>>>) {
+    let forwards: Vec<usize> = (0..groups.len()).collect();
+    let backwards: Vec<usize> = (0..groups.len()).rev().collect();
+    card_rows::clear();
+    let today: Vec<Vec<Vec<u64>>> = stores(groups, &forwards, Mode::Off)
+        .into_iter()
+        .map(|(g, store)| store.unwrap_or_else(|| panic!("{what}: today's group {g} declined")))
+        .collect();
+    card_rows::clear();
+    for order in [&forwards, &backwards] {
+        for (g, got) in stores(groups, order, Mode::Registers) {
+            let got = got.unwrap_or_else(|| panic!("{what}: registers declined group {g}"));
+            let (count, first) = mismatches(&got, &today[g]);
+            assert_eq!(
+                count, 0,
+                "{what}: registers group {g}: {count} words differ, the first at {first:?}"
+            );
+        }
+    }
+    (card_rows::stats(), today)
+}
+
+/// ★ Record-mode runs of programs with every ECALL the walk handles, windows
+/// of 7 and 33 cycles, CPU and MEMW_R chunks of 32 rows, in groups of 3 and
+/// 8: under `registers` every group writes today's words both ways, and the
+/// rule built rows and sent rows whole for an ECALL, after one and before
+/// their table.
+#[test]
+fn card_built_register_rows_write_todays_words_forwards_and_backwards() {
+    let _reset = Reset::new();
+    let max_rows = MaxRowsConfig::small();
+    let mut sum = card_rows::Stats::default();
+    for name in [
+        "all_instructions_64",
+        "all_loadstore_32",
+        "test_keccak_multi",
+        "test_commit_split",
+        "test_copy_ecalls",
+        "test_ecsm",
+        "test_blake3_absorb",
+        "misalign_sd",
+    ] {
+        let (program, _) = run(name);
+        for window in [7usize, 33] {
+            let chunks = history_chunks(&program, &[], &max_rows, window, None);
+            for size in [3usize, 8] {
+                let groups = grouped(&chunks, size);
+                let (s, _) = compare_registers(
+                    &groups,
+                    &format!("{name}, window {window}, groups of {size}"),
+                );
+                assert_eq!(s.declined, 0, "{name}: a group declined");
+                sum.derived_memw_r += s.derived_memw_r;
+                sum.records_memw_r += s.records_memw_r;
+                sum.register_words += s.register_words;
+                sum.whole.ecall += s.whole.ecall;
+                sum.whole.after_ecall += s.whole.after_ecall;
+                sum.whole.before_table += s.whole.before_table;
+                sum.whole.not_held += s.whole.not_held;
+                sum.whole.other += s.whole.other;
+            }
+        }
+    }
+    let w = sum.whole;
+    println!(
+        "CARD ROWS REGISTERS SMALL: MEMW_R derived {} (as records {}) · rows as words {} · whole: ECALL {}, after one {}, before their table {}, not held {}, other {}",
+        sum.derived_memw_r,
+        sum.records_memw_r,
+        sum.register_words,
+        w.ecall,
+        w.after_ecall,
+        w.before_table,
+        w.not_held,
+        w.other
+    );
+    assert!(
+        sum.derived_memw_r > 0 && sum.register_words > 0,
+        "the mechanism did not move: {sum:?}"
+    );
+    assert!(
+        w.ecall > 0 && w.before_table > 0,
+        "a reason to send rows whole never met: {w:?}"
+    );
+}
+
+/// The real block (`BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`) at the production
+/// heights in record mode: the chunks of its first
+/// `CARD_ROWS_REGISTER_WINDOWS` windows (default 20), in groups of ten in
+/// hand-out order, under `registers` against today's, forwards and
+/// backwards. Then one mutant at a time on the same groups and passes, each
+/// required to derive a MEMW_R table and to move a group (other words, or the
+/// group declined): the kernel reading `rs2`'s row as `rs1`'s; the kernel
+/// reading a write's old value as the written value of its old timestamp's
+/// cycle, whatever the slot; the host sending a write whose register was last
+/// touched before its CPU table as its timestamps; the host sending an ECALL
+/// cycle's rows, and the writes after one, as their timestamps.
+#[test]
+#[ignore = "card: a box test (BLOCK_WHIR_ELF, BLOCK_WHIR_INPUT)"]
+fn card_built_register_rows_on_a_real_block_write_todays_words() {
+    let _reset = Reset::new();
+    let elf =
+        std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF")).expect("the ELF");
+    let input =
+        std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT")).expect("input");
+    let windows: usize = std::env::var("CARD_ROWS_REGISTER_WINDOWS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(20);
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let options = crate::block_whir::BlockOptions::production();
+    let window = 1usize << options.window_log2.expect("the block streams");
+    let t = std::time::Instant::now();
+    let chunks = history_chunks(&program, &input, &options.max_rows, window, Some(windows));
+    let count = |table: StreamTable| chunks.iter().filter(|c| c.0 == table).count();
+    println!(
+        "CARD ROWS REGISTERS REAL: {} chunks ({} CPU, {} MEMW_R) of the first {windows} windows in {:.1}s",
+        chunks.len(),
+        count(StreamTable::Cpu),
+        count(StreamTable::MemwRegister),
+        t.elapsed().as_secs_f64()
+    );
+    let groups = grouped(&chunks, 10);
+    let (s, today) = compare_registers(&groups, "the real block");
+    let w = s.whole;
+    println!(
+        "CARD ROWS REGISTERS REAL VERDICT: 0 words differ in {} groups × 2 passes · MEMW_R derived {} (as records {}) · rows as words {} · whole: ECALL {}, after one {}, before their table {}, not held {}, other {} · words {} B · whole rows {} B",
+        groups.len(),
+        s.derived_memw_r,
+        s.records_memw_r,
+        s.register_words,
+        w.ecall,
+        w.after_ecall,
+        w.before_table,
+        w.not_held,
+        w.other,
+        s.register_word_bytes,
+        s.register_whole_bytes
+    );
+    assert!(
+        s.derived_memw_r > 0 && s.register_words > 0,
+        "no MEMW_R table built on the real block: {s:?}"
+    );
+    // The host mutants below need these rows in the tables built.
+    assert!(
+        w.before_table > 0 && w.ecall + w.after_ecall > 0,
+        "the real block's built tables hold no row a host mutant can move: {w:?}"
+    );
+
+    let forwards: Vec<usize> = (0..groups.len()).collect();
+    let backwards: Vec<usize> = (0..groups.len()).rev().collect();
+    for (name, bit) in [
+        ("rs2 read as rs1", card_rows::REGISTER_FAULT_SLOT),
+        (
+            "old value read whatever its slot",
+            card_rows::REGISTER_FAULT_VALUE_AT,
+        ),
+        (
+            "write before its table sent as timestamps",
+            card_rows::REGISTER_FAULT_START,
+        ),
+        (
+            "ECALL rows sent as timestamps",
+            card_rows::REGISTER_FAULT_ECALL,
+        ),
+    ] {
+        card_rows::clear();
+        card_rows::FAULT_REGISTERS.store(bit, std::sync::atomic::Ordering::Relaxed);
+        let (mut moved, mut uploads) = (0usize, 0usize);
+        for order in [&forwards, &backwards] {
+            for (g, got) in stores(&groups, order, Mode::Registers) {
+                uploads += 1;
+                moved += usize::from(match got {
+                    None => true,
+                    Some(got) => mismatches(&got, &today[g]).0 > 0,
+                });
+            }
+        }
+        let after = card_rows::stats();
+        card_rows::FAULT_REGISTERS.store(0, std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "CARD ROWS REGISTERS MUTANT {name}: {moved} of {uploads} groups moved · MEMW_R tables derived {} · declined {}",
+            after.derived_memw_r, after.declined
+        );
+        assert!(
+            after.derived_memw_r > 0,
+            "{name}: no MEMW_R table derived, the mutant cannot bite"
+        );
+        assert!(moved > 0, "{name}: the mutant moved no group");
     }
 }

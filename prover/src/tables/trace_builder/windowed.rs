@@ -964,6 +964,41 @@ impl<'a> WindowedTraceBuilder<'a> {
         Ok(self)
     }
 
+    /// With [`Self::card_fill_streamed`] holding MEMW_R chunks as records,
+    /// also hand each out with the run's ECALL cycles over its rows' span
+    /// ([`multilinear::records::TableRecords::ecall_cycles`]), for the card
+    /// to build its register rows from the CPU logs
+    /// (`LAMBDA_VM_CARD_ROWS=registers`). Each walker reads its window's
+    /// ECALL cycles from the window's history, so only windows walked from
+    /// the executor's history carry them; one that comes without them stops
+    /// them for the rest of the run. Before the first window only. The
+    /// tables are the same.
+    pub fn card_marks_ecalls(mut self) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "card_marks_ecalls after a window was walked".to_string(),
+            ));
+        }
+        if !self.card_fill_streamed.as_ref().is_some_and(|c| c.memw_r) {
+            return Err(Error::Prover(
+                "card_marks_ecalls: card_fill_streamed with MEMW_R first".to_string(),
+            ));
+        }
+        let Some(kept) = self.kept.as_mut() else {
+            return Err(Error::Prover(
+                "card_marks_ecalls: a build that drops its streamed ops".to_string(),
+            ));
+        };
+        kept.ecalls = Some(EcallTail::default());
+        Ok(self)
+    }
+
+    /// Whether the walkers read each window's ECALL cycles from its history
+    /// ([`Self::card_marks_ecalls`]).
+    pub fn marks_ecalls(&self) -> bool {
+        self.kept.as_ref().is_some_and(|kept| kept.ecalls.is_some())
+    }
+
     /// A test's fault: with [`Self::card_fill_streamed`], each CPU chunk held
     /// as its logs has every log's first source value (`src1_val`) and
     /// written value (`dst_val`) XORed with `by` (the CPU table writes its own
@@ -1354,6 +1389,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             walk,
             logs: None,
             made: None,
+            ecalls: None,
         };
         super::build_stamps::mark("p0 last window");
         let Self {
@@ -1689,6 +1725,9 @@ pub struct WalkedWindow {
     /// Its routing, made by its walker, which counted its rows
     /// ([`WindowedTraceBuilder::count_where_made`]); `None` otherwise.
     made: Option<WindowMade>,
+    /// Its ECALL cycles, ascending, read from its history by its walker
+    /// ([`WindowedTraceBuilder::card_marks_ecalls`]); `None` otherwise.
+    ecalls: Option<Vec<u32>>,
 }
 
 impl WalkedWindow {
@@ -1743,6 +1782,12 @@ impl WalkedWindow {
     /// cycles fall in ([`WindowedTraceBuilder::card_fill_streamed`]).
     pub fn keep_logs(&mut self, logs: Arc<Vec<Log>>) {
         self.logs = Some(logs);
+    }
+
+    /// Keeps the window's ECALL cycles, ascending, for its MEMW_R chunks
+    /// ([`WindowedTraceBuilder::card_marks_ecalls`]).
+    pub fn keep_ecall_cycles(&mut self, cycles: Vec<u32>) {
+        self.ecalls = Some(cycles);
     }
 
     /// Its cycles.
@@ -1903,6 +1948,7 @@ fn walk_window(
         walk,
         logs: None,
         made,
+        ecalls: None,
     })
 }
 
@@ -2750,6 +2796,55 @@ impl<T: Clone> Tail<T> {
     }
 }
 
+/// The run's ECALL cycles, ascending, appended window by window as their
+/// walkers read them from the windows' histories, and let go once no MEMW_R
+/// chunk still to leave can read them
+/// ([`WindowedTraceBuilder::card_marks_ecalls`]).
+#[derive(Default)]
+struct EcallTail {
+    cycles: Vec<u32>,
+}
+
+/// Cycles before a MEMW_R chunk's first row's cycle whose ECALLs its rows
+/// may read: a row's old timestamp is at most 2^16 before its own, so at
+/// most 2^14 cycles and a slot before it (the card's
+/// `math_cuda::card_rows::ECALL_SPAN_BEFORE`, the same number).
+const ECALL_SPAN_BEFORE: u64 = (1 << 14) + 1;
+
+#[cfg(test)]
+const _: () = assert!(ECALL_SPAN_BEFORE == math_cuda::card_rows::ECALL_SPAN_BEFORE);
+
+impl EcallTail {
+    /// The ECALL cycles a MEMW_R chunk of `rows` reads, from
+    /// [`ECALL_SPAN_BEFORE`] cycles before its first
+    /// row's cycle to its last row's (an old timestamp is at most 2^16
+    /// before its row's); then the cycles no later chunk reads let go (the
+    /// rows leave in cycle order). `None` for no rows.
+    fn chunk(&mut self, rows: &Segments<super::RegRow>) -> Option<Arc<[u32]>> {
+        let slices = rows.slices();
+        let at = |row: &super::RegRow| {
+            let ts = super::memw_register::card_rows(std::slice::from_ref(row))[0].timestamp;
+            ts.saturating_sub(4) / 4
+        };
+        let first = slices.iter().find_map(|s| s.first()).map(at)?;
+        let last = slices.iter().rev().find_map(|s| s.last()).map(at)?;
+        let before = ECALL_SPAN_BEFORE;
+        let from = self
+            .cycles
+            .partition_point(|&c| u64::from(c) < first.saturating_sub(before));
+        let to = self.cycles.partition_point(|&c| u64::from(c) <= last);
+        let span: Arc<[u32]> = Arc::from(self.cycles.get(from..to.max(from))?);
+        // The next chunk's rows start at this one's last cycle or later.
+        let dead = self
+            .cycles
+            .partition_point(|&c| u64::from(c) < last.saturating_sub(before));
+        if dead * 2 >= self.cycles.len() {
+            self.cycles.drain(..dead);
+        }
+        Some(span)
+    }
+}
+
 /// The run so far under [`WindowedTraceBuilder::drop_streamed_ops`].
 struct Kept {
     cpu: Tail<super::CpuOperation>,
@@ -2758,6 +2853,11 @@ struct Kept {
     /// `None` without, and from a window that came without its logs on.
     logs: Option<Tail<Log>>,
     register_rows: Tail<super::RegRow>,
+    /// The run's ECALL cycles the MEMW_R chunks still to leave may read,
+    /// while [`WindowedTraceBuilder::card_marks_ecalls`] hands them out with
+    /// their chunks; `None` without, and from a window that came without
+    /// them.
+    ecalls: Option<EcallTail>,
     aligned: Tail<memw_aligned::AlignedRow>,
     general: Tail<super::MemwOperation>,
     load: Tail<super::LoadOperation>,
@@ -2888,6 +2988,7 @@ impl Kept {
             cpu: Tail::new(),
             logs: None,
             register_rows: Tail::new(),
+            ecalls: None,
             aligned: Tail::new(),
             general: Tail::new(),
             load: Tail::new(),
@@ -2985,6 +3086,7 @@ impl Kept {
             walk,
             logs,
             made: _,
+            ecalls,
         } = window;
         // A window whose walker kept its list: the run goes back to the list
         // from here, the tail's ops rebuilt from its logs, and its logs
@@ -3026,6 +3128,12 @@ impl Kept {
             match logs {
                 Some(logs) if logs.len() == cpu_ops.len() => tail.push_shared(logs),
                 _ => self.logs = None,
+            }
+        }
+        if let Some(tail) = self.ecalls.as_mut() {
+            match ecalls {
+                Some(cycles) => tail.cycles.extend_from_slice(&cycles),
+                None => self.ecalls = None,
             }
         }
         let WalkOutputs {
@@ -3074,6 +3182,7 @@ impl Kept {
             cpu,
             logs: _,
             register_rows,
+            ecalls: _,
             aligned,
             general,
             load,
@@ -3335,9 +3444,12 @@ fn row_regenerate<T: RowFamily>(
 }
 
 /// A full MEMW_R chunk's rows as handed out: as the records the card fills it
-/// from while the host has room, to be filled on the host otherwise.
+/// from while the host has room, with the run's ECALL cycles over their span
+/// when the run hands them out ([`WindowedTraceBuilder::card_marks_ecalls`]),
+/// to be filled on the host otherwise.
 fn memw_register_chunk_ops(
     rows: Segments<super::RegRow>,
+    ecalls: Option<Arc<[u32]>>,
     index: usize,
     card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
 ) -> ChunkOps {
@@ -3353,7 +3465,7 @@ fn memw_register_chunk_ops(
         Ok(records) => {
             stamps.memw_r[0] += 1;
             stamps.records_bytes += bytes;
-            ChunkOps::MemwRegisterRecords(records)
+            ChunkOps::MemwRegisterRecords(records.with_ecall_cycles(ecalls))
         }
         Err(rows) => {
             stamps.memw_r[1] += 1;
@@ -3488,8 +3600,10 @@ fn tail_jobs(
             Some(counter) => counter.send(CountWork::MemwRegister(rows.clone())),
             None => handout_count::count_memw_register(&rows, &mut counted.histogram),
         }
+        let ecalls = kept.ecalls.as_mut().and_then(|tail| tail.chunk(&rows));
         let ops = memw_register_chunk_ops(
             rows,
+            ecalls,
             e.memw_register,
             card.as_mut().map(|(c, s)| (*c, &mut **s)),
         );

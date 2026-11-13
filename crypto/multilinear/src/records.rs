@@ -586,6 +586,15 @@ pub trait TableRecords: Send + Sync + std::fmt::Debug {
     fn return_pages(&mut self) -> PagesReturned {
         PagesReturned::default()
     }
+
+    /// A MEMW_R chunk's ECALL cycles, ascending, from 2^14 + 1 cycles before
+    /// its first row's cycle to its last row's, when the run's history gave
+    /// them: the card-built register rows read them
+    /// (`math_cuda::card_rows`). `None` (the default) otherwise, and for
+    /// every other family. Neither fill reads them.
+    fn ecall_cycles(&self) -> Option<&[u32]> {
+        None
+    }
 }
 
 /// A table's records, shared: two are equal when they fill the same table
@@ -626,6 +635,11 @@ impl Records {
 
     pub fn host_fill(&self) -> Option<NarrowColumns> {
         self.0.host_fill()
+    }
+
+    /// [`TableRecords::ecall_cycles`].
+    pub fn ecall_cycles(&self) -> Option<&[u32]> {
+        self.0.ecall_cycles()
     }
 
     /// Lets the records go, first handing their buffers' pages back to the
