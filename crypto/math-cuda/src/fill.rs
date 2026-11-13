@@ -624,6 +624,19 @@ pub enum RecordsInput<'a> {
         rows: usize,
         ecall_cycles: Option<&'a [u32]>,
     },
+    /// MEMW_R's `rows` rows as the walk wrote them in words mode
+    /// ([`crate::card_rows`], `LAMBDA_VM_CARD_ROWS=words`): a word a row,
+    /// `timestamp | old_timestamp << 32`, or a marker (low half 0) whose high
+    /// half less `whole_base` indexes `whole`. `decode(from, to)` gives rows
+    /// `from..to` decoded on the host (the rows the card cannot build, and
+    /// every row where the card does not build them).
+    MemwRWords {
+        words: &'a [&'a [u64]],
+        whole: &'a [&'a [RegRowC]],
+        whole_base: u64,
+        rows: usize,
+        decode: &'a (dyn Fn(usize, usize) -> Vec<RegRowC> + Sync),
+    },
     /// MEMW_A's `rows` rows: `records`' pieces in order, then zero rows.
     MemwA {
         records: &'a [&'a [AlignedRowC]],
@@ -657,6 +670,7 @@ impl std::fmt::Debug for RecordsInput<'_> {
             Self::KeccakRnd { .. } => "KECCAK_RND",
             Self::Cpu { .. } => "CPU",
             Self::MemwR { .. } => "MEMW_R",
+            Self::MemwRWords { .. } => "MEMW_R (words)",
             Self::MemwA { .. } => "MEMW_A",
             Self::Load { .. } => "LOAD",
             Self::Store { .. } => "STORE",
@@ -679,6 +693,7 @@ impl RecordsInput<'_> {
             Self::KeccakRnd { rows, .. }
             | Self::Cpu { rows, .. }
             | Self::MemwR { rows, .. }
+            | Self::MemwRWords { rows, .. }
             | Self::MemwA { rows, .. }
             | Self::Load { rows, .. }
             | Self::Store { rows, .. }
@@ -692,7 +707,7 @@ impl RecordsInput<'_> {
         match self {
             Self::KeccakRnd { .. } => KECCAK_RND_COLUMNS,
             Self::Cpu { .. } => CPU_COLUMNS,
-            Self::MemwR { .. } => MEMW_R_COLUMNS,
+            Self::MemwR { .. } | Self::MemwRWords { .. } => MEMW_R_COLUMNS,
             Self::MemwA { .. } => MEMW_A_COLUMNS,
             Self::Load { .. } => LOAD_COLUMNS,
             Self::Store { .. } => STORE_COLUMNS,
@@ -708,6 +723,10 @@ impl RecordsInput<'_> {
             Self::KeccakRnd { ops, .. } => size_of_val(*ops),
             Self::Cpu { logs, .. } => logs.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::MemwR { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::MemwRWords { words, whole, .. } => {
+                words.iter().map(|piece| size_of_val(*piece)).sum::<usize>()
+                    + whole.iter().map(|piece| size_of_val(*piece)).sum::<usize>()
+            }
             Self::MemwA { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Load { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Store { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
@@ -722,6 +741,7 @@ impl RecordsInput<'_> {
             Self::KeccakRnd { ops, .. } => ops.len(),
             Self::Cpu { logs, .. } => logs.iter().map(|piece| piece.len()).sum(),
             Self::MemwR { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::MemwRWords { words, .. } => words.iter().map(|piece| piece.len()).sum(),
             Self::MemwA { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Load { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Store { records, .. } => records.iter().map(|piece| piece.len()).sum(),
@@ -763,7 +783,7 @@ impl FillChecks {
 /// `pieces` on the card, one after another in one buffer: each a pageable
 /// copy on `stream`, as [`upload`] copies one slice. No record uploads one
 /// default record so the kernel gets a pointer; it reads none.
-fn upload_pieces<T: DeviceRepr + Default>(
+pub(crate) fn upload_pieces<T: DeviceRepr + Default>(
     stream: &Arc<CudaStream>,
     pieces: &[&[T]],
 ) -> Result<CudaSlice<T>> {
@@ -917,6 +937,14 @@ pub(crate) fn fill_col_major_into(
             let records_dev = upload_pieces(stream, pieces)?;
             launch_rows(stream, &m.memw_r, &records_dev, records.len(), rows, dst)
         }
+        // Words where the card does not build the rows: every row decoded on
+        // the host, then today's fill.
+        RecordsInput::MemwRWords { rows, decode, .. } => {
+            let n = records.len();
+            let decoded = decode(0, n);
+            let records_dev = upload_pieces(stream, &[&decoded[..]])?;
+            launch_rows(stream, &m.memw_r, &records_dev, n, rows, dst)
+        }
         RecordsInput::MemwA {
             records: pieces,
             rows,
@@ -1004,6 +1032,9 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
             decode: decode.as_ref(),
         },
         RecordsInput::MemwR { records, .. } => Staged::MemwR(upload_pieces(stream, records)?, n),
+        RecordsInput::MemwRWords { decode, .. } => {
+            Staged::MemwR(upload_pieces(stream, &[&decode(0, n)[..]])?, n)
+        }
         RecordsInput::MemwA { records, .. } => Staged::MemwA(upload_pieces(stream, records)?, n),
         RecordsInput::Load { records, .. } => Staged::Load(upload_pieces(stream, records)?, n),
         RecordsInput::Store { records, .. } => Staged::Store(upload_pieces(stream, records)?, n),

@@ -76,6 +76,9 @@ pub enum Mode {
     Derive,
     /// [`Mode::Derive`], and MEMW_R's register rows built on the card.
     Registers,
+    /// [`Mode::Derive`], and MEMW_R's register rows built on the card from
+    /// the words the walk writes in their place (no host plan).
+    Words,
 }
 
 impl Mode {
@@ -91,8 +94,9 @@ impl Mode {
             Some("0") | Some("off") => Ok(Self::Off),
             Some("derive") | Some("1") => Ok(Self::Derive),
             Some("registers") => Ok(Self::Registers),
+            Some("words") => Ok(Self::Words),
             Some(other) => Err(format!(
-                "{CARD_ROWS_ENV}={other}: expected off, order, derive or registers"
+                "{CARD_ROWS_ENV}={other}: expected off, order, derive, registers or words"
             )),
         }
     }
@@ -103,12 +107,13 @@ impl Mode {
             Self::Order => "order",
             Self::Derive => "derive",
             Self::Registers => "registers",
+            Self::Words => "words",
         }
     }
 
     /// Whether the card keeps CPU logs and derives tables from them.
     pub fn derives(self) -> bool {
-        matches!(self, Self::Derive | Self::Registers)
+        matches!(self, Self::Derive | Self::Registers | Self::Words)
     }
 }
 
@@ -117,6 +122,12 @@ impl Mode {
 /// ECALL cycles, when its run has a history.
 pub fn builds_registers() -> bool {
     mode() == Mode::Registers
+}
+
+/// Whether the walk writes MEMW_R's register rows as words for the card to
+/// build them from ([`Mode::Words`]).
+pub fn builds_words() -> bool {
+    mode() == Mode::Words
 }
 
 /// A test's override of the knob (0: none; 1 + the mode's index).
@@ -131,6 +142,7 @@ pub fn mode() -> Mode {
         2 => return Mode::Order,
         3 => return Mode::Derive,
         4 => return Mode::Registers,
+        5 => return Mode::Words,
         _ => {}
     }
     static FROM_ENV: OnceLock<Mode> = OnceLock::new();
@@ -154,6 +166,7 @@ pub fn set_mode_override(mode: Option<Mode>) {
         Some(Mode::Order) => 2,
         Some(Mode::Derive) => 3,
         Some(Mode::Registers) => 4,
+        Some(Mode::Words) => 5,
     };
     OVERRIDE.store(v, Ordering::Relaxed);
 }
@@ -435,7 +448,7 @@ pub fn clear() {
 pub fn report_line() -> String {
     let s = stats();
     let (entries, bytes) = held();
-    let registers = if mode() == Mode::Registers {
+    let registers = if matches!(mode(), Mode::Registers | Mode::Words) {
         let w = s.whole;
         format!(
             " · MEMW_R derived {} of {} · register rows as words {} · whole {} (ECALL {}, after one {}, before their table {}, not held {}, other {}) · MEMW_R records not sent {} B · words {} B · whole rows {} B · planned in {:.3} s summed, {:.3} s waited",
@@ -930,12 +943,15 @@ struct RegistersTableC {
     height: u64,
     out: u64,
     before: u64,
+    /// The run index of `whole`'s first row (a marker's high half less this
+    /// indexes `whole`; 0 for a planned table).
+    whole_base: u64,
 }
 
 const _: () = {
     assert!(std::mem::size_of::<CachedLogsC>() == 24);
     assert!(std::mem::size_of::<RowsTableC>() == 40);
-    assert!(std::mem::size_of::<RegistersTableC>() == 48);
+    assert!(std::mem::size_of::<RegistersTableC>() == 56);
 };
 
 // SAFETY: plain `#[repr(C)]` data of `u64`s, as the kernel reads them.
@@ -985,6 +1001,125 @@ enum Plan {
     },
     /// A MEMW_R table built from the cached logs.
     Registers(RegisterPlan),
+    /// A MEMW_R table built from the walk's words and the cached logs.
+    Words(WordsPlan),
+}
+
+/// A MEMW_R table in words mode as it goes up: the word ranges whose cycles'
+/// logs the card does not hold, decoded on the host into `extra` (sent whole,
+/// after the table's own whole rows, their words patched to markers).
+struct WordsPlan {
+    ranges: Vec<(usize, usize)>,
+    extra: Vec<RegRowC>,
+    n_whole: usize,
+    whole_base: u64,
+    n: usize,
+    span: (u64, u64),
+    /// Markers among the decoded ranges (their rows were whole already).
+    markers_decoded: usize,
+}
+
+/// [`WordsPlan`] of a table's `words` (pieces in order) against the CPU
+/// tables `held` (first cycle, count; ascending): the cycles not held form
+/// index ranges, found by binary search (a table's words are in cycle order),
+/// and decoded with `decode`.
+fn plan_words(
+    words: &[&[u64]],
+    whole: &[&[RegRowC]],
+    whole_base: u64,
+    held: &[(u64, u64)],
+    decode: &(dyn Fn(usize, usize) -> Vec<RegRowC> + Sync),
+) -> Option<WordsPlan> {
+    let starts: Vec<usize> = words
+        .iter()
+        .scan(0usize, |at, p| {
+            let s = *at;
+            *at += p.len();
+            Some(s)
+        })
+        .collect();
+    let n: usize = words.iter().map(|p| p.len()).sum();
+    if n == 0 {
+        return None;
+    }
+    let whole_flat: Vec<&RegRowC> = whole.iter().flat_map(|p| p.iter()).collect();
+    let word_at = |i: usize| -> u64 {
+        let k = starts.partition_point(|&s| s <= i) - 1;
+        words[k][i - starts[k]]
+    };
+    let cycle_of = |i: usize| -> Option<u64> {
+        let w = word_at(i);
+        let ts = if w as u32 == 0 {
+            whole_flat
+                .get(usize::try_from((w >> 32).checked_sub(whole_base)?).ok()?)?
+                .timestamp
+        } else {
+            w & 0xFFFF_FFFF
+        };
+        Some(ts.saturating_sub(4) / 4)
+    };
+    let (lo, hi) = (cycle_of(0)?, cycle_of(n - 1)?);
+    // The cycles of [lo, hi] no held CPU table covers.
+    let mut gaps = Vec::new();
+    let mut c = lo;
+    for &(f, len) in held {
+        if f + len <= c {
+            continue;
+        }
+        if f > hi {
+            break;
+        }
+        if f > c {
+            gaps.push((c, f - 1));
+        }
+        c = c.max(f + len);
+        if c > hi {
+            break;
+        }
+    }
+    if c <= hi {
+        gaps.push((c, hi));
+    }
+    let lower = |pred: &dyn Fn(u64) -> bool| -> Option<usize> {
+        // The first index whose cycle fails `pred` (cycles ascend).
+        let (mut a, mut b) = (0usize, n);
+        while a < b {
+            let m = (a + b) / 2;
+            if pred(cycle_of(m)?) {
+                a = m + 1;
+            } else {
+                b = m;
+            }
+        }
+        Some(a)
+    };
+    let mut ranges = Vec::new();
+    for (a, b) in gaps {
+        let s = lower(&|c| c < a)?;
+        let e = lower(&|c| c <= b)?;
+        if s < e {
+            ranges.push((s, e));
+        }
+    }
+    let mut extra = Vec::new();
+    let mut markers_decoded = 0usize;
+    for &(s, e) in &ranges {
+        markers_decoded += (s..e).filter(|&i| word_at(i) as u32 == 0).count();
+        let rows = decode(s, e);
+        if rows.len() != e - s {
+            return None;
+        }
+        extra.extend(rows);
+    }
+    Some(WordsPlan {
+        ranges,
+        extra,
+        n_whole: whole_flat.len(),
+        whole_base,
+        n,
+        span: (lo, hi),
+        markers_decoded,
+    })
 }
 
 /// A group's upload under [`Mode::Order`], [`Mode::Derive`] or
@@ -1152,6 +1287,39 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 plans[i] = Plan::Registers(plan);
             }
         }
+        // Words mode: MEMW_R's tables as the walk wrote them; the rows of
+        // cycles the card will not hold decoded on the host.
+        if mode == Mode::Words && all_one {
+            let held: Vec<(u64, u64)> = held.iter().map(|(&first, &n)| (first, n)).collect();
+            for (i, table) in tables.iter().enumerate() {
+                let TableUpload::Records(RecordsInput::MemwRWords {
+                    words,
+                    whole,
+                    whole_base,
+                    rows,
+                    decode,
+                }) = table
+                else {
+                    continue;
+                };
+                if words.iter().map(|p| p.len()).sum::<usize>() != *rows {
+                    continue;
+                }
+                let clock = std::time::Instant::now();
+                let plan = plan_words(words, whole, *whole_base, &held, *decode);
+                let ns = clock.elapsed().as_nanos() as u64;
+                add(&counters().plan_ns, ns);
+                add(&counters().plan_wall_ns, ns);
+                let Some(plan) = plan else { continue };
+                let (lo, hi) = plan.span;
+                for (&first, e) in cache.entries.range_mut(..=hi) {
+                    if first + e.n as u64 > lo {
+                        e.tick = tick;
+                    }
+                }
+                plans[i] = Plan::Words(plan);
+            }
+        }
     }
     // A MEMW_R table with its ECALL cycles that goes up as records.
     if registers {
@@ -1184,6 +1352,10 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
             (_, Plan::Registers(plan)) => {
                 (plan.words.len() * 8 + plan.whole.len() * std::mem::size_of::<RegRowC>()) as u64
             }
+            (_, Plan::Words(plan)) => {
+                (plan.n * 8 + (plan.n_whole + plan.extra.len()) * std::mem::size_of::<RegRowC>())
+                    as u64
+            }
             (TableUpload::Narrow(packed), Plan::Narrow) => packed.bytes() as u64,
             _ => 0,
         })
@@ -1210,7 +1382,8 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
     let mut staged: Vec<Option<Staged<'_>>> = Vec::with_capacity(tables.len());
     let mut lists: Vec<Option<CudaSlice<u32>>> = Vec::with_capacity(tables.len());
     // A MEMW_R table built on the card: its words and whole rows up.
-    type RegistersUp = (CudaSlice<u64>, Option<CudaSlice<RegRowC>>);
+    // (words, whole rows, the first whole row's run index, rows)
+    type RegistersUp = (CudaSlice<u64>, Option<CudaSlice<RegRowC>>, u64, u64);
     let mut registers_up: Vec<Option<RegistersUp>> = Vec::with_capacity(tables.len());
     let mut at = 0usize;
     let mut offsets = Vec::with_capacity(tables.len());
@@ -1263,6 +1436,56 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 );
                 s = Some(Staged::Elsewhere);
             }
+            (
+                TableUpload::Records(
+                    records @ RecordsInput::MemwRWords {
+                        words: pieces,
+                        whole,
+                        ..
+                    },
+                ),
+                Plan::Words(plan),
+            ) => {
+                let mut words = crate::fill::upload_pieces(&stream, pieces).ok()?;
+                let mut k = plan.whole_base + plan.n_whole as u64;
+                for &(s, e) in &plan.ranges {
+                    let patch: Vec<u64> = (0..(e - s) as u64).map(|j| (k + j) << 32).collect();
+                    k += (e - s) as u64;
+                    stream
+                        .memcpy_htod(&patch, &mut words.slice_mut(s..e))
+                        .ok()?;
+                }
+                let mut wp: Vec<&[RegRowC]> = whole.to_vec();
+                if !plan.extra.is_empty() {
+                    wp.push(&plan.extra);
+                }
+                let total_whole = plan.n_whole + plan.extra.len();
+                let whole_dev = if total_whole == 0 {
+                    None
+                } else {
+                    Some(crate::fill::upload_pieces(&stream, &wp).ok()?)
+                };
+                r = Some((words, whole_dev, plan.whole_base, plan.n as u64));
+                let c = counters();
+                add(&c.derived_memw_r, 1);
+                let decoded: usize = plan.ranges.iter().map(|&(s, e)| e - s).sum();
+                add(
+                    &c.register_words,
+                    (plan.n - plan.n_whole.min(plan.n) - decoded + plan.markers_decoded) as u64,
+                );
+                add(&c.whole_other, (plan.n_whole - plan.markers_decoded) as u64);
+                add(&c.whole_not_held, decoded as u64);
+                add(&c.register_word_bytes, (plan.n * 8) as u64);
+                add(
+                    &c.register_whole_bytes,
+                    (total_whole * std::mem::size_of::<RegRowC>()) as u64,
+                );
+                let spared = (plan.n * std::mem::size_of::<RegRowC>()) as u64;
+                add(&c.records_bytes_spared, spared);
+                add(&c.register_records_spared, spared);
+                let _ = records;
+                s = Some(Staged::Elsewhere);
+            }
             (TableUpload::Records(records), Plan::Registers(plan)) => {
                 let word_bytes = plan.words.len() * 8;
                 let whole_bytes = std::mem::size_of_val(plan.whole.as_slice());
@@ -1274,7 +1497,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                     crate::pinned::note_upload(plan.whole.as_ptr().cast(), whole_bytes);
                     Some(stream.clone_htod(&plan.whole).ok()?)
                 };
-                r = Some((words, whole));
+                r = Some((words, whole, 0, plan.words.len() as u64));
                 let c = counters();
                 add(&c.derived_memw_r, 1);
                 add(
@@ -1387,8 +1610,11 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
             .zip(&plans)
             .zip(registers_up.iter().zip(&offsets))
         {
-            if let (Plan::Registers(plan), Some((words, whole)), TableUpload::Records(records)) =
-                (plan, up, table)
+            if let (
+                Plan::Registers(_) | Plan::Words(_),
+                Some((words, whole, whole_base, rows)),
+                TableUpload::Records(records),
+            ) = (plan, up, table)
             {
                 let (words_at, _record) = words.device_ptr(&stream);
                 let whole_at = whole.as_ref().map_or(0, |w| w.device_ptr(&stream).0);
@@ -1396,10 +1622,11 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 register_descs.push(RegistersTableC {
                     words: words_at,
                     whole: whole_at,
-                    rows: plan.words.len() as u64,
+                    rows: *rows,
                     height: records.rows() as u64,
                     out: base + (offset * 8) as u64,
                     before,
+                    whole_base: *whole_base,
                 });
             }
         }

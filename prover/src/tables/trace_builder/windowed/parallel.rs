@@ -138,6 +138,9 @@ struct WalkSettings {
     /// Record mode: keep each window's ECALL cycles with it, read from its
     /// history ([`WindowedTraceBuilder::marks_ecalls`]).
     ecall_cycles: bool,
+    /// Record mode, words: each walker writes its window's register rows as
+    /// words, the CPU tables this long ([`WindowedTraceBuilder::writes_words`]).
+    words: Option<usize>,
     /// Record mode's check: where a walker sends the digest of a rechecked
     /// window's lists ([`check_thread`]).
     digests: Option<Mutex<std::sync::mpsc::Sender<(u32, u64)>>>,
@@ -246,6 +249,16 @@ impl WindowWalker {
         self.record.overlay = Some(Box::new(HistoryOverlay::new(Arc::clone(history))));
         let settings = Arc::clone(&self.settings);
         let s = &*settings;
+        // Words mode: the window's ECALL cycles, from its history, before the
+        // walk (its walker marks the rows the card cannot build).
+        let words = s.words.map(|table| {
+            super::super::register_words::WordWindow::new(
+                job.first as u64,
+                job.logs.len(),
+                table,
+                ecall_cycles(history).into_iter().map(u64::from),
+            )
+        });
         let walked = walk_window(
             &s.decode,
             s.lookups,
@@ -258,6 +271,7 @@ impl WindowWalker {
             &mut self.registers,
             job.first,
             &job.logs,
+            words,
         );
         self.record.overlay = None;
         let mut walked = walked?;
@@ -314,6 +328,7 @@ impl WindowWalker {
             &mut self.registers,
             job.first,
             &job.logs,
+            None,
         )?;
         if s.keep_logs {
             walked.keep_logs(Arc::clone(&job.logs));
@@ -641,6 +656,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         key: std::collections::hash_map::RandomState::new().hash_one(0u64),
         keep_logs: builder.keeps_logs(),
         ecall_cycles: builder.marks_ecalls(),
+        words: builder.writes_words(),
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),
     });
     let key = settings.key;
