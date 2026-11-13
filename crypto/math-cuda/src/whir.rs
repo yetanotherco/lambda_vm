@@ -3146,16 +3146,28 @@ pub(crate) fn count_commit_leaves(num_leaves: usize, felts: usize) {
     );
 }
 
+/// Whether `hash` has a joint leaf on the card: Poseidon1's
+/// (`p1s_leaves_base_coset_joint`) and 7-round BLAKE3's
+/// (`b3w_leaves_base_coset_joint`).
+pub fn has_joint_leaf(hash: crate::DeviceHash) -> bool {
+    matches!(
+        hash,
+        crate::DeviceHash::Poseidon1 | crate::DeviceHash::Blake3
+    )
+}
+
 /// The joint leaves over `buffers` — a grouped run's 2–4 base codewords, or
 /// their gathered blocks, each `num_leaves · 2^log_block` values at stride
 /// `num_leaves` — into `out` (`num_leaves` nodes), leaf `j` at `bitrev(j)` over
-/// `leaf_bits` bits (at `j` when 0): `p1s_leaves_base_coset_joint`.
+/// `leaf_bits` bits (at `j` when 0), under `hash`'s joint leaf:
+/// `p1s_leaves_base_coset_joint` or `b3w_leaves_base_coset_joint`.
 pub(crate) fn launch_joint_leaves(
     stream: &Arc<CudaStream>,
     buffers: &[&CudaSlice<u64>],
     num_leaves: usize,
     log_block: usize,
     leaf_bits: u32,
+    hash: crate::DeviceHash,
     out: &mut cudarc::driver::CudaViewMut<'_, u8>,
 ) -> Result<()> {
     ensure!(
@@ -3166,14 +3178,25 @@ pub(crate) fn launch_joint_leaves(
         buffers.iter().all(|b| b.len() >= num_leaves << log_block),
         "a joint leaf's codeword is short"
     );
-    let k = crate::p1_stark::kernels()?;
+    let (kernel, cfg) = match hash {
+        crate::DeviceHash::Poseidon1 => (
+            &crate::p1_stark::kernels()?.leaves_base_coset_joint,
+            crate::p1_stark::launch_cfg(num_leaves as u64),
+        ),
+        crate::DeviceHash::Blake3 => (
+            &crate::blake3_whir::kernels()?.leaves_base_coset_joint,
+            crate::blake3_whir::launch_cfg(num_leaves as u64),
+        ),
+        // No joint leaf: refused, never another hash's kernel.
+        _ => return Err(crate::invalid_value()),
+    };
     let cw = |p: usize| buffers.get(p).copied().unwrap_or(buffers[0]);
     let blocks = buffers.len() as u64;
     let num_leaves_u64 = num_leaves as u64;
     let log_block_u32 = log_block as u32;
     unsafe {
         stream
-            .launch_builder(&k.leaves_base_coset_joint)
+            .launch_builder(kernel)
             .arg(cw(0))
             .arg(cw(1))
             .arg(cw(2))
@@ -3183,18 +3206,20 @@ pub(crate) fn launch_joint_leaves(
             .arg(&log_block_u32)
             .arg(&leaf_bits)
             .arg(out)
-            .launch(crate::p1_stark::launch_cfg(num_leaves_u64))?;
+            .launch(cfg)?;
     }
     Ok(())
 }
 
 /// A joint round-0 tree the card built over a grouped run's codewords
-/// ([`commit_joint`]): its nodes in the host's arity-4 layout, held until the
-/// commitment is retired (its top comes home) or opened (its paths do).
+/// ([`commit_joint`]): its nodes in the host's layout under its hash (arity 4
+/// under Poseidon1, the binary heap under BLAKE3), held until the commitment
+/// is retired (its top comes home) or opened (its paths do).
 pub struct JointTree {
     nodes: CudaSlice<u8>,
     stream: Arc<CudaStream>,
     num_leaves: usize,
+    hash: crate::DeviceHash,
 }
 
 impl JointTree {
@@ -3202,39 +3227,69 @@ impl JointTree {
         self.num_leaves
     }
 
+    /// The hash the tree was built under.
+    pub fn hash(&self) -> crate::DeviceHash {
+        self.hash
+    }
+
     /// The first `nodes` nodes (whole top levels, root first), brought home.
     pub fn top_nodes_to_host(&self, nodes: usize) -> Result<Vec<u8>> {
-        let levels = crate::p1_stark::level_sizes(self.num_leaves).len();
-        ensure!(
-            (1..=levels).any(|t| crate::p1_stark::top_levels_nodes(self.num_leaves, t) == nodes),
-            "not whole top levels of an arity-4 tree"
-        );
+        if self.hash.arity() == crate::p1_stark::ARITY {
+            let levels = crate::p1_stark::level_sizes(self.num_leaves).len();
+            ensure!(
+                (1..=levels)
+                    .any(|t| crate::p1_stark::top_levels_nodes(self.num_leaves, t) == nodes),
+                "not whole top levels of an arity-4 tree"
+            );
+        } else {
+            ensure!(
+                (nodes + 1).is_power_of_two() && nodes < 2 * self.num_leaves,
+                "not whole top levels of a binary tree"
+            );
+        }
         let out = crate::readback::clone_dtoh(&self.stream, &self.nodes.slice(0..nodes * 32))?;
         self.stream.synchronize()?;
         Ok(out)
     }
 
-    /// The authentication paths of `positions` (three siblings a level).
+    /// The authentication paths of `positions` (three siblings a level under
+    /// Poseidon1, one under BLAKE3).
     pub fn paths(&self, positions: &[u32]) -> Result<Vec<u8>> {
-        crate::p1_stark::gather_paths_dev(&self.nodes, self.num_leaves, positions, &self.stream)
+        gather_paths(
+            self.hash,
+            &self.nodes,
+            self.num_leaves,
+            positions,
+            &self.stream,
+        )
     }
 
-    /// [`Self::paths`] and the tree's cap at `cap_height` 4-ary levels below
-    /// the root (its real nodes, left to right).
+    /// [`Self::paths`] and the tree's cap at `cap_height` levels below the
+    /// root (its real nodes, left to right).
     pub fn paths_and_cap(
         &self,
         positions: &[u32],
         cap_height: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let sizes = crate::p1_stark::level_sizes(self.num_leaves);
-        ensure!(cap_height < sizes.len(), "a cap taller than the tree");
-        let level = sizes.len() - 1 - cap_height;
-        let at = crate::p1_stark::level_offsets(&sizes)[level];
+        let (start, end) = if self.hash.arity() == crate::p1_stark::ARITY {
+            let sizes = crate::p1_stark::level_sizes(self.num_leaves);
+            ensure!(cap_height < sizes.len(), "a cap taller than the tree");
+            let level = sizes.len() - 1 - cap_height;
+            let at = crate::p1_stark::level_offsets(&sizes)[level];
+            (at * 32, (at + sizes[level]) * 32)
+        } else {
+            ensure!(
+                self.num_leaves.is_power_of_two()
+                    && cap_height <= self.num_leaves.trailing_zeros() as usize,
+                "a cap taller than the tree"
+            );
+            (
+                ((1usize << cap_height) - 1) * 32,
+                ((2usize << cap_height) - 1) * 32,
+            )
+        };
         let paths = self.paths(positions)?;
-        let cap = crate::readback::clone_dtoh(
-            &self.stream,
-            &self.nodes.slice(at * 32..(at + sizes[level]) * 32),
-        )?;
+        let cap = crate::readback::clone_dtoh(&self.stream, &self.nodes.slice(start..end))?;
         self.stream.synchronize()?;
         Ok((paths, cap))
     }
@@ -3243,7 +3298,8 @@ impl JointTree {
 /// ONE tree over a grouped run's base `codewords` (2–4, equal lengths, in slot
 /// order): leaf `j` hashes every codeword's fold block `j` end to end under
 /// the joint tag, placed by `placement`; then the inner levels. Returns the
-/// tree, kept on the card, and its root. Poseidon1 only.
+/// tree, kept on the card, and its root. Poseidon1 and 7-round BLAKE3 only
+/// ([`has_joint_leaf`]).
 pub fn commit_joint(
     codewords: &[&DeviceCodeword],
     log_folding: usize,
@@ -3251,8 +3307,8 @@ pub fn commit_joint(
     placement: LeafPlacement,
 ) -> Result<(JointTree, [u8; 32])> {
     ensure!(
-        hash == crate::DeviceHash::Poseidon1,
-        "a joint tree is Poseidon1's"
+        has_joint_leaf(hash),
+        "a joint tree is Poseidon1's or 7-round BLAKE3's"
     );
     ensure!(
         (2..=4).contains(&codewords.len()),
@@ -3291,11 +3347,14 @@ pub fn commit_joint(
             num_leaves,
             log_folding,
             leaf_bits,
+            hash,
             &mut region,
         )?;
     }
     LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
-    count_commit_leaves(num_leaves, codewords.len() << log_folding);
+    if hash == crate::DeviceHash::Poseidon1 {
+        count_commit_leaves(num_leaves, codewords.len() << log_folding);
+    }
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
     TREE_BUILDS.fetch_add(1, Ordering::Relaxed);
     let head = crate::readback::clone_dtoh(&stream, &nodes.slice(0..32))?;
@@ -3307,6 +3366,7 @@ pub fn commit_joint(
             nodes,
             stream,
             num_leaves,
+            hash,
         },
         root,
     ))
@@ -3325,8 +3385,8 @@ pub fn joint_block_subtrees(
     placement: LeafPlacement,
 ) -> Result<Vec<u8>> {
     ensure!(
-        hash == crate::DeviceHash::Poseidon1,
-        "a joint tree is Poseidon1's"
+        has_joint_leaf(hash),
+        "a joint tree is Poseidon1's or 7-round BLAKE3's"
     );
     ensure!(
         (2..=4).contains(&codewords.len()),
@@ -3344,7 +3404,13 @@ pub fn joint_block_subtrees(
         codeword.stream.synchronize()?;
     }
     let num_leaves = first.elements >> log_folding;
-    let span = 1u64 << (2 * dropped);
+    // A block is `2^dropped` leaves, or `4^dropped` under Poseidon1 (as
+    // `DeviceCodeword::block_subtrees_placed`).
+    let span = if hash.arity() == crate::p1_stark::ARITY {
+        1u64 << (2 * dropped)
+    } else {
+        1u64 << dropped
+    };
     ensure!(
         ((blocks[blocks.len() - 1] + 1) * span) as usize <= num_leaves,
         "block past the tree's leaves"
@@ -3391,7 +3457,7 @@ pub fn joint_block_subtrees(
     {
         let mut region = nodes.slice_mut(leaves_offset..leaves_offset + leaves * 32);
         let buffers: Vec<&CudaSlice<u64>> = gathered.iter().collect();
-        launch_joint_leaves(&stream, &buffers, leaves, log_folding, 0, &mut region)?;
+        launch_joint_leaves(&stream, &buffers, leaves, log_folding, 0, hash, &mut region)?;
     }
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes, leaves, hash)?;
     let out = crate::readback::clone_dtoh(&stream, &nodes)?;

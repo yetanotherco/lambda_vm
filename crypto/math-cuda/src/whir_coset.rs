@@ -1085,7 +1085,7 @@ pub fn joint_coset_openings(
     hash: crate::DeviceHash,
     in_place: bool,
 ) -> Result<CosetOpenings> {
-    ensure!(hash == crate::DeviceHash::Poseidon1);
+    ensure!(crate::whir::has_joint_leaf(hash));
     ensure!((2..=4).contains(&stacks.len()));
     ensure!(
         stacks
@@ -1152,9 +1152,17 @@ pub fn joint_coset_openings(
     {
         let mut region = nodes.slice_mut(leaves_offset..leaves_offset + leaves * 32);
         let buffers: Vec<&CudaSlice<u64>> = outs.iter().collect();
-        crate::whir::launch_joint_leaves(&stream, &buffers, leaves, log_block, 0, &mut region)?;
+        crate::whir::launch_joint_leaves(
+            &stream,
+            &buffers,
+            leaves,
+            log_block,
+            0,
+            hash,
+            &mut region,
+        )?;
     }
-    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes, leaves, hash)?;
+    crate::whir::build_inner_tree_levels(stream.as_ref(), be, &mut nodes, leaves, hash)?;
     let nodes_host = crate::readback::clone_dtoh(&stream, &nodes)?;
 
     let index_dev = htod_or_trim(&stream, &at)?;
