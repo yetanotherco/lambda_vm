@@ -861,13 +861,14 @@ fn a_limbs_row_lays_out_counts_and_asks_lt_as_its_form_says() {
 }
 
 // =============================================================================
-// The range bus the limbs rest on
+// The facts the limbs rest on, read off the block verifier's own AIR set
 // =============================================================================
 
-/// Every `IS_HALF` sender of the production block's tables, as
-/// `(table, multiplicity)`: the block AIR set under the pinned format, one
-/// table of each family.
-fn half_word_senders() -> Vec<(String, String)> {
+/// The block verifier's AIRs under the pinned format ([`crate::block_airs`]
+/// with [`crate::block_whir::BlockFormat::pinned`]'s forms), one table of each
+/// family and two MEMW_A tables.
+#[cfg(feature = "parallel")]
+fn pinned_block_airs() -> crate::VmAirs {
     let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
     let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
     let opts = stark::proof::options::ProofOptions::default_test_options();
@@ -875,7 +876,7 @@ fn half_word_senders() -> Vec<(String, String)> {
         cpu: 1,
         lt: 1,
         memw: 1,
-        memw_aligned: 1,
+        memw_aligned: 2,
         load: 1,
         mul: 1,
         dvrm: 1,
@@ -906,7 +907,7 @@ fn half_word_senders() -> Vec<(String, String)> {
     let inputs =
         crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("the AIR inputs");
     let format = crate::block_whir::BlockFormat::pinned();
-    let airs = crate::block_airs(
+    crate::block_airs(
         &program,
         &opts,
         &pages,
@@ -914,16 +915,28 @@ fn half_word_senders() -> Vec<(String, String)> {
         &inputs,
         format.keccak_rnd,
         format.memw_aligned,
-    );
+    )
+}
+
+/// A table's family: its AIR's name without the index.
+#[cfg(feature = "parallel")]
+fn family(name: &str) -> String {
+    name.split('[').next().unwrap_or("").to_string()
+}
+
+/// Every `IS_HALF` sender of the production block's tables, as
+/// `(table, multiplicity)`.
+#[cfg(feature = "parallel")]
+fn half_word_senders() -> Vec<(String, String)> {
+    let airs = pinned_block_airs();
     let mut senders: Vec<(String, String)> = airs
         .air_refs()
         .iter()
         .flat_map(|air| {
-            let family = air.name().split('[').next().unwrap_or("").to_string();
             air.bus_interactions()
                 .iter()
                 .filter(|i| i.bus_id == BusId::IsHalfword as u64 && i.is_sender)
-                .map(|i| (family.clone(), format!("{:?}", i.multiplicity)))
+                .map(|i| (family(air.name()), format!("{:?}", i.multiplicity)))
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -937,7 +950,10 @@ fn half_word_senders() -> Vec<(String, String)> {
 /// one of three kinds (a constant 1, a column or a sum constrained to a bit,
 /// or a multiplicity bounded by a lookup of weight 1). A new sender, or a
 /// sender's weight changed, fails here, to be classified before it lands: the
-/// limbs' 16-bit bound is only as good as this bus's.
+/// limbs' 16-bit bound is only as good as this bus's. And its only receiver is
+/// BITWISE (a receiver elsewhere with a free multiplicity could take an
+/// out-of-range limb as surely as a negative-weight sender could cancel one).
+#[cfg(feature = "parallel")]
 #[test]
 fn every_half_word_sender_weighs_one_a_bit_or_a_bounded_count() {
     let senders = half_word_senders();
@@ -954,11 +970,27 @@ fn every_half_word_sender_weighs_one_a_bit_or_a_bounded_count() {
         .map(|(t, m, _)| (t.to_string(), m.to_string()))
         .collect();
     assert_eq!(senders, pinned, "the IS_HALF senders moved: classify them");
+    let receivers: std::collections::BTreeSet<String> = pinned_block_airs()
+        .air_refs()
+        .iter()
+        .filter(|air| {
+            air.bus_interactions()
+                .iter()
+                .any(|i| i.bus_id == BusId::IsHalfword as u64 && !i.is_sender)
+        })
+        .map(|air| family(air.name()))
+        .collect();
+    assert_eq!(
+        receivers.into_iter().collect::<Vec<_>>(),
+        ["BITWISE"],
+        "the only IS_HALF receiver is BITWISE"
+    );
 }
 
 /// [`every_half_word_sender_weighs_one_a_bit_or_a_bounded_count`]'s census:
 /// `(table, multiplicity, why it is never negative)`, read in each table's
 /// constraints and interactions.
+#[cfg(feature = "parallel")]
 const PINNED_HALF_WORD_SENDERS: &[(&str, &str, &str)] = &[
     ("BLAKE3", "Column(3218)", "a bit column"),
     ("BLAKE3", "Column(3219)", "a bit column"),
@@ -1009,3 +1041,185 @@ const PINNED_HALF_WORD_SENDERS: &[(&str, &str, &str)] = &[
     ),
     ("SHIFT", "Column(25)", "a bit column"),
 ];
+
+/// A message's elements as affine forms over the main columns, read off the
+/// real evaluator: `(constant, [(column, coefficient)])` per element.
+#[cfg(feature = "parallel")]
+fn affine_elements(i: &BusInteraction) -> Vec<(u64, Vec<(usize, u64)>)> {
+    let eval = |g: &dyn Fn(usize) -> FE| -> Vec<FE> {
+        i.values.iter().flat_map(|v| v.combine_from(g)).collect()
+    };
+    let zero = eval(&|_| FE::zero());
+    let mut out: Vec<(u64, Vec<(usize, u64)>)> = zero
+        .iter()
+        .map(|c| (c.canonical_u64(), Vec::new()))
+        .collect();
+    for c in i.columns_read() {
+        let e = eval(&|j| if j == c { FE::one() } else { FE::zero() });
+        for (k, v) in e.iter().enumerate() {
+            let coefficient = *v - zero[k];
+            if coefficient != FE::zero() {
+                out[k].1.push((c, coefficient.canonical_u64()));
+            }
+        }
+    }
+    out
+}
+
+/// The buses only the CPU sends on, each element of which the CPU puts at the
+/// constant 0 where a sender's timestamp high word is read from: what a table
+/// that sends its own column as a MEMW timestamp's high word must receive it
+/// on.
+#[cfg(feature = "parallel")]
+const CPU_FED: [BusId; 3] = [BusId::Ecall, BusId::Cpu32, BusId::MemoryOp];
+
+/// ★ The zero-high-word fact as a property of the AIRs, not of honest traces:
+/// on the block verifier's own AIR set, every sender on the MEMW bus puts at
+/// the timestamp's high word either the constant 0 or one of its own columns,
+/// unscaled; and every such column is received, in the same table, on a bus
+/// only the CPU sends on (ECALL, CPU32, MEMORY_OP), where the CPU puts the
+/// constant 0. So the limbs, which do not range-check the shared high word,
+/// see the clock's 0 on every row a sender can make (how a table's rows that do
+/// not receive from the CPU carry the column — COPY's, KECCAK's and BLAKE3's
+/// chains — is the AIR reading of the review, R-PHASEA-JUDGE §3; the pin
+/// records the chain buses beside it). Pinned: a sender that changes its high
+/// word, or the source it receives it from, fails here, and the limbs' form is
+/// to be reviewed again before it lands.
+#[cfg(feature = "parallel")]
+#[test]
+fn every_memw_sender_sends_the_clocks_zero_high_word() {
+    use std::collections::{BTreeMap, BTreeSet};
+    let airs = pinned_block_airs();
+    let refs = airs.air_refs();
+    // The high word's place in a MEMW message: 24 elements (a read: old
+    // values, then the access) or 16 (a write).
+    let hi_at = |len: usize| match len {
+        24 => 20,
+        16 => 12,
+        other => panic!("a MEMW message of {other} elements"),
+    };
+    // The CPU-fed buses' senders at each element: (bus, element) -> forms.
+    let mut cpu_fed: BTreeMap<(u64, usize), BTreeSet<String>> = BTreeMap::new();
+    for air in &refs {
+        for i in air.bus_interactions().iter().filter(|i| i.is_sender) {
+            if CPU_FED.iter().any(|b| *b as u64 == i.bus_id) {
+                for (k, (c, terms)) in affine_elements(i).into_iter().enumerate() {
+                    cpu_fed
+                        .entry((i.bus_id, k))
+                        .or_default()
+                        .insert(format!("{} {c} {terms:?}", family(air.name())));
+                }
+            }
+        }
+    }
+    let mut census: BTreeSet<String> = BTreeSet::new();
+    for air in &refs {
+        let table = family(air.name());
+        let interactions = air.bus_interactions();
+        for i in interactions
+            .iter()
+            .filter(|i| i.bus_id == BusId::Memw as u64 && i.is_sender)
+        {
+            let elements = affine_elements(i);
+            let (c, terms) = &elements[hi_at(elements.len())];
+            assert_eq!(*c, 0, "{table}: a MEMW high word with a constant part");
+            match terms.as_slice() {
+                [] => {
+                    census.insert(format!("{table} 0"));
+                }
+                [(column, 1)] => {
+                    // Where the table receives that column: (bus, element).
+                    let mut sources: BTreeSet<String> = BTreeSet::new();
+                    let mut from_cpu = false;
+                    for r in interactions.iter().filter(|r| {
+                        !r.is_sender
+                            && r.bus_id != BusId::Memw as u64
+                            && r.bus_id != BusId::Memory as u64
+                    }) {
+                        for (k, (c, t)) in affine_elements(r).into_iter().enumerate() {
+                            if c == 0 && t == [(*column, 1)] {
+                                let bus = BusId::try_from(r.bus_id).expect("a bus id");
+                                sources.insert(format!("{bus:?}"));
+                                if CPU_FED.iter().any(|b| *b as u64 == r.bus_id) {
+                                    let senders = &cpu_fed[&(r.bus_id, k)];
+                                    assert!(
+                                        senders.iter().all(|s| s.starts_with("CPU 0 []")),
+                                        "{table}: {bus:?} element {k} is not the CPU's 0: {senders:?}"
+                                    );
+                                    from_cpu = true;
+                                }
+                            }
+                        }
+                    }
+                    assert!(
+                        from_cpu,
+                        "{table}: its MEMW high word, column {column}, comes from no CPU-fed bus \
+                         ({sources:?})"
+                    );
+                    census.insert(format!(
+                        "{table} column {column} from {}",
+                        sources.into_iter().collect::<Vec<_>>().join(" + ")
+                    ));
+                }
+                other => panic!("{table}: a MEMW high word of several columns {other:?}"),
+            }
+        }
+    }
+    for line in &census {
+        println!("MEMW HIGH WORD {line}");
+    }
+    assert_eq!(
+        census.into_iter().collect::<Vec<_>>(),
+        PINNED_MEMW_HIGH_WORDS,
+        "a MEMW sender's high word or its source moved: review the limbs again"
+    );
+}
+
+/// [`every_memw_sender_sends_the_clocks_zero_high_word`]'s census: each MEMW
+/// sender's timestamp high word, and the buses it receives a column one on (a
+/// CPU-fed one among them, checked: ECALL, CPU32, MEMORY_OP; the others are
+/// the tables' own chains and lookups). KECCAK sends both: the constant 0 in
+/// its sponge mode, its column 1 in its permute mode.
+#[cfg(feature = "parallel")]
+const PINNED_MEMW_HIGH_WORDS: [&str; 12] = [
+    "BLAKE3 column 1 from Blake3Absorb + Ecall",
+    "COPY column 1 from CopyNext + Ecall",
+    "CPU 0",
+    "CPU32 column 1 from Cpu32",
+    "ECREC column 1 from Bit + Ecall + Ecdas",
+    "ECSM column 1 from Bit + Ecall + Ecdas",
+    "HALT 0",
+    "HINT column 1 from Ecall",
+    "KECCAK 0",
+    "KECCAK column 1 from Ecall + Keccak + KeccakSponge",
+    "LOAD column 3 from MemoryOp",
+    "STORE column 3 from MemoryOp",
+];
+
+/// The verifier's pinned presets build the limbs' list for every MEMW_A table
+/// of a block, whatever the group opening.
+#[cfg(feature = "parallel")]
+#[test]
+fn the_pinned_verifier_builds_the_limbs_air_for_every_memw_a_table() {
+    use multilinear::whir_chain::GroupFold;
+    for group in [GroupFold::Indexed, GroupFold::PerPoly] {
+        let presets = crate::lfm::whir_block::pinned_verifier_presets(group);
+        assert_eq!(presets.format.memw_aligned, MemwAlignedOrder::Limbs);
+    }
+    let limbs = bus_interactions_for(MemwAlignedOrder::Limbs);
+    let airs = pinned_block_airs();
+    let tables: Vec<_> = airs
+        .air_refs()
+        .into_iter()
+        .filter(|air| air.name().starts_with("MEMW_A["))
+        .collect();
+    assert_eq!(tables.len(), 2, "both MEMW_A tables");
+    for air in tables {
+        assert!(
+            air.bus_interactions() == limbs.as_slice(),
+            "{} is not the limbs' list",
+            air.name()
+        );
+        assert_eq!(air.trace_layout().0, cols::NUM_COLUMNS);
+    }
+}
