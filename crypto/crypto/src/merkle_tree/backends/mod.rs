@@ -1,3 +1,4 @@
+pub mod blake3_joint;
 pub mod field_element;
 pub mod field_element_vector;
 pub mod p1;
