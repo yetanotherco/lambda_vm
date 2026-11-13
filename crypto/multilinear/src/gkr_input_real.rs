@@ -26,7 +26,7 @@
 //! raw-identical to today's: the same round sums, the same halves, the same
 //! transcript and proof bytes.
 //!
-//! Today's layer session (`LAMBDA_VM_ARGUE_GKR_GRUEN=0`) reads every cell of
+//! Today's layer session (`gkr_gruen::argue_gkr_gruen` off) reads every cell of
 //! the halves: for it the tree writes the whole layer again, as a tree that
 //! handed its layer back does.
 //!
@@ -49,16 +49,16 @@ pub enum InputReal {
     Check,
 }
 
-/// The setting `LAMBDA_VM_ARGUE_INPUT_REAL` names: `0` off, unset, empty or
-/// `1` on, `check` on and compared. Anything else is on, said once.
+/// The setting `LAMBDA_VM_ARGUE_INPUT_REAL` names: unset, empty or `1` on,
+/// `check` on and compared. Anything else is on, said once: the padded layer
+/// ([`InputReal::Off`]) is a test's override only.
 pub fn input_real_setting(value: Option<&str>) -> InputReal {
     match value {
-        Some("0") => InputReal::Off,
         None | Some("") | Some("1") => InputReal::On,
         Some("check") => InputReal::Check,
         Some(other) => {
             eprintln!(
-                "[gkr] LAMBDA_VM_ARGUE_INPUT_REAL={other} is not 0, 1 or check; keeping each input layer \
+                "[gkr] LAMBDA_VM_ARGUE_INPUT_REAL={other} is not 1 or check; keeping each input layer \
                  without its padding (the default)"
             );
             InputReal::On
@@ -87,8 +87,7 @@ pub fn argue_input_real() -> InputReal {
                         InputReal::Off => "off (each input layer written with its padding)",
                         InputReal::On => {
                             "on (the default: each input layer kept without its padding; \
-                             LAMBDA_VM_ARGUE_INPUT_REAL=0 writes the padding, =check also compares with the \
-                             whole layer)"
+                             LAMBDA_VM_ARGUE_INPUT_REAL=check also compares with the whole layer)"
                         }
                         InputReal::Check => {
                             "check (each input layer kept without its padding and compared round by round \
@@ -270,7 +269,11 @@ mod tests {
     fn the_knob_reads_its_variable() {
         assert_eq!(input_real_setting(None), InputReal::On);
         assert_eq!(input_real_setting(Some("")), InputReal::On);
-        assert_eq!(input_real_setting(Some("0")), InputReal::Off);
+        assert_eq!(
+            input_real_setting(Some("0")),
+            InputReal::On,
+            "the padded layer is a test's override only"
+        );
         assert_eq!(input_real_setting(Some("1")), InputReal::On);
         assert_eq!(input_real_setting(Some("check")), InputReal::Check);
         assert_eq!(input_real_setting(Some("on")), InputReal::On);
@@ -278,9 +281,9 @@ mod tests {
     }
 
     /// ★ The default keeps each input layer without its padding — the same
-    /// proof bytes, which the card tests show — and only `0` writes it.
+    /// proof bytes, which the card tests show.
     #[test]
-    fn the_knob_is_on_unless_its_variable_is_zero() {
+    fn the_knob_is_on_unless_it_says_check() {
         assert_eq!(
             argue_input_real(),
             input_real_setting(std::env::var("LAMBDA_VM_ARGUE_INPUT_REAL").ok().as_deref())

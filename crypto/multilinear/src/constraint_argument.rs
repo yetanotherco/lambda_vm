@@ -962,7 +962,7 @@ where
     // down.
     let resident = trace.device_factors();
     let t = crate::whir_split::tick();
-    // With no lift (`LAMBDA_VM_ARGUE_NO_LIFT`) the factors are lifted here
+    // With no lift (`gpu::argue_no_lift`) the factors are lifted here
     // only if today's rounds need them.
     let (sumcheck, point, bound) = batch::prove_resident_lazy(
         weights,

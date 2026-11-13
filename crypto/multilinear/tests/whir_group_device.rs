@@ -194,7 +194,7 @@ enum Arm {
     Materialised,
     /// Four, then six lean rounds (`LAMBDA_VM_WHIR_LEAN_ROUNDS`).
     Lean(usize),
-    /// Every successor folded (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`): a grouped
+    /// Every successor folded (`gpu::encode_successor_in_effect` off): a grouped
     /// one is each codeword folded and the folds combined on the card.
     Folded,
     /// The codewords on the card, every opening's factors declined there: the

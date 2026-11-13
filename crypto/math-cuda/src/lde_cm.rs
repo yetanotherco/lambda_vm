@@ -45,7 +45,7 @@
 //! It is the default wherever it applies ([`engine_enabled`]). The legacy path
 //! stays for what the engine does not take — a caller that wants the row-major
 //! LDE back on the host, and shapes outside [`supports`] (for the encoding,
-//! [`spread_supports`]) — and, whole, under [`LEGACY_ENV`].
+//! [`spread_supports`]) — and, whole, under a test's [`with_engine`].
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,38 +60,17 @@ use math::field::traits::IsFFTField;
 use crate::Result;
 use crate::device::Backend;
 
-/// `LAMBDA_VM_LDE_LEGACY=1` sends every LDE back to the legacy per-level
-/// pipeline, the commits' trace LDEs and the WHIR commit's encoding alike — an
-/// A/B and rollback switch, not a tuning knob: both produce the same values,
-/// roots and proofs. Read once per process.
-pub const LEGACY_ENV: &str = "LAMBDA_VM_LDE_LEGACY";
-
 thread_local! {
-    /// Per-thread override of [`LEGACY_ENV`], for parity tests that run both
-    /// pipelines in one process. See [`with_engine`].
+    /// Per-thread override of the engine, for parity tests that run both
+    /// pipelines (the engine and the legacy per-level one, the same values,
+    /// roots and proofs) in one process. See [`with_engine`].
     static ENGINE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 /// Whether the calling thread's LDEs and WHIR encodings take this engine (where
-/// it applies).
+/// it applies): yes, unless a test's [`with_engine`] says otherwise.
 pub fn engine_enabled() -> bool {
-    if let Some(on) = ENGINE_OVERRIDE.with(Cell::get) {
-        return on;
-    }
-    static ENV: OnceLock<bool> = OnceLock::new();
-    *ENV.get_or_init(|| {
-        let legacy = std::env::var(LEGACY_ENV).is_ok_and(|v| v == "1");
-        // One line per process, so every box log states which LDE it ran.
-        eprintln!(
-            "[gpu] LDE: {}",
-            if legacy {
-                "legacy per-level (LAMBDA_VM_LDE_LEGACY=1)"
-            } else {
-                "column-major engine"
-            }
-        );
-        !legacy
-    })
+    ENGINE_OVERRIDE.with(Cell::get).unwrap_or(true)
 }
 
 /// Run `f` with the engine forced on or off for the calling thread — the

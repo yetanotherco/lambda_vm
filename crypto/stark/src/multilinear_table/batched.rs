@@ -852,7 +852,7 @@ where
                     }
                 };
                 // Where today's argue builds it: written from the base columns
-                // with no lift (`LAMBDA_VM_ARGUE_NO_LIFT`), else from the
+                // with no lift (`gpu::argue_no_lift`), else from the
                 // lifted factors on the card, else here — and a big host tree
                 // still folds on a device. The same tree every way.
                 let started = std::time::Instant::now();
@@ -964,7 +964,7 @@ where
     let lambda2 = &lambda * &lambda;
     let started = std::time::Instant::now();
     // What each table's fused rounds read, held for as long as the rounds do:
-    // the base columns on the card with no lift (`LAMBDA_VM_ARGUE_NO_LIFT`), the
+    // the base columns on the card with no lift (`gpu::argue_no_lift`), the
     // lifted factors for a table they cannot read that way (lifted here, as the
     // per-table argue lifts it), or nothing, on the host.
     let mut constraints: Vec<Option<multilinear::fused::Constraints<F>>> =
@@ -973,19 +973,17 @@ where
         Vec::with_capacity(tables.len());
     for table in tables {
         let shape = table.shape();
-        let made = (at == Where::Device
-            && multilinear::gpu_fused::argue_fused()
-            && multilinear::gpu_fused::fused_takes_width(table.num_committed_columns()))
-        .then(|| {
-            multilinear::fused::Constraints::<F>::from_extension(
-                &shape.steps_as_ops(),
-                shape.root_steps(),
-                shape.selector_of_root(),
-                shape.degree(),
-            )
-            .ok()
-        })
-        .flatten();
+        let made = (at == Where::Device && multilinear::gpu_fused::argue_fused())
+            .then(|| {
+                multilinear::fused::Constraints::<F>::from_extension(
+                    &shape.steps_as_ops(),
+                    shape.root_steps(),
+                    shape.selector_of_root(),
+                    shape.degree(),
+                )
+                .ok()
+            })
+            .flatten();
         let column = (at == Where::Device
             && multilinear::gpu::argue_no_lift()
             && table.trace.device_factors().is_none())

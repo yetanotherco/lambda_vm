@@ -185,7 +185,7 @@ where
 /// Every column at `point`, one at a time: what runs when the card does not
 /// take the table whole.
 ///
-/// Under `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` the walk is spread over the pool when
+/// Under `gpu::argue_device_columns` the walk is spread over the pool when
 /// each column is a host loop — the values are the same either way, every
 /// column's fold being its own. Columns tall enough that `evaluate_in` sends
 /// each to the device stay in order: they only get here when the card turned
@@ -302,7 +302,7 @@ where
     }
     let weights = challenge_powers(&transcript.sample_field_element(), sources.len());
 
-    // Under `LAMBDA_VM_ARGUE_DEVICE_TABLES` the tables are built where they are
+    // Under `gpu::argue_device_tables` the tables are built where they are
     // folded: the card takes the point, the columns each offset reads and their
     // weights, and hands back the tables folded to the crossover.
     let on_card = if crate::gpu::argue_device_tables() {
@@ -759,7 +759,7 @@ mod tests {
         );
     }
 
-    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` spreads the host walk over the pool, and
+    /// `gpu::argue_device_columns` spreads the host walk over the pool, and
     /// the proof must not notice: the same rounds, the same column values, the
     /// same transcript after them.
     ///

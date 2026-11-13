@@ -7,9 +7,8 @@
 //! round for round: the same parts (`T`, `U`, `A`, `B`), the same messages out
 //! of them ([`fused::message`]). The kernels are `math_cuda::argue_fused`'s.
 //!
-//! On by default for every table whose constraint part runs in the base field
-//! — or only the committed widths `LAMBDA_VM_ARGUE_FUSED_WIDTHS` lists;
-//! `LAMBDA_VM_ARGUE_FUSED=0` is the opt-out, and it is today's rounds exactly.
+//! On for every table whose constraint part runs in the base field; a test's
+//! [`force_argue_fused`] off is today's rounds exactly.
 //! A table it declines runs today's rounds, counted. `LAMBDA_VM_ARGUE_FUSED_XCHECK=1`
 //! runs today's rounds after it over the same factors with the same
 //! challenges, refuses the prove at the first message that differs, times
@@ -45,7 +44,7 @@ pub struct FusedInput<'a, B: IsField, E: IsField> {
     pub claim_point: &'a [FieldElement<E>],
     pub r: &'a [FieldElement<E>],
     /// The table's base columns on the card as factors, with no lift
-    /// (`LAMBDA_VM_ARGUE_NO_LIFT`, D-BATCH M1-2): the rounds read them when no
+    /// (`gpu::argue_no_lift`, D-BATCH M1-2): the rounds read them when no
     /// lifted factors were made.
     pub columns: Option<&'a crate::gpu::ColumnFactors>,
 }
@@ -286,52 +285,15 @@ fn store_forced(flag: &AtomicU8, on: Option<bool>) {
     );
 }
 
-/// Whether the zerocheck runs the fused rounds: on by default,
-/// `LAMBDA_VM_ARGUE_FUSED=0` the opt-out. Read once, with a banner.
+/// Whether the zerocheck runs the fused rounds: on, unless a test forces them
+/// off ([`force_argue_fused`]).
 pub fn argue_fused() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    forced(&FUSED_FORCED, || {
-        *ON.get_or_init(|| {
-            let on = fused_from(std::env::var("LAMBDA_VM_ARGUE_FUSED").ok().as_deref());
-            eprintln!(
-                "★ ARGUE FUSED: {}",
-                if on {
-                    "on (the default; LAMBDA_VM_ARGUE_FUSED=0 is today's rounds)"
-                } else {
-                    "off (LAMBDA_VM_ARGUE_FUSED=0)"
-                }
-            );
-            on
-        })
-    })
-}
-
-/// The knob's reading of its variable: only `0` turns it off.
-fn fused_from(value: Option<&str>) -> bool {
-    value != Some("0")
+    forced(&FUSED_FORCED, || true)
 }
 
 #[doc(hidden)]
 pub fn force_argue_fused(on: Option<bool>) {
     store_forced(&FUSED_FORCED, on);
-}
-
-/// Whether a table of `width` committed columns is one the fused rounds take:
-/// every table, or those `LAMBDA_VM_ARGUE_FUSED_WIDTHS` (comma-separated) names.
-pub fn fused_takes_width(width: usize) -> bool {
-    static WIDTHS: std::sync::OnceLock<Option<Vec<usize>>> = std::sync::OnceLock::new();
-    WIDTHS
-        .get_or_init(|| {
-            std::env::var("LAMBDA_VM_ARGUE_FUSED_WIDTHS")
-                .ok()
-                .map(|list| {
-                    list.split(',')
-                        .filter_map(|w| w.trim().parse().ok())
-                        .collect()
-                })
-        })
-        .as_ref()
-        .is_none_or(|widths| widths.contains(&width))
 }
 
 /// Whether the fused rounds are cross-checked against today's
@@ -397,13 +359,6 @@ pub fn force_zc_device_tail(mode: Option<Option<usize>>) {
         },
         Ordering::Relaxed,
     );
-}
-
-/// Whether every fused table prints its timings (`LAMBDA_VM_ARGUE_FUSED_LOG=1`);
-/// the cross-check prints them regardless. Read once.
-pub fn argue_fused_log() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| env_is("LAMBDA_VM_ARGUE_FUSED_LOG"))
 }
 
 /// ⛔ Faults and inert checks, for the negative controls and the mutations
@@ -1142,15 +1097,6 @@ mod tests {
                 "x={x} y={y} s={s}"
             );
         }
-    }
-
-    /// The default, pinned: on unless the variable says `0`.
-    #[test]
-    fn the_fused_rounds_are_on_unless_the_knob_says_0() {
-        assert!(fused_from(None));
-        assert!(fused_from(Some("1")));
-        assert!(fused_from(Some("")));
-        assert!(!fused_from(Some("0")));
     }
 
     /// The device tail's rule, pinned: its constants as frozen before they were

@@ -102,8 +102,8 @@ fn gpu_path_fires_end_to_end() {
     assert!(gpu_deep_calls() > 0, "R4 GPU DEEP composition did not fire");
 
     // The resident DEEP's default kernel inverts each row's denominators
-    // itself (`math_cuda::deep_inv`); `LAMBDA_VM_DEEP_INV_LEGACY=1` keeps the
-    // buffered kernel and its inverse buffer. A table that silently fell back
+    // itself (`math_cuda::deep_inv`); the legacy path keeps the buffered
+    // kernel and its inverse buffer. A table that silently fell back
     // to the buffered kernel would still verify, so this counter is what
     // guards the fused dispatch, under either setting.
     if math_cuda::deep_inv::rowwise_enabled() {
@@ -115,7 +115,7 @@ fn gpu_path_fires_end_to_end() {
         assert_eq!(
             gpu_fused_deep_calls(),
             0,
-            "the fused R4 DEEP kernel fired under LAMBDA_VM_DEEP_INV_LEGACY=1"
+            "the fused R4 DEEP kernel fired on the legacy path"
         );
     }
 
@@ -123,7 +123,7 @@ fn gpu_path_fires_end_to_end() {
     assert!(gpu_fri_calls() > 0, "R4 GPU FRI commit did not fire");
 
     // GPU batch-invert dispatch fires for the R3 OOD inv_denoms, and for R4's
-    // on its buffered DEEP path (under `LAMBDA_VM_DEEP_INV_LEGACY=1`, or for a
+    // on its buffered DEEP path (on the legacy path, or for a
     // table the fused kernel declines). A regression where R3 silently fell
     // back to host inv_denoms would drop this to zero.
     assert!(

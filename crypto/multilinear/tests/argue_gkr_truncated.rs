@@ -201,7 +201,7 @@ fn tables() -> Vec<Table> {
 
 /// ★ Each table proved alone, today's trees against kept ones: the same proof
 /// bytes, claim and transcript, with Gruen's rounds (the default) and with
-/// today's layer rounds (`LAMBDA_VM_ARGUE_GKR_GRUEN=0`), which write a kept
+/// today's layer rounds (`gkr_gruen::argue_gkr_gruen` off), which write a kept
 /// layer whole again. Every padded table was kept, and only those.
 #[test]
 fn kept_layers_prove_todays_tables() {

@@ -435,7 +435,7 @@ impl<F: IsField + 'static> GruenCard<F> for crate::gpu::GruenSession {
 }
 
 /// The step over a device layer on Gruen's rounds ([`crate::gkr_gruen`], on
-/// with `LAMBDA_VM_ARGUE_GKR_GRUEN` as today's per-table layers are): the
+/// with `gkr_gruen::argue_gkr_gruen` as today's per-table layers are): the
 /// tree's relation is `w_p·eq·(p_lo q_hi + p_hi q_lo + λ'·q_lo q_hi)` with
 /// `λ' = w_q/w_p`, so the card sums its `H(1)`, `H(2)` under `λ'`, the tree's
 /// own chain (from its claim `p + λ'·q`) makes the message a per-table layer

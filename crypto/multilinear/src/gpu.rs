@@ -46,7 +46,7 @@ static EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Columns the claim reduce evaluated on the HOST, one at a time: the tables
 /// the batched device evaluation did not take, at a height where a single
 /// column stays here too ([`evaluates_on_device`]). The count
-/// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` exists to move: with it off (`=0`) every
+/// `gpu::argue_device_columns` exists to move: with it off (`=0`) every
 /// table under 2^16 rows lands here, however wide.
 static HOST_EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Columns whose device value `LAMBDA_VM_ARGUE_XCHECK` recomputed on the host
@@ -54,14 +54,14 @@ static HOST_EVALUATE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// nothing failed.
 static ARGUE_XCHECKS: AtomicU64 = AtomicU64::new(0);
 /// Challenge tables the card built for the argument
-/// (`LAMBDA_VM_ARGUE_DEVICE_TABLES`): the zerocheck's `eq` weights and the claim
+/// (`gpu::argue_device_tables`): the zerocheck's `eq` weights and the claim
 /// reduce's shift tables and batched columns, each of which the host would
 /// otherwise have built and uploaded.
 static ARGUE_TABLES_ON_CARD: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones `LAMBDA_VM_ARGUE_XCHECK` compared with the host's.
 static ARGUE_TABLE_XCHECKS: AtomicU64 = AtomicU64::new(0);
 /// Zerocheck sessions whose device rounds walked their program on demand
-/// (`LAMBDA_VM_ARGUE_LEAN_PROGRAM`).
+/// (`gpu::argue_lean_program`).
 static LEAN_PROGRAMS: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round against
 /// today's program walking the same factors.
@@ -82,7 +82,7 @@ static FUSED_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
 /// [`FUSED_FOLD_CALLS`] is a share of.
 static RESIDENT_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Successors encoded from their bound message instead of folded from the
-/// codeword (the default; `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` folds; D-SPEED
+/// codeword (the default; `gpu::encode_successor_in_effect` off folds; D-SPEED
 /// lever 5a). Not in [`RESIDENT_FOLD_CALLS`]: no fold ran.
 static ENCODED_SUCCESSORS: AtomicU64 = AtomicU64::new(0);
 /// ★ Successors the card was asked to encode — the encode on, the factors and
@@ -104,7 +104,7 @@ static COSET_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// that order. The same bytes as the card's encode; a host NTT's time instead.
 static COSET_HOST_ENCODES: AtomicU64 = AtomicU64::new(0);
 /// Coset openings that read the stack where it lies in the store's buffer
-/// (the default; `LAMBDA_VM_WHIR_COSET_INPLACE=0` assembles): no stack
+/// (the default; `gpu::coset_inplace_in_effect` off assembles): no stack
 /// assembled, its zero tiles folded unread. Among [`COSET_OPENINGS`].
 static COSET_INPLACE_OPENS: AtomicU64 = AtomicU64::new(0);
 /// ⚠ Coset openings asked to read the stack in place whose parts the kernels
@@ -158,7 +158,7 @@ static ROOM_COMMIT_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// Rooms a group sized, for its commits or its openings' turn.
 static ROOM_SIZINGS: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones sized to the turn they cover rather than to a whole
-/// base codeword (`LAMBDA_VM_NO_WHIR_ROOM_RESIZE`).
+/// base codeword (`gpu::room_resize`).
 static ROOMS_TURN_SIZED: AtomicU64 = AtomicU64::new(0);
 /// ★ GKR fraction trees whose whole-tree promise the budget refused on the
 /// consume path, after refusing their carry: the host built that table's
@@ -166,7 +166,7 @@ static ROOMS_TURN_SIZED: AtomicU64 = AtomicU64::new(0);
 /// `math_cuda::device::device_fallbacks`.
 static GKR_TREE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// Fraction trees whose input layer was written from the base columns
-/// (`LAMBDA_VM_ARGUE_GKR_INPUT`).
+/// (`gpu::argue_gkr_input`).
 static INPUT_COLUMNS_TREES: AtomicU64 = AtomicU64::new(0);
 
 /// Fraction trees whose input layer was written from the base columns.
@@ -175,7 +175,7 @@ pub fn input_columns_trees() -> u64 {
 }
 
 /// Tables whose factors were set up as base columns, with no lift
-/// (`LAMBDA_VM_ARGUE_NO_LIFT`).
+/// (`gpu::argue_no_lift`).
 static COLUMN_FACTOR_TABLES: AtomicU64 = AtomicU64::new(0);
 
 pub fn column_factor_tables() -> u64 {
@@ -193,17 +193,6 @@ pub fn late_lifts() -> u64 {
 pub(crate) fn note_late_lift() {
     LATE_LIFTS.fetch_add(1, Ordering::Relaxed);
     crate::whir_split::bump(&crate::whir_split::LATE_LIFT);
-}
-
-/// Under `LAMBDA_VM_ARGUE_TREE_SYNC` (a diagnostic), wait for the stream's
-/// kernels so the tree's split charges each part its own card time.
-#[cfg(feature = "cuda")]
-macro_rules! tree_sync {
-    ($stream:expr) => {
-        if crate::whir_split::tree_sync() {
-            let _ = $stream.synchronize();
-        }
-    };
 }
 
 pub fn commit_calls() -> u64 {
@@ -457,32 +446,20 @@ pub(crate) fn note_coset_host_encode(levels: usize, num_vars: usize) {
 
 /// Whether a coset-ordered round-0 commitment is revived over its stack (its
 /// openings evaluated coset by coset) instead of re-encoded: the default under
-/// the coset order; `LAMBDA_VM_WHIR_COSET_OPENINGS=0` or a test's override
-/// re-encodes. The same bytes either way. `false` in a build without a device.
+/// the coset order; a test's override re-encodes. The same bytes either way.
+/// `false` in a build without a device.
 pub fn coset_openings_in_effect() -> bool {
     match COSET_OPENINGS_FORCED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            cfg!(feature = "cuda")
-                && *ON.get_or_init(|| {
-                    !matches!(
-                        std::env::var("LAMBDA_VM_WHIR_COSET_OPENINGS")
-                            .ok()
-                            .as_deref()
-                            .map(str::trim),
-                        Some("0")
-                    )
-                })
-        }
+        _ => cfg!(feature = "cuda"),
     }
 }
 
 static COSET_OPENINGS_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Overrides `LAMBDA_VM_WHIR_COSET_OPENINGS` for the whole process. `None`
-/// restores the environment's setting. Not for production callers.
+/// Overrides [`coset_openings_in_effect`] for the whole process. `None`
+/// restores the default. Not for production callers.
 #[doc(hidden)]
 pub fn force_coset_openings(on: Option<bool>) {
     COSET_OPENINGS_FORCED.store(
@@ -514,44 +491,15 @@ pub fn coset_inplace_tiles() -> (u64, u64) {
 }
 
 /// Whether a coset opening reads the stack where it lies instead of
-/// assembling it unless told otherwise: [`coset_inplace_in_effect`]'s answer
-/// with `LAMBDA_VM_WHIR_COSET_INPLACE` unset.
-const COSET_INPLACE_DEFAULT: bool = true;
-
-/// Whether a coset opening reads the stack where it lies instead of
-/// assembling it: [`COSET_INPLACE_DEFAULT`] (on);
-/// `LAMBDA_VM_WHIR_COSET_INPLACE=0` assembles, `=1` reads in place, a test's
-/// override wins. The same words either way.
+/// assembling it: on; a test's override assembles. The same words either way.
 pub fn coset_inplace_in_effect() -> bool {
-    match COSET_INPLACE_FORCED.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| {
-                coset_inplace_from(
-                    std::env::var("LAMBDA_VM_WHIR_COSET_INPLACE")
-                        .ok()
-                        .as_deref(),
-                )
-            })
-        }
-    }
-}
-
-/// [`coset_inplace_in_effect`] for the variable's value `word`.
-fn coset_inplace_from(word: Option<&str>) -> bool {
-    match word.map(str::trim) {
-        Some("0") => false,
-        Some("1") => true,
-        _ => COSET_INPLACE_DEFAULT,
-    }
+    COSET_INPLACE_FORCED.load(Ordering::Relaxed) != 2
 }
 
 static COSET_INPLACE_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Overrides `LAMBDA_VM_WHIR_COSET_INPLACE` for the whole process. `None`
-/// restores the environment's setting. Not for production callers.
+/// Overrides [`coset_inplace_in_effect`] for the whole process. `None`
+/// restores the default. Not for production callers.
 #[doc(hidden)]
 pub fn force_coset_inplace(on: Option<bool>) {
     COSET_INPLACE_FORCED.store(
@@ -565,7 +513,7 @@ pub fn force_coset_inplace(on: Option<bool>) {
 }
 
 /// Whether a chain's first successor is encoded from its bound message (the
-/// default; `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` or a test's override turns it
+/// default; `gpu::encode_successor_in_effect` off or a test's override turns it
 /// off). `false` in a build without a device.
 pub fn encode_successor_in_effect() -> bool {
     #[cfg(feature = "cuda")]
@@ -696,7 +644,7 @@ pub fn rooms_turn_sized() -> u64 {
 }
 
 /// Called where a group sizes a room: `turn_sized` unless
-/// `LAMBDA_VM_NO_WHIR_ROOM_RESIZE` has it promise a whole codeword.
+/// `gpu::room_resize` has it promise a whole codeword.
 pub(crate) fn note_room_sized(turn_sized: bool) {
     ROOM_SIZINGS.fetch_add(1, Ordering::Relaxed);
     if turn_sized {
@@ -871,8 +819,8 @@ pub fn reserve_room(_bytes: u64) -> Option<DeviceRoom> {
 
 /// Whether a group gives its room back between its last commit and its first
 /// opening, and takes it again for the openings ([`take_turn`]). `true` unless
-/// `LAMBDA_VM_NO_WHIR_ROOM_PARK` is set, which holds it from the commit to the
-/// last opening as before — the A/B's control, off the same binary.
+/// a test forces it off ([`force_room_park`]), which holds it from the commit
+/// to the last opening as before.
 ///
 /// Between the two runs the whole per-table argument, which reserves against
 /// the same budget and never touches the room: the room is a promise for the
@@ -882,18 +830,15 @@ pub(crate) fn room_park() -> bool {
     match ROOM_PARK_FORCED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => {
-            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            !*OFF.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_WHIR_ROOM_PARK").is_some())
-        }
+        _ => true,
     }
 }
 
 static ROOM_PARK_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Overrides `LAMBDA_VM_NO_WHIR_ROOM_PARK` for the whole process — for a test
-/// that commits and opens both ways in one binary. `None` restores the
-/// environment's setting. Not for production callers.
+/// Overrides [`room_park`] for the whole process — for a test that commits and
+/// opens both ways in one binary. `None` restores the default. Not for
+/// production callers.
 #[doc(hidden)]
 pub fn force_room_park(on: Option<bool>) {
     ROOM_PARK_FORCED.store(
@@ -1128,8 +1073,8 @@ pub fn device_trims() -> u64 {
 
 /// Whether a group's room is sized to the turns it covers — its commits', two
 /// in flight, and one chain's opening, as the kernels that run them allocate —
-/// rather than one base codeword. `true` unless `LAMBDA_VM_NO_WHIR_ROOM_RESIZE`
-/// is set, which promises the codeword as before.
+/// rather than one base codeword. `true` unless a test forces it off
+/// ([`force_room_resize`]), which promises the codeword as before.
 ///
 /// One codeword was the right number once: two commits in flight at a fold of
 /// four hold (half a codeword, less a node) each. At the production first fold
@@ -1141,17 +1086,14 @@ pub(crate) fn room_resize() -> bool {
     match ROOM_RESIZE_FORCED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => {
-            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            !*OFF.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_WHIR_ROOM_RESIZE").is_some())
-        }
+        _ => true,
     }
 }
 
 static ROOM_RESIZE_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Overrides `LAMBDA_VM_NO_WHIR_ROOM_RESIZE` for the whole process. `None`
-/// restores the environment's setting. Not for production callers.
+/// Overrides [`room_resize`] for the whole process. `None` restores the
+/// default. Not for production callers.
 #[doc(hidden)]
 pub fn force_room_resize(on: Option<bool>) {
     ROOM_RESIZE_FORCED.store(
@@ -1905,7 +1847,7 @@ where
     let spread = if lean { degree } else { 1 };
 
     // A table goes up as it is; an `eq` weight goes up as its point, and the
-    // card builds it (`LAMBDA_VM_ARGUE_DEVICE_TABLES`).
+    // card builds it (`gpu::argue_device_tables`).
     let mut points = Vec::with_capacity(extra.len());
     for weight in extra {
         points.push(match weight {
@@ -2074,7 +2016,7 @@ where
 }
 
 /// The claim reduce's sumcheck with its tables built on the card
-/// (`LAMBDA_VM_ARGUE_DEVICE_TABLES`): `eq(alpha)` once, each offset's shift
+/// (`gpu::argue_device_tables`): `eq(alpha)` once, each offset's shift
 /// table a rotated copy of it, each offset's batched column out of the
 /// epoch's resident columns (`math_cuda::sumcheck::reduce_session`).
 ///
@@ -2416,8 +2358,8 @@ const EVALUATE_THRESHOLD: usize = 1 << 16;
 
 /// Whether the claim reduce evaluates a resident table's columns on the card
 /// once the TABLE holds [`EVALUATE_THRESHOLD`] cells, rather than only once
-/// each column is that tall. On by default; `LAMBDA_VM_ARGUE_DEVICE_COLUMNS=0`
-/// is the opt-out, and it is the old path exactly.
+/// each column is that tall. On; a test's override
+/// ([`force_argue_device_columns`]) takes the old path exactly.
 ///
 /// The default was turned on by its A/B on the block (FAST, 2026-09-28): the
 /// whole run 1.05 s faster, the columns the host walked 24,195 → 3,478, every
@@ -2440,19 +2382,16 @@ pub fn argue_device_columns() -> bool {
     match ARGUE_DEVICE_COLUMNS_FORCED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| env_not_off("LAMBDA_VM_ARGUE_DEVICE_COLUMNS"))
-        }
+        _ => true,
     }
 }
 
 static ARGUE_DEVICE_COLUMNS_FORCED: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
-/// Overrides `LAMBDA_VM_ARGUE_DEVICE_COLUMNS` for the whole process — for a
-/// test that proves both ways in one binary. `None` restores the environment's
-/// setting. Not for production callers.
+/// Overrides [`argue_device_columns`] for the whole process — for a test that
+/// proves both ways in one binary. `None` restores the default. Not for
+/// production callers.
 #[doc(hidden)]
 pub fn force_argue_device_columns(on: Option<bool>) {
     ARGUE_DEVICE_COLUMNS_FORCED.store(
@@ -2508,21 +2447,11 @@ fn env_on(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
-/// `name` unset or set to anything but `0`: a knob that is on by default.
-fn env_not_off(name: &str) -> bool {
-    not_off(std::env::var(name).ok().as_deref())
-}
-
-/// A default-on knob's reading of its variable: only `0` turns it off.
-fn not_off(value: Option<&str>) -> bool {
-    value != Some("0")
-}
-
 /// Whether the argument's challenge tables are built on the card: the
 /// zerocheck's weights `eq(r)` and `eq(row)` from their points, and the claim
 /// reduce's shift tables and batched columns from `alpha` and the resident
-/// columns. On by default; `LAMBDA_VM_ARGUE_DEVICE_TABLES=0` is the opt-out, and
-/// it is the old path exactly.
+/// columns. On; a test's override ([`force_argue_device_tables`]) takes the old
+/// path exactly.
 ///
 /// The default was turned on by its A/B on the block (FAST, 2026-09-29): the
 /// whole run 5.20 s faster, the argue 19.7 → 14.7 s, 1,364 tables built on the
@@ -2541,19 +2470,16 @@ pub fn argue_device_tables() -> bool {
     match ARGUE_DEVICE_TABLES_FORCED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| env_not_off("LAMBDA_VM_ARGUE_DEVICE_TABLES"))
-        }
+        _ => true,
     }
 }
 
 static ARGUE_DEVICE_TABLES_FORCED: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
-/// Overrides `LAMBDA_VM_ARGUE_DEVICE_TABLES` for the whole process — for a test
-/// that proves both ways in one binary. `None` restores the environment's
-/// setting. Not for production callers.
+/// Overrides [`argue_device_tables`] for the whole process — for a test that
+/// proves both ways in one binary. `None` restores the default. Not for
+/// production callers.
 #[doc(hidden)]
 pub fn force_argue_device_tables(on: Option<bool>) {
     ARGUE_DEVICE_TABLES_FORCED.store(
@@ -2569,9 +2495,8 @@ pub fn force_argue_device_tables(on: Option<bool>) {
 /// Whether a table's GKR input layer is written straight from its resident
 /// base columns (D-BATCH M1-2): one launch for every interaction, base × ext3,
 /// where the old path runs two programs an interaction over the lifted factors.
-/// The same cells, so the same tree and proof. On by default;
-/// `LAMBDA_VM_ARGUE_GKR_INPUT=0` is the old path exactly. Read once, with a
-/// banner.
+/// The same cells, so the same tree and proof. On; a test's override
+/// ([`force_argue_gkr_input`]) takes the old path exactly.
 ///
 /// Turned on by its A/B on the block (FAST job 333, 4 + 4 arms): base −0.75 s,
 /// the argue −0.97 s, the whole run −0.73 s, the tree region 1.98 → 1.11 s,
@@ -2580,22 +2505,7 @@ pub fn argue_gkr_input() -> bool {
     match ARGUE_GKR_INPUT_FORCED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| {
-                let on = env_not_off("LAMBDA_VM_ARGUE_GKR_INPUT");
-                eprintln!(
-                    "★ ARGUE GKR INPUT: {}",
-                    if on {
-                        "from the base columns (the default; LAMBDA_VM_ARGUE_GKR_INPUT=0 is the lifted \
-                         factors)"
-                    } else {
-                        "from the lifted factors (LAMBDA_VM_ARGUE_GKR_INPUT=0)"
-                    }
-                );
-                on
-            })
-        }
+        _ => true,
     }
 }
 
@@ -2605,8 +2515,8 @@ static ARGUE_GKR_INPUT_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::
 /// (D-BATCH M1-2, its second half). The input layer is written from the columns
 /// ([`argue_gkr_input`], which this needs) and the fused zerocheck's first pass
 /// reads them where they lie, so the `W·rows·24 B` lift is made only when the
-/// old rounds need it. The same rounds and proof. On by default;
-/// `LAMBDA_VM_ARGUE_NO_LIFT=0` lifts every table's factors as before.
+/// old rounds need it. The same rounds and proof. On; a test's override
+/// ([`force_argue_no_lift`]) lifts every table's factors as before.
 ///
 /// Turned on by its A/B on the block (FAST job 335, 4 + 4 arms over the input
 /// from the columns): base −0.90 s, the whole run −1.55 s, the argue's
@@ -2617,31 +2527,14 @@ pub fn argue_no_lift() -> bool {
     match ARGUE_NO_LIFT_FORCED.load(Ordering::Relaxed) {
         1 => argue_gkr_input(),
         2 => false,
-        _ => {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| {
-                let wanted = env_not_off("LAMBDA_VM_ARGUE_NO_LIFT");
-                let input = argue_gkr_input();
-                eprintln!(
-                    "★ ARGUE NO LIFT: {}",
-                    match (wanted, input) {
-                        (true, true) => {
-                            "on (the default, with the input from the columns; \
-                             LAMBDA_VM_ARGUE_NO_LIFT=0 lifts the factors)"
-                        }
-                        (false, _) => "off (LAMBDA_VM_ARGUE_NO_LIFT=0)",
-                        (true, false) => "off (it needs the input from the columns)",
-                    }
-                );
-                wanted && input
-            })
-        }
+        _ => argue_gkr_input(),
     }
 }
 
 static ARGUE_NO_LIFT_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Overrides `LAMBDA_VM_ARGUE_NO_LIFT` for the whole process; `None` restores it.
+/// Overrides [`argue_no_lift`] for the whole process; `None` restores the
+/// default.
 #[doc(hidden)]
 pub fn force_argue_no_lift(on: Option<bool>) {
     ARGUE_NO_LIFT_FORCED.store(
@@ -2654,8 +2547,8 @@ pub fn force_argue_no_lift(on: Option<bool>) {
     );
 }
 
-/// Overrides `LAMBDA_VM_ARGUE_GKR_INPUT` for the whole process — for a test
-/// that proves both ways in one binary. `None` restores the environment's.
+/// Overrides [`argue_gkr_input`] for the whole process — for a test that proves
+/// both ways in one binary. `None` restores the default.
 #[doc(hidden)]
 pub fn force_argue_gkr_input(on: Option<bool>) {
     ARGUE_GKR_INPUT_FORCED.store(
@@ -2671,8 +2564,8 @@ pub fn force_argue_gkr_input(on: Option<bool>) {
 /// Whether a big batch's device rounds walk its program on demand
 /// ([`Program::on_demand`](crate::program::Program::on_demand)), with the slot
 /// file sized for every interpolation node from the first round. The same
-/// round values either way. On by default; `LAMBDA_VM_ARGUE_LEAN_PROGRAM=0` is
-/// the opt-out, and it is the old path exactly.
+/// round values either way. On; a test's override
+/// ([`force_argue_lean_program`]) takes the old path exactly.
 ///
 /// The default was turned on by its A/B on the block (FAST, 2026-09-29): the
 /// whole run 1.35 s faster, the big batches' early device rounds 1,527 → 442 ms
@@ -2692,18 +2585,15 @@ pub fn argue_lean_program() -> bool {
     match ARGUE_LEAN_PROGRAM_FORCED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| env_not_off("LAMBDA_VM_ARGUE_LEAN_PROGRAM"))
-        }
+        _ => true,
     }
 }
 
 static ARGUE_LEAN_PROGRAM_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Overrides `LAMBDA_VM_ARGUE_LEAN_PROGRAM` for the whole process — for a test
-/// that proves both ways in one binary. `None` restores the environment's
-/// setting. Not for production callers.
+/// Overrides [`argue_lean_program`] for the whole process — for a test that
+/// proves both ways in one binary. `None` restores the default. Not for
+/// production callers.
 #[doc(hidden)]
 pub fn force_argue_lean_program(on: Option<bool>) {
     ARGUE_LEAN_PROGRAM_FORCED.store(
@@ -2764,7 +2654,7 @@ struct ZerocheckLowering {
     big: bool,
 }
 
-/// `program` lowered — or, under `LAMBDA_VM_ARGUE_LEAN_PROGRAM` for a big batch,
+/// `program` lowered — or, under `gpu::argue_lean_program` for a big batch,
 /// the same program on demand, when that holds fewer values.
 #[cfg(feature = "cuda")]
 fn lower_for_zerocheck<E>(program: &crate::program::Program<E>) -> Option<ZerocheckLowering>
@@ -2858,7 +2748,7 @@ fn note_tables_xchecked(tables: usize) {
 }
 
 /// A batch weight as the device is handed it: a table the host built, or the
-/// point of an `eq` table the card builds (`LAMBDA_VM_ARGUE_DEVICE_TABLES`).
+/// point of an `eq` table the card builds (`gpu::argue_device_tables`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WeightView<'a, E: math::field::traits::IsField> {
     Table(&'a crate::mle::Mle<E>),
@@ -4831,13 +4721,6 @@ impl std::fmt::Debug for DeviceFactors {
 
 #[cfg(feature = "cuda")]
 impl DeviceFactors {
-    /// Under `LAMBDA_VM_ARGUE_TREE_SYNC` (a diagnostic), wait for the kernels
-    /// that built the factors, so the tree's split charges the lift its own
-    /// card time.
-    pub fn tree_sync(&self) {
-        tree_sync!(self.0.stream());
-    }
-
     /// The card's handle, for the fused rounds (`gpu_fused`).
     pub(crate) fn inner(&self) -> &math_cuda::sumcheck::DeviceFactors {
         &self.0
@@ -4863,15 +4746,8 @@ impl DeviceFactors {
 #[derive(Debug)]
 pub struct DeviceFactors(std::convert::Infallible);
 
-#[cfg(not(feature = "cuda"))]
-impl DeviceFactors {
-    pub fn tree_sync(&self) {
-        match self.0 {}
-    }
-}
-
 /// A table's factors as its base columns on the card, with no lift (D-BATCH
-/// M1-2, `LAMBDA_VM_ARGUE_NO_LIFT`): the fused zerocheck's rounds 0 and 1 read
+/// M1-2, `gpu::argue_no_lift`): the fused zerocheck's rounds 0 and 1 read
 /// a committed factor where the epoch's columns reside, and a public one from a
 /// base copy. Keeps the columns alive for as long as it lives.
 #[cfg(feature = "cuda")]
@@ -5200,7 +5076,7 @@ where
 }
 
 /// The tree over a table's input layer written straight from its base
-/// columns (D-BATCH M1-2, `LAMBDA_VM_ARGUE_GKR_INPUT`): one launch writes
+/// columns (D-BATCH M1-2, `gpu::argue_gkr_input`): one launch writes
 /// every interaction's two sides from the epoch's resident columns, where
 /// [`input_layer_tree`] runs two programs an interaction over the lifted
 /// factors. The same cells, so the same tree, output and GKR proof.
@@ -5406,7 +5282,6 @@ fn truncated_tree(
     let num_vars = full.trailing_zeros() as usize;
     let t = crate::whir_split::tick();
     let (p, q) = write(false)?;
-    tree_sync!(stream);
     crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
     let t = crate::whir_split::tick();
     let tree = math_cuda::gkr::DeviceFractionTree::from_truncated_input(
@@ -5417,7 +5292,6 @@ fn truncated_tree(
         num_vars,
     )
     .ok()?;
-    tree_sync!(stream);
     crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
     let output = std::sync::OnceLock::new();
     if build == Build::Eager {
@@ -5478,11 +5352,9 @@ fn carried_or_handed_back(
         drop(carried);
         let t = crate::whir_split::tick();
         let (p, q) = write(true)?;
-        tree_sync!(stream);
         crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
         let t = crate::whir_split::tick();
         let tree = math_cuda::gkr::DeviceFractionTree::from_device(stream.clone(), p, q).ok()?;
-        tree_sync!(stream);
         crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
         let output = std::sync::OnceLock::new();
         if build == Build::Eager {
@@ -5522,14 +5394,12 @@ fn carried_or_handed_back(
 
     let t = crate::whir_split::tick();
     let (p, q) = write(false)?;
-    tree_sync!(stream);
     crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
     let num_vars = full.trailing_zeros() as usize;
     let t = crate::whir_split::tick();
     let tree =
         math_cuda::gkr::DeviceFractionTree::from_padded_input(stream.clone(), p, q, real, num_vars)
             .ok()?;
-    tree_sync!(stream);
     crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
     let output = std::sync::OnceLock::new();
     if build == Build::Eager {
@@ -5857,7 +5727,8 @@ pub fn lean_tiles_in_effect() -> &'static str {
 
 /// Whether a device fold runs every level in one launch
 /// ([`math_cuda::whir::fold_resident_fused`]) or one launch per level. `true`
-/// unless `LAMBDA_VM_NO_WHIR_FUSED_FOLD` is set; the two are raw-identical.
+/// unless a test forces it off ([`force_fused_fold`]); the two are
+/// raw-identical.
 #[cfg(feature = "cuda")]
 static FUSED_FOLD_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
@@ -5866,17 +5737,14 @@ fn fused_fold() -> bool {
     match FUSED_FOLD_FORCED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => {
-            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            !*OFF.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_WHIR_FUSED_FOLD").is_some())
-        }
+        _ => true,
     }
 }
 
 /// Whether a chain's first successor is encoded from the message its rounds
 /// bound rather than folded from the committed codeword
-/// (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR`; on by default,
-/// [`math_cuda::whir::ENCODE_SUCCESSOR_DEFAULT`] says why; `=0` folds). The
+/// (on, [`math_cuda::whir::ENCODE_SUCCESSOR_DEFAULT`] says why; a test's
+/// override folds). The
 /// same values either way (`math_cuda::whir::encode_successor`): the fold
 /// reads the `2^(n+blowup)` base codeword, the encode a `2^(n−k)` message.
 #[cfg(feature = "cuda")]
@@ -5884,24 +5752,15 @@ fn encode_successor() -> bool {
     match ENCODE_SUCCESSOR_FORCED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| {
-                math_cuda::whir::encode_successor_setting(
-                    std::env::var("LAMBDA_VM_WHIR_ENCODE_SUCCESSOR")
-                        .ok()
-                        .as_deref(),
-                )
-            })
-        }
+        _ => math_cuda::whir::ENCODE_SUCCESSOR_DEFAULT,
     }
 }
 
 #[cfg(feature = "cuda")]
 static ENCODE_SUCCESSOR_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Overrides `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR` for the whole process. `None`
-/// restores the environment's setting. Not for production callers.
+/// Overrides [`encode_successor`] for the whole process. `None` restores the
+/// default. Not for production callers.
 #[doc(hidden)]
 #[cfg(feature = "cuda")]
 pub fn force_encode_successor(on: Option<bool>) {
@@ -6247,7 +6106,7 @@ impl OpeningFactors {
     /// ★ The successor a `levels`-level fold of `codeword` would make, encoded
     /// from the message these factors' rounds bound
     /// ([`math_cuda::whir_open::OpeningSession::encode_successor`]), unless
-    /// `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`. `None` sends the caller to the
+    /// `gpu::encode_successor_in_effect` off. `None` sends the caller to the
     /// fold: the knob off, or the card declining.
     pub(crate) fn encode_successor(
         &mut self,
@@ -7399,7 +7258,7 @@ impl DeviceCodeword {
     ///
     /// The tree is kept past this call, inside the codeword's promise and
     /// evictable — whole by default, or its leaf layer under
-    /// `LFM_WHIR_WHOLE_TREES=0` — because the only other thing a proof wants
+    /// `whir::whole_trees` off — because the only other thing a proof wants
     /// from it is a path per query, which [`paths`](Self::paths) reads when the
     /// queries are known (see `math_cuda::whir::DeviceCodeword::commit`).
     pub(crate) fn commit(
@@ -8030,19 +7889,11 @@ mod tests {
 
     type FE = FieldElement<Ext3>;
 
-    /// A coset opening reads the stack where it lies by default: unset (or
-    /// any other word) reads in place, `0` assembles, `1` reads in place; with
-    /// the variable unset the knob says so.
+    /// A coset opening reads the stack where it lies by default.
     #[test]
     fn a_coset_opening_reads_its_stack_in_place_by_default() {
-        assert!(coset_inplace_from(None), "unset: in place");
-        assert!(!coset_inplace_from(Some("0")), "0: assembled");
-        assert!(coset_inplace_from(Some(" 1 ")), "1: in place");
-        assert!(coset_inplace_from(Some("yes")), "another word: the default");
-        if std::env::var_os("LAMBDA_VM_WHIR_COSET_INPLACE").is_none() {
-            force_coset_inplace(None);
-            assert!(coset_inplace_in_effect());
-        }
+        force_coset_inplace(None);
+        assert!(coset_inplace_in_effect());
     }
 
     /// ★ A value read back from the card is serialized canonically whatever
@@ -8135,54 +7986,14 @@ mod tests {
         b.finish(root).unwrap()
     }
 
-    /// `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`, `LAMBDA_VM_ARGUE_DEVICE_TABLES` and
-    /// `LAMBDA_VM_ARGUE_LEAN_PROGRAM` are on by default: unset, empty or any value
-    /// reads on, and only `0` — the opt-out — reads off.
+    /// The argue's device paths are on by default. ⚠ No test in this binary
+    /// forces these, which is what makes the reading the default's.
     #[test]
-    fn only_zero_turns_a_default_on_knob_off() {
-        assert!(not_off(None), "unset is the default, on");
-        assert!(not_off(Some("")), "empty is not the opt-out");
-        assert!(not_off(Some("1")));
-        assert!(!not_off(Some("0")), "`0` is the opt-out");
-    }
-
-    /// The GKR input knob reads its variable the default-on way, whatever the
-    /// environment sets. ⚠ No test in this binary forces the knob, which is
-    /// what makes the reading the environment's.
-    #[test]
-    fn the_gkr_input_knob_is_on_unless_its_variable_is_zero() {
-        let variable = std::env::var("LAMBDA_VM_ARGUE_GKR_INPUT").ok();
-        assert_eq!(argue_gkr_input(), not_off(variable.as_deref()));
-    }
-
-    /// No lift reads its variable the default-on way, and needs the input
-    /// from the columns.
-    #[test]
-    fn the_no_lift_knob_is_on_unless_either_variable_is_zero() {
-        let input = std::env::var("LAMBDA_VM_ARGUE_GKR_INPUT").ok();
-        let variable = std::env::var("LAMBDA_VM_ARGUE_NO_LIFT").ok();
-        assert_eq!(
-            argue_no_lift(),
-            not_off(variable.as_deref()) && not_off(input.as_deref())
-        );
-    }
-
-    /// The tables knob reads its variable the default-on way, whatever the
-    /// environment sets. ⚠ No test in this binary forces the knob, which is
-    /// what makes the reading the environment's.
-    #[test]
-    fn the_tables_knob_is_on_unless_its_variable_is_zero() {
-        let variable = std::env::var("LAMBDA_VM_ARGUE_DEVICE_TABLES").ok();
-        assert_eq!(argue_device_tables(), not_off(variable.as_deref()));
-    }
-
-    /// The lean program's knob reads its variable the default-on way, whatever
-    /// the environment sets. ⚠ No test in this binary forces the knob, which is
-    /// what makes the reading the environment's.
-    #[test]
-    fn the_lean_program_knob_is_on_unless_its_variable_is_zero() {
-        let variable = std::env::var("LAMBDA_VM_ARGUE_LEAN_PROGRAM").ok();
-        assert_eq!(argue_lean_program(), not_off(variable.as_deref()));
+    fn the_argue_device_paths_are_on_by_default() {
+        assert!(argue_device_tables());
+        assert!(argue_gkr_input());
+        assert!(argue_no_lift());
+        assert!(argue_lean_program());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! A GKR layer's device rounds with Gruen's split (D-ARGUE S1-3,
-//! `LAMBDA_VM_ARGUE_GKR_GRUEN`): the same round messages as today's, from half
+//! `gkr_gruen::argue_gkr_gruen`): the same round messages as today's, from half
 //! the work.
 //!
 //! # What a round sends, and what the card sums
@@ -43,34 +43,15 @@ use math::field::{element::FieldElement, traits::IsField};
 
 use crate::gkr::Cubic;
 
-/// Whether a device GKR layer runs Gruen's rounds: on by default,
-/// `LAMBDA_VM_ARGUE_GKR_GRUEN=0` the opt-out, and off is the old layer rounds
-/// exactly. Read once, with a banner.
+/// Whether a device GKR layer runs Gruen's rounds: on, unless a test forces
+/// the old layer rounds exactly.
 ///
 /// Turned on by its A/B on the block (FAST job 330, 4 + 4 arms): base −1.77 s,
 /// the argue −2.08 s, the whole run −1.57 s, the GKR 4.24 → 2.13 s, the same
 /// identities; the cross-check arm compared 3,381 real layers with the old
 /// rounds and found every one equal.
 pub fn argue_gkr_gruen() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    forced(&GRUEN_FORCED, || {
-        *ON.get_or_init(|| {
-            let on = not_off(std::env::var("LAMBDA_VM_ARGUE_GKR_GRUEN").ok().as_deref());
-            eprintln!(
-                "★ ARGUE GKR GRUEN: {}",
-                if on {
-                    format!(
-                        "on (the default; LAMBDA_VM_ARGUE_GKR_GRUEN=0 is the old layer rounds; the host tail \
-                         from a cube of {})",
-                        gkr_gruen_tail()
-                    )
-                } else {
-                    "off (LAMBDA_VM_ARGUE_GKR_GRUEN=0)".to_string()
-                }
-            );
-            on
-        })
-    })
+    forced(&GRUEN_FORCED, || true)
 }
 
 /// Whether every Gruen round is checked against today's
@@ -133,11 +114,6 @@ fn on_from(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// A default-on knob's reading of its variable: only `0` turns it off.
-fn not_off(value: Option<&str>) -> bool {
-    value != Some("0")
-}
-
 static GRUEN_FORCED: AtomicU8 = AtomicU8::new(0);
 static XCHECK_FORCED: AtomicU8 = AtomicU8::new(0);
 static TAIL_FORCED: AtomicUsize = AtomicUsize::new(0);
@@ -161,7 +137,7 @@ fn store_forced(cell: &AtomicU8, on: Option<bool>) {
     );
 }
 
-/// Overrides `LAMBDA_VM_ARGUE_GKR_GRUEN` for the whole process — for a test
+/// Overrides `gkr_gruen::argue_gkr_gruen` for the whole process — for a test
 /// that proves both ways in one binary. `None` restores the environment's.
 #[doc(hidden)]
 pub fn force_argue_gkr_gruen(on: Option<bool>) {
@@ -752,25 +728,12 @@ mod tests {
         );
     }
 
-    /// ★ The default: on unless `LAMBDA_VM_ARGUE_GKR_GRUEN=0` (FAST job 330).
-    #[test]
-    fn the_gruen_knob_is_on_unless_its_variable_is_zero() {
-        assert_eq!(
-            argue_gkr_gruen(),
-            not_off(std::env::var("LAMBDA_VM_ARGUE_GKR_GRUEN").ok().as_deref())
-        );
-    }
-
     #[test]
     fn the_knobs_read_their_variables() {
         assert!(!on_from(None));
         assert!(!on_from(Some("0")));
         assert!(!on_from(Some("")));
         assert!(on_from(Some("1")));
-        // The main knob is on unless its variable is `0`.
-        assert!(not_off(None));
-        assert!(not_off(Some("1")));
-        assert!(!not_off(Some("0")));
         assert_eq!(tail_from(None), GRUEN_TAIL_DEFAULT);
         assert_eq!(tail_from(Some("32")), 32);
         assert_eq!(tail_from(Some("512")), 512);

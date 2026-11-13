@@ -2505,7 +2505,7 @@ pub fn gpu_deep_calls() -> u64 {
 
 /// The share of [`gpu_deep_calls`] that took the fused kernel, which inverts
 /// each row's denominators itself ([`try_deep_composition_gpu_fused_keep`]).
-/// Zero under `LAMBDA_VM_DEEP_INV_LEGACY=1`; at the default a resident table
+/// Zero on the legacy path (`math_cuda::deep_inv`); at the default a resident table
 /// that stays at zero fell back to the buffered kernel and its inverse buffer.
 pub(crate) static GPU_FUSED_DEEP_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_fused_deep_calls() -> u64 {

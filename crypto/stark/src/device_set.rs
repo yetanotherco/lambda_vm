@@ -11,7 +11,7 @@
 //! Every term mirrors an allocation in `math_cuda`, with ONE LDE buffer, never
 //! two: the column-major engine (`math_cuda::lde_cm`, the default) writes the
 //! LDE in the layout the rounds read, and the legacy path (host-copy tables,
-//! `LAMBDA_VM_LDE_LEGACY=1`) transposes its row-major LDE in place (#956);
+//! a test's `lde_cm::with_engine(false, ..)`) transposes its row-major LDE in place (#956);
 //! `one_lde_buffer::vram_arm` measures the commit's three big terms and the doc on
 //! `DEFAULT_MEMPOOL_RELEASE_THRESHOLD_BYTES` records the numbers. The model
 //! carries no blanket safety factor: the card's admission budget is 80% of

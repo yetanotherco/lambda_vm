@@ -26,7 +26,7 @@ use crate::{
 ///
 /// The second is what lets a device build the table where it is folded —
 /// `2^n` cells from `n` coordinates — instead of the host building it and
-/// sending it across (`LAMBDA_VM_ARGUE_DEVICE_TABLES`). Whoever runs the rounds
+/// sending it across (`gpu::argue_device_tables`). Whoever runs the rounds
 /// on the host builds it here, the same table either way.
 #[derive(Clone, Debug)]
 pub enum Weight<F: IsField> {
@@ -369,7 +369,7 @@ where
 }
 
 /// [`prove_resident`], with the zerocheck's rounds the stage-1 way when
-/// `fused` describes the batch and `LAMBDA_VM_ARGUE_FUSED` is on
+/// `fused` describes the batch and `gpu_fused::argue_fused` is on
 /// ([`crate::gpu_fused`]): the same messages, the same proof. A decline runs
 /// today's device rounds, then the host's, as before.
 #[allow(clippy::too_many_arguments)]
@@ -402,7 +402,7 @@ where
 }
 
 /// [`prove_resident_with`] for factors that may not be lifted yet (D-BATCH
-/// M1-2, `LAMBDA_VM_ARGUE_NO_LIFT`): with no `device` but the table's base
+/// M1-2, `gpu::argue_no_lift`): with no `device` but the table's base
 /// columns in `fused`, the fused rounds read the columns where they lie, and
 /// `lift` makes the lifted factors only when today's rounds need them — the
 /// fused rounds declined, or the cross-check replays today's beside them. The
@@ -520,7 +520,7 @@ where
                 None => {
                     crate::gpu_fused::note_decline();
                     crate::whir_split::bump(&crate::whir_split::ZC_FUSED_DECLINED);
-                    if check || crate::gpu_fused::argue_fused_log() {
+                    if check {
                         eprintln!(
                             "ARGUE FUSED: declined · factors {} n={} (today's rounds run)",
                             width,
@@ -543,20 +543,6 @@ where
                         cross_check(
                             lifted, &views, program, degree, &rounds, &point, &factors, times,
                         )?;
-                    } else if crate::gpu_fused::argue_fused_log() {
-                        eprintln!(
-                            "ARGUE FUSED: factors {} roots {} terms {} slots {} n={} · fused {:.3} ms (grid \
-                             {:.3} fold2 {:.3} rounds {:.3})",
-                            width,
-                            times.roots,
-                            times.terms,
-                            times.slots,
-                            rows.trailing_zeros(),
-                            times.total * 1e3,
-                            times.grid * 1e3,
-                            times.fold2 * 1e3,
-                            times.rounds * 1e3,
-                        );
                     }
                     let host_tail = crate::whir_split::tick();
                     batched.adopt(factors)?;

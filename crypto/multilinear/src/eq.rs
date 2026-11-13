@@ -561,7 +561,7 @@ mod tests {
     }
 
     /// ★ The identity the claim reduce's tables on the card stand on
-    /// (`LAMBDA_VM_ARGUE_DEVICE_TABLES`): a shift table is the `eq` table read
+    /// (`gpu::argue_device_tables`): a shift table is the `eq` table read
     /// `k` rows back, cyclically, so the card builds `eq(x, ·)` once and each
     /// offset's table is a rotated copy of it.
     ///

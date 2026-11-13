@@ -83,7 +83,7 @@ fn gpu_fri_fault_falls_back_to_cpu() {
 /// on CPU and the remaining GPU path keeps running. The fully resident R4 DEEP
 /// inverts inside its own kernel by default and never reaches that entry
 /// point, so there the faults land on R3's inversions (R4's buffered path takes
-/// them under `LAMBDA_VM_DEEP_INV_LEGACY=1`).
+/// them on the legacy path, `math_cuda::deep_inv`).
 ///
 /// The injection fires the Nth time the math-cuda entry point is reached,
 /// across all tables. We assert that the fault really fired, that the

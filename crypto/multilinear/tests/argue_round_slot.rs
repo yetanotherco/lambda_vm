@@ -221,7 +221,7 @@ fn the_slot_proves_todays_bytes() {
     }
 }
 
-/// The same with today's generic layer rounds (`LAMBDA_VM_ARGUE_GKR_GRUEN=0`):
+/// The same with today's generic layer rounds (`gkr_gruen::argue_gkr_gruen` off):
 /// no Gruen layer, so no slot; the bytes are today's.
 #[test]
 fn without_gruens_rounds_the_slot_changes_nothing() {

@@ -11,7 +11,7 @@
 //! Four arms: the path before the kernels (lean rounds 0, folds level by
 //! level), six lean rounds with the fused fold (`LAMBDA_VM_WHIR_LEAN_ROUNDS=6`,
 //! the way back), three lean rounds and the fused fold with every successor
-//! folded (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`, the way back), and the
+//! folded (`gpu::encode_successor_in_effect` off, the way back), and the
 //! defaults (three lean rounds, the fused fold, the first successor encoded
 //! from the bound message instead of folded). Needs a GPU. Each new path is
 //! asserted TAKEN in its arms and NOT in the others (the call counters), so a
@@ -138,7 +138,7 @@ enum Arm {
     /// Six lean rounds and the fused fold (`LAMBDA_VM_WHIR_LEAN_ROUNDS=6`).
     Six,
     /// Three lean rounds and the fused fold, every successor folded
-    /// (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`).
+    /// (`gpu::encode_successor_in_effect` off).
     Folded,
     /// Nothing forced: the defaults, three lean rounds in tile form (a block a
     /// tile), the fused fold and each chain's first successor encoded from its
@@ -192,9 +192,7 @@ fn prove_arm<H: WhirHash>(
                     "the default is three lean rounds"
                 );
             }
-            if matches!(arm, Arm::Defaults | Arm::Tiles(_))
-                && std::env::var_os("LAMBDA_VM_WHIR_ENCODE_SUCCESSOR").is_none()
-            {
+            if matches!(arm, Arm::Defaults | Arm::Tiles(_)) {
                 assert!(
                     gpu::encode_successor_in_effect(),
                     "the default encodes the first successor"

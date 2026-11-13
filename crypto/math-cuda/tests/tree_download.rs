@@ -1,4 +1,4 @@
-//! The precomputed tree's staged download (`LAMBDA_VM_TREE_DOWNLOAD=staged`)
+//! The precomputed tree's staged download (`device::tree_download_staged`)
 //! must hand the host the same nodes as the pageable download, byte for byte,
 //! across every chunk boundary and a ragged tail (a full node buffer is
 //! `2^k − 32` bytes), in both forms of the preprocessed commit (the legacy

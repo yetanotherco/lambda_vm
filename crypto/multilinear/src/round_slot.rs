@@ -27,17 +27,17 @@ pub enum RoundSlotSetting {
     Check,
 }
 
-/// The setting `LAMBDA_VM_ARGUE_ROUND_SLOT` names: `0` off, unset, empty or
-/// `1` on, `check` on and compared. Anything else is on, said once — `wait`,
+/// The setting `LAMBDA_VM_ARGUE_ROUND_SLOT` names: unset, empty or `1` on,
+/// `check` on and compared. Anything else is on, said once: today's second
+/// launch ([`RoundSlotSetting::Off`]) is a test's override only, and `wait`,
 /// the next round queued behind a card-side wait, is not built.
 pub fn round_slot_setting(value: Option<&str>) -> RoundSlotSetting {
     match value {
-        Some("0") => RoundSlotSetting::Off,
         None | Some("") | Some("1") => RoundSlotSetting::On,
         Some("check") => RoundSlotSetting::Check,
         Some(other) => {
             eprintln!(
-                "[argue] LAMBDA_VM_ARGUE_ROUND_SLOT={other} is not 0, 1 or check; reading the GKR rounds' \
+                "[argue] LAMBDA_VM_ARGUE_ROUND_SLOT={other} is not 1 or check; reading the GKR rounds' \
                  sums from a slot (the default)"
             );
             RoundSlotSetting::On
@@ -64,12 +64,12 @@ pub fn argue_round_slot() -> RoundSlotSetting {
                     "★ ARGUE ROUND SLOT: {}",
                     match set {
                         RoundSlotSetting::Off => {
-                            "off (LAMBDA_VM_ARGUE_ROUND_SLOT=0: today's second launch and read-back every round)"
+                            "off (today's second launch and read-back every round)"
                         }
                         RoundSlotSetting::On => {
                             "on (the default; the GKR rounds' sums from a slot the round kernel's last block \
-                             writes, a bin's trees built without a wait each; =0 restores today's, =check \
-                             compares them)"
+                             writes, a bin's trees built without a wait each; =check compares them with \
+                             today's)"
                         }
                         RoundSlotSetting::Check => {
                             "check (the rounds' sums from a slot and today's read-back, compared every round)"
@@ -150,7 +150,11 @@ mod tests {
     fn the_knob_reads_its_variable() {
         assert_eq!(round_slot_setting(None), RoundSlotSetting::On);
         assert_eq!(round_slot_setting(Some("")), RoundSlotSetting::On);
-        assert_eq!(round_slot_setting(Some("0")), RoundSlotSetting::Off);
+        assert_eq!(
+            round_slot_setting(Some("0")),
+            RoundSlotSetting::On,
+            "today's round trips are a test's override only"
+        );
         assert_eq!(round_slot_setting(Some("1")), RoundSlotSetting::On);
         assert_eq!(round_slot_setting(Some("check")), RoundSlotSetting::Check);
         assert_eq!(
@@ -162,10 +166,9 @@ mod tests {
     }
 
     /// ★ The default reads the GKR rounds' sums from a slot — the same proof
-    /// bytes, which the card tests show — and only `0` keeps today's round
-    /// trips.
+    /// bytes, which the card tests show.
     #[test]
-    fn the_knob_is_on_unless_its_variable_is_zero() {
+    fn the_knob_is_on_unless_it_says_check() {
         assert_eq!(
             argue_round_slot(),
             round_slot_setting(std::env::var("LAMBDA_VM_ARGUE_ROUND_SLOT").ok().as_deref())

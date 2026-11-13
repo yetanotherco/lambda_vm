@@ -98,17 +98,6 @@ pub struct SumcheckSession {
     r_dev: CudaSlice<u64>,
 }
 
-thread_local! {
-    // ROUND-3 ARGUE DEVICE-BUSY SIZING (diagnostic; `LAMBDA_VM_ARGUE_BUSY_PROBE`).
-    // A reusable TIMING-enabled CUDA event pair — created ONCE per thread, never
-    // per round (a mid-prove cuEventCreate convoys the driver lock), and reused to
-    // bracket the round kernels. Off by default: production round() only ever
-    // reads the cached flag and skips all of this.
-    static BUSY_EVENTS: std::cell::RefCell<
-        Option<(cudarc::driver::CudaEvent, cudarc::driver::CudaEvent)>,
-    > = const { std::cell::RefCell::new(None) };
-}
-
 impl SumcheckSession {
     /// Uploads `factors` (each `2^num_vars` ext3 values, interleaved as three
     /// u64 per element) and the lowered program.
@@ -421,20 +410,6 @@ impl SumcheckSession {
         };
         let num_nodes = self.num_nodes as u64;
         let num_t_u32 = num_t as u32;
-        // Round-3 argue device-busy sizing: bracket the round kernels with a
-        // reusable event pair, read the elapsed after the EXISTING sync below.
-        let busy_probe = crate::argue_probe::busy_probe_enabled();
-        if busy_probe {
-            BUSY_EVENTS.with(|cell| -> Result<()> {
-                let mut ev = cell.borrow_mut();
-                if ev.is_none() {
-                    let f = cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
-                    *ev = Some((be.ctx.new_event(Some(f))?, be.ctx.new_event(Some(f))?));
-                }
-                ev.as_ref().unwrap().0.record(&self.stream)?;
-                Ok(())
-            })?;
-        }
         // S1-1: integer nodes take the componentwise multiply — only when
         // every node is `(k, 0, 0)`, where the two are the same value.
         let kernel = if int_nodes() && t.chunks_exact(3).all(|n| n[1] == 0 && n[2] == 0) {
@@ -476,12 +451,6 @@ impl SumcheckSession {
                     shared_mem_bytes: reduce_block * 3 * 8,
                 })?;
         }
-        if busy_probe {
-            BUSY_EVENTS.with(|cell| -> Result<()> {
-                cell.borrow().as_ref().unwrap().1.record(&self.stream)?;
-                Ok(())
-            })?;
-        }
         Ok(num_t)
     }
 
@@ -490,16 +459,6 @@ impl SumcheckSession {
     pub fn round_collect(&self, num_t: usize) -> Result<Vec<u64>> {
         let sums = crate::readback::clone_dtoh(&self.stream, &self.sums.slice(0..num_t * 3))?;
         self.stream.synchronize()?;
-        if crate::argue_probe::busy_probe_enabled() {
-            BUSY_EVENTS.with(|cell| -> Result<()> {
-                let ev = cell.borrow();
-                let (start, end) = ev.as_ref().unwrap();
-                crate::argue_probe::add_device_busy_ns(
-                    (start.elapsed_ms(end)? as f64 * 1.0e6) as u64,
-                );
-                Ok(())
-            })?;
-        }
         Ok(sums)
     }
 
@@ -698,39 +657,16 @@ impl SumcheckSession {
 }
 
 /// Whether a round with integer nodes takes the componentwise multiply
-/// (D-ARGUE S1-1): on by default, `LAMBDA_VM_ARGUE_INT_NODES=0` the opt-out.
-/// The same value either way: `(k, 0, 0)·d = (k·d₀, k·d₁, k·d₂)`. Read once,
-/// with a banner. Turned on with the fused zerocheck, by their A/B together
-/// (FAST jobs 274 and 270).
+/// (D-ARGUE S1-1): on, unless a test forces the full multiply. The same value
+/// either way: `(k, 0, 0)·d = (k·d₀, k·d₁, k·d₂)`. Turned on with the fused
+/// zerocheck, by their A/B together (FAST jobs 274 and 270).
 pub fn int_nodes() -> bool {
-    match INT_NODES_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = int_nodes_from(std::env::var("LAMBDA_VM_ARGUE_INT_NODES").ok().as_deref());
-        eprintln!(
-            "[gpu] sumcheck rounds: {}",
-            if on {
-                "integer nodes (the default; LAMBDA_VM_ARGUE_INT_NODES=0 is the full multiply)"
-            } else {
-                "the full ext3 multiply (LAMBDA_VM_ARGUE_INT_NODES=0)"
-            }
-        );
-        on
-    })
-}
-
-/// The knob's reading of its variable: only `0` turns it off.
-pub(crate) fn int_nodes_from(value: Option<&str>) -> bool {
-    value != Some("0")
+    INT_NODES_FORCED.load(std::sync::atomic::Ordering::Relaxed) != 1
 }
 
 static INT_NODES_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// A test's own setting in place of the environment's (`None` = the environment).
+/// A test's own setting in place of the default (`None` = the default).
 #[doc(hidden)]
 pub fn force_int_nodes(on: Option<bool>) {
     INT_NODES_FORCED.store(
