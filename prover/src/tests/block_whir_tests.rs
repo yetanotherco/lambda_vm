@@ -3295,14 +3295,16 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
     .expect("pages");
     let inputs =
         crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("the AIR inputs");
+    // The AIR set the block verifier builds: the pinned format's table forms.
+    let pinned = BlockFormat::pinned();
     let airs = crate::block_airs(
         &program,
         &opts,
         &pages,
         &counts,
         &inputs,
-        crate::tables::keccak_rnd::KeccakRndForm::Full,
-        crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        pinned.keccak_rnd,
+        pinned.memw_aligned,
     );
     let (fractions, len) = airs
         .air_refs()
