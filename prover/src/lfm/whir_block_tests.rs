@@ -3243,10 +3243,11 @@ fn the_whir_block_tree_on_a_real_block() {
             .to_bytes()
             .expect("the top's file")
             .len();
-        let c1_file = WhirBlockCompressedProof::new(run.statement.clone(), c1.proof.clone())
-            .to_bytes()
-            .expect("the compressed file")
-            .len();
+        let c1_file =
+            WhirBlockCompressedProof::for_binding(run.statement.clone(), c1.proof.clone(), c1.prep)
+                .to_bytes()
+                .expect("the compressed file")
+                .len();
         let c1_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&c1.proof)
             .expect("serialize C1")
             .len();
