@@ -1,15 +1,14 @@
 //! The block proved with its cut tables stopped at the last real row
-//! (`CutPadding::LastTable`, the default; `LAMBDA_VM_BLOCK_CUT_PADDING=run`
-//! pads the whole run): the verifier accepts the block without its tables of
-//! padding rows alone, and refuses a block one table short of the real rows on
-//! the bus balance, which is its only objection. The streamed prove counts the
-//! tables of the rule the process runs under, and phase B builds every one it
-//! dropped again.
+//! (`CutPadding::LastTable`, the only rule a block proves at; the whole run
+//! padded, `CutPadding::WholeRun`, stays as the tests' oracle): the verifier
+//! accepts the block without its tables of padding rows alone, and refuses a
+//! block one table short of the real rows on the bus balance, which is its
+//! only objection. The streamed prove counts the tables of the rule, and
+//! phase B builds every one it dropped again.
 //!
 //! Box tier: each test proves several small blocks and takes minutes on a CPU
 //! runner, so all three are `#[ignore]`d. Run them with
-//! `--ignored --exact --test-threads=1 tests::block_cut_padding_tests::<name>`,
-//! the last one once with the variable unset and once at `run`.
+//! `--ignored --exact --test-threads=1 tests::block_cut_padding_tests::<name>`.
 
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
@@ -278,22 +277,18 @@ fn a_block_one_table_short_of_the_real_rows_is_refused_on_the_bus() {
     }
 }
 
-/// ★ The streamed prove, as the block runs it, counts the tables of the rule
-/// the process runs under (`LAMBDA_VM_BLOCK_CUT_PADDING`): test_keccak_multi's
-/// KECCAK_RND is four tables of 2^5 rows with the whole run padded and three
-/// cut at the last real row (KECCAK, ECSM and ECDAS at their production cuts:
-/// one KECCAK table). Proved with the finish monolithic, with the finish
-/// streamed, and with live regeneration dropping every table it can — which
-/// then builds each dropped KECCAK_RND table again with no mismatch — and
-/// verified each time. Run once per value of the variable.
+/// ★ The streamed prove, as the block runs it, counts the tables of its rule:
+/// test_keccak_multi's KECCAK_RND is three tables of 2^5 rows cut at the last
+/// real row (four with the whole run padded; KECCAK, ECSM and ECDAS at their
+/// production cuts: one KECCAK table). Proved with the finish monolithic, with
+/// the finish streamed, and with live regeneration dropping every table it
+/// can — which then builds each dropped KECCAK_RND table again with no
+/// mismatch — and verified each time.
 #[test]
 #[ignore = "proves small blocks, minutes on a CPU runner; box tier"]
 fn a_streamed_block_counts_the_tables_of_the_rule_in_effect() {
-    let padding = CutPadding::from_env().expect("the variable reads");
-    let tables = match padding {
-        CutPadding::WholeRun => 4,
-        CutPadding::LastTable => 3,
-    };
+    let padding = CutPadding::LastTable;
+    let tables = 3;
     let elf = asm_elf_bytes("test_keccak_multi");
     let opts = ProofOptions::default_test_options();
     let format = many_groups(ArgueFormat::BATCHED);

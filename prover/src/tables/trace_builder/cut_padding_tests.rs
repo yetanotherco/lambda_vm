@@ -188,23 +188,12 @@ fn round_tables(
     keccak_rnd_chunks_in_waves(ops, rows, 0, padding, pack, form, usize::MAX).expect("the chunks")
 }
 
-/// The default stops at the last real row: the type's default, a build's
-/// default settings, and what an unset variable reads as. The knob reads two
-/// words (`run`, the whole run padded) and refuses the rest.
+/// The default stops at the last real row: the type's default and a build's
+/// default settings.
 #[test]
-fn the_default_is_the_last_real_row_and_the_knob_reads_two_words() {
+fn the_default_is_the_last_real_row() {
     assert_eq!(CutPadding::default(), CutPadding::LastTable);
     assert_eq!(StreamSkip::default().cut_padding, CutPadding::LastTable);
-    assert_eq!(CutPadding::parse(None), Ok(CutPadding::LastTable));
-    assert_eq!(CutPadding::parse(Some(" last ")), Ok(CutPadding::LastTable));
-    assert_eq!(CutPadding::parse(Some("run")), Ok(CutPadding::WholeRun));
-    for other in ["", "0", "1", "Last", "whole", "last,run"] {
-        let refused = CutPadding::parse(Some(other)).expect_err("another word");
-        assert!(
-            refused.contains("LAMBDA_VM_BLOCK_CUT_PADDING") && refused.contains("run or last"),
-            "{other}: {refused}"
-        );
-    }
 }
 
 /// The count against a model of the block's split: the whole table is

@@ -689,20 +689,18 @@ fn cut_shapes(t: &Traces) -> Vec<(&'static str, usize, Vec<usize>)> {
         .collect()
 }
 
-/// ★ The default stops at the last real row, and the knob at `run` builds
+/// ★ The default stops at the last real row, and the whole run padded builds
 /// exactly the tables the block always built before, on two pinned programs:
-/// the type's default and what an unset variable reads as keep the tables
-/// with a real row; `run` is the whole run padded, table for table as listed
-/// here and word for word the frozen build's. test_keccak_multi is 3
+/// the type's default keeps the tables with a real row; the whole run padded,
+/// table for table as listed here and word for word the frozen build's. test_keccak_multi is 3
 /// permutations: 3 KECCAK rows (4 padded) and 72 KECCAK_RND rows (128
 /// padded), and its 200-byte `write` is 25 COPY rows (32 padded).
 /// test_ecsm_multi is 3 scalar multiplications: 3 ECSM rows (4 padded) and 42
 /// ECDAS steps (64 padded), and its three 32-byte `write`s are 12 COPY rows
 /// (16 padded).
 #[test]
-fn the_knob_at_run_builds_the_whole_runs_tables_on_pinned_programs() {
-    let unset = CutPadding::parse(None).expect("an unset variable");
-    let run_word = CutPadding::parse(Some("run")).expect("the word run");
+fn the_whole_run_padded_builds_the_whole_runs_tables_on_pinned_programs() {
+    let run_word = CutPadding::WholeRun;
     let keccak_last = [
         ("COPY", 13, 2),
         ("KECCAK", 2, 2),
@@ -719,9 +717,7 @@ fn the_knob_at_run_builds_the_whole_runs_tables_on_pinned_programs() {
     ];
     for (name, padding, want) in [
         ("test_keccak_multi", CutPadding::default(), keccak_last),
-        ("test_keccak_multi", unset, keccak_last),
         ("test_ecsm_multi", CutPadding::default(), ecsm_last),
-        ("test_ecsm_multi", unset, ecsm_last),
         (
             "test_keccak_multi",
             run_word,

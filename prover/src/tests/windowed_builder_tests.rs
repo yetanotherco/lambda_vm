@@ -356,9 +356,9 @@ fn windowed_builds_the_whole_run_tables_at_production_sizes() {
     same_traces(&reference, &traces);
 }
 
-/// The padding rule the windowed builder reads (`LAMBDA_VM_BLOCK_CUT_PADDING`).
+/// The padding rule the windowed builder cuts at by default.
 fn padding() -> CutPadding {
-    CutPadding::from_env().expect("the padding rule")
+    CutPadding::LastTable
 }
 
 /// The whole-run KECCAK_RND table cut into tables of `rows` rows — rows
@@ -1189,19 +1189,15 @@ fn dropping_the_streamed_ops_holds_less_than_a_chunk_per_table() {
 }
 
 /// The hand-out's stamps count every chunk it handed out, table by table, and
-/// the ops it copied. Handed out as the window parts they lie in (the default)
-/// no chunk is copied; under `LAMBDA_VM_HANDOUT_COPY=1` a CPU chunk whose
-/// window lists are each exactly a chunk moves out whole (none copied) and one
-/// cut out of windows of 7 cycles is copied op for op. The tables are the same
-/// every way.
+/// the ops it copied. Handed out as the window parts they lie in, no chunk is
+/// copied, whether the window lists are each exactly a chunk or cut out of
+/// windows of 7 cycles. The tables are the same every way.
 #[test]
 fn the_handout_stamps_count_each_tables_chunks_and_copies() {
     let max_rows = MaxRowsConfig::small();
     let (program, logs) = run("bench_32k");
     let reference = whole(&program, &logs, &max_rows);
-    let copies = std::env::var("LAMBDA_VM_HANDOUT_COPY").is_ok_and(|v| v.trim() == "1");
-    for (window, copied_when_copying) in [(max_rows.cpu, 0), (7, max_rows.cpu)] {
-        let cpu_copied_per_chunk = if copies { copied_when_copying } else { 0 };
+    for window in [max_rows.cpu, 7] {
         let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
             .expect("the builder")
             .drop_streamed_ops()
@@ -1234,7 +1230,7 @@ fn the_handout_stamps_count_each_tables_chunks_and_copies() {
         );
         assert_eq!(
             stamps.copied[StreamTable::Cpu.position()],
-            streamed.cpu * cpu_copied_per_chunk,
+            0,
             "window {window}: CPU ops copied"
         );
         let timed: f64 = stamps.take.iter().chain(&stamps.count).sum();

@@ -1,6 +1,6 @@
 //! The hand-out's two ways of taking a chunk out of a tail: as the window
-//! parts it lies in ([`Tail::take_segments`], what [`Tail::take`] does unless
-//! `LAMBDA_VM_HANDOUT_COPY=1`) and copied into one list ([`Tail::take_copy`])
+//! parts it lies in ([`Tail::take_segments`], what [`Tail::take`] does) and
+//! copied into one list ([`Tail::take_copy`])
 //! give the same ops, and so does what stays behind.
 
 use super::{Segments, Tail};

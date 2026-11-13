@@ -1021,20 +1021,17 @@ fn a_derive_window_holds_its_bound_and_its_order() {
     assert_eq!(failed, Err("item 9".to_string()));
 }
 
-/// The derive's knobs read a positive window and `level`, and refuse nonsense
-/// with an error, not a panic.
+/// The derive's knob reads a positive window and refuses nonsense with an
+/// error, not a panic.
 #[test]
-fn the_derive_knobs_read_their_values_and_refuse_nonsense() {
-    use super::whir_block::{parse_derive_builds, parse_derive_hold};
+fn the_derive_knob_reads_its_value_and_refuses_nonsense() {
+    use super::whir_block::parse_derive_builds;
     assert_eq!(parse_derive_builds(None), Ok(None));
     assert_eq!(parse_derive_builds(Some(" ")), Ok(None));
     assert_eq!(parse_derive_builds(Some("8")), Ok(Some(8)));
     for bad in ["0", "-1", "eight"] {
         assert!(parse_derive_builds(Some(bad)).is_err(), "{bad}");
     }
-    assert_eq!(parse_derive_hold(None), Ok(false));
-    assert_eq!(parse_derive_hold(Some("level")), Ok(true));
-    assert!(parse_derive_hold(Some("all")).is_err());
 }
 
 /// The leaf scale's knob reads nothing as the default (doubled from 10

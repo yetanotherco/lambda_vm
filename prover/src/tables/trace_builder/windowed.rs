@@ -259,10 +259,10 @@ pub struct WindowedTraceBuilder<'a> {
     pack_finished: bool,
     /// [`Self::generate_packed`].
     gpack: bool,
-    /// How `finish` pads the tables it cuts ([`CutPadding`]):
-    /// `LAMBDA_VM_BLOCK_CUT_PADDING`'s rule.
+    /// How `finish` pads the tables it cuts ([`CutPadding`]): the last real
+    /// row's table unless a test says otherwise.
     cut_padding: CutPadding,
-    /// The cycles the walker collects and walks at a time ([`walk_batch`]).
+    /// The cycles the walker collects and walks at a time ([`WALK_BATCH`]).
     walk_batch: usize,
     /// [`Self::defer_ecrec_witnesses`].
     defer_ecrec: bool,
@@ -513,8 +513,10 @@ impl<'a> WindowedTraceBuilder<'a> {
         let decode = Arc::new(DecodeTable::from_instructions(&instructions));
         let decode_secs = t.elapsed().as_secs_f64();
         let decode_trace = DecodeTrace::spawn(instructions)?;
-        let lean = WalkLean::from_env()?;
-        let count = if handout_count::count_thread_from_env()? {
+        let lean = WalkLean::ALL;
+        // The hand-out counts on a thread of its own with the `parallel`
+        // feature, on the accumulator's thread without it.
+        let count = if cfg!(feature = "parallel") {
             CountMode::Thread
         } else {
             CountMode::Inline
@@ -552,8 +554,8 @@ impl<'a> WindowedTraceBuilder<'a> {
             finish_cut_rows: (0, 0, 0, 0),
             pack_finished: false,
             gpack: false,
-            cut_padding: CutPadding::from_env()?,
-            walk_batch: walk_batch(),
+            cut_padding: CutPadding::LastTable,
+            walk_batch: WALK_BATCH,
             defer_ecrec: ecrec_deferred(),
             count_made: counted_where_made(),
             cpu_listless: cpu_list_dropped(),
@@ -575,8 +577,8 @@ impl<'a> WindowedTraceBuilder<'a> {
     }
 
     /// Count what the table phase reads from each handed-out chunk on a
-    /// thread of its own (`true`) or on the accumulator's (`false`), whatever
-    /// `LAMBDA_VM_HANDOUT_COUNT_THREAD` says ([`handout_count`]). The tables
+    /// thread of its own (`true`, the default) or on the accumulator's
+    /// (`false`) ([`handout_count`]). The tables
     /// are the same. Before the first chunk is handed out; later, or without
     /// the `parallel` feature for `true`, it changes nothing.
     pub fn count_handout_on_thread(mut self, on: bool) -> Self {
@@ -642,8 +644,8 @@ impl<'a> WindowedTraceBuilder<'a> {
         Ok(())
     }
 
-    /// Walk with these lean parts, whatever `LAMBDA_VM_WALK_LEAN` says (the
-    /// tables are the same). Before the first window only.
+    /// Walk with these lean parts instead of every one (the tables are the
+    /// same). Before the first window only.
     #[cfg(test)]
     pub(crate) fn walk_lean(mut self, lean: WalkLean) -> Self {
         assert_eq!(self.cycles, 0, "walk_lean after a window was walked");
@@ -652,8 +654,8 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
-    /// `finish` pads the tables it cuts as `padding`, whatever
-    /// `LAMBDA_VM_BLOCK_CUT_PADDING` says.
+    /// `finish` pads the tables it cuts as `padding` instead of
+    /// [`CutPadding::LastTable`].
     #[cfg(test)]
     pub(crate) fn cut_padding(mut self, padding: CutPadding) -> Self {
         self.cut_padding = padding;
@@ -661,7 +663,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     }
 
     /// Walk `n` cycles at a time (`0`: the whole window's CPU ops, then the
-    /// walk), whatever `LAMBDA_VM_WALK_BATCH` says (the lists are the same).
+    /// walk) instead of [`WALK_BATCH`] (the lists are the same).
     #[cfg(test)]
     pub(crate) fn walk_batch(mut self, n: usize) -> Self {
         self.walk_batch = n;
@@ -724,7 +726,6 @@ impl<'a> WindowedTraceBuilder<'a> {
                 .card_fill_streamed
                 .as_ref()
                 .is_some_and(|card| card.cpu.is_some())
-            && route_fused()
     }
 
     /// Whether the walkers count where the rows are made: asked for, and the
@@ -1143,16 +1144,10 @@ impl<'a> WindowedTraceBuilder<'a> {
     }
 
     /// The streamed finish counts the BITWISE lookups beside the rest's
-    /// builds, in BITWISE's own table's job ([`StreamSkip::p4_beside`]). The
-    /// tables are the same.
-    pub fn p4_beside(mut self) -> Self {
-        self.emitted.p4_beside = true;
-        self
-    }
-
-    /// [`Self::p4_beside`], the rest handed on with BITWISE after every other
-    /// table when the finish slides ([`StreamSkip::bitwise_last`]). The tables
-    /// are the same; their order, and so the groups, are not.
+    /// builds, in BITWISE's own table's job ([`StreamSkip::p4_beside`]), and
+    /// the rest is handed on with BITWISE after every other table when the
+    /// finish slides ([`StreamSkip::bitwise_last`]). The tables are the same;
+    /// their order, and so the groups, are not.
     pub fn rest_bitwise_last(mut self) -> Self {
         self.emitted.p4_beside = true;
         self.emitted.bitwise_last = true;
@@ -1951,11 +1946,7 @@ fn walk_window(
         batch_len(batch, logs.len())
     });
     // Without `lookups`, the accumulator counts them (`absorb`).
-    let mut walk = if walk_sized() {
-        WalkOutputs::for_walk_sized(logs.len(), lookups, sizes, order)
-    } else {
-        WalkOutputs::for_walk(logs.len(), lookups, order)
-    };
+    let mut walk = WalkOutputs::for_walk_sized(logs.len(), lookups, sizes, order);
     if let Some(window) = words {
         walk.memw.set_words(window, logs.len() * 3);
     }
@@ -2259,7 +2250,7 @@ impl Accumulator<'_> {
             if let (Err(e), Some(kept)) = (routed, self.kept.as_deref_mut()) {
                 kept.listless_broken.get_or_insert(format!("{e}"));
             }
-        } else if self.lean.route && self.lean.lookups && route_fused() {
+        } else if self.lean.route && self.lean.lookups {
             super::route_ops_into(
                 &window.cpu_ops,
                 self.decode,
@@ -2645,15 +2636,6 @@ impl<T> Segments<T> {
     }
 }
 
-/// Whether the accumulator routes a window into the run's segments in place
-/// and counts its CPU ops' lookups in the same pass (unset or `1`), or routes
-/// it into segments of its own, appends them, then counts
-/// (`LAMBDA_VM_ROUTE_FUSED=0`). Read once. The segments and counts are the same.
-fn route_fused() -> bool {
-    static FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FUSED.get_or_init(|| !std::env::var("LAMBDA_VM_ROUTE_FUSED").is_ok_and(|v| v.trim() == "0"))
-}
-
 /// Whether the walkers keep no CPU list (unset, or anything but `0`: the
 /// default) or keep it (`LAMBDA_VM_WALK_NO_CPU_LIST=0`):
 /// [`WindowedTraceBuilder::drop_cpu_list`]'s default. Read once. The tables
@@ -2682,34 +2664,9 @@ fn ecrec_deferred() -> bool {
     *DEFER.get_or_init(|| !std::env::var("LAMBDA_VM_ECREC_DEFER").is_ok_and(|v| v.trim() == "0"))
 }
 
-/// Whether the walker sizes a window's streamed lists from the last window's
-/// lengths (unset or `1`) or from fixed per-cycle guesses, growing them as it
-/// goes (`LAMBDA_VM_WALK_SIZED=0`). Read once. The lists are the same.
-fn walk_sized() -> bool {
-    static SIZED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SIZED.get_or_init(|| !std::env::var("LAMBDA_VM_WALK_SIZED").is_ok_and(|v| v.trim() == "0"))
-}
-
-/// The cycles the walker collects and walks at a time (`LAMBDA_VM_WALK_BATCH`,
-/// default 2048; `0` collects the whole window's CPU ops, then walks them).
-/// Read once. The lists are the same.
-fn walk_batch() -> usize {
-    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BATCH.get_or_init(|| {
-        std::env::var("LAMBDA_VM_WALK_BATCH")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(2048)
-    })
-}
-
-/// Whether the hand-out copies each chunk's ops out of the window parts
-/// (`LAMBDA_VM_HANDOUT_COPY=1`, the control) instead of handing out the parts
-/// they lie in. Read once. The chunks are the same.
-fn handout_copies() -> bool {
-    static COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *COPY.get_or_init(|| std::env::var("LAMBDA_VM_HANDOUT_COPY").is_ok_and(|v| v.trim() == "1"))
-}
+/// The cycles the walker collects and walks at a time (a test may set `0`:
+/// the whole window's CPU ops, then the walk). The lists are the same.
+const WALK_BATCH: usize = 2048;
 
 /// A streamed table's ops not yet in a handed-out chunk
 /// ([`WindowedTraceBuilder::drop_streamed_ops`]): the windows' lists, moved in
@@ -2743,24 +2700,16 @@ impl<T: Clone> Tail<T> {
 
     /// The first `n` ops (at most `len`), as the parts they lie in: a part the
     /// chunk uses up leaves the tail, a part it uses the front of stays shared.
-    /// Under [`handout_copies`], copied into one list (a part that is exactly
-    /// the chunk moves out whole).
     fn take(&mut self, n: usize) -> Segments<T> {
-        self.take_counted(n).0
+        self.take_segments(n)
     }
 
-    /// [`Self::take`], and how many of the ops it copied (none as parts, nor
-    /// when a part moved out whole).
+    /// [`Self::take`], and how many of the ops it copied: none, as parts.
     fn take_counted(&mut self, n: usize) -> (Segments<T>, usize) {
-        if handout_copies() {
-            let (ops, copied) = self.take_copy_counted(n);
-            return (Segments::one(ops), copied);
-        }
         (self.take_segments(n), 0)
     }
 
-    /// The first `n` ops (at most `len`) as the parts they lie in, whatever
-    /// [`handout_copies`] says.
+    /// The first `n` ops (at most `len`) as the parts they lie in.
     fn take_segments(&mut self, n: usize) -> Segments<T> {
         let mut want = n.min(self.len);
         self.len -= want;
@@ -3590,7 +3539,7 @@ fn route_from_logs(
     histogram: &mut bitwise::BitwiseHistogram,
 ) -> Result<(), Error> {
     let dvrm_before = segments.dvrm_filter.len();
-    let batch = walk_batch().max(1);
+    let batch = WALK_BATCH;
     let mut ops = Vec::with_capacity(batch.min(logs.len()));
     let mut at = first;
     for part in logs.chunks(batch) {
@@ -4172,19 +4121,6 @@ fn join<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + 
 
 /// The windows' lists concatenated into the run's, once: list by list in
 /// parallel, each window's list freed as it is copied.
-/// Whether [`concatenate`] copies each list's windows one after another on one
-/// thread (`LAMBDA_VM_BUILDER_CONCAT=serial`), the control for the parallel copy
-/// that is the default: on block 25368371 it read −0.52 s of base (FAST 417) and
-/// replicated in its re-registered band at −0.21 s (FAST 419). Read once. The
-/// two give the same lists.
-#[cfg(feature = "parallel")]
-fn serial_concat() -> bool {
-    static SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SERIAL.get_or_init(|| {
-        std::env::var("LAMBDA_VM_BUILDER_CONCAT").is_ok_and(|v| v.trim() == "serial")
-    })
-}
-
 fn concatenate(
     windows: Vec<WalkedWindow>,
     order: MemwAlignedOrder,
@@ -4197,7 +4133,7 @@ fn concatenate(
         let total = parts.iter().map(Vec::len).sum();
         let mut out = Vec::with_capacity(total);
         #[cfg(feature = "parallel")]
-        if !serial_concat() && parts.len() > 1 {
+        if parts.len() > 1 {
             let mut slots: Vec<&mut [std::mem::MaybeUninit<T>]> = Vec::with_capacity(parts.len());
             let mut rest = &mut out.spare_capacity_mut()[..total];
             for part in &parts {
@@ -4707,7 +4643,7 @@ impl RegenBuilder {
     ) -> Result<Self, Error> {
         let mut memory_state =
             MemoryState::from_pages(&build_initial_image_paged(elf, private_input));
-        memory_state.lean = WalkLean::from_env()?.memory;
+        memory_state.lean = WalkLean::ALL.memory;
         let register_init = register::register_init_from_entry_point(elf.entry_point);
         let instructions = decode::instructions_from_elf(elf)
             .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;

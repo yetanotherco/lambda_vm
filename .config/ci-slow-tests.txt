@@ -28,7 +28,6 @@ lambda-vm-prover tests::block_whir_tests::the_shadow_stays_off_where_it_cannot_r
 lambda-vm-prover tests::block_whir_tests::row_families_filled_from_their_rows_move_no_byte  # 418 s
 lambda-vm-prover tests::block_batched_tests::a_batched_group_argued_wrongly_is_refused  # 414 s
 lambda-vm-prover tests::block_whir_tests::keccak_rnd_filled_from_records_moves_no_byte  # 358 s
-lambda-vm-prover tests::block_whir_tests::regenerators_started_at_the_finishs_end_prove_the_same_bytes  # 356 s
 lambda-vm-prover tests::block_whir_tests::row_records_chunks_drop_as_records_and_come_back  # 352 s
 lambda-vm-prover tests::block_whir_tests::phase_b_overlap_failures_are_the_proves_error_and_a_refusal_turns_it_serial  # 351 s
 lambda-vm-prover tests::block_whir_tests::phase_b_led_by_a_leaf_proves_the_same_bytes  # not timed: four proves of the streamed keccak block, as the 351 s test above
@@ -69,7 +68,6 @@ lambda-vm-prover lfm::machine_tests::tampered_merkle_opening_rejects  # 201 s
 lambda-vm-prover tests::block_batched_tests::the_bus_balance_binds_the_batched_block  # 198 s
 lambda-vm-prover tests::block_whir_tests::a_streamed_block_laid_out_on_three_threads_packs_the_same_groups  # 197 s
 lambda-vm-prover tests::recursion_smoke_test::test_recursion_continuation_blob_decodes_and_verifies_on_host  # 196 s
-lambda-vm-prover tests::block_whir_tests::bitwise_handed_on_last_moves_the_partition_and_verifies  # 192 s
 lambda-vm-prover tests::block_whir_tests::ecdas_split_into_chunks_proves_and_verifies  # 190 s
 lambda-vm-prover lfm::machine_tests::machine_proves_the_sample_replay  # 190 s
 lambda-vm-prover tests::recursion_smoke_test::test_recursion_accepts_a_bundle_whose_epochs_carry_different_tables  # 190 s
@@ -150,7 +148,6 @@ lambda-vm-prover tests::multiplicity_forgery_poc::load_unanswered_forged_claim_i
 lambda-vm-prover tests::multiplicity_forgery_poc::mul_negative_mu_hi_forgery_is_rejected  # 95 s
 lambda-vm-prover tests::cpu_timestamp_tests::swapped_cpu_tables_are_rejected  # 95 s
 lambda-vm-prover tables::trace_builder::finish::stream_tests::with_bitwise_from_tables_the_stream_is_the_monolithic_finish  # 94 s
-lambda-vm-prover tables::trace_builder::finish::stream_tests::with_bitwise_last_the_sliding_stream_hands_bitwise_on_last  # 94 s
 lambda-vm-prover tests::block_whir_tests::a_wrong_records_table_is_refused_by_the_verifier  # 93 s
 lambda-vm-prover tests::is_wh_tests::test_is_wh_canonical_word_rewrite_verifies  # 93 s
 lambda-vm-prover tests::multiplicity_forgery_poc::shift_unanswered_forged_claim_is_rejected  # 93 s
@@ -280,7 +277,6 @@ lambda-vm-prover tests::prove_elfs_tests::test_prove_dma_memcpy_cases_rust_guest
 lambda-vm-prover tests::skip_empty_tables_tests::counts_the_proof_cannot_back_are_refused_before_verification  # 51 s
 lambda-vm-prover tests::prove_elfs_tests::test_verify_rejects_undercounted_table_count  # 51 s
 lambda-vm-prover tests::multiplicity_forgery_poc::load_negative_mu_sign_extension_forgery_is_rejected  # 51 s
-lambda-vm-prover tables::trace_builder::finish::stream_tests::bitwise_counted_beside_the_rest_builds_the_same_tables  # 51 s
 lambda-vm-prover tests::recursion_smoke_test::test_recursion_blob_decodes_and_verifies_on_host  # 51 s
 lambda-vm-prover tests::decode_tests::decode_commitment_wrong_value_rejects  # 51 s
 lambda-vm-prover continuation::tests::test_verify_continuation_with_supplied_roots  # 51 s

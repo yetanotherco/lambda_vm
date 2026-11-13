@@ -365,229 +365,144 @@ fn count_bitwise(
     // Where each source's collectors start in `collectors`, in order, so the
     // parallel path can say what each source cost (the `BLOCK P4 ROWS` line).
     let mut starts: Vec<(&'static str, usize)> = Vec::new();
-    if p4_sliced() {
-        // LT's segments slice by slice; a compact one through a temporary of a
-        // slice's ops at a time.
-        starts.push(("LT", collectors.len()));
-        // Counted straight into the histogram (`skip.p4_direct`), or
-        // through each slice's list of lookups, as before.
-        let lt_lookups = move |slice: &[LtOperation], h: &mut bitwise::BitwiseHistogram| {
-            if direct {
-                count_bitwise_from_lt_ops(slice, h)
-            } else {
-                h.add_ops(&collect_bitwise_from_lt_ops(slice))
-            }
-        };
-        let lt_slice = p4_slice_len(P4Source::Lt, mul_chunk, dvrm_chunk);
-        for part in lt_ops.parts.iter().filter(|_| !from_tables) {
-            match *part {
-                Part::Ops(ops) => {
-                    for slice in ops.chunks(lt_slice) {
-                        collectors.push(Box::new(move |h| lt_lookups(slice, h)));
-                    }
+    // LT's segments slice by slice; a compact one through a temporary of a
+    // slice's ops at a time.
+    starts.push(("LT", collectors.len()));
+    // Counted straight into the histogram (`skip.p4_direct`), or
+    // through each slice's list of lookups, as before.
+    let lt_lookups = move |slice: &[LtOperation], h: &mut bitwise::BitwiseHistogram| {
+        if direct {
+            count_bitwise_from_lt_ops(slice, h)
+        } else {
+            h.add_ops(&collect_bitwise_from_lt_ops(slice))
+        }
+    };
+    let lt_slice = p4_slice_len(P4Source::Lt, mul_chunk, dvrm_chunk);
+    for part in lt_ops.parts.iter().filter(|_| !from_tables) {
+        match *part {
+            Part::Ops(ops) => {
+                for slice in ops.chunks(lt_slice) {
+                    collectors.push(Box::new(move |h| lt_lookups(slice, h)));
                 }
-                Part::Compact(compact) => {
-                    for start in (0..compact.len()).step_by(lt_slice) {
-                        collectors.push(Box::new(move |h| {
-                            let mut slice = Vec::new();
-                            compact.expand_into(start, start + lt_slice, &mut slice);
-                            lt_lookups(&slice, h)
-                        }));
-                    }
+            }
+            Part::Compact(compact) => {
+                for start in (0..compact.len()).step_by(lt_slice) {
+                    collectors.push(Box::new(move |h| {
+                        let mut slice = Vec::new();
+                        compact.expand_into(start, start + lt_slice, &mut slice);
+                        lt_lookups(&slice, h)
+                    }));
                 }
             }
         }
-        // MUL and DVRM deduplicate per instance: their slices are the
-        // instances of the concatenation (copied only where one straddles two
-        // blocks). The other sources are sums over their ops: block by block.
-        starts.push(("MUL", collectors.len()));
-        let mul_slice = p4_slice_len(P4Source::Mul, mul_chunk, dvrm_chunk);
-        for k in 0..mul_ops.len().div_ceil(mul_slice) {
-            let mul_ops = &mul_ops;
-            collectors.push(Box::new(move |h| {
-                let slice = mul_ops.range(k * mul_slice, (k + 1) * mul_slice);
-                h.add_ops(&collect_bitwise_from_mul(&slice, mul_chunk))
-            }));
-        }
-        starts.push(("DVRM", collectors.len()));
-        let dvrm_slice = p4_slice_len(P4Source::Dvrm, mul_chunk, dvrm_chunk);
-        for k in 0..dvrm_ops.len().div_ceil(dvrm_slice) {
-            let dvrm_ops = &dvrm_ops;
-            collectors.push(Box::new(move |h| {
-                let slice = dvrm_ops.range(k * dvrm_slice, (k + 1) * dvrm_slice);
-                h.add_ops(&collect_bitwise_from_dvrm(&slice, dvrm_chunk))
-            }));
-        }
-        starts.push(("BRANCH", collectors.len()));
-        let branch_slice = p4_slice_len(P4Source::Branch, mul_chunk, dvrm_chunk);
-        let branch_slices = if from_tables {
-            0
-        } else {
-            branch_ops.len().div_ceil(branch_slice.max(1))
-        };
-        for k in 0..branch_slices {
-            let branch_ops = &branch_ops;
-            collectors.push(Box::new(move |h| {
-                let slice = branch_ops.range(k * branch_slice, (k + 1) * branch_slice);
-                h.add_ops(&collect_bitwise_from_branch_ops(&slice))
-            }));
-        }
-        starts.push(("SHIFT", collectors.len()));
-        let shift_slice = p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk);
-        for slice in shift_parts
-            .iter()
-            .copied()
-            .flat_map(|part| part.chunks(shift_slice))
-        {
-            collectors.push(Box::new(move |h| {
-                h.add_ops(&shift::collect_bitwise_from_shift(slice))
-            }));
-        }
-        starts.push(("BYTEWISE", collectors.len()));
-        let bytewise_slice = p4_slice_len(P4Source::Bytewise, mul_chunk, dvrm_chunk);
-        let bytewise_slices = if from_tables {
-            0
-        } else {
-            bytewise_ops.len().div_ceil(bytewise_slice.max(1))
-        };
-        for k in 0..bytewise_slices {
-            let bytewise_ops = &bytewise_ops;
-            collectors.push(Box::new(move |h| {
-                for op in bytewise_ops.range(k * bytewise_slice, (k + 1) * bytewise_slice) {
-                    h.add_ops(&op.collect_bitwise_ops());
-                }
-            }));
-        }
-        starts.push(("EQ", collectors.len()));
-        let eq_slice = p4_slice_len(P4Source::Eq, mul_chunk, dvrm_chunk);
-        for k in 0..eq_ops.len().div_ceil(eq_slice.max(1)) {
-            let eq_ops = &eq_ops;
-            collectors.push(Box::new(move |h| {
-                for op in eq_ops.range(k * eq_slice, (k + 1) * eq_slice) {
-                    h.add_ops(&op.collect_bitwise_ops());
-                }
-            }));
-        }
-        starts.push(("STORE", collectors.len()));
-        let store_slice = p4_slice_len(P4Source::Store, mul_chunk, dvrm_chunk);
-        for slice in store_ops.parts().flat_map(|part| part.chunks(store_slice)) {
-            collectors.push(Box::new(move |h| {
-                for op in slice {
-                    h.add_ops(&op.collect_bitwise_ops());
-                }
-            }));
-        }
-        starts.push(("MEMW_A", collectors.len()));
-        for slice in
-            memw_aligned_ops.chunks(p4_slice_len(P4Source::MemwAligned, mul_chunk, dvrm_chunk))
-        {
-            collectors.push(Box::new(move |h| {
-                h.add_ops(&collect_bitwise_from_memw_aligned(slice))
-            }));
-        }
-        starts.push(("KECCAK", collectors.len()));
-        let keccak_slice = p4_slice_len(P4Source::Keccak, mul_chunk, dvrm_chunk);
-        for slice in keccak_ops
-            .parts()
-            .flat_map(|part| part.chunks(keccak_slice))
-        {
-            collectors.push(Box::new(move |h| {
-                if direct {
-                    count_bitwise_from_keccak_for(slice, keccak_rnd_form, h)
-                } else {
-                    h.add_ops(&collect_bitwise_from_keccak_for(slice, keccak_rnd_form))
-                }
-            }));
-        }
-        starts.push(("ECDAS", collectors.len()));
-        let ecdas_slice = p4_slice_len(P4Source::Ecdas, mul_chunk, dvrm_chunk);
-        for slice in ecdas_ops.parts().flat_map(|part| part.chunks(ecdas_slice)) {
-            collectors.push(Box::new(move |h| {
-                h.add_ops(&collect_bitwise_from_compact_ecdas(slice))
-            }));
-        }
+    }
+    // MUL and DVRM deduplicate per instance: their slices are the
+    // instances of the concatenation (copied only where one straddles two
+    // blocks). The other sources are sums over their ops: block by block.
+    starts.push(("MUL", collectors.len()));
+    let mul_slice = p4_slice_len(P4Source::Mul, mul_chunk, dvrm_chunk);
+    for k in 0..mul_ops.len().div_ceil(mul_slice) {
+        let mul_ops = &mul_ops;
+        collectors.push(Box::new(move |h| {
+            let slice = mul_ops.range(k * mul_slice, (k + 1) * mul_slice);
+            h.add_ops(&collect_bitwise_from_mul(&slice, mul_chunk))
+        }));
+    }
+    starts.push(("DVRM", collectors.len()));
+    let dvrm_slice = p4_slice_len(P4Source::Dvrm, mul_chunk, dvrm_chunk);
+    for k in 0..dvrm_ops.len().div_ceil(dvrm_slice) {
+        let dvrm_ops = &dvrm_ops;
+        collectors.push(Box::new(move |h| {
+            let slice = dvrm_ops.range(k * dvrm_slice, (k + 1) * dvrm_slice);
+            h.add_ops(&collect_bitwise_from_dvrm(&slice, dvrm_chunk))
+        }));
+    }
+    starts.push(("BRANCH", collectors.len()));
+    let branch_slice = p4_slice_len(P4Source::Branch, mul_chunk, dvrm_chunk);
+    let branch_slices = if from_tables {
+        0
     } else {
-        for (k, name) in [
-            "LT", "MUL", "DVRM", "BRANCH", "SHIFT", "BYTEWISE", "EQ", "STORE", "MEMW_A", "KECCAK",
-            "ECDAS",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            starts.push((name, collectors.len() + k));
-        }
-        // `LAMBDA_VM_P4_SLICED=0`: every source one collector, as before the slices (the A/B's
-        // control). The same multiplicities: the histogram is a commutative sum.
-        collectors.extend([
-            Box::new(|h: &mut bitwise::BitwiseHistogram| {
-                for part in lt_ops.parts.iter().filter(|_| !from_tables) {
-                    match *part {
-                        Part::Ops(ops) => h.add_ops(&collect_bitwise_from_lt_ops(ops)),
-                        Part::Compact(compact) => {
-                            for start in (0..compact.len()).step_by(1 << 20) {
-                                let mut slice = Vec::new();
-                                compact.expand_into(start, start + (1 << 20), &mut slice);
-                                h.add_ops(&collect_bitwise_from_lt_ops(&slice));
-                            }
-                        }
-                    }
-                }
-            }) as Collector,
-            // MUL and DVRM deduplicate per instance: instance by instance.
-            Box::new(|h| {
-                for k in 0..mul_ops.len().div_ceil(mul_chunk.max(1)) {
-                    let slice = mul_ops.range(k * mul_chunk, (k + 1) * mul_chunk);
-                    h.add_ops(&collect_bitwise_from_mul(&slice, mul_chunk))
-                }
-            }),
-            Box::new(|h| {
-                for k in 0..dvrm_ops.len().div_ceil(dvrm_chunk.max(1)) {
-                    let slice = dvrm_ops.range(k * dvrm_chunk, (k + 1) * dvrm_chunk);
-                    h.add_ops(&collect_bitwise_from_dvrm(&slice, dvrm_chunk))
-                }
-            }),
-            Box::new(|h| {
-                for k in 0..branch_ops.len().div_ceil(1 << 20) * usize::from(!from_tables) {
-                    let slice = branch_ops.range(k << 20, (k + 1) << 20);
-                    h.add_ops(&collect_bitwise_from_branch_ops(&slice))
-                }
-            }),
-            Box::new(|h| {
-                for part in &shift_parts {
-                    h.add_ops(&shift::collect_bitwise_from_shift(part))
-                }
-            }),
-            Box::new(|h| {
-                for k in 0..bytewise_ops.len().div_ceil(1 << 20) * usize::from(!from_tables) {
-                    for op in bytewise_ops.range(k << 20, (k + 1) << 20) {
-                        h.add_ops(&op.collect_bitwise_ops());
-                    }
-                }
-            }),
-            Box::new(|h| {
-                for k in 0..eq_ops.len().div_ceil(1 << 20) {
-                    for op in eq_ops.range(k << 20, (k + 1) << 20) {
-                        h.add_ops(&op.collect_bitwise_ops());
-                    }
-                }
-            }),
-            Box::new(|h| {
-                for op in store_ops.iter() {
-                    h.add_ops(&op.collect_bitwise_ops());
-                }
-            }),
-            Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(memw_aligned_ops))),
-            Box::new(|h| {
-                for part in keccak_ops.parts() {
-                    h.add_ops(&collect_bitwise_from_keccak_for(part, keccak_rnd_form))
-                }
-            }),
-            Box::new(|h| {
-                for part in ecdas_ops.parts() {
-                    h.add_ops(&collect_bitwise_from_compact_ecdas(part))
-                }
-            }),
-        ]);
+        branch_ops.len().div_ceil(branch_slice.max(1))
+    };
+    for k in 0..branch_slices {
+        let branch_ops = &branch_ops;
+        collectors.push(Box::new(move |h| {
+            let slice = branch_ops.range(k * branch_slice, (k + 1) * branch_slice);
+            h.add_ops(&collect_bitwise_from_branch_ops(&slice))
+        }));
+    }
+    starts.push(("SHIFT", collectors.len()));
+    let shift_slice = p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk);
+    for slice in shift_parts
+        .iter()
+        .copied()
+        .flat_map(|part| part.chunks(shift_slice))
+    {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&shift::collect_bitwise_from_shift(slice))
+        }));
+    }
+    starts.push(("BYTEWISE", collectors.len()));
+    let bytewise_slice = p4_slice_len(P4Source::Bytewise, mul_chunk, dvrm_chunk);
+    let bytewise_slices = if from_tables {
+        0
+    } else {
+        bytewise_ops.len().div_ceil(bytewise_slice.max(1))
+    };
+    for k in 0..bytewise_slices {
+        let bytewise_ops = &bytewise_ops;
+        collectors.push(Box::new(move |h| {
+            for op in bytewise_ops.range(k * bytewise_slice, (k + 1) * bytewise_slice) {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
+        }));
+    }
+    starts.push(("EQ", collectors.len()));
+    let eq_slice = p4_slice_len(P4Source::Eq, mul_chunk, dvrm_chunk);
+    for k in 0..eq_ops.len().div_ceil(eq_slice.max(1)) {
+        let eq_ops = &eq_ops;
+        collectors.push(Box::new(move |h| {
+            for op in eq_ops.range(k * eq_slice, (k + 1) * eq_slice) {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
+        }));
+    }
+    starts.push(("STORE", collectors.len()));
+    let store_slice = p4_slice_len(P4Source::Store, mul_chunk, dvrm_chunk);
+    for slice in store_ops.parts().flat_map(|part| part.chunks(store_slice)) {
+        collectors.push(Box::new(move |h| {
+            for op in slice {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
+        }));
+    }
+    starts.push(("MEMW_A", collectors.len()));
+    for slice in memw_aligned_ops.chunks(p4_slice_len(P4Source::MemwAligned, mul_chunk, dvrm_chunk))
+    {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_memw_aligned(slice))
+        }));
+    }
+    starts.push(("KECCAK", collectors.len()));
+    let keccak_slice = p4_slice_len(P4Source::Keccak, mul_chunk, dvrm_chunk);
+    for slice in keccak_ops
+        .parts()
+        .flat_map(|part| part.chunks(keccak_slice))
+    {
+        collectors.push(Box::new(move |h| {
+            if direct {
+                count_bitwise_from_keccak_for(slice, keccak_rnd_form, h)
+            } else {
+                h.add_ops(&collect_bitwise_from_keccak_for(slice, keccak_rnd_form))
+            }
+        }));
+    }
+    starts.push(("ECDAS", collectors.len()));
+    let ecdas_slice = p4_slice_len(P4Source::Ecdas, mul_chunk, dvrm_chunk);
+    for slice in ecdas_ops.parts().flat_map(|part| part.chunks(ecdas_slice)) {
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&collect_bitwise_from_compact_ecdas(slice))
+        }));
     }
     // COPY's rows are millions at a block's size: a collector a block of
     // them, each counted straight into its histogram.

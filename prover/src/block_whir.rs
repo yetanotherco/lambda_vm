@@ -573,9 +573,8 @@ pub struct BlockOptions {
     /// tables ([`WindowedTraceBuilder::cuts_at_finish`]), each packed as it is
     /// built with [`Self::pack_finished`], instead of one wide table each that
     /// [`split_keccak`], [`split_ecsm`] and [`split_ecdas`] then copy apart;
-    /// the tables are the same. Production: on unless
-    /// `LAMBDA_VM_BLOCK_FINISH_PLAN=0` (the A arm: built whole and wide, then
-    /// split). At p90 the three are the rest's only wide tables (5.09 GiB) and
+    /// the tables are the same. Production: on (off, a test's A arm: built
+    /// whole and wide, then split). At p90 the three are the rest's only wide tables (5.09 GiB) and
     /// the rest's layout transposes them into fresh pages (+4.7 GiB VmRSS, BIG
     /// 660).
     pub finish_cuts: bool,
@@ -586,8 +585,8 @@ pub struct BlockOptions {
     /// ops freed with its last table, the layout taking each table as it comes
     /// and the packer placing it, so the rest's first groups commit while the
     /// finish still builds the later ones. The tables, their order and the
-    /// groups are the same. Production: on unless `LAMBDA_VM_BLOCK_FINISH_STREAM=0`
-    /// (the A arm: every table built at once, then laid out).
+    /// groups are the same. Production: on (off, a test's A arm and a build
+    /// without `parallel`'s path: every table built at once, then laid out).
     pub finish_stream: bool,
     /// With windows: `Some(bytes)` lays the rest of the run out in AIR order,
     /// in waves of at most `bytes` of rows (a larger table is a wave of its
@@ -619,8 +618,8 @@ pub struct BlockOptions {
     /// they generate it, with no 64-bit copy — every streamed chunk (laid out
     /// narrow from that, when the groups are held narrow) and, with
     /// [`Self::pack_finished`], every table the finish packs. The proof's bytes
-    /// are the same. Production: on unless `LAMBDA_VM_BLOCK_GPACK=0` (the A
-    /// arm: built at 8 bytes a cell, then laid out or packed as before).
+    /// are the same. Production: on (off, a test's A arm: built at 8 bytes a
+    /// cell, then laid out or packed as before).
     pub gpack: bool,
     /// What phase B does with the streamed chunks ([`regen::RegenMode`]):
     /// `None` reads `LAMBDA_VM_BLOCK_REGEN` when the prove starts (unset:
@@ -1035,20 +1034,16 @@ fn memory_reserve_bytes(cells: u64, per_g: f64) -> u64 {
 /// [`memory_reserve_bytes`]'s GiB per G cells committed.
 const MEMORY_RESERVE_PER_G: f64 = 1.65;
 
-/// `LAMBDA_VM_BLOCK_MEMORY_RESERVE_PER_G` (read under its old name,
-/// `LAMBDA_VM_BLOCK_SPILL_RESERVE_PER_G`, while the new one is unset): the
+/// `LAMBDA_VM_BLOCK_MEMORY_RESERVE_PER_G`: the
 /// `auto` rule's reserve per G cells committed, in GiB
 /// ([`memory_reserve_bytes`]), a measurement knob for its retune (D-FINISH S4:
 /// it still budgets the finish's transient S2b removed); unset, or not a finite
 /// number ≥ 0, is [`MEMORY_RESERVE_PER_G`].
 fn memory_reserve_per_g() -> f64 {
     parse_reserve_per_g(
-        renamed_knob(
-            |name| std::env::var(name).ok(),
-            "LAMBDA_VM_BLOCK_MEMORY_RESERVE_PER_G",
-            "LAMBDA_VM_BLOCK_SPILL_RESERVE_PER_G",
-        )
-        .as_deref(),
+        std::env::var("LAMBDA_VM_BLOCK_MEMORY_RESERVE_PER_G")
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -1249,12 +1244,12 @@ impl BlockOptions {
             upload_ahead: true,
             memlog: memlog::from_env(),
             finish_keccak_rnd_chunks: true,
-            finish_cuts: finish_plan_from_env(),
-            finish_stream: finish_stream_from_env(),
+            finish_cuts: true,
+            finish_stream: true,
             rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
             rest_build_bytes: Some(BLOCK_REST_BUILD_BYTES),
             pack_finished: true,
-            gpack: gpack_from_env(),
+            gpack: true,
             regen: regen::production_regen(),
             phase_b_overlap: phase_b_overlap_from_env(),
         }
@@ -1319,24 +1314,6 @@ pub(crate) fn phase_b_sched_from(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
-/// `LAMBDA_VM_BLOCK_GPACK`: [`BlockOptions::gpack`]'s production value, on
-/// unless `0`.
-pub(crate) fn gpack_from_env() -> bool {
-    !std::env::var("LAMBDA_VM_BLOCK_GPACK").is_ok_and(|v| v.trim() == "0")
-}
-
-/// `LAMBDA_VM_BLOCK_FINISH_PLAN`: [`BlockOptions::finish_cuts`]'s production
-/// value, on unless `0`.
-pub(crate) fn finish_plan_from_env() -> bool {
-    !std::env::var("LAMBDA_VM_BLOCK_FINISH_PLAN").is_ok_and(|v| v.trim() == "0")
-}
-
-/// `LAMBDA_VM_BLOCK_FINISH_STREAM`: [`BlockOptions::finish_stream`]'s
-/// production value, on unless `0`.
-pub(crate) fn finish_stream_from_env() -> bool {
-    !std::env::var("LAMBDA_VM_BLOCK_FINISH_STREAM").is_ok_and(|v| v.trim() == "0")
-}
-
 /// The card set up (its context, its modules and its staging pools) on a
 /// thread of its own as the streamed prove starts, so the first group's upload
 /// does not wait for it; nothing without the card's kernels. The proof is the
@@ -1348,14 +1325,6 @@ fn set_up_card() {
             head_log::card_ready();
         });
     }
-}
-
-/// `LAMBDA_VM_BLOCK_LT_CONCAT=1`: the finish concatenates LT's ops into one
-/// list before chunking them ([`WindowedTraceBuilder::concat_lt`]), the A arm
-/// of keeping them as segments; off by default. The tables are the same
-/// (#1013's knob).
-fn lt_concat() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
 }
 
 /// `LAMBDA_VM_BLOCK_LT_MERGE`: unset, empty or `1` (the default) makes the
@@ -1396,30 +1365,6 @@ mod lt_merge_knob_tests {
             assert!(super::lt_merge_from(Some(bad)).is_err(), "{bad}");
         }
     }
-}
-
-/// `LAMBDA_VM_BLOCK_P4_BESIDE=1`: the streamed finish counts the BITWISE
-/// lookups in BITWISE's own table's job, so the slide starts the tables after
-/// it while it counts ([`WindowedTraceBuilder::p4_beside`]); off by default.
-/// The tables are the same.
-fn p4_beside() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_P4_BESIDE").is_ok_and(|v| v.trim() == "1")
-}
-
-/// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST`: `1` has the streamed finish count
-/// BITWISE's multiplicities beside the rest's builds and, when it slides, hand
-/// the rest on in AIR order but BITWISE, which goes after every other table
-/// ([`WindowedTraceBuilder::rest_bitwise_last`]), so the tables that do not
-/// read the count reach the packer while it counts. Unset, empty or `0` (the
-/// default): AIR order, BITWISE first. Anything else refuses the prove. The
-/// tables are the same; the groups they are packed into, and so the proof's
-/// bytes, are not; the verifier takes any partition the statement declares.
-fn block_rest_bitwise_last() -> Result<bool, Error> {
-    parse_rest_bitwise_last(
-        std::env::var("LAMBDA_VM_BLOCK_REST_BITWISE_LAST")
-            .ok()
-            .as_deref(),
-    )
 }
 
 /// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`: unset, empty or `1` (the default)
@@ -1471,16 +1416,6 @@ fn parse_keccak_rnd_first(value: Option<&str>) -> Result<bool, Error> {
         Some("0") => Ok(false),
         Some(v) => Err(Error::Prover(format!(
             "LAMBDA_VM_BLOCK_KECCAK_RND_FIRST={v}: 1 (KECCAK_RND's tables handed on first) or 0"
-        ))),
-    }
-}
-
-fn parse_rest_bitwise_last(value: Option<&str>) -> Result<bool, Error> {
-    match value.map(str::trim) {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_REST_BITWISE_LAST={v}: 1 (BITWISE handed on last, beside the count) or 0"
         ))),
     }
 }
@@ -1614,30 +1549,6 @@ fn parse_card_fill(value: Option<&str>) -> Result<CardFill, Error> {
     }
 }
 
-/// `LAMBDA_VM_BLOCK_RECORDS_DROP`: `park` (and unset or empty) lets live
-/// regeneration park and drop a streamed chunk held as its records like any
-/// chunk, phase B rebuilding its packed columns checked by its records'
-/// digest; `keep` holds such a chunk on the host to the prove's end, with no
-/// rank. Anything else refuses the prove. The proof's bytes are the same.
-pub(crate) fn records_keep() -> Result<bool, Error> {
-    parse_records_drop(
-        std::env::var("LAMBDA_VM_BLOCK_RECORDS_DROP")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// [`records_keep`]'s reading of its variable: whether records are kept.
-fn parse_records_drop(value: Option<&str>) -> Result<bool, Error> {
-    match value.map(str::trim) {
-        None | Some("" | "park") => Ok(false),
-        Some("keep") => Ok(true),
-        Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_RECORDS_DROP={v}: park (records drop like any chunk) or keep"
-        ))),
-    }
-}
-
 /// Whether the streamed CPU and MEMW_R chunks may be held as their records,
 /// and why not when they may not. They need the card asked for at least one of
 /// the two families (`asked`), and G-pack's narrow chunks of a build that drops
@@ -1645,7 +1556,7 @@ fn parse_records_drop(value: Option<&str>) -> Result<bool, Error> {
 /// parked records drop only under live regeneration, so without it (a store,
 /// or regeneration off) every one admitted would stay resident to the prove's
 /// end, which no room rule bounds on a block that arms. Records kept on purpose
-/// (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`, `keep_records`) are undroppable by
+/// (a test's [`Deviations::records_keep`], `keep_records`) are undroppable by
 /// design: the A/B control.
 fn records_admission(
     asked: bool,
@@ -1674,25 +1585,16 @@ const MAX_WALKERS: usize = 4;
 /// touches as they stood before it ([`parallel::walk_windows`]); `1` to
 /// [`MAX_WALKERS`] on that many; `0` on one thread, the walk before the
 /// walkers (the rollback). The tables and their order are the same. Anything
-/// else refuses the prove, and so does a count with the executor's words
-/// store (`LAMBDA_VM_EXEC_MEMORY=words`), whose every window's snapshot copies
-/// the whole map; with that store, unset walks on one thread.
+/// else refuses the prove.
 fn block_walkers() -> Result<usize, Error> {
-    parse_walkers(
-        std::env::var("LAMBDA_VM_BLOCK_WALKERS").ok().as_deref(),
-        executor::vm::memory::StoreKind::from_env(),
-    )
+    parse_walkers(std::env::var("LAMBDA_VM_BLOCK_WALKERS").ok().as_deref())
 }
 
-/// [`block_walkers`] of the knob's value and the executor's store.
-fn parse_walkers(
-    value: Option<&str>,
-    store: executor::vm::memory::StoreKind,
-) -> Result<usize, Error> {
-    let walkers = match value.map(str::trim) {
-        None | Some("") if store == executor::vm::memory::StoreKind::Words => return Ok(0),
-        None | Some("") => return Ok(MAX_WALKERS),
-        Some("0") => return Ok(0),
+/// [`block_walkers`] of the knob's value.
+fn parse_walkers(value: Option<&str>) -> Result<usize, Error> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(MAX_WALKERS),
+        Some("0") => Ok(0),
         Some(v) => v
             .parse::<usize>()
             .ok()
@@ -1701,15 +1603,8 @@ fn parse_walkers(
                 Error::Prover(format!(
                     "LAMBDA_VM_BLOCK_WALKERS={v}: 0 (one walker), or 1 to {MAX_WALKERS} walkers"
                 ))
-            })?,
-    };
-    if store == executor::vm::memory::StoreKind::Words {
-        return Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_WALKERS={walkers} needs the executor's pages store, not \
-             LAMBDA_VM_EXEC_MEMORY=words"
-        )));
+            }),
     }
-    Ok(walkers)
 }
 
 /// The rest's layout bytes ([`BlockOptions::rest_layout_bytes`]). On the
@@ -1744,11 +1639,9 @@ fn parse_rest_build(value: Option<&str>) -> Result<Option<usize>, String> {
     }
 }
 
-/// `BLOCK_WHIR_REST_LAYOUT=all|<MiB>`, `BLOCK_WHIR_REST_BUILD=<MiB>`,
-/// `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` and `BLOCK_WHIR_PACK_FINISHED=0|1`: the
-/// real-block tests' choice of [`BlockOptions::rest_layout_bytes`],
-/// [`BlockOptions::rest_build_bytes`], [`BlockOptions::finish_keccak_rnd_chunks`]
-/// and [`BlockOptions::pack_finished`]; unset leaves the production ones.
+/// `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` and `BLOCK_WHIR_REST_BUILD=<MiB>`: the
+/// real-block tests' choice of [`BlockOptions::rest_layout_bytes`] and
+/// [`BlockOptions::rest_build_bytes`]; unset leaves the production ones.
 pub(crate) fn rest_layout_from_env(options: &mut BlockOptions) {
     match parse_rest_build(std::env::var("BLOCK_WHIR_REST_BUILD").ok().as_deref()) {
         Ok(Some(bytes)) => options.rest_build_bytes = Some(bytes),
@@ -1766,24 +1659,6 @@ pub(crate) fn rest_layout_from_env(options: &mut BlockOptions) {
         },
         Err(_) => {}
     }
-    match std::env::var("BLOCK_WHIR_KR_FINISH_CHUNKS")
-        .as_deref()
-        .map(str::trim)
-    {
-        Ok("0") => options.finish_keccak_rnd_chunks = false,
-        Ok("1") => options.finish_keccak_rnd_chunks = true,
-        Ok(other) => panic!("BLOCK_WHIR_KR_FINISH_CHUNKS={other}: 0 or 1"),
-        Err(_) => {}
-    }
-    match std::env::var("BLOCK_WHIR_PACK_FINISHED")
-        .as_deref()
-        .map(str::trim)
-    {
-        Ok("0") => options.pack_finished = false,
-        Ok("1") => options.pack_finished = true,
-        Ok(other) => panic!("BLOCK_WHIR_PACK_FINISHED={other}: 0 or 1"),
-        Err(_) => {}
-    }
 }
 
 /// `BLOCK_WHIR_NARROW=wide|card|host`: the real-block tests' choice of
@@ -1795,42 +1670,6 @@ pub(crate) fn narrow_from_env() -> Option<multilinear_block::Narrowing> {
         Ok("card") => Some(Narrowing::CARD),
         Ok("host") => Some(Narrowing::Host),
         Ok(other) => panic!("BLOCK_WHIR_NARROW={other}: wide, card or host"),
-        Err(_) => None,
-    }
-}
-
-/// `BLOCK_WHIR_WINDOW_LOG2=20`: [`BlockOptions::window_log2`] as the tree
-/// harness and the CLI read it, production's [`BLOCK_WINDOW_LOG2`] and nothing
-/// else. Another window (#1013's one CPU chunk is 2^21 cycles) builds the same
-/// tables, but the chunks leave in another order across tables, so the groups
-/// (statement data) and the proof bytes differ: the knob refuses it. `None`
-/// leaves the production one.
-pub(crate) fn window_log2_from_env() -> Option<usize> {
-    parse_window_log2(std::env::var("BLOCK_WHIR_WINDOW_LOG2").ok().as_deref())
-        .unwrap_or_else(|e| panic!("{e}"))
-}
-
-/// [`window_log2_from_env`]'s reading of the knob's `value`.
-fn parse_window_log2(value: Option<&str>) -> Result<Option<usize>, String> {
-    match value.map(str::trim) {
-        None => Ok(None),
-        Some("20") => Ok(Some(BLOCK_WINDOW_LOG2)),
-        Some(other) => Err(format!(
-            "BLOCK_WHIR_WINDOW_LOG2={other}: only 20 (another window moves the groups)"
-        )),
-    }
-}
-
-/// `BLOCK_WHIR_UPLOAD_AHEAD=0|1`: the real-block tests' choice of
-/// [`BlockOptions::upload_ahead`]; `None` leaves the production one.
-pub(crate) fn upload_ahead_from_env() -> Option<bool> {
-    match std::env::var("BLOCK_WHIR_UPLOAD_AHEAD")
-        .as_deref()
-        .map(str::trim)
-    {
-        Ok("0") => Some(false),
-        Ok("1") => Some(true),
-        Ok(other) => panic!("BLOCK_WHIR_UPLOAD_AHEAD={other}: 0 or 1"),
         Err(_) => None,
     }
 }
@@ -3737,9 +3576,6 @@ pub(crate) struct Deviations {
     /// frontier, so a phase-B order that takes a class out of its rank order
     /// cannot complete.
     pub regen_windows: Option<(u64, u64)>,
-    /// When live regeneration starts the streamed chunks' regenerator
-    /// ([`regen::EarlyStart`]), instead of the knob ([`regen::early_start`]).
-    pub regen_early: Option<regen::EarlySpawn>,
     /// The streamed groups phase B takes ahead of the rest's first
     /// ([`led_order`]), instead of the knob ([`regen::regen_lead`]).
     pub regen_lead: Option<usize>,
@@ -3751,8 +3587,9 @@ pub(crate) struct Deviations {
     /// phase A ends in an error with the streamed chunks' regenerator
     /// running.
     pub abort_after_finish: bool,
-    /// The rest handed on with BITWISE last, beside the count, as
-    /// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1` asks ([`block_rest_bitwise_last`]).
+    /// The rest handed on with BITWISE last, beside phase 4's count from the
+    /// ops ([`WindowedTraceBuilder::rest_bitwise_last`]): what BITWISE's
+    /// lookups from the tables are compared with.
     pub rest_bitwise_last: bool,
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables, BITWISE
     /// last (`Some(true)`), or from their ops in phase 4, BITWISE first
@@ -3765,9 +3602,8 @@ pub(crate) struct Deviations {
     /// [`block_keccak_rnd_first`]).
     pub keccak_rnd_first: Option<bool>,
     /// The hand-out's counting on a thread of its own (`Some(true)`) or on
-    /// the accumulator's (`Some(false)`), instead of what
-    /// `LAMBDA_VM_HANDOUT_COUNT_THREAD` says (`None`;
-    /// [`WindowedTraceBuilder::count_handout_on_thread`]).
+    /// the accumulator's (`Some(false)`), instead of the default (`None`: a
+    /// thread of its own; [`WindowedTraceBuilder::count_handout_on_thread`]).
     pub handout_count_thread: Option<bool>,
     /// The host's memory target, in bytes, instead of the machine's
     /// ([`memory_target_bytes`]): 0 makes the `auto` rule want every table out.
@@ -3811,7 +3647,7 @@ pub(crate) struct Deviations {
     /// instead of the host's resident set against its pressure line.
     pub records_room: Option<crate::tables::trace_builder::RecordsRoom>,
     /// Whether streamed chunks held as records stay on the host instead of
-    /// parking and dropping, instead of the knob ([`records_keep`]).
+    /// parking and dropping (`Some(true)`, the A/B control; `None` parks).
     pub records_keep: Option<bool>,
     /// Whether phase A's head is stamped, instead of the knob
     /// ([`head_log::knob`]).
@@ -4459,7 +4295,7 @@ fn prove_block_whir_body(
     stamps.build_marks = crate::tables::trace_builder::build_stamps::take();
 
     let t = Instant::now();
-    let padding = CutPadding::from_env()?;
+    let padding = CutPadding::LastTable;
     split_keccak_rnd(
         &mut traces,
         options.keccak_rnd_rows_log2,
@@ -6107,7 +5943,10 @@ fn prove_streamed(
     };
     // A streamed chunk held as its records parks and drops like any chunk,
     // unless records are kept: then it has no recipe and no rank.
-    let keep_records = deviations.records_keep.map_or_else(records_keep, Ok)?;
+    // Live regeneration parks and drops a streamed chunk held as its records
+    // like any chunk, phase B rebuilding its packed columns checked by its
+    // records' digest; a test may keep such chunks on the host instead.
+    let keep_records = deviations.records_keep.unwrap_or(false);
     let regen_recorder = regen::recorder(regen_mode, stream_form == TraceForm::Narrow)
         .map(|recorder| {
             if keep_records {
@@ -6164,7 +6003,6 @@ fn prove_streamed(
     // The streamed chunks' regenerator started before phase B, when it is
     // (N4c); phase B takes it, and an error before then closes its window and
     // joins.
-    let early_spawn = deviations.regen_early.unwrap_or_else(regen::early_start);
     let regen_lead = deviations.regen_lead.unwrap_or_else(regen::regen_lead);
     let early_owned: std::sync::Mutex<Option<regen::EarlyStart>> = std::sync::Mutex::new(None);
     let early_slot = &early_owned;
@@ -6290,7 +6128,7 @@ fn prove_streamed(
     let tag = block_statement_tag(&format.zf.base);
     crate::with_block_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
-        let bitwise_last = deviations.rest_bitwise_last || block_rest_bitwise_last()?;
+        let bitwise_last = deviations.rest_bitwise_last;
         let keccak_rnd_first = match deviations.keccak_rnd_first {
             Some(first) => first,
             None => block_keccak_rnd_first()?,
@@ -6603,16 +6441,10 @@ fn prove_streamed(
                 if options.drop_streamed_ops {
                     builder = builder.drop_streamed_ops()?;
                 }
-                if lt_concat() {
-                    builder = builder.concat_lt();
-                }
                 if lt_merge()? {
                     builder = builder.lt_merge();
                 }
                 builder = builder.p4_rows_on_pool().p4_lookups_direct();
-                if p4_beside() {
-                    builder = builder.p4_beside();
-                }
                 if bitwise_last {
                     builder = builder.rest_bitwise_last();
                 }
@@ -6950,9 +6782,12 @@ fn prove_streamed(
                     // Every streamed chunk is handed out and the finish begins:
                     // the thread goes up now, whether or not regeneration has
                     // armed, and takes each chunk's fate as phase A decides it.
-                    if early_spawn == regen::EarlySpawn::Fates {
-                        start_early();
-                    }
+                    // Its thread waits for the fates
+                    // ([`stark::multilinear_block::BlockRegen::await_rank`]),
+                    // which the arm and the streamed groups' commits decide
+                    // while the finish still runs; until the finish's end its
+                    // window holds only its frontier.
+                    start_early();
                     let emitted = builder.finish_streamed_keeping(&last, rest_gate, keep, |header| {
                         let (tx, rx) = std::sync::mpsc::channel();
                         btx.send(Built::Stream(Box::new(RestStream {
@@ -6980,14 +6815,8 @@ fn prove_streamed(
                         ledger.image.store(0, Relaxed);
                     }
                     let rest_regen = emitted?;
-                    // The finish's end. `finish`: the regenerator starts here,
-                    // when live regeneration has armed (or drops every table).
-                    // Either way its window may now take the host's room.
-                    if early_spawn == regen::EarlySpawn::Finish
-                        && early_feed.as_ref().is_some_and(|feed| feed.drops_all_from_now())
-                    {
-                        start_early();
-                    }
+                    // The finish's end: the regenerator's window may now take
+                    // the host's room.
                     early_paced.store(true, std::sync::atomic::Ordering::Release);
                     if deviations.abort_after_finish {
                         return Err(Error::Prover(
@@ -7040,8 +6869,8 @@ fn prove_streamed(
                 }
                 let mut rest = built_rest?;
                 let finish_marks = crate::tables::trace_builder::build_stamps::take();
-                // The builder's own rule (it read the same variable).
-                let padding = CutPadding::from_env()?;
+                // The builder's own rule.
+                let padding = CutPadding::LastTable;
                 split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2, padding, format.keccak_rnd)?;
                 // Cut at the finish already, and held packed: a packed table
                 // has no rows for `split_rows` to copy.
@@ -8489,11 +8318,11 @@ mod memory_target_tests {
 
     const GIB: u64 = 1 << 30;
 
-    /// The memory target's knob and the reserve's are read under their new
-    /// names, and under the names they had with the disk store while the new
-    /// ones are unset; the target's value is GiB above 0, else the machine's.
+    /// The memory target's knob is read under its new name, and under the
+    /// name it had with the disk store while the new one is unset; its value is
+    /// GiB above 0, else the machine's.
     #[test]
-    fn the_renamed_knobs_still_read_their_old_names() {
+    fn the_renamed_knob_still_reads_its_old_name() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |name: &str| {
                 pairs
@@ -9816,7 +9645,7 @@ mod keccak_rnd_first_tests {
 mod producer_report_tests {
     use super::{
         BLOCK_LAYOUT_AHEAD, BLOCK_LAYOUT_WORKERS, BLOCK_WINDOW_LOG2, BlockOptions, BlockStamps,
-        ExecutorStamps, ProducerStamps, StreamTable, parse_window_log2,
+        ExecutorStamps, ProducerStamps, StreamTable,
     };
     use super::{
         exec_mode_from, parse_exec_history, parse_exec_history_check, parse_exec_prefault,
@@ -9901,16 +9730,13 @@ mod producer_report_tests {
         assert_eq!(BLOCK_LAYOUT_AHEAD + 1, BLOCK_LAYOUT_WORKERS + 3);
     }
 
-    /// The window knob takes production's 2^20 only, unset is production's,
-    /// and anything else (#1013's 2^21 included) is refused.
+    /// The window is production's 2^20: another (#1013's one CPU chunk is
+    /// 2^21 cycles) builds the same tables, but the chunks leave in another
+    /// order across tables, so the groups and the proof bytes differ.
     #[test]
-    fn the_window_knob_takes_20_only() {
+    fn the_window_is_2_20() {
         assert_eq!(BLOCK_WINDOW_LOG2, 20);
-        assert_eq!(parse_window_log2(None), Ok(None));
-        assert_eq!(parse_window_log2(Some(" 20 ")), Ok(Some(20)));
-        for bad in ["", "19", "21", " 21 ", "22", "2^20", "x"] {
-            assert!(parse_window_log2(Some(bad)).is_err(), "{bad:?}");
-        }
+        assert_eq!(BlockOptions::production().window_log2, Some(20));
     }
 
     /// The executor's line: its own work apart from its blocked sends, and
@@ -10157,11 +9983,7 @@ mod packer_tests {
 
 #[cfg(test)]
 mod walkers_knob_tests {
-    use executor::vm::memory::StoreKind;
-
-    use super::{
-        CardFill, Error, parse_card_fill, parse_records_drop, parse_walkers, records_admission,
-    };
+    use super::{CardFill, Error, parse_card_fill, parse_walkers, records_admission};
 
     /// Streamed chunks are held as records only with live regeneration to drop
     /// them, or kept on purpose: never with a store or with regeneration off
@@ -10192,32 +10014,9 @@ mod walkers_knob_tests {
         );
     }
 
-    /// `LAMBDA_VM_BLOCK_RECORDS_DROP`: unset, empty or `park` parks and drops
-    /// records chunks like any chunk; `keep` keeps them; any other word
-    /// refuses the prove.
-    #[test]
-    fn the_records_drop_knob_takes_park_and_keep_and_refuses_anything_else() {
-        for (value, keep) in [
-            (None, false),
-            (Some(""), false),
-            (Some(" park "), false),
-            (Some("keep"), true),
-        ] {
-            assert_eq!(parse_records_drop(value).ok(), Some(keep), "{value:?}");
-        }
-        for value in ["on", "off", "Keep", "drop", "park,keep"] {
-            let refused = parse_records_drop(Some(value));
-            assert!(
-                matches!(&refused, Err(Error::Prover(m)) if m.contains("LAMBDA_VM_BLOCK_RECORDS_DROP")),
-                "{value}: {refused:?}"
-            );
-        }
-    }
-
     /// `LAMBDA_VM_BLOCK_WALKERS`: unset or empty is four walkers (the
     /// default); 0 one walker (the rollback); 1 to 4 that many; any other
-    /// word refuses the prove, and so does a count with the executor's words
-    /// store, with which unset is one walker.
+    /// word refuses the prove.
     #[test]
     fn the_walkers_knob_defaults_to_4_takes_0_to_4_and_refuses_anything_else() {
         for (value, walkers) in [
@@ -10229,27 +10028,10 @@ mod walkers_knob_tests {
             (Some(" 3 "), 3),
             (Some("4"), 4),
         ] {
-            assert_eq!(
-                parse_walkers(value, StoreKind::Pages).ok(),
-                Some(walkers),
-                "{value:?}"
-            );
+            assert_eq!(parse_walkers(value).ok(), Some(walkers), "{value:?}");
         }
         for value in ["5", "8", "16", "17", "-1", "auto", "4x", "1.5"] {
-            assert!(
-                parse_walkers(Some(value), StoreKind::Pages).is_err(),
-                "{value}"
-            );
-        }
-        for value in [None, Some(""), Some("0")] {
-            assert_eq!(parse_walkers(value, StoreKind::Words).ok(), Some(0));
-        }
-        for value in ["1", "4"] {
-            let refused = parse_walkers(Some(value), StoreKind::Words);
-            assert!(
-                matches!(&refused, Err(Error::Prover(m)) if m.contains("pages store")),
-                "{value}: {refused:?}"
-            );
+            assert!(parse_walkers(Some(value)).is_err(), "{value}");
         }
     }
 
@@ -10392,31 +10174,13 @@ mod air_input_tests {
 
 #[cfg(test)]
 mod p4_rows_knob_tests {
-    use super::{parse_bitwise_from_tables, parse_rest_bitwise_last};
+    use super::parse_bitwise_from_tables;
 
-    /// The finish's BITWISE defaults: its LT, BRANCH and BYTEWISE lookups from
-    /// their tables; BITWISE last alone stays opt-in.
+    /// The finish's BITWISE default: its LT, BRANCH and BYTEWISE lookups from
+    /// their tables.
     #[test]
     fn the_finish_takes_bitwise_from_its_tables_by_default() {
         assert_eq!(parse_bitwise_from_tables(None).ok(), Some(true));
-        assert_eq!(parse_rest_bitwise_last(None).ok(), Some(false));
-    }
-
-    /// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST`: off (AIR order, BITWISE first)
-    /// unless `1`; any other word refuses.
-    #[test]
-    fn the_bitwise_last_knob_is_off_by_default_and_on_at_1() {
-        for (value, on) in [
-            (None, false),
-            (Some(""), false),
-            (Some("0"), false),
-            (Some(" 1 "), true),
-        ] {
-            assert_eq!(parse_rest_bitwise_last(value).ok(), Some(on), "{value:?}");
-        }
-        for value in ["on", "true", "2", "last", "BITWISE"] {
-            assert!(parse_rest_bitwise_last(Some(value)).is_err(), "{value}");
-        }
     }
 
     /// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`: on (BITWISE's three families'

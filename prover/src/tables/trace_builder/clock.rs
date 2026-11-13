@@ -11,28 +11,11 @@
 //! timestamp would reach 2^32 — the walk's window that reaches cycle 2^30 − 1,
 //! or the final PC token, which the last chunk's padding rows can put past
 //! 2^32 a little below 2^30 cycles — rather than proved and then rejected.
-//!
-//! `LAMBDA_VM_BLOCK_UNVERIFIABLE_CLOCK=1` proves past the bound anyway, for
-//! memory and timing measurements only: the proof does not verify, and the log
-//! says so. A release build only: HALT and HINT debug-assert 32-bit timestamps
-//! (`halt.rs`, `hint.rs`), so a build with debug assertions refuses instead of
-//! proving into them.
-
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use crate::Error;
 
 /// The first timestamp the CPU cannot send: its high word is lost from here.
 pub(crate) const CLOCK_LIMIT: u64 = 1 << 32;
-
-/// The knob that proves past [`CLOCK_LIMIT`] anyway (a proof that does not
-/// verify).
-const UNVERIFIABLE_CLOCK: &str = "LAMBDA_VM_BLOCK_UNVERIFIABLE_CLOCK";
-
-/// Whether the knob's value asks to prove past the bound: `1`, `true` or `yes`.
-fn unverifiable_clock_from(value: Option<&str>) -> bool {
-    value.is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
-}
 
 /// The largest timestamp a window of `cycles` cycles from cycle `first` uses:
 /// its last cycle's `4·cycle + 4`, plus the cycle's accesses up to `+3`.
@@ -48,53 +31,21 @@ pub(crate) fn final_pc_timestamp(halt_timestamp: u64, padding_rows: usize) -> u6
 }
 
 /// Refuses `max_timestamp` at or past [`CLOCK_LIMIT`] (`what` names where it
-/// was reached), unless [`UNVERIFIABLE_CLOCK`] is set in a release build: then
-/// it warns, once a process, and lets the run go on.
+/// was reached).
 pub(crate) fn check_clock(max_timestamp: u64, what: &str) -> Result<(), Error> {
-    check_clock_with(
-        max_timestamp,
-        what,
-        unverifiable_clock_from(std::env::var(UNVERIFIABLE_CLOCK).ok().as_deref()),
-    )
-}
-
-/// [`check_clock`] with the knob's answer given.
-fn check_clock_with(max_timestamp: u64, what: &str, unverifiable: bool) -> Result<(), Error> {
     if max_timestamp < CLOCK_LIMIT {
-        return Ok(());
-    }
-    if unverifiable && cfg!(debug_assertions) {
-        return Err(Error::ClockPastLimit(format!(
-            "{what} reaches timestamp {max_timestamp}, past the CPU's 32-bit clock (2^32); \
-             {UNVERIFIABLE_CLOCK}=1 proves past it only in a release build (HALT and HINT \
-             debug-assert 32-bit timestamps)"
-        )));
-    }
-    if unverifiable {
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Relaxed) {
-            eprintln!(
-                "BLOCK CLOCK: UNVERIFIABLE — {what} reaches timestamp {max_timestamp} ≥ 2^32 \
-                 (the CPU sends a zero high word); {UNVERIFIABLE_CLOCK}=1 proves anyway, and \
-                 THE PROOF WILL NOT VERIFY"
-            );
-        }
         return Ok(());
     }
     Err(Error::ClockPastLimit(format!(
         "{what} reaches timestamp {max_timestamp}, past the CPU's 32-bit clock (2^32): \
          its buses cannot balance, so the proof would not verify (a run's CPU rows, \
-         padding included, number at most 2^30 − 1; {UNVERIFIABLE_CLOCK}=1 proves \
-         anyway, for measurements)"
+         padding included, number at most 2^30 − 1)"
     )))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CLOCK_LIMIT, check_clock_with, final_pc_timestamp, unverifiable_clock_from,
-        window_max_timestamp,
-    };
+    use super::{CLOCK_LIMIT, check_clock, final_pc_timestamp, window_max_timestamp};
     use crate::Error;
 
     /// A window ending at cycle 2^30 − 2 (2^30 − 1 cycles) stays under 2^32;
@@ -104,15 +55,15 @@ mod tests {
         let last = (1usize << 30) - 1;
         assert_eq!(window_max_timestamp(0, last), CLOCK_LIMIT - 1);
         assert_eq!(window_max_timestamp(last - 5, 5), CLOCK_LIMIT - 1);
-        assert!(check_clock_with(window_max_timestamp(0, last), "run", false).is_ok());
+        assert!(check_clock(window_max_timestamp(0, last), "run").is_ok());
         assert_eq!(window_max_timestamp(last, 1), CLOCK_LIMIT + 3);
         assert!(matches!(
-            check_clock_with(window_max_timestamp(last, 1), "run", false),
+            check_clock(window_max_timestamp(last, 1), "run"),
             Err(Error::ClockPastLimit(_))
         ));
         // The final PC token of a run whose padding crosses: refused too.
-        assert!(check_clock_with(CLOCK_LIMIT - 1, "pc", false).is_ok());
-        assert!(check_clock_with(CLOCK_LIMIT + 1, "pc", false).is_err());
+        assert!(check_clock(CLOCK_LIMIT - 1, "pc").is_ok());
+        assert!(check_clock(CLOCK_LIMIT + 1, "pc").is_err());
     }
 
     /// The walk refuses a window whose last cycle's timestamp would reach 2^32,
@@ -181,31 +132,10 @@ mod tests {
         assert_eq!(last_row + 1, final_pc);
         assert!(final_pc >= CLOCK_LIMIT);
         assert!(matches!(
-            check_clock_with(final_pc, "the CPU's last padding row", false),
+            check_clock(final_pc, "the CPU's last padding row"),
             Err(Error::ClockPastLimit(_))
         ));
         // Without padding the same halt fits.
-        assert!(check_clock_with(final_pc_timestamp(halt, 0), "pc", false).is_ok());
-    }
-
-    /// The knob lets a run past the bound go on in a release build; a build
-    /// with debug assertions refuses instead (HALT and HINT assert 32-bit
-    /// timestamps).
-    #[test]
-    fn the_unverifiable_clock_knob_proves_anyway() {
-        for ts in [CLOCK_LIMIT, u64::MAX] {
-            let run = check_clock_with(ts, "run", true);
-            if cfg!(debug_assertions) {
-                assert!(matches!(run, Err(Error::ClockPastLimit(_))));
-            } else {
-                assert!(run.is_ok());
-            }
-        }
-        assert!(unverifiable_clock_from(Some("1")));
-        assert!(unverifiable_clock_from(Some(" true ")));
-        assert!(unverifiable_clock_from(Some("yes")));
-        assert!(!unverifiable_clock_from(Some("0")));
-        assert!(!unverifiable_clock_from(Some("")));
-        assert!(!unverifiable_clock_from(None));
+        assert!(check_clock(final_pc_timestamp(halt, 0), "pc").is_ok());
     }
 }

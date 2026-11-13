@@ -1,5 +1,5 @@
 //! The hand-out's counting on a thread of its own
-//! (`LAMBDA_VM_HANDOUT_COUNT_THREAD`, [`WindowedTraceBuilder::count_handout_on_thread`]).
+//! ([`WindowedTraceBuilder::count_handout_on_thread`]).
 //!
 //! Under [`WindowedTraceBuilder::drop_streamed_ops`] each full chunk leaves the
 //! run's tails with what the table phase would have read from its ops counted:
@@ -15,7 +15,8 @@
 //! of its tail and sends the counter the chunk's parts (shared, not copied).
 //!
 //! The functions below are the counts themselves, called on the accumulator's
-//! thread (the knob at `0`) and on the counter's alike.
+//! thread (a test's override, or a build without `parallel`) and on the
+//! counter's alike.
 //!
 //! [`WindowedTraceBuilder::drop_streamed_ops`]: super::WindowedTraceBuilder::drop_streamed_ops
 //! [`WindowedTraceBuilder::count_handout_on_thread`]: super::WindowedTraceBuilder::count_handout_on_thread
@@ -33,24 +34,6 @@ use super::{Segments, StreamTable};
 use crate::Error;
 use crate::tables::decode::DecodeTable;
 use crate::tables::{memw_aligned, memw_register, shift};
-
-/// `LAMBDA_VM_HANDOUT_COUNT_THREAD`: unset or `1` counts on a thread of its
-/// own (with the `parallel` feature; without it, on the accumulator's), `0`
-/// on the accumulator's thread (the rollback). Anything else is an error. The
-/// tables are the same either way.
-pub(super) fn count_thread_from_env() -> Result<bool, Error> {
-    match std::env::var("LAMBDA_VM_HANDOUT_COUNT_THREAD")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        None | Some("") | Some("1") => Ok(cfg!(feature = "parallel")),
-        Some("0") => Ok(false),
-        Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_HANDOUT_COUNT_THREAD={v}: 1 (a thread of its own) or 0 (the accumulator's)"
-        ))),
-    }
-}
 
 /// The (timestamp, next pc) of the last ECALL among `ops`.
 pub(super) fn last_ecall(ops: &Segments<CpuOperation>, decode: &DecodeTable) -> Option<(u64, u64)> {

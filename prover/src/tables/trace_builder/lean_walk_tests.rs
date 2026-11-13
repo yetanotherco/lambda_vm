@@ -184,33 +184,6 @@ fn lean_memory_accesses_are_the_plain_ones() {
     t.same_cells();
 }
 
-/// `LAMBDA_VM_WALK_LEAN`'s values: every part, none, a list of parts; anything
-/// else is refused.
-#[test]
-fn the_walk_lean_knob_names_its_parts() {
-    assert_eq!(WalkLean::parse("1"), Some(WalkLean::ALL));
-    assert_eq!(WalkLean::parse(" 0 "), Some(WalkLean::NONE));
-    assert_eq!(
-        WalkLean::parse("decode,memory,lookups,route"),
-        Some(WalkLean::ALL)
-    );
-    // The decode is always read from the table: `decode` is accepted, alone
-    // it is none of the parts.
-    assert_eq!(WalkLean::parse("memory,lookups,route"), Some(WalkLean::ALL));
-    assert_eq!(WalkLean::parse("decode"), Some(WalkLean::NONE));
-    assert_eq!(
-        WalkLean::parse("memory, route"),
-        Some(WalkLean {
-            memory: true,
-            route: true,
-            ..WalkLean::NONE
-        })
-    );
-    for bad in ["", "yes", "2", "decode,", "decode;memory", "Decode"] {
-        assert_eq!(WalkLean::parse(bad), None, "{bad:?}");
-    }
-}
-
 /// BITWISE's multiplicities from `histogram`, row by row.
 fn multiplicities(histogram: &bitwise::BitwiseHistogram) -> Vec<Vec<u64>> {
     let mut trace = bitwise::generate_bitwise_trace();
