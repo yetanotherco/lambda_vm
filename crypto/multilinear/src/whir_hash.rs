@@ -182,6 +182,11 @@ pub trait WhirHash: Copy + Clone + Default + Send + Sync + 'static {
     /// A fresh sponge: what a block proof's statement is absorbed into.
     fn sponge() -> Self::Sponge;
 
+    /// Whether [`Self::joint_leaf`] is defined: a joint round-0 tree
+    /// (`whir_chain::Round0Trees::One`) is built under this hash only then
+    /// (`whir_chain::check_round0_trees`).
+    const JOINT_LEAF: bool = false;
+
     /// The leaf of a joint round-0 tree (`whir_chain::Round0Trees::One`):
     /// `values` is `blocks` equal coset blocks laid end to end, hashed under a
     /// tag that carries the block count. `None` under a hash with no joint
@@ -269,6 +274,8 @@ impl WhirHash for P1Whir {
 
     const DEVICE: DeviceHashKey = DeviceHashKey::Poseidon1;
 
+    const JOINT_LEAF: bool = true;
+
     type Transcript = P1TranscriptHash;
 
     type Backend<F>
@@ -313,6 +320,8 @@ impl WhirHash for Blake3Whir {
 
     const DEVICE: DeviceHashKey = DeviceHashKey::Blake3;
 
+    const JOINT_LEAF: bool = true;
+
     type Transcript = Blake3StdTranscriptHash;
 
     type Backend<F>
@@ -325,6 +334,17 @@ impl WhirHash for Blake3Whir {
 
     fn sponge() -> Self::Sponge {
         DefaultTranscript::new(&[])
+    }
+
+    /// `Blake3Std` over a one-block prefix that carries the leaf's byte count,
+    /// its block count and its block's shape, then the values' bytes
+    /// (`crypto::merkle_tree::backends::blake3_joint`).
+    fn joint_leaf<F>(values: &[FieldElement<F>], blocks: usize) -> Option<Commitment>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+    {
+        crypto::merkle_tree::backends::blake3_joint::joint_leaf(values, blocks)
     }
 }
 
