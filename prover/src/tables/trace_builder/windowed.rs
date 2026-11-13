@@ -1924,7 +1924,7 @@ fn walk_window(
         WalkOutputs::for_walk(logs.len(), lookups)
     };
     if let Some(window) = words {
-        walk.memw.into_words(window, logs.len() * 3);
+        walk.memw.set_words(window, logs.len() * 3);
     }
     // The walk is a left fold over the CPU ops: walking each batch right
     // after collecting it gives the window's lists, with the batch's ops
@@ -3873,12 +3873,11 @@ fn tail_jobs(
         let taken = t.elapsed().as_secs_f64();
         let t = Instant::now();
         if !walker_counted {
-            for (w, whole) in [(chunk.words.slices(), chunk.whole.slices())] {
-                let words: Vec<u64> = w.iter().flat_map(|p| p.iter()).copied().collect();
-                let whole: Vec<super::RegRow> =
-                    whole.iter().flat_map(|p| p.iter()).copied().collect();
-                super::register_words::count_bitwise(&words, &whole, &mut counted.histogram);
-            }
+            super::register_words::count_bitwise_pieces(
+                &chunk.words.slices(),
+                &chunk.whole.slices(),
+                &mut counted.histogram,
+            );
         }
         let ops = memw_register_words_chunk_ops(
             chunk,
