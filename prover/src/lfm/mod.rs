@@ -96,9 +96,11 @@ pub mod whir_stacked;
 pub mod whir_table;
 pub mod whir_transcript;
 pub mod whir_transcript_kats;
-/// The block tree's LFM programs proved by the block's own WHIR prover.
+/// A compact wire encoding of a W-LFM proof (the compressed file's).
 #[cfg(feature = "parallel")]
 pub mod wire;
+/// The block tree's LFM programs proved by the block's own WHIR prover.
+#[cfg(feature = "parallel")]
 pub mod wlfm;
 pub mod word;
 
