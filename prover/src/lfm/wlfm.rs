@@ -51,7 +51,7 @@ use multilinear::mle::Mle;
 use multilinear::stacked_eval::StackedProof;
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
-use multilinear::whir_chain::{ArgueFormat, ChainConfig};
+use multilinear::whir_chain::{ArgueFormat, ChainConfig, FinalPoly};
 use multilinear::whir_commit::Commitment;
 use multilinear::whir_hash::WhirHash;
 use stark::multilinear_block::{
@@ -149,6 +149,33 @@ pub enum WlfmPrep {
     Evaluated,
 }
 
+/// The format levers of a W-LFM proof beyond its rate: verifier constants,
+/// named by both sides and folded into the identity. [`WlfmLevers::DEFAULT`]
+/// is today's format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WlfmLevers {
+    /// How the instruction columns are bound.
+    pub prep: WlfmPrep,
+    /// Where the chains stop committing.
+    pub final_poly: FinalPoly,
+}
+
+impl WlfmLevers {
+    /// Today's format: the stacked binding, no final polynomial.
+    pub const DEFAULT: Self = Self {
+        prep: WlfmPrep::Stacked,
+        final_poly: FinalPoly::Off,
+    };
+
+    /// Today's format with the instruction columns bound per `prep`.
+    pub const fn with_prep(prep: WlfmPrep) -> Self {
+        Self {
+            prep,
+            final_poly: FinalPoly::Off,
+        }
+    }
+}
+
 /// The stack cap at [`WlfmRate::Sixteen`]: a grouped chain lives on
 /// `H_{n + m + lb}`, and Goldilocks' two-adicity (32) leaves `32 − 4 − 2 = 26`
 /// stacked variables at blowup 16 and the widest index; the default 27 would
@@ -162,6 +189,17 @@ pub const WLFM_B16_STACK: usize = 26;
 /// (and, at blowup 16, the [`WLFM_B16_STACK`] stack). The ONE call the build,
 /// the prover and the verifier make.
 pub fn wlfm_config(rate: WlfmRate, shapes: &[(usize, usize)]) -> ChainConfig {
+    wlfm_config_under(rate, FinalPoly::Off, shapes)
+}
+
+/// [`wlfm_config`] with the chains' [`FinalPoly`]: a proof whose verifier is
+/// the host may stop committing at a final polynomial (the in-guest chain
+/// verifier has no such round, so a proof a parent verifies keeps `Off`).
+pub fn wlfm_config_under(
+    rate: WlfmRate,
+    final_poly: FinalPoly,
+    shapes: &[(usize, usize)],
+) -> ChainConfig {
     let mut zf = ZfFormat {
         whir_blowup: rate.factor() as u8,
         ..ZfFormat::DEFAULT
@@ -178,6 +216,7 @@ pub fn wlfm_config(rate: WlfmRate, shapes: &[(usize, usize)]) -> ChainConfig {
     if rate == WlfmRate::Four {
         config.num_queries = WLFM_B4_QUERIES;
     }
+    config.format.final_poly = final_poly;
     #[cfg(test)]
     let config = test_format::apply(config);
     config
@@ -221,6 +260,9 @@ pub struct WlfmArtifacts {
     pub config: ChainConfig,
     /// How the instruction columns are bound.
     pub prep: WlfmPrep,
+    /// Where the chains stop committing (folded into `config`; held here so
+    /// the verifier re-derives the config from the levers, never the reverse).
+    pub final_poly: FinalPoly,
     /// Under [`WlfmPrep::Stacked`]: the prepared stacks. Empty otherwise.
     pub stacks: Vec<WlfmStack>,
     /// Under [`WlfmPrep::Evaluated`]: each table's preprocessed prefix, as the
@@ -374,7 +416,7 @@ pub fn build_wlfm(
     hasher: HasherKind,
     rate: WlfmRate,
 ) -> Result<WlfmBuild, String> {
-    build_wlfm_under(program, hasher, rate, WlfmPrep::Stacked, false)
+    build_wlfm_under(program, hasher, rate, WlfmLevers::DEFAULT, false)
 }
 
 /// [`build_wlfm`] with every prepared commit on the host: the VERIFIER's
@@ -385,19 +427,20 @@ pub fn build_wlfm_on_host(
     hasher: HasherKind,
     rate: WlfmRate,
 ) -> Result<WlfmBuild, String> {
-    build_wlfm_under(program, hasher, rate, WlfmPrep::Stacked, true)
+    build_wlfm_under(program, hasher, rate, WlfmLevers::DEFAULT, true)
 }
 
-/// [`build_wlfm`] at `rate` with the instruction columns bound per `prep`,
-/// the prepared commits (under [`WlfmPrep::Stacked`]) on the host when
-/// `on_host` (a verifier's build).
+/// [`build_wlfm`] at `rate` under `levers` (the instruction columns' binding
+/// and the chains' final polynomial), the prepared commits (under
+/// [`WlfmPrep::Stacked`]) on the host when `on_host` (a verifier's build).
 pub fn build_wlfm_under(
     program: &LfmProgram,
     hasher: HasherKind,
     rate: WlfmRate,
-    prep: WlfmPrep,
+    levers: WlfmLevers,
     on_host: bool,
 ) -> Result<WlfmBuild, String> {
+    let WlfmLevers { prep, final_poly } = levers;
     // The mask with `BITWISE` dropped where nothing sends it: the default, as a
     // constant (`for_program_with_hasher` reads it from the environment).
     let chip_set = ChipSet::for_program_under(program, hasher, true);
@@ -435,7 +478,7 @@ pub fn build_wlfm_under(
         counts.push(count);
     }
     let shapes = table_shapes(&refs, &table_num_vars);
-    let config = wlfm_config(rate, &shapes);
+    let config = wlfm_config_under(rate, final_poly, &shapes);
     let sizes = multilinear_block::block_groups(&shapes, config.format.stack, WLFM_GROUP_POLYS)
         .map_err(|e| format!("{e:?}"))?;
     let group_lists: Vec<Vec<u32>> = {
@@ -475,6 +518,7 @@ pub fn build_wlfm_under(
             sizes,
             config,
             prep,
+            final_poly,
             stacks: Vec::new(),
             evaluated,
             program_id: [0u8; 32],
@@ -520,6 +564,7 @@ pub fn build_wlfm_under(
         sizes,
         config,
         prep,
+        final_poly,
         stacks,
         evaluated: Vec::new(),
         program_id: [0u8; 32],
@@ -913,7 +958,7 @@ fn verifier_frame(artifacts: &WlfmArtifacts, airs: &LfmAirs) -> Result<VerifierF
         }
     }
     let shapes = artifacts.shapes(airs);
-    if wlfm_config(artifacts.rate, &shapes) != artifacts.config {
+    if wlfm_config_under(artifacts.rate, artifacts.final_poly, &shapes) != artifacts.config {
         return Err("the artifacts' config is not their rate's over their shapes".into());
     }
     let sizes =

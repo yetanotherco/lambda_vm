@@ -30,6 +30,14 @@
 //! C1's instruction columns itself, so the proof carries no prepared chain.
 //! Unset is [`WlfmPrep::Stacked`], today's C1 byte for byte; the pinned
 //! verifier checks [`COMPRESS_PREP`], the evaluated arm has its own verifier.
+//!
+//! # Where C1's chains stop committing
+//!
+//! `LAMBDA_VM_BLOCK_COMPRESS_FINAL` ([`compress_final_setting`]; default off)
+//! proves C1's chains under [`FinalPoly::Vars`]([`COMPRESS_FINAL_VARS`]): each
+//! chain sends its folded polynomial once at most that many variables remain,
+//! instead of committing and opening the rounds that would fold it to a
+//! constant. Unset is today's chains. Its files have verifiers of their own.
 
 use super::block_node::BlockLayout;
 use super::builder::LfmBuilder;
@@ -37,11 +45,12 @@ use super::compiler::LfmProgram;
 use super::per_table_aggregator::{ChildShape, DerivedChild, declare_leg_arenas, emit_leg};
 use super::whir_block::{WhirBlockPlan, derived_of, finish_program, top_claims};
 use super::wlfm::{
-    WlfmArtifacts, WlfmBuild, WlfmPrep, WlfmProof, WlfmRate, build_wlfm_under, prove_wlfm,
-    verify_wlfm,
+    WlfmArtifacts, WlfmBuild, WlfmLevers, WlfmPrep, WlfmProof, WlfmRate, build_wlfm_under,
+    prove_wlfm, verify_wlfm,
 };
 use super::word::LfmWord;
 use crate::hash_pin::{BlockFamily, ProofFamily};
+use multilinear::whir_chain::FinalPoly;
 
 /// The knob that adds the compression step to the block prover.
 pub const COMPRESS_ENV: &str = "LAMBDA_VM_BLOCK_COMPRESS";
@@ -98,16 +107,47 @@ pub fn compress_prep_setting(value: Option<&str>) -> Result<WlfmPrep, String> {
     }
 }
 
-/// [`compress_prep_setting`] of the process's environment, refused when it
-/// asks for the evaluated binding with no compression step to apply it to.
-pub fn compress_prep_from_env(compress: Option<WlfmRate>) -> Result<WlfmPrep, String> {
-    let prep = compress_prep_setting(std::env::var(COMPRESS_EVAL_ENV).ok().as_deref())?;
-    if compress.is_none() && prep != WlfmPrep::Stacked {
+/// The knob that proves C1's chains with a final polynomial.
+pub const COMPRESS_FINAL_ENV: &str = "LAMBDA_VM_BLOCK_COMPRESS_FINAL";
+
+/// The final polynomial's width C1's chains stop at under
+/// [`COMPRESS_FINAL_ENV`]: at most `2^6` variables are sent in the clear.
+pub const COMPRESS_FINAL_VARS: u8 = 6;
+
+/// Where the pinned compressed block's verifier expects C1's chains to stop:
+/// a constant of the verifier, today's chains.
+pub const COMPRESS_FINAL: FinalPoly = FinalPoly::Off;
+
+/// [`COMPRESS_FINAL_ENV`]'s value: unset, `0` or `off` is [`FinalPoly::Off`]
+/// (the default); `1`, `on` or `6` is [`FinalPoly::Vars`] at
+/// [`COMPRESS_FINAL_VARS`]. Anything else is refused.
+pub fn compress_final_setting(value: Option<&str>) -> Result<FinalPoly, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(FinalPoly::Off),
+        Some(v) => match v.as_str() {
+            "" | "0" | "off" => Ok(FinalPoly::Off),
+            "1" | "on" | "6" => Ok(FinalPoly::Vars(COMPRESS_FINAL_VARS)),
+            other => Err(format!(
+                "{COMPRESS_FINAL_ENV}={other:?}: expected off, 0, 1, on or 6"
+            )),
+        },
+    }
+}
+
+/// C1's format levers from the process's environment
+/// ([`compress_prep_setting`], [`compress_final_setting`]), refused when one
+/// is set with no compression step to apply it to.
+pub fn compress_levers_from_env(compress: Option<WlfmRate>) -> Result<WlfmLevers, String> {
+    let levers = WlfmLevers {
+        prep: compress_prep_setting(std::env::var(COMPRESS_EVAL_ENV).ok().as_deref())?,
+        final_poly: compress_final_setting(std::env::var(COMPRESS_FINAL_ENV).ok().as_deref())?,
+    };
+    if compress.is_none() && levers != WlfmLevers::DEFAULT {
         return Err(format!(
-            "{COMPRESS_EVAL_ENV} binds C1's columns, and {COMPRESS_ENV} adds no C1"
+            "{COMPRESS_EVAL_ENV} and {COMPRESS_FINAL_ENV} shape C1, and {COMPRESS_ENV} adds no C1"
         ));
     }
-    Ok(prep)
+    Ok(levers)
 }
 
 /// Emits C1 into `b`: the top's arenas, its leg, and every published word of
@@ -156,28 +196,28 @@ pub fn top_child(
     derived_of(top_artifacts, wrap_opts, plan.top_layout().total())
 }
 
-/// ★ C1's program and build at `rate` with its columns bound per `prep`, for
-/// the top `top`: ONE derivation for the prover and the verifier (whose
-/// prepared commits run on the host, [`compressed_artifacts`]).
+/// ★ C1's program and build at `rate` under `levers`, for the top `top`: ONE
+/// derivation for the prover and the verifier (whose prepared commits run on
+/// the host, [`compressed_artifacts`]).
 pub fn build_compress(
     top: &DerivedChild,
     layout: BlockLayout,
     rate: WlfmRate,
-    prep: WlfmPrep,
+    levers: WlfmLevers,
 ) -> Result<CompressBuild, String> {
-    build_compress_with(top, layout, rate, prep, false)
+    build_compress_with(top, layout, rate, levers, false)
 }
 
 fn build_compress_with(
     top: &DerivedChild,
     layout: BlockLayout,
     rate: WlfmRate,
-    prep: WlfmPrep,
+    levers: WlfmLevers,
     on_host: bool,
 ) -> Result<CompressBuild, String> {
     let program = compress_program(top, layout)?;
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
-    let build = build_wlfm_under(&program, hasher, rate, prep, on_host)?;
+    let build = build_wlfm_under(&program, hasher, rate, levers, on_host)?;
     Ok(CompressBuild { program, build })
 }
 
@@ -190,33 +230,33 @@ pub fn prove_compress(c: &CompressBuild, top_arena: &[Vec<LfmWord>]) -> Result<W
 
 /// ★ A compressed block verified against `plan` (the verifier's own, derived
 /// from the ELF and the statement): the top program derived under
-/// `wrap_opts`, C1 built over it at `rate` and `prep`
+/// `wrap_opts`, C1 built over it at `rate` under `levers`
 /// ([`compressed_artifacts`]), and the proof checked against them
 /// ([`verify_compressed_against`]).
 pub fn verify_compressed(
     plan: &WhirBlockPlan,
     wrap_opts: &crate::ProofOptions,
     rate: WlfmRate,
-    prep: WlfmPrep,
+    levers: WlfmLevers,
     proof: &WlfmProof,
 ) -> Result<(), String> {
-    let artifacts = compressed_artifacts(plan, wrap_opts, rate, prep)?;
+    let artifacts = compressed_artifacts(plan, wrap_opts, rate, levers)?;
     verify_compressed_against(plan, &artifacts, proof)
 }
 
 /// C1's artifacts as a verifier derives them for `plan`: the top program's
 /// artifacts under `wrap_opts`, its shape at the top layout, C1 over it at
-/// `rate` and `prep`, its prepared stacks (if any) committed on the host.
+/// `rate` under `levers`, its prepared stacks (if any) committed on the host.
 pub fn compressed_artifacts(
     plan: &WhirBlockPlan,
     wrap_opts: &crate::ProofOptions,
     rate: WlfmRate,
-    prep: WlfmPrep,
+    levers: WlfmLevers,
 ) -> Result<WlfmArtifacts, String> {
     let top = plan.derive_top(wrap_opts)?;
     let child = top_child(plan, &top, wrap_opts)?;
     Ok(
-        build_compress_with(&child, plan.top_layout(), rate, prep, true)?
+        build_compress_with(&child, plan.top_layout(), rate, levers, true)?
             .build
             .artifacts,
     )
@@ -272,5 +312,29 @@ mod tests {
             assert!(compress_prep_setting(Some(bad)).is_err(), "{bad:?}");
         }
         assert_eq!(COMPRESS_PREP, WlfmPrep::Stacked);
+    }
+
+    /// The final-polynomial knob is off unless set, refuses nonsense, and the
+    /// pinned verifier's constant is today's chains.
+    #[test]
+    fn the_compress_final_knob_is_off_unless_set_and_refuses_nonsense() {
+        assert_eq!(compress_final_setting(None), Ok(FinalPoly::Off));
+        for off in ["", "0", "off", " OFF "] {
+            assert_eq!(compress_final_setting(Some(off)), Ok(FinalPoly::Off));
+        }
+        for on in ["1", "on", "6", " ON "] {
+            assert_eq!(
+                compress_final_setting(Some(on)),
+                Ok(FinalPoly::Vars(COMPRESS_FINAL_VARS))
+            );
+        }
+        for bad in ["2", "8", "yes", "-1"] {
+            assert!(compress_final_setting(Some(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(COMPRESS_FINAL, FinalPoly::Off);
+        assert_eq!(
+            FinalPoly::vars(COMPRESS_FINAL_VARS),
+            Some(FinalPoly::Vars(6))
+        );
     }
 }

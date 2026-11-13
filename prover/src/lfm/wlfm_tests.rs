@@ -21,10 +21,10 @@ use super::builder::{Cell, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
 use super::hash::HasherKind;
 use super::wlfm::{
-    WLFM_B4_QUERIES, WLFM_B16_STACK, WlfmBuild, WlfmHash, WlfmPrep, WlfmProof, WlfmRate,
-    absorb_wlfm_statement, build_wlfm, build_wlfm_on_host, build_wlfm_under, check_coverage,
-    execute_and_fill_unmerged, prove_wlfm, prove_wlfm_traces, test_format, verify_wlfm,
-    verify_wlfm_with, wlfm_config,
+    WLFM_B4_QUERIES, WLFM_B16_STACK, WlfmBuild, WlfmHash, WlfmLevers, WlfmPrep, WlfmProof,
+    WlfmRate, absorb_wlfm_statement, build_wlfm, build_wlfm_on_host, build_wlfm_under,
+    check_coverage, execute_and_fill_unmerged, prove_wlfm, prove_wlfm_traces, test_format,
+    verify_wlfm, verify_wlfm_with, wlfm_config,
 };
 use super::word::LfmWord;
 
@@ -83,8 +83,14 @@ fn build(program: &LfmProgram, rate: WlfmRate) -> WlfmBuild {
 }
 
 fn evaluated(program: &LfmProgram, rate: WlfmRate) -> WlfmBuild {
-    build_wlfm_under(program, HASHER, rate, WlfmPrep::Evaluated, false)
-        .unwrap_or_else(|e| panic!("the evaluated W-LFM build: {e}"))
+    build_wlfm_under(
+        program,
+        HASHER,
+        rate,
+        WlfmLevers::with_prep(WlfmPrep::Evaluated),
+        false,
+    )
+    .unwrap_or_else(|e| panic!("the evaluated W-LFM build: {e}"))
 }
 
 fn proof_bytes(proof: &WlfmProof) -> usize {
@@ -571,4 +577,139 @@ fn the_evaluated_rule_refuses_a_short_resized_changed_or_mixed_binding() {
     let mut mixed = stacked.artifacts.clone();
     mixed.evaluated = a.evaluated.clone();
     refused(&mixed, "stacked artifacts carry evaluated columns");
+}
+
+// =============================================================================
+// The final polynomial (the chains stop committing once few variables remain)
+// =============================================================================
+
+fn under(program: &LfmProgram, rate: WlfmRate, levers: WlfmLevers) -> WlfmBuild {
+    build_wlfm_under(program, HASHER, rate, levers, false)
+        .unwrap_or_else(|e| panic!("the W-LFM build under {levers:?}: {e}"))
+}
+
+fn final_levers(prep: WlfmPrep) -> WlfmLevers {
+    WlfmLevers {
+        prep,
+        final_poly: multilinear::whir_chain::FinalPoly::Vars(6),
+    }
+}
+
+/// Every chain round that sends a final polynomial, as `(group, chain,
+/// round)`: no successor root, one successor block with no path, and rounds
+/// after it.
+fn final_rounds(proof: &WlfmProof) -> Vec<(usize, usize, usize)> {
+    use multilinear::whir_chain::RoundOpenings;
+    let mut out = Vec::new();
+    for (g, opening) in proof.proof.columns.iter().enumerate() {
+        for (p, chain) in opening.polys.iter().enumerate() {
+            for (r, round) in chain.rounds.iter().enumerate() {
+                if let RoundOpenings::Extension(o) = &round.openings
+                    && round.next_root.is_none()
+                    && r + 1 < chain.rounds.len()
+                    && o.next.len() == 1
+                    && o.next[0].proof.merkle_path.is_empty()
+                {
+                    out.push((g, p, r));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// ★ THE FINAL-POLYNOMIAL ANCHOR: at blowup 2 and 16, under both bindings,
+/// the proof verifies, at least one chain stops at a final polynomial, the
+/// proof is smaller than the same binding without it, the identity moves, and
+/// each format's proof is refused by the other's artifacts.
+#[test]
+fn the_final_polynomial_round_trips_smaller_and_is_another_identity() {
+    let _unground = test_format::set(None);
+    let program = honest();
+    for rate in [WlfmRate::Two, WlfmRate::Sixteen] {
+        for prep in [WlfmPrep::Stacked, WlfmPrep::Evaluated] {
+            let off = under(&program, rate, WlfmLevers::with_prep(prep));
+            let on = under(&program, rate, final_levers(prep));
+            assert_eq!(on.artifacts.final_poly, final_levers(prep).final_poly);
+            assert_ne!(on.artifacts.program_id, off.artifacts.program_id);
+            let proof = prove(&program, &on);
+            verify_wlfm(&on.artifacts, &proof, &proof.public_words)
+                .unwrap_or_else(|e| panic!("{rate:?} {prep:?}: {e}"));
+            assert!(
+                !final_rounds(&proof).is_empty(),
+                "{rate:?} {prep:?}: a chain stops at a final polynomial"
+            );
+            let today = prove(&program, &off);
+            assert!(
+                proof_bytes(&proof) < proof_bytes(&today),
+                "{rate:?} {prep:?}: {} vs {}",
+                proof_bytes(&proof),
+                proof_bytes(&today)
+            );
+            assert!(final_rounds(&today).is_empty(), "today's chains send none");
+            assert!(verify_wlfm(&off.artifacts, &proof, &proof.public_words).is_err());
+            assert!(verify_wlfm(&on.artifacts, &today, &today.public_words).is_err());
+        }
+    }
+}
+
+/// A final-polynomial W-LFM proof refuses a changed polynomial value, a
+/// changed final value, a tampered commit-time answer and a tampered word.
+#[test]
+fn a_final_polynomial_proof_refuses_a_tampered_polynomial() {
+    use multilinear::whir_chain::RoundOpenings;
+    let _unground = test_format::set(None);
+    let program = honest();
+    let build = under(&program, WlfmRate::Sixteen, final_levers(WlfmPrep::Stacked));
+    let proof = prove(&program, &build);
+    let a = &build.artifacts;
+    verify_wlfm(a, &proof, &proof.public_words).expect("honest");
+    let (g, p, r) = final_rounds(&proof)[0];
+    let mut poly = proof.clone();
+    match &mut poly.proof.columns[g].polys[p].rounds[r].openings {
+        RoundOpenings::Extension(o) => o.next[0].values[0] += FieldElement::<E>::one(),
+        _ => panic!("the final round is an extension round"),
+    }
+    assert!(verify_wlfm(a, &poly, &poly.public_words).is_err(), "poly");
+    let mut value = proof.clone();
+    value.proof.columns[g].polys[p].final_value += FieldElement::<E>::one();
+    assert!(
+        verify_wlfm(a, &value, &value.public_words).is_err(),
+        "final value"
+    );
+    let mut answer = proof.clone();
+    answer.commit_ood[0] += FieldElement::<E>::one();
+    assert!(
+        verify_wlfm(a, &answer, &answer.public_words).is_err(),
+        "answer"
+    );
+    let mut claimed = proof.public_words.clone();
+    claimed[0].1[0] += FE::one();
+    assert!(verify_wlfm(a, &proof, &claimed).is_err(), "word");
+}
+
+/// The final polynomial is the compression step's alone: the base block's
+/// chain, the default ZF format and a W-LFM proof at the default levers (the
+/// formats a parent verifies in-guest) all keep `Off`.
+#[test]
+fn only_an_opted_in_wlfm_proof_stops_at_a_final_polynomial() {
+    use multilinear::whir_chain::FinalPoly;
+    let shapes = [(329usize, 18usize), (23, 21), (25, 20)];
+    assert_eq!(
+        crate::block_whir::BlockFormat::pinned()
+            .chain_config(&shapes)
+            .format
+            .final_poly,
+        FinalPoly::Off
+    );
+    assert_eq!(
+        crate::zf_format::ZfFormat::DEFAULT
+            .chain_format()
+            .final_poly,
+        FinalPoly::Off
+    );
+    for rate in [WlfmRate::Two, WlfmRate::Four, WlfmRate::Sixteen] {
+        assert_eq!(wlfm_config(rate, &shapes).format.final_poly, FinalPoly::Off);
+    }
+    assert_eq!(WlfmLevers::DEFAULT.final_poly, FinalPoly::Off);
 }
