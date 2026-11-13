@@ -39,6 +39,12 @@ pub struct Kernels {
     /// [`Self::leaves_base_coset`] with block `j` at position `bitrev(j)`.
     pub leaves_base_coset_rev: CudaFunction,
     pub leaves_ext3_coset: CudaFunction,
+    /// The joint leaves of a grouped run's 2–4 base codewords
+    /// (`crate::whir::launch_joint_leaves`).
+    pub leaves_base_coset_joint: CudaFunction,
+    /// The joint leaf's prefix midstate, for the host to check
+    /// ([`joint_midstate`]).
+    pub joint_midstate_probe: CudaFunction,
     pub merkle_level: CudaFunction,
     pub merkle_tail: CudaFunction,
     pub grind_search: CudaFunction,
@@ -80,6 +86,8 @@ pub fn kernels() -> Result<&'static Kernels> {
         leaves_base_coset: module.load_function("b3w_leaves_base_coset")?,
         leaves_base_coset_rev: module.load_function("b3w_leaves_base_coset_rev")?,
         leaves_ext3_coset: module.load_function("b3w_leaves_ext3_coset")?,
+        leaves_base_coset_joint: module.load_function("b3w_leaves_base_coset_joint")?,
+        joint_midstate_probe: module.load_function("b3w_joint_midstate_probe")?,
         merkle_level: module.load_function("blake3_merkle_level")?,
         merkle_tail: module.load_function("blake3_merkle_tail")?,
         grind_search: module.load_function("b3w_grind_search")?,
@@ -142,6 +150,32 @@ pub(crate) fn build_inner_tree_levels(
         level_begin = new_begin;
     }
     Ok(())
+}
+
+/// The chaining value the joint-leaf kernel starts every leaf's chain from,
+/// for `blocks` blocks of `2^log_block` base values: what the host's
+/// `crypto::merkle_tree::backends::blake3_joint::joint_leaf_midstate` gives.
+pub fn joint_midstate(blocks: u64, log_block: u32) -> Result<[u32; 8]> {
+    let k = kernels()?;
+    let stream = backend()?.next_stream();
+    let mut out = stream.alloc_zeros::<u32>(8)?;
+    unsafe {
+        stream
+            .launch_builder(&k.joint_midstate_probe)
+            .arg(&blocks)
+            .arg(&log_block)
+            .arg(&mut out)
+            .launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    let host = crate::readback::clone_dtoh(&stream, &out)?;
+    stream.synchronize()?;
+    let mut cv = [0u32; 8];
+    cv.copy_from_slice(&host);
+    Ok(cv)
 }
 
 /// The grind kernel and its block size, for [`crate::grinding`]'s range walk.

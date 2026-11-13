@@ -74,6 +74,76 @@ extern "C" __global__ void b3w_leaves_ext3_coset(const uint64_t *__restrict__ co
     h.finalize(out + tid * 32);
 }
 
+// The chaining value after a joint leaf's 64-byte prefix for `blocks` blocks
+// of `2^log_block` base values (8 bytes each): the 7-round compression of the
+// IV over the prefix's 16 little-endian words, counter 0, `block_len` 64,
+// CHUNK_START. The words are the prefix's bytes: `0xFF` × 8, the domain
+// "LAMBDAVM_WHIR_JOINT_LEAF", then the values' byte count, `blocks`, the
+// values a block and the bytes a value, each a big-endian u64. Twin of the
+// host's `blake3_joint::joint_leaf_midstate`.
+__device__ __forceinline__ void b3w_joint_midstate(uint64_t blocks, uint32_t log_block,
+                                                   uint32_t *out) {
+    const uint64_t per_block = 1ull << log_block;
+    const uint64_t width = 8;
+    const uint64_t fields[4] = {blocks * per_block * width, blocks, per_block, width};
+    uint32_t m[16] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0x424d414cu, 0x4d564144u,
+                      0x4948575fu, 0x4f4a5f52u, 0x5f544e49u, 0x4641454cu};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        m[8 + 2 * k] = bswap32((uint32_t)(fields[k] >> 32));
+        m[9 + 2 * k] = bswap32((uint32_t)fields[k]);
+    }
+    uint32_t o[16];
+    blake3_compress<BLAKE3_ROUNDS>(BLAKE3_IV, m, 0, 64u, BLAKE3_FLAG_CHUNK_START, o);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) out[i] = o[i];
+}
+
+// The JOINT coset leaves of a grouped run (`whir_chain::Round0Trees::One`)
+// under 7-round BLAKE3: leaf `tid` is `Blake3Std` over a 64-byte prefix and
+// then block `tid` of each of `blocks` (2..=4) base codewords in slot order,
+// end to end — `cw_p[tid + t·num_leaves]`, `t` in `[0, 2^log_block)` — its
+// digest at `bitrev(tid)` over `leaf_bits` bits (at `tid` when 0). Unused
+// codeword slots repeat `cw0` and are never read. Twin of
+// `p1s_leaves_base_coset_joint`; the host is
+// `crypto::merkle_tree::backends::blake3_joint::joint_leaf`.
+//
+// THE PREFIX is a launch constant, so its compression is too: thread 0 of
+// each CUDA block compresses it once into shared memory
+// (`b3w_joint_midstate`), and every leaf's chain starts there with
+// CHUNK_START spent, paying only its values' compressions.
+extern "C" __global__ void b3w_leaves_base_coset_joint(
+    const uint64_t *__restrict__ cw0, const uint64_t *__restrict__ cw1,
+    const uint64_t *__restrict__ cw2, const uint64_t *__restrict__ cw3, uint64_t blocks,
+    uint64_t num_leaves, uint32_t log_block, uint32_t leaf_bits, uint8_t *__restrict__ out) {
+    __shared__ uint32_t midstate[8];
+    if (threadIdx.x == 0) b3w_joint_midstate(blocks, log_block, midstate);
+    __syncthreads();
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    Blake3Chain h;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) h.cv[i] = midstate[i];
+    h.block.init();
+    h.started = true;
+    const uint64_t per_block = 1ull << log_block;
+    for (uint64_t p = 0; p < blocks; ++p) {
+        const uint64_t *cw = p == 0 ? cw0 : (p == 1 ? cw1 : (p == 2 ? cw2 : cw3));
+        for (uint64_t t = 0; t < per_block; ++t) h.push_felt(cw[tid + t * num_leaves]);
+    }
+    const uint64_t at = leaf_bits == 0 ? tid : (__brevll(tid) >> (64 - leaf_bits));
+    h.finalize(out + at * 32);
+}
+
+// This module's joint-leaf midstate for `blocks` blocks of `2^log_block` base
+// values, as `b3w_leaves_base_coset_joint` computes it: the host checks it
+// against `joint_leaf_midstate` (tests/blake3_whir.rs).
+extern "C" __global__ void b3w_joint_midstate_probe(uint64_t blocks, uint32_t log_block,
+                                                     uint32_t *out) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    b3w_joint_midstate(blocks, log_block, out);
+}
+
 // The proof-of-work nonce search under standard BLAKE3.
 //
 // The host predicate (`crypto::grinding::is_valid_nonce::<Blake3Std>`) hashes
