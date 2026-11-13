@@ -854,7 +854,6 @@ dependencies = [
  "multilinear",
  "rayon",
  "rkyv",
- "serde",
  "serde_json",
  "sha2",
  "stark",

@@ -27,8 +27,6 @@ pub mod multilinear_prove;
 mod paged_mem;
 pub use stark::profile_markers;
 pub mod recursion;
-#[cfg(feature = "shape-profile")]
-pub mod shape_profile;
 mod statement;
 pub mod tables;
 pub mod test_utils;
@@ -1917,8 +1915,6 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("proving");
     let pairs = airs.air_trace_pairs(&mut traces);
-    #[cfg(feature = "shape-profile")]
-    shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
     // ★ The block path's PIN, not `stark`'s default alias — the monolithic
     // production prove, the twin of the batched one in `continuation.rs`.
     let proof = crate::hash_pin::BlockProver::multi_prove(

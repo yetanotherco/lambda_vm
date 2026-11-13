@@ -21,32 +21,6 @@ use super::compiler::ColumnGroup;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-/// Whether the instruction-group commit pass runs its column loops in parallel.
-///
-/// ⛔ THE A/B CONTROL FOR THE PARALLEL BUILD, and it is a separate knob from
-/// [`groups_in_flight`](super::registry::groups_in_flight) on purpose.
-/// `LFM_ARTIFACT_GROUPS_IN_FLIGHT=1` bounds RESIDENCY and leaves the columns
-/// parallel; `LFM_ARTIFACT_PARALLEL=0` restores the pre-change walk exactly —
-/// serial columns, serial groups.
-///
-/// ⚠ `RAYON_NUM_THREADS=1` is NOT this control. It also serializes work that was
-/// already parallel before this change (the Merkle leaf hashing in
-/// `stark::commitment`, and the fixed tables' own commitments), so an A/B taken
-/// that way attributes their speedup to this commit.
-pub fn parallel_build() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(
-        // An EMPTY value reads as unset: `FOO= cmd` is the shell's way of
-        // clearing a variable, and panicking on it would fail a run for a
-        // spelling of "default".
-        || match std::env::var("LFM_ARTIFACT_PARALLEL").ok().as_deref() {
-            Some("0") => false,
-            None | Some("") | Some("1") => true,
-            Some(other) => panic!("LFM_ARTIFACT_PARALLEL must be `0` or `1`, got `{other}`"),
-        },
-    )
-}
-
 /// The coset LDE of a column matrix, column-major and in NATURAL order.
 ///
 /// Split out of [`commit_columns`] so a caller that needs the evaluations for
@@ -82,10 +56,13 @@ pub fn lde_columns(columns: &[Vec<FE>], options: &ProofOptions) -> Vec<Vec<FE>> 
         .expect("LDE evaluation failed for LFM column group")
     };
     #[cfg(feature = "parallel")]
-    if parallel_build() {
-        return columns.par_iter().map(expand).collect();
+    {
+        columns.par_iter().map(expand).collect()
     }
-    columns.iter().map(expand).collect()
+    #[cfg(not(feature = "parallel"))]
+    {
+        columns.iter().map(expand).collect()
+    }
 }
 
 /// Commits an already-expanded LDE column matrix with today's row-pair
@@ -143,24 +120,13 @@ pub fn commit_columns_with(
 pub fn group_columns(group: &ColumnGroup) -> Vec<Vec<FE>> {
     let column = |c: usize| (0..group.padded_rows).map(|r| *group.at(r, c)).collect();
     #[cfg(feature = "parallel")]
-    if parallel_build() {
-        return (0..group.width).into_par_iter().map(column).collect();
+    {
+        (0..group.width).into_par_iter().map(column).collect()
     }
-    (0..group.width).map(column).collect()
-}
-
-/// Whether an instruction column group is committed on the DEVICE when one is
-/// present. `LFM_DEVICE_ARTIFACTS=0` forces the host pass and is the A/B control
-/// for O1.
-pub fn device_artifacts() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(
-        || match std::env::var("LFM_DEVICE_ARTIFACTS").ok().as_deref() {
-            Some("0") => false,
-            None | Some("") | Some("1") => true,
-            Some(other) => panic!("LFM_DEVICE_ARTIFACTS must be `0` or `1`, got `{other}`"),
-        },
-    )
+    #[cfg(not(feature = "parallel"))]
+    {
+        (0..group.width).map(column).collect()
+    }
 }
 
 /// The largest device working set any artifact commit has asked for in this
@@ -252,7 +218,7 @@ pub fn commit_group_device_or_host_under<S: StarkHash>(
     layout: LeafLayout,
 ) -> Commitment {
     #[cfg(feature = "cuda")]
-    if device_artifacts() && group.padded_rows > 0 && group.width > 0 {
+    if group.padded_rows > 0 && group.width > 0 {
         let set = stark::device_set::commit_device_set_rpl(
             group.padded_rows,
             group.width,
@@ -261,19 +227,6 @@ pub fn commit_group_device_or_host_under<S: StarkHash>(
             layout.rows_per_leaf(),
         );
         DEVICE_PEAK_BYTES.fetch_max(set.total(), std::sync::atomic::Ordering::Relaxed);
-        // ⛔ ROUND-3 TREE PROBE (diagnostic, OFF by default). The card permit is
-        // held across the WHOLE of `build_artifacts_with_hasher`, and THIS call
-        // is the only device work inside it. So `Σ dispatch` against that hold
-        // says how much of an exclusive card hold is actually spent on the card:
-        // far below it and the permit is held over HOST work, which is a lever
-        // with a mechanism rather than a floor.
-        //
-        // ⚠ A HOST STOPWATCH, NOT A CUDA EVENT, and that is the point:
-        // `try_commit_row_major` blocks until it has a root, so the wall around
-        // it brackets the dispatch without adding a synchronize the device path
-        // would otherwise not have. The measurement cannot perturb what it
-        // measures.
-        let probe_t = super::tree_probe::enabled().then(std::time::Instant::now);
         let committed = stark::gpu_lde::try_commit_row_major_with::<
             GoldilocksField,
             S::Batched<GoldilocksField>,
@@ -286,9 +239,6 @@ pub fn commit_group_device_or_host_under<S: StarkHash>(
             &FE::from(options.coset_offset),
             layout.rows_per_leaf(),
         );
-        if let Some(t) = probe_t {
-            super::tree_probe::note_device_commit(t.elapsed().as_nanos() as u64);
-        }
         if let Some(root) = committed {
             DEVICE_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return root;
@@ -378,10 +328,6 @@ mod device_parity {
     #[test]
     fn the_one_row_device_commit_matches_the_host_commit_above_the_floor() {
         let options = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
-        assert!(
-            device_artifacts(),
-            "LFM_DEVICE_ARTIFACTS=0: this test would compare a host root with a host root"
-        );
         let before = stark::gpu_lde::gpu_one_row_trees();
         let shapes = [(4_096usize, 1usize), (8_192, 20), (4_096, 134)];
         for (rows, width) in shapes {
@@ -409,22 +355,6 @@ mod device_parity {
             moved >= shapes.len() as u64,
             "only {moved} one-row device trees for {} groups: the device declined (host fallback)",
             shapes.len()
-        );
-    }
-
-    /// And the control: `LFM_DEVICE_ARTIFACTS=0` must reach the host pass. Read
-    /// once per process, so this asserts the knob's VALUE agrees with the branch
-    /// rather than flipping it mid-run.
-    #[test]
-    fn the_opt_out_and_the_branch_agree() {
-        let options = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
-        let g = group(4_096, 20);
-        let host = commit_lde_columns(&lde_columns(&group_columns(&g), &options));
-        assert_eq!(
-            commit_group_device_or_host("device_parity_optout", &g, &options),
-            host,
-            "with LFM_DEVICE_ARTIFACTS={}, the commit must still equal the host root",
-            if device_artifacts() { "1" } else { "0" }
         );
     }
 }

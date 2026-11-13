@@ -362,8 +362,8 @@ fn decompose_and_extend_d2_subcoset_matches_whole_coset() {
 #[test]
 fn composition_eval_stride_rule() {
     use crate::prover::composition_eval_stride;
-    // Read under the default (environment) setting, which these tests never
-    // override: on unless `LAMBDA_VM_COMPOSITION_SUBCOSET=0`.
+    // Read under the default setting (on); a test that forces it off
+    // ([`crate::prover::set_composition_subcoset`]) skips this one meanwhile.
     if !crate::prover::composition_subcoset_enabled() {
         return;
     }

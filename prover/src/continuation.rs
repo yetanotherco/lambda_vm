@@ -1150,7 +1150,7 @@ struct BuildJob {
 }
 
 /// What a trace builder hands the STARK base's prover: a built epoch, or —
-/// when the preparation runs ahead of the prover ([`base_prep_ahead`], the
+/// when the preparation runs ahead of the prover ([`BASE_PREP_AHEAD`], the
 /// default) — one whose host preparation ([`prep_epoch`]) is done too.
 ///
 /// Unboxed `Built` on purpose: it is the channel item of the schedule that
@@ -1554,7 +1554,7 @@ pub(crate) fn build_epoch_airs(
 /// set, its AIRs, the epoch-local L2G table and the statement values the
 /// transcript absorbs. [`prep_epoch`] builds it and [`prove_prepped_epoch`]
 /// proves it, so the two can run on different threads (by default the prep on
-/// a trace builder, ahead of the prover: [`base_prep_ahead`]).
+/// a trace builder, ahead of the prover: [`BASE_PREP_AHEAD`]).
 pub(crate) struct EpochPrep {
     traces: Traces,
     airs: VmAirs,
@@ -1673,8 +1673,6 @@ fn prove_prepped_epoch(
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
 
-    #[cfg(feature = "shape-profile")]
-    crate::shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
     let proof = crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
         pairs,
         &mut seed(),
@@ -1951,7 +1949,7 @@ fn prove_global(
 /// The global proof's host-side preparation, done: every epoch's L2G table
 /// and every touched page's GLOBAL_MEMORY table, with their AIRs. Built by
 /// [`prep_global`], proved by [`prove_prepped_global`] — split so the prep can
-/// run while the last epochs prove ([`base_prep_ahead`]).
+/// run while the last epochs prove ([`BASE_PREP_AHEAD`]).
 pub(crate) struct GlobalPrep {
     num_epochs: usize,
     l2g_airs: Vec<AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints>>,
@@ -2039,9 +2037,6 @@ fn prove_prepped_global(
     for (air, trace) in gm_airs.iter().zip(gm_traces.iter_mut()) {
         pairs.push((air as AirRef, trace, &()));
     }
-
-    #[cfg(feature = "shape-profile")]
-    crate::shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
 
     crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
         pairs,
@@ -2213,43 +2208,14 @@ fn base_stage_done(index: u64, stage: &str, open: Option<(std::time::Instant, f6
     }
 }
 
-/// The switch that keeps each base epoch's host preparation, and the global
-/// proof's, on the prover thread just before its prove, which is where they ran
-/// before they moved ahead of it. Unset or `0`: ahead (the default).
-pub const BASE_PREP_ON_PROVER_ENV: &str = "LAMBDA_VM_BASE_PREP_ON_PROVER";
-
-/// Whether the preparation runs ahead of the prover thread, for a raw value of
-/// [`BASE_PREP_ON_PROVER_ENV`]: unset, empty or `0` is ahead, `1` is on the
-/// prover thread, and anything else stops the run — a typo read as the default
-/// would measure one schedule under the other's name.
-pub fn base_prep_ahead_setting(raw: Option<&str>) -> bool {
-    match raw.map(str::trim) {
-        None | Some("") | Some("0") => true,
-        Some("1") => false,
-        Some(other) => panic!("{BASE_PREP_ON_PROVER_ENV} must be 0 or 1, got {other:?}"),
-    }
-}
-
-/// Whether this process prepares each base epoch, and the global proof, ahead
+/// Whether a production base prepares each epoch, and the global proof, ahead
 /// of the prover thread: the epochs' on the STARK trace builders or the WHIR
 /// producer, the global proof's on the producer once the last epoch is out.
-/// The proofs are the same either way; only which thread does the host work,
-/// and when, changes. Read once, and named on stderr in one write either way,
-/// so a log states the schedule its base ran.
-pub(crate) fn base_prep_ahead() -> bool {
-    static AHEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| {
-        let ahead = base_prep_ahead_setting(std::env::var(BASE_PREP_ON_PROVER_ENV).ok().as_deref());
-        let line = if ahead {
-            "BASE PREP: ahead of the prover thread (the default)\n".to_string()
-        } else {
-            format!("BASE PREP: on the prover thread ({BASE_PREP_ON_PROVER_ENV}=1)\n")
-        };
-        use std::io::Write;
-        let _ = std::io::stderr().write_all(line.as_bytes());
-        ahead
-    })
-}
+/// Always, outside tests: [`prove_continuation_scheduled`] takes the schedule
+/// as an argument so a test can prove the prover-thread schedule (where the
+/// preparation ran before it moved ahead) and compare. The proofs are the same
+/// either way; only which thread does the host work, and when, changes.
+pub(crate) const BASE_PREP_AHEAD: bool = true;
 
 /// Hooks on a base's epoch pipeline, for a caller that starts host-only work on
 /// the epoch proofs before the bundle exists: the recursion tree's level-0
@@ -2381,7 +2347,7 @@ pub fn prove_continuation_keeping_decode(
         private_inputs,
         epoch_size_log2,
         opts,
-        base_prep_ahead(),
+        BASE_PREP_AHEAD,
         &MaxRowsConfig::default(),
     )
 }
@@ -2401,15 +2367,15 @@ pub(crate) fn prove_continuation_with_max_rows(
         private_inputs,
         epoch_size_log2,
         opts,
-        base_prep_ahead(),
+        BASE_PREP_AHEAD,
         max_rows,
     )
     .map(|(bundle, _)| bundle)
 }
 
 /// [`prove_continuation_keeping_decode`] with the preparation's schedule named
-/// by the caller rather than read from [`BASE_PREP_ON_PROVER_ENV`], so one
-/// process can run both: `prep_ahead` moves each epoch's host preparation onto
+/// by the caller (production: [`BASE_PREP_AHEAD`]), so one process can run
+/// both: `prep_ahead` moves each epoch's host preparation onto
 /// the trace builders and the global proof's onto the producer, ahead of the
 /// prover thread. The proofs are the same either way; only who does the host
 /// work, and when, changes.
@@ -2507,7 +2473,7 @@ pub(crate) fn prove_continuation_scheduled(
     // queued, `builders` building, one built epoch queued, one proving.
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<ReadyEpoch, Error>>(1);
     let (build_tx, build_rx) = std::sync::mpsc::sync_channel::<Result<BuildJob, Error>>(1);
-    // `prep_ahead` ([`base_prep_ahead`], the default): the builders also run
+    // `prep_ahead` ([`BASE_PREP_AHEAD`], the default): the builders also run
     // each epoch's host preparation, and the producer prepares the global proof
     // once it has handed over the last epoch, both ahead of the prover thread
     // instead of on it.
@@ -4109,24 +4075,6 @@ mod tests {
         assert_eq!(ahead.touched_page_bases, on_prover.touched_page_bases);
         let out = verify_continuation(&elf_bytes, &ahead, &opts).unwrap();
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
-    }
-
-    /// The schedule switch: unset, empty or `0` prepares ahead of the prover
-    /// thread, `1` keeps the preparation on it.
-    #[test]
-    fn the_base_prep_switch_is_ahead_unless_exactly_one() {
-        assert!(base_prep_ahead_setting(None));
-        assert!(base_prep_ahead_setting(Some("")));
-        assert!(base_prep_ahead_setting(Some("0")));
-        assert!(!base_prep_ahead_setting(Some("1")));
-        assert!(!base_prep_ahead_setting(Some(" 1 ")));
-    }
-
-    /// Anything else stops the run instead of reading as the default.
-    #[test]
-    #[should_panic(expected = "LAMBDA_VM_BASE_PREP_ON_PROVER must be 0 or 1")]
-    fn the_base_prep_switch_refuses_anything_else() {
-        base_prep_ahead_setting(Some("yes"));
     }
 
     // Round-trip: a bundle from prove_continuation verifies on its own (only the

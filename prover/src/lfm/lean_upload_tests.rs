@@ -27,7 +27,7 @@ type E = GoldilocksExtension;
 
 const KIND: HasherKind = HasherKind::Poseidon1W16;
 
-/// Restores the knob to the environment's choice when a test ends, pass or fail.
+/// Restores the default (on) when a test ends, pass or fail.
 struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {

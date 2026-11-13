@@ -141,9 +141,6 @@ pub mod recursion_soundness_gap_poc;
 pub mod register_tests;
 #[cfg(test)]
 pub mod rpx_two_implementations;
-#[cfg(test)]
-#[cfg(feature = "shape-profile")]
-pub mod shape_profile_tests;
 pub mod transcript_counts;
 pub mod windowed_builder_tests;
 

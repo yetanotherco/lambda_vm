@@ -47,9 +47,8 @@
 //! # Inert until armed
 //!
 //! Unarmed, and at one worker, [`hold`] takes no lock and touches no counter on
-//! the contended path: it reads one relaxed `usize` plus the round-3 tree
-//! probe's cached `OnceLock<bool>` and returns. Nothing that ships arms it, and
-//! nothing that ships sets `LAMBDA_VM_TREE_BUSY_PROBE`.
+//! the contended path: it reads one relaxed `usize` and returns. Nothing that
+//! ships arms it.
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -379,16 +378,6 @@ impl PermitStats {
 pub struct CardPermit {
     guard: Option<std::sync::MutexGuard<'static, ()>>,
     since: Instant,
-    /// ⛔ ROUND-3 TREE PROBE ONLY, `None` unless `LAMBDA_VM_TREE_BUSY_PROBE` is
-    /// set: which device phase this hold is, and the nanoseconds its holder
-    /// queued for the card.
-    ///
-    /// ⚠ Carried on EVERY permit the probe sees, not only the armed ones. An
-    /// unarmed stage (`arm(1)` — the WHIR global child, the block-artifact
-    /// root) returns before a guard exists and accumulates nothing into
-    /// `HELD_NANOS`, so without this its device-phase time appears in no
-    /// summary at all — only on the per-hold `LFM_CARD_TRACE` lines.
-    probe: Option<(&'static str, u64)>,
     /// Trace-only, `None` unless `LFM_CARD_TRACE` is set: which device phase
     /// this hold is, the seconds it queued, its sequence number, and the epoch
     /// second it was acquired.
@@ -404,19 +393,6 @@ impl Drop for CardPermit {
             IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             HELD_HERE.with(|h| h.set(false));
         }
-        // ⛔ DELIBERATELY OUTSIDE the `guard` branch above. `HELD_NANOS` is the
-        // ARMED accounting a level reports through `take_stats`; this is a
-        // SECOND, separate accounting that also sees the `K = 1` stages. It
-        // never touches `HELD_NANOS`, `ACQUISITIONS` or `PEAK_IN_FLIGHT`, so
-        // every line the drivers already print keeps its exact meaning and the
-        // probe cannot move an existing number.
-        if let Some((phase, waited_nanos)) = self.probe {
-            super::tree_probe::note_hold(
-                phase,
-                self.since.elapsed().as_nanos() as u64,
-                waited_nanos,
-            );
-        }
         if let Some((phase, waited, seq, t0)) = self.trace {
             println!(
                 "CARD HOLD #{seq} {phase}: waited {waited:.3}s · held {:.3}s · t=[{t0:.3},{:.3}]{}",
@@ -430,9 +406,8 @@ impl Drop for CardPermit {
 
 /// Take the card. Blocks until the current holder releases it.
 ///
-/// Inert — no lock, no counter, two relaxed reads (the worker count and the
-/// round-3 tree probe's `OnceLock`) — while the driver is serial, so every call
-/// site can take it unconditionally.
+/// Inert — no lock, no counter, one relaxed read (the worker count) — while the
+/// driver is serial, so every call site can take it unconditionally.
 ///
 /// # Panics
 ///
@@ -448,19 +423,15 @@ pub fn hold() -> CardPermit {
 /// a log where both are just holds.
 pub fn hold_labeled(phase: &'static str) -> CardPermit {
     let traced = trace_enabled();
-    // One `OnceLock` read per hold — tens of them in a whole block run, never in
-    // a loop. Off, this is the only thing the probe costs anywhere.
-    let probed = super::tree_probe::enabled();
-    if workers() <= 1 && !traced && !probed {
+    if workers() <= 1 && !traced {
         return CardPermit {
             guard: None,
             since: Instant::now(),
-            probe: None,
             trace: None,
             who: String::new(),
         };
     }
-    // ★ Unarmed BUT traced or probed: there is no card to take (the serial
+    // ★ Unarmed BUT traced: there is no card to take (the serial
     // driver holds it by construction), and the window is still exactly the
     // device phase — which is the window the sampler has to be sliced by in the
     // K=1 control too, or the two arms are compared on different definitions.
@@ -469,7 +440,6 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
         return CardPermit {
             guard: None,
             since: Instant::now(),
-            probe: probed.then_some((phase, 0)),
             trace: traced.then(|| (phase, 0.0, seq, stark::prove_split::epoch_secs())),
             who: if traced {
                 holder_suffix()
@@ -523,9 +493,7 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
         guard: Some(guard),
         since: Instant::now(),
         // ⚠ The SAME `waited` the trace line and `WAITED_NANOS` carry, not a
-        // second reading of the clock — three accountings of one wait that
-        // disagreed would be worse than two that do not exist.
-        probe: probed.then_some((phase, waited.as_nanos() as u64)),
+        // second reading of the clock.
         trace: traced.then(|| {
             (
                 phase,

@@ -43,8 +43,8 @@
 //! file (not Linux) `auto` has no reading and admits by the other two rules
 //! only, which is what the line reports.
 //!
-//! What `auto` reads of the host is [`READING_ENV`]'s choice. `live`, the
-//! default ([`READING_DEFAULT`]), takes off what a purge could return
+//! What `auto` reads of the host is [`READING_DEFAULT`]: `live`, which takes
+//! off what a purge could return
 //! ([`live_bytes`]): after phase A frees its tables the resident set is mostly
 //! pages the allocator holds and a new program is written into, and counting
 //! them made the room shortest on the hosts with the most of it. A large
@@ -149,39 +149,20 @@ pub fn parse_share(value: Option<&str>) -> Result<f64, String> {
     }
 }
 
-/// What `auto` reads of the host: [`READING_ENV`].
+/// What `auto` reads of the host: [`READING_DEFAULT`] in a prove; `Resident`
+/// stays as the tests' comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reading {
     /// `resident`: the process's resident bytes ([`resident_bytes`]), the
     /// reading before.
     Resident,
-    /// Unset, empty or `live` (the default): the resident bytes less what a
-    /// purge could return ([`live_bytes`]).
+    /// `live` (the default): the resident bytes less what a purge could
+    /// return ([`live_bytes`]).
     Live,
 }
 
-/// [`READING_ENV`] unset or empty: the live reading. `resident` is the way
-/// back.
+/// The reading a prove's budget takes: live.
 pub const READING_DEFAULT: Reading = Reading::Live;
-
-/// [`Reading`]'s knob.
-pub const READING_ENV: &str = "LAMBDA_VM_TREE_PROGRAM_BUDGET_READING";
-
-/// [`READING_ENV`], parsed.
-pub fn reading_from_env() -> Result<Reading, String> {
-    parse_reading(std::env::var(READING_ENV).ok().as_deref())
-}
-
-/// A value of [`READING_ENV`]: unset or empty is [`READING_DEFAULT`];
-/// nonsense is an error.
-pub fn parse_reading(value: Option<&str>) -> Result<Reading, String> {
-    match value.map(str::trim) {
-        None | Some("") => Ok(READING_DEFAULT),
-        Some("resident") => Ok(Reading::Resident),
-        Some("live") => Ok(Reading::Live),
-        Some(v) => Err(format!("{READING_ENV} must be resident or live, got `{v}`")),
-    }
-}
 
 /// What counts as room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -774,17 +755,10 @@ mod tests {
         );
     }
 
-    /// Unset or empty, the knob reads live; `resident` is the reading before.
+    /// A prove's budget reads live; `resident` is the reading before.
     #[test]
-    fn the_reading_knob_reads_resident_or_live_and_refuses_nonsense() {
+    fn the_budget_reads_live() {
         assert_eq!(READING_DEFAULT, Reading::Live);
-        assert_eq!(parse_reading(None), Ok(Reading::Live));
-        assert_eq!(parse_reading(Some(" ")), Ok(Reading::Live));
-        assert_eq!(parse_reading(Some("resident")), Ok(Reading::Resident));
-        assert_eq!(parse_reading(Some(" live ")), Ok(Reading::Live));
-        for bad in ["rss", "1", "LIVE", "purgeable"] {
-            assert!(parse_reading(Some(bad)).is_err(), "{bad}");
-        }
     }
 
     /// The allocator's figures, in MiB.
@@ -870,7 +844,7 @@ mod tests {
                 || live.starts_with("auto: no VmRSS reading"),
             "{live}"
         );
-        let default = ProgramBudget::new(room, parse_reading(None).expect("unset")).describe();
+        let default = ProgramBudget::new(room, READING_DEFAULT).describe();
         assert!(
             default.starts_with("auto: VmRSS less what a purge could return (")
                 || default.starts_with("auto: no VmRSS reading"),

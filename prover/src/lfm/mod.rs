@@ -72,8 +72,6 @@ pub mod statement_replay;
 pub mod sub_proof;
 pub mod trace;
 pub mod transcript_replay;
-/// ⛔ ROUND-3 TREE/WRAP DISCRIMINATOR — a diagnostic, OFF by default.
-pub mod tree_probe;
 pub(crate) mod tree_run;
 pub mod validator;
 pub mod whir_air;

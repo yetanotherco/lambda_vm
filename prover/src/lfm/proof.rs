@@ -410,10 +410,8 @@ impl LfmFilled {
         } = self;
         same_hasher(artifacts.hasher, hasher)?;
         // The domains and twiddles this proof's tables need, built before it
-        // takes the card rather than under it (`LFM_WARM_DOMAINS`).
-        if super::domain_warm::on() {
-            super::domain_warm::warm(&traces, options);
-        }
+        // takes the card rather than under it ([`super::domain_warm`]).
+        super::domain_warm::warm(&traces, options);
         let t = Instant::now();
         let waited_before = super::device_permit::waited_secs();
         let proof = prove_traces_under::<Fam>(

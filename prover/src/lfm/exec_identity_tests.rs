@@ -16,9 +16,9 @@
 //! else serial and in program order.
 //!
 //! ⚠ The knob that selects the schedule in production cannot be the thing this
-//! test flips. The precedent (`LFM_ARTIFACT_PARALLEL`, `commit.rs:35`) caches
-//! its environment read in a `OnceLock`, so a process reads it once and a test
-//! that set it per-case would gate whichever arm happened to run first. The two
+//! test flips. A knob that caches its environment read in a `OnceLock` is
+//! read once a process, so a test that set it per-case would gate whichever
+//! arm happened to run first. The two
 //! arms are therefore reached by an explicit argument, the way
 //! `build_traces_walked` takes a [`super::trace::Walk`], and the environment
 //! chooses only the production default.

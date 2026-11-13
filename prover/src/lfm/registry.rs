@@ -372,12 +372,12 @@ pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtif
 /// residency by at most four rather than by the group count.
 ///
 /// `LFM_ARTIFACT_GROUPS_IN_FLIGHT=1` walks the groups one at a time and leaves
-/// the column loops parallel; [`parallel_build`](super::commit::parallel_build)
-/// is the knob that restores the pre-change pass entirely.
+/// the column loops parallel.
 pub fn groups_in_flight() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        // An empty value reads as unset — see `commit::parallel_build`.
+        // An empty value reads as unset: `FOO= cmd` is the shell's way of
+        // clearing a variable.
         match std::env::var("LFM_ARTIFACT_GROUPS_IN_FLIGHT") {
             Ok(v) if v.is_empty() => 4,
             Ok(v) => v
@@ -404,11 +404,14 @@ where
     R: Send,
 {
     #[cfg(feature = "parallel")]
-    if super::commit::parallel_build() {
+    {
         use rayon::prelude::*;
-        return items.par_iter().map(f).collect();
+        items.par_iter().map(f).collect()
     }
-    items.iter().map(f).collect()
+    #[cfg(not(feature = "parallel"))]
+    {
+        items.iter().map(f).collect()
+    }
 }
 
 /// The dispatch label an artifact-prep commit carries into `gpu_lde`'s

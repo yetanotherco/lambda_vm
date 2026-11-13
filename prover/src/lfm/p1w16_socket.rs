@@ -244,13 +244,12 @@ pub fn air(
     .with_preprocessed(root, cols::PREP_WIDTH)
 }
 
-/// Runtime override of the lean upload: 0 = the environment's choice, 1 = off,
-/// 2 = on.
+/// Runtime override of the lean upload: 0 = the default (on), 1 = off, 2 = on.
 static LEAN_UPLOAD_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Force the lean upload on (`Some(true)`), off (`Some(false)`) or back to the
-/// environment's choice (`None`). It changes which bytes cross to the card,
-/// never the trace or the proof.
+/// default (`None`, on): a test's control. It changes which bytes cross to the
+/// card, never the trace or the proof.
 pub fn set_lean_upload(on: Option<bool>) {
     let v = match on {
         None => 0,
@@ -263,20 +262,10 @@ pub fn set_lean_upload(on: Option<bool>) {
 /// Whether the socket's trace crosses to the card lean: the preprocessed prefix
 /// and the sixteen input lanes only, the round witness rebuilt on the card
 /// (`stark::trace::MainDevProducer::poseidon1_w16_rows`) — 29 of the 329 words a
-/// row. On by default; `LAMBDA_VM_LFM_LEAN_UPLOAD=0` uploads the whole row as
-/// before (an A/B knob: the proof bytes do not depend on it).
+/// row. On unless a test turns it off ([`set_lean_upload`]), which uploads
+/// the whole row as before: the proof bytes do not depend on it.
 pub fn lean_upload_enabled() -> bool {
-    match LEAN_UPLOAD_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
-    }
-    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENV.get_or_init(|| {
-        std::env::var("LAMBDA_VM_LFM_LEAN_UPLOAD")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    LEAN_UPLOAD_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 1
 }
 
 /// The device producer for a socket trace of `real_rows` permutation rows
