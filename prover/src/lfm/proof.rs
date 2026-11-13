@@ -349,6 +349,13 @@ impl LfmFilled {
     /// The traces, the published words, the hasher they were filled for, and
     /// the execute and fill seconds with the execute's split: what a prover
     /// other than [`Self::prove`] (the W-LFM one, `wlfm`) consumes.
+    /// The claimed words, for a test that proves a FALSE claim over an
+    /// honest trace (the forger's statement).
+    #[cfg(test)]
+    pub(crate) fn public_words_mut(&mut self) -> &mut Vec<(u32, LfmWord)> {
+        &mut self.public_words
+    }
+
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn into_parts(
         self,

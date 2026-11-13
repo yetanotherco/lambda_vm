@@ -11,9 +11,12 @@ use crate::tables::types::{FE, FEE};
 
 use super::compiler::LfmProgram;
 use super::executor::execute;
-use super::wlfm::{WlfmBuild, WlfmLevers, WlfmPrep, WlfmProof, WlfmRate, test_format};
+use super::wlfm::{
+    WlfmBuild, WlfmLevers, WlfmPrep, WlfmProof, WlfmRate, execute_and_fill_unmerged,
+    prove_wlfm_traces, test_format, verify_wlfm,
+};
 use super::wlfm_leg::{WlfmChild, faults, wlfm_leg_arena, wlfm_leg_program};
-use super::wlfm_tests::{HASHER, build, honest, prove, under};
+use super::wlfm_tests::{HASHER, arenas, build, honest, prove, under};
 use super::word::LfmWord;
 
 fn child_of(build: &WlfmBuild, words: usize) -> WlfmChild {
@@ -188,4 +191,39 @@ fn the_leg_proved_at_blowup_64_under_the_second_steps_levers_verifies() {
         prove_wlfm(&leg, &c2, &[tampered]).is_err(),
         "a tampered child has no execution"
     );
+}
+
+/// ★ The closure is load-bearing: a proof of the honest trace under a FALSE
+/// claimed word (the forger's statement absorbs the false word, so the
+/// transcript is consistent with it) is refused by the host verifier (its
+/// `LfmPublic` balance) and has no execution under the leg; with the leg's
+/// closure assert left out, the same arena executes and republishes the false
+/// word.
+#[test]
+fn the_legs_public_balance_refuses_a_false_word_the_transcript_carries() {
+    let _small = test_format::set(Some(12));
+    let program = honest();
+    let build = build(&program, WlfmRate::Sixteen);
+    let mut filled =
+        execute_and_fill_unmerged(&program, &arenas(), HASHER).expect("the program executes");
+    filled.public_words_mut()[0].1[0] += FE::one();
+    let forged = prove_wlfm_traces(&build, filled, true)
+        .unwrap_or_else(|e| panic!("the forger's prover proves a false claim: {e}"));
+    assert!(
+        verify_wlfm(&build.artifacts, &forged, &forged.public_words).is_err(),
+        "the host refuses the false word"
+    );
+    let child = child_of(&build, forged.public_words.len());
+    let arena = wlfm_leg_arena(&child, &forged).expect("the shapes hold");
+    let leg = wlfm_leg_program(&child).expect("the leg");
+    assert!(
+        runs(&leg, arena.clone()).is_err(),
+        "the leg refuses the false word"
+    );
+    let open = faults::with(faults::Fault::SkipClosure, || wlfm_leg_program(&child))
+        .expect("the leg without its closure");
+    let published = runs(&open, arena).unwrap_or_else(|e| {
+        panic!("without its closure the leg accepts the false word (else the test isolates nothing): {e}")
+    });
+    assert_eq!(published, forged.public_words);
 }
