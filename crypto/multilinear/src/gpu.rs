@@ -4342,6 +4342,16 @@ pub enum TableColumns<'a, F: math::field::traits::IsField> {
 #[cfg(feature = "cuda")]
 type WordsDecode<'a> = dyn Fn(usize, usize) -> Vec<math_cuda::fill::RegRowC> + Sync + 'a;
 
+/// A MEMW_R table going up as words: its words, its whole rows as the card's
+/// struct, the first whole row's run index, and its host decode.
+#[cfg(feature = "cuda")]
+type WordsUp<'a> = (
+    Vec<&'a [u64]>,
+    Vec<&'a [math_cuda::fill::RegRowC]>,
+    u64,
+    Box<WordsDecode<'a>>,
+);
+
 /// A table's records as the card's fill reads them, before they go up: the
 /// fill, and a CPU table's DECODE rows on the card ([`records_input`] borrows
 /// both).
@@ -4361,12 +4371,7 @@ struct RecordsUp<'a> {
     /// Words mode: a MEMW_R table as the walk wrote it
     /// ([`crate::records::Records::register_words`]), its whole rows as the
     /// card's struct, and its host decode.
-    words: Option<(
-        Vec<&'a [u64]>,
-        Vec<&'a [math_cuda::fill::RegRowC]>,
-        u64,
-        Box<WordsDecode<'a>>,
-    )>,
+    words: Option<WordsUp<'a>>,
     aligned: Vec<&'a [math_cuda::fill::AlignedRowC]>,
     loads: Vec<&'a [math_cuda::fill::LoadOpC]>,
     stores: Vec<&'a [math_cuda::fill::StoreOpC]>,

@@ -180,8 +180,17 @@ impl WordState {
 
 /// The IsHalfword lookups of `words` (markers' rows from `whole`, in order).
 pub(crate) fn count_bitwise(words: &[u64], whole: &[RegRow], histogram: &mut BitwiseHistogram) {
-    let mut next = whole.iter();
-    for &w in words {
+    count_bitwise_pieces(&[words], &[whole], histogram);
+}
+
+/// [`count_bitwise`] over pieces in order.
+pub(crate) fn count_bitwise_pieces(
+    words: &[&[u64]],
+    whole: &[&[RegRow]],
+    histogram: &mut BitwiseHistogram,
+) {
+    let mut next = whole.iter().flat_map(|p| p.iter());
+    for &w in words.iter().flat_map(|p| p.iter()) {
         if w as u32 == 0 {
             if let Some(row) = next.next() {
                 memw_register::collect_bitwise_from_memw_register(
