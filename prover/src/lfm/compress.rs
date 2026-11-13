@@ -44,6 +44,7 @@ use super::builder::LfmBuilder;
 use super::compiler::LfmProgram;
 use super::per_table_aggregator::{ChildShape, DerivedChild, declare_leg_arenas, emit_leg};
 use super::whir_block::{WhirBlockPlan, derived_of, finish_program, top_claims};
+use super::wire::WireFormat;
 use super::wlfm::{
     WlfmArtifacts, WlfmBuild, WlfmLevers, WlfmPrep, WlfmProof, WlfmRate, build_wlfm_under,
     prove_wlfm, verify_wlfm,
@@ -139,16 +140,18 @@ pub fn compress_final_setting(value: Option<&str>) -> Result<FinalPoly, String> 
 pub const COMPRESS_WIRE_ENV: &str = "LAMBDA_VM_BLOCK_COMPRESS_WIRE";
 
 /// [`COMPRESS_WIRE_ENV`]'s value: unset, `0` or `off` is the rkyv file (the
-/// default); `1`, `on` or `compact` is the compact file. Anything else is
+/// default); `1`, `on` or `compact` is the compact file; `2` or `dedup` is the
+/// compact file with repeated Merkle siblings sent once. Anything else is
 /// refused.
-pub fn compress_wire_setting(value: Option<&str>) -> Result<bool, String> {
+pub fn compress_wire_setting(value: Option<&str>) -> Result<WireFormat, String> {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
-        None => Ok(false),
+        None => Ok(WireFormat::Rkyv),
         Some(v) => match v.as_str() {
-            "" | "0" | "off" => Ok(false),
-            "1" | "on" | "compact" => Ok(true),
+            "" | "0" | "off" => Ok(WireFormat::Rkyv),
+            "1" | "on" | "compact" => Ok(WireFormat::Compact),
+            "2" | "dedup" => Ok(WireFormat::Dedup),
             other => Err(format!(
-                "{COMPRESS_WIRE_ENV}={other:?}: expected off, 0, 1, on or compact"
+                "{COMPRESS_WIRE_ENV}={other:?}: expected off, 0, 1, on, compact, 2 or dedup"
             )),
         },
     }
@@ -156,9 +159,9 @@ pub fn compress_wire_setting(value: Option<&str>) -> Result<bool, String> {
 
 /// [`compress_wire_setting`] of the process's environment, refused when it is
 /// set with no compression step to ship.
-pub fn compress_wire_from_env(compress: Option<WlfmRate>) -> Result<bool, String> {
+pub fn compress_wire_from_env(compress: Option<WlfmRate>) -> Result<WireFormat, String> {
     let compact = compress_wire_setting(std::env::var(COMPRESS_WIRE_ENV).ok().as_deref())?;
-    if compress.is_none() && compact {
+    if compress.is_none() && compact != WireFormat::Rkyv {
         return Err(format!(
             "{COMPRESS_WIRE_ENV} encodes C1's file, and {COMPRESS_ENV} adds no C1"
         ));
@@ -447,14 +450,17 @@ mod tests {
     /// The compact-file knob is off unless set and refuses nonsense.
     #[test]
     fn the_compress_wire_knob_is_off_unless_set_and_refuses_nonsense() {
-        assert_eq!(compress_wire_setting(None), Ok(false));
+        assert_eq!(compress_wire_setting(None), Ok(WireFormat::Rkyv));
         for off in ["", "0", "off", " OFF "] {
-            assert_eq!(compress_wire_setting(Some(off)), Ok(false));
+            assert_eq!(compress_wire_setting(Some(off)), Ok(WireFormat::Rkyv));
         }
         for on in ["1", "on", "compact", " Compact "] {
-            assert_eq!(compress_wire_setting(Some(on)), Ok(true));
+            assert_eq!(compress_wire_setting(Some(on)), Ok(WireFormat::Compact));
         }
-        for bad in ["2", "rkyv", "yes"] {
+        for on in ["2", "dedup", " DEDUP "] {
+            assert_eq!(compress_wire_setting(Some(on)), Ok(WireFormat::Dedup));
+        }
+        for bad in ["3", "rkyv", "yes"] {
             assert!(compress_wire_setting(Some(bad)).is_err(), "{bad:?}");
         }
     }

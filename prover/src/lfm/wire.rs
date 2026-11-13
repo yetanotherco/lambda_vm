@@ -33,15 +33,66 @@ use crate::tables::types::{FE, FEE, GoldilocksExtension as E, GoldilocksField as
 /// The Goldilocks modulus: a base element's canonical value is below it.
 const GOLDILOCKS: u64 = 0xFFFF_FFFF_0000_0001;
 
-/// A cursor over encoded bytes.
+/// Which encoding a compressed file's C1 proof is written in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WireFormat {
+    /// The rkyv archive (today's file).
+    Rkyv,
+    /// [`encode`]: varints and canonical values, no framing.
+    Compact,
+    /// [`encode_dedup`]: [`Compact`](Self::Compact) with every Merkle sibling
+    /// already sent replaced by a reference to it, so the nodes many paths
+    /// share travel once.
+    Dedup,
+}
+
+/// The bytes being written, and under [`WireFormat::Dedup`] every Merkle
+/// sibling written so far with its index.
+pub struct Out {
+    bytes: Vec<u8>,
+    seen: Option<std::collections::BTreeMap<Commitment, u64>>,
+}
+
+impl Out {
+    fn new(dedup: bool) -> Self {
+        Self {
+            bytes: Vec::new(),
+            seen: dedup.then(std::collections::BTreeMap::new),
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.bytes.push(byte);
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+}
+
+/// A cursor over encoded bytes, and under [`WireFormat::Dedup`] every Merkle
+/// sibling read so far.
 pub struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
+    table: Option<Vec<Commitment>>,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self {
+            bytes,
+            at: 0,
+            table: None,
+        }
+    }
+
+    fn dedup(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            table: Some(Vec::new()),
+        }
     }
 
     fn left(&self) -> usize {
@@ -71,12 +122,12 @@ impl<'a> Reader<'a> {
 
 /// A value with one compact encoding.
 pub trait Wire: Sized {
-    fn put(&self, out: &mut Vec<u8>);
+    fn put(&self, out: &mut Out);
     fn get(r: &mut Reader<'_>) -> Result<Self, String>;
 }
 
 /// LEB128, at most ten bytes, the shortest form only.
-fn put_varint(mut v: u64, out: &mut Vec<u8>) {
+fn put_varint(mut v: u64, out: &mut Out) {
     loop {
         let byte = (v & 0x7f) as u8;
         v >>= 7;
@@ -108,7 +159,7 @@ fn get_varint(r: &mut Reader<'_>) -> Result<u64, String> {
 }
 
 impl Wire for u64 {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Out) {
         put_varint(*self, out);
     }
     fn get(r: &mut Reader<'_>) -> Result<Self, String> {
@@ -117,7 +168,7 @@ impl Wire for u64 {
 }
 
 impl Wire for u32 {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Out) {
         put_varint(u64::from(*self), out);
     }
     fn get(r: &mut Reader<'_>) -> Result<Self, String> {
@@ -126,7 +177,7 @@ impl Wire for u32 {
 }
 
 impl Wire for Commitment {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Out) {
         out.extend_from_slice(self);
     }
     fn get(r: &mut Reader<'_>) -> Result<Self, String> {
@@ -137,7 +188,7 @@ impl Wire for Commitment {
 }
 
 impl Wire for FE {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Out) {
         use math::field::traits::IsPrimeField;
         out.extend_from_slice(&F::canonical(self.value()).to_le_bytes());
     }
@@ -153,7 +204,7 @@ impl Wire for FE {
 }
 
 impl Wire for FEE {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Out) {
         for c in self.value() {
             c.put(out);
         }
@@ -168,7 +219,7 @@ impl Wire for FEE {
 }
 
 impl<A: Wire, B: Wire> Wire for (A, B) {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Out) {
         self.0.put(out);
         self.1.put(out);
     }
@@ -178,7 +229,7 @@ impl<A: Wire, B: Wire> Wire for (A, B) {
 }
 
 impl<T: Wire, const N: usize> Wire for [T; N] {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Out) {
         for x in self {
             x.put(out);
         }
@@ -192,7 +243,7 @@ impl<T: Wire, const N: usize> Wire for [T; N] {
 }
 
 impl<T: Wire> Wire for Vec<T> {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Out) {
         put_varint(self.len() as u64, out);
         for x in self {
             x.put(out);
@@ -210,7 +261,7 @@ impl<T: Wire> Wire for Vec<T> {
 }
 
 impl<T: Wire> Wire for Option<T> {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Out) {
         match self {
             None => out.push(0),
             Some(x) => {
@@ -232,7 +283,7 @@ impl<T: Wire> Wire for Option<T> {
 macro_rules! wire_struct {
     ($ty:ty { $($field:ident),+ $(,)? }) => {
         impl Wire for $ty {
-            fn put(&self, out: &mut Vec<u8>) {
+            fn put(&self, out: &mut Out) {
                 $(self.$field.put(out);)+
             }
             fn get(r: &mut Reader<'_>) -> Result<Self, String> {
@@ -275,19 +326,67 @@ wire_struct!(WlfmProof {
     public_words
 });
 
+/// A Merkle path. Under [`WireFormat::Dedup`] each sibling is a varint: 0 and
+/// its 32 bytes for a digest not sent before, `i ≥ 1` for the `i`-th distinct
+/// sibling sent so far. A sibling is referenced whenever it was sent before —
+/// so the decoder refuses a "new" one it already holds, and a proof keeps one
+/// encoding.
 impl Wire for crypto::merkle_tree::proof::Proof<Commitment> {
-    fn put(&self, out: &mut Vec<u8>) {
-        self.merkle_path.put(out);
+    fn put(&self, out: &mut Out) {
+        if out.seen.is_none() {
+            self.merkle_path.put(out);
+            return;
+        }
+        put_varint(self.merkle_path.len() as u64, out);
+        for d in &self.merkle_path {
+            let seen = out.seen.as_mut().expect("dedup");
+            match seen.get(d) {
+                Some(&i) => put_varint(i + 1, out),
+                None => {
+                    let i = seen.len() as u64;
+                    seen.insert(*d, i);
+                    out.push(0);
+                    out.extend_from_slice(d);
+                }
+            }
+        }
     }
     fn get(r: &mut Reader<'_>) -> Result<Self, String> {
-        Ok(Self {
-            merkle_path: Wire::get(r)?,
-        })
+        if r.table.is_none() {
+            return Ok(Self {
+                merkle_path: Wire::get(r)?,
+            });
+        }
+        let n = usize::try_from(get_varint(r)?).map_err(|_| "a length out of range")?;
+        if n > r.left() {
+            return Err(format!("{n} siblings in {} bytes", r.left()));
+        }
+        let mut merkle_path = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t = get_varint(r)?;
+            let d = if t == 0 {
+                let d = Commitment::get(r)?;
+                let table = r.table.as_mut().expect("dedup");
+                if table.contains(&d) {
+                    return Err("a sibling sent twice".into());
+                }
+                table.push(d);
+                d
+            } else {
+                let table = r.table.as_ref().expect("dedup");
+                *usize::try_from(t - 1)
+                    .ok()
+                    .and_then(|i| table.get(i))
+                    .ok_or_else(|| format!("a reference to sibling {t} of {}", table.len()))?
+            };
+            merkle_path.push(d);
+        }
+        Ok(Self { merkle_path })
     }
 }
 
 impl Wire for RoundOpenings<F, E> {
-    fn put(&self, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Out) {
         match self {
             RoundOpenings::Base(p) => {
                 out.push(0);
@@ -320,9 +419,9 @@ impl Wire for RoundOpenings<F, E> {
 
 /// `proof`'s compact bytes.
 pub fn encode(proof: &WlfmProof) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Out::new(false);
     proof.put(&mut out);
-    out
+    out.bytes
 }
 
 /// The proof `bytes` encode, refused unless they are exactly one proof's
@@ -332,6 +431,32 @@ pub fn decode(bytes: &[u8]) -> Result<WlfmProof, String> {
     let proof = WlfmProof::get(&mut r)?;
     r.finish()?;
     Ok(proof)
+}
+
+/// `proof`'s compact bytes with every repeated Merkle sibling referenced
+/// ([`WireFormat::Dedup`]).
+pub fn encode_dedup(proof: &WlfmProof) -> Vec<u8> {
+    let mut out = Out::new(true);
+    proof.put(&mut out);
+    out.bytes
+}
+
+/// [`decode`] for [`encode_dedup`]'s bytes.
+pub fn decode_dedup(bytes: &[u8]) -> Result<WlfmProof, String> {
+    let mut r = Reader::dedup(bytes);
+    let proof = WlfmProof::get(&mut r)?;
+    r.finish()?;
+    Ok(proof)
+}
+
+/// `proof` in `wire`'s encoding (`None` for [`WireFormat::Rkyv`], which the
+/// file writes itself).
+pub fn encode_as(proof: &WlfmProof, wire: WireFormat) -> Option<Vec<u8>> {
+    match wire {
+        WireFormat::Rkyv => None,
+        WireFormat::Compact => Some(encode(proof)),
+        WireFormat::Dedup => Some(encode_dedup(proof)),
+    }
 }
 
 #[cfg(test)]
@@ -346,9 +471,9 @@ mod tests {
     }
 
     fn put<T: Wire>(v: &T) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Out::new(false);
         v.put(&mut out);
-        out
+        out.bytes
     }
 
     /// Varints round-trip at the edges, and an overlong, a too-long or a
@@ -390,9 +515,9 @@ mod tests {
     fn containers_refuse_lies_unknown_tags_and_trailing_bytes() {
         let v: Vec<FE> = vec![FE::from(5u64); 3];
         assert_eq!(get::<Vec<FE>>(&put(&v)), Ok(v.clone()));
-        let mut huge = Vec::new();
+        let mut huge = Out::new(false);
         put_varint(u64::MAX >> 1, &mut huge);
-        assert!(get::<Vec<FE>>(&huge).is_err());
+        assert!(get::<Vec<FE>>(&huge.bytes).is_err());
         assert!(get::<Option<FE>>(&[2]).is_err());
         assert!(get::<RoundOpenings<F, E>>(&[4]).is_err());
         let mut trailing = put(&v);
@@ -400,5 +525,47 @@ mod tests {
         assert!(get::<Vec<FE>>(&trailing).is_err());
         let truncated = &put(&v)[..10];
         assert!(get::<Vec<FE>>(truncated).is_err());
+    }
+
+    fn path(ds: &[u8]) -> crypto::merkle_tree::proof::Proof<Commitment> {
+        crypto::merkle_tree::proof::Proof {
+            merkle_path: ds.iter().map(|&b| [b; 32]).collect(),
+        }
+    }
+
+    /// Dedup paths: a repeated sibling is one byte, the paths decode back,
+    /// and a "new" sibling the table holds, a reference past the table and a
+    /// zero-length lie are refused.
+    #[test]
+    fn dedup_paths_reference_repeats_and_refuse_lies() {
+        let paths = vec![path(&[1, 2, 3]), path(&[4, 2, 3]), path(&[1, 5, 3])];
+        let mut out = Out::new(true);
+        paths.put(&mut out);
+        let plain = put(&paths);
+        assert!(
+            out.bytes.len() < plain.len(),
+            "{} vs {}",
+            out.bytes.len(),
+            plain.len()
+        );
+        // 1 (count) + per path 1 (len) + 5 new × 33 + 4 refs × 1.
+        assert_eq!(out.bytes.len(), 1 + 3 + 5 * 33 + 4);
+        let mut r = Reader::dedup(&out.bytes);
+        let back = Vec::<crypto::merkle_tree::proof::Proof<Commitment>>::get(&mut r).unwrap();
+        r.finish().unwrap();
+        let flat = |v: &[crypto::merkle_tree::proof::Proof<Commitment>]| {
+            v.iter().map(|p| p.merkle_path.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(flat(&back), flat(&paths));
+        // A sibling sent new twice.
+        let mut twice = vec![1u8, 2, 0];
+        twice.extend_from_slice(&[7u8; 32]);
+        twice.push(0);
+        twice.extend_from_slice(&[7u8; 32]);
+        let mut r = Reader::dedup(&twice);
+        assert!(Vec::<crypto::merkle_tree::proof::Proof<Commitment>>::get(&mut r).is_err());
+        // A reference past the table.
+        let mut r = Reader::dedup(&[1, 1, 1]);
+        assert!(Vec::<crypto::merkle_tree::proof::Proof<Commitment>>::get(&mut r).is_err());
     }
 }
