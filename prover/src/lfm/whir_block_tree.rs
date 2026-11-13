@@ -197,13 +197,16 @@ pub struct WhirTreeConfig {
     /// phase B finished while another group was still to come executes and
     /// fills right then, or (0, the control) with the others after the base.
     pub early_on: bool,
-    /// `W3_EARLY_LEAVES=<n>` (default 1): with the early leaf on and the leaves
-    /// offered to phase B (`W3_LEAF_FIRST`), phase B leads with the groups of
-    /// up to `n` leaves, one leaf after another ([`block_whir::PhaseBLead::leading`]),
-    /// and each of them that completes while a group is still to come executes
-    /// and fills right then, on a thread of its own, host only; the tree takes
-    /// them first, in the order they completed. 1 is today's single early leaf.
-    /// Prover-only: the bytes are the same.
+    /// `W3_EARLY_LEAVES=<n>` (default [`EARLY_LEAVES_DEFAULT`], every leaf
+    /// that can): with the early leaf on and the leaves offered to phase B
+    /// (`W3_LEAF_FIRST`), phase B leads with the groups of up to `n` leaves, one
+    /// leaf after another ([`block_whir::PhaseBLead::leading`]), and each of
+    /// them that completes while a group is still to come, and whose execute +
+    /// fill is predicted to end before the base ([`early_leaf_fits`]), executes
+    /// and fills right then, on a thread of its own, host only. The tree starts
+    /// its own leaves' execute first ([`early_leaves_order`]). 1 is the single
+    /// early leaf this replaced (the control). Prover-only: the bytes are the
+    /// same.
     pub early_leaves: usize,
     /// `W3_LEAF_EMITTERS` ([`LEAF_EMITTERS`] by default): how many of the
     /// leaves' programs are emitted at once beside phase B, in leaf order,
@@ -249,11 +252,17 @@ pub struct WhirTreeConfig {
     pub leaf_first: bool,
 }
 
-/// `W3_EARLY_LEAVES`: unset is 1 (today's single early leaf); 0 is refused,
-/// since `W3_LEAF_DURING_PHASE_B=0` is the knob that turns early leaves off.
+/// `W3_EARLY_LEAVES` unset: every leaf that can lead and fits goes early
+/// (measured on a 9950X with a 5090: whole block −0.40 s on a median block,
+/// −0.76 s on a large one, against a single early leaf).
+pub const EARLY_LEAVES_DEFAULT: usize = usize::MAX;
+
+/// `W3_EARLY_LEAVES`: unset is [`EARLY_LEAVES_DEFAULT`]; 1 is the single early
+/// leaf (the control); 0 is refused, since `W3_LEAF_DURING_PHASE_B=0` is the
+/// knob that turns early leaves off.
 fn early_leaves_setting(knob: Option<usize>) -> Result<usize, String> {
     match knob {
-        None => Ok(1),
+        None => Ok(EARLY_LEAVES_DEFAULT),
         Some(0) => Err(
             "W3_EARLY_LEAVES=0: a count of at least 1 (W3_LEAF_DURING_PHASE_B=0 turns the early \
              leaf off)"
@@ -3196,7 +3205,8 @@ mod tests {
             early_leaf_first(base.clone(), Some(2)),
             "one early leaf is the single case"
         );
-        assert_eq!(early_leaves_setting(None), Ok(1));
+        assert_eq!(early_leaves_setting(None), Ok(EARLY_LEAVES_DEFAULT));
+        assert_eq!(early_leaves_setting(Some(1)), Ok(1), "the control");
         assert_eq!(early_leaves_setting(Some(3)), Ok(3));
         assert!(early_leaves_setting(Some(0)).is_err());
     }
@@ -3516,7 +3526,7 @@ mod tests {
             leaves_each: false,
             program_budget: super::super::program_budget::BudgetSetting::Auto,
             early_on: true,
-            early_leaves: 1,
+            early_leaves: EARLY_LEAVES_DEFAULT,
             leaf_emitters: Some(LEAF_EMITTERS),
             argue: BlockFormat::production().argue,
             format: BlockFormat::production(),
