@@ -86,41 +86,46 @@ pub(crate) fn production_regen_from(regen: Option<&str>) -> Option<RegenMode> {
     }
 }
 
-/// `LAMBDA_VM_BLOCK_SPILL`, the knob of the block's disk store, which is gone:
-/// set, it refuses the prove. It used to switch regeneration off when
-/// `LAMBDA_VM_BLOCK_REGEN` was unset, so a run that sets it asked for an arm
-/// that no longer exists; `LAMBDA_VM_BLOCK_REGEN=off` holds every table.
-pub(crate) fn refuse_spill_knob(value: Option<&str>) -> Result<(), Error> {
-    match value {
-        None => Ok(()),
-        Some(v) => Err(Error::Prover(format!(
+/// The words of the block's removed disk store, each refusing the prove when
+/// set in `env`, whatever its value, so a run that still sets one fails
+/// instead of running without what it asked for:
+/// - `LAMBDA_VM_BLOCK_SPILL` used to switch regeneration off when
+///   `LAMBDA_VM_BLOCK_REGEN` was unset; `LAMBDA_VM_BLOCK_REGEN=off` holds every
+///   table.
+/// - `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB` is the memory target's old name;
+///   `LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB` sets the target
+///   ([`super::memory_target_bytes`]).
+pub(crate) fn refuse_removed_spill_words(
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(), Error> {
+    if let Some(v) = env("LAMBDA_VM_BLOCK_SPILL") {
+        return Err(Error::Prover(format!(
             "LAMBDA_VM_BLOCK_SPILL={} is no longer read: the block has no disk store; unset it \
              (LAMBDA_VM_BLOCK_REGEN=off holds every table in memory)",
             v.trim()
-        ))),
+        )));
     }
+    if let Some(v) = env("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB") {
+        return Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_SPILL_TARGET_GIB={} is no longer read: the memory target is \
+             LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB; set that instead",
+            v.trim()
+        )));
+    }
+    Ok(())
 }
 
-/// The `BLOCK REGEN mode` line: the mode a prove runs, the knobs it reads at
-/// its start as set (`LAMBDA_VM_BLOCK_SPILL` only to refuse it,
-/// [`refuse_spill_knob`]; the production default is `auto` when
-/// `LAMBDA_VM_BLOCK_REGEN` is unset), and `no disk` when live regeneration
-/// runs. The line is what it was while the block had a disk store, so the
-/// read-outs that parse it read it as before.
-pub(crate) fn regen_mode_line(
-    mode: RegenMode,
-    live: bool,
-    regen: Option<&str>,
-    spill: Option<&str>,
-) -> String {
+/// The `BLOCK REGEN mode` line: the mode a prove runs, its knob as set (the
+/// production default is `auto` when `LAMBDA_VM_BLOCK_REGEN` is unset), and
+/// `no disk` when live regeneration runs.
+pub(crate) fn regen_mode_line(mode: RegenMode, live: bool, regen: Option<&str>) -> String {
     let knob = |name: &str, value: Option<&str>| match value {
         Some(v) => format!("{name}={}", v.trim()),
         None => format!("{name} unset"),
     };
     format!(
-        "BLOCK REGEN mode: {mode:?} · {} · {}{}",
+        "BLOCK REGEN mode: {mode:?} · {}{}",
         knob("LAMBDA_VM_BLOCK_REGEN", regen),
-        knob("LAMBDA_VM_BLOCK_SPILL", spill),
         if live { " · no disk" } else { "" }
     )
 }
@@ -2983,26 +2988,37 @@ mod tests {
         assert_eq!(parse_regen_mode(None).unwrap(), RegenMode::Off);
         assert!(parse_regen_mode(Some("bogus")).is_err());
         assert_eq!(
-            regen_mode_line(RegenMode::Auto, true, None, None),
-            "BLOCK REGEN mode: Auto · LAMBDA_VM_BLOCK_REGEN unset · LAMBDA_VM_BLOCK_SPILL unset \
-             · no disk"
+            regen_mode_line(RegenMode::Auto, true, None),
+            "BLOCK REGEN mode: Auto · LAMBDA_VM_BLOCK_REGEN unset · no disk"
         );
         assert_eq!(
-            regen_mode_line(RegenMode::Off, false, Some(" off "), None),
-            "BLOCK REGEN mode: Off · LAMBDA_VM_BLOCK_REGEN=off · LAMBDA_VM_BLOCK_SPILL unset"
+            regen_mode_line(RegenMode::Off, false, Some(" off ")),
+            "BLOCK REGEN mode: Off · LAMBDA_VM_BLOCK_REGEN=off"
         );
     }
 
-    /// The disk store's knob refuses the prove when it is set, whatever its
-    /// value, and names the arm that replaces its `off`; unset, nothing.
+    /// The disk store's two words refuse the prove when set, whatever their
+    /// value, each naming what replaces it; unset (or another word), nothing.
     #[test]
-    fn the_disk_stores_knob_refuses_the_prove_when_set() {
-        assert!(refuse_spill_knob(None).is_ok());
-        for value in ["off", "auto", "always", "2.5", ""] {
-            let Err(Error::Prover(why)) = refuse_spill_knob(Some(value)) else {
+    fn the_disk_stores_words_refuse_the_prove_when_set() {
+        let one = |name: &'static str, value: &'static str| {
+            move |n: &str| (n == name).then(|| value.to_string())
+        };
+        assert!(refuse_removed_spill_words(|_| None).is_ok());
+        assert!(refuse_removed_spill_words(one("LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB", "54")).is_ok());
+        for value in ["off", "auto", "always", "2.5", "", "0"] {
+            let Err(Error::Prover(why)) =
+                refuse_removed_spill_words(one("LAMBDA_VM_BLOCK_SPILL", value))
+            else {
                 panic!("LAMBDA_VM_BLOCK_SPILL={value} must refuse the prove");
             };
             assert!(why.contains("LAMBDA_VM_BLOCK_REGEN=off"), "{why}");
+            let Err(Error::Prover(why)) =
+                refuse_removed_spill_words(one("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB", value))
+            else {
+                panic!("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB={value} must refuse the prove");
+            };
+            assert!(why.contains("LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB"), "{why}");
         }
     }
 
