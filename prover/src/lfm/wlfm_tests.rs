@@ -957,3 +957,106 @@ fn the_dedup_encoding_round_trips_every_wlfm_proof() {
         }
     }
 }
+
+// =============================================================================
+// Probe: the verifier's host prepared commit, by step
+// =============================================================================
+
+/// ⛔ A MEASUREMENT (ignored; laptop or box): the host prepared commit a C2
+/// verifier pays for C1 — `commit_groups_on_host` at blowup 16 over C1's
+/// prepared columns at C1's table heights (median and large, from the box's
+/// `C1 ROWS` lines), synthetic values (the cost does not read them) — whole,
+/// then split on one stacked polynomial of the same height into the lift
+/// (Möbius + bit-reversed gather), the encode (host NTT + bit-reverse) and the
+/// tree (leaf gather + Poseidon1 + nodes). Prints `PREP COMMIT` lines.
+#[test]
+#[ignore = "a measurement of the verifier's host prepared commit"]
+fn probe_the_host_prepared_commit_by_step() {
+    use crate::block_whir::{PreparedColumns, commit_groups_on_host, group_stacks};
+    use multilinear::whir::{Domain, encode, lift_coefficients};
+    use multilinear::whir_chain::LeafOrder;
+    use multilinear::whir_commit::CodewordCommitment;
+    use std::time::Instant;
+    let program = honest();
+    let fixture = build(&program, WlfmRate::Sixteen);
+    let counts = fixture.artifacts.counts.clone();
+    let config = fixture.artifacts.config;
+    assert_eq!(counts.len(), 10, "the WHIR recursion chip set's ten tables");
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        FE::from(seed >> 1)
+    };
+    println!(
+        "PREP COMMIT: rayon threads {} · counts {counts:?} · blowup {} · first fold {:?} · leaves {:?}",
+        rayon::current_num_threads(),
+        1usize << config.log_blowup,
+        config.schedule(24).first(),
+        config.format.leaves
+    );
+    for (name, heights) in [
+        ("median", [11u32, 17, 19, 18, 11, 16, 17, 19, 2, 16]),
+        ("large", [11u32, 17, 20, 18, 11, 16, 17, 19, 2, 16]),
+    ] {
+        let prepared: Vec<PreparedColumns> = counts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c > 0)
+            .map(|(t, &c)| {
+                let rows = 1usize << heights[t];
+                (
+                    t,
+                    (0..c)
+                        .map(|_| (0..rows).map(|_| next()).collect())
+                        .collect(),
+                )
+            })
+            .collect();
+        let cells: usize = prepared
+            .iter()
+            .map(|(_, cols)| cols.iter().map(Vec::len).sum::<usize>())
+            .sum();
+        let groups = vec![(0..10u32).collect::<Vec<u32>>()];
+        let t = Instant::now();
+        let stacks = group_stacks(prepared, &groups).expect("the stacks");
+        let stacked = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let committed = commit_groups_on_host::<WlfmHash>(stacks, &config).expect("the commit");
+        let whole = t.elapsed().as_secs_f64();
+        let layout = committed[0].commitment.layout().clone();
+        let (n, polys) = (layout.n_stack(), layout.num_polys());
+        drop(committed);
+        println!(
+            "PREP COMMIT {name}: prepared cells {cells} (2^{:.3}) · stacks {polys}x2^{n} · group_stacks {stacked:.3}s · commit_groups_on_host {whole:.3}s",
+            (cells as f64).log2()
+        );
+        // The split, on one stacked polynomial of the same height.
+        let values: Vec<FieldElement<F>> = (0..1usize << n).map(|_| next()).collect();
+        let mle = Mle::new(values).expect("an MLE");
+        let t = Instant::now();
+        let lifted = lift_coefficients(&mle);
+        let lift = t.elapsed().as_secs_f64();
+        drop(mle);
+        let domain = Domain::<F>::new(n + config.log_blowup).expect("the domain");
+        let t = Instant::now();
+        let codeword = encode::<F, F>(&lifted, &domain).expect("the encode");
+        let enc = t.elapsed().as_secs_f64();
+        drop(lifted);
+        let first = config.schedule(n).first().copied().unwrap_or(0);
+        let t = Instant::now();
+        let tree = CodewordCommitment::<F, WlfmHash>::from_codeword_on_host_in(
+            codeword,
+            first,
+            LeafOrder::Coset,
+        )
+        .expect("the tree");
+        let hashed = t.elapsed().as_secs_f64();
+        drop(tree);
+        println!(
+            "PREP COMMIT {name} SPLIT (one 2^{n} polynomial, {polys} in the stack): lift {lift:.3}s · encode {enc:.3}s · tree {hashed:.3}s · sum {:.3}s",
+            lift + enc + hashed
+        );
+    }
+}
