@@ -643,6 +643,14 @@ pub struct BlockOptions {
     pub phase_b_overlap: multilinear_block::PhaseBOverlap,
 }
 
+/// Stacked-polynomial commits that fell back to the host this process
+/// (`multilinear::gpu::host_fallbacks`): a round-0 tree the card declined
+/// (a joint run's or a polynomial's) is counted here. On a build without a
+/// card every commit is counted.
+pub fn host_commit_fallbacks() -> u64 {
+    multilinear::gpu::host_fallbacks()
+}
+
 /// The host's memory target, against which live regeneration's `auto` rule
 /// arms ([`drop_wanted`]): `LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB` (read under its
 /// old name, `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB`, while the new one is unset),
