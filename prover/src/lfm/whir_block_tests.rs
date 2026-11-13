@@ -3319,6 +3319,102 @@ fn the_whir_block_tree_on_a_real_block() {
         );
         honest.unwrap_or_else(|e| panic!("the compressed block must verify: {e}"));
         assert!(refused && refused_words, "a tampered C1 proof is refused");
+        // Under `LAMBDA_VM_BLOCK_COMPRESS2`: C2's proof verified as the
+        // twice-compressed block's verifier does (C1 and C2 derived for this
+        // run's plan), a tampered one refused, its files both ways, and the
+        // shipped file through the file-level verifier from the ELF.
+        if let Some(c2) = &c1.c2 {
+            use super::compress::compressed2_artifacts;
+            use super::whir_block_tree::{Compressed2Format, verify_whir_block_compressed2_as};
+            use super::wire::WireFormat;
+            let t = std::time::Instant::now();
+            let artifacts2 =
+                compressed2_artifacts(plan, &wrap, c2.grind).expect("C2's artifacts derive");
+            let derive2 = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let honest2 = verify_compressed_against(plan, &artifacts2, &c2.proof);
+            let check2 = t.elapsed().as_secs_f64();
+            let mut tampered = c2.proof.clone();
+            tampered.commit_ood[0] += FEE::one();
+            let refused2 = verify_compressed_against(plan, &artifacts2, &tampered).is_err();
+            let mut reworded = c2.proof.clone();
+            reworded.public_words[0].1[0] += FE::from(1u64);
+            let refused2_words = verify_compressed_against(plan, &artifacts2, &reworded).is_err();
+            let file2 =
+                WhirBlockCompressedProof::for_c2(run.statement.clone(), c2.proof.clone(), c2.grind)
+                    .expect("a built grind");
+            let rkyv2 = file2.to_bytes().expect("the C2 file").len();
+            let mut sizes = Vec::new();
+            let mut decoded_all = true;
+            for wire in [WireFormat::Compact, WireFormat::Dedup] {
+                let bytes = file2.to_wire_bytes(wire).expect("the C2 wire file");
+                let back =
+                    WhirBlockCompressedProof::from_compact_bytes(&bytes).expect("reads back");
+                let same = super::wire::encode(&back.compressed) == super::wire::encode(&c2.proof);
+                let ok = verify_compressed_against(plan, &artifacts2, &back.compressed).is_ok();
+                decoded_all &= same && ok;
+                sizes.push((bytes.len(), back.pipeline()));
+            }
+            println!(
+                "W3 COMPRESS2 WIRE: rkyv file {rkyv2} B tag {} · compact file {} B tag {} · dedup file {} B tag {} · decoded verifies and same proof {decoded_all}",
+                file2.pipeline(),
+                sizes[0].0,
+                sizes[0].1,
+                sizes[1].0,
+                sizes[1].1
+            );
+            assert!(decoded_all, "the C2 wire files carry the proof");
+            let format2 = Compressed2Format {
+                grind: c2.grind,
+                wire: c1.wire,
+            };
+            let shipped = file2.to_wire_bytes(c1.wire).expect("the shipped C2 file");
+            let t = std::time::Instant::now();
+            let read = match c1.wire {
+                WireFormat::Rkyv => WhirBlockCompressedProof::from_bytes(&shipped),
+                _ => WhirBlockCompressedProof::from_compact_bytes(&shipped),
+            }
+            .expect("the shipped C2 file reads back");
+            let file_ok = verify_whir_block_compressed2_as(&elf, &read, format2);
+            let file_secs = t.elapsed().as_secs_f64();
+            println!(
+                "W3 COMPRESS2 VERIFY: {} (C1 + C2 derived in {derive2:.2}s, checked in {check2:.3}s) · tampered answer refused {refused2} · tampered word refused {refused2_words} · file verifier {} in {file_secs:.2}s",
+                if honest2.is_ok() {
+                    "ACCEPTED"
+                } else {
+                    "REJECTED"
+                },
+                if file_ok.is_ok() {
+                    "ACCEPTED"
+                } else {
+                    "REJECTED"
+                }
+            );
+            let c2_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&c2.proof)
+                .expect("serialize C2")
+                .len();
+            println!(
+                "W3 COMPRESS2 BYTES: shipped file {} B compressed vs {top_file} B top ({:.3}×) · C2 proof {c2_bytes} B · blowup {} · Q {} · grind {} · binding {:?} · prepared openings {} · final {:?} · fold {} · tag {} · wire {}",
+                shipped.len(),
+                shipped.len() as f64 / top_file as f64,
+                artifacts2.rate.factor(),
+                artifacts2.config.num_queries,
+                c2.grind,
+                artifacts2.prep,
+                c2.proof.prepared.len(),
+                artifacts2.final_poly,
+                artifacts2.config.log_folding,
+                format2.tag().unwrap_or(0),
+                match c1.wire {
+                    WireFormat::Rkyv => "rkyv",
+                    WireFormat::Compact => "compact",
+                    WireFormat::Dedup => "dedup",
+                }
+            );
+            honest2.unwrap_or_else(|e| panic!("the twice-compressed block must verify: {e}"));
+            file_ok.unwrap_or_else(|e| panic!("the shipped C2 file must verify: {e}"));
+            assert!(refused2 && refused2_words, "a tampered C2 proof is refused");
+        }
     }
     // Off the clock: the top's rows and padded heights by chip, emitted again
     // from its children's shapes, and its LANES rows against 2^19 — the chips a
@@ -4665,6 +4761,167 @@ fn the_folds_compressed_block_verifies_and_refuses_tampering() {
     compressed_block_case(super::compress::folds_levers(
         super::wlfm::WlfmPrep::Stacked,
     ));
+}
+
+/// ★ C2 over C1 over a small block's top (`LAMBDA_VM_BLOCK_COMPRESS2`) at a
+/// 22-bit query grind: C2 executes over C1's honest proof and republishes the
+/// top's words; it verifies against the plan with the verifier's own C1 and
+/// C2 (the verifier's C2 is the prover's); its wire encodings decode to the
+/// same proof; it is refused with a tampered answer or word, under the other
+/// grind and under another block; and C2 does not execute over a tampered C1
+/// proof (an answer, a word, the main or the prepared opening).
+#[test]
+#[ignore = "proves a small block's tree, C1 and C2; box tier"]
+fn the_twice_compressed_block_verifies_and_refuses_tampering() {
+    compressed2_block_case(22);
+}
+
+/// ★ The same at a 26-bit query grind.
+#[test]
+#[ignore = "proves a small block's tree, C1 and C2; box tier"]
+fn the_twice_compressed_block_at_grind_26_verifies_and_refuses_tampering() {
+    compressed2_block_case(26);
+}
+
+fn compressed2_block_case(grind: u8) {
+    use super::compress::{
+        COMPRESS2_GRINDS, build_compress, build_compress2, compressed2_artifacts, prove_compress,
+        prove_compress2, top_child, verify_compressed_against, verify_compressed2,
+    };
+    use super::wlfm::{WlfmLevers, WlfmRate};
+    let _permit = super::device_permit::serial_for_test();
+    let format = small_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let wrap = aggregation_wrap_options();
+    let plan = plan_of(&elf, &proof, &format, Some(2));
+    let (top, _) = compose(&plan, &proof, "C2").expect("the honest tree proves");
+    let top_artifacts = plan.derive_top(&wrap).expect("the top derives");
+    let child = top_child(&plan, &top_artifacts, &wrap).expect("the top's shape");
+    let c = build_compress(
+        &child,
+        plan.top_layout(),
+        WlfmRate::Sixteen,
+        WlfmLevers::DEFAULT,
+    )
+    .expect("C1 builds");
+    let harvested = super::harvest::harvest_child_under::<BlockFamily>(
+        top_artifacts.clone(),
+        wrap.clone(),
+        &top,
+    )
+    .expect("the top harvests");
+    let arena = super::harvest::try_child_arena_words(&harvested).expect("the top's arena");
+    let c1 = prove_compress(&c, &arena).expect("C1 proves over the honest top");
+    let layout = plan.top_layout();
+    let tb = std::time::Instant::now();
+    let c2b = build_compress2(&c.build.artifacts, layout, grind).expect("C2 builds");
+    let build_secs = tb.elapsed().as_secs_f64();
+    let a2 = &c2b.build.artifacts;
+    assert_eq!(a2.config.log_blowup, 6);
+    assert_eq!(a2.config.grind.query, grind);
+    let t = std::time::Instant::now();
+    let c2 = prove_compress2(&c2b, &c.build.artifacts, layout, &c1).expect("C2 proves over C1");
+    let prove_secs = t.elapsed().as_secs_f64();
+    let size = |p: &super::wlfm::WlfmProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serializes")
+            .len()
+    };
+    let compact = super::wire::encode(&c2);
+    let dedup = super::wire::encode_dedup(&c2);
+    println!(
+        "C2 SMALL: built in {build_secs:.2}s · proved in {prove_secs:.2}s · blowup {} · Q {} · grind {grind} · binding {:?} · final {:?} · fold {} · tables 2^{:?} · C2 {} B (compact {} · dedup {}) vs C1 {} B vs top {} B",
+        a2.rate.factor(),
+        a2.config.num_queries,
+        a2.prep,
+        a2.final_poly,
+        a2.config.log_folding,
+        a2.table_num_vars,
+        size(&c2),
+        compact.len(),
+        dedup.len(),
+        size(&c1),
+        rkyv::to_bytes::<rkyv::rancor::Error>(&top.proof)
+            .expect("the top serializes")
+            .len()
+    );
+    assert_eq!(
+        c2.public_words, top.public_words,
+        "C2 republishes the top's words"
+    );
+    verify_compressed2(&plan, &wrap, grind, &c2)
+        .unwrap_or_else(|e| panic!("the twice-compressed block verifies: {e}"));
+    let artifacts = compressed2_artifacts(&plan, &wrap, grind).expect("C2's artifacts");
+    assert_eq!(
+        artifacts.program_id, a2.program_id,
+        "the verifier's C2 is the prover's"
+    );
+    for bytes in [&compact, &dedup] {
+        let back = if bytes == &dedup {
+            super::wire::decode_dedup(bytes)
+        } else {
+            super::wire::decode(bytes)
+        }
+        .expect("the wire bytes decode");
+        assert_eq!(super::wire::encode(&back), compact);
+        verify_compressed_against(&plan, &artifacts, &back)
+            .unwrap_or_else(|e| panic!("the decoded C2 verifies: {e}"));
+    }
+
+    // Tampered C2 proofs.
+    let mut answer = c2.clone();
+    answer.commit_ood[0] += FEE::one();
+    assert!(
+        verify_compressed_against(&plan, &artifacts, &answer).is_err(),
+        "answer"
+    );
+    for w in 0..c2.public_words.len() {
+        let mut word = c2.clone();
+        word.public_words[w].1[0] += FE::from(1u64);
+        assert!(
+            verify_compressed_against(&plan, &artifacts, &word).is_err(),
+            "word {w}"
+        );
+    }
+    // The other grind: the verifier's constant, never the proof's.
+    let other = COMPRESS2_GRINDS
+        .into_iter()
+        .find(|&g| g != grind)
+        .expect("two grinds");
+    assert!(
+        verify_compressed2(&plan, &wrap, other, &c2).is_err(),
+        "C2 under the other grind's verifier"
+    );
+    // Another block's plan: another statement, so another top, C1 and C2.
+    let other_format = other_format();
+    let (other_elf, other_proof) = small_block("test_commit_4", &other_format);
+    let other_plan = plan_of(&other_elf, &other_proof, &other_format, Some(2));
+    assert_ne!(other_plan.id(), plan.id(), "the two blocks' plans differ");
+    assert!(
+        verify_compressed2(&other_plan, &wrap, grind, &c2).is_err(),
+        "C2 under another block"
+    );
+
+    // A tampered C1 proof: C2 does not execute.
+    let mut c1_answer = c1.clone();
+    c1_answer.commit_ood[0] += FEE::one();
+    let mut c1_word = c1.clone();
+    c1_word.public_words[0].1[0] += FE::from(1u64);
+    let mut c1_main = c1.clone();
+    c1_main.proof.columns[0].polys[0].final_value += FEE::one();
+    let mut c1_prepared = c1.clone();
+    c1_prepared.prepared[0].polys[0].final_value += FEE::one();
+    for (what, forged) in [
+        ("answer", c1_answer),
+        ("word", c1_word),
+        ("main opening", c1_main),
+        ("prepared opening", c1_prepared),
+    ] {
+        assert!(
+            prove_compress2(&c2b, &c.build.artifacts, layout, &forged).is_err(),
+            "a tampered C1 {what}"
+        );
+    }
 }
 
 fn compressed_block_case(levers: super::wlfm::WlfmLevers) {

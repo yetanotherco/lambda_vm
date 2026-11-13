@@ -38,6 +38,19 @@
 //! chain sends its folded polynomial once at most that many variables remain,
 //! instead of committing and opening the rounds that would fold it to a
 //! constant. Unset is today's chains. Its files have verifiers of their own.
+//!
+//! # The second step (C2)
+//!
+//! `LAMBDA_VM_BLOCK_COMPRESS2` ([`compress2_setting`]; default off) adds a
+//! second W-LFM proof after C1: a program whose one child is C1's proof, which
+//! it verifies in-guest ([`super::wlfm_leg`]) and whose words it republishes
+//! in order, so its words are still the top's. C1 then stays in-guest
+//! checkable (stacked binding, today's chains: any C1 lever knob is refused)
+//! and C2 — the proof that ships, verified on the host — takes the format
+//! levers: blowup 64 ([`COMPRESS2_RATE`]), the verifier's own columns, the
+//! byte-minimising schedule, and a query grind of 22 or 26 bits
+//! ([`compress2_levers`]). Unset is today's pipeline, C1 and its files byte
+//! for byte.
 
 use super::block_node::BlockLayout;
 use super::builder::LfmBuilder;
@@ -49,6 +62,7 @@ use super::wlfm::{
     WlfmArtifacts, WlfmBuild, WlfmLevers, WlfmPrep, WlfmProof, WlfmRate, build_wlfm_under,
     prove_wlfm, verify_wlfm,
 };
+use super::wlfm_leg::{WlfmChild, wlfm_leg_arena, wlfm_leg_program};
 use super::word::LfmWord;
 use crate::hash_pin::{BlockFamily, ProofFamily};
 use multilinear::whir_chain::FinalPoly;
@@ -238,6 +252,78 @@ pub fn compress_levers_from_env(compress: Option<WlfmRate>) -> Result<WlfmLevers
     Ok(levers)
 }
 
+/// The knob that adds the second compression step C2 over C1.
+pub const COMPRESS2_ENV: &str = "LAMBDA_VM_BLOCK_COMPRESS2";
+
+/// The rate the compressed block's verifier checks C2 at: a constant of the
+/// verifier, never read from a proof or the environment.
+pub const COMPRESS2_RATE: WlfmRate = WlfmRate::SixtyFour;
+
+/// The query grinds C2 is built at, each a verifier constant of its own files.
+pub const COMPRESS2_GRINDS: [u8; 2] = [22, 26];
+
+/// C2's format levers at `grind` query-grind bits: the instruction columns
+/// evaluated by the verifier, the byte-minimising schedule (fold 5 after
+/// round 0, a final polynomial of at most 2^10 values), and the grind.
+pub const fn compress2_levers(grind: u8) -> WlfmLevers {
+    WlfmLevers {
+        prep: WlfmPrep::Evaluated,
+        final_poly: FinalPoly::Vars(COMPRESS_FOLDS_FINAL_VARS),
+        fold: Some(COMPRESS_FOLDS_FOLD),
+        grind: Some(grind),
+    }
+}
+
+/// [`COMPRESS2_ENV`]'s value: unset, `0` or `off` is no second step (the
+/// default); `1` or `22` is C2 at a 22-bit query grind; `26` at 26 bits.
+/// Anything else is refused.
+pub fn compress2_setting(value: Option<&str>) -> Result<Option<u8>, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(None),
+        Some(v) => match v.as_str() {
+            "" | "0" | "off" => Ok(None),
+            "1" | "22" => Ok(Some(22)),
+            "26" => Ok(Some(26)),
+            other => Err(format!(
+                "{COMPRESS2_ENV}={other:?}: expected off, 0, 1, 22 or 26"
+            )),
+        },
+    }
+}
+
+/// [`compress2_setting`] of the process's environment, refused unless C1 is
+/// on at [`COMPRESS_RATE`] with today's levers (`c1_levers`): C2 verifies C1
+/// in-guest, which checks a stacked C1 on today's chains only.
+pub fn compress2_from_env(
+    compress: Option<WlfmRate>,
+    c1_levers: WlfmLevers,
+) -> Result<Option<u8>, String> {
+    let grind = compress2_setting(std::env::var(COMPRESS2_ENV).ok().as_deref())?;
+    compress2_checked(grind, compress, c1_levers)
+}
+
+/// [`compress2_from_env`]'s rule on a parsed setting.
+pub fn compress2_checked(
+    grind: Option<u8>,
+    compress: Option<WlfmRate>,
+    c1_levers: WlfmLevers,
+) -> Result<Option<u8>, String> {
+    if grind.is_some() {
+        if compress != Some(COMPRESS_RATE) {
+            return Err(format!(
+                "{COMPRESS2_ENV} adds a step over C1, which needs {COMPRESS_ENV} at blowup 16"
+            ));
+        }
+        if c1_levers != WlfmLevers::DEFAULT {
+            return Err(format!(
+                "{COMPRESS2_ENV} verifies C1 in-guest: unset {COMPRESS_EVAL_ENV}, \
+                 {COMPRESS_FINAL_ENV} and {COMPRESS_FOLDS_ENV}"
+            ));
+        }
+    }
+    Ok(grind)
+}
+
 /// Emits C1 into `b`: the top's arenas, its leg, and every published word of
 /// the top republished as a whole word, in order. `top` must publish `layout`
 /// (the top layout: no bus sum).
@@ -365,9 +451,134 @@ pub fn verify_compressed_against(
     Ok(())
 }
 
+/// C1 as C2's child: its artifacts (every shape, root and the id are C2's
+/// program constants) and its word count, the top layout's.
+pub fn c1_child(c1: &WlfmArtifacts, layout: BlockLayout) -> WlfmChild {
+    WlfmChild {
+        artifacts: c1.clone(),
+        num_public_words: layout.total(),
+    }
+}
+
+/// ★ C2's program and build at [`COMPRESS2_RATE`] under
+/// [`compress2_levers`]`(grind)`, over C1 (`c1`, C1's artifacts): ONE
+/// derivation for the prover and the verifier. C2's program is the W-leg over
+/// C1 with C1's words republished in order ([`wlfm_leg_program`]).
+pub fn build_compress2(
+    c1: &WlfmArtifacts,
+    layout: BlockLayout,
+    grind: u8,
+) -> Result<CompressBuild, String> {
+    build_compress2_with(c1, layout, grind, false)
+}
+
+fn build_compress2_with(
+    c1: &WlfmArtifacts,
+    layout: BlockLayout,
+    grind: u8,
+    on_host: bool,
+) -> Result<CompressBuild, String> {
+    if !COMPRESS2_GRINDS.contains(&grind) {
+        return Err(format!(
+            "C2 is built at a grind of {COMPRESS2_GRINDS:?} bits, not {grind}"
+        ));
+    }
+    let program = wlfm_leg_program(&c1_child(c1, layout))?;
+    let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+    let build = build_wlfm_under(
+        &program,
+        hasher,
+        COMPRESS2_RATE,
+        compress2_levers(grind),
+        on_host,
+    )?;
+    Ok(CompressBuild { program, build })
+}
+
+/// C2 executed over C1's proof (`c1_proof`, as the W-leg's arena) and proved.
+/// A C1 proof that does not verify under the leg does not execute.
+pub fn prove_compress2(
+    c2: &CompressBuild,
+    c1: &WlfmArtifacts,
+    layout: BlockLayout,
+    c1_proof: &WlfmProof,
+) -> Result<WlfmProof, String> {
+    let arena = wlfm_leg_arena(&c1_child(c1, layout), c1_proof)?;
+    prove_wlfm(&c2.program, &c2.build, &[arena])
+}
+
+/// C2's artifacts as a verifier derives them for `plan`: C1's
+/// ([`compressed_artifacts`] at [`COMPRESS_RATE`], today's levers, its
+/// prepared stacks committed on the host), then C2 over them at `grind`.
+pub fn compressed2_artifacts(
+    plan: &WhirBlockPlan,
+    wrap_opts: &crate::ProofOptions,
+    grind: u8,
+) -> Result<WlfmArtifacts, String> {
+    let c1 = compressed_artifacts(plan, wrap_opts, COMPRESS_RATE, WlfmLevers::DEFAULT)?;
+    Ok(build_compress2_with(&c1, plan.top_layout(), grind, true)?
+        .build
+        .artifacts)
+}
+
+/// ★ A twice-compressed block verified against `plan`: C2's artifacts derived
+/// ([`compressed2_artifacts`]) and the proof checked against them and to
+/// claim the block ([`verify_compressed_against`]: C2's words are the top's).
+pub fn verify_compressed2(
+    plan: &WhirBlockPlan,
+    wrap_opts: &crate::ProofOptions,
+    grind: u8,
+    proof: &WlfmProof,
+) -> Result<(), String> {
+    let artifacts = compressed2_artifacts(plan, wrap_opts, grind)?;
+    verify_compressed_against(plan, &artifacts, proof)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The second step's knob is off unless set, refuses nonsense, needs C1
+    /// at blowup 16 with today's levers, and its levers are the evaluated
+    /// columns on the byte-minimising schedule at the grind.
+    #[test]
+    fn the_compress2_knob_is_off_unless_set_and_refuses_nonsense() {
+        assert_eq!(compress2_setting(None), Ok(None));
+        for off in ["", "0", "off", " OFF "] {
+            assert_eq!(compress2_setting(Some(off)), Ok(None), "{off:?}");
+        }
+        for on in ["1", "22", " 22 "] {
+            assert_eq!(compress2_setting(Some(on)), Ok(Some(22)), "{on:?}");
+        }
+        assert_eq!(compress2_setting(Some("26")), Ok(Some(26)));
+        for bad in ["2", "18", "20", "64", "on", "yes"] {
+            assert!(compress2_setting(Some(bad)).is_err(), "{bad:?}");
+        }
+        let c1 = Some(COMPRESS_RATE);
+        let today = WlfmLevers::DEFAULT;
+        assert_eq!(compress2_checked(None, None, today), Ok(None));
+        assert_eq!(compress2_checked(Some(22), c1, today), Ok(Some(22)));
+        assert!(compress2_checked(Some(22), None, today).is_err());
+        assert!(compress2_checked(Some(22), Some(WlfmRate::Four), today).is_err());
+        for c1_levers in [
+            WlfmLevers::with_prep(WlfmPrep::Evaluated),
+            folds_levers(WlfmPrep::Stacked),
+            WlfmLevers {
+                final_poly: FinalPoly::Vars(COMPRESS_FINAL_VARS),
+                ..today
+            },
+        ] {
+            assert!(compress2_checked(Some(26), c1, c1_levers).is_err());
+            assert_eq!(compress2_checked(None, c1, c1_levers), Ok(None));
+        }
+        let l = compress2_levers(26);
+        assert_eq!(l.prep, WlfmPrep::Evaluated);
+        assert_eq!(l.fold, Some(5));
+        assert_eq!(l.final_poly, FinalPoly::Vars(10));
+        assert_eq!(l.grind, Some(26));
+        assert_eq!(COMPRESS2_RATE, WlfmRate::SixtyFour);
+        assert_eq!(COMPRESS2_GRINDS, [22, 26]);
+    }
 
     #[test]
     fn the_compress_knob_is_off_unless_set_and_refuses_nonsense() {
