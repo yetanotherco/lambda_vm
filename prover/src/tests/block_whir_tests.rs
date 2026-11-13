@@ -676,7 +676,11 @@ fn the_rest_is_cut_into_waves_within_the_budget() {
 /// finish's tables packed as they are built, laid out narrow and committed from
 /// the card (b2: BlockOptions::pack_finished) move no byte: the same tables,
 /// partition and statement as with all of them off, inline and on the worker
-/// layout, and the proof bytes equal under the deterministic grind.
+/// layout, and the proof bytes equal under the deterministic grind. The rest is
+/// handed on in AIR order in every arm ([`Deviations::keccak_rnd_first`] off):
+/// with b1 on three workers the rest streams and slides, where KECCAK_RND's
+/// tables would otherwise go first, while with b1 off it is built whole in AIR
+/// order, so the partitions would differ by that order alone.
 #[test]
 fn the_rest_in_waves_and_the_finish_packed_move_no_byte() {
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -696,7 +700,10 @@ fn the_rest_in_waves_and_the_finish_packed_move_no_byte() {
                 &ProofOptions::default_test_options(),
                 &format,
                 &o,
-                &Deviations::default(),
+                &Deviations {
+                    keccak_rnd_first: Some(false),
+                    ..Deviations::default()
+                },
             )
             .expect("prove");
             assert!(
