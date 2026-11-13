@@ -277,12 +277,12 @@ pub struct BlockFormat {
     pub keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
     /// How MEMW_A proves each access's old timestamp below its timestamp
     /// ([`MemwAlignedOrder`](crate::tables::memw_aligned::MemwAlignedOrder)):
-    /// one LT lookup a row
-    /// ([`Lt`](crate::tables::memw_aligned::MemwAlignedOrder::Lt), the
-    /// production constant), or the step's two 16-bit limbs in the row
+    /// the step's two 16-bit limbs in the row
     /// ([`Limbs`](crate::tables::memw_aligned::MemwAlignedOrder::Limbs), the
-    /// variant a caller names). Its interactions, so its bus, the LT tables
-    /// the block holds and the recursion's programs, follow it.
+    /// production constant), or one LT lookup a row
+    /// ([`Lt`](crate::tables::memw_aligned::MemwAlignedOrder::Lt), the format
+    /// before it, a variant a caller names). Its interactions, so its bus, the
+    /// LT tables the block holds and the recursion's programs, follow it.
     pub memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
 }
 
@@ -394,7 +394,7 @@ impl BlockFormat {
             argue: ArgueFormat::BATCHED,
             group: GroupFold::Indexed,
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
-            memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+            memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
         }
     }
 
@@ -431,7 +431,7 @@ impl BlockFormat {
             argue: ArgueFormat::BATCHED,
             group: GroupFold::Indexed,
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
-            memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+            memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
         }
     }
 

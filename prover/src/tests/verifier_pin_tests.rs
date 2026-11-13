@@ -252,7 +252,7 @@ const OFF_DEFAULT: [(&str, &str); 9] = [
     ("LFM_WHIR_SHARE_INVERSE", "0"),
     ("BLOCK_WHIR_ARGUE_PACK", "off"),
     ("BLOCK_WHIR_KECCAK_RND", "full"),
-    ("BLOCK_WHIR_MEMW_A", "limbs"),
+    ("BLOCK_WHIR_MEMW_A", "lt"),
 ];
 
 /// ★ The block verifier reads no format from its environment. In a process of
@@ -327,12 +327,12 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     );
     assert_eq!(
         harness.format.memw_aligned,
-        crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+        crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         "the harness's MEMW_A follows its knob"
     );
     assert_eq!(
         production.memw_aligned,
-        crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
         "the prover's own production format reads no MEMW_A knob"
     );
 
@@ -355,7 +355,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     );
     assert_eq!(
         pinned.format.memw_aligned,
-        crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
         "the verifier's MEMW_A form is its named constant, not the environment's"
     );
     assert!(pinned.share_inverse);
