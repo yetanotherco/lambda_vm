@@ -3961,6 +3961,10 @@ pub struct LeadTaken {
     /// The groups still to come that phase B rebuilds, with their class, as
     /// the lead found them.
     pub rebuilt: Vec<(usize, usize)>,
+    /// The rule that let each leaf in `leaves` lead.
+    pub rules: Vec<LeadRule>,
+    /// Per rebuilt class, whether it fit its window ([`class_fits`]).
+    pub class_fits: Vec<bool>,
     /// Phase B's order as it was taken.
     pub order: Vec<usize>,
 }
@@ -3999,6 +4003,7 @@ impl PhaseBLead {
         classes: &[Option<usize>],
         cells: &[u64],
         after: f64,
+        class_fits: &[bool],
     ) -> Option<Vec<usize>> {
         let leaves = self.leaves.get()?;
         let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
@@ -4006,16 +4011,30 @@ impl PhaseBLead {
             return None;
         }
         let rest = &order[p + 1..];
-        let led = lead_order_n(leaves, rest, classes, cells, self.lead_leaves.max(1));
-        let (led_leaves, moved, now) = match &led {
-            Some((led_leaves, moved, now)) => (led_leaves.clone(), moved.clone(), now.clone()),
-            None => (Vec::new(), Vec::new(), rest.to_vec()),
+        let led = lead_order_n_rules(
+            leaves,
+            rest,
+            classes,
+            cells,
+            self.lead_leaves.max(1),
+            class_fits,
+        );
+        let (led_leaves, rules, moved, now) = match &led {
+            Some((led_leaves, rules, moved, now)) => (
+                led_leaves.clone(),
+                rules.clone(),
+                moved.clone(),
+                now.clone(),
+            ),
+            None => (Vec::new(), Vec::new(), rest.to_vec(), rest.to_vec()),
         };
         *taken = Some(LeadTaken {
             turn: p,
             after,
             leaf: led_leaves.first().copied(),
             leaves: led_leaves,
+            rules,
+            class_fits: class_fits.to_vec(),
             rebuilt: rest
                 .iter()
                 .filter_map(|&g| classes.get(g).copied().flatten().map(|c| (g, c)))
@@ -4027,7 +4046,7 @@ impl PhaseBLead {
                 .chain(now.iter().copied())
                 .collect(),
         });
-        led.map(|(_, _, now)| now).filter(|now| now != rest)
+        led.map(|(_, _, _, now)| now).filter(|now| now != rest)
     }
 }
 
@@ -4055,6 +4074,7 @@ pub(crate) fn lead_order(
 /// own. Its groups then go first and each class still goes in group order (the
 /// regenerators deposit in that order). Without `class_next` it is
 /// [`lead_order`]'s rule: no rebuilt group to come at all.
+#[cfg(test)]
 pub(crate) fn lead_order_with(
     leaves: &[Vec<usize>],
     rest: &[usize],
@@ -4062,10 +4082,62 @@ pub(crate) fn lead_order_with(
     cells: &[u64],
     class_next: bool,
 ) -> Option<(usize, Vec<usize>, Vec<usize>)> {
+    lead_pick(leaves, rest, classes, cells, class_next, &[])
+        .map(|(k, _, moved, now)| (k, moved, now))
+}
+
+/// Which rule let a leaf lead ([`lead_pick`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeadRule {
+    /// No rebuilt group of its was still to come.
+    Plain,
+    /// Its rebuilt groups were, class by class, the next ones of their class.
+    ClassNext,
+    /// A rebuilt group of a class whose dropped bytes all fit the class's
+    /// regeneration window ([`class_fits`]) went out of group order.
+    Window,
+}
+
+impl LeadRule {
+    pub fn word(self) -> &'static str {
+        match self {
+            LeadRule::Plain => "plain",
+            LeadRule::ClassNext => "class-next",
+            LeadRule::Window => "window",
+        }
+    }
+}
+
+/// Per rebuilt class, whether every byte phase B rebuilds of it fits the
+/// class's regeneration window at its smallest in phase B (`floors[c]`: the
+/// adaptive window's floor, or the fixed size). Then every deposit of the
+/// class is admitted as soon as it is made, whatever the order its groups are
+/// taken in, so no taker can wait on a deposit the window holds back
+/// (`stark::regen`'s pacing from the frontier). `dropped[c]` is the class's
+/// (tables, bytes); a class with no floor never fits.
+pub(crate) fn class_fits(dropped: &[(usize, u64)], floors: &[u64]) -> Vec<bool> {
+    dropped
+        .iter()
+        .enumerate()
+        .map(|(c, &(_, bytes))| floors.get(c).is_some_and(|&floor| bytes <= floor))
+        .collect()
+}
+
+/// [`lead_order_with`] that also says which rule let the leaf lead, and with
+/// `class_fits` (per class, [`class_fits`]): leading several (`class_next`), a
+/// rebuilt group of a class that fits its window may go out of group order.
+fn lead_pick(
+    leaves: &[Vec<usize>],
+    rest: &[usize],
+    classes: &[Option<usize>],
+    cells: &[u64],
+    class_next: bool,
+    class_fits: &[bool],
+) -> Option<(usize, LeadRule, Vec<usize>, Vec<usize>)> {
     let to_come: std::collections::BTreeSet<usize> = rest.iter().copied().collect();
     let class = |g: usize| classes.get(g).copied().flatten();
     let cell = |g: usize| cells.get(g).copied().unwrap_or(0);
-    let (leaf, _) = leaves
+    let (leaf, rule) = leaves
         .iter()
         .enumerate()
         .filter_map(|(k, groups)| {
@@ -4076,19 +4148,32 @@ pub(crate) fn lead_order_with(
                 .collect();
             let rebuilt = left.iter().any(|&g| class(g).is_some());
             // With `class_next`: each of the leaf's rebuilt groups to come has
-            // only the leaf's own groups of its class below it in `rest`.
-            let next_of_class = || {
-                left.iter().all(|&g| match class(g) {
-                    None => true,
-                    Some(c) => rest
-                        .iter()
-                        .all(|&h| h >= g || class(h) != Some(c) || groups.contains(&h)),
-                })
+            // only the leaf's own groups of its class below it in `rest`, or
+            // (the window rule) belongs to a class that fits its window.
+            let next_of = |g: usize, c: usize| {
+                rest.iter()
+                    .all(|&h| h >= g || class(h) != Some(c) || groups.contains(&h))
             };
-            let may = !rebuilt || (class_next && next_of_class());
-            (may && !left.is_empty()).then(|| (k, left.iter().map(|&g| cell(g)).sum::<u64>()))
+            let fits = |c: usize| class_fits.get(c).copied().unwrap_or(false);
+            let rule = if !rebuilt {
+                Some(LeadRule::Plain)
+            } else if !class_next {
+                None
+            } else if left.iter().all(|&g| class(g).is_none_or(|c| next_of(g, c))) {
+                Some(LeadRule::ClassNext)
+            } else if left
+                .iter()
+                .all(|&g| class(g).is_none_or(|c| next_of(g, c) || fits(c)))
+            {
+                Some(LeadRule::Window)
+            } else {
+                None
+            };
+            rule.filter(|_| !left.is_empty())
+                .map(|rule| (k, rule, left.iter().map(|&g| cell(g)).sum::<u64>()))
         })
-        .min_by_key(|&(k, cost)| (cost, k))?;
+        .min_by_key(|&(k, _, cost)| (cost, k))
+        .map(|(k, rule, _)| (k, rule))?;
     let mine: std::collections::BTreeSet<usize> = leaves[leaf].iter().copied().collect();
     let moved: Vec<usize> = rest.iter().copied().filter(|g| mine.contains(g)).collect();
     let now: Vec<usize> = moved
@@ -4096,7 +4181,7 @@ pub(crate) fn lead_order_with(
         .copied()
         .chain(rest.iter().copied().filter(|g| !mine.contains(g)))
         .collect();
-    Some((leaf, moved, now))
+    Some((leaf, rule, moved, now))
 }
 
 /// [`lead_order`] for up to `n` leaves, one after another: the leaf that
@@ -4106,6 +4191,7 @@ pub(crate) fn lead_order_with(
 /// moved (theirs, leaf by leaf, each leaf's in `rest`'s order) and the new
 /// `rest`, a permutation of it; `None` when no leaf can lead. With `n` 1 it is
 /// [`lead_order`].
+#[cfg(test)]
 pub(crate) fn lead_order_n(
     leaves: &[Vec<usize>],
     rest: &[usize],
@@ -4113,25 +4199,47 @@ pub(crate) fn lead_order_n(
     cells: &[u64],
     n: usize,
 ) -> Option<(Vec<usize>, Vec<usize>, Vec<usize>)> {
+    lead_order_n_rules(leaves, rest, classes, cells, n, &[])
+        .map(|(led, _, moved, now)| (led, moved, now))
+}
+
+/// A multi-leaf lead: the leaves in order, the rule each led by, every group
+/// moved, and phase B's new order of the groups still to come.
+pub(crate) type LeadOrder = (Vec<usize>, Vec<LeadRule>, Vec<usize>, Vec<usize>);
+
+/// [`lead_order_n`] with each leaf's rule, and `class_fits` ([`class_fits`]):
+/// leading several, a class that fits its window may go out of group order.
+pub(crate) fn lead_order_n_rules(
+    leaves: &[Vec<usize>],
+    rest: &[usize],
+    classes: &[Option<usize>],
+    cells: &[u64],
+    n: usize,
+    class_fits: &[bool],
+) -> Option<LeadOrder> {
     let mut led = Vec::new();
+    let mut rules = Vec::new();
     let mut moved = Vec::new();
     let mut left = rest.to_vec();
     while led.len() < n {
         // A leaf already led has no group left in `left`, so it cannot lead again.
         // Leading several, a leaf whose rebuilt groups are next in their class may
         // lead too ([`lead_order_with`]); one is today's rule exactly.
-        let Some((leaf, mine, _)) = lead_order_with(leaves, &left, classes, cells, n > 1) else {
+        let Some((leaf, rule, mine, _)) =
+            lead_pick(leaves, &left, classes, cells, n > 1, class_fits)
+        else {
             break;
         };
         left.retain(|g| !mine.contains(g));
         moved.extend(mine);
         led.push(leaf);
+        rules.push(rule);
     }
     if led.is_empty() {
         return None;
     }
     let now = moved.iter().copied().chain(left).collect();
-    Some((led, moved, now))
+    Some((led, rules, moved, now))
 }
 
 /// The block's trace as the streamed prove builds it, each closed group
@@ -7518,6 +7626,16 @@ fn prove_streamed(
         let readbacks_before = multilinear::gpu::background_readbacks();
         // The recursion's lead (`W3_LEAF_FIRST`): once the tree offers its
         // leaves, the groups of the one phase B can finish soonest go next.
+        // Per rebuilt class, whether all its dropped bytes fit its window at
+        // the window's smallest in phase B (the adaptive window's floor, or
+        // the fixed size): the windows the regeneration was opened with.
+        let class_floors = match deviations.regen_windows {
+            Some((streamed, rest)) => [streamed, rest],
+            None => [regen::ahead_policy().initial(), regen::rest_ahead_bytes()],
+        };
+        let class_fit = live.as_ref().map_or_else(Vec::new, |(drops, ..)| {
+            class_fits(&drops.by_class, &class_floors)
+        });
         let lead_turn = |p: usize, order: &[usize]| {
             lead.and_then(|lead| {
                 lead.turn(
@@ -7526,6 +7644,7 @@ fn prove_streamed(
                     &classes,
                     &group_cells,
                     phase_b_start.elapsed().as_secs_f64(),
+                    &class_fit,
                 )
             })
         };
@@ -8871,7 +8990,7 @@ fn led_order(classes: &[Option<usize>], cells: &[u64], lead: usize) -> Vec<usize
 
 #[cfg(test)]
 mod lead_order_tests {
-    use super::{PhaseBLead, lead_order, lead_order_n};
+    use super::{LeadRule, PhaseBLead, class_fits, lead_order, lead_order_n, lead_order_n_rules};
 
     /// Each class's groups in `order`, in the order taken.
     fn by_class(order: &[usize], classes: &[Option<usize>], class: usize) -> Vec<usize> {
@@ -9096,6 +9215,132 @@ mod lead_order_tests {
         }
     }
 
+    /// A class fits its window when all its dropped bytes do, against the
+    /// window's floor; a class with no floor never fits.
+    #[test]
+    fn a_class_fits_its_window_when_all_its_dropped_bytes_do() {
+        assert_eq!(
+            class_fits(&[(2, 100), (5, 4096), (1, 4097)], &[100, 4096, 4096]),
+            vec![true, true, false]
+        );
+        assert_eq!(class_fits(&[(1, 1)], &[]), vec![false], "no floor, no fit");
+        assert_eq!(class_fits(&[], &[1]), Vec::<bool>::new());
+    }
+
+    /// Leading several, a leaf whose rebuilt groups are out of class order
+    /// leads by the window rule only when its class fits; the rule each leaf
+    /// led by is recorded; leading one, nothing changes.
+    #[test]
+    fn the_window_rule_lets_a_fitting_class_go_out_of_group_order() {
+        let classes = [None, None, None, Some(1), Some(1), Some(1)];
+        // Leaf 0 holds the class's last group and the fewest cells.
+        let leaves = vec![vec![0, 5], vec![1, 4], vec![2, 3]];
+        let cells = [1u64, 10, 10, 10, 10, 1];
+        let rest: Vec<usize> = (0..6).collect();
+        let no = [false, false];
+        let (led, rules, ..) =
+            lead_order_n_rules(&leaves, &rest, &classes, &cells, 3, &no).expect("leads");
+        assert_eq!(led, vec![2, 1, 0]);
+        assert_eq!(rules, vec![LeadRule::ClassNext; 3]);
+        let yes = [false, true];
+        let (led, rules, _, now) =
+            lead_order_n_rules(&leaves, &rest, &classes, &cells, 3, &yes).expect("leads");
+        assert_eq!(led, vec![0, 1, 2]);
+        assert_eq!(
+            rules,
+            vec![LeadRule::Window, LeadRule::Window, LeadRule::ClassNext]
+        );
+        assert_eq!(
+            by_class(&now, &classes, 1),
+            vec![5, 4, 3],
+            "out of group order"
+        );
+        // Leading one: today's rule, which no fit relaxes.
+        assert_eq!(
+            lead_order_n_rules(&leaves, &rest, &classes, &cells, 1, &yes).map(|x| x.0),
+            None
+        );
+        // A plain leaf is labelled plain.
+        let (_, rules, ..) =
+            lead_order_n_rules(&[vec![0, 1]], &rest, &classes, &cells, 2, &yes).expect("leads");
+        assert_eq!(rules, vec![LeadRule::Plain]);
+    }
+
+    /// The lead's take order against a real regeneration window: its
+    /// depositor in rank (group) order, its taker in the lead's order, every
+    /// wait bounded. A class larger than its window keeps group order and
+    /// every take completes; a class that fits goes out of order and still
+    /// completes. With the size check dropped (every class "fits"), the class
+    /// larger than its window is taken out of order and the taker waits on a
+    /// deposit the window holds back: this test fails within its bound.
+    #[test]
+    fn a_class_larger_than_its_window_keeps_group_order_and_never_deadlocks() {
+        use multilinear::narrow::NarrowColumns;
+        use stark::regen::RegenWindow;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let cols = |seed: u64| {
+            let words: Vec<u64> = (0..3000u64).map(|i| (i ^ seed) % 60_000).collect();
+            NarrowColumns::pack_row_major(&words, 3).expect("packs")
+        };
+        let bytes = {
+            let (w, _p) = RegenWindow::new(0);
+            w.slot(&cols(0), 0).len() as u64
+        };
+        let classes = [None, None, None, Some(1), Some(1), Some(1)];
+        let leaves = vec![vec![0, 5], vec![1, 4], vec![2, 3]];
+        let cells = [1u64, 10, 10, 10, 10, 1];
+        let rest: Vec<usize> = (0..6).collect();
+        // The rebuilt groups' take order for a window of `floor` bytes, and
+        // whether every take completed within the bound.
+        let run = |floor: u64| -> (Vec<usize>, bool) {
+            let fits = class_fits(&[(0, 0), (3, 3 * bytes)], &[u64::MAX, floor]);
+            let (_, _, _, now) =
+                lead_order_n_rules(&leaves, &rest, &classes, &cells, 3, &fits).expect("leads");
+            let takes: Vec<usize> = now.into_iter().filter(|&g| classes[g].is_some()).collect();
+            let (window, producer) = RegenWindow::new(floor);
+            let slots: Vec<_> = (0..3u64).map(|r| window.slot(&cols(r), r)).collect();
+            let deposits = slots.clone();
+            let depositor = std::thread::spawn(move || {
+                for (r, slot) in deposits.iter().enumerate() {
+                    let _ = slot.deposit(cols(r as u64));
+                }
+                drop(producer);
+            });
+            let (tx, rx) = mpsc::channel();
+            let order = takes.clone();
+            let taker = std::thread::spawn(move || {
+                let ok = order.iter().all(|&g| {
+                    let slot = &slots[g - 3];
+                    slot.wait();
+                    slot.take().is_ok()
+                });
+                let _ = tx.send(ok);
+            });
+            let done = rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false);
+            // Closing the window wakes every waiter and depositor, so both
+            // threads end whatever happened.
+            window.close("the test's end");
+            let _ = depositor.join();
+            let _ = taker.join();
+            (takes, done)
+        };
+        let (takes, done) = run(2 * bytes);
+        assert_eq!(
+            takes,
+            vec![3, 4, 5],
+            "a class larger than its window keeps group order"
+        );
+        assert!(done, "every take completes with the class in group order");
+        let (takes, done) = run(4 * bytes);
+        assert_eq!(
+            takes,
+            vec![5, 4, 3],
+            "a class that fits goes out of group order"
+        );
+        assert!(done, "and every take still completes");
+    }
+
     /// A lead made for several leaves records them all, the first as `leaf`.
     #[test]
     fn a_lead_for_several_leaves_records_them_in_order() {
@@ -9106,7 +9351,7 @@ mod lead_order_tests {
         assert!(lead.offer(vec![vec![0, 2], vec![1, 4, 5], vec![3]]));
         // Turn 1: leaf 1 has 2 cells left, leaf 0 three, leaf 2 three (tie to 0).
         assert_eq!(
-            lead.turn(1, &order, &none, &cells, 0.5),
+            lead.turn(1, &order, &none, &cells, 0.5, &[]),
             Some(vec![4, 5, 2, 3])
         );
         let taken = lead.taken().expect("read");
@@ -9124,13 +9369,13 @@ mod lead_order_tests {
         let none = [None; 6];
         let order: Vec<usize> = (0..6).collect();
         let lead = PhaseBLead::default();
-        assert_eq!(lead.turn(0, &order, &none, &cells, 0.0), None);
+        assert_eq!(lead.turn(0, &order, &none, &cells, 0.0, &[]), None);
         assert_eq!(lead.taken(), None);
         assert!(lead.offer(vec![vec![0, 2], vec![1, 4, 5]]));
         assert!(!lead.offer(vec![vec![3]]), "only the first offer counts");
         // At turn 1 (groups 0 and 1 taken): leaf 0 has 3 cells left, leaf 1 two.
         assert_eq!(
-            lead.turn(1, &order, &none, &cells, 0.5),
+            lead.turn(1, &order, &none, &cells, 0.5, &[]),
             Some(vec![4, 5, 2, 3])
         );
         let taken = lead.taken().expect("read");
@@ -9140,13 +9385,13 @@ mod lead_order_tests {
         assert_eq!(taken.order, vec![0, 1, 4, 5, 2, 3]);
         assert_eq!(taken.after, 0.5);
         let now = [0, 1, 4, 5, 2, 3];
-        assert_eq!(lead.turn(2, &now, &none, &cells, 0.6), None);
+        assert_eq!(lead.turn(2, &now, &none, &cells, 0.6, &[]), None);
         assert_eq!(lead.taken(), Some(taken));
         // Phase B's own order already leads with the soonest leaf: no change.
         let cells = [1, 1, 1, 9, 9, 9];
         let lead = PhaseBLead::default();
         assert!(lead.offer(vec![vec![1, 2], vec![3, 4, 5]]));
-        assert_eq!(lead.turn(0, &order, &none, &cells, 0.0), None);
+        assert_eq!(lead.turn(0, &order, &none, &cells, 0.0, &[]), None);
         let taken = lead.taken().expect("read");
         assert_eq!((taken.leaf, taken.order), (Some(0), order.clone()));
     }

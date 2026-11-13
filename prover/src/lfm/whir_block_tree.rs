@@ -2797,11 +2797,18 @@ pub fn prove_whir_block_tree(
         };
         let n = partition.num_leaves();
         sink.line(&format!(
-            "W3 EARLY ORDER: phase B led {} of {n} leaves [{}] · rebuilt groups to come: {rebuilt} · {}",
+            "W3 EARLY ORDER: phase B led {} of {n} leaves [{}] · rebuilt groups to come: {rebuilt} · classes fitting their window [{}] · {}",
             t.leaves.len(),
             t.leaves
                 .iter()
-                .map(|k| k.to_string())
+                .zip(&t.rules)
+                .map(|(k, r)| format!("{k} ({})", r.word()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            t.class_fits
+                .iter()
+                .enumerate()
+                .map(|(c, f)| format!("class {c} {}", if *f { "fits" } else { "does not" }))
                 .collect::<Vec<_>>()
                 .join(", "),
             if t.leaves.len() + 1 >= n {
