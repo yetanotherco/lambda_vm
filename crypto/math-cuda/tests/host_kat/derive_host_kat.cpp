@@ -3,7 +3,7 @@
 // `LAMBDA_VM_CARD_ROWS=registers`), run on the host.
 //
 // WHY THIS EXISTS. The card test checks the kernel on a GPU; this checks its
-// arithmetic and indexing without one, before a box run is spent on it. The
+// arithmetic and indexing without one, before a GPU run is spent on it. The
 // vectors come from the prover (the ignored test
 // `register_rows_tests::write_the_register_rows_kernel_vectors`): record-mode
 // runs' MEMW_R chunks as the host plans them (`card_rows::plan_registers`),
