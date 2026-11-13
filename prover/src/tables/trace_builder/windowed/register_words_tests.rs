@@ -86,13 +86,14 @@ fn built(
     walkers: usize,
     room: RecordsRoom,
     words: bool,
+    where_made: bool,
 ) -> (Traces, Held) {
     use executor::vm::fast::FastExecutor;
     let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
         .and_then(WindowedTraceBuilder::drop_streamed_ops)
         .and_then(|b| b.card_fill_streamed(room, true, true))
         .expect("the builder")
-        .count_where_made(true);
+        .count_where_made(where_made);
     if words {
         builder = builder.card_writes_words().expect("words mode");
     }
@@ -176,10 +177,22 @@ fn words_mode_builds_the_whole_run_tables_and_each_mutant_moves_them() {
             for walkers in [1usize, 3] {
                 for (what, room) in rooms() {
                     let at = format!("{name}, window {window}, {walkers} walkers, room {what}");
-                    let (traces, held) = built(&program, &max_rows, window, walkers, room, true);
+                    let (traces, held) =
+                        built(&program, &max_rows, window, walkers, room, true, true);
                     same_traces(&reference, &traces);
                     words_chunks += held.words;
                     if what == "always" {
+                        // The accumulator counting the handed-out words.
+                        let (traces, _) = built(
+                            &program,
+                            &max_rows,
+                            window,
+                            walkers,
+                            Arc::new(|_| true),
+                            true,
+                            false,
+                        );
+                        same_traces(&reference, &traces);
                         let (_, rows) = built(
                             &program,
                             &max_rows,
@@ -187,6 +200,7 @@ fn words_mode_builds_the_whole_run_tables_and_each_mutant_moves_them() {
                             walkers,
                             Arc::new(|_| true),
                             false,
+                            true,
                         );
                         assert_eq!(held.digests, rows.digests, "{at}: the chunks' digests");
                         compared += held.digests.len();
@@ -230,8 +244,15 @@ fn words_mode_builds_the_whole_run_tables_and_each_mutant_moves_them() {
             for window in [7usize, 33] {
                 FAULT_WORDS.store(bit, Ordering::Relaxed);
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    let (traces, _) =
-                        built(&program, &max_rows, window, 1, Arc::new(|_| true), true);
+                    let (traces, _) = built(
+                        &program,
+                        &max_rows,
+                        window,
+                        1,
+                        Arc::new(|_| true),
+                        true,
+                        true,
+                    );
                     same_traces(&reference, &traces);
                 }));
                 FAULT_WORDS.store(0, Ordering::Relaxed);
@@ -267,4 +288,105 @@ fn words_mode_needs_memw_r_as_records_and_the_cpu_logs() {
         .and_then(|b| b.card_fill_streamed(Arc::new(|_| true), true, true))
         .expect("the builder");
     assert!(rows.writes_words().is_none());
+}
+
+/// The MEMW_R chunks a record-mode run of `program` hands out as records, in
+/// hand-out order, its walkers writing words when `words`.
+fn memw_r_chunks(
+    program: &Elf,
+    input: &[u8],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    words: bool,
+) -> Vec<multilinear::records::Records> {
+    use executor::vm::fast::FastExecutor;
+    let mut builder = WindowedTraceBuilder::new(program, input, max_rows)
+        .and_then(WindowedTraceBuilder::drop_streamed_ops)
+        .and_then(|b| b.card_fill_streamed(Arc::new(|_| true), true, true))
+        .expect("the builder")
+        .count_where_made(true);
+    if words {
+        builder = builder.card_writes_words().expect("words mode");
+    }
+    let mut held = Vec::new();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<super::parallel::ExecWindow>(2);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut fast = FastExecutor::new(program, input.to_vec()).expect("the fast engine");
+            fast.enable_history().expect("history mode");
+            while let Some((logs, history)) = fast.resume_history(window).expect("the run") {
+                let last = (fast.pc() == 0)
+                    .then(|| fast.take_history_final().map(Box::new))
+                    .flatten();
+                let sent = tx.send(super::parallel::ExecWindow {
+                    logs: Arc::new(logs),
+                    start: None,
+                    history: Some(Box::new(history)),
+                    last,
+                });
+                if sent.is_err() {
+                    break;
+                }
+            }
+        });
+        super::parallel::walk_windows_from_history(&mut builder, rx, 4, 0, |a, w, _| {
+            for job in a.absorb(w) {
+                if job.table == StreamTable::MemwRegister && job.is_records() {
+                    let mut chunk = job.generate();
+                    held.extend(chunk.trace.take_records_main());
+                }
+            }
+            Ok(())
+        })
+        .expect("the walk");
+    });
+    held
+}
+
+/// The real block (`BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`) at the production
+/// heights in record mode, every window, walked as rows and as words: each
+/// MEMW_R chunk's rows decoded from its words are the walk's rows, field for
+/// field, and its digest is the rows' digest. A box test: both runs' chunks
+/// are held at once.
+#[test]
+#[ignore = "a real block's whole record-mode run, twice: box only"]
+fn the_real_blocks_words_decode_to_the_walks_rows() {
+    let elf =
+        std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF")).expect("the ELF");
+    let input =
+        std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT")).expect("input");
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let options = crate::block_whir::BlockOptions::production();
+    let window = 1usize << options.window_log2.expect("the block streams");
+    let clock = std::time::Instant::now();
+    let rows = memw_r_chunks(&program, &input, &options.max_rows, window, false);
+    let words = memw_r_chunks(&program, &input, &options.max_rows, window, true);
+    assert_eq!(rows.len(), words.len(), "the same MEMW_R chunks");
+    let (mut as_words, mut decoded) = (0usize, 0usize);
+    for (k, (r, w)) in rows.into_iter().zip(words).enumerate() {
+        as_words += usize::from(w.register_words().is_some());
+        let flat = |x: &multilinear::records::Records| -> Vec<multilinear::records::RegisterRow> {
+            match x.fill() {
+                multilinear::records::RecordsFill::MemwR { rows } => {
+                    rows.iter().flat_map(|p| p.iter()).copied().collect()
+                }
+                other => panic!("chunk {k}: not MEMW_R: {other:?}"),
+            }
+        };
+        let (a, b) = (flat(&r), flat(&w));
+        assert_eq!(a.len(), b.len(), "chunk {k}: rows");
+        if let Some(i) = (0..a.len()).find(|&i| a[i] != b[i]) {
+            panic!(
+                "chunk {k} row {i}: words decode to {:?}, the walk wrote {:?}",
+                b[i], a[i]
+            );
+        }
+        assert_eq!(r.digest(), w.digest(), "chunk {k}: digest");
+        decoded += b.len();
+    }
+    println!(
+        "REGISTER WORDS REAL: {as_words} MEMW_R chunks held as words · rows decoded from words equal to the walk's {decoded} · digests equal · {:.1}s",
+        clock.elapsed().as_secs_f64()
+    );
+    assert!(as_words > 0 && decoded > 0, "nothing held as words");
 }
