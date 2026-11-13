@@ -3937,6 +3937,9 @@ pub fn prove_block_whir_observed_led(
 pub struct PhaseBLead {
     leaves: std::sync::OnceLock<Vec<Vec<usize>>>,
     taken: std::sync::Mutex<Option<LeadTaken>>,
+    /// How many leaves lead, one after another ([`PhaseBLead::leading`]);
+    /// 0 reads as 1, today's single lead.
+    lead_leaves: usize,
 }
 
 /// What phase B did with the offered leaves ([`PhaseBLead`]).
@@ -3951,11 +3954,27 @@ pub struct LeadTaken {
     pub leaf: Option<usize>,
     /// The groups moved ahead of the others, in their new order.
     pub moved: Vec<usize>,
+    /// Every leaf that led, in the order their groups go (`leaf` is the
+    /// first); one leaf unless the lead was made for more
+    /// ([`PhaseBLead::leading`]).
+    pub leaves: Vec<usize>,
     /// Phase B's order as it was taken.
     pub order: Vec<usize>,
 }
 
 impl PhaseBLead {
+    /// A lead for up to `n` leaves (`W3_EARLY_LEAVES`): at its turn phase B
+    /// takes the groups of the leaf it can finish soonest, then of the next
+    /// soonest among the others, and so on for `n` leaves ([`lead_order_n`]),
+    /// so each of them completes as early as the ones before it allow. `n` 1
+    /// is [`PhaseBLead::default`]'s single lead.
+    pub fn leading(n: usize) -> Self {
+        Self {
+            lead_leaves: n,
+            ..Self::default()
+        }
+    }
+
     /// Offers the leaves' groups (leaf `k`'s at `leaves[k]`); only the first
     /// offer counts. Returns whether this one did.
     pub fn offer(&self, leaves: Vec<Vec<usize>>) -> bool {
@@ -3984,15 +4003,16 @@ impl PhaseBLead {
             return None;
         }
         let rest = &order[p + 1..];
-        let led = lead_order(leaves, rest, classes, cells);
-        let (leaf, moved, now) = match &led {
-            Some((leaf, moved, now)) => (Some(*leaf), moved.clone(), now.clone()),
-            None => (None, Vec::new(), rest.to_vec()),
+        let led = lead_order_n(leaves, rest, classes, cells, self.lead_leaves.max(1));
+        let (led_leaves, moved, now) = match &led {
+            Some((led_leaves, moved, now)) => (led_leaves.clone(), moved.clone(), now.clone()),
+            None => (Vec::new(), Vec::new(), rest.to_vec()),
         };
         *taken = Some(LeadTaken {
             turn: p,
             after,
-            leaf,
+            leaf: led_leaves.first().copied(),
+            leaves: led_leaves,
             moved,
             order: order[..=p]
                 .iter()
@@ -4043,6 +4063,39 @@ pub(crate) fn lead_order(
         .chain(rest.iter().copied().filter(|g| !mine.contains(g)))
         .collect();
     Some((leaf, moved, now))
+}
+
+/// [`lead_order`] for up to `n` leaves, one after another: the leaf that
+/// leads `rest`, then the one that leads what `rest` holds after its groups,
+/// and so on, each by the same rule (no rebuilt group to come, fewest cells
+/// left, ties to the lower leaf). Returns the leaves in that order, every group
+/// moved (theirs, leaf by leaf, each leaf's in `rest`'s order) and the new
+/// `rest`, a permutation of it; `None` when no leaf can lead. With `n` 1 it is
+/// [`lead_order`].
+pub(crate) fn lead_order_n(
+    leaves: &[Vec<usize>],
+    rest: &[usize],
+    classes: &[Option<usize>],
+    cells: &[u64],
+    n: usize,
+) -> Option<(Vec<usize>, Vec<usize>, Vec<usize>)> {
+    let mut led = Vec::new();
+    let mut moved = Vec::new();
+    let mut left = rest.to_vec();
+    while led.len() < n {
+        // A leaf already led has no group left in `left`, so it cannot lead again.
+        let Some((leaf, mine, _)) = lead_order(leaves, &left, classes, cells) else {
+            break;
+        };
+        left.retain(|g| !mine.contains(g));
+        moved.extend(mine);
+        led.push(leaf);
+    }
+    if led.is_empty() {
+        return None;
+    }
+    let now = moved.iter().copied().chain(left).collect();
+    Some((led, moved, now))
 }
 
 /// The block's trace as the streamed prove builds it, each closed group
@@ -8734,7 +8787,7 @@ fn led_order(classes: &[Option<usize>], cells: &[u64], lead: usize) -> Vec<usize
 
 #[cfg(test)]
 mod lead_order_tests {
-    use super::{PhaseBLead, lead_order};
+    use super::{PhaseBLead, lead_order, lead_order_n};
 
     /// Each class's groups in `order`, in the order taken.
     fn by_class(order: &[usize], classes: &[Option<usize>], class: usize) -> Vec<usize> {
@@ -8817,6 +8870,75 @@ mod lead_order_tests {
         // Every leaf's groups taken, or none offered: nothing leads.
         assert_eq!(lead_order(&leaves, &[], &classes, &cells), None);
         assert_eq!(lead_order(&[], &[0, 1], &classes, &cells), None);
+    }
+
+    /// Several leaves lead one after another, each by the single lead's rule
+    /// over what the ones before it left; one leaf is exactly `lead_order`;
+    /// a leaf with a rebuilt group to come is skipped, not waited for; the
+    /// result is a permutation of `rest` and every class keeps its order.
+    #[test]
+    fn several_leaves_lead_one_after_another() {
+        let cells = [10, 10, 10, 10, 10, 10, 1, 1];
+        let none = [None; 8];
+        let leaves = vec![vec![0, 3, 6], vec![1, 4, 7], vec![2, 5]];
+        let rest: Vec<usize> = (0..8).collect();
+        for r in [
+            rest.clone(),
+            vec![1, 2, 4, 5, 6, 7],
+            vec![7, 6, 5, 4, 3, 2, 1, 0],
+        ] {
+            let one = lead_order(&leaves, &r, &none, &cells).map(|(k, m, n)| (vec![k], m, n));
+            assert_eq!(
+                lead_order_n(&leaves, &r, &none, &cells, 1),
+                one,
+                "n 1 is lead_order"
+            );
+        }
+        // Leaf 2 (20 cells), then leaf 0 (21, the lower of the tie), then leaf 1.
+        let (led, moved, now) = lead_order_n(&leaves, &rest, &none, &cells, 3).expect("leads");
+        assert_eq!(led, vec![2, 0, 1]);
+        assert_eq!(moved, vec![2, 5, 0, 3, 6, 1, 4, 7]);
+        assert_eq!(now, moved, "every group belongs to a leaf");
+        // Two of three: the third leaf's groups keep their order after.
+        let (led, _, now) = lead_order_n(&leaves, &rest, &none, &cells, 2).expect("leads");
+        assert_eq!((led, now), (vec![2, 0], vec![2, 5, 0, 3, 6, 1, 4, 7]));
+        // More than there are leaves: all of them, once each.
+        let (led, ..) = lead_order_n(&leaves, &rest, &none, &cells, 9).expect("leads");
+        assert_eq!(led, vec![2, 0, 1]);
+        // A rebuilt group to come: that leaf is skipped; each class keeps order.
+        let classes = [None, None, None, None, Some(1), Some(0), Some(1), Some(0)];
+        let leaves = vec![vec![0, 6], vec![1, 2], vec![3, 5, 7], vec![4]];
+        let (led, _, now) = lead_order_n(&leaves, &rest, &classes, &cells, 4).expect("leads");
+        assert_eq!(led, vec![1], "only leaf 1 has no rebuilt group to come");
+        let mut sorted = now.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, rest, "a permutation");
+        for class in 0..2 {
+            assert_eq!(
+                by_class(&now, &classes, class),
+                by_class(&rest, &classes, class)
+            );
+        }
+        assert_eq!(lead_order_n(&leaves, &[], &classes, &cells, 3), None);
+    }
+
+    /// A lead made for several leaves records them all, the first as `leaf`.
+    #[test]
+    fn a_lead_for_several_leaves_records_them_in_order() {
+        let cells = [3, 3, 3, 3, 1, 1];
+        let none = [None; 6];
+        let order: Vec<usize> = (0..6).collect();
+        let lead = PhaseBLead::leading(2);
+        assert!(lead.offer(vec![vec![0, 2], vec![1, 4, 5], vec![3]]));
+        // Turn 1: leaf 1 has 2 cells left, leaf 0 three, leaf 2 three (tie to 0).
+        assert_eq!(
+            lead.turn(1, &order, &none, &cells, 0.5),
+            Some(vec![4, 5, 2, 3])
+        );
+        let taken = lead.taken().expect("read");
+        assert_eq!((taken.leaf, taken.leaves.clone()), (Some(1), vec![1, 0]));
+        assert_eq!(taken.moved, vec![4, 5, 2]);
+        assert_eq!(taken.order, vec![0, 1, 4, 5, 2, 3]);
     }
 
     /// The lead reads the offer once: nothing before it, the re-ranking at
