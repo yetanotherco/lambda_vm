@@ -1729,7 +1729,7 @@ impl MemwBuckets {
     }
 
     /// Words mode from here: `capacity` words, the window `window`.
-    fn into_words(&mut self, window: register_words::WordWindow, capacity: usize) {
+    fn set_words(&mut self, window: register_words::WordWindow, capacity: usize) {
         self.register_rows = Vec::new();
         self.words = Some(Box::new(register_words::WordState::new(window, capacity)));
     }
