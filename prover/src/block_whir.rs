@@ -6402,10 +6402,11 @@ fn prove_streamed(
                     // rows from the CPU logs, and needs each chunk's ECALL
                     // cycles, which the walkers read from the executor's
                     // history. Without record mode MEMW_R goes up as records.
-                    // `LAMBDA_VM_CARD_ROWS=words`: the walkers write MEMW_R's rows
-                    // as words the card builds them from. Needs record mode (the
-                    // ECALL cycles from the history) and the CPU logs kept; without
-                    // them MEMW_R goes up as rows, as today.
+                    // `LAMBDA_VM_CARD_ROWS=words`, the default: the walkers write
+                    // MEMW_R's rows as words the card builds them from. Needs record
+                    // mode (the ECALL cycles from the history) and the CPU logs kept;
+                    // without them MEMW_R goes up as rows (LOAD and STORE are still
+                    // derived).
                     if multilinear::gpu::card_rows_builds_words() {
                         let words = card_fill.memw_r && history && walkers > 0 && builder.keeps_logs();
                         if words {
@@ -7407,7 +7408,7 @@ fn prove_streamed(
         }
         // Phase B starts: an early start's windows go to their phase-B sizes.
         early_gate.store(true, std::sync::atomic::Ordering::Release);
-        // `LAMBDA_VM_CARD_ROWS=registers`: the card-built rows' counters as
+        // `LAMBDA_VM_CARD_ROWS=registers` or `words` (the default): the card-built rows' counters as
         // phase B starts (the block's end line holds both phases).
         if (multilinear::gpu::card_rows_builds_registers()
             || multilinear::gpu::card_rows_builds_words())

@@ -225,8 +225,9 @@ fn main() {
     // The table fills from records (`src/fill.rs`), loaded on first use, never
     // by the backend. Pinned on the host by `tests/host_kat/fill_host_kat.cpp`.
     compile_kernel("fill.cu", "fill.cubin", have_nvcc, &[]);
-    // The card-built LOAD and STORE rows from the cached CPU logs
-    // (`src/card_rows.rs`, `LAMBDA_VM_CARD_ROWS=derive`); includes fill.cu.
+    // The card-built LOAD, STORE and MEMW_R rows from the cached CPU logs
+    // (`src/card_rows.rs`, `LAMBDA_VM_CARD_ROWS`: derive, registers and the
+    // default, words); includes fill.cu.
     compile_kernel("card_rows.cu", "card_rows.cubin", have_nvcc, &[]);
     compile_kernel("ntt.cu", "ntt.cubin", have_nvcc, &[]);
     // The column-major LDE engine (`src/lde_cm.rs`). Pinned on the host by
