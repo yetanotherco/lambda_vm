@@ -2242,6 +2242,46 @@ fn live_regeneration_proves_the_same_bytes() {
     }
 }
 
+/// A block proves and verifies at the host's own memory target: `auto`
+/// regeneration with no target given, so the prove reads
+/// `LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB` or, unset, the machine's limit
+/// ([`block_whir::memory_target_bytes`]). On a large host nothing arms; on a
+/// small one (or with the knob set low) tables drop and come back. Either way
+/// the partition is the plain prove's, every dropped table is rebuilt, and the
+/// proof verifies. With the knob below 1 GiB the prove must arm. This is the
+/// test a low-memory run names to show the prover still works on a smaller
+/// machine.
+#[test]
+fn a_block_proves_at_the_hosts_memory_target() {
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let (plain, _) =
+        regenerated(&elf, &format, RegenMode::Off, Deviations::default()).expect("prove");
+    let target = block_whir::memory_target_bytes();
+    let (proof, stamps) =
+        regenerated(&elf, &format, RegenMode::Auto, Deviations::default()).expect("prove");
+    let r = stamps.regen.expect("live regeneration's readout");
+    let lines = r.lines.join("\n");
+    eprintln!(
+        "HOST TARGET TEST: target {:.6} GiB · dropped {} · regenerated {}",
+        target as f64 / (1u64 << 30) as f64,
+        r.dropped,
+        r.regenerated
+    );
+    assert_eq!(
+        r.regenerated, r.dropped,
+        "every dropped table back\n{lines}"
+    );
+    assert_eq!((r.mismatches, r.failed), (0, 0), "{lines}");
+    assert_eq!(r.error, None, "{lines}");
+    if target < 1 << 30 {
+        assert!(r.dropped > 0, "a target under 1 GiB must arm\n{lines}");
+    }
+    assert_eq!(proof.groups, plain.groups, "the partition");
+    assert!(verify(&proof, &elf, &format));
+}
+
 /// ★ The real-memory guard arms where the page-locked pool hides the host. A
 /// 24 GiB pool is locked at the prove's entry, and the target sits 16 GiB
 /// above what the host held before it. The netted reading (the pool's free

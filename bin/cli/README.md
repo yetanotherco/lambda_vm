@@ -103,8 +103,8 @@ cli prove-block <PROGRAM.elf> --input <BLOCK.bin> -o block.proof [--time] [--dig
 stdout carries the public output and the requested numbers; the run's progress lines go to stderr.
 
 The command runs the production posture: every knob in `POSTURE` (`prover/src/lfm/whir_block_tree.rs`) that the
-environment leaves unset is set to its posture value: the table parallelism, the row cap, the WHIR retention, the
-WHIR hash (RPX), the tree cache cap, the executor schedule and the grind search. The `BLOCK POSTURE` lines on stderr
+environment leaves unset is set to its posture value: the table parallelism, the WHIR retention, the tree cache cap,
+the executor schedule and the grind search. The `BLOCK POSTURE` lines on stderr
 say what was set and what came from the environment. The WHIR hash is a format knob, so `verify-block` sets it too:
 prove and verify under the same environment. The binary compiles in jemalloc's never-purge posture. The tree's
 leaf count, fan-in and argue format are the block verifier's; `W3_LEAVES`, `W3_FAN_IN` and `BLOCK_WHIR_ARGUE`
@@ -114,6 +114,21 @@ The compressed file's format is the CLI's constant (`whir_block_tree::DEFAULT_SH
 pinned format only (every format flag at its default). The compression knobs (`LAMBDA_VM_BLOCK_COMPRESS*`,
 `prover/src/lfm/compress.rs`) default to that format; a knob that makes another file is refused. To ship the top's
 file, at any format flags, give `--tree-file` (and `verify-block --tree-file`).
+
+#### Running on a smaller machine
+
+`prove-block` sizes its host memory to a target: by default the smaller of the cgroup's memory limit and the
+machine's `MemTotal`, less 10 GiB. When the trace it holds would pass that target, it drops tables after committing
+them and rebuilds them for the openings (live regeneration), so the same proof comes out with less memory held. To
+run on a machine with less memory than it reports, or to leave room for other processes, set the target yourself:
+
+```sh
+LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB=24 cli prove-block <PROGRAM.elf> --input <BLOCK.bin> -o block.proof
+```
+
+The value is in GiB (fractions allowed); the proof's bytes do not depend on it, only the peak memory and the time.
+The `BLOCK DROPS` and `BLOCK REGEN` lines on stderr say whether regeneration armed and how much it dropped. The old
+name `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB` is refused.
 
 ### Verify a block
 
