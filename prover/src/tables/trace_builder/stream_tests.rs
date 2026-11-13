@@ -966,6 +966,117 @@ fn with_keccak_rnd_first_the_sliding_stream_hands_keccak_rnd_on_first() {
     );
 }
 
+/// CPU's tables then LT's in `t`'s AIR order ([`air_order`]'s positions).
+fn cpu_lt_positions_of(t: &Traces) -> Vec<usize> {
+    let before = 5
+        + t.copies.len()
+        + t.keccaks.len()
+        + t.keccak_rnds.len()
+        + t.ecsms.len()
+        + t.ecdases.len()
+        + t.hints.len()
+        + usize::from(t.table_counts().blake3 == 1)
+        + t.is_whs.len();
+    (before..before + t.cpus.len() + t.lts.len()).collect()
+}
+
+/// ★ With CPU's and LT's tables handed on after KECCAK_RND's
+/// ([`WindowedTraceBuilder::cpu_lt_first`]), with KECCAK_RND first and
+/// without it, and BITWISE last, the sliding stream hands on the monolithic
+/// finish's tables word for word, each at its AIR position and each once,
+/// KECCAK_RND's first when asked, then CPU's and LT's at exactly their AIR
+/// positions (counted from the monolithic finish's tables, not by the finish's
+/// own reckoning), then the rest in AIR order, BITWISE last, under a header
+/// that says so: every configuration, windows of 7 and 1000 cycles, budgets of
+/// one byte and none, and one table building at once. In waves the order stays
+/// AIR order.
+#[test]
+fn with_cpu_lt_first_the_sliding_stream_hands_cpu_and_lt_on_after_keccak_rnd() {
+    let max_rows = MaxRowsConfig::small();
+    let mut reordered_with_tables = 0usize;
+    for name in ["test_keccak_multi", "all_instructions_64"] {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            for (config, configure) in &configs() {
+                let (builder, last) =
+                    pushed(&program, &logs, &max_rows, window, configure.as_ref());
+                let whole = builder.finish(last).expect("the monolithic finish");
+                let cpu_lt = cpu_lt_positions_of(&whole);
+                let want = air_order(&whole)
+                    .into_iter()
+                    .map(|t| t.map(shape_and_words))
+                    .collect::<Vec<_>>();
+                for keccak_rnd in [true, false] {
+                    for (slide, budget, build) in [
+                        (true, 1usize, None),
+                        (true, usize::MAX, None),
+                        (true, usize::MAX, Some(1)),
+                        (false, usize::MAX, None),
+                    ] {
+                        let what = format!(
+                            "{name} window {window} {config} KECCAK_RND first {keccak_rnd} slide \
+                             {slide} budget {budget} build {build:?}"
+                        );
+                        let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                            let b = configure(b).rest_bitwise_last().cpu_lt_first();
+                            let b = if keccak_rnd { b.keccak_rnd_first() } else { b };
+                            if slide { b.slide_rest() } else { b }
+                        });
+                        let (header, got, _) = streamed_capped(builder, last, budget, build);
+                        let reordered = slide && cfg!(feature = "parallel");
+                        assert_eq!(header.cpu_lt_first, reordered, "{what}: the header");
+                        let mut first: Vec<usize> = if reordered && keccak_rnd {
+                            crate::block_whir::chunked_table_ranges(&header.table_counts)
+                                .into_iter()
+                                .find(|(family, ..)| *family == "KECCAK_RND")
+                                .map(|(_, range, _)| range.collect())
+                                .expect("KECCAK_RND's range")
+                        } else {
+                            Vec::new()
+                        };
+                        if reordered {
+                            first.extend(&cpu_lt);
+                        }
+                        let positions: Vec<usize> = got.iter().map(|e| e.position).collect();
+                        assert_eq!(
+                            positions,
+                            hand_on_order_first(want.len(), &first, reordered.then_some(0)),
+                            "{what}: the hand-on order"
+                        );
+                        let mut seen = positions.clone();
+                        seen.sort_unstable();
+                        assert_eq!(
+                            seen,
+                            (0..want.len()).collect::<Vec<_>>(),
+                            "{what}: every table once"
+                        );
+                        for e in &got {
+                            assert!(
+                                e.table.as_ref().map(shape_and_words) == want[e.position],
+                                "{what}: table {}",
+                                e.position
+                            );
+                        }
+                        // A built CPU or LT table handed on before DECODE (position 1).
+                        let decode = positions.iter().position(|&p| p == 1).expect("DECODE");
+                        if reordered
+                            && got[..decode]
+                                .iter()
+                                .any(|e| cpu_lt.contains(&e.position) && e.table.is_some())
+                        {
+                            reordered_with_tables += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        reordered_with_tables > 0 || !cfg!(feature = "parallel"),
+        "no stream handed a built CPU or LT table on before DECODE"
+    );
+}
+
 /// Handed on first under a one-byte budget, with BITWISE last, the tables go
 /// one at a time in the order `first`, AIR order, BITWISE, and the stream
 /// completes (a named timeout, not a hang, if the gate's lowest-pending rule

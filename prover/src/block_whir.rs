@@ -1441,6 +1441,33 @@ fn block_keccak_rnd_first() -> Result<bool, Error> {
     )
 }
 
+/// `LAMBDA_VM_BLOCK_CPU_LT_FIRST`: `1` has the streamed finish, when it slides,
+/// hand on and start CPU's and LT's tables right after KECCAK_RND's
+/// ([`WindowedTraceBuilder::cpu_lt_first`]), so CPU's last chunk and LT, the
+/// finish's longest builds, start as the finish does and the card commits them
+/// sooner. Unset, empty or `0` (the default): as without it. Anything else
+/// refuses the prove. The tables are the same; the groups they are packed
+/// into, and so the proof's bytes, are not; the verifier takes any partition
+/// the statement declares.
+fn block_cpu_lt_first() -> Result<bool, Error> {
+    parse_cpu_lt_first(
+        std::env::var("LAMBDA_VM_BLOCK_CPU_LT_FIRST")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_cpu_lt_first(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_CPU_LT_FIRST={v}: 1 (CPU's and LT's tables handed on after \
+             KECCAK_RND's) or 0"
+        ))),
+    }
+}
+
 fn parse_keccak_rnd_first(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
         None | Some("" | "1") => Ok(true),
@@ -3740,6 +3767,10 @@ pub(crate) struct Deviations {
     /// `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST` says (`None`;
     /// [`block_keccak_rnd_first`]).
     pub keccak_rnd_first: Option<bool>,
+    /// CPU's and LT's tables handed on right after KECCAK_RND's (`Some(true)`)
+    /// or not (`Some(false)`), instead of what `LAMBDA_VM_BLOCK_CPU_LT_FIRST`
+    /// says (`None`; [`block_cpu_lt_first`]).
+    pub cpu_lt_first: Option<bool>,
     /// The hand-out's counting on a thread of its own (`Some(true)`) or on
     /// the accumulator's (`Some(false)`), instead of what
     /// `LAMBDA_VM_HANDOUT_COUNT_THREAD` says (`None`;
@@ -4844,6 +4875,35 @@ impl RestOrder {
     }
 }
 
+/// Whether `name` is a table of `family`'s AIR: the family's name alone, or
+/// followed by `[index]` (so CPU32's tables are not CPU's).
+fn of_family(name: &str, family: &str) -> bool {
+    name.strip_prefix(family)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('['))
+}
+
+/// The rest's positions of CPU's tables then LT's, each in AIR order: the order
+/// the finish hands them on in right after KECCAK_RND's
+/// ([`crate::tables::trace_builder::RestHeader::cpu_lt_first`]). Refused unless
+/// each family has as many tables among the AIRs as the header counts.
+fn cpu_lt_positions(counts: &TableCounts, names: &[&str]) -> Result<Vec<usize>, Error> {
+    let mut first = Vec::new();
+    for (family, count) in [("CPU", counts.cpu), ("LT", counts.lt)] {
+        let positions: Vec<usize> = (0..names.len())
+            .filter(|&p| of_family(names[p], family))
+            .collect();
+        if positions.len() != count {
+            return Err(Error::Prover(format!(
+                "CPU and LT go after KECCAK_RND, but the rest has {} {family} table(s) where \
+                 the header counts {count}",
+                positions.len()
+            )));
+        }
+        first.extend(positions);
+    }
+    Ok(first)
+}
+
 /// The rest's positions of KECCAK_RND's tables, the order the finish hands them
 /// on in when it hands them first: their range among the chunked tables
 /// ([`chunked_table_ranges`]), each checked to name a KECCAK_RND AIR.
@@ -5662,12 +5722,22 @@ fn lay_out_rest_streamed<'a>(
     });
     marks.push(("airs", at()));
     let refs = airs.air_refs();
-    let first = if header.keccak_rnd_first {
-        let names: Vec<&str> = refs.iter().map(|air| air.name()).collect();
+    let names: Vec<&str> = refs.iter().map(|air| air.name()).collect();
+    let keccak_rnd_first = if header.keccak_rnd_first {
         keccak_rnd_positions(&header.table_counts, &names)?
     } else {
         Vec::new()
     };
+    let cpu_lt_first = if header.cpu_lt_first {
+        cpu_lt_positions(&header.table_counts, &names)?
+    } else {
+        Vec::new()
+    };
+    let first: Vec<usize> = keccak_rnd_first
+        .iter()
+        .chain(&cpu_lt_first)
+        .copied()
+        .collect();
     let mut order = RestOrder::with_first(
         refs.iter().map(|air| air.trace_layout().0).collect(),
         &first,
@@ -5678,15 +5748,25 @@ fn lay_out_rest_streamed<'a>(
             "the rest's BITWISE goes last, but BITWISE is not the rest's first table".into(),
         ));
     }
+    let listed = |positions: &[usize]| {
+        positions
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     if header.keccak_rnd_first {
         eprintln!(
             "BLOCK REST ORDER: KECCAK_RND first · {} table(s) at [{}]",
-            first.len(),
-            first
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
+            keccak_rnd_first.len(),
+            listed(&keccak_rnd_first)
+        );
+    }
+    if header.cpu_lt_first {
+        eprintln!(
+            "BLOCK REST ORDER: CPU and LT after KECCAK_RND · {} table(s) at [{}]",
+            cpu_lt_first.len(),
+            listed(&cpu_lt_first)
         );
     }
     let mut timed: Vec<(usize, f64)> = Vec::new();
@@ -6056,6 +6136,10 @@ fn prove_streamed(
             Some(first) => first,
             None => block_keccak_rnd_first()?,
         };
+        let cpu_lt_first = match deviations.cpu_lt_first {
+            Some(first) => first,
+            None => block_cpu_lt_first()?,
+        };
         let from_tables = match deviations.bitwise_from_tables {
             Some(from_tables) => from_tables,
             None => block_bitwise_from_tables()?,
@@ -6382,6 +6466,9 @@ fn prove_streamed(
                 }
                 if keccak_rnd_first {
                     builder = builder.keccak_rnd_first();
+                }
+                if cpu_lt_first {
+                    builder = builder.cpu_lt_first();
                 }
                 builder = builder.slide_rest();
                 builder = builder.keccak_rnd_form(format.keccak_rnd);
@@ -9219,6 +9306,117 @@ mod keccak_rnd_first_tests {
         }
         for value in ["on", "true", "2", "first", "KECCAK_RND"] {
             assert!(parse_keccak_rnd_first(Some(value)).is_err(), "{value}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod cpu_lt_first_tests {
+    use super::{cpu_lt_positions, of_family, parse_cpu_lt_first};
+
+    fn counts(cpu: usize, lt: usize) -> crate::TableCounts {
+        crate::TableCounts {
+            cpu,
+            lt,
+            memw: 0,
+            memw_aligned: 0,
+            load: 0,
+            mul: 0,
+            dvrm: 0,
+            shift: 0,
+            branch: 0,
+            memw_register: 0,
+            eq: 0,
+            bytewise: 0,
+            store: 0,
+            cpu32: 1,
+            keccak: 0,
+            keccak_rnd: 0,
+            ecsm: 0,
+            ecdas: 0,
+            hint: 0,
+            copy: 0,
+            blake3: 0,
+            is_wh: 0,
+            ecrec: 0,
+        }
+    }
+
+    /// The rest's AIR names as far as they matter here: the five fixed
+    /// tables, `cpu` CPU and `lt` LT tables between others, and CPU32 last.
+    fn names(cpu: usize, lt: usize) -> Vec<String> {
+        [
+            "BITWISE",
+            "DECODE",
+            "KECCAK_RC",
+            "REGISTER",
+            "HALT",
+            "KECCAK_RND[0]",
+        ]
+        .iter()
+        .map(|n| n.to_string())
+        .chain((0..cpu).map(|i| format!("CPU[{i}]")))
+        .chain((0..lt).map(|i| format!("LT[{i}]")))
+        .chain(["SHIFT[0]".to_string(), "CPU32[0]".to_string()])
+        .collect()
+    }
+
+    /// A family's tables are its name alone or with an index; CPU32's are
+    /// not CPU's, LTX would not be LT's.
+    #[test]
+    fn a_family_is_its_name_or_its_name_and_an_index() {
+        for (name, family, is) in [
+            ("CPU", "CPU", true),
+            ("CPU[57]", "CPU", true),
+            ("CPU32[0]", "CPU", false),
+            ("CPU32", "CPU", false),
+            ("LT[3]", "LT", true),
+            ("LTX[0]", "LT", false),
+            ("MEMW_A[0]", "MEMW", false),
+        ] {
+            assert_eq!(of_family(name, family), is, "{name} of {family}");
+        }
+    }
+
+    /// CPU's positions then LT's, each in AIR order, CPU32's left out; a
+    /// count the AIRs do not hold is refused.
+    #[test]
+    fn cpu_lt_positions_are_cpus_then_lts_and_match_the_counts() {
+        let owned = names(3, 2);
+        let n: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert_eq!(
+            cpu_lt_positions(&counts(3, 2), &n).ok(),
+            Some(vec![6, 7, 8, 9, 10])
+        );
+        let owned = names(1, 0);
+        let one: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert_eq!(cpu_lt_positions(&counts(1, 0), &one).ok(), Some(vec![6]));
+        let err = cpu_lt_positions(&counts(4, 2), &n).expect_err("one CPU table short");
+        assert!(
+            format!("{err:?}").contains("3 CPU table(s) where the header counts 4"),
+            "{err:?}"
+        );
+        let err = cpu_lt_positions(&counts(3, 1), &n).expect_err("one LT table too many");
+        assert!(
+            format!("{err:?}").contains("2 LT table(s) where the header counts 1"),
+            "{err:?}"
+        );
+    }
+
+    /// `LAMBDA_VM_BLOCK_CPU_LT_FIRST`: off unless `1`; any other word
+    /// refuses.
+    #[test]
+    fn the_cpu_lt_first_knob_is_off_by_default_and_on_at_1() {
+        for (value, on) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some(" 1 "), true),
+        ] {
+            assert_eq!(parse_cpu_lt_first(value).ok(), Some(on), "{value:?}");
+        }
+        for value in ["on", "true", "2", "CPU", "LT"] {
+            assert!(parse_cpu_lt_first(Some(value)).is_err(), "{value}");
         }
     }
 }
