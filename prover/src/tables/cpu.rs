@@ -318,6 +318,35 @@ pub mod cols {
     pub const RES: [usize; 4] = [RES_0, RES_1, RES_2, RES_3];
 }
 
+/// The CPU table's columns: [`cols::NUM_COLUMNS`], and under the
+/// measurement-only register-shape probe ([`crate::regs_probe`]) its
+/// [`probe_cols`] after them.
+pub fn num_columns() -> usize {
+    num_columns_for(crate::regs_probe::on())
+}
+
+/// [`num_columns`] with the probe `on` or off.
+pub fn num_columns_for(probe: bool) -> usize {
+    if probe {
+        cols::NUM_COLUMNS + crate::regs_probe::EXTRA_CPU_COLUMNS
+    } else {
+        cols::NUM_COLUMNS
+    }
+}
+
+/// The columns the register-shape probe ([`crate::regs_probe`]) adds after
+/// [`cols::NUM_COLUMNS`]: each register slot's previous timestamp and `rd`'s
+/// old value, as the format with the registers in the CPU row carries them.
+/// The probe leaves them zero.
+pub mod probe_cols {
+    use super::cols::NUM_COLUMNS;
+    pub const PREV_TS_1: usize = NUM_COLUMNS;
+    pub const PREV_TS_2: usize = NUM_COLUMNS + 1;
+    pub const PREV_TS_D: usize = NUM_COLUMNS + 2;
+    pub const OLD_RD_0: usize = NUM_COLUMNS + 3;
+    pub const OLD_RD_1: usize = NUM_COLUMNS + 4;
+}
+
 // =========================================================================
 // CPU Operation (for trace generation)
 // =========================================================================
@@ -823,7 +852,7 @@ pub(crate) fn generate_cpu_trace_segments_as(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n: usize = segments.iter().map(|s| s.len()).sum();
     let num_rows = n.next_power_of_two().max(4);
-    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |t| {
+    generate_main!(form, &WIDTHS, num_rows, num_columns(), |t| {
         fill_cpu_rows(t, segments, decode, num_rows)
     })
 }
@@ -1029,8 +1058,123 @@ fn timestamp_slot(ts_base: u64, offset: i64) -> BusValue {
 }
 
 /// Returns the bus interactions for a CPU table whose timestamps start at
-/// `ts_base` (`4·S_k` for table `k`, see [`timestamp_bases`]).
+/// `ts_base` (`4·S_k` for table `k`, see [`timestamp_bases`]); under the
+/// measurement-only register-shape probe, [`probe_interactions`].
 pub fn bus_interactions(ts_base: u64) -> Vec<BusInteraction> {
+    if crate::regs_probe::on() {
+        probe_interactions(ts_base)
+    } else {
+        today_interactions(ts_base)
+    }
+}
+
+/// The register-shape probe's CPU row ([`crate::regs_probe`]; never a
+/// proof's): today's interactions but the three MEMW register sends and the
+/// four PC tokens (13), then the row of the format that moves the register
+/// accesses into the CPU row (11), 24 in all, the GKR slots today's 20 take.
+/// Each register slot consumes its register's token at its previous
+/// timestamp, produces it at its own, and range-checks the step; the PC is one
+/// token, consumed at `ts − 3 + 3·pc_double_read` and produced at `ts + 1`.
+/// The tokens ride [`BusId::Memory`] as `(register, timestamp, low word, high
+/// word)`: the bus is a stand-in, its cost is per interaction and per value.
+/// Nothing receives what these send, so a block proved with them does not
+/// verify.
+pub fn probe_interactions(ts_base: u64) -> Vec<BusInteraction> {
+    use probe_cols::*;
+    let mut interactions: Vec<BusInteraction> = today_interactions(ts_base)
+        .into_iter()
+        .filter(|i| i.bus_id != BusId::Memw as u64 && i.bus_id != BusId::Memory as u64)
+        .collect();
+    let column = |c: usize| BusValue::Packed {
+        start_column: c,
+        packing: Packing::Direct,
+    };
+    // `ts + offset − prev − 1`: a slot's step, less one.
+    let step = |offset: i64, prev: usize| {
+        let mut terms = timestamp_terms(ts_base, offset - 1);
+        terms.push(LinearTerm::Column {
+            coefficient: -1,
+            column: prev,
+        });
+        BusValue::linear(terms)
+    };
+    for (flag, reg, prev, offset, old, new) in [
+        (
+            cols::READ_REGISTER1,
+            cols::RS1,
+            PREV_TS_1,
+            0,
+            (cols::RV1_0, cols::RV1_1),
+            (cols::RV1_0, cols::RV1_1),
+        ),
+        (
+            cols::READ_REGISTER2,
+            cols::RS2,
+            PREV_TS_2,
+            1,
+            (cols::RV2_0, cols::RV2_1),
+            (cols::RV2_0, cols::RV2_1),
+        ),
+        (
+            cols::WRITE_REGISTER,
+            cols::RD,
+            PREV_TS_D,
+            2,
+            (OLD_RD_0, OLD_RD_1),
+            (cols::RVD_0, cols::RVD_1),
+        ),
+    ] {
+        interactions.push(BusInteraction::sender(
+            BusId::Memory,
+            Multiplicity::Column(flag),
+            vec![column(reg), column(prev), column(old.0), column(old.1)],
+        ));
+        interactions.push(BusInteraction::receiver(
+            BusId::Memory,
+            Multiplicity::Column(flag),
+            vec![
+                column(reg),
+                timestamp_slot(ts_base, offset),
+                column(new.0),
+                column(new.1),
+            ],
+        ));
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(flag),
+            vec![step(offset, prev)],
+        ));
+    }
+    let mut prev_pc_ts = timestamp_terms(ts_base, -3);
+    prev_pc_ts.push(LinearTerm::Column {
+        coefficient: 3,
+        column: cols::PC_DOUBLE_READ,
+    });
+    interactions.push(BusInteraction::sender(
+        BusId::Memory,
+        Multiplicity::One,
+        vec![
+            BusValue::constant(255),
+            BusValue::linear(prev_pc_ts),
+            column(cols::PC_0),
+            column(cols::PC_1),
+        ],
+    ));
+    interactions.push(BusInteraction::receiver(
+        BusId::Memory,
+        Multiplicity::One,
+        vec![
+            BusValue::constant(255),
+            timestamp_slot(ts_base, 1),
+            column(cols::NEXT_PC_0),
+            column(cols::NEXT_PC_1),
+        ],
+    ));
+    interactions
+}
+
+/// Today's CPU interactions ([`bus_interactions`] with the probe off).
+pub(crate) fn today_interactions(ts_base: u64) -> Vec<BusInteraction> {
     use super::types::packed_decode_shrunk as pd;
 
     let mut interactions = Vec::with_capacity(24);

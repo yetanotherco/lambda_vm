@@ -1813,6 +1813,86 @@ impl MemwSink for MemwBuckets {
     }
 }
 
+/// The measurement-only register-shape probe's sink for a CPU row's own
+/// register accesses (`crate::regs_probe`; its proofs never verify): an access
+/// whose step the range check takes makes no row at all, as in the format that
+/// checks it in the CPU row itself; one past it, and every other op, goes to
+/// the walk's buckets as today.
+struct CpuRowProbeSink<'a, S: MemwSink>(&'a mut S);
+
+impl<S: MemwSink> MemwSink for CpuRowProbeSink<'_, S> {
+    #[inline]
+    fn push_op(&mut self, op: MemwOperation) {
+        self.0.push_op(op);
+    }
+
+    #[inline]
+    fn push_reg_access(
+        &mut self,
+        reg_addr: u64,
+        val: [u32; 2],
+        old: [u32; 2],
+        timestamp: u64,
+        old_ts: u64,
+        is_read: bool,
+    ) {
+        if !reg_ts_delta_in_range(timestamp, old_ts) {
+            self.0
+                .push_reg_access(reg_addr, val, old, timestamp, old_ts, is_read);
+        }
+    }
+}
+
+#[cfg(test)]
+mod regs_probe_sink_tests {
+    use super::*;
+
+    /// The probe's sink drops a CPU row's register access whose step fits
+    /// the range check, routes one past it as today (to the aligned bucket),
+    /// and passes any other op on unchanged.
+    #[test]
+    fn the_probe_sink_drops_only_in_range_register_accesses() {
+        let mut today = MemwBuckets::default();
+        let mut probed = MemwBuckets::default();
+        let accesses = [
+            // (timestamp, old timestamp): steps 1, 2^16, 2^16 + 1, and a
+            // timestamp across a high-word boundary.
+            (100u64, 99u64),
+            (0x2_0000, 0x1_0000),
+            (0x2_0001, 0x1_0000),
+            (1 << 32, (1 << 32) - 4),
+        ];
+        for &(ts, old_ts) in &accesses {
+            for (sink, probe) in [(&mut today, false), (&mut probed, true)] {
+                if probe {
+                    CpuRowProbeSink(&mut *sink).push_reg_access(
+                        2 * 7,
+                        [5, 6],
+                        [3, 4],
+                        ts,
+                        old_ts,
+                        false,
+                    );
+                } else {
+                    sink.push_reg_access(2 * 7, [5, 6], [3, 4], ts, old_ts, false);
+                }
+            }
+        }
+        assert_eq!(today.register_rows.len(), 2);
+        assert_eq!(probed.register_rows.len(), 0);
+        let routed = |b: &MemwBuckets| b.aligned.len() + b.general.len();
+        assert_eq!(routed(&today), 2);
+        assert_eq!(routed(&probed), routed(&today));
+        // Another op passes through.
+        let op = MemwOperation::new(false, 0x1000, [1, 0, 0, 0, 0, 0, 0, 0], 40, 8, true)
+            .with_old([1, 0, 0, 0, 0, 0, 0, 0], [8; 8]);
+        let route = classify_memw(&op);
+        CpuRowProbeSink(&mut probed).push_op(op);
+        assert_eq!(route, MemwRoute::Aligned);
+        assert_eq!(routed(&probed), 3);
+    }
+}
+
 /// Materialize the aligned/general `MemwOperation` for a register access that does
 /// NOT fit the MEMW_R fast path. Register values pack as `[lo, hi, 0, …]` (see
 /// [`pack_register_value`]) and both words share `old_ts`, so this rebuilds exactly
@@ -2173,6 +2253,9 @@ fn walk_cpu_ops<const REST: bool>(
     // from x254 and break the COPY chip's Memw token (see the drift assert below).
     let start_commit_index = register_state.read_index().0;
     let mut current_commit_index = start_commit_index;
+    // The measurement-only register-shape probe (`crate::regs_probe`): the
+    // CPU row's own register accesses make no MEMW_R row.
+    let regs_probe = crate::regs_probe::on();
 
     for op in cpu_ops {
         let op = decode.op(op);
@@ -2208,7 +2291,11 @@ fn walk_cpu_ops<const REST: bool>(
         }
 
         // Collect register operations (M1, M3, M5)
-        collect_register_ops_from_cpu(op, register_state, memw);
+        if regs_probe && !op.decode.fields.word_instr {
+            collect_register_ops_from_cpu(op, register_state, &mut CpuRowProbeSink(&mut *memw));
+        } else {
+            collect_register_ops_from_cpu(op, register_state, memw);
+        }
 
         // The commit syscall (ecall 64): the COPY chip receives the ECALL, reads the operand
         // registers, advances x254 and moves the bytes into the COMMIT domain.

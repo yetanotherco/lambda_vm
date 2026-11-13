@@ -139,7 +139,7 @@ impl TableRecords for CpuLogRecords {
     }
 
     fn cols(&self) -> usize {
-        cpu::cols::NUM_COLUMNS
+        cpu::num_columns()
     }
 
     fn fill(&self) -> RecordsFill<'_> {
