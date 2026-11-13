@@ -5007,7 +5007,7 @@ pub(crate) mod head_log;
 #[cfg(test)]
 mod regen_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "parallel"))]
 mod clock_census_tests;
 
 #[cfg(test)]
