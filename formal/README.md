@@ -176,9 +176,12 @@ Counted pulls in the LT model need two things Clean main lacks:
    requirements on the same channel when the requirements depend only on
    channels finished earlier.
 
-The model takes both from the `counted-pulls` branch of
-[yetanotherco/clean](https://github.com/yetanotherco/clean/tree/counted-pulls),
-Clean main `f3abad7c` plus three commits: `Balance.logUpUpTo N` with
+The model takes both from the `yetanotherco/clean` fork, pinned in
+`lakefile.toml` by sha at
+[`73309694`](https://github.com/yetanotherco/clean/commit/73309694ae33279094597f7f3f819fb8a3439620)
+— by sha, not by branch name, so the pin survives the branch being renamed or
+deleted once the upstream PRs land. That is Clean main `f3abad7c` plus three
+commits, and four review fixes answering the audit of them: `Balance.logUpUpTo N` with
 `RawChannel.ConsistentUpTo N`, the typed `Channel.counted N`, and
 `Ensemble.tableSoundness_of_staged` / `_stagedOn` (soundness by finishing
 order of channels, and of message classes within a channel). On top of it:
@@ -208,7 +211,7 @@ into the ensemble. Each provider assumes its own answers are correct; nothing
 in the file derives that from a row of BITWISE. `CountedSameBus` reuses those
 two components, so the LT answers it feeds to CMIN are assumed in the same way.
 
-`EqLookup`, in this same PR, is the contrast. Its `pushStatic` emits the
+`EqLookup`, already in the model (PR #1027), is the contrast. Its `pushStatic` emits the
 entries of a real `StaticLookupChannel` and proves the guarantee from
 membership in the table, so `eq_rows_correct` discharges `witness.Assumptions`
 outright — "no component assumes anything" — and states a conclusion about
