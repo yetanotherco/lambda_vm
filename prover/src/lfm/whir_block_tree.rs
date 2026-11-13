@@ -1269,6 +1269,52 @@ pub(crate) fn early_leaf_first(mut order: Vec<TreeAt>, first: Option<usize>) -> 
     order
 }
 
+/// How much longer a later early leaf's execute + fill is taken to run than the
+/// first early leaf's, scaled by their costs: it runs beside phase B's end and
+/// the tree's start, with more on the host than the first had.
+pub(crate) const EARLY_FIT_FACTOR: f64 = 1.3;
+
+/// A later early leaf's fit ([`early_leaf_fits`]): when its execute + fill is
+/// predicted to end, when the base is, and whether the first is before the
+/// second.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EarlyFit {
+    pub(crate) fill_end: f64,
+    pub(crate) base_end: f64,
+    pub(crate) fits: bool,
+}
+
+/// Whether a leaf after the first goes early (`W3_EARLY_LEAVES` > 1): only when
+/// its execute + fill, predicted from the first early leaf's measured one scaled
+/// by the leaves' plan costs and by [`EARLY_FIT_FACTOR`], ends before the base
+/// is predicted to end. The base's end is now plus phase B's groups still to
+/// come, at the pace phase B has kept since its first group. Seconds are since
+/// the prove started; costs are the plan's. `None` (stay for the tree) while
+/// either pace is unknown: the first early leaf's fill has not ended, or no
+/// group has followed phase B's first.
+pub(crate) fn early_leaf_fits(
+    now: f64,
+    leaf_cost: u64,
+    first_fill: Option<(f64, u64)>,
+    first_group_at: Option<f64>,
+    cost_since_first_group: u64,
+    cost_to_come: u64,
+) -> Option<EarlyFit> {
+    let (first_secs, first_cost) = first_fill?;
+    let t1 = first_group_at?;
+    if first_cost == 0 || cost_since_first_group == 0 || now <= t1 {
+        return None;
+    }
+    let pace = (now - t1) / cost_since_first_group as f64;
+    let base_end = now + pace * cost_to_come as f64;
+    let fill_end = now + EARLY_FIT_FACTOR * first_secs * leaf_cost as f64 / first_cost as f64;
+    Some(EarlyFit {
+        fill_end,
+        base_end,
+        fits: fill_end <= base_end,
+    })
+}
+
 /// `order` with the leaves `first` taken before the others, in `first`'s
 /// order ([`early_leaf_first`] for each, the last first); with one leaf it is
 /// [`early_leaf_first`].
@@ -1597,6 +1643,7 @@ pub(crate) fn prove_tree_pipelined(
     stream_top: Option<&std::sync::OnceLock<bool>>,
     exec_early: bool,
     top_handoff: Option<&TopHandoff>,
+    base_end: f64,
     say: &(dyn Fn(&str) + Sync),
 ) -> Result<
     (
@@ -1997,7 +2044,9 @@ pub(crate) fn prove_tree_pipelined(
             stamps
                 .iter()
                 .map(|(k, at, started, secs)| format!(
-                    "leaf {k} complete at {at:.2}s, execute + fill from {started:.2}s for {secs:.2}s"
+                    "leaf {k} complete at {at:.2}s, execute + fill from {started:.2}s for {secs:.2}s, \
+                     margin {:+.2}s to the base's end",
+                    base_end - (started + secs)
                 ))
                 .collect::<Vec<_>>()
                 .join(" · ")
@@ -2109,7 +2158,7 @@ type Planned = (
     f64,
     Option<f64>,
     f64,
-    Vec<EarlyLeaf>,
+    (Vec<EarlyLeaf>, Vec<String>),
 );
 
 /// ★ W3 on a real block, run the way a prover runs it:
@@ -2332,12 +2381,27 @@ pub fn prove_whir_block_tree(
             let (looped, emitted) = std::thread::scope(|inner| {
                 let emitter = beside
                     .map(|(permits, threads)| inner.spawn(move || emit_leaves(permits, threads)));
-                let looped = (|| -> Result<Vec<EarlyLeaf>, String> {
+                let looped = (|| -> Result<(Vec<EarlyLeaf>, Vec<String>), String> {
                     // The groups as phase B finishes them (none unless `early_on`):
                     // each leaf complete while a group is still to come, up to
                     // `W3_EARLY_LEAVES` of them, runs its execute + fill now, on a
                     // thread of its own; the first also warms the first prove.
                     let mut early: Vec<EarlyLeaf> = Vec::new();
+                    // A later leaf goes early only if it fits before the base ends
+                    // ([`early_leaf_fits`]): the paces it is predicted from, and
+                    // the leaves it kept for the tree.
+                    let costs: Vec<u64> = plan.costs().iter().map(|&c| c as u64).collect();
+                    let leaf_cost = |k: usize| -> u64 {
+                        plan.partition().leaf(k).iter().map(|&g| costs.get(g).copied().unwrap_or(0)).sum()
+                    };
+                    let mut cost_to_come: u64 = costs.iter().sum();
+                    let mut first_group_at: Option<f64> = None;
+                    let mut cost_since_first_group: u64 = 0;
+                    let first_fill: std::sync::Arc<std::sync::Mutex<Option<f64>>> =
+                        std::sync::Arc::new(std::sync::Mutex::new(None));
+                    let mut first_cost: u64 = 0;
+                    let mut kept: Vec<usize> = Vec::new();
+                    let mut fit_notes: Vec<String> = Vec::new();
                     let mut words: Vec<Option<Vec<LfmWord>>> =
                         (0..plan.num_groups()).map(|_| None).collect();
                     let mut block_roots = Vec::new();
@@ -2346,6 +2410,12 @@ pub fn prove_whir_block_tree(
                     while let Ok(msg) = grx.recv() {
                         done += 1;
                         let g = msg.group;
+                        let c = costs.get(g).copied().unwrap_or(0);
+                        cost_to_come = cost_to_come.saturating_sub(c);
+                        match first_group_at {
+                            None => first_group_at = Some(msg.at),
+                            Some(_) => cost_since_first_group += c,
+                        }
                         let slot = words.get_mut(g).ok_or("a group the plan does not hold")?;
                         *slot = Some(group_arena_words(
                             &plan,
@@ -2364,11 +2434,43 @@ pub fn prove_whir_block_tree(
                         }
                         let partition = plan.partition();
                         let complete = (0..partition.num_leaves())
-                            .filter(|&k| early.iter().all(|e| e.leaf != k))
+                            .filter(|&k| early.iter().all(|e| e.leaf != k) && !kept.contains(&k))
                             .find(|&k| partition.leaf(k).iter().all(|&g| words[g].is_some()))
                             .filter(|&k| k < upto);
+                        // After the first: only a leaf whose execute + fill fits
+                        // before the base ends; one that does not stays for the
+                        // tree, and so does one whose fit cannot be told yet.
+                        let complete = match complete {
+                            Some(k) if !early.is_empty() => {
+                                let measured = *first_fill.lock().unwrap_or_else(|e| e.into_inner());
+                                match early_leaf_fits(
+                                    msg.at,
+                                    leaf_cost(k),
+                                    measured.map(|s| (s, first_cost)),
+                                    first_group_at,
+                                    cost_since_first_group,
+                                    cost_to_come,
+                                ) {
+                                    Some(fit) if fit.fits => Some(k),
+                                    Some(fit) => {
+                                        kept.push(k);
+                                        fit_notes.push(format!(
+                                            "leaf {k} complete at {:.2}s kept for the tree: execute + fill predicted to end {:.2}s, the base {:.2}s",
+                                            msg.at, fit.fill_end, fit.base_end
+                                        ));
+                                        None
+                                    }
+                                    None => None,
+                                }
+                            }
+                            other => other,
+                        };
                         if let Some(k) = complete {
                             let first = early.is_empty();
+                            if first {
+                                first_cost = leaf_cost(k);
+                            }
+                            let first_fill_slot = first_fill.clone();
                             let groups: Vec<Vec<LfmWord>> = partition
                                 .leaf(k)
                                 .iter()
@@ -2404,6 +2506,8 @@ pub fn prove_whir_block_tree(
                                     lfm_execute_and_fill(&program.program, &arena, hasher)
                                         .map_err(|e| format!("early leaf {k}: {e:?}"))?;
                                 let secs = t.elapsed().as_secs_f64();
+                                *first_fill_slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(secs);
                                 let wrap = super::proof::aggregation_wrap_options();
                                 // Its tables' domains and twiddles, warm before
                                 // the tree's first card hold (`LFM_WARM_DOMAINS`).
@@ -2441,7 +2545,7 @@ pub fn prove_whir_block_tree(
                             });
                         }
                     }
-                    Ok(early)
+                    Ok((early, fit_notes))
                 })();
                 // Every admitted leaf published before the tree may look: an
                 // empty slot is, to it, a leaf the budget left to the tree.
@@ -2490,7 +2594,16 @@ pub fn prove_whir_block_tree(
     // the block found its memory short, or as `LAMBDA_VM_ALLOC_PURGE` names it
     // (`alloc_purge`).
     crate::alloc_purge::purge_point("base");
-    let (plan, programs, upto, tree_budget, stated_at, first_ready_at, ready_at, early) = pre
+    let (
+        plan,
+        programs,
+        upto,
+        tree_budget,
+        stated_at,
+        first_ready_at,
+        ready_at,
+        (early, fit_notes),
+    ) = pre
         .map_err(|_| "the planner panicked".to_string())?
         .map_err(|e| format!("the plan and the leaves derive: {e}"))?;
     sink.write(&stamps.report());
@@ -2589,6 +2702,9 @@ pub fn prove_whir_block_tree(
         lead.taken(),
         &early.iter().map(|e| e.leaf).collect::<Vec<_>>(),
     ));
+    for note in &fit_notes {
+        sink.line(&format!("W3 EARLY LEAF KEPT: {note}"));
+    }
     sink.line(&format!(
         "W3 TREE PROGRAM BUDGET: {}",
         match &tree_budget {
@@ -2708,6 +2824,7 @@ pub fn prove_whir_block_tree(
             stream_top.then_some(&top_streamed),
             exec_early,
             handoff.as_ref(),
+            base,
             &|line: &str| sink.line(line),
         )
     })
@@ -4096,6 +4213,41 @@ mod tests {
         assert_eq!(early_leaves_setting(None), Ok(1));
         assert_eq!(early_leaves_setting(Some(3)), Ok(3));
         assert!(early_leaves_setting(Some(0)).is_err());
+    }
+
+    /// A later leaf goes early only when its predicted execute + fill ends
+    /// before the base's predicted end; with either pace unknown it stays.
+    #[test]
+    fn the_early_leaves_fit_only_before_the_base_ends() {
+        // Phase B: first group at 10 s, 100 cost units since in 5 s (0.05 s a
+        // unit), 60 units to come: the base ends at 15 + 3 = 18 s.
+        let fit =
+            early_leaf_fits(15.0, 40, Some((1.0, 40)), Some(10.0), 100, 60).expect("both paces");
+        assert_eq!(fit.base_end, 18.0);
+        assert!((fit.fill_end - (15.0 + EARLY_FIT_FACTOR)).abs() < 1e-9);
+        assert!(fit.fits);
+        // Twice the first's cost and a slower first fill: past the base's end.
+        let late =
+            early_leaf_fits(15.0, 80, Some((1.5, 40)), Some(10.0), 100, 60).expect("both paces");
+        assert!(!late.fits && late.fill_end > late.base_end);
+        // Little left of phase B: no room.
+        let tight =
+            early_leaf_fits(17.9, 40, Some((1.0, 40)), Some(10.0), 158, 2).expect("both paces");
+        assert!(!tight.fits);
+        // Unknown paces: stay for the tree.
+        assert_eq!(early_leaf_fits(15.0, 40, None, Some(10.0), 100, 60), None);
+        assert_eq!(
+            early_leaf_fits(15.0, 40, Some((1.0, 40)), None, 100, 60),
+            None
+        );
+        assert_eq!(
+            early_leaf_fits(15.0, 40, Some((1.0, 40)), Some(10.0), 0, 60),
+            None
+        );
+        assert_eq!(
+            early_leaf_fits(15.0, 40, Some((1.0, 0)), Some(10.0), 100, 60),
+            None
+        );
     }
 
     #[test]
