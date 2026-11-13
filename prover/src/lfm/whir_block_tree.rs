@@ -81,13 +81,15 @@ impl WhirTreeSink for StderrSink {
 /// The base hash is not posture: it is the build's (`hash_pin::BLOCK_BASE`, the
 /// only base `block_whir::checked_base` admits), and `LAMBDA_VM_WHIR_HASH` is
 /// not read on the block path. The measurement-only `LAMBDA_VM_BASE_SPLIT` is not posture, and
-/// the allocator's never-purge posture is compiled into the binary.
+/// the allocator's never-purge posture is compiled into the binary. Neither is
+/// `LAMBDA_VM_MAX_ROWS_LOG2`: the block cuts every chunked table at 2^21 rows
+/// ([`BlockOptions::production`]), a height its verifier bounds, and the word
+/// is read only by the epoch pipeline and the monolithic prove.
 /// `LFM_PRECOMPUTED_TREE_CACHE_CAP`'s posture follows the host target
 /// ([`posture_tree_cache_cap`]): the table's 64 from a 64 GiB target up, 16
 /// below it.
 pub const POSTURE: &[(&str, &str)] = &[
     ("TABLE_PARALLELISM", "4"),
-    ("LAMBDA_VM_MAX_ROWS_LOG2", "21"),
     ("LFM_WHIR_RETENTION", "1"),
     ("LFM_PRECOMPUTED_TREE_CACHE_CAP", "64"),
     ("LFM_EXEC_PARALLEL", "1"),
