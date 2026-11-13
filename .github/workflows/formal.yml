@@ -4,6 +4,10 @@ on:
   push:
     branches: ["main"]
     paths: ["formal/**", ".github/workflows/formal.yml"]
+  # The repository merges through a queue (see `pr_main.yaml` and `gpu-tests.yml`). Without
+  # this trigger the job runs on the PR but not on the merge-group commit, so a change that
+  # only breaks the model once combined with another queued PR merges unchecked.
+  merge_group:
   pull_request:
     paths: ["formal/**", ".github/workflows/formal.yml"]
 
