@@ -79,7 +79,10 @@ where
 /// the first hit any worker finds.
 ///
 /// Read once, cached, presence-based — the convention `LAMBDA_VM_NO_GPU_GRIND`
-/// uses.
+/// uses: a set word turns it on whatever its value, so
+/// `LAMBDA_VM_DETERMINISTIC_GRIND=0` (or `=false`, or empty) turns the
+/// smallest-first search ON. Unset the word to turn it off; a timed run must
+/// not carry it at all.
 #[cfg(feature = "std")]
 pub fn deterministic() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -305,7 +308,8 @@ where
     );
     // Kill switch (presence-based, matching `LAMBDA_VM_NO_GPU_LOGUP`):
     // `LAMBDA_VM_NO_GPU_GRIND` forces the CPU search — a production escape hatch
-    // and fallback-path coverage. Cached; read once.
+    // and fallback-path coverage. Any value turns it on, `0` included. Cached;
+    // read once.
     static GPU_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *GPU_DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_GRIND").is_some()) {
         return generate_nonce::<D>(seed, grinding_factor);

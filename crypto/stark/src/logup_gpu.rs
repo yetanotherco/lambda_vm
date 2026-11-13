@@ -363,7 +363,8 @@ where
     if trace_len < GPU_LOGUP_MIN_ROWS || main_cols.is_empty() || interactions.is_empty() {
         return None;
     }
-    // Escape hatch for A/B measurement: force the CPU aux build.
+    // Escape hatch for A/B measurement: force the CPU aux build. Presence-based:
+    // any value turns it on, `0` included.
     if std::env::var_os("LAMBDA_VM_NO_GPU_LOGUP").is_some() {
         return None;
     }
