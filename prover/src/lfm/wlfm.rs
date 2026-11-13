@@ -19,6 +19,12 @@
 //!   the chain format, so a parent that holds it as a constant pins the program
 //!   and the format it was proved under.
 //!
+//! A proof whose verifier is the host may bind the instruction columns by
+//! EVALUATION instead ([`WlfmPrep::Evaluated`]): the verifier holds the columns
+//! it derived and checks each prefix at its table's reduced point against the
+//! main opening, so no prepared stack is committed or opened. The prefix count
+//! is still the AIR's ([`check_evaluated`]).
+//!
 //! # ⛔ The preprocessed count comes from the AIR
 //!
 //! The LFM AIRs declare their preprocessed columns by COUNT only
@@ -41,8 +47,8 @@ use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use digest::Digest;
 use math::field::element::FieldElement;
 use math::field::traits::IsPrimeField;
-use multilinear::stacked_eval::StackedProof;
 use multilinear::mle::Mle;
+use multilinear::stacked_eval::StackedProof;
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{ArgueFormat, ChainConfig};
@@ -543,11 +549,8 @@ pub fn check_evaluated(
             counts.len()
         ));
     }
-    for (table, ((&count, &num_vars), cols)) in counts
-        .iter()
-        .zip(table_num_vars)
-        .zip(evaluated)
-        .enumerate()
+    for (table, ((&count, &num_vars), cols)) in
+        counts.iter().zip(table_num_vars).zip(evaluated).enumerate()
     {
         if cols.len() != count {
             return Err(format!(
@@ -631,19 +634,43 @@ pub fn wlfm_program_id(a: &WlfmArtifacts) -> Commitment {
     // The rest of the format, whole: a lever added later moves the identity.
     h.update(format!("{:?}", c.format).as_bytes());
     // Under the evaluated binding there are no roots to fold: the columns
-    // themselves, every value. (The stacked binding's identity is unchanged.)
+    // themselves, every value, one digest a column. (The stacked binding's
+    // identity is unchanged.)
     if a.prep == WlfmPrep::Evaluated {
         h.update(b"EVALUATED");
         for cols in &a.evaluated {
             h.update((cols.len() as u64).to_le_bytes());
-            for col in cols {
-                for v in col.evals() {
-                    h.update(F::canonical(v.value()).to_le_bytes());
-                }
+            for digest in column_digests(cols) {
+                h.update(digest);
             }
         }
     }
     h.finalize().into()
+}
+
+/// Each column's Keccak-256 over its length and its values, eight
+/// little-endian canonical bytes each: the evaluated identity's leaves.
+fn column_digests(cols: &[Mle<F>]) -> Vec<Commitment> {
+    let digest = |col: &Mle<F>| -> Commitment {
+        let evals = col.evals();
+        let mut bytes = Vec::with_capacity(8 * (evals.len() + 1));
+        bytes.extend_from_slice(&(evals.len() as u64).to_le_bytes());
+        for v in evals {
+            bytes.extend_from_slice(&F::canonical(v.value()).to_le_bytes());
+        }
+        let mut h = Keccak256::new();
+        h.update(&bytes);
+        h.finalize().into()
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        cols.par_iter().map(digest).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        cols.iter().map(digest).collect()
+    }
 }
 
 /// A word's four lanes, each its canonical value as eight big-endian bytes:

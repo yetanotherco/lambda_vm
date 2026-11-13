@@ -10,6 +10,7 @@
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::element::FieldElement;
+use multilinear::mle::Mle;
 use multilinear::whir_hash::WhirHash;
 use stark::multilinear_table::TableStatement;
 use stark::multilinear_table::batched::VerifierChecks;
@@ -20,8 +21,8 @@ use super::builder::{Cell, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
 use super::hash::HasherKind;
 use super::wlfm::{
-    WLFM_B4_QUERIES, WLFM_B16_STACK, WlfmBuild, WlfmHash, WlfmProof, WlfmRate,
-    absorb_wlfm_statement, build_wlfm, build_wlfm_on_host, check_coverage,
+    WLFM_B4_QUERIES, WLFM_B16_STACK, WlfmBuild, WlfmHash, WlfmPrep, WlfmProof, WlfmRate,
+    absorb_wlfm_statement, build_wlfm, build_wlfm_on_host, build_wlfm_under, check_coverage,
     execute_and_fill_unmerged, prove_wlfm, prove_wlfm_traces, test_format, verify_wlfm,
     verify_wlfm_with, wlfm_config,
 };
@@ -79,6 +80,17 @@ fn forged() -> LfmProgram {
 
 fn build(program: &LfmProgram, rate: WlfmRate) -> WlfmBuild {
     build_wlfm(program, HASHER, rate).unwrap_or_else(|e| panic!("the W-LFM build: {e}"))
+}
+
+fn evaluated(program: &LfmProgram, rate: WlfmRate) -> WlfmBuild {
+    build_wlfm_under(program, HASHER, rate, WlfmPrep::Evaluated, false)
+        .unwrap_or_else(|e| panic!("the evaluated W-LFM build: {e}"))
+}
+
+fn proof_bytes(proof: &WlfmProof) -> usize {
+    rkyv::to_bytes::<rkyv::rancor::Error>(proof)
+        .expect("a W-LFM proof serializes")
+        .len()
 }
 
 fn prove(program: &LfmProgram, build: &WlfmBuild) -> WlfmProof {
@@ -405,4 +417,158 @@ fn the_coverage_rule_refuses_every_unbound_plan() {
         let e = check_coverage(&counts, &sizes, &plan).expect_err(why);
         assert!(e.contains(why), "{why}: {e}");
     }
+}
+
+// =============================================================================
+// The evaluated binding (the verifier evaluates the instruction columns)
+// =============================================================================
+
+/// ★ THE EVALUATED ANCHOR: at blowup 2 and 16 the evaluated build carries every
+/// table's prefix at its AIR's count and no prepared stack; its proof carries
+/// no prepared opening, is smaller, and verifies; it is another identity than
+/// the stacked build, and each binding's proof is refused by the other's
+/// artifacts, as is the evaluated proof with a stacked opening added.
+#[test]
+fn the_evaluated_binding_round_trips_with_no_prepared_chain_and_is_another_identity() {
+    let _unground = test_format::set(None);
+    let program = honest();
+    for rate in [WlfmRate::Two, WlfmRate::Sixteen] {
+        let stacked = build(&program, rate);
+        let evaluated = evaluated(&program, rate);
+        let a = &evaluated.artifacts;
+        assert_eq!(a.prep, WlfmPrep::Evaluated);
+        assert_eq!(stacked.artifacts.prep, WlfmPrep::Stacked);
+        assert!(a.stacks.is_empty(), "no prepared stack");
+        assert!(stacked.artifacts.evaluated.is_empty());
+        assert_eq!(
+            a.evaluated.iter().map(Vec::len).collect::<Vec<_>>(),
+            a.counts,
+            "every table's prefix at its AIR's count"
+        );
+        assert!(a.counts.iter().any(|&c| c > 0), "the fixture has prefixes");
+        assert_ne!(a.program_id, stacked.artifacts.program_id);
+        let proof = prove(&program, &evaluated);
+        assert!(proof.prepared.is_empty(), "no prepared opening");
+        verify_wlfm(a, &proof, &proof.public_words)
+            .unwrap_or_else(|e| panic!("the evaluated proof must verify at {rate:?}: {e}"));
+        let stacked_proof = prove(&program, &stacked);
+        assert!(
+            proof_bytes(&proof) < proof_bytes(&stacked_proof),
+            "the evaluated proof is the smaller: {} vs {}",
+            proof_bytes(&proof),
+            proof_bytes(&stacked_proof)
+        );
+        assert!(
+            verify_wlfm(&stacked.artifacts, &proof, &proof.public_words).is_err(),
+            "an evaluated proof under stacked artifacts"
+        );
+        assert!(
+            verify_wlfm(a, &stacked_proof, &stacked_proof.public_words).is_err(),
+            "a stacked proof under evaluated artifacts"
+        );
+        let mut added = proof.clone();
+        added.prepared.push(stacked_proof.prepared[0].clone());
+        assert!(
+            verify_wlfm(a, &added, &added.public_words).is_err(),
+            "an evaluated proof with a prepared opening added"
+        );
+    }
+}
+
+/// An evaluated proof at blowup 16 refuses a false commit-time answer, a
+/// missing one, and a tampered public word.
+#[test]
+fn an_evaluated_proof_refuses_a_tampered_answer_or_word() {
+    let _unground = test_format::set(None);
+    let program = honest();
+    let build = evaluated(&program, WlfmRate::Sixteen);
+    let proof = prove(&program, &build);
+    let a = &build.artifacts;
+    let mut altered = proof.clone();
+    altered.commit_ood[0] += FieldElement::<E>::one();
+    assert!(verify_wlfm(a, &altered, &altered.public_words).is_err());
+    let mut missing = proof.clone();
+    missing.commit_ood.pop();
+    assert!(verify_wlfm(a, &missing, &missing.public_words).is_err());
+    let mut claimed = proof.public_words.clone();
+    claimed[0].1[0] += FE::one();
+    assert!(verify_wlfm(a, &proof, &claimed).is_err());
+}
+
+/// ★ A forged instruction column — the twin's program proved against the
+/// honest program's evaluated artifacts — is refused by the verifier's own
+/// evaluation of the columns, and only by it: with the preprocessed check off
+/// (a mutation), the same proof verifies. The honest prover refuses to make it.
+#[test]
+fn a_forged_instruction_column_is_refused_by_the_evaluated_columns() {
+    let _unground = test_format::set(None);
+    let build = evaluated(&honest(), WlfmRate::Two);
+    assert!(
+        prove_wlfm(&forged(), &build, &arenas()).is_err(),
+        "the prover's prefix check refuses the forged program"
+    );
+    let proof = forge(&forged(), &build);
+    assert!(proof.prepared.is_empty());
+    assert!(
+        verify_wlfm(&build.artifacts, &proof, &proof.public_words).is_err(),
+        "the forged program's proof is refused"
+    );
+    verify_wlfm_with(
+        &build.artifacts,
+        &proof,
+        &proof.public_words,
+        false,
+        VerifierChecks {
+            preprocessed: false,
+            ..VerifierChecks::ALL
+        },
+    )
+    .unwrap_or_else(|e| panic!("with the column check off the forgery verifies: {e}"));
+}
+
+/// ⛔ THE EVALUATED RULE: artifacts that evaluate a prefix short, none of it,
+/// over another height, with a changed value, or that mix the two bindings
+/// are refused — the first four before or by the column check, the mixes
+/// before any proof is read.
+#[test]
+fn the_evaluated_rule_refuses_a_short_resized_changed_or_mixed_binding() {
+    let _unground = test_format::set(None);
+    let program = honest();
+    let build = evaluated(&program, WlfmRate::Two);
+    let proof = prove(&program, &build);
+    let a = &build.artifacts;
+    let t = a
+        .counts
+        .iter()
+        .position(|&c| c > 0)
+        .expect("a table with a prefix");
+    let refused = |artifacts: &super::wlfm::WlfmArtifacts, why: &str| {
+        let e = verify_wlfm(artifacts, &proof, &proof.public_words).expect_err(why);
+        assert!(e.contains(why), "{why}: {e}");
+    };
+    let mut short = a.clone();
+    short.evaluated[t].pop();
+    refused(&short, "and the verifier evaluates");
+    let mut none = a.clone();
+    none.evaluated.iter_mut().for_each(Vec::clear);
+    refused(&none, "and the verifier evaluates");
+    let mut resized = a.clone();
+    let rows = resized.evaluated[t][0].evals().len();
+    resized.evaluated[t][0] = Mle::new(vec![FE::zero(); 2 * rows]).expect("a column");
+    refused(&resized, "rows and a preprocessed column");
+    let mut changed = a.clone();
+    let mut values = changed.evaluated[t][0].evals().to_vec();
+    values[0] += FE::one();
+    changed.evaluated[t][0] = Mle::new(values).expect("a column");
+    assert!(
+        verify_wlfm(&changed, &proof, &proof.public_words).is_err(),
+        "a changed instruction value"
+    );
+    let stacked = build_wlfm(&program, HASHER, WlfmRate::Two).expect("the stacked build");
+    let mut mixed = a.clone();
+    mixed.stacks = stacked.artifacts.stacks.clone();
+    refused(&mixed, "evaluated artifacts carry prepared stacks");
+    let mut mixed = stacked.artifacts.clone();
+    mixed.evaluated = a.evaluated.clone();
+    refused(&mixed, "stacked artifacts carry evaluated columns");
 }
