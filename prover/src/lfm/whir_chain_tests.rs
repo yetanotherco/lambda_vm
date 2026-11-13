@@ -1897,6 +1897,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
             group: multilinear::whir_chain::GroupFold::PerPoly,
             leaves: multilinear::whir_chain::LeafOrder::Natural,
             round0: multilinear::whir_chain::Round0Trees::Each,
+            final_poly: multilinear::whir_chain::FinalPoly::Off,
         },
         log_blowup: 1,
         ..config(229, 0)
@@ -1934,6 +1935,7 @@ fn the_blowup_opt_out_chain_keeps_the_pins_from_before_the_flip() {
             group: multilinear::whir_chain::GroupFold::PerPoly,
             leaves: multilinear::whir_chain::LeafOrder::Natural,
             round0: multilinear::whir_chain::Round0Trees::Each,
+            final_poly: multilinear::whir_chain::FinalPoly::Off,
         },
         ..config(114, 0)
     };
@@ -1978,6 +1980,7 @@ fn the_grind_bits_opt_out_chain_keeps_its_pins() {
             group: multilinear::whir_chain::GroupFold::PerPoly,
             leaves: multilinear::whir_chain::LeafOrder::Natural,
             round0: multilinear::whir_chain::Round0Trees::Each,
+            final_poly: multilinear::whir_chain::FinalPoly::Off,
         },
         ..config(112, 0)
     };
@@ -2017,6 +2020,7 @@ fn the_grind_opt_out_chain_keeps_the_pins_from_before_p2() {
             group: multilinear::whir_chain::GroupFold::PerPoly,
             leaves: multilinear::whir_chain::LeafOrder::Natural,
             round0: multilinear::whir_chain::Round0Trees::Each,
+            final_poly: multilinear::whir_chain::FinalPoly::Off,
         },
         ..config(112, 20)
     };

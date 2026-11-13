@@ -356,6 +356,10 @@ pub struct ChainFormat {
     /// How many round-0 trees a grouped run commits: one a polynomial
     /// ([`Round0Trees::Each`], today) or one for the run ([`Round0Trees::One`]).
     pub round0: Round0Trees,
+    /// Where the chain stops committing ([`FinalPoly`]). [`FinalPoly::Off`] =
+    /// today: every round commits its successor and the last folds to a
+    /// constant.
+    pub final_poly: FinalPoly,
 }
 
 impl ChainFormat {
@@ -370,6 +374,7 @@ impl ChainFormat {
         group: GroupFold::PerPoly,
         leaves: LeafOrder::Natural,
         round0: Round0Trees::Each,
+        final_poly: FinalPoly::Off,
     };
 
     /// True when this is today's format (`Fixed(0)` counts as `Off`).
@@ -383,6 +388,7 @@ impl ChainFormat {
             && self.group == GroupFold::PerPoly
             && self.leaves == LeafOrder::Natural
             && self.round0 == Round0Trees::Each
+            && self.final_poly == FinalPoly::Off
     }
 
     /// The cap policy of trees with `arity` children per node:
@@ -607,6 +613,53 @@ pub enum WhirFolds {
     /// last. `first5` / `first6`.
     First(FirstFold),
 }
+
+/// Where a chain stops committing.
+///
+/// [`Off`](Self::Off) is today's format: every round but the last commits its
+/// successor, and the last folds to a constant the prover sends.
+/// [`Vars(v)`](Self::Vars) stops at the FINAL ROUND [`ChainConfig::final_round`]
+/// gives — the first round `r ≥ 1`, short of the last, after which at most `v`
+/// variables remain: its successor is not committed; the prover sends the
+/// folded polynomial itself, its `2^rem` hypercube values, and the round's
+/// queries are checked against that polynomial's encoding at their folded
+/// positions. The rounds after it are sumcheck rounds alone (no commitment,
+/// no out-of-domain point, no query), and the verifier evaluates the sent
+/// polynomial at their challenges for `f(α)`. A chain with no such round is
+/// today's chain.
+///
+/// ⚠ HOST VERIFIER ONLY. The in-guest chain verifier has no final-polynomial
+/// round; a config that a parent verifies in-guest must keep `Off`. The
+/// polynomial rides the final round's successor slot (one block, no path), so
+/// the proof's type — and every proof at `Off` — is unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FinalPoly {
+    #[default]
+    Off,
+    Vars(u8),
+}
+
+/// The widest final polynomial a [`FinalPoly::Vars`] may send: `2^10`
+/// extension values.
+pub const MAX_FINAL_VARS: u8 = 10;
+
+impl FinalPoly {
+    /// `None` outside `1..=MAX_FINAL_VARS`.
+    pub const fn vars(v: u8) -> Option<Self> {
+        if v >= 1 && v <= MAX_FINAL_VARS {
+            Some(Self::Vars(v))
+        } else {
+            None
+        }
+    }
+}
+
+/// The bit of [`ChainConfig::fold_word`] that says [`FinalPoly::Vars`], always
+/// beside [`FOLD_WORD_TAG`], its `v` in bits 36..=39. No other word sets them:
+/// a `First` word's fields sit at bits 52+, 48 and the low nibble,
+/// [`FOLD_WORD_INDEXED`] is bit 47, [`FOLD_WORD_COSET`] 46 and
+/// [`FOLD_WORD_ONE_TREE`] 45.
+pub const FOLD_WORD_FINAL: u64 = 1 << 44;
 
 /// See [`WHIR_CAP_IMPLEMENTED`]. W2 is in: the host chain, the statement word,
 /// `agrees_with`, the production config, the GPU parity at k = 6 and the
@@ -991,6 +1044,12 @@ impl ChainConfig {
             Round0Trees::Each => word,
             Round0Trees::One => word | FOLD_WORD_TAG | FOLD_WORD_ONE_TREE,
         };
+        let word = match self.format.final_poly {
+            FinalPoly::Off => word,
+            FinalPoly::Vars(v) => {
+                word | FOLD_WORD_TAG | FOLD_WORD_FINAL | ((u64::from(v) & 0xf) << 36)
+            }
+        };
         match self.format.leaves {
             LeafOrder::Natural => word,
             LeafOrder::Coset => word | FOLD_WORD_TAG | FOLD_WORD_COSET,
@@ -1050,6 +1109,26 @@ impl ChainConfig {
                 crate::whir_commit::tree_cap_height(policy, openings, domain_log, arity)
             })
             .collect()
+    }
+
+    /// The final-polynomial round of a chain over `num_vars` variables under
+    /// [`FinalPoly::Vars`]: `(r, rem)` for the first round `r ≥ 1`, short of
+    /// the last, after which `rem ≤ v` variables remain. `None` under
+    /// [`FinalPoly::Off`] and for a chain with no such round (today's chain
+    /// then). One derivation for the prover and the verifier.
+    pub fn final_round(&self, num_vars: usize) -> Option<(usize, usize)> {
+        let FinalPoly::Vars(v) = self.format.final_poly else {
+            return None;
+        };
+        let schedule = self.schedule(num_vars);
+        let mut left = num_vars;
+        for (r, &k) in schedule.iter().enumerate() {
+            left -= k;
+            if r >= 1 && r + 1 < schedule.len() && left <= usize::from(v) {
+                return Some((r, left));
+            }
+        }
+        None
     }
 
     /// Variables folded in each round: `log_folding` until the remainder.
@@ -2218,6 +2297,12 @@ where
 
     let mut rounds = Vec::with_capacity(schedule.len());
     let mut final_value = FieldElement::<E>::zero();
+    // Under `FinalPoly::Vars`: the round that sends the folded polynomial
+    // instead of committing it, the polynomial, and the challenges of the
+    // sumcheck rounds after it.
+    let final_at = config.final_round(num_vars);
+    let mut final_poly: Option<Mle<E>> = None;
+    let mut tail_alphas: Vec<FieldElement<E>> = Vec::new();
 
     for (r, &k) in schedule.iter().enumerate() {
         // The loop's OWN wall, so the six are measured against the thing that
@@ -2247,6 +2332,74 @@ where
         // A grouped round 0 also bound its index: the challenges past the
         // first `k` are `ρ`, and only the first `k` fold a block.
         let (alphas, rho) = challenges.split_at(k.min(challenges.len()));
+
+        if let Some((final_r, rem)) = final_at {
+            // After the final polynomial: a sumcheck round and nothing else.
+            if r > final_r {
+                tail_alphas.extend_from_slice(alphas);
+                rounds.push(ChainRound {
+                    sumcheck: sumcheck_rounds,
+                    next_root: None,
+                    ood_value: None,
+                    nonces,
+                    openings: RoundOpenings::Extension(RoundProof {
+                        current: Vec::new(),
+                        next: Vec::new(),
+                    }),
+                });
+                crate::whir_split::add(&crate::whir_split::ROUND, __wc_round);
+                continue;
+            }
+            // The final round: the folded polynomial sent, absorbed before the
+            // queries are drawn, and the queries opened against the current
+            // codeword alone; the polynomial rides the successor slot.
+            if r == final_r {
+                let Current::Extension(held) = &current else {
+                    return Err(Error::RoundCountMismatch {
+                        expected: 1,
+                        got: r,
+                    });
+                };
+                let poly = message_values(&mut factors, rem)?;
+                for value in poly.evals() {
+                    transcript.append_field_element(value);
+                }
+                let __wc_g3 = crate::whir_split::mark();
+                nonces.query = grind::<E, T, H>(transcript, config.grind.query)?;
+                crate::whir_split::add(&crate::whir_split::GRIND, __wc_g3);
+                let __wc_q = crate::whir_split::mark();
+                let mut proof = final_openings::<E, E, T, H>(
+                    held,
+                    &RoundConfig {
+                        num_queries: config.num_queries,
+                        log_folding: k,
+                    },
+                    RoundCaps {
+                        current: caps[r],
+                        current_owner: false,
+                        next: 0,
+                    },
+                    transcript,
+                )?;
+                proof.next = vec![crate::whir_commit::CosetOpening {
+                    values: poly.evals().to_vec(),
+                    proof: crypto::merkle_tree::proof::Proof {
+                        merkle_path: Vec::new(),
+                    },
+                }];
+                crate::whir_split::add(&crate::whir_split::QUERIES, __wc_q);
+                final_poly = Some(poly);
+                rounds.push(ChainRound {
+                    sumcheck: sumcheck_rounds,
+                    next_root: None,
+                    ood_value: None,
+                    nonces,
+                    openings: RoundOpenings::Extension(proof),
+                });
+                crate::whir_split::add(&crate::whir_split::ROUND, __wc_round);
+                continue;
+            }
+        }
 
         // The fold lands in the extension whichever field it started in, so
         // the field is the only thing the two cases differ in — and a codeword
@@ -2489,11 +2642,55 @@ where
         }
         current_domain = folded_domain;
     }
+    // The sent polynomial at the tail's challenges: `f(α)`, as the verifier
+    // computes it.
+    if let Some(poly) = &final_poly {
+        final_value = poly.evaluate(&tail_alphas)?;
+    }
 
     Ok(ChainProof {
         rounds,
         final_value,
     })
+}
+
+/// The `2^rem` hypercube values of the message `factors` bound, in
+/// [`Mle`] index order: the final polynomial a [`FinalPoly::Vars`] round sends.
+fn message_values<F, E>(factors: &mut Factors<F, E>, rem: usize) -> Result<Mle<E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    if factors.num_vars() != rem {
+        return Err(Error::VariableCountMismatch {
+            expected: rem,
+            got: factors.num_vars(),
+        });
+    }
+    if let Some(message) = factors.host_message() {
+        return Ok(message.clone());
+    }
+    let values = (0..1usize << rem)
+        .map(|i| factors.evaluate_message(&hypercube_point::<E>(i, rem)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Mle::new(values)
+}
+
+/// Hypercube point `i` of `n` variables in [`Mle`] index order: the first
+/// variable is the index's top bit (`Mle::evaluate` splits the table in
+/// halves first).
+pub fn hypercube_point<E: IsField>(i: usize, n: usize) -> Vec<FieldElement<E>> {
+    (0..n)
+        .map(|j| {
+            if (i >> (n - 1 - j)) & 1 == 1 {
+                FieldElement::<E>::one()
+            } else {
+                FieldElement::<E>::zero()
+            }
+        })
+        .collect()
 }
 
 /// Folds a codeword wherever it is, leaving the result where it was.
@@ -2976,6 +3173,11 @@ where
     // it entered the weight — the challenges after that are where its `eq`
     // lands.
     let mut ood: Vec<(FieldElement<E>, Vec<FieldElement<E>>, usize)> = Vec::new();
+    // Under `FinalPoly::Vars`, from the config alone: the final round, the
+    // polynomial it sent, and the challenges of the sumcheck rounds after it.
+    let final_at = config.final_round(num_vars);
+    let mut final_poly: Option<Mle<E>> = None;
+    let mut tail_alphas: Vec<FieldElement<E>> = Vec::new();
 
     for (r, (round, (&k, &sent))) in proof
         .rounds
@@ -3018,6 +3220,75 @@ where
             num_queries: config.num_queries,
             log_folding: k,
         };
+        if let Some((final_r, rem)) = final_at
+            && r >= final_r
+        {
+            // No successor and no out-of-domain point from the final round on.
+            if round.next_root.is_some() || round.ood_value.is_some() || round.nonces.ood != 0 {
+                return Err(Error::RoundCountMismatch {
+                    expected: final_r,
+                    got: r,
+                });
+            }
+            let RoundOpenings::Extension(openings) = &round.openings else {
+                return Err(Error::RoundCountMismatch {
+                    expected: 0,
+                    got: r,
+                });
+            };
+            if r > final_r {
+                // A sumcheck round alone: no query, no block, no nonce.
+                if !openings.current.is_empty()
+                    || !openings.next.is_empty()
+                    || round.nonces.query != 0
+                {
+                    return Err(Error::QueryCountMismatch {
+                        expected: 0,
+                        got: openings.current.len() + openings.next.len(),
+                    });
+                }
+                tail_alphas.extend(group.point.iter().cloned());
+            } else {
+                // The final round: one successor block, the polynomial's
+                // `2^rem` values with no path, absorbed before the queries;
+                // every queried block folds to the polynomial's encoding at
+                // its folded position.
+                let [sent_poly] = openings.next.as_slice() else {
+                    return Err(Error::QueryCountMismatch {
+                        expected: 1,
+                        got: openings.next.len(),
+                    });
+                };
+                if !sent_poly.proof.merkle_path.is_empty() || sent_poly.values.len() != 1 << rem {
+                    return Err(Error::VariableCountMismatch {
+                        expected: rem,
+                        got: sent_poly.values.len(),
+                    });
+                }
+                for value in &sent_poly.values {
+                    transcript.append_field_element(value);
+                }
+                check_nonce::<E, T, H>(transcript, config.grind.query, round.nonces.query, layout)?;
+                let poly = Mle::new(sent_poly.values.clone())?;
+                let generator = next_domain.generator().clone();
+                verify_final_against::<F, E, E, T, H>(
+                    &openings.current,
+                    current,
+                    &current_domain,
+                    data,
+                    &round_config,
+                    |q| {
+                        let y = generator.pow(q as u64).to_extension::<E>();
+                        poly.evaluate(&ood_point(&y, rem))
+                    },
+                    transcript,
+                )?;
+                final_poly = Some(poly);
+            }
+            alphas.extend(group.point);
+            current_domain = next_domain;
+            continue;
+        }
         match (
             &round.next_root,
             round.ood_value.as_ref(),
@@ -3187,6 +3458,19 @@ where
     if proof.final_value != required {
         return Err(Error::EvaluationMismatch);
     }
+    // Under a final polynomial the value is the polynomial's at the tail's
+    // challenges, never the prover's word alone.
+    if let Some(poly) = &final_poly
+        && poly.evaluate(&tail_alphas)? != proof.final_value
+    {
+        return Err(Error::EvaluationMismatch);
+    }
+    if final_at.is_some() != final_poly.is_some() {
+        return Err(Error::RoundCountMismatch {
+            expected: schedule.len(),
+            got: proof.rounds.len(),
+        });
+    }
 
     Ok(())
 }
@@ -3209,22 +3493,59 @@ where
     T: IsTranscript<N>,
     H: WhirHash,
 {
-    if openings.current.len() != config.num_queries || !openings.next.is_empty() {
+    if !openings.next.is_empty() {
         return Err(Error::QueryCountMismatch {
             expected: config.num_queries,
             got: openings.current.len(),
+        });
+    }
+    verify_final_against::<F, C, N, T, H>(
+        &openings.current,
+        current,
+        current_domain,
+        alphas,
+        config,
+        |_| Ok(final_value.clone()),
+        transcript,
+    )
+}
+
+/// The final round's queries: every queried block of the current codeword must
+/// fold to `expected(q)` — the constant the prover sent, or under
+/// [`FinalPoly::Vars`] the sent polynomial's encoding at the folded position.
+fn verify_final_against<'a, F, C, N, T, H>(
+    current_openings: &'a [crate::whir_commit::CosetOpening<C>],
+    current: TreeCheck<'a>,
+    current_domain: &Domain<F>,
+    alphas: &[FieldElement<N>],
+    config: &RoundConfig,
+    expected: impl Fn(usize) -> Result<FieldElement<N>, Error>,
+    transcript: &mut T,
+) -> Result<(), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<C> + IsSubFieldOf<N>,
+    C: IsField + IsSubFieldOf<N> + 'static,
+    N: IsField + 'static,
+    FieldElement<C>: AsBytes + Sync + Send,
+    T: IsTranscript<N>,
+    H: WhirHash,
+{
+    if current_openings.len() != config.num_queries {
+        return Err(Error::QueryCountMismatch {
+            expected: config.num_queries,
+            got: current_openings.len(),
         });
     }
     let num_leaves = current_domain.size() >> config.log_folding;
     let depth = num_leaves.trailing_zeros() as usize;
     // The tree's check, built once from its first opening, after the count
     // guard above, so indexing it never panics. With no openings there is nothing to check.
-    let Some(first) = openings.current.first() else {
+    let Some(first) = current_openings.first() else {
         return Ok(());
     };
     let (check, first_siblings) = current.open::<C, H>(depth, first)?;
 
-    for (i, opening) in openings.current.iter().enumerate() {
+    for (i, opening) in current_openings.iter().enumerate() {
         let q = transcript.sample_u64(num_leaves as u64) as usize;
         let siblings = if i == 0 {
             first_siblings
@@ -3235,7 +3556,7 @@ where
         if !verify_opening_capped::<C, H>(&check, at, opening, siblings) {
             return Err(Error::OpeningRejected { query: i });
         }
-        if fold_coset::<F, C, N>(&opening.values, current_domain, q, alphas)? != *final_value {
+        if fold_coset::<F, C, N>(&opening.values, current_domain, q, alphas)? != expected(q)? {
             return Err(Error::FoldInconsistent { query: i });
         }
     }
@@ -5002,5 +5323,254 @@ mod tests {
             &mut verifier,
         )
         .unwrap();
+    }
+
+    // ── the final polynomial (`FinalPoly::Vars`) ──
+
+    fn finals(log_folding: usize, v: u8) -> ChainConfig {
+        let mut c = first(6, log_folding);
+        c.format.final_poly = FinalPoly::vars(v).expect("a final width");
+        c
+    }
+
+    /// The honest proof under `cfg` with its pieces, for tampering.
+    fn final_case(
+        cfg: &ChainConfig,
+        num_vars: usize,
+    ) -> (ChainProof<F, F>, Commitment, Vec<FE>, FE, Domain<F>) {
+        let f = pseudo_mle(num_vars, 17);
+        let z = point(num_vars);
+        let y = f.evaluate(&z).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, cfg, true).unwrap();
+        let proof =
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, cfg, &mut transcript())
+                .unwrap();
+        (proof, commitment.root(), z, y, domain)
+    }
+
+    fn check(
+        cfg: &ChainConfig,
+        proof: &ChainProof<F, F>,
+        root: &Commitment,
+        z: &[FE],
+        y: FE,
+        domain: &Domain<F>,
+    ) -> Result<(), Error> {
+        verify::<F, F, _, KeccakWhir>(proof, root, z, y, domain, cfg, &mut transcript())
+    }
+
+    /// The final round is the first `r ≥ 1`, short of the last, after which
+    /// at most `v` variables remain; none at `Off`, and none when only the
+    /// last round would qualify.
+    #[test]
+    fn the_final_round_is_the_first_short_of_the_last_within_v() {
+        // first6 then 4s: 26 → [6, 4, 4, 4, 4, 4], left 20 16 12 8 4 0.
+        assert_eq!(finals(4, 6).final_round(26), Some((4, 4)));
+        assert_eq!(finals(4, 8).final_round(26), Some((3, 8)));
+        assert_eq!(finals(4, 4).final_round(26), Some((4, 4)));
+        assert_eq!(finals(4, 3).final_round(26), None);
+        // 23 → [6, 4, 4, 4, 4, 1], left 17 13 9 5 1 0.
+        assert_eq!(finals(4, 6).final_round(23), Some((3, 5)));
+        assert_eq!(finals(4, 1).final_round(23), Some((4, 1)));
+        // Round 0 never: 9 → [6, 3], left 3 0.
+        assert_eq!(finals(4, 6).final_round(9), None);
+        assert_eq!(first(6, 4).final_round(26), None);
+        assert!(FinalPoly::vars(0).is_none());
+        assert!(FinalPoly::vars(MAX_FINAL_VARS + 1).is_none());
+        assert!(!finals(4, 6).format.is_default());
+    }
+
+    /// ★ Round trips at several heights and widths: the final round carries
+    /// its queries' current blocks and ONE successor block (the polynomial,
+    /// no path), every round after it is a sumcheck round alone, and the proof
+    /// is smaller than today's at the same config.
+    #[test]
+    fn a_final_polynomial_proof_verifies_and_drops_the_tail_rounds() {
+        for (n, v) in [(14usize, 6u8), (16, 6), (16, 8), (13, 3), (15, 1)] {
+            let cfg = finals(4, v);
+            let (final_r, rem) = cfg.final_round(n).expect("a final round");
+            let (proof, root, z, y, domain) = final_case(&cfg, n);
+            check(&cfg, &proof, &root, &z, y, &domain)
+                .unwrap_or_else(|e| panic!("n={n} v={v}: {e:?}"));
+            assert_eq!(proof.rounds.len(), cfg.rounds(n));
+            for (r, round) in proof.rounds.iter().enumerate() {
+                let RoundOpenings::Extension(p) = &round.openings else {
+                    assert_eq!(r, 0);
+                    continue;
+                };
+                if r == final_r {
+                    assert_eq!(p.current.len(), cfg.num_queries);
+                    assert_eq!(p.next.len(), 1);
+                    assert_eq!(p.next[0].values.len(), 1 << rem);
+                    assert!(p.next[0].proof.merkle_path.is_empty());
+                    assert!(round.next_root.is_none() && round.ood_value.is_none());
+                } else if r > final_r {
+                    assert!(p.current.is_empty() && p.next.is_empty());
+                    assert!(round.next_root.is_none() && round.ood_value.is_none());
+                }
+            }
+            let today = run_with(&first(6, 4), n).expect("today's chain");
+            assert!(
+                proof.opened_elements() < today.opened_elements(),
+                "n={n} v={v}: {} vs {}",
+                proof.opened_elements(),
+                today.opened_elements()
+            );
+            // Each format refuses the other's proof.
+            assert!(check(&first(6, 4), &proof, &root, &z, y, &domain).is_err());
+            let (today_proof, today_root, ..) = final_case(&first(6, 4), n);
+            assert!(check(&cfg, &today_proof, &today_root, &z, y, &domain).is_err());
+        }
+    }
+
+    /// With no qualifying round the chain is today's, byte for byte.
+    #[test]
+    fn a_chain_with_no_final_round_is_todays_chain() {
+        let n = 9; // [6, 3]: no round r ≥ 1 short of the last.
+        let cfg = finals(4, 6);
+        assert_eq!(cfg.final_round(n), None);
+        let (with, ..) = final_case(&cfg, n);
+        let (today, ..) = final_case(&first(6, 4), n);
+        assert_eq!(
+            rkyv::to_bytes::<rkyv::rancor::Error>(&with)
+                .unwrap()
+                .as_slice(),
+            rkyv::to_bytes::<rkyv::rancor::Error>(&today)
+                .unwrap()
+                .as_slice()
+        );
+    }
+
+    /// Every way to tamper the final polynomial or the rounds after it is
+    /// refused: a changed value, a missing or an extra block, a path on the
+    /// block, a value too many, a changed query block of the final round, a
+    /// query in a tail round, a nonce or a successor root where none belongs,
+    /// and a changed final value.
+    #[test]
+    fn a_tampered_final_polynomial_or_tail_round_is_refused() {
+        let n = 16;
+        let cfg = finals(4, 6);
+        let (final_r, _) = cfg.final_round(n).unwrap();
+        let (proof, root, z, y, domain) = final_case(&cfg, n);
+        check(&cfg, &proof, &root, &z, y, &domain).expect("honest");
+        fn ext(p: &mut ChainProof<F, F>, r: usize) -> &mut RoundProof<F, F> {
+            match &mut p.rounds[r].openings {
+                RoundOpenings::Extension(o) => o,
+                _ => panic!("an extension round"),
+            }
+        }
+        type Tamper = fn(&mut ChainProof<F, F>, usize);
+        let tampers: [(&str, usize, Tamper); 11] = [
+            ("a poly value", 0, |p, r| {
+                ext(p, r).next[0].values[1] += FE::one()
+            }),
+            ("no poly", 0, |p, r| ext(p, r).next.clear()),
+            ("two polys", 0, |p, r| {
+                let b = ext(p, r).next[0].clone();
+                ext(p, r).next.push(b)
+            }),
+            ("a path", 0, |p, r| {
+                ext(p, r).next[0].proof.merkle_path.push([0u8; 32])
+            }),
+            ("a value too many", 0, |p, r| {
+                ext(p, r).next[0].values.push(FE::one())
+            }),
+            ("a query block", 0, |p, r| {
+                ext(p, r).current[0].values[0] += FE::one()
+            }),
+            ("a tail query", 1, |p, r| {
+                ext(p, r).current.push(crate::whir_commit::CosetOpening {
+                    values: vec![FE::one()],
+                    proof: crypto::merkle_tree::proof::Proof {
+                        merkle_path: Vec::new(),
+                    },
+                })
+            }),
+            ("a tail query nonce", 1, |p, r| p.rounds[r].nonces.query = 1),
+            ("a final-round ood nonce", 0, |p, r| {
+                p.rounds[r].nonces.ood = 1
+            }),
+            ("a successor root", 0, |p, r| {
+                p.rounds[r].next_root = Some([1u8; 32])
+            }),
+            ("the final value", 0, |p, _| p.final_value += FE::one()),
+        ];
+        for (what, offset, tamper) in tampers {
+            let mut bad = proof.clone();
+            tamper(&mut bad, final_r + offset);
+            assert!(
+                check(&cfg, &bad, &root, &z, y, &domain).is_err(),
+                "{what} is refused"
+            );
+        }
+        assert!(
+            check(&cfg, &proof, &root, &z, y + FE::one(), &domain).is_err(),
+            "a false claim"
+        );
+    }
+
+    /// The final polynomial and the fold word: every width a distinct tagged
+    /// word, none equal to the format without it.
+    #[test]
+    fn the_final_polynomial_moves_the_fold_word() {
+        let base = first(6, 4).fold_word();
+        let mut seen = std::collections::HashSet::from([base]);
+        for v in 1..=MAX_FINAL_VARS {
+            let w = finals(4, v).fold_word();
+            assert_ne!(w & FOLD_WORD_FINAL, 0);
+            assert_eq!(w & !(FOLD_WORD_FINAL | (0xf << 36)), base);
+            assert!(seen.insert(w), "v={v}");
+        }
+    }
+
+    /// `hypercube_point(i, n)` is the point `Mle::evaluate` reads as `evals[i]`:
+    /// the device's message values come out in the host's order.
+    #[test]
+    fn the_hypercube_point_is_the_mle_index_order() {
+        let m = pseudo_mle(5, 3);
+        for i in 0..32 {
+            assert_eq!(
+                m.evaluate(&hypercube_point::<F>(i, 5)).unwrap(),
+                m.evals()[i]
+            );
+        }
+    }
+
+    /// A final polynomial over the extension (base-field polynomial, cubic
+    /// point): the encoding's points are lifted and the chain verifies.
+    #[test]
+    fn a_final_polynomial_proof_verifies_over_the_extension() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
+        type ExtE = FieldElement<Ext>;
+        let cfg = finals(4, 6);
+        let num_vars = 16;
+        assert!(cfg.final_round(num_vars).is_some());
+        let f = pseudo_mle(num_vars, 29);
+        let z: Vec<ExtE> = (0..num_vars).map(|i| ExtE::from(101 + i as u64)).collect();
+        let y = f.evaluate_in(&z).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
+        let mut prover = DefaultTranscript::<Ext>::new(b"tower");
+        let proof = prove::<F, Ext, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut prover)
+            .unwrap();
+        let verify_with = |proof: &ChainProof<F, Ext>, y: ExtE| {
+            let mut verifier = DefaultTranscript::<Ext>::new(b"tower");
+            verify::<F, Ext, _, KeccakWhir>(
+                proof,
+                &commitment.root(),
+                &z,
+                y,
+                &domain,
+                &cfg,
+                &mut verifier,
+            )
+        };
+        verify_with(&proof, y).expect("the extension chain verifies");
+        assert!(verify_with(&proof, y + ExtE::one()).is_err());
+        let (final_r, _) = cfg.final_round(num_vars).unwrap();
+        let mut bad = proof.clone();
+        if let RoundOpenings::Extension(o) = &mut bad.rounds[final_r].openings {
+            o.next[0].values[0] += ExtE::one();
+        }
+        assert!(verify_with(&bad, y).is_err());
     }
 }
