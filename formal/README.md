@@ -41,8 +41,8 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   `generate_lt_trace` produces, `RowSpec` is what an active row establishes, and
   the `GeneralFormalCircuit` proves that a row that pulls its range checks
   satisfies `RowSpec` and pushes a correct ALU result (soundness) and that an
-  honest row satisfies everything (completeness), for rows with `μ ∈ {0, 1}`
-  only (see "Known differences"). `Eq.lean` is the EQ chip in the
+  honest row satisfies everything (completeness), for byte multiplicities
+  `μ ∈ [0, 255]`, deduplicated rows included. `Eq.lean` is the EQ chip in the
   same shape: the `sub` template, four IS_HALF pulls, a ZERO pull on the sum of
   the halves, `res = eq xor invert`; its `μ` is a bit, as in the spec and `eq.rs`. Completeness covers
   the honest row and the all-zero padding row.
