@@ -150,6 +150,7 @@ fn small_format() -> BlockFormat {
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
     }
 }
 
@@ -240,9 +241,9 @@ fn the_frame_refuses_a_bitwise_table_off_its_fixed_height() {
 }
 
 /// Format knobs a verifier's process could carry, each off the default: the
-/// WHIR blowup, grind bits and folds, the leaves' query check and scale, and
-/// the leaves' share form.
-const OFF_DEFAULT: [(&str, &str); 8] = [
+/// WHIR blowup, grind bits and folds, the leaves' query check and scale, the
+/// leaves' share form, the GKR packing and the KECCAK_RND and MEMW_A forms.
+const OFF_DEFAULT: [(&str, &str); 9] = [
     (crate::zf_format::ENV_WHIR_BLOWUP, "4"),
     (crate::zf_format::ENV_WHIR_GRIND_BITS, "20"),
     (crate::zf_format::ENV_WHIR_FOLDS, "uniform4"),
@@ -251,6 +252,7 @@ const OFF_DEFAULT: [(&str, &str); 8] = [
     ("LFM_WHIR_SHARE_INVERSE", "0"),
     ("BLOCK_WHIR_ARGUE_PACK", "off"),
     ("BLOCK_WHIR_KECCAK_RND", "full"),
+    ("BLOCK_WHIR_MEMW_A", "limbs"),
 ];
 
 /// ★ The block verifier reads no format from its environment. In a process of
@@ -323,6 +325,16 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         crate::tables::keccak_rnd::KeccakRndForm::Full,
         "the harness's KECCAK_RND follows its knob"
     );
+    assert_eq!(
+        harness.format.memw_aligned,
+        crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+        "the harness's MEMW_A follows its knob"
+    );
+    assert_eq!(
+        production.memw_aligned,
+        crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        "the prover's own production format reads no MEMW_A knob"
+    );
 
     // The verifier's is not.
     let debug = |o: &ProofOptions| format!("{o:?}");
@@ -340,6 +352,11 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         pinned.format.keccak_rnd,
         crate::tables::keccak_rnd::KeccakRndForm::Lean,
         "the verifier's KECCAK_RND form is its named constant, not the environment's"
+    );
+    assert_eq!(
+        pinned.format.memw_aligned,
+        crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        "the verifier's MEMW_A form is its named constant, not the environment's"
     );
     assert!(pinned.share_inverse);
     assert_eq!(

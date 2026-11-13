@@ -275,6 +275,15 @@ pub struct BlockFormat {
     /// variant a caller names). Its interactions, so its bus and its GKR trees,
     /// follow it.
     pub keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
+    /// How MEMW_A proves each access's old timestamp below its timestamp
+    /// ([`MemwAlignedOrder`](crate::tables::memw_aligned::MemwAlignedOrder)):
+    /// one LT lookup a row
+    /// ([`Lt`](crate::tables::memw_aligned::MemwAlignedOrder::Lt), the
+    /// production constant), or the step's two 16-bit limbs in the row
+    /// ([`Limbs`](crate::tables::memw_aligned::MemwAlignedOrder::Limbs), the
+    /// variant a caller names). Its interactions, so its bus, the LT tables
+    /// the block holds and the recursion's programs, follow it.
+    pub memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
 }
 
 /// The most groups a block statement may declare: a verifier constant, never in
@@ -385,6 +394,7 @@ impl BlockFormat {
             argue: ArgueFormat::BATCHED,
             group: GroupFold::Indexed,
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
+            memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         }
     }
 
@@ -421,6 +431,7 @@ impl BlockFormat {
             argue: ArgueFormat::BATCHED,
             group: GroupFold::Indexed,
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
+            memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         }
     }
 
@@ -439,6 +450,19 @@ impl BlockFormat {
     /// the verifier of one block both take, never read from a proof.
     pub fn with_keccak_rnd(self, keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm) -> Self {
         Self { keccak_rnd, ..self }
+    }
+
+    /// This format with MEMW_A's timestamp order in `memw_aligned`'s form: a
+    /// named constant the prover and the verifier of one block both take,
+    /// never read from a proof.
+    pub fn with_memw_aligned(
+        self,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
+    ) -> Self {
+        Self {
+            memw_aligned,
+            ..self
+        }
     }
 
     /// This format with its batched argue's GKR trees laid out per `pack`:
@@ -4214,6 +4238,13 @@ fn prove_block_whir_body(
             format.keccak_rnd
         )));
     }
+    // And lays MEMW_A out in the per-table STARK's form alone.
+    if format.memw_aligned != crate::tables::memw_aligned::MemwAlignedOrder::Lt {
+        return Err(Error::Prover(format!(
+            "MEMW_A's {:?} timestamp order needs the windowed build (`window_log2`)",
+            format.memw_aligned
+        )));
+    }
 
     let t = Instant::now();
     let result = Executor::new(&program, private_inputs.to_vec())
@@ -4385,6 +4416,7 @@ pub(crate) fn prove_traces(
         &table_counts,
         &inputs,
         format.keccak_rnd,
+        format.memw_aligned,
     );
 
     let prepared_columns = prepared_tables(&airs, &traces.page_configs, format)?;
@@ -4644,6 +4676,7 @@ impl StreamAirs {
         form: TraceForm,
         cpu_rows: usize,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
     ) -> Self {
         use crate::test_utils::*;
         // As many CPU tables as a run's rows allow (`tables::cpu::MAX_CPU_ROWS`).
@@ -4656,7 +4689,7 @@ impl StreamAirs {
             cpu_rows,
             opts: opts.clone(),
             memw_register: Box::new(create_memw_register_air(opts)),
-            memw_aligned: Box::new(create_memw_aligned_air(opts)),
+            memw_aligned: Box::new(create_memw_aligned_air_for(opts, memw_aligned)),
             memw: Box::new(create_memw_air(opts)),
             load: Box::new(create_load_air(opts)),
             lt: Box::new(create_lt_air(opts)),
@@ -5448,6 +5481,7 @@ fn lay_out_rest<'a>(
             &table_counts,
             &inputs,
             format.keccak_rnd,
+            format.memw_aligned,
         )
     });
     marks.push(("airs", at()));
@@ -5630,6 +5664,7 @@ fn lay_out_rest_streamed<'a>(
     ledger: Option<&memlog::Ledger>,
     recorder: Option<&regen::Recorder>,
     keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
+    memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
@@ -5658,6 +5693,7 @@ fn lay_out_rest_streamed<'a>(
             &header.table_counts,
             &inputs,
             keccak_rnd,
+            memw_aligned,
         )
     });
     marks.push(("airs", at()));
@@ -5857,7 +5893,13 @@ fn prove_streamed(
     // commits and phase B's arguments alike.
     let fills_before = multilinear::records::fills();
     let times_before = multilinear::records::upload_times();
-    let stream_airs = StreamAirs::new(opts, stream_form, options.max_rows.cpu, format.keccak_rnd);
+    let stream_airs = StreamAirs::new(
+        opts,
+        stream_form,
+        options.max_rows.cpu,
+        format.keccak_rnd,
+        format.memw_aligned,
+    );
     // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
     // it — its chunks generated packed. The disk store's knob, which used to
     // turn it off, refuses the prove when set.
@@ -6385,6 +6427,7 @@ fn prove_streamed(
                 }
                 builder = builder.slide_rest();
                 builder = builder.keccak_rnd_form(format.keccak_rnd);
+                builder = builder.memw_aligned_order(format.memw_aligned)?;
                 if card_fill.keccak_rnd {
                     builder = builder.card_fill_keccak_rnd();
                     #[cfg(test)]
@@ -6694,6 +6737,7 @@ fn prove_streamed(
                                     max_rows: options.max_rows.clone(),
                                     window_cycles: window,
                                     form: stream_form,
+                                    order: format.memw_aligned,
                                     faults: deviations.regen_faults,
                                     policy: deviations.regen_windows.map_or_else(
                                         regen::ahead_policy,
@@ -6890,6 +6934,7 @@ fn prove_streamed(
                         ledger,
                         live_recorder,
                         format.keccak_rnd,
+                        format.memw_aligned,
                     ),
                 };
                 let (streamed, rest) = if inline {
@@ -7161,6 +7206,7 @@ fn prove_streamed(
                 window,
                 recipes.clone(),
                 stream_form,
+                format.memw_aligned,
                 deviations.regen_drop_one_op,
             )
         });
@@ -7275,6 +7321,7 @@ fn prove_streamed(
                                 producer,
                                 keyed,
                                 stream_form,
+                                format.memw_aligned,
                                 deviations.regen_faults,
                                 deviations
                                     .regen_windows
@@ -7981,6 +8028,7 @@ pub(crate) fn block_frame(
         statement.table_counts,
         &inputs,
         format.keccak_rnd,
+        format.memw_aligned,
     );
     // The CPU heights were read at `cpu_proof_start`: the tables must be there.
     airs.check_cpu_position(statement.table_counts)?;
@@ -9502,6 +9550,7 @@ mod packer_tests {
             TraceForm::Wide,
             1 << 21,
             crate::tables::keccak_rnd::KeccakRndForm::Full,
+            crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         );
         let air = airs.of(StreamTable::Lt).expect("LT's AIR is the family's");
         // Tables of 4, 8 and 16 rows, in an order that makes uneven groups.

@@ -248,7 +248,11 @@ fn the_counted_lookups_are_the_listed_ones() {
             let mut memory_state = MemoryState::from_image(&image);
             memory_state.lean = !lookups;
             let mut register_state = RegisterState::from_init(&register_init);
-            let mut out = WalkOutputs::for_walk(cpu_ops.len(), lookups);
+            let mut out = WalkOutputs::for_walk(
+                cpu_ops.len(),
+                lookups,
+                crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+            );
             collect_ops_from_cpu_into(
                 &cpu_ops,
                 &artifacts.decode,
@@ -317,7 +321,10 @@ fn the_one_pass_routing_is_the_routing() {
         let register_init = register::register_init_from_entry_point(program.entry_point);
         let mut memory_state = MemoryState::from_image(&image);
         let mut register_state = RegisterState::from_init(&register_init);
-        let mut walk = WalkOutputs::with_capacity(cpu_ops.len());
+        let mut walk = WalkOutputs::with_capacity(
+            cpu_ops.len(),
+            crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        );
         collect_ops_from_cpu_into(
             &cpu_ops,
             &artifacts.decode,
@@ -396,7 +403,10 @@ fn the_in_place_routing_is_the_appended_routing() {
                 bitwise::BitwiseHistogram::new(),
             );
             for ops in cpu_ops.chunks(window) {
-                let mut walk = WalkOutputs::with_capacity(ops.len());
+                let mut walk = WalkOutputs::with_capacity(
+                    ops.len(),
+                    crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+                );
                 collect_ops_from_cpu_into(
                     ops,
                     decode,

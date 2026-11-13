@@ -121,6 +121,8 @@ struct WindowJob {
 /// The walk's settings a window is walked with.
 struct WalkSettings {
     decode: Arc<DecodeTable>,
+    /// The run's MEMW_A form ([`WindowedTraceBuilder::memw_aligned_order`]).
+    order: crate::tables::memw_aligned::MemwAlignedOrder,
     lookups: bool,
     batch: usize,
     /// [`WindowedTraceBuilder::defer_ecrec_witnesses`].
@@ -261,6 +263,7 @@ impl WindowWalker {
         });
         let walked = walk_window(
             &s.decode,
+            s.order,
             s.lookups,
             s.batch,
             s.defer_ecrec,
@@ -318,6 +321,7 @@ impl WindowWalker {
         let s = &*self.settings;
         let mut walked = walk_window(
             &s.decode,
+            s.order,
             s.lookups,
             s.batch,
             s.defer_ecrec,
@@ -648,6 +652,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
     let (digest_tx, digest_rx) = std::sync::mpsc::channel::<(u32, u64)>();
     let settings = Arc::new(WalkSettings {
         decode: Arc::clone(&builder.decode),
+        order: builder.emitted.memw_aligned_order,
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
         defer_ecrec: builder.defer_ecrec,

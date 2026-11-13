@@ -4406,6 +4406,7 @@ impl<'a> RecordsUp<'a> {
             assert!(offset_of!(AlignedRow, width) == offset_of!(AlignedRowC, width));
             assert!(offset_of!(AlignedRow, is_read) == offset_of!(AlignedRowC, is_read));
             assert!(offset_of!(AlignedRow, is_register) == offset_of!(AlignedRowC, is_register));
+            assert!(offset_of!(AlignedRow, limbs) == offset_of!(AlignedRowC, limbs));
             assert!(size_of::<LoadOp>() == size_of::<LoadOpC>());
             assert!(align_of::<LoadOp>() == align_of::<LoadOpC>());
             assert!(offset_of!(LoadOp, width) == offset_of!(LoadOpC, width));

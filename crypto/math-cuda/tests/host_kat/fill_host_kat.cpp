@@ -13,7 +13,9 @@
 // WHAT IT COVERS:
 //   1. MEMW_R: thirteen register rows, then zero rows, every word.
 //   1a. MEMW_A: thirteen aligned rows (memory and register accesses, reads and
-//      writes, every width), then zero rows, every word.
+//      writes, every width), then zero rows, every word; and thirteen more in
+//      the limbs' form (the step's two 16-bit limbs in columns 25 and 26, the
+//      steps at the window's edges and random, high words zero and not).
 //   1b. LOAD: nineteen ops (every width, signed or not, sign bits set and
 //      clear), then zero rows, every word.
 //   1c. STORE: eleven ops at every width, then zero rows, every word.
@@ -152,6 +154,15 @@ void test_memw_a() {
     check_words("MEMW_A", out, KAT_MEMW_A_WORDS, height, cols);
 }
 
+void test_memw_a_limbs() {
+    const uint64_t height = KAT_MEMW_A_LIMB_HEIGHT;
+    const uint64_t cols = memw_a_cols::NUM_COLUMNS;
+    auto out = table(height * cols);
+    each_row(height, 0,
+             [&] { fill_memw_a(KAT_MEMW_A_LIMB_ROWS, KAT_MEMW_A_LIMB_N, height, out.data()); });
+    check_words("MEMW_A limbs", out, KAT_MEMW_A_LIMB_WORDS, height, cols);
+}
+
 void test_load() {
     const uint64_t height = KAT_LOAD_HEIGHT;
     const uint64_t cols = load_cols::NUM_COLUMNS;
@@ -272,6 +283,7 @@ void test_keccak_rnd() {
 int main() {
     test_memw_r();
     test_memw_a();
+    test_memw_a_limbs();
     test_load();
     test_store();
     test_shift();

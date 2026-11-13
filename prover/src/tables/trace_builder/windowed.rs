@@ -79,6 +79,7 @@ use super::{
 use crate::Error;
 use crate::paged_mem::PagedMem;
 use crate::tables::decode::DecodeTable;
+use crate::tables::memw_aligned::MemwAlignedOrder;
 use crate::tables::{
     cpu, decode, keccak_rnd, load, lt, memw, memw_aligned, memw_register, register, shift, store,
 };
@@ -888,6 +889,21 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// MEMW_A's timestamp order in `order`'s form (the block format's
+    /// [`MemwAlignedOrder`]): the walk routes each aligned access by it and
+    /// lays its row out in it, so BITWISE counts the limbs' lookups and LT
+    /// takes no comparison of a [`MemwAlignedOrder::Limbs`] row. The default
+    /// is the per-table STARK's. Before the first window only.
+    pub fn memw_aligned_order(mut self, order: MemwAlignedOrder) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "memw_aligned_order after a window was walked".to_string(),
+            ));
+        }
+        self.emitted.memw_aligned_order = order;
+        Ok(self)
+    }
+
     /// A test's fault ([`StreamSkip::card_fill_fault`]): with
     /// [`Self::card_fill_keccak_rnd`], each KECCAK_RND table's records start
     /// `rows` rows late, the same wrong table however they are filled.
@@ -1395,7 +1411,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         let first = self.cycles;
         let cpu_ops = super::collect_cpu_ops_from(logs, decode, self.cycles)?;
         self.cycles += logs.len();
-        let mut walk = WalkOutputs::with_capacity(cpu_ops.len());
+        let mut walk = WalkOutputs::with_capacity(cpu_ops.len(), self.emitted.memw_aligned_order);
         // The last window's in-walk lookups are listed and counted by the
         // table phase, lean or not.
         collect_ops_from_cpu_into(
@@ -1478,7 +1494,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         let (ops, decode_trace, skip, pre) = match kept {
             None => {
                 windows.push(last);
-                let (cpu_ops, mut walk) = concatenate(windows);
+                let (cpu_ops, mut walk) = concatenate(windows, emitted.memw_aligned_order);
                 super::build_stamps::mark("p0 concatenate");
                 let rest = KeptRest::from_walk(&mut walk);
                 let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state);
@@ -1574,7 +1590,8 @@ impl<'a> WindowedTraceBuilder<'a> {
                     kept.listless = false;
                 }
                 kept.append(last, &decode);
-                let (cpu_ops, walk, rest, decode_trace) = kept.into_run(&decode)?;
+                let (cpu_ops, walk, rest, decode_trace) =
+                    kept.into_run(&decode, emitted.memw_aligned_order)?;
                 super::build_stamps::mark("p0 concatenate");
                 let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state);
                 super::build_stamps::mark("p0 assemble");
@@ -1706,6 +1723,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         (
             Walker {
                 decode: &self.decode,
+                order: self.emitted.memw_aligned_order,
                 lookups: !self.lean.lookups,
                 keep_logs: self.keeps_logs(),
                 batch: self.walk_batch,
@@ -1831,6 +1849,8 @@ impl WalkedWindow {
 pub struct Walker<'b> {
     /// Each cycle's decode, by DECODE row.
     decode: &'b DecodeTable,
+    /// The run's MEMW_A form ([`WindowedTraceBuilder::memw_aligned_order`]).
+    order: MemwAlignedOrder,
     /// List the in-walk lookups (`false` under [`WalkLean::lookups`]).
     lookups: bool,
     /// Keep each window's logs ([`WindowedTraceBuilder::keeps_logs`]).
@@ -1865,6 +1885,7 @@ impl Walker<'_> {
         let t = std::time::Instant::now();
         let walked = walk_window(
             self.decode,
+            self.order,
             self.lookups,
             self.batch,
             self.defer_ecrec,
@@ -1907,6 +1928,7 @@ impl Walker<'_> {
 #[allow(clippy::too_many_arguments)]
 fn walk_window(
     decode: &DecodeTable,
+    order: MemwAlignedOrder,
     lookups: bool,
     batch: usize,
     defer_ecrec: bool,
@@ -1930,9 +1952,9 @@ fn walk_window(
     });
     // Without `lookups`, the accumulator counts them (`absorb`).
     let mut walk = if walk_sized() {
-        WalkOutputs::for_walk_sized(logs.len(), lookups, sizes)
+        WalkOutputs::for_walk_sized(logs.len(), lookups, sizes, order)
     } else {
-        WalkOutputs::for_walk(logs.len(), lookups)
+        WalkOutputs::for_walk(logs.len(), lookups, order)
     };
     if let Some(window) = words {
         walk.memw.set_words(window, logs.len() * 3);
@@ -3445,6 +3467,7 @@ impl Kept {
     fn into_run(
         self,
         decode_table: &DecodeTable,
+        order: MemwAlignedOrder,
     ) -> Result<(Vec<super::CpuOperation>, WalkOutputs, KeptRest, Table), Error> {
         let Kept {
             cpu,
@@ -3462,7 +3485,7 @@ impl Kept {
             listless: _,
             listless_broken: _,
         } = self;
-        let mut walk = WalkOutputs::with_capacity(0);
+        let mut walk = WalkOutputs::with_capacity(0, order);
         // Words mode: the run's last register rows, decoded from the logs. A
         // run whose words could not all be decoded (a window without its
         // logs) is refused here: its prove fails, nothing panics.
@@ -3482,6 +3505,7 @@ impl Kept {
             aligned: aligned.into_vec(),
             general: general.into_vec(),
             words: None,
+            order,
         };
         walk.load_ops = load.into_vec();
         walk.lt_ops = lt.into_vec();
@@ -4160,7 +4184,10 @@ fn serial_concat() -> bool {
     })
 }
 
-fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOutputs) {
+fn concatenate(
+    windows: Vec<WalkedWindow>,
+    order: MemwAlignedOrder,
+) -> (Vec<super::CpuOperation>, WalkOutputs) {
     /// The windows' lists one after another, in window order. Under `parallel`
     /// each window's part is moved into its own disjoint slice of the output
     /// on a thread of its own: the copy and the first touch of a list of
@@ -4247,6 +4274,7 @@ fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOut
             aligned,
             general,
             words: None,
+            order,
         },
         load_ops: load,
         lt_ops: lt,
@@ -4552,10 +4580,11 @@ fn assemble(
         aligned: mut memw_aligned_ops,
         general: mut memw_ops,
         words: _,
+        order,
     } = memw;
     // HALT's register ops land at the end of their buckets, as in
-    // `collect_all_ops`.
-    let mut halt = MemwBuckets::with_register_capacity(0);
+    // `collect_all_ops`, routed and laid out in the run's MEMW_A form.
+    let mut halt = MemwBuckets::with_register_capacity(0, order);
     halt.extend_ops(collect_halt_ops(register_state));
     memw_register_rows.extend(halt.register_rows);
     memw_aligned_ops.extend(halt.aligned);
@@ -4699,6 +4728,19 @@ impl RegenBuilder {
         })
     }
 
+    /// MEMW_A's timestamp order in `order`'s form, as the run being rebuilt
+    /// walked it ([`WindowedTraceBuilder::memw_aligned_order`]): its aligned
+    /// rows routed and laid out the same. Before the first window only.
+    pub fn memw_aligned_order(mut self, order: MemwAlignedOrder) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "memw_aligned_order after a window was walked".to_string(),
+            ));
+        }
+        self.cut.memw_aligned_order = order;
+        Ok(self)
+    }
+
     /// The slicer drops the first op of `table`'s list: a regeneration bug, for
     /// the tests that check it is caught.
     #[cfg(test)]
@@ -4762,7 +4804,7 @@ impl RegenBuilder {
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut cpu_ops = super::collect_cpu_ops_from(logs, &self.decode, self.cycles)?;
         self.cycles += logs.len();
-        let mut walk = WalkOutputs::for_walk(cpu_ops.len(), false);
+        let mut walk = WalkOutputs::for_walk(cpu_ops.len(), false, self.cut.memw_aligned_order);
         super::collect_streamed_ops_from_cpu_into(
             &cpu_ops,
             &self.decode,
@@ -4785,6 +4827,7 @@ impl RegenBuilder {
             mut aligned,
             mut general,
             words: _,
+            order: _,
         } = walk.memw;
         #[cfg_attr(not(test), allow(unused_mut))]
         let (mut load, mut lt, mut shift) = (walk.load_ops, walk.lt_ops, walk.shift_ops);

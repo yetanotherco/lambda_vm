@@ -100,7 +100,9 @@ pub struct RegisterRow {
 /// One MEMW_A row as its fill reads it (the prover's aligned row, field for
 /// field): the base address, timestamp and shared old timestamp, the value
 /// and old value packed a word each (eight bytes for a memory access, the two
-/// 32-bit halves for a register access), the width, and flags 0 or 1.
+/// 32-bit halves for a register access), the width, and flags 0 or 1
+/// (`limbs`: the row holds the step's 16-bit limbs instead of the old
+/// timestamp).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AlignedRow {
@@ -112,6 +114,7 @@ pub struct AlignedRow {
     pub width: u8,
     pub is_read: u8,
     pub is_register: u8,
+    pub limbs: u8,
 }
 
 /// One LOAD op as its fill reads it (the prover's load op, field for field):
@@ -465,7 +468,8 @@ impl RecordsFill<'_> {
                     each(
                         u64::from(row.width)
                             | u64::from(row.is_read) << 8
-                            | u64::from(row.is_register) << 16,
+                            | u64::from(row.is_register) << 16
+                            | u64::from(row.limbs) << 24,
                     );
                 }
             }
@@ -1035,6 +1039,7 @@ mod tests {
                 width: 8,
                 is_read: (i % 2) as u8,
                 is_register: (i % 3 == 0) as u8,
+                limbs: (i % 2 == 0) as u8,
             })
             .collect();
         let memw_a = |pieces| Records(Arc::new(Pieces::MemwA(pieces))).digest();
@@ -1043,7 +1048,7 @@ mod tests {
         assert_eq!(memw_a(cut(&aligned, &[0, 1, 5])), whole);
         assert_ne!(memw_a(cut(&aligned[..4], &[])), whole, "a row fewer");
         for at in 0..aligned.len() {
-            for field in 0..8 {
+            for field in 0..9 {
                 let mut moved = aligned.clone();
                 let row = &mut moved[at];
                 match field {
@@ -1054,7 +1059,8 @@ mod tests {
                     4 => row.old ^= 1 << 63,
                     5 => row.width ^= 0x80,
                     6 => row.is_read ^= 1,
-                    _ => row.is_register ^= 1,
+                    7 => row.is_register ^= 1,
+                    _ => row.limbs ^= 1,
                 }
                 assert_ne!(memw_a(cut(&moved, &[3])), whole, "row {at}, field {field}");
             }

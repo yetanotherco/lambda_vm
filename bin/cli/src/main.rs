@@ -845,6 +845,11 @@ fn cmd_prove_block(
         );
         return ExitCode::FAILURE;
     }
+    // So is MEMW_A's.
+    if std::env::var_os("BLOCK_WHIR_MEMW_A").is_some() {
+        eprintln!("BLOCK_WHIR_MEMW_A is the harness's knob: the CLI proves the verifier's form");
+        return ExitCode::FAILURE;
+    }
     let pack = match prover::lfm::whir_block_tree::pack_setting(Some(argue_pack)) {
         Ok(pack) => pack,
         Err(e) => {
@@ -972,8 +977,9 @@ fn cmd_prove_block(
     // the one `verify-block` derives: harness arms, not a production proof.
     if !cfg.at_presets() {
         eprintln!(
-            "W3_LEAVES, W3_FAN_IN, BLOCK_WHIR_ARGUE and BLOCK_WHIR_KECCAK_RND make another tree \
-             than the block verifier derives: unset them to prove a block the CLI can verify"
+            "W3_LEAVES, W3_FAN_IN, BLOCK_WHIR_ARGUE, BLOCK_WHIR_KECCAK_RND and BLOCK_WHIR_MEMW_A \
+             make another tree than the block verifier derives: unset them to prove a block the \
+             CLI can verify"
         );
         return ExitCode::FAILURE;
     }

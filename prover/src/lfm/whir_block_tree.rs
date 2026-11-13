@@ -24,6 +24,7 @@ use multilinear::whir_chain::{ArgueFormat, GkrPack, GroupFold, LeafOrder, Round0
 
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
 use crate::tables::keccak_rnd::KeccakRndForm;
+use crate::tables::memw_aligned::MemwAlignedOrder;
 use crate::zf_format::WhirBlowup;
 
 use super::compiler::LfmProgram;
@@ -379,6 +380,21 @@ pub fn keccak_rnd_setting(knob: Option<&str>) -> Result<KeccakRndForm, String> {
     }
 }
 
+/// `BLOCK_WHIR_MEMW_A`'s reading: unset is the pinned preset's form
+/// ([`BlockFormat::pinned`]), so the harness proves what `verify-block`
+/// verifies; `limbs` names the step's two 16-bit limbs in the row
+/// ([`MemwAlignedOrder::Limbs`]) and `lt` one LT lookup a row
+/// ([`MemwAlignedOrder::Lt`]). A format value: the prover and the verifier of
+/// one proof take the same one.
+pub fn memw_aligned_setting(knob: Option<&str>) -> Result<MemwAlignedOrder, String> {
+    match knob.map(str::trim) {
+        None => Ok(BlockFormat::pinned().memw_aligned),
+        Some("limbs") => Ok(MemwAlignedOrder::Limbs),
+        Some("lt") => Ok(MemwAlignedOrder::Lt),
+        Some(v) => Err(format!("BLOCK_WHIR_MEMW_A={v}: limbs or lt")),
+    }
+}
+
 /// `argue` with its trees laid out per `pack`: only the batched argue has
 /// trees to pack.
 fn with_pack(argue: ArgueFormat, pack: GkrPack) -> Result<ArgueFormat, String> {
@@ -442,6 +458,7 @@ impl WhirTreeConfig {
             leaf_scale,
             leaf_query,
             keccak_rnd: keccak_rnd_setting(std::env::var("BLOCK_WHIR_KECCAK_RND").ok().as_deref())?,
+            memw_aligned: memw_aligned_setting(std::env::var("BLOCK_WHIR_MEMW_A").ok().as_deref())?,
             ..BlockFormat::production_with(group_setting(
                 std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
             )?)
@@ -452,6 +469,14 @@ impl WhirTreeConfig {
             match format.keccak_rnd {
                 KeccakRndForm::Full => "full",
                 KeccakRndForm::Lean => "lean",
+            }
+        );
+        eprintln!(
+            "★ BLOCK MEMW_A: {} (BLOCK_WHIR_MEMW_A; limbs proves each timestamp step by two 16-bit \
+             limbs in the row, lt by one LT lookup a row)",
+            match format.memw_aligned {
+                MemwAlignedOrder::Limbs => "limbs",
+                MemwAlignedOrder::Lt => "lt",
             }
         );
         let mut options = BlockOptions::production();
@@ -548,7 +573,7 @@ impl WhirTreeConfig {
     /// [`BLOCK_FAN_IN`] and the production argue — with its GKR trees laid out
     /// as the format's packing says, a named constant the block verifier is
     /// given too ([`BlockFormat::with_pack`]) — and the verifier's preset
-    /// KECCAK_RND form, which the CLI has no flag for.
+    /// KECCAK_RND and MEMW_A forms, which the CLI has no flag for.
     pub fn at_presets(&self) -> bool {
         let pack = match self.argue {
             ArgueFormat::Batched { pack, .. } => pack,
@@ -559,6 +584,7 @@ impl WhirTreeConfig {
             && self.argue == BlockFormat::production().with_pack(pack).argue
             && self.format.argue == self.argue
             && self.format.keccak_rnd == BlockFormat::pinned().keccak_rnd
+            && self.format.memw_aligned == BlockFormat::pinned().memw_aligned
     }
 }
 
@@ -4960,6 +4986,14 @@ mod tests {
         let mut c = production.clone();
         c.format = c.format.with_keccak_rnd(other);
         assert!(!c.at_presets(), "the other KECCAK_RND form");
+        // Nor has MEMW_A's.
+        let other = match BlockFormat::pinned().memw_aligned {
+            MemwAlignedOrder::Lt => MemwAlignedOrder::Limbs,
+            MemwAlignedOrder::Limbs => MemwAlignedOrder::Lt,
+        };
+        let mut c = production.clone();
+        c.format = c.format.with_memw_aligned(other);
+        assert!(!c.at_presets(), "the other MEMW_A form");
     }
 
     /// `W3_LEAF_EMITTERS`: unset is the default count, 0 is the control (one

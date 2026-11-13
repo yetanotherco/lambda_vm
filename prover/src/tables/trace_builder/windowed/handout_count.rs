@@ -72,7 +72,9 @@ pub(super) fn count_memw_register(
 
 /// A MEMW_A chunk's BITWISE lookups into `histogram` (none when its walker
 /// counted them), and its phase-3 LT ops into `lt` (none when the
-/// MEMW-derived LT ops are streamed).
+/// MEMW-derived LT ops are streamed, and none of a row in
+/// [`memw_aligned::MemwAlignedOrder::Limbs`], which sends its limbs' lookups
+/// instead).
 pub(super) fn count_memw_aligned(
     ops: &Segments<memw_aligned::AlignedRow>,
     mut histogram: Option<&mut bitwise::BitwiseHistogram>,
@@ -83,7 +85,7 @@ pub(super) fn count_memw_aligned(
             histogram.add_ops(&collect_bitwise_from_memw_aligned(rows));
         }
         if let Some(lt) = lt.as_deref_mut() {
-            lt.extend_pairs(rows.iter().map(memw_aligned_lt_pair));
+            lt.extend_pairs(rows.iter().filter_map(memw_aligned_lt_pair));
         }
     }
 }

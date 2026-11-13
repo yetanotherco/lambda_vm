@@ -31,6 +31,7 @@ use stark::regen::{RegenError, RegenProducer, RegenSlot, RegenWindow};
 
 use crate::Error;
 use crate::tables::gpack::TraceForm;
+use crate::tables::memw_aligned::MemwAlignedOrder;
 use crate::tables::trace_builder::{ChunkJob, RegenBuilder, RegenFamily, RestRegen, StreamTable};
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -1137,9 +1138,11 @@ pub(crate) struct ShadowRun {
 impl ShadowRun {
     /// [`run_shadow`] over the run of `elf_bytes` on `private_input`, executed
     /// `window` cycles at a time (phase A's windows), its chunks cut at
-    /// `max_rows` and generated in `form` (phase A's), on
-    /// [`regen_generators`] generators; its times are from now. `drop_one_op`
-    /// is a test's slicer bug ([`RegenBuilder`]'s), `None` outside tests.
+    /// `max_rows` and generated in `form` (phase A's), its MEMW_A rows in
+    /// `order` (phase A's), on [`regen_generators`] generators; its times are
+    /// from now. `drop_one_op` is a test's slicer bug ([`RegenBuilder`]'s),
+    /// `None` outside tests.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         elf_bytes: Vec<u8>,
         private_input: Vec<u8>,
@@ -1147,6 +1150,7 @@ impl ShadowRun {
         window: usize,
         recipes: Vec<Recipe>,
         form: TraceForm,
+        order: MemwAlignedOrder,
         drop_one_op: Option<StreamTable>,
     ) -> Self {
         let started = Instant::now();
@@ -1167,7 +1171,9 @@ impl ShadowRun {
                         return report;
                     }
                 };
-                match RegenBuilder::new(&program, &private_input, &max_rows) {
+                match RegenBuilder::new(&program, &private_input, &max_rows)
+                    .and_then(|b| b.memw_aligned_order(order))
+                {
                     Ok(builder) => {
                         #[cfg(test)]
                         let builder = match drop_one_op {
@@ -1962,10 +1968,11 @@ pub(crate) struct LiveRun {
 impl LiveRun {
     /// [`run_live`] over the run of `elf_bytes` on `private_input`, executed
     /// `window_cycles` at a time (phase A's windows), its chunks cut at
-    /// `max_rows` and generated in `form` (phase A's), on [`regen_generators`]
-    /// generators, depositing `dropped` into `window`, which `policy` sizes;
-    /// its times are from now. A regenerator that cannot start drops
-    /// `producer`, so every slot fails at once.
+    /// `max_rows` and generated in `form` (phase A's), its MEMW_A rows in
+    /// `order` (phase A's), on [`regen_generators`] generators, depositing
+    /// `dropped` into `window`, which `policy` sizes; its times are from now.
+    /// A regenerator that cannot start drops `producer`, so every slot fails
+    /// at once.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         elf_bytes: Vec<u8>,
@@ -1976,6 +1983,7 @@ impl LiveRun {
         producer: RegenProducer,
         dropped: Vec<(StreamKey, RegenSlot)>,
         form: TraceForm,
+        order: MemwAlignedOrder,
         faults: LiveFaults,
         policy: AheadPolicy,
         gate: Option<Arc<AtomicBool>>,
@@ -2022,6 +2030,7 @@ impl LiveRun {
                     .iter()
                     .any(|((table, _), slot)| *table == StreamTable::Cpu && slot.is_records());
                 match RegenBuilder::new(&program, &private_input, &max_rows)
+                    .and_then(|b| b.memw_aligned_order(order))
                     .and_then(|b| if cpu_logs { b.keep_cpu_logs() } else { Ok(b) })
                 {
                     Ok(builder) => {
@@ -2504,6 +2513,8 @@ pub(crate) struct LiveArgs {
     pub(crate) max_rows: crate::tables::MaxRowsConfig,
     pub(crate) window_cycles: usize,
     pub(crate) form: TraceForm,
+    /// The run's MEMW_A form (phase A's).
+    pub(crate) order: MemwAlignedOrder,
     pub(crate) faults: LiveFaults,
     pub(crate) policy: AheadPolicy,
 }
@@ -2610,6 +2621,7 @@ impl EarlyStart {
                                 producer,
                                 keyed,
                                 live.form,
+                                live.order,
                                 live.faults,
                                 live.policy,
                                 Some(gate),

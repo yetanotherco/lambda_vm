@@ -50,6 +50,7 @@ fn small_format() -> BlockFormat {
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
     }
 }
 
@@ -473,6 +474,7 @@ fn dense_format() -> BlockFormat {
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
     }
 }
 
@@ -3216,6 +3218,23 @@ fn the_whir_block_tree_on_a_real_block() {
         t.elapsed().as_secs_f64()
     );
     assert!(ok, "the block proof must verify");
+    // The shipped file's verifier derives every program from the pinned
+    // presets, as `verify-block` does: a run a knob moved off them (an arm of
+    // another format) ships a file it refuses. Such a run's C1 proof is
+    // checked against the run's own plan below, and its file is not verified
+    // from the ELF.
+    let file_at_pinned = {
+        let pack = match argue {
+            ArgueFormat::Batched { pack, .. } => pack,
+            ArgueFormat::PerTable => multilinear::whir_chain::GkrPack::Off,
+        };
+        let pinned = BlockFormat::pinned_with(format.group).with_pack(pack);
+        leaves.is_none()
+            && fan_in == BLOCK_FAN_IN
+            && argue == pinned.argue
+            && format!("{format:?}") == format!("{pinned:?}")
+            && super::whir_block::share_inverse()
+    };
     // Off the clock, under `LAMBDA_VM_BLOCK_COMPRESS`: C1's proof verified as
     // the compressed block's verifier does over this run's plan, a tampered
     // one refused, and the shipped files' bytes both ways.
@@ -3424,6 +3443,11 @@ fn the_whir_block_tree_on_a_real_block() {
             let t = std::time::Instant::now();
             let verified = if c1.c2.is_some() {
                 "ACCEPTED above".to_string()
+            } else if !file_at_pinned {
+                read_shipped(&shipped, format)
+                    .unwrap_or_else(|e| panic!("the shipped C1 file must read back: {e}"));
+                "SKIPPED (the run is not at the pinned format; C1 checked against its plan above)"
+                    .to_string()
             } else {
                 let ok = read_shipped(&shipped, format)
                     .and_then(|f| verify_whir_block_shipped_as(&elf, &f, format));

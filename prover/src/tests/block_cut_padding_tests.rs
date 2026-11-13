@@ -41,6 +41,7 @@ fn many_groups(argue: ArgueFormat) -> BlockFormat {
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
     }
 }
 

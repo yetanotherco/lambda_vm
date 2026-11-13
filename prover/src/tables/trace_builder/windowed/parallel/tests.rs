@@ -78,6 +78,7 @@ fn walked_from_entries_with(
     }
     let settings = Arc::new(WalkSettings {
         decode: Arc::clone(&builder.decode),
+        order: builder.emitted.memw_aligned_order,
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
         defer_ecrec: builder.defer_ecrec,

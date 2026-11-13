@@ -263,3 +263,110 @@ fn the_windowed_tables_balance_every_inner_bus() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// MEMW_A's tables in the limbs' form ([`MemwAlignedOrder::Limbs`]) against
+/// the same windowed build in LT's: every inner bus balances under the limbs'
+/// interactions (BITWISE counts the two limbs a row, LT takes no comparison of
+/// one), MEMW_A sends and takes the very Memory-bus tokens LT's form does (the
+/// limbs give back each old timestamp), and the LT lookups the ALU bus carries
+/// fall by exactly one per active MEMW_A row.
+#[test]
+fn the_limbs_tables_send_lts_tokens_and_balance_every_inner_bus() {
+    use crate::tables::memw_aligned::{self, MemwAlignedOrder};
+    let limbs_air = |name: &str| {
+        name.starts_with("MEMW_A[")
+            .then(|| memw_aligned::bus_interactions_for(MemwAlignedOrder::Limbs))
+    };
+    // A table's tuples on `bus` under `interactions`, with their nets.
+    type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
+    let on_bus = |t: &Table, interactions: &[BusInteraction], bus: BusId| {
+        let (cols, rows, words) = super::finish_tests::shape_and_words(t);
+        let mut net: BTreeMap<Vec<u64>, i128> = BTreeMap::new();
+        for r in 0..rows {
+            let g = |c: usize| FE::from(words[r * cols + c]);
+            for bi in interactions.iter().filter(|bi| bi.bus_id == u64::from(bus)) {
+                let m = multiplicity(&bi.multiplicity, &g).canonical_u64() as i128;
+                if m == 0 {
+                    continue;
+                }
+                let tuple = bi
+                    .values
+                    .iter()
+                    .flat_map(|v| v.combine_from(g))
+                    .map(|x: FE| x.canonical_u64())
+                    .collect();
+                *net.entry(tuple).or_default() += if bi.is_sender { m } else { -m };
+            }
+        }
+        net
+    };
+    let sum = |tables: &[Table], interactions: &[BusInteraction], bus: BusId| {
+        let mut all: BTreeMap<Vec<u64>, i128> = BTreeMap::new();
+        for t in tables {
+            for (tuple, m) in on_bus(t, interactions, bus) {
+                *all.entry(tuple).or_default() += m;
+            }
+        }
+        all.retain(|_, m| *m != 0);
+        all
+    };
+    let lt_air = super::lt::bus_interactions();
+    let lt_lookups = |traces: &Traces| -> i128 {
+        sum(&traces.lts, &lt_air, BusId::Alu)
+            .values()
+            .map(|m| -m)
+            .sum()
+    };
+    let mut failed = Vec::new();
+    let mut rows_seen = 0usize;
+    for name in PROGRAMS {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            for dropped in [false, true] {
+                let build = |order: MemwAlignedOrder| {
+                    windowed(&program, &logs, &MaxRowsConfig::small(), window, &|b| {
+                        let b = b.memw_aligned_order(order).expect("before any window");
+                        if dropped {
+                            b.drop_streamed_ops().expect("before any window")
+                        } else {
+                            b
+                        }
+                    })
+                };
+                let what = format!("{name} window {window} dropped {dropped}");
+                let (mut lt, mut limbs) =
+                    (build(MemwAlignedOrder::Lt), build(MemwAlignedOrder::Limbs));
+                let left = unbalanced_with(&program, &mut limbs, &limbs_air);
+                if !left.is_empty() {
+                    failed.push(format!("{what}: {}", named(&left)));
+                }
+                let lt_form = memw_aligned::bus_interactions_for(MemwAlignedOrder::Lt);
+                let limbs_form = memw_aligned::bus_interactions_for(MemwAlignedOrder::Limbs);
+                if sum(&lt.memw_aligneds, &lt_form, BusId::Memory)
+                    != sum(&limbs.memw_aligneds, &limbs_form, BusId::Memory)
+                {
+                    failed.push(format!("{what}: MEMW_A's Memory tokens differ"));
+                }
+                // One LT lookup a row under LT's form (its senders on the ALU
+                // bus), none under the limbs'.
+                let rows: i128 = sum(&lt.memw_aligneds, &lt_form, BusId::Alu).values().sum();
+                assert!(sum(&limbs.memw_aligneds, &limbs_form, BusId::Alu).is_empty());
+                if lt_lookups(&lt) - lt_lookups(&limbs) != rows {
+                    failed.push(format!(
+                        "{what}: LT takes {} lookups under LT's form and {} under the limbs', \
+                         not {rows} fewer",
+                        lt_lookups(&lt),
+                        lt_lookups(&limbs)
+                    ));
+                }
+                rows_seen += rows as usize;
+                let left = unbalanced(&program, &mut lt);
+                if !left.is_empty() {
+                    failed.push(format!("{what} (LT's form): {}", named(&left)));
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+    assert!(rows_seen > 0, "no program made a MEMW_A row");
+}
