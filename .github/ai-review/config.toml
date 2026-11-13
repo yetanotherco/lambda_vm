@@ -1,0 +1,50 @@
+# Review config for the multi-model AI review (yetanotherco/actions pr_review_multi.yml), read from the
+# PR base branch. RISC-V zkVM: executor, STARK prover/verifier, recursion.
+# Layout checked with `git ls-tree` of main (2026-11-06): bin/ crypto/{crypto,ecsm,math,math-cuda,stark}
+# executor/ prover/{src/constraints,src/tables,src/recursion.rs} syscalls/ spec/ tooling/ bench_vs/.
+threat_model = "threat_model.md"
+
+# Areas are Cargo packages (dirs with a Cargo.toml), else the first `unit_depth` path components.
+unit_depth = 2
+
+# Soundness-critical code: units touching these get all lanes.
+sensitive = [
+  "prover/**",                 # AIR tables, constraints, LogUp/bus, trace generation, recursion.rs
+  "crypto/stark/**",           # STARK prover and verifier, FRI, transcript
+  "crypto/math/src/**",        # field and polynomial arithmetic
+  "crypto/crypto/src/**",      # hashes, Merkle commitments, Fiat-Shamir
+  "crypto/ecsm/src/**",        # elliptic-curve precompile
+  "executor/src/vm/**",        # instruction semantics the constraints must match
+  "syscalls/src/**",           # guest/host ABI, private-input and commit paths
+  "**/constraints/**",
+  "**/*verif*",
+  "**/*recursion*",
+  "**/recursion/**",
+  "**/continuation*/**",
+  "formal/**",                 # Lean / Clean models (not present on main yet)
+  "Cargo.toml",                # workspace dependencies (supply chain)
+  "rust-toolchain*",
+]
+
+# Not reviewed (in addition to lockfiles, binaries and the built-in generated/vendored patterns).
+ignore = [
+  "bench_vs/**",               # comparison benchmarks against other zkVMs
+  "**/*.elf",
+  "**/*.log",
+  "**/*.log/**",
+  "executor/programs/**/*.json",
+  "crypto/math-cuda/kernels/**/*.ptx",
+]
+
+# Extra test globs (on top of tests/, test/, *_test.rs, ...).
+test_globs = [
+  "executor/programs/asm/test_*",
+  "tooling/ethrex-tests/**",
+  "tooling/ethrex-fixtures/**",
+  "crypto/math/fuzz/**",
+]
+
+nonsensitive_lanes = ["claude", "gpt", "kimi"]
+
+# Order of review under --pr-budget, after "sensitive first".
+priority = ["crypto/stark/**", "prover/src/constraints/**", "prover/**", "**/*recursion*", "crypto/**", "formal/**"]
