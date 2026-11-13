@@ -47,6 +47,24 @@ fn the_blake3_grind_returns_the_smallest_valid_nonce() {
     }
 }
 
+/// ★ The joint-leaf kernel's prefix midstate is the host's
+/// (`blake3_joint::joint_leaf_midstate`) at every run width and the fold
+/// widths a round 0 takes: the card restates the prefix's layout, so this is
+/// what holds the two statements to one.
+#[test]
+fn the_joint_leaf_midstate_is_the_hosts() {
+    use crypto::merkle_tree::backends::blake3_joint::joint_leaf_midstate;
+    for blocks in 2u64..=4 {
+        for log_block in [2u32, 4, 6] {
+            assert_eq!(
+                math_cuda::blake3_whir::joint_midstate(blocks, log_block).expect("needs a GPU"),
+                joint_leaf_midstate(blocks, 1 << log_block, 8),
+                "{blocks} blocks of 2^{log_block}"
+            );
+        }
+    }
+}
+
 /// At the production grind (18 bits) the card's nonce is valid.
 #[test]
 fn the_blake3_grind_is_valid_at_the_production_factor() {
