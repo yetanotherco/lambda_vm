@@ -181,9 +181,12 @@ impl TableRecords for CpuLogRecords {
     }
 }
 
-/// A full MEMW_R chunk held as its register rows.
+/// A full MEMW_R chunk held as its register rows, and the run's ECALL cycles
+/// over their span when the run hands them out
+/// ([`TableRecords::ecall_cycles`]).
 pub(crate) struct RegisterRowRecords {
     rows: Segments<RegRow>,
+    ecalls: Option<Arc<[u32]>>,
 }
 
 impl RegisterRowRecords {
@@ -192,10 +195,16 @@ impl RegisterRowRecords {
     /// pads it.
     pub(crate) fn new(rows: Segments<RegRow>) -> Result<Self, Segments<RegRow>> {
         if whole_table(rows.len()) {
-            Ok(Self { rows })
+            Ok(Self { rows, ecalls: None })
         } else {
             Err(rows)
         }
+    }
+
+    /// The same records with the run's ECALL cycles over their span (`None`:
+    /// without them).
+    pub(crate) fn with_ecall_cycles(self, ecalls: Option<Arc<[u32]>>) -> Self {
+        Self { ecalls, ..self }
     }
 
     /// The table held as these records.
@@ -256,6 +265,10 @@ impl TableRecords for RegisterRowRecords {
 
     fn return_pages(&mut self) -> PagesReturned {
         self.rows.return_pages()
+    }
+
+    fn ecall_cycles(&self) -> Option<&[u32]> {
+        self.ecalls.as_deref()
     }
 }
 

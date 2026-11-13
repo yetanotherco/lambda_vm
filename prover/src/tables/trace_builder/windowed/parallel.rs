@@ -75,6 +75,20 @@ impl<L: Into<Arc<Vec<Log>>>> From<(L, Option<MemorySnapshot>)> for ExecWindow {
     }
 }
 
+/// A window's ECALL cycles in the run, ascending: the cycles whose history
+/// record names an ECALL (`HistExtra::side`). Cycles stay below 2^30 in
+/// history mode (`HISTORY_MAX_CYCLES`).
+pub(super) fn ecall_cycles(history: &WindowHistory) -> Vec<u32> {
+    use executor::vm::history::{ECALL, NO_ACCESS};
+    history
+        .extras
+        .iter()
+        .enumerate()
+        .filter(|(_, extra)| extra.side != NO_ACCESS && extra.side & ECALL != 0)
+        .map(|(i, _)| (history.first + i as u64) as u32)
+        .collect()
+}
+
 /// The walk's register cells, as the executor's history holds them.
 fn register_state(cells: &RegisterCells) -> RegisterState {
     RegisterState {
@@ -121,6 +135,9 @@ struct WalkSettings {
     key: u64,
     /// Keep each window's logs with it ([`WindowedTraceBuilder::keeps_logs`]).
     keep_logs: bool,
+    /// Record mode: keep each window's ECALL cycles with it, read from its
+    /// history ([`WindowedTraceBuilder::marks_ecalls`]).
+    ecall_cycles: bool,
     /// Record mode's check: where a walker sends the digest of a rechecked
     /// window's lists ([`check_thread`]).
     digests: Option<Mutex<std::sync::mpsc::Sender<(u32, u64)>>>,
@@ -246,6 +263,9 @@ impl WindowWalker {
         let mut walked = walked?;
         if s.keep_logs {
             walked.keep_logs(Arc::clone(&job.logs));
+        }
+        if s.ecall_cycles {
+            walked.keep_ecall_cycles(ecall_cycles(history));
         }
         if self.record.take_missing() {
             return Err(Error::Prover(format!(
@@ -620,6 +640,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         listless: builder.cpu_listless(),
         key: std::collections::hash_map::RandomState::new().hash_one(0u64),
         keep_logs: builder.keeps_logs(),
+        ecall_cycles: builder.marks_ecalls(),
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),
     });
     let key = settings.key;
@@ -1295,5 +1316,7 @@ fn finish_state(
 
 #[cfg(test)]
 mod history_tests;
+#[cfg(test)]
+mod register_rows_tests;
 #[cfg(test)]
 mod tests;
