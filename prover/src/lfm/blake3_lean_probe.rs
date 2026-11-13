@@ -1556,3 +1556,7 @@ fn s4_the_lean_chip_on_the_card() {
     }
     println!("B3R S4 DONE");
 }
+
+/// The same tables through the block prover.
+#[path = "blake3_lean_block.rs"]
+mod block;
