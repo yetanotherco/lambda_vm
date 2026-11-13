@@ -81,6 +81,13 @@ pub(crate) const WORDS_FAULT_BEFORE: u32 = 2;
 /// timestamp's cycle, whatever the slot.
 pub(crate) const WORDS_FAULT_DECODE_SLOT: u32 = 4;
 
+// A test's fault: the accumulator drops every window's logs after the first
+// it keeps (the thread that absorbs the windows; the run must be refused).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DROP_LOGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 fn fault(bit: u32) -> bool {
     FAULT_WORDS.load(std::sync::atomic::Ordering::Relaxed) & bit != 0

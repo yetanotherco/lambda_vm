@@ -1574,7 +1574,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                     kept.listless = false;
                 }
                 kept.append(last, &decode);
-                let (cpu_ops, walk, rest, decode_trace) = kept.into_run(&decode);
+                let (cpu_ops, walk, rest, decode_trace) = kept.into_run(&decode)?;
                 super::build_stamps::mark("p0 concatenate");
                 let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state);
                 super::build_stamps::mark("p0 assemble");
@@ -2937,6 +2937,10 @@ impl KeptWords {
         // Only a window walked as words needs its logs: rows from a walker
         // without words cross whole.
         let as_words = words.is_some();
+        #[cfg(test)]
+        let logs = logs.filter(|_| {
+            !(super::register_words::DROP_LOGS.with(std::cell::Cell::get) && self.words_in > 0)
+        });
         let mut state = match words {
             Some(state) => *state,
             None => {
@@ -3002,6 +3006,32 @@ impl KeptWords {
             .filter(|(f, l)| *f <= hi && lo < f + l.len() as u64)
             .map(|(f, l)| (*f, Arc::clone(l)))
             .collect();
+        // Every cycle from the chunk's first word (not a marker: a whole row
+        // needs no log) to its last must lie in a window whose logs the chunk
+        // holds (a word's old access lies in its own window): else its rows
+        // cannot be decoded, and the run is refused at the finish.
+        let pieces = words.slices();
+        let word_cycle = |w: &u64| (*w as u32 != 0).then(|| ((*w & 0xFFFF_FFFF) - 4) / 4);
+        let first_word = pieces.iter().flat_map(|p| p.iter()).find_map(word_cycle);
+        let last_word = pieces
+            .iter()
+            .rev()
+            .flat_map(|p| p.iter().rev())
+            .find_map(word_cycle);
+        if let (Some(wlo), Some(whi)) = (first_word, last_word) {
+            let mut covered = wlo;
+            for (f, l) in &logs {
+                if *f > covered {
+                    break;
+                }
+                covered = covered.max(f + l.len() as u64);
+            }
+            if covered <= whi {
+                self.broken.get_or_insert_with(|| {
+                    format!("a MEMW_R chunk's words at cycles {wlo}..={whi}: logs held only to {covered}")
+                });
+            }
+        }
         // The next chunk's rows start at this one's last cycle or later, and
         // a word's old access lies in its own window.
         while self
@@ -3415,7 +3445,7 @@ impl Kept {
     fn into_run(
         self,
         decode_table: &DecodeTable,
-    ) -> (Vec<super::CpuOperation>, WalkOutputs, KeptRest, Table) {
+    ) -> Result<(Vec<super::CpuOperation>, WalkOutputs, KeptRest, Table), Error> {
         let Kept {
             cpu,
             logs: _,
@@ -3433,17 +3463,17 @@ impl Kept {
             listless_broken: _,
         } = self;
         let mut walk = WalkOutputs::with_capacity(0);
-        // Words mode: the run's last register rows, decoded from the logs.
+        // Words mode: the run's last register rows, decoded from the logs. A
+        // run whose words could not all be decoded (a window without its
+        // logs) is refused here: its prove fails, nothing panics.
         let register_rows = match words {
             Some(mut words) => {
-                if let Some(e) = &words.broken {
-                    panic!("words mode: {e}");
-                }
                 let n = words.words.len;
                 let chunk = words.take(n);
-                chunk
-                    .decode(decode_table, 0..chunk.len())
-                    .unwrap_or_else(|e| panic!("the run's last MEMW_R rows: {e}"))
+                if let Some(e) = &words.broken {
+                    return Err(Error::Prover(format!("words mode: {e}")));
+                }
+                chunk.decode(decode_table, 0..chunk.len())?
             }
             None => register_rows.into_vec(),
         };
@@ -3456,7 +3486,7 @@ impl Kept {
         walk.load_ops = load.into_vec();
         walk.lt_ops = lt.into_vec();
         walk.shift_ops = shift.into_vec();
-        (cpu.into_vec(), walk, rest, decode.into_table())
+        Ok((cpu.into_vec(), walk, rest, decode.into_table()))
     }
 }
 
@@ -3731,17 +3761,20 @@ fn memw_register_chunk_ops(
 /// A full MEMW_R chunk in words mode, as handed out: held as its words (the
 /// card builds the rows) while the card fills MEMW_R and has room; otherwise
 /// its rows, decoded from the logs, to be filled on the host as today's.
+/// A chunk whose rows cannot be decoded goes out empty, and the error with it
+/// (the run is then refused at the finish).
 fn memw_register_words_chunk_ops(
     chunk: WordChunk,
     decode: &Arc<DecodeTable>,
     index: usize,
     card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
-) -> ChunkOps {
-    let decoded = |chunk: &WordChunk| {
-        let rows = chunk
-            .decode(decode, 0..chunk.len())
-            .unwrap_or_else(|e| panic!("MEMW_R chunk {index}: {e}"));
-        ChunkOps::MemwRegister(Segments::one(rows))
+) -> (ChunkOps, Option<String>) {
+    let decoded = |chunk: &WordChunk| match chunk.decode(decode, 0..chunk.len()) {
+        Ok(rows) => (ChunkOps::MemwRegister(Segments::one(rows)), None),
+        Err(e) => (
+            ChunkOps::MemwRegister(Segments::one(Vec::new())),
+            Some(format!("MEMW_R chunk {index}: {e}")),
+        ),
     };
     let Some((card, stamps)) = card.filter(|(card, _)| card.memw_r) else {
         return decoded(&chunk);
@@ -3755,7 +3788,10 @@ fn memw_register_words_chunk_ops(
     }
     stamps.memw_r[0] += 1;
     stamps.records_bytes += bytes;
-    ChunkOps::MemwRegisterRecords(RegisterRowRecords::from_words(chunk, Arc::clone(decode)))
+    (
+        ChunkOps::MemwRegisterRecords(RegisterRowRecords::from_words(chunk, Arc::clone(decode))),
+        None,
+    )
 }
 
 /// [`chunk_jobs`] under [`WindowedTraceBuilder::drop_streamed_ops`]: every full
@@ -3890,12 +3926,15 @@ fn tail_jobs(
                 &mut counted.histogram,
             );
         }
-        let ops = memw_register_words_chunk_ops(
+        let (ops, broken) = memw_register_words_chunk_ops(
             chunk,
             decode_table,
             e.memw_register,
             card.as_mut().map(|(c, s)| (*c, &mut **s)),
         );
+        if let (Some(e), Some(words)) = (broken, kept.words.as_mut()) {
+            words.broken.get_or_insert(e);
+        }
         stamps.note(
             StreamTable::MemwRegister,
             taken,
