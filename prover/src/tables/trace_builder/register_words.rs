@@ -199,7 +199,13 @@ pub(crate) fn count_bitwise_pieces(
                 );
             }
         } else {
-            memw_register::count_bitwise_lookup(w as u32, (w >> 32) as u32, histogram);
+            // The lookup reads the timestamp's and the old timestamp's low
+            // words only.
+            let row = RegRow::new(0, w & 0xFFFF_FFFF, 0, 0, 0, 0, w >> 32, true);
+            memw_register::collect_bitwise_from_memw_register(
+                std::slice::from_ref(&row),
+                histogram,
+            );
         }
     }
 }
