@@ -17,7 +17,7 @@ use executor::vm::fast::FastExecutor;
 use executor::vm::logs::Log;
 use math_cuda::card_rows::{RegisterPlan, WHOLE_ROW, WholeRows, plan_registers};
 use math_cuda::fill::RegRowC;
-use multilinear::records::{Records, RecordsFill};
+use multilinear::records::{Records, RecordsFill, RegisterRow};
 
 use super::super::super::CpuOperation;
 use super::super::{StreamTable, WindowedTraceBuilder};
@@ -55,12 +55,22 @@ struct Walked {
 }
 
 fn walked(program: &Elf, max_rows: &MaxRowsConfig, window: usize) -> Walked {
-    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
+    walked_as(program, max_rows, window, false)
+}
+
+/// [`walked`], the walkers writing MEMW_R's rows as words when `words`
+/// ([`WindowedTraceBuilder::card_writes_words`]).
+fn walked_as(program: &Elf, max_rows: &MaxRowsConfig, window: usize, words: bool) -> Walked {
+    let builder = WindowedTraceBuilder::new(program, &[], max_rows)
         .and_then(WindowedTraceBuilder::drop_streamed_ops)
-        .and_then(|b| b.card_fill_streamed(Arc::new(|_| true), true, true))
-        .and_then(WindowedTraceBuilder::card_marks_ecalls)
-        .expect("the builder");
-    assert!(builder.marks_ecalls());
+        .and_then(|b| b.card_fill_streamed(Arc::new(|_| true), true, true));
+    let mut builder = if words {
+        builder.and_then(WindowedTraceBuilder::card_writes_words)
+    } else {
+        builder.and_then(WindowedTraceBuilder::card_marks_ecalls)
+    }
+    .expect("the builder");
+    assert!(builder.marks_ecalls() || words);
     let decode = Arc::clone(&builder.decode);
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
     let logs = Mutex::new(Vec::new());
@@ -312,6 +322,10 @@ fn without_the_history_a_memw_r_chunk_carries_no_ecall_cycles() {
     assert!(seen > 0, "no MEMW_R chunk held as records");
 }
 
+/// A words-mode MEMW_R table for the kernel's vectors: its words, its whole
+/// rows, the run index of the first, and the host fill's words.
+type WordsTable = (Vec<u64>, Vec<RegisterRow>, u64, Vec<u64>);
+
 /// `v`'s bytes as they lie (plain `#[repr(C)]` records without padding).
 fn raw<T: Copy>(v: &[T]) -> &[u8] {
     // SAFETY: `T` is one of the records below, all fields, no padding.
@@ -352,9 +366,10 @@ fn write_the_register_rows_kernel_vectors() {
         ("test_copy_ecalls", 7),
         ("misalign_sd", 33),
     ];
-    let mut out: Vec<u8> = b"CRREG001".to_vec();
+    let mut out: Vec<u8> = b"CRREG002".to_vec();
     put(&mut out, &[cases.len() as u64]);
     let mut tables = 0usize;
+    let (mut words_count, mut words_based) = (0usize, 0usize);
     for (name, window) in cases {
         let (program, _) = run(name);
         let walked = walked(&program, &max_rows, window);
@@ -414,11 +429,54 @@ fn write_the_register_rows_kernel_vectors() {
                 }
             }
         }
+        // The same run walked as words: each MEMW_R chunk whose cycles the
+        // full CPU tables hold, as the card gets it in words mode (its words
+        // as the walk wrote them, its whole rows, the run index of the first),
+        // and the words the host fill of its decoded rows writes.
+        let as_words = walked_as(&program, &max_rows, window, true);
+        let end = held.last().map_or(0, |&(f, n)| f + n);
+        let words_tables: Vec<WordsTable> = as_words
+            .chunks
+            .iter()
+            .filter_map(|records| {
+                let w = records.register_words()?;
+                let words: Vec<u64> = w.words.concat();
+                let whole: Vec<RegisterRow> = w.whole.concat();
+                let ts = |x: u64| {
+                    if x as u32 == 0 {
+                        whole[((x >> 32) - w.whole_base) as usize].timestamp
+                    } else {
+                        x & 0xFFFF_FFFF
+                    }
+                };
+                let last = (ts(*words.last()?) - 4) / 4;
+                if last >= end {
+                    return None;
+                }
+                let packed = records.host_fill().expect("the host fill");
+                let want = (0..packed.cols()).flat_map(|c| packed.column(c)).collect();
+                Some((words, whole, w.whole_base, want))
+            })
+            .collect();
+        put(&mut out, &[words_tables.len() as u64]);
+        for (words, whole, base, want) in &words_tables {
+            words_count += 1;
+            words_based += usize::from(*base > 0);
+            put(&mut out, &[words.len() as u64, want.len() as u64, *base]);
+            put(&mut out, words);
+            put(&mut out, &[whole.len() as u64]);
+            out.extend_from_slice(raw(whole));
+            put(&mut out, want);
+        }
     }
     std::fs::write(&path, &out).expect("the vectors written");
     println!(
-        "REGISTER VECTORS: {} cases, {tables} tables, {} bytes → {path}",
+        "REGISTER VECTORS: {} cases, {tables} tables, {words_count} tables as words ({words_based} after a whole row of an earlier chunk), {} bytes → {path}",
         cases.len(),
         out.len()
+    );
+    assert!(
+        words_count >= 2 && words_based > 0,
+        "the vectors need words tables past the first chunk"
     );
 }
