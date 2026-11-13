@@ -1405,6 +1405,11 @@ fn cmd_prove_block_base(
         stark::grinding::gpu_grind_calls_p1(),
         stark::grinding::gpu_grind_calls_b3()
     );
+    #[cfg(feature = "cuda")]
+    eprintln!(
+        "BLOCK BASE HOST COMMITS: {} (stacked commits the card declined)",
+        prover::block_whir::host_commit_fallbacks()
+    );
     let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
         Ok(bytes) => bytes,
         Err(e) => {
