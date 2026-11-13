@@ -4654,6 +4654,7 @@ fn the_final_polynomial_compressed_block_verifies_and_refuses_tampering() {
         prep: super::wlfm::WlfmPrep::Stacked,
         final_poly: multilinear::whir_chain::FinalPoly::Vars(super::compress::COMPRESS_FINAL_VARS),
         fold: None,
+        grind: None,
     });
 }
 

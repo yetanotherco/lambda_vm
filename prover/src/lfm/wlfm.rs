@@ -120,6 +120,10 @@ pub enum WlfmRate {
     /// format's query grind), under a 2^[`WLFM_B16_STACK`] stack: the
     /// compression step's rate, where a query buys the most bytes.
     Sixteen,
+    /// Blowup 64 at the production query rule, under a 2^[`WLFM_B64_STACK`]
+    /// stack: the second compression step's rate (a proof whose verifier is
+    /// the host), where a query buys ≈ 2.96 Johnson bits.
+    SixtyFour,
 }
 
 impl WlfmRate {
@@ -129,6 +133,7 @@ impl WlfmRate {
             WlfmRate::Two => 2,
             WlfmRate::Four => 4,
             WlfmRate::Sixteen => 16,
+            WlfmRate::SixtyFour => 64,
         }
     }
 }
@@ -161,6 +166,10 @@ pub struct WlfmLevers {
     /// The fold width of every chain round after the first; `None` is
     /// today's (`log_folding` of the pinned chain).
     pub fold: Option<u8>,
+    /// The query grind's bits; `None` is the format's
+    /// ([`crate::zf_format::PRODUCTION_WHIR_GRIND_BITS`]). The query count
+    /// follows from it by the production rule, so more bits run fewer queries.
+    pub grind: Option<u8>,
 }
 
 impl WlfmLevers {
@@ -169,6 +178,7 @@ impl WlfmLevers {
         prep: WlfmPrep::Stacked,
         final_poly: FinalPoly::Off,
         fold: None,
+        grind: None,
     };
 
     /// Today's format with the instruction columns bound per `prep`.
@@ -177,6 +187,7 @@ impl WlfmLevers {
             prep,
             final_poly: FinalPoly::Off,
             fold: None,
+            grind: None,
         }
     }
 }
@@ -187,6 +198,10 @@ impl WlfmLevers {
 /// need 33.
 pub const WLFM_B16_STACK: usize = 26;
 
+/// The stack cap at [`WlfmRate::SixtyFour`]: `32 − 6 − 2 = 24` stacked
+/// variables at blowup 64 and the widest index.
+pub const WLFM_B64_STACK: usize = 24;
+
 /// ★ The chain config a W-LFM program proves under, over its table shapes:
 /// the pinned block format's chain
 /// ([`crate::block_whir::BlockFormat::chain_config`]: its argue, group fold,
@@ -194,7 +209,7 @@ pub const WLFM_B16_STACK: usize = 26;
 /// (and, at blowup 16, the [`WLFM_B16_STACK`] stack). The ONE call the build,
 /// the prover and the verifier make.
 pub fn wlfm_config(rate: WlfmRate, shapes: &[(usize, usize)]) -> ChainConfig {
-    wlfm_config_under(rate, FinalPoly::Off, None, shapes)
+    wlfm_config_under(rate, FinalPoly::Off, None, None, shapes)
 }
 
 /// [`wlfm_config`] with the chains' [`FinalPoly`] and, when `fold` is set,
@@ -203,20 +218,32 @@ pub fn wlfm_config(rate: WlfmRate, shapes: &[(usize, usize)]) -> ChainConfig {
 /// byte-minimising schedule (the in-guest chain verifier has neither, so a
 /// proof a parent verifies keeps both at today's). The query count stays the
 /// one today's schedule derives: a wider fold has no more rounds, so the
-/// count only over-covers its union bound.
+/// count only over-covers its union bound. `grind`, when set, is the query
+/// grind's bits, and the query count is the production rule's at those bits.
 pub fn wlfm_config_under(
     rate: WlfmRate,
     final_poly: FinalPoly,
     fold: Option<u8>,
+    grind: Option<u8>,
     shapes: &[(usize, usize)],
 ) -> ChainConfig {
     let mut zf = ZfFormat {
         whir_blowup: rate.factor() as u8,
         ..ZfFormat::DEFAULT
     };
-    if rate == WlfmRate::Sixteen {
-        zf.whir_stack = multilinear::whir_chain::StackVars::new(WLFM_B16_STACK)
-            .expect("the blowup-16 stack is in range");
+    match rate {
+        WlfmRate::Sixteen => {
+            zf.whir_stack = multilinear::whir_chain::StackVars::new(WLFM_B16_STACK)
+                .expect("the blowup-16 stack is in range");
+        }
+        WlfmRate::SixtyFour => {
+            zf.whir_stack = multilinear::whir_chain::StackVars::new(WLFM_B64_STACK)
+                .expect("the blowup-64 stack is in range");
+        }
+        WlfmRate::Two | WlfmRate::Four => {}
+    }
+    if let Some(bits) = grind {
+        zf.whir_grind_bits = bits;
     }
     let format = crate::block_whir::BlockFormat {
         zf,
@@ -278,6 +305,8 @@ pub struct WlfmArtifacts {
     /// from the levers, never the reverse).
     pub final_poly: FinalPoly,
     pub fold: Option<u8>,
+    /// The query grind's bits when not the format's (folded into `config`).
+    pub grind: Option<u8>,
     /// Under [`WlfmPrep::Stacked`]: the prepared stacks. Empty otherwise.
     pub stacks: Vec<WlfmStack>,
     /// Under [`WlfmPrep::Evaluated`]: each table's preprocessed prefix, as the
@@ -459,6 +488,7 @@ pub fn build_wlfm_under(
         prep,
         final_poly,
         fold,
+        grind,
     } = levers;
     // The mask with `BITWISE` dropped where nothing sends it: the default, as a
     // constant (`for_program_with_hasher` reads it from the environment).
@@ -497,7 +527,7 @@ pub fn build_wlfm_under(
         counts.push(count);
     }
     let shapes = table_shapes(&refs, &table_num_vars);
-    let config = wlfm_config_under(rate, final_poly, fold, &shapes);
+    let config = wlfm_config_under(rate, final_poly, fold, grind, &shapes);
     let sizes = multilinear_block::block_groups(&shapes, config.format.stack, WLFM_GROUP_POLYS)
         .map_err(|e| format!("{e:?}"))?;
     let group_lists: Vec<Vec<u32>> = {
@@ -539,6 +569,7 @@ pub fn build_wlfm_under(
             prep,
             final_poly,
             fold,
+            grind,
             stacks: Vec::new(),
             evaluated,
             program_id: [0u8; 32],
@@ -586,6 +617,7 @@ pub fn build_wlfm_under(
         prep,
         final_poly,
         fold,
+        grind,
         stacks,
         evaluated: Vec::new(),
         program_id: [0u8; 32],
@@ -983,6 +1015,7 @@ fn verifier_frame(artifacts: &WlfmArtifacts, airs: &LfmAirs) -> Result<VerifierF
         artifacts.rate,
         artifacts.final_poly,
         artifacts.fold,
+        artifacts.grind,
         &shapes,
     ) != artifacts.config
     {
