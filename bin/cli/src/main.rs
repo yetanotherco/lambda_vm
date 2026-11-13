@@ -524,9 +524,9 @@ enum Commands {
         #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
         leaves: String,
 
-        /// As `prove-block --trees`, except that unset under `--base b3` reads
-        /// `each`: one tree a run is defined for Poseidon1's joint leaf only,
-        /// so a named `one` beside the BLAKE3 base is refused.
+        /// As `prove-block --trees`: unset is the format's default (one tree
+        /// a run) under both bases, whose trees both have a joint leaf;
+        /// `each` is the rollback.
         #[arg(long, value_parser = ["each", "one"])]
         trees: Option<String>,
     },
@@ -1326,17 +1326,18 @@ fn vm_hwm() -> Option<String> {
         .map(|l| l["VmHWM:".len()..].trim().to_string())
 }
 
-/// `prove-block-base`'s `--trees`: [`round0_choice`], except that unset reads
-/// `each` under a base other than Poseidon1 (one tree a run is defined for
-/// Poseidon1's joint leaf only). A named `one` there passes through, for the
-/// install to refuse by name.
+/// `prove-block-base`'s `--trees`: [`round0_choice`] under a base whose
+/// trees have a joint leaf (Poseidon1 and 7-round BLAKE3), so unset is the
+/// format's default there; unset reads `each` under any other base. A named
+/// `one` there passes through, for the install to refuse by name.
 fn base_round0_choice(
     trees: Option<&str>,
     leaves: prover::zf_format::LeafOrder,
     hash: stark::config::CommitmentHash,
 ) -> Result<prover::zf_format::Round0Trees, String> {
+    use stark::config::CommitmentHash;
     match (trees, hash) {
-        (None, stark::config::CommitmentHash::Poseidon1) | (Some(_), _) => {
+        (None, CommitmentHash::Poseidon1 | CommitmentHash::Blake3) | (Some(_), _) => {
             round0_choice(trees, leaves)
         }
         (None, _) => Ok(prover::zf_format::Round0Trees::Each),
@@ -1345,8 +1346,8 @@ fn base_round0_choice(
 
 /// [`install_block_format`] with the base `base` in place of the family's:
 /// `prove-block-base` alone calls it, after declaring base-only. `--trees`
-/// unset reads `each` under a base other than Poseidon1, whose joint leaf is
-/// the only one a run's tree has; a named `one` there is refused by the install.
+/// is [`base_round0_choice`]'s; a named `one` under a base with no joint leaf
+/// is refused by the install.
 fn install_block_format_with_base(
     blowup: &str,
     leaves: &str,
@@ -2841,8 +2842,9 @@ mod tests {
     }
 
     /// `prove-block-base --trees`: unset is the format's default under the
-    /// Poseidon1 base and `each` under BLAKE3 (no joint leaf there); a named
-    /// word is taken as given; anything else does not parse.
+    /// Poseidon1 base and under BLAKE3 (both have a joint leaf), `each` under
+    /// the natural order and under a base with no joint leaf; a named word is
+    /// taken as given; anything else does not parse.
     #[test]
     fn the_base_only_command_reads_its_round0_trees_by_base() {
         use prover::zf_format::{LeafOrder, Round0Trees, ZfFormat};
@@ -2859,6 +2861,15 @@ mod tests {
         );
         assert_eq!(
             choice(None, LeafOrder::Coset, CommitmentHash::Blake3),
+            Ok(ZfFormat::DEFAULT.whir_trees)
+        );
+        assert_eq!(ZfFormat::DEFAULT.whir_trees, Round0Trees::One);
+        assert_eq!(
+            choice(None, LeafOrder::Natural, CommitmentHash::Blake3),
+            Ok(Round0Trees::Each)
+        );
+        assert_eq!(
+            choice(None, LeafOrder::Coset, CommitmentHash::Rpx256),
             Ok(Round0Trees::Each)
         );
         assert_eq!(
@@ -2867,6 +2878,14 @@ mod tests {
         );
         assert_eq!(
             choice(Some("one"), LeafOrder::Coset, CommitmentHash::Blake3),
+            Ok(Round0Trees::One)
+        );
+        assert_eq!(
+            choice(Some("each"), LeafOrder::Coset, CommitmentHash::Blake3),
+            Ok(Round0Trees::Each)
+        );
+        assert_eq!(
+            choice(Some("one"), LeafOrder::Coset, CommitmentHash::Rpx256),
             Ok(Round0Trees::One),
             "passed through for the install to refuse"
         );

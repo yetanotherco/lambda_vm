@@ -245,3 +245,95 @@ fn a_blake3_base_in_the_natural_order_is_its_own_format() {
         assert!(!verify(&proof, &elf, &coset));
     });
 }
+
+/// ★★ The BLAKE3 base with grouped chains takes one round-0 tree a run by
+/// default (the format's `whir_trees`, as under Poseidon1): under the permit
+/// it proves and verifies with groups retired and revived (drop 3), its
+/// grouped runs open joint leaves, it carries fewer roots than the same block
+/// under one tree a polynomial (`each`, the rollback, which proves and
+/// verifies too), and each format's verifier refuses the other's proof. A
+/// joint leaf's tampers are refused: a value moved in any of its blocks, two
+/// blocks swapped, and a value short.
+#[test]
+fn a_blake3_base_commits_one_tree_a_run_and_refuses_its_tampers() {
+    use multilinear::whir_chain::{GroupFold, Round0Trees};
+    let elf = asm_elf_bytes("all_instructions_64");
+    let mut one = many_groups(BaseFormat::B3_WHIR);
+    one.group = GroupFold::Indexed;
+    assert_eq!(one.zf.whir_trees, Round0Trees::One, "the default");
+    assert_eq!(one.zf.check_trees(), Ok(()));
+    let mut each = one;
+    each.zf.whir_trees = Round0Trees::Each;
+    crate::base_only::with_permit(|| {
+        let honest = prove(&elf, &one, 3);
+        let per_tree = prove(&elf, &each, 3);
+        assert_eq!(
+            refusal(&honest, &elf, &one),
+            None,
+            "one tree a run verifies"
+        );
+        assert_eq!(refusal(&per_tree, &elf, &each), None, "each verifies");
+        assert!(!verify(&honest, &elf, &each), "a joint proof under each");
+        assert!(!verify(&per_tree, &elf, &one), "a per-tree proof under one");
+        assert!(
+            honest.proof.roots.len() < per_tree.proof.roots.len(),
+            "{} roots against {}",
+            honest.proof.roots.len(),
+            per_tree.proof.roots.len()
+        );
+        // The first joint round 0: (group, chain) and its leaf width.
+        let (g, c, width) = honest
+            .proof
+            .columns
+            .iter()
+            .enumerate()
+            .find_map(|(g, column)| {
+                column.polys.iter().enumerate().find_map(|(c, chain)| {
+                    match &chain.rounds[0].openings {
+                        RoundOpenings::BaseJoint(p) => Some((g, c, p.current[0].values.len())),
+                        _ => None,
+                    }
+                })
+            })
+            .expect("a grouped run opens a joint leaf");
+        let block = match one.zf.whir_folds {
+            multilinear::whir_chain::WhirFolds::First(k0) => 1usize << k0.get(),
+            other => panic!("the default folds its first round wider: {other:?}"),
+        };
+        assert!(
+            width >= 2 * block && width.is_multiple_of(block),
+            "width {width}"
+        );
+        fn joint_at(
+            p: &mut BlockWhirProof,
+            g: usize,
+            c: usize,
+        ) -> &mut multilinear::whir_round::RoundProof<F, E> {
+            match &mut p.proof.columns[g].polys[c].rounds[0].openings {
+                RoundOpenings::BaseJoint(p) => p,
+                other => panic!("group {g} chain {c} is joint: {other:?}"),
+            }
+        }
+        let tampered = |name: &str, edit: &dyn Fn(&mut BlockWhirProof)| {
+            let mut proof = honest.clone();
+            edit(&mut proof);
+            let why = refusal(&proof, &elf, &one);
+            println!("B3 JOINT TAMPER {name}: {why:?}");
+            assert!(why.is_some(), "{name}: accepted");
+        };
+        for at in [0, block - 1, block, width - 1] {
+            tampered(&format!("value {at}"), &|p| {
+                joint_at(p, g, c).current[0].values[at] += FieldElement::<F>::one();
+            });
+        }
+        tampered("blocks 0 and 1 swapped", &|p| {
+            let values = &mut joint_at(p, g, c).current[0].values;
+            for t in 0..block {
+                values.swap(t, block + t);
+            }
+        });
+        tampered("a value short", &|p| {
+            joint_at(p, g, c).current[0].values.pop();
+        });
+    });
+}

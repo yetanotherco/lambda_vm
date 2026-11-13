@@ -96,7 +96,7 @@ pub const ENV_WHIR_LEAVES: &str = "LAMBDA_VM_ZF_WHIR_LEAVES";
 /// polynomial's coset block, end to end) or `each` (one a stacked polynomial,
 /// the rollback; unset beside `whir_leaves=natural` it is `each`).
 /// A proof format: the roots, the paths and the in-guest walks follow it.
-/// Poseidon1 trees and grouped chains only.
+/// Poseidon1 or 7-round BLAKE3 trees and grouped chains only.
 pub const ENV_WHIR_TREES: &str = "LAMBDA_VM_ZF_WHIR_TREES";
 /// Whether the recursion's LFM proofs put their equal-height chips into one
 /// AIR (`1`, the default) or keep one AIR a chip (`0`, the rollback). A proof
@@ -539,18 +539,23 @@ impl ZfFormat {
     }
 
     /// Refuses one round-0 tree a run where it has no joint tree to build: its
-    /// joint leaf is Poseidon1's, and its runs are the coset-ordered block
-    /// groups', so under any other base or the natural order it is refused by
-    /// name before anything is built.
+    /// joint leaf is Poseidon1's and the 7-round BLAKE3 base's
+    /// (`multilinear::whir_hash::WhirHash::JOINT_LEAF`), and its runs are the
+    /// coset-ordered block groups', so under any other base or the natural
+    /// order it is refused by name before anything is built.
     pub fn check_trees(&self) -> Result<(), String> {
+        use stark::config::CommitmentHash;
         match (self.whir_trees, self.base.hash, self.whir_leaves) {
             (Round0Trees::Each, _, _)
-            | (Round0Trees::One, stark::config::CommitmentHash::Poseidon1, LeafOrder::Coset) => {
-                Ok(())
-            }
+            | (
+                Round0Trees::One,
+                CommitmentHash::Poseidon1 | CommitmentHash::Blake3,
+                LeafOrder::Coset,
+            ) => Ok(()),
             (Round0Trees::One, hash, leaves) => Err(format!(
-                "{ENV_WHIR_TREES}=one: one round-0 tree a run is defined for Poseidon1 trees in \
-                 the coset order only, and the base hash is {hash:?}, the order {leaves:?}"
+                "{ENV_WHIR_TREES}=one: one round-0 tree a run is defined for Poseidon1 and \
+                 7-round BLAKE3 trees in the coset order only, and the base hash is {hash:?}, \
+                 the order {leaves:?}"
             )),
         }
     }
