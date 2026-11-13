@@ -15,6 +15,8 @@ pub mod block_cut_padding_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
 pub mod block_keccak_lean_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
 pub mod block_memw_limbs_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
@@ -104,6 +106,7 @@ pub mod lt_bus_tests;
 pub mod lt_multiplicity_poc;
 #[cfg(test)]
 pub mod lt_tests;
+#[cfg(test)]
 pub mod memw_aligned_limbs_tests;
 #[cfg(test)]
 pub mod memw_aligned_tests;
