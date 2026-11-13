@@ -3223,7 +3223,8 @@ fn the_whir_block_tree_on_a_real_block() {
         use super::compress::{compressed_artifacts, verify_compressed_against};
         use super::whir_block_tree::{WhirBlockCompressedProof, WhirBlockTreeProof};
         let t = std::time::Instant::now();
-        let artifacts = compressed_artifacts(plan, &wrap, c1.rate).expect("C1's artifacts derive");
+        let artifacts =
+            compressed_artifacts(plan, &wrap, c1.rate, c1.prep).expect("C1's artifacts derive");
         let derive = t.elapsed().as_secs_f64();
         let t = std::time::Instant::now();
         let honest = verify_compressed_against(plan, &artifacts, &c1.proof);
@@ -3258,9 +3259,11 @@ fn the_whir_block_tree_on_a_real_block() {
             }
         );
         println!(
-            "W3 COMPRESS BYTES: shipped file {c1_file} B compressed vs {top_file} B top ({:.3}×) · C1 proof {c1_bytes} B · blowup {}",
+            "W3 COMPRESS BYTES: shipped file {c1_file} B compressed vs {top_file} B top ({:.3}×) · C1 proof {c1_bytes} B · blowup {} · binding {:?} · prepared openings {}",
             c1_file as f64 / top_file as f64,
-            c1.rate.factor()
+            c1.rate.factor(),
+            c1.prep,
+            c1.proof.prepared.len()
         );
         honest.unwrap_or_else(|e| panic!("the compressed block must verify: {e}"));
         assert!(refused && refused_words, "a tampered C1 proof is refused");
@@ -4573,11 +4576,25 @@ fn split_prepared_stack_refuses_a_forgery_in_its_last_chain(argue: ArgueFormat) 
 #[test]
 #[ignore = "proves a small block's tree and C1 over its top; box tier"]
 fn the_compressed_block_verifies_and_refuses_tampering() {
+    compressed_block_case(super::wlfm::WlfmPrep::Stacked);
+}
+
+/// ★ The same under the evaluated binding (`LAMBDA_VM_BLOCK_COMPRESS_EVAL`):
+/// C1's proof carries no prepared opening and verifies, is refused with one
+/// added, refuses every tamper the stacked case does, and each binding's proof
+/// is refused by the other binding's verifier.
+#[test]
+#[ignore = "proves a small block's tree and C1 over its top twice; box tier"]
+fn the_evaluated_compressed_block_verifies_and_refuses_tampering() {
+    compressed_block_case(super::wlfm::WlfmPrep::Evaluated);
+}
+
+fn compressed_block_case(prep: super::wlfm::WlfmPrep) {
     use super::compress::{
         build_compress, compressed_artifacts, prove_compress, top_child, verify_compressed,
         verify_compressed_against,
     };
-    use super::wlfm::WlfmRate;
+    use super::wlfm::{WlfmPrep, WlfmRate};
     let _permit = super::device_permit::serial_for_test();
     let format = small_format();
     let (elf, proof) = small_block("test_commit_4", &format);
@@ -4586,8 +4603,9 @@ fn the_compressed_block_verifies_and_refuses_tampering() {
     let (top, _) = compose(&plan, &proof, "C1").expect("the honest tree proves");
     let top_artifacts = plan.derive_top(&wrap).expect("the top derives");
     let child = top_child(&plan, &top_artifacts, &wrap).expect("the top's shape");
-    let c = build_compress(&child, plan.top_layout(), WlfmRate::Sixteen).expect("C1 builds");
+    let c = build_compress(&child, plan.top_layout(), WlfmRate::Sixteen, prep).expect("C1 builds");
     assert_eq!(c.build.artifacts.config.log_blowup, 4);
+    assert_eq!(c.build.artifacts.prep, prep);
     let harvested = super::harvest::harvest_child_under::<BlockFamily>(
         top_artifacts.clone(),
         wrap.clone(),
@@ -4604,19 +4622,21 @@ fn the_compressed_block_verifies_and_refuses_tampering() {
         .expect("the top serializes")
         .len();
     println!(
-        "C1 SMALL: proved in {:.2}s · Q {} · C1 {bytes} B vs top {top_bytes} B",
+        "C1 SMALL: proved in {:.2}s · Q {} · binding {prep:?} · prepared openings {} · C1 {bytes} B vs top {top_bytes} B",
         t.elapsed().as_secs_f64(),
-        c.build.artifacts.config.num_queries
+        c.build.artifacts.config.num_queries,
+        c1.prepared.len()
     );
     assert_eq!(
         c1.public_words, top.public_words,
         "C1 republishes the top's words"
     );
-    verify_compressed(&plan, &wrap, WlfmRate::Sixteen, &c1)
+    verify_compressed(&plan, &wrap, WlfmRate::Sixteen, prep, &c1)
         .unwrap_or_else(|e| panic!("the compressed block verifies: {e}"));
 
     // Tampered C1 proofs.
-    let artifacts = compressed_artifacts(&plan, &wrap, WlfmRate::Sixteen).expect("C1's artifacts");
+    let artifacts =
+        compressed_artifacts(&plan, &wrap, WlfmRate::Sixteen, prep).expect("C1's artifacts");
     let mut answer = c1.clone();
     answer.commit_ood[0] += FEE::one();
     assert!(
@@ -4631,15 +4651,47 @@ fn the_compressed_block_verifies_and_refuses_tampering() {
             "word {w}"
         );
     }
-    let mut opening = c1.clone();
-    opening.prepared.clear();
-    assert!(
-        verify_compressed_against(&plan, &artifacts, &opening).is_err(),
-        "prepared"
-    );
+    match prep {
+        WlfmPrep::Stacked => {
+            assert!(!c1.prepared.is_empty());
+            let mut opening = c1.clone();
+            opening.prepared.clear();
+            assert!(
+                verify_compressed_against(&plan, &artifacts, &opening).is_err(),
+                "prepared"
+            );
+        }
+        WlfmPrep::Evaluated => {
+            assert!(c1.prepared.is_empty(), "no prepared chain");
+            // The stacked twin: its proof under the evaluated verifier, this
+            // proof under the stacked one, and its opening added here.
+            let stacked = build_compress(
+                &child,
+                plan.top_layout(),
+                WlfmRate::Sixteen,
+                WlfmPrep::Stacked,
+            )
+            .expect("the stacked C1 builds");
+            let twin = prove_compress(&stacked, &arena).expect("the stacked C1 proves");
+            assert!(
+                verify_compressed_against(&plan, &artifacts, &twin).is_err(),
+                "a stacked C1 under the evaluated verifier"
+            );
+            assert!(
+                verify_compressed(&plan, &wrap, WlfmRate::Sixteen, WlfmPrep::Stacked, &c1).is_err(),
+                "an evaluated C1 under the stacked verifier"
+            );
+            let mut added = c1.clone();
+            added.prepared.push(twin.prepared[0].clone());
+            assert!(
+                verify_compressed_against(&plan, &artifacts, &added).is_err(),
+                "an added prepared opening"
+            );
+        }
+    }
     // Another rate: the verifier's constant, never the proof's.
     assert!(
-        verify_compressed(&plan, &wrap, WlfmRate::Four, &c1).is_err(),
+        verify_compressed(&plan, &wrap, WlfmRate::Four, prep, &c1).is_err(),
         "a blowup-16 C1 under a blowup-4 verifier"
     );
     // Another block's plan: another statement, so another top and another C1.
@@ -4648,7 +4700,7 @@ fn the_compressed_block_verifies_and_refuses_tampering() {
     let other_plan = plan_of(&other_elf, &other_proof, &other, Some(2));
     assert_ne!(other_plan.id(), plan.id(), "the two blocks' plans differ");
     assert!(
-        verify_compressed(&other_plan, &wrap, WlfmRate::Sixteen, &c1).is_err(),
+        verify_compressed(&other_plan, &wrap, WlfmRate::Sixteen, prep, &c1).is_err(),
         "C1 under another block"
     );
 

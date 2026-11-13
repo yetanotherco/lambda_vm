@@ -21,6 +21,15 @@
 //! the prover adds C1 after the top; the file it ships is another pipeline
 //! (`whir_block_tree::WhirBlockCompressedProof`), whose verifier takes the rate
 //! as its own constant ([`COMPRESS_RATE`]), never from the proof.
+//!
+//! # How C1 binds its own program
+//!
+//! C1's proof is the pipeline's last, verified on the host, which derives C1's
+//! program anyway. `LAMBDA_VM_BLOCK_COMPRESS_EVAL` ([`compress_prep_setting`];
+//! default off) proves it under [`WlfmPrep::Evaluated`]: the verifier evaluates
+//! C1's instruction columns itself, so the proof carries no prepared chain.
+//! Unset is [`WlfmPrep::Stacked`], today's C1 byte for byte; the pinned
+//! verifier checks [`COMPRESS_PREP`], the evaluated arm has its own verifier.
 
 use super::block_node::BlockLayout;
 use super::builder::LfmBuilder;
@@ -28,7 +37,7 @@ use super::compiler::LfmProgram;
 use super::per_table_aggregator::{ChildShape, DerivedChild, declare_leg_arenas, emit_leg};
 use super::whir_block::{WhirBlockPlan, derived_of, finish_program, top_claims};
 use super::wlfm::{
-    WlfmArtifacts, WlfmBuild, WlfmProof, WlfmRate, build_wlfm, build_wlfm_on_host, prove_wlfm,
+    WlfmArtifacts, WlfmBuild, WlfmPrep, WlfmProof, WlfmRate, build_wlfm_under, prove_wlfm,
     verify_wlfm,
 };
 use super::word::LfmWord;
@@ -63,6 +72,42 @@ pub fn compress_setting(value: Option<&str>) -> Result<Option<WlfmRate>, String>
 /// [`compress_setting`] of the process's environment.
 pub fn compress_from_env() -> Result<Option<WlfmRate>, String> {
     compress_setting(std::env::var(COMPRESS_ENV).ok().as_deref())
+}
+
+/// The knob that proves C1 with its instruction columns evaluated by the
+/// verifier instead of a prepared chain.
+pub const COMPRESS_EVAL_ENV: &str = "LAMBDA_VM_BLOCK_COMPRESS_EVAL";
+
+/// How the pinned compressed block's verifier binds C1's instruction columns:
+/// a constant of the verifier, never read from a proof or the environment.
+pub const COMPRESS_PREP: WlfmPrep = WlfmPrep::Stacked;
+
+/// [`COMPRESS_EVAL_ENV`]'s value: unset, `0` or `off` is
+/// [`WlfmPrep::Stacked`] (the default); `1` or `on` is
+/// [`WlfmPrep::Evaluated`]. Anything else is refused.
+pub fn compress_prep_setting(value: Option<&str>) -> Result<WlfmPrep, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(WlfmPrep::Stacked),
+        Some(v) => match v.as_str() {
+            "" | "0" | "off" => Ok(WlfmPrep::Stacked),
+            "1" | "on" => Ok(WlfmPrep::Evaluated),
+            other => Err(format!(
+                "{COMPRESS_EVAL_ENV}={other:?}: expected off, 0, 1 or on"
+            )),
+        },
+    }
+}
+
+/// [`compress_prep_setting`] of the process's environment, refused when it
+/// asks for the evaluated binding with no compression step to apply it to.
+pub fn compress_prep_from_env(compress: Option<WlfmRate>) -> Result<WlfmPrep, String> {
+    let prep = compress_prep_setting(std::env::var(COMPRESS_EVAL_ENV).ok().as_deref())?;
+    if compress.is_none() && prep != WlfmPrep::Stacked {
+        return Err(format!(
+            "{COMPRESS_EVAL_ENV} binds C1's columns, and {COMPRESS_ENV} adds no C1"
+        ));
+    }
+    Ok(prep)
 }
 
 /// Emits C1 into `b`: the top's arenas, its leg, and every published word of
@@ -111,30 +156,28 @@ pub fn top_child(
     derived_of(top_artifacts, wrap_opts, plan.top_layout().total())
 }
 
-/// ★ C1's program and build at `rate`, for the top `top`: ONE derivation for
-/// the prover and the verifier (whose prepared commits run on the host,
-/// `on_host`).
+/// ★ C1's program and build at `rate` with its columns bound per `prep`, for
+/// the top `top`: ONE derivation for the prover and the verifier (whose
+/// prepared commits run on the host, [`compressed_artifacts`]).
 pub fn build_compress(
     top: &DerivedChild,
     layout: BlockLayout,
     rate: WlfmRate,
+    prep: WlfmPrep,
 ) -> Result<CompressBuild, String> {
-    build_compress_with(top, layout, rate, false)
+    build_compress_with(top, layout, rate, prep, false)
 }
 
 fn build_compress_with(
     top: &DerivedChild,
     layout: BlockLayout,
     rate: WlfmRate,
+    prep: WlfmPrep,
     on_host: bool,
 ) -> Result<CompressBuild, String> {
     let program = compress_program(top, layout)?;
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
-    let build = if on_host {
-        build_wlfm_on_host(&program, hasher, rate)?
-    } else {
-        build_wlfm(&program, hasher, rate)?
-    };
+    let build = build_wlfm_under(&program, hasher, rate, prep, on_host)?;
     Ok(CompressBuild { program, build })
 }
 
@@ -147,31 +190,36 @@ pub fn prove_compress(c: &CompressBuild, top_arena: &[Vec<LfmWord>]) -> Result<W
 
 /// ★ A compressed block verified against `plan` (the verifier's own, derived
 /// from the ELF and the statement): the top program derived under
-/// `wrap_opts`, C1 built over it at `rate` ([`compressed_artifacts`]), and the
-/// proof checked against them ([`verify_compressed_against`]).
+/// `wrap_opts`, C1 built over it at `rate` and `prep`
+/// ([`compressed_artifacts`]), and the proof checked against them
+/// ([`verify_compressed_against`]).
 pub fn verify_compressed(
     plan: &WhirBlockPlan,
     wrap_opts: &crate::ProofOptions,
     rate: WlfmRate,
+    prep: WlfmPrep,
     proof: &WlfmProof,
 ) -> Result<(), String> {
-    let artifacts = compressed_artifacts(plan, wrap_opts, rate)?;
+    let artifacts = compressed_artifacts(plan, wrap_opts, rate, prep)?;
     verify_compressed_against(plan, &artifacts, proof)
 }
 
 /// C1's artifacts as a verifier derives them for `plan`: the top program's
 /// artifacts under `wrap_opts`, its shape at the top layout, C1 over it at
-/// `rate`, its prepared stacks committed on the host.
+/// `rate` and `prep`, its prepared stacks (if any) committed on the host.
 pub fn compressed_artifacts(
     plan: &WhirBlockPlan,
     wrap_opts: &crate::ProofOptions,
     rate: WlfmRate,
+    prep: WlfmPrep,
 ) -> Result<WlfmArtifacts, String> {
     let top = plan.derive_top(wrap_opts)?;
     let child = top_child(plan, &top, wrap_opts)?;
-    Ok(build_compress(&child, plan.top_layout(), rate)?
-        .build
-        .artifacts)
+    Ok(
+        build_compress_with(&child, plan.top_layout(), rate, prep, true)?
+            .build
+            .artifacts,
+    )
 }
 
 /// `proof` verified against C1's `artifacts` over its own words, and those
@@ -207,5 +255,22 @@ mod tests {
             assert!(compress_setting(Some(bad)).is_err(), "{bad:?}");
         }
         assert_eq!(COMPRESS_RATE, WlfmRate::Sixteen);
+    }
+
+    /// The evaluated binding is off unless set, refuses nonsense, and the
+    /// pinned verifier's constant is today's stacked binding.
+    #[test]
+    fn the_compress_eval_knob_is_off_unless_set_and_refuses_nonsense() {
+        assert_eq!(compress_prep_setting(None), Ok(WlfmPrep::Stacked));
+        for off in ["", "0", "off", " OFF "] {
+            assert_eq!(compress_prep_setting(Some(off)), Ok(WlfmPrep::Stacked));
+        }
+        for on in ["1", "on", " ON "] {
+            assert_eq!(compress_prep_setting(Some(on)), Ok(WlfmPrep::Evaluated));
+        }
+        for bad in ["2", "yes", "evaluated", "-1"] {
+            assert!(compress_prep_setting(Some(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(COMPRESS_PREP, WlfmPrep::Stacked);
     }
 }

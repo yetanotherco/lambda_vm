@@ -243,6 +243,9 @@ pub struct WhirTreeConfig {
     /// default off): after the top, one compression proof of the top's
     /// verification (C1) at this rate, which then ships instead of the top.
     pub compress: Option<super::wlfm::WlfmRate>,
+    /// `LAMBDA_VM_BLOCK_COMPRESS_EVAL` ([`super::compress::compress_prep_setting`];
+    /// default off, stacked): how C1 binds its instruction columns.
+    pub compress_prep: super::wlfm::WlfmPrep,
 }
 
 /// A count knob: unset is `None`; anything but a count is an error.
@@ -499,6 +502,8 @@ impl WhirTreeConfig {
         // waves) and the bytes it builds at once, KECCAK_RND built as its
         // tables, the finish's tables packed as they are built.
         block_whir::rest_layout_from_env(&mut options);
+        let compress = super::compress::compress_from_env()?;
+        let compress_prep = super::compress::compress_prep_from_env(compress)?;
         let node_pipe = count_knob("W3_NODE_PIPE")?
             .is_none_or(|v| v != 0)
             .then(|| count_knob("W3_EMIT_THREADS").map(|t| t.unwrap_or(4).max(1)))
@@ -521,7 +526,8 @@ impl WhirTreeConfig {
             exec_early: count_knob("W3_EXEC_EARLY")?.is_none_or(|v| v != 0),
             node_times: count_knob("W3_NODE_TIMES")? == Some(1),
             leaf_first: count_knob("W3_LEAF_FIRST")?.is_none_or(|v| v != 0),
-            compress: super::compress::compress_from_env()?,
+            compress,
+            compress_prep,
         })
     }
 
@@ -1935,9 +1941,11 @@ pub struct WhirTreeTimes {
     pub readouts: f64,
 }
 
-/// The compression step's proof (C1) and the rate it was proved at.
+/// The compression step's proof (C1), the rate it was proved at and how it
+/// binds its instruction columns.
 pub struct CompressedTop {
     pub rate: super::wlfm::WlfmRate,
+    pub prep: super::wlfm::WlfmPrep,
     pub proof: super::wlfm::WlfmProof,
 }
 
@@ -2521,7 +2529,12 @@ pub fn prove_whir_block_tree(
                     let tb = std::time::Instant::now();
                     let wrap = aggregation_wrap_options();
                     let child = super::compress::top_child(plan, top, &wrap)?;
-                    let c = super::compress::build_compress(&child, plan.top_layout(), rate)?;
+                    let c = super::compress::build_compress(
+                        &child,
+                        plan.top_layout(),
+                        rate,
+                        cfg.compress_prep,
+                    )?;
                     Ok((c, tb.elapsed().as_secs_f64(), t.elapsed().as_secs_f64()))
                 })();
                 let _ = c1_built.0.set(built);
@@ -2578,15 +2591,20 @@ pub fn prove_whir_block_tree(
             });
             let a = &c.build.artifacts;
             sink.line(&format!(
-                "W3 COMPRESS: C1 at blowup {} · Q {} · groups {:?} · prepared stacks {} · tables 2^{:?} · built in {build_secs:.2}s (done@{built_at:.2}, top proved@{tree:.2}, waited {:.2}s) · C1 {c1_secs:.2}s after the top ({split})",
+                "W3 COMPRESS: C1 at blowup {} · Q {} · binding {:?} · groups {:?} · prepared stacks {} · tables 2^{:?} · built in {build_secs:.2}s (done@{built_at:.2}, top proved@{tree:.2}, waited {:.2}s) · C1 {c1_secs:.2}s after the top ({split})",
                 rate.factor(),
                 a.config.num_queries,
+                a.prep,
                 a.sizes,
                 a.stacks.len(),
                 a.table_num_vars,
                 (built_at - tree).max(0.0),
             ));
-            Some(CompressedTop { rate, proof: c1 })
+            Some(CompressedTop {
+                rate,
+                prep: cfg.compress_prep,
+                proof: c1,
+            })
         }
         _ => None,
     };
@@ -2964,8 +2982,9 @@ impl WhirBlockCompressedProof {
 /// ★ A compressed W3 block proof file verified: the plan derived from the
 /// trusted ELF and the claimed statement under the pinned presets (as
 /// [`verify_whir_block_tree_proof`]), C1 built over the derived top at
-/// [`super::compress::COMPRESS_RATE`], and the file's C1 proof checked against
-/// it and to claim the block. No format choice is the caller's or the file's.
+/// [`super::compress::COMPRESS_RATE`] and [`super::compress::COMPRESS_PREP`],
+/// and the file's C1 proof checked against it and to claim the block. No format
+/// choice is the caller's or the file's.
 pub fn verify_whir_block_compressed_proof(
     elf_bytes: &[u8],
     proof: &WhirBlockCompressedProof,
@@ -2976,6 +2995,28 @@ pub fn verify_whir_block_compressed_proof(
         &plan,
         &presets.wrap_options,
         super::compress::COMPRESS_RATE,
+        super::compress::COMPRESS_PREP,
+        &proof.compressed,
+    )
+}
+
+/// ★ The evaluated arm's compressed W3 block verifier
+/// (`LAMBDA_VM_BLOCK_COMPRESS_EVAL`): [`verify_whir_block_compressed_proof`]
+/// with C1's instruction columns evaluated by this verifier
+/// ([`super::wlfm::WlfmPrep::Evaluated`]), a constant of this function. A file
+/// of one binding is refused by the other's verifier: the binding is folded
+/// into C1's identity, which the statement absorbs before any root.
+pub fn verify_whir_block_compressed_evaluated_proof(
+    elf_bytes: &[u8],
+    proof: &WhirBlockCompressedProof,
+) -> Result<(), String> {
+    let presets = super::whir_block::pinned_verifier_presets(BlockFormat::pinned().group);
+    let plan = super::whir_block::verifier_plan(elf_bytes, proof.statement(), &presets)?;
+    super::compress::verify_compressed(
+        &plan,
+        &presets.wrap_options,
+        super::compress::COMPRESS_RATE,
+        super::wlfm::WlfmPrep::Evaluated,
         &proof.compressed,
     )
 }
@@ -3387,17 +3428,45 @@ mod tests {
             .expect("the compressed verifier");
         let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
         assert!(body.contains("super::compress::COMPRESS_RATE"), "{body}");
-        for forbidden in ["env::var", "compress_from_env", "ZfFormat::global", ".rate"] {
+        assert!(body.contains("super::compress::COMPRESS_PREP"), "{body}");
+        let forbidden_in_verifiers = [
+            "env::var",
+            "compress_from_env",
+            "compress_prep_from_env",
+            "ZfFormat::global",
+            ".rate",
+            ".prep",
+        ];
+        for forbidden in forbidden_in_verifiers {
             assert!(
                 !body.contains(forbidden),
                 "the verifier reads `{forbidden}`"
+            );
+        }
+        // The evaluated arm's verifier: the same constants but its binding,
+        // named in its body.
+        let at = src
+            .find("\npub fn verify_whir_block_compressed_evaluated_proof(")
+            .expect("the evaluated compressed verifier");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
+        assert!(body.contains("super::compress::COMPRESS_RATE"), "{body}");
+        assert!(body.contains("WlfmPrep::Evaluated"), "{body}");
+        for forbidden in forbidden_in_verifiers {
+            assert!(
+                !body.contains(forbidden),
+                "the evaluated verifier reads `{forbidden}`"
             );
         }
         let compress = include_str!("compress.rs");
         let verify = &compress[compress
             .find("\npub fn verify_compressed(")
             .expect("verify_compressed")..];
-        for forbidden in ["env::var", "compress_from_env", "ZfFormat::global"] {
+        for forbidden in [
+            "env::var",
+            "compress_from_env",
+            "compress_prep_from_env",
+            "ZfFormat::global",
+        ] {
             assert!(
                 !verify.contains(forbidden),
                 "compress.rs's verifiers read `{forbidden}`"
@@ -3428,6 +3497,7 @@ mod tests {
             node_times: false,
             leaf_first: true,
             compress: None,
+            compress_prep: super::super::wlfm::WlfmPrep::Stacked,
         };
         assert!(production.at_presets());
         let off = |f: fn(&mut WhirTreeConfig)| {
