@@ -127,3 +127,111 @@ fn the_round_counts_meet_the_papers_bounds_with_the_margin() {
 }
 
 const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001;
+
+// =============================================================================
+// The sparse partial rounds against the textbook form
+// =============================================================================
+
+/// Random states with edge values planted: every seventh lane is 0, 1, p − 1
+/// or a non-canonical word.
+#[cfg(feature = "std")]
+fn random_states(n: usize, seed: u64) -> alloc::vec::Vec<[Fp; STATE_FELTS]> {
+    const P: u64 = 0xFFFF_FFFF_0000_0001;
+    const EDGES: [u64; 6] = [0, 1, P - 1, P, P + 1, u64::MAX];
+    let mut z = seed;
+    let mut next = || {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut x = z;
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    };
+    (0..n)
+        .map(|k| {
+            core::array::from_fn(|i| {
+                if (k * STATE_FELTS + i).is_multiple_of(7) {
+                    Fp::from(EDGES[(k + i) % EDGES.len()])
+                } else {
+                    Fp::from(next())
+                }
+            })
+        })
+        .collect()
+}
+
+/// ★ The sparse form is the textbook permutation: equal on 100,000 random
+/// states (edge values planted) and on the known answers' inputs, and
+/// `permute` (the production entry) is the sparse form under `std`.
+#[cfg(feature = "std")]
+#[test]
+fn the_sparse_form_is_the_textbook_permutation() {
+    let t = fast::tables();
+    for (k, s) in random_states(100_000, 7).into_iter().enumerate() {
+        assert_eq!(
+            canon(&fast::permute(t, s)),
+            canon(&permute_textbook(s)),
+            "state {k}"
+        );
+    }
+    for (input, expected) in PERMUTATION_VECTORS.iter() {
+        assert_eq!(canon(&fast::permute(t, fp16(input))), expected.to_vec());
+        assert_eq!(canon(&permute_textbook(fp16(input))), expected.to_vec());
+    }
+    let s = fp16(&PERMUTATION_VECTORS[1].0);
+    assert_eq!(canon(&permute(s)), canon(&fast::permute(t, s)));
+}
+
+/// Each derived table is load-bearing: one moved entry of the lane-0
+/// constants, of a sparse layer's `w` or `v`, of the tail matrix or of the
+/// carried constants makes the sparse form differ from the textbook one.
+#[cfg(feature = "std")]
+#[test]
+fn every_derived_table_of_the_sparse_form_is_load_bearing() {
+    let states = random_states(64, 11);
+    type Mutant = (&'static str, fn(&mut fast::Tables));
+    let mutants: [Mutant; 6] = [
+        ("lane-0 constant", |t| t.lane0[7] ^= 1),
+        ("sparse m00", |t| t.sparse[0].m00 ^= 1),
+        ("sparse w", |t| t.sparse[12].w[3] ^= 1),
+        ("sparse v", |t| t.sparse[21].v[14] ^= 1),
+        ("tail matrix", |t| t.tail[5][9] ^= 1),
+        ("carried constants", |t| t.full[4][13] += Fp::one()),
+    ];
+    for (what, mutate) in mutants {
+        let mut t = fast::tables().clone();
+        mutate(&mut t);
+        let differs = states
+            .iter()
+            .any(|s| canon(&fast::permute(&t, *s)) != canon(&permute_textbook(*s)));
+        assert!(differs, "a moved {what} is not caught");
+    }
+}
+
+/// ⛔ A MEASUREMENT (ignored): microseconds a permutation, textbook against
+/// sparse, one thread. Prints `P1W16 PERMUTE` lines.
+#[cfg(feature = "std")]
+#[test]
+#[ignore = "a measurement"]
+fn probe_the_sparse_forms_speed() {
+    let states = random_states(200_000, 3);
+    let t = fast::tables();
+    for _ in 0..2 {
+        let start = std::time::Instant::now();
+        let mut acc = Fp::zero();
+        for s in &states {
+            acc += permute_textbook(*s)[0];
+        }
+        let textbook = start.elapsed().as_secs_f64() * 1e6 / states.len() as f64;
+        let start = std::time::Instant::now();
+        let mut acc2 = Fp::zero();
+        for s in &states {
+            acc2 += fast::permute(t, *s)[0];
+        }
+        let sparse = start.elapsed().as_secs_f64() * 1e6 / states.len() as f64;
+        assert_eq!(acc, acc2);
+        std::println!(
+            "P1W16 PERMUTE: textbook {textbook:.3} µs · sparse {sparse:.3} µs · {:.2}×",
+            textbook / sparse
+        );
+    }
+}
