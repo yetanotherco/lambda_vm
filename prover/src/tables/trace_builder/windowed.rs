@@ -1680,6 +1680,21 @@ pub struct WalkedWindow {
     made: Option<WindowMade>,
 }
 
+#[cfg(test)]
+impl WalkedWindow {
+    /// Its cycles, its MEMW_R rows, and the register accesses routed past
+    /// MEMW_R (to MEMW_A, to MEMW): a test's census of the window.
+    pub(crate) fn register_census(&self) -> (usize, usize, usize, usize) {
+        let m = &self.walk.memw;
+        (
+            self.cycles,
+            m.register_rows.len(),
+            m.aligned.iter().filter(|r| r.is_register()).count(),
+            m.general.iter().filter(|op| op.is_register).count(),
+        )
+    }
+}
+
 impl WalkedWindow {
     /// A digest of everything the window's walk emitted, its CPU ops and
     /// every list, through their `Debug` forms: two walks that emit the same

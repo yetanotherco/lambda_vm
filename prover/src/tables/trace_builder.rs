@@ -1843,6 +1843,118 @@ impl<S: MemwSink> MemwSink for CpuRowProbeSink<'_, S> {
     }
 }
 
+/// A test's census of register accesses ([`regs_census`]) is on for this
+/// thread's walk.
+#[cfg(test)]
+fn census_on() -> bool {
+    regs_census::active()
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn census_on() -> bool {
+    false
+}
+
+/// With `on`, `op`'s register accesses collected through the census's sink
+/// (counted, then routed as today); `false` (nothing done) otherwise.
+#[cfg(test)]
+fn census_walk(
+    op: CpuOp<'_>,
+    register_state: &mut RegisterState,
+    memw: &mut MemwBuckets,
+    on: bool,
+) -> bool {
+    if on {
+        let word = op.decode.fields.word_instr;
+        collect_register_ops_from_cpu(op, register_state, &mut regs_census::Sink(memw, word));
+    }
+    on
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn census_walk(_: CpuOp<'_>, _: &mut RegisterState, _: &mut MemwBuckets, _: bool) -> bool {
+    false
+}
+
+/// A test-only census of the register accesses the walk's CPU ops make, by
+/// who makes them and whether their step fits MEMW_R's range check: what the
+/// format with the registers in the CPU row would check in the CPU row (a
+/// non-word row's in-range accesses), keep alive (its accesses past the
+/// range) or leave to a small register table (word instructions'). Counts on
+/// the walking thread, between [`regs_census::start`] and
+/// [`regs_census::take`]; the routing is today's.
+#[cfg(test)]
+pub(crate) mod regs_census {
+    use super::{MemwBuckets, MemwOperation, MemwSink, reg_ts_delta_in_range};
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Counts {
+        /// A non-word CPU row's own accesses within the range check.
+        pub cpu_in: u64,
+        /// Of those, reads of the PC register (AUIPC, JAL).
+        pub cpu_in_pc: u64,
+        /// A non-word CPU row's own accesses past the range check.
+        pub cpu_far: u64,
+        /// A word instruction's accesses (CPU32's), within and past the range.
+        pub word_in: u64,
+        pub word_far: u64,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Option<Counts>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn start() {
+        COUNTS.with(|c| c.set(Some(Counts::default())));
+    }
+
+    pub(crate) fn take() -> Option<Counts> {
+        COUNTS.with(|c| c.take())
+    }
+
+    pub(super) fn active() -> bool {
+        COUNTS.with(|c| c.get().is_some())
+    }
+
+    /// Counts each register access, then routes it as today.
+    pub(super) struct Sink<'a>(pub(super) &'a mut MemwBuckets, pub(super) bool);
+
+    impl MemwSink for Sink<'_> {
+        fn push_op(&mut self, op: MemwOperation) {
+            self.0.push_op(op);
+        }
+
+        fn push_reg_access(
+            &mut self,
+            reg_addr: u64,
+            val: [u32; 2],
+            old: [u32; 2],
+            timestamp: u64,
+            old_ts: u64,
+            is_read: bool,
+        ) {
+            let fits = reg_ts_delta_in_range(timestamp, old_ts);
+            let word = self.1;
+            COUNTS.with(|c| {
+                let mut n = c.get().unwrap_or_default();
+                match (word, fits) {
+                    (false, true) => {
+                        n.cpu_in += 1;
+                        n.cpu_in_pc += u64::from(reg_addr == 2 * 255);
+                    }
+                    (false, false) => n.cpu_far += 1,
+                    (true, true) => n.word_in += 1,
+                    (true, false) => n.word_far += 1,
+                }
+                c.set(Some(n));
+            });
+            self.0
+                .push_reg_access(reg_addr, val, old, timestamp, old_ts, is_read);
+        }
+    }
+}
+
 #[cfg(test)]
 mod regs_probe_sink_tests {
     use super::*;
@@ -2256,6 +2368,7 @@ fn walk_cpu_ops<const REST: bool>(
     // The measurement-only register-shape probe (`crate::regs_probe`): the
     // CPU row's own register accesses make no MEMW_R row.
     let regs_probe = crate::regs_probe::on();
+    let census = census_on();
 
     for op in cpu_ops {
         let op = decode.op(op);
@@ -2291,7 +2404,9 @@ fn walk_cpu_ops<const REST: bool>(
         }
 
         // Collect register operations (M1, M3, M5)
-        if regs_probe && !op.decode.fields.word_instr {
+        if census_walk(op, register_state, memw, census) {
+            // A test's census counted them (and routed them as today).
+        } else if regs_probe && !op.decode.fields.word_instr {
             collect_register_ops_from_cpu(op, register_state, &mut CpuRowProbeSink(&mut *memw));
         } else {
             collect_register_ops_from_cpu(op, register_state, memw);

@@ -266,3 +266,102 @@ mod block {
         assert!(!verified, "a probe's proof must never verify");
     }
 }
+
+/// The register census of a block (ignored; a laptop run, no trace kept): the
+/// walk's register accesses, window by window, each window's lists dropped
+/// once counted. What the format with the registers in the CPU row takes:
+/// the CPU rows' in-range accesses become CPU slots; their accesses past the
+/// range check need keep-alive rows; word instructions', the ECALL chips' and
+/// HALT's accesses (and the keep-alives) are the small register table's rows.
+/// Prints the counts and the predicted shape; refuses (panics) when that
+/// table passes 2^23 rows or the keep-alives pass 2^17.
+///
+/// `REGS_CENSUS_ELF=<guest> REGS_CENSUS_INPUT=<block> cargo test -p lambda-vm-prover --lib
+/// tests::regs_probe_tests::the_register_census_of_a_block -- --ignored --nocapture`
+#[cfg(feature = "parallel")]
+#[test]
+#[ignore = "census of a real block: REGS_CENSUS_ELF and REGS_CENSUS_INPUT"]
+fn the_register_census_of_a_block() {
+    use crate::tables::trace_builder::{WindowedTraceBuilder, regs_census};
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf = std::fs::read(std::env::var("REGS_CENSUS_ELF").expect("REGS_CENSUS_ELF")).unwrap();
+    let input =
+        std::fs::read(std::env::var("REGS_CENSUS_INPUT").expect("REGS_CENSUS_INPUT")).unwrap();
+    assert!(!regs_probe::on(), "the census counts today's routing");
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let options = crate::block_whir::BlockOptions::production();
+    let window = 1usize << options.window_log2.expect("the block streams");
+    let t = std::time::Instant::now();
+    let mut builder =
+        WindowedTraceBuilder::new(&program, &input, &options.max_rows).expect("the builder");
+    let mut executor = Executor::new(&program, input.clone()).expect("the executor starts");
+    let (mut walker, _accumulator) = builder.split();
+    regs_census::start();
+    let (mut cycles, mut memw_r, mut to_memw_a, mut to_memw, mut windows) = (0, 0, 0, 0, 0);
+    // Before the last window: what the block's walkers count (they walk the
+    // full windows; the finish walks the last).
+    let mut before_last = (0, 0);
+    while let Some(logs) = executor.resume_with_limit(window).expect("the block runs") {
+        if logs.is_empty() {
+            break;
+        }
+        // The halting cycle is the finish's (with HALT's own rows): counted
+        // as a cycle, its CPU row's register accesses (at most two) left out.
+        let halts = logs.last().is_some_and(|log| log.next_pc == 0);
+        before_last = (cycles, memw_r);
+        let walked = walker
+            .walk(&logs[..logs.len() - usize::from(halts)])
+            .expect("the walk");
+        let (c, r, a, g) = walked.register_census();
+        cycles += c + usize::from(halts);
+        memw_r += r;
+        to_memw_a += a;
+        to_memw += g;
+        windows += 1;
+    }
+    let n = regs_census::take().expect("the census ran");
+    // The ECALL chips' accesses: the rest of MEMW_R's rows and of the
+    // register accesses routed past it.
+    let chips_in = memw_r as u64 - n.cpu_in - n.word_in;
+    let chips_far = (to_memw_a + to_memw) as u64 - n.cpu_far - n.word_far;
+    const HALT: u64 = 31;
+    let keep_alives = n.cpu_far;
+    let regx = n.word_in + n.word_far + chips_in + chips_far + HALT + keep_alives;
+    // The shape, against today's (2^21-row chunks; MEMW_R 10 columns and 8
+    // GKR slots, REGX 12 and 8, CPU 37 → 42 columns at 24 slots).
+    let rows = 1u64 << 21;
+    let tables = |r: u64| r.div_ceil(rows);
+    let cpu_tables = tables(cycles as u64);
+    let (memw_r_tables, regx_tables) = (tables(memw_r as u64), tables(regx));
+    let cells = |t: u64, cols: u64| (t * rows * cols) as f64 / 1e9;
+    let d_cells = cells(regx_tables, 12) + cells(cpu_tables, 5) - cells(memw_r_tables, 10);
+    let d_leaves = cells(regx_tables, 8) - cells(memw_r_tables, 8);
+    println!(
+        "REGS CENSUS: windows {windows} · cycles {cycles} · MEMW_R rows {memw_r} · register accesses \
+         past MEMW_R {} (MEMW_A {to_memw_a}, MEMW {to_memw}) · the full windows (the walkers' \
+         count, BLOCK WALK COUNTS): {} CPU ops, {} MEMW_R · walked in {:.1} s",
+        to_memw_a + to_memw,
+        before_last.0,
+        before_last.1,
+        t.elapsed().as_secs_f64()
+    );
+    println!(
+        "REGS CENSUS ACCESSES: CPU rows in range {} (PC reads {}) · CPU rows past the range {} · word \
+         instructions {} in range, {} past · ECALL chips {} in range, {} past · HALT {HALT}",
+        n.cpu_in, n.cpu_in_pc, n.cpu_far, n.word_in, n.word_far, chips_in, chips_far
+    );
+    println!(
+        "REGS CENSUS FORMAT: CPU slots filled {} of {} ({:.3} a cycle) · keep-alives {keep_alives} \
+         (STOP > 2^17 = 131072) · REGX rows {regx} (STOP > 2^23 = 8388608), {regx_tables} tables · \
+         MEMW_R tables {memw_r_tables} go · CPU tables {cpu_tables} · predicted Δ cells {d_cells:+.3} G \
+         · Δ GKR leaves {d_leaves:+.3} G · Δ groups ≈ {:+.1} (at 0.3735 G cells a group)",
+        n.cpu_in + keep_alives,
+        3 * cycles,
+        (n.cpu_in + keep_alives) as f64 / cycles as f64,
+        d_cells / 0.3735
+    );
+    assert!(keep_alives <= 1 << 17, "STOP: {keep_alives} keep-alives");
+    assert!(regx <= 1 << 23, "STOP: {regx} REGX rows");
+}
