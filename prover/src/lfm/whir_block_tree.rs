@@ -2903,6 +2903,20 @@ impl WhirBlockTreeProof {
 /// verifier reads the other's file as its own.
 pub const PIPELINE_WHIR_COMPRESSED: u8 = 2;
 
+/// Which tree a proof file holds: the WHIR block tree compressed by C1 with
+/// C1's instruction columns evaluated by the verifier
+/// (`LAMBDA_VM_BLOCK_COMPRESS_EVAL`). A file names the verifier it is for: each
+/// compressed verifier refuses the other's tag before it reads anything else.
+pub const PIPELINE_WHIR_COMPRESSED_EVALUATED: u8 = 3;
+
+/// The compressed file's tag for C1 bound per `prep`.
+pub fn compressed_pipeline(prep: super::wlfm::WlfmPrep) -> u8 {
+    match prep {
+        super::wlfm::WlfmPrep::Stacked => PIPELINE_WHIR_COMPRESSED,
+        super::wlfm::WlfmPrep::Evaluated => PIPELINE_WHIR_COMPRESSED_EVALUATED,
+    }
+}
+
 /// A whole W3 block's proof compressed (`LAMBDA_VM_BLOCK_COMPRESS`): the
 /// block's statement and C1's proof over the top. As for
 /// [`WhirBlockTreeProof`], nothing here is a format parameter: the rate C1 is
@@ -2922,12 +2936,22 @@ pub struct WhirBlockCompressedProof {
 }
 
 impl WhirBlockCompressedProof {
-    /// The file for a W3 block's statement and C1's proof.
+    /// The file for a W3 block's statement and C1's (stacked) proof.
     pub fn new(statement: block_whir::OwnedBlockStatement, c1: super::wlfm::WlfmProof) -> Self {
+        Self::for_binding(statement, c1, super::wlfm::WlfmPrep::Stacked)
+    }
+
+    /// The file for a W3 block's statement and C1's proof bound per `prep`,
+    /// tagged for that binding's verifier ([`compressed_pipeline`]).
+    pub fn for_binding(
+        statement: block_whir::OwnedBlockStatement,
+        c1: super::wlfm::WlfmProof,
+        prep: super::wlfm::WlfmPrep,
+    ) -> Self {
         Self {
             magic: PROOF_MAGIC,
             version: PROOF_VERSION,
-            pipeline: PIPELINE_WHIR_COMPRESSED,
+            pipeline: compressed_pipeline(prep),
             table_num_vars: statement.table_num_vars,
             runtime_page_ranges: statement.runtime_page_ranges,
             table_counts: statement.table_counts,
@@ -2969,7 +2993,9 @@ impl WhirBlockCompressedProof {
                 proof.version
             ));
         }
-        if proof.pipeline != PIPELINE_WHIR_COMPRESSED {
+        if proof.pipeline != PIPELINE_WHIR_COMPRESSED
+            && proof.pipeline != PIPELINE_WHIR_COMPRESSED_EVALUATED
+        {
             return Err(format!(
                 "the file holds pipeline {}, not the compressed WHIR block tree",
                 proof.pipeline
@@ -2977,6 +3003,23 @@ impl WhirBlockCompressedProof {
         }
         Ok(proof)
     }
+
+    /// The file's tag: which compressed verifier it is for.
+    pub fn pipeline(&self) -> u8 {
+        self.pipeline
+    }
+}
+
+/// A compressed file refused unless it carries `tag`, the calling verifier's
+/// own: run before the verifier reads anything else.
+fn require_compressed_tag(proof: &WhirBlockCompressedProof, tag: u8) -> Result<(), String> {
+    if proof.pipeline != tag {
+        return Err(format!(
+            "the file holds pipeline {}, and this verifier reads pipeline {tag}",
+            proof.pipeline
+        ));
+    }
+    Ok(())
 }
 
 /// ★ A compressed W3 block proof file verified: the plan derived from the
@@ -2989,6 +3032,7 @@ pub fn verify_whir_block_compressed_proof(
     elf_bytes: &[u8],
     proof: &WhirBlockCompressedProof,
 ) -> Result<(), String> {
+    require_compressed_tag(proof, PIPELINE_WHIR_COMPRESSED)?;
     let presets = super::whir_block::pinned_verifier_presets(BlockFormat::pinned().group);
     let plan = super::whir_block::verifier_plan(elf_bytes, proof.statement(), &presets)?;
     super::compress::verify_compressed(
@@ -3004,12 +3048,14 @@ pub fn verify_whir_block_compressed_proof(
 /// (`LAMBDA_VM_BLOCK_COMPRESS_EVAL`): [`verify_whir_block_compressed_proof`]
 /// with C1's instruction columns evaluated by this verifier
 /// ([`super::wlfm::WlfmPrep::Evaluated`]), a constant of this function. A file
-/// of one binding is refused by the other's verifier: the binding is folded
+/// of one binding is refused by the other's verifier up front, by its tag
+/// ([`PIPELINE_WHIR_COMPRESSED_EVALUATED`]); behind that, the binding is folded
 /// into C1's identity, which the statement absorbs before any root.
 pub fn verify_whir_block_compressed_evaluated_proof(
     elf_bytes: &[u8],
     proof: &WhirBlockCompressedProof,
 ) -> Result<(), String> {
+    require_compressed_tag(proof, PIPELINE_WHIR_COMPRESSED_EVALUATED)?;
     let presets = super::whir_block::pinned_verifier_presets(BlockFormat::pinned().group);
     let plan = super::whir_block::verifier_plan(elf_bytes, proof.statement(), &presets)?;
     super::compress::verify_compressed(
@@ -3415,6 +3461,60 @@ mod tests {
             "the compressed verifier refuses the tree's file"
         );
         assert_ne!(PIPELINE_WHIR, PIPELINE_WHIR_COMPRESSED);
+        // The evaluated file reads back with its own tag; the tree's reader
+        // refuses it too.
+        let evaluated = WhirBlockCompressedProof::for_binding(
+            proof.statement().to_owned(),
+            proof.compressed.clone(),
+            super::super::wlfm::WlfmPrep::Evaluated,
+        );
+        let bytes = evaluated.to_bytes().expect("serializes");
+        let back = WhirBlockCompressedProof::from_bytes(&bytes).expect("reads back");
+        assert_eq!(back.pipeline(), PIPELINE_WHIR_COMPRESSED_EVALUATED);
+        assert!(WhirBlockTreeProof::from_bytes(&bytes).is_err());
+        assert_eq!(proof.pipeline(), PIPELINE_WHIR_COMPRESSED);
+        assert_ne!(PIPELINE_WHIR_COMPRESSED, PIPELINE_WHIR_COMPRESSED_EVALUATED);
+        assert_ne!(PIPELINE_WHIR, PIPELINE_WHIR_COMPRESSED_EVALUATED);
+    }
+
+    /// Each compressed verifier refuses the other's tag before it reads the
+    /// ELF or the statement: with no ELF at all, the refusal is the tag's.
+    #[test]
+    fn each_compressed_verifier_refuses_the_others_tag_up_front() {
+        use super::super::wlfm::WlfmPrep;
+        let stacked = synthetic_compressed();
+        let evaluated = WhirBlockCompressedProof::for_binding(
+            stacked.statement().to_owned(),
+            stacked.compressed.clone(),
+            WlfmPrep::Evaluated,
+        );
+        let tag_refusal = |r: Result<(), String>, theirs: u8, ours: u8| {
+            let e = r.expect_err("refused");
+            assert!(
+                e.contains(&format!(
+                    "the file holds pipeline {theirs}, and this verifier reads pipeline {ours}"
+                )),
+                "{e}"
+            );
+        };
+        tag_refusal(
+            verify_whir_block_compressed_proof(&[], &evaluated),
+            PIPELINE_WHIR_COMPRESSED_EVALUATED,
+            PIPELINE_WHIR_COMPRESSED,
+        );
+        tag_refusal(
+            verify_whir_block_compressed_evaluated_proof(&[], &stacked),
+            PIPELINE_WHIR_COMPRESSED,
+            PIPELINE_WHIR_COMPRESSED_EVALUATED,
+        );
+        // Its own tag passes the gate: the refusal is then something else.
+        for e in [
+            verify_whir_block_compressed_proof(&[], &stacked),
+            verify_whir_block_compressed_evaluated_proof(&[], &evaluated),
+        ] {
+            let e = e.expect_err("no ELF");
+            assert!(!e.contains("and this verifier reads pipeline"), "{e}");
+        }
     }
 
     /// The compressed block's verifier takes its rate from the code: its body
@@ -3429,6 +3529,10 @@ mod tests {
         let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
         assert!(body.contains("super::compress::COMPRESS_RATE"), "{body}");
         assert!(body.contains("super::compress::COMPRESS_PREP"), "{body}");
+        assert!(
+            body.contains("require_compressed_tag(proof, PIPELINE_WHIR_COMPRESSED)?"),
+            "{body}"
+        );
         let forbidden_in_verifiers = [
             "env::var",
             "compress_from_env",
@@ -3451,6 +3555,10 @@ mod tests {
         let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
         assert!(body.contains("super::compress::COMPRESS_RATE"), "{body}");
         assert!(body.contains("WlfmPrep::Evaluated"), "{body}");
+        assert!(
+            body.contains("require_compressed_tag(proof, PIPELINE_WHIR_COMPRESSED_EVALUATED)?"),
+            "{body}"
+        );
         for forbidden in forbidden_in_verifiers {
             assert!(
                 !body.contains(forbidden),
