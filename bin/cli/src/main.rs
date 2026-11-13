@@ -547,6 +547,26 @@ fn main() -> ExitCode {
     env_logger::init();
     prover::alloc_purge::install(allocator::HOOKS);
     let cli = Cli::parse();
+    // The measurement-only register-shape probe (`prover::regs_probe`) makes
+    // proofs that do not verify: only `prove-block-base` takes it, and it
+    // skips its verification. Any other command refuses the knob, and a
+    // misspelt word is refused here too.
+    match prover::regs_probe::check() {
+        Ok(false) => {}
+        Ok(true) if matches!(cli.command, Commands::ProveBlockBase { .. }) => {}
+        Ok(true) => {
+            eprintln!(
+                "{}=1 is a measurement-only probe whose proofs do not verify: only \
+                 prove-block-base takes it",
+                prover::regs_probe::ENV
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    }
     // Still single-threaded here: clap and env_logger spawn nothing.
     if matches!(
         cli.command,
@@ -1296,10 +1316,18 @@ fn cmd_prove_block_base(
         eprintln!("Failed to write {path:?}: {e}");
         return ExitCode::FAILURE;
     }
+    // Under the register-shape probe the proof does not verify: its
+    // verification is skipped, and the line says so.
+    let probe = prover::regs_probe::on();
     let t = Instant::now();
-    let verified = prover::block_whir::verify_block_whir(&proof, &elf_data, &opts, &cfg.format);
+    let verified = if probe {
+        Ok(true)
+    } else {
+        prover::block_whir::verify_block_whir(&proof, &elf_data, &opts, &cfg.format)
+    };
     let verify_secs = t.elapsed().as_secs_f64();
     let verdict = match &verified {
+        Ok(true) if probe => "SKIPPED (register-shape probe: unverifiable)".to_string(),
         Ok(true) => "verified".to_string(),
         Ok(false) => "REFUSED".to_string(),
         Err(e) => format!("ERROR {e:?}"),
