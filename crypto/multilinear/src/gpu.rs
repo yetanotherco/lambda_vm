@@ -7629,6 +7629,18 @@ impl std::fmt::Debug for JointTree {
 
 #[cfg(feature = "cuda")]
 impl JointTree {
+    /// Children per node of the tree: 4 under Poseidon1, 2 under BLAKE3.
+    fn arity(&self) -> usize {
+        self.0.hash().arity()
+    }
+
+    /// Siblings a path of the tree holds.
+    fn path_len(&self) -> usize {
+        let arity = self.arity();
+        let depth = self.0.num_leaves().trailing_zeros() as usize;
+        (arity - 1) * crypto::merkle_tree::cap::tree_levels(depth, arity)
+    }
+
     /// The tree's first `nodes` nodes (whole top levels, root first), home.
     pub(crate) fn top_nodes(&self, nodes: usize) -> Option<Vec<[u8; 32]>> {
         nodes_in_place(self.0.top_nodes_to_host(nodes).ok()?)
@@ -7644,13 +7656,13 @@ impl JointTree {
         let nodes = nodes_in_place(self.0.paths(&positions).ok()?)?;
         Some(
             nodes
-                .chunks_exact(path_len(leaves, crate::whir_hash::DeviceHashKey::Poseidon1))
+                .chunks_exact(self.path_len())
                 .map(<[_]>::to_vec)
                 .collect(),
         )
     }
 
-    /// [`Self::paths`] and the tree's cap at `cap_height` 4-ary levels.
+    /// [`Self::paths`] and the tree's cap at `cap_height` levels of its arity.
     pub(crate) fn paths_and_cap(
         &self,
         indices: &[usize],
@@ -7658,15 +7670,16 @@ impl JointTree {
     ) -> Option<PathsAndCap> {
         let leaves = self.0.num_leaves();
         let depth = leaves.trailing_zeros() as usize;
+        let arity = self.arity();
         if indices.iter().any(|index| *index >= leaves)
-            || cap_height > crypto::merkle_tree::cap::tree_levels(depth, 4)
+            || cap_height > crypto::merkle_tree::cap::tree_levels(depth, arity)
         {
             return None;
         }
         let positions: Vec<u32> = indices.iter().map(|index| *index as u32).collect();
         let (bytes, cap_bytes) = self.0.paths_and_cap(&positions, cap_height).ok()?;
         let nodes = nodes_in_place(bytes)?;
-        let len = crypto::merkle_tree::cap::cap_len(depth, cap_height, 4)?;
+        let len = crypto::merkle_tree::cap::cap_len(depth, cap_height, arity)?;
         if cap_bytes.len() != 32 * len {
             return None;
         }
@@ -7676,7 +7689,7 @@ impl JointTree {
             .collect::<Option<_>>()?;
         Some((
             nodes
-                .chunks_exact(path_len(leaves, crate::whir_hash::DeviceHashKey::Poseidon1))
+                .chunks_exact(self.path_len())
                 .map(<[_]>::to_vec)
                 .collect(),
             cap,
