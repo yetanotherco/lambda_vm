@@ -374,6 +374,14 @@ enum Commands {
         #[arg(long)]
         digest: bool,
 
+        /// Ship the tree's top file instead of the compressed one (the
+        /// rollback; `verify-block --tree-file` reads it). By default the
+        /// block ships its compressed file, whose format is the CLI's
+        /// constant (`whir_block_tree::DEFAULT_SHIPPED`) at the pinned format
+        /// flags (their defaults).
+        #[arg(long)]
+        tree_file: bool,
+
         /// How each group's stacked polynomials are opened: one chain per run
         /// of up to four (`indexed`, production) or one per polynomial
         /// (`per-poly`). A format choice: `verify-block` must be given the
@@ -444,6 +452,13 @@ enum Commands {
         /// Print verification time
         #[arg(long)]
         time: bool,
+
+        /// Verify the tree's top file (`prove-block --tree-file`) instead of
+        /// the compressed one. Without it the file is verified as the CLI's
+        /// compressed format (`whir_block_tree::DEFAULT_SHIPPED`), at the
+        /// pinned format flags (their defaults); the file does not choose.
+        #[arg(long)]
+        tree_file: bool,
 
         /// The group opening the block was proved with (`prove-block
         /// --group`): the verifier's constant, never read from the proof.
@@ -581,6 +596,7 @@ fn main() -> ExitCode {
             output,
             time,
             digest,
+            tree_file,
             group,
             blowup,
             leaves,
@@ -594,6 +610,7 @@ fn main() -> ExitCode {
             output,
             time,
             digest,
+            tree_file,
             BlockChoices {
                 group: &group,
                 blowup: &blowup,
@@ -608,6 +625,7 @@ fn main() -> ExitCode {
             proof,
             elf,
             time,
+            tree_file,
             group,
             blowup,
             leaves,
@@ -619,6 +637,7 @@ fn main() -> ExitCode {
             proof,
             elf,
             time,
+            tree_file,
             BlockChoices {
                 group: &group,
                 blowup: &blowup,
@@ -722,6 +741,19 @@ fn hex(bytes: &[u8]) -> String {
 /// `--leaves`, `--trees`, `--leaf-double-from` and `--leaf-query`:
 /// `verify-block` must be given the ones `prove-block` was, and the proof file
 /// carries none of them.
+/// Whether every format flag is at its default, the pinned presets the
+/// compressed file's verifiers derive the tree under: a compressed file is
+/// proved and verified there only.
+fn at_pinned_choices(c: &BlockChoices<'_>) -> bool {
+    c.group == "indexed"
+        && c.blowup == "2"
+        && c.leaves == "coset"
+        && c.trees.is_none()
+        && c.leaf_double_from == "one-top"
+        && c.leaf_query == "lean"
+        && c.argue_pack == "22"
+}
+
 struct BlockChoices<'a> {
     group: &'a str,
     blowup: &'a str,
@@ -776,11 +808,14 @@ fn cmd_prove_block(
     output_path: PathBuf,
     time: bool,
     digest: bool,
+    tree_file: bool,
     choices: BlockChoices<'_>,
 ) -> ExitCode {
     use prover::lfm::whir_block_tree::{
-        StderrSink, WhirBlockTreeProof, WhirTreeConfig, group_setting, prove_whir_block_tree,
+        DEFAULT_SHIPPED, ShippedFormat, StderrSink, WhirBlockTreeProof, WhirTreeConfig,
+        group_setting, prove_whir_block_tree,
     };
+    let pinned = at_pinned_choices(&choices);
     let BlockChoices {
         group,
         blowup,
@@ -891,6 +926,48 @@ fn cmd_prove_block(
         (blowup.factor(), order, round0),
         "the tree's format is the installed one"
     );
+    // The file it ships: the compressed one by default, in the CLI's constant
+    // format at the pinned flags, which is all `verify-block` checks it as; the
+    // top's file under `--tree-file` (no compression proved).
+    if tree_file {
+        let plan = prover::lfm::compress::UNCOMPRESSED_PLAN;
+        (
+            cfg.compress,
+            cfg.compress_levers,
+            cfg.compress_wire,
+            cfg.compress2,
+        ) = (plan.rate, plan.levers, plan.wire, plan.c2);
+    } else {
+        let plan = prover::lfm::compress::CompressPlan {
+            rate: cfg.compress,
+            levers: cfg.compress_levers,
+            wire: cfg.compress_wire,
+            c2: cfg.compress2,
+        };
+        if ShippedFormat::of(plan) != Some(DEFAULT_SHIPPED) {
+            eprintln!(
+                "the compression knobs make another file ({:?}) than verify-block checks \
+                 ({DEFAULT_SHIPPED:?}): unset them, or give --tree-file to ship the top's file",
+                ShippedFormat::of(plan)
+            );
+            return ExitCode::FAILURE;
+        }
+        if !pinned {
+            eprintln!(
+                "a compressed block is proved at the pinned format (every format flag at its \
+                 default): give --tree-file to ship the top's file at another format"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    eprintln!(
+        "BLOCK FILE: {}",
+        if tree_file {
+            "the top's (--tree-file)".to_string()
+        } else {
+            format!("compressed {DEFAULT_SHIPPED:?}")
+        }
+    );
     // A forced leaf count, another fan-in or another argue is another tree than
     // the one `verify-block` derives: harness arms, not a production proof.
     if !cfg.at_presets() {
@@ -921,8 +998,11 @@ fn cmd_prove_block(
         Err(e) => format!("BLOCK TOP DIGEST: none ({e})"),
     });
     let output_hex = hex(&run.statement.public_output);
-    let file = WhirBlockTreeProof::new(run.statement, top);
-    let bytes = match file.to_bytes() {
+    let bytes = match &run.compressed {
+        Some(compressed) => compressed.shipped(run.statement).map(|(_, bytes)| bytes),
+        None => WhirBlockTreeProof::new(run.statement, top).to_bytes(),
+    };
+    let bytes = match bytes {
         Ok(bytes) => bytes,
         Err(e) => {
             eprintln!("Failed to serialize the block proof: {e}");
@@ -951,11 +1031,14 @@ fn cmd_verify_block(
     proof_path: PathBuf,
     elf_path: PathBuf,
     time: bool,
+    tree_file: bool,
     choices: BlockChoices<'_>,
 ) -> ExitCode {
     use prover::lfm::whir_block_tree::{
-        WhirBlockTreeProof, base_line, group_setting, verify_whir_block_tree_proof_at,
+        DEFAULT_SHIPPED, WhirBlockTreeProof, base_line, group_setting, read_shipped,
+        verify_whir_block_shipped_as, verify_whir_block_tree_proof_at,
     };
+    let pinned = at_pinned_choices(&choices);
     let BlockChoices {
         group,
         blowup,
@@ -1027,6 +1110,45 @@ fn cmd_verify_block(
             return ExitCode::FAILURE;
         }
     };
+    // The compressed file (the default): read in the CLI's constant format and
+    // verified as it, at the pinned format; the file's tag must be that format's.
+    if !tree_file {
+        if !pinned {
+            eprintln!(
+                "a compressed block is verified at the pinned format (every format flag at its \
+                 default): give --tree-file to verify a top's file at another format"
+            );
+            return ExitCode::FAILURE;
+        }
+        let file = match read_shipped(&bytes, DEFAULT_SHIPPED) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("Failed to read the compressed block proof: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        drop(bytes);
+        eprintln!("{}", base_line(&prover::hash_pin::BLOCK_BASE));
+        eprintln!("BLOCK FILE: compressed {DEFAULT_SHIPPED:?}");
+        eprintln!("Verifying block proof...");
+        let start = Instant::now();
+        let result = verify_whir_block_shipped_as(&elf_data, &file, DEFAULT_SHIPPED);
+        let verify_elapsed = start.elapsed();
+        return match result {
+            Ok(()) => {
+                eprintln!("Verification succeeded!");
+                println!("Output: {}", hex(&file.public_output));
+                if time {
+                    println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("Verification failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let proof = match WhirBlockTreeProof::from_bytes(&bytes) {
         Ok(p) => p,
         Err(e) => {

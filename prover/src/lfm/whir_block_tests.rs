@@ -3415,6 +3415,31 @@ fn the_whir_block_tree_on_a_real_block() {
             file_ok.unwrap_or_else(|e| panic!("the shipped C2 file must verify: {e}"));
             assert!(refused2 && refused2_words, "a tampered C2 proof is refused");
         }
+        // The file this run ships, as `cli verify-block` reads it: the run's
+        // plan's format, its bytes read back in that encoding and verified from
+        // the ELF (C2's file was verified so just above).
+        {
+            use super::whir_block_tree::{read_shipped, verify_whir_block_shipped_as};
+            let (format, shipped) = c1.shipped(run.statement.clone()).expect("the shipped file");
+            let t = std::time::Instant::now();
+            let verified = if c1.c2.is_some() {
+                "ACCEPTED above".to_string()
+            } else {
+                let ok = read_shipped(&shipped, format)
+                    .and_then(|f| verify_whir_block_shipped_as(&elf, &f, format));
+                let secs = t.elapsed().as_secs_f64();
+                ok.unwrap_or_else(|e| panic!("the shipped C1 file must verify: {e}"));
+                format!("ACCEPTED in {secs:.2}s")
+            };
+            println!(
+                "W3 SHIPPED: {} file {} B vs {top_file} B top ({:.3}×) · tag {} · default {} · verifier {verified}",
+                if c1.c2.is_some() { "C2" } else { "C1" },
+                shipped.len(),
+                shipped.len() as f64 / top_file as f64,
+                format.tag().unwrap_or(0),
+                format == super::whir_block_tree::DEFAULT_SHIPPED,
+            );
+        }
     }
     // Off the clock: the top's rows and padded heights by chip, emitted again
     // from its children's shapes, and its LANES rows against 2^19 — the chips a
