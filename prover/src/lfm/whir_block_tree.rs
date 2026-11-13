@@ -208,6 +208,12 @@ pub struct WhirTreeConfig {
     /// early leaf this replaced (the control). Prover-only: the bytes are the
     /// same.
     pub early_leaves: usize,
+    /// `W3_EARLY_POOL=<threads>` (default [`EARLY_POOL_DEFAULT`]): the early
+    /// leaves after the first execute and fill on a pool of this many threads
+    /// of their own, below the prover's priority on Linux
+    /// ([`EARLY_POOL_NICE`]), so phase B's host work, which they run beside,
+    /// keeps its cores. 0: on the prover's own pool, beside phase B's work.
+    pub early_pool: usize,
     /// `W3_LEAF_EMITTERS` ([`LEAF_EMITTERS`] by default): how many of the
     /// leaves' programs are emitted at once beside phase B, in leaf order,
     /// each published as it is ready while the planner takes phase B's groups;
@@ -450,6 +456,7 @@ impl WhirTreeConfig {
         let leaves_each = count_knob("W3_LEAF_ARTIFACTS_EACH")? == Some(1);
         let early_on = count_knob("W3_LEAF_DURING_PHASE_B")?.is_none_or(|v| v != 0);
         let early_leaves = early_leaves_setting(count_knob("W3_EARLY_LEAVES")?)?;
+        let early_pool = count_knob("W3_EARLY_POOL")?.unwrap_or(EARLY_POOL_DEFAULT);
         let leaf_emitters = leaf_emitters_setting(count_knob("W3_LEAF_EMITTERS")?);
         let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
             Ok("batched") => match count_knob("BLOCK_WHIR_ARGUE_CAP")? {
@@ -560,6 +567,7 @@ impl WhirTreeConfig {
             program_budget: super::program_budget::setting_from_env()?,
             early_on,
             early_leaves,
+            early_pool,
             leaf_emitters,
             argue,
             format,
@@ -1276,6 +1284,48 @@ pub(crate) fn early_leaf_first(mut order: Vec<TreeAt>, first: Option<usize>) -> 
         order[..=at].rotate_right(1);
     }
     order
+}
+
+/// The early leaves' own pool, threads (`W3_EARLY_POOL`). Half of a 16-core
+/// host's cores: the later early leaves' execute + fill ran 1.2–1.4 s on the
+/// prover's whole pool with 3–12 s to spare before the base's end, and beside
+/// phase B that whole pool cost phase B 0.18–0.36 s of its host work.
+pub const EARLY_POOL_DEFAULT: usize = 8;
+
+/// The nice value the early pool's threads run at on Linux: below the
+/// prover's threads, so phase B's host work is scheduled first.
+pub const EARLY_POOL_NICE: i32 = 10;
+
+/// How much slower a later early leaf's execute + fill is taken to run on the
+/// early pool than the first early leaf's on the prover's pool, until one on
+/// the early pool has been measured ([`early_leaf_fits`]'s input).
+pub const EARLY_POOL_SLOWDOWN: f64 = 2.0;
+
+/// The early leaves' own pool ([`EARLY_POOL_DEFAULT`]): its threads lowered
+/// to [`EARLY_POOL_NICE`] on Linux. `None` for 0 threads.
+fn early_pool(threads: usize) -> Result<Option<std::sync::Arc<rayon::ThreadPool>>, String> {
+    if threads == 0 {
+        return Ok(None);
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("w3-early-{i}"))
+        .start_handler(|_| lower_this_threads_priority(EARLY_POOL_NICE))
+        .build()
+        .map(|p| Some(std::sync::Arc::new(p)))
+        .map_err(|e| format!("the early leaves' pool: {e}"))
+}
+
+/// This thread at `nice` (Linux; elsewhere nothing). A refusal leaves it as
+/// it was: the order of work changes, never its result.
+fn lower_this_threads_priority(nice: i32) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: setpriority on this thread's own id; no memory is touched.
+    unsafe {
+        let _ = libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, nice);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = nice;
 }
 
 /// How much longer a later early leaf's execute + fill is taken to run than the
@@ -2364,6 +2414,13 @@ pub fn prove_whir_block_tree(
     // The leaves offered to phase B (`W3_LEAF_FIRST`), and when.
     let lead = block_whir::PhaseBLead::leading(cfg.early_leaves);
     let early_leaves = cfg.early_leaves;
+    // The later early leaves' pool, only when several can go early.
+    let early_threads = if cfg.early_leaves > 1 {
+        cfg.early_pool
+    } else {
+        0
+    };
+    let early_pool = early_pool(early_threads)?;
     let offered_at = std::sync::Mutex::new(None::<f64>);
     let leaf_first = cfg.leaf_first && early_on;
     let (lead_ref, offered_ref) = (&lead, &offered_at);
@@ -2461,6 +2518,9 @@ pub fn prove_whir_block_tree(
                     let mut cost_since_first_group: u64 = 0;
                     let first_fill: std::sync::Arc<std::sync::Mutex<Option<f64>>> =
                         std::sync::Arc::new(std::sync::Mutex::new(None));
+                    // A later early leaf measured on the early pool: (secs, cost).
+                    let pool_fill: std::sync::Arc<std::sync::Mutex<Option<(f64, u64)>>> =
+                        std::sync::Arc::new(std::sync::Mutex::new(None));
                     let mut first_cost: u64 = 0;
                     let mut kept: Vec<usize> = Vec::new();
                     let mut fit_notes: Vec<String> = Vec::new();
@@ -2512,11 +2572,21 @@ pub fn prove_whir_block_tree(
                         // tree, and so does one whose fit cannot be told yet.
                         let complete = match complete {
                             Some(k) if !early.is_empty() => {
-                                let measured = *first_fill.lock().unwrap_or_else(|e| e.into_inner());
+                                // The pace a later early leaf runs at: one measured
+                                // on the early pool, else the first's, slowed by
+                                // the pool, else unknown.
+                                let on_pool = *pool_fill.lock().unwrap_or_else(|e| e.into_inner());
+                                let first = first_fill
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .map(|s| {
+                                        let slow = if early_pool.is_some() { EARLY_POOL_SLOWDOWN } else { 1.0 };
+                                        (s * slow, first_cost)
+                                    });
                                 match early_leaf_fits(
                                     msg.at,
                                     leaf_cost(k),
-                                    measured.map(|s| (s, first_cost)),
+                                    on_pool.or(first),
                                     first_group_at,
                                     cost_since_first_group,
                                     cost_to_come,
@@ -2541,6 +2611,9 @@ pub fn prove_whir_block_tree(
                                 first_cost = leaf_cost(k);
                             }
                             let first_fill_slot = first_fill.clone();
+                            let pool_fill_slot = pool_fill.clone();
+                            let pool = early_pool.clone();
+                            let cost = leaf_cost(k);
                             let groups: Vec<Vec<LfmWord>> = partition
                                 .leaf(k)
                                 .iter()
@@ -2556,14 +2629,23 @@ pub fn prove_whir_block_tree(
                                 if !first {
                                     // A later early leaf: its execute + fill only;
                                     // the first one warmed what a prove builds once.
+                                    // On the early pool, below phase B's priority.
                                     let t = std::time::Instant::now();
                                     let hasher = program
                                         .program
                                         .hasher(<BlockFamily as ProofFamily>::SOCKET);
-                                    let filled =
-                                        lfm_execute_and_fill(&program.program, &arena, hasher)
-                                            .map_err(|e| format!("early leaf {k}: {e:?}"))?;
-                                    return Ok((filled, arena, started, t.elapsed().as_secs_f64()));
+                                    let run = || lfm_execute_and_fill(&program.program, &arena, hasher);
+                                    let filled = match &pool {
+                                        Some(pool) => pool.install(run),
+                                        None => run(),
+                                    }
+                                    .map_err(|e| format!("early leaf {k}: {e:?}"))?;
+                                    let secs = t.elapsed().as_secs_f64();
+                                    if pool.is_some() {
+                                        *pool_fill_slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                                            Some((secs, cost));
+                                    }
+                                    return Ok((filled, arena, started, secs));
                                 }
                                 // The staging pairs the tree's first card holds
                                 // would allocate, made now, beside the base.
@@ -2774,6 +2856,12 @@ pub fn prove_whir_block_tree(
     ));
     for note in &fit_notes {
         sink.line(&format!("W3 EARLY LEAF KEPT: {note}"));
+    }
+    if early_threads > 0 {
+        sink.line(&format!(
+            "W3 EARLY POOL: the early leaves after the first on {early_threads} threads of their own at nice \
+             {EARLY_POOL_NICE} (Linux; elsewhere at the prover's priority)"
+        ));
     }
     // Several leaves asked for: which led, and the rebuilt groups that decide it
     // (a leaf leads only when its rebuilt groups are next in their class).
@@ -4430,6 +4518,26 @@ mod tests {
         assert_eq!(early_room(3, 3), 3);
     }
 
+    /// The early leaves' pool: none for 0 threads; otherwise that many
+    /// threads of its own, and work installed on it runs there.
+    #[test]
+    fn the_early_pool_runs_its_work_on_its_own_threads() {
+        assert!(early_pool(0).expect("builds").is_none());
+        let pool = early_pool(2).expect("builds").expect("a pool");
+        assert_eq!(pool.current_num_threads(), 2);
+        let names: Vec<String> = pool.install(|| {
+            use rayon::prelude::*;
+            (0..64)
+                .into_par_iter()
+                .map(|_| std::thread::current().name().unwrap_or("").to_string())
+                .collect()
+        });
+        assert!(
+            names.iter().all(|n| n.starts_with("w3-early-")),
+            "{names:?}"
+        );
+    }
+
     #[test]
     fn the_early_leaf_is_taken_first() {
         use super::super::per_table_aggregator::Level;
@@ -5363,6 +5471,7 @@ mod tests {
             program_budget: super::super::program_budget::BudgetSetting::Auto,
             early_on: true,
             early_leaves: EARLY_LEAVES_DEFAULT,
+            early_pool: EARLY_POOL_DEFAULT,
             leaf_emitters: Some(LEAF_EMITTERS),
             argue: BlockFormat::production().argue,
             format: BlockFormat::production(),
