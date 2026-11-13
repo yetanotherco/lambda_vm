@@ -54,7 +54,9 @@ jobs:
         run: |
           set -euo pipefail
           report="${RUNNER_TEMP:-/tmp}/axioms.txt"
-          lake env lean LambdaVM/Axioms.lean | tee "$report"
+          # `-Dformat.width` keeps each report on one line: the `sed` below needs the opening
+          # `[` and the closing `]` of an axiom list on the same line to see it at all.
+          lake env lean -Dformat.width=1000 LambdaVM/Axioms.lean | tee "$report"
 
           # One report per `#print axioms` line: a renamed or deleted declaration fails here
           # instead of quietly dropping out of the check.
