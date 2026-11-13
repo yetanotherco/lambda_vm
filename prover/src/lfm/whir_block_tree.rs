@@ -2599,11 +2599,12 @@ pub fn prove_whir_block_tree(
             });
             let a = &c.build.artifacts;
             sink.line(&format!(
-                "W3 COMPRESS: C1 at blowup {} · Q {} · binding {:?} · final {:?} · groups {:?} · prepared stacks {} · tables 2^{:?} · built in {build_secs:.2}s (done@{built_at:.2}, top proved@{tree:.2}, waited {:.2}s) · C1 {c1_secs:.2}s after the top ({split})",
+                "W3 COMPRESS: C1 at blowup {} · Q {} · binding {:?} · final {:?} · fold {} · groups {:?} · prepared stacks {} · tables 2^{:?} · built in {build_secs:.2}s (done@{built_at:.2}, top proved@{tree:.2}, waited {:.2}s) · C1 {c1_secs:.2}s after the top ({split})",
                 rate.factor(),
                 a.config.num_queries,
                 a.prep,
                 a.final_poly,
+                a.config.log_folding,
                 a.sizes,
                 a.stacks.len(),
                 a.table_num_vars,
@@ -2940,18 +2941,124 @@ pub const PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL: u8 = 5;
 pub fn compressed_pipeline_of(levers: super::wlfm::WlfmLevers) -> Result<u8, String> {
     use super::wlfm::WlfmPrep;
     use multilinear::whir_chain::FinalPoly;
-    match (levers.prep, levers.final_poly) {
-        (prep, FinalPoly::Off) => Ok(compressed_pipeline(prep)),
-        (WlfmPrep::Stacked, FinalPoly::Vars(super::compress::COMPRESS_FINAL_VARS)) => {
+    if levers == super::compress::folds_levers(levers.prep) {
+        return Ok(match levers.prep {
+            WlfmPrep::Stacked => PIPELINE_WHIR_COMPRESSED_FOLDS,
+            WlfmPrep::Evaluated => PIPELINE_WHIR_COMPRESSED_FOLDS_EVALUATED,
+        });
+    }
+    match (levers.prep, levers.final_poly, levers.fold) {
+        (prep, FinalPoly::Off, None) => Ok(compressed_pipeline(prep)),
+        (WlfmPrep::Stacked, FinalPoly::Vars(super::compress::COMPRESS_FINAL_VARS), None) => {
             Ok(PIPELINE_WHIR_COMPRESSED_FINAL)
         }
-        (WlfmPrep::Evaluated, FinalPoly::Vars(super::compress::COMPRESS_FINAL_VARS)) => {
+        (WlfmPrep::Evaluated, FinalPoly::Vars(super::compress::COMPRESS_FINAL_VARS), None) => {
             Ok(PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL)
         }
-        (_, other) => Err(format!(
-            "no compressed verifier takes C1's chains at {other:?}"
+        (_, other, fold) => Err(format!(
+            "no compressed verifier takes C1's chains at {other:?}, fold {fold:?}"
         )),
     }
+}
+
+/// The compressed tree with C1's chains on the byte-minimising schedule
+/// (`LAMBDA_VM_BLOCK_COMPRESS_FOLDS`: fold 5 after round 0, final polynomial of
+/// 10 variables), C1 stacked, rkyv.
+pub const PIPELINE_WHIR_COMPRESSED_FOLDS: u8 = 10;
+/// The same with C1's instruction columns evaluated.
+pub const PIPELINE_WHIR_COMPRESSED_FOLDS_EVALUATED: u8 = 11;
+/// The compact twin of [`PIPELINE_WHIR_COMPRESSED_FOLDS`].
+pub const PIPELINE_WHIR_COMPRESSED_COMPACT_FOLDS: u8 = 12;
+/// The compact twin of [`PIPELINE_WHIR_COMPRESSED_FOLDS_EVALUATED`].
+pub const PIPELINE_WHIR_COMPRESSED_COMPACT_FOLDS_EVALUATED: u8 = 13;
+
+/// Whether `tag` is an rkyv compressed file's.
+fn is_rkyv_compressed(tag: u8) -> bool {
+    (PIPELINE_WHIR_COMPRESSED..=PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL).contains(&tag)
+        || (PIPELINE_WHIR_COMPRESSED_FOLDS..=PIPELINE_WHIR_COMPRESSED_FOLDS_EVALUATED)
+            .contains(&tag)
+}
+
+/// Whether `tag` is a compact compressed file's.
+fn is_compact_compressed(tag: u8) -> bool {
+    (PIPELINE_WHIR_COMPRESSED_COMPACT..=PIPELINE_WHIR_COMPRESSED_COMPACT_EVALUATED_FINAL)
+        .contains(&tag)
+        || (PIPELINE_WHIR_COMPRESSED_COMPACT_FOLDS
+            ..=PIPELINE_WHIR_COMPRESSED_COMPACT_FOLDS_EVALUATED)
+            .contains(&tag)
+}
+
+/// The compact twin of an rkyv compressed file's tag.
+fn compact_twin(tag: u8) -> Option<u8> {
+    if (PIPELINE_WHIR_COMPRESSED..=PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL).contains(&tag) {
+        Some(tag + PIPELINE_COMPACT_OFFSET)
+    } else if (PIPELINE_WHIR_COMPRESSED_FOLDS..=PIPELINE_WHIR_COMPRESSED_FOLDS_EVALUATED)
+        .contains(&tag)
+    {
+        Some(tag + (PIPELINE_WHIR_COMPRESSED_COMPACT_FOLDS - PIPELINE_WHIR_COMPRESSED_FOLDS))
+    } else {
+        None
+    }
+}
+
+/// A compressed file's format as a verifier names it: C1's levers and whether
+/// the file is compact. A constant of the caller, never the file's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressedFormat {
+    pub levers: super::wlfm::WlfmLevers,
+    pub compact: bool,
+}
+
+impl CompressedFormat {
+    /// The tag a file of this format carries; refused for a setting no
+    /// verifier takes.
+    pub fn tag(&self) -> Result<u8, String> {
+        let rkyv = compressed_pipeline_of(self.levers)?;
+        if self.compact {
+            compact_twin(rkyv).ok_or_else(|| format!("pipeline {rkyv} has no compact twin"))
+        } else {
+            Ok(rkyv)
+        }
+    }
+}
+
+/// The byte-minimising schedule's four formats (tags 10–13).
+pub const COMPRESSED_FOLDS: CompressedFormat = CompressedFormat {
+    levers: super::compress::folds_levers(super::wlfm::WlfmPrep::Stacked),
+    compact: false,
+};
+pub const COMPRESSED_FOLDS_EVALUATED: CompressedFormat = CompressedFormat {
+    levers: super::compress::folds_levers(super::wlfm::WlfmPrep::Evaluated),
+    compact: false,
+};
+pub const COMPRESSED_COMPACT_FOLDS: CompressedFormat = CompressedFormat {
+    levers: super::compress::folds_levers(super::wlfm::WlfmPrep::Stacked),
+    compact: true,
+};
+pub const COMPRESSED_COMPACT_FOLDS_EVALUATED: CompressedFormat = CompressedFormat {
+    levers: super::compress::folds_levers(super::wlfm::WlfmPrep::Evaluated),
+    compact: true,
+};
+
+/// ★ A compressed W3 block file verified as `format` — the CALLER'S constant
+/// (one of the `COMPRESSED_*` formats), never the file's: the file's tag must
+/// be `format`'s before anything else is read, then C1 is built under
+/// `format`'s levers at [`super::compress::COMPRESS_RATE`].
+pub fn verify_whir_block_compressed_as(
+    elf_bytes: &[u8],
+    proof: &WhirBlockCompressedProof,
+    format: CompressedFormat,
+) -> Result<(), String> {
+    require_compressed_tag(proof, format.tag()?)?;
+    let presets = super::whir_block::pinned_verifier_presets(BlockFormat::pinned().group);
+    let plan = super::whir_block::verifier_plan(elf_bytes, proof.statement(), &presets)?;
+    super::compress::verify_compressed(
+        &plan,
+        &presets.wrap_options,
+        super::compress::COMPRESS_RATE,
+        format.levers,
+        &proof.compressed,
+    )
 }
 
 /// A whole W3 block's proof compressed (`LAMBDA_VM_BLOCK_COMPRESS`): the
@@ -3051,9 +3158,7 @@ impl WhirBlockCompressedProof {
                 proof.version
             ));
         }
-        if !(PIPELINE_WHIR_COMPRESSED..=PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL)
-            .contains(&proof.pipeline)
-        {
+        if !is_rkyv_compressed(proof.pipeline) {
             return Err(format!(
                 "the file holds pipeline {}, not the compressed WHIR block tree",
                 proof.pipeline
@@ -3072,15 +3177,13 @@ impl WhirBlockCompressedProof {
     /// under the compact twin of this file's tag
     /// ([`PIPELINE_COMPACT_OFFSET`] above it).
     pub fn to_compact_bytes(&self) -> Result<rkyv::util::AlignedVec, String> {
-        if !(PIPELINE_WHIR_COMPRESSED..=PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL)
-            .contains(&self.pipeline)
-        {
+        let Some(twin) = compact_twin(self.pipeline) else {
             return Err(format!("pipeline {} has no compact twin", self.pipeline));
-        }
+        };
         let file = WhirBlockCompactFile {
             magic: PROOF_MAGIC,
             version: PROOF_VERSION,
-            pipeline: self.pipeline + PIPELINE_COMPACT_OFFSET,
+            pipeline: twin,
             table_num_vars: self.table_num_vars.clone(),
             runtime_page_ranges: self.runtime_page_ranges.clone(),
             table_counts: self.table_counts.clone(),
@@ -3108,9 +3211,7 @@ impl WhirBlockCompressedProof {
                 file.version
             ));
         }
-        if !(PIPELINE_WHIR_COMPRESSED_COMPACT..=PIPELINE_WHIR_COMPRESSED_COMPACT_EVALUATED_FINAL)
-            .contains(&file.pipeline)
-        {
+        if !is_compact_compressed(file.pipeline) {
             return Err(format!(
                 "the file holds pipeline {}, not a compact compressed WHIR block tree",
                 file.pipeline
@@ -3192,6 +3293,7 @@ pub fn verify_whir_block_compressed_compact_proof(
         super::wlfm::WlfmLevers {
             prep: super::compress::COMPRESS_PREP,
             final_poly: super::compress::COMPRESS_FINAL,
+            fold: None,
         },
     )
 }
@@ -3208,6 +3310,7 @@ pub fn verify_whir_block_compressed_compact_evaluated_proof(
         super::wlfm::WlfmLevers {
             prep: super::wlfm::WlfmPrep::Evaluated,
             final_poly: super::compress::COMPRESS_FINAL,
+            fold: None,
         },
     )
 }
@@ -3226,6 +3329,7 @@ pub fn verify_whir_block_compressed_compact_final_proof(
             final_poly: multilinear::whir_chain::FinalPoly::Vars(
                 super::compress::COMPRESS_FINAL_VARS,
             ),
+            fold: None,
         },
     )
 }
@@ -3244,6 +3348,7 @@ pub fn verify_whir_block_compressed_compact_evaluated_final_proof(
             final_poly: multilinear::whir_chain::FinalPoly::Vars(
                 super::compress::COMPRESS_FINAL_VARS,
             ),
+            fold: None,
         },
     )
 }
@@ -3280,6 +3385,7 @@ pub fn verify_whir_block_compressed_proof(
         super::wlfm::WlfmLevers {
             prep: super::compress::COMPRESS_PREP,
             final_poly: super::compress::COMPRESS_FINAL,
+            fold: None,
         },
         &proof.compressed,
     )
@@ -3306,6 +3412,7 @@ pub fn verify_whir_block_compressed_evaluated_proof(
         super::wlfm::WlfmLevers {
             prep: super::wlfm::WlfmPrep::Evaluated,
             final_poly: super::compress::COMPRESS_FINAL,
+            fold: None,
         },
         &proof.compressed,
     )
@@ -3332,6 +3439,7 @@ pub fn verify_whir_block_compressed_final_proof(
             final_poly: multilinear::whir_chain::FinalPoly::Vars(
                 super::compress::COMPRESS_FINAL_VARS,
             ),
+            fold: None,
         },
         &proof.compressed,
     )
@@ -3355,6 +3463,7 @@ pub fn verify_whir_block_compressed_evaluated_final_proof(
             final_poly: multilinear::whir_chain::FinalPoly::Vars(
                 super::compress::COMPRESS_FINAL_VARS,
             ),
+            fold: None,
         },
         &proof.compressed,
     )
@@ -3796,6 +3905,7 @@ mod tests {
                 WlfmLevers {
                     prep: WlfmPrep::Stacked,
                     final_poly: six,
+                    fold: None,
                 },
                 PIPELINE_WHIR_COMPRESSED_FINAL,
                 verify_whir_block_compressed_final_proof,
@@ -3804,6 +3914,7 @@ mod tests {
                 WlfmLevers {
                     prep: WlfmPrep::Evaluated,
                     final_poly: six,
+                    fold: None,
                 },
                 PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL,
                 verify_whir_block_compressed_evaluated_final_proof,
@@ -3856,6 +3967,7 @@ mod tests {
                 WlfmLevers {
                     prep: WlfmPrep::Stacked,
                     final_poly: six,
+                    fold: None,
                 },
                 PIPELINE_WHIR_COMPRESSED_COMPACT_FINAL,
                 verify_whir_block_compressed_compact_final_proof,
@@ -3864,6 +3976,7 @@ mod tests {
                 WlfmLevers {
                     prep: WlfmPrep::Evaluated,
                     final_poly: six,
+                    fold: None,
                 },
                 PIPELINE_WHIR_COMPRESSED_COMPACT_EVALUATED_FINAL,
                 verify_whir_block_compressed_compact_evaluated_final_proof,
@@ -3882,8 +3995,72 @@ mod tests {
             );
             all.push((f, *tag, *verify));
         }
-        let tags: std::collections::HashSet<u8> = all.iter().map(|(_, t, _)| *t).collect();
-        assert_eq!(tags.len(), 8, "every lever setting has its own tag");
+        let mut tags: std::collections::HashSet<u8> = all.iter().map(|(_, t, _)| *t).collect();
+        // The byte-minimising schedule's formats, through the format-taking
+        // verifier: each refuses every other file up front, and every named
+        // verifier refuses theirs.
+        let formats = [
+            (COMPRESSED_FOLDS, PIPELINE_WHIR_COMPRESSED_FOLDS),
+            (
+                COMPRESSED_FOLDS_EVALUATED,
+                PIPELINE_WHIR_COMPRESSED_FOLDS_EVALUATED,
+            ),
+            (
+                COMPRESSED_COMPACT_FOLDS,
+                PIPELINE_WHIR_COMPRESSED_COMPACT_FOLDS,
+            ),
+            (
+                COMPRESSED_COMPACT_FOLDS_EVALUATED,
+                PIPELINE_WHIR_COMPRESSED_COMPACT_FOLDS_EVALUATED,
+            ),
+        ];
+        let mut format_files = Vec::new();
+        for (format, tag) in formats {
+            assert_eq!(format.tag(), Ok(tag));
+            let f = file(format.levers);
+            let f = if format.compact {
+                let bytes = f.to_compact_bytes().expect("a compact file");
+                assert!(WhirBlockCompressedProof::from_bytes(&bytes).is_err());
+                WhirBlockCompressedProof::from_compact_bytes(&bytes).expect("reads back")
+            } else {
+                let bytes = f.to_bytes().expect("serializes");
+                assert!(WhirBlockCompressedProof::from_compact_bytes(&bytes).is_err());
+                WhirBlockCompressedProof::from_bytes(&bytes).expect("reads back")
+            };
+            assert_eq!(f.pipeline(), tag);
+            assert!(tags.insert(tag), "tag {tag} repeats");
+            format_files.push((format, f));
+        }
+        assert_eq!(tags.len(), 12, "every lever setting has its own tag");
+        for (format, _) in &format_files {
+            let ours = format.tag().unwrap();
+            for (f, theirs, _) in &all {
+                let e = verify_whir_block_compressed_as(&[], f, *format).expect_err("no ELF");
+                assert!(
+                    e.contains(&format!(
+                        "the file holds pipeline {theirs}, and this verifier reads pipeline {ours}"
+                    )),
+                    "{e}"
+                );
+            }
+            for (other, f) in &format_files {
+                let e = verify_whir_block_compressed_as(&[], f, *format).expect_err("no ELF");
+                assert_eq!(
+                    e.contains("and this verifier reads pipeline"),
+                    other != format,
+                    "{e}"
+                );
+            }
+        }
+        for (_, ours, verify) in &all {
+            for (_, f) in &format_files {
+                let e = verify(&[], f).expect_err("no ELF");
+                assert!(
+                    e.contains(&format!("this verifier reads pipeline {ours}")),
+                    "{e}"
+                );
+            }
+        }
         for (_, ours, verify) in &all {
             for (f, theirs, _) in &all {
                 let e = verify(&[], f).expect_err("no ELF");
@@ -3914,6 +4091,7 @@ mod tests {
             compressed_pipeline_of(WlfmLevers {
                 prep: WlfmPrep::Stacked,
                 final_poly: FinalPoly::Vars(4),
+                fold: None,
             })
             .is_err()
         );

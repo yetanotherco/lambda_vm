@@ -158,6 +158,9 @@ pub struct WlfmLevers {
     pub prep: WlfmPrep,
     /// Where the chains stop committing.
     pub final_poly: FinalPoly,
+    /// The fold width of every chain round after the first; `None` is
+    /// today's (`log_folding` of the pinned chain).
+    pub fold: Option<u8>,
 }
 
 impl WlfmLevers {
@@ -165,6 +168,7 @@ impl WlfmLevers {
     pub const DEFAULT: Self = Self {
         prep: WlfmPrep::Stacked,
         final_poly: FinalPoly::Off,
+        fold: None,
     };
 
     /// Today's format with the instruction columns bound per `prep`.
@@ -172,6 +176,7 @@ impl WlfmLevers {
         Self {
             prep,
             final_poly: FinalPoly::Off,
+            fold: None,
         }
     }
 }
@@ -189,15 +194,20 @@ pub const WLFM_B16_STACK: usize = 26;
 /// (and, at blowup 16, the [`WLFM_B16_STACK`] stack). The ONE call the build,
 /// the prover and the verifier make.
 pub fn wlfm_config(rate: WlfmRate, shapes: &[(usize, usize)]) -> ChainConfig {
-    wlfm_config_under(rate, FinalPoly::Off, shapes)
+    wlfm_config_under(rate, FinalPoly::Off, None, shapes)
 }
 
-/// [`wlfm_config`] with the chains' [`FinalPoly`]: a proof whose verifier is
-/// the host may stop committing at a final polynomial (the in-guest chain
-/// verifier has no such round, so a proof a parent verifies keeps `Off`).
+/// [`wlfm_config`] with the chains' [`FinalPoly`] and, when `fold` is set,
+/// the fold width of every round after the first: a proof whose verifier is
+/// the host may stop committing at a final polynomial and fold on a
+/// byte-minimising schedule (the in-guest chain verifier has neither, so a
+/// proof a parent verifies keeps both at today's). The query count stays the
+/// one today's schedule derives: a wider fold has no more rounds, so the
+/// count only over-covers its union bound.
 pub fn wlfm_config_under(
     rate: WlfmRate,
     final_poly: FinalPoly,
+    fold: Option<u8>,
     shapes: &[(usize, usize)],
 ) -> ChainConfig {
     let mut zf = ZfFormat {
@@ -217,6 +227,9 @@ pub fn wlfm_config_under(
         config.num_queries = WLFM_B4_QUERIES;
     }
     config.format.final_poly = final_poly;
+    if let Some(k) = fold {
+        config.log_folding = usize::from(k);
+    }
     #[cfg(test)]
     let config = test_format::apply(config);
     config
@@ -260,9 +273,11 @@ pub struct WlfmArtifacts {
     pub config: ChainConfig,
     /// How the instruction columns are bound.
     pub prep: WlfmPrep,
-    /// Where the chains stop committing (folded into `config`; held here so
-    /// the verifier re-derives the config from the levers, never the reverse).
+    /// Where the chains stop committing and how wide they fold after round 0
+    /// (folded into `config`; held here so the verifier re-derives the config
+    /// from the levers, never the reverse).
     pub final_poly: FinalPoly,
+    pub fold: Option<u8>,
     /// Under [`WlfmPrep::Stacked`]: the prepared stacks. Empty otherwise.
     pub stacks: Vec<WlfmStack>,
     /// Under [`WlfmPrep::Evaluated`]: each table's preprocessed prefix, as the
@@ -440,7 +455,11 @@ pub fn build_wlfm_under(
     levers: WlfmLevers,
     on_host: bool,
 ) -> Result<WlfmBuild, String> {
-    let WlfmLevers { prep, final_poly } = levers;
+    let WlfmLevers {
+        prep,
+        final_poly,
+        fold,
+    } = levers;
     // The mask with `BITWISE` dropped where nothing sends it: the default, as a
     // constant (`for_program_with_hasher` reads it from the environment).
     let chip_set = ChipSet::for_program_under(program, hasher, true);
@@ -478,7 +497,7 @@ pub fn build_wlfm_under(
         counts.push(count);
     }
     let shapes = table_shapes(&refs, &table_num_vars);
-    let config = wlfm_config_under(rate, final_poly, &shapes);
+    let config = wlfm_config_under(rate, final_poly, fold, &shapes);
     let sizes = multilinear_block::block_groups(&shapes, config.format.stack, WLFM_GROUP_POLYS)
         .map_err(|e| format!("{e:?}"))?;
     let group_lists: Vec<Vec<u32>> = {
@@ -519,6 +538,7 @@ pub fn build_wlfm_under(
             config,
             prep,
             final_poly,
+            fold,
             stacks: Vec::new(),
             evaluated,
             program_id: [0u8; 32],
@@ -565,6 +585,7 @@ pub fn build_wlfm_under(
         config,
         prep,
         final_poly,
+        fold,
         stacks,
         evaluated: Vec::new(),
         program_id: [0u8; 32],
@@ -958,7 +979,13 @@ fn verifier_frame(artifacts: &WlfmArtifacts, airs: &LfmAirs) -> Result<VerifierF
         }
     }
     let shapes = artifacts.shapes(airs);
-    if wlfm_config_under(artifacts.rate, artifacts.final_poly, &shapes) != artifacts.config {
+    if wlfm_config_under(
+        artifacts.rate,
+        artifacts.final_poly,
+        artifacts.fold,
+        &shapes,
+    ) != artifacts.config
+    {
         return Err("the artifacts' config is not their rate's over their shapes".into());
     }
     let sizes =

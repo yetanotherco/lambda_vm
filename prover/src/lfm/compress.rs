@@ -166,17 +166,68 @@ pub fn compress_wire_from_env(compress: Option<WlfmRate>) -> Result<bool, String
     Ok(compact)
 }
 
+/// The knob that proves C1's chains on the byte-minimising schedule: every
+/// round after the first folds [`COMPRESS_FOLDS_FOLD`] variables and the chain
+/// stops at a final polynomial of at most [`COMPRESS_FOLDS_FINAL_VARS`].
+pub const COMPRESS_FOLDS_ENV: &str = "LAMBDA_VM_BLOCK_COMPRESS_FOLDS";
+
+/// The fold width after round 0 under [`COMPRESS_FOLDS_ENV`].
+pub const COMPRESS_FOLDS_FOLD: u8 = 5;
+
+/// The final polynomial's width under [`COMPRESS_FOLDS_ENV`].
+pub const COMPRESS_FOLDS_FINAL_VARS: u8 = 10;
+
+/// The byte-minimising schedule's levers over `prep`.
+pub const fn folds_levers(prep: WlfmPrep) -> WlfmLevers {
+    WlfmLevers {
+        prep,
+        final_poly: FinalPoly::Vars(COMPRESS_FOLDS_FINAL_VARS),
+        fold: Some(COMPRESS_FOLDS_FOLD),
+    }
+}
+
+/// [`COMPRESS_FOLDS_ENV`]'s value: unset, `0` or `off` is today's schedule;
+/// `1` or `on` is the byte-minimising one. Anything else is refused.
+pub fn compress_folds_setting(value: Option<&str>) -> Result<bool, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(false),
+        Some(v) => match v.as_str() {
+            "" | "0" | "off" => Ok(false),
+            "1" | "on" => Ok(true),
+            other => Err(format!(
+                "{COMPRESS_FOLDS_ENV}={other:?}: expected off, 0, 1 or on"
+            )),
+        },
+    }
+}
+
 /// C1's format levers from the process's environment
-/// ([`compress_prep_setting`], [`compress_final_setting`]), refused when one
-/// is set with no compression step to apply it to.
+/// ([`compress_prep_setting`], [`compress_final_setting`],
+/// [`compress_folds_setting`]), refused when one is set with no compression
+/// step to apply it to, or when both chain levers are (the schedule sets its
+/// own final polynomial).
 pub fn compress_levers_from_env(compress: Option<WlfmRate>) -> Result<WlfmLevers, String> {
-    let levers = WlfmLevers {
-        prep: compress_prep_setting(std::env::var(COMPRESS_EVAL_ENV).ok().as_deref())?,
-        final_poly: compress_final_setting(std::env::var(COMPRESS_FINAL_ENV).ok().as_deref())?,
+    let prep = compress_prep_setting(std::env::var(COMPRESS_EVAL_ENV).ok().as_deref())?;
+    let final_poly = compress_final_setting(std::env::var(COMPRESS_FINAL_ENV).ok().as_deref())?;
+    let folds = compress_folds_setting(std::env::var(COMPRESS_FOLDS_ENV).ok().as_deref())?;
+    if folds && final_poly != FinalPoly::Off {
+        return Err(format!(
+            "{COMPRESS_FOLDS_ENV} sets C1's final polynomial itself; unset {COMPRESS_FINAL_ENV}"
+        ));
+    }
+    let levers = if folds {
+        folds_levers(prep)
+    } else {
+        WlfmLevers {
+            prep,
+            final_poly,
+            fold: None,
+        }
     };
     if compress.is_none() && levers != WlfmLevers::DEFAULT {
         return Err(format!(
-            "{COMPRESS_EVAL_ENV} and {COMPRESS_FINAL_ENV} shape C1, and {COMPRESS_ENV} adds no C1"
+            "{COMPRESS_EVAL_ENV}, {COMPRESS_FINAL_ENV} and {COMPRESS_FOLDS_ENV} shape C1, and \
+             {COMPRESS_ENV} adds no C1"
         ));
     }
     Ok(levers)
@@ -367,6 +418,29 @@ mod tests {
         assert_eq!(
             FinalPoly::vars(COMPRESS_FINAL_VARS),
             Some(FinalPoly::Vars(6))
+        );
+    }
+
+    /// The schedule knob is off unless set, refuses nonsense, and its levers
+    /// are fold 5 with a final polynomial of 10 variables.
+    #[test]
+    fn the_compress_folds_knob_is_off_unless_set_and_refuses_nonsense() {
+        assert_eq!(compress_folds_setting(None), Ok(false));
+        for off in ["", "0", "off", " OFF "] {
+            assert_eq!(compress_folds_setting(Some(off)), Ok(false));
+        }
+        for on in ["1", "on", " ON "] {
+            assert_eq!(compress_folds_setting(Some(on)), Ok(true));
+        }
+        for bad in ["2", "5", "yes"] {
+            assert!(compress_folds_setting(Some(bad)).is_err(), "{bad:?}");
+        }
+        let l = folds_levers(WlfmPrep::Stacked);
+        assert_eq!(l.fold, Some(5));
+        assert_eq!(l.final_poly, FinalPoly::Vars(10));
+        assert_eq!(
+            FinalPoly::vars(COMPRESS_FOLDS_FINAL_VARS),
+            Some(l.final_poly)
         );
     }
 

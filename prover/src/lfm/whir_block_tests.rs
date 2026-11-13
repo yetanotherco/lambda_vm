@@ -3286,12 +3286,12 @@ fn the_whir_block_tree_on_a_real_block() {
             c1.levers.prep,
             c1.proof.prepared.len(),
             c1.levers.final_poly,
-            super::whir_block_tree::compressed_pipeline_of(c1.levers).unwrap_or(0)
-                + if c1.compact {
-                    super::whir_block_tree::PIPELINE_COMPACT_OFFSET
-                } else {
-                    0
-                },
+            super::whir_block_tree::CompressedFormat {
+                levers: c1.levers,
+                compact: c1.compact
+            }
+            .tag()
+            .unwrap_or(0),
             if c1.compact { "compact" } else { "rkyv" }
         );
         honest.unwrap_or_else(|e| panic!("the compressed block must verify: {e}"));
@@ -4630,7 +4630,17 @@ fn the_final_polynomial_compressed_block_verifies_and_refuses_tampering() {
     compressed_block_case(super::wlfm::WlfmLevers {
         prep: super::wlfm::WlfmPrep::Stacked,
         final_poly: multilinear::whir_chain::FinalPoly::Vars(super::compress::COMPRESS_FINAL_VARS),
+        fold: None,
     });
+}
+
+/// ★ The same on the byte-minimising schedule (`LAMBDA_VM_BLOCK_COMPRESS_FOLDS`).
+#[test]
+#[ignore = "proves a small block's tree and C1 over its top; box tier"]
+fn the_folds_compressed_block_verifies_and_refuses_tampering() {
+    compressed_block_case(super::compress::folds_levers(
+        super::wlfm::WlfmPrep::Stacked,
+    ));
 }
 
 fn compressed_block_case(levers: super::wlfm::WlfmLevers) {
