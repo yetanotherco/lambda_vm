@@ -3267,7 +3267,26 @@ fn the_whir_block_tree_on_a_real_block() {
             back.pipeline()
         );
         assert!(decoded_ok && same, "the compact file carries the proof");
-        let c1_file = if c1.compact { compact.len() } else { rkyv_file };
+        let t = std::time::Instant::now();
+        let dedup = file
+            .to_wire_bytes(super::wire::WireFormat::Dedup)
+            .expect("the dedup file");
+        let dedup_ms = t.elapsed().as_secs_f64() * 1e3;
+        let dedup_back = WhirBlockCompressedProof::from_compact_bytes(&dedup).expect("reads back");
+        let dedup_same =
+            super::wire::encode(&dedup_back.compressed) == super::wire::encode(&c1.proof);
+        let dedup_ok = verify_compressed_against(plan, &artifacts, &dedup_back.compressed).is_ok();
+        println!(
+            "W3 COMPRESS DEDUP: dedup file {} B · tag {} · decoded verifies {dedup_ok} · same proof {dedup_same} · encode {dedup_ms:.1} ms",
+            dedup.len(),
+            dedup_back.pipeline()
+        );
+        assert!(dedup_ok && dedup_same, "the dedup file carries the proof");
+        let c1_file = match c1.wire {
+            super::wire::WireFormat::Rkyv => rkyv_file,
+            super::wire::WireFormat::Compact => compact.len(),
+            super::wire::WireFormat::Dedup => dedup.len(),
+        };
         let c1_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&c1.proof)
             .expect("serialize C1")
             .len();
@@ -3288,11 +3307,15 @@ fn the_whir_block_tree_on_a_real_block() {
             c1.levers.final_poly,
             super::whir_block_tree::CompressedFormat {
                 levers: c1.levers,
-                compact: c1.compact
+                wire: c1.wire
             }
             .tag()
             .unwrap_or(0),
-            if c1.compact { "compact" } else { "rkyv" }
+            match c1.wire {
+                super::wire::WireFormat::Rkyv => "rkyv",
+                super::wire::WireFormat::Compact => "compact",
+                super::wire::WireFormat::Dedup => "dedup",
+            }
         );
         honest.unwrap_or_else(|e| panic!("the compressed block must verify: {e}"));
         assert!(refused && refused_words, "a tampered C1 proof is refused");
@@ -4700,9 +4723,15 @@ fn compressed_block_case(levers: super::wlfm::WlfmLevers) {
     assert_eq!(super::wire::encode(&back), compact);
     verify_compressed(&plan, &wrap, WlfmRate::Sixteen, levers, &back)
         .unwrap_or_else(|e| panic!("the decoded compressed block verifies: {e}"));
+    let dedup = super::wire::encode_dedup(&c1);
+    let back = super::wire::decode_dedup(&dedup).expect("the dedup bytes decode");
+    assert_eq!(super::wire::encode(&back), compact);
+    verify_compressed(&plan, &wrap, WlfmRate::Sixteen, levers, &back)
+        .unwrap_or_else(|e| panic!("the dedup-decoded compressed block verifies: {e}"));
     println!(
-        "C1 SMALL WIRE: rkyv {bytes} B · compact {} B",
-        compact.len()
+        "C1 SMALL WIRE: rkyv {bytes} B · compact {} B · dedup {} B",
+        compact.len(),
+        dedup.len()
     );
 
     // Tampered C1 proofs.

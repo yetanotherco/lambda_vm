@@ -249,7 +249,7 @@ pub struct WhirTreeConfig {
     pub compress_levers: super::wlfm::WlfmLevers,
     /// `LAMBDA_VM_BLOCK_COMPRESS_WIRE` ([`super::compress::compress_wire_setting`];
     /// default off): ship the compressed file in the compact wire encoding.
-    pub compress_wire: bool,
+    pub compress_wire: super::wire::WireFormat,
 }
 
 /// A count knob: unset is `None`; anything but a count is an error.
@@ -1952,8 +1952,8 @@ pub struct WhirTreeTimes {
 pub struct CompressedTop {
     pub rate: super::wlfm::WlfmRate,
     pub levers: super::wlfm::WlfmLevers,
-    /// Whether the file ships in the compact wire encoding.
-    pub compact: bool,
+    /// The encoding the file ships in.
+    pub wire: super::wire::WireFormat,
     pub proof: super::wlfm::WlfmProof,
 }
 
@@ -2613,7 +2613,7 @@ pub fn prove_whir_block_tree(
             Some(CompressedTop {
                 rate,
                 levers: cfg.compress_levers,
-                compact: cfg.compress_wire,
+                wire: cfg.compress_wire,
                 proof: c1,
             })
         }
@@ -2979,6 +2979,35 @@ fn is_rkyv_compressed(tag: u8) -> bool {
             .contains(&tag)
 }
 
+/// The dedup twins (`LAMBDA_VM_BLOCK_COMPRESS_WIRE=dedup`): tags 14–17 are
+/// 2–5's, 18–19 are 10–11's, C1's proof compact with every repeated Merkle
+/// sibling sent once ([`super::wire::encode_dedup`]).
+pub const PIPELINE_DEDUP_OFFSET: u8 = 12;
+pub const PIPELINE_WHIR_COMPRESSED_DEDUP: u8 = 14;
+pub const PIPELINE_WHIR_COMPRESSED_DEDUP_EVALUATED: u8 = 15;
+pub const PIPELINE_WHIR_COMPRESSED_DEDUP_FINAL: u8 = 16;
+pub const PIPELINE_WHIR_COMPRESSED_DEDUP_EVALUATED_FINAL: u8 = 17;
+pub const PIPELINE_WHIR_COMPRESSED_DEDUP_FOLDS: u8 = 18;
+pub const PIPELINE_WHIR_COMPRESSED_DEDUP_FOLDS_EVALUATED: u8 = 19;
+
+/// Whether `tag` is a dedup compressed file's.
+fn is_dedup_compressed(tag: u8) -> bool {
+    (PIPELINE_WHIR_COMPRESSED_DEDUP..=PIPELINE_WHIR_COMPRESSED_DEDUP_FOLDS_EVALUATED).contains(&tag)
+}
+
+/// The dedup twin of an rkyv compressed file's tag.
+fn dedup_twin(tag: u8) -> Option<u8> {
+    if (PIPELINE_WHIR_COMPRESSED..=PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL).contains(&tag) {
+        Some(tag + PIPELINE_DEDUP_OFFSET)
+    } else if (PIPELINE_WHIR_COMPRESSED_FOLDS..=PIPELINE_WHIR_COMPRESSED_FOLDS_EVALUATED)
+        .contains(&tag)
+    {
+        Some(tag + (PIPELINE_WHIR_COMPRESSED_DEDUP_FOLDS - PIPELINE_WHIR_COMPRESSED_FOLDS))
+    } else {
+        None
+    }
+}
+
 /// Whether `tag` is a compact compressed file's.
 fn is_compact_compressed(tag: u8) -> bool {
     (PIPELINE_WHIR_COMPRESSED_COMPACT..=PIPELINE_WHIR_COMPRESSED_COMPACT_EVALUATED_FINAL)
@@ -3006,18 +3035,23 @@ fn compact_twin(tag: u8) -> Option<u8> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompressedFormat {
     pub levers: super::wlfm::WlfmLevers,
-    pub compact: bool,
+    pub wire: super::wire::WireFormat,
 }
 
 impl CompressedFormat {
     /// The tag a file of this format carries; refused for a setting no
     /// verifier takes.
     pub fn tag(&self) -> Result<u8, String> {
+        use super::wire::WireFormat;
         let rkyv = compressed_pipeline_of(self.levers)?;
-        if self.compact {
-            compact_twin(rkyv).ok_or_else(|| format!("pipeline {rkyv} has no compact twin"))
-        } else {
-            Ok(rkyv)
+        match self.wire {
+            WireFormat::Rkyv => Ok(rkyv),
+            WireFormat::Compact => {
+                compact_twin(rkyv).ok_or_else(|| format!("pipeline {rkyv} has no compact twin"))
+            }
+            WireFormat::Dedup => {
+                dedup_twin(rkyv).ok_or_else(|| format!("pipeline {rkyv} has no dedup twin"))
+            }
         }
     }
 }
@@ -3025,19 +3059,33 @@ impl CompressedFormat {
 /// The byte-minimising schedule's four formats (tags 10–13).
 pub const COMPRESSED_FOLDS: CompressedFormat = CompressedFormat {
     levers: super::compress::folds_levers(super::wlfm::WlfmPrep::Stacked),
-    compact: false,
+    wire: super::wire::WireFormat::Rkyv,
 };
 pub const COMPRESSED_FOLDS_EVALUATED: CompressedFormat = CompressedFormat {
     levers: super::compress::folds_levers(super::wlfm::WlfmPrep::Evaluated),
-    compact: false,
+    wire: super::wire::WireFormat::Rkyv,
 };
 pub const COMPRESSED_COMPACT_FOLDS: CompressedFormat = CompressedFormat {
     levers: super::compress::folds_levers(super::wlfm::WlfmPrep::Stacked),
-    compact: true,
+    wire: super::wire::WireFormat::Compact,
 };
 pub const COMPRESSED_COMPACT_FOLDS_EVALUATED: CompressedFormat = CompressedFormat {
     levers: super::compress::folds_levers(super::wlfm::WlfmPrep::Evaluated),
-    compact: true,
+    wire: super::wire::WireFormat::Compact,
+};
+
+/// The dedup file of C1 alone (tag 14) and of every lever (tag 19).
+pub const COMPRESSED_DEDUP: CompressedFormat = CompressedFormat {
+    levers: super::wlfm::WlfmLevers::DEFAULT,
+    wire: super::wire::WireFormat::Dedup,
+};
+pub const COMPRESSED_DEDUP_FOLDS: CompressedFormat = CompressedFormat {
+    levers: super::compress::folds_levers(super::wlfm::WlfmPrep::Stacked),
+    wire: super::wire::WireFormat::Dedup,
+};
+pub const COMPRESSED_DEDUP_FOLDS_EVALUATED: CompressedFormat = CompressedFormat {
+    levers: super::compress::folds_levers(super::wlfm::WlfmPrep::Evaluated),
+    wire: super::wire::WireFormat::Dedup,
 };
 
 /// ★ A compressed W3 block file verified as `format` — the CALLER'S constant
@@ -3177,8 +3225,23 @@ impl WhirBlockCompressedProof {
     /// under the compact twin of this file's tag
     /// ([`PIPELINE_COMPACT_OFFSET`] above it).
     pub fn to_compact_bytes(&self) -> Result<rkyv::util::AlignedVec, String> {
-        let Some(twin) = compact_twin(self.pipeline) else {
-            return Err(format!("pipeline {} has no compact twin", self.pipeline));
+        self.to_wire_bytes(super::wire::WireFormat::Compact)
+    }
+
+    /// The file's bytes in `wire`'s encoding, under that encoding's twin of
+    /// this file's tag.
+    pub fn to_wire_bytes(
+        &self,
+        wire: super::wire::WireFormat,
+    ) -> Result<rkyv::util::AlignedVec, String> {
+        use super::wire::WireFormat;
+        let twin = match wire {
+            WireFormat::Rkyv => return self.to_bytes(),
+            WireFormat::Compact => compact_twin(self.pipeline),
+            WireFormat::Dedup => dedup_twin(self.pipeline),
+        };
+        let Some(twin) = twin else {
+            return Err(format!("pipeline {} has no {wire:?} twin", self.pipeline));
         };
         let file = WhirBlockCompactFile {
             magic: PROOF_MAGIC,
@@ -3190,7 +3253,7 @@ impl WhirBlockCompressedProof {
             public_output: self.public_output.clone(),
             num_private_input_pages: self.num_private_input_pages,
             groups: self.groups.clone(),
-            compact: super::wire::encode(&self.compressed),
+            compact: super::wire::encode_as(&self.compressed, wire).unwrap_or_default(),
         };
         rkyv::to_bytes::<rkyv::rancor::Error>(&file).map_err(|e| format!("serialize: {e}"))
     }
@@ -3211,7 +3274,7 @@ impl WhirBlockCompressedProof {
                 file.version
             ));
         }
-        if !is_compact_compressed(file.pipeline) {
+        if !is_compact_compressed(file.pipeline) && !is_dedup_compressed(file.pipeline) {
             return Err(format!(
                 "the file holds pipeline {}, not a compact compressed WHIR block tree",
                 file.pipeline
@@ -3227,7 +3290,11 @@ impl WhirBlockCompressedProof {
             public_output: file.public_output,
             num_private_input_pages: file.num_private_input_pages,
             groups: file.groups,
-            compressed: super::wire::decode(&file.compact)?,
+            compressed: if is_dedup_compressed(file.pipeline) {
+                super::wire::decode_dedup(&file.compact)?
+            } else {
+                super::wire::decode(&file.compact)?
+            },
         })
     }
 }
@@ -3999,6 +4066,11 @@ mod tests {
         // The byte-minimising schedule's formats, through the format-taking
         // verifier: each refuses every other file up front, and every named
         // verifier refuses theirs.
+        use super::super::wire::WireFormat;
+        let dedup = |levers| CompressedFormat {
+            levers,
+            wire: WireFormat::Dedup,
+        };
         let formats = [
             (COMPRESSED_FOLDS, PIPELINE_WHIR_COMPRESSED_FOLDS),
             (
@@ -4013,25 +4085,51 @@ mod tests {
                 COMPRESSED_COMPACT_FOLDS_EVALUATED,
                 PIPELINE_WHIR_COMPRESSED_COMPACT_FOLDS_EVALUATED,
             ),
+            (dedup(WlfmLevers::DEFAULT), PIPELINE_WHIR_COMPRESSED_DEDUP),
+            (
+                dedup(WlfmLevers::with_prep(WlfmPrep::Evaluated)),
+                PIPELINE_WHIR_COMPRESSED_DEDUP_EVALUATED,
+            ),
+            (
+                dedup(WlfmLevers {
+                    prep: WlfmPrep::Stacked,
+                    final_poly: six,
+                    fold: None,
+                }),
+                PIPELINE_WHIR_COMPRESSED_DEDUP_FINAL,
+            ),
+            (
+                dedup(WlfmLevers {
+                    prep: WlfmPrep::Evaluated,
+                    final_poly: six,
+                    fold: None,
+                }),
+                PIPELINE_WHIR_COMPRESSED_DEDUP_EVALUATED_FINAL,
+            ),
+            (COMPRESSED_DEDUP_FOLDS, PIPELINE_WHIR_COMPRESSED_DEDUP_FOLDS),
+            (
+                COMPRESSED_DEDUP_FOLDS_EVALUATED,
+                PIPELINE_WHIR_COMPRESSED_DEDUP_FOLDS_EVALUATED,
+            ),
         ];
         let mut format_files = Vec::new();
         for (format, tag) in formats {
             assert_eq!(format.tag(), Ok(tag));
             let f = file(format.levers);
-            let f = if format.compact {
-                let bytes = f.to_compact_bytes().expect("a compact file");
-                assert!(WhirBlockCompressedProof::from_bytes(&bytes).is_err());
-                WhirBlockCompressedProof::from_compact_bytes(&bytes).expect("reads back")
-            } else {
+            let f = if format.wire == WireFormat::Rkyv {
                 let bytes = f.to_bytes().expect("serializes");
                 assert!(WhirBlockCompressedProof::from_compact_bytes(&bytes).is_err());
                 WhirBlockCompressedProof::from_bytes(&bytes).expect("reads back")
+            } else {
+                let bytes = f.to_wire_bytes(format.wire).expect("a compact file");
+                assert!(WhirBlockCompressedProof::from_bytes(&bytes).is_err());
+                WhirBlockCompressedProof::from_compact_bytes(&bytes).expect("reads back")
             };
             assert_eq!(f.pipeline(), tag);
             assert!(tags.insert(tag), "tag {tag} repeats");
             format_files.push((format, f));
         }
-        assert_eq!(tags.len(), 12, "every lever setting has its own tag");
+        assert_eq!(tags.len(), 18, "every lever setting has its own tag");
         for (format, _) in &format_files {
             let ours = format.tag().unwrap();
             for (f, theirs, _) in &all {
@@ -4278,7 +4376,7 @@ mod tests {
             leaf_first: true,
             compress: None,
             compress_levers: super::super::wlfm::WlfmLevers::DEFAULT,
-            compress_wire: false,
+            compress_wire: super::super::wire::WireFormat::Rkyv,
         };
         assert!(production.at_presets());
         let off = |f: fn(&mut WhirTreeConfig)| {

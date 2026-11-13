@@ -838,3 +838,47 @@ fn the_byte_minimising_schedule_round_trips_smaller_and_is_another_identity() {
         }
     }
 }
+
+/// ★ The dedup encoding (repeated Merkle siblings sent once) of every W-LFM
+/// proof the levers make — two rates, both bindings, today's chains, the
+/// final polynomial and the byte-minimising schedule — decodes to the same
+/// canonical bytes, verifies, and is no larger than the compact encoding.
+#[test]
+fn the_dedup_encoding_round_trips_every_wlfm_proof() {
+    use multilinear::whir_chain::FinalPoly;
+    let _unground = test_format::set(None);
+    let program = honest();
+    for rate in [WlfmRate::Two, WlfmRate::Sixteen] {
+        for prep in [WlfmPrep::Stacked, WlfmPrep::Evaluated] {
+            for levers in [
+                WlfmLevers::with_prep(prep),
+                WlfmLevers {
+                    prep,
+                    final_poly: FinalPoly::Vars(6),
+                    fold: None,
+                },
+                super::compress::folds_levers(prep),
+            ] {
+                let build = under(&program, rate, levers);
+                let proof = prove(&program, &build);
+                let compact = super::wire::encode(&proof);
+                let dedup = super::wire::encode_dedup(&proof);
+                let back = super::wire::decode_dedup(&dedup)
+                    .unwrap_or_else(|e| panic!("{rate:?} {levers:?}: {e}"));
+                assert_eq!(super::wire::encode(&back), compact);
+                assert_eq!(super::wire::encode_dedup(&back), dedup);
+                verify_wlfm(&build.artifacts, &back, &back.public_words)
+                    .unwrap_or_else(|e| panic!("the decoded proof verifies: {e}"));
+                println!(
+                    "DEDUP {rate:?} {levers:?}: dedup {} B · compact {} B · rkyv {} B",
+                    dedup.len(),
+                    compact.len(),
+                    proof_bytes(&proof)
+                );
+                assert!(dedup.len() <= compact.len());
+                // The two decoders do not take each other's bytes.
+                assert!(super::wire::decode(&dedup).is_err() || dedup == compact);
+            }
+        }
+    }
+}
