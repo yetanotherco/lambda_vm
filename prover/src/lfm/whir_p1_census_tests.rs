@@ -1109,10 +1109,13 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// machine.
 ///
 /// The pins move with any AIR whose constraint leg a leaf emits, and with the
-/// block's format: last moved by one round-0 tree a group's run as the default
-/// (a joint leaf and one path a query; the lean check's median mix one leaf
-/// fewer), after the block presets' lean KECCAK_RND form (1,011 interactions),
-/// the ECREC table and the 23-count statement.
+/// block's format: last moved by MEMW_A's timestamp order by the step's limbs
+/// as the default (21 interactions, no LT lookup; the form before it,
+/// `BLOCK_WHIR_MEMW_A=lt`, still emits the leaves pinned before it, checked
+/// below), after one round-0 tree a group's run as the default (a joint leaf
+/// and one path a query; the lean check's median mix one leaf fewer), the
+/// block presets' lean KECCAK_RND form (1,011 interactions), the ECREC table
+/// and the 23-count statement.
 #[test]
 fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     use super::whir_chain::LeafQuery;
@@ -1123,29 +1126,29 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
             LeafQuery::V1,
             GkrPack::PRODUCTION,
             5,
-            "f66cf92105f1bf17e0fdfe8c82c4dea0d6bd814f609de248616b7a7cf1295519",
-            "94d400473e0a7e75795fd75ac0b76ffe86fca5353771155caf60b099fb69f01e",
+            "369081b3bfe857e5b44a92f37a19359a9013aae3709ea51ac6beebce84fdaa74",
+            "a3f8f1ea7e5fbb635ea5325aeb9d2dea5814d739ec5a07c1f57d602bf685e4ac",
         ),
         (
             LeafQuery::Lean,
             GkrPack::PRODUCTION,
             4,
-            "8f2baebc59e7665b5bb9a82b2eeb4ed7085c5a173170fbf1cecbc3278e447b9a",
-            "84190e62ce1be60d6ea8c7d348d925b7e829a2b329aff9d59e4bd7cfd7fdb0ba",
+            "61000a26335beb7a78201d2f86cdc3d4f6791b14318a59ba58014feb539fb5fc",
+            "aec31d65ab2a0dcf8f9815f8cabb1bbd51c5089d3565b9d7310a06c9cecec564",
         ),
         (
             LeafQuery::V1,
             GkrPack::Off,
             5,
-            "21c81353fa12c84d25d690293315c5dc9a08664606d7ab07cd28f94f4d0d24e2",
-            "fcd7fe27fbdef8387f45f36bc45d3d2d8be346119289c7c319601f4c278f82c7",
+            "ea01c471d9e6b200daebcaa72029e6a031e461da6eaa4c23b2f69911ae3664b3",
+            "e7cbef64313309dcae3fc91901b2b61e83ea2bc03167549176bac1b495aeb0f3",
         ),
         (
             LeafQuery::Lean,
             GkrPack::Off,
             4,
-            "ce1a330b4efb770b881766b53c829e47efa19400b80c74a2e16a8823d987fb98",
-            "09e96cf9c445b04e7e4188a2f013929bd6d79efc4975b93dd358c276978acbf7",
+            "dff8a4a96763172fa585ea9a62790d4d56b50c6244e806cca64534f14de471b7",
+            "8026b07cf1a429d007972029e8406bd2b8a27f9c300faf5090fccde0234905dc",
         ),
     ];
     let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
@@ -1195,6 +1198,28 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         program_digest(&default.leaf_program(0).expect("the leaf emits")),
         PINS[1].3,
         "the default's first leaf is the lean check's at the production packing"
+    );
+    // MEMW_A's form before the limbs emits the default's leaves pinned before
+    // them, digest for digest: the rollback's recursion is today's.
+    let lt = WhirBlockPlan::derive(
+        elf_bytes,
+        &opts,
+        &p1_format_at_blowup_2()
+            .with_memw_aligned(crate::tables::memw_aligned::MemwAlignedOrder::Lt),
+        owned.view(),
+        None,
+    )
+    .expect("the plan derives");
+    let n = lt.partition().num_leaves();
+    let digest = |k: usize| program_digest(&lt.leaf_program(k).expect("the leaf emits"));
+    assert_eq!(
+        (n, digest(0), digest(n - 1)),
+        (
+            4,
+            "8f2baebc59e7665b5bb9a82b2eeb4ed7085c5a173170fbf1cecbc3278e447b9a".to_string(),
+            "84190e62ce1be60d6ea8c7d348d925b7e829a2b329aff9d59e4bd7cfd7fdb0ba".to_string()
+        ),
+        "MEMW_A's LT form: the leaves before the limbs"
     );
 }
 
