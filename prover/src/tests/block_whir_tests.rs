@@ -2996,6 +2996,106 @@ fn keccak_rnd_first_is_the_default_moves_the_partition_and_verifies() {
     );
 }
 
+/// ★ CPU's and LT's tables handed on after KECCAK_RND's
+/// ([`Deviations::cpu_lt_first`], `LAMBDA_VM_BLOCK_CPU_LT_FIRST=1`; off by
+/// default): with it, every CPU and LT table is packed before DECODE (the first
+/// table of the rest in AIR order) and after every KECCAK_RND table; without it,
+/// every one after DECODE, and the default is without it. The partition moves,
+/// the tables and their counts do not, and every proof verifies under the
+/// unchanged verifier.
+#[test]
+fn cpu_lt_first_moves_the_partition_and_verifies() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    assert!(o.rest_streams(), "the rest streams");
+    let proved = |what: &str, cpu_lt_first: Option<bool>| {
+        let proof = prove_with(
+            &elf,
+            &format,
+            &o,
+            &Deviations {
+                keccak_rnd_first: Some(true),
+                cpu_lt_first,
+                ..Deviations::default()
+            },
+        );
+        assert!(verify(&proof, &elf, &format), "{what}");
+        proof
+    };
+    let default = proved("the default", None);
+    let on = proved("CPU and LT first", Some(true));
+    let off = proved("off", Some(false));
+    let opts = ProofOptions::default_test_options();
+    let frame = block_whir::block_frame(on.statement(), &elf, &opts, &format).expect("frame");
+    let names: Vec<String> = frame
+        .airs
+        .air_refs()
+        .iter()
+        .map(|air| air.name().to_string())
+        .collect();
+    let of = |family: &str| -> Vec<u32> {
+        (0..names.len())
+            .filter(|&i| {
+                names[i]
+                    .strip_prefix(family)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('['))
+            })
+            .map(|i| i as u32)
+            .collect()
+    };
+    let (cpu_lt, keccak_rnd) = ([of("CPU"), of("LT")].concat(), of("KECCAK_RND"));
+    let decode = names.iter().position(|n| n == "DECODE").expect("DECODE") as u32;
+    assert!(!of("CPU").is_empty() && !of("LT").is_empty() && !keccak_rnd.is_empty());
+    let flat = |p: &BlockWhirProof| p.groups.iter().flatten().copied().collect::<Vec<u32>>();
+    let at = |order: &[u32], t: u32| order.iter().position(|&x| x == t).expect("in a group");
+    // The CPU and LT tables the rest builds (the streamed chunks were packed
+    // during the windows): those after the last KECCAK_RND table in AIR order.
+    let rest_cpu_lt = |p: &BlockWhirProof| -> Vec<u32> {
+        let order = flat(p);
+        let last_window = keccak_rnd
+            .iter()
+            .map(|&t| at(&order, t))
+            .min()
+            .expect("KECCAK_RND");
+        cpu_lt
+            .iter()
+            .copied()
+            .filter(|&t| at(&order, t) >= last_window)
+            .collect()
+    };
+    let before_decode = |p: &BlockWhirProof| {
+        let order = flat(p);
+        let d = at(&order, decode);
+        let after_keccak_rnd = keccak_rnd
+            .iter()
+            .map(|&t| at(&order, t))
+            .max()
+            .expect("KECCAK_RND");
+        let built = rest_cpu_lt(p);
+        assert!(!built.is_empty(), "the rest builds CPU or LT tables");
+        (
+            built.iter().filter(|&&t| at(&order, t) < d).count() == built.len(),
+            built.iter().all(|&t| at(&order, t) > after_keccak_rnd),
+        )
+    };
+    assert_eq!(before_decode(&on), (true, true), "CPU and LT first");
+    assert!(!before_decode(&off).0, "off: CPU and LT after DECODE");
+    assert_eq!(default.groups, off.groups, "the default is off");
+    assert_ne!(on.groups, off.groups, "the partition did not move");
+    let sorted = |p: &BlockWhirProof| {
+        let mut v = flat(p);
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(sorted(&on), sorted(&off), "the same tables");
+    assert_eq!(
+        format!("{:?}", on.table_counts),
+        format!("{:?}", off.table_counts)
+    );
+}
+
 /// The bounded layout (D-EXEC E3): with three workers and `layout_ahead =
 /// Some(k)`, at most `k + 1` streamed chunks are laid out (or in the making)
 /// and not yet packed at once, and the groups are the inline layout's.

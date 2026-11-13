@@ -1074,6 +1074,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// The rest handed on, and started, with CPU's and LT's tables right after
+    /// KECCAK_RND's when the finish slides ([`StreamSkip::cpu_lt_first`]). The
+    /// tables are the same; their order, and so the groups, are not.
+    pub fn cpu_lt_first(mut self) -> Self {
+        self.emitted.cpu_lt_first = true;
+        self
+    }
+
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables counted
     /// from each table's rows as it is built, phase 4 beside the rest's builds
     /// and BITWISE handed on last ([`StreamSkip::bitwise_from_tables`]), when
@@ -1297,6 +1305,9 @@ impl<'a> WindowedTraceBuilder<'a> {
         }
         if skip.keccak_rnd_first && slide && cfg!(feature = "parallel") {
             plan.hand_keccak_rnd_first();
+        }
+        if skip.cpu_lt_first && slide && cfg!(feature = "parallel") {
+            plan.hand_cpu_lt_first();
         }
         let mut send = match on_header(plan.header().clone()) {
             Ok(send) => send,

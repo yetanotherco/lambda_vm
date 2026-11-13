@@ -37,6 +37,12 @@ pub(crate) struct RestHeader {
     /// ([`StreamSkip::keccak_rnd_first`], [`hand_on_order_first`]): the order
     /// the layout admits.
     pub(crate) keccak_rnd_first: bool,
+    /// CPU's and LT's tables are handed on right after KECCAK_RND's (after
+    /// [`Self::keccak_rnd_first`]'s when it is set, else first), CPU's then
+    /// LT's, each in AIR order, then the rest as without it
+    /// ([`StreamSkip::cpu_lt_first`], [`hand_on_order_first`]): the order the
+    /// layout admits.
+    pub(crate) cpu_lt_first: bool,
 }
 
 impl RestHeader {
@@ -1463,6 +1469,7 @@ impl<'a> FinishPlan<'a> {
                 bitwise_last: false,
                 bitwise_from_tables: false,
                 keccak_rnd_first: false,
+                cpu_lt_first: false,
             },
             cut_line,
             cpu_decoded,
@@ -1485,6 +1492,12 @@ impl<'a> FinishPlan<'a> {
     /// ([`RestHeader::keccak_rnd_first`]): for a sliding finish.
     pub(crate) fn hand_keccak_rnd_first(&mut self) {
         self.header.keccak_rnd_first = true;
+    }
+
+    /// The rest handed on with CPU's and LT's tables right after KECCAK_RND's
+    /// ([`RestHeader::cpu_lt_first`]): for a sliding finish.
+    pub(crate) fn hand_cpu_lt_first(&mut self) {
+        self.header.cpu_lt_first = true;
     }
 
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables as each is
@@ -2065,6 +2078,7 @@ impl<'a> FinishPlan<'a> {
             bitwise_last: _,
             bitwise_from_tables: _,
             keccak_rnd_first: _,
+            cpu_lt_first: _,
         } = header;
         let traces = Traces {
             cpus,
@@ -3294,13 +3308,14 @@ impl<'a> FinishPlan<'a> {
         // BITWISE is the rest's first table: its position is 0.
         let last = (slide && self.header.bitwise_last).then_some(0);
         let keccak_rnd_first = slide && self.header.keccak_rnd_first;
+        let cpu_lt_first = slide && self.header.cpu_lt_first;
         let (units, regen, side) = match self.units_keeping(keep) {
             Ok((units, regen, side)) => (Ok(units), regen, side),
             Err(e) => (Err(e), None, None),
         };
         let first = match &units {
-            Ok(units) if keccak_rnd_first => positions_of(units, family("KECCAK_RND")),
-            _ => Vec::new(),
+            Ok(units) => first_positions(units, keccak_rnd_first, cpu_lt_first),
+            Err(_) => Vec::new(),
         };
         emit_streamed_units_ordered(units, gate, send, slide, &first, last, side)?;
         Ok(regen)
@@ -3734,6 +3749,21 @@ pub(crate) fn hand_on_order_first(
 }
 
 /// The positions of `units` of `family` ([`FAMILIES`]), ascending.
+/// The positions handed on first: KECCAK_RND's (`keccak_rnd`), then CPU's and
+/// LT's (`cpu_lt`), each family in AIR order ([`RestHeader::keccak_rnd_first`],
+/// [`RestHeader::cpu_lt_first`]).
+fn first_positions(units: &[Unit<'_>], keccak_rnd: bool, cpu_lt: bool) -> Vec<usize> {
+    let mut first = Vec::new();
+    if keccak_rnd {
+        first.extend(positions_of(units, family("KECCAK_RND")));
+    }
+    if cpu_lt {
+        first.extend(positions_of(units, family("CPU")));
+        first.extend(positions_of(units, family("LT")));
+    }
+    first
+}
+
 fn positions_of(units: &[Unit<'_>], family: usize) -> Vec<usize> {
     units
         .iter()

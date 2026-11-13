@@ -6931,6 +6931,14 @@ pub struct StreamSkip {
     /// are built. The tables are the same; the groups they are packed into,
     /// and so the proof's bytes, are not. In waves it changes nothing.
     pub keccak_rnd_first: bool,
+    /// With the slide, CPU's and LT's tables are handed on, and started, right
+    /// after KECCAK_RND's (after [`Self::keccak_rnd_first`]'s tables when it is
+    /// on, else first), in their AIR order, and the rest after them as without
+    /// it (`LAMBDA_VM_BLOCK_CPU_LT_FIRST=1` on the block; off by default), so
+    /// CPU's last chunk and LT, the finish's longest builds, start as the
+    /// finish does. The tables are the same; the groups they are packed into,
+    /// and so the proof's bytes, are not. In waves it changes nothing.
+    pub cpu_lt_first: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table
     /// phase's counts, its
