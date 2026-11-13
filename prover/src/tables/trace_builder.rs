@@ -1727,6 +1727,10 @@ struct MemwBuckets {
     /// aligned row is laid out (the block format's; the per-table STARK's
     /// [`MemwAlignedOrder::Lt`] by default).
     order: MemwAlignedOrder,
+    /// The first aligned access [`memw_aligned::AlignedRow::from_memw`]
+    /// refused (none today: the routing admits only what it takes), returned by
+    /// the walk as an error ([`Self::refusal`]) instead of a wrapped row.
+    refused: Option<String>,
 }
 
 impl MemwBuckets {
@@ -1737,6 +1741,28 @@ impl MemwBuckets {
             general: Vec::new(),
             words: None,
             order,
+            refused: None,
+        }
+    }
+
+    /// MEMW_A's one creation site: `op`'s row in the run's form, or, if
+    /// [`memw_aligned::AlignedRow::from_memw`] refuses it, no row and the
+    /// refusal kept for the walk to return ([`Self::refusal`]).
+    #[inline]
+    fn push_aligned(&mut self, op: &MemwOperation) {
+        match memw_aligned::AlignedRow::from_memw(op, self.order) {
+            Ok(row) => self.aligned.push(row),
+            Err(why) => {
+                self.refused.get_or_insert(why);
+            }
+        }
+    }
+
+    /// The walk's error if a MEMW_A row was refused ([`Self::refused`]).
+    fn refusal(&self) -> Result<(), Error> {
+        match &self.refused {
+            Some(why) => Err(Error::Prover(format!("MEMW_A: {why}"))),
+            None => Ok(()),
         }
     }
 
@@ -1764,9 +1790,7 @@ impl MemwBuckets {
                 Some(words) => words.push(RegRow::from_memw(&op)),
                 None => self.register_rows.push(RegRow::from_memw(&op)),
             },
-            MemwRoute::Aligned => self
-                .aligned
-                .push(memw_aligned::AlignedRow::from_memw(&op, self.order)),
+            MemwRoute::Aligned => self.push_aligned(&op),
             MemwRoute::General => self.general.push(op),
         }
     }
@@ -2564,7 +2588,7 @@ fn walk_cpu_ops<const REST: bool>(
                 == u64::from(current_commit_index - start_commit_index),
         "COPY should move exactly the committed byte count"
     );
-    Ok(())
+    memw.refusal()
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
@@ -4312,6 +4336,46 @@ pub(crate) fn route_for_test(op: &MemwOperation, order: MemwAlignedOrder) -> &'s
         MemwRoute::Register => "MEMW_R",
         MemwRoute::Aligned => "MEMW_A",
         MemwRoute::General => "MEMW",
+    }
+}
+
+/// MEMW_A's creation site refuses, with an error and no row, a step the
+/// limbs cannot carry, whatever routed it there (a routing bug, simulated by
+/// handing the op to the creation site directly): the bucket keeps the
+/// refusal and the walk returns it ([`walk_cpu_ops`]'s last line; HALT's rows
+/// in `collect_all_ops` and the windowed `assemble`). LT's form takes any order.
+#[cfg(test)]
+mod memw_aligned_refusal_tests {
+    use super::*;
+
+    fn op(old: u64, ts: u64) -> MemwOperation {
+        MemwOperation::new(false, 0x2000, [1; 8], ts, 8, true).with_old([0; 8], [old; 8])
+    }
+
+    #[test]
+    fn a_limbs_row_for_a_step_that_does_not_fit_is_refused_with_an_error() {
+        for (old, ts) in [
+            (5u64, 5 + (1 << 32)),
+            ((1 << 32) - 1, 1 << 32),
+            (9, 9),
+            (10, 9),
+        ] {
+            let mut limbs = MemwBuckets::with_register_capacity(0, MemwAlignedOrder::Limbs);
+            limbs.push_aligned(&op(old, ts));
+            limbs.push_aligned(&op(1, 4));
+            assert_eq!(limbs.aligned.len(), 1, "{old:#x} → {ts:#x}: no row of it");
+            match limbs.refusal() {
+                Err(Error::Prover(why)) => assert!(why.starts_with("MEMW_A: "), "{why}"),
+                other => panic!("{old:#x} → {ts:#x}: refused with an error, not {other:?}"),
+            }
+            let mut lt = MemwBuckets::with_register_capacity(0, MemwAlignedOrder::Lt);
+            lt.push_aligned(&op(old, ts));
+            assert_eq!(lt.aligned.len(), 1);
+            assert!(lt.refusal().is_ok(), "LT's form takes any order");
+        }
+        let mut fits = MemwBuckets::with_register_capacity(0, MemwAlignedOrder::Limbs);
+        fits.push_aligned(&op(1, (1 << 32) - 1));
+        assert!(fits.refusal().is_ok() && fits.aligned[0].limbs());
     }
 }
 
@@ -8407,7 +8471,7 @@ fn collect_all_ops(
     ecrec_ops: Vec<ecrec::EcrecOperation>,
     register_state: &mut RegisterState,
     is_final: bool,
-) -> CollectedOps {
+) -> Result<CollectedOps, Error> {
     // HALT finalization: 33 register MEMW operations at timestamp 2^32-1.
     // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
     // Only the final epoch terminates; intermediate epochs keep their boundary
@@ -8416,6 +8480,7 @@ fn collect_all_ops(
         // Route halt ops through the same classifier; they append to the end of their
         // buckets.
         memw.extend_ops(collect_halt_ops(register_state));
+        memw.refusal()?;
     }
 
     // The walk (`collect_ops_from_cpu`) already routed every MemwOperation into its bucket at
@@ -8428,6 +8493,7 @@ fn collect_all_ops(
         general: memw_ops,
         words: _,
         order: _,
+        refused: _,
     } = memw;
 
     let RoutedSegments {
@@ -8460,7 +8526,7 @@ fn collect_all_ops(
         .chain(BlockVec::from_vec(lt_dvrm_filter))
         .chain(BlockVec::from_vec(lt_dvrm_cpu32));
 
-    CollectedOps {
+    Ok(CollectedOps {
         cpu_ops,
         memw_ops,
         memw_aligned_ops,
@@ -8489,7 +8555,7 @@ fn collect_all_ops(
         copy_ops: BlockVec::from_vec(copy_ops),
         hint_ops: BlockVec::from_vec(hint_ops),
         ecrec_ops: BlockVec::from_vec(ecrec_ops),
-    }
+    })
 }
 
 /// When each phase of a trace build ended, and when each table type's phase-5
@@ -9599,7 +9665,7 @@ impl Traces {
             ecrec_ops,
             &mut register_state,
             is_final,
-        );
+        )?;
         #[cfg(feature = "instruments")]
         drop(__sp);
         build_stamps::mark("p2b route");
@@ -9753,7 +9819,7 @@ impl Traces {
             ecrec_ops,
             &mut register_state,
             true,
-        );
+        )?;
 
         // DECODE (from_elf_and_logs does this in Phase 0; same result either way)
         let (decode_trace, _) = decode::generate_decode_trace(&instructions);

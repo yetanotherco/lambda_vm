@@ -1497,7 +1497,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 let (cpu_ops, mut walk) = concatenate(windows, emitted.memw_aligned_order);
                 super::build_stamps::mark("p0 concatenate");
                 let rest = KeptRest::from_walk(&mut walk);
-                let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state);
+                let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state)?;
                 super::build_stamps::mark("p0 assemble");
                 let decode_trace = decode_trace
                     .ok_or_else(|| {
@@ -1593,7 +1593,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 let (cpu_ops, walk, rest, decode_trace) =
                     kept.into_run(&decode, emitted.memw_aligned_order)?;
                 super::build_stamps::mark("p0 concatenate");
-                let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state);
+                let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state)?;
                 super::build_stamps::mark("p0 assemble");
                 // With the MEMW-derived LT ops streamed, `memw_lt_done` counts
                 // the dropped ops too; without, it is zero and the dropped
@@ -3506,6 +3506,7 @@ impl Kept {
             general: general.into_vec(),
             words: None,
             order,
+            refused: None,
         };
         walk.load_ops = load.into_vec();
         walk.lt_ops = lt.into_vec();
@@ -4275,6 +4276,7 @@ fn concatenate(
             general,
             words: None,
             order,
+            refused: None,
         },
         load_ops: load,
         lt_ops: lt,
@@ -4554,7 +4556,7 @@ fn assemble(
     rest: KeptRest,
     segments: RoutedBlocks,
     register_state: &mut RegisterState,
-) -> CollectedOps {
+) -> Result<CollectedOps, Error> {
     // The streamed tables' lists (their tails); `rest` holds the others.
     let WalkOutputs {
         memw,
@@ -4581,11 +4583,13 @@ fn assemble(
         general: mut memw_ops,
         words: _,
         order,
+        refused: _,
     } = memw;
     // HALT's register ops land at the end of their buckets, as in
     // `collect_all_ops`, routed and laid out in the run's MEMW_A form.
     let mut halt = MemwBuckets::with_register_capacity(0, order);
     halt.extend_ops(collect_halt_ops(register_state));
+    halt.refusal()?;
     memw_register_rows.extend(halt.register_rows);
     memw_aligned_ops.extend(halt.aligned);
     memw_ops.extend(halt.general);
@@ -4619,7 +4623,7 @@ fn assemble(
         .chain(lt_dvrm_filter)
         .chain(lt_dvrm_cpu32);
 
-    CollectedOps {
+    Ok(CollectedOps {
         cpu_ops,
         memw_ops,
         memw_aligned_ops,
@@ -4643,7 +4647,7 @@ fn assemble(
         ecdas_ops,
         hint_ops,
         ecrec_ops,
-    }
+    })
 }
 
 /// A run's streamed chunks built again from its logs (D-REGEN §2.3, the
@@ -4828,6 +4832,7 @@ impl RegenBuilder {
             mut general,
             words: _,
             order: _,
+            refused: _,
         } = walk.memw;
         #[cfg_attr(not(test), allow(unused_mut))]
         let (mut load, mut lt, mut shift) = (walk.load_ops, walk.lt_ops, walk.shift_ops);
