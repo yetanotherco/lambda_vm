@@ -4,9 +4,8 @@
 //! The `blake3_probe` pattern: the chip's real interactions and constraints,
 //! its fixed table, and a synthetic `LfmMem` mirror standing in for the
 //! machine's memory. Every digest the honest probes prove is checked against
-//! the `blake3` crate and against the base's own BLAKE3 Merkle backend
-//! (`BatchBlake3StdBackend`), so "BLAKE3" here means the hash the base commits
-//! with, not a reimplementation agreeing with itself.
+//! the `blake3` crate, so "BLAKE3" here means standard BLAKE3, not a
+//! reimplementation agreeing with itself.
 //!
 //! Proved under the LFM's own options ([`crate::lfm::proof::aggregation_wrap_options`]:
 //! blowup 4, 112 queries, the process format) with `multi_prove_bound`, the
@@ -152,8 +151,8 @@ fn parent_op(left: [u8; 32], right: [u8; 32], a: &mut Addrs) -> LeanOp {
 }
 
 /// A leaf over `felts` (≤ 128, one chunk): ⌈8·n/64⌉ chained compressions of
-/// the felts' big-endian bytes — `blake3::hash` of those bytes, which is what
-/// the base's `BatchBlake3StdBackend` hashes a leaf to.
+/// the felts' big-endian bytes — `blake3::hash` of those bytes, which is how
+/// a BLAKE3 base hashes a leaf.
 fn leaf_ops(felts: &[u64], a: &mut Addrs) -> Vec<LeanOp> {
     let bytes: Vec<u8> = felts.iter().flat_map(|f| f.to_be_bytes()).collect();
     let blocks = bytes.len().div_ceil(64).max(1);
@@ -787,9 +786,9 @@ fn seven_n_rows_chunk_exactly() {
 /// compressions), a 3-felt leaf (one partial block) and a parent.
 #[test]
 fn the_lean_digests_are_blake3() {
-    use crypto::merkle_tree::backends::types::BatchBlake3StdBackend;
-    use crypto::merkle_tree::traits::IsMerkleTreeBackend;
-
+    // Against the `blake3` crate only: this branch's base commits with
+    // Poseidon1 and has no standard 7-round BLAKE3 Merkle backend to compare
+    // the leaf and parent framing against.
     let ops = probe_ops(12);
     let t = build_traces(&ops, &Spec::default());
     for (op, d) in ops.iter().zip(&t.digests) {
@@ -800,11 +799,6 @@ fn the_lean_digests_are_blake3() {
         );
     }
     // The 64-felt leaf: the chain's last digest.
-    let felts: Vec<FE> = ops[..8]
-        .iter()
-        .flat_map(|op| op.felts())
-        .map(FE::from)
-        .collect();
     let bytes: Vec<u8> = ops[..8].iter().flat_map(|op| op.block).collect();
     let leaf = digest_bytes(&t.digests[7]);
     assert_eq!(
@@ -812,24 +806,12 @@ fn the_lean_digests_are_blake3() {
         *blake3::hash(&bytes).as_bytes(),
         "64-felt leaf = blake3::hash"
     );
-    assert_eq!(
-        leaf,
-        BatchBlake3StdBackend::<F>::hash_data(&felts),
-        "64-felt leaf = the base's BLAKE3 leaf"
-    );
     // The partial block.
     let short = digest_bytes(&t.digests[8]);
     assert_eq!(short, *blake3::hash(&ops[8].block[..24]).as_bytes());
-    let short_felts: Vec<FE> = ops[8].felts()[..3].iter().map(|&f| FE::from(f)).collect();
-    assert_eq!(short, BatchBlake3StdBackend::<F>::hash_data(&short_felts));
     // The parent of the two leaves.
     let parent = digest_bytes(&t.digests[9]);
     assert_eq!(parent, *blake3::hash(&ops[9].block).as_bytes());
-    assert_eq!(
-        parent,
-        BatchBlake3StdBackend::<F>::hash_new_parent(&leaf, &short),
-        "parent = the base's BLAKE3 parent"
-    );
     // The fixed table saw every lookup the chip sends.
     let per_compression = ROUNDS * 128 + 32 + 32 + 8;
     assert_eq!(t.hist.total() as usize, ops.len() * per_compression);
