@@ -194,7 +194,7 @@ impl DeviceColumns {
     /// [`Self::upload`], or when a packed table is too big for one launch.
     pub fn upload_tables(tables: &[TableUpload<'_>]) -> Option<Self> {
         // `LAMBDA_VM_CARD_ROWS`: `off` is the upload below, untouched; unset
-        // is `order` (`crate::card_rows`).
+        // is `words` (`crate::card_rows`).
         if crate::card_rows::mode() != crate::card_rows::Mode::Off {
             return crate::card_rows::upload_tables(tables);
         }

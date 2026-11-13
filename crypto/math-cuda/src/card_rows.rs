@@ -1,7 +1,8 @@
 //! A group's upload under
-//! `LAMBDA_VM_CARD_ROWS` (read once). Unset is `order`; `0` or `off` is the
-//! upload as it was before (`DeviceColumns::upload_tables_today`), byte for
-//! byte and call for call. Every mode writes the same words.
+//! `LAMBDA_VM_CARD_ROWS` (read once). Unset is `words`, the default (below);
+//! `0` or `off` is the upload as it was before
+//! (`DeviceColumns::upload_tables_today`), byte for byte and call for call.
+//! Every mode writes the same words.
 //!
 //! - `order`: every copy of the group first, then every kernel, then the one
 //!   sync and the one check readback the upload already makes. Today each
@@ -11,7 +12,7 @@
 //!   table-by-table upload at about two commit periods, this order at 1.3).
 //! - `derive`: `order`, and the card keeps the CPU chunks' logs it receives
 //!   (an LRU cache of whole CPU tables, `LAMBDA_VM_CARD_ROWS_CACHE_MIB`,
-//!   default 1024, each entry promised to the backend's ledger), fills a CPU
+//!   default 768, each entry promised to the backend's ledger), fills a CPU
 //!   table it already holds without copying its logs again, and derives a
 //!   LOAD or STORE table from the cached logs (`derive_rows_from_cache`,
 //!   `kernels/card_rows.cu`) instead of copying its records: the table's rows'
@@ -30,6 +31,14 @@
 //!   whose register was last touched by an ECALL or before its CPU table, and
 //!   a row whose cycle's logs the card does not hold. A table more than half
 //!   of whose rows would cross whole goes up as records.
+//! - `words` (the default): `derive`, and MEMW_R built on the card from the
+//!   8-byte words the walk writes in place of the 32-byte rows
+//!   (`prover`'s `register_words`), with no host pass at the upload; the
+//!   rows of cycles the card will not hold are decoded on the host and sent
+//!   whole. A build that cannot write words (no record mode, no CPU logs
+//!   kept) sends MEMW_R as rows, and LOAD and STORE are still derived.
+//!   Measured on whole blocks against `order`: −0.42 s on a median one,
+//!   −1.66 s on a large one (the trace built −0.28 / −0.62 s).
 //!
 //! Nothing the verifier reads moves: the same tables, the same words. A row
 //! whose cycle is not held, or whose log is not that family's op, is counted
@@ -62,7 +71,7 @@ const ROW_BLOCK: u32 = 256;
 pub const CARD_ROWS_ENV: &str = "LAMBDA_VM_CARD_ROWS";
 /// The cache's budget in MiB.
 pub const CARD_ROWS_CACHE_ENV: &str = "LAMBDA_VM_CARD_ROWS_CACHE_MIB";
-const DEFAULT_CACHE_MIB: u64 = 1024;
+const DEFAULT_CACHE_MIB: u64 = 768;
 
 /// What a group's upload does ([`CARD_ROWS_ENV`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,31 +79,30 @@ pub enum Mode {
     /// The upload as it was before this knob: each table's copy, then its
     /// kernel, table by table.
     Off,
-    /// Every copy, then every kernel: the default.
+    /// Every copy, then every kernel.
     Order,
     /// [`Mode::Order`], CPU logs kept on the card, LOAD and STORE derived.
     Derive,
     /// [`Mode::Derive`], and MEMW_R's register rows built on the card.
     Registers,
     /// [`Mode::Derive`], and MEMW_R's register rows built on the card from
-    /// the words the walk writes in their place (no host plan).
+    /// the words the walk writes in their place (no host plan): the default.
     Words,
 }
 
 impl Mode {
-    /// The knob's reading: unset (or empty) or `order` is [`Mode::Order`],
-    /// the default (measured on whole blocks: −0.76 s on a large one with
-    /// order, −0.96 s with derive, about 0 on a median one, never slower);
-    /// `0` or `off` is [`Mode::Off`];
-    /// `derive` or `1` is [`Mode::Derive`]; `registers` is
-    /// [`Mode::Registers`]. Anything else is refused.
+    /// The knob's reading: unset (or empty) or `words` is [`Mode::Words`],
+    /// the default (measured on whole blocks against `order`: −0.42 s on a
+    /// median one, −1.66 s on a large one); `order` is [`Mode::Order`];
+    /// `0` or `off` is [`Mode::Off`]; `derive` or `1` is [`Mode::Derive`];
+    /// `registers` is [`Mode::Registers`]. Anything else is refused.
     pub fn parse(word: Option<&str>) -> Result<Self, String> {
         match word.map(str::trim) {
-            None | Some("") | Some("order") => Ok(Self::Order),
+            None | Some("") | Some("words") => Ok(Self::Words),
+            Some("order") => Ok(Self::Order),
             Some("0") | Some("off") => Ok(Self::Off),
             Some("derive") | Some("1") => Ok(Self::Derive),
             Some("registers") => Ok(Self::Registers),
-            Some("words") => Ok(Self::Words),
             Some(other) => Err(format!(
                 "{CARD_ROWS_ENV}={other}: expected off, order, derive, registers or words"
             )),
@@ -1958,10 +1966,11 @@ mod tests {
     }
 
     #[test]
-    fn the_knob_reads_off_order_and_derive_and_refuses_the_rest() {
-        // Unset is the default, order.
-        assert_eq!(Mode::parse(None), Ok(Mode::Order));
-        assert_eq!(Mode::parse(Some("")), Ok(Mode::Order));
+    fn the_knob_reads_its_words_and_refuses_the_rest() {
+        // Unset is the default, words.
+        assert_eq!(Mode::parse(None), Ok(Mode::Words));
+        assert_eq!(Mode::parse(Some("")), Ok(Mode::Words));
+        assert_eq!(Mode::parse(Some(" words ")), Ok(Mode::Words));
         assert_eq!(Mode::parse(Some("0")), Ok(Mode::Off));
         assert_eq!(Mode::parse(Some("off")), Ok(Mode::Off));
         assert_eq!(Mode::parse(Some("order")), Ok(Mode::Order));
@@ -1973,6 +1982,8 @@ mod tests {
         assert!(Mode::parse(Some("2")).is_err());
         assert!(Mode::Registers.derives() && Mode::Derive.derives());
         assert!(!Mode::Order.derives() && !Mode::Off.derives());
+        assert!(Mode::Words.derives());
+        assert_eq!(DEFAULT_CACHE_MIB, 768);
     }
 
     /// A register row at `ts` (cycle `(ts − 4) / 4`, slot `(ts − 4) % 4`)
