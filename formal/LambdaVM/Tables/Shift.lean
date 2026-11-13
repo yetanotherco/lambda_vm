@@ -512,13 +512,17 @@ theorem soundness :
     have hflagsV : (5 + input_wordInstr + 32 * input_signed + 64 * input_direction : F p).val
         = 5 + input_wordInstr.val + 32 * input_signed.val + 64 * input_direction.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    refine ⟨?_, ?_, ?_⟩
+    refine ⟨?_, ?_, ?_, ?_⟩
     · -- not LT: 5 + w + 32 s + 64 d ≠ 4 + 32 s' + 64 i (mod 32)
       intro s i hs hi hflags
       exfalso; rw [hflagsV] at hflags; simp only [opselLT] at hflags; omega
     · -- not EQ
       intro i hi hflags
       exfalso; rw [hflagsV] at hflags; simp only [opselEQ] at hflags; omega
+    swap
+    · -- not MIN
+      intro hflags
+      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselMIN] at hflags; omega
     · intro w s d hw hs hd hflags
       rw [hflagsV] at hflags; simp only [opselSHIFT] at hflags
       obtain ⟨rfl, rfl, rfl⟩ : input_wordInstr.val = w ∧ input_signed.val = s ∧

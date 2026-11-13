@@ -4,6 +4,10 @@ on:
   push:
     branches: ["main"]
     paths: ["formal/**", ".github/workflows/formal.yml"]
+  # The repository merges through a queue (see `pr_main.yaml` and `gpu-tests.yml`). Without
+  # this trigger the job runs on the PR but not on the merge-group commit, so a change that
+  # only breaks the model once combined with another queued PR merges unchecked.
+  merge_group:
   pull_request:
     paths: ["formal/**", ".github/workflows/formal.yml"]
 
@@ -47,6 +51,42 @@ jobs:
 
       - name: Build
         run: lake build
+
+      # `LambdaVM/Axioms.lean` is a list of `#print axioms` lines, one per modelled circuit and
+      # per ensemble theorem. It is not part of the library, so `lake build` does not see it.
+      - name: No sorry, no axioms beyond the standard three
+        run: |
+          set -euo pipefail
+          report="${RUNNER_TEMP:-/tmp}/axioms.txt"
+          # `-Dformat.width` keeps each report on one line: the `sed` below needs the opening
+          # `[` and the closing `]` of an axiom list on the same line to see it at all.
+          lake env lean -Dformat.width=1000 LambdaVM/Axioms.lean | tee "$report"
+
+          # One report per `#print axioms` line: a renamed or deleted declaration fails here
+          # instead of quietly dropping out of the check.
+          expected=$(grep -c '^#print axioms ' LambdaVM/Axioms.lean || true)
+          got=$(grep -c 'depends on axioms\|does not depend on any axioms' "$report" || true)
+          if [ "$expected" -ne "$got" ]; then
+            echo "::error::expected $expected axiom reports, got $got"
+            exit 1
+          fi
+
+          if grep -q 'sorryAx' "$report"; then
+            echo "::error::a modelled circuit or ensemble theorem depends on sorry"
+            exit 1
+          fi
+
+          unexpected=$(
+            sed -n 's/.*depends on axioms: \[\(.*\)\]/\1/p' "$report" \
+              | tr ',' '\n' | sed 's/[[:space:]]//g; /^$/d' | sort -u \
+              | grep -vxF -e propext -e Classical.choice -e Quot.sound || true
+          )
+          if [ -n "$unexpected" ]; then
+            echo "::error::axioms outside propext, Classical.choice, Quot.sound: $(echo $unexpected)"
+            exit 1
+          fi
+
+          echo "$expected declarations checked, no sorry, no extra axioms"
 
       - name: Export is up to date
         run: |
