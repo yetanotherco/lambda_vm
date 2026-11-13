@@ -250,6 +250,10 @@ pub struct WhirTreeConfig {
     /// `LAMBDA_VM_BLOCK_COMPRESS_WIRE` ([`super::compress::compress_wire_setting`];
     /// default off): ship the compressed file in the compact wire encoding.
     pub compress_wire: super::wire::WireFormat,
+    /// `LAMBDA_VM_BLOCK_COMPRESS2` ([`super::compress::compress2_setting`];
+    /// default off): after C1, a second compression proof C2 that verifies
+    /// C1 in-guest, at this query grind; what ships then.
+    pub compress2: Option<u8>,
 }
 
 /// A count knob: unset is `None`; anything but a count is an error.
@@ -509,6 +513,7 @@ impl WhirTreeConfig {
         let compress = super::compress::compress_from_env()?;
         let compress_levers = super::compress::compress_levers_from_env(compress)?;
         let compress_wire = super::compress::compress_wire_from_env(compress)?;
+        let compress2 = super::compress::compress2_from_env(compress, compress_levers)?;
         let node_pipe = count_knob("W3_NODE_PIPE")?
             .is_none_or(|v| v != 0)
             .then(|| count_knob("W3_EMIT_THREADS").map(|t| t.unwrap_or(4).max(1)))
@@ -534,6 +539,7 @@ impl WhirTreeConfig {
             compress,
             compress_levers,
             compress_wire,
+            compress2,
         })
     }
 
@@ -1955,6 +1961,21 @@ pub struct CompressedTop {
     /// The encoding the file ships in.
     pub wire: super::wire::WireFormat,
     pub proof: super::wlfm::WlfmProof,
+    /// C2 over C1 (`LAMBDA_VM_BLOCK_COMPRESS2`): what ships then.
+    pub c2: Option<Compressed2Top>,
+}
+
+/// C2's program and build on its own thread: the build, its seconds, and
+/// when it was done (seconds since the tree started).
+type C2BuildHandle =
+    std::thread::JoinHandle<Result<(super::compress::CompressBuild, f64, f64), String>>;
+
+/// The second compression step's proof (C2) and the query grind it was
+/// proved at; its rate and levers are [`super::compress::COMPRESS2_RATE`] and
+/// [`super::compress::compress2_levers`].
+pub struct Compressed2Top {
+    pub grind: u8,
+    pub proof: super::wlfm::WlfmProof,
 }
 
 /// The early leaf's readout: its index, its arena (for the harness's check
@@ -2527,9 +2548,14 @@ pub fn prove_whir_block_tree(
     // top's prove; C1 itself proves after the top.
     let handoff = cfg.compress.map(|_| TopHandoff::new());
     let c1_built: Published<(super::compress::CompressBuild, f64, f64)> = Published::new();
+    // `LAMBDA_VM_BLOCK_COMPRESS2`: C2's program and build on a thread of their
+    // own, started the moment C1's build is done (C2's program holds C1's
+    // artifacts) and outliving the tree's scope, so it runs beside the top's
+    // prove and C1's; C2 proves after C1.
+    let c2_build: std::sync::Mutex<Option<C2BuildHandle>> = std::sync::Mutex::new(None);
     let (timings, proofs, early_out, each_from) = std::thread::scope(|scope| {
         if let (Some(rate), Some(handoff)) = (cfg.compress, handoff.as_ref()) {
-            let (plan, c1_built) = (&plan, &c1_built);
+            let (plan, c1_built, c2_build) = (&plan, &c1_built, &c2_build);
             scope.spawn(move || {
                 let _fail = FailEmpty(std::slice::from_ref(c1_built), "the C1 builder stopped");
                 let built = (|| -> Result<_, String> {
@@ -2545,7 +2571,22 @@ pub fn prove_whir_block_tree(
                     )?;
                     Ok((c, tb.elapsed().as_secs_f64(), t.elapsed().as_secs_f64()))
                 })();
+                let c1_artifacts = built
+                    .as_ref()
+                    .ok()
+                    .map(|(c, _, _)| c.build.artifacts.clone());
                 let _ = c1_built.0.set(built);
+                if let (Some(grind), Some(c1)) = (cfg.compress2, c1_artifacts) {
+                    let layout = plan.top_layout();
+                    let handle = std::thread::spawn(move || {
+                        let tb = std::time::Instant::now();
+                        super::compress::build_compress2(&c1, layout, grind)
+                            .map(|c| (c, tb.elapsed().as_secs_f64(), t.elapsed().as_secs_f64()))
+                    });
+                    if let Ok(mut slot) = c2_build.lock() {
+                        *slot = Some(handle);
+                    }
+                }
             });
         }
         prove_tree_pipelined(
@@ -2610,11 +2651,57 @@ pub fn prove_whir_block_tree(
                 a.table_num_vars,
                 (built_at - tree).max(0.0),
             ));
+            // C2 after C1, on the clock: its build (begun on C1's builder
+            // thread) waited for, then executed over C1's proof and proved.
+            let c2 = match cfg.compress2 {
+                Some(grind) => {
+                    let c1_done = t.elapsed().as_secs_f64();
+                    let (c2b, build2_secs, built2_at) = c2_build
+                        .into_inner()
+                        .map_err(|_| "the C2 build's slot is poisoned")?
+                        .ok_or("C1's builder started no C2 build")?
+                        .join()
+                        .map_err(|_| "the C2 builder panicked")?
+                        .map_err(|e| format!("C2's program and build: {e}"))?;
+                    let tc = std::time::Instant::now();
+                    let c2 = super::compress::prove_compress2(
+                        &c2b,
+                        &c.build.artifacts,
+                        plan.top_layout(),
+                        &c1,
+                    )
+                    .map_err(|e| format!("C2 proves: {e}"))?;
+                    let c2_secs = tc.elapsed().as_secs_f64();
+                    let split2 =
+                        super::proof::take_prove_split().map_or("no split".to_string(), |p| {
+                            format!(
+                                "execute {:.2} fill {:.2} prove {:.2}",
+                                p.execute, p.fill, p.multi_prove
+                            )
+                        });
+                    let a2 = &c2b.build.artifacts;
+                    sink.line(&format!(
+                        "W3 COMPRESS2: C2 at blowup {} · Q {} · grind {} · binding {:?} · final {:?} · fold {} · groups {:?} · tables 2^{:?} · built in {build2_secs:.2}s (done@{built2_at:.2}, C1 proved@{c1_done:.2}, waited {:.2}s) · C2 {c2_secs:.2}s after C1 ({split2})",
+                        a2.rate.factor(),
+                        a2.config.num_queries,
+                        grind,
+                        a2.prep,
+                        a2.final_poly,
+                        a2.config.log_folding,
+                        a2.sizes,
+                        a2.table_num_vars,
+                        (built2_at - c1_done).max(0.0),
+                    ));
+                    Some(Compressed2Top { grind, proof: c2 })
+                }
+                None => None,
+            };
             Some(CompressedTop {
                 rate,
                 levers: cfg.compress_levers,
                 wire: cfg.compress_wire,
                 proof: c1,
+                c2,
             })
         }
         _ => None,
@@ -2977,6 +3064,95 @@ fn is_rkyv_compressed(tag: u8) -> bool {
     (PIPELINE_WHIR_COMPRESSED..=PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL).contains(&tag)
         || (PIPELINE_WHIR_COMPRESSED_FOLDS..=PIPELINE_WHIR_COMPRESSED_FOLDS_EVALUATED)
             .contains(&tag)
+        || tag == PIPELINE_WHIR_COMPRESSED2_G22
+        || tag == PIPELINE_WHIR_COMPRESSED2_G26
+}
+
+/// The twice-compressed tree (`LAMBDA_VM_BLOCK_COMPRESS2`): the file carries
+/// C2's proof over C1 ([`super::compress::build_compress2`]) at a 22-bit query
+/// grind as rkyv (20), compact (21) or dedup (22); 23–25 are the same at 26
+/// bits. Each is its own verifier's ([`Compressed2Format`]).
+pub const PIPELINE_WHIR_COMPRESSED2_G22: u8 = 20;
+pub const PIPELINE_WHIR_COMPRESSED2_G22_COMPACT: u8 = 21;
+pub const PIPELINE_WHIR_COMPRESSED2_G22_DEDUP: u8 = 22;
+pub const PIPELINE_WHIR_COMPRESSED2_G26: u8 = 23;
+pub const PIPELINE_WHIR_COMPRESSED2_G26_COMPACT: u8 = 24;
+pub const PIPELINE_WHIR_COMPRESSED2_G26_DEDUP: u8 = 25;
+
+/// A twice-compressed file's format as a verifier names it: C2's query grind
+/// and the file's encoding. A constant of the caller, never the file's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Compressed2Format {
+    pub grind: u8,
+    pub wire: super::wire::WireFormat,
+}
+
+impl Compressed2Format {
+    /// The tag a file of this format carries; refused for a grind C2 is not
+    /// built at.
+    pub fn tag(&self) -> Result<u8, String> {
+        use super::wire::WireFormat;
+        let rkyv = match self.grind {
+            22 => PIPELINE_WHIR_COMPRESSED2_G22,
+            26 => PIPELINE_WHIR_COMPRESSED2_G26,
+            other => return Err(format!("no twice-compressed verifier takes grind {other}")),
+        };
+        Ok(rkyv
+            + match self.wire {
+                WireFormat::Rkyv => 0,
+                WireFormat::Compact => 1,
+                WireFormat::Dedup => 2,
+            })
+    }
+}
+
+/// The six twice-compressed formats (tags 20–25).
+pub const COMPRESSED2_G22: Compressed2Format = Compressed2Format {
+    grind: 22,
+    wire: super::wire::WireFormat::Rkyv,
+};
+pub const COMPRESSED2_G22_COMPACT: Compressed2Format = Compressed2Format {
+    grind: 22,
+    wire: super::wire::WireFormat::Compact,
+};
+pub const COMPRESSED2_G22_DEDUP: Compressed2Format = Compressed2Format {
+    grind: 22,
+    wire: super::wire::WireFormat::Dedup,
+};
+pub const COMPRESSED2_G26: Compressed2Format = Compressed2Format {
+    grind: 26,
+    wire: super::wire::WireFormat::Rkyv,
+};
+pub const COMPRESSED2_G26_COMPACT: Compressed2Format = Compressed2Format {
+    grind: 26,
+    wire: super::wire::WireFormat::Compact,
+};
+pub const COMPRESSED2_G26_DEDUP: Compressed2Format = Compressed2Format {
+    grind: 26,
+    wire: super::wire::WireFormat::Dedup,
+};
+
+/// ★ A twice-compressed W3 block file verified as `format` — the CALLER'S
+/// constant, never the file's: the file's tag must be `format`'s before
+/// anything else is read; then the plan is derived from the trusted ELF and
+/// the claimed statement under the pinned presets, C1 over the derived top at
+/// [`super::compress::COMPRESS_RATE`] with today's levers, C2 over C1 at
+/// [`super::compress::COMPRESS2_RATE`] and `format`'s grind, and the file's C2
+/// proof checked against it and to claim the block.
+pub fn verify_whir_block_compressed2_as(
+    elf_bytes: &[u8],
+    proof: &WhirBlockCompressedProof,
+    format: Compressed2Format,
+) -> Result<(), String> {
+    require_compressed_tag(proof, format.tag()?)?;
+    let presets = super::whir_block::pinned_verifier_presets(BlockFormat::pinned().group);
+    let plan = super::whir_block::verifier_plan(elf_bytes, proof.statement(), &presets)?;
+    super::compress::verify_compressed2(
+        &plan,
+        &presets.wrap_options,
+        format.grind,
+        &proof.compressed,
+    )
 }
 
 /// The dedup twins (`LAMBDA_VM_BLOCK_COMPRESS_WIRE=dedup`): tags 14–17 are
@@ -2993,6 +3169,8 @@ pub const PIPELINE_WHIR_COMPRESSED_DEDUP_FOLDS_EVALUATED: u8 = 19;
 /// Whether `tag` is a dedup compressed file's.
 fn is_dedup_compressed(tag: u8) -> bool {
     (PIPELINE_WHIR_COMPRESSED_DEDUP..=PIPELINE_WHIR_COMPRESSED_DEDUP_FOLDS_EVALUATED).contains(&tag)
+        || tag == PIPELINE_WHIR_COMPRESSED2_G22_DEDUP
+        || tag == PIPELINE_WHIR_COMPRESSED2_G26_DEDUP
 }
 
 /// The dedup twin of an rkyv compressed file's tag.
@@ -3003,6 +3181,8 @@ fn dedup_twin(tag: u8) -> Option<u8> {
         .contains(&tag)
     {
         Some(tag + (PIPELINE_WHIR_COMPRESSED_DEDUP_FOLDS - PIPELINE_WHIR_COMPRESSED_FOLDS))
+    } else if tag == PIPELINE_WHIR_COMPRESSED2_G22 || tag == PIPELINE_WHIR_COMPRESSED2_G26 {
+        Some(tag + 2)
     } else {
         None
     }
@@ -3015,6 +3195,8 @@ fn is_compact_compressed(tag: u8) -> bool {
         || (PIPELINE_WHIR_COMPRESSED_COMPACT_FOLDS
             ..=PIPELINE_WHIR_COMPRESSED_COMPACT_FOLDS_EVALUATED)
             .contains(&tag)
+        || tag == PIPELINE_WHIR_COMPRESSED2_G22_COMPACT
+        || tag == PIPELINE_WHIR_COMPRESSED2_G26_COMPACT
 }
 
 /// The compact twin of an rkyv compressed file's tag.
@@ -3025,6 +3207,8 @@ fn compact_twin(tag: u8) -> Option<u8> {
         .contains(&tag)
     {
         Some(tag + (PIPELINE_WHIR_COMPRESSED_COMPACT_FOLDS - PIPELINE_WHIR_COMPRESSED_FOLDS))
+    } else if tag == PIPELINE_WHIR_COMPRESSED2_G22 || tag == PIPELINE_WHIR_COMPRESSED2_G26 {
+        Some(tag + 1)
     } else {
         None
     }
@@ -3152,6 +3336,31 @@ impl WhirBlockCompressedProof {
             groups: statement.groups,
             compressed: c1,
         }
+    }
+
+    /// The file for C2's proof (over C1) at `grind`, tagged for that grind's
+    /// rkyv verifier ([`Compressed2Format`]).
+    pub fn for_c2(
+        statement: block_whir::OwnedBlockStatement,
+        c2: super::wlfm::WlfmProof,
+        grind: u8,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            magic: PROOF_MAGIC,
+            version: PROOF_VERSION,
+            pipeline: Compressed2Format {
+                grind,
+                wire: super::wire::WireFormat::Rkyv,
+            }
+            .tag()?,
+            table_num_vars: statement.table_num_vars,
+            runtime_page_ranges: statement.runtime_page_ranges,
+            table_counts: statement.table_counts,
+            public_output: statement.public_output,
+            num_private_input_pages: statement.num_private_input_pages,
+            groups: statement.groups,
+            compressed: c2,
+        })
     }
 
     /// The file for C1's proof under `levers`, tagged for that setting's
@@ -4210,6 +4419,175 @@ mod tests {
         );
     }
 
+    /// The twice-compressed files (tags 20–25): each format's tag is its own
+    /// and none of C1's; each reads back by its encoding's reader only; each
+    /// C2 verifier refuses every other twice-compressed file and C1's files up
+    /// front (no ELF needed); C1's verifiers refuse C2's files; a grind C2 is
+    /// not built at has no tag.
+    #[test]
+    fn each_twice_compressed_verifier_refuses_every_other_tag_up_front() {
+        use super::super::wire::WireFormat;
+        use super::super::wlfm::{WlfmLevers, WlfmPrep};
+        let c1 = synthetic_compressed();
+        let formats = [
+            (COMPRESSED2_G22, PIPELINE_WHIR_COMPRESSED2_G22),
+            (
+                COMPRESSED2_G22_COMPACT,
+                PIPELINE_WHIR_COMPRESSED2_G22_COMPACT,
+            ),
+            (COMPRESSED2_G22_DEDUP, PIPELINE_WHIR_COMPRESSED2_G22_DEDUP),
+            (COMPRESSED2_G26, PIPELINE_WHIR_COMPRESSED2_G26),
+            (
+                COMPRESSED2_G26_COMPACT,
+                PIPELINE_WHIR_COMPRESSED2_G26_COMPACT,
+            ),
+            (COMPRESSED2_G26_DEDUP, PIPELINE_WHIR_COMPRESSED2_G26_DEDUP),
+        ];
+        let mut files = Vec::new();
+        for (format, tag) in formats {
+            assert_eq!(format.tag(), Ok(tag));
+            assert!((20..=25).contains(&tag));
+            let f = WhirBlockCompressedProof::for_c2(
+                c1.statement().to_owned(),
+                c1.compressed.clone(),
+                format.grind,
+            )
+            .expect("a built grind");
+            let f = if format.wire == WireFormat::Rkyv {
+                let bytes = f.to_bytes().expect("serializes");
+                assert!(WhirBlockCompressedProof::from_compact_bytes(&bytes).is_err());
+                WhirBlockCompressedProof::from_bytes(&bytes).expect("reads back")
+            } else {
+                let bytes = f.to_wire_bytes(format.wire).expect("a compact file");
+                assert!(WhirBlockCompressedProof::from_bytes(&bytes).is_err());
+                WhirBlockCompressedProof::from_compact_bytes(&bytes).expect("reads back")
+            };
+            assert_eq!(f.pipeline(), tag);
+            files.push((format, f));
+        }
+        // C1's files, the same proof under C1's tags.
+        let c1_files: Vec<WhirBlockCompressedProof> = [
+            WlfmLevers::DEFAULT,
+            WlfmLevers::with_prep(WlfmPrep::Evaluated),
+            super::super::compress::folds_levers(WlfmPrep::Evaluated),
+        ]
+        .into_iter()
+        .map(|levers| {
+            WhirBlockCompressedProof::for_levers(
+                c1.statement().to_owned(),
+                c1.compressed.clone(),
+                levers,
+            )
+            .expect("a tagged setting")
+        })
+        .collect();
+        for (format, _) in &files {
+            let ours = format.tag().unwrap();
+            for (other, f) in &files {
+                let e = verify_whir_block_compressed2_as(&[], f, *format).expect_err("no ELF");
+                assert_eq!(
+                    e.contains("and this verifier reads pipeline"),
+                    other != format,
+                    "{e}"
+                );
+            }
+            for f in &c1_files {
+                let e = verify_whir_block_compressed2_as(&[], f, *format).expect_err("no ELF");
+                assert!(
+                    e.contains(&format!(
+                        "the file holds pipeline {}, and this verifier reads pipeline {ours}",
+                        f.pipeline()
+                    )),
+                    "{e}"
+                );
+            }
+        }
+        for (_, f) in &files {
+            for verify in [
+                verify_whir_block_compressed_proof as fn(&[u8], &WhirBlockCompressedProof) -> _,
+                verify_whir_block_compressed_evaluated_proof,
+            ] {
+                let e = verify(&[], f).expect_err("no ELF");
+                assert!(e.contains("and this verifier reads pipeline"), "{e}");
+            }
+            let e = verify_whir_block_compressed_as(&[], f, COMPRESSED_DEDUP_FOLDS_EVALUATED)
+                .expect_err("no ELF");
+            assert!(e.contains("and this verifier reads pipeline"), "{e}");
+        }
+        for grind in [18u8, 20, 24] {
+            assert!(
+                Compressed2Format {
+                    grind,
+                    wire: WireFormat::Rkyv
+                }
+                .tag()
+                .is_err()
+            );
+            assert!(
+                WhirBlockCompressedProof::for_c2(
+                    c1.statement().to_owned(),
+                    c1.compressed.clone(),
+                    grind
+                )
+                .is_err()
+            );
+        }
+    }
+
+    /// The twice-compressed verifier takes C2's rate, levers and C1's from
+    /// the code: its body checks the caller's tag first and reads neither the
+    /// environment nor the file for a format; `verify_compressed2` derives C1
+    /// at today's levers and C2 at its rate.
+    #[test]
+    fn the_twice_compressed_verifier_pins_its_format() {
+        let src = include_str!("whir_block_tree.rs");
+        let at = src
+            .find("\npub fn verify_whir_block_compressed2_as(")
+            .expect("the twice-compressed verifier");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
+        assert!(
+            body.contains("require_compressed_tag(proof, format.tag()?)?"),
+            "{body}"
+        );
+        for forbidden in [
+            "env::var",
+            "compress2_from_env",
+            "ZfFormat::global",
+            "proof.pipeline",
+            ".levers",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the verifier reads `{forbidden}`"
+            );
+        }
+        let src = include_str!("compress.rs");
+        for (name, needles) in [
+            (
+                "\npub fn compressed2_artifacts(",
+                &[
+                    "COMPRESS_RATE, WlfmLevers::DEFAULT",
+                    "build_compress2_with(&c1, plan.top_layout(), grind, true)",
+                ][..],
+            ),
+            (
+                "\nfn build_compress2_with(",
+                &[
+                    "COMPRESS2_RATE",
+                    "compress2_levers(grind)",
+                    "COMPRESS2_GRINDS",
+                ][..],
+            ),
+        ] {
+            let at = src.find(name).expect(name);
+            let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
+            for needle in needles {
+                assert!(body.contains(needle), "{name}: {body}");
+            }
+            assert!(!body.contains("env::var"), "{name} reads the environment");
+        }
+    }
+
     /// The compressed block's verifier takes its rate from the code: its body
     /// names [`super::super::compress::COMPRESS_RATE`] and reads neither the
     /// environment nor the file for a format.
@@ -4392,6 +4770,7 @@ mod tests {
             compress: None,
             compress_levers: super::super::wlfm::WlfmLevers::DEFAULT,
             compress_wire: super::super::wire::WireFormat::Rkyv,
+            compress2: None,
         };
         assert!(production.at_presets());
         let off = |f: fn(&mut WhirTreeConfig)| {

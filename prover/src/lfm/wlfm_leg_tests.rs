@@ -154,3 +154,38 @@ fn the_leg_refuses_a_child_only_the_host_can_check() {
         assert!(wlfm_leg_program(&child).is_err(), "{levers:?}");
     }
 }
+
+/// ★ The second step in small: the leg over a blowup-16 child, proved by the
+/// W-LFM prover at blowup 64 under C2's levers (evaluated columns, the
+/// byte-minimising schedule, a 22-bit grind), verifies on the host and
+/// publishes the child's words; a tampered child proof has no execution, so
+/// no proof.
+#[test]
+fn the_leg_proved_at_blowup_64_under_the_second_steps_levers_verifies() {
+    use super::wlfm::{build_wlfm_under, prove_wlfm, verify_wlfm};
+    use crate::hash_pin::{BlockFamily, ProofFamily};
+    let _small = test_format::set(Some(12));
+    let (_, proof, leg, arena) = honest_child(WlfmRate::Sixteen);
+    let hasher = leg.hasher(<BlockFamily as ProofFamily>::SOCKET);
+    let c2 = build_wlfm_under(
+        &leg,
+        hasher,
+        WlfmRate::SixtyFour,
+        super::compress::compress2_levers(22),
+        false,
+    )
+    .unwrap_or_else(|e| panic!("the second step builds: {e}"));
+    assert_eq!(c2.artifacts.config.log_blowup, 6);
+    assert_eq!(c2.artifacts.prep, WlfmPrep::Evaluated);
+    let c2_proof = prove_wlfm(&leg, &c2, std::slice::from_ref(&arena))
+        .unwrap_or_else(|e| panic!("the second step proves: {e}"));
+    assert_eq!(c2_proof.public_words, proof.public_words);
+    verify_wlfm(&c2.artifacts, &c2_proof, &c2_proof.public_words)
+        .unwrap_or_else(|e| panic!("the second step verifies: {e}"));
+    let mut tampered = arena.clone();
+    tampered[proof.public_words.len()][0] += FE::one();
+    assert!(
+        prove_wlfm(&leg, &c2, &[tampered]).is_err(),
+        "a tampered child has no execution"
+    );
+}
