@@ -134,6 +134,38 @@ pub fn compress_final_setting(value: Option<&str>) -> Result<FinalPoly, String> 
     }
 }
 
+/// The knob that ships the compressed file in the compact wire encoding
+/// ([`super::wire`]): C1's proof without archive headers.
+pub const COMPRESS_WIRE_ENV: &str = "LAMBDA_VM_BLOCK_COMPRESS_WIRE";
+
+/// [`COMPRESS_WIRE_ENV`]'s value: unset, `0` or `off` is the rkyv file (the
+/// default); `1`, `on` or `compact` is the compact file. Anything else is
+/// refused.
+pub fn compress_wire_setting(value: Option<&str>) -> Result<bool, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(false),
+        Some(v) => match v.as_str() {
+            "" | "0" | "off" => Ok(false),
+            "1" | "on" | "compact" => Ok(true),
+            other => Err(format!(
+                "{COMPRESS_WIRE_ENV}={other:?}: expected off, 0, 1, on or compact"
+            )),
+        },
+    }
+}
+
+/// [`compress_wire_setting`] of the process's environment, refused when it is
+/// set with no compression step to ship.
+pub fn compress_wire_from_env(compress: Option<WlfmRate>) -> Result<bool, String> {
+    let compact = compress_wire_setting(std::env::var(COMPRESS_WIRE_ENV).ok().as_deref())?;
+    if compress.is_none() && compact {
+        return Err(format!(
+            "{COMPRESS_WIRE_ENV} encodes C1's file, and {COMPRESS_ENV} adds no C1"
+        ));
+    }
+    Ok(compact)
+}
+
 /// C1's format levers from the process's environment
 /// ([`compress_prep_setting`], [`compress_final_setting`]), refused when one
 /// is set with no compression step to apply it to.
@@ -336,5 +368,20 @@ mod tests {
             FinalPoly::vars(COMPRESS_FINAL_VARS),
             Some(FinalPoly::Vars(6))
         );
+    }
+
+    /// The compact-file knob is off unless set and refuses nonsense.
+    #[test]
+    fn the_compress_wire_knob_is_off_unless_set_and_refuses_nonsense() {
+        assert_eq!(compress_wire_setting(None), Ok(false));
+        for off in ["", "0", "off", " OFF "] {
+            assert_eq!(compress_wire_setting(Some(off)), Ok(false));
+        }
+        for on in ["1", "on", "compact", " Compact "] {
+            assert_eq!(compress_wire_setting(Some(on)), Ok(true));
+        }
+        for bad in ["2", "rkyv", "yes"] {
+            assert!(compress_wire_setting(Some(bad)).is_err(), "{bad:?}");
+        }
     }
 }

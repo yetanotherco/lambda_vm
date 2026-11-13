@@ -98,6 +98,7 @@ pub mod whir_transcript;
 pub mod whir_transcript_kats;
 /// The block tree's LFM programs proved by the block's own WHIR prover.
 #[cfg(feature = "parallel")]
+pub mod wire;
 pub mod wlfm;
 pub mod word;
 
