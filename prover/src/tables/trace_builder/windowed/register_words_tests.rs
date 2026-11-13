@@ -390,3 +390,37 @@ fn the_real_blocks_words_decode_to_the_walks_rows() {
     );
     assert!(as_words > 0 && decoded > 0, "nothing held as words");
 }
+
+/// The card finds a words table's unheld rows by binary search over their
+/// cycles (`math_cuda::card_rows`): a chunk's rows must be in cycle order.
+#[test]
+fn a_words_chunks_rows_are_in_cycle_order() {
+    let max_rows = MaxRowsConfig::small();
+    let mut out_of_order = Vec::new();
+    for name in PROGRAMS {
+        let (program, _) = run(name);
+        for window in [7usize, 33] {
+            for (k, records) in memw_r_chunks(&program, &[], &max_rows, window, true)
+                .iter()
+                .enumerate()
+            {
+                let multilinear::records::RecordsFill::MemwR { rows } = records.fill() else {
+                    panic!("not MEMW_R");
+                };
+                let cycles: Vec<u64> = rows
+                    .iter()
+                    .flat_map(|p| p.iter())
+                    .map(|r| r.timestamp.saturating_sub(4) / 4)
+                    .collect();
+                if let Some(i) = cycles.windows(2).position(|w| w[0] > w[1]) {
+                    out_of_order.push(format!(
+                        "{name}, window {window}, chunk {k}: row {i} at cycle {} then {}",
+                        cycles[i],
+                        cycles[i + 1]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(out_of_order.is_empty(), "{out_of_order:#?}");
+}
