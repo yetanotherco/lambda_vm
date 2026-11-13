@@ -1285,19 +1285,8 @@ impl WhirBlockPlan {
 
     /// The top program's artifacts, with no proof: [`Self::derive_top_in`]
     /// with the leaves built in windows of `LAMBDA_VM_BLOCK_DERIVE_BUILDS`
-    /// ([`derive_builds_bound`]), or under `LAMBDA_VM_BLOCK_DERIVE_HOLD=level`
-    /// (the A/B control, [`derive_holds_levels`]) every program of the tree
-    /// held to the end ([`Self::programs`]), as the verifier did before.
+    /// ([`derive_builds_bound`]).
     pub fn derive_top(&self, wrap_opts: &crate::ProofOptions) -> Result<LfmArtifacts, String> {
-        if derive_holds_levels()? {
-            let mut programs = self.programs(wrap_opts)?;
-            let top = programs
-                .levels
-                .pop()
-                .and_then(|mut level| level.pop())
-                .ok_or("no top")?;
-            return Ok(top.artifacts);
-        }
         self.derive_top_in(wrap_opts, derive_builds_bound()?)
     }
 
@@ -1454,27 +1443,6 @@ pub fn derive_builds_bound() -> Result<Option<usize>, String> {
 
 /// [`derive_builds_bound`]'s knob.
 pub const DERIVE_BUILDS_ENV: &str = "LAMBDA_VM_BLOCK_DERIVE_BUILDS";
-
-/// `LAMBDA_VM_BLOCK_DERIVE_HOLD=level`: [`WhirBlockPlan::derive_top`] holds
-/// every program and its artifacts to the end ([`WhirBlockPlan::programs`]),
-/// as the verifier did before (the A/B control; #1013's knob of the same
-/// name). Unset or empty, each is dropped once its child's shape is derived.
-/// Any other value is an error.
-pub fn derive_holds_levels() -> Result<bool, String> {
-    parse_derive_hold(std::env::var(DERIVE_HOLD_ENV).ok().as_deref())
-}
-
-/// [`derive_holds_levels`]' knob.
-pub const DERIVE_HOLD_ENV: &str = "LAMBDA_VM_BLOCK_DERIVE_HOLD";
-
-/// A value of [`DERIVE_HOLD_ENV`].
-pub fn parse_derive_hold(value: Option<&str>) -> Result<bool, String> {
-    match value.map(str::trim) {
-        None | Some("") => Ok(false),
-        Some("level") => Ok(true),
-        Some(v) => Err(format!("{DERIVE_HOLD_ENV} must be `level`, got `{v}`")),
-    }
-}
 
 /// A value of [`DERIVE_BUILDS_ENV`]: unset or empty is the whole level.
 pub fn parse_derive_builds(value: Option<&str>) -> Result<Option<usize>, String> {

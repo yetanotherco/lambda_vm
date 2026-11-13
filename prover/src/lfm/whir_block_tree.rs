@@ -152,21 +152,6 @@ pub fn base_line(base: &stark::proof::options::BaseFormat) -> String {
     )
 }
 
-/// Phase A's two knobs beside the finish, as the run read them:
-/// `LAMBDA_VM_KR_PACKED_WAVE` (KECCAK_RND chunks written packed at once) and
-/// `LAMBDA_VM_BLOCK_COMMIT_OFF_POOL` (the committer's pairs off the global
-/// pool).
-pub fn finish_idle_line() -> String {
-    let wave = match crate::tables::trace_builder::kr_packed_wave() {
-        usize::MAX => "all".to_string(),
-        n => n.to_string(),
-    };
-    format!(
-        "BLOCK FINISH IDLE: KECCAK_RND packed wave {wave} · commit pairs off the pool {}",
-        stark::multilinear_block::commit_pairs_off_pool()
-    )
-}
-
 // ================================ the knobs ===============================
 
 /// Every knob the W3 block reads, once.
@@ -474,16 +459,6 @@ impl WhirTreeConfig {
             }
             Err(_) => {}
         }
-        // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
-        // (production drops them).
-        match std::env::var("BLOCK_WHIR_DROP_OPS")
-            .as_deref()
-            .map(str::trim)
-        {
-            Ok("0") => options.drop_streamed_ops = false,
-            Ok("1") => options.drop_streamed_ops = true,
-            _ => {}
-        }
         // `BLOCK_WHIR_NARROW=wide|card|host` (production card): how phase A holds
         // each group's columns once committed.
         if let Some(narrow) = block_whir::narrow_from_env() {
@@ -492,22 +467,9 @@ impl WhirTreeConfig {
         // `BLOCK_WHIR_KECCAK_LOG2=k`, `BLOCK_WHIR_ECSM_LOG2=k`: force a KECCAK or
         // ECSM split (production 2^18 / 2^17).
         block_whir::chunk_cuts_from_env(&mut options);
-        // `BLOCK_WHIR_WINDOW_LOG2=20` (production): the streamed prove's window;
-        // any other value is refused (it would move the groups).
-        if let Some(log2) = block_whir::window_log2_from_env() {
-            options.window_log2 = Some(log2);
-        }
-        // `BLOCK_WHIR_UPLOAD_AHEAD=0|1` (production 1): phase A puts each group's
-        // columns on the card beside the previous group's commit.
-        if let Some(ahead) = block_whir::upload_ahead_from_env() {
-            options.upload_ahead = ahead;
-        }
-        // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 4096),
-        // `BLOCK_WHIR_REST_BUILD=<MiB>` (production 2048),
-        // `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` and `BLOCK_WHIR_PACK_FINISHED=0|1`
-        // (production 1): the rest's gate (its waves where it is laid out in
-        // waves) and the bytes it builds at once, KECCAK_RND built as its
-        // tables, the finish's tables packed as they are built.
+        // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 4096) and
+        // `BLOCK_WHIR_REST_BUILD=<MiB>` (production 2048): the rest's gate (its
+        // waves where it is laid out in waves) and the bytes it builds at once.
         block_whir::rest_layout_from_env(&mut options);
         let super::compress::CompressPlan {
             rate: compress,
@@ -2054,7 +2016,6 @@ pub fn prove_whir_block_tree(
     sink.line(&format!("W3 ARGUE: {argue:?}"));
     sink.line(&format!("W3 GROUP OPENING: {:?}", format.group));
     sink.line(&format!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead));
-    sink.line(&finish_idle_line());
     sink.line(&format!(
         "BLOCK REST LAYOUT CONFIG: {} · KECCAK_RND built as its tables {} · finish packed {} · building at most {}",
         block_whir::rest_layout_label(options, true),

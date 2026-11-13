@@ -644,7 +644,7 @@ fn the_cards_decode_rows_find_the_hosts_rows() {
 
 /// ★ A chunk held as records parks and drops like any chunk: the regeneration
 /// recorder gives it a recipe and a rank, its block index. With records kept
-/// (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`) it has neither: the recorder keeps its
+/// (`Deviations::records_keep`) it has neither: the recorder keeps its
 /// place in the hand-out, so every other chunk's rank is still its block
 /// index, but names no chunk there, so no regenerator drops it or waits on its
 /// fate.

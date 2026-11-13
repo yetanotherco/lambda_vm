@@ -1622,47 +1622,12 @@ impl WalkLean {
         lookups: true,
         route: true,
     };
+    #[cfg(test)]
     pub(crate) const NONE: Self = Self {
         memory: false,
         lookups: false,
         route: false,
     };
-
-    /// `LAMBDA_VM_WALK_LEAN`: unset or `1` every part, `0` none, or a comma list
-    /// of `memory`, `lookups`, `route` (`decode` is accepted and always on).
-    /// Read once; any other value is refused.
-    pub(crate) fn from_env() -> Result<Self, Error> {
-        static LEAN: std::sync::OnceLock<Result<WalkLean, String>> = std::sync::OnceLock::new();
-        LEAN.get_or_init(|| match std::env::var("LAMBDA_VM_WALK_LEAN") {
-            Err(_) => Ok(Self::ALL),
-            Ok(v) => Self::parse(&v).ok_or_else(|| {
-                format!(
-                    "LAMBDA_VM_WALK_LEAN={v}: 1, 0, or a comma list of decode, memory, lookups, route"
-                )
-            }),
-        })
-        .clone()
-        .map_err(Error::Prover)
-    }
-
-    fn parse(v: &str) -> Option<Self> {
-        match v.trim() {
-            "1" => return Some(Self::ALL),
-            "0" => return Some(Self::NONE),
-            _ => {}
-        }
-        let mut lean = Self::NONE;
-        for part in v.split(',').map(str::trim) {
-            match part {
-                "decode" => {}
-                "memory" => lean.memory = true,
-                "lookups" => lean.lookups = true,
-                "route" => lean.route = true,
-                _ => return None,
-            }
-        }
-        Some(lean)
-    }
 }
 
 // =============================================================================
@@ -3908,14 +3873,6 @@ pub(crate) fn strip_blake3_side_effects() -> bool {
 #[cfg(not(test))]
 pub(crate) fn strip_blake3_side_effects() -> bool {
     false
-}
-
-/// `LAMBDA_VM_P4_SLICED`: phase 4 cuts its per-op BITWISE sources into slices of whole ops
-/// (unset or anything but `0`, #1013's c36984343), or counts each source as one collector
-/// (`0`, the path before, kept for the A/B). The multiplicities are the same either way.
-fn p4_sliced() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LAMBDA_VM_P4_SLICED").as_deref() != Ok("0"))
 }
 
 /// Phase 4's per-op BITWISE sources, cut into slices of whole ops ([`p4_slice_len`]).
@@ -6895,8 +6852,7 @@ pub struct StreamSkip {
     pub tails: bool,
     /// Phase 3 concatenates LT's ops into one list before chunking them, as it
     /// did before keeping them as the segments they come from (the A arm of
-    /// the segments, `LAMBDA_VM_BLOCK_LT_CONCAT=1` on the block). The tables
-    /// are the same.
+    /// the segments, a test's arm). The tables are the same.
     pub concat_lt: bool,
     /// The LT tables the table phase builds make the rows of the timestamp
     /// comparisons phase 3 derives from MEMW and MEMW_A ops by merging equal
@@ -6930,14 +6886,15 @@ pub struct StreamSkip {
     pub p4_direct: bool,
     /// The streamed finish counts the BITWISE lookups (phase 4) in BITWISE's
     /// own table's job, beside the rest's builds, instead of before any of
-    /// them (`LAMBDA_VM_BLOCK_P4_BESIDE=1` on the block). The tables are the
-    /// same; a finish that builds every table at once counts first, as ever.
+    /// them (on the block with BITWISE's lookups from the tables). The tables
+    /// are the same; a finish that builds every table at once counts first,
+    /// as ever.
     pub p4_beside: bool,
     /// With [`Self::p4_beside`] and the slide, the rest is handed on in AIR
     /// order but BITWISE, which goes after every other table, so the tables
-    /// that do not read the count reach the packer while it counts
-    /// (`LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1` on the block). The tables are the
-    /// same; the groups they are packed into, and so the proof's bytes, are not.
+    /// that do not read the count reach the packer while it counts (a test's
+    /// comparison arm). The tables are the same; the groups they are packed
+    /// into, and so the proof's bytes, are not.
     pub bitwise_last: bool,
     /// With the slide and only the streamed chunks' tails kept
     /// ([`Self::tails`]), BITWISE's lookups from LT's, BRANCH's and BYTEWISE's
@@ -6984,31 +6941,6 @@ pub enum CutPadding {
 }
 
 impl CutPadding {
-    /// `LAMBDA_VM_BLOCK_CUT_PADDING`: unset or `last`, [`Self::LastTable`] (the
-    /// default); `run`, [`Self::WholeRun`]. Read once; any other value is
-    /// refused. It is the rule of the tables the table phase cuts
-    /// ([`StreamSkip::cut_padding`]) and of the block's split of a table built
-    /// whole (its comparison arms), so every arm builds the same tables.
-    pub(crate) fn from_env() -> Result<Self, Error> {
-        static PADDING: std::sync::OnceLock<Result<CutPadding, String>> =
-            std::sync::OnceLock::new();
-        PADDING
-            .get_or_init(|| {
-                Self::parse(std::env::var("LAMBDA_VM_BLOCK_CUT_PADDING").ok().as_deref())
-            })
-            .clone()
-            .map_err(Error::Prover)
-    }
-
-    /// [`Self::from_env`]'s reading of its variable.
-    fn parse(value: Option<&str>) -> Result<Self, String> {
-        match value.map(str::trim) {
-            None | Some("last") => Ok(Self::LastTable),
-            Some("run") => Ok(Self::WholeRun),
-            Some(v) => Err(format!("LAMBDA_VM_BLOCK_CUT_PADDING={v}: run or last")),
-        }
-    }
-
     /// How many tables `n` rows cut at `rows` rows a table make: none without
     /// rows; one when the whole padded table (`n.next_power_of_two().max(4)`
     /// rows) is no taller than `rows`; else that table's `total / rows` cuts
@@ -7102,35 +7034,16 @@ pub(crate) fn keccak_rnd_chunks(
     pack: bool,
     form: TraceForm,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
-    keccak_rnd_chunks_in_waves(ops, rows, streamed, padding, pack, form, kr_packed_wave())
-}
-
-/// `LAMBDA_VM_KR_PACKED_WAVE`: how many KECCAK_RND chunks [`keccak_rnd_chunks`]
-/// builds at once while it writes them packed (G-pack, once the widths are
-/// known): unset or `0`, every chunk left in one parallel pass (the default);
-/// `n ≥ 1`, `n` (`4`, [`KECCAK_RND_PACK_WAVE`], is the wave as it was). A chunk
-/// written packed holds no 64-bit table, so the wave bounds nothing but the
-/// parallelism. The tables and their order are the same. Read once; any other
-/// value is the default. At the median block the finish's KECCAK_RND tail and
-/// the card's wait for the rest go with it (ULTRA 096: finish 15.8 → 9.1 s,
-/// phase A −6.7 s with the commit pairs off the pool, −5.7 s alone).
-pub(crate) fn kr_packed_wave() -> usize {
-    static WAVE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *WAVE.get_or_init(|| {
-        kr_packed_wave_from(std::env::var("LAMBDA_VM_KR_PACKED_WAVE").ok().as_deref())
-    })
-}
-
-/// [`kr_packed_wave`]'s reading of its variable.
-fn kr_packed_wave_from(value: Option<&str>) -> usize {
-    match value.map(str::trim).map(str::parse::<usize>) {
-        Some(Ok(n)) if n > 0 => n,
-        _ => usize::MAX,
-    }
+    // The chunks written packed (G-pack, once the widths are known) are built
+    // in one parallel pass: a chunk written packed holds no 64-bit table, so a
+    // wave would bound nothing but the parallelism. At the median block one
+    // pass against waves of `KECCAK_RND_PACK_WAVE` took the finish from 15.8
+    // to 9.1 s.
+    keccak_rnd_chunks_in_waves(ops, rows, streamed, padding, pack, form, usize::MAX)
 }
 
 /// [`keccak_rnd_chunks`], the chunks written packed built `packed_wave` at a
-/// time ([`kr_packed_wave`]).
+/// time (`usize::MAX`: all at once).
 fn keccak_rnd_chunks_in_waves(
     ops: &[KeccakRoundOperation],
     rows: usize,
@@ -9827,7 +9740,7 @@ mod p4_slice_tests {
 mod kr_wave_tests {
     use super::{
         CutPadding, KECCAK_RND_PACK_WAVE, KeccakRoundOperation, TraceForm, keccak_rnd,
-        keccak_rnd_chunks_in_waves, kr_packed_wave_from,
+        keccak_rnd_chunks_in_waves,
     };
 
     /// `count` ops with distinct states, each 24 rows.
@@ -9912,19 +9825,6 @@ mod kr_wave_tests {
             !cfg!(feature = "debug-checks")
         );
         assert!(!keccak_rnd::rows_written_packed(TraceForm::Wide));
-    }
-
-    /// The default builds every chunk written packed in one pass; `4` is the opt-out to the
-    /// wave as it was.
-    #[test]
-    fn the_packed_wave_is_all_by_default_and_four_opts_out() {
-        assert_eq!(kr_packed_wave_from(None), usize::MAX);
-        assert_eq!(kr_packed_wave_from(Some("0")), usize::MAX);
-        assert_eq!(kr_packed_wave_from(Some("all")), usize::MAX);
-        assert_eq!(kr_packed_wave_from(Some("-1")), usize::MAX);
-        assert_eq!(KECCAK_RND_PACK_WAVE, 4);
-        assert_eq!(kr_packed_wave_from(Some("4")), KECCAK_RND_PACK_WAVE);
-        assert_eq!(kr_packed_wave_from(Some(" 16 ")), 16);
     }
 }
 

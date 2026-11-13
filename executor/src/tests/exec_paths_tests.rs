@@ -8,7 +8,7 @@ use crate::vm::instruction::execution::{
     DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_GAP, DMA_MEMSET_SYSCALL_NUMBER, ExecutionError,
 };
 use crate::vm::logs::Log;
-use crate::vm::memory::{ExecPaths, Memory, StoreKind};
+use crate::vm::memory::{ExecPaths, Memory};
 use crate::vm::registers::Registers;
 use proptest::prelude::*;
 
@@ -87,19 +87,17 @@ fn apply(memory: &mut Memory, access: &Access) -> Result<Option<u64>, String> {
 proptest! {
     // Any run of loads and stores, inside a page, across a page boundary, in
     // either directory and in neither: every setting loads the same values and
-    // leaves the same written bytes, on both stores.
+    // leaves the same written bytes.
     #[test]
     fn every_access_path_reads_and_writes_the_same_bytes(
         accesses in prop::collection::vec(access(), 1..200),
     ) {
-        for kind in [StoreKind::Pages, StoreKind::Words] {
-            let mut reference = Memory::with_store_and_paths(kind, ExecPaths::GENERAL);
-            let mut fast = Memory::with_store_and_paths(kind, ExecPaths::FAST);
-            for a in &accesses {
-                prop_assert_eq!(apply(&mut reference, a), apply(&mut fast, a), "{:?} on {:?}", a, kind);
-            }
-            prop_assert_eq!(written(&reference), written(&fast), "{:?}", kind);
+        let mut reference = Memory::with_paths(ExecPaths::GENERAL);
+        let mut fast = Memory::with_paths(ExecPaths::FAST);
+        for a in &accesses {
+            prop_assert_eq!(apply(&mut reference, a), apply(&mut fast, a), "{:?}", a);
         }
+        prop_assert_eq!(written(&reference), written(&fast));
     }
 
     // A DMA memcpy or memset of any length, overlapping or not, crossing a page
@@ -119,7 +117,7 @@ proptest! {
         let number = if memset { DMA_MEMSET_SYSCALL_NUMBER } else { DMA_MEMCPY_SYSCALL_NUMBER };
         let mut outcomes = Vec::new();
         for paths in SETTINGS {
-            let mut memory = Memory::with_store_and_paths(StoreKind::Pages, paths);
+            let mut memory = Memory::with_paths(paths);
             // Some of the bytes around the call written, some never.
             for (i, &b) in seed.iter().enumerate() {
                 if b % 3 != 0 {
@@ -303,27 +301,9 @@ fn resume_owned_hands_out_the_logs_resume_lends() {
     );
 }
 
-// The knobs: each path on unless its knob is `0`.
+// A run takes every fast path.
 #[test]
-fn each_path_is_on_unless_its_knob_is_zero() {
-    assert_eq!(ExecPaths::from_values(None, None), ExecPaths::FAST);
-    assert_eq!(ExecPaths::from_values(Some("1"), Some("")), ExecPaths::FAST);
-    assert_eq!(
-        ExecPaths::from_values(Some("0"), Some(" 0 ")),
-        ExecPaths::GENERAL
-    );
-    assert_eq!(
-        ExecPaths::from_values(Some("0"), None),
-        ExecPaths {
-            fixed_access: false,
-            dma_bulk: true
-        }
-    );
-    assert_eq!(
-        ExecPaths::from_values(None, Some("0")),
-        ExecPaths {
-            fixed_access: true,
-            dma_bulk: false
-        }
-    );
+fn a_run_takes_every_fast_path() {
+    assert_eq!(ExecPaths::from_env(), ExecPaths::FAST);
+    assert_eq!(Memory::default().paths(), ExecPaths::FAST);
 }

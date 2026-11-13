@@ -61,12 +61,10 @@ pub const PRIVATE_INPUT_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 ///
 /// It keeps the bytes in 64 KiB pages ([`Pages`]): an access finds its page by
 /// indexing a directory, with no hashing, so its cost does not grow with the
-/// memory a run touches. `LAMBDA_VM_EXEC_MEMORY=words` keeps them in the map of
-/// 4-byte words the executor used before ([`Store::Words`]), the control the
-/// pages are measured and tested against. Both answer every access alike.
+/// memory a run touches.
 #[derive(Debug, Clone)]
 pub struct Memory {
-    store: Store,
+    store: Pages,
     /// Bytes committed to public output via `commit_public_output`. The
     /// COPY chip's commit rows don't write to a fixed memory region (it streams bytes
     /// onto the Commit bus by `index`), so this buffer is purely the
@@ -78,23 +76,22 @@ pub struct Memory {
 
 impl Default for Memory {
     fn default() -> Self {
-        Self::with_store(StoreKind::from_env())
+        Self::with_paths(ExecPaths::from_env())
     }
 }
 
-/// The executor's access paths, each its own knob. Every setting reads and
+/// The executor's access paths. Every setting reads and
 /// writes the same bytes and marks the same written words; only the work per
 /// access differs, so the executor's logs are the same under every setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecPaths {
     /// A load or store of 1, 2, 4 or 8 bytes that stays inside one page reads
     /// or writes the page directly, as a fixed-width copy after one page
-    /// lookup (`LAMBDA_VM_EXEC_FIXED_ACCESS`, on unless `0`). Off, every
-    /// access goes through the general byte-range loop.
+    /// lookup. Off (the test comparator [`ExecPaths::GENERAL`]), every access
+    /// goes through the general byte-range loop.
     pub fixed_access: bool,
     /// The DMA memcpy and memset ecalls read and write their range in one
-    /// call each (`LAMBDA_VM_EXEC_DMA_BULK`, on unless `0`). Off, they move it
-    /// a byte at a time.
+    /// call each. Off, they move it a byte at a time.
     pub dma_bulk: bool,
 }
 
@@ -110,52 +107,10 @@ impl ExecPaths {
         dma_bulk: true,
     };
 
-    /// The two knobs, read once: each is on unless set to `0`.
+    /// The paths a run takes: every fast path ([`ExecPaths::FAST`]).
     pub fn from_env() -> Self {
-        static PATHS: std::sync::OnceLock<ExecPaths> = std::sync::OnceLock::new();
-        *PATHS.get_or_init(|| {
-            Self::from_values(
-                std::env::var("LAMBDA_VM_EXEC_FIXED_ACCESS").ok().as_deref(),
-                std::env::var("LAMBDA_VM_EXEC_DMA_BULK").ok().as_deref(),
-            )
-        })
+        Self::FAST
     }
-
-    /// [`ExecPaths::from_env`] of the knobs' values.
-    pub fn from_values(fixed_access: Option<&str>, dma_bulk: Option<&str>) -> Self {
-        let on = |value: Option<&str>| value.map(str::trim) != Some("0");
-        Self {
-            fixed_access: on(fixed_access),
-            dma_bulk: on(dma_bulk),
-        }
-    }
-}
-
-/// Which store a [`Memory`] keeps its bytes in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StoreKind {
-    /// 64 KiB pages found through a directory ([`Pages`]).
-    Pages,
-    /// A map of 4-byte words keyed by their address.
-    Words,
-}
-
-impl StoreKind {
-    /// `LAMBDA_VM_EXEC_MEMORY=words` picks [`StoreKind::Words`]; unset or
-    /// anything else, [`StoreKind::Pages`]. Read once.
-    pub fn from_env() -> Self {
-        static KIND: std::sync::OnceLock<StoreKind> = std::sync::OnceLock::new();
-        *KIND.get_or_init(|| match std::env::var("LAMBDA_VM_EXEC_MEMORY").as_deref() {
-            Ok("words") => StoreKind::Words,
-            _ => StoreKind::Pages,
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-enum Store {
-    Pages(Pages),
-    Words(U64HashMap<[u8; 4]>),
 }
 
 pub(crate) const PAGE_BITS: u32 = 16;
@@ -437,63 +392,11 @@ impl Pages {
     }
 }
 
-impl Store {
-    /// The bytes at `address..` into `out`; the range must not wrap.
-    #[inline]
-    fn read(&self, address: u64, out: &mut [u8]) {
-        match self {
-            Store::Pages(pages) => pages.read(address, out),
-            Store::Words(cells) => {
-                let mut done = 0;
-                while done < out.len() {
-                    let at = address + done as u64;
-                    let offset = (at % 4) as usize;
-                    let n = (4 - offset).min(out.len() - done);
-                    let word = cells
-                        .get(&(at - offset as u64))
-                        .copied()
-                        .unwrap_or_default();
-                    out[done..done + n].copy_from_slice(&word[offset..offset + n]);
-                    done += n;
-                }
-            }
-        }
-    }
-
-    /// `data` at `address..`; the range must not wrap.
-    #[inline]
-    fn write(&mut self, address: u64, data: &[u8]) {
-        match self {
-            Store::Pages(pages) => pages.write(address, data),
-            Store::Words(cells) => {
-                let mut done = 0;
-                while done < data.len() {
-                    let at = address + done as u64;
-                    let offset = (at % 4) as usize;
-                    let n = (4 - offset).min(data.len() - done);
-                    let word = cells.entry(at - offset as u64).or_insert([0; 4]);
-                    word[offset..offset + n].copy_from_slice(&data[done..done + n]);
-                    done += n;
-                }
-            }
-        }
-    }
-}
-
 impl Memory {
-    /// An empty memory over the given store, on the paths the knobs set
-    /// ([`ExecPaths::from_env`]).
-    pub fn with_store(kind: StoreKind) -> Self {
-        Self::with_store_and_paths(kind, ExecPaths::from_env())
-    }
-
-    /// An empty memory over the given store, on the given paths.
-    pub fn with_store_and_paths(kind: StoreKind, paths: ExecPaths) -> Self {
+    /// An empty memory on the given paths.
+    pub fn with_paths(paths: ExecPaths) -> Self {
         Self {
-            store: match kind {
-                StoreKind::Pages => Store::Pages(Pages::default()),
-                StoreKind::Words => Store::Words(U64HashMap::default()),
-            },
+            store: Pages::default(),
             public_output: Vec::new(),
             paths,
         }
@@ -519,21 +422,16 @@ impl Memory {
         self.paths
     }
 
-    /// The bytes the memory takes on the heap: its pages (or the word map's
-    /// slots, an entry and a control byte each) and the public output.
+    /// The bytes the memory takes on the heap: its pages and the public
+    /// output.
     pub fn heap_bytes(&self) -> usize {
-        let store = match &self.store {
-            Store::Pages(pages) => pages.heap_bytes(),
-            Store::Words(cells) => cells.capacity() * (std::mem::size_of::<(u64, [u8; 4])>() + 1),
-        };
-        store + self.public_output.capacity()
+        self.store.heap_bytes() + self.public_output.capacity()
     }
 
     /// The memory as it is now, kept while the run goes on: the pages are
     /// shared, and a later write copies a page the snapshot holds before
-    /// changing it, so the snapshot keeps reading this moment's bytes. Cheap
-    /// for the pages store (one count per page); the words store copies its
-    /// map.
+    /// changing it, so the snapshot keeps reading this moment's bytes. Cheap:
+    /// one count per page.
     pub fn snapshot(&self) -> MemorySnapshot {
         MemorySnapshot {
             store: self.store.clone(),
@@ -548,19 +446,11 @@ impl Memory {
         GuestMemory::store_byte(self, address, value)
     }
 
-    /// Iterate over all stored bytes as `(address, value)` pairs. Bytes are
-    /// stored in 4-byte words; each word ever written yields its four byte
-    /// addresses. Used to snapshot memory at an epoch boundary.
+    /// Iterate over all stored bytes as `(address, value)` pairs. Each
+    /// 4-byte word ever written yields its four byte addresses. Used to
+    /// snapshot memory at an epoch boundary.
     pub fn iter_bytes(&self) -> Box<dyn Iterator<Item = (u64, u8)> + '_> {
-        match &self.store {
-            Store::Pages(pages) => Box::new(pages.iter_bytes()),
-            Store::Words(cells) => Box::new(cells.iter().flat_map(|(&addr, bytes)| {
-                bytes
-                    .iter()
-                    .enumerate()
-                    .map(move |(i, &b)| (addr + i as u64, b))
-            })),
-        }
+        Box::new(self.store.iter_bytes())
     }
 
     pub fn load_word(&self, address: u64) -> Result<u32, MemoryError> {
@@ -785,17 +675,15 @@ pub trait GuestMemory {
 
 impl GuestMemory for Memory {
     /// `N` bytes at `address..`; the range must not wrap. With
-    /// [`ExecPaths::fixed_access`] and the pages store, an access inside one
+    /// [`ExecPaths::fixed_access`], an access inside one
     /// page is one lookup and a fixed-width copy; any other access takes the
     /// general loop, which reads the same bytes.
     #[inline(always)]
     fn read_n<const N: usize>(&self, address: u64) -> [u8; N] {
-        if self.paths.fixed_access
-            && let Store::Pages(pages) = &self.store
-        {
+        if self.paths.fixed_access {
             let offset = (address & PAGE_MASK) as usize;
             if offset + N <= PAGE_SIZE {
-                return match pages.page(address >> PAGE_BITS) {
+                return match self.store.page(address >> PAGE_BITS) {
                     Some(page) => {
                         let mut out = [0u8; N];
                         out.copy_from_slice(&page.bytes[offset..offset + N]);
@@ -815,12 +703,12 @@ impl GuestMemory for Memory {
     /// words marked written as the general loop.
     #[inline(always)]
     fn write_n<const N: usize>(&mut self, address: u64, data: [u8; N]) {
-        if self.paths.fixed_access
-            && let Store::Pages(pages) = &mut self.store
-        {
+        if self.paths.fixed_access {
             let offset = (address & PAGE_MASK) as usize;
             if offset + N <= PAGE_SIZE {
-                pages.page_mut(address >> PAGE_BITS).write(offset, &data);
+                self.store
+                    .page_mut(address >> PAGE_BITS)
+                    .write(offset, &data);
                 return;
             }
         }
@@ -855,15 +743,13 @@ impl GuestMemory for Memory {
 /// The memory at one moment of a run ([`Memory::snapshot`]).
 #[derive(Debug, Clone)]
 pub struct MemorySnapshot {
-    store: Store,
+    store: Pages,
 }
 
 impl MemorySnapshot {
     /// A snapshot of the given pages (the fast engine's published state).
     pub(crate) fn from_pages(pages: Pages) -> Self {
-        Self {
-            store: Store::Pages(pages),
-        }
+        Self { store: pages }
     }
 
     /// The bytes at `address..` into `out`, as they were at the snapshot; the
@@ -873,7 +759,7 @@ impl MemorySnapshot {
     }
 
     /// A digest of every byte the snapshot holds, by address: equal for two
-    /// snapshots that read alike at every address, whichever store or pages
+    /// snapshots that read alike at every address, whichever pages
     /// hold them (a zero byte and an absent one count the same). For checks
     /// that two runs published the same memory.
     pub fn content_digest(&self) -> u64 {
@@ -887,35 +773,23 @@ impl MemorySnapshot {
             z ^ (z >> 31)
         }
         let mut digest = 0u64;
-        match &self.store {
-            Store::Pages(pages) => {
-                let low = pages
-                    .low
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(n, page)| Some((n as u64, page.as_deref()?)));
-                let high = pages
-                    .high
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, page)| Some((LAST_PAGE - i as u64, page.as_deref()?)));
-                let other = pages.other.iter().map(|(&n, page)| (n, &**page));
-                for (number, page) in low.chain(high).chain(other) {
-                    for (i, word) in page.bytes.chunks_exact(4).enumerate() {
-                        let word = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
-                        if word != 0 {
-                            digest = digest
-                                .wrapping_add(mix((number << PAGE_BITS) + 4 * i as u64, word));
-                        }
-                    }
-                }
-            }
-            Store::Words(cells) => {
-                for (&address, bytes) in cells {
-                    let word = u32::from_le_bytes(*bytes);
-                    if word != 0 {
-                        digest = digest.wrapping_add(mix(address, word));
-                    }
+        let pages = &self.store;
+        let low = pages
+            .low
+            .iter()
+            .enumerate()
+            .filter_map(|(n, page)| Some((n as u64, page.as_deref()?)));
+        let high = pages
+            .high
+            .iter()
+            .enumerate()
+            .filter_map(|(i, page)| Some((LAST_PAGE - i as u64, page.as_deref()?)));
+        let other = pages.other.iter().map(|(&n, page)| (n, &**page));
+        for (number, page) in low.chain(high).chain(other) {
+            for (i, word) in page.bytes.chunks_exact(4).enumerate() {
+                let word = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                if word != 0 {
+                    digest = digest.wrapping_add(mix((number << PAGE_BITS) + 4 * i as u64, word));
                 }
             }
         }
@@ -929,16 +803,9 @@ impl MemorySnapshot {
         byte[0]
     }
 
-    /// The bytes this snapshot keeps alive that `memory` no longer shares (for
-    /// the words store, its whole map).
+    /// The bytes this snapshot keeps alive that `memory` no longer shares.
     pub fn bytes_apart_from(&self, memory: &Memory) -> usize {
-        match (&self.store, &memory.store) {
-            (Store::Pages(mine), Store::Pages(now)) => mine.bytes_apart_from(now),
-            (Store::Words(cells), _) => {
-                cells.capacity() * (std::mem::size_of::<(u64, [u8; 4])>() + 1)
-            }
-            (Store::Pages(mine), Store::Words(_)) => mine.heap_bytes(),
-        }
+        self.store.bytes_apart_from(&memory.store)
     }
 }
 
@@ -1001,12 +868,12 @@ mod tests {
     }
 
     // A snapshot reads the bytes of its moment while the memory is written on:
-    // over both stores, in both directories and outside them, across a page
-    // boundary, for bytes overwritten and for pages first written later.
+    // in both directories and outside them, across a page boundary, for bytes
+    // overwritten and for pages first written later.
     #[test]
     fn a_snapshot_reads_the_bytes_of_its_moment() {
-        for kind in [StoreKind::Pages, StoreKind::Words] {
-            let mut memory = Memory::with_store(kind);
+        {
+            let mut memory = Memory::default();
             for (i, &at) in SPOTS.iter().enumerate() {
                 memory
                     .store_doubleword(at, 0x1111 * (i as u64 + 1))
@@ -1026,18 +893,18 @@ mod tests {
                 assert_eq!(
                     read8(|a, out| first.read(a, out), at),
                     0x1111 * (i as u64 + 1),
-                    "{kind:?} at {at:#x}"
+                    "at {at:#x}"
                 );
-                assert_eq!(first.load_byte(fresh), 0, "{kind:?} at {fresh:#x}");
-                assert_eq!(second.load_byte(fresh), 0x5A, "{kind:?} at {fresh:#x}");
+                assert_eq!(first.load_byte(fresh), 0, "at {fresh:#x}");
+                assert_eq!(second.load_byte(fresh), 0x5A, "at {fresh:#x}");
                 assert_eq!(
                     read8(|a, out| second.read(a, out), at),
                     0xAAAA * (i as u64 + 1),
-                    "{kind:?} at {at:#x}"
+                    "at {at:#x}"
                 );
             }
-            assert_eq!(memory.load_byte(SPOTS[0]), 0x77, "{kind:?}");
-            assert_eq!(second.load_byte(SPOTS[0]), 0xAA, "{kind:?}");
+            assert_eq!(memory.load_byte(SPOTS[0]), 0x77);
+            assert_eq!(second.load_byte(SPOTS[0]), 0xAA);
         }
     }
 
@@ -1046,7 +913,7 @@ mod tests {
     #[test]
     fn a_snapshot_costs_the_pages_written_after_it() {
         let page = std::mem::size_of::<Page>() + PAGE_SIZE + PAGE_SIZE / 4 / 64 * 8;
-        let mut memory = Memory::with_store(StoreKind::Pages);
+        let mut memory = Memory::default();
         for &at in &SPOTS {
             memory.store_byte(at, 1);
         }

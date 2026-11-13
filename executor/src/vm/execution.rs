@@ -8,7 +8,7 @@ use crate::{
             execution::ExecutionError,
         },
         logs::Log,
-        memory::{ExecPaths, GuestMemory, Memory, MemoryError, StoreKind, U64HashMap},
+        memory::{ExecPaths, GuestMemory, Memory, MemoryError, U64HashMap},
         registers::Registers,
     },
 };
@@ -61,14 +61,14 @@ impl Executor {
         Self::with_memory(program, private_inputs, Memory::default())
     }
 
-    /// [`Executor::new`] on the given access paths (the knobs' defaults aside):
-    /// what a test compares the paths with.
+    /// [`Executor::new`] on the given access paths (the default is
+    /// [`ExecPaths::FAST`]): what a test compares the paths with.
     pub fn new_with_paths(
         program: &Elf,
         private_inputs: Vec<u8>,
         paths: ExecPaths,
     ) -> Result<Self, ExecutorError> {
-        let memory = Memory::with_store_and_paths(StoreKind::from_env(), paths);
+        let memory = Memory::with_paths(paths);
         Self::with_memory(program, private_inputs, memory)
     }
 

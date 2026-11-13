@@ -321,40 +321,6 @@ pub(crate) fn rest_ahead_bytes() -> u64 {
     gib_knob("LAMBDA_VM_BLOCK_REGEN_REST_AHEAD_GIB", 4.0)
 }
 
-/// When live regeneration starts the streamed chunks' regenerator
-/// (`LAMBDA_VM_BLOCK_REGEN_EARLY`). The rest's starts with phase B either way.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EarlySpawn {
-    /// `0`: with phase B, from phase A's final drops.
-    Off,
-    /// `finish`: at the finish's end, when regeneration has armed by then.
-    /// Its first chunk needs about a second, so a phase B that starts sooner
-    /// than that after the finish waits for it (the median block's first
-    /// rebuilt groups waited 0.28-0.64 s, measured on a 118 GiB host with one
-    /// RTX 5090).
-    Finish,
-    /// The default: as soon as every streamed chunk's fate is known. Its
-    /// thread is there from the walk's end and waits for the fates
-    /// ([`stark::multilinear_block::BlockRegen::await_rank`]), which the arm
-    /// and the streamed groups' commits decide while the finish still runs;
-    /// until the finish's end its window holds only its frontier.
-    Fates,
-}
-
-/// `LAMBDA_VM_BLOCK_REGEN_EARLY`: [`EarlySpawn::Fates`] unless `0` or
-/// `finish`.
-pub(crate) fn early_start() -> EarlySpawn {
-    parse_early(std::env::var("LAMBDA_VM_BLOCK_REGEN_EARLY").ok().as_deref())
-}
-
-fn parse_early(value: Option<&str>) -> EarlySpawn {
-    match value.map(str::trim) {
-        Some("0") => EarlySpawn::Off,
-        Some("finish") => EarlySpawn::Finish,
-        _ => EarlySpawn::Fates,
-    }
-}
-
 /// The streamed groups phase B takes ahead of the rest's first when it
 /// rebuilds both classes ([`regen_lead`]).
 pub(crate) const REGEN_LEAD: usize = 4;
@@ -578,7 +544,7 @@ pub(crate) struct Recorder {
     /// (the shadow; live regeneration digests what it drops, at the drop).
     digests: bool,
     /// Whether a chunk held as records stays on the host, with no rank
-    /// (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`), instead of parking and dropping
+    /// (a test's `Deviations::records_keep`), instead of parking and dropping
     /// as its records like any chunk.
     keep_records: bool,
 }
@@ -2512,8 +2478,8 @@ pub(crate) struct LiveArgs {
 /// its own outside phase A's, once every streamed chunk's
 /// fate is known (their groups commit first; each waited for through
 /// [`stark::multilinear_block::BlockRegen::await_rank`], which answers nothing
-/// for a table the arm may still drop). The thread may be there before
-/// regeneration arms ([`EarlySpawn::Fates`]): it then waits for the arm's
+/// for a table the arm may still drop). The thread is there from the walk's
+/// end, before regeneration arms: it then waits for the arm's
 /// drop-back, or for phase A's end, where every undropped table is kept and it
 /// starts nothing. The rest's regenerator starts with phase B, from phase A's
 /// final drops. Dropped before phase B takes it (the prove failed), it closes
@@ -3028,19 +2994,9 @@ mod tests {
         }
     }
 
-    /// `LAMBDA_VM_BLOCK_REGEN_EARLY`: at the fates unless `0` (with
-    /// phase B) or `finish` (at the finish's end); and the head-start line,
-    /// with a start and without.
+    /// The head-start line, with a start and without.
     #[test]
-    fn the_early_start_reads_its_knob_and_says_its_head_start() {
-        assert_eq!(parse_early(None), EarlySpawn::Fates);
-        assert_eq!(parse_early(Some("1")), EarlySpawn::Fates);
-        assert_eq!(parse_early(Some("yes")), EarlySpawn::Fates);
-        assert_eq!(parse_early(Some("0")), EarlySpawn::Off);
-        assert_eq!(parse_early(Some(" 0 ")), EarlySpawn::Off);
-        assert_eq!(parse_early(Some("finish")), EarlySpawn::Finish);
-        assert_eq!(parse_early(Some(" finish ")), EarlySpawn::Finish);
-        assert_eq!(parse_early(Some("Finish")), EarlySpawn::Fates);
+    fn the_early_start_says_its_head_start() {
         let pace = EarlyPace {
             readings: 14,
             most: 2 << 30,

@@ -14,7 +14,7 @@ use crate::vm::instruction::execution::{
     KECCAK_SYSCALL_NUMBER, KECCAK256_SYSCALL_NUMBER,
 };
 use crate::vm::logs::Log;
-use crate::vm::memory::{GuestMemory, Memory, MemoryError, StoreKind};
+use crate::vm::memory::{GuestMemory, Memory, MemoryError};
 use proptest::prelude::*;
 
 /// A small layout: the low region's end at 1 MiB and the high region the top
@@ -508,7 +508,7 @@ proptest! {
             1..300,
         ),
     ) {
-        let mut reference = Memory::with_store(StoreKind::Pages);
+        let mut reference = Memory::default();
         let mut flat = FlatMemory::new(SMALL).unwrap();
         let mut kept = Vec::new();
         for (kind, width, at, value, len) in steps {

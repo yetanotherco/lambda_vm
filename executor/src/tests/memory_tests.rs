@@ -1,6 +1,6 @@
 //! Tests for guest memory: public-output commits and bounds-checked loads.
 
-use crate::vm::memory::{Memory, MemoryError};
+use crate::vm::memory::{GuestMemory, Memory, MemoryError};
 
 #[test]
 fn test_commit_public_output_single() {
@@ -140,18 +140,87 @@ fn test_misaligned_load_store_overflow_errors() {
     ));
 }
 
-/// The paged store answers every access as the word map does: loads and
+/// A map of 4-byte words keyed by their address: the store the executor kept
+/// guest memory in before the pages, kept here as the pages' oracle.
+#[derive(Default)]
+struct WordMap {
+    cells: crate::vm::memory::U64HashMap<[u8; 4]>,
+    public_output: Vec<u8>,
+}
+
+impl WordMap {
+    fn iter_bytes(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
+        self.cells.iter().flat_map(|(&addr, bytes)| {
+            bytes
+                .iter()
+                .enumerate()
+                .map(move |(i, &b)| (addr + i as u64, b))
+        })
+    }
+}
+
+impl GuestMemory for WordMap {
+    fn read_n<const N: usize>(&self, address: u64) -> [u8; N] {
+        let mut out = [0u8; N];
+        self.read_range(address, &mut out);
+        out
+    }
+
+    fn write_n<const N: usize>(&mut self, address: u64, data: [u8; N]) {
+        self.write_range(address, &data);
+    }
+
+    fn read_range(&self, address: u64, out: &mut [u8]) {
+        let mut done = 0;
+        while done < out.len() {
+            let at = address + done as u64;
+            let offset = (at % 4) as usize;
+            let n = (4 - offset).min(out.len() - done);
+            let word = self
+                .cells
+                .get(&(at - offset as u64))
+                .copied()
+                .unwrap_or_default();
+            out[done..done + n].copy_from_slice(&word[offset..offset + n]);
+            done += n;
+        }
+    }
+
+    fn write_range(&mut self, address: u64, data: &[u8]) {
+        let mut done = 0;
+        while done < data.len() {
+            let at = address + done as u64;
+            let offset = (at % 4) as usize;
+            let n = (4 - offset).min(data.len() - done);
+            let word = self.cells.entry(at - offset as u64).or_insert([0; 4]);
+            word[offset..offset + n].copy_from_slice(&data[done..done + n]);
+            done += n;
+        }
+    }
+
+    fn public_output(&self) -> &[u8] {
+        &self.public_output
+    }
+
+    fn extend_public_output(&mut self, bytes: &[u8]) {
+        self.public_output.extend_from_slice(bytes);
+    }
+
+    fn dma_bulk(&self) -> bool {
+        false
+    }
+}
+
+/// The paged store answers every access as a word map does: loads and
 /// stores of every width, aligned or not, across 64 KiB pages, in the low and
 /// top directories and between them, the overflow refusals at the top of the
 /// address space, `load_bytes`, the private input, and `iter_bytes` (as a set:
 /// the two iterate in different orders).
 #[test]
 fn the_paged_store_is_the_word_map() {
-    use crate::vm::memory::StoreKind;
-
     const PAGE: u64 = 1 << 16;
-    let mut pages = Memory::with_store(StoreKind::Pages);
-    let mut words = Memory::with_store(StoreKind::Words);
+    let mut pages = Memory::default();
+    let mut words = WordMap::default();
     pages.store_private_inputs(vec![7u8; 70_001]).unwrap();
     words.store_private_inputs(vec![7u8; 70_001]).unwrap();
 

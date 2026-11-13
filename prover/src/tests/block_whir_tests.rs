@@ -2403,54 +2403,6 @@ fn a_hand_off_at_the_walk_arms_live_regeneration_and_moves_no_byte() {
     }
 }
 
-/// ★ The streamed chunks' regenerator starts before phase B, from each
-/// chunk's fate as phase A decided it: its thread up where the streamed chunks
-/// end and started once their fates are known (the default), or started at
-/// the finish's end; the rest's starts with phase B. Every dropped table is
-/// rebuilt and deposited, and the proof is regeneration off's bytes; started
-/// with phase B instead (the knob off), the same. (A fate decided after the
-/// regenerator asks is `stark::multilinear_block`'s
-/// `a_regenerator_started_early_waits_for_each_tables_fate`.)
-#[test]
-fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
-    use crate::block_whir::regen::{EarlySpawn, RegenMode};
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    let bytes = |p: &BlockWhirProof| {
-        rkyv::to_bytes::<rkyv::rancor::Error>(p)
-            .expect("serialize")
-            .to_vec()
-    };
-    let (plain, _) =
-        regenerated(&elf, &format, RegenMode::Off, Deviations::default()).expect("prove");
-    for early in [EarlySpawn::Fates, EarlySpawn::Finish, EarlySpawn::Off] {
-        let (proof, stamps) = regenerated(
-            &elf,
-            &format,
-            RegenMode::Always,
-            Deviations {
-                regen_early: Some(early),
-                ..Deviations::default()
-            },
-        )
-        .unwrap_or_else(|e| panic!("early {early:?}: {e:?}"));
-        let r = stamps.regen.expect("live regeneration's readout");
-        let lines = r.lines.join("\n");
-        assert_eq!(r.head_start.is_some(), early != EarlySpawn::Off, "{lines}");
-        assert!(r.rest_dropped > 0 && r.dropped > r.rest_dropped, "{lines}");
-        assert_eq!(r.regenerated, r.dropped, "{lines}");
-        assert_eq!((r.mismatches, r.failed), (0, 0), "{lines}");
-        assert_eq!(proof.groups, plain.groups, "early {early:?}: the partition");
-        assert!(verify(&proof, &elf, &format), "early {early:?}");
-        if crypto::grinding::deterministic() {
-            assert!(
-                bytes(&proof) == bytes(&plain),
-                "early {early:?}: the proof differs"
-            );
-        }
-    }
-}
-
 /// ★ The regenerator's thread is up before the drops: with each streamed
 /// chunk's drop held back, it asks for fates phase A has not decided yet, waits
 /// for every one, and rebuilds exactly what was dropped; the proof is
@@ -2459,7 +2411,7 @@ fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
 /// took … streamed chunks, phase A dropped …").
 #[test]
 fn a_regenerator_up_before_the_drops_proves_the_same_bytes() {
-    use crate::block_whir::regen::{EarlySpawn, RegenMode};
+    use crate::block_whir::regen::RegenMode;
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
@@ -2474,7 +2426,6 @@ fn a_regenerator_up_before_the_drops_proves_the_same_bytes() {
         &format,
         RegenMode::Always,
         Deviations {
-            regen_early: Some(EarlySpawn::Fates),
             streamed_drop_delay: Some(std::time::Duration::from_millis(100)),
             ..Deviations::default()
         },
@@ -2499,7 +2450,7 @@ fn a_regenerator_up_before_the_drops_proves_the_same_bytes() {
 /// joined) and never hangs.
 #[test]
 fn an_early_regenerator_never_hangs_a_failed_phase_a() {
-    use crate::block_whir::regen::{EarlySpawn, RegenMode};
+    use crate::block_whir::regen::RegenMode;
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2509,7 +2460,6 @@ fn an_early_regenerator_never_hangs_a_failed_phase_a() {
             &format,
             RegenMode::Always,
             Deviations {
-                regen_early: Some(EarlySpawn::Fates),
                 streamed_drop_delay: Some(std::time::Duration::from_millis(400)),
                 abort_after_finish: true,
                 ..Deviations::default()
@@ -2800,58 +2750,6 @@ fn a_streamed_block_laid_out_on_three_threads_packs_the_same_groups() {
         format!("{:?}", inline.table_counts)
     );
     assert!(verify(&proof, &elf, &format));
-}
-
-/// ★ With BITWISE handed on last ([`Deviations::rest_bitwise_last`], as
-/// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1`), the streamed rest is packed in its
-/// hand-on order but BITWISE (AIR index 0), which comes after every other table: the
-/// partition moves, the tables and their counts do not, and the proof verifies
-/// under the unchanged verifier. Without it BITWISE leads the rest, as today.
-#[test]
-fn bitwise_handed_on_last_moves_the_partition_and_verifies() {
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-    o.layout_workers = 3;
-    assert!(o.rest_streams(), "the rest streams");
-    let proved = |bitwise_last: bool| {
-        let proof = prove_with(
-            &elf,
-            &format,
-            &o,
-            &Deviations {
-                rest_bitwise_last: bitwise_last,
-                bitwise_from_tables: Some(false),
-                ..Deviations::default()
-            },
-        );
-        assert!(verify(&proof, &elf, &format), "bitwise_last {bitwise_last}");
-        proof
-    };
-    let air = proved(false);
-    let last = proved(true);
-    assert_eq!(
-        format!("{:?}", last.table_counts),
-        format!("{:?}", air.table_counts)
-    );
-    let flat = |p: &BlockWhirProof| p.groups.iter().flatten().copied().collect::<Vec<u32>>();
-    let (air_flat, last_flat) = (flat(&air), flat(&last));
-    let sorted = |mut v: Vec<u32>| {
-        v.sort_unstable();
-        v
-    };
-    assert_eq!(
-        sorted(air_flat.clone()),
-        sorted(last_flat.clone()),
-        "the same tables"
-    );
-    assert_eq!(last_flat.last(), Some(&0), "BITWISE packed last");
-    assert_ne!(
-        air_flat.last(),
-        Some(&0),
-        "BITWISE packed last without the knob"
-    );
-    assert_ne!(last.groups, air.groups, "the partition did not move");
 }
 
 /// ★ BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables
@@ -4805,8 +4703,7 @@ fn block_whir_on_a_real_block() {
     );
     let mut options = BlockOptions::production();
     // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 6; 0 is the inline layout), as
-    // the tree's harness takes it; `BLOCK_WHIR_DROP_OPS=0`: the builder keeps
-    // the streamed chunks' ops (production drops them).
+    // the tree's harness takes it.
     if let Some(n) = std::env::var("BLOCK_WHIR_LAYOUT_WORKERS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -4827,14 +4724,6 @@ fn block_whir_on_a_real_block() {
         }
         Err(_) => {}
     }
-    match std::env::var("BLOCK_WHIR_DROP_OPS")
-        .as_deref()
-        .map(str::trim)
-    {
-        Ok("0") => options.drop_streamed_ops = false,
-        Ok("1") => options.drop_streamed_ops = true,
-        _ => {}
-    }
     // `BLOCK_WHIR_NARROW=wide|card|host` (production card): how phase A holds
     // each group's columns once committed.
     if let Some(narrow) = crate::block_whir::narrow_from_env() {
@@ -4843,16 +4732,9 @@ fn block_whir_on_a_real_block() {
     // `BLOCK_WHIR_KECCAK_LOG2=k`, `BLOCK_WHIR_ECSM_LOG2=k`: force a KECCAK or
     // ECSM split (production 2^18 / 2^17).
     crate::block_whir::chunk_cuts_from_env(&mut options);
-    // `BLOCK_WHIR_UPLOAD_AHEAD=0|1` (production 1): phase A puts each group's
-    // columns on the card beside the previous group's commit.
-    if let Some(ahead) = crate::block_whir::upload_ahead_from_env() {
-        options.upload_ahead = ahead;
-    }
     println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
-    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 4096),
-    // `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` and `BLOCK_WHIR_PACK_FINISHED=0|1`
-    // (production 1): the rest's layout in waves, KECCAK_RND built as its
-    // tables, the finish's tables packed as they are built.
+    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 4096): the rest's layout
+    // in waves.
     crate::block_whir::rest_layout_from_env(&mut options);
     println!(
         "BLOCK REST LAYOUT CONFIG: {} · KECCAK_RND built as its tables {} · finish packed {}",
@@ -5303,8 +5185,8 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
     }
 }
 
-/// ★ Counting the hand-out on a thread of its own (the
-/// `LAMBDA_VM_HANDOUT_COUNT_THREAD` knob, [`Deviations::handout_count_thread`])
+/// ★ Counting the hand-out on a thread of its own
+/// ([`Deviations::handout_count_thread`])
 /// moves no byte: the streamed block, its ops dropped as their chunks leave,
 /// proved with each chunk's counts taken on the accumulator's thread and on a
 /// thread of its own verifies with the same partition, tables and statement,
@@ -5399,7 +5281,7 @@ fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
     }
 }
 
-/// ★ With records kept (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`), a streamed chunk
+/// ★ With records kept (`Deviations::records_keep`), a streamed chunk
 /// held as its records is never dropped and no regenerator waits on it: with
 /// live regeneration dropping every table it can (the streamed chunks'
 /// regenerator started as early as their fates are known), every dropped
@@ -5537,7 +5419,7 @@ fn a_wrong_cpu_records_table_is_refused_by_the_verifier() {
 /// records, even with the room rule admitting every one: the streamed card
 /// fill is never set up, so no chunk is even handed to it, and each is built
 /// packed on the host, droppable as today. Records kept on purpose
-/// (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`) are still held there: the A/B
+/// (`Deviations::records_keep`) are still held there: the A/B
 /// control. The proofs are one.
 #[test]
 fn parked_records_need_live_regeneration() {
@@ -5580,7 +5462,7 @@ fn parked_records_need_live_regeneration() {
 }
 
 /// ★ A streamed chunk held as its records parks and drops like any chunk (the
-/// default, `LAMBDA_VM_BLOCK_RECORDS_DROP=park`): with live regeneration
+/// default, records parked): with live regeneration
 /// dropping every table it can, as many streamed chunks drop as without the
 /// records, those held as records dropped as them; each comes back as packed
 /// columns checked by its rebuilt records' digest, none is missing or
@@ -5886,7 +5768,7 @@ fn row_families_filled_from_their_rows_move_no_byte() {
 /// streamed chunks drop as without the records, those held as rows dropped
 /// as them, each come back as packed columns checked by its rebuilt rows'
 /// digest, none missing or mismatched. Kept
-/// (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`), none drops and none has a recipe;
+/// (`Deviations::records_keep`), none drops and none has a recipe;
 /// with no live regeneration and not kept, none is held. The proofs are the
 /// one without regeneration. (MEMW_A, LOAD and STORE chunks: the rebuild is
 /// the families' one path.) With no live regeneration and not kept, the
