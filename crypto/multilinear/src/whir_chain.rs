@@ -5573,4 +5573,27 @@ mod tests {
         }
         assert!(verify_with(&bad, y).is_err());
     }
+
+    /// A wider fold after round 0 with a wider final polynomial (the
+    /// byte-minimising schedule's shape): round trips, refuses a tampered
+    /// polynomial value, and is refused under today's schedule. (Its bytes are
+    /// the W-LFM test's: at three queries a wider block can outweigh the paths
+    /// it saves.)
+    #[test]
+    fn a_wide_fold_with_a_wide_final_polynomial_verifies() {
+        let n = 18;
+        let cfg = finals(5, 10);
+        assert_eq!(cfg.schedule(n), vec![6, 5, 5, 2]);
+        let (final_r, rem) = cfg.final_round(n).expect("a final round");
+        assert_eq!((final_r, rem), (1, 7));
+        let (proof, root, z, y, domain) = final_case(&cfg, n);
+        check(&cfg, &proof, &root, &z, y, &domain).expect("honest");
+        let mut bad = proof.clone();
+        if let RoundOpenings::Extension(o) = &mut bad.rounds[final_r].openings {
+            o.next[0].values[0] += FE::one();
+        }
+        assert!(check(&cfg, &bad, &root, &z, y, &domain).is_err());
+        // Today's schedule refuses it (another fold word's chain).
+        assert!(check(&first(6, 4), &proof, &root, &z, y, &domain).is_err());
+    }
 }

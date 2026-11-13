@@ -592,6 +592,7 @@ fn final_levers(prep: WlfmPrep) -> WlfmLevers {
     WlfmLevers {
         prep,
         final_poly: multilinear::whir_chain::FinalPoly::Vars(6),
+        fold: None,
     }
 }
 
@@ -730,7 +731,15 @@ fn the_compact_encoding_round_trips_every_wlfm_proof_and_is_smaller() {
     for rate in [WlfmRate::Two, WlfmRate::Sixteen] {
         for prep in [WlfmPrep::Stacked, WlfmPrep::Evaluated] {
             for final_poly in [FinalPoly::Off, FinalPoly::Vars(6)] {
-                let build = under(&program, rate, WlfmLevers { prep, final_poly });
+                let build = under(
+                    &program,
+                    rate,
+                    WlfmLevers {
+                        prep,
+                        final_poly,
+                        fold: None,
+                    },
+                );
                 let proof = prove(&program, &build);
                 let bytes = super::wire::encode(&proof);
                 let back = super::wire::decode(&bytes)
@@ -779,5 +788,53 @@ fn the_compact_decoder_refuses_trailing_truncated_and_tampered_bytes() {
     match super::wire::decode(&flipped) {
         Err(_) => {}
         Ok(p) => assert!(verify_wlfm(&build.artifacts, &p, &p.public_words).is_err()),
+    }
+}
+
+// =============================================================================
+// The byte-minimising schedule (fold 5 after round 0, a final polynomial of 10)
+// =============================================================================
+
+/// ★ The fixture on the byte-minimising schedule, at blowup 2 and 16 under
+/// both bindings: verifies, folds 5 after round 0, sends a final polynomial,
+/// is smaller than today's chains, is another identity, and each format's
+/// proof is refused by the other's artifacts.
+#[test]
+fn the_byte_minimising_schedule_round_trips_smaller_and_is_another_identity() {
+    let _unground = test_format::set(None);
+    let program = honest();
+    for rate in [WlfmRate::Two, WlfmRate::Sixteen] {
+        for prep in [WlfmPrep::Stacked, WlfmPrep::Evaluated] {
+            let off = under(&program, rate, WlfmLevers::with_prep(prep));
+            let on = under(&program, rate, super::compress::folds_levers(prep));
+            assert_eq!(on.artifacts.config.log_folding, 5);
+            assert_eq!(
+                on.artifacts.config.num_queries,
+                off.artifacts.config.num_queries
+            );
+            assert_ne!(on.artifacts.program_id, off.artifacts.program_id);
+            assert_ne!(
+                on.artifacts.config.fold_word(),
+                off.artifacts.config.fold_word()
+            );
+            let proof = prove(&program, &on);
+            verify_wlfm(&on.artifacts, &proof, &proof.public_words)
+                .unwrap_or_else(|e| panic!("{rate:?} {prep:?}: {e}"));
+            let today = prove(&program, &off);
+            println!(
+                "FOLDS {rate:?} {prep:?}: {} B vs today {} B, {} final rounds",
+                proof_bytes(&proof),
+                proof_bytes(&today),
+                final_rounds(&proof).len()
+            );
+            assert!(proof_bytes(&proof) < proof_bytes(&today));
+            assert!(verify_wlfm(&off.artifacts, &proof, &proof.public_words).is_err());
+            assert!(verify_wlfm(&on.artifacts, &today, &today.public_words).is_err());
+            // The verifier re-derives the config from the levers: artifacts
+            // that claim the schedule without its fold are refused.
+            let mut restated = on.artifacts.clone();
+            restated.fold = None;
+            assert!(verify_wlfm(&restated, &proof, &proof.public_words).is_err());
+        }
     }
 }
