@@ -427,3 +427,62 @@ fn wide_narrow_and_streamed_prove_the_same_bytes() {
         "streamed"
     );
 }
+
+/// The production fill (straight into narrow columns, blocks in parallel) is
+/// the wide fill column for column, over a program whose rounds straddle
+/// chunks and blocks, with lane and felt blocks, IV and chained rows.
+#[test]
+fn the_direct_narrow_fill_is_the_wide_fill() {
+    use super::b3l_tables::{B3lHold, build_b3l_traces_held};
+    let mut b = LfmBuilder::new();
+    let mut cv = B3Cv::Iv;
+    for i in 0..100u64 {
+        let w: [Cell; 4] = core::array::from_fn(|j| {
+            let lanes: LfmWord = core::array::from_fn(|k| {
+                FE::from((i * 31 + j as u64 * 7 + k as u64) & 0xFFFF_FFFF)
+            });
+            b.digest_const(lanes).as_cell()
+        });
+        let block = if i % 3 == 0 {
+            B3Block::Felts([w[0], w[1]])
+        } else {
+            B3Block::Lanes(w)
+        };
+        let d = if i % 5 == 0 {
+            b.b3_compress_rev(cv, block, 64, (i % 16) as u8).0
+        } else {
+            b.b3_compress(cv, block, (i % 65) as u8, (i % 16) as u8)
+        };
+        cv = if i % 7 == 0 { B3Cv::Iv } else { B3Cv::Words(d) };
+        if i == 99 {
+            b.public(d[0]);
+        }
+    }
+    let program = compile(b.finish());
+    super::validator::validate(&program).expect("admissible");
+    let exec = execute(&program, &[], &HASHER).expect("executes");
+    let wide = build_b3l_traces_held(&program, &exec.records.b3l, B3lHold::Wide).expect("tables");
+    let narrow =
+        build_b3l_traces_held(&program, &exec.records.b3l, B3lHold::Narrow).expect("tables");
+    assert!(wide.rounds.len() > 1, "several round chunks");
+    let pairs = wide
+        .rounds
+        .iter()
+        .zip(&narrow.rounds)
+        .chain(wide.heads.iter().zip(&narrow.heads))
+        .chain(core::iter::once((&wide.table, &narrow.table)));
+    for (t, (w, n)) in pairs.enumerate() {
+        assert!(
+            matches!(n, super::b3l_tables::HeldTable::Narrow(_)),
+            "table {t} narrow"
+        );
+        assert_eq!(
+            (w.rows(), w.cols()),
+            (n.rows(), n.cols()),
+            "table {t} shape"
+        );
+        for c in 0..w.cols() {
+            assert_eq!(w.column(c), n.column(c), "table {t} column {c}");
+        }
+    }
+}
