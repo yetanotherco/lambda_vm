@@ -411,7 +411,11 @@ impl LfmFilled {
         same_hasher(artifacts.hasher, hasher)?;
         // The domains and twiddles this proof's tables need, built before it
         // takes the card rather than under it ([`super::domain_warm`]).
-        super::domain_warm::warm(&traces, options);
+        let built = super::domain_warm::warm(&traces, options);
+        #[cfg(feature = "parallel")]
+        super::whir_block_tree::hop_stamp(|| format!("prove domains built {built}"));
+        #[cfg(not(feature = "parallel"))]
+        let _ = built;
         let t = Instant::now();
         let waited_before = super::device_permit::waited_secs();
         let proof = prove_traces_under::<Fam>(
