@@ -41,12 +41,12 @@ libc = "0.2"
 libloading = { version = "0.8", optional = true }
 
 [features]
-# `blake3-6round` is on by default so the cubin's round count matches the host
-# tree's, which P-a Stage 6 moved to 6 by default for the same reason. These are
-# separate crates' features and the lockstep between them is what makes the
-# device and host hashes one hash; defaulting only one of them is precisely the
-# mismatch the parity tests would report as a wrong root.
-default = ["blake3-6round"]
+# `blake3-6round` is off by default so the cubin's round count matches the host
+# tree's: standard 7-round BLAKE3 in both. These are separate crates' features
+# and the lockstep between them is what makes the device and host hashes one
+# hash; turning on only one of them is precisely the mismatch the parity tests
+# would report as a wrong root.
+default = []
 # Test-only fault injection in FriCommitState. Production builds leave this
 # off so the fault check is fully elided at compile time.
 test-faults = []
