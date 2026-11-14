@@ -238,21 +238,136 @@ pub enum B3lHold {
     /// widens it. The production holding: a round chunk is ≈ 1.2 bytes a cell
     /// instead of 8.
     Narrow,
+    /// The round chunks as the compressions their rows come from
+    /// ([`B3lRoundRecords`], 112 bytes a compression against ≈ 3.2 KB of
+    /// packed rows): the card fills them as it uploads them, a host reader
+    /// gets this module's narrow fill. The head chunks and the byte table are
+    /// held narrow.
+    Records,
 }
 
-/// The holding a fill takes: [`B3lHold::Narrow`], or a test's override.
+/// `LAMBDA_VM_B3L_RECORDS=1`: the round chunks held as their records and
+/// filled on the card ([`B3lHold::Records`]). Off by default; a prover's
+/// choice, never the proof's. Read once a process.
+pub const RECORDS_ENV: &str = "LAMBDA_VM_B3L_RECORDS";
+
+/// The holding a fill takes: [`B3lHold::Narrow`], [`B3lHold::Records`] under
+/// [`RECORDS_ENV`], or a test's override.
 pub fn fill_hold() -> B3lHold {
     #[cfg(test)]
     if let Some(hold) = test_hold::get() {
         return hold;
     }
-    B3lHold::Narrow
+    static RECORDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *RECORDS.get_or_init(|| std::env::var(RECORDS_ENV).is_ok_and(|v| v.trim() == "1")) {
+        B3lHold::Records
+    } else {
+        B3lHold::Narrow
+    }
+}
+
+/// A lean round chunk held as the compressions that reach into it: rows
+/// `[skip, skip + rows)` of the table they make, 7 rows a compression, rows
+/// past the last zero. The card fills its columns from them
+/// (`math_cuda::fill`, `fill_b3l_round`); a host reader gets
+/// [`fill_round_rows`]'s narrow fill of the same rows.
+#[derive(Debug)]
+pub struct B3lRoundRecords {
+    ops: Vec<multilinear::records::B3lRoundOp>,
+    skip: usize,
+    rows: usize,
+}
+
+impl multilinear::records::TableRecords for B3lRoundRecords {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn cols(&self) -> usize {
+        round::NUM_COLUMNS
+    }
+
+    fn fill(&self) -> multilinear::records::RecordsFill<'_> {
+        multilinear::records::RecordsFill::B3lRound {
+            ops: &self.ops,
+            skip: self.skip,
+        }
+    }
+
+    fn host_fill(&self) -> Option<multilinear::narrow::NarrowColumns> {
+        let total = l::ROUNDS * self.ops.len();
+        let (packed, _) = fill_narrow(self.rows, &round_widths(), |first, len, scratch, hist| {
+            let lo = self.skip + first;
+            let hi = (lo + len).min(total);
+            fill_round_rows(lo, hi, scratch, hist, |k| {
+                let op = &self.ops[k];
+                (op_values(op), op.block_len, op.flags, op.tag)
+            });
+        })?;
+        Some(packed)
+    }
+}
+
+/// A record's chaining value and block, as the executor's values.
+fn op_values(op: &multilinear::records::B3lRoundOp) -> B3lValues {
+    let mut block = [0u8; 64];
+    for (i, w) in op.m.iter().enumerate() {
+        block[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    B3lValues { h: op.h, block }
+}
+
+/// Round rows `[lo, hi)` of the table compressions `op(k)` make (row
+/// `7k + r` is round `r` of compression `k`), written into `scratch` from its
+/// first row; each compression's lookups counted into `hist` only by the
+/// rows holding its first round.
+fn fill_round_rows(
+    lo: usize,
+    hi: usize,
+    scratch: &mut [FE],
+    hist: &mut TableHist,
+    op: impl Fn(usize) -> (B3lValues, u32, u32, u64),
+) {
+    if lo >= hi {
+        return;
+    }
+    let width = round::NUM_COLUMNS;
+    let mut rows = zeroed_fe_vec(l::ROUNDS * width);
+    let mut skip = TableHist::default();
+    for k in lo / l::ROUNDS..hi.div_ceil(l::ROUNDS) {
+        let (values, block_len, flags, tag) = op(k);
+        rows.iter_mut().for_each(|v| *v = FE::zero());
+        let counted = if (lo..hi).contains(&(l::ROUNDS * k)) {
+            &mut *hist
+        } else {
+            &mut skip
+        };
+        lean::fill_rounds(
+            &mut rows,
+            tag,
+            &values,
+            block_len,
+            flags,
+            None,
+            l::ROUNDS,
+            counted,
+        );
+        for r in 0..l::ROUNDS {
+            let global = l::ROUNDS * k + r;
+            if (lo..hi).contains(&global) {
+                let at = (global - lo) * width;
+                scratch[at..at + width].copy_from_slice(&rows[r * width..(r + 1) * width]);
+            }
+        }
+    }
 }
 
 /// One lean table as the host holds it.
 pub enum HeldTable {
     Wide(Box<TraceTable<F, E>>),
     Narrow(multilinear::narrow::NarrowColumns),
+    /// The rows' records ([`B3lRoundRecords`]): the card fills them.
+    Records(multilinear::records::Records),
 }
 
 impl HeldTable {
@@ -260,7 +375,7 @@ impl HeldTable {
     fn from_rows(data: Vec<FE>, width: usize, hold: B3lHold) -> Self {
         match hold {
             B3lHold::Wide => HeldTable::Wide(Box::new(TraceTable::new_main(data, width, 1))),
-            B3lHold::Narrow => {
+            B3lHold::Narrow | B3lHold::Records => {
                 use math::field::traits::IsPrimeField;
                 let words: Vec<u64> = data
                     .iter()
@@ -279,6 +394,7 @@ impl HeldTable {
         match self {
             HeldTable::Wide(t) => t.num_rows(),
             HeldTable::Narrow(p) => p.rows(),
+            HeldTable::Records(r) => r.rows(),
         }
     }
 
@@ -286,14 +402,20 @@ impl HeldTable {
         match self {
             HeldTable::Wide(t) => t.main_table.width,
             HeldTable::Narrow(p) => p.cols(),
+            HeldTable::Records(r) => r.cols(),
         }
     }
 
-    /// Column `c` as field elements.
+    /// Column `c` as field elements (a records table's from its host fill:
+    /// slow, a reader's and a test's).
     pub fn column(&self, c: usize) -> Vec<FE> {
         match self {
             HeldTable::Wide(t) => (0..t.num_rows()).map(|r| *t.main_table.get(r, c)).collect(),
             HeldTable::Narrow(p) => p.column(c).into_iter().map(FE::from).collect(),
+            HeldTable::Records(r) => r
+                .host_fill()
+                .map(|p| p.column(c).into_iter().map(FE::from).collect())
+                .unwrap_or_default(),
         }
     }
 
@@ -302,7 +424,13 @@ impl HeldTable {
         match self {
             HeldTable::Wide(t) => *t.main_table.get(row, col),
             HeldTable::Narrow(p) => FE::from(p.column(col)[row]),
+            HeldTable::Records(_) => self.column(col)[row],
         }
+    }
+
+    /// Whether the table is held as its records.
+    pub fn is_records(&self) -> bool {
+        matches!(self, HeldTable::Records(_))
     }
 
     /// The table moved out, an empty one left behind.
@@ -318,7 +446,7 @@ impl HeldTable {
     pub fn wide_mut(&mut self) -> Option<&mut TraceTable<F, E>> {
         match self {
             HeldTable::Wide(t) => Some(t.as_mut()),
-            HeldTable::Narrow(_) => None,
+            HeldTable::Narrow(_) | HeldTable::Records(_) => None,
         }
     }
 }
@@ -463,6 +591,13 @@ pub fn build_b3l_traces_held(
         let canon = |c: usize| GoldilocksField::canonical(prep[c].value()) as u32;
         (prep, canon(l::BLEN), canon(l::FLAGS))
     };
+    // The card's path: the round chunks held as their records (the card fills
+    // them), the heads and the byte table narrow.
+    if hold == B3lHold::Records
+        && let Some(traces) = fill_records(n, &shape, &consts, records)
+    {
+        return Some(traces);
+    }
     // The production path: every chunk filled block by block straight into its
     // narrow columns, blocks in parallel. Falls back to the path below if a
     // value outgrows its column's width (never on an honest fill).
@@ -573,7 +708,7 @@ pub fn build_b3l_traces_held(
     let table = lean::table_trace(&hist);
     let table = match hold {
         B3lHold::Wide => HeldTable::Wide(Box::new(table)),
-        B3lHold::Narrow => {
+        B3lHold::Narrow | B3lHold::Records => {
             let width = table::NUM_COLUMNS;
             HeldTable::from_rows(table.main_table.row_major_data().to_vec(), width, hold)
         }
@@ -707,7 +842,6 @@ fn fill_narrow_direct<'p>(
 ) -> Option<B3lTraces> {
     let total = l::ROUNDS * n;
     let widths = round_widths();
-    let width = round::NUM_COLUMNS;
     let mut hist = TableHist::default();
     let mut rounds = Vec::with_capacity(shape.rounds.len());
     let mut start = 0usize;
@@ -716,48 +850,133 @@ fn fill_narrow_direct<'p>(
         let (packed, part) = fill_narrow(size, &widths, |first, len, scratch, hist| {
             let lo = chunk_start + first;
             let hi = (lo + len).min(total);
-            if lo >= hi {
-                return;
-            }
-            let mut rows = zeroed_fe_vec(l::ROUNDS * width);
-            let mut skip = TableHist::default();
-            let k_lo = lo / l::ROUNDS;
-            for (k, record) in records
-                .iter()
-                .enumerate()
-                .take(hi.div_ceil(l::ROUNDS))
-                .skip(k_lo)
-            {
+            fill_round_rows(lo, hi, scratch, hist, |k| {
                 let (_, block_len, flags) = consts(k);
-                rows.iter_mut().for_each(|v| *v = FE::zero());
-                let counted = if (lo..hi).contains(&(l::ROUNDS * k)) {
-                    &mut *hist
-                } else {
-                    &mut skip
-                };
-                lean::fill_rounds(
-                    &mut rows,
-                    l::tag_for_row(k),
-                    record,
-                    block_len,
-                    flags,
-                    None,
-                    l::ROUNDS,
-                    counted,
-                );
-                for r in 0..l::ROUNDS {
-                    let global = l::ROUNDS * k + r;
-                    if (lo..hi).contains(&global) {
-                        let at = (global - lo) * width;
-                        scratch[at..at + width].copy_from_slice(&rows[r * width..(r + 1) * width]);
-                    }
-                }
-            }
+                (records[k], block_len, flags, l::tag_for_row(k))
+            });
         })?;
         hist = hist.merge(&part);
         rounds.push(HeldTable::Narrow(packed));
         start += size;
     }
+    let widths = head_widths();
+    let width = head::NUM_COLUMNS;
+    let mut heads = Vec::with_capacity(shape.heads.len());
+    let mut start = 0usize;
+    for &size in &shape.heads {
+        let chunk_start = start;
+        let (packed, part) = fill_narrow(size, &widths, |first, len, scratch, hist| {
+            let lo = chunk_start + first;
+            let hi = (lo + len).min(n);
+            for (k, record) in records.iter().enumerate().take(hi).skip(lo) {
+                let (prep, block_len, flags) = consts(k);
+                let fs = lean::final_state(record, block_len, flags);
+                let at = (k - lo) * width;
+                lean::fill_head(&mut scratch[at..at + width], prep, record, &fs, hist);
+            }
+        })?;
+        hist = hist.merge(&part);
+        heads.push(HeldTable::Narrow(packed));
+        start += size;
+    }
+    let table = lean::table_trace(&hist);
+    let table = HeldTable::from_rows(
+        table.main_table.row_major_data().to_vec(),
+        table::NUM_COLUMNS,
+        B3lHold::Narrow,
+    );
+    Some(B3lTraces {
+        rounds,
+        heads,
+        table,
+    })
+}
+
+/// [`build_b3l_traces_held`]'s records path: each round chunk held as the
+/// compressions that reach into it, the byte table's counts made on the host
+/// from every compression once (its rows written to a scratch and dropped),
+/// the head chunks filled narrow.
+fn fill_records<'p>(
+    n: usize,
+    shape: &B3lShape,
+    consts: &(dyn Fn(usize) -> (&'p [FE], u32, u32) + Sync),
+    records: &[B3lValues],
+) -> Option<B3lTraces> {
+    let op_of = |k: usize| {
+        let (_, block_len, flags) = consts(k);
+        let values = &records[k];
+        multilinear::records::B3lRoundOp {
+            h: values.h,
+            m: values.message(),
+            block_len,
+            flags,
+            tag: l::tag_for_row(k),
+        }
+    };
+    let total = l::ROUNDS * n;
+    let mut rounds = Vec::with_capacity(shape.rounds.len());
+    let mut start = 0usize;
+    for &size in &shape.rounds {
+        let end = (start + size).min(total);
+        let (k_lo, k_hi) = if start < end {
+            (start / l::ROUNDS, end.div_ceil(l::ROUNDS))
+        } else {
+            (n, n)
+        };
+        let ops: Vec<_> = (k_lo..k_hi).map(op_of).collect();
+        let skip = start.saturating_sub(l::ROUNDS * k_lo);
+        rounds.push(HeldTable::Records(multilinear::records::Records(
+            std::sync::Arc::new(B3lRoundRecords {
+                ops,
+                skip,
+                rows: size,
+            }),
+        )));
+        start += size;
+    }
+    // The byte table counts every compression's round lookups once.
+    let count = |k: usize, rows: &mut Vec<FE>, hist: &mut TableHist| {
+        let (_, block_len, flags) = consts(k);
+        lean::fill_rounds(
+            rows,
+            l::tag_for_row(k),
+            &records[k],
+            block_len,
+            flags,
+            None,
+            l::ROUNDS,
+            hist,
+        );
+    };
+    #[cfg(feature = "parallel")]
+    let mut hist = {
+        use rayon::prelude::*;
+        (0..n)
+            .into_par_iter()
+            .fold(
+                || {
+                    (
+                        TableHist::default(),
+                        zeroed_fe_vec(l::ROUNDS * round::NUM_COLUMNS),
+                    )
+                },
+                |(mut hist, mut rows), k| {
+                    count(k, &mut rows, &mut hist);
+                    (hist, rows)
+                },
+            )
+            .map(|(hist, _)| hist)
+            .reduce(TableHist::default, |a, b| a.merge(&b))
+    };
+    #[cfg(not(feature = "parallel"))]
+    let mut hist = {
+        let mut hist = TableHist::default();
+        let mut rows = zeroed_fe_vec(l::ROUNDS * round::NUM_COLUMNS);
+        for k in 0..n {
+            count(k, &mut rows, &mut hist);
+        }
+        hist
+    };
     let widths = head_widths();
     let width = head::NUM_COLUMNS;
     let mut heads = Vec::with_capacity(shape.heads.len());

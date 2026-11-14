@@ -426,6 +426,13 @@ fn wide_narrow_and_streamed_prove_the_same_bytes() {
         bytes(B3lHold::Narrow, WlfmProving::Streamed),
         "streamed"
     );
+    // The round chunks as their records: on a card build the card fills them.
+    assert_eq!(wide, bytes(B3lHold::Records, WlfmProving::Held), "records");
+    assert_eq!(
+        wide,
+        bytes(B3lHold::Records, WlfmProving::Streamed),
+        "records, streamed"
+    );
 }
 
 /// The production fill (straight into narrow columns, blocks in parallel) is
@@ -464,6 +471,34 @@ fn the_direct_narrow_fill_is_the_wide_fill() {
     let wide = build_b3l_traces_held(&program, &exec.records.b3l, B3lHold::Wide).expect("tables");
     let narrow =
         build_b3l_traces_held(&program, &exec.records.b3l, B3lHold::Narrow).expect("tables");
+    let records =
+        build_b3l_traces_held(&program, &exec.records.b3l, B3lHold::Records).expect("tables");
+    assert!(
+        records.rounds.iter().all(|t| t.is_records()),
+        "round chunks as records"
+    );
+    for (t, (n, r)) in narrow.rounds.iter().zip(&records.rounds).enumerate() {
+        assert_eq!(
+            (n.rows(), n.cols()),
+            (r.rows(), r.cols()),
+            "round chunk {t} shape"
+        );
+        for c in 0..n.cols() {
+            assert_eq!(n.column(c), r.column(c), "round chunk {t} column {c}");
+        }
+    }
+    for (t, (n, r)) in narrow.heads.iter().zip(&records.heads).enumerate() {
+        for c in 0..n.cols() {
+            assert_eq!(n.column(c), r.column(c), "head chunk {t} column {c}");
+        }
+    }
+    for c in 0..narrow.table.cols() {
+        assert_eq!(
+            narrow.table.column(c),
+            records.table.column(c),
+            "byte table column {c}"
+        );
+    }
     assert!(wide.rounds.len() > 1, "several round chunks");
     let pairs = wide
         .rounds
