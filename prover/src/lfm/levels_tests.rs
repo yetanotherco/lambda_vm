@@ -3,7 +3,9 @@
 //! make each piece load-bearing. Every test proves a block's base: box tier.
 
 use super::executor::execute;
-use super::levels::{STOP_GROUPS, derive_levels, prove_levels, verify_levels};
+use super::levels::{
+    LevelStop, derive_levels, derive_levels_to, prove_levels, verify_levels, verify_levels_to,
+};
 use super::whir_block::{LeafChecks, block_leaf_arena, top_claims};
 use super::whir_block_tests::{at_blowup_4, plan_of, small_block, small_format};
 use super::wlfm::{WlfmFamily, verify_wlfm};
@@ -84,10 +86,7 @@ fn the_levels_prove_a_small_block_to_its_last_level() {
     let (elf, proof) = small_block("test_commit_4", &format);
     let plan = plan_of(&elf, &proof, &format, Some(1));
     let levels = derive_levels(&plan, WlfmFamily::P1, false).expect("the levels derive");
-    assert!(
-        levels.last().expect("a level").build.artifacts.sizes.len() <= STOP_GROUPS,
-        "the chain stops at one group"
-    );
+    assert_eq!(levels.len(), 2, "the default chain is two levels");
     let (proofs, secs) = prove_levels(&plan, &levels, &proof).expect("every level proves");
     for (k, (level, p)) in levels.iter().zip(&proofs).enumerate() {
         verify_wlfm(&level.build.artifacts, p, &p.public_words)
@@ -121,4 +120,24 @@ fn the_levels_refuse_a_family_with_no_arm() {
     let (elf, proof) = small_block("test_commit_4", &format);
     let plan = plan_of(&elf, &proof, &format, Some(1));
     assert!(derive_levels(&plan, WlfmFamily::B3, true).is_err());
+}
+
+/// A chain stopped at one group instead (the compression modes' rule) proves
+/// and verifies under its own constant, and the default verifier refuses its
+/// last proof when the chains differ in length.
+#[test]
+#[ignore = "proves a small block and its levels; box tier"]
+fn a_chain_stopped_at_one_group_is_its_own_verifiers() {
+    let format = at_blowup_4(small_format());
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let plan = plan_of(&elf, &proof, &format, Some(1));
+    let stop = LevelStop::Groups(1);
+    let levels = derive_levels_to(&plan, WlfmFamily::P1, stop, false).expect("derives");
+    assert!(levels.last().expect("a level").build.artifacts.sizes.len() <= 1);
+    let (proofs, _) = prove_levels(&plan, &levels, &proof).expect("proves");
+    let last = proofs.last().expect("a last level");
+    verify_levels_to(&plan, WlfmFamily::P1, stop, last).expect("its own verifier accepts");
+    if levels.len() != 2 {
+        assert!(verify_levels(&plan, WlfmFamily::P1, last).is_err());
+    }
 }
