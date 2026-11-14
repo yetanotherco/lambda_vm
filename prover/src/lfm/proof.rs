@@ -114,6 +114,14 @@ pub struct ProveSplit {
 
 thread_local! {
     static LAST_PROVE_SPLIT: Cell<Option<ProveSplit>> = const { Cell::new(None) };
+    static LAST_FILL_SPLIT: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
+}
+
+/// Take the most recent executed fill's split ON THIS THREAD, clearing it:
+/// the seconds of the fixed chip set's traces, then of the lean BLAKE3
+/// tables'. `None` when nothing filled here since the last take.
+pub fn take_fill_split() -> Option<(f64, f64)> {
+    LAST_FILL_SPLIT.with(|c| c.take())
 }
 
 /// Take the split of the most recent prove ON THIS THREAD, clearing it.
@@ -322,9 +330,11 @@ pub(crate) fn lfm_fill_executed_under(
 
     let t = Instant::now();
     let traces = build_traces_with_merge(program, &records, hasher, plan);
+    let chips_secs = t.elapsed().as_secs_f64();
     let b3l = super::b3l_tables::build_b3l_traces(program, &b3l_records);
     drop(b3l_records);
     let fill_secs = t.elapsed().as_secs_f64();
+    LAST_FILL_SPLIT.with(|c| c.set(Some((chips_secs, fill_secs - chips_secs))));
     // Same reason, larger: the records are what the fill consumes, and they are
     // dead the moment it returns. The traces it produced are the live set from
     // here on; holding the records as well doubles the values through the card

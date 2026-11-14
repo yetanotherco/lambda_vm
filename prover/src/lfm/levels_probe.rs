@@ -9,7 +9,15 @@
 //! Words (the card test): `RTP_LOGN` (compressions, log2, comma list; 16 by
 //! default), `RTP_FAMILY` (`b3` or `p1`, comma list; `b3`), `RTP_XALU` (field
 //! rows a compression; 15, about the 200 non-hash cells a compression a
-//! verified group spends), `RTP_RUNS` (timed runs after a warm-up; 1).
+//! verified group spends), `RTP_RUNS` (timed runs after a warm-up; 1),
+//! `RTP_PROVE` (0: execute and fill only, no build or prove — the host seams
+//! alone, for a host without a card; 1 by default).
+//!
+//! Each run prints its fill's split (the fixed chips' traces, the lean
+//! tables') and, when it proves, the prove's split (host preparation, phase A,
+//! phase B) and the card ledger's budget and promise at its start; the last
+//! run also prints one `RTP GROUP` line a group (its stamps: uploads, commit,
+//! argue, codewords, openings, and the ledger's promises in GiB).
 
 use std::time::Instant;
 
@@ -158,6 +166,7 @@ fn the_level_probe_proves_at_a_small_size() {
 fn rtp_a_level_sized_lean_program_on_the_card() {
     let xalu: usize = env_list("RTP_XALU", "15")[0].parse().expect("RTP_XALU");
     let runs: usize = env_list("RTP_RUNS", "1")[0].parse().expect("RTP_RUNS");
+    let prove_it = env_list("RTP_PROVE", "1")[0] != "0";
     for logn in env_list("RTP_LOGN", "16") {
         let logn: u32 = logn.parse().expect("RTP_LOGN");
         let queries = (1usize << logn).div_ceil(PER_QUERY);
@@ -171,6 +180,37 @@ fn rtp_a_level_sized_lean_program_on_the_card() {
                 "p1" => WlfmFamily::P1,
                 other => panic!("RTP_FAMILY {other}: b3 or p1"),
             };
+            if !prove_it {
+                for run in 0..=runs {
+                    let t = Instant::now();
+                    let execution = super::executor::execute(&program, &arenas, &HASHER)
+                        .expect("the program executes");
+                    let execute = t.elapsed().as_secs_f64();
+                    let t = Instant::now();
+                    let filled = super::proof::lfm_fill_executed_under(
+                        &program,
+                        execution,
+                        HASHER,
+                        execute,
+                        &Vec::new(),
+                    );
+                    let fill = t.elapsed().as_secs_f64();
+                    drop(filled);
+                    let (chips, lean) = super::proof::take_fill_split().unwrap_or_default();
+                    println!(
+                        "RTP HOST logn {logn} · run {run} · compressions {n} · instructions {} · \
+                         execute {execute:.3}s · fill {fill:.3}s (chips {chips:.3}s · lean \
+                         {lean:.3}s) · us a compression: execute {:.3} · fill {:.3} (chips {:.3} \
+                         · lean {:.3})",
+                        program.instrs.len(),
+                        1e6 * execute / n as f64,
+                        1e6 * fill / n as f64,
+                        1e6 * chips / n as f64,
+                        1e6 * lean / n as f64,
+                    );
+                }
+                break;
+            }
             let t = Instant::now();
             let build = build_wlfm_under(
                 &program,
@@ -211,10 +251,56 @@ fn rtp_a_level_sized_lean_program_on_the_card() {
                     &Vec::new(),
                 );
                 let fill = t.elapsed().as_secs_f64();
+                let (chips, lean) = super::proof::take_fill_split().unwrap_or_default();
                 let t = Instant::now();
                 let proof = prove_wlfm_traces_as(&build, filled, true, WlfmProving::Streamed)
                     .expect("proves");
                 let prove = t.elapsed().as_secs_f64();
+                let st = super::wlfm::take_wlfm_stamps().unwrap_or_default();
+                let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                println!(
+                    "RTP SPLIT logn {logn} · family {family:?} · run {run} · fill chips \
+                     {chips:.3}s · fill lean {lean:.3}s · prove prep {:.3}s · phase A {:.3}s · \
+                     phase B {:.3}s · card budget {:.2} GiB · promised at the start {:.2} GiB",
+                    st.prep,
+                    st.phase_a,
+                    st.phase_b,
+                    gib(st.card_budget),
+                    gib(st.card_reserved_at_start),
+                );
+                if run == runs {
+                    for (g, s) in st.groups.iter().enumerate() {
+                        println!(
+                            "RTP GROUP logn {logn} · family {family:?} · group {g} · tables {} · \
+                             polys {} · cells {} · up A {:.3}s (paid {:.3}) · commit {:.3}s · \
+                             pack {:.3}s · ood {:.3}s · up B {:.3}s · argue {:.3}s · encode \
+                             {:.3}s · open {:.3}s (paid {:.3}) · turn {:.3}-{:.3}s · overlapped \
+                             {} · GiB promised: commit {:.2}/{:.2} · argue {:.2}/{:.2} · open \
+                             {:.2}",
+                            s.tables,
+                            s.polys,
+                            s.cells,
+                            s.upload_a,
+                            s.upload_paid,
+                            s.commit,
+                            s.pack,
+                            s.ood,
+                            s.upload_b,
+                            s.argue,
+                            s.encode,
+                            s.open,
+                            s.open_paid,
+                            s.start_b,
+                            s.end_b,
+                            s.overlapped,
+                            gib(s.commit_base),
+                            gib(s.commit_reserved),
+                            gib(s.argue_base),
+                            gib(s.argue_reserved),
+                            gib(s.open_reserved),
+                        );
+                    }
+                }
                 let t = Instant::now();
                 verify_wlfm(a, &proof, &proof.public_words).expect("verifies");
                 let verify = t.elapsed().as_secs_f64();
