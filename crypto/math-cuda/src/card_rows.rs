@@ -144,9 +144,25 @@ pub fn builds_words() -> bool {
 /// A test's override of the knob (0: none; 1 + the mode's index).
 static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
-/// The mode this process uploads in. An unknown word is reported once and
-/// read as [`Mode::Off`], the upload as it was; the block's report line
-/// names the mode in force.
+/// The knob's reading, once a process ([`Mode::parse`]): its mode, or the
+/// error naming the values it takes. A block prove refuses on the error
+/// ([`setting`]), before any upload reads the mode.
+fn from_env() -> &'static Result<Mode, String> {
+    static FROM_ENV: OnceLock<Result<Mode, String>> = OnceLock::new();
+    FROM_ENV.get_or_init(|| Mode::parse(std::env::var(CARD_ROWS_ENV).ok().as_deref()))
+}
+
+/// [`CARD_ROWS_ENV`]'s setting: the mode it names, or an error naming the
+/// values it takes (`off`, `order`, `words`) for any other word, a stale
+/// `derive`, `1` or `registers` among them. A block prove calls this at its
+/// start and refuses on the error, so a stale word never runs as another mode.
+pub fn setting() -> Result<Mode, String> {
+    from_env().clone()
+}
+
+/// The mode this process uploads in. A word the knob does not take reads as
+/// [`Mode::Off`] here, but a block prove has refused it first ([`setting`]);
+/// the block's report line names the mode in force.
 pub fn mode() -> Mode {
     match OVERRIDE.load(Ordering::Relaxed) {
         1 => return Mode::Off,
@@ -156,16 +172,7 @@ pub fn mode() -> Mode {
         5 => return Mode::Words,
         _ => {}
     }
-    static FROM_ENV: OnceLock<Mode> = OnceLock::new();
-    *FROM_ENV.get_or_init(
-        || match Mode::parse(std::env::var(CARD_ROWS_ENV).ok().as_deref()) {
-            Ok(mode) => mode,
-            Err(e) => {
-                eprintln!("[gpu] {e}; the upload is as it was (off)");
-                Mode::Off
-            }
-        },
-    )
+    from_env().clone().unwrap_or(Mode::Off)
 }
 
 /// A test's mode, over the knob's (`None` gives the knob back).

@@ -4466,6 +4466,27 @@ pub fn card_rows_builds_registers() -> bool {
     }
 }
 
+/// `LAMBDA_VM_CARD_ROWS`'s refusal: an error naming the values it takes for
+/// any word it does not take (a stale `derive`, `1` or `registers` among
+/// them), for a block prove to refuse on before it uploads. A build without
+/// the card does not read the word.
+pub fn card_rows_refusal() -> Result<(), String> {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::card_rows::setting().map(|_| ())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Ok(())
+    }
+}
+
+/// [`card_rows_refusal`] of a given word (`None`: unset), for a test.
+#[cfg(feature = "cuda")]
+pub fn card_rows_refusal_of(word: Option<&str>) -> Result<(), String> {
+    math_cuda::card_rows::Mode::parse(word).map(|_| ())
+}
+
 /// Whether the walk writes MEMW_R's register rows as words for the card to
 /// build them from (`LAMBDA_VM_CARD_ROWS=words`). `false` without the card.
 pub fn card_rows_builds_words() -> bool {
