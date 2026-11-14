@@ -2758,7 +2758,7 @@ impl ChipRows {
                 Instr::BitDec { .. } => &mut rows.bitdec,
                 Instr::Const { .. } => &mut rows.consts,
                 Instr::Public { .. } => &mut rows.public,
-                Instr::KeccakF(_) | Instr::Blake3(_) => &mut rows.accel,
+                Instr::KeccakF(_) | Instr::Blake3(_) | Instr::B3l(_) => &mut rows.accel,
             };
             *chip += 1;
         }

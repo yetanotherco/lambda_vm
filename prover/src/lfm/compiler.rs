@@ -121,6 +121,10 @@ pub struct LfmColumnGroups {
     pub lanes: ColumnGroup,
     pub hint: ColumnGroup,
     pub public: ColumnGroup,
+    /// `B3L_HEAD`'s instruction group: one row an [`Instr::B3l`]
+    /// ([`layout::b3l`]). Empty in every program that has no such row, and
+    /// outside the fixed STARK chip set: only the block prover proves it.
+    pub b3l: ColumnGroup,
 }
 
 /// A compiled LFM program: multiplicity-backfilled instructions plus the
@@ -415,6 +419,16 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
                     h.mults[i] = take(h.outs[i], &mut written, &mut read_counts);
                 }
             }
+            Instr::B3l(k) => {
+                for i in 0..layout::b3l::DIGEST_WORDS {
+                    k.mults[i] = take(k.outs[i], &mut written, &mut read_counts);
+                }
+                if let Some(rev) = &mut k.rev {
+                    for i in 0..layout::b3l::DIGEST_WORDS {
+                        rev.mults[i] = take(rev.outs[i], &mut written, &mut read_counts);
+                    }
+                }
+            }
             Instr::Public { .. } => {}
         }
     }
@@ -471,6 +485,7 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
     let mut lanes = ColumnGroupBuilder::new(layout::lanes::PREP_WIDTH);
     let mut hint = ColumnGroupBuilder::new(layout::hint::PREP_WIDTH);
     let mut public = ColumnGroupBuilder::new(layout::public::PREP_WIDTH);
+    let mut b3l = ColumnGroupBuilder::new(layout::b3l::PREP_WIDTH);
 
     for instr in instrs {
         match instr {
@@ -662,6 +677,50 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 }
                 blake3.set(r, l::MU, FE::one());
             }
+            Instr::B3l(op) => {
+                use super::instr::{B3lBlock, B3lCv};
+                use layout::b3l as l;
+                // The tag is the row ordinal + 1, so uniqueness is structural
+                // and the prover has no say (it is preprocessed data).
+                let tag = l::tag_for_row(b3l.next_row());
+                let r = b3l.open_row();
+                b3l.set(r, l::MU, FE::one());
+                b3l.set(r, l::TAG, fe(tag));
+                match &op.cv {
+                    B3lCv::Iv => b3l.set(r, l::IVF, FE::one()),
+                    B3lCv::Words(w) => {
+                        for (j, a) in w.iter().enumerate() {
+                            b3l.set(r, l::haddr(j), fe(a.0));
+                        }
+                    }
+                }
+                match &op.block {
+                    B3lBlock::Lanes(w) => {
+                        b3l.set(r, l::MLANES, FE::one());
+                        for (j, a) in w.iter().enumerate() {
+                            b3l.set(r, l::maddr(j), fe(a.0));
+                        }
+                    }
+                    B3lBlock::Felts(w) => {
+                        b3l.set(r, l::MFELTS, FE::one());
+                        for (j, a) in w.iter().enumerate() {
+                            b3l.set(r, l::maddr(j), fe(a.0));
+                        }
+                    }
+                }
+                b3l.set(r, l::BLEN, fe(u64::from(op.block_len)));
+                b3l.set(r, l::FLAGS, fe(u64::from(op.flags)));
+                for j in 0..l::DIGEST_WORDS {
+                    b3l.set(r, l::oaddr(j), fe(op.outs[j].0));
+                    b3l.set(r, l::ocnt(j), fe(op.mults[j]));
+                }
+                if let Some(rev) = &op.rev {
+                    for j in 0..l::DIGEST_WORDS {
+                        b3l.set(r, l::raddr(j), fe(rev.outs[j].0));
+                        b3l.set(r, l::rcnt(j), fe(rev.mults[j]));
+                    }
+                }
+            }
             // A `HintOn` is a hint row: which arena word it read is the
             // executor's, not the row's.
             Instr::Hint { out, mult, .. } | Instr::HintOn { out, mult, .. } => {
@@ -716,5 +775,6 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
         lanes: lanes.finish(),
         hint: hint.finish(),
         public: public.finish(),
+        b3l: b3l.finish(),
     }
 }

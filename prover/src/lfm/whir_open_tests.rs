@@ -168,7 +168,7 @@ fn histogram(program: &LfmProgram) -> String {
             Instr::Public { .. } => 9,
             // No byte hash is reachable from this leg under the algebraic pin;
             // counted so a change that reached one would show here.
-            Instr::KeccakF(_) | Instr::Blake3(_) => 10,
+            Instr::KeccakF(_) | Instr::Blake3(_) | Instr::B3l(_) => 10,
         };
         counts[i] += 1;
     }
