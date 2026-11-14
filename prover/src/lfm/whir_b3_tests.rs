@@ -1714,3 +1714,116 @@ fn the_production_blake3_run_costs_its_closed_form() {
         }
     }
 }
+
+/// The levers on the production BLAKE3 run's compressions, by closed form: the
+/// default (one run of three 2^27 polynomials, one tree a run), then one
+/// setting moved at a time — the query grind, the blowup, the first fold, the
+/// later folds, the binary cap, the run width — each with its query count and
+/// its compressions, and the default's per-round split (current tree and
+/// successor, a query). Prints; asserts nothing but that the forms run.
+#[test]
+#[ignore = "census: prints the levers' closed forms"]
+fn the_production_blake3_run_levers_by_closed_form() {
+    use super::whir_chain::{ChainShape, chain_perms};
+    use super::whir_transcript::SpongeEntry;
+    use crate::zf_format::ZfFormat;
+    use multilinear::whir_chain::{
+        CapPolicy, ChainConfig, FirstFold, GrindBits, GroupFold, Round0Trees, WhirFolds,
+    };
+    let zf = ZfFormat::DEFAULT;
+    let n = zf.whir_stack.get();
+    let build = |log_blowup: usize, log_folding: usize, k0: usize, grind: u8, cap: Option<u8>| {
+        let base = ChainConfig::with_security_folds(
+            log_blowup,
+            log_folding,
+            WhirFolds::First(FirstFold::new(k0).expect("a first fold")),
+            n,
+            128,
+            GrindBits {
+                folding: 0,
+                ood: 0,
+                query: grind,
+            },
+        );
+        let mut config = zf.chain(base);
+        // The format's own folds would replace the lever's: the query count
+        // above was derived under the lever's, so they are put back.
+        config.format.folds = base.format.folds;
+        config.format.group = GroupFold::Indexed;
+        config.format.leaves = zf.whir_leaves;
+        config.format.round0 = Round0Trees::One;
+        if let Some(c) = cap {
+            config.format.cap = CapPolicy::Fixed(c);
+        }
+        config
+    };
+    let run = |config: &ChainConfig, polys: usize| {
+        let shape = ChainShape::for_hash(config, n, WrapHash::Blake3).run(polys);
+        let total = chain_perms(&shape, SpongeEntry::fresh_for(WrapHash::Blake3));
+        (shape, total)
+    };
+    let (base_shape, base) = run(&build(1, 4, 6, 18, None), 3);
+    println!(
+        "LEVER base: Q {} · schedule {:?} · caps {:?} · domains {:?} · {base} compressions",
+        base_shape.num_queries, base_shape.schedule, base_shape.caps, base_shape.domain_log
+    );
+    // The default's split, a query: round r's current opening (per tree at
+    // round 0) and its successor's.
+    for r in 0..base_shape.rounds() {
+        let current = base_shape.trees_at(r)
+            * base_shape.opening_perms(
+                base_shape.current_felts(r),
+                base_shape.current_depth(r),
+                base_shape.caps[r],
+            );
+        let successor = base_shape.next_depth(r).map_or(0, |d| {
+            base_shape.opening_perms(3 << base_shape.schedule[r + 1], d, base_shape.caps[r + 1])
+        });
+        println!(
+            "LEVER split round {r}: tree depth {} cap {} · current {current} + successor {successor} \
+             = {} a query · {} at Q",
+            base_shape.current_depth(r),
+            base_shape.caps[r],
+            current + successor,
+            (current + successor) * base_shape.num_queries
+        );
+    }
+    let report = |name: &str, shape: &ChainShape, total: usize| {
+        println!(
+            "LEVER {name}: Q {} · rounds {} · {total} compressions · {:+} against the default",
+            shape.num_queries,
+            shape.rounds(),
+            total as i64 - base as i64
+        );
+    };
+    for grind in [20u8, 22, 24, 26, 28] {
+        let (s, t) = run(&build(1, 4, 6, grind, None), 3);
+        report(&format!("query grind {grind} bits"), &s, t);
+    }
+    for lb in [2usize, 3] {
+        let (s, t) = run(&build(lb, 4, 6, 18, None), 3);
+        report(&format!("blowup 2^{lb}"), &s, t);
+    }
+    for k0 in [4usize, 5] {
+        let (s, t) = run(&build(1, 4, k0, 18, None), 3);
+        report(&format!("first fold {k0}"), &s, t);
+    }
+    for lf in [3usize, 5, 6] {
+        let (s, t) = run(&build(1, lf, 6, 18, None), 3);
+        report(&format!("later folds {lf}"), &s, t);
+    }
+    for c in [4u8, 5, 6, 7, 8] {
+        let (s, t) = run(&build(1, 4, 6, 18, Some(c)), 3);
+        report(&format!("binary cap {c} (caps {:?})", s.caps), &s, t);
+    }
+    for polys in [1usize, 2, 4] {
+        let (s, t) = run(&build(1, 4, 6, 18, None), polys);
+        report(
+            &format!("run of {polys} ({} a polynomial)", t / polys),
+            &s,
+            t,
+        );
+    }
+    let (s, t) = run(&build(1, 4, 6, 24, Some(6)), 3);
+    report("query grind 24 + binary cap 6", &s, t);
+}
