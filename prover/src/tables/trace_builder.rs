@@ -1992,6 +1992,54 @@ fn collect_ops_from_cpu(
     ))
 }
 
+/// `LAMBDA_VM_INROW_SIDES_PINNED`'s reading: `1` takes each walked window's
+/// in-row side records from the page-locked pool
+/// ([`WalkOutputs::side_records_for_the_card`]); unset, empty or `0` keeps
+/// them on the heap (the default). Any other word is refused. A prover-side
+/// choice: the tables are the same either way.
+pub(crate) fn inrow_sides_pinned_setting(word: Option<&str>) -> Result<bool, String> {
+    match word.map(str::trim) {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(format!(
+            "LAMBDA_VM_INROW_SIDES_PINNED={v}: 1 (page-locked) or 0 / unset (the heap)"
+        )),
+    }
+}
+
+/// [`inrow_sides_pinned_setting`] of the process's environment, read once (a
+/// refused word reads as off here; the block prove refuses it first).
+pub(crate) fn inrow_sides_pinned() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        inrow_sides_pinned_setting(
+            std::env::var("LAMBDA_VM_INROW_SIDES_PINNED")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+mod inrow_sides_pinned_tests {
+    use super::inrow_sides_pinned_setting as setting;
+
+    /// `LAMBDA_VM_INROW_SIDES_PINNED` takes `1` (page-locked) and `0`, empty or
+    /// unset (the heap, the default), and refuses any other word, naming it.
+    #[test]
+    fn the_side_records_word_takes_one_or_zero_and_refuses_the_rest() {
+        assert_eq!(setting(None), Ok(false));
+        assert_eq!(setting(Some("")), Ok(false));
+        assert_eq!(setting(Some("0")), Ok(false));
+        assert_eq!(setting(Some(" 1 ")), Ok(true));
+        for bad in ["2", "on", "true", "yes"] {
+            let e = setting(Some(bad)).expect_err(bad);
+            assert!(e.contains(bad), "{e}");
+        }
+    }
+}
+
 /// A list of `n` items the card fills a table from: from the page-locked pool
 /// when it is on, as a group's upload reads it.
 fn for_the_card<T>(n: usize) -> Vec<T> {
