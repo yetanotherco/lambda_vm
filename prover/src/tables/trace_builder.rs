@@ -1992,6 +1992,12 @@ fn collect_ops_from_cpu(
     ))
 }
 
+/// A list of `n` items the card fills a table from: from the page-locked pool
+/// when it is on, as a group's upload reads it.
+fn for_the_card<T>(n: usize) -> Vec<T> {
+    multilinear::pinned::with_pinned(n * std::mem::size_of::<T>(), || Vec::with_capacity(n))
+}
+
 /// Everything the walk emits. [`collect_ops_from_cpu_into`] APPENDS to one of
 /// these, so a run walked a window at a time into the same accumulator gets the
 /// lists a single walk over the run gets: the walk is a left fold over the CPU
@@ -2049,6 +2055,13 @@ impl WalkOutputs {
     /// [`Self::for_walk`] with the streamed lists sized from an earlier walk's
     /// lengths per cycle (`sizes`, an eighth over), so a window's lists are
     /// allocated once instead of grown from empty or from a fixed guess.
+    /// A window's side records under the in-row register format (one a CPU
+    /// op, `cpu_ops` of them): from the page-locked pool when it is on, as the
+    /// card's CPU fill uploads them with the chunk's logs.
+    pub(crate) fn side_records_for_the_card(&mut self, cpu_ops: usize) {
+        self.cpu_side = for_the_card(cpu_ops);
+    }
+
     pub(crate) fn for_walk_sized(
         cpu_ops: usize,
         lookups: bool,
@@ -2066,9 +2079,6 @@ impl WalkOutputs {
         // The lists the card fills its tables from (MEMW_R, MEMW_A, MEMW, LOAD,
         // SHIFT): from the page-locked pool when it is on, as a group's upload
         // reads them.
-        fn for_the_card<T>(n: usize) -> Vec<T> {
-            multilinear::pinned::with_pinned(n * std::mem::size_of::<T>(), || Vec::with_capacity(n))
-        }
         out.memw.register_rows = for_the_card(size(sizes.register_rows));
         out.memw.aligned = for_the_card(size(sizes.aligned));
         out.memw.general = for_the_card(size(sizes.general));
@@ -2083,6 +2093,7 @@ impl WalkOutputs {
     /// ([`multilinear::pinned::shrink`]), as nothing grows it after its window.
     /// Lists outside the pool keep theirs.
     pub(crate) fn give_back_tails(&mut self) {
+        multilinear::pinned::shrink(&mut self.cpu_side);
         multilinear::pinned::shrink(&mut self.memw.register_rows);
         multilinear::pinned::shrink(&mut self.memw.aligned);
         multilinear::pinned::shrink(&mut self.memw.general);
