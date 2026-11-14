@@ -2987,6 +2987,146 @@ fn a_failed_program_fails_every_program_above_it_without_a_hang() {
     }
 }
 
+/// The streamed leaf's probe on small blocks (its gate before a real block):
+/// every leaf streamed in pieces, its groups landing in plan order and in
+/// reverse, gives its one-arena execute's witness word for word.
+#[test]
+#[ignore = "proves small blocks; box tier"]
+fn a_small_blocks_leaves_stream_in_pieces_to_their_execute() {
+    for name in ["all_instructions_64", "test_keccak"] {
+        let format = at_blowup_4(small_batched());
+        let (elf, proof) = small_block(name, &format);
+        let plan = plan_of(&elf, &proof, &format, None);
+        let groups = proof.groups.len();
+        let forward: Vec<(usize, f64)> = (0..groups).map(|g| (g, g as f64)).collect();
+        let backward: Vec<(usize, f64)> = (0..groups).map(|g| (g, (groups - g) as f64)).collect();
+        for order in [forward, backward] {
+            stream_leaf_probe(&plan, &proof, &order);
+        }
+    }
+}
+
+/// The streamed leaf's probe: for each leaf of a proved block, its execute in
+/// one arena (the tree's path today) against a pieced streamed execution whose
+/// pieces — the roots and answers first, then each group's words — land in the
+/// order phase B finished the groups. Prints the identity, the forward pass,
+/// each wave, and what is left once the leaf's last group lands: the last wave,
+/// the finish and the fill. The waves run on 8 threads of their own, as the
+/// early leaves' pool; the fill on the prover's pool.
+fn stream_leaf_probe(plan: &WhirBlockPlan, proof: &BlockWhirProof, phase_b: &[(usize, f64)]) {
+    use super::executor::{ArenaPiece, StreamedExecution};
+    use super::whir_block::block_leaf_groups;
+    let end_of = |g: usize| phase_b.iter().find(|&&(h, _)| h == g).map(|&(_, e)| e);
+    let last_overall = phase_b.iter().map(|&(_, e)| e).fold(f64::NAN, f64::max);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .thread_name(|i| format!("w3-probe-{i}"))
+        .build()
+        .expect("the probe's pool");
+    for k in 0..plan.partition().num_leaves() {
+        let program = plan.leaf_program(k).expect("the leaf emits");
+        let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+        let groups = block_leaf_groups(plan, proof, k).expect("the leaf's groups");
+        let ids = plan.partition().leaf(k).to_vec();
+        let arena = block_leaf_arena(plan, proof, k).expect("the leaf's arena");
+        assert_eq!(arena.len(), 1, "a leaf has one arena");
+        let total = arena[0].len();
+        let grouped: usize = groups.iter().map(Vec::len).sum();
+        let prefix = total - grouped;
+        // The tree's path: one arena, then the fill.
+        let t = std::time::Instant::now();
+        let reference = execute(&program, &arena, &hasher).expect("the leaf executes");
+        let execute_s = t.elapsed().as_secs_f64();
+        // The pieces: the prefix as group 0, then group i of the leaf as i + 1.
+        let mut pieces = vec![ArenaPiece {
+            arena: 0,
+            start: 0,
+            len: prefix as u32,
+            group: 0,
+        }];
+        let mut at = prefix as u32;
+        for (i, words) in groups.iter().enumerate() {
+            pieces.push(ArenaPiece {
+                arena: 0,
+                start: at,
+                len: words.len() as u32,
+                group: i + 1,
+            });
+            at += words.len() as u32;
+        }
+        let mut order: Vec<usize> = (0..groups.len()).collect();
+        order.sort_by(|&a, &b| {
+            end_of(ids[a])
+                .unwrap_or(f64::INFINITY)
+                .total_cmp(&end_of(ids[b]).unwrap_or(f64::INFINITY))
+        });
+        let last = *order.last().expect("a leaf has groups");
+        let last_end = end_of(ids[last]).unwrap_or(f64::NAN);
+        let words_of = |p: &ArenaPiece| &arena[0][p.start as usize..(p.start + p.len) as usize];
+        let n = program.instrs.len();
+        let (streamed, start_s, waves, finish_s) = pool.install(|| {
+            let t = std::time::Instant::now();
+            let mut ex = StreamedExecution::new_pieced(&program, pieces.clone(), &hasher)
+                .expect("the pieced execution starts");
+            let start_s = t.elapsed().as_secs_f64();
+            let mut waves: Vec<(usize, f64, usize)> = Vec::new();
+            let mut ran = ex.ran();
+            for p in std::iter::once(0).chain(order.iter().map(|&i| i + 1)) {
+                let t = std::time::Instant::now();
+                ex.land_piece(p, words_of(&pieces[p]))
+                    .expect("a piece lands");
+                waves.push((p, t.elapsed().as_secs_f64(), ex.ran() - ran));
+                ran = ex.ran();
+            }
+            let t = std::time::Instant::now();
+            let done = ex.finish().expect("the pieced execution finishes");
+            (done, start_s, waves, t.elapsed().as_secs_f64())
+        });
+        super::exec_identity_tests::assert_executions_identical(
+            "the streamed leaf",
+            program.num_addrs,
+            &reference,
+            &streamed,
+        );
+        drop(reference);
+        let t = std::time::Instant::now();
+        let filled = super::proof::lfm_fill_executed(&program, streamed, hasher, 0.0);
+        let fill_s = t.elapsed().as_secs_f64();
+        drop(filled);
+        let (_, last_s, last_ran) = *waves.last().expect("waves");
+        let waves_s: f64 = waves.iter().map(|w| w.1).sum();
+        let max_wave = waves[..waves.len() - 1]
+            .iter()
+            .map(|w| w.1)
+            .fold(0.0, f64::max);
+        println!(
+            "W3 STREAM LEAF PROBE {k}: identity EQUAL · groups {} · arena words {total} (prefix {prefix}) · instructions {n} · \
+             execute {execute_s:.3} s · fill {fill_s:.3} s · streamed: start {start_s:.3} s (ran {}) · waves {} in {waves_s:.3} s \
+             (max before the last {max_wave:.3} s) · last group {} ends phase B at {last_end:.3} s of {last_overall:.3} s{} · \
+             last wave {last_s:.3} s ({last_ran} of {n} = {:.1} %) · finish {finish_s:.3} s · LAST WAVE + FINISH + FILL {:.3} s",
+            groups.len(),
+            waves.first().map_or(0, |w| w.2),
+            waves.len(),
+            ids[last],
+            if (last_end - last_overall).abs() < 1e-6 {
+                " (phase B's last)"
+            } else {
+                ""
+            },
+            100.0 * last_ran as f64 / n as f64,
+            last_s + finish_s + fill_s,
+        );
+        println!(
+            "W3 STREAM LEAF WAVES {k}: {}",
+            waves
+                .iter()
+                .map(|(p, s, r)| format!("{p}:{s:.3}s/{r}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+}
+
 /// ★ W3's readout on a real block (box only, `--ignored`, `--features cuda`;
 /// the block path reads no WHIR hash knob), through the one driver the CLI's
 /// `prove-block`
@@ -3051,6 +3191,11 @@ fn the_whir_block_tree_on_a_real_block() {
             assert!(same, "the early leaf's arena is the finished proof's");
         }
         None => println!("W3 EARLY LEAF: none (W3_LEAF_DURING_PHASE_B {early_on})"),
+    }
+    // Off the clock, on `W3_STREAM_LEAF_PROBE=1`: each leaf executed both ways,
+    // in one arena and streamed in pieces as phase B finished its groups.
+    if std::env::var("W3_STREAM_LEAF_PROBE").is_ok_and(|v| v.trim() == "1") {
+        stream_leaf_probe(plan, proof, &run.phase_b);
     }
     // The recursion proofs' domains and twiddles built before their card holds
     // ([`super::domain_warm`]): how many lengths, how long, and when the early
