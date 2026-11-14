@@ -199,6 +199,13 @@ pub struct WhirTreeConfig {
     /// ([`EARLY_POOL_NICE`]), so phase B's host work, which they run beside,
     /// keeps its cores. 0: on the prover's own pool, beside phase B's work.
     pub early_pool: usize,
+    /// `W3_STREAM_LEAF=0|1` (default 0): the leaf phase B leads last, when
+    /// fewer than [`STREAM_COVER_LEAVES`] early leaves are ahead of it on the
+    /// card, executes as its groups arrive ([`super::executor::StreamedExecution::new_pieced`],
+    /// its arena landing a group at a time), on the early leaves' pool; only
+    /// its last wave and its fill are left when the base ends. Prover-only:
+    /// the witness is the one-arena execute's, word for word.
+    pub stream_leaf: bool,
     /// `W3_LEAF_EMITTERS` ([`LEAF_EMITTERS`] by default): how many of the
     /// leaves' programs are emitted at once beside phase B, in leaf order,
     /// each published as it is ready while the planner takes phase B's groups;
@@ -460,6 +467,7 @@ impl WhirTreeConfig {
         let early_on = count_knob("W3_LEAF_DURING_PHASE_B")?.is_none_or(|v| v != 0);
         let early_leaves = early_leaves_setting(count_knob("W3_EARLY_LEAVES")?)?;
         let early_pool = count_knob("W3_EARLY_POOL")?.unwrap_or(EARLY_POOL_DEFAULT);
+        let stream_leaf = flag_knob("W3_STREAM_LEAF")?;
         let leaf_emitters = leaf_emitters_setting(count_knob("W3_LEAF_EMITTERS")?);
         let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
             Ok("batched") => match count_knob("BLOCK_WHIR_ARGUE_CAP")? {
@@ -554,6 +562,7 @@ impl WhirTreeConfig {
             early_on,
             early_leaves,
             early_pool,
+            stream_leaf,
             leaf_emitters,
             argue,
             format,
@@ -835,6 +844,215 @@ pub(crate) struct GroupMsg {
         >,
     >,
     pub(crate) at: f64,
+}
+
+/// `W3_STREAM_LEAF`: the leaf streaming beside phase B — its pieces' sender,
+/// its thread, and which of its groups it has had.
+pub(crate) struct StreamingLeaf {
+    leaf: usize,
+    /// Its groups in the leaf's order: piece `i + 1` is `groups[i]`'s words.
+    groups: Vec<usize>,
+    sent: Vec<bool>,
+    tx: Option<std::sync::mpsc::Sender<(usize, Vec<LfmWord>)>>,
+    handle: Option<std::thread::JoinHandle<Result<EarlyOut, String>>>,
+}
+
+/// Sends the streaming leaf each of its groups whose words have arrived and
+/// that it has not had yet. Once the last has gone, ends its stream and hands
+/// it back as an early leaf, complete at `at`; `None` before then (and when
+/// nothing streams).
+fn stream_feed(
+    stream: &mut Option<StreamingLeaf>,
+    words: &[Option<Vec<LfmWord>>],
+    at: f64,
+) -> Option<EarlyLeaf> {
+    let st = stream.as_mut()?;
+    let tx = st.tx.as_ref()?;
+    for (i, &g) in st.groups.iter().enumerate() {
+        if !st.sent[i]
+            && let Some(Some(w)) = words.get(g)
+        {
+            // A thread that has failed has said why; its handle says it again.
+            let _ = tx.send((i + 1, w.clone()));
+            st.sent[i] = true;
+        }
+    }
+    if !st.sent.iter().all(|&s| s) {
+        return None;
+    }
+    st.tx = None;
+    Some(EarlyLeaf {
+        leaf: st.leaf,
+        complete_at: at,
+        handle: st.handle.take()?,
+    })
+}
+
+/// Runs `f` on `pool` when there is one, else here.
+fn on_pool<R: Send>(
+    pool: &Option<std::sync::Arc<rayon::ThreadPool>>,
+    f: impl FnOnce() -> R + Send,
+) -> R {
+    match pool {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
+
+/// Starts leaf `k` streaming: claims its program, and on a thread of its own
+/// lands its arena's pieces as they come — the front (`roots`, their answers)
+/// now, each group's words as [`stream_feed`] sends them — each wave on
+/// `pool`. When the sender closes it finishes and fills. If the streamed
+/// execution refuses anything, the thread executes the assembled arena as
+/// the tree would (the same witness, word for word); a stream short of a
+/// piece is an error. `None` when the leaf's marks do not fit a streamed
+/// execution (one piece a group, at most 64).
+#[allow(clippy::too_many_arguments)]
+fn stream_start(
+    k: usize,
+    marks: &[u32],
+    slot: &ProgramSlot,
+    groups: &[usize],
+    (roots, answers): (
+        &[multilinear::whir_commit::Commitment],
+        &[crate::tables::types::FEE],
+    ),
+    pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    t0: std::time::Instant,
+    lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) -> Result<Option<StreamingLeaf>, String> {
+    use super::executor::{ArenaPiece, StreamedExecution};
+    if marks.len() != groups.len() + 1 || marks.len() > 64 {
+        lines
+            .lock()
+            .map_err(|_| "the stream lines are poisoned")?
+            .push(format!(
+                "W3 STREAM LEAF: leaf {k} not streamed: {} marks for {} groups (at most 63)",
+                marks.len(),
+                groups.len()
+            ));
+        return Ok(None);
+    }
+    let mut pieces = Vec::with_capacity(marks.len());
+    let mut start = 0u32;
+    for (i, &end) in marks.iter().enumerate() {
+        pieces.push(ArenaPiece {
+            arena: 0,
+            start,
+            len: end.saturating_sub(start),
+            group: i,
+        });
+        start = end;
+    }
+    slot.claim();
+    let program = slot.get()?;
+    let front = leaf_arena(roots, answers, Vec::new())
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<LfmWord>)>();
+    tx.send((0, front))
+        .map_err(|_| "the streamed leaf's thread is gone before it started")?;
+    let handle = std::thread::spawn(move || -> Result<EarlyOut, String> {
+        let started = t0.elapsed().as_secs_f64();
+        let hasher = program.program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+        let n = pieces.len();
+        let held: Vec<std::cell::OnceCell<Vec<LfmWord>>> =
+            (0..n).map(|_| std::cell::OnceCell::new()).collect();
+        let mut note: Option<String> = None;
+        let mut ex = match on_pool(&pool, || {
+            StreamedExecution::new_pieced(&program.program, pieces.clone(), &hasher)
+        }) {
+            Ok(ex) => Some(ex),
+            Err(e) => {
+                note = Some(format!("its start refused: {e:?}"));
+                None
+            }
+        };
+        let (mut waves, mut waves_s, mut last_wave_s, mut last_at) =
+            (0usize, 0.0f64, 0.0f64, started);
+        for (i, w) in rx.iter() {
+            let cell = held
+                .get(i)
+                .ok_or_else(|| format!("streamed leaf {k}: piece {i} of {n}"))?;
+            if cell.set(w).is_err() {
+                return Err(format!("streamed leaf {k}: piece {i} came twice"));
+            }
+            let words = cell
+                .get()
+                .ok_or_else(|| format!("streamed leaf {k}: piece {i} not held"))?;
+            let failed = match ex.as_mut() {
+                Some(e) => {
+                    let t = std::time::Instant::now();
+                    let landed = on_pool(&pool, || e.land_piece(i, words));
+                    last_wave_s = t.elapsed().as_secs_f64();
+                    waves += 1;
+                    waves_s += last_wave_s;
+                    landed.err()
+                }
+                None => None,
+            };
+            if let Some(e) = failed {
+                note = Some(format!("piece {i} refused: {e:?}"));
+                ex = None;
+            }
+            last_at = t0.elapsed().as_secs_f64();
+        }
+        let tail = std::time::Instant::now();
+        if held.iter().any(|c| c.get().is_none()) {
+            return Err(format!(
+                "streamed leaf {k}: phase B ended before all {n} of its pieces came"
+            ));
+        }
+        let execution = match ex {
+            Some(e) => match on_pool(&pool, || e.finish()) {
+                Ok(execution) => Some(execution),
+                Err(e) => {
+                    note = Some(format!("its finish refused: {e:?}"));
+                    None
+                }
+            },
+            None => None,
+        };
+        let arena: Vec<Vec<LfmWord>> = vec![
+            held.iter()
+                .filter_map(std::cell::OnceCell::get)
+                .flatten()
+                .copied()
+                .collect(),
+        ];
+        let filled = match execution {
+            Some(execution) => {
+                super::proof::lfm_fill_executed(&program.program, execution, hasher, waves_s)
+            }
+            None => lfm_execute_and_fill(&program.program, &arena, hasher)
+                .map_err(|e| format!("streamed leaf {k}, executed whole: {e:?}"))?,
+        };
+        let secs = tail.elapsed().as_secs_f64();
+        let line = format!(
+            "W3 STREAM LEAF: leaf {k} streamed from {started:.2}s · {n} pieces · {waves} waves in {waves_s:.3}s on {} · its last piece at {last_at:.2}s · last wave {last_wave_s:.3}s + finish and fill {secs:.3}s{}",
+            if pool.is_some() {
+                "the early pool"
+            } else {
+                "the prover's pool"
+            },
+            match &note {
+                Some(why) => format!(" · EXECUTED WHOLE: {why}"),
+                None => String::new(),
+            }
+        );
+        if let Ok(mut l) = lines.lock() {
+            l.push(line);
+        }
+        Ok((filled, arena, started, last_wave_s + secs))
+    });
+    Ok(Some(StreamingLeaf {
+        leaf: k,
+        groups: groups.to_vec(),
+        sent: vec![false; groups.len()],
+        tx: Some(tx),
+        handle: Some(handle),
+    }))
 }
 
 /// What the early leaf's thread hands back: the filled leaf, its arena (for
@@ -1274,6 +1492,12 @@ pub(crate) fn early_leaf_first(mut order: Vec<TreeAt>, first: Option<usize>) -> 
     }
     order
 }
+
+/// `W3_STREAM_LEAF`: the leaf phase B leads last streams only while fewer
+/// than this many early leaves are ahead of it — their proves are what hide
+/// its execute + fill at the tree's start (two cover it on a large block, one
+/// does not on a median one).
+pub(crate) const STREAM_COVER_LEAVES: usize = 2;
 
 /// The early leaves' own pool, threads (`W3_EARLY_POOL`). Half of a 16-core
 /// host's cores: the later early leaves' execute + fill ran 1.2–1.4 s on the
@@ -2387,6 +2611,11 @@ pub fn prove_whir_block_tree(
     // The leaves offered to phase B (`W3_LEAF_FIRST`), and when.
     let lead = block_whir::PhaseBLead::leading(cfg.early_leaves);
     let early_leaves = cfg.early_leaves;
+    let stream_leaf = cfg.stream_leaf;
+    // `W3_STREAM_LEAF`: what the streamed leaf did, printed after the tree.
+    let stream_lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stream_lines_ref = &stream_lines;
     // The later early leaves' pool, only when several can go early.
     let early_threads = if cfg.early_leaves > 1 {
         cfg.early_pool
@@ -2446,9 +2675,17 @@ pub fn prove_whir_block_tree(
                 }
             }
             let programs: Vec<Published<ProgramSlot>> = (0..n).map(|_| Published::new()).collect();
+            // Each emitted leaf's arena marks (its front's end, then each
+            // group's): the pieces a streamed leaf lands (`W3_STREAM_LEAF`).
+            let leaf_marks: Vec<std::sync::OnceLock<Vec<u32>>> =
+                (0..n).map(|_| std::sync::OnceLock::new()).collect();
             // The admitted leaves' programs, on plain threads off the rayon
             // pool phase B is using; the stamps are leaf 0's and the last's.
-            let emit = |k: usize| plan.leaf_program(k);
+            let emit = |k: usize| {
+                let (program, marks) = plan.leaf_program_marked(k)?;
+                let _ = leaf_marks[k].set(marks);
+                Ok::<_, String>(program)
+            };
             let emit_leaves = |permits: Vec<Option<super::program_budget::Permit>>,
                                threads: usize|
              -> Result<(Option<f64>, f64), String> {
@@ -2513,6 +2750,19 @@ pub fn prove_whir_block_tree(
                     let mut block_roots = Vec::new();
                     let mut block_answers = Vec::new();
                     let mut done = 0usize;
+                    // `W3_STREAM_LEAF`: the leaf phase B leads last, streaming.
+                    let leaf_of: Vec<Option<usize>> = {
+                        let mut of = vec![None; plan.num_groups()];
+                        for k in 0..plan.partition().num_leaves() {
+                            for &g in plan.partition().leaf(k) {
+                                if let Some(slot) = of.get_mut(g) {
+                                    *slot = Some(k);
+                                }
+                            }
+                        }
+                        of
+                    };
+                    let mut stream: Option<StreamingLeaf> = None;
                     while let Ok(msg) = grx.recv() {
                         done += 1;
                         let g = msg.group;
@@ -2534,6 +2784,39 @@ pub fn prove_whir_block_tree(
                         if block_roots.is_empty() {
                             block_roots = msg.roots;
                             block_answers = msg.commit_ood;
+                        }
+                        // `W3_STREAM_LEAF`: the streamed leaf's next piece, or its
+                        // start at the first of its groups once it qualifies.
+                        if stream_leaf {
+                            let lead_last = lead_ref.taken().and_then(|t| t.leaves.last().copied());
+                            let fed = stream_feed(&mut stream, &words, msg.at);
+                            if let Some(leaf) = fed {
+                                early.push(leaf);
+                            } else if stream.is_none()
+                                && let Some(k) = leaf_of.get(g).copied().flatten()
+                                && Some(k) == lead_last
+                                && k < upto
+                                && early.len() < STREAM_COVER_LEAVES
+                                && early.iter().all(|e| e.leaf != k)
+                                && !kept.contains(&k)
+                                && let Some(marks) = leaf_marks[k].get()
+                                && let Some(Ok(slot)) = programs[k].0.get()
+                            {
+                                stream = stream_start(
+                                    k,
+                                    marks,
+                                    slot,
+                                    plan.partition().leaf(k),
+                                    (&block_roots, &block_answers),
+                                    early_pool.clone(),
+                                    t0,
+                                    stream_lines_ref.clone(),
+                                )?;
+                                // Its groups that have arrived already.
+                                if let Some(leaf) = stream_feed(&mut stream, &words, msg.at) {
+                                    early.push(leaf);
+                                }
+                            }
                         }
                         // More than one early leaf only when phase B led several
                         // leaves: with fewer (no valid order) the other leaves
@@ -3254,6 +3537,17 @@ pub fn prove_whir_block_tree(
         sink.line(&w.finish());
     }
     sink.line(&prep.finish());
+    if stream_leaf {
+        let lines = stream_lines.lock().map(|l| l.clone()).unwrap_or_default();
+        if lines.is_empty() {
+            sink.line(&format!(
+                "W3 STREAM LEAF: none (the leaf phase B led last had {STREAM_COVER_LEAVES} or more early leaves ahead of it, or phase B led no order)"
+            ));
+        }
+        for line in lines {
+            sink.line(&line);
+        }
+    }
     if proofs.is_empty() {
         return Err("the tree has no top".to_string());
     }
@@ -5424,6 +5718,64 @@ mod tests {
         }
     }
 
+    /// The streaming leaf is fed each of its groups once, as each arrives, in
+    /// any order, and is handed back as an early leaf exactly when its last
+    /// has gone; nothing streams, nothing is fed.
+    #[test]
+    fn a_streaming_leaf_is_fed_each_group_once_and_handed_back_after_its_last() {
+        use crate::tables::types::FE;
+        let w = |x: u64| vec![super::super::word::base_word(FE::from(x))];
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<LfmWord>)>();
+        let handle = std::thread::spawn(move || -> Result<EarlyOut, String> {
+            Err(format!(
+                "{:?}",
+                rx.iter().map(|(i, _)| i).collect::<Vec<_>>()
+            ))
+        });
+        let mut stream = Some(StreamingLeaf {
+            leaf: 1,
+            groups: vec![4, 2, 7],
+            sent: vec![false; 3],
+            tx: Some(tx),
+            handle: Some(handle),
+        });
+        let mut words: Vec<Option<Vec<LfmWord>>> = vec![None; 8];
+        words[2] = Some(w(2));
+        assert!(
+            stream_feed(&mut stream, &words, 1.0).is_none(),
+            "one of three"
+        );
+        assert!(
+            stream_feed(&mut stream, &words, 1.5).is_none(),
+            "nothing new"
+        );
+        words[7] = Some(w(7));
+        words[0] = Some(w(0));
+        assert!(
+            stream_feed(&mut stream, &words, 2.0).is_none(),
+            "two of three"
+        );
+        words[4] = Some(w(4));
+        let back = stream_feed(&mut stream, &words, 3.0).expect("handed back after its last");
+        assert_eq!((back.leaf, back.complete_at), (1, 3.0));
+        assert!(
+            stream_feed(&mut stream, &words, 4.0).is_none(),
+            "handed back once"
+        );
+        let sent = back
+            .handle
+            .join()
+            .expect("joins")
+            .err()
+            .expect("its pieces");
+        assert_eq!(
+            sent, "[2, 3, 1]",
+            "piece i + 1 for group groups[i], each once, as it came"
+        );
+        let mut none: Option<StreamingLeaf> = None;
+        assert!(stream_feed(&mut none, &words, 5.0).is_none());
+    }
+
     /// Only the production tree is at the presets: the plan's leaf count, the
     /// block fan-in and the production argue.
     #[test]
@@ -5437,6 +5789,7 @@ mod tests {
             early_on: true,
             early_leaves: EARLY_LEAVES_DEFAULT,
             early_pool: EARLY_POOL_DEFAULT,
+            stream_leaf: false,
             leaf_emitters: Some(LEAF_EMITTERS),
             argue: BlockFormat::production().argue,
             format: BlockFormat::production(),
