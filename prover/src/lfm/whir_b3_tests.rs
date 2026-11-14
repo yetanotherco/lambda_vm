@@ -1791,6 +1791,55 @@ fn the_production_blake3_run_costs_its_closed_form() {
     }
 }
 
+/// ★ The BLAKE3 base's own format, by closed form: its block format's chain
+/// config (the binary cap [`crate::block_whir::B3_BASE_CAP`], every other
+/// setting production's) under the leaf's lean query check, which takes the
+/// binary tail rounds once a leaf. A run of three 2^27 polynomials, one tree a
+/// run: against today's 41,109 (cap 3, every round per query).
+#[test]
+fn the_blake3_base_format_run_costs_its_closed_form() {
+    use super::whir_chain::{ChainShape, LeafQuery, chain_cap_perms, chain_perms};
+    use super::whir_transcript::SpongeEntry;
+    use crate::block_whir::{B3_BASE_CAP, BlockFormat};
+    use crate::zf_format::ZfFormat;
+    use stark::proof::options::BaseFormat;
+    let zf = ZfFormat::DEFAULT.with_base(BaseFormat::B3_WHIR);
+    let format = BlockFormat {
+        zf,
+        ..BlockFormat::production()
+    };
+    let n = zf.whir_stack.get();
+    let config = format.chain_config(&[(3, n)]);
+    assert_eq!(
+        config.format.cap,
+        multilinear::whir_chain::CapPolicy::Fixed(B3_BASE_CAP)
+    );
+    let shape = ChainShape {
+        query: LeafQuery::Lean,
+        ..ChainShape::for_hash(&config, n, WrapHash::Blake3)
+    }
+    .run(3);
+    let tails: Vec<usize> = (0..shape.rounds())
+        .filter(|&r| shape.tail_round(r))
+        .collect();
+    let total = chain_perms(&shape, SpongeEntry::fresh_for(WrapHash::Blake3));
+    let per_query = chain_perms(
+        &ChainShape {
+            query: LeafQuery::V1,
+            ..shape.clone()
+        },
+        SpongeEntry::fresh_for(WrapHash::Blake3),
+    );
+    println!(
+        "BLAKE3 BASE FORMAT RUN x3: caps {:?} · tail rounds {tails:?} · {total} compressions \
+         (caps {}) · without the tail {per_query} · today's 41109",
+        shape.caps,
+        chain_cap_perms(&shape)
+    );
+    assert_eq!(tails, vec![5, 6], "rounds 5 and 6 lie wholly in their caps");
+    assert!(total < per_query && per_query < 41_109);
+}
+
 /// The levers on the production BLAKE3 run's compressions, by closed form: the
 /// default (one run of three 2^27 polynomials, one tree a run), then one
 /// setting moved at a time — the query grind, the blowup, the first fold, the
