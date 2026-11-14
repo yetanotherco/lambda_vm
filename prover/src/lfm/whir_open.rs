@@ -94,10 +94,91 @@
 //! [`super::p1w16_emit::walk4`]'s three `Select`s ([`Siblings::Rotated`]).
 //! Which word a hint reads is witness: every placement is still a `Select` on
 //! an index bit, so the node hashed is the one the index names.
+//!
+//! # Under 7-round BLAKE3
+//!
+//! A [`WrapHash::Blake3`](super::edsl::WrapHash) builder verifies a
+//! `Blake3Whir` base's binary trees (`BatchBlake3StdBackend`): the leaf is
+//! `Blake3Std` over the block's values, each its canonical eight big-endian
+//! bytes and an extension value its three coordinates in order
+//! (`FieldElementVectorBackend::hash_data`'s `stream_bytes`), and a parent is
+//! one compression of `left ‖ right`. A digest is two words of `u32` lanes, so
+//! a root is compared as two words ([`RootLanes`]). The joint leaf of a run is
+//! `Blake3Std(prefix ‖ blocks)` (`blake3_joint::joint_leaf`); the prefix is one
+//! 64-byte block of verifier constants, so the chain starts from its midstate,
+//! a program constant chosen by the run's width from the shape and never read
+//! from the proof ([`emit_joint_block_leaf`]).
+//!
+//! The pin of a hinted round-0 base value holds here too, by another row:
+//! [`edsl::leaf_stream`] renders each value with one `BitDec`
+//! ([`super::transcript_replay::felt_be_halves`]), which RECEIVES its input as
+//! a base token `(addr, Σ 2^i·bit_i, 0, 0, 0)` (`chips::bitdec`), so the
+//! arena's send balances only when lanes 1–3 are zero; and the executor reads
+//! the input through `read_base`, which refuses a word with a nonzero upper lane
+//! (`LfmExecError::NotBaseWord`). Every felt the fold lifts is a value the leaf
+//! rendered.
 
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
-use super::edsl::{self, WrapDigest};
+use super::edsl::{self, MAX_DIGEST_CELLS, WrapDigest, WrapHash};
 use super::instr::ArenaId;
+
+/// A tree's root, unpacked once and compared against every opening of the
+/// tree: one `[Felt; 4]` a digest cell — one under the felt hashes (four
+/// felts), two under BLAKE3 (eight `u32` lanes).
+#[derive(Clone, Copy, Debug)]
+pub struct RootLanes {
+    words: [[Felt; 4]; MAX_DIGEST_CELLS],
+    len: u8,
+}
+
+impl RootLanes {
+    /// A one-cell root's four lanes.
+    pub fn one(lanes: [Felt; 4]) -> Self {
+        Self {
+            words: [lanes; MAX_DIGEST_CELLS],
+            len: 1,
+        }
+    }
+
+    /// `digest`'s cells, each unpacked: one `Unpack` a cell.
+    pub fn unpack(b: &mut LfmBuilder, digest: WrapDigest) -> Self {
+        let first = b.unpack(digest[0]);
+        // An unused slot repeats the first word, as `WrapDigest::from_cell`'s
+        // does: nothing reads past `len`.
+        let second = match digest.cells() {
+            [_, second] => b.unpack(*second),
+            _ => first,
+        };
+        Self {
+            words: [first, second],
+            len: digest.len() as u8,
+        }
+    }
+
+    /// The lanes, one `[Felt; 4]` a digest cell, as
+    /// [`edsl::assert_digest_eq_lanes`] takes them.
+    pub fn words(&self) -> &[[Felt; 4]] {
+        &self.words[..self.len as usize]
+    }
+}
+
+impl From<[Felt; 4]> for RootLanes {
+    fn from(lanes: [Felt; 4]) -> Self {
+        Self::one(lanes)
+    }
+}
+
+impl From<&[Felt; 4]> for RootLanes {
+    fn from(lanes: &[Felt; 4]) -> Self {
+        Self::one(*lanes)
+    }
+}
+
+impl From<&RootLanes> for RootLanes {
+    fn from(root: &RootLanes) -> Self {
+        *root
+    }
+}
 
 /// Base felts a cubic extension element decomposes to.
 const FELTS_PER_EXT: usize = 3;
@@ -272,16 +353,23 @@ pub fn emit_block_leaf(b: &mut LfmBuilder, values: BlockValues<'_>) -> WrapDiges
 
 /// The joint leaf of a grouped run's round-0 tree
 /// (`whir_commit::verify_joint_opening_capped`): `values` is `blocks` base
-/// blocks end to end, hashed under the Poseidon1 joint tag.
+/// blocks end to end, hashed under the Poseidon1 joint tag, or under BLAKE3
+/// as `Blake3Std(prefix ‖ values)` ([`emit_blake3_joint_leaf`]).
 pub fn emit_joint_block_leaf(
     b: &mut LfmBuilder,
     values: BlockValues<'_>,
     blocks: usize,
 ) -> WrapDigest {
+    if b.wrap_hash() == WrapHash::Blake3 {
+        let BlockValues::Base(felts) = values else {
+            panic!("a BLAKE3 joint leaf hashes its round-0 base values one a word");
+        };
+        return emit_blake3_joint_leaf(b, felts, blocks);
+    }
     assert_eq!(
         b.wrap_hash(),
         edsl::WrapHash::Poseidon1,
-        "a joint leaf hashes under the Poseidon1 leaf"
+        "a joint leaf hashes under the Poseidon1 or the BLAKE3 leaf"
     );
     match values {
         BlockValues::Base(felts) => super::p1w16_emit::joint_leaf_hash(b, felts, blocks),
@@ -291,6 +379,33 @@ pub fn emit_joint_block_leaf(
         BlockValues::Ext(_) => panic!("a joint leaf is a round-0 leaf, base-field"),
     }
 }
+
+/// ★ The BLAKE3 joint leaf, `blake3_joint::joint_leaf(values, blocks)`:
+/// `Blake3Std(prefix ‖ values)`, each value its canonical eight big-endian
+/// bytes, the 64-byte prefix `joint_leaf_prefix(blocks, per_block, 8)`.
+///
+/// The prefix is one whole block of verifier constants, so the chain starts at
+/// block 1 from the prefix's midstate (`joint_leaf_midstate`), interned as two
+/// constant words: the same digest by the chain's definition, one compression
+/// a leaf cheaper. ⚠ The midstate is computed HERE from `blocks` and the block
+/// width, which the caller takes from the chain's shape (the run's polynomial
+/// count and `2^k0`), never from the proof: a chaining value the prover could
+/// pick would leave the leaf binding nothing about its prefix.
+pub fn emit_blake3_joint_leaf(b: &mut LfmBuilder, felts: &[Felt], blocks: usize) -> WrapDigest {
+    use crypto::merkle_tree::backends::blake3_joint::{JOINT_LEAF_PREFIX_LEN, joint_leaf_midstate};
+    assert!(
+        blocks >= 1 && !felts.is_empty() && felts.len().is_multiple_of(blocks),
+        "a joint leaf is {blocks} equal blocks, not {} values",
+        felts.len()
+    );
+    let per_block = felts.len() / blocks;
+    let midstate = joint_leaf_midstate(blocks as u64, per_block as u64, BYTES_PER_BASE as u64);
+    let (stream, len_bytes) = edsl::leaf_stream(b, felts);
+    edsl::blake3_256_resumed(b, &midstate, 1, &stream, JOINT_LEAF_PREFIX_LEN + len_bytes)
+}
+
+/// Bytes a base value streams as in a leaf: its canonical `u64`, big-endian.
+const BYTES_PER_BASE: usize = 8;
 
 /// ★ `whir_commit::verify_opening`, emitted — as a REFUSAL rather than a bool.
 ///
@@ -314,6 +429,23 @@ pub fn emit_verify_opening(
     siblings: &[WrapDigest],
     root_lanes: &[Felt; 4],
 ) {
+    emit_verify_opening_at(
+        b,
+        values,
+        index_bits,
+        siblings,
+        &RootLanes::one(*root_lanes),
+    );
+}
+
+/// [`emit_verify_opening`] against a root in the builder's digest width.
+pub fn emit_verify_opening_at(
+    b: &mut LfmBuilder,
+    values: BlockValues<'_>,
+    index_bits: &[Bit],
+    siblings: &[WrapDigest],
+    root: &RootLanes,
+) {
     let hash = b.wrap_hash();
     assert_eq!(
         hash.path_hints(index_bits.len()),
@@ -326,7 +458,7 @@ pub fn emit_verify_opening(
     } else {
         edsl::wrap_merkle_walk(b, leaf, index_bits, siblings)
     };
-    edsl::assert_digest_eq_lanes(b, walked, std::slice::from_ref(root_lanes));
+    edsl::assert_digest_eq_lanes(b, walked, root.words());
 }
 
 /// ★ One tree's authenticated Merkle cap — the gadget the STARK verifier
@@ -351,7 +483,7 @@ pub enum Siblings<'a> {
 /// lanes (no cap — today's emission, instruction for instruction), or
 /// against its authenticated [`CapCells`].
 pub enum TreeAuth {
-    Root([Felt; 4]),
+    Root(RootLanes),
     Cap(CapCells),
 }
 
@@ -381,14 +513,14 @@ impl TreeAuth {
             assert_eq!(b.wrap_hash().arity(), 4, "a rotated path is 4-ary");
         }
         match (self, siblings) {
-            (TreeAuth::Root(lanes), Siblings::Child(siblings)) => {
-                emit_verify_opening(b, values, index_bits, siblings, lanes)
+            (TreeAuth::Root(root), Siblings::Child(siblings)) => {
+                emit_verify_opening_at(b, values, index_bits, siblings, root)
             }
-            (TreeAuth::Root(lanes), Siblings::Rotated { arena, at }) => {
+            (TreeAuth::Root(root), Siblings::Rotated { arena, at }) => {
                 let leaf = emit_block_leaf(b, values);
                 let hints = super::p1w16_emit::hint_path_rotated(b, arena, at, index_bits);
                 let walked = super::p1w16_emit::walk4(b, leaf, index_bits, &hints);
-                edsl::assert_digest_eq_lanes(b, walked, std::slice::from_ref(lanes));
+                edsl::assert_digest_eq_lanes(b, walked, root.words());
             }
             (TreeAuth::Cap(cap), siblings) => {
                 // The cap checks the path's length against the index and its
@@ -415,8 +547,9 @@ impl TreeAuth {
 
     /// [`Self::verify_opening`] of a JOINT round-0 tree's leaf
     /// (`whir_commit::verify_joint_opening_capped`): `values` is `blocks`
-    /// blocks end to end, hashed under the joint tag; the walk and the cap or
-    /// root comparison are a plain leaf's. Arity 4 only.
+    /// blocks end to end, hashed under the joint tag (Poseidon1, 4-ary) or the
+    /// joint prefix (BLAKE3, binary); the walk and the cap or root comparison
+    /// are a plain leaf's.
     pub fn verify_joint_opening(
         &self,
         b: &mut LfmBuilder,
@@ -425,17 +558,29 @@ impl TreeAuth {
         index_bits: &[Bit],
         siblings: Siblings<'_>,
     ) {
-        assert_eq!(b.wrap_hash().arity(), 4, "a joint tree is 4-ary");
+        let arity = b.wrap_hash().arity();
+        if let Siblings::Rotated { .. } = siblings {
+            assert_eq!(arity, 4, "a rotated path is 4-ary");
+        }
         let leaf = emit_joint_block_leaf(b, values, blocks);
         match (self, siblings) {
-            (TreeAuth::Root(lanes), Siblings::Child(siblings)) => {
-                let walked = super::p1w16_emit::walk4_child(b, leaf, index_bits, siblings);
-                edsl::assert_digest_eq_lanes(b, walked, std::slice::from_ref(lanes));
+            (TreeAuth::Root(root), Siblings::Child(siblings)) => {
+                let walked = if arity == 4 {
+                    super::p1w16_emit::walk4_child(b, leaf, index_bits, siblings)
+                } else {
+                    assert_eq!(
+                        b.wrap_hash().path_hints(index_bits.len()),
+                        siblings.len(),
+                        "the path's siblings for every level of the tree"
+                    );
+                    edsl::wrap_merkle_walk(b, leaf, index_bits, siblings)
+                };
+                edsl::assert_digest_eq_lanes(b, walked, root.words());
             }
-            (TreeAuth::Root(lanes), Siblings::Rotated { arena, at }) => {
+            (TreeAuth::Root(root), Siblings::Rotated { arena, at }) => {
                 let hints = super::p1w16_emit::hint_path_rotated(b, arena, at, index_bits);
                 let walked = super::p1w16_emit::walk4(b, leaf, index_bits, &hints);
-                edsl::assert_digest_eq_lanes(b, walked, std::slice::from_ref(lanes));
+                edsl::assert_digest_eq_lanes(b, walked, root.words());
             }
             (TreeAuth::Cap(cap), Siblings::Child(siblings)) => {
                 cap.verify_path_child(b, leaf, index_bits, siblings)
