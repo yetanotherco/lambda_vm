@@ -757,6 +757,7 @@ const WRITE_TILE: usize = 8;
 /// The fewest blocks a worker fills in one turn: each turn starts a fresh
 /// count of the byte table (2^16 entries an operation) and ends merging it,
 /// so a turn must be many compressions long.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 const BLOCKS_PER_WORKER_TURN: usize = 32;
 
 /// The bytes each round column's values need: tags and the word cells
