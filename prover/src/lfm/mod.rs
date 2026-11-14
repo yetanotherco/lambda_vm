@@ -175,6 +175,8 @@ mod leaf_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod lean_upload_tests;
 #[cfg(all(test, feature = "parallel"))]
+mod levels_probe;
+#[cfg(all(test, feature = "parallel"))]
 mod levels_tests;
 #[cfg(test)]
 mod logup_tests;
