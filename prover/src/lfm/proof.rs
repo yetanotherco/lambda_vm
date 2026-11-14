@@ -239,6 +239,9 @@ pub(crate) struct LfmFilled {
     execute_secs: f64,
     fill_secs: f64,
     exec_split: super::executor::ExecSplit,
+    /// The program's `B3L_HEAD` records: the lean BLAKE3 tables are the block
+    /// prover's (W-LFM), filled there. Nonempty refuses the STARK prove.
+    b3l: Vec<super::b3l::B3lValues>,
 }
 
 /// The host half of [`lfm_prove_with_residency`]: execute `program` over
@@ -303,11 +306,14 @@ pub(crate) fn lfm_fill_executed_under(
     plan: &super::merge::MergePlan,
 ) -> LfmFilled {
     let LfmExecution {
-        records,
+        mut records,
         public_words,
         memory,
         split: exec_split,
     } = execution;
+    // The lean BLAKE3 records go to the block prover's fill; this one builds
+    // the fixed chip set's traces only.
+    let b3l = core::mem::take(&mut records.b3l);
     // The final write-once array: 32 bytes per address, a few hundred MB for a
     // wrap. It is a diagnostic surface for tests — nothing on the proving path
     // reads it — so held to the end of this scope it would stay live through the
@@ -329,6 +335,7 @@ pub(crate) fn lfm_fill_executed_under(
         execute_secs,
         fill_secs,
         exec_split,
+        b3l,
     }
 }
 
@@ -354,6 +361,13 @@ impl LfmFilled {
     #[cfg(test)]
     pub(crate) fn public_words_mut(&mut self) -> &mut Vec<(u32, LfmWord)> {
         &mut self.public_words
+    }
+
+    /// The program's `B3L_HEAD` records, moved out: the W-LFM prover fills
+    /// the lean BLAKE3 tables from them.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn take_b3l(&mut self) -> Vec<super::b3l::B3lValues> {
+        core::mem::take(&mut self.b3l)
     }
 
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
@@ -407,8 +421,21 @@ impl LfmFilled {
             execute_secs,
             fill_secs,
             exec_split,
+            b3l,
         } = self;
         same_hasher(artifacts.hasher, hasher)?;
+        // ⛔ The STARK chip set has no lean BLAKE3 tables: a program that
+        // carries `B3l` rows would prove with them unproved. Refused before
+        // anything reaches the card (its verifier's bus could not balance
+        // either: every digest read would lack its write).
+        if !b3l.is_empty() {
+            return Err(LfmProveError::Prover(ProvingError::WrongParameter(
+                format!(
+                    "{} lean BLAKE3 compressions: only the block prover (W-LFM) proves them",
+                    b3l.len()
+                ),
+            )));
+        }
         // The domains and twiddles this proof's tables need, built before it
         // takes the card rather than under it ([`super::domain_warm`]).
         let built = super::domain_warm::warm(&traces, options);

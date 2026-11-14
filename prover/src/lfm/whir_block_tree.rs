@@ -725,6 +725,7 @@ pub(crate) fn program_bytes(p: &LfmProgram) -> u64 {
             Instr::BitDec { bits, .. } => bits.capacity() * size_of::<(Addr, u64)>(),
             Instr::KeccakF(_) => size_of::<KeccakOperands>(),
             Instr::Blake3(_) => size_of::<Blake3Operands>(),
+            Instr::B3l(_) => size_of::<super::instr::B3lOperands>(),
             _ => 0,
         };
     }
