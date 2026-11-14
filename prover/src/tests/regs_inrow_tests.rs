@@ -50,8 +50,10 @@ fn the_in_row_cpu_row_takes_todays_gkr_slots_and_reads_its_columns() {
     );
     let width = cpu::inrow_cols::NUM_COLUMNS_INROW;
     assert_eq!(width, 42);
-    let read: std::collections::BTreeSet<usize> =
-        in_row.iter().flat_map(BusInteraction::columns_read).collect();
+    let read: std::collections::BTreeSet<usize> = in_row
+        .iter()
+        .flat_map(BusInteraction::columns_read)
+        .collect();
     assert!((cpu::cols::NUM_COLUMNS..width).all(|c| read.contains(&c)));
     assert!(read.iter().all(|&c| c < width));
 }
@@ -71,7 +73,10 @@ fn regx_halt_and_register_take_the_reg_bus() {
     assert!(register.iter().all(|i| i.bus_id == reg));
     let files = crate::tables::register::halted_fini(7);
     let columns = crate::tables::register::inrow::preprocessed_columns(&files, &files);
-    assert_eq!(columns.len(), crate::tables::register::inrow::NUM_PREPROCESSED_COLS);
+    assert_eq!(
+        columns.len(),
+        crate::tables::register::inrow::NUM_PREPROCESSED_COLS
+    );
     assert!(columns.iter().all(|c| c.len() == 64));
 }
 

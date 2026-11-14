@@ -365,7 +365,12 @@ pub(crate) fn generate_memw_register_trace_from_rows_segments_as(
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // REGX rows (the in-row register format) fill REGX's table.
-    if segments.iter().flat_map(|s| s.iter()).next().is_some_and(RegRow::is_regx) {
+    if segments
+        .iter()
+        .flat_map(|s| s.iter())
+        .next()
+        .is_some_and(RegRow::is_regx)
+    {
         return super::regx::generate_regx_trace_segments_as(segments, form);
     }
     let len: usize = segments.iter().map(|s| s.len()).sum();
