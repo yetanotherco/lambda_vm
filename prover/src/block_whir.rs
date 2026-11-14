@@ -30,7 +30,7 @@ use executor::vm::execution::Executor;
 use executor::vm::shadow::{ShadowCheck, WindowStart};
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
-use multilinear::whir_chain::{ArgueFormat, ChainConfig, GroupFold};
+use multilinear::whir_chain::{ArgueFormat, ChainConfig, FinalPoly, GroupFold};
 use rayon::prelude::*;
 use stark::multilinear_block::{self, BlockCommitted, GroupStamps, block_groups};
 use stark::multilinear_table::{
@@ -389,11 +389,17 @@ pub fn block_statement_tag(base: &BaseFormat) -> Vec<u8> {
     }
     // The 7-round BLAKE3 base's binary trees: their cap is the base's own,
     // [`B3_BASE_CAP`], a verifier-side constant, and the tag names it so no
-    // two BLAKE3 geometries share a tag either.
+    // two BLAKE3 geometries share a tag either; then its final polynomial's
+    // width ([`b3_base_final`], `F0` without one).
     if *base == BaseFormat::B3_WHIR {
         let mut tag = MULTILINEAR_BLOCK_TAG.to_vec();
         tag.extend_from_slice(B3_BASE_TAG_SUFFIX);
         tag.extend_from_slice(format!("/C{B3_BASE_CAP}").as_bytes());
+        let final_vars = match b3_base_final() {
+            FinalPoly::Off => 0,
+            FinalPoly::Vars(v) => v,
+        };
+        tag.extend_from_slice(format!("/F{final_vars}").as_bytes());
         return tag;
     }
     let height = match base.arity4_cap {
@@ -422,6 +428,64 @@ pub const B3_BASE_TAG_SUFFIX: &[u8] = b"/B3R7";
 /// once; past about 8 the cap costs more than the levels it saves. The base's
 /// proof carries the cap's nodes (≈ 8 KB a tree).
 pub const B3_BASE_CAP: u8 = 8;
+
+/// The 7-round BLAKE3 base's final polynomial: each chain stops committing at
+/// the first round past round 0, short of the last, after which at most `9`
+/// variables remain (`ChainConfig::final_round`; round 3 of a `2^27` stack's
+/// `[6, 4, 4, 4, 4, 4, 1]`). That round sends the folded polynomial's `2^9`
+/// values, checks its queries against their encoding, and the rounds after it
+/// are sumchecks alone. A verifier-side constant (the base's
+/// [`b3_base_final`] unless [`B3_BASE_FINAL_ENV`] says otherwise), named in the
+/// statement tag ([`block_statement_tag`]).
+///
+/// ★ Why: the recursion's leaf opens no successor at the final round and no
+/// tree after it, for `2^9` values absorbed once and their encoding a query
+/// (`lfm::whir_chain::emit_final_poly_phase`).
+pub const B3_BASE_FINAL_VARS: u8 = 9;
+
+/// The knob that proves and verifies the BLAKE3 base's chains with or without
+/// their final polynomial (a measurement of what it costs the base; both sides
+/// of one process read it, and the tag names it): see [`b3_base_final_setting`].
+pub const B3_BASE_FINAL_ENV: &str = "LAMBDA_VM_B3_BASE_FINAL";
+
+/// [`B3_BASE_FINAL_ENV`]'s value: unset, `on` or `9` is [`FinalPoly::Vars`] at
+/// [`B3_BASE_FINAL_VARS`] (the base's format); `0` or `off` is
+/// [`FinalPoly::Off`], every round committed. Anything else is refused.
+pub fn b3_base_final_setting(value: Option<&str>) -> Result<FinalPoly, String> {
+    let on = FinalPoly::Vars(B3_BASE_FINAL_VARS);
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(on),
+        Some(v) => match v.as_str() {
+            "on" | "9" => Ok(on),
+            "0" | "off" => Ok(FinalPoly::Off),
+            other => Err(format!(
+                "{B3_BASE_FINAL_ENV}={other:?}: expected on, 9, off or 0"
+            )),
+        },
+    }
+}
+
+/// The BLAKE3 base's final polynomial in this process ([`b3_base_final_setting`]
+/// of [`B3_BASE_FINAL_ENV`]), read once. A value it refuses aborts the process
+/// at its first read, as the process format does (`ZfFormat::global`): a
+/// configuration error, before anything is proved or verified.
+pub fn b3_base_final() -> FinalPoly {
+    static FINAL: std::sync::OnceLock<FinalPoly> = std::sync::OnceLock::new();
+    *FINAL.get_or_init(|| {
+        let value = match std::env::var(B3_BASE_FINAL_ENV) {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(v)) => {
+                eprintln!("{B3_BASE_FINAL_ENV}={v:?}: expected on, 9, off or 0");
+                std::process::abort()
+            }
+        };
+        b3_base_final_setting(value.as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::abort()
+        })
+    })
+}
 
 #[cfg(test)]
 thread_local! {
@@ -551,9 +615,11 @@ impl BlockFormat {
     /// of a block builds its config here.
     pub fn chain_config(&self, shapes: &[(usize, usize)]) -> ChainConfig {
         let mut config = chain_config_under(&self.zf, shapes);
-        // The BLAKE3 base's binary trees take its own cap ([`B3_BASE_CAP`]).
+        // The BLAKE3 base's binary trees take its own cap ([`B3_BASE_CAP`]),
+        // and its chains its final polynomial ([`b3_base_final`]).
         if self.zf.base == BaseFormat::B3_WHIR {
             config.format.cap = CapPolicy::Fixed(B3_BASE_CAP);
+            config.format.final_poly = b3_base_final();
         }
         config.format.argue = self.argue;
         config.format.group = self.group;

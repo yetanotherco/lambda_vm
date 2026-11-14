@@ -154,6 +154,9 @@ pub struct ChainRoundWires<'a> {
     pub current_cap: &'a [WrapDigest],
     /// The successor tree's Merkle cap, when it has one (`caps[r + 1] > 0`).
     pub next_cap: &'a [WrapDigest],
+    /// The final-polynomial round's sent polynomial, its `2^rem` hypercube
+    /// values ([`ChainShape::final_at`]); empty at every other round.
+    pub final_poly: &'a [Ext],
 }
 
 /// The shape of one chain: everything the closed forms below are a function of.
@@ -207,6 +210,12 @@ pub struct ChainShape {
     /// chain is emitted by, and the width [`push_round_words`] lays a node out
     /// in.
     pub digest_words: usize,
+    /// The final-polynomial round and the variables left after it
+    /// (`ChainConfig::final_round`, the config's own): that round commits no
+    /// successor and checks its queries against the sent polynomial's
+    /// encoding, and the rounds after it are sumchecks alone. `None` is
+    /// today's chain.
+    pub final_at: Option<(usize, usize)>,
 }
 
 /// How a block's recursion leaf checks a chain's queries: a verifier
@@ -265,6 +274,7 @@ impl ChainShape {
             num_vars,
             num_queries: config.num_queries,
             digest_words: 1,
+            final_at: config.final_round(num_vars),
             caps,
             grind: (
                 config.grind.folding as usize,
@@ -320,6 +330,7 @@ impl ChainShape {
     /// alone, so the arena, the leaf and the cost model agree.
     pub fn tail_round(&self, r: usize) -> bool {
         self.query == LeafQuery::Lean
+            && self.final_at.is_none()
             && r >= 1
             && r < self.rounds()
             && (r..self.rounds()).all(|t| self.tail_shaped(t))
@@ -439,9 +450,22 @@ impl ChainShape {
             NonceLayout::Spent => [
                 folding > 0,
                 ood > 0 && self.next_depth(r).is_some(),
-                query > 0,
+                query > 0 && self.queried(r),
             ],
         }
+    }
+
+    /// Whether round `r` opens its current tree at queries: every round of
+    /// today's chain, and under a final polynomial the rounds up to the final
+    /// one (the rounds after it are sumchecks alone).
+    pub fn queried(&self, r: usize) -> bool {
+        self.final_at.is_none_or(|(f, _)| r <= f)
+    }
+
+    /// Whether round `r` is the final-polynomial round ([`Self::final_at`]),
+    /// and the variables the sent polynomial has.
+    pub fn final_vars_at(&self, r: usize) -> Option<usize> {
+        self.final_at.filter(|&(f, _)| f == r).map(|(_, rem)| rem)
     }
 
     /// The current tree's depth at round `r`: its leaves are the round's domain
@@ -453,7 +477,9 @@ impl ChainShape {
     /// The successor tree's depth at round `r`, which is the NEXT round's
     /// current depth. Only rounds before the last have one.
     pub fn next_depth(&self, r: usize) -> Option<usize> {
-        (r + 1 < self.rounds()).then(|| self.current_depth(r + 1))
+        // A final-polynomial round and the sumchecks after it commit nothing.
+        (r + 1 < self.rounds() && self.final_at.is_none_or(|(f, _)| r < f))
+            .then(|| self.current_depth(r + 1))
     }
 
     /// Round `r`'s current tree's cap height. ⚠ [`current_depth`](Self::current_depth)
@@ -555,6 +581,9 @@ pub fn chain_opening_perms(shape: &ChainShape) -> usize {
     // (no walked level) and opens no successor a query.
     let mut tail = 0;
     for r in 0..shape.rounds() {
+        if !shape.queried(r) {
+            continue;
+        }
         let current = shape.opening_perms(
             shape.current_felts(r),
             shape.current_depth(r),
@@ -578,6 +607,7 @@ pub fn chain_opening_perms(shape: &ChainShape) -> usize {
 /// per-tree term is visible.
 pub fn chain_cap_perms(shape: &ChainShape) -> usize {
     (0..shape.rounds())
+        .filter(|&r| shape.queried(r))
         .map(|r| shape.trees_at(r) * shape.cap_perms(shape.current_depth(r), shape.caps[r]))
         .sum()
 }
@@ -587,6 +617,9 @@ pub fn chain_cap_perms(shape: &ChainShape) -> usize {
 pub fn chain_query_rows(shape: &ChainShape) -> usize {
     let mut per_round = 0;
     for r in 0..shape.rounds() {
+        if !shape.queried(r) {
+            continue;
+        }
         let felts = shape.current_felts(r);
         let unpacks = if r == 0 {
             0
@@ -623,6 +656,15 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
                     shape.caps[r + 1],
                 ) + (next_block - 1)
                     + 2;
+            }
+            // The final-polynomial round: the position's power (a `Select` and a
+            // `Mul` a bit), the encoding's Horner (one `MulAdd` a coefficient)
+            // and `folded == encoding`; its coefficients once a round
+            // ([`emit_final_poly_phase`]).
+            None if shape.final_vars_at(r).is_some() => {
+                let rem = shape.final_vars_at(r).unwrap_or(0);
+                q += 2 * depth + (1usize << rem) + 2;
+                per_round += rem << rem.saturating_sub(1);
             }
             // `folded == final_value`.
             None => q += 2,
@@ -669,6 +711,13 @@ pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
                 rows += 1 + grind_fixed(ood) + 1 + 1;
                 rows += grind_fixed(query);
             }
+            // The sent polynomial's values (one `Unpack` each), then the
+            // query grind.
+            None if shape.final_vars_at(r).is_some() => {
+                rows += (1usize << shape.final_vars_at(r).unwrap_or(0)) + grind_fixed(query);
+            }
+            // A sumcheck after the final round.
+            None if !shape.queried(r) => {}
             None => {
                 // `final_value` absorbed, then the query grind.
                 rows += 1 + grind_fixed(query);
@@ -677,16 +726,22 @@ pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
     }
     // The tail: one `eq` and one `MulAdd` per out-of-domain claim, then the
     // inversion, the multiply and the assert.
-    for r in 0..shape.rounds() - 1 {
+    for r in (0..shape.rounds()).filter(|&r| shape.next_depth(r).is_some()) {
         rows += eq_eval_rows_again(shape.chain_vars() - shape.bound(r)) + 1;
     }
     rows += 1 + 1 + 2;
+    // Under a final polynomial: its value at the tail's challenges (a `Sub` and
+    // a `MulAdd` a fold) and the assert.
+    if let Some((_, rem)) = shape.final_at {
+        rows += 2 * ((1usize << rem) - 1) + 2;
+    }
     // W1: each capped tree's cap check, once (its hinted words are arena
     // words, counted with the arena like every other hint).
     rows += shape
         .caps
         .iter()
         .enumerate()
+        .filter(|&(r, _)| shape.queried(r))
         .map(|(r, &c)| shape.trees_at(r) * cap_check_rows(c))
         .sum::<usize>();
     rows
@@ -741,9 +796,15 @@ pub fn chain_grind_perms(shape: &ChainShape) -> usize {
     }
     let (folding, ood, query) = shape.grind;
     let rounds = shape.rounds();
+    // The out-of-domain grind where a round commits a successor, the query
+    // grind where it opens queries: under a final polynomial, fewer of both.
+    let successors = (0..rounds)
+        .filter(|&r| shape.next_depth(r).is_some())
+        .count();
+    let queried = (0..rounds).filter(|&r| shape.queried(r)).count();
     let checks = rounds * usize::from(folding > 0)
-        + (rounds - 1) * usize::from(ood > 0)
-        + rounds * usize::from(query > 0);
+        + successors * usize::from(ood > 0)
+        + queried * usize::from(query > 0);
     PERMS_PER_GRIND * checks
 }
 
@@ -805,13 +866,24 @@ pub fn chain_sponge(shape: &ChainShape, sponge: &mut SpongeSchedule) {
                 sponge.draw_ext();
                 sponge.grind(query);
             }
+            // The final-polynomial round: the sent polynomial's values, then
+            // the query grind.
+            None if shape.final_vars_at(r).is_some() => {
+                let rem = shape.final_vars_at(r).unwrap_or(0);
+                sponge.absorb(COORDINATES_PER_EXT << rem);
+                sponge.grind(query);
+            }
+            // A sumcheck after the final round: nothing more.
+            None if !shape.queried(r) => {}
             None => {
                 sponge.absorb(COORDINATES_PER_EXT);
                 sponge.grind(query);
             }
         }
-        for _ in 0..shape.num_queries {
-            sponge.candidate();
+        if shape.queried(r) {
+            for _ in 0..shape.num_queries {
+                sponge.candidate();
+            }
         }
     }
 }
@@ -987,6 +1059,16 @@ fn emit_chain(
     let mut ood: Vec<(Ext, Vec<Ext>, usize)> = Vec::new();
     // The run's `eq(ρ, p)`s, once round 0 has drawn `ρ`; none for one tree.
     let mut eqs: Vec<Ext> = Vec::new();
+    // Under a final polynomial: the values it was sent as, and the challenges
+    // of the sumchecks after it, where it is evaluated for `f(α)`. Only the
+    // binary BLAKE3 trees' chains take one (the BLAKE3 base's format): no
+    // other hash's final round is gated.
+    assert!(
+        shape.final_at.is_none() || b.wrap_hash() == WrapHash::Blake3,
+        "a final polynomial is emitted under the BLAKE3 base's binary trees only"
+    );
+    let mut final_sent: Option<&[Ext]> = None;
+    let mut tail_alphas: Vec<Ext> = Vec::new();
 
     for (r, round) in rounds.iter().enumerate() {
         let k = shape.schedule[r];
@@ -1045,6 +1127,53 @@ fn emit_chain(
 
         #[cfg(test)]
         onechain_steps::mark(b, onechain_steps::Step::Ood { round: r });
+        if !shape.queried(r) {
+            // A sumcheck after the final-polynomial round: no commitment, no
+            // out-of-domain point, no query; its challenges are where the sent
+            // polynomial is evaluated (`whir_chain::verify`'s `tail_alphas`).
+            assert!(
+                round.next_root.is_none() && round.current.is_empty() && round.next.is_empty(),
+                "round {r} after the final round carries no commitment and no opening"
+            );
+            tail_alphas.extend(point.iter().copied());
+            alphas.extend(point);
+            current_domain = next_domain;
+            continue;
+        }
+        if let Some(rem) = shape.final_vars_at(r) {
+            // The final-polynomial round: no successor; the sent polynomial's
+            // `2^rem` values absorbed, the query grind, then every query's
+            // block folds to the polynomial's encoding at its folded position.
+            assert!(
+                round.next_root.is_none() && round.ood_value.is_none() && round.next_cap.is_empty(),
+                "the final round commits no successor"
+            );
+            assert_eq!(
+                round.final_poly.len(),
+                1usize << rem,
+                "the final round sends 2^{rem} values"
+            );
+            for value in round.final_poly {
+                transcript.absorb_ext(b, *value);
+            }
+            emit_spent_grind(b, transcript, grind_query, round.nonces.query);
+            emit_final_poly_phase(
+                b,
+                transcript,
+                round,
+                shape,
+                r,
+                &current_domain,
+                &next_domain,
+                data,
+                &current_trees,
+                rem,
+            );
+            final_sent = Some(round.final_poly);
+            alphas.extend(point);
+            current_domain = next_domain;
+            continue;
+        }
         let next_tree = match (round.next_root, round.ood_value, shape.next_depth(r)) {
             (Some(next_root), Some(y0), Some(_)) => {
                 assert_eq!(
@@ -1146,6 +1275,112 @@ fn emit_chain(
     }
 
     emit_final_check(b, claim, weight, final_value, one);
+    // Under a final polynomial, `f(α)` is the sent polynomial's value at the
+    // tail's challenges, never the prover's word alone.
+    if let Some(sent) = final_sent {
+        let value = emit_mle_eval(b, sent, &tail_alphas);
+        b.assert_eq_ext(final_value, value);
+    }
+}
+
+/// ★ The final-polynomial round's queries (`whir_chain::verify_final_against`
+/// under `FinalPoly::Vars`), as REFUSALS: `Q` draws, then per query the current
+/// tree's opening and its block's fold, which must equal the sent polynomial's
+/// encoding at the folded position: the multilinear extension of the sent
+/// `2^rem` values at `(y, y², y⁴, …)`, `y = ω^q` with `ω` the successor
+/// domain's generator.
+///
+/// That value is a univariate polynomial in `y`: with `c` the sent values'
+/// monomial coefficients (a Möbius transform, once a round) and the point's
+/// first coordinate the index's top bit, the monomial of index `i` is
+/// `y^bitrev(i)`. So each query is the position's power (one `Select` and one
+/// `Mul` a bit) and one Horner step a coefficient.
+#[allow(clippy::too_many_arguments)]
+fn emit_final_poly_phase(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    round: &ChainRoundWires<'_>,
+    shape: &ChainShape,
+    r: usize,
+    current_domain: &Domain<GoldilocksField>,
+    next_domain: &Domain<GoldilocksField>,
+    alphas: &[Ext],
+    current_trees: &[TreeAuth],
+    rem: usize,
+) {
+    let depth = shape.current_depth(r);
+    assert!(r >= 1, "a final round folds an extension codeword");
+    assert_eq!(current_trees.len(), 1, "the final round opens one tree");
+    assert_eq!(round.current.len(), shape.num_queries);
+    assert!(round.next.is_empty(), "the final round opens no successor");
+    let queries: Vec<Vec<Bit>> = (0..shape.num_queries)
+        .map(|_| transcript.sample_u64_pow2(b, depth))
+        .collect();
+    let fold = RoundFold::prepare(b, alphas);
+    let coefficients = emit_power_coefficients(b, round.final_poly, rem);
+    let omega = *next_domain.generator();
+    let factors: Vec<FE> = (0..depth).map(|i| omega.pow(1u64 << i)).collect();
+    for (q, bits) in queries.iter().enumerate() {
+        let current = &round.current[q];
+        #[cfg(test)]
+        onechain_steps::mark(b, onechain_steps::opening(r, q, 0));
+        current_trees[0].verify_opening(b, current.values, bits, current.siblings);
+        #[cfg(test)]
+        onechain_steps::mark(b, onechain_steps::Step::Fold { round: r, query: q });
+        let folded = fold.fold(b, &block_ext(current.values), current_domain, bits);
+        let y = super::edsl::pow_bits(b, bits, &factors, FE::one());
+        let encoding = super::edsl::horner_ext(b, y.as_ext(), &coefficients);
+        b.assert_eq_ext(folded, encoding);
+    }
+}
+
+/// The monomial coefficients of the multilinear polynomial whose hypercube
+/// values are `values` (`2^n` of them, `Mle` order: the first variable the
+/// index's top bit), reordered so coefficient `e` is that of `y^e` on the power
+/// point `(y, y², y⁴, …)`: index `i`'s monomial is `y^bitrev_n(i)`. One `Sub` a
+/// value a variable (the Möbius transform).
+pub fn emit_power_coefficients(b: &mut LfmBuilder, values: &[Ext], n: usize) -> Vec<Ext> {
+    assert_eq!(values.len(), 1usize << n, "2^{n} hypercube values");
+    let mut c: Vec<Ext> = values.to_vec();
+    for bit in 0..n {
+        for i in 0..c.len() {
+            if i & (1 << bit) != 0 {
+                c[i] = b.esub(c[i], c[i ^ (1 << bit)]);
+            }
+        }
+    }
+    let mut by_power = c.clone();
+    for (i, coefficient) in c.into_iter().enumerate() {
+        let e = if n == 0 {
+            0
+        } else {
+            i.reverse_bits() >> (usize::BITS as usize - n)
+        };
+        by_power[e] = coefficient;
+    }
+    by_power
+}
+
+/// `Mle::evaluate_at(values, point)`, emitted: the first coordinate folds the
+/// halves (the index's top bit), each fold `lo + p·(hi − lo)`.
+pub fn emit_mle_eval(b: &mut LfmBuilder, values: &[Ext], point: &[Ext]) -> Ext {
+    assert_eq!(
+        values.len(),
+        1usize << point.len(),
+        "2^{} values",
+        point.len()
+    );
+    let mut current: Vec<Ext> = values.to_vec();
+    for p in point {
+        let half = current.len() / 2;
+        current = (0..half)
+            .map(|j| {
+                let gap = b.esub(current[j + half], current[j]);
+                b.emul_add(*p, gap, current[j])
+            })
+            .collect();
+    }
+    current[0]
 }
 
 /// Test only: emitter faults a grouped-chain test switches on, one at a time,
@@ -1902,6 +2137,8 @@ pub struct RoundStorage {
     /// and the successor's cap. Empty where the tree is uncapped.
     current_caps: Vec<Vec<WrapDigest>>,
     next_caps: Vec<Vec<WrapDigest>>,
+    /// Per round: the final-polynomial round's sent values (empty elsewhere).
+    sent: Vec<Vec<Ext>>,
 }
 
 impl RoundStorage {
@@ -1927,6 +2164,7 @@ impl RoundStorage {
         let mut nonces: Vec<RoundNonces> = Vec::new();
         let mut current_caps: Vec<Vec<WrapDigest>> = Vec::new();
         let mut next_caps: Vec<Vec<WrapDigest>> = Vec::new();
+        let mut sent: Vec<Vec<Ext>> = Vec::new();
 
         let mut at = base;
         for r in 0..shape.rounds() {
@@ -1984,7 +2222,10 @@ impl RoundStorage {
             // match — which is exactly how this test first failed.
             // A grouped round 0: one block and path a tree, query-major.
             // A tail round: every leaf's block once, in leaf order, no path.
-            let openings = if shape.tail_round(r) {
+            // After a final-polynomial round: a sumcheck alone, no opening.
+            let openings = if !shape.queried(r) {
+                0
+            } else if shape.tail_round(r) {
                 shape.current_leaves(r)
             } else {
                 shape.num_queries * shape.trees_at(r)
@@ -2056,6 +2297,13 @@ impl RoundStorage {
                 }
                 None => (None, None, Vec::new(), Vec::new()),
             };
+            // The final-polynomial round's sent values, after its openings.
+            let sent_poly: Vec<Ext> = match shape.final_vars_at(r) {
+                Some(rem) => (0..1usize << rem)
+                    .map(|_| next_word(b, &mut at).as_ext())
+                    .collect(),
+                None => Vec::new(),
+            };
 
             sumchecks.push(sumcheck);
             currents.push(current);
@@ -2069,6 +2317,7 @@ impl RoundStorage {
             });
             current_caps.push(current_cap);
             next_caps.push(next_cap);
+            sent.push(sent_poly);
         }
         assert_eq!(
             at - base,
@@ -2086,6 +2335,7 @@ impl RoundStorage {
             nonces,
             current_caps,
             next_caps,
+            sent,
         }
     }
 
@@ -2138,6 +2388,7 @@ impl RoundStorage {
                 next: &next[r],
                 current_cap: &self.current_caps[r],
                 next_cap: &self.next_caps[r],
+                final_poly: &self.sent[r],
             })
             .collect()
     }
@@ -2153,7 +2404,9 @@ pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
     let dw = shape.digest_words;
     let depth = dw * shape.current_path(r);
     let block = shape.current_block(r);
-    if shape.tail_round(r) {
+    if !shape.queried(r) {
+        // A sumcheck after a final-polynomial round: nothing more.
+    } else if shape.tail_round(r) {
         // A tail round: every leaf's block once, in leaf order, and no path.
         n += (shape.current_leaves(r) * block) as u32;
     } else {
@@ -2182,6 +2435,10 @@ pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
             let next_block = 1usize << shape.schedule[r + 1];
             n += (shape.num_queries * (next_block + dw * shape.path_words(next_depth, c))) as u32;
         }
+    }
+    // The final-polynomial round's sent values.
+    if let Some(rem) = shape.final_vars_at(r) {
+        n += 1u32 << rem;
     }
     n
 }
@@ -2234,7 +2491,10 @@ pub fn try_push_round_words(
             cap: shape.caps[r],
             owner: r == 0,
         };
-        if shape.tail_round(r) {
+        if !shape.queried(r) {
+            // A sumcheck after a final-polynomial round: its proof carries no
+            // opening, and the arena none.
+        } else if shape.tail_round(r) {
             push_tail_blocks(words, shape, proof, r)?;
         } else {
             push_openings(words, shape, round, true, current);
@@ -2262,6 +2522,28 @@ pub fn try_push_round_words(
             } else {
                 push_openings(words, shape, round, false, next);
             }
+        }
+        // The final-polynomial round's sent polynomial: its successor slot's one
+        // block (no path), as the host verifier reads it.
+        if let Some(rem) = shape.final_vars_at(r) {
+            let RoundOpenings::Extension(p) = &round.openings else {
+                return Err(format!(
+                    "final round {r}: its openings are not extension-valued"
+                ));
+            };
+            let [sent] = p.next.as_slice() else {
+                return Err(format!(
+                    "final round {r}: {} successor blocks, one sent polynomial expected",
+                    p.next.len()
+                ));
+            };
+            if sent.values.len() != 1usize << rem {
+                return Err(format!(
+                    "final round {r}: {} sent values, 2^{rem} expected",
+                    sent.values.len()
+                ));
+            }
+            words.extend(sent.values.iter().map(ext_word));
         }
     }
     Ok(())

@@ -579,14 +579,14 @@ mod chain {
 
     use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
-    use super::super::builder::Ext;
+    use super::super::builder::{Ext, LfmBuilder};
     use super::super::compiler::{LfmProgram, compile};
     use super::super::edsl::{WrapDigest, WrapHash};
     use super::super::executor::execute;
     use super::super::validator::validate;
     use super::super::whir_chain::{
         ChainShape, RoundStorage, byte_digest_words, emit_verify_weighted, push_round_words,
-        round_words,
+        round_words, try_push_round_words,
     };
     use super::super::whir_open::RootLanes;
     use super::super::whir_poly::emit_eq_eval;
@@ -707,7 +707,11 @@ mod chain {
 
     /// `z`, `y`, the root (two words), the final value, then the rounds.
     pub(super) fn program(shape: &ChainShape) -> LfmProgram {
-        let mut b = builder();
+        program_with(builder(), shape)
+    }
+
+    /// [`program`] on the builder `b`.
+    fn program_with(mut b: LfmBuilder, shape: &ChainShape) -> LfmProgram {
         let head = (shape.num_vars + 4) as u32;
         let total = head
             + (0..shape.rounds())
@@ -1001,6 +1005,179 @@ mod chain {
         });
     }
 
+    /// ★ THE FINAL-POLYNOMIAL GATE. A BLAKE3 chain under `FinalPoly::Vars`
+    /// (the final round commits no successor, sends its folded polynomial, and
+    /// the rounds after it are sumchecks alone) executes on every proof the
+    /// host accepts, at three final rounds; its compressions are the closed
+    /// form's and fewer than the same chain's without the final polynomial;
+    /// and a sent value, a tail sumcheck evaluation, the final value and a
+    /// final-round block value each tampered are refused by the host and have
+    /// no execution.
+    #[test]
+    fn a_blake3_chain_with_a_final_polynomial_executes_and_refuses_its_tampers() {
+        use super::super::whir_chain::chain_perms;
+        use super::super::whir_transcript::SpongeEntry;
+        use multilinear::whir_chain::FinalPoly;
+        super::under_both(|_lowering| {
+            for (num_vars, v) in [(10usize, 2u8), (12, 4), (12, 2)] {
+                let mut cfg = config(5, 4, CapPolicy::Fixed(2), LeafOrder::Coset, Some(6));
+                cfg.format.final_poly = FinalPoly::vars(v).expect("a final width");
+                let (final_r, rem) = cfg.final_round(num_vars).expect("a final round");
+                let f = fixture(num_vars, cfg);
+                assert_eq!(f.shape.final_at, Some((final_r, rem)));
+                let leg = program(&f.shape);
+                execute(&leg, &[arena(&f, &f.proof)], &crate::hash_pin::BLOCK_HASHER)
+                    .unwrap_or_else(|e| {
+                        panic!("S={num_vars} v={v}: refused an accepted proof: {e:?}")
+                    });
+                let (emitted, other) = hash_rows(&leg);
+                assert_eq!(other, 0);
+                assert_eq!(
+                    emitted,
+                    chain_perms(&f.shape, SpongeEntry::fresh_for(WrapHash::Blake3)),
+                    "S={num_vars} v={v}: the closed form"
+                );
+                let mut plain_cfg = cfg;
+                plain_cfg.format.final_poly = FinalPoly::Off;
+                let plain = ChainShape::for_hash(&plain_cfg, num_vars, WrapHash::Blake3);
+                assert!(
+                    emitted < chain_perms(&plain, SpongeEntry::fresh_for(WrapHash::Blake3)),
+                    "the final polynomial saves compressions"
+                );
+                let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
+                let mut forged = f.proof.clone();
+                match &mut forged.rounds[final_r].openings {
+                    RoundOpenings::Extension(p) => p.next[0].values[1] += FEE::one(),
+                    _ => unreachable!("the final round is extension-valued"),
+                }
+                sites.push(("a sent value", forged));
+                let mut forged = f.proof.clone();
+                forged.final_value += FEE::one();
+                sites.push(("the final value", forged));
+                let mut forged = f.proof.clone();
+                match &mut forged.rounds[final_r].openings {
+                    RoundOpenings::Extension(p) => p.current[0].values[0] += FEE::one(),
+                    _ => unreachable!("the final round is extension-valued"),
+                }
+                sites.push(("a final-round block value", forged));
+                if final_r + 1 < f.proof.rounds.len() {
+                    let mut forged = f.proof.clone();
+                    forged.rounds[final_r + 1].sumcheck[0].evaluations[0] += FEE::one();
+                    sites.push(("a tail sumcheck evaluation", forged));
+                }
+                // A sent polynomial one value short or long: refused by the
+                // arena's layout before the leaf runs.
+                for grow in [false, true] {
+                    let mut forged = f.proof.clone();
+                    match &mut forged.rounds[final_r].openings {
+                        RoundOpenings::Extension(p) if grow => p.next[0].values.push(FEE::one()),
+                        RoundOpenings::Extension(p) => {
+                            p.next[0].values.pop();
+                        }
+                        _ => unreachable!("the final round is extension-valued"),
+                    }
+                    let mut words = Vec::new();
+                    assert!(
+                        try_push_round_words(&mut words, &f.shape, &forged).is_err(),
+                        "S={num_vars} v={v}: a sent polynomial of the wrong width (grow {grow})"
+                    );
+                    sites.push(("a sent polynomial of the wrong width", forged));
+                }
+                for (name, forged) in &sites {
+                    assert!(
+                        !host_accepts(&f, forged),
+                        "S={num_vars} v={v}: {name}: host"
+                    );
+                    assert!(
+                        !runs(&leg, arena(&f, forged)),
+                        "S={num_vars} v={v}: {name} must have no execution"
+                    );
+                }
+                println!(
+                    "BLAKE3 FINAL POLY S={num_vars} v={v}: final round {final_r} ({rem} vars) of {:?} \
+                     · {emitted} compressions",
+                    f.shape.schedule
+                );
+            }
+        });
+    }
+
+    /// A final polynomial is emitted under BLAKE3 alone: the same shape on a
+    /// Keccak builder (two-word digests, binary trees too) is refused at
+    /// emission, so no other hash's final round runs ungated.
+    #[test]
+    #[should_panic(expected = "the BLAKE3 base's binary trees only")]
+    fn a_final_polynomial_under_another_hash_is_refused_at_emission() {
+        use multilinear::whir_chain::FinalPoly;
+        let mut cfg = config(5, 4, CapPolicy::Fixed(2), LeafOrder::Coset, Some(6));
+        cfg.format.final_poly = FinalPoly::vars(2).expect("a final width");
+        let shape = ChainShape::for_hash(&cfg, 10, WrapHash::Keccak);
+        assert!(shape.final_at.is_some());
+        program_with(LfmBuilder::new().with_wrap_hash(WrapHash::Keccak), &shape);
+    }
+
+    /// The BLAKE3 base's final polynomial on one production chain (a single
+    /// 2^27 polynomial at the base's format, under the leaf's lean query
+    /// check), emitted with and without it: the instructions and compressions
+    /// each program takes. Emission only (no proof: the shape alone fixes the
+    /// program). Prints; asserts that the final polynomial saves compressions.
+    #[test]
+    #[ignore = "census: emits two production-shape chain programs"]
+    fn the_production_final_round_costs_its_instructions() {
+        use super::super::whir_chain::{LeafQuery, chain_perms};
+        use super::super::whir_transcript::SpongeEntry;
+        use crate::block_whir::BlockFormat;
+        use crate::zf_format::ZfFormat;
+        use multilinear::whir_chain::FinalPoly;
+        use stark::proof::options::BaseFormat;
+        super::under_both(|lowering| {
+            let zf = ZfFormat::DEFAULT.with_base(BaseFormat::B3_WHIR);
+            let format = BlockFormat {
+                zf,
+                ..BlockFormat::production()
+            };
+            let n = zf.whir_stack.get();
+            let mut config = format.chain_config(&[(1, n)]);
+            // One polynomial, its own chain: the rounds the final polynomial
+            // moves (3 and after) are a run's whatever its width.
+            config.format.group = multilinear::whir_chain::GroupFold::PerPoly;
+            config.format.round0 = multilinear::whir_chain::Round0Trees::Each;
+            let mut counts = Vec::new();
+            for final_poly in [config.format.final_poly, FinalPoly::Off] {
+                let mut c = config;
+                c.format.final_poly = final_poly;
+                let shape = ChainShape {
+                    query: LeafQuery::Lean,
+                    ..ChainShape::for_hash(&c, n, WrapHash::Blake3)
+                };
+                let leg = program(&shape);
+                let (compressions, other) = hash_rows(&leg);
+                assert_eq!(other, 0);
+                assert_eq!(
+                    compressions,
+                    chain_perms(&shape, SpongeEntry::fresh_for(WrapHash::Blake3))
+                );
+                println!(
+                    "FINAL ROUND CENSUS {lowering} {final_poly:?}: final {:?} · {} instructions \
+                     · {compressions} compressions",
+                    shape.final_at,
+                    leg.instrs.len()
+                );
+                counts.push((leg.instrs.len(), compressions));
+            }
+            let (with, without) = (counts[0], counts[1]);
+            println!(
+                "FINAL ROUND CENSUS {lowering}: {:+} instructions · {:+} compressions",
+                with.0 as i64 - without.0 as i64,
+                with.1 as i64 - without.1 as i64
+            );
+            assert!(
+                with.1 < without.1,
+                "the final polynomial saves compressions"
+            );
+        });
+    }
+
     /// A round-0 value hinted with a nonzero upper lane is refused before any
     /// hash: the leaf's `BitDec` reads it as a base word, so the lift into the
     /// fold is pinned (whir_open's obligation, under BLAKE3).
@@ -1215,6 +1392,68 @@ mod kats {
                 assert_eq!(got == want, blocks == 4, "{blocks} blocks");
             }
         });
+    }
+
+    /// ★ The final polynomial's two values, against the host's: its encoding
+    /// at a power point (`Mle::evaluate` at `ood_point(y, n)`, what
+    /// `verify_final_against` compares a fold with) through the Möbius
+    /// coefficients and Horner, and its value at a point (`Mle::evaluate_at`,
+    /// the tail's `f(α)`), at every width the gate's chains send and wider.
+    #[test]
+    fn the_final_polynomials_encoding_and_value_are_the_hosts() {
+        use super::super::whir_chain::{emit_mle_eval, emit_power_coefficients};
+        use crate::tables::types::GoldilocksExtension;
+        use multilinear::mle::Mle;
+        for n in 1usize..=5 {
+            let values: Vec<FEE> = (0..1u64 << n)
+                .map(|i| {
+                    let f = felts(3, 31 * i + n as u64);
+                    FEE::new([f[0], f[1], f[2]])
+                })
+                .collect();
+            let y = FE::from(0x1234_5678_9abc_u64 + n as u64);
+            let point: Vec<FEE> = (0..n)
+                .map(|j| {
+                    let f = felts(3, 900 + j as u64);
+                    FEE::new([f[0], f[1], f[2]])
+                })
+                .collect();
+            let host = Mle::<GoldilocksExtension>::new(values.clone()).expect("a cube");
+            let want_encoding = host
+                .evaluate(&multilinear::whir_chain::ood_point(&y.to_extension(), n))
+                .expect("the encoding");
+            let want_value = host.evaluate(&point).expect("the value");
+
+            let mut b = builder();
+            let arena = b.declare_arena((values.len() + n + 1) as u32);
+            let vs: Vec<_> = (0..values.len())
+                .map(|i| b.hint_word(arena, i as u32).as_ext())
+                .collect();
+            let ps: Vec<_> = (0..n)
+                .map(|j| b.hint_word(arena, (values.len() + j) as u32).as_ext())
+                .collect();
+            let yc = b.hint_felt(arena, (values.len() + n) as u32);
+            let coefficients = emit_power_coefficients(&mut b, &vs, n);
+            let encoding = super::super::edsl::horner_ext(&mut b, yc.as_ext(), &coefficients);
+            let value = emit_mle_eval(&mut b, &vs, &ps);
+            b.public(encoding.as_cell());
+            b.public(value.as_cell());
+            let program = compile(b.finish());
+            let mut words: Vec<LfmWord> = values.iter().map(ext_word).collect();
+            words.extend(point.iter().map(ext_word));
+            words.push([y, FE::zero(), FE::zero(), FE::zero()]);
+            let out = run_program(&program, &[words]);
+            assert_eq!(
+                super::super::word::word_as_ext(&out[0]),
+                Some(want_encoding),
+                "{n}: encoding"
+            );
+            assert_eq!(
+                super::super::word::word_as_ext(&out[1]),
+                Some(want_value),
+                "{n}: value"
+            );
+        }
     }
 
     /// ★ A parent is `hash_new_parent(left, right)`: one compression of the
@@ -1792,16 +2031,22 @@ fn the_production_blake3_run_costs_its_closed_form() {
 }
 
 /// ★ The BLAKE3 base's own format, by closed form: its block format's chain
-/// config (the binary cap [`crate::block_whir::B3_BASE_CAP`], every other
-/// setting production's) under the leaf's lean query check, which takes the
-/// binary tail rounds once a leaf. A run of three 2^27 polynomials, one tree a
-/// run: against today's 41,109 (cap 3, every round per query).
+/// config (the binary cap [`crate::block_whir::B3_BASE_CAP`] and the final
+/// polynomial [`crate::block_whir::B3_BASE_FINAL_VARS`], every other setting
+/// production's) under the leaf's lean query check. A run of three 2^27
+/// polynomials, one tree a run: the final round is round 3, so rounds 4 to 6
+/// open nothing. Against the same config without the final polynomial (the
+/// tail rounds 5 and 6 then checked once a leaf: 30,962) and today's 41,109
+/// (cap 3, every round per query).
 #[test]
 fn the_blake3_base_format_run_costs_its_closed_form() {
-    use super::whir_chain::{ChainShape, LeafQuery, chain_cap_perms, chain_perms};
+    use super::whir_chain::{
+        ChainShape, LeafQuery, chain_cap_perms, chain_grind_perms, chain_opening_perms, chain_perms,
+    };
     use super::whir_transcript::SpongeEntry;
-    use crate::block_whir::{B3_BASE_CAP, BlockFormat};
+    use crate::block_whir::{B3_BASE_CAP, B3_BASE_FINAL_VARS, BlockFormat};
     use crate::zf_format::ZfFormat;
+    use multilinear::whir_chain::FinalPoly;
     use stark::proof::options::BaseFormat;
     let zf = ZfFormat::DEFAULT.with_base(BaseFormat::B3_WHIR);
     let format = BlockFormat {
@@ -1814,30 +2059,65 @@ fn the_blake3_base_format_run_costs_its_closed_form() {
         config.format.cap,
         multilinear::whir_chain::CapPolicy::Fixed(B3_BASE_CAP)
     );
-    let shape = ChainShape {
-        query: LeafQuery::Lean,
-        ..ChainShape::for_hash(&config, n, WrapHash::Blake3)
-    }
-    .run(3);
-    let tails: Vec<usize> = (0..shape.rounds())
-        .filter(|&r| shape.tail_round(r))
+    assert_eq!(
+        config.format.final_poly,
+        FinalPoly::Vars(B3_BASE_FINAL_VARS)
+    );
+    assert_eq!(config.final_round(n), Some((3, 9)), "round 3, 2^9 values");
+    let lean = |config: &multilinear::whir_chain::ChainConfig| {
+        ChainShape {
+            query: LeafQuery::Lean,
+            ..ChainShape::for_hash(config, n, WrapHash::Blake3)
+        }
+        .run(3)
+    };
+    let shape = lean(&config);
+    let mut unfinal = config;
+    unfinal.format.final_poly = FinalPoly::Off;
+    let without = lean(&unfinal);
+    let tails: Vec<usize> = (0..without.rounds())
+        .filter(|&r| without.tail_round(r))
         .collect();
+    assert_eq!(tails, vec![5, 6], "rounds 5 and 6 lie wholly in their caps");
+    assert!(
+        (0..shape.rounds()).all(|r| !shape.tail_round(r)),
+        "no tail round past a final polynomial"
+    );
     let total = chain_perms(&shape, SpongeEntry::fresh_for(WrapHash::Blake3));
+    let without_total = chain_perms(&without, SpongeEntry::fresh_for(WrapHash::Blake3));
     let per_query = chain_perms(
         &ChainShape {
             query: LeafQuery::V1,
-            ..shape.clone()
+            ..without.clone()
         },
         SpongeEntry::fresh_for(WrapHash::Blake3),
     );
+    let sponge = |s: &ChainShape| {
+        chain_perms(s, SpongeEntry::fresh_for(WrapHash::Blake3))
+            - chain_opening_perms(s)
+            - chain_grind_perms(s)
+    };
     println!(
-        "BLAKE3 BASE FORMAT RUN x3: caps {:?} · tail rounds {tails:?} · {total} compressions \
-         (caps {}) · without the tail {per_query} · today's 41109",
+        "BLAKE3 BASE FORMAT RUN x3: caps {:?} · final round {:?} · {total} compressions (openings \
+         {} incl. caps {}, grinds {}, transcript {}) · without the final polynomial {without_total} \
+         (openings {} incl. caps {}, grinds {}, transcript {}; tail rounds {tails:?}) · without the \
+         tail too {per_query} · today's 41109",
         shape.caps,
-        chain_cap_perms(&shape)
+        shape.final_at,
+        chain_opening_perms(&shape),
+        chain_cap_perms(&shape),
+        chain_grind_perms(&shape),
+        sponge(&shape),
+        chain_opening_perms(&without),
+        chain_cap_perms(&without),
+        chain_grind_perms(&without),
+        sponge(&without),
     );
-    assert_eq!(tails, vec![5, 6], "rounds 5 and 6 lie wholly in their caps");
-    assert!(total < per_query && per_query < 41_109);
+    assert_eq!(
+        without_total, 30_962,
+        "the format before its final polynomial"
+    );
+    assert!(total < without_total && without_total < per_query && per_query < 41_109);
 }
 
 /// The levers on the production BLAKE3 run's compressions, by closed form: the
