@@ -918,6 +918,11 @@ fn cmd_prove_block(
         eprintln!("BLOCK_WHIR_MEMW_A is the harness's knob: the CLI proves the verifier's form");
         return ExitCode::FAILURE;
     }
+    // So is the register format.
+    if std::env::var_os("BLOCK_WHIR_REGISTERS").is_some() {
+        eprintln!("BLOCK_WHIR_REGISTERS is the harness's knob: the CLI proves the verifier's form");
+        return ExitCode::FAILURE;
+    }
     let pack = match prover::lfm::whir_block_tree::pack_setting(Some(argue_pack)) {
         Ok(pack) => pack,
         Err(e) => {

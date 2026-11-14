@@ -25,6 +25,7 @@ use multilinear::whir_chain::{ArgueFormat, GkrPack, GroupFold, LeafOrder, Round0
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
 use crate::tables::keccak_rnd::KeccakRndForm;
 use crate::tables::memw_aligned::MemwAlignedOrder;
+use crate::tables::register::RegisterFormat;
 use crate::zf_format::WhirBlowup;
 
 use super::compiler::LfmProgram;
@@ -421,6 +422,20 @@ pub fn memw_aligned_setting(knob: Option<&str>) -> Result<MemwAlignedOrder, Stri
     }
 }
 
+/// `BLOCK_WHIR_REGISTERS`'s reading: unset is the pinned preset's format
+/// ([`BlockFormat::pinned`]); `tokens32` names today's word tokens through
+/// MEMW_R and `in-row` the registers checked in the CPU row
+/// ([`RegisterFormat`]). A format value: the prover and the verifier of one
+/// proof take the same one.
+pub fn registers_setting(knob: Option<&str>) -> Result<RegisterFormat, String> {
+    match knob.map(str::trim) {
+        None => Ok(BlockFormat::pinned().registers),
+        Some("tokens32") => Ok(RegisterFormat::Tokens32),
+        Some("in-row") => Ok(RegisterFormat::InRow),
+        Some(v) => Err(format!("BLOCK_WHIR_REGISTERS={v}: tokens32 or in-row")),
+    }
+}
+
 /// `argue` with its trees laid out per `pack`: only the batched argue has
 /// trees to pack.
 fn with_pack(argue: ArgueFormat, pack: GkrPack) -> Result<ArgueFormat, String> {
@@ -487,6 +502,7 @@ impl WhirTreeConfig {
             leaf_query,
             keccak_rnd: keccak_rnd_setting(std::env::var("BLOCK_WHIR_KECCAK_RND").ok().as_deref())?,
             memw_aligned: memw_aligned_setting(std::env::var("BLOCK_WHIR_MEMW_A").ok().as_deref())?,
+            registers: registers_setting(std::env::var("BLOCK_WHIR_REGISTERS").ok().as_deref())?,
             ..BlockFormat::production_with(group_setting(
                 std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
             )?)
@@ -505,6 +521,14 @@ impl WhirTreeConfig {
             match format.memw_aligned {
                 MemwAlignedOrder::Limbs => "limbs",
                 MemwAlignedOrder::Lt => "lt",
+            }
+        );
+        eprintln!(
+            "★ BLOCK REGISTERS: {} (BLOCK_WHIR_REGISTERS; in-row checks a CPU row's register \
+             accesses in the row on one 64-bit token each, REGX taking the rest)",
+            match format.registers {
+                RegisterFormat::Tokens32 => "tokens32",
+                RegisterFormat::InRow => "in-row",
             }
         );
         let mut options = BlockOptions::production();
@@ -586,6 +610,7 @@ impl WhirTreeConfig {
             && self.format.argue == self.argue
             && self.format.keccak_rnd == BlockFormat::pinned().keccak_rnd
             && self.format.memw_aligned == BlockFormat::pinned().memw_aligned
+            && self.format.registers == BlockFormat::pinned().registers
     }
 }
 
