@@ -467,3 +467,385 @@ fn a_grind_over_another_state_refuses_the_hosts_nonce() {
         "the nonce was ground for another state"
     );
 }
+
+// ---------------------------------------------------------------------------
+// One chain: `whir_chain::verify` over `Blake3Whir`, emitted and executed.
+// ---------------------------------------------------------------------------
+
+mod chain {
+    use multilinear::mle::Mle;
+    use multilinear::whir::Domain;
+    use multilinear::whir_chain::{
+        CapPolicy, ChainConfig, ChainFormat, ChainProof, FirstFold, GrindBits, LeafOrder,
+        RoundOpenings, WhirFolds, commit, prove, verify,
+    };
+    use multilinear::whir_hash::Blake3Whir;
+
+    use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
+
+    use super::super::builder::Ext;
+    use super::super::compiler::{LfmProgram, compile};
+    use super::super::edsl::{WrapDigest, WrapHash};
+    use super::super::executor::execute;
+    use super::super::validator::validate;
+    use super::super::whir_chain::{
+        ChainShape, RoundStorage, byte_digest_words, emit_verify_weighted, push_round_words,
+        round_words,
+    };
+    use super::super::whir_open::RootLanes;
+    use super::super::whir_poly::emit_eq_eval;
+    use super::super::whir_transcript::WhirTranscript;
+    use super::super::word::{LfmWord, ext_word};
+    use super::{HostTranscript, builder, hash_rows};
+
+    type F = GoldilocksField;
+    type E = GoldilocksExtension;
+
+    pub(super) fn pseudo_mle(num_vars: usize, seed: u64) -> Mle<F> {
+        let vals = (0..1usize << num_vars)
+            .map(|i| {
+                let mixed = (i as u64)
+                    .wrapping_mul(0x2545_F491_4F6C_DD1D)
+                    .wrapping_add(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                // Some values near the top of the field, whose big-endian bytes
+                // start 0xFF FF FF FF: a lane mix-up shows there first.
+                if i % 7 == 3 {
+                    FE::from(0xFFFF_FFFF_0000_0000u64 - (mixed >> 40))
+                } else {
+                    FE::from(mixed >> 13)
+                }
+            })
+            .collect();
+        Mle::new(vals).expect("a cube")
+    }
+
+    fn point(num_vars: usize) -> Vec<FEE> {
+        (0..num_vars)
+            .map(|i| {
+                FEE::new([
+                    FE::from(101 + i as u64),
+                    FE::from(7 * i as u64 + 3),
+                    FE::from(i as u64 + 1),
+                ])
+            })
+            .collect()
+    }
+
+    /// A small binary-tree chain config: blowup 4, folds of `log_folding`, the
+    /// binary cap `cap`, round-0 leaves in `leaves`' order, round 0 folding
+    /// `first` when given.
+    pub(super) fn config(
+        num_queries: usize,
+        grind: u8,
+        cap: CapPolicy,
+        leaves: LeafOrder,
+        first: Option<usize>,
+    ) -> ChainConfig {
+        ChainConfig {
+            log_blowup: 2,
+            log_folding: 2,
+            num_queries,
+            grind: GrindBits::uniform(grind),
+            format: ChainFormat {
+                cap,
+                leaves,
+                folds: first.map_or(WhirFolds::Uniform, |k| {
+                    WhirFolds::First(FirstFold::new(k).expect("a tested first fold"))
+                }),
+                ..ChainFormat::DEFAULT
+            },
+        }
+    }
+
+    pub(super) struct Fixture {
+        cfg: ChainConfig,
+        pub(super) proof: ChainProof<F, E>,
+        z: Vec<FEE>,
+        y: FEE,
+        root: [u8; 32],
+        domain: Domain<F>,
+        pub(super) shape: ChainShape,
+    }
+
+    /// One chain proved over `Blake3Whir`, accepted by the host.
+    pub(super) fn fixture(num_vars: usize, cfg: ChainConfig) -> Fixture {
+        let f = pseudo_mle(num_vars, 11);
+        let z = point(num_vars);
+        let y = f.evaluate_in::<E>(&z).expect("f takes its own point");
+        let (commitment, domain) =
+            commit::<F, Blake3Whir>(&f, &cfg, true).expect("the polynomial commits");
+        let mut proving = HostTranscript::new(&[]);
+        let proof = prove::<F, E, _, Blake3Whir>(&f, &z, &commitment, &domain, &cfg, &mut proving)
+            .expect("the chain proves");
+        let root = commitment.root();
+        let fx = Fixture {
+            cfg,
+            proof,
+            z,
+            y,
+            root,
+            domain,
+            shape: ChainShape::for_hash(&cfg, num_vars, WrapHash::Blake3),
+        };
+        assert!(
+            host_accepts(&fx, &fx.proof),
+            "the host accepts its own proof"
+        );
+        fx
+    }
+
+    pub(super) fn host_accepts(f: &Fixture, proof: &ChainProof<F, E>) -> bool {
+        let mut t = HostTranscript::new(&[]);
+        verify::<F, E, _, Blake3Whir>(proof, &f.root, &f.z, f.y, &f.domain, &f.cfg, &mut t).is_ok()
+    }
+
+    /// `z`, `y`, the root (two words), the final value, then the rounds.
+    pub(super) fn program(shape: &ChainShape) -> LfmProgram {
+        let mut b = builder();
+        let head = (shape.num_vars + 4) as u32;
+        let total = head
+            + (0..shape.rounds())
+                .map(|r| round_words(shape, r))
+                .sum::<u32>();
+        let arena = b.declare_arena(total);
+        let mut transcript = WhirTranscript::for_builder(&mut b);
+        let z: Vec<Ext> = (0..shape.num_vars)
+            .map(|i| b.hint_word(arena, i as u32).as_ext())
+            .collect();
+        let n = shape.num_vars as u32;
+        let y = b.hint_word(arena, n).as_ext();
+        let r0 = b.hint_word(arena, n + 1);
+        let r1 = b.hint_word(arena, n + 2);
+        let root = RootLanes::unpack(&mut b, WrapDigest::from_pair(r0, r1));
+        let final_value = b.hint_word(arena, n + 3).as_ext();
+        let storage = RoundStorage::hint(&mut b, arena, head, shape);
+        let (current, next) = storage.openings();
+        let wires = storage.wires(&current, &next);
+        let domain = Domain::<F>::new(shape.domain_log[0]).expect("the first domain");
+        emit_verify_weighted(
+            &mut b,
+            &mut transcript,
+            &wires,
+            root,
+            final_value,
+            y,
+            shape,
+            &domain,
+            |b, alphas| emit_eq_eval(b, &z, alphas),
+        );
+        let program = compile(b.finish());
+        validate(&program).expect("the BLAKE3 chain leg is admissible");
+        program
+    }
+
+    pub(super) fn arena(f: &Fixture, proof: &ChainProof<F, E>) -> Vec<LfmWord> {
+        let mut words: Vec<LfmWord> = f.z.iter().map(ext_word).collect();
+        words.push(ext_word(&f.y));
+        words.extend(byte_digest_words(&f.root));
+        words.push(ext_word(&proof.final_value));
+        push_round_words(&mut words, &f.shape, proof);
+        words
+    }
+
+    fn runs(program: &LfmProgram, words: Vec<LfmWord>) -> bool {
+        execute(program, &[words], &crate::hash_pin::BLOCK_HASHER).is_ok()
+    }
+
+    /// The shapes: odd and even depths, one to three rounds, natural and coset
+    /// round-0 leaves, uncapped, a fixed binary cap and the production's
+    /// automatic one, grind off and on, a first fold of 6.
+    pub(super) fn cases() -> Vec<(usize, ChainConfig)> {
+        let mut cases = Vec::new();
+        for leaves in [LeafOrder::Natural, LeafOrder::Coset] {
+            for cap in [CapPolicy::Off, CapPolicy::Fixed(2), CapPolicy::Auto] {
+                for (num_vars, num_queries, grind, first) in [
+                    (5usize, 3usize, 0u8, None),
+                    (6, 4, 0, None),
+                    (9, 3, 5, None),
+                    (10, 4, 6, Some(6)),
+                ] {
+                    cases.push((num_vars, config(num_queries, grind, cap, leaves, first)));
+                }
+            }
+        }
+        cases
+    }
+
+    /// ★ THE CHAIN GATE. The emitted BLAKE3 chain executes on every proof the
+    /// host accepts: every challenge feeds a refusal, so execution IS the
+    /// stream comparison. It hashes with BLAKE3 rows and nothing else.
+    #[test]
+    fn a_blake3_chain_executes_on_a_proof_the_host_accepts() {
+        for (num_vars, cfg) in cases() {
+            let f = fixture(num_vars, cfg);
+            let program = program(&f.shape);
+            let (blake3, other) = hash_rows(&program);
+            assert!(blake3 > 0);
+            assert_eq!(other, 0, "the chain hashes with BLAKE3 alone");
+            execute(
+                &program,
+                &[arena(&f, &f.proof)],
+                &crate::hash_pin::BLOCK_HASHER,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "S={num_vars} {:?} caps {:?} grind {:?} leaves {:?}: refused an \
+                         accepted proof: {e:?}",
+                    f.shape.schedule, f.shape.caps, f.shape.grind, f.shape.leaves
+                )
+            });
+        }
+    }
+
+    fn sibling_flip(proof: &mut ChainProof<F, E>, round: usize, current: bool) -> bool {
+        let path = match (&mut proof.rounds[round].openings, current) {
+            (RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p), true) => {
+                &mut p.current[1].proof.merkle_path
+            }
+            (RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p), false) => {
+                match p.next.get_mut(1) {
+                    Some(o) => &mut o.proof.merkle_path,
+                    None => return false,
+                }
+            }
+            (RoundOpenings::Extension(p), true) => &mut p.current[1].proof.merkle_path,
+            (RoundOpenings::Extension(p), false) => match p.next.get_mut(1) {
+                Some(o) => &mut o.proof.merkle_path,
+                None => return false,
+            },
+            (RoundOpenings::BaseGrouped(_), _) => unreachable!("a per-polynomial chain"),
+        };
+        match path.first_mut() {
+            Some(node) => {
+                node[31] ^= 0x80;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// ★ THE TAMPER ARM. Every forgery the host rejects has no execution: the
+    /// final value, a sumcheck evaluation, an out-of-domain value, a grind
+    /// nonce, a round-0 base value, a current and a successor Merkle sibling
+    /// (its LAST byte, so a digest compared on one word only would miss it),
+    /// a cap node, and the root itself.
+    #[test]
+    fn a_tampered_blake3_chain_cannot_execute() {
+        for leaves in [LeafOrder::Natural, LeafOrder::Coset] {
+            for cap in [CapPolicy::Off, CapPolicy::Fixed(2)] {
+                let f = fixture(10, config(4, 6, cap, leaves, Some(6)));
+                let program = program(&f.shape);
+                assert!(
+                    runs(&program, arena(&f, &f.proof)),
+                    "the untouched proof must execute, or the arm below proves nothing"
+                );
+                let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
+                let mut forged = f.proof.clone();
+                forged.final_value += FEE::one();
+                sites.push(("the final value", forged));
+                let mut forged = f.proof.clone();
+                forged.rounds[0].sumcheck[0].evaluations[1] += FEE::one();
+                sites.push(("a sumcheck evaluation", forged));
+                let mut forged = f.proof.clone();
+                if let Some(v) = forged.rounds[0].ood_value.as_mut() {
+                    *v += FEE::one();
+                }
+                sites.push(("an out-of-domain value", forged));
+                let mut forged = f.proof.clone();
+                forged.rounds[0].nonces.query ^= 1;
+                sites.push(("a grind nonce", forged));
+                let mut forged = f.proof.clone();
+                match &mut forged.rounds[0].openings {
+                    RoundOpenings::Base(p) => p.current[1].values[5] += FE::one(),
+                    _ => unreachable!("round 0 opens base blocks"),
+                }
+                sites.push(("a round-0 base value", forged));
+                let mut forged = f.proof.clone();
+                assert!(sibling_flip(&mut forged, 0, true));
+                sites.push(("a current Merkle sibling", forged));
+                let mut forged = f.proof.clone();
+                if (0..forged.rounds.len()).any(|r| sibling_flip(&mut forged, r, false)) {
+                    sites.push(("a successor Merkle sibling", forged));
+                }
+                if cap != CapPolicy::Off {
+                    let mut forged = f.proof.clone();
+                    match &mut forged.rounds[0].openings {
+                        RoundOpenings::Base(p) => {
+                            let path = &mut p.current[0].proof.merkle_path;
+                            let last = path.len() - 1;
+                            path[last][31] ^= 1;
+                        }
+                        _ => unreachable!("round 0 opens base blocks"),
+                    }
+                    sites.push(("a cap node", forged));
+                }
+                for (name, forged) in &sites {
+                    assert!(
+                        !host_accepts(&f, forged),
+                        "{name} ({cap:?}, {leaves:?}): the host must reject it"
+                    );
+                    assert!(
+                        !runs(&program, arena(&f, forged)),
+                        "{name} ({cap:?}, {leaves:?}): the machine must refuse it"
+                    );
+                }
+                // A wrong root: every opening of round 0 fails against it.
+                let mut words = arena(&f, &f.proof);
+                let n = f.shape.num_vars;
+                words[n + 2][3] += FE::one();
+                assert!(
+                    !runs(&program, words),
+                    "a root off in its second word must be refused"
+                );
+            }
+        }
+    }
+
+    /// A round-0 value hinted with a nonzero upper lane is refused before any
+    /// hash: the leaf's `BitDec` reads it as a base word, so the lift into the
+    /// fold is pinned (whir_open's obligation, under BLAKE3).
+    #[test]
+    fn a_round0_value_with_an_upper_lane_is_refused() {
+        let f = fixture(6, config(3, 0, CapPolicy::Off, LeafOrder::Natural, None));
+        let program = program(&f.shape);
+        let words = arena(&f, &f.proof);
+        // Round 0's first block value: after the head, the round's sumcheck
+        // words (two a message) and its carried nonces.
+        let r0 = f.shape.num_vars + 4;
+        let nonces = f.shape.carries(0).iter().filter(|&&c| c).count();
+        let at = r0 + 2 * f.shape.messages(0) + nonces;
+        assert_eq!(
+            words[at][1..],
+            [FE::zero(); 3],
+            "the slot is a base value's word"
+        );
+        let mut forged = words.clone();
+        forged[at][2] = FE::one();
+        let err = execute(&program, &[forged], &crate::hash_pin::BLOCK_HASHER)
+            .expect_err("a lifted lane must be refused");
+        assert!(
+            matches!(err, super::super::executor::LfmExecError::NotBaseWord(_)),
+            "refused as a non-base word, got {err:?}"
+        );
+    }
+
+    /// The coset program and the natural one refuse each other's proofs (and
+    /// so does the host): round 0's walks are wired to the order.
+    #[test]
+    fn a_coset_blake3_program_refuses_a_natural_proof() {
+        let coset = config(9, 0, CapPolicy::Off, LeafOrder::Coset, Some(6));
+        let natural = config(9, 0, CapPolicy::Off, LeafOrder::Natural, Some(6));
+        let made_coset = fixture(11, coset);
+        let made_natural = fixture(11, natural);
+        let coset_program = program(&made_coset.shape);
+        let natural_program = program(&made_natural.shape);
+        assert!(!runs(
+            &coset_program,
+            arena(&made_natural, &made_natural.proof)
+        ));
+        assert!(!runs(
+            &natural_program,
+            arena(&made_coset, &made_coset.proof)
+        ));
+    }
+}

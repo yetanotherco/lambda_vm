@@ -1276,6 +1276,40 @@ pub fn blake3_256_rev(b: &mut LfmBuilder, stream: &[Felt], len_bytes: usize) -> 
         .expect("requested")
 }
 
+/// `Blake3Std` over `prefix ‖ rest`, where the `skip` 64-byte blocks of
+/// `prefix` are already compressed into the chaining value `midstate`: the
+/// chain resumes at block `skip`, and `stream` holds the halves of `rest` alone.
+/// `len_bytes` is the WHOLE message's length, prefix included, because the flag
+/// schedule (`CHUNK_START` on block 0 only, `CHUNK_END | ROOT` and the true
+/// `block_len` on the last) is the whole message's.
+///
+/// The same function as [`blake3_256`] over the whole message, by the chain's
+/// definition: every block after the first reads only the chaining value, its
+/// own words and its own flags (`blake3_joint`'s midstate note). The midstate
+/// must be a pure function of program constants: a chaining value the prover
+/// could choose would free the chain's start.
+pub fn blake3_256_resumed(
+    b: &mut LfmBuilder,
+    midstate: &[u32; 8],
+    skip: usize,
+    stream: &[Felt],
+    len_bytes: usize,
+) -> Blake3Digest {
+    use super::blake3::chain::BLOCK_LEN;
+    assert!(
+        skip >= 1 && len_bytes > skip * BLOCK_LEN,
+        "a resumed chain skips at least one block and leaves at least one"
+    );
+    let _ = b.felt_const(FE::zero());
+    let h: [Cell; 2] = core::array::from_fn(|w| {
+        b.digest_const(core::array::from_fn(|l| {
+            FE::from(u64::from(midstate[4 * w + l]))
+        }))
+        .as_cell()
+    });
+    blake3_chain_from(b, h, skip, stream, len_bytes, false).0
+}
+
 /// [`blake3_256`] returning BOTH digests — plain and byte-reversed — off the one
 /// compression that produces them.
 pub fn blake3_256_with_rev(
@@ -1316,13 +1350,41 @@ fn blake3_absorb_all(
     want_rev: bool,
 ) -> (Blake3Digest, Option<[Cell; 2]>) {
     use super::blake3::BLAKE3_IV;
+
+    // The zero cell first, then the IV: interning emits a `Const` at first use,
+    // so this order is the program's (the chain's own lookup below is a hit).
+    let _ = b.felt_const(FE::zero());
+    // The initial chaining value: `BLAKE3_IV` as two interned constants. `h` is
+    // `u32` words 0..8, so word 0 is `IV[0..4]` and word 1 is `IV[4..8]`.
+    let iv_word = |b: &mut LfmBuilder, w: usize| -> Cell {
+        b.digest_const(core::array::from_fn(|l| {
+            FE::from(u64::from(BLAKE3_IV[4 * w + l]))
+        }))
+        .as_cell()
+    };
+    let h: [Cell; 2] = [iv_word(b, 0), iv_word(b, 1)];
+    blake3_chain_from(b, h, 0, stream, len_bytes, want_rev)
+}
+
+/// The chain of [`blake3_absorb_all`] from chaining value `h` at block
+/// `first`: blocks `first..` of a `len_bytes`-byte message whose halves from
+/// byte `64 · first` on are `stream`. At `first = 0` with `h` the IV it is the
+/// whole message's chain, row for row.
+fn blake3_chain_from(
+    b: &mut LfmBuilder,
+    mut h: [Cell; 2],
+    first: usize,
+    stream: &[Felt],
+    len_bytes: usize,
+    want_rev: bool,
+) -> (Blake3Digest, Option<[Cell; 2]>) {
     use super::blake3::chain::{BLOCK_LEN, block_flags, block_len_of, num_blocks};
     use super::keccak_host::{BYTES_PER_HALF, num_stream_halves};
 
     assert_eq!(
         stream.len(),
-        num_stream_halves(len_bytes),
-        "stream must hold exactly ceil(len_bytes / 4) halves"
+        num_stream_halves(len_bytes - first * BLOCK_LEN),
+        "stream must hold exactly ceil(len_bytes / 4) halves past the skipped blocks"
     );
 
     /// `u32` halves in one 64-byte BLAKE3 block: the message words `m[0..16]`.
@@ -1332,26 +1394,16 @@ fn blake3_absorb_all(
 
     let zero = b.felt_const(FE::zero());
     let blocks = num_blocks(len_bytes);
-
-    // The initial chaining value: `BLAKE3_IV` as two interned constants. `h` is
-    // `u32` words 0..8, so word 0 is `IV[0..4]` and word 1 is `IV[4..8]`.
-    let iv_word = |b: &mut LfmBuilder, w: usize| -> Cell {
-        b.digest_const(core::array::from_fn(|l| {
-            FE::from(u64::from(BLAKE3_IV[4 * w + l]))
-        }))
-        .as_cell()
-    };
-    let mut h: [Cell; 2] = [iv_word(b, 0), iv_word(b, 1)];
     let mut rev: Option<[Cell; 2]> = None;
 
-    for block in 0..blocks {
-        // Half `h` of this block is half `block * 16 + h` of the message; both a
-        // block (64 bytes) and a half (4 bytes) divide evenly, so the two
-        // indexings line up with no straddling. Halves past the message are the
-        // zero cell — the zero padding, with nothing to splice.
+    for block in first..blocks {
+        // Half `h` of this block is half `(block − first) * 16 + h` of the
+        // stream; both a block (64 bytes) and a half (4 bytes) divide evenly, so
+        // the two indexings line up with no straddling. Halves past the message
+        // are the zero cell — the zero padding, with nothing to splice.
         let message: [Cell; MESSAGE_WORDS] = core::array::from_fn(|w| {
             let lane = |l: usize| {
-                let g = block * HALVES_PER_BLOCK + 4 * w + l;
+                let g = (block - first) * HALVES_PER_BLOCK + 4 * w + l;
                 if g < stream.len() { stream[g] } else { zero }
             };
             b.pack_word([lane(0), lane(1), lane(2), lane(3)])
