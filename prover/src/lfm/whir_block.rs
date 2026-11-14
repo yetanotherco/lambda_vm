@@ -753,6 +753,9 @@ pub struct WhirBlockPlan {
     prepared: Vec<PlannedPrepared>,
     /// Each group's in-guest cost, in permutations.
     costs: Vec<usize>,
+    /// Each group's cost by part: its tables' argue, its opening (with the
+    /// commit-time point), its prepared stack's opening. They sum to `costs`.
+    cost_parts: Vec<[usize; 3]>,
     /// Each group's rows in every bounded chip, and the per-leaf front's
     /// ([`leaf_partition_rows`]).
     loads: Vec<ChipRows>,
@@ -1042,6 +1045,7 @@ impl WhirBlockPlan {
         // prepared ones.
         let refs = frame.airs.air_refs();
         let mut costs = Vec::with_capacity(groups.len());
+        let mut cost_parts = Vec::with_capacity(groups.len());
         for (g, list) in groups.iter().enumerate() {
             let owned = Shapes::build(&refs, &frame.shapes, list)?;
             let shapes = owned.table_shapes();
@@ -1088,6 +1092,7 @@ impl WhirBlockPlan {
                 })
                 .sum();
             costs.push(tables + opening + prepared_perms);
+            cost_parts.push([tables, opening, prepared_perms]);
         }
         drop(refs);
         let id = crate::statement::elf_digest(&statement_bytes);
@@ -1103,6 +1108,7 @@ impl WhirBlockPlan {
             groups,
             prepared,
             costs,
+            cost_parts,
             loads: Vec::new(),
             front: ChipRows::default(),
             partition,
@@ -1156,6 +1162,12 @@ impl WhirBlockPlan {
     /// Each group's in-guest cost, in socket rows.
     pub fn costs(&self) -> &[usize] {
         &self.costs
+    }
+
+    /// Each group's cost by part, `[argue, opening, prepared opening]`, in the
+    /// same unit as [`Self::costs`], which they sum to.
+    pub fn cost_parts(&self) -> &[[usize; 3]] {
+        &self.cost_parts
     }
 
     /// Each group's rows in every bounded chip, and the per-leaf front's —
