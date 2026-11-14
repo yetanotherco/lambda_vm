@@ -325,15 +325,17 @@ impl ChainShape {
             && (r..self.rounds()).all(|t| self.tail_shaped(t))
     }
 
-    /// Round `r`'s current tree on its own: one tree, at arity 4, capped, its
-    /// every leaf a cap node, and [`TAIL_QUERIES_A_LEAF`] queries a leaf.
+    /// Round `r`'s current tree on its own: one tree, at arity 4 (Poseidon1)
+    /// or binary under BLAKE3 (two-word digests), capped, its every leaf a cap
+    /// node, and [`TAIL_QUERIES_A_LEAF`] queries a leaf. The binary felt
+    /// hashes keep their per-query checks: their programs are unchanged.
     fn tail_shaped(&self, r: usize) -> bool {
         let depth = self.current_depth(r);
         let c = self.caps[r];
-        self.arity == 4
+        (self.arity == 4 || self.digest_words == 2)
             && self.trees_at(r) == 1
             && c > 0
-            && super::merkle_cap::mux_bits(depth, c, 4) == depth
+            && super::merkle_cap::mux_bits(depth, c, self.arity) == depth
             && TAIL_QUERIES_A_LEAF << depth <= self.num_queries
     }
 
@@ -2318,9 +2320,21 @@ fn push_tail_blocks(
     r: usize,
 ) -> Result<(), String> {
     use crypto::merkle_tree::traits::IsMerkleTreeBackend;
-    type Leaf = <crate::hash_pin::BlockWhirHash as multilinear::whir_hash::WhirHash>::Backend<
+    type P1Leaf = <crate::hash_pin::BlockWhirHash as multilinear::whir_hash::WhirHash>::Backend<
         GoldilocksExtension,
     >;
+    type B3Leaf = <multilinear::whir_hash::Blake3Whir as multilinear::whir_hash::WhirHash>::Backend<
+        GoldilocksExtension,
+    >;
+    // The tree's leaf hash: Poseidon1's at arity 4, BLAKE3's under two-word
+    // digests (the only binary tail, [`ChainShape::tail_round`]).
+    let leaf_hash = |values: &Vec<math::field::element::FieldElement<GoldilocksExtension>>| {
+        if shape.digest_words == 2 {
+            B3Leaf::hash_data(values)
+        } else {
+            P1Leaf::hash_data(values)
+        }
+    };
     let before = &proof.rounds[r - 1];
     let cap = tail_cap(shape, before, r)?;
     let current: &[multilinear::whir_commit::CosetOpening<GoldilocksExtension>] =
@@ -2342,7 +2356,7 @@ fn push_tail_blocks(
                 opening.values.len()
             ));
         }
-        let digest = Leaf::hash_data(&opening.values);
+        let digest = leaf_hash(&opening.values);
         for (slot, node) in placed.iter_mut().zip(&cap) {
             if slot.is_none() && *node == digest {
                 *slot = Some(&opening.values);

@@ -663,6 +663,16 @@ mod chain {
         pub(super) shape: ChainShape,
     }
 
+    impl Fixture {
+        /// This fixture's shape under the per-query check.
+        fn shape_v1(&self) -> ChainShape {
+            ChainShape {
+                query: super::super::whir_chain::LeafQuery::V1,
+                ..self.shape.clone()
+            }
+        }
+    }
+
     /// One chain proved over `Blake3Whir`, accepted by the host.
     pub(super) fn fixture(num_vars: usize, cfg: ChainConfig) -> Fixture {
         let f = pseudo_mle(num_vars, 11);
@@ -922,6 +932,72 @@ mod chain {
                     );
                 }
             }
+        });
+    }
+
+    /// ★ Under the lean query check a BLAKE3 chain's tail rounds — a tree
+    /// wholly in its binary cap with [`TAIL_QUERIES_A_LEAF`] queries a leaf —
+    /// are checked once a leaf, as Poseidon1's 4-ary tail is: the honest proof
+    /// executes, the compressions are the closed form's (fewer than the
+    /// per-query check's), a tail block's value off has no execution, and the
+    /// tail's compare reading the neighbouring slot refuses the honest proof.
+    ///
+    /// [`TAIL_QUERIES_A_LEAF`]: super::super::whir_chain::TAIL_QUERIES_A_LEAF
+    #[test]
+    fn a_lean_blake3_chain_checks_its_tail_once_a_leaf() {
+        use super::super::whir_chain::{LeafQuery, chain_perms, tail_faults};
+        use super::super::whir_transcript::SpongeEntry;
+        super::under_both(|_lowering| {
+            // Folds of one after the first, so three small trees lie wholly in
+            // their caps at 400 queries: three tail rounds, two of them with a
+            // tail successor.
+            let mut cfg = config(400, 0, CapPolicy::Fixed(4), LeafOrder::Coset, Some(6));
+            cfg.log_folding = 1;
+            let f = fixture(9, cfg);
+            let lean = ChainShape {
+                query: LeafQuery::Lean,
+                ..f.shape.clone()
+            };
+            let tails: Vec<usize> = (0..lean.rounds()).filter(|&r| lean.tail_round(r)).collect();
+            assert!(
+                tails.len() >= 2,
+                "a tail round at {:?} caps {:?}",
+                lean.schedule,
+                lean.caps
+            );
+            let lean_fx = Fixture {
+                shape: lean.clone(),
+                ..f
+            };
+            let leg = program(&lean);
+            let words = arena(&lean_fx, &lean_fx.proof);
+            assert!(runs(&leg, words.clone()), "the honest proof executes");
+            let (emitted, other) = hash_rows(&leg);
+            assert_eq!(other, 0);
+            let predicted = chain_perms(&lean, SpongeEntry::fresh_for(WrapHash::Blake3));
+            assert_eq!(emitted, predicted, "the closed form, tail and all");
+            let v1 = program(&lean_fx.shape_v1());
+            assert!(
+                hash_rows(&v1).0 > emitted,
+                "the tail saves compressions: {} against {emitted}",
+                hash_rows(&v1).0
+            );
+            // A tail block's value: the arena's last words are the last tail
+            // round's blocks, so the last word is one of its values.
+            let mut forged = words.clone();
+            let last = forged.len() - 1;
+            forged[last][0] += FE::one();
+            assert!(!runs(&leg, forged), "a tail value off");
+            let slot_off = tail_faults::with_slot_off(|| program(&lean));
+            assert!(
+                !runs(&slot_off, words),
+                "the tail's compare reads the slot its position names"
+            );
+            println!(
+                "BLAKE3 TAIL: rounds {tails:?} of {:?} · {emitted} compressions (per query {})",
+                lean.schedule,
+                hash_rows(&v1).0
+            );
         });
     }
 
