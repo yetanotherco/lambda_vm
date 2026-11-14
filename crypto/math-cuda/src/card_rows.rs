@@ -2,9 +2,7 @@
 //! `LAMBDA_VM_CARD_ROWS` (read once). Unset is `words`, the default (below);
 //! `order` is the next item; `0` or `off` is the upload as it was before
 //! (`DeviceColumns::upload_tables_today`), byte for byte and call for call.
-//! The knob takes no other word. `derive` and `registers` are modes a test
-//! sets ([`set_mode_override`]), no longer settings. Every mode writes the
-//! same words.
+//! The knob takes no other word. Every mode writes the same words.
 //!
 //! - `order`: every copy of the group first, then every kernel, then the one
 //!   sync and the one check readback the upload already makes. Today each
@@ -12,35 +10,25 @@
 //!   be filled; beside a running commit each such wait costs up to what the
 //!   commit has queued ahead (a probe beside a looping commit measured the
 //!   table-by-table upload at about two commit periods, this order at 1.3).
-//! - `derive` (a test's mode; `words` does it too): `order`, and the card keeps the CPU chunks' logs it receives
-//!   (an LRU cache of whole CPU tables, `LAMBDA_VM_CARD_ROWS_CACHE_MIB`,
-//!   default 768, each entry promised to the backend's ledger), fills a CPU
-//!   table it already holds without copying its logs again, and derives a
-//!   LOAD or STORE table from the cached logs (`derive_rows_from_cache`,
-//!   `kernels/card_rows.cu`) instead of copying its records: the table's rows'
-//!   cycles go up instead (4 bytes a row against 32), read from the records'
-//!   timestamps. One launch for a group's LOAD tables and one for its STORE
-//!   tables. A table whose cycles the cache does not hold, after this group's
-//!   CPU tables are in it, goes up as records, as today.
-//! - `registers` (a test's mode): `derive`, and MEMW_R's register rows built on the
-//!   card from the same cached logs (`derive_registers_from_cache`). Each row
-//!   crosses as one word, its timestamp and its old timestamp (8 bytes against
-//!   32), read from the rows the host holds ([`plan_registers`]). The card
-//!   reads the register, the value, read or write and, for a write, the value
-//!   before it from the logs. The rows it cannot read from them cross whole:
-//!   an ECALL cycle's (its handler's rows; the ECALL cycles come from the
-//!   run's history, so a run without it sends MEMW_R as records), a write
-//!   whose register was last touched by an ECALL or before its CPU table, and
-//!   a row whose cycle's logs the card does not hold. A table more than half
-//!   of whose rows would cross whole goes up as records.
-//! - `words` (the default): `derive`, and MEMW_R built on the card from the
-//!   8-byte words the walk writes in place of the 32-byte rows
-//!   (`prover`'s `register_words`), with no host pass at the upload; the
-//!   rows of cycles the card will not hold are decoded on the host and sent
-//!   whole. A build that cannot write words (no record mode, no CPU logs
-//!   kept) sends MEMW_R as rows, and LOAD and STORE are still derived.
-//!   Measured on whole blocks against `order`: −0.42 s on a median one,
-//!   −1.66 s on a large one (the trace built −0.28 / −0.62 s).
+//! - `words` (the default): `order`, and the card keeps the CPU chunks' logs
+//!   it receives (an LRU cache of whole CPU tables,
+//!   `LAMBDA_VM_CARD_ROWS_CACHE_MIB`, default 768, each entry promised to the
+//!   backend's ledger), fills a CPU table it already holds without copying
+//!   its logs again, and derives a LOAD or STORE table from the cached logs
+//!   (`derive_rows_from_cache`, `kernels/card_rows.cu`) instead of copying
+//!   its records: the table's rows' cycles go up instead (4 bytes a row
+//!   against 32), read from the records' timestamps. One launch for a
+//!   group's LOAD tables and one for its STORE tables. A table whose cycles
+//!   the cache does not hold, after this group's CPU tables are in it, goes
+//!   up as records, as today. And MEMW_R is built on the card from the same
+//!   cached logs (`derive_registers_from_cache`) and the 8-byte words the
+//!   walk writes in place of the 32-byte rows (`prover`'s `register_words`),
+//!   with no host pass at the upload; the rows of cycles the card will not
+//!   hold are decoded on the host and sent whole. A build that cannot write
+//!   words (no record mode, no CPU logs kept) sends MEMW_R as rows, and LOAD
+//!   and STORE are still derived. Measured on whole blocks against `order`:
+//!   −0.42 s on a median one, −1.66 s on a large one (the trace built −0.28 /
+//!   −0.62 s).
 //!
 //! Nothing the verifier reads moves: the same tables, the same words. A row
 //! whose cycle is not held, or whose log is not that family's op, is counted
@@ -48,7 +36,7 @@
 //! host's columns, as for a CPU log with no DECODE row). The cache is
 //! emptied at a block's start and end ([`begin`], [`end`]) and only ever
 //! holds a table's logs while every upload that read them has synchronized:
-//! `derive`'s uploads take the cache's lock for their whole length (`order`'s
+//! `words`' uploads take the cache's lock for their whole length (`order`'s
 //! take none).
 
 use std::collections::BTreeMap;
@@ -83,15 +71,9 @@ pub enum Mode {
     Off,
     /// Every copy, then every kernel.
     Order,
-    /// [`Mode::Order`], CPU logs kept on the card, LOAD and STORE derived. A
-    /// test's mode ([`set_mode_override`]); no word of the knob sets it.
-    Derive,
-    /// [`Mode::Derive`], and MEMW_R's register rows built on the card from a
-    /// host plan ([`plan_registers`]). A test's mode; no word of the knob sets
-    /// it.
-    Registers,
-    /// [`Mode::Derive`], and MEMW_R's register rows built on the card from
-    /// the words the walk writes in their place (no host plan): the default.
+    /// [`Mode::Order`], CPU logs kept on the card, LOAD and STORE derived,
+    /// and MEMW_R's register rows built on the card from the words the walk
+    /// writes in their place: the default.
     Words,
 }
 
@@ -116,23 +98,14 @@ impl Mode {
         match self {
             Self::Off => "off",
             Self::Order => "order",
-            Self::Derive => "derive",
-            Self::Registers => "registers",
             Self::Words => "words",
         }
     }
 
     /// Whether the card keeps CPU logs and derives tables from them.
     pub fn derives(self) -> bool {
-        matches!(self, Self::Derive | Self::Registers | Self::Words)
+        matches!(self, Self::Words)
     }
-}
-
-/// Whether the uploads build MEMW_R's register rows on the card
-/// ([`Mode::Registers`]): a build then hands its MEMW_R chunks out with their
-/// ECALL cycles, when its run has a history.
-pub fn builds_registers() -> bool {
-    mode() == Mode::Registers
 }
 
 /// Whether the walk writes MEMW_R's register rows as words for the card to
@@ -167,9 +140,7 @@ pub fn mode() -> Mode {
     match OVERRIDE.load(Ordering::Relaxed) {
         1 => return Mode::Off,
         2 => return Mode::Order,
-        3 => return Mode::Derive,
-        4 => return Mode::Registers,
-        5 => return Mode::Words,
+        3 => return Mode::Words,
         _ => {}
     }
     from_env().clone().unwrap_or(Mode::Off)
@@ -182,9 +153,7 @@ pub fn set_mode_override(mode: Option<Mode>) {
         None => 0,
         Some(Mode::Off) => 1,
         Some(Mode::Order) => 2,
-        Some(Mode::Derive) => 3,
-        Some(Mode::Registers) => 4,
-        Some(Mode::Words) => 5,
+        Some(Mode::Words) => 3,
     };
     OVERRIDE.store(v, Ordering::Relaxed);
 }
@@ -200,8 +169,8 @@ pub static FAULT_CYCLE_SHIFT: std::sync::atomic::AtomicU32 = std::sync::atomic::
 #[doc(hidden)]
 pub static FAULT_FAMILIES: AtomicU8 = AtomicU8::new(0);
 
-/// A card test's mutants of the card-built register rows, one bit each (0:
-/// none). The test must see other words, or the group declined.
+/// A card test's mutants of the card-built register rows' kernel, one bit
+/// each (0: none). The test must see other words, or the group declined.
 #[doc(hidden)]
 pub static FAULT_REGISTERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// The kernel reads `rs2`'s row as `rs1`'s: its register and its value.
@@ -211,15 +180,7 @@ pub const REGISTER_FAULT_SLOT: u32 = 1;
 /// its old timestamp names, whatever the slot.
 #[doc(hidden)]
 pub const REGISTER_FAULT_VALUE_AT: u32 = 2;
-/// The host sends a write whose register was last touched before its CPU
-/// table as its timestamps (the card holds no value for it).
-#[doc(hidden)]
-pub const REGISTER_FAULT_START: u32 = 4;
-/// The host sends an ECALL cycle's rows, and the writes whose register an
-/// ECALL touched last, as their timestamps.
-#[doc(hidden)]
-pub const REGISTER_FAULT_ECALL: u32 = 8;
-/// The kernel's faults (the rest are the host's).
+/// The kernel's faults (no other bit is read).
 const KERNEL_FAULTS: u32 = REGISTER_FAULT_SLOT | REGISTER_FAULT_VALUE_AT;
 
 fn budget_bytes() -> u64 {
@@ -254,11 +215,7 @@ struct Counters {
     records_bytes_spared: AtomicU64,
     log_bytes_spared: AtomicU64,
     derived_memw_r: AtomicU64,
-    records_memw_r: AtomicU64,
     register_words: AtomicU64,
-    whole_ecall: AtomicU64,
-    whole_after_ecall: AtomicU64,
-    whole_before_table: AtomicU64,
     whole_not_held: AtomicU64,
     whole_other: AtomicU64,
     register_word_bytes: AtomicU64,
@@ -298,11 +255,9 @@ pub struct Stats {
     pub list_bytes: u64,
     pub records_bytes_spared: u64,
     pub log_bytes_spared: u64,
-    /// MEMW_R tables built on the card; sent as records though they had
-    /// the run's ECALL cycles.
+    /// MEMW_R tables built on the card.
     pub derived_memw_r: u64,
-    pub records_memw_r: u64,
-    /// Register rows sent as their timestamps; sent whole, by why
+    /// Register rows sent as their words; sent whole, by why
     /// ([`WholeRows`]).
     pub register_words: u64,
     pub whole: WholeRows,
@@ -311,8 +266,9 @@ pub struct Stats {
     pub register_word_bytes: u64,
     pub register_whole_bytes: u64,
     pub register_records_spared: u64,
-    /// Seconds the host spent planning the register rows, summed over the
-    /// tables; and the uploads' own wait for those plans, summed.
+    /// Seconds the host spent planning MEMW_R's tables ([`plan_words`]),
+    /// summed over the tables; and the uploads' own wait for those plans,
+    /// summed.
     pub plan_secs: f64,
     pub plan_wall_secs: f64,
 }
@@ -336,12 +292,8 @@ pub fn stats() -> Stats {
         records_bytes_spared: l(&c.records_bytes_spared),
         log_bytes_spared: l(&c.log_bytes_spared),
         derived_memw_r: l(&c.derived_memw_r),
-        records_memw_r: l(&c.records_memw_r),
         register_words: l(&c.register_words),
         whole: WholeRows {
-            ecall: l(&c.whole_ecall),
-            after_ecall: l(&c.whole_after_ecall),
-            before_table: l(&c.whole_before_table),
             not_held: l(&c.whole_not_held),
             other: l(&c.whole_other),
         },
@@ -443,11 +395,7 @@ pub fn clear() {
         &c.records_bytes_spared,
         &c.log_bytes_spared,
         &c.derived_memw_r,
-        &c.records_memw_r,
         &c.register_words,
-        &c.whole_ecall,
-        &c.whole_after_ecall,
-        &c.whole_before_table,
         &c.whole_not_held,
         &c.whole_other,
         &c.register_word_bytes,
@@ -461,22 +409,18 @@ pub fn clear() {
 }
 
 /// The block's report line (`BLOCK CARD ROWS: …`), from the counters and the
-/// cache as they stand. Under [`Mode::Registers`] it ends with MEMW_R's part
+/// cache as they stand. Under [`Mode::Words`] it ends with MEMW_R's part
 /// (` · MEMW_R derived …`).
 pub fn report_line() -> String {
     let s = stats();
     let (entries, bytes) = held();
-    let registers = if matches!(mode(), Mode::Registers | Mode::Words) {
+    let registers = if mode() == Mode::Words {
         let w = s.whole;
         format!(
-            " · MEMW_R derived {} of {} · register rows as words {} · whole {} (ECALL {}, after one {}, before their table {}, not held {}, other {}) · MEMW_R records not sent {} B · words {} B · whole rows {} B · planned in {:.3} s summed, {:.3} s waited",
+            " · MEMW_R derived {} · register rows as words {} · whole {} (not held {}, other {}) · MEMW_R records not sent {} B · words {} B · whole rows {} B · planned in {:.3} s summed, {:.3} s waited",
             s.derived_memw_r,
-            s.derived_memw_r + s.records_memw_r,
             s.register_words,
             w.total(),
-            w.ecall,
-            w.after_ecall,
-            w.before_table,
             w.not_held,
             w.other,
             s.register_records_spared,
@@ -582,348 +526,22 @@ pub fn covers(held: &BTreeMap<u64, u64>, lo: u64, hi: u64) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// The register rows' plan: which rows cross as their timestamps, which whole.
+// The register rows: which cross as their words, which whole.
 // ---------------------------------------------------------------------------
 
-/// Cycles before a MEMW_R chunk's first row's cycle whose ECALLs its rows may
-/// name: a row's old timestamp is at most 2^16 before its own (MEMW_R's step,
-/// `0 < ts − old ≤ 2^16`), so at most 2^14 cycles and a slot before it.
-pub const ECALL_SPAN_BEFORE: u64 = (1 << 14) + 1;
-
-/// Why register rows cross whole instead of as their timestamps.
+/// Why register rows cross whole instead of as their words.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WholeRows {
-    /// An ECALL cycle's rows (its handler's; no log holds them).
-    pub ecall: u64,
-    /// A write whose register an ECALL touched last (the value it left is in
-    /// no log).
-    pub after_ecall: u64,
-    /// A write whose register was last touched before its cycle's CPU table
-    /// (the card holds no value for it).
-    pub before_table: u64,
-    /// A row whose cycle's logs the card does not hold.
+    /// A row whose cycle's logs the card does not hold (decoded on the host).
     pub not_held: u64,
-    /// A timestamp the rule does not read (no walk makes one).
+    /// A row the walk wrote whole (its marker's).
     pub other: u64,
 }
 
 impl WholeRows {
     pub fn total(&self) -> u64 {
-        self.ecall + self.after_ecall + self.before_table + self.not_held + self.other
+        self.not_held + self.other
     }
-
-    fn add(&mut self, other: &Self) {
-        self.ecall += other.ecall;
-        self.after_ecall += other.after_ecall;
-        self.before_table += other.before_table;
-        self.not_held += other.not_held;
-        self.other += other.other;
-    }
-
-    fn count(&mut self, why: Whole) {
-        match why {
-            Whole::Ecall => self.ecall += 1,
-            Whole::AfterEcall => self.after_ecall += 1,
-            Whole::BeforeTable => self.before_table += 1,
-            Whole::NotHeld => self.not_held += 1,
-            Whole::Other => self.other += 1,
-        }
-    }
-}
-
-/// Why one row crosses whole ([`WholeRows`]' fields).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Whole {
-    Ecall,
-    AfterEcall,
-    BeforeTable,
-    NotHeld,
-    Other,
-}
-
-/// A MEMW_R table as it crosses when the card builds its rows
-/// ([`plan_registers`]): a word a row, and the rows that cross whole.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RegisterPlan {
-    /// Row `r`'s word: `timestamp | old_timestamp << 32` for a row the card
-    /// builds from the logs; `k << 32` (its low word 0, which no timestamp
-    /// is) for the `k`-th row of `whole`.
-    pub words: Vec<u64>,
-    pub whole: Vec<RegRowC>,
-    pub why: WholeRows,
-    /// The first and the last row's cycles.
-    pub span: (u64, u64),
-}
-
-/// A word's low half for a row that crosses whole.
-pub const WHOLE_ROW: u32 = 0;
-
-/// Rows a part of a table's plan: the parts are planned on
-/// [`PLAN_THREADS`] threads of their own.
-const PLAN_PART: usize = 1 << 18;
-/// The planning pool's threads. They take no lock of this module, so an
-/// upload holding the cache's lock may wait on them.
-const PLAN_THREADS: usize = 4;
-
-/// The ECALL cycles of `[base, hi]`, a bit each.
-struct EcallBits {
-    base: u64,
-    len: u64,
-    words: Vec<u64>,
-}
-
-impl EcallBits {
-    /// From `ecalls`, ascending; those outside `[base, hi]` are left out.
-    fn new(base: u64, hi: u64, ecalls: &[u32]) -> Self {
-        let len = hi - base + 1;
-        let mut words = vec![0u64; len.div_ceil(64) as usize];
-        let from = ecalls.partition_point(|&e| u64::from(e) < base);
-        for &e in &ecalls[from..] {
-            let at = u64::from(e) - base;
-            if at >= len {
-                break;
-            }
-            words[(at / 64) as usize] |= 1 << (at % 64);
-        }
-        Self { base, len, words }
-    }
-
-    /// Whether `cycle` is an ECALL's; `None` outside the bits' cycles.
-    fn get(&self, cycle: u64) -> Option<bool> {
-        let at = cycle.checked_sub(self.base).filter(|&at| at < self.len)?;
-        Some(self.words[(at / 64) as usize] >> (at % 64) & 1 == 1)
-    }
-}
-
-/// What a table's plan reads besides its rows.
-struct Rule<'a> {
-    held: &'a [(u64, u64)],
-    bits: EcallBits,
-    lo: u64,
-    hi: u64,
-    faults: u32,
-}
-
-impl Rule<'_> {
-    /// The first cycle of the held range holding `cycle`, from the range
-    /// last found (`at`) when it still holds it.
-    fn table_of(&self, cycle: u64, at: &mut usize) -> Option<u64> {
-        if let Some(&(first, n)) = self.held.get(*at)
-            && first <= cycle
-            && cycle < first + n
-        {
-            return Some(first);
-        }
-        let k = self.held.partition_point(|&(first, _)| first <= cycle);
-        let (first, n) = *self.held.get(k.checked_sub(1)?)?;
-        (cycle < first + n).then(|| {
-            *at = k - 1;
-            first
-        })
-    }
-
-    /// Row `row`'s word, or why it crosses whole.
-    fn word(&self, row: &RegRowC, at: &mut usize) -> Result<u64, Whole> {
-        let (ts, old) = (row.timestamp, u64::from(row.old_ts_lo));
-        // MEMW_R's step, and a timestamp the word holds.
-        if ts < 4 || ts > u64::from(u32::MAX) || old >= ts || ts - old > 1 << 16 {
-            return Err(Whole::Other);
-        }
-        let (cycle, slot) = ((ts - 4) / 4, (ts - 4) % 4);
-        if slot == 3 || cycle < self.lo || cycle > self.hi {
-            return Err(Whole::Other);
-        }
-        // Outside the bits (never, for a row in MEMW_R's step) reads as an
-        // ECALL: the row crosses whole.
-        let ecalls = self.faults & REGISTER_FAULT_ECALL == 0;
-        if ecalls && self.bits.get(cycle) != Some(false) {
-            return Err(Whole::Ecall);
-        }
-        let first = self.table_of(cycle, at).ok_or(Whole::NotHeld)?;
-        let write = row.is_read == 0;
-        if write != (slot == 2) {
-            return Err(Whole::Other);
-        }
-        if write {
-            if old < 4 * first + 4 {
-                if self.faults & REGISTER_FAULT_START == 0 {
-                    return Err(Whole::BeforeTable);
-                }
-            } else {
-                if (old - 4) % 4 == 3 {
-                    return Err(Whole::Other);
-                }
-                if ecalls && self.bits.get((old - 4) / 4) != Some(false) {
-                    return Err(Whole::AfterEcall);
-                }
-            }
-        }
-        Ok(ts | old << 32)
-    }
-
-    /// The words of `rows` into `out` (one a row; [`WHOLE_ROW`] for a row
-    /// that crosses whole), and the rows that cross whole with their places
-    /// in `rows`.
-    fn plan(
-        &self,
-        rows: &[RegRowC],
-        out: &mut [std::mem::MaybeUninit<u64>],
-    ) -> (Vec<(usize, RegRowC)>, WholeRows) {
-        let (mut whole, mut why, mut at) = (Vec::new(), WholeRows::default(), 0usize);
-        for (i, (row, word)) in rows.iter().zip(out.iter_mut()).enumerate() {
-            match self.word(row, &mut at) {
-                Ok(w) => {
-                    word.write(w);
-                }
-                Err(reason) => {
-                    word.write(u64::from(WHOLE_ROW));
-                    why.count(reason);
-                    whole.push((i, *row));
-                }
-            }
-        }
-        (whole, why)
-    }
-}
-
-fn plan_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(PLAN_THREADS)
-            .thread_name(|i| format!("card-rows-plan-{i}"))
-            .build()
-            .ok()
-    })
-    .as_ref()
-}
-
-/// A MEMW_R table's plan when the card builds its rows from the CPU logs of
-/// the cycles `held` names (first cycle, count; ascending, disjoint, each a
-/// CPU table), `ecalls` the ECALL cycles (ascending) from
-/// [`ECALL_SPAN_BEFORE`] cycles before its first row's to its last row's,
-/// and `faults` a test's host mutants ([`REGISTER_FAULT_START`],
-/// [`REGISTER_FAULT_ECALL`]; 0 in a prove).
-///
-/// A row crosses as its timestamp and old timestamp when the card can read
-/// the rest from the logs: its cycle's logs are held, the cycle is no ECALL,
-/// and for a write, the access its old timestamp names lies in the same CPU
-/// table and in no ECALL cycle (the value then is in that cycle's log, by
-/// its slot). Any other row crosses whole ([`WholeRows`] says why). `None`
-/// (the table goes up as records) when fewer than half of the span's cycles
-/// are held, or more than half of the rows would cross whole.
-pub fn plan_registers(
-    pieces: &[&[RegRowC]],
-    held: &[(u64, u64)],
-    ecalls: &[u32],
-    faults: u32,
-) -> Option<RegisterPlan> {
-    plan_registers_many(&[(pieces, ecalls)], held, faults)
-        .0
-        .pop()
-        .flatten()
-}
-
-/// A MEMW_R table as [`plan_registers_many`] takes it: its rows' pieces in
-/// order, and its ECALL cycles.
-pub type RegisterTable<'a> = (&'a [&'a [RegRowC]], &'a [u32]);
-
-/// [`plan_registers`] of each table, their parts planned on the planning
-/// pool's threads together; and the seconds those threads spent, summed.
-pub fn plan_registers_many(
-    tables: &[RegisterTable<'_>],
-    held: &[(u64, u64)],
-    faults: u32,
-) -> (Vec<Option<RegisterPlan>>, f64) {
-    use rayon::prelude::*;
-    use std::mem::MaybeUninit;
-    // Each table's rule, when at least half of its span is held.
-    let rules: Vec<Option<(Rule<'_>, usize)>> = tables
-        .iter()
-        .map(|&(pieces, ecalls)| {
-            let n: usize = pieces.iter().map(|p| p.len()).sum();
-            let first = pieces.iter().find_map(|p| p.first())?;
-            let last = pieces.iter().rev().find_map(|p| p.last())?;
-            let cycle = |ts: u64| ts.checked_sub(4).map(|t| t / 4);
-            let (lo, hi) = (cycle(first.timestamp)?, cycle(last.timestamp)?);
-            if lo > hi {
-                return None;
-            }
-            let covered: u64 = held
-                .iter()
-                .map(|&(f, len)| (f + len).min(hi + 1).saturating_sub(f.max(lo)))
-                .sum();
-            if covered * 2 < hi - lo + 1 {
-                return None;
-            }
-            let bits = EcallBits::new(lo.saturating_sub(ECALL_SPAN_BEFORE), hi, ecalls);
-            Some((
-                Rule {
-                    held,
-                    bits,
-                    lo,
-                    hi,
-                    faults,
-                },
-                n,
-            ))
-        })
-        .collect();
-    let mut words: Vec<Vec<u64>> = rules
-        .iter()
-        .map(|r| Vec::with_capacity(r.as_ref().map_or(0, |r| r.1)))
-        .collect();
-    // The parts: (table, first row, rows, their words).
-    type Job<'r, 'w> = (usize, usize, &'r [RegRowC], &'w mut [MaybeUninit<u64>]);
-    let mut jobs: Vec<Job<'_, '_>> = Vec::new();
-    for (t, (rule, out)) in rules.iter().zip(words.iter_mut()).enumerate() {
-        let Some((_, n)) = rule else { continue };
-        let mut rest = &mut out.spare_capacity_mut()[..*n];
-        let mut at = 0usize;
-        for piece in tables[t].0 {
-            for part in piece.chunks(PLAN_PART) {
-                let (mine, others) = std::mem::take(&mut rest).split_at_mut(part.len());
-                jobs.push((t, at, part, mine));
-                rest = others;
-                at += part.len();
-            }
-        }
-    }
-    let run = |(t, at, rows, out): Job<'_, '_>| {
-        let clock = std::time::Instant::now();
-        let rule = &rules[t].as_ref().expect("a planned table").0;
-        let (whole, why) = rule.plan(rows, out);
-        (t, at, whole, why, clock.elapsed().as_nanos() as u64)
-    };
-    let done: Vec<_> = match plan_pool() {
-        Some(pool) => pool.install(|| jobs.into_par_iter().map(run).collect()),
-        None => jobs.into_iter().map(run).collect(),
-    };
-    let mut plans: Vec<Option<RegisterPlan>> = Vec::with_capacity(tables.len());
-    for (t, (rule, mut w)) in rules.iter().zip(words).enumerate() {
-        let Some((rule, n)) = rule else {
-            plans.push(None);
-            continue;
-        };
-        // SAFETY: the table's parts cover its `n` words, one after another
-        // (`rest` above), and `Rule::plan` wrote each word of its part.
-        unsafe { w.set_len(*n) };
-        let mut plan = RegisterPlan {
-            words: w,
-            span: (rule.lo, rule.hi),
-            ..RegisterPlan::default()
-        };
-        for (_, at, whole, why, _) in done.iter().filter(|d| d.0 == t) {
-            plan.why.add(why);
-            for &(i, row) in whole {
-                plan.words[at + i] = (plan.whole.len() as u64) << 32;
-                plan.whole.push(row);
-            }
-        }
-        plans.push((plan.whole.len() * 2 <= *n).then_some(plan));
-    }
-    let secs = done.iter().map(|d| d.4).sum::<u64>() as f64 * 1e-9;
-    (plans, secs)
 }
 
 // ---------------------------------------------------------------------------
@@ -951,7 +569,7 @@ struct RowsTableC {
 }
 
 /// `card_rows.cu`'s `RegistersTableC`: a MEMW_R table built on the card,
-/// its words and whole rows ([`RegisterPlan`]).
+/// its words and whole rows ([`WordsPlan`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct RegistersTableC {
@@ -962,7 +580,7 @@ struct RegistersTableC {
     out: u64,
     before: u64,
     /// The run index of `whole`'s first row (a marker's high half less this
-    /// indexes `whole`; 0 for a planned table).
+    /// indexes `whole`).
     whole_base: u64,
 }
 
@@ -1017,8 +635,6 @@ enum Plan {
         store: bool,
         cycles: Vec<u32>,
     },
-    /// A MEMW_R table built from the cached logs.
-    Registers(RegisterPlan),
     /// A MEMW_R table built from the walk's words and the cached logs.
     Words(WordsPlan),
 }
@@ -1146,18 +762,18 @@ fn plan_words(
 }
 
 /// Whether a group's plans build any table on the card from the logs it
-/// holds (LOAD or STORE derived, MEMW_R built from a plan or from words):
+/// holds (LOAD or STORE derived, MEMW_R built from words):
 /// then its cached logs go up as descriptors and the derive kernels launch.
 /// A table planned so and never launched would keep whatever its store held.
 fn launches_from_logs(plans: &[Plan]) -> bool {
     plans.iter().any(|p| match p {
-        Plan::Derived { .. } | Plan::Registers(_) | Plan::Words(_) => true,
+        Plan::Derived { .. } | Plan::Words(_) => true,
         Plan::Wide | Plan::Narrow | Plan::Records | Plan::CpuHit(_) => false,
     })
 }
 
-/// A group's upload under [`Mode::Order`], [`Mode::Derive`] or
-/// [`Mode::Registers`] ([`DeviceColumns::upload_tables`] calls it). `None` as
+/// A group's upload under [`Mode::Order`] or [`Mode::Words`]
+/// ([`DeviceColumns::upload_tables`] calls it). `None` as
 /// today's: the card declines and every reader takes the host's columns.
 pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns> {
     let mode = mode();
@@ -1169,7 +785,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
     {
         return None;
     }
-    // Only `derive` and `registers` read and write the cache: `order` takes
+    // Only `words` reads and writes the cache: `order` takes
     // no lock, so its uploads overlap as today's do.
     let mut local = Cache::default();
     let mut guard = mode.derives().then(lock);
@@ -1180,7 +796,6 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
     cache.tick += 1;
     let tick = cache.tick;
     let derive = mode.derives();
-    let registers = mode == Mode::Registers;
 
     // ---- the plan: what each table sends ----
     let mut plans: Vec<Plan> = Vec::with_capacity(tables.len());
@@ -1283,44 +898,6 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
             }
             *plan = Plan::Derived { store, cycles };
         }
-        // MEMW_R's tables that came with their ECALL cycles, planned together
-        // on the planning pool: each row as its timestamps where the logs the
-        // card will hold give the rest, else whole ([`plan_registers`]).
-        let wanted: Vec<(usize, RegisterTable<'_>)> = if registers && all_one {
-            tables
-                .iter()
-                .enumerate()
-                .filter_map(|(i, table)| match table {
-                    TableUpload::Records(RecordsInput::MemwR {
-                        records,
-                        rows,
-                        ecall_cycles: Some(ecalls),
-                    }) if records_len(records) == *rows => Some((i, (*records, *ecalls))),
-                    _ => None,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        if !wanted.is_empty() {
-            let held: Vec<(u64, u64)> = held.iter().map(|(&first, &n)| (first, n)).collect();
-            let faults = FAULT_REGISTERS.load(Ordering::Relaxed) & !KERNEL_FAULTS;
-            let clock = std::time::Instant::now();
-            let inputs: Vec<RegisterTable<'_>> = wanted.iter().map(|&(_, table)| table).collect();
-            let (planned, secs) = plan_registers_many(&inputs, &held, faults);
-            add(&counters().plan_ns, (secs * 1e9) as u64);
-            add(&counters().plan_wall_ns, clock.elapsed().as_nanos() as u64);
-            for (&(i, _), plan) in wanted.iter().zip(planned) {
-                let Some(plan) = plan else { continue };
-                let (lo, hi) = plan.span;
-                for (&first, e) in cache.entries.range_mut(..=hi) {
-                    if first + e.n as u64 > lo {
-                        e.tick = tick;
-                    }
-                }
-                plans[i] = Plan::Registers(plan);
-            }
-        }
         // Words mode: MEMW_R's tables as the walk wrote them; the rows of
         // cycles the card will not hold decoded on the host.
         if mode == Mode::Words && all_one {
@@ -1355,21 +932,6 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
             }
         }
     }
-    // A MEMW_R table with its ECALL cycles that goes up as records.
-    if registers {
-        for (table, plan) in tables.iter().zip(&plans) {
-            if let (
-                TableUpload::Records(RecordsInput::MemwR {
-                    ecall_cycles: Some(_),
-                    ..
-                }),
-                Plan::Records,
-            ) = (table, plan)
-            {
-                add(&counters().records_memw_r, 1);
-            }
-        }
-    }
 
     // ---- room: the table store, every copy held at once, kept logs ----
     let be = backend().ok()?;
@@ -1383,9 +945,6 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
         .map(|(table, plan)| match (table, plan) {
             (TableUpload::Records(records), Plan::Records) => records.bytes() as u64,
             (_, Plan::Derived { cycles, .. }) => (cycles.len() * 4) as u64,
-            (_, Plan::Registers(plan)) => {
-                (plan.words.len() * 8 + plan.whole.len() * std::mem::size_of::<RegRowC>()) as u64
-            }
             (_, Plan::Words(plan)) => {
                 (plan.n * 8 + (plan.n_whole + plan.extra.len()) * std::mem::size_of::<RegRowC>())
                     as u64
@@ -1520,36 +1079,6 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 let _ = records;
                 s = Some(Staged::Elsewhere);
             }
-            (TableUpload::Records(records), Plan::Registers(plan)) => {
-                let word_bytes = plan.words.len() * 8;
-                let whole_bytes = std::mem::size_of_val(plan.whole.as_slice());
-                crate::pinned::note_upload(plan.words.as_ptr().cast(), word_bytes);
-                let words = stream.clone_htod(&plan.words).ok()?;
-                let whole = if plan.whole.is_empty() {
-                    None
-                } else {
-                    crate::pinned::note_upload(plan.whole.as_ptr().cast(), whole_bytes);
-                    Some(stream.clone_htod(&plan.whole).ok()?)
-                };
-                r = Some((words, whole, 0, plan.words.len() as u64));
-                let c = counters();
-                add(&c.derived_memw_r, 1);
-                add(
-                    &c.register_words,
-                    (plan.words.len() - plan.whole.len()) as u64,
-                );
-                let w = plan.why;
-                add(&c.whole_ecall, w.ecall);
-                add(&c.whole_after_ecall, w.after_ecall);
-                add(&c.whole_before_table, w.before_table);
-                add(&c.whole_not_held, w.not_held);
-                add(&c.whole_other, w.other);
-                add(&c.register_word_bytes, word_bytes as u64);
-                add(&c.register_whole_bytes, whole_bytes as u64);
-                add(&c.records_bytes_spared, records.bytes() as u64);
-                add(&c.register_records_spared, records.bytes() as u64);
-                s = Some(Staged::Elsewhere);
-            }
             (TableUpload::Records(records), _) => {
                 if matches!(records, RecordsInput::Cpu { .. }) && derive {
                     add(&counters().cpu_copies, 1);
@@ -1643,7 +1172,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
             .zip(registers_up.iter().zip(&offsets))
         {
             if let (
-                Plan::Registers(_) | Plan::Words(_),
+                Plan::Words(_),
                 Some((words, whole, whole_base, rows)),
                 TableUpload::Records(records),
             ) = (plan, up, table)
@@ -1991,55 +1520,11 @@ mod tests {
             assert!(err.contains(CARD_ROWS_ENV), "{err}");
             assert!(err.contains("off, order or words"), "{err}");
         }
-        assert!(Mode::Registers.derives() && Mode::Derive.derives());
         assert!(!Mode::Order.derives() && !Mode::Off.derives());
         assert!(Mode::Words.derives());
         assert_eq!(DEFAULT_CACHE_MIB, 768);
     }
 
-    /// A register row at `ts` (cycle `(ts − 4) / 4`, slot `(ts − 4) % 4`)
-    /// whose old timestamp is `old`; a write when its slot is 2.
-    fn reg(ts: u64, old: u64) -> RegRowC {
-        RegRowC {
-            timestamp: ts,
-            val0: (ts * 7) as u32,
-            val1: 1,
-            old0: (old * 3) as u32,
-            old1: 2,
-            old_ts_lo: old as u32,
-            address: 5,
-            is_read: u8::from((ts - 4) % 4 != 2),
-            pad: 0,
-        }
-    }
-
-    fn ts(cycle: u64, slot: u64) -> u64 {
-        4 * cycle + 4 + slot
-    }
-
-    /// Every row as the plan sends it: the words of the rows it builds
-    /// carry their timestamps, and a whole row's word names it, in order.
-    fn check_words(rows: &[RegRowC], plan: &RegisterPlan) {
-        assert_eq!(plan.words.len(), rows.len());
-        let mut next = 0u64;
-        for (r, (row, &word)) in rows.iter().zip(&plan.words).enumerate() {
-            if word as u32 == WHOLE_ROW {
-                assert_eq!(word >> 32, next, "row {r}: whole rows in order");
-                assert_eq!(plan.whole[next as usize], *row, "row {r}");
-                next += 1;
-            } else {
-                assert_eq!(
-                    word,
-                    row.timestamp | u64::from(row.old_ts_lo) << 32,
-                    "row {r}"
-                );
-            }
-        }
-        assert_eq!(next as usize, plan.whole.len());
-        assert_eq!(plan.why.total(), next);
-    }
-
-    /// The rule, row by row: CPU tables of 8 cycles, an ECALL at cycle 10.
     /// A row `(cycle, slot)`'s word, its old timestamp the slot before.
     fn word(cycle: u64, slot: u64) -> u64 {
         let ts = 4 * cycle + 4 + slot;
@@ -2098,9 +1583,6 @@ mod tests {
         };
         assert!(launches_from_logs(&[Plan::Records, words()]));
         assert!(launches_from_logs(&[words()]));
-        assert!(launches_from_logs(&[Plan::Registers(
-            RegisterPlan::default()
-        )]));
         assert!(launches_from_logs(&[Plan::Derived {
             store: false,
             cycles: Vec::new()
@@ -2111,117 +1593,6 @@ mod tests {
             Plan::Records,
             Plan::CpuHit(0)
         ]));
-    }
-
-    #[test]
-    fn a_register_row_crosses_as_its_timestamps_only_where_the_logs_give_the_rest() {
-        let held = [(0u64, 8u64), (8, 8), (16, 8)];
-        let ecalls = [10u32];
-        let rows = [
-            reg(ts(2, 0), ts(1, 2)),  // a read: word
-            reg(ts(2, 2), ts(2, 0)),  // a write, old this cycle's rs1: word
-            reg(ts(5, 2), ts(3, 1)),  // a write, old in its table: word
-            reg(ts(9, 2), ts(6, 0)),  // a write, old before its table (8)
-            reg(ts(10, 0), ts(9, 2)), // the ECALL's own row
-            reg(ts(10, 0), ts(4, 1)), // its handler's rows
-            RegRowC {
-                is_read: 0,
-                ..reg(ts(10, 1), ts(10, 0))
-            }, // and one written at the `rs2` slot
-            reg(ts(11, 0), ts(10, 0)), // a read after it: word
-            reg(ts(12, 2), ts(10, 1)), // a write whose register the ECALL touched
-            reg(ts(13, 2), ts(12, 2)), // a write, old the last write: word
-            reg(ts(14, 1), ts(14, 1)), // an old timestamp not before it: whole
-            reg(ts(15, 0), ts(14, 1)), // reads: words
-            reg(ts(16, 0), ts(15, 0)), //
-            reg(ts(20, 2), ts(17, 1)), // the next table: word
-            reg(ts(22, 3), ts(21, 0)), // slot 3: no cycle access is there
-        ];
-        let plan = plan_registers(&[&rows[..]], &held, &ecalls, 0).expect("planned");
-        check_words(&rows, &plan);
-        let whole: Vec<usize> = (0..rows.len())
-            .filter(|&r| plan.words[r] as u32 == WHOLE_ROW)
-            .collect();
-        assert_eq!(whole, vec![3, 4, 5, 6, 8, 10, 14]);
-        assert_eq!(
-            plan.why,
-            WholeRows {
-                ecall: 3,
-                after_ecall: 1,
-                before_table: 1,
-                not_held: 0,
-                other: 2,
-            }
-        );
-        assert_eq!(plan.span, (2, 22));
-
-        // The host mutants: the rows the card cannot read go as words.
-        let start =
-            plan_registers(&[&rows[..]], &held, &ecalls, REGISTER_FAULT_START).expect("planned");
-        assert_ne!(
-            start.words[3] as u32, WHOLE_ROW,
-            "before its table, as a word"
-        );
-        assert_eq!(start.why.before_table, 0);
-        let ecall =
-            plan_registers(&[&rows[..]], &held, &ecalls, REGISTER_FAULT_ECALL).expect("planned");
-        for r in [4, 5, 8] {
-            assert_ne!(ecall.words[r] as u32, WHOLE_ROW, "row {r} as a word");
-        }
-        assert_eq!((ecall.why.ecall, ecall.why.after_ecall), (0, 0));
-        // Row 6 (a write at the `rs2` slot) stays whole.
-        assert_eq!(ecall.words[6] as u32, WHOLE_ROW);
-        assert_eq!(ecall.why.other, 3);
-    }
-
-    #[test]
-    fn rows_whose_cycles_are_not_held_cross_whole_and_too_many_send_records() {
-        let rows: Vec<RegRowC> = (2..22).map(|c| reg(ts(c, 0), ts(c - 1, 1))).collect();
-        // The middle table missing: its rows whole.
-        let plan = plan_registers(&[&rows[..]], &[(0, 8), (16, 8)], &[], 0).expect("planned");
-        check_words(&rows, &plan);
-        assert_eq!(plan.why.not_held, 8);
-        // Under half the span held: records.
-        assert!(plan_registers(&[&rows[..]], &[(0, 8)], &[], 0).is_none());
-        // Half the span held, more than half the rows whole: records.
-        let late: Vec<RegRowC> = (2..22)
-            .map(|c| reg(ts(c, 0), ts(c - 1, 1)))
-            .chain((14..16).map(|c| reg(ts(c, 0), ts(c - 1, 1))))
-            .collect();
-        assert!(plan_registers(&[&late[..]], &[(0, 12)], &[], 0).is_none());
-        // Nothing held, no rows: records.
-        assert!(plan_registers(&[&rows[..]], &[], &[], 0).is_none());
-        assert!(plan_registers(&[], &[(0, 8)], &[], 0).is_none());
-    }
-
-    /// A table larger than a planning part, in pieces, its whole rows spread
-    /// over the parts: every word and whole row at its place, and the same
-    /// plan however the rows are cut into pieces.
-    #[test]
-    fn a_large_tables_parts_are_planned_apart_and_put_back_in_order() {
-        let cycles = (PLAN_PART as u64) * 3 / 2 + 77;
-        let ecalls: Vec<u32> = (0..cycles as u32).filter(|c| c % 1001 == 7).collect();
-        let rows: Vec<RegRowC> = (1..cycles)
-            .flat_map(|c| [reg(ts(c, 0), ts(c - 1, 0)), reg(ts(c, 2), ts(c, 0))])
-            .collect();
-        let held = [(0u64, cycles / 2), (cycles / 2, cycles)];
-        let one = plan_registers(&[&rows[..]], &held, &ecalls, 0).expect("planned");
-        check_words(&rows, &one);
-        // Each ECALL cycle's two rows; the write after it reads its own
-        // cycle's `rs1`, a read the ECALL did not make.
-        assert_eq!(
-            one.why.ecall,
-            2 * ecalls.iter().filter(|&&c| c >= 1).count() as u64
-        );
-        // The first write of the second table reads the cycle before it.
-        assert_eq!(one.why.before_table, 0);
-        let (a, b) = rows.split_at(PLAN_PART + 12345);
-        let (b, c) = b.split_at(999);
-        let cut = plan_registers(&[a, b, c], &held, &ecalls, 0).expect("planned");
-        assert_eq!(cut, one);
-        // The planning pool and one thread agree.
-        let (many, _) = plan_registers_many(&[(&[&rows[..]][..], &ecalls[..])], &held, 0);
-        assert_eq!(many[0].as_ref(), Some(&one));
     }
 
     #[test]

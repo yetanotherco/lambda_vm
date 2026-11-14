@@ -201,8 +201,8 @@ extern "C" __global__ void derive_rows_from_cache(const CachedLogsC *entries, ui
 
 // ---------------------------------------------------------------------------
 // `src/card_rows.rs`'s register rows: a group's MEMW_R tables built on the
-// card from the CPU logs it holds (`words`, the default, and a test's `registers`). Each row
-// comes as one word (`RegisterPlan::words`): its timestamp `ts` in the low
+// card from the CPU logs it holds (`words`, the default). Each row
+// comes as one word (the walk's, `prover`'s `register_words`): its timestamp `ts` in the low
 // half and its old timestamp `old` in the high half, or a low half of 0 (no
 // timestamp is) and the index of the row in the table's whole rows, which
 // cross as they are. For a row that comes as its timestamps, by the walk's
@@ -216,8 +216,9 @@ extern "C" __global__ void derive_rows_from_cache(const CachedLogsC *entries, ui
 //   - a read's old value is its value; a write's is the register's value at
 //     `old`: the log of `old`'s cycle by `old`'s slot (`src1_val`,
 //     `src2_val`, `dst_val`), the access there being to the same register.
-// The host sends a row this way only when that cycle is in the same cached
-// CPU table, after its first cycle, and no ECALL is involved; the kernel
+// The walk writes a row this way only when that cycle is in the same window
+// and CPU table, after its first cycle, and no ECALL is involved (the upload
+// sends the rows of cycles the card does not hold whole); the kernel
 // checks each of these, and that the cycle makes such an access within
 // MEMW_R's step, and counts a row that fails into `check` (written as zeros):
 // the group is then refused.
@@ -233,7 +234,7 @@ struct RegistersTableC {
     // The launch's rows before this table's.
     uint64_t before;
     // The run index of `whole`'s first row: a marker's high half less this
-    // indexes `whole` (0 for a table the host planned).
+    // indexes `whole`.
     uint64_t whole_base;
 };
 static_assert(sizeof(RegistersTableC) == 56, "RegistersTableC is 56 bytes");
@@ -343,7 +344,7 @@ extern "C" __global__ void derive_registers_from_cache(
     uint64_t before = value;
     if (ok && slot == 2) {
         // The value at `old`: in this table, after its first cycle, and in no
-        // ECALL cycle (the host sends any other write whole).
+        // ECALL cycle (the walk sends any other write whole).
         ok = old >= 4 * e->first + 4;
         const uint64_t j = ok ? (old - 4) / 4 : c;
         const uint32_t sj = ok ? (uint32_t)((old - 4) % 4) : 3;

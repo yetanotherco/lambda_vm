@@ -591,15 +591,6 @@ pub trait TableRecords: Send + Sync + std::fmt::Debug {
         PagesReturned::default()
     }
 
-    /// A MEMW_R chunk's ECALL cycles, ascending, from 2^14 + 1 cycles before
-    /// its first row's cycle to its last row's, when the run's history gave
-    /// them: the card-built register rows read them
-    /// (`math_cuda::card_rows`). `None` (the default) otherwise, and for
-    /// every other family. Neither fill reads them.
-    fn ecall_cycles(&self) -> Option<&[u32]> {
-        None
-    }
-
     /// A MEMW_R chunk held as the 8-byte words the card builds its rows from
     /// (`math_cuda::card_rows`, `LAMBDA_VM_CARD_ROWS=words`); `None` (the
     /// default) for rows and every other family. [`Self::fill`] still gives
@@ -663,11 +654,6 @@ impl Records {
 
     pub fn host_fill(&self) -> Option<NarrowColumns> {
         self.0.host_fill()
-    }
-
-    /// [`TableRecords::ecall_cycles`].
-    pub fn ecall_cycles(&self) -> Option<&[u32]> {
-        self.0.ecall_cycles()
     }
 
     /// [`TableRecords::register_words`].

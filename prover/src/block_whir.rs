@@ -6438,11 +6438,6 @@ fn prove_streamed(
                     if card_fill.rows.any() {
                         builder = builder.card_fill_streamed_rows(card_fill.rows)?;
                     }
-                    // The card's `registers` mode (a test's override, no
-                    // setting): the card builds MEMW_R's
-                    // rows from the CPU logs, and needs each chunk's ECALL
-                    // cycles, which the walkers read from the executor's
-                    // history. Without record mode MEMW_R goes up as records.
                     // `LAMBDA_VM_CARD_ROWS=words`, the default: the walkers write
                     // MEMW_R's rows as words the card builds them from. Needs record
                     // mode (the ECALL cycles from the history) and the CPU logs kept;
@@ -6459,20 +6454,6 @@ fn prove_streamed(
                                 "the walkers write MEMW_R's rows as words"
                             } else {
                                 "off (no record mode, MEMW_R not held as records, or no CPU logs kept): MEMW_R goes up as rows"
-                            }
-                        );
-                    }
-                    if multilinear::gpu::card_rows_builds_registers() {
-                        let marks = card_fill.memw_r && history && walkers > 0;
-                        if marks {
-                            builder = builder.card_marks_ecalls()?;
-                        }
-                        eprintln!(
-                            "BLOCK CARD ROWS REGISTERS: {}",
-                            if marks {
-                                "MEMW_R's chunks go out with their ECALL cycles"
-                            } else {
-                                "off (no record mode, or MEMW_R not held as records): MEMW_R goes up as records"
                             }
                         );
                     }
@@ -7434,10 +7415,9 @@ fn prove_streamed(
         }
         // Phase B starts: an early start's windows go to their phase-B sizes.
         early_gate.store(true, std::sync::atomic::Ordering::Release);
-        // The card's `words` (the default) or `registers` mode: the card-built rows' counters as
+        // The card's `words` mode (the default): the card-built rows' counters as
         // phase B starts (the block's end line holds both phases).
-        if (multilinear::gpu::card_rows_builds_registers()
-            || multilinear::gpu::card_rows_builds_words())
+        if multilinear::gpu::card_rows_builds_words()
             && let Some(line) = multilinear::gpu::card_rows_report()
         {
             eprintln!(
