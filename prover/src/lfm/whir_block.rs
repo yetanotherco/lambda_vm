@@ -738,8 +738,13 @@ pub struct WhirBlockPlan {
     statement_calls: Vec<Vec<u8>>,
     /// The tree's wrap hash, the block proof family's (`hash_pin::BlockFamily`):
     /// the leaves replay the base's transcript in it and the nodes their
-    /// children's LFM proofs.
+    /// children's LFM proofs. [`super::edsl::WrapHash::Blake3`] for a plan
+    /// over the 7-round BLAKE3 base ([`Self::derive_blake3`]).
     wrap_hash: super::edsl::WrapHash,
+    /// Whether the programs' BLAKE3 compressions are the lean tables' rows
+    /// ([`LfmBuilder::with_b3_lean`]): on for a BLAKE3 plan, whose programs
+    /// only the block prover proves; meaningless under any other hash.
+    b3_lean: bool,
     public_output: Vec<u8>,
     /// The statement's groups: AIR indices in each group's order.
     groups: Vec<Vec<usize>>,
@@ -890,6 +895,75 @@ impl WhirBlockPlan {
         // (`crate::base_only`).
         crate::base_only::refuse_recursion()?;
         let wrap_hash = <crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::WRAP;
+        Self::derive_under(
+            elf_bytes,
+            proof_options,
+            format,
+            statement,
+            num_leaves,
+            fan_in,
+            prepared_roots,
+            leaf_cap,
+            share_inverse,
+            wrap_hash,
+        )
+    }
+
+    /// ★ The plan over a block whose base is the 7-round BLAKE3 base
+    /// (`BaseFormat::B3_WHIR`, `Blake3Whir`): its programs replay the base's
+    /// `Blake3Std` transcript, hash its leaves and binary paths with
+    /// `Blake3Std` (the joint leaf from its prefix's midstate), carry every
+    /// root as two words, and take the lean tables' compressions. The
+    /// prepared roots are committed under `Blake3Whir` on the host, or are
+    /// the prover's own (`prepared_roots`, as [`Self::derive_with`]).
+    ///
+    /// Programs only: what proves or verifies them, and whether a process may,
+    /// is the caller's (a base-only process still refuses recursion at its
+    /// own entry points). `num_leaves` is required: the leaf heights the
+    /// partition otherwise bounds are Poseidon1's.
+    pub fn derive_blake3(
+        elf_bytes: &[u8],
+        proof_options: &crate::ProofOptions,
+        format: &BlockFormat,
+        statement: BlockStatement<'_>,
+        num_leaves: usize,
+        prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
+    ) -> Result<Self, String> {
+        if format.zf.base != stark::proof::options::BaseFormat::B3_WHIR {
+            return Err(format!(
+                "a BLAKE3 plan is over the 7-round BLAKE3 base, not {:?}",
+                format.zf.base
+            ));
+        }
+        Self::derive_under(
+            elf_bytes,
+            proof_options,
+            format,
+            statement,
+            Some(num_leaves),
+            BLOCK_FAN_IN,
+            prepared_roots,
+            LEAF_P1_CAP,
+            share_inverse(),
+            super::edsl::WrapHash::Blake3,
+        )
+    }
+
+    /// The derivation's body once the base and the wrap hash are settled.
+    #[allow(clippy::too_many_arguments)]
+    fn derive_under(
+        elf_bytes: &[u8],
+        proof_options: &crate::ProofOptions,
+        format: &BlockFormat,
+        statement: BlockStatement<'_>,
+        num_leaves: Option<usize>,
+        fan_in: usize,
+        prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
+        leaf_cap: usize,
+        share_inverse: bool,
+        wrap_hash: super::edsl::WrapHash,
+    ) -> Result<Self, String> {
+        let base = &format.zf.base;
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;
         let elf_digest = crate::statement::elf_digest(elf_bytes);
@@ -970,7 +1044,6 @@ impl WhirBlockPlan {
         // Each group's cost in socket rows: its tables' legs, its opening, its
         // prepared ones.
         let refs = frame.airs.air_refs();
-        let arity = wrap_hash.arity();
         let mut costs = Vec::with_capacity(groups.len());
         for (g, list) in groups.iter().enumerate() {
             let owned = Shapes::build(&refs, &frame.shapes, list)?;
@@ -993,7 +1066,7 @@ impl WhirBlockPlan {
             let layout = &frame.stack_layouts[g];
             let chain = ChainShape {
                 query: format.leaf_query,
-                ..ChainShape::new_at(config, layout.n_stack(), arity)
+                ..ChainShape::for_hash(config, layout.n_stack(), wrap_hash)
             };
             let opening = stacked_verify_cost_ood(layout, &group_of, &chain, entry, true).perms()
                 + commit_ood_point_perms(
@@ -1012,7 +1085,7 @@ impl WhirBlockPlan {
                         .collect();
                     let chain = ChainShape {
                         query: format.leaf_query,
-                        ..ChainShape::new_at(config, p.layout.n_stack(), arity)
+                        ..ChainShape::for_hash(config, p.layout.n_stack(), wrap_hash)
                     };
                     stacked_verify_cost(&p.layout, &group_of, &chain, entry).perms()
                 })
@@ -1028,6 +1101,7 @@ impl WhirBlockPlan {
             frame,
             statement_calls,
             wrap_hash,
+            b3_lean: wrap_hash == super::edsl::WrapHash::Blake3,
             public_output: statement.public_output.to_vec(),
             groups,
             prepared,
@@ -1098,18 +1172,36 @@ impl WhirBlockPlan {
         self.wrap_hash
     }
 
-    /// A leaf's builder: the tree's wrap hash.
+    /// A leaf's builder: the tree's wrap hash (and under BLAKE3 the plan's
+    /// compression rows).
     fn leaf_builder(&self) -> LfmBuilder {
-        LfmBuilder::new().with_wrap_hash(self.wrap_hash)
+        LfmBuilder::new()
+            .with_wrap_hash(self.wrap_hash)
+            .with_b3_lean(self.b3_lean)
+    }
+
+    /// Test only: this plan with its BLAKE3 compressions lowered to
+    /// `LFM_BLAKE3`'s rows (`lean = false`) or the lean tables' — the same
+    /// digests, so a leaf executes the same arena either way.
+    #[cfg(test)]
+    pub(crate) fn with_b3_lean(mut self, lean: bool) -> Self {
+        self.b3_lean = lean;
+        self
     }
 
     /// The chain shape of a stack of `n_stack` variables, at the base's tree
-    /// arity.
+    /// arity and digest width.
     pub fn chain_shape(&self, n_stack: usize) -> ChainShape {
         ChainShape {
             query: self.leaf_query,
-            ..ChainShape::new_at(&self.frame.config, n_stack, self.wrap_hash.arity())
+            ..ChainShape::for_hash(&self.frame.config, n_stack, self.wrap_hash)
         }
+    }
+
+    /// Words one commitment occupies in a leaf's arena and publishes: one
+    /// under Poseidon1, two under BLAKE3 (`edsl::digest_words`).
+    pub fn digest_words(&self) -> usize {
+        super::proof_arena::words_per_root_for(self.wrap_hash)
     }
 
     pub fn carrier(&self) -> usize {
@@ -1132,12 +1224,12 @@ impl WhirBlockPlan {
 
     /// What a leaf and a non-top node publish.
     pub fn child_layout(&self) -> BlockLayout {
-        BlockLayout::child(STATE_WORDS, out_halves(&self.public_output).len())
+        BlockLayout::child(self.digest_words(), out_halves(&self.public_output).len())
     }
 
     /// What the top node publishes.
     pub fn top_layout(&self) -> BlockLayout {
-        BlockLayout::top(STATE_WORDS, out_halves(&self.public_output).len())
+        BlockLayout::top(self.digest_words(), out_halves(&self.public_output).len())
     }
 
     /// ★ The whole block verified by ONE program (the recursion's level 1): the
@@ -1531,9 +1623,6 @@ pub(crate) fn run_trees(
         .expect("a run ends a round-0 tree");
     first..last + 1
 }
-
-/// Words the transcript's state digest occupies: one, on the algebraic sponge.
-const STATE_WORDS: usize = 1;
 
 /// The public output as the statement's 32-bit halves, little-endian, the last
 /// one zero-padded.
@@ -2090,13 +2179,14 @@ fn route_of(
 /// answers, the transcript after the draws, the challenges and the state
 /// digest.
 struct Front {
+    /// Every group's roots, [`WhirBlockPlan::digest_words`] cells each.
     carried: Vec<Cell>,
     answers: Vec<Ext>,
     transcript: WhirTranscript,
     z: Ext,
     alpha: Ext,
     beta: Ext,
-    state: Cell,
+    state: super::edsl::WrapDigest,
 }
 
 /// The front every leaf replays: every group's roots and every carried
@@ -2122,7 +2212,9 @@ fn emit_front(
         .iter()
         .map(StackedLayout::num_polys)
         .sum();
-    let carried: Vec<Cell> = (0..num_roots)
+    // A root is the plan's digest width in words: one under Poseidon1, two
+    // under BLAKE3.
+    let carried: Vec<Cell> = (0..num_roots * plan.digest_words())
         .map(|_| {
             let cell = b.hint_word(arena, *at);
             *at += 1;
@@ -2147,7 +2239,7 @@ fn emit_front(
         .flat_map(|p| {
             p.roots
                 .iter()
-                .map(super::algebraic_commit::commitment_to_digest)
+                .flat_map(|root| super::proof_arena::commitment_words_for(root, plan.wrap_hash))
         })
         .collect();
     emit_absorb_roots(b, &mut transcript, &carried, &derived);
@@ -2179,7 +2271,7 @@ fn emit_front(
             transcript.absorb_ext(b, *answer);
         }
     }
-    let state = transcript.state(b);
+    let state = transcript.state_digest(b);
     Front {
         carried,
         answers,
@@ -2208,11 +2300,12 @@ pub(crate) fn front_program(plan: &WhirBlockPlan, g: usize) -> LfmProgram {
     b.public(first.as_cell());
     // Group `g`'s commit-time point, from the front's root cells.
     let layout = &plan.frame.stack_layouts[g];
+    let dw = plan.digest_words();
     let root_at = plan.root_start(g);
     let point = emit_commit_ood_point(
         &mut b,
         &stark::multilinear_block::commit_ood_prefix(g, layout, &plan.frame.config),
-        &front.carried[root_at..root_at + plan.trees(layout).len()],
+        &front.carried[dw * root_at..dw * (root_at + plan.trees(layout).len())],
         layout.n_stack(),
         layout.n_stack() + plan.frame.config.log_blowup,
     );
@@ -2223,7 +2316,8 @@ pub(crate) fn front_program(plan: &WhirBlockPlan, g: usize) -> LfmProgram {
 
 /// ★ `multilinear_block::commit_ood_point`, emitted: a fresh sponge over the
 /// group's prefix (program constants, ONE `append_bytes`) and its roots (the
-/// front's cells), one draw `z0`, refused inside the group's domain of
+/// front's cells, the builder's digest width each), one draw `z0`, refused
+/// inside the group's domain of
 /// `2^log_size` points; returns the point over the stack, `z0^(2^j)` for
 /// `j < n_stack`. One squaring chain serves both: the point takes its first
 /// `n_stack` entries and the domain check its last.
@@ -2237,8 +2331,9 @@ pub(crate) fn emit_commit_ood_point(
     assert!(n_stack <= log_size, "the stack lies inside its domain");
     let mut transcript = WhirTranscript::for_builder(b);
     transcript.absorb_const_bytes(prefix);
-    for root in roots {
-        transcript.absorb_digest(b, *root);
+    let dw = super::edsl::digest_words(b) as usize;
+    for root in roots.chunks(dw) {
+        transcript.absorb_root(b, super::edsl::WrapDigest::from_cells(root));
     }
     let z0 = transcript.sample_ext(b);
     let mut powers = Vec::with_capacity(log_size + 1);
@@ -2491,10 +2586,11 @@ fn emit_leaf_over(
         // carried at its own commit-time point — the front's root and answer
         // cells, never a second copy.
         let layout = &frame.stack_layouts[g];
+        let dw = plan.digest_words();
         let root_at = plan.root_start(g);
         let answer_at = plan.answer_start(g);
         let trees = plan.trees(layout);
-        let group_roots = &carried[root_at..root_at + trees.len()];
+        let group_roots = &carried[dw * root_at..dw * (root_at + trees.len())];
         let point = emit_commit_ood_point(
             b,
             &stark::multilinear_block::commit_ood_prefix(g, layout, config),
@@ -2545,7 +2641,7 @@ fn emit_leaf_over(
                 let at = run_trees(&trees, run);
                 StackedChainWires {
                     rounds: &rounds[i],
-                    roots: &carried[root_at + at.start..root_at + at.end],
+                    roots: &carried[dw * (root_at + at.start)..dw * (root_at + at.end)],
                     final_value: held.finals[i],
                 }
             })
@@ -2575,10 +2671,8 @@ fn emit_leaf_over(
             let roots: Vec<Cell> = p
                 .roots
                 .iter()
-                .map(|root| {
-                    b.digest_const(super::algebraic_commit::commitment_to_digest(root))
-                        .as_cell()
-                })
+                .flat_map(|root| super::proof_arena::commitment_words_for(root, plan.wrap_hash))
+                .map(|word| b.digest_const(word).as_cell())
                 .collect();
             let openings: Vec<_> = held
                 .storage
@@ -2596,10 +2690,13 @@ fn emit_leaf_over(
                 .runs
                 .iter()
                 .enumerate()
-                .map(|(i, run)| StackedChainWires {
-                    rounds: &rounds[i],
-                    roots: &roots[run_trees(&prepared_trees, run)],
-                    final_value: held.finals[i],
+                .map(|(i, run)| {
+                    let at = run_trees(&prepared_trees, run);
+                    StackedChainWires {
+                        rounds: &rounds[i],
+                        roots: &roots[dw * at.start..dw * at.end],
+                        final_value: held.finals[i],
+                    }
                 })
                 .collect();
             if !checks.prepared {
@@ -2656,7 +2753,9 @@ fn emit_leaf_over(
         let cell = b.digest_const(word).as_cell();
         b.public(cell);
     }
-    b.public(state);
+    for cell in state.iter() {
+        b.public(*cell);
+    }
     for half in out_halves(&plan.public_output) {
         let felt = b.felt_const(half);
         b.public(felt.as_cell());
@@ -2679,7 +2778,12 @@ pub fn block_leaf_arena(
     k: usize,
 ) -> Result<Vec<Vec<LfmWord>>, String> {
     let groups = block_leaf_groups(plan, proof, k)?;
-    Ok(leaf_arena(&proof.proof.roots, &proof.commit_ood, groups))
+    Ok(leaf_arena_under(
+        &proof.proof.roots,
+        &proof.commit_ood,
+        groups,
+        plan.wrap_hash,
+    ))
 }
 
 /// Leaf `k`'s groups' words from the block proof, in the leaf's group order
@@ -2747,9 +2851,20 @@ pub fn leaf_arena(
     answers: &[FEE],
     groups: Vec<Vec<LfmWord>>,
 ) -> Vec<Vec<LfmWord>> {
+    leaf_arena_under(roots, answers, groups, super::edsl::WrapHash::Poseidon1)
+}
+
+/// [`leaf_arena`] for a plan under `hash`: each root its digest width in words
+/// (`proof_arena::commitment_words_for`).
+pub fn leaf_arena_under(
+    roots: &[Commitment],
+    answers: &[FEE],
+    groups: Vec<Vec<LfmWord>>,
+    hash: super::edsl::WrapHash,
+) -> Vec<Vec<LfmWord>> {
     let mut words: Vec<LfmWord> = roots
         .iter()
-        .map(super::algebraic_commit::commitment_to_digest)
+        .flat_map(|root| super::proof_arena::commitment_words_for(root, hash))
         .collect();
     words.extend(answers.iter().map(super::word::ext_word));
     for group in groups {
@@ -2862,6 +2977,16 @@ fn commit_prepared(
 ) -> Result<Vec<Commitment>, crate::Error> {
     // On the host: the verifier's plan derives these roots itself, and no card
     // kernel may decide what it accepts. The prover hands its own roots in.
+    if *base == stark::proof::options::BaseFormat::B3_WHIR {
+        // A BLAKE3 plan's ([`WhirBlockPlan::derive_blake3`]): the base's own
+        // commitment, `Blake3Whir`.
+        return Ok(
+            crate::block_whir::commit_group_on_host::<multilinear::whir_hash::Blake3Whir>(
+                stack, config,
+            )?
+            .roots,
+        );
+    }
     crate::with_block_hash!(*base, |H| {
         Ok(crate::block_whir::commit_group_on_host::<H>(stack, config)?.roots)
     })
