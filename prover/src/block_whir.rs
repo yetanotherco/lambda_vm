@@ -388,13 +388,13 @@ pub fn block_statement_tag(base: &BaseFormat) -> Vec<u8> {
         return MULTILINEAR_BLOCK_TAG.to_vec();
     }
     // The 7-round BLAKE3 base's binary trees: their cap is the base's own,
-    // [`B3_BASE_CAP`], a verifier-side constant, and the tag names it so no
+    // [`b3_base_cap`], a verifier-side constant, and the tag names it so no
     // two BLAKE3 geometries share a tag either; then its final polynomial's
     // width ([`b3_base_final`], `F0` without one).
     if *base == BaseFormat::B3_WHIR {
         let mut tag = MULTILINEAR_BLOCK_TAG.to_vec();
         tag.extend_from_slice(B3_BASE_TAG_SUFFIX);
-        tag.extend_from_slice(format!("/C{B3_BASE_CAP}").as_bytes());
+        tag.extend_from_slice(format!("/C{}", b3_base_cap()).as_bytes());
         let final_vars = match b3_base_final() {
             FinalPoly::Off => 0,
             FinalPoly::Vars(v) => v,
@@ -428,6 +428,48 @@ pub const B3_BASE_TAG_SUFFIX: &[u8] = b"/B3R7";
 /// once; past about 8 the cap costs more than the levels it saves. The base's
 /// proof carries the cap's nodes (≈ 8 KB a tree).
 pub const B3_BASE_CAP: u8 = 8;
+
+/// The knob that proves and verifies the BLAKE3 base at another binary cap
+/// height than [`B3_BASE_CAP`] (a measurement: the cap's in-guest mux is
+/// `2^c − 1` `Select` rows a digest word an opening, so the recursion's cells
+/// and its compressions move in opposite directions with `c`). Both sides of
+/// one process read it, and the tag names it: see [`b3_base_cap_setting`].
+pub const B3_BASE_CAP_ENV: &str = "LAMBDA_VM_B3_BASE_CAP";
+
+/// [`B3_BASE_CAP_ENV`]'s value: unset is [`B3_BASE_CAP`] (the base's format);
+/// a height `3` to `8` is that height. Anything else is refused.
+pub fn b3_base_cap_setting(value: Option<&str>) -> Result<u8, String> {
+    match value.map(str::trim) {
+        None => Ok(B3_BASE_CAP),
+        Some(v) => match v.parse::<u8>() {
+            Ok(c @ 3..=8) => Ok(c),
+            _ => Err(format!(
+                "{B3_BASE_CAP_ENV}={v:?}: expected a height from 3 to 8"
+            )),
+        },
+    }
+}
+
+/// The BLAKE3 base's binary cap height in this process
+/// ([`b3_base_cap_setting`] of [`B3_BASE_CAP_ENV`]), read once; a refused
+/// value aborts the process at its first read, as [`b3_base_final`] does.
+pub fn b3_base_cap() -> u8 {
+    static CAP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let value = match std::env::var(B3_BASE_CAP_ENV) {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(v)) => {
+                eprintln!("{B3_BASE_CAP_ENV}={v:?}: expected a height from 3 to 8");
+                std::process::abort()
+            }
+        };
+        b3_base_cap_setting(value.as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::abort()
+        })
+    })
+}
 
 /// The 7-round BLAKE3 base's final polynomial: each chain stops committing at
 /// the first round past round 0, short of the last, after which at most `9`
@@ -686,10 +728,10 @@ impl BlockFormat {
     /// of a block builds its config here.
     pub fn chain_config(&self, shapes: &[(usize, usize)]) -> ChainConfig {
         let mut config = chain_config_under(&self.zf, shapes);
-        // The BLAKE3 base's binary trees take its own cap ([`B3_BASE_CAP`]),
+        // The BLAKE3 base's binary trees take its own cap ([`b3_base_cap`]),
         // and its chains its final polynomial ([`b3_base_final`]).
         if self.zf.base == BaseFormat::B3_WHIR {
-            config.format.cap = CapPolicy::Fixed(B3_BASE_CAP);
+            config.format.cap = CapPolicy::Fixed(b3_base_cap());
             config.format.final_poly = b3_base_final();
         }
         config.format.argue = self.argue;
