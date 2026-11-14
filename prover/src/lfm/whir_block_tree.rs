@@ -206,7 +206,8 @@ pub struct WhirTreeConfig {
     /// them before taking the card. Prover-only: a cache, the bytes are the
     /// same.
     pub node_domains_early: bool,
-    /// `W3_READOUTS_AFTER=0|1` (default 0): the base's harness read-outs (the
+    /// `W3_READOUTS_AFTER=0|1` (default on, [`READOUTS_AFTER_DEFAULT`]; 0 is the
+    /// control): the base's harness read-outs (the
     /// stamps' report, LT's heights, the groups' tables, the plan, the leaves'
     /// census) print after the whole block, not between the base and the tree
     /// where the card waits for them. Output only.
@@ -475,7 +476,7 @@ impl WhirTreeConfig {
         let early_pool = count_knob("W3_EARLY_POOL")?.unwrap_or(EARLY_POOL_DEFAULT);
         let stream_leaf = stream_leaf_setting(count_knob("W3_STREAM_LEAF")?)?;
         let node_domains_early = node_domains_early_setting(count_knob("W3_NODE_DOMAINS_EARLY")?)?;
-        let readouts_after = flag_knob("W3_READOUTS_AFTER")?;
+        let readouts_after = readouts_after_setting(count_knob("W3_READOUTS_AFTER")?)?;
         let leaf_emitters = leaf_emitters_setting(count_knob("W3_LEAF_EMITTERS")?);
         let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
             Ok("batched") => match count_knob("BLOCK_WHIR_ARGUE_CAP")? {
@@ -1531,6 +1532,20 @@ pub(crate) fn early_leaf_first(mut order: Vec<TreeAt>, first: Option<usize>) -> 
         order[..=at].rotate_right(1);
     }
     order
+}
+
+/// `W3_READOUTS_AFTER` unset: the base's read-outs print after the whole block.
+pub(crate) const READOUTS_AFTER_DEFAULT: bool = true;
+
+/// `W3_READOUTS_AFTER`: unset is [`READOUTS_AFTER_DEFAULT`] (on), `0` off (the
+/// control: between the base and the tree), `1` on; any other count is refused.
+fn readouts_after_setting(knob: Option<usize>) -> Result<bool, String> {
+    match knob {
+        None => Ok(READOUTS_AFTER_DEFAULT),
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        Some(n) => Err(format!("W3_READOUTS_AFTER={n}: 0 or 1")),
+    }
 }
 
 /// `W3_NODE_DOMAINS_EARLY` unset: each node program's domains and twiddles are
@@ -3174,6 +3189,14 @@ pub fn prove_whir_block_tree(
     let census_now = (!cfg.readouts_after).then(|| census_of(held));
     let n_programs = programs.len();
     let base_readouts = |census: &str| -> Result<(), String> {
+        sink.line(&format!(
+            "W3 READOUTS: {}",
+            if cfg.readouts_after {
+                "the base's read-outs printed after the whole block"
+            } else {
+                "the base's read-outs printed between the base and the tree (W3_READOUTS_AFTER=0)"
+            }
+        ));
         sink.write(&stamps.report());
         // LT's chunk heights (what its per-chunk deduplication leaves): equal across
         // runs of one setting when the chunking is deterministic.
@@ -5872,6 +5895,25 @@ mod tests {
         }
     }
 
+    /// `W3_READOUTS_AFTER`: unset prints the base's read-outs after the whole
+    /// block (the default), 0 is the control, 1 is on, any other count refused.
+    #[test]
+    fn the_readouts_knob_is_on_unless_0_and_refuses_other_counts() {
+        assert_eq!(
+            readouts_after_setting(None),
+            Ok(true),
+            "unset prints them after"
+        );
+        assert_eq!(readouts_after_setting(Some(0)), Ok(false), "the control");
+        assert_eq!(readouts_after_setting(Some(1)), Ok(true));
+        for n in [2, 3, 100] {
+            assert!(
+                readouts_after_setting(Some(n)).is_err(),
+                "W3_READOUTS_AFTER={n}"
+            );
+        }
+    }
+
     /// `W3_NODE_DOMAINS_EARLY`: unset warms the nodes' domains as they are
     /// emitted (the default), 0 is the control, 1 is on, and any other count is
     /// refused.
@@ -5984,7 +6026,7 @@ mod tests {
             early_leaves: EARLY_LEAVES_DEFAULT,
             early_pool: EARLY_POOL_DEFAULT,
             node_domains_early: NODE_DOMAINS_EARLY_DEFAULT,
-            readouts_after: false,
+            readouts_after: READOUTS_AFTER_DEFAULT,
             stream_leaf: STREAM_LEAF_DEFAULT,
             leaf_emitters: Some(LEAF_EMITTERS),
             argue: BlockFormat::production().argue,
@@ -6025,7 +6067,7 @@ mod tests {
             "the early node domains are a cache only"
         );
         assert!(
-            off(|c| c.readouts_after = true),
+            off(|c| c.readouts_after = !READOUTS_AFTER_DEFAULT),
             "where the read-outs print is output only"
         );
         // A packing is a named constant the block verifier is given too: a
