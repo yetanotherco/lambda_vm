@@ -35,6 +35,18 @@
 //! The in-guest chain verifier has no final-polynomial round and folds at the
 //! pinned width, so a child proved with a final polynomial or another fold is
 //! refused at emit time.
+//!
+//! # Under the BLAKE3 family
+//!
+//! A child under [`WlfmFamily::B3`] (`Blake3Whir`) is walked by a
+//! [`WrapHash::Blake3`] builder with the lean tables' compressions
+//! ([`LfmBuilder::with_b3_lean`]), which is the only BLAKE3 the W-LFM prover
+//! proves: the statement under the family's tag, each public word as its four
+//! felts' 32 big-endian bytes, the roots two words of `u32` lanes each (the
+//! carried ones hinted, the derived and the prepared ones constants), and the
+//! chains at the family's arity and digest width ([`wlfm_chain_shape_for`]).
+//! The family is the child's artifacts', a verifier constant; a builder of
+//! another hash is refused rather than walked.
 
 use multilinear::stacking::StackedLayout;
 use multilinear::whir_chain::{ChainConfig, FinalPoly};
@@ -44,6 +56,7 @@ use crate::tables::types::{FEE, GoldilocksField};
 
 use super::builder::{Cell, Ext, LfmBuilder};
 use super::compiler::LfmProgram;
+use super::edsl::WrapHash;
 use super::instr::ArenaId;
 use super::per_table_aggregator::{HintedPublicWord, LegCells, emit_public_balance};
 use super::whir_block::{
@@ -56,7 +69,9 @@ use super::whir_epoch::{
 };
 use super::whir_stacked::{OodWires, StackedChainWires};
 use super::whir_transcript::WhirTranscript;
-use super::wlfm::{WlfmArtifacts, WlfmPrep, WlfmProof, check_coverage, statement_head};
+use super::wlfm::{
+    WlfmArtifacts, WlfmFamily, WlfmPrep, WlfmProof, check_coverage, statement_head_for,
+};
 use super::word::{LfmWord, ext_word};
 use crate::hash_pin::{BlockFamily, ProofFamily};
 
@@ -77,6 +92,40 @@ pub fn wlfm_chain_shape(config: &ChainConfig, n_stack: usize) -> ChainShape {
         query: LeafQuery::Lean,
         ..ChainShape::new_at(config, n_stack, BlockFamily::WRAP.arity())
     }
+}
+
+/// [`wlfm_chain_shape`] for a child of `family`: its hash's tree arity and
+/// digest width (two words a node under BLAKE3), under the lean query check
+/// (which checks query by query at arity 2).
+pub fn wlfm_chain_shape_for(
+    family: WlfmFamily,
+    config: &ChainConfig,
+    n_stack: usize,
+) -> ChainShape {
+    match family {
+        WlfmFamily::P1 => wlfm_chain_shape(config, n_stack),
+        WlfmFamily::B3 => ChainShape {
+            query: LeafQuery::Lean,
+            ..ChainShape::for_hash(config, n_stack, WrapHash::Blake3)
+        },
+    }
+}
+
+/// The wrap hash a W-leg over a child of `family` is built under: the block
+/// family's (Poseidon1), or BLAKE3.
+pub const fn wlfm_wrap_hash(family: WlfmFamily) -> WrapHash {
+    match family {
+        WlfmFamily::P1 => BlockFamily::WRAP,
+        WlfmFamily::B3 => WrapHash::Blake3,
+    }
+}
+
+/// A W-leg's builder for a child of `family`: its wrap hash, and under BLAKE3
+/// the lean tables' compressions (the W-LFM prover proves no other BLAKE3).
+pub fn wlfm_leg_builder(family: WlfmFamily) -> LfmBuilder {
+    LfmBuilder::new()
+        .with_wrap_hash(wlfm_wrap_hash(family))
+        .with_b3_lean(family == WlfmFamily::B3)
 }
 
 /// A stack's round-0 trees under the child's config, each a range of its
@@ -130,20 +179,24 @@ pub fn emit_wlfm_leg(
     child: &WlfmChild,
     arena: ArenaId,
 ) -> Result<LegCells, String> {
-    if b.wrap_hash() != BlockFamily::WRAP {
-        return Err(
-            "a W-leg replays the block family's transcript; the builder hashes otherwise".into(),
-        );
-    }
     let a = &child.artifacts;
-    // ⛔ The in-guest walk replays the block family's hash (Poseidon1) only: a
-    // child under another family is refused, never walked under the wrong one.
-    if a.family != super::wlfm::WlfmFamily::P1 {
+    // ⛔ The in-guest walk replays the child's family's hash and no other: a
+    // builder under another hash is refused, never walked under the wrong one.
+    if b.wrap_hash() != wlfm_wrap_hash(a.family) {
         return Err(format!(
-            "a W-leg walks a Poseidon1 child; this one is {:?}",
-            a.family
+            "a W-leg replays its child's transcript ({:?}); the builder hashes under {:?}",
+            a.family,
+            b.wrap_hash()
         ));
     }
+    if a.family == WlfmFamily::B3 && !b.b3_lean() {
+        return Err(
+            "a BLAKE3 W-leg emits the lean tables' compressions, the only BLAKE3 W-LFM proves"
+                .into(),
+        );
+    }
+    // A root is the family's digest width in words: one, or two under BLAKE3.
+    let dw = super::edsl::digest_words(b) as usize;
     let airs = a.airs();
     let refs = airs.air_refs();
     let shapes = a.shapes(&airs);
@@ -167,7 +220,7 @@ pub fn emit_wlfm_leg(
         .collect();
     let num_roots: usize = layouts.iter().map(|l| trees(l, &a.config).len()).sum();
     let num_answers: usize = layouts.iter().map(StackedLayout::num_polys).sum();
-    let carried: Vec<Cell> = (0..num_roots)
+    let carried: Vec<Cell> = (0..num_roots * dw)
         .map(|_| {
             let cell = b.hint_word(arena, at);
             at += 1;
@@ -185,17 +238,20 @@ pub fn emit_wlfm_leg(
     // ---- 2. the statement (the id a constant, the words their lanes), the
     // roots block, the answers, then (z, α, β).
     let mut transcript = WhirTranscript::for_builder(b);
-    for call in statement_head(&a.program_id, child.num_public_words) {
+    for call in statement_head_for(a.family, &a.program_id, child.num_public_words) {
         transcript.absorb_const_bytes(&call);
     }
+    // Each word one 32-byte call of its four lanes' canonical big-endian bytes
+    // (`wlfm::word_bytes`).
     for word in &publics {
         let lanes: [_; 4] = [word.lanes[0], word.lanes[1], word.lanes[2], word.lanes[3]];
-        transcript.absorb_root_lanes(b, &lanes);
+        transcript.absorb_be_felts(b, &lanes);
     }
+    let wrap = wlfm_wrap_hash(a.family);
     let derived: Vec<LfmWord> = a
         .derived_roots()
         .iter()
-        .map(super::algebraic_commit::commitment_to_digest)
+        .flat_map(|root| super::proof_arena::commitment_words_for(root, wrap))
         .collect();
     emit_absorb_roots(b, &mut transcript, &carried, &derived);
     #[cfg(test)]
@@ -286,7 +342,7 @@ pub fn emit_wlfm_leg(
         let layout = &layouts[g];
         let polys = layout.num_polys();
         let group_trees = trees(layout, &a.config);
-        let group_roots = &carried[root_at..root_at + group_trees.len()];
+        let group_roots = &carried[dw * root_at..dw * (root_at + group_trees.len())];
         let point = emit_commit_ood_point(
             b,
             &stark::multilinear_block::commit_ood_prefix(g, layout, &a.config),
@@ -313,7 +369,7 @@ pub fn emit_wlfm_leg(
         };
         #[cfg(not(test))]
         let group_answers: &[Ext] = &answers[answer_at..answer_at + polys];
-        let chain = wlfm_chain_shape(&a.config, layout.n_stack());
+        let chain = wlfm_chain_shape_for(a.family, &a.config, layout.n_stack());
         let held = hint_group_chains_shaped(b, arena, &mut at, polys, &chain);
         let openings: Vec<_> = held
             .storage
@@ -333,10 +389,13 @@ pub fn emit_wlfm_leg(
             .runs
             .iter()
             .enumerate()
-            .map(|(i, run)| StackedChainWires {
-                rounds: &rounds[i],
-                roots: &group_roots[run_trees(&group_trees, run)],
-                final_value: held.finals[i],
+            .map(|(i, run)| {
+                let at = run_trees(&group_trees, run);
+                StackedChainWires {
+                    rounds: &rounds[i],
+                    roots: &group_roots[dw * at.start..dw * at.end],
+                    final_value: held.finals[i],
+                }
             })
             .collect();
         emit_group_walk_chains(
@@ -360,16 +419,14 @@ pub fn emit_wlfm_leg(
         // each table's prefix at that table's point. Prepared roots carry no
         // answers: the verifier derives them, so each is a codeword.
         for stack in a.stacks.iter().filter(|s| s.group == g) {
-            let shape = wlfm_chain_shape(&a.config, stack.layout.n_stack());
+            let shape = wlfm_chain_shape_for(a.family, &a.config, stack.layout.n_stack());
             let held =
                 hint_group_chains_shaped(b, arena, &mut at, stack.layout.num_polys(), &shape);
             let roots: Vec<Cell> = stack
                 .roots
                 .iter()
-                .map(|root| {
-                    b.digest_const(super::algebraic_commit::commitment_to_digest(root))
-                        .as_cell()
-                })
+                .flat_map(|root| super::proof_arena::commitment_words_for(root, wrap))
+                .map(|word| b.digest_const(word).as_cell())
                 .collect();
             let openings: Vec<_> = held
                 .storage
@@ -387,10 +444,13 @@ pub fn emit_wlfm_leg(
                 .runs
                 .iter()
                 .enumerate()
-                .map(|(i, run)| StackedChainWires {
-                    rounds: &rounds[i],
-                    roots: &roots[run_trees(&stack_trees, run)],
-                    final_value: held.finals[i],
+                .map(|(i, run)| {
+                    let at = run_trees(&stack_trees, run);
+                    StackedChainWires {
+                        rounds: &rounds[i],
+                        roots: &roots[dw * at.start..dw * at.end],
+                        final_value: held.finals[i],
+                    }
                 })
                 .collect();
             let mut points: Vec<&[Ext]> = Vec::new();
@@ -473,12 +533,13 @@ pub fn wlfm_leg_arena(child: &WlfmChild, proof: &WlfmProof) -> Result<Vec<LfmWor
         return Err("the proof's groups or prepared openings are not the child's".into());
     }
     let mut words: Vec<LfmWord> = proof.public_words.iter().map(|(_, w)| *w).collect();
+    let wrap = wlfm_wrap_hash(a.family);
     words.extend(
         proof
             .proof
             .roots
             .iter()
-            .map(super::algebraic_commit::commitment_to_digest),
+            .flat_map(|root| super::proof_arena::commitment_words_for(root, wrap)),
     );
     words.extend(proof.commit_ood.iter().map(ext_word));
     for (g, tables) in a.groups().iter().enumerate() {
@@ -494,7 +555,7 @@ pub fn wlfm_leg_arena(child: &WlfmChild, proof: &WlfmProof) -> Result<Vec<LfmWor
             ));
         }
         let layout = &layouts[g];
-        let chain = wlfm_chain_shape(&a.config, layout.n_stack());
+        let chain = wlfm_chain_shape_for(a.family, &a.config, layout.n_stack());
         push_chains(
             &mut words,
             &proof.proof.columns[g],
@@ -502,7 +563,7 @@ pub fn wlfm_leg_arena(child: &WlfmChild, proof: &WlfmProof) -> Result<Vec<LfmWor
             &chain,
         )?;
         for (k, stack) in a.stacks.iter().enumerate().filter(|(_, s)| s.group == g) {
-            let shape = wlfm_chain_shape(&a.config, stack.layout.n_stack());
+            let shape = wlfm_chain_shape_for(a.family, &a.config, stack.layout.n_stack());
             push_chains(
                 &mut words,
                 &proof.prepared[k],
@@ -518,7 +579,7 @@ pub fn wlfm_leg_arena(child: &WlfmChild, proof: &WlfmProof) -> Result<Vec<LfmWor
 /// each as a whole word: the second compression step's body
 /// ([`super::compress`]), and what a test executes a child's arena against.
 pub fn wlfm_leg_program(child: &WlfmChild) -> Result<LfmProgram, String> {
-    let mut b = LfmBuilder::new().with_wrap_hash(BlockFamily::WRAP);
+    let mut b = wlfm_leg_builder(child.artifacts.family);
     let arena = b.declare_arena(0);
     let leg = emit_wlfm_leg(&mut b, child, arena)?;
     for word in &leg.publics {

@@ -367,18 +367,24 @@ fn the_default_family_is_todays_poseidon1() {
     );
 }
 
-/// The in-guest W-leg walks Poseidon1 children only: a BLAKE3 child is
-/// refused at emit time, never walked under the wrong hash.
+/// The in-guest W-leg walks a BLAKE3 child under BLAKE3 only: a Poseidon1
+/// builder refuses it at emit time, never walking it under the wrong hash, and
+/// the leg's own builder (BLAKE3, lean rows) emits it.
 #[test]
-fn the_w_leg_refuses_a_blake3_child() {
+fn the_w_leg_walks_a_blake3_child_under_blake3_only() {
     let program = honest();
     let b3 = build_under(&program, super::wlfm::WlfmFamily::B3);
     let child = super::wlfm_leg::WlfmChild {
         artifacts: b3.artifacts,
         num_public_words: 8,
     };
-    let err = super::wlfm_leg::wlfm_leg_program(&child).expect_err("refused");
-    assert!(err.contains("Poseidon1"), "{err}");
+    let mut b = super::wlfm_leg::wlfm_leg_builder(super::wlfm::WlfmFamily::P1);
+    let arena = b.declare_arena(0);
+    let Err(err) = super::wlfm_leg::emit_wlfm_leg(&mut b, &child, arena) else {
+        panic!("a Poseidon1 builder walked a BLAKE3 child");
+    };
+    assert!(err.contains("B3"), "{err}");
+    super::wlfm_leg::wlfm_leg_program(&child).expect("the BLAKE3 leg emits");
 }
 
 /// The W-leg walks a Poseidon1 child that carries lean tables: the leg is
