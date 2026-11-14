@@ -999,6 +999,7 @@ fn what_a_chain_is_entered_with_reaches_its_first_squeeze_and_stops() {
             buffered_felts: buffered,
             out_pos,
             p1: None,
+            bytes: None,
         };
         let entered = chain_hash_schedule(&shape, entry);
         assert_eq!(entered.len(), fresh.len(), "the event count cannot move");
@@ -1032,6 +1033,7 @@ fn what_a_chain_is_entered_with_reaches_its_first_squeeze_and_stops() {
                     buffered_felts: 5,
                     out_pos,
                     p1: None,
+                    bytes: None,
                 }
             ),
             chain_hash_schedule(
@@ -1040,6 +1042,7 @@ fn what_a_chain_is_entered_with_reaches_its_first_squeeze_and_stops() {
                     buffered_felts: 5,
                     out_pos: 0,
                     p1: None,
+                    bytes: None,
                 }
             ),
             "a chain never draws before it absorbs, so what is in hand on entry is dropped"
