@@ -2240,9 +2240,11 @@ pub(crate) fn prove_tree_pipelined(
                         };
                         drop(program);
                         emitted.program.release();
+                        hop_stamp(|| format!("L{}.{} released", at.lv, at.j));
                         Ok((filled, t, (emitted.at, emitted.emit)))
                     },
                     |(filled, t, (program_at, program_emit)), node: &TreeNode| {
+                        hop_stamp(|| format!("L{}.{} prove called", at.lv, at.j));
                         let lfm = filled
                             .prove_under::<BlockFamily>(
                                 &node.artifacts,
@@ -3295,6 +3297,7 @@ pub fn prove_whir_block_tree(
                 let _fail = FailEmpty(std::slice::from_ref(c1_built), "the C1 builder stopped");
                 let built = (|| -> Result<_, String> {
                     let top = handoff.artifacts.wait()?;
+                    hop_stamp(|| "C1 build started".to_string());
                     let tb = std::time::Instant::now();
                     let wrap = aggregation_wrap_options();
                     let child = super::compress::top_child(plan, top, &wrap)?;
@@ -3304,6 +3307,7 @@ pub fn prove_whir_block_tree(
                         rate,
                         cfg.compress_levers,
                     )?;
+                    hop_stamp(|| "C1 build done".to_string());
                     Ok((c, tb.elapsed().as_secs_f64(), t.elapsed().as_secs_f64()))
                 })();
                 let c1_artifacts = built
