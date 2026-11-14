@@ -6785,6 +6785,17 @@ fn page_trace(
     page::generate_page_trace_from_dense(config, final_page, exclude_touched)
 }
 
+/// [`page_trace`] in `form` ([`page::generate_page_trace_from_dense_as`]).
+fn page_trace_as(
+    config: &PageConfig,
+    memory_state: &MemoryState,
+    exclude_touched: bool,
+    form: crate::tables::gpack::TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let final_page = memory_state.cells.page_data(config.page_base);
+    page::generate_page_trace_from_dense_as(config, final_page, exclude_touched, form)
+}
+
 /// The PAGE configs of a run, one a page the memory state holds, in base
 /// order: private-input pages, then pages the initial image fills, then
 /// zero-init pages, as [`generate_page_tables`] makes them — the PAGE layout,

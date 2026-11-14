@@ -81,6 +81,8 @@ pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
 #[cfg(test)]
+pub mod finish_direct_tests;
+#[cfg(test)]
 pub mod gpack_tests;
 #[cfg(test)]
 pub mod grouped_run_claim_tests;
