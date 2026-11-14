@@ -453,21 +453,65 @@ impl WlfmAirs {
         &'a self,
         traces: &'a mut super::trace::LfmTraces,
         b3l: Option<&'a mut B3lTraces>,
-    ) -> Result<Vec<(DynLfmAir<'a>, &'a mut stark::trace::TraceTable<F, E>)>, String> {
-        let mut pairs: Vec<(DynLfmAir<'a>, &'a mut stark::trace::TraceTable<F, E>)> = self
+    ) -> Result<Vec<(DynLfmAir<'a>, TableIn<'a>)>, String> {
+        let mut pairs: Vec<(DynLfmAir<'a>, TableIn<'a>)> = self
             .lfm
             .air_trace_pairs(traces)
             .into_iter()
-            .map(|(air, trace, _)| (air, trace))
+            .map(|(air, trace, _)| (air, TableIn::Wide(trace)))
             .collect();
         let lean = self.b3l.refs().len();
         match b3l {
-            Some(t) => pairs.extend(self.b3l.pairs(t)?),
+            Some(t) => pairs.extend(
+                self.b3l
+                    .pairs(t)?
+                    .into_iter()
+                    .map(|(air, held)| (air, TableIn::Held(held))),
+            ),
             None if lean == 0 => {}
             None => return Err("the AIR set has lean BLAKE3 tables and the fill none".into()),
         }
         Ok(pairs)
     }
+}
+
+/// One table's columns as the W-LFM prover takes them: an LFM chip's trace, or
+/// a lean table as its fill held it (wide or narrow).
+pub enum TableIn<'a> {
+    Wide(&'a mut stark::trace::TraceTable<F, E>),
+    Held(&'a mut super::b3l_tables::HeldTable),
+}
+
+impl TableIn<'_> {
+    fn shape(&self) -> (usize, usize) {
+        match self {
+            TableIn::Wide(t) => (t.main_table.width, t.main_table.height),
+            TableIn::Held(h) => (h.cols(), h.rows()),
+        }
+    }
+
+    fn column(&self, c: usize) -> Vec<FieldElement<F>> {
+        match self {
+            TableIn::Wide(t) => (0..t.main_table.height)
+                .map(|r| *t.main_table.get(r, c))
+                .collect(),
+            TableIn::Held(h) => h.column(c),
+        }
+    }
+}
+
+/// How the W-LFM prover holds and streams a proof's tables: a prover's
+/// choice, never the proof's (the same bytes either way).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WlfmProving {
+    /// Every table up wide, every tree kept, the groups proved on their forks
+    /// in order: today's, for the small programs C1 and C2 are.
+    Held,
+    /// The base's production streaming: the block options' tree drop, card
+    /// narrowing and upload ahead, narrow lean tables as their fill held them,
+    /// and phase B in group order under the pinned overlap. For a program of
+    /// many groups (a recursion level).
+    Streamed,
 }
 
 /// A program's artifacts and the prover's half of its prepared stacks.
@@ -1017,22 +1061,37 @@ pub(crate) fn prove_wlfm_traces(
     filled: LfmFilled,
     check_prefix: bool,
 ) -> Result<WlfmProof, String> {
+    prove_wlfm_traces_as(build, filled, check_prefix, WlfmProving::Held)
+}
+
+/// [`prove_wlfm_traces`] held and streamed as `proving` says.
+pub(crate) fn prove_wlfm_traces_as(
+    build: &WlfmBuild,
+    filled: LfmFilled,
+    check_prefix: bool,
+    proving: WlfmProving,
+) -> Result<WlfmProof, String> {
     match &build.stacks {
         WlfmStacks::P1(stacks) => {
-            prove_traces_under::<WlfmHash>(&build.artifacts, stacks, filled, check_prefix)
+            prove_traces_under::<WlfmHash>(&build.artifacts, stacks, filled, check_prefix, proving)
         }
-        WlfmStacks::B3(stacks) => {
-            prove_traces_under::<WlfmB3Hash>(&build.artifacts, stacks, filled, check_prefix)
-        }
+        WlfmStacks::B3(stacks) => prove_traces_under::<WlfmB3Hash>(
+            &build.artifacts,
+            stacks,
+            filled,
+            check_prefix,
+            proving,
+        ),
     }
 }
 
-/// [`prove_wlfm_traces`] under the build's hash `H`.
+/// [`prove_wlfm_traces_as`] under the build's hash `H`.
 fn prove_traces_under<H: WhirHash>(
     artifacts: &WlfmArtifacts,
     stacks: &[GroupPrepared<H>],
     filled: LfmFilled,
     check_prefix: bool,
+    proving: WlfmProving,
 ) -> Result<WlfmProof, String> {
     if artifacts.family.hash_name() != H::NAME {
         return Err(format!(
@@ -1075,19 +1134,18 @@ fn prove_traces_under<H: WhirHash>(
         }
     }
     let mut tables: Vec<CommittedTable<'_, F, E>> = Vec::with_capacity(pairs.len());
-    for (t, ((air, trace), &(width, num_vars))) in pairs.into_iter().zip(&shapes).enumerate() {
-        if trace.main_table.width != width || trace.main_table.height != 1usize << num_vars {
+    for (t, ((air, table), &(width, num_vars))) in pairs.into_iter().zip(&shapes).enumerate() {
+        let (cols, rows) = table.shape();
+        if cols != width || rows != 1usize << num_vars {
             return Err(format!(
-                "{}: the trace is {} columns of {} rows, the program's {width} of 2^{num_vars}",
-                air.name(),
-                trace.main_table.width,
-                trace.main_table.height
+                "{}: the trace is {cols} columns of {rows} rows, the program's {width} of \
+                 2^{num_vars}",
+                air.name()
             ));
         }
-        let mut columns = trace.columns_main();
         if check_prefix && let Some((s, at, n)) = prefix_of[t] {
-            for (column, pinned) in columns[..n].iter().zip(&stacks[s].columns[at..at + n]) {
-                if column.as_slice() != pinned.evals() {
+            for (c, pinned) in stacks[s].columns[at..at + n].iter().enumerate() {
+                if table.column(c).as_slice() != pinned.evals() {
                     return Err(format!(
                         "{}: a preprocessed column is not the program's",
                         air.name()
@@ -1096,8 +1154,8 @@ fn prove_traces_under<H: WhirHash>(
             }
         }
         if check_prefix && artifacts.prep == WlfmPrep::Evaluated {
-            for (column, pinned) in columns.iter().zip(&artifacts.evaluated[t]) {
-                if column.as_slice() != pinned.evals() {
+            for (c, pinned) in artifacts.evaluated[t].iter().enumerate() {
+                if table.column(c).as_slice() != pinned.evals() {
                     return Err(format!(
                         "{}: a preprocessed column is not the program's",
                         air.name()
@@ -1106,10 +1164,26 @@ fn prove_traces_under<H: WhirHash>(
             }
         }
         let layout = layout_of(air, width, num_vars).map_err(|e| format!("{e:?}"))?;
-        tables.push(
-            CommittedTable::from_layout(layout, |col| core::mem::take(&mut columns[col as usize]))
-                .map_err(|e| format!("{}: {e:?}", air.name()))?,
-        );
+        let committed = match table {
+            TableIn::Wide(trace) => {
+                let mut columns = trace.columns_main();
+                CommittedTable::from_layout(layout, |col| {
+                    core::mem::take(&mut columns[col as usize])
+                })
+            }
+            TableIn::Held(held) => match held.take() {
+                super::b3l_tables::HeldTable::Wide(trace) => {
+                    let mut columns = trace.columns_main();
+                    CommittedTable::from_layout(layout, |col| {
+                        core::mem::take(&mut columns[col as usize])
+                    })
+                }
+                super::b3l_tables::HeldTable::Narrow(packed) => {
+                    CommittedTable::from_narrow(layout, packed)
+                }
+            },
+        };
+        tables.push(committed.map_err(|e| format!("{}: {e:?}", air.name()))?);
     }
     let prep_secs = t_prep.elapsed().as_secs_f64();
     let waited_before = super::device_permit::waited_secs();
@@ -1125,14 +1199,28 @@ fn prove_traces_under<H: WhirHash>(
         &artifacts.program_id,
         &public_words,
     );
-    let block = BlockCommitted::commit::<H, H::Sponge>(
-        tables,
-        &artifacts.sizes,
-        config,
-        multilinear::whir_commit::TreeDrop::uniform(0),
-        Narrowing::Wide,
-        false,
-    )
+    let block = match proving {
+        WlfmProving::Held => BlockCommitted::commit::<H, H::Sponge>(
+            tables,
+            &artifacts.sizes,
+            config,
+            multilinear::whir_commit::TreeDrop::uniform(0),
+            Narrowing::Wide,
+            false,
+        ),
+        WlfmProving::Streamed => {
+            let options = crate::block_whir::BlockOptions::production();
+            BlockCommitted::commit::<H, H::Sponge>(
+                tables,
+                &artifacts.sizes,
+                config,
+                options.drop_levels,
+                options.narrow,
+                options.upload_ahead,
+            )
+            .map(|b| b.with_phase_b_overlap(multilinear_block::PhaseBOverlap::On))
+        }
+    }
     .map_err(|e| format!("{e:?}"))?;
     let borrowed: Vec<Vec<&multilinear::mle::Mle<F>>> = stacks
         .iter()
@@ -1148,8 +1236,9 @@ fn prove_traces_under<H: WhirHash>(
             columns,
         })
         .collect();
-    let (proof, argues, prepared, _stamps, commit_ood) =
-        multilinear_block::block_prove_on_forks::<F, E, H::Sponge, H>(
+    let order: Vec<usize> = (0..artifacts.sizes.len()).collect();
+    let (proof, argues, prepared, _stamps, commit_ood) = match proving {
+        WlfmProving::Held => multilinear_block::block_prove_on_forks::<F, E, H::Sponge, H>(
             block,
             config,
             &mut transcript,
@@ -1157,8 +1246,21 @@ fn prove_traces_under<H: WhirHash>(
             &[],
             &|g| g,
             &multilinear_block::ArgueDeviation::default(),
-        )
-        .map_err(|e| format!("{e:?}"))?;
+        ),
+        WlfmProving::Streamed => multilinear_block::block_prove_in_order::<F, E, H::Sponge, H>(
+            block,
+            config,
+            &mut transcript,
+            &openings,
+            &[],
+            &|g| g,
+            &multilinear_block::ArgueDeviation::default(),
+            &|_| {},
+            &order,
+            None,
+        ),
+    }
+    .map_err(|e| format!("{e:?}"))?;
     let permit_wait = (super::device_permit::waited_secs() - waited_before).max(0.0);
     let held = (t_held.elapsed().as_secs_f64() - permit_wait).max(0.0);
     super::proof::record_prove_split(super::proof::ProveSplit {
@@ -1204,6 +1306,17 @@ pub fn prove_wlfm(
 ) -> Result<WlfmProof, String> {
     let filled = execute_and_fill_unmerged(program, arenas, build.artifacts.hasher)?;
     prove_wlfm_filled(build, filled)
+}
+
+/// [`prove_wlfm`] held and streamed as `proving` says.
+pub fn prove_wlfm_as(
+    program: &LfmProgram,
+    build: &WlfmBuild,
+    arenas: &[Vec<LfmWord>],
+    proving: WlfmProving,
+) -> Result<WlfmProof, String> {
+    let filled = execute_and_fill_unmerged(program, arenas, build.artifacts.hasher)?;
+    prove_wlfm_traces_as(build, filled, true, proving)
 }
 
 /// The tables' shapes, and the groups' stacked layouts and domains.
