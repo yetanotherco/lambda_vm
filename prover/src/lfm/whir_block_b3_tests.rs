@@ -152,6 +152,15 @@ fn blake3_leaves_execute_and_close_the_bus() {
                 let layout = plan.child_layout();
                 assert_eq!(plan.digest_words(), 2, "a BLAKE3 root is two words");
                 let label = format!("{name} {group:?}/{trees:?} lean {lean}");
+                for g in 0..plan.num_groups() {
+                    let (polys, n_stack) = plan.group_stack(g);
+                    println!(
+                        "B3 GROUP {label} {g}: polys {polys} · stack 2^{n_stack} · cost model {} \
+                         compressions · emitted {}",
+                        plan.costs()[g],
+                        plan.chip_loads().0[g].accel
+                    );
+                }
                 let mut words = Vec::new();
                 for k in 0..plan.partition().num_leaves() {
                     let program = plan.leaf_program(k).expect("the leaf emits");
@@ -442,7 +451,10 @@ fn blake3_level0_census_on_a_real_block() {
         let words = run_leaf(&plan, &proof, k);
         let exec_secs = t.elapsed().as_secs_f64();
         println!(
-            "B3 CENSUS GROUP {g}: compressions {b3l} · leaf compressions {leaf_b3l} · instructions {} · group rows {:?} · leaf field main cells {field_main} (with aux {field_padded}) · leaf lean hash cells {hash_cells} · leaf hash share {:.4} · execute {exec_secs:.2} s · executed {}",
+            "B3 CENSUS GROUP {g}: compressions {b3l} · leaf compressions {leaf_b3l} · polys {} · stack 2^{} · cost model {} · instructions {} · group rows {:?} · leaf field main cells {field_main} (with aux {field_padded}) · leaf lean hash cells {hash_cells} · leaf hash share {:.4} · execute {exec_secs:.2} s · executed {}",
+            plan.group_stack(g).0,
+            plan.group_stack(g).1,
+            plan.costs()[g],
             program.instrs.len(),
             loads[g],
             hash_cells as f64 / (hash_cells + field_main) as f64,
