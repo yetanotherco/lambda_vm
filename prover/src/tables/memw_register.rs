@@ -236,7 +236,7 @@ impl RegRow {
     }
 }
 
-/// The row read as REGX's ([`super::regx`], under the register format that
+/// The row read as the residual table's ([`super::register_residual`], under the register format that
 /// checks a CPU row's accesses in the row itself): the same fields, the spare
 /// byte marking a keep-alive.
 impl RegRow {
@@ -250,9 +250,9 @@ impl RegRow {
         row
     }
 
-    /// A REGX row of a register access (any step in `[1, 2^32]`, both
+    /// A residual register row of a register access (any step in `[1, 2^32]`, both
     /// timestamps below `2^32`), its spare byte 2.
-    pub(crate) fn regx(
+    pub(crate) fn residual(
         reg_addr: u64,
         timestamp: u64,
         val: [u32; 2],
@@ -272,9 +272,9 @@ impl RegRow {
         self.pad == 1
     }
 
-    /// Whether the row is REGX's ([`Self::regx`], [`Self::keep_alive`]) rather
+    /// Whether the row is the residual table's ([`Self::residual`], [`Self::keep_alive`]) rather
     /// than MEMW_R's.
-    pub(crate) fn is_regx(&self) -> bool {
+    pub(crate) fn is_residual(&self) -> bool {
         self.pad != 0
     }
 
@@ -364,14 +364,14 @@ pub(crate) fn generate_memw_register_trace_from_rows_segments_as(
     segments: &[&[RegRow]],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // REGX rows (the in-row register format) fill REGX's table.
+    // Residual register rows (the in-row register format) fill the residual table.
     if segments
         .iter()
         .flat_map(|s| s.iter())
         .next()
-        .is_some_and(RegRow::is_regx)
+        .is_some_and(RegRow::is_residual)
     {
-        return super::regx::generate_regx_trace_segments_as(segments, form);
+        return super::register_residual::generate_residual_trace_segments_as(segments, form);
     }
     let len: usize = segments.iter().map(|s| s.len()).sum();
     let num_rows = len.next_power_of_two().max(4);
@@ -422,9 +422,9 @@ fn memw_register_is_half_lookup(ts_lo: u32, old_ts_lo: u32) -> BitwiseOperation 
 /// MEMW_R trace fill uses), one per row. No intermediate op vector: register
 /// rows number in the tens of millions and the histogram is the only consumer.
 pub(crate) fn collect_bitwise_from_memw_register(rows: &[RegRow], hist: &mut BitwiseHistogram) {
-    // REGX rows (the in-row register format) send their step's two limbs.
-    if rows.first().is_some_and(RegRow::is_regx) {
-        super::regx::count_bitwise_from_regx(rows, hist);
+    // residual register rows (the in-row register format) send their step's two limbs.
+    if rows.first().is_some_and(RegRow::is_residual) {
+        super::register_residual::count_bitwise_from_residual(rows, hist);
         return;
     }
     for r in rows {

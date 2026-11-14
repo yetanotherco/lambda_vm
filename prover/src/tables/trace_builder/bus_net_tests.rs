@@ -413,7 +413,7 @@ fn the_limbs_tables_send_lts_tokens_and_balance_every_inner_bus() {
 
 /// ★ The in-row register format (`RegisterFormat::InRow`): on the same
 /// windowed builds, with the CPU rows checking their own register accesses,
-/// REGX taking the rest and the keep-alives, REGISTER a register a row and
+/// the residual register table taking the rest and the keep-alives, REGISTER a register a row and
 /// HALT's PC bridge on the REG bus, every inner bus balances — the REG bus is
 /// one of them, closed by REGISTER's verifier-known files — and no table puts
 /// a register token on the Memory bus any more.
@@ -460,13 +460,13 @@ fn the_in_row_register_format_balances_every_inner_bus() {
 /// ★ The in-row register format's keep-alives: `keep_alive_regs` leaves two
 /// registers alone past a CPU slot's reach (2^16 timestamps), then reads one
 /// and writes the other. Each such access first moves the register's token
-/// with a REGX keep-alive, and so does the first access of a register after
+/// with a keep-alive, and so does the first access of a register after
 /// that long (its token is REGISTER's, at timestamp 1): `t2`, `t3`, then
 /// `t4`, `a0` and `a7`, five. Every inner bus still balances.
 #[test]
 fn the_in_row_register_format_keeps_long_idle_registers_alive() {
     use crate::tables::register::RegisterFormat;
-    use crate::tables::regx::cols as regx;
+    use crate::tables::register_residual::cols as residual;
     let (program, logs) = run("keep_alive_regs");
     for (sizes, max_rows) in [
         ("small", MaxRowsConfig::small()),
@@ -488,7 +488,7 @@ fn the_in_row_register_format_keeps_long_idle_registers_alive() {
                 .iter()
                 .map(|t| {
                     (0..t.num_rows())
-                        .filter(|&row| *t.get_main(row, regx::MU_KEEP) == FE::one())
+                        .filter(|&row| *t.get_main(row, residual::MU_KEEP) == FE::one())
                         .count()
                 })
                 .sum();

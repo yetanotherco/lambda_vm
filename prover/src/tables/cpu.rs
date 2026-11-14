@@ -853,9 +853,13 @@ pub(crate) fn generate_cpu_trace_segments_as(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CpuSide {
     pub(crate) prev_ts: [u32; 3],
-    pub(crate) pad: u32,
-    pub(crate) old_rd: u64,
+    /// `rd`'s old value, low word then high word.
+    pub(crate) old_rd: [u32; 2],
 }
+
+// Five words, no padding: the record crosses to the card as it lies, and an
+// inactive slot or a word-instruction row is all zeros either way.
+const _: () = assert!(std::mem::size_of::<CpuSide>() == 20);
 
 /// The widths in-row CPU traces needed so far in this process.
 static WIDTHS_INROW: WidthHint = WidthHint::new();
@@ -888,7 +892,8 @@ pub(crate) fn generate_cpu_trace_inrow_segments_as(
                 t.set_u64(row, inrow_cols::PREV_TS_1, u64::from(side.prev_ts[0]));
                 t.set_u64(row, inrow_cols::PREV_TS_2, u64::from(side.prev_ts[1]));
                 t.set_u64(row, inrow_cols::PREV_TS_D, u64::from(side.prev_ts[2]));
-                t.set_dword_wl(row, inrow_cols::OLD_RD_0, side.old_rd);
+                t.set_u64(row, inrow_cols::OLD_RD_0, u64::from(side.old_rd[0]));
+                t.set_u64(row, inrow_cols::OLD_RD_1, u64::from(side.old_rd[1]));
             }
         }
     )

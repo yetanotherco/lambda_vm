@@ -1694,7 +1694,7 @@ struct MemwBuckets {
     order: MemwAlignedOrder,
     /// The run's register format: under
     /// [`RegisterFormat::InRow`](super::register::RegisterFormat::InRow)
-    /// every register access that reaches a bucket is a REGX row (word
+    /// every register access that reaches a bucket is a residual register row (word
     /// instructions', the chips', HALT's and keep-alives), whatever its step.
     registers: super::register::RegisterFormat,
     /// The first aligned access [`memw_aligned::AlignedRow::from_memw`]
@@ -1716,23 +1716,23 @@ impl MemwBuckets {
         }
     }
 
-    /// Whether register accesses are REGX rows (the in-row register format).
+    /// Whether register accesses are residual register rows (the in-row register format).
     #[inline]
     fn in_row(&self) -> bool {
         self.registers == super::register::RegisterFormat::InRow
     }
 
-    /// A register access's REGX row, or the refusal kept for the walk (an
-    /// access REGX cannot take: not two words with one old timestamp, or its
+    /// A register access's residual register row, or the refusal kept for the walk (an
+    /// access the residual register table cannot take: not two words with one old timestamp, or its
     /// timestamps past 32 bits or out of order).
     #[inline]
-    fn push_regx(&mut self, op: &MemwOperation) {
+    fn push_residual(&mut self, op: &MemwOperation) {
         let fits = op.width == 2
             && op.old_timestamp[0] == op.old_timestamp[1]
             && op.timestamp <= u64::from(u32::MAX)
             && op.old_timestamp[0] < op.timestamp;
         if fits {
-            self.register_rows.push(RegRow::regx(
+            self.register_rows.push(RegRow::residual(
                 op.base_address,
                 op.timestamp,
                 [op.value[0], op.value[1]],
@@ -1741,8 +1741,9 @@ impl MemwBuckets {
                 op.is_read,
             ));
         } else {
-            self.refused
-                .get_or_insert(format!("REGX cannot take the register access {op:?}"));
+            self.refused.get_or_insert(format!(
+                "the residual register table cannot take the register access {op:?}"
+            ));
         }
     }
 
@@ -1787,7 +1788,7 @@ impl MemwBuckets {
     #[inline]
     fn push(&mut self, op: MemwOperation) {
         if op.is_register && self.in_row() {
-            self.push_regx(&op);
+            self.push_residual(&op);
             return;
         }
         match classify_memw(&op, self.order) {
@@ -1860,9 +1861,9 @@ impl MemwSink for MemwBuckets {
         old_ts: u64,
         is_read: bool,
     ) {
-        // Under the in-row register format every such access is a REGX row.
+        // Under the in-row register format every such access is a residual register row.
         if self.in_row() {
-            self.push_regx(&build_reg_fallback(
+            self.push_residual(&build_reg_fallback(
                 reg_addr, val, old, timestamp, old_ts, is_read,
             ));
             return;
@@ -2298,7 +2299,7 @@ fn walk_cpu_ops<const REST: bool>(
 
         // Collect register operations (M1, M3, M5). Under the in-row register
         // format a non-word row checks its own: its slots' record, and any
-        // keep-alive its steps need, as REGX rows; a word row's go to REGX.
+        // keep-alive its steps need, as residual register rows; a word row's go to the residual register table.
         if in_row {
             let side = if op.decode.fields.word_instr {
                 collect_register_ops_from_cpu(op, register_state, memw);
@@ -3600,7 +3601,7 @@ const IN_ROW_MAX_STEP: u64 = 1 << 16;
 /// (`tables::register::RegisterFormat::InRow`): the row checks them itself, so
 /// they make no MEMW op. Returns the row's [`super::cpu::CpuSide`]; a slot
 /// whose register was last accessed more than [`IN_ROW_MAX_STEP`] ago gets a
-/// keep-alive first, a REGX row moving the register's token, value unchanged,
+/// keep-alive first, a residual register row moving the register's token, value unchanged,
 /// to `slot_ts − 1`, which no access of that register can hold (a row's
 /// register slots are `ts`, `ts + 1`, `ts + 2`; the slot before `ts` is the
 /// previous row's fourth, which no register access takes). Each slot's
@@ -3655,7 +3656,7 @@ fn collect_register_ops_in_row(
     if d.write_register && d.rd != 0 {
         let (old_val, old_ts) = register_state.read(d.rd);
         side.prev_ts[2] = slot(memw, d.rd, old_val, ts + 2, old_ts);
-        side.old_rd = old_val;
+        side.old_rd = [old_val as u32, (old_val >> 32) as u32];
         register_state.write(d.rd, op.rvd, ts + 2);
     }
     register_state.write_pc(op.next_pc, ts + 1);
@@ -7186,7 +7187,7 @@ pub struct StreamSkip {
     /// How register accesses are checked ([`RegisterFormat`], the block
     /// format's): under [`RegisterFormat::InRow`] the walk makes no MEMW op for
     /// a CPU row's own register accesses (it writes the row's side record) and
-    /// every other register access is a REGX row; the finish builds REGISTER a
+    /// every other register access is a residual register row; the finish builds REGISTER a
     /// register a row. The default is today's.
     ///
     /// [`RegisterFormat`]: super::register::RegisterFormat

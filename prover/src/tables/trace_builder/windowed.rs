@@ -904,7 +904,7 @@ impl<'a> WindowedTraceBuilder<'a> {
 
     /// How register accesses are checked ([`RegisterFormat`], the block
     /// format's): under [`RegisterFormat::InRow`] the walk writes each CPU
-    /// row's side record instead of its register rows, REGX takes every other
+    /// row's side record instead of its register rows, the residual register table takes every other
     /// register access and the keep-alives, and the finish builds REGISTER a
     /// register a row. Before the first window only.
     ///
@@ -4457,7 +4457,7 @@ fn assemble(
         refused: _,
     } = memw;
     // HALT's register ops land at the end of their buckets, as in
-    // `collect_all_ops`, routed and laid out in the run's MEMW_A form (REGX
+    // `collect_all_ops`, routed and laid out in the run's MEMW_A form (the residual register table
     // rows under the in-row register format).
     let mut halt = MemwBuckets::with_register_capacity(0, order);
     halt.registers = registers;

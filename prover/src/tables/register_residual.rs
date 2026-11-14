@@ -1,18 +1,19 @@
-//! REGX: the register accesses a CPU row does not check itself, under
+//! The residual register table (MEMW_R's slot under the in-row register
+//! format): the register accesses a CPU row does not check itself, under
 //! [`RegisterFormat::InRow`](super::register::RegisterFormat::InRow).
 //!
 //! In that format each CPU row checks its own `rs1`, `rs2` and `rd` accesses on
 //! the [`BusId::Reg`] token bus (one token a register access:
-//! `(register, timestamp, value_lo, value_hi)`). REGX takes the rest:
+//! `(register, timestamp, value_lo, value_hi)`). This table takes the rest:
 //!
 //! - the register accesses of word (`*W`) instructions (CPU32 sends them), of
-//!   the ECALL chips and of HALT, each a MEMW message REGX receives as MEMW_R
+//!   the ECALL chips and of HALT, each a MEMW message this table receives as MEMW_R
 //!   does today, its step proved by two 16-bit limbs, so any step in
 //!   `[1, 2^32]`;
 //! - keep-alives: a value-preserving consume and re-produce of a register's
 //!   token, inserted where a CPU row's step would pass the CPU's 16-bit range
 //!   check. A keep-alive has no requester. `MU_KEEP·(OLD − VAL) = 0` makes it
-//!   preserve the value, and the verifier caps REGX's rows
+//!   preserve the value, and the verifier caps the residual table's rows
 //!   ([`MAX_ROWS_TOTAL`]), so keep-alives cannot advance a register's clock
 //!   past the field.
 //!
@@ -58,8 +59,8 @@ pub mod cols {
     pub const NUM_COLUMNS: usize = 12;
 }
 
-/// The most REGX rows a block may hold, over all its REGX tables: a verifier
-/// constant. Every REGX row advances one register's clock by at most `2^32`;
+/// The most residual register rows a block may hold, over all its residual tables: a verifier
+/// constant. Every residual register row advances one register's clock by at most `2^32`;
 /// with at most `2^28` of them, and each CPU slot advancing by at most `2^16`
 /// over at most `3·2^30` slots, a register's timestamps stay below
 /// `2^61 ≪ p`, so the field's order is the integers' and no chain of tokens
@@ -90,7 +91,7 @@ fn column(c: usize) -> BusValue {
     }
 }
 
-/// REGX's interactions (module docs).
+/// The table's interactions (module docs).
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu = Multiplicity::Sum3(cols::MU_READ, cols::MU_WRITE, cols::MU_KEEP);
     let mut old_ts = ts_terms();
@@ -158,13 +159,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ]
 }
 
-/// REGX's constraints: `IS_BIT` on the three flags (idx 0–2) and on their sum
+/// The table's constraints: `IS_BIT` on the three flags (idx 0–2) and on their sum
 /// (idx 3), and a keep-alive preserves the value, `MU_KEEP·(OLD_i − VAL_i) = 0`
 /// (idx 4, 5).
 #[derive(Clone, Copy)]
-pub struct RegxConstraints;
+pub struct ResidualConstraints;
 
-impl ConstraintSet<GoldilocksField, GoldilocksExtension> for RegxConstraints {
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ResidualConstraints {
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         emit_is_bit(b, 0, cols::MU_READ, None);
         emit_is_bit(b, 1, cols::MU_WRITE, None);
@@ -186,16 +187,19 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for RegxConstraints {
 /// A row's step less one, `ts − old_ts − 1`, as `(D0, D1)`.
 fn step_limbs(row: &RegRow) -> (u16, u16) {
     let d = row.step() - 1;
-    debug_assert!(d < 1 << 32, "a REGX step fits 32 bits: {row:?}");
+    debug_assert!(
+        d < 1 << 32,
+        "a residual register step fits 32 bits: {row:?}"
+    );
     (d as u16, (d >> 16) as u16)
 }
 
-/// The widths REGX traces needed so far in this process (`tables::gpack`).
+/// The widths residual register traces needed so far in this process (`tables::gpack`).
 static WIDTHS: WidthHint = WidthHint::new();
 
-/// REGX's trace from its rows (in order, then zero rows to a power of two of
+/// The table's trace from its rows (in order, then zero rows to a power of two of
 /// at least four), in `form`.
-pub(crate) fn generate_regx_trace_segments_as(
+pub(crate) fn generate_residual_trace_segments_as(
     segments: &[&[RegRow]],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
@@ -221,9 +225,9 @@ pub(crate) fn generate_regx_trace_segments_as(
     })
 }
 
-/// The two IS_HALF lookups each REGX row sends (`D0`, `D1`), counted into
+/// The two IS_HALF lookups each residual register row sends (`D0`, `D1`), counted into
 /// `hist`.
-pub(crate) fn count_bitwise_from_regx(rows: &[RegRow], hist: &mut BitwiseHistogram) {
+pub(crate) fn count_bitwise_from_residual(rows: &[RegRow], hist: &mut BitwiseHistogram) {
     for r in rows {
         let (d0, d1) = step_limbs(r);
         for d in [d0, d1] {

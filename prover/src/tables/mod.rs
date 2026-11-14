@@ -53,7 +53,7 @@ pub mod memw_register;
 pub mod mul;
 pub mod page;
 pub mod register;
-pub mod regx;
+pub mod register_residual;
 pub mod shift;
 pub mod store;
 pub mod trace_builder;

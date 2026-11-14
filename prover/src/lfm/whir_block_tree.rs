@@ -540,7 +540,7 @@ impl WhirTreeConfig {
         );
         eprintln!(
             "★ BLOCK REGISTERS: {} (BLOCK_WHIR_REGISTERS; in-row checks a CPU row's register \
-             accesses in the row on one 64-bit token each, REGX taking the rest)",
+             accesses in the row on one 64-bit token each, the residual register table taking the rest)",
             match format.registers {
                 RegisterFormat::Tokens32 => "tokens32",
                 RegisterFormat::InRow => "in-row",

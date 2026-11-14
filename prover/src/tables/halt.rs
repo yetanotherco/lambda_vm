@@ -175,7 +175,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
 /// HALT's interactions under the register format that checks a CPU row's
 /// accesses in the row itself (`tables::register::RegisterFormat::InRow`):
-/// the ECALL receiver and the 31 MEMW finalizations as today (REGX receives
+/// the ECALL receiver and the 31 MEMW finalizations as today (the residual register table receives
 /// them), and the PC bridge as one 64-bit token on [`BusId::Reg`]: consume
 /// `(255, T + 1, pc)`, produce `(255, T + 1, 1, 0)`.
 pub fn bus_interactions_inrow() -> Vec<BusInteraction> {
