@@ -1161,6 +1161,41 @@ impl WhirBlockPlan {
         finish(b)
     }
 
+    /// [`Self::closed_block_program`] with where its arena's parts end: the
+    /// front, then each group's words in group order ([`block_leaf_arena`]'s
+    /// layout for leaf 0), so a caller can land them as phase B finishes the
+    /// groups. The last mark is the arena's length.
+    pub fn closed_block_program_marked(&self) -> Result<(LfmProgram, Vec<u32>), String> {
+        if self.partition.num_leaves() != 1 {
+            return Err(format!(
+                "a closed block program covers every group in one leaf; the plan has {} leaves",
+                self.partition.num_leaves()
+            ));
+        }
+        let mut b = self.leaf_builder();
+        let mut marks = LeafMarks::default();
+        emit_leaf_over(
+            &mut b,
+            self,
+            self.partition.leaf(0),
+            true,
+            true,
+            LeafChecks::ALL,
+            Some(&mut marks),
+        )?;
+        let program = finish(b)?;
+        if marks.arena_ends.len() != self.partition.leaf(0).len() + 1
+            || marks.arena_ends.last().copied() != program.arena_schema.lens.first().copied()
+        {
+            return Err(format!(
+                "the closed program's arena marks {:?} are not its front, its groups and its \
+                 length {:?}",
+                marks.arena_ends, program.arena_schema.lens
+            ));
+        }
+        Ok((program, marks.arena_ends))
+    }
+
     /// [`Self::closed_block_program`] under `checks`, with its bus assert
     /// kept or not (`closed = false` publishes the sum instead): a test's
     /// mutation, to show the assert is what refuses a block whose bus does not

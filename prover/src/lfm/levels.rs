@@ -206,3 +206,361 @@ pub fn verify_levels_to(
     }
     Ok(())
 }
+
+// ============================ the block's driver ===========================
+
+/// The seconds of one level, on the driver's clock (seconds since it
+/// started).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LevelClock {
+    /// When its execute could start, and when it ended (level 1: the last
+    /// streamed wave, after the base's end).
+    pub execute_from: f64,
+    pub executed: f64,
+    /// Its fill's seconds and its prove's (the W-LFM prove, card held).
+    pub fill: f64,
+    pub prove: f64,
+    pub end: f64,
+}
+
+/// What a levels run measured.
+#[derive(Clone, Debug, Default)]
+pub struct LevelsTimes {
+    /// The base proof's end, the plan's derivation, level 1's program emitted
+    /// and every level built.
+    pub base: f64,
+    pub planned: f64,
+    pub emitted: f64,
+    pub built: f64,
+    /// Level 1's streamed execution: its pieces, the waves landed before the
+    /// base ended and their seconds, the seconds after it.
+    pub pieces: usize,
+    pub waves_before_base: usize,
+    pub wave_secs_before_base: f64,
+    pub execute_tail: f64,
+    pub levels: Vec<LevelClock>,
+}
+
+/// A block proved to its last level.
+pub struct LevelsRun {
+    pub base_proof: BlockWhirProof,
+    pub plan: WhirBlockPlan,
+    pub levels: Vec<Level>,
+    pub proofs: Vec<WlfmProof>,
+    pub times: LevelsTimes,
+}
+
+/// The arena pieces level 1's streamed execution lands: the front, then the
+/// groups in group order, at most 63 pieces of consecutive groups (the
+/// streamed execution's 64). Returns each piece's arena range and its groups.
+pub(crate) fn level1_pieces(marks: &[u32]) -> Vec<(std::ops::Range<u32>, std::ops::Range<usize>)> {
+    let groups = marks.len() - 1;
+    let per = groups.div_ceil(63).max(1);
+    let mut out = vec![(0..marks[0], 0..0)];
+    let mut g = 0usize;
+    while g < groups {
+        let hi = (g + per).min(groups);
+        out.push((marks[g]..marks[hi], g..hi));
+        g = hi;
+    }
+    out
+}
+
+/// ★ A block proved to the end of its level chain: the base proof
+/// (`base_options`, `format`, `options`), the plan derived the moment its
+/// statement is final (one leaf over every group), level 1's program emitted
+/// and EXECUTED BESIDE PHASE B (its arena's pieces landed as phase B finishes
+/// each group, [`StreamedExecution::new_pieced`]), then level 1 filled and
+/// proved, and each next level executed over the one below and proved. The
+/// proofs are the ones [`prove_levels`] makes over the finished base; only
+/// when the work runs moves.
+///
+/// [`StreamedExecution::new_pieced`]: super::executor::StreamedExecution::new_pieced
+#[allow(clippy::too_many_arguments)]
+pub fn prove_block_levels(
+    elf: &[u8],
+    input: &[u8],
+    base_options: &crate::ProofOptions,
+    format: &crate::block_whir::BlockFormat,
+    options: &crate::block_whir::BlockOptions,
+    family: WlfmFamily,
+    stop: LevelStop,
+) -> Result<LevelsRun, String> {
+    use super::executor::{ArenaPiece, StreamedExecution};
+    use super::word::LfmWord;
+    use std::sync::mpsc;
+
+    crate::base_only::refuse_recursion()?;
+    let t0 = std::time::Instant::now();
+    let now = || t0.elapsed().as_secs_f64();
+    type Statement = (
+        crate::block_whir::OwnedBlockStatement,
+        Vec<crate::block_whir::PreparedRoots>,
+    );
+    let (stx, srx) = mpsc::channel::<Statement>();
+    let stx = std::sync::Mutex::new(Some(stx));
+    let plan_cell: std::sync::OnceLock<WhirBlockPlan> = std::sync::OnceLock::new();
+    let observe = |statement: crate::block_whir::BlockStatement<'_>,
+                   roots: &[crate::block_whir::PreparedRoots]| {
+        if let Some(tx) = stx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = tx.send((statement.to_owned(), roots.to_vec()));
+        }
+    };
+    // A group's words need the plan; a group that finishes before it is
+    // derived waits in the channel as its parts, here as its words once it is.
+    type Parts = (
+        usize,
+        Vec<multilinear::whir_commit::Commitment>,
+        Vec<crate::tables::types::FEE>,
+        Vec<stark::multilinear_table::TableProof<crate::tables::types::GoldilocksExtension>>,
+        Option<stark::multilinear_table::BatchedArgue<crate::tables::types::GoldilocksExtension>>,
+        multilinear::stacked_eval::StackedProof<
+            crate::tables::types::GoldilocksField,
+            crate::tables::types::GoldilocksExtension,
+        >,
+        Option<
+            multilinear::stacked_eval::StackedProof<
+                crate::tables::types::GoldilocksField,
+                crate::tables::types::GoldilocksExtension,
+            >,
+        >,
+    );
+    let (ptx, prx) = mpsc::channel::<Parts>();
+    let ptx = std::sync::Mutex::new(Some(ptx));
+    let on_group = |opened: stark::multilinear_block::GroupOpened<'_, _, _>| {
+        if let Some(tx) = ptx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = tx.send((
+                opened.group,
+                opened.roots.to_vec(),
+                opened.commit_ood.to_vec(),
+                opened.tables.to_vec(),
+                opened.argue.cloned(),
+                opened.opening.clone(),
+                opened.prepared.cloned(),
+            ));
+        }
+    };
+    let (elf_ref, opts_ref, format_ref) = (elf, base_options, format);
+    let plan_ref = &plan_cell;
+    let mut times = LevelsTimes::default();
+    // What level 1's thread hands back: when the plan and the program were
+    // ready, the program, its execution, when it could start and when it
+    // ended, and its waves before the base ended.
+    type Level1 = (
+        f64,
+        f64,
+        LfmProgram,
+        super::executor::LfmExecution,
+        f64,
+        f64,
+        usize,
+        usize,
+        f64,
+    );
+    let base_end: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let base_end_ref = &base_end;
+    let result = std::thread::scope(|scope| {
+        // Level 1's thread: the plan, the program, then its execute, a piece
+        // landed as soon as phase B has finished its groups.
+        let level1 = scope.spawn(move || -> Result<Level1, String> {
+            let (statement, roots) = srx.recv().map_err(|_| "the prover never stated")?;
+            let plan = WhirBlockPlan::derive_with(
+                elf_ref,
+                opts_ref,
+                format_ref,
+                statement.view(),
+                Some(1),
+                super::whir_block::BLOCK_FAN_IN,
+                Some(&roots),
+            )?;
+            let planned = now();
+            let (program, marks) = plan.closed_block_program_marked()?;
+            let emitted = now();
+            let _ = plan_ref.set(plan);
+            let plan = plan_ref.get().ok_or("the plan is set")?;
+            let pieces = level1_pieces(&marks);
+            let npieces = pieces.len();
+            let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+            let arena_pieces: Vec<ArenaPiece> = pieces
+                .iter()
+                .enumerate()
+                .map(|(i, (range, _))| ArenaPiece {
+                    arena: 0,
+                    start: range.start,
+                    len: range.end - range.start,
+                    group: i,
+                })
+                .collect();
+            let held: Vec<std::cell::OnceCell<Vec<LfmWord>>> =
+                (0..npieces).map(|_| std::cell::OnceCell::new()).collect();
+            let mut by_group: Vec<Option<Vec<LfmWord>>> = vec![None; marks.len() - 1];
+            let execute_from = now();
+            let mut ex = StreamedExecution::new_pieced(&program, arena_pieces, &hasher)
+                .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
+            let mut landed = vec![false; npieces];
+            let (mut waves_before, mut wave_secs_before) = (0usize, 0.0f64);
+            for (g, roots, answers, tables, argue, opening, prepared) in prx.iter() {
+                if !landed[0] {
+                    let front = super::whir_block::leaf_arena(&roots, &answers, Vec::new())
+                        .into_iter()
+                        .next()
+                        .ok_or("no front")?;
+                    held[0].set(front).map_err(|_| "the front landed twice")?;
+                    ex.land_piece(0, held[0].get().ok_or("the front")?)
+                        .map_err(|e| format!("level 1's front: {e:?}"))?;
+                    landed[0] = true;
+                }
+                let words = super::whir_block::group_arena_words(
+                    plan,
+                    g,
+                    &tables,
+                    argue.as_ref(),
+                    &opening,
+                    prepared.as_ref(),
+                )?;
+                *by_group
+                    .get_mut(g)
+                    .ok_or("a group the plan does not hold")? = Some(words);
+                for (i, (_, groups)) in pieces.iter().enumerate().skip(1) {
+                    if landed[i] || !groups.clone().all(|h| by_group[h].is_some()) {
+                        continue;
+                    }
+                    let words: Vec<LfmWord> = groups
+                        .clone()
+                        .flat_map(|h| by_group[h].take().unwrap_or_default())
+                        .collect();
+                    held[i].set(words).map_err(|_| "a piece landed twice")?;
+                    let t = std::time::Instant::now();
+                    ex.land_piece(i, held[i].get().ok_or("a piece")?)
+                        .map_err(|e| format!("level 1's piece {i}: {e:?}"))?;
+                    if base_end_ref.get().is_none() {
+                        waves_before += 1;
+                        wave_secs_before += t.elapsed().as_secs_f64();
+                    }
+                    landed[i] = true;
+                }
+            }
+            if !landed.iter().all(|&l| l) {
+                return Err("phase B ended before level 1 had every group".into());
+            }
+            let execution = ex
+                .finish()
+                .map_err(|e| format!("level 1's execution: {e:?}"))?;
+            let executed = now();
+            Ok((
+                planned,
+                emitted,
+                program,
+                execution,
+                execute_from,
+                executed,
+                npieces,
+                waves_before,
+                wave_secs_before,
+            ))
+        });
+        let proved = crate::block_whir::prove_block_whir_observed_groups(
+            elf,
+            input,
+            base_options,
+            format,
+            options,
+            &observe,
+            &on_group,
+        );
+        let _ = base_end_ref.set(now());
+        *stx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *ptx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        (proved, level1.join())
+    });
+    let (proved, level1) = result;
+    let (base_proof, _stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
+    times.base = base_end.get().copied().unwrap_or_else(now);
+    let (planned, emitted, program, execution, execute_from, executed, npieces, waves, wave_secs) =
+        level1.map_err(|_| "level 1's thread panicked")??;
+    times.planned = planned;
+    times.emitted = emitted;
+    times.pieces = npieces;
+    times.waves_before_base = waves;
+    times.wave_secs_before_base = wave_secs;
+    times.execute_tail = (executed - times.base).max(0.0);
+    let plan = plan_cell.into_inner().ok_or("no plan")?;
+
+    // Every level's build, on the card after the base (the first cut: the
+    // builds beside phase B are a measurement still to make).
+    let first = build_level(program, family, false)?;
+    let mut levels = vec![first];
+    let more = |levels: &[Level]| -> bool {
+        match stop {
+            LevelStop::Levels(n) => levels.len() < n.clamp(1, MAX_LEVELS),
+            LevelStop::Groups(g) => {
+                levels.len() < MAX_LEVELS
+                    && levels.last().expect("a level").build.artifacts.sizes.len() > g
+            }
+        }
+    };
+    while more(&levels) {
+        let child = child_of(&plan, levels.last().expect("a level"));
+        levels.push(build_level(wlfm_leg_program(&child)?, family, false)?);
+    }
+    times.built = now();
+
+    // Level 1: fill and prove; then each level over the one below.
+    let mut proofs: Vec<WlfmProof> = Vec::with_capacity(levels.len());
+    let t = std::time::Instant::now();
+    let filled = super::proof::lfm_fill_executed_under(
+        &levels[0].program,
+        execution,
+        levels[0].build.artifacts.hasher,
+        executed - execute_from,
+        &Vec::new(),
+    );
+    let fill = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    proofs.push(
+        super::wlfm::prove_wlfm_traces_as(&levels[0].build, filled, true, WlfmProving::Streamed)
+            .map_err(|e| format!("level 1: {e}"))?,
+    );
+    times.levels.push(LevelClock {
+        execute_from,
+        executed,
+        fill,
+        prove: t.elapsed().as_secs_f64(),
+        end: now(),
+    });
+    for k in 1..levels.len() {
+        let execute_from = now();
+        let child = child_of(&plan, &levels[k - 1]);
+        let arena = wlfm_leg_arena(&child, &proofs[k - 1])?;
+        let filled = super::wlfm::execute_and_fill_unmerged(
+            &levels[k].program,
+            &[arena],
+            levels[k].build.artifacts.hasher,
+        )?;
+        let executed = now();
+        let t = std::time::Instant::now();
+        proofs.push(
+            super::wlfm::prove_wlfm_traces_as(
+                &levels[k].build,
+                filled,
+                true,
+                WlfmProving::Streamed,
+            )
+            .map_err(|e| format!("level {}: {e}", k + 1))?,
+        );
+        times.levels.push(LevelClock {
+            execute_from,
+            executed,
+            fill: 0.0,
+            prove: t.elapsed().as_secs_f64(),
+            end: now(),
+        });
+    }
+    Ok(LevelsRun {
+        base_proof,
+        plan,
+        levels,
+        proofs,
+        times,
+    })
+}
