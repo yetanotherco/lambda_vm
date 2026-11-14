@@ -666,6 +666,7 @@ fn final_levers(prep: WlfmPrep) -> WlfmLevers {
         final_poly: multilinear::whir_chain::FinalPoly::Vars(6),
         fold: None,
         grind: None,
+        family: crate::lfm::wlfm::WlfmFamily::P1,
     }
 }
 
@@ -812,6 +813,7 @@ fn the_compact_encoding_round_trips_every_wlfm_proof_and_is_smaller() {
                         final_poly,
                         fold: None,
                         grind: None,
+                        family: crate::lfm::wlfm::WlfmFamily::P1,
                     },
                 );
                 let proof = prove(&program, &build);
@@ -931,6 +933,7 @@ fn the_dedup_encoding_round_trips_every_wlfm_proof() {
                     final_poly: FinalPoly::Vars(6),
                     fold: None,
                     grind: None,
+                    family: crate::lfm::wlfm::WlfmFamily::P1,
                 },
                 super::compress::folds_levers(prep),
             ] {

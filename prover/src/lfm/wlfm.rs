@@ -91,6 +91,59 @@ pub type WlfmHash = crate::hash_pin::BlockWhirHash;
 /// The transcript of a W-LFM proof: [`WlfmHash`]'s sponge.
 pub type WlfmTranscript = <WlfmHash as WhirHash>::Sponge;
 
+/// The hash a [`WlfmFamily::B3`] proof commits, transcripts and grinds with:
+/// standard 7-round BLAKE3 ([`multilinear::whir_hash::Blake3Whir`]), the
+/// BLAKE3 base's, so a BLAKE3 base's recursion is one hash end to end.
+pub type WlfmB3Hash = multilinear::whir_hash::Blake3Whir;
+
+/// The hash family of a W-LFM proof: a verifier constant, named by both sides
+/// and folded into the identity and the statement's tag, never read from a
+/// proof.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WlfmFamily {
+    /// [`WlfmHash`]: Poseidon1 at width 16, the block family's. Today's.
+    #[default]
+    P1,
+    /// [`WlfmB3Hash`]: standard 7-round BLAKE3.
+    B3,
+}
+
+impl WlfmFamily {
+    /// The statement's domain tag under this family.
+    pub const fn statement_tag(self) -> &'static [u8] {
+        match self {
+            WlfmFamily::P1 => WLFM_STATEMENT_TAG,
+            WlfmFamily::B3 => WLFM_B3_STATEMENT_TAG,
+        }
+    }
+
+    /// The commitment hash's name, as the identity folds it.
+    pub fn hash_name(self) -> &'static str {
+        match self {
+            WlfmFamily::P1 => <WlfmHash as WhirHash>::NAME,
+            WlfmFamily::B3 => <WlfmB3Hash as WhirHash>::NAME,
+        }
+    }
+}
+
+/// `$body` with `$h` the commitment hash of `$family`.
+macro_rules! with_wlfm_hash {
+    ($family:expr, |$h:ident| $body:expr) => {
+        match $family {
+            WlfmFamily::P1 => {
+                #[allow(non_camel_case_types)]
+                type $h = WlfmHash;
+                $body
+            }
+            WlfmFamily::B3 => {
+                #[allow(non_camel_case_types)]
+                type $h = WlfmB3Hash;
+                $body
+            }
+        }
+    };
+}
+
 /// Stacked polynomials a W-LFM group may take: four, so a doubled leaf (four
 /// polynomials of 2^27) is one group, one chain and one prepared stack. The
 /// base's groups take three (`block_whir::BLOCK_GROUP_POLYS`).
@@ -103,6 +156,9 @@ pub const WLFM_B4_QUERIES: usize = 141;
 
 /// The statement's domain tag.
 pub const WLFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_WHIR_BLOCK_STATEMENT_V1/P1W16";
+
+/// The statement's domain tag under [`WlfmFamily::B3`].
+pub const WLFM_B3_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_WHIR_BLOCK_STATEMENT_V1/B3W";
 
 /// The identity's domain tag.
 const WLFM_PROGRAM_TAG: &[u8] = b"LAMBDAVM_LFM_WHIR_BLOCK_PROGRAM_V1";
@@ -171,6 +227,8 @@ pub struct WlfmLevers {
     /// ([`crate::zf_format::PRODUCTION_WHIR_GRIND_BITS`]). The query count
     /// follows from it by the production rule, so more bits run fewer queries.
     pub grind: Option<u8>,
+    /// The hash family.
+    pub family: WlfmFamily,
 }
 
 impl WlfmLevers {
@@ -180,6 +238,7 @@ impl WlfmLevers {
         final_poly: FinalPoly::Off,
         fold: None,
         grind: None,
+        family: WlfmFamily::P1,
     };
 
     /// Today's format with the instruction columns bound per `prep`.
@@ -189,6 +248,15 @@ impl WlfmLevers {
             final_poly: FinalPoly::Off,
             fold: None,
             grind: None,
+            family: WlfmFamily::P1,
+        }
+    }
+
+    /// Today's format under `family`.
+    pub const fn with_family(family: WlfmFamily) -> Self {
+        Self {
+            family,
+            ..Self::DEFAULT
         }
     }
 }
@@ -308,6 +376,8 @@ pub struct WlfmArtifacts {
     pub fold: Option<u8>,
     /// The query grind's bits when not the format's (folded into `config`).
     pub grind: Option<u8>,
+    /// The hash family the proof commits, transcripts and grinds with.
+    pub family: WlfmFamily,
     /// The lean BLAKE3 tables' chunks ([`super::b3l_tables`]), after the LFM
     /// chips' tables: empty for a program with no `B3l` row, which then has
     /// none of them.
@@ -403,7 +473,59 @@ impl WlfmAirs {
 /// A program's artifacts and the prover's half of its prepared stacks.
 pub struct WlfmBuild {
     pub artifacts: WlfmArtifacts,
-    stacks: Vec<GroupPrepared<WlfmHash>>,
+    stacks: WlfmStacks,
+}
+
+/// The prover's prepared stacks, under the build's family.
+enum WlfmStacks {
+    P1(Vec<GroupPrepared<WlfmHash>>),
+    B3(Vec<GroupPrepared<WlfmB3Hash>>),
+}
+
+impl WlfmStacks {
+    fn empty(family: WlfmFamily) -> Self {
+        match family {
+            WlfmFamily::P1 => WlfmStacks::P1(Vec::new()),
+            WlfmFamily::B3 => WlfmStacks::B3(Vec::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        match self {
+            WlfmStacks::P1(s) => s.clear(),
+            WlfmStacks::B3(s) => s.clear(),
+        }
+    }
+}
+
+/// Every group's prepared commitment under `H`, on the host when `on_host`
+/// (a verifier's build), else where the card is.
+fn commit_under<H: WhirHash>(
+    stacks: Vec<crate::block_whir::GroupStack>,
+    config: &ChainConfig,
+    on_host: bool,
+) -> Result<Vec<GroupPrepared<H>>, String> {
+    if on_host {
+        commit_groups_on_host::<H>(stacks, config).map_err(|e| format!("{e:?}"))
+    } else {
+        // ⛔ THE CARD, as `program_census::build_artifacts_counted` holds it
+        // for a STARK build: the prepared commits run on the device, so
+        // concurrent siblings serialize them. Inert unless a driver armed it.
+        let _card = super::device_permit::hold_labeled("build_artifacts");
+        commit_groups::<H>(stacks, config).map_err(|e| format!("{e:?}"))
+    }
+}
+
+/// What a build keeps of each prepared commitment, under any hash.
+fn stack_of<H: WhirHash>(p: &GroupPrepared<H>) -> WlfmStack {
+    WlfmStack {
+        group: p.group,
+        tables: p.tables.clone(),
+        roots: p.roots.clone(),
+        layout: p.commitment.layout().clone(),
+        domain: p.commitment.domain().clone(),
+    }
 }
 
 #[cfg(test)]
@@ -536,6 +658,7 @@ pub fn build_wlfm_under(
         final_poly,
         fold,
         grind,
+        family,
     } = levers;
     // The mask with `BITWISE` dropped where nothing sends it: the default, as a
     // constant (`for_program_with_hasher` reads it from the environment).
@@ -622,6 +745,7 @@ pub fn build_wlfm_under(
             final_poly,
             fold,
             grind,
+            family,
             b3l,
             stacks: Vec::new(),
             evaluated,
@@ -630,29 +754,18 @@ pub fn build_wlfm_under(
         artifacts.program_id = wlfm_program_id(&artifacts);
         return Ok(WlfmBuild {
             artifacts,
-            stacks: Vec::new(),
+            stacks: WlfmStacks::empty(family),
         });
     }
     let stacks = group_stacks(columns, &group_lists).map_err(|e| format!("{e:?}"))?;
-    // ⛔ THE CARD, as `program_census::build_artifacts_counted` holds it for a
-    // STARK build: the prepared commits run on the device, so concurrent
-    // siblings serialize them. Inert unless a driver armed the permit.
-    let committed = if on_host {
-        commit_groups_on_host::<WlfmHash>(stacks, &config).map_err(|e| format!("{e:?}"))?
-    } else {
-        let _card = super::device_permit::hold_labeled("build_artifacts");
-        commit_groups::<WlfmHash>(stacks, &config).map_err(|e| format!("{e:?}"))?
+    let committed = match family {
+        WlfmFamily::P1 => WlfmStacks::P1(commit_under::<WlfmHash>(stacks, &config, on_host)?),
+        WlfmFamily::B3 => WlfmStacks::B3(commit_under::<WlfmB3Hash>(stacks, &config, on_host)?),
     };
-    let stacks: Vec<WlfmStack> = committed
-        .iter()
-        .map(|p| WlfmStack {
-            group: p.group,
-            tables: p.tables.clone(),
-            roots: p.roots.clone(),
-            layout: p.commitment.layout().clone(),
-            domain: p.commitment.domain().clone(),
-        })
-        .collect();
+    let stacks: Vec<WlfmStack> = match &committed {
+        WlfmStacks::P1(c) => c.iter().map(stack_of).collect(),
+        WlfmStacks::B3(c) => c.iter().map(stack_of).collect(),
+    };
     let plan: Vec<(usize, &[(usize, usize)])> = stacks
         .iter()
         .map(|s| (s.group, s.tables.as_slice()))
@@ -671,6 +784,7 @@ pub fn build_wlfm_under(
         final_poly,
         fold,
         grind,
+        family,
         b3l,
         stacks,
         evaluated: Vec::new(),
@@ -740,7 +854,7 @@ pub fn wlfm_program_id(a: &WlfmArtifacts) -> Commitment {
     h.update(WLFM_PROGRAM_TAG);
     h.update(LFM_MACHINE_VERSION.to_le_bytes());
     h.update([a.hasher.as_tag(), a.chip_set.as_tag()]);
-    h.update(<WlfmHash as WhirHash>::NAME.as_bytes());
+    h.update(a.family.hash_name().as_bytes());
     h.update((a.rate.factor() as u64).to_le_bytes());
     h.update((a.hash_chunks as u64).to_le_bytes());
     h.update((a.table_num_vars.len() as u64).to_le_bytes());
@@ -848,10 +962,19 @@ pub fn word_bytes(word: &LfmWord) -> [u8; 32] {
 /// and the machine version with the word count. The in-guest leg absorbs these
 /// as program constants, call for call.
 pub fn statement_head(program_id: &Commitment, num_words: usize) -> [Vec<u8>; 3] {
+    statement_head_for(WlfmFamily::P1, program_id, num_words)
+}
+
+/// [`statement_head`] under `family`: its tag first.
+pub fn statement_head_for(
+    family: WlfmFamily,
+    program_id: &Commitment,
+    num_words: usize,
+) -> [Vec<u8>; 3] {
     let mut counts = Vec::with_capacity(16);
     counts.extend_from_slice(&u64::from(LFM_MACHINE_VERSION).to_le_bytes());
     counts.extend_from_slice(&(num_words as u64).to_le_bytes());
-    [WLFM_STATEMENT_TAG.to_vec(), program_id.to_vec(), counts]
+    [family.statement_tag().to_vec(), program_id.to_vec(), counts]
 }
 
 /// ★ Binds a W-LFM statement before any root: [`statement_head`]'s calls, then
@@ -863,7 +986,17 @@ pub fn absorb_wlfm_statement(
     program_id: &Commitment,
     public_words: &[(u32, LfmWord)],
 ) {
-    for call in statement_head(program_id, public_words.len()) {
+    absorb_wlfm_statement_for(WlfmFamily::P1, transcript, program_id, public_words)
+}
+
+/// [`absorb_wlfm_statement`] under `family`'s tag.
+pub fn absorb_wlfm_statement_for(
+    family: WlfmFamily,
+    transcript: &mut impl IsTranscript<E>,
+    program_id: &Commitment,
+    public_words: &[(u32, LfmWord)],
+) {
+    for call in statement_head_for(family, program_id, public_words.len()) {
         transcript.append_bytes(&call);
     }
     for (_, word) in public_words {
@@ -884,6 +1017,30 @@ pub(crate) fn prove_wlfm_traces(
     filled: LfmFilled,
     check_prefix: bool,
 ) -> Result<WlfmProof, String> {
+    match &build.stacks {
+        WlfmStacks::P1(stacks) => {
+            prove_traces_under::<WlfmHash>(&build.artifacts, stacks, filled, check_prefix)
+        }
+        WlfmStacks::B3(stacks) => {
+            prove_traces_under::<WlfmB3Hash>(&build.artifacts, stacks, filled, check_prefix)
+        }
+    }
+}
+
+/// [`prove_wlfm_traces`] under the build's hash `H`.
+fn prove_traces_under<H: WhirHash>(
+    artifacts: &WlfmArtifacts,
+    stacks: &[GroupPrepared<H>],
+    filled: LfmFilled,
+    check_prefix: bool,
+) -> Result<WlfmProof, String> {
+    if artifacts.family.hash_name() != H::NAME {
+        return Err(format!(
+            "a {:?} build's stacks under {}",
+            artifacts.family,
+            H::NAME
+        ));
+    }
     let mut filled = filled;
     let mut b3l = filled.take_b3l();
     let (mut traces, public_words, hasher, execute_secs, fill_secs, exec_split) =
@@ -891,7 +1048,6 @@ pub(crate) fn prove_wlfm_traces(
     // Every chip its own table: a set filled under the process's merge is
     // split back (a copy; [`execute_and_fill_unmerged`] fills it so).
     traces.merge_to(&Vec::new())?;
-    let artifacts = &build.artifacts;
     if hasher != artifacts.hasher {
         return Err(format!(
             "the traces were filled for {hasher:?} and the artifacts built for {:?}",
@@ -911,7 +1067,7 @@ pub(crate) fn prove_wlfm_traces(
     }
     // Where each table's prefix sits among the prover's stacks' columns.
     let mut prefix_of: Vec<Option<(usize, usize, usize)>> = vec![None; shapes.len()];
-    for (s, stack) in build.stacks.iter().enumerate() {
+    for (s, stack) in stacks.iter().enumerate() {
         let mut at = 0usize;
         for &(table, n) in &stack.tables {
             prefix_of[table] = Some((s, at, n));
@@ -930,10 +1086,7 @@ pub(crate) fn prove_wlfm_traces(
         }
         let mut columns = trace.columns_main();
         if check_prefix && let Some((s, at, n)) = prefix_of[t] {
-            for (column, pinned) in columns[..n]
-                .iter()
-                .zip(&build.stacks[s].columns[at..at + n])
-            {
+            for (column, pinned) in columns[..n].iter().zip(&stacks[s].columns[at..at + n]) {
                 if column.as_slice() != pinned.evals() {
                     return Err(format!(
                         "{}: a preprocessed column is not the program's",
@@ -965,9 +1118,14 @@ pub(crate) fn prove_wlfm_traces(
     // holds around `multi_prove`. Taken after the host prep above.
     let _card = super::device_permit::hold_labeled("multi_prove");
     let config = &artifacts.config;
-    let mut transcript = <WlfmHash as WhirHash>::sponge();
-    absorb_wlfm_statement(&mut transcript, &artifacts.program_id, &public_words);
-    let block = BlockCommitted::commit::<WlfmHash, WlfmTranscript>(
+    let mut transcript = H::sponge();
+    absorb_wlfm_statement_for(
+        artifacts.family,
+        &mut transcript,
+        &artifacts.program_id,
+        &public_words,
+    );
+    let block = BlockCommitted::commit::<H, H::Sponge>(
         tables,
         &artifacts.sizes,
         config,
@@ -976,13 +1134,11 @@ pub(crate) fn prove_wlfm_traces(
         false,
     )
     .map_err(|e| format!("{e:?}"))?;
-    let borrowed: Vec<Vec<&multilinear::mle::Mle<F>>> = build
-        .stacks
+    let borrowed: Vec<Vec<&multilinear::mle::Mle<F>>> = stacks
         .iter()
         .map(|p| multilinear::stacking::borrow(&p.columns))
         .collect();
-    let openings: Vec<BlockPrepared<'_, F, WlfmHash>> = build
-        .stacks
+    let openings: Vec<BlockPrepared<'_, F, H>> = stacks
         .iter()
         .zip(&borrowed)
         .map(|(p, columns)| BlockPrepared {
@@ -993,7 +1149,7 @@ pub(crate) fn prove_wlfm_traces(
         })
         .collect();
     let (proof, argues, prepared, _stamps, commit_ood) =
-        multilinear_block::block_prove_on_forks::<F, E, WlfmTranscript, WlfmHash>(
+        multilinear_block::block_prove_on_forks::<F, E, H::Sponge, H>(
             block,
             config,
             &mut transcript,
@@ -1185,8 +1341,43 @@ pub(crate) fn verify_wlfm_with(
         })
         .collect();
     let derived = artifacts.derived_roots();
-    let mut transcript = <WlfmHash as WhirHash>::sponge();
-    absorb_wlfm_statement(&mut transcript, &artifacts.program_id, claimed);
+    with_wlfm_hash!(artifacts.family, |H| verify_block_under::<H>(
+        artifacts,
+        proof,
+        claimed,
+        &derived,
+        &checks_of,
+        &statements,
+        &layouts,
+        &domains,
+        skip_prepared,
+        checks,
+    ))
+}
+
+/// [`verify_wlfm_with`]'s block check under the family's hash `H`: the
+/// statement under its tag, the balance the claimed words owe, then the block
+/// verifier.
+#[allow(clippy::too_many_arguments)]
+fn verify_block_under<H: WhirHash>(
+    artifacts: &WlfmArtifacts,
+    proof: &WlfmProof,
+    claimed: &[(u32, LfmWord)],
+    derived: &[Commitment],
+    checks_of: &[BlockPreparedCheck<'_, F>],
+    statements: &[TableStatement<'_, F, E>],
+    layouts: &[StackedLayout],
+    domains: &[Domain<F>],
+    skip_prepared: bool,
+    checks: VerifierChecks,
+) -> Result<(), String> {
+    let mut transcript = H::sponge();
+    absorb_wlfm_statement_for(
+        artifacts.family,
+        &mut transcript,
+        &artifacts.program_id,
+        claimed,
+    );
     // What the tables owe: the `LfmPublic` balance of the claimed words, at the
     // challenges `block_verify_with` is about to draw — the roots block replayed
     // on a fork by the same function, answers and all.
@@ -1194,22 +1385,22 @@ pub(crate) fn verify_wlfm_with(
     multilinear_block::absorb_roots_and_answers::<E, _>(
         &mut probe,
         &proof.proof.roots,
-        &derived,
+        derived,
         &proof.commit_ood,
     );
     let z: FieldElement<E> = probe.sample_field_element();
     let alpha: FieldElement<E> = probe.sample_field_element();
     let expected = super::proof::expected_public_balance(claimed, &z, &alpha)
         .ok_or("a public word's fingerprint is zero")?;
-    multilinear_block::block_verify_with::<F, E, WlfmTranscript, WlfmHash>(
+    multilinear_block::block_verify_with::<F, E, H::Sponge, H>(
         &proof.proof,
         &proof.commit_ood,
         &proof.argues,
         &proof.prepared,
-        &checks_of,
-        &statements,
-        &layouts,
-        &domains,
+        checks_of,
+        statements,
+        layouts,
+        domains,
         &artifacts.sizes,
         &expected,
         &artifacts.config,
