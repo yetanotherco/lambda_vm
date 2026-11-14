@@ -817,18 +817,18 @@ pub fn create_cpu_air_inrow(
     )
 }
 
-/// The REGX AIR (`tables::regx`), the in-row register format's table of the
+/// The residual register table's AIR (`tables::register_residual`), the in-row register format's table of the
 /// register accesses a CPU row does not check and of keep-alives.
-pub fn create_regx_air(
+pub fn create_register_residual_air(
     proof_options: &ProofOptions,
-) -> ConcreteVmAir<crate::tables::regx::RegxConstraints> {
+) -> ConcreteVmAir<crate::tables::register_residual::ResidualConstraints> {
     build_air(
-        crate::tables::regx::cols::NUM_COLUMNS,
-        crate::tables::regx::bus_interactions(),
+        crate::tables::register_residual::cols::NUM_COLUMNS,
+        crate::tables::register_residual::bus_interactions(),
         proof_options,
         1,
-        crate::tables::regx::RegxConstraints,
-        "REGX",
+        crate::tables::register_residual::ResidualConstraints,
+        "MEMW_R~residual",
     )
 }
 

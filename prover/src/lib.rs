@@ -968,7 +968,7 @@ pub(crate) fn block_airs(
 impl VmAirs {
     /// The in-row register format's four families in place of today's
     /// (`tables::register::RegisterFormat::InRow`): CPU at its 42 columns and
-    /// in-row interactions, REGX in MEMW_R's slot (the same names and counts:
+    /// in-row interactions, the residual register table in MEMW_R's slot (the same names and counts:
     /// the block's routes and its statement read them), REGISTER a register a
     /// row, HALT with its PC bridge on the REG bus.
     pub(crate) fn swap_in_row_registers(&mut self, opts: &ProofOptions, inputs: &BlockAirInputs) {
@@ -993,7 +993,8 @@ impl VmAirs {
         self.memw_registers = (0..self.memw_registers.len())
             .map(|i| {
                 Box::new(
-                    crate::test_utils::create_regx_air(opts).with_name(&format!("MEMW_R[{i}]")),
+                    crate::test_utils::create_register_residual_air(opts)
+                        .with_name(&format!("MEMW_R[{i}]")),
                 ) as VmAir
             })
             .collect();

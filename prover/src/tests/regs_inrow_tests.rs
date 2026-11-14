@@ -1,15 +1,15 @@
 //! The in-row register format (`tables::register::RegisterFormat::InRow`):
-//! its AIRs' shapes, the verifier's cap on REGX's rows, and blocks proved and
+//! its AIRs' shapes, the verifier's cap on the residual table's rows, and blocks proved and
 //! verified under it (the proving tests run where a block can be proved: the
 //! box's lib run and CI). The inner buses' balance on the builders' traces is
 //! `tables::trace_builder::bus_net_tests`'.
 
 use crate::block_whir::{
-    self, BlockFormat, Deviations, check_regx_rows, prove_block_whir_with, verify_block_whir,
+    self, BlockFormat, Deviations, check_residual_rows, prove_block_whir_with, verify_block_whir,
 };
 use crate::tables::register::RegisterFormat;
 use crate::tables::types::BusId;
-use crate::tables::{MaxRowsConfig, cpu, halt, regx};
+use crate::tables::{MaxRowsConfig, cpu, halt, register_residual};
 use crate::test_utils::asm_elf_bytes;
 use multilinear::whir_chain::GkrPack;
 use stark::lookup::BusInteraction;
@@ -59,12 +59,12 @@ fn the_in_row_cpu_row_takes_todays_gkr_slots_and_reads_its_columns() {
 }
 
 #[test]
-fn regx_halt_and_register_take_the_reg_bus() {
+fn the_residual_table_halt_and_register_take_the_reg_bus() {
     let reg = u64::from(BusId::Reg);
-    let regx = regx::bus_interactions();
-    assert_eq!(regx.len(), 6);
-    assert_eq!(slots(&regx, 21), 8);
-    assert_eq!(regx.iter().filter(|i| i.bus_id == reg).count(), 2);
+    let residual = register_residual::bus_interactions();
+    assert_eq!(residual.len(), 6);
+    assert_eq!(slots(&residual, 21), 8);
+    assert_eq!(residual.iter().filter(|i| i.bus_id == reg).count(), 2);
     let halt = halt::bus_interactions_inrow();
     assert_eq!(halt.len(), 1 + 31 + 2);
     assert_eq!(halt.iter().filter(|i| i.bus_id == reg).count(), 2);
@@ -80,15 +80,15 @@ fn regx_halt_and_register_take_the_reg_bus() {
     assert!(columns.iter().all(|c| c.len() == 64));
 }
 
-/// The verifier refuses a statement whose REGX tables hold more than
-/// `regx::MAX_ROWS_TOTAL` rows, and takes one at the cap.
+/// The verifier refuses a statement whose residual register tables hold more than
+/// `register_residual::MAX_ROWS_TOTAL` rows, and takes one at the cap.
 #[test]
-fn the_verifier_caps_regx_rows() {
-    assert_eq!(regx::MAX_ROWS_TOTAL, 1 << 28);
-    assert!(check_regx_rows(std::iter::repeat_n(21u8, 128)).is_ok());
-    assert!(check_regx_rows(std::iter::repeat_n(21u8, 129)).is_err());
-    assert!(check_regx_rows([28u8]).is_ok());
-    assert!(check_regx_rows([28u8, 2]).is_err());
+fn the_verifier_caps_the_residual_tables_rows() {
+    assert_eq!(register_residual::MAX_ROWS_TOTAL, 1 << 28);
+    assert!(check_residual_rows(std::iter::repeat_n(21u8, 128)).is_ok());
+    assert!(check_residual_rows(std::iter::repeat_n(21u8, 129)).is_err());
+    assert!(check_residual_rows([28u8]).is_ok());
+    assert!(check_residual_rows([28u8, 2]).is_err());
 }
 
 /// The production format under the in-row register format.
@@ -118,7 +118,7 @@ fn verifies(proof: &block_whir::BlockWhirProof, elf: &[u8], format: &BlockFormat
 }
 
 /// Blocks proved under the in-row register format verify: every instruction,
-/// KECCAK's chips (register reads through REGX), the commit syscall (x254),
+/// KECCAK's chips (register reads through the residual register table), the commit syscall (x254),
 /// and registers idle past a CPU slot's reach (keep-alives).
 #[test]
 fn an_in_row_block_proves_and_verifies() {

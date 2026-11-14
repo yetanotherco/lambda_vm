@@ -617,7 +617,7 @@ pub enum RegisterFormat {
     Tokens32,
     /// A CPU row checks its own `rs1`, `rs2` and `rd` accesses and its PC on
     /// the [`BusId::Reg`] bus, one 64-bit token an access (`tables::cpu`'s
-    /// in-row interactions); REGX (`tables::regx`) takes every other register
+    /// in-row interactions); the residual register table (`tables::register_residual`) takes every other register
     /// access and the keep-alives; REGISTER closes the tokens a register a row
     /// ([`inrow`]); HALT bridges the PC on the same bus.
     InRow,

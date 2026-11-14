@@ -307,7 +307,7 @@ pub struct BlockFormat {
     /// word tokens through MEMW_R
     /// ([`Tokens32`](crate::tables::register::RegisterFormat::Tokens32), the
     /// production constant), or in the CPU row on one 64-bit token an access,
-    /// REGX taking the rest
+    /// the residual register table taking the rest
     /// ([`InRow`](crate::tables::register::RegisterFormat::InRow), a variant a
     /// caller names). The CPU, MEMW_R's slot, REGISTER and HALT, so their
     /// buses and the block's tables, follow it.
@@ -3001,21 +3001,23 @@ pub(crate) fn check_chunked_heights(
     Ok(())
 }
 
-/// Under the in-row register format MEMW_R's slot holds REGX's tables, whose
-/// rows the verifier caps ([`crate::tables::regx::MAX_ROWS_TOTAL`]): a
+/// Under the in-row register format MEMW_R's slot holds the residual register tables, whose
+/// rows the verifier caps ([`crate::tables::register_residual::MAX_ROWS_TOTAL`]): a
 /// keep-alive has no requester, so without the cap a statement could state
 /// enough of them to carry a register's clock past the field.
-/// `regx_num_vars` are REGX's tables' heights in variables, as the statement
+/// `residual_num_vars` are the residual tables' heights in variables, as the statement
 /// states them.
-pub(crate) fn check_regx_rows(regx_num_vars: impl IntoIterator<Item = u8>) -> Result<(), Error> {
-    let rows: u128 = regx_num_vars
+pub(crate) fn check_residual_rows(
+    residual_num_vars: impl IntoIterator<Item = u8>,
+) -> Result<(), Error> {
+    let rows: u128 = residual_num_vars
         .into_iter()
         .map(|num_vars| 1u128 << num_vars.min(127))
         .sum();
-    if rows > u128::from(crate::tables::regx::MAX_ROWS_TOTAL) {
+    if rows > u128::from(crate::tables::register_residual::MAX_ROWS_TOTAL) {
         return Err(Error::InvalidTableCounts(format!(
-            "REGX states {rows} rows — a block takes at most {}",
-            crate::tables::regx::MAX_ROWS_TOTAL
+            "the residual register table states {rows} rows — a block takes at most {}",
+            crate::tables::register_residual::MAX_ROWS_TOTAL
         )));
     }
     Ok(())
@@ -6328,7 +6330,7 @@ fn prove_streamed(
             }
         };
         // Under the in-row register format the host fills the CPU chunks
-        // (their side records are not a card fill yet) and REGX's (MEMW_R's
+        // (their side records are not a card fill yet) and the residual table's (MEMW_R's
         // kernel fills MEMW_R's columns).
         if format.registers == crate::tables::register::RegisterFormat::InRow {
             card_fill.cpu = false;
@@ -8184,10 +8186,10 @@ pub(crate) fn block_frame(
             air_refs.len(),
         )));
     }
-    // Under the in-row register format MEMW_R's slot holds REGX's tables,
+    // Under the in-row register format MEMW_R's slot holds the residual register tables,
     // their rows capped.
     if format.registers == crate::tables::register::RegisterFormat::InRow {
-        check_regx_rows(
+        check_residual_rows(
             air_refs
                 .iter()
                 .zip(statement.table_num_vars)
