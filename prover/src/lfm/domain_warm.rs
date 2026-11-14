@@ -85,14 +85,35 @@ pub(crate) fn warm(traces: &LfmTraces, options: &ProofOptions) -> usize {
     built
 }
 
-/// `W3_NODE_DOMAINS_EARLY` (default off), set by the tree at its start: a node
+/// `W3_NODE_DOMAINS_EARLY` (default on), set by the tree at its start: a node
 /// program's lengths are warmed as soon as it is emitted ([`warm_lengths`] on
 /// a thread of its own), instead of at its prove's start.
 static NODES_EARLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The lengths the nodes' early warm-ups built this tree.
+static NODES_EARLY_BUILT: AtomicU64 = AtomicU64::new(0);
+
 /// Sets `W3_NODE_DOMAINS_EARLY` for the tree that starts now.
 pub(crate) fn set_nodes_early(on: bool) {
     NODES_EARLY.store(on, Ordering::Relaxed);
+    NODES_EARLY_BUILT.store(0, Ordering::Relaxed);
+}
+
+/// Counts what a node's early warm-up built.
+pub(crate) fn note_nodes_early_built(built: usize) {
+    NODES_EARLY_BUILT.fetch_add(built as u64, Ordering::Relaxed);
+}
+
+/// The tree's `W3 NODE DOMAINS` line: where the nodes' lengths were warmed.
+pub(crate) fn nodes_line() -> String {
+    if nodes_early() {
+        format!(
+            "warmed as each node program is emitted · {} lengths built early",
+            NODES_EARLY_BUILT.load(Ordering::Relaxed)
+        )
+    } else {
+        "at each prove's start (W3_NODE_DOMAINS_EARLY=0)".to_string()
+    }
 }
 
 /// Whether node programs warm their lengths when emitted.
