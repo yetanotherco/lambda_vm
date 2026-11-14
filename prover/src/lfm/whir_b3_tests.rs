@@ -27,8 +27,29 @@ use super::word::{LfmWord, ext_word, word_as_ext};
 
 type HostTranscript = DefaultTranscript<GoldilocksExtension, Blake3StdTranscriptHash>;
 
+std::thread_local! {
+    /// Whether this thread's programs take the lean tables' rows
+    /// ([`LfmBuilder::with_b3_lean`]): each gate runs under both lowerings.
+    static LEAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` once under each lowering — `LFM_BLAKE3`'s rows, then the lean
+/// tables' — with the lowering's name: the digests and every refusal must not
+/// depend on which chip proves a compression.
+fn under_both(mut f: impl FnMut(&str)) {
+    for lean in [false, true] {
+        LEAN.with(|c| c.set(lean));
+        let name = if lean { "lean" } else { "LFM_BLAKE3" };
+        println!("lowering: {name}");
+        f(name);
+    }
+    LEAN.with(|c| c.set(false));
+}
+
 fn builder() -> LfmBuilder {
-    LfmBuilder::new().with_wrap_hash(WrapHash::Blake3)
+    LfmBuilder::new()
+        .with_wrap_hash(WrapHash::Blake3)
+        .with_b3_lean(LEAN.with(std::cell::Cell::get))
 }
 
 fn run_program(program: &LfmProgram, arenas: &[Vec<LfmWord>]) -> Vec<LfmWord> {
@@ -69,19 +90,32 @@ fn publish_digest(b: &mut LfmBuilder, d: WrapDigest) {
     }
 }
 
-/// Instructions of each hash kind a program emits: (BLAKE3 rows, other hash
-/// rows). The BLAKE3 arm must emit no felt-sponge row at all.
+/// Instructions of each hash kind a program emits: (BLAKE3 rows of this
+/// thread's lowering, every other hash row). The BLAKE3 arm emits no
+/// felt-sponge row, and one lowering's rows only.
 fn hash_rows(program: &LfmProgram) -> (usize, usize) {
-    let blake3 = program
-        .instrs
-        .iter()
-        .filter(|i| matches!(i, Instr::Blake3(_)))
-        .count();
+    let lean = LEAN.with(std::cell::Cell::get);
+    let ours = |i: &&Instr| match i {
+        Instr::Blake3(_) => !lean,
+        Instr::B3l(_) => lean,
+        _ => false,
+    };
+    let blake3 = program.instrs.iter().filter(ours).count();
     let other = program
         .instrs
         .iter()
-        .filter(|i| matches!(i, Instr::Hash { .. } | Instr::Hash16(_) | Instr::KeccakF(_)))
-        .count();
+        .filter(|i| {
+            matches!(
+                i,
+                Instr::Hash { .. }
+                    | Instr::Hash16(_)
+                    | Instr::KeccakF(_)
+                    | Instr::Blake3(_)
+                    | Instr::B3l(_)
+            )
+        })
+        .count()
+        - blake3;
     (blake3, other)
 }
 
@@ -201,17 +235,19 @@ fn observe(script: &Script, emitted: &Emitted) -> Observed {
 /// wrong reversal, a missing re-absorb or a misplaced byte moves it.
 #[test]
 fn the_blake3_arm_replays_the_blake3_std_transcript() {
-    for script in super::whir_transcript_kat_tests::scripts() {
-        let emitted = emit_script(script);
-        let machine = observe(script, &emitted);
-        let host = run_with::<Blake3StdTranscriptHash>(script);
-        assert_eq!(machine.ext, host.ext, "{}: challenges", script.name);
-        assert_eq!(machine.u64s, host.u64s, "{}: bounded draws", script.name);
-        assert_eq!(machine.state, host.state, "{}: state", script.name);
-        let (blake3, other) = hash_rows(&emitted.program);
-        assert!(blake3 > 0, "{}: the arm hashes with BLAKE3", script.name);
-        assert_eq!(other, 0, "{}: and with nothing else", script.name);
-    }
+    under_both(|_lowering| {
+        for script in super::whir_transcript_kat_tests::scripts() {
+            let emitted = emit_script(script);
+            let machine = observe(script, &emitted);
+            let host = run_with::<Blake3StdTranscriptHash>(script);
+            assert_eq!(machine.ext, host.ext, "{}: challenges", script.name);
+            assert_eq!(machine.u64s, host.u64s, "{}: bounded draws", script.name);
+            assert_eq!(machine.state, host.state, "{}: state", script.name);
+            let (blake3, other) = hash_rows(&emitted.program);
+            assert!(blake3 > 0, "{}: the arm hashes with BLAKE3", script.name);
+            assert_eq!(other, 0, "{}: and with nothing else", script.name);
+        }
+    });
 }
 
 /// The scripts' host vectors under BLAKE3 are not RPX's: a replay that fell
@@ -231,103 +267,107 @@ fn the_blake3_and_rpx_transcripts_differ_on_every_script() {
 /// `append_bytes(root)`, `append_field_element`, `append_bytes(nonce_be)`.
 #[test]
 fn roots_values_and_nonces_enter_as_the_host_absorbs_them() {
-    let root: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(5));
-    let root2: [u8; 32] = core::array::from_fn(|i| 0xFF - (i as u8).wrapping_mul(11));
-    let value = ext_from(0xABCD_EF01);
-    // A nonce whose two halves differ in every byte: a swapped half or a
-    // little-endian render moves the stream.
-    let nonce = 0x0123_4567_89AB_CDEFu64;
+    under_both(|_lowering| {
+        let root: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(5));
+        let root2: [u8; 32] = core::array::from_fn(|i| 0xFF - (i as u8).wrapping_mul(11));
+        let value = ext_from(0xABCD_EF01);
+        // A nonce whose two halves differ in every byte: a swapped half or a
+        // little-endian render moves the stream.
+        let nonce = 0x0123_4567_89AB_CDEFu64;
 
-    let mut host = HostTranscript::new(&[]);
-    host.append_bytes(b"lead");
-    host.append_bytes(&root);
-    let h0 = host.sample_field_element();
-    host.append_field_element(&value);
-    host.append_bytes(&nonce.to_be_bytes());
-    let h1 = host.sample_field_element();
-    let hq = host.sample_u64(1 << 21);
-    host.append_bytes(&root2);
-    let h2 = host.sample_field_element();
-    let hstate = host.state();
+        let mut host = HostTranscript::new(&[]);
+        host.append_bytes(b"lead");
+        host.append_bytes(&root);
+        let h0 = host.sample_field_element();
+        host.append_field_element(&value);
+        host.append_bytes(&nonce.to_be_bytes());
+        let h1 = host.sample_field_element();
+        let hq = host.sample_u64(1 << 21);
+        host.append_bytes(&root2);
+        let h2 = host.sample_field_element();
+        let hstate = host.state();
 
-    let mut b = builder();
-    let arena = b.declare_arena(6);
-    let r0 = b.hint_word(arena, 0);
-    let r1 = b.hint_word(arena, 1);
-    let v = b.hint_word(arena, 2).as_ext();
-    let n = b.hint_felt(arena, 3);
-    let s0 = b.hint_word(arena, 4);
-    let s1 = b.hint_word(arena, 5);
-    let mut t = WhirTranscript::for_builder(&mut b);
-    t.absorb_const_bytes(b"lead");
-    t.absorb_root(&mut b, WrapDigest::from_pair(r0, r1));
-    let m0 = t.sample_ext(&mut b);
-    t.absorb_ext(&mut b, v);
-    t.absorb_nonce(&mut b, n);
-    let m1 = t.sample_ext(&mut b);
-    let mq = t.sample_u64_pow2(&mut b, 21);
-    let lanes = [b.unpack(s0), b.unpack(s1)];
-    t.absorb_digest_lanes(&mut b, &lanes);
-    let m2 = t.sample_ext(&mut b);
-    let mstate = t.state_digest(&mut b);
-    for e in [m0, m1, m2] {
-        b.public(e.as_cell());
-    }
-    for bit in &mq {
-        b.public(bit.as_cell());
-    }
-    publish_digest(&mut b, mstate);
-    let program = compile(b.finish());
-    validate(&program).expect("admissible");
-
-    let [w0, w1] = digest_words(&root);
-    let [w2, w3] = digest_words(&root2);
-    let arena_words = vec![
-        w0,
-        w1,
-        ext_word(&value),
-        [FE::from(nonce), FE::zero(), FE::zero(), FE::zero()],
-        w2,
-        w3,
-    ];
-    let words = run_program(&program, &[arena_words]);
-    let got: Vec<FEE> = (0..3)
-        .map(|i| word_as_ext(&words[i]).expect("ext"))
-        .collect();
-    assert_eq!(got, vec![h0, h1, h2], "the challenges after each absorb");
-    let mut q = 0u64;
-    for bit in 0..21 {
-        if words[3 + bit][0] == FE::one() {
-            q |= 1 << bit;
+        let mut b = builder();
+        let arena = b.declare_arena(6);
+        let r0 = b.hint_word(arena, 0);
+        let r1 = b.hint_word(arena, 1);
+        let v = b.hint_word(arena, 2).as_ext();
+        let n = b.hint_felt(arena, 3);
+        let s0 = b.hint_word(arena, 4);
+        let s1 = b.hint_word(arena, 5);
+        let mut t = WhirTranscript::for_builder(&mut b);
+        t.absorb_const_bytes(b"lead");
+        t.absorb_root(&mut b, WrapDigest::from_pair(r0, r1));
+        let m0 = t.sample_ext(&mut b);
+        t.absorb_ext(&mut b, v);
+        t.absorb_nonce(&mut b, n);
+        let m1 = t.sample_ext(&mut b);
+        let mq = t.sample_u64_pow2(&mut b, 21);
+        let lanes = [b.unpack(s0), b.unpack(s1)];
+        t.absorb_digest_lanes(&mut b, &lanes);
+        let m2 = t.sample_ext(&mut b);
+        let mstate = t.state_digest(&mut b);
+        for e in [m0, m1, m2] {
+            b.public(e.as_cell());
         }
-    }
-    assert_eq!(q, hq, "the bounded draw");
-    assert_eq!(digest_bytes(&words[24..26]), hstate, "the state");
+        for bit in &mq {
+            b.public(bit.as_cell());
+        }
+        publish_digest(&mut b, mstate);
+        let program = compile(b.finish());
+        validate(&program).expect("admissible");
+
+        let [w0, w1] = digest_words(&root);
+        let [w2, w3] = digest_words(&root2);
+        let arena_words = vec![
+            w0,
+            w1,
+            ext_word(&value),
+            [FE::from(nonce), FE::zero(), FE::zero(), FE::zero()],
+            w2,
+            w3,
+        ];
+        let words = run_program(&program, &[arena_words]);
+        let got: Vec<FEE> = (0..3)
+            .map(|i| word_as_ext(&words[i]).expect("ext"))
+            .collect();
+        assert_eq!(got, vec![h0, h1, h2], "the challenges after each absorb");
+        let mut q = 0u64;
+        for bit in 0..21 {
+            if words[3 + bit][0] == FE::one() {
+                q |= 1 << bit;
+            }
+        }
+        assert_eq!(q, hq, "the bounded draw");
+        assert_eq!(digest_bytes(&words[24..26]), hstate, "the state");
+    });
 }
 
 /// A root whose two hinted words are swapped is a different 32 bytes: the
 /// challenge after it moves. (The words are the digest's byte order, not a set.)
 #[test]
 fn a_root_absorbed_with_its_words_swapped_moves_the_challenge() {
-    let root: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(3));
-    let mut host = HostTranscript::new(&[]);
-    host.append_bytes(&root);
-    let want = host.sample_field_element();
+    under_both(|_lowering| {
+        let root: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(3));
+        let mut host = HostTranscript::new(&[]);
+        host.append_bytes(&root);
+        let want = host.sample_field_element();
 
-    let mut b = builder();
-    let arena = b.declare_arena(2);
-    let r0 = b.hint_word(arena, 0);
-    let r1 = b.hint_word(arena, 1);
-    let mut t = WhirTranscript::for_builder(&mut b);
-    t.absorb_root(&mut b, WrapDigest::from_pair(r0, r1));
-    let e = t.sample_ext(&mut b);
-    b.public(e.as_cell());
-    let program = compile(b.finish());
-    let [w0, w1] = digest_words(&root);
-    let honest = run_program(&program, &[vec![w0, w1]]);
-    assert_eq!(word_as_ext(&honest[0]), Some(want));
-    let swapped = run_program(&program, &[vec![w1, w0]]);
-    assert_ne!(word_as_ext(&swapped[0]), Some(want));
+        let mut b = builder();
+        let arena = b.declare_arena(2);
+        let r0 = b.hint_word(arena, 0);
+        let r1 = b.hint_word(arena, 1);
+        let mut t = WhirTranscript::for_builder(&mut b);
+        t.absorb_root(&mut b, WrapDigest::from_pair(r0, r1));
+        let e = t.sample_ext(&mut b);
+        b.public(e.as_cell());
+        let program = compile(b.finish());
+        let [w0, w1] = digest_words(&root);
+        let honest = run_program(&program, &[vec![w0, w1]]);
+        assert_eq!(word_as_ext(&honest[0]), Some(want));
+        let swapped = run_program(&program, &[vec![w1, w0]]);
+        assert_ne!(word_as_ext(&swapped[0]), Some(want));
+    });
 }
 
 /// A constant run that ends off a 4-byte boundary (a statement's odd-length
@@ -335,39 +375,49 @@ fn a_root_absorbed_with_its_words_swapped_moves_the_challenge() {
 /// segment is spliced and the stream is the host's.
 #[test]
 fn a_runtime_value_after_an_odd_constant_run_is_the_hosts_stream() {
-    let root: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(41).wrapping_add(9));
-    let value = ext_from(0x5151_7272);
-    for lead in [1usize, 2, 3, 5, 7] {
-        let prefix = bytes_from(0x33, lead);
-        let mut host = HostTranscript::new(&[]);
-        host.append_bytes(&prefix);
-        host.append_bytes(&root);
-        host.append_bytes(&prefix[..1]);
-        host.append_field_element(&value);
-        let want = host.sample_field_element();
-        let want_state = host.state();
+    under_both(|_lowering| {
+        let root: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(41).wrapping_add(9));
+        let value = ext_from(0x5151_7272);
+        for lead in [1usize, 2, 3, 5, 7] {
+            let prefix = bytes_from(0x33, lead);
+            let mut host = HostTranscript::new(&[]);
+            host.append_bytes(&prefix);
+            host.append_bytes(&root);
+            host.append_bytes(&prefix[..1]);
+            host.append_field_element(&value);
+            let want = host.sample_field_element();
+            let want_state = host.state();
 
-        let mut b = builder();
-        let arena = b.declare_arena(3);
-        let r0 = b.hint_word(arena, 0);
-        let r1 = b.hint_word(arena, 1);
-        let v = b.hint_word(arena, 2).as_ext();
-        let mut t = WhirTranscript::for_builder(&mut b);
-        t.absorb_const_bytes(&prefix);
-        t.absorb_root(&mut b, WrapDigest::from_pair(r0, r1));
-        t.absorb_const_bytes(&prefix[..1]);
-        t.absorb_ext(&mut b, v);
-        let e = t.sample_ext(&mut b);
-        let st = t.state_digest(&mut b);
-        b.public(e.as_cell());
-        publish_digest(&mut b, st);
-        let program = compile(b.finish());
-        validate(&program).expect("admissible");
-        let [w0, w1] = digest_words(&root);
-        let out = run_program(&program, &[vec![w0, w1, ext_word(&value)]]);
-        assert_eq!(word_as_ext(&out[0]), Some(want), "{lead} lead bytes: the draw");
-        assert_eq!(digest_bytes(&out[1..3]), want_state, "{lead} lead bytes: the state");
-    }
+            let mut b = builder();
+            let arena = b.declare_arena(3);
+            let r0 = b.hint_word(arena, 0);
+            let r1 = b.hint_word(arena, 1);
+            let v = b.hint_word(arena, 2).as_ext();
+            let mut t = WhirTranscript::for_builder(&mut b);
+            t.absorb_const_bytes(&prefix);
+            t.absorb_root(&mut b, WrapDigest::from_pair(r0, r1));
+            t.absorb_const_bytes(&prefix[..1]);
+            t.absorb_ext(&mut b, v);
+            let e = t.sample_ext(&mut b);
+            let st = t.state_digest(&mut b);
+            b.public(e.as_cell());
+            publish_digest(&mut b, st);
+            let program = compile(b.finish());
+            validate(&program).expect("admissible");
+            let [w0, w1] = digest_words(&root);
+            let out = run_program(&program, &[vec![w0, w1, ext_word(&value)]]);
+            assert_eq!(
+                word_as_ext(&out[0]),
+                Some(want),
+                "{lead} lead bytes: the draw"
+            );
+            assert_eq!(
+                digest_bytes(&out[1..3]),
+                want_state,
+                "{lead} lead bytes: the state"
+            );
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -399,113 +449,119 @@ fn grind_program(seed_felts: usize, bits: u8) -> LfmProgram {
 /// `is_valid_nonce::<Blake3Std>` rejects.
 #[test]
 fn the_blake3_grind_accepts_what_the_host_accepts_and_refuses_the_rest() {
-    let seed_felts = 5usize;
-    let values: Vec<FE> = (0..seed_felts)
-        .map(|i| FE::from(0xFFFF_FFFF_0000_0000u64 - 977 * i as u64))
-        .collect();
-    for bits in [1u8, 7, 8, 13] {
-        let mut host = HostTranscript::new(&[]);
-        for value in &values {
-            host.append_bytes(&value.canonical().to_be_bytes());
-        }
-        let seed = host.state();
-        let nonce = crypto::grinding::generate_nonce_smallest::<Blake3Std>(&seed, bits)
-            .expect("a nonce exists at these factors");
-        assert!(crypto::grinding::is_valid_nonce::<Blake3Std>(
-            &seed, nonce, bits
-        ));
-
-        let program = grind_program(seed_felts, bits);
-        let (blake3, other) = hash_rows(&program);
-        assert!(blake3 > 0);
-        assert_eq!(other, 0, "the grind hashes with BLAKE3 alone");
-        let mut arena: Vec<LfmWord> = values
-            .iter()
-            .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
+    under_both(|_lowering| {
+        let seed_felts = 5usize;
+        let values: Vec<FE> = (0..seed_felts)
+            .map(|i| FE::from(0xFFFF_FFFF_0000_0000u64 - 977 * i as u64))
             .collect();
-        arena.push([FE::from(nonce), FE::zero(), FE::zero(), FE::zero()]);
-        let words = run_program(&program, &[arena.clone()]);
-        host.append_bytes(&nonce.to_be_bytes());
-        assert_eq!(
-            digest_bytes(&words[..2]),
-            host.state(),
-            "{bits} bits: after the grind the machine's transcript is the host's"
-        );
-
-        let mut refused = 0usize;
-        for candidate in 0..48u64 {
-            if crypto::grinding::is_valid_nonce::<Blake3Std>(&seed, candidate, bits) {
-                continue;
+        for bits in [1u8, 7, 8, 13] {
+            let mut host = HostTranscript::new(&[]);
+            for value in &values {
+                host.append_bytes(&value.canonical().to_be_bytes());
             }
-            let mut forged = arena.clone();
-            forged[seed_felts] = [FE::from(candidate), FE::zero(), FE::zero(), FE::zero()];
-            assert!(
-                execute(&program, &[forged], &crate::hash_pin::BLOCK_HASHER).is_err(),
-                "{bits} bits, nonce {candidate}: the host rejects it, so must the machine"
+            let seed = host.state();
+            let nonce = crypto::grinding::generate_nonce_smallest::<Blake3Std>(&seed, bits)
+                .expect("a nonce exists at these factors");
+            assert!(crypto::grinding::is_valid_nonce::<Blake3Std>(
+                &seed, nonce, bits
+            ));
+
+            let program = grind_program(seed_felts, bits);
+            let (blake3, other) = hash_rows(&program);
+            assert!(blake3 > 0);
+            assert_eq!(other, 0, "the grind hashes with BLAKE3 alone");
+            let mut arena: Vec<LfmWord> = values
+                .iter()
+                .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
+                .collect();
+            arena.push([FE::from(nonce), FE::zero(), FE::zero(), FE::zero()]);
+            let words = run_program(&program, &[arena.clone()]);
+            host.append_bytes(&nonce.to_be_bytes());
+            assert_eq!(
+                digest_bytes(&words[..2]),
+                host.state(),
+                "{bits} bits: after the grind the machine's transcript is the host's"
             );
-            refused += 1;
+
+            let mut refused = 0usize;
+            for candidate in 0..48u64 {
+                if crypto::grinding::is_valid_nonce::<Blake3Std>(&seed, candidate, bits) {
+                    continue;
+                }
+                let mut forged = arena.clone();
+                forged[seed_felts] = [FE::from(candidate), FE::zero(), FE::zero(), FE::zero()];
+                assert!(
+                    execute(&program, &[forged], &crate::hash_pin::BLOCK_HASHER).is_err(),
+                    "{bits} bits, nonce {candidate}: the host rejects it, so must the machine"
+                );
+                refused += 1;
+            }
+            if bits >= 7 {
+                assert!(
+                    refused >= 40,
+                    "{bits} bits: only {refused} rejects exercised"
+                );
+            }
+            println!("BLAKE3 grind at {bits:>2} bits: nonce {nonce} accepted, {refused} refused");
         }
-        if bits >= 7 {
-            assert!(
-                refused >= 40,
-                "{bits} bits: only {refused} rejects exercised"
-            );
-        }
-        println!("BLAKE3 grind at {bits:>2} bits: nonce {nonce} accepted, {refused} refused");
-    }
+    });
 }
 
 /// `bits == 0` emits nothing at all, as on the host (no state read, no
 /// nonce absorb): the program equals one with no grind call.
 #[test]
 fn a_zero_bit_blake3_grind_touches_nothing() {
-    let with_zero = grind_program(4, 0);
-    let mut b = builder();
-    let arena = b.declare_arena(5);
-    let felts: Vec<Felt> = (0..4).map(|index| b.hint_felt(arena, index)).collect();
-    let _unused = b.hint_felt(arena, 4);
-    let mut transcript = WhirTranscript::for_builder(&mut b);
-    transcript.absorb_felts(&mut b, &felts);
-    let state = transcript.state_digest(&mut b);
-    publish_digest(&mut b, state);
-    let without = compile(b.finish());
-    assert_eq!(with_zero.instrs.len(), without.instrs.len());
+    under_both(|_lowering| {
+        let with_zero = grind_program(4, 0);
+        let mut b = builder();
+        let arena = b.declare_arena(5);
+        let felts: Vec<Felt> = (0..4).map(|index| b.hint_felt(arena, index)).collect();
+        let _unused = b.hint_felt(arena, 4);
+        let mut transcript = WhirTranscript::for_builder(&mut b);
+        transcript.absorb_felts(&mut b, &felts);
+        let state = transcript.state_digest(&mut b);
+        publish_digest(&mut b, state);
+        let without = compile(b.finish());
+        assert_eq!(with_zero.instrs.len(), without.instrs.len());
+    });
 }
 
 /// The grind's state seed is the transcript's, so an absorb the host did not
 /// make before the grind refuses the host's nonce (the seed moved).
 #[test]
 fn a_grind_over_another_state_refuses_the_hosts_nonce() {
-    let bits = 10u8;
-    let value = FE::from(0x1234_5678u64);
-    let mut host = HostTranscript::new(&[]);
-    host.append_bytes(&value.canonical().to_be_bytes());
-    let seed = host.state();
-    let nonce = crypto::grinding::generate_nonce_smallest::<Blake3Std>(&seed, bits)
-        .expect("a nonce at ten bits");
+    under_both(|_lowering| {
+        let bits = 10u8;
+        let value = FE::from(0x1234_5678u64);
+        let mut host = HostTranscript::new(&[]);
+        host.append_bytes(&value.canonical().to_be_bytes());
+        let seed = host.state();
+        let nonce = crypto::grinding::generate_nonce_smallest::<Blake3Std>(&seed, bits)
+            .expect("a nonce at ten bits");
 
-    let mut b = builder();
-    let arena = b.declare_arena(2);
-    let felt = b.hint_felt(arena, 0);
-    let n = b.hint_felt(arena, 1);
-    let mut t = WhirTranscript::for_builder(&mut b);
-    t.absorb_felts(&mut b, &[felt]);
-    // The extra absorb: four constant bytes the host never appended (whole
-    // `u32` halves, so the nonce after them stays on the byte arm's 4-byte
-    // grid).
-    t.absorb_const_bytes(&[0; 4]);
-    emit_grind_check(&mut b, &mut t, bits, n);
-    let program = compile(b.finish());
-    let arena_words = vec![
-        [value, FE::zero(), FE::zero(), FE::zero()],
-        [FE::from(nonce), FE::zero(), FE::zero(), FE::zero()],
-    ];
-    // ≈ 2^-10 that the host's nonce is also valid for the other seed; this
-    // seed and value are fixed, so the outcome is deterministic.
-    assert!(
-        execute(&program, &[arena_words], &crate::hash_pin::BLOCK_HASHER).is_err(),
-        "the nonce was ground for another state"
-    );
+        let mut b = builder();
+        let arena = b.declare_arena(2);
+        let felt = b.hint_felt(arena, 0);
+        let n = b.hint_felt(arena, 1);
+        let mut t = WhirTranscript::for_builder(&mut b);
+        t.absorb_felts(&mut b, &[felt]);
+        // The extra absorb: four constant bytes the host never appended (whole
+        // `u32` halves, so the nonce after them stays on the byte arm's 4-byte
+        // grid).
+        t.absorb_const_bytes(&[0; 4]);
+        emit_grind_check(&mut b, &mut t, bits, n);
+        let program = compile(b.finish());
+        let arena_words = vec![
+            [value, FE::zero(), FE::zero(), FE::zero()],
+            [FE::from(nonce), FE::zero(), FE::zero(), FE::zero()],
+        ];
+        // ≈ 2^-10 that the host's nonce is also valid for the other seed; this
+        // seed and value are fixed, so the outcome is deterministic.
+        assert!(
+            execute(&program, &[arena_words], &crate::hash_pin::BLOCK_HASHER).is_err(),
+            "the nonce was ground for another state"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -716,25 +772,27 @@ mod chain {
     /// stream comparison. It hashes with BLAKE3 rows and nothing else.
     #[test]
     fn a_blake3_chain_executes_on_a_proof_the_host_accepts() {
-        for (num_vars, cfg) in cases() {
-            let f = fixture(num_vars, cfg);
-            let program = program(&f.shape);
-            let (blake3, other) = hash_rows(&program);
-            assert!(blake3 > 0);
-            assert_eq!(other, 0, "the chain hashes with BLAKE3 alone");
-            execute(
-                &program,
-                &[arena(&f, &f.proof)],
-                &crate::hash_pin::BLOCK_HASHER,
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "S={num_vars} {:?} caps {:?} grind {:?} leaves {:?}: refused an \
-                         accepted proof: {e:?}",
-                    f.shape.schedule, f.shape.caps, f.shape.grind, f.shape.leaves
+        super::under_both(|_lowering| {
+            for (num_vars, cfg) in cases() {
+                let f = fixture(num_vars, cfg);
+                let program = program(&f.shape);
+                let (blake3, other) = hash_rows(&program);
+                assert!(blake3 > 0);
+                assert_eq!(other, 0, "the chain hashes with BLAKE3 alone");
+                execute(
+                    &program,
+                    &[arena(&f, &f.proof)],
+                    &crate::hash_pin::BLOCK_HASHER,
                 )
-            });
-        }
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "S={num_vars} {:?} caps {:?} grind {:?} leaves {:?}: refused an \
+                             accepted proof: {e:?}",
+                        f.shape.schedule, f.shape.caps, f.shape.grind, f.shape.leaves
+                    )
+                });
+            }
+        });
     }
 
     /// ★ The cost model's compressions are the emitted program's: the
@@ -743,24 +801,22 @@ mod chain {
     /// gate runs.
     #[test]
     fn a_blake3_chain_emits_its_compression_closed_form() {
-        use super::super::instr::Instr;
-        use super::super::whir_chain::chain_perms;
-        use super::super::whir_transcript::SpongeEntry;
-        for (num_vars, cfg) in cases() {
-            let shape = ChainShape::for_hash(&cfg, num_vars, WrapHash::Blake3);
-            let program = program(&shape);
-            let emitted = program
-                .instrs
-                .iter()
-                .filter(|i| matches!(i, Instr::Blake3(_)))
-                .count();
-            let predicted = chain_perms(&shape, SpongeEntry::fresh_for(WrapHash::Blake3));
-            assert_eq!(
-                emitted, predicted,
-                "S={num_vars} {:?} caps {:?} grind {:?}",
-                shape.schedule, shape.caps, shape.grind
-            );
-        }
+        super::under_both(|_lowering| {
+            use super::super::whir_chain::chain_perms;
+            use super::super::whir_transcript::SpongeEntry;
+            for (num_vars, cfg) in cases() {
+                let shape = ChainShape::for_hash(&cfg, num_vars, WrapHash::Blake3);
+                let program = program(&shape);
+                let (emitted, other) = hash_rows(&program);
+                assert_eq!(other, 0, "one lowering's rows only");
+                let predicted = chain_perms(&shape, SpongeEntry::fresh_for(WrapHash::Blake3));
+                assert_eq!(
+                    emitted, predicted,
+                    "S={num_vars} {:?} caps {:?} grind {:?}",
+                    shape.schedule, shape.caps, shape.grind
+                );
+            }
+        });
     }
 
     fn sibling_flip(proof: &mut ChainProof<F, E>, round: usize, current: bool) -> bool {
@@ -797,74 +853,76 @@ mod chain {
     /// a cap node, and the root itself.
     #[test]
     fn a_tampered_blake3_chain_cannot_execute() {
-        for leaves in [LeafOrder::Natural, LeafOrder::Coset] {
-            for cap in [CapPolicy::Off, CapPolicy::Fixed(2)] {
-                let f = fixture(10, config(4, 6, cap, leaves, Some(6)));
-                let program = program(&f.shape);
-                assert!(
-                    runs(&program, arena(&f, &f.proof)),
-                    "the untouched proof must execute, or the arm below proves nothing"
-                );
-                let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
-                let mut forged = f.proof.clone();
-                forged.final_value += FEE::one();
-                sites.push(("the final value", forged));
-                let mut forged = f.proof.clone();
-                forged.rounds[0].sumcheck[0].evaluations[1] += FEE::one();
-                sites.push(("a sumcheck evaluation", forged));
-                let mut forged = f.proof.clone();
-                if let Some(v) = forged.rounds[0].ood_value.as_mut() {
-                    *v += FEE::one();
-                }
-                sites.push(("an out-of-domain value", forged));
-                let mut forged = f.proof.clone();
-                forged.rounds[0].nonces.query ^= 1;
-                sites.push(("a grind nonce", forged));
-                let mut forged = f.proof.clone();
-                match &mut forged.rounds[0].openings {
-                    RoundOpenings::Base(p) => p.current[1].values[5] += FE::one(),
-                    _ => unreachable!("round 0 opens base blocks"),
-                }
-                sites.push(("a round-0 base value", forged));
-                let mut forged = f.proof.clone();
-                assert!(sibling_flip(&mut forged, 0, true));
-                sites.push(("a current Merkle sibling", forged));
-                let mut forged = f.proof.clone();
-                if (0..forged.rounds.len()).any(|r| sibling_flip(&mut forged, r, false)) {
-                    sites.push(("a successor Merkle sibling", forged));
-                }
-                if cap != CapPolicy::Off {
+        super::under_both(|_lowering| {
+            for leaves in [LeafOrder::Natural, LeafOrder::Coset] {
+                for cap in [CapPolicy::Off, CapPolicy::Fixed(2)] {
+                    let f = fixture(10, config(4, 6, cap, leaves, Some(6)));
+                    let program = program(&f.shape);
+                    assert!(
+                        runs(&program, arena(&f, &f.proof)),
+                        "the untouched proof must execute, or the arm below proves nothing"
+                    );
+                    let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
+                    let mut forged = f.proof.clone();
+                    forged.final_value += FEE::one();
+                    sites.push(("the final value", forged));
+                    let mut forged = f.proof.clone();
+                    forged.rounds[0].sumcheck[0].evaluations[1] += FEE::one();
+                    sites.push(("a sumcheck evaluation", forged));
+                    let mut forged = f.proof.clone();
+                    if let Some(v) = forged.rounds[0].ood_value.as_mut() {
+                        *v += FEE::one();
+                    }
+                    sites.push(("an out-of-domain value", forged));
+                    let mut forged = f.proof.clone();
+                    forged.rounds[0].nonces.query ^= 1;
+                    sites.push(("a grind nonce", forged));
                     let mut forged = f.proof.clone();
                     match &mut forged.rounds[0].openings {
-                        RoundOpenings::Base(p) => {
-                            let path = &mut p.current[0].proof.merkle_path;
-                            let last = path.len() - 1;
-                            path[last][31] ^= 1;
-                        }
+                        RoundOpenings::Base(p) => p.current[1].values[5] += FE::one(),
                         _ => unreachable!("round 0 opens base blocks"),
                     }
-                    sites.push(("a cap node", forged));
-                }
-                for (name, forged) in &sites {
+                    sites.push(("a round-0 base value", forged));
+                    let mut forged = f.proof.clone();
+                    assert!(sibling_flip(&mut forged, 0, true));
+                    sites.push(("a current Merkle sibling", forged));
+                    let mut forged = f.proof.clone();
+                    if (0..forged.rounds.len()).any(|r| sibling_flip(&mut forged, r, false)) {
+                        sites.push(("a successor Merkle sibling", forged));
+                    }
+                    if cap != CapPolicy::Off {
+                        let mut forged = f.proof.clone();
+                        match &mut forged.rounds[0].openings {
+                            RoundOpenings::Base(p) => {
+                                let path = &mut p.current[0].proof.merkle_path;
+                                let last = path.len() - 1;
+                                path[last][31] ^= 1;
+                            }
+                            _ => unreachable!("round 0 opens base blocks"),
+                        }
+                        sites.push(("a cap node", forged));
+                    }
+                    for (name, forged) in &sites {
+                        assert!(
+                            !host_accepts(&f, forged),
+                            "{name} ({cap:?}, {leaves:?}): the host must reject it"
+                        );
+                        assert!(
+                            !runs(&program, arena(&f, forged)),
+                            "{name} ({cap:?}, {leaves:?}): the machine must refuse it"
+                        );
+                    }
+                    // A wrong root: every opening of round 0 fails against it.
+                    let mut words = arena(&f, &f.proof);
+                    let n = f.shape.num_vars;
+                    words[n + 2][3] += FE::one();
                     assert!(
-                        !host_accepts(&f, forged),
-                        "{name} ({cap:?}, {leaves:?}): the host must reject it"
-                    );
-                    assert!(
-                        !runs(&program, arena(&f, forged)),
-                        "{name} ({cap:?}, {leaves:?}): the machine must refuse it"
+                        !runs(&program, words),
+                        "a root off in its second word must be refused"
                     );
                 }
-                // A wrong root: every opening of round 0 fails against it.
-                let mut words = arena(&f, &f.proof);
-                let n = f.shape.num_vars;
-                words[n + 2][3] += FE::one();
-                assert!(
-                    !runs(&program, words),
-                    "a root off in its second word must be refused"
-                );
             }
-        }
+        });
     }
 
     /// A round-0 value hinted with a nonzero upper lane is refused before any
@@ -872,47 +930,51 @@ mod chain {
     /// fold is pinned (whir_open's obligation, under BLAKE3).
     #[test]
     fn a_round0_value_with_an_upper_lane_is_refused() {
-        let f = fixture(6, config(3, 0, CapPolicy::Off, LeafOrder::Natural, None));
-        let program = program(&f.shape);
-        let words = arena(&f, &f.proof);
-        // Round 0's first block value: after the head, the round's sumcheck
-        // words (two a message) and its carried nonces.
-        let r0 = f.shape.num_vars + 4;
-        let nonces = f.shape.carries(0).iter().filter(|&&c| c).count();
-        let at = r0 + 2 * f.shape.messages(0) + nonces;
-        assert_eq!(
-            words[at][1..],
-            [FE::zero(); 3],
-            "the slot is a base value's word"
-        );
-        let mut forged = words.clone();
-        forged[at][2] = FE::one();
-        let err = execute(&program, &[forged], &crate::hash_pin::BLOCK_HASHER)
-            .expect_err("a lifted lane must be refused");
-        assert!(
-            matches!(err, super::super::executor::LfmExecError::NotBaseWord(_)),
-            "refused as a non-base word, got {err:?}"
-        );
+        super::under_both(|_lowering| {
+            let f = fixture(6, config(3, 0, CapPolicy::Off, LeafOrder::Natural, None));
+            let program = program(&f.shape);
+            let words = arena(&f, &f.proof);
+            // Round 0's first block value: after the head, the round's sumcheck
+            // words (two a message) and its carried nonces.
+            let r0 = f.shape.num_vars + 4;
+            let nonces = f.shape.carries(0).iter().filter(|&&c| c).count();
+            let at = r0 + 2 * f.shape.messages(0) + nonces;
+            assert_eq!(
+                words[at][1..],
+                [FE::zero(); 3],
+                "the slot is a base value's word"
+            );
+            let mut forged = words.clone();
+            forged[at][2] = FE::one();
+            let err = execute(&program, &[forged], &crate::hash_pin::BLOCK_HASHER)
+                .expect_err("a lifted lane must be refused");
+            assert!(
+                matches!(err, super::super::executor::LfmExecError::NotBaseWord(_)),
+                "refused as a non-base word, got {err:?}"
+            );
+        });
     }
 
     /// The coset program and the natural one refuse each other's proofs (and
     /// so does the host): round 0's walks are wired to the order.
     #[test]
     fn a_coset_blake3_program_refuses_a_natural_proof() {
-        let coset = config(9, 0, CapPolicy::Off, LeafOrder::Coset, Some(6));
-        let natural = config(9, 0, CapPolicy::Off, LeafOrder::Natural, Some(6));
-        let made_coset = fixture(11, coset);
-        let made_natural = fixture(11, natural);
-        let coset_program = program(&made_coset.shape);
-        let natural_program = program(&made_natural.shape);
-        assert!(!runs(
-            &coset_program,
-            arena(&made_natural, &made_natural.proof)
-        ));
-        assert!(!runs(
-            &natural_program,
-            arena(&made_coset, &made_coset.proof)
-        ));
+        super::under_both(|_lowering| {
+            let coset = config(9, 0, CapPolicy::Off, LeafOrder::Coset, Some(6));
+            let natural = config(9, 0, CapPolicy::Off, LeafOrder::Natural, Some(6));
+            let made_coset = fixture(11, coset);
+            let made_natural = fixture(11, natural);
+            let coset_program = program(&made_coset.shape);
+            let natural_program = program(&made_natural.shape);
+            assert!(!runs(
+                &coset_program,
+                arena(&made_natural, &made_natural.proof)
+            ));
+            assert!(!runs(
+                &natural_program,
+                arena(&made_coset, &made_coset.proof)
+            ));
+        });
     }
 }
 
@@ -931,7 +993,7 @@ mod kats {
     use super::super::compiler::compile;
     use super::super::edsl::{self, WrapDigest};
     use super::super::whir_chain::byte_digest_words;
-    use super::super::whir_open::{BlockValues, emit_block_leaf, emit_blake3_joint_leaf};
+    use super::super::whir_open::{BlockValues, emit_blake3_joint_leaf, emit_block_leaf};
     use super::super::word::{LfmWord, ext_word};
     use super::{builder, digest_bytes, publish_digest, run_program};
 
@@ -955,7 +1017,10 @@ mod kats {
     /// them.
     fn digest_of(
         words: Vec<LfmWord>,
-        emit: impl FnOnce(&mut super::super::builder::LfmBuilder, &[super::super::builder::Cell]) -> WrapDigest,
+        emit: impl FnOnce(
+            &mut super::super::builder::LfmBuilder,
+            &[super::super::builder::Cell],
+        ) -> WrapDigest,
     ) -> [u8; 32] {
         let mut b = builder();
         let arena = b.declare_arena(words.len() as u32);
@@ -975,40 +1040,43 @@ mod kats {
     /// two-wide tail's 48 bytes in one partial block).
     #[test]
     fn the_leaf_is_the_hosts_blake3_std_leaf() {
-        for n in [2usize, 3, 8, 16, 21, 64] {
-            let values = felts(n, n as u64);
-            let want = <BatchBlake3StdBackend<GoldilocksField> as IsMerkleTreeBackend>::hash_data(
-                &values,
-            );
-            let got = digest_of(
-                values
-                    .iter()
-                    .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
-                    .collect(),
-                |b, cells| {
-                    let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
-                    emit_block_leaf(b, BlockValues::Base(&fs))
-                },
-            );
-            assert_eq!(got, want, "a base block of {n} values");
-        }
-        for n in [1usize, 2, 4, 16] {
-            let values: Vec<FEE> = (0..n)
-                .map(|i| {
-                    let f = felts(3, 100 + i as u64);
-                    FEE::new([f[0], f[1], f[2]])
-                })
-                .collect();
-            let want =
-                <BatchBlake3StdBackend<GoldilocksExtension> as IsMerkleTreeBackend>::hash_data(
-                    &values,
+        super::under_both(|_lowering| {
+            for n in [2usize, 3, 8, 16, 21, 64] {
+                let values = felts(n, n as u64);
+                let want =
+                    <BatchBlake3StdBackend<GoldilocksField> as IsMerkleTreeBackend>::hash_data(
+                        &values,
+                    );
+                let got = digest_of(
+                    values
+                        .iter()
+                        .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
+                        .collect(),
+                    |b, cells| {
+                        let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
+                        emit_block_leaf(b, BlockValues::Base(&fs))
+                    },
                 );
-            let got = digest_of(values.iter().map(ext_word).collect(), |b, cells| {
-                let es: Vec<_> = cells.iter().map(|c| c.as_ext()).collect();
-                emit_block_leaf(b, BlockValues::Ext(&es))
-            });
-            assert_eq!(got, want, "an extension block of {n} values");
-        }
+                assert_eq!(got, want, "a base block of {n} values");
+            }
+            for n in [1usize, 2, 4, 16] {
+                let values: Vec<FEE> = (0..n)
+                    .map(|i| {
+                        let f = felts(3, 100 + i as u64);
+                        FEE::new([f[0], f[1], f[2]])
+                    })
+                    .collect();
+                let want =
+                    <BatchBlake3StdBackend<GoldilocksExtension> as IsMerkleTreeBackend>::hash_data(
+                        &values,
+                    );
+                let got = digest_of(values.iter().map(ext_word).collect(), |b, cells| {
+                    let es: Vec<_> = cells.iter().map(|c| c.as_ext()).collect();
+                    emit_block_leaf(b, BlockValues::Ext(&es))
+                });
+                assert_eq!(got, want, "an extension block of {n} values");
+            }
+        });
     }
 
     /// ★ The joint leaf, resumed from the prefix's midstate, is
@@ -1017,35 +1085,38 @@ mod kats {
     /// and equals the whole chain over `prefix ‖ values` from the IV.
     #[test]
     fn the_joint_leaf_from_its_midstate_is_the_hosts() {
-        use crypto::merkle_tree::backends::blake3_joint::{JOINT_LEAF_PREFIX_LEN, joint_leaf_prefix};
-        for blocks in [2usize, 3, 4] {
-            for per_block in [8usize, 16, 64] {
-                let values = felts(blocks * per_block, (blocks * 100 + per_block) as u64);
-                let want = joint_leaf(&values, blocks).expect("an even split");
-                let words: Vec<LfmWord> = values
-                    .iter()
-                    .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
-                    .collect();
-                let got = digest_of(words.clone(), |b, cells| {
-                    let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
-                    emit_blake3_joint_leaf(b, &fs, blocks)
-                });
-                assert_eq!(got, want, "{blocks} blocks of {per_block}");
-                // The same message chained from the IV, prefix as constants.
-                let prefix =
-                    joint_leaf_prefix(blocks as u64, per_block as u64, 8);
-                let whole = digest_of(words, |b, cells| {
-                    let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
-                    let mut t = super::super::transcript_replay::ByteString::new();
-                    t.push_const(&prefix);
-                    let (stream, len) = edsl::leaf_stream(b, &fs);
-                    assert_eq!(len + JOINT_LEAF_PREFIX_LEN, prefix.len() + 8 * fs.len());
-                    t.push_halves(&stream);
-                    t.wrap_hash(b, edsl::ByteWrapHash::Blake3)
-                });
-                assert_eq!(whole, want, "{blocks} blocks of {per_block}, from the IV");
+        super::under_both(|_lowering| {
+            use crypto::merkle_tree::backends::blake3_joint::{
+                JOINT_LEAF_PREFIX_LEN, joint_leaf_prefix,
+            };
+            for blocks in [2usize, 3, 4] {
+                for per_block in [8usize, 16, 64] {
+                    let values = felts(blocks * per_block, (blocks * 100 + per_block) as u64);
+                    let want = joint_leaf(&values, blocks).expect("an even split");
+                    let words: Vec<LfmWord> = values
+                        .iter()
+                        .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
+                        .collect();
+                    let got = digest_of(words.clone(), |b, cells| {
+                        let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
+                        emit_blake3_joint_leaf(b, &fs, blocks)
+                    });
+                    assert_eq!(got, want, "{blocks} blocks of {per_block}");
+                    // The same message chained from the IV, prefix as constants.
+                    let prefix = joint_leaf_prefix(blocks as u64, per_block as u64, 8);
+                    let whole = digest_of(words, |b, cells| {
+                        let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
+                        let mut t = super::super::transcript_replay::ByteString::new();
+                        t.push_const(&prefix);
+                        let (stream, len) = edsl::leaf_stream(b, &fs);
+                        assert_eq!(len + JOINT_LEAF_PREFIX_LEN, prefix.len() + 8 * fs.len());
+                        t.push_halves(&stream);
+                        t.wrap_hash(b, edsl::ByteWrapHash::Blake3)
+                    });
+                    assert_eq!(whole, want, "{blocks} blocks of {per_block}, from the IV");
+                }
             }
-        }
+        });
     }
 
     /// The joint leaf binds its block count through the midstate: the same
@@ -1053,40 +1124,45 @@ mod kats {
     /// shape's own count matches the host's.
     #[test]
     fn the_joint_leaf_binds_its_block_count() {
-        let values = felts(4 * 16, 7);
-        let words: Vec<LfmWord> = values
-            .iter()
-            .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
-            .collect();
-        let want = joint_leaf(&values, 4).expect("an even split");
-        for blocks in [2usize, 4] {
-            let got = digest_of(words.clone(), |b, cells| {
-                let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
-                emit_blake3_joint_leaf(b, &fs, blocks)
-            });
-            assert_eq!(got == want, blocks == 4, "{blocks} blocks");
-        }
+        super::under_both(|_lowering| {
+            let values = felts(4 * 16, 7);
+            let words: Vec<LfmWord> = values
+                .iter()
+                .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
+                .collect();
+            let want = joint_leaf(&values, 4).expect("an even split");
+            for blocks in [2usize, 4] {
+                let got = digest_of(words.clone(), |b, cells| {
+                    let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
+                    emit_blake3_joint_leaf(b, &fs, blocks)
+                });
+                assert_eq!(got == want, blocks == 4, "{blocks} blocks");
+            }
+        });
     }
 
     /// ★ A parent is `hash_new_parent(left, right)`: one compression of the
     /// two digests' 64 bytes, in order.
     #[test]
     fn the_parent_is_the_hosts() {
-        let left: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(13) ^ 0x5A);
-        let right: [u8; 32] = core::array::from_fn(|i| 0xC3 ^ (i as u8).wrapping_mul(7));
-        let want = <BatchBlake3StdBackend<GoldilocksField> as IsMerkleTreeBackend>::hash_new_parent(
-            &left, &right,
-        );
-        let mut words: Vec<LfmWord> = byte_digest_words(&left).to_vec();
-        words.extend(byte_digest_words(&right));
-        let got = digest_of(words, |b, cells| {
-            edsl::wrap_hash_pair(
-                b,
-                WrapDigest::from_pair(cells[0], cells[1]),
-                WrapDigest::from_pair(cells[2], cells[3]),
-            )
+        super::under_both(|_lowering| {
+            let left: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(13) ^ 0x5A);
+            let right: [u8; 32] = core::array::from_fn(|i| 0xC3 ^ (i as u8).wrapping_mul(7));
+            let want =
+                <BatchBlake3StdBackend<GoldilocksField> as IsMerkleTreeBackend>::hash_new_parent(
+                    &left, &right,
+                );
+            let mut words: Vec<LfmWord> = byte_digest_words(&left).to_vec();
+            words.extend(byte_digest_words(&right));
+            let got = digest_of(words, |b, cells| {
+                edsl::wrap_hash_pair(
+                    b,
+                    WrapDigest::from_pair(cells[0], cells[1]),
+                    WrapDigest::from_pair(cells[2], cells[3]),
+                )
+            });
+            assert_eq!(got, want);
         });
-        assert_eq!(got, want);
     }
 }
 
@@ -1192,8 +1268,9 @@ mod stacked {
             .zip(&points)
             .map(|(c, p)| c.evaluate_in::<E>(p).expect("a column takes its own point"))
             .collect();
-        let stacked = StackedCommitment::<F, Blake3Whir>::commit(layout.clone(), &borrowed, None, &cfg)
-            .expect("the group commits");
+        let stacked =
+            StackedCommitment::<F, Blake3Whir>::commit(layout.clone(), &borrowed, None, &cfg)
+                .expect("the group commits");
         let proof = multilinear::stacked_eval::prove::<F, E, _, Blake3Whir, _>(
             &stacked,
             &borrowed,
@@ -1258,8 +1335,8 @@ mod stacked {
         let mut b = builder();
         let runs = f.shape.chains(f.layout.num_polys());
         let trees = run_trees(f);
-        let mut total: u32 = f.points.iter().map(|p| p.len() as u32).sum::<u32>()
-            + f.values.len() as u32;
+        let mut total: u32 =
+            f.points.iter().map(|p| p.len() as u32).sum::<u32>() + f.values.len() as u32;
         let mut chain_at = Vec::new();
         for (run, t) in runs.iter().zip(&trees) {
             chain_at.push(total);
@@ -1431,30 +1508,32 @@ mod stacked {
     /// is the host's, and it hashes with BLAKE3 alone.
     #[test]
     fn a_blake3_group_opening_executes_on_proofs_the_host_accepts() {
-        for (name, case) in cases() {
-            let f = build(&case);
-            let joint = f
-                .shape
-                .chains(f.layout.num_polys())
-                .iter()
-                .any(|run| f.shape.run(run.len()).joint());
-            assert_eq!(
-                joint,
-                case.round0 == Round0Trees::One,
-                "{name}: a joint run exactly under one tree a run"
-            );
-            let program = program(&f);
-            let (blake3, other) = hash_rows(&program);
-            assert!(blake3 > 0);
-            assert_eq!(other, 0, "{name}: BLAKE3 alone");
-            let gamma = runs(&program, arena(&f, &f.proof)).unwrap_or_else(|e| {
-                panic!(
-                    "{name} ({:?}, {:?}, {:?}): refused an accepted proof: {e}",
-                    case.round0, case.leaves, case.cap
-                )
-            });
-            assert_eq!(gamma, host_gamma(&f), "{name}: the batching draw");
-        }
+        super::under_both(|_lowering| {
+            for (name, case) in cases() {
+                let f = build(&case);
+                let joint = f
+                    .shape
+                    .chains(f.layout.num_polys())
+                    .iter()
+                    .any(|run| f.shape.run(run.len()).joint());
+                assert_eq!(
+                    joint,
+                    case.round0 == Round0Trees::One,
+                    "{name}: a joint run exactly under one tree a run"
+                );
+                let program = program(&f);
+                let (blake3, other) = hash_rows(&program);
+                assert!(blake3 > 0);
+                assert_eq!(other, 0, "{name}: BLAKE3 alone");
+                let gamma = runs(&program, arena(&f, &f.proof)).unwrap_or_else(|e| {
+                    panic!(
+                        "{name} ({:?}, {:?}, {:?}): refused an accepted proof: {e}",
+                        case.round0, case.leaves, case.cap
+                    )
+                });
+                assert_eq!(gamma, host_gamma(&f), "{name}: the batching draw");
+            }
+        });
     }
 
     /// ★ THE JOINT TAMPER ARM. One tree a run, natural and coset, uncapped and
@@ -1463,82 +1542,133 @@ mod stacked {
     /// word are refused by the host and have no execution.
     #[test]
     fn a_tampered_joint_blake3_leg_cannot_execute() {
-        for leaves in [LeafOrder::Natural, LeafOrder::Coset] {
-            for cap in [CapPolicy::Off, CapPolicy::Fixed(2)] {
-                let case = Case {
-                    heights: vec![9; 3],
-                    n_stack: 9,
-                    first: Some(6),
-                    cap,
-                    leaves,
-                    round0: Round0Trees::One,
-                    grind: 0,
-                };
-                let f = build(&case);
-                let program = program(&f);
-                runs(&program, arena(&f, &f.proof)).expect("the control executes");
-                let width = f.shape.run(3).current_block(0);
-                assert_eq!(width, 3 * 64);
-                let mut forgeries = Vec::new();
-                for t in [0usize, 63, 64, 64 + 5, width - 1] {
-                    let mut forged = f.proof.clone();
-                    match &mut forged.polys[0].rounds[0].openings {
-                        RoundOpenings::BaseJoint(p) => p.current[1].values[t] += FE::one(),
+        super::under_both(|_lowering| {
+            for leaves in [LeafOrder::Natural, LeafOrder::Coset] {
+                for cap in [CapPolicy::Off, CapPolicy::Fixed(2)] {
+                    let case = Case {
+                        heights: vec![9; 3],
+                        n_stack: 9,
+                        first: Some(6),
+                        cap,
+                        leaves,
+                        round0: Round0Trees::One,
+                        grind: 0,
+                    };
+                    let f = build(&case);
+                    let program = program(&f);
+                    runs(&program, arena(&f, &f.proof)).expect("the control executes");
+                    let width = f.shape.run(3).current_block(0);
+                    assert_eq!(width, 3 * 64);
+                    let mut forgeries = Vec::new();
+                    for t in [0usize, 63, 64, 64 + 5, width - 1] {
+                        let mut forged = f.proof.clone();
+                        match &mut forged.polys[0].rounds[0].openings {
+                            RoundOpenings::BaseJoint(p) => p.current[1].values[t] += FE::one(),
+                            _ => panic!("chain 0 is joint"),
+                        }
+                        forgeries.push((format!("value {t}"), forged));
+                    }
+                    let mut swapped = f.proof.clone();
+                    match &mut swapped.polys[0].rounds[0].openings {
+                        RoundOpenings::BaseJoint(p) => {
+                            for opening in &mut p.current {
+                                let (a, b) = opening.values.split_at_mut(64);
+                                a.swap_with_slice(&mut b[..64]);
+                            }
+                        }
                         _ => panic!("chain 0 is joint"),
                     }
-                    forgeries.push((format!("value {t}"), forged));
-                }
-                let mut swapped = f.proof.clone();
-                match &mut swapped.polys[0].rounds[0].openings {
-                    RoundOpenings::BaseJoint(p) => {
-                        for opening in &mut p.current {
-                            let (a, b) = opening.values.split_at_mut(64);
-                            a.swap_with_slice(&mut b[..64]);
-                        }
+                    forgeries.push(("blocks 0 and 1 swapped".to_string(), swapped));
+                    let mut node = f.proof.clone();
+                    match &mut node.polys[0].rounds[0].openings {
+                        RoundOpenings::BaseJoint(p) => p.current[2].proof.merkle_path[0][31] ^= 1,
+                        _ => panic!("chain 0 is joint"),
                     }
-                    _ => panic!("chain 0 is joint"),
-                }
-                forgeries.push(("blocks 0 and 1 swapped".to_string(), swapped));
-                let mut node = f.proof.clone();
-                match &mut node.polys[0].rounds[0].openings {
-                    RoundOpenings::BaseJoint(p) => p.current[2].proof.merkle_path[0][31] ^= 1,
-                    _ => panic!("chain 0 is joint"),
-                }
-                forgeries.push(("a path node".to_string(), node));
-                for (what, forged) in &forgeries {
-                    assert!(!host_accepts(&f, forged), "{what} ({leaves:?}, {cap:?}): host");
+                    forgeries.push(("a path node".to_string(), node));
+                    for (what, forged) in &forgeries {
+                        assert!(
+                            !host_accepts(&f, forged),
+                            "{what} ({leaves:?}, {cap:?}): host"
+                        );
+                        assert!(
+                            runs(&program, arena(&f, forged)).is_err(),
+                            "{what} ({leaves:?}, {cap:?}): must have no execution"
+                        );
+                    }
+                    let mut words = arena(&f, &f.proof);
+                    let root_at = f.points.iter().map(Vec::len).sum::<usize>() + f.values.len();
+                    words[root_at + 1][2] += FE::one();
                     assert!(
-                        runs(&program, arena(&f, forged)).is_err(),
-                        "{what} ({leaves:?}, {cap:?}): must have no execution"
+                        runs(&program, words).is_err(),
+                        "a joint root off in its second word"
                     );
                 }
-                let mut words = arena(&f, &f.proof);
-                let root_at = f.points.iter().map(Vec::len).sum::<usize>() + f.values.len();
-                words[root_at + 1][2] += FE::one();
-                assert!(
-                    runs(&program, words).is_err(),
-                    "a joint root off in its second word"
-                );
             }
-        }
+        });
     }
 
     /// A joint leg and a per-tree leg refuse each other's proofs.
     #[test]
     fn a_joint_blake3_leg_and_a_per_tree_one_refuse_each_others_proofs() {
-        let at = |round0| Case {
-            heights: vec![9; 3],
-            n_stack: 9,
-            first: Some(6),
-            cap: CapPolicy::Off,
-            leaves: LeafOrder::Coset,
-            round0,
-            grind: 0,
-        };
-        let each = build(&at(Round0Trees::Each));
-        let one = build(&at(Round0Trees::One));
-        let (each_program, one_program) = (program(&each), program(&one));
-        assert!(runs(&one_program, arena(&each, &each.proof)).is_err());
-        assert!(runs(&each_program, arena(&one, &one.proof)).is_err());
+        super::under_both(|_lowering| {
+            let at = |round0| Case {
+                heights: vec![9; 3],
+                n_stack: 9,
+                first: Some(6),
+                cap: CapPolicy::Off,
+                leaves: LeafOrder::Coset,
+                round0,
+                grind: 0,
+            };
+            let each = build(&at(Round0Trees::Each));
+            let one = build(&at(Round0Trees::One));
+            let (each_program, one_program) = (program(&each), program(&one));
+            assert!(runs(&one_program, arena(&each, &each.proof)).is_err());
+            assert!(runs(&each_program, arena(&one, &one.proof)).is_err());
+        });
     }
+}
+
+// ---------------------------------------------------------------------------
+// The two lowerings side by side.
+// ---------------------------------------------------------------------------
+
+/// ★ What the lean lowering changes is the chip and the byte work, never the
+/// compressions: a chain emits the same number of compressions either way,
+/// all of them `B3l` rows and none `LFM_BLAKE3` rows under the lean builder,
+/// and its leaves take no `BitDec` a value (the head renders the bytes), so the
+/// lean program has fewer `BitDec` rows by at least the leaf values hashed.
+#[test]
+fn the_lean_lowering_moves_the_chip_and_the_byte_work_only() {
+    use super::whir_chain::ChipRows;
+    use multilinear::whir_chain::{CapPolicy, LeafOrder};
+    let cfg = chain::config(4, 6, CapPolicy::Fixed(2), LeafOrder::Coset, Some(6));
+    let shape = super::whir_chain::ChainShape::for_hash(&cfg, 10, WrapHash::Blake3);
+    let mut programs = Vec::new();
+    under_both(|_| programs.push(chain::program(&shape)));
+    let [plain, lean] = [&programs[0], &programs[1]];
+    let count = |p: &LfmProgram, f: fn(&Instr) -> bool| p.instrs.iter().filter(|i| f(i)).count();
+    let plain_rows = count(plain, |i| matches!(i, Instr::Blake3(_)));
+    let lean_rows = count(lean, |i| matches!(i, Instr::B3l(_)));
+    assert_eq!(plain_rows, lean_rows, "the same compressions");
+    assert_eq!(count(lean, |i| matches!(i, Instr::Blake3(_))), 0);
+    assert_eq!(count(plain, |i| matches!(i, Instr::B3l(_))), 0);
+    let (p, l) = (ChipRows::of(plain), ChipRows::of(lean));
+    // Round 0's base values alone: Q queries of a 64-value block.
+    let round0_values = shape.num_queries * 64;
+    assert!(
+        p.bitdec >= l.bitdec + round0_values,
+        "lean leaves render no value with a BitDec: {} against {}",
+        l.bitdec,
+        p.bitdec
+    );
+    assert!(lean.instrs.len() < plain.instrs.len());
+    println!(
+        "chain S=10: {plain_rows} compressions; instructions {} (LFM_BLAKE3) vs {} (lean); \
+         BitDec {} vs {}",
+        plain.instrs.len(),
+        lean.instrs.len(),
+        p.bitdec,
+        l.bitdec
+    );
 }
