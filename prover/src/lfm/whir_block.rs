@@ -973,7 +973,7 @@ impl WhirBlockPlan {
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;
         let elf_digest = crate::statement::elf_digest(elf_bytes);
-        let tag = crate::block_whir::block_statement_tag(base);
+        let tag = crate::block_whir::block_format_tag(format);
         let statement_bytes =
             block_statement_bytes(statement, &tag, &elf_digest, &frame.config, format.memory);
         let statement_calls = crate::block_whir::block_statement_calls(

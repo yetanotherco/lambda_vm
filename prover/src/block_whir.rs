@@ -510,6 +510,71 @@ pub fn b3_base_final() -> FinalPoly {
     })
 }
 
+/// The 7-round BLAKE3 base's group size: at most `4` stacked polynomials a
+/// group (Poseidon1's is [`BLOCK_GROUP_POLYS`], three). A quarter fewer
+/// groups for the recursion to verify, each a run of four polynomials in one
+/// chain: about 10.7 k compressions a polynomial against 13.7 k in a run of
+/// three at the binary default cap (by closed form). The production format's
+/// ([`BlockFormat::production`] under the BLAKE3 base, the base's
+/// [`b3_base_group_polys`] unless [`B3_BASE_GROUP_ENV`] says otherwise); the
+/// statement tag names a BLAKE3 format's group size ([`block_format_tag`]).
+pub const B3_BASE_GROUP_POLYS: usize = 4;
+
+/// The knob that proves and verifies the BLAKE3 base at three polynomials a
+/// group instead of [`B3_BASE_GROUP_POLYS`] (a measurement of what four cost
+/// the base; both sides of one process read it, and the tag names it): see
+/// [`b3_base_group_setting`].
+pub const B3_BASE_GROUP_ENV: &str = "LAMBDA_VM_B3_BASE_GROUP";
+
+/// [`B3_BASE_GROUP_ENV`]'s value: unset or `4` is [`B3_BASE_GROUP_POLYS`]
+/// (the base's format); `3` is Poseidon1's group size. Anything else is
+/// refused.
+pub fn b3_base_group_setting(value: Option<&str>) -> Result<usize, String> {
+    match value.map(str::trim) {
+        None | Some("4") => Ok(B3_BASE_GROUP_POLYS),
+        Some("3") => Ok(3),
+        Some(other) => Err(format!("{B3_BASE_GROUP_ENV}={other:?}: expected 4 or 3")),
+    }
+}
+
+/// The BLAKE3 base's group size in this process ([`b3_base_group_setting`]
+/// of [`B3_BASE_GROUP_ENV`]), read once; a refused value aborts the process
+/// at its first read, as [`b3_base_final`] does.
+pub fn b3_base_group_polys() -> usize {
+    static GROUP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GROUP.get_or_init(|| {
+        let value = match std::env::var(B3_BASE_GROUP_ENV) {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(v)) => {
+                eprintln!("{B3_BASE_GROUP_ENV}={v:?}: expected 4 or 3");
+                std::process::abort()
+            }
+        };
+        b3_base_group_setting(value.as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::abort()
+        })
+    })
+}
+
+/// The statement tag of a block proved under `format`: [`block_statement_tag`]
+/// of its base, and under the 7-round BLAKE3 base its group size too
+/// (`/G<n>`, the format's [`BlockFormat::group_polys`]), so no two BLAKE3
+/// group sizes share a tag. Every block statement's prover and verifier (and
+/// the recursion's plan) take their tag here.
+pub fn block_format_tag(format: &BlockFormat) -> Vec<u8> {
+    let mut tag = block_statement_tag(&format.zf.base);
+    if format.zf.base == BaseFormat::B3_WHIR {
+        #[cfg(test)]
+        if P1_TAG_OMITTED.with(std::cell::Cell::get) {
+            return tag;
+        }
+        tag.extend_from_slice(format!("/G{}", format.group_polys).as_bytes());
+    }
+    tag
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test only: on this thread, a statement takes the untagged
@@ -534,9 +599,15 @@ impl BlockFormat {
     /// [`LeafQuery::Lean`](crate::lfm::whir_chain::LeafQuery::Lean); `v1`, the
     /// check before it).
     pub fn production() -> Self {
+        let zf = *ZfFormat::global();
         Self {
-            zf: *ZfFormat::global(),
-            group_polys: BLOCK_GROUP_POLYS,
+            zf,
+            // The BLAKE3 base's own group size ([`b3_base_group_polys`]).
+            group_polys: if zf.base == BaseFormat::B3_WHIR {
+                b3_base_group_polys()
+            } else {
+                BLOCK_GROUP_POLYS
+            },
             max_groups: BLOCK_MAX_GROUPS,
             prepared: true,
             leaf_scale: crate::lfm::whir_block::process_leaf_scale(),
@@ -4907,7 +4978,7 @@ pub(crate) fn prove_traces(
             })
             .collect()
     };
-    let tag = block_statement_tag(&format.zf.base);
+    let tag = block_format_tag(format);
     let proof = crate::with_base_hash!(format.zf.base, |H| {
         let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
         absorb_block(
@@ -6613,7 +6684,7 @@ fn prove_streamed(
     let rest_gate = &rest_gate;
     let waits = ProducerWaits::default();
     let waits = &waits;
-    let tag = block_statement_tag(&format.zf.base);
+    let tag = block_format_tag(format);
     crate::with_base_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
         let bitwise_last = deviations.rest_bitwise_last;
@@ -8672,7 +8743,7 @@ pub(crate) fn verify_block_whir_traced(
     let statements: Vec<TableStatement<'_, F, E>> = order.iter().map(|&i| statements[i]).collect();
     let prepared_columns = prepared_tables(airs, page_configs, format)?;
 
-    let tag = block_statement_tag(&format.zf.base);
+    let tag = block_format_tag(format);
     Ok(crate::with_base_hash!(format.zf.base, |H| {
         let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
         absorb_block(
