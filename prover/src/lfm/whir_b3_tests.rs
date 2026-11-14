@@ -849,3 +849,630 @@ mod chain {
         ));
     }
 }
+
+// ---------------------------------------------------------------------------
+// The hashes one at a time: leaf, joint leaf, parent, against the host.
+// ---------------------------------------------------------------------------
+
+mod kats {
+    use crypto::merkle_tree::backends::blake3_joint::joint_leaf;
+    use crypto::merkle_tree::backends::types::BatchBlake3StdBackend;
+    use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+
+    use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
+
+    use super::super::builder::Felt;
+    use super::super::compiler::compile;
+    use super::super::edsl::{self, WrapDigest};
+    use super::super::whir_chain::byte_digest_words;
+    use super::super::whir_open::{BlockValues, emit_block_leaf, emit_blake3_joint_leaf};
+    use super::super::word::{LfmWord, ext_word};
+    use super::{builder, digest_bytes, publish_digest, run_program};
+
+    fn felts(n: usize, seed: u64) -> Vec<FE> {
+        (0..n as u64)
+            .map(|i| {
+                if i % 5 == 2 {
+                    FE::from(0xFFFF_FFFF_0000_0000u64 - i - seed)
+                } else {
+                    FE::from(
+                        (i + seed)
+                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            .wrapping_add(13),
+                    )
+                }
+            })
+            .collect()
+    }
+
+    /// One digest out of a program that hints `words` and emits `emit` over
+    /// them.
+    fn digest_of(
+        words: Vec<LfmWord>,
+        emit: impl FnOnce(&mut super::super::builder::LfmBuilder, &[super::super::builder::Cell]) -> WrapDigest,
+    ) -> [u8; 32] {
+        let mut b = builder();
+        let arena = b.declare_arena(words.len() as u32);
+        let cells: Vec<_> = (0..words.len())
+            .map(|i| b.hint_word(arena, i as u32))
+            .collect();
+        let d = emit(&mut b, &cells);
+        publish_digest(&mut b, d);
+        let program = compile(b.finish());
+        let out = run_program(&program, &[words]);
+        digest_bytes(&out)
+    }
+
+    /// ★ The per-polynomial leaf is `BatchBlake3StdBackend::hash_data`, for a
+    /// base block of every width the chains open (2 to 64 values, and an odd
+    /// 3 for a partial block) and an extension block (3 felts a value, the
+    /// two-wide tail's 48 bytes in one partial block).
+    #[test]
+    fn the_leaf_is_the_hosts_blake3_std_leaf() {
+        for n in [2usize, 3, 8, 16, 21, 64] {
+            let values = felts(n, n as u64);
+            let want = <BatchBlake3StdBackend<GoldilocksField> as IsMerkleTreeBackend>::hash_data(
+                &values,
+            );
+            let got = digest_of(
+                values
+                    .iter()
+                    .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
+                    .collect(),
+                |b, cells| {
+                    let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
+                    emit_block_leaf(b, BlockValues::Base(&fs))
+                },
+            );
+            assert_eq!(got, want, "a base block of {n} values");
+        }
+        for n in [1usize, 2, 4, 16] {
+            let values: Vec<FEE> = (0..n)
+                .map(|i| {
+                    let f = felts(3, 100 + i as u64);
+                    FEE::new([f[0], f[1], f[2]])
+                })
+                .collect();
+            let want =
+                <BatchBlake3StdBackend<GoldilocksExtension> as IsMerkleTreeBackend>::hash_data(
+                    &values,
+                );
+            let got = digest_of(values.iter().map(ext_word).collect(), |b, cells| {
+                let es: Vec<_> = cells.iter().map(|c| c.as_ext()).collect();
+                emit_block_leaf(b, BlockValues::Ext(&es))
+            });
+            assert_eq!(got, want, "an extension block of {n} values");
+        }
+    }
+
+    /// ★ The joint leaf, resumed from the prefix's midstate, is
+    /// `blake3_joint::joint_leaf` at every run width (2, 3, 4) and at the
+    /// block sizes the tests and the production fold use (8, 16, 64 values),
+    /// and equals the whole chain over `prefix ‖ values` from the IV.
+    #[test]
+    fn the_joint_leaf_from_its_midstate_is_the_hosts() {
+        use crypto::merkle_tree::backends::blake3_joint::{JOINT_LEAF_PREFIX_LEN, joint_leaf_prefix};
+        for blocks in [2usize, 3, 4] {
+            for per_block in [8usize, 16, 64] {
+                let values = felts(blocks * per_block, (blocks * 100 + per_block) as u64);
+                let want = joint_leaf(&values, blocks).expect("an even split");
+                let words: Vec<LfmWord> = values
+                    .iter()
+                    .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
+                    .collect();
+                let got = digest_of(words.clone(), |b, cells| {
+                    let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
+                    emit_blake3_joint_leaf(b, &fs, blocks)
+                });
+                assert_eq!(got, want, "{blocks} blocks of {per_block}");
+                // The same message chained from the IV, prefix as constants.
+                let prefix =
+                    joint_leaf_prefix(blocks as u64, per_block as u64, 8);
+                let whole = digest_of(words, |b, cells| {
+                    let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
+                    let mut t = super::super::transcript_replay::ByteString::new();
+                    t.push_const(&prefix);
+                    let (stream, len) = edsl::leaf_stream(b, &fs);
+                    assert_eq!(len + JOINT_LEAF_PREFIX_LEN, prefix.len() + 8 * fs.len());
+                    t.push_halves(&stream);
+                    t.wrap_hash(b, edsl::ByteWrapHash::Blake3)
+                });
+                assert_eq!(whole, want, "{blocks} blocks of {per_block}, from the IV");
+            }
+        }
+    }
+
+    /// The joint leaf binds its block count through the midstate: the same
+    /// values hashed as another run width give another digest, and only the
+    /// shape's own count matches the host's.
+    #[test]
+    fn the_joint_leaf_binds_its_block_count() {
+        let values = felts(4 * 16, 7);
+        let words: Vec<LfmWord> = values
+            .iter()
+            .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()])
+            .collect();
+        let want = joint_leaf(&values, 4).expect("an even split");
+        for blocks in [2usize, 4] {
+            let got = digest_of(words.clone(), |b, cells| {
+                let fs: Vec<Felt> = cells.iter().map(|c| Felt(c.addr())).collect();
+                emit_blake3_joint_leaf(b, &fs, blocks)
+            });
+            assert_eq!(got == want, blocks == 4, "{blocks} blocks");
+        }
+    }
+
+    /// ★ A parent is `hash_new_parent(left, right)`: one compression of the
+    /// two digests' 64 bytes, in order.
+    #[test]
+    fn the_parent_is_the_hosts() {
+        let left: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(13) ^ 0x5A);
+        let right: [u8; 32] = core::array::from_fn(|i| 0xC3 ^ (i as u8).wrapping_mul(7));
+        let want = <BatchBlake3StdBackend<GoldilocksField> as IsMerkleTreeBackend>::hash_new_parent(
+            &left, &right,
+        );
+        let mut words: Vec<LfmWord> = byte_digest_words(&left).to_vec();
+        words.extend(byte_digest_words(&right));
+        let got = digest_of(words, |b, cells| {
+            edsl::wrap_hash_pair(
+                b,
+                WrapDigest::from_pair(cells[0], cells[1]),
+                WrapDigest::from_pair(cells[2], cells[3]),
+            )
+        });
+        assert_eq!(got, want);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A group's stacked opening: `stacked_eval::verify` over `Blake3Whir`, one
+// chain a run (`GroupFold::Indexed`), a tree a polynomial or one a run.
+// ---------------------------------------------------------------------------
+
+mod stacked {
+    use multilinear::mle::Mle;
+    use multilinear::stacked_eval::{Claimed, StackedCommitment, StackedProof};
+    use multilinear::stacking::StackedLayout;
+    use multilinear::whir::Domain;
+    use multilinear::whir_chain::{
+        CapPolicy, ChainConfig, ChainFormat, FirstFold, GrindBits, GroupFold, LeafOrder,
+        Round0Trees, RoundOpenings, WhirFolds,
+    };
+    use multilinear::whir_commit::Commitment;
+    use multilinear::whir_hash::Blake3Whir;
+
+    use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
+
+    use super::super::builder::{Cell, Ext};
+    use super::super::compiler::{LfmProgram, compile};
+    use super::super::edsl::WrapHash;
+    use super::super::executor::execute;
+    use super::super::validator::validate;
+    use super::super::whir_chain::{ChainShape, RoundStorage, byte_digest_words, push_round_words};
+    use super::super::whir_stacked::{StackedChainWires, emit_stacked_verify_chains};
+    use super::super::whir_transcript::WhirTranscript;
+    use super::super::word::{LfmWord, ext_word, word_as_ext};
+    use super::{HostTranscript, builder, hash_rows};
+
+    type F = GoldilocksField;
+    type E = GoldilocksExtension;
+
+    struct Case {
+        heights: Vec<usize>,
+        n_stack: usize,
+        first: Option<usize>,
+        cap: CapPolicy,
+        leaves: LeafOrder,
+        round0: Round0Trees,
+        grind: u8,
+    }
+
+    fn config(case: &Case) -> ChainConfig {
+        ChainConfig {
+            log_blowup: 2,
+            log_folding: 4,
+            num_queries: 4,
+            grind: GrindBits::uniform(case.grind),
+            format: ChainFormat {
+                folds: case.first.map_or(WhirFolds::Uniform, |k| {
+                    WhirFolds::First(FirstFold::new(k).expect("a tested first fold"))
+                }),
+                group: GroupFold::Indexed,
+                leaves: case.leaves,
+                round0: case.round0,
+                cap: case.cap,
+                ..ChainFormat::DEFAULT
+            },
+        }
+    }
+
+    fn fee(v: u64) -> FEE {
+        FEE::new([
+            FE::from(v.wrapping_mul(6364136223846793005) >> 11),
+            FE::from(v ^ 0xA5A5),
+            FE::from(v.wrapping_add(7)),
+        ])
+    }
+
+    struct Fixture {
+        cfg: ChainConfig,
+        layout: StackedLayout,
+        points: Vec<Vec<FEE>>,
+        values: Vec<FEE>,
+        roots: Vec<Commitment>,
+        proof: StackedProof<F, E>,
+        domain: Domain<F>,
+        shape: ChainShape,
+    }
+
+    fn build(case: &Case) -> Fixture {
+        let cfg = config(case);
+        let layout = StackedLayout::build(&case.heights, case.n_stack).expect("the layout packs");
+        let columns: Vec<Mle<F>> = case
+            .heights
+            .iter()
+            .enumerate()
+            .map(|(c, &h)| super::chain::pseudo_mle(h, 17 + 13 * c as u64))
+            .collect();
+        let borrowed = multilinear::stacking::borrow(&columns);
+        let points: Vec<Vec<FEE>> = case
+            .heights
+            .iter()
+            .enumerate()
+            .map(|(c, &h)| (0..h).map(|i| fee(0x5eed + (c * 37 + i) as u64)).collect())
+            .collect();
+        let values: Vec<FEE> = columns
+            .iter()
+            .zip(&points)
+            .map(|(c, p)| c.evaluate_in::<E>(p).expect("a column takes its own point"))
+            .collect();
+        let stacked = StackedCommitment::<F, Blake3Whir>::commit(layout.clone(), &borrowed, None, &cfg)
+            .expect("the group commits");
+        let proof = multilinear::stacked_eval::prove::<F, E, _, Blake3Whir, _>(
+            &stacked,
+            &borrowed,
+            None,
+            &Claimed::PerColumn(&points),
+            &values,
+            &cfg,
+            &mut HostTranscript::new(&[]),
+        )
+        .expect("the group proves");
+        let f = Fixture {
+            shape: ChainShape::for_hash(&cfg, layout.n_stack(), WrapHash::Blake3),
+            cfg,
+            layout,
+            points,
+            values,
+            roots: stacked.roots(),
+            proof,
+            domain: stacked.domain().clone(),
+        };
+        assert!(host_accepts(&f, &f.proof), "the host accepts its own proof");
+        f
+    }
+
+    fn host_accepts(f: &Fixture, proof: &StackedProof<F, E>) -> bool {
+        multilinear::stacked_eval::verify::<F, E, _, Blake3Whir>(
+            proof,
+            &f.layout,
+            &f.roots,
+            &Claimed::PerColumn(&f.points),
+            &f.values,
+            &f.domain,
+            &f.cfg,
+            &mut HostTranscript::new(&[]),
+        )
+        .is_ok()
+    }
+
+    /// The trees of each run: one a polynomial, or the run's one joint tree.
+    fn run_trees(f: &Fixture) -> Vec<std::ops::Range<usize>> {
+        let trees = multilinear::stacked_eval::round0_trees(f.layout.num_polys(), &f.cfg);
+        f.shape
+            .chains(f.layout.num_polys())
+            .iter()
+            .map(|run| {
+                let first = trees
+                    .iter()
+                    .position(|t| t.start == run.start)
+                    .expect("a tree starts the run");
+                let last = trees
+                    .iter()
+                    .position(|t| t.end == run.end)
+                    .expect("a tree ends the run");
+                first..last + 1
+            })
+            .collect()
+    }
+
+    /// Each column's point, the values, then per run its roots (two words
+    /// each), its final value and its rounds. Publishes the batching draw.
+    fn program(f: &Fixture) -> LfmProgram {
+        let mut b = builder();
+        let runs = f.shape.chains(f.layout.num_polys());
+        let trees = run_trees(f);
+        let mut total: u32 = f.points.iter().map(|p| p.len() as u32).sum::<u32>()
+            + f.values.len() as u32;
+        let mut chain_at = Vec::new();
+        for (run, t) in runs.iter().zip(&trees) {
+            chain_at.push(total);
+            total += 2 * t.len() as u32 + 1 + RoundStorage::words(&f.shape.run(run.len()));
+        }
+        let arena = b.declare_arena(total);
+        let mut transcript = WhirTranscript::for_builder(&mut b);
+        let mut next = 0u32;
+        let points: Vec<Vec<Ext>> = f
+            .points
+            .iter()
+            .map(|p| {
+                p.iter()
+                    .map(|_| {
+                        let w = b.hint_word(arena, next).as_ext();
+                        next += 1;
+                        w
+                    })
+                    .collect()
+            })
+            .collect();
+        let values: Vec<Ext> = (0..f.values.len() as u32)
+            .map(|_| {
+                let w = b.hint_word(arena, next).as_ext();
+                next += 1;
+                w
+            })
+            .collect();
+        let mut roots: Vec<Vec<Cell>> = Vec::new();
+        let mut finals: Vec<Ext> = Vec::new();
+        let mut storage: Vec<RoundStorage> = Vec::new();
+        for ((run, t), &base) in runs.iter().zip(&trees).zip(&chain_at) {
+            let n = 2 * t.len() as u32;
+            roots.push((0..n).map(|i| b.hint_word(arena, base + i)).collect());
+            finals.push(b.hint_word(arena, base + n).as_ext());
+            storage.push(RoundStorage::hint(
+                &mut b,
+                arena,
+                base + n + 1,
+                &f.shape.run(run.len()),
+            ));
+        }
+        let openings: Vec<_> = storage.iter().map(RoundStorage::openings).collect();
+        let rounds: Vec<Vec<_>> = storage
+            .iter()
+            .zip(&openings)
+            .map(|(chain, (current, next))| chain.wires(current, next))
+            .collect();
+        let chains: Vec<StackedChainWires<'_>> = (0..runs.len())
+            .map(|i| StackedChainWires {
+                rounds: &rounds[i],
+                roots: &roots[i],
+                final_value: finals[i],
+            })
+            .collect();
+        let claimed: Vec<&[Ext]> = points.iter().map(Vec::as_slice).collect();
+        let gamma = emit_stacked_verify_chains(
+            &mut b,
+            &mut transcript,
+            &f.layout,
+            &chains,
+            &claimed,
+            &values,
+            None,
+            &f.shape,
+            &f.domain,
+        );
+        b.public(gamma.as_cell());
+        let program = compile(b.finish());
+        validate(&program).expect("the BLAKE3 grouped leg is admissible");
+        program
+    }
+
+    fn arena(f: &Fixture, proof: &StackedProof<F, E>) -> Vec<LfmWord> {
+        let mut words: Vec<LfmWord> = f.points.iter().flatten().map(ext_word).collect();
+        words.extend(f.values.iter().map(ext_word));
+        let runs = f.shape.chains(f.layout.num_polys());
+        for ((chain, run), t) in proof.polys.iter().zip(&runs).zip(run_trees(f)) {
+            for root in &f.roots[t] {
+                words.extend(byte_digest_words(root));
+            }
+            words.push(ext_word(&chain.final_value));
+            push_round_words(&mut words, &f.shape.run(run.len()), chain);
+        }
+        words
+    }
+
+    fn runs(program: &LfmProgram, words: Vec<LfmWord>) -> Result<FEE, String> {
+        let exec = execute(program, &[words], &crate::hash_pin::BLOCK_HASHER)
+            .map_err(|e| format!("{e:?}"))?;
+        word_as_ext(&exec.public_words[0].1).ok_or_else(|| "no published draw".to_string())
+    }
+
+    /// The host's batching draw: the stacked verifier's first sample after
+    /// absorbing the claimed values, replayed on the host transcript.
+    fn host_gamma(f: &Fixture) -> FEE {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+        let mut t = HostTranscript::new(&[]);
+        for v in &f.values {
+            t.append_field_element(v);
+        }
+        t.sample_field_element()
+    }
+
+    fn cases() -> Vec<(&'static str, Case)> {
+        let base = |heights: &[usize], n_stack| Case {
+            heights: heights.to_vec(),
+            n_stack,
+            first: Some(6),
+            cap: CapPolicy::Off,
+            leaves: LeafOrder::Natural,
+            round0: Round0Trees::Each,
+            grind: 4,
+        };
+        let mut cases = Vec::new();
+        for round0 in [Round0Trees::Each, Round0Trees::One] {
+            for leaves in [LeafOrder::Natural, LeafOrder::Coset] {
+                for cap in [CapPolicy::Off, CapPolicy::Fixed(2), CapPolicy::Auto] {
+                    cases.push((
+                        "three polys",
+                        Case {
+                            round0,
+                            leaves,
+                            cap,
+                            ..base(&[9; 3], 9)
+                        },
+                    ));
+                }
+                cases.push((
+                    "two polys",
+                    Case {
+                        round0,
+                        leaves,
+                        ..base(&[9; 2], 9)
+                    },
+                ));
+                cases.push((
+                    "four polys",
+                    Case {
+                        round0,
+                        leaves,
+                        ..base(&[9; 4], 9)
+                    },
+                ));
+                cases.push((
+                    "five polys split [4, 1]",
+                    Case {
+                        round0,
+                        leaves,
+                        ..base(&[8; 5], 8)
+                    },
+                ));
+                cases.push((
+                    "mixed heights",
+                    Case {
+                        round0,
+                        leaves,
+                        ..base(&[8, 5, 8, 3, 7, 8], 8)
+                    },
+                ));
+            }
+        }
+        cases
+    }
+
+    /// ★ THE GROUPED GATE. Under one tree a polynomial and one a run, natural
+    /// and coset leaves, three caps, runs of two to four and a split, the
+    /// emitted leg executes on every proof the host accepts, its batching draw
+    /// is the host's, and it hashes with BLAKE3 alone.
+    #[test]
+    fn a_blake3_group_opening_executes_on_proofs_the_host_accepts() {
+        for (name, case) in cases() {
+            let f = build(&case);
+            let joint = f
+                .shape
+                .chains(f.layout.num_polys())
+                .iter()
+                .any(|run| f.shape.run(run.len()).joint());
+            assert_eq!(
+                joint,
+                case.round0 == Round0Trees::One,
+                "{name}: a joint run exactly under one tree a run"
+            );
+            let program = program(&f);
+            let (blake3, other) = hash_rows(&program);
+            assert!(blake3 > 0);
+            assert_eq!(other, 0, "{name}: BLAKE3 alone");
+            let gamma = runs(&program, arena(&f, &f.proof)).unwrap_or_else(|e| {
+                panic!(
+                    "{name} ({:?}, {:?}, {:?}): refused an accepted proof: {e}",
+                    case.round0, case.leaves, case.cap
+                )
+            });
+            assert_eq!(gamma, host_gamma(&f), "{name}: the batching draw");
+        }
+    }
+
+    /// ★ THE JOINT TAMPER ARM. One tree a run, natural and coset, uncapped and
+    /// capped: a value off in any block of a joint leaf, two blocks swapped,
+    /// a joint path node off (its last byte), and a root off in its second
+    /// word are refused by the host and have no execution.
+    #[test]
+    fn a_tampered_joint_blake3_leg_cannot_execute() {
+        for leaves in [LeafOrder::Natural, LeafOrder::Coset] {
+            for cap in [CapPolicy::Off, CapPolicy::Fixed(2)] {
+                let case = Case {
+                    heights: vec![9; 3],
+                    n_stack: 9,
+                    first: Some(6),
+                    cap,
+                    leaves,
+                    round0: Round0Trees::One,
+                    grind: 0,
+                };
+                let f = build(&case);
+                let program = program(&f);
+                runs(&program, arena(&f, &f.proof)).expect("the control executes");
+                let width = f.shape.run(3).current_block(0);
+                assert_eq!(width, 3 * 64);
+                let mut forgeries = Vec::new();
+                for t in [0usize, 63, 64, 64 + 5, width - 1] {
+                    let mut forged = f.proof.clone();
+                    match &mut forged.polys[0].rounds[0].openings {
+                        RoundOpenings::BaseJoint(p) => p.current[1].values[t] += FE::one(),
+                        _ => panic!("chain 0 is joint"),
+                    }
+                    forgeries.push((format!("value {t}"), forged));
+                }
+                let mut swapped = f.proof.clone();
+                match &mut swapped.polys[0].rounds[0].openings {
+                    RoundOpenings::BaseJoint(p) => {
+                        for opening in &mut p.current {
+                            let (a, b) = opening.values.split_at_mut(64);
+                            a.swap_with_slice(&mut b[..64]);
+                        }
+                    }
+                    _ => panic!("chain 0 is joint"),
+                }
+                forgeries.push(("blocks 0 and 1 swapped".to_string(), swapped));
+                let mut node = f.proof.clone();
+                match &mut node.polys[0].rounds[0].openings {
+                    RoundOpenings::BaseJoint(p) => p.current[2].proof.merkle_path[0][31] ^= 1,
+                    _ => panic!("chain 0 is joint"),
+                }
+                forgeries.push(("a path node".to_string(), node));
+                for (what, forged) in &forgeries {
+                    assert!(!host_accepts(&f, forged), "{what} ({leaves:?}, {cap:?}): host");
+                    assert!(
+                        runs(&program, arena(&f, forged)).is_err(),
+                        "{what} ({leaves:?}, {cap:?}): must have no execution"
+                    );
+                }
+                let mut words = arena(&f, &f.proof);
+                let root_at = f.points.iter().map(Vec::len).sum::<usize>() + f.values.len();
+                words[root_at + 1][2] += FE::one();
+                assert!(
+                    runs(&program, words).is_err(),
+                    "a joint root off in its second word"
+                );
+            }
+        }
+    }
+
+    /// A joint leg and a per-tree leg refuse each other's proofs.
+    #[test]
+    fn a_joint_blake3_leg_and_a_per_tree_one_refuse_each_others_proofs() {
+        let at = |round0| Case {
+            heights: vec![9; 3],
+            n_stack: 9,
+            first: Some(6),
+            cap: CapPolicy::Off,
+            leaves: LeafOrder::Coset,
+            round0,
+            grind: 0,
+        };
+        let each = build(&at(Round0Trees::Each));
+        let one = build(&at(Round0Trees::One));
+        let (each_program, one_program) = (program(&each), program(&one));
+        assert!(runs(&one_program, arena(&each, &each.proof)).is_err());
+        assert!(runs(&each_program, arena(&one, &one.proof)).is_err());
+    }
+}
