@@ -205,6 +205,11 @@ pub struct WhirTreeConfig {
     /// them before taking the card. Prover-only: a cache, the bytes are the
     /// same.
     pub node_domains_early: bool,
+    /// `W3_READOUTS_AFTER=0|1` (default 0): the base's harness read-outs (the
+    /// stamps' report, LT's heights, the groups' tables, the plan, the leaves'
+    /// census) print after the whole block, not between the base and the tree
+    /// where the card waits for them. Output only.
+    pub readouts_after: bool,
     /// `W3_STREAM_LEAF=0|1` (default on, [`STREAM_LEAF_DEFAULT`]; 0 is the
     /// control): the leaf phase B leads last, when
     /// fewer than [`STREAM_COVER_LEAVES`] early leaves are ahead of it on the
@@ -469,6 +474,7 @@ impl WhirTreeConfig {
         let early_pool = count_knob("W3_EARLY_POOL")?.unwrap_or(EARLY_POOL_DEFAULT);
         let stream_leaf = stream_leaf_setting(count_knob("W3_STREAM_LEAF")?)?;
         let node_domains_early = flag_knob("W3_NODE_DOMAINS_EARLY")?;
+        let readouts_after = flag_knob("W3_READOUTS_AFTER")?;
         let leaf_emitters = leaf_emitters_setting(count_knob("W3_LEAF_EMITTERS")?);
         let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
             Ok("batched") => match count_knob("BLOCK_WHIR_ARGUE_CAP")? {
@@ -564,6 +570,7 @@ impl WhirTreeConfig {
             early_leaves,
             early_pool,
             node_domains_early,
+            readouts_after,
             stream_leaf,
             leaf_emitters,
             argue,
@@ -3085,164 +3092,26 @@ pub fn prove_whir_block_tree(
     ) = pre
         .map_err(|_| "the planner panicked".to_string())?
         .map_err(|e| format!("the plan and the leaves derive: {e}"))?;
-    sink.write(&stamps.report());
     #[cfg(test)]
     let phase_b: Vec<(usize, f64)> = stamps
         .phase_b_order
         .iter()
         .filter_map(|&g| stamps.groups.get(g).map(|s| (g, s.end_b)))
         .collect();
-    // LT's chunk heights (what its per-chunk deduplication leaves): equal across
-    // runs of one setting when the chunking is deterministic.
-    {
-        let frame = block_whir::block_frame(proof.statement(), elf, &opts, &format)
-            .map_err(|e| format!("the statement's frame: {e}"))?;
-        let refs = frame.airs.air_refs();
-        let lt: Vec<u8> = refs
-            .iter()
-            .zip(&proof.table_num_vars)
-            .filter(|(air, _)| air.name().starts_with("LT["))
-            .map(|(_, &n)| n)
-            .collect();
-        sink.line(&format!("W3 LT HEIGHTS: {lt:?}"));
-        sink.line(&format!(
-            "W3 CHUNKED: {} (cuts KECCAK 2^{} · ECSM 2^{} · COPY 2^{})",
-            block_whir::chunked_census(&proof.table_counts, &proof.table_num_vars),
-            options.keccak_rows_log2,
-            options.ecsm_rows_log2,
-            options.copy_rows_log2,
-        ));
-        // Each group's tables by AIR, in the group's order: which tables the
-        // card waited for, and where the layout's chunks went.
-        for (g, group) in proof.groups.iter().enumerate() {
-            let mut kinds: Vec<(String, usize)> = Vec::new();
-            for &index in group {
-                let name = refs[index as usize].name();
-                let kind = name.split('[').next().unwrap_or(name).to_string();
-                match kinds.last_mut() {
-                    Some((last, n)) if *last == kind => *n += 1,
-                    _ => kinds.push((kind, 1)),
-                }
-            }
-            let kinds: Vec<String> = kinds
-                .into_iter()
-                .map(|(kind, n)| if n == 1 { kind } else { format!("{kind}×{n}") })
-                .collect();
-            sink.line(&format!("W3 GROUP TABLES {g}: {}", kinds.join(" ")));
-        }
-        // The groups' round-0 trees (one a polynomial, or one a joint run)
-        // and the round-0 leaf permutations the card's commits paid.
-        let polys: usize = frame
-            .stack_layouts
-            .iter()
-            .map(multilinear::stacking::StackedLayout::num_polys)
-            .sum();
-        sink.line(&format!(
-            "W3 WHIR TREES: {} · round-0 trees {} · polys {polys} · card leaf permutations {}",
-            match format.zf.whir_trees {
-                multilinear::whir_chain::Round0Trees::Each => "each",
-                multilinear::whir_chain::Round0Trees::One => "one",
-            },
-            proof.proof.roots.len(),
-            multilinear::gpu::commit_leaf_perms(),
-        ));
-    }
-    sink.line(&format!(
-        "W3 BASE: {base:.2}s · statement at {stated_at:.2}s · plan + {} leaves emitted by {ready_at:.2}s ({})",
-        if upto == programs.len() {
-            format!("{upto}")
-        } else {
-            format!("{upto} of {}", programs.len())
-        },
-        if ready_at <= base {
-            "inside the base"
-        } else {
-            "after the base"
-        }
-    ));
-    // The card's upload traffic at the base's end, read against the same line at
-    // the tree's end: what the tree's proves uploaded.
+    // `W3_READOUTS_AFTER`: the base's read-outs (the stamps' report, LT's
+    // heights, the groups' tables, the plan, each leaf's chip census) print
+    // after the whole block instead of between the base and the tree, where the
+    // card waits for them. What belongs to the base's end is taken now either
+    // way: the staging traffic, the budget's state, the early leaves, and each
+    // leaf's census while its program is alive (on a thread of its own when
+    // deferred, at the early pool's lower priority).
     #[cfg(feature = "cuda")]
-    sink.line(&format!(
+    let staging_after_base = format!(
         "W3 STAGING AFTER BASE: {} · main traces built on the card {}",
         stark::gpu_lde::staging_report(),
         stark::trace::main_dev_producer_calls()
-    ));
-    sink.line(&format!(
-        "W3 LEAF EMITTERS: {} · leaf 0's program at {} · the last at {ready_at:.2}s",
-        match leaf_emitters {
-            Some(threads) => format!(
-                "{threads} at a time in leaf order, beside phase B's groups (W3_LEAF_EMITTERS)"
-            ),
-            None => "one thread a leaf, all at once, before the first group is taken \
-                     (W3_LEAF_EMITTERS=0, the control)"
-                .to_string(),
-        },
-        first_ready_at.map_or("-".to_string(), |t| format!("{t:.2}s")),
-    ));
-    sink.line(&leaf_first_line(
-        leaf_first,
-        *offered_at.lock().unwrap_or_else(|e| e.into_inner()),
-        stated_at,
-        lead.taken(),
-        &early.iter().map(|e| e.leaf).collect::<Vec<_>>(),
-    ));
-    for note in &fit_notes {
-        sink.line(&format!("W3 EARLY LEAF KEPT: {note}"));
-    }
-    if early_threads > 0 {
-        sink.line(&format!(
-            "W3 EARLY POOL: the early leaves after the first on {early_threads} threads of their own at nice \
-             {EARLY_POOL_NICE} (Linux; elsewhere at the prover's priority)"
-        ));
-    }
-    // Several leaves asked for: which led, and the rebuilt groups that decide it
-    // (a leaf leads only when its rebuilt groups are next in their class).
-    if cfg.early_leaves > 1
-        && let Some(t) = lead.taken()
-    {
-        let partition = plan.partition();
-        let owner = |g: usize| {
-            (0..partition.num_leaves())
-                .find(|&k| partition.leaf(k).contains(&g))
-                .map_or("-".to_string(), |k| k.to_string())
-        };
-        let rebuilt = if t.rebuilt.is_empty() {
-            "none".to_string()
-        } else {
-            t.rebuilt
-                .iter()
-                .map(|&(g, c)| format!("{g} (class {c}, leaf {})", owner(g)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let n = partition.num_leaves();
-        sink.line(&format!(
-            "W3 EARLY ORDER: phase B led {} of {n} leaves [{}] · rebuilt groups to come: {rebuilt} · classes fitting their window [{}] · {}",
-            t.leaves.len(),
-            t.leaves
-                .iter()
-                .zip(&t.rules)
-                .map(|(k, r)| format!("{k} ({})", r.word()))
-                .collect::<Vec<_>>()
-                .join(", "),
-            t.class_fits
-                .iter()
-                .enumerate()
-                .map(|(c, f)| format!("class {c} {}", if *f { "fits" } else { "does not" }))
-                .collect::<Vec<_>>()
-                .join(", "),
-            if t.leaves.len() + 1 >= n {
-                "every leaf but the last led".to_string()
-            } else {
-                format!(
-                    "NO VALID ORDER for the other {} leaves: their rebuilt groups are not next in their class",
-                    n - t.leaves.len()
-                )
-            }
-        ));
-    }
-    sink.line(&format!(
+    );
+    let budget_line = format!(
         "W3 TREE PROGRAM BUDGET: {}",
         match &tree_budget {
             Some(b) => format!(
@@ -3253,34 +3122,212 @@ pub fn prove_whir_block_tree(
             ),
             None => "off (every leaf program beside the base)".to_string(),
         }
-    ));
-    sink.line(&format!(
-        "W3 PLAN: {} groups · costs {:?} (Σ {}) · {} leaves {:?} · {} prepared",
-        plan.num_groups(),
-        plan.costs(),
-        plan.costs().iter().sum::<usize>(),
-        plan.partition().num_leaves(),
-        plan.partition().leaves(),
-        plan.prepared().len()
-    ));
-    sink.line(&leaf_scale_line(format.leaf_scale, &plan));
-    sink.line(&format!("W3 LEAF QUERY: {:?}", format.leaf_query));
-    // Each leaf's chips, real / padded rows: how far each sits from its next
-    // doubling, and which one doubled when the in-guest work moves.
-    // (The leaves emitted beside the base: the others do not exist yet.)
-    for (k, slot) in programs.iter().take(upto).enumerate() {
-        let program = slot.wait()?.get()?;
-        let chips: Vec<String> = super::airs::lfm_chip_census_with_hasher(
-            &program.program,
-            program.program.hasher(<BlockFamily as ProofFamily>::SOCKET),
-        )
+    );
+    let early_ids: Vec<usize> = early.iter().map(|e| e.leaf).collect();
+    let census_of = |held: Vec<std::sync::Arc<Admitted>>| -> String {
+        held.iter()
+            .enumerate()
+            .map(|(k, program)| {
+                let chips: Vec<String> = super::airs::lfm_chip_census_with_hasher(
+                    &program.program,
+                    program.program.hasher(<BlockFamily as ProofFamily>::SOCKET),
+                )
+                .iter()
+                .filter(|c| c.real_rows > 0)
+                .map(|c| format!("{}={}/{}", c.name, c.real_rows, c.rows))
+                .collect();
+                format!("W3 LEAF CENSUS {k}: {}", chips.join(" "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // The leaves emitted beside the base: the others do not exist yet.
+    let held: Vec<std::sync::Arc<Admitted>> = programs
         .iter()
-        .filter(|c| c.real_rows > 0)
-        .map(|c| format!("{}={}/{}", c.name, c.real_rows, c.rows))
-        .collect();
-        sink.line(&format!("W3 LEAF CENSUS {k}: {}", chips.join(" ")));
-    }
+        .take(upto)
+        .map(|slot| slot.wait().and_then(ProgramSlot::get))
+        .collect::<Result<_, String>>()?;
+    let census_after = cfg.readouts_after.then(|| {
+        let held = held.clone();
+        std::thread::spawn(move || {
+            lower_this_threads_priority(EARLY_POOL_NICE);
+            census_of(held)
+        })
+    });
+    let census_now = (!cfg.readouts_after).then(|| census_of(held));
+    let n_programs = programs.len();
+    let base_readouts = |census: &str| -> Result<(), String> {
+        sink.write(&stamps.report());
+        // LT's chunk heights (what its per-chunk deduplication leaves): equal across
+        // runs of one setting when the chunking is deterministic.
+        {
+            let frame = block_whir::block_frame(proof.statement(), elf, &opts, &format)
+                .map_err(|e| format!("the statement's frame: {e}"))?;
+            let refs = frame.airs.air_refs();
+            let lt: Vec<u8> = refs
+                .iter()
+                .zip(&proof.table_num_vars)
+                .filter(|(air, _)| air.name().starts_with("LT["))
+                .map(|(_, &n)| n)
+                .collect();
+            sink.line(&format!("W3 LT HEIGHTS: {lt:?}"));
+            sink.line(&format!(
+                "W3 CHUNKED: {} (cuts KECCAK 2^{} · ECSM 2^{} · COPY 2^{})",
+                block_whir::chunked_census(&proof.table_counts, &proof.table_num_vars),
+                options.keccak_rows_log2,
+                options.ecsm_rows_log2,
+                options.copy_rows_log2,
+            ));
+            // Each group's tables by AIR, in the group's order: which tables the
+            // card waited for, and where the layout's chunks went.
+            for (g, group) in proof.groups.iter().enumerate() {
+                let mut kinds: Vec<(String, usize)> = Vec::new();
+                for &index in group {
+                    let name = refs[index as usize].name();
+                    let kind = name.split('[').next().unwrap_or(name).to_string();
+                    match kinds.last_mut() {
+                        Some((last, n)) if *last == kind => *n += 1,
+                        _ => kinds.push((kind, 1)),
+                    }
+                }
+                let kinds: Vec<String> = kinds
+                    .into_iter()
+                    .map(|(kind, n)| if n == 1 { kind } else { format!("{kind}×{n}") })
+                    .collect();
+                sink.line(&format!("W3 GROUP TABLES {g}: {}", kinds.join(" ")));
+            }
+            // The groups' round-0 trees (one a polynomial, or one a joint run)
+            // and the round-0 leaf permutations the card's commits paid.
+            let polys: usize = frame
+                .stack_layouts
+                .iter()
+                .map(multilinear::stacking::StackedLayout::num_polys)
+                .sum();
+            sink.line(&format!(
+                "W3 WHIR TREES: {} · round-0 trees {} · polys {polys} · card leaf permutations {}",
+                match format.zf.whir_trees {
+                    multilinear::whir_chain::Round0Trees::Each => "each",
+                    multilinear::whir_chain::Round0Trees::One => "one",
+                },
+                proof.proof.roots.len(),
+                multilinear::gpu::commit_leaf_perms(),
+            ));
+        }
+        sink.line(&format!(
+            "W3 BASE: {base:.2}s · statement at {stated_at:.2}s · plan + {} leaves emitted by {ready_at:.2}s ({})",
+            if upto == n_programs {
+                format!("{upto}")
+            } else {
+                format!("{upto} of {}", n_programs)
+            },
+            if ready_at <= base {
+                "inside the base"
+            } else {
+                "after the base"
+            }
+        ));
+        // The card's upload traffic at the base's end, read against the same line at
+        // the tree's end: what the tree's proves uploaded.
+        #[cfg(feature = "cuda")]
+        sink.line(&staging_after_base);
+        sink.line(&format!(
+            "W3 LEAF EMITTERS: {} · leaf 0's program at {} · the last at {ready_at:.2}s",
+            match leaf_emitters {
+                Some(threads) => format!(
+                    "{threads} at a time in leaf order, beside phase B's groups (W3_LEAF_EMITTERS)"
+                ),
+                None => "one thread a leaf, all at once, before the first group is taken \
+                         (W3_LEAF_EMITTERS=0, the control)"
+                    .to_string(),
+            },
+            first_ready_at.map_or("-".to_string(), |t| format!("{t:.2}s")),
+        ));
+        sink.line(&leaf_first_line(
+            leaf_first,
+            *offered_at.lock().unwrap_or_else(|e| e.into_inner()),
+            stated_at,
+            lead.taken(),
+            &early_ids,
+        ));
+        for note in &fit_notes {
+            sink.line(&format!("W3 EARLY LEAF KEPT: {note}"));
+        }
+        if early_threads > 0 {
+            sink.line(&format!(
+                "W3 EARLY POOL: the early leaves after the first on {early_threads} threads of their own at nice \
+                 {EARLY_POOL_NICE} (Linux; elsewhere at the prover's priority)"
+            ));
+        }
+        // Several leaves asked for: which led, and the rebuilt groups that decide it
+        // (a leaf leads only when its rebuilt groups are next in their class).
+        if cfg.early_leaves > 1
+            && let Some(t) = lead.taken()
+        {
+            let partition = plan.partition();
+            let owner = |g: usize| {
+                (0..partition.num_leaves())
+                    .find(|&k| partition.leaf(k).contains(&g))
+                    .map_or("-".to_string(), |k| k.to_string())
+            };
+            let rebuilt = if t.rebuilt.is_empty() {
+                "none".to_string()
+            } else {
+                t.rebuilt
+                    .iter()
+                    .map(|&(g, c)| format!("{g} (class {c}, leaf {})", owner(g)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let n = partition.num_leaves();
+            sink.line(&format!(
+                "W3 EARLY ORDER: phase B led {} of {n} leaves [{}] · rebuilt groups to come: {rebuilt} · classes fitting their window [{}] · {}",
+                t.leaves.len(),
+                t.leaves
+                    .iter()
+                    .zip(&t.rules)
+                    .map(|(k, r)| format!("{k} ({})", r.word()))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                t.class_fits
+                    .iter()
+                    .enumerate()
+                    .map(|(c, f)| format!("class {c} {}", if *f { "fits" } else { "does not" }))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if t.leaves.len() + 1 >= n {
+                    "every leaf but the last led".to_string()
+                } else {
+                    format!(
+                        "NO VALID ORDER for the other {} leaves: their rebuilt groups are not next in their class",
+                        n - t.leaves.len()
+                    )
+                }
+            ));
+        }
+        sink.line(&budget_line);
+        sink.line(&format!(
+            "W3 PLAN: {} groups · costs {:?} (Σ {}) · {} leaves {:?} · {} prepared",
+            plan.num_groups(),
+            plan.costs(),
+            plan.costs().iter().sum::<usize>(),
+            plan.partition().num_leaves(),
+            plan.partition().leaves(),
+            plan.prepared().len()
+        ));
+        sink.line(&leaf_scale_line(format.leaf_scale, &plan));
+        sink.line(&format!("W3 LEAF QUERY: {:?}", format.leaf_query));
+        // Each leaf's chips, real / padded rows: how far each sits from its next
+        // doubling, and which one doubled when the in-guest work moves.
+        // (The leaves emitted beside the base: the others do not exist yet.)
+        for line in census.lines() {
+            sink.line(line);
+        }
 
+        Ok(())
+    };
+    if let Some(census) = &census_now {
+        base_readouts(census)?;
+    }
     // The readouts above run on the clock, between the base and the tree: a
     // prover prints none of them, so the whole block is also given without.
     let readouts = t0.elapsed().as_secs_f64() - base;
@@ -3472,6 +3519,13 @@ pub fn prove_whir_block_tree(
         _ => None,
     };
     let whole = t0.elapsed().as_secs_f64();
+    // `W3_READOUTS_AFTER`: the base's read-outs, now that the clock is stopped.
+    if let Some(census) = census_after {
+        let census = census
+            .join()
+            .map_err(|_| "the leaves' census thread panicked".to_string())?;
+        base_readouts(&census)?;
+    }
     for (lv, level) in timings.iter().enumerate() {
         let programs: Vec<String> = level
             .programs
@@ -5885,6 +5939,7 @@ mod tests {
             early_leaves: EARLY_LEAVES_DEFAULT,
             early_pool: EARLY_POOL_DEFAULT,
             node_domains_early: false,
+            readouts_after: false,
             stream_leaf: STREAM_LEAF_DEFAULT,
             leaf_emitters: Some(LEAF_EMITTERS),
             argue: BlockFormat::production().argue,
@@ -5923,6 +5978,10 @@ mod tests {
         assert!(
             off(|c| c.node_domains_early = true),
             "the early node domains are a cache only"
+        );
+        assert!(
+            off(|c| c.readouts_after = true),
+            "where the read-outs print is output only"
         );
         // A packing is a named constant the block verifier is given too: a
         // tree argued under another (here `Off`), its format saying so, is at
