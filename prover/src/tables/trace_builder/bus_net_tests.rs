@@ -79,7 +79,7 @@ pub(super) fn unbalanced_with(
 }
 
 /// Each bus's leftover tuples and their nets ([`unbalanced`]'s).
-type Leftovers = BTreeMap<u64, Vec<(Vec<u64>, i128)>>;
+pub(super) type Leftovers = BTreeMap<u64, Vec<(Vec<u64>, i128)>>;
 
 /// [`unbalanced_with`] under the register format `registers` (its AIRs
 /// swapped as the block's are, [`crate::block_airs`]), and the number of rows
@@ -90,6 +90,31 @@ pub(super) fn unbalanced_in(
     over: &dyn Fn(&str) -> Option<Vec<BusInteraction>>,
     registers: crate::tables::register::RegisterFormat,
 ) -> (Leftovers, usize) {
+    let nets = nets_in(program, traces, over, registers);
+    (nets.left, nets.memory_register_tokens)
+}
+
+/// What [`nets_in`] reads off a build.
+pub(super) struct Nets {
+    /// Every inner bus's leftover tuples ([`unbalanced`]'s).
+    pub(super) left: Leftovers,
+    /// The rows that put a register token (`is_register = 1`) on the Memory
+    /// bus.
+    pub(super) memory_register_tokens: usize,
+    /// The Memory bus's register tokens (`is_register = 1`) left over: the
+    /// statement closes the Memory bus from outside for memory alone, so under
+    /// the in-row register format any such token left over is a chain no table
+    /// starts.
+    pub(super) memory_register_left: Vec<(Vec<u64>, i128)>,
+}
+
+/// [`unbalanced_in`]'s nets, and the Memory bus's register tokens left over.
+pub(super) fn nets_in(
+    program: &Elf,
+    traces: &mut Traces,
+    over: &dyn Fn(&str) -> Option<Vec<BusInteraction>>,
+    registers: crate::tables::register::RegisterFormat,
+) -> Nets {
     let options = ProofOptions::default_test_options();
     let table_counts = traces.table_counts();
     let mut airs = VmAirs::new(
@@ -121,6 +146,7 @@ pub(super) fn unbalanced_in(
     }
     let memory = u64::from(BusId::Memory);
     let mut memory_register_tokens = 0usize;
+    let mut memory_register_net: HashMap<Vec<u64>, FE> = HashMap::new();
     let outside: Vec<u64> = OUTSIDE.iter().map(|b| u64::from(*b)).collect();
     let mut net: HashMap<(u64, Vec<u64>), FE> = HashMap::new();
     // Each table's share of each tuple, to name the tables of a tuple left over.
@@ -136,8 +162,17 @@ pub(super) fn unbalanced_in(
             for bi in interactions.iter().filter(|bi| bi.bus_id == memory) {
                 let first = bi.values.first().map(|v| v.combine_from(g));
                 let is_register = first.is_some_and(|v: Vec<FE>| v.first() == Some(&FE::one()));
-                if is_register && multiplicity(&bi.multiplicity, &g) != FE::zero() {
+                let m = multiplicity(&bi.multiplicity, &g);
+                if is_register && m != FE::zero() {
                     memory_register_tokens += 1;
+                    let tuple: Vec<u64> = bi
+                        .values
+                        .iter()
+                        .flat_map(|v| v.combine_from(g))
+                        .map(|x: FE| x.canonical_u64())
+                        .collect();
+                    let e = memory_register_net.entry(tuple).or_insert(FE::zero());
+                    *e = if bi.is_sender { *e + m } else { *e - m };
                 }
             }
             for bi in interactions
@@ -188,7 +223,26 @@ pub(super) fn unbalanced_in(
             by_bus.entry(bus).or_default().push((tuple, signed));
         }
     }
-    (by_bus, memory_register_tokens)
+    let memory_register_left = memory_register_net
+        .into_iter()
+        .filter(|(_, v)| *v != FE::zero())
+        .map(|(tuple, v)| (tuple, signed_net(v)))
+        .collect();
+    Nets {
+        left: by_bus,
+        memory_register_tokens,
+        memory_register_left,
+    }
+}
+
+/// A net as a small signed count: a send left over is positive.
+fn signed_net(v: FE) -> i128 {
+    let v = v.canonical_u64();
+    if v > u64::MAX / 2 {
+        -((FE::zero() - FE::from(v)).canonical_u64() as i128)
+    } else {
+        v as i128
+    }
 }
 
 pub(super) fn named(by_bus: &BTreeMap<u64, Vec<(Vec<u64>, i128)>>) -> String {
