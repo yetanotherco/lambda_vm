@@ -1378,97 +1378,26 @@ fn set_up_card() {
     }
 }
 
-/// `LAMBDA_VM_BLOCK_LT_MERGE`: unset, empty or `1` (the default) makes the
-/// rows of the LT tables the finish builds from the memory accesses' timestamp
-/// comparisons by merging equal neighbours instead of through a map
-/// ([`WindowedTraceBuilder::lt_merge`]); `0` keeps the map's rows. Any other
-/// value refuses the prove. LT's rows and BITWISE's multiplicities change, so the
-/// proof's bytes do; what it proves does not.
-fn lt_merge() -> Result<bool, Error> {
-    lt_merge_from(std::env::var("LAMBDA_VM_BLOCK_LT_MERGE").ok().as_deref())
+/// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables, counted as
+/// each is built from the table's own rows and their multiplicities, with
+/// BITWISE handed on after every other table, where the finish slides and
+/// keeps only the streamed chunks' tails
+/// ([`WindowedTraceBuilder::bitwise_from_tables`]), unless a deviation asks
+/// for phase 4's count from the ops with BITWISE leading the rest
+/// (`Some(false)`). The tables are the same either way; their order, and so
+/// the groups and the proof's bytes, are not.
+fn bitwise_from_tables_or_default(deviation: Option<bool>) -> bool {
+    deviation.unwrap_or(true)
 }
 
-/// [`lt_merge`]'s reading of its variable.
-fn lt_merge_from(value: Option<&str>) -> Result<bool, Error> {
-    match value.map(str::trim) {
-        None | Some("") | Some("1") => Ok(true),
-        Some("0") => Ok(false),
-        Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_LT_MERGE={v}: 1 or unset (LT's memory comparisons merged with \
-             their neighbours) or 0 (the map's rows)"
-        ))),
-    }
-}
-
-#[cfg(test)]
-mod lt_merge_knob_tests {
-    /// Unset, empty and `1` are the merge (the default), `0` the map's rows,
-    /// anything else is refused (an error, not a silent default).
-    #[test]
-    fn the_lt_merge_knob_is_on_unless_zero_and_refuses_the_rest() {
-        for on in [None, Some(""), Some(" "), Some("1"), Some(" 1 ")] {
-            assert!(super::lt_merge_from(on).expect("on"), "{on:?}");
-        }
-        for off in [Some("0"), Some(" 0 ")] {
-            assert!(!super::lt_merge_from(off).expect("off"), "{off:?}");
-        }
-        for bad in ["2", "on", "true", "yes", "-1"] {
-            assert!(super::lt_merge_from(Some(bad)).is_err(), "{bad}");
-        }
-    }
-}
-
-/// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`: unset, empty or `1` (the default)
-/// counts BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables as each
-/// is built, from the table's own rows and their multiplicities, and hands
-/// BITWISE on after every other table, where the finish slides and keeps only
-/// the streamed chunks' tails ([`WindowedTraceBuilder::bitwise_from_tables`]);
-/// `0` (the rollback) has phase 4 count them from their ops and BITWISE lead
-/// the rest, as before. Anything else refuses the prove. The tables are the
-/// same either way; their order, and so the groups and the proof's bytes, are
-/// not.
-fn block_bitwise_from_tables() -> Result<bool, Error> {
-    parse_bitwise_from_tables(
-        std::env::var("LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn parse_bitwise_from_tables(value: Option<&str>) -> Result<bool, Error> {
-    match value.map(str::trim) {
-        None | Some("" | "1") => Ok(true),
-        Some("0") => Ok(false),
-        Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES={v}: 1 (BITWISE's lookups from the tables' rows, \
-             BITWISE last) or 0"
-        ))),
-    }
-}
-
-/// `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST`: unset, empty or `1` (the default) has
-/// the streamed finish, when it slides, hand KECCAK_RND's tables on before
-/// every other table ([`WindowedTraceBuilder::keccak_rnd_first`]), so the card
-/// commits them while the tables before them in AIR order are built. `0`: AIR
-/// order. Anything else refuses the prove. The tables are the same; the groups
-/// they are packed into, and so the proof's bytes, are not; the verifier takes
-/// any partition the statement declares.
-fn block_keccak_rnd_first() -> Result<bool, Error> {
-    parse_keccak_rnd_first(
-        std::env::var("LAMBDA_VM_BLOCK_KECCAK_RND_FIRST")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn parse_keccak_rnd_first(value: Option<&str>) -> Result<bool, Error> {
-    match value.map(str::trim) {
-        None | Some("" | "1") => Ok(true),
-        Some("0") => Ok(false),
-        Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_KECCAK_RND_FIRST={v}: 1 (KECCAK_RND's tables handed on first) or 0"
-        ))),
-    }
+/// KECCAK_RND's tables handed on before every other table when the streamed
+/// finish slides ([`WindowedTraceBuilder::keccak_rnd_first`]), so the card
+/// commits them while the tables before them in AIR order are built, unless a
+/// deviation asks for AIR order (`Some(false)`). The tables are the same; the
+/// groups they are packed into, and so the proof's bytes, are not; the
+/// verifier takes any partition the statement declares.
+fn keccak_rnd_first_or_default(deviation: Option<bool>) -> bool {
+    deviation.unwrap_or(true)
 }
 
 /// How the rest's layout bytes ([`BlockOptions::rest_layout_bytes`]) bound
@@ -3641,13 +3570,12 @@ pub(crate) struct Deviations {
     pub rest_bitwise_last: bool,
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables, BITWISE
     /// last (`Some(true)`), or from their ops in phase 4, BITWISE first
-    /// (`Some(false)`), instead of what `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`
-    /// says (`None`; [`block_bitwise_from_tables`]).
+    /// (`Some(false)`), instead of the default (`None`: from the tables;
+    /// [`bitwise_from_tables_or_default`]).
     pub bitwise_from_tables: Option<bool>,
     /// KECCAK_RND's tables handed on first (`Some(true)`) or the rest in AIR
-    /// order (`Some(false)`), instead of what
-    /// `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST` says (`None`;
-    /// [`block_keccak_rnd_first`]).
+    /// order (`Some(false)`), instead of the default (`None`: first;
+    /// [`keccak_rnd_first_or_default`]).
     pub keccak_rnd_first: Option<bool>,
     /// The hand-out's counting on a thread of its own (`Some(true)`) or on
     /// the accumulator's (`Some(false)`), instead of the default (`None`: a
@@ -6152,14 +6080,8 @@ fn prove_streamed(
     crate::with_base_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
         let bitwise_last = deviations.rest_bitwise_last;
-        let keccak_rnd_first = match deviations.keccak_rnd_first {
-            Some(first) => first,
-            None => block_keccak_rnd_first()?,
-        };
-        let from_tables = match deviations.bitwise_from_tables {
-            Some(from_tables) => from_tables,
-            None => block_bitwise_from_tables()?,
-        };
+        let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
+        let from_tables = bitwise_from_tables_or_default(deviations.bitwise_from_tables);
         let card_fill = match (
             deviations.card_fill,
             deviations.card_fill_streamed,
@@ -6464,9 +6386,9 @@ fn prove_streamed(
                 if options.drop_streamed_ops {
                     builder = builder.drop_streamed_ops()?;
                 }
-                if lt_merge()? {
-                    builder = builder.lt_merge();
-                }
+                // LT's memory comparisons merged with their neighbours instead
+                // of the map's rows ([`WindowedTraceBuilder::lt_merge`]).
+                builder = builder.lt_merge();
                 builder = builder.p4_rows_on_pool().p4_lookups_direct();
                 if bitwise_last {
                     builder = builder.rest_bitwise_last();
@@ -9516,7 +9438,7 @@ mod rest_order_tests {
 
 #[cfg(test)]
 mod keccak_rnd_first_tests {
-    use super::{RestOrder, keccak_rnd_positions, parse_keccak_rnd_first};
+    use super::{RestOrder, keccak_rnd_first_or_default, keccak_rnd_positions};
 
     fn counts(copy: usize, keccak: usize, keccak_rnd: usize) -> crate::TableCounts {
         crate::TableCounts {
@@ -9618,22 +9540,12 @@ mod keccak_rnd_first_tests {
         );
     }
 
-    /// `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST`: on (KECCAK_RND first) unless `0`,
-    /// which keeps AIR order; any other word refuses.
+    /// KECCAK_RND first unless a deviation asks for AIR order.
     #[test]
-    fn the_keccak_rnd_first_knob_is_on_by_default_and_off_at_0() {
-        for (value, on) in [
-            (None, true),
-            (Some(""), true),
-            (Some(" 1 "), true),
-            (Some("0"), false),
-            (Some(" 0 "), false),
-        ] {
-            assert_eq!(parse_keccak_rnd_first(value).ok(), Some(on), "{value:?}");
-        }
-        for value in ["on", "true", "2", "first", "KECCAK_RND"] {
-            assert!(parse_keccak_rnd_first(Some(value)).is_err(), "{value}");
-        }
+    fn keccak_rnd_first_is_the_default_unless_a_deviation_says_otherwise() {
+        assert!(keccak_rnd_first_or_default(None));
+        assert!(keccak_rnd_first_or_default(Some(true)));
+        assert!(!keccak_rnd_first_or_default(Some(false)));
     }
 }
 
@@ -10126,32 +10038,15 @@ mod air_input_tests {
 
 #[cfg(test)]
 mod p4_rows_knob_tests {
-    use super::parse_bitwise_from_tables;
+    use super::bitwise_from_tables_or_default;
 
     /// The finish's BITWISE default: its LT, BRANCH and BYTEWISE lookups from
-    /// their tables.
+    /// their tables, unless a deviation asks for phase 4's count from the ops.
     #[test]
     fn the_finish_takes_bitwise_from_its_tables_by_default() {
-        assert_eq!(parse_bitwise_from_tables(None).ok(), Some(true));
-    }
-
-    /// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`: on (BITWISE's three families'
-    /// lookups from their tables, BITWISE last) unless `0`, the rollback; any
-    /// other word refuses.
-    #[test]
-    fn the_bitwise_from_tables_knob_is_on_by_default_and_off_at_0() {
-        for (value, on) in [
-            (None, true),
-            (Some(""), true),
-            (Some(" 1 "), true),
-            (Some("0"), false),
-            (Some(" 0\n"), false),
-        ] {
-            assert_eq!(parse_bitwise_from_tables(value).ok(), Some(on), "{value:?}");
-        }
-        for value in ["on", "true", "2", "tables", "rows"] {
-            assert!(parse_bitwise_from_tables(Some(value)).is_err(), "{value}");
-        }
+        assert!(bitwise_from_tables_or_default(None));
+        assert!(bitwise_from_tables_or_default(Some(true)));
+        assert!(!bitwise_from_tables_or_default(Some(false)));
     }
 }
 
