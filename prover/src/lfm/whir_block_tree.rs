@@ -219,7 +219,8 @@ pub struct WhirTreeConfig {
     /// are built on a pool of this many threads of their own, each level
     /// proving as its own nodes arrive.
     pub emit_threads: usize,
-    /// `W3_NODE_TIMES=1`: the per-program stamps readout after the tree.
+    /// `W3_NODE_TIMES=0|1` (default 0): the per-program stamps readout after
+    /// the tree.
     pub node_times: bool,
     /// `W3_LEAF_FIRST=0|1` (default 1): with the early leaf on, the planner
     /// offers the leaves to phase B as soon as it has derived the plan, and
@@ -274,6 +275,22 @@ fn count_knob(name: &str) -> Result<Option<usize>, String> {
             .map(Some)
             .map_err(|_| format!("{name} is a count, got `{v}`")),
     }
+}
+
+/// An on/off knob read as a count ([`count_knob`]'s value): unset or `0` is
+/// off, `1` on; any other count is an error naming the knob, as a word that is
+/// no count is.
+fn flag_setting(name: &str, knob: Option<usize>) -> Result<bool, String> {
+    match knob {
+        None | Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        Some(n) => Err(format!("{name}={n}: 0 or 1")),
+    }
+}
+
+/// [`flag_setting`] of the knob `name` from the environment.
+fn flag_knob(name: &str) -> Result<bool, String> {
+    flag_setting(name, count_knob(name)?)
 }
 
 /// `LAMBDA_VM_WHIR_GROUP`'s reading: unset or `indexed` is one chain per run
@@ -439,7 +456,7 @@ impl WhirTreeConfig {
         let leaves = count_knob("W3_LEAVES")?;
         let siblings = count_knob("W3_SIBLINGS")?.unwrap_or(3);
         let fan_in = count_knob("W3_FAN_IN")?.unwrap_or(BLOCK_FAN_IN);
-        let leaves_each = count_knob("W3_LEAF_ARTIFACTS_EACH")? == Some(1);
+        let leaves_each = flag_knob("W3_LEAF_ARTIFACTS_EACH")?;
         let early_on = count_knob("W3_LEAF_DURING_PHASE_B")?.is_none_or(|v| v != 0);
         let early_leaves = early_leaves_setting(count_knob("W3_EARLY_LEAVES")?)?;
         let early_pool = count_knob("W3_EARLY_POOL")?.unwrap_or(EARLY_POOL_DEFAULT);
@@ -542,7 +559,7 @@ impl WhirTreeConfig {
             format,
             options,
             emit_threads,
-            node_times: count_knob("W3_NODE_TIMES")? == Some(1),
+            node_times: flag_knob("W3_NODE_TIMES")?,
             leaf_first: count_knob("W3_LEAF_FIRST")?.is_none_or(|v| v != 0),
             compress,
             compress_levers,
@@ -4326,6 +4343,22 @@ mod tests {
         assert_eq!(early_leaves_setting(Some(1)), Ok(1), "the control");
         assert_eq!(early_leaves_setting(Some(3)), Ok(3));
         assert!(early_leaves_setting(Some(0)).is_err());
+    }
+
+    /// The on/off knobs (`W3_LEAF_ARTIFACTS_EACH`, `W3_NODE_TIMES`): unset and
+    /// `0` off, `1` on, any other count refused by the knob's name instead of
+    /// read as off.
+    #[test]
+    fn an_on_off_knob_takes_0_or_1_and_refuses_other_counts() {
+        for name in ["W3_LEAF_ARTIFACTS_EACH", "W3_NODE_TIMES"] {
+            assert_eq!(flag_setting(name, None), Ok(false), "{name} unset");
+            assert_eq!(flag_setting(name, Some(0)), Ok(false), "{name}=0");
+            assert_eq!(flag_setting(name, Some(1)), Ok(true), "{name}=1");
+            for n in [2, 3, 10] {
+                let err = flag_setting(name, Some(n)).expect_err("not 0 or 1");
+                assert!(err.contains(name) && err.contains("0 or 1"), "{err}");
+            }
+        }
     }
 
     /// A later leaf goes early only when its predicted execute + fill ends
