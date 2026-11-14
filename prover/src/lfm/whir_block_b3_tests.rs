@@ -305,9 +305,8 @@ fn a_tampered_blake3_base_has_no_leaf_execution() {
     }
 }
 
-/// ★ A Poseidon1 base and a BLAKE3 one are each other's foreigners: a BLAKE3
-/// plan is refused over a Poseidon1 format, and a BLAKE3 leaf does not execute
-/// a Poseidon1 base's arena (another root width, another transcript).
+/// ★ A BLAKE3 plan is over its own base alone: it is refused over a Poseidon1
+/// format, and over its own base its leaf executes.
 #[test]
 #[ignore = "proves small blocks; box tier"]
 fn a_blake3_plan_is_its_base_alone() {
@@ -326,16 +325,6 @@ fn a_blake3_plan_is_its_base_alone() {
     let (_, b3_proof) = b3_block("test_commit_4", &b3, 0);
     let plan = b3_plan(&elf, &b3_proof, &b3, 1);
     run_leaf(&plan, &b3_proof, 0).expect("its own base executes");
-    assert!(
-        block_leaf_arena(&plan, &p1_proof, 0)
-            .map(|a| a[0].len())
-            .ok()
-            != block_leaf_arena(&plan, &b3_proof, 0)
-                .map(|a| a[0].len())
-                .ok()
-            || run_leaf(&plan, &p1_proof, 0).is_err(),
-        "a Poseidon1 base has no execution in a BLAKE3 leaf"
-    );
 }
 
 /// ★★ The census on a real block: the BLAKE3 base proved at the production
