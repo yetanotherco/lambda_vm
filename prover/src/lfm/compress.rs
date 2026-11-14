@@ -46,7 +46,7 @@
 //! # The second step (C2)
 //!
 //! `LAMBDA_VM_BLOCK_COMPRESS2` ([`compress2_setting`]; default
-//! [`DEFAULT_COMPRESS2`], none: opt-in) adds a second W-LFM proof after C1: a program whose one child is C1's proof, which
+//! [`DEFAULT_COMPRESS2`], grind 26) adds a second W-LFM proof after C1: a program whose one child is C1's proof, which
 //! it verifies in-guest ([`super::wlfm_leg`]) and whose words it republishes
 //! in order, so its words are still the top's. C1 then stays in-guest
 //! checkable (stacked binding, today's chains: any C1 lever knob is refused)
@@ -276,9 +276,12 @@ pub fn compress2_checked(
 pub const DEFAULT_COMPRESS: Option<WlfmRate> = Some(COMPRESS_RATE);
 
 /// C2's query grind when no knob says otherwise; `None` ships C1's file.
-/// C2 is opt-in (`LAMBDA_VM_BLOCK_COMPRESS2=22|26`): its tail after C1 is
-/// ≈ 1.9 s on the median block, against ≈ 0.6 s for C1.
-pub const DEFAULT_COMPRESS2: Option<u8> = None;
+/// Grind 26: C2's file is ≈ 296 KB on the median block (132.6 Johnson / 61.2
+/// unique-decoding bits a round) for ≈ 0.6 s after C1, with the column
+/// engine encoding its blowup-64 codeword. `LAMBDA_VM_BLOCK_COMPRESS2=0`
+/// ships C1's file (C1 then takes [`DEFAULT_C1_LEVERS`]'s one-step levers
+/// only when no C2 runs; with C2, C1 stays as C2 verifies it in-guest).
+pub const DEFAULT_COMPRESS2: Option<u8> = Some(26);
 
 /// C1's levers when no C1 lever knob is set: today's when C2 verifies C1
 /// in-guest, else the one-step format (the evaluated columns on the

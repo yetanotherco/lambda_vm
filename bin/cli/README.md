@@ -82,10 +82,12 @@ match the value used during proving.
 ### Prove a block
 
 Prove a whole block as a recursion tree: the block's WHIR base proof, the leaves that verify its groups, the nodes
-and the top, then the compression step after the top (C1: an LFM program that verifies the top, proved by the
-block's WHIR prover at blowup 16 with the verifier's own instruction columns, fold 5 and a final polynomial). The
-file it writes is the compressed one: one WHIR proof (≈ 450 KB on a median block, against ≈ 5.4 MB for the top's
-file) that carries the block's statement and the top's words. A consumer verifies it against the ELF with `verify-block`. Needs a CUDA build
+and the top, then two compression steps after the top: C1, an LFM program that verifies the top, proved by the
+block's WHIR prover at blowup 16; and C2, one that verifies C1, proved at blowup 64 with the verifier's own
+instruction columns, fold 5, a final polynomial and a 26-bit query grind. The file it writes is C2's: one WHIR
+proof (≈ 296 KB on a median block, against ≈ 5.4 MB for the top's file) that carries the block's statement and the
+top's words. Verifying it derives C1's program and its prepared commit on the host (≈ 10 s on a median block, ≈ 20 s
+on a large one). A consumer verifies it against the ELF with `verify-block`. Needs a CUDA build
 (`cargo build --release -p cli --features cuda`).
 
 ```sh
