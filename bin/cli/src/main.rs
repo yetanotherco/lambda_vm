@@ -1375,6 +1375,13 @@ fn cmd_prove_block_base(
     );
     let opts = prover::lfm::proof::block_base_options();
     eprintln!("{}", base_line(&cfg.format.zf.base));
+    if cfg.format.zf.base == BaseFormat::B3_WHIR {
+        eprintln!(
+            "BLOCK BASE FINAL POLY: {:?} ({} reads on, 9, off or 0)",
+            prover::block_whir::b3_base_final(),
+            prover::block_whir::B3_BASE_FINAL_ENV
+        );
+    }
     eprintln!(
         "BLOCK BASE ONLY: base {:?} · group {group} · blowup {blowup} · leaves {leaves} · trees \
          {round0:?} · no recursion in this process",

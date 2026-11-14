@@ -121,6 +121,13 @@ fn a_blake3_base_needs_the_base_only_permit_and_never_reaches_the_recursion() {
     let mut want = MULTILINEAR_BLOCK_TAG.to_vec();
     want.extend_from_slice(B3_BASE_TAG_SUFFIX);
     want.extend_from_slice(b"/C8");
+    // The final polynomial's width, the base's own unless the measurement
+    // knob turned it off (no test sets it).
+    assert_eq!(
+        crate::block_whir::b3_base_final(),
+        multilinear::whir_chain::FinalPoly::Vars(crate::block_whir::B3_BASE_FINAL_VARS)
+    );
+    want.extend_from_slice(b"/F9");
     assert_eq!(block_statement_tag(&b3), want);
     assert_ne!(
         block_statement_tag(&b3),
@@ -337,4 +344,26 @@ fn a_blake3_base_commits_one_tree_a_run_and_refuses_its_tampers() {
             joint_at(p, g, c).current[0].values.pop();
         });
     });
+}
+
+/// The BLAKE3 base's final-polynomial knob: unset and its two words are the
+/// base's width, its two others turn it off, and anything else is refused.
+#[test]
+fn the_blake3_base_final_knob_reads_its_words_and_refuses_the_rest() {
+    use crate::block_whir::{B3_BASE_FINAL_VARS, b3_base_final_setting};
+    use multilinear::whir_chain::FinalPoly;
+    let on = FinalPoly::Vars(B3_BASE_FINAL_VARS);
+    for (word, want) in [
+        (None, on),
+        (Some("on"), on),
+        (Some("9"), on),
+        (Some(" ON "), on),
+        (Some("off"), FinalPoly::Off),
+        (Some("0"), FinalPoly::Off),
+    ] {
+        assert_eq!(b3_base_final_setting(word), Ok(want), "{word:?}");
+    }
+    for word in ["", "1", "6", "10", "yes"] {
+        assert!(b3_base_final_setting(Some(word)).is_err(), "{word:?}");
+    }
 }
