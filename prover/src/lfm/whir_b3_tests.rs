@@ -330,6 +330,46 @@ fn a_root_absorbed_with_its_words_swapped_moves_the_challenge() {
     assert_ne!(word_as_ext(&swapped[0]), Some(want));
 }
 
+/// A constant run that ends off a 4-byte boundary (a statement's odd-length
+/// field) followed by runtime values: the byte sponge has no boundary, so the
+/// segment is spliced and the stream is the host's.
+#[test]
+fn a_runtime_value_after_an_odd_constant_run_is_the_hosts_stream() {
+    let root: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(41).wrapping_add(9));
+    let value = ext_from(0x5151_7272);
+    for lead in [1usize, 2, 3, 5, 7] {
+        let prefix = bytes_from(0x33, lead);
+        let mut host = HostTranscript::new(&[]);
+        host.append_bytes(&prefix);
+        host.append_bytes(&root);
+        host.append_bytes(&prefix[..1]);
+        host.append_field_element(&value);
+        let want = host.sample_field_element();
+        let want_state = host.state();
+
+        let mut b = builder();
+        let arena = b.declare_arena(3);
+        let r0 = b.hint_word(arena, 0);
+        let r1 = b.hint_word(arena, 1);
+        let v = b.hint_word(arena, 2).as_ext();
+        let mut t = WhirTranscript::for_builder(&mut b);
+        t.absorb_const_bytes(&prefix);
+        t.absorb_root(&mut b, WrapDigest::from_pair(r0, r1));
+        t.absorb_const_bytes(&prefix[..1]);
+        t.absorb_ext(&mut b, v);
+        let e = t.sample_ext(&mut b);
+        let st = t.state_digest(&mut b);
+        b.public(e.as_cell());
+        publish_digest(&mut b, st);
+        let program = compile(b.finish());
+        validate(&program).expect("admissible");
+        let [w0, w1] = digest_words(&root);
+        let out = run_program(&program, &[vec![w0, w1, ext_word(&value)]]);
+        assert_eq!(word_as_ext(&out[0]), Some(want), "{lead} lead bytes: the draw");
+        assert_eq!(digest_bytes(&out[1..3]), want_state, "{lead} lead bytes: the state");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The grind: `is_valid_nonce::<Blake3Std>` over the transcript state.
 // ---------------------------------------------------------------------------
@@ -694,6 +734,32 @@ mod chain {
                     f.shape.schedule, f.shape.caps, f.shape.grind, f.shape.leaves
                 )
             });
+        }
+    }
+
+    /// ★ The cost model's compressions are the emitted program's: the
+    /// openings (leaf blocks, a parent a walked level, the caps), two a grind,
+    /// and the byte sponge's squeezes and `state()` reads — at every shape the
+    /// gate runs.
+    #[test]
+    fn a_blake3_chain_emits_its_compression_closed_form() {
+        use super::super::instr::Instr;
+        use super::super::whir_chain::chain_perms;
+        use super::super::whir_transcript::SpongeEntry;
+        for (num_vars, cfg) in cases() {
+            let shape = ChainShape::for_hash(&cfg, num_vars, WrapHash::Blake3);
+            let program = program(&shape);
+            let emitted = program
+                .instrs
+                .iter()
+                .filter(|i| matches!(i, Instr::Blake3(_)))
+                .count();
+            let predicted = chain_perms(&shape, SpongeEntry::fresh_for(WrapHash::Blake3));
+            assert_eq!(
+                emitted, predicted,
+                "S={num_vars} {:?} caps {:?} grind {:?}",
+                shape.schedule, shape.caps, shape.grind
+            );
         }
     }
 
