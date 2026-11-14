@@ -199,7 +199,8 @@ pub struct WhirTreeConfig {
     /// ([`EARLY_POOL_NICE`]), so phase B's host work, which they run beside,
     /// keeps its cores. 0: on the prover's own pool, beside phase B's work.
     pub early_pool: usize,
-    /// `W3_STREAM_LEAF=0|1` (default 0): the leaf phase B leads last, when
+    /// `W3_STREAM_LEAF=0|1` (default on, [`STREAM_LEAF_DEFAULT`]; 0 is the
+    /// control): the leaf phase B leads last, when
     /// fewer than [`STREAM_COVER_LEAVES`] early leaves are ahead of it on the
     /// card, executes as its groups arrive ([`super::executor::StreamedExecution::new_pieced`],
     /// its arena landing a group at a time), on the early leaves' pool; only
@@ -467,7 +468,7 @@ impl WhirTreeConfig {
         let early_on = count_knob("W3_LEAF_DURING_PHASE_B")?.is_none_or(|v| v != 0);
         let early_leaves = early_leaves_setting(count_knob("W3_EARLY_LEAVES")?)?;
         let early_pool = count_knob("W3_EARLY_POOL")?.unwrap_or(EARLY_POOL_DEFAULT);
-        let stream_leaf = flag_knob("W3_STREAM_LEAF")?;
+        let stream_leaf = stream_leaf_setting(count_knob("W3_STREAM_LEAF")?)?;
         let leaf_emitters = leaf_emitters_setting(count_knob("W3_LEAF_EMITTERS")?);
         let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
             Ok("batched") => match count_knob("BLOCK_WHIR_ARGUE_CAP")? {
@@ -1491,6 +1492,21 @@ pub(crate) fn early_leaf_first(mut order: Vec<TreeAt>, first: Option<usize>) -> 
         order[..=at].rotate_right(1);
     }
     order
+}
+
+/// `W3_STREAM_LEAF` unset: the leaf phase B leads last streams its execute
+/// beside phase B when the cover rule lets it ([`STREAM_COVER_LEAVES`]).
+pub(crate) const STREAM_LEAF_DEFAULT: bool = true;
+
+/// `W3_STREAM_LEAF`: unset is [`STREAM_LEAF_DEFAULT`] (on), `0` off (the
+/// control), `1` on; any other count is refused.
+fn stream_leaf_setting(knob: Option<usize>) -> Result<bool, String> {
+    match knob {
+        None => Ok(STREAM_LEAF_DEFAULT),
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        Some(n) => Err(format!("W3_STREAM_LEAF={n}: 0 or 1")),
+    }
 }
 
 /// `W3_STREAM_LEAF`: the leaf phase B leads last streams only while fewer
@@ -5718,6 +5734,22 @@ mod tests {
         }
     }
 
+    /// `W3_STREAM_LEAF`: unset streams the last leaf (the default), 0 is the
+    /// control, 1 is on, and any other count is refused.
+    #[test]
+    fn the_stream_leaf_knob_is_on_unless_0_and_refuses_other_counts() {
+        assert_eq!(
+            stream_leaf_setting(None),
+            Ok(true),
+            "unset streams the last leaf"
+        );
+        assert_eq!(stream_leaf_setting(Some(0)), Ok(false), "the control");
+        assert_eq!(stream_leaf_setting(Some(1)), Ok(true));
+        for n in [2, 3, 100] {
+            assert!(stream_leaf_setting(Some(n)).is_err(), "W3_STREAM_LEAF={n}");
+        }
+    }
+
     /// The streaming leaf is fed each of its groups once, as each arrives, in
     /// any order, and is handed back as an early leaf exactly when its last
     /// has gone; nothing streams, nothing is fed.
@@ -5789,7 +5821,7 @@ mod tests {
             early_on: true,
             early_leaves: EARLY_LEAVES_DEFAULT,
             early_pool: EARLY_POOL_DEFAULT,
-            stream_leaf: false,
+            stream_leaf: STREAM_LEAF_DEFAULT,
             leaf_emitters: Some(LEAF_EMITTERS),
             argue: BlockFormat::production().argue,
             format: BlockFormat::production(),
@@ -5820,6 +5852,10 @@ mod tests {
         assert!(
             off(|c| c.siblings = 6),
             "the sibling count is scheduling only"
+        );
+        assert!(
+            off(|c| c.stream_leaf = !STREAM_LEAF_DEFAULT),
+            "the streamed leaf is scheduling only"
         );
         // A packing is a named constant the block verifier is given too: a
         // tree argued under another (here `Off`), its format saying so, is at
