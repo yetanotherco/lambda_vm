@@ -49,6 +49,10 @@ pub const SHIFT_COLUMNS: usize = 29;
 pub const MEMW_COLUMNS: usize = 49;
 /// CPU's columns (`cpu::cols::NUM_COLUMNS`).
 pub const CPU_COLUMNS: usize = 37;
+/// CPU's columns under the register format that checks a CPU row's register
+/// accesses in the row itself (`cpu::inrow_cols::NUM_COLUMNS_INROW`): today's
+/// and the five a [`CpuSideC`] fills.
+pub const CPU_IN_ROW_COLUMNS: usize = CPU_COLUMNS + 5;
 /// KECCAK_RND's columns (`keccak_rnd::cols::NUM_COLUMNS`).
 pub const KECCAK_RND_COLUMNS: usize = 1480;
 /// Rows a keccak operation fills.
@@ -73,6 +77,22 @@ pub struct LogC {
     pub src2_val: u64,
     pub dst_val: u64,
 }
+
+/// One CPU row's register slots under the register format that checks a CPU
+/// row's register accesses in the row itself (the prover's side record,
+/// field for field): the previous timestamps of `rs1`, `rs2` and `rd`, then
+/// `rd`'s old value, low word then high word. They fill CPU's columns 37–41.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuSideC {
+    pub prev_ts: [u32; 3],
+    pub old_rd: [u32; 2],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<CpuSideC>() == 20);
+    assert!(std::mem::offset_of!(CpuSideC, old_rd) == 12);
+};
 
 /// One MEMW_R row (the prover's `RegRow`): `address` the register index,
 /// `old_ts_lo` the old timestamp's low word, `is_read` 0 or 1, `pad` 0.
@@ -254,6 +274,7 @@ const _: () = {
 // (`RegRowC::pad` is a named field; the row families' structs end in
 // padding), so its bytes on the card are the struct the kernel declares.
 unsafe impl DeviceRepr for LogC {}
+unsafe impl DeviceRepr for CpuSideC {}
 unsafe impl DeviceRepr for RegRowC {}
 unsafe impl DeviceRepr for DecodeEntryC {}
 unsafe impl DeviceRepr for DecodeRunC {}
@@ -496,8 +517,42 @@ pub fn fill_cpu_from_logs_into(
     height: usize,
     dst: &mut CudaViewMut<u64>,
 ) -> Result<FillTimes> {
+    fill_cpu_rows_into(stream, logs, &[], decode, height, dst)
+}
+
+/// [`fill_cpu_from_logs_into`] under the register format that checks a CPU
+/// row's register accesses in the row itself: `dst` holds
+/// [`CPU_IN_ROW_COLUMNS`] columns, the last five from `sides` (one a log; the
+/// padding rows' zero).
+pub fn fill_cpu_in_row_from_logs_into(
+    stream: &Arc<CudaStream>,
+    logs: &[LogC],
+    sides: &[CpuSideC],
+    decode: &CardDecode,
+    height: usize,
+    dst: &mut CudaViewMut<u64>,
+) -> Result<FillTimes> {
+    ensure_eq!(sides.len(), logs.len(), "one side record a log");
+    ensure!(!sides.is_empty(), "the side records");
+    fill_cpu_rows_into(stream, logs, sides, decode, height, dst)
+}
+
+/// CPU's columns of `logs` (and of `sides`, when there are any) into `dst`.
+fn fill_cpu_rows_into(
+    stream: &Arc<CudaStream>,
+    logs: &[LogC],
+    sides: &[CpuSideC],
+    decode: &CardDecode,
+    height: usize,
+    dst: &mut CudaViewMut<u64>,
+) -> Result<FillTimes> {
     ensure!(logs.len() <= height, "more logs than the table");
-    ensure_eq!(dst.len(), height * CPU_COLUMNS, "the table's words");
+    let cols = if sides.is_empty() {
+        CPU_COLUMNS
+    } else {
+        CPU_IN_ROW_COLUMNS
+    };
+    ensure_eq!(dst.len(), height * cols, "the table's words");
     if height == 0 {
         return Ok(FillTimes {
             upload_ms: 0.0,
@@ -509,11 +564,14 @@ pub fn fill_cpu_from_logs_into(
     let mut missing = stream.alloc_zeros::<u64>(1)?;
     let clock = Clock::start(stream)?;
     let records = upload(stream, logs)?;
+    let sides_dev = (!sides.is_empty())
+        .then(|| upload(stream, sides))
+        .transpose()?;
     clock.uploaded.record(stream)?;
     let (n, height_u64) = (logs.len() as u64, height as u64);
     unsafe {
-        stream
-            .launch_builder(&m.cpu)
+        let mut launch = stream.launch_builder(&m.cpu);
+        launch
             .arg(&records)
             .arg(&n)
             .arg(&decode.entries)
@@ -521,15 +579,20 @@ pub fn fill_cpu_from_logs_into(
             .arg(&decode.nruns)
             .arg(&height_u64)
             .arg(dst)
-            .arg(&mut missing)
-            .launch(LaunchConfig {
-                grid_dim: (row_grid(height, CPU_BLOCK)?, 1, 1),
-                block_dim: (CPU_BLOCK, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
+            .arg(&mut missing);
+        // No side records: a null pointer, and the kernel writes today's 37.
+        match &sides_dev {
+            Some(sides) => launch.arg(sides),
+            None => launch.arg(&NO_SIDES),
+        };
+        launch.launch(LaunchConfig {
+            grid_dim: (row_grid(height, CPU_BLOCK)?, 1, 1),
+            block_dim: (CPU_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })?;
     }
     clock.done.record(stream)?;
-    let times = clock.finish(size_of_val(logs))?;
+    let times = clock.finish(size_of_val(logs) + size_of_val(sides))?;
     let missing = crate::readback::clone_dtoh(stream, &missing)?;
     stream.synchronize()?;
     ensure_eq!(missing[0], 0, "every log's pc has a DECODE row");
@@ -609,9 +672,13 @@ pub enum RecordsInput<'a> {
     /// `first_cycle` is the first log's cycle in the run, and `hold` the
     /// records the logs belong to: the card-rows cache keys its copy of the
     /// logs by the first and keeps the second alive while it holds them
-    /// ([`crate::card_rows`]). The fill itself reads neither.
+    /// ([`crate::card_rows`]). The fill itself reads neither. Under the
+    /// register format that checks a CPU row's register accesses in the row
+    /// itself, `sides` holds one side record a log (in pieces of their own)
+    /// and the table [`CPU_IN_ROW_COLUMNS`] columns; otherwise it is empty.
     Cpu {
         logs: &'a [&'a [LogC]],
+        sides: &'a [&'a [CpuSideC]],
         decode: &'a Arc<CardDecode>,
         first_cycle: u64,
         hold: Option<&'a Arc<dyn std::any::Any + Send + Sync>>,
@@ -704,7 +771,8 @@ impl RecordsInput<'_> {
     pub fn cols(&self) -> usize {
         match self {
             Self::KeccakRnd { .. } => KECCAK_RND_COLUMNS,
-            Self::Cpu { .. } => CPU_COLUMNS,
+            Self::Cpu { sides, .. } if sides.iter().all(|piece| piece.is_empty()) => CPU_COLUMNS,
+            Self::Cpu { .. } => CPU_IN_ROW_COLUMNS,
             Self::MemwR { .. } | Self::MemwRWords { .. } => MEMW_R_COLUMNS,
             Self::MemwA { .. } => MEMW_A_COLUMNS,
             Self::Load { .. } => LOAD_COLUMNS,
@@ -719,7 +787,10 @@ impl RecordsInput<'_> {
     pub fn bytes(&self) -> usize {
         match self {
             Self::KeccakRnd { ops, .. } => size_of_val(*ops),
-            Self::Cpu { logs, .. } => logs.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::Cpu { logs, sides, .. } => {
+                logs.iter().map(|piece| size_of_val(*piece)).sum::<usize>()
+                    + sides.iter().map(|piece| size_of_val(*piece)).sum::<usize>()
+            }
             Self::MemwR { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::MemwRWords { words, whole, .. } => {
                 words.iter().map(|piece| size_of_val(*piece)).sum::<usize>()
@@ -898,15 +969,20 @@ pub(crate) fn fill_col_major_into(
             launch_keccak_rnd(stream, &m.keccak_rnd_in, &ops_dev, nops, skip, rows, dst)
         }
         RecordsInput::Cpu {
-            logs, decode, rows, ..
+            logs,
+            sides,
+            decode,
+            rows,
+            ..
         } => {
             let n = records.len() as u64;
             let logs_dev = upload_pieces(stream, logs)?;
+            let sides_dev = upload_sides(stream, sides, records.len())?;
             let height = rows as u64;
             let missing = checks.missing(stream)?;
             unsafe {
-                stream
-                    .launch_builder(&m.cpu)
+                let mut launch = stream.launch_builder(&m.cpu);
+                launch
                     .arg(&logs_dev)
                     .arg(&n)
                     .arg(&decode.entries)
@@ -914,12 +990,16 @@ pub(crate) fn fill_col_major_into(
                     .arg(&decode.nruns)
                     .arg(&height)
                     .arg(&mut *dst)
-                    .arg(missing)
-                    .launch(LaunchConfig {
-                        grid_dim: (row_grid(rows, CPU_BLOCK)?, 1, 1),
-                        block_dim: (CPU_BLOCK, 1, 1),
-                        shared_mem_bytes: 0,
-                    })?;
+                    .arg(missing);
+                match &sides_dev {
+                    Some(sides) => launch.arg(sides),
+                    None => launch.arg(&NO_SIDES),
+                };
+                launch.launch(LaunchConfig {
+                    grid_dim: (row_grid(rows, CPU_BLOCK)?, 1, 1),
+                    block_dim: (CPU_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
             }
             #[cfg(feature = "test-faults")]
             if let Some(pair) = fault_cpu_swap() {
@@ -985,6 +1065,25 @@ pub(crate) fn fill_col_major_into(
     }
 }
 
+/// The CPU kernel's side-record pointer without side records: null, and the
+/// kernel writes today's columns alone.
+const NO_SIDES: u64 = 0;
+
+/// A CPU table's side records on the card, its `n` logs' (none: `None`),
+/// pieces in order. Refused unless there is one a log.
+pub(crate) fn upload_sides(
+    stream: &Arc<CudaStream>,
+    sides: &[&[CpuSideC]],
+    n: usize,
+) -> Result<Option<CudaSlice<CpuSideC>>> {
+    let held: usize = sides.iter().map(|piece| piece.len()).sum();
+    if held == 0 {
+        return Ok(None);
+    }
+    ensure_eq!(held, n, "one side record a log");
+    upload_pieces(stream, sides).map(Some)
+}
+
 /// A CPU table's logs on the card: copied up for this table, or a CPU chunk
 /// the card-rows cache holds ([`crate::card_rows`]), by its address.
 pub(crate) enum CpuLogsOnCard {
@@ -1006,6 +1105,9 @@ pub(crate) enum Staged<'a> {
         logs: CpuLogsOnCard,
         n: usize,
         decode: &'a CardDecode,
+        /// The side records, under the in-row register format
+        /// ([`RecordsInput::Cpu`]); never cached.
+        sides: Option<CudaSlice<CpuSideC>>,
     },
     MemwR(CudaSlice<RegRowC>, usize),
     MemwA(CudaSlice<AlignedRowC>, usize),
@@ -1028,10 +1130,16 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
             ops: upload(stream, ops)?,
             skip,
         },
-        RecordsInput::Cpu { logs, decode, .. } => Staged::Cpu {
+        RecordsInput::Cpu {
+            logs,
+            sides,
+            decode,
+            ..
+        } => Staged::Cpu {
             logs: CpuLogsOnCard::Owned(upload_pieces(stream, logs)?),
             n,
             decode: decode.as_ref(),
+            sides: upload_sides(stream, sides, n)?,
         },
         RecordsInput::MemwR { records, .. } => Staged::MemwR(upload_pieces(stream, records)?, n),
         RecordsInput::MemwRWords { decode, .. } => {
@@ -1068,7 +1176,12 @@ pub(crate) fn launch_staged(
             let skip = &(*skip + fault_records_skip());
             launch_keccak_rnd(stream, &m.keccak_rnd_in, ops, *nops, *skip, rows, dst)
         }
-        Staged::Cpu { logs, n, decode } => {
+        Staged::Cpu {
+            logs,
+            n,
+            decode,
+            sides,
+        } => {
             let (n, height) = (*n as u64, rows as u64);
             let missing = checks.missing(stream)?;
             let config = LaunchConfig {
@@ -1089,8 +1202,12 @@ pub(crate) fn launch_staged(
                     .arg(&decode.nruns)
                     .arg(&height)
                     .arg(&mut *dst)
-                    .arg(missing)
-                    .launch(config)?;
+                    .arg(missing);
+                match sides {
+                    Some(sides) => launch.arg(sides),
+                    None => launch.arg(&NO_SIDES),
+                };
+                launch.launch(config)?;
             }
             #[cfg(feature = "test-faults")]
             if let Some(pair) = fault_cpu_swap() {

@@ -67,6 +67,9 @@ pub(super) fn whole_table(rows: usize) -> bool {
 /// A full CPU chunk held as the logs of its cycles, from `first_cycle` on.
 pub(crate) struct CpuLogRecords {
     logs: Segments<Log>,
+    /// Under the in-row register format, one side record a log, in the same
+    /// order (in pieces of their own); empty otherwise.
+    sides: Segments<cpu::CpuSide>,
     first_cycle: u64,
     decode: Arc<CardDecode>,
 }
@@ -82,9 +85,25 @@ impl CpuLogRecords {
     ) -> Option<Self> {
         whole_table(logs.len()).then_some(Self {
             logs,
+            sides: Segments { parts: Vec::new() },
             first_cycle,
             decode,
         })
+    }
+
+    /// [`Self::new`] under the in-row register format: the chunk's logs and
+    /// their side records, one a log (refused otherwise), the table's five
+    /// more columns filled from them.
+    pub(crate) fn in_row(
+        logs: Segments<Log>,
+        sides: Segments<cpu::CpuSide>,
+        first_cycle: u64,
+        decode: Arc<CardDecode>,
+    ) -> Option<Self> {
+        (sides.len() == logs.len() && sides.len() > 0)
+            .then(|| Self::new(logs, first_cycle, decode))
+            .flatten()
+            .map(|records| Self { sides, ..records })
     }
 
     /// The table held as these records.
@@ -95,6 +114,11 @@ impl CpuLogRecords {
     /// The host's DECODE table its CPU ops are read with.
     pub(crate) fn decode_table(&self) -> &DecodeTable {
         &self.decode.table
+    }
+
+    /// Its side records, under the in-row register format; `None` otherwise.
+    pub(crate) fn sides(&self) -> Option<&Segments<cpu::CpuSide>> {
+        (self.sides.len() > 0).then_some(&self.sides)
     }
 
     /// A test's fault: the same chunk from a copy of its logs, each log's
@@ -139,19 +163,24 @@ impl TableRecords for CpuLogRecords {
     }
 
     fn cols(&self) -> usize {
-        cpu::cols::NUM_COLUMNS
+        if self.sides.len() == 0 {
+            cpu::cols::NUM_COLUMNS
+        } else {
+            cpu::inrow_cols::NUM_COLUMNS_INROW
+        }
     }
 
     fn fill(&self) -> RecordsFill<'_> {
         RecordsFill::Cpu {
             logs: self.logs.slices().into_iter().map(cpu::card_logs).collect(),
+            sides: self.sides.slices(),
             first_cycle: self.first_cycle,
             decode: &self.decode.records,
         }
     }
 
     fn bytes(&self) -> usize {
-        self.logs.op_bytes()
+        self.logs.op_bytes() + self.sides.op_bytes()
     }
 
     /// TIMESTAMP, `4·(row + 1)`: the fill writes it from the row index, as the
@@ -170,14 +199,25 @@ impl TableRecords for CpuLogRecords {
             super::super::collect_cpu_ops_into(piece, &self.decode.table, first, &mut ops).ok()?;
             first += piece.len();
         }
-        let mut trace = cpu::generate_cpu_trace_as(&ops, &self.decode.table, TraceForm::Narrow);
+        let mut trace = if self.sides.len() == 0 {
+            cpu::generate_cpu_trace_as(&ops, &self.decode.table, TraceForm::Narrow)
+        } else {
+            cpu::generate_cpu_trace_inrow_segments_as(
+                &[&ops],
+                &self.sides.slices(),
+                &self.decode.table,
+                TraceForm::Narrow,
+            )
+        };
         // Written packed, except in a build that holds every trace wide.
         trace.pack_main_narrow();
         trace.take_narrow_main()
     }
 
     fn return_pages(&mut self) -> PagesReturned {
-        self.logs.return_pages()
+        let mut got = self.logs.return_pages();
+        got += self.sides.return_pages();
+        got
     }
 }
 

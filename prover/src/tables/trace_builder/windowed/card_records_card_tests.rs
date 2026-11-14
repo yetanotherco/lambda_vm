@@ -26,6 +26,7 @@ use super::card_records::{CardDecode, CpuLogRecords};
 use super::{RecordsRoom, RowFamilies, Segments, StreamTable, WindowedTraceBuilder};
 use crate::tables::MaxRowsConfig;
 use crate::tables::memw_aligned::MemwAlignedOrder;
+use crate::tables::register::RegisterFormat;
 use crate::tests::windowed_builder_tests::run;
 
 pub(super) fn always() -> RecordsRoom {
@@ -65,10 +66,42 @@ pub(super) fn records_chunks_in(
     rows: bool,
     order: MemwAlignedOrder,
 ) -> Vec<(StreamTable, usize, Records)> {
+    let mut held = Vec::new();
+    for_each_records_chunk(
+        program,
+        input,
+        max_rows,
+        window,
+        (from, windows),
+        rows,
+        (order, RegisterFormat::Tokens32),
+        &mut |table, index, records| held.push((table, index, records)),
+    );
+    held
+}
+
+/// Each chunk [`records_chunks_in`] holds, handed to `each` as it is cut,
+/// under the register format `registers` too: under
+/// [`RegisterFormat::InRow`] the CPU chunks go up with their side records and
+/// MEMW_R's slot (the residual register table) stays on the host, as the
+/// block asks.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn for_each_records_chunk(
+    program: &Elf,
+    input: &[u8],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    (from, windows): (usize, Option<usize>),
+    rows: bool,
+    (order, registers): (MemwAlignedOrder, RegisterFormat),
+    each: &mut dyn FnMut(StreamTable, usize, Records),
+) {
+    let memw_r = registers != RegisterFormat::InRow;
     let mut builder = WindowedTraceBuilder::new(program, input, max_rows)
         .and_then(|b| b.memw_aligned_order(order))
+        .and_then(|b| b.register_format(registers))
         .and_then(WindowedTraceBuilder::drop_streamed_ops)
-        .and_then(|b| b.card_fill_streamed(always(), true, true))
+        .and_then(|b| b.card_fill_streamed(always(), true, memw_r))
         .and_then(|b| {
             if rows {
                 b.card_fill_streamed_rows(RowFamilies::ALL)
@@ -78,7 +111,6 @@ pub(super) fn records_chunks_in(
         })
         .expect("the builder");
     let mut executor = Executor::new(program, input.to_vec()).expect("the executor starts");
-    let mut held = Vec::new();
     let (mut walker, mut accumulator) = builder.split();
     let mut walked = 0usize;
     let mut ahead: Option<Vec<Log>> = None;
@@ -93,7 +125,7 @@ pub(super) fn records_chunks_in(
                 }
                 let mut chunk = job.generate();
                 if let Some(records) = chunk.trace.take_records_main() {
-                    held.push((table, index, records));
+                    each(table, index, records);
                 }
             }
             walked += 1;
@@ -102,7 +134,6 @@ pub(super) fn records_chunks_in(
             break;
         }
     }
-    held
 }
 
 /// The group's store, column by column, as the card holds it.
@@ -176,6 +207,106 @@ fn the_card_fills_cpu_and_memw_r_chunks_from_their_records_as_the_host_does() {
         }
     }
     assert!(filled[0] > 0 && filled[1] > 0, "{filled:?}");
+}
+
+/// `records` (a CPU chunk under the in-row register format, read with
+/// `decode`) with one side record's field moved: a table the run did not
+/// make.
+fn side_moved(records: &Records, decode: &Arc<CardDecode>, field: usize) -> Records {
+    let multilinear::records::RecordsFill::Cpu {
+        logs,
+        sides,
+        first_cycle,
+        ..
+    } = records.fill()
+    else {
+        panic!("a CPU chunk");
+    };
+    let logs: Vec<Log> = logs
+        .iter()
+        .flat_map(|piece| piece.iter())
+        .map(|l| Log {
+            current_pc: l.current_pc,
+            next_pc: l.next_pc,
+            src1_val: l.src1_val,
+            src2_val: l.src2_val,
+            dst_val: l.dst_val,
+        })
+        .collect();
+    let mut sides: Vec<_> = sides
+        .iter()
+        .flat_map(|piece| piece.iter().copied())
+        .collect();
+    let at = sides.len() / 2;
+    match field {
+        0..3 => sides[at].prev_ts[field] ^= 1 << 3,
+        _ => sides[at].old_rd[field - 3] ^= 1 << 3,
+    }
+    Records(Arc::new(
+        CpuLogRecords::in_row(
+            Segments::one(logs),
+            Segments::one(sides),
+            first_cycle,
+            Arc::clone(decode),
+        )
+        .expect("a whole table"),
+    ))
+}
+
+/// ★ The in-row register format: every full CPU chunk, held as its logs and
+/// their side records (in the window parts they were cut from), fills on the
+/// card with the host fill's words, its 42 columns; and a chunk with one side
+/// record's field moved differs from the honest host fill in that row alone,
+/// so the comparison reads the five columns.
+#[test]
+fn the_card_fills_in_row_cpu_chunks_from_their_records_as_the_host_does() {
+    let max_rows = MaxRowsConfig::small();
+    let mut filled = 0usize;
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "test_ecsm",
+        "keep_alive_regs",
+    ] {
+        let (program, _) = run(name);
+        let builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder");
+        let decode = Arc::new(CardDecode::new(Arc::clone(&builder.decode)).expect("a program"));
+        for window in [1, 7, 33] {
+            for_each_records_chunk(
+                &program,
+                &[],
+                &max_rows,
+                window,
+                (0, None),
+                false,
+                (MemwAlignedOrder::Lt, RegisterFormat::InRow),
+                &mut |table, index, records| {
+                    assert_eq!(table, StreamTable::Cpu, "only CPU is held under in-row");
+                    assert_eq!(
+                        records.cols(),
+                        crate::tables::cpu::inrow_cols::NUM_COLUMNS_INROW
+                    );
+                    let what = format!("{name}, window {window}, in-row CPU[{index}]");
+                    check(&what, &records);
+                    if filled == 0 {
+                        let honest = host_words(&records.host_fill().expect("the host fills it"));
+                        for field in 0..5 {
+                            let moved = side_moved(&records, &decode, field);
+                            let card = uploaded(&[TableColumns::Records(&moved)]);
+                            let (count, first) = mismatches(&card, &honest);
+                            assert!(
+                                count == 1 && first.is_some_and(|(c, _)| c == 37 + field),
+                                "{what}: side field {field} moved reads in its column alone: \
+                                 {count} words, first {first:?}"
+                            );
+                        }
+                    }
+                    filled += 1;
+                },
+            );
+        }
+    }
+    assert!(filled > 1, "{filled}");
 }
 
 /// A row family's records: its place in [`ROW_FAMILIES`] and its pieces.
@@ -516,6 +647,56 @@ fn the_card_fills_a_real_blocks_cpu_and_memw_r_chunks_as_the_host_does() {
     );
     println!("CARD FILL REAL absent pc at log {at}: declined by the card");
     println!("CARD FILL REAL VERDICT PASS");
+}
+
+/// ★ The in-row register format on the real block (`BLOCK_WHIR_ELF`,
+/// `BLOCK_WHIR_INPUT`): every full CPU chunk of the run, at the production
+/// height and windows, held as its logs and their side records, fills on the
+/// card with the host fill's words. One `CARD FILL IN-ROW` line a chunk and
+/// a closing `CARD FILL IN-ROW VERDICT`.
+#[test]
+#[ignore = "card: a box test (BLOCK_WHIR_ELF, BLOCK_WHIR_INPUT)"]
+fn the_card_fills_every_in_row_cpu_chunk_of_a_real_block_as_the_host_does() {
+    let elf =
+        std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF")).expect("the ELF");
+    let input =
+        std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT")).expect("input");
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let options = crate::block_whir::BlockOptions::production();
+    let window = 1usize << options.window_log2.expect("the block streams");
+    let t = std::time::Instant::now();
+    let mut chunks = Vec::new();
+    for_each_records_chunk(
+        &program,
+        &input,
+        &options.max_rows,
+        window,
+        (0, None),
+        false,
+        (MemwAlignedOrder::Limbs, RegisterFormat::InRow),
+        &mut |table, index, records| {
+            assert_eq!(table, StreamTable::Cpu, "only CPU is held under in-row");
+            let c = std::time::Instant::now();
+            check(&format!("real in-row CPU[{index}]"), &records);
+            println!(
+                "CARD FILL IN-ROW CPU[{index}] rows={} cols={} 0 words differ secs={:.2}",
+                records.rows(),
+                records.cols(),
+                c.elapsed().as_secs_f64()
+            );
+            chunks.push(index);
+        },
+    );
+    assert!(!chunks.is_empty(), "no CPU chunk held");
+    assert!(
+        chunks.iter().enumerate().all(|(k, &i)| k == i),
+        "every CPU chunk, in order: {chunks:?}"
+    );
+    println!(
+        "CARD FILL IN-ROW VERDICT PASS chunks={} secs={:.1}",
+        chunks.len(),
+        t.elapsed().as_secs_f64()
+    );
 }
 
 /// The real block's first chunk of each row family held as its rows, at the

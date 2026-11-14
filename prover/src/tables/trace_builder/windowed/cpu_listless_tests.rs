@@ -14,6 +14,7 @@ use executor::vm::logs::Log;
 use math::field::element::FieldElement;
 
 use crate::tables::MaxRowsConfig;
+use crate::tables::register::RegisterFormat;
 use crate::tables::trace_builder::{StreamedChunk, Traces};
 use crate::tables::types::GoldilocksField;
 use crate::tests::windowed_builder_tests::{run, same_traces, whole};
@@ -85,9 +86,38 @@ fn built(
     cpu: bool,
     listless: bool,
 ) -> (Traces, usize) {
+    built_in(
+        program,
+        logs,
+        max_rows,
+        window,
+        walk,
+        room,
+        (cpu, listless),
+        RegisterFormat::Tokens32,
+    )
+}
+
+/// [`built`] under the register format `registers`: under
+/// [`RegisterFormat::InRow`] MEMW_R's slot (the residual register table) is
+/// filled on the host, as the block asks, and each CPU chunk cut from its
+/// logs takes their side records with it.
+#[allow(clippy::too_many_arguments)]
+fn built_in(
+    program: &Elf,
+    logs: &[Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    walk: Walk,
+    room: RecordsRoom,
+    (cpu, listless): (bool, bool),
+    registers: RegisterFormat,
+) -> (Traces, usize) {
+    let memw_r = registers != RegisterFormat::InRow;
     let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
+        .and_then(|b| b.register_format(registers))
         .and_then(WindowedTraceBuilder::drop_streamed_ops)
-        .and_then(|b| b.card_fill_streamed(room, cpu, true))
+        .and_then(|b| b.card_fill_streamed(room, cpu, memw_r))
         .expect("the builder")
         .count_where_made(true)
         .drop_cpu_list(listless);
@@ -214,6 +244,59 @@ fn without_the_cpu_list_the_windows_build_the_whole_run_tables() {
                 for (what, room) in rooms() {
                     let (traces, without) =
                         built(&program, &logs, &max_rows, window, walk, room, true, true);
+                    same_traces(&reference, &traces);
+                    let body = (logs.len() - 1) / window;
+                    assert!(
+                        without == body || !matches!(walk, Walk::Owned),
+                        "{name}/{window} {walk:?} {what}: {without} of {body} windows listless"
+                    );
+                    assert!(
+                        without > 0 || body == 0,
+                        "{name}/{window} {walk:?} {what}: no window walked without its list"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// ★ The in-row register format without the CPU list: each CPU chunk is cut
+/// from its logs and their side records (the walkers still write one a
+/// cycle), filled from them or, where the room says no, on the host from its
+/// rebuilt ops and the same side records; the finish rebuilds its tail's.
+/// Through the split walker, on 1 and 3 threads and in record mode, at windows
+/// of 1, 7 and 33 cycles, the windows build the in-row tables the build
+/// without the card makes, and their walkers kept no list.
+#[test]
+fn in_row_without_the_cpu_list_the_windows_build_the_in_row_tables() {
+    let max_rows = MaxRowsConfig::small();
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "keep_alive_regs",
+    ] {
+        let (program, logs) = run(name);
+        for window in [1, 7, 33] {
+            let reference =
+                super::card_records_tests::in_row_windowed(&program, &logs, &max_rows, window);
+            for walk in [
+                Walk::Owned,
+                Walk::Threads(1),
+                Walk::Threads(3),
+                Walk::History(1, 0),
+                Walk::History(3, 2),
+            ] {
+                for (what, room) in rooms() {
+                    let (traces, without) = built_in(
+                        &program,
+                        &logs,
+                        &max_rows,
+                        window,
+                        walk,
+                        room,
+                        (true, true),
+                        RegisterFormat::InRow,
+                    );
                     same_traces(&reference, &traces);
                     let body = (logs.len() - 1) / window;
                     assert!(

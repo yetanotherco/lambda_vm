@@ -847,19 +847,12 @@ pub(crate) fn generate_cpu_trace_segments_as(
 /// A CPU row's register slots under the in-row register format
 /// (`tables::register::RegisterFormat::InRow`): the previous timestamp of
 /// each of `rs1`, `rs2`, `rd` (0 for a slot the row does not use; after a
-/// keep-alive, the keep-alive's) and `rd`'s old value. The walk writes one a
-/// CPU op, in the ops' order; they fill [`inrow_cols`].
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CpuSide {
-    pub(crate) prev_ts: [u32; 3],
-    /// `rd`'s old value, low word then high word.
-    pub(crate) old_rd: [u32; 2],
-}
-
-// Five words, no padding: the record crosses to the card as it lies, and an
-// inactive slot or a word-instruction row is all zeros either way.
-const _: () = assert!(std::mem::size_of::<CpuSide>() == 20);
+/// keep-alive, the keep-alive's) and `rd`'s old value, low word then high
+/// word. The walk writes one a CPU op, in the ops' order; they fill
+/// [`inrow_cols`]. The card's fill reads the same record
+/// (`multilinear::records::CpuSide`): five words, no padding, so it crosses
+/// as it lies, and an inactive slot or a word-instruction row is all zeros.
+pub(crate) use multilinear::records::CpuSide;
 
 /// The widths in-row CPU traces needed so far in this process.
 static WIDTHS_INROW: WidthHint = WidthHint::new();
