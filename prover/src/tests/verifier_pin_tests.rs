@@ -243,8 +243,9 @@ fn the_frame_refuses_a_bitwise_table_off_its_fixed_height() {
 
 /// Format knobs a verifier's process could carry, each off the default: the
 /// WHIR blowup, grind bits and folds, the leaves' query check and scale, the
-/// leaves' share form, the GKR packing and the KECCAK_RND and MEMW_A forms.
-const OFF_DEFAULT: [(&str, &str); 9] = [
+/// leaves' share form, the GKR packing, the KECCAK_RND and MEMW_A forms and
+/// the register format.
+const OFF_DEFAULT: [(&str, &str); 10] = [
     (crate::zf_format::ENV_WHIR_BLOWUP, "4"),
     (crate::zf_format::ENV_WHIR_GRIND_BITS, "20"),
     (crate::zf_format::ENV_WHIR_FOLDS, "uniform4"),
@@ -254,6 +255,7 @@ const OFF_DEFAULT: [(&str, &str); 9] = [
     ("BLOCK_WHIR_ARGUE_PACK", "off"),
     ("BLOCK_WHIR_KECCAK_RND", "full"),
     ("BLOCK_WHIR_MEMW_A", "lt"),
+    ("BLOCK_WHIR_REGISTERS", "in-row"),
 ];
 
 /// ★ The block verifier reads no format from its environment. In a process of
@@ -336,6 +338,16 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
         "the prover's own production format reads no MEMW_A knob"
     );
+    assert_eq!(
+        harness.format.registers,
+        crate::tables::register::RegisterFormat::InRow,
+        "the harness's register format follows its knob"
+    );
+    assert_eq!(
+        production.registers,
+        crate::tables::register::RegisterFormat::Tokens32,
+        "the prover's own production format reads no register knob"
+    );
 
     // The verifier's is not.
     let debug = |o: &ProofOptions| format!("{o:?}");
@@ -358,6 +370,11 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         pinned.format.memw_aligned,
         crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
         "the verifier's MEMW_A form is its named constant, not the environment's"
+    );
+    assert_eq!(
+        pinned.format.registers,
+        crate::tables::register::RegisterFormat::Tokens32,
+        "the verifier's register format is its named constant, not the environment's"
     );
     assert!(pinned.share_inverse);
     assert_eq!(

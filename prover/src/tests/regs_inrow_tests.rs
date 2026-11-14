@@ -147,3 +147,133 @@ fn each_register_format_refuses_the_others_proof() {
     assert!(!verifies(&in_row_proof, &elf, &today));
     assert!(!verifies(&today_proof, &elf, &in_row()));
 }
+
+/// The in-row build of `logs` as the block prover's windowed build makes it
+/// under `format` (its MEMW_A and KECCAK_RND forms), at the small chunks.
+fn in_row_build_as(
+    program: &executor::elf::Elf,
+    logs: &[executor::vm::logs::Log],
+    format: &BlockFormat,
+) -> crate::tables::trace_builder::Traces {
+    use crate::tables::trace_builder::WindowedTraceBuilder;
+    let mut builder = WindowedTraceBuilder::new(program, &[], &MaxRowsConfig::small())
+        .and_then(|b| b.register_format(RegisterFormat::InRow))
+        .and_then(|b| b.memw_aligned_order(format.memw_aligned))
+        .map(|b| b.keccak_rnd_form(format.keccak_rnd))
+        .expect("the builder");
+    let window = 1000;
+    let body = logs.len() - 1;
+    let cut = body - body % window;
+    let mut chunks = Vec::new();
+    for w in logs[..cut].chunks(window) {
+        chunks.extend(builder.push(w).expect("a window"));
+    }
+    let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+    traces
+        .insert_streamed(chunks)
+        .expect("every chunk has a placeholder");
+    traces
+}
+
+/// `traces` proved as a block under `format`: the prover takes any trace.
+fn prove_built(
+    program: &executor::elf::Elf,
+    elf: &[u8],
+    traces: &mut crate::tables::trace_builder::Traces,
+    format: &BlockFormat,
+) -> Result<block_whir::BlockWhirProof, crate::Error> {
+    let options = super::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
+    let mut stamps = block_whir::BlockStamps::default();
+    block_whir::prove_traces(
+        program,
+        elf,
+        traces,
+        &ProofOptions::default_test_options(),
+        format,
+        &options,
+        &Deviations::default(),
+        true,
+        &|_, _| {},
+        &mut stamps,
+    )
+}
+
+/// ★ Box: the in-row forgeries proved (`tables::trace_builder::
+/// in_row_forgery_tests`, which reads each on the buses): every forged build
+/// proves, and the block verifier refuses it; the honest build of each
+/// program proves and verifies. With the PC chain run past the exit call
+/// (HALT's pc `(1, 0)`) among them, against the honest exit 0 of the program
+/// without its first exit.
+#[test]
+fn in_row_forgeries_are_refused_by_the_block_verifier() {
+    use crate::tables::trace_builder::in_row_forgery_tests::{
+        Forgery, forge, program_of, with_verifier_files,
+    };
+    use crate::tests::halt_pc_forgery_poc::{
+        FORGED_ROWS, GUEST, forged_logs, patched_elf, run_logs,
+    };
+    let format = in_row();
+    let run = |elf: &[u8], logs: Option<Vec<executor::vm::logs::Log>>| {
+        let program = executor::elf::Elf::load(elf).expect("the ELF loads");
+        let logs = logs.unwrap_or_else(|| run_logs(elf));
+        let mut traces = in_row_build_as(&program, &logs, &format);
+        with_verifier_files(&program, &mut traces);
+        (program, traces)
+    };
+    let mut refused = Vec::new();
+    for forgery in [
+        Forgery::SlotSelfLoop,
+        Forgery::SlotCycle,
+        Forgery::SlotPastReach,
+        Forgery::ResidualSelfLoop,
+        Forgery::KeepAliveChangesValue,
+        Forgery::WrongOldRd,
+        Forgery::KeepAliveInventsValue,
+        Forgery::ReadWithoutRequester,
+    ] {
+        let elf = asm_elf_bytes(program_of(forgery));
+        let (program, mut honest) = run(&elf, None);
+        let proof =
+            prove_built(&program, &elf, &mut honest, &format).expect("the honest build proves");
+        assert!(
+            verifies(&proof, &elf, &format),
+            "{forgery:?}: the honest build verifies"
+        );
+        let (program, mut forged) = run(&elf, None);
+        forge(forgery, &mut forged);
+        let proof =
+            prove_built(&program, &elf, &mut forged, &format).expect("the forged build proves");
+        assert!(
+            !verifies(&proof, &elf, &format),
+            "{forgery:?}: the forged build is refused"
+        );
+        refused.push(forgery);
+    }
+    // The PC chain past the exit call.
+    let patched = patched_elf(&asm_elf_bytes(GUEST));
+    let (program, mut honest) = run(&patched, None);
+    let proof =
+        prove_built(&program, &patched, &mut honest, &format).expect("the honest exit proves");
+    assert!(
+        verifies(&proof, &patched, &format),
+        "the patched program's exit 0 verifies"
+    );
+    let elf = asm_elf_bytes(GUEST);
+    let (program, mut forged) = run(&elf, Some(forged_logs(&elf, FORGED_ROWS)));
+    crate::tables::types::VmTable::set_dword_wl(
+        &mut forged.halt.main_table,
+        0,
+        halt::cols::PC_0,
+        1,
+    );
+    with_verifier_files(&program, &mut forged);
+    let proof = prove_built(&program, &elf, &mut forged, &format).expect("the forged run proves");
+    assert!(
+        !verifies(&proof, &elf, &format),
+        "the PC chain past the exit call is refused"
+    );
+    println!(
+        "IN-ROW FORGERIES REFUSED: {} and the PC chain past the exit",
+        refused.len()
+    );
+}

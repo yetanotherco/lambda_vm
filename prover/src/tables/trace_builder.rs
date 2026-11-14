@@ -83,6 +83,8 @@ mod compact_branch;
 mod compact_bytewise;
 mod compact_eq;
 #[cfg(test)]
+pub(crate) mod in_row_forgery_tests;
+#[cfg(test)]
 mod keccak256_tests;
 pub(crate) mod register_words;
 #[cfg(test)]
@@ -3595,7 +3597,22 @@ fn collect_hint_ops(
 
 /// The largest step a CPU row's register slot takes under the in-row register
 /// format: its `IS_HALF[ts − prev − 1]` check.
-const IN_ROW_MAX_STEP: u64 = 1 << 16;
+pub(crate) const IN_ROW_MAX_STEP: u64 = 1 << 16;
+
+/// The previous timestamp a CPU row's register slot at `slot_ts` reads under
+/// the in-row register format, the register's last access being at `old_ts`:
+/// that access itself while the step is in the slot's reach
+/// (`slot_ts − old_ts ≤ 2^16`), else `slot_ts − 1`, where a keep-alive moves
+/// the register's token first. The one rule the walk's side records (which
+/// the card copies as they are), its keep-alive rows and its IS_HALF counts
+/// follow.
+pub(crate) fn in_row_prev(slot_ts: u64, old_ts: u64) -> u64 {
+    if slot_ts - old_ts > IN_ROW_MAX_STEP {
+        slot_ts - 1
+    } else {
+        old_ts
+    }
+}
 
 /// A non-word CPU row's register accesses under the in-row register format
 /// (`tables::register::RegisterFormat::InRow`): the row checks them itself, so
@@ -3618,14 +3635,12 @@ fn collect_register_ops_in_row(
     // The slot's previous timestamp, after a keep-alive where the step is too
     // long, and its range-check lookup.
     let mut slot = |memw: &mut MemwBuckets, reg: u8, value: u64, ts: u64, old_ts: u64| -> u32 {
-        let prev = if ts - old_ts > IN_ROW_MAX_STEP {
+        let prev = in_row_prev(ts, old_ts);
+        if prev != old_ts {
             let v = [value as u32, (value >> 32) as u32];
             memw.register_rows
-                .push(RegRow::keep_alive(2 * u64::from(reg), ts - 1, v, old_ts));
-            ts - 1
-        } else {
-            old_ts
-        };
+                .push(RegRow::keep_alive(2 * u64::from(reg), prev, v, old_ts));
+        }
         let d = (ts - prev - 1) as u16;
         bitwise_ops.push(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,

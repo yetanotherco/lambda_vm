@@ -3113,7 +3113,9 @@ fn the_prover_refuses_a_partition_over_the_group_maximum() {
 /// committed word decoding to one codeword: 136.77 bits at 1024 groups, 140.77
 /// at 64 (136.79 and 140.79 at len 204). The census reads both constants from the block's
 /// AIRs, so a wider AIR or a larger maximum fails here before it moves the
-/// figure.
+/// figure. It holds under both register formats: the in-row one's AIRs (the
+/// CPU's 24 interactions, the residual table's 6, REGISTER's 3, the REG
+/// bus's 4-value tokens) move neither constant.
 #[test]
 fn block_wide_logup_at_the_group_maximum_is_pinned() {
     let elf = asm_elf_bytes("all_instructions_64");
@@ -3153,19 +3155,20 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
     .expect("pages");
     let inputs =
         crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("the AIR inputs");
-    // The AIR set the block verifier builds: the pinned format's table forms.
+    // The AIR set the block verifier builds: the pinned format's table forms,
+    // then the in-row register format's.
     let pinned = BlockFormat::pinned();
-    let airs = crate::block_airs(
-        &program,
-        &opts,
-        &pages,
-        &counts,
-        &inputs,
-        pinned.keccak_rnd,
-        pinned.memw_aligned,
-        pinned.registers,
-    );
-    let (fractions, len) = airs
+    let census = |registers| {
+        crate::block_airs(
+            &program,
+            &opts,
+            &pages,
+            &counts,
+            &inputs,
+            pinned.keccak_rnd,
+            pinned.memw_aligned,
+            registers,
+        )
         .air_refs()
         .iter()
         .map(|air| {
@@ -3173,11 +3176,18 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
             let len = bus.iter().map(|b| b.num_bus_elements()).max().unwrap_or(0);
             (bus.len(), len)
         })
-        .fold((0, 0), |(f, l), (f2, l2)| (f.max(f2), l.max(l2)));
+        .fold((0, 0), |(f, l), (f2, l2)| (f.max(f2), l.max(l2)))
+    };
+    let (fractions, len) = census(pinned.registers);
     assert_eq!(
         (fractions, len),
         (1475, 208),
         "the census: fractions a row, message length"
+    );
+    assert_eq!(
+        census(crate::tables::register::RegisterFormat::InRow),
+        (fractions, len),
+        "the in-row register format's census"
     );
     let bits = |groups: usize| {
         let support =
