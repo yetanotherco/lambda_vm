@@ -571,6 +571,285 @@ fn a_streamed_execution_refuses_an_incomplete_or_malformed_landing() {
     ));
 }
 
+// ==================== the pieced streamed execution ====================
+
+/// A leaf-shaped program: ONE arena of three runs, each a BLAKE3 sponge over
+/// its own run (as a leaf verifies each base group from its run of the arena),
+/// then a little work over all three, and a `HintOn` whose two words sit in
+/// the first and the last run (so it needs both pieces).
+fn one_arena_case() -> (Case, u32) {
+    use super::builder::LfmBuilder;
+    use super::edsl::{ByteWrapHash, WrapHash, wrap_hash_bytes};
+    let len = 202;
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
+    let halves = super::keccak_host::num_stream_halves(len) as u32;
+    let arena = b.declare_arena(3 * halves);
+    let mut firsts = Vec::new();
+    for run in 0..3 {
+        let stream: Vec<_> = (0..halves)
+            .map(|i| b.hint_felt(arena, run * halves + i))
+            .collect();
+        let digest = wrap_hash_bytes(&mut b, ByteWrapHash::Blake3, &stream, len);
+        b.public(digest[0]);
+        b.public(digest[1]);
+        firsts.push(stream[0]);
+    }
+    let x = b.add(firsts[0], firsts[2]);
+    let y = b.mul(x, firsts[1]);
+    let joined = b.pack_word([x, y, x, y]);
+    b.public(joined);
+    let one = b.bit_const(true);
+    let either = b.hint_word_on(arena, 1, one, 2 * halves + 1);
+    b.public(either);
+    let words: Vec<super::word::LfmWord> = (0..3u32)
+        .flat_map(|seed| {
+            let msg: Vec<u8> = (0..len)
+                .map(|i| (37 * i as u32 + 11 + 13 * seed) as u8)
+                .collect();
+            super::keccak_host::pack_stream(&msg)
+                .into_iter()
+                .map(super::word::base_word)
+        })
+        .collect();
+    let case = Case {
+        name: "OneArenaThreeRuns(202)",
+        program: super::compiler::compile(b.finish()),
+        arenas: vec![words],
+        hasher: super::hash::HasherKind::Test,
+    };
+    (case, halves)
+}
+
+/// Each arena of `case` cut at `cuts` (fractions of its length, in order) into
+/// pieces, numbered as groups arena by arena.
+fn pieces_of(case: &Case, cuts: usize) -> Vec<super::executor::ArenaPiece> {
+    let mut pieces = Vec::new();
+    for (a, words) in case.arenas.iter().enumerate() {
+        let len = words.len() as u32;
+        let n = (cuts as u32).clamp(1, len.max(1));
+        let mut at = 0;
+        for k in 0..n {
+            let end = if k + 1 == n { len } else { len * (k + 1) / n };
+            if end > at {
+                let group = pieces.len();
+                pieces.push(super::executor::ArenaPiece {
+                    arena: a as u32,
+                    start: at,
+                    len: end - at,
+                    group,
+                });
+            }
+            at = end;
+        }
+    }
+    pieces
+}
+
+/// `case` streamed in pieces, landing them in `order` (indices into `pieces`).
+fn pieced(
+    case: &Case,
+    pieces: &[super::executor::ArenaPiece],
+    order: &[usize],
+) -> (LfmExecution, Vec<usize>) {
+    use super::executor::StreamedExecution;
+    let mut ex = StreamedExecution::new_pieced(&case.program, pieces.to_vec(), &case.hasher)
+        .unwrap_or_else(|e| panic!("{}: a pieced execution starts: {e:?}", case.name));
+    let mut ran = vec![ex.ran()];
+    for &i in order {
+        let p = pieces[i];
+        let words = &case.arenas[p.arena as usize][p.start as usize..(p.start + p.len) as usize];
+        ex.land_piece(p.group, words)
+            .unwrap_or_else(|e| panic!("{}: piece {i} lands: {e:?}", case.name));
+        ran.push(ex.ran());
+    }
+    let done = ex
+        .finish()
+        .unwrap_or_else(|e| panic!("{}: the pieced execution finishes: {e:?}", case.name));
+    (done, ran)
+}
+
+/// ★ The pieced execution's gate: one arena landing in pieces, in any order,
+/// gives the serial reference's witness word for word — on the leaf-shaped
+/// case in all six orders (its `HintOn` reads the first and the last piece)
+/// and on every identity case cut in three pieces an arena, forwards and
+/// backwards — and most of the leaf-shaped program runs before its last piece.
+#[test]
+fn a_pieced_execution_is_byte_identical_in_any_landing_order() {
+    let (leaf, halves) = one_arena_case();
+    let reference_leaf = reference(&leaf);
+    let pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let (got, ran) = pieced(&leaf, &pieces, &order);
+        assert_executions_identical(leaf.name, leaf.program.num_addrs, &reference_leaf, &got);
+        let n = leaf.program.instrs.len();
+        assert_eq!(
+            *ran.last().expect("waves"),
+            n,
+            "{order:?}: every instruction ran once"
+        );
+        assert!(
+            ran[2] * 2 >= n,
+            "{order:?}: only {} of {n} instructions ran before the last piece landed",
+            ran[2]
+        );
+    }
+    for case in cases() {
+        let a = reference(&case);
+        let pieces = pieces_of(&case, 3);
+        let forward: Vec<usize> = (0..pieces.len()).collect();
+        let backward: Vec<usize> = (0..pieces.len()).rev().collect();
+        for order in [forward, backward] {
+            let (b, ran) = pieced(&case, &pieces, &order);
+            assert_executions_identical(case.name, case.program.num_addrs, &a, &b);
+            assert_eq!(*ran.last().expect("waves"), case.program.instrs.len());
+        }
+    }
+}
+
+/// A pieced execution refuses pieces that do not tile the program's arenas
+/// and landings it cannot run: each an error, never a witness.
+#[test]
+fn a_pieced_execution_refuses_bad_pieces_and_bad_landings() {
+    use super::executor::{ArenaPiece, StreamedExecution};
+    let (leaf, h) = one_arena_case();
+    let piece = |start, len, group| ArenaPiece {
+        arena: 0,
+        start,
+        len,
+        group,
+    };
+    let refused = |pieces: Vec<ArenaPiece>| {
+        matches!(
+            StreamedExecution::new_pieced(&leaf.program, pieces, &leaf.hasher),
+            Err(LfmExecError::Internal(_))
+        )
+    };
+    assert!(
+        refused(vec![piece(0, h, 0), piece(h + 1, 2 * h - 1, 1)]),
+        "a gap"
+    );
+    assert!(
+        refused(vec![piece(0, h + 1, 0), piece(h, 2 * h, 1)]),
+        "an overlap"
+    );
+    assert!(
+        refused(vec![piece(0, h, 0), piece(h, h, 1)]),
+        "short of the arena"
+    );
+    assert!(
+        refused(vec![piece(0, h, 0), piece(h, 2 * h + 1, 1)]),
+        "past the arena"
+    );
+    assert!(
+        refused(vec![piece(0, h, 0), piece(h, 2 * h, 0)]),
+        "one group, two pieces"
+    );
+    assert!(refused(vec![piece(0, 3 * h, 64)]), "group 64");
+    assert!(
+        refused(vec![piece(0, 0, 0), piece(0, 3 * h, 1)]),
+        "an empty piece"
+    );
+    assert!(
+        refused(vec![
+            piece(0, 3 * h, 0),
+            ArenaPiece {
+                arena: 1,
+                start: 0,
+                len: 1,
+                group: 1
+            }
+        ]),
+        "an arena the program does not have"
+    );
+
+    let pieces = vec![piece(0, h, 0), piece(h, h, 1), piece(2 * h, h, 2)];
+    let words = |k: u32| &leaf.arenas[0][(k * h) as usize..((k + 1) * h) as usize];
+    let start = || {
+        StreamedExecution::new_pieced(&leaf.program, pieces.clone(), &leaf.hasher).expect("starts")
+    };
+    let mut ex = start();
+    ex.land_piece(1, words(1)).expect("lands");
+    assert!(
+        matches!(ex.land_piece(1, words(1)), Err(LfmExecError::Internal(_))),
+        "a piece landed twice"
+    );
+    assert!(
+        matches!(ex.land_piece(0, words(1)), Ok(())),
+        "a piece of the right length lands (its words are the caller's)"
+    );
+    assert!(
+        matches!(
+            ex.land_piece(2, &words(2)[1..]),
+            Err(LfmExecError::ArenaLenMismatch { .. })
+        ),
+        "a short piece"
+    );
+    assert!(
+        matches!(ex.land_piece(5, words(2)), Err(LfmExecError::Internal(_))),
+        "a group with no piece"
+    );
+    assert!(
+        matches!(ex.finish(), Err(LfmExecError::Internal(_))),
+        "finished before every piece landed"
+    );
+    let mut ex = start();
+    assert!(
+        matches!(
+            ex.land(0, std::slice::from_ref(&leaf.arenas[0])),
+            Err(LfmExecError::Internal(_))
+        ),
+        "a pieced execution lands pieces only"
+    );
+    let mut plain =
+        StreamedExecution::new(&leaf.program, vec![0], &leaf.hasher).expect("starts unpieced");
+    assert!(
+        matches!(
+            plain.land_piece(0, words(0)),
+            Err(LfmExecError::Internal(_))
+        ),
+        "an unpieced execution lands no piece"
+    );
+}
+
+/// A pieced arena's word comes from the piece that holds it once that piece
+/// has landed; a word in a piece not landed yet, or in no piece, is
+/// `ArenaOutOfBounds` — an error, never a value.
+#[test]
+fn a_word_of_a_piece_not_landed_or_in_no_piece_is_refused() {
+    use super::executor::piece_word;
+    let w = |x: u64| super::word::base_word(crate::tables::types::FE::from(x));
+    let first = [w(10), w(11)];
+    let pieces: Vec<(u32, u32, &[super::word::LfmWord])> = vec![(0, 2, &first), (2, 3, &[])];
+    assert_eq!(piece_word(&pieces, 0, 1).expect("landed"), w(11));
+    for index in [2, 4, 5, 1000] {
+        assert!(
+            matches!(
+                piece_word(&pieces, 0, index),
+                Err(LfmExecError::ArenaOutOfBounds { arena: 0, index: i }) if i == index
+            ),
+            "index {index}"
+        );
+    }
+    assert!(matches!(
+        piece_word(&[], 3, 0),
+        Err(LfmExecError::ArenaOutOfBounds { arena: 3, index: 0 })
+    ));
+}
+
 /// A node-shaped program over children that supply different numbers of
 /// arenas (`counts[c]` for child `c`, declared in child order): a BLAKE3 sponge
 /// over each arena, then a little work across the children — the shape of a
