@@ -1268,6 +1268,19 @@ pub fn fill_rounds(
     v
 }
 
+/// The state after the seven rounds of `values`' compression (what
+/// [`fill_rounds`] returns), from its output: `v[i + 8] = out[i + 8] ⊕ h[i]`,
+/// `v[i] = out[i] ⊕ v[i + 8]`.
+pub fn final_state(values: &B3lValues, block_len: u32, flags: u32) -> [u32; 16] {
+    let out = blake3_compress_rounds(&values.h, &values.message(), 0, block_len, flags, ROUNDS);
+    let mut v = [0u32; 16];
+    for i in 0..8 {
+        v[i + 8] = out[i + 8] ^ values.h[i];
+        v[i] = out[i] ^ v[i + 8];
+    }
+    v
+}
+
 /// Fill one head row: its instruction group `prep` (the program's
 /// `B3L_HEAD` row, [`super::layout::b3l`]), then the values of `values` and
 /// the final state `fs`; records the head's lookups.

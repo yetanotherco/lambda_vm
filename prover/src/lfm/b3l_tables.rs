@@ -197,11 +197,11 @@ impl B3lAirs {
         v
     }
 
-    /// Each AIR with its trace, in table order.
+    /// Each AIR with its table, in table order.
     pub fn pairs<'a>(
         &'a self,
         traces: &'a mut B3lTraces,
-    ) -> Result<Vec<(DynLfmAir<'a>, &'a mut TraceTable<F, E>)>, String> {
+    ) -> Result<Vec<(DynLfmAir<'a>, &'a mut HeldTable)>, String> {
         if traces.rounds.len() != self.rounds.len() || traces.heads.len() != self.heads.len() {
             return Err(format!(
                 "the lean traces are {} round and {} head chunks, the AIR set {} and {}",
@@ -214,7 +214,7 @@ impl B3lAirs {
         let Some(table_air) = &self.table else {
             return Err("lean traces for an AIR set with no lean table".into());
         };
-        let mut v: Vec<(DynLfmAir<'a>, &'a mut TraceTable<F, E>)> = Vec::new();
+        let mut v: Vec<(DynLfmAir<'a>, &'a mut HeldTable)> = Vec::new();
         for (air, t) in self.rounds.iter().zip(traces.rounds.iter_mut()) {
             v.push((air, t));
         }
@@ -226,20 +226,117 @@ impl B3lAirs {
     }
 }
 
+/// How the host holds a lean table until the card takes it: a prover's
+/// choice, never the proof's (the block prover commits the same columns
+/// either way, `Narrowing`'s rule).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum B3lHold {
+    /// As field elements, eight bytes a cell.
+    Wide,
+    /// Packed chunk by chunk as it is filled, each column at the bytes its
+    /// largest value needs ([`multilinear::narrow::NarrowColumns`]); the card
+    /// widens it. The production holding: a round chunk is ≈ 1.2 bytes a cell
+    /// instead of 8.
+    Narrow,
+}
+
+/// The holding a fill takes: [`B3lHold::Narrow`], or a test's override.
+pub fn fill_hold() -> B3lHold {
+    #[cfg(test)]
+    if let Some(hold) = test_hold::get() {
+        return hold;
+    }
+    B3lHold::Narrow
+}
+
+/// One lean table as the host holds it.
+pub enum HeldTable {
+    Wide(TraceTable<F, E>),
+    Narrow(multilinear::narrow::NarrowColumns),
+}
+
+impl HeldTable {
+    /// `rows` row-major rows of `width` cells, held as `hold` says.
+    fn from_rows(data: Vec<FE>, width: usize, hold: B3lHold) -> Self {
+        match hold {
+            B3lHold::Wide => HeldTable::Wide(TraceTable::new_main(data, width, 1)),
+            B3lHold::Narrow => {
+                use math::field::traits::IsPrimeField;
+                let words: Vec<u64> = data
+                    .iter()
+                    .map(|f| GoldilocksField::canonical(f.value()))
+                    .collect();
+                drop(data);
+                HeldTable::Narrow(
+                    multilinear::narrow::NarrowColumns::pack_row_major(&words, width)
+                        .expect("whole rows"),
+                )
+            }
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        match self {
+            HeldTable::Wide(t) => t.num_rows(),
+            HeldTable::Narrow(p) => p.rows(),
+        }
+    }
+
+    pub fn cols(&self) -> usize {
+        match self {
+            HeldTable::Wide(t) => t.main_table.width,
+            HeldTable::Narrow(p) => p.cols(),
+        }
+    }
+
+    /// Column `c` as field elements.
+    pub fn column(&self, c: usize) -> Vec<FE> {
+        match self {
+            HeldTable::Wide(t) => (0..t.num_rows()).map(|r| *t.main_table.get(r, c)).collect(),
+            HeldTable::Narrow(p) => p.column(c).into_iter().map(FE::from).collect(),
+        }
+    }
+
+    /// The cell at `(row, col)`.
+    pub fn get(&self, row: usize, col: usize) -> FE {
+        match self {
+            HeldTable::Wide(t) => *t.main_table.get(row, col),
+            HeldTable::Narrow(p) => FE::from(p.column(col)[row]),
+        }
+    }
+
+    /// The table moved out, an empty one left behind.
+    pub fn take(&mut self) -> HeldTable {
+        core::mem::replace(
+            self,
+            HeldTable::Wide(TraceTable::new_main(Vec::new(), 1, 1)),
+        )
+    }
+
+    /// A wide table's cells, for a test that corrupts one: `None` if narrow.
+    #[cfg(test)]
+    pub fn wide_mut(&mut self) -> Option<&mut TraceTable<F, E>> {
+        match self {
+            HeldTable::Wide(t) => Some(t),
+            HeldTable::Narrow(_) => None,
+        }
+    }
+}
+
 /// A program's lean tables, filled.
 pub struct B3lTraces {
-    pub rounds: Vec<TraceTable<F, E>>,
-    pub heads: Vec<TraceTable<F, E>>,
-    pub table: TraceTable<F, E>,
+    pub rounds: Vec<HeldTable>,
+    pub heads: Vec<HeldTable>,
+    pub table: HeldTable,
 }
 
 impl B3lTraces {
     /// The round chunk holding round-table row `i` (row `7k + r` is round `r`
     /// of compression `k`), and `i`'s row in it.
-    pub fn round_at(&self, i: usize) -> Option<(&TraceTable<F, E>, usize)> {
+    pub fn round_at(&self, i: usize) -> Option<(&HeldTable, usize)> {
         let mut start = 0usize;
         for t in &self.rounds {
-            let rows = t.num_rows();
+            let rows = t.rows();
             if i < start + rows {
                 return Some((t, i - start));
             }
@@ -249,7 +346,7 @@ impl B3lTraces {
     }
 
     /// Every table in table order.
-    pub fn tables_mut(&mut self) -> impl Iterator<Item = &mut TraceTable<F, E>> {
+    pub fn tables_mut(&mut self) -> impl Iterator<Item = &mut HeldTable> {
         self.rounds
             .iter_mut()
             .chain(self.heads.iter_mut())
@@ -332,9 +429,23 @@ pub fn b3l_prep_groups(program: &LfmProgram) -> Vec<ColumnGroup> {
 }
 
 /// Fill a program's lean tables from its `B3L_HEAD` records (one a
-/// compression, in program order; the executor's [`B3lValues`]). `None` for a
-/// program with no compression.
+/// compression, in program order; the executor's [`B3lValues`]), each chunk
+/// filled and then held as [`fill_hold`] says. `None` for a program with no
+/// compression.
+///
+/// A round chunk is filled from the compressions that reach into it, a
+/// compression straddling two chunks filled for each; its lookups are counted
+/// once, by the chunk that holds its first round.
 pub fn build_b3l_traces(program: &LfmProgram, records: &[B3lValues]) -> Option<B3lTraces> {
+    build_b3l_traces_held(program, records, fill_hold())
+}
+
+/// [`build_b3l_traces`] under `hold`.
+pub fn build_b3l_traces_held(
+    program: &LfmProgram,
+    records: &[B3lValues],
+    hold: B3lHold,
+) -> Option<B3lTraces> {
     let g = &program.groups.b3l;
     let n = g.real_rows;
     assert_eq!(
@@ -346,79 +457,153 @@ pub fn build_b3l_traces(program: &LfmProgram, records: &[B3lValues]) -> Option<B
         return None;
     }
     let shape = B3lShape::of(n);
-    let total = l::ROUNDS * n;
-    let mut round_data = zeroed_fe_vec(total * round::NUM_COLUMNS);
-    let head_rows: usize = shape.heads.iter().sum();
-    let mut head_data = zeroed_fe_vec(head_rows * head::NUM_COLUMNS);
-    let fill_one = |k: usize, rows: &mut [FE], hrow: &mut [FE], hist: &mut TableHist| {
+    let consts = |k: usize| {
+        use math::field::traits::IsPrimeField;
         let prep = &g.data[k * g.width..(k + 1) * g.width];
-        let canon = |c: usize| {
-            use math::field::traits::IsPrimeField;
-            GoldilocksField::canonical(prep[c].value())
+        let canon = |c: usize| GoldilocksField::canonical(prep[c].value()) as u32;
+        (prep, canon(l::BLEN), canon(l::FLAGS))
+    };
+    let mut hist = TableHist::default();
+
+    // The round chunks.
+    let mut rounds = Vec::with_capacity(shape.rounds.len());
+    let mut start = 0usize;
+    for &size in &shape.rounds {
+        let end = (start + size).min(l::ROUNDS * n);
+        let mut data = zeroed_fe_vec(size * round::NUM_COLUMNS);
+        if start < end {
+            let (k_lo, k_hi) = (start / l::ROUNDS, end.div_ceil(l::ROUNDS));
+            let fill = |k: usize, rows: &mut [FE], hist: &mut TableHist| {
+                let (_, block_len, flags) = consts(k);
+                let mut scratch = TableHist::default();
+                // Count a compression's lookups in the chunk that holds its
+                // first round only.
+                let counted = if l::ROUNDS * k >= start {
+                    hist
+                } else {
+                    &mut scratch
+                };
+                lean::fill_rounds(
+                    rows,
+                    l::tag_for_row(k),
+                    &records[k],
+                    block_len,
+                    flags,
+                    None,
+                    l::ROUNDS,
+                    counted,
+                );
+            };
+            let mut buf = zeroed_fe_vec((k_hi - k_lo) * l::ROUNDS * round::NUM_COLUMNS);
+            #[cfg(feature = "parallel")]
+            let part = {
+                use rayon::prelude::*;
+                buf.par_chunks_mut(l::ROUNDS * round::NUM_COLUMNS)
+                    .enumerate()
+                    .fold(TableHist::default, |mut h, (i, rows)| {
+                        fill(k_lo + i, rows, &mut h);
+                        h
+                    })
+                    .reduce(TableHist::default, |a, b| a.merge(&b))
+            };
+            #[cfg(not(feature = "parallel"))]
+            let part = {
+                let mut h = TableHist::default();
+                for (i, rows) in buf.chunks_mut(l::ROUNDS * round::NUM_COLUMNS).enumerate() {
+                    fill(k_lo + i, rows, &mut h);
+                }
+                h
+            };
+            hist = hist.merge(&part);
+            let skip = start - l::ROUNDS * k_lo;
+            let rows = end - start;
+            data[..rows * round::NUM_COLUMNS].copy_from_slice(
+                &buf[skip * round::NUM_COLUMNS..(skip + rows) * round::NUM_COLUMNS],
+            );
+        }
+        rounds.push(HeldTable::from_rows(data, round::NUM_COLUMNS, hold));
+        start += size;
+    }
+
+    // The head chunks: one row a compression. Its final state is the round
+    // chain's, recomputed (seven rounds on the host: the rows are not kept).
+    let mut heads = Vec::with_capacity(shape.heads.len());
+    let mut start = 0usize;
+    for &size in &shape.heads {
+        let end = (start + size).min(n);
+        let mut data = zeroed_fe_vec(size * head::NUM_COLUMNS);
+        let fill = |k: usize, hrow: &mut [FE], hist: &mut TableHist| {
+            let (prep, block_len, flags) = consts(k);
+            let fs = lean::final_state(&records[k], block_len, flags);
+            lean::fill_head(hrow, prep, &records[k], &fs, hist);
         };
-        let (block_len, flags) = (canon(l::BLEN) as u32, canon(l::FLAGS) as u32);
-        let tag = l::tag_for_row(k);
-        let fs = lean::fill_rounds(
-            rows,
-            tag,
-            &records[k],
-            block_len,
-            flags,
-            None,
-            l::ROUNDS,
-            hist,
-        );
-        lean::fill_head(hrow, prep, &records[k], &fs, hist);
-    };
-    #[cfg(feature = "parallel")]
-    let hist = {
-        use rayon::prelude::*;
-        round_data
-            .par_chunks_mut(l::ROUNDS * round::NUM_COLUMNS)
-            .zip(head_data.par_chunks_mut(head::NUM_COLUMNS))
-            .enumerate()
-            .fold(TableHist::default, |mut hist, (k, (rows, hrow))| {
-                fill_one(k, rows, hrow, &mut hist);
-                hist
-            })
-            .reduce(TableHist::default, |a, b| a.merge(&b))
-    };
-    #[cfg(not(feature = "parallel"))]
-    let hist = {
-        let mut hist = TableHist::default();
-        for (k, (rows, hrow)) in round_data
-            .chunks_mut(l::ROUNDS * round::NUM_COLUMNS)
-            .zip(head_data.chunks_mut(head::NUM_COLUMNS))
-            .enumerate()
-        {
-            fill_one(k, rows, hrow, &mut hist);
+        let live = &mut data[..(end - start) * head::NUM_COLUMNS];
+        #[cfg(feature = "parallel")]
+        let part = {
+            use rayon::prelude::*;
+            live.par_chunks_mut(head::NUM_COLUMNS)
+                .enumerate()
+                .fold(TableHist::default, |mut h, (i, row)| {
+                    fill(start + i, row, &mut h);
+                    h
+                })
+                .reduce(TableHist::default, |a, b| a.merge(&b))
+        };
+        #[cfg(not(feature = "parallel"))]
+        let part = {
+            let mut h = TableHist::default();
+            for (i, row) in live.chunks_mut(head::NUM_COLUMNS).enumerate() {
+                fill(start + i, row, &mut h);
+            }
+            h
+        };
+        hist = hist.merge(&part);
+        heads.push(HeldTable::from_rows(data, head::NUM_COLUMNS, hold));
+        start += size;
+    }
+
+    let table = lean::table_trace(&hist);
+    let table = match hold {
+        B3lHold::Wide => HeldTable::Wide(table),
+        B3lHold::Narrow => {
+            let width = table::NUM_COLUMNS;
+            HeldTable::from_rows(table.main_table.row_major_data().to_vec(), width, hold)
         }
-        hist
     };
-    let split = |data: &mut Vec<FE>, width: usize, sizes: &[usize]| -> Vec<TraceTable<F, E>> {
-        let mut starts = Vec::with_capacity(sizes.len());
-        let mut s = 0usize;
-        for &size in sizes {
-            starts.push(s);
-            s += size;
-        }
-        // From the back, so each chunk's rows move once.
-        let mut out = Vec::with_capacity(sizes.len());
-        for (&start, &size) in starts.iter().zip(sizes).rev() {
-            let mut chunk = data.split_off((start * width).min(data.len()));
-            chunk.resize(size * width, FE::zero());
-            out.push(TraceTable::new_main(chunk, width, 1));
-        }
-        out.reverse();
-        out
-    };
-    let rounds = split(&mut round_data, round::NUM_COLUMNS, &shape.rounds);
-    let heads = split(&mut head_data, head::NUM_COLUMNS, &shape.heads);
     Some(B3lTraces {
         rounds,
         heads,
-        table: lean::table_trace(&hist),
+        table,
     })
+}
+
+/// A TEST-ONLY override of the holding every lean fill on this thread takes.
+#[cfg(test)]
+pub(crate) mod test_hold {
+    use std::cell::Cell;
+
+    use super::B3lHold;
+
+    thread_local! {
+        static HOLD: Cell<Option<B3lHold>> = const { Cell::new(None) };
+    }
+
+    /// The override, restored when dropped.
+    pub(crate) struct Override(Option<B3lHold>);
+
+    impl Drop for Override {
+        fn drop(&mut self) {
+            HOLD.with(|c| c.set(self.0));
+        }
+    }
+
+    pub(crate) fn set(hold: B3lHold) -> Override {
+        Override(HOLD.with(|c| c.replace(Some(hold))))
+    }
+
+    pub(super) fn get() -> Option<B3lHold> {
+        HOLD.with(Cell::get)
+    }
 }
 
 /// A TEST-ONLY override of the lean constraint sets every [`B3lAirs::new`]
