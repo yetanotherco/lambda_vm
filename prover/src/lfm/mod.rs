@@ -223,6 +223,8 @@ mod whir_air_tests;
 #[cfg(test)]
 mod whir_b3_tests;
 #[cfg(test)]
+mod whir_b3_wleg_tests;
+#[cfg(test)]
 mod whir_batch_tests;
 #[cfg(all(test, feature = "parallel"))]
 mod whir_block_b3_tests;
