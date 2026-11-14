@@ -199,7 +199,8 @@ pub struct WhirTreeConfig {
     /// ([`EARLY_POOL_NICE`]), so phase B's host work, which they run beside,
     /// keeps its cores. 0: on the prover's own pool, beside phase B's work.
     pub early_pool: usize,
-    /// `W3_NODE_DOMAINS_EARLY=0|1` (default 0): each node program's domains
+    /// `W3_NODE_DOMAINS_EARLY=0|1` (default on, [`NODE_DOMAINS_EARLY_DEFAULT`];
+    /// 0 is the control): each node program's domains
     /// and twiddles are built as it is emitted, on a thread of its own, rather
     /// than at its prove's start, where a first node over new lengths builds
     /// them before taking the card. Prover-only: a cache, the bytes are the
@@ -473,7 +474,7 @@ impl WhirTreeConfig {
         let early_leaves = early_leaves_setting(count_knob("W3_EARLY_LEAVES")?)?;
         let early_pool = count_knob("W3_EARLY_POOL")?.unwrap_or(EARLY_POOL_DEFAULT);
         let stream_leaf = stream_leaf_setting(count_knob("W3_STREAM_LEAF")?)?;
-        let node_domains_early = flag_knob("W3_NODE_DOMAINS_EARLY")?;
+        let node_domains_early = node_domains_early_setting(count_knob("W3_NODE_DOMAINS_EARLY")?)?;
         let readouts_after = flag_knob("W3_READOUTS_AFTER")?;
         let leaf_emitters = leaf_emitters_setting(count_knob("W3_LEAF_EMITTERS")?);
         let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
@@ -1442,6 +1443,7 @@ pub(crate) fn build_nodes(
                 let wrap = wrap.clone();
                 std::thread::spawn(move || {
                     let built = super::domain_warm::warm_lengths(&lengths, &wrap);
+                    super::domain_warm::note_nodes_early_built(built);
                     hop_stamp(|| format!("L{lv}.{j} domains warmed {built} of {}", lengths.len()));
                 });
             }
@@ -1529,6 +1531,21 @@ pub(crate) fn early_leaf_first(mut order: Vec<TreeAt>, first: Option<usize>) -> 
         order[..=at].rotate_right(1);
     }
     order
+}
+
+/// `W3_NODE_DOMAINS_EARLY` unset: each node program's domains and twiddles are
+/// warmed as it is emitted.
+pub(crate) const NODE_DOMAINS_EARLY_DEFAULT: bool = true;
+
+/// `W3_NODE_DOMAINS_EARLY`: unset is [`NODE_DOMAINS_EARLY_DEFAULT`] (on), `0`
+/// off (the control), `1` on; any other count is refused.
+fn node_domains_early_setting(knob: Option<usize>) -> Result<bool, String> {
+    match knob {
+        None => Ok(NODE_DOMAINS_EARLY_DEFAULT),
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        Some(n) => Err(format!("W3_NODE_DOMAINS_EARLY={n}: 0 or 1")),
+    }
 }
 
 /// `W3_STREAM_LEAF` unset: the leaf phase B leads last streams its execute
@@ -3660,6 +3677,10 @@ pub fn prove_whir_block_tree(
         "W3 STAGING AT END: {} · main traces built on the card {}",
         stark::gpu_lde::staging_report(),
         stark::trace::main_dev_producer_calls()
+    ));
+    sink.line(&format!(
+        "W3 NODE DOMAINS: {}",
+        super::domain_warm::nodes_line()
     ));
     sink.line(&format!(
         "W3 RECURSION: {:.2}s after the base (tree {tree:.2}s) · whole block {whole:.2}s · whole excl. harness readouts {:.2}s (readouts {readouts:.2}s)",
@@ -5851,6 +5872,30 @@ mod tests {
         }
     }
 
+    /// `W3_NODE_DOMAINS_EARLY`: unset warms the nodes' domains as they are
+    /// emitted (the default), 0 is the control, 1 is on, and any other count is
+    /// refused.
+    #[test]
+    fn the_node_domains_knob_is_on_unless_0_and_refuses_other_counts() {
+        assert_eq!(
+            node_domains_early_setting(None),
+            Ok(true),
+            "unset warms early"
+        );
+        assert_eq!(
+            node_domains_early_setting(Some(0)),
+            Ok(false),
+            "the control"
+        );
+        assert_eq!(node_domains_early_setting(Some(1)), Ok(true));
+        for n in [2, 3, 100] {
+            assert!(
+                node_domains_early_setting(Some(n)).is_err(),
+                "W3_NODE_DOMAINS_EARLY={n}"
+            );
+        }
+    }
+
     /// `W3_STREAM_LEAF`: unset streams the last leaf (the default), 0 is the
     /// control, 1 is on, and any other count is refused.
     #[test]
@@ -5938,7 +5983,7 @@ mod tests {
             early_on: true,
             early_leaves: EARLY_LEAVES_DEFAULT,
             early_pool: EARLY_POOL_DEFAULT,
-            node_domains_early: false,
+            node_domains_early: NODE_DOMAINS_EARLY_DEFAULT,
             readouts_after: false,
             stream_leaf: STREAM_LEAF_DEFAULT,
             leaf_emitters: Some(LEAF_EMITTERS),
@@ -5976,7 +6021,7 @@ mod tests {
             "the streamed leaf is scheduling only"
         );
         assert!(
-            off(|c| c.node_domains_early = true),
+            off(|c| c.node_domains_early = !NODE_DOMAINS_EARLY_DEFAULT),
             "the early node domains are a cache only"
         );
         assert!(
