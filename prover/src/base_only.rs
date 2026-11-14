@@ -19,6 +19,18 @@
 //! environment here — the CLI's subcommand is the declaration — and nothing
 //! about the default moves: a process that never declares proves exactly
 //! today's Poseidon1 block, base and recursion alike.
+//!
+//! # A BLAKE3 base under a BLAKE3 recursion
+//!
+//! The other case the rule admits is a base whose recursion is the same hash:
+//! the BLAKE3 levels (`lfm::levels` under `WlfmFamily::B3`) verify a 7-round
+//! BLAKE3 base in-guest and prove every level under BLAKE3, one hash end to
+//! end. Their driver proves its base inside [`with_blake3_levels`], which
+//! admits the BLAKE3 base on the calling thread for that prove alone. The
+//! Poseidon1 recursion admits its base through `block_whir::checked_base`,
+//! which refuses a BLAKE3 base whatever is held here, so no base of one hash is
+//! verified under another's recursion; and a process that declared base-only
+//! refuses the levels too ([`refuse_recursion`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -56,11 +68,39 @@ pub(crate) fn with_permit<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+thread_local! {
+    /// This thread is proving the base of a block whose recursion is BLAKE3
+    /// too ([`with_blake3_levels`]).
+    static BLAKE3_LEVELS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f`, the base prove of a block whose levels are BLAKE3 (one hash end to
+/// end), with the 7-round BLAKE3 base admitted on this thread. The admission
+/// is read on the calling thread, at the base's prove entry, before any worker
+/// is spawned; it ends with `f`, panic or not. Only the base's own prove and
+/// verify sites read it (`block_whir::checked_base_only`): the Poseidon1
+/// recursion's admission (`block_whir::checked_base`) refuses a BLAKE3 base
+/// inside it as outside.
+pub(crate) fn with_blake3_levels<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BLAKE3_LEVELS.with(|p| p.set(self.0));
+        }
+    }
+    let _restore = Restore(BLAKE3_LEVELS.with(|p| p.replace(true)));
+    f()
+}
+
 /// Whether a base other than the recursion's may be admitted here: the
-/// process declared base-only, or (tests) this thread holds the permit.
+/// process declared base-only, this thread is proving a BLAKE3 levels block's
+/// base ([`with_blake3_levels`]), or (tests) this thread holds the permit.
 pub fn admitted() -> bool {
     #[cfg(test)]
     if PERMIT.with(std::cell::Cell::get) {
+        return true;
+    }
+    if BLAKE3_LEVELS.with(std::cell::Cell::get) {
         return true;
     }
     declared()
@@ -78,4 +118,52 @@ pub fn refuse_recursion() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::block_whir::{checked_base, checked_base_only};
+    use stark::proof::options::BaseFormat;
+
+    /// The BLAKE3 levels' admission holds for its scope on its thread alone:
+    /// the base's own admission takes the BLAKE3 base inside it and refuses it
+    /// before, after, and on another thread; the recursion's admission refuses
+    /// it inside it too; and a panic inside it still ends it.
+    #[test]
+    fn the_blake3_levels_admission_is_scoped_to_its_prove() {
+        // On a fresh thread: no declaration, no permit, nothing held.
+        std::thread::spawn(|| {
+            let b3 = BaseFormat::B3_WHIR;
+            assert!(!super::declared());
+            assert!(checked_base_only(&b3).is_err(), "refused before");
+            super::with_blake3_levels(|| {
+                assert!(checked_base_only(&b3).is_ok(), "admitted inside");
+                assert!(
+                    checked_base(&b3).is_err(),
+                    "the recursion's admission refuses it inside"
+                );
+                let other = std::thread::spawn(move || checked_base_only(&b3).is_err());
+                assert!(other.join().expect("joins"), "another thread is refused");
+                super::with_blake3_levels(|| assert!(checked_base_only(&b3).is_ok()));
+                assert!(
+                    checked_base_only(&b3).is_ok(),
+                    "a nested scope restores it held"
+                );
+            });
+            assert!(checked_base_only(&b3).is_err(), "refused after");
+            let _ = std::panic::catch_unwind(|| {
+                super::with_blake3_levels(|| panic!("inside the scope"));
+            });
+            assert!(
+                checked_base_only(&b3).is_err(),
+                "refused after a panic inside"
+            );
+            assert!(
+                checked_base_only(&crate::hash_pin::BLOCK_BASE).is_ok(),
+                "the block family's base is admitted throughout"
+            );
+        })
+        .join()
+        .expect("the checks hold");
+    }
 }
