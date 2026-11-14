@@ -1005,6 +1005,21 @@ const PINNED_HALF_WORD_SENDERS: &[(&str, &str, &str)] = &[
     ),
     ("COPY", "Column(36)", "a bit column"),
     ("COPY", "Column(38)", "a bit column"),
+    (
+        "CPU",
+        "Column(6)",
+        "read_register1, a bit column (the in-row slot's step)",
+    ),
+    (
+        "CPU",
+        "Column(7)",
+        "read_register2, a bit column (the in-row slot's step)",
+    ),
+    (
+        "CPU",
+        "Column(8)",
+        "write_register, a bit column (the in-row slot's step)",
+    ),
     ("CPU", "One", "the constant 1"),
     ("CPU32", "Column(37)", "a bit column"),
     (
@@ -1032,8 +1047,8 @@ const PINNED_HALF_WORD_SENDERS: &[(&str, &str, &str)] = &[
     ),
     (
         "MEMW_R",
-        "Sum(8, 9)",
-        "μ_read + μ_write, a bit (IS_BIT on the sum)",
+        "Sum3(9, 10, 11)",
+        "the residual register table's μ_read + μ_write + μ_keep, a bit (IS_BIT on the sum)",
     ),
     (
         "MUL",
@@ -1181,12 +1196,13 @@ fn every_memw_sender_sends_the_clocks_zero_high_word() {
 /// sender's timestamp high word, and the buses it receives a column one on (a
 /// CPU-fed one among them, checked: ECALL, CPU32, MEMORY_OP; the others are
 /// the tables' own chains and lookups). KECCAK sends both: the constant 0 in
-/// its sponge mode, its column 1 in its permute mode.
+/// its sponge mode, its column 1 in its permute mode. The CPU sends no MEMW
+/// message under the pinned register format (its register accesses are
+/// tokens on the REG bus, checked in the row); its constant 0 was here before.
 #[cfg(feature = "parallel")]
-const PINNED_MEMW_HIGH_WORDS: [&str; 12] = [
+const PINNED_MEMW_HIGH_WORDS: [&str; 11] = [
     "BLAKE3 column 1 from Blake3Absorb + Ecall",
     "COPY column 1 from CopyNext + Ecall",
-    "CPU 0",
     "CPU32 column 1 from Cpu32",
     "ECREC column 1 from Bit + Ecall + Ecdas",
     "ECSM column 1 from Bit + Ecall + Ecdas",

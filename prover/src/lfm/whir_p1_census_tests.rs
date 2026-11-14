@@ -1141,7 +1141,12 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// machine.
 ///
 /// The pins move with any AIR whose constraint leg a leaf emits, with the
-/// block's format and with the mix: last moved by the mix's LT row, LT's
+/// block's format and with the mix: last moved by the registers checked in the
+/// CPU row as the default (the CPU's 42 columns and REG tokens, MEMW_R's slot
+/// one residual register table on the mix, REGISTER a register a row: one leaf
+/// fewer under either check; the format before it,
+/// `BLOCK_WHIR_REGISTERS=tokens32`, emits the leaves pinned before it, pinned
+/// below); before that by the mix's LT row, LT's
 /// tables as the median block makes them with MEMW_A's limbs (38, from 98);
 /// before that by MEMW_A's timestamp order by the step's limbs as the default
 /// (21 interactions, no LT lookup; on the mix of then, the form before it,
@@ -1159,30 +1164,30 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         (
             LeafQuery::V1,
             GkrPack::PRODUCTION,
-            5,
-            "87153dc8999cfac57ee889fbbbc109869611d26e0708f243db9eb4a525245756",
-            "91a3755b7dd401ff52649b2373a982a4058e0b55f54004264d67090421fe7388",
+            4,
+            "0eb241d6d58cc1084eca014c911bfae4e65bf1e2c8fc6fd83e51d28dc158f170",
+            "cd63daed363e9bf8c77a487a0d0960399faf54b7ec8ef6bafb2944723ec5557e",
         ),
         (
             LeafQuery::Lean,
             GkrPack::PRODUCTION,
-            4,
-            "a044471c75ac1bcda5babf6ccbf1ec3b5123ba699e44f1c96d192a14af6ed015",
-            "a0268205cc5c6b456d0f7822a6b0010c48387a2851f13bb9dc2230721675d8a8",
+            3,
+            "152026f346dcda0a11f473ae5a20746120705477ad6fffe01713018d287238e0",
+            "793d86dc97cf6389d93c636887f1d3949c601f37e2643e41875ef59ac35d6f3f",
         ),
         (
             LeafQuery::V1,
             GkrPack::Off,
-            5,
-            "6b2fa02199044ca7f5b80c7b5db8d39571fab63e929d8267635afc740a4df860",
-            "774eab6f2ebb311fd9f492862ab2369a06e13d4e0cb9b60d76d4b0866dd7092e",
+            4,
+            "35282d8a6ae963712584d7ef13513dea80c0811806941d03a3804adae612a90a",
+            "1827fced92f4f03ee2e3a20205b34442c7e90aed4baa5a2db6c19d5876d1c644",
         ),
         (
             LeafQuery::Lean,
             GkrPack::Off,
-            4,
-            "e926cebe1ca85fc28b14642065fe4974ceb90fdb82edf6964e85312a8dd20b43",
-            "bd8bda46e453675764a0e3a853ba5ddf127a4d5ed500a6210b071d72328693c7",
+            3,
+            "5c25f4d8ad9d2dd6b759fdefbc88198e8f12594a5708c91060c14f78e056162e",
+            "cb4fb5252d421e13c8550e5a3df933c8ad1a759e05cbec4940dd705f387d95a7",
         ),
     ];
     let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
@@ -1233,14 +1238,46 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         PINS[1].3,
         "the default's first leaf is the lean check's at the production packing"
     );
-    // MEMW_A's form before the limbs (`BLOCK_WHIR_MEMW_A=lt`), pinned too: its
-    // leaves are other programs than the limbs'.
+    // The register format before the in-row one (`BLOCK_WHIR_REGISTERS=tokens32`),
+    // pinned too: over its own statement of the mix (MEMW_R's tables), it
+    // emits the leaves the lean check pinned before the flip.
+    let tokens32 = |format: BlockFormat| BlockFormat {
+        registers: crate::tables::register::RegisterFormat::Tokens32,
+        ..format
+    };
+    let owned_tokens32 = median_statement(
+        elf_bytes,
+        &opts,
+        &tokens32(at(LeafQuery::V1, GkrPack::PRODUCTION)),
+    );
+    let before = WhirBlockPlan::derive(
+        elf_bytes,
+        &opts,
+        &tokens32(at(LeafQuery::Lean, GkrPack::PRODUCTION)),
+        owned_tokens32.view(),
+        None,
+    )
+    .expect("the plan derives");
+    let n = before.partition().num_leaves();
+    let digest = |k: usize| program_digest(&before.leaf_program(k).expect("the leaf emits"));
+    assert_eq!(
+        (n, digest(0), digest(n - 1)),
+        (
+            4,
+            "a044471c75ac1bcda5babf6ccbf1ec3b5123ba699e44f1c96d192a14af6ed015".to_string(),
+            "a0268205cc5c6b456d0f7822a6b0010c48387a2851f13bb9dc2230721675d8a8".to_string()
+        ),
+        "the register format before the in-row one"
+    );
+    // MEMW_A's form before the limbs (`BLOCK_WHIR_MEMW_A=lt`), pinned too, at
+    // the register format of then: its leaves are other programs than the
+    // limbs'.
     let lt = WhirBlockPlan::derive(
         elf_bytes,
         &opts,
-        &p1_format_at_blowup_2()
+        &tokens32(p1_format_at_blowup_2())
             .with_memw_aligned(crate::tables::memw_aligned::MemwAlignedOrder::Lt),
-        owned.view(),
+        owned_tokens32.view(),
         None,
     )
     .expect("the plan derives");
@@ -1683,10 +1720,8 @@ fn the_one_top_scale_doubles_and_puts_at_most_three_leaves_under_one_top() {
         levels(LeafScale::DoubledOneTop, Some(5)),
         vec![vec![3, 2], vec![2]]
     );
-    // One round-0 tree a group's run (the default) leaves the median mix one
-    // leaf fewer than one a polynomial did.
-    assert_eq!(
-        levels(LeafScale::DoubledOneTop, None),
-        vec![vec![3, 1], vec![2]]
-    );
+    // One round-0 tree a group's run left the median mix one leaf fewer than
+    // one a polynomial did (four), and the registers checked in the CPU row
+    // (the default) one fewer again: three, under one top.
+    assert_eq!(levels(LeafScale::DoubledOneTop, None), vec![vec![3]]);
 }
