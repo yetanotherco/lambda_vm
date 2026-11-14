@@ -435,53 +435,70 @@ fn the_kept_lists_build_the_finishs_keccak_rnd_and_lt_tables_again() {
 /// Every windowed configuration, chunked small and at four rows, windows of 7
 /// and 1000 cycles, budgets of one byte, 2 GiB and none: the streamed finish
 /// hands on, in AIR order, the monolithic finish's tables word for word and
-/// its streamed slots, under its header.
+/// its streamed slots, under its header. Each (row configuration, program)
+/// pair is checked on a thread of its own: the same checks, side by side; the
+/// first failing pair's panic is the test's.
 #[test]
 fn the_stream_is_the_monolithic_finish_in_air_order() {
-    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
-        for name in [
-            "all_instructions_64",
-            "misalign_sd",
-            "test_keccak_multi",
-            "test_ecsm_multi",
-            "test_commit_split",
-            "test_blake3_absorb",
-            "test_dense_pages",
-        ] {
-            let (program, logs) = run(name);
-            for window in [7, 1000] {
-                for (config, configure) in &configs() {
-                    let (builder, last) =
-                        pushed(&program, &logs, &max_rows, window, configure.as_ref());
-                    let whole = builder.finish(last).expect("the monolithic finish");
-                    let want = air_order(&whole);
-                    for budget in [1usize, 2 << 30, usize::MAX] {
-                        let what = format!("{name} window {window} {config} budget {budget}");
-                        let (builder, last) =
-                            pushed(&program, &logs, &max_rows, window, configure.as_ref());
-                        let (header, got, _) = streamed(builder, last, budget);
-                        assert_eq!(
-                            format!("{:?}", header.table_counts),
-                            format!("{:?}", whole.table_counts()),
-                            "{what}: the header's counts"
-                        );
-                        assert_eq!(got.len(), want.len(), "{what}: the tables in AIR order");
-                        for (k, (emitted, table)) in got.iter().zip(&want).enumerate() {
-                            assert_eq!(emitted.position, k, "{what}: position {k}");
-                            match (&emitted.table, table) {
-                                (None, None) => {}
-                                (Some(a), Some(b)) => assert_eq!(
-                                    shape_and_words(a),
-                                    shape_and_words(b),
-                                    "{what}: table {k}"
-                                ),
-                                (a, b) => panic!(
-                                    "{what}: table {k} streamed {} but built {}",
-                                    a.is_some(),
-                                    b.is_some()
-                                ),
-                            }
+    let programs = [
+        "all_instructions_64",
+        "misalign_sd",
+        "test_keccak_multi",
+        "test_ecsm_multi",
+        "test_commit_split",
+        "test_blake3_absorb",
+        "test_dense_pages",
+    ];
+    let pairs: Vec<(MaxRowsConfig, &str)> = [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)]
+        .into_iter()
+        .flat_map(|max_rows| programs.map(|name| (max_rows.clone(), name)))
+        .collect();
+    std::thread::scope(|scope| {
+        let pairs: Vec<_> = pairs
+            .iter()
+            .map(|(max_rows, name)| {
+                scope.spawn(move || the_stream_is_the_finish_for(max_rows, name))
+            })
+            .collect();
+        for pair in pairs {
+            if let Err(panic) = pair.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
+}
+
+/// [`the_stream_is_the_monolithic_finish_in_air_order`] for one row
+/// configuration and one program.
+fn the_stream_is_the_finish_for(max_rows: &MaxRowsConfig, name: &str) {
+    let (program, logs) = run(name);
+    for window in [7, 1000] {
+        for (config, configure) in &configs() {
+            let (builder, last) = pushed(&program, &logs, max_rows, window, configure.as_ref());
+            let whole = builder.finish(last).expect("the monolithic finish");
+            let want = air_order(&whole);
+            for budget in [1usize, 2 << 30, usize::MAX] {
+                let what = format!("{name} window {window} {config} budget {budget}");
+                let (builder, last) = pushed(&program, &logs, max_rows, window, configure.as_ref());
+                let (header, got, _) = streamed(builder, last, budget);
+                assert_eq!(
+                    format!("{:?}", header.table_counts),
+                    format!("{:?}", whole.table_counts()),
+                    "{what}: the header's counts"
+                );
+                assert_eq!(got.len(), want.len(), "{what}: the tables in AIR order");
+                for (k, (emitted, table)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(emitted.position, k, "{what}: position {k}");
+                    match (&emitted.table, table) {
+                        (None, None) => {}
+                        (Some(a), Some(b)) => {
+                            assert_eq!(shape_and_words(a), shape_and_words(b), "{what}: table {k}")
                         }
+                        (a, b) => panic!(
+                            "{what}: table {k} streamed {} but built {}",
+                            a.is_some(),
+                            b.is_some()
+                        ),
                     }
                 }
             }
