@@ -401,13 +401,22 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(2_832);
+    // Each group's own rows, the front's apart (the plan's emission marks):
+    // a verified group's compressions are its walk's and opening's, not the
+    // front every leaf repeats.
+    let (loads, front) = plan.chip_loads();
+    println!(
+        "B3E01 FRONT: compressions {} · rows {:?}",
+        front.accel, front
+    );
     let mut sum = FEE::zero();
     let mut per_group: Vec<(usize, usize, u64, u64)> = Vec::new();
     let mut executed = 0usize;
     for k in 0..plan.partition().num_leaves() {
         let g = plan.partition().leaf(k)[0];
         let program = plan.leaf_program(k).expect("the leaf emits");
-        let (b3l, blake3, other) = hash_rows(&program);
+        let (leaf_b3l, blake3, other) = hash_rows(&program);
+        let b3l = loads[g].accel;
         assert_eq!((blake3, other), (0, 0), "group {g}: lean rows only");
         let chips = super::airs::lfm_chip_census_with_hasher(
             &program,
@@ -415,14 +424,16 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
         );
         let field_main: u64 = chips.iter().map(|c| c.main_cells()).sum();
         let field_padded: u64 = chips.iter().map(|c| c.main_cells() + c.aux_cells()).sum();
-        let hash_cells = b3l as u64 * lean_cells_per_compression;
+        // The leaf's (front and group): its chips at their padded heights,
+        // and its compressions at the lean tables' cells each.
+        let hash_cells = leaf_b3l as u64 * lean_cells_per_compression;
         let t = std::time::Instant::now();
         let words = run_leaf(&plan, &proof, k);
         let exec_secs = t.elapsed().as_secs_f64();
         println!(
-            "B3E01 GROUP {g}: compressions {b3l} · instructions {} · rows {:?} · field main cells {field_main} (with aux {field_padded}) · lean hash cells {hash_cells} · hash share {:.4} · execute {exec_secs:.2} s · executed {}",
+            "B3E01 GROUP {g}: compressions {b3l} · leaf compressions {leaf_b3l} · instructions {} · group rows {:?} · leaf field main cells {field_main} (with aux {field_padded}) · leaf lean hash cells {hash_cells} · leaf hash share {:.4} · execute {exec_secs:.2} s · executed {}",
             program.instrs.len(),
-            ChipRows::of(&program),
+            loads[g],
             hash_cells as f64 / (hash_cells + field_main) as f64,
             words.is_ok()
         );
@@ -443,7 +454,7 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
     let field: u64 = per_group.iter().map(|p| p.2).sum();
     let hash: u64 = per_group.iter().map(|p| p.3).sum();
     println!(
-        "B3E01 SUMMARY: groups {groups} · executed {executed} · bus closes {} · compressions a group median {median} max {max} total {total} · lean cells total {} (hash {hash}, field {field}) · hash share {:.4}",
+        "B3E01 SUMMARY: groups {groups} · executed {executed} · bus closes {} · compressions a group median {median} max {max} total {total} · one-group leaves' lean cells Σ {} (hash {hash}, field {field}) · leaf hash share {:.4}",
         sum == FEE::zero(),
         hash + field,
         hash as f64 / (hash + field) as f64
