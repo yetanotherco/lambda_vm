@@ -7,8 +7,11 @@
 //! - **Level k + 1** verifies level k's proof in-guest (the W-leg,
 //!   [`super::wlfm_leg`]) and republishes its words in order, so every level
 //!   publishes the top's words and [`top_claims`] reads the last one's.
-//! - The chain stops at the first level whose proof is at most
-//!   [`STOP_GROUPS`] groups. The level count follows from the shapes alone.
+//! - The chain's length is a verifier constant, [`LevelStop`]: by default
+//!   [`LevelStop::DEFAULT`], two levels (the base verified, then that proof
+//!   verified once: a file of a few megabytes, the size the uncompressed block
+//!   ships today); deeper chains stop at a group count instead, for the
+//!   compression modes. The level count follows from the shapes alone.
 //!
 //! There are no leaves and no nodes: the unit of proving (a group of the
 //! level's block) is apart from the unit of verifying (a program).
@@ -42,12 +45,22 @@ use crate::hash_pin::{BlockFamily, ProofFamily};
 /// The rate every level proves at: the base's, blowup 2.
 pub const LEVEL_RATE: WlfmRate = WlfmRate::Two;
 
-/// The chain stops at the first level whose proof has at most this many
-/// groups.
-pub const STOP_GROUPS: usize = 1;
+/// Where a chain stops: a verifier constant, named by both sides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LevelStop {
+    /// Exactly this many levels (at least one).
+    Levels(usize),
+    /// At the first level whose proof has at most this many groups.
+    Groups(usize),
+}
 
-/// The most levels a chain may take: a shape that does not shrink to
-/// [`STOP_GROUPS`] by then is refused rather than proved without end.
+impl LevelStop {
+    /// Two levels: level 1 over the base, level 2 over level 1.
+    pub const DEFAULT: Self = LevelStop::Levels(2);
+}
+
+/// The most levels a chain may take: a [`LevelStop::Groups`] chain that does
+/// not shrink to its count by then is refused rather than proved without end.
 pub const MAX_LEVELS: usize = 8;
 
 /// One level: its program and its build (the artifacts, and for a prover the
@@ -97,15 +110,31 @@ pub fn derive_levels(
     family: WlfmFamily,
     on_host: bool,
 ) -> Result<Vec<Level>, String> {
+    derive_levels_to(plan, family, LevelStop::DEFAULT, on_host)
+}
+
+/// [`derive_levels`] under the chain stop `stop`.
+pub fn derive_levels_to(
+    plan: &WhirBlockPlan,
+    family: WlfmFamily,
+    stop: LevelStop,
+    on_host: bool,
+) -> Result<Vec<Level>, String> {
     check_family(plan, family)?;
-    let mut levels = vec![build_level(plan.closed_block_program()?, family, on_host)?];
-    while levels.last().expect("a level").build.artifacts.sizes.len() > STOP_GROUPS {
-        if levels.len() == MAX_LEVELS {
-            return Err(format!(
-                "{MAX_LEVELS} levels and the last still has {} groups",
-                levels.last().expect("a level").build.artifacts.sizes.len()
-            ));
+    let more = |levels: &[Level]| -> Result<bool, String> {
+        let groups = levels.last().expect("a level").build.artifacts.sizes.len();
+        match stop {
+            LevelStop::Levels(0) => Err("a chain has at least one level".into()),
+            LevelStop::Levels(n) => Ok(levels.len() < n.min(MAX_LEVELS)),
+            LevelStop::Groups(g) if groups <= g => Ok(false),
+            LevelStop::Groups(_) if levels.len() == MAX_LEVELS => Err(format!(
+                "{MAX_LEVELS} levels and the last still has {groups} groups"
+            )),
+            LevelStop::Groups(_) => Ok(true),
         }
+    };
+    let mut levels = vec![build_level(plan.closed_block_program()?, family, on_host)?];
+    while more(&levels)? {
         let child = child_of(plan, levels.last().expect("a level"));
         levels.push(build_level(wlfm_leg_program(&child)?, family, on_host)?);
     }
@@ -158,7 +187,17 @@ pub fn verify_levels(
     family: WlfmFamily,
     last: &WlfmProof,
 ) -> Result<(), String> {
-    let levels = derive_levels(plan, family, true)?;
+    verify_levels_to(plan, family, LevelStop::DEFAULT, last)
+}
+
+/// [`verify_levels`] under the chain stop `stop` (the verifier's constant).
+pub fn verify_levels_to(
+    plan: &WhirBlockPlan,
+    family: WlfmFamily,
+    stop: LevelStop,
+    last: &WlfmProof,
+) -> Result<(), String> {
+    let levels = derive_levels_to(plan, family, stop, true)?;
     let top = levels.last().expect("a level");
     verify_wlfm(&top.build.artifacts, last, &last.public_words)
         .map_err(|e| format!("the last level does not verify: {e}"))?;
