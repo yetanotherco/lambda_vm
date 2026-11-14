@@ -120,6 +120,7 @@ fn a_blake3_base_needs_the_base_only_permit_and_never_reaches_the_recursion() {
     });
     let mut want = MULTILINEAR_BLOCK_TAG.to_vec();
     want.extend_from_slice(B3_BASE_TAG_SUFFIX);
+    want.extend_from_slice(b"/C8");
     assert_eq!(block_statement_tag(&b3), want);
     assert_ne!(
         block_statement_tag(&b3),
