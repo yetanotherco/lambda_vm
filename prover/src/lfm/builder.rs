@@ -148,6 +148,11 @@ pub struct LfmBuilder {
     /// the arena the width-16 walk's third sibling is hinted from. See
     /// [`LfmBuilder::with_p1w16_census`].
     p1w16_census: Option<ArenaId>,
+    /// Whether a [`WrapHash::Blake3`] program's compressions are the lean
+    /// tables' standard 7-round rows ([`Self::b3_compress`]) rather than
+    /// `LFM_BLAKE3`'s. Off by default: every program today emits what it
+    /// emitted. See [`Self::with_b3_lean`].
+    b3_lean: bool,
 }
 
 impl LfmBuilder {
@@ -169,6 +174,29 @@ impl LfmBuilder {
         );
         self.wrap_hash = wrap_hash;
         self
+    }
+
+    /// Emit a [`WrapHash::Blake3`] program's BLAKE3 compressions as the lean
+    /// tables' rows ([`Self::b3_compress`]): every hash the byte constructions
+    /// emit (`edsl`'s chain, leaf and parent) computes the same standard
+    /// 7-round digest either way; what moves is the chip that proves it. A
+    /// leaf then takes its felts as `Felts` blocks (no `BitDec` a value) and a
+    /// parent its two digests' words as one `Lanes` block. Program shape, so
+    /// chosen before emission like the wrap hash; only the block prover
+    /// (W-LFM) proves the lean rows.
+    pub fn with_b3_lean(mut self, lean: bool) -> Self {
+        assert!(
+            self.instrs.is_empty(),
+            "the BLAKE3 chip is program shape and must be chosen before emission"
+        );
+        self.b3_lean = lean;
+        self
+    }
+
+    /// Whether this program's BLAKE3 compressions are the lean tables' rows:
+    /// a [`WrapHash::Blake3`] program built [`Self::with_b3_lean`].
+    pub fn b3_lean(&self) -> bool {
+        self.b3_lean && self.wrap_hash == WrapHash::Blake3
     }
 
     /// The byte hash this program's commitment layer runs.
