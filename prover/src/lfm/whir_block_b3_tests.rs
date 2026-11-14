@@ -484,6 +484,41 @@ fn blake3_level0_census_on_a_real_block() {
         .expect("a leaf holds group 0");
     let refused = run_leaf(&plan, &forged, holder).is_err();
     println!("B3 CENSUS TAMPER root byte: refused {refused}");
+    // Under the base's final polynomial: one of group 0's sent values off;
+    // the host refuses it and group 0's leaf has no execution.
+    let final_at = cfg
+        .format
+        .chain_config(&[(1, plan.group_stack(0).1)])
+        .final_round(plan.group_stack(0).1);
+    let final_refused = match final_at {
+        Some((r, _)) => {
+            let mut forged = proof.clone();
+            assert!(
+                forged.proof.columns[0].polys[0].rounds[r]
+                    .next_root
+                    .is_none(),
+                "round {r} is group 0's final round: it commits no successor"
+            );
+            match &mut forged.proof.columns[0].polys[0].rounds[r].openings {
+                RoundOpenings::Extension(p) => p.next[0].values[0] += FEE::one(),
+                other => panic!("group 0's final round {r} sends extension values: {other:?}"),
+            }
+            let host = crate::base_only::with_permit(|| {
+                verify_block_whir(&forged, &elf, &opts, &cfg.format).unwrap_or(false)
+            });
+            let refused = !host && run_leaf(&plan, &forged, holder).is_err();
+            println!(
+                "B3 CENSUS TAMPER final polynomial value (group 0, round {r}): host refuses {} · \
+                 refused {refused}",
+                !host
+            );
+            Some(refused)
+        }
+        None => {
+            println!("B3 CENSUS TAMPER final polynomial value: none (no final round)");
+            None
+        }
+    };
 
     if std::env::var("B3_CENSUS_WHOLE").is_ok_and(|v| v.trim() == "1") {
         let whole =
@@ -503,4 +538,9 @@ fn blake3_level0_census_on_a_real_block() {
     assert_eq!(executed, groups, "every group's leaf executes");
     assert_eq!(sum, FEE::zero(), "the leaves' shares cancel");
     assert!(refused, "a tampered root is refused");
+    assert_ne!(
+        final_refused,
+        Some(false),
+        "a tampered sent value is refused"
+    );
 }
