@@ -1,9 +1,8 @@
 //! ★ The card-built rows' upload on the card (`math_cuda::card_rows`,
-//! `LAMBDA_VM_CARD_ROWS`); `registers` (MEMW_R's rows built from the logs, a
-//! mode only a test sets) at the end of the file: a
-//! group's upload in the knob's `order` (every copy, then every kernel) and
-//! the test's `derive` (CPU logs kept on the card; LOAD and STORE derived from
-//! them, as `words` derives them)
+//! `LAMBDA_VM_CARD_ROWS`); `words`' MEMW_R (its rows built from the walk's
+//! words and the logs) at the end of the file: a group's upload in the knob's
+//! `order` (every copy, then every kernel) and in `words` (CPU logs kept on
+//! the card; LOAD and STORE derived from them)
 //! writes the words today's upload writes, group by group, in the hand-out's
 //! order and again in the reverse order (phase B's re-uploads, with the cache
 //! holding other chunks than the ones asked for). Each test says that the
@@ -72,9 +71,11 @@ fn grouped(chunks: &[(StreamTable, usize, Records)], size: usize) -> Vec<Vec<&Re
         .collect()
 }
 
-/// Every group in `order` and `derive`, forwards and backwards, against
+/// Every group in `order` and `words`, forwards and backwards, against
 /// today's: the words differing in each (0 everywhere). Returns the counters
-/// of the derive mode's two passes and today's stores, group by group.
+/// of the words mode's two passes and today's stores, group by group. The
+/// chunks hold MEMW_R as rows, so `words` derives LOAD and STORE here and
+/// sends MEMW_R as records.
 fn compare(groups: &[Vec<&Records>], what: &str) -> (card_rows::Stats, Vec<Vec<Vec<u64>>>) {
     let forwards: Vec<usize> = (0..groups.len()).collect();
     let backwards: Vec<usize> = (0..groups.len()).rev().collect();
@@ -87,11 +88,11 @@ fn compare(groups: &[Vec<&Records>], what: &str) -> (card_rows::Stats, Vec<Vec<V
         );
     }
     let want = |g: usize| today[g].1.as_ref().expect("today's store");
-    let mut derive_stats = card_rows::Stats::default();
+    let mut words_stats = card_rows::Stats::default();
     for (mode, order) in [
         (Mode::Order, &forwards),
-        (Mode::Derive, &forwards),
-        (Mode::Derive, &backwards),
+        (Mode::Words, &forwards),
+        (Mode::Words, &backwards),
     ] {
         if order == &forwards {
             card_rows::clear();
@@ -104,16 +105,16 @@ fn compare(groups: &[Vec<&Records>], what: &str) -> (card_rows::Stats, Vec<Vec<V
                 "{what}: {mode:?} group {g}: {count} words differ, the first at {first:?}"
             );
         }
-        if mode == Mode::Derive {
+        if mode == Mode::Words {
             let s = card_rows::stats();
-            derive_stats = s;
+            words_stats = s;
         }
     }
     let today = today
         .into_iter()
         .map(|(_, store)| store.expect("today's store"))
         .collect();
-    (derive_stats, today)
+    (words_stats, today)
 }
 
 #[test]
@@ -153,7 +154,7 @@ fn card_rows_uploads_write_todays_words_forwards_and_backwards() {
     let (program, _) = run("all_loadstore_32");
     let chunks = records_chunks(&program, &[], &max_rows, 7, (0, None), true);
     let groups = grouped(&chunks, 8);
-    let outside = stores(&groups, &[0], Mode::Derive);
+    let outside = stores(&groups, &[0], Mode::Words);
     assert!(outside[0].1.is_some(), "a group outside a block declined");
     assert_eq!(card_rows::held(), (0, 0), "logs kept outside a block");
     println!(
@@ -230,7 +231,7 @@ fn card_rows_on_a_real_block_write_todays_words() {
         "no LOAD or STORE table derived on the real block"
     );
 
-    // The mutant: the derive passes again (forwards from an empty cache, then
+    // The mutant: the words passes again (forwards from an empty cache, then
     // backwards with it warm), each derived row's cycle read one late in one
     // family at a time.
     let forwards: Vec<usize> = (0..groups.len()).collect();
@@ -242,7 +243,7 @@ fn card_rows_on_a_real_block_write_todays_words() {
         let mut moved = 0usize;
         let mut uploads = 0usize;
         for order in [&forwards, &backwards] {
-            for (g, got) in stores(&groups, order, Mode::Derive) {
+            for (g, got) in stores(&groups, order, Mode::Words) {
                 uploads += 1;
                 moved += usize::from(match got {
                     None => true,
@@ -270,30 +271,18 @@ fn card_rows_on_a_real_block_write_todays_words() {
 }
 
 // ---------------------------------------------------------------------------
-// `registers`: MEMW_R's rows built on the card from the CPU logs it holds.
+// `words`: MEMW_R's rows built on the card from the words the walk writes.
 // ---------------------------------------------------------------------------
 
-/// The absorbing side's word for "enough windows" ([`history_chunks`]).
+/// The absorbing side's word for "enough windows" ([`history_chunks_as`]).
 const ENOUGH: &str = "card rows test: enough windows walked";
 
 /// Every chunk a record-mode run of `program` hands out as records (every
-/// row family's too), MEMW_R's with their ECALL cycles
-/// ([`WindowedTraceBuilder::card_marks_ecalls`]): windows of `window` cycles
-/// walked from the fast engine's history on two walkers, through `windows`
-/// windows absorbed (all of them: `None`), in hand-out order.
-fn history_chunks(
-    program: &Elf,
-    input: &[u8],
-    max_rows: &MaxRowsConfig,
-    window: usize,
-    windows: Option<usize>,
-) -> Vec<(StreamTable, usize, Records)> {
-    history_chunks_as(program, input, max_rows, window, windows, false)
-}
-
-/// [`history_chunks`], the walkers writing MEMW_R's rows as words when
-/// `words` ([`WindowedTraceBuilder::card_writes_words`]; no ECALL cycles
-/// then: the walkers mark the rows the card cannot build).
+/// row family's too): windows of `window` cycles walked from the fast
+/// engine's history on two walkers, through `windows` windows absorbed (all
+/// of them: `None`), in hand-out order; the walkers writing MEMW_R's rows as
+/// words when `words` ([`WindowedTraceBuilder::card_writes_words`]: they mark
+/// the rows the card cannot build), as rows otherwise.
 fn history_chunks_as(
     program: &Elf,
     input: &[u8],
@@ -312,7 +301,7 @@ fn history_chunks_as(
     let mut builder = if words {
         builder.and_then(WindowedTraceBuilder::card_writes_words)
     } else {
-        builder.and_then(WindowedTraceBuilder::card_marks_ecalls)
+        builder
     }
     .expect("the builder");
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
@@ -386,223 +375,6 @@ fn memw_r_host_words(groups: &[Vec<&Records>]) -> Vec<Vec<(usize, Vec<Vec<u64>>)
         })
         .collect()
 }
-
-/// The groups uploaded in [`Mode::Registers`], forwards from an empty cache
-/// and then backwards with it warm, against today's upload: the words
-/// differing in each (0 everywhere), and each MEMW_R table's columns against
-/// the host's fill of its records, word for word. Returns the counters at the
-/// passes' end, today's stores, and the MEMW_R tables compared with the
-/// host's fill.
-fn compare_registers(
-    groups: &[Vec<&Records>],
-    what: &str,
-) -> (card_rows::Stats, Vec<Vec<Vec<u64>>>, usize) {
-    let forwards: Vec<usize> = (0..groups.len()).collect();
-    let backwards: Vec<usize> = (0..groups.len()).rev().collect();
-    card_rows::clear();
-    let today: Vec<Vec<Vec<u64>>> = stores(groups, &forwards, Mode::Off)
-        .into_iter()
-        .map(|(g, store)| store.unwrap_or_else(|| panic!("{what}: today's group {g} declined")))
-        .collect();
-    let host = memw_r_host_words(groups);
-    let mut against_host = 0usize;
-    card_rows::clear();
-    for order in [&forwards, &backwards] {
-        for (g, got) in stores(groups, order, Mode::Registers) {
-            let got = got.unwrap_or_else(|| panic!("{what}: registers declined group {g}"));
-            let (count, first) = mismatches(&got, &today[g]);
-            assert_eq!(
-                count, 0,
-                "{what}: registers group {g}: {count} words differ, the first at {first:?}"
-            );
-            for (column, words) in &host[g] {
-                let (count, first) = mismatches(&got[*column..*column + words.len()], words);
-                assert_eq!(
-                    count, 0,
-                    "{what}: registers group {g}: the MEMW_R table at column {column}: \
-                     {count} words differ from the host's fill, the first at {first:?}"
-                );
-                against_host += 1;
-            }
-        }
-    }
-    (card_rows::stats(), today, against_host)
-}
-
-/// ★ Record-mode runs of programs with every ECALL the walk handles, windows
-/// of 7 and 33 cycles, CPU and MEMW_R chunks of 32 rows, in groups of 3 and
-/// 8: under `registers` every group writes today's words both ways, and the
-/// rule built rows and sent rows whole for an ECALL, after one and before
-/// their table.
-#[test]
-fn card_built_register_rows_write_todays_words_forwards_and_backwards() {
-    let _reset = Reset::new();
-    let max_rows = MaxRowsConfig::small();
-    let mut sum = card_rows::Stats::default();
-    let mut against_host = 0usize;
-    for name in [
-        "all_instructions_64",
-        "all_loadstore_32",
-        "test_keccak_multi",
-        "test_commit_split",
-        "test_copy_ecalls",
-        "test_ecsm",
-        "test_blake3_absorb",
-        "misalign_sd",
-    ] {
-        let (program, _) = run(name);
-        for window in [7usize, 33] {
-            let chunks = history_chunks(&program, &[], &max_rows, window, None);
-            for size in [3usize, 8] {
-                let groups = grouped(&chunks, size);
-                let (s, _, host) = compare_registers(
-                    &groups,
-                    &format!("{name}, window {window}, groups of {size}"),
-                );
-                assert_eq!(s.declined, 0, "{name}: a group declined");
-                against_host += host;
-                sum.derived_memw_r += s.derived_memw_r;
-                sum.records_memw_r += s.records_memw_r;
-                sum.register_words += s.register_words;
-                sum.whole.ecall += s.whole.ecall;
-                sum.whole.after_ecall += s.whole.after_ecall;
-                sum.whole.before_table += s.whole.before_table;
-                sum.whole.not_held += s.whole.not_held;
-                sum.whole.other += s.whole.other;
-            }
-        }
-    }
-    let w = sum.whole;
-    println!(
-        "CARD ROWS REGISTERS SMALL: MEMW_R derived {} (as records {}) · rows as words {} · whole: ECALL {}, after one {}, before their table {}, not held {}, other {} · MEMW_R tables equal to the host's fill {against_host}",
-        sum.derived_memw_r,
-        sum.records_memw_r,
-        sum.register_words,
-        w.ecall,
-        w.after_ecall,
-        w.before_table,
-        w.not_held,
-        w.other
-    );
-    assert!(
-        sum.derived_memw_r > 0 && sum.register_words > 0 && against_host > 0,
-        "the mechanism did not move: {sum:?}, {against_host} compared with the host"
-    );
-    assert!(
-        w.ecall > 0 && w.before_table > 0,
-        "a reason to send rows whole never met: {w:?}"
-    );
-}
-
-/// The real block (`BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`) at the production
-/// heights in record mode: the chunks of its first
-/// `CARD_ROWS_REGISTER_WINDOWS` windows (default 20), in groups of ten in
-/// hand-out order, under `registers` against today's, forwards and
-/// backwards. Then one mutant at a time on the same groups and passes, each
-/// required to derive a MEMW_R table and to move a group (other words, or the
-/// group declined): the kernel reading `rs2`'s row as `rs1`'s; the kernel
-/// reading a write's old value as the written value of its old timestamp's
-/// cycle, whatever the slot; the host sending a write whose register was last
-/// touched before its CPU table as its timestamps; the host sending an ECALL
-/// cycle's rows, and the writes after one, as their timestamps.
-#[test]
-#[ignore = "card: a box test (BLOCK_WHIR_ELF, BLOCK_WHIR_INPUT)"]
-fn card_built_register_rows_on_a_real_block_write_todays_words() {
-    let _reset = Reset::new();
-    let elf =
-        std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF")).expect("the ELF");
-    let input =
-        std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT")).expect("input");
-    let windows: usize = std::env::var("CARD_ROWS_REGISTER_WINDOWS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(20);
-    let program = Elf::load(&elf).expect("the ELF loads");
-    let options = crate::block_whir::BlockOptions::production();
-    let window = 1usize << options.window_log2.expect("the block streams");
-    let t = std::time::Instant::now();
-    let chunks = history_chunks(&program, &input, &options.max_rows, window, Some(windows));
-    let count = |table: StreamTable| chunks.iter().filter(|c| c.0 == table).count();
-    println!(
-        "CARD ROWS REGISTERS REAL: {} chunks ({} CPU, {} MEMW_R) of the first {windows} windows in {:.1}s",
-        chunks.len(),
-        count(StreamTable::Cpu),
-        count(StreamTable::MemwRegister),
-        t.elapsed().as_secs_f64()
-    );
-    let groups = grouped(&chunks, 10);
-    let (s, today, against_host) = compare_registers(&groups, "the real block");
-    let w = s.whole;
-    println!(
-        "CARD ROWS REGISTERS REAL VERDICT: 0 words differ in {} groups × 2 passes · MEMW_R tables equal to the host's fill {against_host} · MEMW_R derived {} (as records {}) · rows as words {} · whole: ECALL {}, after one {}, before their table {}, not held {}, other {} · words {} B · whole rows {} B",
-        groups.len(),
-        s.derived_memw_r,
-        s.records_memw_r,
-        s.register_words,
-        w.ecall,
-        w.after_ecall,
-        w.before_table,
-        w.not_held,
-        w.other,
-        s.register_word_bytes,
-        s.register_whole_bytes
-    );
-    assert!(
-        s.derived_memw_r > 0 && s.register_words > 0 && against_host > 0,
-        "no MEMW_R table built on the real block: {s:?}, {against_host} compared with the host"
-    );
-    // The host mutants below need these rows in the tables built.
-    assert!(
-        w.before_table > 0 && w.ecall + w.after_ecall > 0,
-        "the real block's built tables hold no row a host mutant can move: {w:?}"
-    );
-
-    let forwards: Vec<usize> = (0..groups.len()).collect();
-    let backwards: Vec<usize> = (0..groups.len()).rev().collect();
-    for (name, bit) in [
-        ("rs2 read as rs1", card_rows::REGISTER_FAULT_SLOT),
-        (
-            "old value read whatever its slot",
-            card_rows::REGISTER_FAULT_VALUE_AT,
-        ),
-        (
-            "write before its table sent as timestamps",
-            card_rows::REGISTER_FAULT_START,
-        ),
-        (
-            "ECALL rows sent as timestamps",
-            card_rows::REGISTER_FAULT_ECALL,
-        ),
-    ] {
-        card_rows::clear();
-        card_rows::FAULT_REGISTERS.store(bit, std::sync::atomic::Ordering::Relaxed);
-        let (mut moved, mut uploads) = (0usize, 0usize);
-        for order in [&forwards, &backwards] {
-            for (g, got) in stores(&groups, order, Mode::Registers) {
-                uploads += 1;
-                moved += usize::from(match got {
-                    None => true,
-                    Some(got) => mismatches(&got, &today[g]).0 > 0,
-                });
-            }
-        }
-        let after = card_rows::stats();
-        card_rows::FAULT_REGISTERS.store(0, std::sync::atomic::Ordering::Relaxed);
-        println!(
-            "CARD ROWS REGISTERS MUTANT {name}: {moved} of {uploads} groups moved · MEMW_R tables derived {} · declined {}",
-            after.derived_memw_r, after.declined
-        );
-        assert!(
-            after.derived_memw_r > 0,
-            "{name}: no MEMW_R table derived, the mutant cannot bite"
-        );
-        assert!(moved > 0, "{name}: the mutant moved no group");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// `words`: MEMW_R's rows built on the card from the words the walk writes.
-// ---------------------------------------------------------------------------
 
 /// The same run's chunks walked as rows and as words, grouped alike: the
 /// groups in [`Mode::Words`] (forwards from an empty cache, then backwards
@@ -753,10 +525,9 @@ fn card_built_words_on_a_real_block_write_todays_words() {
     let (s, today, against_host) = compare_words(&row_groups, &word_groups, "the real block");
     let w = s.whole;
     println!(
-        "CARD ROWS WORDS REAL VERDICT: 0 words differ in {} groups × 2 passes · MEMW_R tables equal to the host's fill {against_host} · MEMW_R built from words {} (as records {}) · rows as words {} · whole from the walk {} · decoded on the host (not held) {} · words {} B · whole rows {} B",
+        "CARD ROWS WORDS REAL VERDICT: 0 words differ in {} groups × 2 passes · MEMW_R tables equal to the host's fill {against_host} · MEMW_R built from words {} · rows as words {} · whole from the walk {} · decoded on the host (not held) {} · words {} B · whole rows {} B",
         word_groups.len(),
         s.derived_memw_r,
-        s.records_memw_r,
         s.register_words,
         w.other,
         w.not_held,

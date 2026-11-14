@@ -181,15 +181,12 @@ impl TableRecords for CpuLogRecords {
     }
 }
 
-/// A full MEMW_R chunk held as its register rows, and the run's ECALL cycles
-/// over their span when the run hands them out
-/// ([`TableRecords::ecall_cycles`]).
+/// A full MEMW_R chunk held as its register rows.
 pub(crate) struct RegisterRowRecords {
     /// Its rows: as given, or decoded from `words` the first time a host
     /// reader asks (an error when they cannot be: the run is then refused at
     /// its finish, and the readers here get no rows, never a panic).
     rows: std::sync::OnceLock<Result<Segments<RegRow>, String>>,
-    ecalls: Option<Arc<[u32]>>,
     /// Words mode: the chunk as the walk wrote it, and the program's DECODE
     /// rows its rows decode with.
     words: Option<(super::WordChunk, Arc<DecodeTable>)>,
@@ -203,7 +200,6 @@ impl RegisterRowRecords {
         if whole_table(rows.len()) {
             Ok(Self {
                 rows: std::sync::OnceLock::from(Ok(rows)),
-                ecalls: None,
                 words: None,
             })
         } else {
@@ -216,7 +212,6 @@ impl RegisterRowRecords {
     pub(crate) fn from_words(chunk: super::WordChunk, decode: Arc<DecodeTable>) -> Self {
         Self {
             rows: std::sync::OnceLock::new(),
-            ecalls: None,
             words: Some((chunk, decode)),
         }
     }
@@ -242,12 +237,6 @@ impl RegisterRowRecords {
             (None, Some(Ok(rows))) => rows.len(),
             (None, _) => 0,
         }
-    }
-
-    /// The same records with the run's ECALL cycles over their span (`None`:
-    /// without them).
-    pub(crate) fn with_ecall_cycles(self, ecalls: Option<Arc<[u32]>>) -> Self {
-        Self { ecalls, ..self }
     }
 
     /// The table held as these records.
@@ -325,10 +314,6 @@ impl TableRecords for RegisterRowRecords {
             (None, Some((chunk, _))) => chunk.words.return_pages(),
             _ => PagesReturned::default(),
         }
-    }
-
-    fn ecall_cycles(&self) -> Option<&[u32]> {
-        self.ecalls.as_deref()
     }
 
     fn register_words(&self) -> Option<multilinear::records::RegisterWords<'_>> {

@@ -137,9 +137,6 @@ struct WalkSettings {
     key: u64,
     /// Keep each window's logs with it ([`WindowedTraceBuilder::keeps_logs`]).
     keep_logs: bool,
-    /// Record mode: keep each window's ECALL cycles with it, read from its
-    /// history ([`WindowedTraceBuilder::marks_ecalls`]).
-    ecall_cycles: bool,
     /// Record mode, words: each walker writes its window's register rows as
     /// words, the CPU tables this long ([`WindowedTraceBuilder::writes_words`]).
     words: Option<usize>,
@@ -280,9 +277,6 @@ impl WindowWalker {
         let mut walked = walked?;
         if s.keep_logs {
             walked.keep_logs(Arc::clone(&job.logs));
-        }
-        if s.ecall_cycles {
-            walked.keep_ecall_cycles(ecall_cycles(history));
         }
         if self.record.take_missing() {
             return Err(Error::Prover(format!(
@@ -660,7 +654,6 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         listless: builder.cpu_listless(),
         key: std::collections::hash_map::RandomState::new().hash_one(0u64),
         keep_logs: builder.keeps_logs(),
-        ecall_cycles: builder.marks_ecalls(),
         words: builder.writes_words(),
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),
     });
