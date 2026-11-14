@@ -551,6 +551,11 @@ pub enum TableIn<'a> {
 }
 
 impl TableIn<'_> {
+    /// Whether the table is held as its records (the card fills its columns).
+    fn is_records(&self) -> bool {
+        matches!(self, TableIn::Held(h) if h.is_records())
+    }
+
     fn shape(&self) -> (usize, usize) {
         match self {
             TableIn::Wide(t) => (t.main_table.width, t.main_table.height),
@@ -1262,7 +1267,15 @@ fn prove_traces_under<H: WhirHash>(
                 air.name()
             ));
         }
-        if check_prefix && let Some((s, at, n)) = prefix_of[t] {
+        // A table held as its records writes its prefix from them (a lean
+        // round chunk's MU, TAG, RND, from each record's tag and the row): the
+        // check would fill it on the host, which the records exist to avoid,
+        // so the prepared opening is what binds it. (The host-against-card
+        // fill test and the proofs' byte equality check the fill.)
+        if check_prefix
+            && !table.is_records()
+            && let Some((s, at, n)) = prefix_of[t]
+        {
             for (c, pinned) in stacks[s].columns[at..at + n].iter().enumerate() {
                 if table.column(c).as_slice() != pinned.evals() {
                     return Err(format!(
@@ -1305,6 +1318,9 @@ fn prove_traces_under<H: WhirHash>(
                 }
                 super::b3l_tables::HeldTable::Narrow(packed) => {
                     CommittedTable::from_narrow(layout, packed)
+                }
+                super::b3l_tables::HeldTable::Records(records) => {
+                    CommittedTable::from_records(layout, records)
                 }
             },
         };
