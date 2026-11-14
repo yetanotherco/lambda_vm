@@ -28,19 +28,23 @@
 //! # The format is a constant
 //!
 //! Every level proves at [`LEVEL_RATE`] under today's levers and the family the
-//! caller names (a verifier constant: [`WlfmFamily::P1`] today, whose in-guest
-//! arm exists). The plan's own family must be the levels' — one hash end to
-//! end.
+//! caller names, a verifier constant: [`WlfmFamily::P1`] over the block
+//! family's Poseidon1 base, or [`WlfmFamily::B3`] over the 7-round BLAKE3 base
+//! (`BaseFormat::B3_WHIR`), whose levels hash with the lean tables' rows. The
+//! plan's hash, the base's and the levels' are one ([`level_plan`],
+//! [`check_base`]) — one hash end to end.
 
 use super::compiler::LfmProgram;
+use super::edsl::WrapHash;
 use super::whir_block::{WhirBlockPlan, block_leaf_arena, top_claims};
 use super::wlfm::{
     WlfmBuild, WlfmFamily, WlfmLevers, WlfmProof, WlfmProving, WlfmRate, build_wlfm_under,
     prove_wlfm_as, verify_wlfm,
 };
-use super::wlfm_leg::{WlfmChild, wlfm_leg_arena, wlfm_leg_program};
+use super::wlfm_leg::{WlfmChild, wlfm_leg_arena, wlfm_leg_program, wlfm_wrap_hash};
 use crate::block_whir::BlockWhirProof;
 use crate::hash_pin::{BlockFamily, ProofFamily};
+use stark::proof::options::BaseFormat;
 
 /// The rate every level proves at: the base's, blowup 2.
 pub const LEVEL_RATE: WlfmRate = WlfmRate::Two;
@@ -75,16 +79,71 @@ pub fn level_levers(family: WlfmFamily) -> WlfmLevers {
     WlfmLevers::with_family(family)
 }
 
-/// The family whose in-guest arm the plan's programs replay: one hash end to
-/// end, so the levels' must be it.
-fn check_family(plan: &WhirBlockPlan, family: WlfmFamily) -> Result<(), String> {
-    let _ = plan;
-    if family != WlfmFamily::P1 {
+/// The levels' family against the hash the plan's programs replay: one hash
+/// end to end, so a plan hashing otherwise than `family` is refused.
+pub(crate) fn check_hash(wrap: WrapHash, family: WlfmFamily) -> Result<(), String> {
+    if wlfm_wrap_hash(family) != wrap {
         return Err(format!(
-            "the levels run the plan's in-guest arm, Poseidon1's; {family:?} has none yet"
+            "the levels prove under {family:?} and the plan's programs hash under {wrap:?}: one \
+             hash end to end"
         ));
     }
     Ok(())
+}
+
+fn check_family(plan: &WhirBlockPlan, family: WlfmFamily) -> Result<(), String> {
+    check_hash(plan.wrap_hash(), family)
+}
+
+/// The base a family's levels verify: the block family's Poseidon1 base
+/// under [`WlfmFamily::P1`], the 7-round BLAKE3 base under
+/// [`WlfmFamily::B3`]. Any other pairing is refused before anything is
+/// proved or derived.
+pub fn check_base(base: &BaseFormat, family: WlfmFamily) -> Result<(), String> {
+    let ok = match family {
+        WlfmFamily::P1 => crate::block_whir::checked_base(base).is_ok(),
+        WlfmFamily::B3 => *base == BaseFormat::B3_WHIR,
+    };
+    if !ok {
+        return Err(format!(
+            "{family:?} levels verify their own hash's base, not {:?} (4-ary cap {:?})",
+            base.hash, base.arity4_cap
+        ));
+    }
+    Ok(())
+}
+
+/// ★ Level 1's plan: one leaf over every group, under `family`'s derivation
+/// (the block family's for [`WlfmFamily::P1`],
+/// [`WhirBlockPlan::derive_blake3`] for [`WlfmFamily::B3`]). The prover hands
+/// its prepared roots in; a verifier passes `None` and commits them on the
+/// host.
+pub fn level_plan(
+    elf: &[u8],
+    proof_options: &crate::ProofOptions,
+    format: &crate::block_whir::BlockFormat,
+    statement: crate::block_whir::BlockStatement<'_>,
+    family: WlfmFamily,
+    prepared_roots: Option<&[(usize, Vec<multilinear::whir_commit::Commitment>)]>,
+) -> Result<WhirBlockPlan, String> {
+    crate::base_only::refuse_recursion()?;
+    check_base(&format.zf.base, family)?;
+    let plan = match family {
+        WlfmFamily::P1 => WhirBlockPlan::derive_with(
+            elf,
+            proof_options,
+            format,
+            statement,
+            Some(1),
+            super::whir_block::BLOCK_FAN_IN,
+            prepared_roots,
+        )?,
+        WlfmFamily::B3 => {
+            WhirBlockPlan::derive_blake3(elf, proof_options, format, statement, 1, prepared_roots)?
+        }
+    };
+    check_family(&plan, family)?;
+    Ok(plan)
 }
 
 fn build_level(program: LfmProgram, family: WlfmFamily, on_host: bool) -> Result<Level, String> {
@@ -277,6 +336,11 @@ pub(crate) fn level1_pieces(marks: &[u32]) -> Vec<(std::ops::Range<u32>, std::op
 /// when the work runs moves. `beside = false` is the control: level 1's
 /// groups land only once the base has ended.
 ///
+/// Under [`WlfmFamily::B3`] the base is the 7-round BLAKE3 base
+/// (`format.zf.base` must be `BaseFormat::B3_WHIR`, [`check_base`]), admitted
+/// for this prove alone because its levels are BLAKE3 too
+/// ([`crate::base_only::with_blake3_levels`]).
+///
 /// [`StreamedExecution::new_pieced`]: super::executor::StreamedExecution::new_pieced
 #[allow(clippy::too_many_arguments)]
 pub fn prove_block_levels(
@@ -294,6 +358,7 @@ pub fn prove_block_levels(
     use std::sync::mpsc;
 
     crate::base_only::refuse_recursion()?;
+    check_base(&format.zf.base, family)?;
     let t0 = std::time::Instant::now();
     let now = || t0.elapsed().as_secs_f64();
     type Statement = (
@@ -367,13 +432,12 @@ pub fn prove_block_levels(
         // landed as soon as phase B has finished its groups.
         let level1 = scope.spawn(move || -> Result<Level1, String> {
             let (statement, roots) = srx.recv().map_err(|_| "the prover never stated")?;
-            let plan = WhirBlockPlan::derive_with(
+            let plan = level_plan(
                 elf_ref,
                 opts_ref,
                 format_ref,
                 statement.view(),
-                Some(1),
-                super::whir_block::BLOCK_FAN_IN,
+                family,
                 Some(&roots),
             )?;
             let planned = now();
@@ -411,10 +475,15 @@ pub fn prove_block_levels(
             };
             for (g, roots, answers, tables, argue, opening, prepared) in parts {
                 if !landed[0] {
-                    let front = super::whir_block::leaf_arena(&roots, &answers, Vec::new())
-                        .into_iter()
-                        .next()
-                        .ok_or("no front")?;
+                    let front = super::whir_block::leaf_arena_under(
+                        &roots,
+                        &answers,
+                        Vec::new(),
+                        plan.wrap_hash(),
+                    )
+                    .into_iter()
+                    .next()
+                    .ok_or("no front")?;
                     held[0].set(front).map_err(|_| "the front landed twice")?;
                     ex.land_piece(0, held[0].get().ok_or("the front")?)
                         .map_err(|e| format!("level 1's front: {e:?}"))?;
@@ -469,15 +538,23 @@ pub fn prove_block_levels(
                 wave_secs_before,
             ))
         });
-        let proved = crate::block_whir::prove_block_whir_observed_groups(
-            elf,
-            input,
-            base_options,
-            format,
-            options,
-            &observe,
-            &on_group,
-        );
+        let prove_base = || {
+            crate::block_whir::prove_block_whir_observed_groups(
+                elf,
+                input,
+                base_options,
+                format,
+                options,
+                &observe,
+                &on_group,
+            )
+        };
+        // A BLAKE3 base is admitted for its own levels' prove alone: the
+        // recursion over it is BLAKE3 too.
+        let proved = match family {
+            WlfmFamily::P1 => prove_base(),
+            WlfmFamily::B3 => crate::base_only::with_blake3_levels(prove_base),
+        };
         let _ = base_end_ref.set(now());
         *stx.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ptx.lock().unwrap_or_else(|e| e.into_inner()) = None;
