@@ -39,6 +39,7 @@ use rayon::prelude::*;
 use math::field::element::FieldElement;
 use math::field::traits::IsField;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 // =========================================================================
@@ -937,6 +938,73 @@ impl BitwiseHistogram {
                 let count = self.counters[base + row];
                 if count != 0 {
                     trace.main_table.set_fe(row, mu_col, FE::from(count));
+                }
+            }
+        }
+    }
+}
+
+/// The BITWISE kind's widths so far ([`BitwiseHistogram::trace_as`]).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// The widths the BITWISE trace's columns take before any has been built: one
+/// byte for X, Y, Z, the byte results and the flags, two for the shifts and
+/// four for each multiplicity. A column that needs fewer is narrowed, one that
+/// needs more is written again ([`generate_main!`]): a hint moves no byte.
+const SEED_WIDTHS: [u8; cols::NUM_COLUMNS] = [
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+];
+
+impl BitwiseHistogram {
+    /// [`generate_bitwise_trace`] with these multiplicities filled
+    /// ([`Self::fill_multiplicities`]), in `form`, in one pass in row order:
+    /// under [`TraceForm::Narrow`] straight into the packed columns, with no
+    /// 64-bit table between. The packed bytes are those of packing the
+    /// two-pass table.
+    pub(crate) fn trace_as(
+        &self,
+        form: TraceForm,
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+        if !WIDTHS.known(cols::NUM_COLUMNS) {
+            WIDTHS.learn(&SEED_WIDTHS);
+        }
+        generate_main!(form, &WIDTHS, NUM_ROWS, cols::NUM_COLUMNS, |table| {
+            self.fill_row_order(table)
+        })
+    }
+
+    /// Every row's precomputed columns and multiplicities, rows in order.
+    fn fill_row_order(&self, table: &mut impl VmTable) {
+        for row_idx in 0..NUM_ROWS {
+            let (x, y, z) = (
+                (row_idx & 0xFF) as u32,
+                ((row_idx >> 8) & 0xFF) as u32,
+                (row_idx >> 16) as u32,
+            );
+            table.set_byte(row_idx, cols::X, x as u8);
+            table.set_byte(row_idx, cols::Y, y as u8);
+            table.set_byte(row_idx, cols::Z, z as u8);
+            table.set_byte(row_idx, cols::AND, (x & y) as u8);
+            table.set_byte(row_idx, cols::OR, (x | y) as u8);
+            table.set_byte(row_idx, cols::XOR, (x ^ y) as u8);
+            let msb8 = (x >> 7) & 1;
+            let halfword = x + y * 256;
+            let msb16 = (halfword >> 15) & 1;
+            table.set_bool(row_idx, cols::MSB8, msb8 == 1);
+            table.set_bool(row_idx, cols::MSB16, msb16 == 1);
+            table.set_bool(row_idx, cols::ZERO, x == 0 && y == 0 && z == 0);
+            let sll = if z == 0 {
+                halfword
+            } else {
+                (halfword << z) & 0xFFFF
+            };
+            let sllc = if z == 0 { 0 } else { halfword >> (16 - z) };
+            table.set_half(row_idx, cols::SLL, sll as u16);
+            table.set_half(row_idx, cols::SLLC, sllc as u16);
+            for type_idx in 0..NUM_LOOKUP_TYPES {
+                let count = self.counters[type_idx * NUM_ROWS + row_idx];
+                if count != 0 {
+                    table.set_fe(row_idx, type_mu_column(type_idx), FE::from(count));
                 }
             }
         }
