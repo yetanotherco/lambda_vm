@@ -200,9 +200,9 @@ pub fn barycentric_base_on_device(
 ///
 /// The sums run on the row-chunked multi kernel at one point
 /// ([`barycentric_base_chunked_with_dev_inv_denoms`], `num_cols × chunks`
-/// blocks); the legacy path ([`crate::deep_inv`]) runs one block per column
-/// ([`barycentric_base_one_block_with_dev_inv_denoms`], the parity tests'
-/// oracle). The same sums, added in a different order.
+/// blocks); one block per column
+/// ([`barycentric_base_one_block_with_dev_inv_denoms`]) stays as the parity
+/// tests' oracle. The same sums, added in a different order.
 pub fn barycentric_base_on_device_with_dev_inv_denoms(
     stream: &Arc<CudaStream>,
     main_handle: &GpuLdeBase,
@@ -214,19 +214,8 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
 ) -> Result<Vec<u64>> {
     #[cfg(feature = "test-faults")]
     crate::faults::check_sticky(&crate::faults::FAULT_BARYCENTRIC_STICKY)?;
-    if crate::deep_inv::rowwise_enabled() {
-        crate::deep_inv::count_chunked_ood_sum();
-        return barycentric_base_chunked_with_dev_inv_denoms(
-            stream,
-            main_handle,
-            row_stride,
-            coset_points_dev,
-            inv_denoms_dev,
-            inv_offset_u64,
-            n,
-        );
-    }
-    barycentric_base_one_block_with_dev_inv_denoms(
+    crate::deep_inv::count_chunked_ood_sum();
+    barycentric_base_chunked_with_dev_inv_denoms(
         stream,
         main_handle,
         row_stride,
@@ -359,19 +348,8 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
 ) -> Result<Vec<u64>> {
     #[cfg(feature = "test-faults")]
     crate::faults::check_sticky(&crate::faults::FAULT_BARYCENTRIC_STICKY)?;
-    if crate::deep_inv::rowwise_enabled() {
-        crate::deep_inv::count_chunked_ood_sum();
-        return barycentric_ext3_chunked_with_dev_inv_denoms(
-            stream,
-            aux_handle,
-            row_stride,
-            coset_points_dev,
-            inv_denoms_dev,
-            inv_offset_u64,
-            n,
-        );
-    }
-    barycentric_ext3_one_block_with_dev_inv_denoms(
+    crate::deep_inv::count_chunked_ood_sum();
+    barycentric_ext3_chunked_with_dev_inv_denoms(
         stream,
         aux_handle,
         row_stride,
@@ -510,9 +488,11 @@ pub fn barycentric_ext3_chunked_with_dev_inv_denoms(
 
 include!(concat!(env!("OUT_DIR"), "/bary_consts.rs"));
 
-/// Row-chunk count for the multi kernels: enough `cols * chunks` blocks to
-/// occupy the device, without shrinking a chunk's row range below the point
-/// where launch + combine overhead dominates.
+/// Row-chunk count for the multi kernels before [`bary_num_chunks_filled`]
+/// lifted its cap: enough `cols * chunks` blocks to occupy the device, without
+/// shrinking a chunk's row range below the point where launch + combine
+/// overhead dominates. Kept for the tests that pin the two against each other.
+#[cfg(test)]
 fn bary_num_chunks(num_cols: usize, n: usize) -> usize {
     let by_occupancy = (2048 / num_cols.max(1)).max(1);
     let by_rows = (n / 8192).max(1);
@@ -530,14 +510,9 @@ fn bary_num_chunks_filled(num_cols: usize, n: usize) -> usize {
     by_occupancy.min(by_rows)
 }
 
-/// The chunk count the multi kernels launch with: [`bary_num_chunks_filled`],
-/// or [`bary_num_chunks`] on the legacy path ([`crate::deep_inv`]).
+/// The chunk count the multi kernels launch with: [`bary_num_chunks_filled`].
 fn multi_num_chunks(num_cols: usize, n: usize) -> usize {
-    if crate::deep_inv::rowwise_enabled() {
-        bary_num_chunks_filled(num_cols, n)
-    } else {
-        bary_num_chunks(num_cols, n)
-    }
+    bary_num_chunks_filled(num_cols, n)
 }
 
 /// One multi-point launch over `num_cols` resident columns plus the combine

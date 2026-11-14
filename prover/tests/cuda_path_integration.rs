@@ -105,19 +105,11 @@ fn gpu_path_fires_end_to_end() {
     // itself (`math_cuda::deep_inv`); the legacy path keeps the buffered
     // kernel and its inverse buffer. A table that silently fell back
     // to the buffered kernel would still verify, so this counter is what
-    // guards the fused dispatch, under either setting.
-    if math_cuda::deep_inv::rowwise_enabled() {
-        assert!(
-            gpu_fused_deep_calls() > 0,
-            "the fused R4 DEEP kernel did not fire at the default"
-        );
-    } else {
-        assert_eq!(
-            gpu_fused_deep_calls(),
-            0,
-            "the fused R4 DEEP kernel fired on the legacy path"
-        );
-    }
+    // guards the fused dispatch.
+    assert!(
+        gpu_fused_deep_calls() > 0,
+        "the fused R4 DEEP kernel did not fire at the default"
+    );
 
     // FRI commit fires once per table (commit_phase_from_evaluations).
     assert!(gpu_fri_calls() > 0, "R4 GPU FRI commit did not fire");

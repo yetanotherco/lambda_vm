@@ -3973,21 +3973,18 @@ pub trait IsStarkProver<
         let z_scalars: Vec<FieldElement<FieldExtension>> =
             core::iter::once(z_power).chain(z_shifted).collect();
         // The rows invert their own denominators, so there is no inverse
-        // buffer; the legacy path (`math_cuda::deep_inv`) keeps the buffered kernel.
-        if math_cuda::deep_inv::rowwise_enabled()
-            && let Some(dw) =
-                crate::gpu_lde::try_deep_composition_gpu_fused_keep::<Field, FieldExtension>(
-                    lde_trace,
-                    parts_dev,
-                    &round_3_result.composition_poly_parts_ood_evaluation,
-                    trace_ood_columns,
-                    composition_poly_gammas,
-                    trace_terms_gammas,
-                    &domain.lde_roots_of_unity_coset,
-                    &z_scalars,
-                    num_eval_points,
-                )
-        {
+        // buffer; a table the fused kernel declines takes the buffered kernel below.
+        if let Some(dw) = crate::gpu_lde::try_deep_composition_gpu_fused_keep::<Field, FieldExtension>(
+            lde_trace,
+            parts_dev,
+            &round_3_result.composition_poly_parts_ood_evaluation,
+            trace_ood_columns,
+            composition_poly_gammas,
+            trace_terms_gammas,
+            &domain.lde_roots_of_unity_coset,
+            &z_scalars,
+            num_eval_points,
+        ) {
             return Some(dw);
         }
         let (inv_dev, stream) =

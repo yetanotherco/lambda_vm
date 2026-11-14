@@ -14,12 +14,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Whether the DEEP and OOD denominators are inverted row-wise: always, where
-/// the row-wise kernels apply.
-pub fn rowwise_enabled() -> bool {
-    true
-}
-
 static ROWWISE_INVERSIONS: AtomicU64 = AtomicU64::new(0);
 static CHUNKED_OOD_SUMS: AtomicU64 = AtomicU64::new(0);
 

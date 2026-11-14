@@ -311,7 +311,7 @@ pub fn compute_and_invert_denoms_ext3_dev(
     assert_eq!(z_scalars_host.len(), k_scalars * 3);
     assert!(n >= 1 && k_scalars >= 1);
 
-    if crate::deep_inv::rowwise_enabled() && k_scalars <= ROWWISE_MAX_K {
+    if k_scalars <= ROWWISE_MAX_K {
         crate::deep_inv::count_rowwise_inversion();
         return invert_denoms_rowwise_dev(x_lde_dev, z_scalars_host, n, k_scalars, sign, stream);
     }
