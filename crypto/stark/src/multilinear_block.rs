@@ -2642,7 +2642,7 @@ where
 /// whose turn it is) and may return the groups after it, `order[p + 1..]`, in
 /// another order; `None` keeps them. The proof is the same in any order, so a
 /// caller may decide the rest of the order from what it learns while phase B
-/// runs (the recursion's leaves, `W3_LEAF_FIRST`).
+/// runs (the recursion's leaves, led by the early leaf).
 pub type PhaseBReorder<'a> = dyn Fn(usize, &[usize]) -> Option<Vec<usize>> + Sync + 'a;
 
 /// The groups that hold a table whose columns phase B rebuilds rather than

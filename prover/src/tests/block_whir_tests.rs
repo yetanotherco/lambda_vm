@@ -1561,7 +1561,7 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
     }
 }
 
-/// ★ Phase B led by a leaf (`W3_LEAF_FIRST`, [`block_whir::PhaseBLead`]) on a
+/// ★ Phase B led by a leaf (the early leaf first, [`block_whir::PhaseBLead`]) on a
 /// streamed block: with a leaf offered before phase B starts, phase B moves
 /// that leaf's groups ahead at its first turn and takes that order (the
 /// observer hears it, the stamps record it), with the overlap off and pinned;

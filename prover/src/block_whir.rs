@@ -3932,7 +3932,7 @@ pub fn prove_block_whir_observed_led(
     )
 }
 
-/// The recursion's leaves, offered to phase B while it runs (`W3_LEAF_FIRST`),
+/// The recursion's leaves, offered to phase B while it runs (the early leaf first),
 /// and what phase B did with them. The tree's planner offers each admitted
 /// leaf's groups as soon as it has derived the plan; at its next turn phase B
 /// moves the groups of the leaf it can finish soonest ([`lead_order`]) ahead of
@@ -7552,7 +7552,7 @@ fn prove_streamed(
         let phase_b_sched = phase_b_sched_from_env();
         stamps.phase_b_sched = phase_b_sched;
         let readbacks_before = multilinear::gpu::background_readbacks();
-        // The recursion's lead (`W3_LEAF_FIRST`): once the tree offers its
+        // The recursion's lead (the early leaf first): once the tree offers its
         // leaves, the groups of the one phase B can finish soonest go next.
         // Per rebuilt class, whether all its dropped bytes fit its window at
         // the window's smallest in phase B (the adaptive window's floor, or
