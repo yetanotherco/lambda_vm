@@ -303,6 +303,13 @@ impl WhirTranscript {
         self.absorb_byte_felts(b, BYTES_PER_FELT, &[nonce]);
     }
 
+    /// One `append_bytes` of the canonical big-endian bytes of `felts`, eight
+    /// a felt (a W-LFM statement's public word is four): under Poseidon1 the
+    /// length then the felts, under RPX the felts, under BLAKE3 the bytes.
+    pub fn absorb_be_felts(&mut self, b: &mut LfmBuilder, felts: &[Felt]) {
+        self.absorb_byte_felts(b, BYTES_PER_FELT * felts.len(), felts);
+    }
+
     /// One `append_bytes` of `len` RUNTIME bytes that are exactly `felts`, big-
     /// endian: the felts on the byte arm, the length and then the felts under
     /// Poseidon1.
