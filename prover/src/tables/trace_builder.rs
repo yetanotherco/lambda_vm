@@ -1992,23 +1992,23 @@ fn collect_ops_from_cpu(
     ))
 }
 
-/// `LAMBDA_VM_INROW_SIDES_PINNED`'s reading: `1` takes each walked window's
-/// in-row side records from the page-locked pool
-/// ([`WalkOutputs::side_records_for_the_card`]); unset, empty or `0` keeps
-/// them on the heap (the default). Any other word is refused. A prover-side
+/// `LAMBDA_VM_INROW_SIDES_PINNED`'s reading: unset, empty or `1` takes each
+/// walked window's in-row side records from the page-locked pool
+/// ([`WalkOutputs::side_records_for_the_card`], the default); `0` keeps them
+/// on the heap (the rollback). Any other word is refused. A prover-side
 /// choice: the tables are the same either way.
 pub(crate) fn inrow_sides_pinned_setting(word: Option<&str>) -> Result<bool, String> {
     match word.map(str::trim) {
-        None | Some("") | Some("0") => Ok(false),
-        Some("1") => Ok(true),
+        None | Some("") | Some("1") => Ok(true),
+        Some("0") => Ok(false),
         Some(v) => Err(format!(
-            "LAMBDA_VM_INROW_SIDES_PINNED={v}: 1 (page-locked) or 0 / unset (the heap)"
+            "LAMBDA_VM_INROW_SIDES_PINNED={v}: 1 / unset (page-locked, the default) or 0 (the heap)"
         )),
     }
 }
 
 /// [`inrow_sides_pinned_setting`] of the process's environment, read once (a
-/// refused word reads as off here; the block prove refuses it first).
+/// refused word reads as the default here; the block prove refuses it first).
 pub(crate) fn inrow_sides_pinned() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -2017,7 +2017,7 @@ pub(crate) fn inrow_sides_pinned() -> bool {
                 .ok()
                 .as_deref(),
         )
-        .unwrap_or(false)
+        .unwrap_or(true)
     })
 }
 
@@ -2025,14 +2025,15 @@ pub(crate) fn inrow_sides_pinned() -> bool {
 mod inrow_sides_pinned_tests {
     use super::inrow_sides_pinned_setting as setting;
 
-    /// `LAMBDA_VM_INROW_SIDES_PINNED` takes `1` (page-locked) and `0`, empty or
-    /// unset (the heap, the default), and refuses any other word, naming it.
+    /// `LAMBDA_VM_INROW_SIDES_PINNED` takes `1`, empty or unset (page-locked,
+    /// the default) and `0` (the heap, the rollback), and refuses any other
+    /// word, naming it.
     #[test]
     fn the_side_records_word_takes_one_or_zero_and_refuses_the_rest() {
-        assert_eq!(setting(None), Ok(false));
-        assert_eq!(setting(Some("")), Ok(false));
-        assert_eq!(setting(Some("0")), Ok(false));
+        assert_eq!(setting(None), Ok(true));
+        assert_eq!(setting(Some("")), Ok(true));
         assert_eq!(setting(Some(" 1 ")), Ok(true));
+        assert_eq!(setting(Some("0")), Ok(false));
         for bad in ["2", "on", "true", "yes"] {
             let e = setting(Some(bad)).expect_err(bad);
             assert!(e.contains(bad), "{e}");

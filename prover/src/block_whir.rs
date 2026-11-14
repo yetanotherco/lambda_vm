@@ -6137,9 +6137,9 @@ fn prove_streamed(
         eprintln!(
             "★ BLOCK IN-ROW SIDES: {} (LAMBDA_VM_INROW_SIDES_PINNED)",
             if sides_pinned {
-                "page-locked"
+                "page-locked (the default)"
             } else {
-                "heap (the default)"
+                "heap (the rollback)"
             }
         );
     }
