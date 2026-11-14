@@ -2535,6 +2535,18 @@ pub fn block_leaf_arena(
     proof: &BlockWhirProof,
     k: usize,
 ) -> Result<Vec<Vec<LfmWord>>, String> {
+    let groups = block_leaf_groups(plan, proof, k)?;
+    Ok(leaf_arena(&proof.proof.roots, &proof.commit_ood, groups))
+}
+
+/// Leaf `k`'s groups' words from the block proof, in the leaf's group order
+/// ([`group_arena_words`] each): [`block_leaf_arena`]'s arena is the roots and
+/// their commit-time answers, then these. Refuses what it refuses.
+pub fn block_leaf_groups(
+    plan: &WhirBlockPlan,
+    proof: &BlockWhirProof,
+    k: usize,
+) -> Result<Vec<Vec<LfmWord>>, String> {
     let mut groups = Vec::with_capacity(plan.partition.leaf(k).len());
     for &g in plan.partition.leaf(k) {
         let start = plan.group_start(g);
@@ -2582,7 +2594,7 @@ pub fn block_leaf_arena(
             polys
         ));
     }
-    Ok(leaf_arena(&proof.proof.roots, &proof.commit_ood, groups))
+    Ok(groups)
 }
 
 /// A leaf's arena from the block's roots, their commit-time answers and its

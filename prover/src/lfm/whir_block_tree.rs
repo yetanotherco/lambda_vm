@@ -2219,6 +2219,10 @@ pub struct WhirTreeRun {
     pub(crate) plan: WhirBlockPlan,
     #[cfg(test)]
     pub(crate) early: Option<EarlyReadout>,
+    /// Phase B's groups in the order it took them, with each one's end
+    /// (seconds into phase B): when each would land on a streamed leaf.
+    #[cfg(test)]
+    pub(crate) phase_b: Vec<(usize, f64)>,
 }
 
 impl WhirTreeRun {
@@ -2737,6 +2741,12 @@ pub fn prove_whir_block_tree(
         .map_err(|_| "the planner panicked".to_string())?
         .map_err(|e| format!("the plan and the leaves derive: {e}"))?;
     sink.write(&stamps.report());
+    #[cfg(test)]
+    let phase_b: Vec<(usize, f64)> = stamps
+        .phase_b_order
+        .iter()
+        .filter_map(|&g| stamps.groups.get(g).map(|s| (g, s.end_b)))
+        .collect();
     // LT's chunk heights (what its per-chunk deduplication leaves): equal across
     // runs of one setting when the chunking is deterministic.
     {
@@ -3266,6 +3276,8 @@ pub fn prove_whir_block_tree(
         plan,
         #[cfg(test)]
         early: early_out,
+        #[cfg(test)]
+        phase_b,
     })
 }
 
