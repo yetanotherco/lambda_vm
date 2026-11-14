@@ -318,6 +318,22 @@ pub mod cols {
     pub const RES: [usize; 4] = [RES_0, RES_1, RES_2, RES_3];
 }
 
+/// The columns the in-row register format
+/// (`tables::register::RegisterFormat::InRow`) adds after
+/// [`cols::NUM_COLUMNS`]: each register slot's previous timestamp and `rd`'s
+/// old value. The token match and the step's range check pin them; no
+/// constraint reads them.
+pub mod inrow_cols {
+    use super::cols::NUM_COLUMNS;
+    pub const PREV_TS_1: usize = NUM_COLUMNS;
+    pub const PREV_TS_2: usize = NUM_COLUMNS + 1;
+    pub const PREV_TS_D: usize = NUM_COLUMNS + 2;
+    pub const OLD_RD_0: usize = NUM_COLUMNS + 3;
+    pub const OLD_RD_1: usize = NUM_COLUMNS + 4;
+    /// The CPU table's columns under the in-row format.
+    pub const NUM_COLUMNS_INROW: usize = NUM_COLUMNS + 5;
+}
+
 // =========================================================================
 // CPU Operation (for trace generation)
 // =========================================================================
@@ -1026,6 +1042,115 @@ fn timestamp_terms(ts_base: u64, offset: i64) -> Vec<LinearTerm> {
 /// element (the low word; the high word is 0, CPU timestamps fit in 32 bits).
 fn timestamp_slot(ts_base: u64, offset: i64) -> BusValue {
     BusValue::linear(timestamp_terms(ts_base, offset))
+}
+
+/// The CPU row under the in-row register format
+/// (`tables::register::RegisterFormat::InRow`), 24 interactions:
+/// [`bus_interactions`]' 13 that are not register or PC tokens (DECODE, ALU,
+/// CPU32, MEMORY, BRANCH, the three ARE_BYTES, the four IS_HALF on `res`,
+/// ECALL), then, on [`BusId::Reg`], for each register slot (`rs1` at `ts`,
+/// `rs2` at `ts + 1`, `rd` at `ts + 2`, each on its read or write flag): consume
+/// `(reg, prev, old)`, produce `(reg, ts + k, new)` and range-check the step,
+/// `IS_HALF[ts + k − prev − 1]`; and the PC as one token, consumed at
+/// `ts − 3 + 3·pc_double_read` and produced at `ts + 1`. A read's old value is
+/// its new one; `rd`'s old value is [`inrow_cols::OLD_RD_0`]. A token is
+/// `(register, timestamp, value_lo, value_hi)`.
+///
+/// `rs1 = x255` (AUIPC, JAL) reads the PC's token through slot 1 at `ts`, which
+/// is where `pc_double_read` moves the PC's own consume.
+pub fn bus_interactions_inrow(ts_base: u64) -> Vec<BusInteraction> {
+    use inrow_cols::*;
+    let mut interactions: Vec<BusInteraction> = bus_interactions(ts_base)
+        .into_iter()
+        .filter(|i| i.bus_id != BusId::Memw as u64 && i.bus_id != BusId::Memory as u64)
+        .collect();
+    debug_assert_eq!(interactions.len(), 13);
+    let column = |c: usize| BusValue::Packed {
+        start_column: c,
+        packing: Packing::Direct,
+    };
+    // `ts + offset − prev − 1`: a slot's step, less one.
+    let step = |offset: i64, prev: usize| {
+        let mut terms = timestamp_terms(ts_base, offset - 1);
+        terms.push(LinearTerm::Column {
+            coefficient: -1,
+            column: prev,
+        });
+        BusValue::linear(terms)
+    };
+    for (flag, reg, prev, offset, old, new) in [
+        (
+            cols::READ_REGISTER1,
+            cols::RS1,
+            PREV_TS_1,
+            0,
+            (cols::RV1_0, cols::RV1_1),
+            (cols::RV1_0, cols::RV1_1),
+        ),
+        (
+            cols::READ_REGISTER2,
+            cols::RS2,
+            PREV_TS_2,
+            1,
+            (cols::RV2_0, cols::RV2_1),
+            (cols::RV2_0, cols::RV2_1),
+        ),
+        (
+            cols::WRITE_REGISTER,
+            cols::RD,
+            PREV_TS_D,
+            2,
+            (OLD_RD_0, OLD_RD_1),
+            (cols::RVD_0, cols::RVD_1),
+        ),
+    ] {
+        interactions.push(BusInteraction::sender(
+            BusId::Reg,
+            Multiplicity::Column(flag),
+            vec![column(reg), column(prev), column(old.0), column(old.1)],
+        ));
+        interactions.push(BusInteraction::receiver(
+            BusId::Reg,
+            Multiplicity::Column(flag),
+            vec![
+                column(reg),
+                timestamp_slot(ts_base, offset),
+                column(new.0),
+                column(new.1),
+            ],
+        ));
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(flag),
+            vec![step(offset, prev)],
+        ));
+    }
+    let mut prev_pc_ts = timestamp_terms(ts_base, -3);
+    prev_pc_ts.push(LinearTerm::Column {
+        coefficient: 3,
+        column: cols::PC_DOUBLE_READ,
+    });
+    interactions.push(BusInteraction::sender(
+        BusId::Reg,
+        Multiplicity::One,
+        vec![
+            BusValue::constant(255),
+            BusValue::linear(prev_pc_ts),
+            column(cols::PC_0),
+            column(cols::PC_1),
+        ],
+    ));
+    interactions.push(BusInteraction::receiver(
+        BusId::Reg,
+        Multiplicity::One,
+        vec![
+            BusValue::constant(255),
+            timestamp_slot(ts_base, 1),
+            column(cols::NEXT_PC_0),
+            column(cols::NEXT_PC_1),
+        ],
+    ));
+    interactions
 }
 
 /// Returns the bus interactions for a CPU table whose timestamps start at

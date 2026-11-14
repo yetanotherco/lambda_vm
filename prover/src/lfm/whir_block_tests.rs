@@ -51,6 +51,7 @@ fn small_format() -> BlockFormat {
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        registers: crate::tables::register::RegisterFormat::Tokens32,
     }
 }
 
@@ -475,6 +476,7 @@ fn dense_format() -> BlockFormat {
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        registers: crate::tables::register::RegisterFormat::Tokens32,
     }
 }
 

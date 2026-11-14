@@ -923,6 +923,7 @@ pub(crate) fn block_airs(
     inputs: &BlockAirInputs,
     keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
     memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
+    registers: crate::tables::register::RegisterFormat,
 ) -> VmAirs {
     let mut airs = VmAirs::new(
         program,
@@ -956,7 +957,59 @@ pub(crate) fn block_airs(
             })
             .collect();
     }
+    if registers == crate::tables::register::RegisterFormat::InRow {
+        airs.swap_in_row_registers(opts, inputs);
+    }
     airs
+}
+
+impl VmAirs {
+    /// The in-row register format's four families in place of today's
+    /// (`tables::register::RegisterFormat::InRow`): CPU at its 42 columns and
+    /// in-row interactions, REGX in MEMW_R's slot (the same names and counts:
+    /// the block's routes and its statement read them), REGISTER a register a
+    /// row, HALT with its PC bridge on the REG bus.
+    fn swap_in_row_registers(&mut self, opts: &ProofOptions, inputs: &BlockAirInputs) {
+        use crate::tables::{cpu, register};
+        let heights = &inputs.cpu_heights;
+        self.cpus = heights
+            .iter()
+            .zip(cpu::timestamp_bases(heights))
+            .enumerate()
+            .map(|(i, (&height, ts_base))| {
+                Box::new(
+                    crate::test_utils::create_cpu_air_inrow(opts, ts_base)
+                        .with_name(&format!("CPU[{i}]"))
+                        .with_lazy_preprocessed_columns(
+                            cpu::lazy_timestamp_commitment(opts, height),
+                            cpu::NUM_PRECOMPUTED_COLS,
+                            Arc::new(move || vec![cpu::timestamp_column(height)]),
+                        ),
+                ) as VmAir
+            })
+            .collect();
+        self.memw_registers = (0..self.memw_registers.len())
+            .map(|i| {
+                Box::new(
+                    crate::test_utils::create_regx_air(opts).with_name(&format!("MEMW_R[{i}]")),
+                ) as VmAir
+            })
+            .collect();
+        let rows: u64 = heights.iter().map(|&h| h as u64).sum();
+        let final_pc_ts = cpu::final_pc_timestamp(rows);
+        let files = inputs.register.preprocessed();
+        let (init, fini) = (files.init.to_vec(), files.fini.to_vec());
+        self.register = Box::new(
+            crate::test_utils::create_register_air_inrow(opts, final_pc_ts)
+                .with_name("REGISTER")
+                .with_lazy_preprocessed_columns(
+                    register::inrow::lazy_commitment(opts, &init, &fini),
+                    register::inrow::NUM_PREPROCESSED_COLS,
+                    Arc::new(move || register::inrow::preprocessed_columns(&init, &fini)),
+                ),
+        );
+        self.halt = Box::new(crate::test_utils::create_halt_air_inrow(opts).with_name("HALT"));
+    }
 }
 
 impl VmAirs {

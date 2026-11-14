@@ -915,6 +915,7 @@ fn pinned_block_airs() -> crate::VmAirs {
         &inputs,
         format.keccak_rnd,
         format.memw_aligned,
+        format.registers,
     )
 }
 

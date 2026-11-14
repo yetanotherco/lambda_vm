@@ -302,6 +302,16 @@ pub struct BlockFormat {
     /// before it, a variant a caller names). Its interactions, so its bus, the
     /// LT tables the block holds and the recursion's programs, follow it.
     pub memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
+    /// How register accesses are checked
+    /// ([`RegisterFormat`](crate::tables::register::RegisterFormat)): as 32-bit
+    /// word tokens through MEMW_R
+    /// ([`Tokens32`](crate::tables::register::RegisterFormat::Tokens32), the
+    /// production constant), or in the CPU row on one 64-bit token an access,
+    /// REGX taking the rest
+    /// ([`InRow`](crate::tables::register::RegisterFormat::InRow), a variant a
+    /// caller names). The CPU, MEMW_R's slot, REGISTER and HALT, so their
+    /// buses and the block's tables, follow it.
+    pub registers: crate::tables::register::RegisterFormat,
 }
 
 /// The most groups a block statement may declare: a verifier constant, never in
@@ -443,6 +453,7 @@ impl BlockFormat {
             group: GroupFold::Indexed,
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+            registers: crate::tables::register::RegisterFormat::Tokens32,
         }
     }
 
@@ -480,6 +491,7 @@ impl BlockFormat {
             group: GroupFold::Indexed,
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+            registers: crate::tables::register::RegisterFormat::Tokens32,
         }
     }
 
@@ -4576,6 +4588,7 @@ pub(crate) fn prove_traces(
         &inputs,
         format.keccak_rnd,
         format.memw_aligned,
+        format.registers,
     );
 
     let prepared_columns = prepared_tables(&airs, &traces.page_configs, format)?;
@@ -5633,6 +5646,7 @@ fn lay_out_rest<'a>(
             &inputs,
             format.keccak_rnd,
             format.memw_aligned,
+            format.registers,
         )
     });
     marks.push(("airs", at()));
@@ -5816,6 +5830,7 @@ fn lay_out_rest_streamed<'a>(
     recorder: Option<&regen::Recorder>,
     keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
     memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
+    registers: crate::tables::register::RegisterFormat,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
@@ -5845,6 +5860,7 @@ fn lay_out_rest_streamed<'a>(
             &inputs,
             keccak_rnd,
             memw_aligned,
+            registers,
         )
     });
     marks.push(("airs", at()));
@@ -6966,6 +6982,7 @@ fn prove_streamed(
                         live_recorder,
                         format.keccak_rnd,
                         format.memw_aligned,
+                        format.registers,
                     ),
                 };
                 let (streamed, rest) = if inline {
@@ -8061,6 +8078,7 @@ pub(crate) fn block_frame(
         &inputs,
         format.keccak_rnd,
         format.memw_aligned,
+        format.registers,
     );
     // The CPU heights were read at `cpu_proof_start`: the tables must be there.
     airs.check_cpu_position(statement.table_counts)?;

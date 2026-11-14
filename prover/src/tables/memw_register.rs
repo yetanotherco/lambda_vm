@@ -236,6 +236,50 @@ impl RegRow {
     }
 }
 
+/// The row read as REGX's ([`super::regx`], under the register format that
+/// checks a CPU row's accesses in the row itself): the same fields, the spare
+/// byte marking a keep-alive.
+impl RegRow {
+    /// A keep-alive of register `reg_addr / 2`'s value `val`: its token at
+    /// `old_ts` consumed and produced again at `timestamp`.
+    pub(crate) fn keep_alive(reg_addr: u64, timestamp: u64, val: [u32; 2], old_ts: u64) -> Self {
+        let mut row = Self::new(
+            reg_addr, timestamp, val[0], val[1], val[0], val[1], old_ts, true,
+        );
+        row.pad = 1;
+        row
+    }
+
+    /// Whether the row is a keep-alive ([`Self::keep_alive`]).
+    pub(crate) fn is_keep(&self) -> bool {
+        self.pad == 1
+    }
+
+    /// The register index.
+    pub(crate) fn register(&self) -> u16 {
+        self.address
+    }
+
+    pub(crate) fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    pub(crate) fn is_read(&self) -> bool {
+        self.is_read
+    }
+
+    /// The new and the old value's two words.
+    pub(crate) fn words(&self) -> ([u32; 2], [u32; 2]) {
+        ([self.val0, self.val1], [self.old0, self.old1])
+    }
+
+    /// `timestamp − old timestamp`, the old one's high word the row's own.
+    pub(crate) fn step(&self) -> u64 {
+        let old = (self.timestamp & !0xFFFF_FFFF) | u64::from(self.old_ts_lo);
+        self.timestamp - old
+    }
+}
+
 #[cfg(test)]
 impl RegRow {
     /// The row as the card's MEMW_R fill reads it, field for field.

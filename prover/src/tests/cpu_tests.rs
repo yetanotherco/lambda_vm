@@ -568,6 +568,7 @@ fn the_cpu_and_register_airs_expose_the_columns_the_verifier_checks() {
         &inputs,
         crate::tables::keccak_rnd::KeccakRndForm::Full,
         crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        crate::tables::register::RegisterFormat::Tokens32,
     );
     let refs = airs.air_refs();
     let start = crate::cpu_proof_start(true, &counts);
@@ -656,6 +657,7 @@ fn the_block_register_sends_the_final_pc_token_at_its_clocks_end() {
             &inputs,
             crate::tables::keccak_rnd::KeccakRndForm::Full,
             crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+            crate::tables::register::RegisterFormat::Tokens32,
         );
         let refs = airs.air_refs();
         let register_air = refs
@@ -702,6 +704,7 @@ fn the_cpu_tables_are_refused_where_their_heights_are_not_read() {
         &inputs,
         crate::tables::keccak_rnd::KeccakRndForm::Full,
         crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        crate::tables::register::RegisterFormat::Tokens32,
     );
     assert!(airs.check_cpu_position(&counts).is_ok());
     let mut shifted = counts.clone();
