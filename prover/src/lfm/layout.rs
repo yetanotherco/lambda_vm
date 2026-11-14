@@ -317,6 +317,89 @@ pub mod blake3 {
     }
 }
 
+/// `B3L_HEAD` — one standard 7-round BLAKE3 compression on the lean tables
+/// ([`super::instr::Instr::B3l`]): the head row's instruction group. One row a
+/// compression; the round rows' group ([`b3l::round`]) follows from it.
+///
+/// The compression always runs at counter `t = 0` — every message the block
+/// format hashes is one chunk that never ends (`crypto::hash::blake3::chain`) —
+/// so the counter is a constant of the chip, not a column. `block_len` and
+/// `flags` are emit-time constants, hence instruction columns.
+pub mod b3l {
+    /// Is-real flag: gates every read, write and lookup of the row.
+    pub const MU: usize = 0;
+    /// The compression's tag on the round chain: its row ordinal + 1
+    /// ([`tag_for_row`]), so uniqueness is structural.
+    pub const TAG: usize = 1;
+    /// The chaining value is BLAKE3's IV (no `h` read).
+    pub const IVF: usize = 2;
+    /// The block is 16 `u32` lanes in four words.
+    pub const MLANES: usize = 3;
+    /// The block is 8 field elements in two words, each its canonical value's
+    /// eight big-endian bytes.
+    pub const MFELTS: usize = 4;
+    pub const BLEN: usize = 5;
+    pub const FLAGS: usize = 6;
+    /// The chaining value's two words (`h[0..4]`, `h[4..8]`); 0 under `IVF`.
+    pub const HADDR0: usize = 7; // ..9
+    /// The block's words: four under `MLANES`, the first two under `MFELTS`
+    /// (the last two are then 0).
+    pub const MADDR0: usize = 9; // ..13
+    /// The digest's two words (`out[0..4]`, `out[4..8]`) and their read counts.
+    pub const OADDR0: usize = 13; // ..15
+    pub const OCNT0: usize = 15; // ..17
+    /// The byte-reversed digest's two words and their read counts: 0 on a row
+    /// that writes none. Free on the bus (a relabel of the digest's bytes), as
+    /// `LFM_BLAKE3`'s `REV_ADDR0`.
+    pub const RADDR0: usize = 17; // ..19
+    pub const RCNT0: usize = 19; // ..21
+    pub const PREP_WIDTH: usize = 21;
+
+    /// Words in a digest (and in a chaining value).
+    pub const DIGEST_WORDS: usize = 2;
+    /// Words in a block of `u32` lanes.
+    pub const LANE_WORDS: usize = 4;
+    /// Words in a block of field elements.
+    pub const FELT_WORDS: usize = 2;
+    /// Standard BLAKE3's rounds, whatever the build's `blake3-6round` says.
+    pub const ROUNDS: usize = 7;
+
+    pub const fn haddr(word: usize) -> usize {
+        HADDR0 + word
+    }
+    pub const fn maddr(word: usize) -> usize {
+        MADDR0 + word
+    }
+    pub const fn oaddr(word: usize) -> usize {
+        OADDR0 + word
+    }
+    pub const fn ocnt(word: usize) -> usize {
+        OCNT0 + word
+    }
+    pub const fn raddr(word: usize) -> usize {
+        RADDR0 + word
+    }
+    pub const fn rcnt(word: usize) -> usize {
+        RCNT0 + word
+    }
+
+    /// The round-chain tag of the compression on head row `row` (0-based):
+    /// `row + 1`, so no real compression takes tag 0, which the all-zero
+    /// padding rows carry.
+    pub const fn tag_for_row(row: usize) -> u64 {
+        row as u64 + 1
+    }
+
+    /// `B3L_ROUND` — the round rows' instruction group: row `7k + r` is round
+    /// `r` of the compression on head row `k`.
+    pub mod round {
+        pub const MU: usize = 0;
+        pub const TAG: usize = 1;
+        pub const RND: usize = 2;
+        pub const PREP_WIDTH: usize = 3;
+    }
+}
+
 /// `LFM_LANES` — word ↔ lane conversion (Pack / Unpack). Pack rows receive
 /// four lane cells and send the assembled word; Unpack rows receive a word
 /// and send its four lanes as base cells. The shared value columns appear in

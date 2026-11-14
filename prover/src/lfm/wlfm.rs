@@ -494,6 +494,12 @@ pub fn build_wlfm_under(
     // constant (`for_program_with_hasher` reads it from the environment).
     let chip_set = ChipSet::for_program_under(program, hasher, true);
     check_chip_set(chip_set)?;
+    if program.groups.b3l.real_rows > 0 {
+        return Err(format!(
+            "{} lean BLAKE3 compressions: the W-LFM AIR set has no lean tables yet",
+            program.groups.b3l.real_rows
+        ));
+    }
     let hash_chunks = program.hash_chunk_count();
     let groups = program_prep_groups(program);
     let airs = whir_lfm_airs(hasher, chip_set, hash_chunks, &air_options());
@@ -821,6 +827,10 @@ pub(crate) fn prove_wlfm_traces(
     filled: LfmFilled,
     check_prefix: bool,
 ) -> Result<WlfmProof, String> {
+    let mut filled = filled;
+    if !filled.take_b3l().is_empty() {
+        return Err("lean BLAKE3 records: the W-LFM AIR set has no lean tables yet".into());
+    }
     let (mut traces, public_words, hasher, execute_secs, fill_secs, exec_split) =
         filled.into_parts();
     // Every chip its own table: a set filled under the process's merge is

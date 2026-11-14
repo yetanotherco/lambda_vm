@@ -223,6 +223,7 @@ fn kind(instr: &Instr) -> &'static str {
         Instr::Hash16(_) => "HASH16",
         Instr::KeccakF(_) => "KECCAK",
         Instr::Blake3(_) => "BLAKE3",
+        Instr::B3l(_) => "B3L",
         Instr::Hint { .. } | Instr::HintOn { .. } => "HINT",
         Instr::Pack { .. } => "LANES.pack",
         Instr::Unpack { .. } => "LANES.unpack",

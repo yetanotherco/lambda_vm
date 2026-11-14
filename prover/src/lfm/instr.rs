@@ -213,6 +213,71 @@ pub struct Blake3ReversedDigest {
     pub mults: [u64; layout::blake3::DIGEST_WORDS],
 }
 
+/// The chaining value an [`Instr::B3l`] compression starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum B3lCv {
+    /// BLAKE3's IV: a constant of the row, nothing read.
+    Iv,
+    /// Two words of four `u32` lanes: `h[0..4]`, then `h[4..8]`.
+    Words([Addr; layout::b3l::DIGEST_WORDS]),
+}
+
+/// The 64-byte block an [`Instr::B3l`] compression absorbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum B3lBlock {
+    /// Four words of four `u32` lanes: message words `m[0..16]` in order,
+    /// each little-endian in the block.
+    Lanes([Addr; layout::b3l::LANE_WORDS]),
+    /// Two words of four field elements: eight felts in order, each its
+    /// canonical value's eight BIG-endian bytes — what the block format's
+    /// leaves hash (`Blake3Whir`, `blake3_joint`).
+    Felts([Addr; layout::b3l::FELT_WORDS]),
+}
+
+/// Operands of an [`Instr::B3l`]: one standard 7-round BLAKE3 compression at
+/// counter 0 on the lean tables, its 256-bit digest written as two words of
+/// four `u32` lanes (`out[0..8]`, the chaining value of a next block), and
+/// optionally the digest byte-reversed as two more.
+///
+/// `block_len` and `flags` are the compression's own (BLAKE3's `b` and `d`):
+/// constants of the program, as the framing (`chain::block_flags`,
+/// `block_len_of`) decides them at emit time.
+#[derive(Debug, Clone)]
+pub struct B3lOperands {
+    pub cv: B3lCv,
+    pub block: B3lBlock,
+    pub block_len: u8,
+    pub flags: u8,
+    pub outs: [Addr; layout::b3l::DIGEST_WORDS],
+    pub mults: [u64; layout::b3l::DIGEST_WORDS],
+    /// When set, the row ALSO writes the byte-reversed digest as two words —
+    /// the transcript's `sample()`. Free on the bus.
+    pub rev: Option<B3lReversed>,
+}
+
+/// The reversed-digest outputs of a [`B3lOperands`] row.
+#[derive(Debug, Clone)]
+pub struct B3lReversed {
+    pub outs: [Addr; layout::b3l::DIGEST_WORDS],
+    pub mults: [u64; layout::b3l::DIGEST_WORDS],
+}
+
+impl B3lOperands {
+    /// The words this compression reads: the chaining value's (none under the
+    /// IV), then the block's, in order.
+    pub fn read_words(&self) -> impl Iterator<Item = Addr> + '_ {
+        let cv: &[Addr] = match &self.cv {
+            B3lCv::Iv => &[],
+            B3lCv::Words(w) => w,
+        };
+        let block: &[Addr] = match &self.block {
+            B3lBlock::Lanes(w) => w,
+            B3lBlock::Felts(w) => w,
+        };
+        cv.iter().chain(block).copied()
+    }
+}
+
 /// One LFM instruction. Operand-field conventions:
 ///
 /// - `c` on the ALU ops is meaningful iff the op is `MulAdd` (and is emitted
@@ -332,6 +397,11 @@ pub enum Instr {
     /// path, and an inline 4-wide variant would grow every instruction of every
     /// program.
     Hash16(Box<Hash16Operands>),
+    /// One standard 7-round BLAKE3 compression on the lean tables (`B3L_HEAD`,
+    /// `B3L_ROUND`, `B3L_XOR`), which only the block prover (W-LFM) proves.
+    ///
+    /// Boxed for the reason `KeccakF` is.
+    B3l(Box<B3lOperands>),
     Public {
         addr: Addr,
         index: u32,
@@ -384,6 +454,12 @@ impl Instr {
                 out.extend_from_slice(&outs[..mode.num_output_cells()])
             }
             Instr::Hash16(h) => out.extend_from_slice(&h.outs),
+            Instr::B3l(k) => {
+                out.extend_from_slice(&k.outs);
+                if let Some(rev) = &k.rev {
+                    out.extend_from_slice(&rev.outs);
+                }
+            }
             Instr::Public { .. } => {}
         }
     }
@@ -432,6 +508,9 @@ impl Instr {
             // Every input word is read on every row: the chip has one mode, so
             // there is no gated operand and no placeholder to exclude.
             Instr::Blake3(k) => out.extend_from_slice(&k.ins),
+            // The chaining value's words unless the IV, then the block's words:
+            // exactly the head's memory receives, each gated by its mode.
+            Instr::B3l(k) => out.extend(k.read_words()),
             Instr::Public { addr, .. } => out.push(*addr),
         }
     }
