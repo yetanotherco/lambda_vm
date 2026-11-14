@@ -423,11 +423,12 @@ pub enum BusId {
     /// fixed 2^16-row `B3L_XOR` table (XOR, XOR split into nibbles, a byte
     /// pair, a 16-bit value).
     ///
-    /// ID 39: the next free one (20 and 29 stay unused).
-    B3lXor = 39,
+    /// IDs 40 and 41: 39 is the in-row register format's bus (20 and 29 stay
+    /// unused).
+    B3lXor = 40,
     /// The lean BLAKE3 round chain: `(tag, round, state, message)` from a
     /// compression's head row through its seven round rows and back.
-    B3lRound = 40,
+    B3lRound = 41,
 }
 
 impl BusId {
@@ -503,8 +504,8 @@ impl TryFrom<u64> for BusId {
             36 => Ok(BusId::CopyNext),
             38 => Ok(BusId::KeccakSponge),
             37 => Ok(BusId::IsWh),
-            39 => Ok(BusId::B3lXor),
-            40 => Ok(BusId::B3lRound),
+            40 => Ok(BusId::B3lXor),
+            41 => Ok(BusId::B3lRound),
             other => Err(other),
         }
     }

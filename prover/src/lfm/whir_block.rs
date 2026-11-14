@@ -1134,7 +1134,7 @@ impl WhirBlockPlan {
         BlockLayout::top(STATE_WORDS, out_halves(&self.public_output).len())
     }
 
-    /// ★ The whole block verified by ONE program (route A's level 1): the
+    /// ★ The whole block verified by ONE program (the recursion's level 1): the
     /// leaf walk over every group, as the carrier, with the bus closed
     /// in-program — the sum of every table's share, less the COMMIT-bus
     /// target, asserted zero, as the top node asserts its children's — and the
