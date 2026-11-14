@@ -1758,8 +1758,11 @@ pub struct WalkedWindow {
 
 impl WalkedWindow {
     /// A digest of everything the window's walk emitted, its CPU ops and
-    /// every list, through their `Debug` forms: two walks that emit the same
-    /// give the same digest. For the record mode's sampled re-walk.
+    /// every list (the in-row register format's side records among them),
+    /// through their `Debug` forms: two walks that emit the same give the
+    /// same digest. For the record mode's sampled re-walk. The in-walk
+    /// lookups are left out: they follow from the lists, and a walker that
+    /// counts where it makes the rows has counted and dropped its own.
     #[cfg(feature = "parallel")]
     pub(crate) fn emitted_digest(&self) -> u64 {
         use std::fmt::Write as _;
@@ -1783,7 +1786,7 @@ impl WalkedWindow {
             w.load_ops,
             w.lt_ops,
             w.shift_ops,
-            w.bitwise_ops,
+            w.cpu_side,
             w.keccak_ops,
             w.blake3_ops,
             w.blake3_absorb_ops,
@@ -1961,6 +1964,13 @@ fn walk_window(
         )?;
         if let (Some(counts), Some(last_ecall)) = (counts.as_deref_mut(), made.as_mut()) {
             counts.count_batch(decode, &cpu_ops[start..], &walk, marks, last_ecall);
+            // A walk that lists no lookup of its own still lists each in-row
+            // CPU slot's step: counted here, on the walker's thread, and none
+            // left for the accumulator to count.
+            if !lookups {
+                counts.count_listed(&walk.bitwise_ops[marks.bitwise..]);
+                walk.bitwise_ops.truncate(marks.bitwise);
+            }
         }
     }
     *sizes = WalkSizes::of(&walk, logs.len());
@@ -2000,11 +2010,15 @@ struct BatchMarks {
     aligned: usize,
     load: usize,
     shift: usize,
+    /// The in-walk lookups listed so far: under the in-row register format
+    /// each CPU slot's `IS_HALF` (a walk that does not list the rest).
+    bitwise: usize,
 }
 
 impl BatchMarks {
     fn of(walk: &WalkOutputs) -> Self {
         Self {
+            bitwise: walk.bitwise_ops.len(),
             register_rows: walk.memw.register_rows.len(),
             words: walk.memw.words.as_ref().map_or(0, |w| w.words.len()),
             whole: walk.memw.words.as_ref().map_or(0, |w| w.whole.len()),
@@ -2068,6 +2082,17 @@ impl WalkCounts {
         histogram.add_ops(&shift::collect_bitwise_from_shift(
             &walk.shift_ops[marks.shift..],
         ));
+    }
+
+    /// Lookups the walk listed (each in-row CPU slot's `IS_HALF`), counted on
+    /// the walker's thread.
+    fn count_listed(&mut self, ops: &[super::BitwiseOperation]) {
+        if ops.is_empty() {
+            return;
+        }
+        self.histogram
+            .get_or_insert_with(bitwise::BitwiseHistogram::new)
+            .add_ops(ops);
     }
 
     /// Adds these counts to the run's: `histogram`, and DECODE's trace.
