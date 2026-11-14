@@ -85,6 +85,68 @@ pub(crate) fn warm(traces: &LfmTraces, options: &ProofOptions) -> usize {
     built
 }
 
+/// `W3_NODE_DOMAINS_EARLY` (default off), set by the tree at its start: a node
+/// program's lengths are warmed as soon as it is emitted ([`warm_lengths`] on
+/// a thread of its own), instead of at its prove's start.
+static NODES_EARLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets `W3_NODE_DOMAINS_EARLY` for the tree that starts now.
+pub(crate) fn set_nodes_early(on: bool) {
+    NODES_EARLY.store(on, Ordering::Relaxed);
+}
+
+/// Whether node programs warm their lengths when emitted.
+pub(crate) fn nodes_early() -> bool {
+    NODES_EARLY.load(Ordering::Relaxed)
+}
+
+/// The lengths a program's traces take that depend on the program, from the
+/// program alone: its groups' padded rows (a merged table keeps its tables'
+/// height), its BLAKE3 chunks' and its split `LFM_HASH` chunks', each at least
+/// [`MIN_ROWS`], once each. The fixed tables (range, KECCAK_RC, BITWISE, the
+/// KECCAK_RND chunks) take the same lengths in every prove, so the first leaf's
+/// prove has built them. A length missed here is built at the prove's start as
+/// before; an extra one costs only its build.
+pub(crate) fn program_lengths(program: &super::compiler::LfmProgram) -> Vec<usize> {
+    let mut rows: Vec<usize> = super::registry::program_groups(program)
+        .iter()
+        .map(|g| g.padded_rows)
+        .chain(super::airs::blake3_chunk_rows(program))
+        .chain(
+            program
+                .hash_chunk_real_rows()
+                .into_iter()
+                .map(super::layout::padded_rows),
+        )
+        .filter(|&n| n >= MIN_ROWS && n.is_power_of_two())
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
+/// Builds the domains and twiddles of `lengths` under `options` that are not
+/// built yet ([`warm`]'s work, for lengths known before the traces); returns
+/// how many it built.
+pub(crate) fn warm_lengths(lengths: &[usize], options: &ProofOptions) -> usize {
+    let t = std::time::Instant::now();
+    let built: Vec<u64> = lengths
+        .iter()
+        .filter_map(|&n| {
+            stark::prover::warm_domain_twiddles::<GoldilocksField>(
+                options.blowup_factor as usize,
+                options.coset_offset,
+                n,
+            )
+        })
+        .collect();
+    BYTES.fetch_add(built.iter().sum::<u64>(), Ordering::Relaxed);
+    let built = built.len();
+    BUILT.fetch_add(built as u64, Ordering::Relaxed);
+    BUILD_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    built
+}
+
 /// The early leaf's lengths are warm, `at` seconds into the tree's clock.
 pub(crate) fn note_early(at: f64) {
     EARLY_BYTES.store(BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -113,11 +175,60 @@ pub fn line() -> String {
 mod tests {
     use super::*;
 
+    /// The counters are process-wide: one of these tests at a time.
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The lengths a program gives before it runs (`W3_NODE_DOMAINS_EARLY`)
+    /// cover the lengths its filled traces take, so an early warm leaves its
+    /// prove nothing to build; and a warm of them finds them after.
+    #[test]
+    fn a_programs_lengths_cover_its_filled_traces() {
+        let _g = lock();
+        use crate::tables::types::FE;
+        let program = super::super::programs::trivial_program();
+        let mut opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(16)
+            .expect("blowup 16 is valid");
+        opts.coset_offset = 13;
+        let arenas = vec![
+            (0..4u64)
+                .map(|i| core::array::from_fn(|j| FE::from(2_000 * (i + 1) + j as u64)))
+                .collect(),
+        ];
+        let hasher = super::super::registry::build_artifacts(&program, &opts).hasher;
+        let filled =
+            super::super::proof::lfm_execute_and_fill(&program, &arenas, hasher).expect("filled");
+        let early = program_lengths(&program);
+        let t = filled.traces();
+        let fixed: Vec<usize> = [&t.range, &t.keccak_rc, &t.bitwise]
+            .into_iter()
+            .chain(&t.keccak_rnd)
+            .map(|table| table.num_rows())
+            .collect();
+        for l in lengths(t).into_iter().filter(|l| l.is_power_of_two()) {
+            assert!(
+                early.contains(&l) || fixed.contains(&l),
+                "length {l} of the traces is neither the program's {early:?} nor a fixed table's {fixed:?}"
+            );
+        }
+        assert_eq!(warm_lengths(&early, &opts), early.len(), "each built once");
+        let fixed_built = warm_lengths(&fixed, &opts);
+        assert!(fixed_built <= fixed.len());
+        assert_eq!(
+            warm(filled.traces(), &opts),
+            0,
+            "the prove then builds nothing"
+        );
+    }
+
     /// ★ A proof's table lengths are built once and found after: the second
     /// warm builds nothing (the proof's own `multi_prove` lookups then hit,
     /// which the stark crate's test shows value for value).
     #[test]
     fn a_proofs_lengths_are_built_once_then_found() {
+        let _g = lock();
         use crate::tables::types::FE;
         let program = super::super::programs::trivial_program();
         // A blowup and coset offset no other test proves under: the

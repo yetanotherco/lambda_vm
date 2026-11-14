@@ -199,6 +199,12 @@ pub struct WhirTreeConfig {
     /// ([`EARLY_POOL_NICE`]), so phase B's host work, which they run beside,
     /// keeps its cores. 0: on the prover's own pool, beside phase B's work.
     pub early_pool: usize,
+    /// `W3_NODE_DOMAINS_EARLY=0|1` (default 0): each node program's domains
+    /// and twiddles are built as it is emitted, on a thread of its own, rather
+    /// than at its prove's start, where a first node over new lengths builds
+    /// them before taking the card. Prover-only: a cache, the bytes are the
+    /// same.
+    pub node_domains_early: bool,
     /// `W3_STREAM_LEAF=0|1` (default on, [`STREAM_LEAF_DEFAULT`]; 0 is the
     /// control): the leaf phase B leads last, when
     /// fewer than [`STREAM_COVER_LEAVES`] early leaves are ahead of it on the
@@ -462,6 +468,7 @@ impl WhirTreeConfig {
         let early_leaves = early_leaves_setting(count_knob("W3_EARLY_LEAVES")?)?;
         let early_pool = count_knob("W3_EARLY_POOL")?.unwrap_or(EARLY_POOL_DEFAULT);
         let stream_leaf = stream_leaf_setting(count_knob("W3_STREAM_LEAF")?)?;
+        let node_domains_early = flag_knob("W3_NODE_DOMAINS_EARLY")?;
         let leaf_emitters = leaf_emitters_setting(count_knob("W3_LEAF_EMITTERS")?);
         let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
             Ok("batched") => match count_knob("BLOCK_WHIR_ARGUE_CAP")? {
@@ -556,6 +563,7 @@ impl WhirTreeConfig {
             early_on,
             early_leaves,
             early_pool,
+            node_domains_early,
             stream_leaf,
             leaf_emitters,
             argue,
@@ -803,7 +811,7 @@ pub(crate) struct ProgramTimes {
 static HOP_STAMPS: std::sync::Mutex<Vec<(String, f64)>> = std::sync::Mutex::new(Vec::new());
 static HOPS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn hop_stamp(what: impl FnOnce() -> String) {
+pub(crate) fn hop_stamp(what: impl FnOnce() -> String) {
     if !HOPS_ON.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -1417,9 +1425,19 @@ pub(crate) fn build_nodes(
                 .map(Some),
             None => Ok(None),
         },
-        |_, _, kids: &[&DerivedChild], top, permit| -> Result<Emitted, String> {
+        |lv, j, kids: &[&DerivedChild], top, permit| -> Result<Emitted, String> {
             let t = std::time::Instant::now();
             let program = plan.node_program(kids, top)?;
+            // `W3_NODE_DOMAINS_EARLY`: this node's lengths warmed now, on a
+            // thread of its own, while the card proves below it.
+            if super::domain_warm::nodes_early() {
+                let lengths = super::domain_warm::program_lengths(&program);
+                let wrap = wrap.clone();
+                std::thread::spawn(move || {
+                    let built = super::domain_warm::warm_lengths(&lengths, &wrap);
+                    hop_stamp(|| format!("L{lv}.{j} domains warmed {built} of {}", lengths.len()));
+                });
+            }
             let child_arenas = kids
                 .iter()
                 .map(|kid| {
@@ -3276,6 +3294,7 @@ pub fn prove_whir_block_tree(
         stamps.clear();
     }
     HOPS_ON.store(cfg.node_times, std::sync::atomic::Ordering::Relaxed);
+    super::domain_warm::set_nodes_early(cfg.node_domains_early);
     let t = std::time::Instant::now();
     let tree_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5865,6 +5884,7 @@ mod tests {
             early_on: true,
             early_leaves: EARLY_LEAVES_DEFAULT,
             early_pool: EARLY_POOL_DEFAULT,
+            node_domains_early: false,
             stream_leaf: STREAM_LEAF_DEFAULT,
             leaf_emitters: Some(LEAF_EMITTERS),
             argue: BlockFormat::production().argue,
@@ -5899,6 +5919,10 @@ mod tests {
         assert!(
             off(|c| c.stream_leaf = !STREAM_LEAF_DEFAULT),
             "the streamed leaf is scheduling only"
+        );
+        assert!(
+            off(|c| c.node_domains_early = true),
+            "the early node domains are a cache only"
         );
         // A packing is a named constant the block verifier is given too: a
         // tree argued under another (here `Off`), its format saying so, is at
