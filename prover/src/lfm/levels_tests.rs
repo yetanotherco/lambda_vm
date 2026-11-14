@@ -1,16 +1,124 @@
 //! The block's recursion as levels ([`super::levels`]) over small blocks: the
 //! closed level-1 program, the chain to its last level, and the refusals that
-//! make each piece load-bearing. Every test proves a block's base: box tier.
+//! make each piece load-bearing, under Poseidon1 and under 7-round BLAKE3.
+//! Every test that proves a block's base is box tier; the hash and base
+//! pairings are checked on the laptop.
 
+use super::edsl::WrapHash;
 use super::executor::execute;
 use super::levels::{
-    LevelStop, derive_levels, derive_levels_to, prove_levels, verify_levels, verify_levels_to,
+    LevelStop, check_base, check_hash, derive_levels, derive_levels_to, level_plan, prove_levels,
+    verify_levels, verify_levels_to,
 };
-use super::whir_block::{LeafChecks, block_leaf_arena, top_claims};
+use super::whir_block::{LeafChecks, WhirBlockPlan, block_leaf_arena, top_claims};
 use super::whir_block_tests::{
     at_blowup_4, plan_of, small_block, small_block_options, small_format,
 };
 use super::wlfm::{WlfmFamily, verify_wlfm};
+use crate::block_whir::{BlockFormat, BlockWhirProof};
+use stark::proof::options::{BaseFormat, ProofOptions};
+
+/// The small blocks' format over the 7-round BLAKE3 base.
+fn b3_format() -> BlockFormat {
+    crate::tests::block_whir_p1_tests::many_groups(BaseFormat::B3_WHIR)
+}
+
+/// A small block's BLAKE3 base, proved inside the levels' admission (the
+/// driver's own) and accepted by the host verifier (under the test permit).
+fn b3_small_block(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
+    let elf = crate::test_utils::asm_elf_bytes(name);
+    let opts = ProofOptions::default_test_options();
+    let proof = crate::base_only::with_blake3_levels(|| {
+        crate::block_whir::prove_block_whir_with(
+            &elf,
+            &[],
+            &opts,
+            format,
+            &small_block_options(),
+            &crate::block_whir::Deviations::default(),
+        )
+    })
+    .expect("the BLAKE3 base proves")
+    .0;
+    assert!(
+        crate::base_only::with_permit(|| crate::block_whir::verify_block_whir(
+            &proof, &elf, &opts, format
+        )
+        .expect("verify runs")),
+        "the host verifier accepts the BLAKE3 base"
+    );
+    (elf, proof)
+}
+
+/// Level 1's BLAKE3 plan, as a verifier derives it (prepared roots on the
+/// host).
+fn b3_plan(elf: &[u8], proof: &BlockWhirProof, format: &BlockFormat) -> WhirBlockPlan {
+    level_plan(
+        elf,
+        &ProofOptions::default_test_options(),
+        format,
+        proof.statement(),
+        WlfmFamily::B3,
+        None,
+    )
+    .expect("the BLAKE3 plan derives")
+}
+
+/// One hash end to end: a family's levels take a plan of its own hash and no
+/// other.
+#[test]
+fn the_levels_take_a_plan_of_their_own_hash_only() {
+    let hashes = [
+        WrapHash::Keccak,
+        WrapHash::Blake3,
+        WrapHash::Algebraic,
+        WrapHash::Poseidon1,
+    ];
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let own = match family {
+            WlfmFamily::P1 => WrapHash::Poseidon1,
+            WlfmFamily::B3 => WrapHash::Blake3,
+        };
+        for wrap in hashes {
+            assert_eq!(
+                check_hash(wrap, family).is_ok(),
+                wrap == own,
+                "{family:?} levels over a {wrap:?} plan"
+            );
+        }
+    }
+}
+
+/// A family's levels verify their own hash's base and no other, and the driver
+/// refuses a mismatched base before it proves anything.
+#[test]
+fn the_levels_take_a_base_of_their_own_hash_only() {
+    let p1 = crate::hash_pin::BLOCK_BASE;
+    let b3 = BaseFormat::B3_WHIR;
+    assert!(check_base(&p1, WlfmFamily::P1).is_ok());
+    assert!(check_base(&b3, WlfmFamily::B3).is_ok());
+    assert!(check_base(&b3, WlfmFamily::P1).is_err());
+    assert!(check_base(&p1, WlfmFamily::B3).is_err());
+    let opts = ProofOptions::default_test_options();
+    for (format, family) in [
+        (small_format(), WlfmFamily::B3),
+        (b3_format(), WlfmFamily::P1),
+    ] {
+        let Err(err) = super::levels::prove_block_levels(
+            &[],
+            &[],
+            &opts,
+            &format,
+            &small_block_options(),
+            family,
+            LevelStop::DEFAULT,
+            true,
+        ) else {
+            panic!("{family:?} levels proved over another hash's base");
+        };
+        assert!(err.contains("own hash's base"), "{err}");
+    }
+}
 
 /// ★ Level 1 over a small block: one program over every group executes over
 /// the base proof's witness, closes the bus and publishes the top's words,
@@ -114,14 +222,70 @@ fn the_levels_prove_a_small_block_to_its_last_level() {
     assert!(verify_levels(&plan2, WlfmFamily::P1, last).is_err());
 }
 
-/// The levels refuse a family whose in-guest arm the plan does not replay.
+/// The levels refuse a family whose hash the plan's programs do not replay:
+/// BLAKE3 levels over a Poseidon1 plan.
 #[test]
 #[ignore = "proves a small block's base; box tier"]
-fn the_levels_refuse_a_family_with_no_arm() {
+fn the_levels_refuse_another_hashs_family() {
     let format = at_blowup_4(small_format());
     let (elf, proof) = small_block("test_commit_4", &format);
     let plan = plan_of(&elf, &proof, &format, Some(1));
     assert!(derive_levels(&plan, WlfmFamily::B3, true).is_err());
+}
+
+/// ★ THE BLAKE3 CHAIN: a small block's 7-round BLAKE3 base, level 1 its
+/// in-guest verifier under BLAKE3 (the lean tables' compressions, no felt
+/// sponge), level 2 the BLAKE3 W-leg over level 1, both proved under the
+/// BLAKE3 family; each verifies against its own artifacts; the host verifier,
+/// deriving every level itself, accepts the last; a changed word, another
+/// block's plan and the Poseidon1 family are refused.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels; box tier"]
+fn the_blake3_levels_prove_a_small_block_to_its_last_level() {
+    let format = b3_format();
+    let (elf, proof) = b3_small_block("test_commit_4", &format);
+    let plan = b3_plan(&elf, &proof, &format);
+    assert_eq!(plan.digest_words(), 2, "a BLAKE3 root is two words");
+    let levels = derive_levels(&plan, WlfmFamily::B3, false).expect("the levels derive");
+    assert_eq!(levels.len(), 2, "the default chain is two levels");
+    for (k, level) in levels.iter().enumerate() {
+        let rows = &level.program.groups;
+        assert!(
+            rows.b3l.real_rows > 0 && rows.hash.real_rows == 0,
+            "level {}: lean compressions only ({} lean, {} felt-sponge rows)",
+            k + 1,
+            rows.b3l.real_rows,
+            rows.hash.real_rows
+        );
+        assert_eq!(level.build.artifacts.family, WlfmFamily::B3);
+    }
+    let (proofs, secs) = prove_levels(&plan, &levels, &proof).expect("every level proves");
+    for (k, (level, p)) in levels.iter().zip(&proofs).enumerate() {
+        verify_wlfm(&level.build.artifacts, p, &p.public_words)
+            .unwrap_or_else(|e| panic!("level {} verifies: {e}", k + 1));
+        println!(
+            "LEVEL B3 {}: {} groups · {} instructions · {} lean compressions · arena {:.3}s · \
+             prove {:.3}s",
+            k + 1,
+            level.build.artifacts.sizes.len(),
+            level.program.instrs.len(),
+            level.program.groups.b3l.real_rows,
+            secs[k].arena,
+            secs[k].prove
+        );
+    }
+    let last = proofs.last().expect("a last level");
+    verify_levels(&plan, WlfmFamily::B3, last).expect("the block's verifier accepts");
+    let mut forged = last.clone();
+    forged.public_words[0].1[0] += crate::tables::types::FE::one();
+    assert!(verify_levels(&plan, WlfmFamily::B3, &forged).is_err());
+    assert!(
+        verify_levels(&plan, WlfmFamily::P1, last).is_err(),
+        "the Poseidon1 family is not this chain's"
+    );
+    let (elf2, proof2) = b3_small_block("all_instructions_64", &format);
+    let plan2 = b3_plan(&elf2, &proof2, &format);
+    assert!(verify_levels(&plan2, WlfmFamily::B3, last).is_err());
 }
 
 /// A chain stopped at one group instead (the compression modes' rule) proves
@@ -201,6 +365,66 @@ fn the_block_levels_driver_proves_a_small_block() {
     );
 }
 
+/// ★ THE BLAKE3 DRIVER: a small block's 7-round BLAKE3 base proved with level
+/// 1 executed beside its phase B, then both levels under the BLAKE3 family.
+/// The base verifies, every level verifies against its own artifacts, and the
+/// block's verifier — its BLAKE3 plan derived on its own — accepts the last.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels; box tier"]
+fn the_blake3_levels_driver_proves_a_small_block() {
+    use super::levels::prove_block_levels;
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = prove_block_levels(
+        &elf,
+        &[],
+        &opts,
+        &format,
+        &small_block_options(),
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        true,
+    )
+    .expect("the BLAKE3 block proves to its last level");
+    assert!(
+        crate::base_only::with_permit(|| crate::block_whir::verify_block_whir(
+            &run.base_proof,
+            &elf,
+            &opts,
+            &format
+        )
+        .expect("verify runs")),
+        "the base verifies"
+    );
+    assert_eq!(run.proofs.len(), 2);
+    for (k, (level, p)) in run.levels.iter().zip(&run.proofs).enumerate() {
+        verify_wlfm(&level.build.artifacts, p, &p.public_words)
+            .unwrap_or_else(|e| panic!("level {} verifies: {e}", k + 1));
+    }
+    let plan = b3_plan(&elf, &run.base_proof, &format);
+    verify_levels(
+        &plan,
+        WlfmFamily::B3,
+        run.proofs.last().expect("a last level"),
+    )
+    .expect("the block's own verifier accepts the last level");
+    let t = &run.times;
+    println!(
+        "LEVELS DRIVER B3: base {:.3}s · planned {:.3}s · emitted {:.3}s · pieces {} · waves \
+         before the base ended {} ({:.3}s) · execute tail {:.3}s · built {:.3}s · levels {:?}",
+        t.base,
+        t.planned,
+        t.emitted,
+        t.pieces,
+        t.waves_before_base,
+        t.wave_secs_before_base,
+        t.execute_tail,
+        t.built,
+        t.levels
+    );
+}
+
 /// Level 1's pieces: the front, then the groups in order, one piece a group up
 /// to 63, consecutive groups merged beyond; the pieces tile the arena.
 #[test]
@@ -234,9 +458,12 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
 
 /// ★ A real block through the levels driver (the box's timing harness):
 /// `BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`, the tree harness's format and options
-/// words (`WhirTreeConfig::from_env`), `RTA_BESIDE` (1, the default: level 1
-/// executes beside phase B; 0 the control), `RTA_LEVELS` (the chain's length;
-/// 2). Prints `RTA …` lines; everything is verified off the clock.
+/// words (`WhirTreeConfig::from_env`), `RTA_FAMILY` (`p1`, the default, or
+/// `b3`: the 7-round BLAKE3 base at `prove-block-base --base b3`'s format —
+/// blowup 2, coset leaves, one tree a run, indexed groups — and BLAKE3
+/// levels), `RTA_BESIDE` (1, the default: level 1 executes beside phase B; 0
+/// the control), `RTA_LEVELS` (the chain's length; 2). Prints `RTA …` lines;
+/// everything is verified off the clock.
 #[test]
 #[ignore = "a real block and its levels: box only"]
 fn rta_a_real_block_through_its_levels() {
@@ -247,12 +474,35 @@ fn rta_a_real_block_through_its_levels() {
         .expect("read the ELF");
     let input = std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT"))
         .expect("read the input");
-    let cfg = WhirTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let family = match std::env::var("RTA_FAMILY").as_deref().map(str::trim) {
+        Err(_) | Ok("p1") => WlfmFamily::P1,
+        Ok("b3") => WlfmFamily::B3,
+        Ok(other) => panic!("RTA_FAMILY is p1 or b3, not {other}"),
+    };
+    if family == WlfmFamily::B3 {
+        use crate::zf_format::{LeafOrder, ZfFormat};
+        // `prove-block-base --base b3`'s format, installed before anything
+        // reads it.
+        let zf = ZfFormat {
+            whir_blowup: 2,
+            whir_leaves: LeafOrder::Coset,
+            whir_trees: multilinear::whir_chain::Round0Trees::One,
+            base: BaseFormat::B3_WHIR,
+            ..ZfFormat::from_env().expect("the environment's format")
+        };
+        zf.check_leaves().expect("leaves");
+        zf.check_trees().expect("trees");
+        ZfFormat::install(zf).expect("install the format");
+    }
+    let mut cfg = WhirTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    if family == WlfmFamily::B3 {
+        cfg.format.group = multilinear::whir_chain::GroupFold::Indexed;
+        assert_eq!(cfg.format.zf.base, BaseFormat::B3_WHIR);
+    }
     let beside = std::env::var("RTA_BESIDE").map_or(true, |v| v.trim() != "0");
     let levels: usize =
         std::env::var("RTA_LEVELS").map_or(2, |v| v.trim().parse().expect("RTA_LEVELS"));
     let opts = super::proof::block_base_options();
-    let family = WlfmFamily::P1;
     println!(
         "RTA CONFIG: base {:?} · family {family:?} · levels {levels} · beside {beside}",
         cfg.format.zf.base.hash
@@ -312,9 +562,12 @@ fn rta_a_real_block_through_its_levels() {
         "RTA RECURSION: {:.3}s after the base (end {end:.3}s)",
         end - t.base
     );
-    // Off the clock: the base, every level, and the block's verifier.
-    let ok_base = crate::block_whir::verify_block_whir(&run.base_proof, &elf, &opts, &cfg.format)
-        .expect("verify runs");
+    // Off the clock: the base (a BLAKE3 one under the test permit), every
+    // level, and the block's verifier.
+    let ok_base = crate::base_only::with_permit(|| {
+        crate::block_whir::verify_block_whir(&run.base_proof, &elf, &opts, &cfg.format)
+    })
+    .expect("verify runs");
     let mut ok_levels = true;
     for (level, p) in run.levels.iter().zip(&run.proofs) {
         ok_levels &= verify_wlfm(&level.build.artifacts, p, &p.public_words).is_ok();
