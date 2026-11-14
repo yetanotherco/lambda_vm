@@ -1122,6 +1122,7 @@ impl ShadowRun {
         recipes: Vec<Recipe>,
         form: TraceForm,
         order: MemwAlignedOrder,
+        registers: crate::tables::register::RegisterFormat,
         drop_one_op: Option<StreamTable>,
     ) -> Self {
         let started = Instant::now();
@@ -1144,6 +1145,7 @@ impl ShadowRun {
                 };
                 match RegenBuilder::new(&program, &private_input, &max_rows)
                     .and_then(|b| b.memw_aligned_order(order))
+                    .and_then(|b| b.register_format(registers))
                 {
                     Ok(builder) => {
                         #[cfg(test)]
@@ -1955,6 +1957,7 @@ impl LiveRun {
         dropped: Vec<(StreamKey, RegenSlot)>,
         form: TraceForm,
         order: MemwAlignedOrder,
+        registers: crate::tables::register::RegisterFormat,
         faults: LiveFaults,
         policy: AheadPolicy,
         gate: Option<Arc<AtomicBool>>,
@@ -2002,6 +2005,7 @@ impl LiveRun {
                     .any(|((table, _), slot)| *table == StreamTable::Cpu && slot.is_records());
                 match RegenBuilder::new(&program, &private_input, &max_rows)
                     .and_then(|b| b.memw_aligned_order(order))
+                    .and_then(|b| b.register_format(registers))
                     .and_then(|b| if cpu_logs { b.keep_cpu_logs() } else { Ok(b) })
                 {
                     Ok(builder) => {
@@ -2486,6 +2490,8 @@ pub(crate) struct LiveArgs {
     pub(crate) form: TraceForm,
     /// The run's MEMW_A form (phase A's).
     pub(crate) order: MemwAlignedOrder,
+    /// The run's register format (phase A's).
+    pub(crate) registers: crate::tables::register::RegisterFormat,
     pub(crate) faults: LiveFaults,
     pub(crate) policy: AheadPolicy,
 }
@@ -2593,6 +2599,7 @@ impl EarlyStart {
                                 keyed,
                                 live.form,
                                 live.order,
+                                live.registers,
                                 live.faults,
                                 live.policy,
                                 Some(gate),

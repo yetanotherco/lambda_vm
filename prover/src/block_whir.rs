@@ -2982,6 +2982,26 @@ pub(crate) fn check_chunked_heights(
     Ok(())
 }
 
+/// Under the in-row register format MEMW_R's slot holds REGX's tables, whose
+/// rows the verifier caps ([`crate::tables::regx::MAX_ROWS_TOTAL`]): a
+/// keep-alive has no requester, so without the cap a statement could state
+/// enough of them to carry a register's clock past the field.
+/// `regx_num_vars` are REGX's tables' heights in variables, as the statement
+/// states them.
+pub(crate) fn check_regx_rows(regx_num_vars: impl IntoIterator<Item = u8>) -> Result<(), Error> {
+    let rows: u128 = regx_num_vars
+        .into_iter()
+        .map(|num_vars| 1u128 << num_vars.min(127))
+        .sum();
+    if rows > u128::from(crate::tables::regx::MAX_ROWS_TOTAL) {
+        return Err(Error::InvalidTableCounts(format!(
+            "REGX states {rows} rows — a block takes at most {}",
+            crate::tables::regx::MAX_ROWS_TOTAL
+        )));
+    }
+    Ok(())
+}
+
 /// The block statement: the monolithic multilinear one under
 /// [`MULTILINEAR_BLOCK_TAG`], then the group partition — the count, then per
 /// group its size and its tables' indices, every value a little-endian `u64`
@@ -4414,6 +4434,13 @@ fn prove_block_whir_body(
         return Err(Error::Prover(format!(
             "MEMW_A's {:?} timestamp order needs the windowed build (`window_log2`)",
             format.memw_aligned
+        )));
+    }
+    // And the registers in today's format alone.
+    if format.registers != crate::tables::register::RegisterFormat::Tokens32 {
+        return Err(Error::Prover(format!(
+            "the {:?} register format needs the windowed build (`window_log2`)",
+            format.registers
         )));
     }
 
@@ -6259,7 +6286,7 @@ fn prove_streamed(
         let bitwise_last = deviations.rest_bitwise_last;
         let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
         let from_tables = bitwise_from_tables_or_default(deviations.bitwise_from_tables);
-        let card_fill = match (
+        let mut card_fill = match (
             deviations.card_fill,
             deviations.card_fill_streamed,
             deviations.card_fill_rows,
@@ -6281,6 +6308,13 @@ fn prove_streamed(
                 }
             }
         };
+        // Under the in-row register format the host fills the CPU chunks
+        // (their side records are not a card fill yet) and REGX's (MEMW_R's
+        // kernel fills MEMW_R's columns).
+        if format.registers == crate::tables::register::RegisterFormat::InRow {
+            card_fill.cpu = false;
+            card_fill.memw_r = false;
+        }
         // The streamed chunks held as records ([`records_admission`]):
         // G-pack's narrow chunks only, from a build that drops its streamed
         // ops, with live regeneration to drop them (or kept on purpose),
@@ -6503,6 +6537,7 @@ fn prove_streamed(
                 builder = builder.slide_rest();
                 builder = builder.keccak_rnd_form(format.keccak_rnd);
                 builder = builder.memw_aligned_order(format.memw_aligned)?;
+                builder = builder.register_format(format.registers)?;
                 if card_fill.keccak_rnd {
                     builder = builder.card_fill_keccak_rnd();
                     #[cfg(test)]
@@ -6795,6 +6830,7 @@ fn prove_streamed(
                                     window_cycles: window,
                                     form: stream_form,
                                     order: format.memw_aligned,
+                                    registers: format.registers,
                                     faults: deviations.regen_faults,
                                     policy: deviations.regen_windows.map_or_else(
                                         regen::ahead_policy,
@@ -7246,6 +7282,7 @@ fn prove_streamed(
                 recipes.clone(),
                 stream_form,
                 format.memw_aligned,
+                format.registers,
                 deviations.regen_drop_one_op,
             )
         });
@@ -7361,6 +7398,7 @@ fn prove_streamed(
                                 keyed,
                                 stream_form,
                                 format.memw_aligned,
+                                format.registers,
                                 deviations.regen_faults,
                                 deviations
                                     .regen_windows
@@ -8088,6 +8126,17 @@ pub(crate) fn block_frame(
             "the layout has {} tables, the statement {num_tables}",
             air_refs.len(),
         )));
+    }
+    // Under the in-row register format MEMW_R's slot holds REGX's tables,
+    // their rows capped.
+    if format.registers == crate::tables::register::RegisterFormat::InRow {
+        check_regx_rows(
+            air_refs
+                .iter()
+                .zip(statement.table_num_vars)
+                .filter(|(air, _)| air.name().starts_with("MEMW_R["))
+                .map(|(_, &num_vars)| num_vars),
+        )?;
     }
     // The width is the AIR's, never the proof's; only the height is stated.
     let shapes: Vec<(usize, usize)> = air_refs

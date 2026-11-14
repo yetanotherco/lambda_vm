@@ -148,6 +148,9 @@ pub mod recursion_soundness_gap_poc;
 #[cfg(test)]
 pub mod register_tests;
 #[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod regs_inrow_tests;
+#[cfg(test)]
 pub mod rpx_two_implementations;
 pub mod transcript_counts;
 pub mod windowed_builder_tests;

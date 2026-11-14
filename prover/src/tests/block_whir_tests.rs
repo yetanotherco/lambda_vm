@@ -35,7 +35,7 @@ fn one_group() -> BlockFormat {
 
 /// A stack of 2^10 and two polynomials a group: a small program spans several
 /// groups, which is the block's shape at a size a test can prove.
-fn many_groups() -> BlockFormat {
+pub(super) fn many_groups() -> BlockFormat {
     let mut zf = ZfFormat::DEFAULT;
     zf.whir_stack = StackVars::new(10).expect("a valid stack");
     BlockFormat {
@@ -53,7 +53,7 @@ fn many_groups() -> BlockFormat {
     }
 }
 
-fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions {
+pub(super) fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions {
     BlockOptions {
         max_rows,
         keccak_rnd_rows_log2,
@@ -1126,7 +1126,7 @@ fn a_block_with_a_negative_keccak_multiplicity_is_refused() {
     assert!(!verify(&negative, &elf, &format));
 }
 
-fn streamed(
+pub(super) fn streamed(
     max_rows: MaxRowsConfig,
     keccak_rnd_rows_log2: usize,
     window_log2: usize,
