@@ -97,10 +97,13 @@ mod probe_finish_load {
     static STARTED: Mutex<Option<(Instant, f64)>> = Mutex::new(None);
 
     fn pid() -> Option<String> {
+        // Read as a number, so a zero-padded pid (equal environment bytes
+        // across arms) reaches `kill` without its leading zeros.
         std::env::var("LAMBDA_VM_PROBE_FINISH_LOAD_PID")
             .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&pid| pid > 1)
+            .map(|pid| pid.to_string())
     }
 
     fn unix() -> f64 {
