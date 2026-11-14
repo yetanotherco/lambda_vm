@@ -1228,3 +1228,159 @@ extern "C" __global__ void fill_lfm_p1w16_socket(const uint64_t *__restrict__ na
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The lean BLAKE3 round table (`prover/src/lfm/blake3_lean.rs`, `fill_rounds`
+// and `fill_g`): rows `[skip, skip + rows)` of the table `ops` make, op `k`'s
+// round `r` at row `7k + r`; rows past the last op are zero (MU = 0). One
+// thread a row, so a column's stores coalesce: the thread runs the op's
+// rounds before its own, then writes its row. Standard 7-round BLAKE3 at
+// counter 0: the state starts `h ‖ IV[0..4] ‖ 0 ‖ 0 ‖ block_len ‖ flags`.
+// ---------------------------------------------------------------------------
+
+// One compression as the round table's records carry it (`fill.rs`, `B3lOpC`).
+struct B3lOpC {
+    uint32_t h[8];
+    uint32_t m[16];
+    uint32_t block_len;
+    uint32_t flags;
+    uint64_t tag;
+};
+static_assert(sizeof(B3lOpC) == 112, "B3lOpC is 112 bytes");
+static_assert(offsetof(B3lOpC, tag) == 104, "B3lOpC field order");
+
+namespace b3l {
+
+constexpr uint32_t ROUNDS = 7;
+constexpr uint32_t COLS = 379;
+// `round::` columns: preprocessed MU, TAG, RND; the input state's a words, b
+// bytes, c words, d bytes; the message; eight G-blocks of 40.
+constexpr uint32_t MU = 0, TAG = 1, RND = 2;
+constexpr uint32_t IA = 3, IB = 7, IC = 23, ID = 27, M = 43, G = 59, G_SIZE = 40;
+// Offsets inside a G-block.
+constexpr uint32_t A1 = 0, X1 = 4, C1 = 8, P2 = 12, A2 = 20, X3 = 24, C2 = 28, Z = 32, T = 36;
+static_assert(G + 8 * G_SIZE == COLS, "the round row's width");
+
+__constant__ uint32_t IV[8] = {0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+                               0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u};
+__constant__ uint8_t PERM[16] = {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8};
+// The (a, b, c, d) of a round's 8 G-calls: 4 column mixes, then 4 diagonal.
+__constant__ uint8_t GI[8][4] = {{0, 4, 8, 12}, {1, 5, 9, 13}, {2, 6, 10, 14}, {3, 7, 11, 15},
+                                 {0, 5, 10, 15}, {1, 6, 11, 12}, {2, 7, 8, 13}, {3, 4, 9, 14}};
+
+__device__ __forceinline__ uint32_t rotr(uint32_t x, uint32_t n) {
+    return (x >> n) | (x << (32u - n));
+}
+
+// One round over `v` with the round's message `m`.
+__device__ __forceinline__ void round(uint32_t *v, const uint32_t *m) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int a = GI[j][0], b = GI[j][1], c = GI[j][2], d = GI[j][3];
+        v[a] = v[a] + v[b] + m[2 * j];
+        v[d] = rotr(v[d] ^ v[a], 16);
+        v[c] = v[c] + v[d];
+        v[b] = rotr(v[b] ^ v[c], 12);
+        v[a] = v[a] + v[b] + m[2 * j + 1];
+        v[d] = rotr(v[d] ^ v[a], 8);
+        v[c] = v[c] + v[d];
+        v[b] = rotr(v[b] ^ v[c], 7);
+    }
+}
+
+// The next round's message: `m'[i] = m[PERM[i]]`.
+__device__ __forceinline__ void permute(uint32_t *m) {
+    uint32_t t[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) t[i] = m[PERM[i]];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) m[i] = t[i];
+}
+
+// A word's four bytes, low first, from `col`.
+__device__ __forceinline__ void bytes(const fill::RowWriter &w, uint32_t col, uint32_t x) {
+#pragma unroll
+    for (uint32_t k = 0; k < 4; ++k) w.word(col + k, (x >> (8 * k)) & 0xFFu);
+}
+
+}  // namespace b3l
+
+extern "C" __global__ void fill_b3l_round(const B3lOpC *ops, uint32_t nops, uint64_t skip,
+                                          uint64_t rows, uint64_t *out) {
+    namespace l = b3l;
+    const uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const fill::RowWriter w{out, rows, row};
+    const uint64_t at = skip + row;
+    const uint64_t op = at / l::ROUNDS;
+    const uint32_t r = (uint32_t)(at % l::ROUNDS);
+    if (op >= nops) {
+        w.zeros(0, l::COLS);
+        return;
+    }
+    const B3lOpC &o = ops[op];
+    uint32_t v[16], m[16];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = o.h[i];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[8 + i] = l::IV[i];
+    v[12] = 0;
+    v[13] = 0;
+    v[14] = o.block_len;
+    v[15] = o.flags;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) m[i] = o.m[i];
+    for (uint32_t rr = 0; rr < r; ++rr) {
+        l::round(v, m);
+        l::permute(m);
+    }
+
+    w.word(l::MU, 1);
+    w.word(l::TAG, o.tag);
+    w.word(l::RND, r);
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+        w.word(l::IA + i, v[i]);
+        l::bytes(w, l::IB + 4 * i, v[4 + i]);
+        w.word(l::IC + i, v[8 + i]);
+        l::bytes(w, l::ID + 4 * i, v[12 + i]);
+    }
+#pragma unroll
+    for (uint32_t k = 0; k < 16; ++k) w.word(l::M + k, m[k]);
+#pragma unroll
+    for (uint32_t j = 0; j < 8; ++j) {
+        const uint32_t base = l::G + j * l::G_SIZE;
+        const int a = l::GI[j][0], b = l::GI[j][1], c = l::GI[j][2], d = l::GI[j][3];
+        const uint32_t a1 = v[a] + v[b] + m[2 * j];
+        const uint32_t x1 = v[d] ^ a1;
+        const uint32_t d1 = l::rotr(x1, 16);
+        const uint32_t c1 = v[c] + d1;
+        const uint32_t x2 = v[b] ^ c1;
+        const uint32_t b1 = l::rotr(x2, 12);
+        const uint32_t a2 = a1 + b1 + m[2 * j + 1];
+        const uint32_t x3 = d1 ^ a2;
+        const uint32_t d2 = l::rotr(x3, 8);
+        const uint32_t c2 = c1 + d2;
+        const uint32_t z = b1 ^ c2;
+        const uint32_t b2 = l::rotr(z, 7);
+        l::bytes(w, base + l::A1, a1);
+        l::bytes(w, base + l::X1, x1);
+        l::bytes(w, base + l::C1, c1);
+#pragma unroll
+        for (uint32_t k = 0; k < 4; ++k) {
+            const uint32_t byte = (x2 >> (8 * k)) & 0xFFu;
+            w.word(base + l::P2 + 2 * k, byte & 15u);
+            w.word(base + l::P2 + 2 * k + 1, byte >> 4);
+        }
+        l::bytes(w, base + l::A2, a2);
+        l::bytes(w, base + l::X3, x3);
+        l::bytes(w, base + l::C2, c2);
+        l::bytes(w, base + l::Z, z);
+#pragma unroll
+        for (uint32_t k = 0; k < 4; ++k) w.word(base + l::T + k, (z >> (8 * k + 7)) & 1u);
+        v[a] = a2;
+        v[b] = b2;
+        v[c] = c2;
+        v[d] = d2;
+    }
+}

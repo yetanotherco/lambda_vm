@@ -67,6 +67,23 @@ const _: () = {
     assert!(std::mem::offset_of!(KeccakRndOp, input) == 8);
 };
 
+/// One standard 7-round BLAKE3 compression as the lean round table's fill
+/// reads it: the 7 rows of its rounds are a function of these alone.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct B3lRoundOp {
+    pub h: [u32; 8],
+    pub m: [u32; 16],
+    pub block_len: u32,
+    pub flags: u32,
+    pub tag: u64,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<B3lRoundOp>() == 112);
+    assert!(std::mem::offset_of!(B3lRoundOp, tag) == 104);
+};
+
 /// One cycle's executor log as CPU's fill reads it (the executor's `Log`,
 /// field for field): the pcs before and after, and the values it read and
 /// wrote.
@@ -440,6 +457,9 @@ pub enum RecordsFill<'a> {
     Shift { ops: Vec<&'a [ShiftOp]> },
     /// MEMW's rows: one an op of the pieces in order, then zero rows.
     Memw { ops: Vec<&'a [MemwOp]> },
+    /// The lean BLAKE3 round table's rows `[skip, skip + rows)` of the table
+    /// `ops` make, 7 rows an op; rows past the last op are zero.
+    B3lRound { ops: &'a [B3lRoundOp], skip: usize },
 }
 
 impl RecordsFill<'_> {
@@ -465,6 +485,7 @@ impl RecordsFill<'_> {
             Self::MemStore { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::Shift { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::Memw { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
+            Self::B3lRound { ops, .. } => std::mem::size_of_val(*ops),
         }
     }
 
@@ -481,6 +502,7 @@ impl RecordsFill<'_> {
             Self::MemStore { rows } => rows.iter().map(|p| p.len()).sum(),
             Self::Shift { ops } => ops.iter().map(|p| p.len()).sum(),
             Self::Memw { ops } => ops.iter().map(|p| p.len()).sum(),
+            Self::B3lRound { ops, .. } => ops.len(),
         }
     }
 
@@ -636,6 +658,17 @@ impl RecordsFill<'_> {
                             | u64::from(op.width) << 8
                             | u64::from(op.is_read) << 16,
                     );
+                }
+            }
+            Self::B3lRound { ops, skip } => {
+                each(8);
+                each(*skip as u64);
+                for op in ops.iter() {
+                    for pair in op.h.chunks_exact(2).chain(op.m.chunks_exact(2)) {
+                        each(u64::from(pair[0]) | u64::from(pair[1]) << 32);
+                    }
+                    each(u64::from(op.block_len) | u64::from(op.flags) << 32);
+                    each(op.tag);
                 }
             }
         }
