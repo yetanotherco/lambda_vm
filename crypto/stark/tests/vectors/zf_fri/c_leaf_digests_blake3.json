@@ -3,11 +3,11 @@
   "hash": "blake3",
   "codeword": "b_group_folds.json codeword",
   "leaves": [
-    {"d": 1, "first_leaf": "3e94099701015ba4b517b2da241e742be08d6247bc8863a07484aa134dd3c0b2", "layer_root": "ab6a1860afd95f056e99f36162ee961aec77ee8e14c4206b024c02f63a5a7f1e"},
-    {"d": 2, "first_leaf": "8a3a4601f36fa9c390e9d690a87c2c32ca8d039becd87497f2c7e6aeadda7a3f", "layer_root": "c5e6e011fd76656fa059479df53c33122b79894e95471ffab51dd6b6dedeb9a2"},
-    {"d": 3, "first_leaf": "b1ea4061930ffd7af7ea20c263e8c41e3cfc46202480b54945b302759e4fb8a9", "layer_root": "1f638946ead0713ced39f29587cb25f308f43a2db7443fe4fc12ee5574e2e930"},
-    {"d": 4, "first_leaf": "126e67d8deb4860e5a065a64b28319be8db0441a397dc716b2cc63b14dafacdc", "layer_root": "225d49f0dd2fc63dabf168f21825dd49dc08958ee89a3a1841db1dc2ab9e5fd7"},
-    {"d": 5, "first_leaf": "a420dd3555ee2d35e54094b728abb93ef1e441426c0fdac244a88f0e733d7438", "layer_root": "f6c327d2325176f17f157c40f345251b788f37377c65ea3d5eaa3f72e2af68d3"},
-    {"d": 6, "first_leaf": "3a1ad10b88c75a26d86a8898e00519c7bce95870d7d2f7be716d179393a124e7", "layer_root": "0f42251b7c5b0e388e761f3a35b319c455f9539adb59f7e725959b91ad0e3f5a"}
+    {"d": 1, "first_leaf": "fc6b5a1315464730b8df2452f92d09fea246257c366876babf94d266f816785c", "layer_root": "0af0827824c8784c3286f5744b5e0514771d2b0db2f9b7de166d683b53384926"},
+    {"d": 2, "first_leaf": "59b42ef6c0d099a5faf6bf79470aefb3b3ea8087b0aea63427bfda9783ba131b", "layer_root": "e353c8271fbaac2fd72ca9e9a82661d048153108f726d82c1cd4756966b6cc26"},
+    {"d": 3, "first_leaf": "bb9f33c99ebdb34d40ad3345833db10b9c6e938c456b0f75d8c44871983e8f8c", "layer_root": "a2dadf8e4b1e3ecbaa9f99882ac73b2564fa581ffcf364112021a0dbe9d5630d"},
+    {"d": 4, "first_leaf": "2342d11f08ebc2b15cb9e9d3e986273dfe6c7e3ac73002fd11e164ec48e7de84", "layer_root": "048c315bf842569f6c44900ff5f5f7be757e89e45f609076a3b549c012e9b840"},
+    {"d": 5, "first_leaf": "3589df551ad7cbcaeb8879b1e7599d17f608438e92ded33259acc21f9876e221", "layer_root": "d3d89cea298a6732cad6415934da5783538e073a5effa79ac0c6334a2d4a6419"},
+    {"d": 6, "first_leaf": "a2d4e57d011df4ee807c54bf4595850d3ee192cf8f154e044229637606733687", "layer_root": "c051ea4c767e7748c74500005ce3f03e06c38481bfbc0e725df3f33724d0edaa"}
   ]
 }
