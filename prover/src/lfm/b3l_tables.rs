@@ -251,7 +251,7 @@ pub fn fill_hold() -> B3lHold {
 
 /// One lean table as the host holds it.
 pub enum HeldTable {
-    Wide(TraceTable<F, E>),
+    Wide(Box<TraceTable<F, E>>),
     Narrow(multilinear::narrow::NarrowColumns),
 }
 
@@ -259,7 +259,7 @@ impl HeldTable {
     /// `rows` row-major rows of `width` cells, held as `hold` says.
     fn from_rows(data: Vec<FE>, width: usize, hold: B3lHold) -> Self {
         match hold {
-            B3lHold::Wide => HeldTable::Wide(TraceTable::new_main(data, width, 1)),
+            B3lHold::Wide => HeldTable::Wide(Box::new(TraceTable::new_main(data, width, 1))),
             B3lHold::Narrow => {
                 use math::field::traits::IsPrimeField;
                 let words: Vec<u64> = data
@@ -309,7 +309,7 @@ impl HeldTable {
     pub fn take(&mut self) -> HeldTable {
         core::mem::replace(
             self,
-            HeldTable::Wide(TraceTable::new_main(Vec::new(), 1, 1)),
+            HeldTable::Wide(Box::new(TraceTable::new_main(Vec::new(), 1, 1))),
         )
     }
 
@@ -317,7 +317,7 @@ impl HeldTable {
     #[cfg(test)]
     pub fn wide_mut(&mut self) -> Option<&mut TraceTable<F, E>> {
         match self {
-            HeldTable::Wide(t) => Some(t),
+            HeldTable::Wide(t) => Some(t.as_mut()),
             HeldTable::Narrow(_) => None,
         }
     }
@@ -564,7 +564,7 @@ pub fn build_b3l_traces_held(
 
     let table = lean::table_trace(&hist);
     let table = match hold {
-        B3lHold::Wide => HeldTable::Wide(table),
+        B3lHold::Wide => HeldTable::Wide(Box::new(table)),
         B3lHold::Narrow => {
             let width = table::NUM_COLUMNS;
             HeldTable::from_rows(table.main_table.row_major_data().to_vec(), width, hold)
