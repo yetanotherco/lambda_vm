@@ -136,6 +136,14 @@ pub fn emit_wlfm_leg(
         );
     }
     let a = &child.artifacts;
+    // ⛔ The in-guest walk replays the block family's hash (Poseidon1) only: a
+    // child under another family is refused, never walked under the wrong one.
+    if a.family != super::wlfm::WlfmFamily::P1 {
+        return Err(format!(
+            "a W-leg walks a Poseidon1 child; this one is {:?}",
+            a.family
+        ));
+    }
     let airs = a.airs();
     let refs = airs.air_refs();
     let shapes = a.shapes(&airs);

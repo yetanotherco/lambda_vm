@@ -4563,6 +4563,7 @@ pub fn verify_whir_block_compressed_compact_proof(
             final_poly: super::compress::COMPRESS_FINAL,
             fold: None,
             grind: None,
+            family: crate::lfm::wlfm::WlfmFamily::P1,
         },
     )
 }
@@ -4581,6 +4582,7 @@ pub fn verify_whir_block_compressed_compact_evaluated_proof(
             final_poly: super::compress::COMPRESS_FINAL,
             fold: None,
             grind: None,
+            family: crate::lfm::wlfm::WlfmFamily::P1,
         },
     )
 }
@@ -4601,6 +4603,7 @@ pub fn verify_whir_block_compressed_compact_final_proof(
             ),
             fold: None,
             grind: None,
+            family: crate::lfm::wlfm::WlfmFamily::P1,
         },
     )
 }
@@ -4621,6 +4624,7 @@ pub fn verify_whir_block_compressed_compact_evaluated_final_proof(
             ),
             fold: None,
             grind: None,
+            family: crate::lfm::wlfm::WlfmFamily::P1,
         },
     )
 }
@@ -4659,6 +4663,7 @@ pub fn verify_whir_block_compressed_proof(
             final_poly: super::compress::COMPRESS_FINAL,
             fold: None,
             grind: None,
+            family: crate::lfm::wlfm::WlfmFamily::P1,
         },
         &proof.compressed,
     )
@@ -4687,6 +4692,7 @@ pub fn verify_whir_block_compressed_evaluated_proof(
             final_poly: super::compress::COMPRESS_FINAL,
             fold: None,
             grind: None,
+            family: crate::lfm::wlfm::WlfmFamily::P1,
         },
         &proof.compressed,
     )
@@ -4715,6 +4721,7 @@ pub fn verify_whir_block_compressed_final_proof(
             ),
             fold: None,
             grind: None,
+            family: crate::lfm::wlfm::WlfmFamily::P1,
         },
         &proof.compressed,
     )
@@ -4740,6 +4747,7 @@ pub fn verify_whir_block_compressed_evaluated_final_proof(
             ),
             fold: None,
             grind: None,
+            family: crate::lfm::wlfm::WlfmFamily::P1,
         },
         &proof.compressed,
     )
@@ -5334,6 +5342,7 @@ mod tests {
                     final_poly: six,
                     fold: None,
                     grind: None,
+                    family: crate::lfm::wlfm::WlfmFamily::P1,
                 },
                 PIPELINE_WHIR_COMPRESSED_FINAL,
                 verify_whir_block_compressed_final_proof,
@@ -5344,6 +5353,7 @@ mod tests {
                     final_poly: six,
                     fold: None,
                     grind: None,
+                    family: crate::lfm::wlfm::WlfmFamily::P1,
                 },
                 PIPELINE_WHIR_COMPRESSED_EVALUATED_FINAL,
                 verify_whir_block_compressed_evaluated_final_proof,
@@ -5398,6 +5408,7 @@ mod tests {
                     final_poly: six,
                     fold: None,
                     grind: None,
+                    family: crate::lfm::wlfm::WlfmFamily::P1,
                 },
                 PIPELINE_WHIR_COMPRESSED_COMPACT_FINAL,
                 verify_whir_block_compressed_compact_final_proof,
@@ -5408,6 +5419,7 @@ mod tests {
                     final_poly: six,
                     fold: None,
                     grind: None,
+                    family: crate::lfm::wlfm::WlfmFamily::P1,
                 },
                 PIPELINE_WHIR_COMPRESSED_COMPACT_EVALUATED_FINAL,
                 verify_whir_block_compressed_compact_evaluated_final_proof,
@@ -5460,6 +5472,7 @@ mod tests {
                     final_poly: six,
                     fold: None,
                     grind: None,
+                    family: crate::lfm::wlfm::WlfmFamily::P1,
                 }),
                 PIPELINE_WHIR_COMPRESSED_DEDUP_FINAL,
             ),
@@ -5469,6 +5482,7 @@ mod tests {
                     final_poly: six,
                     fold: None,
                     grind: None,
+                    family: crate::lfm::wlfm::WlfmFamily::P1,
                 }),
                 PIPELINE_WHIR_COMPRESSED_DEDUP_EVALUATED_FINAL,
             ),
@@ -5557,6 +5571,7 @@ mod tests {
                 final_poly: FinalPoly::Vars(4),
                 fold: None,
                 grind: None,
+                family: crate::lfm::wlfm::WlfmFamily::P1,
             })
             .is_err()
         );
