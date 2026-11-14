@@ -983,7 +983,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// also hand each out with the run's ECALL cycles over its rows' span
     /// ([`multilinear::records::TableRecords::ecall_cycles`]), for the card
     /// to build its register rows from the CPU logs
-    /// (`LAMBDA_VM_CARD_ROWS=registers`). Each walker reads its window's
+    /// (the card's `registers` mode, a test's). Each walker reads its window's
     /// ECALL cycles from the window's history, so only windows walked from
     /// the executor's history carry them; one that comes without them stops
     /// them for the rest of the run. Before the first window only. The

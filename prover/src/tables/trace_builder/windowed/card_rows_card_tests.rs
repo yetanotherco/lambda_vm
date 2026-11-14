@@ -1,8 +1,9 @@
 //! ★ The card-built rows' upload on the card (`math_cuda::card_rows`,
-//! `LAMBDA_VM_CARD_ROWS`); `registers` (MEMW_R's rows built from the logs) at
-//! the end of the file: a
+//! `LAMBDA_VM_CARD_ROWS`); `registers` (MEMW_R's rows built from the logs, a
+//! mode only a test sets) at the end of the file: a
 //! group's upload in the knob's `order` (every copy, then every kernel) and
-//! `derive` (CPU logs kept on the card; LOAD and STORE derived from them)
+//! the test's `derive` (CPU logs kept on the card; LOAD and STORE derived from
+//! them, as `words` derives them)
 //! writes the words today's upload writes, group by group, in the hand-out's
 //! order and again in the reverse order (phase B's re-uploads, with the cache
 //! holding other chunks than the ones asked for). Each test says that the

@@ -4450,10 +4450,11 @@ pub fn card_reserved_peak() -> Option<u64> {
     }
 }
 
-/// Whether the card builds MEMW_R's register rows
-/// (`LAMBDA_VM_CARD_ROWS=registers`): a block's build then hands its MEMW_R
-/// chunks out with their ECALL cycles, when its run has a history. `false`
-/// without the card.
+/// Whether the card builds MEMW_R's register rows from a host plan (the
+/// `registers` mode, which only a test's override sets; no word of
+/// `LAMBDA_VM_CARD_ROWS` does): a block's build then hands its MEMW_R chunks
+/// out with their ECALL cycles, when its run has a history. `false` without
+/// the card.
 pub fn card_rows_builds_registers() -> bool {
     #[cfg(feature = "cuda")]
     {

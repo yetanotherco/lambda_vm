@@ -1,8 +1,10 @@
 //! A group's upload under
 //! `LAMBDA_VM_CARD_ROWS` (read once). Unset is `words`, the default (below);
-//! `0` or `off` is the upload as it was before
+//! `order` is the next item; `0` or `off` is the upload as it was before
 //! (`DeviceColumns::upload_tables_today`), byte for byte and call for call.
-//! Every mode writes the same words.
+//! The knob takes no other word. `derive` and `registers` are modes a test
+//! sets ([`set_mode_override`]), no longer settings. Every mode writes the
+//! same words.
 //!
 //! - `order`: every copy of the group first, then every kernel, then the one
 //!   sync and the one check readback the upload already makes. Today each
@@ -10,7 +12,7 @@
 //!   be filled; beside a running commit each such wait costs up to what the
 //!   commit has queued ahead (a probe beside a looping commit measured the
 //!   table-by-table upload at about two commit periods, this order at 1.3).
-//! - `derive`: `order`, and the card keeps the CPU chunks' logs it receives
+//! - `derive` (a test's mode; `words` does it too): `order`, and the card keeps the CPU chunks' logs it receives
 //!   (an LRU cache of whole CPU tables, `LAMBDA_VM_CARD_ROWS_CACHE_MIB`,
 //!   default 768, each entry promised to the backend's ledger), fills a CPU
 //!   table it already holds without copying its logs again, and derives a
@@ -20,7 +22,7 @@
 //!   timestamps. One launch for a group's LOAD tables and one for its STORE
 //!   tables. A table whose cycles the cache does not hold, after this group's
 //!   CPU tables are in it, goes up as records, as today.
-//! - `registers` (opt-in): `derive`, and MEMW_R's register rows built on the
+//! - `registers` (a test's mode): `derive`, and MEMW_R's register rows built on the
 //!   card from the same cached logs (`derive_registers_from_cache`). Each row
 //!   crosses as one word, its timestamp and its old timestamp (8 bytes against
 //!   32), read from the rows the host holds ([`plan_registers`]). The card
@@ -81,9 +83,12 @@ pub enum Mode {
     Off,
     /// Every copy, then every kernel.
     Order,
-    /// [`Mode::Order`], CPU logs kept on the card, LOAD and STORE derived.
+    /// [`Mode::Order`], CPU logs kept on the card, LOAD and STORE derived. A
+    /// test's mode ([`set_mode_override`]); no word of the knob sets it.
     Derive,
-    /// [`Mode::Derive`], and MEMW_R's register rows built on the card.
+    /// [`Mode::Derive`], and MEMW_R's register rows built on the card from a
+    /// host plan ([`plan_registers`]). A test's mode; no word of the knob sets
+    /// it.
     Registers,
     /// [`Mode::Derive`], and MEMW_R's register rows built on the card from
     /// the words the walk writes in their place (no host plan): the default.
@@ -94,17 +99,15 @@ impl Mode {
     /// The knob's reading: unset (or empty) or `words` is [`Mode::Words`],
     /// the default (measured on whole blocks against `order`: −0.42 s on a
     /// median one, −1.66 s on a large one); `order` is [`Mode::Order`];
-    /// `0` or `off` is [`Mode::Off`]; `derive` or `1` is [`Mode::Derive`];
-    /// `registers` is [`Mode::Registers`]. Anything else is refused.
+    /// `0` or `off` is [`Mode::Off`]. Anything else (`derive`, `1` and
+    /// `registers` among them) is refused.
     pub fn parse(word: Option<&str>) -> Result<Self, String> {
         match word.map(str::trim) {
             None | Some("") | Some("words") => Ok(Self::Words),
             Some("order") => Ok(Self::Order),
             Some("0") | Some("off") => Ok(Self::Off),
-            Some("derive") | Some("1") => Ok(Self::Derive),
-            Some("registers") => Ok(Self::Registers),
             Some(other) => Err(format!(
-                "{CARD_ROWS_ENV}={other}: expected off, order, derive, registers or words"
+                "{CARD_ROWS_ENV}={other}: expected off, order or words"
             )),
         }
     }
@@ -1974,12 +1977,13 @@ mod tests {
         assert_eq!(Mode::parse(Some("0")), Ok(Mode::Off));
         assert_eq!(Mode::parse(Some("off")), Ok(Mode::Off));
         assert_eq!(Mode::parse(Some("order")), Ok(Mode::Order));
-        assert_eq!(Mode::parse(Some(" derive ")), Ok(Mode::Derive));
-        assert_eq!(Mode::parse(Some("1")), Ok(Mode::Derive));
-        assert_eq!(Mode::parse(Some("registers")), Ok(Mode::Registers));
-        assert!(Mode::parse(Some("yes")).is_err());
-        assert!(Mode::parse(Some("Derive")).is_err());
-        assert!(Mode::parse(Some("2")).is_err());
+        // The removed settings are refused like any other word, by a message
+        // that names the knob's words.
+        for bad in ["derive", " derive ", "1", "registers", "yes", "Derive", "2"] {
+            let err = Mode::parse(Some(bad)).expect_err(bad);
+            assert!(err.contains(CARD_ROWS_ENV), "{err}");
+            assert!(err.contains("off, order or words"), "{err}");
+        }
         assert!(Mode::Registers.derives() && Mode::Derive.derives());
         assert!(!Mode::Order.derives() && !Mode::Off.derives());
         assert!(Mode::Words.derives());

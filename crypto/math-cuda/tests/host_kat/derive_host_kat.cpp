@@ -1,6 +1,6 @@
 // Known-answer replay of `kernels/card_rows.cu`'s `derive_registers_from_cache`
 // (MEMW_R's register rows built on the card from the CPU logs it holds,
-// `LAMBDA_VM_CARD_ROWS=registers`), run on the host.
+// a test's `registers` mode and the `words` default), run on the host.
 //
 // WHY THIS EXISTS. The card test checks the kernel on a GPU; this checks its
 // arithmetic and indexing without one, before a GPU run is spent on it. The
