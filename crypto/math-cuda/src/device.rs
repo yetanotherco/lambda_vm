@@ -1042,8 +1042,8 @@ impl Backend {
         let whir_fold = ctx.load_module(Ptx::from_binary(WHIR_FOLD_CUBIN.to_vec()))?;
 
         // The stream classes (`LAMBDA_VM_STREAM_CLASSES`): off, every stream as
-        // it always was; otherwise a background pool beside the pool, under
-        // `priority` the pool at the device's greatest priority and the
+        // it always was; `priority` (the default), a background pool beside
+        // the pool, the pool at the device's greatest priority and the
         // background at its least.
         let classes = crate::stream_class::setting();
         let (foreground_priority, background_priority) = match classes {
@@ -1052,7 +1052,7 @@ impl Backend {
                 let (least, greatest) = cudarc::driver::result::stream::get_priority_range()?;
                 (Some(greatest), Some(least))
             }
-            _ => (None, None),
+            crate::stream_class::StreamClasses::Off => (None, None),
         };
         let make_stream = |priority: Option<i32>| match priority {
             Some(p) => ctx.new_stream_with_priority(p),

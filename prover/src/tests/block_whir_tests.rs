@@ -1916,18 +1916,18 @@ fn the_phase_b_overlap_readout_names_its_transitions() {
     );
 }
 
-/// ★ On a card with a background pool (`LAMBDA_VM_STREAM_CLASSES=equal` or
+/// ★ On a card with a background pool (`LAMBDA_VM_STREAM_CLASSES` unset or
 /// `priority`), every stream the openings beside an argue draw is a
 /// background one: as many as the same group's openings drew alone, all of
 /// them foreground, with the overlap off. A device call they made from
 /// another thread would draw a foreground stream and show here as fewer.
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "box: needs a card and LAMBDA_VM_STREAM_CLASSES=equal"]
+#[ignore = "box: needs a card and the stream classes on (the default)"]
 fn phase_b_overlap_openings_draw_background_streams() {
     assert!(
         math_cuda::stream_class::setting().split(),
-        "run with LAMBDA_VM_STREAM_CLASSES=equal or priority"
+        "run with LAMBDA_VM_STREAM_CLASSES unset or priority"
     );
     let elf = asm_elf_bytes("test_keccak_multi");
     let mut format = many_groups();
