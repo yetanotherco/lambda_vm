@@ -410,11 +410,13 @@ pub fn block_statement_tag(base: &BaseFormat) -> Vec<u8> {
     if P1_TAG_OMITTED.with(std::cell::Cell::get) {
         return MULTILINEAR_BLOCK_TAG.to_vec();
     }
-    // The 7-round BLAKE3 base's binary trees: their cap is the format's
-    // binary one, a verifier-side constant as under RPX before Poseidon1.
+    // The 7-round BLAKE3 base's binary trees: their cap is the base's own,
+    // [`B3_BASE_CAP`], a verifier-side constant, and the tag names it so no
+    // two BLAKE3 geometries share a tag either.
     if *base == BaseFormat::B3_WHIR {
         let mut tag = MULTILINEAR_BLOCK_TAG.to_vec();
         tag.extend_from_slice(B3_BASE_TAG_SUFFIX);
+        tag.extend_from_slice(format!("/C{B3_BASE_CAP}").as_bytes());
         return tag;
     }
     let height = match base.arity4_cap {
@@ -428,8 +430,21 @@ pub fn block_statement_tag(base: &BaseFormat) -> Vec<u8> {
 }
 
 /// The 7-round BLAKE3 base's statement tag after
-/// `LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V2` (see [`block_statement_tag`]).
+/// `LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V2` (see [`block_statement_tag`]),
+/// before its cap height.
 pub const B3_BASE_TAG_SUFFIX: &[u8] = b"/B3R7";
+
+/// The 7-round BLAKE3 base's binary cap height: every tree of its chains is
+/// cut to a cap of `2^8` nodes (or to the tree itself, when it is shallower),
+/// whatever the process's binary cap knob says. A verifier-side constant,
+/// named in the statement tag ([`block_statement_tag`]).
+///
+/// ★ Why 8 and not the binary default's height (3 at production): a tree a
+/// query phase opens `Q = 229` times (round 0) or `2Q` (a successor) pays one
+/// parent a walked level an opening, against `2^c − 1` parents for its cap
+/// once; past about 8 the cap costs more than the levels it saves. The base's
+/// proof carries the cap's nodes (≈ 8 KB a tree).
+pub const B3_BASE_CAP: u8 = 8;
 
 #[cfg(test)]
 thread_local! {
@@ -571,6 +586,10 @@ impl BlockFormat {
     /// of a block builds its config here.
     pub fn chain_config(&self, shapes: &[(usize, usize)]) -> ChainConfig {
         let mut config = chain_config_under(&self.zf, shapes);
+        // The BLAKE3 base's binary trees take its own cap ([`B3_BASE_CAP`]).
+        if self.zf.base == BaseFormat::B3_WHIR {
+            config.format.cap = CapPolicy::Fixed(B3_BASE_CAP);
+        }
         config.format.argue = self.argue;
         config.format.group = self.group;
         config.format.leaves = self.zf.whir_leaves;
