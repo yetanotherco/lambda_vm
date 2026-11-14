@@ -139,7 +139,10 @@ fn an_in_row_block_proves_and_verifies() {
 #[test]
 fn each_register_format_refuses_the_others_proof() {
     let elf = asm_elf_bytes("keep_alive_regs");
-    let today = BlockFormat::production();
+    let today = BlockFormat {
+        registers: RegisterFormat::Tokens32,
+        ..BlockFormat::production()
+    };
     let in_row_proof = prove(&elf, &in_row());
     let today_proof = prove(&elf, &today);
     assert!(verifies(&in_row_proof, &elf, &in_row()));

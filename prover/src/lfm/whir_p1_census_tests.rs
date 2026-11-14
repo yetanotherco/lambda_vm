@@ -67,10 +67,17 @@ const MEDIAN_MIX: &[(&str, &[(usize, usize)])] = &[
     ("CPU32", &[(1 << 20, 1)]),
 ];
 const MEDIAN_PAGES: usize = 198;
+/// MEMW_R's slot under the in-row register format (the production one): the
+/// residual register table, one table (the median block's 1.24 M rows of
+/// word instructions', chips', HALT's accesses and keep-alives), in place of
+/// [`MEDIAN_MIX`]'s MEMW_R tables.
+const MEDIAN_RESIDUAL: &[(usize, usize)] = &[(1 << 21, 1)];
 const RUNTIME_PAGE_BASE: u64 = 0x4000_0000;
 
 /// The statement of [`MEDIAN_MIX`] over `elf_bytes`, its groups packed as the
-/// prover packs them ([`stark::multilinear_block::block_groups`]).
+/// prover packs them ([`stark::multilinear_block::block_groups`]), its tables
+/// in `format`'s register form (under the in-row one, MEMW_R's slot is
+/// [`MEDIAN_RESIDUAL`] and the CPU, REGISTER and HALT take their in-row AIRs).
 pub(crate) fn median_statement(
     elf_bytes: &[u8],
     opts: &crate::ProofOptions,
@@ -103,8 +110,14 @@ pub(crate) fn median_statement(
         is_wh: 0,
         ecrec: 0,
     };
+    let in_row = format.registers == crate::tables::register::RegisterFormat::InRow;
     let mut rows: Vec<usize> = vec![32; crate::FIXED_TABLE_COUNT];
     for &(kind, runs) in MEDIAN_MIX {
+        let runs = if in_row && kind == "MEMW_R" {
+            MEDIAN_RESIDUAL
+        } else {
+            runs
+        };
         if kind == "PAGE" {
             // Every page table is one row a byte of its page (`page::DEFAULT_PAGE_SIZE`).
             rows.extend(std::iter::repeat_n(
@@ -152,7 +165,7 @@ pub(crate) fn median_statement(
         rows.len(),
     )
     .expect("page configs");
-    let airs = crate::VmAirs::new(
+    let mut airs = crate::VmAirs::new(
         &elf,
         opts,
         false,
@@ -164,6 +177,11 @@ pub(crate) fn median_statement(
         None,
         crate::test_utils::halted_register_commitment(opts, &elf, &[]).preprocessed(),
     );
+    if in_row {
+        let inputs = crate::BlockAirInputs::new(opts, &elf, vec![4; counts.cpu], &[])
+            .expect("the block's inputs");
+        airs.swap_in_row_registers(opts, &inputs);
+    }
     // The fixed tables at their preprocessed columns' heights, so group 0
     // emits too (HALT, which has none, stays at the placeholder).
     for (i, air) in airs
