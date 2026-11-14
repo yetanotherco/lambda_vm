@@ -40,6 +40,7 @@ use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // =========================================================================
@@ -353,9 +354,45 @@ pub fn generate_page_trace_from_dense(
         cols::NUM_COLUMNS,
         1,
     );
-    let table = &mut trace.main_table;
+    fill_page(&mut trace.main_table, config, final_page, exclude_touched);
+    trace
+}
 
-    for offset in 0..page_size {
+/// The PAGE kind's widths so far ([`generate_page_trace_from_dense_as`]).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_page_trace_from_dense`] in `form`: under [`TraceForm::Narrow`]
+/// the packed columns are written straight from the page ([`generate_main!`]),
+/// with no 64-bit table between; the packed bytes are those of packing
+/// [`generate_page_trace_from_dense`]'s table.
+pub fn generate_page_trace_from_dense_as(
+    config: &PageConfig,
+    final_page: Option<&[(u8, u64)]>,
+    exclude_touched: bool,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let page_size = DEFAULT_PAGE_SIZE;
+    assert!(
+        config.page_base.is_multiple_of(page_size as u64),
+        "Page base must be page-aligned"
+    );
+    if let Some(page) = final_page {
+        debug_assert_eq!(page.len(), page_size, "dense page slice must span the page");
+    }
+    generate_main!(form, &WIDTHS, page_size, cols::NUM_COLUMNS, |table| {
+        fill_page(table, config, final_page, exclude_touched)
+    })
+}
+
+/// A PAGE table's rows: each offset, its init byte, and its final byte and
+/// timestamp.
+fn fill_page(
+    table: &mut impl VmTable,
+    config: &PageConfig,
+    final_page: Option<&[(u8, u64)]>,
+    exclude_touched: bool,
+) {
+    for offset in 0..DEFAULT_PAGE_SIZE {
         table.set_u64(offset, cols::OFFSET, offset as u64);
 
         let init_value = config
@@ -370,8 +407,6 @@ pub fn generate_page_trace_from_dense(
         table.set_byte(offset, cols::FINI, fini_value);
         table.set_dword_wl(offset, cols::TIMESTAMP_LO, fini_ts);
     }
-
-    trace
 }
 
 // =========================================================================

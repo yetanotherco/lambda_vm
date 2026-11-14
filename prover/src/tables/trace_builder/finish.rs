@@ -2118,6 +2118,27 @@ const FAMILIES: [(&str, usize); 29] = [
     ("CPU32", cpu32::cols::NUM_COLUMNS),
 ];
 
+/// Which of the finish's tables are written straight into their packed form
+/// rather than built at 8 bytes a cell and packed after: PAGE
+/// (`LAMBDA_VM_FINISH_PAGE_DIRECT=1`) and BITWISE, its multiplicities in the
+/// same pass (`LAMBDA_VM_FINISH_BITWISE_DIRECT=1`). Off unless set; either way
+/// the tables' packed bytes are the same, and only under the packed form
+/// ([`TraceForm::Narrow`]) does a setting change how they are written.
+#[derive(Clone, Copy)]
+struct FinishDirect {
+    page: bool,
+    bitwise: bool,
+}
+
+fn finish_direct() -> FinishDirect {
+    static DIRECT: std::sync::OnceLock<FinishDirect> = std::sync::OnceLock::new();
+    let on = |name: &str| std::env::var(name).is_ok_and(|v| v.trim() == "1");
+    *DIRECT.get_or_init(|| FinishDirect {
+        page: on("LAMBDA_VM_FINISH_PAGE_DIRECT"),
+        bitwise: on("LAMBDA_VM_FINISH_BITWISE_DIRECT"),
+    })
+}
+
 /// [`FAMILIES`]' index of a family.
 fn family(name: &str) -> usize {
     FAMILIES
@@ -2331,6 +2352,7 @@ impl<'a> FinishPlan<'a> {
             TraceForm::Wide
         };
         let tails = skip.tails;
+        let (direct_page, direct_bitwise) = (finish_direct().page, finish_direct().bitwise);
         let byte_checks = padding_byte_checks(shift_ops.len(), keccak_ops.len(), max_rows, &skip);
         let p4_mode = P4Mode::of(&skip);
         // BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables as each
@@ -2430,6 +2452,9 @@ impl<'a> FinishPlan<'a> {
                     }
                 };
                 note_bitwise(&histogram, from);
+                if direct_bitwise && form == TraceForm::Narrow {
+                    return Ok(histogram.trace_as(form));
+                }
                 let mut table = bitwise::generate_bitwise_trace();
                 histogram.fill_multiplicities(&mut table);
                 Ok(packed_if(pack, table))
@@ -2730,6 +2755,14 @@ impl<'a> FinishPlan<'a> {
                 family: family("PAGE"),
                 rows: page::DEFAULT_PAGE_SIZE,
                 job: Box::new(move || {
+                    if direct_page && form == TraceForm::Narrow {
+                        return Ok(page_trace_as(
+                            &configs[k],
+                            memory_state,
+                            l2g_memory_bookend,
+                            form,
+                        ));
+                    }
                     Ok(packed_if(
                         pack,
                         page_trace(&configs[k], memory_state, l2g_memory_bookend),
