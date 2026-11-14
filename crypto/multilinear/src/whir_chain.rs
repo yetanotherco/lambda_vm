@@ -1798,6 +1798,15 @@ where
         }
     }
 
+    /// The message these rounds bound, read back from a card in one copy;
+    /// `None` when these factors are not on one.
+    fn device_message(&mut self) -> Result<Option<Mle<E>>, Error> {
+        match self {
+            Self::Device(device) => Ok(Some(Mle::new(device.message_to_host::<E>()?)?)),
+            _ => Ok(None),
+        }
+    }
+
     /// The successor a `levels`-level fold of `codeword` would make, encoded
     /// from the message these rounds bound — on a device, when the factors and
     /// the codeword are both there, unless `gpu::encode_successor_in_effect` off.
@@ -2711,6 +2720,10 @@ where
     if let Some(message) = factors.host_message() {
         return Ok(message.clone());
     }
+    // On a card: one copy of the whole cube, not one folded copy a value.
+    if let Some(message) = factors.device_message()? {
+        return Ok(message);
+    }
     let values = (0..1usize << rem)
         .map(|i| factors.evaluate_message(&hypercube_point::<E>(i, rem)))
         .collect::<Result<Vec<_>, _>>()?;
@@ -3615,6 +3628,55 @@ mod tests {
 
     fn transcript() -> DefaultTranscript<F> {
         DefaultTranscript::<F>::new(b"whir-chain-test")
+    }
+
+    /// ★ On a card, the message a chain's rounds leave reads back in ONE copy
+    /// as exactly the values the per-point evaluation gives, cube index by
+    /// cube index, and the final round's message (`message_values`) takes
+    /// that copy. Box tier: without a card the opening stays on the host and
+    /// the test fails rather than pass there.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a card; box tier"]
+    fn a_card_message_reads_back_as_its_per_point_values() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+        type X = FieldElement<Ext3>;
+        // The card's opening threshold, folded down to a final round's 2^9.
+        let (n, rem) = (12usize, 9usize);
+        let word = |i: u64, k: u64| {
+            FE::from(
+                i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(k.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+                    >> 1,
+            )
+        };
+        let message = Mle::new((0..1u64 << n).map(|i| word(i, 0)).collect()).expect("message");
+        let weight = Mle::new(
+            (0..1u64 << n)
+                .map(|i| X::new([word(i, 1), word(i, 2), word(i, 3)]))
+                .collect(),
+        )
+        .expect("weight");
+        let mut factors = Factors::<F, Ext3>::new(&message, weight).expect("factors");
+        assert!(
+            matches!(factors, Factors::Device(_)),
+            "no card took the opening: this test needs one"
+        );
+        let mut t = DefaultTranscript::<Ext3>::new(b"card-message-read-back");
+        factors.rounds(n - rem, &mut t).expect("rounds");
+        let read = factors
+            .device_message()
+            .expect("reads back")
+            .expect("the factors are on the card");
+        assert_eq!(read.num_vars(), rem);
+        for i in 0..1usize << rem {
+            let each = factors
+                .evaluate_message(&hypercube_point::<Ext3>(i, rem))
+                .expect("evaluates");
+            assert_eq!(read.evals()[i], each, "cube index {i}");
+        }
+        let values = message_values(&mut factors, rem).expect("the final round's values");
+        assert_eq!(values.evals(), read.evals());
     }
 
     /// The current codeword's blocks, whichever variant holds them. In these
