@@ -4855,6 +4855,12 @@ struct StreamAirs {
     cpus: Vec<std::sync::OnceLock<Box<[std::sync::OnceLock<crate::VmAir>]>>>,
     /// The CPU chunk height (`MaxRowsConfig::cpu`).
     cpu_rows: usize,
+    /// The run's register format: under
+    /// [`RegisterFormat::InRow`](crate::tables::register::RegisterFormat::InRow)
+    /// a CPU chunk is laid out with the in-row CPU AIR and MEMW_R's chunks
+    /// with the residual register table's, as [`crate::block_airs`] builds
+    /// them for the verifier.
+    registers: crate::tables::register::RegisterFormat,
     opts: ProofOptions,
     memw_register: crate::VmAir,
     memw_aligned: crate::VmAir,
@@ -4878,7 +4884,9 @@ impl StreamAirs {
         cpu_rows: usize,
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
+        registers: crate::tables::register::RegisterFormat,
     ) -> Self {
+        use crate::tables::register::RegisterFormat;
         use crate::test_utils::*;
         // As many CPU tables as a run's rows allow (`tables::cpu::MAX_CPU_ROWS`).
         let most = (crate::tables::cpu::MAX_CPU_ROWS as usize).div_ceil(cpu_rows.max(1));
@@ -4888,8 +4896,12 @@ impl StreamAirs {
                 .map(|_| std::sync::OnceLock::new())
                 .collect(),
             cpu_rows,
+            registers,
             opts: opts.clone(),
-            memw_register: Box::new(create_memw_register_air(opts)),
+            memw_register: match registers {
+                RegisterFormat::Tokens32 => Box::new(create_memw_register_air(opts)),
+                RegisterFormat::InRow => Box::new(create_register_residual_air(opts)),
+            },
             memw_aligned: Box::new(create_memw_aligned_air_for(opts, memw_aligned)),
             memw: Box::new(create_memw_air(opts)),
             load: Box::new(create_load_air(opts)),
@@ -4917,17 +4929,26 @@ impl StreamAirs {
         Ok(page[index % CPU_AIR_PAGE]
             .get_or_init(|| {
                 let ts_base = crate::tables::cpu::TIMESTAMP_STRIDE * (index * self.cpu_rows) as u64;
-                Box::new(
-                    crate::test_utils::create_cpu_air(&self.opts, ts_base)
-                        .with_name(&format!("CPU[{index}]"))
-                        .with_lazy_preprocessed_columns(
-                            crate::tables::cpu::lazy_timestamp_commitment(&self.opts, height),
-                            crate::tables::cpu::NUM_PRECOMPUTED_COLS,
-                            std::sync::Arc::new(move || {
-                                vec![crate::tables::cpu::timestamp_column(height)]
-                            }),
-                        ),
-                )
+                let opts = &self.opts;
+                let name = format!("CPU[{index}]");
+                let commitment = crate::tables::cpu::lazy_timestamp_commitment(opts, height);
+                let columns: std::sync::Arc<
+                    dyn Fn() -> Vec<Vec<crate::tables::types::FE>> + Send + Sync,
+                > = std::sync::Arc::new(move || vec![crate::tables::cpu::timestamp_column(height)]);
+                let cols = crate::tables::cpu::NUM_PRECOMPUTED_COLS;
+                match self.registers {
+                    crate::tables::register::RegisterFormat::Tokens32 => Box::new(
+                        crate::test_utils::create_cpu_air(opts, ts_base)
+                            .with_name(&name)
+                            .with_lazy_preprocessed_columns(commitment, cols, columns),
+                    )
+                        as crate::VmAir,
+                    crate::tables::register::RegisterFormat::InRow => Box::new(
+                        crate::test_utils::create_cpu_air_inrow(opts, ts_base)
+                            .with_name(&name)
+                            .with_lazy_preprocessed_columns(commitment, cols, columns),
+                    ),
+                }
             })
             .as_ref())
     }
@@ -6095,6 +6116,7 @@ fn prove_streamed(
         options.max_rows.cpu,
         format.keccak_rnd,
         format.memw_aligned,
+        format.registers,
     );
     // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
     // it — its chunks generated packed. The disk store's knob, which used to
@@ -9912,6 +9934,160 @@ mod packer_tests {
     use multilinear::whir_chain::StackVars;
     use stark::proof::options::ProofOptions;
 
+    /// ★ Every streamed chunk is laid out with the AIR the verifier builds for
+    /// its table ([`crate::block_airs`]), under either register format: each
+    /// CPU table (its own timestamp base, the last one shorter) and each
+    /// streamed family the same width, constraints and interactions. The
+    /// argue reads the AIR a chunk was laid out with, so a chunk laid out with
+    /// another format's AIR proves a block its verifier refuses.
+    #[test]
+    fn streamed_chunks_are_laid_out_with_the_verifiers_airs() {
+        use super::{BlockFormat, DynAir};
+        use crate::tables::register::RegisterFormat;
+        let opts = ProofOptions::default_test_options();
+        let elf = crate::test_utils::asm_elf_bytes("keep_alive_regs");
+        let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+        let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+            &program,
+            &[],
+            0,
+            1 << 20,
+        )
+        .expect("pages");
+        let cpu_rows = 1 << 4;
+        let heights = vec![cpu_rows, cpu_rows, cpu_rows, cpu_rows / 2];
+        let counts = crate::TableCounts {
+            cpu: heights.len(),
+            lt: 2,
+            memw: 2,
+            memw_aligned: 2,
+            load: 2,
+            mul: 1,
+            dvrm: 1,
+            shift: 2,
+            branch: 1,
+            memw_register: 3,
+            eq: 1,
+            bytewise: 1,
+            store: 2,
+            cpu32: 1,
+            keccak: 1,
+            keccak_rnd: 2,
+            ecsm: 1,
+            ecdas: 1,
+            hint: 1,
+            copy: 1,
+            blake3: 1,
+            is_wh: 1,
+            ecrec: 1,
+        };
+        let inputs = crate::BlockAirInputs::new(&opts, &program, heights.clone(), &[])
+            .expect("the AIR inputs");
+        // An AIR's interactions read on a row of distinct column values: each
+        // one's bus, side, multiplicity and values.
+        use crate::tables::types::FE;
+        use stark::lookup::{LinearTerm, Multiplicity};
+        let g = |c: usize| FE::from((c as u64 + 3) * 1_000_003);
+        let weight = |m: &Multiplicity| match m {
+            Multiplicity::One => FE::one(),
+            Multiplicity::Column(c) => g(*c),
+            Multiplicity::Sum(a, b) => g(*a) + g(*b),
+            Multiplicity::Negated(c) => FE::one() - g(*c),
+            Multiplicity::Diff(a, b) => g(*a) - g(*b),
+            Multiplicity::Sum3(a, b, c) => g(*a) + g(*b) + g(*c),
+            Multiplicity::Linear(ts) => ts.iter().fold(FE::zero(), |acc, t| match *t {
+                LinearTerm::Column {
+                    coefficient,
+                    column,
+                } => acc + g(column) * FE::from(coefficient),
+                LinearTerm::ColumnUnsigned {
+                    coefficient,
+                    column,
+                } => acc + g(column) * FE::from(coefficient),
+                LinearTerm::Constant(v) => acc + FE::from(v),
+            }),
+        };
+        let shape = |air: &DynAir| {
+            let interactions: Vec<(u64, bool, u64, Vec<u64>)> = air
+                .bus_interactions()
+                .iter()
+                .map(|bi| {
+                    let values = bi
+                        .values
+                        .iter()
+                        .flat_map(|v| v.combine_from(g))
+                        .map(|x: FE| x.canonical_u64())
+                        .collect();
+                    (
+                        bi.bus_id,
+                        bi.is_sender,
+                        weight(&bi.multiplicity).canonical_u64(),
+                        values,
+                    )
+                })
+                .collect();
+            (
+                air.trace_layout(),
+                air.num_transition_constraints(),
+                interactions,
+            )
+        };
+        for registers in [RegisterFormat::Tokens32, RegisterFormat::InRow] {
+            let format = BlockFormat {
+                registers,
+                ..BlockFormat::production()
+            };
+            let airs = crate::block_airs(
+                &program,
+                &opts,
+                &pages,
+                &counts,
+                &inputs,
+                format.keccak_rnd,
+                format.memw_aligned,
+                registers,
+            );
+            let stream = StreamAirs::new(
+                &opts,
+                TraceForm::Wide,
+                cpu_rows,
+                format.keccak_rnd,
+                format.memw_aligned,
+                registers,
+            );
+            for (i, &height) in heights.iter().enumerate() {
+                let laid = stream
+                    .of_chunk(StreamTable::Cpu, i, height)
+                    .expect("a CPU chunk's AIR");
+                assert_eq!(laid.name(), airs.cpus[i].name());
+                assert_eq!(
+                    shape(laid),
+                    shape(airs.cpus[i].as_ref()),
+                    "{registers:?} CPU[{i}]"
+                );
+            }
+            for (table, verifier) in [
+                (StreamTable::MemwRegister, &airs.memw_registers),
+                (StreamTable::MemwAligned, &airs.memw_aligneds),
+                (StreamTable::Memw, &airs.memws),
+                (StreamTable::Load, &airs.loads),
+                (StreamTable::Lt, &airs.lts),
+                (StreamTable::Shift, &airs.shifts),
+                (StreamTable::Store, &airs.stores),
+                (StreamTable::KeccakRnd, &airs.keccak_rnds),
+            ] {
+                let laid = stream.of(table).expect("the family's AIR");
+                for (i, air) in verifier.iter().enumerate() {
+                    assert_eq!(
+                        shape(laid),
+                        shape(air.as_ref()),
+                        "{registers:?} {table:?}[{i}]"
+                    );
+                }
+            }
+        }
+    }
+
     /// The packer closes every table into groups in order, and phase A, taking
     /// slowly through the channel of one, is handed those groups in that
     /// order.
@@ -9924,6 +10100,7 @@ mod packer_tests {
             1 << 21,
             crate::tables::keccak_rnd::KeccakRndForm::Full,
             crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+            crate::tables::register::RegisterFormat::Tokens32,
         );
         let air = airs.of(StreamTable::Lt).expect("LT's AIR is the family's");
         // Tables of 4, 8 and 16 rows, in an order that makes uneven groups.
