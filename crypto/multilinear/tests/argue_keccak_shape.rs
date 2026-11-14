@@ -18,7 +18,7 @@
 //! Each bin's tree is written from the table's resident columns and folded
 //! (`trees`), then proved by the batched argue's lockstep ladder (`ladders`),
 //! as the batched argue does it. Two warm-ups and seven timed passes an arm,
-//! the arms interleaved; medians. `KSHAPE` lines.
+//! the arms interleaved; medians. `KECCAK SHAPE` lines.
 
 #![cfg(feature = "cuda")]
 
@@ -118,7 +118,7 @@ fn keccak_round_group_lookup_argument_today_against_sliced() {
     let today: Vec<Table> = (0..4).map(|i| table(1480, 1011, 0x7EA + i)).collect();
     let sliced = vec![table(5461, 857, 0x511CE)];
     println!(
-        "KSHAPE SETUP: today 4 tables x 1480 columns x 2^{ROWS_LOG2} rows x 1011 interactions · sliced 1 table x 5461 columns x 2^{ROWS_LOG2} rows x 857 interactions · built and uploaded in {:.1} s",
+        "KECCAK SHAPE SETUP: today 4 tables x 1480 columns x 2^{ROWS_LOG2} rows x 1011 interactions · sliced 1 table x 5461 columns x 2^{ROWS_LOG2} rows x 857 interactions · built and uploaded in {:.1} s",
         built.elapsed().as_secs_f64()
     );
     let arms: [(&str, &[Table]); 2] = [("today", &today), ("sliced", &sliced)];
@@ -135,7 +135,7 @@ fn keccak_round_group_lookup_argument_today_against_sliced() {
                 ladders += la;
             }
             println!(
-                "KSHAPE RUN arm={name} rep={rep} warm={} trees_ms={:.3} ladders_ms={:.3} total_ms={:.3}",
+                "KECCAK SHAPE RUN arm={name} rep={rep} warm={} trees_ms={:.3} ladders_ms={:.3} total_ms={:.3}",
                 rep < WARM,
                 trees * 1e3,
                 ladders * 1e3,
@@ -153,14 +153,14 @@ fn keccak_round_group_lookup_argument_today_against_sliced() {
         let total = median(times[a].iter().map(|t| t.0 + t.1).collect());
         totals[a] = total;
         println!(
-            "KSHAPE MEDIAN arm={name} reps={TIMED} trees_ms={:.3} ladders_ms={:.3} total_ms={:.3}",
+            "KECCAK SHAPE MEDIAN arm={name} reps={TIMED} trees_ms={:.3} ladders_ms={:.3} total_ms={:.3}",
             trees * 1e3,
             ladders * 1e3,
             total * 1e3
         );
     }
     println!(
-        "KSHAPE RATIO sliced/today={:.4} (one group's lookup argument at equal permutations)",
+        "KECCAK SHAPE RATIO sliced/today={:.4} (one group's lookup argument at equal permutations)",
         totals[1] / totals[0]
     );
 }
