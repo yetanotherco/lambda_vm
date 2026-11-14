@@ -664,18 +664,24 @@ pub mod inrow {
     /// ([`register_word_address_list`] order, as [`super::preprocessed_columns`]
     /// takes them): a register's two words side by side in its row.
     pub fn preprocessed_columns(init: &[u32], fini: &[u32]) -> Vec<Vec<FE>> {
-        let mut columns =
-            vec![crate::tables::types::zeroed_fe_vec(NUM_ROWS); NUM_PREPROCESSED_COLS];
         let word = |v: &[u32], i: usize| FE::from(u64::from(v.get(i).copied().unwrap_or(0)));
-        for row in 0..NUM_REGISTERS {
-            columns[cols::OFFSET][row] = FE::from(register_of_row(row));
-            columns[cols::INIT_0][row] = word(init, 2 * row);
-            columns[cols::INIT_1][row] = word(init, 2 * row + 1);
-            columns[cols::FINI_0][row] = word(fini, 2 * row);
-            columns[cols::FINI_1][row] = word(fini, 2 * row + 1);
-            columns[cols::IS_PC][row] = FE::from(u64::from(row == 33));
-        }
-        columns
+        // A column of the registers' rows (`of(row)`), zero on the padding.
+        let column = |of: &dyn Fn(usize) -> FE| -> Vec<FE> {
+            let mut column = crate::tables::types::zeroed_fe_vec(NUM_ROWS);
+            for (row, cell) in column.iter_mut().enumerate().take(NUM_REGISTERS) {
+                *cell = of(row);
+            }
+            column
+        };
+        // In `cols` order: OFFSET, INIT_0, INIT_1, FINI_0, FINI_1, IS_PC.
+        vec![
+            column(&|row| FE::from(register_of_row(row))),
+            column(&|row| word(init, 2 * row)),
+            column(&|row| word(init, 2 * row + 1)),
+            column(&|row| word(fini, 2 * row)),
+            column(&|row| word(fini, 2 * row + 1)),
+            column(&|row| FE::from(u64::from(row == 33))),
+        ]
     }
 
     /// The trace: the preprocessed columns, and each register's final

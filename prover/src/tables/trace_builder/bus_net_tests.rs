@@ -78,6 +78,9 @@ pub(super) fn unbalanced_with(
     .0
 }
 
+/// Each bus's leftover tuples and their nets ([`unbalanced`]'s).
+type Leftovers = BTreeMap<u64, Vec<(Vec<u64>, i128)>>;
+
 /// [`unbalanced_with`] under the register format `registers` (its AIRs
 /// swapped as the block's are, [`crate::block_airs`]), and the number of rows
 /// that put a register token (`is_register = 1`) on the Memory bus.
@@ -86,7 +89,7 @@ pub(super) fn unbalanced_in(
     traces: &mut Traces,
     over: &dyn Fn(&str) -> Option<Vec<BusInteraction>>,
     registers: crate::tables::register::RegisterFormat,
-) -> (BTreeMap<u64, Vec<(Vec<u64>, i128)>>, usize) {
+) -> (Leftovers, usize) {
     let options = ProofOptions::default_test_options();
     let table_counts = traces.table_counts();
     let mut airs = VmAirs::new(

@@ -914,7 +914,9 @@ impl BlockAirInputs {
 /// A block's AIRs: every table of `table_counts`, HALT included, the CPU
 /// tables at `inputs`' heights, REGISTER's FINI pinned to the halted file,
 /// KECCAK_RND's byte checks as `keccak_rnd` sends them and MEMW_A's timestamp
-/// order in `memw_aligned`'s form (the block format's).
+/// order in `memw_aligned`'s form and the registers in `registers`' (the
+/// block format's).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn block_airs(
     program: &Elf,
     opts: &ProofOptions,
