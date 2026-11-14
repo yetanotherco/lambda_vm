@@ -2113,6 +2113,34 @@ fn the_blake3_base_format_run_costs_its_closed_form() {
         chain_grind_perms(&without),
         sponge(&without),
     );
+    // The final polynomial alone against today's chain (the binary default
+    // cap, every round per query): the lever measured on its own control.
+    let mut today = unfinal;
+    today.format.cap = crate::multilinear_prove::chain_config_under(&zf, &[(3, n)])
+        .format
+        .cap;
+    let today_shape = ChainShape {
+        query: LeafQuery::V1,
+        ..ChainShape::for_hash(&today, n, WrapHash::Blake3)
+    }
+    .run(3);
+    let mut alone = today;
+    alone.format.final_poly = FinalPoly::Vars(B3_BASE_FINAL_VARS);
+    let alone_shape = ChainShape {
+        query: LeafQuery::V1,
+        ..ChainShape::for_hash(&alone, n, WrapHash::Blake3)
+    }
+    .run(3);
+    let today_total = chain_perms(&today_shape, SpongeEntry::fresh_for(WrapHash::Blake3));
+    let alone_total = chain_perms(&alone_shape, SpongeEntry::fresh_for(WrapHash::Blake3));
+    println!(
+        "BLAKE3 FINAL POLYNOMIAL ALONE: today's {today_total} (caps {:?}) -> {alone_total} ({:+}); on the base's \
+         cap and tail: {without_total} -> {total} ({:+})",
+        today_shape.caps,
+        alone_total as i64 - today_total as i64,
+        total as i64 - without_total as i64
+    );
+    assert_eq!(today_total, 41_109, "today's chain");
     assert_eq!(
         without_total, 30_962,
         "the format before its final polynomial"
