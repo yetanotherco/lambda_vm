@@ -32,8 +32,8 @@
 use super::compiler::LfmProgram;
 use super::whir_block::{WhirBlockPlan, block_leaf_arena, top_claims};
 use super::wlfm::{
-    WlfmBuild, WlfmFamily, WlfmLevers, WlfmProof, WlfmRate, build_wlfm_under, prove_wlfm,
-    verify_wlfm,
+    WlfmBuild, WlfmFamily, WlfmLevers, WlfmProof, WlfmProving, WlfmRate, build_wlfm_under,
+    prove_wlfm_as, verify_wlfm,
 };
 use super::wlfm_leg::{WlfmChild, wlfm_leg_arena, wlfm_leg_program};
 use crate::block_whir::BlockWhirProof;
@@ -139,7 +139,7 @@ pub fn prove_levels(
         };
         let arena = t.elapsed().as_secs_f64();
         let t = std::time::Instant::now();
-        let proof = prove_wlfm(&level.program, &level.build, &arenas)
+        let proof = prove_wlfm_as(&level.program, &level.build, &arenas, WlfmProving::Streamed)
             .map_err(|e| format!("level {}: {e}", k + 1))?;
         secs.push(LevelSecs {
             arena,

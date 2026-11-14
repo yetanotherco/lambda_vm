@@ -217,10 +217,13 @@ fn a_corrupted_round_witness_is_refused() {
     let _fast = test_format::set(Some(2));
     let program = honest();
     let build = build(&program);
+    let _wide = super::b3l_tables::test_hold::set(super::b3l_tables::B3lHold::Wide);
     let corrupt = || {
         let mut filled =
             execute_and_fill_unmerged(&program, &[], HASHER).expect("the program executes");
-        let t = &mut filled.b3l_mut().expect("lean tables").rounds[0];
+        let t = filled.b3l_mut().expect("lean tables").rounds[0]
+            .wide_mut()
+            .expect("held wide");
         // Round 0 of compression 0, G 0's a' low byte, one up: its add3 sum is
         // then off by one.
         let col = round::g_base(0) + round::A1;
@@ -280,16 +283,12 @@ fn the_lean_prefixes_are_the_programs() {
     let g = &program.groups.b3l;
     for k in 0..g.real_rows {
         for c in 0..l::PREP_WIDTH {
-            assert_eq!(
-                t.heads[0].main_table.get(k, c),
-                g.at(k, c),
-                "head row {k} column {c}"
-            );
+            assert_eq!(t.heads[0].get(k, c), *g.at(k, c), "head row {k} column {c}");
         }
     }
     for i in 0..l::ROUNDS * g.real_rows {
         let (chunk, r) = t.round_at(i).expect("a round row");
-        let at = |c| *chunk.main_table.get(r, c);
+        let at = |c| chunk.get(r, c);
         assert_eq!(at(round::MU), FE::one());
         assert_eq!(at(round::TAG), FE::from(l::tag_for_row(i / l::ROUNDS)));
         assert_eq!(at(round::RND), FE::from((i % l::ROUNDS) as u64));
@@ -399,4 +398,32 @@ fn the_w_leg_executes_over_a_poseidon1_child_with_lean_tables() {
     let arena = super::wlfm_leg::wlfm_leg_arena(&child, &proof).expect("the leg's arena");
     let exec = execute(&leg, &[arena], &HASHER).expect("the leg accepts the honest child");
     assert!(!exec.public_words.is_empty());
+}
+
+/// The holding and the streaming are the prover's: a lean program proved with
+/// its tables held wide on the forks, narrow on the forks, and narrow streamed
+/// under the base's production options, is the same proof byte for byte.
+#[test]
+fn wide_narrow_and_streamed_prove_the_same_bytes() {
+    use super::b3l_tables::{B3lHold, test_hold};
+    use super::wlfm::{WlfmProving, prove_wlfm_as};
+    // Grinding off: an ungrinded proof has no nonce search to vary.
+    let _fast = test_format::set(Some(2));
+    let program = honest();
+    let build = build(&program);
+    let bytes = |hold: B3lHold, proving: WlfmProving| {
+        let _hold = test_hold::set(hold);
+        let proof = prove_wlfm_as(&program, &build, &[], proving).expect("proves");
+        verify_wlfm(&build.artifacts, &proof, &proof.public_words).expect("verifies");
+        rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+            .expect("serializes")
+            .to_vec()
+    };
+    let wide = bytes(B3lHold::Wide, WlfmProving::Held);
+    assert_eq!(wide, bytes(B3lHold::Narrow, WlfmProving::Held), "narrow");
+    assert_eq!(
+        wide,
+        bytes(B3lHold::Narrow, WlfmProving::Streamed),
+        "streamed"
+    );
 }
