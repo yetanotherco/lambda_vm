@@ -1920,24 +1920,80 @@ fn parse_exec_recycle_logs(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
-/// `LAMBDA_VM_EXEC_PREFAULT=1`: a helper thread prepares the executor's next
-/// window buffers (logs, and the history's extras in record mode) already
-/// written, so the executor does not fault fresh pages in as it writes a
-/// window; the card fill holds the buffers it sent long after (so they are
-/// never free to reuse in time). Unset, empty or `0`: off. Anything else
-/// refuses the prove. The logs are the same.
-pub(crate) fn exec_prefault() -> Result<bool, Error> {
-    parse_exec_prefault(std::env::var("LAMBDA_VM_EXEC_PREFAULT").ok().as_deref())
+/// Switches the block prove no longer reads, each with what it now always
+/// does. Set, any of them refuses the prove ([`refuse_retired_words`]), so a
+/// script that still sets one learns it at once instead of running the default
+/// believing it ran its arm.
+const RETIRED_WORDS: &[(&str, &str)] = &[
+    (
+        "LAMBDA_VM_BLOCK_LT_MERGE",
+        "LT's memory rows are always built by merging equal neighbours",
+    ),
+    (
+        "LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES",
+        "BITWISE's lookups are always counted from the tables' rows, BITWISE last",
+    ),
+    (
+        "LAMBDA_VM_BLOCK_KECCAK_RND_FIRST",
+        "KECCAK_RND's tables are always handed on first",
+    ),
+    (
+        "LAMBDA_VM_WALK_NO_CPU_LIST",
+        "the walkers never keep a CPU list where the card fills CPU",
+    ),
+    (
+        "LAMBDA_VM_WALK_COUNT",
+        "the walkers always count where they make the rows",
+    ),
+    (
+        "LAMBDA_VM_EXEC_PREFAULT",
+        "the executor writes each window into fresh buffers",
+    ),
+];
+
+/// [`RETIRED_WORDS`]: the first one set in `env`, whatever its value, refuses
+/// the prove, naming the word and what the prove now always does.
+fn refuse_retired_words(env: impl Fn(&str) -> Option<String>) -> Result<(), Error> {
+    for &(word, now) in RETIRED_WORDS {
+        if let Some(v) = env(word) {
+            return Err(Error::Prover(format!(
+                "{word}={} is no longer read: {now}; unset it",
+                v.trim()
+            )));
+        }
+    }
+    Ok(())
 }
 
-/// [`exec_prefault`]'s reading of its variable.
-fn parse_exec_prefault(value: Option<&str>) -> Result<bool, Error> {
-    match value.map(str::trim) {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_EXEC_PREFAULT={v}: 1 (pre-faulted window buffers) or 0"
-        ))),
+#[cfg(test)]
+mod retired_words_tests {
+    use super::{RETIRED_WORDS, refuse_retired_words};
+    use crate::Error;
+
+    /// Each retired switch refuses the prove when set, whatever its value
+    /// (`0` and empty included), naming itself; unset, or another word set,
+    /// nothing.
+    #[test]
+    fn a_retired_switch_refuses_the_prove_naming_itself() {
+        assert!(refuse_retired_words(|_| None).is_ok());
+        assert!(
+            refuse_retired_words(|n| (n == "LAMBDA_VM_BLOCK_WALKERS").then(|| "4".to_string()))
+                .is_ok()
+        );
+        assert_eq!(RETIRED_WORDS.len(), 6);
+        for &(word, _) in RETIRED_WORDS {
+            for value in ["0", "1", "", " 0 "] {
+                let Err(Error::Prover(why)) =
+                    refuse_retired_words(|n| (n == word).then(|| value.to_string()))
+                else {
+                    panic!("{word}={value} must refuse the prove");
+                };
+                assert!(
+                    why.starts_with(word) && why.contains("is no longer read"),
+                    "{why}"
+                );
+            }
+        }
     }
 }
 
@@ -5899,6 +5955,8 @@ fn prove_streamed(
     // it — its chunks generated packed. The disk store's knob, which used to
     // turn it off, refuses the prove when set.
     regen::refuse_removed_spill_words(|name| std::env::var(name).ok())?;
+    // A switch that is gone refuses the prove when set, rather than being ignored.
+    refuse_retired_words(|name| std::env::var(name).ok())?;
     // A card-rows word the uploads do not take refuses the prove, rather than
     // running as another mode.
     multilinear::gpu::card_rows_refusal().map_err(Error::Prover)?;
@@ -6180,27 +6238,6 @@ fn prove_streamed(
                 if history {
                     executor.enable_history().map_err(failed)?;
                 }
-                // Pre-faulted window buffers from a helper, two ahead.
-                let prefault = exec_prefault()?.then(|| {
-                    let (tx, rx) = std::sync::mpsc::sync_channel(2);
-                    let n = window.min(1 << 22);
-                    std::thread::spawn(move || {
-                        loop {
-                            let logs = executor::vm::logs::prefaulted_logs(n);
-                            let extras = history.then(|| {
-                                executor::vm::logs::prefaulted(
-                                    n,
-                                    executor::vm::history::HistExtra::default(),
-                                )
-                            });
-                            if tx.send((logs, extras)).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    rx
-                });
-                let mut prefaulted = 0usize;
                 // The windows sent, while someone downstream still holds them.
                 let mut sent: Option<std::collections::VecDeque<std::sync::Arc<Vec<_>>>> =
                     exec_recycle_logs()?.then(Default::default);
@@ -6242,16 +6279,6 @@ fn prove_streamed(
                         if let Some(buffer) = back {
                             recycled += 1;
                             executor.recycle(buffer);
-                        }
-                    }
-                    // The next window's buffers, when the helper has them ready.
-                    if let Some(ready) = &prefault
-                        && let Ok((logs, extras)) = ready.try_recv()
-                    {
-                        prefaulted += 1;
-                        executor.recycle(logs);
-                        if let Some(extras) = extras {
-                            executor.recycle_extras(extras);
                         }
                     }
                     // A sampled window's start, for the shadow check.
@@ -6329,13 +6356,6 @@ fn prove_streamed(
                 }
                 let executed = start.elapsed().as_secs_f64();
                 drop(executor);
-                if prefault.is_some() {
-                    eprintln!(
-                        "BLOCK EXECUTOR PREFAULT: {prefaulted} of {} windows given pre-faulted buffers",
-                        own.windows
-                    );
-                }
-                drop(prefault);
                 if sent.is_some() {
                     eprintln!(
                         "BLOCK EXECUTOR RECYCLE: {recycled} of {} windows written into a buffer taken back",
@@ -9598,18 +9618,8 @@ mod producer_report_tests {
         ExecutorStamps, ProducerStamps, StreamTable,
     };
     use super::{
-        exec_mode_from, parse_exec_history, parse_exec_history_check, parse_exec_prefault,
-        parse_exec_recycle_logs,
+        exec_mode_from, parse_exec_history, parse_exec_history_check, parse_exec_recycle_logs,
     };
-
-    /// `LAMBDA_VM_EXEC_PREFAULT`: off unless `1`; anything else refused.
-    #[test]
-    fn prefault_is_off_unless_asked() {
-        assert!(!parse_exec_prefault(None).unwrap());
-        assert!(!parse_exec_prefault(Some("0")).unwrap());
-        assert!(parse_exec_prefault(Some("1")).unwrap());
-        assert!(parse_exec_prefault(Some("yes")).is_err());
-    }
 
     /// Record mode on the fast engine unless `LAMBDA_VM_EXEC_HISTORY=0`, the
     /// reference engine named, or no walkers; `1` with the reference engine
