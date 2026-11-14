@@ -420,6 +420,20 @@ pub enum BusId {
     /// the timestamp one field element, one token a 64-bit register
     /// (`tables::register::RegisterFormat::InRow`).
     Reg = 39,
+
+    // =========================================================================
+    // LFM — standard BLAKE3 on the lean tables (`lfm::blake3_lean`)
+    // =========================================================================
+    /// The lean BLAKE3 byte table's lookups: `(op, a, b, …)` against the
+    /// fixed 2^16-row `B3L_XOR` table (XOR, XOR split into nibbles, a byte
+    /// pair, a 16-bit value).
+    ///
+    /// IDs 40 and 41: 39 is the in-row register format's bus (20 and 29 stay
+    /// unused).
+    B3lXor = 40,
+    /// The lean BLAKE3 round chain: `(tag, round, state, message)` from a
+    /// compression's head row through its seven round rows and back.
+    B3lRound = 41,
 }
 
 impl BusId {
@@ -456,6 +470,8 @@ impl BusId {
             BusId::LfmPublic => "LfmPublic",
             BusId::Blake3Absorb => "Blake3Absorb",
             BusId::IsWh => "IsWh",
+            BusId::B3lXor => "B3lXor",
+            BusId::B3lRound => "B3lRound",
         }
     }
 }
@@ -495,6 +511,8 @@ impl TryFrom<u64> for BusId {
             38 => Ok(BusId::KeccakSponge),
             39 => Ok(BusId::Reg),
             37 => Ok(BusId::IsWh),
+            40 => Ok(BusId::B3lXor),
+            41 => Ok(BusId::B3lRound),
             other => Err(other),
         }
     }

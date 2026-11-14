@@ -299,8 +299,17 @@ fn fill_op(
     op: &LeanOp,
     hist: &mut TableHist,
 ) -> [u32; 8] {
-    let fs = lean::fill_rounds(rows, k as u64 + 1, op, None, ROUNDS, hist);
-    lean::fill_head(head_row, k as u64 + 1, op, &fs, hist);
+    let fs = lean::fill_rounds(
+        rows,
+        k as u64 + 1,
+        &op.values(),
+        op.block_len,
+        op.flags,
+        None,
+        ROUNDS,
+        hist,
+    );
+    lean::fill_head(head_row, &op.prep(k as u64 + 1), &op.values(), &fs, hist);
     digest_of(&fs)
 }
 
@@ -447,7 +456,7 @@ impl BlockAirs {
                     },
                     &opts,
                     1,
-                    HeadConstraints,
+                    HeadConstraints::default(),
                 )
                 .with_name("B3R_HEAD")
                 .with_preprocessed([0u8; 32], head::PREP_WIDTH)

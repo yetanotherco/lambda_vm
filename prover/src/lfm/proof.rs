@@ -239,9 +239,9 @@ pub(crate) struct LfmFilled {
     execute_secs: f64,
     fill_secs: f64,
     exec_split: super::executor::ExecSplit,
-    /// The program's `B3L_HEAD` records: the lean BLAKE3 tables are the block
-    /// prover's (W-LFM), filled there. Nonempty refuses the STARK prove.
-    b3l: Vec<super::b3l::B3lValues>,
+    /// The program's lean BLAKE3 tables, filled: the block prover's (W-LFM).
+    /// Present refuses the STARK prove.
+    b3l: Option<super::b3l_tables::B3lTraces>,
 }
 
 /// The host half of [`lfm_prove_with_residency`]: execute `program` over
@@ -311,9 +311,9 @@ pub(crate) fn lfm_fill_executed_under(
         memory,
         split: exec_split,
     } = execution;
-    // The lean BLAKE3 records go to the block prover's fill; this one builds
-    // the fixed chip set's traces only.
-    let b3l = core::mem::take(&mut records.b3l);
+    // The lean BLAKE3 records fill their own tables (the block prover's);
+    // the fixed chip set's traces are built from the rest.
+    let b3l_records = core::mem::take(&mut records.b3l);
     // The final write-once array: 32 bytes per address, a few hundred MB for a
     // wrap. It is a diagnostic surface for tests — nothing on the proving path
     // reads it — so held to the end of this scope it would stay live through the
@@ -322,6 +322,8 @@ pub(crate) fn lfm_fill_executed_under(
 
     let t = Instant::now();
     let traces = build_traces_with_merge(program, &records, hasher, plan);
+    let b3l = super::b3l_tables::build_b3l_traces(program, &b3l_records);
+    drop(b3l_records);
     let fill_secs = t.elapsed().as_secs_f64();
     // Same reason, larger: the records are what the fill consumes, and they are
     // dead the moment it returns. The traces it produced are the live set from
@@ -363,11 +365,16 @@ impl LfmFilled {
         &mut self.public_words
     }
 
-    /// The program's `B3L_HEAD` records, moved out: the W-LFM prover fills
-    /// the lean BLAKE3 tables from them.
+    /// The program's lean BLAKE3 tables, moved out (the W-LFM prover's).
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    pub(crate) fn take_b3l(&mut self) -> Vec<super::b3l::B3lValues> {
-        core::mem::take(&mut self.b3l)
+    pub(crate) fn take_b3l(&mut self) -> Option<super::b3l_tables::B3lTraces> {
+        self.b3l.take()
+    }
+
+    /// The program's lean BLAKE3 tables, for a test that corrupts one.
+    #[cfg(test)]
+    pub(crate) fn b3l_mut(&mut self) -> Option<&mut super::b3l_tables::B3lTraces> {
+        self.b3l.as_mut()
     }
 
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
@@ -428,12 +435,9 @@ impl LfmFilled {
         // carries `B3l` rows would prove with them unproved. Refused before
         // anything reaches the card (its verifier's bus could not balance
         // either: every digest read would lack its write).
-        if !b3l.is_empty() {
+        if b3l.is_some() {
             return Err(LfmProveError::Prover(ProvingError::WrongParameter(
-                format!(
-                    "{} lean BLAKE3 compressions: only the block prover (W-LFM) proves them",
-                    b3l.len()
-                ),
+                "lean BLAKE3 compressions: only the block prover (W-LFM) proves them".into(),
             )));
         }
         // The domains and twiddles this proof's tables need, built before it

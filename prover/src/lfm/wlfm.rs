@@ -70,6 +70,7 @@ use crate::zf_format::ZfFormat;
 
 use super::airs::{ChipSet, LfmAirs};
 use super::airs::{DynLfmAir, NUM_LFM_CHIPS};
+use super::b3l_tables::{B3lAirs, B3lShape, B3lTraces, b3l_prep_groups};
 use super::compiler::ColumnGroup;
 use super::compiler::LfmProgram;
 use super::hash::HasherKind;
@@ -307,6 +308,10 @@ pub struct WlfmArtifacts {
     pub fold: Option<u8>,
     /// The query grind's bits when not the format's (folded into `config`).
     pub grind: Option<u8>,
+    /// The lean BLAKE3 tables' chunks ([`super::b3l_tables`]), after the LFM
+    /// chips' tables: empty for a program with no `B3l` row, which then has
+    /// none of them.
+    pub b3l: B3lShape,
     /// Under [`WlfmPrep::Stacked`]: the prepared stacks. Empty otherwise.
     pub stacks: Vec<WlfmStack>,
     /// Under [`WlfmPrep::Evaluated`]: each table's preprocessed prefix, as the
@@ -316,13 +321,17 @@ pub struct WlfmArtifacts {
 }
 
 impl WlfmArtifacts {
-    /// The program's AIR set, with no STARK roots ([`whir_lfm_airs`]).
-    pub fn airs(&self) -> LfmAirs {
-        whir_lfm_airs(self.hasher, self.chip_set, self.hash_chunks, &air_options())
+    /// The program's AIR set, with no STARK roots ([`whir_lfm_airs`]), and
+    /// its lean BLAKE3 tables after them.
+    pub fn airs(&self) -> WlfmAirs {
+        WlfmAirs {
+            lfm: whir_lfm_airs(self.hasher, self.chip_set, self.hash_chunks, &air_options()),
+            b3l: B3lAirs::new(&self.b3l, &air_options()),
+        }
     }
 
     /// `(main width, height)` per table.
-    pub fn shapes(&self, airs: &LfmAirs) -> Vec<(usize, usize)> {
+    pub fn shapes(&self, airs: &WlfmAirs) -> Vec<(usize, usize)> {
         table_shapes(&airs.air_refs(), &self.table_num_vars)
     }
 
@@ -350,6 +359,44 @@ impl WlfmArtifacts {
             .iter()
             .flat_map(|s| s.roots.iter().copied())
             .collect()
+    }
+}
+
+/// A W-LFM program's AIR set: the LFM chips' ([`whir_lfm_airs`]), then the
+/// lean BLAKE3 tables' ([`B3lAirs`]) — the proof's table order.
+pub struct WlfmAirs {
+    pub lfm: LfmAirs,
+    pub b3l: B3lAirs,
+}
+
+impl WlfmAirs {
+    /// Every AIR in table order.
+    pub fn air_refs(&self) -> Vec<DynLfmAir<'_>> {
+        let mut refs = self.lfm.air_refs();
+        refs.extend(self.b3l.refs());
+        refs
+    }
+
+    /// Every AIR with its trace, in table order. `b3l` is the program's lean
+    /// tables: present exactly when the AIR set has them.
+    pub fn air_trace_pairs<'a>(
+        &'a self,
+        traces: &'a mut super::trace::LfmTraces,
+        b3l: Option<&'a mut B3lTraces>,
+    ) -> Result<Vec<(DynLfmAir<'a>, &'a mut stark::trace::TraceTable<F, E>)>, String> {
+        let mut pairs: Vec<(DynLfmAir<'a>, &'a mut stark::trace::TraceTable<F, E>)> = self
+            .lfm
+            .air_trace_pairs(traces)
+            .into_iter()
+            .map(|(air, trace, _)| (air, trace))
+            .collect();
+        let lean = self.b3l.refs().len();
+        match b3l {
+            Some(t) => pairs.extend(self.b3l.pairs(t)?),
+            None if lean == 0 => {}
+            None => return Err("the AIR set has lean BLAKE3 tables and the fill none".into()),
+        }
+        Ok(pairs)
     }
 }
 
@@ -494,15 +541,14 @@ pub fn build_wlfm_under(
     // constant (`for_program_with_hasher` reads it from the environment).
     let chip_set = ChipSet::for_program_under(program, hasher, true);
     check_chip_set(chip_set)?;
-    if program.groups.b3l.real_rows > 0 {
-        return Err(format!(
-            "{} lean BLAKE3 compressions: the W-LFM AIR set has no lean tables yet",
-            program.groups.b3l.real_rows
-        ));
-    }
     let hash_chunks = program.hash_chunk_count();
-    let groups = program_prep_groups(program);
-    let airs = whir_lfm_airs(hasher, chip_set, hash_chunks, &air_options());
+    let b3l = B3lShape::of_program(program);
+    let mut groups = program_prep_groups(program);
+    groups.extend(b3l_prep_groups(program).into_iter().map(Cow::Owned));
+    let airs = WlfmAirs {
+        lfm: whir_lfm_airs(hasher, chip_set, hash_chunks, &air_options()),
+        b3l: B3lAirs::new(&b3l, &air_options()),
+    };
     let refs = airs.air_refs();
     if refs.len() != groups.len() {
         return Err(format!(
@@ -576,6 +622,7 @@ pub fn build_wlfm_under(
             final_poly,
             fold,
             grind,
+            b3l,
             stacks: Vec::new(),
             evaluated,
             program_id: [0u8; 32],
@@ -624,6 +671,7 @@ pub fn build_wlfm_under(
         final_poly,
         fold,
         grind,
+        b3l,
         stacks,
         evaluated: Vec::new(),
         program_id: [0u8; 32],
@@ -736,6 +784,15 @@ pub fn wlfm_program_id(a: &WlfmArtifacts) -> Commitment {
     }
     // The rest of the format, whole: a lever added later moves the identity.
     h.update(format!("{:?}", c.format).as_bytes());
+    // The lean BLAKE3 tables, when the program has any: their round count and
+    // their chunks (their heights are in the table list above). A program
+    // with none folds nothing here, so its identity is unchanged.
+    if !a.b3l.is_empty() {
+        h.update(b"B3L");
+        h.update((super::b3l::ROUNDS as u64).to_le_bytes());
+        h.update((a.b3l.rounds.len() as u64).to_le_bytes());
+        h.update((a.b3l.heads.len() as u64).to_le_bytes());
+    }
     // Under the evaluated binding there are no roots to fold: the columns
     // themselves, every value, one digest a column. (The stacked binding's
     // identity is unchanged.)
@@ -828,9 +885,7 @@ pub(crate) fn prove_wlfm_traces(
     check_prefix: bool,
 ) -> Result<WlfmProof, String> {
     let mut filled = filled;
-    if !filled.take_b3l().is_empty() {
-        return Err("lean BLAKE3 records: the W-LFM AIR set has no lean tables yet".into());
-    }
+    let mut b3l = filled.take_b3l();
     let (mut traces, public_words, hasher, execute_secs, fill_secs, exec_split) =
         filled.into_parts();
     // Every chip its own table: a set filled under the process's merge is
@@ -846,7 +901,7 @@ pub(crate) fn prove_wlfm_traces(
     let t_prep = std::time::Instant::now();
     let airs = artifacts.airs();
     let shapes = artifacts.shapes(&airs);
-    let pairs = airs.air_trace_pairs(&mut traces);
+    let pairs = airs.air_trace_pairs(&mut traces, b3l.as_mut())?;
     if pairs.len() != shapes.len() {
         return Err(format!(
             "{} traces for {} tables",
@@ -864,7 +919,7 @@ pub(crate) fn prove_wlfm_traces(
         }
     }
     let mut tables: Vec<CommittedTable<'_, F, E>> = Vec::with_capacity(pairs.len());
-    for (t, ((air, trace, _), &(width, num_vars))) in pairs.into_iter().zip(&shapes).enumerate() {
+    for (t, ((air, trace), &(width, num_vars))) in pairs.into_iter().zip(&shapes).enumerate() {
         if trace.main_table.width != width || trace.main_table.height != 1usize << num_vars {
             return Err(format!(
                 "{}: the trace is {} columns of {} rows, the program's {width} of 2^{num_vars}",
@@ -1002,7 +1057,7 @@ type VerifierFrame = (Vec<(usize, usize)>, Vec<StackedLayout>, Vec<Domain<F>>);
 /// inputs, and the groups' layouts and domains: what the verifier derives from
 /// the artifacts. Refuses artifacts that do not describe their own program's
 /// AIRs and format.
-fn verifier_frame(artifacts: &WlfmArtifacts, airs: &LfmAirs) -> Result<VerifierFrame, String> {
+fn verifier_frame(artifacts: &WlfmArtifacts, airs: &WlfmAirs) -> Result<VerifierFrame, String> {
     let refs = airs.air_refs();
     if refs.len() != artifacts.table_num_vars.len() || refs.len() != artifacts.counts.len() {
         return Err(format!(
