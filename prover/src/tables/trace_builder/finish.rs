@@ -158,6 +158,8 @@ pub(super) struct FinishPlan<'a> {
     l2g_memory_bookend: bool,
     skip: StreamSkip,
     cpu_ops: Vec<CpuOperation>,
+    /// One a CPU op under the in-row register format; empty otherwise.
+    cpu_side: Vec<super::super::cpu::CpuSide>,
     memw_ops: Vec<MemwOperation>,
     memw_aligned_ops: Vec<memw_aligned::AlignedRow>,
     memw_register_rows: Vec<RegRow>,
@@ -979,6 +981,7 @@ impl<'a> FinishPlan<'a> {
     ) -> Result<Self, Error> {
         let CollectedOps {
             cpu_ops,
+            cpu_side,
             memw_ops,
             memw_aligned_ops,
             memw_register_rows,
@@ -1342,6 +1345,7 @@ impl<'a> FinishPlan<'a> {
             l2g_memory_bookend,
             skip: *skip,
             cpu_ops,
+            cpu_side,
             memw_ops,
             memw_aligned_ops,
             memw_register_rows,
@@ -1436,6 +1440,7 @@ impl<'a> FinishPlan<'a> {
             l2g_memory_bookend,
             skip,
             cpu_ops,
+            cpu_side,
             memw_ops,
             memw_aligned_ops,
             memw_register_rows,
@@ -1532,8 +1537,23 @@ impl<'a> FinishPlan<'a> {
                 skip.cpu,
                 skip.tails,
                 false,
-                packed_by(pack, |ops| {
-                    cpu::generate_cpu_trace_as(ops, decode_table, form)
+                packed_by(pack, |ops: &[CpuOperation]| {
+                    if cpu_side.is_empty() {
+                        return cpu::generate_cpu_trace_as(ops, decode_table, form);
+                    }
+                    // A chunk of `cpu_ops`: its side records at the same place.
+                    let start = if ops.is_empty() {
+                        0
+                    } else {
+                        (ops.as_ptr() as usize - cpu_ops_ref.as_ptr() as usize)
+                            / std::mem::size_of::<CpuOperation>()
+                    };
+                    cpu::generate_cpu_trace_inrow_segments_as(
+                        &[ops],
+                        &[&cpu_side[start..start + ops.len()]],
+                        decode_table,
+                        form,
+                    )
                 }),
             )
         };
@@ -1772,7 +1792,7 @@ impl<'a> FinishPlan<'a> {
         let gen_register = || {
             packed_if(
                 pack,
-                register::generate_register_trace(&register_final_state, register_init),
+                register_trace(skip.register_format, &register_final_state, register_init),
             )
         };
         let gen_halt = || {
@@ -2271,6 +2291,7 @@ impl<'a> FinishPlan<'a> {
             l2g_memory_bookend,
             skip,
             cpu_ops,
+            cpu_side,
             memw_ops,
             memw_aligned_ops,
             memw_register_rows,
@@ -2327,6 +2348,8 @@ impl<'a> FinishPlan<'a> {
             form,
         });
         let cpu_ops = Arc::new(cpu_ops);
+        let cpu_side = Arc::new(cpu_side);
+        let register_format = skip.register_format;
         // The lists phase 4 reads, shared by their units and, when it counts
         // beside them ([`StreamSkip::p4_beside`]), BITWISE's.
         let shared = P4Shared {
@@ -2444,7 +2467,7 @@ impl<'a> FinishPlan<'a> {
             job: Box::new(move || {
                 Ok(packed_if(
                     pack,
-                    register::generate_register_trace(&register_final_state, register_init),
+                    register_trace(register_format, &register_final_state, register_init),
                 ))
             }),
         });
@@ -2583,15 +2606,26 @@ impl<'a> FinishPlan<'a> {
             false,
             |start, end| {
                 let ops = Arc::clone(&cpu_ops);
+                let side = Arc::clone(&cpu_side);
                 Box::new(move || {
                     Ok(packed_if(
                         pack,
-                        cpu::generate_cpu_trace_as(&ops[start..end], decode_table, form),
+                        if side.is_empty() {
+                            cpu::generate_cpu_trace_as(&ops[start..end], decode_table, form)
+                        } else {
+                            cpu::generate_cpu_trace_inrow_segments_as(
+                                &[&ops[start..end]],
+                                &[&side[start..end]],
+                                decode_table,
+                                form,
+                            )
+                        },
                     ))
                 })
             },
         )?);
         drop(cpu_ops);
+        drop(cpu_side);
         let lt = Arc::clone(&shared.lt);
         LT_ROWS_BUILT.reset();
         units.extend(lt_units(
@@ -3663,3 +3697,28 @@ fn positions_of(units: &[Unit<'_>], family: usize) -> Vec<usize> {
 #[cfg(test)]
 #[path = "stream_tests.rs"]
 mod stream_tests;
+
+/// REGISTER's trace in the run's register format: a word a row (today's), or
+/// a register a row under [`RegisterFormat::InRow`], its final timestamps the
+/// final state's and its final file the one the word rows would carry.
+///
+/// [`RegisterFormat::InRow`]: super::super::register::RegisterFormat::InRow
+fn register_trace(
+    format: super::super::register::RegisterFormat,
+    final_state: &register::FinalRegisterStateMap,
+    init: &[u32],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    match format {
+        super::super::register::RegisterFormat::Tokens32 => {
+            register::generate_register_trace(final_state, init)
+        }
+        super::super::register::RegisterFormat::InRow => {
+            let fini = register::fini_from_final_state(final_state, init);
+            register::inrow::generate_trace(init, &fini, &|reg| {
+                final_state
+                    .get(&register::register_base_address(reg as u8))
+                    .map(|state| state.timestamp)
+            })
+        }
+    }
+}

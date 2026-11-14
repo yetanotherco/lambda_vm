@@ -844,6 +844,50 @@ pub(crate) fn generate_cpu_trace_segments_as(
     })
 }
 
+/// A CPU row's register slots under the in-row register format
+/// (`tables::register::RegisterFormat::InRow`): the previous timestamp of
+/// each of `rs1`, `rs2`, `rd` (0 for a slot the row does not use; after a
+/// keep-alive, the keep-alive's) and `rd`'s old value. The walk writes one a
+/// CPU op, in the ops' order; they fill [`inrow_cols`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CpuSide {
+    pub(crate) prev_ts: [u32; 3],
+    pub(crate) pad: u32,
+    pub(crate) old_rd: u64,
+}
+
+/// The widths in-row CPU traces needed so far in this process.
+static WIDTHS_INROW: WidthHint = WidthHint::new();
+
+/// [`generate_cpu_trace_segments_as`] under the in-row register format: the
+/// same rows at [`inrow_cols::NUM_COLUMNS_INROW`] columns, `sides` (one a CPU
+/// op, in the same pieces' order) filling the five slot columns; padding rows
+/// leave them zero.
+pub(crate) fn generate_cpu_trace_inrow_segments_as(
+    segments: &[&[CpuOperation]],
+    sides: &[&[CpuSide]],
+    decode: &DecodeTable,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let n: usize = segments.iter().map(|s| s.len()).sum();
+    debug_assert_eq!(
+        n,
+        sides.iter().map(|s| s.len()).sum::<usize>(),
+        "one side record a CPU op"
+    );
+    let num_rows = n.next_power_of_two().max(4);
+    generate_main!(form, &WIDTHS_INROW, num_rows, inrow_cols::NUM_COLUMNS_INROW, |t| {
+        fill_cpu_rows(t, segments, decode, num_rows);
+        for (row, side) in sides.iter().flat_map(|s| s.iter()).enumerate() {
+            t.set_u64(row, inrow_cols::PREV_TS_1, u64::from(side.prev_ts[0]));
+            t.set_u64(row, inrow_cols::PREV_TS_2, u64::from(side.prev_ts[1]));
+            t.set_u64(row, inrow_cols::PREV_TS_D, u64::from(side.prev_ts[2]));
+            t.set_dword_wl(row, inrow_cols::OLD_RD_0, side.old_rd);
+        }
+    })
+}
+
 /// Every row of a zeroed CPU table of `num_rows` rows: `segments`' operations,
 /// then the padding.
 fn fill_cpu_rows<T: VmTable>(

@@ -58,8 +58,10 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     mut pre: Option<PreCounted>,
 ) -> Result<Traces, Error> {
     RUNS.with(|runs| runs.set(runs.get() + 1));
+    // The oracle is today's register format's.
     let CollectedOps {
         cpu_ops,
+        cpu_side: _,
         memw_ops,
         memw_aligned_ops,
         memw_register_rows,

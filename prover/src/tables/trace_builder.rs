@@ -1692,6 +1692,11 @@ struct MemwBuckets {
     /// aligned row is laid out (the block format's; the per-table STARK's
     /// [`MemwAlignedOrder::Lt`] by default).
     order: MemwAlignedOrder,
+    /// The run's register format: under
+    /// [`RegisterFormat::InRow`](super::register::RegisterFormat::InRow)
+    /// every register access that reaches a bucket is a REGX row (word
+    /// instructions', the chips', HALT's and keep-alives), whatever its step.
+    registers: super::register::RegisterFormat,
     /// The first aligned access [`memw_aligned::AlignedRow::from_memw`]
     /// refused (none today: the routing admits only what it takes), returned by
     /// the walk as an error ([`Self::refusal`]) instead of a wrapped row.
@@ -1706,7 +1711,38 @@ impl MemwBuckets {
             general: Vec::new(),
             words: None,
             order,
+            registers: super::register::RegisterFormat::Tokens32,
             refused: None,
+        }
+    }
+
+    /// Whether register accesses are REGX rows (the in-row register format).
+    #[inline]
+    fn in_row(&self) -> bool {
+        self.registers == super::register::RegisterFormat::InRow
+    }
+
+    /// A register access's REGX row, or the refusal kept for the walk (an
+    /// access REGX cannot take: not two words with one old timestamp, or its
+    /// timestamps past 32 bits or out of order).
+    #[inline]
+    fn push_regx(&mut self, op: &MemwOperation) {
+        let fits = op.width == 2
+            && op.old_timestamp[0] == op.old_timestamp[1]
+            && op.timestamp <= u64::from(u32::MAX)
+            && op.old_timestamp[0] < op.timestamp;
+        if fits {
+            self.register_rows.push(RegRow::regx(
+                op.base_address,
+                op.timestamp,
+                [op.value[0], op.value[1]],
+                [op.old[0], op.old[1]],
+                op.old_timestamp[0],
+                op.is_read,
+            ));
+        } else {
+            self.refused
+                .get_or_insert(format!("REGX cannot take the register access {op:?}"));
         }
     }
 
@@ -1750,6 +1786,10 @@ impl MemwBuckets {
 
     #[inline]
     fn push(&mut self, op: MemwOperation) {
+        if op.is_register && self.in_row() {
+            self.push_regx(&op);
+            return;
+        }
         match classify_memw(&op, self.order) {
             MemwRoute::Register => match self.words.as_deref_mut() {
                 Some(words) => words.push(RegRow::from_memw(&op)),
@@ -1820,6 +1860,13 @@ impl MemwSink for MemwBuckets {
         old_ts: u64,
         is_read: bool,
     ) {
+        // Under the in-row register format every such access is a REGX row.
+        if self.in_row() {
+            self.push_regx(&build_reg_fallback(
+                reg_addr, val, old, timestamp, old_ts, is_read,
+            ));
+            return;
+        }
         // Mirror `is_register_op` for a width-2 register access whose two words share
         // `old_ts` (always true here by construction). If it passes, fill a RegRow
         // directly; otherwise fall back to the general/aligned MemwOperation path.
@@ -1921,6 +1968,8 @@ fn collect_ops_from_cpu(
         copy_ops,
         hint_ops,
         ecrec_ops,
+        // The whole-run build is the per-table STARK's (today's register format).
+        cpu_side: _,
     } = out;
     Ok((
         memw,
@@ -1959,6 +2008,10 @@ pub(crate) struct WalkOutputs {
     copy_ops: Vec<copy::CopyOperation>,
     hint_ops: Vec<hint::HintOperation>,
     ecrec_ops: Vec<ecrec::EcrecOperation>,
+    /// Under the in-row register format, one record a CPU op (its register
+    /// slots' previous timestamps and `rd`'s old value), in the ops' order;
+    /// empty otherwise.
+    cpu_side: Vec<super::cpu::CpuSide>,
 }
 
 impl WalkOutputs {
@@ -1986,6 +2039,7 @@ impl WalkOutputs {
             copy_ops: Vec::new(),
             hint_ops: Vec::new(),
             ecrec_ops: Vec::new(),
+            cpu_side: Vec::new(),
         }
     }
 
@@ -2197,7 +2251,9 @@ fn walk_cpu_ops<const REST: bool>(
         copy_ops,
         hint_ops,
         ecrec_ops,
+        cpu_side,
     } = out;
+    let in_row = memw.in_row();
     // This call's COPY rows start here; earlier calls' are already in the list.
     let copy_ops_before = copy_ops.len();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
@@ -2240,8 +2296,20 @@ fn walk_cpu_ops<const REST: bool>(
             memw.push(memw_op);
         }
 
-        // Collect register operations (M1, M3, M5)
-        collect_register_ops_from_cpu(op, register_state, memw);
+        // Collect register operations (M1, M3, M5). Under the in-row register
+        // format a non-word row checks its own: its slots' record, and any
+        // keep-alive its steps need, as REGX rows; a word row's go to REGX.
+        if in_row {
+            let side = if op.decode.fields.word_instr {
+                collect_register_ops_from_cpu(op, register_state, memw);
+                super::cpu::CpuSide::default()
+            } else {
+                collect_register_ops_in_row(op, register_state, memw, bitwise_ops)
+            };
+            cpu_side.push(side);
+        } else {
+            collect_register_ops_from_cpu(op, register_state, memw);
+        }
 
         // The commit syscall (ecall 64): the COPY chip receives the ECALL, reads the operand
         // registers, advances x254 and moves the bytes into the COMMIT domain.
@@ -3522,6 +3590,76 @@ fn collect_hint_ops(
         in_addr,
     };
     (memw_ops, hint_op)
+}
+
+/// The largest step a CPU row's register slot takes under the in-row register
+/// format: its `IS_HALF[ts − prev − 1]` check.
+const IN_ROW_MAX_STEP: u64 = 1 << 16;
+
+/// A non-word CPU row's register accesses under the in-row register format
+/// (`tables::register::RegisterFormat::InRow`): the row checks them itself, so
+/// they make no MEMW op. Returns the row's [`super::cpu::CpuSide`]; a slot
+/// whose register was last accessed more than [`IN_ROW_MAX_STEP`] ago gets a
+/// keep-alive first, a REGX row moving the register's token, value unchanged,
+/// to `slot_ts − 1`, which no access of that register can hold (a row's
+/// register slots are `ts`, `ts + 1`, `ts + 2`; the slot before `ts` is the
+/// previous row's fourth, which no register access takes). Each slot's
+/// `IS_HALF` lookup goes to `bitwise_ops`. The register state advances as
+/// [`collect_register_ops_from_cpu`] advances it.
+fn collect_register_ops_in_row(
+    op: CpuOp<'_>,
+    register_state: &mut RegisterState,
+    memw: &mut MemwBuckets,
+    bitwise_ops: &mut Vec<BitwiseOperation>,
+) -> super::cpu::CpuSide {
+    let d = &op.decode.fields;
+    let mut side = super::cpu::CpuSide::default();
+    // The slot's previous timestamp, after a keep-alive where the step is too
+    // long, and its range-check lookup.
+    let mut slot = |memw: &mut MemwBuckets, reg: u8, value: u64, ts: u64, old_ts: u64| -> u32 {
+        let prev = if ts - old_ts > IN_ROW_MAX_STEP {
+            let v = [value as u32, (value >> 32) as u32];
+            memw.register_rows
+                .push(RegRow::keep_alive(2 * u64::from(reg), ts - 1, v, old_ts));
+            ts - 1
+        } else {
+            old_ts
+        };
+        let d = (ts - prev - 1) as u16;
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            d as u8,
+            (d >> 8) as u8,
+        ));
+        prev as u32
+    };
+    let ts = op.timestamp;
+    if d.read_register1 && d.rs1 != 0 {
+        let (_, old_ts) = if d.rs1 == 255 {
+            register_state.read_pc()
+        } else {
+            register_state.read(d.rs1)
+        };
+        side.prev_ts[0] = slot(memw, d.rs1, op.rv1, ts, old_ts);
+        if d.rs1 == 255 {
+            register_state.write_pc(op.rv1, ts);
+        } else {
+            register_state.write(d.rs1, op.rv1, ts);
+        }
+    }
+    if d.read_register2 && d.rs2 != 0 {
+        let (_, old_ts) = register_state.read(d.rs2);
+        side.prev_ts[1] = slot(memw, d.rs2, op.rv2, ts + 1, old_ts);
+        register_state.write(d.rs2, op.rv2, ts + 1);
+    }
+    if d.write_register && d.rd != 0 {
+        let (old_val, old_ts) = register_state.read(d.rd);
+        side.prev_ts[2] = slot(memw, d.rd, old_val, ts + 2, old_ts);
+        side.old_rd = old_val;
+        register_state.write(d.rd, op.rvd, ts + 2);
+    }
+    register_state.write_pc(op.next_pc, ts + 1);
+    side
 }
 
 /// Collects register read/write operations (M1, M3, M5) from CpuOperation,
@@ -6868,6 +7006,8 @@ pub struct Traces {
 /// concatenated ([`blocks`]); a whole-run build's are one block each.
 struct CollectedOps {
     cpu_ops: Vec<CpuOperation>,
+    /// One a CPU op under the in-row register format; empty otherwise.
+    cpu_side: Vec<super::cpu::CpuSide>,
     memw_ops: Vec<MemwOperation>,
     memw_aligned_ops: Vec<memw_aligned::AlignedRow>,
     /// Direct-fill MEMW_R rows (register fast path).
@@ -7043,6 +7183,15 @@ pub struct StreamSkip {
     /// format's): what the walk routes by and lays each aligned row out in, so
     /// what BITWISE and LT count of it. The default is the per-table STARK's.
     pub memw_aligned_order: MemwAlignedOrder,
+    /// How register accesses are checked ([`RegisterFormat`], the block
+    /// format's): under [`RegisterFormat::InRow`] the walk makes no MEMW op for
+    /// a CPU row's own register accesses (it writes the row's side record) and
+    /// every other register access is a REGX row; the finish builds REGISTER a
+    /// register a row. The default is today's.
+    ///
+    /// [`RegisterFormat`]: super::register::RegisterFormat
+    /// [`RegisterFormat::InRow`]: super::register::RegisterFormat::InRow
+    pub register_format: super::register::RegisterFormat,
 }
 
 /// How the tables a block cuts at a fixed number of rows (KECCAK_RND, KECCAK,
@@ -8406,6 +8555,7 @@ fn collect_all_ops(
         general: memw_ops,
         words: _,
         order: _,
+        registers: _,
         refused: _,
     } = memw;
 
@@ -8441,6 +8591,7 @@ fn collect_all_ops(
 
     Ok(CollectedOps {
         cpu_ops,
+        cpu_side: Vec::new(),
         memw_ops,
         memw_aligned_ops,
         memw_register_rows,

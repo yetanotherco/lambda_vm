@@ -69,9 +69,27 @@ pub(super) fn unbalanced_with(
     traces: &mut Traces,
     over: &dyn Fn(&str) -> Option<Vec<BusInteraction>>,
 ) -> BTreeMap<u64, Vec<(Vec<u64>, i128)>> {
+    unbalanced_in(
+        program,
+        traces,
+        over,
+        crate::tables::register::RegisterFormat::Tokens32,
+    )
+    .0
+}
+
+/// [`unbalanced_with`] under the register format `registers` (its AIRs
+/// swapped as the block's are, [`crate::block_airs`]), and the number of rows
+/// that put a register token (`is_register = 1`) on the Memory bus.
+pub(super) fn unbalanced_in(
+    program: &Elf,
+    traces: &mut Traces,
+    over: &dyn Fn(&str) -> Option<Vec<BusInteraction>>,
+    registers: crate::tables::register::RegisterFormat,
+) -> (BTreeMap<u64, Vec<(Vec<u64>, i128)>>, usize) {
     let options = ProofOptions::default_test_options();
     let table_counts = traces.table_counts();
-    let airs = VmAirs::new(
+    let mut airs = VmAirs::new(
         program,
         &options,
         false,
@@ -88,6 +106,18 @@ pub(super) fn unbalanced_with(
         )
         .preprocessed(),
     );
+    if registers == crate::tables::register::RegisterFormat::InRow {
+        let inputs = crate::BlockAirInputs::new(
+            &options,
+            program,
+            crate::cpu_heights_from_traces(traces),
+            &traces.public_output_bytes,
+        )
+        .expect("the block's inputs");
+        airs.swap_in_row_registers(&options, &inputs);
+    }
+    let memory = u64::from(BusId::Memory);
+    let mut memory_register_tokens = 0usize;
     let outside: Vec<u64> = OUTSIDE.iter().map(|b| u64::from(*b)).collect();
     let mut net: HashMap<(u64, Vec<u64>), FE> = HashMap::new();
     // Each table's share of each tuple, to name the tables of a tuple left over.
@@ -100,6 +130,13 @@ pub(super) fn unbalanced_with(
         };
         for row in 0..trace.num_rows() {
             let g = |c: usize| *trace.get_main(row, c);
+            for bi in interactions.iter().filter(|bi| bi.bus_id == memory) {
+                let first = bi.values.first().map(|v| v.combine_from(g));
+                let is_register = first.is_some_and(|v: Vec<FE>| v.first() == Some(&FE::one()));
+                if is_register && multiplicity(&bi.multiplicity, &g) != FE::zero() {
+                    memory_register_tokens += 1;
+                }
+            }
             for bi in interactions
                 .iter()
                 .filter(|bi| !outside.contains(&bi.bus_id))
@@ -148,7 +185,7 @@ pub(super) fn unbalanced_with(
             by_bus.entry(bus).or_default().push((tuple, signed));
         }
     }
-    by_bus
+    (by_bus, memory_register_tokens)
 }
 
 pub(super) fn named(by_bus: &BTreeMap<u64, Vec<(Vec<u64>, i128)>>) -> String {
@@ -369,4 +406,97 @@ fn the_limbs_tables_send_lts_tokens_and_balance_every_inner_bus() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
     assert!(rows_seen > 0, "no program made a MEMW_A row");
+}
+
+/// ★ The in-row register format (`RegisterFormat::InRow`): on the same
+/// windowed builds, with the CPU rows checking their own register accesses,
+/// REGX taking the rest and the keep-alives, REGISTER a register a row and
+/// HALT's PC bridge on the REG bus, every inner bus balances — the REG bus is
+/// one of them, closed by REGISTER's verifier-known files — and no table puts
+/// a register token on the Memory bus any more.
+#[test]
+fn the_in_row_register_format_balances_every_inner_bus() {
+    use crate::tables::register::RegisterFormat;
+    type Configure = Box<dyn Fn(WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_>>;
+    let configs: Vec<(&str, Configure)> = vec![
+        ("plain", Box::new(|b| b)),
+        (
+            "dropped",
+            Box::new(|b| b.drop_streamed_ops().expect("before any window")),
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (sizes, max_rows) in [
+        ("small", MaxRowsConfig::small()),
+        ("2^4", MaxRowsConfig::uniform(4)),
+    ] {
+        for name in PROGRAMS {
+            let (program, logs) = run(name);
+            for window in [7, 1000] {
+                for (config, configure) in &configs {
+                    let mut traces = windowed(&program, &logs, &max_rows, window, &|b| {
+                        configure(b)
+                            .register_format(RegisterFormat::InRow)
+                            .expect("before any window")
+                    });
+                    let (left, tokens) =
+                        unbalanced_in(&program, &mut traces, &|_| None, RegisterFormat::InRow);
+                    if !left.is_empty() || tokens != 0 {
+                        failed.push(format!(
+                            "{name} {sizes} window {window} {config}: {} · register tokens on Memory {tokens}",
+                            named(&left)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// ★ The in-row register format's keep-alives: `keep_alive_regs` leaves two
+/// registers alone past a CPU slot's reach (2^16 timestamps), then reads one
+/// and writes the other. Each such access first moves the register's token
+/// with a REGX keep-alive, and so does the first access of a register after
+/// that long (its token is REGISTER's, at timestamp 1): `t2`, `t3`, then
+/// `t4`, `a0` and `a7`, five. Every inner bus still balances.
+#[test]
+fn the_in_row_register_format_keeps_long_idle_registers_alive() {
+    use crate::tables::register::RegisterFormat;
+    use crate::tables::regx::cols as regx;
+    let (program, logs) = run("keep_alive_regs");
+    for (sizes, max_rows) in [
+        ("small", MaxRowsConfig::small()),
+        ("default", MaxRowsConfig::default()),
+    ] {
+        for dropped in [false, true] {
+            let mut traces = windowed(&program, &logs, &max_rows, 1000, &|b| {
+                let b = b
+                    .register_format(RegisterFormat::InRow)
+                    .expect("before any window");
+                if dropped {
+                    b.drop_streamed_ops().expect("before any window")
+                } else {
+                    b
+                }
+            });
+            let keeps: usize = traces
+                .memw_registers
+                .iter()
+                .map(|t| {
+                    (0..t.num_rows())
+                        .filter(|&row| *t.get_main(row, regx::MU_KEEP) == FE::one())
+                        .count()
+                })
+                .sum();
+            assert_eq!(keeps, 5, "{sizes} dropped {dropped}: five keep-alives");
+            let (left, tokens) =
+                unbalanced_in(&program, &mut traces, &|_| None, RegisterFormat::InRow);
+            assert!(
+                left.is_empty() && tokens == 0,
+                "{sizes} dropped {dropped}: {} · register tokens on Memory {tokens}",
+                named(&left)
+            );
+        }
+    }
 }
