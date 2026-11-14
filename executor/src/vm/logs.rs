@@ -21,7 +21,11 @@
 /// executor evaluates where `src`, `dst` and `count` are all known. Today a row's
 /// width follows from the remaining count alone (eight bytes, or one for the last
 /// seven), so the CLI report just sums the carried counts.
+///
+/// `#[repr(C)]`: five `u64`s in this order and no padding, so a window's logs
+/// can cross to a card as they lie (the prover's card fill of the CPU table).
 #[derive(Debug, Clone)]
+#[repr(C)]
 pub struct Log {
     /// PC before instruction execution (use this to look up the instruction)
     pub current_pc: u64,
@@ -37,3 +41,52 @@ pub struct Log {
     /// For ECALL: see the per-syscall table above.
     pub dst_val: u64,
 }
+
+/// The buffer for a run's next window of `window` logs: `spare`, emptied,
+/// when it holds exactly that many (a window's buffer handed back for reuse,
+/// whose pages are already in memory), else a new one.
+pub(crate) fn next_buffer(spare: &mut Option<Vec<Log>>, window: usize) -> Vec<Log> {
+    match spare.take() {
+        Some(mut buffer) if buffer.capacity() == window => {
+            buffer.clear();
+            buffer
+        }
+        _ => Vec::with_capacity(window),
+    }
+}
+
+/// A buffer of `n` items whose memory is already written (so its pages are
+/// faulted in), empty: what a helper thread prepares so a run's next window
+/// is not written into fresh memory.
+pub fn prefaulted<T: Copy>(n: usize, fill: T) -> Vec<T> {
+    let mut buffer = Vec::with_capacity(n);
+    for slot in buffer.spare_capacity_mut() {
+        slot.write(fill);
+    }
+    buffer
+}
+
+/// [`prefaulted`] for logs.
+pub fn prefaulted_logs(n: usize) -> Vec<Log> {
+    let mut buffer: Vec<Log> = Vec::with_capacity(n);
+    for slot in buffer.spare_capacity_mut() {
+        slot.write(Log {
+            current_pc: 0,
+            next_pc: 0,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        });
+    }
+    buffer
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<Log>() == 40);
+    assert!(std::mem::align_of::<Log>() == 8);
+    assert!(std::mem::offset_of!(Log, current_pc) == 0);
+    assert!(std::mem::offset_of!(Log, next_pc) == 8);
+    assert!(std::mem::offset_of!(Log, src1_val) == 16);
+    assert!(std::mem::offset_of!(Log, src2_val) == 24);
+    assert!(std::mem::offset_of!(Log, dst_val) == 32);
+};

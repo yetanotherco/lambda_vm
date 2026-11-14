@@ -22,7 +22,7 @@ use num_traits::{Signed, Zero};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use crate::curve::{StepPts, replay_double_and_add};
+use crate::curve::{AffinePoint, StepPts, replay_double_and_add};
 use crate::{B, EcsmError, P_BYTES, R_BYTES, n, p, prepare, to_le_32};
 
 /// Full ECSM-chip witness for one scalar multiplication (one ECSM row).
@@ -86,7 +86,7 @@ pub struct EcdasStep {
 // =========================================================================
 
 /// Zero-extends a little-endian byte slice (≤ 64 bytes) to 64 `i128` limbs.
-fn ext64(bytes: &[u8]) -> [i128; 64] {
+pub(crate) fn ext64(bytes: &[u8]) -> [i128; 64] {
     let mut a = [0i128; 64];
     for (i, &b) in bytes.iter().enumerate() {
         a[i] = b as i128;
@@ -95,7 +95,7 @@ fn ext64(bytes: &[u8]) -> [i128; 64] {
 }
 
 /// Convolution `Σ_{j=0}^{i} a[j]·b[i-j]`.
-fn conv(a: &[i128; 64], b: &[i128; 64], i: usize) -> i128 {
+pub(crate) fn conv(a: &[i128; 64], b: &[i128; 64], i: usize) -> i128 {
     let mut s = 0i128;
     for j in 0..=i {
         s += a[j] * b[i - j];
@@ -108,7 +108,7 @@ fn conv(a: &[i128; 64], b: &[i128; 64], i: usize) -> i128 {
 ///
 /// These asserts catch any transcription error in the `terms` builders: for valid inputs
 /// the relation `LHS − RHS = 0` holds exactly, so every partial sum is divisible by 256.
-fn limb_carries(relation: &str, terms: &[i128; 64]) -> [i64; 64] {
+pub(crate) fn limb_carries(relation: &str, terms: &[i128; 64]) -> [i64; 64] {
     let mut c = [0i64; 64];
     let mut carry: i128 = 0;
     for i in 0..64 {
@@ -134,7 +134,12 @@ fn limb_carries(relation: &str, terms: &[i128; 64]) -> [i64; 64] {
 // =========================================================================
 
 /// ECSM `x2` relation: `xG^2 − x2 − q0·p = 0`.
-fn carries_x2(xg: &[i128; 64], x2: &[i128; 64], q0: &[i128; 64], pp: &[i128; 64]) -> [i64; 64] {
+pub(crate) fn carries_x2(
+    xg: &[i128; 64],
+    x2: &[i128; 64],
+    q0: &[i128; 64],
+    pp: &[i128; 64],
+) -> [i64; 64] {
     let mut terms = [0i128; 64];
     for i in 0..64 {
         terms[i] = conv(xg, xg, i) - x2[i] - conv(q0, pp, i);
@@ -143,7 +148,7 @@ fn carries_x2(xg: &[i128; 64], x2: &[i128; 64], q0: &[i128; 64], pp: &[i128; 64]
 }
 
 /// ECSM `yG` relation: `yG^2 + p^2 − xG·x2 − b − q1·p = 0`.
-fn carries_yg(
+pub(crate) fn carries_yg(
     yg: &[i128; 64],
     pp: &[i128; 64],
     x2: &[i128; 64],
@@ -244,7 +249,7 @@ fn carries_yr(
 // =========================================================================
 
 /// Little-endian 33 bytes of a non-negative value that fits in 264 bits.
-fn to_le_33(relation: &str, v: &BigUint) -> [u8; 33] {
+pub(crate) fn to_le_33(relation: &str, v: &BigUint) -> [u8; 33] {
     let mut bytes = v.to_bytes_le();
     assert!(
         bytes.len() <= 33,
@@ -258,7 +263,12 @@ fn to_le_33(relation: &str, v: &BigUint) -> [u8; 33] {
 
 /// `r + numerator / p`, where `numerator` must be divisible by `p`. Asserts divisibility
 /// and that the result is non-negative (guaranteed by the spec quotient ranges).
-fn shifted_quotient(relation: &str, numerator: &BigInt, p_big: &BigInt, r_big: &BigInt) -> BigUint {
+pub(crate) fn shifted_quotient(
+    relation: &str,
+    numerator: &BigInt,
+    p_big: &BigInt,
+    r_big: &BigInt,
+) -> BigUint {
     let (q, rem) = numerator.div_rem(p_big);
     assert!(
         rem.is_zero(),
@@ -280,6 +290,26 @@ fn shifted_quotient(relation: &str, numerator: &BigInt, p_big: &BigInt, r_big: &
 /// little-endian 32-byte values. This is the prover's entry point.
 pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness, EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
+    Ok(witness_for_point(&k, &g, k_le))
+}
+
+/// [`compute_witness`] for a scalar already checked to be in `[1, N)` and a point already
+/// on the curve with canonical coordinates, whichever root its `y` is (`k_le` is `k`'s
+/// bytes). The ECDSA-recovery call builds its two chains with it.
+pub(crate) fn witness_for_point(k: &BigUint, g: &AffinePoint, k_le: &[u8; 32]) -> EcsmWitness {
+    witness_for_point_in(k, g, k_le, true)
+}
+
+/// [`witness_for_point`], its steps built in parallel (`parallel`, with the
+/// `parallel` feature) or one after another on the calling thread. The same
+/// witness either way.
+pub(crate) fn witness_for_point_in(
+    k: &BigUint,
+    g: &AffinePoint,
+    k_le: &[u8; 32],
+    parallel: bool,
+) -> EcsmWitness {
+    let (k, g) = (k.clone(), g.clone());
 
     let p_big = BigInt::from(p());
     let r_big = BigInt::from(BigUint::from_bytes_le(&R_BYTES)); // r = 3p
@@ -332,17 +362,27 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
     // Steps are independent witnesses (each builds its own λ/quotient/carry data
     // from one StepPts), so they parallelize freely when rayon is available.
     #[cfg(feature = "parallel")]
-    let steps = steps_pts
-        .par_iter()
-        .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
-        .collect();
+    let steps = if parallel {
+        steps_pts
+            .par_iter()
+            .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
+            .collect()
+    } else {
+        steps_pts
+            .iter()
+            .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
+            .collect()
+    };
     #[cfg(not(feature = "parallel"))]
-    let steps = steps_pts
-        .iter()
-        .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
-        .collect();
+    let steps = {
+        let _ = parallel;
+        steps_pts
+            .iter()
+            .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
+            .collect()
+    };
 
-    Ok(EcsmWitness {
+    EcsmWitness {
         x_g: xg_b,
         y_g: yg_b,
         k: *k_le,
@@ -358,11 +398,11 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
         x_r,
         y_r,
         steps,
-    })
+    }
 }
 
 /// Builds one ECDAS step witness (λ, quotients, carries) from a point-level step.
-fn build_step(
+pub(crate) fn build_step(
     s: &StepPts,
     p_big: &BigInt,
     r_big: &BigInt,

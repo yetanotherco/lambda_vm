@@ -41,6 +41,20 @@ impl Registers {
         Ok(())
     }
 
+    /// The registers held as all 32 (`regs[0]` ignored).
+    pub(crate) fn from_array(regs: &[u64; 32]) -> Self {
+        let mut registers = Registers([0; 31]);
+        registers.0.copy_from_slice(&regs[1..]);
+        registers
+    }
+
+    /// All 32 registers, `x0` (always zero) included.
+    pub(crate) fn to_array(&self) -> [u64; 32] {
+        let mut regs = [0u64; 32];
+        regs[1..].copy_from_slice(&self.0);
+        regs
+    }
+
     /// Read the return values (aka registers a0 & a1)
     pub fn read_return_values(&self) -> (u64, u64) {
         (self.0[9], self.0[10])

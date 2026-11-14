@@ -174,6 +174,10 @@ pub struct CompositionAccum<'a> {
     /// device buffer (kernel indexing `b * num_rows + row`) — no PCIe traffic
     /// per dispatch.
     pub b_z_inv: &'a [&'a GpuBaseVec],
+    /// Sub-coset stride: `H` is produced at LDE rows `0, s, 2s, …` only
+    /// (`num_rows / s` output rows). 1 is the whole LDE coset. Must divide
+    /// `num_rows`.
+    pub row_stride: usize,
 }
 
 /// A base-field column resident on device, uploaded once and reused across
@@ -248,6 +252,13 @@ fn eval_composition_launch(
         "b_beta ext3 per boundary"
     );
 
+    let row_stride = accum.row_stride;
+    assert!(
+        row_stride >= 1 && num_rows.is_multiple_of(row_stride),
+        "row_stride must divide the LDE row count"
+    );
+    let num_out = num_rows / row_stride;
+
     let be = backend()?;
     let stream = be.next_stream();
     main.wait_ready_on(&stream)?;
@@ -284,14 +295,14 @@ fn eval_composition_launch(
     }
 
     let max_grid = MAX_THREADS / BLOCK_DIM;
-    let grid = (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);
+    let grid = (num_out as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);
     let num_threads = (grid as usize) * (BLOCK_DIM as usize);
 
     // Per-thread slot scratch, uninitialized (the walk writes before reading).
     let mut d_vals_base = unsafe { stream.alloc::<u64>((num_base_slots * num_threads).max(1)) }?;
     let mut d_vals_ext = unsafe { stream.alloc::<u64>((num_ext_slots * 3 * num_threads).max(1)) }?;
-    // Output: every row is written by the grid-stride loop.
-    let mut d_h = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
+    // Output: every output row is written by the grid-stride loop.
+    let mut d_h = unsafe { stream.alloc::<u64>(num_out * 3) }?;
 
     let num_nodes_u64 = num_nodes as u64;
     let num_roots_u64 = num_roots as u64;
@@ -299,6 +310,7 @@ fn eval_composition_launch(
     let aux_stride = aux.lde_size as u64;
     let next_step_u64 = next_step as u64;
     let num_rows_u64 = num_rows as u64;
+    let row_stride_u64 = row_stride as u64;
     let z_len_u64 = (accum.z_inv.len() as u64).max(1);
     let num_boundary_u64 = num_boundary as u64;
 
@@ -326,6 +338,7 @@ fn eval_composition_launch(
             .arg(&aux_stride)
             .arg(&next_step_u64)
             .arg(&num_rows_u64)
+            .arg(&row_stride_u64)
             .arg(&d_beta_trans)
             .arg(&d_z_inv)
             .arg(&z_len_u64)
@@ -344,8 +357,9 @@ fn eval_composition_launch(
 
 /// Evaluate the constraints AND fuse the composition accumulation on-device:
 /// `H(row) = z_inv[row]·Σ βᵢ·Cᵢ + Σ_b z_b_inv[row]·β_b·(trace_b − value_b)`,
-/// returning `H` as raw ext3 limbs (`num_rows * 3` u64, `out[row*3 + k]`). No
-/// per-constraint matrix is materialized.
+/// returning `H` as raw ext3 limbs (`(num_rows / accum.row_stride) * 3` u64,
+/// `out[out_row*3 + k]` for LDE row `out_row * row_stride`). No per-constraint
+/// matrix is materialized.
 ///
 /// Uniform-zerofier case only (the VM has no end-exemptions); the caller gates
 /// on `is_uniform` and falls back to CPU otherwise.
@@ -397,7 +411,8 @@ pub fn eval_composition_on_device(
 
 /// The composition evals `H` resident on device (interleaved ext3,
 /// `num_rows * 3` u64), with the stream that produced them: downstream device
-/// consumers enqueue on the same stream for ordering.
+/// consumers enqueue on the same stream for ordering. `num_rows` counts the
+/// rows `H` was evaluated at — the LDE size divided by the sub-coset stride.
 pub struct GpuCompH {
     buf: CudaSlice<u64>,
     pub num_rows: usize,
@@ -442,7 +457,7 @@ pub fn eval_composition_on_device_keep(
     )?;
     Ok(GpuCompH {
         buf,
-        num_rows,
+        num_rows: num_rows / accum.row_stride,
         stream,
     })
 }
@@ -462,6 +477,27 @@ pub fn download_comp_h(h: &GpuCompH) -> Result<Vec<u64>> {
     Ok(out)
 }
 
+/// [`download_comp_h`] through the staging pairs (32 MiB pinned chunks,
+/// double-buffered) instead of the shared pinned slab. The slab grows to the
+/// largest drain it has served, and a growth is a `cuMemHostAlloc` of the new
+/// size that holds the driver's lock — every other thread's CUDA call waits
+/// behind it (≈ 0.23 s for a 192 MiB `H`, the card idle meanwhile). The pairs
+/// never grow. Same words.
+pub fn download_comp_h_staged(h: &GpuCompH) -> Result<Vec<u64>> {
+    use cudarc::driver::DevicePtr;
+    let mut out = Vec::new();
+    let src = {
+        let (ptr, _record) = h.buf.device_ptr(&h.stream);
+        ptr
+    };
+    // SAFETY: `src` is `h.buf`, `h.buf.len()` words written by kernels queued on
+    // `h.stream` before this call, and kept alive by `h` past the last chunk.
+    unsafe {
+        crate::device::dtoh_staged_into(&h.stream, src, h.buf.len(), &mut out, || Ok(()))?;
+    }
+    Ok(out)
+}
+
 /// Degree-2 quotient decomposition on device: splits a resident `H` (2n rows)
 /// into the two halves `H0/H1`, written in zero-padded slab layout (6 slabs of
 /// `lde_size = 2n` u64, first `n` filled) ready for the batched slab LDE.
@@ -471,10 +507,28 @@ pub fn decompose_d2_into_slabs(
     inv_2x: &GpuBaseVec,
     two_inv: u64,
 ) -> Result<(CudaSlice<u64>, Arc<CudaStream>, usize)> {
+    decompose_d2_into_slabs_strided(h, inv_2x, two_inv, 1, h.num_rows)
+}
+
+/// [`decompose_d2_into_slabs`] for an `H` evaluated on a sub-coset of the LDE
+/// coset (every `inv_stride`-th LDE row; 2n rows): `inv_2x` is the full coset's
+/// `1/(2x)` table, read at `i * inv_stride`, and the slabs are `lde_size` u64
+/// each (first `n` filled, the rest the zero-pad of an n → `lde_size` LDE).
+pub fn decompose_d2_into_slabs_strided(
+    h: &GpuCompH,
+    inv_2x: &GpuBaseVec,
+    two_inv: u64,
+    inv_stride: usize,
+    lde_size: usize,
+) -> Result<(CudaSlice<u64>, Arc<CudaStream>, usize)> {
     let n = h.num_rows / 2;
     assert_eq!(h.num_rows, n * 2, "H row count must be even");
-    assert!(inv_2x.len() >= n, "inv_2x must cover the half domain");
-    let lde_size = h.num_rows;
+    assert!(inv_stride >= 1, "inv_stride must be positive");
+    assert!(
+        n == 0 || inv_2x.len() > (n - 1) * inv_stride,
+        "inv_2x must cover the sub-coset's half"
+    );
+    assert!(lde_size >= h.num_rows, "slabs must hold the evaluated rows");
     let be = backend()?;
     let stream = h.stream.clone();
     let mut out = stream.alloc_zeros::<u64>(6 * lde_size)?;
@@ -489,6 +543,7 @@ pub fn decompose_d2_into_slabs(
     };
     let n_u64 = n as u64;
     let stride_u64 = lde_size as u64;
+    let inv_stride_u64 = inv_stride as u64;
     unsafe {
         stream
             .launch_builder(&be.decompose_d2_kernel)
@@ -497,6 +552,7 @@ pub fn decompose_d2_into_slabs(
             .arg(&two_inv)
             .arg(&n_u64)
             .arg(&stride_u64)
+            .arg(&inv_stride_u64)
             .arg(&mut out)
             .launch(cfg)?;
     }

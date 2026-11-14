@@ -354,13 +354,6 @@ pub enum BusId {
     Bit = 30,
 
     // =========================================================================
-    // Copy accelerator
-    // =========================================================================
-    // ID 29 is unused (32 is IS_WH, below). The copy primitive chains over a single
-    // [`BusId::CopyNext`] and carries the functionality selectors inside the tuple,
-    // rather than giving each of its three operations a bus of its own.
-
-    // =========================================================================
     // Continuations
     // =========================================================================
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
@@ -368,13 +361,26 @@ pub enum BusId {
     GlobalMemory = 31,
 
     // =========================================================================
-    // Address range checks
+    // LFM — the Lambda Field Machine (recursion machine; `lfm` module)
     // =========================================================================
-    /// `IS_WH[Word, Half]`: range check that the top 48 bits of a `DWordWHH`
-    /// are a valid `(Word, Half)` pair. Callers send it through the `IS_WHH`
-    /// template; the IS_WH table receives it. ID 29 (the removed EC_SCALAR
-    /// `ServeK` bus) stays unused.
-    IsWh = 32,
+    /// LFM write-once memory: token `(addr, v0..v3)`. Writes send with the
+    /// preprocessed static read count; reads receive gated by is_real.
+    LfmMem = 32,
+    /// LFM 16-bit range lookup (the `LFM_RANGE` fixed table).
+    LfmRange = 33,
+    /// LFM public values: token `(index, v0..v3)`; closed by a
+    /// consumer-computed balance (the COMMIT-bus pattern).
+    LfmPublic = 34,
+
+    // =========================================================================
+    // BLAKE3 chained absorb
+    // =========================================================================
+    /// BLAKE3 absorb self-referencing chain (row N → row N+1 of one absorb
+    /// group): `(timestamp, remaining, msg_base, ctrl_addr, cv[0..8])`.
+    ///
+    /// ID 35 rather than 29: 29 is a gap left by a removed bus and reusing it
+    /// would make a stale artifact decode as this one.
+    Blake3Absorb = 35,
 
     // =========================================================================
     // Unified copy primitive
@@ -385,9 +391,30 @@ pub enum BusId {
     /// previous one. The functionality selectors travel inside the tuple, so a chain
     /// cannot change operation half way through it — a guarantee that separating the
     /// operations by bus id would otherwise have to carry structurally.
-    CopyNext = 33,
-    // ID 34 is unused. COPY receives the `write` ECALL and reads its operand
-    // registers itself, so nothing defers the commit to a second chip.
+    ///
+    /// ID 36: 32–35 are the LFM and BLAKE3 absorb buses, and 20 and 29 are gaps
+    /// left by removed buses, which a stale artifact would decode as this one.
+    CopyNext = 36,
+
+    // =========================================================================
+    // Address range checks
+    // =========================================================================
+    /// `IS_WH[Word, Half]`: range check that the top 48 bits of a `DWordWHH`
+    /// are a valid `(Word, Half)` pair. Callers send it through the `IS_WHH`
+    /// template; the IS_WH table receives it. Main numbers it 32, which the LFM
+    /// buses hold here; 37 is the next free ID (20 and 29 stay unused).
+    IsWh = 37,
+
+    // =========================================================================
+    // Keccak-256 of a buffer
+    // =========================================================================
+    /// KECCAK's sponge-mode chain: block `j` of a `keccak256` call sends
+    /// `(T, j + 1, count − 136, src + 136, src_hi, out_lo, out_hi, state[200])` to
+    /// the row of block `j + 1`, which receives it as its own `(T, j, count, src,
+    /// …, previous state)`.
+    ///
+    /// ID 38: the next free one (20 and 29 stay unused).
+    KeccakSponge = 38,
 }
 
 impl BusId {
@@ -408,6 +435,7 @@ impl BusId {
             BusId::Ecall => "Ecall",
             BusId::Commit => "Commit",
             BusId::CopyNext => "CopyNext",
+            BusId::KeccakSponge => "KeccakSponge",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
             BusId::ByteAlu => "ByteAlu",
@@ -417,6 +445,10 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::LfmMem => "LfmMem",
+            BusId::LfmRange => "LfmRange",
+            BusId::LfmPublic => "LfmPublic",
+            BusId::Blake3Absorb => "Blake3Absorb",
             BusId::IsWh => "IsWh",
         }
     }
@@ -449,8 +481,13 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
-            32 => Ok(BusId::IsWh),
-            33 => Ok(BusId::CopyNext),
+            32 => Ok(BusId::LfmMem),
+            33 => Ok(BusId::LfmRange),
+            34 => Ok(BusId::LfmPublic),
+            35 => Ok(BusId::Blake3Absorb),
+            36 => Ok(BusId::CopyNext),
+            38 => Ok(BusId::KeccakSponge),
+            37 => Ok(BusId::IsWh),
             other => Err(other),
         }
     }
@@ -531,8 +568,22 @@ pub const MU_MAX: u64 = u8::MAX as u64;
 /// several rows when its count exceeds [`MU_MAX`]. Shared by trace generation
 /// and the BITWISE collectors of LT, BYTEWISE and BRANCH so the per-row lookups
 /// they count cannot drift apart.
+///
+/// The map hashes with the process's one state (`tables::trace_hash`), so the
+/// rows come out in one order for one operation list: a streamed chunk built
+/// again is the chunk it was.
 pub fn dedup_rows<T: std::hash::Hash + Eq + Clone>(operations: &[T]) -> Vec<(T, u64)> {
-    let mut op_map: std::collections::HashMap<T, u64> = std::collections::HashMap::new();
+    dedup_rows_of(operations.iter())
+}
+
+/// [`dedup_rows`] over the operations an iterator yields, one after another (a
+/// chunk handed out as the window parts it lies in).
+pub fn dedup_rows_of<'a, T: std::hash::Hash + Eq + Clone + 'a>(
+    operations: impl Iterator<Item = &'a T>,
+) -> Vec<(T, u64)> {
+    use super::trace_hash::{OpMap, trace_hash_state};
+
+    let mut op_map: OpMap<T, u64> = OpMap::with_hasher(trace_hash_state());
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
@@ -546,6 +597,26 @@ pub fn dedup_rows<T: std::hash::Hash + Eq + Clone>(operations: &[T]) -> Vec<(T, 
         }
     }
     rows
+}
+
+/// Rows of operations by merging equal neighbours, with no map: each op joins
+/// the row before it when that row holds the same op below [`MU_MAX`], and
+/// starts a row otherwise. An op that comes back after another starts a new
+/// row, so the rows can be more than [`dedup_rows_of`]'s, but each op's μ
+/// summed over its rows is the same: the multiset a lookup receiver puts on
+/// its bus. The rows are a function of the ops and their order alone, so the
+/// same ops in the same order give the same rows. Appended to `rows`, merging
+/// with its last row: a list handed over a slice at a time merges as one.
+pub fn merge_rows_into<'a, T: Eq + Clone + 'a>(
+    rows: &mut Vec<(T, u64)>,
+    operations: impl Iterator<Item = &'a T>,
+) {
+    for op in operations {
+        match rows.last_mut() {
+            Some((last, mu)) if *mu < MU_MAX && last == op => *mu += 1,
+            _ => rows.push((op.clone(), 1)),
+        }
+    }
 }
 
 // =========================================================================

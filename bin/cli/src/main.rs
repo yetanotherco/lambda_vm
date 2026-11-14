@@ -51,13 +51,75 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // "_rjem_malloc_conf")]`, its `src/lib.rs`). None of that is compiler-checked.
 // `prover/tests/jemalloc_conf.rs` reads both options back out of jemalloc, but
 // it carries its own copy of this block and reads its own process — it pins the
-// pattern, not this export. Deleting the lines below turns nothing red.
+// pattern. This binary's own unit tests read this export back
+// (`the_binary_runs_its_never_purge_posture`): deleting the lines below turns
+// that test red.
 const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static malloc_conf: Option<&'static core::ffi::c_char> =
     Some(unsafe { &*(NEVER_PURGE.as_ptr() as *const core::ffi::c_char) });
+
+/// This binary's jemalloc, as the prover asks it (`prover::alloc_purge`): its
+/// statistics, and a purge of every arena's dirty pages. Installed at the top
+/// of `main`, so the block's purge points (`LAMBDA_VM_ALLOC_PURGE`, `auto` by
+/// default) run here as they do in the prover's own tests. It also reads back
+/// the never-purge posture it runs for the `BLOCK POSTURE SET` line and its
+/// test.
+mod allocator {
+    use prover::alloc_purge::{AllocStats, AllocatorHooks};
+
+    pub const HOOKS: AllocatorHooks = AllocatorHooks { stats, purge_all };
+
+    /// jemalloc's statistics, the epoch turned first (they are cached until
+    /// it turns).
+    fn stats() -> Option<AllocStats> {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        epoch::advance().ok()?;
+        Some(AllocStats {
+            allocated: stats::allocated::read().ok()?,
+            active: stats::active::read().ok()?,
+            resident: stats::resident::read().ok()?,
+            mapped: stats::mapped::read().ok()?,
+            retained: stats::retained::read().ok()?,
+        })
+    }
+
+    /// `arena.<MALLCTL_ARENAS_ALL>.purge` (4096, jemalloc's "every arena"
+    /// index): a control that neither reads nor writes, so every pointer is
+    /// null.
+    fn purge_all() -> bool {
+        // SAFETY: the name is NUL-terminated, and a control that takes no
+        // value is called with null old and new pointers and zero lengths, as
+        // jemalloc's `NEITHER_READ_NOR_WRITE` requires.
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                c"arena.4096.purge".as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            eprintln!("ALLOC PURGE: arena.4096.purge returned {rc}");
+        }
+        rc == 0
+    }
+
+    /// The running `opt.dirty_decay_ms` and `opt.muzzy_decay_ms`: `-1` is the
+    /// never-purge posture this binary compiles in.
+    pub fn decay_ms() -> Option<(isize, isize)> {
+        // SAFETY: both names are NUL-terminated `ssize_t` options.
+        unsafe {
+            Some((
+                tikv_jemalloc_ctl::raw::read(b"opt.dirty_decay_ms\0").ok()?,
+                tikv_jemalloc_ctl::raw::read(b"opt.muzzy_decay_ms\0").ok()?,
+            ))
+        }
+    }
+}
 
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
@@ -236,6 +298,14 @@ enum Commands {
         #[arg(long)]
         continuations: bool,
 
+        /// Prove with the multilinear backend (WHIR) instead of FRI.
+        ///
+        /// A different proof format: verify it with `verify --whir`. The
+        /// multilinear path derives its own rate and query count from the
+        /// trace, so `--blowup` does not apply to it.
+        #[arg(long, conflicts_with = "continuations")]
+        whir: bool,
+
         /// Continuation epoch size as log2(cycles); e.g. 20 means 1,048,576 cycles.
         #[arg(
             long,
@@ -268,6 +338,212 @@ enum Commands {
         /// Verify a continuation proof bundle (produced by `prove --continuations`)
         #[arg(long)]
         continuations: bool,
+
+        /// Verify a multilinear proof (produced by `prove --whir`)
+        #[arg(long, conflicts_with = "continuations")]
+        whir: bool,
+    },
+
+    /// Prove a whole block as a recursion tree, base to top node
+    ///
+    /// The block's no-epoch WHIR base proof, the leaves that verify its
+    /// groups, the nodes and the top: one proof a consumer verifies with
+    /// `verify-block` against the ELF. Needs a `--features cuda` build. The
+    /// production posture (table parallelism, retention, the grind's search,
+    /// ...) is set for every knob the environment leaves unset; the `BLOCK
+    /// POSTURE` lines on stderr say which. The base hash is the build's
+    /// (`hash_pin::BLOCK_BASE`), a constant `verify-block` shares.
+    ProveBlock {
+        /// Path to the guest ELF
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
+
+        /// The block's private input (the guest reads it with `get_private_input()`)
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        input: Option<PathBuf>,
+
+        /// Output path for the block proof
+        #[arg(short, long, value_hint = ValueHint::FilePath)]
+        output: PathBuf,
+
+        /// Print the whole run's wall (base to top node)
+        #[arg(long)]
+        time: bool,
+
+        /// Print the blake3 digest of the top proof's bytes
+        #[arg(long)]
+        digest: bool,
+
+        /// Ship the tree's top file instead of the compressed one (the
+        /// rollback; `verify-block --tree-file` reads it). By default the
+        /// block ships its compressed file, whose format is the CLI's
+        /// constant (`whir_block_tree::DEFAULT_SHIPPED`) at the pinned format
+        /// flags (their defaults).
+        #[arg(long)]
+        tree_file: bool,
+
+        /// How each group's stacked polynomials are opened: one chain per run
+        /// of up to four (`indexed`, production) or one per polynomial
+        /// (`per-poly`). A format choice: `verify-block` must be given the
+        /// same one; the proof file does not carry it.
+        #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "indexed")]
+        group: String,
+
+        /// The WHIR base code's blowup: 2 (production) or 4 (the legacy rate),
+        /// its query count from the code's own rule. A format choice:
+        /// `verify-block` must be given the same one; the proof file does not
+        /// carry it.
+        #[arg(long, value_parser = ["2", "4"], default_value = "2")]
+        blowup: String,
+
+        /// Where the WHIR round-0 trees put their leaves: each query's coset
+        /// together (`coset`, production) or in the codeword's order
+        /// (`natural`). A format choice: `verify-block` must be given the same
+        /// one; the proof file does not carry it.
+        #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
+        leaves: String,
+
+        /// How many WHIR round-0 trees a group's chain commits: one a stacked
+        /// polynomial (`each`) or one for each run of them (`one`). Unset, the
+        /// format's default, or `each` under `--leaves natural`. A format
+        /// choice: `verify-block` must be given the same one; the proof file
+        /// does not carry it.
+        #[arg(long, value_parser = ["each", "one"])]
+        trees: Option<String>,
+
+        /// The recursion's leaf scale: `one-top` (production) doubles every
+        /// leaf and puts at most three under one top; a count `T` doubles the
+        /// leaves' chip heights when the single heights take `T` leaves or
+        /// more; `off` keeps every leaf at the single heights. A format choice:
+        /// `verify-block` must be given the same one; the proof file does not
+        /// carry it.
+        #[arg(long, value_parser = leaf_double_from_word, default_value = "one-top")]
+        leaf_double_from: String,
+
+        /// How the recursion's leaves check each chain's queries: `lean`
+        /// (production: round 0's values four to a word, paths walked on
+        /// rotated hints, and the tail rounds wholly in their caps checked at
+        /// every leaf once) or `v1` (every query opened and folded one by
+        /// one). A format choice: `verify-block` must be given the same one;
+        /// the proof file does not carry it.
+        #[arg(long, value_parser = ["v1", "lean"], default_value = "lean")]
+        leaf_query: String,
+
+        /// How the base's batched argue lays a table's interactions into GKR
+        /// trees: a price `τ` in 0..=40, a table cut into equal chunk trees
+        /// where that saves more input cells than the 2^τ each extra tree is
+        /// priced at (production: 22), or `off` (one tree a table). A format
+        /// choice: `verify-block` must be given the same one; the proof file
+        /// does not carry it.
+        #[arg(long, value_parser = argue_pack_word, default_value = "22")]
+        argue_pack: String,
+    },
+
+    /// Verify a block proof produced by `prove-block`
+    VerifyBlock {
+        /// Path to the block proof
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        proof: PathBuf,
+
+        /// Path to the guest ELF the block ran (trusted)
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
+
+        /// Print verification time
+        #[arg(long)]
+        time: bool,
+
+        /// Verify the tree's top file (`prove-block --tree-file`) instead of
+        /// the compressed one. Without it the file is verified as the CLI's
+        /// compressed format (`whir_block_tree::DEFAULT_SHIPPED`), at the
+        /// pinned format flags (their defaults); the file does not choose.
+        #[arg(long)]
+        tree_file: bool,
+
+        /// The group opening the block was proved with (`prove-block
+        /// --group`): the verifier's constant, never read from the proof.
+        #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "indexed")]
+        group: String,
+
+        /// The WHIR blowup the block was proved with (`prove-block
+        /// --blowup`): the verifier's constant, never read from the proof.
+        #[arg(long, value_parser = ["2", "4"], default_value = "2")]
+        blowup: String,
+
+        /// The round-0 leaf order the block was proved with (`prove-block
+        /// --leaves`): the verifier's constant, never read from the proof.
+        #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
+        leaves: String,
+
+        /// The round-0 trees the block was proved with (`prove-block
+        /// --trees`; unset, as there): the verifier's constant, never read from
+        /// the proof.
+        #[arg(long, value_parser = ["each", "one"])]
+        trees: Option<String>,
+
+        /// The leaf scale the block was proved with (`prove-block
+        /// --leaf-double-from`): the verifier's constant, never read from the
+        /// proof.
+        #[arg(long, value_parser = leaf_double_from_word, default_value = "one-top")]
+        leaf_double_from: String,
+
+        /// The leaves' query check the block was proved with (`prove-block
+        /// --leaf-query`): the verifier's constant, never read from the proof.
+        #[arg(long, value_parser = ["v1", "lean"], default_value = "lean")]
+        leaf_query: String,
+
+        /// The GKR packing the block was proved with (`prove-block
+        /// --argue-pack`, production 22): the verifier's constant, never read
+        /// from the proof.
+        #[arg(long, value_parser = argue_pack_word, default_value = "22")]
+        argue_pack: String,
+    },
+
+    /// Prove a block's WHIR BASE proof alone — no recursion over it — and
+    /// verify it on the host (the opt-in BLAKE3 base proves here and only here)
+    ///
+    /// The production base prover and posture, without the tree: the base
+    /// under `--base p1` (the block family's Poseidon1, today's) or `--base b3`
+    /// (standard 7-round BLAKE3, binary trees under the format's binary cap).
+    /// The process declares itself base-only before anything is proved, so no
+    /// recursion runs in it under either base. Prints the phase stamps, the
+    /// base's seconds, its serialized bytes, the host verifier's seconds and
+    /// verdict. Needs a `--features cuda` build to run on the card.
+    ProveBlockBase {
+        /// Path to the guest ELF
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
+
+        /// The block's private input (the guest reads it with `get_private_input()`)
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        input: Option<PathBuf>,
+
+        /// Where to write the base proof's rkyv bytes (not written when omitted)
+        #[arg(short, long, value_hint = ValueHint::FilePath)]
+        output: Option<PathBuf>,
+
+        /// The base's hash: `p1` (the block family's Poseidon1, production) or
+        /// `b3` (standard 7-round BLAKE3, base-only).
+        #[arg(long, value_parser = ["p1", "b3"], default_value = "p1")]
+        base: String,
+
+        /// As `prove-block --group`.
+        #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "indexed")]
+        group: String,
+
+        /// As `prove-block --blowup`.
+        #[arg(long, value_parser = ["2", "4"], default_value = "2")]
+        blowup: String,
+
+        /// As `prove-block --leaves`.
+        #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
+        leaves: String,
+
+        /// As `prove-block --trees`: unset is the format's default (one tree
+        /// a run) under both bases, whose trees both have a joint leaf;
+        /// `each` is the rollback.
+        #[arg(long, value_parser = ["each", "one"])]
+        trees: Option<String>,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -284,7 +560,20 @@ enum Commands {
 
 fn main() -> ExitCode {
     env_logger::init();
+    prover::alloc_purge::install(allocator::HOOKS);
     let cli = Cli::parse();
+    // Still single-threaded here: clap and env_logger spawn nothing.
+    if matches!(
+        cli.command,
+        Commands::ProveBlock { .. }
+            | Commands::VerifyBlock { .. }
+            | Commands::ProveBlockBase { .. }
+    ) {
+        // SAFETY: no thread but this one exists yet.
+        for line in unsafe { apply_posture() } {
+            eprintln!("{line}");
+        }
+    }
 
     match cli.command {
         Commands::Execute {
@@ -316,6 +605,7 @@ fn main() -> ExitCode {
             elements,
             continuations,
             epoch_size_log2,
+            whir,
         } => {
             if continuations {
                 cmd_prove_continuation(
@@ -327,6 +617,8 @@ fn main() -> ExitCode {
                     time,
                     cycles,
                 )
+            } else if whir {
+                cmd_prove_whir(elf, output, private_input, blowup, time)
             } else {
                 cmd_prove(elf, output, private_input, blowup, time, cycles, elements)
             }
@@ -337,15 +629,973 @@ fn main() -> ExitCode {
             blowup,
             time,
             continuations,
+            whir,
         } => {
             if continuations {
                 cmd_verify_continuation(proof, elf, blowup, time)
+            } else if whir {
+                cmd_verify_whir(proof, elf, blowup, time)
             } else {
                 cmd_verify(proof, elf, blowup, time)
             }
         }
+        Commands::ProveBlock {
+            elf,
+            input,
+            output,
+            time,
+            digest,
+            tree_file,
+            group,
+            blowup,
+            leaves,
+            trees,
+            leaf_double_from,
+            leaf_query,
+            argue_pack,
+        } => cmd_prove_block(
+            elf,
+            input,
+            output,
+            time,
+            digest,
+            tree_file,
+            BlockChoices {
+                group: &group,
+                blowup: &blowup,
+                leaves: &leaves,
+                trees: trees.as_deref(),
+                leaf_double_from: &leaf_double_from,
+                leaf_query: &leaf_query,
+                argue_pack: &argue_pack,
+            },
+        ),
+        Commands::VerifyBlock {
+            proof,
+            elf,
+            time,
+            tree_file,
+            group,
+            blowup,
+            leaves,
+            trees,
+            leaf_double_from,
+            leaf_query,
+            argue_pack,
+        } => cmd_verify_block(
+            proof,
+            elf,
+            time,
+            tree_file,
+            BlockChoices {
+                group: &group,
+                blowup: &blowup,
+                leaves: &leaves,
+                trees: trees.as_deref(),
+                leaf_double_from: &leaf_double_from,
+                leaf_query: &leaf_query,
+                argue_pack: &argue_pack,
+            },
+        ),
+        Commands::ProveBlockBase {
+            elf,
+            input,
+            output,
+            base,
+            group,
+            blowup,
+            leaves,
+            trees,
+        } => cmd_prove_block_base(
+            elf,
+            input,
+            output,
+            &base,
+            &group,
+            &blowup,
+            &leaves,
+            trees.as_deref(),
+        ),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
     }
+}
+
+/// What the posture does in an environment: the knobs it sets (each posture
+/// knob the environment leaves unset), the ones the environment already sets,
+/// and notes on the knobs it set to something other than the table's value.
+struct PosturePlan {
+    set: Vec<(&'static str, &'static str)>,
+    env: Vec<String>,
+    notes: Vec<String>,
+}
+
+/// The posture against the environment `env` and the host `target` (bytes):
+/// the precomputed-tree cache's cap follows the target
+/// ([`prover::lfm::whir_block_tree::posture_tree_cache_cap`]).
+fn posture_plan(env: impl Fn(&str) -> Option<String>, target: impl Fn() -> u64) -> PosturePlan {
+    use prover::lfm::whir_block_tree::{POSTURE, POSTURE_TREE_CACHE_KNOB, posture_tree_cache_cap};
+    let mut plan = PosturePlan {
+        set: Vec::new(),
+        env: Vec::new(),
+        notes: Vec::new(),
+    };
+    for &(name, value) in POSTURE {
+        if let Some(v) = env(name) {
+            plan.env.push(format!("{name}={v}"));
+            continue;
+        }
+        if name == POSTURE_TREE_CACHE_KNOB {
+            let target = target();
+            let cap = posture_tree_cache_cap(target);
+            if cap != value {
+                plan.notes.push(format!(
+                    "BLOCK POSTURE: {name}={cap}, not {value}: the host target is {:.1} GiB \
+                     (LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB, else the cgroup or MemTotal less 10 GiB)",
+                    target as f64 / (1u64 << 30) as f64
+                ));
+            }
+            plan.set.push((name, cap));
+            continue;
+        }
+        plan.set.push((name, value));
+    }
+    plan
+}
+
+/// The block's production posture ([`prover::lfm::whir_block_tree::POSTURE`]),
+/// set for every knob the environment leaves unset ([`posture_plan`]), for
+/// `verify-block` too. The base hash is not posture: it is the build's
+/// (`hash_pin::BLOCK_BASE`).
+/// Returns the lines that say what it set and what it left.
+///
+/// # Safety
+///
+/// Sets environment variables: no other thread may exist.
+unsafe fn apply_posture() -> Vec<String> {
+    let plan = posture_plan(
+        |name| std::env::var(name).ok(),
+        prover::block_whir::memory_target_bytes,
+    );
+    for (name, value) in &plan.set {
+        // SAFETY: the caller's: no other thread exists.
+        unsafe { std::env::set_var(name, value) };
+    }
+    let decay = match allocator::decay_ms() {
+        Some((-1, -1)) => "never purge (dirty -1, muzzy -1)".to_string(),
+        Some((d, m)) => format!("dirty_decay_ms {d}, muzzy_decay_ms {m} (_RJEM_MALLOC_CONF)"),
+        None => "unread".to_string(),
+    };
+    let words = |w: Vec<String>| {
+        if w.is_empty() {
+            "none".to_string()
+        } else {
+            w.join(" ")
+        }
+    };
+    let mut lines = vec![format!(
+        "BLOCK POSTURE SET: {} · from the environment: {} · jemalloc: {decay}",
+        words(plan.set.iter().map(|(n, v)| format!("{n}={v}")).collect()),
+        words(plan.env),
+    )];
+    lines.extend(plan.notes);
+    lines
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The block commands' format choices, the words of `--group`, `--blowup`,
+/// `--leaves`, `--trees`, `--leaf-double-from` and `--leaf-query`:
+/// `verify-block` must be given the ones `prove-block` was, and the proof file
+/// carries none of them.
+/// Whether every format flag is at its default, the pinned presets the
+/// compressed file's verifiers derive the tree under: a compressed file is
+/// proved and verified there only.
+fn at_pinned_choices(c: &BlockChoices<'_>) -> bool {
+    c.group == "indexed"
+        && c.blowup == "2"
+        && c.leaves == "coset"
+        && c.trees.is_none()
+        && c.leaf_double_from == "one-top"
+        && c.leaf_query == "lean"
+        && c.argue_pack == "22"
+}
+
+struct BlockChoices<'a> {
+    group: &'a str,
+    blowup: &'a str,
+    leaves: &'a str,
+    trees: Option<&'a str>,
+    leaf_double_from: &'a str,
+    leaf_query: &'a str,
+    argue_pack: &'a str,
+}
+
+/// `--argue-pack`'s words: `off` or a price in 0..=40
+/// (`whir_block_tree::pack_setting`).
+fn argue_pack_word(word: &str) -> Result<String, String> {
+    prover::lfm::whir_block_tree::pack_setting(Some(word))?;
+    Ok(word.to_string())
+}
+
+/// `--leaf-double-from`'s words: `off`, `one-top` or a leaf count
+/// (`whir_block::leaf_scale_setting`).
+fn leaf_double_from_word(word: &str) -> Result<String, String> {
+    prover::lfm::whir_block::leaf_scale_setting(Some(word))?;
+    Ok(word.to_string())
+}
+
+/// The leaf scale of `--leaf-double-from`: the caller's, so the format's own
+/// environment knob is refused rather than silently outranked.
+fn block_leaf_scale(word: &str) -> Result<prover::lfm::whir_block::LeafScale, String> {
+    use prover::lfm::whir_block::{LEAF_DOUBLE_FROM_ENV, leaf_scale_setting};
+    if std::env::var_os(LEAF_DOUBLE_FROM_ENV).is_some() {
+        return Err(format!(
+            "{LEAF_DOUBLE_FROM_ENV} is the harness's knob: give the CLI --leaf-double-from instead"
+        ));
+    }
+    leaf_scale_setting(Some(word))
+}
+
+/// The leaves' query check of `--leaf-query`: the caller's, so the format's
+/// own environment knob is refused rather than silently outranked.
+fn block_leaf_query(word: &str) -> Result<prover::lfm::whir_chain::LeafQuery, String> {
+    use prover::lfm::whir_block::{LEAF_QUERY_ENV, leaf_query_setting};
+    if std::env::var_os(LEAF_QUERY_ENV).is_some() {
+        return Err(format!(
+            "{LEAF_QUERY_ENV} is the harness's knob: give the CLI --leaf-query instead"
+        ));
+    }
+    leaf_query_setting(Some(word))
+}
+
+fn cmd_prove_block(
+    elf_path: PathBuf,
+    input_path: Option<PathBuf>,
+    output_path: PathBuf,
+    time: bool,
+    digest: bool,
+    tree_file: bool,
+    choices: BlockChoices<'_>,
+) -> ExitCode {
+    use prover::lfm::whir_block_tree::{
+        DEFAULT_SHIPPED, ShippedFormat, StderrSink, WhirBlockTreeProof, WhirTreeConfig,
+        group_setting, prove_whir_block_tree,
+    };
+    let pinned = at_pinned_choices(&choices);
+    let BlockChoices {
+        group,
+        blowup,
+        leaves,
+        trees,
+        leaf_double_from,
+        leaf_query,
+        argue_pack,
+    } = choices;
+
+    // The group opening is the caller's constant, given on the command line
+    // and to `verify-block` alike; the harness's environment word for it is
+    // refused here rather than silently outranked.
+    if std::env::var_os("LAMBDA_VM_WHIR_GROUP").is_some() {
+        eprintln!("LAMBDA_VM_WHIR_GROUP is the harness's knob: give the CLI --group instead");
+        return ExitCode::FAILURE;
+    }
+    // So is the GKR packing.
+    if std::env::var_os("BLOCK_WHIR_ARGUE_PACK").is_some() {
+        eprintln!("BLOCK_WHIR_ARGUE_PACK is the harness's knob: give the CLI --argue-pack instead");
+        return ExitCode::FAILURE;
+    }
+    // So is KECCAK_RND's form.
+    if std::env::var_os("BLOCK_WHIR_KECCAK_RND").is_some() {
+        eprintln!(
+            "BLOCK_WHIR_KECCAK_RND is the harness's knob: the CLI proves the verifier's form"
+        );
+        return ExitCode::FAILURE;
+    }
+    // So is MEMW_A's.
+    if std::env::var_os("BLOCK_WHIR_MEMW_A").is_some() {
+        eprintln!("BLOCK_WHIR_MEMW_A is the harness's knob: the CLI proves the verifier's form");
+        return ExitCode::FAILURE;
+    }
+    let pack = match prover::lfm::whir_block_tree::pack_setting(Some(argue_pack)) {
+        Ok(pack) => pack,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // So are the WHIR blowup and the round-0 leaf order, installed as the
+    // process format before anything reads it: the banner then states the
+    // format this block is proved under.
+    let (blowup, order, round0) = match install_block_format(blowup, leaves, trees) {
+        Ok(choices) => choices,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("BLOCK WHIR BLOWUP: {blowup}");
+    eprintln!("BLOCK WHIR LEAVES: {leaves}");
+    eprintln!("BLOCK WHIR TREES: {round0:?}");
+    // So is the leaves' scale: the tree's format below takes the flag's.
+    let leaf_scale = match block_leaf_scale(leaf_double_from) {
+        Ok(scale) => scale,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("BLOCK LEAF SCALE: {leaf_scale}");
+    // So is the leaves' query check.
+    let leaf_query = match block_leaf_query(leaf_query) {
+        Ok(query) => query,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("BLOCK LEAF QUERY: {leaf_query:?}");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let input = match read_private_input(input_path.as_ref()) {
+        Ok(input) => input,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut cfg = match WhirTreeConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    cfg.format.group = match group_setting(Some(group)) {
+        Ok(group) => group,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("BLOCK GROUP OPENING: {group}");
+    cfg.format.leaf_scale = leaf_scale;
+    cfg.format.leaf_query = leaf_query;
+    cfg.format = cfg.format.with_pack(pack);
+    cfg.argue = cfg.format.argue;
+    eprintln!("BLOCK ARGUE PACK: {argue_pack} ({pack:?})");
+    assert_eq!(
+        (
+            cfg.format.zf.whir_blowup,
+            cfg.format.zf.whir_leaves,
+            cfg.format.zf.whir_trees
+        ),
+        (blowup.factor(), order, round0),
+        "the tree's format is the installed one"
+    );
+    // The file it ships: the compressed one by default, in the CLI's constant
+    // format at the pinned flags, which is all `verify-block` checks it as; the
+    // top's file under `--tree-file` (no compression proved).
+    if tree_file {
+        let plan = prover::lfm::compress::UNCOMPRESSED_PLAN;
+        (
+            cfg.compress,
+            cfg.compress_levers,
+            cfg.compress_wire,
+            cfg.compress2,
+        ) = (plan.rate, plan.levers, plan.wire, plan.c2);
+    } else {
+        let plan = prover::lfm::compress::CompressPlan {
+            rate: cfg.compress,
+            levers: cfg.compress_levers,
+            wire: cfg.compress_wire,
+            c2: cfg.compress2,
+        };
+        if ShippedFormat::of(plan) != Some(DEFAULT_SHIPPED) {
+            eprintln!(
+                "the compression knobs make another file ({:?}) than verify-block checks \
+                 ({DEFAULT_SHIPPED:?}): unset them, or give --tree-file to ship the top's file",
+                ShippedFormat::of(plan)
+            );
+            return ExitCode::FAILURE;
+        }
+        if !pinned {
+            eprintln!(
+                "a compressed block is proved at the pinned format (every format flag at its \
+                 default): give --tree-file to ship the top's file at another format"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    eprintln!(
+        "BLOCK FILE: {}",
+        if tree_file {
+            "the top's (--tree-file)".to_string()
+        } else {
+            format!("compressed {DEFAULT_SHIPPED:?}")
+        }
+    );
+    // A forced leaf count, another fan-in or another argue is another tree than
+    // the one `verify-block` derives: harness arms, not a production proof.
+    if !cfg.at_presets() {
+        eprintln!(
+            "W3_LEAVES, W3_FAN_IN, BLOCK_WHIR_ARGUE, BLOCK_WHIR_KECCAK_RND and BLOCK_WHIR_MEMW_A \
+             make another tree than the block verifier derives: unset them to prove a block the \
+             CLI can verify"
+        );
+        return ExitCode::FAILURE;
+    }
+    let mut run = match prove_whir_block_tree(&elf_data, &input, &cfg, &StderrSink) {
+        Ok(run) => run,
+        Err(e) => {
+            eprintln!("Block proof failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let whole = run.times.whole;
+    let Some((_, top)) = run.proofs.pop() else {
+        eprintln!("Block proof failed: the tree has no top");
+        return ExitCode::FAILURE;
+    };
+    let top_digest = digest.then(|| match rkyv::to_bytes::<rkyv::rancor::Error>(&top.proof) {
+        Ok(bytes) => format!(
+            "BLOCK TOP DIGEST: {} (blake3 of the top proof's {} bytes)",
+            &blake3::hash(&bytes).to_hex()[..32],
+            bytes.len()
+        ),
+        Err(e) => format!("BLOCK TOP DIGEST: none ({e})"),
+    });
+    let output_hex = hex(&run.statement.public_output);
+    let bytes = match &run.compressed {
+        Some(compressed) => compressed.shipped(run.statement).map(|(_, bytes)| bytes),
+        None => WhirBlockTreeProof::new(run.statement, top).to_bytes(),
+    };
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Failed to serialize the block proof: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = std::fs::write(&output_path, &bytes) {
+        eprintln!("Failed to write {output_path:?}: {e}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!(
+        "Block proof written to {output_path:?} ({} bytes)",
+        bytes.len()
+    );
+    println!("Output: {output_hex}");
+    if let Some(line) = top_digest {
+        println!("{line}");
+    }
+    if time {
+        println!("Proving time: {whole:.3}s");
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_verify_block(
+    proof_path: PathBuf,
+    elf_path: PathBuf,
+    time: bool,
+    tree_file: bool,
+    choices: BlockChoices<'_>,
+) -> ExitCode {
+    use prover::lfm::whir_block_tree::{
+        DEFAULT_SHIPPED, WhirBlockTreeProof, base_line, group_setting, read_shipped,
+        verify_whir_block_shipped_as, verify_whir_block_tree_proof_at,
+    };
+    let pinned = at_pinned_choices(&choices);
+    let BlockChoices {
+        group,
+        blowup,
+        leaves,
+        trees,
+        leaf_double_from,
+        leaf_query,
+        argue_pack,
+    } = choices;
+
+    let fold = match group_setting(Some(group)) {
+        Ok(fold) => fold,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The verifier is told the rate and the leaf order as it is told the group
+    // opening, and both are installed as the process format before anything
+    // reads it.
+    let (blowup, order, round0) = match install_verify_format(blowup, leaves, trees) {
+        Ok(choices) => choices,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // So is the leaves' scale, before the production format below reads the
+    // environment's knob, which this refuses.
+    let leaf_scale = match block_leaf_scale(leaf_double_from) {
+        Ok(scale) => scale,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let leaf_query = match block_leaf_query(leaf_query) {
+        Ok(query) => query,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pack = match prover::lfm::whir_block_tree::pack_setting(Some(argue_pack)) {
+        Ok(pack) => pack,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let zf = prover::block_whir::BlockFormat::production_with(fold).zf;
+    assert_eq!(
+        (zf.whir_blowup, zf.whir_leaves, zf.whir_trees),
+        (blowup.factor(), order, round0),
+        "the verifier's process format is the installed one"
+    );
+
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bytes = match read_aligned_file(&proof_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to read proof file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The compressed file (the default): read in the CLI's constant format and
+    // verified as it, at the pinned format; the file's tag must be that format's.
+    if !tree_file {
+        if !pinned {
+            eprintln!(
+                "a compressed block is verified at the pinned format (every format flag at its \
+                 default): give --tree-file to verify a top's file at another format"
+            );
+            return ExitCode::FAILURE;
+        }
+        let file = match read_shipped(&bytes, DEFAULT_SHIPPED) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("Failed to read the compressed block proof: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        drop(bytes);
+        eprintln!("{}", base_line(&prover::hash_pin::BLOCK_BASE));
+        eprintln!("BLOCK FILE: compressed {DEFAULT_SHIPPED:?}");
+        eprintln!("Verifying block proof...");
+        let start = Instant::now();
+        let result = verify_whir_block_shipped_as(&elf_data, &file, DEFAULT_SHIPPED);
+        let verify_elapsed = start.elapsed();
+        return match result {
+            Ok(()) => {
+                eprintln!("Verification succeeded!");
+                println!("Output: {}", hex(&file.public_output));
+                if time {
+                    println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("Verification failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let proof = match WhirBlockTreeProof::from_bytes(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to read the block proof: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    drop(bytes);
+    // The block's base is its proof family's: the verifier's constant, never
+    // read from the file.
+    eprintln!("{}", base_line(&prover::hash_pin::BLOCK_BASE));
+    // So is the group opening: the caller's, never the file's.
+    eprintln!("BLOCK GROUP OPENING: {group}");
+    eprintln!("BLOCK WHIR BLOWUP: {blowup}");
+    eprintln!("BLOCK WHIR LEAVES: {leaves}");
+    eprintln!("BLOCK WHIR TREES: {round0:?}");
+    eprintln!("BLOCK LEAF SCALE: {leaf_scale}");
+    eprintln!("BLOCK LEAF QUERY: {leaf_query:?}");
+    eprintln!("BLOCK ARGUE PACK: {argue_pack} ({pack:?})");
+    eprintln!("Verifying block proof...");
+    let start = Instant::now();
+    let result = verify_whir_block_tree_proof_at(
+        &elf_data, &proof, fold, blowup, order, round0, leaf_scale, leaf_query, pack,
+    );
+    let verify_elapsed = start.elapsed();
+    match result {
+        Ok(()) => {
+            eprintln!("Verification succeeded!");
+            println!("Output: {}", hex(&proof.public_output));
+            if time {
+                println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Verification failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `--trees`'s word, or unset: the format's default, except under the natural
+/// leaf order, where one tree a run is not defined and unset reads `each`. A
+/// named `one` there is refused by the install (`ZfFormat::check_trees`).
+fn round0_choice(
+    trees: Option<&str>,
+    leaves: prover::zf_format::LeafOrder,
+) -> Result<prover::zf_format::Round0Trees, String> {
+    match (trees, leaves) {
+        (None, prover::zf_format::LeafOrder::Natural) => Ok(prover::zf_format::Round0Trees::Each),
+        (word, _) => prover::lfm::whir_block_tree::trees_setting(word),
+    }
+}
+
+/// The three format choices the block commands name: the blowup, the round-0
+/// leaf order and the round-0 trees.
+type FormatChoices = (
+    prover::zf_format::WhirBlowup,
+    prover::zf_format::LeafOrder,
+    prover::zf_format::Round0Trees,
+);
+
+/// `prove-block-base`: the block's base proof alone, under `base`, then its
+/// host verification. The process declares base-only first
+/// (`prover::base_only`), so its recursion entry points refuse to run.
+#[allow(clippy::too_many_arguments)]
+fn cmd_prove_block_base(
+    elf_path: PathBuf,
+    input_path: Option<PathBuf>,
+    output_path: Option<PathBuf>,
+    base: &str,
+    group: &str,
+    blowup: &str,
+    leaves: &str,
+    trees: Option<&str>,
+) -> ExitCode {
+    use prover::lfm::whir_block_tree::{WhirTreeConfig, base_line, group_setting};
+    use stark::proof::options::BaseFormat;
+    prover::base_only::declare();
+    let base = match base {
+        "p1" => BaseFormat::P1_WHIR,
+        "b3" => BaseFormat::B3_WHIR,
+        other => {
+            eprintln!("--base {other}: p1 or b3");
+            return ExitCode::FAILURE;
+        }
+    };
+    if std::env::var_os("LAMBDA_VM_WHIR_GROUP").is_some() {
+        eprintln!("LAMBDA_VM_WHIR_GROUP is the harness's knob: give the CLI --group instead");
+        return ExitCode::FAILURE;
+    }
+    let (blowup, order, round0) = match install_block_format_with_base(blowup, leaves, trees, base)
+    {
+        Ok(choices) => choices,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let input = match read_private_input(input_path.as_ref()) {
+        Ok(input) => input,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut cfg = match WhirTreeConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    cfg.format.group = match group_setting(Some(group)) {
+        Ok(group) => group,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    assert_eq!(
+        (
+            cfg.format.zf.base,
+            cfg.format.zf.whir_blowup,
+            cfg.format.zf.whir_leaves,
+            cfg.format.zf.whir_trees
+        ),
+        (base, blowup.factor(), order, round0),
+        "the base's format is the installed one"
+    );
+    let opts = prover::lfm::proof::block_base_options();
+    eprintln!("{}", base_line(&cfg.format.zf.base));
+    eprintln!(
+        "BLOCK BASE ONLY: base {:?} · group {group} · blowup {blowup} · leaves {leaves} · trees \
+         {round0:?} · no recursion in this process",
+        cfg.format.zf.base.hash
+    );
+    #[cfg(feature = "cuda")]
+    stark::grinding::reset_gpu_grind_calls();
+    // The allocator watermark `prove-block` runs its base under
+    // (`LAMBDA_VM_ALLOC_WATERMARK`), so the base's memory behaves as there.
+    let watermark = prover::alloc_purge::start_watermark(prover::block_whir::memory_target_bytes());
+    let t = Instant::now();
+    let proved = prover::block_whir::prove_block_whir_observed_led(
+        &elf_data,
+        &input,
+        &opts,
+        &cfg.format,
+        &cfg.options,
+        &|_, _| {},
+        &|_| {},
+        None,
+    );
+    let base_secs = t.elapsed().as_secs_f64();
+    // The base's allocator peak (`ALLOC PEAK base`, as `prove-block` prints it).
+    if let Some(peak) = prover::alloc_purge::peak_window() {
+        eprintln!("ALLOC PEAK base: {peak}");
+    }
+    drop(watermark);
+    let (proof, stamps) = match proved {
+        Ok(proved) => proved,
+        Err(e) => {
+            eprintln!("Base proof failed: {e:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprint!("{}", stamps.report());
+    #[cfg(feature = "cuda")]
+    eprintln!(
+        "BLOCK BASE GRINDS ON THE CARD: keccak {} · rpx {} · p1 {} · b3 {}",
+        stark::grinding::gpu_grind_calls(),
+        stark::grinding::gpu_grind_calls_rpx(),
+        stark::grinding::gpu_grind_calls_p1(),
+        stark::grinding::gpu_grind_calls_b3()
+    );
+    #[cfg(feature = "cuda")]
+    eprintln!(
+        "BLOCK BASE HOST COMMITS: {} (stacked commits the card declined)",
+        prover::block_whir::host_commit_fallbacks()
+    );
+    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Failed to serialize the base proof: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let digest = blake3::hash(&bytes).to_hex();
+    if let Some(path) = &output_path
+        && let Err(e) = std::fs::write(path, &bytes)
+    {
+        eprintln!("Failed to write {path:?}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let t = Instant::now();
+    let verified = prover::block_whir::verify_block_whir(&proof, &elf_data, &opts, &cfg.format);
+    let verify_secs = t.elapsed().as_secs_f64();
+    let verdict = match &verified {
+        Ok(true) => "verified".to_string(),
+        Ok(false) => "REFUSED".to_string(),
+        Err(e) => format!("ERROR {e:?}"),
+    };
+    println!(
+        "BLOCK BASE ONLY RESULT: base {:?} · prove {base_secs:.3} s · phase A {:.3} s · phase B \
+         {:.3} s · proof {} bytes (blake3 {}) · host verify {verify_secs:.3} s {verdict} · peak \
+         VmHWM {}",
+        cfg.format.zf.base.hash,
+        stamps.phase_a,
+        stamps.phase_b,
+        bytes.len(),
+        &digest[..32],
+        vm_hwm().unwrap_or_else(|| "unread".to_string()),
+    );
+    if matches!(verified, Ok(true)) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// This process's peak resident set (`VmHWM`, Linux), as `/proc` prints it.
+fn vm_hwm() -> Option<String> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find(|l| l.starts_with("VmHWM:"))
+        .map(|l| l["VmHWM:".len()..].trim().to_string())
+}
+
+/// `prove-block-base`'s `--trees`: [`round0_choice`] under a base whose
+/// trees have a joint leaf (Poseidon1 and 7-round BLAKE3), so unset is the
+/// format's default there; unset reads `each` under any other base. A named
+/// `one` there passes through, for the install to refuse by name.
+fn base_round0_choice(
+    trees: Option<&str>,
+    leaves: prover::zf_format::LeafOrder,
+    hash: stark::config::CommitmentHash,
+) -> Result<prover::zf_format::Round0Trees, String> {
+    use stark::config::CommitmentHash;
+    match (trees, hash) {
+        (None, CommitmentHash::Poseidon1 | CommitmentHash::Blake3) | (Some(_), _) => {
+            round0_choice(trees, leaves)
+        }
+        (None, _) => Ok(prover::zf_format::Round0Trees::Each),
+    }
+}
+
+/// [`install_block_format`] with the base `base` in place of the family's:
+/// `prove-block-base` alone calls it, after declaring base-only. `--trees`
+/// is [`base_round0_choice`]'s; a named `one` under a base with no joint leaf
+/// is refused by the install.
+fn install_block_format_with_base(
+    blowup: &str,
+    leaves: &str,
+    trees: Option<&str>,
+    base: stark::proof::options::BaseFormat,
+) -> Result<FormatChoices, String> {
+    use prover::zf_format::{ENV_WHIR_BLOWUP, ENV_WHIR_LEAVES, ENV_WHIR_TREES, ZfFormat};
+    for (knob, flag) in [
+        (ENV_WHIR_BLOWUP, "--blowup"),
+        (ENV_WHIR_LEAVES, "--leaves"),
+        (ENV_WHIR_TREES, "--trees"),
+    ] {
+        if std::env::var_os(knob).is_some() {
+            return Err(format!(
+                "{knob} is the harness's knob: give the CLI {flag} instead"
+            ));
+        }
+    }
+    let blowup = prover::lfm::whir_block_tree::blowup_setting(Some(blowup))?;
+    let leaves = prover::lfm::whir_block_tree::leaves_setting(Some(leaves))?;
+    let trees = base_round0_choice(trees, leaves, base.hash)?;
+    let format = ZfFormat {
+        whir_blowup: blowup.factor(),
+        whir_leaves: leaves,
+        whir_trees: trees,
+        base,
+        ..ZfFormat::from_env()?
+    };
+    format.check_leaves()?;
+    format.check_trees()?;
+    ZfFormat::install(format)?;
+    Ok((blowup, leaves, trees))
+}
+
+/// `prove-block`'s process format: the environment's ZF knobs with the
+/// WHIR blowup of `--blowup` (`blowup`), the round-0 leaf order of
+/// `--leaves` (`leaves`) and the round-0 trees of `--trees` (`trees`),
+/// installed before anything reads the process format, so its banner — printed
+/// once, on stdout — and every reader of it state the format the block is
+/// proved under. The format's own environment knobs for the three are refused:
+/// the flags are the caller's. One tree a run under the natural order is
+/// refused (`ZfFormat::install`).
+fn install_block_format(
+    blowup: &str,
+    leaves: &str,
+    trees: Option<&str>,
+) -> Result<FormatChoices, String> {
+    use prover::zf_format::{ENV_WHIR_BLOWUP, ENV_WHIR_LEAVES, ENV_WHIR_TREES, ZfFormat};
+    for (knob, flag) in [
+        (ENV_WHIR_BLOWUP, "--blowup"),
+        (ENV_WHIR_LEAVES, "--leaves"),
+        (ENV_WHIR_TREES, "--trees"),
+    ] {
+        if std::env::var_os(knob).is_some() {
+            return Err(format!(
+                "{knob} is the harness's knob: give the CLI {flag} instead"
+            ));
+        }
+    }
+    let blowup = prover::lfm::whir_block_tree::blowup_setting(Some(blowup))?;
+    let leaves = prover::lfm::whir_block_tree::leaves_setting(Some(leaves))?;
+    let trees = round0_choice(trees, leaves)?;
+    let format = ZfFormat {
+        whir_blowup: blowup.factor(),
+        whir_leaves: leaves,
+        whir_trees: trees,
+        ..ZfFormat::from_env()?
+    };
+    format.check_leaves()?;
+    format.check_trees()?;
+    ZfFormat::install(format)?;
+    Ok((blowup, leaves, trees))
+}
+
+/// `verify-block`'s process format: [`ZfFormat::DEFAULT`] with the WHIR blowup
+/// of `--blowup`, the round-0 leaf order of `--leaves` and the round-0 trees of
+/// `--trees`, installed before anything reads the process format. The verifier
+/// pins every other field (`verify_whir_block_tree_proof_at` reads none of them
+/// from the process), so any ZF knob in the environment is refused rather than
+/// silently ignored. One tree a run under the natural order is refused.
+fn install_verify_format(
+    blowup: &str,
+    leaves: &str,
+    trees: Option<&str>,
+) -> Result<FormatChoices, String> {
+    use prover::zf_format::{
+        ENV_KNOBS, ENV_WHIR_BLOWUP, ENV_WHIR_LEAVES, ENV_WHIR_TREES, ZfFormat,
+    };
+    if let Some(&knob) = ENV_KNOBS.iter().find(|k| std::env::var_os(k).is_some()) {
+        return Err(match knob {
+            ENV_WHIR_BLOWUP => {
+                format!("{knob} is the harness's knob: give the CLI --blowup instead")
+            }
+            ENV_WHIR_LEAVES => {
+                format!("{knob} is the harness's knob: give the CLI --leaves instead")
+            }
+            ENV_WHIR_TREES => {
+                format!("{knob} is the harness's knob: give the CLI --trees instead")
+            }
+            _ => format!("{knob} is set: the verifier pins the format to its default; unset it"),
+        });
+    }
+    let blowup = prover::lfm::whir_block_tree::blowup_setting(Some(blowup))?;
+    let leaves = prover::lfm::whir_block_tree::leaves_setting(Some(leaves))?;
+    let trees = round0_choice(trees, leaves)?;
+    let format = ZfFormat {
+        whir_blowup: blowup.factor(),
+        whir_leaves: leaves,
+        whir_trees: trees,
+        ..ZfFormat::DEFAULT
+    };
+    format.check_leaves()?;
+    format.check_trees()?;
+    ZfFormat::install(format)?;
+    Ok((blowup, leaves, trees))
 }
 
 fn read_private_input(path: Option<&PathBuf>) -> Result<Vec<u8>, String> {
@@ -414,8 +1664,14 @@ struct FlamegraphCliOptions {
 /// One tally per [`Accelerator`] variant, printed by `execute --cycles`.
 #[derive(Default)]
 struct AccelCounts {
+    /// KECCAK rows: one per `keccak_permute` call, `⌊len / 136⌋ + 1` per
+    /// Keccak-256 call.
     keccak: u64,
+    /// Keccak-256 (buffer) calls; their permutations are counted in `keccak`.
+    keccak256: u64,
+    blake3: u64,
     ecsm: u64,
+    ecrec: u64,
     dma: u64,
     /// Bytes copied and DMA table rows those copies consume. Keccak and ECSM
     /// cost the same per call, so DMA is the only accelerator whose report needs
@@ -436,7 +1692,15 @@ impl AccelCounts {
     fn tally(&mut self, accelerator: Accelerator, dst_val: u64, rows: u64) {
         match accelerator {
             Accelerator::Keccak => self.keccak += 1,
+            // `rows` is the call's permutation count (the executor logs it in
+            // `src2_val`).
+            Accelerator::Keccak256 => {
+                self.keccak256 += 1;
+                self.keccak += rows;
+            }
+            Accelerator::Blake3 => self.blake3 += 1,
             Accelerator::Ecsm => self.ecsm += 1,
+            Accelerator::Ecrec => self.ecrec += 1,
             Accelerator::Dma => {
                 self.dma += 1;
                 self.dma_bytes += dst_val;
@@ -624,7 +1888,10 @@ fn cmd_execute(
         println!("Cycles: {}", cycle_count);
         if let Some(counts) = accel_counts {
             println!("Keccak calls: {}", counts.keccak);
+            println!("Keccak256 calls: {}", counts.keccak256);
+            println!("Blake3 calls: {}", counts.blake3);
             println!("Ecsm calls: {}", counts.ecsm);
+            println!("Ecrec calls: {}", counts.ecrec);
             println!("Dma calls: {}", counts.dma);
             println!("Dma bytes: {}", counts.dma_bytes);
             println!("Dma rows: {}", counts.dma_rows);
@@ -803,6 +2070,159 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
         }
     };
     let result = prover::verify_with_options(&proof, &elf_data, &opts, None, None);
+    let verify_elapsed = start.elapsed();
+    let result = match result {
+        Ok(valid) => valid,
+        Err(e) => {
+            eprintln!("Verification error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if result {
+        eprintln!("Verification succeeded!");
+        if time {
+            println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+        }
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("Verification failed! Ensure --blowup matches the value used for proving.");
+        ExitCode::FAILURE
+    }
+}
+
+/// `prove --whir`: the multilinear backend.
+///
+/// Same executor, same traces, same AIRs as [`cmd_prove`]; each table is argued
+/// in one sumcheck against a WHIR commitment instead of a composition
+/// polynomial committed by FRI. The proof is a different type, so `verify`
+/// needs `--whir` too.
+///
+/// `blowup` reaches the AIRs (it sets the preprocessed commitments) but not the
+/// multilinear argument, which derives its own rate and query count from the
+/// tallest stacked polynomial in the proof.
+fn cmd_prove_whir(
+    elf_path: PathBuf,
+    output_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    blowup: u8,
+    time: bool,
+) -> ExitCode {
+    eprintln!("Reading ELF file...");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Generating proof (multilinear/WHIR)...");
+    let start = Instant::now();
+    let proof = prover::multilinear_prove::prove_with_options_and_inputs(
+        &elf_data,
+        &private_inputs,
+        &opts,
+        &Default::default(),
+    );
+    let prove_elapsed = start.elapsed();
+    let proof = match proof {
+        Ok(proof) => proof,
+        Err(e) => {
+            eprintln!("Proof generation failed: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Writing proof...");
+    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to serialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let file = match File::create(&output_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to create output file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = BufWriter::new(file).write_all(&bytes) {
+        eprintln!("Failed to write proof: {}", e);
+        return ExitCode::FAILURE;
+    }
+
+    eprintln!("Proof written to {:?}", output_path);
+    println!("Tables: {}", proof.proof.tables.len());
+    println!("Commitments: {}", proof.proof.roots.len());
+    if time {
+        println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
+    }
+    ExitCode::SUCCESS
+}
+
+/// `verify --whir`: the counterpart of [`cmd_prove_whir`].
+fn cmd_verify_whir(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) -> ExitCode {
+    eprintln!("Reading ELF file...");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Reading proof...");
+    let proof_bytes = match read_aligned_file(&proof_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to read proof file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let proof = match rkyv::from_bytes::<
+        prover::multilinear_prove::MultilinearVmProof,
+        rkyv::rancor::Error,
+    >(&proof_bytes)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to deserialize proof: {e}");
+            eprintln!("(a proof produced without `--whir` needs `verify` without it)");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Verifying proof (multilinear/WHIR)...");
+    let start = Instant::now();
+    let result = prover::multilinear_prove::verify_with_options(&proof, &elf_data, &opts);
     let verify_elapsed = start.elapsed();
     let result = match result {
         Ok(valid) => valid,
@@ -1190,6 +2610,497 @@ mod tests {
         assert!(!help.contains("--epoch-size <"));
     }
 
+    /// `prove-block` takes the ELF, an optional input and a required output;
+    /// `verify-block` the proof and the ELF.
+    #[test]
+    fn the_block_commands_take_their_arguments() {
+        let ok = |args: &[&str]| Cli::command().try_get_matches_from(args).is_ok();
+        assert!(ok(&[
+            "cli",
+            "prove-block",
+            "guest.elf",
+            "-o",
+            "block.proof"
+        ]));
+        assert!(ok(&[
+            "cli",
+            "prove-block",
+            "guest.elf",
+            "--input",
+            "block.bin",
+            "-o",
+            "block.proof",
+            "--time",
+            "--digest"
+        ]));
+        assert!(
+            !ok(&["cli", "prove-block", "guest.elf"]),
+            "an output is required"
+        );
+        assert!(ok(&[
+            "cli",
+            "verify-block",
+            "block.proof",
+            "guest.elf",
+            "--time"
+        ]));
+        assert!(
+            !ok(&["cli", "verify-block", "block.proof"]),
+            "the ELF is required"
+        );
+    }
+
+    /// Both block commands take the group opening, one chain per run unless
+    /// told otherwise, and nothing but its two words.
+    #[test]
+    fn the_block_commands_take_the_group_opening() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let group = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(Commands::ProveBlock { group, .. } | Commands::VerifyBlock { group, .. }) => {
+                    Some(group)
+                }
+                _ => None,
+            };
+            assert_eq!(group(cmd).as_deref(), Some("indexed"), "the default");
+            for word in ["per-poly", "indexed"] {
+                let args = [cmd, &["--group", word]].concat();
+                assert_eq!(group(&args).as_deref(), Some(word));
+                assert!(
+                    prover::lfm::whir_block_tree::group_setting(Some(word)).is_ok(),
+                    "{word} reads"
+                );
+            }
+            let args = [cmd, &["--group", "index"]].concat();
+            assert!(parse(&args).is_err(), "another word is refused");
+        }
+    }
+
+    /// Both block commands take the WHIR blowup, 2 unless told otherwise, and
+    /// nothing but its two words; each word reads to the blowup it names.
+    #[test]
+    fn the_block_commands_take_the_blowup() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let blowup = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(Commands::ProveBlock { blowup, .. } | Commands::VerifyBlock { blowup, .. }) => {
+                    Some(blowup)
+                }
+                _ => None,
+            };
+            assert_eq!(blowup(cmd).as_deref(), Some("2"), "the default");
+            for (word, want) in [
+                ("4", prover::zf_format::WhirBlowup::Four),
+                ("2", prover::zf_format::WhirBlowup::Two),
+            ] {
+                let args = [cmd, &["--blowup", word]].concat();
+                assert_eq!(blowup(&args).as_deref(), Some(word));
+                assert_eq!(
+                    prover::lfm::whir_block_tree::blowup_setting(Some(word)),
+                    Ok(want),
+                    "{word} reads"
+                );
+            }
+            for word in ["1", "8", "half"] {
+                let args = [cmd, &["--blowup", word]].concat();
+                assert!(parse(&args).is_err(), "--blowup {word} is refused");
+            }
+        }
+        assert_eq!(
+            prover::lfm::whir_block_tree::blowup_setting(None).map(|b| b.factor()),
+            Ok(prover::block_whir::BlockFormat::production().zf.whir_blowup),
+            "unset is the production blowup"
+        );
+    }
+
+    /// Both block commands take the round-0 leaf order, the coset order unless told
+    /// otherwise, and nothing but its two words; each word reads to the order
+    /// it names.
+    #[test]
+    fn the_block_commands_take_the_leaf_order() {
+        use prover::zf_format::LeafOrder;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let leaves = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(Commands::ProveBlock { leaves, .. } | Commands::VerifyBlock { leaves, .. }) => {
+                    Some(leaves)
+                }
+                _ => None,
+            };
+            assert_eq!(leaves(cmd).as_deref(), Some("coset"), "the default");
+            for (word, want) in [("natural", LeafOrder::Natural), ("coset", LeafOrder::Coset)] {
+                let args = [cmd, &["--leaves", word]].concat();
+                assert_eq!(leaves(&args).as_deref(), Some(word));
+                assert_eq!(
+                    prover::lfm::whir_block_tree::leaves_setting(Some(word)),
+                    Ok(want),
+                    "{word} reads"
+                );
+            }
+            for word in ["Coset", "bit-reversed", "1"] {
+                let args = [cmd, &["--leaves", word]].concat();
+                assert!(parse(&args).is_err(), "--leaves {word} is refused");
+            }
+        }
+        assert_eq!(
+            prover::lfm::whir_block_tree::leaves_setting(None),
+            Ok(prover::zf_format::ZfFormat::DEFAULT.whir_leaves),
+            "unset is the production order"
+        );
+    }
+
+    /// Both block commands take the round-0 trees, the production's (one tree
+    /// a run) unless told otherwise, and nothing but its two words; each word reads to the
+    /// trees it names. One tree a run is refused under the natural order by
+    /// both commands' installs, before anything is installed.
+    #[test]
+    fn the_block_commands_take_the_round0_trees() {
+        use prover::zf_format::{LeafOrder, Round0Trees};
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let trees = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(Commands::ProveBlock { trees, .. } | Commands::VerifyBlock { trees, .. }) => {
+                    Some(trees)
+                }
+                _ => None,
+            };
+            assert_eq!(trees(cmd), Some(None), "unset by default");
+            for (word, want) in [("each", Round0Trees::Each), ("one", Round0Trees::One)] {
+                let args = [cmd, &["--trees", word]].concat();
+                assert_eq!(trees(&args), Some(Some(word.to_string())));
+                assert_eq!(
+                    prover::lfm::whir_block_tree::trees_setting(Some(word)),
+                    Ok(want),
+                    "{word} reads"
+                );
+            }
+            for word in ["One", "joint", "1"] {
+                let args = [cmd, &["--trees", word]].concat();
+                assert!(parse(&args).is_err(), "--trees {word} is refused");
+            }
+        }
+        assert_eq!(
+            round0_choice(None, LeafOrder::Coset),
+            Ok(prover::zf_format::ZfFormat::DEFAULT.whir_trees),
+            "unset is the production trees"
+        );
+        assert_eq!(
+            round0_choice(None, LeafOrder::Natural),
+            Ok(Round0Trees::Each),
+            "unset under the natural order is one tree a polynomial"
+        );
+        for install in [install_block_format, install_verify_format] {
+            let err =
+                install("2", "natural", Some("one")).expect_err("one tree under the natural order");
+            assert!(err.contains("LAMBDA_VM_ZF_WHIR_TREES"), "{err}");
+        }
+    }
+
+    /// Both block commands take the leaf scale, production's threshold of 10
+    /// unless told otherwise, and nothing but `off` or a leaf count; each word
+    /// reads to the scale it names.
+    #[test]
+    fn the_block_commands_take_the_leaf_scale() {
+        use prover::lfm::whir_block::LeafScale;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let scale = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(
+                    Commands::ProveBlock {
+                        leaf_double_from, ..
+                    }
+                    | Commands::VerifyBlock {
+                        leaf_double_from, ..
+                    },
+                ) => Some(leaf_double_from),
+                _ => None,
+            };
+            assert_eq!(scale(cmd).as_deref(), Some("one-top"), "the default");
+            for (word, want) in [
+                ("off", LeafScale::Fixed),
+                ("12", LeafScale::DoubleFrom(12)),
+                ("10", LeafScale::DoubleFrom(10)),
+                ("one-top", LeafScale::DoubledOneTop),
+            ] {
+                let args = [cmd, &["--leaf-double-from", word]].concat();
+                assert_eq!(scale(&args).as_deref(), Some(word));
+                assert_eq!(
+                    prover::lfm::whir_block::leaf_scale_setting(Some(word)),
+                    Ok(want),
+                    "{word} reads"
+                );
+            }
+            for word in ["0", "on", "twelve", "-3"] {
+                let args = [cmd, &["--leaf-double-from", word]].concat();
+                assert!(
+                    parse(&args).is_err(),
+                    "--leaf-double-from {word} is refused"
+                );
+            }
+        }
+        assert_eq!(
+            prover::lfm::whir_block::leaf_scale_setting(Some("one-top")),
+            Ok(LeafScale::DEFAULT),
+            "the flag's default is production's"
+        );
+    }
+
+    /// Both block commands take the leaves' query check, production's `lean`
+    /// unless told otherwise, and nothing but `v1` or `lean`; each word reads
+    /// to the check it names.
+    #[test]
+    fn the_block_commands_take_the_leaf_query() {
+        use prover::lfm::whir_chain::LeafQuery;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let query = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(
+                    Commands::ProveBlock { leaf_query, .. }
+                    | Commands::VerifyBlock { leaf_query, .. },
+                ) => Some(leaf_query),
+                _ => None,
+            };
+            assert_eq!(query(cmd).as_deref(), Some("lean"), "the default");
+            for (word, want) in [("v1", LeafQuery::V1), ("lean", LeafQuery::Lean)] {
+                let args = [cmd, &["--leaf-query", word]].concat();
+                assert_eq!(query(&args).as_deref(), Some(word));
+                assert_eq!(
+                    prover::lfm::whir_block::leaf_query_setting(Some(word)),
+                    Ok(want),
+                    "{word} reads"
+                );
+            }
+            for word in ["", "V1", "lean2", "on"] {
+                let args = [cmd, &["--leaf-query", word]].concat();
+                assert!(parse(&args).is_err(), "--leaf-query {word:?} is refused");
+            }
+        }
+        assert_eq!(
+            prover::lfm::whir_block::leaf_query_setting(Some("lean")),
+            Ok(LeafQuery::default()),
+            "the flag's default is production's"
+        );
+    }
+
+    /// Both block commands take the GKR packing as `--argue-pack`, `off` or a
+    /// price; unset, both read the production packing (the harness's unset
+    /// reading).
+    #[test]
+    fn the_block_commands_take_the_argue_pack() {
+        use prover::lfm::whir_block_tree::pack_setting;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let pack = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(
+                    Commands::ProveBlock { argue_pack, .. }
+                    | Commands::VerifyBlock { argue_pack, .. },
+                ) => Some(argue_pack),
+                _ => None,
+            };
+            let default = pack(cmd).expect("the default parses");
+            assert_eq!(
+                pack_setting(Some(&default)),
+                pack_setting(None),
+                "the default is production's"
+            );
+            assert_ne!(pack_setting(Some("off")), pack_setting(None));
+            for word in ["off", "22", "0", "40"] {
+                let args = [cmd, &["--argue-pack", word]].concat();
+                assert_eq!(pack(&args).as_deref(), Some(word));
+            }
+            for word in ["", "on", "41", "-1", "OFF"] {
+                let args = [cmd, &["--argue-pack", word]].concat();
+                assert!(parse(&args).is_err(), "--argue-pack {word:?} is refused");
+            }
+        }
+    }
+
+    /// The block commands take no base hash: the block's base is its proof
+    /// family's, a constant of the build, so `--base-hash` is refused on both.
+    #[test]
+    fn the_block_commands_take_no_base_hash() {
+        let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            assert!(ok(cmd));
+            for word in ["rpx", "p1"] {
+                let args = [cmd, &["--base-hash", word]].concat();
+                assert!(!ok(&args), "--base-hash {word} is refused");
+            }
+        }
+        assert_eq!(
+            prover::block_whir::BlockFormat::production().zf.base,
+            stark::proof::options::BaseFormat::P1_WHIR,
+            "the production base is the family's"
+        );
+    }
+
+    /// `prove-block-base` takes `--base p1|b3` (p1 by default) and no other
+    /// word; `prove-block` and `verify-block` take no `--base` at all.
+    #[test]
+    fn the_base_only_command_takes_its_base_and_the_block_commands_none() {
+        let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
+        let base = ["cli", "prove-block-base", "guest.elf"];
+        assert!(ok(&base));
+        for word in ["p1", "b3"] {
+            assert!(ok(&[&base[..], &["--base", word]].concat()), "{word}");
+        }
+        for word in ["rpx", "blake3", "keccak", ""] {
+            assert!(!ok(&[&base[..], &["--base", word]].concat()), "{word:?}");
+        }
+        match Cli::try_parse_from(base).map(|c| c.command) {
+            Ok(Commands::ProveBlockBase { base, .. }) => assert_eq!(base, "p1"),
+            _ => panic!("prove-block-base parses"),
+        }
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            assert!(!ok(&[cmd, &["--base", "b3"]].concat()));
+        }
+    }
+
+    /// `prove-block-base --trees`: unset is the format's default under the
+    /// Poseidon1 base and under BLAKE3 (both have a joint leaf), `each` under
+    /// the natural order and under a base with no joint leaf; a named word is
+    /// taken as given; anything else does not parse.
+    #[test]
+    fn the_base_only_command_reads_its_round0_trees_by_base() {
+        use prover::zf_format::{LeafOrder, Round0Trees, ZfFormat};
+        use stark::config::CommitmentHash;
+        let base = ["cli", "prove-block-base", "guest.elf"];
+        for word in ["each", "one"] {
+            assert!(Cli::try_parse_from([&base[..], &["--trees", word]].concat()).is_ok());
+        }
+        assert!(Cli::try_parse_from([&base[..], &["--trees", "two"]].concat()).is_err());
+        let choice = base_round0_choice;
+        assert_eq!(
+            choice(None, LeafOrder::Coset, CommitmentHash::Poseidon1),
+            Ok(ZfFormat::DEFAULT.whir_trees)
+        );
+        assert_eq!(
+            choice(None, LeafOrder::Coset, CommitmentHash::Blake3),
+            Ok(ZfFormat::DEFAULT.whir_trees)
+        );
+        assert_eq!(ZfFormat::DEFAULT.whir_trees, Round0Trees::One);
+        assert_eq!(
+            choice(None, LeafOrder::Natural, CommitmentHash::Blake3),
+            Ok(Round0Trees::Each)
+        );
+        assert_eq!(
+            choice(None, LeafOrder::Coset, CommitmentHash::Rpx256),
+            Ok(Round0Trees::Each)
+        );
+        assert_eq!(
+            choice(None, LeafOrder::Natural, CommitmentHash::Poseidon1),
+            Ok(Round0Trees::Each)
+        );
+        assert_eq!(
+            choice(Some("one"), LeafOrder::Coset, CommitmentHash::Blake3),
+            Ok(Round0Trees::One)
+        );
+        assert_eq!(
+            choice(Some("each"), LeafOrder::Coset, CommitmentHash::Blake3),
+            Ok(Round0Trees::Each)
+        );
+        assert_eq!(
+            choice(Some("one"), LeafOrder::Coset, CommitmentHash::Rpx256),
+            Ok(Round0Trees::One),
+            "passed through for the install to refuse"
+        );
+        assert_eq!(
+            choice(Some("each"), LeafOrder::Coset, CommitmentHash::Poseidon1),
+            Ok(Round0Trees::Each)
+        );
+    }
+
+    /// The posture sets exactly the knobs the environment leaves unset.
+    #[test]
+    fn the_posture_sets_only_unset_knobs() {
+        use prover::lfm::whir_block_tree::POSTURE;
+        let roomy = || 110u64 << 30;
+        let all = posture_plan(|_| None, roomy);
+        assert_eq!(all.set, POSTURE.to_vec());
+        assert!(all.env.is_empty() && all.notes.is_empty());
+        let mine = posture_plan(
+            |n| (n == "TABLE_PARALLELISM").then(|| "8".to_string()),
+            roomy,
+        );
+        assert!(mine.set.iter().all(|(n, _)| *n != "TABLE_PARALLELISM"));
+        assert_eq!(mine.env, vec!["TABLE_PARALLELISM=8".to_string()]);
+    }
+
+    /// The precomputed-tree cache's posture follows the host target: 64
+    /// entries from a 64 GiB target up, 16 below it (with a note), and a value
+    /// the environment sets is left alone.
+    #[test]
+    fn the_tree_cache_posture_follows_the_host_target() {
+        use prover::lfm::whir_block_tree::POSTURE_TREE_CACHE_KNOB as CAP;
+        let none = |_: &str| None;
+        let cap = |plan: &PosturePlan| plan.set.iter().find(|(n, _)| *n == CAP).map(|(_, v)| *v);
+        let big = posture_plan(none, || 64u64 << 30);
+        assert_eq!(cap(&big), Some("64"));
+        assert!(big.notes.is_empty());
+        let small = posture_plan(none, || 38u64 << 30);
+        assert_eq!(cap(&small), Some("16"));
+        assert_eq!(small.notes.len(), 1, "the note says why");
+        let set = posture_plan(|n| (n == CAP).then(|| "32".to_string()), || 38u64 << 30);
+        assert_eq!(cap(&set), None, "the environment's value stays");
+        assert_eq!(set.env, vec![format!("{CAP}=32")]);
+    }
+
+    /// The binary runs the allocator posture it compiles in: jemalloc never
+    /// purges (`opt.dirty_decay_ms` and `opt.muzzy_decay_ms` are -1), unless
+    /// `_RJEM_MALLOC_CONF` says otherwise. Deleting the `malloc_conf` export
+    /// turns this red.
+    #[test]
+    fn the_binary_runs_its_never_purge_posture() {
+        if std::env::var_os("_RJEM_MALLOC_CONF").is_some() {
+            println!("_RJEM_MALLOC_CONF is set: the compiled posture is overridden, not read");
+            return;
+        }
+        assert_eq!(allocator::decay_ms(), Some((-1, -1)));
+    }
+
+    /// The hooks the binary installs reach its jemalloc: the prover reads the
+    /// statistics through them, and the purge hands back the pages 512 freed
+    /// buffers of 1 MiB left behind (under the never-purge posture they stay
+    /// resident until then).
+    #[test]
+    fn the_installed_hooks_read_and_purge_this_binarys_jemalloc() {
+        prover::alloc_purge::install(allocator::HOOKS);
+        let resident = || {
+            prover::alloc_purge::stats()
+                .expect("the prover reads the installed hooks")
+                .resident
+        };
+        let buffers: Vec<Vec<u8>> = (0..512).map(|_| vec![1u8; 1 << 20]).collect();
+        drop(buffers);
+        let retained = resident();
+        assert!((allocator::HOOKS.purge_all)(), "the purge runs");
+        let purged = resident();
+        assert!(
+            retained >= purged + (256 << 20),
+            "resident {} → {} MiB: the purge returned less than half of 512 MiB freed",
+            retained >> 20,
+            purged >> 20
+        );
+    }
+
     #[test]
     fn continuation_epoch_size_rejects_tiny_cli_values() {
         assert!(continuation_epoch_size(17).is_err());
@@ -1216,7 +3127,11 @@ mod tests {
     /// until it gets a row here.
     const EXPECTED_ACCELERATORS: &[(SyscallNumbers, Option<Accelerator>)] = &[
         (SyscallNumbers::KeccakPermute, Some(Accelerator::Keccak)),
+        (SyscallNumbers::Keccak256, Some(Accelerator::Keccak256)),
+        (SyscallNumbers::Blake3Compress, Some(Accelerator::Blake3)),
+        (SyscallNumbers::Blake3Absorb, Some(Accelerator::Blake3)),
         (SyscallNumbers::Ecsm, Some(Accelerator::Ecsm)),
+        (SyscallNumbers::Ecrec, Some(Accelerator::Ecrec)),
         (SyscallNumbers::DmaMemcpy, Some(Accelerator::Dma)),
         (SyscallNumbers::DmaMemset, Some(Accelerator::Dma)),
         (SyscallNumbers::Print, None),
@@ -1276,13 +3191,21 @@ mod tests {
             let mut counts = AccelCounts::default();
             counts.tally(accelerator, 0, 0);
             assert_eq!(
-                counts.keccak + counts.ecsm + counts.dma,
+                counts.keccak
+                    + counts.keccak256
+                    + counts.blake3
+                    + counts.ecsm
+                    + counts.ecrec
+                    + counts.dma,
                 1,
                 "{accelerator:?} must increment exactly one counter"
             );
             let expected = match accelerator {
                 Accelerator::Keccak => counts.keccak,
+                Accelerator::Keccak256 => counts.keccak256,
+                Accelerator::Blake3 => counts.blake3,
                 Accelerator::Ecsm => counts.ecsm,
+                Accelerator::Ecrec => counts.ecrec,
                 Accelerator::Dma => counts.dma,
             };
             assert_eq!(

@@ -22,6 +22,7 @@ fn main() {
         coset_offset: 3,
         grinding_factor: 0,
         fri_final_poly_log_degree: 7,
+        format: stark::proof::options::ProofFormat::DEFAULT,
     };
 
     let num_columns = 16;

@@ -199,7 +199,7 @@ impl RowDomain {
 /// [`num_base_from_meta`]. Degree is intentionally absent: only the per-table
 /// max is consumed (by `composition_poly_degree_bound`), declared once via
 /// [`ConstraintSet::max_degree`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstraintMeta {
     pub constraint_idx: usize,
     /// Base | Ext; Base entries MUST be a prefix.
@@ -285,6 +285,65 @@ pub trait ConstraintSet<F: IsField, E: IsField>: Send + Sync {
         self.eval(&mut mb);
         mb.into_meta()
     }
+}
+
+/// Why an emitted index set can be wrong in a way nothing else catches.
+///
+/// [`EmitTracker`]'s duplicate assert is `#[cfg(debug_assertions)]`, and this
+/// workspace declares no `[profile.release]` override — so under the house
+/// convention of `cargo test --release` it is a no-op and a second
+/// `emit_base(idx, …)` silently overwrites the first. Constraint *counts* do not
+/// notice: a body that emits one index twice and another never still fills
+/// `0..N` slots, so `NUM_CONSTRAINTS`, any hand-written predicted-count test,
+/// and `assert_complete` all still pass while a constraint has been deleted.
+///
+/// This is the check that does notice, and it runs wherever it is called
+/// from — no `cfg`. It returns rather than panics so a caller on a proving or
+/// verifying path can decide; the tests call it and assert.
+///
+/// `meta` is what [`ConstraintSet::meta`] returns: one entry per `emit_*` call,
+/// idx-sorted, duplicates included.
+pub fn check_dense_index_set(
+    meta: &[ConstraintMeta],
+    num_constraints: usize,
+) -> Result<(), String> {
+    if meta.len() != num_constraints {
+        return Err(format!(
+            "emitted {} constraints, declared {num_constraints}",
+            meta.len()
+        ));
+    }
+    // `meta` arrives idx-sorted, so a repeat is an equal neighbour and a gap is
+    // a jump. Reporting both by name beats reporting "not dense".
+    let mut duplicates = Vec::new();
+    let mut missing = Vec::new();
+    let mut expected = 0usize;
+    let mut prev: Option<usize> = None;
+    for m in meta {
+        if prev == Some(m.constraint_idx) {
+            duplicates.push(m.constraint_idx);
+            continue;
+        }
+        prev = Some(m.constraint_idx);
+        while expected < m.constraint_idx {
+            missing.push(expected);
+            expected += 1;
+        }
+        if m.constraint_idx == expected {
+            expected += 1;
+        }
+    }
+    while expected < num_constraints {
+        missing.push(expected);
+        expected += 1;
+    }
+    if duplicates.is_empty() && missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "emitted index set is not exactly 0..{num_constraints}: \
+         emitted twice {duplicates:?}, never emitted {missing:?}"
+    ))
 }
 
 /// A [`ConstraintSet`] with no transition constraints — for tables whose

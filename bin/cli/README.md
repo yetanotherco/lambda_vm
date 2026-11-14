@@ -79,6 +79,69 @@ cargo run -p cli --release -- verify <PROOF> <PROGRAM.elf> [flags]
 Returns exit code `0` on successful verification, `1` on failure. `--blowup` must
 match the value used during proving.
 
+### Prove a block
+
+Prove a whole block as a recursion tree: the block's WHIR base proof, the leaves that verify its groups, the nodes
+and the top, then the compression step after the top (C1: an LFM program that verifies the top, proved by the
+block's WHIR prover at blowup 16 with the verifier's own instruction columns, fold 5 and a final polynomial). The
+file it writes is the compressed one: one WHIR proof (≈ 450 KB on a median block, against ≈ 5.4 MB for the top's
+file) that carries the block's statement and the top's words. A consumer verifies it against the ELF with `verify-block`. Needs a CUDA build
+(`cargo build --release -p cli --features cuda`).
+
+```sh
+cli prove-block <PROGRAM.elf> --input <BLOCK.bin> -o block.proof [--time] [--digest]
+```
+
+| Flag | Description |
+|---|---|
+| `--input <FILE>` | The block's private input (the guest reads it with `get_private_input()`). |
+| `-o, --output <FILE>` | Output path for the block proof. Required. |
+| `--time` | Print the whole run's wall, base to top node. |
+| `--digest` | Print the blake3 digest of the top proof's bytes. |
+| `--tree-file` | Write the tree's top file instead of the compressed one (no compression proved). |
+
+stdout carries the public output and the requested numbers; the run's progress lines go to stderr.
+
+The command runs the production posture: every knob in `POSTURE` (`prover/src/lfm/whir_block_tree.rs`) that the
+environment leaves unset is set to its posture value: the table parallelism, the WHIR retention, the tree cache cap,
+the executor schedule and the grind search. The `BLOCK POSTURE` lines on stderr
+say what was set and what came from the environment. The WHIR hash is a format knob, so `verify-block` sets it too:
+prove and verify under the same environment. The binary compiles in jemalloc's never-purge posture. The tree's
+leaf count, fan-in and argue format are the block verifier's; `W3_LEAVES`, `W3_FAN_IN` and `BLOCK_WHIR_ARGUE`
+(harness arms) are refused.
+
+The compressed file's format is the CLI's constant (`whir_block_tree::DEFAULT_SHIPPED`), and it is proved at the
+pinned format only (every format flag at its default). The compression knobs (`LAMBDA_VM_BLOCK_COMPRESS*`,
+`prover/src/lfm/compress.rs`) default to that format; a knob that makes another file is refused. To ship the top's
+file, at any format flags, give `--tree-file` (and `verify-block --tree-file`).
+
+#### Running on a smaller machine
+
+`prove-block` sizes its host memory to a target: by default the smaller of the cgroup's memory limit and the
+machine's `MemTotal`, less 10 GiB. When the trace it holds would pass that target, it drops tables after committing
+them and rebuilds them for the openings (live regeneration), so the same proof comes out with less memory held. To
+run on a machine with less memory than it reports, or to leave room for other processes, set the target yourself:
+
+```sh
+LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB=24 cli prove-block <PROGRAM.elf> --input <BLOCK.bin> -o block.proof
+```
+
+The value is in GiB (fractions allowed); the proof's bytes do not depend on it, only the peak memory and the time.
+The `BLOCK DROPS` and `BLOCK REGEN` lines on stderr say whether regeneration armed and how much it dropped. The old
+name `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB` is refused.
+
+### Verify a block
+
+```sh
+cli verify-block <block.proof> <PROGRAM.elf> [--time]
+```
+
+Derives the block's recursion plan and top program from the ELF and the proof's claimed statement under the block
+presets, then the compression programs over the derived top (never from the file), verifies the compressed proof
+against the last of them, and checks it claims the ELF's id and the output. The file is read and verified as the
+CLI's compressed format; its tag must be that format's. Prints the public output. Returns exit code `0` on success,
+`1` on failure. `--tree-file` verifies a top's file (`prove-block --tree-file`) under the format flags given.
+
 ### Count Elements
 
 Build traces and print main-trace and aux-trace field element counts **without** running the proof step. Useful for sizing.

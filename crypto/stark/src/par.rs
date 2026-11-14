@@ -72,23 +72,3 @@ pub(crate) fn par_for_each_mut<T: Send>(slice: &mut [T], f: impl Fn(&mut T) + Sy
         slice.iter_mut().for_each(f);
     }
 }
-
-/// Run `f(&mut item)` for each element of `slice`, short-circuiting on the
-/// first `Err`. Parallel when `feature = "parallel"`, sequential otherwise.
-// Only called from `disk-spill`-gated paths; keep it available without warning
-// when that feature is off.
-#[cfg_attr(not(feature = "disk-spill"), allow(dead_code))]
-pub(crate) fn par_try_for_each_mut<T: Send, E: Send>(
-    slice: &mut [T],
-    f: impl Fn(&mut T) -> Result<(), E> + Sync + Send,
-) -> Result<(), E> {
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
-        slice.par_iter_mut().try_for_each(f)
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        slice.iter_mut().try_for_each(f)
-    }
-}

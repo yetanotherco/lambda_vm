@@ -1,3 +1,4 @@
+pub mod bus_permutation;
 pub mod dummy_air;
 pub mod fibonacci_2_cols_shifted;
 pub mod fibonacci_2_columns;

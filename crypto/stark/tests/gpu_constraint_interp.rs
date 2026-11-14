@@ -483,6 +483,7 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
         b_value: &b_value,
         b_beta: &b_beta,
         b_z_inv: &b_z_inv,
+        row_stride: 1,
     };
     let gpu = match try_eval_composition_gpu(
         prog, &main, &aux, &rap, &alpha, &offset, NEXT_STEP, NUM_ROWS, &inputs, false,
@@ -567,6 +568,63 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
     assert_eq!(
         dev_raw, gpu,
         "[{label}] evaluate_dev (keep=true) H != host-drained H, seed {seed:#x}"
+    );
+
+    // Sub-coset evaluation: at stride 2 the kernel must produce exactly the
+    // full evaluation's even rows — frame, zerofier and boundary reads all at
+    // the LDE row — in both the host-drained and the device-resident mode.
+    const STRIDE: usize = 2;
+    let strided_inputs = CompositionInputs {
+        row_stride: STRIDE,
+        ..inputs
+    };
+    let strided = match try_eval_composition_gpu(
+        prog,
+        &main,
+        &aux,
+        &rap,
+        &alpha,
+        &offset,
+        NEXT_STEP,
+        NUM_ROWS,
+        &strided_inputs,
+        false,
+    ) {
+        Some(stark::constraint_ir::gpu_interp::GpuComposition::Host(raw)) => raw,
+        _ => panic!("[{label}] strided GPU composition path must engage (host mode)"),
+    };
+    let even_rows: Vec<u64> = (0..NUM_ROWS / STRIDE)
+        .flat_map(|j| gpu[j * STRIDE * 3..j * STRIDE * 3 + 3].iter().copied())
+        .collect();
+    assert_eq!(
+        strided, even_rows,
+        "[{label}] stride-{STRIDE} H != the full H's even rows, seed {seed:#x}"
+    );
+    let strided_dev = match try_eval_composition_gpu(
+        prog,
+        &main,
+        &aux,
+        &rap,
+        &alpha,
+        &offset,
+        NEXT_STEP,
+        NUM_ROWS,
+        &strided_inputs,
+        true,
+    ) {
+        Some(stark::constraint_ir::gpu_interp::GpuComposition::Dev(h)) => h,
+        _ => panic!("[{label}] strided GPU composition Dev (keep) path must engage"),
+    };
+    assert_eq!(
+        strided_dev.num_rows,
+        NUM_ROWS / STRIDE,
+        "[{label}] strided H rows"
+    );
+    let strided_dev_raw = math_cuda::constraint_interp::download_comp_h(&strided_dev)
+        .unwrap_or_else(|e| panic!("[{label}] download_comp_h (strided) failed: {e:?}"));
+    assert_eq!(
+        strided_dev_raw, even_rows,
+        "[{label}] strided device-resident H != the full H's even rows, seed {seed:#x}"
     );
 }
 

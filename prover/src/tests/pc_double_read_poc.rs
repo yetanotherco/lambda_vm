@@ -21,13 +21,13 @@
 //!
 //! Production proof options, as in `halt_pc_forgery_poc`.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::elf::Elf;
 use executor::vm::logs::Log;
 use stark::config::Commitment;
+use stark::leaf_layout::LeafLayout;
 use stark::proof::view::MultiProofView;
-use stark::prover::{IsStarkProver, Prover};
-use stark::verifier::{IsStarkVerifier, Verifier};
+use stark::prover::IsStarkProver;
+use stark::verifier::IsStarkVerifier;
 
 use super::halt_pc_forgery_poc::{opts, run_logs};
 use crate::statement::{StatementKind, absorb_statement};
@@ -35,7 +35,7 @@ use crate::tables::cpu::{self, CpuOperation, cols as cpu_cols};
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::VmTable;
 use crate::tables::{decode, register};
-use crate::test_utils::{E, asm_elf_bytes, create_cpu_air, create_register_air};
+use crate::test_utils::{asm_elf_bytes, create_cpu_air, create_register_air};
 use crate::{MaxRowsConfig, VmAirs, VmProof};
 
 const GUEST: &str = "poc_pc_double_read";
@@ -60,18 +60,27 @@ fn patched_elf(honest: &[u8]) -> Vec<u8> {
     patched
 }
 
+/// The CPU operation of `log` at timestamp `ts`, read against the program's
+/// decode table (as the trace builder's own ops are).
+fn op_at(table: &decode::DecodeTable, log: &Log, ts: u64) -> CpuOperation {
+    let row = table
+        .row(log.current_pc)
+        .expect("an instruction of the program");
+    CpuOperation::from_log(log, ts, table.entry(row), row)
+}
+
+/// The program's decode table, as the trace builder reads it.
+fn decode_table(program: &Elf) -> decode::DecodeTable {
+    let instructions = decode::instructions_from_elf(program).expect("decode");
+    decode::DecodeTable::from_instructions(&instructions)
+}
+
 /// CPU operations with the honest timestamps `4 * (i + 1)`, in program order.
 fn honest_ops(program: &Elf, logs: &[Log]) -> Vec<CpuOperation> {
-    let instructions = decode::instructions_from_elf(program).expect("decode");
+    let table = decode_table(program);
     logs.iter()
         .enumerate()
-        .map(|(i, log)| {
-            CpuOperation::from_log_and_instruction(
-                log,
-                4 * (i as u64 + 1),
-                instructions[&log.current_pc],
-            )
-        })
+        .map(|(i, log)| op_at(&table, log, 4 * (i as u64 + 1)))
         .collect()
 }
 
@@ -86,14 +95,14 @@ fn forged_ops(program: &Elf, logs: &[Log]) -> Vec<CpuOperation> {
         logs[row].src1_val = 0;
         logs[row].dst_val = 0;
     }
-    let instructions = decode::instructions_from_elf(program).expect("decode");
+    let table = decode_table(program);
     let mut ops: Vec<CpuOperation> = logs
         .iter()
         .enumerate()
         .map(|(i, log)| {
             let honest_ts = 4 * (i as u64 + 1);
             let ts = if i == ROW_A { honest_ts } else { honest_ts - 3 };
-            CpuOperation::from_log_and_instruction(log, ts, instructions[&log.current_pc])
+            op_at(&table, log, ts)
         })
         .collect();
     ops.swap(ROW_A, ROW_B);
@@ -172,7 +181,7 @@ fn craft(elf_bytes: &[u8], ops: Vec<CpuOperation>, tamper: Tamper) -> Crafted {
         final_pc_ts: cpu::final_pc_timestamp(height as u64),
     };
     let forged = Pins {
-        timestamp_root: cpu::commit_timestamp_column(&options, &column),
+        timestamp_root: cpu::commit_timestamp_column(&options, &column, LeafLayout::RowPair),
         final_pc_ts: last_ts + 1,
     };
     let crafted = Crafted {
@@ -189,8 +198,9 @@ fn craft(elf_bytes: &[u8], ops: Vec<CpuOperation>, tamper: Tamper) -> Crafted {
             &opts(),
             &register::register_init_from_entry_point(crafted.program.entry_point),
             &crafted.traces,
-        ),
-        crafted.register_commitment(),
+        )
+        .commitment(),
+        crafted.register_commitment().commitment(),
         "the run must end in the halted register file"
     );
     crafted
@@ -212,7 +222,7 @@ impl Crafted {
             None,
             true,
             None,
-            self.register_commitment(),
+            self.register_commitment().preprocessed(),
         );
         airs.cpus[0] = Box::new(
             create_cpu_air(&options, 0)
@@ -220,21 +230,25 @@ impl Crafted {
                 .with_preprocessed(pins.timestamp_root, cpu::NUM_PRECOMPUTED_COLS),
         );
         airs.register = Box::new(
-            create_register_air(&options, pins.final_pc_ts)
-                .with_preprocessed(self.register_commitment(), register::NUM_PREPROCESSED_COLS),
+            create_register_air(&options, pins.final_pc_ts).with_preprocessed(
+                self.register_commitment().commitment(),
+                register::NUM_PREPROCESSED_COLS,
+            ),
         );
         airs
     }
 
     /// As the production verifier: REGISTER FINI pinned to the halted register file.
-    fn register_commitment(&self) -> Commitment {
-        let committed_bytes = u32::try_from(self.traces.public_output_bytes.len())
-            .expect("public output fits in u32");
-        register::halted_commitment(&opts(), self.program.entry_point, committed_bytes)
+    fn register_commitment(&self) -> crate::RegisterFiles {
+        crate::test_utils::halted_register_commitment(
+            &opts(),
+            &self.program,
+            &self.traces.public_output_bytes,
+        )
     }
 
-    fn transcript(&self) -> DefaultTranscript<E> {
-        let mut transcript = DefaultTranscript::<E>::new(&[]);
+    fn transcript(&self) -> crate::hash_pin::BlockTranscript {
+        let mut transcript = crate::hash_pin::block_transcript(&[]);
         absorb_statement(
             &mut transcript,
             StatementKind::Monolithic,
@@ -253,11 +267,10 @@ impl Crafted {
     fn prove(mut self, pins: Pins) -> (Self, Result<VmProof, stark::prover::ProvingError>) {
         let airs = self.airs(pins);
         let mut transcript = self.transcript();
-        let proof = Prover::multi_prove(
+        let proof = crate::hash_pin::BlockProver::multi_prove(
             airs.air_trace_pairs(&mut self.traces),
             &mut transcript,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
+            stark::residency_mode::ResidencyMode::Retain,
         )
         .map(|proof| VmProof {
             proof,
@@ -284,7 +297,12 @@ impl Crafted {
         ) else {
             return false;
         };
-        Verifier::multi_verify_views(&refs, view, &mut self.transcript(), &expected)
+        crate::hash_pin::BlockVerifier::multi_verify_views(
+            &refs,
+            view,
+            &mut self.transcript(),
+            &expected,
+        )
     }
 }
 

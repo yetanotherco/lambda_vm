@@ -26,6 +26,7 @@ use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::{AddOperand, emit_add_pair, emit_is_bit};
 
@@ -120,31 +121,35 @@ impl EqOperation {
 pub fn generate_eq_trace(
     operations: &[EqOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_eq_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths EQ traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_eq_trace`] in `form` (`tables::gpack`).
+pub fn generate_eq_trace_as(
+    operations: &[EqOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in operations.iter().enumerate() {
+            // a, b as DWordWL (2 words each)
+            table.set_dword_wl(row_idx, cols::A_0, op.a);
+            table.set_dword_wl(row_idx, cols::B_0, op.b);
 
-    for (row_idx, op) in operations.iter().enumerate() {
-        // a, b as DWordWL (2 words each)
-        table.set_dword_wl(row_idx, cols::A_0, op.a);
-        table.set_dword_wl(row_idx, cols::B_0, op.b);
+            table.set_bool(row_idx, cols::INVERT, op.invert);
+            table.set_bool(row_idx, cols::RES, op.compute_res());
 
-        table.set_bool(row_idx, cols::INVERT, op.invert);
-        table.set_bool(row_idx, cols::RES, op.compute_res());
+            // diff = a - b (wrapping) as DWordHL (4 halves)
+            let diff = op.a.wrapping_sub(op.b);
+            table.set_dword_hl(row_idx, cols::DIFF_0, diff);
 
-        // diff = a - b (wrapping) as DWordHL (4 halves)
-        let diff = op.a.wrapping_sub(op.b);
-        table.set_dword_hl(row_idx, cols::DIFF_0, diff);
-
-        table.set_bool(row_idx, cols::EQ, op.compute_eq());
-        table.set_u64(row_idx, cols::MU, 1);
-    }
-
-    trace
+            table.set_bool(row_idx, cols::EQ, op.compute_eq());
+            table.set_u64(row_idx, cols::MU, 1);
+        }
+    })
 }
 
 // =========================================================================

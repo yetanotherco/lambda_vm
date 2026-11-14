@@ -128,6 +128,9 @@ pub struct CompositionInputs<'a, F: IsField, E: IsField> {
     /// cached per domain) — resolved to device-resident columns via
     /// [`bzinv_device_handles`], so nothing LDE-sized crosses PCIe per dispatch.
     pub b_z_inv: &'a [std::sync::Arc<Vec<FieldElement<F>>>],
+    /// Evaluate `H` only at every `row_stride`-th LDE row (a sub-coset of the
+    /// LDE coset); 1 is the whole coset. Must divide the LDE row count.
+    pub row_stride: usize,
 }
 
 pub(crate) type GoldilocksBZInv = std::sync::Arc<Vec<FieldElement<GoldilocksField>>>;
@@ -321,8 +324,9 @@ pub enum GpuComposition {
 }
 
 /// Fused composition-poly evaluation on the GPU: returns `H(row)` (host or
-/// device-resident per `keep`), or `None` for non-Goldilocks towers (→ CPU
-/// fallback). `H(row) = z_inv·Σβᵢ·Cᵢ + Σ_b z_b_inv·β_b·(trace_b − value_b)`,
+/// device-resident per `keep`) at every `inputs.row_stride`-th LDE row, or
+/// `None` for non-Goldilocks towers or a stride that does not divide `num_rows`
+/// (→ CPU fallback). `H(row) = z_inv·Σβᵢ·Cᵢ + Σ_b z_b_inv·β_b·(trace_b − value_b)`,
 /// the uniform-zerofier accumulation of `evaluator::evaluate`.
 #[allow(clippy::too_many_arguments)]
 pub fn try_eval_composition_gpu<F, E>(
@@ -341,6 +345,9 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
+    if inputs.row_stride == 0 || !num_rows.is_multiple_of(inputs.row_stride) {
+        return None;
+    }
     let LoweredCall {
         lowered,
         rap,
@@ -370,6 +377,7 @@ where
         b_value: &b_value,
         b_beta: &b_beta,
         b_z_inv: &b_z_inv,
+        row_stride: inputs.row_stride,
     };
 
     let result = if keep {

@@ -28,8 +28,8 @@
 use std::collections::HashMap;
 
 use math::polynomial::Polynomial;
-use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed};
 use stark::config::Commitment;
+use stark::leaf_layout::LeafLayout;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
@@ -341,19 +341,36 @@ pub fn fini_from_final_state(final_state: &FinalRegisterStateMap, init: &[u32]) 
 // Preprocessed commitment
 // =========================================================================
 
-/// Computes the Merkle root commitment over the LDE of the REGISTER preprocessed
-/// columns: OFFSET (the Word address: 0..63 for x0-x31, 508-509 for x254, 510-511 for
-/// x255), INIT, FINI and IS_PC, so the verifier recomputes it from the public `init`
-/// and `fini` and the proof's FINI column is locked to `fini`. `fini` is the vector
-/// produced by `fini_from_trace` (entry `i` = the register at
-/// `register_word_address_list()[i]`). Must match the column order of the REGISTER
-/// trace (OFFSET, INIT, FINI, IS_PC), and FINI and IS_PC on padding rows are 0 (as
-/// the trace builds them).
-pub fn compute_precomputed_commitment(
-    options: &ProofOptions,
-    init: &[u32],
-    fini: &[u32],
-) -> Commitment {
+/// The preprocessed columns themselves: OFFSET (the Word address: 0..63 for
+/// x0-x31, 508-509 for x254, 510-511 for x255), INIT, FINI and IS_PC, padded to a
+/// power of two. FINI and IS_PC are 0 on padding rows, as the trace builds them.
+///
+/// ★ THE COLUMNS, NOT ONLY THEIR ROOT, because the two verifiers bind different
+/// things. The univariate verifier compares [`compute_precomputed_commitment`]'s
+/// root against the proof's precomputed tree (`stark::verifier`, the
+/// `is_preprocessed()` branch). The multilinear verifier has no such tree: it
+/// checks the claimed openings of columns `0..num_precomputed_columns()` against
+/// the values the program implies (`stark::multilinear_table::check_preprocessed`),
+/// and it reads them through [`stark::traits::AIR::precomputed_columns`]. An AIR
+/// built with a commitment and no columns closure hands that check an EMPTY list,
+/// which it walks in zero iterations — so this function is what makes INIT and
+/// FINI binding on the multilinear path at all.
+///
+/// `fini` is the vector produced by `fini_from_trace` (entry `i` = the register
+/// at `register_word_address_list()[i]`): a continuation epoch's `R_{i+1}`, or a
+/// monolithic proof's (and a block's) halted file ([`halted_fini`]).
+///
+/// # ★ Why the epoch statement does not absorb `init` or `fini`, and must not
+///
+/// The chain of custody is already closed without an absorb. The commitment
+/// ROOTS go into the transcript before any challenge is drawn, so the FINI
+/// column is fixed before the prover learns the reduced point; `check_preprocessed`
+/// then binds the verifier's own `(init, fini)` to that committed column AT that
+/// point. A prover therefore cannot choose the claim after the fact: the column
+/// is committed first and the value it is compared against is the verifier's,
+/// not the proof's. Adding these vectors to `absorb_epoch` would bind nothing
+/// further and would move every pinned transcript constant.
+pub fn preprocessed_columns(init: &[u32], fini: &[u32]) -> Vec<Vec<FE>> {
     debug_assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let addr_list = register_word_address_list();
@@ -366,16 +383,44 @@ pub fn compute_precomputed_commitment(
     for i in 0..NUM_REGISTER_ADDRESSES {
         offset_col[i] = FE::from(addr_list[i]);
         init_col[i] = FE::from(init.get(i).copied().unwrap_or(0) as u64);
-        fini_col[i] = FE::from(fini[i] as u64);
+        fini_col[i] = FE::from(fini.get(i).copied().unwrap_or(0) as u64);
         is_pc_col[i] = FE::from(u64::from(is_pc_address(addr_list[i])));
     }
 
-    commit_register_columns(options, vec![offset_col, init_col, fini_col, is_pc_col])
+    vec![offset_col, init_col, fini_col, is_pc_col]
+}
+
+/// Computes the Merkle root commitment over the LDE of the REGISTER preprocessed
+/// columns ([`preprocessed_columns`]), so the univariate verifier recomputes it
+/// from the public `init` and `fini` and the proof's FINI column is locked to
+/// `fini`. The multilinear path never reads this root.
+pub fn compute_precomputed_commitment(
+    options: &ProofOptions,
+    init: &[u32],
+    fini: &[u32],
+) -> Commitment {
+    compute_precomputed_commitment_with(options, init, fini, LeafLayout::RowPair)
+}
+
+/// [`compute_precomputed_commitment`] under an explicit leaf layout (S2) — the
+/// host twin of the in-circuit register commitment
+/// (`lfm::programs::emit_register_commitment` at the same `rows_per_leaf`).
+pub fn compute_precomputed_commitment_with(
+    options: &ProofOptions,
+    init: &[u32],
+    fini: &[u32],
+    layout: LeafLayout,
+) -> Commitment {
+    commit_register_columns(options, preprocessed_columns(init, fini), layout)
 }
 
 /// LDE + bit-reverse + Merkle-commit the given preprocessed columns (in column
 /// order).
-fn commit_register_columns(options: &ProofOptions, columns: Vec<Vec<FE>>) -> Commitment {
+fn commit_register_columns(
+    options: &ProofOptions,
+    columns: Vec<Vec<FE>>,
+    layout: LeafLayout,
+) -> Commitment {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let polys: Vec<Polynomial<FE>> = columns
         .iter()
@@ -395,9 +440,32 @@ fn commit_register_columns(options: &ProofOptions, columns: Vec<Vec<FE>>) -> Com
         })
         .collect();
 
-    let (_, root) = commit_bit_reversed(&lde_columns, ROWS_PER_LEAF)
-        .expect("Failed to build Merkle tree for register LDE");
-    root
+    // ★ Through the LFM commit helper, which commits under the BLOCK PATH's pin
+    // rather than `stark`'s default aliases. This root is a PREPROCESSED
+    // commitment the prover recomputes and compares against, so building it with
+    // a different hash than the path commits under fails at prove time with
+    // `PrecomputedCommitmentMismatch` — which is exactly how it was found.
+    crate::lfm::commit::commit_lde_columns_with(&lde_columns, layout)
+}
+
+/// REGISTER's commitment source for both leaf layouts, from `init` and `fini`:
+/// the row-pair root `row_pair` the caller holds, and the one-row root computed
+/// from the same files on first use.
+pub fn lazy_commitment(
+    options: &ProofOptions,
+    row_pair: Commitment,
+    init: &[u32],
+    fini: &[u32],
+) -> stark::lookup::LazyCommitment {
+    let (o, init, fini) = (options.clone(), init.to_vec(), fini.to_vec());
+    stark::lookup::LazyCommitment::ready(row_pair).with_one_row(move || {
+        Some(compute_precomputed_commitment_with(
+            &o,
+            &init,
+            &fini,
+            LeafLayout::Row,
+        ))
+    })
 }
 
 // =========================================================================
@@ -507,7 +575,7 @@ pub fn bus_interactions(final_pc_ts: u64) -> Vec<BusInteraction> {
 // =========================================================================
 
 /// Whether `word_addr` is one of the two x255 (PC) Word addresses.
-fn is_pc_address(word_addr: u64) -> bool {
+pub(crate) fn is_pc_address(word_addr: u64) -> bool {
     word_addr == 510 || word_addr == 511
 }
 

@@ -1,7 +1,7 @@
 use crate::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
-    memory::{Memory, MemoryError},
+    memory::{GuestMemory, MemoryError},
     registers::Registers,
 };
 
@@ -29,6 +29,11 @@ syscall_numbers! {
     KeccakPermute = 0,
     Print = 1,
     Panic = 2,
+    // Placeholder discriminant. The actual syscall value is BLAKE3_SYSCALL_NUMBER.
+    Blake3Compress = 3,
+    // Placeholder discriminant. The actual syscall value is
+    // BLAKE3_ABSORB_SYSCALL_NUMBER.
+    Blake3Absorb = 4,
     Commit = 64,
     Halt = 93,
     /// Placeholder discriminant. The actual syscall value is `ECSM_SYSCALL_NUMBER`.
@@ -45,6 +50,12 @@ syscall_numbers! {
     /// `DMA_MEMSET_SYSCALL_NUMBER`. `memset` chunks are proven by the same
     /// COPY table, which derives the inverted timestamp order from this number.
     DmaMemset = 97,
+    /// Placeholder discriminant. The actual syscall value is
+    /// `KECCAK256_SYSCALL_NUMBER`: Keccak-256 of a guest buffer, proven by the
+    /// KECCAK table's sponge mode.
+    Keccak256 = 98,
+    /// Placeholder discriminant. The actual syscall value is `ECREC_SYSCALL_NUMBER`.
+    Ecrec = 99,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -53,12 +64,226 @@ syscall_numbers! {
 pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
 const KECCAK_STATE_BYTES: u64 = 25 * 8;
 
+/// Syscall number for Keccak-256 of a guest buffer (`u64::MAX - 4`, ECALL `-5`,
+/// in the hash group `-1 ..= -10`).
+///
+/// ABI: `x10` = input address (any alignment), `x11` = input length in bytes,
+/// `x12` = address the 32-byte digest is written to (any alignment). Registers
+/// are left unchanged. The digest is Keccak-256 with the original Keccak padding
+/// (`0x01 ... 0x80`), the hash Ethereum uses.
+///
+/// The input is read at the ecall's timestamp `T` and the digest written at
+/// `T + 1`, so the output may overlap the input: the hash is of the bytes as they
+/// were before the call.
+///
+/// The KECCAK table proves the call one row per permutation: block `j` of the
+/// padded input is read at `ptr + 136·j`, absorbed into the state carried from
+/// row `j - 1`, and permuted; the last row writes the first four lanes. Its
+/// address arithmetic adds offsets to the low 32-bit word of `ptr` and `out`
+/// without a carry, so the call is refused unless
+/// [`keccak256_addresses_ok`] holds — the chip accepts exactly the calls this
+/// accepts.
+pub const KECCAK256_SYSCALL_NUMBER: u64 = u64::MAX - 4;
+
+/// Bytes of one Keccak-256 block (the rate, 1088 bits).
+pub const KECCAK256_RATE_BYTES: u64 = 136;
+
+/// Permutations (KECCAK rows) one Keccak-256 call of `len` bytes makes: one per
+/// whole block and one for the padded last block, `⌊len / 136⌋ + 1`.
+pub const fn keccak256_blocks(len: u64) -> u64 {
+    len / KECCAK256_RATE_BYTES + 1
+}
+
+/// Whether a Keccak-256 call's operands fit the chip's address arithmetic:
+///
+/// - every block's 136-byte window stays below one `2^32` boundary of the low
+///   address word: `(ptr mod 2^32) + 136·blocks ≤ 2^32` (this also bounds `len`
+///   below `2^32`, which the chip needs for its byte count);
+/// - the 32-byte digest does too: `(out mod 2^32) + 31 < 2^32`.
+pub fn keccak256_addresses_ok(ptr: u64, len: u64, out: u64) -> bool {
+    let window = keccak256_blocks(len).checked_mul(KECCAK256_RATE_BYTES);
+    let input_ok = window.is_some_and(|w| {
+        (ptr % LOW_LIMB)
+            .checked_add(w)
+            .is_some_and(|e| e <= LOW_LIMB)
+    });
+    input_ok && addr_limb_ok(out, 31)
+}
+
+/// The permutations of Keccak-256 over `input`, block by block: each item is the
+/// state a block's permutation starts from (the previous output with the padded
+/// block XORed into its first 17 lanes) and the state it ends in. The digest is
+/// the first four lanes of the last item's output, little-endian.
+///
+/// One function for the executor and the trace builder, so the rows the prover
+/// builds are the permutations the VM ran.
+pub fn keccak256_permutations(input: &[u8]) -> Vec<([u64; 25], [u64; 25])> {
+    const RATE: usize = KECCAK256_RATE_BYTES as usize;
+    let blocks = input.len() / RATE + 1;
+    let mut out = Vec::with_capacity(blocks);
+    let mut state = [0u64; 25];
+    for j in 0..blocks {
+        let block = keccak256_padded_block(input, j);
+        for (lane, chunk) in state.iter_mut().zip(block.chunks_exact(8)) {
+            *lane ^= u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        }
+        let start = state;
+        keccak_f1600(&mut state);
+        out.push((start, state));
+    }
+    out
+}
+
+/// Block `j` of `input` after Keccak padding: the input's bytes, then on the last
+/// block (`j = ⌊len / 136⌋`) `0x01` right after them and `0x80` on byte 135
+/// (`0x81` when the two meet).
+pub fn keccak256_padded_block(input: &[u8], j: usize) -> [u8; 136] {
+    const RATE: usize = KECCAK256_RATE_BYTES as usize;
+    let mut block = [0u8; RATE];
+    let start = j * RATE;
+    let take = input.len().saturating_sub(start).min(RATE);
+    block[..take].copy_from_slice(&input[start..start + take]);
+    if j == input.len() / RATE {
+        block[take] ^= 0x01;
+        block[RATE - 1] ^= 0x80;
+    }
+    block
+}
+
+/// Keccak-256 of `input`, through [`keccak256_permutations`].
+pub fn keccak256_digest(input: &[u8]) -> [u8; 32] {
+    let perms = keccak256_permutations(input);
+    let (_, last) = perms.last().expect("at least one block");
+    let mut digest = [0u8; 32];
+    for (k, lane) in last.iter().take(4).enumerate() {
+        digest[8 * k..8 * k + 8].copy_from_slice(&lane.to_le_bytes());
+    }
+    digest
+}
+
+/// Syscall number for the BLAKE3 6-round compression accelerator
+/// (u64::MAX - 2 = 0xFFFF_FFFF_FFFF_FFFD).
+///
+/// This is the **6-round internal variant** of the BLAKE3 compression function
+/// (`thoughts/blake3/blake3-chip/DESIGN.md`), intended for in-house Merkle /
+/// Fiat–Shamir use — it is NOT standard 7-round BLAKE3 and its security rests
+/// on the named 6-round assumption recorded in the design.
+///
+/// ABI: `x10` = 8-byte-aligned pointer to a 176-byte state region laid out as
+/// consecutive little-endian dwords at `addr + 8k`:
+///
+/// | dword k | contents                                   |
+/// |---------|--------------------------------------------|
+/// | 0..=3   | `h[0..8]` chaining value (2 u32 words/dword) |
+/// | 4..=11  | `m[0..16]` message block                     |
+/// | 12      | `t` counter (`t_lo = low u32 → v[12]`, `t_hi = high u32 → v[13]`) |
+/// | 13      | `block_len` (low u32) \| `flags` (high u32)  |
+/// | 14..=21 | `out[0..16]` — written by the syscall        |
+pub const BLAKE3_SYSCALL_NUMBER: u64 = u64::MAX - 2;
+/// Bytes of the BLAKE3 state region: 112 input + 64 output.
+const BLAKE3_STATE_BYTES: u64 = 22 * 8;
+/// Dword offset of `out[0..16]` inside the BLAKE3 state region.
+const BLAKE3_OUT_DWORDS: u64 = 14;
+
+/// Syscall number for the BLAKE3 6-round **chained absorb** accelerator
+/// (u64::MAX - 3 = 0xFFFF_FFFF_FFFF_FFFC).
+///
+/// Same 6-round internal compression as [`BLAKE3_SYSCALL_NUMBER`], but one ecall
+/// folds a run of `num_blocks` consecutive 64-byte message blocks into the
+/// chaining value instead of one. That is the whole point: a guest hashing a
+/// 1 KiB message pays one ecall and one marshaling round-trip rather than
+/// sixteen, and the prover receives one `Ecall` bus tuple per absorb rather than
+/// one per compression.
+///
+/// ABI:
+///
+/// | register | contents |
+/// |----------|----------|
+/// | `x10` | 8-byte-aligned pointer to the 64-byte control region |
+/// | `x11` | 8-byte-aligned pointer to `num_blocks * 64` message bytes |
+/// | `x12` | `num_blocks`, in `1..=`[`BLAKE3_ABSORB_MAX_BLOCKS`] |
+/// | `x13` | `first_flags`, the flag word of the run's FIRST block (`< 2^32`) |
+///
+/// Control region, as consecutive little-endian dwords at `ctrl + 8k`:
+///
+/// | dword k | contents |
+/// |---------|----------|
+/// | 0..=3   | `cv_in[0..8]` — the incoming chaining value (read) |
+/// | 4..=7   | `cv_out[0..8]` — the outgoing chaining value (written) |
+///
+/// `cv_in` and `cv_out` are disjoint on purpose: every memory access of one
+/// absorb happens at a single timestamp, and the chip reads `cv_in` and writes
+/// `cv_out` through SEPARATE `Memw` interactions (one gated on the group's first
+/// row, one on its last). Two separate interactions at one timestamp on one
+/// address are a pair the MEMW consistency argument cannot order, so the two
+/// halves have to be disjoint — and for the same reason the control and message
+/// regions must not overlap ([`ExecutionError::Blake3AbsorbRegionOverlap`]).
+///
+/// Note this is a consequence of the chip's interaction layout, NOT a blanket
+/// property of the machine: a single COMBINED read+write interaction on one
+/// address at one timestamp is fine, and is exactly what keccak does for its 25
+/// lanes and what the single-compression BLAKE3 mode does for its output region
+/// (the `old_out` columns). Stated broadly the rule would imply keccak is
+/// broken, which it is not.
+///
+/// The block schedule this applies — `t = 0`, `block_len = 64` on every block,
+/// `first_flags` on block 0 and `0` on every later block — is a SECOND statement
+/// of the flag framing that `crypto`'s `Blake3Chain` owns (this crate cannot
+/// call it: `executor` does not depend on `crypto/crypto`). It is therefore
+/// parity-gated against `Blake3Chain` over exhaustive message lengths rather
+/// than trusted; see [`blake3_absorb_chain_6round`].
+pub const BLAKE3_ABSORB_SYSCALL_NUMBER: u64 = u64::MAX - 3;
+/// Bytes of one BLAKE3 message block.
+pub const BLAKE3_BLOCK_BYTES: u64 = 64;
+/// Dwords in the absorb control region: 4 for `cv_in`, 4 for `cv_out`.
+pub const BLAKE3_ABSORB_CTRL_DWORDS: u64 = 8;
+/// Dword offset of `cv_out` inside the absorb control region.
+pub const BLAKE3_ABSORB_CV_OUT_DWORD: u64 = 4;
+/// Largest `num_blocks` one absorb ecall accepts — 1 024 blocks, 64 KiB of
+/// message.
+///
+/// A guest with more to hash calls again; the chain is stateless across calls
+/// because the chaining value travels through the control region.
+///
+/// Three things the cap has to do, in increasing order of how easy they are to
+/// get wrong:
+///
+/// 1. **Soundness.** The chip counts a group's rows down from `num_blocks` in a
+///    single field element, so the count must stay far below the modulus for
+///    "the group has exactly `num_blocks` rows" to follow from "the counter
+///    reaches 1".
+/// 2. **Address arithmetic.** `num_blocks * 64` must not wrap.
+/// 3. ★ **Trace height.** Every other accelerator is one CPU cycle to one chip
+///    row, so an epoch's table heights are implicitly bounded by its cycle
+///    budget — epochs split on cycles. This ecall is the first to break that
+///    ratio: it is ONE cycle and up to `BLAKE3_ABSORB_MAX_BLOCKS` BLAKE3 rows,
+///    and the BLAKE3 table has no entry in `prover::tables::max_rows` at all.
+///    At 3 219 columns a row is ~26 KiB of trace, so an unbounded absorb near
+///    an epoch boundary could demand a table height nothing sized for.
+///
+/// 1 024 is chosen for (3), and it is free: the guest cost of an absorb is flat
+/// in message length past ~4 blocks (measured 552 cycles at both 256 B and
+/// 1 KiB, 558 at 4 KiB), and real absorbs — verifier leaves, transcript
+/// segments — are KiB-class. So capping at 64 KiB costs nothing measurable and
+/// bounds one ecall's trace to ~26 MiB instead of ~1.7 GiB.
+pub const BLAKE3_ABSORB_MAX_BLOCKS: u64 = 1 << 10;
+
 /// Syscall number for the ECSM (elliptic-curve scalar multiply) accelerator.
 ///
 /// The spec uses ECALL number `-11`; interpreted as an unsigned 64-bit value that is
 /// `u64::MAX - 10 = 0xFFFF_FFFF_FFFF_FFF5`, which the ECSM core table puts on the `Ecall`
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
+
+/// Syscall number for the ECDSA public-key recovery accelerator (secp256k1).
+///
+/// The spec uses ECALL number `-12`, i.e. `u64::MAX - 11 = 0xFFFF_FFFF_FFFF_FFF4`, which
+/// the ECREC table puts on the `Ecall` bus as `[lo32, hi32] = [2^32 - 12, 2^32 - 1]`.
+pub const ECREC_SYSCALL_NUMBER: u64 = u64::MAX - 11;
+
+/// Bytes the ECREC call writes at `x10`: the key's x and y (32 bytes each, big-endian)
+/// and the status doubleword (0 = key, 1 = bailed).
+pub const ECREC_OUT_BYTES: u64 = 72;
 
 /// Syscall number for the copy accelerator, serving `memcpy` and `memmove`.
 ///
@@ -214,7 +439,11 @@ impl TryFrom<u64> for SyscallNumbers {
             64 => Ok(SyscallNumbers::Commit),
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
+            v if v == KECCAK256_SYSCALL_NUMBER => Ok(SyscallNumbers::Keccak256),
+            v if v == BLAKE3_SYSCALL_NUMBER => Ok(SyscallNumbers::Blake3Compress),
+            v if v == BLAKE3_ABSORB_SYSCALL_NUMBER => Ok(SyscallNumbers::Blake3Absorb),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == ECREC_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecrec),
             v if v == DMA_MEMCPY_SYSCALL_NUMBER => Ok(SyscallNumbers::DmaMemcpy),
             v if v == DMA_MEMSET_SYSCALL_NUMBER => Ok(SyscallNumbers::DmaMemset),
             v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
@@ -227,7 +456,12 @@ impl TryFrom<u64> for SyscallNumbers {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Accelerator {
     Keccak,
+    /// Keccak-256 of a buffer: the KECCAK chip again, `keccak256_blocks(len)`
+    /// rows a call rather than one.
+    Keccak256,
+    Blake3,
     Ecsm,
+    Ecrec,
     Dma,
 }
 
@@ -237,7 +471,11 @@ impl SyscallNumbers {
     pub fn raw(self) -> u64 {
         match self {
             SyscallNumbers::KeccakPermute => KECCAK_SYSCALL_NUMBER,
+            SyscallNumbers::Keccak256 => KECCAK256_SYSCALL_NUMBER,
+            SyscallNumbers::Blake3Compress => BLAKE3_SYSCALL_NUMBER,
+            SyscallNumbers::Blake3Absorb => BLAKE3_ABSORB_SYSCALL_NUMBER,
             SyscallNumbers::Ecsm => ECSM_SYSCALL_NUMBER,
+            SyscallNumbers::Ecrec => ECREC_SYSCALL_NUMBER,
             SyscallNumbers::DmaMemcpy => DMA_MEMCPY_SYSCALL_NUMBER,
             SyscallNumbers::DmaMemset => DMA_MEMSET_SYSCALL_NUMBER,
             SyscallNumbers::Hint => HINT_SYSCALL_NUMBER,
@@ -254,7 +492,16 @@ impl SyscallNumbers {
     pub fn accelerator(self) -> Option<Accelerator> {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
+            // The same chip, one row per permutation of the call; counters read
+            // the permutation count from the log (`src2_val`).
+            SyscallNumbers::Keccak256 => Some(Accelerator::Keccak256),
+            SyscallNumbers::Blake3Compress => Some(Accelerator::Blake3),
+            // Both BLAKE3 syscalls drive the same chip, so they count as one
+            // accelerator — a counter that split them would report "BLAKE3
+            // calls" that no longer track BLAKE3 rows.
+            SyscallNumbers::Blake3Absorb => Some(Accelerator::Blake3),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
+            SyscallNumbers::Ecrec => Some(Accelerator::Ecrec),
             SyscallNumbers::DmaMemcpy | SyscallNumbers::DmaMemset => Some(Accelerator::Dma),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
@@ -266,7 +513,7 @@ impl SyscallNumbers {
 }
 
 /// Reads a 256-bit little-endian value as four doublewords at `addr + 8i`.
-fn load_u256_le(memory: &Memory, addr: u64) -> Result<[u8; 32], MemoryError> {
+fn load_u256_le<M: GuestMemory>(memory: &M, addr: u64) -> Result<[u8; 32], MemoryError> {
     let mut out = [0u8; 32];
     for i in 0..4 {
         let dw = memory.load_doubleword(addr + (i as u64) * 8)?;
@@ -276,7 +523,11 @@ fn load_u256_le(memory: &Memory, addr: u64) -> Result<[u8; 32], MemoryError> {
 }
 
 /// Writes a 256-bit little-endian value as four doublewords at `addr + 8i`.
-fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(), MemoryError> {
+fn store_u256_le<M: GuestMemory>(
+    memory: &mut M,
+    addr: u64,
+    bytes: &[u8; 32],
+) -> Result<(), MemoryError> {
     for i in 0..4 {
         let mut dw = [0u8; 8];
         dw.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
@@ -341,13 +592,97 @@ fn addr_limb_ok(addr: u64, max_offset: u64) -> bool {
     (addr % LOW_LIMB) + max_offset < LOW_LIMB
 }
 
+/// The address a load or store of `offset` from a register holding `base`
+/// reaches.
+#[inline(always)]
+pub(crate) fn effective_address(base: u64, offset: i32) -> u64 {
+    (base as i64).wrapping_add(offset as i64) as u64
+}
+
+/// The target of a branch or jump `offset` bytes from `pc`.
+#[inline(always)]
+pub(crate) fn pc_relative(pc: u64, offset: i32) -> u64 {
+    (pc as i64).wrapping_add(offset as i64) as u64
+}
+
+/// The target of a JALR from a register holding `base`: the sum with its low
+/// bit cleared.
+#[inline(always)]
+pub(crate) fn jalr_target(base: u64, offset: i32) -> u64 {
+    (((base as i64).wrapping_add(offset as i64)) & !1) as u64
+}
+
+/// The value LUI writes: RV64 sign-extends the 32-bit result to 64 bits.
+#[inline(always)]
+pub(crate) fn lui_value(imm: u32) -> u64 {
+    (imm as i32) as i64 as u64
+}
+
+/// The value AUIPC writes: `pc` plus the sign-extended immediate.
+#[inline(always)]
+pub(crate) fn auipc_value(pc: u64, imm: u32) -> u64 {
+    pc.wrapping_add((imm as i32) as i64 as u64)
+}
+
+/// The value a load of `width` at `addr` writes to its register, with RV64's
+/// sign or zero extension.
+#[inline(always)]
+pub(crate) fn load_value<M: GuestMemory>(
+    memory: &M,
+    width: LoadStoreWidth,
+    addr: u64,
+) -> Result<u64, MemoryError> {
+    Ok(match width {
+        // RV64: LB sign-extends to 64 bits
+        LoadStoreWidth::Byte => (memory.load_byte(addr) as i8) as i64 as u64,
+        // RV64: LH sign-extends to 64 bits
+        LoadStoreWidth::Half => (memory.load_half(addr)? as i16) as i64 as u64,
+        // RV64: LW sign-extends to 64 bits
+        LoadStoreWidth::Word => (memory.load_word(addr)? as i32) as i64 as u64,
+        // RV64: LD loads 64 bits
+        LoadStoreWidth::DoubleWord => memory.load_doubleword(addr)?,
+        // RV64: LBU zero-extends to 64 bits
+        LoadStoreWidth::ByteUnsigned => memory.load_byte(addr) as u64,
+        // RV64: LHU zero-extends to 64 bits
+        LoadStoreWidth::HalfUnsigned => memory.load_half(addr)? as u64,
+        // RV64: LWU zero-extends to 64 bits
+        LoadStoreWidth::WordUnsigned => memory.load_word(addr)? as u64,
+    })
+}
+
+/// A store of `width` of the register value `value` at `addr`.
+#[inline(always)]
+pub(crate) fn store_value<M: GuestMemory>(
+    memory: &mut M,
+    width: LoadStoreWidth,
+    addr: u64,
+    value: u64,
+) -> Result<(), ExecutionError> {
+    match width {
+        LoadStoreWidth::Byte => memory.store_byte(addr, (value & 0xFF) as u8),
+        LoadStoreWidth::Half => memory.store_half(addr, (value & 0xFFFF) as u16)?,
+        LoadStoreWidth::Word => memory.store_word(addr, value as u32)?,
+        LoadStoreWidth::DoubleWord => memory.store_doubleword(addr, value)?,
+        LoadStoreWidth::ByteUnsigned => {
+            return Err(ExecutionError::StoreBytesUnsignedNotSupported);
+        }
+        LoadStoreWidth::HalfUnsigned => {
+            return Err(ExecutionError::StoreHalfUnsignedNotSupported);
+        }
+        LoadStoreWidth::WordUnsigned => {
+            return Err(ExecutionError::StoreWordUnsignedNotSupported);
+        }
+    }
+    Ok(())
+}
+
 impl Instruction {
     /// Runs the given instruction and returns its execution log
-    pub fn run(
+    pub fn run<M: GuestMemory>(
         self,
         pc: &mut u64,
         registers: &mut Registers,
-        memory: &mut Memory,
+        memory: &mut M,
     ) -> Result<Log, ExecutionError> {
         let log = self.execute(*pc, registers, memory)?;
         *pc = log.next_pc;
@@ -355,11 +690,11 @@ impl Instruction {
     }
 
     /// Executes the given instruction returning the new value of pc, the register to be updated and the new value of said register
-    fn execute(
+    pub(crate) fn execute<M: GuestMemory>(
         self,
         pc: u64,
         registers: &mut Registers,
-        memory: &mut Memory,
+        memory: &mut M,
     ) -> Result<Log, ExecutionError> {
         Ok(match self {
             Instruction::ArithImm { dst, src, imm, op } => {
@@ -400,7 +735,7 @@ impl Instruction {
             }
             Instruction::JumpAndLinkRegister { dst, base, offset } => {
                 let base_value = registers.read(base)?;
-                let new_pc = (((base_value as i64).wrapping_add(offset as i64)) & !1) as u64;
+                let new_pc = jalr_target(base_value, offset);
                 registers.write(dst, pc.wrapping_add(REGULAR_PC_UPDATE))?;
                 Log {
                     current_pc: pc,
@@ -414,7 +749,7 @@ impl Instruction {
                 registers.write(dst, pc.wrapping_add(REGULAR_PC_UPDATE))?;
                 Log {
                     current_pc: pc,
-                    next_pc: (pc as i64).wrapping_add(offset as i64) as u64,
+                    next_pc: pc_relative(pc, offset),
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: pc.wrapping_add(REGULAR_PC_UPDATE),
@@ -428,32 +763,8 @@ impl Instruction {
             } => {
                 let read_value = registers.read(src)?;
                 let base = registers.read(base)?;
-                let addr = (base as i64).wrapping_add(offset as i64) as u64;
-                match width {
-                    LoadStoreWidth::Byte => {
-                        let value = read_value & 0xFF;
-                        memory.store_byte(addr, value as u8);
-                    }
-                    LoadStoreWidth::Half => {
-                        let value = read_value & 0xFFFF;
-                        memory.store_half(addr, value as u16)?;
-                    }
-                    LoadStoreWidth::Word => {
-                        memory.store_word(addr, read_value as u32)?;
-                    }
-                    LoadStoreWidth::DoubleWord => {
-                        memory.store_doubleword(addr, read_value)?;
-                    }
-                    LoadStoreWidth::ByteUnsigned => {
-                        return Err(ExecutionError::StoreBytesUnsignedNotSupported);
-                    }
-                    LoadStoreWidth::HalfUnsigned => {
-                        return Err(ExecutionError::StoreHalfUnsignedNotSupported);
-                    }
-                    LoadStoreWidth::WordUnsigned => {
-                        return Err(ExecutionError::StoreWordUnsignedNotSupported);
-                    }
-                };
+                let addr = effective_address(base, offset);
+                store_value(memory, width, addr, read_value)?;
                 Log {
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
@@ -469,23 +780,8 @@ impl Instruction {
                 width,
             } => {
                 let base = registers.read(base)?;
-                let addr = (base as i64).wrapping_add(offset as i64) as u64;
-                let value = match width {
-                    // RV64: LB sign-extends to 64 bits
-                    LoadStoreWidth::Byte => (memory.load_byte(addr) as i8) as i64 as u64,
-                    // RV64: LH sign-extends to 64 bits
-                    LoadStoreWidth::Half => (memory.load_half(addr)? as i16) as i64 as u64,
-                    // RV64: LW sign-extends to 64 bits
-                    LoadStoreWidth::Word => (memory.load_word(addr)? as i32) as i64 as u64,
-                    // RV64: LD loads 64 bits
-                    LoadStoreWidth::DoubleWord => memory.load_doubleword(addr)?,
-                    // RV64: LBU zero-extends to 64 bits
-                    LoadStoreWidth::ByteUnsigned => memory.load_byte(addr) as u64,
-                    // RV64: LHU zero-extends to 64 bits
-                    LoadStoreWidth::HalfUnsigned => memory.load_half(addr)? as u64,
-                    // RV64: LWU zero-extends to 64 bits
-                    LoadStoreWidth::WordUnsigned => memory.load_word(addr)? as u64,
-                };
+                let addr = effective_address(base, offset);
+                let value = load_value(memory, width, addr)?;
                 registers.write(dst, value)?;
                 Log {
                     current_pc: pc,
@@ -503,7 +799,7 @@ impl Instruction {
             } => {
                 let (a, b) = (registers.read(src1)?, registers.read(src2)?);
                 let new_pc = if cond.apply(a, b) {
-                    (pc as i64).wrapping_add(offset as i64) as u64
+                    pc_relative(pc, offset)
                 } else {
                     pc.wrapping_add(REGULAR_PC_UPDATE)
                 };
@@ -516,8 +812,7 @@ impl Instruction {
                 }
             }
             Instruction::LoadUpperImm { dst, imm } => {
-                // RV64: LUI sign-extends the 32-bit result to 64 bits
-                let value = (imm as i32) as i64 as u64;
+                let value = lui_value(imm);
                 registers.write(dst, value)?;
                 Log {
                     current_pc: pc,
@@ -528,8 +823,7 @@ impl Instruction {
                 }
             }
             Instruction::AddUpperImmToPc { dst, imm } => {
-                // RV64: AUIPC adds sign-extended imm to PC
-                let value = pc.wrapping_add((imm as i32) as i64 as u64);
+                let value = auipc_value(pc, imm);
                 registers.write(dst, value)?;
                 Log {
                     current_pc: pc,
@@ -672,6 +966,165 @@ impl Instruction {
                         }
                         src2_val = state_addr;
                     }
+                    SyscallNumbers::Keccak256 => {
+                        // Keccak-256 of [x10, x10 + x11) written to [x12, x12 + 32).
+                        // See KECCAK256_SYSCALL_NUMBER for the ABI.
+                        let ptr = registers.read(10)?;
+                        let len = registers.read(11)?;
+                        let out = registers.read(12)?;
+                        if !keccak256_addresses_ok(ptr, len, out) {
+                            return Err(ExecutionError::Keccak256AddressOverflow { ptr, len, out });
+                        }
+                        let input = memory.load_bytes(ptr, len)?;
+                        let digest = keccak256_digest(&input);
+                        for (k, chunk) in digest.chunks_exact(8).enumerate() {
+                            let lane = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+                            memory.store_doubleword(out + 8 * k as u64, lane)?;
+                        }
+                        // The permutation count (KECCAK rows) for the counters, and
+                        // the input address (its alignment decides which memory
+                        // table the chip's reads land in). Inert for the CPU row:
+                        // `EcallEbreak` writes no register, and the trace builder
+                        // recovers x10..x12 from the register state, like ECSM and
+                        // HINT.
+                        src2_val = keccak256_blocks(len);
+                        dst_val = ptr;
+                    }
+                    SyscallNumbers::Blake3Compress => {
+                        // BLAKE3 6-round compression on a 176-byte region at the
+                        // address in x10 (layout: see BLAKE3_SYSCALL_NUMBER docs).
+                        let state_addr = registers.read(10)?;
+                        if !state_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedBlake3StateAddress(state_addr));
+                        }
+                        state_addr
+                            .checked_add(BLAKE3_STATE_BYTES - 1)
+                            .ok_or(ExecutionError::Blake3StateAddressOverflow(state_addr))?;
+
+                        // Input: 14 dwords = h[8] | m[16] | t | (block_len, flags),
+                        // each dword two little-endian u32 words.
+                        let mut words = [0u32; 28];
+                        for k in 0..14 {
+                            let dw = memory.load_doubleword(state_addr + (k as u64) * 8)?;
+                            words[2 * k] = dw as u32;
+                            words[2 * k + 1] = (dw >> 32) as u32;
+                        }
+                        let h: [u32; 8] = words[0..8].try_into().unwrap();
+                        let m: [u32; 16] = words[8..24].try_into().unwrap();
+                        let t = (words[24] as u64) | ((words[25] as u64) << 32);
+                        let block_len = words[26];
+                        let flags = words[27];
+
+                        let out = blake3_compress_6round(&h, &m, t, block_len, flags);
+                        for k in 0..8 {
+                            let dw = (out[2 * k] as u64) | ((out[2 * k + 1] as u64) << 32);
+                            memory.store_doubleword(
+                                state_addr + (BLAKE3_OUT_DWORDS + k as u64) * 8,
+                                dw,
+                            )?;
+                        }
+                        src2_val = state_addr;
+                    }
+                    SyscallNumbers::Blake3Absorb => {
+                        // Chained absorb: fold `num_blocks` consecutive 64-byte
+                        // blocks into the chaining value in one ecall. Layout and
+                        // register roles: see BLAKE3_ABSORB_SYSCALL_NUMBER.
+                        let ctrl_addr = registers.read(10)?;
+                        let msg_addr = registers.read(11)?;
+                        let num_blocks = registers.read(12)?;
+                        let first_flags = registers.read(13)?;
+
+                        if !ctrl_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedBlake3AbsorbAddress(ctrl_addr));
+                        }
+                        if !msg_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedBlake3AbsorbAddress(msg_addr));
+                        }
+                        if num_blocks == 0 || num_blocks > BLAKE3_ABSORB_MAX_BLOCKS {
+                            return Err(ExecutionError::Blake3AbsorbBlockCountOutOfRange(
+                                num_blocks,
+                            ));
+                        }
+                        // The chip's flags column is one 32-bit word.
+                        if first_flags > u32::MAX as u64 {
+                            return Err(ExecutionError::Blake3AbsorbFlagsOutOfRange(first_flags));
+                        }
+
+                        let ctrl_bytes = BLAKE3_ABSORB_CTRL_DWORDS * 8;
+                        // Unreachable today — the cap above bounds this by
+                        // 2^16 · 64 = 4 MiB — and kept anyway, so that raising
+                        // BLAKE3_ABSORB_MAX_BLOCKS cannot silently turn a
+                        // multiply into a wrap. The tests reach the address
+                        // overflow below, not this arm.
+                        let msg_bytes = num_blocks
+                            .checked_mul(BLAKE3_BLOCK_BYTES)
+                            .ok_or(ExecutionError::Blake3AbsorbAddressOverflow(msg_addr))?;
+                        // The LAST addressable byte of each region, kept rather
+                        // than discarded: the overlap test below is written on
+                        // these, so it cannot overflow on a guest-chosen address.
+                        // (`end = addr + bytes` would: a region ending exactly at
+                        // 2^64 wraps to 0, which panics in a debug build and in
+                        // release silently reports "no overlap" for regions that
+                        // do overlap.)
+                        let ctrl_last = ctrl_addr
+                            .checked_add(ctrl_bytes - 1)
+                            .ok_or(ExecutionError::Blake3AbsorbAddressOverflow(ctrl_addr))?;
+                        let msg_last = msg_addr
+                            .checked_add(msg_bytes - 1)
+                            .ok_or(ExecutionError::Blake3AbsorbAddressOverflow(msg_addr))?;
+
+                        // Every access of one absorb carries the same timestamp,
+                        // so an address touched by both regions would be accessed
+                        // twice at that timestamp and the MEMW consistency
+                        // argument could not order the pair. Reject rather than
+                        // emit a trace the prover cannot close.
+                        if ctrl_addr <= msg_last && msg_addr <= ctrl_last {
+                            return Err(ExecutionError::Blake3AbsorbRegionOverlap);
+                        }
+
+                        // cv_in: dwords 0..4 of the control region.
+                        let mut cv = [0u32; 8];
+                        for k in 0..4u64 {
+                            let dw = memory.load_doubleword(ctrl_addr + k * 8)?;
+                            cv[2 * k as usize] = dw as u32;
+                            cv[2 * k as usize + 1] = (dw >> 32) as u32;
+                        }
+
+                        for i in 0..num_blocks {
+                            let block_addr = msg_addr + i * BLAKE3_BLOCK_BYTES;
+                            let mut m = [0u32; 16];
+                            for k in 0..8u64 {
+                                let dw = memory.load_doubleword(block_addr + k * 8)?;
+                                m[2 * k as usize] = dw as u32;
+                                m[2 * k as usize + 1] = (dw >> 32) as u32;
+                            }
+                            cv = blake3_absorb_step_6round(
+                                &cv,
+                                &m,
+                                if i == 0 { first_flags as u32 } else { 0 },
+                            );
+                        }
+
+                        // cv_out: dwords 4..8 of the control region.
+                        for k in 0..4u64 {
+                            let dw = (cv[2 * k as usize] as u64)
+                                | ((cv[2 * k as usize + 1] as u64) << 32);
+                            memory.store_doubleword(
+                                ctrl_addr + (BLAKE3_ABSORB_CV_OUT_DWORD + k) * 8,
+                                dw,
+                            )?;
+                        }
+
+                        // Logged for the CPU row the way the other accelerators
+                        // log theirs. Both are inert today: `EcallEbreak`'s
+                        // decode writes no register, and `CpuOperation::from_log`
+                        // reads `dst_val` only under the Commit classification.
+                        // They are here for the absorb classification the chip
+                        // will add, which — like ECSM and HINT — will recover
+                        // x10..x13 from the register state rather than the log.
+                        src2_val = ctrl_addr;
+                        dst_val = msg_addr;
+                    }
                     SyscallNumbers::Ecsm => {
                         // ECSM(-11): k×G on secp256k1.
                         // x10 = addr to write xR, x11 = addr of xG, x12 = addr of k.
@@ -705,6 +1158,64 @@ impl Instruction {
                         src2_val = addr_xg;
                         dst_val = addr_k;
                     }
+                    SyscallNumbers::Ecrec => {
+                        // ECREC(-12): ECDSA public-key recovery on secp256k1.
+                        // x10 = addr to write the key (Q.x, Q.y, 32 bytes big-endian each)
+                        // and the status doubleword; x11 = addr of the signature r ‖ s
+                        // (64 bytes, big-endian each); x12 = addr of the message hash
+                        // (32 bytes big-endian); x13 = the parity of R's y (0 or 1).
+                        // Status 0: the key. Status 1: the call bailed (the key bytes are
+                        // zero) and the guest recovers the key itself; see
+                        // `ecsm::ecrec` for exactly when.
+                        let addr_out = registers.read(10)?;
+                        let addr_sig = registers.read(11)?;
+                        let addr_msg = registers.read(12)?;
+                        let parity = registers.read(13)?;
+                        if !addr_limb_ok(addr_out, ECREC_OUT_BYTES - 1)
+                            || !addr_limb_ok(addr_sig, 63)
+                            || !addr_limb_ok(addr_msg, 31)
+                        {
+                            return Err(ExecutionError::EcrecAddressOverflow);
+                        }
+                        // The signature is read at T and the hash at T + 1, as unaligned
+                        // doubleword MEMW accesses: the two regions must be disjoint, for
+                        // the same trace-provability reason as ECSM's operands.
+                        if addr_sig < addr_msg.wrapping_add(32)
+                            && addr_msg < addr_sig.wrapping_add(64)
+                        {
+                            return Err(ExecutionError::EcrecOperandOverlap);
+                        }
+                        if parity > 1 {
+                            return Err(ExecutionError::EcrecParityOutOfRange(parity));
+                        }
+                        let mut sig = [0u8; 64];
+                        for i in 0..8u64 {
+                            let dw = memory.load_doubleword(addr_sig + 8 * i)?;
+                            sig[8 * i as usize..8 * i as usize + 8]
+                                .copy_from_slice(&dw.to_le_bytes());
+                        }
+                        let mut msg = [0u8; 32];
+                        for i in 0..4u64 {
+                            let dw = memory.load_doubleword(addr_msg + 8 * i)?;
+                            msg[8 * i as usize..8 * i as usize + 8]
+                                .copy_from_slice(&dw.to_le_bytes());
+                        }
+                        let mut out = [0u8; ECREC_OUT_BYTES as usize];
+                        match ecsm::ecrecover(&sig, &msg, parity as u8) {
+                            Some((x, y)) => {
+                                out[..32].copy_from_slice(&x);
+                                out[32..64].copy_from_slice(&y);
+                            }
+                            None => out[64] = ecsm::ECREC_STATUS_BAIL,
+                        }
+                        for i in 0..9u64 {
+                            let mut dw = [0u8; 8];
+                            dw.copy_from_slice(&out[8 * i as usize..8 * i as usize + 8]);
+                            memory.store_doubleword(addr_out + 8 * i, u64::from_le_bytes(dw))?;
+                        }
+                        src2_val = addr_sig;
+                        dst_val = addr_msg;
+                    }
                     SyscallNumbers::DmaMemcpy => {
                         // memcpy(dst = x10, src = x11, n = x12). Snapshot the input
                         // before writing, which also gives this ecall well-defined
@@ -722,11 +1233,20 @@ impl Instruction {
                         // The fixed-size scratch avoids a heap allocation on every
                         // hot-path ecall while preserving snapshot semantics.
                         let mut bytes = [0u8; DMA_MEMCPY_MAX_BYTES as usize];
-                        for (i, byte) in bytes[..n as usize].iter_mut().enumerate() {
-                            *byte = memory.load_byte(src + i as u64);
-                        }
-                        for (i, &byte) in bytes[..n as usize].iter().enumerate() {
-                            memory.store_byte(dst + i as u64, byte);
+                        let bytes = &mut bytes[..n as usize];
+                        if memory.dma_bulk() {
+                            // The whole source, then the whole destination: the
+                            // bytes and the words marked written are the byte
+                            // loop's below.
+                            memory.read_range(src, bytes);
+                            memory.write_range(dst, bytes);
+                        } else {
+                            for (i, byte) in bytes.iter_mut().enumerate() {
+                                *byte = memory.load_byte(src + i as u64);
+                            }
+                            for (i, &byte) in bytes.iter().enumerate() {
+                                memory.store_byte(dst + i as u64, byte);
+                            }
                         }
                         src2_val = copy_trace_rows(src, dst, n, false);
                         dst_val = n;
@@ -758,9 +1278,26 @@ impl Instruction {
                             return Err(ExecutionError::DmaMemsetBadGap { src, dst });
                         }
 
-                        for i in 0..n {
-                            let byte = memory.load_byte(src + i);
-                            memory.store_byte(dst + i, byte);
+                        if memory.dma_bulk() {
+                            // With `dst = src + 8` the forward byte walk below
+                            // reads, at step `i >= 8`, the byte it wrote at step
+                            // `i - 8`: the destination is the first
+                            // `min(n, 8)` source bytes repeated. Those are read
+                            // before any write, then the range is written once.
+                            let mut seed = [0u8; DMA_MEMSET_GAP as usize];
+                            let seed_len = n.min(DMA_MEMSET_GAP) as usize;
+                            memory.read_range(src, &mut seed[..seed_len]);
+                            let mut bytes = [0u8; DMA_MEMCPY_MAX_BYTES as usize];
+                            let bytes = &mut bytes[..n as usize];
+                            for (i, byte) in bytes.iter_mut().enumerate() {
+                                *byte = seed[i % DMA_MEMSET_GAP as usize];
+                            }
+                            memory.write_range(dst, bytes);
+                        } else {
+                            for i in 0..n {
+                                let byte = memory.load_byte(src + i);
+                                memory.store_byte(dst + i, byte);
+                            }
                         }
                         src2_val = copy_trace_rows(src, dst, n, false);
                         dst_val = n;
@@ -836,7 +1373,8 @@ impl Instruction {
 
 impl ArithOp {
     /// 64-bit arithmetic operations (RV64I base)
-    fn apply(&self, a: i64, b: i64) -> i64 {
+    #[inline(always)]
+    pub(crate) fn apply(&self, a: i64, b: i64) -> i64 {
         match self {
             ArithOp::Add => a.wrapping_add(b),
             ArithOp::Sub => a.wrapping_sub(b),
@@ -891,7 +1429,8 @@ impl ArithOp {
     }
 
     /// 32-bit arithmetic operations with sign extension (RV64 W-suffix)
-    fn apply_word(&self, a: i32, b: i32) -> Result<i32, ExecutionError> {
+    #[inline(always)]
+    pub(crate) fn apply_word(&self, a: i32, b: i32) -> Result<i32, ExecutionError> {
         Ok(match self {
             ArithOp::Add => a.wrapping_add(b),
             ArithOp::Sub => a.wrapping_sub(b),
@@ -937,7 +1476,8 @@ impl ArithOp {
 }
 
 impl Comparison {
-    fn apply(&self, a: u64, b: u64) -> bool {
+    #[inline(always)]
+    pub(crate) fn apply(&self, a: u64, b: u64) -> bool {
         match self {
             Comparison::Equal => a == b,
             Comparison::NotEqual => a != b,
@@ -977,10 +1517,34 @@ pub enum ExecutionError {
     UnalignedKeccakStateAddress(u64),
     #[error("Keccak state address range overflows: {0:#018x}")]
     KeccakStateAddressOverflow(u64),
+    #[error(
+        "Keccak-256 operands cross a 2^32 address-word boundary: ptr {ptr:#x}, len {len}, out {out:#x}"
+    )]
+    Keccak256AddressOverflow { ptr: u64, len: u64, out: u64 },
+    #[error("Unaligned BLAKE3 state address: {0:#018x}")]
+    UnalignedBlake3StateAddress(u64),
+    #[error("BLAKE3 state address range overflows: {0:#018x}")]
+    Blake3StateAddressOverflow(u64),
+    #[error("Unaligned BLAKE3 absorb address: {0:#018x}")]
+    UnalignedBlake3AbsorbAddress(u64),
+    #[error("BLAKE3 absorb address range overflows: {0:#018x}")]
+    Blake3AbsorbAddressOverflow(u64),
+    #[error("BLAKE3 absorb block count out of range: {0}")]
+    Blake3AbsorbBlockCountOutOfRange(u64),
+    #[error("BLAKE3 absorb first_flags exceeds 32 bits: {0:#018x}")]
+    Blake3AbsorbFlagsOutOfRange(u64),
+    #[error("BLAKE3 absorb control and message regions overlap")]
+    Blake3AbsorbRegionOverlap,
     #[error("ECSM address range overflows the lower 32-bit limb")]
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
     EcsmOperandOverlap,
+    #[error("ECREC address range overflows the lower 32-bit limb")]
+    EcrecAddressOverflow,
+    #[error("ECREC signature and message hash ranges overlap")]
+    EcrecOperandOverlap,
+    #[error("ECREC parity must be 0 or 1, got {0}")]
+    EcrecParityOutOfRange(u64),
     #[error("DMA chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
     DmaChunkTooLarge(u64),
     #[error("DMA memset needs dst == src + {DMA_MEMSET_GAP}; got src {src:#x}, dst {dst:#x}")]
@@ -1073,4 +1637,149 @@ pub fn keccak_f1600(state: &mut [u64; 25]) {
         // ι (iota)
         state[0] ^= rc;
     }
+}
+
+// =============================================================================
+// BLAKE3 6-round compression (internal variant)
+// =============================================================================
+//
+// A Rust port of the validated oracle `tooling/blake3-second-source/blake3-oracle/blake3_ref.py`
+// with `rounds = 6` fixed. This is the **6-round internal variant** — NOT
+// standard BLAKE3 (7 rounds); its security rests on the named 6-round
+// assumption recorded in `thoughts/blake3/blake3-chip/DESIGN.md`. Differentially
+// tested against the oracle's canonical 6-round vectors (pinned in
+// `tooling/blake3-second-source/blake3-oracle/canonical_6round_vectors.json`, themselves
+// validated against the official `blake3` crate).
+
+/// The BLAKE3 IV (identical to SHA-256's initial state). `IV[0..4]` seeds
+/// `v[8..12]` of the compression working state.
+pub const BLAKE3_IV: [u32; 8] = [
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+];
+
+/// The BLAKE3 message-schedule permutation, applied between rounds
+/// (`m'[i] = m[MSG_PERMUTATION[i]]`).
+pub const BLAKE3_MSG_PERMUTATION: [usize; 16] =
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+
+/// Rounds of the internal variant. 6, per the design; standard BLAKE3 is 7.
+pub const BLAKE3_ROUNDS: usize = 6;
+
+/// The BLAKE3 quarter-round G (spec §2.1).
+#[inline]
+fn blake3_g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(mx);
+    v[d] = (v[d] ^ v[a]).rotate_right(16);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(12);
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(my);
+    v[d] = (v[d] ^ v[a]).rotate_right(8);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(7);
+}
+
+/// The BLAKE3 compression function `f` at 6 rounds (spec §2.2, oracle §2.4).
+///
+/// State init: `v[0..8] = h`, `v[8..12] = IV[0..4]`, `v[12] = t as u32`,
+/// `v[13] = (t >> 32) as u32`, `v[14] = block_len`, `v[15] = flags`. Six
+/// rounds of 8 G-calls (4 columns then 4 diagonals), permuting the message
+/// schedule between rounds (`r < rounds - 1`, i.e. 5 permutes — the trailing
+/// permute is never consumed). Feed-forward: `out[i] = v[i] ^ v[i+8]`,
+/// `out[i+8] = v[i+8] ^ h[i]`. The truncated chaining value is `out[0..8]`.
+pub fn blake3_compress_6round(
+    h: &[u32; 8],
+    m: &[u32; 16],
+    t: u64,
+    block_len: u32,
+    flags: u32,
+) -> [u32; 16] {
+    let mut v: [u32; 16] = [
+        h[0],
+        h[1],
+        h[2],
+        h[3],
+        h[4],
+        h[5],
+        h[6],
+        h[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        t as u32,
+        (t >> 32) as u32,
+        block_len,
+        flags,
+    ];
+
+    let mut m = *m;
+    for r in 0..BLAKE3_ROUNDS {
+        // Mix the columns.
+        blake3_g(&mut v, 0, 4, 8, 12, m[0], m[1]);
+        blake3_g(&mut v, 1, 5, 9, 13, m[2], m[3]);
+        blake3_g(&mut v, 2, 6, 10, 14, m[4], m[5]);
+        blake3_g(&mut v, 3, 7, 11, 15, m[6], m[7]);
+        // Mix the diagonals.
+        blake3_g(&mut v, 0, 5, 10, 15, m[8], m[9]);
+        blake3_g(&mut v, 1, 6, 11, 12, m[10], m[11]);
+        blake3_g(&mut v, 2, 7, 8, 13, m[12], m[13]);
+        blake3_g(&mut v, 3, 4, 9, 14, m[14], m[15]);
+        // Permute between rounds; the permute after the last round is never
+        // consumed (oracle: `r < rounds - 1`).
+        if r < BLAKE3_ROUNDS - 1 {
+            let prev = m;
+            for (i, &p) in BLAKE3_MSG_PERMUTATION.iter().enumerate() {
+                m[i] = prev[p];
+            }
+        }
+    }
+
+    let mut out = [0u32; 16];
+    for i in 0..8 {
+        out[i] = v[i] ^ v[i + 8];
+        out[i + 8] = v[i + 8] ^ h[i];
+    }
+    out
+}
+
+/// One block of a chained absorb: compress `m` into `cv` under the absorb
+/// schedule and return the truncated chaining value.
+///
+/// The schedule — `t = 0`, `block_len = 64` — is the absorb ABI's, applied to
+/// every block of a run. It is the interior shape of `crypto`'s `Blake3Chain`
+/// framing, restated here because `executor` does not depend on `crypto`;
+/// [`blake3_absorb_chain_6round`] is where that restatement is gated.
+pub fn blake3_absorb_step_6round(cv: &[u32; 8], m: &[u32; 16], flags: u32) -> [u32; 8] {
+    let out = blake3_compress_6round(cv, m, 0, BLAKE3_BLOCK_BYTES as u32, flags);
+    let mut next = [0u32; 8];
+    next.copy_from_slice(&out[..8]);
+    next
+}
+
+/// ★ The absorb ecall's semantics, as a pure function over whole blocks.
+///
+/// `first_flags` lands on block 0 and every later block carries `0`. The syscall
+/// handler is this loop reading its blocks out of VM memory, and the prover's
+/// trace builder is this loop again over one row per block — so this is the
+/// single object all three agree on, and the one a parity test can drive.
+///
+/// **This is a second framing and is treated as one.** `crypto`'s `Blake3Chain`
+/// owns the flag schedule (`block_flags`: `CHUNK_START` on the first block,
+/// `CHUNK_END | ROOT` and the true byte count on the last). This function
+/// restates the *interior* of that schedule — full blocks, no flags after the
+/// first — because `executor` cannot call `crypto`. What makes the restatement
+/// safe is not that it looks right: it is that a guest's `Blake3Chain` drives
+/// this for every block but its last, and the parity tests check the composite
+/// against `Blake3Chain` over exhaustive message lengths. A drift in either the
+/// flags or the `block_len` moves the digest and fails those tests.
+pub fn blake3_absorb_chain_6round(
+    cv_in: &[u32; 8],
+    blocks: &[[u32; 16]],
+    first_flags: u32,
+) -> [u32; 8] {
+    let mut cv = *cv_in;
+    for (i, m) in blocks.iter().enumerate() {
+        cv = blake3_absorb_step_6round(&cv, m, if i == 0 { first_flags } else { 0 });
+    }
+    cv
 }

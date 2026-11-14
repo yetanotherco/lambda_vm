@@ -84,8 +84,6 @@ fn craft_bundle(
             &[],
             is_final,
             true,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
         )?;
         if is_final {
             apply_tamper(&mut traces, epoch_logs, tamper);
