@@ -798,6 +798,68 @@ pub fn create_cpu_air(proof_options: &ProofOptions, ts_base: u64) -> ConcreteVmA
     )
 }
 
+/// The CPU AIR under the in-row register format
+/// ([`crate::tables::register::RegisterFormat::InRow`]): 42 columns, the
+/// in-row interactions, today's constraints.
+pub fn create_cpu_air_inrow(
+    proof_options: &ProofOptions,
+    ts_base: u64,
+) -> ConcreteVmAir<CpuConstraints> {
+    let full_table = crate::tables::cpu::TIMESTAMP_STRIDE * crate::tables::max_rows::CPU as u64;
+    build_air_maybe_cached(
+        crate::tables::cpu::inrow_cols::NUM_COLUMNS_INROW,
+        crate::tables::cpu::bus_interactions_inrow(ts_base),
+        proof_options,
+        1,
+        CpuConstraints,
+        &format!("CPU~inrow@{ts_base}"),
+        ts_base.is_multiple_of(full_table),
+    )
+}
+
+/// The REGX AIR (`tables::regx`), the in-row register format's table of the
+/// register accesses a CPU row does not check and of keep-alives.
+pub fn create_regx_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::regx::RegxConstraints> {
+    build_air(
+        crate::tables::regx::cols::NUM_COLUMNS,
+        crate::tables::regx::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::regx::RegxConstraints,
+        "REGX",
+    )
+}
+
+/// REGISTER under the in-row register format (`tables::register::inrow`).
+pub fn create_register_air_inrow(
+    proof_options: &ProofOptions,
+    final_pc_ts: u64,
+) -> ConcreteVmAir<EmptyConstraints> {
+    build_air_maybe_cached(
+        crate::tables::register::inrow::cols::NUM_COLUMNS,
+        crate::tables::register::inrow::bus_interactions(final_pc_ts),
+        proof_options,
+        1,
+        EmptyConstraints,
+        &format!("REGISTER~inrow@{final_pc_ts}"),
+        false,
+    )
+}
+
+/// HALT under the in-row register format (`tables::halt::bus_interactions_inrow`).
+pub fn create_halt_air_inrow(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
+        halt_cols::NUM_COLUMNS,
+        crate::tables::halt::bus_interactions_inrow(),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "HALT~inrow",
+    )
+}
+
 /// Create Bitwise AIR with bus interactions.
 pub fn create_bitwise_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
     build_air(

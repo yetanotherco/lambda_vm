@@ -415,6 +415,11 @@ pub enum BusId {
     ///
     /// ID 38: the next free one (20 and 29 stay unused).
     KeccakSponge = 38,
+    /// Register tokens under the format that checks a CPU row's register
+    /// accesses in the row itself: `(register, timestamp, value_lo, value_hi)`,
+    /// the timestamp one field element, one token a 64-bit register
+    /// (`tables::register::RegisterFormat::InRow`).
+    Reg = 39,
 }
 
 impl BusId {
@@ -436,6 +441,7 @@ impl BusId {
             BusId::Commit => "Commit",
             BusId::CopyNext => "CopyNext",
             BusId::KeccakSponge => "KeccakSponge",
+            BusId::Reg => "Reg",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
             BusId::ByteAlu => "ByteAlu",
@@ -487,6 +493,7 @@ impl TryFrom<u64> for BusId {
             35 => Ok(BusId::Blake3Absorb),
             36 => Ok(BusId::CopyNext),
             38 => Ok(BusId::KeccakSponge),
+            39 => Ok(BusId::Reg),
             37 => Ok(BusId::IsWh),
             other => Err(other),
         }

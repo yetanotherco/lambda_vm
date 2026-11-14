@@ -421,7 +421,8 @@ fn commit_register_columns(
     columns: Vec<Vec<FE>>,
     layout: LeafLayout,
 ) -> Commitment {
-    let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+    // Every column has the table's rows (a power of two).
+    let num_rows = columns.first().map_or(0, Vec::len);
     let polys: Vec<Polynomial<FE>> = columns
         .iter()
         .map(|col| {
@@ -597,5 +598,178 @@ pub fn register_word_addresses(reg_idx: u8) -> Vec<u64> {
             let base = 2 * reg_idx as u64;
             vec![base, base + 1]
         }
+    }
+}
+
+// =========================================================================
+// The register format, and REGISTER under its in-row form
+// =========================================================================
+
+/// How a block checks its register accesses: a constant of the proof format,
+/// which the prover and the verifier of one proof take alike and nothing reads
+/// from a proof (`block_whir::BlockFormat::registers`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RegisterFormat {
+    /// Today's: every register access is a MEMW message; MEMW_R (or MEMW_A /
+    /// MEMW past its range) checks it against two 32-bit word tokens on the
+    /// Memory bus, and REGISTER closes them a word a row.
+    #[default]
+    Tokens32,
+    /// A CPU row checks its own `rs1`, `rs2` and `rd` accesses and its PC on
+    /// the [`BusId::Reg`] bus, one 64-bit token an access (`tables::cpu`'s
+    /// in-row interactions); REGX (`tables::regx`) takes every other register
+    /// access and the keep-alives; REGISTER closes the tokens a register a row
+    /// ([`inrow`]); HALT bridges the PC on the same bus.
+    InRow,
+}
+
+/// REGISTER under [`RegisterFormat::InRow`]: one row a register (x0–x31, x254,
+/// x255), its 64-bit initial and final values preprocessed, its final
+/// timestamp committed. Interactions: REG receive `(OFFSET, 1, INIT)`; REG
+/// send `(OFFSET, final_pc_ts, FINI)` on `IS_PC`; REG send `(OFFSET, TS, FINI)`
+/// on `1 − IS_PC`. Padding rows (all zero, `TS = 1`) receive and send the same
+/// token `(0, 1, 0, 0)` and cancel.
+pub mod inrow {
+    use super::*;
+
+    pub mod cols {
+        /// The register index (0–31, 254, 255), preprocessed.
+        pub const OFFSET: usize = 0;
+        pub const INIT_0: usize = 1;
+        pub const INIT_1: usize = 2;
+        pub const FINI_0: usize = 3;
+        pub const FINI_1: usize = 4;
+        pub const IS_PC: usize = 5;
+        /// The register's final timestamp (1 if never accessed).
+        pub const TS: usize = 6;
+        pub const NUM_COLUMNS: usize = 7;
+    }
+
+    /// OFFSET, INIT_0/1, FINI_0/1, IS_PC.
+    pub const NUM_PREPROCESSED_COLS: usize = 6;
+
+    /// The table's rows, padded: 34 registers to 64.
+    pub const NUM_ROWS: usize = NUM_REGISTERS.next_power_of_two();
+
+    /// The register index of row `row` (`row < NUM_REGISTERS`).
+    pub fn register_of_row(row: usize) -> u64 {
+        match row {
+            32 => 254,
+            33 => 255,
+            r => r as u64,
+        }
+    }
+
+    /// The preprocessed columns from the word-ordered files `init` and `fini`
+    /// ([`register_word_address_list`] order, as [`super::preprocessed_columns`]
+    /// takes them): a register's two words side by side in its row.
+    pub fn preprocessed_columns(init: &[u32], fini: &[u32]) -> Vec<Vec<FE>> {
+        let mut columns =
+            vec![crate::tables::types::zeroed_fe_vec(NUM_ROWS); NUM_PREPROCESSED_COLS];
+        let word = |v: &[u32], i: usize| FE::from(u64::from(v.get(i).copied().unwrap_or(0)));
+        for row in 0..NUM_REGISTERS {
+            columns[cols::OFFSET][row] = FE::from(register_of_row(row));
+            columns[cols::INIT_0][row] = word(init, 2 * row);
+            columns[cols::INIT_1][row] = word(init, 2 * row + 1);
+            columns[cols::FINI_0][row] = word(fini, 2 * row);
+            columns[cols::FINI_1][row] = word(fini, 2 * row + 1);
+            columns[cols::IS_PC][row] = FE::from(u64::from(row == 33));
+        }
+        columns
+    }
+
+    /// The trace: the preprocessed columns, and each register's final
+    /// timestamp from `final_ts` (by register index; 1 when it was never
+    /// accessed). Padding rows take `TS = 1`.
+    pub fn generate_trace(
+        init: &[u32],
+        fini: &[u32],
+        final_ts: &dyn Fn(u64) -> Option<u64>,
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+        let pre = preprocessed_columns(init, fini);
+        let mut trace = TraceTable::new_main(
+            crate::tables::types::zeroed_fe_vec(NUM_ROWS * cols::NUM_COLUMNS),
+            cols::NUM_COLUMNS,
+            1,
+        );
+        let table = &mut trace.main_table;
+        for row in 0..NUM_ROWS {
+            for (c, column) in pre.iter().enumerate() {
+                table.set_fe(row, c, column[row]);
+            }
+            let ts = if row < NUM_REGISTERS {
+                final_ts(register_of_row(row)).unwrap_or(1)
+            } else {
+                1
+            };
+            table.set_u64(row, cols::TS, ts);
+        }
+        trace
+    }
+
+    /// The preprocessed columns' commitment for both leaf layouts, computed on
+    /// first use (the univariate verifier's root; the block reads the columns).
+    pub fn lazy_commitment(
+        options: &ProofOptions,
+        init: &[u32],
+        fini: &[u32],
+    ) -> stark::lookup::LazyCommitment {
+        let (o, one_row) = (options.clone(), options.clone());
+        let (i0, f0) = (init.to_vec(), fini.to_vec());
+        let (i1, f1) = (init.to_vec(), fini.to_vec());
+        stark::lookup::LazyCommitment::deferred(move || {
+            commit_register_columns(&o, preprocessed_columns(&i0, &f0), LeafLayout::RowPair)
+        })
+        .with_one_row(move || {
+            Some(commit_register_columns(
+                &one_row,
+                preprocessed_columns(&i1, &f1),
+                LeafLayout::Row,
+            ))
+        })
+    }
+
+    fn column(c: usize) -> BusValue {
+        BusValue::Packed {
+            start_column: c,
+            packing: Packing::Direct,
+        }
+    }
+
+    /// The interactions (module docs); `final_pc_ts` is where the last CPU row
+    /// produces its `next_pc` token ([`crate::tables::cpu::final_pc_timestamp`]).
+    pub fn bus_interactions(final_pc_ts: u64) -> Vec<BusInteraction> {
+        vec![
+            BusInteraction::receiver(
+                BusId::Reg,
+                Multiplicity::One,
+                vec![
+                    column(cols::OFFSET),
+                    BusValue::constant(1),
+                    column(cols::INIT_0),
+                    column(cols::INIT_1),
+                ],
+            ),
+            BusInteraction::sender(
+                BusId::Reg,
+                Multiplicity::Column(cols::IS_PC),
+                vec![
+                    column(cols::OFFSET),
+                    BusValue::constant(final_pc_ts),
+                    column(cols::FINI_0),
+                    column(cols::FINI_1),
+                ],
+            ),
+            BusInteraction::sender(
+                BusId::Reg,
+                Multiplicity::Negated(cols::IS_PC),
+                vec![
+                    column(cols::OFFSET),
+                    column(cols::TS),
+                    column(cols::FINI_0),
+                    column(cols::FINI_1),
+                ],
+            ),
+        ]
     }
 }
