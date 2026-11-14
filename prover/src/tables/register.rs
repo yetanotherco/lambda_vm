@@ -610,16 +610,19 @@ pub fn register_word_addresses(reg_idx: u8) -> Vec<u64> {
 /// from a proof (`block_whir::BlockFormat::registers`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RegisterFormat {
-    /// Today's: every register access is a MEMW message; MEMW_R (or MEMW_A /
-    /// MEMW past its range) checks it against two 32-bit word tokens on the
-    /// Memory bus, and REGISTER closes them a word a row.
+    /// The format before the block's production one (its rollback, and the
+    /// per-table STARK's and the builders' default): every register access is
+    /// a MEMW message; MEMW_R (or MEMW_A / MEMW past its range) checks it
+    /// against two 32-bit word tokens on the Memory bus, and REGISTER closes
+    /// them a word a row.
     #[default]
     Tokens32,
     /// A CPU row checks its own `rs1`, `rs2` and `rd` accesses and its PC on
     /// the [`BusId::Reg`] bus, one 64-bit token an access (`tables::cpu`'s
     /// in-row interactions); the residual register table (`tables::register_residual`) takes every other register
     /// access and the keep-alives; REGISTER closes the tokens a register a row
-    /// ([`inrow`]); HALT bridges the PC on the same bus.
+    /// ([`inrow`]); HALT bridges the PC on the same bus. The block's
+    /// production and pinned format.
     InRow,
 }
 

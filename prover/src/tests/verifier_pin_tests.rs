@@ -255,7 +255,7 @@ const OFF_DEFAULT: [(&str, &str); 10] = [
     ("BLOCK_WHIR_ARGUE_PACK", "off"),
     ("BLOCK_WHIR_KECCAK_RND", "full"),
     ("BLOCK_WHIR_MEMW_A", "lt"),
-    ("BLOCK_WHIR_REGISTERS", "in-row"),
+    ("BLOCK_WHIR_REGISTERS", "tokens32"),
 ];
 
 /// ★ The block verifier reads no format from its environment. In a process of
@@ -340,12 +340,12 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     );
     assert_eq!(
         harness.format.registers,
-        crate::tables::register::RegisterFormat::InRow,
+        crate::tables::register::RegisterFormat::Tokens32,
         "the harness's register format follows its knob"
     );
     assert_eq!(
         production.registers,
-        crate::tables::register::RegisterFormat::Tokens32,
+        crate::tables::register::RegisterFormat::InRow,
         "the prover's own production format reads no register knob"
     );
 
@@ -373,7 +373,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     );
     assert_eq!(
         pinned.format.registers,
-        crate::tables::register::RegisterFormat::Tokens32,
+        crate::tables::register::RegisterFormat::InRow,
         "the verifier's register format is its named constant, not the environment's"
     );
     assert!(pinned.share_inverse);

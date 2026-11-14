@@ -303,14 +303,15 @@ pub struct BlockFormat {
     /// LT tables the block holds and the recursion's programs, follow it.
     pub memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
     /// How register accesses are checked
-    /// ([`RegisterFormat`](crate::tables::register::RegisterFormat)): as 32-bit
-    /// word tokens through MEMW_R
+    /// ([`RegisterFormat`](crate::tables::register::RegisterFormat)): in the
+    /// CPU row on one 64-bit token an access, the residual register table
+    /// taking the rest
+    /// ([`InRow`](crate::tables::register::RegisterFormat::InRow), the
+    /// production constant), or as 32-bit word tokens through MEMW_R
     /// ([`Tokens32`](crate::tables::register::RegisterFormat::Tokens32), the
-    /// production constant), or in the CPU row on one 64-bit token an access,
-    /// the residual register table taking the rest
-    /// ([`InRow`](crate::tables::register::RegisterFormat::InRow), a variant a
-    /// caller names). The CPU, MEMW_R's slot, REGISTER and HALT, so their
-    /// buses and the block's tables, follow it.
+    /// format before it, a variant a caller names). The CPU, MEMW_R's slot,
+    /// REGISTER and HALT, so their buses, the block's tables and the
+    /// recursion's programs, follow it.
     pub registers: crate::tables::register::RegisterFormat,
 }
 
@@ -453,7 +454,7 @@ impl BlockFormat {
             group: GroupFold::Indexed,
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
-            registers: crate::tables::register::RegisterFormat::Tokens32,
+            registers: crate::tables::register::RegisterFormat::InRow,
         }
     }
 
@@ -491,7 +492,7 @@ impl BlockFormat {
             group: GroupFold::Indexed,
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
-            registers: crate::tables::register::RegisterFormat::Tokens32,
+            registers: crate::tables::register::RegisterFormat::InRow,
         }
     }
 

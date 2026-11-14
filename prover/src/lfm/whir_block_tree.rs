@@ -423,10 +423,10 @@ pub fn memw_aligned_setting(knob: Option<&str>) -> Result<MemwAlignedOrder, Stri
 }
 
 /// `BLOCK_WHIR_REGISTERS`'s reading: unset is the pinned preset's format
-/// ([`BlockFormat::pinned`]); `tokens32` names today's word tokens through
-/// MEMW_R and `in-row` the registers checked in the CPU row
-/// ([`RegisterFormat`]). A format value: the prover and the verifier of one
-/// proof take the same one.
+/// ([`BlockFormat::pinned`], the registers checked in the CPU row);
+/// `tokens32` names the format before it, word tokens through MEMW_R (the
+/// rollback), and `in-row` the pinned one ([`RegisterFormat`]). A format
+/// value: the prover and the verifier of one proof take the same one.
 pub fn registers_setting(knob: Option<&str>) -> Result<RegisterFormat, String> {
     match knob.map(str::trim) {
         None => Ok(BlockFormat::pinned().registers),
