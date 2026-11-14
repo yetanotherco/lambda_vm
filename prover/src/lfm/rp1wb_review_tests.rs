@@ -146,7 +146,7 @@ fn chain_program(shape: &ChainShape) -> LfmProgram {
         &mut b,
         &mut transcript,
         &wires,
-        &root_lanes,
+        root_lanes,
         final_value,
         y,
         shape,
