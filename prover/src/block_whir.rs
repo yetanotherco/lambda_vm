@@ -5861,6 +5861,9 @@ fn prove_streamed(
     // it — its chunks generated packed. The disk store's knob, which used to
     // turn it off, refuses the prove when set.
     regen::refuse_removed_spill_words(|name| std::env::var(name).ok())?;
+    // A card-rows word the uploads do not take refuses the prove, rather than
+    // running as another mode.
+    multilinear::gpu::card_rows_refusal().map_err(Error::Prover)?;
     let regen_mode = match options.regen {
         Some(mode) => mode,
         None => regen::regen_mode()?,
@@ -8196,6 +8199,44 @@ pub(crate) fn verify_block_whir_traced(
         )
         .map_err(BlockRefusal::Proof)
     }))
+}
+
+/// A stale `LAMBDA_VM_CARD_ROWS` word (`derive`, `1`, `registers`, or any
+/// word the uploads do not take) refuses the block prove with an error that
+/// names the values it takes; `off`, `order`, `words` and unset prove.
+#[cfg(all(test, feature = "cuda"))]
+mod card_rows_refusal_tests {
+    use crate::Error;
+
+    #[test]
+    fn a_stale_card_rows_word_refuses_the_prove_and_names_the_values() {
+        let refusal = |word| multilinear::gpu::card_rows_refusal_of(word).map_err(Error::Prover);
+        for word in [
+            "derive",
+            " derive ",
+            "1",
+            "registers",
+            "equal",
+            "yes",
+            "Words",
+        ] {
+            let Err(Error::Prover(why)) = refusal(Some(word)) else {
+                panic!("LAMBDA_VM_CARD_ROWS={word} must refuse the prove");
+            };
+            assert!(why.contains("LAMBDA_VM_CARD_ROWS"), "{why}");
+            assert!(why.contains("off, order or words"), "{why}");
+        }
+        for word in [
+            None,
+            Some(""),
+            Some("off"),
+            Some("0"),
+            Some("order"),
+            Some(" words "),
+        ] {
+            assert!(refusal(word).is_ok(), "{word:?} must prove");
+        }
+    }
 }
 
 #[cfg(test)]
