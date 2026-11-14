@@ -242,12 +242,13 @@ $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_
 # $(1) is the preset; the recipe uses $$ so `$$(call build_guest_elf,...)`
 # expands at recipe-run time (where $@ is defined).
 #
-# `absorb` rides along with every preset: it routes the verifier legs' coalesced
-# leaf hashing through the chained-absorb ecall, which the prover's BLAKE3 table
-# answers with its absorb mode. It is a feature rather than a default of the
-# guest crate so the no-absorb leg stays buildable for A/B cycle measurement —
-# drop it from RECURSION_GUEST_FEATURES to rebuild that leg.
-RECURSION_GUEST_FEATURES := absorb
+# No preset enables `absorb`. That feature routes the verifier legs' coalesced
+# leaf hashing through the chained-absorb ecall, whose accelerator implements
+# six rounds only, so it turns `crypto/blake3-6round` on; every BLAKE3 in a
+# default build is standard 7-round now, and `stark::config` refuses a build of
+# the commitment configuration at six. Add `absorb` here only together with a
+# six-round configuration.
+RECURSION_GUEST_FEATURES :=
 define recursion_verifier_rule
 $(RECURSION_ARTIFACTS_DIR)/recursion-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
 	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features "$(1) $$(RECURSION_GUEST_FEATURES)")
@@ -885,33 +886,20 @@ check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
-	# BLAKE3 at SEVEN rounds — the standard, externally anchored arm.
+	# BLAKE3 at SIX rounds — the internal variant, `crypto` alone.
 	#
-	# This pass used to be the six-round one. Six is the default now (P-a Stage 6
-	# put the commitment aliases on BLAKE3, and every blessed constant is six), so
-	# the pass that needs writing down is the other one: without this, nothing in
-	# the matrix compiles `hash::blake3` at seven and the arm the KATs anchor
-	# against could rot unnoticed.
-	#
-	# Scoped to `crypto`, and it has to be. A workspace-level
-	# `--no-default-features` does NOT turn six off: `lambda-vm-prover` depends on
-	# `crypto` with default features, and feature unification takes the union, so
-	# the flag applies to the packages and the dependency edge puts it back. Only
-	# building `crypto` alone leaves the edge out of the graph.
-	#
-	# The lockstep between `crypto`'s knob and `math-cuda`'s (host primitive vs
-	# compiled cubin) still holds and is now expressed as both defaulting to six,
-	# which `math_cuda::blake3::device_rounds` makes assertable rather than
-	# discoverable as a wrong root.
-	cargo clippy -p crypto --all-targets --no-default-features --features std,asm -- -D warnings -A clippy::op_ref
-	# The chained-absorb guest arm's feature graph. Nothing else resolves it: it is
-	# not a default and no dependency names it, so a typo in the forwarding chain
-	# would go unnoticed. ⚠ This does NOT compile the guest absorb arm — that arm
-	# is `cfg(all(target_arch = "riscv64", feature = "blake3-absorb"))` and this is
-	# a host pass, so what compiles is its `cfg(not(...))` stub. The riscv64 arm
-	# has no CI coverage at all (RESUME-PA-STAGE4 §4.2); closing that needs a
-	# guest-target build, not a clippy feature.
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-absorb -- -D warnings -A clippy::op_ref
+	# Seven is the default now: every BLAKE3 in a default build is standard, and
+	# every blessed constant is seven. So the pass that needs writing down is the
+	# six-round one, which nothing else compiles. Scoped to `crypto`, and it has to
+	# be: `stark::config` refuses the commitment configuration at six rounds, so a
+	# workspace build with the feature does not compile by design.
+	cargo clippy -p crypto --all-targets --features blake3-6round -- -D warnings -A clippy::op_ref
+	# The chained-absorb guest arm's feature graph, `crypto` alone for the same
+	# reason (the feature implies six rounds). ⚠ This does NOT compile the guest
+	# absorb arm — that arm is `cfg(all(target_arch = "riscv64", feature =
+	# "blake3-absorb"))` and this is a host pass, so what compiles is its
+	# `cfg(not(...))` stub.
+	cargo clippy -p crypto --all-targets --features blake3-absorb -- -D warnings -A clippy::op_ref
 
 fmt:
 	cargo fmt --all
@@ -921,33 +909,20 @@ lint:
 	cargo fmt --check --all
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
-	# BLAKE3 at SEVEN rounds — the standard, externally anchored arm.
+	# BLAKE3 at SIX rounds — the internal variant, `crypto` alone.
 	#
-	# This pass used to be the six-round one. Six is the default now (P-a Stage 6
-	# put the commitment aliases on BLAKE3, and every blessed constant is six), so
-	# the pass that needs writing down is the other one: without this, nothing in
-	# the matrix compiles `hash::blake3` at seven and the arm the KATs anchor
-	# against could rot unnoticed.
-	#
-	# Scoped to `crypto`, and it has to be. A workspace-level
-	# `--no-default-features` does NOT turn six off: `lambda-vm-prover` depends on
-	# `crypto` with default features, and feature unification takes the union, so
-	# the flag applies to the packages and the dependency edge puts it back. Only
-	# building `crypto` alone leaves the edge out of the graph.
-	#
-	# The lockstep between `crypto`'s knob and `math-cuda`'s (host primitive vs
-	# compiled cubin) still holds and is now expressed as both defaulting to six,
-	# which `math_cuda::blake3::device_rounds` makes assertable rather than
-	# discoverable as a wrong root.
-	cargo clippy -p crypto --all-targets --no-default-features --features std,asm -- -D warnings -A clippy::op_ref
-	# The chained-absorb guest arm's feature graph. Nothing else resolves it: it is
-	# not a default and no dependency names it, so a typo in the forwarding chain
-	# would go unnoticed. ⚠ This does NOT compile the guest absorb arm — that arm
-	# is `cfg(all(target_arch = "riscv64", feature = "blake3-absorb"))` and this is
-	# a host pass, so what compiles is its `cfg(not(...))` stub. The riscv64 arm
-	# has no CI coverage at all (RESUME-PA-STAGE4 §4.2); closing that needs a
-	# guest-target build, not a clippy feature.
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/blake3-absorb -- -D warnings -A clippy::op_ref
+	# Seven is the default now: every BLAKE3 in a default build is standard, and
+	# every blessed constant is seven. So the pass that needs writing down is the
+	# six-round one, which nothing else compiles. Scoped to `crypto`, and it has to
+	# be: `stark::config` refuses the commitment configuration at six rounds, so a
+	# workspace build with the feature does not compile by design.
+	cargo clippy -p crypto --all-targets --features blake3-6round -- -D warnings -A clippy::op_ref
+	# The chained-absorb guest arm's feature graph, `crypto` alone for the same
+	# reason (the feature implies six rounds). ⚠ This does NOT compile the guest
+	# absorb arm — that arm is `cfg(all(target_arch = "riscv64", feature =
+	# "blake3-absorb"))` and this is a host pass, so what compiles is its
+	# `cfg(not(...))` stub.
+	cargo clippy -p crypto --all-targets --features blake3-absorb -- -D warnings -A clippy::op_ref
 	# The cuda feature gates whole modules + cuda-only integration tests. build.rs emits empty
 	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
 	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.

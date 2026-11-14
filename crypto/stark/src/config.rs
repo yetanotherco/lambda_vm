@@ -624,19 +624,18 @@ const _: () = assert!(matches!(
     CommitmentHash::Keccak256
 ));
 
-/// ★ The round-count lockstep, and the reason the default build must carry
-/// `blake3-6round`.
+/// ★ The round-count lockstep: standard 7-round BLAKE3 only.
 ///
 /// `BLAKE3_ROUNDS` is a crate-global compile-time constant, so one build cannot
 /// produce two hashes — but two *builds* can, and every blessed constant in this
-/// workspace was generated at six rounds. Without this assertion a build that
-/// merely lost the feature would commit seven-round roots and fail later, at
-/// drift-test time, with a mismatch that names no cause. Here it is a compile
+/// workspace was generated at seven rounds. Without this assertion a build that
+/// turned `crypto/blake3-6round` on would commit six-round roots and fail later,
+/// at drift-test time, with a mismatch that names no cause. Here it is a compile
 /// error that names one.
 ///
 const _: () = assert!(
-    crypto::hash::blake3::BLAKE3_ROUNDS == crypto::hash::blake3::BLAKE3_SIX_ROUNDS,
-    "the default commitment configuration is BLAKE3, so this build must enable \
-     `crypto/blake3-6round` (via `lambda-vm-prover/blake3-6round`, or the \
-     default feature set): every blessed root was generated at six rounds"
+    crypto::hash::blake3::BLAKE3_ROUNDS == crypto::hash::blake3::BLAKE3_STANDARD_ROUNDS,
+    "the default commitment configuration is standard 7-round BLAKE3, so this \
+     build must not enable `crypto/blake3-6round`: every blessed root was \
+     generated at seven rounds"
 );
