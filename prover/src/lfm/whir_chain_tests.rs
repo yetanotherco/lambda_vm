@@ -439,7 +439,7 @@ pub(super) fn chain_program_from(shape: &ChainShape, b: LfmBuilder) -> LfmProgra
         &mut b,
         &mut transcript,
         &wires,
-        &root_lanes,
+        root_lanes,
         final_value,
         y,
         shape,
