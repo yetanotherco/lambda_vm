@@ -4261,6 +4261,9 @@ struct RecordsUp<'a> {
     /// while it holds their logs (`math_cuda::card_rows`).
     hold: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     logs: Vec<&'a [math_cuda::fill::LogC]>,
+    /// A CPU table's side records (the in-row register format's), as the
+    /// card's struct; empty without them.
+    sides: Vec<&'a [math_cuda::fill::CpuSideC]>,
     registers: Vec<&'a [math_cuda::fill::RegRowC]>,
     /// Words mode: a MEMW_R table as the walk wrote it
     /// ([`crate::records::Records::register_words`]), its whole rows as the
@@ -4279,11 +4282,16 @@ impl<'a> RecordsUp<'a> {
     /// DECODE rows cannot go up.
     fn of(records: &'a crate::records::Records) -> Option<Self> {
         use crate::records::{
-            AlignedRow, CpuLog, LoadOp, MemwOp, RecordsFill, RegisterRow, ShiftOp, StoreOp,
+            AlignedRow, CpuLog, CpuSide, LoadOp, MemwOp, RecordsFill, RegisterRow, ShiftOp, StoreOp,
         };
-        use math_cuda::fill::{AlignedRowC, LoadOpC, LogC, MemwOpC, RegRowC, ShiftOpC, StoreOpC};
+        use math_cuda::fill::{
+            AlignedRowC, CpuSideC, LoadOpC, LogC, MemwOpC, RegRowC, ShiftOpC, StoreOpC,
+        };
         const _: () = {
             use std::mem::{align_of, offset_of, size_of};
+            assert!(size_of::<CpuSide>() == size_of::<CpuSideC>());
+            assert!(align_of::<CpuSide>() == align_of::<CpuSideC>());
+            assert!(offset_of!(CpuSide, old_rd) == offset_of!(CpuSideC, old_rd));
             assert!(size_of::<CpuLog>() == size_of::<LogC>());
             assert!(align_of::<CpuLog>() == align_of::<LogC>());
             assert!(offset_of!(CpuLog, src2_val) == offset_of!(LogC, src2_val));
@@ -4366,6 +4374,7 @@ impl<'a> RecordsUp<'a> {
                 decode: None,
                 hold: None,
                 logs: Vec::new(),
+                sides: Vec::new(),
                 registers: Vec::new(),
                 words: Some((w.words, whole, w.whole_base, decode)),
                 aligned: Vec::new(),
@@ -4383,6 +4392,7 @@ impl<'a> RecordsUp<'a> {
             decode: None,
             hold: None,
             logs: Vec::new(),
+            sides: Vec::new(),
             registers: Vec::new(),
             words: None,
             aligned: Vec::new(),
@@ -4393,11 +4403,18 @@ impl<'a> RecordsUp<'a> {
         };
         match &fill {
             RecordsFill::KeccakRnd { .. } => {}
-            RecordsFill::Cpu { logs, decode, .. } => {
+            RecordsFill::Cpu {
+                logs,
+                sides,
+                decode,
+                ..
+            } => {
                 up.decode = Some(decode.on_card()?);
                 up.hold = Some(std::sync::Arc::new(records.clone()));
                 // SAFETY: five `u64`s in the same order (asserted above).
                 up.logs = unsafe { cast::<CpuLog, LogC>(logs) };
+                // SAFETY: five `u32`s in the same order (asserted above).
+                up.sides = unsafe { cast::<CpuSide, CpuSideC>(sides) };
             }
             // SAFETY: the same fields in the same order (asserted above).
             RecordsFill::MemwR { rows } => {
@@ -4518,6 +4535,7 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
         // records' (their digest and host fill), not the card's.
         RecordsFill::Cpu { first_cycle, .. } => RecordsInput::Cpu {
             logs: &up.logs,
+            sides: &up.sides,
             decode: up.decode.as_ref()?,
             first_cycle: *first_cycle,
             hold: up.hold.as_ref(),

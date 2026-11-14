@@ -6329,11 +6329,12 @@ fn prove_streamed(
                 }
             }
         };
-        // Under the in-row register format the host fills the CPU chunks
-        // (their side records are not a card fill yet) and the residual table's (MEMW_R's
-        // kernel fills MEMW_R's columns).
+        // Under the in-row register format MEMW_R's slot holds the residual
+        // register table, which the host builds (MEMW_R's kernel fills MEMW_R's
+        // columns, never the residual table's): MEMW_R's records, its words and
+        // what the card derives from them are off. The CPU chunks go up with
+        // their side records as the card fills them.
         if format.registers == crate::tables::register::RegisterFormat::InRow {
-            card_fill.cpu = false;
             card_fill.memw_r = false;
         }
         // The streamed chunks held as records ([`records_admission`]):

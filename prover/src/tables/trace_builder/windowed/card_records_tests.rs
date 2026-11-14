@@ -19,6 +19,7 @@ use super::{
     WalkedWindow, WindowedTraceBuilder,
 };
 use crate::tables::MaxRowsConfig;
+use crate::tables::register::RegisterFormat;
 use crate::tables::trace_builder::Traces;
 use crate::tests::windowed_builder_tests::{run, same_traces, whole};
 
@@ -121,9 +122,38 @@ fn held(
     room: RecordsRoom,
     rows: bool,
 ) -> (Traces, usize, CardFillStamps) {
+    held_in(
+        program,
+        logs,
+        max_rows,
+        window,
+        walk,
+        room,
+        rows,
+        RegisterFormat::Tokens32,
+    )
+}
+
+/// [`held`] under the register format `registers`: under
+/// [`RegisterFormat::InRow`] the CPU chunks go up with their side records and
+/// MEMW_R's slot (the residual register table) is filled on the host, as the
+/// block asks.
+#[allow(clippy::too_many_arguments)]
+fn held_in(
+    program: &Elf,
+    logs: &[Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    walk: Walk,
+    room: RecordsRoom,
+    rows: bool,
+    registers: RegisterFormat,
+) -> (Traces, usize, CardFillStamps) {
+    let in_row = registers == RegisterFormat::InRow;
     let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
+        .and_then(|b| b.register_format(registers))
         .and_then(WindowedTraceBuilder::drop_streamed_ops)
-        .and_then(|b| b.card_fill_streamed(room, true, true))
+        .and_then(|b| b.card_fill_streamed(room, true, !in_row))
         .and_then(|b| {
             if rows {
                 b.card_fill_streamed_rows(RowFamilies::ALL)
@@ -237,6 +267,91 @@ fn cpu_and_memw_r_chunks_held_as_records_are_the_runs_tables() {
 #[test]
 fn row_family_chunks_held_as_records_are_the_runs_tables() {
     chunks_held_as_records_are_the_runs_tables(true);
+}
+
+/// ★ The in-row register format: every full CPU chunk handed out as its logs
+/// and their side records (20 B a cycle more), in the window parts it was cut
+/// from, walked by the builder or on 1 and 4 threads (where the walkers keep
+/// no CPU list and a chunk is cut from its logs alone), fills on the host to
+/// the table the in-row build makes without the card, 42 columns; every
+/// other table is the same, and MEMW_R's slot (the residual register table)
+/// is never held.
+#[test]
+fn in_row_cpu_chunks_held_as_records_are_the_runs_tables() {
+    let max_rows = MaxRowsConfig::small();
+    let mut walks = vec![Walk::Own];
+    #[cfg(feature = "parallel")]
+    walks.extend([Walk::Threads(1), Walk::Threads(4)]);
+    let mut held_most = 0usize;
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "test_commit_split",
+        "keep_alive_regs",
+    ] {
+        let (program, logs) = run(name);
+        for window in [1, 7, 32, 33] {
+            let reference = in_row_windowed(&program, &logs, &max_rows, window);
+            for &walk in &walks {
+                let what = format!("{name}, window {window}, {walk:?}");
+                let (traces, records, stamps) = held_in(
+                    &program,
+                    &logs,
+                    &max_rows,
+                    window,
+                    walk,
+                    always(),
+                    false,
+                    RegisterFormat::InRow,
+                );
+                same_traces(&reference, &traces);
+                assert!(
+                    traces
+                        .cpus
+                        .iter()
+                        .all(|t| t.narrow_main().map_or(t.main_table.width, |p| p.cols())
+                            == crate::tables::cpu::inrow_cols::NUM_COLUMNS_INROW),
+                    "{what}: 42 CPU columns"
+                );
+                let families = families(&stamps);
+                assert!(families.iter().all(|f| f[1] == 0), "{what}: {stamps:?}");
+                assert!(families[1..].iter().all(|f| f[0] == 0), "{what}: CPU alone");
+                assert_eq!(stamps.out_of_step, 0, "{what}");
+                assert_eq!(records, stamps.cpu[0], "{what}");
+                assert_eq!(
+                    stamps.records_bytes,
+                    stamps.cpu[0] * max_rows.cpu * (40 + 20),
+                    "{what}: 40 B a cycle's log and 20 its side record"
+                );
+                held_most = held_most.max(stamps.cpu[0]);
+            }
+        }
+    }
+    assert!(held_most > 1, "{held_most}");
+}
+
+/// The in-row build over windows of `window` cycles without the card, its
+/// streamed chunks put back.
+pub(super) fn in_row_windowed(
+    program: &Elf,
+    logs: &[Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+) -> Traces {
+    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
+        .and_then(|b| b.register_format(RegisterFormat::InRow))
+        .expect("the builder");
+    let body = logs.len() - 1;
+    let cut = body - body % window;
+    let mut chunks = Vec::new();
+    for w in logs[..cut].chunks(window) {
+        chunks.extend(builder.push(w).expect("a window"));
+    }
+    let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+    traces
+        .insert_streamed(chunks)
+        .expect("every chunk has a placeholder");
+    traces
 }
 
 fn chunks_held_as_records_are_the_runs_tables(rows: bool) {
@@ -871,6 +986,106 @@ fn a_chunk_dropped_as_records_is_rebuilt_as_them() {
         }
     }
     assert!(crossed.iter().all(|&n| n > 0), "{crossed:?}");
+}
+
+/// ★ The in-row register format: a CPU chunk dropped as its logs and side
+/// records comes back as them. Walked again from the same logs, with the CPU
+/// logs kept, every CPU chunk phase A held is rebuilt with records of the same
+/// digest (side records included), whose packed columns are the host fill of
+/// phase A's, 42 columns; with one log changed the digest moves.
+#[test]
+fn an_in_row_cpu_chunk_dropped_as_records_is_rebuilt_as_them() {
+    use std::collections::HashMap;
+
+    use super::RegenBuilder;
+    use crate::tables::gpack::TraceForm;
+
+    let max_rows = MaxRowsConfig::small();
+    let mut total = 0usize;
+    for name in ["all_instructions_64", "keep_alive_regs"] {
+        let (program, logs) = run(name);
+        let window = 7;
+        let body = logs.len() - 1;
+        let cut = body - body % window;
+        let mut held: HashMap<usize, multilinear::records::Records> = HashMap::new();
+        {
+            let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
+                .and_then(|b| b.register_format(RegisterFormat::InRow))
+                .and_then(WindowedTraceBuilder::drop_streamed_ops)
+                .and_then(|b| b.card_fill_streamed(always(), true, false))
+                .expect("the builder");
+            let (mut walker, mut accumulator) = builder.split();
+            for w in logs[..cut].chunks(window) {
+                let walked = walker.walk_owned(w.to_vec()).expect("a window");
+                for job in accumulator.absorb(walked) {
+                    let (table, index) = (job.table, job.index);
+                    if let Some(records) = job.generate().trace.take_records_main() {
+                        assert_eq!(table, StreamTable::Cpu, "{name}: CPU alone is held");
+                        held.insert(index, records);
+                    }
+                }
+            }
+        }
+        assert!(!held.is_empty(), "{name}: no CPU chunk held");
+        total += held.len();
+        let replay = |tamper: Option<usize>| {
+            let mut regen = RegenBuilder::new(&program, &[], &max_rows)
+                .and_then(|b| b.register_format(RegisterFormat::InRow))
+                .and_then(RegenBuilder::keep_cpu_logs)
+                .expect("the regenerator");
+            let mut rebuilt = HashMap::new();
+            let mut at = 0usize;
+            for w in logs.chunks(window) {
+                let mut w = w.to_vec();
+                if let Some(k) = tamper.filter(|&k| (at..at + w.len()).contains(&k)) {
+                    w[k - at].dst_val ^= 1;
+                }
+                at += w.len();
+                for job in regen.push_owned(w).expect("a window") {
+                    let (table, index) = (job.table, job.index);
+                    if table != StreamTable::Cpu {
+                        continue;
+                    }
+                    let (digest, chunk) = job.regenerate(TraceForm::Narrow, true);
+                    let mut trace = chunk.trace;
+                    trace.pack_main_narrow();
+                    rebuilt.insert(index, (digest, trace.take_narrow_main()));
+                }
+            }
+            rebuilt
+        };
+        let rebuilt = replay(None);
+        for (index, records) in &held {
+            let what = format!("{name} CPU[{index}]");
+            let (digest, packed) = rebuilt.get(index).cloned().expect("rebuilt");
+            assert_eq!(
+                digest,
+                Some(records.digest()),
+                "{what}: the records' digest"
+            );
+            let packed = packed.expect("packed");
+            let want = records
+                .host_fill()
+                .expect("the host fills phase A's records");
+            assert_eq!(
+                want.cols(),
+                crate::tables::cpu::inrow_cols::NUM_COLUMNS_INROW
+            );
+            assert_eq!(
+                (packed.widths(), packed.data()),
+                (want.widths(), want.data()),
+                "{what}: the packed columns"
+            );
+        }
+        let first = *held.keys().min().expect("a chunk");
+        let bent = replay(Some(first * max_rows.cpu + 1));
+        assert_ne!(
+            bent[&first].0,
+            Some(held[&first].digest()),
+            "{name}: one log changed"
+        );
+    }
+    assert!(total > 2, "{total} CPU chunks held");
 }
 
 /// ★ A records chunk let go hands back the pages of the lists it is the last

@@ -998,7 +998,15 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 continue;
             }
             (TableUpload::Narrow(_), _) => {}
-            (TableUpload::Records(RecordsInput::Cpu { decode, logs, .. }), Plan::CpuHit(key)) => {
+            (
+                TableUpload::Records(RecordsInput::Cpu {
+                    decode,
+                    logs,
+                    sides,
+                    ..
+                }),
+                Plan::CpuHit(key),
+            ) => {
                 let e = cache.entries.get(key)?;
                 let (ptr, _record) = e.logs.device_ptr(&stream);
                 add(&counters().cpu_hits, 1);
@@ -1012,6 +1020,8 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                     logs: CpuLogsOnCard::Cached(ptr),
                     n: e.n,
                     decode: decode.as_ref(),
+                    // Side records are never cached: they go up each time.
+                    sides: crate::fill::upload_sides(&stream, sides, e.n).ok()?,
                 });
             }
             (TableUpload::Records(records), Plan::Derived { store, cycles }) => {

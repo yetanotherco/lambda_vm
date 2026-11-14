@@ -3289,9 +3289,11 @@ impl Kept {
         } = walk;
         if !self.listless {
             self.cpu.push(cpu_ops);
-            if !cpu_side.is_empty() {
-                self.cpu_side.push(cpu_side);
-            }
+        }
+        // The side records stay in step with the CPU ops, or without the CPU
+        // list with the logs that stand for them.
+        if !cpu_side.is_empty() {
+            self.cpu_side.push(cpu_side);
         }
         match self.words.as_mut() {
             Some(kept) => kept.append(first as u64, memw.words, memw.register_rows, logs_for_words),
@@ -3466,6 +3468,7 @@ fn route_from_logs(
 /// otherwise.
 fn cpu_chunk_from_logs(
     logs: Segments<Log>,
+    sides: Option<Segments<super::super::cpu::CpuSide>>,
     index: usize,
     rows: usize,
     decode_table: &Arc<DecodeTable>,
@@ -3475,8 +3478,10 @@ fn cpu_chunk_from_logs(
     if let Some((card, stamps)) = card
         && let Some(decode) = card.cpu.as_ref()
     {
-        if card.admits(logs.op_bytes(), (StreamTable::Cpu, index), stamps) {
-            let records = CpuLogRecords::new(logs.clone(), first_cycle as u64, Arc::clone(decode));
+        let bytes = logs.op_bytes() + sides.as_ref().map_or(0, Segments::op_bytes);
+        if card.admits(bytes, (StreamTable::Cpu, index), stamps) {
+            let records =
+                cpu_log_records(logs.clone(), sides.clone(), first_cycle, Arc::clone(decode));
             #[cfg(test)]
             let records = records.map(|r| match card.fault {
                 0 => r,
@@ -3493,30 +3498,63 @@ fn cpu_chunk_from_logs(
         }
         stamps.cpu[1] += 1;
     }
-    let ops = ops_of_logs(&logs, first_cycle, decode_table)?;
-    Ok(ChunkOps::Cpu(Segments::one(ops), Arc::clone(decode_table)))
+    let ops = Segments::one(ops_of_logs(&logs, first_cycle, decode_table)?);
+    Ok(host_cpu_chunk(ops, sides, decode_table))
+}
+
+/// A CPU chunk the host fills: its ops, and under the in-row register format
+/// its side records.
+fn host_cpu_chunk(
+    ops: Segments<super::CpuOperation>,
+    sides: Option<Segments<super::super::cpu::CpuSide>>,
+    decode_table: &Arc<DecodeTable>,
+) -> ChunkOps {
+    match sides {
+        Some(sides) => ChunkOps::CpuInRow(ops, sides, Arc::clone(decode_table)),
+        None => ChunkOps::Cpu(ops, Arc::clone(decode_table)),
+    }
+}
+
+/// A full CPU chunk held as its logs from `first_cycle` on, and under the
+/// in-row register format their side records ([`CpuLogRecords::in_row`]).
+fn cpu_log_records(
+    logs: Segments<Log>,
+    sides: Option<Segments<super::super::cpu::CpuSide>>,
+    first_cycle: usize,
+    decode: Arc<CardDecode>,
+) -> Option<CpuLogRecords> {
+    match sides {
+        Some(sides) => CpuLogRecords::in_row(logs, sides, first_cycle as u64, decode),
+        None => CpuLogRecords::new(logs, first_cycle as u64, decode),
+    }
 }
 
 fn cpu_chunk_ops(
     ops: Segments<super::CpuOperation>,
     logs: Option<Segments<Log>>,
+    sides: Option<Segments<super::super::cpu::CpuSide>>,
     index: usize,
     rows: usize,
     decode_table: &Arc<DecodeTable>,
     card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
 ) -> ChunkOps {
     let Some((card, stamps)) = card else {
-        return ChunkOps::Cpu(ops, Arc::clone(decode_table));
+        return host_cpu_chunk(ops, sides, decode_table);
     };
     let Some(decode) = card.cpu.as_ref() else {
-        return ChunkOps::Cpu(ops, Arc::clone(decode_table));
+        return host_cpu_chunk(ops, sides, decode_table);
     };
     let first_cycle = index * rows;
+    let side_bytes = sides.as_ref().map_or(0, Segments::op_bytes);
     let records = match logs {
         Some(logs) if logs_in_step(&ops, &logs, first_cycle, decode_table) => card
-            .admits(logs.op_bytes(), (StreamTable::Cpu, index), stamps)
+            .admits(
+                logs.op_bytes() + side_bytes,
+                (StreamTable::Cpu, index),
+                stamps,
+            )
             .then(|| {
-                let records = CpuLogRecords::new(logs, first_cycle as u64, Arc::clone(decode));
+                let records = cpu_log_records(logs, sides.clone(), first_cycle, Arc::clone(decode));
                 #[cfg(test)]
                 let records = records.map(|r| match card.fault {
                     0 => r,
@@ -3541,7 +3579,7 @@ fn cpu_chunk_ops(
         }
         None => {
             stamps.cpu[1] += 1;
-            ChunkOps::Cpu(ops, Arc::clone(decode_table))
+            host_cpu_chunk(ops, sides, decode_table)
         }
     }
 }
@@ -3730,10 +3768,13 @@ fn tail_jobs(
         let Some(logs) = kept.logs.as_mut().map(|tail| tail.take_segments(m.cpu)) else {
             break;
         };
+        // Under the in-row register format its side records leave with it.
+        let sides = (kept.cpu_side.len > 0).then(|| kept.cpu_side.take_segments(m.cpu));
         let taken = t.elapsed().as_secs_f64();
         let t = Instant::now();
         let ops = match cpu_chunk_from_logs(
             logs,
+            sides,
             e.cpu,
             m.cpu,
             decode_table,
@@ -3772,26 +3813,19 @@ fn tail_jobs(
                 }
             }
         }
-        // The chunk's logs leave the logs' tail with its ops.
+        // The chunk's logs leave the logs' tail with its ops, and under the
+        // in-row register format its side records too.
         let logs = kept.logs.as_mut().map(|tail| tail.take_segments(m.cpu));
-        // Under the in-row register format the chunk carries its side
-        // records, and the host fills it.
-        let ops = if kept.cpu_side.len > 0 {
-            ChunkOps::CpuInRow(
-                ops,
-                kept.cpu_side.take_segments(m.cpu),
-                Arc::clone(decode_table),
-            )
-        } else {
-            cpu_chunk_ops(
-                ops,
-                logs,
-                e.cpu,
-                m.cpu,
-                decode_table,
-                card.as_mut().map(|(c, s)| (*c, &mut **s)),
-            )
-        };
+        let sides = (kept.cpu_side.len > 0).then(|| kept.cpu_side.take_segments(m.cpu));
+        let ops = cpu_chunk_ops(
+            ops,
+            logs,
+            sides,
+            e.cpu,
+            m.cpu,
+            decode_table,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+        );
         stamps.note(StreamTable::Cpu, taken, t.elapsed().as_secs_f64(), copied);
         jobs.push(ChunkJob {
             table: StreamTable::Cpu,
@@ -4317,11 +4351,21 @@ impl ChunkJob {
         let (digest, trace) = match self.ops {
             ChunkOps::CpuRecords { records, spent } => {
                 let digest = as_records.then(|| multilinear::records::digest_of(&records));
-                let trace = cpu::generate_cpu_trace_segments_as(
-                    &spent.slices(),
-                    records.decode_table(),
-                    form,
-                );
+                // Under the in-row register format the records' side records
+                // fill the five columns, as the card fills them.
+                let trace = match records.sides() {
+                    Some(sides) => cpu::generate_cpu_trace_inrow_segments_as(
+                        &spent.slices(),
+                        &sides.slices(),
+                        records.decode_table(),
+                        form,
+                    ),
+                    None => cpu::generate_cpu_trace_segments_as(
+                        &spent.slices(),
+                        records.decode_table(),
+                        form,
+                    ),
+                };
                 (digest, trace)
             }
             ChunkOps::MemwRegisterRecords(records) => {
@@ -4790,27 +4834,15 @@ impl RegenBuilder {
         while m.cpu > 0 && self.cpu.len >= m.cpu {
             let ops = self.cpu.take(m.cpu);
             // Under the in-row register format the chunk carries its side
-            // records (and no records: the host fills it).
-            if self.cpu_side.len > 0 {
-                let side = self.cpu_side.take(m.cpu);
-                if let Some((tail, _)) = self.logs.as_mut() {
-                    drop(tail.take_segments(m.cpu));
-                }
-                jobs.push(ChunkJob {
-                    table: StreamTable::Cpu,
-                    index: e.cpu,
-                    ops: ChunkOps::CpuInRow(ops, side, Arc::clone(&self.decode)),
-                });
-                e.cpu += 1;
-                continue;
-            }
+            // records.
+            let sides = (self.cpu_side.len > 0).then(|| self.cpu_side.take(m.cpu));
             // With the logs kept, the chunk carries the records phase A held
             // it as, when they are in step with its ops.
             let records = self.logs.as_mut().and_then(|(tail, decode)| {
                 let logs = tail.take_segments(m.cpu);
                 let first_cycle = e.cpu * m.cpu;
                 logs_in_step(&ops, &logs, first_cycle, &self.decode)
-                    .then(|| CpuLogRecords::new(logs, first_cycle as u64, Arc::clone(decode)))
+                    .then(|| cpu_log_records(logs, sides.clone(), first_cycle, Arc::clone(decode)))
                     .flatten()
             });
             let ops = match records {
@@ -4818,7 +4850,7 @@ impl RegenBuilder {
                     records,
                     spent: ops,
                 },
-                None => ChunkOps::Cpu(ops, Arc::clone(&self.decode)),
+                None => host_cpu_chunk(ops, sides, &self.decode),
             };
             jobs.push(ChunkJob {
                 table: StreamTable::Cpu,

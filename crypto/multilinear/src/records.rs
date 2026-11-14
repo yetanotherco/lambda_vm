@@ -80,6 +80,18 @@ pub struct CpuLog {
     pub dst_val: u64,
 }
 
+/// One CPU row's register slots under the register format that checks a CPU
+/// row's register accesses in the row itself, as CPU's fill reads them (the
+/// prover's side record, field for field): the previous timestamps of `rs1`,
+/// `rs2` and `rd`, then `rd`'s old value, low word then high word. They fill
+/// the CPU table's five columns after its 37.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuSide {
+    pub prev_ts: [u32; 3],
+    pub old_rd: [u32; 2],
+}
+
 /// One MEMW_R row as its fill reads it (the prover's register row, field for
 /// field): `address` the register index, `old_ts_lo` the old timestamp's low
 /// word, `is_read` 0 or 1, `pad` 0.
@@ -212,6 +224,8 @@ const _: () = {
     use std::mem::{offset_of, size_of};
     assert!(size_of::<CpuLog>() == 40);
     assert!(offset_of!(CpuLog, dst_val) == 32);
+    assert!(size_of::<CpuSide>() == 20);
+    assert!(offset_of!(CpuSide, old_rd) == 12);
     assert!(size_of::<RegisterRow>() == 32);
     assert!(offset_of!(RegisterRow, old_ts_lo) == 24);
     assert!(offset_of!(RegisterRow, address) == 28);
@@ -362,8 +376,13 @@ pub enum RecordsFill<'a> {
     KeccakRnd { ops: &'a [KeccakRndOp], skip: usize },
     /// CPU's rows: one a log of the pieces in order, log `i` the cycle
     /// `first_cycle + i`, read with its row of `decode`; then the padding rows.
+    /// Under the register format that checks a CPU row's register accesses in
+    /// the row itself, `sides` holds one side record a log, in the same order
+    /// (their pieces need not lie as the logs'), and the table has five more
+    /// columns; otherwise it is empty.
     Cpu {
         logs: Vec<&'a [CpuLog]>,
+        sides: Vec<&'a [CpuSide]>,
         first_cycle: u64,
         decode: &'a DecodeRecords,
     },
@@ -387,7 +406,15 @@ impl RecordsFill<'_> {
     pub fn bytes(&self) -> usize {
         match self {
             Self::KeccakRnd { ops, .. } => std::mem::size_of_val(*ops),
-            Self::Cpu { logs, .. } => logs.iter().map(|p| std::mem::size_of_val(*p)).sum(),
+            Self::Cpu { logs, sides, .. } => {
+                logs.iter()
+                    .map(|p| std::mem::size_of_val(*p))
+                    .sum::<usize>()
+                    + sides
+                        .iter()
+                        .map(|p| std::mem::size_of_val(*p))
+                        .sum::<usize>()
+            }
             Self::MemwR { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::MemwA { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::Load { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
@@ -430,7 +457,10 @@ impl RecordsFill<'_> {
                 }
             }
             Self::Cpu {
-                logs, first_cycle, ..
+                logs,
+                sides,
+                first_cycle,
+                ..
             } => {
                 each(1);
                 each(*first_cycle);
@@ -440,6 +470,13 @@ impl RecordsFill<'_> {
                     each(log.src1_val);
                     each(log.src2_val);
                     each(log.dst_val);
+                }
+                // Side records only where they are held: a table without
+                // them reads as it always has.
+                for side in sides.iter().flat_map(|piece| piece.iter()) {
+                    each(u64::from(side.prev_ts[0]) | u64::from(side.prev_ts[1]) << 32);
+                    each(u64::from(side.prev_ts[2]) | u64::from(side.old_rd[0]) << 32);
+                    each(u64::from(side.old_rd[1]));
                 }
             }
             Self::MemwR { rows } => {
@@ -869,6 +906,7 @@ mod tests {
     #[derive(Debug)]
     enum Pieces {
         Cpu(Vec<Vec<CpuLog>>, u64, Arc<DecodeRecords>),
+        CpuInRow(Vec<Vec<CpuLog>>, Vec<Vec<CpuSide>>, Arc<DecodeRecords>),
         MemwR(Vec<Vec<RegisterRow>>),
         MemwA(Vec<Vec<AlignedRow>>),
         Load(Vec<Vec<LoadOp>>),
@@ -885,6 +923,7 @@ mod tests {
         fn cols(&self) -> usize {
             match self {
                 Self::Cpu(..) => 38,
+                Self::CpuInRow(..) => 43,
                 Self::MemwR(_) => 10,
                 Self::MemwA(_) => 29,
                 Self::Load(_) => 18,
@@ -898,7 +937,14 @@ mod tests {
             match self {
                 Self::Cpu(pieces, first_cycle, decode) => RecordsFill::Cpu {
                     logs: pieces.iter().map(Vec::as_slice).collect(),
+                    sides: Vec::new(),
                     first_cycle: *first_cycle,
+                    decode,
+                },
+                Self::CpuInRow(pieces, sides, decode) => RecordsFill::Cpu {
+                    logs: pieces.iter().map(Vec::as_slice).collect(),
+                    sides: sides.iter().map(Vec::as_slice).collect(),
+                    first_cycle: 0,
                     decode,
                 },
                 Self::MemwR(pieces) => RecordsFill::MemwR {
@@ -1213,6 +1259,50 @@ mod tests {
         );
     }
 
+    /// ★ A CPU table's side records (the in-row register format's) are in
+    /// its digest, whatever pieces they lie in: a table with them reads apart
+    /// from one without, and one bit moved in any field of any of them moves
+    /// it.
+    #[test]
+    fn a_cpu_tables_side_records_are_in_its_digest() {
+        let decode = Arc::new(decode());
+        let logs = logs(6);
+        let sides: Vec<CpuSide> = (0..6u32)
+            .map(|i| CpuSide {
+                prev_ts: [4 * i + 1, 4 * i + 2, 4 * i + 3],
+                old_rd: [i + 7, i + 9],
+            })
+            .collect();
+        let digest = |sides: Vec<Vec<CpuSide>>| {
+            Records(Arc::new(Pieces::CpuInRow(
+                cut(&logs, &[2]),
+                sides,
+                Arc::clone(&decode),
+            )))
+            .digest()
+        };
+        let whole = digest(cut(&sides, &[]));
+        let without = Records(Arc::new(Pieces::Cpu(
+            cut(&logs, &[2]),
+            0,
+            Arc::clone(&decode),
+        )));
+        assert_ne!(without.digest(), whole, "side records held or not");
+        assert_eq!(digest(cut(&sides, &[1, 5])), whole, "their pieces");
+        for at in 0..sides.len() {
+            for field in 0..5 {
+                let mut moved = sides.clone();
+                let side = &mut moved[at];
+                let word = match field {
+                    0..3 => &mut side.prev_ts[field],
+                    _ => &mut side.old_rd[field - 3],
+                };
+                *word ^= 1 << (at % 32);
+                assert_ne!(digest(cut(&moved, &[3])), whole, "side {at}, field {field}");
+            }
+        }
+    }
+
     /// A fill's bytes and count are its pieces' summed. (Two fills compare
     /// equal only when their pieces lie alike; their digests match however
     /// the pieces lie.)
@@ -1222,6 +1312,7 @@ mod tests {
         let logs = logs(6);
         let split = RecordsFill::Cpu {
             logs: vec![&logs[..2], &logs[2..]],
+            sides: Vec::new(),
             first_cycle: 0,
             decode: &decode,
         };

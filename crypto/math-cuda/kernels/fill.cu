@@ -34,6 +34,16 @@ struct LogC {
 static_assert(sizeof(LogC) == 40, "LogC is 40 bytes");
 static_assert(offsetof(LogC, dst_val) == 32, "LogC field order");
 
+// One CPU row's register slots under the register format that checks a CPU
+// row's register accesses in the row itself (`cpu.rs`, `CpuSide`): the
+// previous timestamps of rs1, rs2 and rd, then rd's old value (low, high).
+struct CpuSideC {
+    uint32_t prev_ts[3];
+    uint32_t old_rd[2];
+};
+static_assert(sizeof(CpuSideC) == 20, "CpuSideC is 20 bytes");
+static_assert(offsetof(CpuSideC, old_rd) == 12, "CpuSideC field order");
+
 // One MEMW_R row (`memw_register.rs`, `RegRow`): `address` is the register
 // index, `old_ts_lo` the old timestamp's low word (its high word is the
 // timestamp's), `is_read` 0 or 1, `pad` 0.
@@ -614,6 +624,11 @@ constexpr uint32_t ARG2_0 = 30;
 constexpr uint32_t RES_0 = 32;
 constexpr uint32_t BRANCH_COND = 36;
 constexpr uint32_t NUM_COLUMNS = 37;
+// The in-row register format's five (`cpu.rs`, `inrow_cols`): PREV_TS_1,
+// PREV_TS_2, PREV_TS_D, OLD_RD_0, OLD_RD_1.
+constexpr uint32_t PREV_TS_1 = 37;
+constexpr uint32_t OLD_RD_0 = 40;
+constexpr uint32_t NUM_COLUMNS_IN_ROW = 42;
 }  // namespace cpu_cols
 
 // `alu_op::EQ` / `alu_op::LT` (`types.rs`).
@@ -665,12 +680,16 @@ __device__ __forceinline__ bool branch_taken(uint8_t alu_flags, uint64_t rv1, ui
 // `[n, height)` the CPU padding rows. Every row's TIMESTAMP is the table's own
 // preprocessed `4·(row + 1)` (`cpu.rs`, `local_timestamp`). A log whose pc has
 // no DECODE row counts into `missing` and leaves its row zero: the caller
-// refuses the table. One thread a row.
+// refuses the table. With `sides` (the in-row register format's, one a log;
+// null otherwise) the table has five more columns: row `r < n` takes side
+// record `r` (`cpu.rs`, `generate_cpu_trace_inrow_segments_as`), a padding row
+// zeros. One thread a row.
 extern "C" __global__ void fill_cpu_from_logs(const LogC *logs, uint64_t n,
                                               const DecodeEntryC *entries,
                                               const DecodeRunC *runs, uint32_t nruns,
                                               uint64_t height, uint64_t *out,
-                                              unsigned long long *missing) {
+                                              unsigned long long *missing,
+                                              const CpuSideC *sides) {
     namespace c = cpu_cols;
     uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= height) return;
@@ -679,18 +698,26 @@ extern "C" __global__ void fill_cpu_from_logs(const LogC *logs, uint64_t n,
 
     if (row >= n) {
         // pc = next_pc = 1, every flag 0.
-        w.zeros(0, c::NUM_COLUMNS);
+        w.zeros(0, sides ? c::NUM_COLUMNS_IN_ROW : c::NUM_COLUMNS);
         w.word(c::TIMESTAMP, timestamp);
         w.word(c::PC_0, FILL_CPU_PADDING_PC);
         w.word(c::NEXT_PC_0, FILL_CPU_PADDING_PC);
         return;
     }
 
+    if (sides) {
+        const CpuSideC side = sides[row];
+#pragma unroll
+        for (uint32_t i = 0; i < 3; ++i) w.word(c::PREV_TS_1 + i, side.prev_ts[i]);
+        w.word(c::OLD_RD_0, side.old_rd[0]);
+        w.word(c::OLD_RD_0 + 1, side.old_rd[1]);
+    }
+
     const LogC log = logs[row];
     int64_t at = fill::decode_row(runs, nruns, log.current_pc);
     if (at < 0) {
         atomicAdd(missing, 1ull);
-        w.zeros(0, c::NUM_COLUMNS);
+        w.zeros(0, sides ? c::NUM_COLUMNS_IN_ROW : c::NUM_COLUMNS);
         return;
     }
     const DecodeEntryC e = entries[at];
