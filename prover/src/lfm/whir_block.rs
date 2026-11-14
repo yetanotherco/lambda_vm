@@ -1135,12 +1135,37 @@ impl WhirBlockPlan {
 
     /// Leaf `k`, emitted and validated.
     pub fn leaf_program(&self, k: usize) -> Result<LfmProgram, String> {
+        self.leaf_program_marked(k).map(|(program, _)| program)
+    }
+
+    /// [`Self::leaf_program`], with where its arena's parts end: the front
+    /// (the roots and their commit-time answers), then each of its groups'
+    /// words, in the leaf's group order — [`block_leaf_arena`]'s layout, so a
+    /// streamed leaf can land each group's words as its own piece. The last end
+    /// is the arena's length.
+    pub fn leaf_program_marked(&self, k: usize) -> Result<(LfmProgram, Vec<u32>), String> {
         if k >= self.partition.num_leaves() {
             return Err(format!("no leaf {k}"));
         }
         let mut b = self.leaf_builder();
-        emit_block_leaf(&mut b, self, k)?;
+        let mut marks = LeafMarks::default();
+        emit_leaf_over(
+            &mut b,
+            self,
+            self.partition.leaf(k),
+            k == CARRIER,
+            LeafChecks::ALL,
+            Some(&mut marks),
+        )?;
         let program = finish(b)?;
+        if marks.arena_ends.len() != self.partition.leaf(k).len() + 1
+            || marks.arena_ends.last().copied() != program.arena_schema.lens.first().copied()
+        {
+            return Err(format!(
+                "leaf {k}: its arena's marks {:?} are not its front, its groups and its length {:?}",
+                marks.arena_ends, program.arena_schema.lens
+            ));
+        }
         // The partition held this leaf's planned rows (the front plus its
         // groups') under the heights; the emitted rows are held there too, so
         // the bound on every leaf chip holds by construction, not only by the
@@ -1154,7 +1179,7 @@ impl WhirBlockPlan {
                 ));
             }
         }
-        Ok(program)
+        Ok((program, marks.arena_ends))
     }
 
     /// The plan with every leaf held under `heights` instead of its
@@ -2206,6 +2231,9 @@ fn emit_leaf(
 struct LeafMarks {
     front: usize,
     shares: usize,
+    /// The arena's position where the front ends, then where each group's
+    /// words end.
+    arena_ends: Vec<u32>,
 }
 
 /// A leaf over `groups`, the carrier when `carrier`: [`emit_leaf`]'s body, which
@@ -2238,6 +2266,7 @@ fn emit_leaf_over(
     } = emit_front(b, plan, arena, &mut at);
     if let Some(m) = marks.as_deref_mut() {
         m.front = b.instrs().len();
+        m.arena_ends.push(at);
     }
 
     // ---- 2. the leaf's groups, each on its fork.
@@ -2488,6 +2517,9 @@ fn emit_leaf_over(
             );
         }
         outputs.extend(walk.outputs.iter().copied());
+        if let Some(m) = marks.as_deref_mut() {
+            m.arena_ends.push(at);
+        }
     }
 
     // ---- 3. the leaf's share of the bus: Σ p/q, less the COMMIT-bus target on

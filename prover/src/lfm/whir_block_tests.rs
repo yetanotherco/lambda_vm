@@ -3027,6 +3027,25 @@ fn stream_leaf_probe(plan: &WhirBlockPlan, proof: &BlockWhirProof, phase_b: &[(u
         let program = plan.leaf_program(k).expect("the leaf emits");
         let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
         let groups = block_leaf_groups(plan, proof, k).expect("the leaf's groups");
+        // The emitter's marks (what `W3_STREAM_LEAF` cuts the arena by) are
+        // the proof's layout: the front, then each group's words.
+        let (marked, marks) = plan.leaf_program_marked(k).expect("the leaf emits, marked");
+        assert_eq!(
+            marked.instrs.len(),
+            program.instrs.len(),
+            "leaf {k}: marking changes no instruction"
+        );
+        assert_eq!(marked.arena_schema.lens, program.arena_schema.lens);
+        let front = block_leaf_arena(plan, proof, k).expect("the arena")[0].len()
+            - groups.iter().map(Vec::len).sum::<usize>();
+        let mut want = vec![front as u32];
+        for g in &groups {
+            want.push(want.last().copied().unwrap_or(0) + g.len() as u32);
+        }
+        assert_eq!(
+            marks, want,
+            "leaf {k}: the marks are the arena's front and groups"
+        );
         let ids = plan.partition().leaf(k).to_vec();
         let arena = block_leaf_arena(plan, proof, k).expect("the leaf's arena");
         assert_eq!(arena.len(), 1, "a leaf has one arena");
