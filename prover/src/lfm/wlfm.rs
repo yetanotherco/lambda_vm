@@ -261,6 +261,42 @@ impl WlfmLevers {
     }
 }
 
+/// The rows an LFM chip's table may hold in a W-LFM proof: 2^22. A chip
+/// whose padded height is above it (a recursion level's extension ALU, say)
+/// is cut into tables of 2^22 rows and a last one padded to its own power of
+/// two ([`chip_chunk_rows`]), each a table of the block, so no table outgrows a
+/// group and the padding is at most one chunk's. A format constant: the
+/// identity folds the cut, and no program today reaches it.
+pub const WLFM_CHUNK_LOG: u32 = 22;
+
+/// The padded rows of each table an LFM chip of `real_rows` rows (padded to
+/// `padded_rows` as one table) takes under a `2^chunk_log` cap: the one table
+/// as it is when it fits, else full chunks and the remainder's own power of
+/// two. Every LFM chip's constraints read one row and its bus tokens are one
+/// row's, so which table a row sits in is invisible to the proof's claims.
+pub fn chip_chunk_rows(real_rows: usize, padded_rows: usize, chunk_log: u32) -> Vec<usize> {
+    let cap = 1usize << chunk_log;
+    if padded_rows <= cap {
+        return vec![padded_rows];
+    }
+    let mut out = vec![cap; real_rows / cap];
+    let rem = real_rows % cap;
+    if rem > 0 {
+        out.push(super::layout::padded_rows(rem));
+    }
+    out
+}
+
+/// The chunk cap a W-LFM build cuts its chips at: [`WLFM_CHUNK_LOG`], or a
+/// test's override.
+fn chunk_log() -> u32 {
+    #[cfg(test)]
+    if let Some(log) = test_format::chunk_log() {
+        return log;
+    }
+    WLFM_CHUNK_LOG
+}
+
 /// The stack cap at [`WlfmRate::Sixteen`]: a grouped chain lives on
 /// `H_{n + m + lb}`, and Goldilocks' two-adicity (32) leaves `32 − 4 − 2 = 26`
 /// stacked variables at blowup 16 and the widest index; the default 27 would
@@ -378,6 +414,10 @@ pub struct WlfmArtifacts {
     pub grind: Option<u8>,
     /// The hash family the proof commits, transcripts and grinds with.
     pub family: WlfmFamily,
+    /// The padded rows of each table every LFM chip takes, in
+    /// `LfmAirs::air_refs` order ([`chip_chunk_rows`]): one entry a chip
+    /// unless it is cut.
+    pub lfm_chunks: Vec<Vec<usize>>,
     /// The lean BLAKE3 tables' chunks ([`super::b3l_tables`]), after the LFM
     /// chips' tables: empty for a program with no `B3l` row, which then has
     /// none of them.
@@ -396,6 +436,7 @@ impl WlfmArtifacts {
     pub fn airs(&self) -> WlfmAirs {
         WlfmAirs {
             lfm: whir_lfm_airs(self.hasher, self.chip_set, self.hash_chunks, &air_options()),
+            lfm_chunks: self.lfm_chunks.clone(),
             b3l: B3lAirs::new(&self.b3l, &air_options()),
         }
     }
@@ -436,13 +477,20 @@ impl WlfmArtifacts {
 /// lean BLAKE3 tables' ([`B3lAirs`]) — the proof's table order.
 pub struct WlfmAirs {
     pub lfm: LfmAirs,
+    /// Each LFM chip's tables' padded rows ([`WlfmArtifacts::lfm_chunks`]).
+    pub lfm_chunks: Vec<Vec<usize>>,
     pub b3l: B3lAirs,
 }
 
 impl WlfmAirs {
-    /// Every AIR in table order.
+    /// Every AIR in table order: an LFM chip's once a table it takes, then the
+    /// lean tables'.
     pub fn air_refs(&self) -> Vec<DynLfmAir<'_>> {
-        let mut refs = self.lfm.air_refs();
+        let mut refs: Vec<DynLfmAir<'_>> = Vec::new();
+        for (i, air) in self.lfm.air_refs().into_iter().enumerate() {
+            let n = self.lfm_chunks.get(i).map_or(1, Vec::len);
+            refs.extend(std::iter::repeat_n(air, n));
+        }
         refs.extend(self.b3l.refs());
         refs
     }
@@ -454,12 +502,30 @@ impl WlfmAirs {
         traces: &'a mut super::trace::LfmTraces,
         b3l: Option<&'a mut B3lTraces>,
     ) -> Result<Vec<(DynLfmAir<'a>, TableIn<'a>)>, String> {
-        let mut pairs: Vec<(DynLfmAir<'a>, TableIn<'a>)> = self
-            .lfm
-            .air_trace_pairs(traces)
-            .into_iter()
-            .map(|(air, trace, _)| (air, TableIn::Wide(trace)))
-            .collect();
+        let mut pairs: Vec<(DynLfmAir<'a>, TableIn<'a>)> = Vec::new();
+        for (i, (air, trace, _)) in self.lfm.air_trace_pairs(traces).into_iter().enumerate() {
+            match self.lfm_chunks.get(i) {
+                Some(chunks) if chunks.len() > 1 => {
+                    // A cut chip: each chunk its own table, its rows copied out.
+                    let width = trace.main_table.width;
+                    let data = trace.main_table.row_major_data();
+                    let mut start = 0usize;
+                    for &rows in chunks {
+                        let end = (start + rows).min(trace.main_table.height);
+                        let mut chunk = data[start * width..end * width].to_vec();
+                        chunk.resize(rows * width, FieldElement::zero());
+                        pairs.push((
+                            air,
+                            TableIn::Owned(Box::new(stark::trace::TraceTable::new_main(
+                                chunk, width, 1,
+                            ))),
+                        ));
+                        start += rows;
+                    }
+                }
+                _ => pairs.push((air, TableIn::Wide(trace))),
+            }
+        }
         let lean = self.b3l.refs().len();
         match b3l {
             Some(t) => pairs.extend(
@@ -479,6 +545,8 @@ impl WlfmAirs {
 /// a lean table as its fill held it (wide or narrow).
 pub enum TableIn<'a> {
     Wide(&'a mut stark::trace::TraceTable<F, E>),
+    /// A chunk of a cut chip's trace.
+    Owned(Box<stark::trace::TraceTable<F, E>>),
     Held(&'a mut super::b3l_tables::HeldTable),
 }
 
@@ -486,15 +554,20 @@ impl TableIn<'_> {
     fn shape(&self) -> (usize, usize) {
         match self {
             TableIn::Wide(t) => (t.main_table.width, t.main_table.height),
+            TableIn::Owned(t) => (t.main_table.width, t.main_table.height),
             TableIn::Held(h) => (h.cols(), h.rows()),
         }
     }
 
     fn column(&self, c: usize) -> Vec<FieldElement<F>> {
-        match self {
-            TableIn::Wide(t) => (0..t.main_table.height)
+        let wide = |t: &stark::trace::TraceTable<F, E>| {
+            (0..t.main_table.height)
                 .map(|r| *t.main_table.get(r, c))
-                .collect(),
+                .collect()
+        };
+        match self {
+            TableIn::Wide(t) => wide(t),
+            TableIn::Owned(t) => wide(t),
             TableIn::Held(h) => h.column(c),
         }
     }
@@ -710,10 +783,45 @@ pub fn build_wlfm_under(
     check_chip_set(chip_set)?;
     let hash_chunks = program.hash_chunk_count();
     let b3l = B3lShape::of_program(program);
-    let mut groups = program_prep_groups(program);
+    let chip_groups = program_prep_groups(program);
+    let lfm = whir_lfm_airs(hasher, chip_set, hash_chunks, &air_options());
+    let chip_count = lfm.air_refs().len();
+    if chip_count != chip_groups.len() {
+        return Err(format!(
+            "the AIR set has {chip_count} LFM tables and the program commits {} instruction \
+             groups",
+            chip_groups.len()
+        ));
+    }
+    // Each chip cut at the chunk cap: its groups' rows sliced as its tables'.
+    let cut = chunk_log();
+    let mut lfm_chunks: Vec<Vec<usize>> = Vec::with_capacity(chip_groups.len());
+    let mut groups: Vec<Cow<'_, ColumnGroup>> = Vec::with_capacity(chip_groups.len());
+    for group in chip_groups {
+        let chunks = chip_chunk_rows(group.real_rows, group.padded_rows, cut);
+        if chunks.len() == 1 {
+            groups.push(group);
+        } else {
+            let mut start = 0usize;
+            for &rows in &chunks {
+                let end = (start + rows).min(group.real_rows.max(start));
+                let mut data = group.data[start * group.width..end * group.width].to_vec();
+                data.resize(rows * group.width, FieldElement::zero());
+                groups.push(Cow::Owned(ColumnGroup {
+                    width: group.width,
+                    real_rows: end - start,
+                    padded_rows: rows,
+                    data,
+                }));
+                start += rows;
+            }
+        }
+        lfm_chunks.push(chunks);
+    }
     groups.extend(b3l_prep_groups(program).into_iter().map(Cow::Owned));
     let airs = WlfmAirs {
-        lfm: whir_lfm_airs(hasher, chip_set, hash_chunks, &air_options()),
+        lfm,
+        lfm_chunks: lfm_chunks.clone(),
         b3l: B3lAirs::new(&b3l, &air_options()),
     };
     let refs = airs.air_refs();
@@ -790,6 +898,7 @@ pub fn build_wlfm_under(
             fold,
             grind,
             family,
+            lfm_chunks,
             b3l,
             stacks: Vec::new(),
             evaluated,
@@ -829,6 +938,7 @@ pub fn build_wlfm_under(
         fold,
         grind,
         family,
+        lfm_chunks,
         b3l,
         stacks,
         evaluated: Vec::new(),
@@ -942,6 +1052,15 @@ pub fn wlfm_program_id(a: &WlfmArtifacts) -> Commitment {
     }
     // The rest of the format, whole: a lever added later moves the identity.
     h.update(format!("{:?}", c.format).as_bytes());
+    // The chips' cut, when any chip is cut: each chip's table count (their
+    // heights are in the table list above). A program with no cut chip folds
+    // nothing here.
+    if a.lfm_chunks.iter().any(|c| c.len() > 1) {
+        h.update(b"CHUNKS");
+        for chunks in &a.lfm_chunks {
+            h.update((chunks.len() as u64).to_le_bytes());
+        }
+    }
     // The lean BLAKE3 tables, when the program has any: their round count and
     // their chunks (their heights are in the table list above). A program
     // with none folds nothing here, so its identity is unchanged.
@@ -1166,6 +1285,12 @@ fn prove_traces_under<H: WhirHash>(
         let layout = layout_of(air, width, num_vars).map_err(|e| format!("{e:?}"))?;
         let committed = match table {
             TableIn::Wide(trace) => {
+                let mut columns = trace.columns_main();
+                CommittedTable::from_layout(layout, |col| {
+                    core::mem::take(&mut columns[col as usize])
+                })
+            }
+            TableIn::Owned(trace) => {
                 let mut columns = trace.columns_main();
                 CommittedTable::from_layout(layout, |col| {
                     core::mem::take(&mut columns[col as usize])
@@ -1632,6 +1757,25 @@ pub(crate) mod test_format {
     thread_local! {
         static UNGROUND: Cell<bool> = const { Cell::new(false) };
         static QUERIES: Cell<Option<usize>> = const { Cell::new(None) };
+        static CHUNK_LOG: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// Every W-LFM build on this thread cuts its chips at `2^log` rows until
+    /// the guard drops.
+    pub(crate) struct ChunkOverride(Option<u32>);
+
+    impl Drop for ChunkOverride {
+        fn drop(&mut self) {
+            CHUNK_LOG.with(|c| c.set(self.0));
+        }
+    }
+
+    pub(crate) fn set_chunk_log(log: u32) -> ChunkOverride {
+        ChunkOverride(CHUNK_LOG.with(|c| c.replace(Some(log))))
+    }
+
+    pub(super) fn chunk_log() -> Option<u32> {
+        CHUNK_LOG.with(Cell::get)
     }
 
     /// The override, restored when dropped.

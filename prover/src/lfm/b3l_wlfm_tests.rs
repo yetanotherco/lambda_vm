@@ -486,3 +486,82 @@ fn the_direct_narrow_fill_is_the_wide_fill() {
         }
     }
 }
+
+// =============================================================================
+// Cut chips
+// =============================================================================
+
+/// A program of `n` published constants and a sum over them; `last` is the
+/// last constant, which a forged twin changes (every table keeps its height).
+fn constants(n: u64, last: u64) -> LfmProgram {
+    let mut b = LfmBuilder::new();
+    let mut acc = b.felt_const(FE::from(1u64));
+    for i in 0..n {
+        let v = if i + 1 == n { last } else { 1_000 + i };
+        let c = b.felt_const(FE::from(v));
+        acc = b.add(acc, c);
+    }
+    b.public(acc.as_cell());
+    compile(b.finish())
+}
+
+/// ★ A chip cut into chunk tables (the cap forced to 2^3 rows) proves and
+/// verifies, is another identity than the uncut program, and the W-leg walks
+/// it in-guest.
+#[test]
+fn a_cut_chip_round_trips_and_is_another_identity() {
+    let _fast = test_format::set(Some(2));
+    let program = constants(40, 77);
+    let uncut = build(&program);
+    assert!(uncut.artifacts.lfm_chunks.iter().all(|c| c.len() == 1));
+    let _cut = test_format::set_chunk_log(3);
+    let cut = build(&program);
+    let a = &cut.artifacts;
+    assert!(
+        a.lfm_chunks.iter().any(|c| c.len() > 1),
+        "some chip is cut at 2^3 rows: {:?}",
+        a.lfm_chunks
+    );
+    assert_eq!(a.table_num_vars.len(), a.airs().air_refs().len());
+    assert_ne!(a.program_id, uncut.artifacts.program_id);
+    let proof = prove(&program, &cut);
+    verify_wlfm(a, &proof, &proof.public_words).expect("the cut proof verifies");
+    let child = super::wlfm_leg::WlfmChild {
+        artifacts: a.clone(),
+        num_public_words: proof.public_words.len(),
+    };
+    let leg = super::wlfm_leg::wlfm_leg_program(&child).expect("the leg emits");
+    let arena = super::wlfm_leg::wlfm_leg_arena(&child, &proof).expect("the leg's arena");
+    execute(&leg, &[arena], &HASHER).expect("the leg accepts the cut child");
+}
+
+/// A forged constant in a cut chip's LAST chunk, proved against the honest
+/// build by the forger's prover, is refused by that chunk's prepared opening.
+#[test]
+fn a_forged_column_in_a_later_chunk_is_refused() {
+    let _fast = test_format::set(Some(2));
+    let _cut = test_format::set_chunk_log(3);
+    let honest = constants(40, 77);
+    let forged = constants(40, 78);
+    let build = build(&honest);
+    let filled = execute_and_fill_unmerged(&forged, &[], HASHER).expect("executes");
+    let proof = prove_wlfm_traces(&build, filled, false).expect("the forger's prover");
+    assert!(verify_wlfm(&build.artifacts, &proof, &proof.public_words).is_err());
+    // The honest one, for contrast.
+    let proof = prove(&honest, &build);
+    verify_wlfm(&build.artifacts, &proof, &proof.public_words).expect("honest verifies");
+}
+
+/// The cut rule: a chip that fits is one table as it is; above the cap, full
+/// chunks and the remainder's own power of two.
+#[test]
+fn the_chunk_rule_keeps_what_fits_and_cuts_the_rest() {
+    use super::wlfm::chip_chunk_rows;
+    assert_eq!(chip_chunk_rows(5, 8, 3), vec![8]);
+    assert_eq!(chip_chunk_rows(8, 8, 3), vec![8]);
+    assert_eq!(chip_chunk_rows(9, 16, 3), vec![8, 4]);
+    assert_eq!(chip_chunk_rows(27, 32, 3), vec![8, 8, 8, 4]);
+    assert_eq!(chip_chunk_rows(32, 32, 3), vec![8, 8, 8, 8]);
+    assert_eq!(chip_chunk_rows(1 << 21, 1 << 21, 22), vec![1 << 21]);
+    assert_eq!(chip_chunk_rows(27_000_000, 1 << 25, 22).len(), 7);
+}
