@@ -6077,6 +6077,25 @@ impl OpeningFactors {
         Ok(ext3_from_raw::<E>(&value))
     }
 
+    /// The message the rounds so far have bound, read back in one copy: its
+    /// `2^num_vars` values in the cube's index order (the order an
+    /// [`crate::mle::Mle`] holds them, and the one [`Self::evaluate_message`]
+    /// reads at a hypercube point).
+    pub(crate) fn message_to_host<E>(
+        &mut self,
+    ) -> Result<Vec<math::field::element::FieldElement<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let raw =
+            self.materialize()?
+                .message_to_host()
+                .map_err(|_| crate::Error::DeviceFailed {
+                    stage: "the message read back",
+                })?;
+        Ok(raw.chunks_exact(3).map(ext3_from_raw::<E>).collect())
+    }
+
     /// `weight += gamma · eq(point, ·)`: the weight the next group carries.
     pub(crate) fn add_scaled_eq<E>(
         &mut self,
@@ -6210,6 +6229,15 @@ impl OpeningFactors {
         &mut self,
         _point: &[math::field::element::FieldElement<E>],
     ) -> Result<math::field::element::FieldElement<E>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn message_to_host<E>(
+        &mut self,
+    ) -> Result<Vec<math::field::element::FieldElement<E>>, crate::Error>
     where
         E: math::field::traits::IsField + 'static,
     {
