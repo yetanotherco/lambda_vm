@@ -3629,6 +3629,58 @@ mod tests {
         (0..num_vars).map(|i| FE::from(101 + i as u64)).collect()
     }
 
+    /// Round 0's commitment made on the host, as [`commit_stacked`] makes it
+    /// when no card takes it. The base-field chains below (`E = F`) need it at
+    /// `2^16` codeword values or more: a card build commits those on the card
+    /// with no host copy, and the card folds Goldilocks only into its cubic
+    /// extension (`gpu::fold_scalars`), so round 0 could fold nowhere
+    /// (`DeviceFailed { stage: "codeword fold" }`). Production chains fold into
+    /// the extension. Its root is `commit`'s
+    /// (`the_host_commit_is_the_commit_and_a_base_chain_proves_on_any_build`).
+    fn host_commit(
+        f: &Mle<F>,
+        cfg: &ChainConfig,
+    ) -> (CodewordCommitment<F, KeccakWhir>, Domain<F>) {
+        assert_eq!(cfg.format.leaves, LeafOrder::Natural, "the default leaves");
+        let num_vars = f.num_vars();
+        let first = cfg.schedule(num_vars).first().copied().unwrap_or(0);
+        let domain = Domain::<F>::new(num_vars + cfg.log_blowup).unwrap();
+        let codeword = encode::<F, F>(&lift_coefficients(f), &domain).unwrap();
+        (
+            CodewordCommitment::from_codeword(codeword, first).unwrap(),
+            domain,
+        )
+    }
+
+    /// The host commitment's root is `commit`'s, on the host or on a card, and
+    /// a base-field chain over it proves and verifies at a size a card build
+    /// commits on the card.
+    #[test]
+    fn the_host_commit_is_the_commit_and_a_base_chain_proves_on_any_build() {
+        let num_vars = 16;
+        let cfg = first(6, 4);
+        let f = pseudo_mle(num_vars, 23);
+        let (host, host_domain) = host_commit(&f, &cfg);
+        let (committed, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
+        assert_eq!(host.root(), committed.root());
+        assert_eq!(host_domain.log_size(), domain.log_size());
+        let z = point(num_vars);
+        let y = f.evaluate(&z).unwrap();
+        let proof =
+            prove::<F, F, _, KeccakWhir>(&f, &z, &host, &host_domain, &cfg, &mut transcript())
+                .unwrap();
+        verify::<F, F, _, KeccakWhir>(
+            &proof,
+            &host.root(),
+            &z,
+            y,
+            &host_domain,
+            &cfg,
+            &mut transcript(),
+        )
+        .unwrap();
+    }
+
     fn run(num_vars: usize, log_folding: usize) -> Result<ChainProof<F, F>, Error> {
         let cfg = config(log_folding);
         let f = pseudo_mle(num_vars, 11);
@@ -3978,7 +4030,7 @@ mod tests {
         let f = pseudo_mle(num_vars, 13);
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
-        let (commitment, domain) = commit::<F, KeccakWhir>(&f, cfg, true)?;
+        let (commitment, domain) = host_commit(&f, cfg);
         let proof =
             prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, cfg, &mut transcript())?;
         verify::<F, F, _, KeccakWhir>(
@@ -4529,13 +4581,15 @@ mod tests {
             resident: None,
             num_vars,
         };
-        let (commitment, domain) = commit_stacked::<F, KeccakWhir>(&stacked, &cfg, true).unwrap();
+        // On the host, as a prover with no card: this test reads the codeword
+        // and the bound message, which a card build keeps on the card.
+        let message = stacked.assemble().unwrap();
+        let (commitment, domain) = host_commit(&message, &cfg);
         let base = commitment
             .codeword()
             .host()
-            .expect("no device: the host committed")
+            .expect("the host committed")
             .to_vec();
-        let message = stacked.assemble().unwrap();
 
         let weight = Mle::new(
             (0..1u64 << num_vars)
@@ -4543,7 +4597,11 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let mut factors = Factors::<F, E>::new(&message, weight).unwrap();
+        let mut factors = Factors::<F, E>::Host {
+            weight,
+            message: lift(&message),
+            field: core::marker::PhantomData,
+        };
         let mut transcript = DefaultTranscript::<E>::new(b"whir-chain-5a");
 
         let mut current: Vec<EE> = Vec::new();
@@ -5341,7 +5399,7 @@ mod tests {
         let f = pseudo_mle(num_vars, 17);
         let z = point(num_vars);
         let y = f.evaluate(&z).unwrap();
-        let (commitment, domain) = commit::<F, KeccakWhir>(&f, cfg, true).unwrap();
+        let (commitment, domain) = host_commit(&f, cfg);
         let proof =
             prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, cfg, &mut transcript())
                 .unwrap();
