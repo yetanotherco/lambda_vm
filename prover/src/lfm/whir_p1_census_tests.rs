@@ -28,7 +28,21 @@ const MEDIAN_MIX: &[(&str, &[(usize, usize)])] = &[
     ("ECDAS", &[(1 << 17, 4)]),
     ("HINT", &[(1024, 1)]),
     ("CPU", &[(1 << 21, 142), (1 << 20, 1)]),
-    ("LT", &[(1 << 21, 49), (1 << 20, 49)]),
+    // LT's tables as the median block makes them with MEMW_A's timestamp order
+    // by the step's limbs (no MEMW_A comparison in LT; the guest 938c3699, its
+    // 38 tables' heights in AIR order 20 ×3, 17, 15, 18, 19 ×11, 17, 15, 16 ×2,
+    // 18, 19 ×12, 18 ×2, 19, 17), the rest of the mix as above.
+    (
+        "LT",
+        &[
+            (1 << 20, 3),
+            (1 << 19, 24),
+            (1 << 18, 4),
+            (1 << 17, 3),
+            (1 << 16, 2),
+            (1 << 15, 2),
+        ],
+    ),
     ("SHIFT", &[(1 << 21, 10), (1 << 20, 1)]),
     ("MEMW", &[(1 << 21, 5)]),
     ("MEMW_A", &[(1 << 21, 50), (1 << 17, 1)]),
@@ -1108,14 +1122,16 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// pins are taken over a checked-in copy of it: the same bytes on every
 /// machine.
 ///
-/// The pins move with any AIR whose constraint leg a leaf emits, and with the
-/// block's format: last moved by MEMW_A's timestamp order by the step's limbs
-/// as the default (21 interactions, no LT lookup; the form before it,
-/// `BLOCK_WHIR_MEMW_A=lt`, still emits the leaves pinned before it, checked
-/// below), after one round-0 tree a group's run as the default (a joint leaf
-/// and one path a query; the lean check's median mix one leaf fewer), the
-/// block presets' lean KECCAK_RND form (1,011 interactions), the ECREC table
-/// and the 23-count statement.
+/// The pins move with any AIR whose constraint leg a leaf emits, with the
+/// block's format and with the mix: last moved by the mix's LT row, LT's
+/// tables as the median block makes them with MEMW_A's limbs (38, from 98);
+/// before that by MEMW_A's timestamp order by the step's limbs as the default
+/// (21 interactions, no LT lookup; on the mix of then, the form before it,
+/// `BLOCK_WHIR_MEMW_A=lt`, emitted the leaves pinned before it digest for
+/// digest; that form is pinned below on this mix), after one round-0 tree a
+/// group's run as the default (a joint leaf and one path a query; the lean
+/// check's median mix one leaf fewer), the block presets' lean KECCAK_RND form
+/// (1,011 interactions), the ECREC table and the 23-count statement.
 #[test]
 fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     use super::whir_chain::LeafQuery;
@@ -1126,29 +1142,29 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
             LeafQuery::V1,
             GkrPack::PRODUCTION,
             5,
-            "369081b3bfe857e5b44a92f37a19359a9013aae3709ea51ac6beebce84fdaa74",
-            "a3f8f1ea7e5fbb635ea5325aeb9d2dea5814d739ec5a07c1f57d602bf685e4ac",
+            "87153dc8999cfac57ee889fbbbc109869611d26e0708f243db9eb4a525245756",
+            "91a3755b7dd401ff52649b2373a982a4058e0b55f54004264d67090421fe7388",
         ),
         (
             LeafQuery::Lean,
             GkrPack::PRODUCTION,
             4,
-            "61000a26335beb7a78201d2f86cdc3d4f6791b14318a59ba58014feb539fb5fc",
-            "aec31d65ab2a0dcf8f9815f8cabb1bbd51c5089d3565b9d7310a06c9cecec564",
+            "a044471c75ac1bcda5babf6ccbf1ec3b5123ba699e44f1c96d192a14af6ed015",
+            "a0268205cc5c6b456d0f7822a6b0010c48387a2851f13bb9dc2230721675d8a8",
         ),
         (
             LeafQuery::V1,
             GkrPack::Off,
             5,
-            "ea01c471d9e6b200daebcaa72029e6a031e461da6eaa4c23b2f69911ae3664b3",
-            "e7cbef64313309dcae3fc91901b2b61e83ea2bc03167549176bac1b495aeb0f3",
+            "6b2fa02199044ca7f5b80c7b5db8d39571fab63e929d8267635afc740a4df860",
+            "774eab6f2ebb311fd9f492862ab2369a06e13d4e0cb9b60d76d4b0866dd7092e",
         ),
         (
             LeafQuery::Lean,
             GkrPack::Off,
             4,
-            "dff8a4a96763172fa585ea9a62790d4d56b50c6244e806cca64534f14de471b7",
-            "8026b07cf1a429d007972029e8406bd2b8a27f9c300faf5090fccde0234905dc",
+            "e926cebe1ca85fc28b14642065fe4974ceb90fdb82edf6964e85312a8dd20b43",
+            "bd8bda46e453675764a0e3a853ba5ddf127a4d5ed500a6210b071d72328693c7",
         ),
     ];
     let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
@@ -1199,8 +1215,8 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         PINS[1].3,
         "the default's first leaf is the lean check's at the production packing"
     );
-    // MEMW_A's form before the limbs emits the default's leaves pinned before
-    // them, digest for digest: the rollback's recursion is today's.
+    // MEMW_A's form before the limbs (`BLOCK_WHIR_MEMW_A=lt`), pinned too: its
+    // leaves are other programs than the limbs'.
     let lt = WhirBlockPlan::derive(
         elf_bytes,
         &opts,
@@ -1216,10 +1232,10 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         (n, digest(0), digest(n - 1)),
         (
             4,
-            "8f2baebc59e7665b5bb9a82b2eeb4ed7085c5a173170fbf1cecbc3278e447b9a".to_string(),
-            "84190e62ce1be60d6ea8c7d348d925b7e829a2b329aff9d59e4bd7cfd7fdb0ba".to_string()
+            "f8d02d2bb02877be150c0de61152e7caee4bc19c5e7ba87e6228bc4eb482b32a".to_string(),
+            "ecf8f4531e7660fc025e8f43c3f27d98f2ac3ad603e7baa6f62f0a948adea8eb".to_string()
         ),
-        "MEMW_A's LT form: the leaves before the limbs"
+        "MEMW_A's LT form"
     );
 }
 
