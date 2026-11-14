@@ -34,6 +34,27 @@ pub struct Cell(pub(crate) Addr);
 #[derive(Debug, Clone, Copy)]
 pub struct Bit(pub(crate) Addr);
 
+/// The chaining value of a [`LfmBuilder::b3_compress`].
+#[derive(Debug, Clone, Copy)]
+pub enum B3Cv {
+    /// BLAKE3's IV: nothing read.
+    Iv,
+    /// Two words of four `u32` lanes: `h[0..4]`, then `h[4..8]` (a digest,
+    /// or a midstate constant).
+    Words([Cell; layout::b3l::DIGEST_WORDS]),
+}
+
+/// The 64-byte block of a [`LfmBuilder::b3_compress`].
+#[derive(Debug, Clone, Copy)]
+pub enum B3Block {
+    /// Four words of four `u32` lanes: `m[0..16]`, each little-endian in the
+    /// block.
+    Lanes([Cell; layout::b3l::LANE_WORDS]),
+    /// Two words of four field elements: eight felts, each its canonical
+    /// value's eight big-endian bytes in the block.
+    Felts([Cell; layout::b3l::FELT_WORDS]),
+}
+
 macro_rules! handle_addr {
     ($($t:ty),*) => {$(
         impl $t {
@@ -657,6 +678,101 @@ impl LfmBuilder {
                 }),
             })));
         (outs.map(Cell), rev_outs.map(|r| r.map(Cell)))
+    }
+
+    // ---- standard BLAKE3 on the lean tables (B3L) ----
+
+    /// One standard 7-round BLAKE3 compression at counter 0, on the lean
+    /// tables: `compress(h, m, 0, block_len, flags)`, returning the 256-bit
+    /// digest `out[0..8]` as two words of four `u32` lanes — also the
+    /// chaining value of a next block.
+    ///
+    /// `cv` is BLAKE3's IV or two words of `u32` lanes (a digest, a midstate
+    /// constant); `block` is 16 `u32` lanes in four words, or 8 field elements
+    /// in two words, each felt its canonical value's eight big-endian bytes.
+    /// Every `u32` lane read must be below `2^32` (the executor refuses one
+    /// that is not: the head recomposes each lane from range-checked bytes).
+    ///
+    /// Only the block prover (W-LFM) proves this instruction; the STARK path
+    /// refuses a program that carries one.
+    ///
+    /// # Panics
+    ///
+    /// When `block_len` exceeds 64, a BLAKE3 block's length.
+    pub fn b3_compress(
+        &mut self,
+        cv: B3Cv,
+        block: B3Block,
+        block_len: u8,
+        flags: u8,
+    ) -> [Cell; layout::b3l::DIGEST_WORDS] {
+        self.emit_b3l(cv, block, block_len, flags, false).0
+    }
+
+    /// [`LfmBuilder::b3_compress`], additionally writing the byte-REVERSED
+    /// digest as two more words — the transcript's `sample()`, which returns
+    /// those bytes and re-absorbs them. Free on the bus.
+    pub fn b3_compress_rev(
+        &mut self,
+        cv: B3Cv,
+        block: B3Block,
+        block_len: u8,
+        flags: u8,
+    ) -> (
+        [Cell; layout::b3l::DIGEST_WORDS],
+        [Cell; layout::b3l::DIGEST_WORDS],
+    ) {
+        let (digest, rev) = self.emit_b3l(cv, block, block_len, flags, true);
+        (digest, rev.expect("requested"))
+    }
+
+    fn emit_b3l(
+        &mut self,
+        cv: B3Cv,
+        block: B3Block,
+        block_len: u8,
+        flags: u8,
+        want_rev: bool,
+    ) -> (
+        [Cell; layout::b3l::DIGEST_WORDS],
+        Option<[Cell; layout::b3l::DIGEST_WORDS]>,
+    ) {
+        assert!(
+            usize::from(block_len) <= crypto::hash::blake3::chain::BLOCK_LEN,
+            "a BLAKE3 block holds at most 64 bytes, not {block_len}"
+        );
+        let cv = match cv {
+            B3Cv::Iv => super::instr::B3lCv::Iv,
+            B3Cv::Words(w) => super::instr::B3lCv::Words(w.map(|c| c.0)),
+        };
+        let block = match block {
+            B3Block::Lanes(w) => super::instr::B3lBlock::Lanes(w.map(|c| c.0)),
+            B3Block::Felts(w) => super::instr::B3lBlock::Felts(w.map(|c| c.0)),
+        };
+        let mut op = super::instr::B3lOperands {
+            cv,
+            block,
+            block_len,
+            flags,
+            outs: [Addr(0); layout::b3l::DIGEST_WORDS],
+            mults: [0; layout::b3l::DIGEST_WORDS],
+            rev: None,
+        };
+        let reads: Vec<Addr> = op.read_words().collect();
+        for a in reads {
+            self.read(a);
+        }
+        op.outs = core::array::from_fn(|_| self.alloc());
+        if want_rev {
+            op.rev = Some(super::instr::B3lReversed {
+                outs: core::array::from_fn(|_| self.alloc()),
+                mults: [0; layout::b3l::DIGEST_WORDS],
+            });
+        }
+        let outs = op.outs.map(Cell);
+        let rev = op.rev.as_ref().map(|r| r.outs.map(Cell));
+        self.instrs.push(Instr::B3l(Box::new(op)));
+        (outs, rev)
     }
 
     // ---- hints / public ----

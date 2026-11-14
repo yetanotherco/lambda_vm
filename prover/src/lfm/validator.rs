@@ -97,6 +97,10 @@ pub enum LfmViolation {
     },
     /// Cross-check — group shape does not match the instruction partition.
     GroupShapeMismatch { chip: &'static str },
+    /// Check 10 — a `B3L_HEAD` instruction row whose tag is not its ordinal + 1,
+    /// whose IV flag is not a bit, whose `block_len` exceeds 64 or `flags` a
+    /// byte, or whose mode leaves a placeholder nonzero.
+    MalformedB3lRow { row: usize },
 }
 
 pub fn validate(program: &LfmProgram) -> Result<(), LfmViolation> {
@@ -351,6 +355,16 @@ fn check_multiplicities_with(program: &LfmProgram, dense: bool) -> Result<(), Lf
                     }
                 }
             }
+            Instr::B3l(k) => {
+                for i in 0..layout::b3l::DIGEST_WORDS {
+                    check(k.outs[i], k.mults[i])?;
+                }
+                if let Some(rev) = &k.rev {
+                    for i in 0..layout::b3l::DIGEST_WORDS {
+                        check(rev.outs[i], rev.mults[i])?;
+                    }
+                }
+            }
             Instr::Public { .. } => {}
         }
     }
@@ -410,6 +424,7 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
     chip_real("LFM_LANES", &g.lanes, counts.lanes)?;
     chip_real("LFM_HINT", &g.hint, counts.hint)?;
     chip_real("LFM_PUBLIC", &g.public, counts.public)?;
+    chip_real("B3L_HEAD", &g.b3l, counts.b3l)?;
 
     // Selector one-hot / is_real flags on real rows.
     one_hot(
@@ -445,6 +460,7 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
     flag_is_one(&g.select, "LFM_SELECT", layout::select::IS_REAL)?;
     flag_is_one(&g.bitdec, "LFM_BITDEC", layout::bitdec::IS_REAL)?;
     flag_is_one(&g.public, "LFM_PUBLIC", layout::public::IS_REAL)?;
+    check_b3l_rows(&g.b3l)?;
 
     // Padding: everything beyond the real rows is zero.
     for (chip, group) in [
@@ -459,6 +475,7 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
         ("LFM_LANES", &g.lanes),
         ("LFM_HINT", &g.hint),
         ("LFM_PUBLIC", &g.public),
+        ("B3L_HEAD", &g.b3l),
     ] {
         for row in group.real_rows..group.padded_rows {
             for col in 0..group.width {
@@ -490,7 +507,7 @@ const MULT_HARD_CAP: u64 = 1 << 32;
 /// upper bound (safe), under-counting would reject honest programs, so where
 /// two receivers are mutually exclusive the count rounds up.
 fn mult_bound(g: &LfmColumnGroups, hash16: bool) -> u64 {
-    let receives_per_row: [(&ColumnGroup, u64); 11] = [
+    let receives_per_row: [(&ColumnGroup, u64); 12] = [
         (&g.const_, 0),                        // reads nothing
         (&g.balu, 3),                          // A, B, C
         (&g.xalu, 3),                          // A, B, C
@@ -505,6 +522,10 @@ fn mult_bound(g: &LfmColumnGroups, hash16: bool) -> u64 {
         (&g.lanes, 5),                         // the word (Unpack) or the four lanes (Pack)
         (&g.hint, 0),                          // reads nothing
         (&g.public, 1),                        // the published cell
+        (
+            &g.b3l,
+            (layout::b3l::DIGEST_WORDS + layout::b3l::LANE_WORDS) as u64,
+        ), // h | the block
     ];
     let reads = receives_per_row.iter().fold(0u64, |acc, (group, per_row)| {
         acc.saturating_add((group.real_rows as u64).saturating_mul(*per_row))
@@ -574,7 +595,55 @@ fn mult_columns(
                 .collect(),
         ),
         ("LFM_HINT", &g.hint, vec![hint::MULT]),
+        (
+            "B3L_HEAD",
+            &g.b3l,
+            (0..layout::b3l::DIGEST_WORDS)
+                .map(layout::b3l::ocnt)
+                .chain((0..layout::b3l::DIGEST_WORDS).map(layout::b3l::rcnt))
+                .collect(),
+        ),
     ]
+}
+
+/// Check 10 — `B3L_HEAD`'s instruction rows: real, tagged by ordinal, one
+/// block mode, a boolean IV flag, a `block_len` of at most 64 and a one-byte
+/// `flags`, and the placeholders a mode leaves at zero (no chaining-value
+/// words under the IV, no third or fourth block word under a felt block).
+///
+/// The tag is what binds a head row to its seven round rows on the round
+/// chain, as `LFM_KECCAK`'s tag binds a request to its reply: two equal tags
+/// would let a prover swap two compressions' round rows. It is the row
+/// ordinal + 1 by construction ([`layout::b3l::tag_for_row`]); this is what
+/// makes that a checked property of the program.
+fn check_b3l_rows(group: &ColumnGroup) -> Result<(), LfmViolation> {
+    use layout::b3l as l;
+    const CHIP: &str = "B3L_HEAD";
+    let at = |row: usize, col: usize| GoldilocksField::canonical(group.at(row, col).value());
+    flag_is_one(group, CHIP, l::MU)?;
+    one_hot(group, CHIP, l::MLANES, 2)?;
+    for row in 0..group.real_rows {
+        let bad = || LfmViolation::MalformedB3lRow { row };
+        if at(row, l::TAG) != l::tag_for_row(row) {
+            return Err(bad());
+        }
+        let iv = at(row, l::IVF);
+        if iv > 1 || at(row, l::BLEN) > crypto::hash::blake3::chain::BLOCK_LEN as u64 {
+            return Err(bad());
+        }
+        if at(row, l::FLAGS) > 0xFF {
+            return Err(bad());
+        }
+        if iv == 1 && (0..l::DIGEST_WORDS).any(|w| at(row, l::haddr(w)) != 0) {
+            return Err(bad());
+        }
+        if at(row, l::MFELTS) == 1
+            && (l::FELT_WORDS..l::LANE_WORDS).any(|w| at(row, l::maddr(w)) != 0)
+        {
+            return Err(bad());
+        }
+    }
+    Ok(())
 }
 
 /// Check 9: every multiplicity column of every group holds a canonically
@@ -657,6 +726,7 @@ struct PartitionCounts {
     lanes: usize,
     hint: usize,
     public: usize,
+    b3l: usize,
 }
 
 fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
@@ -672,6 +742,7 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
         lanes: 0,
         hint: 0,
         public: 0,
+        b3l: 0,
     };
     for i in instrs {
         match i {
@@ -683,6 +754,7 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
             Instr::Hash { .. } | Instr::Hash16(_) => c.hash += 1,
             Instr::KeccakF(_) => c.keccak += 1,
             Instr::Blake3(_) => c.blake3 += 1,
+            Instr::B3l(_) => c.b3l += 1,
             Instr::Pack { .. } | Instr::Unpack { .. } => c.lanes += 1,
             Instr::Hint { .. } | Instr::HintOn { .. } => c.hint += 1,
             Instr::Public { .. } => c.public += 1,

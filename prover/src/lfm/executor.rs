@@ -16,6 +16,7 @@ use math::field::traits::IsPrimeField;
 
 use crate::tables::types::{FE, FEE, GoldilocksField};
 
+use super::b3l::B3lValues;
 use super::blake3_chip::Blake3Values;
 use super::compiler::{LfmColumnGroups, LfmProgram};
 use super::exec_schedule::{self, LevelSchedule};
@@ -166,6 +167,9 @@ pub struct LfmRecords {
     pub lanes: Vec<LfmWord>,
     pub hint: Vec<LfmWord>,
     pub public: Vec<LfmWord>,
+    /// One `B3L_HEAD` row: a compression's chaining value and block. Values
+    /// only; the mode, constants, addresses and read counts are the program's.
+    pub b3l: Vec<B3lValues>,
 }
 
 impl LfmRecords {
@@ -201,6 +205,7 @@ impl LfmRecords {
             lanes: Vec::with_capacity(groups.lanes.real_rows),
             hint: Vec::with_capacity(groups.hint.real_rows),
             public: Vec::with_capacity(groups.public.real_rows),
+            b3l: Vec::with_capacity(groups.b3l.real_rows),
         }
     }
 }
@@ -241,7 +246,7 @@ impl LfmRecords {
             )+};
         }
         commit!(
-            balu, xalu, select, bitdec, keccak, blake3, lanes, hint, public
+            balu, xalu, select, bitdec, keccak, blake3, lanes, hint, public, b3l
         );
         // `LFM_HASH`'s rows are one vector or the other, by the program's width.
         let rows = groups.hash.real_rows;
@@ -274,6 +279,7 @@ impl LfmRecords {
             + groups.hash.real_rows * hash_row
             + groups.keccak.real_rows * size_of::<KeccakRow>()
             + groups.blake3.real_rows * size_of::<Blake3Values>()
+            + groups.b3l.real_rows * size_of::<B3lValues>()
             + (groups.lanes.real_rows + groups.hint.real_rows + groups.public.real_rows)
                 * size_of::<LfmWord>()
     }
@@ -964,6 +970,57 @@ fn step(
                     }
                 }
                 sink.put(&mut records.blake3, values);
+            }
+            Instr::B3l(op) => {
+                use super::instr::{B3lBlock, B3lCv};
+                // Every lane a `u32` read must be below 2^32: the head
+                // recomposes each from range-checked bytes, so no larger value
+                // exists on the AIR side.
+                let u32_word = |m: &Machine<'_>, cell: Addr| -> Result<[u32; 4], LfmExecError> {
+                    let w = m.read_word(cell)?;
+                    let mut out = [0u32; 4];
+                    for (lane, value) in w.iter().enumerate() {
+                        out[lane] = super::b3l::lane_u32(value)
+                            .ok_or(LfmExecError::NotU32Half { addr: cell.0, lane })?;
+                    }
+                    Ok(out)
+                };
+                let h = match &op.cv {
+                    B3lCv::Iv => super::b3l::IV,
+                    B3lCv::Words(ws) => {
+                        let (a, b) = (u32_word(m, ws[0])?, u32_word(m, ws[1])?);
+                        core::array::from_fn(|i| if i < 4 { a[i] } else { b[i - 4] })
+                    }
+                };
+                let block = match &op.block {
+                    B3lBlock::Lanes(ws) => {
+                        let mut words = [0u32; 16];
+                        for (j, cell) in ws.iter().enumerate() {
+                            words[4 * j..4 * j + 4].copy_from_slice(&u32_word(m, *cell)?);
+                        }
+                        super::b3l::lane_block(&words)
+                    }
+                    // A field element always has its canonical bytes: nothing
+                    // to refuse.
+                    B3lBlock::Felts(ws) => {
+                        let (a, b) = (m.read_word(ws[0])?, m.read_word(ws[1])?);
+                        super::b3l::felt_block(&core::array::from_fn(|f| {
+                            if f < 4 { a[f] } else { b[f - 4] }
+                        }))
+                    }
+                };
+                let values = B3lValues { h, block };
+                let digest = values.digest(op.block_len, op.flags);
+                for (cell, word) in op.outs.iter().zip(super::b3l::digest_words(&digest)) {
+                    m.write(*cell, word)?;
+                }
+                if let Some(rev) = &op.rev {
+                    let words = super::b3l::reversed_digest_words(&digest);
+                    for (cell, word) in rev.outs.iter().zip(words) {
+                        m.write(*cell, word)?;
+                    }
+                }
+                sink.put(&mut records.b3l, values);
             }
             Instr::Hint {
                 arena, index, out, ..
