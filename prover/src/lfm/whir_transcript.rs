@@ -66,12 +66,34 @@
 //! [`WhirTranscript::absorb_const_bytes`] call is one `append_bytes` of its
 //! bytes. A candidate is one squeezed lane; `state()` is the sponge's digest
 //! after flushing a copy. The byte arm above is unchanged, call for call.
+//!
+//! # The BLAKE3 arm
+//!
+//! A [`WrapHash::Blake3`] builder replays `DefaultTranscript<_,
+//! Blake3StdTranscriptHash>`, the sponge of the 7-round BLAKE3 base
+//! (`multilinear::whir_hash::Blake3Whir`), through
+//! [`TranscriptReplay`]'s byte arm: a byte sponge again, but over `Blake3Std`
+//! and with the BYTE conventions this module's own sponge dropped. A squeeze is
+//! reversed (`REVERSES_SQUEEZE = true`), and a coordinate draws two candidates
+//! (`CANDIDATES_PER_COORDINATE = Some(2)`). Both are the build's
+//! `Blake3TranscriptHash`'s too, which differs from the standard one by its
+//! round count alone, and the default build runs seven, so the replay that
+//! already verifies the STARK wrap's BLAKE3 transcript IS this one.
+//!
+//! What crosses the seam: a felt is its eight big-endian bytes
+//! ([`super::transcript_replay::felt_be_halves`], one `BitDec` row), an
+//! extension element its three coordinates in order, a 32-byte digest its two
+//! words of `u32` lanes as they stand (the byte digest's lanes ARE its bytes,
+//! little-endian), and the nonce its eight big-endian bytes. There is no felt
+//! boundary to keep: the byte sponge has none, so a constant of any length may
+//! sit anywhere before a runtime value of whole `u32` halves.
 
 use crate::tables::types::{FE, FEE};
 
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
-use super::edsl::WrapHash;
+use super::edsl::{WrapDigest, WrapHash};
 use super::p1w16_emit::P1SpongeVar;
+use super::transcript_replay::TranscriptReplay;
 
 /// Felts a squeeze hands out before it must refill — `SQUEEZE_LEN / 8` in the
 /// host's bytes (`default_transcript.rs:19`).
@@ -82,6 +104,9 @@ pub const COORDINATES_PER_EXT: usize = 3;
 
 /// Bytes one felt occupies in the sponge's stream.
 const BYTES_PER_FELT: usize = 8;
+
+/// Words a byte hash's 32-byte digest occupies: two of four `u32` lanes.
+const BYTE_DIGEST_WORDS: usize = super::layout::blake3::DIGEST_WORDS;
 
 /// The WHIR transcript, replayed. A clone is a fork: the host's
 /// `transcript.clone()`, as the block's per-group forks take it.
@@ -102,6 +127,10 @@ pub struct WhirTranscript {
     /// The Poseidon1 sponge, when the builder verifies a Poseidon1 base: every
     /// call below goes to it and the byte buffer above stays empty.
     p1: Option<P1Arm>,
+    /// The BLAKE3 byte sponge, when the builder verifies a 7-round BLAKE3
+    /// base (the module doc's "The BLAKE3 arm"): every call below goes to it
+    /// and the felt buffer above stays empty.
+    bytes: Option<TranscriptReplay>,
 }
 
 /// The Poseidon1 arm's state: the sponge, and constant lanes absorbed by a
@@ -134,31 +163,48 @@ impl WhirTranscript {
             out_pos: CANDIDATES_PER_SQUEEZE,
             squeezes: 0,
             p1: None,
+            bytes: None,
         }
     }
 
     /// The transcript of a program built by `b`: [`Self::new`], or under a
     /// [`WrapHash::Poseidon1`] builder the empty `P1Transcript` (`P1Whir`'s
-    /// `WhirHash::sponge()`, which absorbs no seed).
+    /// `WhirHash::sponge()`, which absorbs no seed), or under a
+    /// [`WrapHash::Blake3`] builder the empty `DefaultTranscript<_,
+    /// Blake3StdTranscriptHash>` (`Blake3Whir`'s, `DefaultTranscript::new(&[])`).
     pub fn for_builder(b: &mut LfmBuilder) -> Self {
         let mut t = Self::new();
-        if b.wrap_hash() == WrapHash::Poseidon1 {
-            t.p1 = Some(P1Arm {
-                sponge: P1SpongeVar::new(b),
-                consts: Vec::new(),
-            });
+        match b.wrap_hash() {
+            WrapHash::Poseidon1 => {
+                t.p1 = Some(P1Arm {
+                    sponge: P1SpongeVar::new(b),
+                    consts: Vec::new(),
+                });
+            }
+            WrapHash::Blake3 => t.bytes = Some(TranscriptReplay::new(&[])),
+            WrapHash::Keccak | WrapHash::Algebraic => {}
         }
         t
+    }
+
+    /// Whether this transcript replays the BLAKE3 byte sponge.
+    pub fn is_bytes(&self) -> bool {
+        self.bytes.is_some()
     }
 
     /// `append_bytes` of a PROGRAM CONSTANT: free, and unconstrained in length.
     ///
     /// Under Poseidon1 it is ONE `append_bytes` call: the length, then the
-    /// bytes' felts, all program constants.
+    /// bytes' felts, all program constants. Under BLAKE3 the bytes join the
+    /// segment as they stand.
     pub fn absorb_const_bytes(&mut self, bytes: &[u8]) {
         if let Some(arm) = &mut self.p1 {
             arm.consts.push(FE::from(bytes.len() as u64));
             arm.consts.extend(const_byte_felts(bytes));
+            return;
+        }
+        if let Some(t) = &mut self.bytes {
+            t.append_const_bytes(bytes);
             return;
         }
         self.pending.extend_from_slice(bytes);
@@ -170,11 +216,20 @@ impl WhirTranscript {
     /// Panics when the constant run before it does not end on a felt boundary:
     /// see the module header. Under Poseidon1 these are field-element lanes
     /// with no length: a byte string goes through the named absorbs below.
+    /// Under BLAKE3 each felt is its eight big-endian bytes, so felts absorbed
+    /// one by one and an extension element's coordinates absorbed at once are
+    /// the same stream.
     pub fn absorb_felts(&mut self, b: &mut LfmBuilder, felts: &[Felt]) {
         if let Some(arm) = &mut self.p1 {
             let sponge = arm.ready(b);
             for felt in felts {
                 sponge.put_felt(b, *felt);
+            }
+            return;
+        }
+        if let Some(t) = &mut self.bytes {
+            for felt in felts {
+                t.append_felt(b, *felt);
             }
             return;
         }
@@ -203,13 +258,43 @@ impl WhirTranscript {
     /// `append_bytes(root, 32)`: a commitment is four canonical felts, big-endian
     /// (`digest_to_commitment`, `rpx/mod.rs:428`).
     pub fn absorb_digest(&mut self, b: &mut LfmBuilder, digest: Cell) {
-        let lanes = b.unpack(digest);
-        self.absorb_root_lanes(b, &lanes);
+        self.absorb_root(b, WrapDigest::from_cell(digest));
+    }
+
+    /// `append_bytes(root, 32)` of a commitment in the builder's digest width:
+    /// one cell of four felts, or under BLAKE3 two words of `u32` lanes.
+    pub fn absorb_root(&mut self, b: &mut LfmBuilder, digest: WrapDigest) {
+        let lanes: Vec<[Felt; 4]> = digest.iter().map(|cell| b.unpack(*cell)).collect();
+        self.absorb_digest_lanes(b, &lanes);
     }
 
     /// `append_bytes(root, 32)` of a root already unpacked into its four lanes.
     pub fn absorb_root_lanes(&mut self, b: &mut LfmBuilder, lanes: &[Felt; 4]) {
-        self.absorb_byte_felts(b, DIGEST_FELTS * BYTES_PER_FELT, lanes);
+        self.absorb_digest_lanes(b, std::slice::from_ref(lanes));
+    }
+
+    /// `append_bytes(root, 32)` of a root already unpacked, one `[Felt; 4]` a
+    /// digest cell: one under the felt sponges, whose 32 bytes are the four
+    /// canonical felts big-endian; two under BLAKE3, whose 32 bytes are the
+    /// eight `u32` lanes little-endian, so they enter the segment as they
+    /// stand.
+    pub fn absorb_digest_lanes(&mut self, b: &mut LfmBuilder, lanes: &[[Felt; 4]]) {
+        if let Some(t) = &mut self.bytes {
+            assert_eq!(
+                lanes.len(),
+                BYTE_DIGEST_WORDS,
+                "a BLAKE3 digest is two words of u32 lanes"
+            );
+            let halves: Vec<Felt> = lanes.iter().flatten().copied().collect();
+            t.append_halves(&halves);
+            return;
+        }
+        assert_eq!(
+            lanes.len(),
+            1,
+            "a felt-sponge digest is one cell of four felts"
+        );
+        self.absorb_byte_felts(b, DIGEST_FELTS * BYTES_PER_FELT, &lanes[0]);
     }
 
     /// `append_bytes(&nonce.to_be_bytes())`: eight big-endian bytes, one felt.
@@ -233,7 +318,15 @@ impl WhirTranscript {
     /// ⚠ The re-absorb is the chain advance, and it is what makes consecutive
     /// draws differ. Dropping it leaves every draw after the first identical,
     /// which a single pinned value cannot see.
+    ///
+    /// The felt sponges' primitive: a BLAKE3 squeeze is 32 uniform bytes, not
+    /// four felts, and its draws go through [`Self::sample_ext`] and
+    /// [`Self::sample_u64_pow2`].
     pub fn squeeze(&mut self, b: &mut LfmBuilder) -> [Felt; CANDIDATES_PER_SQUEEZE] {
+        assert!(
+            self.bytes.is_none(),
+            "a BLAKE3 squeeze is bytes, not four felts: draw through sample_ext / sample_u64_pow2"
+        );
         if let Some(arm) = &mut self.p1 {
             // Four candidates: the Poseidon1 sponge squeezes lanes, not digests.
             let sponge = arm.ready(b);
@@ -255,6 +348,11 @@ impl WhirTranscript {
     /// writes felt `i` as the big-endian bytes `8i..8i+8` and the sampler reads
     /// exactly those with `from_be_bytes`, so the two conversions cancel.
     pub fn next_candidate(&mut self, b: &mut LfmBuilder) -> Felt {
+        assert!(
+            self.bytes.is_none(),
+            "a BLAKE3 candidate is a 64-bit integer, not a felt: draw through sample_ext / \
+             sample_u64_pow2"
+        );
         if let Some(arm) = &mut self.p1 {
             return arm.ready(b).squeeze(b);
         }
@@ -273,7 +371,15 @@ impl WhirTranscript {
     /// `candidate_in_range` holds by construction and the host's single-draw
     /// schedule (`CANDIDATES_PER_COORDINATE = Some(1)`) has no rejected branch
     /// to emit.
+    ///
+    /// Under BLAKE3 a coordinate draws TWO 64-bit candidates and keeps the
+    /// first below `p` ([`TranscriptReplay::sample_felt`]): the program is
+    /// unprovable only when both miss, ≈ 2⁻⁶⁴ a coordinate, and then the host
+    /// draws again where the machine has no execution (completeness only).
     pub fn sample_ext(&mut self, b: &mut LfmBuilder) -> Ext {
+        if let Some(t) = &mut self.bytes {
+            return t.sample_ext(b);
+        }
         let a0 = self.next_candidate(b);
         let a1 = self.next_candidate(b);
         let a2 = self.next_candidate(b);
@@ -287,7 +393,13 @@ impl WhirTranscript {
     /// schedule is fixed and there is no branch to emit. The answer is
     /// `candidate mod 2^nbits`, the low `nbits` bits, which is one `BitDec` row
     /// and needs no recomposition because its consumer wants bits.
+    ///
+    /// Under BLAKE3 the candidate is a 64-bit integer, and the answer is the
+    /// low `nbits ≤ 32` bits of its low `u32` half.
     pub fn sample_u64_pow2(&mut self, b: &mut LfmBuilder, nbits: usize) -> Vec<Bit> {
+        if let Some(t) = &mut self.bytes {
+            return t.sample_u64_pow2(b, nbits);
+        }
         let candidate = self.next_candidate(b);
         b.bit_dec(candidate, nbits)
     }
@@ -299,12 +411,29 @@ impl WhirTranscript {
     /// Neither the buffer nor the output position moves, so a later squeeze
     /// hashes the same bytes again. The packing is therefore emitted twice,
     /// which is redundant work and never a different value.
+    ///
+    /// One cell: the felt sponges' digest. A BLAKE3 state is two words, and
+    /// [`Self::state_digest`] returns it.
     pub fn state(&mut self, b: &mut LfmBuilder) -> Cell {
+        assert!(
+            self.bytes.is_none(),
+            "a BLAKE3 state is two words: read it with state_digest"
+        );
+        self.state_digest(b)[0]
+    }
+
+    /// `state()` in the builder's digest width: one cell under the felt
+    /// sponges, two words of `u32` lanes under BLAKE3 (`Blake3Std` over the
+    /// segment, unreversed: production finalizes a clone, with no reversal).
+    pub fn state_digest(&mut self, b: &mut LfmBuilder) -> WrapDigest {
+        if let Some(t) = &mut self.bytes {
+            return t.state(b);
+        }
         if let Some(arm) = &mut self.p1 {
-            return arm.ready(b).digest(b);
+            return WrapDigest::from_cell(arm.ready(b).digest(b));
         }
         let felts = self.felts_now(b);
-        WrapHash::Algebraic.leaf_hash(b, &felts).cells()[0]
+        WrapHash::Algebraic.leaf_hash(b, &felts)
     }
 
     /// Squeezes emitted so far.
@@ -690,8 +819,8 @@ pub fn emit_grind_check(
     if bits == 0 {
         return;
     }
-    let seed = transcript.state(b);
-    super::epoch::emit_grinding_check(b, super::edsl::WrapDigest::from_cell(seed), nonce, bits);
+    let seed = transcript.state_digest(b);
+    super::epoch::emit_grinding_check(b, seed, nonce, bits);
     // `append_bytes(&nonce.to_be_bytes())`: eight big-endian bytes are one felt.
     transcript.absorb_nonce(b, nonce);
 }
