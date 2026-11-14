@@ -1,7 +1,7 @@
 // The card-built LOAD and STORE rows (`src/card_rows.rs`): a group's LOAD or
 // STORE tables derived on the card from the CPU logs it already holds, instead of filled from records the host made. Loaded by
-// `src/card_rows.rs` and launched only under `LAMBDA_VM_CARD_ROWS=derive` (or `registers`). Under
-// `registers`, MEMW_R's register rows are built from the same logs (`derive_registers_from_cache`, below).
+// `src/card_rows.rs` and launched only where the upload derives (`LAMBDA_VM_CARD_ROWS` unset or `words`).
+// MEMW_R's register rows are built from the same logs (`derive_registers_from_cache`, below).
 //
 // Each row is written with the words `fill.cu`'s `fill_load` and
 // `fill_store` write for the same op (the same writers and columns, included
@@ -201,7 +201,7 @@ extern "C" __global__ void derive_rows_from_cache(const CachedLogsC *entries, ui
 
 // ---------------------------------------------------------------------------
 // `src/card_rows.rs`'s register rows: a group's MEMW_R tables built on the
-// card from the CPU logs it holds (`LAMBDA_VM_CARD_ROWS=registers`). Each row
+// card from the CPU logs it holds (`words`, the default, and a test's `registers`). Each row
 // comes as one word (`RegisterPlan::words`): its timestamp `ts` in the low
 // half and its old timestamp `old` in the high half, or a low half of 0 (no
 // timestamp is) and the index of the row in the table's whole rows, which

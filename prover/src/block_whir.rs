@@ -6377,7 +6377,8 @@ fn prove_streamed(
                     if card_fill.rows.any() {
                         builder = builder.card_fill_streamed_rows(card_fill.rows)?;
                     }
-                    // `LAMBDA_VM_CARD_ROWS=registers`: the card builds MEMW_R's
+                    // The card's `registers` mode (a test's override, no
+                    // setting): the card builds MEMW_R's
                     // rows from the CPU logs, and needs each chunk's ECALL
                     // cycles, which the walkers read from the executor's
                     // history. Without record mode MEMW_R goes up as records.
@@ -7372,7 +7373,7 @@ fn prove_streamed(
         }
         // Phase B starts: an early start's windows go to their phase-B sizes.
         early_gate.store(true, std::sync::atomic::Ordering::Release);
-        // `LAMBDA_VM_CARD_ROWS=registers` or `words` (the default): the card-built rows' counters as
+        // The card's `words` (the default) or `registers` mode: the card-built rows' counters as
         // phase B starts (the block's end line holds both phases).
         if (multilinear::gpu::card_rows_builds_registers()
             || multilinear::gpu::card_rows_builds_words())
