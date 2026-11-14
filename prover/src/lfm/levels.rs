@@ -244,6 +244,7 @@ pub struct LevelsTimes {
 /// A block proved to its last level.
 pub struct LevelsRun {
     pub base_proof: BlockWhirProof,
+    pub base_stamps: crate::block_whir::BlockStamps,
     pub plan: WhirBlockPlan,
     pub levels: Vec<Level>,
     pub proofs: Vec<WlfmProof>,
@@ -273,7 +274,8 @@ pub(crate) fn level1_pieces(marks: &[u32]) -> Vec<(std::ops::Range<u32>, std::op
 /// each group, [`StreamedExecution::new_pieced`]), then level 1 filled and
 /// proved, and each next level executed over the one below and proved. The
 /// proofs are the ones [`prove_levels`] makes over the finished base; only
-/// when the work runs moves.
+/// when the work runs moves. `beside = false` is the control: level 1's
+/// groups land only once the base has ended.
 ///
 /// [`StreamedExecution::new_pieced`]: super::executor::StreamedExecution::new_pieced
 #[allow(clippy::too_many_arguments)]
@@ -285,6 +287,7 @@ pub fn prove_block_levels(
     options: &crate::block_whir::BlockOptions,
     family: WlfmFamily,
     stop: LevelStop,
+    beside: bool,
 ) -> Result<LevelsRun, String> {
     use super::executor::{ArenaPiece, StreamedExecution};
     use super::word::LfmWord;
@@ -399,7 +402,14 @@ pub fn prove_block_levels(
                 .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
             let mut landed = vec![false; npieces];
             let (mut waves_before, mut wave_secs_before) = (0usize, 0.0f64);
-            for (g, roots, answers, tables, argue, opening, prepared) in prx.iter() {
+            // Beside phase B, each group as it comes; otherwise (the control)
+            // every group once the base has ended.
+            let parts: Box<dyn Iterator<Item = Parts>> = if beside {
+                Box::new(prx.iter())
+            } else {
+                Box::new(prx.iter().collect::<Vec<_>>().into_iter())
+            };
+            for (g, roots, answers, tables, argue, opening, prepared) in parts {
                 if !landed[0] {
                     let front = super::whir_block::leaf_arena(&roots, &answers, Vec::new())
                         .into_iter()
@@ -474,7 +484,7 @@ pub fn prove_block_levels(
         (proved, level1.join())
     });
     let (proved, level1) = result;
-    let (base_proof, _stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
+    let (base_proof, base_stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
     times.base = base_end.get().copied().unwrap_or_else(now);
     let (planned, emitted, program, execution, execute_from, executed, npieces, waves, wave_secs) =
         level1.map_err(|_| "level 1's thread panicked")??;
@@ -558,6 +568,7 @@ pub fn prove_block_levels(
     }
     Ok(LevelsRun {
         base_proof,
+        base_stamps,
         plan,
         levels,
         proofs,
