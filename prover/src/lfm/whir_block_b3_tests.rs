@@ -337,12 +337,12 @@ fn a_blake3_plan_is_its_base_alone() {
 /// group's compressions, rows by chip and cells printed. A tampered copy (a
 /// root's byte) is refused by its group's leaf.
 ///
-/// Reads `BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`; with `B3E01_WHOLE=1` also
-/// executes the whole block as ONE leaf (route A's level 1) and prints its
-/// size. Prints `B3E01 …` lines; the reader turns them into rows.
+/// Reads `BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`; with `B3_CENSUS_WHOLE=1` also
+/// executes the whole block as ONE leaf (the whole block's verifier) and prints its
+/// size. Prints `B3 CENSUS …` lines; the reader turns them into rows.
 #[test]
 #[ignore = "a real block's BLAKE3 base and its in-guest verifier: box only"]
-fn b3e01_blake3_level0_census_on_a_real_block() {
+fn blake3_level0_census_on_a_real_block() {
     use super::whir_block_tree::WhirTreeConfig;
     use crate::zf_format::{LeafOrder, ZfFormat};
     let _permit = super::device_permit::serial_for_test();
@@ -386,7 +386,7 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
         verify_block_whir(&proof, &elf, &opts, &cfg.format).expect("verify runs")
     });
     println!(
-        "B3E01 BASE: groups {} · prove {prove_secs:.2} s · host verify {:.2} s · verified {verified}",
+        "B3 CENSUS BASE: groups {} · prove {prove_secs:.2} s · host verify {:.2} s · verified {verified}",
         proof.proof.columns.len(),
         t.elapsed().as_secs_f64()
     );
@@ -398,7 +398,7 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
         WhirBlockPlan::derive_blake3(&elf, &opts, &cfg.format, proof.statement(), groups, None)
             .expect("the BLAKE3 plan derives");
     println!(
-        "B3E01 PLAN: {} groups · {} leaves · derived {:.2} s",
+        "B3 CENSUS PLAN: {} groups · {} leaves · derived {:.2} s",
         plan.num_groups(),
         plan.partition().num_leaves(),
         t.elapsed().as_secs_f64()
@@ -408,7 +408,7 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
         "one group a leaf"
     );
     let layout = plan.child_layout();
-    let lean_cells_per_compression = std::env::var("B3E01_LEAN_CELLS")
+    let lean_cells_per_compression = std::env::var("B3_CENSUS_LEAN_CELLS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(2_832);
@@ -417,7 +417,7 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
     // front every leaf repeats.
     let (loads, front) = plan.chip_loads();
     println!(
-        "B3E01 FRONT: compressions {} · rows {:?}",
+        "B3 CENSUS FRONT: compressions {} · rows {:?}",
         front.accel, front
     );
     let mut sum = FEE::zero();
@@ -442,7 +442,7 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
         let words = run_leaf(&plan, &proof, k);
         let exec_secs = t.elapsed().as_secs_f64();
         println!(
-            "B3E01 GROUP {g}: compressions {b3l} · leaf compressions {leaf_b3l} · instructions {} · group rows {:?} · leaf field main cells {field_main} (with aux {field_padded}) · leaf lean hash cells {hash_cells} · leaf hash share {:.4} · execute {exec_secs:.2} s · executed {}",
+            "B3 CENSUS GROUP {g}: compressions {b3l} · leaf compressions {leaf_b3l} · instructions {} · group rows {:?} · leaf field main cells {field_main} (with aux {field_padded}) · leaf lean hash cells {hash_cells} · leaf hash share {:.4} · execute {exec_secs:.2} s · executed {}",
             program.instrs.len(),
             loads[g],
             hash_cells as f64 / (hash_cells + field_main) as f64,
@@ -453,7 +453,7 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
                 executed += 1;
                 sum += word_as_ext(&w[layout.sum()]).expect("a share");
             }
-            Err(e) => println!("B3E01 REFUSED group {g}: {e}"),
+            Err(e) => println!("B3 CENSUS REFUSED group {g}: {e}"),
         }
         per_group.push((g, b3l, field_main, hash_cells));
     }
@@ -465,7 +465,7 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
     let field: u64 = per_group.iter().map(|p| p.2).sum();
     let hash: u64 = per_group.iter().map(|p| p.3).sum();
     println!(
-        "B3E01 SUMMARY: groups {groups} · executed {executed} · bus closes {} · compressions a group median {median} max {max} total {total} · one-group leaves' lean cells Σ {} (hash {hash}, field {field}) · leaf hash share {:.4}",
+        "B3 CENSUS SUMMARY: groups {groups} · executed {executed} · bus closes {} · compressions a group median {median} max {max} total {total} · one-group leaves' lean cells Σ {} (hash {hash}, field {field}) · leaf hash share {:.4}",
         sum == FEE::zero(),
         hash + field,
         hash as f64 / (hash + field) as f64
@@ -478,9 +478,9 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
         .find(|&k| plan.partition().leaf(k).contains(&0))
         .expect("a leaf holds group 0");
     let refused = run_leaf(&plan, &forged, holder).is_err();
-    println!("B3E01 TAMPER root byte: refused {refused}");
+    println!("B3 CENSUS TAMPER root byte: refused {refused}");
 
-    if std::env::var("B3E01_WHOLE").is_ok_and(|v| v.trim() == "1") {
+    if std::env::var("B3_CENSUS_WHOLE").is_ok_and(|v| v.trim() == "1") {
         let whole =
             WhirBlockPlan::derive_blake3(&elf, &opts, &cfg.format, proof.statement(), 1, None)
                 .expect("the one-leaf plan");
@@ -489,7 +489,7 @@ fn b3e01_blake3_level0_census_on_a_real_block() {
         let t = std::time::Instant::now();
         let ok = run_leaf(&whole, &proof, 0).is_ok();
         println!(
-            "B3E01 WHOLE: compressions {b3l} · instructions {} · rows {:?} · execute {:.2} s · executed {ok}",
+            "B3 CENSUS WHOLE: compressions {b3l} · instructions {} · rows {:?} · execute {:.2} s · executed {ok}",
             program.instrs.len(),
             ChipRows::of(&program),
             t.elapsed().as_secs_f64()
