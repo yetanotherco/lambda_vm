@@ -24,8 +24,9 @@
 //! The leaf's build then takes what was prepared ([`take`]). The merged
 //! groups are used only when the build's own merge plan equals the one they
 //! were laid out for. The bytes the card receives are the same in every mode,
-//! so the artifacts and the proofs do not change. Off (unset, `0`, `off`) is
-//! today's path: no helper, and [`take`] returns at once. Registration is
+//! so the artifacts and the proofs do not change. Unset is `merged`, the
+//! default; `0` or `off` is the path without a helper, where [`take`] returns
+//! at once. A build outside a tree's session takes nothing and records nothing. Registration is
 //! undone on a release thread after each build, off the builder's path.
 //!
 //! The helper holds each program until its build has taken the preparation
@@ -57,10 +58,12 @@ pub enum PrepPinned {
 }
 
 impl PrepPinned {
-    /// Reads the knob's value: unset, `0` or `off` is [`PrepPinned::Off`].
+    /// Reads the knob's value: unset is [`PrepPinned::Merged`], the default;
+    /// `0` or `off` is [`PrepPinned::Off`].
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim) {
-            None | Some("") | Some("0") | Some("off") => Ok(Self::Off),
+            None | Some("") => Ok(Self::Merged),
+            Some("0") | Some("off") => Ok(Self::Off),
             Some("programs") => Ok(Self::Programs),
             Some("merged") => Ok(Self::Merged),
             Some("merged-pageable") => Ok(Self::MergedPageable),
@@ -163,28 +166,41 @@ struct State {
     /// is dropped at once.
     built: Vec<usize>,
     tally: Tally,
+    /// Tree sessions live now; [`take`] acts only while one is.
+    sessions: usize,
 }
 
-static STATE: Mutex<State> = Mutex::new(State {
-    ready: Vec::new(),
-    built: Vec::new(),
-    tally: Tally {
-        leaves: 0,
-        late: 0,
-        locked_groups: 0,
-        locked_bytes: 0,
-        refused_pieces: 0,
-        lock_seconds: 0.0,
-        merged_bytes: 0,
-        merged_seconds: 0.0,
-        taken: 0,
-        merged_used: 0,
-        plan_mismatch: 0,
-    },
-});
+impl State {
+    const fn new() -> Self {
+        Self {
+            ready: Vec::new(),
+            built: Vec::new(),
+            tally: Tally {
+                leaves: 0,
+                late: 0,
+                locked_groups: 0,
+                locked_bytes: 0,
+                refused_pieces: 0,
+                lock_seconds: 0.0,
+                merged_bytes: 0,
+                merged_seconds: 0.0,
+                taken: 0,
+                merged_used: 0,
+                plan_mismatch: 0,
+            },
+            sessions: 0,
+        }
+    }
+}
+
+static STATE: Mutex<State> = Mutex::new(State::new());
+
+fn lock_state(st: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+    st.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn state() -> std::sync::MutexGuard<'static, State> {
-    STATE.lock().unwrap_or_else(|e| e.into_inner())
+    lock_state(&STATE)
 }
 
 fn key_of(program: &LfmProgram) -> usize {
@@ -211,11 +227,23 @@ fn program_groups_to_lock<'p>(program: &'p LfmProgram, plan: &MergePlan) -> Vec<
 
 /// Prepares one leaf's program under `mode` (on the helper thread).
 fn prepare(holder: Arc<dyn HoldsProgram>, options: &ProofOptions, mode: PrepPinned) {
+    prepare_in(&STATE, holder, options, mode);
+}
+
+fn prepare_in(
+    st: &Mutex<State>,
+    holder: Arc<dyn HoldsProgram>,
+    options: &ProofOptions,
+    mode: PrepPinned,
+) {
     let program = holder.program();
     let key = key_of(program);
-    if state().built.contains(&key) {
-        state().tally.late += 1;
-        return;
+    {
+        let mut s = lock_state(st);
+        if s.built.contains(&key) {
+            s.tally.late += 1;
+            return;
+        }
     }
     let plan = super::registry::merge_plan_for(program, options);
     let mut locked = Vec::new();
@@ -252,7 +280,7 @@ fn prepare(holder: Arc<dyn HoldsProgram>, options: &ProofOptions, mode: PrepPinn
         merged,
         _program: holder,
     };
-    let mut s = state();
+    let mut s = lock_state(st);
     s.tally.leaves += 1;
     s.tally.locked_groups += locked_groups;
     s.tally.locked_bytes += locked_bytes;
@@ -277,11 +305,20 @@ pub(crate) fn take(program: &LfmProgram) -> Option<Prepared> {
 }
 
 fn take_in(program: &LfmProgram, mode: PrepPinned) -> Option<Prepared> {
+    take_from(&STATE, program, mode)
+}
+
+fn take_from(st: &Mutex<State>, program: &LfmProgram, mode: PrepPinned) -> Option<Prepared> {
     if mode == PrepPinned::Off {
         return None;
     }
     let key = key_of(program);
-    let mut s = state();
+    let mut s = lock_state(st);
+    // Outside a tree's session no helper prepares anything: nothing to take,
+    // and nothing recorded, so the record cannot grow between trees.
+    if s.sessions == 0 {
+        return None;
+    }
     s.built.push(key);
     let at = s.ready.iter().position(|p| p.key == key)?;
     s.tally.taken += 1;
@@ -325,6 +362,8 @@ pub(crate) struct Session {
     helper: Option<std::thread::JoinHandle<()>>,
     releaser: Option<std::thread::JoinHandle<()>>,
     started: Instant,
+    /// Counted in [`State::sessions`] until closed.
+    live: bool,
 }
 
 impl Session {
@@ -338,6 +377,7 @@ impl Session {
             helper: None,
             releaser: None,
             started: Instant::now(),
+            live: false,
         };
         if mode == PrepPinned::Off {
             return Ok(session);
@@ -347,7 +387,9 @@ impl Session {
             s.ready.clear();
             s.built.clear();
             s.tally = Tally::default();
+            s.sessions += 1;
         }
+        session.live = true;
         multilinear::pinned::reset_in_place_stats();
         let (tx, rx): (Sender<Arc<dyn HoldsProgram>>, Receiver<_>) = channel();
         let helper = std::thread::Builder::new()
@@ -423,6 +465,10 @@ impl Session {
     }
 
     fn close(&mut self) {
+        if std::mem::take(&mut self.live) {
+            let mut s = state();
+            s.sessions = s.sessions.saturating_sub(1);
+        }
         self.tx = None;
         if let Some(h) = self.helper.take() {
             let _ = h.join();
@@ -450,7 +496,12 @@ mod tests {
 
     #[test]
     fn the_knob_reads_its_five_words_and_refuses_others() {
-        assert_eq!(PrepPinned::parse(None), Ok(PrepPinned::Off));
+        assert_eq!(
+            PrepPinned::parse(None),
+            Ok(PrepPinned::Merged),
+            "the default"
+        );
+        assert_eq!(PrepPinned::parse(Some("")), Ok(PrepPinned::Merged));
         assert_eq!(PrepPinned::parse(Some("0")), Ok(PrepPinned::Off));
         assert_eq!(PrepPinned::parse(Some("off")), Ok(PrepPinned::Off));
         assert_eq!(
@@ -485,17 +536,12 @@ mod tests {
     use crate::tables::types::FE;
     use stark::proof::options::GoldilocksCubicProofOptions;
 
-    /// The module's state is process-wide: one test at a time touches it.
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn reset() {
-        let mut s = state();
-        s.ready.clear();
-        s.built.clear();
-        s.tally = Tally::default();
+    /// A state of the test's own, as inside a live session: the process-wide
+    /// one is a tree's, and a tree may run beside these tests.
+    fn local() -> Mutex<State> {
+        let mut s = State::new();
+        s.sessions = 1;
+        Mutex::new(s)
     }
 
     struct Held(LfmProgram);
@@ -540,15 +586,15 @@ mod tests {
     /// build that lays them out itself.
     #[test]
     fn a_prepared_leaf_builds_the_same_artifacts_as_a_fresh_one() {
-        let _g = lock();
-        reset();
+        let st = local();
         let opts = options(true);
         let held = Arc::new(Held(program()));
         let p = held.program();
         let plan = super::super::registry::merge_plan_for(p, &opts);
         assert!(!plan.is_empty(), "the fixture merges");
-        prepare(held.clone(), &opts, PrepPinned::MergedPageable);
-        let prepared = take_in(p, PrepPinned::MergedPageable).expect("prepared before its build");
+        prepare_in(&st, held.clone(), &opts, PrepPinned::MergedPageable);
+        let prepared =
+            take_from(&st, p, PrepPinned::MergedPageable).expect("prepared before its build");
         let fresh = super::super::merge::merged_groups(p, &plan);
         let ready = prepared
             .merged_for(&plan)
@@ -570,7 +616,7 @@ mod tests {
         assert_eq!(with.program_id, without.program_id);
         assert_eq!(with.roots, without.roots);
         assert!(
-            take_in(p, PrepPinned::MergedPageable).is_none(),
+            take_from(&st, p, PrepPinned::MergedPageable).is_none(),
             "taken once"
         );
         drop(prepared);
@@ -584,12 +630,16 @@ mod tests {
     /// Merged groups laid out under another plan are never used.
     #[test]
     fn merged_groups_under_another_plan_are_not_used() {
-        let _g = lock();
-        reset();
+        let st = local();
         let held = Arc::new(Held(program()));
         let p = held.program();
-        prepare(held.clone(), &options(true), PrepPinned::MergedPageable);
-        let prepared = take_in(p, PrepPinned::MergedPageable).expect("prepared");
+        prepare_in(
+            &st,
+            held.clone(),
+            &options(true),
+            PrepPinned::MergedPageable,
+        );
+        let prepared = take_from(&st, p, PrepPinned::MergedPageable).expect("prepared");
         let other = super::super::registry::merge_plan_for(p, &options(false));
         assert!(other.is_empty());
         assert!(prepared.has_merged());
@@ -600,19 +650,23 @@ mod tests {
     /// handed to anyone; and with the knob off nothing is taken or recorded.
     #[test]
     fn a_late_preparation_is_dropped_and_off_takes_nothing() {
-        let _g = lock();
-        reset();
+        let st = local();
         let held = Arc::new(Held(program()));
         let p = held.program();
-        assert!(take_in(p, PrepPinned::Off).is_none());
-        assert!(state().built.is_empty(), "off records nothing");
+        assert!(take_from(&st, p, PrepPinned::Off).is_none());
+        assert!(lock_state(&st).built.is_empty(), "off records nothing");
         assert!(
-            take_in(p, PrepPinned::MergedPageable).is_none(),
+            take_from(&st, p, PrepPinned::MergedPageable).is_none(),
             "nothing yet"
         );
-        prepare(held.clone(), &options(true), PrepPinned::MergedPageable);
-        assert!(state().ready.is_empty());
-        assert_eq!(state().tally.late, 1);
+        prepare_in(
+            &st,
+            held.clone(),
+            &options(true),
+            PrepPinned::MergedPageable,
+        );
+        assert!(lock_state(&st).ready.is_empty());
+        assert_eq!(lock_state(&st).tally.late, 1);
         assert_eq!(Arc::strong_count(&held), 1);
     }
 
@@ -625,5 +679,26 @@ mod tests {
         assert_eq!(row(Merged), (false, true, true));
         assert_eq!(row(MergedPageable), (false, true, false));
         assert_eq!(row(All), (true, true, true));
+    }
+
+    /// Outside a tree's session a build takes nothing and records nothing,
+    /// so the default-on knob leaves other builds as they were.
+    #[test]
+    fn without_a_live_session_a_build_takes_nothing_and_records_nothing() {
+        let st = Mutex::new(State::new());
+        let held = Arc::new(Held(program()));
+        let p = held.program();
+        assert!(take_from(&st, p, PrepPinned::Merged).is_none());
+        assert!(lock_state(&st).built.is_empty(), "nothing recorded");
+        lock_state(&st).sessions = 1;
+        assert!(
+            take_from(&st, p, PrepPinned::Merged).is_none(),
+            "nothing prepared"
+        );
+        assert_eq!(
+            lock_state(&st).built,
+            vec![key_of(p)],
+            "recorded inside a session"
+        );
     }
 }
