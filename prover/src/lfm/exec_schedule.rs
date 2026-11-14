@@ -178,7 +178,9 @@ pub fn build_with_merge(program: &LfmProgram, merge: u32) -> LevelSchedule {
             // where it was.
             d = d.max(addr_depth.get(r.0 as usize).copied().unwrap_or(0));
         }
-        let is_hash = matches!(instr, Instr::Hash { .. } | Instr::Hash16(_));
+        // A lean BLAKE3 compression runs in the levels as a hash does: a
+        // recursion level is mostly them, in long independent chains.
+        let is_hash = matches!(instr, Instr::Hash { .. } | Instr::Hash16(_) | Instr::B3l(_));
         if is_hash {
             d += 1;
         }
@@ -250,7 +252,7 @@ pub fn build_with_merge(program: &LfmProgram, merge: u32) -> LevelSchedule {
     for (i, instr) in program.instrs.iter().enumerate() {
         let level = depth[i] as usize;
         record_row[i] = chip_rows.take(instr);
-        if matches!(instr, Instr::Hash { .. } | Instr::Hash16(_)) {
+        if matches!(instr, Instr::Hash { .. } | Instr::Hash16(_) | Instr::B3l(_)) {
             hash_instr[row as usize] = i as u32;
             let at = &mut hash_cursor[level];
             hash_rows[*at as usize] = row;

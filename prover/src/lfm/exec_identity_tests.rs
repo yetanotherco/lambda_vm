@@ -128,7 +128,69 @@ pub(super) fn assert_executions_identical(
     assert_rows_identical(case, "LFM_LANES", &ra.lanes, &rb.lanes);
     assert_rows_identical(case, "LFM_HINT", &ra.hint, &rb.hint);
     assert_rows_identical(case, "LFM_PUBLIC", &ra.public, &rb.public);
+    assert_rows_identical(case, "LFM_HASH16", &ra.hash16, &rb.hash16);
+    assert_rows_identical(case, "B3L_HEAD", &ra.b3l, &rb.b3l);
     assert_rows_identical(case, "public_words", &a.public_words, &b.public_words);
+}
+
+/// ★ Lean BLAKE3 compressions run in the levels as hashes do, beside width-16
+/// hash rows: a program that interleaves the two in independent chains is
+/// byte-identical under the level schedule (forking at every level of width 2
+/// or more) and the serial reference — memory, every record vector, and each
+/// chip's rows in program order, though a level holds the two chips' rows
+/// together.
+#[test]
+fn lean_compressions_and_width_16_hashes_run_in_levels_identically() {
+    use super::builder::{B3Block, B3Cv, Cell, LfmBuilder};
+    use crate::tables::types::FE;
+    let mut b = LfmBuilder::new();
+    let mut publics = Vec::new();
+    for chain in 0..6u64 {
+        let w: Vec<Cell> = (0..4u64)
+            .map(|k| b.digest_const([FE::from(chain * 100 + k); 4]).as_cell())
+            .collect();
+        let mut cv = B3Cv::Iv;
+        let mut h16 = [w[0], w[1], w[2], w[3]];
+        for step in 0..5u64 {
+            let d = b.b3_compress(
+                cv,
+                B3Block::Lanes([w[0], w[1], w[2], w[3]]),
+                64,
+                (step % 16) as u8,
+            );
+            cv = B3Cv::Words(d);
+            h16 = b.hash16(h16);
+            if step % 2 == 1 {
+                let (_, rev) =
+                    b.b3_compress_rev(B3Cv::Iv, B3Block::Felts([h16[0], h16[1]]), 64, 11);
+                publics.push(rev[0]);
+            }
+        }
+        if let B3Cv::Words(d) = cv {
+            publics.push(d[1]);
+        }
+        publics.push(h16[2]);
+    }
+    for c in &publics {
+        b.public(*c);
+    }
+    let program = super::compiler::compile(b.finish());
+    super::validator::validate(&program).expect("admissible");
+    let hasher = super::hash::HasherKind::Poseidon1W16;
+    let a = execute_scheduled(&program, &[], &hasher, Schedule::Serial).expect("serial");
+    let c = execute_scheduled(
+        &program,
+        &[],
+        &hasher,
+        Schedule::LevelParallel {
+            coalesce_below: GATE_COALESCE_BELOW,
+        },
+    )
+    .expect("levels");
+    assert_executions_identical("lean+hash16", program.num_addrs, &a, &c);
+    assert!(c.split.parallel_levels > 0, "the candidate forked");
+    assert_eq!(a.records.b3l.len(), 6 * 7);
+    assert_eq!(a.records.hash16.len(), 6 * 5);
 }
 
 /// ★ The gate. Both schedules, every case, word for word.
