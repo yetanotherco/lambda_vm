@@ -168,11 +168,13 @@ pub struct WhirTreeConfig {
     /// `W3_FAN_IN` ([`BLOCK_FAN_IN`] by default): another fan-in is another
     /// tree than the production verifier derives.
     pub fan_in: usize,
-    /// `W3_LEAF_ARTIFACTS_EACH=0|1` (default 0): the leaves' artifacts are
-    /// published all at once after the last is built while every leaf's
-    /// program is there, and each as it is built from the first leaf whose
-    /// program is not ([`publish_each`]); or (1, a measurement arm) each as it
-    /// is built throughout.
+    /// `W3_LEAF_ARTIFACTS_EACH` ([`leaves_each_setting`]): unset or `1` (the
+    /// default) publishes each leaf's artifacts as it is built, throughout;
+    /// `0` (the rollback) publishes them all at once after the last is built
+    /// while every leaf's program is there, and each as it is built from the
+    /// first leaf whose program is not ([`publish_each`]). Measured on whole
+    /// blocks against `0`: −0.44 s on a large one (its recursion −0.46 s),
+    /// −0.04 s on a median one; the proof's bytes are the same.
     pub leaves_each: bool,
     /// `LAMBDA_VM_TREE_PROGRAM_BUDGET` (`auto` by default): how many bytes of
     /// tree programs may exist ahead of their provers
@@ -285,6 +287,20 @@ fn flag_setting(name: &str, knob: Option<usize>) -> Result<bool, String> {
         None | Some(0) => Ok(false),
         Some(1) => Ok(true),
         Some(n) => Err(format!("{name}={n}: 0 or 1")),
+    }
+}
+
+/// `W3_LEAF_ARTIFACTS_EACH`'s reading ([`WhirTreeConfig::leaves_each`]): unset
+/// or `1` is each leaf's artifacts published as built (the default), `0` all
+/// at once (the rollback); any other count is an error naming the knob.
+fn leaves_each_setting(knob: Option<usize>) -> Result<bool, String> {
+    match knob {
+        None | Some(1) => Ok(true),
+        Some(0) => Ok(false),
+        Some(n) => Err(format!(
+            "W3_LEAF_ARTIFACTS_EACH={n}: 1 (each leaf's artifacts published as built, the default) or 0 \
+             (all at once)"
+        )),
     }
 }
 
@@ -456,7 +472,7 @@ impl WhirTreeConfig {
         let leaves = count_knob("W3_LEAVES")?;
         let siblings = count_knob("W3_SIBLINGS")?.unwrap_or(3);
         let fan_in = count_knob("W3_FAN_IN")?.unwrap_or(BLOCK_FAN_IN);
-        let leaves_each = flag_knob("W3_LEAF_ARTIFACTS_EACH")?;
+        let leaves_each = leaves_each_setting(count_knob("W3_LEAF_ARTIFACTS_EACH")?)?;
         let early_on = count_knob("W3_LEAF_DURING_PHASE_B")?.is_none_or(|v| v != 0);
         let early_leaves = early_leaves_setting(count_knob("W3_EARLY_LEAVES")?)?;
         let early_pool = count_knob("W3_EARLY_POOL")?.unwrap_or(EARLY_POOL_DEFAULT);
@@ -3223,7 +3239,10 @@ pub fn prove_whir_block_tree(
         "W3 LEAF ARTIFACTS: {} · first leaf proved@{first_leaf:.2} · first level-1 program@{first_program:.2} · last leaf built@{last_leaf:.2}",
         match each_from {
             None => "together (every leaf's published after the last is built)".to_string(),
-            Some(_) if cfg.leaves_each => "each published as it is built (W3_LEAF_ARTIFACTS_EACH=1)".to_string(),
+            Some(_) if cfg.leaves_each => {
+                "each published as it is built (the default; W3_LEAF_ARTIFACTS_EACH=0 publishes them together)"
+                    .to_string()
+            }
             Some(k) => format!(
                 "together until leaf {k}'s program was not there, then each published as it is built"
             ),
@@ -4367,12 +4386,11 @@ mod tests {
         assert!(early_leaves_setting(Some(0)).is_err());
     }
 
-    /// The on/off knobs (`W3_LEAF_ARTIFACTS_EACH`, `W3_NODE_TIMES`): unset and
-    /// `0` off, `1` on, any other count refused by the knob's name instead of
-    /// read as off.
+    /// An on/off knob (`W3_NODE_TIMES`): unset and `0` off, `1` on, any other
+    /// count refused by the knob's name instead of read as off.
     #[test]
     fn an_on_off_knob_takes_0_or_1_and_refuses_other_counts() {
-        for name in ["W3_LEAF_ARTIFACTS_EACH", "W3_NODE_TIMES"] {
+        for name in ["W3_NODE_TIMES"] {
             assert_eq!(flag_setting(name, None), Ok(false), "{name} unset");
             assert_eq!(flag_setting(name, Some(0)), Ok(false), "{name}=0");
             assert_eq!(flag_setting(name, Some(1)), Ok(true), "{name}=1");
@@ -4380,6 +4398,23 @@ mod tests {
                 let err = flag_setting(name, Some(n)).expect_err("not 0 or 1");
                 assert!(err.contains(name) && err.contains("0 or 1"), "{err}");
             }
+        }
+    }
+
+    /// `W3_LEAF_ARTIFACTS_EACH`: unset and `1` publish each leaf's artifacts as
+    /// built (the default), `0` all at once (the rollback); any other count is
+    /// refused by the knob's name.
+    #[test]
+    fn the_leaves_artifacts_are_published_each_by_default_and_together_at_0() {
+        assert_eq!(leaves_each_setting(None), Ok(true), "the default");
+        assert_eq!(leaves_each_setting(Some(1)), Ok(true));
+        assert_eq!(leaves_each_setting(Some(0)), Ok(false), "the rollback");
+        for n in [2, 3, 10] {
+            let err = leaves_each_setting(Some(n)).expect_err("not 0 or 1");
+            assert!(
+                err.contains("W3_LEAF_ARTIFACTS_EACH") && err.contains("or 0"),
+                "{err}"
+            );
         }
     }
 
@@ -5420,7 +5455,7 @@ mod tests {
             leaves: None,
             siblings: 3,
             fan_in: BLOCK_FAN_IN,
-            leaves_each: false,
+            leaves_each: true,
             program_budget: super::super::program_budget::BudgetSetting::Auto,
             early_on: true,
             early_leaves: EARLY_LEAVES_DEFAULT,
