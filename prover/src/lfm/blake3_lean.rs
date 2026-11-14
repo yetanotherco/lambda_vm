@@ -63,7 +63,7 @@
 //! add-chain words `a`, `c` as one cell each — 40 cells a row, for the four
 //! column G's only: the diagonal G's read the column G's outputs in the same
 //! row. The message travels as 16 word cells a row. That is what the narrow
-//! layout pays over one row a compression (I-B3CHIP §1.1).
+//! layout pays over one row a compression.
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity};
