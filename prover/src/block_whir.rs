@@ -6125,6 +6125,24 @@ fn prove_streamed(
     regen::refuse_removed_spill_words(|name| std::env::var(name).ok())?;
     // A switch that is gone refuses the prove when set, rather than being ignored.
     refuse_retired_words(|name| std::env::var(name).ok())?;
+    // Where the in-row side records are walked into: a word it does not take
+    // refuses the prove.
+    let sides_pinned = crate::tables::trace_builder::inrow_sides_pinned_setting(
+        std::env::var("LAMBDA_VM_INROW_SIDES_PINNED")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(Error::Prover)?;
+    if format.registers == crate::tables::register::RegisterFormat::InRow {
+        eprintln!(
+            "★ BLOCK IN-ROW SIDES: {} (LAMBDA_VM_INROW_SIDES_PINNED)",
+            if sides_pinned {
+                "page-locked"
+            } else {
+                "heap (the default)"
+            }
+        );
+    }
     // A card-rows word the uploads do not take refuses the prove, rather than
     // running as another mode.
     multilinear::gpu::card_rows_refusal().map_err(Error::Prover)?;
