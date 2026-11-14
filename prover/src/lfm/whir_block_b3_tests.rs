@@ -384,9 +384,10 @@ fn blake3_level0_census_on_a_real_block() {
         verify_block_whir(&proof, &elf, &opts, &cfg.format).expect("verify runs")
     });
     println!(
-        "B3 CENSUS BASE: groups {} · prove {prove_secs:.2} s · host verify {:.2} s · verified {verified}",
+        "B3 CENSUS BASE: groups {} · prove {prove_secs:.2} s · host verify {:.2} s · verified {verified} · proof bytes {}",
         proof.proof.columns.len(),
-        t.elapsed().as_secs_f64()
+        t.elapsed().as_secs_f64(),
+        rkyv::to_bytes::<rkyv::rancor::Error>(&proof).map_or(0, |b| b.len())
     );
     assert!(verified, "the host verifier accepts the BLAKE3 base");
 
@@ -440,10 +441,13 @@ fn blake3_level0_census_on_a_real_block() {
         let words = run_leaf(&plan, &proof, k);
         let exec_secs = t.elapsed().as_secs_f64();
         println!(
-            "B3 CENSUS GROUP {g}: compressions {b3l} · leaf compressions {leaf_b3l} · polys {} · stack 2^{} · cost model {} · instructions {} · group rows {:?} · leaf field main cells {field_main} (with aux {field_padded}) · leaf lean hash cells {hash_cells} · leaf hash share {:.4} · execute {exec_secs:.2} s · executed {}",
+            "B3 CENSUS GROUP {g}: compressions {b3l} · leaf compressions {leaf_b3l} · polys {} · stack 2^{} · cost model {} (argue {}, opening {}, prepared {}) · instructions {} · group rows {:?} · leaf field main cells {field_main} (with aux {field_padded}) · leaf lean hash cells {hash_cells} · leaf hash share {:.4} · execute {exec_secs:.2} s · executed {}",
             plan.group_stack(g).0,
             plan.group_stack(g).1,
             plan.costs()[g],
+            plan.cost_parts()[g][0],
+            plan.cost_parts()[g][1],
+            plan.cost_parts()[g][2],
             program.instrs.len(),
             loads[g],
             hash_cells as f64 / (hash_cells + field_main) as f64,
