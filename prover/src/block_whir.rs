@@ -1924,35 +1924,118 @@ fn parse_exec_recycle_logs(value: Option<&str>) -> Result<bool, Error> {
 /// does. Set, any of them refuses the prove ([`refuse_retired_words`]), so a
 /// script that still sets one learns it at once instead of running the default
 /// believing it ran its arm.
+#[rustfmt::skip]
 const RETIRED_WORDS: &[(&str, &str)] = &[
+    ("LAMBDA_VM_EXEC_MEMORY", "the executor keeps its memory in pages"),
+    ("LAMBDA_VM_EXEC_FIXED_ACCESS", "the executor's fixed-width access path is always on"),
+    ("LAMBDA_VM_EXEC_DMA_BULK", "the DMA ecalls always move their range in one call"),
+    ("LAMBDA_VM_EXEC_PREFAULT", "the executor writes each window into fresh buffers"),
+    ("LAMBDA_VM_ECREC_DEFER", "ECREC witnesses are always built on their own pool, off the walk"),
+    ("LAMBDA_VM_WALK_LEAN", "the lean walk always runs every part"),
+    ("LAMBDA_VM_ROUTE_FUSED", "the accumulator's fused route is always taken"),
+    ("LAMBDA_VM_WALK_SIZED", "the walk's lists are always sized from the window"),
+    ("LAMBDA_VM_WALK_BATCH", "the walk always collects 2048 cycles at a time"),
+    ("LAMBDA_VM_WALK_NO_CPU_LIST", "the walkers never keep a CPU list where the card fills CPU"),
+    ("LAMBDA_VM_WALK_COUNT", "the walkers always count where they make the rows"),
+    ("LAMBDA_VM_HANDOUT_COPY", "the hand-out always hands out the window parts the chunks lie in"),
+    ("LAMBDA_VM_HANDOUT_COUNT_THREAD", "the hand-out always counts on its own thread"),
+    ("LAMBDA_VM_BUILDER_CONCAT", "the whole-run builder always concatenates its windows in parallel"),
+    ("LAMBDA_VM_P4_SLICED", "BITWISE's per-op sources are always cut into slices"),
+    ("LAMBDA_VM_KR_PACKED_WAVE", "KECCAK_RND's packed chunks are always built at once"),
+    ("LAMBDA_VM_BLOCK_CUT_PADDING", "tables of padding rows alone are always cut after the last real row"),
+    ("LAMBDA_VM_BLOCK_LT_CONCAT", "LT's ops are never concatenated before chunking"),
+    ("LAMBDA_VM_BLOCK_LT_MERGE", "LT's memory rows are always built by merging equal neighbours"),
+    ("LAMBDA_VM_BLOCK_P4_BESIDE", "BITWISE is always counted from the built tables"),
+    ("LAMBDA_VM_BLOCK_REST_BITWISE_LAST", "BITWISE is always counted from the built tables and handed on last"),
+    ("LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES", "BITWISE's lookups are always counted from the tables' rows, BITWISE last"),
+    ("LAMBDA_VM_BLOCK_KECCAK_RND_FIRST", "KECCAK_RND's tables are always handed on first"),
+    ("LAMBDA_VM_BLOCK_GPACK", "streamed chunks are always packed as built"),
+    ("LAMBDA_VM_BLOCK_FINISH_PLAN", "the finish always runs its plan"),
+    ("LAMBDA_VM_BLOCK_FINISH_STREAM", "the finish always streams the rest"),
+    ("LAMBDA_VM_BLOCK_RECORDS_DROP", "records chunks always park and drop under regeneration"),
+    ("LAMBDA_VM_BLOCK_COMMIT_OFF_POOL", "group commits always run on the committer's own threads"),
+    ("LAMBDA_VM_BLOCK_UNVERIFIABLE_CLOCK", "a run past the 32-bit clock is always refused"),
+    ("LAMBDA_VM_BLOCK_GROUP_QUEUE", "one closed group always waits for the card"),
+    ("LAMBDA_VM_BLOCK_SPILL_RESERVE_PER_G", "the reserve is LAMBDA_VM_BLOCK_MEMORY_RESERVE_PER_G"),
+    ("LAMBDA_VM_BLOCK_REGEN_EARLY", "the regenerator always starts as soon as the chunks' fates are known"),
+    ("LAMBDA_VM_BLOCK_DERIVE_HOLD", "the verifier always drops each program once its child's shape is derived"),
+    ("BLOCK_WHIR_DROP_OPS", "the streamed chunks' ops are always dropped"),
+    ("BLOCK_WHIR_UPLOAD_AHEAD", "phase A always uploads ahead"),
+    ("BLOCK_WHIR_KR_FINISH_CHUNKS", "KECCAK_RND is always built as its finish chunks"),
+    ("BLOCK_WHIR_PACK_FINISHED", "the finish always packs its tables"),
+    ("BLOCK_WHIR_WINDOW_LOG2", "the streamed window is always 2^20 cycles"),
+    ("BLOCK_WHIR_REHASH_SERIAL", "kept-top paths are always re-hashed in parallel"),
+    ("LAMBDA_VM_ARGUE_FUSED", "the argue always runs its fused zerocheck rounds"),
+    ("LAMBDA_VM_ARGUE_INT_NODES", "the argue always takes its integer nodes"),
+    ("LAMBDA_VM_ARGUE_GKR_GRUEN", "the GKR layers always run Gruen's rounds"),
+    ("LAMBDA_VM_ARGUE_GKR_INPUT", "the GKR input layer is always built from the base columns"),
+    ("LAMBDA_VM_ARGUE_NO_LIFT", "the argue never lifts its factors"),
+    ("LAMBDA_VM_ARGUE_DEVICE_TABLES", "the argue's tables are always built on the card"),
+    ("LAMBDA_VM_ARGUE_DEVICE_COLUMNS", "the argue's columns are always evaluated on the card"),
+    ("LAMBDA_VM_ARGUE_LEAN_PROGRAM", "the argue's programs are always built on demand"),
+    ("LAMBDA_VM_ARGUE_FUSED_WIDTHS", "the fused rounds take every width"),
+    ("LAMBDA_VM_ARGUE_FUSED_LOG", "the fused rounds' timings print only under the cross-check"),
+    ("LAMBDA_VM_ARGUE_TREE_SYNC", "the tree split does not time its parts"),
+    ("LAMBDA_VM_ARGUE_BUSY_PROBE", "the argue's busy probe is gone"),
+    ("LAMBDA_VM_WHIR_COSET_OPENINGS", "a coset-ordered commitment is always revived over its stack"),
+    ("LAMBDA_VM_WHIR_COSET_INPLACE", "a coset opening always reads the stack where it lies"),
+    ("LAMBDA_VM_NO_WHIR_ROOM_PARK", "the WHIR room always parks"),
+    ("LAMBDA_VM_NO_WHIR_ROOM_RESIZE", "the WHIR room is always sized to its codeword"),
+    ("LAMBDA_VM_NO_WHIR_FUSED_FOLD", "the WHIR fold is always fused"),
+    ("LAMBDA_VM_WHIR_ENCODE_SUCCESSOR", "the first successor is always encoded"),
+    ("LFM_WHIR_KEEP_FUTILE", "retained layers are always kept through a futile miss"),
+    ("LFM_WHIR_WHOLE_TREES", "whole trees are always kept"),
+    ("LAMBDA_VM_LDE_LEGACY", "every LDE runs through the column-major engine"),
+    ("LAMBDA_VM_DEEP_INV_LEGACY", "the DEEP inverses are always row-wise up to their bound"),
+    ("LAMBDA_VM_LDE_TRANSPOSE_UNBATCHED", "run copies are always batched"),
+    ("LAMBDA_VM_STAGING_SHARED_SLAB", "staging always goes through pairs"),
+    ("LAMBDA_VM_TREE_DOWNLOAD", "trees always download through staging"),
+    ("LAMBDA_VM_RPX_WARP_MERKLE", "RPX Merkle tops always run a half-warp per parent"),
+    ("LAMBDA_VM_RPX_GRIND_QUEUE", "the RPX grind always searches through its queue"),
+    ("LAMBDA_VM_RPX_LIMB_PERMUTE", "the RPX permutation always runs on limbs"),
+    ("W3_DATAFLOW", "nodes always prove as their own children land"),
+    ("W3_STREAM_TOP", "the top always streams while a child is unproved"),
+    ("W3_EXEC_EARLY", "nodes always execute from their emitted program"),
+    ("W3_NODE_PIPE", "node programs are always built on the W3_EMIT_THREADS pool"),
+    ("W3_EXEC_BESIDE_ARTIFACTS", "leaves always execute beside their artifacts"),
+    ("W3_LEAF_FIRST", "phase B always leads with a leaf's groups when the early leaf runs"),
+    ("LFM_ARTIFACT_PARALLEL", "artifact columns are always built in parallel"),
+    ("LFM_DEVICE_ARTIFACTS", "artifact groups are always committed on the card when admitted"),
+    ("LFM_WARM_DOMAINS", "domains are always warmed before the card holds"),
+    ("LFM_VALIDATE_DENSE_COUNTS", "the validator always recounts densely"),
+    ("LAMBDA_VM_WARM_PROVE_CONSTANTS", "first-use constants are always warmed"),
+    ("LAMBDA_VM_LFM_LEAN_UPLOAD", "the socket always uploads lean rows"),
+    ("LAMBDA_VM_COMPOSITION_SUBCOSET", "composition always runs on a sub-coset"),
+    ("LAMBDA_VM_TREE_BUSY_PROBE", "the tree's busy probe is gone"),
+    ("LAMBDA_VM_SHAPE_PROFILE", "the shape profile is gone"),
+    ("LAMBDA_VM_BASE_PREP_ON_PROVER", "the epoch pipeline always prepares ahead of the prover thread"),
+    ("LAMBDA_VM_TREE_PROGRAM_BUDGET_READING", "the program budget always reads live"),
+];
+
+/// Values of live switches that are no longer settings, each with what the
+/// prove now always does instead. Set to one of them, the switch refuses the
+/// prove ([`refuse_retired_words`]); its other values are read as before.
+const RETIRED_VALUES: &[(&str, &str, &str)] = &[
     (
-        "LAMBDA_VM_BLOCK_LT_MERGE",
-        "LT's memory rows are always built by merging equal neighbours",
+        "LAMBDA_VM_ARGUE_ROUND_SLOT",
+        "0",
+        "the GKR rounds' sums are always read from the slot (`check` also compares)",
     ),
     (
-        "LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES",
-        "BITWISE's lookups are always counted from the tables' rows, BITWISE last",
+        "LAMBDA_VM_ARGUE_INPUT_REAL",
+        "0",
+        "the input layers are always kept without their padding (`check` also compares)",
     ),
     (
-        "LAMBDA_VM_BLOCK_KECCAK_RND_FIRST",
-        "KECCAK_RND's tables are always handed on first",
-    ),
-    (
-        "LAMBDA_VM_WALK_NO_CPU_LIST",
-        "the walkers never keep a CPU list where the card fills CPU",
-    ),
-    (
-        "LAMBDA_VM_WALK_COUNT",
-        "the walkers always count where they make the rows",
-    ),
-    (
-        "LAMBDA_VM_EXEC_PREFAULT",
-        "the executor writes each window into fresh buffers",
+        "LAMBDA_VM_STREAM_CLASSES",
+        "equal",
+        "the background pool always runs at the least priority (`off` turns it off)",
     ),
 ];
 
 /// [`RETIRED_WORDS`]: the first one set in `env`, whatever its value, refuses
-/// the prove, naming the word and what the prove now always does.
+/// the prove, naming the word and what the prove now always does; then a
+/// switch set to one of its [`RETIRED_VALUES`] refuses it the same way.
 fn refuse_retired_words(env: impl Fn(&str) -> Option<String>) -> Result<(), Error> {
     for &(word, now) in RETIRED_WORDS {
         if let Some(v) = env(word) {
@@ -1962,12 +2045,19 @@ fn refuse_retired_words(env: impl Fn(&str) -> Option<String>) -> Result<(), Erro
             )));
         }
     }
+    for &(word, value, now) in RETIRED_VALUES {
+        if env(word).is_some_and(|v| v.trim() == value) {
+            return Err(Error::Prover(format!(
+                "{word}={value} is no longer a setting: {now}"
+            )));
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod retired_words_tests {
-    use super::{RETIRED_WORDS, refuse_retired_words};
+    use super::{RETIRED_VALUES, RETIRED_WORDS, refuse_retired_words};
     use crate::Error;
 
     /// Each retired switch refuses the prove when set, whatever its value
@@ -1980,7 +2070,8 @@ mod retired_words_tests {
             refuse_retired_words(|n| (n == "LAMBDA_VM_BLOCK_WALKERS").then(|| "4".to_string()))
                 .is_ok()
         );
-        assert_eq!(RETIRED_WORDS.len(), 6);
+        // Every retired word is read nowhere else: the table is the whole list.
+        assert_eq!(RETIRED_WORDS.len(), 84);
         for &(word, _) in RETIRED_WORDS {
             for value in ["0", "1", "", " 0 "] {
                 let Err(Error::Prover(why)) =
@@ -1993,6 +2084,34 @@ mod retired_words_tests {
                     "{why}"
                 );
             }
+        }
+    }
+
+    /// A live switch set to a value that is no longer a setting refuses the
+    /// prove naming the switch and the value; its other values do not.
+    #[test]
+    fn a_retired_value_refuses_the_prove_and_the_others_do_not() {
+        for &(word, value, _) in RETIRED_VALUES {
+            for set in [value.to_string(), format!(" {value} ")] {
+                let Err(Error::Prover(why)) =
+                    refuse_retired_words(|n| (n == word).then(|| set.clone()))
+                else {
+                    panic!("{word}={set} must refuse the prove");
+                };
+                assert!(why.starts_with(&format!("{word}={value}")), "{why}");
+            }
+        }
+        for (word, value) in [
+            ("LAMBDA_VM_ARGUE_ROUND_SLOT", "1"),
+            ("LAMBDA_VM_ARGUE_ROUND_SLOT", "check"),
+            ("LAMBDA_VM_ARGUE_INPUT_REAL", "check"),
+            ("LAMBDA_VM_STREAM_CLASSES", "off"),
+            ("LAMBDA_VM_STREAM_CLASSES", "priority"),
+        ] {
+            assert!(
+                refuse_retired_words(|n| (n == word).then(|| value.to_string())).is_ok(),
+                "{word}={value} must prove"
+            );
         }
     }
 }

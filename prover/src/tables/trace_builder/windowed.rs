@@ -556,7 +556,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             gpack: false,
             cut_padding: CutPadding::LastTable,
             walk_batch: WALK_BATCH,
-            defer_ecrec: ecrec_deferred(),
+            defer_ecrec: true,
             count_made: true,
             cpu_listless: true,
             own_counts: WalkCounts::default(),
@@ -674,8 +674,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// relations and two chains) to a pool of its own and walk on, writing the
     /// key they recover themselves; the finish takes the witnesses before it
     /// builds a table (`true`, the default); or they compute it in the walk
-    /// (`false`). Whatever `LAMBDA_VM_ECREC_DEFER` says; the tables are the
-    /// same. The run's last
+    /// (`false`, a test's control). The tables are the same. The run's last
     /// window, walked by the finish, computes its own. Without the `parallel`
     /// feature it changes nothing.
     pub fn defer_ecrec_witnesses(mut self, on: bool) -> Self {
@@ -2586,15 +2585,6 @@ impl<T> Segments<T> {
             .flat_map(|(list, range)| list[range.clone()].iter().cloned())
             .collect()
     }
-}
-
-/// Whether the walkers hand each ECREC call's witness to a pool (unset, or
-/// anything but `0`: the default) or compute it in the walk
-/// (`LAMBDA_VM_ECREC_DEFER=0`): [`WindowedTraceBuilder::defer_ecrec_witnesses`]'s
-/// default. Read once. The tables are the same.
-fn ecrec_deferred() -> bool {
-    static DEFER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DEFER.get_or_init(|| !std::env::var("LAMBDA_VM_ECREC_DEFER").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// The cycles the walker collects and walks at a time (a test may set `0`:

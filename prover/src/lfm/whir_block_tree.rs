@@ -184,7 +184,7 @@ pub struct WhirTreeConfig {
     pub early_on: bool,
     /// `W3_EARLY_LEAVES=<n>` (default [`EARLY_LEAVES_DEFAULT`], every leaf
     /// that can): with the early leaf on and the leaves offered to phase B
-    /// (`W3_LEAF_FIRST`), phase B leads with the groups of up to `n` leaves, one
+    /// (the early leaf first), phase B leads with the groups of up to `n` leaves, one
     /// leaf after another ([`block_whir::PhaseBLead::leading`]), and each of
     /// them that completes while a group is still to come, and whose execute +
     /// fill is predicted to end before the base ([`early_leaf_fits`]), executes
@@ -222,13 +222,6 @@ pub struct WhirTreeConfig {
     /// `W3_NODE_TIMES=0|1` (default 0): the per-program stamps readout after
     /// the tree.
     pub node_times: bool,
-    /// `W3_LEAF_FIRST=0|1` (default 1): with the early leaf on, the planner
-    /// offers the leaves to phase B as soon as it has derived the plan, and
-    /// phase B takes the groups of the leaf it can finish soonest next
-    /// ([`block_whir::PhaseBLead`]); the tree's workers take that early leaf
-    /// first. Or (0, the control) phase B keeps its own order and the tree
-    /// takes the leaves in index order. Prover-only: the bytes are the same.
-    pub leaf_first: bool,
     /// `LAMBDA_VM_BLOCK_COMPRESS` (the four compression fields are
     /// [`super::compress::compress_plan`]'s; default
     /// [`super::compress::DEFAULT_PLAN`], `=0` the rollback): after the top,
@@ -560,7 +553,6 @@ impl WhirTreeConfig {
             options,
             emit_threads,
             node_times: flag_knob("W3_NODE_TIMES")?,
-            leaf_first: count_knob("W3_LEAF_FIRST")?.is_none_or(|v| v != 0),
             compress,
             compress_levers,
             compress_wire,
@@ -1746,7 +1738,7 @@ pub(crate) fn prove_tree_pipelined(
     ),
     String,
 > {
-    // With `early_first` (`W3_LEAF_FIRST`), the early leaves are taken first,
+    // With `early_first` (the early leaf first), the early leaves are taken first,
     // in the order they completed.
     let first: Vec<usize> = if early_first {
         early.iter().map(|e| e.leaf).collect()
@@ -2380,7 +2372,7 @@ pub fn prove_whir_block_tree(
             super::program_budget::READING_DEFAULT,
         )),
     };
-    // The leaves offered to phase B (`W3_LEAF_FIRST`), and when.
+    // The leaves offered to phase B (the early leaf first), and when.
     let lead = block_whir::PhaseBLead::leading(cfg.early_leaves);
     let early_leaves = cfg.early_leaves;
     // The later early leaves' pool, only when several can go early.
@@ -2391,7 +2383,11 @@ pub fn prove_whir_block_tree(
     };
     let early_pool = early_pool(early_threads)?;
     let offered_at = std::sync::Mutex::new(None::<f64>);
-    let leaf_first = cfg.leaf_first && early_on;
+    // With the early leaf on, the planner offers the leaves to phase B as soon
+    // as it has derived the plan, and phase B takes the groups of the leaf it
+    // can finish soonest next ([`block_whir::PhaseBLead`]); the tree's workers
+    // take that early leaf first. The bytes are the same either way.
+    let leaf_first = early_on;
     let (lead_ref, offered_ref) = (&lead, &offered_at);
     let (elf_ref, opts_ref, format_ref) = (elf, &opts, &format);
     // `LAMBDA_VM_LFM_PREP_PINNED`: each leaf's preprocessed groups made ready
@@ -4335,7 +4331,7 @@ pub fn verify_whir_block_tree_proof_at(
 mod tests {
     use super::*;
 
-    /// With the early leaf first (`W3_LEAF_FIRST`), the tree's order takes
+    /// With the early leaf first, the tree's order takes
     /// that leaf before every other and is otherwise [`tree_order`]'s: a
     /// permutation of the leaves alone, every node after every leaf. With no
     /// early leaf, leaf 0, or a leaf out of range it is [`tree_order`]
@@ -5431,7 +5427,6 @@ mod tests {
             options: BlockOptions::production(),
             emit_threads: 4,
             node_times: false,
-            leaf_first: true,
             compress: super::super::compress::DEFAULT_PLAN.rate,
             compress_levers: super::super::compress::DEFAULT_PLAN.levers,
             compress_wire: super::super::compress::DEFAULT_PLAN.wire,
