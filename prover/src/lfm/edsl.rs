@@ -673,6 +673,10 @@ impl WrapHash {
         }
         match self.byte_hash() {
             None => Self::algebraic_leaf_hash(b, values),
+            Some(ByteWrapHash::Blake3) if b.b3_lean() => {
+                assert!(!values.is_empty(), "a leaf covers at least one column");
+                b3_felt_chain(b, ChainStart::Iv, 0, values, 8 * values.len())
+            }
             Some(h) => {
                 let (stream, len_bytes) = leaf_stream(b, values);
                 h.hash_bytes(b, &stream, len_bytes)
@@ -769,6 +773,19 @@ impl WrapHash {
     pub fn hash_pair(self, b: &mut LfmBuilder, left: WrapDigest, right: WrapDigest) -> WrapDigest {
         match self.byte_hash() {
             None => Self::algebraic_hash_pair(b, left, right),
+            Some(ByteWrapHash::Blake3) if b.b3_lean() => {
+                // One block, the two digests' four words as they stand: no
+                // `Unpack` or `Pack`, the head range-checks every lane.
+                let (out, _) = b3_lean_compress(
+                    b,
+                    ChainStart::Iv,
+                    super::builder::B3Block::Lanes([left[0], left[1], right[0], right[1]]),
+                    (2 * COMMITMENT_BYTES) as u32,
+                    super::blake3::chain::FLAGS_ONE_BLOCK,
+                    false,
+                );
+                WrapDigest::from_pair(out[0], out[1])
+            }
             Some(h) => {
                 let stream = parent_stream(b, left, right);
                 h.hash_bytes(b, &stream, 2 * COMMITMENT_BYTES)
@@ -1301,13 +1318,123 @@ pub fn blake3_256_resumed(
         "a resumed chain skips at least one block and leaves at least one"
     );
     let _ = b.felt_const(FE::zero());
-    let h: [Cell; 2] = core::array::from_fn(|w| {
-        b.digest_const(core::array::from_fn(|l| {
-            FE::from(u64::from(midstate[4 * w + l]))
-        }))
-        .as_cell()
-    });
-    blake3_chain_from(b, h, skip, stream, len_bytes, false).0
+    let h = midstate_words(b, midstate);
+    blake3_chain_from(b, ChainStart::Words(h), skip, stream, len_bytes, false).0
+}
+
+/// A chaining value of program constants as its two interned words.
+fn midstate_words(b: &mut LfmBuilder, cv: &[u32; 8]) -> [Cell; 2] {
+    core::array::from_fn(|w| {
+        b.digest_const(core::array::from_fn(|l| FE::from(u64::from(cv[4 * w + l]))))
+            .as_cell()
+    })
+}
+
+/// [`blake3_256_resumed`] over FELTS rather than their halves: `Blake3Std(
+/// prefix ‖ values)`, each value its canonical eight big-endian bytes, the
+/// prefix's `skip` blocks already the chaining value `midstate`. On a lean
+/// builder the values enter as `Felts` blocks (no `BitDec` a value); otherwise
+/// through [`leaf_stream`].
+pub fn blake3_felts_resumed(
+    b: &mut LfmBuilder,
+    midstate: &[u32; 8],
+    skip: usize,
+    values: &[Felt],
+) -> Blake3Digest {
+    use super::blake3::chain::BLOCK_LEN;
+    if b.b3_lean() {
+        let _ = b.felt_const(FE::zero());
+        let h = midstate_words(b, midstate);
+        return b3_felt_chain(
+            b,
+            ChainStart::Words(h),
+            skip,
+            values,
+            skip * BLOCK_LEN + 8 * values.len(),
+        );
+    }
+    let (stream, len_bytes) = leaf_stream(b, values);
+    blake3_256_resumed(b, midstate, skip, &stream, skip * BLOCK_LEN + len_bytes)
+}
+
+/// Where a BLAKE3 chain starts: BLAKE3's IV, or a chaining value held in two
+/// words (constants: the IV interned, or a prefix's midstate).
+#[derive(Clone, Copy)]
+enum ChainStart {
+    Iv,
+    Words([Cell; 2]),
+}
+
+/// The lean tables' one compression of the chain: the chaining value (the IV
+/// row reads none), the block, and the framing's `block_len` and flags.
+fn b3_lean_compress(
+    b: &mut LfmBuilder,
+    cv: ChainStart,
+    block: super::builder::B3Block,
+    block_len: u32,
+    flags: u32,
+    want_rev: bool,
+) -> ([Cell; 2], Option<[Cell; 2]>) {
+    use super::builder::B3Cv;
+    let cv = match cv {
+        ChainStart::Iv => B3Cv::Iv,
+        ChainStart::Words(w) => B3Cv::Words(w),
+    };
+    let block_len = u8::try_from(block_len).expect("a block is at most 64 bytes");
+    let flags = u8::try_from(flags).expect("BLAKE3's flags are one byte");
+    if want_rev {
+        let (d, rev) = b.b3_compress_rev(cv, block, block_len, flags);
+        (d, Some(rev))
+    } else {
+        (b.b3_compress(cv, block, block_len, flags), None)
+    }
+}
+
+/// `Blake3Std` over `values`' canonical big-endian bytes from block `first`
+/// of a `len_bytes`-byte message (the blocks before it already `start`), each
+/// block eight felts as two `Felts` words on the lean tables — the head
+/// renders and range-checks the bytes, so no `BitDec` is emitted. A block past
+/// the values is zero felts: zero bytes, BLAKE3's own padding, under the
+/// block's true `block_len`. Each felt is packed into its word by a `Pack`,
+/// which receives it as a base token: a hinted value's upper lanes are pinned
+/// to zero there.
+fn b3_felt_chain(
+    b: &mut LfmBuilder,
+    start: ChainStart,
+    first: usize,
+    values: &[Felt],
+    len_bytes: usize,
+) -> Blake3Digest {
+    use super::blake3::chain::{BLOCK_LEN, block_flags, block_len_of, num_blocks};
+    use super::builder::B3Block;
+    const FELTS_PER_BLOCK: usize = BLOCK_LEN / 8;
+    assert_eq!(
+        len_bytes - first * BLOCK_LEN,
+        8 * values.len(),
+        "the values are the message past the skipped blocks"
+    );
+    let zero = b.felt_const(FE::zero());
+    let blocks = num_blocks(len_bytes);
+    let mut cv = start;
+    for block in first..blocks {
+        let at = (block - first) * FELTS_PER_BLOCK;
+        let felt = |k: usize| values.get(at + k).copied().unwrap_or(zero);
+        let w0 = b.pack_word([felt(0), felt(1), felt(2), felt(3)]);
+        let w1 = b.pack_word([felt(4), felt(5), felt(6), felt(7)]);
+        let (out, _) = b3_lean_compress(
+            b,
+            cv,
+            B3Block::Felts([w0, w1]),
+            block_len_of(block, len_bytes),
+            block_flags(block, blocks),
+            false,
+        );
+        cv = ChainStart::Words(out);
+    }
+    match cv {
+        ChainStart::Words([d0, d1]) => WrapDigest::from_pair(d0, d1),
+        ChainStart::Iv => unreachable!("a chain compresses at least one block"),
+    }
 }
 
 /// [`blake3_256`] returning BOTH digests — plain and byte-reversed — off the one
@@ -1354,6 +1481,10 @@ fn blake3_absorb_all(
     // The zero cell first, then the IV: interning emits a `Const` at first use,
     // so this order is the program's (the chain's own lookup below is a hit).
     let _ = b.felt_const(FE::zero());
+    if b.b3_lean() {
+        // The lean IV row reads no chaining value: nothing to intern.
+        return blake3_chain_from(b, ChainStart::Iv, 0, stream, len_bytes, want_rev);
+    }
     // The initial chaining value: `BLAKE3_IV` as two interned constants. `h` is
     // `u32` words 0..8, so word 0 is `IV[0..4]` and word 1 is `IV[4..8]`.
     let iv_word = |b: &mut LfmBuilder, w: usize| -> Cell {
@@ -1363,7 +1494,7 @@ fn blake3_absorb_all(
         .as_cell()
     };
     let h: [Cell; 2] = [iv_word(b, 0), iv_word(b, 1)];
-    blake3_chain_from(b, h, 0, stream, len_bytes, want_rev)
+    blake3_chain_from(b, ChainStart::Words(h), 0, stream, len_bytes, want_rev)
 }
 
 /// The chain of [`blake3_absorb_all`] from chaining value `h` at block
@@ -1372,7 +1503,7 @@ fn blake3_absorb_all(
 /// whole message's chain, row for row.
 fn blake3_chain_from(
     b: &mut LfmBuilder,
-    mut h: [Cell; 2],
+    start: ChainStart,
     first: usize,
     stream: &[Felt],
     len_bytes: usize,
@@ -1395,6 +1526,8 @@ fn blake3_chain_from(
     let zero = b.felt_const(FE::zero());
     let blocks = num_blocks(len_bytes);
     let mut rev: Option<[Cell; 2]> = None;
+    let lean = b.b3_lean();
+    let mut cv = start;
 
     for block in first..blocks {
         // Half `h` of this block is half `(block − first) * 16 + h` of the
@@ -1408,6 +1541,28 @@ fn blake3_chain_from(
             };
             b.pack_word([lane(0), lane(1), lane(2), lane(3)])
         });
+
+        let last = block + 1 == blocks;
+        if lean {
+            // The lean tables' row: `block_len` and the flags are the row's
+            // constants, the chaining value the IV or the last digest.
+            let (out, rev_words) = b3_lean_compress(
+                b,
+                cv,
+                super::builder::B3Block::Lanes(message),
+                block_len_of(block, len_bytes),
+                block_flags(block, blocks),
+                last && want_rev,
+            );
+            if rev_words.is_some() {
+                rev = rev_words;
+            }
+            cv = ChainStart::Words(out);
+            continue;
+        }
+        let ChainStart::Words(h) = cv else {
+            unreachable!("LFM_BLAKE3 reads its chaining value from two words")
+        };
 
         // `(t_lo, t_hi, block_len, flags)`. `t = 0` at every block: the
         // construction is a single chunk that never ends (PA-PLAN §1.7, F1).
@@ -1430,10 +1585,13 @@ fn blake3_chain_from(
         // The next block's chaining value is `out[0..8]` — output words 0 and 1
         // — and so is the digest when this was the last block. One and the same,
         // which is what the truncation to `[out[0], out[1]]` says.
-        h = [out[0], out[1]];
+        cv = ChainStart::Words([out[0], out[1]]);
     }
 
-    (WrapDigest::from_pair(h[0], h[1]), rev)
+    match cv {
+        ChainStart::Words([d0, d1]) => (WrapDigest::from_pair(d0, d1), rev),
+        ChainStart::Iv => unreachable!("a chain compresses at least one block"),
+    }
 }
 
 fn keccak256_absorb_all(

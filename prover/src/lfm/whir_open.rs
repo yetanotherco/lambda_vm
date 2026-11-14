@@ -400,8 +400,9 @@ pub fn emit_blake3_joint_leaf(b: &mut LfmBuilder, felts: &[Felt], blocks: usize)
     );
     let per_block = felts.len() / blocks;
     let midstate = joint_leaf_midstate(blocks as u64, per_block as u64, BYTES_PER_BASE as u64);
-    let (stream, len_bytes) = edsl::leaf_stream(b, felts);
-    edsl::blake3_256_resumed(b, &midstate, 1, &stream, JOINT_LEAF_PREFIX_LEN + len_bytes)
+    // The prefix is exactly the one block the midstate stands for.
+    const _: () = assert!(JOINT_LEAF_PREFIX_LEN == super::blake3::chain::BLOCK_LEN);
+    edsl::blake3_felts_resumed(b, &midstate, 1, felts)
 }
 
 /// Bytes a base value streams as in a leaf: its canonical `u64`, big-endian.
