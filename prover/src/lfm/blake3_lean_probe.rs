@@ -1,5 +1,6 @@
 //! Prove + verify the lean, narrow BLAKE3 chip ([`super::blake3_lean`])
-//! standalone, and time it on the card (I-B3CHIP: D-B3-3 S3 and S4).
+//! standalone: its census against the design's closed form, its proofs and
+//! refusals on the host, and its cost on the card.
 //!
 //! The `blake3_probe` pattern: the chip's real interactions and constraints,
 //! its fixed table, and a synthetic `LfmMem` mirror standing in for the
@@ -188,8 +189,8 @@ fn leaf_ops(felts: &[u64], a: &mut Addrs) -> Vec<LeanOp> {
 }
 
 /// A leaf-shaped mix: per group, one 64-felt base leaf (8 chained
-/// compressions in leaf mode) and 16 Merkle parents, D-B3-3 §3.1's ratio for a
-/// base query round (an 8-compression leaf and a 14–17-compression path).
+/// compressions in leaf mode) and 16 Merkle parents, a base query round's
+/// ratio (an 8-compression leaf and a 14–17-compression path).
 /// Truncated to `n` compressions; a tail shorter than a leaf is parents.
 fn mixed_ops(n: usize, seed: u64) -> Vec<LeanOp> {
     let mut rng = Rng(seed | 1);
@@ -658,7 +659,8 @@ fn row_cells(main: usize, interactions: usize) -> usize {
 }
 
 /// ★ S3's census: the built layout against the pre-registered closed form
-/// (I-B3CHIP §1.1), and the pieces of the per-compression cell bill.
+/// (the chip design's cells a compression), and the pieces of the
+/// per-compression cell bill.
 #[test]
 fn the_lean_chip_census_matches_its_closed_form() {
     let round_i = lean::round_interactions().len();
@@ -703,7 +705,7 @@ fn the_lean_chip_census_matches_its_closed_form() {
     assert_eq!((rm, ra), (round::NUM_COLUMNS, 65));
     assert_eq!((hm, ha), (head::NUM_COLUMNS, 43));
 
-    // The pieces (I-B3CHIP §1.1), each as cells a compression.
+    // The pieces of the cell bill, each as cells a compression.
     let core_g = ROUNDS * 8 * (40 + 3 * 8); // 16 lookups = 8 aux a G
     let carried = ROUNDS * (40 + 16);
     let tokens = ROUNDS * 3; // two interactions a row = one aux column
@@ -722,8 +724,8 @@ fn the_lean_chip_census_matches_its_closed_form() {
          aux {t_a} · {} cells in all\n\
          B3R CENSUS PIECES: G core {core_g} · carried state + message {carried} · round tokens \
          {tokens} · head {}\n\
-         B3R CENSUS AGAINST: today's LFM_HASH BLAKE3 socket 5,545 (×{:.3}) · D-B3-3 lean \
-         3,800 (×{:.3}) · its band 3,300–4,300",
+         B3R CENSUS AGAINST: today's LFM_HASH BLAKE3 socket 5,545 (×{:.3}) · the lean design's \
+         estimate 3,800 (×{:.3}) · its band 3,300–4,300",
         100.0 * aux_share,
         round::MAIN_COLUMNS,
         round_i.div_ceil(2),
@@ -1237,7 +1239,8 @@ fn the_child_check_hash_ratio_of_narrow_tables() {
     let socket = synthetic("P1_SOCKET", 329, 13, 8, &opts);
     let s_p1 = under(&socket, 1 << 19, p1_geom, super::edsl::WrapHash::Poseidon1);
     println!("\nB3R CHILD CHECK P1 SOCKET (329 cols, 2^19 rows, P1 4-ary C2): {s_p1} permutations");
-    // D-B3-3's non-hash leaf tables, at the median leaf's heights (aux: 2 ext columns each, I).
+    // The lean design's non-hash leaf tables, at the median leaf's heights (aux: 2 ext
+    // columns each, inferred).
     let mut p1_sum = 0usize;
     let mut b3_sum = 0usize;
     for (name, main, log) in [
@@ -1268,7 +1271,7 @@ fn the_child_check_hash_ratio_of_narrow_tables() {
     );
 }
 
-/// The child check under the format levers D-B3-3 names: one-row openings
+/// The child check under the proof-format levers: one-row openings
 /// (auto per table, or on) and blowup 8 at its own 128-bit query count — the
 /// lean tables of a 2^18-compression leaf, and the non-hash tables' BLAKE3 cost
 /// against today's Poseidon1 one (`r`).
