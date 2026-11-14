@@ -229,7 +229,8 @@ impl WhirTranscript {
         }
         if let Some(t) = &mut self.bytes {
             for felt in felts {
-                t.append_felt(b, *felt);
+                let halves = super::transcript_replay::felt_be_halves(b, *felt);
+                append_runtime_halves(t, &halves);
             }
             return;
         }
@@ -286,7 +287,7 @@ impl WhirTranscript {
                 "a BLAKE3 digest is two words of u32 lanes"
             );
             let halves: Vec<Felt> = lanes.iter().flatten().copied().collect();
-            t.append_halves(&halves);
+            append_runtime_halves(t, &halves);
             return;
         }
         assert_eq!(
@@ -475,6 +476,19 @@ impl WhirTranscript {
     }
 }
 
+/// Machine `u32` halves into the BLAKE3 segment: as they stand when the
+/// segment is on a 4-byte boundary (no row), spliced byte-wise by the packer
+/// when a constant run before them left it off one
+/// (`TranscriptReplay::append_halves_misaligned`). Either way the bytes are the
+/// host's: the byte sponge has no boundary of its own.
+fn append_runtime_halves(t: &mut TranscriptReplay, halves: &[Felt]) {
+    if t.segment_len().is_multiple_of(4) {
+        t.append_halves(halves);
+    } else {
+        t.append_halves_misaligned(halves);
+    }
+}
+
 /// Constant bytes as the felts `sponge_leaf_bytes` would read: 8-byte
 /// BIG-endian groups, the trailing partial group zero-extended on the LOW side
 /// (`rpx/mod.rs:396-406` writes the available bytes at the FRONT of a zeroed
@@ -562,6 +576,32 @@ pub struct SpongeEntry {
     /// The Poseidon1 sponge's state instead, when the program verifies a
     /// Poseidon1 base (the two fields above are then unused).
     pub p1: Option<P1SpongeEntry>,
+    /// The BLAKE3 byte sponge's state instead, when the program verifies a
+    /// 7-round BLAKE3 base (the first two fields are then unused).
+    pub bytes: Option<ByteSpongeEntry>,
+}
+
+/// Where the BLAKE3 byte sponge stands (`DefaultTranscript<_,
+/// Blake3StdTranscriptHash>`): bytes absorbed since the last squeeze, and
+/// 64-bit candidates of the last squeeze handed out
+/// ([`CANDIDATES_PER_SQUEEZE`] = none in hand).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteSpongeEntry {
+    pub segment: usize,
+    pub out_pos: usize,
+}
+
+/// Bytes a squeeze re-absorbs: its 32 reversed digest bytes.
+const SQUEEZE_BYTES: usize = 32;
+
+/// 64-bit candidates one BLAKE3 coordinate draws
+/// (`Blake3StdTranscriptHash::CANDIDATES_PER_COORDINATE`).
+const BYTE_CANDIDATES_PER_COORDINATE: usize = 2;
+
+/// BLAKE3 compressions a `Blake3Std` hash of `len` bytes costs: one a 64-byte
+/// block, and one for the empty message (`chain::num_blocks`).
+const fn byte_hash_compressions(len: usize) -> usize {
+    crypto::hash::blake3::chain::num_blocks(len)
 }
 
 /// Where a Poseidon1 sponge stands (`poseidon1_stark::Transcript`): lanes
@@ -580,6 +620,7 @@ impl SpongeEntry {
             buffered_felts: 0,
             out_pos: CANDIDATES_PER_SQUEEZE,
             p1: None,
+            bytes: None,
         }
     }
 
@@ -591,6 +632,13 @@ impl SpongeEntry {
                 p1: Some(P1SpongeEntry {
                     pending: 0,
                     unread: 0,
+                }),
+                ..Self::fresh()
+            },
+            WrapHash::Blake3 => Self {
+                bytes: Some(ByteSpongeEntry {
+                    segment: 0,
+                    out_pos: CANDIDATES_PER_SQUEEZE,
                 }),
                 ..Self::fresh()
             },
@@ -642,6 +690,8 @@ pub struct SpongeSchedule {
     hashes: Vec<SpongeHash>,
     /// The Poseidon1 sponge instead, and the permutations it has spent.
     p1: Option<(P1SpongeEntry, usize)>,
+    /// The BLAKE3 byte sponge instead, and the compressions it has spent.
+    bytes: Option<(ByteSpongeEntry, usize)>,
 }
 
 /// Lanes of rate in a Poseidon1 sponge block, and lanes one permutation's
@@ -656,6 +706,7 @@ impl SpongeSchedule {
             out_pos: entry.out_pos,
             hashes: Vec::new(),
             p1: entry.p1.map(|p| (p, 0)),
+            bytes: entry.bytes.map(|t| (t, 0)),
         }
     }
 
@@ -663,6 +714,12 @@ impl SpongeSchedule {
     /// buffered squeeze output is dropped (`:205-210`). Under Poseidon1, each
     /// felt is a lane: a full rate permutes (`Transcript::put1`).
     pub fn absorb(&mut self, felts: usize) {
+        if let Some((t, _)) = &mut self.bytes {
+            // A felt is its eight big-endian bytes.
+            t.segment += BYTES_PER_FELT * felts;
+            t.out_pos = CANDIDATES_PER_SQUEEZE;
+            return;
+        }
         if let Some((p, perms)) = &mut self.p1 {
             for _ in 0..felts {
                 p.pending += 1;
@@ -683,12 +740,19 @@ impl SpongeSchedule {
     /// before them.
     pub fn absorb_root(&mut self) {
         let len = usize::from(self.p1.is_some());
+        // Under BLAKE3 the 32 bytes are four felts' worth: the same count.
         self.absorb(len + DIGEST_FELTS);
     }
 
     /// `sample()`: the buffer is hashed, and the digest is re-absorbed — which
     /// is why the buffer is FOUR felts afterwards and not none (`:104-110`).
     pub fn squeeze(&mut self) {
+        if let Some((t, compressions)) = &mut self.bytes {
+            *compressions += byte_hash_compressions(t.segment);
+            t.segment = SQUEEZE_BYTES;
+            t.out_pos = 0;
+            return;
+        }
         self.hashes.push(SpongeHash::Squeeze(self.buffered));
         self.buffered = DIGEST_FELTS;
         self.out_pos = 0;
@@ -696,6 +760,15 @@ impl SpongeSchedule {
 
     /// `next_sample_u64`: refill only when nothing is in hand.
     pub fn candidate(&mut self) {
+        if let Some((t, _)) = &self.bytes {
+            if t.out_pos >= CANDIDATES_PER_SQUEEZE {
+                self.squeeze();
+            }
+            if let Some((t, _)) = &mut self.bytes {
+                t.out_pos += 1;
+            }
+            return;
+        }
         if let Some((p, perms)) = &mut self.p1 {
             if p.unread == 0 {
                 *perms += 1;
@@ -714,7 +787,13 @@ impl SpongeSchedule {
     /// `sample_field_element` on the cubic extension: one candidate a
     /// coordinate, no rejection (`CANDIDATES_PER_COORDINATE = Some(1)`).
     pub fn draw_ext(&mut self) {
-        for _ in 0..COORDINATES_PER_EXT {
+        // Two candidates a coordinate under BLAKE3, drawn whichever lands.
+        let per = if self.bytes.is_some() {
+            BYTE_CANDIDATES_PER_COORDINATE
+        } else {
+            1
+        };
+        for _ in 0..COORDINATES_PER_EXT * per {
             self.candidate();
         }
     }
@@ -725,6 +804,14 @@ impl SpongeSchedule {
     /// eight big-endian bytes.
     pub fn grind(&mut self, bits: usize) {
         if bits == 0 {
+            return;
+        }
+        if let Some((t, compressions)) = &mut self.bytes {
+            // `state()` over the segment, then the nonce's eight bytes. The
+            // nonce check's own two compressions are the chain's grind term
+            // (`whir_chain::chain_grind_perms`), as on the RPX arm.
+            *compressions += byte_hash_compressions(t.segment);
+            self.absorb(NONCE_FELTS);
             return;
         }
         if let Some((p, perms)) = &mut self.p1 {
@@ -758,6 +845,7 @@ impl SpongeSchedule {
             buffered_felts: self.buffered,
             out_pos: self.out_pos,
             p1: self.p1.map(|(p, _)| p),
+            bytes: self.bytes.map(|(t, _)| t),
         }
     }
 
@@ -768,6 +856,12 @@ impl SpongeSchedule {
         if let Some((_, perms)) = self.p1 {
             return 4 * perms;
         }
+        if let Some((_, compressions)) = self.bytes {
+            // An estimate, as Poseidon1's: a compression's four message
+            // `Pack`s and its row (the felts' `BitDec`s are not in it); the
+            // census reads the emitted program.
+            return 5 * compressions;
+        }
         self.hashes.iter().map(|hash| hash.rows()).sum()
     }
 
@@ -775,6 +869,9 @@ impl SpongeSchedule {
     pub fn perms(&self) -> usize {
         if let Some((_, perms)) = self.p1 {
             return perms;
+        }
+        if let Some((_, compressions)) = self.bytes {
+            return compressions;
         }
         self.hashes.iter().map(|hash| hash.perms()).sum()
     }
