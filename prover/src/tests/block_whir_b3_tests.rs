@@ -129,6 +129,25 @@ fn a_blake3_base_needs_the_base_only_permit_and_never_reaches_the_recursion() {
     );
     want.extend_from_slice(b"/F9");
     assert_eq!(block_statement_tag(&b3), want);
+    // A BLAKE3 format's tag names its group size; Poseidon1's is its base's.
+    let at = |base: BaseFormat, group_polys: usize| {
+        crate::block_whir::block_format_tag(&BlockFormat {
+            zf: ZfFormat::DEFAULT.with_base(base),
+            group_polys,
+            ..BlockFormat::pinned()
+        })
+    };
+    let mut four = want.clone();
+    four.extend_from_slice(b"/G4");
+    assert_eq!(at(b3, 4), four);
+    let mut three = want.clone();
+    three.extend_from_slice(b"/G3");
+    assert_eq!(at(b3, 3), three);
+    assert_eq!(
+        at(BaseFormat::P1_WHIR, 3),
+        block_statement_tag(&BaseFormat::P1_WHIR),
+        "Poseidon1's tag does not move"
+    );
     assert_ne!(
         block_statement_tag(&b3),
         block_statement_tag(&BaseFormat::P1_WHIR)
@@ -365,5 +384,19 @@ fn the_blake3_base_final_knob_reads_its_words_and_refuses_the_rest() {
     }
     for word in ["", "1", "6", "10", "yes"] {
         assert!(b3_base_final_setting(Some(word)).is_err(), "{word:?}");
+    }
+}
+
+/// The BLAKE3 base's group-size knob: unset and `4` are the base's four, `3`
+/// is Poseidon1's three, and anything else is refused.
+#[test]
+fn the_blake3_base_group_knob_reads_its_words_and_refuses_the_rest() {
+    use crate::block_whir::{B3_BASE_GROUP_POLYS, b3_base_group_setting};
+    assert_eq!(B3_BASE_GROUP_POLYS, 4);
+    for (word, want) in [(None, 4), (Some("4"), 4), (Some(" 4 "), 4), (Some("3"), 3)] {
+        assert_eq!(b3_base_group_setting(word), Ok(want), "{word:?}");
+    }
+    for word in ["", "2", "5", "four", "0"] {
+        assert!(b3_base_group_setting(Some(word)).is_err(), "{word:?}");
     }
 }

@@ -1368,6 +1368,12 @@ fn cmd_prove_block_base(
             prover::block_whir::b3_base_final(),
             prover::block_whir::B3_BASE_FINAL_ENV
         );
+        eprintln!(
+            "BLOCK BASE GROUP POLYS: {} ({} reads 4 or 3) · tag {}",
+            cfg.format.group_polys,
+            prover::block_whir::B3_BASE_GROUP_ENV,
+            String::from_utf8_lossy(&prover::block_whir::block_format_tag(&cfg.format))
+        );
     }
     eprintln!(
         "BLOCK BASE ONLY: base {:?} · group {group} · blowup {blowup} · leaves {leaves} · trees \

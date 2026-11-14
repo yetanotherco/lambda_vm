@@ -397,10 +397,12 @@ fn blake3_level0_census_on_a_real_block() {
         WhirBlockPlan::derive_blake3(&elf, &opts, &cfg.format, proof.statement(), groups, None)
             .expect("the BLAKE3 plan derives");
     println!(
-        "B3 CENSUS PLAN: {} groups · {} leaves · derived {:.2} s",
+        "B3 CENSUS PLAN: {} groups · {} leaves · derived {:.2} s · group polys {} · tag {}",
         plan.num_groups(),
         plan.partition().num_leaves(),
-        t.elapsed().as_secs_f64()
+        t.elapsed().as_secs_f64(),
+        cfg.format.group_polys,
+        String::from_utf8_lossy(&crate::block_whir::block_format_tag(&cfg.format))
     );
     assert!(
         (0..plan.partition().num_leaves()).all(|k| plan.partition().leaf(k).len() == 1),
