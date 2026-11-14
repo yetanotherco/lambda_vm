@@ -721,7 +721,13 @@ fn fill_narrow_direct<'p>(
             }
             let mut rows = zeroed_fe_vec(l::ROUNDS * width);
             let mut skip = TableHist::default();
-            for k in lo / l::ROUNDS..hi.div_ceil(l::ROUNDS) {
+            let k_lo = lo / l::ROUNDS;
+            for (k, record) in records
+                .iter()
+                .enumerate()
+                .take(hi.div_ceil(l::ROUNDS))
+                .skip(k_lo)
+            {
                 let (_, block_len, flags) = consts(k);
                 rows.iter_mut().for_each(|v| *v = FE::zero());
                 let counted = if (lo..hi).contains(&(l::ROUNDS * k)) {
@@ -732,7 +738,7 @@ fn fill_narrow_direct<'p>(
                 lean::fill_rounds(
                     &mut rows,
                     l::tag_for_row(k),
-                    &records[k],
+                    record,
                     block_len,
                     flags,
                     None,
@@ -761,11 +767,11 @@ fn fill_narrow_direct<'p>(
         let (packed, part) = fill_narrow(size, &widths, |first, len, scratch, hist| {
             let lo = chunk_start + first;
             let hi = (lo + len).min(n);
-            for k in lo..hi {
+            for (k, record) in records.iter().enumerate().take(hi).skip(lo) {
                 let (prep, block_len, flags) = consts(k);
-                let fs = lean::final_state(&records[k], block_len, flags);
+                let fs = lean::final_state(record, block_len, flags);
                 let at = (k - lo) * width;
-                lean::fill_head(&mut scratch[at..at + width], prep, &records[k], &fs, hist);
+                lean::fill_head(&mut scratch[at..at + width], prep, record, &fs, hist);
             }
         })?;
         hist = hist.merge(&part);
