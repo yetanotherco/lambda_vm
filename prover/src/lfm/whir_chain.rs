@@ -92,10 +92,10 @@ use stark::config::Commitment;
 
 use super::algebraic_commit::commitment_to_digest;
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
-use super::edsl::WrapDigest;
+use super::edsl::{WrapDigest, WrapHash};
 use super::whir_fold::{RoundFold, fold_coset_rows_lean, lean_prepare_rows};
 use super::whir_open::{
-    BlockValues, CapCells, Siblings, TreeAuth, cap_check_perms, cap_check_rows,
+    BlockValues, CapCells, RootLanes, Siblings, TreeAuth, cap_check_perms, cap_check_rows,
     verify_opening_perms_capped, verify_opening_rows_capped,
 };
 use super::whir_poly::{
@@ -132,9 +132,10 @@ pub struct RoundNonces {
 pub struct ChainRoundWires<'a> {
     /// `k_r` sumcheck rounds, each carrying `SUMCHECK_DEGREE` evaluations.
     pub sumcheck: &'a [Vec<Ext>],
-    /// The successor's root as a word. `None` on the last round, where the
-    /// folded message is a constant and `final_value` is sent instead.
-    pub next_root: Option<Cell>,
+    /// The successor's root, in the builder's digest width. `None` on the
+    /// last round, where the folded message is a constant and `final_value` is
+    /// sent instead.
+    pub next_root: Option<WrapDigest>,
     /// The successor's value at the out-of-domain point. `None` on the last
     /// round.
     pub ood_value: Option<Ext>,
@@ -200,6 +201,12 @@ pub struct ChainShape {
     /// ONE tree whose leaf holds every polynomial's block, end to end
     /// ([`Self::joint`]).
     pub round0: Round0Trees,
+    /// Arena words one Merkle node (a root, a cap node, a path sibling)
+    /// occupies: one under the felt hashes (four canonical felts), two under
+    /// BLAKE3 (eight `u32` lanes) — `edsl::digest_words` of the builder the
+    /// chain is emitted by, and the width [`push_round_words`] lays a node out
+    /// in.
+    pub digest_words: usize,
 }
 
 /// How a block's recursion leaf checks a chain's queries: a verifier
@@ -257,6 +264,7 @@ impl ChainShape {
             domain_log,
             num_vars,
             num_queries: config.num_queries,
+            digest_words: 1,
             caps,
             grind: (
                 config.grind.folding as usize,
@@ -269,6 +277,15 @@ impl ChainShape {
             trees: 1,
             leaves: config.format.leaves,
             round0: config.format.round0,
+        }
+    }
+
+    /// [`Self::new_at`] for a chain a builder under `hash` emits: the hash's
+    /// arity and digest width.
+    pub fn for_hash(config: &ChainConfig, num_vars: usize, hash: WrapHash) -> Self {
+        Self {
+            digest_words: if hash.one_cell_digest() { 1 } else { 2 },
+            ..Self::new_at(config, num_vars, hash.arity())
         }
     }
 
@@ -846,7 +863,7 @@ pub fn emit_verify_weighted(
     b: &mut LfmBuilder,
     transcript: &mut WhirTranscript,
     rounds: &[ChainRoundWires<'_>],
-    root_lanes: &[Felt; 4],
+    root: impl Into<RootLanes>,
     final_value: Ext,
     y: Ext,
     shape: &ChainShape,
@@ -861,7 +878,7 @@ pub fn emit_verify_weighted(
         b,
         transcript,
         rounds,
-        std::slice::from_ref(root_lanes),
+        &[root.into()],
         final_value,
         y,
         shape,
@@ -888,7 +905,7 @@ pub fn emit_verify_grouped(
     b: &mut LfmBuilder,
     transcript: &mut WhirTranscript,
     rounds: &[ChainRoundWires<'_>],
-    roots: &[[Felt; 4]],
+    roots: &[RootLanes],
     final_value: Ext,
     y: Ext,
     shape: &ChainShape,
@@ -920,7 +937,7 @@ fn emit_chain(
     b: &mut LfmBuilder,
     transcript: &mut WhirTranscript,
     rounds: &[ChainRoundWires<'_>],
-    roots: &[[Felt; 4]],
+    roots: &[RootLanes],
     final_value: Ext,
     y: Ext,
     shape: &ChainShape,
@@ -1028,8 +1045,13 @@ fn emit_chain(
         onechain_steps::mark(b, onechain_steps::Step::Ood { round: r });
         let next_tree = match (round.next_root, round.ood_value, shape.next_depth(r)) {
             (Some(next_root), Some(y0), Some(_)) => {
-                let lanes = b.unpack(next_root);
-                transcript.absorb_root_lanes(b, &lanes);
+                assert_eq!(
+                    next_root.len(),
+                    shape.digest_words,
+                    "a successor root in the chain's digest width"
+                );
+                let lanes = RootLanes::unpack(b, next_root);
+                transcript.absorb_digest_lanes(b, lanes.words());
 
                 let z0 = transcript.sample_ext(b);
 
@@ -1358,7 +1380,7 @@ fn tree_auth(
     depth: usize,
     cap_height: usize,
     cap: &[WrapDigest],
-    root_lanes: &[Felt; 4],
+    root_lanes: &RootLanes,
 ) -> TreeAuth {
     if cap_height == 0 {
         assert!(cap.is_empty(), "an uncapped tree carries no cap wires");
@@ -1373,15 +1395,11 @@ fn tree_auth(
             b,
             cap,
             cap_height,
-            std::slice::from_ref(root_lanes),
+            root_lanes.words(),
         ))
     } else {
         assert_eq!(cap.len(), 1usize << cap_height, "a cap is 2^c digests");
-        TreeAuth::Cap(CapCells::authenticate(
-            b,
-            cap,
-            std::slice::from_ref(root_lanes),
-        ))
+        TreeAuth::Cap(CapCells::authenticate(b, cap, root_lanes.words()))
     }
 }
 
@@ -1875,7 +1893,7 @@ pub struct RoundStorage {
     sumchecks: Vec<Vec<Vec<Ext>>>,
     currents: Vec<Vec<(CurrentBlock, PathStore)>>,
     nexts: Vec<Vec<(Vec<Ext>, PathStore)>>,
-    roots: Vec<Option<super::builder::Cell>>,
+    roots: Vec<Option<WrapDigest>>,
     oods: Vec<Option<Ext>>,
     nonces: Vec<RoundNonces>,
     /// Per round: the current tree's cap when the round owns it (round 0),
@@ -1902,7 +1920,7 @@ impl RoundStorage {
         let mut sumchecks: Vec<Vec<Vec<Ext>>> = Vec::new();
         let mut currents: Vec<Vec<(CurrentBlock, PathStore)>> = Vec::new();
         let mut nexts: Vec<Vec<(Vec<Ext>, PathStore)>> = Vec::new();
-        let mut roots: Vec<Option<super::builder::Cell>> = Vec::new();
+        let mut roots: Vec<Option<WrapDigest>> = Vec::new();
         let mut oods: Vec<Option<Ext>> = Vec::new();
         let mut nonces: Vec<RoundNonces> = Vec::new();
         let mut current_caps: Vec<Vec<WrapDigest>> = Vec::new();
@@ -1915,6 +1933,11 @@ impl RoundStorage {
                 *at += 1;
                 cell
             };
+            // One Merkle node: the shape's digest width in words.
+            let next_digest = |b: &mut LfmBuilder, at: &mut u32| {
+                let cells: Vec<_> = (0..shape.digest_words).map(|_| next_word(b, at)).collect();
+                WrapDigest::from_cells(&cells)
+            };
             // A path of `words` words: hinted now, or left for its walk.
             let next_path = |b: &mut LfmBuilder, at: &mut u32, words: usize| {
                 if shape.paths_rotated() {
@@ -1922,11 +1945,7 @@ impl RoundStorage {
                     *at += words as u32;
                     path
                 } else {
-                    PathStore::Hinted(
-                        (0..words)
-                            .map(|_| WrapDigest::from_cell(next_word(b, at)))
-                            .collect(),
-                    )
+                    PathStore::Hinted((0..words).map(|_| next_digest(b, at)).collect())
                 }
             };
             let sumcheck: Vec<Vec<Ext>> = (0..shape.messages(r))
@@ -1948,7 +1967,7 @@ impl RoundStorage {
             // trees' caps, in tree order.
             let current_cap: Vec<WrapDigest> = if r == 0 {
                 (0..shape.trees_at(0) * shape.cap_words(shape.current_depth(0), shape.caps[0]))
-                    .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
+                    .map(|_| next_digest(b, &mut at))
                     .collect()
             } else {
                 Vec::new()
@@ -2007,12 +2026,12 @@ impl RoundStorage {
 
             let (next_root, ood_value, next, next_cap) = match shape.next_depth(r) {
                 Some(next_depth) => {
-                    let nr = next_word(b, &mut at);
+                    let nr = next_digest(b, &mut at);
                     let ov = next_word(b, &mut at).as_ext();
                     // W1: the successor's cap, after its root and ood value.
                     let next_cap: Vec<WrapDigest> = (0..shape
                         .cap_words(next_depth, shape.caps[r + 1]))
-                        .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
+                        .map(|_| next_digest(b, &mut at))
                         .collect();
                     let next_depth = shape.path_words(next_depth, shape.caps[r + 1]);
                     let next_block = 1usize << shape.schedule[r + 1];
@@ -2128,7 +2147,9 @@ pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
     // has one).
     let nonces = shape.carries(r).iter().filter(|&&carried| carried).count();
     let mut n = (2 * shape.messages(r) + nonces) as u32;
-    let depth = shape.current_path(r);
+    // A node (root, cap node, sibling) is the shape's digest width in words.
+    let dw = shape.digest_words;
+    let depth = dw * shape.current_path(r);
     let block = shape.current_block(r);
     if shape.tail_round(r) {
         // A tail round: every leaf's block once, in leaf order, and no path.
@@ -2145,18 +2166,19 @@ pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
     }
     if r == 0 {
         // W1: tree 0's cap words, a grouped round 0's trees' each.
-        n += (shape.trees_at(0) * shape.cap_words(shape.current_depth(0), shape.caps[0])) as u32;
+        n += (dw * shape.trees_at(0) * shape.cap_words(shape.current_depth(0), shape.caps[0]))
+            as u32;
     }
     if let Some(next_depth) = shape.next_depth(r) {
         // The successor root, its out-of-domain value, its cap, and per query
         // its block and path.
         let c = shape.caps[r + 1];
-        n += 2 + shape.cap_words(next_depth, c) as u32;
+        n += (dw + 1 + dw * shape.cap_words(next_depth, c)) as u32;
         // A tail round reads its successor's blocks where that tail round
         // hints them, so it opens none a query.
         if !shape.tail_round(r) {
             let next_block = 1usize << shape.schedule[r + 1];
-            n += (shape.num_queries * (next_block + shape.path_words(next_depth, c))) as u32;
+            n += (shape.num_queries * (next_block + dw * shape.path_words(next_depth, c))) as u32;
         }
     }
     n
@@ -2216,9 +2238,11 @@ pub fn try_push_round_words(
             push_openings(words, shape, round, true, current);
         }
         if let Some(next_depth) = shape.next_depth(r) {
-            words.push(commitment_to_digest(
+            push_node(
+                words,
                 round.next_root.as_ref().expect("a successor root"),
-            ));
+                shape.digest_words,
+            );
             words.push(ext_word(
                 round.ood_value.as_ref().expect("an out-of-domain value"),
             ));
@@ -2231,7 +2255,7 @@ pub fn try_push_round_words(
                 // The successor's cap, for its tail round to authenticate; its
                 // blocks are that round's own.
                 for node in tail_cap(shape, round, r + 1)? {
-                    words.push(commitment_to_digest(&node));
+                    push_node(words, &node, shape.digest_words);
                 }
             } else {
                 push_openings(words, shape, round, false, next);
@@ -2370,10 +2394,12 @@ fn push_openings(
         push_openings4(words, round, current, tree, shape.round0_packed());
         return;
     }
+    let dw = shape.digest_words;
     fn side<V>(
         words: &mut Vec<LfmWord>,
         openings: &[multilinear::whir_commit::CosetOpening<V>],
         owner_cap: usize,
+        dw: usize,
         value_word: impl Fn(&math::field::element::FieldElement<V>) -> LfmWord,
     ) where
         V: math::field::traits::IsField,
@@ -2383,7 +2409,7 @@ fn push_openings(
             .map_or(0, |o| o.proof.merkle_path.len().saturating_sub(owner_cap));
         if let Some(owner) = openings.first() {
             for node in &owner.proof.merkle_path[owner_split..] {
-                words.push(commitment_to_digest(node));
+                push_node(words, node, dw);
             }
         }
         for (i, opening) in openings.iter().enumerate() {
@@ -2396,7 +2422,7 @@ fn push_openings(
                 &opening.proof.merkle_path[..]
             };
             for node in path {
-                words.push(commitment_to_digest(node));
+                push_node(words, node, dw);
             }
         }
     }
@@ -2405,16 +2431,16 @@ fn push_openings(
         RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
             if current {
                 // A base value arrives as `(v, 0, 0, 0)`.
-                side(words, &p.current, owner_cap, |v| {
+                side(words, &p.current, owner_cap, dw, |v| {
                     [*v, FE::zero(), FE::zero(), FE::zero()]
                 });
             } else {
-                side(words, &p.next, owner_cap, ext_word);
+                side(words, &p.next, owner_cap, dw, ext_word);
             }
         }
         RoundOpenings::Extension(p) => {
             let openings = if current { &p.current } else { &p.next };
-            side(words, openings, owner_cap, ext_word);
+            side(words, openings, owner_cap, dw, ext_word);
         }
         // A grouped round 0 (D-ONECHAIN): every tree's cap off its owner
         // (query 0's opening of it), in tree order; then per query each
@@ -2430,7 +2456,7 @@ fn push_openings(
                                 let path = &owner.proof.merkle_path;
                                 let split = path.len().saturating_sub(owner_cap);
                                 for node in &path[split..] {
-                                    words.push(commitment_to_digest(node));
+                                    push_node(words, node, dw);
                                 }
                                 split
                             })
@@ -2448,15 +2474,47 @@ fn push_openings(
                             _ => &path[..],
                         };
                         for node in path {
-                            words.push(commitment_to_digest(node));
+                            push_node(words, node, dw);
                         }
                     }
                 }
             } else {
-                side(words, &p.next, owner_cap, ext_word);
+                side(words, &p.next, owner_cap, dw, ext_word);
             }
         }
     }
+}
+
+/// One Merkle node's arena words in a chain of `digest_words`-word digests:
+/// the four canonical felts of a felt hash's node ([`commitment_to_digest`]),
+/// or a byte hash's 32 bytes as two words of `u32` lanes, lane `h` of word `w`
+/// the little-endian `u32` of bytes `4(4w + h)..` ([`byte_digest_words`]).
+pub fn push_node(words: &mut Vec<LfmWord>, node: &Commitment, digest_words: usize) {
+    debug_assert!(
+        (1..=2).contains(&digest_words),
+        "a digest is one or two words"
+    );
+    if digest_words == 1 {
+        words.push(commitment_to_digest(node));
+    } else {
+        words.extend(byte_digest_words(node));
+    }
+}
+
+/// A byte hash's 32-byte digest as the two words of `u32` lanes the machine
+/// holds it in: what a BLAKE3 compression writes.
+pub fn byte_digest_words(node: &Commitment) -> [LfmWord; 2] {
+    core::array::from_fn(|w| {
+        core::array::from_fn(|h| {
+            let at = 4 * (4 * w + h);
+            FE::from(u64::from(u32::from_le_bytes([
+                node[at],
+                node[at + 1],
+                node[at + 2],
+                node[at + 3],
+            ])))
+        })
+    })
 }
 
 /// Round 0's base block: a `(v, 0, 0, 0)` word a value, or four values a word,

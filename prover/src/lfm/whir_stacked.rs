@@ -26,11 +26,13 @@ use crate::tables::types::{FEE, GoldilocksField};
 
 use super::algebraic_commit::leaf_capacity;
 use super::builder::{Cell, Ext, LfmBuilder};
+use super::edsl::WrapDigest;
 use super::instr::Addr;
 use super::whir_chain::{
     ChainRoundWires, ChainShape, chain_grind_perms, chain_opening_perms, chain_shape_rows,
     chain_sponge, emit_verify_grouped, emit_verify_weighted,
 };
+use super::whir_open::RootLanes;
 use super::whir_poly::{
     challenge_powers_rows, emit_challenge_powers, emit_eq_eval, eq_eval_rows_again,
 };
@@ -280,7 +282,9 @@ pub struct StackedChainWires<'a> {
     pub rounds: &'a [ChainRoundWires<'a>],
     /// The roots of the polynomials it opens, as words, in slot order: the
     /// run's slice of the group's carried roots, so tree `p` is checked against
-    /// the root at a position the program fixes (REV-B2-JUDGE B2-4).
+    /// the root at a position the program fixes (REV-B2-JUDGE B2-4). Each root
+    /// is `shape.digest_words` consecutive cells: one under the felt hashes,
+    /// two under BLAKE3.
     pub roots: &'a [Cell],
     /// The value its chain folds down to.
     pub final_value: Ext,
@@ -451,13 +455,17 @@ pub fn emit_stacked_verify_chains(
             b,
             super::whir_chain::onechain_steps::Step::Chain(run.start),
         );
+        let dw = shape.digest_words;
         assert_eq!(
             chain.roots.len(),
-            shape.run(run.len()).trees_at(0),
-            "one root per round-0 tree of the run"
+            dw * shape.run(run.len()).trees_at(0),
+            "one root per round-0 tree of the run, in the chain's digest width"
         );
-        let roots: Vec<[super::builder::Felt; 4]> =
-            chain.roots.iter().map(|&root| b.unpack(root)).collect();
+        let roots: Vec<RootLanes> = chain
+            .roots
+            .chunks(dw)
+            .map(|cells| RootLanes::unpack(b, WrapDigest::from_cells(cells)))
+            .collect();
         let mut claimed = emit_claimed(b, layout, run.clone(), values, &weights);
         #[cfg(test)]
         let claim_fault = ood_faults::get() == ood_faults::Fault::ClaimWithoutAnswers;
@@ -479,7 +487,7 @@ pub fn emit_stacked_verify_chains(
                 b,
                 transcript,
                 chain.rounds,
-                &roots[0],
+                roots[0],
                 chain.final_value,
                 claimed,
                 shape,
