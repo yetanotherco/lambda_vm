@@ -1931,6 +1931,9 @@ fn walk_window(
     // Without `lookups`, the accumulator counts them (`absorb`).
     let mut walk = WalkOutputs::for_walk_sized(logs.len(), lookups, sizes, order);
     walk.memw.registers = register_format;
+    if register_format == crate::tables::register::RegisterFormat::InRow {
+        walk.side_records_for_the_card(logs.len());
+    }
     if let Some(window) = words {
         walk.memw.set_words(window, logs.len() * 3);
     }
