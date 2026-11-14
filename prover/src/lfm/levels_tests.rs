@@ -7,7 +7,9 @@ use super::levels::{
     LevelStop, derive_levels, derive_levels_to, prove_levels, verify_levels, verify_levels_to,
 };
 use super::whir_block::{LeafChecks, block_leaf_arena, top_claims};
-use super::whir_block_tests::{at_blowup_4, plan_of, small_block, small_format};
+use super::whir_block_tests::{
+    at_blowup_4, plan_of, small_block, small_block_options, small_format,
+};
 use super::wlfm::{WlfmFamily, verify_wlfm};
 
 /// ★ Level 1 over a small block: one program over every group executes over
@@ -139,5 +141,92 @@ fn a_chain_stopped_at_one_group_is_its_own_verifiers() {
     verify_levels_to(&plan, WlfmFamily::P1, stop, last).expect("its own verifier accepts");
     if levels.len() != 2 {
         assert!(verify_levels(&plan, WlfmFamily::P1, last).is_err());
+    }
+}
+
+/// ★ THE DRIVER: a small block proved to its last level with level 1's
+/// program emitted the moment the statement is final and executed as phase B
+/// finishes its groups. The base verifies, every level verifies against its own
+/// artifacts, and the block's verifier — its plan derived on its own from the
+/// ELF and the statement — accepts the last level.
+#[test]
+#[ignore = "proves a small block and its levels; box tier"]
+fn the_block_levels_driver_proves_a_small_block() {
+    use super::levels::prove_block_levels;
+    let format = at_blowup_4(small_format());
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let options = small_block_options();
+    let run = prove_block_levels(
+        &elf,
+        &[],
+        &opts,
+        &format,
+        &options,
+        WlfmFamily::P1,
+        LevelStop::DEFAULT,
+    )
+    .expect("the block proves to its last level");
+    assert!(
+        crate::block_whir::verify_block_whir(&run.base_proof, &elf, &opts, &format)
+            .expect("verify runs"),
+        "the base verifies"
+    );
+    assert_eq!(run.proofs.len(), 2);
+    for (k, (level, p)) in run.levels.iter().zip(&run.proofs).enumerate() {
+        verify_wlfm(&level.build.artifacts, p, &p.public_words)
+            .unwrap_or_else(|e| panic!("level {} verifies: {e}", k + 1));
+    }
+    let plan = plan_of(&elf, &run.base_proof, &format, Some(1));
+    verify_levels(
+        &plan,
+        WlfmFamily::P1,
+        run.proofs.last().expect("a last level"),
+    )
+    .expect("the block's own verifier accepts the last level");
+    let t = &run.times;
+    println!(
+        "LEVELS DRIVER: base {:.3}s · planned {:.3}s · emitted {:.3}s · pieces {} · waves before \
+         the base ended {} ({:.3}s) · execute tail {:.3}s · built {:.3}s · levels {:?}",
+        t.base,
+        t.planned,
+        t.emitted,
+        t.pieces,
+        t.waves_before_base,
+        t.wave_secs_before_base,
+        t.execute_tail,
+        t.built,
+        t.levels
+    );
+}
+
+/// Level 1's pieces: the front, then the groups in order, one piece a group up
+/// to 63, consecutive groups merged beyond; the pieces tile the arena.
+#[test]
+fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
+    use super::levels::level1_pieces;
+    for groups in [1usize, 2, 41, 63, 64, 82, 200] {
+        let marks: Vec<u32> = (0..=groups as u32).map(|i| 10 + 7 * i).collect();
+        let pieces = level1_pieces(&marks);
+        assert!(
+            pieces.len() <= 64,
+            "{groups} groups: {} pieces",
+            pieces.len()
+        );
+        assert_eq!(pieces[0].0, 0..10, "the front first");
+        let mut at = 0u32;
+        let mut g = 0usize;
+        for (range, gs) in &pieces {
+            assert_eq!(range.start, at);
+            at = range.end;
+            if !gs.is_empty() {
+                assert_eq!(gs.start, g);
+                g = gs.end;
+            }
+        }
+        assert_eq!((at, g), (*marks.last().expect("marks"), groups));
+        if groups <= 63 {
+            assert_eq!(pieces.len(), groups + 1, "one piece a group");
+        }
     }
 }

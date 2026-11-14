@@ -93,16 +93,10 @@ fn small_block_at(
     small_block_cut(name, format, |o| o.ecdas_rows_log2 = ecdas_rows_log2)
 }
 
-/// [`small_block`] with its options changed by `cut` (the chunked tables'
-/// heights).
-fn small_block_cut(
-    name: &str,
-    format: &BlockFormat,
-    cut: impl FnOnce(&mut BlockOptions),
-) -> (Vec<u8>, BlockWhirProof) {
-    let elf = asm_elf_bytes(name);
-    let opts = ProofOptions::default_test_options();
-    let mut options = BlockOptions {
+/// The small blocks' options: every chunked table cut small, every table packed
+/// on a card, the rest laid out in waves of 1 MiB.
+pub(super) fn small_block_options() -> BlockOptions {
+    BlockOptions {
         max_rows: MaxRowsConfig::small(),
         keccak_rnd_rows_log2: 3,
         ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
@@ -129,7 +123,19 @@ fn small_block_cut(
         gpack: true,
         regen: None,
         phase_b_overlap: stark::multilinear_block::PhaseBOverlap::Off,
-    };
+    }
+}
+
+/// [`small_block`] with its options changed by `cut` (the chunked tables'
+/// heights).
+fn small_block_cut(
+    name: &str,
+    format: &BlockFormat,
+    cut: impl FnOnce(&mut BlockOptions),
+) -> (Vec<u8>, BlockWhirProof) {
+    let elf = asm_elf_bytes(name);
+    let opts = ProofOptions::default_test_options();
+    let mut options = small_block_options();
     cut(&mut options);
     let proof = prove_block_whir(&elf, &[], &opts, format, &options)
         .expect("the block proves")
