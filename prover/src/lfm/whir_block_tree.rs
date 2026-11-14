@@ -795,6 +795,26 @@ pub(crate) struct ProgramTimes {
     pub(crate) split: Option<(f64, f64, f64, f64)>,
 }
 
+/// `W3_NODE_TIMES=1`'s hop stamps, on the card trace's clock (unix seconds):
+/// each program's proof harvested for its parent, and a node's children's
+/// words made, landed, its execution finished and its traces filled — the
+/// host's steps between a child's proof and its parent's prove. Off unless
+/// the tree turns them on; printed as `W3 HOP STAMPS`.
+static HOP_STAMPS: std::sync::Mutex<Vec<(String, f64)>> = std::sync::Mutex::new(Vec::new());
+static HOPS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn hop_stamp(what: impl FnOnce() -> String) {
+    if !HOPS_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    if let Ok(mut stamps) = HOP_STAMPS.lock() {
+        stamps.push((what(), at));
+    }
+}
+
 /// One `ALLOC PEAK <phase>` line, when the watermark monitor runs: the phase's
 /// highest VmRSS reading with jemalloc's allocated (live) and resident bytes
 /// at it ([`crate::alloc_purge::peak_window`]), and the precomputed-tree
@@ -1799,9 +1819,9 @@ pub(crate) fn execute_streamed(
     let (execution, after) = execute_streamed_with(program, child_arenas, kids, &hasher, |kid| {
         try_child_arena_words(&kid.child)
     })?;
-    Ok(super::proof::lfm_fill_executed(
-        program, execution, hasher, after,
-    ))
+    let filled = super::proof::lfm_fill_executed(program, execution, hasher, after);
+    hop_stamp(|| "top filled".to_string());
+    Ok(filled)
 }
 
 /// [`execute_streamed`]'s execution, over children of any kind: `arenas_of` gives
@@ -1837,14 +1857,19 @@ pub(crate) fn execute_streamed_with<R: Send + Sync>(
             Some(words) => words,
             None => {
                 let words = arenas_of(kid)?;
+                hop_stamp(|| format!("top words {c}"));
                 held[c].get_or_init(|| words)
             }
         };
         last = std::time::Instant::now();
-        ex.land(c, words)
-            .map_err(|e| format!("child {c} lands: {e:?}"))
+        let landed = ex
+            .land(c, words)
+            .map_err(|e| format!("child {c} lands: {e:?}"));
+        hop_stamp(|| format!("top landed {c}"));
+        landed
     })?;
     let execution = ex.finish().map_err(|e| format!("{e:?}"))?;
+    hop_stamp(|| "top finished".to_string());
     Ok((execution, last.elapsed().as_secs_f64()))
 }
 
@@ -2163,6 +2188,7 @@ pub(crate) fn prove_tree_pipelined(
                     };
                     let child =
                         harvest_child_under::<BlockFamily>(artifacts.clone(), wrap.clone(), &lfm)?;
+                    hop_stamp(|| format!("L0.{k} harvested"));
                     return Ok(ProvedProgram {
                         lfm,
                         child,
@@ -2206,8 +2232,11 @@ pub(crate) fn prove_tree_pipelined(
                             for k in &kids {
                                 arenas.extend(try_child_arena_words(&k.child)?);
                             }
-                            lfm_execute_and_fill(&program.program, &arenas, hasher)
-                                .map_err(|e| format!("level {} node {}: {e:?}", at.lv, at.j))?
+                            hop_stamp(|| format!("L{}.{} words", at.lv, at.j));
+                            let filled = lfm_execute_and_fill(&program.program, &arenas, hasher)
+                                .map_err(|e| format!("level {} node {}: {e:?}", at.lv, at.j))?;
+                            hop_stamp(|| format!("L{}.{} filled", at.lv, at.j));
+                            filled
                         };
                         drop(program);
                         emitted.program.release();
@@ -2235,6 +2264,7 @@ pub(crate) fn prove_tree_pipelined(
                             wrap.clone(),
                             &lfm,
                         )?;
+                        hop_stamp(|| format!("L{}.{} harvested", at.lv, at.j));
                         Ok(ProvedProgram {
                             lfm,
                             child,
@@ -3240,6 +3270,10 @@ pub fn prove_whir_block_tree(
         .build()
         .map_err(|e| format!("the node builder's pool: {e}"))?;
     let top_streamed = std::sync::OnceLock::new();
+    if let Ok(mut stamps) = HOP_STAMPS.lock() {
+        stamps.clear();
+    }
+    HOPS_ON.store(cfg.node_times, std::sync::atomic::Ordering::Relaxed);
     let t = std::time::Instant::now();
     let tree_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3434,6 +3468,16 @@ pub fn prove_whir_block_tree(
     if cfg.node_times {
         sink.line(&format!(
             "W3 TIMES TREE START: unix {tree_unix:.3} (the card trace's clock)"
+        ));
+        HOPS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut hops = HOP_STAMPS.lock().map(|h| h.clone()).unwrap_or_default();
+        hops.sort_by(|a, b| a.1.total_cmp(&b.1));
+        sink.line(&format!(
+            "W3 HOP STAMPS: {} (seconds after the tree start)",
+            hops.iter()
+                .map(|(what, at)| format!("{what}@{:.3}", at - tree_unix))
+                .collect::<Vec<_>>()
+                .join(" · ")
         ));
         let shape = plan.levels();
         let split = |t: &ProgramTimes| match t.split {
