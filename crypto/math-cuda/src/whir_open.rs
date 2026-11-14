@@ -238,6 +238,17 @@ impl OpeningSession {
         self.len >>= rounds;
     }
 
+    /// The message's live cube, `len` ext3 values, read back in one copy: its
+    /// value at hypercube index `i` (the first variable the index's top bit,
+    /// as [`Self::evaluate_message`] folds it) at `3i..3i + 3`. What the final
+    /// round of a chain sends, read without folding a copy per value.
+    pub fn message_to_host(&self) -> Result<Vec<u64>> {
+        let message =
+            crate::readback::clone_dtoh(&self.stream, &self.message.slice(0..self.len * 3))?;
+        self.stream.synchronize()?;
+        Ok(message)
+    }
+
     /// The message's value at `point`, which the out-of-domain answer needs.
     ///
     /// Folds a copy: the message is the next group's factor and the rounds
