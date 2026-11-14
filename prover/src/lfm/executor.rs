@@ -621,6 +621,74 @@ fn hash16_compute(
 /// A width-16 row's write half: all four output words. One nobody reads is
 /// written all the same (its multiplicity is zero), as `Instr::writes_into`
 /// lists it.
+/// One lean BLAKE3 compression's read-only half: its chaining value and block
+/// read from memory (every `u32` lane below 2^32: the head recomposes each
+/// from range-checked bytes, so no larger value exists on the AIR side), and
+/// its digest.
+fn b3l_compute(
+    memory: &WriteOnceMemory,
+    op: &super::instr::B3lOperands,
+) -> Result<(B3lValues, [u32; 8]), LfmExecError> {
+    use super::instr::{B3lBlock, B3lCv};
+    let u32_word = |cell: Addr| -> Result<[u32; 4], LfmExecError> {
+        let w = memory.read(cell)?;
+        let mut out = [0u32; 4];
+        for (lane, value) in w.iter().enumerate() {
+            out[lane] = super::b3l::lane_u32(value)
+                .ok_or(LfmExecError::NotU32Half { addr: cell.0, lane })?;
+        }
+        Ok(out)
+    };
+    let h = match &op.cv {
+        B3lCv::Iv => super::b3l::IV,
+        B3lCv::Words(ws) => {
+            let (a, b) = (u32_word(ws[0])?, u32_word(ws[1])?);
+            core::array::from_fn(|i| if i < 4 { a[i] } else { b[i - 4] })
+        }
+    };
+    let block = match &op.block {
+        B3lBlock::Lanes(ws) => {
+            let mut words = [0u32; 16];
+            for (j, cell) in ws.iter().enumerate() {
+                words[4 * j..4 * j + 4].copy_from_slice(&u32_word(*cell)?);
+            }
+            super::b3l::lane_block(&words)
+        }
+        // A field element always has its canonical bytes: nothing to refuse.
+        B3lBlock::Felts(ws) => {
+            let (a, b) = (memory.read(ws[0])?, memory.read(ws[1])?);
+            super::b3l::felt_block(&core::array::from_fn(
+                |f| if f < 4 { a[f] } else { b[f - 4] },
+            ))
+        }
+    };
+    let values = B3lValues { h, block };
+    let digest = values.digest(op.block_len, op.flags);
+    Ok((values, digest))
+}
+
+/// A lean BLAKE3 compression's writes: the digest's two words, and the
+/// reversed digest's when the row has them.
+fn b3l_apply(
+    memory: &mut WriteOnceMemory,
+    op: &super::instr::B3lOperands,
+    digest: &[u32; 8],
+) -> Result<(), LfmExecError> {
+    for (cell, word) in op.outs.iter().zip(super::b3l::digest_words(digest)) {
+        memory.write(*cell, word)?;
+    }
+    if let Some(rev) = &op.rev {
+        for (cell, word) in rev
+            .outs
+            .iter()
+            .zip(super::b3l::reversed_digest_words(digest))
+        {
+            memory.write(*cell, word)?;
+        }
+    }
+    Ok(())
+}
+
 fn hash16_apply(
     memory: &mut WriteOnceMemory,
     outs: &[Addr; 4],
@@ -972,54 +1040,8 @@ fn step(
                 sink.put(&mut records.blake3, values);
             }
             Instr::B3l(op) => {
-                use super::instr::{B3lBlock, B3lCv};
-                // Every lane a `u32` read must be below 2^32: the head
-                // recomposes each from range-checked bytes, so no larger value
-                // exists on the AIR side.
-                let u32_word = |m: &Machine<'_>, cell: Addr| -> Result<[u32; 4], LfmExecError> {
-                    let w = m.read_word(cell)?;
-                    let mut out = [0u32; 4];
-                    for (lane, value) in w.iter().enumerate() {
-                        out[lane] = super::b3l::lane_u32(value)
-                            .ok_or(LfmExecError::NotU32Half { addr: cell.0, lane })?;
-                    }
-                    Ok(out)
-                };
-                let h = match &op.cv {
-                    B3lCv::Iv => super::b3l::IV,
-                    B3lCv::Words(ws) => {
-                        let (a, b) = (u32_word(m, ws[0])?, u32_word(m, ws[1])?);
-                        core::array::from_fn(|i| if i < 4 { a[i] } else { b[i - 4] })
-                    }
-                };
-                let block = match &op.block {
-                    B3lBlock::Lanes(ws) => {
-                        let mut words = [0u32; 16];
-                        for (j, cell) in ws.iter().enumerate() {
-                            words[4 * j..4 * j + 4].copy_from_slice(&u32_word(m, *cell)?);
-                        }
-                        super::b3l::lane_block(&words)
-                    }
-                    // A field element always has its canonical bytes: nothing
-                    // to refuse.
-                    B3lBlock::Felts(ws) => {
-                        let (a, b) = (m.read_word(ws[0])?, m.read_word(ws[1])?);
-                        super::b3l::felt_block(&core::array::from_fn(|f| {
-                            if f < 4 { a[f] } else { b[f - 4] }
-                        }))
-                    }
-                };
-                let values = B3lValues { h, block };
-                let digest = values.digest(op.block_len, op.flags);
-                for (cell, word) in op.outs.iter().zip(super::b3l::digest_words(&digest)) {
-                    m.write(*cell, word)?;
-                }
-                if let Some(rev) = &op.rev {
-                    let words = super::b3l::reversed_digest_words(&digest);
-                    for (cell, word) in rev.outs.iter().zip(words) {
-                        m.write(*cell, word)?;
-                    }
-                }
+                let (values, digest) = b3l_compute(&m.memory, op)?;
+                b3l_apply(&mut m.memory, op, &digest)?;
                 sink.put(&mut records.b3l, values);
             }
             Instr::Hint {
@@ -1910,17 +1932,26 @@ fn run_levels(
                 Ok(r) => r,
                 Err(e) => return Err(e.clone()),
             };
-            let instr = &program.instrs[levels.instr_of_row(row)];
+            let index = levels.instr_of_row(row);
+            let instr = &program.instrs[index];
+            let slot = levels.record_row(index);
             // The hash chip's row goes through the same slot write as every
             // other chip's: the vector's length is zero until `commit_slots`.
             match (instr, row_value) {
+                // Each entry's slot is its own chip's record row: a level holds
+                // the hash chip's rows and the lean compressions' together, so
+                // an entry's position among them is neither chip's row.
                 (Instr::Hash { mode, outs, .. }, HashOut::Narrow(r)) => {
                     hash_apply(&mut m.memory, *mode, outs, r)?;
-                    Sink::Slot(row).put(&mut records.hash, r.clone());
+                    Sink::Slot(slot).put(&mut records.hash, r.clone());
                 }
                 (Instr::Hash16(h), HashOut::Wide(r)) => {
                     hash16_apply(&mut m.memory, &h.outs, r)?;
-                    Sink::Slot(row).put(&mut records.hash16, (**r).clone());
+                    Sink::Slot(slot).put(&mut records.hash16, (**r).clone());
+                }
+                (Instr::B3l(op), HashOut::Lean(values, digest)) => {
+                    b3l_apply(&mut m.memory, op, digest)?;
+                    Sink::Slot(slot).put(&mut records.b3l, *values);
                 }
                 _ => {
                     return Err(LfmExecError::Internal(
@@ -1965,6 +1996,8 @@ fn run_levels(
 enum HashOut {
     Narrow(HashRow),
     Wide(Box<Hash16Row>),
+    /// A lean BLAKE3 compression's values and digest.
+    Lean(B3lValues, [u32; 8]),
 }
 
 /// One hash instruction's read-only half, dispatched from a program index.
@@ -1980,6 +2013,7 @@ fn hash_one(
         Instr::Hash16(h) => {
             hash16_compute(memory, hasher, &h.ins).map(|r| HashOut::Wide(Box::new(r)))
         }
+        Instr::B3l(op) => b3l_compute(memory, op).map(|(v, d)| HashOut::Lean(v, d)),
         _ => Err(LfmExecError::Internal(
             "the schedule listed a non-hash instruction as a hash row",
         )),
