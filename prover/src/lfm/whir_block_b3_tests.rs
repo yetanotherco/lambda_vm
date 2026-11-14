@@ -56,6 +56,18 @@ fn b3_block(name: &str, format: &BlockFormat, drop_levels: usize) -> (Vec<u8>, B
     (elf, proof)
 }
 
+/// Whether the host verifier accepts `proof` as a BLAKE3 base. The base-only
+/// permit is held for the verify alone: without it the BLAKE3 base is refused
+/// before it is read, which a tamper test would mistake for a refusal of the
+/// tamper.
+fn host_accepts(proof: &BlockWhirProof, elf: &[u8], format: &BlockFormat) -> bool {
+    let opts = ProofOptions::default_test_options();
+    crate::base_only::with_permit(|| {
+        verify_block_whir(proof, elf, &opts, format)
+            .expect("the BLAKE3 base is read under the permit")
+    })
+}
+
 fn b3_plan(
     elf: &[u8],
     proof: &BlockWhirProof,
@@ -212,7 +224,6 @@ fn a_tampered_blake3_base_has_no_leaf_execution() {
             .find(|&k| plan.partition().leaf(k).contains(&0))
             .expect("a leaf holds group 0");
         run_leaf(&plan, &honest, holder).expect("the honest leaf executes");
-        let opts = ProofOptions::default_test_options();
         let mut sites: Vec<(String, BlockWhirProof)> = Vec::new();
         let mut p = honest.clone();
         p.proof.roots[0][31] ^= 0x40;
@@ -262,7 +273,7 @@ fn a_tampered_blake3_base_has_no_leaf_execution() {
                 .find(|&k| plan.partition().leaf(k).contains(&g))
                 .expect("a leaf holds the group");
             assert!(
-                !verify_block_whir(&p, &elf, &opts, &format).unwrap_or(false),
+                !host_accepts(&p, &elf, &format),
                 "{trees:?}: the host refuses a joint value"
             );
             assert!(
@@ -272,7 +283,7 @@ fn a_tampered_blake3_base_has_no_leaf_execution() {
         }
         for (what, forged) in &sites {
             assert!(
-                !verify_block_whir(forged, &elf, &opts, &format).unwrap_or(false),
+                !host_accepts(forged, &elf, &format),
                 "{trees:?} {what}: the host refuses"
             );
             let refused = run_leaf(&plan, forged, holder);
