@@ -1672,3 +1672,45 @@ fn the_lean_lowering_moves_the_chip_and_the_byte_work_only() {
         l.bitdec
     );
 }
+
+/// The production chain's compressions under BLAKE3, by closed form (the cost
+/// model the chain gates hold to the emission): a run of `P'` stacked
+/// polynomials of the default stack, one tree a run (joint leaves) and one a
+/// polynomial, against the same run's Poseidon1 permutations. Prints, asserts
+/// only the forms' internal consistency.
+#[test]
+fn the_production_blake3_run_costs_its_closed_form() {
+    use super::whir_chain::{
+        ChainShape, chain_cap_perms, chain_grind_perms, chain_opening_perms, chain_perms,
+    };
+    use super::whir_transcript::SpongeEntry;
+    use crate::zf_format::ZfFormat;
+    use multilinear::whir_chain::{GroupFold, Round0Trees};
+    let zf = ZfFormat::DEFAULT;
+    let n = zf.whir_stack.get();
+    let mut config = crate::multilinear_prove::chain_config_under(&zf, &[(3, n)]);
+    config.format.group = GroupFold::Indexed;
+    config.format.leaves = zf.whir_leaves;
+    for trees in [Round0Trees::One, Round0Trees::Each] {
+        config.format.round0 = trees;
+        for run in [1usize, 2, 3] {
+            let b3 = ChainShape::for_hash(&config, n, WrapHash::Blake3).run(run);
+            let p1 = ChainShape::for_hash(&config, n, WrapHash::Poseidon1).run(run);
+            let b3_total = chain_perms(&b3, SpongeEntry::fresh_for(WrapHash::Blake3));
+            let p1_total = chain_perms(&p1, SpongeEntry::fresh_for(WrapHash::Poseidon1));
+            assert!(chain_opening_perms(&b3) <= b3_total);
+            println!(
+                "PRODUCTION RUN {trees:?} x{run}: stack 2^{n} · schedule {:?} · Q {} · caps {:?} · \
+                 BLAKE3 compressions {b3_total} (openings {} incl. caps {}, grinds {}) · Poseidon1 \
+                 permutations {p1_total} (openings {})",
+                b3.schedule,
+                b3.num_queries,
+                b3.caps,
+                chain_opening_perms(&b3),
+                chain_cap_perms(&b3),
+                chain_grind_perms(&b3),
+                chain_opening_perms(&p1),
+            );
+        }
+    }
+}
