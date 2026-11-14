@@ -2799,7 +2799,7 @@ fn a_streamed_block_laid_out_on_three_threads_packs_the_same_groups() {
 /// each table's rows as it is built, commit what BITWISE handed on last
 /// commits with phase 4's count from the ops: the same partition and the same
 /// group roots, and the proof verifies. The default is that; the rollback
-/// (`LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES=0`) packs BITWISE first, as before.
+/// (`bitwise_from_tables: Some(false)`) packs BITWISE first, as before.
 /// The finish keeps only the streamed chunks' tails, as the block does.
 #[test]
 fn bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies() {
@@ -2860,7 +2860,7 @@ fn bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies() {
 }
 
 /// ★ KECCAK_RND's tables handed on first ([`Deviations::keccak_rnd_first`],
-/// the block's default; `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST=0` rolls it back):
+/// the block's default; `keccak_rnd_first: Some(false)` rolls it back):
 /// every KECCAK_RND table is packed before DECODE, the first table of the rest
 /// in AIR order, and in the rollback every one after it. The partition moves,
 /// the tables and their counts do not, and both proofs verify under the
@@ -5155,15 +5155,14 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
 /// thread of its own verifies with the same partition, tables and statement,
 /// its bytes equal under the deterministic grind; with the CPU and MEMW_R
 /// chunks held as records or filled on the host, laid out inline and on
-/// workers. The thread ran only where asked. It counted chunks, unless the
-/// walkers count the rows where they make them (`LAMBDA_VM_WALK_COUNT`, on
-/// unless `0`): then it is handed no CPU, MEMW_R or SHIFT chunk, and only
-/// MEMW_A, MEMW and LT chunks a run hands out, which a small one may not.
+/// workers. The thread ran only where asked. The walkers count the rows where
+/// they make them (the default), so it is handed no CPU, MEMW_R or SHIFT
+/// chunk, and only MEMW_A, MEMW and LT chunks a run hands out, which a small
+/// one may not.
 #[test]
 fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
     use crate::tables::trace_builder::StreamTable;
     let _fills = records_fill_lock();
-    let walkers_count = !std::env::var("LAMBDA_VM_WALK_COUNT").is_ok_and(|v| v.trim() == "0");
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
         rkyv::to_bytes::<rkyv::rancor::Error>(p)
@@ -5206,7 +5205,7 @@ fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
                     assert!(verify(&proof, &elf, &format), "{what}, thread {on_thread}");
                     match (on_thread, stamps.windows.count_thread) {
                         (false, None) => {}
-                        (true, Some(c)) if walkers_count => {
+                        (true, Some(c)) => {
                             for table in [
                                 StreamTable::Cpu,
                                 StreamTable::MemwRegister,
@@ -5219,10 +5218,6 @@ fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
                                 );
                             }
                         }
-                        (true, Some(c)) => assert!(
-                            c.chunks.iter().sum::<usize>() > 0,
-                            "{what}: the thread counted no chunk"
-                        ),
                         (on, c) => panic!("{what}: thread {on}, stamps {c:?}"),
                     }
                     proof

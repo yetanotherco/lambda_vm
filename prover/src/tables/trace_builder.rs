@@ -6975,8 +6975,8 @@ pub struct StreamSkip {
     /// The LT tables the table phase builds make the rows of the timestamp
     /// comparisons phase 3 derives from MEMW and MEMW_A ops by merging equal
     /// neighbours instead of through a map ([`lt_chunk_rows`]); the CPU's,
-    /// DVRM's and HINT's comparisons keep their map (the block's prove sets it
-    /// unless `LAMBDA_VM_BLOCK_LT_MERGE=0`). The chunks are the same; their
+    /// DVRM's and HINT's comparisons keep their map (the block's prove always
+    /// sets it). The chunks are the same; their
     /// rows, and so LT's tables and BITWISE's multiplicities, are not, while
     /// every op's μ summed over LT's rows is. With [`Self::concat_lt`] the
     /// derived ops are in one list with the others and nothing merges.
@@ -7018,13 +7018,13 @@ pub struct StreamSkip {
     /// ([`Self::tails`]), BITWISE's lookups from LT's, BRANCH's and BYTEWISE's
     /// tables are counted from each table's rows as it is built, instead of
     /// from their ops in phase 4, and BITWISE is built after them and handed
-    /// on last, as [`Self::bitwise_last`] hands it (the block's default;
-    /// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES=0` rolls it back). Elsewhere it
+    /// on last, as [`Self::bitwise_last`] hands it (the block's default; a
+    /// test's deviation rolls it back). Elsewhere it
     /// changes nothing. The tables are the same; their order is not.
     pub bitwise_from_tables: bool,
     /// With the slide, KECCAK_RND's tables are handed on before every other
     /// table, in their AIR order, and the rest after them as without it (the
-    /// block's default; `LAMBDA_VM_BLOCK_KECCAK_RND_FIRST=0` rolls it back),
+    /// block's default; a test's deviation rolls it back),
     /// so the card can commit them while the tables they would wait behind
     /// are built. The tables are the same; the groups they are packed into,
     /// and so the proof's bytes, are not. In waves it changes nothing.

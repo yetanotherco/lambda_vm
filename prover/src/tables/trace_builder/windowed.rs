@@ -557,8 +557,8 @@ impl<'a> WindowedTraceBuilder<'a> {
             cut_padding: CutPadding::LastTable,
             walk_batch: WALK_BATCH,
             defer_ecrec: ecrec_deferred(),
-            count_made: counted_where_made(),
-            cpu_listless: cpu_list_dropped(),
+            count_made: true,
+            cpu_listless: true,
             own_counts: WalkCounts::default(),
             made_counts: Vec::new(),
             walked_rows: WalkedRows::default(),
@@ -688,8 +688,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// the CPU ops' DECODE lookups — while the batch is in their cache
     /// (`true`, the default), instead of the hand-out's counting reading each
     /// chunk back (`false`); the accumulator routes the CPU ops and counts
-    /// their lookups either way. Whatever `LAMBDA_VM_WALK_COUNT` says; the
-    /// tables are the same. It takes effect
+    /// their lookups either way. The tables are the same. It takes effect
     /// only where the accumulator would route in one pass and count the
     /// in-walk lookups itself, under [`Self::drop_streamed_ops`], without
     /// [`Self::stream_memw_lt`] (see [`Self::counts_where_made`]); the run's
@@ -704,9 +703,8 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// the window from its logs, rebuilt a batch at a time; a CPU chunk is
     /// handed out as its logs, its ops rebuilt from them only where the host
     /// fills it (the card declined the room), and the finish rebuilds its
-    /// tail's (`true`, the default). Or they keep the list (`false`). Whatever
-    /// `LAMBDA_VM_WALK_NO_CPU_LIST` says (`0` keeps it); the tables are the
-    /// same. It takes effect only where the card fills CPU from the logs
+    /// tail's (`true`, the default). Or they keep the list (`false`). The
+    /// tables are the same. It takes effect only where the card fills CPU from the logs
     /// ([`Self::card_fill_streamed`] with `cpu`), the walkers count where they
     /// make the rows ([`Self::counts_where_made`]) and the accumulator routes
     /// in one pass (see [`Self::cpu_listless`]). A window whose walker kept its
@@ -2634,25 +2632,6 @@ impl<T> Segments<T> {
             .flat_map(|(list, range)| list[range.clone()].iter().cloned())
             .collect()
     }
-}
-
-/// Whether the walkers keep no CPU list (unset, or anything but `0`: the
-/// default) or keep it (`LAMBDA_VM_WALK_NO_CPU_LIST=0`):
-/// [`WindowedTraceBuilder::drop_cpu_list`]'s default. Read once. The tables
-/// are the same.
-fn cpu_list_dropped() -> bool {
-    static DROPPED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DROPPED
-        .get_or_init(|| !std::env::var("LAMBDA_VM_WALK_NO_CPU_LIST").is_ok_and(|v| v.trim() == "0"))
-}
-
-/// Whether the walkers count where they make the rows (unset, or anything but
-/// `0`: the default) or leave it to the hand-out's counting
-/// (`LAMBDA_VM_WALK_COUNT=0`): [`WindowedTraceBuilder::count_where_made`]'s
-/// default. Read once. The tables are the same.
-fn counted_where_made() -> bool {
-    static MADE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MADE.get_or_init(|| !std::env::var("LAMBDA_VM_WALK_COUNT").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// Whether the walkers hand each ECREC call's witness to a pool (unset, or
