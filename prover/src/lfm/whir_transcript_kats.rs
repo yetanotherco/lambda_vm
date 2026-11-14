@@ -32,11 +32,9 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
-use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
+use crypto::fiat_shamir::transcript_hash::{RpxTranscriptHash, TranscriptHash};
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension};
-
-type Transcript = DefaultTranscript<GoldilocksExtension, RpxTranscriptHash>;
 
 /// One step of a transcript script.
 ///
@@ -88,7 +86,13 @@ pub fn ext_from(seed: u64) -> FEE {
 
 /// Runs a script against the production transcript type.
 pub fn run(script: &Script) -> Observed {
-    let mut t = Transcript::new(&[]);
+    run_with::<RpxTranscriptHash>(script)
+}
+
+/// Runs a script against `DefaultTranscript` over the hash `T` names: the same
+/// steps under another sponge, for a replay arm whose host is not RPX's.
+pub fn run_with<T: TranscriptHash>(script: &Script) -> Observed {
+    let mut t = DefaultTranscript::<GoldilocksExtension, T>::new(&[]);
     let mut ext = Vec::new();
     let mut u64s = Vec::new();
     for step in script.steps {
