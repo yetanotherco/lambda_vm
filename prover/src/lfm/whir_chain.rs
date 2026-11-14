@@ -2502,19 +2502,12 @@ pub fn push_node(words: &mut Vec<LfmWord>, node: &Commitment, digest_words: usiz
 }
 
 /// A byte hash's 32-byte digest as the two words of `u32` lanes the machine
-/// holds it in: what a BLAKE3 compression writes.
+/// holds it in: what a BLAKE3 compression writes, and
+/// `proof_arena::commitment_words_for`'s layout under a byte hash (one
+/// definition: this reads it).
 pub fn byte_digest_words(node: &Commitment) -> [LfmWord; 2] {
-    core::array::from_fn(|w| {
-        core::array::from_fn(|h| {
-            let at = 4 * (4 * w + h);
-            FE::from(u64::from(u32::from_le_bytes([
-                node[at],
-                node[at + 1],
-                node[at + 2],
-                node[at + 3],
-            ])))
-        })
-    })
+    let words = super::proof_arena::commitment_words_for(node, WrapHash::Blake3);
+    [words[0], words[1]]
 }
 
 /// Round 0's base block: a `(v, 0, 0, 0)` word a value, or four values a word,
