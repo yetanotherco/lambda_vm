@@ -799,31 +799,7 @@ impl TranscriptReplay {
         };
         let n = candidates_per_coordinate(b.wrap_hash());
         let candidates: Vec<Candidate> = (0..n).map(|_| self.next_candidate(b, h)).collect();
-
-        // The fallback is the LAST candidate, matching the host's
-        // `chosen.unwrap_or(last)`: when everything missed it hands back an
-        // out-of-range value, its field rejects it, and the draw continues.
-        // Here "the field rejects it" is `assert_canonical` below, i.e. the
-        // program is unprovable — see the claim above.
-        let mut chosen = *candidates.last().expect("at least one candidate");
-        for candidate in candidates[..n - 1].iter().rev() {
-            let in_range = candidate_in_range(b, *candidate);
-            // `select(bit, l, r)` yields `l` first when the bit is 0 and `r`
-            // first when it is 1, so `l = chosen`, `r = candidate` gives
-            // "this candidate if it is in range, else what we had".
-            let (lo, _) = b.select(in_range, chosen.lo.as_cell(), candidate.lo.as_cell());
-            let (hi, _) = b.select(in_range, chosen.hi.as_cell(), candidate.hi.as_cell());
-            // Both halves are `Select` outputs of `u32` cells, so they are the
-            // `u32`s the hash chip range-checked — which is what
-            // `assert_canonical`'s derivation needs.
-            chosen = Candidate {
-                lo: Felt(lo.addr()),
-                hi: Felt(hi.addr()),
-            };
-        }
-
-        assert_canonical(b, chosen);
-        candidate_to_felt(b, chosen)
+        felt_of_candidates(b, &candidates)
     }
 
     /// One cubic-extension challenge: three independent base draws in
@@ -1011,6 +987,45 @@ pub fn assert_canonical(b: &mut LfmBuilder, c: Candidate) {
     let hi_max = b.felt_const(FE::from(HI_MAX));
     let g = b.sub(hi_max, c.hi);
     let _ = b.div(c.lo, g);
+}
+
+/// ★ One coordinate's felt from its drawn candidates, under the fixed
+/// schedule ([`TranscriptReplay::sample_felt`]'s rule, the host's
+/// `candidate_under_fixed_schedule` then its field's rejection): the FIRST
+/// candidate in range, else the LAST, then [`assert_canonical`]. So when
+/// every candidate misses the chosen one is out of range and the program has
+/// no execution; the host, where the field rejects it, draws another `n`.
+/// The machine never takes a challenge the host would not: its accepted runs
+/// are the host's whose coordinates each land within their `n` draws.
+///
+/// The candidates are the caller's (the squeeze's, in
+/// [`TranscriptReplay::sample_felt`]); a test drives it with hinted ones to
+/// reach the both-miss corner a squeeze reaches at ≈ 2⁻⁶⁴.
+pub fn felt_of_candidates(b: &mut LfmBuilder, candidates: &[Candidate]) -> Felt {
+    let n = candidates.len();
+    // The fallback is the LAST candidate, matching the host's
+    // `chosen.unwrap_or(last)`: when everything missed it hands back an
+    // out-of-range value, its field rejects it, and the draw continues.
+    // Here "the field rejects it" is `assert_canonical` below, i.e. the
+    // program is unprovable — see the claim on `sample_felt`.
+    let mut chosen = *candidates.last().expect("at least one candidate");
+    for candidate in candidates[..n - 1].iter().rev() {
+        let in_range = candidate_in_range(b, *candidate);
+        // `select(bit, l, r)` yields `l` first when the bit is 0 and `r`
+        // first when it is 1, so `l = chosen`, `r = candidate` gives
+        // "this candidate if it is in range, else what we had".
+        let (lo, _) = b.select(in_range, chosen.lo.as_cell(), candidate.lo.as_cell());
+        let (hi, _) = b.select(in_range, chosen.hi.as_cell(), candidate.hi.as_cell());
+        // Both halves are `Select` outputs of `u32` cells, so they are the
+        // `u32`s the hash chip range-checked — which is what
+        // `assert_canonical`'s derivation needs.
+        chosen = Candidate {
+            lo: Felt(lo.addr()),
+            hi: Felt(hi.addr()),
+        };
+    }
+    assert_canonical(b, chosen);
+    candidate_to_felt(b, chosen)
 }
 
 /// `hi·2^32 + lo` as a field element.
@@ -1480,6 +1495,9 @@ fn candidates_per_coordinate(hash: WrapHash) -> usize {
     };
     let schedule = match hash {
         WrapHash::Keccak => KeccakTranscriptHash::CANDIDATES_PER_COORDINATE,
+        // The STARK pipeline's BLAKE3 sponge and the 7-round base's
+        // (`Blake3StdTranscriptHash`, the WHIR base proof's transcript) share
+        // one schedule: the const below refuses a build where they part.
         WrapHash::Blake3 => Blake3TranscriptHash::CANDIDATES_PER_COORDINATE,
         // ★ One candidate, GUARANTEED rather than probabilistic: an algebraic
         // squeeze returns felts canonical by construction, so a carved `u64`
@@ -1494,6 +1512,22 @@ fn candidates_per_coordinate(hash: WrapHash) -> usize {
     };
     schedule.map_or(1, core::num::NonZeroUsize::get)
 }
+
+// The byte arm replays the 7-round base's transcript with the schedule read
+// from `Blake3TranscriptHash`: the two must draw alike.
+const _: () = {
+    use crypto::fiat_shamir::transcript_hash::{
+        Blake3StdTranscriptHash, Blake3TranscriptHash, TranscriptHash,
+    };
+    let (a, b) = (
+        Blake3TranscriptHash::CANDIDATES_PER_COORDINATE,
+        Blake3StdTranscriptHash::CANDIDATES_PER_COORDINATE,
+    );
+    assert!(
+        matches!((a, b), (Some(x), Some(y)) if x.get() == y.get()),
+        "the BLAKE3 sponges' candidate schedules differ"
+    );
+};
 
 /// Whether a candidate is a canonical field element, as a BIT.
 ///
