@@ -67,6 +67,77 @@ pub mod regen;
 /// group asks the card for more than an epoch does.
 pub const BLOCK_GROUP_POLYS: usize = 3;
 
+/// Measurement only: `LAMBDA_VM_PROBE_GROUP_POLYS` (3 to 6) sets the group
+/// size [`BlockFormat::production`] takes, for the prover and its own host
+/// verification alike; unset is [`BLOCK_GROUP_POLYS`]. [`BlockFormat::pinned`]
+/// never reads it.
+fn probe_group_polys() -> usize {
+    static POLYS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *POLYS.get_or_init(|| match std::env::var("LAMBDA_VM_PROBE_GROUP_POLYS") {
+        Err(_) => BLOCK_GROUP_POLYS,
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(n) if (3..=6).contains(&n) => {
+                eprintln!("PROBE GROUP POLYS: {n} a group (format constant {BLOCK_GROUP_POLYS})");
+                n
+            }
+            _ => panic!("LAMBDA_VM_PROBE_GROUP_POLYS={v}: a count in 3..=6"),
+        },
+    })
+}
+
+/// Measurement only: a memory load beside the finish
+/// (`LAMBDA_VM_PROBE_FINISH_LOAD_PID`, the pid of a waiting load process):
+/// it is sent `SIGUSR1` when the finish starts and `SIGTERM` when it ends,
+/// and the two instants are printed as a `PROBE FINISH LOAD` line. Unset, it
+/// does nothing.
+mod probe_finish_load {
+    use std::sync::Mutex;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    static STARTED: Mutex<Option<(Instant, f64)>> = Mutex::new(None);
+
+    fn pid() -> Option<String> {
+        std::env::var("LAMBDA_VM_PROBE_FINISH_LOAD_PID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    fn unix() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    }
+
+    fn signal(sig: &str, pid: &str) {
+        if let Err(e) = std::process::Command::new("kill").args([sig, pid]).spawn() {
+            eprintln!("PROBE FINISH LOAD: kill {sig} {pid} failed: {e}");
+        }
+    }
+
+    pub(super) fn begin() {
+        if let Some(pid) = pid() {
+            let at = unix();
+            signal("-USR1", &pid);
+            if let Ok(mut slot) = STARTED.lock() {
+                *slot = Some((Instant::now(), at));
+            }
+        }
+    }
+
+    pub(super) fn end() {
+        let Some(pid) = pid() else { return };
+        let started = STARTED.lock().ok().and_then(|mut slot| slot.take());
+        let Some((from, at)) = started else { return };
+        let secs = from.elapsed().as_secs_f64();
+        let stop = unix();
+        signal("-TERM", &pid);
+        eprintln!(
+            "PROBE FINISH LOAD: pid {pid} · go at unix {at:.3} · stop at unix {stop:.3} · finish {secs:.3} s"
+        );
+    }
+}
+
 /// The most KECCAK_RND tables a block statement may declare: a bound on what
 /// the verifier builds before anything is checked, far above any block.
 pub const BLOCK_MAX_KECCAK_RND: usize = 1 << 12;
@@ -434,7 +505,7 @@ impl BlockFormat {
     pub fn production() -> Self {
         Self {
             zf: *ZfFormat::global(),
-            group_polys: BLOCK_GROUP_POLYS,
+            group_polys: probe_group_polys(),
             max_groups: BLOCK_MAX_GROUPS,
             prepared: true,
             leaf_scale: crate::lfm::whir_block::process_leaf_scale(),
@@ -6809,6 +6880,7 @@ fn prove_streamed(
                 }
                 // The table phase's marks, for `finish` alone.
                 crate::tables::trace_builder::build_stamps::start();
+                probe_finish_load::begin();
                 if let Some(ledger) = finish_ledger {
                     crate::tables::trace_builder::build_stamps::set_hook(Some(
                         std::sync::Arc::new(move |label: &str| {
@@ -6883,6 +6955,7 @@ fn prove_streamed(
                         ledger.walk.store(0, Relaxed);
                         ledger.image.store(0, Relaxed);
                     }
+                    probe_finish_load::end();
                     let rest_regen = emitted?;
                     // The finish's end: the regenerator's window may now take
                     // the host's room.
@@ -6930,6 +7003,7 @@ fn prove_streamed(
                     ));
                 }
                 let built_rest = builder.finish(&last);
+                probe_finish_load::end();
                 if let Some(ledger) = ledger {
                     crate::tables::trace_builder::build_stamps::set_hook(None);
                     ledger.builder.store(0, Relaxed);
