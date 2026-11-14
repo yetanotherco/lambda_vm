@@ -1374,6 +1374,11 @@ fn cmd_prove_block_base(
             prover::block_whir::B3_BASE_FINAL_ENV
         );
         eprintln!(
+            "BLOCK BASE CAP: {} ({} reads 3 to 8)",
+            prover::block_whir::b3_base_cap(),
+            prover::block_whir::B3_BASE_CAP_ENV
+        );
+        eprintln!(
             "BLOCK BASE GROUP POLYS: {} ({} reads 4 or 3) · tag {}",
             cfg.format.group_polys,
             prover::block_whir::B3_BASE_GROUP_ENV,

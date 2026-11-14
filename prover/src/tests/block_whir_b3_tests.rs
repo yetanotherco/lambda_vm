@@ -400,3 +400,19 @@ fn the_blake3_base_group_knob_reads_its_words_and_refuses_the_rest() {
         assert!(b3_base_group_setting(Some(word)).is_err(), "{word:?}");
     }
 }
+
+/// The BLAKE3 base's cap knob: unset is the base's 2^8, a height from 3 to 8
+/// is that height, and anything else is refused.
+#[test]
+fn the_blake3_base_cap_knob_reads_its_words_and_refuses_the_rest() {
+    use crate::block_whir::{B3_BASE_CAP, b3_base_cap, b3_base_cap_setting};
+    assert_eq!(b3_base_cap(), B3_BASE_CAP, "no test sets the knob");
+    assert_eq!(b3_base_cap_setting(None), Ok(8));
+    for c in 3u8..=8 {
+        assert_eq!(b3_base_cap_setting(Some(&c.to_string())), Ok(c));
+    }
+    assert_eq!(b3_base_cap_setting(Some(" 6 ")), Ok(6));
+    for word in ["", "2", "9", "0", "eight", "-1"] {
+        assert!(b3_base_cap_setting(Some(word)).is_err(), "{word:?}");
+    }
+}
