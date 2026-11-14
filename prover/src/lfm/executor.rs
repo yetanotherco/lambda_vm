@@ -20,7 +20,7 @@ use super::blake3_chip::Blake3Values;
 use super::compiler::{LfmColumnGroups, LfmProgram};
 use super::exec_schedule::{self, LevelSchedule};
 use super::hash::{HASH_STATE_FELTS, LfmHasher};
-use super::instr::{Addr, BaseOp, ExtOp, HashMode, Instr, KeccakMode};
+use super::instr::{Addr, ArenaId, BaseOp, ExtOp, HashMode, Instr, KeccakMode};
 use super::word::{LfmWord, base_word, ext_word};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,9 +422,49 @@ struct Machine<'a> {
     /// arena empty until its group lands, so a read of it before then is
     /// `ArenaOutOfBounds` — an error, never a value.
     arenas: Vec<&'a [LfmWord]>,
+    /// A pieced streamed execution's arenas ([`StreamedExecution::new_pieced`]):
+    /// per arena, its pieces as `(start, len, words)` by `start`, each `words`
+    /// empty until its piece lands. Empty for every other execution, which
+    /// reads `arenas`.
+    pieces: Vec<Vec<(u32, u32, &'a [LfmWord])>>,
+}
+
+/// Word `index` of a pieced arena: from the piece that holds it, once that
+/// piece has landed. An index in no piece, or in a piece not landed yet, is
+/// `ArenaOutOfBounds` — an error, never a value.
+pub(super) fn piece_word(
+    pieces: &[(u32, u32, &[LfmWord])],
+    arena: ArenaId,
+    index: u32,
+) -> Result<LfmWord, LfmExecError> {
+    let oob = || LfmExecError::ArenaOutOfBounds { arena, index };
+    let at = pieces.partition_point(|&(start, _, _)| start <= index);
+    let &(start, len, words) = at
+        .checked_sub(1)
+        .and_then(|i| pieces.get(i))
+        .ok_or_else(oob)?;
+    if index - start >= len {
+        return Err(oob());
+    }
+    words.get((index - start) as usize).copied().ok_or_else(oob)
 }
 
 impl Machine<'_> {
+    /// Word `index` of arena `arena`.
+    #[inline]
+    fn arena_word(&self, arena: ArenaId, index: u32) -> Result<LfmWord, LfmExecError> {
+        let oob = || LfmExecError::ArenaOutOfBounds { arena, index };
+        if !self.pieces.is_empty() {
+            return piece_word(
+                self.pieces.get(arena as usize).ok_or_else(oob)?,
+                arena,
+                index,
+            );
+        }
+        let words = self.arenas.get(arena as usize).ok_or_else(oob)?;
+        words.get(index as usize).copied().ok_or_else(oob)
+    }
+
     #[inline]
     fn write(&mut self, addr: Addr, w: LfmWord) -> Result<(), LfmExecError> {
         self.memory.write(addr, w)
@@ -946,19 +986,7 @@ fn step(
                     }
                     _ => index,
                 };
-                let words =
-                    m.arenas
-                        .get(*arena as usize)
-                        .ok_or(LfmExecError::ArenaOutOfBounds {
-                            arena: *arena,
-                            index: *index,
-                        })?;
-                let w = *words
-                    .get(*index as usize)
-                    .ok_or(LfmExecError::ArenaOutOfBounds {
-                        arena: *arena,
-                        index: *index,
-                    })?;
+                let w = m.arena_word(*arena, *index)?;
                 m.write(*out, w)?;
                 sink.put(&mut records.hint, w);
             }
@@ -1227,6 +1255,7 @@ fn execute_inner(
     let mut m = Machine {
         memory: WriteOnceMemory::new(program.num_addrs as usize),
         arenas: arenas.iter().map(Vec::as_slice).collect(),
+        pieces: Vec::new(),
     };
     let mut records = LfmRecords::with_capacity(&program.groups, program.hash16());
     let mut public_words = Vec::with_capacity(program.groups.public.real_rows);
@@ -1340,6 +1369,17 @@ pub(super) fn public_rows_fit<T>(words: &Vec<T>, rows: usize) -> Result<(), LfmE
     }
 }
 
+/// One piece of a pieced streamed execution's arena
+/// ([`StreamedExecution::new_pieced`]): words `start .. start + len` of arena
+/// `arena`, landing as group `group`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArenaPiece {
+    pub arena: ArenaId,
+    pub start: u32,
+    pub len: u32,
+    pub group: usize,
+}
+
 /// An execution that runs as its arenas arrive, a group at a time: the
 /// instructions that read only landed groups run as soon as the last of those
 /// groups lands, the rest wait. A tree node's children land at different times,
@@ -1363,8 +1403,12 @@ pub struct StreamedExecution<'p, 'a, H: LfmHasher + Sync> {
     hasher: &'p H,
     levels: LevelSchedule,
     need: Vec<u64>,
-    /// Each arena's group.
+    /// Each arena's group (empty for a pieced execution).
     group_of: Vec<usize>,
+    /// A pieced execution's pieces ([`Self::new_pieced`]); empty otherwise.
+    pieces: Vec<ArenaPiece>,
+    /// Every group the execution waits for.
+    groups: u64,
     landed: u64,
     ran: usize,
     m: Machine<'a>,
@@ -1394,24 +1438,134 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
                 "a streamed execution takes at most 64 groups",
             ));
         }
-        let t = Instant::now();
-        let levels = exec_schedule::build_with_merge(program, 1);
-        // The forward pass: each address's group set, then each instruction's.
+        // An arena past the schema reads as no group: the executor rejects
+        // the read itself, as it does unstreamed.
+        let hint_group =
+            |arena: ArenaId, _index: u32| group_of.get(arena as usize).map_or(0, |&g| 1u64 << g);
+        let need = Self::need_of(program, hint_group);
+        let groups = group_of.iter().fold(0u64, |a, &g| a | (1u64 << g));
+        Self::start(program, hasher, need, group_of, Vec::new(), groups)
+    }
+
+    /// A streamed execution of `program` whose arenas land in PIECES: each
+    /// piece is a run of one arena's words, and lands as its group
+    /// ([`Self::land_piece`]). The pieces must tile every arena of the program
+    /// exactly, one piece a group, at most 64 groups. A leaf's single arena —
+    /// its roots and answers, then each base group's words — streams this way
+    /// as phase B finishes the groups; the program is unchanged.
+    ///
+    /// A hint needs the group of the piece that holds its word (a `HintOn`,
+    /// both of its words'); an index in no piece reads as no group, and the
+    /// read itself is then refused, as unstreamed.
+    pub fn new_pieced(
+        program: &'p LfmProgram,
+        pieces: Vec<ArenaPiece>,
+        hasher: &'p H,
+    ) -> Result<Self, LfmExecError> {
+        let schema = &program.arena_schema.lens;
+        let mut sorted = pieces.clone();
+        sorted.sort_by_key(|p| (p.arena, p.start));
+        if sorted.iter().any(|p| p.group >= 64) {
+            return Err(LfmExecError::Internal(
+                "a streamed execution takes at most 64 groups",
+            ));
+        }
+        let mut groups = 0u64;
+        for p in &sorted {
+            if groups & (1u64 << p.group) != 0 {
+                return Err(LfmExecError::Internal("a group holds more than one piece"));
+            }
+            groups |= 1u64 << p.group;
+        }
+        // Every arena tiled exactly: pieces in order, no gap, no overlap, no
+        // word past the arena's length.
+        for (a, &len) in schema.iter().enumerate() {
+            let mut at = 0u32;
+            for p in sorted.iter().filter(|p| p.arena as usize == a) {
+                if p.start != at || p.len == 0 {
+                    return Err(LfmExecError::Internal(
+                        "the pieces do not tile an arena (a gap, an overlap or an empty piece)",
+                    ));
+                }
+                at = at
+                    .checked_add(p.len)
+                    .ok_or(LfmExecError::Internal("a piece past the arena"))?;
+            }
+            if at != len {
+                return Err(LfmExecError::Internal(
+                    "the pieces do not cover an arena to its length",
+                ));
+            }
+        }
+        if sorted.iter().any(|p| p.arena as usize >= schema.len()) {
+            return Err(LfmExecError::Internal(
+                "a piece of an arena the program does not have",
+            ));
+        }
+        let mut by_arena: Vec<Vec<(u32, u32, usize)>> = vec![Vec::new(); schema.len()];
+        for p in &sorted {
+            by_arena[p.arena as usize].push((p.start, p.len, p.group));
+        }
+        let group_at = |arena: ArenaId, index: u32| -> u64 {
+            let Some(ps) = by_arena.get(arena as usize) else {
+                return 0;
+            };
+            let at = ps.partition_point(|&(start, _, _)| start <= index);
+            match at.checked_sub(1).and_then(|i| ps.get(i)) {
+                Some(&(start, len, g)) if index - start < len => 1u64 << g,
+                _ => 0,
+            }
+        };
+        let need = Self::need_of_pieced(program, group_at);
+        let mut streamed = Self::start(program, hasher, need, Vec::new(), sorted, groups)?;
+        streamed.m.pieces = by_arena
+            .iter()
+            .map(|ps| {
+                ps.iter()
+                    .map(|&(start, len, _)| (start, len, &[][..]))
+                    .collect()
+            })
+            .collect();
+        // `start` ran the first wave before the pieces were in place, but that
+        // wave holds only the instructions that read no arena.
+        Ok(streamed)
+    }
+
+    /// The forward pass: each address's group set, then each instruction's;
+    /// a hint adds `hint_group(arena, index)`.
+    fn need_of(program: &LfmProgram, hint_group: impl Fn(ArenaId, u32) -> u64) -> Vec<u64> {
+        Self::forward(program, |instr| match instr {
+            Instr::Hint { arena, index, .. } | Instr::HintOn { arena, index, .. } => {
+                hint_group(*arena, *index)
+            }
+            _ => 0,
+        })
+    }
+
+    /// [`Self::need_of`] for pieces: a `HintOn` needs the pieces of both of
+    /// its words.
+    fn need_of_pieced(program: &LfmProgram, group_at: impl Fn(ArenaId, u32) -> u64) -> Vec<u64> {
+        Self::forward(program, |instr| match instr {
+            Instr::Hint { arena, index, .. } => group_at(*arena, *index),
+            Instr::HintOn {
+                arena, index, alt, ..
+            } => group_at(*arena, *index) | group_at(*arena, *alt),
+            _ => 0,
+        })
+    }
+
+    fn forward(program: &LfmProgram, hint: impl Fn(&Instr) -> u64) -> Vec<u64> {
         let mut addr_need = vec![0u64; program.num_addrs as usize];
         let mut need = vec![0u64; program.instrs.len()];
         let mut scratch: Vec<Addr> = Vec::with_capacity(32);
         for (i, instr) in program.instrs.iter().enumerate() {
             scratch.clear();
             instr.schedule_reads_into(&mut scratch);
-            let mut n = scratch
+            let n = scratch
                 .iter()
                 .map(|r| addr_need.get(r.0 as usize).copied().unwrap_or(0))
-                .fold(0u64, |a, b| a | b);
-            if let Instr::Hint { arena, .. } | Instr::HintOn { arena, .. } = instr {
-                // An arena past the schema reads as no group: the executor
-                // rejects the read itself, as it does unstreamed.
-                n |= group_of.get(*arena as usize).map_or(0, |&g| 1u64 << g);
-            }
+                .fold(0u64, |a, b| a | b)
+                | hint(instr);
             need[i] = n;
             scratch.clear();
             instr.writes_into(&mut scratch);
@@ -1421,7 +1575,20 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
                 }
             }
         }
-        drop(addr_need);
+        need
+    }
+
+    fn start(
+        program: &'p LfmProgram,
+        hasher: &'p H,
+        need: Vec<u64>,
+        group_of: Vec<usize>,
+        pieces: Vec<ArenaPiece>,
+        groups: u64,
+    ) -> Result<Self, LfmExecError> {
+        let schema = &program.arena_schema.lens;
+        let t = Instant::now();
+        let levels = exec_schedule::build_with_merge(program, 1);
         let mut split = ExecSplit {
             depth_pass: t.elapsed().as_secs_f64(),
             levels: levels.levels(),
@@ -1431,6 +1598,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         let m = Machine {
             memory: WriteOnceMemory::new(program.num_addrs as usize),
             arenas: vec![&[]; schema.len()],
+            pieces: Vec::new(),
         };
         let records = LfmRecords::with_capacity(&program.groups, program.hash16());
         let public_words = Vec::with_capacity(program.groups.public.real_rows);
@@ -1442,6 +1610,8 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             levels,
             need,
             group_of,
+            pieces,
+            groups,
             landed: 0,
             ran: 0,
             m,
@@ -1453,9 +1623,46 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         Ok(streamed)
     }
 
+    /// Group `group`'s piece has landed with `words`: runs every instruction
+    /// whose last group it is. Only for a pieced execution.
+    pub fn land_piece(&mut self, group: usize, words: &'a [LfmWord]) -> Result<(), LfmExecError> {
+        if group >= 64 || self.landed & (1u64 << group) != 0 {
+            return Err(LfmExecError::Internal(
+                "a group landed twice, or is out of range",
+            ));
+        }
+        let piece = *self
+            .pieces
+            .iter()
+            .find(|p| p.group == group)
+            .ok_or(LfmExecError::Internal("a group with no piece"))?;
+        if words.len() != piece.len as usize {
+            return Err(LfmExecError::ArenaLenMismatch {
+                arena: piece.arena,
+                expected: piece.len,
+                found: words.len(),
+            });
+        }
+        let slot = self
+            .m
+            .pieces
+            .get_mut(piece.arena as usize)
+            .and_then(|ps| ps.iter_mut().find(|p| p.0 == piece.start))
+            .ok_or(LfmExecError::Internal("a piece the machine does not hold"))?;
+        slot.2 = words;
+        let before = self.landed;
+        self.landed |= 1u64 << group;
+        self.wave(Some(before))
+    }
+
     /// Group `group` has landed with `arenas` (its arenas, in arena order): runs
     /// every instruction whose last group it is.
     pub fn land(&mut self, group: usize, arenas: &'a [Vec<LfmWord>]) -> Result<(), LfmExecError> {
+        if !self.pieces.is_empty() {
+            return Err(LfmExecError::Internal(
+                "a pieced execution lands pieces (land_piece)",
+            ));
+        }
         if group >= 64 || self.landed & (1u64 << group) != 0 {
             return Err(LfmExecError::Internal(
                 "a group landed twice, or is out of range",
@@ -1515,8 +1722,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
 
     /// The execution, once every group has landed: [`execute`]'s, word for word.
     pub fn finish(mut self) -> Result<LfmExecution, LfmExecError> {
-        let groups = self.group_of.iter().fold(0u64, |a, &g| a | (1u64 << g));
-        if self.landed != groups {
+        if self.landed != self.groups {
             return Err(LfmExecError::Internal(
                 "a streamed execution finished before every group landed",
             ));
