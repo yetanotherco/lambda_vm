@@ -1291,6 +1291,20 @@ pub fn fill_head(
     fs: &[u32; 16],
     hist: &mut TableHist,
 ) {
+    fill_head_uninverted(row, prep, values, fs, hist);
+    invert_heads(row);
+}
+
+/// [`fill_head`] with each felt slot's canonicity witness `CG` left as the
+/// value it inverts (`2^32 − 1 − hi`, nonzero; zero where `CZ` is set), for a
+/// caller that inverts a block of rows at once ([`invert_heads`]).
+pub fn fill_head_uninverted(
+    row: &mut [FE],
+    prep: &[FE],
+    values: &B3lValues,
+    fs: &[u32; 16],
+    hist: &mut TableHist,
+) {
     row[..head::PREP_WIDTH].copy_from_slice(&prep[..head::PREP_WIDTH]);
     for (k, &byte) in values.block.iter().enumerate() {
         row[head::MB + k] = FE::from(u64::from(byte));
@@ -1315,7 +1329,7 @@ pub fn fill_head(
         if g == 0 {
             row[head::CZ + f] = FE::one();
         } else {
-            row[head::CG + f] = FE::from(g).inv().expect("nonzero inverts");
+            row[head::CG + f] = FE::from(g);
         }
     }
     let op = values;
@@ -1339,6 +1353,25 @@ pub fn fill_head(
                 (fs[i + 8] >> (8 * k)) & 0xFF,
             );
         }
+    }
+}
+
+/// The canonicity witnesses of whole head rows `rows` (each
+/// [`head::NUM_COLUMNS`] wide) as [`fill_head_uninverted`] left them, inverted
+/// in one batch: every nonzero `CG` cell. A zero one is a slot whose `CZ` is
+/// set, or a padding row's, and stays zero.
+pub fn invert_heads(rows: &mut [FE]) {
+    let width = head::NUM_COLUMNS;
+    debug_assert_eq!(rows.len() % width, 0, "whole head rows");
+    let zero = FE::zero();
+    let at: Vec<usize> = (0..rows.len() / width)
+        .flat_map(|r| (0..8).map(move |f| r * width + head::CG + f))
+        .filter(|&i| rows[i] != zero)
+        .collect();
+    let mut values: Vec<FE> = at.iter().map(|&i| rows[i]).collect();
+    FE::inplace_batch_inverse_sequential(&mut values).expect("every collected witness is nonzero");
+    for (&i, v) in at.iter().zip(values) {
+        rows[i] = v;
     }
 }
 
