@@ -212,6 +212,8 @@ mod whir_b3_tests;
 #[cfg(test)]
 mod whir_batch_tests;
 #[cfg(all(test, feature = "parallel"))]
+mod whir_block_b3_tests;
+#[cfg(all(test, feature = "parallel"))]
 mod whir_block_tests;
 #[cfg(test)]
 mod whir_bus_tests;

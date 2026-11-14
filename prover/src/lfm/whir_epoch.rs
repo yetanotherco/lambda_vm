@@ -68,12 +68,16 @@ pub fn emit_absorb_roots(
     carried: &[Cell],
     derived: &[LfmWord],
 ) {
-    for root in carried {
-        transcript.absorb_digest(b, *root);
+    // A root is the builder's digest width in cells: one on the felt hashes
+    // (each call below then absorbs one cell, as it always has), two words of
+    // `u32` lanes under BLAKE3.
+    let dw = super::edsl::digest_words(b) as usize;
+    for root in carried.chunks(dw) {
+        transcript.absorb_root(b, super::edsl::WrapDigest::from_cells(root));
     }
-    for word in derived {
-        let root = b.digest_const(*word);
-        transcript.absorb_digest(b, root.as_cell());
+    for words in derived.chunks(dw) {
+        let cells: Vec<Cell> = words.iter().map(|w| b.digest_const(*w).as_cell()).collect();
+        transcript.absorb_root(b, super::edsl::WrapDigest::from_cells(&cells));
     }
 }
 
