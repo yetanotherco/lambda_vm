@@ -5,9 +5,7 @@
 //! foreground pool is created at the device's greatest stream priority and a
 //! background pool of [`BACKGROUND_STREAMS`] at its least, so the card's block
 //! scheduler starts a foreground kernel's blocks before a background kernel's
-//! pending ones; with `equal`, the background pool exists but every stream has
-//! the default priority (the control for `priority`); with `off` the class is
-//! read by nobody: one pool of streams serves every thread, as it did before
+//! pending ones; with `off` the class is read by nobody: one pool of streams serves every thread, as it did before
 //! the classes. A process with no background thread runs every kernel on the
 //! foreground pool whichever it is.
 //!
@@ -45,22 +43,16 @@ pub enum StreamClasses {
     /// The foreground pool at the greatest priority, a background pool at the
     /// least (unset, `priority`).
     Priority,
-    /// A background pool, every stream at the default priority (`equal`).
-    Equal,
 }
 
 impl StreamClasses {
-    /// The knob's reading: unset or `priority` is [`Self::Priority`], `equal`
-    /// the two pools at one priority, `off` [`Self::Off`]; anything else is an
-    /// error naming the knob.
+    /// The knob's reading: unset or `priority` is [`Self::Priority`], `off`
+    /// [`Self::Off`]; anything else is an error naming the knob.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim) {
             None | Some("priority") => Ok(Self::Priority),
             Some("off") => Ok(Self::Off),
-            Some("equal") => Ok(Self::Equal),
-            Some(other) => Err(format!(
-                "{STREAM_CLASSES_ENV}={other}: off, priority or equal"
-            )),
+            Some(other) => Err(format!("{STREAM_CLASSES_ENV}={other}: off or priority")),
         }
     }
 
@@ -231,22 +223,21 @@ mod tests {
     }
 
     /// The knob's words, unset read as `priority`, and a word it does not take
-    /// refused by name.
+    /// (`equal`, the removed control, among them) refused by name.
     #[test]
-    fn the_knob_reads_off_priority_and_equal() {
+    fn the_knob_reads_off_and_priority() {
         assert_eq!(StreamClasses::parse(None), Ok(StreamClasses::Priority));
         assert_eq!(StreamClasses::parse(Some("off")), Ok(StreamClasses::Off));
         assert_eq!(
             StreamClasses::parse(Some(" priority ")),
             Ok(StreamClasses::Priority)
         );
-        assert_eq!(
-            StreamClasses::parse(Some("equal")),
-            Ok(StreamClasses::Equal)
-        );
-        let err = StreamClasses::parse(Some("high")).expect_err("not a setting");
-        assert!(err.contains(STREAM_CLASSES_ENV), "{err}");
+        for bad in ["equal", "high"] {
+            let err = StreamClasses::parse(Some(bad)).expect_err("not a setting");
+            assert!(err.contains(STREAM_CLASSES_ENV), "{err}");
+            assert!(err.contains("off or priority"), "{err}");
+        }
         assert!(!StreamClasses::Off.split());
-        assert!(StreamClasses::Priority.split() && StreamClasses::Equal.split());
+        assert!(StreamClasses::Priority.split());
     }
 }
