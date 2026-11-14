@@ -4392,7 +4392,7 @@ impl<'a> RecordsUp<'a> {
             memws: Vec::new(),
         };
         match &fill {
-            RecordsFill::KeccakRnd { .. } => {}
+            RecordsFill::KeccakRnd { .. } | RecordsFill::B3lRound { .. } => {}
             RecordsFill::Cpu { logs, decode, .. } => {
                 up.decode = Some(decode.on_card()?);
                 up.hold = Some(std::sync::Arc::new(records.clone()));
@@ -4557,10 +4557,36 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
             records: &up.memws,
             rows: up.rows,
         },
+        RecordsFill::B3lRound { ops, skip } => {
+            use crate::records::B3lRoundOp;
+            use math_cuda::fill::B3lOpC;
+            const _: () = {
+                assert!(std::mem::size_of::<B3lRoundOp>() == std::mem::size_of::<B3lOpC>());
+                assert!(std::mem::align_of::<B3lRoundOp>() == std::mem::align_of::<B3lOpC>());
+                assert!(std::mem::offset_of!(B3lRoundOp, tag) == std::mem::offset_of!(B3lOpC, tag));
+                assert!(
+                    std::mem::offset_of!(B3lRoundOp, block_len)
+                        == std::mem::offset_of!(B3lOpC, block_len)
+                );
+            };
+            RecordsInput::B3lRound {
+                // SAFETY: both are `#[repr(C)]` with the same fields in the
+                // same order (asserted above), so the same size, alignment and
+                // offsets.
+                ops: unsafe {
+                    core::slice::from_raw_parts(ops.as_ptr() as *const B3lOpC, ops.len())
+                },
+                skip: *skip,
+                rows: up.rows,
+            }
+        }
     };
     // A KECCAK_RND table's records are ops, 24 rows each, cut at `skip`.
     let fits = input.cols() == up.cols
-        && (matches!(input, RecordsInput::KeccakRnd { .. }) || up.fill.len() <= up.rows);
+        && (matches!(
+            input,
+            RecordsInput::KeccakRnd { .. } | RecordsInput::B3lRound { .. }
+        ) || up.fill.len() <= up.rows);
     fits.then_some(input)
 }
 
