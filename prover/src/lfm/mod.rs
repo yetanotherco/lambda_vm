@@ -259,6 +259,8 @@ mod whir_transcript_replay_tests;
 #[cfg(all(test, feature = "parallel"))]
 mod wlfm_leg_tests;
 #[cfg(all(test, feature = "parallel"))]
+mod wlfm_pin_print;
+#[cfg(all(test, feature = "parallel"))]
 mod wlfm_tests;
 // ★ Test-only: the dependency-structure measurement that prices a parallel
 // executor before one is written (lane E). No production path reaches it.
