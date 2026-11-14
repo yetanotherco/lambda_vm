@@ -93,6 +93,16 @@ struct LtLists {
 }
 
 impl LtLists {
+    /// The bytes its lists hold: what LT's units read, once over.
+    fn heap_bytes(&self) -> usize {
+        self.walk.heap_bytes()
+            + self.memw_lt.heap_bytes()
+            + self.memw_aligned_lt.heap_bytes()
+            + std::mem::size_of_val(&self.from_memw[..])
+            + std::mem::size_of_val(&self.from_memw_aligned[..])
+            + std::mem::size_of_val(&self.from_hints[..])
+    }
+
     fn segments(&self) -> Segmented<'_, LtOperation> {
         let mut parts: Vec<Part<'_, LtOperation>> = self.walk.parts().map(Part::Ops).collect();
         parts.extend([
@@ -2098,6 +2108,31 @@ const FAMILIES: [(&str, usize); 29] = [
     ("CPU32", cpu32::cols::NUM_COLUMNS),
 ];
 
+/// Each family's input lists' bytes, as the rest's units are made: what its
+/// jobs read, once over (PAGE: the memory state's pages). The build's marks
+/// print it beside each family's span (`p5 reads`): a measurement.
+static FAMILY_READS: std::sync::Mutex<[usize; FAMILIES.len()]> =
+    std::sync::Mutex::new([0; FAMILIES.len()]);
+
+/// `(family, bytes)` pairs summed at each family's slot; a name that is not a
+/// family is dropped.
+fn family_reads(reads: &[(&str, usize)]) -> [usize; FAMILIES.len()] {
+    let mut all = [0usize; FAMILIES.len()];
+    for &(name, bytes) in reads {
+        if let Some(slot) = all.get_mut(family(name)) {
+            *slot += bytes;
+        }
+    }
+    all
+}
+
+/// Records [`FAMILY_READS`], replacing what an earlier plan left.
+fn note_family_reads(reads: &[(&str, usize)]) {
+    if let Ok(mut slot) = FAMILY_READS.lock() {
+        *slot = family_reads(reads);
+    }
+}
+
 /// [`FAMILIES`]' index of a family.
 fn family(name: &str) -> usize {
     FAMILIES
@@ -2350,6 +2385,43 @@ impl<'a> FinishPlan<'a> {
             ecrec_ops: Arc::new(ecrec_ops),
             is_wh_rows: Arc::new(is_wh_rows),
         };
+        {
+            let s = &shared;
+            let keccak = s.keccak_ops.heap_bytes();
+            note_family_reads(&[
+                (
+                    "DECODE",
+                    std::mem::size_of_val(&cpu_ops[cpu_decoded.min(cpu_ops.len())..]),
+                ),
+                ("COPY", s.copy_ops.heap_bytes()),
+                ("KECCAK", keccak),
+                ("KECCAK_RND", keccak),
+                ("ECSM", s.ecsm_ops.heap_bytes()),
+                ("ECDAS", s.ecdas_ops.heap_bytes()),
+                ("HINT", s.hint_ops.heap_bytes()),
+                ("ECREC", s.ecrec_ops.heap_bytes()),
+                (
+                    "BLAKE3",
+                    s.blake3_ops.heap_bytes() + s.blake3_absorb_ops.heap_bytes(),
+                ),
+                ("IS_WH", std::mem::size_of_val(&s.is_wh_rows[..])),
+                ("CPU", std::mem::size_of_val(&cpu_ops[..])),
+                ("LT", s.lt.heap_bytes()),
+                ("SHIFT", s.shift_ops.heap_bytes()),
+                ("MEMW", std::mem::size_of_val(&memw_ops[..])),
+                ("MEMW_A", std::mem::size_of_val(&s.memw_aligned_ops[..])),
+                ("LOAD", std::mem::size_of_val(&load_ops[..])),
+                ("MUL", s.mul_ops.heap_bytes()),
+                ("DVRM", s.dvrm_ops.heap_bytes()),
+                ("BRANCH", s.branch_ops.heap_bytes()),
+                ("PAGE", memory_state.heap_bytes()),
+                ("MEMW_R", std::mem::size_of_val(&s.memw_register_rows[..])),
+                ("EQ", s.eq_ops.heap_bytes()),
+                ("BYTEWISE", s.bytewise_ops.heap_bytes()),
+                ("STORE", s.store_ops.heap_bytes()),
+                ("CPU32", cpu32_ops.heap_bytes()),
+            ]);
+        }
 
         // BITWISE, DECODE, KECCAK_RC, REGISTER, HALT. Counted beside the rest's
         // builds, BITWISE's job counts its multiplicities first: the slide
@@ -3606,6 +3678,19 @@ fn slide_units(
                 ));
             }
         }
+        // Each built family's input lists' bytes ([`FAMILY_READS`]).
+        let reads = FAMILY_READS
+            .lock()
+            .map(|r| *r)
+            .unwrap_or([0; FAMILIES.len()]);
+        for ((f, &(name, _)), bytes) in families.iter().zip(&FAMILIES).zip(reads) {
+            if f.first_started.is_some() && bytes > 0 {
+                build_stamps::mark(&format!(
+                    "p5 reads {name} {:.3}GiB,",
+                    bytes as f64 / (1u64 << 30) as f64
+                ));
+            }
+        }
         build_stamps::mark(&LT_ROWS_BUILT.mark());
         build_stamps::mark("p5 end");
         Ok(())
@@ -3663,3 +3748,21 @@ fn positions_of(units: &[Unit<'_>], family: usize) -> Vec<usize> {
 #[cfg(test)]
 #[path = "stream_tests.rs"]
 mod stream_tests;
+
+#[cfg(test)]
+mod read_marks_tests {
+    use super::*;
+
+    /// The read stamp adds each family's bytes at its own slot and drops a name
+    /// that is not a family. (The pure sum: the stamp itself is process state
+    /// other tests' builds write.)
+    #[test]
+    fn family_reads_land_at_their_family() {
+        let reads = family_reads(&[("PAGE", 5), ("PAGE", 2), ("EQ", 4), ("NOT_A_TABLE", 9)]);
+        assert_eq!(reads[family("PAGE")], 7);
+        assert_eq!(reads[family("EQ")], 4);
+        assert_eq!(reads[family("COPY")], 0);
+        assert_eq!(reads.iter().sum::<usize>(), 11);
+        assert_eq!(family("NOT_A_TABLE"), usize::MAX);
+    }
+}
