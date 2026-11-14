@@ -4,10 +4,10 @@
 //! evaluated coset by coset from the stack or read from a re-encoded codeword.
 //!
 //! ```text
-//! cargo test --release -p multilinear --features cuda --test whir_coset_device
+//! cargo test --release -p multilinear --features cuda,parallel --test whir_coset_device
 //! ```
 //!
-//! Needs a GPU. The device paths are asserted TAKEN (the commit stayed on the
+//! (`--features cuda` alone gives the same result.) Needs a GPU. The device paths are asserted TAKEN (the commit stayed on the
 //! card; the stack-held openings were served from the stack and nothing fell
 //! back), so a card that declined could not turn this into a host-against-host
 //! comparison.
@@ -42,12 +42,20 @@ fn config(leaves: LeafOrder, cap: CapPolicy) -> ChainConfig {
 }
 
 /// [`config`] at blowup `2^log_blowup` (`LAMBDA_VM_ZF_WHIR_BLOWUP=2` is 1).
+///
+/// The grind is 12 bits, the smallest factor the card searches
+/// (`math_cuda::grinding::GRIND_MIN_FACTOR`). Every test here compares the
+/// bytes of two proves. The card's search returns the smallest valid nonce,
+/// so the two proves absorb the same nonce whatever the build. Below 12 bits
+/// the host searches instead, and under the `parallel` feature that search
+/// returns any valid nonce (rayon's `find_any`), so two proves of one chain
+/// differ from the first nonce on.
 fn config_at(leaves: LeafOrder, cap: CapPolicy, log_blowup: usize) -> ChainConfig {
     ChainConfig {
         log_blowup,
         log_folding: 4,
         num_queries: 33,
-        grind: GrindBits::uniform(8),
+        grind: GrindBits::uniform(math_cuda::grinding::GRIND_MIN_FACTOR),
         format: ChainFormat {
             folds: WhirFolds::First(FirstFold::new(6).unwrap()),
             arity4_cap: cap,
