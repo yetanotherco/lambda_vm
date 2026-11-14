@@ -638,6 +638,7 @@ pub(crate) fn chip_loads_by_emission(
             plan,
             groups,
             carrier,
+            false,
             LeafChecks::ALL,
             Some(&mut marks),
         )?;
@@ -1139,6 +1140,56 @@ impl WhirBlockPlan {
         BlockLayout::top(STATE_WORDS, out_halves(&self.public_output).len())
     }
 
+    /// ★ The whole block verified by ONE program (route A's level 1): the
+    /// leaf walk over every group, as the carrier, with the bus closed
+    /// in-program — the sum of every table's share, less the COMMIT-bus
+    /// target, asserted zero, as the top node asserts its children's — and the
+    /// top's layout published ([`Self::top_layout`]), so [`top_claims`] reads
+    /// its words. Its arena is [`block_leaf_arena`]'s for leaf 0. Refused
+    /// unless the plan is one leaf over every group.
+    pub fn closed_block_program(&self) -> Result<LfmProgram, String> {
+        if self.partition.num_leaves() != 1 {
+            return Err(format!(
+                "a closed block program covers every group in one leaf; the plan has {} leaves",
+                self.partition.num_leaves()
+            ));
+        }
+        let mut b = self.leaf_builder();
+        emit_leaf_over(
+            &mut b,
+            self,
+            self.partition.leaf(0),
+            true,
+            true,
+            LeafChecks::ALL,
+            None,
+        )?;
+        finish(b)
+    }
+
+    /// [`Self::closed_block_program`] under `checks`, with its bus assert
+    /// kept or not (`closed = false` publishes the sum instead): a test's
+    /// mutation, to show the assert is what refuses a block whose bus does not
+    /// close.
+    #[cfg(test)]
+    pub(crate) fn closed_block_program_with(
+        &self,
+        checks: LeafChecks,
+        closed: bool,
+    ) -> Result<LfmProgram, String> {
+        let mut b = self.leaf_builder();
+        emit_leaf_over(
+            &mut b,
+            self,
+            self.partition.leaf(0),
+            true,
+            closed,
+            checks,
+            None,
+        )?;
+        finish(b)
+    }
+
     /// Leaf `k`, emitted and validated.
     pub fn leaf_program(&self, k: usize) -> Result<LfmProgram, String> {
         self.leaf_program_marked(k).map(|(program, _)| program)
@@ -1160,6 +1211,7 @@ impl WhirBlockPlan {
             self,
             self.partition.leaf(k),
             k == CARRIER,
+            false,
             LeafChecks::ALL,
             Some(&mut marks),
         )?;
@@ -2227,7 +2279,15 @@ fn emit_leaf(
     k: usize,
     checks: LeafChecks,
 ) -> Result<(), String> {
-    emit_leaf_over(b, plan, plan.partition.leaf(k), k == CARRIER, checks, None)
+    emit_leaf_over(
+        b,
+        plan,
+        plan.partition.leaf(k),
+        k == CARRIER,
+        false,
+        checks,
+        None,
+    )
 }
 
 /// Where a leaf's parts end among its instructions: the front, and its
@@ -2250,6 +2310,7 @@ fn emit_leaf_over(
     plan: &WhirBlockPlan,
     groups: &[usize],
     carrier: bool,
+    closed: bool,
     checks: LeafChecks,
     mut marks: Option<&mut LeafMarks>,
 ) -> Result<(), String> {
@@ -2547,8 +2608,15 @@ fn emit_leaf_over(
         let target = emit_expected(b, &plan.public_output, 0, z, alpha);
         sum = b.esub(sum, target);
     }
+    // A closed leaf holds every table's share: the bus is closed here, as the
+    // top asserts it over its children's.
+    if closed {
+        let zero = b.ext_const(&FEE::zero());
+        b.assert_eq_ext(sum, zero);
+    }
 
-    // ---- the publishes, in `BlockLayout::child`'s order.
+    // ---- the publishes, in `BlockLayout::child`'s order (the top's when
+    // closed: no sum).
     for word in id_words(&plan.id) {
         let cell = b.digest_const(word).as_cell();
         b.public(cell);
@@ -2558,7 +2626,9 @@ fn emit_leaf_over(
         let felt = b.felt_const(half);
         b.public(felt.as_cell());
     }
-    b.public(sum.as_cell());
+    if !closed {
+        b.public(sum.as_cell());
+    }
     b.set_arena_len(arena, at);
     Ok(())
 }
