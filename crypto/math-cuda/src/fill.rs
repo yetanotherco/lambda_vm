@@ -164,6 +164,33 @@ pub struct KeccakOpInC {
     pub input: [u64; 25],
 }
 
+/// One standard 7-round BLAKE3 compression as the lean round table's fill
+/// reads it (`multilinear::records::B3lRoundOp`): its chaining value, its 16
+/// message words, `block_len` and `flags`, and its tag on the round chain.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct B3lOpC {
+    pub h: [u32; 8],
+    pub m: [u32; 16],
+    pub block_len: u32,
+    pub flags: u32,
+    pub tag: u64,
+}
+
+const _: () = {
+    assert!(size_of::<B3lOpC>() == 112);
+    assert!(std::mem::offset_of!(B3lOpC, tag) == 104);
+};
+
+/// The lean BLAKE3 round table's columns (`prover/src/lfm/blake3_lean.rs`,
+/// `round::NUM_COLUMNS`): three preprocessed, the round's input state and
+/// message, and eight G-blocks of 40.
+pub const B3L_ROUND_COLUMNS: usize = 379;
+/// Rows a lean compression fills in the round table.
+pub const B3L_ROUND_ROWS_PER_OP: usize = 7;
+/// Threads a block for the lean round kernel.
+const B3L_BLOCK: u32 = 128;
+
 /// One MEMW_A row (the prover's `AlignedRow`): the base address, timestamp and
 /// shared old timestamp, the value and old value packed a word each, the
 /// width, and flags 0 or 1 (`limbs`: columns 25 and 26 hold the step's 16-bit
@@ -280,6 +307,7 @@ unsafe impl DeviceRepr for DecodeEntryC {}
 unsafe impl DeviceRepr for DecodeRunC {}
 unsafe impl DeviceRepr for KeccakOpC {}
 unsafe impl DeviceRepr for KeccakOpInC {}
+unsafe impl DeviceRepr for B3lOpC {}
 unsafe impl DeviceRepr for AlignedRowC {}
 unsafe impl DeviceRepr for LoadOpC {}
 unsafe impl DeviceRepr for StoreOpC {}
@@ -321,6 +349,7 @@ struct Module {
     cpu: CudaFunction,
     keccak_rnd: CudaFunction,
     keccak_rnd_in: CudaFunction,
+    b3l_round: CudaFunction,
     lfm_p1w16_socket: CudaFunction,
 }
 
@@ -341,6 +370,7 @@ fn module() -> Result<&'static Module> {
         cpu: module.load_function("fill_cpu_from_logs")?,
         keccak_rnd: module.load_function("fill_keccak_rnd")?,
         keccak_rnd_in: module.load_function("fill_keccak_rnd_in")?,
+        b3l_round: module.load_function("fill_b3l_round")?,
         lfm_p1w16_socket: module.load_function("fill_lfm_p1w16_socket")?,
         _module: module,
     };
@@ -727,6 +757,13 @@ pub enum RecordsInput<'a> {
         records: &'a [&'a [MemwOpC]],
         rows: usize,
     },
+    /// The lean BLAKE3 round table's rows `[skip, skip + rows)` of the table
+    /// `ops` make, 7 rows an op; rows past the last op zero.
+    B3lRound {
+        ops: &'a [B3lOpC],
+        skip: usize,
+        rows: usize,
+    },
 }
 
 impl std::fmt::Debug for RecordsInput<'_> {
@@ -741,6 +778,7 @@ impl std::fmt::Debug for RecordsInput<'_> {
             Self::Store { .. } => "STORE",
             Self::Shift { .. } => "SHIFT",
             Self::Memw { .. } => "MEMW",
+            Self::B3lRound { .. } => "B3L_ROUND",
         };
         write!(
             f,
@@ -763,7 +801,8 @@ impl RecordsInput<'_> {
             | Self::Load { rows, .. }
             | Self::Store { rows, .. }
             | Self::Shift { rows, .. }
-            | Self::Memw { rows, .. } => *rows,
+            | Self::Memw { rows, .. }
+            | Self::B3lRound { rows, .. } => *rows,
         }
     }
 
@@ -779,6 +818,7 @@ impl RecordsInput<'_> {
             Self::Store { .. } => STORE_COLUMNS,
             Self::Shift { .. } => SHIFT_COLUMNS,
             Self::Memw { .. } => MEMW_COLUMNS,
+            Self::B3lRound { .. } => B3L_ROUND_COLUMNS,
         }
     }
 
@@ -801,6 +841,7 @@ impl RecordsInput<'_> {
             Self::Store { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Shift { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Memw { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::B3lRound { ops, .. } => size_of_val(*ops),
         }
     }
 
@@ -816,6 +857,7 @@ impl RecordsInput<'_> {
             Self::Store { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Shift { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Memw { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::B3lRound { ops, .. } => ops.len(),
         }
     }
 }
@@ -955,7 +997,13 @@ pub(crate) fn fill_col_major_into(
         records.rows() * records.cols(),
         "the table's words"
     );
-    ensure!(records.len() <= records.rows() || matches!(records, RecordsInput::KeccakRnd { .. }));
+    ensure!(
+        records.len() <= records.rows()
+            || matches!(
+                records,
+                RecordsInput::KeccakRnd { .. } | RecordsInput::B3lRound { .. }
+            )
+    );
     if records.rows() == 0 {
         return Ok(());
     }
@@ -1062,6 +1110,11 @@ pub(crate) fn fill_col_major_into(
             let records_dev = upload_pieces(stream, pieces)?;
             launch_rows(stream, &m.memw, &records_dev, records.len(), rows, dst)
         }
+        RecordsInput::B3lRound { ops, skip, rows } => {
+            let nops = u32::try_from(ops.len()).map_err(|_| crate::invalid_value())?;
+            let ops_dev = upload(stream, ops)?;
+            launch_b3l_round(stream, &m.b3l_round, &ops_dev, nops, skip, rows, dst)
+        }
     }
 }
 
@@ -1082,6 +1135,35 @@ pub(crate) fn upload_sides(
     }
     ensure_eq!(held, n, "one side record a log");
     upload_pieces(stream, sides).map(Some)
+}
+
+/// The lean BLAKE3 round kernel's launch over ops already on the card: one
+/// thread a row, so a column's stores coalesce.
+fn launch_b3l_round(
+    stream: &Arc<CudaStream>,
+    function: &CudaFunction,
+    ops: &CudaSlice<B3lOpC>,
+    nops: u32,
+    skip: usize,
+    rows: usize,
+    dst: &mut CudaViewMut<u64>,
+) -> Result<()> {
+    let (skip_u64, rows_u64) = (skip as u64, rows as u64);
+    unsafe {
+        stream
+            .launch_builder(function)
+            .arg(ops)
+            .arg(&nops)
+            .arg(&skip_u64)
+            .arg(&rows_u64)
+            .arg(dst)
+            .launch(LaunchConfig {
+                grid_dim: (row_grid(rows, B3L_BLOCK)?, 1, 1),
+                block_dim: (B3L_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    Ok(())
 }
 
 /// A CPU table's logs on the card: copied up for this table, or a CPU chunk
@@ -1115,6 +1197,11 @@ pub(crate) enum Staged<'a> {
     Store(CudaSlice<StoreOpC>, usize),
     Shift(CudaSlice<ShiftOpC>, usize),
     Memw(CudaSlice<MemwOpC>, usize),
+    B3lRound {
+        ops: CudaSlice<B3lOpC>,
+        nops: u32,
+        skip: usize,
+    },
     /// Written by another launch (a derived table, [`crate::card_rows`]):
     /// nothing to launch here.
     Elsewhere,
@@ -1154,6 +1241,11 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
         RecordsInput::Store { records, .. } => Staged::Store(upload_pieces(stream, records)?, n),
         RecordsInput::Shift { records, .. } => Staged::Shift(upload_pieces(stream, records)?, n),
         RecordsInput::Memw { records, .. } => Staged::Memw(upload_pieces(stream, records)?, n),
+        RecordsInput::B3lRound { ops, skip, .. } => Staged::B3lRound {
+            nops: u32::try_from(ops.len()).map_err(|_| crate::invalid_value())?,
+            ops: upload(stream, ops)?,
+            skip,
+        },
     })
 }
 
@@ -1221,6 +1313,9 @@ pub(crate) fn launch_staged(
         Staged::Store(records, n) => launch_rows(stream, &m.store, records, *n, rows, dst),
         Staged::Shift(records, n) => launch_rows(stream, &m.shift, records, *n, rows, dst),
         Staged::Memw(records, n) => launch_rows(stream, &m.memw, records, *n, rows, dst),
+        Staged::B3lRound { ops, nops, skip } => {
+            launch_b3l_round(stream, &m.b3l_round, ops, *nops, *skip, rows, dst)
+        }
         Staged::Elsewhere => Ok(()),
     }
 }
