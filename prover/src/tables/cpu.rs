@@ -877,15 +877,21 @@ pub(crate) fn generate_cpu_trace_inrow_segments_as(
         "one side record a CPU op"
     );
     let num_rows = n.next_power_of_two().max(4);
-    generate_main!(form, &WIDTHS_INROW, num_rows, inrow_cols::NUM_COLUMNS_INROW, |t| {
-        fill_cpu_rows(t, segments, decode, num_rows);
-        for (row, side) in sides.iter().flat_map(|s| s.iter()).enumerate() {
-            t.set_u64(row, inrow_cols::PREV_TS_1, u64::from(side.prev_ts[0]));
-            t.set_u64(row, inrow_cols::PREV_TS_2, u64::from(side.prev_ts[1]));
-            t.set_u64(row, inrow_cols::PREV_TS_D, u64::from(side.prev_ts[2]));
-            t.set_dword_wl(row, inrow_cols::OLD_RD_0, side.old_rd);
+    generate_main!(
+        form,
+        &WIDTHS_INROW,
+        num_rows,
+        inrow_cols::NUM_COLUMNS_INROW,
+        |t| {
+            fill_cpu_rows(t, segments, decode, num_rows);
+            for (row, side) in sides.iter().flat_map(|s| s.iter()).enumerate() {
+                t.set_u64(row, inrow_cols::PREV_TS_1, u64::from(side.prev_ts[0]));
+                t.set_u64(row, inrow_cols::PREV_TS_2, u64::from(side.prev_ts[1]));
+                t.set_u64(row, inrow_cols::PREV_TS_D, u64::from(side.prev_ts[2]));
+                t.set_dword_wl(row, inrow_cols::OLD_RD_0, side.old_rd);
+            }
         }
-    })
+    )
 }
 
 /// Every row of a zeroed CPU table of `num_rows` rows: `segments`' operations,

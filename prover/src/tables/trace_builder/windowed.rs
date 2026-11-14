@@ -910,7 +910,10 @@ impl<'a> WindowedTraceBuilder<'a> {
     ///
     /// [`RegisterFormat`]: super::super::register::RegisterFormat
     /// [`RegisterFormat::InRow`]: super::super::register::RegisterFormat::InRow
-    pub fn register_format(mut self, format: super::super::register::RegisterFormat) -> Result<Self, Error> {
+    pub fn register_format(
+        mut self,
+        format: super::super::register::RegisterFormat,
+    ) -> Result<Self, Error> {
         if self.cycles > 0 {
             return Err(Error::Prover(
                 "register_format after a window was walked".to_string(),
@@ -1469,11 +1472,8 @@ impl<'a> WindowedTraceBuilder<'a> {
         let (ops, decode_trace, skip, pre) = match kept {
             None => {
                 windows.push(last);
-                let (cpu_ops, mut walk) = concatenate(
-                    windows,
-                    emitted.memw_aligned_order,
-                    emitted.register_format,
-                );
+                let (cpu_ops, mut walk) =
+                    concatenate(windows, emitted.memw_aligned_order, emitted.register_format);
                 super::build_stamps::mark("p0 concatenate");
                 let rest = KeptRest::from_walk(&mut walk);
                 let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state)?;
@@ -2404,7 +2404,11 @@ fn chunk_jobs(
             // Under the in-row register format the chunk carries its side
             // records.
             let ops = if e.register_format == super::super::register::RegisterFormat::InRow {
-                let side = Segments::one(gather(windows, |w: &WalkedWindow| w.walk.cpu_side.as_slice(), range));
+                let side = Segments::one(gather(
+                    windows,
+                    |w: &WalkedWindow| w.walk.cpu_side.as_slice(),
+                    range,
+                ));
                 ChunkOps::CpuInRow(ops, side, Arc::clone(decode))
             } else {
                 ChunkOps::Cpu(ops, Arc::clone(decode))
@@ -4619,7 +4623,10 @@ impl RegenBuilder {
 
     /// [`WindowedTraceBuilder::register_format`], for the chunks this
     /// regenerates. Before the first window only.
-    pub fn register_format(mut self, format: super::super::register::RegisterFormat) -> Result<Self, Error> {
+    pub fn register_format(
+        mut self,
+        format: super::super::register::RegisterFormat,
+    ) -> Result<Self, Error> {
         if self.cycles > 0 {
             return Err(Error::Prover(
                 "register_format after a window was walked".to_string(),
