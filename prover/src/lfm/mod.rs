@@ -52,6 +52,9 @@ pub mod keccak_adapter;
 pub mod keccak_host;
 pub mod layout;
 pub mod lde;
+/// The block's recursion as levels: each one W-LFM proof of one program.
+#[cfg(feature = "parallel")]
+pub mod levels;
 pub mod logup;
 pub mod merge;
 pub mod merkle_cap;
@@ -131,7 +134,7 @@ pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
 // The algebraic `StarkHash` configurations this differential drives the host
 // with are `#[cfg(not(feature = "cuda"))]` — inexpressible under cuda, by
 // design — so the gate follows them rather than failing to compile there.
-#[cfg(test)]
+#[cfg(all(test, feature = "parallel"))]
 mod b3l_wlfm_tests;
 #[cfg(test)]
 mod blake3_chip_tests;
@@ -171,6 +174,8 @@ mod leaf_kats;
 mod leaf_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod lean_upload_tests;
+#[cfg(all(test, feature = "parallel"))]
+mod levels_tests;
 #[cfg(test)]
 mod logup_tests;
 #[cfg(test)]
