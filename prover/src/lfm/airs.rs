@@ -868,6 +868,30 @@ fn build_air_no_prep<CS: ConstraintSet<F, E> + 'static>(
     .with_name(name)
 }
 
+/// [`build_air`] for a table outside the fixed chip set (the lean BLAKE3
+/// tables, `b3l_tables`): the same AIR shape, named and with its preprocessed
+/// count, under the root given.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_lfm_air<CS: ConstraintSet<F, E> + 'static>(
+    num_columns: usize,
+    interactions: Vec<BusInteraction>,
+    options: &ProofOptions,
+    constraint_set: CS,
+    name: &'static str,
+    root: Commitment,
+    num_prep: usize,
+) -> LfmAir<CS> {
+    build_air(
+        num_columns,
+        interactions,
+        options,
+        constraint_set,
+        name,
+        root,
+        num_prep,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_air<CS: ConstraintSet<F, E> + 'static>(
     num_columns: usize,

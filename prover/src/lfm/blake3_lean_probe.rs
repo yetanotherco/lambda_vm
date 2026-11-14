@@ -396,8 +396,17 @@ fn fill(ops: &[LeanOp], spec: &Spec) -> (Vec<FE>, usize, Vec<FE>, Vec<[u32; 8]>,
             .fold(
                 TableHist::default,
                 |mut hist, (k, (((rows, hrow), dig), op))| {
-                    let fs = lean::fill_rounds(rows, k as u64 + 1, op, None, ROUNDS, &mut hist);
-                    lean::fill_head(hrow, k as u64 + 1, op, &fs, &mut hist);
+                    let fs = lean::fill_rounds(
+                        rows,
+                        k as u64 + 1,
+                        &op.values(),
+                        op.block_len,
+                        op.flags,
+                        None,
+                        ROUNDS,
+                        &mut hist,
+                    );
+                    lean::fill_head(hrow, &op.prep(k as u64 + 1), &op.values(), &fs, &mut hist);
                     *dig = digest_of(&fs);
                     hist
                 },
@@ -412,9 +421,18 @@ fn fill(ops: &[LeanOp], spec: &Spec) -> (Vec<FE>, usize, Vec<FE>, Vec<[u32; 8]>,
         let r = rounds_of(k);
         let rows = &mut round_data[off * round::NUM_COLUMNS..(off + r) * round::NUM_COLUMNS];
         let fault = spec.fault.filter(|&(at, _)| at == k).map(|(_, f)| f);
-        let fs = lean::fill_rounds(rows, k as u64 + 1, op, fault, r, &mut hist);
+        let fs = lean::fill_rounds(
+            rows,
+            k as u64 + 1,
+            &op.values(),
+            op.block_len,
+            op.flags,
+            fault,
+            r,
+            &mut hist,
+        );
         let hrow = &mut head_data[k * head::NUM_COLUMNS..(k + 1) * head::NUM_COLUMNS];
-        lean::fill_head(hrow, k as u64 + 1, op, &fs, &mut hist);
+        lean::fill_head(hrow, &op.prep(k as u64 + 1), &op.values(), &fs, &mut hist);
         digests[k] = digest_of(&fs);
         off += r;
     }
@@ -528,7 +546,7 @@ fn airs(roots: &Roots, opts: &ProofOptions, drops: Drops) -> Airs {
             },
             opts,
             1,
-            HeadConstraints,
+            HeadConstraints::default(),
         )
         .with_name("B3R_HEAD")
         .with_preprocessed(roots.head, head::PREP_WIDTH),
@@ -661,14 +679,16 @@ fn the_lean_chip_census_matches_its_closed_form() {
     // canonicity 16.
     assert_eq!(head::MAIN_COLUMNS, 64 + 8 + 16 + 64 + 32 + 16);
     assert_eq!(head::MAIN_COLUMNS, 200);
-    assert_eq!(head_i, 2 + 32 + 8 + 32 + 10);
-    assert_eq!(head_i.div_ceil(2), 42);
-    assert_eq!(row_cells(head::MAIN_COLUMNS, head_i), 326);
+    // Memory: two chaining-value words, four lane words, two felt words, the
+    // digest's two words and the reversed digest's two (12).
+    assert_eq!(head_i, 2 + 32 + 8 + 32 + 12);
+    assert_eq!(head_i.div_ceil(2), 43);
+    assert_eq!(row_cells(head::MAIN_COLUMNS, head_i), 329);
 
     let main = ROUNDS * round::MAIN_COLUMNS + head::MAIN_COLUMNS;
     let aux = ROUNDS * round_i.div_ceil(2) + head_i.div_ceil(2);
     let cells = main + 3 * aux;
-    assert_eq!((main, aux, cells), (2_832, 497, 4_323));
+    assert_eq!((main, aux, cells), (2_832, 498, 4_326));
 
     // The same counts as the AIRs report them: the framework's own aux width.
     let opts = options();
@@ -681,7 +701,7 @@ fn the_lean_chip_census_matches_its_closed_form() {
     let (rm, ra) = a.rounds[0].trace_layout();
     let (hm, ha) = a.head.trace_layout();
     assert_eq!((rm, ra), (round::NUM_COLUMNS, 65));
-    assert_eq!((hm, ha), (head::NUM_COLUMNS, 42));
+    assert_eq!((hm, ha), (head::NUM_COLUMNS, 43));
 
     // The pieces (I-B3CHIP §1.1), each as cells a compression.
     let core_g = ROUNDS * 8 * (40 + 3 * 8); // 16 lookups = 8 aux a G
@@ -759,7 +779,7 @@ fn the_lean_constraints_are_cubic_and_dense() {
         lean::ROUND_CONSTRAINTS,
         "round",
     );
-    check(&HeadConstraints, lean::HEAD_CONSTRAINTS, "head");
+    check(&HeadConstraints::default(), lean::HEAD_CONSTRAINTS, "head");
 }
 
 /// `7·N` rows chunk with no padding: `2^(k+2) + 2^(k+1) + 2^k`.

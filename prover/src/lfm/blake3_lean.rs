@@ -1,24 +1,26 @@
-//! `B3R` — a lean, NARROW BLAKE3 compression chip: one round a row.
+//! `B3L` — a lean, NARROW BLAKE3 compression chip: one round a row.
 //!
-//! Test-only. This is the chip D-B3-3 §2.2 designs, built to turn its model
-//! into a census and a card measurement (thoughts/zf/gap3/I-B3CHIP.md). It is
-//! not registered in the LFM's AIR set and nothing outside the probes reads it.
+//! The tables that prove [`Instr::B3l`](super::instr::Instr::B3l), standard
+//! 7-round BLAKE3, on the real `LfmMem` bus. They are tables of a W-LFM proof
+//! only ([`super::b3l_tables`]): the fixed STARK chip set never carries them.
+//! The probes (`blake3_lean_probe`, `blake3_lean_block`) prove them
+//! standalone against a test mirror of the memory bus.
 //!
 //! # Shape
 //!
 //! Three AIRs prove one compression:
 //!
-//! - [`round`] (`B3R_ROUND`): seven rows, one a round, and **no transition
+//! - [`round`] (`B3L_ROUND`): seven rows, one a round, and **no transition
 //!   constraints**. A row receives `(tag, r, state, m)` on [`ROUND_BUS`] and
 //!   sends `(tag, r + 1, state', P(m))`, the way `KECCAK_RND` chains its 24
 //!   rounds (`chunking.rs`). So the table splits into chunks with no pairing
 //!   logic, and an all-zero padding row satisfies every constraint.
-//! - [`head`] (`B3R_HEAD`): one row a compression. It reads the chaining value
+//! - [`head`] (`B3L_HEAD`): one row a compression. It reads the chaining value
 //!   and the message block from `LfmMem`, range-checks them, sends the round-0
 //!   token, receives the round-7 token and computes the feed-forward of a
 //!   **256-bit digest** (`out[i] = v[i] ⊕ v[i+8]`, `i < 8`), which it writes
 //!   back to `LfmMem`.
-//! - [`table`] (`B3R_XOR`): the fixed 2^16-row byte table every lookup closes
+//! - [`table`] (`B3L_XOR`): the fixed 2^16-row byte table every lookup closes
 //!   against — XOR, XOR split into nibbles, byte pair, 16-bit value.
 //!
 //! # The G-function, 40 cells and 16 lookups
@@ -69,6 +71,7 @@ use stark::trace::TraceTable;
 
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField, zeroed_fe_vec};
 
+use super::b3l::B3lValues;
 use super::blake3::{BLAKE3_IV, BLAKE3_MSG_PERMUTATION, blake3_compress_rounds};
 
 type F = GoldilocksField;
@@ -77,11 +80,10 @@ type E = GoldilocksExtension;
 /// Standard BLAKE3: seven rounds, whatever the build's `blake3-6round` says.
 pub const ROUNDS: usize = 7;
 
-/// The fixed byte table's bus. Outside `BusId`'s range: this chip is not in the
-/// machine, and its buses must not alias one that is.
-pub const XOR_BUS: u64 = 0xB3_01;
+/// The fixed byte table's bus.
+pub const XOR_BUS: u64 = BusId::B3lXor as u64;
 /// The round chain's bus: `(tag, round, state, message)`.
-pub const ROUND_BUS: u64 = 0xB3_02;
+pub const ROUND_BUS: u64 = BusId::B3lRound as u64;
 
 /// `XOR_BUS` op tags, the tuple's first element.
 pub const OP_XOR: i64 = 0;
@@ -221,7 +223,7 @@ fn konst_bytes(w: u32) -> Bytes {
 // =========================================================================
 
 pub mod round {
-    //! `B3R_ROUND` columns: preprocessed `[MU, TAG, RND]`, then the round's
+    //! `B3L_ROUND` columns: preprocessed `[MU, TAG, RND]`, then the round's
     //! input state, its message, and 8 G-blocks of 40.
 
     pub const MU: usize = 0;
@@ -509,7 +511,7 @@ pub struct Drops {
     pub top_bits: bool,
 }
 
-/// `B3R_ROUND`'s constraints, ungated (a zero row satisfies all): per G, two
+/// `B3L_ROUND`'s constraints, ungated (a zero row satisfies all): per G, two
 /// implicit add3 carries (degree 3), two add2 carries (degree 2) and four
 /// top-bit booleanities (degree 2). 64 a row.
 #[derive(Clone, Copy, Debug, Default)]
@@ -583,25 +585,16 @@ impl ConstraintSet<F, E> for RoundConstraints {
 // =========================================================================
 
 pub mod head {
-    //! `B3R_HEAD` columns: a preprocessed instruction group, then the block,
-    //! the chaining value, the final state, the digest and the canonicity
+    //! `B3L_HEAD` columns: the instruction group
+    //! ([`crate::lfm::layout::b3l`], the program's), then the block, the
+    //! chaining value, the final state, the digest and the canonicity
     //! witnesses.
 
-    pub const MU: usize = 0;
-    pub const TAG: usize = 1;
-    /// `h` is the IV (else a chaining value read from memory).
-    pub const IVF: usize = 2;
-    /// The message is 16 `u32` lanes of 4 memory words (a Merkle parent).
-    pub const MDIG: usize = 3;
-    /// The message is 8 big-endian felts of 2 memory words (a leaf block).
-    pub const MFELT: usize = 4;
-    pub const BLEN: usize = 5;
-    pub const FLAGS: usize = 6;
-    pub const HADDR: usize = 7; // ..9
-    pub const MADDR: usize = 9; // ..13
-    pub const OADDR: usize = 13; // ..15
-    pub const OCNT: usize = 15; // ..17
-    pub const PREP_WIDTH: usize = 17;
+    pub use crate::lfm::layout::b3l::{BLEN, FLAGS, IVF, MFELTS, MLANES, MU, PREP_WIDTH, TAG};
+    pub use crate::lfm::layout::b3l::{
+        HADDR0 as HADDR, MADDR0 as MADDR, OADDR0 as OADDR, OCNT0 as OCNT, RADDR0 as RADDR,
+        RCNT0 as RCNT,
+    };
 
     /// The 64 block bytes, in message order.
     pub const MB: usize = PREP_WIDTH;
@@ -767,14 +760,14 @@ pub fn head_interactions() -> Vec<BusInteraction> {
     for w in 0..4 {
         out.push(BusInteraction::receiver(
             BusId::LfmMem,
-            Multiplicity::Column(head::MDIG),
+            Multiplicity::Column(head::MLANES),
             mem_token(head::MADDR + w, core::array::from_fn(|l| m_word(4 * w + l))),
         ));
     }
     for w in 0..2 {
         out.push(BusInteraction::receiver(
             BusId::LfmMem,
-            Multiplicity::Column(head::MFELT),
+            Multiplicity::Column(head::MFELTS),
             mem_token(
                 head::MADDR + w,
                 core::array::from_fn(|l| felt_value(4 * w + l)),
@@ -791,13 +784,38 @@ pub fn head_interactions() -> Vec<BusInteraction> {
             ),
         ));
     }
+    // The byte-reversed digest: the same 32 byte columns, read back to front.
+    // Free on the bus: a different linear form over columns the digest's sends
+    // already cover. Inert on a row whose read counts are zero.
+    for w in 0..2 {
+        out.push(BusInteraction::sender(
+            BusId::LfmMem,
+            Multiplicity::Column(head::RCNT + w),
+            mem_token(
+                head::RADDR + w,
+                core::array::from_fn(|l| reversed_lane(w, l)),
+            ),
+        ));
+    }
     out
 }
 
-/// `B3R_HEAD`'s constraints: the IV under its flag (24, degree 2) and leaf
-/// felt canonicity under the leaf mode (24, degree 3).
+/// Lane `l` of reversed-digest word `w`: reversed bytes `16w + 4l .. + 4`
+/// little-endian, i.e. digest bytes `31 − (16w + 4l + k)` for `k = 0..4`.
+fn reversed_lane(w: usize, l: usize) -> Lin {
+    (0..4).fold(Lin::default(), |acc, k| {
+        acc.plus(&Lin::col(head::OB + 31 - (16 * w + 4 * l + k)).scaled(1 << (8 * k)))
+    })
+}
+
+/// `B3L_HEAD`'s constraints: the IV under its flag (24, degree 2) and leaf
+/// felt canonicity under the felt mode (24, degree 3).
 #[derive(Clone, Copy, Debug, Default)]
-pub struct HeadConstraints;
+pub struct HeadConstraints {
+    /// A test's mutation: the felt canonicity triples return zero, to show
+    /// they are what refuses a felt whose bytes encode `v + p`.
+    pub drop_canonicity: bool,
+}
 
 pub const HEAD_CONSTRAINTS: usize = 24 + 24;
 
@@ -830,7 +848,15 @@ impl ConstraintSet<F, E> for HeadConstraints {
         // `v < p ⟺ ¬(hi = 2³²−1 ∧ lo ≠ 0)` for halves already known u32:
         // the socket's Z/GINV idiom (`blake3_socket.rs`, LEAF mode).
         for f in 0..8 {
-            let mode = b.main(0, head::MFELT);
+            if self.drop_canonicity {
+                for k in 0..3 {
+                    let zero = b.zero();
+                    b.emit_base(idx + k, zero);
+                }
+                idx += 3;
+                continue;
+            }
+            let mode = b.main(0, head::MFELTS);
             let z = b.main(0, head::CZ + f);
             let ginv = b.main(0, head::CG + f);
             let g = Lin::konst(MAX_HALF)
@@ -852,7 +878,7 @@ impl ConstraintSet<F, E> for HeadConstraints {
 // =========================================================================
 
 pub mod table {
-    //! `B3R_XOR`: row `a + 256·b`, preprocessed `[A, B, X, LO, HI]`, then one
+    //! `B3L_XOR`: row `a + 256·b`, preprocessed `[A, B, X, LO, HI]`, then one
     //! multiplicity column per op.
     pub const A: usize = 0;
     pub const B: usize = 1;
@@ -1014,6 +1040,36 @@ impl LeanOp {
         core::array::from_fn(|i| out[i])
     }
 
+    /// The compression's values, as the executor records them.
+    pub fn values(&self) -> B3lValues {
+        B3lValues {
+            h: self.chaining_value(),
+            block: self.block,
+        }
+    }
+
+    /// The head row's instruction group for this op at `tag`, as the
+    /// compiler lays it out ([`super::layout::b3l`]), with no reversed digest.
+    pub fn prep(&self, tag: u64) -> [FE; head::PREP_WIDTH] {
+        let mut row = [FE::zero(); head::PREP_WIDTH];
+        row[head::MU] = FE::one();
+        row[head::TAG] = FE::from(tag);
+        row[head::IVF] = FE::from(u64::from(self.iv));
+        row[head::MLANES] = FE::from(u64::from(!self.felt_mode));
+        row[head::MFELTS] = FE::from(u64::from(self.felt_mode));
+        row[head::BLEN] = FE::from(u64::from(self.block_len));
+        row[head::FLAGS] = FE::from(u64::from(self.flags));
+        for w in 0..2 {
+            row[head::HADDR + w] = FE::from(self.h_addr[w]);
+            row[head::OADDR + w] = FE::from(self.out_addr[w]);
+            row[head::OCNT + w] = FE::from(self.out_cnt[w]);
+        }
+        for w in 0..4 {
+            row[head::MADDR + w] = FE::from(self.m_addr[w]);
+        }
+        row
+    }
+
     /// Leaf mode's 8 felts, as the memory words carry them.
     pub fn felts(&self) -> [u64; 8] {
         core::array::from_fn(|f| {
@@ -1145,15 +1201,18 @@ fn fill_g(
 /// `round::NUM_COLUMNS` wide, the preprocessed prefix included) and return the
 /// final state. `rounds` is [`ROUNDS`] for every compression but a negative
 /// test's.
+#[allow(clippy::too_many_arguments)]
 pub fn fill_rounds(
     rows: &mut [FE],
     tag: u64,
-    op: &LeanOp,
+    values: &B3lValues,
+    block_len: u32,
+    flags: u32,
     fault: Option<Fault>,
     rounds: usize,
     hist: &mut TableHist,
 ) -> [u32; 16] {
-    let h = op.chaining_value();
+    let h = values.h;
     let mut v: [u32; 16] = [
         h[0],
         h[1],
@@ -1169,10 +1228,10 @@ pub fn fill_rounds(
         BLAKE3_IV[3],
         0,
         0,
-        op.block_len,
-        op.flags,
+        block_len,
+        flags,
     ];
-    let m = op.message();
+    let m = values.message();
     for r in 0..rounds {
         let row = &mut rows[r * round::NUM_COLUMNS..(r + 1) * round::NUM_COLUMNS];
         row[round::MU] = FE::one();
@@ -1209,28 +1268,21 @@ pub fn fill_rounds(
     v
 }
 
-/// Fill one head row from the op and its final state; records the head's
-/// lookups.
-pub fn fill_head(row: &mut [FE], tag: u64, op: &LeanOp, fs: &[u32; 16], hist: &mut TableHist) {
-    row[head::MU] = FE::one();
-    row[head::TAG] = FE::from(tag);
-    row[head::IVF] = FE::from(u64::from(op.iv));
-    row[head::MDIG] = FE::from(u64::from(!op.felt_mode));
-    row[head::MFELT] = FE::from(u64::from(op.felt_mode));
-    row[head::BLEN] = FE::from(u64::from(op.block_len));
-    row[head::FLAGS] = FE::from(u64::from(op.flags));
-    for w in 0..2 {
-        row[head::HADDR + w] = FE::from(op.h_addr[w]);
-        row[head::OADDR + w] = FE::from(op.out_addr[w]);
-        row[head::OCNT + w] = FE::from(op.out_cnt[w]);
-    }
-    for w in 0..4 {
-        row[head::MADDR + w] = FE::from(op.m_addr[w]);
-    }
-    for (k, &byte) in op.block.iter().enumerate() {
+/// Fill one head row: its instruction group `prep` (the program's
+/// `B3L_HEAD` row, [`super::layout::b3l`]), then the values of `values` and
+/// the final state `fs`; records the head's lookups.
+pub fn fill_head(
+    row: &mut [FE],
+    prep: &[FE],
+    values: &B3lValues,
+    fs: &[u32; 16],
+    hist: &mut TableHist,
+) {
+    row[..head::PREP_WIDTH].copy_from_slice(&prep[..head::PREP_WIDTH]);
+    for (k, &byte) in values.block.iter().enumerate() {
         row[head::MB + k] = FE::from(u64::from(byte));
     }
-    let h = op.chaining_value();
+    let h = values.h;
     for i in 0..4 {
         row[head::HL + 2 * i] = FE::from(u64::from(h[i] & 0xFFFF));
         row[head::HL + 2 * i + 1] = FE::from(u64::from(h[i] >> 16));
@@ -1242,8 +1294,10 @@ pub fn fill_head(row: &mut [FE], tag: u64, op: &LeanOp, fs: &[u32; 16], hist: &m
     for i in 0..8 {
         set_bytes(row, head::OB + 4 * i, fs[i] ^ fs[i + 8]);
     }
+    // The canonicity witnesses for every felt slot, whatever the mode: the
+    // constraints are gated by `MFELTS`, so on a lane block they are inert.
     for f in 0..8 {
-        let hi = u32::from_be_bytes(op.block[8 * f..8 * f + 4].try_into().expect("4 bytes"));
+        let hi = u32::from_be_bytes(values.block[8 * f..8 * f + 4].try_into().expect("4 bytes"));
         let g = u64::from(0xFFFF_FFFFu32 - hi);
         if g == 0 {
             row[head::CZ + f] = FE::one();
@@ -1251,7 +1305,7 @@ pub fn fill_head(row: &mut [FE], tag: u64, op: &LeanOp, fs: &[u32; 16], hist: &m
             row[head::CG + f] = FE::from(g).inv().expect("nonzero inverts");
         }
     }
-
+    let op = values;
     for j in 0..32 {
         hist.add(
             OP_PAIR as usize,

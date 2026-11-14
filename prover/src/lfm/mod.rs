@@ -19,8 +19,10 @@ pub mod airs;
 pub mod algebraic_commit;
 pub mod algebraic_transcript;
 pub mod b3l;
+pub mod b3l_tables;
 pub mod blake3;
 pub mod blake3_chip;
+pub mod blake3_lean;
 pub mod blake3_socket;
 pub mod block_node;
 pub mod builder;
@@ -130,9 +132,9 @@ pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
 // with are `#[cfg(not(feature = "cuda"))]` — inexpressible under cuda, by
 // design — so the gate follows them rather than failing to compile there.
 #[cfg(test)]
-mod blake3_chip_tests;
+mod b3l_wlfm_tests;
 #[cfg(test)]
-mod blake3_lean;
+mod blake3_chip_tests;
 #[cfg(test)]
 mod blake3_lean_probe;
 #[cfg(test)]

@@ -449,8 +449,9 @@ mod tests {
         let opts =
             stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2).expect("options");
         let artifacts = crate::lfm::registry::build_artifacts(&program, &opts);
-        let err =
-            crate::lfm::proof::lfm_prove(&program, &artifacts, &[], &opts).expect_err("refused");
+        let Err(err) = crate::lfm::proof::lfm_prove(&program, &artifacts, &[], &opts) else {
+            panic!("the STARK prover proved a lean compression");
+        };
         assert!(format!("{err:?}").contains("lean BLAKE3"), "{err:?}");
     }
 
