@@ -1,4 +1,4 @@
-// The WHIR base proof's BLAKE3 kernels (D-B3HYB S3): coset leaves over a base
+// The WHIR base proof's BLAKE3 kernels (the opt-in BLAKE3 base): coset leaves over a base
 // or ext3 codeword, the base leaves in the coset leaf order, and the
 // proof-of-work nonce search — all at 7 ROUNDS, standard BLAKE3, whatever
 // round count `blake3.cu`'s own cubin is built at.

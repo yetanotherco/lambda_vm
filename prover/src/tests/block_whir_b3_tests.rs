@@ -1,4 +1,4 @@
-//! D-B3HYB S3: the block's base proof under standard 7-round BLAKE3
+//! The block's base proof under standard 7-round BLAKE3
 //! ([`BaseFormat::B3_WHIR`], `Blake3Whir`) — an experiment arm admitted only
 //! to a base proved with no recursion over it ([`crate::base_only`]).
 //!

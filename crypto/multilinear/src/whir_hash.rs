@@ -307,7 +307,7 @@ impl WhirHash for P1Whir {
 /// binary trees: the leaf is the fold block's canonical big-endian bytes
 /// under `Blake3Std`, a parent the one compression over its two 32-byte
 /// children, the sponge [`Blake3StdTranscriptHash`] and the grind its digest's
-/// (D-B3HYB S3). The round count is the type's, never the build's: the crate
+/// (the opt-in BLAKE3 base). The round count is the type's, never the build's: the crate
 /// default `blake3-6round` moves the STARK pipeline's BLAKE3, not this one.
 ///
 /// Opt-in, for a block's base proof proved with no recursion over it

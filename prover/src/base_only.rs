@@ -1,8 +1,8 @@
 //! ★ The base-only declaration: the one thing that lets a block's base proof
-//! be made under another hash than the recursion's (D-B3HYB S3, the BLAKE3
-//! base experiment).
+//! be made under another hash than the recursion's (the opt-in BLAKE3
+//! base, proved with no recursion over it).
 //!
-//! The block path proves one hash end to end (`hash_pin`, Mauro 10-10): no base
+//! The block path proves one hash end to end (`hash_pin`): no base
 //! of one hash under another's recursion. A base proved with NO recursion over
 //! it is outside that rule, and that is the only case this module admits: a
 //! process [`declare`]s, once, that it proves block bases and nothing above

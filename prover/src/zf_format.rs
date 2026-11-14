@@ -576,7 +576,7 @@ impl ZfFormat {
 
     /// Refuses a round-0 leaf order the base's trees do not take: the coset
     /// order is Poseidon1's (the block's base and recursion hash) and the
-    /// 7-round BLAKE3 base's (`Blake3Whir`, D-B3HYB S3), so under any other
+    /// 7-round BLAKE3 base's (`Blake3Whir`, opt-in), so under any other
     /// base it is refused by name before anything is built.
     pub fn check_leaves(&self) -> Result<(), String> {
         match (self.whir_leaves, self.base.hash) {
