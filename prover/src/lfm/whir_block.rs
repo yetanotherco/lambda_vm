@@ -919,7 +919,10 @@ impl WhirBlockPlan {
     /// Programs only: what proves or verifies them, and whether a process may,
     /// is the caller's (a base-only process still refuses recursion at its
     /// own entry points). `num_leaves` is required: the leaf heights the
-    /// partition otherwise bounds are Poseidon1's.
+    /// partition otherwise bounds are Poseidon1's. For the same reason no
+    /// group is refused for its cost: [`LEAF_P1_CAP`] bounds a Poseidon1
+    /// leaf's socket rows, and a BLAKE3 leaf's compressions are the lean
+    /// tables' rows, which the block prover cuts into chunks of its own.
     pub fn derive_blake3(
         elf_bytes: &[u8],
         proof_options: &crate::ProofOptions,
@@ -942,7 +945,7 @@ impl WhirBlockPlan {
             Some(num_leaves),
             BLOCK_FAN_IN,
             prepared_roots,
-            LEAF_P1_CAP,
+            usize::MAX,
             share_inverse(),
             super::edsl::WrapHash::Blake3,
         )
@@ -1189,6 +1192,12 @@ impl WhirBlockPlan {
             query: self.leaf_query,
             ..ChainShape::for_hash(&self.frame.config, n_stack, self.wrap_hash)
         }
+    }
+
+    /// Group `g`'s stack: its polynomials and its variables.
+    pub fn group_stack(&self, g: usize) -> (usize, usize) {
+        let layout = &self.frame.stack_layouts[g];
+        (layout.num_polys(), layout.n_stack())
     }
 
     /// Words one commitment occupies in a leaf's arena and publishes: one
