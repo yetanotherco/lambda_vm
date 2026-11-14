@@ -296,3 +296,107 @@ fn the_lean_prefixes_are_the_programs() {
     }
     let _ = head::NUM_COLUMNS;
 }
+
+// =============================================================================
+// The BLAKE3 family
+// =============================================================================
+
+fn build_under(program: &LfmProgram, family: super::wlfm::WlfmFamily) -> WlfmBuild {
+    super::wlfm::build_wlfm_under(
+        program,
+        HASHER,
+        WlfmRate::Two,
+        super::wlfm::WlfmLevers::with_family(family),
+        false,
+    )
+    .unwrap_or_else(|e| panic!("the {family:?} W-LFM build: {e}"))
+}
+
+/// ★ A program of lean compressions proves and verifies under the BLAKE3
+/// family — commitments, transcript and grind all 7-round BLAKE3 — and is
+/// another identity than the same program under Poseidon1.
+#[test]
+fn lean_compressions_round_trip_under_blake3() {
+    use super::wlfm::WlfmFamily;
+    let _fast = test_format::set(Some(2));
+    let program = honest();
+    let b3 = build_under(&program, WlfmFamily::B3);
+    assert_eq!(b3.artifacts.family, WlfmFamily::B3);
+    let proof = prove(&program, &b3);
+    verify_wlfm(&b3.artifacts, &proof, &proof.public_words)
+        .unwrap_or_else(|e| panic!("the BLAKE3 W-LFM proof must verify: {e}"));
+    let p1 = build_under(&program, WlfmFamily::P1);
+    assert_ne!(b3.artifacts.program_id, p1.artifacts.program_id);
+}
+
+/// A proof made under one family is refused against the other's artifacts,
+/// both ways: the family is the verifier's constant.
+#[test]
+fn a_proof_under_one_family_is_refused_under_the_other() {
+    use super::wlfm::WlfmFamily;
+    let _fast = test_format::set(Some(2));
+    let program = honest();
+    let b3 = build_under(&program, WlfmFamily::B3);
+    let p1 = build_under(&program, WlfmFamily::P1);
+    let b3_proof = prove(&program, &b3);
+    let p1_proof = prove(&program, &p1);
+    assert!(verify_wlfm(&p1.artifacts, &b3_proof, &b3_proof.public_words).is_err());
+    assert!(verify_wlfm(&b3.artifacts, &p1_proof, &p1_proof.public_words).is_err());
+    // Under B3's artifacts with only the family relabelled P1 (identity
+    // unchanged), the B3 proof is still refused: the transcript and the
+    // commitments are the family's, not the label's.
+    let mut relabelled = b3.artifacts.clone();
+    relabelled.family = WlfmFamily::P1;
+    assert!(verify_wlfm(&relabelled, &b3_proof, &b3_proof.public_words).is_err());
+}
+
+/// The default family is today's: a build under `WlfmLevers::DEFAULT` and one
+/// under `with_family(P1)` are the same artifacts, with today's statement tag.
+#[test]
+fn the_default_family_is_todays_poseidon1() {
+    use super::wlfm::{WLFM_STATEMENT_TAG, WlfmFamily, WlfmLevers};
+    let program = super::wlfm_tests::honest();
+    let a = super::wlfm_tests::build(&program, WlfmRate::Two).artifacts;
+    let b = build_under(&program, WlfmFamily::P1).artifacts;
+    assert_eq!(WlfmLevers::DEFAULT.family, WlfmFamily::P1);
+    assert_eq!(a.family, WlfmFamily::P1);
+    assert_eq!(a.program_id, b.program_id);
+    assert_eq!(WlfmFamily::P1.statement_tag(), WLFM_STATEMENT_TAG);
+    assert_eq!(
+        WlfmFamily::P1.hash_name(),
+        <super::wlfm::WlfmHash as multilinear::whir_hash::WhirHash>::NAME
+    );
+}
+
+/// The in-guest W-leg walks Poseidon1 children only: a BLAKE3 child is
+/// refused at emit time, never walked under the wrong hash.
+#[test]
+fn the_w_leg_refuses_a_blake3_child() {
+    let program = honest();
+    let b3 = build_under(&program, super::wlfm::WlfmFamily::B3);
+    let child = super::wlfm_leg::WlfmChild {
+        artifacts: b3.artifacts,
+        num_public_words: 8,
+    };
+    let err = super::wlfm_leg::wlfm_leg_program(&child).expect_err("refused");
+    assert!(err.contains("Poseidon1"), "{err}");
+}
+
+/// The W-leg walks a Poseidon1 child that carries lean tables: the leg is
+/// generic over the child's tables, the lean ones included. Executed, not
+/// proved: the leg's program accepts the honest child's proof.
+#[test]
+fn the_w_leg_executes_over_a_poseidon1_child_with_lean_tables() {
+    let _fast = test_format::set(Some(2));
+    let program = honest();
+    let build = build(&program);
+    let proof = prove(&program, &build);
+    let child = super::wlfm_leg::WlfmChild {
+        artifacts: build.artifacts.clone(),
+        num_public_words: proof.public_words.len(),
+    };
+    let leg = super::wlfm_leg::wlfm_leg_program(&child).expect("the leg emits");
+    let arena = super::wlfm_leg::wlfm_leg_arena(&child, &proof).expect("the leg's arena");
+    let exec = execute(&leg, &[arena], &HASHER).expect("the leg accepts the honest child");
+    assert!(!exec.public_words.is_empty());
+}

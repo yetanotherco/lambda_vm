@@ -189,6 +189,7 @@ pub const fn folds_levers(prep: WlfmPrep) -> WlfmLevers {
         final_poly: FinalPoly::Vars(COMPRESS_FOLDS_FINAL_VARS),
         fold: Some(COMPRESS_FOLDS_FOLD),
         grind: None,
+        family: crate::lfm::wlfm::WlfmFamily::P1,
     }
 }
 
@@ -226,6 +227,7 @@ pub const fn compress2_levers(grind: u8) -> WlfmLevers {
         final_poly: FinalPoly::Vars(COMPRESS_FOLDS_FINAL_VARS),
         fold: Some(COMPRESS_FOLDS_FOLD),
         grind: Some(grind),
+        family: crate::lfm::wlfm::WlfmFamily::P1,
     }
 }
 
@@ -355,6 +357,7 @@ pub fn compress_plan(lookup: impl Fn(&str) -> Option<String>) -> Result<Compress
             final_poly,
             fold: None,
             grind: None,
+            family: crate::lfm::wlfm::WlfmFamily::P1,
         }
     };
     if rate.is_none() && explicit != WlfmLevers::DEFAULT {
