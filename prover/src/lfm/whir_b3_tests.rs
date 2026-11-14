@@ -443,6 +443,101 @@ fn grind_program(seed_felts: usize, bits: u8) -> LfmProgram {
     program
 }
 
+/// ★ THE SAMPLER'S DOUBLE MISS. A BLAKE3 coordinate draws two 64-bit
+/// candidates and keeps the first below `p`; when both miss (≈ 2⁻⁶⁴, which no
+/// squeeze reaches in a test) the host's field rejects the fallback and draws
+/// another pair, while the machine has no execution. Driven here with hinted
+/// candidates through `felt_of_candidates`, the selection `sample_felt` emits
+/// for every byte-arm draw: at each pattern but both-miss the machine's felt
+/// is the host's; at both-miss it has no execution and the host takes the
+/// next pair's. The host is `GoldilocksField::sample_field_element_from` over
+/// the fixed two-candidate schedule (`candidate_under_fixed_schedule`,
+/// `pub(crate)` in `crypto` and transcribed verbatim).
+#[test]
+fn a_double_miss_has_no_execution_and_every_other_draw_is_the_hosts() {
+    use super::transcript_replay::{Candidate, felt_of_candidates};
+    use super::word::base_word;
+    use crate::tables::types::GoldilocksField;
+    use math::field::traits::{HasDefaultTranscript, IsPrimeField};
+    const P: u64 = 0xFFFF_FFFF_0000_0001;
+    fn fixed(n: usize, next: &mut impl FnMut() -> u64) -> u64 {
+        let mut chosen: Option<u64> = None;
+        let mut last = 0u64;
+        for _ in 0..n {
+            let candidate = next();
+            last = candidate;
+            if chosen.is_none() && GoldilocksField::candidate_in_range(candidate) {
+                chosen = Some(candidate);
+            }
+        }
+        chosen.unwrap_or(last)
+    }
+    // The host: the pair, then (only on a double miss) a second pair.
+    let host = |pair: [u64; 2], redraw: [u64; 2]| -> (u64, usize) {
+        let stream = [pair[0], pair[1], redraw[0], redraw[1]];
+        let mut used = 0usize;
+        let mut next = || {
+            let c = stream[used];
+            used += 1;
+            c
+        };
+        let value = GoldilocksField::sample_field_element_from(|| fixed(2, &mut next));
+        (GoldilocksField::canonical(value.value()), used)
+    };
+    let machine = |pair: [u64; 2]| -> Option<u64> {
+        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
+        let arena = b.declare_arena(4);
+        let candidates: Vec<Candidate> = (0..2)
+            .map(|i| Candidate {
+                lo: b.hint_felt(arena, 2 * i),
+                hi: b.hint_felt(arena, 2 * i + 1),
+            })
+            .collect();
+        let felt = felt_of_candidates(&mut b, &candidates);
+        b.public(felt.as_cell());
+        let program = compile(b.finish());
+        validate(&program).expect("admissible");
+        let words: Vec<LfmWord> = pair
+            .iter()
+            .flat_map(|c| [*c & 0xFFFF_FFFF, *c >> 32])
+            .map(|half| base_word(FE::from(half)))
+            .collect();
+        execute(&program, &[words], &crate::hash_pin::BLOCK_HASHER)
+            .ok()
+            .map(|e| GoldilocksField::canonical(e.public_words[0].1[0].value()))
+    };
+    let redraw = [P + 99, 42];
+    for (pair, what) in [
+        ([7, 9], "both in range: the first"),
+        ([P + 5, 9], "the first misses: the second"),
+        ([7, P + 5], "the second misses: the first"),
+        ([P - 1, P], "the boundary: p - 1 is in range"),
+        ([P, P - 1], "p misses: the second"),
+        ([u64::MAX, 0], "the largest misses: zero"),
+    ] {
+        let (want, used) = host(pair, redraw);
+        assert_eq!(used, 2, "{what}: the host draws one pair");
+        assert_eq!(
+            machine(pair),
+            Some(want),
+            "{what}: the machine's felt is the host's"
+        );
+    }
+    for pair in [[P + 5, P + 11], [P, P], [u64::MAX, P]] {
+        let (want, used) = host(pair, redraw);
+        assert_eq!(
+            (want, used),
+            (42, 4),
+            "{pair:x?}: the host draws a second pair and takes its first in range"
+        );
+        assert_eq!(
+            machine(pair),
+            None,
+            "{pair:x?}: both candidates miss, so the machine has no execution"
+        );
+    }
+}
+
 /// ★ THE GRIND GATE AND ITS TAMPER ARM. At several factors the machine accepts
 /// the host's own smallest valid nonce, leaves the host's transcript after
 /// absorbing it, and refuses to execute on every nonce
@@ -1114,6 +1209,74 @@ mod chain {
         let shape = ChainShape::for_hash(&cfg, 10, WrapHash::Keccak);
         assert!(shape.final_at.is_some());
         program_with(LfmBuilder::new().with_wrap_hash(WrapHash::Keccak), &shape);
+    }
+
+    /// The cap height on one production chain under the BLAKE3 base's format
+    /// (a single 2^27 polynomial, the final polynomial on, the lean query
+    /// check and lowering), priced in CELLS: compressions at the lean tables'
+    /// 2,832 cells each, plus the field chips' real rows times their value
+    /// columns (and with their LogUp columns at three felts each). The cap's
+    /// mux is `2^c − 1` `Select` rows a digest word an opening, so the field
+    /// side grows with the cap while the compressions shrink. Emission only.
+    /// Prints; asserts that the forms agree with the emission.
+    #[test]
+    #[ignore = "census: emits six production-shape chain programs"]
+    fn the_production_chain_cells_by_cap() {
+        use super::super::whir_chain::{ChipRows, LeafQuery, chain_perms};
+        use super::super::whir_transcript::SpongeEntry;
+        use crate::block_whir::BlockFormat;
+        use crate::hash_pin::{BlockFamily, ProofFamily};
+        use crate::zf_format::ZfFormat;
+        use stark::proof::options::BaseFormat;
+        super::LEAN.with(|c| c.set(true));
+        let zf = ZfFormat::DEFAULT.with_base(BaseFormat::B3_WHIR);
+        let format = BlockFormat {
+            zf,
+            ..BlockFormat::production()
+        };
+        let n = zf.whir_stack.get();
+        let mut config = format.chain_config(&[(1, n)]);
+        config.format.group = multilinear::whir_chain::GroupFold::PerPoly;
+        config.format.round0 = multilinear::whir_chain::Round0Trees::Each;
+        for cap in 3u8..=8 {
+            let mut c = config;
+            c.format.cap = CapPolicy::Fixed(cap);
+            let shape = ChainShape {
+                query: LeafQuery::Lean,
+                ..ChainShape::for_hash(&c, n, WrapHash::Blake3)
+            };
+            let leg = program(&shape);
+            let (compressions, other) = hash_rows(&leg);
+            assert_eq!(other, 0);
+            assert_eq!(
+                compressions,
+                chain_perms(&shape, SpongeEntry::fresh_for(WrapHash::Blake3))
+            );
+            let chips = super::super::airs::lfm_chip_census_with_hasher(
+                &leg,
+                leg.hasher(<BlockFamily as ProofFamily>::SOCKET),
+            );
+            let field: u64 = chips.iter().map(|c| c.real_rows * c.main_cols as u64).sum();
+            let field_aux: u64 = chips
+                .iter()
+                .map(|c| c.real_rows * (c.main_cols + 3 * c.aux_cols) as u64)
+                .sum();
+            let select: u64 = chips
+                .iter()
+                .filter(|c| c.name.contains("SELECT"))
+                .map(|c| c.real_rows * c.main_cols as u64)
+                .sum();
+            let hash = compressions as u64 * 2_832;
+            println!(
+                "CAP CELLS c={cap}: caps {:?} · {compressions} compressions ({hash} lean cells) · field main \
+                 {field} (select {select}; with LogUp {field_aux}) · total {} (with LogUp {}) · rows {:?}",
+                shape.caps,
+                hash + field,
+                hash + field_aux,
+                ChipRows::of(&leg)
+            );
+        }
+        super::LEAN.with(|c| c.set(false));
     }
 
     /// The BLAKE3 base's final polynomial on one production chain (a single
@@ -2139,6 +2302,25 @@ fn the_blake3_base_format_run_costs_its_closed_form() {
         today_shape.caps,
         alone_total as i64 - today_total as i64,
         total as i64 - without_total as i64
+    );
+    // Four polynomials a group (`B3_BASE_GROUP_POLYS`): one run of four.
+    let four = ChainShape {
+        query: LeafQuery::Lean,
+        ..ChainShape::for_hash(&format.chain_config(&[(4, n)]), n, WrapHash::Blake3)
+    }
+    .run(4);
+    let four_total = chain_perms(&four, SpongeEntry::fresh_for(WrapHash::Blake3));
+    println!(
+        "BLAKE3 BASE FORMAT RUN x4: {four_total} compressions ({} a polynomial) against the run of three's \
+         {total} ({} a polynomial): {:+.1} % a group, {:+.1} % a polynomial",
+        four_total / 4,
+        total / 3,
+        100.0 * (four_total as f64 / total as f64 - 1.0),
+        100.0 * ((four_total as f64 / 4.0) / (total as f64 / 3.0) - 1.0)
+    );
+    assert!(
+        four_total > total && four_total * 3 < total * 4,
+        "a run of four costs less a polynomial"
     );
     assert_eq!(today_total, 41_109, "today's chain");
     assert_eq!(
