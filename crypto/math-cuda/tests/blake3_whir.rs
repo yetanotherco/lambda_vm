@@ -1,4 +1,4 @@
-//! The WHIR base proof's 7-round BLAKE3 on the card (D-B3HYB S3): the module
+//! The WHIR base proof's 7-round BLAKE3 on the card (the opt-in BLAKE3 base): the module
 //! loads at 7 rounds whatever the STARK cubin's count, its nonce search
 //! returns the host predicate's smallest valid nonce, its coset-ordered base
 //! tree is the host's, and — box tier, `#[ignore]` — the microbenchmark that

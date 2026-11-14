@@ -348,7 +348,7 @@ pub fn checked_base(base: &BaseFormat) -> Result<(), Error> {
 /// The base of a block proved with NO recursion over it
 /// ([`crate::base_only`]), or a typed refusal: [`checked_base`]'s base, or —
 /// once the process declared base-only — [`BaseFormat::B3_WHIR`], the
-/// 7-round BLAKE3 base (D-B3HYB S3). Read by the base's own prove and verify
+/// opt-in 7-round BLAKE3 base. Read by the base's own prove and verify
 /// sites alone ([`crate::with_base_hash!`]); the recursion admits through
 /// [`checked_base`], which refuses BLAKE3 whatever this process declared.
 pub fn checked_base_only(base: &BaseFormat) -> Result<(), Error> {

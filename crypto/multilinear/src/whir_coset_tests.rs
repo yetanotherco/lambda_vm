@@ -269,7 +269,7 @@ fn a_coset_stack_verifies_whole_or_retired() {
     a_coset_stack_verifies_whole_or_retired_under::<P1Whir>();
 }
 
-/// The same over the 7-round BLAKE3 base's binary trees (D-B3HYB S3).
+/// The same over the 7-round BLAKE3 base's binary trees.
 #[test]
 fn a_coset_stack_verifies_whole_or_retired_under_blake3_std() {
     a_coset_stack_verifies_whole_or_retired_under::<Blake3Whir>();

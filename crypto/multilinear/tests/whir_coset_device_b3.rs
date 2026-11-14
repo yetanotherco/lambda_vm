@@ -1,5 +1,5 @@
 //! `whir_coset_device.rs` under the 7-round BLAKE3 base's binary trees
-//! (`Blake3Whir`, D-B3HYB S3): the coset leaf order on the card — a round-0
+//! (`Blake3Whir`, the opt-in BLAKE3 base): the coset leaf order on the card — a round-0
 //! tree the card commits in the coset order is the host's, and a stack retired
 //! and revived over its resident columns proves the whole tree's bytes whether
 //! its openings are evaluated coset by coset from the stack or read from a

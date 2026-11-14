@@ -1,4 +1,4 @@
-//! The WHIR base proof's BLAKE3 kernels (D-B3HYB S3): the
+//! The WHIR base proof's BLAKE3 kernels (the opt-in BLAKE3 base): the
 //! [`crate::DeviceHash::Blake3`] arm of the WHIR leaf, tree and grind
 //! dispatches, at **7 rounds** — standard BLAKE3, the host's
 //! `crypto::hash::blake3::Blake3Std` — whatever round count the STARK

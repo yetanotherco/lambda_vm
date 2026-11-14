@@ -500,7 +500,7 @@ enum Commands {
     },
 
     /// Prove a block's WHIR BASE proof alone — no recursion over it — and
-    /// verify it on the host (D-B3HYB S3, the BLAKE3 base experiment)
+    /// verify it on the host (the opt-in BLAKE3 base proves here and only here)
     ///
     /// The production base prover and posture, without the tree: the base
     /// under `--base p1` (the block family's Poseidon1, today's) or `--base b3`

@@ -1,7 +1,7 @@
 //! ⛔ MEASUREMENT ONLY, on no proving path: the card seconds of a WHIR tree's
 //! leaf pass and inner levels, and of one proof-of-work search, under each
-//! device hash — the D-B3HYB S3 microbenchmark (BLAKE3 against Poseidon1 at
-//! the base proof's shapes). The kernels timed are the ones the prover
+//! device hash — a microbenchmark of BLAKE3 against Poseidon1 at
+//! the base proof's shapes. The kernels timed are the ones the prover
 //! launches (`crate::whir::coset_leaf_kernel`, `crate::whir::build_inner_tree_levels`,
 //! `crate::grinding`'s search), over a codeword of pseudo-random canonical
 //! values the card writes itself.
