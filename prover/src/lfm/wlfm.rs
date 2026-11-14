@@ -1210,6 +1210,31 @@ pub(crate) fn prove_wlfm_traces_as(
 }
 
 /// [`prove_wlfm_traces_as`] under the build's hash `H`.
+/// What one W-LFM prove spent, by phase and by group: the host's table
+/// preparation, phase A (every group committed) and phase B (argued and
+/// opened), each group's stamps, and the card ledger's budget and its promise
+/// when the prove took the card.
+#[derive(Clone, Debug, Default)]
+pub struct WlfmStamps {
+    pub prep: f64,
+    pub phase_a: f64,
+    pub phase_b: f64,
+    pub groups: Vec<multilinear_block::GroupStamps>,
+    pub card_budget: u64,
+    pub card_reserved_at_start: u64,
+}
+
+thread_local! {
+    static LAST_WLFM_STAMPS: std::cell::RefCell<Option<WlfmStamps>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take the most recent W-LFM prove's stamps ON THIS THREAD, clearing them;
+/// `None` when nothing proved here since the last take.
+pub fn take_wlfm_stamps() -> Option<WlfmStamps> {
+    LAST_WLFM_STAMPS.with(|c| c.borrow_mut().take())
+}
+
 fn prove_traces_under<H: WhirHash>(
     artifacts: &WlfmArtifacts,
     stacks: &[GroupPrepared<H>],
@@ -1332,6 +1357,9 @@ fn prove_traces_under<H: WhirHash>(
     // ⛔ THE CARD, for the prove's device phases: the permit the STARK prover
     // holds around `multi_prove`. Taken after the host prep above.
     let _card = super::device_permit::hold_labeled("multi_prove");
+    let card_budget = multilinear::gpu::reserve_budget();
+    let card_reserved_at_start = multilinear::gpu::ledger_reserved();
+    let t_a = std::time::Instant::now();
     let config = &artifacts.config;
     let mut transcript = H::sponge();
     absorb_wlfm_statement_for(
@@ -1363,6 +1391,8 @@ fn prove_traces_under<H: WhirHash>(
         }
     }
     .map_err(|e| format!("{e:?}"))?;
+    let phase_a = t_a.elapsed().as_secs_f64();
+    let t_b = std::time::Instant::now();
     let borrowed: Vec<Vec<&multilinear::mle::Mle<F>>> = stacks
         .iter()
         .map(|p| multilinear::stacking::borrow(&p.columns))
@@ -1378,7 +1408,7 @@ fn prove_traces_under<H: WhirHash>(
         })
         .collect();
     let order: Vec<usize> = (0..artifacts.sizes.len()).collect();
-    let (proof, argues, prepared, _stamps, commit_ood) = match proving {
+    let (proof, argues, prepared, group_stamps, commit_ood) = match proving {
         WlfmProving::Held => multilinear_block::block_prove_on_forks::<F, E, H::Sponge, H>(
             block,
             config,
@@ -1402,6 +1432,17 @@ fn prove_traces_under<H: WhirHash>(
         ),
     }
     .map_err(|e| format!("{e:?}"))?;
+    let phase_b = t_b.elapsed().as_secs_f64();
+    LAST_WLFM_STAMPS.with(|c| {
+        *c.borrow_mut() = Some(WlfmStamps {
+            prep: prep_secs,
+            phase_a,
+            phase_b,
+            groups: group_stamps,
+            card_budget,
+            card_reserved_at_start,
+        })
+    });
     let permit_wait = (super::device_permit::waited_secs() - waited_before).max(0.0);
     let held = (t_held.elapsed().as_secs_f64() - permit_wait).max(0.0);
     super::proof::record_prove_split(super::proof::ProveSplit {
