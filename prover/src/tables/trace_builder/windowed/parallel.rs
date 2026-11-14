@@ -123,6 +123,8 @@ struct WalkSettings {
     decode: Arc<DecodeTable>,
     /// The run's MEMW_A form ([`WindowedTraceBuilder::memw_aligned_order`]).
     order: crate::tables::memw_aligned::MemwAlignedOrder,
+    /// The run's register format ([`WindowedTraceBuilder::register_format`]).
+    registers: crate::tables::register::RegisterFormat,
     lookups: bool,
     batch: usize,
     /// [`WindowedTraceBuilder::defer_ecrec_witnesses`].
@@ -261,6 +263,7 @@ impl WindowWalker {
         let walked = walk_window(
             &s.decode,
             s.order,
+            s.registers,
             s.lookups,
             s.batch,
             s.defer_ecrec,
@@ -316,6 +319,7 @@ impl WindowWalker {
         let mut walked = walk_window(
             &s.decode,
             s.order,
+            s.registers,
             s.lookups,
             s.batch,
             s.defer_ecrec,
@@ -647,6 +651,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
     let settings = Arc::new(WalkSettings {
         decode: Arc::clone(&builder.decode),
         order: builder.emitted.memw_aligned_order,
+        registers: builder.emitted.register_format,
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
         defer_ecrec: builder.defer_ecrec,

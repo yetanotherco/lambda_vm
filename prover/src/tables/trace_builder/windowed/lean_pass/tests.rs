@@ -167,6 +167,7 @@ impl Setup {
         Walker {
             decode: &self.decode,
             order: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+            registers: crate::tables::register::RegisterFormat::Tokens32,
             lookups: self.lookups,
             keep_logs: false,
             batch: self.batch,

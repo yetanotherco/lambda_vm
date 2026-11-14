@@ -969,7 +969,7 @@ impl VmAirs {
     /// in-row interactions, REGX in MEMW_R's slot (the same names and counts:
     /// the block's routes and its statement read them), REGISTER a register a
     /// row, HALT with its PC bridge on the REG bus.
-    fn swap_in_row_registers(&mut self, opts: &ProofOptions, inputs: &BlockAirInputs) {
+    pub(crate) fn swap_in_row_registers(&mut self, opts: &ProofOptions, inputs: &BlockAirInputs) {
         use crate::tables::{cpu, register};
         let heights = &inputs.cpu_heights;
         self.cpus = heights

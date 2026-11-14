@@ -902,6 +902,24 @@ impl<'a> WindowedTraceBuilder<'a> {
         Ok(self)
     }
 
+    /// How register accesses are checked ([`RegisterFormat`], the block
+    /// format's): under [`RegisterFormat::InRow`] the walk writes each CPU
+    /// row's side record instead of its register rows, REGX takes every other
+    /// register access and the keep-alives, and the finish builds REGISTER a
+    /// register a row. Before the first window only.
+    ///
+    /// [`RegisterFormat`]: super::super::register::RegisterFormat
+    /// [`RegisterFormat::InRow`]: super::super::register::RegisterFormat::InRow
+    pub fn register_format(mut self, format: super::super::register::RegisterFormat) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "register_format after a window was walked".to_string(),
+            ));
+        }
+        self.emitted.register_format = format;
+        Ok(self)
+    }
+
     /// A test's fault ([`StreamSkip::card_fill_fault`]): with
     /// [`Self::card_fill_keccak_rnd`], each KECCAK_RND table's records start
     /// `rows` rows late, the same wrong table however they are filled.
@@ -1369,6 +1387,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         let cpu_ops = super::collect_cpu_ops_from(logs, decode, self.cycles)?;
         self.cycles += logs.len();
         let mut walk = WalkOutputs::with_capacity(cpu_ops.len(), self.emitted.memw_aligned_order);
+        walk.memw.registers = self.emitted.register_format;
         // The last window's in-walk lookups are listed and counted by the
         // table phase, lean or not.
         collect_ops_from_cpu_into(
@@ -1450,7 +1469,11 @@ impl<'a> WindowedTraceBuilder<'a> {
         let (ops, decode_trace, skip, pre) = match kept {
             None => {
                 windows.push(last);
-                let (cpu_ops, mut walk) = concatenate(windows, emitted.memw_aligned_order);
+                let (cpu_ops, mut walk) = concatenate(
+                    windows,
+                    emitted.memw_aligned_order,
+                    emitted.register_format,
+                );
                 super::build_stamps::mark("p0 concatenate");
                 let rest = KeptRest::from_walk(&mut walk);
                 let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state)?;
@@ -1547,7 +1570,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 }
                 kept.append(last, &decode);
                 let (cpu_ops, walk, rest, decode_trace) =
-                    kept.into_run(&decode, emitted.memw_aligned_order)?;
+                    kept.into_run(&decode, emitted.memw_aligned_order, emitted.register_format)?;
                 super::build_stamps::mark("p0 concatenate");
                 let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state)?;
                 super::build_stamps::mark("p0 assemble");
@@ -1680,6 +1703,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             Walker {
                 decode: &self.decode,
                 order: self.emitted.memw_aligned_order,
+                registers: self.emitted.register_format,
                 lookups: !self.lean.lookups,
                 keep_logs: self.keeps_logs(),
                 batch: self.walk_batch,
@@ -1798,6 +1822,8 @@ pub struct Walker<'b> {
     decode: &'b DecodeTable,
     /// The run's MEMW_A form ([`WindowedTraceBuilder::memw_aligned_order`]).
     order: MemwAlignedOrder,
+    /// The run's register format ([`WindowedTraceBuilder::register_format`]).
+    registers: crate::tables::register::RegisterFormat,
     /// List the in-walk lookups (`false` under [`WalkLean::lookups`]).
     lookups: bool,
     /// Keep each window's logs ([`WindowedTraceBuilder::keeps_logs`]).
@@ -1833,6 +1859,7 @@ impl Walker<'_> {
         let walked = walk_window(
             self.decode,
             self.order,
+            self.registers,
             self.lookups,
             self.batch,
             self.defer_ecrec,
@@ -1876,6 +1903,7 @@ impl Walker<'_> {
 fn walk_window(
     decode: &DecodeTable,
     order: MemwAlignedOrder,
+    register_format: crate::tables::register::RegisterFormat,
     lookups: bool,
     batch: usize,
     defer_ecrec: bool,
@@ -1899,6 +1927,7 @@ fn walk_window(
     });
     // Without `lookups`, the accumulator counts them (`absorb`).
     let mut walk = WalkOutputs::for_walk_sized(logs.len(), lookups, sizes, order);
+    walk.memw.registers = register_format;
     if let Some(window) = words {
         walk.memw.set_words(window, logs.len() * 3);
     }
@@ -2370,17 +2399,20 @@ fn chunk_jobs(
         let len: usize = windows.iter().map(|w| w.cpu_ops.len()).sum();
         while (e.cpu + 1) * m.cpu <= len {
             let index = e.cpu;
+            let range = index * m.cpu..(index + 1) * m.cpu;
+            let ops = Segments::one(gather(windows, list_cpu, range.clone()));
+            // Under the in-row register format the chunk carries its side
+            // records.
+            let ops = if e.register_format == super::super::register::RegisterFormat::InRow {
+                let side = Segments::one(gather(windows, |w: &WalkedWindow| w.walk.cpu_side.as_slice(), range));
+                ChunkOps::CpuInRow(ops, side, Arc::clone(decode))
+            } else {
+                ChunkOps::Cpu(ops, Arc::clone(decode))
+            };
             jobs.push(ChunkJob {
                 table: StreamTable::Cpu,
                 index,
-                ops: ChunkOps::Cpu(
-                    Segments::one(gather(
-                        windows,
-                        list_cpu,
-                        index * m.cpu..(index + 1) * m.cpu,
-                    )),
-                    Arc::clone(decode),
-                ),
+                ops,
             });
             e.cpu += 1;
         }
@@ -2949,6 +2981,9 @@ impl WordChunk {
 /// The run so far under [`WindowedTraceBuilder::drop_streamed_ops`].
 struct Kept {
     cpu: Tail<super::CpuOperation>,
+    /// The CPU tail's side records, in step with it, under the in-row
+    /// register format; empty otherwise.
+    cpu_side: Tail<super::super::cpu::CpuSide>,
     /// The CPU tail's logs, in step with it, while
     /// [`WindowedTraceBuilder::card_fill_streamed`] holds CPU chunks as logs;
     /// `None` without, and from a window that came without its logs on.
@@ -3085,6 +3120,7 @@ impl Kept {
     fn new(decode: DecodeTrace, max_rows: &crate::tables::MaxRowsConfig) -> Self {
         Self {
             cpu: Tail::new(),
+            cpu_side: Tail::new(),
             logs: None,
             register_rows: Tail::new(),
             words: None,
@@ -3245,9 +3281,13 @@ impl Kept {
             copy_ops,
             hint_ops,
             ecrec_ops,
+            cpu_side,
         } = walk;
         if !self.listless {
             self.cpu.push(cpu_ops);
+            if !cpu_side.is_empty() {
+                self.cpu_side.push(cpu_side);
+            }
         }
         match self.words.as_mut() {
             Some(kept) => kept.append(first as u64, memw.words, memw.register_rows, logs_for_words),
@@ -3278,9 +3318,11 @@ impl Kept {
         self,
         decode_table: &DecodeTable,
         order: MemwAlignedOrder,
+        registers: super::super::register::RegisterFormat,
     ) -> Result<(Vec<super::CpuOperation>, WalkOutputs, KeptRest, Table), Error> {
         let Kept {
             cpu,
+            cpu_side,
             logs: _,
             register_rows,
             words,
@@ -3315,8 +3357,10 @@ impl Kept {
             general: general.into_vec(),
             words: None,
             order,
+            registers,
             refused: None,
         };
+        walk.cpu_side = cpu_side.into_vec();
         walk.load_ops = load.into_vec();
         walk.lt_ops = lt.into_vec();
         walk.shift_ops = shift.into_vec();
@@ -3726,14 +3770,24 @@ fn tail_jobs(
         }
         // The chunk's logs leave the logs' tail with its ops.
         let logs = kept.logs.as_mut().map(|tail| tail.take_segments(m.cpu));
-        let ops = cpu_chunk_ops(
-            ops,
-            logs,
-            e.cpu,
-            m.cpu,
-            decode_table,
-            card.as_mut().map(|(c, s)| (*c, &mut **s)),
-        );
+        // Under the in-row register format the chunk carries its side
+        // records, and the host fills it.
+        let ops = if kept.cpu_side.len > 0 {
+            ChunkOps::CpuInRow(
+                ops,
+                kept.cpu_side.take_segments(m.cpu),
+                Arc::clone(decode_table),
+            )
+        } else {
+            cpu_chunk_ops(
+                ops,
+                logs,
+                e.cpu,
+                m.cpu,
+                decode_table,
+                card.as_mut().map(|(c, s)| (*c, &mut **s)),
+            )
+        };
         stamps.note(StreamTable::Cpu, taken, t.elapsed().as_secs_f64(), copied);
         jobs.push(ChunkJob {
             table: StreamTable::Cpu,
@@ -3979,6 +4033,7 @@ fn join<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + 
 fn concatenate(
     windows: Vec<WalkedWindow>,
     order: MemwAlignedOrder,
+    registers: super::super::register::RegisterFormat,
 ) -> (Vec<super::CpuOperation>, WalkOutputs) {
     /// The windows' lists one after another, in window order. Under `parallel`
     /// each window's part is moved into its own disjoint slice of the output
@@ -4032,8 +4087,10 @@ fn concatenate(
     let mut ecdas = Vec::with_capacity(n);
     let mut hint = Vec::with_capacity(n);
     let mut ecrec = Vec::with_capacity(n);
+    let mut cpu_side = Vec::with_capacity(n);
     for WalkedWindow { cpu_ops, walk, .. } in windows {
         cpu.push(cpu_ops);
+        cpu_side.push(walk.cpu_side);
         register_rows.push(walk.memw.register_rows);
         aligned.push(walk.memw.aligned);
         general.push(walk.memw.general);
@@ -4067,8 +4124,10 @@ fn concatenate(
             general,
             words: None,
             order,
+            registers,
             refused: None,
         },
+        cpu_side: cat(cpu_side),
         load_ops: load,
         lt_ops: lt,
         shift_ops: shift,
@@ -4098,6 +4157,13 @@ pub struct ChunkJob {
 enum ChunkOps {
     /// The ops and the decode they are read with.
     Cpu(Segments<super::CpuOperation>, Arc<DecodeTable>),
+    /// Under the in-row register format: the ops, their side records (one an
+    /// op, in step) and the decode; the host fills the CPU table's 42 columns.
+    CpuInRow(
+        Segments<super::CpuOperation>,
+        Segments<super::super::cpu::CpuSide>,
+        Arc<DecodeTable>,
+    ),
     /// The logs of its cycles, for the card to fill it from
     /// ([`WindowedTraceBuilder::card_fill_streamed`]), and its ops, spent: let
     /// go of where it is laid out.
@@ -4130,6 +4196,7 @@ impl ChunkJob {
         use super::vec_heap_bytes as b;
         match &self.ops {
             ChunkOps::Cpu(ops, _) => ops.op_bytes(),
+            ChunkOps::CpuInRow(ops, side, _) => ops.op_bytes() + side.op_bytes(),
             ChunkOps::CpuRecords { records, spent } => {
                 multilinear::records::TableRecords::bytes(records) + spent.op_bytes()
             }
@@ -4153,6 +4220,7 @@ impl ChunkJob {
     pub fn op_count(&self) -> usize {
         match &self.ops {
             ChunkOps::Cpu(ops, _) => ops.len(),
+            ChunkOps::CpuInRow(ops, _, _) => ops.len(),
             ChunkOps::CpuRecords { spent, .. } => spent.len(),
             ChunkOps::MemwRegister(ops) => ops.len(),
             ChunkOps::MemwRegisterRecords(records) => {
@@ -4189,6 +4257,12 @@ impl ChunkJob {
             ChunkOps::Cpu(ops, decode) => {
                 cpu::generate_cpu_trace_segments_as(&ops.slices(), &decode, form)
             }
+            ChunkOps::CpuInRow(ops, side, decode) => cpu::generate_cpu_trace_inrow_segments_as(
+                &ops.slices(),
+                &side.slices(),
+                &decode,
+                form,
+            ),
             ChunkOps::MemwRegister(ops) => {
                 memw_register::generate_memw_register_trace_from_rows_segments_as(
                     &ops.slices(),
@@ -4354,6 +4428,7 @@ fn assemble(
         load_ops,
         lt_ops,
         shift_ops,
+        cpu_side,
         ..
     } = walk;
     let KeptRest {
@@ -4374,11 +4449,14 @@ fn assemble(
         general: mut memw_ops,
         words: _,
         order,
+        registers,
         refused: _,
     } = memw;
     // HALT's register ops land at the end of their buckets, as in
-    // `collect_all_ops`, routed and laid out in the run's MEMW_A form.
+    // `collect_all_ops`, routed and laid out in the run's MEMW_A form (REGX
+    // rows under the in-row register format).
     let mut halt = MemwBuckets::with_register_capacity(0, order);
+    halt.registers = registers;
     halt.extend_ops(collect_halt_ops(register_state));
     halt.refusal()?;
     memw_register_rows.extend(halt.register_rows);
@@ -4416,6 +4494,7 @@ fn assemble(
 
     Ok(CollectedOps {
         cpu_ops,
+        cpu_side,
         memw_ops,
         memw_aligned_ops,
         memw_register_rows,
@@ -4471,6 +4550,7 @@ pub struct RegenBuilder {
     cycles: usize,
     max_rows: crate::tables::MaxRowsConfig,
     cpu: Tail<super::CpuOperation>,
+    cpu_side: Tail<super::super::cpu::CpuSide>,
     register_rows: Tail<super::RegRow>,
     aligned: Tail<memw_aligned::AlignedRow>,
     general: Tail<super::MemwOperation>,
@@ -4509,6 +4589,7 @@ impl RegenBuilder {
             cycles: 0,
             max_rows: max_rows.clone(),
             cpu: Tail::new(),
+            cpu_side: Tail::new(),
             register_rows: Tail::new(),
             aligned: Tail::new(),
             general: Tail::new(),
@@ -4533,6 +4614,18 @@ impl RegenBuilder {
             ));
         }
         self.cut.memw_aligned_order = order;
+        Ok(self)
+    }
+
+    /// [`WindowedTraceBuilder::register_format`], for the chunks this
+    /// regenerates. Before the first window only.
+    pub fn register_format(mut self, format: super::super::register::RegisterFormat) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "register_format after a window was walked".to_string(),
+            ));
+        }
+        self.cut.register_format = format;
         Ok(self)
     }
 
@@ -4600,6 +4693,7 @@ impl RegenBuilder {
         let mut cpu_ops = super::collect_cpu_ops_from(logs, &self.decode, self.cycles)?;
         self.cycles += logs.len();
         let mut walk = WalkOutputs::for_walk(cpu_ops.len(), false, self.cut.memw_aligned_order);
+        walk.memw.registers = self.cut.register_format;
         super::collect_streamed_ops_from_cpu_into(
             &cpu_ops,
             &self.decode,
@@ -4623,6 +4717,7 @@ impl RegenBuilder {
             mut general,
             words: _,
             order: _,
+            registers: _,
             refused: _,
         } = walk.memw;
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -4653,6 +4748,9 @@ impl RegenBuilder {
             (held, _) => *held = None,
         }
         self.cpu.push(cpu_ops);
+        if !walk.cpu_side.is_empty() {
+            self.cpu_side.push(walk.cpu_side);
+        }
         self.register_rows.push(register_rows);
         self.aligned.push(aligned);
         self.general.push(general);
@@ -4684,6 +4782,21 @@ impl RegenBuilder {
         }
         while m.cpu > 0 && self.cpu.len >= m.cpu {
             let ops = self.cpu.take(m.cpu);
+            // Under the in-row register format the chunk carries its side
+            // records (and no records: the host fills it).
+            if self.cpu_side.len > 0 {
+                let side = self.cpu_side.take(m.cpu);
+                if let Some((tail, _)) = self.logs.as_mut() {
+                    drop(tail.take_segments(m.cpu));
+                }
+                jobs.push(ChunkJob {
+                    table: StreamTable::Cpu,
+                    index: e.cpu,
+                    ops: ChunkOps::CpuInRow(ops, side, Arc::clone(&self.decode)),
+                });
+                e.cpu += 1;
+                continue;
+            }
             // With the logs kept, the chunk carries the records phase A held
             // it as, when they are in step with its ops.
             let records = self.logs.as_mut().and_then(|(tail, decode)| {

@@ -250,9 +250,32 @@ impl RegRow {
         row
     }
 
+    /// A REGX row of a register access (any step in `[1, 2^32]`, both
+    /// timestamps below `2^32`), its spare byte 2.
+    pub(crate) fn regx(
+        reg_addr: u64,
+        timestamp: u64,
+        val: [u32; 2],
+        old: [u32; 2],
+        old_ts: u64,
+        is_read: bool,
+    ) -> Self {
+        let mut row = Self::new(
+            reg_addr, timestamp, val[0], val[1], old[0], old[1], old_ts, is_read,
+        );
+        row.pad = 2;
+        row
+    }
+
     /// Whether the row is a keep-alive ([`Self::keep_alive`]).
     pub(crate) fn is_keep(&self) -> bool {
         self.pad == 1
+    }
+
+    /// Whether the row is REGX's ([`Self::regx`], [`Self::keep_alive`]) rather
+    /// than MEMW_R's.
+    pub(crate) fn is_regx(&self) -> bool {
+        self.pad != 0
     }
 
     /// The register index.
@@ -341,6 +364,10 @@ pub(crate) fn generate_memw_register_trace_from_rows_segments_as(
     segments: &[&[RegRow]],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    // REGX rows (the in-row register format) fill REGX's table.
+    if segments.iter().flat_map(|s| s.iter()).next().is_some_and(RegRow::is_regx) {
+        return super::regx::generate_regx_trace_segments_as(segments, form);
+    }
     let len: usize = segments.iter().map(|s| s.len()).sum();
     let num_rows = len.next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
@@ -390,6 +417,11 @@ fn memw_register_is_half_lookup(ts_lo: u32, old_ts_lo: u32) -> BitwiseOperation 
 /// MEMW_R trace fill uses), one per row. No intermediate op vector: register
 /// rows number in the tens of millions and the histogram is the only consumer.
 pub(crate) fn collect_bitwise_from_memw_register(rows: &[RegRow], hist: &mut BitwiseHistogram) {
+    // REGX rows (the in-row register format) send their step's two limbs.
+    if rows.first().is_some_and(RegRow::is_regx) {
+        super::regx::count_bitwise_from_regx(rows, hist);
+        return;
+    }
     for r in rows {
         hist.bump(memw_register_is_half_lookup(
             (r.timestamp & 0xFFFF_FFFF) as u32,
