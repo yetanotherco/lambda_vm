@@ -165,6 +165,7 @@ fn the_block_levels_driver_proves_a_small_block() {
         &options,
         WlfmFamily::P1,
         LevelStop::DEFAULT,
+        true,
     )
     .expect("the block proves to its last level");
     assert!(
@@ -229,4 +230,103 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
             assert_eq!(pieces.len(), groups + 1, "one piece a group");
         }
     }
+}
+
+/// ★ A real block through the levels driver (the box's timing harness):
+/// `BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`, the tree harness's format and options
+/// words (`WhirTreeConfig::from_env`), `RTA_BESIDE` (1, the default: level 1
+/// executes beside phase B; 0 the control), `RTA_LEVELS` (the chain's length;
+/// 2). Prints `RTA …` lines; everything is verified off the clock.
+#[test]
+#[ignore = "a real block and its levels: box only"]
+fn rta_a_real_block_through_its_levels() {
+    use super::levels::prove_block_levels;
+    use super::whir_block_tree::WhirTreeConfig;
+    let _permit = super::device_permit::serial_for_test();
+    let elf = std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF"))
+        .expect("read the ELF");
+    let input = std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT"))
+        .expect("read the input");
+    let cfg = WhirTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let beside = std::env::var("RTA_BESIDE").map_or(true, |v| v.trim() != "0");
+    let levels: usize =
+        std::env::var("RTA_LEVELS").map_or(2, |v| v.trim().parse().expect("RTA_LEVELS"));
+    let opts = super::proof::block_base_options();
+    let family = WlfmFamily::P1;
+    println!(
+        "RTA CONFIG: base {:?} · family {family:?} · levels {levels} · beside {beside}",
+        cfg.format.zf.base.hash
+    );
+    let run = prove_block_levels(
+        &elf,
+        &input,
+        &opts,
+        &cfg.format,
+        &cfg.options,
+        family,
+        LevelStop::Levels(levels),
+        beside,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let t = &run.times;
+    let s = &run.base_stamps;
+    println!(
+        "RTA BASE: end {:.3}s · execute {:.3}s · build {:.3}s · phase A {:.3}s · phase B {:.3}s",
+        t.base, s.execute, s.build, s.phase_a, s.phase_b
+    );
+    let l1_prove_from = t.built + t.levels.first().map_or(0.0, |l| l.fill);
+    println!(
+        "RTA LEVEL1 STREAM: planned {:.3}s · emitted {:.3}s · pieces {} · waves before the base \
+         ended {} ({:.3}s) · execute tail {:.3}s · built {:.3}s · card idle after the base {:.3}s",
+        t.planned,
+        t.emitted,
+        t.pieces,
+        t.waves_before_base,
+        t.wave_secs_before_base,
+        t.execute_tail,
+        t.built,
+        l1_prove_from - t.base
+    );
+    for (k, (l, (level, p))) in t
+        .levels
+        .iter()
+        .zip(run.levels.iter().zip(&run.proofs))
+        .enumerate()
+    {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(p).map_or(0, |b| b.len());
+        println!(
+            "RTA LEVEL {}: groups {} · instructions {} · compressions {} · execute {:.3}s · fill \
+             {:.3}s · prove {:.3}s · end {:.3}s · proof {bytes} B",
+            k + 1,
+            level.build.artifacts.sizes.len(),
+            level.program.instrs.len(),
+            level.program.groups.b3l.real_rows,
+            l.executed - l.execute_from,
+            l.fill,
+            l.prove,
+            l.end
+        );
+    }
+    let end = t.levels.last().map_or(t.base, |l| l.end);
+    println!(
+        "RTA RECURSION: {:.3}s after the base (end {end:.3}s)",
+        end - t.base
+    );
+    // Off the clock: the base, every level, and the block's verifier.
+    let ok_base = crate::block_whir::verify_block_whir(&run.base_proof, &elf, &opts, &cfg.format)
+        .expect("verify runs");
+    let mut ok_levels = true;
+    for (level, p) in run.levels.iter().zip(&run.proofs) {
+        ok_levels &= verify_wlfm(&level.build.artifacts, p, &p.public_words).is_ok();
+    }
+    let ok_last = super::levels::verify_levels_to(
+        &run.plan,
+        family,
+        LevelStop::Levels(levels),
+        run.proofs.last().expect("a last level"),
+    )
+    .is_ok();
+    println!("RTA VERIFIED: base {ok_base} · levels {ok_levels} · block {ok_last}");
+    assert!(ok_base && ok_levels && ok_last, "everything verifies");
+    println!("RTA DONE");
 }
