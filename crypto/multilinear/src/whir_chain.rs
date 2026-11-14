@@ -633,8 +633,10 @@ pub enum WhirFolds {
 /// polynomial at their challenges for `f(α)`. A chain with no such round is
 /// today's chain.
 ///
-/// ⚠ HOST VERIFIER ONLY. The in-guest chain verifier has no final-polynomial
-/// round; a config that a parent verifies in-guest must keep `Off`. The
+/// The in-guest chain verifier (`prover::lfm::whir_chain`) checks a final
+/// round under the binary BLAKE3 trees alone (the 7-round BLAKE3 base's
+/// format) and refuses to emit one under any other hash; every other config
+/// a parent verifies in-guest keeps `Off`. The
 /// polynomial rides the final round's successor slot (one block, no path), so
 /// the proof's type — and every proof at `Off` — is unchanged.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
