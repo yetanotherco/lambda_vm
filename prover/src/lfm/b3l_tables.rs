@@ -296,10 +296,10 @@ impl multilinear::records::TableRecords for B3lRoundRecords {
 
     fn host_fill(&self) -> Option<multilinear::narrow::NarrowColumns> {
         let total = l::ROUNDS * self.ops.len();
-        let (packed, _) = fill_narrow(self.rows, &round_widths(), |first, len, scratch, hist| {
+        let (packed, _) = fill_narrow(self.rows, &round_widths(), |first, len, scratch, hists| {
             let lo = self.skip + first;
             let hi = (lo + len).min(total);
-            fill_round_rows(lo, hi, scratch, hist, |k| {
+            fill_round_rows(lo, hi, scratch, hists, |k| {
                 let op = &self.ops[k];
                 (op_values(op), op.block_len, op.flags, op.tag)
             });
@@ -317,33 +317,60 @@ fn op_values(op: &multilinear::records::B3lRoundOp) -> B3lValues {
     B3lValues { h: op.h, block }
 }
 
+/// A fill worker's own buffers, kept across the blocks it fills: the byte
+/// table's counts of the compressions it owns, a sink for the counts of those
+/// it fills but does not own (their first round is another block's), and one
+/// compression's round rows. One a worker, not one a block: a block of a few
+/// dozen compressions must not zero and merge a 2^16-entry count of its own.
+struct FillHists {
+    counted: TableHist,
+    skip: TableHist,
+    rows: Vec<FE>,
+}
+
+impl FillHists {
+    fn new() -> Self {
+        FillHists {
+            counted: TableHist::default(),
+            skip: TableHist::default(),
+            rows: zeroed_fe_vec(l::ROUNDS * round::NUM_COLUMNS),
+        }
+    }
+}
+
 /// Round rows `[lo, hi)` of the table compressions `op(k)` make (row
 /// `7k + r` is round `r` of compression `k`), written into `scratch` from its
-/// first row; each compression's lookups counted into `hist` only by the
-/// rows holding its first round.
+/// first row, every column of every row, and the scratch's rows past them
+/// (the padding past the last compression) zeroed; each compression's lookups
+/// counted into `hists.counted` only by the rows holding its first round.
 fn fill_round_rows(
     lo: usize,
     hi: usize,
     scratch: &mut [FE],
-    hist: &mut TableHist,
+    hists: &mut FillHists,
     op: impl Fn(usize) -> (B3lValues, u32, u32, u64),
 ) {
+    let width = round::NUM_COLUMNS;
+    let written = (hi.saturating_sub(lo) * width).min(scratch.len());
+    scratch[written..].iter_mut().for_each(|v| *v = FE::zero());
     if lo >= hi {
         return;
     }
-    let width = round::NUM_COLUMNS;
-    let mut rows = zeroed_fe_vec(l::ROUNDS * width);
-    let mut skip = TableHist::default();
+    let FillHists {
+        counted: hist,
+        skip,
+        rows,
+    } = hists;
     for k in lo / l::ROUNDS..hi.div_ceil(l::ROUNDS) {
         let (values, block_len, flags, tag) = op(k);
         rows.iter_mut().for_each(|v| *v = FE::zero());
         let counted = if (lo..hi).contains(&(l::ROUNDS * k)) {
             &mut *hist
         } else {
-            &mut skip
+            &mut *skip
         };
         lean::fill_rounds(
-            &mut rows,
+            rows,
             tag,
             &values,
             block_len,
@@ -723,6 +750,15 @@ pub fn build_b3l_traces_held(
 /// Rows a narrow fill writes at once: a block's wide scratch stays in cache.
 const BLOCK_ROWS: usize = 1 << 9;
 
+/// Rows of a block written to their columns at once (a tile of round rows is
+/// 24 KB wide).
+const WRITE_TILE: usize = 8;
+
+/// The fewest blocks a worker fills in one turn: each turn starts a fresh
+/// count of the byte table (2^16 entries an operation) and ends merging it,
+/// so a turn must be many compressions long.
+const BLOCKS_PER_WORKER_TURN: usize = 32;
+
 /// The bytes each round column's values need: tags and the word cells
 /// (`a`, `c` inputs, the message) four, everything else one (bytes, nibbles,
 /// bits, `MU`, `RND`).
@@ -763,16 +799,19 @@ fn head_widths() -> Vec<u8> {
 }
 
 /// `rows` rows of `widths.len()` columns, filled [`BLOCK_ROWS`] at a time by
-/// `fill(first_row, rows, scratch, hist)` into a wide scratch and written
-/// straight into narrow columns at `widths`, blocks in parallel. `None` when a
-/// value does not fit its column's width.
+/// `fill(first_row, rows, scratch, hists)` into a wide scratch and written
+/// straight into narrow columns at `widths`, blocks in parallel. The scratch
+/// and the counts are a worker's, reused block after block: `fill` must write
+/// every cell of the scratch's first `rows` rows. Returns the columns and the
+/// counts of every block (`hists.counted`, merged once a worker); `None` when
+/// a value does not fit its column's width.
 fn fill_narrow<Fill>(
     rows: usize,
     widths: &[u8],
     fill: Fill,
 ) -> Option<(multilinear::narrow::NarrowColumns, TableHist)>
 where
-    Fill: Fn(usize, usize, &mut [FE], &mut TableHist) + Sync,
+    Fill: Fn(usize, usize, &mut [FE], &mut FillHists) + Sync,
 {
     use math::field::traits::IsPrimeField;
     let cols = widths.len();
@@ -790,23 +829,69 @@ where
         }
         rest = tail;
     }
-    let one = |(b, mut segments): (usize, Vec<&mut [u8]>)| -> Option<TableHist> {
+    // A worker's state: its counts and its scratch, one block's rows wide.
+    let fresh = || (FillHists::new(), zeroed_fe_vec(BLOCK_ROWS * cols));
+    let one = |(mut hists, mut scratch): (FillHists, Vec<FE>),
+               (b, mut segments): (usize, Vec<&mut [u8]>)|
+     -> Option<(FillHists, Vec<FE>)> {
         let first = b * BLOCK_ROWS;
         let len = BLOCK_ROWS.min(rows - first);
-        let mut scratch = zeroed_fe_vec(len * cols);
-        let mut hist = TableHist::default();
-        fill(first, len, &mut scratch, &mut hist);
-        for (c, (segment, &w)) in segments.iter_mut().zip(widths).enumerate() {
-            let w = w as usize;
-            for r in 0..len {
-                let v = GoldilocksField::canonical(scratch[r * cols + c].value());
-                if w < 8 && v >> (8 * w) != 0 {
-                    return None;
+        let scratch_rows = &mut scratch[..len * cols];
+        fill(first, len, scratch_rows, &mut hists);
+        // Tile by tile: a tile's rows stay in the first-level cache while
+        // every column takes its share of them, each written at its width.
+        let canon =
+            |r: usize, c: usize| GoldilocksField::canonical(scratch_rows[r * cols + c].value());
+        for t0 in (0..len).step_by(WRITE_TILE) {
+            let t1 = (t0 + WRITE_TILE).min(len);
+            for (c, (segment, &w)) in segments.iter_mut().zip(widths).enumerate() {
+                match w {
+                    1 => {
+                        for r in t0..t1 {
+                            let v = canon(r, c);
+                            if v > u8::MAX as u64 {
+                                return None;
+                            }
+                            segment[r] = v as u8;
+                        }
+                    }
+                    2 => {
+                        for r in t0..t1 {
+                            let v = canon(r, c);
+                            if v > u16::MAX as u64 {
+                                return None;
+                            }
+                            segment[2 * r..2 * r + 2].copy_from_slice(&(v as u16).to_le_bytes());
+                        }
+                    }
+                    4 => {
+                        for r in t0..t1 {
+                            let v = canon(r, c);
+                            if v > u32::MAX as u64 {
+                                return None;
+                            }
+                            segment[4 * r..4 * r + 4].copy_from_slice(&(v as u32).to_le_bytes());
+                        }
+                    }
+                    8 => {
+                        for r in t0..t1 {
+                            segment[8 * r..8 * r + 8].copy_from_slice(&canon(r, c).to_le_bytes());
+                        }
+                    }
+                    w => {
+                        let w = w as usize;
+                        for r in t0..t1 {
+                            let v = canon(r, c);
+                            if w < 8 && v >> (8 * w) != 0 {
+                                return None;
+                            }
+                            segment[r * w..(r + 1) * w].copy_from_slice(&v.to_le_bytes()[..w]);
+                        }
+                    }
                 }
-                segment[r * w..(r + 1) * w].copy_from_slice(&v.to_le_bytes()[..w]);
             }
         }
-        Some(hist)
+        Some((hists, scratch))
     };
     #[cfg(feature = "parallel")]
     let hist = {
@@ -814,16 +899,18 @@ where
         by_block
             .into_par_iter()
             .enumerate()
-            .map(one)
+            .with_min_len(BLOCKS_PER_WORKER_TURN)
+            .try_fold(fresh, one)
+            .map(|state| state.map(|(hists, _)| hists.counted))
             .try_reduce(TableHist::default, |a, b| Some(a.merge(&b)))?
     };
     #[cfg(not(feature = "parallel"))]
     let hist = {
-        let mut acc = TableHist::default();
+        let mut state = fresh();
         for item in by_block.into_iter().enumerate() {
-            acc = acc.merge(&one(item)?);
+            state = one(state, item)?;
         }
-        acc
+        state.0.counted
     };
     let packed = multilinear::narrow::NarrowColumns::from_parts(rows, widths.to_vec(), data)
         .expect("whole columns");
@@ -847,10 +934,10 @@ fn fill_narrow_direct<'p>(
     let mut start = 0usize;
     for &size in &shape.rounds {
         let chunk_start = start;
-        let (packed, part) = fill_narrow(size, &widths, |first, len, scratch, hist| {
+        let (packed, part) = fill_narrow(size, &widths, |first, len, scratch, hists| {
             let lo = chunk_start + first;
             let hi = (lo + len).min(total);
-            fill_round_rows(lo, hi, scratch, hist, |k| {
+            fill_round_rows(lo, hi, scratch, hists, |k| {
                 let (_, block_len, flags) = consts(k);
                 (records[k], block_len, flags, l::tag_for_row(k))
             });
@@ -865,15 +952,25 @@ fn fill_narrow_direct<'p>(
     let mut start = 0usize;
     for &size in &shape.heads {
         let chunk_start = start;
-        let (packed, part) = fill_narrow(size, &widths, |first, len, scratch, hist| {
+        let (packed, part) = fill_narrow(size, &widths, |first, len, scratch, hists| {
             let lo = chunk_start + first;
             let hi = (lo + len).min(n);
+            // The scratch is the worker's last block's: every row zeroed
+            // before its fill, the padding rows past the last compression too.
+            scratch.iter_mut().for_each(|v| *v = FE::zero());
             for (k, record) in records.iter().enumerate().take(hi).skip(lo) {
                 let (prep, block_len, flags) = consts(k);
                 let fs = lean::final_state(record, block_len, flags);
                 let at = (k - lo) * width;
-                lean::fill_head(&mut scratch[at..at + width], prep, record, &fs, hist);
+                lean::fill_head_uninverted(
+                    &mut scratch[at..at + width],
+                    prep,
+                    record,
+                    &fs,
+                    &mut hists.counted,
+                );
             }
+            lean::invert_heads(scratch);
         })?;
         hist = hist.merge(&part);
         heads.push(HeldTable::Narrow(packed));
@@ -983,15 +1080,25 @@ fn fill_records<'p>(
     let mut start = 0usize;
     for &size in &shape.heads {
         let chunk_start = start;
-        let (packed, part) = fill_narrow(size, &widths, |first, len, scratch, hist| {
+        let (packed, part) = fill_narrow(size, &widths, |first, len, scratch, hists| {
             let lo = chunk_start + first;
             let hi = (lo + len).min(n);
+            // The scratch is the worker's last block's: every row zeroed
+            // before its fill, the padding rows past the last compression too.
+            scratch.iter_mut().for_each(|v| *v = FE::zero());
             for (k, record) in records.iter().enumerate().take(hi).skip(lo) {
                 let (prep, block_len, flags) = consts(k);
                 let fs = lean::final_state(record, block_len, flags);
                 let at = (k - lo) * width;
-                lean::fill_head(&mut scratch[at..at + width], prep, record, &fs, hist);
+                lean::fill_head_uninverted(
+                    &mut scratch[at..at + width],
+                    prep,
+                    record,
+                    &fs,
+                    &mut hists.counted,
+                );
             }
+            lean::invert_heads(scratch);
         })?;
         hist = hist.merge(&part);
         heads.push(HeldTable::Narrow(packed));
