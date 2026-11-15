@@ -4248,6 +4248,17 @@ type WordsUp<'a> = (
     Box<WordsDecode<'a>>,
 );
 
+/// A MEMW_A table going up as refs: its parts as the card's structs, the
+/// program's DECODE rows on the card, the run's form, and its rows derived on
+/// the host.
+#[cfg(feature = "cuda")]
+type AlignedUp<'a> = (
+    Vec<math_cuda::fill::AlignedPartIn<'a>>,
+    std::sync::Arc<math_cuda::fill::CardDecode>,
+    bool,
+    Box<math_cuda::fill::AlignedHostRows<'a>>,
+);
+
 /// A table's records as the card's fill reads them, before they go up: the
 /// fill, and a CPU table's DECODE rows on the card ([`records_input`] borrows
 /// both).
@@ -4274,6 +4285,9 @@ struct RecordsUp<'a> {
     /// card's struct, and its host decode.
     words: Option<WordsUp<'a>>,
     aligned: Vec<&'a [math_cuda::fill::AlignedRowC]>,
+    /// A MEMW_A table held as refs, where the card derives its rows
+    /// ([`crate::records::Records::aligned_refs`]).
+    aligned_refs: Option<AlignedUp<'a>>,
     loads: Vec<&'a [math_cuda::fill::LoadOpC]>,
     stores: Vec<&'a [math_cuda::fill::StoreOpC]>,
     shifts: Vec<&'a [math_cuda::fill::ShiftOpC]>,
@@ -4356,6 +4370,85 @@ impl<'a> RecordsUp<'a> {
                 .map(|p| unsafe { core::slice::from_raw_parts(p.as_ptr() as *const C, p.len()) })
                 .collect()
         }
+        // A MEMW_A table held as refs goes up as them where the card
+        // derives (its rows not derived on the host unless it declines).
+        if math_cuda::card_rows::mode().derives()
+            && let Some(a) = records.aligned_refs()
+        {
+            use crate::records::{AlignedRef, MemoryAccess};
+            use math_cuda::fill::{AlignedPartIn, AlignedRefC, MemoryAccessC};
+            const _: () = {
+                use std::mem::{align_of, offset_of, size_of};
+                assert!(size_of::<AlignedRef>() == size_of::<AlignedRefC>());
+                assert!(align_of::<AlignedRef>() == align_of::<AlignedRefC>());
+                assert!(offset_of!(AlignedRef, at) == offset_of!(AlignedRefC, at));
+                assert!(size_of::<MemoryAccess>() == size_of::<MemoryAccessC>());
+                assert!(align_of::<MemoryAccess>() == align_of::<MemoryAccessC>());
+                assert!(offset_of!(MemoryAccess, ts) == offset_of!(MemoryAccessC, ts));
+                assert!(offset_of!(MemoryAccess, mixed) == offset_of!(MemoryAccessC, mixed));
+            };
+            let decode = a.decode.on_card()?;
+            let parts = a
+                .parts
+                .iter()
+                .map(|p| {
+                    // SAFETY: each pair is `#[repr(C)]` with the same fields
+                    // in the same order (asserted above and below); a mixed
+                    // entry is eight `u32`s, laid out flat.
+                    unsafe {
+                        AlignedPartIn {
+                            refs: core::slice::from_raw_parts(
+                                p.refs.as_ptr() as *const AlignedRefC,
+                                p.refs.len(),
+                            ),
+                            accesses: core::slice::from_raw_parts(
+                                p.accesses.as_ptr() as *const MemoryAccessC,
+                                p.accesses.len(),
+                            ),
+                            access_base: p.access_base,
+                            mixed: core::slice::from_raw_parts(
+                                p.mixed.as_ptr() as *const u32,
+                                p.mixed.len() * 8,
+                            ),
+                            whole: core::slice::from_raw_parts(
+                                p.whole.as_ptr() as *const AlignedRowC,
+                                p.whole.len(),
+                            ),
+                            whole_base: p.whole_base,
+                        }
+                    }
+                })
+                .collect();
+            let host: Box<math_cuda::fill::AlignedHostRows<'a>> =
+                Box::new(move || match records.fill() {
+                    RecordsFill::MemwA { rows } => {
+                        unsafe { cast::<AlignedRow, AlignedRowC>(&rows) }
+                            .into_iter()
+                            .flat_map(|piece| piece.iter().copied())
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                });
+            return Some(Self {
+                rows: records.rows(),
+                cols: records.cols(),
+                fill: RecordsFill::MemwA { rows: Vec::new() },
+                decode: None,
+                hold: None,
+                logs: Vec::new(),
+                sides: Vec::new(),
+                stamps: Vec::new(),
+                exceptions: Vec::new(),
+                registers: Vec::new(),
+                words: None,
+                aligned: Vec::new(),
+                aligned_refs: Some((parts, decode, a.limbs, host)),
+                loads: Vec::new(),
+                stores: Vec::new(),
+                shifts: Vec::new(),
+                memws: Vec::new(),
+            });
+        }
         // Words mode: a MEMW_R table held as words goes up as them, its rows
         // not decoded (the card builds them).
         if math_cuda::card_rows::builds_words()
@@ -4392,6 +4485,7 @@ impl<'a> RecordsUp<'a> {
                 registers: Vec::new(),
                 words: Some((w.words, whole, w.whole_base, decode)),
                 aligned: Vec::new(),
+                aligned_refs: None,
                 loads: Vec::new(),
                 stores: Vec::new(),
                 shifts: Vec::new(),
@@ -4412,6 +4506,7 @@ impl<'a> RecordsUp<'a> {
             registers: Vec::new(),
             words: None,
             aligned: Vec::new(),
+            aligned_refs: None,
             loads: Vec::new(),
             stores: Vec::new(),
             shifts: Vec::new(),
@@ -4580,6 +4675,16 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
             records: &up.registers,
             rows: up.rows,
         },
+        RecordsFill::MemwA { .. } if up.aligned_refs.is_some() => {
+            let (parts, decode, limbs, host) = up.aligned_refs.as_ref()?;
+            RecordsInput::MemwARefs {
+                parts,
+                decode,
+                limbs: *limbs,
+                rows: up.rows,
+                host: &**host,
+            }
+        }
         RecordsFill::MemwA { .. } => RecordsInput::MemwA {
             records: &up.aligned,
             rows: up.rows,

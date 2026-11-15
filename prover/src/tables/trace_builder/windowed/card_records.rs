@@ -10,8 +10,12 @@ use std::sync::Arc;
 
 use executor::vm::logs::Log;
 use multilinear::narrow::NarrowColumns;
-use multilinear::records::{DecodeRecords, PagesReturned, Records, RecordsFill, TableRecords};
+use multilinear::records::{
+    ALIGNED_ECALL, AlignedRef, AlignedRefPart, AlignedRefs, DecodeRecords, PagesReturned, Records,
+    RecordsFill, TableRecords,
+};
 
+use super::history_rows::RefWindow;
 use super::history_sides::{HistoryParts, HistorySides};
 use super::{Segments, StreamTable, Table};
 use crate::tables::decode::DecodeTable;
@@ -688,5 +692,207 @@ impl<T: RowFamily> RowChunk for RowRecords<T> {
     fn regenerate(self: Box<Self>, form: TraceForm, digest: bool) -> (Option<[u64; 2]>, Table) {
         let digest = digest.then(|| multilinear::records::digest_of(&*self));
         (digest, T::host_fill(&self.rows.slices(), form))
+    }
+}
+
+/// A full MEMW_A chunk held as its rows' refs, for the card to derive its
+/// rows from the executor's history ([`super::history_rows`]): the refs in
+/// the window parts the chunk was cut from, each part beside the window it
+/// lies in. Every host reader gets the rows the host derives from them, once,
+/// on the first ask; the chunk digests and fills as the same rows held as
+/// rows.
+// Handed out by the windowed builder under the card-built trace.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct AlignedRefRecords {
+    refs: Segments<AlignedRef>,
+    /// The window of each part of `refs`, one a part.
+    windows: Vec<Arc<RefWindow>>,
+    /// Each part's regular rows' access indices and ECALL rows' whole-row
+    /// indices, `lo..hi`: what of its window the card reads.
+    spans: Vec<(std::ops::Range<u32>, std::ops::Range<u32>)>,
+    decode: Arc<CardDecode>,
+    order: memw_aligned::MemwAlignedOrder,
+    derived: std::sync::OnceLock<Result<Vec<AlignedRow>, String>>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl AlignedRefRecords {
+    /// The chunk `refs` (one window of `windows` a part, in order) make, in
+    /// the run's `order`. Refused (the refs given back) unless they are a
+    /// whole table with one window a part.
+    pub(crate) fn new(
+        refs: Segments<AlignedRef>,
+        windows: Vec<Arc<RefWindow>>,
+        decode: Arc<CardDecode>,
+        order: memw_aligned::MemwAlignedOrder,
+    ) -> Result<Self, Segments<AlignedRef>> {
+        if !whole_table(refs.len()) || windows.len() != refs.parts.len() {
+            return Err(refs);
+        }
+        let spans = refs
+            .slices()
+            .iter()
+            .map(|part| {
+                let span = |ecall: bool| {
+                    let ats = part
+                        .iter()
+                        .filter(|r| (r.cycle & ALIGNED_ECALL != 0) == ecall)
+                        .map(|r| r.at);
+                    let (lo, hi) = ats.fold((u32::MAX, 0u32), |(lo, hi), at| {
+                        (lo.min(at), hi.max(at.saturating_add(1)))
+                    });
+                    if lo < hi { lo..hi } else { 0..0 }
+                };
+                (span(false), span(true))
+            })
+            .collect();
+        Ok(Self {
+            refs,
+            windows,
+            spans,
+            decode,
+            order,
+            derived: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The rows as the host derives them, or why they cannot be.
+    pub(crate) fn rows(&self) -> Result<&[AlignedRow], &str> {
+        self.derived
+            .get_or_init(|| {
+                let slices = self.refs.slices();
+                let parts: Vec<(&[AlignedRef], &RefWindow)> = slices
+                    .iter()
+                    .zip(&self.windows)
+                    .map(|(refs, window)| (*refs, &**window))
+                    .collect();
+                super::history_rows::aligned_rows_from_refs(&parts, &self.decode.table, self.order)
+            })
+            .as_deref()
+            .map_err(String::as_str)
+    }
+
+    /// The table held as these records.
+    pub(crate) fn into_trace(self) -> Table {
+        held(Records(Arc::new(self)))
+    }
+
+    /// The rows back, as the host derives them, or why they cannot be.
+    pub(crate) fn into_rows(self) -> Result<Segments<AlignedRow>, String> {
+        let _ = self.rows();
+        match self.derived.into_inner() {
+            Some(Ok(rows)) => Ok(Segments::one(rows)),
+            Some(Err(e)) => Err(e),
+            None => Err("a MEMW_A chunk's rows were not derived".to_string()),
+        }
+    }
+}
+
+impl std::fmt::Debug for AlignedRefRecords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MEMW_A refs: {} in {} pieces",
+            self.refs.len(),
+            self.refs.parts.len()
+        )
+    }
+}
+
+impl TableRecords for AlignedRefRecords {
+    fn rows(&self) -> usize {
+        self.refs.len()
+    }
+
+    fn cols(&self) -> usize {
+        memw_aligned::cols::NUM_COLUMNS
+    }
+
+    /// The rows the host derives (none where it cannot: the table then
+    /// digests and fills as no table its AIR takes).
+    fn fill(&self) -> RecordsFill<'_> {
+        RecordsFill::MemwA {
+            rows: self
+                .rows()
+                .map(|rows| vec![memw_aligned::card_rows(rows)])
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The rows' bytes, as held as rows: the same chunk held either way
+    /// digests alike.
+    fn bytes(&self) -> usize {
+        self.refs.len() * std::mem::size_of::<AlignedRow>()
+    }
+
+    fn host_fill(&self) -> Option<NarrowColumns> {
+        let rows = self.rows().ok()?;
+        let mut trace =
+            memw_aligned::generate_memw_aligned_trace_segments_as(&[rows], TraceForm::Narrow);
+        // Written packed, except in a build that holds every trace wide.
+        trace.pack_main_narrow();
+        trace.take_narrow_main()
+    }
+
+    fn return_pages(&mut self) -> PagesReturned {
+        self.refs.return_pages()
+    }
+
+    fn aligned_refs(&self) -> Option<AlignedRefs<'_>> {
+        let parts = self
+            .refs
+            .slices()
+            .into_iter()
+            .zip(&self.windows)
+            .zip(&self.spans)
+            .map(|((refs, window), (accesses, whole))| {
+                let h = &window.history;
+                AlignedRefPart {
+                    refs,
+                    accesses: super::history_rows::card_accesses(
+                        h.accesses
+                            .get(accesses.start as usize..accesses.end as usize)
+                            .unwrap_or_default(),
+                    ),
+                    access_base: accesses.start,
+                    mixed: &h.mixed,
+                    whole: memw_aligned::card_rows(
+                        window
+                            .whole
+                            .get(whole.start as usize..whole.end as usize)
+                            .unwrap_or_default(),
+                    ),
+                    whole_base: whole.start,
+                }
+            })
+            .collect();
+        Some(AlignedRefs {
+            parts,
+            decode: &self.decode.records,
+            limbs: self.order == memw_aligned::MemwAlignedOrder::Limbs,
+        })
+    }
+}
+
+impl RowChunk for AlignedRefRecords {
+    fn op_bytes(&self) -> usize {
+        self.refs.op_bytes()
+    }
+
+    fn op_count(&self) -> usize {
+        self.refs.len()
+    }
+
+    fn into_trace(self: Box<Self>) -> Table {
+        held(Records(Arc::new(*self)))
+    }
+
+    fn regenerate(self: Box<Self>, form: TraceForm, digest: bool) -> (Option<[u64; 2]>, Table) {
+        let digest = digest.then(|| multilinear::records::digest_of(&*self));
+        let rows = self.rows().unwrap_or_default();
+        (
+            digest,
+            memw_aligned::generate_memw_aligned_trace_segments_as(&[rows], form),
+        )
     }
 }

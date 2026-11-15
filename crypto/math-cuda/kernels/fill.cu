@@ -332,20 +332,11 @@ __device__ __forceinline__ void aligned_elements(const RowWriter &w, uint32_t co
     }
 }
 
-}  // namespace fill
-
-// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
-extern "C" __global__ void fill_memw_a(const AlignedRowC *rows, uint64_t n, uint64_t height,
-                                       uint64_t *out) {
+// One MEMW_A row's 29 words from its record (`generate_memw_aligned_trace`'s
+// writes): `fill_memw_a`'s, and `card_rows.cu`'s for a row derived from the
+// executor's history.
+__device__ __forceinline__ void memw_a_row(const RowWriter &w, const AlignedRowC &r) {
     namespace c = memw_a_cols;
-    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= height) return;
-    const fill::RowWriter w{out, height, row};
-    if (row >= n) {
-        w.zeros(0, c::NUM_COLUMNS);
-        return;
-    }
-    const AlignedRowC r = rows[row];
     const bool is_register = r.is_register != 0;
     w.word(c::IS_REGISTER, is_register);
     // `set_dword_whh`: the low and middle halves, then the high word.
@@ -369,6 +360,21 @@ extern "C" __global__ void fill_memw_a(const AlignedRowC *rows, uint64_t n, uint
     }
     w.word(c::MU_READ, r.is_read != 0);
     w.word(c::MU_WRITE, r.is_read == 0);
+}
+
+}  // namespace fill
+
+// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_memw_a(const AlignedRowC *rows, uint64_t n, uint64_t height,
+                                       uint64_t *out) {
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, memw_a_cols::NUM_COLUMNS);
+        return;
+    }
+    fill::memw_a_row(w, rows[row]);
 }
 
 // ---------------------------------------------------------------------------
