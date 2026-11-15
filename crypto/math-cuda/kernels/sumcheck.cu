@@ -537,6 +537,61 @@ extern "C" __global__ void fraction_fold_ext3(const uint64_t *__restrict__ p,
     down[2] = denominator.c;
 }
 
+// Two levels of the fraction tree in one pass: the level above `p`/`q` (`half` cells, into
+// `p_mid`/`q_mid`) and the one above that (`half / 2` cells, into `p_out`/`q_out`). Thread `i` reads
+// the four cells `i`, `i + half/2`, `i + half` and `i + 3·half/2` below, writes the two middle
+// cells `i` and `i + half/2`, and folds them into cell `i` above — so the middle level is written
+// once and never read back. The same values as two `fraction_fold_ext3` launches.
+__device__ __forceinline__ void fraction_pair(const Fe3 &p_lo, const Fe3 &p_hi, const Fe3 &q_lo,
+                                              const Fe3 &q_hi, Fe3 &p_up, Fe3 &q_up) {
+    p_up = ext3::add(ext3::mul(p_lo, q_hi), ext3::mul(p_hi, q_lo));
+    q_up = ext3::mul(q_lo, q_hi);
+}
+
+extern "C" __global__ void fraction_fold2_ext3(const uint64_t *__restrict__ p,
+                                               const uint64_t *__restrict__ q, uint64_t half,
+                                               uint64_t *__restrict__ p_mid,
+                                               uint64_t *__restrict__ q_mid,
+                                               uint64_t *__restrict__ p_out,
+                                               uint64_t *__restrict__ q_out, uint32_t fault) {
+    uint64_t quarter = half / 2;
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= quarter) return;
+    Fe3 pa, qa, pb, qb;
+    fraction_pair(load_ext(p + i * 3), load_ext(p + (i + half) * 3), load_ext(q + i * 3),
+                  load_ext(q + (i + half) * 3), pa, qa);
+    fraction_pair(load_ext(p + (i + quarter) * 3), load_ext(p + (i + quarter + half) * 3),
+                  load_ext(q + (i + quarter) * 3), load_ext(q + (i + quarter + half) * 3), pb, qb);
+    uint64_t *at = p_mid + i * 3;
+    at[0] = pa.a;
+    at[1] = pa.b;
+    at[2] = pa.c;
+    at = q_mid + i * 3;
+    at[0] = qa.a;
+    at[1] = qa.b;
+    at[2] = qa.c;
+    at = p_mid + (i + quarter) * 3;
+    at[0] = pb.a;
+    at[1] = pb.b;
+    at[2] = pb.c;
+    at = q_mid + (i + quarter) * 3;
+    at[0] = qb.a;
+    at[1] = qb.b;
+    at[2] = qb.c;
+    Fe3 pu, qu;
+    fraction_pair(pa, pb, qa, qb, pu, qu);
+    // ⛔ A negative control's fault only: the upper cell off by one.
+    if (fault) pu = ext3::add(pu, ext3::one());
+    at = p_out + i * 3;
+    at[0] = pu.a;
+    at[1] = pu.b;
+    at[2] = pu.c;
+    at = q_out + i * 3;
+    at[0] = qu.a;
+    at[1] = qu.b;
+    at[2] = qu.c;
+}
+
 // The same, for a layer whose upper half runs out: the interactions are padded
 // up to a power of two with the fraction 0/1, and a fraction nobody wrote is
 // one nobody has to store. The lower half is always there — the padding is

@@ -1071,6 +1071,75 @@ fn the_bus_column_from_rows_sends_todays_messages() {
     eprintln!("argue bus from rows: {checked} card runs sent today's messages; the fault parted");
 }
 
+/// ★ The fraction tree folded two levels a pass (`gkr::two_level_folds`, on by
+/// default; `LAMBDA_VM_GKR_TWO_LEVEL_FOLDS=0` folds one level a pass) builds
+/// the same levels: over random input layers of 2^1 to 2^12 fractions, stored
+/// whole and padded (the first fold reading the padding as `0/1`), every level
+/// above the input is bit for bit the one-level build's. Then the two-level
+/// pass's upper cells off by one must part, so the comparison is load-bearing.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
+fn the_two_level_tree_folds_build_todays_levels() {
+    use math_cuda::gkr::{DeviceFractionTree, two_level_folds};
+    struct Back;
+    impl Drop for Back {
+        fn drop(&mut self) {
+            two_level_folds::force(None);
+            two_level_folds::force_fault(false);
+        }
+    }
+    let _back = Back;
+    const MODULUS: u64 = 0xFFFF_FFFF_0000_0001;
+    let mut rng = Rng::new(0x2F01D);
+    let mut limbs = |n: usize| -> Vec<u64> { (0..n * 3).map(|_| rng.next() % MODULUS).collect() };
+    let levels = |tree: &DeviceFractionTree| -> Vec<(Vec<u64>, Vec<u64>)> {
+        (0..tree.num_layers() - 1)
+            .map(|layer| tree.layer_to_host(layer).expect("a level above the input"))
+            .collect()
+    };
+    let build = |p: &[u64], q: &[u64], real: usize, num_vars: usize| -> DeviceFractionTree {
+        if real == 1usize << num_vars {
+            return DeviceFractionTree::build(p, q).expect("the card builds the tree");
+        }
+        let be = math_cuda::device::backend().expect("a card");
+        let stream = be.next_stream();
+        let p = math_cuda::device::htod_or_trim(&stream, p).expect("upload");
+        let q = math_cuda::device::htod_or_trim(&stream, q).expect("upload");
+        DeviceFractionTree::from_padded_input(stream, p, q, real, num_vars)
+            .expect("the card builds the padded tree")
+    };
+    let mut checked = 0;
+    for num_vars in 1..=12usize {
+        let full = 1usize << num_vars;
+        for real in [full, full / 2 + 1, full - 1] {
+            if real <= full / 2 || real == 0 {
+                continue;
+            }
+            let (p, q) = (limbs(real), limbs(real));
+            two_level_folds::force(Some(false));
+            let today = levels(&build(&p, &q, real, num_vars));
+            two_level_folds::force(Some(true));
+            let two = levels(&build(&p, &q, real, num_vars));
+            assert_eq!(
+                two, today,
+                "2^{num_vars} fractions, {real} stored: the levels"
+            );
+            if num_vars >= 3 {
+                two_level_folds::force_fault(true);
+                let faulted = levels(&build(&p, &q, real, num_vars));
+                two_level_folds::force_fault(false);
+                assert_ne!(
+                    faulted, today,
+                    "2^{num_vars}, {real} stored: the fault must part"
+                );
+            }
+            checked += 1;
+        }
+    }
+    eprintln!("gkr two-level folds: {checked} trees built today's levels; every fault parted");
+}
+
 /// ★ The production switches (fused on, the corners skipped, no
 /// cross-check) on every table without roots: its constraint part is zero,
 /// so its grid `{0,1}²` is all corners, the corner skip is exact on random

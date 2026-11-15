@@ -355,6 +355,57 @@ impl DeviceFractionTree {
     }
 }
 
+/// How the tree's levels are folded, read once.
+pub mod two_level_folds {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static FORCED: AtomicU8 = AtomicU8::new(0);
+    static FAULT: AtomicU8 = AtomicU8::new(0);
+
+    /// Whether two levels of the fraction tree are folded in one pass
+    /// (`fraction_fold2_ext3`): the middle level is written once and not read
+    /// back by the next fold. The same values as one level a pass. On by
+    /// default; `LAMBDA_VM_GKR_TWO_LEVEL_FOLDS=0` folds one level a pass.
+    pub fn enabled() -> bool {
+        match FORCED.load(Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("LAMBDA_VM_GKR_TWO_LEVEL_FOLDS")
+                .map_or(true, |v| v != "0" && v != "false")
+        })
+    }
+
+    /// Forces [`enabled`] for trees built after it; `None` back to the
+    /// environment's word.
+    #[doc(hidden)]
+    pub fn force(on: Option<bool>) {
+        FORCED.store(
+            match on {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// ⛔ A FAULT, a negative control's only: every two-level pass writes its
+    /// upper cells off by one.
+    #[doc(hidden)]
+    pub fn force_fault(on: bool) {
+        FAULT.store(u8::from(on), Ordering::Relaxed);
+    }
+
+    pub(super) fn fault() -> u32 {
+        u32::from(FAULT.load(Ordering::Relaxed))
+    }
+}
+
 /// Every level above an input layer of `full` fractions, of which the first
 /// `real` are stored — the rest are the padding's `0/1` and the first fold
 /// reads them as that. Returned with the output first, the way the tree
@@ -369,8 +420,53 @@ fn fold_upwards(
 ) -> Result<Vec<DeviceLayer>> {
     let mut layers: Vec<DeviceLayer> = Vec::new();
     let mut num_vars = full.trailing_zeros() as usize;
+    let two_levels = two_level_folds::enabled();
     while num_vars > 0 {
         let half = (1usize << num_vars) / 2;
+        let padded = layers.is_empty() && real != full;
+        // Two levels at once when two are left above and the level below is
+        // stored whole ([`two_level_folds`]).
+        if two_levels && num_vars >= 2 && !padded {
+            let quarter = half / 2;
+            // SAFETY: the kernel writes every element of both levels it produces.
+            let mut p_mid = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
+            let mut q_mid = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
+            let mut p_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, quarter * 3) }?;
+            let mut q_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, quarter * 3) }?;
+            let (below_p, below_q) = match layers.last() {
+                Some(level) => (level.p.clone(), level.q.clone()),
+                None => (p.clone(), q.clone()),
+            };
+            let half_arg = half as u64;
+            let fault = two_level_folds::fault();
+            unsafe {
+                stream
+                    .launch_builder(&be.fraction_fold2_ext3)
+                    .arg(below_p.as_ref())
+                    .arg(below_q.as_ref())
+                    .arg(&half_arg)
+                    .arg(&mut p_mid)
+                    .arg(&mut q_mid)
+                    .arg(&mut p_out)
+                    .arg(&mut q_out)
+                    .arg(&fault)
+                    .launch(LaunchConfig::for_num_elems(quarter as u32))?;
+            }
+            layers.push(DeviceLayer {
+                p: Arc::new(p_mid),
+                q: Arc::new(q_mid),
+                num_vars: num_vars - 1,
+                real: half,
+            });
+            layers.push(DeviceLayer {
+                p: Arc::new(p_out),
+                q: Arc::new(q_out),
+                num_vars: num_vars - 2,
+                real: quarter,
+            });
+            num_vars -= 2;
+            continue;
+        }
         // SAFETY: the kernel writes every element of the level it produces.
         let mut p_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
         let mut q_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
@@ -379,7 +475,6 @@ fn fold_upwards(
             None => (p.clone(), q.clone()),
         };
         let half_arg = half as u64;
-        let padded = layers.is_empty() && real != full;
         unsafe {
             if padded {
                 let real_arg = real as u64;
