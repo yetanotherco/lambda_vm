@@ -179,6 +179,35 @@ fn a_block_ground_at_18_bits_is_refused_by_a_verifier_at_20() {
     );
 }
 
+/// ★ The block's verifier checks every spent grinding nonce: a block whose
+/// prover skips the query grind (each query nonce one that fails the check,
+/// the rest of the proof consistent with it) is refused, while the same block
+/// ground honestly verifies. Proved at 17 bits, a count no other test of this
+/// process grinds at, because the fault is armed process-wide.
+#[test]
+fn a_block_whose_nonces_fail_the_grind_is_refused() {
+    let at17 = BlockFormat {
+        zf: ZfFormat {
+            whir_grind_bits: 17,
+            ..many_groups().zf
+        },
+        ..many_groups()
+    };
+    assert_eq!(at17.chain_config(&[(1, 27)]).grind.query, 17);
+    let elf = asm_elf_bytes("sub");
+    let options = options(MaxRowsConfig::small(), 3);
+    let honest = prove(&elf, &at17, &options);
+    assert!(verify(&honest, &elf, &at17), "the control: ground honestly");
+    let spoiled = {
+        let _spoiled = multilinear::whir_chain::SpoiledGrind::at(17);
+        prove(&elf, &at17, &options)
+    };
+    assert!(
+        !verify(&spoiled, &elf, &at17),
+        "a block whose query nonces fail the grind must be refused"
+    );
+}
+
 /// ★ `LAMBDA_VM_ZF_WHIR_BLOWUP` on the block: the base code's rate, and the Q
 /// the rule charges for it, are the verifier's constants, never the proof's. A
 /// block at blowup 2 verifies under blowup 2 and is refused by a verifier at

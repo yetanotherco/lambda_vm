@@ -173,6 +173,33 @@ pub fn require_out_of_domain_of_size<E: IsField>(
     Ok(())
 }
 
+/// ⛔ A NEGATIVE test's fault: while it holds `bits`, every grind of exactly
+/// that many bits skips the work and absorbs the first nonce that FAILS the
+/// check, so the rest of the proof is consistent with a nonce the verifier
+/// must refuse. 0 (the only value outside such a test) arms nothing. A test
+/// arms it at a bit count no other proof of its process uses
+/// ([`SpoiledGrind`]).
+#[doc(hidden)]
+pub static SPOIL_GRIND_AT_BITS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Arms [`SPOIL_GRIND_AT_BITS`] at `bits` while it lives; dropping it (also on
+/// a panic) disarms it.
+#[doc(hidden)]
+pub struct SpoiledGrind;
+
+impl SpoiledGrind {
+    pub fn at(bits: u8) -> Self {
+        SPOIL_GRIND_AT_BITS.store(bits, std::sync::atomic::Ordering::SeqCst);
+        SpoiledGrind
+    }
+}
+
+impl Drop for SpoiledGrind {
+    fn drop(&mut self) {
+        SPOIL_GRIND_AT_BITS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Proof of work over the transcript state, absorbed before the next challenge.
 ///
 /// Retrying that challenge then costs `2^bits` hashes. Zero bits is a no-op, so
@@ -185,6 +212,14 @@ where
 {
     if bits == 0 {
         return Ok(0);
+    }
+    if SPOIL_GRIND_AT_BITS.load(std::sync::atomic::Ordering::Relaxed) == bits {
+        let state = transcript.state();
+        let nonce = (0u64..)
+            .find(|&n| !crypto::grinding::is_valid_nonce::<GrindingDigest<H>>(&state, n, bits))
+            .expect("a failing nonce");
+        transcript.append_bytes(&nonce.to_be_bytes());
+        return Ok(nonce);
     }
     let nonce =
         crypto::grinding::generate_nonce_maybe_gpu::<GrindingDigest<H>>(&transcript.state(), bits)
@@ -5160,6 +5195,31 @@ mod tests {
         for round in &proof.rounds {
             assert_eq!(round.nonces, RoundNonces::default());
         }
+    }
+
+    /// The spoiled-grind fault ([`SpoiledGrind`]) makes a proof consistent
+    /// with nonces that fail the check: refused, by the grind. At 13 bits, a
+    /// count no other test of this crate grinds at (the fault is process-wide).
+    #[test]
+    fn a_spoiled_grind_is_refused_by_the_grind() {
+        let num_vars = 6;
+        let cfg = ChainConfig {
+            grind: GrindBits::uniform(13),
+            ..config(2)
+        };
+        let (proof, root, domain, y) = prove_ground(num_vars, &cfg);
+        assert_eq!(
+            verify_ground(&proof, &root, &domain, y, &cfg, num_vars),
+            Ok(())
+        );
+        let (spoiled, root, domain, y) = {
+            let _spoiled = SpoiledGrind::at(13);
+            prove_ground(num_vars, &cfg)
+        };
+        assert_eq!(
+            verify_ground(&spoiled, &root, &domain, y, &cfg, num_vars),
+            Err(Error::GrindingRejected { bits: 13 })
+        );
     }
 
     #[test]
