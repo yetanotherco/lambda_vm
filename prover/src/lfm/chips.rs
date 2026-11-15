@@ -378,6 +378,82 @@ pub mod select {
 }
 
 // =========================================================================
+// LEAN_MUX — a one-output select (the W-LFM prover's lean table)
+// =========================================================================
+
+pub mod mux {
+    use super::*;
+
+    pub mod cols {
+        pub use crate::lfm::layout::mux::*;
+        pub const BIT: usize = PREP_WIDTH;
+        pub const INL0: usize = PREP_WIDTH + 1; // ..+4
+        pub const INR0: usize = PREP_WIDTH + 5; // ..+8
+        pub const OUT0: usize = PREP_WIDTH + 9; // ..+12
+        pub const NUM_COLUMNS: usize = PREP_WIDTH + 13;
+    }
+
+    /// `LFM_SELECT`'s three receives and its left send: the bit and both arms
+    /// read on every real row, the chosen arm written with its multiplicity.
+    pub fn bus_interactions() -> Vec<BusInteraction> {
+        vec![
+            BusInteraction::receiver(
+                BusId::LfmMem,
+                Multiplicity::Column(cols::IS_REAL),
+                base_token(cols::BIT_ADDR, cols::BIT),
+            ),
+            BusInteraction::receiver(
+                BusId::LfmMem,
+                Multiplicity::Column(cols::IS_REAL),
+                word_token(cols::INL_ADDR, cols::INL0),
+            ),
+            BusInteraction::receiver(
+                BusId::LfmMem,
+                Multiplicity::Column(cols::IS_REAL),
+                word_token(cols::INR_ADDR, cols::INR0),
+            ),
+            BusInteraction::sender(
+                BusId::LfmMem,
+                Multiplicity::Column(cols::MULT),
+                word_token(cols::OUT_ADDR, cols::OUT0),
+            ),
+        ]
+    }
+
+    /// `LFM_SELECT`'s constraints with the right output gone: the bit
+    /// boolean, `out = in_l + bit·(in_r − in_l)` lane by lane.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct MuxConstraints {
+        /// Test only: the choice `out = in_l + bit·(in_r − in_l)` left out
+        /// (a mutant).
+        pub drop_choice: bool,
+    }
+
+    impl ConstraintSet<F, E> for MuxConstraints {
+        fn max_degree(&self) -> usize {
+            2
+        }
+
+        fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
+            let bit = b.main(0, cols::BIT);
+            let one = b.one();
+            b.emit_base(0, bit.clone() * (one - bit));
+            for j in 0..4 {
+                let bit = b.main(0, cols::BIT);
+                let inl = b.main(0, cols::INL0 + j);
+                let inr = b.main(0, cols::INR0 + j);
+                let out = b.main(0, cols::OUT0 + j);
+                if self.drop_choice {
+                    b.emit_base(1 + j, out.clone() - out);
+                } else {
+                    b.emit_base(1 + j, out - (inl.clone() + bit * (inr - inl)));
+                }
+            }
+        }
+    }
+}
+
+// =========================================================================
 // LFM_BITDEC — canonical 64-bit decomposition over p = 2^64 − 2^32 + 1
 // =========================================================================
 

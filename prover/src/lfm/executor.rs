@@ -103,6 +103,15 @@ pub struct SelectRow {
     pub out_r: LfmWord,
 }
 
+/// One `Instr::Mux` row's values: the bit, both arms, the chosen one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuxRow {
+    pub bit: FE,
+    pub in_l: LfmWord,
+    pub in_r: LfmWord,
+    pub out: LfmWord,
+}
+
 #[derive(Debug, Clone)]
 pub struct BitDecRow {
     /// All 64 bit values, low-to-high (constrained witness columns).
@@ -170,6 +179,7 @@ pub struct LfmRecords {
     /// One `B3L_HEAD` row: a compression's chaining value and block. Values
     /// only; the mode, constants, addresses and read counts are the program's.
     pub b3l: Vec<B3lValues>,
+    pub mux: Vec<MuxRow>,
 }
 
 impl LfmRecords {
@@ -206,6 +216,7 @@ impl LfmRecords {
             hint: Vec::with_capacity(groups.hint.real_rows),
             public: Vec::with_capacity(groups.public.real_rows),
             b3l: Vec::with_capacity(groups.b3l.real_rows),
+            mux: Vec::with_capacity(groups.mux.real_rows),
         }
     }
 }
@@ -246,7 +257,7 @@ impl LfmRecords {
             )+};
         }
         commit!(
-            balu, xalu, select, bitdec, keccak, blake3, lanes, hint, public, b3l
+            balu, xalu, select, bitdec, keccak, blake3, lanes, hint, public, b3l, mux
         );
         // `LFM_HASH`'s rows are one vector or the other, by the program's width.
         let rows = groups.hash.real_rows;
@@ -280,6 +291,7 @@ impl LfmRecords {
             + groups.keccak.real_rows * size_of::<KeccakRow>()
             + groups.blake3.real_rows * size_of::<Blake3Values>()
             + groups.b3l.real_rows * size_of::<B3lValues>()
+            + groups.mux.real_rows * size_of::<MuxRow>()
             + (groups.lanes.real_rows + groups.hint.real_rows + groups.public.real_rows)
                 * size_of::<LfmWord>()
     }
@@ -841,6 +853,37 @@ fn step(
                         in_r: r,
                         out_l: ol,
                         out_r: or,
+                    },
+                );
+            }
+            Instr::Mux {
+                bit,
+                out,
+                in_l,
+                in_r,
+                ..
+            } => {
+                let bv = m.read_base(*bit).map_err(|e| match e {
+                    LfmExecError::NotBaseWord(a) => LfmExecError::NonBooleanBit(a),
+                    other => other,
+                })?;
+                let l = m.read_word(*in_l)?;
+                let r = m.read_word(*in_r)?;
+                let chosen = if bv == FE::zero() {
+                    l
+                } else if bv == FE::one() {
+                    r
+                } else {
+                    return Err(LfmExecError::NonBooleanBit(bit.0));
+                };
+                m.write(*out, chosen)?;
+                sink.put(
+                    &mut records.mux,
+                    MuxRow {
+                        bit: bv,
+                        in_l: l,
+                        in_r: r,
+                        out: chosen,
                     },
                 );
             }
@@ -2082,6 +2125,7 @@ pub fn locate_addr(program: &LfmProgram, addr: u64) -> String {
             Instr::Const { out, .. } => vec![out.0],
             Instr::BaseAlu { out, .. } | Instr::ExtAlu { out, .. } => vec![out.0],
             Instr::Select { out_l, out_r, .. } => vec![out_l.0, out_r.0],
+            Instr::Mux { out, .. } => vec![out.0],
             Instr::BitDec { bits, halves, .. } => bits
                 .iter()
                 .map(|(a, _)| a.0)
