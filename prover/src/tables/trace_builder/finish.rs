@@ -2119,11 +2119,12 @@ const FAMILIES: [(&str, usize); 29] = [
 ];
 
 /// Which of the finish's tables are written straight into their packed form
-/// rather than built at 8 bytes a cell and packed after: PAGE
-/// (`LAMBDA_VM_FINISH_PAGE_DIRECT=1`) and BITWISE, its multiplicities in the
-/// same pass (`LAMBDA_VM_FINISH_BITWISE_DIRECT=1`). Off unless set; either way
-/// the tables' packed bytes are the same, and only under the packed form
-/// ([`TraceForm::Narrow`]) does a setting change how they are written.
+/// rather than built at 8 bytes a cell and packed after: PAGE, on by default
+/// (`LAMBDA_VM_FINISH_PAGE_DIRECT=0` builds it as before), and BITWISE, its
+/// multiplicities in the same pass, off unless asked
+/// (`LAMBDA_VM_FINISH_BITWISE_DIRECT=1`). Either way the tables' packed bytes
+/// are the same, and only under the packed form ([`TraceForm::Narrow`]) does a
+/// setting change how they are written.
 #[derive(Clone, Copy)]
 struct FinishDirect {
     page: bool,
@@ -2132,11 +2133,17 @@ struct FinishDirect {
 
 fn finish_direct() -> FinishDirect {
     static DIRECT: std::sync::OnceLock<FinishDirect> = std::sync::OnceLock::new();
-    let on = |name: &str| std::env::var(name).is_ok_and(|v| v.trim() == "1");
+    let word = |name: &str| std::env::var(name).ok();
     *DIRECT.get_or_init(|| FinishDirect {
-        page: on("LAMBDA_VM_FINISH_PAGE_DIRECT"),
-        bitwise: on("LAMBDA_VM_FINISH_BITWISE_DIRECT"),
+        page: page_direct_from(word("LAMBDA_VM_FINISH_PAGE_DIRECT").as_deref()),
+        bitwise: word("LAMBDA_VM_FINISH_BITWISE_DIRECT").is_some_and(|v| v.trim() == "1"),
     })
+}
+
+/// [`finish_direct`]'s reading of `LAMBDA_VM_FINISH_PAGE_DIRECT`: unset or any
+/// word but `0` writes PAGE straight into its packed form; `0` is the rollback.
+fn page_direct_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 /// [`FAMILIES`]' index of a family.
@@ -3753,5 +3760,21 @@ fn register_trace(
                     .map(|state| state.timestamp)
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod page_direct_tests {
+    use super::page_direct_from;
+
+    /// PAGE is written packed by default; `0` is the rollback, and nothing
+    /// else turns it off.
+    #[test]
+    fn page_direct_is_on_by_default_and_0_rolls_it_back() {
+        assert!(page_direct_from(None));
+        assert!(page_direct_from(Some("1")));
+        assert!(page_direct_from(Some(" 1 ")));
+        assert!(!page_direct_from(Some("0")));
+        assert!(!page_direct_from(Some(" 0")));
     }
 }

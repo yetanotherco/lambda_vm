@@ -1,5 +1,6 @@
-//! The finish's tables written straight into their packed form
-//! (`LAMBDA_VM_FINISH_PAGE_DIRECT`, `LAMBDA_VM_FINISH_BITWISE_DIRECT`) against
+//! The finish's tables written straight into their packed form (PAGE by
+//! default, `LAMBDA_VM_FINISH_PAGE_DIRECT=0` its rollback;
+//! `LAMBDA_VM_FINISH_BITWISE_DIRECT=1`) against
 //! today's: built at 8 bytes a cell, then packed. The packed bytes and widths
 //! must be the same, so the proof is.
 
