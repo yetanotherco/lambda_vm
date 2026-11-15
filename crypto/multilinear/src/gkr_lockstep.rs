@@ -641,6 +641,34 @@ fn tree_program<F: IsField + 'static>(
     b.finish(root)
 }
 
+/// The layers a device tree hands the host whole, by their variable count:
+/// today's prefix, `log2 HOST_CUBE_DIRECT + 1`, unless
+/// `LAMBDA_VM_GKR_HOST_PREFIX=<vars>` (1 to 30) says otherwise. The host's
+/// rounds over a layer send what the card's do, so every setting makes the
+/// same proof; a measurement word.
+pub fn host_prefix() -> usize {
+    static PREFIX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let today = crate::HOST_CUBE_DIRECT.trailing_zeros() as usize + 1;
+    match PREFIX_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => *PREFIX.get_or_init(|| {
+            std::env::var("LAMBDA_VM_GKR_HOST_PREFIX")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|vars| (1..=30).contains(vars))
+                .unwrap_or(today)
+        }),
+        forced => forced as usize,
+    }
+}
+
+static PREFIX_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Forces [`host_prefix`] (`None` back to the environment's word).
+#[doc(hidden)]
+pub fn force_host_prefix(vars: Option<u8>) {
+    PREFIX_FORCED.store(vars.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A table's tree as the argue builds it: its levels here, or on a device.
 impl<F: IsField + 'static> LadderTree<F> for crate::gkr::FractionTree<F>
 where
@@ -667,7 +695,7 @@ where
         // A level near the output comes here whole, as today's prefix does:
         // its rounds are over cubes a core walks in microseconds. Never the
         // input layer, which a tree that gave it back writes again.
-        let prefix = crate::HOST_CUBE_DIRECT.trailing_zeros() as usize + 1;
+        let prefix = host_prefix();
         if layer <= prefix && layer + 1 < self.num_layers() {
             let (p, q) = device
                 .layer_to_host::<F>(layer)

@@ -375,6 +375,54 @@ fn a_tampered_vm_proof_is_refused() {
     }
 }
 
+/// ★ The argue's measurement words keep the host reference's bytes: with the
+/// ladder's host prefix at 14 variables (`LAMBDA_VM_GKR_HOST_PREFIX`), the
+/// Gruen tail at 1024 cells, the zerocheck's three variants on and its card
+/// rounds down to two cells, and every pricing arm of the lookup argument
+/// twice, the card's argue of `test_keccak` and `all_instructions_64` is the
+/// host reference's bytes, and both verify.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "proves programs and flips process-global argue switches: a box run, alone"]
+fn the_card_keeps_the_host_references_bytes_under_every_measurement_word() {
+    use math_cuda::argue_fused::knobs;
+    use math_cuda::ktime;
+    struct Back;
+    impl Drop for Back {
+        fn drop(&mut self) {
+            multilinear::gkr_lockstep::force_host_prefix(None);
+            multilinear::gkr_gruen::force_gkr_gruen_tail(None);
+            knobs::force_stage(None, None, None);
+            multilinear::gpu_fused::force_zc_device_tail(None);
+            ktime::force_twice(None);
+        }
+    }
+    let _back = Back;
+    multilinear::gkr_lockstep::force_host_prefix(Some(14));
+    multilinear::gkr_gruen::force_gkr_gruen_tail(Some(1024));
+    knobs::force_stage(Some(true), Some(true), Some(true));
+    multilinear::gpu_fused::force_zc_device_tail(Some(Some(2)));
+    ktime::force_twice(Some(&[
+        "tree.fold.small",
+        "ladder.round.read.small",
+        "ladder.collect",
+    ]));
+    for name in ["test_keccak", "all_instructions_64"] {
+        let elf = crate::test_utils::asm_elf_bytes(name);
+        let (verdict, _, bytes) =
+            vm_round_trip_elf(name, &elf, None, &[Where::Host, Where::Device]);
+        verdict.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert!(
+            bytes[1] == bytes[0],
+            "{name}: under the measurement words the card's argue is not the host reference's bytes"
+        );
+        eprintln!(
+            "argue measurement words {name}: {} argue bytes == the host's",
+            bytes[1].len()
+        );
+    }
+}
+
 /// ★ D-BATCH B-3 on real tables: the prover on the card proves the host
 /// reference's canonical bytes — the roots and the whole argue — for every
 /// table of `test_keccak`, `test_ecsm` and `all_instructions_64`, and both

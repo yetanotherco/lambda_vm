@@ -381,8 +381,12 @@ fn fold_upwards(
         let half_arg = half as u64;
         let padded = layers.is_empty() && real != full;
         let mark = crate::ktime::start(stream);
-        // Twice under the pricing arm: the second launch writes what the first wrote.
-        for _ in 0..crate::ktime::times("tree.fold") {
+        // Twice under the pricing arm: the second launch writes what the first
+        // wrote (`tree.fold` every depth, `tree.fold.small` the outputs of at
+        // most 16 variables).
+        let twice = crate::ktime::twice("tree.fold")
+            || (num_vars <= 17 && crate::ktime::twice("tree.fold.small"));
+        for _ in 0..if twice { 2 } else { 1 } {
             unsafe {
                 if padded {
                     let real_arg = real as u64;
@@ -729,7 +733,9 @@ impl GruenLayer {
         // The pricing arm `ladder.round.read`: the same round again first, read
         // only (no fold, so nothing written back), its partials overwritten by the
         // real launch after it — the round's reads paid twice, its writes once.
-        if crate::ktime::twice("ladder.round.read") {
+        if crate::ktime::twice("ladder.round.read")
+            || (depth <= 18 && crate::ktime::twice("ladder.round.read.small"))
+        {
             let shadow = if stored < cube {
                 &be.gkr_round_gruen_real
             } else {
@@ -852,6 +858,11 @@ impl GruenLayer {
             self.stream.synchronize()?;
             Ok(sums)
         };
+        // The pricing arm `ladder.collect`: one more read-back of the same
+        // words, discarded — a round trip's price, paid once more a round.
+        if crate::ktime::twice("ladder.collect") {
+            let _ = today()?;
+        }
         match self.slot.as_ref() {
             Some(slot) => slot.collect(rows as usize, today),
             None => today(),
