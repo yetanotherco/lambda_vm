@@ -88,7 +88,8 @@ type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
 mod card_records;
 use card_records::{
-    CardDecode, CpuLogRecords, RegisterRowRecords, RowChunk, RowFamily, RowRecords,
+    AlignedRefRecords, CardDecode, CpuLogRecords, RegisterRowRecords, RowChunk, RowFamily,
+    RowRecords,
 };
 
 mod handout_count;
@@ -96,8 +97,6 @@ pub use handout_count::CountThreadStamps;
 
 mod history_sides;
 use handout_count::{CountWork, HandoutCounter};
-// Wired into the windowed builder by the MEMW_A chunks held as refs.
-#[cfg_attr(not(test), allow(dead_code))]
 mod history_rows;
 pub(crate) use history_sides::card_trace_rows;
 
@@ -1152,6 +1151,55 @@ impl<'a> WindowedTraceBuilder<'a> {
         };
         kept.history = Some(history_sides::HistoryTail::default());
         Ok(self)
+    }
+
+    /// With [`Self::card_derives_sides`] and MEMW_A held as records
+    /// ([`Self::card_fill_streamed_rows`]) in the limbs' form: each walked
+    /// window's MEMW_A rows go as refs (8 bytes a row: a load's or store's
+    /// cycle and its access in the window's history, or an ECALL row's index
+    /// in the window's whole rows; [`history_rows`]), and each full MEMW_A
+    /// chunk is handed out as them for the card to derive its rows from the
+    /// CPU logs it holds and the windows' accesses. Every host reader of such
+    /// a chunk, and the run's MEMW_A tail at the finish, derives its rows on
+    /// the host. A window that comes without its history or logs ends it for
+    /// the rest of the run (`LAMBDA_VM_CARD_TRACE=rows`). Before the first
+    /// window only. The words are the same.
+    pub fn card_derives_memw_a(mut self) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "card_derives_memw_a after a window was walked".to_string(),
+            ));
+        }
+        if !self
+            .card_fill_streamed
+            .as_ref()
+            .is_some_and(|c| c.rows.memw_a && c.cpu.is_some())
+        {
+            return Err(Error::Prover(
+                "card_derives_memw_a: card_fill_streamed with CPU and MEMW_A's rows first"
+                    .to_string(),
+            ));
+        }
+        let order = self.emitted.memw_aligned_order;
+        if order != MemwAlignedOrder::Limbs {
+            return Err(Error::Prover(
+                "card_derives_memw_a: MEMW_A in the limbs' form".to_string(),
+            ));
+        }
+        let decode = Arc::clone(&self.decode);
+        let Some(kept) = self.kept.as_mut().filter(|kept| kept.history.is_some()) else {
+            return Err(Error::Prover(
+                "card_derives_memw_a: card_derives_sides first".to_string(),
+            ));
+        };
+        kept.refs = Some(history_rows::RefTail::new(decode, order));
+        Ok(self)
+    }
+
+    /// Whether MEMW_A's rows go as refs ([`Self::card_derives_memw_a`]),
+    /// still.
+    pub fn derives_memw_a(&self) -> bool {
+        self.kept.as_ref().is_some_and(|kept| kept.refs.is_some())
     }
 
     /// A test's fault: with [`Self::card_derives_sides`], the walkers hook
@@ -3463,6 +3511,14 @@ struct Kept {
     /// rows as words and whole rows, in place of `register_rows`.
     words: Option<KeptWords>,
     aligned: Tail<memw_aligned::AlignedRow>,
+    /// [`WindowedTraceBuilder::card_derives_memw_a`]: the MEMW_A rows as refs
+    /// beside the windows they lie in, in place of `aligned`; `None` without,
+    /// and from a window that came without its history or logs on (the
+    /// pending refs' rows then join `aligned`).
+    refs: Option<history_rows::RefTail>,
+    /// What went wrong deriving a MEMW_A row on the host under that mode.
+    /// Refused at the finish.
+    refs_broken: Option<String>,
     general: Tail<super::MemwOperation>,
     load: Tail<super::LoadOperation>,
     lt: Tail<super::LtOperation>,
@@ -3600,6 +3656,8 @@ impl Kept {
             register_rows: Tail::new(),
             words: None,
             aligned: Tail::new(),
+            refs: None,
+            refs_broken: None,
             general: Tail::new(),
             load: Tail::new(),
             lt: Tail::new(),
@@ -3619,6 +3677,10 @@ impl Kept {
             + self.logs.as_ref().map_or(0, Tail::heap_bytes)
             + self.register_rows.heap_bytes()
             + self.aligned.heap_bytes()
+            + self
+                .refs
+                .as_ref()
+                .map_or(0, history_rows::RefTail::heap_bytes)
             + self.general.heap_bytes()
             + self.load.heap_bytes()
             + self.lt.heap_bytes()
@@ -3642,6 +3704,12 @@ impl Kept {
             ),
             ("kept memw_r".to_string(), self.register_rows.heap_bytes()),
             ("kept memw_a".to_string(), self.aligned.heap_bytes()),
+            (
+                "kept memw_a refs".to_string(),
+                self.refs
+                    .as_ref()
+                    .map_or(0, history_rows::RefTail::heap_bytes),
+            ),
             ("kept memw".to_string(), self.general.heap_bytes()),
             ("kept load".to_string(), self.load.heap_bytes()),
             ("kept lt".to_string(), self.lt.heap_bytes()),
@@ -3719,6 +3787,23 @@ impl Kept {
         Ok(())
     }
 
+    /// Ends [`WindowedTraceBuilder::card_derives_memw_a`] for the rest of the
+    /// run: the MEMW_A rows of the refs not handed out, derived on the host
+    /// from their windows ([`history_rows::RefTail::take_rows`]), join
+    /// `aligned`, as the walk made them. What cannot be derived is refused at
+    /// the finish.
+    fn settle_refs(&mut self) {
+        let Some(mut tail) = self.refs.take() else {
+            return;
+        };
+        match tail.take_rows() {
+            Ok(rows) => self.aligned.push(rows),
+            Err(e) => {
+                self.refs_broken.get_or_insert(e);
+            }
+        }
+    }
+
     fn append(&mut self, window: WalkedWindow, decode: &DecodeTable) {
         let WalkedWindow {
             cpu_ops,
@@ -3736,6 +3821,17 @@ impl Kept {
         if let Some(lists) = lists {
             self.unlisted += lists.rows();
         }
+        // The card derives MEMW_A's rows: the window's history and logs, for
+        // its rows' refs to lie in.
+        let refs_window = self
+            .refs
+            .is_some()
+            .then(|| {
+                let history = history_sides.as_ref().map(|(h, _)| Arc::clone(h))?;
+                let logs = logs.as_ref().map(Arc::clone)?;
+                (history.extras.len() == cycles && logs.len() == cycles).then_some((history, logs))
+            })
+            .flatten();
         // The card derives the CPU side records: each window's history goes
         // in step with the logs. A window without it, or the run going back
         // to the CPU list, ends that: the tail's side records are derived on
@@ -3848,7 +3944,33 @@ impl Kept {
             Some(kept) => kept.append(first as u64, memw.words, memw.register_rows, logs_for_words),
             None => self.register_rows.push(memw.register_rows),
         }
-        self.aligned.push(memw.aligned);
+        // Under the card's MEMW_A rows the window's rows go as refs; a window
+        // that cannot (no history or logs, or a row no ref names) ends the
+        // mode, the pending refs' rows first.
+        match (self.refs.as_mut(), refs_window) {
+            (Some(tail), Some((history, logs))) => {
+                match history_rows::aligned_refs_of_rows(&memw.aligned, first as u64, &history) {
+                    Ok((refs, whole)) => tail.push(
+                        refs,
+                        Arc::new(history_rows::RefWindow {
+                            first: first as u64,
+                            logs,
+                            history,
+                            whole,
+                        }),
+                    ),
+                    Err(_) => {
+                        self.settle_refs();
+                        self.aligned.push(memw.aligned);
+                    }
+                }
+            }
+            (Some(_), None) => {
+                self.settle_refs();
+                self.aligned.push(memw.aligned);
+            }
+            (None, _) => self.aligned.push(memw.aligned),
+        }
         self.general.push(memw.general);
         self.load.push(load_ops);
         self.lt.push(lt_ops);
@@ -3884,6 +4006,8 @@ impl Kept {
             register_rows,
             words,
             aligned,
+            refs,
+            refs_broken,
             general,
             load,
             lt,
@@ -3898,6 +4022,18 @@ impl Kept {
             return Err(Error::Prover(format!(
                 "{unlisted} LOAD or MEMW_A rows listed by the walkers that no chunk took"
             )));
+        }
+        // The card's MEMW_A rows: the run's last rows, derived from their
+        // refs. A run whose rows could not all be derived is refused here.
+        if let Some(e) = refs_broken {
+            return Err(Error::Prover(format!("MEMW_A rows from the history: {e}")));
+        }
+        let mut aligned = aligned.into_vec();
+        if let Some(mut tail) = refs {
+            aligned.extend(
+                tail.take_rows()
+                    .map_err(|e| Error::Prover(format!("MEMW_A rows from the history: {e}")))?,
+            );
         }
         let mut walk = WalkOutputs::with_capacity(0, order);
         // Words mode: the run's last register rows, decoded from the logs. A
@@ -3916,7 +4052,7 @@ impl Kept {
         };
         walk.memw = MemwBuckets {
             register_rows,
-            aligned: aligned.into_vec(),
+            aligned,
             general: general.into_vec(),
             words: None,
             order,
@@ -4267,6 +4403,75 @@ fn row_chunk_ops<T: RowFamily>(
     }
 }
 
+/// A full MEMW_A chunk of refs as handed out
+/// ([`WindowedTraceBuilder::card_derives_memw_a`]): held as them for the card
+/// to derive its rows while the host has room and the card holds the CPU
+/// chunks' decode, its rows derived on the host otherwise; and what went wrong
+/// deriving them on the host. Where its walker did not count its lookups the
+/// host derives its rows to count them.
+#[allow(clippy::too_many_arguments)]
+fn memw_a_refs_chunk_ops(
+    refs: Segments<multilinear::records::AlignedRef>,
+    windows: Vec<Arc<history_rows::RefWindow>>,
+    order: MemwAlignedOrder,
+    index: usize,
+    walker_counted: bool,
+    counter: Option<&HandoutCounter>,
+    histogram: &mut super::bitwise::BitwiseHistogram,
+    card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
+) -> (ChunkOps, Option<String>) {
+    let decode = card
+        .as_ref()
+        .and_then(|(c, _)| c.cpu.as_ref().map(Arc::clone));
+    let Some(decode) = decode else {
+        return (
+            ChunkOps::MemwAligned(Segments::one(Vec::new())),
+            Some("a MEMW_A chunk of refs without the CPU chunks' decode".to_string()),
+        );
+    };
+    let records = match AlignedRefRecords::new(refs, windows, decode, order) {
+        Ok(records) => records,
+        Err(_) => {
+            return (
+                ChunkOps::MemwAligned(Segments::one(Vec::new())),
+                Some("a MEMW_A chunk of refs that is not a whole table".to_string()),
+            );
+        }
+    };
+    if !walker_counted {
+        match records.rows() {
+            Ok(rows) => {
+                let rows = Segments::one(rows.to_vec());
+                match counter {
+                    Some(counter) => counter.send(CountWork::MemwAligned(rows, true)),
+                    None => handout_count::count_memw_aligned(&rows, Some(histogram), None),
+                }
+            }
+            Err(e) => {
+                return (
+                    ChunkOps::MemwAligned(Segments::one(Vec::new())),
+                    Some(e.to_string()),
+                );
+            }
+        }
+    }
+    let plain = |records: AlignedRefRecords| match records.into_rows() {
+        Ok(rows) => (ChunkOps::MemwAligned(rows), None),
+        Err(e) => (ChunkOps::MemwAligned(Segments::one(Vec::new())), Some(e)),
+    };
+    let Some((card, stamps)) = card.filter(|(card, _)| card.rows.memw_a) else {
+        return plain(records);
+    };
+    let bytes = multilinear::records::TableRecords::bytes(&records);
+    if !card.admits(bytes, (StreamTable::MemwAligned, index), stamps) {
+        stamps.memw_a[1] += 1;
+        return plain(records);
+    }
+    stamps.memw_a[0] += 1;
+    stamps.records_bytes += bytes;
+    (ChunkOps::Rows(Box::new(records)), None)
+}
+
 /// [`ChunkJob::regenerate`] of a [`RowFamily`]'s chunk cut from the regeneration
 /// walk: a whole table with the digest of the rows phase A would have held it
 /// as; any other filled as `plain` makes it, with none.
@@ -4548,6 +4753,44 @@ fn tail_jobs(
             ops,
         });
         e.memw_register += 1;
+    }
+    // The card's MEMW_A rows: each full chunk of refs, held as them while the
+    // host has room, as the rows the host derives from them otherwise.
+    while let Some(tail) = kept
+        .refs
+        .as_mut()
+        .filter(|tail| tail.len() >= m.memw_aligned)
+    {
+        let t = Instant::now();
+        let (refs, windows) = tail.take(m.memw_aligned);
+        let order = tail.order;
+        let taken = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let (ops, broken) = memw_a_refs_chunk_ops(
+            refs,
+            windows,
+            order,
+            e.memw_aligned,
+            walker_counted,
+            counter,
+            &mut counted.histogram,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+        );
+        if let Some(e) = broken {
+            kept.refs_broken.get_or_insert(e);
+        }
+        stamps.note(
+            StreamTable::MemwAligned,
+            taken,
+            t.elapsed().as_secs_f64(),
+            0,
+        );
+        jobs.push(ChunkJob {
+            table: StreamTable::MemwAligned,
+            index: e.memw_aligned,
+            ops,
+        });
+        e.memw_aligned += 1;
     }
     take_chunks!(
         StreamTable::MemwAligned,

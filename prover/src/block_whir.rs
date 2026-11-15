@@ -6660,12 +6660,27 @@ fn prove_streamed(
                         if sides {
                             builder = builder.card_derives_sides()?;
                         }
+                        // And MEMW_A's rows from the windows' accesses: needs the
+                        // side records' mode (the windows' history), MEMW_A held as
+                        // records, and the limbs' form.
+                        let memw_a = sides
+                            && card_fill.rows.memw_a
+                            && format.memw_aligned
+                                == crate::tables::memw_aligned::MemwAlignedOrder::Limbs;
+                        if memw_a {
+                            builder = builder.card_derives_memw_a()?;
+                        }
                         eprintln!(
-                            "BLOCK CARD TRACE: rows · {}",
+                            "BLOCK CARD TRACE: rows · {} · {}",
                             if sides {
                                 "the card derives the CPU rows' side records from the history"
                             } else {
                                 "off here (no record mode, the history re-walked, no walkers, no CPU logs kept, or not the in-row format): the side records go up"
+                            },
+                            if memw_a {
+                                "and MEMW_A's rows from the windows' accesses"
+                            } else {
+                                "MEMW_A's rows go up (MEMW_A not held as records, or not the limbs' form)"
                             }
                         );
                     }
