@@ -1132,6 +1132,12 @@ pub fn wlfm_program_id(a: &WlfmArtifacts) -> Commitment {
             h.update(b"MUX");
             h.update((a.b3l.muxes.len() as u64).to_le_bytes());
         }
+        // The cap tables' and reads' chunks, only when a program has them.
+        if !a.b3l.caps.is_empty() || !a.b3l.cap_reads.is_empty() {
+            h.update(b"CAP");
+            h.update((a.b3l.caps.len() as u64).to_le_bytes());
+            h.update((a.b3l.cap_reads.len() as u64).to_le_bytes());
+        }
     }
     // Under the evaluated binding there are no roots to fold: the columns
     // themselves, every value, one digest a column. (The stacked binding's

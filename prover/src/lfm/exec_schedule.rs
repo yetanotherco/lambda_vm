@@ -301,14 +301,22 @@ struct ChipRows {
     public: u32,
     b3l: u32,
     mux: u32,
+    cap: u32,
+    cap_read: u32,
 }
 
 impl ChipRows {
     /// The next row for `instr`'s chip, post-incrementing that chip's counter.
     /// Every arm of the executor pushes exactly one record, so every
-    /// instruction takes exactly one row.
+    /// instruction takes exactly one row — but a cap table, which pushes one
+    /// a node and takes that many rows from its first.
     #[inline]
     fn take(&mut self, instr: &Instr) -> u32 {
+        if let Instr::CapTable(t) = instr {
+            let row = self.cap;
+            self.cap += t.nodes.len() as u32;
+            return row;
+        }
         let c = match instr {
             Instr::Const { .. } => &mut self.const_,
             Instr::BaseAlu { .. } => &mut self.balu,
@@ -326,6 +334,8 @@ impl ChipRows {
             Instr::Public { .. } => &mut self.public,
             Instr::B3l(_) => &mut self.b3l,
             Instr::Mux { .. } => &mut self.mux,
+            Instr::CapRead { .. } => &mut self.cap_read,
+            Instr::CapTable(_) => unreachable!("taken above"),
         };
         let row = *c;
         *c += 1;
@@ -348,6 +358,8 @@ impl ChipRows {
             self.public,
             self.b3l,
             self.mux,
+            self.cap,
+            self.cap_read,
         ];
         let census = [
             g.const_.real_rows,
@@ -363,13 +375,16 @@ impl ChipRows {
             g.public.real_rows,
             g.b3l.real_rows,
             g.mux.real_rows,
+            g.cap.real_rows,
+            g.cap_read.real_rows,
         ];
         assert_eq!(
             mine.map(|v| v as usize),
             census,
             "the schedule handed out a different number of record rows than the \
              compiler emitted column-group rows (order: const, balu, xalu, \
-             select, bitdec, hash, keccak, blake3, lanes, hint, public, b3l, mux)"
+             select, bitdec, hash, keccak, blake3, lanes, hint, public, b3l, mux, cap, \
+             cap_read)"
         );
     }
 }

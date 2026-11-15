@@ -40,10 +40,13 @@ use super::b3l::B3lValues;
 use super::blake3_lean::{
     self as lean, HeadConstraints, RoundConstraints, TableHist, head, round, table,
 };
+use super::chips::cap::{CapConstraints, cols as cap};
+use super::chips::cap_read::cols as cap_read;
 use super::chips::mux::{MuxConstraints, cols as mux};
 use super::compiler::{ColumnGroup, LfmProgram};
-use super::executor::MuxRow;
+use super::executor::{CapReadRow, MuxRow};
 use super::layout::b3l as l;
+use super::word::LfmWord;
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -60,6 +63,8 @@ pub const ROUND_NAME: &str = "B3L_ROUND";
 pub const HEAD_NAME: &str = "B3L_HEAD";
 pub const TABLE_NAME: &str = "B3L_XOR";
 pub const MUX_NAME: &str = "LEAN_MUX";
+pub const CAP_NAME: &str = "LEAN_CAP";
+pub const CAP_READ_NAME: &str = "LEAN_CAP_READ";
 
 /// The largest `LEAN_MUX` chunk, in rows: the LFM chips' cut (`wlfm`'s
 /// `WLFM_CHUNK_LOG`).
@@ -75,6 +80,11 @@ pub struct B3lShape {
     /// The `LEAN_MUX` chunks (one-output selects): only in a program with
     /// compressions, after the byte table.
     pub muxes: Vec<usize>,
+    /// The `LEAN_CAP` chunks (cap tables, one row a node), then the
+    /// `LEAN_CAP_READ` chunks (one row a read): only in a program with
+    /// compressions, after the mux chunks, each cut as the mux's.
+    pub caps: Vec<usize>,
+    pub cap_reads: Vec<usize>,
 }
 
 impl B3lShape {
@@ -87,6 +97,8 @@ impl B3lShape {
             rounds: lean::chunk_rows(l::ROUNDS * compressions, CHUNK_LOG, MIN_CHUNK_LOG),
             heads: lean::chunk_rows(compressions, CHUNK_LOG, MIN_CHUNK_LOG),
             muxes: Vec::new(),
+            caps: Vec::new(),
+            cap_reads: Vec::new(),
         }
     }
 
@@ -94,8 +106,10 @@ impl B3lShape {
     pub fn of_program(program: &LfmProgram) -> Self {
         let mut shape = Self::of(program.groups.b3l.real_rows);
         if !shape.is_empty() {
-            shape.muxes =
-                lean::chunk_rows(program.groups.mux.real_rows, MUX_CHUNK_LOG, MIN_CHUNK_LOG);
+            let g = &program.groups;
+            shape.muxes = lean::chunk_rows(g.mux.real_rows, MUX_CHUNK_LOG, MIN_CHUNK_LOG);
+            shape.caps = lean::chunk_rows(g.cap.real_rows, MUX_CHUNK_LOG, MIN_CHUNK_LOG);
+            shape.cap_reads = lean::chunk_rows(g.cap_read.real_rows, MUX_CHUNK_LOG, MIN_CHUNK_LOG);
         }
         shape
     }
@@ -105,12 +119,17 @@ impl B3lShape {
     }
 
     /// The tables this shape adds: the round chunks, the head chunks, the
-    /// byte table and the mux chunks; none when empty.
+    /// byte table, the mux chunks and the cap chunks; none when empty.
     pub fn num_tables(&self) -> usize {
         if self.is_empty() {
             0
         } else {
-            self.rounds.len() + self.heads.len() + 1 + self.muxes.len()
+            self.rounds.len()
+                + self.heads.len()
+                + 1
+                + self.muxes.len()
+                + self.caps.len()
+                + self.cap_reads.len()
         }
     }
 
@@ -124,7 +143,13 @@ impl B3lShape {
             .chain(&self.heads)
             .map(|rows| rows.trailing_zeros() as u8)
             .chain([table::ROWS.trailing_zeros() as u8])
-            .chain(self.muxes.iter().map(|rows| rows.trailing_zeros() as u8))
+            .chain(
+                self.muxes
+                    .iter()
+                    .chain(&self.caps)
+                    .chain(&self.cap_reads)
+                    .map(|rows| rows.trailing_zeros() as u8),
+            )
             .collect()
     }
 }
@@ -138,6 +163,8 @@ pub struct B3lAirs {
     heads: Vec<LfmAir<HeadConstraints>>,
     table: Option<LfmAir<EmptyConstraints>>,
     muxes: Vec<LfmAir<MuxConstraints>>,
+    caps: Vec<LfmAir<CapConstraints>>,
+    cap_reads: Vec<LfmAir<EmptyConstraints>>,
 }
 
 impl B3lAirs {
@@ -215,6 +242,37 @@ impl B3lAirs {
                     )
                 })
                 .collect(),
+            caps: shape
+                .caps
+                .iter()
+                .map(|_| {
+                    let (constraints, drop_node_read) = cap_mutant();
+                    build_lfm_air(
+                        cap::NUM_COLUMNS,
+                        super::chips::cap::bus_interactions_with(drop_node_read),
+                        options,
+                        constraints,
+                        CAP_NAME,
+                        zero,
+                        cap::PREP_WIDTH,
+                    )
+                })
+                .collect(),
+            cap_reads: shape
+                .cap_reads
+                .iter()
+                .map(|_| {
+                    build_lfm_air(
+                        cap_read::NUM_COLUMNS,
+                        super::chips::cap_read::bus_interactions(),
+                        options,
+                        EmptyConstraints,
+                        CAP_READ_NAME,
+                        zero,
+                        cap_read::PREP_WIDTH,
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -228,6 +286,8 @@ impl B3lAirs {
             v.push(t);
         }
         v.extend(self.muxes.iter().map(|a| a as DynLfmAir<'_>));
+        v.extend(self.caps.iter().map(|a| a as DynLfmAir<'_>));
+        v.extend(self.cap_reads.iter().map(|a| a as DynLfmAir<'_>));
         v
     }
 
@@ -236,6 +296,15 @@ impl B3lAirs {
         &'a self,
         traces: &'a mut B3lTraces,
     ) -> Result<Vec<(DynLfmAir<'a>, &'a mut HeldTable)>, String> {
+        if traces.caps.len() != self.caps.len() || traces.cap_reads.len() != self.cap_reads.len() {
+            return Err(format!(
+                "the lean traces are {} cap and {} cap-read chunks, the AIR set {} and {}",
+                traces.caps.len(),
+                traces.cap_reads.len(),
+                self.caps.len(),
+                self.cap_reads.len()
+            ));
+        }
         if traces.rounds.len() != self.rounds.len()
             || traces.heads.len() != self.heads.len()
             || traces.muxes.len() != self.muxes.len()
@@ -263,6 +332,12 @@ impl B3lAirs {
         }
         v.push((table_air, &mut traces.table));
         for (air, t) in self.muxes.iter().zip(traces.muxes.iter_mut()) {
+            v.push((air, t));
+        }
+        for (air, t) in self.caps.iter().zip(traces.caps.iter_mut()) {
+            v.push((air, t));
+        }
+        for (air, t) in self.cap_reads.iter().zip(traces.cap_reads.iter_mut()) {
             v.push((air, t));
         }
         Ok(v)
@@ -528,6 +603,9 @@ pub struct B3lTraces {
     pub table: HeldTable,
     /// The `LEAN_MUX` chunks ([`build_mux_tables`]).
     pub muxes: Vec<HeldTable>,
+    /// The `LEAN_CAP` and `LEAN_CAP_READ` chunks ([`build_cap_tables`]).
+    pub caps: Vec<HeldTable>,
+    pub cap_reads: Vec<HeldTable>,
 }
 
 impl B3lTraces {
@@ -552,6 +630,8 @@ impl B3lTraces {
             .chain(self.heads.iter_mut())
             .chain(core::iter::once(&mut self.table))
             .chain(self.muxes.iter_mut())
+            .chain(self.caps.iter_mut())
+            .chain(self.cap_reads.iter_mut())
     }
 }
 
@@ -626,13 +706,130 @@ pub fn b3l_prep_groups(program: &LfmProgram) -> Vec<ColumnGroup> {
         padded_rows: table::ROWS,
         data,
     });
-    let g = &program.groups.mux;
-    let mut start = 0usize;
-    for &rows in &shape.muxes {
-        out.push(chunk_of(&g.data, g.width, g.real_rows, start, rows));
-        start += rows;
+    for (g, chunks) in [
+        (&program.groups.mux, &shape.muxes),
+        (&program.groups.cap, &shape.caps),
+        (&program.groups.cap_read, &shape.cap_reads),
+    ] {
+        let mut start = 0usize;
+        for &rows in chunks {
+            out.push(chunk_of(&g.data, g.width, g.real_rows, start, rows));
+            start += rows;
+        }
     }
     out
+}
+
+/// The cap tables' constraint set and whether their node read is dropped:
+/// today's, or a test's mutant.
+fn cap_mutant() -> (CapConstraints, bool) {
+    #[cfg(test)]
+    if let Some(m) = test_cap::get() {
+        return (
+            CapConstraints {
+                drop_real_gate: m.drop_real_gate,
+            },
+            m.drop_node_read,
+        );
+    }
+    (CapConstraints::default(), false)
+}
+
+/// A program's `LEAN_CAP` and `LEAN_CAP_READ` chunks, in table order, from
+/// its cap records: a table row is the program's instruction row, then its
+/// node's word and `M`, the number of reads of `(tag, index)` among the read
+/// records; a read row is its instruction row, then the tag, the index and
+/// the word. Rows past the last instruction zero. Held wide.
+///
+/// A read record naming no table row counts nowhere (an honest execution
+/// has none; a tampered one leaves the lookup unbalanced).
+pub fn build_cap_tables(
+    program: &LfmProgram,
+    nodes: &[LfmWord],
+    reads: &[CapReadRow],
+) -> (Vec<HeldTable>, Vec<HeldTable>) {
+    let shape = B3lShape::of_program(program);
+    let (g, gr) = (&program.groups.cap, &program.groups.cap_read);
+    assert_eq!(
+        (nodes.len(), reads.len()),
+        (g.real_rows, gr.real_rows),
+        "one LEAN_CAP record a node and one LEAN_CAP_READ record a read: the executor and the \
+         compiler disagree"
+    );
+    // Each table's first row, by tag: tables are tagged 0, 1, … in row order
+    // and a table's rows indexed from 0 (the validator's check 11).
+    use math::field::traits::IsPrimeField;
+    let at = |row: usize, col: usize| GoldilocksField::canonical(g.at(row, col).value());
+    let starts: Vec<usize> = (0..g.real_rows)
+        .filter(|&row| at(row, super::layout::cap::INDEX) == 0)
+        .collect();
+    let mut counts = vec![0u64; g.real_rows];
+    for r in reads {
+        let (tag, index) = (r.tag.canonical(), r.index.canonical());
+        let row = usize::try_from(tag)
+            .ok()
+            .and_then(|t| starts.get(t))
+            .and_then(|&s| usize::try_from(index).ok().map(|i| s + i))
+            .filter(|&row| {
+                row < g.real_rows
+                    && at(row, super::layout::cap::TAG) == tag
+                    && at(row, super::layout::cap::INDEX) == index
+            });
+        if let Some(row) = row {
+            counts[row] += 1;
+        }
+    }
+    let fill_table = |rows: usize, start: usize| {
+        let width = cap::NUM_COLUMNS;
+        let mut data = zeroed_fe_vec(rows * width);
+        for (r, row) in data.chunks_mut(width).enumerate() {
+            let k = start + r;
+            if k >= nodes.len() {
+                break;
+            }
+            row[..cap::PREP_WIDTH].copy_from_slice(&g.data[k * g.width..(k + 1) * g.width]);
+            row[cap::W0..cap::W0 + 4].copy_from_slice(&nodes[k]);
+            row[cap::M] = FE::from(counts[k]);
+        }
+        HeldTable::from_rows(data, width, B3lHold::Wide)
+    };
+    let fill_read = |rows: usize, start: usize| {
+        let width = cap_read::NUM_COLUMNS;
+        let mut data = zeroed_fe_vec(rows * width);
+        for (r, row) in data.chunks_mut(width).enumerate() {
+            let k = start + r;
+            if k >= reads.len() {
+                break;
+            }
+            row[..cap_read::PREP_WIDTH].copy_from_slice(&gr.data[k * gr.width..(k + 1) * gr.width]);
+            let rec = &reads[k];
+            row[cap_read::TAG] = rec.tag;
+            row[cap_read::INDEX] = rec.index;
+            row[cap_read::OUT0..cap_read::OUT0 + 4].copy_from_slice(&rec.out);
+        }
+        HeldTable::from_rows(data, width, B3lHold::Wide)
+    };
+    let mut start = 0usize;
+    let tables = shape
+        .caps
+        .iter()
+        .map(|&rows| {
+            let t = fill_table(rows, start);
+            start += rows;
+            t
+        })
+        .collect();
+    let mut start = 0usize;
+    let reads = shape
+        .cap_reads
+        .iter()
+        .map(|&rows| {
+            let t = fill_read(rows, start);
+            start += rows;
+            t
+        })
+        .collect();
+    (tables, reads)
 }
 
 /// The mux tables' constraint set: today's, or a test's mutant.
@@ -847,6 +1044,8 @@ pub fn build_b3l_traces_held(
         heads,
         table,
         muxes: Vec::new(),
+        caps: Vec::new(),
+        cap_reads: Vec::new(),
     })
 }
 
@@ -1096,6 +1295,8 @@ fn fill_narrow_direct<'p>(
         heads,
         table,
         muxes: Vec::new(),
+        caps: Vec::new(),
+        cap_reads: Vec::new(),
     })
 }
 
@@ -1238,6 +1439,8 @@ fn fill_records<'p>(
         heads,
         table,
         muxes: Vec::new(),
+        caps: Vec::new(),
+        cap_reads: Vec::new(),
     })
 }
 
@@ -1300,6 +1503,40 @@ pub(crate) mod test_mux {
 
     pub(super) fn get() -> Option<MuxConstraints> {
         MUX.with(Cell::get)
+    }
+}
+
+/// A TEST-ONLY mutant of the cap tables (their padding gate, or their node
+/// read, dropped), per thread, restored when the guard drops; it reaches
+/// prover and verifier alike.
+#[cfg(test)]
+pub(crate) mod test_cap {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) struct CapMutant {
+        pub(crate) drop_real_gate: bool,
+        pub(crate) drop_node_read: bool,
+    }
+
+    thread_local! {
+        static CAP: Cell<Option<CapMutant>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct Override(Option<CapMutant>);
+
+    impl Drop for Override {
+        fn drop(&mut self) {
+            CAP.with(|c| c.set(self.0));
+        }
+    }
+
+    pub(crate) fn set(mutant: CapMutant) -> Override {
+        Override(CAP.with(|c| c.replace(Some(mutant))))
+    }
+
+    pub(super) fn get() -> Option<CapMutant> {
+        CAP.with(Cell::get)
     }
 }
 

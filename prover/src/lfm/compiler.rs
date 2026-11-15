@@ -128,6 +128,13 @@ pub struct LfmColumnGroups {
     /// `LEAN_MUX`'s instruction group: one row an [`Instr::Mux`]
     /// ([`layout::mux`]), on the same terms as [`Self::b3l`].
     pub mux: ColumnGroup,
+    /// `LEAN_CAP`'s instruction group: one row a node of an
+    /// [`Instr::CapTable`] ([`layout::cap`]), tables in program order, on the
+    /// same terms as [`Self::b3l`].
+    pub cap: ColumnGroup,
+    /// `LEAN_CAP_READ`'s instruction group: one row an [`Instr::CapRead`]
+    /// ([`layout::cap_read`]), on the same terms as [`Self::b3l`].
+    pub cap_read: ColumnGroup,
 }
 
 /// A compiled LFM program: multiplicity-backfilled instructions plus the
@@ -399,8 +406,11 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
                 *mult_l = take(*out_l, &mut written, &mut read_counts);
                 *mult_r = take(*out_r, &mut written, &mut read_counts);
             }
-            Instr::Mux { out, mult, .. } => {
+            Instr::Mux { out, mult, .. } | Instr::CapRead { out, mult, .. } => {
                 *mult = take(*out, &mut written, &mut read_counts);
+            }
+            Instr::CapTable(t) => {
+                t.handle_mult = take(t.handle, &mut written, &mut read_counts);
             }
             Instr::BitDec { bits, halves, .. } => {
                 for (addr, mult) in bits.iter_mut() {
@@ -493,6 +503,8 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
     let mut public = ColumnGroupBuilder::new(layout::public::PREP_WIDTH);
     let mut b3l = ColumnGroupBuilder::new(layout::b3l::PREP_WIDTH);
     let mut mux = ColumnGroupBuilder::new(layout::mux::PREP_WIDTH);
+    let mut cap = ColumnGroupBuilder::new(layout::cap::PREP_WIDTH);
+    let mut cap_read = ColumnGroupBuilder::new(layout::cap_read::PREP_WIDTH);
 
     for instr in instrs {
         match instr {
@@ -700,6 +712,34 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 mux.set(r, l::MULT, fe(*mult));
                 mux.set(r, l::IS_REAL, FE::one());
             }
+            Instr::CapTable(t) => {
+                use layout::cap as l;
+                for (i, node) in t.nodes.iter().enumerate() {
+                    let r = cap.open_row();
+                    cap.set(r, l::TAG, fe(u64::from(t.tag)));
+                    cap.set(r, l::INDEX, fe(i as u64));
+                    cap.set(r, l::NODE_ADDR, fe(node.0));
+                    if i == 0 {
+                        cap.set(r, l::H_ADDR, fe(t.handle.0));
+                        cap.set(r, l::H_MULT, fe(t.handle_mult));
+                    }
+                    cap.set(r, l::IS_REAL, FE::one());
+                }
+            }
+            Instr::CapRead {
+                handle,
+                index,
+                out,
+                mult,
+            } => {
+                use layout::cap_read as l;
+                let r = cap_read.open_row();
+                cap_read.set(r, l::HANDLE_ADDR, fe(handle.0));
+                cap_read.set(r, l::INDEX_ADDR, fe(index.0));
+                cap_read.set(r, l::OUT_ADDR, fe(out.0));
+                cap_read.set(r, l::MULT, fe(*mult));
+                cap_read.set(r, l::IS_REAL, FE::one());
+            }
             Instr::B3l(op) => {
                 use super::instr::{B3lBlock, B3lCv};
                 use layout::b3l as l;
@@ -800,5 +840,7 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
         public: public.finish(),
         b3l: b3l.finish(),
         mux: mux.finish(),
+        cap: cap.finish(),
+        cap_read: cap_read.finish(),
     }
 }

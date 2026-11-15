@@ -159,7 +159,10 @@ fn histogram(program: &LfmProgram) -> String {
             Instr::Const { .. } => 0,
             Instr::BaseAlu { .. } => 1,
             Instr::ExtAlu { .. } => 2,
-            Instr::Select { .. } | Instr::Mux { .. } => 3,
+            Instr::Select { .. }
+            | Instr::Mux { .. }
+            | Instr::CapTable(_)
+            | Instr::CapRead { .. } => 3,
             Instr::BitDec { .. } => 4,
             Instr::Hash { .. } | Instr::Hash16(_) => 5,
             Instr::Hint { .. } | Instr::HintOn { .. } => 6,

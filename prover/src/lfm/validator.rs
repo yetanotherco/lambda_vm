@@ -101,6 +101,16 @@ pub enum LfmViolation {
     /// whose IV flag is not a bit, whose `block_len` exceeds 64 or `flags` a
     /// byte, or whose mode leaves a placeholder nonzero.
     MalformedB3lRow { row: usize },
+    /// Check 11 — a `LEAN_CAP` instruction row out of shape: tables not
+    /// tagged `0, 1, …` in order, a table's indices not `0, 1, …`, or a
+    /// handle write off a table's first row. `(tag, index)` is what a read
+    /// looks a word up by, so two rows sharing it would let a prover answer
+    /// a read from either.
+    MalformedCapRow { row: usize },
+    /// Check 11 — cap tables or reads in a program with no lean compression:
+    /// only the lean tables prove them, and a program without compressions
+    /// has none.
+    CapWithoutLeanTables,
 }
 
 pub fn validate(program: &LfmProgram) -> Result<(), LfmViolation> {
@@ -287,7 +297,8 @@ fn check_multiplicities_with(program: &LfmProgram, dense: bool) -> Result<(), Lf
                 check(*out_l, *mult_l)?;
                 check(*out_r, *mult_r)?;
             }
-            Instr::Mux { out, mult, .. } => check(*out, *mult)?,
+            Instr::Mux { out, mult, .. } | Instr::CapRead { out, mult, .. } => check(*out, *mult)?,
+            Instr::CapTable(t) => check(t.handle, t.handle_mult)?,
             Instr::BitDec { bits, halves, .. } => {
                 for (addr, mult) in bits {
                     check(*addr, *mult)?;
@@ -427,6 +438,8 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
     chip_real("LFM_PUBLIC", &g.public, counts.public)?;
     chip_real("B3L_HEAD", &g.b3l, counts.b3l)?;
     chip_real("LEAN_MUX", &g.mux, counts.mux)?;
+    chip_real("LEAN_CAP", &g.cap, counts.cap)?;
+    chip_real("LEAN_CAP_READ", &g.cap_read, counts.cap_read)?;
 
     // Selector one-hot / is_real flags on real rows.
     one_hot(
@@ -463,7 +476,10 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
     flag_is_one(&g.bitdec, "LFM_BITDEC", layout::bitdec::IS_REAL)?;
     flag_is_one(&g.public, "LFM_PUBLIC", layout::public::IS_REAL)?;
     flag_is_one(&g.mux, "LEAN_MUX", layout::mux::IS_REAL)?;
+    flag_is_one(&g.cap, "LEAN_CAP", layout::cap::IS_REAL)?;
+    flag_is_one(&g.cap_read, "LEAN_CAP_READ", layout::cap_read::IS_REAL)?;
     check_b3l_rows(&g.b3l)?;
+    check_cap_rows(g)?;
 
     // Padding: everything beyond the real rows is zero.
     for (chip, group) in [
@@ -480,6 +496,8 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
         ("LFM_PUBLIC", &g.public),
         ("B3L_HEAD", &g.b3l),
         ("LEAN_MUX", &g.mux),
+        ("LEAN_CAP", &g.cap),
+        ("LEAN_CAP_READ", &g.cap_read),
     ] {
         for row in group.real_rows..group.padded_rows {
             for col in 0..group.width {
@@ -511,7 +529,7 @@ const MULT_HARD_CAP: u64 = 1 << 32;
 /// upper bound (safe), under-counting would reject honest programs, so where
 /// two receivers are mutually exclusive the count rounds up.
 fn mult_bound(g: &LfmColumnGroups, hash16: bool) -> u64 {
-    let receives_per_row: [(&ColumnGroup, u64); 13] = [
+    let receives_per_row: [(&ColumnGroup, u64); 15] = [
         (&g.const_, 0),                        // reads nothing
         (&g.balu, 3),                          // A, B, C
         (&g.xalu, 3),                          // A, B, C
@@ -531,6 +549,8 @@ fn mult_bound(g: &LfmColumnGroups, hash16: bool) -> u64 {
             (layout::b3l::DIGEST_WORDS + layout::b3l::LANE_WORDS) as u64,
         ), // h | the block
         (&g.mux, 3),                           // BIT, IN_L, IN_R
+        (&g.cap, 1),                           // the node
+        (&g.cap_read, 2),                      // the handle, the index
     ];
     let reads = receives_per_row.iter().fold(0u64, |acc, (group, per_row)| {
         acc.saturating_add((group.real_rows as u64).saturating_mul(*per_row))
@@ -560,6 +580,8 @@ fn mult_columns(
             vec![select::MULT_L, select::MULT_R],
         ),
         ("LEAN_MUX", &g.mux, vec![layout::mux::MULT]),
+        ("LEAN_CAP", &g.cap, vec![layout::cap::H_MULT]),
+        ("LEAN_CAP_READ", &g.cap_read, vec![layout::cap_read::MULT]),
         (
             "LFM_BITDEC",
             &g.bitdec,
@@ -652,6 +674,37 @@ fn check_b3l_rows(group: &ColumnGroup) -> Result<(), LfmViolation> {
     Ok(())
 }
 
+/// Check 11 — `LEAN_CAP`'s instruction rows, read from the committed columns
+/// (whatever the instruction list says): tables tagged `0, 1, …` in row order,
+/// each table's rows indexed `0, 1, …`, at most `2^32` nodes a table, the
+/// handle's write on a table's index-0 row only. So `(tag, index)` is unique
+/// to a row. And cap rows only beside lean compressions.
+fn check_cap_rows(g: &LfmColumnGroups) -> Result<(), LfmViolation> {
+    use layout::cap as l;
+    if (g.cap.real_rows > 0 || g.cap_read.real_rows > 0) && g.b3l.real_rows == 0 {
+        return Err(LfmViolation::CapWithoutLeanTables);
+    }
+    let at = |row: usize, col: usize| GoldilocksField::canonical(g.cap.at(row, col).value());
+    let (mut tag, mut index) = (0u64, 0u64);
+    for row in 0..g.cap.real_rows {
+        let bad = || LfmViolation::MalformedCapRow { row };
+        let (t, i) = (at(row, l::TAG), at(row, l::INDEX));
+        if row > 0 && i == 0 {
+            // A new table: the next tag.
+            tag += 1;
+            index = 0;
+        }
+        if t != tag || i != index || i >= 1 << 32 {
+            return Err(bad());
+        }
+        if i != 0 && (at(row, l::H_ADDR) != 0 || at(row, l::H_MULT) != 0) {
+            return Err(bad());
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
 /// Check 9: every multiplicity column of every group holds a canonically
 /// small non-negative integer.
 ///
@@ -734,6 +787,9 @@ struct PartitionCounts {
     public: usize,
     b3l: usize,
     mux: usize,
+    /// `LEAN_CAP` rows: one a node of every cap table.
+    cap: usize,
+    cap_read: usize,
 }
 
 fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
@@ -751,6 +807,8 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
         public: 0,
         b3l: 0,
         mux: 0,
+        cap: 0,
+        cap_read: 0,
     };
     for i in instrs {
         match i {
@@ -764,6 +822,8 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
             Instr::Blake3(_) => c.blake3 += 1,
             Instr::B3l(_) => c.b3l += 1,
             Instr::Mux { .. } => c.mux += 1,
+            Instr::CapTable(t) => c.cap += t.nodes.len(),
+            Instr::CapRead { .. } => c.cap_read += 1,
             Instr::Pack { .. } | Instr::Unpack { .. } => c.lanes += 1,
             Instr::Hint { .. } | Instr::HintOn { .. } => c.hint += 1,
             Instr::Public { .. } => c.public += 1,

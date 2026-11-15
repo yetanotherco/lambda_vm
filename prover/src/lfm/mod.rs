@@ -173,6 +173,8 @@ mod leaf_kats;
 #[cfg(test)]
 mod leaf_tests;
 #[cfg(all(test, feature = "parallel"))]
+mod lean_cap_tests;
+#[cfg(all(test, feature = "parallel"))]
 mod lean_mux_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod lean_upload_tests;

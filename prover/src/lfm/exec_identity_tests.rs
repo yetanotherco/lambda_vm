@@ -131,6 +131,8 @@ pub(super) fn assert_executions_identical(
     assert_rows_identical(case, "LFM_HASH16", &ra.hash16, &rb.hash16);
     assert_rows_identical(case, "B3L_HEAD", &ra.b3l, &rb.b3l);
     assert_rows_identical(case, "LEAN_MUX", &ra.mux, &rb.mux);
+    assert_rows_identical(case, "LEAN_CAP", &ra.cap, &rb.cap);
+    assert_rows_identical(case, "LEAN_CAP_READ", &ra.cap_read, &rb.cap_read);
     assert_rows_identical(case, "public_words", &a.public_words, &b.public_words);
 }
 
@@ -1096,4 +1098,62 @@ fn lean_muxes_run_in_levels_identically() {
     assert!(c.split.parallel_levels > 0, "the candidate forked");
     assert_eq!(a.records.mux.len(), 8);
     assert!(a.records.select.is_empty(), "every select became a mux");
+}
+
+/// Cap tables and their reads run in levels exactly as the serial reference
+/// runs them: each table over digests a forked level computes, its reads in
+/// later levels beside more compressions (memory, every record vector, each
+/// chip's rows).
+#[test]
+fn lean_cap_reads_run_in_levels_identically() {
+    use super::builder::{B3Block, B3Cv, Cell, LfmBuilder};
+    use super::edsl::WrapHash;
+    use crate::tables::types::FE;
+    let mut b = LfmBuilder::new()
+        .with_wrap_hash(WrapHash::Blake3)
+        .with_b3_lean(true);
+    let mut publics = Vec::new();
+    for tree in 0..3u64 {
+        // Eight compressions in one level: the tree's nodes.
+        let nodes: Vec<Cell> = (0..8u64)
+            .map(|i| {
+                let w: Vec<Cell> = (0..4u64)
+                    .map(|k| {
+                        b.digest_const([FE::from(100 * tree + 10 * i + k + 1); 4])
+                            .as_cell()
+                    })
+                    .collect();
+                b.b3_compress(B3Cv::Iv, B3Block::Lanes([w[0], w[1], w[2], w[3]]), 64, 11)[0]
+            })
+            .collect();
+        let handle = b.cap_table(&nodes);
+        for index in [tree, 7 - tree, 3] {
+            let x = b.felt_const(FE::from(index));
+            let bits = b.bit_dec(x, 3);
+            let read = b.cap_read(handle, &bits);
+            // A compression over the read word, in a later level.
+            let again = b.b3_compress(B3Cv::Iv, B3Block::Lanes([read, read, read, read]), 64, 11);
+            publics.push(read);
+            publics.push(again[0]);
+        }
+    }
+    for c in &publics {
+        b.public(*c);
+    }
+    let program = super::compiler::compile(b.finish());
+    super::validator::validate(&program).expect("admissible");
+    let hasher = super::hash::HasherKind::Poseidon1W16;
+    let a = execute_scheduled(&program, &[], &hasher, Schedule::Serial).expect("serial");
+    let c = execute_scheduled(
+        &program,
+        &[],
+        &hasher,
+        Schedule::LevelParallel {
+            coalesce_below: GATE_COALESCE_BELOW,
+        },
+    )
+    .expect("levels");
+    assert_executions_identical("lean cap reads", program.num_addrs, &a, &c);
+    assert!(c.split.parallel_levels > 0, "the candidate forked");
+    assert_eq!((a.records.cap.len(), a.records.cap_read.len()), (24, 9));
 }
