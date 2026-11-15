@@ -79,6 +79,53 @@ pub(crate) fn with_verifier_files(program: &Elf, traces: &mut Traces) {
     }
 }
 
+/// BITWISE's `IS_HALF` counts recounted for `traces` as they stand, as a
+/// prover of an edited build would recount them: every value under 2^16 that
+/// the edits left sent and not counted (or counted and no longer sent) is
+/// counted again, so the only `IS_HALF` values the build leaves over are of
+/// 2^16 or more. Returns how many values were recounted.
+pub(crate) fn recount_is_half(program: &Elf, traces: &mut Traces) -> usize {
+    use crate::tables::bitwise;
+    let halfword = u64::from(BusId::IsHalfword);
+    let in_range = |nets: &Nets| -> Vec<(u64, i128)> {
+        nets.left
+            .get(&halfword)
+            .into_iter()
+            .flatten()
+            .filter(|(t, _)| t[0] < TWO_16)
+            .map(|(t, net)| (t[0], *net))
+            .collect()
+    };
+    let stale = in_range(&nets_in(program, traces, &|_| None, RegisterFormat::InRow));
+    let col = bitwise::cols::MU_IS_HALF;
+    let table = &mut traces.bitwise;
+    #[cfg(feature = "cuda")]
+    table.clear_main_rowmajor_dev();
+    for &(value, net) in &stale {
+        let row = bitwise::row_index((value & 0xFF) as u8, (value >> 8) as u8, 0);
+        let recount = |have: u64| {
+            u64::try_from(i128::from(have) + net)
+                .unwrap_or_else(|_| panic!("IS_HALF[{value}] counts {have}, net {net}"))
+        };
+        if let Some(packed) = table.narrow_main_mut() {
+            let count = recount(packed.get(row, col));
+            assert!(
+                packed.set(row, col, count),
+                "IS_HALF[{value}]: {count} fits its packed column"
+            );
+        } else {
+            let count = recount(table.get_main(row, col).canonical_u64());
+            table.main_table.set(row, col, FE::from(count));
+        }
+    }
+    let left = in_range(&nets_in(program, traces, &|_| None, RegisterFormat::InRow));
+    assert!(
+        left.is_empty(),
+        "no IS_HALF value under 2^16 is left after the recount: {left:?}"
+    );
+    stale.len()
+}
+
 // ---- the REG bus's nodes ----------------------------------------------------------------------------------------------
 
 /// A node that consumes a register token on the REG bus.
