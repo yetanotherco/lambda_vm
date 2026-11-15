@@ -619,3 +619,126 @@ fn write_the_memw_a_kernel_vectors() {
     );
     assert!(ecall > 0 && sign > 0 && store_old > 0 && mixed2 > 0);
 }
+
+/// The whole in-row build of a record-mode run in the limbs' form, walked
+/// from the history on two walkers, CPU and MEMW_A chunks held as records,
+/// the side records derived on the card; with `refs` MEMW_A's rows too
+/// ([`WindowedTraceBuilder::card_derives_memw_a`]), the windows from `until`
+/// on coming without their history; its streamed chunks put back. And the
+/// MEMW_A chunks held as refs.
+fn build(
+    program: &Elf,
+    input: &[u8],
+    window: usize,
+    refs: bool,
+    until: u32,
+) -> (crate::tables::trace_builder::Traces, usize) {
+    use super::RowFamilies;
+    let room: super::RecordsRoom = Arc::new(|_| true);
+    let rows = RowFamilies {
+        memw_a: true,
+        ..RowFamilies::NONE
+    };
+    let mut builder = WindowedTraceBuilder::new(program, input, &MaxRowsConfig::small())
+        .and_then(|b| b.register_format(RegisterFormat::InRow))
+        .and_then(|b| b.memw_aligned_order(MemwAlignedOrder::Limbs))
+        .and_then(WindowedTraceBuilder::drop_streamed_ops)
+        .and_then(|b| b.card_fill_streamed(room, true, false))
+        .and_then(|b| b.card_fill_streamed_rows(rows))
+        .and_then(WindowedTraceBuilder::card_derives_sides)
+        .and_then(|b| if refs { b.card_derives_memw_a() } else { Ok(b) })
+        .map(|b| b.card_derives_sides_until(until))
+        .expect("the builder");
+    assert_eq!(builder.derives_memw_a(), refs);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
+    let mut chunks = Vec::new();
+    let mut held = 0usize;
+    let report = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut fast = FastExecutor::new(program, input.to_vec()).expect("the fast engine");
+            fast.enable_history().expect("history mode");
+            while let Some((logs, history)) = fast.resume_history(window).expect("the run") {
+                let last = (fast.pc() == 0)
+                    .then(|| fast.take_history_final().map(Box::new))
+                    .flatten();
+                let window = ExecWindow {
+                    logs: Arc::new(logs),
+                    start: None,
+                    history: Some(Box::new(history)),
+                    last,
+                };
+                if tx.send(window).is_err() {
+                    break;
+                }
+            }
+        });
+        walk_windows_from_history(&mut builder, rx, 2, 0, |accumulator, walked, _| {
+            for job in accumulator.absorb(walked) {
+                let chunk = job.generate();
+                if let Some(records) = chunk.trace.records_main() {
+                    held += usize::from(records.aligned_refs().is_some());
+                }
+                // Held as records: the host fill's table, compared below.
+                chunks.push(super::card_records_tests::unheld(chunk).0);
+            }
+            Ok(())
+        })
+    })
+    .expect("the walk");
+    let mut traces = builder.finish(&report.last).expect("the finish");
+    traces
+        .insert_streamed(chunks)
+        .expect("every chunk has a placeholder");
+    (traces, held)
+}
+
+/// ★ The whole build with MEMW_A's rows derived from the history (the walk's
+/// rows handed out as refs) is the build with the walk's rows, every table,
+/// in windows that cut chunks inside windows and over the MEMW_A tail the
+/// finish derives on the host; and full MEMW_A chunks are held as refs.
+#[test]
+fn the_build_with_memw_a_rows_derived_is_todays() {
+    let mut held = 0usize;
+    let mut cases: Vec<(String, Elf, usize)> = ["test_keccak_multi", "all_loadstore_32"]
+        .iter()
+        .flat_map(|name| [7usize, 33].map(|w| (name.to_string(), run(name).0, w)))
+        .collect();
+    cases.push((
+        "dma_memmove_cases".to_string(),
+        rust_elf("dma_memmove_cases"),
+        97,
+    ));
+    for (name, program, window) in &cases {
+        let (today, none) = build(program, &[], *window, false, u32::MAX);
+        let (derived, n) = build(program, &[], *window, true, u32::MAX);
+        assert_eq!(none, 0, "{name}");
+        crate::tests::windowed_builder_tests::same_traces(&today, &derived);
+        println!("{name}, window {window}: {n} MEMW_A chunks held as refs");
+        held += n;
+    }
+    assert!(held > 4, "{held} chunks held as refs");
+}
+
+/// ★ A window that comes without its history mid-run (as a rebuilt one
+/// would): the pending refs' rows are derived on the host, every later chunk
+/// is held as rows, no chunk mixes the two, and the whole build is today's.
+#[test]
+fn a_window_without_its_history_ends_the_memw_a_refs_and_the_build_is_todays() {
+    let program = rust_elf("dma_memmove_cases");
+    let window = 97usize;
+    let (today, _) = build(&program, &[], window, false, u32::MAX);
+    let (all, n_all) = build(&program, &[], window, true, u32::MAX);
+    crate::tests::windowed_builder_tests::same_traces(&today, &all);
+    assert!(n_all > 1, "{n_all} chunks held as refs");
+    let mut between = false;
+    for until in [0u32, 1, 7, 100, 333] {
+        let (part, n) = build(&program, &[], window, true, until);
+        crate::tests::windowed_builder_tests::same_traces(&today, &part);
+        assert!(n <= n_all, "until {until}: {n} of {n_all}");
+        if until == 0 {
+            assert_eq!(n, 0, "no window hooked, no chunk held as refs");
+        }
+        between |= n > 0 && n < n_all;
+    }
+    assert!(between, "no run ended the mode between its chunks");
+}

@@ -234,3 +234,95 @@ pub(crate) fn aligned_refs_of_rows(
     }
     Ok((refs, whole))
 }
+
+/// The windows' MEMW_A refs not yet in a handed-out chunk
+/// ([`super::WindowedTraceBuilder::card_derives_memw_a`]), each window's
+/// (shared) beside the window it lies in, in order: the registry a chunk's
+/// host readers rebuild its rows from.
+pub(crate) struct RefTail {
+    parts: std::collections::VecDeque<(Arc<Vec<AlignedRef>>, Arc<RefWindow>)>,
+    /// The front part's refs already handed out.
+    start: usize,
+    len: usize,
+    pub(crate) decode: Arc<DecodeTable>,
+    pub(crate) order: MemwAlignedOrder,
+}
+
+impl RefTail {
+    pub(crate) fn new(decode: Arc<DecodeTable>, order: MemwAlignedOrder) -> Self {
+        Self {
+            parts: std::collections::VecDeque::new(),
+            start: 0,
+            len: 0,
+            decode,
+            order,
+        }
+    }
+
+    /// A window's refs, after the windows before it.
+    pub(crate) fn push(&mut self, refs: Vec<AlignedRef>, window: Arc<RefWindow>) {
+        if !refs.is_empty() {
+            self.len += refs.len();
+            self.parts.push_back((Arc::new(refs), window));
+        }
+    }
+
+    /// The refs not handed out.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The next `n` refs (at most `len`), as the window parts they lie in,
+    /// and each part's window.
+    pub(crate) fn take(&mut self, n: usize) -> (super::Segments<AlignedRef>, Vec<Arc<RefWindow>>) {
+        let mut want = n.min(self.len);
+        self.len -= want;
+        let (mut parts, mut windows) = (Vec::new(), Vec::new());
+        while want > 0 {
+            let Some((refs, window)) = self.parts.front() else {
+                break;
+            };
+            let available = refs.len() - self.start;
+            if available <= want {
+                let range = self.start..refs.len();
+                if let Some((refs, window)) = self.parts.pop_front() {
+                    parts.push((refs, range));
+                    windows.push(window);
+                }
+                self.start = 0;
+                want -= available;
+            } else {
+                parts.push((Arc::clone(refs), self.start..self.start + want));
+                windows.push(Arc::clone(window));
+                self.start += want;
+                want = 0;
+            }
+        }
+        (super::Segments { parts }, windows)
+    }
+
+    /// Every ref not handed out, as its row derived on the host (the run's
+    /// MEMW_A tail, or the rows the mode leaves behind as it ends), in order.
+    pub(crate) fn take_rows(&mut self) -> Result<Vec<AlignedRow>, String> {
+        let (refs, windows) = self.take(self.len);
+        let slices = refs.slices();
+        let parts: Vec<(&[AlignedRef], &RefWindow)> = slices
+            .iter()
+            .zip(&windows)
+            .map(|(refs, window)| (*refs, &**window))
+            .collect();
+        aligned_rows_from_refs(&parts, &self.decode, self.order)
+    }
+
+    /// The bytes its refs take on the heap (the windows they lie in are the
+    /// logs' and the history's, held elsewhere too).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.parts
+            .iter()
+            .map(|(refs, window)| {
+                refs.capacity() * std::mem::size_of::<AlignedRef>()
+                    + window.whole.capacity() * std::mem::size_of::<AlignedRow>()
+            })
+            .sum()
+    }
+}

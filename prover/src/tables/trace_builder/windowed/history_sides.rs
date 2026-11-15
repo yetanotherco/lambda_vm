@@ -40,8 +40,10 @@ use crate::tables::decode::DecodeTable;
 /// The knob of the trace's parts the card builds from the executor's
 /// records: unset, empty, `0` or `off` builds none of them here (today's
 /// trace); `rows` derives the in-row CPU rows' side records on the card from
-/// the history ([`super::WindowedTraceBuilder::card_derives_sides`]). The
-/// tables are the same either way.
+/// the history ([`super::WindowedTraceBuilder::card_derives_sides`]), and
+/// MEMW_A's rows from the windows' accesses
+/// ([`super::WindowedTraceBuilder::card_derives_memw_a`]). The tables are the
+/// same either way.
 pub const CARD_TRACE_KNOB: &str = "LAMBDA_VM_CARD_TRACE";
 
 /// [`CARD_TRACE_KNOB`]'s reading of `word`: whether `rows` is on. Any other

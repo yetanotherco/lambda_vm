@@ -701,8 +701,6 @@ impl<T: RowFamily> RowChunk for RowRecords<T> {
 /// lies in. Every host reader gets the rows the host derives from them, once,
 /// on the first ask; the chunk digests and fills as the same rows held as
 /// rows.
-// Handed out by the windowed builder under the card-built trace.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct AlignedRefRecords {
     refs: Segments<AlignedRef>,
     /// The window of each part of `refs`, one a part.
@@ -715,7 +713,6 @@ pub(crate) struct AlignedRefRecords {
     derived: std::sync::OnceLock<Result<Vec<AlignedRow>, String>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl AlignedRefRecords {
     /// The chunk `refs` (one window of `windows` a part, in order) make, in
     /// the run's `order`. Refused (the refs given back) unless they are a
@@ -770,11 +767,6 @@ impl AlignedRefRecords {
             })
             .as_deref()
             .map_err(String::as_str)
-    }
-
-    /// The table held as these records.
-    pub(crate) fn into_trace(self) -> Table {
-        held(Records(Arc::new(self)))
     }
 
     /// The rows back, as the host derives them, or why they cannot be.
