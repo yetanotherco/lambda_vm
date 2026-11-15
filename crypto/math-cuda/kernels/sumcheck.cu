@@ -876,6 +876,172 @@ extern "C" __global__ __launch_bounds__(256) void zc_grid01(
     }
 }
 
+// `zc_grid01` with ONE walk of the program a group for every grid point: each step's value is a
+// vector over the `P` points, so a node is decoded once and a factor's four rows read once a group,
+// not once a point. Slot `s`'s `P` values sit at `d_slots[(s·P + p)·stride + tid]`. The sums go to
+// `d_partials[(p·gridDim.x + block)·3]`, point `p` of `d_points` — the layout `zc_grid01` leaves —
+// and a corner is checked or kept as there. One block row; `P` is the template's.
+template <int P>
+__device__ __forceinline__ void zc_grid01_all_body(
+    const uint64_t *const *__restrict__ d_factors, uint64_t q,
+    const uint64_t *__restrict__ d_nodes, uint64_t num_nodes,
+    const uint64_t *__restrict__ d_consts, const uint64_t *__restrict__ d_betas,
+    const uint64_t *__restrict__ d_points, const uint64_t *__restrict__ d_eq_r,
+    uint64_t *__restrict__ d_slots, uint64_t *__restrict__ d_partials,
+    unsigned long long *__restrict__ d_violation, uint32_t keep_corners, uint64_t stride_f) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_threads = (uint64_t)gridDim.x * blockDim.x;
+    uint64_t pa[P], pb[P];
+    bool corner[P];
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+        uint64_t point = d_points[p];
+        pa[p] = point & 0xFFFFFFFFull;
+        pb[p] = point >> 32;
+        corner[p] = pa[p] < 2 && pb[p] < 2;
+    }
+    Fe3 t_acc[P];
+#pragma unroll
+    for (int p = 0; p < P; p++) t_acc[p] = ext3::zero();
+    for (uint64_t x = tid; x < q; x += num_threads) {
+        Fe3 c[P];
+#pragma unroll
+        for (int p = 0; p < P; p++) c[p] = ext3::zero();
+        for (uint64_t i = 0; i < num_nodes; i++) {
+            Node nd = load_node(d_nodes, i);
+            uint64_t *out = d_slots + ((uint64_t)nd.res * P) * num_threads + tid;
+            switch (nd.op) {
+            case OP_VAR: {
+                const uint64_t *column = d_factors[nd.a];
+                uint64_t f00 = column[x * stride_f];
+                uint64_t f01 = column[(x + q) * stride_f];
+                uint64_t f10 = column[(x + 2 * q) * stride_f];
+                uint64_t f11 = column[(x + 3 * q) * stride_f];
+                uint64_t da = goldilocks::sub(f10, f00);
+                uint64_t db = goldilocks::sub(f01, f00);
+                uint64_t dab = goldilocks::sub(goldilocks::sub(f11, f10), db);
+#pragma unroll
+                for (int p = 0; p < P; p++) {
+                    uint64_t v = f00;
+                    if (pa[p]) v = goldilocks::add(v, goldilocks::mul(da, pa[p]));
+                    if (pb[p]) v = goldilocks::add(v, goldilocks::mul(db, pb[p]));
+                    if (pa[p] && pb[p]) v = goldilocks::add(v, goldilocks::mul(dab, goldilocks::mul(pa[p], pb[p])));
+                    out[(uint64_t)p * num_threads] = v;
+                }
+                break;
+            }
+            case OP_FIXED: {
+                uint64_t k = d_consts[nd.a];
+#pragma unroll
+                for (int p = 0; p < P; p++) out[(uint64_t)p * num_threads] = k;
+                break;
+            }
+            case OP_ADD:
+            case OP_SUB:
+            case OP_MUL: {
+                const uint64_t *u = d_slots + ((uint64_t)nd.a * P) * num_threads + tid;
+                const uint64_t *w = d_slots + ((uint64_t)nd.b * P) * num_threads + tid;
+#pragma unroll
+                for (int p = 0; p < P; p++) {
+                    uint64_t l = u[(uint64_t)p * num_threads];
+                    uint64_t r = w[(uint64_t)p * num_threads];
+                    out[(uint64_t)p * num_threads] = nd.op == OP_ADD   ? goldilocks::add(l, r)
+                                                     : nd.op == OP_SUB ? goldilocks::sub(l, r)
+                                                                       : goldilocks::mul(l, r);
+                }
+                break;
+            }
+            case OP_NEG: {
+                const uint64_t *u = d_slots + ((uint64_t)nd.a * P) * num_threads + tid;
+#pragma unroll
+                for (int p = 0; p < P; p++) out[(uint64_t)p * num_threads] = goldilocks::neg(u[(uint64_t)p * num_threads]);
+                break;
+            }
+            case OP_ACC: {
+                const uint64_t *u = d_slots + ((uint64_t)nd.a * P) * num_threads + tid;
+                Fe3 beta = load_ext(d_betas + (uint64_t)nd.res * 3);
+                if (nd.b != NO_SELECTOR) {
+                    const uint64_t *column = d_factors[nd.b];
+                    uint64_t f00 = column[x * stride_f];
+                    uint64_t f01 = column[(x + q) * stride_f];
+                    uint64_t f10 = column[(x + 2 * q) * stride_f];
+                    uint64_t f11 = column[(x + 3 * q) * stride_f];
+                    uint64_t da = goldilocks::sub(f10, f00);
+                    uint64_t db = goldilocks::sub(f01, f00);
+                    uint64_t dab = goldilocks::sub(goldilocks::sub(f11, f10), db);
+#pragma unroll
+                    for (int p = 0; p < P; p++) {
+                        uint64_t sel = f00;
+                        if (pa[p]) sel = goldilocks::add(sel, goldilocks::mul(da, pa[p]));
+                        if (pb[p]) sel = goldilocks::add(sel, goldilocks::mul(db, pb[p]));
+                        if (pa[p] && pb[p]) sel = goldilocks::add(sel, goldilocks::mul(dab, goldilocks::mul(pa[p], pb[p])));
+                        c[p] = ext3::add(c[p], ext3::mul_base(beta, goldilocks::mul(u[(uint64_t)p * num_threads], sel)));
+                    }
+                } else {
+#pragma unroll
+                    for (int p = 0; p < P; p++) c[p] = ext3::add(c[p], ext3::mul_base(beta, u[(uint64_t)p * num_threads]));
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        Fe3 w = load_ext(d_eq_r + x * 3);
+#pragma unroll
+        for (int p = 0; p < P; p++) {
+            if (corner[p] && !keep_corners) {
+                Fe3 k = ext3::canonical(c[p]);
+                if (k.a | k.b | k.c) {
+                    atomicMin(d_violation, (unsigned long long)(pa[p] * 2 * q + pb[p] * q + x));
+                }
+                continue;
+            }
+            t_acc[p] = ext3::add(t_acc[p], ext3::mul(w, c[p]));
+        }
+    }
+    extern __shared__ uint64_t shared[];
+    for (int p = 0; p < P; p++) {
+        shared[threadIdx.x * 3 + 0] = t_acc[p].a;
+        shared[threadIdx.x * 3 + 1] = t_acc[p].b;
+        shared[threadIdx.x * 3 + 2] = t_acc[p].c;
+        __syncthreads();
+        for (uint32_t width = blockDim.x / 2; width > 0; width >>= 1) {
+            if (threadIdx.x < width) {
+                Fe3 sum = ext3::add(load_ext(shared + threadIdx.x * 3),
+                                    load_ext(shared + (threadIdx.x + width) * 3));
+                shared[threadIdx.x * 3 + 0] = sum.a;
+                shared[threadIdx.x * 3 + 1] = sum.b;
+                shared[threadIdx.x * 3 + 2] = sum.c;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            uint64_t at = ((uint64_t)p * gridDim.x + blockIdx.x) * 3;
+            d_partials[at + 0] = shared[0];
+            d_partials[at + 1] = shared[1];
+            d_partials[at + 2] = shared[2];
+        }
+        __syncthreads();
+    }
+}
+
+#define ZC_GRID01_ALL(P)                                                                           \
+    extern "C" __global__ __launch_bounds__(256) void zc_grid01_all_##P(                           \
+        const uint64_t *const *__restrict__ d_factors, uint64_t q,                                  \
+        const uint64_t *__restrict__ d_nodes, uint64_t num_nodes,                                  \
+        const uint64_t *__restrict__ d_consts, const uint64_t *__restrict__ d_betas,               \
+        const uint64_t *__restrict__ d_points, const uint64_t *__restrict__ d_eq_r,                \
+        uint64_t *__restrict__ d_slots, uint64_t *__restrict__ d_partials,                         \
+        unsigned long long *__restrict__ d_violation, uint32_t keep_corners, uint64_t stride) {    \
+        zc_grid01_all_body<P>(d_factors, q, d_nodes, num_nodes, d_consts, d_betas, d_points,       \
+                              d_eq_r, d_slots, d_partials, d_violation, keep_corners, stride);     \
+    }
+ZC_GRID01_ALL(5)
+ZC_GRID01_ALL(9)
+ZC_GRID01_ALL(12)
+ZC_GRID01_ALL(16)
+
 // `U(b, c) = Σ_x eq_rho[x]·L(b, c, x)` for `(b, c) ∈ {0,1}²`, `L = a₀ + Σ a_k·f_k`
 // from each term's four base rows. One thread per group; the block's four sums
 // go to `d_partials[(bc·gridDim.x + block)·3]`, `bc = 2b + c`.

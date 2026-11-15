@@ -394,6 +394,7 @@ fn the_card_keeps_the_host_references_bytes_under_every_measurement_word() {
             multilinear::gkr_gruen::force_gkr_gruen_tail(None);
             knobs::force_stage(None, None, None);
             knobs::force_shared_slots(None);
+            knobs::force_grid_one_walk(None);
             multilinear::gpu_fused::force_zc_device_tail(None);
             ktime::force_twice(None);
         }
@@ -403,6 +404,7 @@ fn the_card_keeps_the_host_references_bytes_under_every_measurement_word() {
     multilinear::gkr_gruen::force_gkr_gruen_tail(Some(1024));
     knobs::force_stage(Some(true), Some(true), Some(true));
     knobs::force_shared_slots(Some(Some(12)));
+    knobs::force_grid_one_walk(Some(true));
     multilinear::gpu_fused::force_zc_device_tail(Some(Some(2)));
     ktime::force_twice(Some(&[
         "tree.fold.small",

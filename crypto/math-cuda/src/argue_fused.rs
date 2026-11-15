@@ -153,6 +153,23 @@ pub mod knobs {
         );
     }
 
+    static ONE_WALK_FORCED: AtomicU8 = AtomicU8::new(0);
+
+    /// `LAMBDA_VM_ZC_GRID_ONE_WALK=1`: rounds 0 and 1's pass walks the program
+    /// once a group for every grid point (`zc_grid01_all_*`, 5, 9, 12 or 16
+    /// points), on the same slot file, instead of once a point. The same sums.
+    /// Default off.
+    pub fn grid_one_walk() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        word(&ONE_WALK_FORCED, &ON, "LAMBDA_VM_ZC_GRID_ONE_WALK")
+    }
+
+    /// Forces [`grid_one_walk`]; `None` back to the environment's word.
+    #[doc(hidden)]
+    pub fn force_grid_one_walk(on: Option<bool>) {
+        set(&ONE_WALK_FORCED, on);
+    }
+
     /// Forces the three words above; `None` back to the environment's.
     #[doc(hidden)]
     pub fn force_stage(bus_from_grid: Option<bool>, eq_levels: Option<bool>, at_end: Option<bool>) {
@@ -829,6 +846,57 @@ impl<'f> FusedZerocheck<'f> {
         self.stream.memcpy_htod(&[u64::MAX], &mut self.violation)?;
         let (grid, block) = self.shape(q, points.len(), self.num_slots as u64)?;
         let factors = self.source.ptrs;
+        // One walk for every point ([`knobs::grid_one_walk`]): one block row of
+        // the same threads a point row has today, each holding every point's
+        // value of a slot — the same slot file.
+        let one_walk = if knobs::grid_one_walk() {
+            match points.len() {
+                5 => Some(&be.zc_grid01_all_5),
+                9 => Some(&be.zc_grid01_all_9),
+                12 => Some(&be.zc_grid01_all_12),
+                16 => Some(&be.zc_grid01_all_16),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(kernel) = one_walk {
+            for _ in 0..crate::ktime::times("zc.grid") {
+                let t0 = self.tick();
+                unsafe {
+                    self.stream
+                        .launch_builder(kernel)
+                        .arg(factors)
+                        .arg(&q)
+                        .arg(&self.nodes)
+                        .arg(&self.num_nodes)
+                        .arg(&self.base_consts)
+                        .arg(&self.betas)
+                        .arg(&self.points)
+                        .arg(&self.eq_r)
+                        .arg(&mut self.slots)
+                        .arg(&mut self.partials)
+                        .arg(&mut self.violation)
+                        .arg(&u32::from(keep_corners))
+                        .arg(&self.source.stride)
+                        .launch(LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: block * 3 * 8,
+                        })?;
+                }
+                self.tock(
+                    "zc.grid",
+                    t0,
+                    q * (self.vars * 32 + 24),
+                    q * points.len() as u64 * self.steps,
+                );
+            }
+            let t = self.reduce(points.len(), grid)?;
+            let violation = crate::readback::clone_dtoh(&self.stream, &self.violation)?;
+            self.stream.synchronize()?;
+            return Ok((t, (violation[0] != u64::MAX).then_some(violation[0])));
+        }
         for _ in 0..crate::ktime::times("zc.grid") {
             let t0 = self.tick();
             unsafe {
