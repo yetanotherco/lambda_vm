@@ -975,24 +975,28 @@ fn the_fused_rounds_on_the_card_send_todays_messages() {
     );
 }
 
-/// ★ The zerocheck's kernel timers (`LAMBDA_VM_ZC_KERNEL_TIMES`, measurement
-/// only) change no message: the Q1 tables at 2^10 on the card with the timers
-/// off and then on send the same rounds, reach the same point and bind every
-/// factor to the same value — today's, checked against the host rounds — and
-/// the on run moves every class the fused rounds launch, with no time lost.
+/// ★ The argue's kernel timers (`LAMBDA_VM_ARGUE_KERNEL_TIMES`) and the bus
+/// column paid twice (`LAMBDA_VM_ZC_BUS_TWICE`), both measurement only, change
+/// no message: the Q1 tables at 2^10 on the card with neither, then with the
+/// timers, then with both, send the same rounds, reach the same point and bind
+/// every factor to the same value — today's, checked against the host rounds.
+/// The timed runs move every zerocheck kind the fused rounds launch, the bus
+/// kernels' launches double under the second arm, and no time is lost.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
 fn the_zerocheck_kernel_timers_change_no_message() {
-    use math_cuda::argue_fused::kernel_times;
+    use math_cuda::argue_fused::knobs;
+    use math_cuda::ktime;
     use multilinear::gpu_fused::*;
-    struct TimersBack;
-    impl Drop for TimersBack {
+    struct Back;
+    impl Drop for Back {
         fn drop(&mut self) {
-            kernel_times::force(None);
+            ktime::force(None);
+            knobs::force_bus_twice(None);
         }
     }
-    let _back = TimersBack;
+    let _back = Back;
     let _switches = CardSwitches::set(
         FusedFaults {
             keep_corners: true,
@@ -1000,6 +1004,22 @@ fn the_zerocheck_kernel_timers_change_no_message() {
         },
         false,
     );
+    let launches = |kind: &str| -> (f64, u64) {
+        let (rows, _) = ktime::totals();
+        rows.iter()
+            .filter(|((k, _), _)| *k == kind)
+            .fold((0.0, 0), |(s, n), (_, e)| (s + e.seconds, n + e.launches))
+    };
+    let kinds = [
+        "zc.grid",
+        "zc.bus_u",
+        "zc.fold2",
+        "zc.bus_column",
+        "zc.halve",
+        "zc.rounds",
+        "zc.reduce",
+        "zc.fold",
+    ];
     let vm = vm_airs();
     let airs = every_air(&vm);
     for (at, label) in THE_Q1_TABLES.iter().enumerate() {
@@ -1009,60 +1029,69 @@ fn the_zerocheck_kernel_timers_change_no_message() {
         let table = Table::from_air(air, label, n, &mut rng);
         let session = table.session(table.random_columns(n, &mut rng), &mut rng);
         let claims = session.true_claims();
-        kernel_times::force(Some(false));
+        ktime::force(Some(false));
+        knobs::force_bus_twice(Some(false));
         let sessions = fused_sessions();
         let (untimed, untimed_point, untimed_bound) = session
             .on_the_card(&claims)
             .unwrap_or_else(|e| panic!("{label}: untimed: {e:?}"));
-        let (before, lost_before) = kernel_times::totals();
-        kernel_times::force(Some(true));
-        let timed = session.on_the_card(&claims);
-        let (after, lost_after) = kernel_times::totals();
-        assert_eq!(
-            fused_sessions(),
-            sessions + 2,
-            "{label}: both runs took the card"
-        );
-        let (proof, point, bound) = timed
-            .as_ref()
-            .unwrap_or_else(|e| panic!("{label}: timed: {e:?}"));
-        assert_eq!(proof.rounds.len(), untimed.rounds.len(), "{label}");
-        for (round, (a, b)) in untimed.rounds.iter().zip(&proof.rounds).enumerate() {
-            assert_eq!(a.evaluations, b.evaluations, "{label}: round {round}");
-        }
-        assert_eq!(*point, untimed_point, "{label}: the point");
-        assert_eq!(*bound, untimed_bound, "{label}: the bound factors");
-        session.assert_card_is_today(&claims, timed, "timed");
-        for class in [
-            kernel_times::GRID,
-            kernel_times::BUS_U,
-            kernel_times::FOLD2,
-            kernel_times::BUS_COLUMN,
-            kernel_times::HALVE,
-            kernel_times::ROUNDS,
-            kernel_times::REDUCE,
-            kernel_times::FOLD,
-        ] {
-            assert!(
-                after[class].1 > before[class].1 && after[class].0 > before[class].0,
-                "{label}: the timed run moved class {}",
-                kernel_times::CLASSES[class]
+        let mut per_arm = Vec::new();
+        for twice in [false, true] {
+            let before: Vec<(f64, u64)> = kinds.iter().map(|k| launches(k)).collect();
+            let (_, lost_before) = ktime::totals();
+            ktime::force(Some(true));
+            knobs::force_bus_twice(Some(twice));
+            let timed = session.on_the_card(&claims);
+            ktime::force(Some(false));
+            knobs::force_bus_twice(Some(false));
+            let after: Vec<(f64, u64)> = kinds.iter().map(|k| launches(k)).collect();
+            let (_, lost_after) = ktime::totals();
+            let what = if twice { "timed, bus twice" } else { "timed" };
+            let (proof, point, bound) = timed
+                .as_ref()
+                .unwrap_or_else(|e| panic!("{label} {what}: {e:?}"));
+            assert_eq!(proof.rounds.len(), untimed.rounds.len(), "{label} {what}");
+            for (round, (a, b)) in untimed.rounds.iter().zip(&proof.rounds).enumerate() {
+                assert_eq!(
+                    a.evaluations, b.evaluations,
+                    "{label} {what}: round {round}"
+                );
+            }
+            assert_eq!(*point, untimed_point, "{label} {what}: the point");
+            assert_eq!(*bound, untimed_bound, "{label} {what}: the bound factors");
+            session.assert_card_is_today(&claims, timed, what);
+            for (k, kind) in kinds.iter().enumerate() {
+                assert!(
+                    after[k].1 > before[k].1 && after[k].0 > before[k].0,
+                    "{label} {what}: the run moved {kind}"
+                );
+            }
+            assert_eq!(lost_after, lost_before, "{label} {what}: no timer lost");
+            per_arm.push(
+                kinds
+                    .iter()
+                    .enumerate()
+                    .map(|(k, _)| after[k].1 - before[k].1)
+                    .collect::<Vec<u64>>(),
             );
         }
-        assert_eq!(lost_after, lost_before, "{label}: no timer lost");
-        eprintln!(
-            "argue ZC timers: {label} n={n} same messages timed and untimed; card {:.4}s over {} launches",
-            after
-                .iter()
-                .zip(&before)
-                .map(|(a, b)| a.0 - b.0)
-                .sum::<f64>(),
-            after
-                .iter()
-                .zip(&before)
-                .map(|(a, b)| a.1 - b.1)
-                .sum::<u64>()
+        assert_eq!(
+            fused_sessions(),
+            sessions + 3,
+            "{label}: every run took the card"
         );
+        for (k, kind) in kinds.iter().enumerate() {
+            let expect = if matches!(*kind, "zc.bus_u" | "zc.bus_column") {
+                2 * per_arm[0][k]
+            } else {
+                per_arm[0][k]
+            };
+            assert_eq!(
+                per_arm[1][k], expect,
+                "{label}: {kind} launches under bus twice"
+            );
+        }
+        eprintln!("argue ZC timers: {label} n={n} same messages untimed, timed and bus twice");
     }
 }
 

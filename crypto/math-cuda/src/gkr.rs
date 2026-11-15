@@ -380,6 +380,7 @@ fn fold_upwards(
         };
         let half_arg = half as u64;
         let padded = layers.is_empty() && real != full;
+        let mark = crate::ktime::start(stream);
         unsafe {
             if padded {
                 let real_arg = real as u64;
@@ -403,6 +404,15 @@ fn fold_upwards(
                     .launch(LaunchConfig::for_num_elems(half as u32))?;
             }
         }
+        // Each output cell reads two children's `p` and `q` and writes its own.
+        crate::ktime::end(
+            stream,
+            mark,
+            "tree.fold",
+            (num_vars - 1) as u32,
+            half as u64 * 144,
+            half as u64,
+        );
         num_vars -= 1;
         layers.push(DeviceLayer {
             p: Arc::new(p_out),
@@ -567,6 +577,7 @@ impl GruenLayer {
         )?;
         let low_arg = low as u32;
         let rounds_arg = rounds as u32;
+        let mark = crate::ktime::start(stream);
         unsafe {
             stream
                 .launch_builder(&be.gkr_eq_levels_ext3)
@@ -580,6 +591,14 @@ impl GruenLayer {
                     shared_mem_bytes: 0,
                 })?;
         }
+        crate::ktime::end(
+            stream,
+            mark,
+            "ladder.eq",
+            num_vars as u32,
+            cells as u64 * 24,
+            cells as u64,
+        );
         let partials = unsafe {
             crate::device::alloc_or_trim::<u64>(stream, 3 * GRUEN_MAX_GRID as usize * 3)
         }?;
@@ -703,6 +722,9 @@ impl GruenLayer {
         // Today's second launch, unless the slot's last block does its work.
         let second = self.slot.as_ref().is_none_or(|slot| slot.checking());
         let mut slot_args = self.slot.as_mut().map(|slot| slot.launch());
+        let depth = (m + 1) as u32;
+        let mark = crate::ktime::start(&self.stream);
+        let mut reduce_mark = None;
         unsafe {
             let mut launch = self.stream.launch_builder(kernel);
             launch
@@ -729,7 +751,23 @@ impl GruenLayer {
                 launch.arg(&mut **ticket).arg(&*dev).arg(&*seq);
             }
             launch.launch(config)?;
+            // A folding round reads each thread's four cells of the four
+            // halves and writes back two of each; the first reads two of each.
+            let per = if fold_by.is_some() {
+                16 * 24 + 8 * 24
+            } else {
+                8 * 24
+            };
+            crate::ktime::end(
+                &self.stream,
+                mark,
+                "ladder.round",
+                depth,
+                quarter * per + quarter * 24,
+                quarter,
+            );
             if second {
+                reduce_mark = Some(crate::ktime::start(&self.stream));
                 crate::round_slot::note_second_launch();
                 let reduce_block = 256u32;
                 self.stream
@@ -744,6 +782,16 @@ impl GruenLayer {
                     })?;
             }
         }
+        if let Some(mark) = reduce_mark {
+            crate::ktime::end(
+                &self.stream,
+                mark,
+                "ladder.reduce",
+                depth,
+                u64::from(rows) * u64::from(grid) * 24,
+                u64::from(rows),
+            );
+        }
         self.stored = stored_after_round(self.stored, quarter as usize);
         self.done += 1;
         Ok(rows)
@@ -752,6 +800,7 @@ impl GruenLayer {
     /// The sums a [`round_enqueue`](Self::round_enqueue) queued, `rows` of
     /// them, three u64 each.
     pub fn round_collect(&self, rows: u32) -> Result<Vec<u64>> {
+        let _wait = crate::ktime::HostWait::new("ladder.collect", self.half.trailing_zeros() + 1);
         let today = || -> Result<Vec<u64>> {
             let sums =
                 crate::readback::clone_dtoh(&self.stream, &self.sums.slice(0..rows as usize * 3))?;
@@ -791,6 +840,7 @@ impl GruenLayer {
         } else {
             &be.gkr_gruen_finish
         };
+        let mark = crate::ktime::start(&self.stream);
         unsafe {
             let mut launch = self.stream.launch_builder(kernel);
             launch
@@ -811,6 +861,14 @@ impl GruenLayer {
                 shared_mem_bytes: 0,
             })?;
         }
+        crate::ktime::end(
+            &self.stream,
+            mark,
+            "ladder.finish",
+            self.half.trailing_zeros() + 1,
+            4 * cells * 24 * 3,
+            4 * cells,
+        );
         let values = crate::readback::clone_dtoh(&self.stream, &out)?;
         self.stream.synchronize()?;
         Ok(values)
@@ -990,6 +1048,7 @@ pub fn input_from_columns(
     let rows_arg = rows as u64;
     let interactions_arg = interactions as u64;
     let slots_arg = slots as u64;
+    let mark = crate::ktime::start(stream);
     unsafe {
         stream
             .launch_builder(&be.gkr_input_from_columns)
@@ -1009,6 +1068,16 @@ pub fn input_from_columns(
                 shared_mem_bytes: 0,
             })?;
     }
+    // Each term reads its column's cell once a row; each cell writes `p` and `q`.
+    let terms = (plan.terms.len() / 2) as u64;
+    crate::ktime::end(
+        stream,
+        mark,
+        "tree.input",
+        cells.trailing_zeros(),
+        terms * rows as u64 * 8 + cells as u64 * 48,
+        cells as u64,
+    );
     Ok((p, q))
 }
 

@@ -511,13 +511,13 @@ pub fn take_tail() -> TailTimes {
     TAIL.with(|cell| cell.replace(TailTimes::default()))
 }
 
-/// Whether the zerocheck's optional timers are on (`LAMBDA_VM_ZC_KERNEL_TIMES=1`,
-/// measurement only: the messages are the same either way). Never without the
-/// card.
+/// Whether the argue's optional kernel timers are on
+/// (`LAMBDA_VM_ARGUE_KERNEL_TIMES=1`, measurement only: the messages are the
+/// same either way). Never without the card.
 pub fn zc_kernel_times() -> bool {
     #[cfg(feature = "cuda")]
     {
-        math_cuda::argue_fused::kernel_times::enabled()
+        math_cuda::ktime::enabled()
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -525,24 +525,28 @@ pub fn zc_kernel_times() -> bool {
     }
 }
 
-/// The process's fused-zerocheck kernel time so far under [`zc_kernel_times`]:
-/// `(class, seconds, launches)` a kernel class, and the launches whose time
-/// could not be read. Empty without the card.
-pub fn zc_kernel_totals() -> (Vec<(&'static str, f64, u64)>, u64) {
+/// The process's kernel-timer table so far, one line: every `kind@depth` with
+/// its seconds, launches, bytes and work, and the launches whose time was lost.
+/// `None` without the card or with the timers off.
+pub fn kernel_totals_line() -> Option<String> {
     #[cfg(feature = "cuda")]
     {
-        use math_cuda::argue_fused::kernel_times;
-        let (totals, lost) = kernel_times::totals();
-        let rows = kernel_times::CLASSES
-            .iter()
-            .zip(totals)
-            .map(|(name, (secs, launches))| (*name, secs, launches))
-            .collect();
-        (rows, lost)
+        if !math_cuda::ktime::enabled() {
+            return None;
+        }
+        let (rows, lost) = math_cuda::ktime::totals();
+        let mut line = format!("ARGUE KERNEL TOTALS (process): lost {lost} ·");
+        for ((kind, depth), e) in rows {
+            line.push_str(&format!(
+                " {kind}@{depth} {:.4}s/{}/{}/{}",
+                e.seconds, e.launches, e.bytes, e.work
+            ));
+        }
+        Some(line)
     }
     #[cfg(not(feature = "cuda"))]
     {
-        (Vec::new(), 0)
+        None
     }
 }
 
