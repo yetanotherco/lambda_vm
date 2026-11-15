@@ -1,5 +1,5 @@
-//! Width seeds for the finish's packed tables (`LAMBDA_VM_FINISH_SEED_WIDTHS=1`,
-//! off by default).
+//! Width seeds for the finish's packed tables (on by default;
+//! `LAMBDA_VM_FINISH_SEED_WIDTHS=0` is the rollback).
 //!
 //! A kind writes its trace straight into the packed form only once its
 //! process-wide width hint exists ([`super::gpack::WidthHint`]); until then its
@@ -109,6 +109,25 @@ fn parse(widths: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Whether the finish seeds the width hints: on unless
+/// `LAMBDA_VM_FINISH_SEED_WIDTHS=0`, read once a process.
+pub(crate) fn seed_widths_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        seed_widths_from(
+            std::env::var("LAMBDA_VM_FINISH_SEED_WIDTHS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`seed_widths_on`]'s reading of `LAMBDA_VM_FINISH_SEED_WIDTHS`: unset or any
+/// word but `0` seeds; `0` is the rollback.
+fn seed_widths_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
 /// Seeds every kind's hint that has none yet, once a process; the kinds seeded.
 pub(crate) fn seed_finish_widths() -> usize {
     static SEEDED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -169,5 +188,15 @@ mod tests {
                 "{name}: widths are 1, 2, 4 or 8"
             );
         }
+    }
+
+    /// The seeds are on unset and for any word but `0`, which rolls them back.
+    #[test]
+    fn seed_widths_are_on_by_default_and_0_rolls_them_back() {
+        assert!(seed_widths_from(None));
+        assert!(seed_widths_from(Some("1")));
+        assert!(seed_widths_from(Some(" 1 ")));
+        assert!(!seed_widths_from(Some("0")));
+        assert!(!seed_widths_from(Some(" 0\n")));
     }
 }
