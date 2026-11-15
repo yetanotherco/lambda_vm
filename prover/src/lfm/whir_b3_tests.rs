@@ -84,6 +84,43 @@ fn digest_words(bytes: &[u8; 32]) -> [LfmWord; 2] {
     })
 }
 
+/// The `LEAN_MUX` table's cells for `program`: a lean BLAKE3 program's
+/// one-output selects become mux rows of that narrower table (13 value
+/// columns, 4 bus interactions), which `airs::lfm_chip_census_with_hasher`
+/// does not count (it lists the LFM chips; the lean tables are apart). Every
+/// census that prices a leaf's field side adds these.
+pub(crate) struct LeanMuxCells {
+    /// Value cells at the table's padded heights (its chunks).
+    pub padded_main: u64,
+    /// LogUp columns at the padded heights, one a pair of interactions.
+    pub padded_aux: u64,
+    /// Value cells at the real rows.
+    pub real_main: u64,
+    /// LogUp columns at the real rows.
+    pub real_aux: u64,
+}
+
+pub(crate) fn lean_mux_cells(program: &LfmProgram) -> LeanMuxCells {
+    use super::b3l_tables::B3lShape;
+    use super::chips::mux;
+    let main = (mux::cols::NUM_COLUMNS - super::layout::mux::PREP_WIDTH) as u64;
+    let aux = mux::bus_interactions().len().div_ceil(2) as u64;
+    let shape = B3lShape::of_program(program);
+    let padded: u64 = shape.muxes.iter().map(|&rows| rows as u64).sum();
+    // A program with no compression has no lean table, so no mux rows either.
+    let real = if shape.is_empty() {
+        0
+    } else {
+        program.groups.mux.real_rows as u64
+    };
+    LeanMuxCells {
+        padded_main: padded * main,
+        padded_aux: padded * aux,
+        real_main: real * main,
+        real_aux: real * aux,
+    }
+}
+
 fn publish_digest(b: &mut LfmBuilder, d: WrapDigest) {
     for cell in d.iter() {
         b.public(*cell);
@@ -1260,16 +1297,26 @@ mod chain {
                 &leg,
                 leg.hasher(<BlockFamily as ProofFamily>::SOCKET),
             );
-            let field: u64 = chips.iter().map(|c| c.real_rows * c.main_cols as u64).sum();
+            // The lean program's one-output selects are LEAN_MUX rows, outside
+            // the chip census: counted with the field side and the selects.
+            let muxes = super::lean_mux_cells(&leg);
+            let field: u64 = chips
+                .iter()
+                .map(|c| c.real_rows * c.main_cols as u64)
+                .sum::<u64>()
+                + muxes.real_main;
             let field_aux: u64 = chips
                 .iter()
                 .map(|c| c.real_rows * (c.main_cols + 3 * c.aux_cols) as u64)
-                .sum();
+                .sum::<u64>()
+                + muxes.real_main
+                + 3 * muxes.real_aux;
             let select: u64 = chips
                 .iter()
                 .filter(|c| c.name.contains("SELECT"))
                 .map(|c| c.real_rows * c.main_cols as u64)
-                .sum();
+                .sum::<u64>()
+                + muxes.real_main;
             let hash = compressions as u64 * 2_832;
             println!(
                 "CAP CELLS packed={packed} c={cap}: caps {:?} · {compressions} compressions ({hash} lean cells) · field main \
@@ -2492,7 +2539,7 @@ fn the_packed_cap_mux_halves_the_muxs_select_rows() {
     let selects = |p: &LfmProgram| {
         p.instrs
             .iter()
-            .filter(|i| matches!(i, Instr::Select { .. }))
+            .filter(|i| matches!(i, Instr::Select { .. } | Instr::Mux { .. }))
             .count()
     };
     let (mut plain, mut packed) = (None, None);
