@@ -63,6 +63,13 @@ impl WidthHint {
         widths.len() == cols && cols > 0
     }
 
+    /// The bytes a packed row takes at these widths (their sum), when there
+    /// are widths.
+    pub(crate) fn bytes_a_row(&self) -> Option<usize> {
+        let widths = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (!widths.is_empty()).then(|| widths.iter().map(|&w| usize::from(w)).sum())
+    }
+
     /// Take `widths` (a trace's) into the most each column needed.
     pub fn learn(&self, widths: &[u8]) {
         let mut most = self.0.lock().unwrap_or_else(|e| e.into_inner());

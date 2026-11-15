@@ -27,7 +27,7 @@ const SEEDS: &[(&str, usize, &WidthHint, &str)] = &[
     (
         "CPU",
         42,
-        &super::cpu::WIDTHS,
+        &super::cpu::WIDTHS_INROW,
         "4x2,1x7,4x2,1x10,4,1,4x2,1,4x6,2x4,1,4x5",
     ),
     (
@@ -128,12 +128,49 @@ fn seed_widths_from(value: Option<&str>) -> bool {
     value.is_none_or(|v| v.trim() != "0")
 }
 
+/// `LAMBDA_VM_FINISH_SEED_CPU=base`: CPU's seed goes to the base CPU table's
+/// hint (`cpu::WIDTHS`, 37 columns), where its 42 widths are never read, as
+/// before; unset or any other word, to the in-row table's (`cpu::WIDTHS_INROW`),
+/// which the block's CPU tables are written at. A measurement's rollback.
+pub(crate) fn cpu_seed_base() -> bool {
+    static BASE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| {
+        cpu_seed_base_from(std::env::var("LAMBDA_VM_FINISH_SEED_CPU").ok().as_deref())
+    })
+}
+
+/// [`cpu_seed_base`]'s reading of `LAMBDA_VM_FINISH_SEED_CPU`.
+fn cpu_seed_base_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "base")
+}
+
+/// A kind's seed hint: CPU's in-row one, or under [`cpu_seed_base`] the base
+/// one.
+fn seed_hint(name: &str, hint: &'static WidthHint) -> &'static WidthHint {
+    if name == "CPU" && cpu_seed_base() {
+        &super::cpu::WIDTHS
+    } else {
+        hint
+    }
+}
+
+/// The bytes a packed row of `kind` takes at the widths its hint holds now
+/// (seeded or learned), for a kind the seeds cover: what the finish estimates
+/// a first table of the kind at ([`WidthHint::bytes_a_row`]).
+pub(crate) fn bytes_a_row(kind: &str) -> Option<usize> {
+    SEEDS
+        .iter()
+        .find(|&&(name, ..)| name == kind)
+        .and_then(|&(name, _, hint, _)| seed_hint(name, hint).bytes_a_row())
+}
+
 /// Seeds every kind's hint that has none yet, once a process; the kinds seeded.
 pub(crate) fn seed_finish_widths() -> usize {
     static SEEDED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SEEDED.get_or_init(|| {
         let mut seeded = 0;
-        for &(_, cols, hint, widths) in SEEDS {
+        for &(name, cols, hint, widths) in SEEDS {
+            let hint = seed_hint(name, hint);
             if let Some(widths) = parse(widths).filter(|w| w.len() == cols)
                 && !hint.known(cols)
             {
@@ -198,5 +235,33 @@ mod tests {
         assert!(seed_widths_from(Some(" 1 ")));
         assert!(!seed_widths_from(Some("0")));
         assert!(!seed_widths_from(Some(" 0\n")));
+    }
+
+    /// CPU's seed is the in-row table's hint, the one the block's CPU tables
+    /// are written at: its 42 widths are that table's columns; `base` alone
+    /// sends it back to the base table's hint.
+    #[test]
+    fn the_cpu_seed_goes_to_the_in_row_hint() {
+        let &(_, cols, hint, _) = SEEDS
+            .iter()
+            .find(|&&(name, ..)| name == "CPU")
+            .expect("a CPU seed");
+        assert!(std::ptr::eq(hint, &super::super::cpu::WIDTHS_INROW));
+        assert_eq!(cols, super::super::cpu::inrow_cols::NUM_COLUMNS_INROW);
+        assert!(!cpu_seed_base_from(None));
+        assert!(!cpu_seed_base_from(Some("inrow")));
+        assert!(cpu_seed_base_from(Some(" base ")));
+    }
+
+    /// A seeded kind's packed row is the sum of its seed's widths.
+    #[test]
+    fn a_seeded_kinds_row_is_its_widths_summed() {
+        seed_finish_widths();
+        let bytewise = parse("1x26").expect("parses");
+        assert!(
+            bytes_a_row("BYTEWISE")
+                .is_some_and(|b| b >= bytewise.iter().map(|&w| usize::from(w)).sum::<usize>())
+        );
+        assert_eq!(bytes_a_row("PAGE"), None);
     }
 }

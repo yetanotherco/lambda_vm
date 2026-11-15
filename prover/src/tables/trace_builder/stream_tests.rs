@@ -952,6 +952,7 @@ fn tables_handed_on_first_stream_under_a_one_byte_budget() {
                 &first,
                 Some(0),
                 None,
+                super::NO_FIRST_ROWS,
             );
             result.map(|()| (order, most.into_inner()))
         });
