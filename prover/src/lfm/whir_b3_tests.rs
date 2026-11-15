@@ -880,7 +880,7 @@ mod chain {
     /// host accepts: every challenge feeds a refusal, so execution IS the
     /// stream comparison. It hashes with BLAKE3 rows and nothing else.
     #[test]
-    fn a_blake3_chain_executes_on_a_proof_the_host_accepts() {
+    pub(super) fn a_blake3_chain_executes_on_a_proof_the_host_accepts() {
         super::under_both(|_lowering| {
             for (num_vars, cfg) in cases() {
                 let f = fixture(num_vars, cfg);
@@ -909,7 +909,7 @@ mod chain {
     /// and the byte sponge's squeezes and `state()` reads — at every shape the
     /// gate runs.
     #[test]
-    fn a_blake3_chain_emits_its_compression_closed_form() {
+    pub(super) fn a_blake3_chain_emits_its_compression_closed_form() {
         super::under_both(|_lowering| {
             use super::super::whir_chain::chain_perms;
             use super::super::whir_transcript::SpongeEntry;
@@ -961,7 +961,7 @@ mod chain {
     /// (its LAST byte, so a digest compared on one word only would miss it),
     /// a cap node, and the root itself.
     #[test]
-    fn a_tampered_blake3_chain_cannot_execute() {
+    pub(super) fn a_tampered_blake3_chain_cannot_execute() {
         super::under_both(|_lowering| {
             for leaves in [LeafOrder::Natural, LeafOrder::Coset] {
                 for cap in [CapPolicy::Off, CapPolicy::Fixed(2)] {
@@ -1043,7 +1043,7 @@ mod chain {
     ///
     /// [`TAIL_QUERIES_A_LEAF`]: super::super::whir_chain::TAIL_QUERIES_A_LEAF
     #[test]
-    fn a_lean_blake3_chain_checks_its_tail_once_a_leaf() {
+    pub(super) fn a_lean_blake3_chain_checks_its_tail_once_a_leaf() {
         use super::super::whir_chain::{LeafQuery, chain_perms, tail_faults};
         use super::super::whir_transcript::SpongeEntry;
         super::under_both(|_lowering| {
@@ -1109,7 +1109,7 @@ mod chain {
     /// final-round block value each tampered are refused by the host and have
     /// no execution.
     #[test]
-    fn a_blake3_chain_with_a_final_polynomial_executes_and_refuses_its_tampers() {
+    pub(super) fn a_blake3_chain_with_a_final_polynomial_executes_and_refuses_its_tampers() {
         use super::super::whir_chain::chain_perms;
         use super::super::whir_transcript::SpongeEntry;
         use multilinear::whir_chain::FinalPoly;
@@ -1238,7 +1238,11 @@ mod chain {
         let mut config = format.chain_config(&[(1, n)]);
         config.format.group = multilinear::whir_chain::GroupFold::PerPoly;
         config.format.round0 = multilinear::whir_chain::Round0Trees::Each;
-        for cap in 3u8..=8 {
+        for (packed, cap) in [false, true]
+            .into_iter()
+            .flat_map(|p| (3u8..=8).map(move |c| (p, c)))
+        {
+            super::super::merkle_cap::PACKED_MUX.with(|c| c.set(Some(packed)));
             let mut c = config;
             c.format.cap = CapPolicy::Fixed(cap);
             let shape = ChainShape {
@@ -1268,7 +1272,7 @@ mod chain {
                 .sum();
             let hash = compressions as u64 * 2_832;
             println!(
-                "CAP CELLS c={cap}: caps {:?} · {compressions} compressions ({hash} lean cells) · field main \
+                "CAP CELLS packed={packed} c={cap}: caps {:?} · {compressions} compressions ({hash} lean cells) · field main \
                  {field} (select {select}; with LogUp {field_aux}) · total {} (with LogUp {}) · rows {:?}",
                 shape.caps,
                 hash + field,
@@ -1276,6 +1280,7 @@ mod chain {
                 ChipRows::of(&leg)
             );
         }
+        super::super::merkle_cap::PACKED_MUX.with(|c| c.set(None));
         super::LEAN.with(|c| c.set(false));
     }
 
@@ -1985,7 +1990,7 @@ mod stacked {
     /// emitted leg executes on every proof the host accepts, its batching draw
     /// is the host's, and it hashes with BLAKE3 alone.
     #[test]
-    fn a_blake3_group_opening_executes_on_proofs_the_host_accepts() {
+    pub(super) fn a_blake3_group_opening_executes_on_proofs_the_host_accepts() {
         super::under_both(|_lowering| {
             for (name, case) in cases() {
                 let f = build(&case);
@@ -2019,7 +2024,7 @@ mod stacked {
     /// a joint path node off (its last byte), and a root off in its second
     /// word are refused by the host and have no execution.
     #[test]
-    fn a_tampered_joint_blake3_leg_cannot_execute() {
+    pub(super) fn a_tampered_joint_blake3_leg_cannot_execute() {
         super::under_both(|_lowering| {
             for leaves in [LeafOrder::Natural, LeafOrder::Coset] {
                 for cap in [CapPolicy::Off, CapPolicy::Fixed(2)] {
@@ -2441,4 +2446,171 @@ fn the_production_blake3_run_levers_by_closed_form() {
     }
     let (s, t) = run(&build(1, 4, 6, 24, Some(6)), 3);
     report("query grind 24 + binary cap 6", &s, t);
+}
+
+/// Runs `f` with this thread's cap mux packed
+/// (`merkle_cap::PACKED_MUX`), then restores the knob's reading.
+fn with_packed_mux(f: impl FnOnce()) {
+    super::merkle_cap::PACKED_MUX.with(|c| c.set(Some(true)));
+    f();
+    super::merkle_cap::PACKED_MUX.with(|c| c.set(None));
+}
+
+/// ★ THE PACKED MUX GATE. Every BLAKE3 chain and group gate again with the cap
+/// checked over packed digests (`LAMBDA_VM_LFM_CAP_MUX=packed`): honest proofs
+/// execute, every tamper has no execution, the compressions are the closed
+/// form's (the packing hashes nothing), under both lowerings.
+#[test]
+fn every_blake3_gate_holds_under_the_packed_cap_mux() {
+    with_packed_mux(|| {
+        chain::a_blake3_chain_executes_on_a_proof_the_host_accepts();
+        chain::a_blake3_chain_emits_its_compression_closed_form();
+        chain::a_tampered_blake3_chain_cannot_execute();
+        chain::a_lean_blake3_chain_checks_its_tail_once_a_leaf();
+        chain::a_blake3_chain_with_a_final_polynomial_executes_and_refuses_its_tampers();
+        stacked::a_blake3_group_opening_executes_on_proofs_the_host_accepts();
+        stacked::a_tampered_joint_blake3_leg_cannot_execute();
+    });
+}
+
+/// The packed mux is the mode the gate above ran: a capped chain's program
+/// muxes one word a node instead of two (about half its cap `Select` rows),
+/// with the same compressions.
+#[test]
+fn the_packed_cap_mux_halves_the_muxs_select_rows() {
+    use super::whir_chain::ChainShape;
+    use multilinear::whir_chain::{CapPolicy, LeafOrder};
+    let cfg = chain::config(4, 0, CapPolicy::Fixed(4), LeafOrder::Coset, Some(6));
+    let shape = ChainShape::for_hash(&cfg, 12, WrapHash::Blake3);
+    assert!(
+        shape.caps.iter().any(|&c| c >= 3),
+        "a cap the mux reads: {:?}",
+        shape.caps
+    );
+    let selects = |p: &LfmProgram| {
+        p.instrs
+            .iter()
+            .filter(|i| matches!(i, Instr::Select { .. }))
+            .count()
+    };
+    let plain = chain::program(&shape);
+    let mut packed = None;
+    with_packed_mux(|| packed = Some(chain::program(&shape)));
+    let packed = packed.expect("the packed program");
+    assert_eq!(
+        hash_rows(&plain),
+        hash_rows(&packed),
+        "the packing hashes nothing"
+    );
+    let (s_plain, s_packed) = (selects(&plain), selects(&packed));
+    println!(
+        "PACKED MUX: caps {:?} · Select rows {s_plain} -> {s_packed}",
+        shape.caps
+    );
+    assert!(s_packed < s_plain, "the packed mux takes fewer Select rows");
+}
+
+/// ★ What the packed compare admits, exactly. A height-2 cap of four nodes is
+/// authenticated against its host root; an opening at the cap's own level
+/// (no walk) compares a hinted digest with node `idx`. Packed, the node
+/// itself executes, every single-lane change of it is refused, and the
+/// node's documented partner — a `(lo = a, hi = 0)` pair replaced by
+/// `(lo = a + 1, hi = 2^32 − 1)`, the one non-injective case of
+/// `lo + 2^32·hi mod p` — executes too (the at most 16 packed-equal
+/// digests). Plain, the partner is refused.
+#[test]
+fn the_packed_cap_compare_admits_the_node_and_its_partners_only() {
+    use super::merkle_cap::CapCells;
+    use super::word::base_word;
+    use crate::tables::types::GoldilocksField;
+    use crypto::merkle_tree::backends::types::BatchBlake3StdBackend;
+    use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+    type Std = BatchBlake3StdBackend<GoldilocksField>;
+    let mut nodes: Vec<[u8; 32]> = (0..4u8)
+        .map(|n| core::array::from_fn(|i| (i as u8).wrapping_mul(29) ^ n.wrapping_mul(0x47) ^ 0x3C))
+        .collect();
+    // Node 2's first lane pair (lanes 0 and 1: lo, hi) is (a, 0): a partner exists.
+    nodes[2][0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    nodes[2][4..8].copy_from_slice(&0u32.to_le_bytes());
+    let l = Std::hash_new_parent(&nodes[0], &nodes[1]);
+    let r = Std::hash_new_parent(&nodes[2], &nodes[3]);
+    let root = Std::hash_new_parent(&l, &r);
+    let run = |packed: bool, idx: u64, leaf: [u8; 32]| -> bool {
+        let mut b = builder();
+        // Words: four nodes, the leaf, the root (two words each), the index.
+        let arena = b.declare_arena(13);
+        let digest = |b: &mut LfmBuilder, at: u32| {
+            WrapDigest::from_pair(b.hint_word(arena, at), b.hint_word(arena, at + 1))
+        };
+        let cap: Vec<WrapDigest> = (0..4).map(|n| digest(&mut b, 2 * n)).collect();
+        let leaf_d = digest(&mut b, 8);
+        let root_d = digest(&mut b, 10);
+        let root_lanes = [b.unpack(root_d[0]), b.unpack(root_d[1])];
+        super::merkle_cap::PACKED_MUX.with(|c| c.set(Some(packed)));
+        let cells = CapCells::authenticate(&mut b, &cap, &root_lanes);
+        let index = b.hint_felt(arena, 12);
+        let bits = b.bit_dec(index, 2);
+        cells.verify_path(&mut b, leaf_d, &bits, &[]);
+        super::merkle_cap::PACKED_MUX.with(|c| c.set(None));
+        let program = compile(b.finish());
+        validate(&program).expect("admissible");
+        let mut words: Vec<LfmWord> = Vec::new();
+        for node in &nodes {
+            words.extend(digest_words(node));
+        }
+        words.extend(digest_words(&leaf));
+        words.extend(digest_words(&root));
+        words.push(base_word(FE::from(idx)));
+        execute(&program, &[words], &crate::hash_pin::BLOCK_HASHER).is_ok()
+    };
+    under_both(|_lowering| {
+        for packed in [false, true] {
+            for idx in 0..4u64 {
+                assert!(
+                    run(packed, idx, nodes[idx as usize]),
+                    "packed {packed}: node {idx} itself"
+                );
+                for lane in 0..8 {
+                    let mut off = nodes[idx as usize];
+                    off[4 * lane] ^= 0x01;
+                    assert!(
+                        !run(packed, idx, off),
+                        "packed {packed}: node {idx} with lane {lane} off"
+                    );
+                }
+            }
+            assert!(
+                !run(packed, 1, nodes[2]),
+                "packed {packed}: another node's digest"
+            );
+            // Node 2's partner: lane pair 0 from (a, 0) to (a + 1, 2^32 − 1).
+            let mut partner = nodes[2];
+            partner[0..4].copy_from_slice(&0x1234_5679u32.to_le_bytes());
+            partner[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert_eq!(
+                run(packed, 2, partner),
+                packed,
+                "the partner digest passes the packed compare only (packed {packed})"
+            );
+        }
+    });
+}
+
+/// The packed mux's knob: unset and `plain` are today's mux, `packed` the
+/// packed one, and anything else is refused.
+#[test]
+fn the_cap_mux_knob_reads_its_words_and_refuses_the_rest() {
+    use super::merkle_cap::{cap_mux_packed, cap_mux_setting};
+    assert!(!cap_mux_packed(), "no test sets the knob");
+    for (word, want) in [
+        (None, false),
+        (Some("plain"), false),
+        (Some(" packed "), true),
+        (Some("packed"), true),
+    ] {
+        assert_eq!(cap_mux_setting(word), Ok(want), "{word:?}");
+    }
+    for word in ["", "on", "1", "Packed", "pack"] {
+        assert!(cap_mux_setting(Some(word)).is_err(), "{word:?}");
+    }
 }
