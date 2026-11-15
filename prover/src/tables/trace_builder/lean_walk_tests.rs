@@ -323,6 +323,7 @@ fn the_one_pass_routing_is_the_routing() {
                 lt_dvrm_cpu32,
                 mul_dvrm_filter,
                 mul_dvrm_cpu32,
+                store_cycles: _,
             } = s;
             format!(
                 "{branch_ops:?}{mul_filter:?}{dvrm_filter:?}{eq_ops:?}{bytewise_ops:?}{store_ops:?}\

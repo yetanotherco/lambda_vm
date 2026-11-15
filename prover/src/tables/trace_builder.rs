@@ -1000,9 +1000,9 @@ pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
 #[cfg(test)]
 pub(crate) use windowed::DECODE_TRACE_DELAY;
 pub use windowed::{
-    Accumulator, CardFillStamps, ChunkJob, CountThreadStamps, RecordsRoom, RegenBuilder,
-    RowFamilies, SetupStamps, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
-    WindowedTraceBuilder,
+    Accumulator, CardFillStamps, ChunkJob, CountThreadStamps, MEMW_A_WHOLE, RecordsRoom,
+    RegenBuilder, RowFamilies, RowLists, SetupStamps, StreamTable, StreamedChunk, WalkedWindow,
+    Walker, WindowStamps, WindowedTraceBuilder,
 };
 #[cfg(feature = "parallel")]
 pub(crate) use windowed::{head_log, parallel};
@@ -8270,6 +8270,9 @@ struct RoutedSegments {
     lt_dvrm_cpu32: Vec<LtOperation>,
     mul_dvrm_filter: Vec<(MulOperation, bool)>,
     mul_dvrm_cpu32: Vec<(MulOperation, bool)>,
+    /// STORE as its rows' cycles, where the walker lists them
+    /// ([`CpuRouter::store_cycles`]); `store_ops` then holds none.
+    store_cycles: Option<Vec<u32>>,
 }
 
 /// [`RoutedSegments`] accumulated over a run, window by window: each segment
@@ -8293,6 +8296,9 @@ struct RoutedBlocks {
     lt_dvrm_cpu32: BlockVec<LtOperation>,
     mul_dvrm_filter: BlockVec<(MulOperation, bool)>,
     mul_dvrm_cpu32: BlockVec<(MulOperation, bool)>,
+    /// STORE as its rows' cycles, where the walkers list them: in run order,
+    /// the run's STORE rows in place of `store_ops`.
+    store_cycles: BlockVec<u32>,
 }
 
 impl RoutedBlocks {
@@ -8316,6 +8322,7 @@ impl RoutedBlocks {
             lt_dvrm_cpu32: list(m.lt),
             mul_dvrm_filter: list(m.mul),
             mul_dvrm_cpu32: list(m.mul),
+            store_cycles: list(m.store),
         }
     }
 
@@ -8335,6 +8342,9 @@ impl RoutedBlocks {
         self.lt_dvrm_cpu32.extend(other.lt_dvrm_cpu32);
         self.mul_dvrm_filter.extend(other.mul_dvrm_filter);
         self.mul_dvrm_cpu32.extend(other.mul_dvrm_cpu32);
+        if let Some(cycles) = other.store_cycles {
+            self.store_cycles.extend(cycles);
+        }
     }
 
     /// Each segment's (name, heap bytes, largest single allocation).
@@ -8477,6 +8487,9 @@ struct CpuRouter {
     eq_ops: Vec<eq::EqOperation>,
     bytewise_ops: Vec<bytewise::BytewiseOperation>,
     store_ops: Vec<store::StoreOperation>,
+    /// STORE as its rows' cycles ([`Self::store_cycles`]): each store's
+    /// cycle instead of its op, which [`Self::push`] then leaves out.
+    store_cycles: Option<Vec<u32>>,
 }
 
 impl CpuRouter {
@@ -8491,6 +8504,25 @@ impl CpuRouter {
             eq_ops: Vec::with_capacity(eq),
             bytewise_ops: Vec::with_capacity(bytewise),
             store_ops: Vec::with_capacity(store),
+            store_cycles: None,
+        }
+    }
+
+    /// STORE's segment as its rows' cycles from here on: [`Self::push`] routes
+    /// no store; [`Self::push_store_cycle`] lists each store's cycle.
+    fn store_cycles(mut self, capacity: usize) -> Self {
+        self.store_cycles = Some(Vec::with_capacity(capacity));
+        self
+    }
+
+    /// The store `op`'s cycle, its STORE row's lookups counted into
+    /// `histogram` (the hand-out counts a STORE op's lookups as it cuts it;
+    /// a cycle has none to count).
+    #[inline]
+    fn push_store_cycle(&mut self, op: CpuOp<'_>, histogram: &mut bitwise::BitwiseHistogram) {
+        if let Some(cycles) = self.store_cycles.as_mut() {
+            histogram.add_ops(&route_store(op).collect_bitwise_ops());
+            cycles.push(((op.timestamp - 4) / 4) as u32);
         }
     }
 
@@ -8515,14 +8547,14 @@ impl CpuRouter {
                 self.bytewise_ops.push(route_bytewise(op));
             }
         }
-        if f.is_store() {
+        if f.is_store() && self.store_cycles.is_none() {
             self.store_ops.push(route_store(op));
         }
     }
 
     /// The segments, with the CPU32 ops' dispatch and the DVRM-implied ops.
     fn finish(self, cpu32_ops: &[cpu32::Cpu32Operation]) -> RoutedSegments {
-        route_from_cpu_segments(
+        let mut segments = route_from_cpu_segments(
             self.branch_ops,
             self.mul_filter,
             self.dvrm_filter,
@@ -8530,7 +8562,9 @@ impl CpuRouter {
             self.bytewise_ops,
             self.store_ops,
             cpu32_ops,
-        )
+        );
+        segments.store_cycles = self.store_cycles;
+        segments
     }
 }
 
@@ -8739,6 +8773,7 @@ fn route_from_cpu_segments(
         lt_dvrm_cpu32,
         mul_dvrm_filter,
         mul_dvrm_cpu32,
+        store_cycles: None,
     }
 }
 
@@ -8807,6 +8842,7 @@ fn collect_all_ops(
         lt_dvrm_cpu32,
         mul_dvrm_filter,
         mul_dvrm_cpu32,
+        store_cycles: _,
     } = route_ops(&cpu_ops, decode, &cpu32_ops);
     // The lists are the segments in the order the routing always produced them:
     // each CPU-op filter, then what CPU32 dispatches, then what DVRM implies,

@@ -272,6 +272,8 @@ pub struct WindowedTraceBuilder<'a> {
     cpu_listless: bool,
     /// [`Self::light_walk`]: 0, 1 or 2.
     light_walk: u8,
+    /// [`Self::card_row_lists`].
+    row_lists: RowLists,
     /// The split walker's counts ([`Self::count_where_made`]).
     own_counts: WalkCounts,
     /// The counts of the walkers of a run walked from its entries or its
@@ -562,6 +564,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             count_made: true,
             cpu_listless: true,
             light_walk: 0,
+            row_lists: RowLists::NONE,
             own_counts: WalkCounts::default(),
             made_counts: Vec::new(),
             walked_rows: WalkedRows::default(),
@@ -766,6 +769,44 @@ impl<'a> WindowedTraceBuilder<'a> {
 
     /// The walkers' light walk in effect ([`Self::light_walk`]): its cells
     /// skipped (`.0`) and its windows routed where walked (`.1`).
+    /// The walkers list the rows of `lists`' families for the card to derive
+    /// instead of making them ([`RowLists`], [`WindowRowLists`]): a batch's
+    /// LOAD ops and MEMW_A rows, counted where made while in cache, become
+    /// their cycles (an ECALL cycle's MEMW_A rows stay whole, marked); each
+    /// store's cycle is listed where its walker routes it, its STORE row's
+    /// lookups counted there. The chunks of those families are then cut from
+    /// the lists, which this build does not do: a run that lists rows no
+    /// chunk takes is refused at its finish. Needs the in-row register format
+    /// (no register access is a MEMW_A row) and MEMW_A's limbs form (no MEMW_A
+    /// row has an LT op to make); at the walk, the walkers counting where they
+    /// make the rows, STORE routing on the walkers
+    /// ([`Self::light_walk`] at 2), and no re-walk. Before the first window
+    /// only. [`RowLists::NONE`] (the default) is today's build.
+    pub fn card_row_lists(mut self, lists: RowLists) -> Result<Self, Error> {
+        let refuse = |why: &str| Err(Error::Prover(format!("card_row_lists: {why}")));
+        if self.cycles > 0 {
+            return refuse("after a window was walked");
+        }
+        if lists.any() {
+            if self.emitted.register_format != super::super::register::RegisterFormat::InRow {
+                return refuse("it needs the in-row register format");
+            }
+            if lists.memw_a && self.emitted.memw_aligned_order != MemwAlignedOrder::Limbs {
+                return refuse("MEMW_A listed needs its limbs form");
+            }
+            if self.kept.is_none() {
+                return refuse("it needs a build that drops its streamed ops");
+            }
+        }
+        self.row_lists = lists;
+        Ok(self)
+    }
+
+    /// The families the walkers list ([`Self::card_row_lists`]).
+    pub(crate) fn row_lists(&self) -> RowLists {
+        self.row_lists
+    }
+
     pub(crate) fn light_walks(&self) -> (bool, bool) {
         (
             self.light_walk >= 1,
@@ -1454,6 +1495,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             logs: None,
             made: None,
             routed: None,
+            lists: None,
         };
         super::build_stamps::mark("p0 last window");
         let Self {
@@ -1783,6 +1825,112 @@ impl<'a> WindowedTraceBuilder<'a> {
     }
 }
 
+/// The families whose rows the walkers list for the card to derive, instead
+/// of making them ([`WindowedTraceBuilder::card_row_lists`]): LOAD's and
+/// STORE's rows as their cycles, MEMW_A's as the cycle of a regular row or a
+/// marked index into its window's ECALL rows ([`WindowRowLists`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowLists {
+    pub load: bool,
+    pub store: bool,
+    pub memw_a: bool,
+}
+
+impl RowLists {
+    /// Every row made, as today.
+    pub const NONE: Self = Self {
+        load: false,
+        store: false,
+        memw_a: false,
+    };
+
+    pub fn any(self) -> bool {
+        self.load || self.store || self.memw_a
+    }
+}
+
+/// [`WindowRowLists::aligned_rows`]' mark of an ECALL cycle's MEMW_A row:
+/// this bit and the row's index in the window's
+/// [`WindowRowLists::aligned_whole`]. A regular row's entry is its cycle,
+/// which stays below 2^30.
+pub const MEMW_A_WHOLE: u32 = 1 << 31;
+
+/// What a window's walker listed in place of the rows ([`RowLists`]), each
+/// list in today's row order.
+#[derive(Debug, Default)]
+pub(crate) struct WindowRowLists {
+    /// LOAD: each row's cycle (`(timestamp − 4) / 4`).
+    pub(crate) load_cycles: Vec<u32>,
+    /// MEMW_A, in walk order: a regular row's (a cycle's load or store, one
+    /// a cycle under the in-row register format) cycle; an ECALL cycle's row
+    /// as [`MEMW_A_WHOLE`] and its index in `aligned_whole`.
+    pub(crate) aligned_rows: Vec<u32>,
+    /// The ECALL cycles' MEMW_A rows, whole, in walk order.
+    pub(crate) aligned_whole: Vec<memw_aligned::AlignedRow>,
+}
+
+impl WindowRowLists {
+    fn heap_bytes(&self) -> usize {
+        super::vec_heap_bytes(&self.load_cycles)
+            + super::vec_heap_bytes(&self.aligned_rows)
+            + super::vec_heap_bytes(&self.aligned_whole)
+    }
+
+    fn rows(&self) -> usize {
+        self.load_cycles.len() + self.aligned_rows.len()
+    }
+
+    /// The rows of the batch from cycle `batch_first` (`cpu_ops`, one a
+    /// cycle) the walk just made: LOAD's ops from `walk.load_ops[load..]` and
+    /// MEMW_A's rows from `walk.memw.aligned[aligned..]`, as `lists` lists
+    /// them, taken out of the walk's lists once counted.
+    fn take_batch(
+        &mut self,
+        lists: RowLists,
+        decode: &DecodeTable,
+        cpu_ops: &[super::CpuOperation],
+        batch_first: usize,
+        walk: &mut WalkOutputs,
+        marks: BatchMarks,
+    ) -> Result<(), Error> {
+        let cycle_of = |ts: u64| (ts - 4) / 4;
+        if lists.load {
+            self.load_cycles.extend(
+                walk.load_ops
+                    .drain(marks.load..)
+                    .map(|op| cycle_of(op.timestamp) as u32),
+            );
+        }
+        if lists.memw_a {
+            let mut last_regular = None;
+            for row in walk.memw.aligned.drain(marks.aligned..) {
+                let cycle = cycle_of(row.timestamp());
+                let Some(raw) = (cycle as usize)
+                    .checked_sub(batch_first)
+                    .and_then(|i| cpu_ops.get(i))
+                else {
+                    return Err(Error::Prover(format!(
+                        "MEMW_A listed: a row at cycle {cycle} outside its batch from {batch_first}"
+                    )));
+                };
+                if decode.op(raw).decode.fields.ecall {
+                    self.aligned_rows
+                        .push(MEMW_A_WHOLE | self.aligned_whole.len() as u32);
+                    self.aligned_whole.push(row);
+                } else if last_regular == Some(cycle) {
+                    return Err(Error::Prover(format!(
+                        "MEMW_A listed: cycle {cycle} made two regular rows"
+                    )));
+                } else {
+                    last_regular = Some(cycle);
+                    self.aligned_rows.push(cycle as u32);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One window, walked: its CPU ops and what the walk emitted for them, and,
 /// for a build whose CPU chunks the card fills
 /// ([`WindowedTraceBuilder::card_fill_streamed`]), the executor's logs it was
@@ -1802,6 +1950,9 @@ pub struct WalkedWindow {
     /// ([`WindowedTraceBuilder::light_walk`] at 2); `None` when the
     /// accumulator routes it.
     routed: Option<super::RoutedSegments>,
+    /// The rows its walker listed instead of making them
+    /// ([`WindowedTraceBuilder::card_row_lists`]).
+    lists: Option<Box<WindowRowLists>>,
 }
 
 impl WalkedWindow {
@@ -1853,6 +2004,7 @@ impl WalkedWindow {
         super::vec_heap_bytes(&self.cpu_ops)
             + self.walk.heap_bytes()
             + self.logs.as_deref().map_or(0, super::vec_heap_bytes)
+            + self.lists.as_deref().map_or(0, WindowRowLists::heap_bytes)
     }
 
     /// Keeps `logs`, the logs it was walked from, for the CPU chunks its
@@ -1917,6 +2069,7 @@ impl Walker<'_> {
             self.counts.as_deref_mut(),
             list,
             false,
+            RowLists::NONE,
             self.sizes,
             self.memory_state,
             self.register_state,
@@ -1962,6 +2115,7 @@ fn walk_window(
     mut counts: Option<&mut WalkCounts>,
     list: bool,
     route: bool,
+    lists: RowLists,
     sizes: &mut WalkSizes,
     memory: &mut MemoryState,
     registers: &mut RegisterState,
@@ -2001,8 +2155,17 @@ fn walk_window(
     // Routing where the ops are (`route`, with the counts): each batch's ops
     // routed and their own lookups counted while in cache, into segments
     // sized from the walker's last window.
-    let mut router = (route && counts.is_some())
-        .then(|| super::CpuRouter::with_capacities(sizes.routed_for(logs.len())));
+    let mut router = (route && counts.is_some()).then(|| {
+        let capacities = sizes.routed_for(logs.len());
+        let router = super::CpuRouter::with_capacities(capacities);
+        if lists.store {
+            router.store_cycles(capacities[5])
+        } else {
+            router
+        }
+    });
+    // The rows listed instead of made, with the counts where they are made.
+    let mut row_lists = (lists.any() && counts.is_some()).then(WindowRowLists::default);
     // Without the list, each batch's ops in one buffer, reused.
     let mut from = 0usize;
     for part in logs.chunks(batch) {
@@ -2034,6 +2197,16 @@ fn walk_window(
             if let Some(router) = router.as_mut() {
                 counts.route_batch(decode, &cpu_ops[start..], router);
             }
+            if let Some(row_lists) = row_lists.as_mut() {
+                row_lists.take_batch(
+                    lists,
+                    decode,
+                    &cpu_ops[start..],
+                    first + from - part.len(),
+                    &mut walk,
+                    marks,
+                )?;
+            }
         }
     }
     let routed = router.map(|router| router.finish(&walk.cpu32_ops));
@@ -2058,6 +2231,7 @@ fn walk_window(
         logs: None,
         made,
         routed,
+        lists: row_lists.map(Box::new),
     })
 }
 
@@ -2169,6 +2343,9 @@ impl WalkCounts {
             let op = decode.op(raw);
             op.count_bitwise_into(histogram);
             router.push(op);
+            if op.decode.fields.is_store() {
+                router.push_store_cycle(op, histogram);
+            }
         }
     }
 
@@ -2316,7 +2493,8 @@ impl Accumulator<'_> {
             let walk = &window.walk;
             self.walked.cpu += window.cycles;
             self.walked.memw_register += walk.memw.register_len();
-            self.walked.memw_aligned += walk.memw.aligned.len();
+            self.walked.memw_aligned +=
+                walk.memw.aligned.len() + window.lists.as_ref().map_or(0, |l| l.aligned_rows.len());
             self.walked.shift += walk.shift_ops.len();
             if made.last_ecall.is_some() {
                 self.counted.last_ecall = made.last_ecall;
@@ -3132,6 +3310,9 @@ struct Kept {
     /// Under `listless`, what went wrong: a window without its logs, or logs
     /// that did not decode again. Refused at the finish.
     listless_broken: Option<String>,
+    /// Rows the walkers listed ([`WindowedTraceBuilder::card_row_lists`])
+    /// that no chunk took: refused at the finish.
+    unlisted: usize,
 }
 
 /// The walk lists a run keeps whole to its end, each appended window by
@@ -3256,6 +3437,7 @@ impl Kept {
             decode,
             listless: false,
             listless_broken: None,
+            unlisted: 0,
         }
     }
 
@@ -3345,7 +3527,13 @@ impl Kept {
             logs,
             made: _,
             routed: _,
+            lists,
         } = window;
+        // The rows its walker listed: no chunk of this build takes them, so
+        // the run is refused at its finish rather than built without them.
+        if let Some(lists) = lists {
+            self.unlisted += lists.rows();
+        }
         // A window whose walker kept its list: the run goes back to the list
         // from here, the tail's ops rebuilt from its logs, and its logs
         // checked against its ops chunk by chunk as without the mode.
@@ -3461,7 +3649,13 @@ impl Kept {
             decode,
             listless: _,
             listless_broken: _,
+            unlisted,
         } = self;
+        if unlisted > 0 {
+            return Err(Error::Prover(format!(
+                "{unlisted} LOAD or MEMW_A rows listed by the walkers that no chunk took"
+            )));
+        }
         let mut walk = WalkOutputs::with_capacity(0, order);
         // Words mode: the run's last register rows, decoded from the logs. A
         // run whose words could not all be decoded (a window without its
@@ -4646,7 +4840,17 @@ fn assemble(
         lt_dvrm_cpu32,
         mul_dvrm_filter,
         mul_dvrm_cpu32,
+        store_cycles,
     } = segments;
+    // STORE listed as cycles leaves its rows to the chunks cut from them
+    // ([`super::RowLists`]); a run that cut none would build a STORE table
+    // without them, so it is refused here instead.
+    if !store_cycles.is_empty() {
+        return Err(Error::Prover(format!(
+            "STORE: {} rows listed as cycles that no chunk took",
+            store_cycles.len()
+        )));
+    }
     // Each list is its segments' blocks, in the routing's order, never
     // concatenated: the tables chunk them as their concatenation.
     let shift_ops = BlockVec::from_vec(shift_ops).chain(shift_cpu32);
@@ -5089,8 +5293,11 @@ mod cpu_listless_tests;
 
 #[cfg(all(test, feature = "parallel"))]
 mod light_walk_tests;
+
 #[cfg(test)]
 mod register_words_tests;
+#[cfg(all(test, feature = "parallel"))]
+mod row_lists_tests;
 
 #[cfg(test)]
 mod tail_tests;
