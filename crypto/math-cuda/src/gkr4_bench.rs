@@ -314,8 +314,9 @@ mod tests {
     /// at the same point and `λ` — at Boolean `t` the two relations agree
     /// cell by cell; (2) every card round's rows `H(1)..H(4), H(0)` equal a
     /// host reference that composes the two folds over the quarters, folded
-    /// by the same challenges; (3) the last quarter's cell one off parts from
-    /// both.
+    /// by the same challenges; (3) the last quarter's lower cell one off parts
+    /// from the reference and from today's `H(0)`, and leaves `H(1)`, which
+    /// reads no lower cell.
     #[test]
     #[ignore = "a card; flips a process-global fault: run alone, --ignored --test-threads=1"]
     fn the_double_step_is_the_pair_composed() {
@@ -418,15 +419,21 @@ mod tests {
                 bad, first,
                 "2^{num_vars}: the off-by-one must part from the reference"
             );
-            assert_ne!(
+            // The fault reads only a lower-half cell, so H(1) (built from the
+            // upper half alone) keeps today's value and H(0) must leave it.
+            assert_eq!(
                 bad[0], today_rows[0],
-                "2^{num_vars}: the off-by-one must part from today's step"
+                "2^{num_vars}: the off-by-one leaves H(1), which reads no lower cell"
+            );
+            assert_ne!(
+                bad[4], today_rows[2],
+                "2^{num_vars}: the off-by-one must part from today's H(0)"
             );
         }
         eprintln!(
             "GKR4 GATE equality PASS: {checked} card rounds at 2^10 and 2^12 equal the composed \
              pair; round 0's H(1), H(0) equal today's step over the middle layer; the off-by-one \
-             parted from both"
+             parted from the reference and from today's H(0)"
         );
     }
 
