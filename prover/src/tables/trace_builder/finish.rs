@@ -322,9 +322,9 @@ fn count_bitwise(
     let bytewise_segments = bytewise_ops.segments();
     // The MEMW_A and SHIFT rows their walkers counted where they made them
     // ([`PreCounted::memw_aligned_rows`], [`PreCounted::shift_rows`]): the rest.
-    let (aligned_counted, shift_counted) = pre
-        .as_ref()
-        .map_or((0, 0), |pre| (pre.memw_aligned_rows, pre.shift_rows));
+    let (aligned_counted, shift_counted, store_counted) = pre.as_ref().map_or((0, 0, 0), |pre| {
+        (pre.memw_aligned_rows, pre.shift_rows, pre.store_rows)
+    });
     let memw_aligned_ops = &memw_aligned_ops[aligned_counted.min(memw_aligned_ops.len())..];
     let shift_parts: Vec<&[ShiftOperation]> = {
         let mut skip = shift_counted;
@@ -471,7 +471,21 @@ fn count_bitwise(
     }
     starts.push(("STORE", collectors.len()));
     let store_slice = p4_slice_len(P4Source::Store, mul_chunk, dvrm_chunk);
-    for slice in store_ops.parts().flat_map(|part| part.chunks(store_slice)) {
+    // The STORE rows their walkers counted where they routed them
+    // ([`PreCounted::store_rows`]): the rest.
+    let mut skip = store_counted;
+    let store_parts: Vec<&[store::StoreOperation]> = store_ops
+        .parts()
+        .filter_map(|part| {
+            let from = skip.min(part.len());
+            skip -= from;
+            (from < part.len()).then(|| &part[from..])
+        })
+        .collect();
+    for slice in store_parts
+        .into_iter()
+        .flat_map(|part| part.chunks(store_slice))
+    {
         collectors.push(Box::new(move |h| {
             for op in slice {
                 h.add_ops(&op.collect_bitwise_ops());

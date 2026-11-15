@@ -7479,6 +7479,11 @@ pub(crate) struct PreCounted {
     pub(crate) cpu_decoded: usize,
     pub(crate) memw_aligned_rows: usize,
     pub(crate) shift_rows: usize,
+    /// How many of the STORE tail's first ops had their BITWISE lookups
+    /// counted where their walkers routed them: the rows listed as cycles
+    /// (`WindowedTraceBuilder::card_row_lists`) and rebuilt at the finish,
+    /// ahead of the finish window's own. Zero otherwise.
+    pub(crate) store_rows: usize,
 }
 
 impl PreCounted {
