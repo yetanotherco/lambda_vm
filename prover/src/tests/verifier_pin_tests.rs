@@ -522,3 +522,97 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         "one tree a run under the natural order is refused"
     );
 }
+
+/// A hand-built block statement for `sub` under the pinned format: `counts`,
+/// every table at four rows but BITWISE at its fixed 2^20, each table a group
+/// of its own but every table after BITWISE in one group.
+fn frame_counts(
+    elf: &[u8],
+    counts: &crate::TableCounts,
+) -> Result<block_whir::BlockFrame, crate::Error> {
+    let program = executor::elf::Elf::load(elf).expect("the ELF loads");
+    let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &[],
+        0,
+        usize::MAX,
+    )
+    .expect("pages")
+    .len();
+    let tables = counts.total().expect("a total") + crate::FIXED_TABLE_COUNT + pages;
+    let mut heights = vec![2u8; tables];
+    heights[block_whir::BITWISE_TABLE] = crate::tables::bitwise::NUM_VARS as u8;
+    let groups: Vec<Vec<u32>> = vec![vec![0], (1..tables as u32).collect()];
+    block_whir::block_frame(
+        block_whir::BlockStatement {
+            table_num_vars: &heights,
+            runtime_page_ranges: &[],
+            table_counts: counts,
+            public_output: &[],
+            num_private_input_pages: 0,
+            groups: &groups,
+        },
+        elf,
+        &ProofOptions::default_test_options(),
+        &BlockFormat::pinned(),
+    )
+}
+
+/// ★ The block's caps on its chunked families hold through the frame, not only
+/// in the helper: a statement one table over the cap of COPY, KECCAK,
+/// KECCAK_RND, ECSM or ECDAS is refused by the frame, by name, while the same
+/// statement at one table of each frames.
+#[test]
+fn the_frame_refuses_a_chunked_family_over_its_cap() {
+    let elf = asm_elf_bytes("sub");
+    let one_each = crate::TableCounts {
+        cpu: 1,
+        lt: 1,
+        memw: 1,
+        memw_aligned: 2,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 1,
+        memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        copy: 1,
+        blake3: 1,
+        is_wh: 1,
+        ecrec: 1,
+    };
+    frame_counts(&elf, &one_each).expect("one table of each frames");
+    type Count = fn(&mut crate::TableCounts) -> &mut usize;
+    let families: [(&str, usize, Count); 5] = [
+        ("copy", block_whir::BLOCK_MAX_COPY, |c| &mut c.copy),
+        ("keccak", block_whir::BLOCK_MAX_KECCAK, |c| &mut c.keccak),
+        ("keccak_rnd", block_whir::BLOCK_MAX_KECCAK_RND, |c| {
+            &mut c.keccak_rnd
+        }),
+        ("ecsm", block_whir::BLOCK_MAX_ECSM, |c| &mut c.ecsm),
+        ("ecdas", block_whir::BLOCK_MAX_ECDAS, |c| &mut c.ecdas),
+    ];
+    for (name, cap, count) in families {
+        let mut over = one_each.clone();
+        *count(&mut over) = cap + 1;
+        let why = match frame_counts(&elf, &over) {
+            Err(crate::Error::InvalidTableCounts(why)) => why,
+            Err(other) => panic!("{name}: {} tables refused otherwise: {other:?}", cap + 1),
+            Ok(_) => panic!("{name}: {} tables framed", cap + 1),
+        };
+        assert_eq!(
+            why,
+            format!("{name} count is {} — a block takes at most {cap}", cap + 1),
+            "{name}: refused by its cap"
+        );
+    }
+}
