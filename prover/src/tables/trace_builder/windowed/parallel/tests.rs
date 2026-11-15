@@ -89,6 +89,7 @@ fn walked_from_entries_with(
         keep_logs: builder.keeps_logs(),
         words: builder.writes_words(),
         sides_chunk: builder.derives_sides(),
+        sides_until: builder.sides_until(),
         digests: None,
         light: false,
         route: false,
