@@ -89,6 +89,8 @@ fn walked_from_entries_with(
         keep_logs: builder.keeps_logs(),
         words: builder.writes_words(),
         digests: None,
+        light: false,
+        route: false,
     });
     let mut pass = LeanPass::new(Arc::clone(&builder.decode), &builder.register_state)?;
     let mut executor =

@@ -1059,6 +1059,10 @@ pub(crate) struct HistoryOverlay {
     timestamps: Vec<u64>,
     /// The cycle being walked, its index in the window.
     cycle: Option<usize>,
+    /// The light record walk ([`Self::light`]): a cycle that is no ECALL is
+    /// walked without its cells, its load or store read from its access
+    /// record.
+    light: bool,
 }
 
 impl HistoryOverlay {
@@ -1069,7 +1073,49 @@ impl HistoryOverlay {
             values: Vec::new(),
             timestamps: Vec::new(),
             cycle: None,
+            light: false,
         }
+    }
+
+    /// The light record walk: each cycle that is no ECALL is walked without
+    /// expanding its cells ([`Self::begin_light`]); its register stamps are
+    /// checked against its record as every cycle's are, and its load or
+    /// store takes its old bytes and their stamps from its access record
+    /// ([`Self::access`]), the bytes the cells would hold. ECALL cycles are
+    /// walked from their cells as without it.
+    pub(crate) fn light(mut self, on: bool) -> Self {
+        self.light = on;
+        self
+    }
+
+    /// [`Self::begin`] with no cell made: the cycle at `timestamp` for
+    /// [`Self::registers_match`] and [`Self::access`]; a byte read finds none.
+    fn begin_light(&mut self, timestamp: u64) {
+        self.ranges.clear();
+        self.values.clear();
+        self.timestamps.clear();
+        self.cycle = (timestamp / 4)
+            .checked_sub(1 + self.history.first)
+            .map(|i| i as usize)
+            .filter(|&i| i < self.history.extras.len() && timestamp.is_multiple_of(4));
+    }
+
+    /// The cycle's load or store as its access record holds it: the address,
+    /// the eight bytes from it before the cycle and their stamps; `None` when
+    /// the cycle has no record or none of a load or store.
+    fn access(&self) -> Option<(u64, u64, [u64; 8])> {
+        use executor::vm::history::{ECALL, NO_ACCESS};
+        let side = self.history.extras.get(self.cycle?)?.side;
+        if side == NO_ACCESS || side & ECALL != 0 {
+            return None;
+        }
+        let a = self.history.accesses.get(side as usize)?;
+        let ts = if a.mixed == NO_ACCESS {
+            [u64::from(a.ts); 8]
+        } else {
+            self.history.mixed.get(a.mixed as usize)?.map(u64::from)
+        };
+        Some((a.addr, a.old, ts))
     }
 
     /// Whether the cycle's register accesses find, in the walk's register
@@ -2190,6 +2236,9 @@ pub(crate) struct WalkSizes {
     load: usize,
     lt: usize,
     shift: usize,
+    /// The six segments the CPU ops route to (BRANCH, MUL, DVRM, EQ,
+    /// BYTEWISE, STORE), where the walker routes its window.
+    routed: [usize; 6],
 }
 
 impl WalkSizes {
@@ -2203,7 +2252,32 @@ impl WalkSizes {
             load: walk.load_ops.len(),
             lt: walk.lt_ops.len(),
             shift: walk.shift_ops.len(),
+            routed: [0; 6],
         }
+    }
+
+    /// Room for a window of `cycles` cycles in each routed segment: the
+    /// walker's last window's lengths per cycle, an eighth over.
+    fn routed_for(&self, cycles: usize) -> [usize; 6] {
+        if self.cycles == 0 {
+            return [0; 6];
+        }
+        self.routed.map(|len| {
+            let scaled = (len as u128 * cycles as u128 / self.cycles as u128) as usize;
+            scaled + scaled / 8 + 16
+        })
+    }
+
+    /// The routed segments' lengths of a window routed into `segments`.
+    fn set_routed(&mut self, segments: &RoutedSegments) {
+        self.routed = [
+            segments.branch_ops.len(),
+            segments.mul_filter.len(),
+            segments.dvrm_filter.len(),
+            segments.eq_ops.len(),
+            segments.bytewise_ops.len(),
+            segments.store_ops.len(),
+        ];
     }
 }
 
@@ -2329,9 +2403,17 @@ fn walk_cpu_ops<const REST: bool>(
     for op in cpu_ops {
         let op = decode.op(op);
         // Record mode: the cycle's cells from the executor's history, its
-        // register accesses checked against the walk's cells.
+        // register accesses checked against the walk's cells. The light
+        // record walk makes no cell for a cycle that is no ECALL: its load
+        // or store reads its access record.
+        let mut light = false;
         if let Some(overlay) = memory_state.overlay.as_deref_mut() {
-            overlay.begin(op.timestamp);
+            light = overlay.light && !op.decode.fields.ecall;
+            if light {
+                overlay.begin_light(op.timestamp);
+            } else {
+                overlay.begin(op.timestamp);
+            }
             if !overlay.registers_match(&op, register_state) {
                 memory_state.missing.store(true, Relaxed);
             }
@@ -2347,7 +2429,11 @@ fn walk_cpu_ops<const REST: bool>(
 
         // Collect memory operations for Load/Store instructions
         if op.decode.fields.is_load() {
-            let (memw_op, load_op) = collect_load_op_from_cpu(op, memory_state);
+            let (memw_op, load_op) = if light {
+                collect_load_op_from_access(op, memory_state)
+            } else {
+                collect_load_op_from_cpu(op, memory_state)
+            };
             memw.push(memw_op);
             if lookups {
                 // MSB8 lookups for the sign bit extraction.
@@ -2355,7 +2441,11 @@ fn walk_cpu_ops<const REST: bool>(
             }
             load_ops.push(load_op);
         } else if op.decode.fields.is_store() {
-            let memw_op = collect_store_op_from_cpu(op, memory_state);
+            let memw_op = if light {
+                collect_store_op_from_access(op, memory_state)
+            } else {
+                collect_store_op_from_cpu(op, memory_state)
+            };
             memw.push(memw_op);
         }
 
@@ -2697,12 +2787,53 @@ fn collect_load_op_from_cpu(
 ) -> (MemwOperation, LoadOperation) {
     // res contains the effective address (base + offset)
     let base_address = op.res;
+    let (byte_count, _) = cpu_op_to_bytes_and_signed(op);
+    // Read old timestamps from memory state
+    let (_old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
+    let ops = load_ops_with_old(op, old_timestamps);
+    // Update memory state
+    memory_state.write_bytes(base_address, op.rvd, byte_count, op.timestamp);
+    ops
+}
+
+/// The light record walk's load ([`HistoryOverlay::light`]): the old stamps
+/// of the eight bytes from its address are its access record's, which are the
+/// cycle's cells; a cycle with no record of this access reads none (the
+/// window is refused, as a byte the cells lack refuses it). Nothing reads
+/// the state after it in its cycle, so it writes none.
+fn collect_load_op_from_access(
+    op: CpuOp<'_>,
+    memory_state: &mut MemoryState,
+) -> (MemwOperation, LoadOperation) {
+    let (_, old_timestamps) = access_or_missing(op, memory_state);
+    load_ops_with_old(op, old_timestamps)
+}
+
+/// The cycle's access record of the load or store at `op.res`, from the
+/// light record walk's overlay: its old bytes and their stamps; zeros and
+/// [`ABSENT`] stamps, the state marked missing, without one.
+fn access_or_missing(op: CpuOp<'_>, memory_state: &mut MemoryState) -> ([u32; 8], [u64; 8]) {
+    let found = memory_state
+        .overlay
+        .as_deref()
+        .and_then(HistoryOverlay::access)
+        .filter(|&(address, _, _)| address == op.res);
+    match found {
+        Some((_, old, ts)) => (old.to_le_bytes().map(u32::from), ts),
+        None => {
+            memory_state.missing.store(true, Relaxed);
+            ([0; 8], [ABSENT; 8])
+        }
+    }
+}
+
+/// A load's MEMW read and LOAD op, the eight bytes from its address last
+/// touched at `old_timestamps`.
+fn load_ops_with_old(op: CpuOp<'_>, old_timestamps: [u64; 8]) -> (MemwOperation, LoadOperation) {
+    let base_address = op.res;
     let (byte_count, signed) = cpu_op_to_bytes_and_signed(op);
     // rvd contains the loaded value
     let loaded_value = op.rvd;
-
-    // Read old timestamps from memory state
-    let (_old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
     // Extract individual bytes from loaded value
     let mut value_bytes = [0u32; 8];
@@ -2742,9 +2873,6 @@ fn collect_load_op_from_cpu(
         res_bytes.map(|byte| byte as u8),
     );
 
-    // Update memory state
-    memory_state.write_bytes(base_address, loaded_value, byte_count, op.timestamp);
-
     (memw_op, load_op)
 }
 
@@ -2752,14 +2880,34 @@ fn collect_load_op_from_cpu(
 ///
 /// Returns: memw_op
 fn collect_store_op_from_cpu(op: CpuOp<'_>, memory_state: &mut MemoryState) -> MemwOperation {
+    let base_address = op.res;
+    let (byte_count, _) = cpu_op_to_bytes_and_signed(op);
+    // Read old values and timestamps
+    let (old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
+    let memw_op = store_op_with_old(op, old_values, old_timestamps);
+    // Update memory state at the base timestamp (matches the STORE MEMW write).
+    memory_state.write_bytes(base_address, op.rv2, byte_count, op.timestamp);
+    memw_op
+}
+
+/// The light record walk's store ([`collect_load_op_from_access`]'s rule).
+fn collect_store_op_from_access(op: CpuOp<'_>, memory_state: &mut MemoryState) -> MemwOperation {
+    let (old_values, old_timestamps) = access_or_missing(op, memory_state);
+    store_op_with_old(op, old_values, old_timestamps)
+}
+
+/// A store's MEMW write, the eight bytes from its address `old_values`
+/// before it, last touched at `old_timestamps`.
+fn store_op_with_old(
+    op: CpuOp<'_>,
+    old_values: [u32; 8],
+    old_timestamps: [u64; 8],
+) -> MemwOperation {
     // res contains the effective address (base + offset)
     let base_address = op.res;
     let (byte_count, _) = cpu_op_to_bytes_and_signed(op);
     // rv2 contains the store value
     let store_value = op.rv2;
-
-    // Read old values and timestamps
-    let (old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
     // Pack ALL 8 bytes of store_value into value_bytes.
     // Bus 14: the MEMW Memory Write receiver reconstructs lo32/hi32 via a linear
@@ -2776,7 +2924,7 @@ fn collect_store_op_from_cpu(op: CpuOp<'_>, memory_state: &mut MemoryState) -> M
     // The STORE chip now owns this MEMW write (the CPU sends MEMORY instead of
     // the old inline M7). It uses the base timestamp — the same the CPU sends on
     // the MEMORY bus — per spec store.toml.
-    let memw_op = MemwOperation::new(
+    MemwOperation::new(
         false, // is_register = false
         base_address,
         value_bytes,
@@ -2784,12 +2932,7 @@ fn collect_store_op_from_cpu(op: CpuOp<'_>, memory_state: &mut MemoryState) -> M
         byte_count as u8,
         false, // is_read = false (write)
     )
-    .with_old(old_values, old_timestamps);
-
-    // Update memory state at the base timestamp (matches the STORE MEMW write).
-    memory_state.write_bytes(base_address, store_value, byte_count, op.timestamp);
-
-    memw_op
+    .with_old(old_values, old_timestamps)
 }
 
 /// Collects all MEMW ops and the ECSM / ECDAS table ops for one ECSM ecall;
@@ -8122,7 +8265,7 @@ fn chunk_and_generate_ranges(
 /// CPU32's). A run routed window by window appends each segment per window and
 /// concatenates the segments at the end, which gives exactly the lists a
 /// whole-run routing gives (the windowed builder).
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct RoutedSegments {
     branch_ops: Vec<BranchOperation>,
     mul_filter: Vec<(MulOperation, bool)>,
@@ -8348,6 +8491,20 @@ struct CpuRouter {
 }
 
 impl CpuRouter {
+    /// A router whose six segments (BRANCH, MUL, DVRM, EQ, BYTEWISE, STORE)
+    /// start with room for `capacities` ops each.
+    fn with_capacities(capacities: [usize; 6]) -> Self {
+        let [branch, mul, dvrm, eq, bytewise, store] = capacities;
+        Self {
+            branch_ops: Vec::with_capacity(branch),
+            mul_filter: Vec::with_capacity(mul),
+            dvrm_filter: Vec::with_capacity(dvrm),
+            eq_ops: Vec::with_capacity(eq),
+            bytewise_ops: Vec::with_capacity(bytewise),
+            store_ops: Vec::with_capacity(store),
+        }
+    }
+
     /// Routes one CPU op into the segments its filters pick.
     #[inline]
     fn push(&mut self, op: CpuOp<'_>) {

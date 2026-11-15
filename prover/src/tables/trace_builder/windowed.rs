@@ -270,6 +270,8 @@ pub struct WindowedTraceBuilder<'a> {
     count_made: bool,
     /// [`Self::drop_cpu_list`].
     cpu_listless: bool,
+    /// [`Self::light_walk`]: 0, 1 or 2.
+    light_walk: u8,
     /// The split walker's counts ([`Self::count_where_made`]).
     own_counts: WalkCounts,
     /// The counts of the walkers of a run walked from its entries or its
@@ -559,6 +561,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             defer_ecrec: true,
             count_made: true,
             cpu_listless: true,
+            light_walk: 0,
             own_counts: WalkCounts::default(),
             made_counts: Vec::new(),
             walked_rows: WalkedRows::default(),
@@ -733,6 +736,41 @@ impl<'a> WindowedTraceBuilder<'a> {
             && self.lean.lookups
             && self.lean.route
             && !self.stream_memw_lt
+    }
+
+    /// The light walk of the walkers on threads ([`parallel`]): at `1`, a
+    /// record-mode window's cycles that are no ECALL are walked without
+    /// expanding their cells, each load or store reading its access record
+    /// (`HistoryOverlay::light`); at `2`, also each window routed by its
+    /// walker, batch by batch with its ops in cache, and their own lookups
+    /// counted there, into segments sized from the walker's last window,
+    /// which the accumulator appends instead of routing the window from its
+    /// logs. `0` (the default) is today's walk. The lists, the counts and the
+    /// tables are the same at every level; routing needs the walkers to count
+    /// where they make the rows ([`Self::counts_where_made`]) and is today's
+    /// without it. Before the first window only.
+    pub fn light_walk(mut self, level: u8) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "light_walk after a window was walked".to_string(),
+            ));
+        }
+        if level > 2 {
+            return Err(Error::Prover(format!(
+                "light_walk: level {level} (0, 1 or 2)"
+            )));
+        }
+        self.light_walk = level;
+        Ok(self)
+    }
+
+    /// The walkers' light walk in effect ([`Self::light_walk`]): its cells
+    /// skipped (`.0`) and its windows routed where walked (`.1`).
+    pub(crate) fn light_walks(&self) -> (bool, bool) {
+        (
+            self.light_walk >= 1,
+            self.light_walk >= 2 && self.counts_where_made(),
+        )
     }
 
     /// Collects the next window of the run's logs (not the last one: that is
@@ -1415,6 +1453,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             walk,
             logs: None,
             made: None,
+            routed: None,
         };
         super::build_stamps::mark("p0 last window");
         let Self {
@@ -1501,12 +1540,17 @@ impl<'a> WindowedTraceBuilder<'a> {
                     }
                     eprintln!(
                         "BLOCK WALK COUNTS: the walkers counted {} CPU ops, {} MEMW_R, {} MEMW_A and \
-                         {} SHIFT rows · routed by the accumulator · {walkers} walkers' counts added in \
+                         {} SHIFT rows · routed by the {} · {walkers} walkers' counts added in \
                          {:.3}s",
                         walked_rows.cpu,
                         walked_rows.memw_register,
                         walked_rows.memw_aligned,
                         walked_rows.shift,
+                        if walked_rows.routed > 0 {
+                            "walkers"
+                        } else {
+                            "accumulator"
+                        },
                         t.elapsed().as_secs_f64()
                     );
                 }
@@ -1754,6 +1798,10 @@ pub struct WalkedWindow {
     /// Its routing, made by its walker, which counted its rows
     /// ([`WindowedTraceBuilder::count_where_made`]); `None` otherwise.
     made: Option<WindowMade>,
+    /// Its CPU ops routed by its walker, their own lookups counted there
+    /// ([`WindowedTraceBuilder::light_walk`] at 2); `None` when the
+    /// accumulator routes it.
+    routed: Option<super::RoutedSegments>,
 }
 
 impl WalkedWindow {
@@ -1868,6 +1916,7 @@ impl Walker<'_> {
             self.defer_ecrec,
             self.counts.as_deref_mut(),
             list,
+            false,
             self.sizes,
             self.memory_state,
             self.register_state,
@@ -1912,6 +1961,7 @@ fn walk_window(
     defer_ecrec: bool,
     mut counts: Option<&mut WalkCounts>,
     list: bool,
+    route: bool,
     sizes: &mut WalkSizes,
     memory: &mut MemoryState,
     registers: &mut RegisterState,
@@ -1948,6 +1998,11 @@ fn walk_window(
     };
     // Counting where the rows are made: the window's last ECALL.
     let mut made = counts.is_some().then_some(None);
+    // Routing where the ops are (`route`, with the counts): each batch's ops
+    // routed and their own lookups counted while in cache, into segments
+    // sized from the walker's last window.
+    let mut router = (route && counts.is_some())
+        .then(|| super::CpuRouter::with_capacities(sizes.routed_for(logs.len())));
     // Without the list, each batch's ops in one buffer, reused.
     let mut from = 0usize;
     for part in logs.chunks(batch) {
@@ -1976,9 +2031,18 @@ fn walk_window(
                 counts.count_listed(&walk.bitwise_ops[marks.bitwise..]);
                 walk.bitwise_ops.truncate(marks.bitwise);
             }
+            if let Some(router) = router.as_mut() {
+                counts.route_batch(decode, &cpu_ops[start..], router);
+            }
         }
     }
+    let routed = router.map(|router| router.finish(&walk.cpu32_ops));
+    let last_routed = sizes.routed;
     *sizes = WalkSizes::of(&walk, logs.len());
+    match routed.as_ref() {
+        Some(segments) => sizes.set_routed(segments),
+        None => sizes.routed = last_routed,
+    }
     // Lists from the page-locked pool hold their sizing's slack: back to the
     // pool, as the window is walked.
     walk.give_back_tails();
@@ -1993,6 +2057,7 @@ fn walk_window(
         walk,
         logs: None,
         made,
+        routed,
     })
 }
 
@@ -2089,6 +2154,24 @@ impl WalkCounts {
         ));
     }
 
+    /// One batch's CPU ops routed into `router` and their own lookups (the
+    /// routing's, [`super::route_cpu_ops_into`]'s) counted.
+    fn route_batch(
+        &mut self,
+        decode: &DecodeTable,
+        cpu_ops: &[super::CpuOperation],
+        router: &mut super::CpuRouter,
+    ) {
+        let histogram = self
+            .histogram
+            .get_or_insert_with(bitwise::BitwiseHistogram::new);
+        for raw in cpu_ops {
+            let op = decode.op(raw);
+            op.count_bitwise_into(histogram);
+            router.push(op);
+        }
+    }
+
     /// Lookups the walk listed (each in-row CPU slot's `IS_HALF`), counted on
     /// the walker's thread.
     fn count_listed(&mut self, ops: &[super::BitwiseOperation]) {
@@ -2135,6 +2218,8 @@ struct WalkedRows {
     memw_register: usize,
     memw_aligned: usize,
     shift: usize,
+    /// Windows their walkers routed ([`WindowedTraceBuilder::light_walk`]).
+    routed: usize,
 }
 
 /// The accumulating half of a split builder ([`WindowedTraceBuilder::split`]).
@@ -2241,7 +2326,11 @@ impl Accumulator<'_> {
         // and LOAD ops when the walk left the lookups out (the list is then
         // empty), from the list otherwise. The one-pass routing appends to the
         // run's segments and counts the CPU ops' lookups as it goes.
-        if window.cpu_ops.len() != window.cycles {
+        if let Some(segments) = window.routed.take() {
+            // Its walker routed it and counted its CPU ops' lookups.
+            self.walked.routed += 1;
+            self.segments.append(segments);
+        } else if window.cpu_ops.len() != window.cycles {
             // Its walker kept no CPU list: routed from its logs, a batch at a
             // time ([`WindowedTraceBuilder::drop_cpu_list`]).
             let routed = match window.logs.as_deref() {
@@ -3255,6 +3344,7 @@ impl Kept {
             walk,
             logs,
             made: _,
+            routed: _,
         } = window;
         // A window whose walker kept its list: the run goes back to the list
         // from here, the tail's ops rebuilt from its logs, and its logs
@@ -4996,6 +5086,9 @@ mod count_made_tests;
 
 #[cfg(all(test, feature = "parallel"))]
 mod cpu_listless_tests;
+
+#[cfg(all(test, feature = "parallel"))]
+mod light_walk_tests;
 #[cfg(test)]
 mod register_words_tests;
 
