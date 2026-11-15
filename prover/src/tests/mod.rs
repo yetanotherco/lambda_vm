@@ -180,6 +180,8 @@ pub mod whir_hash_tests;
 #[cfg(test)]
 pub mod whir_identity_tests;
 #[cfg(test)]
+pub mod zc_work_census;
+#[cfg(test)]
 pub mod zf_air_cache_tests;
 #[cfg(test)]
 pub mod zf_lfm_bytes_tests;
