@@ -91,6 +91,114 @@ fn the_verifier_caps_the_residual_tables_rows() {
     assert!(check_residual_rows([28u8, 2]).is_err());
 }
 
+/// The block verifier's statement checks cap the residual register tables'
+/// rows: a statement whose three residual tables (MEMW_R's slot under the
+/// in-row register format) state 2^27 + 2^27 + 2^2 rows is refused by that
+/// cap, and one at 2^27 + 2^26 + 2^26 rows frames. The tables are found by
+/// their exact names, so the frame's own selection of them is what is read:
+/// a selection that missed one would pass the refused statement, and one that
+/// took any other table would refuse the statement at the cap.
+#[test]
+fn the_block_frame_caps_the_rows_its_residual_register_tables_state() {
+    use crate::tables::{bitwise, register_residual::cols as residual_cols};
+    let elf = asm_elf_bytes("all_instructions_64");
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let opts = ProofOptions::default_test_options();
+    let counts = crate::TableCounts {
+        cpu: 1,
+        memw_register: 3,
+        lt: 0,
+        memw: 0,
+        memw_aligned: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        shift: 0,
+        branch: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        copy: 0,
+        blake3: 0,
+        is_wh: 0,
+        ecrec: 0,
+    };
+    let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &[],
+        0,
+        usize::MAX,
+    )
+    .expect("the program's pages")
+    .len();
+    let n = crate::FIXED_TABLE_COUNT + counts.total().expect("fits") + pages;
+    let groups: Vec<Vec<u32>> = (0..n as u32).map(|i| vec![i]).collect();
+    let mut heights = vec![10u8; n];
+    heights[block_whir::BITWISE_TABLE] = bitwise::NUM_VARS as u8;
+    let format = in_row();
+    let frame = |heights: &[u8]| {
+        block_whir::block_frame(
+            block_whir::BlockStatement {
+                table_num_vars: heights,
+                runtime_page_ranges: &[],
+                table_counts: &counts,
+                public_output: &[],
+                num_private_input_pages: 0,
+                groups: &groups,
+            },
+            &elf,
+            &opts,
+            &format,
+        )
+    };
+    let honest = frame(&heights).expect("the small statement frames");
+    let residual: Vec<usize> = (0..counts.memw_register)
+        .map(|k| {
+            let refs = honest.airs.air_refs();
+            let at = refs
+                .iter()
+                .position(|air| air.name() == format!("MEMW_R[{k}]"))
+                .expect("a residual table in MEMW_R's slot");
+            assert_eq!(
+                refs[at].trace_layout().0,
+                residual_cols::NUM_COLUMNS,
+                "MEMW_R[{k}] is the residual register table"
+            );
+            at
+        })
+        .collect();
+    let stated = |vars: [u8; 3]| {
+        let mut h = heights.clone();
+        for (&at, v) in residual.iter().zip(vars) {
+            h[at] = v;
+        }
+        h
+    };
+    let at_cap = frame(&stated([27, 26, 26]));
+    assert!(
+        at_cap.is_ok(),
+        "2^28 residual rows, the cap, frame: {:?}",
+        at_cap.err()
+    );
+    let over = frame(&stated([27, 27, 2]))
+        .err()
+        .expect("2^28 + 4 residual rows are refused");
+    let message = over.to_string();
+    assert!(
+        message.contains(&format!(
+            "the residual register table states {} rows",
+            (1u64 << 28) + 4
+        )),
+        "refused by the residual cap: {message}"
+    );
+}
+
 /// The production format under the in-row register format.
 fn in_row() -> BlockFormat {
     BlockFormat {
