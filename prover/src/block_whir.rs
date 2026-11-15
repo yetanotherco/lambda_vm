@@ -1602,21 +1602,21 @@ fn parse_walkers(value: Option<&str>) -> Result<usize, Error> {
 
 /// The rest's layout bytes ([`BlockOptions::rest_layout_bytes`]). On the
 /// streamed finish that slides (production) they are its byte gate's budget:
-/// what the rest holds built and not yet placed, or building. At 2 GiB the
-/// large block's gate filled and its builds waited for room (≈ 1.3 s); with
-/// at most [`BLOCK_REST_BUILD_BYTES`] building at once, the first tables the
-/// packer needs build as they did at 2 GiB. Where the rest is laid out in
-/// waves (the finish not streamed, or not sliding) they bound the rows each
-/// wave transposes: each transposition is parallel within its table, so a
-/// wave of a few tables keeps the cores busy while bounding the copies in
-/// flight.
-pub const BLOCK_REST_LAYOUT_BYTES: usize = 4 << 30;
+/// what the rest holds built and not yet placed, or building, so they bound
+/// the host memory the finish adds. A family's first table is admitted on an
+/// estimate of eight bytes a cell, so a smaller gate, or a build cap under it,
+/// starts the rest's tables one after another as earlier ones end; at 8 GiB,
+/// building up to the gate, they start as the packer needs them. Where the
+/// rest is laid out in waves (the finish not streamed, or not sliding) they
+/// bound the rows each wave transposes: each transposition is parallel within
+/// its table, so a wave of a few tables keeps the cores busy while bounding
+/// the copies in flight.
+pub const BLOCK_REST_LAYOUT_BYTES: usize = 8 << 30;
 
 /// The estimated bytes of the rest's tables the sliding finish builds at once
-/// by default ([`BlockOptions::rest_build_bytes`]), apart from the gate's
-/// [`BLOCK_REST_LAYOUT_BYTES`]: more builds at once on the shared pool slow
-/// the first tables the packer needs.
-pub const BLOCK_REST_BUILD_BYTES: usize = 2 << 30;
+/// by default ([`BlockOptions::rest_build_bytes`]): the gate's
+/// [`BLOCK_REST_LAYOUT_BYTES`], so the gate alone bounds what builds.
+pub const BLOCK_REST_BUILD_BYTES: usize = 8 << 30;
 
 /// `BLOCK_WHIR_REST_BUILD=<MiB>`: the real-block tests' choice of
 /// [`BlockOptions::rest_build_bytes`]; unset leaves production's
@@ -10478,9 +10478,9 @@ mod rest_slide_knob_tests {
         assert!(options.rest_streams());
         assert_eq!(
             rest_layout_label(&options, true),
-            "a gate of 4096 MiB, sliding (no waves)"
+            "a gate of 8192 MiB, sliding (no waves)"
         );
-        assert_eq!(rest_layout_label(&options, false), "waves of 4096 MiB");
+        assert_eq!(rest_layout_label(&options, false), "waves of 8192 MiB");
         options.rest_layout_bytes = None;
         assert_eq!(
             rest_layout_label(&options, true),
@@ -10496,13 +10496,15 @@ mod rest_slide_knob_tests {
         assert_eq!(rest_layout_label(&options, true), "waves of 2048 MiB");
     }
 
-    /// The rest holds up to 4 GiB with at most 2 GiB building by default; the
-    /// harness's words 2048 / 2048 are the earlier default (a cap equal to the
-    /// gate's budget is the gate alone).
+    /// The rest holds up to 8 GiB, building up to the gate, by default;
+    /// `BLOCK_WHIR_REST_LAYOUT` and `BLOCK_WHIR_REST_BUILD` set either in MiB
+    /// (a cap equal to the gate's budget is the gate alone).
     #[test]
-    fn the_rest_holds_4_gib_with_at_most_2_gib_building_by_default() {
-        assert_eq!(BLOCK_REST_LAYOUT_BYTES, 4 << 30);
-        assert_eq!(BLOCK_REST_BUILD_BYTES, 2 << 30);
+    fn the_rest_holds_8_gib_building_up_to_the_gate_by_default() {
+        assert_eq!(BLOCK_REST_LAYOUT_BYTES, 8 << 30);
+        assert_eq!(BLOCK_REST_BUILD_BYTES, 8 << 30);
+        assert_eq!(BLOCK_REST_BUILD_BYTES, BLOCK_REST_LAYOUT_BYTES);
+        assert_eq!(parse_rest_build(Some("4096")), Ok(Some(4 << 30)));
         let options = BlockOptions::production();
         assert_eq!(options.rest_layout_bytes, Some(BLOCK_REST_LAYOUT_BYTES));
         assert_eq!(options.rest_build_bytes, Some(BLOCK_REST_BUILD_BYTES));

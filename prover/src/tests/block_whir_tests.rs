@@ -4709,7 +4709,7 @@ fn block_whir_on_a_real_block() {
     // ECSM split (production 2^18 / 2^17).
     crate::block_whir::chunk_cuts_from_env(&mut options);
     println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
-    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 4096): the rest's layout
+    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 8192): the rest's layout
     // in waves.
     crate::block_whir::rest_layout_from_env(&mut options);
     println!(

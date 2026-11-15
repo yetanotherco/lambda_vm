@@ -575,8 +575,8 @@ impl WhirTreeConfig {
         // `BLOCK_WHIR_KECCAK_LOG2=k`, `BLOCK_WHIR_ECSM_LOG2=k`: force a KECCAK or
         // ECSM split (production 2^18 / 2^17).
         block_whir::chunk_cuts_from_env(&mut options);
-        // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 4096) and
-        // `BLOCK_WHIR_REST_BUILD=<MiB>` (production 2048): the rest's gate (its
+        // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 8192) and
+        // `BLOCK_WHIR_REST_BUILD=<MiB>` (production 8192): the rest's gate (its
         // waves where it is laid out in waves) and the bytes it builds at once.
         block_whir::rest_layout_from_env(&mut options);
         let super::compress::CompressPlan {
