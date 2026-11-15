@@ -2101,9 +2101,6 @@ impl WalkOutputs {
         }
     }
 
-    /// [`Self::for_walk`] with the streamed lists sized from an earlier walk's
-    /// lengths per cycle (`sizes`, an eighth over), so a window's lists are
-    /// allocated once instead of grown from empty or from a fixed guess.
     /// A window's side records under the in-row register format (one a CPU
     /// op, `cpu_ops` of them): from the page-locked pool when it is on, as the
     /// card's CPU fill uploads them with the chunk's logs.
@@ -2111,6 +2108,9 @@ impl WalkOutputs {
         self.cpu_side = for_the_card(cpu_ops);
     }
 
+    /// [`Self::for_walk`] with the streamed lists sized from an earlier walk's
+    /// lengths per cycle (`sizes`, an eighth over), so a window's lists are
+    /// allocated once instead of grown from empty or from a fixed guess.
     pub(crate) fn for_walk_sized(
         cpu_ops: usize,
         lookups: bool,
