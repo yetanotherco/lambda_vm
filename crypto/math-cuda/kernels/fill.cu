@@ -165,6 +165,39 @@ struct StoreOpC {
 static_assert(sizeof(StoreOpC) == 32, "StoreOpC is 32 bytes");
 static_assert(offsetof(StoreOpC, write2) == 24, "StoreOpC field order");
 
+// One fused aligned CPU load (the prover's `MemLoadRow`): the address, the
+// timestamp, the step to its bytes' old timestamp less one (`ts − old − 1`,
+// two 16-bit limbs), the result's eight bytes (the loaded bytes, then the
+// sign or zero fill), the width and whether it sign-extends (0 or 1).
+struct MemLoadRowC {
+    uint64_t address;
+    uint64_t timestamp;
+    uint32_t step;
+    uint8_t res[8];
+    uint8_t width;
+    uint8_t is_signed;
+    uint8_t pad[2];
+};
+static_assert(sizeof(MemLoadRowC) == 32, "MemLoadRowC is 32 bytes");
+static_assert(offsetof(MemLoadRowC, res) == 20, "MemLoadRowC field order");
+static_assert(offsetof(MemLoadRowC, width) == 28, "MemLoadRowC field order");
+
+// One fused aligned CPU store (the prover's `MemStoreRow`): the address, the
+// timestamp, the step as a load's, the width, the eight bytes written and the
+// eight bytes they replace, packed a word each.
+struct MemStoreRowC {
+    uint64_t address;
+    uint64_t timestamp;
+    uint32_t step;
+    uint8_t width;
+    uint8_t pad[3];
+    uint64_t value;
+    uint64_t old;
+};
+static_assert(sizeof(MemStoreRowC) == 40, "MemStoreRowC is 40 bytes");
+static_assert(offsetof(MemStoreRowC, width) == 20, "MemStoreRowC field order");
+static_assert(offsetof(MemStoreRowC, value) == 24, "MemStoreRowC field order");
+
 // One SHIFT op (`shift.rs`, `ShiftOperation`): the full shift amount, the input
 // as four 16-bit halves, the amount's low byte, and flags 0 or 1.
 struct ShiftOpC {
@@ -426,6 +459,107 @@ extern "C" __global__ void fill_store(const StoreOpC *ops, uint64_t n, uint64_t 
     w.word(c::WRITE4, op.write4 != 0);
     w.word(c::WRITE8, op.write8 != 0);
     w.dword_bl(c::VALUE, op.value);
+    w.word(c::MU, 1);
+}
+
+// ---------------------------------------------------------------------------
+// MEM_LOAD and MEM_STORE: the aligned CPU loads and stores checked in one row
+// with their memory tokens (the fused memory format). A row is LOAD's (STORE's)
+// columns and MEMW_A's: the address as MEMW_A's (low half, middle half, high
+// word), the timestamp as two words, the width flags, the bytes, the step's two
+// 16-bit limbs, μ.
+// ---------------------------------------------------------------------------
+
+namespace mem_load_cols {
+constexpr uint32_t BASE_ADDRESS = 0;  // 3 columns: half, half, word
+constexpr uint32_t TIMESTAMP_0 = 3;   // 2 columns
+constexpr uint32_t READ2 = 5;
+constexpr uint32_t READ4 = 6;
+constexpr uint32_t READ8 = 7;
+constexpr uint32_t SIGNED = 8;
+constexpr uint32_t RES = 9;  // 8 columns
+constexpr uint32_t SIGN_BIT = 17;
+constexpr uint32_t STEP_0 = 18;
+constexpr uint32_t STEP_1 = 19;
+constexpr uint32_t MU = 20;
+constexpr uint32_t NUM_COLUMNS = 21;
+}  // namespace mem_load_cols
+
+namespace mem_store_cols {
+constexpr uint32_t BASE_ADDRESS = 0;  // 3 columns
+constexpr uint32_t TIMESTAMP_0 = 3;   // 2 columns
+constexpr uint32_t WRITE2 = 5;
+constexpr uint32_t WRITE4 = 6;
+constexpr uint32_t WRITE8 = 7;
+constexpr uint32_t VALUE = 8;  // 8 columns
+constexpr uint32_t OLD = 16;   // 8 columns
+constexpr uint32_t STEP_0 = 24;
+constexpr uint32_t STEP_1 = 25;
+constexpr uint32_t MU = 26;
+constexpr uint32_t NUM_COLUMNS = 27;
+}  // namespace mem_store_cols
+
+namespace fill {
+
+// `set_dword_whh`: the low and middle halves, then the high word (MEMW_A's
+// address).
+__device__ __forceinline__ void address_whh(const RowWriter &w, uint32_t col, uint64_t a) {
+    w.word(col, a & 0xFFFFull);
+    w.word(col + 1, (a >> 16) & 0xFFFFull);
+    w.word(col + 2, a >> 32);
+}
+
+}  // namespace fill
+
+// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_mem_load(const MemLoadRowC *rows, uint64_t n, uint64_t height,
+                                         uint64_t *out) {
+    namespace c = mem_load_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const MemLoadRowC r = rows[row];
+    fill::address_whh(w, c::BASE_ADDRESS, r.address);
+    w.dword_wl(c::TIMESTAMP_0, r.timestamp);
+    w.word(c::READ2, r.width == 2);
+    w.word(c::READ4, r.width == 4);
+    w.word(c::READ8, r.width == 8);
+    w.word(c::SIGNED, r.is_signed != 0);
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) w.word(c::RES + i, r.res[i]);
+    // LOAD's `compute_sign_bit`: the top bit of the highest byte read.
+    const uint32_t top = r.width == 2 ? 1 : (r.width == 4 ? 3 : (r.width == 8 ? 7 : 0));
+    w.word(c::SIGN_BIT, (r.res[top] >> 7) & 1);
+    w.word(c::STEP_0, r.step & 0xFFFFu);
+    w.word(c::STEP_1, r.step >> 16);
+    w.word(c::MU, 1);
+}
+
+// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_mem_store(const MemStoreRowC *rows, uint64_t n, uint64_t height,
+                                          uint64_t *out) {
+    namespace c = mem_store_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const MemStoreRowC r = rows[row];
+    fill::address_whh(w, c::BASE_ADDRESS, r.address);
+    w.dword_wl(c::TIMESTAMP_0, r.timestamp);
+    w.word(c::WRITE2, r.width == 2);
+    w.word(c::WRITE4, r.width == 4);
+    w.word(c::WRITE8, r.width == 8);
+    w.dword_bl(c::VALUE, r.value);
+    w.dword_bl(c::OLD, r.old);
+    w.word(c::STEP_0, r.step & 0xFFFFu);
+    w.word(c::STEP_1, r.step >> 16);
     w.word(c::MU, 1);
 }
 

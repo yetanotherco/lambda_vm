@@ -155,6 +155,37 @@ pub struct StoreOp {
     pub write8: u8,
 }
 
+/// One fused aligned CPU load as its fill reads it (the prover's fused load
+/// row, field for field): the address, the timestamp, the step to its bytes'
+/// old timestamp less one (two 16-bit limbs), the result's bytes with their
+/// fill, the width, whether it sign-extends (0 or 1), and padding 0.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemLoadRow {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub res: [u8; 8],
+    pub width: u8,
+    pub signed: u8,
+    pub pad: [u8; 2],
+}
+
+/// One fused aligned CPU store as its fill reads it (the prover's fused store
+/// row, field for field): the address, the timestamp, the step as a load's,
+/// the width, padding 0, and the bytes written and replaced, a word each.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemStoreRow {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub width: u8,
+    pub pad: [u8; 3],
+    pub value: u64,
+    pub old: u64,
+}
+
 /// One SHIFT op as its fill reads it (the prover's shift op, field for
 /// field): the full shift amount, the input as four 16-bit halves, the
 /// amount's low byte, and flags 0 or 1.
@@ -244,6 +275,12 @@ const _: () = {
     assert!(offset_of!(LoadOp, res) == 18);
     assert!(size_of::<StoreOp>() == 32);
     assert!(offset_of!(StoreOp, write8) == 26);
+    assert!(size_of::<MemLoadRow>() == 32);
+    assert!(offset_of!(MemLoadRow, res) == 20);
+    assert!(offset_of!(MemLoadRow, width) == 28);
+    assert!(size_of::<MemStoreRow>() == 40);
+    assert!(offset_of!(MemStoreRow, width) == 20);
+    assert!(offset_of!(MemStoreRow, value) == 24);
     assert!(size_of::<ShiftOp>() == 24);
     assert!(offset_of!(ShiftOp, word_instr) == 19);
     assert!(size_of::<MemwOp>() == 152);
@@ -394,6 +431,11 @@ pub enum RecordsFill<'a> {
     Load { ops: Vec<&'a [LoadOp]> },
     /// STORE's rows: one an op of the pieces in order, then zero rows.
     Store { ops: Vec<&'a [StoreOp]> },
+    /// MEM_LOAD's rows (the fused memory format): the pieces in order, then
+    /// zero rows.
+    MemLoad { rows: Vec<&'a [MemLoadRow]> },
+    /// MEM_STORE's rows: the pieces in order, then zero rows.
+    MemStore { rows: Vec<&'a [MemStoreRow]> },
     /// SHIFT's rows: one an op of the pieces in order, then padding rows.
     Shift { ops: Vec<&'a [ShiftOp]> },
     /// MEMW's rows: one an op of the pieces in order, then zero rows.
@@ -419,6 +461,8 @@ impl RecordsFill<'_> {
             Self::MemwA { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::Load { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::Store { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
+            Self::MemLoad { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
+            Self::MemStore { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::Shift { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::Memw { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
         }
@@ -433,6 +477,8 @@ impl RecordsFill<'_> {
             Self::MemwA { rows } => rows.iter().map(|p| p.len()).sum(),
             Self::Load { ops } => ops.iter().map(|p| p.len()).sum(),
             Self::Store { ops } => ops.iter().map(|p| p.len()).sum(),
+            Self::MemLoad { rows } => rows.iter().map(|p| p.len()).sum(),
+            Self::MemStore { rows } => rows.iter().map(|p| p.len()).sum(),
             Self::Shift { ops } => ops.iter().map(|p| p.len()).sum(),
             Self::Memw { ops } => ops.iter().map(|p| p.len()).sum(),
         }
@@ -530,6 +576,30 @@ impl RecordsFill<'_> {
                             | u64::from(op.write4) << 8
                             | u64::from(op.write8) << 16,
                     );
+                }
+            }
+            // The fields alone: the padding is named, but read here as 0 anyway.
+            Self::MemLoad { rows } => {
+                each(8);
+                for row in rows.iter().flat_map(|piece| piece.iter()) {
+                    each(row.address);
+                    each(row.timestamp);
+                    each(
+                        u64::from(row.step)
+                            | u64::from(row.width) << 32
+                            | u64::from(row.signed) << 40,
+                    );
+                    each(u64::from_le_bytes(row.res));
+                }
+            }
+            Self::MemStore { rows } => {
+                each(9);
+                for row in rows.iter().flat_map(|piece| piece.iter()) {
+                    each(row.address);
+                    each(row.timestamp);
+                    each(u64::from(row.step) | u64::from(row.width) << 32);
+                    each(row.value);
+                    each(row.old);
                 }
             }
             Self::Shift { ops } => {
