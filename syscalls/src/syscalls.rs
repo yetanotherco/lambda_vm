@@ -369,6 +369,13 @@ pub fn ecrecover_addresses_ok(out: u64, sig: u64, msg: u64) -> bool {
 /// big-endian each, and a little-endian status doubleword, 0 when the call computed the
 /// key and 1 when it bailed (the key bytes are then zero and the caller must recover
 /// the key another way). `sig` and `msg` must not overlap; `out` may alias either.
+///
+/// Status 1 means "not computed, recompute in software". It NEVER means "invalid
+/// signature": nothing proves a bail, so a prover may answer 1 for any call, a
+/// valid signature included. A caller that treated 1 as a rejection would let the
+/// prover refuse valid signatures at will; on 1, recover the key in software (which
+/// also decides whether the signature is invalid). Pre-fill the status with a
+/// nonzero value so a call that wrote nothing also reads as "recompute".
 pub fn ecrecover(out: &mut [u8; 72], sig: &[u8; 64], msg: &[u8; 32], parity: u64) {
     unsafe {
         asm!(
