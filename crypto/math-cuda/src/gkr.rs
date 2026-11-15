@@ -1214,6 +1214,45 @@ pub mod fused_input {
     pub(super) fn fault() -> u32 {
         u32::from(FAULT.load(Ordering::Relaxed))
     }
+
+    static TILES_FORCED: AtomicU8 = AtomicU8::new(0);
+
+    /// Whether the fused writer walks a tile of rows across every slot group
+    /// before the next tile, so a row's columns are read back from L2 by the
+    /// other slots' terms. Only the order of the writes changes. On by default;
+    /// `LAMBDA_VM_GKR_INPUT_ROW_TILES=0` walks slot by slot as before.
+    pub fn row_tiles() -> bool {
+        match TILES_FORCED.load(Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("LAMBDA_VM_GKR_INPUT_ROW_TILES")
+                .map_or(true, |v| v != "0" && v != "false")
+        })
+    }
+
+    /// Forces [`row_tiles`]; `None` back to the environment's word.
+    #[doc(hidden)]
+    pub fn force_row_tiles(on: Option<bool>) {
+        TILES_FORCED.store(
+            match on {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// ⛔ A FAULT, a negative control's only: under the row tiles, each task
+    /// reads its row one off inside its tile and writes where the right row goes.
+    #[doc(hidden)]
+    pub fn force_tile_fault(on: bool) {
+        FAULT.store(if on { 2 } else { 0 }, Ordering::Relaxed);
+    }
 }
 
 /// [`input_from_columns`] and the two tree levels above the layer in one pass
@@ -1251,6 +1290,12 @@ pub fn input_fold2_from_columns(
     let stored_arg = stored_slots as u64;
     let cube_arg = cube as u64;
     let fault = fused_input::fault();
+    // Row tiles of 256 rows, or the whole table when it is shorter (a power of two).
+    let tile: u64 = if fused_input::row_tiles() {
+        (rows as u64).min(256)
+    } else {
+        0
+    };
     unsafe {
         stream
             .launch_builder(&be.gkr_input_fold2_from_columns)
@@ -1270,6 +1315,7 @@ pub fn input_fold2_from_columns(
             .arg(&mut p_out)
             .arg(&mut q_out)
             .arg(&fault)
+            .arg(&tile)
             .launch(LaunchConfig {
                 grid_dim: ((quarter as u64).div_ceil(256).clamp(1, 8192) as u32, 1, 1),
                 block_dim: (256, 1, 1),

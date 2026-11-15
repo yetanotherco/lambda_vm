@@ -1143,11 +1143,14 @@ fn the_two_level_tree_folds_build_todays_levels() {
 /// ★ The input layer written with the two tree levels above it
 /// (`gkr::fused_input`, on by default; `LAMBDA_VM_GKR_FUSED_INPUT=0` writes the
 /// layer and folds it as before) makes the same layer and the same tree: over
-/// random columns and random input plans of 4, 5 and 7 interactions at 8 and 64
-/// rows, kept whole (the padding's `0/1` written, `from_device`) and truncated
-/// (only the real cells, `from_truncated_input`), the input cells and every
-/// level above them are bit for bit the plain writer's. Then the fused pass's
-/// upper cells off by one must part, so the comparison is load-bearing.
+/// random columns and random input plans of 4, 5 and 7 interactions at 8, 64
+/// and 1024 rows, kept whole (the padding's `0/1` written, `from_device`) and
+/// truncated (only the real cells, `from_truncated_input`), the input cells and
+/// every level above them are bit for bit the plain writer's, walked slot by
+/// slot and by row tiles (`fused_input::row_tiles`; 1024 rows is four tiles).
+/// Then the fused pass's upper cells off by one, and under the row tiles each
+/// row read one off inside its tile, must each part, so the comparison is
+/// load-bearing.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
@@ -1160,6 +1163,7 @@ fn the_fused_input_writes_todays_layer_and_tree() {
         fn drop(&mut self) {
             fused_input::force(None);
             fused_input::force_fault(false);
+            fused_input::force_row_tiles(None);
         }
     }
     let _back = Back;
@@ -1173,7 +1177,7 @@ fn the_fused_input_writes_todays_layer_and_tree() {
     };
     let mut checked = 0;
     for interactions in [4usize, 5, 7] {
-        for rows in [8usize, 64] {
+        for rows in [8usize, 64, 1024] {
             let width = 6usize;
             let columns: Vec<u64> = (0..width * rows).map(|_| rng.next() % MODULUS).collect();
             // Each side: a constant and up to three terms on random columns and shifts.
@@ -1227,16 +1231,36 @@ fn the_fused_input_writes_todays_layer_and_tree() {
                     stream.clone_dtoh(&q).unwrap(),
                 );
                 let today = levels(&tree_of(p, q, None));
-                let ((p, q), top) = input_fold2_from_columns(&stream, &view, rows, &plan, padding)
+                let what = format!("{interactions} interactions, {rows} rows, padding {padding}");
+                for tiles in [true, false] {
+                    fused_input::force_row_tiles(Some(tiles));
+                    let ((p, q), top) =
+                        input_fold2_from_columns(&stream, &view, rows, &plan, padding)
+                            .expect("fused write");
+                    let fused_input_cells = (
+                        stream.clone_dtoh(&p).unwrap(),
+                        stream.clone_dtoh(&q).unwrap(),
+                    );
+                    let fused = levels(&tree_of(p, q, Some(top)));
+                    assert_eq!(
+                        fused_input_cells, today_input,
+                        "{what}, row tiles {tiles}: the input cells"
+                    );
+                    assert_eq!(fused, today, "{what}, row tiles {tiles}: the levels");
+                }
+                fused_input::force_row_tiles(Some(true));
+                fused_input::force_tile_fault(true);
+                let ((p, q), _top) = input_fold2_from_columns(&stream, &view, rows, &plan, padding)
                     .expect("fused write");
-                let fused_input_cells = (
+                let tile_faulted = (
                     stream.clone_dtoh(&p).unwrap(),
                     stream.clone_dtoh(&q).unwrap(),
                 );
-                let fused = levels(&tree_of(p, q, Some(top)));
-                let what = format!("{interactions} interactions, {rows} rows, padding {padding}");
-                assert_eq!(fused_input_cells, today_input, "{what}: the input cells");
-                assert_eq!(fused, today, "{what}: the levels");
+                fused_input::force_tile_fault(false);
+                assert_ne!(
+                    tile_faulted, today_input,
+                    "{what}: the row-tile fault must part"
+                );
                 fused_input::force_fault(true);
                 let ((p, q), top) = input_fold2_from_columns(&stream, &view, rows, &plan, padding)
                     .expect("fused write");
@@ -1247,7 +1271,10 @@ fn the_fused_input_writes_todays_layer_and_tree() {
             }
         }
     }
-    eprintln!("gkr fused input: {checked} layers and trees as today's; every fault parted");
+    eprintln!(
+        "gkr fused input: {checked} layers and trees as today's, slot by slot and by row tiles; \
+         every fault parted"
+    );
 }
 
 /// ★ The production switches (fused on, the corners skipped, no

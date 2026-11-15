@@ -1584,17 +1584,36 @@ extern "C" __global__ __launch_bounds__(256) void gkr_input_fold2_from_columns(
     const uint64_t *__restrict__ d_coeffs, const uint64_t *__restrict__ d_constants,
     uint64_t interactions, uint64_t stored_slots, uint64_t cube, uint64_t *__restrict__ p,
     uint64_t *__restrict__ q, uint64_t *__restrict__ p_mid, uint64_t *__restrict__ q_mid,
-    uint64_t *__restrict__ p_out, uint64_t *__restrict__ q_out, uint32_t fault) {
+    uint64_t *__restrict__ p_out, uint64_t *__restrict__ q_out, uint32_t fault, uint64_t tile) {
     uint64_t quarter = cube / 4;
     uint64_t stored = stored_slots * rows;
-    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < quarter;
-         i += (uint64_t)gridDim.x * blockDim.x) {
+    // With `tile` (row tiles, a power of two dividing `rows`, and `quarter` a whole number of slot
+    // rows), the task order walks a tile of rows across every slot group before the next tile, so
+    // the columns a row's terms read are read back from L2 by the other slots' terms. The same
+    // cells either way: only the order changes.
+    uint64_t groups = (tile && quarter % rows == 0) ? quarter / rows : 0;
+    for (uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; task < quarter;
+         task += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t i = task, src = task;
+        if (groups) {
+            uint64_t span = groups * tile;
+            uint64_t at = task - (task / span) * span;
+            uint64_t group = at / tile;
+            uint64_t row = (task / span) * tile + (at - group * tile);
+            i = group * rows + row;
+            src = i;
+            // ⛔ A negative control's fault only (2): each task reads its row one off inside its
+            // tile and writes where the right row goes.
+            if (fault == 2)
+                src = group * rows + (task / span) * tile + ((at - group * tile + 1) & (tile - 1));
+        }
         Fe3 pc[4], qc[4];
 #pragma unroll
         for (int k = 0; k < 4; k++) {
             uint64_t cell = i + (uint64_t)k * quarter;
-            uint64_t s = cell / rows;
-            uint64_t r = cell - s * rows;
+            uint64_t from = src + (uint64_t)k * quarter;
+            uint64_t s = from / rows;
+            uint64_t r = from - s * rows;
             gkr_input_cell(d_columns, rows, d_side_start, d_terms, d_coeffs, d_constants,
                            interactions, s, r, pc[k], qc[k]);
             if (cell < stored) {
@@ -1611,8 +1630,8 @@ extern "C" __global__ __launch_bounds__(256) void gkr_input_fold2_from_columns(
         store_ext(q_mid + (i + quarter) * 3, qb);
         Fe3 pu, qu;
         fraction_pair(pa, pb, qa, qb, pu, qu);
-        // ⛔ A negative control's fault only: the upper cell off by one.
-        if (fault) pu = ext3::add(pu, ext3::one());
+        // ⛔ A negative control's fault only (1): the upper cell off by one.
+        if (fault == 1) pu = ext3::add(pu, ext3::one());
         store_ext(p_out + i * 3, pu);
         store_ext(q_out + i * 3, qu);
     }
