@@ -40,7 +40,7 @@ fn ext(seed: u64) -> EE {
     ])
 }
 
-/// D-ARGUE units a row of each phase at `2^n` rows, and the total.
+/// The op model's units a row of each phase at `2^n` rows, and the total.
 fn per_row(counters: &Counters, n: usize) -> (Vec<(&'static str, f64)>, f64) {
     let rows = (1u64 << n) as f64;
     let phases: Vec<(&'static str, f64)> = counters
