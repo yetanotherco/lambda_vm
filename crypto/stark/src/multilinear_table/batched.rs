@@ -753,6 +753,8 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
+    // Measurement: what the argue spends outside the split's terms.
+    let entered = std::time::Instant::now();
     let beta = beta.clone();
     let statements: Vec<TableStatement<'_, F, E>> = tables.iter().map(|t| t.statement()).collect();
     let shapes: Vec<ArgueShape> = statements.iter().map(ArgueShape::of).collect();
@@ -761,6 +763,8 @@ where
         faults.bin_log_cells.unwrap_or(bin_log_cells),
         faults.pack.unwrap_or(pack),
     );
+    let planned = entered.elapsed().as_secs_f64();
+    let instantiating = std::time::Instant::now();
     let interactions: Vec<Vec<Interaction<E>>> = tables
         .iter()
         .map(|table| {
@@ -773,6 +777,7 @@ where
             )
         })
         .collect::<Result<_, _>>()?;
+    let instantiated = instantiating.elapsed().as_secs_f64();
     // Each tree's interactions, table order then chunk order: a whole table's
     // own list, or a chunk of it.
     let mut lists: Vec<std::borrow::Cow<'_, [Interaction<E>]>> = Vec::with_capacity(plan.trees());
@@ -808,6 +813,7 @@ where
         }
     };
     let mut split = ArgueSplit::default();
+    let before_trees = entered.elapsed().as_secs_f64();
     let gruen_layers = multilinear::gkr_gruen::gruen_layers();
     // ── G: a ladder per bin, its outputs absorbed just before it ──────────
     let mut bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>> = vec![None; plan.trees()];
@@ -1112,6 +1118,13 @@ where
     }
     split.reduce += started.elapsed().as_secs_f64();
     if multilinear::whir_split::enabled() {
+        let total = entered.elapsed().as_secs_f64();
+        eprintln!(
+            "BATCHED ARGUE PREP: statements and plan {planned:.3}s · interactions instantiated \
+             {instantiated:.3}s · all before the trees {before_trees:.3}s · whole argue so far {total:.3}s · \
+             outside the split {:.3}s",
+            total - split.trees - split.ladders - split.zc_setup - split.zc_rounds - split.reduce
+        );
         // The Gruen count is the process's: an argue running beside this one
         // adds its layers too.
         eprintln!(
