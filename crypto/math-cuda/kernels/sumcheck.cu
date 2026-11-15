@@ -974,6 +974,62 @@ extern "C" __global__ void zc_bus_column(const uint64_t *const *__restrict__ d_f
     }
 }
 
+// `zc_bus_u_store`: `zc_bus_u`, and each row's `L0 = a₀ + Σ a_k·f_k` kept in `d_l0` at
+// `(x + bc·q)·3`, the row the factors index. Folding `L0` by the round-0 and round-1 challenges
+// gives `L` over the quarter exactly (the weights sum to one), so `zc_bus_column` is not needed.
+extern "C" __global__ __launch_bounds__(256) void zc_bus_u_store(
+    const uint64_t *const *__restrict__ d_factors, uint64_t q,
+    const uint32_t *__restrict__ d_term_slots, const uint64_t *__restrict__ d_term_coeffs,
+    uint64_t num_terms, const uint64_t *__restrict__ d_constant,
+    const uint64_t *__restrict__ d_eq_rho, uint64_t *__restrict__ d_partials, uint64_t stride,
+    uint64_t *__restrict__ d_l0) {
+    Fe3 u[4] = {ext3::zero(), ext3::zero(), ext3::zero(), ext3::zero()};
+    Fe3 a0 = load_ext(d_constant);
+    for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < q;
+         x += (uint64_t)gridDim.x * blockDim.x) {
+        Fe3 l[4] = {a0, a0, a0, a0};
+        for (uint64_t k = 0; k < num_terms; k++) {
+            const uint64_t *column = d_factors[d_term_slots[k]];
+            Fe3 coeff = load_ext(d_term_coeffs + k * 3);
+            for (uint32_t bc = 0; bc < 4; bc++) {
+                l[bc] = ext3::add(l[bc], ext3::mul_base(coeff, column[(x + bc * q) * stride]));
+            }
+        }
+        Fe3 w = load_ext(d_eq_rho + x * 3);
+        for (uint32_t bc = 0; bc < 4; bc++) {
+            u[bc] = ext3::add(u[bc], ext3::mul(w, l[bc]));
+            uint64_t *at = d_l0 + (x + bc * q) * 3;
+            at[0] = l[bc].a;
+            at[1] = l[bc].b;
+            at[2] = l[bc].c;
+        }
+    }
+    extern __shared__ uint64_t shared[];
+    for (uint32_t bc = 0; bc < 4; bc++) {
+        shared[threadIdx.x * 3 + 0] = u[bc].a;
+        shared[threadIdx.x * 3 + 1] = u[bc].b;
+        shared[threadIdx.x * 3 + 2] = u[bc].c;
+        __syncthreads();
+        for (uint32_t width = blockDim.x / 2; width > 0; width >>= 1) {
+            if (threadIdx.x < width) {
+                Fe3 sum = ext3::add(load_ext(shared + threadIdx.x * 3),
+                                    load_ext(shared + (threadIdx.x + width) * 3));
+                shared[threadIdx.x * 3 + 0] = sum.a;
+                shared[threadIdx.x * 3 + 1] = sum.b;
+                shared[threadIdx.x * 3 + 2] = sum.c;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            uint64_t at = ((uint64_t)bc * gridDim.x + blockIdx.x) * 3;
+            d_partials[at + 0] = shared[0];
+            d_partials[at + 1] = shared[1];
+            d_partials[at + 2] = shared[2];
+        }
+        __syncthreads();
+    }
+}
+
 // `eq(a_{>j+1}, ·)` from `eq(a_{>j}, ·)` in place: `t[x] += t[x + half]`.
 extern "C" __global__ void zc_halve(uint64_t *__restrict__ table, uint64_t half) {
     for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < half;

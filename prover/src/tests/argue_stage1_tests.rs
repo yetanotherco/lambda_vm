@@ -975,6 +975,102 @@ fn the_fused_rounds_on_the_card_send_todays_messages() {
     );
 }
 
+/// ★ The bus column from rounds 0–1's rows (`argue_fused::bus_rows`, on by
+/// default; `LAMBDA_VM_ZC_BUS_FROM_ROWS=0` is the folded factors' column) sends
+/// today's messages: on every table at 2^8 (or the height the card takes it
+/// at) and on the Q1 tables at 2^10 and 2^12, with it on and off, the card's
+/// rounds at the crossover and then down to two cells, against today's host
+/// rounds — the same rounds, point and bound factors. Then the rows folded by
+/// one challenge only must part from today, so the comparison is load-bearing.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
+fn the_bus_column_from_rows_sends_todays_messages() {
+    use math_cuda::argue_fused::bus_rows;
+    use multilinear::gpu_fused::*;
+    struct Back;
+    impl Drop for Back {
+        fn drop(&mut self) {
+            bus_rows::force(None);
+            bus_rows::force_fault(false);
+            force_zc_device_tail(None);
+        }
+    }
+    let _back = Back;
+    let _switches = CardSwitches::set(
+        FusedFaults {
+            keep_corners: true,
+            ..FusedFaults::default()
+        },
+        false,
+    );
+    let vm = vm_airs();
+    let airs = every_air(&vm);
+    let mut runs: Vec<(String, usize)> = airs
+        .iter()
+        .map(|(air, label)| {
+            let mut rng = Rng::new(0);
+            let width = Table::from_air(*air, label, 8, &mut rng).width();
+            let n = (8..).find(|n| width << n >= 4096).expect("a height");
+            (label.clone(), n)
+        })
+        .collect();
+    for label in THE_Q1_TABLES {
+        runs.push((label.to_string(), 10));
+        runs.push((label.to_string(), 12));
+    }
+    let mut checked = 0usize;
+    for tail in [None, Some(Some(2usize))] {
+        force_zc_device_tail(tail);
+        for on in [true, false] {
+            bus_rows::force(Some(on));
+            for (at, (label, n)) in runs.iter().enumerate() {
+                let air = airs.iter().find(|(_, l)| l == label).unwrap().0;
+                let mut rng = Rng::new(0xB05 + at as u64);
+                let table = Table::from_air(air, label, *n, &mut rng);
+                let session = table.session(table.random_columns(*n, &mut rng), &mut rng);
+                let claims = session.true_claims();
+                let sessions = fused_sessions();
+                let what = format!("bus from rows {on}, tail {tail:?}");
+                session.assert_card_is_today(&claims, session.on_the_card(&claims), &what);
+                assert_eq!(
+                    fused_sessions(),
+                    sessions + 1,
+                    "{label} n={n} {what}: the card ran the fused rounds"
+                );
+                checked += 1;
+            }
+        }
+    }
+    bus_rows::force(Some(true));
+    bus_rows::force_fault(true);
+    for (at, label) in THE_Q1_TABLES.iter().enumerate() {
+        let n = 10;
+        let air = airs.iter().find(|(_, l)| l == label).unwrap().0;
+        let mut rng = Rng::new(0xFA58 + at as u64);
+        let table = Table::from_air(air, label, n, &mut rng);
+        let session = table.session(table.random_columns(n, &mut rng), &mut rng);
+        let claims = session.true_claims();
+        let (today, today_point, _) = session.today(&claims);
+        let parted = match session.on_the_card(&claims) {
+            Err(_) => true,
+            Ok((proof, point, _)) => {
+                proof
+                    .rounds
+                    .iter()
+                    .zip(&today.rounds)
+                    .any(|(a, b)| a.evaluations != b.evaluations)
+                    || point != today_point
+            }
+        };
+        assert!(
+            parted,
+            "{label}: the faulted bus column must part from today's rounds"
+        );
+    }
+    eprintln!("argue bus from rows: {checked} card runs sent today's messages; the fault parted");
+}
+
 /// ★ The production switches (fused on, the corners skipped, no
 /// cross-check) on every table without roots: its constraint part is zero,
 /// so its grid `{0,1}²` is all corners, the corner skip is exact on random

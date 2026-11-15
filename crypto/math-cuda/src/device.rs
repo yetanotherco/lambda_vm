@@ -390,6 +390,7 @@ pub struct Backend {
     // D-ARGUE stage 1's fused zerocheck (`crate::argue_fused`).
     pub zc_grid01: CudaFunction,
     pub zc_bus_u: CudaFunction,
+    pub zc_bus_u_store: CudaFunction,
     pub zc_fold2: CudaFunction,
     pub zc_bus_column: CudaFunction,
     pub zc_halve: CudaFunction,
@@ -1319,6 +1320,7 @@ impl Backend {
             sum_partials_ext3: sumcheck.load_function("sum_partials_ext3")?,
             zc_grid01: sumcheck.load_function("zc_grid01")?,
             zc_bus_u: sumcheck.load_function("zc_bus_u")?,
+            zc_bus_u_store: sumcheck.load_function("zc_bus_u_store")?,
             zc_fold2: sumcheck.load_function("zc_fold2")?,
             zc_bus_column: sumcheck.load_function("zc_bus_column")?,
             zc_halve: sumcheck.load_function("zc_halve")?,

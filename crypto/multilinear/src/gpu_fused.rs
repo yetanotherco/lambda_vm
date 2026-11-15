@@ -956,8 +956,13 @@ where
                         w[at..at + 3].copy_from_slice(&limbs);
                     }
                 }
+                // Rounds 0 and 1's challenges: the rows' bus values are folded by
+                // them (`argue_fused::bus_rows`).
+                let mut challenges = [0u64; 6];
+                challenges[..3].copy_from_slice(&ext3_raw(s0).ok_or(failed("fused weights"))?);
+                challenges[3..].copy_from_slice(&ext3_raw(s1).ok_or(failed("fused weights"))?);
                 self.session
-                    .fold2(&w)
+                    .fold2(&w, &challenges)
                     .map_err(|_| failed("fused double fold"))?;
                 self.times.fold2 = tick.elapsed().as_secs_f64();
             }

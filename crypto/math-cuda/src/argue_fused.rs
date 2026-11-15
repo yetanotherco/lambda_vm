@@ -22,6 +22,58 @@ use crate::sumcheck::{FactorView, eq_table_ext3, launch_shape};
 const BLOCK_DIM: u32 = 256;
 const MAX_GRID: u32 = 4096;
 
+/// How the session makes the bus column `L`, read once.
+pub mod bus_rows {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static FORCED: AtomicU8 = AtomicU8::new(0);
+    static FAULT: AtomicU8 = AtomicU8::new(0);
+
+    /// Whether rounds 0 and 1's pass keeps each row's bus value
+    /// `a₀ + Σ a_k·f_k` and `L` is those values folded by the two challenges.
+    /// The weights sum to one, so these are the values `zc_bus_column` makes
+    /// from the folded factors, without its product a term a quarter-row. On by
+    /// default; `LAMBDA_VM_ZC_BUS_FROM_ROWS=0` makes `L` from the folded factors
+    /// as before. The same messages either way.
+    pub fn enabled() -> bool {
+        match FORCED.load(Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("LAMBDA_VM_ZC_BUS_FROM_ROWS").map_or(true, |v| v != "0" && v != "false")
+        })
+    }
+
+    /// Forces [`enabled`] for sessions made after it; `None` back to the
+    /// environment's word.
+    #[doc(hidden)]
+    pub fn force(on: Option<bool>) {
+        FORCED.store(
+            match on {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// ⛔ A FAULT, a negative control's only: the rows' values folded by the
+    /// first challenge alone, so `L` is wrong.
+    #[doc(hidden)]
+    pub fn force_fault(on: bool) {
+        FAULT.store(u8::from(on), Ordering::Relaxed);
+    }
+
+    pub(super) fn fault() -> bool {
+        FAULT.load(Ordering::Relaxed) == 1
+    }
+}
+
 /// Scratch ceiling for the per-thread slot files, as the round kernel's.
 const SLOT_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_THREADS: u64 = 1 << 20;
@@ -82,6 +134,9 @@ pub struct FusedZerocheck<'f> {
     node_ints: CudaSlice<u32>,
     scratch: CudaSlice<u64>,
     violation: CudaSlice<u64>,
+    /// [`bus_rows`]: every row's bus value (`4q` ext3), its one-entry pointer
+    /// table for the folds, and room for the two challenges' limbs.
+    rows_l: Option<(CudaSlice<u64>, CudaSlice<u64>, CudaSlice<u64>)>,
     _room: DeviceReservation,
 }
 
@@ -188,13 +243,11 @@ impl<'f> FusedZerocheck<'f> {
         if words == 0 {
             return Ok(None);
         }
-        let Some(room) = be.reserve(Self::device_bytes(
-            width,
-            rows,
-            program.num_slots,
-            grid_rows,
-            gruen_rows,
-        )) else {
+        let from_rows = bus_rows::enabled();
+        let extra = if from_rows { rows as u64 * 24 } else { 0 };
+        let Some(room) = be.reserve(
+            Self::device_bytes(width, rows, program.num_slots, grid_rows, gruen_rows) + extra,
+        ) else {
             return Ok(None);
         };
         let stream = source.stream.clone();
@@ -233,6 +286,19 @@ impl<'f> FusedZerocheck<'f> {
         let node_ints = alloc_zeros_or_trim::<u32>(&stream, MAX_ROWS)?;
         let scratch = alloc_zeros_or_trim::<u64>(&stream, 12)?;
         let violation = alloc_zeros_or_trim::<u64>(&stream, 1)?;
+        let rows_l = if from_rows {
+            // SAFETY: `zc_bus_u_store` writes every row before the folds read it.
+            let values = unsafe { alloc_or_trim::<u64>(&stream, rows * 3) }?;
+            let address = {
+                let (at, _record) = values.device_ptr(&stream);
+                at
+            };
+            let table = htod_or_trim(&stream, &[address])?;
+            let challenges = alloc_zeros_or_trim::<u64>(&stream, 6)?;
+            Some((values, table, challenges))
+        } else {
+            None
+        };
         Ok(Some(Self {
             stream,
             source,
@@ -261,6 +327,7 @@ impl<'f> FusedZerocheck<'f> {
             node_ints,
             scratch,
             violation,
+            rows_l,
             _room: room,
         }))
     }
@@ -332,23 +399,44 @@ impl<'f> FusedZerocheck<'f> {
             BLOCK_DIM,
         );
         let factors = self.source.ptrs;
+        let config = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: block * 3 * 8,
+        };
         unsafe {
-            self.stream
-                .launch_builder(&be.zc_bus_u)
-                .arg(factors)
-                .arg(&q)
-                .arg(&self.term_slots)
-                .arg(&self.term_coeffs)
-                .arg(&self.num_terms)
-                .arg(&self.constant)
-                .arg(&self.eq_rho)
-                .arg(&mut self.partials)
-                .arg(&self.source.stride)
-                .launch(LaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: block * 3 * 8,
-                })?;
+            match self.rows_l.as_mut() {
+                // Each row's bus value kept as well: `L`'s source ([`bus_rows`]).
+                Some((values, _, _)) => {
+                    self.stream
+                        .launch_builder(&be.zc_bus_u_store)
+                        .arg(factors)
+                        .arg(&q)
+                        .arg(&self.term_slots)
+                        .arg(&self.term_coeffs)
+                        .arg(&self.num_terms)
+                        .arg(&self.constant)
+                        .arg(&self.eq_rho)
+                        .arg(&mut self.partials)
+                        .arg(&self.source.stride)
+                        .arg(values)
+                        .launch(config)?;
+                }
+                None => {
+                    self.stream
+                        .launch_builder(&be.zc_bus_u)
+                        .arg(factors)
+                        .arg(&q)
+                        .arg(&self.term_slots)
+                        .arg(&self.term_coeffs)
+                        .arg(&self.num_terms)
+                        .arg(&self.constant)
+                        .arg(&self.eq_rho)
+                        .arg(&mut self.partials)
+                        .arg(&self.source.stride)
+                        .launch(config)?;
+                }
+            }
         }
         let u = self.reduce(4, grid)?;
         Ok((t, u, violation))
@@ -404,8 +492,9 @@ impl<'f> FusedZerocheck<'f> {
 
     /// Both folds at once (`w[2a + b] = eq₁(s₀, a)·eq₁(s₁, b)`, twelve u64), into
     /// the quarter-size copy; then `L` there, and the weights halved to round
-    /// 2's `eq(·_{>2})`.
-    pub fn fold2(&mut self, w: &[u64; 12]) -> Result<()> {
+    /// 2's `eq(·_{>2})`. `challenges` are `s₀` then `s₁` (three u64 each), which
+    /// the rows' bus values are folded by ([`bus_rows`]).
+    pub fn fold2(&mut self, w: &[u64; 12], challenges: &[u64; 6]) -> Result<()> {
         assert_eq!(self.len, 0, "the double fold is the first");
         let be = backend()?;
         let q = (self.rows / 4) as u64;
@@ -430,8 +519,51 @@ impl<'f> FusedZerocheck<'f> {
                 })?;
         }
         self.len = q as usize;
-        self.bus_column()?;
+        if self.rows_l.is_some() {
+            self.bus_from_rows(challenges)?;
+        } else {
+            self.bus_column()?;
+        }
         self.halve_weights()
+    }
+
+    /// `L` from the rows' bus values: folded by `s₀` (the high variable) and
+    /// then `s₁` in place, and the first quarter copied into `L`'s slab.
+    fn bus_from_rows(&mut self, challenges: &[u64; 6]) -> Result<()> {
+        let be = backend()?;
+        let q = (self.rows / 4) as u64;
+        let Some((values, table, limbs)) = self.rows_l.as_mut() else {
+            return Ok(());
+        };
+        self.stream.memcpy_htod(&challenges[..], limbs)?;
+        let folds: &[(usize, u64)] = if bus_rows::fault() {
+            &[(0, 2 * q)]
+        } else {
+            &[(0, 2 * q), (1, q)]
+        };
+        for &(round, half) in folds {
+            let one = 1u64;
+            let grid = half.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
+            let s = limbs.slice(round * 3..round * 3 + 3);
+            unsafe {
+                self.stream
+                    .launch_builder(&be.sumcheck_fold_ext3)
+                    .arg(&mut *table)
+                    .arg(&half)
+                    .arg(&one)
+                    .arg(&s)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (BLOCK_DIM, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+        }
+        let width = self.width;
+        let qs = q as usize;
+        let mut l = self.folded.slice_mut(width * qs * 3..(width + 1) * qs * 3);
+        self.stream.memcpy_dtod(&values.slice(0..qs * 3), &mut l)?;
+        Ok(())
     }
 
     /// `L` over the folded factors, into its slab.
