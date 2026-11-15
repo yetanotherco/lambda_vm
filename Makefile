@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-eq-dot-host-kat test-round-slot-host-kat test-fill-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-eq-dot-host-kat test-round-slot-host-kat test-fill-host-kat test-sides-host-kat test-memw-a-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -760,6 +760,32 @@ test-fill-host-kat:
 	$(CXX) $(HOST_KAT_CXXFLAGS) \
 	    -o target/host_kat/fill_host_kat $(HOST_KAT_DIR)/fill_host_kat.cpp
 	./target/host_kat/fill_host_kat
+
+# Known-answer replays of the card's derivations from the executor's history,
+# run on the HOST through the same shim: `fill.cu`'s `derive_cpu_sides` with
+# `fill_cpu_from_logs` (the in-row CPU side records), and `card_rows.cu`'s
+# `derive_memw_a_from_cache` (MEMW_A's rows from the windows' accesses). Their
+# vectors are record-mode walks of asm programs, Rust guests and an ethrex
+# block, written by an ignored prover test (so the guests must be built), with
+# the words the prover's host fill writes from the WALK's records; each replay
+# also checks that its mutants bite. Arithmetic and indexing only; execution
+# stays with the card tests (`history_sides_card_tests`,
+# `history_rows_card_tests`).
+test-sides-host-kat:
+	@mkdir -p target/host_kat
+	SIDE_RECORDS_VECTORS=$(CURDIR)/target/host_kat/sides.bin cargo test -p lambda-vm-prover --lib -- \
+	    --ignored --exact tables::trace_builder::windowed::history_sides_tests::write_the_side_records_kernel_vectors
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/sides_host_kat $(HOST_KAT_DIR)/sides_host_kat.cpp
+	./target/host_kat/sides_host_kat target/host_kat/sides.bin
+
+test-memw-a-host-kat:
+	@mkdir -p target/host_kat
+	MEMW_A_VECTORS=$(CURDIR)/target/host_kat/memw_a.bin cargo test -p lambda-vm-prover --lib -- \
+	    --ignored --exact tables::trace_builder::windowed::history_rows_tests::write_the_memw_a_kernel_vectors
+	$(CXX) $(HOST_KAT_CXXFLAGS) \
+	    -o target/host_kat/memw_a_host_kat $(HOST_KAT_DIR)/memw_a_host_kat.cpp
+	./target/host_kat/memw_a_host_kat target/host_kat/memw_a.bin
 
 # SECOND-SOURCE validation of the 6-round vectors the KAT above trusts.
 #
