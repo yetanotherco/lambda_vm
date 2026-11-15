@@ -787,7 +787,7 @@ struct Recording {
 
 impl crypto::fiat_shamir::is_transcript::IsTranscript<Ext> for Recording {
     fn append_field_element(&mut self, element: &ExtE) {
-        self.log.push(Event::Absorb(element.clone()));
+        self.log.push(Event::Absorb(*element));
         self.inner.append_field_element(element);
     }
     fn append_bytes(&mut self, new_bytes: &[u8]) {
@@ -818,7 +818,7 @@ impl crypto::fiat_shamir::transcript_hash::HasTranscriptHash for Recording {
 /// Where `values` were absorbed one after another in `log`: the index just
 /// past the last of them (the run must occur exactly once).
 fn just_after(log: &[Event], values: &[ExtE]) -> usize {
-    let absorbs: Vec<Event> = values.iter().cloned().map(Event::Absorb).collect();
+    let absorbs: Vec<Event> = values.iter().copied().map(Event::Absorb).collect();
     let at: Vec<usize> = (0..=log.len().saturating_sub(absorbs.len()))
         .filter(|&i| log[i..i + absorbs.len()] == absorbs[..])
         .collect();
@@ -882,7 +882,7 @@ fn the_combination_challenge_is_drawn_after_the_whole_ladder() {
         .argue
         .bus_outputs
         .iter()
-        .flat_map(|(p, q)| [p.clone(), q.clone()])
+        .flat_map(|(p, q)| [*p, *q])
         .collect();
     let ladder_start = just_after(&log, &outputs);
     assert_eq!(
@@ -894,14 +894,7 @@ fn the_combination_challenge_is_drawn_after_the_whole_ladder() {
     let halves: Vec<ExtE> = last
         .halves
         .iter()
-        .flat_map(|h| {
-            [
-                h.p_lo.clone(),
-                h.p_hi.clone(),
-                h.q_lo.clone(),
-                h.q_hi.clone(),
-            ]
-        })
+        .flat_map(|h| [h.p_lo, h.p_hi, h.q_lo, h.q_hi])
         .collect();
     let ladder_end = just_after(&log, &halves);
     assert_eq!(
