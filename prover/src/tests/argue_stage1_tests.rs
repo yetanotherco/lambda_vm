@@ -1140,6 +1140,116 @@ fn the_two_level_tree_folds_build_todays_levels() {
     eprintln!("gkr two-level folds: {checked} trees built today's levels; every fault parted");
 }
 
+/// ★ The input layer written with the two tree levels above it
+/// (`gkr::fused_input`, on by default; `LAMBDA_VM_GKR_FUSED_INPUT=0` writes the
+/// layer and folds it as before) makes the same layer and the same tree: over
+/// random columns and random input plans of 4, 5 and 7 interactions at 8 and 64
+/// rows, kept whole (the padding's `0/1` written, `from_device`) and truncated
+/// (only the real cells, `from_truncated_input`), the input cells and every
+/// level above them are bit for bit the plain writer's. Then the fused pass's
+/// upper cells off by one must part, so the comparison is load-bearing.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
+fn the_fused_input_writes_todays_layer_and_tree() {
+    use math_cuda::gkr::{
+        DeviceFractionTree, InputPlan, fused_input, input_fold2_from_columns, input_from_columns,
+    };
+    struct Back;
+    impl Drop for Back {
+        fn drop(&mut self) {
+            fused_input::force(None);
+            fused_input::force_fault(false);
+        }
+    }
+    let _back = Back;
+    const MODULUS: u64 = 0xFFFF_FFFF_0000_0001;
+    let mut rng = Rng::new(0xF5ED);
+    let be = math_cuda::device::backend().expect("a card");
+    let levels = |tree: &DeviceFractionTree| -> Vec<(Vec<u64>, Vec<u64>)> {
+        (0..tree.num_layers() - 1)
+            .map(|layer| tree.layer_to_host(layer).expect("a level above the input"))
+            .collect()
+    };
+    let mut checked = 0;
+    for interactions in [4usize, 5, 7] {
+        for rows in [8usize, 64] {
+            let width = 6usize;
+            let columns: Vec<u64> = (0..width * rows).map(|_| rng.next() % MODULUS).collect();
+            // Each side: a constant and up to three terms on random columns and shifts.
+            let mut side_start = vec![0u32];
+            let (mut terms, mut coeffs, mut constants) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..2 * interactions {
+                for _ in 0..3 {
+                    constants.push(rng.next() % MODULUS);
+                }
+                let count = (rng.next() % 4) as usize;
+                for _ in 0..count {
+                    terms.push((rng.next() % width as u64) * rows as u64);
+                    terms.push(rng.next() % rows as u64);
+                    for _ in 0..3 {
+                        coeffs.push(rng.next() % MODULUS);
+                    }
+                }
+                side_start.push(side_start.last().unwrap() + count as u32);
+            }
+            let num_vars = (interactions.next_power_of_two() * rows).trailing_zeros() as usize;
+            let real = interactions * rows;
+            for padding in [true, false] {
+                if !padding && real == 1usize << num_vars {
+                    continue;
+                }
+                let stream = be.next_stream();
+                let column_buf =
+                    math_cuda::device::htod_or_trim(&stream, &columns).expect("upload");
+                let view = column_buf.slice(..);
+                let plan = InputPlan::upload(&stream, &side_start, &terms, &coeffs, &constants)
+                    .expect("the plan uploads");
+                let tree_of = |p, q, top| {
+                    if padding {
+                        DeviceFractionTree::from_device_top(stream.clone(), p, q, top)
+                    } else {
+                        DeviceFractionTree::from_truncated_input_top(
+                            stream.clone(),
+                            p,
+                            q,
+                            real,
+                            num_vars,
+                            top,
+                        )
+                    }
+                    .expect("the card builds the tree")
+                };
+                let (p, q) =
+                    input_from_columns(&stream, &view, rows, &plan, padding).expect("write");
+                let today_input = (
+                    stream.clone_dtoh(&p).unwrap(),
+                    stream.clone_dtoh(&q).unwrap(),
+                );
+                let today = levels(&tree_of(p, q, None));
+                let ((p, q), top) = input_fold2_from_columns(&stream, &view, rows, &plan, padding)
+                    .expect("fused write");
+                let fused_input_cells = (
+                    stream.clone_dtoh(&p).unwrap(),
+                    stream.clone_dtoh(&q).unwrap(),
+                );
+                let fused = levels(&tree_of(p, q, Some(top)));
+                let what = format!("{interactions} interactions, {rows} rows, padding {padding}");
+                assert_eq!(fused_input_cells, today_input, "{what}: the input cells");
+                assert_eq!(fused, today, "{what}: the levels");
+                fused_input::force_fault(true);
+                let ((p, q), top) = input_fold2_from_columns(&stream, &view, rows, &plan, padding)
+                    .expect("fused write");
+                let faulted = levels(&tree_of(p, q, Some(top)));
+                fused_input::force_fault(false);
+                assert_ne!(faulted, today, "{what}: the fault must part");
+                checked += 1;
+            }
+        }
+    }
+    eprintln!("gkr fused input: {checked} layers and trees as today's; every fault parted");
+}
+
 /// ★ The production switches (fused on, the corners skipped, no
 /// cross-check) on every table without roots: its constraint part is zero,
 /// so its grid `{0,1}²` is all corners, the corner skip is exact on random

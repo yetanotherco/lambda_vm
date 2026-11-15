@@ -136,6 +136,17 @@ impl DeviceFractionTree {
         p: CudaSlice<u64>,
         q: CudaSlice<u64>,
     ) -> Result<Self> {
+        Self::from_device_top(stream, p, q, None)
+    }
+
+    /// [`from_device`](Self::from_device) with the two levels above the input
+    /// already made by its writer ([`input_fold2_from_columns`]).
+    pub fn from_device_top(
+        stream: Arc<CudaStream>,
+        p: CudaSlice<u64>,
+        q: CudaSlice<u64>,
+        top: Option<TopLevels>,
+    ) -> Result<Self> {
         assert_eq!(p.len(), q.len(), "a layer's halves span one cube");
         assert!(p.len().is_multiple_of(3), "three u64 per ext3 element");
         let elements = p.len() / 3;
@@ -157,7 +168,7 @@ impl DeviceFractionTree {
             num_vars: elements.trailing_zeros() as usize,
             real: elements,
         };
-        let layers = fold_upwards(&stream, be, &input.p, &input.q, elements, elements)?;
+        let layers = fold_upwards(&stream, be, &input.p, &input.q, elements, elements, top)?;
         Ok(Self {
             stream,
             layers,
@@ -200,7 +211,7 @@ impl DeviceFractionTree {
         let layers = {
             let p = Arc::new(p);
             let q = Arc::new(q);
-            fold_upwards(&stream, be, &p, &q, real, full)?
+            fold_upwards(&stream, be, &p, &q, real, full, None)?
             // `p` and `q` go here, which is the point of this constructor.
         };
         Ok(Self {
@@ -234,6 +245,19 @@ impl DeviceFractionTree {
         real: usize,
         num_vars: usize,
     ) -> Result<Self> {
+        Self::from_truncated_input_top(stream, p, q, real, num_vars, None)
+    }
+
+    /// [`from_truncated_input`](Self::from_truncated_input) with the two levels
+    /// above the input already made by its writer ([`input_fold2_from_columns`]).
+    pub fn from_truncated_input_top(
+        stream: Arc<CudaStream>,
+        p: CudaSlice<u64>,
+        q: CudaSlice<u64>,
+        real: usize,
+        num_vars: usize,
+        top: Option<TopLevels>,
+    ) -> Result<Self> {
         let full = 1usize.checked_shl(num_vars as u32).ok_or_else(invalid)?;
         let rounded_up = real <= full && real > full / 2;
         if p.len() != real * 3 || q.len() != real * 3 || !rounded_up {
@@ -250,7 +274,7 @@ impl DeviceFractionTree {
             num_vars,
             real,
         };
-        let layers = fold_upwards(&stream, be, &input.p, &input.q, real, full)?;
+        let layers = fold_upwards(&stream, be, &input.p, &input.q, real, full, top)?;
         Ok(Self {
             stream,
             layers,
@@ -417,9 +441,30 @@ fn fold_upwards(
     q: &Arc<CudaSlice<u64>>,
     real: usize,
     full: usize,
+    top: Option<TopLevels>,
 ) -> Result<Vec<DeviceLayer>> {
     let mut layers: Vec<DeviceLayer> = Vec::new();
     let mut num_vars = full.trailing_zeros() as usize;
+    // The two levels the input pass already made ([`input_fold2_from_columns`]).
+    if let Some(top) = top {
+        if num_vars < 2 {
+            return Err(invalid());
+        }
+        let half = full / 2;
+        layers.push(DeviceLayer {
+            p: Arc::new(top.p_mid),
+            q: Arc::new(top.q_mid),
+            num_vars: num_vars - 1,
+            real: half,
+        });
+        layers.push(DeviceLayer {
+            p: Arc::new(top.p_out),
+            q: Arc::new(top.q_out),
+            num_vars: num_vars - 2,
+            real: half / 2,
+        });
+        num_vars -= 2;
+    }
     let two_levels = two_level_folds::enabled();
     while num_vars > 0 {
         let half = (1usize << num_vars) / 2;
@@ -1111,6 +1156,135 @@ pub fn input_from_columns(
             })?;
     }
     Ok((p, q))
+}
+
+/// The two tree levels above an input layer, made by the pass that wrote it.
+pub struct TopLevels {
+    p_mid: CudaSlice<u64>,
+    q_mid: CudaSlice<u64>,
+    p_out: CudaSlice<u64>,
+    q_out: CudaSlice<u64>,
+}
+
+/// Whether the input layer's writer also makes the two tree levels above it,
+/// read once.
+pub mod fused_input {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static FORCED: AtomicU8 = AtomicU8::new(0);
+    static FAULT: AtomicU8 = AtomicU8::new(0);
+
+    /// Whether the input layer from the columns is written by
+    /// `gkr_input_fold2_from_columns`, which also writes the two levels above
+    /// it, so the tree never reads the input layer back. The same cells and
+    /// levels. On by default; `LAMBDA_VM_GKR_FUSED_INPUT=0` writes the layer
+    /// and folds it as before.
+    pub fn enabled() -> bool {
+        match FORCED.load(Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("LAMBDA_VM_GKR_FUSED_INPUT").map_or(true, |v| v != "0" && v != "false")
+        })
+    }
+
+    /// Forces [`enabled`]; `None` back to the environment's word.
+    #[doc(hidden)]
+    pub fn force(on: Option<bool>) {
+        FORCED.store(
+            match on {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// ⛔ A FAULT, a negative control's only: the upper level's cells off by one.
+    #[doc(hidden)]
+    pub fn force_fault(on: bool) {
+        FAULT.store(u8::from(on), Ordering::Relaxed);
+    }
+
+    pub(super) fn fault() -> u32 {
+        u32::from(FAULT.load(Ordering::Relaxed))
+    }
+}
+
+/// [`input_from_columns`] and the two tree levels above the layer in one pass
+/// (`gkr_input_fold2_from_columns`): the same input cells, written the same
+/// way (`padding` writes the padding's `0/1` too), and the levels
+/// `fold_upwards` would make first. `None`-free: a cube of fewer than four
+/// cells is refused (the caller writes the layer alone then).
+pub fn input_fold2_from_columns(
+    stream: &Arc<CudaStream>,
+    columns: &cudarc::driver::CudaView<'_, u64>,
+    rows: usize,
+    plan: &InputPlan,
+    padding: bool,
+) -> Result<(Halves, TopLevels)> {
+    let be = backend()?;
+    let interactions = plan.interactions;
+    let slots = interactions.next_power_of_two();
+    let cube = slots * rows;
+    if cube < 4 || !cube.is_power_of_two() {
+        return Err(invalid());
+    }
+    let stored_slots = if padding { slots } else { interactions };
+    let stored = stored_slots * rows;
+    let (half, quarter) = (cube / 2, cube / 4);
+    // SAFETY: the kernel writes every stored input cell and every cell of both
+    // levels.
+    let mut p = unsafe { crate::device::alloc_or_trim::<u64>(stream, stored * 3) }?;
+    let mut q = unsafe { crate::device::alloc_or_trim::<u64>(stream, stored * 3) }?;
+    let mut p_mid = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
+    let mut q_mid = unsafe { crate::device::alloc_or_trim::<u64>(stream, half * 3) }?;
+    let mut p_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, quarter * 3) }?;
+    let mut q_out = unsafe { crate::device::alloc_or_trim::<u64>(stream, quarter * 3) }?;
+    let rows_arg = rows as u64;
+    let interactions_arg = interactions as u64;
+    let stored_arg = stored_slots as u64;
+    let cube_arg = cube as u64;
+    let fault = fused_input::fault();
+    unsafe {
+        stream
+            .launch_builder(&be.gkr_input_fold2_from_columns)
+            .arg(columns)
+            .arg(&rows_arg)
+            .arg(&plan.side_start)
+            .arg(&plan.terms)
+            .arg(&plan.coeffs)
+            .arg(&plan.constants)
+            .arg(&interactions_arg)
+            .arg(&stored_arg)
+            .arg(&cube_arg)
+            .arg(&mut p)
+            .arg(&mut q)
+            .arg(&mut p_mid)
+            .arg(&mut q_mid)
+            .arg(&mut p_out)
+            .arg(&mut q_out)
+            .arg(&fault)
+            .launch(LaunchConfig {
+                grid_dim: ((quarter as u64).div_ceil(256).clamp(1, 8192) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    Ok((
+        (p, q),
+        TopLevels {
+            p_mid,
+            q_mid,
+            p_out,
+            q_out,
+        },
+    ))
 }
 
 #[cfg(test)]
