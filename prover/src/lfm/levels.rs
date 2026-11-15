@@ -366,11 +366,13 @@ pub(crate) fn level1_pieces(marks: &[u32]) -> Vec<(std::ops::Range<u32>, std::op
 /// when the work runs moves. `beside = false` is the control: level 1's
 /// groups land only once the base has ended.
 ///
-/// `build_beside` builds every level (its prepared stacks committed on the
-/// HOST, as a verifier commits them, so the card holds none of them through
-/// the proves) on a thread of its own the moment level 1's program is
-/// emitted, beside phase B; `false` (today's) builds them on the card after
-/// the base. The same roots either way, so the same proofs.
+/// Every level's prepared stacks are committed on the HOST, as a verifier
+/// commits them, so the card holds none of them through the proves (a
+/// level's stacks are its program's instruction columns: gigabytes a level,
+/// which the card cannot hold beside a group's commit). `build_beside` builds
+/// every level on a thread of its own the moment level 1's program is
+/// emitted, beside phase B; `false` builds them after the base. The same
+/// roots either way, so the same proofs.
 ///
 /// Under [`WlfmFamily::B3`] the base is the 7-round BLAKE3 base
 /// (`format.zf.base` must be `BaseFormat::B3_WHIR`, [`check_base`]), admitted
@@ -396,6 +398,15 @@ pub fn prove_block_levels(
 
     crate::base_only::refuse_recursion()?;
     check_base(&format.zf.base, family)?;
+    // Level 1's groups arrive as a streamed base's phase B opens them; the
+    // whole-run base prover opens them without telling anyone.
+    if options.window_log2.is_none() {
+        return Err(
+            "the levels driver lands level 1's groups as a streamed base opens them: the block \
+             options must stream (window_log2)"
+                .into(),
+        );
+    }
     let t0 = std::time::Instant::now();
     let now = || t0.elapsed().as_secs_f64();
     type Statement = (
@@ -644,8 +655,8 @@ pub fn prove_block_levels(
                 .collect::<Vec<_>>()
         }
         None => {
-            let first = build_level(program, family, false)?;
-            let rest = build_rest(&plan, &first.build, family, stop, false)?;
+            let first = build_level(program, family, true)?;
+            let rest = build_rest(&plan, &first.build, family, stop, true)?;
             times.built = now();
             std::iter::once(first).chain(rest).collect::<Vec<_>>()
         }
