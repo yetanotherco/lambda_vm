@@ -6650,7 +6650,10 @@ fn prove_streamed(
                     // mode, the walkers and the CPU logs kept; without them the side
                     // records go up as the walk wrote them.
                     if crate::tables::trace_builder::card_trace_rows().map_err(Error::Prover)? {
+                        // The sampled re-walk compares a window's lists with a
+                        // walk that writes side records: not beside it.
                         let sides = history
+                            && history_check == 0
                             && walkers > 0
                             && builder.keeps_logs()
                             && format.registers == crate::tables::register::RegisterFormat::InRow;
@@ -6662,7 +6665,7 @@ fn prove_streamed(
                             if sides {
                                 "the card derives the CPU rows' side records from the history"
                             } else {
-                                "off here (no record mode, no walkers, no CPU logs kept, or not the in-row format): the side records go up"
+                                "off here (no record mode, the history re-walked, no walkers, no CPU logs kept, or not the in-row format): the side records go up"
                             }
                         );
                     }

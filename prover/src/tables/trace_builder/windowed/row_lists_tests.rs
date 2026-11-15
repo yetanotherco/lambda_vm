@@ -116,6 +116,7 @@ fn walked(
         first,
         logs,
         None,
+        None,
     )
     .expect("the walk");
     assert!(!record.take_missing(), "the walk refused the window");

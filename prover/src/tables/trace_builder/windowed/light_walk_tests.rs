@@ -126,6 +126,7 @@ fn walked(
         first,
         logs,
         None,
+        None,
     )
     .expect("the walk");
     let refused = record.take_missing();
