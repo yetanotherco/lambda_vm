@@ -1535,3 +1535,85 @@ extern "C" __global__ void gkr_input_from_columns(
         at[2] = side[1].c;
     }
 }
+
+// One input cell `(s, r)` from the columns, as `gkr_input_from_columns` makes it: slot `s` is
+// interaction `s`'s two sides, or the padding's `0/1` from `interactions` on.
+__device__ __forceinline__ void gkr_input_cell(
+    const uint64_t *__restrict__ d_columns, uint64_t rows,
+    const uint32_t *__restrict__ d_side_start, const uint64_t *__restrict__ d_terms,
+    const uint64_t *__restrict__ d_coeffs, const uint64_t *__restrict__ d_constants,
+    uint64_t interactions, uint64_t s, uint64_t r, Fe3 &p_cell, Fe3 &q_cell) {
+    if (s >= interactions) {
+        p_cell = ext3::zero();
+        q_cell = ext3::one();
+        return;
+    }
+    Fe3 side[2];
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+        uint64_t which = 2 * s + h;
+        Fe3 acc = load_ext(d_constants + which * 3);
+        for (uint32_t t = d_side_start[which]; t < d_side_start[which + 1]; t++) {
+            uint64_t k = r + d_terms[2 * t + 1];
+            if (k >= rows) k -= rows;
+            uint64_t value = d_columns[d_terms[2 * t] + k];
+            acc = ext3::add(acc, ext3::mul_base(load_ext(d_coeffs + (uint64_t)t * 3), value));
+        }
+        side[h] = acc;
+    }
+    p_cell = side[0];
+    q_cell = side[1];
+}
+
+__device__ __forceinline__ void store_ext(uint64_t *at, const Fe3 &v) {
+    at[0] = v.a;
+    at[1] = v.b;
+    at[2] = v.c;
+}
+
+// The input layer and the two tree levels above it in one pass: thread `i` of `quarter = cube/4`
+// makes the four input cells `i`, `i + quarter`, `i + 2·quarter`, `i + 3·quarter` (the four that fold
+// together; cell `s·rows + r` is slot `s` at row `r`), writes those of the first `stored_slots`
+// slots into `p`/`q` (the padding's are written only when the layer is kept whole), writes the two
+// cells of the level above (`i`, `i + quarter`) and folds them into cell `i` of the level above
+// that. So the tree never reads the input layer back. The same cells and levels as
+// `gkr_input_from_columns` followed by `fraction_fold2_ext3`.
+extern "C" __global__ __launch_bounds__(256) void gkr_input_fold2_from_columns(
+    const uint64_t *__restrict__ d_columns, uint64_t rows,
+    const uint32_t *__restrict__ d_side_start, const uint64_t *__restrict__ d_terms,
+    const uint64_t *__restrict__ d_coeffs, const uint64_t *__restrict__ d_constants,
+    uint64_t interactions, uint64_t stored_slots, uint64_t cube, uint64_t *__restrict__ p,
+    uint64_t *__restrict__ q, uint64_t *__restrict__ p_mid, uint64_t *__restrict__ q_mid,
+    uint64_t *__restrict__ p_out, uint64_t *__restrict__ q_out, uint32_t fault) {
+    uint64_t quarter = cube / 4;
+    uint64_t stored = stored_slots * rows;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < quarter;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        Fe3 pc[4], qc[4];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            uint64_t cell = i + (uint64_t)k * quarter;
+            uint64_t s = cell / rows;
+            uint64_t r = cell - s * rows;
+            gkr_input_cell(d_columns, rows, d_side_start, d_terms, d_coeffs, d_constants,
+                           interactions, s, r, pc[k], qc[k]);
+            if (cell < stored) {
+                store_ext(p + cell * 3, pc[k]);
+                store_ext(q + cell * 3, qc[k]);
+            }
+        }
+        Fe3 pa, qa, pb, qb;
+        fraction_pair(pc[0], pc[2], qc[0], qc[2], pa, qa);
+        fraction_pair(pc[1], pc[3], qc[1], qc[3], pb, qb);
+        store_ext(p_mid + i * 3, pa);
+        store_ext(q_mid + i * 3, qa);
+        store_ext(p_mid + (i + quarter) * 3, pb);
+        store_ext(q_mid + (i + quarter) * 3, qb);
+        Fe3 pu, qu;
+        fraction_pair(pa, pb, qa, qb, pu, qu);
+        // ⛔ A negative control's fault only: the upper cell off by one.
+        if (fault) pu = ext3::add(pu, ext3::one());
+        store_ext(p_out + i * 3, pu);
+        store_ext(q_out + i * 3, qu);
+    }
+}

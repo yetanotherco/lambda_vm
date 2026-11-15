@@ -5073,6 +5073,7 @@ where
         rows,
         interactions,
         lifted_writer(factors, numerators, denominators),
+        None,
         Build::Eager,
     )
 }
@@ -5082,6 +5083,13 @@ where
 /// sumcheck.
 #[cfg(feature = "cuda")]
 type InputWriter = std::sync::Arc<dyn Fn(bool) -> Option<math_cuda::gkr::Halves> + Send + Sync>;
+
+/// A writer that also makes the two tree levels above the layer
+/// (`math_cuda::gkr::input_fold2_from_columns`), for the tree's first build.
+#[cfg(feature = "cuda")]
+type TopWriter = std::sync::Arc<
+    dyn Fn(bool) -> Option<(math_cuda::gkr::Halves, math_cuda::gkr::TopLevels)> + Send + Sync,
+>;
 
 /// The writer that runs each interaction's two programs over the lifted
 /// factors (`write_input_layer`).
@@ -5161,11 +5169,31 @@ fn tree_from_columns(
     );
     let interactions = plan.interactions();
     let writer_stream = stream.clone();
+    let (write_resident, write_plan) = (resident.clone(), uploaded.clone());
     let write: InputWriter = std::sync::Arc::new(move |padding| {
-        let view = resident.0.view(first, width);
-        math_cuda::gkr::input_from_columns(&writer_stream, &view, rows, &uploaded, padding).ok()
+        let view = write_resident.0.view(first, width);
+        math_cuda::gkr::input_from_columns(&writer_stream, &view, rows, &write_plan, padding).ok()
     });
-    let tree = input_layer_tree_impl(stream, rows, interactions, write, build)?;
+    // The first build's writer also makes the two levels above the layer
+    // (`math_cuda::gkr::fused_input`); a rebuild writes the layer alone.
+    let cube = interactions.next_power_of_two() * rows;
+    let write_top: Option<TopWriter> =
+        (math_cuda::gkr::fused_input::enabled() && cube >= 4).then(|| {
+            let top_stream = stream.clone();
+            let top: TopWriter = std::sync::Arc::new(move |padding| {
+                let view = resident.0.view(first, width);
+                math_cuda::gkr::input_fold2_from_columns(
+                    &top_stream,
+                    &view,
+                    rows,
+                    &uploaded,
+                    padding,
+                )
+                .ok()
+            });
+            top
+        });
+    let tree = input_layer_tree_impl(stream, rows, interactions, write, write_top, build)?;
     INPUT_COLUMNS_TREES.fetch_add(1, Ordering::Relaxed);
     crate::whir_split::bump(&crate::whir_split::TREE_FROM_COLUMNS);
     Some(tree)
@@ -5207,6 +5235,7 @@ where
         rows,
         interactions,
         lifted_writer(factors, numerators, denominators),
+        None,
         Build::Prefetch,
     )
 }
@@ -5254,6 +5283,7 @@ fn input_layer_tree_impl(
     rows: usize,
     interactions: usize,
     write: InputWriter,
+    write_top: Option<TopWriter>,
     build: Build,
 ) -> Option<DeviceTree> {
     use crate::gkr_input_real::{self as input_real, InputReal};
@@ -5265,14 +5295,14 @@ fn input_layer_tree_impl(
         && !HAND_BACK_FORCED.load(Ordering::Relaxed)
         && input_real::argue_input_real() != InputReal::Off;
     let kept = if wanted {
-        truncated_tree(&stream, real, full, &write, build)
+        truncated_tree(&stream, real, full, &write, write_top.as_ref(), build)
     } else {
         None
     };
     let tree = match kept {
         Some(tree) => Some(tree),
         None => {
-            let tree = carried_or_handed_back(stream, rows, interactions, write, build);
+            let tree = carried_or_handed_back(stream, rows, interactions, write, write_top, build);
             if wanted && tree.is_some() {
                 input_real::note_decline();
             }
@@ -5300,20 +5330,28 @@ fn truncated_tree(
     real: usize,
     full: usize,
     write: &InputWriter,
+    write_top: Option<&TopWriter>,
     build: Build,
 ) -> Option<DeviceTree> {
     let room = math_cuda::device::reserve(math_cuda::gkr::truncated_peak_bytes(real, full))?;
     let num_vars = full.trailing_zeros() as usize;
     let t = crate::whir_split::tick();
-    let (p, q) = write(false)?;
+    let ((p, q), top) = match write_top {
+        Some(write_top) => {
+            let (halves, top) = write_top(false)?;
+            (halves, Some(top))
+        }
+        None => (write(false)?, None),
+    };
     crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
     let t = crate::whir_split::tick();
-    let tree = math_cuda::gkr::DeviceFractionTree::from_truncated_input(
+    let tree = math_cuda::gkr::DeviceFractionTree::from_truncated_input_top(
         stream.clone(),
         p,
         q,
         real,
         num_vars,
+        top,
     )
     .ok()?;
     crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
@@ -5355,6 +5393,7 @@ fn carried_or_handed_back(
     rows: usize,
     interactions: usize,
     write: InputWriter,
+    write_top: Option<TopWriter>,
     build: Build,
 ) -> Option<DeviceTree> {
     let slots = interactions.next_power_of_two();
@@ -5375,10 +5414,17 @@ fn carried_or_handed_back(
     if !hand_back && (carried.is_some() || eager - lazy < worth_handing_back()) {
         drop(carried);
         let t = crate::whir_split::tick();
-        let (p, q) = write(true)?;
+        let ((p, q), top) = match write_top.as_ref() {
+            Some(write_top) => {
+                let (halves, top) = write_top(true)?;
+                (halves, Some(top))
+            }
+            None => (write(true)?, None),
+        };
         crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
         let t = crate::whir_split::tick();
-        let tree = math_cuda::gkr::DeviceFractionTree::from_device(stream.clone(), p, q).ok()?;
+        let tree =
+            math_cuda::gkr::DeviceFractionTree::from_device_top(stream.clone(), p, q, top).ok()?;
         crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
         let output = std::sync::OnceLock::new();
         if build == Build::Eager {
