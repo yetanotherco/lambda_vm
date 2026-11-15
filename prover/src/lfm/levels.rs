@@ -152,10 +152,40 @@ fn build_level(program: LfmProgram, family: WlfmFamily, on_host: bool) -> Result
     Ok(Level { program, build })
 }
 
+/// The levels after a chain's first (whose build is `first`), each the W-leg
+/// over the one below, built until `stop`; `on_host` commits the prepared
+/// stacks on the host (as a verifier does), the card holding none of them.
+fn build_rest(
+    plan: &WhirBlockPlan,
+    first: &WlfmBuild,
+    family: WlfmFamily,
+    stop: LevelStop,
+    on_host: bool,
+) -> Result<Vec<Level>, String> {
+    let mut rest: Vec<Level> = Vec::new();
+    loop {
+        let last = rest.last().map_or(first, |l| &l.build);
+        let count = 1 + rest.len();
+        let more = match stop {
+            LevelStop::Levels(n) => count < n.clamp(1, MAX_LEVELS),
+            LevelStop::Groups(g) => count < MAX_LEVELS && last.artifacts.sizes.len() > g,
+        };
+        if !more {
+            return Ok(rest);
+        }
+        let child = child_of_build(plan, last);
+        rest.push(build_level(wlfm_leg_program(&child)?, family, on_host)?);
+    }
+}
+
 /// Level `k + 1`'s view of level `k`: its artifacts and the top's word count.
 pub fn child_of(plan: &WhirBlockPlan, level: &Level) -> WlfmChild {
+    child_of_build(plan, &level.build)
+}
+
+fn child_of_build(plan: &WhirBlockPlan, build: &WlfmBuild) -> WlfmChild {
     WlfmChild {
-        artifacts: level.build.artifacts.clone(),
+        artifacts: build.artifacts.clone(),
         num_public_words: plan.top_layout().total(),
     }
 }
@@ -336,6 +366,12 @@ pub(crate) fn level1_pieces(marks: &[u32]) -> Vec<(std::ops::Range<u32>, std::op
 /// when the work runs moves. `beside = false` is the control: level 1's
 /// groups land only once the base has ended.
 ///
+/// `build_beside` builds every level (its prepared stacks committed on the
+/// HOST, as a verifier commits them, so the card holds none of them through
+/// the proves) on a thread of its own the moment level 1's program is
+/// emitted, beside phase B; `false` (today's) builds them on the card after
+/// the base. The same roots either way, so the same proofs.
+///
 /// Under [`WlfmFamily::B3`] the base is the 7-round BLAKE3 base
 /// (`format.zf.base` must be `BaseFormat::B3_WHIR`, [`check_base`]), admitted
 /// for this prove alone because its levels are BLAKE3 too
@@ -352,6 +388,7 @@ pub fn prove_block_levels(
     family: WlfmFamily,
     stop: LevelStop,
     beside: bool,
+    build_beside: bool,
 ) -> Result<LevelsRun, String> {
     use super::executor::{ArenaPiece, StreamedExecution};
     use super::word::LfmWord;
@@ -417,7 +454,6 @@ pub fn prove_block_levels(
     type Level1 = (
         f64,
         f64,
-        LfmProgram,
         super::executor::LfmExecution,
         f64,
         f64,
@@ -427,7 +463,26 @@ pub fn prove_block_levels(
     );
     let base_end: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     let base_end_ref = &base_end;
+    // Level 1's program, emitted by its thread and read by the builder's.
+    let program_cell: std::sync::OnceLock<LfmProgram> = std::sync::OnceLock::new();
+    let program_ref = &program_cell;
+    let (btx, brx) = mpsc::channel::<()>();
     let result = std::thread::scope(|scope| {
+        // The builder's thread (`build_beside`): every level, on the host, as
+        // soon as level 1's program exists.
+        let builder = build_beside.then(|| {
+            scope.spawn(move || -> Result<(WlfmBuild, Vec<Level>, f64), String> {
+                brx.recv()
+                    .map_err(|_| "level 1's program was never emitted")?;
+                let plan = plan_ref.get().ok_or("the plan is set")?;
+                let program = program_ref.get().ok_or("the program is set")?;
+                let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+                let first =
+                    build_wlfm_under(program, hasher, LEVEL_RATE, level_levers(family), true)?;
+                let rest = build_rest(plan, &first, family, stop, true)?;
+                Ok((first, rest, now()))
+            })
+        });
         // Level 1's thread: the plan, the program, then its execute, a piece
         // landed as soon as phase B has finished its groups.
         let level1 = scope.spawn(move || -> Result<Level1, String> {
@@ -445,6 +500,9 @@ pub fn prove_block_levels(
             let emitted = now();
             let _ = plan_ref.set(plan);
             let plan = plan_ref.get().ok_or("the plan is set")?;
+            let _ = program_ref.set(program);
+            let program = program_ref.get().ok_or("the program is set")?;
+            let _ = btx.send(());
             let pieces = level1_pieces(&marks);
             let npieces = pieces.len();
             let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
@@ -462,7 +520,7 @@ pub fn prove_block_levels(
                 (0..npieces).map(|_| std::cell::OnceCell::new()).collect();
             let mut by_group: Vec<Option<Vec<LfmWord>>> = vec![None; marks.len() - 1];
             let execute_from = now();
-            let mut ex = StreamedExecution::new_pieced(&program, arena_pieces, &hasher)
+            let mut ex = StreamedExecution::new_pieced(program, arena_pieces, &hasher)
                 .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
             let mut landed = vec![false; npieces];
             let (mut waves_before, mut wave_secs_before) = (0usize, 0.0f64);
@@ -529,7 +587,6 @@ pub fn prove_block_levels(
             Ok((
                 planned,
                 emitted,
-                program,
                 execution,
                 execute_from,
                 executed,
@@ -558,13 +615,16 @@ pub fn prove_block_levels(
         let _ = base_end_ref.set(now());
         *stx.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ptx.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        (proved, level1.join())
+        let level1 = level1.join();
+        let built = builder.map(|b| b.join());
+        (proved, level1, built)
     });
-    let (proved, level1) = result;
+    let (proved, level1, built_beside) = result;
     let (base_proof, base_stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
     times.base = base_end.get().copied().unwrap_or_else(now);
-    let (planned, emitted, program, execution, execute_from, executed, npieces, waves, wave_secs) =
+    let (planned, emitted, execution, execute_from, executed, npieces, waves, wave_secs) =
         level1.map_err(|_| "level 1's thread panicked")??;
+    let program = program_cell.into_inner().ok_or("no level 1 program")?;
     times.planned = planned;
     times.emitted = emitted;
     times.pieces = npieces;
@@ -573,24 +633,23 @@ pub fn prove_block_levels(
     times.execute_tail = (executed - times.base).max(0.0);
     let plan = plan_cell.into_inner().ok_or("no plan")?;
 
-    // Every level's build, on the card after the base (the first cut: the
-    // builds beside phase B are a measurement still to make).
-    let first = build_level(program, family, false)?;
-    let mut levels = vec![first];
-    let more = |levels: &[Level]| -> bool {
-        match stop {
-            LevelStop::Levels(n) => levels.len() < n.clamp(1, MAX_LEVELS),
-            LevelStop::Groups(g) => {
-                levels.len() < MAX_LEVELS
-                    && levels.last().expect("a level").build.artifacts.sizes.len() > g
-            }
+    // Every level's build: beside phase B on the host (`build_beside`), or on
+    // the card after the base (today's).
+    let levels = match built_beside {
+        Some(built) => {
+            let (build, rest, at) = built.map_err(|_| "the builder's thread panicked")??;
+            times.built = at;
+            std::iter::once(Level { program, build })
+                .chain(rest)
+                .collect::<Vec<_>>()
+        }
+        None => {
+            let first = build_level(program, family, false)?;
+            let rest = build_rest(&plan, &first.build, family, stop, false)?;
+            times.built = now();
+            std::iter::once(first).chain(rest).collect::<Vec<_>>()
         }
     };
-    while more(&levels) {
-        let child = child_of(&plan, levels.last().expect("a level"));
-        levels.push(build_level(wlfm_leg_program(&child)?, family, false)?);
-    }
-    times.built = now();
 
     // Level 1: fill and prove; then each level over the one below.
     let mut proofs: Vec<WlfmProof> = Vec::with_capacity(levels.len());
