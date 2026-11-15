@@ -155,10 +155,33 @@ pub const BLOCK_ECSM_MAX_VARS: usize = 17;
 pub const BLOCK_COPY_MAX_VARS: usize = 21;
 
 /// The tallest CPU table a block statement may state, in variables: a
-/// verifier constant ([`block_cpu_heights`]), the block's chunk height
-/// (`BlockOptions::production`'s 2^21). The CPU tables' total stays under the
+/// verifier constant ([`block_cpu_heights`]), at least the prover's CPU cap
+/// (`BlockOptions::production`'s 2^21 by default, 2^22 under
+/// `LAMBDA_VM_BLOCK_CPU_ROWS_LOG2=22`). The CPU tables' total stays under the
 /// clock's bound (`tables::cpu::validate_heights`).
-pub const BLOCK_CPU_MAX_VARS: usize = 21;
+pub const BLOCK_CPU_MAX_VARS: usize = 22;
+
+/// `LAMBDA_VM_BLOCK_CPU_ROWS_LOG2`: the prover's cap on a CPU table, in
+/// variables — 21 (unset, today's) or 22; every other table keeps 2^21. Its
+/// two values have the same length, so an A/B's environment bytes are equal.
+pub(crate) fn block_cpu_rows_log2() -> usize {
+    static LOG2: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LOG2.get_or_init(|| {
+        block_cpu_rows_log2_from(
+            std::env::var("LAMBDA_VM_BLOCK_CPU_ROWS_LOG2")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`block_cpu_rows_log2`]'s reading: `22` raises the cap, anything else is 21.
+pub(crate) fn block_cpu_rows_log2_from(value: Option<&str>) -> usize {
+    match value.map(str::trim) {
+        Some("22") => 22,
+        _ => 21,
+    }
+}
 
 /// The tallest table a block statement may state, in variables: a verifier
 /// constant ([`check_table_heights`]). A group stacks at `want.min(cap).max(tallest)`
@@ -1293,7 +1316,10 @@ impl BlockOptions {
     /// KECCAK at 2^18, ECSM at 2^17, windows of 2^20 cycles.
     pub fn production() -> Self {
         Self {
-            max_rows: MaxRowsConfig::uniform(1 << 21),
+            max_rows: MaxRowsConfig {
+                cpu: 1 << block_cpu_rows_log2(),
+                ..MaxRowsConfig::uniform(1 << 21)
+            },
             keccak_rnd_rows_log2: BLOCK_KECCAK_RND_ROWS_LOG2,
             ecdas_rows_log2: BLOCK_ECDAS_ROWS_LOG2,
             keccak_rows_log2: BLOCK_KECCAK_ROWS_LOG2,
@@ -1776,6 +1802,8 @@ pub struct BlockWhirProof {
 /// Where a block's prove spent its time, for the readout. Seconds.
 #[derive(Clone, Debug, Default)]
 pub struct BlockStamps {
+    /// The CPU tables' heights the statement states, in variables.
+    pub cpu_heights: Vec<u8>,
     pub execute: f64,
     pub build: f64,
     /// KECCAK_RND split, AIRs, transposition and layouts.
@@ -2301,6 +2329,22 @@ impl BlockStamps {
             self.cells as f64 / 1e9,
             tree as f64 / (1u64 << 30) as f64,
         );
+        if !self.cpu_heights.is_empty() {
+            let mut by: std::collections::BTreeMap<u8, usize> = std::collections::BTreeMap::new();
+            for &n in &self.cpu_heights {
+                *by.entry(n).or_default() += 1;
+            }
+            let parts: Vec<String> = by
+                .iter()
+                .rev()
+                .map(|(n, k)| format!("2^{n} x {k}"))
+                .collect();
+            out.push_str(&format!(
+                "BLOCK CPU HEIGHTS: {} tables · {}\n",
+                self.cpu_heights.len(),
+                parts.join(" · ")
+            ));
+        }
         for (g, s) in self.groups.iter().enumerate() {
             out.push_str(&format!(
                 "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} paid {:.3} commit {:.3} retire {:.3} from@{:.2} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}{}\n",
@@ -7451,6 +7495,14 @@ fn prove_streamed(
         })?;
         stamps.tables = laid.shapes.len();
         stamps.cells = laid.shapes.iter().map(|&(w, n)| w << n).sum();
+        let cpu_start = crate::cpu_proof_start(true, &laid.table_counts);
+        stamps.cpu_heights = laid
+            .shapes
+            .iter()
+            .skip(cpu_start)
+            .take(laid.table_counts.cpu)
+            .map(|&(_, n)| n as u8)
+            .collect();
 
         let config = format.chain_config(&laid.shapes);
         if config.log_blowup != commit_config.log_blowup

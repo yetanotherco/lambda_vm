@@ -5905,3 +5905,68 @@ fn a_wrong_row_records_table_is_refused_by_the_verifier() {
         );
     }
 }
+
+/// The prover's CPU cap reads 21 unset and for any word but `22`, which
+/// raises it; the two values have the same length.
+#[test]
+fn the_cpu_cap_knob_reads_21_or_22() {
+    use crate::block_whir::block_cpu_rows_log2_from;
+    assert_eq!(block_cpu_rows_log2_from(None), 21);
+    assert_eq!(block_cpu_rows_log2_from(Some("21")), 21);
+    assert_eq!(block_cpu_rows_log2_from(Some("22")), 22);
+    assert_eq!(block_cpu_rows_log2_from(Some(" 22 ")), 22);
+    assert_eq!(block_cpu_rows_log2_from(Some("23")), 21);
+}
+
+/// A statement's CPU tables are bounded by the verifier's constant: 2^22 rows
+/// are taken, 2^23 are refused, whatever the prover's cap.
+#[test]
+fn a_cpu_table_past_the_verifiers_bound_is_refused() {
+    use crate::block_whir::{BLOCK_CPU_MAX_VARS, block_cpu_heights};
+    assert_eq!(BLOCK_CPU_MAX_VARS, 22);
+    let counts = crate::TableCounts {
+        cpu: 2,
+        ..chunked_counts()
+    };
+    let start = crate::cpu_proof_start(true, &counts);
+    let stated = |a: u8, b: u8| {
+        let mut vars = vec![0u8; start + counts.cpu];
+        vars[start] = a;
+        vars[start + 1] = b;
+        vars
+    };
+    assert_eq!(
+        block_cpu_heights(&counts, &stated(22, 20)).expect("2^22 is taken"),
+        vec![1 << 22, 1 << 20]
+    );
+    assert!(
+        block_cpu_heights(&counts, &stated(23, 20)).is_err(),
+        "2^23 is refused"
+    );
+    assert!(
+        block_cpu_heights(&counts, &stated(21, 23)).is_err(),
+        "a later table past it too"
+    );
+}
+
+/// ★ A streamed block whose CPU tables are cut at twice the other tables'
+/// height proves and verifies, its statement stating the taller CPU tables.
+#[test]
+fn a_streamed_block_with_the_cpu_cap_doubled_proves_and_verifies() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let max_rows = MaxRowsConfig {
+        cpu: MaxRowsConfig::small().cpu * 2,
+        ..MaxRowsConfig::small()
+    };
+    let proof = prove(&elf, &format, &streamed(max_rows.clone(), 16, 3));
+    let start = crate::cpu_proof_start(true, &proof.table_counts);
+    let cpu: Vec<u8> = proof.table_num_vars[start..start + proof.table_counts.cpu].to_vec();
+    let cap = max_rows.cpu.trailing_zeros() as u8;
+    assert!(cpu.len() >= 2, "several CPU tables: {cpu:?}");
+    assert!(
+        cpu[..cpu.len() - 1].iter().all(|&n| n == cap),
+        "full CPU tables at the doubled cap: {cpu:?}"
+    );
+    assert!(verify(&proof, &elf, &format));
+}
