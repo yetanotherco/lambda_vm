@@ -133,14 +133,12 @@ pub fn reset_counts() {
     }
 }
 
-#[cfg(test)]
 thread_local! {
     /// [`counts`] of this thread's traces, never reset.
     static THREAD_COUNTS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
 }
 
 /// [`counts`] of the traces this thread built, since the thread began.
-#[cfg(test)]
 pub(crate) fn thread_counts() -> [usize; 4] {
     THREAD_COUNTS.with(std::cell::Cell::get)
 }
@@ -148,7 +146,6 @@ pub(crate) fn thread_counts() -> [usize; 4] {
 /// One more trace in [`counts`] slot `i`.
 fn count(i: usize) {
     COUNTS[i].fetch_add(1, Relaxed);
-    #[cfg(test)]
     THREAD_COUNTS.with(|c| {
         let mut n = c.get();
         n[i] += 1;
