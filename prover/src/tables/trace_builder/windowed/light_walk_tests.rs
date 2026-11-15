@@ -113,6 +113,7 @@ fn walked(
         decode,
         order,
         format,
+        crate::tables::fused_memory::MemoryFormat::Split,
         false,
         batch,
         false,
@@ -211,7 +212,7 @@ fn light_is_todays(
         for op in &today.cpu_ops {
             decode.op(op).count_bitwise_into(&mut cpu_lookups);
         }
-        let routed = route_ops_one_pass(&today.cpu_ops, &decode, &today.walk.cpu32_ops);
+        let routed = route_ops_one_pass(&today.cpu_ops, &decode, &today.walk.cpu32_ops, true);
         let want = lists(today);
         for (level, (light, refused)) in walks.iter().enumerate().skip(1) {
             let what = format!("{what} level {level}");

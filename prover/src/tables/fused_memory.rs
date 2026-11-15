@@ -26,13 +26,9 @@
 //!   `write2 + write4 + write8`, bytes 2 and 3 at `write4 + write8`, bytes 4 to
 //!   7 at `write8`.
 
-// No walk routes an access to the fused tables yet: until one does, only the
-// tests reach the records, the fills and the lookup counts.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 
-use super::bitwise::{BitwiseHistogram, BitwiseOperation, BitwiseOperationType};
+use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 use super::memw_aligned::step_fits_limbs;
 use super::types::BusId;
 
@@ -209,23 +205,18 @@ pub(crate) fn step_limbs(step: u32) -> (u16, u16) {
 }
 
 /// The three `IS_HALF` lookups of a fused row's memory check
-/// ([`memory_check_interactions`]), counted into `histogram`: the span
-/// `address[0] + width − 1` and the step's two limbs.
+/// ([`memory_check_interactions`]): the span `address[0] + width − 1` and the
+/// step's two limbs.
 #[inline]
-pub(crate) fn count_memory_check_into(
+pub(crate) fn memory_check_lookups(
     address: u64,
     width: u8,
     step: u32,
-    histogram: &mut BitwiseHistogram,
-) {
+) -> impl Iterator<Item = BitwiseOperation> {
     let span = (address & 0xFFFF) as u32 + u32::from(width) - 1;
     debug_assert!(span <= 0xFFFF, "an aligned access stays in its low half");
     let (d0, d1) = step_limbs(step);
-    for half in [span as u16, d0, d1] {
-        histogram.bump(BitwiseOperation::halfword(
-            BitwiseOperationType::IsHalf,
-            half as u8,
-            (half >> 8) as u8,
-        ));
-    }
+    [span as u16, d0, d1].into_iter().map(|half| {
+        BitwiseOperation::halfword(BitwiseOperationType::IsHalf, half as u8, (half >> 8) as u8)
+    })
 }

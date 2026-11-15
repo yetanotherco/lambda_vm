@@ -136,6 +136,9 @@ pub mod max_rows {
     pub const BYTEWISE: usize = 1 << 20;
     pub const STORE: usize = 1 << 20;
     pub const CPU32: usize = 1 << 19;
+    // The fused memory format's tables, at LOAD's and STORE's rows.
+    pub const MEM_LOAD: usize = 1 << 20;
+    pub const MEM_STORE: usize = 1 << 20;
 }
 
 /// Per-table maximum row limits, configurable for different environments.
@@ -158,6 +161,9 @@ pub struct MaxRowsConfig {
     pub bytewise: usize,
     pub store: usize,
     pub cpu32: usize,
+    /// The fused memory format's MEM_LOAD and MEM_STORE tables.
+    pub mem_load: usize,
+    pub mem_store: usize,
 }
 
 /// The uniform table cap this process proves at, or `None` for the production
@@ -213,6 +219,8 @@ impl Default for MaxRowsConfig {
             bytewise: max_rows::BYTEWISE,
             store: max_rows::STORE,
             cpu32: max_rows::CPU32,
+            mem_load: max_rows::MEM_LOAD,
+            mem_store: max_rows::MEM_STORE,
         }
     }
 }
@@ -235,6 +243,8 @@ impl MaxRowsConfig {
             bytewise: rows,
             store: rows,
             cpu32: rows,
+            mem_load: rows,
+            mem_store: rows,
         }
     }
 
@@ -256,6 +266,8 @@ impl MaxRowsConfig {
             bytewise: 1 << 5,
             store: 1 << 5,
             cpu32: 1 << 5,
+            mem_load: 1 << 5,
+            mem_store: 1 << 5,
         }
     }
 }

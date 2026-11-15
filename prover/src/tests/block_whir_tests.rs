@@ -116,6 +116,19 @@ fn groups_of(proof: &BlockWhirProof) -> usize {
     proof.proof.columns.len()
 }
 
+/// A split proof's archived bytes without its last field, the fused memory
+/// pair: the sixteen bytes of `[0, 0]` its archive ends with
+/// (`fused_memory_block_tests` checks the rest is the archive of the proof
+/// before the field); `None` for a fused proof.
+pub(super) fn before_fused_pair<'a>(proof: &BlockWhirProof, bytes: &'a [u8]) -> Option<&'a [u8]> {
+    if proof.fused_memory != [0, 0] {
+        return None;
+    }
+    let (before, pair) = bytes.split_at(bytes.len() - 16);
+    assert_eq!(pair, &[0u8; 16], "the archive ends with the pair");
+    Some(before)
+}
+
 #[test]
 fn a_program_proves_and_verifies_as_one_block() {
     let elf = asm_elf_bytes("sub");
@@ -231,6 +244,17 @@ fn a_block_at_each_blowup_prints_its_proof_bytes() {
             bytes.len(),
             &blake3::hash(&bytes).to_hex()[..32]
         );
+        // The bytes before the fused memory pair (the proof's last field,
+        // `[0, 0]` under the split format): a build from before that field
+        // prints these as its RATE BLOCK DIGEST.
+        if let Some(before) = before_fused_pair(&proof, &bytes) {
+            println!(
+                "RATE BLOCK DIGEST BEFORE FUSED blowup={blowup} groups={} bytes={} blake3={}",
+                groups_of(&proof),
+                before.len(),
+                &blake3::hash(before).to_hex()[..32]
+            );
+        }
     }
 }
 
@@ -3496,7 +3520,13 @@ fn the_statement_bytes_are_what_absorb_block_appends() {
     let frame = block_whir::block_frame(proof.statement(), &elf, &opts, &format).expect("frame");
     let digest = crate::statement::elf_digest(&elf);
     let tag = block_whir::block_statement_tag(&format.zf.base);
-    let bytes = block_whir::block_statement_bytes(proof.statement(), &tag, &digest, &frame.config);
+    let bytes = block_whir::block_statement_bytes(
+        proof.statement(),
+        &tag,
+        &digest,
+        &frame.config,
+        format.memory,
+    );
     let (a, b) = crate::with_whir_hash!(|H| {
         type T = DefaultTranscript<E, <H as multilinear::whir_hash::WhirHash>::Transcript>;
         let mut host = T::new(&[]);
@@ -3506,6 +3536,7 @@ fn the_statement_bytes_are_what_absorb_block_appends() {
             &elf,
             &proof.public_output,
             &proof.table_counts,
+            &[],
             proof.num_private_input_pages,
             &proof.runtime_page_ranges,
             &proof.table_num_vars,
@@ -4810,6 +4841,15 @@ fn block_whir_on_a_real_block() {
         &blake3::hash(&bytes).to_hex()[..32],
         bytes.len()
     );
+    // The bytes before the fused memory pair: a build from before that field
+    // prints these as its BLOCK PROOF DIGEST.
+    if let Some(before) = before_fused_pair(&proof, &bytes) {
+        println!(
+            "BLOCK PROOF DIGEST BEFORE FUSED: {} (blake3 of the {} proof bytes)",
+            &blake3::hash(before).to_hex()[..32],
+            before.len()
+        );
+    }
     assert!(ok, "the block proof must verify");
 }
 

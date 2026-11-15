@@ -176,7 +176,19 @@ fn handed_out_digests(
     max_rows: &MaxRowsConfig,
     window: usize,
 ) -> Vec<(Key, [u64; 2])> {
+    handed_out_digests_as(program, logs, max_rows, window, &|b| Ok(b))
+}
+
+/// [`handed_out_digests`] with the builder `configure` returns.
+fn handed_out_digests_as(
+    program: &Elf,
+    logs: &[executor::vm::logs::Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    configure: &dyn Fn(WindowedTraceBuilder<'_>) -> Result<WindowedTraceBuilder<'_>, crate::Error>,
+) -> Vec<(Key, [u64; 2])> {
     let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
+        .and_then(configure)
         .expect("the builder")
         .drop_streamed_ops()
         .expect("before the first window");
@@ -231,7 +243,7 @@ fn the_regenerator_rebuilds_the_handed_out_chunks() {
             phase_a.len(),
             "{name}: a chunk handed out twice"
         );
-        let mut last = [None; 9];
+        let mut last = [None; StreamTable::ALL.len()];
         for &(t, i) in by_key.keys() {
             last[t] = Some(last[t].map_or(i, |l: usize| l.max(i)));
         }
@@ -300,4 +312,50 @@ fn a_slicer_that_drops_an_op_is_caught() {
         }
     }
     assert!(caught >= 4, "only {caught} tables checked");
+}
+
+/// ★ Under the fused memory format (with the block's register format and
+/// MEMW_A order) the regenerator rebuilds every chunk phase A handed out, the
+/// fused tables' and STORE's (the walk's stores) among them, byte for byte:
+/// tables of 4 rows, phase A walked 5 cycles at a time, the regenerator 1, 5
+/// and 33.
+#[test]
+fn the_regenerator_rebuilds_the_fused_chunks() {
+    use crate::tables::fused_memory::MemoryFormat;
+    use crate::tables::memw_aligned::MemwAlignedOrder;
+    use crate::tables::register::RegisterFormat;
+    let max_rows = MaxRowsConfig::uniform(4);
+    let mut fused_chunks = 0;
+    for name in ["fused_mem_cases", "all_loadstore_32", "test_keccak_multi"] {
+        let program = Elf::load(&asm_elf_bytes(name)).expect("the ELF loads");
+        let logs = run_logs(&program);
+        let phase_a = handed_out_digests_as(&program, &logs, &max_rows, 5, &|b| {
+            b.register_format(RegisterFormat::InRow)?
+                .memw_aligned_order(MemwAlignedOrder::Limbs)?
+                .memory_format(MemoryFormat::Fused)
+        });
+        let fused = [slot(StreamTable::MemLoad), slot(StreamTable::MemStore)];
+        fused_chunks += phase_a
+            .iter()
+            .filter(|((t, _), _)| fused.contains(t))
+            .count();
+        for window in [1, 5, 33] {
+            let regen = RegenBuilder::new(&program, &[], &max_rows)
+                .and_then(|b| b.register_format(RegisterFormat::InRow))
+                .and_then(|b| b.memw_aligned_order(MemwAlignedOrder::Limbs))
+                .and_then(|b| b.memory_format(MemoryFormat::Fused))
+                .expect("the regenerator");
+            let again: BTreeMap<Key, [u64; 2]> = regenerated_digests(regen, &logs, window)
+                .into_iter()
+                .collect();
+            for (key, digest) in &phase_a {
+                assert_eq!(
+                    again.get(key),
+                    Some(digest),
+                    "{name}, windows of {window}: chunk {key:?}"
+                );
+            }
+        }
+    }
+    assert!(fused_chunks > 0, "no fused chunk was handed out");
 }

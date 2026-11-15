@@ -37,6 +37,10 @@ pub(crate) struct RestHeader {
     /// ([`StreamSkip::keccak_rnd_first`], [`hand_on_order_first`]): the order
     /// the layout admits.
     pub(crate) keccak_rnd_first: bool,
+    /// The fused memory format's MEM_LOAD and MEM_STORE tables (none under the
+    /// split format): counted apart from [`crate::TableCounts`], which a proof
+    /// archives as it always has.
+    pub(crate) fused_counts: [usize; 2],
 }
 
 impl RestHeader {
@@ -181,6 +185,9 @@ pub(super) struct FinishPlan<'a> {
     ecdas_ops: BlockVec<ecdas::CompactEcdasOp>,
     hint_ops: BlockVec<hint::HintOperation>,
     ecrec_ops: BlockVec<ecrec::EcrecOperation>,
+    /// The fused memory format's rows; empty under the split format.
+    mem_load_rows: Vec<super::super::mem_load::MemLoadRow>,
+    mem_store_rows: Vec<super::super::mem_store::MemStoreRow>,
     /// IS_WH's rows ([`is_wh::dedup_is_wh_rows`] over KECCAK's state addresses),
     /// shared by its BITWISE lookups and its table.
     is_wh_rows: Vec<(is_wh::IsWhKey, u64)>,
@@ -1004,6 +1011,8 @@ impl<'a> FinishPlan<'a> {
             mut ecdas_ops,
             hint_ops,
             mut ecrec_ops,
+            mem_load_rows,
+            mem_store_rows,
         } = ops;
         // The ECREC witnesses the walkers handed to the pool, in place.
         super::resolve_deferred_ecrec(&mut ecdas_ops, &mut ecrec_ops)?;
@@ -1285,6 +1294,22 @@ impl<'a> FinishPlan<'a> {
             is_wh: usize::from(!is_wh_rows.is_empty()),
             ecrec: usize::from(!ecrec_ops.is_empty()),
         };
+        let fused_counts = [
+            chunked(
+                mem_load_rows.len(),
+                max_rows.mem_load,
+                skip.mem_load,
+                tails,
+                true,
+            )?,
+            chunked(
+                mem_store_rows.len(),
+                max_rows.mem_store,
+                skip.mem_store,
+                tails,
+                true,
+            )?,
+        ];
         if cpu_heights.len() != table_counts.cpu {
             return Err(Error::InvalidTableCounts(format!(
                 "{} CPU heights for {} CPU tables",
@@ -1367,6 +1392,8 @@ impl<'a> FinishPlan<'a> {
             ecdas_ops,
             hint_ops,
             ecrec_ops,
+            mem_load_rows,
+            mem_store_rows,
             is_wh_rows,
             bitwise,
             num_padding_rows,
@@ -1382,6 +1409,7 @@ impl<'a> FinishPlan<'a> {
                 bitwise_last: false,
                 bitwise_from_tables: false,
                 keccak_rnd_first: false,
+                fused_counts,
             },
             cut_line,
             cpu_decoded,
@@ -1462,6 +1490,8 @@ impl<'a> FinishPlan<'a> {
             ecdas_ops,
             hint_ops,
             ecrec_ops,
+            mem_load_rows,
+            mem_store_rows,
             is_wh_rows,
             bitwise,
             num_padding_rows,
@@ -1691,6 +1721,30 @@ impl<'a> FinishPlan<'a> {
                 packed_by(pack, |ops| store::generate_store_trace_as(ops, form)),
             )
         };
+        let gen_mem_loads = || {
+            chunk_and_generate_skipping(
+                &mem_load_rows,
+                max_rows.mem_load,
+                skip.mem_load,
+                skip.tails,
+                true,
+                packed_by(pack, |rows| {
+                    super::super::mem_load::generate_mem_load_trace_segments_as(&[rows], form)
+                }),
+            )
+        };
+        let gen_mem_stores = || {
+            chunk_and_generate_skipping(
+                &mem_store_rows,
+                max_rows.mem_store,
+                skip.mem_store,
+                skip.tails,
+                true,
+                packed_by(pack, |rows| {
+                    super::super::mem_store::generate_mem_store_trace_segments_as(&[rows], form)
+                }),
+            )
+        };
         let gen_cpu32s = || {
             chunk_and_generate_segmented::<cpu32::Cpu32Operation>(
                 &cpu32_ops.segments(),
@@ -1863,6 +1917,7 @@ impl<'a> FinishPlan<'a> {
         let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
         let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
             (None, None, None, None);
+        let (mut mem_loads_slot, mut mem_stores_slot) = (None, None);
         let (mut ecsms_slot, mut ecdases_slot) = (None, None);
         let mut hints_slot = None;
         let mut ecrecs_slot = None;
@@ -1910,6 +1965,8 @@ impl<'a> FinishPlan<'a> {
                 spawn_into!(ecdases_slot, gen_ecdases);
                 spawn_into!(hints_slot, gen_hints);
                 spawn_into!(ecrecs_slot, gen_ecrecs);
+                spawn_into!(mem_loads_slot, gen_mem_loads);
+                spawn_into!(mem_stores_slot, gen_mem_stores);
             });
         } else {
             cpus_slot = Some(gen_cpus());
@@ -1940,6 +1997,8 @@ impl<'a> FinishPlan<'a> {
             ecdases_slot = Some(gen_ecdases());
             hints_slot = Some(gen_hints());
             ecrecs_slot = Some(gen_ecrecs());
+            mem_loads_slot = Some(gen_mem_loads());
+            mem_stores_slot = Some(gen_mem_stores());
         }
 
         build_stamps::mark("p5 end");
@@ -1977,6 +2036,8 @@ impl<'a> FinishPlan<'a> {
         let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
         let hints = hints_slot.expect(PHASE5_RAN)?;
         let ecrecs = ecrecs_slot.expect(PHASE5_RAN)?;
+        let mem_loads = mem_loads_slot.expect(PHASE5_RAN)?;
+        let mem_stores = mem_stores_slot.expect(PHASE5_RAN)?;
         // IS_WH: one table of its rows, none when nothing sent `IS_WH`.
         let is_whs = generate_optional(&is_wh_rows, packed_by(pack, is_wh::generate_is_wh_trace))?;
 
@@ -2000,6 +2061,7 @@ impl<'a> FinishPlan<'a> {
             bitwise_last: _,
             bitwise_from_tables: _,
             keccak_rnd_first: _,
+            fused_counts,
         } = header;
         let traces = Traces {
             cpus,
@@ -2036,6 +2098,8 @@ impl<'a> FinishPlan<'a> {
             bytewises,
             stores,
             cpu32s,
+            mem_loads,
+            mem_stores,
         };
         // The tables are the ones the header counted, or the build is refused: the
         // header is what a statement can be read from before the tables exist.
@@ -2043,6 +2107,12 @@ impl<'a> FinishPlan<'a> {
         if counts_of(&built) != counts_of(&table_counts) {
             return Err(Error::Prover(format!(
                 "the finish built {built:?}, its plan counted {table_counts:?}"
+            )));
+        }
+        if traces.fused_counts() != fused_counts {
+            return Err(Error::Prover(format!(
+                "the finish built {:?} fused tables, its plan counted {fused_counts:?}",
+                traces.fused_counts()
             )));
         }
         Ok(traces)
@@ -2086,7 +2156,7 @@ pub(crate) struct Emitted {
 /// The rest's families in AIR order (`VmAirs::air_refs`), each with its
 /// columns at eight bytes a cell: what a family's first table is estimated
 /// at, before one of them has been built.
-const FAMILIES: [(&str, usize); 29] = [
+const FAMILIES: [(&str, usize); 31] = [
     ("BITWISE", bitwise::cols::NUM_COLUMNS),
     ("DECODE", decode::cols::NUM_COLUMNS),
     ("KECCAK_RC", keccak_rc::cols::NUM_COLUMNS),
@@ -2115,6 +2185,8 @@ const FAMILIES: [(&str, usize); 29] = [
     ("EQ", eq::cols::NUM_COLUMNS),
     ("BYTEWISE", bytewise::cols::NUM_COLUMNS),
     ("STORE", store::cols::NUM_COLUMNS),
+    ("MEM_LOAD", super::super::mem_load::cols::NUM_COLUMNS),
+    ("MEM_STORE", super::super::mem_store::cols::NUM_COLUMNS),
     ("CPU32", cpu32::cols::NUM_COLUMNS),
 ];
 
@@ -2341,6 +2413,8 @@ impl<'a> FinishPlan<'a> {
             ecdas_ops,
             hint_ops,
             ecrec_ops,
+            mem_load_rows,
+            mem_store_rows,
             is_wh_rows,
             bitwise,
             num_padding_rows,
@@ -2839,6 +2913,36 @@ impl<'a> FinishPlan<'a> {
                 packed_if(pack, store::generate_store_trace_as(ops, form))
             },
         )?);
+        // The fused memory format's tables (none under the split format),
+        // after STORE in AIR order.
+        units.extend(vec_units(
+            family("MEM_LOAD"),
+            Arc::new(mem_load_rows),
+            max_rows.mem_load,
+            skip.mem_load,
+            tails,
+            true,
+            move |rows: &[super::super::mem_load::MemLoadRow]| {
+                packed_if(
+                    pack,
+                    super::super::mem_load::generate_mem_load_trace_segments_as(&[rows], form),
+                )
+            },
+        )?);
+        units.extend(vec_units(
+            family("MEM_STORE"),
+            Arc::new(mem_store_rows),
+            max_rows.mem_store,
+            skip.mem_store,
+            tails,
+            true,
+            move |rows: &[super::super::mem_store::MemStoreRow]| {
+                packed_if(
+                    pack,
+                    super::super::mem_store::generate_mem_store_trace_segments_as(&[rows], form),
+                )
+            },
+        )?);
         units.extend(segmented_units(
             family("CPU32"),
             Arc::new(cpu32_ops),
@@ -2851,7 +2955,7 @@ impl<'a> FinishPlan<'a> {
         )?);
 
         // The units are the tables the header counted, or the build is refused.
-        check_units(&units, &header.table_counts)?;
+        check_units(&units, &header.table_counts, header.fused_counts)?;
         if let Some(tables) = &from_tables {
             let adding = [family("LT"), family("BRANCH"), family("BYTEWISE")];
             let built = units
@@ -3216,7 +3320,11 @@ fn keccak_rnd_units<'a>(
 /// The units' tables, family by family, against the header's counts: the same,
 /// or an error ([`FinishPlan::emit_all`]'s refusal). HALT and the four fixed
 /// tables are one each.
-fn check_units(units: &[Unit<'_>], counts: &crate::TableCounts) -> Result<(), Error> {
+fn check_units(
+    units: &[Unit<'_>],
+    counts: &crate::TableCounts,
+    fused: [usize; 2],
+) -> Result<(), Error> {
     let mut made = [0usize; FAMILIES.len()];
     for unit in units {
         let (Unit::Build { family, .. } | Unit::Streamed { family }) = unit;
@@ -3251,9 +3359,14 @@ fn check_units(units: &[Unit<'_>], counts: &crate::TableCounts) -> Result<(), Er
         ecrec: of("ECREC"),
     };
     let fixed = ["BITWISE", "DECODE", "KECCAK_RC", "REGISTER", "HALT"];
-    if counts_of(&units_counts) != counts_of(counts) || fixed.iter().any(|f| of(f) != 1) {
+    let units_fused = [of("MEM_LOAD"), of("MEM_STORE")];
+    if counts_of(&units_counts) != counts_of(counts)
+        || units_fused != fused
+        || fixed.iter().any(|f| of(f) != 1)
+    {
         return Err(Error::Prover(format!(
-            "the streamed finish would build {units_counts:?}, its plan counted {counts:?}"
+            "the streamed finish would build {units_counts:?} and {units_fused:?} fused tables, \
+             its plan counted {counts:?} and {fused:?}"
         )));
     }
     Ok(())

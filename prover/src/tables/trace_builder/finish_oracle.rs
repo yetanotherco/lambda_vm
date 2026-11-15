@@ -58,7 +58,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     mut pre: Option<PreCounted>,
 ) -> Result<Traces, Error> {
     RUNS.with(|runs| runs.set(runs.get() + 1));
-    // The oracle is today's register format's.
+    // The oracle is today's register and memory formats'.
     let CollectedOps {
         cpu_ops,
         cpu_side: _,
@@ -84,6 +84,8 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         mut ecdas_ops,
         hint_ops,
         mut ecrec_ops,
+        mem_load_rows: _,
+        mem_store_rows: _,
     } = ops;
     super::resolve_deferred_ecrec(&mut ecdas_ops, &mut ecrec_ops)?;
     // The CPU, MEMW_A and SHIFT rows counted where they were made
@@ -1018,5 +1020,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         bytewises,
         stores,
         cpu32s,
+        mem_loads: Vec::new(),
+        mem_stores: Vec::new(),
     })
 }

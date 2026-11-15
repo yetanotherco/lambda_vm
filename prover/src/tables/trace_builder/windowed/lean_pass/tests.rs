@@ -168,6 +168,7 @@ impl Setup {
             decode: &self.decode,
             order: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
             registers: crate::tables::register::RegisterFormat::Tokens32,
+            memory: crate::tables::fused_memory::MemoryFormat::Split,
             lookups: self.lookups,
             keep_logs: false,
             batch: self.batch,

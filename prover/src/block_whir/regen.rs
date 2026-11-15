@@ -537,6 +537,8 @@ fn slot(table: StreamTable) -> Option<usize> {
         StreamTable::Shift => Some(6),
         StreamTable::Store => Some(7),
         StreamTable::KeccakRnd => None,
+        StreamTable::MemLoad => Some(8),
+        StreamTable::MemStore => Some(9),
     }
 }
 
@@ -558,7 +560,7 @@ pub(crate) struct Recorder {
 #[derive(Default)]
 struct Recorded {
     /// Per streamed table, its list's length at the end of each window.
-    ends: [Vec<usize>; 8],
+    ends: [Vec<usize>; 10],
     windows: usize,
     recipes: BTreeMap<(usize, usize), Recipe>,
     /// Each recipe's chunk, by its place in the hand-out; `None` for a chunk
@@ -653,7 +655,7 @@ impl Recorder {
     /// The next window, with the ops it added to each streamed table's list
     /// ([`StreamTable::ALL`] order, KECCAK_RND aside), and the chunks its
     /// hand-out completed, in hand-out order.
-    pub(crate) fn window(&self, added: [usize; 8], jobs: &[ChunkJob]) {
+    pub(crate) fn window(&self, added: [usize; 10], jobs: &[ChunkJob]) {
         let mut r = self.lock();
         let w = r.windows;
         r.windows += 1;
@@ -1123,6 +1125,7 @@ impl ShadowRun {
         form: TraceForm,
         order: MemwAlignedOrder,
         registers: crate::tables::register::RegisterFormat,
+        memory: crate::tables::fused_memory::MemoryFormat,
         drop_one_op: Option<StreamTable>,
     ) -> Self {
         let started = Instant::now();
@@ -1146,6 +1149,7 @@ impl ShadowRun {
                 match RegenBuilder::new(&program, &private_input, &max_rows)
                     .and_then(|b| b.memw_aligned_order(order))
                     .and_then(|b| b.register_format(registers))
+                    .and_then(|b| b.memory_format(memory))
                 {
                     Ok(builder) => {
                         #[cfg(test)]
@@ -1958,6 +1962,7 @@ impl LiveRun {
         form: TraceForm,
         order: MemwAlignedOrder,
         registers: crate::tables::register::RegisterFormat,
+        memory: crate::tables::fused_memory::MemoryFormat,
         faults: LiveFaults,
         policy: AheadPolicy,
         gate: Option<Arc<AtomicBool>>,
@@ -2006,6 +2011,7 @@ impl LiveRun {
                 match RegenBuilder::new(&program, &private_input, &max_rows)
                     .and_then(|b| b.memw_aligned_order(order))
                     .and_then(|b| b.register_format(registers))
+                    .and_then(|b| b.memory_format(memory))
                     .and_then(|b| if cpu_logs { b.keep_cpu_logs() } else { Ok(b) })
                 {
                     Ok(builder) => {
@@ -2492,6 +2498,8 @@ pub(crate) struct LiveArgs {
     pub(crate) order: MemwAlignedOrder,
     /// The run's register format (phase A's).
     pub(crate) registers: crate::tables::register::RegisterFormat,
+    /// The run's memory format (phase A's).
+    pub(crate) memory: crate::tables::fused_memory::MemoryFormat,
     pub(crate) faults: LiveFaults,
     pub(crate) policy: AheadPolicy,
 }
@@ -2600,6 +2608,7 @@ impl EarlyStart {
                                 live.form,
                                 live.order,
                                 live.registers,
+                                live.memory,
                                 live.faults,
                                 live.policy,
                                 Some(gate),

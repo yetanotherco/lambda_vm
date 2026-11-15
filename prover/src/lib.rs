@@ -805,6 +805,11 @@ pub(crate) struct VmAirs {
     pub bytewises: Vec<VmAir>,
     pub stores: Vec<VmAir>,
     pub cpu32s: Vec<VmAir>,
+    /// The fused memory format's MEM_LOAD and MEM_STORE tables
+    /// ([`Self::with_fused_memory`]); none under the split format, and none
+    /// in any proof but a block's.
+    pub mem_loads: Vec<VmAir>,
+    pub mem_stores: Vec<VmAir>,
 }
 
 /// What REGISTER is preprocessed against: the commitment **and** the two public
@@ -1046,7 +1051,9 @@ impl VmAirs {
                 self.eqs.len(),
                 self.bytewises.len(),
                 self.stores.len(),
-                self.cpu32s.len()
+                self.cpu32s.len(),
+                self.mem_loads.len(),
+                self.mem_stores.len()
             ],
             [
                 traces.cpus.len(),
@@ -1071,7 +1078,9 @@ impl VmAirs {
                 traces.eqs.len(),
                 traces.bytewises.len(),
                 traces.stores.len(),
-                traces.cpu32s.len()
+                traces.cpu32s.len(),
+                traces.mem_loads.len(),
+                traces.mem_stores.len()
             ],
             "AIR set and traces disagree on table counts",
         );
@@ -1169,6 +1178,14 @@ impl VmAirs {
             pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.stores.iter().zip(traces.stores.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        // The fused memory format's tables, right after STORE's, in both
+        // orders.
+        for (air, trace) in self.mem_loads.iter().zip(traces.mem_loads.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.mem_stores.iter().zip(traces.mem_stores.iter_mut()) {
             pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.cpu32s.iter().zip(traces.cpu32s.iter_mut()) {
@@ -1302,6 +1319,12 @@ impl VmAirs {
             refs.push(air.as_ref());
         }
         for air in &self.stores {
+            refs.push(air.as_ref());
+        }
+        for air in &self.mem_loads {
+            refs.push(air.as_ref());
+        }
+        for air in &self.mem_stores {
             refs.push(air.as_ref());
         }
         for air in &self.cpu32s {
@@ -1671,7 +1694,33 @@ impl VmAirs {
             bytewises,
             stores,
             cpu32s,
+            mem_loads: Vec::new(),
+            mem_stores: Vec::new(),
         }
+    }
+
+    /// The fused memory format's tables in this set: `counts[0]` MEM_LOAD and
+    /// `counts[1]` MEM_STORE tables, named `MEM_LOAD[i]` and `MEM_STORE[i]`
+    /// (`tables::fused_memory::MemoryFormat::Fused`). They sit right after
+    /// STORE's in both orders.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn with_fused_memory(&mut self, opts: &ProofOptions, counts: [usize; 2]) {
+        self.mem_loads = (0..counts[0])
+            .map(|i| {
+                Box::new(
+                    crate::test_utils::create_mem_load_air(opts)
+                        .with_name(&format!("MEM_LOAD[{i}]")),
+                ) as VmAir
+            })
+            .collect();
+        self.mem_stores = (0..counts[1])
+            .map(|i| {
+                Box::new(
+                    crate::test_utils::create_mem_store_air(opts)
+                        .with_name(&format!("MEM_STORE[{i}]")),
+                ) as VmAir
+            })
+            .collect();
     }
 }
 

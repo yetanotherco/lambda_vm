@@ -1747,6 +1747,11 @@ struct MemwBuckets {
     /// every register access that reaches a bucket is a residual register row (word
     /// instructions', the chips', HALT's and keep-alives), whatever its step.
     registers: super::register::RegisterFormat,
+    /// The run's memory format: under
+    /// [`MemoryFormat::Fused`](super::fused_memory::MemoryFormat::Fused) a CPU
+    /// load or store this bucket would route to MEMW_A is a fused row of the
+    /// walk's ([`walk_cpu_ops`]) and never reaches it.
+    memory: super::fused_memory::MemoryFormat,
     /// The first aligned access [`memw_aligned::AlignedRow::from_memw`]
     /// refused (none today: the routing admits only what it takes), returned by
     /// the walk as an error ([`Self::refusal`]) instead of a wrapped row.
@@ -1762,8 +1767,16 @@ impl MemwBuckets {
             words: None,
             order,
             registers: super::register::RegisterFormat::Tokens32,
+            memory: super::fused_memory::MemoryFormat::Split,
             refused: None,
         }
+    }
+
+    /// Whether the CPU's aligned loads and stores are fused rows (the fused
+    /// memory format).
+    #[inline]
+    fn fused(&self) -> bool {
+        self.memory == super::fused_memory::MemoryFormat::Fused
     }
 
     /// Whether register accesses are residual register rows (the in-row register format).
@@ -2019,8 +2032,12 @@ fn collect_ops_from_cpu(
         copy_ops,
         hint_ops,
         ecrec_ops,
-        // The whole-run build is the per-table STARK's (today's register format).
+        // The whole-run build is the per-table STARK's (today's register and
+        // memory formats).
         cpu_side: _,
+        mem_load_rows: _,
+        mem_store_rows: _,
+        store_ops: _,
     } = out;
     Ok((
         memw,
@@ -2118,6 +2135,14 @@ pub(crate) struct WalkOutputs {
     /// slots' previous timestamps and `rd`'s old value), in the ops' order;
     /// empty otherwise.
     cpu_side: Vec<super::cpu::CpuSide>,
+    /// Under the fused memory format, the CPU loads and stores checked in one
+    /// row with their memory tokens, in the ops' order; empty otherwise.
+    mem_load_rows: Vec<super::mem_load::MemLoadRow>,
+    mem_store_rows: Vec<super::mem_store::MemStoreRow>,
+    /// Under the fused memory format, the CPU's other stores' STORE ops, in
+    /// the ops' order (the walk routes every store there, the routing none);
+    /// empty otherwise.
+    store_ops: Vec<store::StoreOperation>,
 }
 
 impl WalkOutputs {
@@ -2146,6 +2171,9 @@ impl WalkOutputs {
             hint_ops: Vec::new(),
             ecrec_ops: Vec::new(),
             cpu_side: Vec::new(),
+            mem_load_rows: Vec::new(),
+            mem_store_rows: Vec::new(),
+            store_ops: Vec::new(),
         }
     }
 
@@ -2182,6 +2210,11 @@ impl WalkOutputs {
         out.load_ops = for_the_card(size(sizes.load));
         out.lt_ops = Vec::with_capacity(size(sizes.lt));
         out.shift_ops = for_the_card(size(sizes.shift));
+        // The fused rows, under the fused memory format (none else).
+        if sizes.mem_load > 0 || sizes.mem_store > 0 {
+            out.mem_load_rows = for_the_card(size(sizes.mem_load));
+            out.mem_store_rows = for_the_card(size(sizes.mem_store));
+        }
         out
     }
 
@@ -2196,6 +2229,8 @@ impl WalkOutputs {
         multilinear::pinned::shrink(&mut self.memw.general);
         multilinear::pinned::shrink(&mut self.load_ops);
         multilinear::pinned::shrink(&mut self.shift_ops);
+        multilinear::pinned::shrink(&mut self.mem_load_rows);
+        multilinear::pinned::shrink(&mut self.mem_store_rows);
     }
 
     /// The bytes its lists take on the heap (capacities, not lengths).
@@ -2204,6 +2239,9 @@ impl WalkOutputs {
             + vec_heap_bytes(&self.load_ops)
             + vec_heap_bytes(&self.lt_ops)
             + vec_heap_bytes(&self.shift_ops)
+            + vec_heap_bytes(&self.mem_load_rows)
+            + vec_heap_bytes(&self.mem_store_rows)
+            + vec_heap_bytes(&self.store_ops)
             + vec_heap_bytes(&self.bitwise_ops)
             + vec_heap_bytes(&self.keccak_ops)
             + vec_heap_bytes(&self.blake3_ops)
@@ -2238,6 +2276,8 @@ pub(crate) struct WalkSizes {
     load: usize,
     lt: usize,
     shift: usize,
+    mem_load: usize,
+    mem_store: usize,
     /// The six segments the CPU ops route to (BRANCH, MUL, DVRM, EQ,
     /// BYTEWISE, STORE), where the walker routes its window.
     routed: [usize; 6],
@@ -2254,6 +2294,8 @@ impl WalkSizes {
             load: walk.load_ops.len(),
             lt: walk.lt_ops.len(),
             shift: walk.shift_ops.len(),
+            mem_load: walk.mem_load_rows.len(),
+            mem_store: walk.mem_store_rows.len(),
             routed: [0; 6],
         }
     }
@@ -2391,8 +2433,12 @@ fn walk_cpu_ops<const REST: bool>(
         hint_ops,
         ecrec_ops,
         cpu_side,
+        mem_load_rows,
+        mem_store_rows,
+        store_ops,
     } = out;
     let in_row = memw.in_row();
+    let fused = memw.fused();
     // This call's COPY rows start here; earlier calls' are already in the list.
     let copy_ops_before = copy_ops.len();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
@@ -2436,19 +2482,52 @@ fn walk_cpu_ops<const REST: bool>(
             } else {
                 collect_load_op_from_cpu(op, memory_state)
             };
-            memw.push(memw_op);
-            if lookups {
-                // MSB8 lookups for the sign bit extraction.
-                bitwise_ops.extend(load_op.collect_bitwise_ops());
+            // Under the fused memory format, a load MEMW_A would take is one
+            // MEM_LOAD row, its lookups the row's.
+            match fused
+                .then(|| fused_load(&memw_op, &load_op, memw))
+                .flatten()
+            {
+                Some(row) => {
+                    if lookups {
+                        bitwise_ops.extend(row.bitwise_ops());
+                    }
+                    mem_load_rows.push(row);
+                }
+                None => {
+                    memw.push(memw_op);
+                    if lookups {
+                        // MSB8 lookups for the sign bit extraction.
+                        bitwise_ops.extend(load_op.collect_bitwise_ops());
+                    }
+                    load_ops.push(load_op);
+                }
             }
-            load_ops.push(load_op);
         } else if op.decode.fields.is_store() {
             let memw_op = if light {
                 collect_store_op_from_access(op, memory_state)
             } else {
                 collect_store_op_from_cpu(op, memory_state)
             };
-            memw.push(memw_op);
+            // Under the fused memory format the walk routes every store: one
+            // MEMW_A would take is one MEM_STORE row, its lookups the row's;
+            // any other a STORE op beside its MEMW write.
+            if fused {
+                match fused_store(&memw_op, op.rv2, memw) {
+                    Some(row) => {
+                        if lookups {
+                            bitwise_ops.extend(row.bitwise_ops());
+                        }
+                        mem_store_rows.push(row);
+                    }
+                    None => {
+                        memw.push(memw_op);
+                        store_ops.push(route_store(op));
+                    }
+                }
+            } else {
+                memw.push(memw_op);
+            }
         }
 
         // Collect register operations (M1, M3, M5). Under the in-row register
@@ -2876,6 +2955,72 @@ fn load_ops_with_old(op: CpuOp<'_>, old_timestamps: [u64; 8]) -> (MemwOperation,
     );
 
     (memw_op, load_op)
+}
+
+/// A CPU load's MEM_LOAD row (the fused memory format): `Some` when its MEMW
+/// read is one [`classify_memw`] routes to MEMW_A, the row laid out from it
+/// and its LOAD op; `None` for any other, which stays a LOAD op and a MEMW
+/// read. A row the routing admits but its record refuses is kept as the
+/// bucket's refusal (the walk returns it as an error), never laid out wrong.
+#[inline]
+fn fused_load(
+    memw_op: &MemwOperation,
+    load_op: &LoadOperation,
+    memw: &mut MemwBuckets,
+) -> Option<super::mem_load::MemLoadRow> {
+    if classify_memw(memw_op, memw.order) != MemwRoute::Aligned {
+        return None;
+    }
+    match super::mem_load::MemLoadRow::new(
+        load_op.base_address,
+        load_op.timestamp,
+        memw_op.old_timestamp[0],
+        load_op.width,
+        load_op.signed,
+        load_op.res,
+    ) {
+        Ok(row) => Some(row),
+        Err(why) => {
+            memw.refused.get_or_insert(format!("MEM_LOAD: {why}"));
+            None
+        }
+    }
+}
+
+/// A CPU store's MEM_STORE row (the fused memory format): `Some` when its
+/// MEMW write is one [`classify_memw`] routes to MEMW_A, the row laid out from
+/// it and the register's value `value`; `None` for any other ([`fused_load`]'s
+/// rule).
+#[inline]
+fn fused_store(
+    memw_op: &MemwOperation,
+    value: u64,
+    memw: &mut MemwBuckets,
+) -> Option<super::mem_store::MemStoreRow> {
+    if classify_memw(memw_op, memw.order) != MemwRoute::Aligned {
+        return None;
+    }
+    let old = memw_op
+        .old
+        .iter()
+        .enumerate()
+        .fold(0u64, |packed, (i, &byte)| {
+            packed | (u64::from(byte) & 0xFF) << (8 * i)
+        });
+    match super::mem_store::MemStoreRow::new(
+        memw_op.base_address,
+        memw_op.timestamp,
+        memw_op.old_timestamp[0],
+        memw_op.width,
+        value,
+        old,
+    ) {
+        Ok(row) => Some(row),
+        Err(why) => {
+            memw.refused.get_or_insert(format!("MEM_STORE: {why}"));
+            None
+        }
+    }
 }
 
 /// Collects a STORE operation as a MEMW write from CpuOperation.
@@ -7227,6 +7372,10 @@ pub struct Traces {
     pub bytewises: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub stores: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub cpu32s: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    /// The fused memory format's MEM_LOAD and MEM_STORE tables (split into
+    /// chunks of their max_rows); empty under the split format.
+    pub mem_loads: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub mem_stores: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
@@ -7272,6 +7421,10 @@ struct CollectedOps {
     hint_ops: BlockVec<hint::HintOperation>,
     // ECDSA public-key recovery.
     ecrec_ops: BlockVec<ecrec::EcrecOperation>,
+    /// The fused memory format's MEM_LOAD and MEM_STORE rows; empty under
+    /// the split format.
+    mem_load_rows: Vec<super::mem_load::MemLoadRow>,
+    mem_store_rows: Vec<super::mem_store::MemStoreRow>,
 }
 
 /// How many leading chunks of each streamed table a windowed build already
@@ -7424,6 +7577,18 @@ pub struct StreamSkip {
     /// [`RegisterFormat`]: super::register::RegisterFormat
     /// [`RegisterFormat::InRow`]: super::register::RegisterFormat::InRow
     pub register_format: super::register::RegisterFormat,
+    /// How the CPU's loads and stores are checked ([`MemoryFormat`], the
+    /// block format's): under [`MemoryFormat::Fused`] the walk makes one
+    /// MEM_LOAD or MEM_STORE row of each it would route to MEMW_A, and routes
+    /// every store itself. The default is today's.
+    ///
+    /// [`MemoryFormat`]: super::fused_memory::MemoryFormat
+    /// [`MemoryFormat::Fused`]: super::fused_memory::MemoryFormat::Fused
+    pub memory_format: super::fused_memory::MemoryFormat,
+    /// MEM_LOAD and MEM_STORE chunks already handed out (the fused memory
+    /// format's).
+    pub mem_load: usize,
+    pub mem_store: usize,
 }
 
 /// How the tables a block cuts at a fixed number of rows (KECCAK_RND, KECCAK,
@@ -8409,6 +8574,7 @@ fn route_ops(
     cpu_ops: &[CpuOperation],
     decode: &DecodeTable,
     cpu32_ops: &[cpu32::Cpu32Operation],
+    stores: bool,
 ) -> RoutedSegments {
     let ops = || cpu_ops.iter().map(|op| decode.op(op));
     // Collect BRANCH operations from CPU ops where branch_cond = true
@@ -8446,8 +8612,10 @@ fn route_ops(
     // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
     // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
     // table row).
+    // Under the fused memory format the walk routes the stores (`stores`
+    // false): the segment is its list.
     let store_ops: Vec<store::StoreOperation> = ops()
-        .filter(|op| op.decode.fields.is_store())
+        .filter(|op| stores && op.decode.fields.is_store())
         .map(route_store)
         .collect();
 
@@ -8469,8 +8637,9 @@ fn route_ops_one_pass(
     cpu_ops: &[CpuOperation],
     decode: &DecodeTable,
     cpu32_ops: &[cpu32::Cpu32Operation],
+    stores: bool,
 ) -> RoutedSegments {
-    let mut router = CpuRouter::default();
+    let mut router = CpuRouter::default().routing_stores(stores);
     for op in cpu_ops {
         router.push(decode.op(op));
     }
@@ -8490,9 +8659,19 @@ struct CpuRouter {
     eq_ops: Vec<eq::EqOperation>,
     bytewise_ops: Vec<bytewise::BytewiseOperation>,
     store_ops: Vec<store::StoreOperation>,
+    /// Under the fused memory format the walk routes the stores: this router
+    /// routes none.
+    skip_stores: bool,
 }
 
 impl CpuRouter {
+    /// This router routing the stores (`stores`, today's) or leaving them to
+    /// the walk (the fused memory format).
+    fn routing_stores(mut self, stores: bool) -> Self {
+        self.skip_stores = !stores;
+        self
+    }
+
     /// A router whose six segments (BRANCH, MUL, DVRM, EQ, BYTEWISE, STORE)
     /// start with room for `capacities` ops each.
     fn with_capacities(capacities: [usize; 6]) -> Self {
@@ -8504,6 +8683,7 @@ impl CpuRouter {
             eq_ops: Vec::with_capacity(eq),
             bytewise_ops: Vec::with_capacity(bytewise),
             store_ops: Vec::with_capacity(store),
+            skip_stores: false,
         }
     }
 
@@ -8528,7 +8708,7 @@ impl CpuRouter {
                 self.bytewise_ops.push(route_bytewise(op));
             }
         }
-        if f.is_store() {
+        if f.is_store() && !self.skip_stores {
             self.store_ops.push(route_store(op));
         }
     }
@@ -8560,9 +8740,10 @@ fn route_ops_into(
     cpu32_ops: &[cpu32::Cpu32Operation],
     segments: &mut RoutedBlocks,
     histogram: &mut bitwise::BitwiseHistogram,
+    stores: bool,
 ) {
     let dvrm_before = segments.dvrm_filter.len();
-    route_cpu_ops_into(cpu_ops, decode, segments, histogram);
+    route_cpu_ops_into(cpu_ops, decode, segments, histogram, stores);
     route_window_tail_into(cpu32_ops, segments, dvrm_before);
 }
 
@@ -8575,6 +8756,7 @@ fn route_cpu_ops_into(
     decode: &DecodeTable,
     segments: &mut RoutedBlocks,
     histogram: &mut bitwise::BitwiseHistogram,
+    stores: bool,
 ) {
     for op in cpu_ops {
         let op = decode.op(op);
@@ -8601,7 +8783,7 @@ fn route_cpu_ops_into(
                     .extend(std::slice::from_ref(&route_bytewise(op)));
             }
         }
-        if f.is_store() {
+        if stores && f.is_store() {
             segments.store_ops.push(route_store(op));
         }
     }
@@ -8802,6 +8984,7 @@ fn collect_all_ops(
         words: _,
         order: _,
         registers: _,
+        memory: _,
         refused: _,
     } = memw;
 
@@ -8820,7 +9003,7 @@ fn collect_all_ops(
         lt_dvrm_cpu32,
         mul_dvrm_filter,
         mul_dvrm_cpu32,
-    } = route_ops(&cpu_ops, decode, &cpu32_ops);
+    } = route_ops(&cpu_ops, decode, &cpu32_ops, true);
     // The lists are the segments in the order the routing always produced them:
     // each CPU-op filter, then what CPU32 dispatches, then what DVRM implies,
     // each segment a block of its own (no copies).
@@ -8865,6 +9048,8 @@ fn collect_all_ops(
         copy_ops: BlockVec::from_vec(copy_ops),
         hint_ops: BlockVec::from_vec(hint_ops),
         ecrec_ops: BlockVec::from_vec(ecrec_ops),
+        mem_load_rows: Vec::new(),
+        mem_store_rows: Vec::new(),
     })
 }
 
@@ -9157,6 +9342,8 @@ impl Traces {
             bytewises,
             stores,
             cpu32s,
+            mem_loads,
+            mem_stores,
         } = self;
         [
             cpus,
@@ -9182,6 +9369,8 @@ impl Traces {
             bytewises,
             stores,
             cpu32s,
+            mem_loads,
+            mem_stores,
         ]
         .into_iter()
         .map(|ts| all(ts))
@@ -9355,6 +9544,8 @@ impl Traces {
             bytewises,
             stores,
             cpu32s,
+            mem_loads,
+            mem_stores,
             page_configs: _,
             public_output_bytes: _,
             local_to_global: _,
@@ -9423,6 +9614,12 @@ impl Traces {
         for t in cpu32s {
             total += (t.num_rows() * CPU32_COLS) as u64;
         }
+        for t in mem_loads {
+            total += (t.num_rows() * super::mem_load::cols::NUM_COLUMNS) as u64;
+        }
+        for t in mem_stores {
+            total += (t.num_rows() * super::mem_store::cols::NUM_COLUMNS) as u64;
+        }
         for t in ecsms {
             total += (t.num_rows() * ECSM_COLS) as u64;
         }
@@ -9463,6 +9660,8 @@ impl Traces {
         let n_memw = aux_cols(super::memw::bus_interactions().len());
         let n_memw_a = aux_cols(super::memw_aligned::bus_interactions().len());
         let n_load = aux_cols(super::load::bus_interactions().len());
+        let n_mem_load = aux_cols(super::mem_load::bus_interactions().len());
+        let n_mem_store = aux_cols(super::mem_store::bus_interactions().len());
         let n_decode = aux_cols(super::decode::bus_interactions().len());
         let n_mul = aux_cols(super::mul::bus_interactions().len());
         let n_dvrm = aux_cols(super::dvrm::bus_interactions().len());
@@ -9518,6 +9717,8 @@ impl Traces {
             bytewises,
             stores,
             cpu32s,
+            mem_loads,
+            mem_stores,
             page_configs: _,
             public_output_bytes: _,
             local_to_global: _,
@@ -9584,6 +9785,12 @@ impl Traces {
         for t in cpu32s {
             total += (t.num_rows() * n_cpu32) as u64;
         }
+        for t in mem_loads {
+            total += (t.num_rows() * n_mem_load) as u64;
+        }
+        for t in mem_stores {
+            total += (t.num_rows() * n_mem_store) as u64;
+        }
         for t in ecsms {
             total += (t.num_rows() * n_ecsm) as u64;
         }
@@ -9635,6 +9842,13 @@ impl Traces {
             blake3: usize::from(self.num_blake3_ops > 0),
             is_wh: self.is_whs.len(),
         }
+    }
+
+    /// The fused memory format's tables: MEM_LOAD's and MEM_STORE's chunks
+    /// (none under the split format). Counted apart from
+    /// [`Self::table_counts`]: a block states them in a field of its own.
+    pub fn fused_counts(&self) -> [usize; 2] {
+        [self.mem_loads.len(), self.mem_stores.len()]
     }
 
     /// Extract page configurations from ELF only (deterministic from binary).

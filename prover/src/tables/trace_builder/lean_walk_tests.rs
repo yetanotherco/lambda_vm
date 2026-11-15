@@ -331,11 +331,17 @@ fn the_one_pass_routing_is_the_routing() {
             )
         };
         assert_eq!(
-            show(route_ops(&cpu_ops, &artifacts.decode, &walk.cpu32_ops)),
+            show(route_ops(
+                &cpu_ops,
+                &artifacts.decode,
+                &walk.cpu32_ops,
+                true
+            )),
             show(route_ops_one_pass(
                 &cpu_ops,
                 &artifacts.decode,
-                &walk.cpu32_ops
+                &walk.cpu32_ops,
+                true
             )),
             "{name}"
         );
@@ -389,10 +395,17 @@ fn the_in_place_routing_is_the_appended_routing() {
                     true,
                 )
                 .expect("the walk");
-                appended.append(route_ops_one_pass(ops, decode, &walk.cpu32_ops));
+                appended.append(route_ops_one_pass(ops, decode, &walk.cpu32_ops, true));
                 ops.iter()
                     .for_each(|op| decode.op(op).count_bitwise_into(&mut counted));
-                route_ops_into(ops, decode, &walk.cpu32_ops, &mut in_place, &mut fused);
+                route_ops_into(
+                    ops,
+                    decode,
+                    &walk.cpu32_ops,
+                    &mut in_place,
+                    &mut fused,
+                    true,
+                );
             }
             assert_eq!(
                 blocks_of(&appended),

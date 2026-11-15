@@ -718,12 +718,14 @@ fn round_trips_and_refuses_the_other_mode(
                 &tag,
                 &digest,
                 &frame(&indexed).config,
+                indexed.memory,
             ),
             block_whir::block_statement_bytes(
                 a.statement(),
                 &tag,
                 &digest,
                 &frame(&per_poly).config,
+                per_poly.memory,
             ),
         );
         assert_eq!(sa.len(), sb.len());

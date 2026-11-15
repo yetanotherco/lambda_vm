@@ -170,6 +170,7 @@ pub(crate) fn absorb(
         elf_digest,
         public_output,
         table_counts,
+        &[],
         num_private_input_pages,
         runtime_page_ranges,
         table_num_vars,
@@ -180,6 +181,9 @@ pub(crate) fn absorb(
 /// [`absorb`] under `tag` — the block prover's statement is this one under a
 /// tag of its own (`crate::block_whir`), so a block proof and a monolithic one
 /// never share a transcript prefix. `kind` names it in the padding diagnostic.
+/// `more_counts` follow the table counts, each a little-endian `u64` (the
+/// block's fused memory tables under that format; none otherwise, which is
+/// the statement as it always was).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn absorb_tagged(
     t: &mut impl crypto::fiat_shamir::is_transcript::IsTranscript<E>,
@@ -188,6 +192,7 @@ pub(crate) fn absorb_tagged(
     elf_digest: &[u8; 32],
     public_output: &[u8],
     table_counts: &TableCounts,
+    more_counts: &[u64],
     num_private_input_pages: usize,
     runtime_page_ranges: &[RuntimePageRange],
     table_num_vars: &[u8],
@@ -206,6 +211,10 @@ pub(crate) fn absorb_tagged(
     len += public_output.len();
 
     len += statement::absorb_table_counts(t, table_counts);
+    for count in more_counts {
+        t.append_bytes(&count.to_le_bytes());
+        len += size_of::<u64>();
+    }
     t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
     len += size_of::<u64>();
 
