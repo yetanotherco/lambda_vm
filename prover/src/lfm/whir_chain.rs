@@ -3039,7 +3039,8 @@ impl ChipRows {
         for instr in instrs {
             let chip = match instr {
                 Instr::Hash { .. } | Instr::Hash16(_) => &mut rows.hash,
-                Instr::Select { .. } => &mut rows.select,
+                // A one-output select is a select row of a narrower table.
+                Instr::Select { .. } | Instr::Mux { .. } => &mut rows.select,
                 Instr::BaseAlu { .. } => &mut rows.balu,
                 Instr::ExtAlu { .. } => &mut rows.xalu,
                 Instr::Pack { .. } | Instr::Unpack { .. } => &mut rows.lanes,

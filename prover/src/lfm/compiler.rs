@@ -125,6 +125,9 @@ pub struct LfmColumnGroups {
     /// ([`layout::b3l`]). Empty in every program that has no such row, and
     /// outside the fixed STARK chip set: only the block prover proves it.
     pub b3l: ColumnGroup,
+    /// `LEAN_MUX`'s instruction group: one row an [`Instr::Mux`]
+    /// ([`layout::mux`]), on the same terms as [`Self::b3l`].
+    pub mux: ColumnGroup,
 }
 
 /// A compiled LFM program: multiplicity-backfilled instructions plus the
@@ -396,6 +399,9 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
                 *mult_l = take(*out_l, &mut written, &mut read_counts);
                 *mult_r = take(*out_r, &mut written, &mut read_counts);
             }
+            Instr::Mux { out, mult, .. } => {
+                *mult = take(*out, &mut written, &mut read_counts);
+            }
             Instr::BitDec { bits, halves, .. } => {
                 for (addr, mult) in bits.iter_mut() {
                     *mult = take(*addr, &mut written, &mut read_counts);
@@ -486,6 +492,7 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
     let mut hint = ColumnGroupBuilder::new(layout::hint::PREP_WIDTH);
     let mut public = ColumnGroupBuilder::new(layout::public::PREP_WIDTH);
     let mut b3l = ColumnGroupBuilder::new(layout::b3l::PREP_WIDTH);
+    let mut mux = ColumnGroupBuilder::new(layout::mux::PREP_WIDTH);
 
     for instr in instrs {
         match instr {
@@ -677,6 +684,22 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 }
                 blake3.set(r, l::MU, FE::one());
             }
+            Instr::Mux {
+                bit,
+                out,
+                in_l,
+                in_r,
+                mult,
+            } => {
+                use layout::mux as l;
+                let r = mux.open_row();
+                mux.set(r, l::BIT_ADDR, fe(bit.0));
+                mux.set(r, l::INL_ADDR, fe(in_l.0));
+                mux.set(r, l::INR_ADDR, fe(in_r.0));
+                mux.set(r, l::OUT_ADDR, fe(out.0));
+                mux.set(r, l::MULT, fe(*mult));
+                mux.set(r, l::IS_REAL, FE::one());
+            }
             Instr::B3l(op) => {
                 use super::instr::{B3lBlock, B3lCv};
                 use layout::b3l as l;
@@ -776,5 +799,6 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
         hint: hint.finish(),
         public: public.finish(),
         b3l: b3l.finish(),
+        mux: mux.finish(),
     }
 }

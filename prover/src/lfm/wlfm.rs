@@ -1087,6 +1087,11 @@ pub fn wlfm_program_id(a: &WlfmArtifacts) -> Commitment {
         h.update((super::b3l::ROUNDS as u64).to_le_bytes());
         h.update((a.b3l.rounds.len() as u64).to_le_bytes());
         h.update((a.b3l.heads.len() as u64).to_le_bytes());
+        // The one-output selects' chunks, only when a program has them.
+        if !a.b3l.muxes.is_empty() {
+            h.update(b"MUX");
+            h.update((a.b3l.muxes.len() as u64).to_le_bytes());
+        }
     }
     // Under the evaluated binding there are no roots to fold: the columns
     // themselves, every value, one digest a column. (The stacked binding's

@@ -300,6 +300,7 @@ struct ChipRows {
     hint: u32,
     public: u32,
     b3l: u32,
+    mux: u32,
 }
 
 impl ChipRows {
@@ -324,6 +325,7 @@ impl ChipRows {
             Instr::Hint { .. } | Instr::HintOn { .. } => &mut self.hint,
             Instr::Public { .. } => &mut self.public,
             Instr::B3l(_) => &mut self.b3l,
+            Instr::Mux { .. } => &mut self.mux,
         };
         let row = *c;
         *c += 1;
@@ -345,6 +347,7 @@ impl ChipRows {
             self.hint,
             self.public,
             self.b3l,
+            self.mux,
         ];
         let census = [
             g.const_.real_rows,
@@ -359,13 +362,14 @@ impl ChipRows {
             g.hint.real_rows,
             g.public.real_rows,
             g.b3l.real_rows,
+            g.mux.real_rows,
         ];
         assert_eq!(
             mine.map(|v| v as usize),
             census,
             "the schedule handed out a different number of record rows than the \
              compiler emitted column-group rows (order: const, balu, xalu, \
-             select, bitdec, hash, keccak, blake3, lanes, hint, public, b3l)"
+             select, bitdec, hash, keccak, blake3, lanes, hint, public, b3l, mux)"
         );
     }
 }
