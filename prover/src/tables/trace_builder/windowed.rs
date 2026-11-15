@@ -5096,6 +5096,9 @@ mod register_words_tests;
 mod tail_tests;
 
 #[cfg(all(test, feature = "parallel"))]
+mod mem_widths_tests;
+
+#[cfg(all(test, feature = "parallel"))]
 mod block_tests {
     /// The kept ECDAS ops' blocks are the block proof's ECDAS cut, so a cut is
     /// one block.
