@@ -379,6 +379,8 @@ fn blake3_level0_census_on_a_real_block() {
         .0
     });
     let prove_secs = t.elapsed().as_secs_f64();
+    let (host, one_copy, per_point) = multilinear::whir_chain::final_message_reads();
+    println!("B3 CENSUS FINAL READS: one-copy {one_copy} · host {host} · per-point {per_point}");
     let t = std::time::Instant::now();
     let verified = crate::base_only::with_permit(|| {
         verify_block_whir(&proof, &elf, &opts, &cfg.format).expect("verify runs")

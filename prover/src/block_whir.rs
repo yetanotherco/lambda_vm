@@ -552,6 +552,14 @@ pub fn b3_base_final() -> FinalPoly {
     })
 }
 
+/// How this process's WHIR final rounds read their message so far,
+/// `(host, one copy off a card, per point)`
+/// (`multilinear::whir_chain::final_message_reads`): what a base-only run
+/// prints, so a final polynomial's arm shows the path its reads took.
+pub fn final_message_reads() -> (usize, usize, usize) {
+    multilinear::whir_chain::final_message_reads()
+}
+
 /// The 7-round BLAKE3 base's group size: at most `4` stacked polynomials a
 /// group (Poseidon1's is [`BLOCK_GROUP_POLYS`], three). A quarter fewer
 /// groups for the recursion to verify, each a run of four polynomials in one

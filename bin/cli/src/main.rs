@@ -1441,6 +1441,13 @@ fn cmd_prove_block_base(
         "BLOCK BASE HOST COMMITS: {} (stacked commits the card declined)",
         prover::block_whir::host_commit_fallbacks()
     );
+    {
+        let (host, one_copy, per_point) = prover::block_whir::final_message_reads();
+        eprintln!(
+            "BLOCK BASE FINAL READS: one-copy {one_copy} · host {host} · per-point {per_point} (final \
+             rounds' message reads)"
+        );
+    }
     let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
         Ok(bytes) => bytes,
         Err(e) => {

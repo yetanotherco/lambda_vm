@@ -2718,16 +2718,34 @@ where
         });
     }
     if let Some(message) = factors.host_message() {
+        FINAL_READS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(message.clone());
     }
     // On a card: one copy of the whole cube, not one folded copy a value.
     if let Some(message) = factors.device_message()? {
+        FINAL_READS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(message);
     }
+    FINAL_READS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let values = (0..1usize << rem)
         .map(|i| factors.evaluate_message(&hypercube_point::<E>(i, rem)))
         .collect::<Result<Vec<_>, _>>()?;
     Mle::new(values)
+}
+
+/// How this process's final rounds read their message ([`message_values`]),
+/// counted per final round: off the host's own table, off a card in one copy,
+/// or one per-point evaluation a value (the fallback). Instrumentation only.
+static FINAL_READS: [std::sync::atomic::AtomicUsize; 3] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// [`FINAL_READS`] so far: `(host, one copy, per point)`.
+pub fn final_message_reads() -> (usize, usize, usize) {
+    let read = |i: usize| FINAL_READS[i].load(std::sync::atomic::Ordering::Relaxed);
+    (read(0), read(1), read(2))
 }
 
 /// Hypercube point `i` of `n` variables in [`Mle`] index order: the first
@@ -5605,6 +5623,28 @@ mod tests {
             let (today_proof, today_root, ..) = final_case(&first(6, 4), n);
             assert!(check(&cfg, &today_proof, &today_root, &z, y, &domain).is_err());
         }
+    }
+
+    /// A host chain's final round reads its message off the host's table and
+    /// counts it there: the counter a base-only run prints can move, and the
+    /// card's and the per-point paths stay untouched on the host.
+    #[test]
+    fn a_host_final_round_counts_a_host_read() {
+        let n = 16;
+        let cfg = finals(4, 6);
+        assert!(cfg.final_round(n).is_some());
+        let before = final_message_reads();
+        let _ = final_case(&cfg, n);
+        let after = final_message_reads();
+        assert!(
+            after.0 > before.0,
+            "a host read counted: {before:?} -> {after:?}"
+        );
+        assert_eq!(
+            (after.1, after.2),
+            (before.1, before.2),
+            "no card or per-point read on the host"
+        );
     }
 
     /// With no qualifying round the chain is today's, byte for byte.
