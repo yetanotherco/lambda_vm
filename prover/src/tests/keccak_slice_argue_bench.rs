@@ -11,8 +11,12 @@
 //!   from 2,730 random permutations each.
 //! - `sliced`: a synthetic two-rounds-a-row table of 2^16 rows (5,460 columns of
 //!   digits, the row's 858 lookups at their real shapes, one degree-2
-//!   constraint) and a synthetic boundary table of 2^14 rows (3,208 columns,
-//!   3,204 booleanities, 6 interactions), covering the same permutations.
+//!   constraint) and a synthetic boundary table of 2^14 rows (3,208 columns:
+//!   its 3,200 bits range-checked by 400 byte-to-bits lookups, its four flags
+//!   by booleanities; 406 interactions), covering the same permutations.
+//! - `fixed`: the format's fixed tables, argued once a block: CHI (2^21 rows,
+//!   11 columns and a multiplicity), XOR5 (46,656 rows in 2^16, 6 and one) and
+//!   the byte-to-bits table (2^8 rows, 9 and one), each one receiving lookup.
 //!
 //! The synthetic tables' buses do not balance and nothing is verified: only the
 //! shapes are real. Each pass builds the group afresh, puts it on the card as
@@ -208,13 +212,46 @@ fn slice_air() -> BoolAir {
             BusInteraction::receiver(103u64, Multiplicity::Column(SC_FLAGS + 3), values)
         });
     }
-    let bools: Vec<usize> = (SC_FLAGS..SC_COLS).collect();
+    // Each byte's bits range-checked against the byte-to-bits table: the byte
+    // (linear in its bits) and its eight bits, one lookup a byte.
+    for (bits, m) in [(SC_A, SC_FLAGS + 1), (SC_B, SC_FLAGS + 2)] {
+        for byte in 0..200 {
+            let terms: Vec<(usize, i64)> = (0..8).map(|i| (bits + byte * 8 + i, 1 << i)).collect();
+            let mut values = vec![sum(&terms)];
+            values.extend((0..8).map(|i| direct(bits + byte * 8 + i)));
+            interactions.push(BusInteraction::sender(
+                105u64,
+                Multiplicity::Column(m),
+                values,
+            ));
+        }
+    }
+    let bools: Vec<usize> = (SC_FLAGS..SC_A).collect();
     AirWithBuses::new(
         SC_COLS,
         AuxiliaryTraceBuildData { interactions },
         &options(),
         1,
         Bools(bools),
+    )
+}
+
+/// A fixed table of `width` value columns and a multiplicity, receiving one
+/// lookup of all of them on `bus`.
+fn fixed_air(width: usize, bus: u64) -> BoolAir {
+    let values = (0..width).map(direct).collect();
+    AirWithBuses::new(
+        width + 1,
+        AuxiliaryTraceBuildData {
+            interactions: vec![BusInteraction::receiver(
+                bus,
+                Multiplicity::Column(width),
+                values,
+            )],
+        },
+        &options(),
+        1,
+        Bools(Vec::new()),
     )
 }
 
@@ -310,6 +347,7 @@ fn keccak_group_argue_today_against_sliced() {
     let opts = options();
     let today_air = crate::test_utils::create_keccak_rnd_air_for(&opts, KeccakRndForm::Lean);
     let (sl, slice) = (sl_air(), slice_air());
+    let (chi, xor5, bytebits) = (fixed_air(11, 101), fixed_air(6, 100), fixed_air(9, 105));
     let built = std::time::Instant::now();
     let today_cols: Vec<Vec<Vec<FE>>> = (0..4).map(|i| today_columns(0x7EA + i, 16)).collect();
     let digit = |_: usize, s: &mut u64| [0u64, 1, 8, 9][(next(s) % 4) as usize];
@@ -318,6 +356,12 @@ fn keccak_group_argue_today_against_sliced() {
         *row = FE::from(1u64);
     }
     let slice_cols = columns(SC_COLS, 14, 0x5C, |_, s| next(s) & 1);
+    let small = |_: usize, s: &mut u64| next(s) % 64;
+    let (chi_cols, xor5_cols, bytebits_cols) = (
+        columns(12, 21, 0xC1, small),
+        columns(7, 16, 0x50, small),
+        columns(10, 8, 0xB8, small),
+    );
     println!(
         "KECCAK SLICED SETUP: today 4 x KECCAK_RND (lean, {} interactions) x 2^16 · sliced {} columns x 2^16 ({} interactions) + boundary {} columns x 2^14 ({} interactions) · built in {:.1} s",
         today_air.bus_interactions().len(),
@@ -327,11 +371,11 @@ fn keccak_group_argue_today_against_sliced() {
         slice.bus_interactions().len(),
         built.elapsed().as_secs_f64()
     );
-    let mut times: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+    let mut times: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for rep in 0..WARM + TIMED {
-        let order = if rep % 2 == 0 { [0, 1] } else { [1, 0] };
+        let order = if rep % 2 == 0 { [0, 1, 2] } else { [1, 0, 2] };
         for arm in order {
-            let name = ["today", "sliced"][arm];
+            let name = ["today", "sliced", "fixed"][arm];
             println!(
                 "KECCAK SLICED ARGUE arm={name} rep={rep} warm={}",
                 rep < WARM
@@ -342,10 +386,17 @@ fn keccak_group_argue_today_against_sliced() {
                     .map(|c| committed(&today_air, c.clone(), 16))
                     .collect();
                 argue(&mut tables, Where::Device)
-            } else {
+            } else if arm == 1 {
                 let mut tables = vec![
                     committed(&sl, sl_cols.clone(), 16),
                     committed(&slice, slice_cols.clone(), 14),
+                ];
+                argue(&mut tables, Where::Device)
+            } else {
+                let mut tables = vec![
+                    committed(&chi, chi_cols.clone(), 21),
+                    committed(&xor5, xor5_cols.clone(), 16),
+                    committed(&bytebits, bytebits_cols.clone(), 8),
                 ];
                 argue(&mut tables, Where::Device)
             };
@@ -363,9 +414,14 @@ fn keccak_group_argue_today_against_sliced() {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
     };
-    let (t, s) = (median(&mut times[0]), median(&mut times[1]));
+    let (t, s, f) = (
+        median(&mut times[0]),
+        median(&mut times[1]),
+        median(&mut times[2]),
+    );
     println!("KECCAK SLICED MEDIAN arm=today ms={:.3}", t * 1e3);
     println!("KECCAK SLICED MEDIAN arm=sliced ms={:.3}", s * 1e3);
+    println!("KECCAK SLICED MEDIAN arm=fixed ms={:.3}", f * 1e3);
     println!(
         "KECCAK SLICED RATIO sliced/today={:.4} (one group's whole argue at equal permutations)",
         s / t
@@ -395,5 +451,12 @@ fn the_bench_tables_argue_at_a_small_size() {
     ];
     argue(&mut sliced, Where::Host);
     assert_eq!(sl.bus_interactions().len(), 858);
-    assert_eq!(slice.bus_interactions().len(), 6);
+    assert_eq!(slice.bus_interactions().len(), 406);
+    let bytebits = fixed_air(9, 105);
+    let mut fixed = vec![committed(
+        &bytebits,
+        columns(10, 8, 0xB8, |_, s| next(s) % 64),
+        8,
+    )];
+    argue(&mut fixed, Where::Host);
 }
