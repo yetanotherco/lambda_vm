@@ -208,6 +208,62 @@ pub struct AlignedRowC {
     pub limbs: u8,
 }
 
+/// One MEMW_A row as the card derives it from the executor's history
+/// (`multilinear::records::AlignedRef`; `card_rows.cu`'s `AlignedRefC`): a
+/// load's or store's cycle and its access's index in its window's accesses,
+/// or [`ALIGNED_ECALL`] and an ECALL cycle, and its row's index in the
+/// window's whole rows.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AlignedRefC {
+    pub cycle: u32,
+    pub at: u32,
+}
+
+/// [`AlignedRefC::cycle`]'s mark of an ECALL cycle's row.
+pub const ALIGNED_ECALL: u32 = 1 << 31;
+
+/// A load or store's eight bytes before its cycle (the executor's
+/// `MemAccess`; `card_rows.cu`'s `MemoryAccessC`): the address, the bytes,
+/// their shared old timestamp, and `u32::MAX` or the index of their eight
+/// old timestamps in the window's mixed list.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryAccessC {
+    pub addr: u64,
+    pub old: u64,
+    pub ts: u32,
+    pub mixed: u32,
+}
+
+/// One window's part of a MEMW_A table derived on the card
+/// ([`RecordsInput::MemwARefs`]): its refs, in order; its window's accesses
+/// from `access_base`; the window's mixed list, eight timestamps an entry;
+/// its whole rows from `whole_base`.
+#[derive(Clone, Copy, Debug)]
+pub struct AlignedPartIn<'a> {
+    pub refs: &'a [AlignedRefC],
+    pub accesses: &'a [MemoryAccessC],
+    pub access_base: u32,
+    pub mixed: &'a [u32],
+    pub whole: &'a [AlignedRowC],
+    pub whole_base: u32,
+}
+
+impl AlignedPartIn<'_> {
+    /// The bytes that cross the bus.
+    pub fn bytes(&self) -> usize {
+        size_of_val(self.refs)
+            + size_of_val(self.accesses)
+            + size_of_val(self.mixed)
+            + size_of_val(self.whole)
+    }
+}
+
+/// A MEMW_A table's rows derived on the host (the rows where the card does
+/// not derive them).
+pub type AlignedHostRows<'a> = dyn Fn() -> Vec<AlignedRowC> + Sync + 'a;
+
 /// One LOAD op (the prover's `LoadOperation`): the base address, the
 /// timestamp, the width, whether it sign-extends (0 or 1) and the result's
 /// bytes.
@@ -283,6 +339,10 @@ const _: () = {
     assert!(offset_of!(AlignedRowC, width) == 40);
     assert!(offset_of!(AlignedRowC, is_register) == 42);
     assert!(offset_of!(AlignedRowC, limbs) == 43);
+    assert!(size_of::<AlignedRefC>() == 8);
+    assert!(size_of::<MemoryAccessC>() == 24);
+    assert!(offset_of!(MemoryAccessC, ts) == 16);
+    assert!(offset_of!(MemoryAccessC, mixed) == 20);
     assert!(size_of::<LoadOpC>() == 32);
     assert!(offset_of!(LoadOpC, is_signed) == 17);
     assert!(offset_of!(LoadOpC, res) == 18);
@@ -309,6 +369,8 @@ unsafe impl DeviceRepr for DecodeRunC {}
 unsafe impl DeviceRepr for KeccakOpC {}
 unsafe impl DeviceRepr for KeccakOpInC {}
 unsafe impl DeviceRepr for AlignedRowC {}
+unsafe impl DeviceRepr for AlignedRefC {}
+unsafe impl DeviceRepr for MemoryAccessC {}
 unsafe impl DeviceRepr for LoadOpC {}
 unsafe impl DeviceRepr for StoreOpC {}
 unsafe impl DeviceRepr for ShiftOpC {}
@@ -742,6 +804,18 @@ pub enum RecordsInput<'a> {
         records: &'a [&'a [AlignedRowC]],
         rows: usize,
     },
+    /// MEMW_A's `rows` rows as the card derives them from the executor's
+    /// history ([`crate::card_rows`]): `parts`' refs in order, each regular
+    /// row's log read from the CPU logs the card holds with `decode`, in the
+    /// limbs' form or not. `host()` gives the rows derived on the host (every
+    /// row, where the card does not derive them).
+    MemwARefs {
+        parts: &'a [AlignedPartIn<'a>],
+        decode: &'a Arc<CardDecode>,
+        limbs: bool,
+        rows: usize,
+        host: &'a AlignedHostRows<'a>,
+    },
     /// LOAD's `rows` rows: `records`' pieces in order, then zero rows.
     Load {
         records: &'a [&'a [LoadOpC]],
@@ -772,6 +846,7 @@ impl std::fmt::Debug for RecordsInput<'_> {
             Self::MemwR { .. } => "MEMW_R",
             Self::MemwRWords { .. } => "MEMW_R (words)",
             Self::MemwA { .. } => "MEMW_A",
+            Self::MemwARefs { .. } => "MEMW_A (refs)",
             Self::Load { .. } => "LOAD",
             Self::Store { .. } => "STORE",
             Self::Shift { .. } => "SHIFT",
@@ -795,6 +870,7 @@ impl RecordsInput<'_> {
             | Self::MemwR { rows, .. }
             | Self::MemwRWords { rows, .. }
             | Self::MemwA { rows, .. }
+            | Self::MemwARefs { rows, .. }
             | Self::Load { rows, .. }
             | Self::Store { rows, .. }
             | Self::Shift { rows, .. }
@@ -814,7 +890,7 @@ impl RecordsInput<'_> {
             }
             Self::Cpu { .. } => CPU_IN_ROW_COLUMNS,
             Self::MemwR { .. } | Self::MemwRWords { .. } => MEMW_R_COLUMNS,
-            Self::MemwA { .. } => MEMW_A_COLUMNS,
+            Self::MemwA { .. } | Self::MemwARefs { .. } => MEMW_A_COLUMNS,
             Self::Load { .. } => LOAD_COLUMNS,
             Self::Store { .. } => STORE_COLUMNS,
             Self::Shift { .. } => SHIFT_COLUMNS,
@@ -851,6 +927,7 @@ impl RecordsInput<'_> {
                     + whole.iter().map(|piece| size_of_val(*piece)).sum::<usize>()
             }
             Self::MemwA { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::MemwARefs { parts, .. } => parts.iter().map(AlignedPartIn::bytes).sum(),
             Self::Load { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Store { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Shift { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
@@ -866,6 +943,7 @@ impl RecordsInput<'_> {
             Self::MemwR { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::MemwRWords { words, .. } => words.iter().map(|piece| piece.len()).sum(),
             Self::MemwA { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::MemwARefs { parts, .. } => parts.iter().map(|part| part.refs.len()).sum(),
             Self::Load { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Store { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Shift { records, .. } => records.iter().map(|piece| piece.len()).sum(),
@@ -1055,6 +1133,18 @@ pub(crate) fn fill_col_major_into(
             let records_dev = upload_pieces(stream, pieces)?;
             launch_rows(stream, &m.memw_a, &records_dev, records.len(), rows, dst)
         }
+        // Refs where the card does not derive the rows: every row derived on
+        // the host, then today's fill.
+        RecordsInput::MemwARefs { rows, host, .. } => {
+            let n = records.len();
+            let derived = host();
+            // Rows that could not be derived come back short: refused.
+            if derived.len() != n {
+                return Err(crate::invalid_value());
+            }
+            let records_dev = upload_pieces(stream, &[&derived[..]])?;
+            launch_rows(stream, &m.memw_a, &records_dev, n, rows, dst)
+        }
         RecordsInput::Load {
             records: pieces,
             rows,
@@ -1240,6 +1330,13 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
             Staged::MemwR(upload_pieces(stream, &[&decoded[..]])?, n)
         }
         RecordsInput::MemwA { records, .. } => Staged::MemwA(upload_pieces(stream, records)?, n),
+        RecordsInput::MemwARefs { host, .. } => {
+            let derived = host();
+            if derived.len() != n {
+                return Err(crate::invalid_value());
+            }
+            Staged::MemwA(upload_pieces(stream, &[&derived[..]])?, n)
+        }
         RecordsInput::Load { records, .. } => Staged::Load(upload_pieces(stream, records)?, n),
         RecordsInput::Store { records, .. } => Staged::Store(upload_pieces(stream, records)?, n),
         RecordsInput::Shift { records, .. } => Staged::Shift(upload_pieces(stream, records)?, n),

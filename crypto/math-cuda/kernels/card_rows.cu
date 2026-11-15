@@ -367,3 +367,190 @@ extern "C" __global__ void derive_registers_from_cache(
     }
     derive::register_row(w, reg, ts, value, before, (uint32_t)old, slot < 2);
 }
+
+// ---------------------------------------------------------------------------
+// MEMW_A's rows derived from the executor's history (`src/card_rows.rs`,
+// `prover`'s `history_rows.rs`, whose host reference this restates rule for
+// rule). A table is held as refs, in parts of one window each: a load's or
+// store's row as its cycle and the index of its access in the window's
+// accesses; an ECALL cycle's row as `ALIGNED_ECALL | cycle` and its index in
+// the window's whole rows. For a regular row of cycle `c`:
+// - its log (from the cached CPU chunks) names a load or a store;
+// - its address is the op's `res` and the access's;
+// - its old timestamps are the access's: shared, or its entry of the mixed
+//   list;
+// - it is aligned to its width, one old timestamp over its width's bytes, and
+//   in the limbs' form its step `ts − old` fits them (same high word, old
+//   earlier);
+// - a load's value and old are its loaded bytes and the sign or zero fill; a
+//   store's value is `rv2`, its old the access's bytes.
+// A row that breaks a rule is counted into `check` and written as zeros: the
+// group is refused. One thread a row over every part of the launch.
+// ---------------------------------------------------------------------------
+
+// `multilinear::records::AlignedRef`.
+struct AlignedRefC {
+    uint32_t cycle;
+    uint32_t at;
+};
+static_assert(sizeof(AlignedRefC) == 8, "AlignedRefC is 8 bytes");
+
+// `multilinear::records::MemoryAccess` (the executor's `MemAccess`).
+struct MemoryAccessC {
+    uint64_t addr;
+    uint64_t old;
+    uint32_t ts;
+    uint32_t mixed;
+};
+static_assert(sizeof(MemoryAccessC) == 24, "MemoryAccessC is 24 bytes");
+static_assert(offsetof(MemoryAccessC, mixed) == 20, "MemoryAccessC field order");
+
+constexpr uint32_t ALIGNED_ECALL = 1u << 31;
+constexpr uint32_t NO_MIXED = 0xFFFFFFFFu;
+// The history's last cycle plus one (`HISTORY_MAX_CYCLES + 1`).
+constexpr uint64_t HISTORY_CYCLES = (1ull << 30) - 1;
+
+// One part of a derived MEMW_A table: its refs, the table rows they fill
+// (`row0..row0 + n` of the table at `out`, `height` rows), the launch's rows
+// before them, and the window's records they read: its accesses from
+// `access_base`, its mixed list (8 timestamps an entry), its whole rows from
+// `whole_base`.
+struct AlignedPartC {
+    const AlignedRefC *refs;
+    uint64_t n;
+    uint64_t before;
+    uint64_t row0;
+    uint64_t height;
+    uint64_t *out;
+    const MemoryAccessC *accesses;
+    uint64_t access_base;
+    uint64_t naccesses;
+    const uint32_t *mixed;
+    uint64_t nmixed;
+    const AlignedRowC *whole;
+    uint64_t whole_base;
+    uint64_t nwhole;
+    uint64_t limbs;
+};
+static_assert(sizeof(AlignedPartC) == 120, "AlignedPartC is 120 bytes");
+
+// A card test's mutants (`src/card_rows.rs`, `FAULT_MEMW_A`), one bit each:
+// the mixed list read as uniform; a load's sign fill dropped; a store's old
+// read as its value; the limbs' step rule dropped.
+constexpr uint32_t MEMW_A_FAULT_MIXED = 1;
+constexpr uint32_t MEMW_A_FAULT_SIGN_FILL = 2;
+constexpr uint32_t MEMW_A_FAULT_STORE_OLD = 4;
+constexpr uint32_t MEMW_A_FAULT_LIMBS = 8;
+
+namespace derive {
+
+// The row of regular ref `r` from its cycle's log; `false` where a rule
+// breaks.
+__device__ __forceinline__ bool memw_a_row(const AlignedRefC r, const AlignedPartC &p,
+                                           const CachedLogsC *entries, uint32_t nentries,
+                                           const DecodeEntryC *dec, const DecodeRunC *runs,
+                                           uint32_t nruns, uint32_t fault, AlignedRowC &row) {
+    const uint64_t c = r.cycle;
+    if (c >= HISTORY_CYCLES) return false;
+    uint32_t a = 0, b = nentries;
+    while (b - a > 1) {
+        const uint32_t mid = (a + b) / 2;
+        if (entries[mid].first <= c) {
+            a = mid;
+        } else {
+            b = mid;
+        }
+    }
+    if (nentries == 0 || c < entries[a].first || c - entries[a].first >= entries[a].n) return false;
+    const LogC log = entries[a].logs[c - entries[a].first];
+    const int64_t at = fill::decode_row(runs, nruns, log.current_pc);
+    if (at < 0 || !dec[at].memory || dec[at].ecall) return false;
+    const DecodeEntryC d = dec[at];
+    const Values v = values(log, d);
+    if (r.at < p.access_base || r.at - p.access_base >= p.naccesses) return false;
+    const MemoryAccessC acc = p.accesses[r.at - p.access_base];
+    if (acc.addr != v.res) return false;
+    uint32_t old_ts[8];
+    if (acc.mixed == NO_MIXED || (fault & MEMW_A_FAULT_MIXED)) {
+        for (uint32_t k = 0; k < 8; ++k) old_ts[k] = acc.ts;
+    } else {
+        if (acc.mixed >= p.nmixed) return false;
+        for (uint32_t k = 0; k < 8; ++k) old_ts[k] = p.mixed[8 * (uint64_t)acc.mixed + k];
+    }
+    const uint32_t width = mem_bytes(d.mem_flags);
+    const bool is_load = (d.mem_flags & 1) == 0;
+    const uint64_t ts = 4 * c + 4;
+    // `is_aligned_op`: aligned to the width, one old timestamp over its bytes.
+    if (width > 1 && ((uint32_t)v.res & (width - 1)) != 0) return false;
+    for (uint32_t k = 1; k < width; ++k) {
+        if (old_ts[k] != old_ts[0]) return false;
+    }
+    const uint64_t old = old_ts[0];
+    // `step_fits_limbs`: the same high word, the old timestamp earlier.
+    if (p.limbs && !(fault & MEMW_A_FAULT_LIMBS) && !((old >> 32) == (ts >> 32) && old < ts)) {
+        return false;
+    }
+    row.base_address = v.res;
+    row.timestamp = ts;
+    row.old_timestamp = old;
+    row.width = (uint8_t)width;
+    row.is_read = is_load;
+    row.is_register = 0;
+    row.limbs = p.limbs != 0;
+    if (is_load) {
+        uint8_t res[8];
+        for (uint32_t k = 0; k < 8; ++k) res[k] = (uint8_t)(v.rvd >> (8 * k));
+        if (width < 8 && !(fault & MEMW_A_FAULT_SIGN_FILL)) {
+            const uint8_t fill = (mem_signed(d.mem_flags) && (res[width - 1] >> 7)) ? 0xFF : 0;
+            for (uint32_t k = width; k < 8; ++k) res[k] = fill;
+        }
+        uint64_t packed = 0;
+        for (uint32_t k = 0; k < 8; ++k) packed |= (uint64_t)res[k] << (8 * k);
+        row.value = packed;
+        row.old = packed;
+    } else {
+        row.value = v.rv2;
+        row.old = (fault & MEMW_A_FAULT_STORE_OLD) ? v.rv2 : acc.old;
+    }
+    return true;
+}
+
+}  // namespace derive
+
+extern "C" __global__ void derive_memw_a_from_cache(const CachedLogsC *entries, uint32_t nentries,
+                                                    const AlignedPartC *parts, uint32_t nparts,
+                                                    uint64_t total, const DecodeEntryC *dec,
+                                                    const DecodeRunC *runs, uint32_t nruns,
+                                                    uint32_t fault, unsigned long long *check) {
+    const uint64_t g = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= total || nparts == 0) return;
+    // The part: the last whose rows start at or before `g`.
+    uint32_t lo = 0, hi = nparts;
+    while (hi - lo > 1) {
+        const uint32_t mid = (lo + hi) / 2;
+        if (parts[mid].before <= g) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    const AlignedPartC &p = parts[lo];
+    const uint64_t j = g - p.before;
+    if (j >= p.n) return;
+    const fill::RowWriter w{p.out, p.height, p.row0 + j};
+    const AlignedRefC r = p.refs[j];
+    AlignedRowC row{};
+    bool ok;
+    if (r.cycle & ALIGNED_ECALL) {
+        ok = r.at >= p.whole_base && r.at - p.whole_base < p.nwhole;
+        if (ok) row = p.whole[r.at - p.whole_base];
+    } else {
+        ok = derive::memw_a_row(r, p, entries, nentries, dec, runs, nruns, fault, row);
+    }
+    if (!ok) {
+        atomicAdd(check, 1ull);
+        w.zeros(0, memw_a_cols::NUM_COLUMNS);
+        return;
+    }
+    fill::memw_a_row(w, row);
+}

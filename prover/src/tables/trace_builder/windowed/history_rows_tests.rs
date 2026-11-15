@@ -248,10 +248,11 @@ fn rust_guests_and_ethrex_derive_the_walks_memw_a_rows() {
 /// as uniform, a store's old bytes moved, a ref pointed at the next access, a
 /// step that does not fit the limbs, an ECALL ref past its window's whole
 /// rows, and a cycle outside its window; each is refused or changes the row.
+/// And a narrow load's log moved past its width keeps its row (the fill).
 #[test]
 fn each_rule_of_the_memw_a_derivation_is_load_bearing() {
     let order = MemwAlignedOrder::Limbs;
-    let mut seen = [0usize; 6];
+    let mut seen = [0usize; 7];
     for name in ["all_loadstore_32", "test_keccak_multi", "misalign_sd"] {
         let (program, _) = run(name);
         let (windows, decode) = walked(&program, &[], 7, order);
@@ -331,6 +332,26 @@ fn each_rule_of_the_memw_a_derivation_is_load_bearing() {
                 );
                 seen[4] += 1;
             }
+            // A narrow load's log with its written value's top bit flipped
+            // (past its width): the fill makes the same row.
+            if let Some(i) = (0..refs.len())
+                .find(|&i| regular(i) && w.rows[i].is_read() && w.rows[i].width() < 8)
+            {
+                let mut logs = (*window.logs).clone();
+                logs[(u64::from(refs[i].cycle) - window.first) as usize].dst_val ^= 1 << 63;
+                let edited = RefWindow {
+                    logs: Arc::new(logs),
+                    first: window.first,
+                    history: Arc::clone(&window.history),
+                    whole: window.whole.clone(),
+                };
+                assert_eq!(
+                    derive(&edited, &refs).as_deref(),
+                    Ok(&w.rows[..]),
+                    "{name}: the fill"
+                );
+                seen[6] += 1;
+            }
             // A cycle outside the window.
             if !refs.is_empty() {
                 let mut moved = refs.clone();
@@ -344,4 +365,257 @@ fn each_rule_of_the_memw_a_derivation_is_load_bearing() {
         }
     }
     assert!(seen.iter().all(|&n| n > 0), "{seen:?}");
+}
+
+/// A whole MEMW_A chunk held as refs, and the walk's rows it stands for.
+pub(super) struct RefChunk {
+    pub(super) refs: super::Segments<AlignedRef>,
+    pub(super) windows: Vec<Arc<RefWindow>>,
+    pub(super) want: Vec<AlignedRow>,
+}
+
+/// A run's refs cut into whole chunks of `rows` rows across its windows, as
+/// the hand-out cuts them: each chunk's parts its windows' ranges.
+pub(super) fn chunks(walked: &[Walked], rows: usize) -> Vec<RefChunk> {
+    let lists: Vec<(Arc<RefWindow>, Arc<Vec<AlignedRef>>, &[AlignedRow])> = walked
+        .iter()
+        .map(|w| {
+            let (window, refs) = ref_window(w);
+            (Arc::new(window), Arc::new(refs), &w.rows[..])
+        })
+        .collect();
+    let mut out = Vec::new();
+    let (mut k, mut at) = (0usize, 0usize);
+    let total: usize = lists.iter().map(|(_, r, _)| r.len()).sum();
+    for _ in 0..total / rows {
+        let mut chunk = RefChunk {
+            refs: super::Segments { parts: Vec::new() },
+            windows: Vec::new(),
+            want: Vec::new(),
+        };
+        let mut want = rows;
+        while want > 0 {
+            let (window, refs, walked_rows) = &lists[k];
+            let take = (refs.len() - at).min(want);
+            if take > 0 {
+                chunk.refs.parts.push((Arc::clone(refs), at..at + take));
+                chunk.windows.push(Arc::clone(window));
+                chunk.want.extend_from_slice(&walked_rows[at..at + take]);
+            }
+            at += take;
+            want -= take;
+            if at == refs.len() {
+                (k, at) = (k + 1, 0);
+            }
+        }
+        out.push(chunk);
+    }
+    out
+}
+
+/// A chunk held as refs digests and fills as the same rows held as rows, and
+/// hands the card each part's records: every regular row's access inside
+/// its part's accesses, every ECALL row inside its whole rows.
+#[test]
+fn a_memw_a_chunk_held_as_refs_reads_as_its_rows() {
+    use super::card_records::{AlignedRefRecords, CardDecode, RowRecords};
+    use multilinear::records::{TableRecords, digest_of};
+    let order = MemwAlignedOrder::Limbs;
+    let mut checked = 0usize;
+    for (name, window, rows) in [
+        ("test_keccak_multi", 7usize, 16usize),
+        ("test_copy_ecalls", 33, 32),
+        ("all_loadstore_32", 7, 64),
+    ] {
+        let (program, _) = run(name);
+        let (walked, decode) = walked(&program, &[], window, order);
+        let card = Arc::new(CardDecode::new(Arc::clone(&decode)).expect("DECODE rows"));
+        for chunk in chunks(&walked, rows) {
+            let held = AlignedRefRecords::new(
+                chunk.refs.clone(),
+                chunk.windows.clone(),
+                Arc::clone(&card),
+                order,
+            )
+            .unwrap_or_else(|_| panic!("{name}: a whole chunk"));
+            let as_rows = RowRecords::new(super::Segments::one(chunk.want.clone()))
+                .unwrap_or_else(|_| panic!("{name}: rows"));
+            assert_eq!(digest_of(&held), digest_of(&as_rows), "{name}");
+            assert_eq!(held.host_fill(), as_rows.host_fill(), "{name}");
+            let a = held.aligned_refs().expect("refs");
+            assert_eq!(a.len(), rows);
+            assert!(a.limbs);
+            for p in &a.parts {
+                for r in p.refs {
+                    let (base, n) = if r.cycle & ALIGNED_ECALL != 0 {
+                        (p.whole_base, p.whole.len())
+                    } else {
+                        (p.access_base, p.accesses.len())
+                    };
+                    assert!(
+                        r.at >= base && ((r.at - base) as usize) < n,
+                        "{name}: {r:?}"
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 3, "{checked} chunks");
+}
+
+fn put(out: &mut Vec<u8>, words: &[u64]) {
+    words
+        .iter()
+        .for_each(|w| out.extend_from_slice(&w.to_le_bytes()));
+}
+
+/// `v`'s bytes as they lie (plain `#[repr(C)]` records without padding, or
+/// whose padding the replay never reads).
+fn raw<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: plain records; the bytes are read, never interpreted here.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+}
+
+/// Writes `derive_memw_a_from_cache`'s known-answer vectors to
+/// `MEMW_A_VECTORS` for `crypto/math-cuda/tests/host_kat/memw_a_host_kat.cpp`,
+/// which replays the kernel on the host: record walks of asm programs (chunks
+/// of 16 or 64 rows), Rust guests and an ethrex block (chunks of 4096), each
+/// whole chunk's parts as the card gets them, the windows' logs as the card's
+/// cache holds them, the program's DECODE rows, and the words the host fills
+/// of the chunk's MEMW_A table with the WALK's rows. Nothing is checked here
+/// but that the vectors hold the rows the replay's mutants move: ECALL rows,
+/// loads that sign-fill, stores whose old bytes are not their value, and a
+/// row with a mixed access of two bytes or more to break.
+#[test]
+#[ignore = "writes the kernel's vectors to MEMW_A_VECTORS"]
+fn write_the_memw_a_kernel_vectors() {
+    use super::card_records::{AlignedRefRecords, CardDecode};
+    use crate::tables::card_fill_inputs::{col_major, decode_records, log_record};
+    use crate::tables::gpack::TraceForm;
+    use multilinear::records::TableRecords;
+    let path = std::env::var("MEMW_A_VECTORS").expect("MEMW_A_VECTORS");
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../executor/tests");
+    let mut cases: Vec<(String, Elf, Vec<u8>, usize, usize, usize)> = [
+        ("all_loadstore_32", 8usize),
+        ("test_keccak_multi", 16),
+        ("test_copy_ecalls", 16),
+        ("misalign_sd", 4),
+        ("misalign_ld", 4),
+    ]
+    .iter()
+    .map(|&(name, rows)| {
+        (
+            name.to_string(),
+            run(name).0,
+            Vec::new(),
+            7,
+            rows,
+            usize::MAX,
+        )
+    })
+    .collect();
+    for (name, rows) in [
+        ("hint_multi", 64usize),
+        ("dma_memmove_cases", 4096),
+        ("keccak_precompile", 256),
+    ] {
+        cases.push((
+            name.to_string(),
+            rust_elf(name),
+            Vec::new(),
+            97,
+            rows,
+            usize::MAX,
+        ));
+    }
+    let input = std::fs::read(fixtures.join("ethrex_empty_block.bin")).expect("the fixture");
+    cases.push((
+        "ethrex_empty_block".to_string(),
+        rust_elf("ethrex"),
+        input,
+        1 << 16,
+        4096,
+        8,
+    ));
+    let order = MemwAlignedOrder::Limbs;
+    let mut out: Vec<u8> = b"CTMEMWA1".to_vec();
+    put(&mut out, &[cases.len() as u64]);
+    let (mut n_chunks, mut ecall, mut sign, mut store_old, mut mixed2) = (0, 0, 0, 0, 0);
+    for (name, program, input, window, rows, most) in &cases {
+        let (walked, decode) = walked(program, input, *window, order);
+        let card = Arc::new(CardDecode::new(Arc::clone(&decode)).expect("DECODE rows"));
+        let (entries, runs) = decode_records(&decode);
+        put(&mut out, &[entries.len() as u64]);
+        out.extend_from_slice(raw(&entries));
+        put(&mut out, &[runs.len() as u64]);
+        out.extend_from_slice(raw(&runs));
+        // The card's cache: every walked window's logs.
+        put(&mut out, &[walked.len() as u64]);
+        for w in &walked {
+            let logs: Vec<_> = w.logs.iter().map(log_record).collect();
+            put(&mut out, &[w.first, logs.len() as u64]);
+            out.extend_from_slice(raw(&logs));
+        }
+        let chunks: Vec<RefChunk> = chunks(&walked, *rows).into_iter().take(*most).collect();
+        put(&mut out, &[chunks.len() as u64]);
+        for chunk in &chunks {
+            let held = AlignedRefRecords::new(
+                chunk.refs.clone(),
+                chunk.windows.clone(),
+                Arc::clone(&card),
+                order,
+            )
+            .unwrap_or_else(|_| panic!("{name}: a whole chunk"));
+            let a = held.aligned_refs().expect("refs");
+            put(&mut out, &[u64::from(a.limbs), a.parts.len() as u64]);
+            for p in &a.parts {
+                put(&mut out, &[p.refs.len() as u64]);
+                out.extend_from_slice(raw(p.refs));
+                put(
+                    &mut out,
+                    &[p.accesses.len() as u64, u64::from(p.access_base)],
+                );
+                out.extend_from_slice(raw(p.accesses));
+                // Eight timestamps an entry, as `u32`s.
+                put(&mut out, &[8 * p.mixed.len() as u64]);
+                out.extend_from_slice(raw(p.mixed));
+                put(&mut out, &[p.whole.len() as u64, u64::from(p.whole_base)]);
+                out.extend_from_slice(raw(p.whole));
+                for r in p.refs {
+                    if r.cycle & ALIGNED_ECALL != 0 {
+                        ecall += 1;
+                        continue;
+                    }
+                    let acc = p.accesses[(r.at - p.access_base) as usize];
+                    mixed2 += usize::from(acc.mixed != NO_ACCESS);
+                }
+            }
+            for row in &chunk.want {
+                let v = row.value();
+                sign += usize::from(
+                    row.is_read() && row.width() < 8 && v[row.width() as usize] == 0xFF,
+                );
+                store_old += usize::from(!row.is_read() && row.old() != row.value());
+            }
+            let want = col_major(
+                &crate::tables::memw_aligned::generate_memw_aligned_trace_segments_as(
+                    &[&chunk.want],
+                    TraceForm::Wide,
+                ),
+            );
+            put(&mut out, &[want.len() as u64]);
+            put(&mut out, &want);
+            n_chunks += 1;
+        }
+        println!("{name}: {} chunks of {rows}", chunks.len());
+    }
+    std::fs::write(&path, &out).expect("the vectors written");
+    println!(
+        "MEMW_A VECTORS: {} cases, {n_chunks} chunks ({ecall} ECALL rows, {sign} sign fills, \
+         {store_old} stores with old ≠ value, {mixed2} mixed accesses), {} bytes → {path}",
+        cases.len(),
+        out.len()
+    );
+    assert!(ecall > 0 && sign > 0 && store_old > 0 && mixed2 > 0);
 }

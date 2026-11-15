@@ -5302,6 +5302,9 @@ mod history_sides_card_tests;
 #[cfg(all(test, feature = "parallel"))]
 mod history_rows_tests;
 
+#[cfg(all(test, feature = "cuda", feature = "parallel"))]
+mod history_rows_card_tests;
+
 #[cfg(test)]
 mod tail_tests;
 

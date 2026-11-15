@@ -51,7 +51,8 @@ use cudarc::nvrtc::Ptx;
 use crate::columns::{DeviceColumns, TableClock, TableUpload};
 use crate::device::{DeviceReservation, alloc_or_trim, backend};
 use crate::fill::{
-    CardDecode, CpuLogsOnCard, FillChecks, LoadOpC, LogC, RecordsInput, RegRowC, Staged, StoreOpC,
+    ALIGNED_ECALL, AlignedPartIn, AlignedRefC, AlignedRowC, CardDecode, CpuLogsOnCard, FillChecks,
+    LoadOpC, LogC, MemoryAccessC, RecordsInput, RegRowC, Staged, StoreOpC,
 };
 
 const CARD_ROWS_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/card_rows.cubin"));
@@ -183,6 +184,28 @@ pub const REGISTER_FAULT_VALUE_AT: u32 = 2;
 /// The kernel's faults (no other bit is read).
 const KERNEL_FAULTS: u32 = REGISTER_FAULT_SLOT | REGISTER_FAULT_VALUE_AT;
 
+/// A card test's mutants of the kernel that derives MEMW_A's rows from the
+/// executor's history, one bit each (0: none). The test must see other
+/// words, or the group declined.
+#[doc(hidden)]
+pub static FAULT_MEMW_A: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The kernel reads every access's old timestamps as its shared one.
+#[doc(hidden)]
+pub const MEMW_A_FAULT_MIXED: u32 = 1;
+/// The kernel drops a load's sign fill (the bytes past its width are the
+/// log's).
+#[doc(hidden)]
+pub const MEMW_A_FAULT_SIGN_FILL: u32 = 2;
+/// The kernel reads a store's old bytes as its value.
+#[doc(hidden)]
+pub const MEMW_A_FAULT_STORE_OLD: u32 = 4;
+/// The kernel drops the limbs' step rule.
+#[doc(hidden)]
+pub const MEMW_A_FAULT_LIMBS: u32 = 8;
+/// The MEMW_A kernel's faults (no other bit is read).
+const MEMW_A_FAULTS: u32 =
+    MEMW_A_FAULT_MIXED | MEMW_A_FAULT_SIGN_FILL | MEMW_A_FAULT_STORE_OLD | MEMW_A_FAULT_LIMBS;
+
 fn budget_bytes() -> u64 {
     static BYTES: OnceLock<u64> = OnceLock::new();
     *BYTES.get_or_init(|| {
@@ -223,6 +246,9 @@ struct Counters {
     register_records_spared: AtomicU64,
     plan_ns: AtomicU64,
     plan_wall_ns: AtomicU64,
+    derived_memw_a: AtomicU64,
+    records_memw_a: AtomicU64,
+    memw_a_ref_bytes: AtomicU64,
 }
 
 static COUNTERS: OnceLock<Counters> = OnceLock::new();
@@ -271,6 +297,12 @@ pub struct Stats {
     /// summed.
     pub plan_secs: f64,
     pub plan_wall_secs: f64,
+    /// MEMW_A tables held as refs: derived on the card; whose rows were
+    /// derived on the host and sent; the bytes of refs, accesses, mixed
+    /// lists and whole rows sent for those derived.
+    pub derived_memw_a: u64,
+    pub records_memw_a: u64,
+    pub memw_a_ref_bytes: u64,
 }
 
 pub fn stats() -> Stats {
@@ -302,6 +334,9 @@ pub fn stats() -> Stats {
         register_records_spared: l(&c.register_records_spared),
         plan_secs: l(&c.plan_ns) as f64 * 1e-9,
         plan_wall_secs: l(&c.plan_wall_ns) as f64 * 1e-9,
+        derived_memw_a: l(&c.derived_memw_a),
+        records_memw_a: l(&c.records_memw_a),
+        memw_a_ref_bytes: l(&c.memw_a_ref_bytes),
     }
 }
 
@@ -403,6 +438,9 @@ pub fn clear() {
         &c.register_records_spared,
         &c.plan_ns,
         &c.plan_wall_ns,
+        &c.derived_memw_a,
+        &c.records_memw_a,
+        &c.memw_a_ref_bytes,
     ] {
         counter.store(0, Ordering::Relaxed);
     }
@@ -432,8 +470,19 @@ pub fn report_line() -> String {
     } else {
         String::new()
     };
+    // Only where MEMW_A tables were held as refs (the card-built trace).
+    let aligned = if s.derived_memw_a + s.records_memw_a > 0 {
+        format!(
+            " · MEMW_A derived {} of {} · MEMW_A refs {} B",
+            s.derived_memw_a,
+            s.derived_memw_a + s.records_memw_a,
+            s.memw_a_ref_bytes,
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "BLOCK CARD ROWS: mode {} · groups {} (order refused {}, declined {}) · CPU tables from the cache {}, copied {}, kept {}, let go {} · LOAD derived {} of {} · STORE derived {} of {} · cycle lists {} B · records not sent {} B · CPU logs not sent {} B · cache {} entries, {} B, budget {} B{registers}",
+        "BLOCK CARD ROWS: mode {} · groups {} (order refused {}, declined {}) · CPU tables from the cache {}, copied {}, kept {}, let go {} · LOAD derived {} of {} · STORE derived {} of {} · cycle lists {} B · records not sent {} B · CPU logs not sent {} B · cache {} entries, {} B, budget {} B{registers}{aligned}",
         mode().name(),
         s.groups,
         s.order_refused,
@@ -584,7 +633,30 @@ struct RegistersTableC {
     whole_base: u64,
 }
 
+/// `card_rows.cu`'s `AlignedPartC`: one window's part of a MEMW_A table
+/// derived on the card, its rows `row0..row0 + n` of the table at `out`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct AlignedPartC {
+    refs: u64,
+    n: u64,
+    before: u64,
+    row0: u64,
+    height: u64,
+    out: u64,
+    accesses: u64,
+    access_base: u64,
+    naccesses: u64,
+    mixed: u64,
+    nmixed: u64,
+    whole: u64,
+    whole_base: u64,
+    nwhole: u64,
+    limbs: u64,
+}
+
 const _: () = {
+    assert!(std::mem::size_of::<AlignedPartC>() == 120);
     assert!(std::mem::size_of::<CachedLogsC>() == 24);
     assert!(std::mem::size_of::<RowsTableC>() == 40);
     assert!(std::mem::size_of::<RegistersTableC>() == 56);
@@ -594,11 +666,13 @@ const _: () = {
 unsafe impl DeviceRepr for CachedLogsC {}
 unsafe impl DeviceRepr for RowsTableC {}
 unsafe impl DeviceRepr for RegistersTableC {}
+unsafe impl DeviceRepr for AlignedPartC {}
 
 struct Module {
     _module: Arc<CudaModule>,
     rows: CudaFunction,
     registers: CudaFunction,
+    memw_a: CudaFunction,
 }
 
 fn module() -> crate::Result<&'static Module> {
@@ -613,6 +687,7 @@ fn module() -> crate::Result<&'static Module> {
     let m = Module {
         rows: module.load_function("derive_rows_from_cache")?,
         registers: module.load_function("derive_registers_from_cache")?,
+        memw_a: module.load_function("derive_memw_a_from_cache")?,
         _module: module,
     };
     Ok(MODULE.get_or_init(|| m))
@@ -637,6 +712,9 @@ enum Plan {
     },
     /// A MEMW_R table built from the walk's words and the cached logs.
     Words(WordsPlan),
+    /// A MEMW_A table derived from its refs, the cached logs and its
+    /// windows' accesses.
+    DerivedMemwA,
 }
 
 /// A MEMW_R table in words mode as it goes up: the word ranges whose cycles'
@@ -767,7 +845,7 @@ fn plan_words(
 /// A table planned so and never launched would keep whatever its store held.
 fn launches_from_logs(plans: &[Plan]) -> bool {
     plans.iter().any(|p| match p {
-        Plan::Derived { .. } | Plan::Words(_) => true,
+        Plan::Derived { .. } | Plan::Words(_) | Plan::DerivedMemwA => true,
         Plan::Wide | Plan::Narrow | Plan::Records | Plan::CpuHit(_) => false,
     })
 }
@@ -931,6 +1009,33 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 plans[i] = Plan::Words(plan);
             }
         }
+        // MEMW_A's tables held as refs: derived where the cache holds every
+        // regular row's cycle, read with the table's own DECODE rows.
+        for (i, table) in tables.iter().enumerate() {
+            let TableUpload::Records(RecordsInput::MemwARefs {
+                parts,
+                decode,
+                rows,
+                ..
+            }) = table
+            else {
+                continue;
+            };
+            let n: usize = parts.iter().map(|p| p.refs.len()).sum();
+            let same = one_decode.as_ref().is_some_and(|d| Arc::ptr_eq(d, decode));
+            let Some((lo, hi)) = memw_a_span(parts) else {
+                continue;
+            };
+            if n != *rows || !all_one || !same || !covers(&held, lo, hi) {
+                continue;
+            }
+            for (&first, e) in cache.entries.range_mut(..=hi) {
+                if first + e.n as u64 > lo {
+                    e.tick = tick;
+                }
+            }
+            plans[i] = Plan::DerivedMemwA;
+        }
     }
 
     // ---- room: the table store, every copy held at once, kept logs ----
@@ -950,6 +1055,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                     as u64
             }
             (TableUpload::Narrow(packed), Plan::Narrow) => packed.bytes() as u64,
+            (TableUpload::Records(records), Plan::DerivedMemwA) => records.bytes() as u64,
             _ => 0,
         })
         .sum();
@@ -978,11 +1084,13 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
     // (words, whole rows, the first whole row's run index, rows)
     type RegistersUp = (CudaSlice<u64>, Option<CudaSlice<RegRowC>>, u64, u64);
     let mut registers_up: Vec<Option<RegistersUp>> = Vec::with_capacity(tables.len());
+    // A MEMW_A table derived on the card: its parts' records up.
+    let mut memw_a_up: Vec<Option<MemwAUp>> = Vec::with_capacity(tables.len());
     let mut at = 0usize;
     let mut offsets = Vec::with_capacity(tables.len());
     for (table, plan) in tables.iter().zip(&plans) {
         offsets.push(at);
-        let (mut s, mut l, mut r) = (None, None, None);
+        let (mut s, mut l, mut r, mut a) = (None, None, None, None);
         match (table, plan) {
             (TableUpload::Wide(columns), _) => {
                 for column in columns.iter() {
@@ -995,6 +1103,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 staged.push(None);
                 lists.push(None);
                 registers_up.push(None);
+                memw_a_up.push(None);
                 continue;
             }
             (TableUpload::Narrow(_), _) => {}
@@ -1101,9 +1210,26 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 let _ = records;
                 s = Some(Staged::Elsewhere);
             }
+            (TableUpload::Records(RecordsInput::MemwARefs { parts, .. }), Plan::DerivedMemwA) => {
+                let up = MemwAUp::upload(&stream, parts).ok()?;
+                let c = counters();
+                add(&c.derived_memw_a, 1);
+                let bytes: usize = parts.iter().map(AlignedPartIn::bytes).sum();
+                add(&c.memw_a_ref_bytes, bytes as u64);
+                let rows: usize = parts.iter().map(|p| p.refs.len()).sum();
+                add(
+                    &c.records_bytes_spared,
+                    (rows * std::mem::size_of::<AlignedRowC>()).saturating_sub(bytes) as u64,
+                );
+                a = Some(up);
+                s = Some(Staged::Elsewhere);
+            }
             (TableUpload::Records(records), _) => {
                 if matches!(records, RecordsInput::Cpu { .. }) && derive {
                     add(&counters().cpu_copies, 1);
+                }
+                if matches!(records, RecordsInput::MemwARefs { .. }) {
+                    add(&counters().records_memw_a, 1);
                 }
                 s = Some(crate::fill::stage(&stream, *records).ok()?);
             }
@@ -1118,6 +1244,7 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
         staged.push(s);
         lists.push(l);
         registers_up.push(r);
+        memw_a_up.push(a);
     }
 
     // The derived launches' descriptors: the cache's entries and this group's
@@ -1223,6 +1350,35 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
         .collect();
     let registers_dev = (!register_descs.is_empty())
         .then(|| stream.clone_htod(&register_descs).ok())
+        .flatten();
+    // The MEMW_A tables derived on the card, part by part.
+    let mut memw_a_descs: Vec<AlignedPartC> = Vec::new();
+    if derived_any {
+        let (base, _record) = buffer.device_ptr(&stream);
+        for (((table, plan), up), &offset) in
+            tables.iter().zip(&plans).zip(&memw_a_up).zip(&offsets)
+        {
+            if let (
+                Plan::DerivedMemwA,
+                Some(up),
+                TableUpload::Records(RecordsInput::MemwARefs {
+                    parts, limbs, rows, ..
+                }),
+            ) = (plan, up, table)
+            {
+                up.describe(
+                    &stream,
+                    parts,
+                    *limbs,
+                    *rows as u64,
+                    base + (offset * 8) as u64,
+                    &mut memw_a_descs,
+                );
+            }
+        }
+    }
+    let memw_a_dev = (!memw_a_descs.is_empty())
+        .then(|| stream.clone_htod(&memw_a_descs).ok())
         .flatten();
 
     // ---- pass 2: every kernel ----
@@ -1336,6 +1492,48 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 }
             }
         }
+        // The MEMW_A tables derived on the card, one launch: a thread a row.
+        if let Some(last) = memw_a_descs.last() {
+            let total_rows = last.before + last.n;
+            let nparts = u32::try_from(memw_a_descs.len()).ok()?;
+            let fault = FAULT_MEMW_A.load(Ordering::Relaxed) & MEMW_A_FAULTS;
+            let missing = checks.missing(&stream).ok()?;
+            let config = LaunchConfig {
+                grid_dim: (
+                    u32::try_from(total_rows.div_ceil(u64::from(ROW_BLOCK))).ok()?,
+                    1,
+                    1,
+                ),
+                block_dim: (ROW_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            match &memw_a_dev {
+                None => kernels_ok = false,
+                Some(dev) => {
+                    let clock = TableClock::start(&stream, true);
+                    // SAFETY: as the launches above; the parts' records are
+                    // this group's copies, alive until the stream is
+                    // synchronized below.
+                    let launched = unsafe {
+                        stream
+                            .launch_builder(&m.memw_a)
+                            .arg(entries)
+                            .arg(&nentries)
+                            .arg(dev)
+                            .arg(&nparts)
+                            .arg(&total_rows)
+                            .arg(dec)
+                            .arg(runs)
+                            .arg(&nruns)
+                            .arg(&fault)
+                            .arg(missing)
+                            .launch(config)
+                    };
+                    kernels_ok &= launched.is_ok();
+                    clocks.extend(clock.filter(|c| c.done.record(&stream).is_ok()));
+                }
+            }
+        }
     } else if derived_any {
         kernels_ok = false;
     }
@@ -1385,6 +1583,102 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
     }
     drop(guard);
     Some(DeviceColumns::from_parts(stream, buffer, spans, room))
+}
+
+/// The least and the greatest cycle of `parts`' regular rows (an ECALL's row
+/// reads no log); `None` when there is none, or a ref names a cycle past the
+/// history's clock (the table then goes up as the rows derived on the host).
+pub fn memw_a_span(parts: &[AlignedPartIn<'_>]) -> Option<(u64, u64)> {
+    let mut span: Option<(u64, u64)> = None;
+    for r in parts.iter().flat_map(|p| p.refs.iter()) {
+        if r.cycle & ALIGNED_ECALL != 0 {
+            continue;
+        }
+        let c = u64::from(r.cycle);
+        if c >= (1 << 30) - 1 {
+            return None;
+        }
+        span = Some(span.map_or((c, c), |(lo, hi)| (lo.min(c), hi.max(c))));
+    }
+    span
+}
+
+/// A MEMW_A table's parts' records on the card: refs, accesses, mixed
+/// timestamps and whole rows, each kind in one buffer, and where each part's
+/// start in them.
+struct MemwAUp {
+    refs: CudaSlice<AlignedRefC>,
+    accesses: CudaSlice<MemoryAccessC>,
+    mixed: CudaSlice<u32>,
+    whole: CudaSlice<AlignedRowC>,
+    starts: Vec<[usize; 4]>,
+}
+
+impl MemwAUp {
+    fn upload(
+        stream: &Arc<cudarc::driver::CudaStream>,
+        parts: &[AlignedPartIn<'_>],
+    ) -> crate::Result<Self> {
+        let mut starts = Vec::with_capacity(parts.len());
+        let mut at = [0usize; 4];
+        for p in parts {
+            starts.push(at);
+            at[0] += p.refs.len();
+            at[1] += p.accesses.len();
+            at[2] += p.mixed.len();
+            at[3] += p.whole.len();
+        }
+        let refs: Vec<&[AlignedRefC]> = parts.iter().map(|p| p.refs).collect();
+        let accesses: Vec<&[MemoryAccessC]> = parts.iter().map(|p| p.accesses).collect();
+        let mixed: Vec<&[u32]> = parts.iter().map(|p| p.mixed).collect();
+        let whole: Vec<&[AlignedRowC]> = parts.iter().map(|p| p.whole).collect();
+        Ok(Self {
+            refs: crate::fill::upload_pieces(stream, &refs)?,
+            accesses: crate::fill::upload_pieces(stream, &accesses)?,
+            mixed: crate::fill::upload_pieces(stream, &mixed)?,
+            whole: crate::fill::upload_pieces(stream, &whole)?,
+            starts,
+        })
+    }
+
+    /// The parts' descriptors, appended to `out` after the launch's rows so
+    /// far: rows from 0 of the `height`-row table at `out_at`.
+    fn describe(
+        &self,
+        stream: &Arc<cudarc::driver::CudaStream>,
+        parts: &[AlignedPartIn<'_>],
+        limbs: bool,
+        height: u64,
+        out_at: u64,
+        out: &mut Vec<AlignedPartC>,
+    ) {
+        let (refs, _r) = self.refs.device_ptr(stream);
+        let (accesses, _a) = self.accesses.device_ptr(stream);
+        let (mixed, _m) = self.mixed.device_ptr(stream);
+        let (whole, _w) = self.whole.device_ptr(stream);
+        let mut row0 = 0u64;
+        for (p, s) in parts.iter().zip(&self.starts) {
+            let before = out.last().map_or(0, |d| d.before + d.n);
+            out.push(AlignedPartC {
+                refs: refs + (s[0] * std::mem::size_of::<AlignedRefC>()) as u64,
+                n: p.refs.len() as u64,
+                before,
+                row0,
+                height,
+                out: out_at,
+                accesses: accesses + (s[1] * std::mem::size_of::<MemoryAccessC>()) as u64,
+                access_base: u64::from(p.access_base),
+                naccesses: p.accesses.len() as u64,
+                mixed: mixed + (s[2] * 4) as u64,
+                nmixed: (p.mixed.len() / 8) as u64,
+                whole: whole + (s[3] * std::mem::size_of::<AlignedRowC>()) as u64,
+                whole_base: u64::from(p.whole_base),
+                nwhole: p.whole.len() as u64,
+                limbs: u64::from(limbs),
+            });
+            row0 += p.refs.len() as u64;
+        }
+    }
 }
 
 fn records_len<T>(pieces: &[&[T]]) -> usize {
@@ -1526,6 +1820,41 @@ mod tests {
         }
     }
 
+    /// A MEMW_A table's span is its regular rows' cycles, ECALL rows aside;
+    /// none without a regular row or with a cycle past the history's clock.
+    #[test]
+    fn a_memw_a_tables_span_is_its_regular_rows_cycles() {
+        let part = |refs: &'static [AlignedRefC]| AlignedPartIn {
+            refs,
+            accesses: &[],
+            access_base: 0,
+            mixed: &[],
+            whole: &[],
+            whole_base: 0,
+        };
+        const A: [AlignedRefC; 3] = [
+            AlignedRefC { cycle: 9, at: 0 },
+            AlignedRefC {
+                cycle: ALIGNED_ECALL | 2,
+                at: 0,
+            },
+            AlignedRefC { cycle: 5, at: 1 },
+        ];
+        const B: [AlignedRefC; 1] = [AlignedRefC { cycle: 12, at: 0 }];
+        const ECALLS: [AlignedRefC; 1] = [AlignedRefC {
+            cycle: ALIGNED_ECALL | 40,
+            at: 0,
+        }];
+        const LATE: [AlignedRefC; 1] = [AlignedRefC {
+            cycle: (1 << 30) - 1,
+            at: 0,
+        }];
+        assert_eq!(memw_a_span(&[part(&A), part(&B)]), Some((5, 12)));
+        assert_eq!(memw_a_span(&[part(&ECALLS)]), None);
+        assert_eq!(memw_a_span(&[part(&A), part(&LATE)]), None);
+        assert_eq!(memw_a_span(&[]), None);
+    }
+
     #[test]
     fn the_knob_reads_its_words_and_refuses_the_rest() {
         // Unset is the default, words.
@@ -1609,6 +1938,7 @@ mod tests {
             store: false,
             cycles: Vec::new()
         }]));
+        assert!(launches_from_logs(&[Plan::Records, Plan::DerivedMemwA]));
         assert!(!launches_from_logs(&[
             Plan::Wide,
             Plan::Narrow,
