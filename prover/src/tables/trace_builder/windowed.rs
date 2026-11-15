@@ -999,6 +999,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 "memory_format after a window was walked".to_string(),
             ));
         }
+        super::super::fused_memory::refuse_unbuilt(format)?;
         self.emitted.memory_format = format;
         Ok(self)
     }
@@ -5024,6 +5025,7 @@ impl RegenBuilder {
                 "memory_format after a window was walked".to_string(),
             ));
         }
+        super::super::fused_memory::refuse_unbuilt(format)?;
         self.cut.memory_format = format;
         Ok(self)
     }
@@ -5112,6 +5114,11 @@ impl RegenBuilder {
                 .map(super::route_store)
                 .collect(),
             MemoryFormat::Fused => std::mem::take(&mut walk.store_ops),
+            MemoryFormat::Words => {
+                return Err(Error::Prover(
+                    "the word memory format is not built yet".to_string(),
+                ));
+            }
         };
         // Mutable for the tests' slicer bug (`drop_one_op`).
         #[cfg_attr(not(test), allow(unused_mut))]

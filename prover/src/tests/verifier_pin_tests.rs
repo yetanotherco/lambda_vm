@@ -583,7 +583,8 @@ fn frame_counts(
     // One MEM_LOAD and one MEM_STORE table under the fused memory format.
     let fused: [u64; 2] = match format.memory {
         crate::tables::fused_memory::MemoryFormat::Fused => [1, 1],
-        crate::tables::fused_memory::MemoryFormat::Split => [0, 0],
+        crate::tables::fused_memory::MemoryFormat::Split
+        | crate::tables::fused_memory::MemoryFormat::Words => [0, 0],
     };
     let tables = counts.total().expect("a total")
         + crate::FIXED_TABLE_COUNT

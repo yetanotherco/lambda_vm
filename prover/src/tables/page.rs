@@ -596,7 +596,7 @@ pub fn offset_column() -> Vec<FE> {
 /// [`compute_offset_only_commitment`] (OFFSET alone) so both go through an
 /// identical pipeline — the two commitments must be built the same way or the
 /// verifier's recomputation would not match the prover's tree.
-fn commit_preprocessed_columns(
+pub(crate) fn commit_preprocessed_columns(
     columns: &[Vec<FE>],
     num_rows: usize,
     options: &ProofOptions,
