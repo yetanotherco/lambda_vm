@@ -44,6 +44,27 @@ struct CpuSideC {
 static_assert(sizeof(CpuSideC) == 20, "CpuSideC is 20 bytes");
 static_assert(offsetof(CpuSideC, old_rd) == 12, "CpuSideC field order");
 
+// What the executor's history writes beside a cycle's log
+// (`executor/src/vm/history.rs`, `HistExtra`): the old timestamps of the
+// cycle's rs1 (the pc's for JAL and AUIPC), rs2 and rd accesses, in the walk's
+// order, 0 where it makes none; and where its memory accesses are.
+struct RegisterStampsC {
+    uint32_t regs_ts[3];
+    uint32_t side;
+};
+static_assert(sizeof(RegisterStampsC) == 16, "RegisterStampsC is 16 bytes");
+static_assert(offsetof(RegisterStampsC, side) == 12, "RegisterStampsC field order");
+
+// A CPU row whose rd old value the card cannot read from the chunk's own logs
+// (`prover`'s `history_sides.rs`, `SideException`): its cycle, and the value,
+// low word then high word. A chunk's list is ascending by cycle.
+struct SideExceptionC {
+    uint32_t cycle;
+    uint32_t old_rd[2];
+};
+static_assert(sizeof(SideExceptionC) == 12, "SideExceptionC is 12 bytes");
+static_assert(offsetof(SideExceptionC, old_rd) == 4, "SideExceptionC field order");
+
 // One MEMW_R row (`memw_register.rs`, `RegRow`): `address` is the register
 // index, `old_ts_lo` the old timestamp's low word (its high word is the
 // timestamp's), `is_read` 0 or 1, `pad` 0.
@@ -786,6 +807,136 @@ extern "C" __global__ void fill_cpu_from_logs(const LogC *logs, uint64_t n,
     w.word(c::BRANCH_COND, branch_cond);
     // The inline pc read's column.
     w.word(c::PC_DOUBLE_READ, live && e.read_register1 && e.rs1 == 255);
+}
+
+// ---------------------------------------------------------------------------
+// The in-row register format's side records derived on the card from the
+// executor's history (`prover`'s `history_sides.rs`, `cpu_sides_from_history`,
+// the host reference this restates rule for rule), instead of copied up as the
+// walk wrote them. For the row of cycle `c = first_cycle + r`:
+//   - a word instruction's row is all zeros (the walk's `CpuSide::default()`);
+//   - slot k (0 rs1 at ts, 1 rs2 at ts + 1, 2 rd at ts + 2, ts = 4c + 4),
+//     where the row makes it (read1 and rs1 != 0, read2 and rs2 != 0, write and
+//     rd != 0), takes `in_row_prev(slot_ts, regs_ts[k])`: the old timestamp,
+//     or `slot_ts - 1` past a step of 2^16 (`trace_builder.rs`, `in_row_prev`);
+//   - rd's old value is the row's exception when the list names its cycle;
+//     else the value of the access at `o = regs_ts[2]`: cycle `j = (o - 4) / 4`,
+//     slot `(o - 4) % 4`, read from `j`'s log (src1, src2 or dst by slot), which
+//     must lie in this chunk at or before `c`, in no ECALL cycle, and access rd
+//     at that slot.
+// A row that breaks a rule counts into `check` and is written as zeros: the
+// group is then refused. One thread a row.
+// ---------------------------------------------------------------------------
+
+// A card test's mutants (`src/fill.rs`, `FAULT_SIDES`): rs2's previous
+// timestamp read from rs1's stamp; the keep-alive rule dropped; rd's old value
+// read as `j`'s written value whatever the slot; the exceptions ignored.
+constexpr uint32_t SIDES_FAULT_SLOT = 1;
+constexpr uint32_t SIDES_FAULT_KEEP_ALIVE = 2;
+constexpr uint32_t SIDES_FAULT_VALUE = 4;
+constexpr uint32_t SIDES_FAULT_EXCEPTIONS = 8;
+
+namespace sides {
+
+// `in_row_prev` with its preconditions: `old < slot_ts`, both below 2^32.
+__device__ __forceinline__ bool prev(uint64_t slot_ts, uint32_t old, bool keep_alive,
+                                     uint32_t *out) {
+    if ((uint64_t)old >= slot_ts || (slot_ts >> 32) != 0) return false;
+    *out = (keep_alive && slot_ts - old > (1ull << 16)) ? (uint32_t)(slot_ts - 1) : old;
+    return true;
+}
+
+// The exception for `cycle`, if `ex` (ascending, `n` of them) names it.
+__device__ __forceinline__ const SideExceptionC *exception(const SideExceptionC *ex, uint32_t n,
+                                                           uint32_t cycle) {
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (ex[mid].cycle < cycle) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return (lo < n && ex[lo].cycle == cycle) ? &ex[lo] : nullptr;
+}
+
+}  // namespace sides
+
+extern "C" __global__ void derive_cpu_sides(const LogC *logs, uint64_t n, uint64_t first_cycle,
+                                            const RegisterStampsC *stamps,
+                                            const SideExceptionC *ex, uint32_t nex,
+                                            const DecodeEntryC *entries, const DecodeRunC *runs,
+                                            uint32_t nruns, CpuSideC *out,
+                                            unsigned long long *check, uint32_t fault) {
+    const uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n) return;
+    CpuSideC side{{0, 0, 0}, {0, 0}};
+    const LogC log = logs[r];
+    const int64_t at = fill::decode_row(runs, nruns, log.current_pc);
+    // A log with no DECODE row: the CPU fill counts it and refuses the table.
+    if (at < 0) {
+        out[r] = side;
+        return;
+    }
+    const DecodeEntryC e = entries[at];
+    if (e.word_instr) {
+        out[r] = side;
+        return;
+    }
+    const uint64_t c = first_cycle + r;
+    const uint64_t ts = 4 * c + 4;
+    const RegisterStampsC st = stamps[r];
+    const bool keep_alive = (fault & SIDES_FAULT_KEEP_ALIVE) == 0;
+    bool ok = true;
+    if (e.read_register1 && e.rs1 != 0) {
+        ok = ok && sides::prev(ts, st.regs_ts[0], keep_alive, &side.prev_ts[0]);
+    }
+    if (e.read_register2 && e.rs2 != 0) {
+        const uint32_t old = (fault & SIDES_FAULT_SLOT) ? st.regs_ts[0] : st.regs_ts[1];
+        ok = ok && sides::prev(ts + 1, old, keep_alive, &side.prev_ts[1]);
+    }
+    if (e.write_register && e.rd != 0) {
+        ok = ok && sides::prev(ts + 2, st.regs_ts[2], keep_alive, &side.prev_ts[2]);
+        const SideExceptionC *x = (fault & SIDES_FAULT_EXCEPTIONS)
+                                      ? nullptr
+                                      : sides::exception(ex, nex, (uint32_t)c);
+        if (x != nullptr) {
+            side.old_rd[0] = x->old_rd[0];
+            side.old_rd[1] = x->old_rd[1];
+        } else {
+            const uint64_t o = st.regs_ts[2];
+            ok = ok && o >= 4 * first_cycle + 4;
+            const uint64_t j = ok ? (o - 4) / 4 : c;
+            const uint32_t sj = ok ? (uint32_t)((o - 4) % 4) : 3;
+            ok = ok && j <= c && sj < 3;
+            uint64_t value = 0;
+            if (ok) {
+                const LogC lj = logs[j - first_cycle];
+                const int64_t aj = fill::decode_row(runs, nruns, lj.current_pc);
+                ok = aj >= 0 && !entries[aj].ecall;
+                if (ok) {
+                    const DecodeEntryC d = entries[aj];
+                    // The access at `o` must be rd's.
+                    ok = sj == 0   ? (d.read_register1 && d.rs1 == e.rd)
+                         : sj == 1 ? (d.read_register2 && d.rs2 == e.rd)
+                                   : (d.write_register && d.rd == e.rd);
+                    if (fault & SIDES_FAULT_VALUE) {
+                        value = lj.dst_val;
+                    } else {
+                        value = sj == 0 ? lj.src1_val : (sj == 1 ? lj.src2_val : lj.dst_val);
+                    }
+                }
+            }
+            side.old_rd[0] = (uint32_t)value;
+            side.old_rd[1] = (uint32_t)(value >> 32);
+        }
+    }
+    if (!ok) {
+        atomicAdd(check, 1ull);
+        side = CpuSideC{{0, 0, 0}, {0, 0}};
+    }
+    out[r] = side;
 }
 
 // ---------------------------------------------------------------------------

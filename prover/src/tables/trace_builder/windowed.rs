@@ -93,6 +93,8 @@ use card_records::{
 
 mod handout_count;
 pub use handout_count::CountThreadStamps;
+
+mod history_sides;
 use handout_count::{CountWork, HandoutCounter};
 
 /// Whether the host has room to hold a chunk of so many bytes as records
@@ -4993,6 +4995,9 @@ mod count_made_tests;
 mod cpu_listless_tests;
 #[cfg(test)]
 mod register_words_tests;
+
+#[cfg(all(test, feature = "parallel"))]
+mod history_sides_tests;
 
 #[cfg(test)]
 mod tail_tests;

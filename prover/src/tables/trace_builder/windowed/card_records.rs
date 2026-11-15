@@ -12,6 +12,7 @@ use executor::vm::logs::Log;
 use multilinear::narrow::NarrowColumns;
 use multilinear::records::{DecodeRecords, PagesReturned, Records, RecordsFill, TableRecords};
 
+use super::history_sides::{HistoryParts, HistorySides};
 use super::{Segments, StreamTable, Table};
 use crate::tables::decode::DecodeTable;
 use crate::tables::gpack::TraceForm;
@@ -70,6 +71,9 @@ pub(crate) struct CpuLogRecords {
     /// Under the in-row register format, one side record a log, in the same
     /// order (in pieces of their own); empty otherwise.
     sides: Segments<cpu::CpuSide>,
+    /// Under the in-row register format with the side records derived on the
+    /// card: what they are derived from (`sides` is then empty).
+    history: Option<HistorySides>,
     first_cycle: u64,
     decode: Arc<CardDecode>,
 }
@@ -86,6 +90,7 @@ impl CpuLogRecords {
         whole_table(logs.len()).then_some(Self {
             logs,
             sides: Segments { parts: Vec::new() },
+            history: None,
             first_cycle,
             decode,
         })
@@ -106,6 +111,28 @@ impl CpuLogRecords {
             .map(|records| Self { sides, ..records })
     }
 
+    /// [`Self::in_row`] with the side records derived on the card from the
+    /// executor's history: `extras` (one a log) and `exceptions` (ascending
+    /// by cycle, every row whose `rd` old value the logs do not give;
+    /// [`super::history_sides`]). Refused unless there is one record a log.
+    // Its caller, the windowed builder's cut, comes with `LAMBDA_VM_CARD_TRACE`.
+    #[allow(dead_code)]
+    pub(crate) fn in_row_from_history(
+        logs: Segments<Log>,
+        extras: HistoryParts,
+        exceptions: Vec<multilinear::records::SideException>,
+        first_cycle: u64,
+        decode: Arc<CardDecode>,
+    ) -> Option<Self> {
+        (extras.len() == logs.len() && extras.len() > 0)
+            .then(|| Self::new(logs, first_cycle, decode))
+            .flatten()
+            .map(|records| Self {
+                history: Some(HistorySides::new(extras, exceptions)),
+                ..records
+            })
+    }
+
     /// The table held as these records.
     pub(crate) fn into_trace(self) -> Table {
         held(Records(Arc::new(self)))
@@ -116,9 +143,14 @@ impl CpuLogRecords {
         &self.decode.table
     }
 
-    /// Its side records, under the in-row register format; `None` otherwise.
+    /// Its side records, under the in-row register format (those the host
+    /// derives, where the card derives them); `None` otherwise, and where the
+    /// derivation refused a row.
     pub(crate) fn sides(&self) -> Option<&Segments<cpu::CpuSide>> {
-        (self.sides.len() > 0).then_some(&self.sides)
+        match &self.history {
+            Some(h) => h.derived(&self.logs, self.first_cycle, &self.decode.table),
+            None => (self.sides.len() > 0).then_some(&self.sides),
+        }
     }
 
     /// A test's fault: the same chunk from a copy of its logs, each log's
@@ -163,7 +195,7 @@ impl TableRecords for CpuLogRecords {
     }
 
     fn cols(&self) -> usize {
-        if self.sides.len() == 0 {
+        if self.sides.len() == 0 && self.history.is_none() {
             cpu::cols::NUM_COLUMNS
         } else {
             cpu::inrow_cols::NUM_COLUMNS_INROW
@@ -176,11 +208,42 @@ impl TableRecords for CpuLogRecords {
             sides: self.sides.slices(),
             first_cycle: self.first_cycle,
             decode: &self.decode.records,
+            history: self
+                .history
+                .as_ref()
+                .map(|h| multilinear::records::SidesFromHistory {
+                    stamps: h
+                        .extras
+                        .slices()
+                        .into_iter()
+                        .map(super::history_sides::card_stamps)
+                        .collect(),
+                    exceptions: vec![&h.exceptions[..]],
+                }),
         }
     }
 
     fn bytes(&self) -> usize {
-        self.logs.op_bytes() + self.sides.op_bytes()
+        self.logs.op_bytes()
+            + self.sides.op_bytes()
+            + self.history.as_ref().map_or(0, |h| {
+                h.extras.bytes() + std::mem::size_of_val(&h.exceptions[..])
+            })
+    }
+
+    /// Where the card derives the side records, the records as if they had
+    /// been held: the logs and the side records the host derives, so a chunk
+    /// rebuilt either way digests alike.
+    fn digest_fill(&self) -> Option<RecordsFill<'_>> {
+        self.history.as_ref()?;
+        let sides = self.sides()?;
+        Some(RecordsFill::Cpu {
+            logs: self.logs.slices().into_iter().map(cpu::card_logs).collect(),
+            sides: sides.slices(),
+            first_cycle: self.first_cycle,
+            decode: &self.decode.records,
+            history: None,
+        })
     }
 
     /// TIMESTAMP, `4·(row + 1)`: the fill writes it from the row index, as the
@@ -199,15 +262,14 @@ impl TableRecords for CpuLogRecords {
             super::super::collect_cpu_ops_into(piece, &self.decode.table, first, &mut ops).ok()?;
             first += piece.len();
         }
-        let mut trace = if self.sides.len() == 0 {
-            cpu::generate_cpu_trace_as(&ops, &self.decode.table, TraceForm::Narrow)
-        } else {
-            cpu::generate_cpu_trace_inrow_segments_as(
+        let mut trace = match (self.sides.len(), &self.history) {
+            (0, None) => cpu::generate_cpu_trace_as(&ops, &self.decode.table, TraceForm::Narrow),
+            _ => cpu::generate_cpu_trace_inrow_segments_as(
                 &[&ops],
-                &self.sides.slices(),
+                &self.sides()?.slices(),
                 &self.decode.table,
                 TraceForm::Narrow,
-            )
+            ),
         };
         // Written packed, except in a build that holds every trace wide.
         trace.pack_main_narrow();

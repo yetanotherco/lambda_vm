@@ -92,6 +92,60 @@ pub struct CpuSide {
     pub old_rd: [u32; 2],
 }
 
+/// What the executor's history writes beside a cycle's log (the executor's
+/// `HistExtra`, field for field): the old timestamps of the cycle's `rs1`
+/// (the pc's for JAL and AUIPC), `rs2` and `rd` accesses, 0 where it makes
+/// none, and where its memory accesses are. The card derives a CPU row's side
+/// record from them ([`SidesFromHistory`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegisterStamps {
+    pub regs_ts: [u32; 3],
+    pub side: u32,
+}
+
+/// A CPU row whose `rd` old value the card cannot read from its chunk's own
+/// logs: its cycle, and the value, low word then high word.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SideException {
+    pub cycle: u32,
+    pub old_rd: [u32; 2],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<RegisterStamps>() == 16);
+    assert!(std::mem::offset_of!(RegisterStamps, side) == 12);
+    assert!(std::mem::size_of::<SideException>() == 12);
+    assert!(std::mem::offset_of!(SideException, old_rd) == 4);
+};
+
+/// A CPU table's side records as the card derives them instead of reading
+/// them: one [`RegisterStamps`] a log, in the same order (in pieces of their
+/// own), and the rows whose `rd` old value the logs do not give, ascending by
+/// cycle (the prover's `history_sides`, whose host reference every host
+/// reader of the table goes through).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidesFromHistory<'a> {
+    pub stamps: Vec<&'a [RegisterStamps]>,
+    pub exceptions: Vec<&'a [SideException]>,
+}
+
+impl SidesFromHistory<'_> {
+    /// The bytes that cross the bus.
+    pub fn bytes(&self) -> usize {
+        self.stamps
+            .iter()
+            .map(|p| std::mem::size_of_val(*p))
+            .sum::<usize>()
+            + self
+                .exceptions
+                .iter()
+                .map(|p| std::mem::size_of_val(*p))
+                .sum::<usize>()
+    }
+}
+
 /// One MEMW_R row as its fill reads it (the prover's register row, field for
 /// field): `address` the register index, `old_ts_lo` the old timestamp's low
 /// word, `is_read` 0 or 1, `pad` 0.
@@ -379,12 +433,14 @@ pub enum RecordsFill<'a> {
     /// Under the register format that checks a CPU row's register accesses in
     /// the row itself, `sides` holds one side record a log, in the same order
     /// (their pieces need not lie as the logs'), and the table has five more
-    /// columns; otherwise it is empty.
+    /// columns; otherwise it is empty. With `history` (and no `sides`) the
+    /// card derives the side records itself from the executor's history.
     Cpu {
         logs: Vec<&'a [CpuLog]>,
         sides: Vec<&'a [CpuSide]>,
         first_cycle: u64,
         decode: &'a DecodeRecords,
+        history: Option<SidesFromHistory<'a>>,
     },
     /// MEMW_R's rows: the pieces in order, then zero rows.
     MemwR { rows: Vec<&'a [RegisterRow]> },
@@ -406,7 +462,12 @@ impl RecordsFill<'_> {
     pub fn bytes(&self) -> usize {
         match self {
             Self::KeccakRnd { ops, .. } => std::mem::size_of_val(*ops),
-            Self::Cpu { logs, sides, .. } => {
+            Self::Cpu {
+                logs,
+                sides,
+                history,
+                ..
+            } => {
                 logs.iter()
                     .map(|p| std::mem::size_of_val(*p))
                     .sum::<usize>()
@@ -414,6 +475,7 @@ impl RecordsFill<'_> {
                         .iter()
                         .map(|p| std::mem::size_of_val(*p))
                         .sum::<usize>()
+                    + history.as_ref().map_or(0, SidesFromHistory::bytes)
             }
             Self::MemwR { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::MemwA { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
@@ -460,8 +522,25 @@ impl RecordsFill<'_> {
                 logs,
                 sides,
                 first_cycle,
+                history,
                 ..
             } => {
+                // A table whose side records the card derives digests them as
+                // derived ([`TableRecords::digest_fill`]): what reaches here
+                // from a digest holds `sides`, never `history`. Its words are
+                // read anyway, first, so two fills that differ only there do
+                // not read alike.
+                if let Some(h) = history {
+                    each(7);
+                    for st in h.stamps.iter().flat_map(|piece| piece.iter()) {
+                        each(u64::from(st.regs_ts[0]) | u64::from(st.regs_ts[1]) << 32);
+                        each(u64::from(st.regs_ts[2]) | u64::from(st.side) << 32);
+                    }
+                    for x in h.exceptions.iter().flat_map(|piece| piece.iter()) {
+                        each(u64::from(x.cycle) | u64::from(x.old_rd[0]) << 32);
+                        each(u64::from(x.old_rd[1]));
+                    }
+                }
                 each(1);
                 each(*first_cycle);
                 for log in logs.iter().flat_map(|piece| piece.iter()) {
@@ -642,6 +721,15 @@ pub trait TableRecords: Send + Sync + std::fmt::Debug {
         let _ = (from, to);
         Vec::new()
     }
+
+    /// The records [`digest_of`] reads, when they are not [`Self::fill`]'s:
+    /// a CPU table whose side records the card derives from the executor's
+    /// history digests the side records derived (its host reference's), so
+    /// the same table held either way digests alike. `None` (the default):
+    /// [`Self::fill`] and [`Self::bytes`].
+    fn digest_fill(&self) -> Option<RecordsFill<'_>> {
+        None
+    }
 }
 
 /// A MEMW_R chunk as words ([`TableRecords::register_words`]): a word a row,
@@ -725,14 +813,18 @@ pub fn digest_of(records: &dyn TableRecords) -> [u64; 2] {
         0x1656_67b1_9e37_79f9,
         0x85eb_ca77_c2b2_ae63,
     ];
+    let (bytes, fill) = match records.digest_fill() {
+        Some(fill) => (fill.bytes(), fill),
+        None => (records.bytes(), records.fill()),
+    };
     let mut lanes = [
         records.rows() as u64,
         records.cols() as u64,
-        records.bytes() as u64,
+        bytes as u64,
         0x243f_6a88_85a3_08d3,
     ];
     let mut i = 0usize;
-    records.fill().words(|w| {
+    fill.words(|w| {
         let l = i % 4;
         lanes[l] = (lanes[l] ^ w).wrapping_mul(K[l]).rotate_left(31);
         i += 1;
@@ -940,12 +1032,14 @@ mod tests {
                     sides: Vec::new(),
                     first_cycle: *first_cycle,
                     decode,
+                    history: None,
                 },
                 Self::CpuInRow(pieces, sides, decode) => RecordsFill::Cpu {
                     logs: pieces.iter().map(Vec::as_slice).collect(),
                     sides: sides.iter().map(Vec::as_slice).collect(),
                     first_cycle: 0,
                     decode,
+                    history: None,
                 },
                 Self::MemwR(pieces) => RecordsFill::MemwR {
                     rows: pieces.iter().map(Vec::as_slice).collect(),
@@ -1315,6 +1409,7 @@ mod tests {
             sides: Vec::new(),
             first_cycle: 0,
             decode: &decode,
+            history: None,
         };
         assert_eq!((split.len(), split.bytes()), (6, 240));
         let rows = [RegisterRow::default(); 3];
