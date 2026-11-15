@@ -561,7 +561,8 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     );
 }
 
-/// A hand-built block statement for `sub` under the pinned format: `counts`,
+/// A hand-built block statement for `sub` under the pinned format: `counts`
+/// (and one fused memory table of each kind when the format fuses memory),
 /// every table at four rows but BITWISE at its fixed 2^20, each table a group
 /// of its own but every table after BITWISE in one group.
 fn frame_counts(
@@ -577,7 +578,16 @@ fn frame_counts(
     )
     .expect("pages")
     .len();
-    let tables = counts.total().expect("a total") + crate::FIXED_TABLE_COUNT + pages;
+    let format = BlockFormat::pinned();
+    // One MEM_LOAD and one MEM_STORE table under the fused memory format.
+    let fused: [u64; 2] = match format.memory {
+        crate::tables::fused_memory::MemoryFormat::Fused => [1, 1],
+        crate::tables::fused_memory::MemoryFormat::Split => [0, 0],
+    };
+    let tables = counts.total().expect("a total")
+        + crate::FIXED_TABLE_COUNT
+        + pages
+        + (fused[0] + fused[1]) as usize;
     let mut heights = vec![2u8; tables];
     heights[block_whir::BITWISE_TABLE] = crate::tables::bitwise::NUM_VARS as u8;
     let groups: Vec<Vec<u32>> = vec![vec![0], (1..tables as u32).collect()];
@@ -589,10 +599,11 @@ fn frame_counts(
             public_output: &[],
             num_private_input_pages: 0,
             groups: &groups,
+            fused_memory: fused,
         },
         elf,
         &ProofOptions::default_test_options(),
-        &BlockFormat::pinned(),
+        &format,
     )
 }
 
