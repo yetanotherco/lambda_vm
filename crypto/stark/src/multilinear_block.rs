@@ -2455,6 +2455,28 @@ type Store = Option<Arc<multilinear::gpu::ResidentColumns>>;
 /// Uploads a group's columns, in table order — a narrow table's packed, and
 /// widened on the card; `None` when the card declines (every reader then takes
 /// the host copy, widening a narrow table's there).
+/// A bench's group put on the card as phase B puts each group there (its
+/// columns uploaded in one store, each table pointed at its share): whether
+/// the card took it. Measurement only.
+#[doc(hidden)]
+pub fn reside_group_for_bench<F, E>(group: &mut [CommittedTable<'_, F, E>]) -> bool
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let Some(store) = upload_group(group) else {
+        return false;
+    };
+    let mut first = 0usize;
+    for table in group.iter_mut() {
+        table.set_resident(store.clone(), first);
+        first += table.num_committed_columns();
+    }
+    true
+}
+
 fn upload_group<F, E>(group: &[CommittedTable<'_, F, E>]) -> Store
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
