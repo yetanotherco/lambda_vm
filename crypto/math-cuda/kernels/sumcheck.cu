@@ -1030,6 +1030,76 @@ extern "C" __global__ __launch_bounds__(256) void zc_bus_u_store(
     }
 }
 
+// `zc_fold2` over the factors listed in `d_sel` only: `out` slab `sel[i]` from factor `sel[i]`.
+extern "C" __global__ void zc_fold2_sel(const uint64_t *const *__restrict__ d_factors, uint64_t q,
+                                        const uint32_t *__restrict__ d_sel, uint64_t nsel,
+                                        const uint64_t *__restrict__ d_w,
+                                        uint64_t *__restrict__ out, uint64_t stride) {
+    Fe3 w0 = load_ext(d_w), w1 = load_ext(d_w + 3), w2 = load_ext(d_w + 6),
+        w3 = load_ext(d_w + 9);
+    uint64_t total = nsel * q;
+    for (uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; task < total;
+         task += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t i = task / q;
+        uint64_t x = task - i * q;
+        uint64_t k = d_sel[i];
+        const uint64_t *column = d_factors[k];
+        Fe3 v = ext3::mul_base(w0, column[x * stride]);
+        v = ext3::add(v, ext3::mul_base(w1, column[(x + q) * stride]));
+        v = ext3::add(v, ext3::mul_base(w2, column[(x + 2 * q) * stride]));
+        v = ext3::add(v, ext3::mul_base(w3, column[(x + 3 * q) * stride]));
+        uint64_t *at = out + (k * q + x) * 3;
+        at[0] = v.a;
+        at[1] = v.b;
+        at[2] = v.c;
+    }
+}
+
+// Every challenge bound at once, for the factors no round reads: for factor `sel[i]` and cell `y`
+// of the `cells` the host tail takes, `Σ_t E[t]·f[(t·cells + y)·stride]`, `E` the `eq` table of
+// the bound challenges (the first bound in the high bit, the order the folds bind in). Pass one:
+// thread `tid` of `threads` (a multiple of `cells`) sums the rows `r ≡ tid (mod threads)` into
+// `d_partials[i·threads + tid]`; `blockIdx.y` is `i`.
+extern "C" __global__ void zc_bind_all(const uint64_t *const *__restrict__ d_factors,
+                                       const uint32_t *__restrict__ d_sel, uint64_t rows,
+                                       uint64_t cells, const uint64_t *__restrict__ d_e,
+                                       uint64_t stride, uint64_t *__restrict__ d_partials) {
+    uint64_t threads = (uint64_t)gridDim.x * blockDim.x;
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t *column = d_factors[d_sel[blockIdx.y]];
+    Fe3 acc = ext3::zero();
+    for (uint64_t r = tid; r < rows; r += threads) {
+        acc = ext3::add(acc, ext3::mul_base(load_ext(d_e + (r / cells) * 3), column[r * stride]));
+    }
+    uint64_t *at = d_partials + ((uint64_t)blockIdx.y * threads + tid) * 3;
+    at[0] = acc.a;
+    at[1] = acc.b;
+    at[2] = acc.c;
+}
+
+// Pass two: `out[(sel[i]·cells + y)·3] = Σ_{j ≡ y (mod cells)} d_partials[i·threads + j]`, one
+// thread a cell — factor `sel[i]`'s place in the gathered heads (`gather_factor_heads_ext3`'s layout),
+// so one read-back takes every factor.
+extern "C" __global__ void zc_bind_all_sum(const uint64_t *__restrict__ d_partials, uint64_t nsel,
+                                           uint64_t cells, uint64_t threads,
+                                           const uint32_t *__restrict__ d_sel,
+                                           uint64_t *__restrict__ out) {
+    uint64_t total = nsel * cells;
+    for (uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; task < total;
+         task += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t i = task / cells;
+        uint64_t y = task - i * cells;
+        Fe3 acc = ext3::zero();
+        for (uint64_t j = y; j < threads; j += cells) {
+            acc = ext3::add(acc, load_ext(d_partials + (i * threads + j) * 3));
+        }
+        uint64_t *at = out + ((uint64_t)d_sel[i] * cells + y) * 3;
+        at[0] = acc.a;
+        at[1] = acc.b;
+        at[2] = acc.c;
+    }
+}
+
 // `eq(a_{>j+1}, ·)` from `eq(a_{>j}, ·)` in place: `t[x] += t[x + half]`.
 extern "C" __global__ void zc_halve(uint64_t *__restrict__ table, uint64_t half) {
     for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < half;

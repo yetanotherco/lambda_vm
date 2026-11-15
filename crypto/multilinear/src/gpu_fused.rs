@@ -989,10 +989,20 @@ where
         if self.bound.len() != self.there {
             return Err(failed("fused factor values"));
         }
-        let values = self
-            .session
-            .values()
-            .map_err(|_| failed("fused factor values"))?;
+        // A session that left the factors no round read unfolded
+        // (`argue_fused::unread`) binds them on the card at the same read-back,
+        // from the bound challenges.
+        let values = if self.session.skips_unread() {
+            use crate::gpu::ext3_raw;
+            let mut bound = Vec::with_capacity(self.bound.len() * 3);
+            for s in &self.bound {
+                bound.extend_from_slice(&ext3_raw(s).ok_or(failed("fused factor values"))?);
+            }
+            self.session.values_bound(&bound)
+        } else {
+            self.session.values()
+        }
+        .map_err(|_| failed("fused factor values"))?;
         let mut factors: Vec<crate::mle::Mle<E>> = Vec::with_capacity(values.len() + 2);
         for factor in &values {
             factors.push(

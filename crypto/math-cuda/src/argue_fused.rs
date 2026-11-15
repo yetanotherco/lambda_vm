@@ -74,6 +74,76 @@ pub mod bus_rows {
     }
 }
 
+/// Whether the factors no round reads are bound once at the hand-off, read once.
+pub mod unread {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static FORCED: AtomicU8 = AtomicU8::new(0);
+    static FAULT: AtomicU8 = AtomicU8::new(0);
+
+    /// Whether a session whose bus column comes from the rows
+    /// ([`super::bus_rows`]) leaves the factors no round reads (the bus's
+    /// alone) out of the double fold and the folds. Their cells for the host
+    /// tail are then made once from the base columns with every bound
+    /// challenge at a time, on the card, at the hand-off's own read-back. The
+    /// same values. On by default; `LAMBDA_VM_ZC_UNREAD_AT_END=0` folds them as
+    /// before.
+    pub fn enabled() -> bool {
+        match FORCED.load(Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("LAMBDA_VM_ZC_UNREAD_AT_END").map_or(true, |v| v != "0" && v != "false")
+        })
+    }
+
+    /// Forces [`enabled`] for sessions made after it; `None` back to the
+    /// environment's word.
+    #[doc(hidden)]
+    pub fn force(on: Option<bool>) {
+        FORCED.store(
+            match on {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// ⛔ A FAULT, a negative control's only: the unread factors' cells are not
+    /// written, so the host tail reads what the gather left there.
+    #[doc(hidden)]
+    pub fn force_fault(on: bool) {
+        FAULT.store(u8::from(on), Ordering::Relaxed);
+    }
+
+    pub(super) fn fault() -> bool {
+        FAULT.load(Ordering::Relaxed) == 1
+    }
+}
+
+/// [`unread`]'s split of a table's factors: those a round reads (their slots,
+/// how many, and the fold's pointer table over their slabs and `L`) and those
+/// no round reads (their slots on the card and here), with the end pass's own
+/// partials.
+struct Unread {
+    reads: CudaSlice<u32>,
+    count: u64,
+    fold_table: CudaSlice<u64>,
+    unread_dev: CudaSlice<u32>,
+    unread: Vec<u32>,
+    partials: CudaSlice<u64>,
+}
+
+/// Threads the end pass sums each unread factor over: a multiple of every cube
+/// the host tail takes (at most this many cells).
+const UNREAD_THREADS: u64 = 1024;
+
 /// Scratch ceiling for the per-thread slot files, as the round kernel's.
 const SLOT_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_THREADS: u64 = 1 << 20;
@@ -137,6 +207,8 @@ pub struct FusedZerocheck<'f> {
     /// [`bus_rows`]: every row's bus value (`4q` ext3), its one-entry pointer
     /// table for the folds, and room for the two challenges' limbs.
     rows_l: Option<(CudaSlice<u64>, CudaSlice<u64>, CudaSlice<u64>)>,
+    /// [`unread`]: the factors a round reads and those it does not.
+    needed: Option<Unread>,
     _room: DeviceReservation,
 }
 
@@ -244,7 +316,15 @@ impl<'f> FusedZerocheck<'f> {
             return Ok(None);
         }
         let from_rows = bus_rows::enabled();
-        let extra = if from_rows { rows as u64 * 24 } else { 0 };
+        // The unread factors' end pass needs the rows' bus column: no round
+        // reads a factor to make `L` then.
+        let at_end = from_rows && unread::enabled();
+        let extra = if from_rows { rows as u64 * 24 } else { 0 }
+            + if at_end {
+                width as u64 * UNREAD_THREADS * 24
+            } else {
+                0
+            };
         let Some(room) = be.reserve(
             Self::device_bytes(width, rows, program.num_slots, grid_rows, gruen_rows) + extra,
         ) else {
@@ -286,6 +366,46 @@ impl<'f> FusedZerocheck<'f> {
         let node_ints = alloc_zeros_or_trim::<u32>(&stream, MAX_ROWS)?;
         let scratch = alloc_zeros_or_trim::<u64>(&stream, 12)?;
         let violation = alloc_zeros_or_trim::<u64>(&stream, 1)?;
+        let needed = if at_end {
+            // The slots a walk reads: its `VAR` steps' factors and its selected
+            // `ACC` steps' selectors.
+            let mut read = vec![false; width];
+            for node in program.nodes.chunks_exact(2) {
+                let op = node[0] as u32;
+                let a = (node[0] >> 32) as usize;
+                let b = node[1] as u32;
+                if op == 1 && a < width {
+                    read[a] = true;
+                }
+                if op == 6 && b != u32::MAX && (b as usize) < width {
+                    read[b as usize] = true;
+                }
+            }
+            let reads: Vec<u32> = (0..width as u32).filter(|&k| read[k as usize]).collect();
+            let unread: Vec<u32> = (0..width as u32).filter(|&k| !read[k as usize]).collect();
+            let mut fold_table: Vec<u64> = reads.iter().map(|&k| addresses[k as usize]).collect();
+            fold_table.push(addresses[width]);
+            let count = reads.len() as u64;
+            let one_or =
+                |v: &[u32]| -> Vec<u32> { if v.is_empty() { vec![0] } else { v.to_vec() } };
+            let reads_dev = htod_or_trim(&stream, &one_or(&reads))?;
+            let unread_dev = htod_or_trim(&stream, &one_or(&unread))?;
+            let fold_dev = htod_or_trim(&stream, &fold_table)?;
+            // SAFETY: the end pass writes every partial before it reads one.
+            let partials = unsafe {
+                alloc_or_trim::<u64>(&stream, unread.len().max(1) * UNREAD_THREADS as usize * 3)
+            }?;
+            Some(Unread {
+                reads: reads_dev,
+                count,
+                fold_table: fold_dev,
+                unread_dev,
+                unread,
+                partials,
+            })
+        } else {
+            None
+        };
         let rows_l = if from_rows {
             // SAFETY: `zc_bus_u_store` writes every row before the folds read it.
             let values = unsafe { alloc_or_trim::<u64>(&stream, rows * 3) }?;
@@ -328,6 +448,7 @@ impl<'f> FusedZerocheck<'f> {
             scratch,
             violation,
             rows_l,
+            needed,
             _room: room,
         }))
     }
@@ -499,24 +620,45 @@ impl<'f> FusedZerocheck<'f> {
         let be = backend()?;
         let q = (self.rows / 4) as u64;
         self.stream.memcpy_htod(&w[..], &mut self.scratch)?;
-        let width = self.width as u64;
+        let factors = self.source.ptrs;
+        // With [`unread`], only the factors a round reads.
+        let selected = self.needed.as_ref().map(|u| (&u.reads, u.count));
+        let width = selected.map_or(self.width as u64, |(_, count)| count);
         let total = width * q;
         let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
-        let factors = self.source.ptrs;
-        unsafe {
-            self.stream
-                .launch_builder(&be.zc_fold2)
-                .arg(factors)
-                .arg(&q)
-                .arg(&width)
-                .arg(&self.scratch)
-                .arg(&mut self.folded)
-                .arg(&self.source.stride)
-                .launch(LaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+        let config = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        if total > 0 {
+            unsafe {
+                match selected {
+                    Some((reads, count)) => {
+                        self.stream
+                            .launch_builder(&be.zc_fold2_sel)
+                            .arg(factors)
+                            .arg(&q)
+                            .arg(reads)
+                            .arg(&count)
+                            .arg(&self.scratch)
+                            .arg(&mut self.folded)
+                            .arg(&self.source.stride)
+                            .launch(config)?;
+                    }
+                    None => {
+                        self.stream
+                            .launch_builder(&be.zc_fold2)
+                            .arg(factors)
+                            .arg(&q)
+                            .arg(&width)
+                            .arg(&self.scratch)
+                            .arg(&mut self.folded)
+                            .arg(&self.source.stride)
+                            .launch(config)?;
+                    }
+                }
+            }
         }
         self.len = q as usize;
         if self.rows_l.is_some() {
@@ -682,14 +824,18 @@ impl<'f> FusedZerocheck<'f> {
         let half = (self.len / 2) as u64;
         self.stream
             .memcpy_htod(&s[..], &mut self.scratch.slice_mut(0..3))?;
-        // The factors and `L`, through the one pointer table of `width + 1`.
-        let width = self.width as u64 + 1;
+        // The factors and `L`, through the one pointer table of `width + 1` —
+        // or, with [`unread`], of the factors a round reads and `L`.
+        let (table, width) = match self.needed.as_mut() {
+            Some(u) => (&mut u.fold_table, u.count + 1),
+            None => (&mut self.fold_ptrs, self.width as u64 + 1),
+        };
         let total = width * half;
         let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
         unsafe {
             self.stream
                 .launch_builder(&be.sumcheck_fold_ext3)
-                .arg(&mut self.fold_ptrs)
+                .arg(table)
                 .arg(&half)
                 .arg(&width)
                 .arg(&self.scratch)
@@ -717,6 +863,104 @@ impl<'f> FusedZerocheck<'f> {
 
     /// What every factor has left — `width` of them, three u64 an element —
     /// gathered on the card and read back in one copy.
+    /// Whether this session leaves the factors no round reads unfolded
+    /// ([`unread`], read when it was made), so
+    /// [`values_bound`](Self::values_bound) owes their cells.
+    pub fn skips_unread(&self) -> bool {
+        self.needed.as_ref().is_some_and(|u| !u.unread.is_empty())
+    }
+
+    /// [`values`](Self::values) for a session that leaves the factors no
+    /// round reads unfolded: those factors' cells are made from the base
+    /// columns with every bound challenge at once (`bound`, three u64 a
+    /// challenge, the first bound first) and written into the same gathered
+    /// heads, so one read-back takes every factor. The `eq` table of the bound
+    /// challenges is built on the card, and the partials are the session's own.
+    pub fn values_bound(&mut self, bound: &[u64]) -> Result<Vec<Vec<u64>>> {
+        if !self.skips_unread() {
+            return self.values();
+        }
+        let be = backend()?;
+        let rows = self.rows as u64;
+        let cells = self.len as u64;
+        let spans = rows / cells.max(1);
+        if (1u64 << (bound.len() / 3)) != spans || cells > UNREAD_THREADS {
+            return Err(cudarc::driver::DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+            ));
+        }
+        let e = eq_table_ext3(&self.stream, bound, spans as usize)?;
+        let span = self.len * 3;
+        let total = self.width * span;
+        // SAFETY: the gather writes every word, the second pass the unread
+        // factors' cells over theirs.
+        let mut out = unsafe { alloc_or_trim::<u64>(&self.stream, total) }?;
+        let width = self.width as u64;
+        let grid = (total as u64)
+            .div_ceil(BLOCK_DIM as u64)
+            .clamp(1, MAX_GRID as u64) as u32;
+        let factors = self.source.ptrs;
+        let threads = UNREAD_THREADS;
+        let fault = unread::fault();
+        let Some(u) = self.needed.as_mut() else {
+            return self.values();
+        };
+        let nsel = u.unread.len();
+        unsafe {
+            self.stream
+                .launch_builder(&be.gather_factor_heads_ext3)
+                .arg(&self.folded_ptrs)
+                .arg(&width)
+                .arg(&cells)
+                .arg(&mut out)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            self.stream
+                .launch_builder(&be.zc_bind_all)
+                .arg(factors)
+                .arg(&u.unread_dev)
+                .arg(&rows)
+                .arg(&cells)
+                .arg(&e)
+                .arg(&self.source.stride)
+                .arg(&mut u.partials)
+                .launch(LaunchConfig {
+                    grid_dim: ((threads / u64::from(BLOCK_DIM)) as u32, nsel as u32, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            if !fault {
+                let nsel_arg = nsel as u64;
+                let cells_total = nsel as u64 * cells;
+                self.stream
+                    .launch_builder(&be.zc_bind_all_sum)
+                    .arg(&u.partials)
+                    .arg(&nsel_arg)
+                    .arg(&cells)
+                    .arg(&threads)
+                    .arg(&u.unread_dev)
+                    .arg(&mut out)
+                    .launch(LaunchConfig {
+                        grid_dim: (
+                            cells_total
+                                .div_ceil(u64::from(BLOCK_DIM))
+                                .clamp(1, MAX_GRID as u64) as u32,
+                            1,
+                            1,
+                        ),
+                        block_dim: (BLOCK_DIM, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+        }
+        let flat = crate::readback::clone_dtoh(&self.stream, &out)?;
+        self.stream.synchronize()?;
+        Ok(flat.chunks_exact(span).map(<[u64]>::to_vec).collect())
+    }
+
     pub fn values(&self) -> Result<Vec<Vec<u64>>> {
         let be = backend()?;
         let span = self.len * 3;
