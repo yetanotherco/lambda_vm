@@ -1095,6 +1095,70 @@ fn the_zerocheck_kernel_timers_change_no_message() {
     }
 }
 
+/// ★ Every pricing arm at once (`LAMBDA_VM_ARGUE_TWICE` over every site that
+/// takes it) with the kernel timers on: a program's proof made that way
+/// verifies, the timed run moved the zerocheck's kinds (the lookup's are
+/// printed), and no timer was lost. (The block's proof bytes are compared with
+/// today's on the box, under the deterministic grind.)
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "flips process-global argue switches and proves a program: run alone, --ignored --test-threads=1"]
+fn a_proof_made_under_every_pricing_arm_verifies() {
+    use crate::tables::MaxRowsConfig;
+    use math_cuda::ktime;
+    use multilinear::gpu_fused::*;
+    use stark::proof::options::ProofOptions;
+    struct Back;
+    impl Drop for Back {
+        fn drop(&mut self) {
+            ktime::force(None);
+            ktime::force_twice(None);
+        }
+    }
+    let _back = Back;
+    let _switches = CardSwitches::set(FusedFaults::default(), false);
+    ktime::force(Some(true));
+    ktime::force_twice(Some(&[
+        "zc.grid",
+        "zc.bus",
+        "zc.fold2",
+        "zc.halve",
+        "zc.rounds",
+        "zc.reduce",
+        "tree.input",
+        "tree.fold",
+        "ladder.reduce",
+        "ladder.round.read",
+    ]));
+    let (_, lost_before) = ktime::totals();
+    let options = ProofOptions::default_test_options();
+    let elf = crate::test_utils::asm_elf_bytes("test_keccak");
+    let sessions = fused_sessions();
+    let proof =
+        crate::multilinear_prove::prove_with_options(&elf, &options, &MaxRowsConfig::default())
+            .unwrap_or_else(|e| panic!("test_keccak proves under every pricing arm: {e:?}"));
+    assert!(fused_sessions() > sessions, "the fused rounds ran");
+    ktime::force_twice(None);
+    assert!(
+        crate::multilinear_prove::verify_with_options(&proof, &elf, &options)
+            .unwrap_or_else(|e| panic!("verify: {e:?}")),
+        "the proof made under every pricing arm verifies"
+    );
+    let (rows, lost_after) = ktime::totals();
+    let moved = |kind: &str| rows.iter().any(|((k, _), e)| *k == kind && e.launches > 0);
+    for kind in ["zc.grid", "zc.rounds", "zc.bus_u"] {
+        assert!(moved(kind), "the timers saw {kind}");
+    }
+    // The lookup kinds run on the card only for tables past its size floor; the
+    // box's block runs check them (one totals line an argue).
+    eprintln!(
+        "argue pricing arms: test_keccak verified; tree.fold seen {}, ladder.round seen {}",
+        moved("tree.fold"),
+        moved("ladder.round")
+    );
+    assert_eq!(lost_after, lost_before, "no timer lost");
+}
+
 /// ★ The production switches (fused on, the corners skipped, no
 /// cross-check) on every table without roots: its constraint part is zero,
 /// so its grid `{0,1}²` is all corners, the corner skip is exact on random

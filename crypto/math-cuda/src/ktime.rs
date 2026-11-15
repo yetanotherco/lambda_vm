@@ -223,3 +223,40 @@ impl Drop for HostWait {
         }
     }
 }
+
+/// A test's override of [`twice`]'s list.
+static TWICE_FORCED: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// Whether the launch site `kind` runs its launch twice
+/// (`LAMBDA_VM_ARGUE_TWICE=<kind>,<kind>,…`; a measurement arm, off by default):
+/// the arm's wall time against today's is that launch's wall price. Only
+/// sites whose second launch writes what the first wrote (or only scratch)
+/// take the word, so the messages are the same. Unknown names are ignored.
+pub fn twice(kind: &str) -> bool {
+    if let Ok(forced) = TWICE_FORCED.lock()
+        && let Some(list) = forced.as_ref()
+    {
+        return list.iter().any(|k| k == kind);
+    }
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("LAMBDA_VM_ARGUE_TWICE")
+            .map(|v| v.split(',').map(|k| k.trim().to_string()).collect())
+            .unwrap_or_default()
+    })
+    .iter()
+    .any(|k| k == kind)
+}
+
+/// Forces [`twice`]'s list; `None` back to the environment's word.
+#[doc(hidden)]
+pub fn force_twice(kinds: Option<&[&str]>) {
+    if let Ok(mut forced) = TWICE_FORCED.lock() {
+        *forced = kinds.map(|ks| ks.iter().map(|k| k.to_string()).collect());
+    }
+}
+
+/// How many times the site `kind` launches: 2 under [`twice`], else 1.
+pub fn times(kind: &str) -> usize {
+    if twice(kind) { 2 } else { 1 }
+}

@@ -138,6 +138,8 @@ pub struct FusedZerocheck<'f> {
     depth: u32,
     steps: u64,
     vars: u64,
+    /// Scratch weights for the halvings' pricing arm (`zc.halve` twice).
+    shadow_eq: Option<CudaSlice<u64>>,
     _room: DeviceReservation,
 }
 
@@ -330,6 +332,7 @@ impl<'f> FusedZerocheck<'f> {
             depth: crate::ktime::log2_bucket(steps),
             steps,
             vars,
+            shadow_eq: None,
             _room: room,
         };
         if crate::ktime::enabled() {
@@ -401,6 +404,19 @@ impl<'f> FusedZerocheck<'f> {
         crate::ktime::end(&self.stream, mark, kind, self.depth, bytes, work);
     }
 
+    /// [`tock`](Self::tock) under an explicit depth: the rounds file theirs as
+    /// `100 × step bucket + log2 half`, so their cost reads by round size too.
+    fn tock_at(
+        &self,
+        kind: &'static str,
+        depth: u32,
+        mark: crate::ktime::Mark,
+        bytes: u64,
+        work: u64,
+    ) {
+        crate::ktime::end(&self.stream, mark, kind, depth, bytes, work);
+    }
+
     /// A launch over `work` indices with `rows` block rows and `words` slot
     /// u64s a thread, inside the slot file this session holds.
     fn shape(&self, work: u64, rows: usize, words: u64) -> Result<(u32, u32)> {
@@ -420,20 +436,22 @@ impl<'f> FusedZerocheck<'f> {
         let be = backend()?;
         crate::round_slot::note_second_launch();
         let reduce_block = 256u32;
-        let t0 = self.tick();
-        unsafe {
-            self.stream
-                .launch_builder(&be.sum_partials_ext3)
-                .arg(&self.partials)
-                .arg(&(grid as u64))
-                .arg(&mut self.sums)
-                .launch(LaunchConfig {
-                    grid_dim: (rows as u32, 1, 1),
-                    block_dim: (reduce_block, 1, 1),
-                    shared_mem_bytes: reduce_block * 3 * 8,
-                })?;
+        for _ in 0..crate::ktime::times("zc.reduce") {
+            let t0 = self.tick();
+            unsafe {
+                self.stream
+                    .launch_builder(&be.sum_partials_ext3)
+                    .arg(&self.partials)
+                    .arg(&(grid as u64))
+                    .arg(&mut self.sums)
+                    .launch(LaunchConfig {
+                        grid_dim: (rows as u32, 1, 1),
+                        block_dim: (reduce_block, 1, 1),
+                        shared_mem_bytes: reduce_block * 3 * 8,
+                    })?;
+            }
+            self.tock("zc.reduce", t0, rows as u64 * grid as u64 * 24, rows as u64);
         }
-        self.tock("zc.reduce", t0, rows as u64 * grid as u64 * 24, rows as u64);
         Ok(())
     }
 
@@ -473,7 +491,11 @@ impl<'f> FusedZerocheck<'f> {
         let factors = self.source.ptrs;
         // Twice under the measurement arm: the second run writes what the
         // first wrote.
-        for _ in 0..if knobs::bus_twice() { 2 } else { 1 } {
+        for _ in 0..if knobs::bus_twice() || crate::ktime::twice("zc.bus") {
+            2
+        } else {
+            1
+        } {
             let t0 = self.tick();
             unsafe {
                 self.stream
@@ -524,35 +546,37 @@ impl<'f> FusedZerocheck<'f> {
         self.stream.memcpy_htod(&[u64::MAX], &mut self.violation)?;
         let (grid, block) = self.shape(q, points.len(), self.num_slots as u64)?;
         let factors = self.source.ptrs;
-        let t0 = self.tick();
-        unsafe {
-            self.stream
-                .launch_builder(&be.zc_grid01)
-                .arg(factors)
-                .arg(&q)
-                .arg(&self.nodes)
-                .arg(&self.num_nodes)
-                .arg(&self.base_consts)
-                .arg(&self.betas)
-                .arg(&self.points)
-                .arg(&self.eq_r)
-                .arg(&mut self.slots)
-                .arg(&mut self.partials)
-                .arg(&mut self.violation)
-                .arg(&u32::from(keep_corners))
-                .arg(&self.source.stride)
-                .launch(LaunchConfig {
-                    grid_dim: (grid, points.len() as u32, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: block * 3 * 8,
-                })?;
+        for _ in 0..crate::ktime::times("zc.grid") {
+            let t0 = self.tick();
+            unsafe {
+                self.stream
+                    .launch_builder(&be.zc_grid01)
+                    .arg(factors)
+                    .arg(&q)
+                    .arg(&self.nodes)
+                    .arg(&self.num_nodes)
+                    .arg(&self.base_consts)
+                    .arg(&self.betas)
+                    .arg(&self.points)
+                    .arg(&self.eq_r)
+                    .arg(&mut self.slots)
+                    .arg(&mut self.partials)
+                    .arg(&mut self.violation)
+                    .arg(&u32::from(keep_corners))
+                    .arg(&self.source.stride)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid, points.len() as u32, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: block * 3 * 8,
+                    })?;
+            }
+            self.tock(
+                "zc.grid",
+                t0,
+                q * points.len() as u64 * (self.vars * 32 + 24),
+                q * points.len() as u64 * self.steps,
+            );
         }
-        self.tock(
-            "zc.grid",
-            t0,
-            q * points.len() as u64 * (self.vars * 32 + 24),
-            q * points.len() as u64 * self.steps,
-        );
         let t = self.reduce(points.len(), grid)?;
         let violation = crate::readback::clone_dtoh(&self.stream, &self.violation)?;
         self.stream.synchronize()?;
@@ -571,23 +595,25 @@ impl<'f> FusedZerocheck<'f> {
         let total = width * q;
         let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
         let factors = self.source.ptrs;
-        let t0 = self.tick();
-        unsafe {
-            self.stream
-                .launch_builder(&be.zc_fold2)
-                .arg(factors)
-                .arg(&q)
-                .arg(&width)
-                .arg(&self.scratch)
-                .arg(&mut self.folded)
-                .arg(&self.source.stride)
-                .launch(LaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+        for _ in 0..crate::ktime::times("zc.fold2") {
+            let t0 = self.tick();
+            unsafe {
+                self.stream
+                    .launch_builder(&be.zc_fold2)
+                    .arg(factors)
+                    .arg(&q)
+                    .arg(&width)
+                    .arg(&self.scratch)
+                    .arg(&mut self.folded)
+                    .arg(&self.source.stride)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (BLOCK_DIM, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            self.tock("zc.fold2", t0, width * q * 56, width * q * 4);
         }
-        self.tock("zc.fold2", t0, width * q * 56, width * q * 4);
         self.len = q as usize;
         self.bus_column()?;
         self.halve_weights()
@@ -601,7 +627,11 @@ impl<'f> FusedZerocheck<'f> {
         let q = self.rows / 4;
         // Twice under the measurement arm: the second run writes what the
         // first wrote.
-        for _ in 0..if knobs::bus_twice() { 2 } else { 1 } {
+        for _ in 0..if knobs::bus_twice() || crate::ktime::twice("zc.bus") {
+            2
+        } else {
+            1
+        } {
             let t0 = self.tick();
             let mut l = self
                 .folded
@@ -654,6 +684,28 @@ impl<'f> FusedZerocheck<'f> {
             }
         }
         self.tock("zc.halve", t0, half * 144, half);
+        // The pricing arm: the same two halvings again, on scratch tables of the
+        // weights' size, so nothing the rounds read changes.
+        if crate::ktime::twice("zc.halve") {
+            if self.shadow_eq.is_none() {
+                self.shadow_eq = Some(alloc_zeros_or_trim::<u64>(&self.stream, self.eq_r.len())?);
+            }
+            if let Some(shadow) = self.shadow_eq.as_mut() {
+                for _ in 0..2 {
+                    unsafe {
+                        self.stream
+                            .launch_builder(&be.zc_halve)
+                            .arg(&mut *shadow)
+                            .arg(&half)
+                            .launch(LaunchConfig {
+                                grid_dim: (grid, 1, 1),
+                                block_dim: (BLOCK_DIM, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -689,35 +741,38 @@ impl<'f> FusedZerocheck<'f> {
         let l = self
             .folded
             .slice(self.width * q * 3..(self.width + 1) * q * 3);
-        let t0 = self.tick();
-        unsafe {
-            self.stream
-                .launch_builder(&be.zc_round_gruen)
-                .arg(&self.folded_ptrs)
-                .arg(&half)
-                .arg(&self.nodes)
-                .arg(&self.num_nodes)
-                .arg(&self.ext_consts)
-                .arg(&self.betas)
-                .arg(&self.node_ints)
-                .arg(&num_a)
-                .arg(&self.eq_r)
-                .arg(&self.eq_rho)
-                .arg(&l)
-                .arg(&mut self.slots)
-                .arg(&mut self.partials)
-                .launch(LaunchConfig {
-                    grid_dim: (grid, rows as u32, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: block * 3 * 8,
-                })?;
+        for _ in 0..crate::ktime::times("zc.rounds") {
+            let t0 = self.tick();
+            unsafe {
+                self.stream
+                    .launch_builder(&be.zc_round_gruen)
+                    .arg(&self.folded_ptrs)
+                    .arg(&half)
+                    .arg(&self.nodes)
+                    .arg(&self.num_nodes)
+                    .arg(&self.ext_consts)
+                    .arg(&self.betas)
+                    .arg(&self.node_ints)
+                    .arg(&num_a)
+                    .arg(&self.eq_r)
+                    .arg(&self.eq_rho)
+                    .arg(&l)
+                    .arg(&mut self.slots)
+                    .arg(&mut self.partials)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid, rows as u32, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: block * 3 * 8,
+                    })?;
+            }
+            self.tock_at(
+                "zc.rounds",
+                self.depth * 100 + half.trailing_zeros(),
+                t0,
+                half * (u64::from(num_a) * self.vars * 48 + 48 + (u64::from(num_a) + 2) * 24),
+                half * u64::from(num_a) * self.steps,
+            );
         }
-        self.tock(
-            "zc.rounds",
-            t0,
-            half * (u64::from(num_a) * self.vars * 48 + 48 + (u64::from(num_a) + 2) * 24),
-            half * u64::from(num_a) * self.steps,
-        );
         self.reduce_enqueue(rows, grid)?;
         Ok(rows)
     }

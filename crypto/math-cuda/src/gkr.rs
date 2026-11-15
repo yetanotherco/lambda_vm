@@ -381,27 +381,30 @@ fn fold_upwards(
         let half_arg = half as u64;
         let padded = layers.is_empty() && real != full;
         let mark = crate::ktime::start(stream);
-        unsafe {
-            if padded {
-                let real_arg = real as u64;
-                stream
-                    .launch_builder(&be.fraction_fold_padded_ext3)
-                    .arg(below_p.as_ref())
-                    .arg(below_q.as_ref())
-                    .arg(&half_arg)
-                    .arg(&real_arg)
-                    .arg(&mut p_out)
-                    .arg(&mut q_out)
-                    .launch(LaunchConfig::for_num_elems(half as u32))?;
-            } else {
-                stream
-                    .launch_builder(&be.fraction_fold_ext3)
-                    .arg(below_p.as_ref())
-                    .arg(below_q.as_ref())
-                    .arg(&half_arg)
-                    .arg(&mut p_out)
-                    .arg(&mut q_out)
-                    .launch(LaunchConfig::for_num_elems(half as u32))?;
+        // Twice under the pricing arm: the second launch writes what the first wrote.
+        for _ in 0..crate::ktime::times("tree.fold") {
+            unsafe {
+                if padded {
+                    let real_arg = real as u64;
+                    stream
+                        .launch_builder(&be.fraction_fold_padded_ext3)
+                        .arg(below_p.as_ref())
+                        .arg(below_q.as_ref())
+                        .arg(&half_arg)
+                        .arg(&real_arg)
+                        .arg(&mut p_out)
+                        .arg(&mut q_out)
+                        .launch(LaunchConfig::for_num_elems(half as u32))?;
+                } else {
+                    stream
+                        .launch_builder(&be.fraction_fold_ext3)
+                        .arg(below_p.as_ref())
+                        .arg(below_q.as_ref())
+                        .arg(&half_arg)
+                        .arg(&mut p_out)
+                        .arg(&mut q_out)
+                        .launch(LaunchConfig::for_num_elems(half as u32))?;
+                }
             }
         }
         // Each output cell reads two children's `p` and `q` and writes its own.
@@ -723,6 +726,46 @@ impl GruenLayer {
         let second = self.slot.as_ref().is_none_or(|slot| slot.checking());
         let mut slot_args = self.slot.as_mut().map(|slot| slot.launch());
         let depth = (m + 1) as u32;
+        // The pricing arm `ladder.round.read`: the same round again first, read
+        // only (no fold, so nothing written back), its partials overwritten by the
+        // real launch after it — the round's reads paid twice, its writes once.
+        if crate::ktime::twice("ladder.round.read") {
+            let shadow = if stored < cube {
+                &be.gkr_round_gruen_real
+            } else {
+                &be.gkr_round_gruen
+            };
+            let no_fold = 0u32;
+            let plain = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: block * 3 * 8,
+            };
+            unsafe {
+                let mut launch = self.stream.launch_builder(shadow);
+                launch
+                    .arg(&self.p_at)
+                    .arg(&self.q_at)
+                    .arg(&half)
+                    .arg(&quarter)
+                    .arg(&no_fold)
+                    .arg(&s[0])
+                    .arg(&s[1])
+                    .arg(&s[2])
+                    .arg(&lambda[0])
+                    .arg(&lambda[1])
+                    .arg(&lambda[2])
+                    .arg(&e_hi)
+                    .arg(&e_lo)
+                    .arg(&low)
+                    .arg(&want);
+                if stored < cube {
+                    launch.arg(&stored);
+                }
+                launch.arg(&mut self.partials);
+                launch.launch(plain)?;
+            }
+        }
         let mark = crate::ktime::start(&self.stream);
         let mut reduce_mark = None;
         unsafe {
@@ -770,16 +813,18 @@ impl GruenLayer {
                 reduce_mark = Some(crate::ktime::start(&self.stream));
                 crate::round_slot::note_second_launch();
                 let reduce_block = 256u32;
-                self.stream
-                    .launch_builder(&be.sum_partials_ext3)
-                    .arg(&self.partials)
-                    .arg(&(grid as u64))
-                    .arg(&mut self.sums)
-                    .launch(LaunchConfig {
-                        grid_dim: (rows, 1, 1),
-                        block_dim: (reduce_block, 1, 1),
-                        shared_mem_bytes: reduce_block * 3 * 8,
-                    })?;
+                for _ in 0..crate::ktime::times("ladder.reduce") {
+                    self.stream
+                        .launch_builder(&be.sum_partials_ext3)
+                        .arg(&self.partials)
+                        .arg(&(grid as u64))
+                        .arg(&mut self.sums)
+                        .launch(LaunchConfig {
+                            grid_dim: (rows, 1, 1),
+                            block_dim: (reduce_block, 1, 1),
+                            shared_mem_bytes: reduce_block * 3 * 8,
+                        })?;
+                }
             }
         }
         if let Some(mark) = reduce_mark {
@@ -1049,24 +1094,27 @@ pub fn input_from_columns(
     let interactions_arg = interactions as u64;
     let slots_arg = slots as u64;
     let mark = crate::ktime::start(stream);
-    unsafe {
-        stream
-            .launch_builder(&be.gkr_input_from_columns)
-            .arg(columns)
-            .arg(&rows_arg)
-            .arg(&plan.side_start)
-            .arg(&plan.terms)
-            .arg(&plan.coeffs)
-            .arg(&plan.constants)
-            .arg(&interactions_arg)
-            .arg(&slots_arg)
-            .arg(&mut p)
-            .arg(&mut q)
-            .launch(LaunchConfig {
-                grid_dim: ((cells as u64).div_ceil(256).clamp(1, 8192) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
+    // Twice under the pricing arm: the second launch writes what the first wrote.
+    for _ in 0..crate::ktime::times("tree.input") {
+        unsafe {
+            stream
+                .launch_builder(&be.gkr_input_from_columns)
+                .arg(columns)
+                .arg(&rows_arg)
+                .arg(&plan.side_start)
+                .arg(&plan.terms)
+                .arg(&plan.coeffs)
+                .arg(&plan.constants)
+                .arg(&interactions_arg)
+                .arg(&slots_arg)
+                .arg(&mut p)
+                .arg(&mut q)
+                .launch(LaunchConfig {
+                    grid_dim: ((cells as u64).div_ceil(256).clamp(1, 8192) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
     }
     // Each term reads its column's cell once a row; each cell writes `p` and `q`.
     let terms = (plan.terms.len() / 2) as u64;
