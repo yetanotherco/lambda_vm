@@ -1849,11 +1849,25 @@ impl RowLists {
     }
 }
 
-/// [`WindowRowLists::aligned_rows`]' mark of an ECALL cycle's MEMW_A row:
-/// this bit and the row's index in the window's
-/// [`WindowRowLists::aligned_whole`]. A regular row's entry is its cycle,
-/// which stays below 2^30.
-pub const MEMW_A_WHOLE: u32 = 1 << 31;
+/// [`AlignedRef::cycle`]'s mark of an ECALL cycle's MEMW_A row, whose
+/// [`AlignedRef::at`] is then its index in the window's
+/// [`WindowRowLists::aligned_whole`]. A cycle stays below 2^30.
+pub const ALIGNED_ECALL: u32 = 1 << 31;
+
+/// A MEMW_A row as the walkers list it ([`WindowRowLists::aligned_rows`]): a
+/// regular row (a cycle's load or store) as its cycle and its access's index
+/// in the window's history (`history.accesses`, the cycle's
+/// `HistExtra::side`), from which and the cycle's log the row is derived; an
+/// ECALL cycle's row as its cycle marked with [`ALIGNED_ECALL`] and its
+/// index in the window's whole rows.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AlignedRef {
+    pub cycle: u32,
+    pub at: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<AlignedRef>() == 8);
 
 /// What a window's walker listed in place of the rows ([`RowLists`]), each
 /// list in today's row order.
@@ -1861,10 +1875,11 @@ pub const MEMW_A_WHOLE: u32 = 1 << 31;
 pub(crate) struct WindowRowLists {
     /// LOAD: each row's cycle (`(timestamp − 4) / 4`).
     pub(crate) load_cycles: Vec<u32>,
-    /// MEMW_A, in walk order: a regular row's (a cycle's load or store, one
-    /// a cycle under the in-row register format) cycle; an ECALL cycle's row
-    /// as [`MEMW_A_WHOLE`] and its index in `aligned_whole`.
-    pub(crate) aligned_rows: Vec<u32>,
+    /// MEMW_A, in walk order ([`AlignedRef`]): a regular row (a cycle's load
+    /// or store, one a cycle under the in-row register format) as its cycle
+    /// and access index; an ECALL cycle's row marked, with its index in
+    /// `aligned_whole`.
+    pub(crate) aligned_rows: Vec<AlignedRef>,
     /// The ECALL cycles' MEMW_A rows, whole, in walk order.
     pub(crate) aligned_whole: Vec<memw_aligned::AlignedRow>,
 }
@@ -1883,16 +1898,20 @@ impl WindowRowLists {
     /// The rows of the batch from cycle `batch_first` (`cpu_ops`, one a
     /// cycle) the walk just made: LOAD's ops from `walk.load_ops[load..]` and
     /// MEMW_A's rows from `walk.memw.aligned[aligned..]`, as `lists` lists
-    /// them, taken out of the walk's lists once counted.
+    /// them, taken out of the walk's lists once counted; a regular MEMW_A
+    /// row's access index from the window's `history`.
+    #[allow(clippy::too_many_arguments)]
     fn take_batch(
         &mut self,
         lists: RowLists,
         decode: &DecodeTable,
         cpu_ops: &[super::CpuOperation],
         batch_first: usize,
+        history: Option<&executor::vm::history::WindowHistory>,
         walk: &mut WalkOutputs,
         marks: BatchMarks,
     ) -> Result<(), Error> {
+        use executor::vm::history::{ECALL, NO_ACCESS};
         let cycle_of = |ts: u64| (ts - 4) / 4;
         if lists.load {
             self.load_cycles.extend(
@@ -1914,16 +1933,34 @@ impl WindowRowLists {
                     )));
                 };
                 if decode.op(raw).decode.fields.ecall {
-                    self.aligned_rows
-                        .push(MEMW_A_WHOLE | self.aligned_whole.len() as u32);
+                    self.aligned_rows.push(AlignedRef {
+                        cycle: ALIGNED_ECALL | cycle as u32,
+                        at: self.aligned_whole.len() as u32,
+                    });
                     self.aligned_whole.push(row);
                 } else if last_regular == Some(cycle) {
                     return Err(Error::Prover(format!(
                         "MEMW_A listed: cycle {cycle} made two regular rows"
                     )));
                 } else {
+                    let side = history
+                        .and_then(|h| {
+                            (cycle as usize)
+                                .checked_sub(h.first as usize)
+                                .and_then(|i| h.extras.get(i))
+                        })
+                        .map(|extra| extra.side)
+                        .filter(|&side| side != NO_ACCESS && side & ECALL == 0);
+                    let Some(at) = side else {
+                        return Err(Error::Prover(format!(
+                            "MEMW_A listed: cycle {cycle}'s row has no access in its history"
+                        )));
+                    };
                     last_regular = Some(cycle);
-                    self.aligned_rows.push(cycle as u32);
+                    self.aligned_rows.push(AlignedRef {
+                        cycle: cycle as u32,
+                        at,
+                    });
                 }
             }
         }
@@ -2203,6 +2240,7 @@ fn walk_window(
                     decode,
                     &cpu_ops[start..],
                     first + from - part.len(),
+                    memory.overlay.as_deref().map(|o| &*o.history),
                     &mut walk,
                     marks,
                 )?;

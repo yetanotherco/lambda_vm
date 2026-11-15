@@ -689,6 +689,9 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         if recheck > 0 {
             return refuse("a re-walk compares lists the walkers no longer make");
         }
+        if lists.memw_a && record.is_none() {
+            return refuse("MEMW_A's rows name their accesses in the history: record mode");
+        }
     }
     let key = settings.key;
     let start_registers = builder.register_state.clone();
