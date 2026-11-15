@@ -754,6 +754,20 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// asserts its own at compile time.
 pub const SPONGE_MAX_ROWS: u128 = 1 << 40;
 
+// The sponge's round-chip key is `(T, j)`: the block index `j` sits where a
+// permute row's key carries its timestamp's high word. The two kinds of key
+// cannot meet only because every CPU timestamp has a high word of 0, which the
+// CPU's row cap gives (the last row's last slot is `4·MAX_CPU_ROWS + 3`). With a
+// clock past 2^32, a permute call at `T + j·2^32` would share the key of block
+// `j` of a keccak256 call at `T`, and the two could swap round-chip replies (a
+// free digest). Raising the cap past this bound needs the key changed first.
+const _: () = assert!(
+    super::cpu::TIMESTAMP_STRIDE * super::cpu::MAX_CPU_ROWS + (super::cpu::TIMESTAMP_STRIDE - 1)
+        < 1u64 << 32,
+    "a CPU timestamp would reach 2^32: the keccak256 sponge's round-chip keys (T, block index) \
+     would no longer be distinct from the permute call's (T, high word)"
+);
+
 /// Interactions of the sponge mode, after the 84 of the permute mode.
 pub const SPONGE_INTERACTIONS: usize = 1 + 3 + 2 + RATE_READS + cols::RATE + 4 + 4;
 
