@@ -23,6 +23,7 @@
 pub mod types;
 
 pub mod gpack;
+pub(crate) mod gpack_seeds;
 
 pub mod bitwise;
 pub mod blake3;

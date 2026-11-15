@@ -828,7 +828,7 @@ pub fn generate_cpu_trace_as(
 }
 
 /// The widths CPU traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_cpu_trace_as`] over `segments`, the operations one after
 /// another: a chunk handed out as the window parts it lies in.

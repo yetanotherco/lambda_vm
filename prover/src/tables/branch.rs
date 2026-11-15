@@ -170,7 +170,7 @@ pub fn generate_branch_trace(
 }
 
 /// The widths BRANCH traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_branch_trace`] in `form` (`tables::gpack`).
 pub fn generate_branch_trace_as(

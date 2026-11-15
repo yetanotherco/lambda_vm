@@ -223,7 +223,7 @@ pub fn generate_load_trace(
 }
 
 /// The widths LOAD traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_load_trace`] in `form` (`tables::gpack`).
 pub fn generate_load_trace_as(

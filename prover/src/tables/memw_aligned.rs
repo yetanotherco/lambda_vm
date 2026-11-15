@@ -395,7 +395,7 @@ pub(crate) fn generate_memw_aligned_trace(
 }
 
 /// The widths MEMW_A traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_memw_aligned_trace`] in `form` (`tables::gpack`).
 pub(crate) fn generate_memw_aligned_trace_as(

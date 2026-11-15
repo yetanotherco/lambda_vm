@@ -211,7 +211,7 @@ pub fn generate_memw_trace(
 }
 
 /// The widths MEMW traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_memw_trace`] in `form` (`tables::gpack`).
 pub fn generate_memw_trace_as(

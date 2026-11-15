@@ -200,7 +200,7 @@ pub fn generate_cpu32_trace(
 }
 
 /// The widths CPU32 traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_cpu32_trace`] in `form` (`tables::gpack`).
 pub fn generate_cpu32_trace_as(

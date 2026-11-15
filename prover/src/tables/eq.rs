@@ -125,7 +125,7 @@ pub fn generate_eq_trace(
 }
 
 /// The widths EQ traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_eq_trace`] in `form` (`tables::gpack`).
 pub fn generate_eq_trace_as(

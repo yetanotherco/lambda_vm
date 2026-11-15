@@ -134,7 +134,7 @@ pub fn generate_ecdas_trace(
 }
 
 /// The widths ECDAS traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_ecdas_trace`] in `form` (`tables::gpack`).
 pub fn generate_ecdas_trace_as(

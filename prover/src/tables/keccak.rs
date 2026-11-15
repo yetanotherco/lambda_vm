@@ -359,7 +359,7 @@ pub fn generate_keccak_trace(
 }
 
 /// The widths KECCAK traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_keccak_trace`] in `form` (`tables::gpack`).
 pub fn generate_keccak_trace_as(
