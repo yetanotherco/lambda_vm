@@ -3469,7 +3469,7 @@ fn emit_units(
 /// tables, its family, the bytes it was estimated at, the table or its error,
 /// and the seconds its job took.
 #[cfg(feature = "parallel")]
-type Built = (usize, usize, usize, usize, Result<Table, Error>, f64);
+type Built = (usize, usize, usize, usize, Result<Table, Error>, f64, usize);
 
 /// A family's tables built by [`emit_units_sliding`], for the build's marks:
 /// how many, when the first started and the last was built (seconds since the
@@ -3482,6 +3482,10 @@ struct FamilyBuild {
     last_built: f64,
     busy: f64,
     bytes: usize,
+    /// Its tables built at 8 bytes a cell then packed (no width hint yet:
+    /// `gpack`), and the bytes those wide tables took.
+    wide: usize,
+    wide_bytes: usize,
 }
 
 /// [`emit_streamed_units`]' loop without waves: each table starts building on
@@ -3629,6 +3633,7 @@ fn slide_units(
                         let (tx, number) = (tx.clone(), numbers[position]);
                         scope.spawn_fifo(move |_| {
                             let t = std::time::Instant::now();
+                            let wide_before = crate::tables::gpack::thread_counts()[3];
                             let table = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                                 .unwrap_or_else(|_| {
                                     Err(Error::Prover(format!(
@@ -3636,7 +3641,8 @@ fn slide_units(
                                     )))
                                 });
                             let secs = t.elapsed().as_secs_f64();
-                            let _ = tx.send((position, number, family, est_now, table, secs));
+                            let wide = crate::tables::gpack::thread_counts()[3] - wide_before;
+                            let _ = tx.send((position, number, family, est_now, table, secs, wide));
                         });
                         building += 1;
                         building_bytes = building_bytes.saturating_add(est_now);
@@ -3659,7 +3665,7 @@ fn slide_units(
                 rx.recv()
                     .map_err(|_| Error::Prover("the rest's builders stopped".into()))?
             };
-            let (position, number, family, est, table, secs) = built;
+            let (position, number, family, est, table, secs, wide) = built;
             building -= 1;
             building_bytes = building_bytes.saturating_sub(est);
             let table = table?;
@@ -3671,6 +3677,20 @@ fn slide_units(
                 f.last_built = build_stamps::since_start().unwrap_or(0.0);
                 f.busy += secs;
                 f.bytes += bytes;
+                if wide > 0 {
+                    let rows = table.narrow_main().map_or(0, |n| n.rows());
+                    let cols = table.narrow_main().map_or(0, |n| n.widths().len());
+                    f.wide += wide;
+                    f.wide_bytes += rows * cols * 8;
+                    if let Some(n) = table.narrow_main() {
+                        let widths: Vec<String> = n.widths().iter().map(u8::to_string).collect();
+                        build_stamps::mark(&format!(
+                            "p5 widths {} {},",
+                            FAMILIES.get(family).map_or("?", |&(name, _)| name),
+                            widths.join("/")
+                        ));
+                    }
+                }
             }
             ready[position] = Some(Some(table));
         }
@@ -3684,6 +3704,16 @@ fn slide_units(
                     f.last_built,
                     f.busy,
                     f.bytes as f64 / (1u64 << 30) as f64
+                ));
+            }
+        }
+        // The tables built wide before their kind had widths: a measurement.
+        for (f, &(name, _)) in families.iter().zip(&FAMILIES) {
+            if f.wide > 0 {
+                build_stamps::mark(&format!(
+                    "p5 wide {name} {} {:.3}GiB,",
+                    f.wide,
+                    f.wide_bytes as f64 / (1u64 << 30) as f64
                 ));
             }
         }
