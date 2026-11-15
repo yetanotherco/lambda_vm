@@ -323,6 +323,13 @@ pub struct ProverFaults {
     /// This cut table's first two chunks trade their interactions: honest
     /// trees, outputs and ladder, over the chunks in the wrong order.
     pub swap_chunks: Option<usize>,
+    /// This cut table's last chunk puts mass in a padding slot, which the
+    /// verifier takes as `0/1` whatever the prover built: the slot's
+    /// numerator is the constant that brings the whole bus to zero (spread
+    /// over the table's rows), and the trees, their outputs and the ladder are
+    /// honest over the lists so changed. The table's last chunk must hold a
+    /// padding slot of its own (a short last chunk).
+    pub pad_mass: Option<usize>,
 }
 
 /// Which of the batched verifier's checks run. Every one, except in the
@@ -405,6 +412,12 @@ fn chunk_lists<'a, E: IsField + 'static>(
             Cow::Owned(padded)
         })
         .collect()
+}
+
+/// The real interactions in a cut table's last chunk (the rest of its list
+/// is [`chunk_lists`]' padding).
+fn chunks_real_len(interactions: usize, chunks: &Chunking) -> usize {
+    chunks.range(chunks.count - 1, interactions).len()
 }
 
 /// The table a tree belongs to, `tree` counted in table order then chunk
@@ -782,6 +795,29 @@ where
             table_lists.swap(0, 1);
         }
         lists.extend(table_lists);
+    }
+    // The fault `pad_mass`: the bus's whole sum moved into a padding slot.
+    if let Some(target) = faults.pad_mass {
+        let mut sum = FieldElement::<E>::zero();
+        for (i, list) in lists.iter().enumerate() {
+            let t = table_of_tree(&plan, i);
+            let layers = host_tree(list, &tables[t].trace)?;
+            let (p, q) = gkr_lockstep::LadderTree::output(&gkr_lockstep::HostLayers(&layers));
+            sum += p * q.inv().expect("q != 0");
+        }
+        let rows = FieldElement::<E>::from(1u64 << shapes[target].num_vars);
+        let tree = plan.first_tree(target) + plan.chunks[target].count - 1;
+        let real = chunks_real_len(interactions[target].len(), &plan.chunks[target]);
+        let list = lists[tree].to_mut();
+        assert!(
+            plan.chunks[target].count > 1 && list.len() > real,
+            "pad_mass: table {target}'s last chunk has no padding slot of its own"
+        );
+        let last = list.len() - 1;
+        list[last] = Interaction::new(
+            Affine::constant(-(sum * rows.inv().expect("rows != 0"))),
+            Affine::constant(FieldElement::one()),
+        );
     }
 
     // The fault `balance_with`: the numerator that balances the bus, from every true

@@ -716,3 +716,204 @@ fn the_card_proves_the_host_references_packed_bytes() {
         assert_eq!(host.2, card.2, "cap={cap}: the next challenge moved");
     }
 }
+
+// ─── mass in a padding slot ──────────────────────────────────────────────
+
+/// ★ Padding is the verifier's to define: an unbalanced trace (FAN(7)'s odd
+/// sender reading a one) whose prover moves the bus's whole sum into a padding
+/// slot of FAN(5)'s short last chunk — honest trees, outputs and ladder over
+/// that list, so the bus balances — is refused by the constraint phase, where
+/// the verifier's own `0/1` padding meets the claim; with that check off, it
+/// is accepted, so nothing else objects.
+#[test]
+fn mass_in_a_padding_slot_is_refused_by_the_verifiers_own_padding() {
+    let airs = airs();
+    let fans = fan_airs();
+    let mut fan_cols = fan_cols();
+    let cfg = packed(27, 2);
+    fan_cols[1][1][2] = FE::one();
+    let committed = commit(packed_tables(&airs, &fans, &fan_cols), &cfg);
+    let plan = plan_of(&committed, &cfg);
+    assert_eq!(
+        (plan.chunks[3].slot_vars, plan.chunks[3].count),
+        (1, 3),
+        "FAN(5): three chunks of two slots, the last holding one interaction"
+    );
+    let honest = prove(&committed, &cfg, ProverFaults::default());
+    assert_eq!(
+        verify(&committed, &honest, &cfg),
+        Err(MlError::BusImbalance),
+        "premise: the trace's bus does not balance"
+    );
+    let forged = prove(
+        &committed,
+        &cfg,
+        ProverFaults {
+            pad_mass: Some(3),
+            ..ProverFaults::default()
+        },
+    );
+    assert_eq!(
+        verify(&committed, &forged, &cfg),
+        Err(MlError::BatchMismatch),
+        "the padding slot's mass is refused where the verifier's padding enters"
+    );
+    let checks = VerifierChecks {
+        constraint: false,
+        ..VerifierChecks::ALL
+    };
+    assert_eq!(
+        verify_with_checks(&committed, &forged, &cfg, checks),
+        Ok(()),
+        "with the constraint check off the forgery passes: the bus balances and the ladder holds"
+    );
+}
+
+// ─── where the combination challenge is drawn ─────────────────────────────
+
+/// What the prover did to its transcript, in order.
+#[derive(Clone, Debug, PartialEq)]
+enum Event {
+    Absorb(ExtE),
+    Bytes,
+    Draw,
+}
+
+/// A transcript that logs every absorb and draw of the one it wraps.
+struct Recording {
+    inner: DefaultTranscript<Ext>,
+    log: Vec<Event>,
+}
+
+impl crypto::fiat_shamir::is_transcript::IsTranscript<Ext> for Recording {
+    fn append_field_element(&mut self, element: &ExtE) {
+        self.log.push(Event::Absorb(element.clone()));
+        self.inner.append_field_element(element);
+    }
+    fn append_bytes(&mut self, new_bytes: &[u8]) {
+        self.log.push(Event::Bytes);
+        self.inner.append_bytes(new_bytes);
+    }
+    fn mark_statement_end(&mut self) {
+        self.inner.mark_statement_end();
+    }
+    fn state(&self) -> [u8; 32] {
+        self.inner.state()
+    }
+    fn sample_field_element(&mut self) -> ExtE {
+        self.log.push(Event::Draw);
+        self.inner.sample_field_element()
+    }
+    fn sample_u64(&mut self, upper_bound: u64) -> u64 {
+        self.log.push(Event::Draw);
+        self.inner.sample_u64(upper_bound)
+    }
+}
+
+impl crypto::fiat_shamir::transcript_hash::HasTranscriptHash for Recording {
+    type Hash =
+        <DefaultTranscript<Ext> as crypto::fiat_shamir::transcript_hash::HasTranscriptHash>::Hash;
+}
+
+/// Where `values` were absorbed one after another in `log`: the index just
+/// past the last of them (the run must occur exactly once).
+fn just_after(log: &[Event], values: &[ExtE]) -> usize {
+    let absorbs: Vec<Event> = values.iter().cloned().map(Event::Absorb).collect();
+    let at: Vec<usize> = (0..=log.len().saturating_sub(absorbs.len()))
+        .filter(|&i| log[i..i + absorbs.len()] == absorbs[..])
+        .collect();
+    assert_eq!(at.len(), 1, "the run is absorbed once");
+    at[0] + absorbs.len()
+}
+
+/// The draws in a row from `at` on.
+fn draws_from(log: &[Event], at: usize) -> usize {
+    log[at..].iter().take_while(|e| **e == Event::Draw).count()
+}
+
+/// ★ `s'` is drawn after the bin's whole ladder, never before: drawn before,
+/// the prover would know it while fixing its chunk claims, and a false claim
+/// would no longer be caught with probability `≥ 1 − ℓ/|E|`. Every round trip
+/// and every tamper would still pass with the draw moved earlier on both
+/// sides, so this pins its place in the prover's transcript on the small cut
+/// fixture (one bin, four cut tables): right after the bus outputs come one
+/// draw (the first step's batching challenge) and then the ladder's absorbs;
+/// right after the last step's halves come exactly `1 + Σ ℓ + n` draws (the
+/// last line challenge, every cut table's `s'`, then the constraint point `ξ`)
+/// and then the tables' claims. The verifier replays the same transcript, so
+/// the honest proof verifying pins its side too.
+#[test]
+fn the_combination_challenge_is_drawn_after_the_whole_ladder() {
+    let airs = airs();
+    let fans = fan_airs();
+    let fan_cols = fan_cols();
+    let cfg = packed(27, 2);
+    let committed = commit(packed_tables(&airs, &fans, &fan_cols), &cfg);
+    let plan = plan_of(&committed, &cfg);
+    assert_eq!(plan.bins.len(), 1, "one bin");
+    let combine: usize = plan
+        .chunks
+        .iter()
+        .filter(|c| c.count > 1)
+        .map(Chunking::combine_vars)
+        .sum();
+    assert_eq!(
+        combine,
+        2 + 3 + 3 + 2,
+        "FAN(5), FAN(7), FAN(9), FAN(11): ℓ = 2, 3, 3, 2"
+    );
+
+    let mut transcript = Recording {
+        inner: DefaultTranscript::<Ext>::new(SEED),
+        log: Vec::new(),
+    };
+    let proof = prove_batched_with(
+        &committed,
+        &cfg,
+        &mut transcript,
+        None,
+        ProverFaults::default(),
+    )
+    .expect("the prover runs");
+    verify(&committed, &proof, &cfg).expect("the honest proof verifies");
+    let log = transcript.log;
+
+    let outputs: Vec<ExtE> = proof
+        .argue
+        .bus_outputs
+        .iter()
+        .flat_map(|(p, q)| [p.clone(), q.clone()])
+        .collect();
+    let ladder_start = just_after(&log, &outputs);
+    assert_eq!(
+        draws_from(&log, ladder_start),
+        1,
+        "after the outputs, the first step's batching challenge alone"
+    );
+    let last = proof.argue.gkr[0].layers.last().expect("a ladder step");
+    let halves: Vec<ExtE> = last
+        .halves
+        .iter()
+        .flat_map(|h| {
+            [
+                h.p_lo.clone(),
+                h.p_hi.clone(),
+                h.q_lo.clone(),
+                h.q_hi.clone(),
+            ]
+        })
+        .collect();
+    let ladder_end = just_after(&log, &halves);
+    assert_eq!(
+        draws_from(&log, ladder_end),
+        1 + combine + plan.num_vars,
+        "after the last halves: the line challenge, every s', then ξ"
+    );
+    assert!(
+        matches!(
+            log[ladder_end + 1 + combine + plan.num_vars],
+            Event::Absorb(_)
+        ),
+        "then the tables' claims are absorbed"
+    );
+}
