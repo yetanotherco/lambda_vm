@@ -154,6 +154,8 @@ pub mod regs_inrow_tests;
 pub mod rpx_two_implementations;
 pub mod transcript_counts;
 pub mod windowed_builder_tests;
+#[cfg(test)]
+pub mod zc_term_census;
 
 pub mod shift_tests;
 
