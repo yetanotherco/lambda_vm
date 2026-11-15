@@ -1000,9 +1000,9 @@ pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
 #[cfg(test)]
 pub(crate) use windowed::DECODE_TRACE_DELAY;
 pub use windowed::{
-    Accumulator, CardFillStamps, ChunkJob, CountThreadStamps, MEMW_A_WHOLE, RecordsRoom,
-    RegenBuilder, RowFamilies, RowLists, SetupStamps, StreamTable, StreamedChunk, WalkedWindow,
-    Walker, WindowStamps, WindowedTraceBuilder,
+    ALIGNED_ECALL, Accumulator, AlignedRef, CardFillStamps, ChunkJob, CountThreadStamps,
+    RecordsRoom, RegenBuilder, RowFamilies, RowLists, SetupStamps, StreamTable, StreamedChunk,
+    WalkedWindow, Walker, WindowStamps, WindowedTraceBuilder,
 };
 #[cfg(feature = "parallel")]
 pub(crate) use windowed::{head_log, parallel};

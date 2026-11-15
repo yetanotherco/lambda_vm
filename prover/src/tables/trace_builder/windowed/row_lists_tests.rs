@@ -17,8 +17,8 @@ use executor::vm::logs::Log;
 use super::super::{HistoryOverlay, MemoryState, RegisterState, WalkSizes};
 use super::parallel::{ExecWindow, walk_windows_from_history};
 use super::{
-    MEMW_A_WHOLE, RecordsRoom, RowLists, WalkCounts, WalkedWindow, WindowedTraceBuilder,
-    walk_window,
+    ALIGNED_ECALL, AlignedRef, RecordsRoom, RowLists, WalkCounts, WalkedWindow,
+    WindowedTraceBuilder, walk_window,
 };
 use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise::BitwiseHistogram;
@@ -191,17 +191,24 @@ fn lists_are_the_rows(
         let load: Vec<u32> = t.load_ops.iter().map(|op| cycle(op.timestamp)).collect();
         assert_eq!(lists.load_cycles, load, "{what}: LOAD's cycles");
         assert!(l.load_ops.is_empty(), "{what}: LOAD ops made");
-        // MEMW_A: a regular row's cycle, an ECALL cycle's row whole.
+        // MEMW_A: a regular row's cycle and access, an ECALL cycle's row
+        // whole.
         let mut rows = Vec::new();
         let mut whole = Vec::new();
         for row in &t.memw.aligned {
             let c = cycle(row.timestamp());
             let raw = &today.cpu_ops[c as usize - first];
             if decode.op(raw).decode.fields.ecall {
-                rows.push(MEMW_A_WHOLE | whole.len() as u32);
+                rows.push(AlignedRef {
+                    cycle: ALIGNED_ECALL | c,
+                    at: whole.len() as u32,
+                });
                 whole.push(*row);
             } else {
-                rows.push(c);
+                let at = history.extras[c as usize - first].side;
+                let a = history.accesses[at as usize];
+                assert_eq!(a.addr, row.base_address(), "{what}: cycle {c}'s access");
+                rows.push(AlignedRef { cycle: c, at });
             }
         }
         assert_eq!(lists.aligned_rows, rows, "{what}: MEMW_A's list");
