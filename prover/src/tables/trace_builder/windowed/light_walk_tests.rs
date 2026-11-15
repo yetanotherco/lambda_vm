@@ -119,6 +119,7 @@ fn walked(
         Some(counts),
         true,
         route,
+        super::RowLists::NONE,
         sizes,
         &mut record,
         &mut registers,

@@ -149,6 +149,8 @@ struct WalkSettings {
     /// cycles walked without their cells, and each window routed by its walker.
     light: bool,
     route: bool,
+    /// [`WindowedTraceBuilder::card_row_lists`].
+    lists: super::RowLists,
 }
 
 /// One byte's cell hashed for the windows' boundary sums, under the run's
@@ -276,6 +278,7 @@ impl WindowWalker {
             self.counts.as_mut(),
             !(s.keep_logs && s.listless),
             s.route,
+            s.lists,
             &mut self.sizes,
             &mut self.record,
             &mut self.registers,
@@ -333,6 +336,7 @@ impl WindowWalker {
             self.counts.as_mut(),
             !(s.keep_logs && s.listless),
             s.route,
+            s.lists,
             &mut self.sizes,
             &mut self.memory,
             &mut self.registers,
@@ -671,7 +675,21 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),
         light: builder.light_walks().0,
         route: builder.light_walks().1,
+        lists: builder.row_lists(),
     });
+    let lists = builder.row_lists();
+    if lists.any() {
+        let refuse = |why: &str| Err(Error::Prover(format!("the walk's row lists: {why}")));
+        if !builder.counts_where_made() {
+            return refuse("they need the walkers to count where they make the rows");
+        }
+        if lists.store && !builder.light_walks().1 {
+            return refuse("STORE's cycles need the walkers routing (the light walk at 2)");
+        }
+        if recheck > 0 {
+            return refuse("a re-walk compares lists the walkers no longer make");
+        }
+    }
     let key = settings.key;
     let start_registers = builder.register_state.clone();
     let lean = builder.lean.memory;

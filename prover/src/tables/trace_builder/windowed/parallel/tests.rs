@@ -91,6 +91,7 @@ fn walked_from_entries_with(
         digests: None,
         light: false,
         route: false,
+        lists: super::super::RowLists::NONE,
     });
     let mut pass = LeanPass::new(Arc::clone(&builder.decode), &builder.register_state)?;
     let mut executor =
