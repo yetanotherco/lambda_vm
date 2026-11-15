@@ -78,6 +78,16 @@ fn options(
 /// `program` run, and its traces as the block's windowed build makes them at
 /// [`options`]' cuts, the cut tables padded as `padding`, held wide.
 fn traces(program: &str, padding: CutPadding) -> (Elf, Vec<u8>, Traces) {
+    traces_as(program, padding, None)
+}
+
+/// [`traces`], built in `format`'s register format, MEMW_A order and
+/// KECCAK_RND form when one is given (the builder's defaults otherwise).
+fn traces_as(
+    program: &str,
+    padding: CutPadding,
+    format: Option<&BlockFormat>,
+) -> (Elf, Vec<u8>, Traces) {
     let elf = asm_elf_bytes(program);
     let program = Elf::load(&elf).expect("the ELF loads");
     let logs = Executor::new(&program, Vec::new())
@@ -86,8 +96,15 @@ fn traces(program: &str, padding: CutPadding) -> (Elf, Vec<u8>, Traces) {
         .expect("the program runs")
         .logs;
     let o = options(MaxRowsConfig::default(), None, 0);
-    let mut builder = WindowedTraceBuilder::new(&program, &[], &o.max_rows)
-        .expect("the builder")
+    let mut builder = WindowedTraceBuilder::new(&program, &[], &o.max_rows).expect("the builder");
+    if let Some(format) = format {
+        builder = builder
+            .register_format(format.registers)
+            .and_then(|b| b.memw_aligned_order(format.memw_aligned))
+            .map(|b| b.keccak_rnd_form(format.keccak_rnd))
+            .expect("the builder in the format's forms");
+    }
+    let mut builder = builder
         .keccak_rnd_chunks_at_finish(1 << o.keccak_rnd_rows_log2)
         .expect("rows")
         .cuts_at_finish(
@@ -311,11 +328,24 @@ fn a_block_at_the_pinned_format_short_of_real_tables_is_refused_on_the_bus() {
         }),
         ("all", 1, |v| v.clear()),
     ];
+    // The controls: each program, nothing left out, proves and verifies.
+    for program in ["test_keccak_multi", "test_ecsm_multi"] {
+        let (elf_program, elf, mut traces) =
+            traces_as(program, CutPadding::LastTable, Some(&format));
+        let honest = prove(&elf_program, &elf, &mut traces, &format);
+        assert_eq!(
+            verify_block_whir(&honest, &elf, &opts, &format).map_err(|e| format!("{e:?}")),
+            Ok(true),
+            "{program}: the control, nothing left out"
+        );
+        println!("BLOCK CUT PADDING PINNED CONTROL: {program} proves and verifies");
+    }
     let mut ran = 0;
     for (program, family, tables) in families {
         for (which, needs, edit) in edits {
             let what = format!("{program} {family}: {which} left out");
-            let (elf_program, elf, mut traces) = traces(program, CutPadding::LastTable);
+            let (elf_program, elf, mut traces) =
+                traces_as(program, CutPadding::LastTable, Some(&format));
             let real = tables(&mut traces).len();
             if real < needs {
                 println!("BLOCK CUT PADDING PINNED SKIPPED: {what}: {real} real-row tables");
