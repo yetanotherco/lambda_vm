@@ -1245,9 +1245,12 @@ extern "C" __global__ void zc_bind_all(const uint64_t *const *__restrict__ d_fac
     at[2] = acc.c;
 }
 
-// Pass two: `out[i·cells + y] = Σ_{j ≡ y (mod cells)} d_partials[i·threads + j]`, one thread a cell.
+// Pass two: `out[(sel[i]·cells + y)·3] = Σ_{j ≡ y (mod cells)} d_partials[i·threads + j]`, one
+// thread a cell — factor `sel[i]`'s place in the gathered heads (`gather_factor_heads_ext3`'s layout),
+// so one read-back takes every factor.
 extern "C" __global__ void zc_bind_all_sum(const uint64_t *__restrict__ d_partials, uint64_t nsel,
                                            uint64_t cells, uint64_t threads,
+                                           const uint32_t *__restrict__ d_sel,
                                            uint64_t *__restrict__ out) {
     uint64_t total = nsel * cells;
     for (uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; task < total;
@@ -1258,7 +1261,7 @@ extern "C" __global__ void zc_bind_all_sum(const uint64_t *__restrict__ d_partia
         for (uint64_t j = y; j < threads; j += cells) {
             acc = ext3::add(acc, load_ext(d_partials + (i * threads + j) * 3));
         }
-        uint64_t *at = out + task * 3;
+        uint64_t *at = out + ((uint64_t)d_sel[i] * cells + y) * 3;
         at[0] = acc.a;
         at[1] = acc.b;
         at[2] = acc.c;

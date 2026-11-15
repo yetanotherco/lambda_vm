@@ -1100,29 +1100,20 @@ where
         if self.bound.len() != self.there {
             return Err(failed("fused factor values"));
         }
-        let values = self
-            .session
-            .values()
-            .map_err(|_| failed("fused factor values"))?;
-        let mut values = values;
-        // The factors no round read were not folded
-        // (`argue_fused::knobs::bus_only_at_end`): their cells come from the base
-        // columns, every bound challenge at once.
-        if self.session.skips_unread() {
+        // A session that left the factors no round read unfolded
+        // (`argue_fused::knobs::bus_only_at_end`) binds them on the card at the
+        // same read-back, from the bound challenges.
+        let values = if self.session.skips_unread() {
             use crate::gpu::ext3_raw;
-            let table = crate::eq::eq_evals(&self.bound);
-            let mut e = Vec::with_capacity(table.len() * 3);
-            for v in &table {
-                e.extend_from_slice(&ext3_raw(v).ok_or(failed("fused factor values"))?);
+            let mut bound = Vec::with_capacity(self.bound.len() * 3);
+            for s in &self.bound {
+                bound.extend_from_slice(&ext3_raw(s).ok_or(failed("fused factor values"))?);
             }
-            let bound = self
-                .session
-                .bound_unread(&e)
-                .map_err(|_| failed("fused factor values"))?;
-            for (slot, limbs) in bound {
-                *values.get_mut(slot).ok_or(failed("fused factor values"))? = limbs;
-            }
+            self.session.values_bound(&bound)
+        } else {
+            self.session.values()
         }
+        .map_err(|_| failed("fused factor values"))?;
         let mut factors: Vec<crate::mle::Mle<E>> = Vec::with_capacity(values.len() + 2);
         for factor in &values {
             factors.push(

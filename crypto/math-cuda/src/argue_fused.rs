@@ -229,7 +229,13 @@ struct Unread {
     fold_table: CudaSlice<u64>,
     unread_dev: CudaSlice<u32>,
     unread: Vec<u32>,
+    /// The end pass's partials, [`UNREAD_THREADS`] a factor, made once.
+    partials: CudaSlice<u64>,
 }
+
+/// Threads the end pass sums each unread factor over: a multiple of every cube
+/// the host tail takes (at most this many cells).
+const UNREAD_THREADS: u64 = 1024;
 
 /// One table's fused zerocheck on the card.
 pub struct FusedZerocheck<'f> {
@@ -435,6 +441,11 @@ impl<'f> FusedZerocheck<'f> {
                 2 * (rows as u64 / 4) * 24
             } else {
                 0
+            }
+            + if at_end {
+                width as u64 * UNREAD_THREADS * 24
+            } else {
+                0
             };
         let Some(room) = be.reserve(
             Self::device_bytes(width, rows, program.num_slots, grid_rows, gruen_rows) + extra,
@@ -566,12 +577,17 @@ impl<'f> FusedZerocheck<'f> {
                 },
             )?;
             let fold_dev = htod_or_trim(&stream, &fold_table)?;
+            // SAFETY: the end pass writes every partial before it reads one.
+            let partials = unsafe {
+                alloc_or_trim::<u64>(&stream, unread.len().max(1) * UNREAD_THREADS as usize * 3)
+            }?;
             Some(Unread {
                 reads: reads_dev,
                 count,
                 fold_table: fold_dev,
                 unread_dev,
                 unread,
+                partials,
             })
         } else {
             None
@@ -1063,91 +1079,107 @@ impl<'f> FusedZerocheck<'f> {
         self.needed.as_ref().is_some_and(|u| !u.unread.is_empty())
     }
 
-    /// Every bound challenge at once for the factors no round reads
-    /// ([`knobs::bus_only_at_end`]): `e` is the `eq` table of the bound
-    /// challenges (three u64 a cell, the first bound in the high bit), and the
-    /// result each such factor's cells over the cube left — `(slot, limbs)`.
-    pub fn bound_unread(&self, e: &[u64]) -> Result<Vec<(usize, Vec<u64>)>> {
-        let Some(Unread {
-            unread_dev, unread, ..
-        }) = self.needed.as_ref()
-        else {
-            return Ok(Vec::new());
+    /// [`values`](Self::values) for a session that leaves the factors no round
+    /// reads unfolded ([`knobs::bus_only_at_end`]): those factors' cells are
+    /// made from the base columns with every bound challenge at once (`bound`,
+    /// three u64 a challenge, the first bound first) and written into the same
+    /// gathered heads, so one read-back takes every factor. The `eq` table of
+    /// the bound challenges is built on the card, and the partials are the
+    /// session's own.
+    pub fn values_bound(&mut self, bound: &[u64]) -> Result<Vec<Vec<u64>>> {
+        let Some(u) = self.needed.as_ref() else {
+            return self.values();
         };
-        if unread.is_empty() {
-            return Ok(Vec::new());
+        if u.unread.is_empty() {
+            return self.values();
         }
         let be = backend()?;
         let rows = self.rows as u64;
         let cells = self.len as u64;
-        assert_eq!(
-            (e.len() / 3) as u64 * cells,
-            rows,
-            "the table spans the bound variables"
-        );
-        let nsel = unread.len();
-        let threads: u64 = if nsel >= 32 { 4096 } else { 16384 }.max(cells);
-        let e_dev = htod_or_trim(&self.stream, e)?;
-        // SAFETY: pass one writes every partial, pass two every cell.
-        let mut partials =
-            unsafe { alloc_or_trim::<u64>(&self.stream, nsel * threads as usize * 3) }?;
-        let mut out = unsafe { alloc_or_trim::<u64>(&self.stream, nsel * cells as usize * 3) }?;
+        let spans = rows / cells.max(1);
+        if (1u64 << (bound.len() / 3)) != spans || cells > UNREAD_THREADS {
+            return Err(cudarc::driver::DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+            ));
+        }
+        let e = eq_table_ext3(&self.stream, bound, spans as usize)?;
+        let nsel = u.unread.len();
+        let span = self.len * 3;
+        let total = self.width * span;
+        // SAFETY: the gather writes every word, the second pass the unread
+        // factors' cells over them.
+        let mut out = unsafe { alloc_or_trim::<u64>(&self.stream, total) }?;
+        let width = self.width as u64;
+        let grid = (total as u64)
+            .div_ceil(BLOCK_DIM as u64)
+            .clamp(1, MAX_GRID as u64) as u32;
         let factors = self.source.ptrs;
+        let threads = UNREAD_THREADS;
         let t0 = crate::ktime::start(&self.stream);
+        let Some(u) = self.needed.as_mut() else {
+            return self.values();
+        };
         unsafe {
+            self.stream
+                .launch_builder(&be.gather_factor_heads_ext3)
+                .arg(&self.folded_ptrs)
+                .arg(&width)
+                .arg(&cells)
+                .arg(&mut out)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
             self.stream
                 .launch_builder(&be.zc_bind_all)
                 .arg(factors)
-                .arg(unread_dev)
+                .arg(&u.unread_dev)
                 .arg(&rows)
                 .arg(&cells)
-                .arg(&e_dev)
+                .arg(&e)
                 .arg(&self.source.stride)
-                .arg(&mut partials)
+                .arg(&mut u.partials)
                 .launch(LaunchConfig {
                     grid_dim: ((threads / u64::from(BLOCK_DIM)) as u32, nsel as u32, 1),
                     block_dim: (BLOCK_DIM, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
-            let nsel_arg = nsel as u64;
-            let total = nsel as u64 * cells;
-            self.stream
-                .launch_builder(&be.zc_bind_all_sum)
-                .arg(&partials)
-                .arg(&nsel_arg)
-                .arg(&cells)
-                .arg(&threads)
-                .arg(&mut out)
-                .launch(LaunchConfig {
-                    grid_dim: (
-                        total
-                            .div_ceil(u64::from(BLOCK_DIM))
-                            .clamp(1, MAX_GRID as u64) as u32,
-                        1,
-                        1,
-                    ),
-                    block_dim: (BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+            if knobs::stage_fault() != 3 {
+                let nsel_arg = nsel as u64;
+                let cells_total = nsel as u64 * cells;
+                self.stream
+                    .launch_builder(&be.zc_bind_all_sum)
+                    .arg(&u.partials)
+                    .arg(&nsel_arg)
+                    .arg(&cells)
+                    .arg(&threads)
+                    .arg(&u.unread_dev)
+                    .arg(&mut out)
+                    .launch(LaunchConfig {
+                        grid_dim: (
+                            cells_total
+                                .div_ceil(u64::from(BLOCK_DIM))
+                                .clamp(1, MAX_GRID as u64) as u32,
+                            1,
+                            1,
+                        ),
+                        block_dim: (BLOCK_DIM, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
         }
         crate::ktime::end(
             &self.stream,
             t0,
             "zc.bound_unread",
             self.depth,
-            nsel as u64 * rows * 8,
+            nsel as u64 * rows * 8 + total as u64 * 16,
             nsel as u64 * rows,
         );
         let flat = crate::readback::clone_dtoh(&self.stream, &out)?;
         self.stream.synchronize()?;
-        let span = cells as usize * 3;
-        let skip = usize::from(knobs::stage_fault() == 3);
-        Ok(unread
-            .iter()
-            .zip(flat.chunks_exact(span))
-            .skip(skip)
-            .map(|(&slot, limbs)| (slot as usize, limbs.to_vec()))
-            .collect())
+        Ok(flat.chunks_exact(span).map(<[u64]>::to_vec).collect())
     }
 
     /// `L` over the folded factors, into its slab.
