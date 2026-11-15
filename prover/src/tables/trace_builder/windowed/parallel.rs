@@ -145,6 +145,10 @@ struct WalkSettings {
     /// Record mode's check: where a walker sends the digest of a rechecked
     /// window's lists ([`check_thread`]).
     digests: Option<Mutex<std::sync::mpsc::Sender<(u32, u64)>>>,
+    /// The light walk ([`WindowedTraceBuilder::light_walk`]): record mode's
+    /// cycles walked without their cells, and each window routed by its walker.
+    light: bool,
+    route: bool,
 }
 
 /// One byte's cell hashed for the windows' boundary sums, under the run's
@@ -247,7 +251,9 @@ impl WindowWalker {
         };
         self.seeding = 0.0;
         self.registers = register_state(cells);
-        self.record.overlay = Some(Box::new(HistoryOverlay::new(Arc::clone(history))));
+        self.record.overlay = Some(Box::new(
+            HistoryOverlay::new(Arc::clone(history)).light(self.settings.light),
+        ));
         let settings = Arc::clone(&self.settings);
         let s = &*settings;
         // Words mode: the window's ECALL cycles, from its history, before the
@@ -269,6 +275,7 @@ impl WindowWalker {
             s.defer_ecrec,
             self.counts.as_mut(),
             !(s.keep_logs && s.listless),
+            s.route,
             &mut self.sizes,
             &mut self.record,
             &mut self.registers,
@@ -325,6 +332,7 @@ impl WindowWalker {
             s.defer_ecrec,
             self.counts.as_mut(),
             !(s.keep_logs && s.listless),
+            s.route,
             &mut self.sizes,
             &mut self.memory,
             &mut self.registers,
@@ -661,6 +669,8 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         keep_logs: builder.keeps_logs(),
         words: builder.writes_words(),
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),
+        light: builder.light_walks().0,
+        route: builder.light_walks().1,
     });
     let key = settings.key;
     let start_registers = builder.register_state.clone();
