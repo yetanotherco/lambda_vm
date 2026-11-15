@@ -43,6 +43,10 @@ pub const MEMW_A_COLUMNS: usize = 29;
 pub const LOAD_COLUMNS: usize = 18;
 /// STORE's columns (`store::cols::NUM_COLUMNS`).
 pub const STORE_COLUMNS: usize = 16;
+/// MEM_LOAD's columns: the fused memory format's aligned CPU loads.
+pub const MEM_LOAD_COLUMNS: usize = 21;
+/// MEM_STORE's columns: the fused memory format's aligned CPU stores.
+pub const MEM_STORE_COLUMNS: usize = 27;
 /// SHIFT's columns (`shift::cols::NUM_COLUMNS`).
 pub const SHIFT_COLUMNS: usize = 29;
 /// MEMW's columns (`memw::cols::NUM_COLUMNS`).
@@ -182,6 +186,37 @@ pub struct AlignedRowC {
     pub limbs: u8,
 }
 
+/// One fused aligned CPU load (the prover's `MemLoadRow`; `fill.cu`'s
+/// `MemLoadRowC`): the address, the timestamp, the step to its bytes' old
+/// timestamp less one (two 16-bit limbs), the result's bytes with their fill,
+/// the width, whether it sign-extends (0 or 1), and padding 0.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemLoadRowC {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub res: [u8; 8],
+    pub width: u8,
+    pub is_signed: u8,
+    pub pad: [u8; 2],
+}
+
+/// One fused aligned CPU store (the prover's `MemStoreRow`; `fill.cu`'s
+/// `MemStoreRowC`): the address, the timestamp, the step as a load's, the
+/// width, padding 0, and the bytes written and replaced, a word each.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemStoreRowC {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub width: u8,
+    pub pad: [u8; 3],
+    pub value: u64,
+    pub old: u64,
+}
+
 /// One LOAD op (the prover's `LoadOperation`): the base address, the
 /// timestamp, the width, whether it sign-extends (0 or 1) and the result's
 /// bytes.
@@ -261,6 +296,12 @@ const _: () = {
     assert!(offset_of!(LoadOpC, is_signed) == 17);
     assert!(offset_of!(LoadOpC, res) == 18);
     assert!(size_of::<StoreOpC>() == 32);
+    assert!(size_of::<MemLoadRowC>() == 32);
+    assert!(offset_of!(MemLoadRowC, res) == 20);
+    assert!(offset_of!(MemLoadRowC, width) == 28);
+    assert!(size_of::<MemStoreRowC>() == 40);
+    assert!(offset_of!(MemStoreRowC, width) == 20);
+    assert!(offset_of!(MemStoreRowC, value) == 24);
     assert!(offset_of!(StoreOpC, write2) == 24);
     assert!(size_of::<ShiftOpC>() == 24);
     assert!(offset_of!(ShiftOpC, in_halves) == 8);
@@ -283,6 +324,8 @@ unsafe impl DeviceRepr for KeccakOpInC {}
 unsafe impl DeviceRepr for AlignedRowC {}
 unsafe impl DeviceRepr for LoadOpC {}
 unsafe impl DeviceRepr for StoreOpC {}
+unsafe impl DeviceRepr for MemLoadRowC {}
+unsafe impl DeviceRepr for MemStoreRowC {}
 unsafe impl DeviceRepr for ShiftOpC {}
 unsafe impl DeviceRepr for MemwOpC {}
 
@@ -316,6 +359,8 @@ struct Module {
     memw_a: CudaFunction,
     load: CudaFunction,
     store: CudaFunction,
+    mem_load: CudaFunction,
+    mem_store: CudaFunction,
     shift: CudaFunction,
     memw: CudaFunction,
     cpu: CudaFunction,
@@ -336,6 +381,8 @@ fn module() -> Result<&'static Module> {
         memw_a: module.load_function("fill_memw_a")?,
         load: module.load_function("fill_load")?,
         store: module.load_function("fill_store")?,
+        mem_load: module.load_function("fill_mem_load")?,
+        mem_store: module.load_function("fill_mem_store")?,
         shift: module.load_function("fill_shift")?,
         memw: module.load_function("fill_memw")?,
         cpu: module.load_function("fill_cpu_from_logs")?,
@@ -717,6 +764,16 @@ pub enum RecordsInput<'a> {
         records: &'a [&'a [StoreOpC]],
         rows: usize,
     },
+    /// MEM_LOAD's `rows` rows: `records`' pieces in order, then zero rows.
+    MemLoad {
+        records: &'a [&'a [MemLoadRowC]],
+        rows: usize,
+    },
+    /// MEM_STORE's `rows` rows: `records`' pieces in order, then zero rows.
+    MemStore {
+        records: &'a [&'a [MemStoreRowC]],
+        rows: usize,
+    },
     /// SHIFT's `rows` rows: `records`' pieces in order, then padding rows.
     Shift {
         records: &'a [&'a [ShiftOpC]],
@@ -738,6 +795,8 @@ impl std::fmt::Debug for RecordsInput<'_> {
             Self::MemwRWords { .. } => "MEMW_R (words)",
             Self::MemwA { .. } => "MEMW_A",
             Self::Load { .. } => "LOAD",
+            Self::MemLoad { .. } => "MEM_LOAD",
+            Self::MemStore { .. } => "MEM_STORE",
             Self::Store { .. } => "STORE",
             Self::Shift { .. } => "SHIFT",
             Self::Memw { .. } => "MEMW",
@@ -761,6 +820,8 @@ impl RecordsInput<'_> {
             | Self::MemwRWords { rows, .. }
             | Self::MemwA { rows, .. }
             | Self::Load { rows, .. }
+            | Self::MemLoad { rows, .. }
+            | Self::MemStore { rows, .. }
             | Self::Store { rows, .. }
             | Self::Shift { rows, .. }
             | Self::Memw { rows, .. } => *rows,
@@ -776,6 +837,8 @@ impl RecordsInput<'_> {
             Self::MemwR { .. } | Self::MemwRWords { .. } => MEMW_R_COLUMNS,
             Self::MemwA { .. } => MEMW_A_COLUMNS,
             Self::Load { .. } => LOAD_COLUMNS,
+            Self::MemLoad { .. } => MEM_LOAD_COLUMNS,
+            Self::MemStore { .. } => MEM_STORE_COLUMNS,
             Self::Store { .. } => STORE_COLUMNS,
             Self::Shift { .. } => SHIFT_COLUMNS,
             Self::Memw { .. } => MEMW_COLUMNS,
@@ -798,6 +861,8 @@ impl RecordsInput<'_> {
             }
             Self::MemwA { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Load { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::MemLoad { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::MemStore { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Store { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Shift { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Memw { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
@@ -813,6 +878,8 @@ impl RecordsInput<'_> {
             Self::MemwRWords { words, .. } => words.iter().map(|piece| piece.len()).sum(),
             Self::MemwA { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Load { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::MemLoad { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::MemStore { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Store { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Shift { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Memw { records, .. } => records.iter().map(|piece| piece.len()).sum(),
@@ -1041,6 +1108,20 @@ pub(crate) fn fill_col_major_into(
             let records_dev = upload_pieces(stream, pieces)?;
             launch_rows(stream, &m.load, &records_dev, records.len(), rows, dst)
         }
+        RecordsInput::MemLoad {
+            records: pieces,
+            rows,
+        } => {
+            let records_dev = upload_pieces(stream, pieces)?;
+            launch_rows(stream, &m.mem_load, &records_dev, records.len(), rows, dst)
+        }
+        RecordsInput::MemStore {
+            records: pieces,
+            rows,
+        } => {
+            let records_dev = upload_pieces(stream, pieces)?;
+            launch_rows(stream, &m.mem_store, &records_dev, records.len(), rows, dst)
+        }
         RecordsInput::Store {
             records: pieces,
             rows,
@@ -1113,6 +1194,8 @@ pub(crate) enum Staged<'a> {
     MemwA(CudaSlice<AlignedRowC>, usize),
     Load(CudaSlice<LoadOpC>, usize),
     Store(CudaSlice<StoreOpC>, usize),
+    MemLoad(CudaSlice<MemLoadRowC>, usize),
+    MemStore(CudaSlice<MemStoreRowC>, usize),
     Shift(CudaSlice<ShiftOpC>, usize),
     Memw(CudaSlice<MemwOpC>, usize),
     /// Written by another launch (a derived table, [`crate::card_rows`]):
@@ -1151,6 +1234,12 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
         }
         RecordsInput::MemwA { records, .. } => Staged::MemwA(upload_pieces(stream, records)?, n),
         RecordsInput::Load { records, .. } => Staged::Load(upload_pieces(stream, records)?, n),
+        RecordsInput::MemLoad { records, .. } => {
+            Staged::MemLoad(upload_pieces(stream, records)?, n)
+        }
+        RecordsInput::MemStore { records, .. } => {
+            Staged::MemStore(upload_pieces(stream, records)?, n)
+        }
         RecordsInput::Store { records, .. } => Staged::Store(upload_pieces(stream, records)?, n),
         RecordsInput::Shift { records, .. } => Staged::Shift(upload_pieces(stream, records)?, n),
         RecordsInput::Memw { records, .. } => Staged::Memw(upload_pieces(stream, records)?, n),
@@ -1219,6 +1308,8 @@ pub(crate) fn launch_staged(
         Staged::MemwA(records, n) => launch_rows(stream, &m.memw_a, records, *n, rows, dst),
         Staged::Load(records, n) => launch_rows(stream, &m.load, records, *n, rows, dst),
         Staged::Store(records, n) => launch_rows(stream, &m.store, records, *n, rows, dst),
+        Staged::MemLoad(records, n) => launch_rows(stream, &m.mem_load, records, *n, rows, dst),
+        Staged::MemStore(records, n) => launch_rows(stream, &m.mem_store, records, *n, rows, dst),
         Staged::Shift(records, n) => launch_rows(stream, &m.shift, records, *n, rows, dst),
         Staged::Memw(records, n) => launch_rows(stream, &m.memw, records, *n, rows, dst),
         Staged::Elsewhere => Ok(()),
