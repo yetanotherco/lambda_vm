@@ -648,3 +648,173 @@ fn a_chain_x_at_p_is_refused_only_by_its_bound() {
         assert_eq!(failing(main), vec![closing(bound)], "{bound:?}");
     }
 }
+
+// =============================================================================
+// The `r < N` and `yR < p` bounds, each the only constraint refusing an
+// otherwise consistent row. Without `r < N` a prover reads the signature's `r`
+// as `r + N` (a different curve x when it is below p) and recovers the key of a
+// different R; without `yR < p` a prover who requests the parity of a point
+// with a tiny y claims `y + p` (32 bytes, the requested parity) instead of the
+// root `p − y`, and recovers the key of −R.
+// =============================================================================
+
+use crate::tables::ecsm::{CARRY_OFFSET_X2, CARRY_OFFSET_YG};
+
+/// Little-endian bytes of a big-endian hex string of `len` bytes.
+fn le_hex(s: &str, len: usize) -> Vec<u8> {
+    let s = format!("{s:0>width$}", width = 2 * len);
+    let mut out: Vec<u8> = (0..len)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+    out.reverse();
+    out
+}
+
+/// `(v − m) mod 2^256`: the bound's sub witness the prover has for `v`.
+fn wrap_sub(v: &[u8], m: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut borrow = 0i16;
+    for (i, o) in out.iter_mut().enumerate() {
+        let d = v[i] as i16 - m[i] as i16 - borrow;
+        borrow = i16::from(d < 0);
+        *o = d.rem_euclid(256) as u8;
+    }
+    out
+}
+
+/// Carries of the `yR` relation `yR² + p² − x2·r − q1·p − 7 = 0`.
+fn yr_carries(yr: &[u8], x2: &[u8], r: &[u8], q1: &[u8]) -> [i64; 64] {
+    let g = |v: &[u8], j: usize| *v.get(j).unwrap_or(&0) as i128;
+    let mut out = [0i64; 64];
+    let mut prev = 0i128;
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut s = if i == 0 { -7 } else { 0 };
+        for j in 0..=i {
+            s += g(yr, j) * g(yr, i - j) + g(&P_BYTES, j) * g(&P_BYTES, i - j)
+                - g(x2, j) * g(r, i - j)
+                - g(q1, j) * g(&P_BYTES, i - j);
+        }
+        let t = prev + s;
+        assert_eq!(t.rem_euclid(256), 0, "the yR relation fails at limb {i}");
+        prev = t / 256;
+        *o = prev as i64;
+    }
+    assert_eq!(out[63], 0, "the yR relation does not close");
+    out
+}
+
+/// `c` into the carry columns at `col`, each inside its `IS_HALF` window at
+/// `offset` (else the bus, not the bound, would refuse the row).
+fn set_carries_at(main: &mut [FE], col: usize, c: &[i64; 64], offset: i64) {
+    for (i, &v) in c.iter().enumerate() {
+        if i < 63 {
+            assert!(
+                (0..1 << 16).contains(&(v + offset)),
+                "carry {i} = {v} outside its IsHalfword window"
+            );
+        }
+        main[col + i] = fe_i64(v);
+    }
+}
+
+/// `r' = r + N` with `r = 2`: `N + 2` is below p and is itself a curve x, so
+/// every relation is recomputed for it (`qw' = qw + w`, `w`, `u1`, `u2`
+/// unchanged; `x2`, `q0`, `yR` (even root), `q1`, `H` of the point at x = N + 2),
+/// every byte is a byte and every carry is in its window; only RLtN's closing
+/// carry refuses the row. The point's values were computed off line (x = N + 2,
+/// `x2 = x² mod p`, `q0 = (x² − x2)/p`, `yR² ≡ x³ + 7`, `q1 = (yR² + p² − x2·x −
+/// 7)/p`); the carries below check that each relation closes.
+#[test]
+fn r_plus_n_is_refused_only_by_its_bound() {
+    let (_, s_be) = r_s();
+    let (mut main, w) = computed(&sig_of(&be(&two()), &s_be), &hex32(Z), 0);
+    assert!(failing(main.clone()).is_empty(), "the honest row holds");
+
+    let rp = add_le(&w.r, &N_BYTES, 32);
+    let x2 = le_hex(
+        "9d671cd581c69bc5e697f5e1d12ab7da62c24080e2e3decc0cab03cab713cd61",
+        32,
+    );
+    let q0 = le_hex(
+        "fffffffffffffffffffffffffffffffd755db9cd5e9140777fa4bd1aa06c8658",
+        32,
+    );
+    let yr = le_hex(
+        "c94e559d14883e68cfda34341568bf1127153254788dd974c6af9bb9cd962a5c",
+        32,
+    );
+    let q1 = le_hex(
+        "100e4fd9370d1894561df11e85f8d4db46a77bf7f4838ca829fcb0f28cbdfbf69",
+        33,
+    );
+    assert_eq!(yr[0] % 2, 0, "the even root, the row's parity");
+    assert!(q1[32] <= 1, "q1's top byte is a bit");
+
+    let qwp = add_le(&w.qw, &w.w, 32);
+    set_bytes(&mut main, cols::R, &rp);
+    set_bytes(&mut main, cols::QW, &qwp);
+    set_carries(
+        &mut main,
+        cols::CW,
+        &carries(&rp, &w.w, &qwp, &N_BYTES, &[1], -1),
+    );
+    set_bytes(&mut main, cols::X2, &x2);
+    set_bytes(&mut main, cols::Q0, &q0);
+    set_carries_at(
+        &mut main,
+        cols::C0,
+        &carries(&rp, &rp, &q0, &P_BYTES, &x2, -1),
+        CARRY_OFFSET_X2,
+    );
+    set_bytes(&mut main, cols::YR, &yr);
+    set_bytes(&mut main, cols::Q1, &q1);
+    set_carries_at(
+        &mut main,
+        cols::C1,
+        &yr_carries(&yr, &x2, &rp, &q1),
+        CARRY_OFFSET_YG,
+    );
+    main[cols::H] = FE::from((yr[0] / 2) as u64);
+    set_halfwords(&mut main, cols::YR_SUB_P, &wrap_sub(&yr, &P_BYTES));
+    // The best sub witness the prover has: (r' − N) mod 2^256 = 2.
+    set_halfwords(&mut main, cols::R_SUB_N, &wrap_sub(&rp, &N_BYTES));
+    assert_eq!(failing(main), vec![closing(Bound::RLtN)]);
+}
+
+/// The tiny-y wrong root: R = (r, 1) is on the curve (`r³ + 7 ≡ 1`, r found off
+/// line, below N). Requesting the even root, the honest `yR` is `p − 1`; the
+/// forgery claims `p + 1` (even, 32 bytes, the same square mod p), with
+/// `q1' = q1 + 4` (`(p + y)² − (p − y)² = 4yp`) and the carries recomputed. Every
+/// other constraint holds; only YrLtP's closing carry refuses the row. Its
+/// chain would compute `u2·(r, 1)`, the key of −R.
+#[test]
+fn a_tiny_y_root_plus_p_is_refused_only_by_its_bound() {
+    let r_be: [u8; 32] = be(&le_hex(
+        "146d3b65add9f54ccca28533c88e2cbc63f7443e1658783ab41f8ef97c2a10b5",
+        32,
+    ));
+    let (_, s_be) = r_s();
+    let (mut main, w) = computed(&sig_of(&r_be, &s_be), &hex32(Z), 0);
+    assert!(failing(main.clone()).is_empty(), "the honest row holds");
+    assert_eq!(
+        w.y_r.to_vec(),
+        sub_le(&P_BYTES, &[1], 32),
+        "the honest even root is p − 1"
+    );
+
+    let yrp = add_le(&P_BYTES, &[1], 32);
+    let q1p = add_le(&w.q1, &[4], 33);
+    assert!(q1p[32] <= 1, "q1's top byte is a bit");
+    set_bytes(&mut main, cols::YR, &yrp);
+    set_bytes(&mut main, cols::Q1, &q1p);
+    set_carries_at(
+        &mut main,
+        cols::C1,
+        &yr_carries(&yrp, &w.x2, &w.r, &q1p),
+        CARRY_OFFSET_YG,
+    );
+    main[cols::H] = FE::from((yrp[0] / 2) as u64);
+    // The best sub witness the prover has: (yR' − p) mod 2^256 = 1.
+    set_halfwords(&mut main, cols::YR_SUB_P, &wrap_sub(&yrp, &P_BYTES));
+    assert_eq!(failing(main), vec![closing(Bound::YrLtP)]);
+}
