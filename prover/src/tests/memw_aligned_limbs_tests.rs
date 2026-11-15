@@ -1306,9 +1306,10 @@ fn ram_values_without_a_byte_check(tables: &TableInteractions) -> Vec<UncheckedV
         [(column, 1)] if *c == 0 => Some(*column),
         _ => None,
     };
-    // table -> (received-on buses -> columns), and the other forms.
-    let mut unchecked: BTreeMap<String, (BTreeMap<String, BTreeSet<usize>>, BTreeSet<String>)> =
-        BTreeMap::new();
+    // A table's unchecked values: single columns by the buses it receives
+    // them on, and the other forms.
+    type Unchecked = (BTreeMap<String, BTreeSet<usize>>, BTreeSet<String>);
+    let mut unchecked: BTreeMap<String, Unchecked> = BTreeMap::new();
     for (table, interactions) in tables {
         // The table's byte-checked columns, with the checks' weights.
         let mut checked: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
