@@ -503,12 +503,12 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
 /// levels), `RTA_BESIDE` (1, the default: level 1 executes beside phase B; 0
 /// the control), `RTA_BUILD_BESIDE` (1: every level built on the host beside
 /// phase B; 0, the default: on the card after the base), `RTA_LEVELS` (the
-/// chain's length; 2). Prints `RTA …` lines; everything is verified off the
-/// clock.
+/// chain's length; 2), `RTA_RUNS` (runs in this process, the first a warm-up;
+/// 1). Prints `RTA …` lines, each run's tagged `run k`; everything is verified
+/// off the clock.
 #[test]
 #[ignore = "a real block and its levels: box only"]
 fn rta_a_real_block_through_its_levels() {
-    use super::levels::prove_block_levels;
     use super::whir_block_tree::WhirTreeConfig;
     let _permit = super::device_permit::serial_for_test();
     let elf = std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF"))
@@ -544,12 +544,50 @@ fn rta_a_real_block_through_its_levels() {
     let build_beside = std::env::var("RTA_BUILD_BESIDE").is_ok_and(|v| v.trim() == "1");
     let levels: usize =
         std::env::var("RTA_LEVELS").map_or(2, |v| v.trim().parse().expect("RTA_LEVELS"));
+    let runs: usize = std::env::var("RTA_RUNS").map_or(1, |v| v.trim().parse().expect("RTA_RUNS"));
     let opts = super::proof::block_base_options();
     println!(
-        "RTA CONFIG: base {:?} · family {family:?} · levels {levels} · beside {beside} · build \
-         beside {build_beside}",
-        cfg.format.zf.base.hash
+        "RTA CONFIG: base {:?} · tag {} · group polys {} · family {family:?} · levels {levels} · \
+         beside {beside} · build beside {build_beside} · runs {runs}",
+        cfg.format.zf.base.hash,
+        String::from_utf8_lossy(&crate::block_whir::block_format_tag(&cfg.format)),
+        cfg.format.group_polys
     );
+    for k in 0..runs.max(1) {
+        println!(
+            "RTA RUN {k}{}",
+            if k == 0 && runs > 1 { " (warm-up)" } else { "" }
+        );
+        rta_one_run(
+            &elf,
+            &input,
+            &opts,
+            &cfg,
+            family,
+            levels,
+            beside,
+            build_beside,
+        );
+    }
+    println!("RTA DONE");
+}
+
+/// One run of [`rta_a_real_block_through_its_levels`]: proved, printed,
+/// verified.
+#[allow(clippy::too_many_arguments)]
+fn rta_one_run(
+    elf: &[u8],
+    input: &[u8],
+    opts: &ProofOptions,
+    cfg: &super::whir_block_tree::WhirTreeConfig,
+    family: WlfmFamily,
+    levels: usize,
+    beside: bool,
+    build_beside: bool,
+) {
+    use super::levels::prove_block_levels;
+    let (elf, input) = (elf.to_vec(), input.to_vec());
+    let opts = opts.clone();
     let run = prove_block_levels(
         &elf,
         &input,
@@ -625,5 +663,4 @@ fn rta_a_real_block_through_its_levels() {
     .is_ok();
     println!("RTA VERIFIED: base {ok_base} · levels {ok_levels} · block {ok_last}");
     assert!(ok_base && ok_levels && ok_last, "everything verifies");
-    println!("RTA DONE");
 }
