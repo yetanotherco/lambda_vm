@@ -391,70 +391,102 @@ pub fn generate_keccak_rows_as(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
-        for (row_idx, op) in ops.iter().enumerate() {
-            // Timestamp (sponge: `(T, j)`)
-            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
-
-            // Input and output state as bytes
-            for x in 0..5 {
-                for y in 0..5 {
-                    table.set_dword_bl(row_idx, cols::input_state(x, y, 0), op.input[x + 5 * y]);
-                    table.set_dword_bl(row_idx, cols::output_state(x, y, 0), op.output[x + 5 * y]);
-                }
-            }
-            table.set_fe(row_idx, cols::MU, FE::one());
-
-            let Some(sponge) = &op.sponge else {
-                // Permute row.
-                table.set_dword_bl(row_idx, cols::addr(0), op.state_addr);
-                // State pointers: state_ptr[lane] = addr + 8 * lane_idx
-                for lane_idx in 0..25 {
-                    let ptr = op
-                        .state_addr
-                        .checked_add(lane_idx as u64 * 8)
-                        .expect("keccak state address range must be validated by the executor");
-                    table.set_dword_whh(row_idx, cols::state_ptr(lane_idx, 0), ptr);
-                }
-                table.set_fe(row_idx, cols::MU_P, FE::one());
-                continue;
-            };
-
-            // Sponge row. `ADDR` and `STATE_PTR` stay 0: their constraints and
-            // sends are gated by `MU_P`.
-            table.set_fe(row_idx, cols::MU_S, FE::one());
-            table.set_bool(row_idx, cols::FIRST, sponge.first);
-            table.set_bool(row_idx, cols::LAST, sponge.last);
-            table.set_u64(row_idx, cols::COUNT, sponge.count);
-            table.set_dword_wl(row_idx, cols::SRC_LO, sponge.src);
-            table.set_dword_wl(row_idx, cols::OUT_LO, sponge.out);
-            let src_end = (sponge.src & 0xFFFF_FFFF) + 135;
-            table.set_u64(row_idx, cols::SRC_END, src_end & 0xFFFF);
-            table.set_u64(row_idx, cols::SRC_END + 1, src_end >> 16);
-            if sponge.last {
-                let out_end = (sponge.out & 0xFFFF_FFFF) + 31;
-                table.set_u64(row_idx, cols::OUT_END, out_end & 0xFFFF);
-                table.set_u64(row_idx, cols::OUT_END + 1, out_end >> 16);
-            }
-            table.set_bytes(row_idx, cols::PREV, &op.sponge_prev(sponge));
-            table.set_bytes(row_idx, cols::MSG, &sponge.msg);
-            for lane in 0..cols::RATE_LANES {
-                table.set_bool(row_idx, cols::full(lane), sponge.full(lane));
-                for byte in 0..7 {
-                    table.set_bool(row_idx, cols::part(lane, byte), sponge.part(lane, byte));
-                }
-            }
-        }
-
-        // Padding rows: state_ptr[lane][0] = 8 * lane_idx (per spec keccak.toml pad).
-        // half_mid and word_hi stay zero since 8*24 = 192 fits in half_lo.
-        // mu = 0 gates all bus interactions and the ADD constraint, so these values
-        // only need to satisfy the pad requirement, not reconstruct a real address.
-        for row_idx in n..num_rows {
-            for lane_idx in 0..25 {
-                table.set_u64(row_idx, cols::state_ptr(lane_idx, 0), (lane_idx as u64) * 8);
-            }
-        }
+        fill_keccak_range(table, ops, n, 0..num_rows)
     })
+}
+
+/// [`generate_keccak_rows_as`] with its rows filled as up to
+/// [`super::gpack::SPLIT_MAX_PARTS`] row ranges at once, `bounds(rows)` ([`super::gpack::row_bounds`] in the
+/// finish's tail split); the same trace, byte for byte.
+pub(crate) fn generate_keccak_rows_split_as(
+    ops: &[KeccakOperation],
+    num_rows: usize,
+    form: TraceForm,
+    bounds: &dyn Fn(usize) -> Vec<usize>,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let n = ops.len();
+    let bounds = bounds(num_rows);
+    super::gpack::generate_main_rows!(
+        form,
+        &WIDTHS,
+        num_rows,
+        cols::NUM_COLUMNS,
+        &bounds,
+        |table, rows| { fill_keccak_range(table, ops, n, rows) }
+    )
+}
+
+/// The rows `range` of a zeroed KECCAK table of `n` operations: a row reads
+/// its own op alone and the padding rows are constants.
+fn fill_keccak_range<T: VmTable>(
+    table: &mut T,
+    ops: &[KeccakOperation],
+    n: usize,
+    range: std::ops::Range<usize>,
+) {
+    for (row_idx, op) in super::gpack::items_in(&[ops], range.clone()) {
+        // Timestamp (sponge: `(T, j)`)
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+
+        // Input and output state as bytes
+        for x in 0..5 {
+            for y in 0..5 {
+                table.set_dword_bl(row_idx, cols::input_state(x, y, 0), op.input[x + 5 * y]);
+                table.set_dword_bl(row_idx, cols::output_state(x, y, 0), op.output[x + 5 * y]);
+            }
+        }
+        table.set_fe(row_idx, cols::MU, FE::one());
+
+        let Some(sponge) = &op.sponge else {
+            // Permute row.
+            table.set_dword_bl(row_idx, cols::addr(0), op.state_addr);
+            // State pointers: state_ptr[lane] = addr + 8 * lane_idx
+            for lane_idx in 0..25 {
+                let ptr = op
+                    .state_addr
+                    .checked_add(lane_idx as u64 * 8)
+                    .expect("keccak state address range must be validated by the executor");
+                table.set_dword_whh(row_idx, cols::state_ptr(lane_idx, 0), ptr);
+            }
+            table.set_fe(row_idx, cols::MU_P, FE::one());
+            continue;
+        };
+
+        // Sponge row. `ADDR` and `STATE_PTR` stay 0: their constraints and
+        // sends are gated by `MU_P`.
+        table.set_fe(row_idx, cols::MU_S, FE::one());
+        table.set_bool(row_idx, cols::FIRST, sponge.first);
+        table.set_bool(row_idx, cols::LAST, sponge.last);
+        table.set_u64(row_idx, cols::COUNT, sponge.count);
+        table.set_dword_wl(row_idx, cols::SRC_LO, sponge.src);
+        table.set_dword_wl(row_idx, cols::OUT_LO, sponge.out);
+        let src_end = (sponge.src & 0xFFFF_FFFF) + 135;
+        table.set_u64(row_idx, cols::SRC_END, src_end & 0xFFFF);
+        table.set_u64(row_idx, cols::SRC_END + 1, src_end >> 16);
+        if sponge.last {
+            let out_end = (sponge.out & 0xFFFF_FFFF) + 31;
+            table.set_u64(row_idx, cols::OUT_END, out_end & 0xFFFF);
+            table.set_u64(row_idx, cols::OUT_END + 1, out_end >> 16);
+        }
+        table.set_bytes(row_idx, cols::PREV, &op.sponge_prev(sponge));
+        table.set_bytes(row_idx, cols::MSG, &sponge.msg);
+        for lane in 0..cols::RATE_LANES {
+            table.set_bool(row_idx, cols::full(lane), sponge.full(lane));
+            for byte in 0..7 {
+                table.set_bool(row_idx, cols::part(lane, byte), sponge.part(lane, byte));
+            }
+        }
+    }
+
+    // Padding rows: state_ptr[lane][0] = 8 * lane_idx (per spec keccak.toml pad).
+    // half_mid and word_hi stay zero since 8*24 = 192 fits in half_lo.
+    // mu = 0 gates all bus interactions and the ADD constraint, so these values
+    // only need to satisfy the pad requirement, not reconstruct a real address.
+    for row_idx in range.start.max(n)..range.end {
+        for lane_idx in 0..25 {
+            table.set_u64(row_idx, cols::state_ptr(lane_idx, 0), (lane_idx as u64) * 8);
+        }
+    }
 }
 
 // =========================================================================

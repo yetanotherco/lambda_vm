@@ -242,32 +242,64 @@ pub(crate) fn generate_load_trace_segments_as(
     let len: usize = segments.iter().map(|s| s.len()).sum();
     let num_rows = len.next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
-        for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
-            // Input columns
-            table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
-            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
-
-            // read flags
-            let (r2, r4, r8) = op.read_flags();
-            table.set_bool(row_idx, cols::READ2, r2);
-            table.set_bool(row_idx, cols::READ4, r4);
-            table.set_bool(row_idx, cols::READ8, r8);
-
-            // signed
-            table.set_bool(row_idx, cols::SIGNED, op.signed);
-
-            // Output: res[8]
-            for i in 0..8 {
-                table.set_u64(row_idx, cols::RES[i], u64::from(op.res[i]));
-            }
-
-            // Auxiliary: sign_bit
-            table.set_bool(row_idx, cols::SIGN_BIT, op.compute_sign_bit());
-
-            // Multiplicity: active row
-            table.set_fe(row_idx, cols::MU, FE::one());
-        }
+        fill_load_range(table, segments, 0..num_rows)
     })
+}
+
+/// [`generate_load_trace_segments_as`] over one slice, its rows filled as up to
+/// [`super::gpack::SPLIT_MAX_PARTS`] row ranges at once, `bounds(rows)` ([`super::gpack::row_bounds`] in the
+/// finish's tail split); the same trace, byte for byte.
+pub(crate) fn generate_load_trace_split_as(
+    operations: &[LoadOperation],
+    form: TraceForm,
+    bounds: &dyn Fn(usize) -> Vec<usize>,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let segments: &[&[LoadOperation]] = &[operations];
+    let len = operations.len();
+    let num_rows = len.next_power_of_two().max(4);
+    let bounds = bounds(num_rows);
+    super::gpack::generate_main_rows!(
+        form,
+        &WIDTHS,
+        num_rows,
+        cols::NUM_COLUMNS,
+        &bounds,
+        |table, rows| { fill_load_range(table, segments, rows) }
+    )
+}
+
+/// The rows `range` of a zeroed table of `segments`' operations: each row
+/// reads its own operation alone, the padding rows stay zero.
+fn fill_load_range<T: VmTable>(
+    table: &mut T,
+    segments: &[&[LoadOperation]],
+    range: std::ops::Range<usize>,
+) {
+    for (row_idx, op) in super::gpack::items_in(segments, range) {
+        // Input columns
+        table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+
+        // read flags
+        let (r2, r4, r8) = op.read_flags();
+        table.set_bool(row_idx, cols::READ2, r2);
+        table.set_bool(row_idx, cols::READ4, r4);
+        table.set_bool(row_idx, cols::READ8, r8);
+
+        // signed
+        table.set_bool(row_idx, cols::SIGNED, op.signed);
+
+        // Output: res[8]
+        for i in 0..8 {
+            table.set_u64(row_idx, cols::RES[i], u64::from(op.res[i]));
+        }
+
+        // Auxiliary: sign_bit
+        table.set_bool(row_idx, cols::SIGN_BIT, op.compute_sign_bit());
+
+        // Multiplicity: active row
+        table.set_fe(row_idx, cols::MU, FE::one());
+    }
 }
 
 // =========================================================================

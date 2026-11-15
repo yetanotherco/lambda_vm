@@ -1784,3 +1784,64 @@ fn with_the_knob_the_plan_leaves_the_count_to_bitwise() {
         );
     }
 }
+
+/// ★ The finish's tail split (`LAMBDA_VM_FINISH_TAIL_SPLIT=cpu|all`: each tail
+/// table filled as row ranges at once, `tables::gpack::generate_main_rows`)
+/// streams the tables the sliding finish streams without it, at their AIR
+/// positions, word for word and, held packed, byte for byte (widths and
+/// data, [`packed_bytes`]): every configuration the block uses, windows of 7 and 1000 cycles,
+/// parts of at least 1, 4 and 7 rows (the tails here are at most 32 rows). The
+/// split did run: CPU tails under `cpu`, more tails than that under `all`.
+#[test]
+fn the_tail_split_streams_the_same_tables() {
+    use super::{TailSplit, tail_split_test};
+    use crate::tables::gpack::split_fills;
+    let max_rows = MaxRowsConfig::small();
+    let mut fills = [0usize; 2];
+    for name in ["all_instructions_64", "test_keccak_multi", "misalign_sd"] {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            for (config, configure) in &configs() {
+                let emit = |split, min_rows| {
+                    tail_split_test::with(split, min_rows, || {
+                        let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                            configure(b).slide_rest()
+                        });
+                        streamed(builder, last, usize::MAX).1
+                    })
+                };
+                let want = emit(TailSplit::Off, 4);
+                for (k, split) in [TailSplit::Cpu, TailSplit::All].into_iter().enumerate() {
+                    for min_rows in [1, 4, 7] {
+                        let what = format!(
+                            "{name} window {window} {config} {split:?} parts of {min_rows}"
+                        );
+                        let before = split_fills();
+                        let got = emit(split, min_rows);
+                        fills[k] += split_fills() - before;
+                        assert_eq!(got.len(), want.len(), "{what}: tables");
+                        for (g, w) in got.iter().zip(&want) {
+                            assert_eq!(g.position, w.position, "{what}");
+                            let (g, w) = (g.table.as_ref(), w.table.as_ref());
+                            assert_eq!(
+                                g.map(shape_and_words),
+                                w.map(shape_and_words),
+                                "{what}: words"
+                            );
+                            assert_eq!(
+                                g.and_then(packed_bytes),
+                                w.and_then(packed_bytes),
+                                "{what}: packed bytes"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(fills[0] > 0, "no CPU tail was split: {fills:?}");
+    assert!(
+        fills[1] > fills[0],
+        "no tail past the CPU's was split: {fills:?}"
+    );
+}

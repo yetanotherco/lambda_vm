@@ -844,6 +844,28 @@ pub(crate) fn generate_cpu_trace_segments_as(
     })
 }
 
+/// [`generate_cpu_trace_segments_as`] with its rows filled as up to
+/// [`super::gpack::SPLIT_MAX_PARTS`] row ranges at once, `bounds(rows)` ([`super::gpack::row_bounds`] in the
+/// finish's tail split); the same trace, byte for byte.
+pub(crate) fn generate_cpu_trace_split_as(
+    operations: &[CpuOperation],
+    decode: &DecodeTable,
+    form: TraceForm,
+    bounds: &dyn Fn(usize) -> Vec<usize>,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let segments: &[&[CpuOperation]] = &[operations];
+    let num_rows = operations.len().next_power_of_two().max(4);
+    let bounds = bounds(num_rows);
+    super::gpack::generate_main_rows!(
+        form,
+        &WIDTHS,
+        num_rows,
+        cols::NUM_COLUMNS,
+        &bounds,
+        |t, rows| { fill_cpu_range(t, segments, decode, rows) }
+    )
+}
+
 /// A CPU row's register slots under the in-row register format
 /// (`tables::register::RegisterFormat::InRow`): the previous timestamp of
 /// each of `rs1`, `rs2`, `rd` (0 for a slot the row does not use; after a
@@ -879,17 +901,52 @@ pub(crate) fn generate_cpu_trace_inrow_segments_as(
         &WIDTHS_INROW,
         num_rows,
         inrow_cols::NUM_COLUMNS_INROW,
-        |t| {
-            fill_cpu_rows(t, segments, decode, num_rows);
-            for (row, side) in sides.iter().flat_map(|s| s.iter()).enumerate() {
-                t.set_u64(row, inrow_cols::PREV_TS_1, u64::from(side.prev_ts[0]));
-                t.set_u64(row, inrow_cols::PREV_TS_2, u64::from(side.prev_ts[1]));
-                t.set_u64(row, inrow_cols::PREV_TS_D, u64::from(side.prev_ts[2]));
-                t.set_u64(row, inrow_cols::OLD_RD_0, u64::from(side.old_rd[0]));
-                t.set_u64(row, inrow_cols::OLD_RD_1, u64::from(side.old_rd[1]));
-            }
-        }
+        |t| fill_cpu_inrow_range(t, segments, sides, decode, 0..num_rows)
     )
+}
+
+/// [`generate_cpu_trace_inrow_segments_as`] with its rows filled as up to
+/// [`super::gpack::SPLIT_MAX_PARTS`] row ranges at once, `bounds(rows)` ([`super::gpack::row_bounds`] in the
+/// finish's tail split); the same trace, byte for byte.
+pub(crate) fn generate_cpu_trace_inrow_split_as(
+    operations: &[CpuOperation],
+    sides: &[CpuSide],
+    decode: &DecodeTable,
+    form: TraceForm,
+    bounds: &dyn Fn(usize) -> Vec<usize>,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    debug_assert_eq!(operations.len(), sides.len(), "one side record a CPU op");
+    let (segments, sides): (&[&[CpuOperation]], &[&[CpuSide]]) = (&[operations], &[sides]);
+    let num_rows = operations.len().next_power_of_two().max(4);
+    let bounds = bounds(num_rows);
+    super::gpack::generate_main_rows!(
+        form,
+        &WIDTHS_INROW,
+        num_rows,
+        inrow_cols::NUM_COLUMNS_INROW,
+        &bounds,
+        |t, rows| fill_cpu_inrow_range(t, segments, sides, decode, rows)
+    )
+}
+
+/// The rows `range` of a zeroed in-row CPU table: the CPU row's cells, then
+/// the five slot columns from each op's side record (padding rows leave them
+/// zero).
+fn fill_cpu_inrow_range<T: VmTable>(
+    t: &mut T,
+    segments: &[&[CpuOperation]],
+    sides: &[&[CpuSide]],
+    decode: &DecodeTable,
+    range: std::ops::Range<usize>,
+) {
+    fill_cpu_range(t, segments, decode, range.clone());
+    for (row, side) in super::gpack::items_in(sides, range) {
+        t.set_u64(row, inrow_cols::PREV_TS_1, u64::from(side.prev_ts[0]));
+        t.set_u64(row, inrow_cols::PREV_TS_2, u64::from(side.prev_ts[1]));
+        t.set_u64(row, inrow_cols::PREV_TS_D, u64::from(side.prev_ts[2]));
+        t.set_u64(row, inrow_cols::OLD_RD_0, u64::from(side.old_rd[0]));
+        t.set_u64(row, inrow_cols::OLD_RD_1, u64::from(side.old_rd[1]));
+    }
 }
 
 /// Every row of a zeroed CPU table of `num_rows` rows: `segments`' operations,
@@ -900,8 +957,19 @@ fn fill_cpu_rows<T: VmTable>(
     decode: &DecodeTable,
     num_rows: usize,
 ) {
+    fill_cpu_range(table, segments, decode, 0..num_rows);
+}
+
+/// The rows `range` of a zeroed CPU table: [`fill_cpu_rows`]'s cells of those
+/// rows alone (a row reads its own operation and its index only).
+fn fill_cpu_range<T: VmTable>(
+    table: &mut T,
+    segments: &[&[CpuOperation]],
+    decode: &DecodeTable,
+    range: std::ops::Range<usize>,
+) {
     let n: usize = segments.iter().map(|s| s.len()).sum();
-    for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
+    for (row_idx, op) in super::gpack::items_in(segments, range.clone()) {
         let op = decode.op(op);
         let f = &op.decode.fields;
         let word = f.word_instr;
@@ -999,7 +1067,7 @@ fn fill_cpu_rows<T: VmTable>(
     // ECALL). pc_double_read stays 0, giving prev_ts = timestamp - 3. The first
     // padding read then lands on the halting row's timestamp + 1, where the HALT
     // chip's emit_pc deposited pc = 1.
-    for row_idx in n..num_rows {
+    for row_idx in range.start.max(n)..range.end {
         table.set_u64(row_idx, cols::TIMESTAMP, local_timestamp(row_idx));
         table.set_u64(row_idx, cols::PC_0, CPU_PADDING_PC);
         table.set_u64(row_idx, cols::NEXT_PC_0, CPU_PADDING_PC);

@@ -2140,6 +2140,108 @@ fn finish_direct() -> FinishDirect {
     })
 }
 
+/// `LAMBDA_VM_FINISH_TAIL_SPLIT=off|cpu|all`: the finish's tail tables filled
+/// as row ranges at once (`tables::gpack::generate_main_rows`): the CPU table
+/// alone, or CPU, KECCAK, SHIFT, MEMW, MEMW_A and LOAD. Unset or any other
+/// word: off. The tables are the same byte for byte either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TailSplit {
+    Off,
+    Cpu,
+    All,
+}
+
+impl TailSplit {
+    fn cpu(self) -> bool {
+        self != TailSplit::Off
+    }
+
+    fn all(self) -> bool {
+        self == TailSplit::All
+    }
+}
+
+fn tail_split() -> TailSplit {
+    #[cfg(test)]
+    if let Some(split) = tail_split_test::mode() {
+        return split;
+    }
+    static SPLIT: std::sync::OnceLock<TailSplit> = std::sync::OnceLock::new();
+    *SPLIT.get_or_init(|| {
+        tail_split_from(std::env::var("LAMBDA_VM_FINISH_TAIL_SPLIT").ok().as_deref())
+    })
+}
+
+/// The row ranges a tail table of `rows` rows is filled by under
+/// [`tail_split`] ([`crate::tables::gpack::row_bounds`]).
+fn tail_bounds(rows: usize) -> Vec<usize> {
+    #[cfg(test)]
+    if let Some(min_rows) = tail_split_test::min_rows() {
+        return crate::tables::gpack::row_bounds_at(
+            rows,
+            min_rows,
+            crate::tables::gpack::SPLIT_MAX_PARTS,
+        );
+    }
+    crate::tables::gpack::row_bounds(rows, true)
+}
+
+/// The tests' choice of [`tail_split`] and of the parts' fewest rows, in place
+/// of the word and of [`crate::tables::gpack::SPLIT_MIN_ROWS`]: process-wide,
+/// so held under one lock. A split moves no byte, so another test's build
+/// that sees it builds the same tables.
+#[cfg(test)]
+pub(crate) mod tail_split_test {
+    use super::TailSplit;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::Relaxed};
+
+    static MODE: AtomicU8 = AtomicU8::new(0);
+    static MIN_ROWS: AtomicUsize = AtomicUsize::new(0);
+    static HELD: Mutex<()> = Mutex::new(());
+
+    pub(super) fn mode() -> Option<TailSplit> {
+        match MODE.load(Relaxed) {
+            1 => Some(TailSplit::Off),
+            2 => Some(TailSplit::Cpu),
+            3 => Some(TailSplit::All),
+            _ => None,
+        }
+    }
+
+    pub(super) fn min_rows() -> Option<usize> {
+        let n = MIN_ROWS.load(Relaxed);
+        (n > 0).then_some(n)
+    }
+
+    /// `f` with the split at `split` and parts of at least `min_rows` rows.
+    pub(crate) fn with<T>(split: TailSplit, min_rows: usize, f: impl FnOnce() -> T) -> T {
+        let _held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        MODE.store(
+            match split {
+                TailSplit::Off => 1,
+                TailSplit::Cpu => 2,
+                TailSplit::All => 3,
+            },
+            Relaxed,
+        );
+        MIN_ROWS.store(min_rows, Relaxed);
+        let out = f();
+        MODE.store(0, Relaxed);
+        MIN_ROWS.store(0, Relaxed);
+        out
+    }
+}
+
+/// [`tail_split`]'s reading of `LAMBDA_VM_FINISH_TAIL_SPLIT`.
+fn tail_split_from(value: Option<&str>) -> TailSplit {
+    match value.map(str::trim) {
+        Some("cpu") => TailSplit::Cpu,
+        Some("all") => TailSplit::All,
+        _ => TailSplit::Off,
+    }
+}
+
 /// [`finish_direct`]'s reading of `LAMBDA_VM_FINISH_PAGE_DIRECT`: unset or any
 /// word but `0` writes PAGE straight into its packed form; `0` is the rollback.
 fn page_direct_from(value: Option<&str>) -> bool {
@@ -2364,6 +2466,10 @@ impl<'a> FinishPlan<'a> {
         // none is built at 8 bytes a cell first ([`crate::tables::gpack_seeds`];
         // `LAMBDA_VM_FINISH_SEED_WIDTHS=0` rolls it back). The packed bytes are
         // the same.
+        let split = tail_split();
+        if split != TailSplit::Off {
+            build_stamps::mark(&format!("p5 tail split {split:?}"));
+        }
         if crate::tables::gpack_seeds::seed_widths_on() {
             let seeded = crate::tables::gpack_seeds::seed_finish_widths();
             build_stamps::mark(&format!("p5 seeded {seeded} kinds"));
@@ -2543,7 +2649,15 @@ impl<'a> FinishPlan<'a> {
             skip.cut_padding,
             pack,
             form,
-            Arc::new(keccak::generate_keccak_rows_as),
+            if split.all() {
+                Arc::new(
+                    |ops: &[keccak::KeccakOperation], rows: usize, form: TraceForm| {
+                        keccak::generate_keccak_rows_split_as(ops, rows, form, &tail_bounds)
+                    },
+                )
+            } else {
+                Arc::new(keccak::generate_keccak_rows_as)
+            },
             |ops| Box::new(move || Ok(keccak::generate_keccak_trace(&ops.whole()))),
         )?);
         units.extend(keccak_rnd_units(&keccak_ops, &skip, pack, form)?);
@@ -2650,15 +2764,29 @@ impl<'a> FinishPlan<'a> {
                 Box::new(move || {
                     Ok(packed_if(
                         pack,
-                        if side.is_empty() {
-                            cpu::generate_cpu_trace_as(&ops[start..end], decode_table, form)
-                        } else {
-                            cpu::generate_cpu_trace_inrow_segments_as(
+                        match (side.is_empty(), split.cpu()) {
+                            (true, false) => {
+                                cpu::generate_cpu_trace_as(&ops[start..end], decode_table, form)
+                            }
+                            (false, false) => cpu::generate_cpu_trace_inrow_segments_as(
                                 &[&ops[start..end]],
                                 &[&side[start..end]],
                                 decode_table,
                                 form,
-                            )
+                            ),
+                            (true, true) => cpu::generate_cpu_trace_split_as(
+                                &ops[start..end],
+                                decode_table,
+                                form,
+                                &tail_bounds,
+                            ),
+                            (false, true) => cpu::generate_cpu_trace_inrow_split_as(
+                                &ops[start..end],
+                                &side[start..end],
+                                decode_table,
+                                form,
+                                &tail_bounds,
+                            ),
                         },
                     ))
                 })
@@ -2688,7 +2816,14 @@ impl<'a> FinishPlan<'a> {
             skip.shift,
             tails,
             move |ops: &[ShiftOperation]| {
-                packed_if(pack, shift::generate_shift_trace_as(ops, form))
+                packed_if(
+                    pack,
+                    if split.all() {
+                        shift::generate_shift_trace_split_as(ops, form, &tail_bounds)
+                    } else {
+                        shift::generate_shift_trace_as(ops, form)
+                    },
+                )
             },
         )?);
         units.extend(vec_units(
@@ -2698,7 +2833,16 @@ impl<'a> FinishPlan<'a> {
             skip.memw,
             tails,
             true,
-            move |ops: &[MemwOperation]| packed_if(pack, memw::generate_memw_trace_as(ops, form)),
+            move |ops: &[MemwOperation]| {
+                packed_if(
+                    pack,
+                    if split.all() {
+                        memw::generate_memw_trace_split_as(ops, form, &tail_bounds)
+                    } else {
+                        memw::generate_memw_trace_as(ops, form)
+                    },
+                )
+            },
         )?);
         units.extend(vec_units(
             family("MEMW_A"),
@@ -2710,7 +2854,11 @@ impl<'a> FinishPlan<'a> {
             move |ops: &[memw_aligned::AlignedRow]| {
                 packed_if(
                     pack,
-                    memw_aligned::generate_memw_aligned_trace_as(ops, form),
+                    if split.all() {
+                        memw_aligned::generate_memw_aligned_trace_split_as(ops, form, &tail_bounds)
+                    } else {
+                        memw_aligned::generate_memw_aligned_trace_as(ops, form)
+                    },
                 )
             },
         )?);
@@ -2721,7 +2869,16 @@ impl<'a> FinishPlan<'a> {
             skip.load,
             tails,
             true,
-            move |ops: &[LoadOperation]| packed_if(pack, load::generate_load_trace_as(ops, form)),
+            move |ops: &[LoadOperation]| {
+                packed_if(
+                    pack,
+                    if split.all() {
+                        load::generate_load_trace_split_as(ops, form, &tail_bounds)
+                    } else {
+                        load::generate_load_trace_as(ops, form)
+                    },
+                )
+            },
         )?);
         units.extend(segmented_units(
             family("MUL"),
@@ -3784,5 +3941,24 @@ mod page_direct_tests {
         assert!(page_direct_from(Some(" 1 ")));
         assert!(!page_direct_from(Some("0")));
         assert!(!page_direct_from(Some(" 0")));
+    }
+}
+
+#[cfg(test)]
+mod tail_split_knob_tests {
+    use super::{TailSplit, tail_split_from};
+
+    /// The tail split is off unset and for any word but `cpu` and `all`.
+    #[test]
+    fn the_tail_split_is_off_by_default_and_reads_cpu_or_all() {
+        assert_eq!(tail_split_from(None), TailSplit::Off);
+        assert_eq!(tail_split_from(Some("off")), TailSplit::Off);
+        assert_eq!(tail_split_from(Some("1")), TailSplit::Off);
+        assert_eq!(tail_split_from(Some("CPU")), TailSplit::Off);
+        assert_eq!(tail_split_from(Some("cpu")), TailSplit::Cpu);
+        assert_eq!(tail_split_from(Some(" all ")), TailSplit::All);
+        assert!(TailSplit::Cpu.cpu() && !TailSplit::Cpu.all());
+        assert!(TailSplit::All.cpu() && TailSplit::All.all());
+        assert!(!TailSplit::Off.cpu() && !TailSplit::Off.all());
     }
 }
