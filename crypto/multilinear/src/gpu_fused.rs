@@ -334,8 +334,34 @@ pub fn zc_device_tail() -> Option<(usize, usize)> {
     match TAIL_FORCED.load(Ordering::Relaxed) {
         1 => None,
         2 => Some((0, TAIL_FORCED_CUBE.load(Ordering::Relaxed) as usize)),
-        _ => Some((DEVICE_TAIL_MIN_STEPS, DEVICE_TAIL_CUBE)),
+        _ => device_tail_word(),
     }
+}
+
+/// `LAMBDA_VM_ZC_DEVICE_TAIL`, read once: `off` hands every program to the
+/// host at the crossover; `<min_steps>:<cube>` (`cube` a power of two, at
+/// least 2) keeps programs of at least `min_steps` steps on the card down to
+/// `cube`. Unset or unreadable, today's `(DEVICE_TAIL_MIN_STEPS,
+/// DEVICE_TAIL_CUBE)`. Host and card rounds send the same messages, so every
+/// setting makes the same proof; a measurement word.
+fn device_tail_word() -> Option<(usize, usize)> {
+    static WORD: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    *WORD.get_or_init(|| {
+        let today = Some((DEVICE_TAIL_MIN_STEPS, DEVICE_TAIL_CUBE));
+        let Ok(word) = std::env::var("LAMBDA_VM_ZC_DEVICE_TAIL") else {
+            return today;
+        };
+        if word == "off" {
+            return None;
+        }
+        let parsed = word.split_once(':').and_then(|(steps, cube)| {
+            Some((steps.parse::<usize>().ok()?, cube.parse::<usize>().ok()?))
+        });
+        match parsed {
+            Some((steps, cube)) if cube >= 2 && cube.is_power_of_two() => Some((steps, cube)),
+            _ => today,
+        }
+    })
 }
 
 /// Forces a mode: `None` back to the default, `Some(None)` the crossover,
@@ -1041,8 +1067,13 @@ where
                         w[at..at + 3].copy_from_slice(&limbs);
                     }
                 }
+                // Rounds 0 and 1's challenges, for a session that folds its rows'
+                // bus values itself (`argue_fused::knobs::bus_from_grid`).
+                let mut challenges = [0u64; 6];
+                challenges[..3].copy_from_slice(&ext3_raw(s0).ok_or(failed("fused weights"))?);
+                challenges[3..].copy_from_slice(&ext3_raw(s1).ok_or(failed("fused weights"))?);
                 self.session
-                    .fold2(&w)
+                    .fold2_bound(&w, Some(&challenges))
                     .map_err(|_| failed("fused double fold"))?;
                 self.times.fold2 = tick.elapsed().as_secs_f64();
             }
@@ -1073,6 +1104,25 @@ where
             .session
             .values()
             .map_err(|_| failed("fused factor values"))?;
+        let mut values = values;
+        // The factors no round read were not folded
+        // (`argue_fused::knobs::bus_only_at_end`): their cells come from the base
+        // columns, every bound challenge at once.
+        if self.session.skips_unread() {
+            use crate::gpu::ext3_raw;
+            let table = crate::eq::eq_evals(&self.bound);
+            let mut e = Vec::with_capacity(table.len() * 3);
+            for v in &table {
+                e.extend_from_slice(&ext3_raw(v).ok_or(failed("fused factor values"))?);
+            }
+            let bound = self
+                .session
+                .bound_unread(&e)
+                .map_err(|_| failed("fused factor values"))?;
+            for (slot, limbs) in bound {
+                *values.get_mut(slot).ok_or(failed("fused factor values"))? = limbs;
+            }
+        }
         let mut factors: Vec<crate::mle::Mle<E>> = Vec::with_capacity(values.len() + 2);
         for factor in &values {
             factors.push(

@@ -1159,6 +1159,124 @@ fn a_proof_made_under_every_pricing_arm_verifies() {
     assert_eq!(lost_after, lost_before, "no timer lost");
 }
 
+/// ★ The zerocheck's opt-in variants send today's messages: the bus column
+/// from rounds 0–1's rows (`LAMBDA_VM_ZC_BUS_FROM_GRID`), the weights as levels
+/// built once (`LAMBDA_VM_ZC_EQ_LEVELS`), the unread factors bound at the end
+/// (`LAMBDA_VM_ZC_BUS_ONLY_AT_END`, which brings the first along), and all
+/// three. Each on every table at 2^8 (or the height the card takes it at) and
+/// on the Q1 tables at 2^10 and 2^12, with the card's rounds at the crossover
+/// and then down to two cells, against today's host rounds: the same rounds,
+/// point and bound factors. Then each variant's fault on the Q1 tables must
+/// part from today, so the comparison is load-bearing.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
+fn the_zerocheck_variants_send_todays_messages() {
+    use math_cuda::argue_fused::knobs;
+    use multilinear::gpu_fused::*;
+    struct Back;
+    impl Drop for Back {
+        fn drop(&mut self) {
+            knobs::force_stage(None, None, None);
+            knobs::force_stage_fault(0);
+            force_zc_device_tail(None);
+        }
+    }
+    let _back = Back;
+    let _switches = CardSwitches::set(
+        FusedFaults {
+            keep_corners: true,
+            ..FusedFaults::default()
+        },
+        false,
+    );
+    let vm = vm_airs();
+    let airs = every_air(&vm);
+    let mut runs: Vec<(String, usize)> = airs
+        .iter()
+        .map(|(air, label)| {
+            let mut rng = Rng::new(0);
+            let width = Table::from_air(*air, label, 8, &mut rng).width();
+            let n = (8..).find(|n| width << n >= 4096).expect("a height");
+            (label.clone(), n)
+        })
+        .collect();
+    for label in THE_Q1_TABLES {
+        runs.push((label.to_string(), 10));
+        runs.push((label.to_string(), 12));
+    }
+    let variants: [(&str, (bool, bool, bool)); 4] = [
+        ("bus from grid", (true, false, false)),
+        ("eq levels", (false, true, false)),
+        ("unread at end", (false, false, true)),
+        ("all three", (true, true, true)),
+    ];
+    let mut checked = 0usize;
+    for tail in [None, Some(Some(2usize))] {
+        force_zc_device_tail(tail);
+        for (name, (grid, levels, end)) in variants {
+            knobs::force_stage(Some(grid), Some(levels), Some(end));
+            for (at, (label, n)) in runs.iter().enumerate() {
+                let air = airs.iter().find(|(_, l)| l == label).unwrap().0;
+                let mut rng = Rng::new(0x57A6 + at as u64);
+                let table = Table::from_air(air, label, *n, &mut rng);
+                let session = table.session(table.random_columns(*n, &mut rng), &mut rng);
+                let claims = session.true_claims();
+                let sessions = fused_sessions();
+                let what = format!("{name}, tail {tail:?}");
+                session.assert_card_is_today(&claims, session.on_the_card(&claims), &what);
+                assert_eq!(
+                    fused_sessions(),
+                    sessions + 1,
+                    "{label} n={n} {what}: the card ran the fused rounds"
+                );
+                checked += 1;
+            }
+        }
+    }
+    // The faults: each variant's own path broken must part from today.
+    force_zc_device_tail(Some(Some(2)));
+    for (fault, (grid, levels, end)) in [
+        (1u8, (true, false, false)),
+        (2, (false, true, false)),
+        (3, (false, false, true)),
+    ] {
+        knobs::force_stage(Some(grid), Some(levels), Some(end));
+        knobs::force_stage_fault(fault);
+        for (at, label) in THE_Q1_TABLES.iter().enumerate() {
+            let n = 10;
+            let air = airs.iter().find(|(_, l)| l == label).unwrap().0;
+            let mut rng = Rng::new(0xFA57 + at as u64);
+            let table = Table::from_air(air, label, n, &mut rng);
+            let session = table.session(table.random_columns(n, &mut rng), &mut rng);
+            let claims = session.true_claims();
+            let (today, today_point, _) = session.today(&claims);
+            let parted = match session.on_the_card(&claims) {
+                Err(_) => true,
+                Ok((proof, point, bound)) => {
+                    proof
+                        .rounds
+                        .iter()
+                        .zip(&today.rounds)
+                        .any(|(a, b)| a.evaluations != b.evaluations)
+                        || point != today_point
+                        || session
+                            .factors
+                            .iter()
+                            .enumerate()
+                            .any(|(slot, f)| bound[slot] != f.evaluate_in(&point).unwrap())
+                }
+            };
+            assert!(
+                parted,
+                "{label}: fault {fault} must part from today's rounds"
+            );
+        }
+        knobs::force_stage_fault(0);
+    }
+    eprintln!("argue ZC variants: {checked} card runs sent today's messages; 3 faults parted");
+}
+
 /// ★ The production switches (fused on, the corners skipped, no
 /// cross-check) on every table without roots: its constraint part is zero,
 /// so its grid `{0,1}²` is all corners, the corner skip is exact on random

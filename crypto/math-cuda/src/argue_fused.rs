@@ -55,6 +55,78 @@ pub mod knobs {
         })
     }
 
+    static BUS_FROM_GRID_FORCED: AtomicU8 = AtomicU8::new(0);
+    static EQ_LEVELS_FORCED: AtomicU8 = AtomicU8::new(0);
+    static BUS_ONLY_AT_END_FORCED: AtomicU8 = AtomicU8::new(0);
+
+    fn word(forced: &AtomicU8, cell: &OnceLock<bool>, name: &str) -> bool {
+        match forced.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => *cell.get_or_init(|| std::env::var(name).is_ok_and(|v| v == "1" || v == "true")),
+        }
+    }
+
+    fn set(forced: &AtomicU8, on: Option<bool>) {
+        forced.store(
+            match on {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// `LAMBDA_VM_ZC_BUS_FROM_GRID=1`: rounds 0 and 1's pass keeps each row's
+    /// bus value, and the bus column is that, folded by their two challenges —
+    /// the same values as `zc_bus_column` makes from the folded factors (the
+    /// weights sum to one), without its product a term a row. Default off.
+    pub fn bus_from_grid() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        word(&BUS_FROM_GRID_FORCED, &ON, "LAMBDA_VM_ZC_BUS_FROM_GRID") || bus_only_at_end()
+    }
+
+    /// `LAMBDA_VM_ZC_EQ_LEVELS=1`: every round's weights built once a session,
+    /// one level a round (`gkr_eq_levels_ext3`), instead of halved by a launch
+    /// a round. The same values. Default off.
+    pub fn eq_levels() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        word(&EQ_LEVELS_FORCED, &ON, "LAMBDA_VM_ZC_EQ_LEVELS")
+    }
+
+    /// `LAMBDA_VM_ZC_BUS_ONLY_AT_END=1`: the factors no round reads (the
+    /// bus's alone) are not folded; the cells the host tail takes are made
+    /// from the base columns once, every bound challenge at a time. The same
+    /// values. Implies [`bus_from_grid`], whose column needs no folded factor.
+    /// Default off.
+    pub fn bus_only_at_end() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        word(&BUS_ONLY_AT_END_FORCED, &ON, "LAMBDA_VM_ZC_BUS_ONLY_AT_END")
+    }
+
+    static STAGE_FAULT: AtomicU8 = AtomicU8::new(0);
+
+    /// ⛔ A FAULT for the variants' negative controls, a test's only: 1 skips
+    /// the bus rows' second fold, 2 reads the weights one level off, 3 leaves
+    /// one unread factor's cells unbound. 0 (the default) is none.
+    #[doc(hidden)]
+    pub fn force_stage_fault(fault: u8) {
+        STAGE_FAULT.store(fault, Ordering::Relaxed);
+    }
+
+    pub(super) fn stage_fault() -> u8 {
+        STAGE_FAULT.load(Ordering::Relaxed)
+    }
+
+    /// Forces the three words above; `None` back to the environment's.
+    #[doc(hidden)]
+    pub fn force_stage(bus_from_grid: Option<bool>, eq_levels: Option<bool>, at_end: Option<bool>) {
+        set(&BUS_FROM_GRID_FORCED, bus_from_grid);
+        set(&EQ_LEVELS_FORCED, eq_levels);
+        set(&BUS_ONLY_AT_END_FORCED, at_end);
+    }
+
     /// Forces [`bus_twice`]; `None` back to the environment's word.
     #[doc(hidden)]
     pub fn force_bus_twice(on: Option<bool>) {
@@ -95,6 +167,17 @@ pub struct FusedBus<'a> {
     pub slots: &'a [u32],
     pub coeffs: &'a [u64],
     pub constant: [u64; 3],
+}
+
+/// [`knobs::bus_only_at_end`]'s split of a table's factors: those a round
+/// reads (their slots, how many, and the fold's pointer table over their slabs
+/// and `L`) and those no round reads (their slots on the card and here).
+struct Unread {
+    reads: CudaSlice<u32>,
+    count: u64,
+    fold_table: CudaSlice<u64>,
+    unread_dev: CudaSlice<u32>,
+    unread: Vec<u32>,
 }
 
 /// One table's fused zerocheck on the card.
@@ -140,6 +223,17 @@ pub struct FusedZerocheck<'f> {
     vars: u64,
     /// Scratch weights for the halvings' pricing arm (`zc.halve` twice).
     shadow_eq: Option<CudaSlice<u64>>,
+    /// [`knobs::bus_from_grid`]: every row's bus value (`4q` ext3), its
+    /// one-entry pointer table for the fold, and the two challenges' limbs.
+    l0: Option<(CudaSlice<u64>, CudaSlice<u64>, CudaSlice<u64>)>,
+    /// [`knobs::eq_levels`]: both weights' levels and their variable count
+    /// `J`, and the halvings asked for so far.
+    levels: Option<(CudaSlice<u64>, CudaSlice<u64>, u32)>,
+    halvings: usize,
+    /// [`knobs::bus_only_at_end`]: the factors a round reads (their slots, and
+    /// the fold's pointer table over their slabs and `L`), and those no round
+    /// reads (slots, on the card and here).
+    needed: Option<Unread>,
     _room: DeviceReservation,
 }
 
@@ -246,13 +340,21 @@ impl<'f> FusedZerocheck<'f> {
         if words == 0 {
             return Ok(None);
         }
-        let Some(room) = be.reserve(Self::device_bytes(
-            width,
-            rows,
-            program.num_slots,
-            grid_rows,
-            gruen_rows,
-        )) else {
+        let (from_grid, levels_on, at_end) = (
+            knobs::bus_from_grid(),
+            knobs::eq_levels(),
+            knobs::bus_only_at_end(),
+        );
+        // The opt-in variants' buffers: the rows' bus values, the weights' levels.
+        let extra = if from_grid { rows as u64 * 24 } else { 0 }
+            + if levels_on {
+                2 * (rows as u64 / 4) * 24
+            } else {
+                0
+            };
+        let Some(room) = be.reserve(
+            Self::device_bytes(width, rows, program.num_slots, grid_rows, gruen_rows) + extra,
+        ) else {
             return Ok(None);
         };
         let stream = source.stream.clone();
@@ -301,6 +403,95 @@ impl<'f> FusedZerocheck<'f> {
                 op == 1 || (op == 6 && (node[1] as u32) != u32::MAX)
             })
             .count() as u64;
+        let l0 = if from_grid {
+            // SAFETY: `zc_bus_u_store` writes every row before the folds read it.
+            let values = unsafe { alloc_or_trim::<u64>(&stream, rows * 3) }?;
+            let address = {
+                let (at, _record) = values.device_ptr(&stream);
+                at
+            };
+            let table = htod_or_trim(&stream, &[address])?;
+            let challenges = alloc_zeros_or_trim::<u64>(&stream, 6)?;
+            Some((values, table, challenges))
+        } else {
+            None
+        };
+        let levels = if levels_on {
+            let j = (r_tail.len() / 3) as u32;
+            let mut out = Vec::with_capacity(2);
+            for tail in [r_tail, rho_tail] {
+                // SAFETY: the kernel writes every cell.
+                let mut table = unsafe { alloc_or_trim::<u64>(&stream, q * 3) }?;
+                let point = htod_or_trim(&stream, &nonempty(tail))?;
+                let low = 0u32;
+                unsafe {
+                    stream
+                        .launch_builder(&be.gkr_eq_levels_ext3)
+                        .arg(&point)
+                        .arg(&low)
+                        .arg(&j)
+                        .arg(&mut table)
+                        .launch(LaunchConfig {
+                            grid_dim: ((q as u64).div_ceil(256).min(4096) as u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+                out.push(table);
+            }
+            let rho_levels = out.pop().expect("two tables");
+            let r_levels = out.pop().expect("two tables");
+            Some((r_levels, rho_levels, j))
+        } else {
+            None
+        };
+        let needed = if at_end {
+            // The slots a walk reads: its `VAR` steps' factors and its selected
+            // `ACC` steps' selectors.
+            let mut read = vec![false; width];
+            for node in program.nodes.chunks_exact(2) {
+                let op = node[0] as u32;
+                let a = (node[0] >> 32) as usize;
+                let b = node[1] as u32;
+                if op == 1 && a < width {
+                    read[a] = true;
+                }
+                if op == 6 && b != u32::MAX && (b as usize) < width {
+                    read[b as usize] = true;
+                }
+            }
+            let reads: Vec<u32> = (0..width as u32).filter(|&k| read[k as usize]).collect();
+            let unread: Vec<u32> = (0..width as u32).filter(|&k| !read[k as usize]).collect();
+            let mut fold_table: Vec<u64> = reads.iter().map(|&k| addresses[k as usize]).collect();
+            fold_table.push(addresses[width]);
+            let count = reads.len() as u64;
+            let reads_dev = htod_or_trim(
+                &stream,
+                if reads.is_empty() {
+                    &[0u32][..]
+                } else {
+                    &reads
+                },
+            )?;
+            let unread_dev = htod_or_trim(
+                &stream,
+                if unread.is_empty() {
+                    &[0u32][..]
+                } else {
+                    &unread
+                },
+            )?;
+            let fold_dev = htod_or_trim(&stream, &fold_table)?;
+            Some(Unread {
+                reads: reads_dev,
+                count,
+                fold_table: fold_dev,
+                unread_dev,
+                unread,
+            })
+        } else {
+            None
+        };
         let session = Self {
             stream,
             source,
@@ -333,6 +524,10 @@ impl<'f> FusedZerocheck<'f> {
             steps,
             vars,
             shadow_eq: None,
+            l0,
+            levels,
+            halvings: 0,
+            needed,
             _room: room,
         };
         if crate::ktime::enabled() {
@@ -497,23 +692,44 @@ impl<'f> FusedZerocheck<'f> {
             1
         } {
             let t0 = self.tick();
+            let config = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: block * 3 * 8,
+            };
             unsafe {
-                self.stream
-                    .launch_builder(&be.zc_bus_u)
-                    .arg(factors)
-                    .arg(&q)
-                    .arg(&self.term_slots)
-                    .arg(&self.term_coeffs)
-                    .arg(&self.num_terms)
-                    .arg(&self.constant)
-                    .arg(&self.eq_rho)
-                    .arg(&mut self.partials)
-                    .arg(&self.source.stride)
-                    .launch(LaunchConfig {
-                        grid_dim: (grid, 1, 1),
-                        block_dim: (block, 1, 1),
-                        shared_mem_bytes: block * 3 * 8,
-                    })?;
+                match self.l0.as_mut() {
+                    // Each row's bus value kept as well: the bus column's source.
+                    Some((values, _, _)) => {
+                        self.stream
+                            .launch_builder(&be.zc_bus_u_store)
+                            .arg(factors)
+                            .arg(&q)
+                            .arg(&self.term_slots)
+                            .arg(&self.term_coeffs)
+                            .arg(&self.num_terms)
+                            .arg(&self.constant)
+                            .arg(&self.eq_rho)
+                            .arg(&mut self.partials)
+                            .arg(&self.source.stride)
+                            .arg(values)
+                            .launch(config)?;
+                    }
+                    None => {
+                        self.stream
+                            .launch_builder(&be.zc_bus_u)
+                            .arg(factors)
+                            .arg(&q)
+                            .arg(&self.term_slots)
+                            .arg(&self.term_coeffs)
+                            .arg(&self.num_terms)
+                            .arg(&self.constant)
+                            .arg(&self.eq_rho)
+                            .arg(&mut self.partials)
+                            .arg(&self.source.stride)
+                            .launch(config)?;
+                    }
+                }
             }
             self.tock(
                 "zc.bus_u",
@@ -587,36 +803,216 @@ impl<'f> FusedZerocheck<'f> {
     /// the quarter-size copy; then `L` there, and the weights halved to round
     /// 2's `eq(·_{>2})`.
     pub fn fold2(&mut self, w: &[u64; 12]) -> Result<()> {
+        self.fold2_bound(w, None)
+    }
+
+    /// [`fold2`](Self::fold2) with rounds 0 and 1's challenges (`s₀` then
+    /// `s₁`, three u64 each), which the opt-in bus column
+    /// ([`knobs::bus_from_grid`]) folds its rows' values by. A session that
+    /// keeps them refuses a double fold without them.
+    pub fn fold2_bound(&mut self, w: &[u64; 12], challenges: Option<&[u64; 6]>) -> Result<()> {
         assert_eq!(self.len, 0, "the double fold is the first");
         let be = backend()?;
         let q = (self.rows / 4) as u64;
         self.stream.memcpy_htod(&w[..], &mut self.scratch)?;
-        let width = self.width as u64;
+        let factors = self.source.ptrs;
+        let selected = self.needed.as_ref().map(|u| (&u.reads, u.count));
+        let width = selected.map_or(self.width as u64, |(_, count)| count);
         let total = width * q;
         let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
-        let factors = self.source.ptrs;
+        let config = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
         for _ in 0..crate::ktime::times("zc.fold2") {
             let t0 = self.tick();
+            if total > 0 {
+                unsafe {
+                    match selected {
+                        // Only the factors a round reads.
+                        Some((reads, count)) => {
+                            self.stream
+                                .launch_builder(&be.zc_fold2_sel)
+                                .arg(factors)
+                                .arg(&q)
+                                .arg(reads)
+                                .arg(&count)
+                                .arg(&self.scratch)
+                                .arg(&mut self.folded)
+                                .arg(&self.source.stride)
+                                .launch(config)?;
+                        }
+                        None => {
+                            self.stream
+                                .launch_builder(&be.zc_fold2)
+                                .arg(factors)
+                                .arg(&q)
+                                .arg(&width)
+                                .arg(&self.scratch)
+                                .arg(&mut self.folded)
+                                .arg(&self.source.stride)
+                                .launch(config)?;
+                        }
+                    }
+                }
+            }
+            self.tock("zc.fold2", t0, width * q * 56, width * q * 4);
+        }
+        self.len = q as usize;
+        if self.l0.is_some() {
+            let Some(challenges) = challenges else {
+                return Err(cudarc::driver::DriverError(
+                    cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+                ));
+            };
+            self.bus_from_rows(challenges)?;
+        } else {
+            self.bus_column()?;
+        }
+        self.halve_weights()
+    }
+
+    /// `L` from the rows' bus values: folded by `s₀` (the high variable) and
+    /// then `s₁`, in place, and its first quarter copied into `L`'s slab.
+    fn bus_from_rows(&mut self, challenges: &[u64; 6]) -> Result<()> {
+        let be = backend()?;
+        let q = (self.rows / 4) as u64;
+        let Some((values, table, limbs)) = self.l0.as_mut() else {
+            return Ok(());
+        };
+        self.stream.memcpy_htod(&challenges[..], limbs)?;
+        let t0 = crate::ktime::start(&self.stream);
+        let rounds: &[(usize, u64)] = if knobs::stage_fault() == 1 {
+            &[(0, 2 * q)]
+        } else {
+            &[(0, 2 * q), (1, q)]
+        };
+        for &(round, half) in rounds {
+            let one = 1u64;
+            let grid = half.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
+            let s = limbs.slice(round * 3..round * 3 + 3);
             unsafe {
                 self.stream
-                    .launch_builder(&be.zc_fold2)
-                    .arg(factors)
-                    .arg(&q)
-                    .arg(&width)
-                    .arg(&self.scratch)
-                    .arg(&mut self.folded)
-                    .arg(&self.source.stride)
+                    .launch_builder(&be.sumcheck_fold_ext3)
+                    .arg(&mut *table)
+                    .arg(&half)
+                    .arg(&one)
+                    .arg(&s)
                     .launch(LaunchConfig {
                         grid_dim: (grid, 1, 1),
                         block_dim: (BLOCK_DIM, 1, 1),
                         shared_mem_bytes: 0,
                     })?;
             }
-            self.tock("zc.fold2", t0, width * q * 56, width * q * 4);
         }
-        self.len = q as usize;
-        self.bus_column()?;
-        self.halve_weights()
+        let width = self.width;
+        let qs = q as usize;
+        let mut l = self.folded.slice_mut(width * qs * 3..(width + 1) * qs * 3);
+        self.stream.memcpy_dtod(&values.slice(0..qs * 3), &mut l)?;
+        crate::ktime::end(
+            &self.stream,
+            t0,
+            "zc.bus_rows",
+            self.depth,
+            q * 4 * 24 * 2,
+            q * 4,
+        );
+        Ok(())
+    }
+
+    /// Whether this session leaves the factors no round reads unfolded
+    /// ([`knobs::bus_only_at_end`], read when it was made), so
+    /// [`bound_unread`](Self::bound_unread) owes their cells.
+    pub fn skips_unread(&self) -> bool {
+        self.needed.as_ref().is_some_and(|u| !u.unread.is_empty())
+    }
+
+    /// Every bound challenge at once for the factors no round reads
+    /// ([`knobs::bus_only_at_end`]): `e` is the `eq` table of the bound
+    /// challenges (three u64 a cell, the first bound in the high bit), and the
+    /// result each such factor's cells over the cube left — `(slot, limbs)`.
+    pub fn bound_unread(&self, e: &[u64]) -> Result<Vec<(usize, Vec<u64>)>> {
+        let Some(Unread {
+            unread_dev, unread, ..
+        }) = self.needed.as_ref()
+        else {
+            return Ok(Vec::new());
+        };
+        if unread.is_empty() {
+            return Ok(Vec::new());
+        }
+        let be = backend()?;
+        let rows = self.rows as u64;
+        let cells = self.len as u64;
+        assert_eq!(
+            (e.len() / 3) as u64 * cells,
+            rows,
+            "the table spans the bound variables"
+        );
+        let nsel = unread.len();
+        let threads: u64 = if nsel >= 32 { 4096 } else { 16384 }.max(cells);
+        let e_dev = htod_or_trim(&self.stream, e)?;
+        // SAFETY: pass one writes every partial, pass two every cell.
+        let mut partials =
+            unsafe { alloc_or_trim::<u64>(&self.stream, nsel * threads as usize * 3) }?;
+        let mut out = unsafe { alloc_or_trim::<u64>(&self.stream, nsel * cells as usize * 3) }?;
+        let factors = self.source.ptrs;
+        let t0 = crate::ktime::start(&self.stream);
+        unsafe {
+            self.stream
+                .launch_builder(&be.zc_bind_all)
+                .arg(factors)
+                .arg(unread_dev)
+                .arg(&rows)
+                .arg(&cells)
+                .arg(&e_dev)
+                .arg(&self.source.stride)
+                .arg(&mut partials)
+                .launch(LaunchConfig {
+                    grid_dim: ((threads / u64::from(BLOCK_DIM)) as u32, nsel as u32, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            let nsel_arg = nsel as u64;
+            let total = nsel as u64 * cells;
+            self.stream
+                .launch_builder(&be.zc_bind_all_sum)
+                .arg(&partials)
+                .arg(&nsel_arg)
+                .arg(&cells)
+                .arg(&threads)
+                .arg(&mut out)
+                .launch(LaunchConfig {
+                    grid_dim: (
+                        total
+                            .div_ceil(u64::from(BLOCK_DIM))
+                            .clamp(1, MAX_GRID as u64) as u32,
+                        1,
+                        1,
+                    ),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        crate::ktime::end(
+            &self.stream,
+            t0,
+            "zc.bound_unread",
+            self.depth,
+            nsel as u64 * rows * 8,
+            nsel as u64 * rows,
+        );
+        let flat = crate::readback::clone_dtoh(&self.stream, &out)?;
+        self.stream.synchronize()?;
+        let span = cells as usize * 3;
+        let skip = usize::from(knobs::stage_fault() == 3);
+        Ok(unread
+            .iter()
+            .zip(flat.chunks_exact(span))
+            .skip(skip)
+            .map(|(&slot, limbs)| (slot as usize, limbs.to_vec()))
+            .collect())
     }
 
     /// `L` over the folded factors, into its slab.
@@ -665,6 +1061,11 @@ impl<'f> FusedZerocheck<'f> {
     /// Both weights to the next round's `eq(·_{>j+1})`: their halves added. The
     /// weights are always half the folded cube after this.
     pub fn halve_weights(&mut self) -> Result<()> {
+        self.halvings += 1;
+        // The levels were built once ([`knobs::eq_levels`]): nothing to launch.
+        if self.levels.is_some() {
+            return Ok(());
+        }
         let be = backend()?;
         let half = (self.len / 2) as u64;
         let grid = half.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
@@ -741,6 +1142,26 @@ impl<'f> FusedZerocheck<'f> {
         let l = self
             .folded
             .slice(self.width * q * 3..(self.width + 1) * q * 3);
+        // The weights this round reads: today's tables, halved in place, or the
+        // level the halvings so far stand at — level `k − 1` after `k`, at
+        // `1 + 2^J − 2^{J−k+1}`, `2^{J−k}` cells (`gkr_eq_levels_ext3`'s layout).
+        let (eq_r, eq_rho) = match self.levels.as_ref() {
+            Some((r_levels, rho_levels, j)) => {
+                let (j, mut k) = (*j as usize, self.halvings);
+                if knobs::stage_fault() == 2 && k > 1 {
+                    k -= 1;
+                }
+                if k == 0 || k > j || ((1usize << (j - k)) as u64) < half {
+                    return Err(cudarc::driver::DriverError(
+                        cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+                    ));
+                }
+                let at = 1 + (1usize << j) - (1usize << (j - k + 1));
+                let span = at * 3..(at + (1usize << (j - k))) * 3;
+                (r_levels.slice(span.clone()), rho_levels.slice(span))
+            }
+            None => (self.eq_r.slice(..), self.eq_rho.slice(..)),
+        };
         for _ in 0..crate::ktime::times("zc.rounds") {
             let t0 = self.tick();
             unsafe {
@@ -754,8 +1175,8 @@ impl<'f> FusedZerocheck<'f> {
                     .arg(&self.betas)
                     .arg(&self.node_ints)
                     .arg(&num_a)
-                    .arg(&self.eq_r)
-                    .arg(&self.eq_rho)
+                    .arg(&eq_r)
+                    .arg(&eq_rho)
                     .arg(&l)
                     .arg(&mut self.slots)
                     .arg(&mut self.partials)
@@ -785,15 +1206,19 @@ impl<'f> FusedZerocheck<'f> {
         let half = (self.len / 2) as u64;
         self.stream
             .memcpy_htod(&s[..], &mut self.scratch.slice_mut(0..3))?;
-        // The factors and `L`, through the one pointer table of `width + 1`.
-        let width = self.width as u64 + 1;
+        // The factors and `L`, through the one pointer table of `width + 1` — or,
+        // with [`knobs::bus_only_at_end`], of the factors a round reads and `L`.
+        let (table, width) = match self.needed.as_mut() {
+            Some(u) => (&mut u.fold_table, u.count + 1),
+            None => (&mut self.fold_ptrs, self.width as u64 + 1),
+        };
         let total = width * half;
         let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
-        let t0 = self.tick();
+        let t0 = crate::ktime::start(&self.stream);
         unsafe {
             self.stream
                 .launch_builder(&be.sumcheck_fold_ext3)
-                .arg(&mut self.fold_ptrs)
+                .arg(table)
                 .arg(&half)
                 .arg(&width)
                 .arg(&self.scratch)
