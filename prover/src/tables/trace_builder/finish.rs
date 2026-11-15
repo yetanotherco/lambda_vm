@@ -2364,6 +2364,9 @@ impl<'a> FinishPlan<'a> {
         // none is built at 8 bytes a cell first ([`crate::tables::gpack_seeds`];
         // `LAMBDA_VM_FINISH_SEED_WIDTHS=0` rolls it back). The packed bytes are
         // the same.
+        if crate::tables::gpack_seeds::cpu_seed_base() {
+            build_stamps::mark("p5 cpu seed base");
+        }
         if crate::tables::gpack_seeds::seed_widths_on() {
             let seeded = crate::tables::gpack_seeds::seed_finish_widths();
             build_stamps::mark(&format!("p5 seeded {seeded} kinds"));
