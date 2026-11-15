@@ -3141,7 +3141,9 @@ fn the_prover_refuses_a_partition_over_the_group_maximum() {
 /// AIRs, so a wider AIR or a larger maximum fails here before it moves the
 /// figure. It holds under both register formats: the in-row one's AIRs (the
 /// CPU's 24 interactions, the residual table's 6, REGISTER's 3, the REG
-/// bus's 4-value tokens) move neither constant.
+/// bus's 4-value tokens) move neither constant. The census holds the fused
+/// memory format's MEM_LOAD and MEM_STORE AIRs too (23 and 24 interactions,
+/// 9-value messages), so a wider fused table fails here as well.
 #[test]
 fn block_wide_logup_at_the_group_maximum_is_pinned() {
     let elf = asm_elf_bytes("all_instructions_64");
@@ -3181,11 +3183,12 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
     .expect("pages");
     let inputs =
         crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("the AIR inputs");
-    // The AIR set the block verifier builds: the pinned format's table forms,
-    // then the same with the register format before it.
+    // The AIR set the block verifier builds: the pinned format's table forms
+    // with the fused memory format's two tables, then the same with the
+    // register format before it.
     let pinned = BlockFormat::pinned();
     let census = |registers| {
-        crate::block_airs(
+        let mut airs = crate::block_airs(
             &program,
             &opts,
             &pages,
@@ -3194,15 +3197,22 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
             pinned.keccak_rnd,
             pinned.memw_aligned,
             registers,
-        )
-        .air_refs()
-        .iter()
-        .map(|air| {
-            let bus = air.bus_interactions();
-            let len = bus.iter().map(|b| b.num_bus_elements()).max().unwrap_or(0);
-            (bus.len(), len)
-        })
-        .fold((0, 0), |(f, l), (f2, l2)| (f.max(f2), l.max(l2)))
+        );
+        airs.with_fused_memory(&opts, [1, 1]);
+        let refs = airs.air_refs();
+        for table in ["MEM_LOAD[0]", "MEM_STORE[0]"] {
+            assert!(
+                refs.iter().any(|air| air.name() == table),
+                "the census holds {table}"
+            );
+        }
+        refs.iter()
+            .map(|air| {
+                let bus = air.bus_interactions();
+                let len = bus.iter().map(|b| b.num_bus_elements()).max().unwrap_or(0);
+                (bus.len(), len)
+            })
+            .fold((0, 0), |(f, l), (f2, l2)| (f.max(f2), l.max(l2)))
     };
     let (fractions, len) = census(pinned.registers);
     assert_eq!(
