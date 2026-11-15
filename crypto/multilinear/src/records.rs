@@ -722,6 +722,13 @@ pub trait TableRecords: Send + Sync + std::fmt::Debug {
         Vec::new()
     }
 
+    /// A MEMW_A chunk held as what the card derives its rows from
+    /// ([`AlignedRefs`]); `None` (the default) for rows and every other
+    /// family. [`Self::fill`] still gives the rows, derived on the host.
+    fn aligned_refs(&self) -> Option<AlignedRefs<'_>> {
+        None
+    }
+
     /// The records [`digest_of`] reads, when they are not [`Self::fill`]'s:
     /// a CPU table whose side records the card derives from the executor's
     /// history digests the side records derived (its host reference's), so
@@ -729,6 +736,99 @@ pub trait TableRecords: Send + Sync + std::fmt::Debug {
     /// [`Self::fill`] and [`Self::bytes`].
     fn digest_fill(&self) -> Option<RecordsFill<'_>> {
         None
+    }
+}
+
+/// [`AlignedRef::cycle`]'s mark of a row an ECALL cycle made: this bit and
+/// the cycle; its [`AlignedRef::at`] indexes its window's whole rows
+/// ([`AlignedRefPart::whole`]). A cycle stays below 2^30.
+pub const ALIGNED_ECALL: u32 = 1 << 31;
+
+/// [`MemoryAccess::mixed`] of an access whose eight bytes share one old
+/// timestamp.
+pub const NO_MIXED: u32 = u32::MAX;
+
+/// One MEMW_A row as the card derives it from the executor's history
+/// instead of reading it: a load's or store's cycle and the index of its
+/// access in its window's [`MemoryAccess`]es; or [`ALIGNED_ECALL`] and the
+/// cycle of an ECALL's row, and its index in the window's whole rows.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AlignedRef {
+    pub cycle: u32,
+    pub at: u32,
+}
+
+/// A load or store as the executor's history writes it (its `MemAccess`,
+/// field for field): the access's address, the eight bytes from it before
+/// the cycle, their shared old timestamp, and [`NO_MIXED`] or the index of
+/// their eight old timestamps in the window's mixed list.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryAccess {
+    pub addr: u64,
+    pub old: u64,
+    pub ts: u32,
+    pub mixed: u32,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<AlignedRef>() == 8);
+    assert!(std::mem::size_of::<MemoryAccess>() == 24);
+    assert!(std::mem::offset_of!(MemoryAccess, ts) == 16);
+    assert!(std::mem::offset_of!(MemoryAccess, mixed) == 20);
+};
+
+/// A MEMW_A chunk's rows from one window, as the card derives them
+/// ([`AlignedRefs`]): `refs` in order; a regular row's access at
+/// `accesses[at − access_base]` (the window's accesses from `access_base`),
+/// its eight old timestamps, when they differ, at `mixed[access.mixed]` (the
+/// window's whole mixed list); an ECALL's row at `whole[at − whole_base]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlignedRefPart<'a> {
+    pub refs: &'a [AlignedRef],
+    pub accesses: &'a [MemoryAccess],
+    pub access_base: u32,
+    pub mixed: &'a [[u32; 8]],
+    pub whole: &'a [AlignedRow],
+    pub whole_base: u32,
+}
+
+impl AlignedRefPart<'_> {
+    /// The bytes that cross the bus.
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of_val(self.refs)
+            + std::mem::size_of_val(self.accesses)
+            + std::mem::size_of_val(self.mixed)
+            + std::mem::size_of_val(self.whole)
+    }
+}
+
+/// A MEMW_A chunk held as what the card derives its rows from
+/// ([`TableRecords::aligned_refs`]): its parts in order, the program's DECODE
+/// rows, and the run's form (`limbs`: the step's limbs, else the old
+/// timestamp). A regular row's log is read from the CPU logs the card holds
+/// (`math_cuda::card_rows`); [`TableRecords::fill`] still gives the rows,
+/// derived on the host (the prover's `history_rows`).
+pub struct AlignedRefs<'a> {
+    pub parts: Vec<AlignedRefPart<'a>>,
+    pub decode: &'a DecodeRecords,
+    pub limbs: bool,
+}
+
+impl AlignedRefs<'_> {
+    /// The bytes that cross the bus.
+    pub fn bytes(&self) -> usize {
+        self.parts.iter().map(AlignedRefPart::bytes).sum()
+    }
+
+    /// The rows.
+    pub fn len(&self) -> usize {
+        self.parts.iter().map(|p| p.refs.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -784,6 +884,11 @@ impl Records {
     /// [`TableRecords::register_words`].
     pub fn register_words(&self) -> Option<RegisterWords<'_>> {
         self.0.register_words()
+    }
+
+    /// [`TableRecords::aligned_refs`].
+    pub fn aligned_refs(&self) -> Option<AlignedRefs<'_>> {
+        self.0.aligned_refs()
     }
 
     /// [`TableRecords::decode_register_rows`].
