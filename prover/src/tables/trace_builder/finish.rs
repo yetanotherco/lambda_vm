@@ -2360,10 +2360,11 @@ impl<'a> FinishPlan<'a> {
         };
         let tails = skip.tails;
         let (direct_page, direct_bitwise) = (finish_direct().page, finish_direct().bitwise);
-        // `LAMBDA_VM_FINISH_SEED_WIDTHS=1`: every packed kind's width hint
-        // seeded before its first table, so none is built at 8 bytes a cell
-        // first ([`crate::tables::gpack_seeds`]). The packed bytes are the same.
-        if std::env::var("LAMBDA_VM_FINISH_SEED_WIDTHS").is_ok_and(|v| v.trim() == "1") {
+        // Every packed kind's width hint seeded before its first table, so
+        // none is built at 8 bytes a cell first ([`crate::tables::gpack_seeds`];
+        // `LAMBDA_VM_FINISH_SEED_WIDTHS=0` rolls it back). The packed bytes are
+        // the same.
+        if crate::tables::gpack_seeds::seed_widths_on() {
             let seeded = crate::tables::gpack_seeds::seed_finish_widths();
             build_stamps::mark(&format!("p5 seeded {seeded} kinds"));
         }
