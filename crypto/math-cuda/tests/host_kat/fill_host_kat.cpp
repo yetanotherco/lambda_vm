@@ -28,7 +28,10 @@
 //   2. CPU: 29 logs over 24 decode entries in three runs (every op class the
 //      fill branches on, each entry in turn), then padding rows, every word;
 //      and a log whose pc no run holds, counted as missing with its row left
-//      zero.
+//      zero. Both register formats: without side records (37 columns), and
+//      with one a log (the in-row format's five more columns, 37 to 41, slot
+//      words random, zero and 2^32 - 1; the padding rows' zero), each with the
+//      absent pc's row zero in every column.
 //   3. KECCAK_RND: a table cut into its first op, holding every round of the
 //      second and zero rows after it, and one cut at both ends: every row's
 //      fifteen column groups, by digest; the same through the entry that reads
@@ -202,7 +205,7 @@ void test_cpu() {
     unsigned long long missing = 0;
     each_row(height, 0, [&] {
         fill_cpu_from_logs(KAT_CPU_LOGS, KAT_CPU_N, KAT_CPU_ENTRIES,
-                           KAT_CPU_RUNS, KAT_CPU_RUNS_N, height, out.data(), &missing);
+                           KAT_CPU_RUNS, KAT_CPU_RUNS_N, height, out.data(), &missing, nullptr);
     });
     CHECK(missing == 0, "CPU: %llu logs missing their decode row", missing);
     check_words("CPU", out, KAT_CPU_WORDS, height, cols);
@@ -217,10 +220,42 @@ void test_cpu() {
     missing = 0;
     each_row(height, 0, [&] {
         fill_cpu_from_logs(logs.data(), KAT_CPU_N, KAT_CPU_ENTRIES,
-                           KAT_CPU_RUNS, KAT_CPU_RUNS_N, height, refused.data(), &missing);
+                           KAT_CPU_RUNS, KAT_CPU_RUNS_N, height, refused.data(), &missing,
+                           nullptr);
     });
     CHECK(missing == 1, "CPU: an absent pc counted %llu times, not once", missing);
     check_words("CPU with an absent pc", refused, want.data(), height, cols);
+}
+
+// The in-row register format's CPU table: the same logs, a side record each,
+// five more columns.
+void test_cpu_in_row() {
+    const uint64_t height = KAT_CPU_HEIGHT;
+    const uint64_t cols = cpu_cols::NUM_COLUMNS_IN_ROW;
+    auto out = table(height * cols);
+    unsigned long long missing = 0;
+    each_row(height, 0, [&] {
+        fill_cpu_from_logs(KAT_CPU_LOGS, KAT_CPU_N, KAT_CPU_ENTRIES, KAT_CPU_RUNS,
+                           KAT_CPU_RUNS_N, height, out.data(), &missing, KAT_CPU_SIDES);
+    });
+    CHECK(missing == 0, "CPU in-row: %llu logs missing their decode row", missing);
+    check_words("CPU in-row", out, KAT_CPU_IN_ROW_WORDS, height, cols);
+
+    // A log whose pc no run holds: counted, its row zero in every column (its
+    // side's too), every other row as before.
+    std::vector<LogC> logs(KAT_CPU_LOGS, KAT_CPU_LOGS + KAT_CPU_N);
+    const uint64_t absent_row = 5;
+    logs[absent_row].current_pc = KAT_CPU_ABSENT_PC;
+    std::vector<uint64_t> want(KAT_CPU_IN_ROW_WORDS, KAT_CPU_IN_ROW_WORDS + height * cols);
+    for (uint64_t c = 0; c < cols; ++c) want[c * height + absent_row] = 0;
+    auto refused = table(height * cols);
+    missing = 0;
+    each_row(height, 0, [&] {
+        fill_cpu_from_logs(logs.data(), KAT_CPU_N, KAT_CPU_ENTRIES, KAT_CPU_RUNS,
+                           KAT_CPU_RUNS_N, height, refused.data(), &missing, KAT_CPU_SIDES);
+    });
+    CHECK(missing == 1, "CPU in-row: an absent pc counted %llu times, not once", missing);
+    check_words("CPU in-row with an absent pc", refused, want.data(), height, cols);
 }
 
 // Every KECCAK_RND case through `fill(case, out)`, one of the kernel's
@@ -289,6 +324,7 @@ int main() {
     test_shift();
     test_memw();
     test_cpu();
+    test_cpu_in_row();
     test_keccak_rnd();
     std::printf("fill host KAT: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
