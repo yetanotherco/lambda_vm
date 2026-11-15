@@ -377,7 +377,8 @@ pub(super) struct RefChunk {
 /// A run's refs cut into whole chunks of `rows` rows across its windows, as
 /// the hand-out cuts them: each chunk's parts its windows' ranges.
 pub(super) fn chunks(walked: &[Walked], rows: usize) -> Vec<RefChunk> {
-    let lists: Vec<(Arc<RefWindow>, Arc<Vec<AlignedRef>>, &[AlignedRow])> = walked
+    type Listed<'a> = (Arc<RefWindow>, Arc<Vec<AlignedRef>>, &'a [AlignedRow]);
+    let lists: Vec<Listed<'_>> = walked
         .iter()
         .map(|w| {
             let (window, refs) = ref_window(w);
