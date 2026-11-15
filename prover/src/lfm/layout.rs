@@ -62,6 +62,18 @@ pub mod select {
     pub const PREP_WIDTH: usize = 8;
 }
 
+/// `LEAN_MUX` — a one-output select (`Instr::Mux`), a lean table of the
+/// W-LFM prover: one row an instruction.
+pub mod mux {
+    pub const BIT_ADDR: usize = 0;
+    pub const INL_ADDR: usize = 1;
+    pub const INR_ADDR: usize = 2;
+    pub const OUT_ADDR: usize = 3;
+    pub const MULT: usize = 4;
+    pub const IS_REAL: usize = 5;
+    pub const PREP_WIDTH: usize = 6;
+}
+
 /// `LFM_BITDEC` — canonical 64-bit decomposition. Per-bit pairs
 /// `(BIT_ADDR_i, MULT_i)` at `2 + 2i` / `3 + 2i`.
 pub mod bitdec {

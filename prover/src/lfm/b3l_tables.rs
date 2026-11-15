@@ -40,7 +40,9 @@ use super::b3l::B3lValues;
 use super::blake3_lean::{
     self as lean, HeadConstraints, RoundConstraints, TableHist, head, round, table,
 };
+use super::chips::mux::{MuxConstraints, cols as mux};
 use super::compiler::{ColumnGroup, LfmProgram};
+use super::executor::MuxRow;
 use super::layout::b3l as l;
 
 type F = GoldilocksField;
@@ -57,6 +59,11 @@ pub const MIN_CHUNK_LOG: u32 = lean::MIN_CHUNK_LOG;
 pub const ROUND_NAME: &str = "B3L_ROUND";
 pub const HEAD_NAME: &str = "B3L_HEAD";
 pub const TABLE_NAME: &str = "B3L_XOR";
+pub const MUX_NAME: &str = "LEAN_MUX";
+
+/// The largest `LEAN_MUX` chunk, in rows: the LFM chips' cut (`wlfm`'s
+/// `WLFM_CHUNK_LOG`).
+pub const MUX_CHUNK_LOG: u32 = 22;
 
 /// The lean tables' shape: the padded rows of every round chunk and every
 /// head chunk, in table order. Empty for a program with no compression, which
@@ -65,10 +72,13 @@ pub const TABLE_NAME: &str = "B3L_XOR";
 pub struct B3lShape {
     pub rounds: Vec<usize>,
     pub heads: Vec<usize>,
+    /// The `LEAN_MUX` chunks (one-output selects): only in a program with
+    /// compressions, after the byte table.
+    pub muxes: Vec<usize>,
 }
 
 impl B3lShape {
-    /// The shape of `compressions` compressions.
+    /// The shape of `compressions` compressions and no one-output select.
     pub fn of(compressions: usize) -> Self {
         if compressions == 0 {
             return Self::default();
@@ -76,25 +86,31 @@ impl B3lShape {
         Self {
             rounds: lean::chunk_rows(l::ROUNDS * compressions, CHUNK_LOG, MIN_CHUNK_LOG),
             heads: lean::chunk_rows(compressions, CHUNK_LOG, MIN_CHUNK_LOG),
+            muxes: Vec::new(),
         }
     }
 
     /// A program's.
     pub fn of_program(program: &LfmProgram) -> Self {
-        Self::of(program.groups.b3l.real_rows)
+        let mut shape = Self::of(program.groups.b3l.real_rows);
+        if !shape.is_empty() {
+            shape.muxes =
+                lean::chunk_rows(program.groups.mux.real_rows, MUX_CHUNK_LOG, MIN_CHUNK_LOG);
+        }
+        shape
     }
 
     pub fn is_empty(&self) -> bool {
         self.heads.is_empty()
     }
 
-    /// The tables this shape adds: the round chunks, the head chunks and the
-    /// byte table; none when empty.
+    /// The tables this shape adds: the round chunks, the head chunks, the
+    /// byte table and the mux chunks; none when empty.
     pub fn num_tables(&self) -> usize {
         if self.is_empty() {
             0
         } else {
-            self.rounds.len() + self.heads.len() + 1
+            self.rounds.len() + self.heads.len() + 1 + self.muxes.len()
         }
     }
 
@@ -108,6 +124,7 @@ impl B3lShape {
             .chain(&self.heads)
             .map(|rows| rows.trailing_zeros() as u8)
             .chain([table::ROWS.trailing_zeros() as u8])
+            .chain(self.muxes.iter().map(|rows| rows.trailing_zeros() as u8))
             .collect()
     }
 }
@@ -120,6 +137,7 @@ pub struct B3lAirs {
     rounds: Vec<LfmAir<RoundConstraints>>,
     heads: Vec<LfmAir<HeadConstraints>>,
     table: Option<LfmAir<EmptyConstraints>>,
+    muxes: Vec<LfmAir<MuxConstraints>>,
 }
 
 impl B3lAirs {
@@ -182,6 +200,21 @@ impl B3lAirs {
                     table::PREP_WIDTH,
                 )
             }),
+            muxes: shape
+                .muxes
+                .iter()
+                .map(|_| {
+                    build_lfm_air(
+                        mux::NUM_COLUMNS,
+                        super::chips::mux::bus_interactions(),
+                        options,
+                        mux_constraints(),
+                        MUX_NAME,
+                        zero,
+                        mux::PREP_WIDTH,
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -194,6 +227,7 @@ impl B3lAirs {
         if let Some(t) = &self.table {
             v.push(t);
         }
+        v.extend(self.muxes.iter().map(|a| a as DynLfmAir<'_>));
         v
     }
 
@@ -202,13 +236,19 @@ impl B3lAirs {
         &'a self,
         traces: &'a mut B3lTraces,
     ) -> Result<Vec<(DynLfmAir<'a>, &'a mut HeldTable)>, String> {
-        if traces.rounds.len() != self.rounds.len() || traces.heads.len() != self.heads.len() {
+        if traces.rounds.len() != self.rounds.len()
+            || traces.heads.len() != self.heads.len()
+            || traces.muxes.len() != self.muxes.len()
+        {
             return Err(format!(
-                "the lean traces are {} round and {} head chunks, the AIR set {} and {}",
+                "the lean traces are {} round, {} head and {} mux chunks, the AIR set {}, {} \
+                 and {}",
                 traces.rounds.len(),
                 traces.heads.len(),
+                traces.muxes.len(),
                 self.rounds.len(),
-                self.heads.len()
+                self.heads.len(),
+                self.muxes.len()
             ));
         }
         let Some(table_air) = &self.table else {
@@ -222,6 +262,9 @@ impl B3lAirs {
             v.push((air, t));
         }
         v.push((table_air, &mut traces.table));
+        for (air, t) in self.muxes.iter().zip(traces.muxes.iter_mut()) {
+            v.push((air, t));
+        }
         Ok(v)
     }
 }
@@ -483,6 +526,8 @@ pub struct B3lTraces {
     pub rounds: Vec<HeldTable>,
     pub heads: Vec<HeldTable>,
     pub table: HeldTable,
+    /// The `LEAN_MUX` chunks ([`build_mux_tables`]).
+    pub muxes: Vec<HeldTable>,
 }
 
 impl B3lTraces {
@@ -506,6 +551,7 @@ impl B3lTraces {
             .iter_mut()
             .chain(self.heads.iter_mut())
             .chain(core::iter::once(&mut self.table))
+            .chain(self.muxes.iter_mut())
     }
 }
 
@@ -580,6 +626,62 @@ pub fn b3l_prep_groups(program: &LfmProgram) -> Vec<ColumnGroup> {
         padded_rows: table::ROWS,
         data,
     });
+    let g = &program.groups.mux;
+    let mut start = 0usize;
+    for &rows in &shape.muxes {
+        out.push(chunk_of(&g.data, g.width, g.real_rows, start, rows));
+        start += rows;
+    }
+    out
+}
+
+/// The mux tables' constraint set: today's, or a test's mutant.
+fn mux_constraints() -> MuxConstraints {
+    #[cfg(test)]
+    if let Some(c) = test_mux::get() {
+        return c;
+    }
+    MuxConstraints::default()
+}
+
+/// A program's `LEAN_MUX` chunks from its mux records, in table order: each
+/// row the program's instruction group, then the bit and the arms' and the
+/// chosen word's lanes; the rows past the last instruction zero. Held wide.
+pub fn build_mux_tables(program: &LfmProgram, records: &[MuxRow]) -> Vec<HeldTable> {
+    let shape = B3lShape::of_program(program);
+    let g = &program.groups.mux;
+    assert_eq!(
+        records.len(),
+        g.real_rows,
+        "one LEAN_MUX record a mux row: the executor and the compiler disagree"
+    );
+    let width = mux::NUM_COLUMNS;
+    let mut start = 0usize;
+    let mut out = Vec::with_capacity(shape.muxes.len());
+    for &rows in &shape.muxes {
+        let mut data = zeroed_fe_vec(rows * width);
+        let fill = |(r, row): (usize, &mut [FE])| {
+            let k = start + r;
+            if k >= records.len() {
+                return;
+            }
+            row[..mux::PREP_WIDTH].copy_from_slice(&g.data[k * g.width..(k + 1) * g.width]);
+            let rec = &records[k];
+            row[mux::BIT] = rec.bit;
+            row[mux::INL0..mux::INL0 + 4].copy_from_slice(&rec.in_l);
+            row[mux::INR0..mux::INR0 + 4].copy_from_slice(&rec.in_r);
+            row[mux::OUT0..mux::OUT0 + 4].copy_from_slice(&rec.out);
+        };
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            data.par_chunks_mut(width).enumerate().for_each(fill);
+        }
+        #[cfg(not(feature = "parallel"))]
+        data.chunks_mut(width).enumerate().for_each(fill);
+        out.push(HeldTable::from_rows(data, width, B3lHold::Wide));
+        start += rows;
+    }
     out
 }
 
@@ -744,6 +846,7 @@ pub fn build_b3l_traces_held(
         rounds,
         heads,
         table,
+        muxes: Vec::new(),
     })
 }
 
@@ -992,6 +1095,7 @@ fn fill_narrow_direct<'p>(
         rounds,
         heads,
         table,
+        muxes: Vec::new(),
     })
 }
 
@@ -1133,6 +1237,7 @@ fn fill_records<'p>(
         rounds,
         heads,
         table,
+        muxes: Vec::new(),
     })
 }
 
@@ -1169,6 +1274,35 @@ pub(crate) mod test_hold {
 /// on this thread builds (prover and verifier alike): a mutation, to show a
 /// constraint group is what refuses its forgery. No production build reaches
 /// it.
+/// A TEST-ONLY override of the mux tables' constraint set (a mutant),
+/// per thread, restored when the guard drops.
+#[cfg(test)]
+pub(crate) mod test_mux {
+    use std::cell::Cell;
+
+    use super::MuxConstraints;
+
+    thread_local! {
+        static MUX: Cell<Option<MuxConstraints>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct Override(Option<MuxConstraints>);
+
+    impl Drop for Override {
+        fn drop(&mut self) {
+            MUX.with(|c| c.set(self.0));
+        }
+    }
+
+    pub(crate) fn set(constraints: MuxConstraints) -> Override {
+        Override(MUX.with(|c| c.replace(Some(constraints))))
+    }
+
+    pub(super) fn get() -> Option<MuxConstraints> {
+        MUX.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_drops {
     use std::cell::Cell;

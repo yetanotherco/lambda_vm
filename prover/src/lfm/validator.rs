@@ -287,6 +287,7 @@ fn check_multiplicities_with(program: &LfmProgram, dense: bool) -> Result<(), Lf
                 check(*out_l, *mult_l)?;
                 check(*out_r, *mult_r)?;
             }
+            Instr::Mux { out, mult, .. } => check(*out, *mult)?,
             Instr::BitDec { bits, halves, .. } => {
                 for (addr, mult) in bits {
                     check(*addr, *mult)?;
@@ -425,6 +426,7 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
     chip_real("LFM_HINT", &g.hint, counts.hint)?;
     chip_real("LFM_PUBLIC", &g.public, counts.public)?;
     chip_real("B3L_HEAD", &g.b3l, counts.b3l)?;
+    chip_real("LEAN_MUX", &g.mux, counts.mux)?;
 
     // Selector one-hot / is_real flags on real rows.
     one_hot(
@@ -460,6 +462,7 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
     flag_is_one(&g.select, "LFM_SELECT", layout::select::IS_REAL)?;
     flag_is_one(&g.bitdec, "LFM_BITDEC", layout::bitdec::IS_REAL)?;
     flag_is_one(&g.public, "LFM_PUBLIC", layout::public::IS_REAL)?;
+    flag_is_one(&g.mux, "LEAN_MUX", layout::mux::IS_REAL)?;
     check_b3l_rows(&g.b3l)?;
 
     // Padding: everything beyond the real rows is zero.
@@ -476,6 +479,7 @@ fn check_groups(program: &LfmProgram) -> Result<(), LfmViolation> {
         ("LFM_HINT", &g.hint),
         ("LFM_PUBLIC", &g.public),
         ("B3L_HEAD", &g.b3l),
+        ("LEAN_MUX", &g.mux),
     ] {
         for row in group.real_rows..group.padded_rows {
             for col in 0..group.width {
@@ -507,7 +511,7 @@ const MULT_HARD_CAP: u64 = 1 << 32;
 /// upper bound (safe), under-counting would reject honest programs, so where
 /// two receivers are mutually exclusive the count rounds up.
 fn mult_bound(g: &LfmColumnGroups, hash16: bool) -> u64 {
-    let receives_per_row: [(&ColumnGroup, u64); 12] = [
+    let receives_per_row: [(&ColumnGroup, u64); 13] = [
         (&g.const_, 0),                        // reads nothing
         (&g.balu, 3),                          // A, B, C
         (&g.xalu, 3),                          // A, B, C
@@ -526,6 +530,7 @@ fn mult_bound(g: &LfmColumnGroups, hash16: bool) -> u64 {
             &g.b3l,
             (layout::b3l::DIGEST_WORDS + layout::b3l::LANE_WORDS) as u64,
         ), // h | the block
+        (&g.mux, 3),                           // BIT, IN_L, IN_R
     ];
     let reads = receives_per_row.iter().fold(0u64, |acc, (group, per_row)| {
         acc.saturating_add((group.real_rows as u64).saturating_mul(*per_row))
@@ -554,6 +559,7 @@ fn mult_columns(
             &g.select,
             vec![select::MULT_L, select::MULT_R],
         ),
+        ("LEAN_MUX", &g.mux, vec![layout::mux::MULT]),
         (
             "LFM_BITDEC",
             &g.bitdec,
@@ -727,6 +733,7 @@ struct PartitionCounts {
     hint: usize,
     public: usize,
     b3l: usize,
+    mux: usize,
 }
 
 fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
@@ -743,6 +750,7 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
         hint: 0,
         public: 0,
         b3l: 0,
+        mux: 0,
     };
     for i in instrs {
         match i {
@@ -755,6 +763,7 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
             Instr::KeccakF(_) => c.keccak += 1,
             Instr::Blake3(_) => c.blake3 += 1,
             Instr::B3l(_) => c.b3l += 1,
+            Instr::Mux { .. } => c.mux += 1,
             Instr::Pack { .. } | Instr::Unpack { .. } => c.lanes += 1,
             Instr::Hint { .. } | Instr::HintOn { .. } => c.hint += 1,
             Instr::Public { .. } => c.public += 1,
