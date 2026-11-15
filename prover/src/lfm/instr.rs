@@ -322,6 +322,17 @@ pub enum Instr {
         mult_l: u64,
         mult_r: u64,
     },
+    /// A one-output select: `out = bit ? in_r : in_l`. Only the compiler makes
+    /// it, from a [`Self::Select`] one of whose outputs nothing reads, in a
+    /// program whose lean tables prove it (`LfmBuilder::with_b3_lean`): the
+    /// W-LFM prover's `LEAN_MUX` table, not a fixed chip.
+    Mux {
+        bit: Addr,
+        out: Addr,
+        in_l: Addr,
+        in_r: Addr,
+        mult: u64,
+    },
     BitDec {
         input: Addr,
         bits: Vec<(Addr, u64)>,
@@ -446,6 +457,7 @@ impl Instr {
                 out.push(*out_l);
                 out.push(*out_r);
             }
+            Instr::Mux { out: o, .. } => out.push(*o),
             Instr::BitDec { bits, halves, .. } => {
                 out.extend(bits.iter().map(|(a, _)| *a));
                 out.extend(halves.iter().flat_map(|hs| hs.iter().map(|(a, _)| *a)));
@@ -488,6 +500,9 @@ impl Instr {
                 }
             }
             Instr::Select {
+                bit, in_l, in_r, ..
+            }
+            | Instr::Mux {
                 bit, in_l, in_r, ..
             } => {
                 out.push(*bit);

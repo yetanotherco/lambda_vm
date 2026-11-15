@@ -865,7 +865,45 @@ impl LfmBuilder {
         self.instrs.push(Instr::Public { addr: c.0, index });
     }
 
-    pub fn finish(self) -> LfmProgramSource {
+    pub fn finish(mut self) -> LfmProgramSource {
+        // A lean program's selects of which one output nothing reads become
+        // one-output selects (`Instr::Mux`, the lean `LEAN_MUX` table): the
+        // cap's and a slot's muxes keep one arm of each pair. Only in a
+        // program with lean compressions, whose lean tables carry it.
+        if self.b3_lean() && self.instrs.iter().any(|i| matches!(i, Instr::B3l(_))) {
+            let reads = &self.read_counts;
+            let unread = |a: Addr| reads.get(a.0 as usize).is_none_or(|&n| n == 0);
+            for instr in &mut self.instrs {
+                if let Instr::Select {
+                    bit,
+                    out_l,
+                    out_r,
+                    in_l,
+                    in_r,
+                    ..
+                } = *instr
+                {
+                    *instr = match (unread(out_l), unread(out_r)) {
+                        (false, true) => Instr::Mux {
+                            bit,
+                            out: out_l,
+                            in_l,
+                            in_r,
+                            mult: 0,
+                        },
+                        // `out_r = bit ? in_l : in_r`: the same mux, arms swapped.
+                        (true, false) => Instr::Mux {
+                            bit,
+                            out: out_r,
+                            in_l: in_r,
+                            in_r: in_l,
+                            mult: 0,
+                        },
+                        _ => continue,
+                    };
+                }
+            }
+        }
         LfmProgramSource {
             instrs: self.instrs,
             num_addrs: self.next_addr,

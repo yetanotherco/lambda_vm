@@ -236,6 +236,7 @@ fn kind(instr: &Instr) -> &'static str {
         },
         Instr::ExtAlu { .. } => "XALU",
         Instr::Select { .. } => "SELECT",
+        Instr::Mux { .. } => "MUX",
         Instr::BitDec { .. } => "BITDEC",
         Instr::Hash { .. } => "HASH",
         Instr::Hash16(_) => "HASH16",

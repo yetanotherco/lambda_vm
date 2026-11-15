@@ -331,8 +331,20 @@ pub(crate) fn lfm_fill_executed_under(
     let t = Instant::now();
     let traces = build_traces_with_merge(program, &records, hasher, plan);
     let chips_secs = t.elapsed().as_secs_f64();
-    let b3l = super::b3l_tables::build_b3l_traces(program, &b3l_records);
+    let mut b3l = super::b3l_tables::build_b3l_traces(program, &b3l_records);
     drop(b3l_records);
+    // The one-output selects ride the lean tables (only a program with
+    // compressions has them).
+    let mux_records = core::mem::take(&mut records.mux);
+    if let Some(lean) = b3l.as_mut() {
+        lean.muxes = super::b3l_tables::build_mux_tables(program, &mux_records);
+    } else {
+        assert!(
+            mux_records.is_empty(),
+            "one-output selects in a program with no lean compression"
+        );
+    }
+    drop(mux_records);
     let fill_secs = t.elapsed().as_secs_f64();
     LAST_FILL_SPLIT.with(|c| c.set(Some((chips_secs, fill_secs - chips_secs))));
     // Same reason, larger: the records are what the fill consumes, and they are

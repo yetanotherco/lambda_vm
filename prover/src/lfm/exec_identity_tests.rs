@@ -130,6 +130,7 @@ pub(super) fn assert_executions_identical(
     assert_rows_identical(case, "LFM_PUBLIC", &ra.public, &rb.public);
     assert_rows_identical(case, "LFM_HASH16", &ra.hash16, &rb.hash16);
     assert_rows_identical(case, "B3L_HEAD", &ra.b3l, &rb.b3l);
+    assert_rows_identical(case, "LEAN_MUX", &ra.mux, &rb.mux);
     assert_rows_identical(case, "public_words", &a.public_words, &b.public_words);
 }
 
@@ -1038,4 +1039,61 @@ fn public_words_short_of_the_programs_rows_are_refused() {
         public_rows_fit(&words, words.capacity() + 1),
         Err(LfmExecError::Internal(_))
     ));
+}
+
+/// One-output selects (a lean BLAKE3 program's muxes) run in levels exactly
+/// as the serial reference runs them: memory, every record vector, each
+/// chip's rows.
+#[test]
+fn lean_muxes_run_in_levels_identically() {
+    use super::builder::{B3Block, B3Cv, Cell, LfmBuilder};
+    use super::edsl::WrapHash;
+    use crate::tables::types::FE;
+    let mut b = LfmBuilder::new()
+        .with_wrap_hash(WrapHash::Blake3)
+        .with_b3_lean(true);
+    let x = b.felt_const(FE::from(0b1011_0110u64));
+    let bits = b.bit_dec(x, 8);
+    let mut publics = Vec::new();
+    // Eight compressions in one level, then in the next eight more beside
+    // eight muxes of the first eight's digests: the muxes run inside a forked
+    // level.
+    for (i, bit) in bits.iter().enumerate() {
+        let w: Vec<Cell> = (0..4u64)
+            .map(|k| {
+                b.digest_const([FE::from(10 * i as u64 + k + 1); 4])
+                    .as_cell()
+            })
+            .collect();
+        let d = b.b3_compress(B3Cv::Iv, B3Block::Lanes([w[0], w[1], w[2], w[3]]), 64, 11);
+        let again = b.b3_compress(
+            B3Cv::Words(d),
+            B3Block::Lanes([w[0], w[1], w[2], w[3]]),
+            64,
+            2,
+        );
+        let (chosen, _) = b.select(*bit, d[0], d[1]);
+        publics.push(chosen);
+        publics.push(again[0]);
+    }
+    for c in &publics {
+        b.public(*c);
+    }
+    let program = super::compiler::compile(b.finish());
+    super::validator::validate(&program).expect("admissible");
+    let hasher = super::hash::HasherKind::Poseidon1W16;
+    let a = execute_scheduled(&program, &[], &hasher, Schedule::Serial).expect("serial");
+    let c = execute_scheduled(
+        &program,
+        &[],
+        &hasher,
+        Schedule::LevelParallel {
+            coalesce_below: GATE_COALESCE_BELOW,
+        },
+    )
+    .expect("levels");
+    assert_executions_identical("lean muxes", program.num_addrs, &a, &c);
+    assert!(c.split.parallel_levels > 0, "the candidate forked");
+    assert_eq!(a.records.mux.len(), 8);
+    assert!(a.records.select.is_empty(), "every select became a mux");
 }
