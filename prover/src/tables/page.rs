@@ -36,8 +36,10 @@ use math::polynomial::Polynomial;
 use stark::config::Commitment;
 use stark::leaf_layout::LeafLayout;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::narrow::NarrowWriter;
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
+use stark::table::Table;
 use stark::trace::TraceTable;
 
 use super::gpack::{TraceForm, WidthHint, generate_main};
@@ -380,8 +382,185 @@ pub fn generate_page_trace_from_dense_as(
         debug_assert_eq!(page.len(), page_size, "dense page slice must span the page");
     }
     generate_main!(form, &WIDTHS, page_size, cols::NUM_COLUMNS, |table| {
-        fill_page(table, config, final_page, exclude_touched)
+        PageFill::fill(table, config, final_page, exclude_touched)
     })
+}
+
+/// Whether a PAGE table written packed is filled a column at a time
+/// ([`fill_page_columns`]): on unless `LAMBDA_VM_FINISH_PAGE_COLUMNS=0`, read
+/// once a process. Either way the packed bytes are the same.
+fn page_columns_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        page_columns_from(
+            std::env::var("LAMBDA_VM_FINISH_PAGE_COLUMNS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`page_columns_on`]'s reading of `LAMBDA_VM_FINISH_PAGE_COLUMNS`: unset or
+/// any word but `0` fills by columns; `0` is the rollback to [`fill_page`].
+fn page_columns_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+/// How [`generate_main!`]'s writer is filled with a PAGE table: the 64-bit
+/// table a cell at a time ([`fill_page`]), the packed writer a column at a
+/// time ([`fill_page_columns`]) unless that is turned off.
+trait PageFill {
+    fn fill(&mut self, config: &PageConfig, final_page: Option<&[(u8, u64)]>, exclude: bool);
+}
+
+impl PageFill for Table<GoldilocksField> {
+    fn fill(&mut self, config: &PageConfig, final_page: Option<&[(u8, u64)]>, exclude: bool) {
+        fill_page(self, config, final_page, exclude);
+    }
+}
+
+impl PageFill for NarrowWriter {
+    fn fill(&mut self, config: &PageConfig, final_page: Option<&[(u8, u64)]>, exclude: bool) {
+        if page_columns_on() {
+            fill_page_columns(self, config, final_page, exclude);
+        } else {
+            fill_page(self, config, final_page, exclude);
+        }
+    }
+}
+
+/// Store `word`'s low `width` bytes as cell `row` of `cells`, a packed column
+/// at `width` bytes a cell (1, 2, 4 or 8), as [`NarrowWriter::set`] does.
+#[inline]
+fn put(cells: &mut [u8], width: usize, row: usize, word: u64) {
+    let at = row * width;
+    cells[at..at + width].copy_from_slice(&word.to_le_bytes()[..width]);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A mutant for the tests: [`fill_page_columns`] moves the first written
+    /// timestamp's low word one row down.
+    static MOVE_A_TIMESTAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`fill_page`] a column at a time, straight into `writer`'s packed columns:
+/// the same words, so the same packed bytes and the same widths. OFFSET is the
+/// row index, INIT the page's init bytes, and FINI and the timestamp's two
+/// words come from one pass over the final cells ([`page_final`]). Cells whose
+/// word is zero may be left as they are: the writer's cells start at zero.
+fn fill_page_columns(
+    writer: &mut NarrowWriter,
+    config: &PageConfig,
+    final_page: Option<&[(u8, u64)]>,
+    exclude_touched: bool,
+) {
+    const ROWS: usize = DEFAULT_PAGE_SIZE;
+    let init = config.init_values.as_deref().unwrap_or(&[]);
+    let init = &init[..init.len().min(ROWS)];
+    if writer.rows() != ROWS || final_page.is_some_and(|p| p.len() < ROWS) {
+        return fill_page(writer, config, final_page, exclude_touched);
+    }
+    // Each column's OR of the words written to it, for its width.
+    let mut seen = [0u64; cols::NUM_COLUMNS];
+    {
+        let mut columns = writer.columns_mut();
+        let [offset, init_col, fini, ts_lo, ts_hi] = columns.as_mut_slice() else {
+            drop(columns);
+            return fill_page(writer, config, final_page, exclude_touched);
+        };
+
+        // OFFSET: the row index; 0..ROWS ORs to ROWS - 1 (a power of two).
+        match offset.1 {
+            4 => {
+                for (row, cell) in offset.0.chunks_exact_mut(4).enumerate() {
+                    cell.copy_from_slice(&(row as u32).to_le_bytes());
+                }
+            }
+            width => (0..ROWS).for_each(|row| put(offset.0, width, row, row as u64)),
+        }
+        seen[cols::OFFSET] = (ROWS - 1) as u64;
+
+        // INIT: the init bytes, zero past them.
+        match init_col.1 {
+            1 => init_col.0[..init.len()].copy_from_slice(init),
+            width => {
+                for (row, &byte) in init.iter().enumerate() {
+                    put(init_col.0, width, row, u64::from(byte));
+                }
+            }
+        }
+        seen[cols::INIT] = init.iter().fold(0, |m, &b| m | u64::from(b));
+
+        match final_page {
+            // No runtime cells: every offset is `(init, 0)` ([`page_final`]'s
+            // untouched case), so FINI is INIT and the timestamp zero.
+            None => {
+                match fini.1 {
+                    1 => fini.0[..init.len()].copy_from_slice(init),
+                    width => {
+                        for (row, &byte) in init.iter().enumerate() {
+                            put(fini.0, width, row, u64::from(byte));
+                        }
+                    }
+                }
+                seen[cols::FINI] = seen[cols::INIT];
+            }
+            Some(page) => {
+                let (mut or_fini, mut or_lo, mut or_hi) = (0u64, 0u64, 0u64);
+                if (fini.1, ts_lo.1, ts_hi.1) == (1, 4, 1) {
+                    let lo_cells = ts_lo.0.chunks_exact_mut(4);
+                    for (row, ((&(value, timestamp), f), lo)) in
+                        page.iter().zip(fini.0.iter_mut()).zip(lo_cells).enumerate()
+                    {
+                        let init_byte = if row < init.len() { init[row] } else { 0 };
+                        let (fini_value, fini_ts) =
+                            page_final(init_byte, value, timestamp, exclude_touched);
+                        let (low, high) = (fini_ts & 0xFFFF_FFFF, fini_ts >> 32);
+                        *f = fini_value;
+                        lo.copy_from_slice(&(low as u32).to_le_bytes());
+                        ts_hi.0[row] = high as u8;
+                        or_fini |= u64::from(fini_value);
+                        or_lo |= low;
+                        or_hi |= high;
+                    }
+                } else {
+                    for (row, &(value, timestamp)) in page.iter().enumerate().take(ROWS) {
+                        let init_byte = if row < init.len() { init[row] } else { 0 };
+                        let (fini_value, fini_ts) =
+                            page_final(init_byte, value, timestamp, exclude_touched);
+                        let (low, high) = (fini_ts & 0xFFFF_FFFF, fini_ts >> 32);
+                        put(fini.0, fini.1, row, u64::from(fini_value));
+                        put(ts_lo.0, ts_lo.1, row, low);
+                        put(ts_hi.0, ts_hi.1, row, high);
+                        or_fini |= u64::from(fini_value);
+                        or_lo |= low;
+                        or_hi |= high;
+                    }
+                }
+                seen[cols::FINI] = or_fini;
+                seen[cols::TIMESTAMP_LO] = or_lo;
+                seen[cols::TIMESTAMP_HI] = or_hi;
+            }
+        }
+
+        #[cfg(test)]
+        if MOVE_A_TIMESTAMP.get() {
+            let width = ts_lo.1;
+            let first = ts_lo
+                .0
+                .chunks_exact(width)
+                .position(|c| c.iter().any(|&b| b != 0));
+            if let Some(row) = first.filter(|&row| row + 1 < ROWS) {
+                let at = row * width;
+                ts_lo.0.copy_within(at..at + width, at + width);
+                ts_lo.0[at..at + width].fill(0);
+            }
+        }
+    }
+    for (col, words) in seen.into_iter().enumerate() {
+        writer.note(col, words);
+    }
 }
 
 /// A PAGE table's rows: each offset, its init byte, and its final byte and
@@ -901,4 +1080,201 @@ pub fn page_base_for_address(addr: u64) -> u64 {
 /// Compute the offset within a page for a given byte address.
 pub fn offset_in_page(addr: u64) -> usize {
     (addr & (DEFAULT_PAGE_SIZE as u64 - 1)) as usize
+}
+
+#[cfg(test)]
+mod column_fill_tests {
+    //! [`fill_page_columns`] against [`fill_page`] on the same packed writer:
+    //! the same packed bytes and widths for every PAGE kind, at the widths a
+    //! block's hint holds and at widths that miss.
+
+    use super::*;
+
+    const ROWS: usize = DEFAULT_PAGE_SIZE;
+
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    /// About a third of the cells written (a value, a timestamp of at least 4
+    /// and below `ts_below`), the rest untouched at their init byte.
+    fn final_cells(config: &PageConfig, seed: u64, ts_below: u64) -> Vec<(u8, u64)> {
+        let mut seed = seed | 1;
+        (0..ROWS)
+            .map(|offset| {
+                let init = config
+                    .init_values
+                    .as_ref()
+                    .and_then(|v| v.get(offset).copied())
+                    .unwrap_or(0);
+                if next(&mut seed).is_multiple_of(3) {
+                    (next(&mut seed) as u8, 4 + next(&mut seed) % ts_below)
+                } else {
+                    (init, 0)
+                }
+            })
+            .collect()
+    }
+
+    fn configs() -> Vec<(&'static str, PageConfig)> {
+        let base = 7 * ROWS as u64;
+        let data: Vec<u8> = {
+            let mut seed = 0xDA7A_u64;
+            (0..5000).map(|_| next(&mut seed) as u8).collect()
+        };
+        vec![
+            ("zero-init", PageConfig::zero_init(base)),
+            ("image", PageConfig::with_data(base, data.clone())),
+            ("private input", PageConfig::with_private_input(base, data)),
+            // An image that fills the whole page.
+            (
+                "full image",
+                PageConfig::with_data(base, (0..ROWS).map(|i| (i * 7 + 3) as u8).collect()),
+            ),
+        ]
+    }
+
+    /// What the writer finishes as: the packed widths and bytes, or the widths
+    /// the trace needs when a word missed its column.
+    type Finished = Result<(Vec<u8>, Vec<u8>), Vec<u8>>;
+
+    fn finish(writer: NarrowWriter) -> (Vec<u8>, Finished) {
+        let needed = writer.needed_widths();
+        let finished = writer.finish().map(|narrow| {
+            let (_, widths, data) = narrow.into_parts();
+            (widths, data)
+        });
+        (needed, finished)
+    }
+
+    fn by_cells(
+        widths: &[u8],
+        config: &PageConfig,
+        cells: Option<&[(u8, u64)]>,
+        exclude: bool,
+    ) -> (Vec<u8>, Finished) {
+        let mut writer = NarrowWriter::new(ROWS, widths);
+        fill_page(&mut writer, config, cells, exclude);
+        finish(writer)
+    }
+
+    fn by_columns(
+        widths: &[u8],
+        config: &PageConfig,
+        cells: Option<&[(u8, u64)]>,
+        exclude: bool,
+    ) -> (Vec<u8>, Finished) {
+        let mut writer = NarrowWriter::new(ROWS, widths);
+        fill_page_columns(&mut writer, config, cells, exclude);
+        finish(writer)
+    }
+
+    /// ★ A PAGE table filled a column at a time is the table filled a cell at
+    /// a time, packed byte for byte with the same widths: zero-init, image,
+    /// full-image and private-input pages; no final cells or a third written,
+    /// with timestamps of one word and of two; touched cells kept or excluded;
+    /// at the widths the cells need, at a block's usual hint, at eight bytes
+    /// everywhere, and at widths that miss (the same needed widths then).
+    #[test]
+    fn a_page_filled_by_columns_is_the_page_filled_by_cells() {
+        let width_sets: [&[u8]; 4] = [&[4, 1, 1, 4, 1], &[8; 5], &[1; 5], &[4, 1, 1, 2, 1]];
+        let mut checked = 0;
+        for (k, (name, config)) in configs().iter().enumerate() {
+            for ts_below in [1u64 << 28, 1 << 40] {
+                let cells = final_cells(config, 0x9A6E + k as u64, ts_below);
+                for final_page in [None, Some(&cells[..])] {
+                    for exclude in [false, true] {
+                        let what = format!(
+                            "{name}, ts below 2^{}, final cells {}, exclude {exclude}",
+                            ts_below.trailing_zeros(),
+                            final_page.is_some()
+                        );
+                        // The widths the trace needs, from today's fill.
+                        let need = by_cells(&[8; 5], config, final_page, exclude).0;
+                        for widths in width_sets.iter().copied().chain([&need[..]]) {
+                            assert_eq!(
+                                by_columns(widths, config, final_page, exclude),
+                                by_cells(widths, config, final_page, exclude),
+                                "{what}, widths {widths:?}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 4 * 2 * 2 * 2 * 5);
+    }
+
+    /// ★ The comparison above sees a timestamp moved by one row: with the
+    /// mutant on, the column fill's packed bytes differ from the cell fill's.
+    #[test]
+    fn a_timestamp_moved_one_row_is_caught() {
+        let (_, config) = configs().swap_remove(1);
+        let cells = final_cells(&config, 0x5EED, 1 << 28);
+        let widths = [4, 1, 1, 4, 1];
+        let today = by_cells(&widths, &config, Some(&cells), false);
+        assert_eq!(by_columns(&widths, &config, Some(&cells), false), today);
+        MOVE_A_TIMESTAMP.set(true);
+        let mutant = by_columns(&widths, &config, Some(&cells), false);
+        MOVE_A_TIMESTAMP.set(false);
+        assert_eq!(mutant.0, today.0, "the mutant keeps the widths");
+        assert_ne!(mutant.1, today.1, "the mutant moved a timestamp");
+    }
+
+    /// `LAMBDA_VM_FINISH_PAGE_COLUMNS`: unset or any word but `0` fills by
+    /// columns; `0` rolls back to the cell fill.
+    #[test]
+    fn the_column_fill_is_on_unless_turned_off() {
+        assert!(page_columns_from(None));
+        assert!(page_columns_from(Some("1")));
+        assert!(page_columns_from(Some("")));
+        assert!(!page_columns_from(Some("0")));
+        assert!(!page_columns_from(Some(" 0 ")));
+    }
+
+    /// A timing, not a check (step 0 of the column fill): one PAGE table's
+    /// fill, writer to packed trace, a cell at a time against a column at a
+    /// time, on one idle core. Run with `--ignored --nocapture` in release.
+    #[test]
+    #[ignore = "a timing: run alone, in release"]
+    fn page_fill_timing() {
+        let reps = 30;
+        for (name, config) in configs().into_iter().take(2) {
+            let cells = final_cells(&config, 0x7173, 1 << 28);
+            for final_page in [Some(&cells[..]), None] {
+                let need = by_cells(&[8; 5], &config, final_page, false).0;
+                let time = |columns: bool| {
+                    let mut best = f64::MAX;
+                    let mut total = 0.0;
+                    for _ in 0..reps {
+                        let t = std::time::Instant::now();
+                        let out = if columns {
+                            by_columns(&need, &config, final_page, false)
+                        } else {
+                            by_cells(&need, &config, final_page, false)
+                        };
+                        let secs = t.elapsed().as_secs_f64();
+                        let _ = std::hint::black_box(out);
+                        best = best.min(secs);
+                        total += secs;
+                    }
+                    (best * 1e3, total / reps as f64 * 1e3)
+                };
+                let (cells_best, cells_mean) = time(false);
+                let (cols_best, cols_mean) = time(true);
+                eprintln!(
+                    "PAGE FILL TIMING: {name}, final cells {} · widths {need:?} · cells {cells_best:.2} ms \
+                     (mean {cells_mean:.2}) · columns {cols_best:.2} ms (mean {cols_mean:.2}) · ×{:.2} best, \
+                     ×{:.2} mean",
+                    final_page.is_some(),
+                    cells_best / cols_best,
+                    cells_mean / cols_mean
+                );
+            }
+        }
+    }
 }

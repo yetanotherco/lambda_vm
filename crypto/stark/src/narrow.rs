@@ -444,6 +444,29 @@ impl NarrowWriter {
         }
     }
 
+    /// Every column's cells as bytes, with its width: `rows` cells of that
+    /// many bytes each, little endian, for a writer that fills whole columns
+    /// rather than a cell at a time. Store each word's low bytes, as
+    /// [`Self::set`] does, and pass each column's OR of the words written this
+    /// way to [`Self::note`]: the widths [`Self::finish`] gives come from the
+    /// words noted.
+    pub fn columns_mut(&mut self) -> Vec<(&mut [u8], usize)> {
+        let mut rest: &mut [u8] = &mut self.data;
+        let mut out = Vec::with_capacity(self.columns.len());
+        for column in &self.columns {
+            let (cells, after) = std::mem::take(&mut rest).split_at_mut(self.rows * column.width);
+            out.push((cells, column.width));
+            rest = after;
+        }
+        out
+    }
+
+    /// Count `words`, the OR of words written to column `col` through
+    /// [`Self::columns_mut`], toward that column's width.
+    pub fn note(&mut self, col: usize, words: u64) {
+        self.columns[col].seen |= words;
+    }
+
     /// The widths the words written so far need: what [`Self::finish`] gives
     /// the trace when they all fit.
     pub fn needed_widths(&self) -> Vec<u8> {
