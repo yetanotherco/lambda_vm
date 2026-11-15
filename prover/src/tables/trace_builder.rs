@@ -1000,9 +1000,9 @@ pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
 #[cfg(test)]
 pub(crate) use windowed::DECODE_TRACE_DELAY;
 pub use windowed::{
-    Accumulator, CardFillStamps, ChunkJob, CountThreadStamps, RecordsRoom, RegenBuilder,
-    RowFamilies, SetupStamps, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
-    WindowedTraceBuilder,
+    Accumulator, CardFillStamps, ChunkJob, CountThreadStamps, FloorRoute, FloorStamps, RecordsRoom,
+    RegenBuilder, RowFamilies, SetupStamps, StreamTable, StreamedChunk, WalkedWindow, Walker,
+    WindowStamps, WindowedTraceBuilder,
 };
 #[cfg(feature = "parallel")]
 pub(crate) use windowed::{head_log, parallel};
@@ -4461,42 +4461,47 @@ fn is_aligned_op(op: &MemwOperation) -> bool {
 /// assumptions — the caller's (CPU's) responsibility.
 fn collect_bitwise_from_memw_aligned(ops: &[memw_aligned::AlignedRow]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(ops.len());
-
     for op in ops {
-        let low_half = (op.base_address() & 0xFFFF) as u32;
-        let mask: u32 = match op.width() {
-            2 => 1,
-            4 => 3,
-            8 => 7,
-            _ => 0,
-        };
+        memw_aligned_lookups(op, |lookup| bitwise_ops.push(lookup));
+    }
+    bitwise_ops
+}
 
-        // IS_HALF[base_address[0] + mask]
-        let value = low_half + mask;
-        debug_assert!(
-            value <= 0xFFFF,
-            "misaligned: base_address[0] + mask overflows halfword"
-        );
-        let x = (value & 0xFF) as u8;
-        let y = ((value >> 8) & 0xFF) as u8;
-        bitwise_ops.push(BitwiseOperation::halfword(
-            BitwiseOperationType::IsHalf,
-            x,
-            y,
-        ));
-        if op.limbs() {
-            let (d0, d1) = op.step_limbs();
-            for limb in [d0, d1] {
-                bitwise_ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    limb as u8,
-                    (limb >> 8) as u8,
-                ));
-            }
+/// One MEMW_A row's lookups ([`collect_bitwise_from_memw_aligned`]), each
+/// given to `emit` in the list's order.
+#[inline]
+fn memw_aligned_lookups(op: &memw_aligned::AlignedRow, mut emit: impl FnMut(BitwiseOperation)) {
+    let low_half = (op.base_address() & 0xFFFF) as u32;
+    let mask: u32 = match op.width() {
+        2 => 1,
+        4 => 3,
+        8 => 7,
+        _ => 0,
+    };
+
+    // IS_HALF[base_address[0] + mask]
+    let value = low_half + mask;
+    debug_assert!(
+        value <= 0xFFFF,
+        "misaligned: base_address[0] + mask overflows halfword"
+    );
+    let x = (value & 0xFF) as u8;
+    let y = ((value >> 8) & 0xFF) as u8;
+    emit(BitwiseOperation::halfword(
+        BitwiseOperationType::IsHalf,
+        x,
+        y,
+    ));
+    if op.limbs() {
+        let (d0, d1) = op.step_limbs();
+        for limb in [d0, d1] {
+            emit(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                limb as u8,
+                (limb >> 8) as u8,
+            ));
         }
     }
-
-    bitwise_ops
 }
 
 /// A test's view of the routing: the table [`classify_memw`] sends `op` to
@@ -8337,6 +8342,21 @@ struct CpuRouter {
 }
 
 impl CpuRouter {
+    /// A router whose six segments (BRANCH, MUL, DVRM, EQ, BYTEWISE, STORE)
+    /// start with room for `capacities` ops each.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    fn with_capacities(capacities: [usize; 6]) -> Self {
+        let [branch, mul, dvrm, eq, bytewise, store] = capacities;
+        Self {
+            branch_ops: Vec::with_capacity(branch),
+            mul_filter: Vec::with_capacity(mul),
+            dvrm_filter: Vec::with_capacity(dvrm),
+            eq_ops: Vec::with_capacity(eq),
+            bytewise_ops: Vec::with_capacity(bytewise),
+            store_ops: Vec::with_capacity(store),
+        }
+    }
+
     /// Routes one CPU op into the segments its filters pick.
     #[inline]
     fn push(&mut self, op: CpuOp<'_>) {

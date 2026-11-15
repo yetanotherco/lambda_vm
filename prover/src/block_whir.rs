@@ -46,8 +46,8 @@ use crate::multilinear_prove::{
 use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
 use crate::tables::gpack::{self, TraceForm};
 use crate::tables::trace_builder::{
-    ChunkJob, CutPadding, RowFamilies, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
-    head_log, parallel,
+    ChunkJob, CutPadding, FloorRoute, RowFamilies, StreamTable, Traces, WindowStamps,
+    WindowedTraceBuilder, head_log, parallel,
 };
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
@@ -2186,6 +2186,63 @@ fn parse_exec_history(value: Option<&str>) -> Result<Option<bool>, Error> {
              do not) or unset (the default: 1 on the fast engine with walkers)"
         ))),
     }
+}
+
+/// `LAMBDA_VM_EXEC_HISTORY_FLOOR`: the floor arm, a timing arm of the
+/// host-only build only. In record mode, under the in-row register format,
+/// the walkers make no side record, MEMW_A row, LOAD op or residual register
+/// row; they count them and their lookups, and those families' chunks go out
+/// as placeholders nothing fills ([`WindowedTraceBuilder::history_floor`]).
+/// `1`: the accumulator routes each window from its logs, as today; `2`: each
+/// walker routes its window as it goes. Unset, empty or `0`: off. Anything
+/// else refuses the prove, and so does either value anywhere but the
+/// host-only build ([`floor_arm`]).
+pub(crate) fn exec_history_floor() -> Result<Option<FloorRoute>, Error> {
+    parse_exec_history_floor(
+        std::env::var("LAMBDA_VM_EXEC_HISTORY_FLOOR")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`exec_history_floor`]'s reading of its variable.
+fn parse_exec_history_floor(value: Option<&str>) -> Result<Option<FloorRoute>, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(None),
+        Some("1") => Ok(Some(FloorRoute::Accumulator)),
+        Some("2") => Ok(Some(FloorRoute::Walkers)),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_EXEC_HISTORY_FLOOR={v}: 1 or 2 (the floor arm of the host-only build,              routed by the accumulator or by the walkers) or 0"
+        ))),
+    }
+}
+
+/// The floor arm the build runs (`knob`, [`exec_history_floor`]): it makes no
+/// row of four families, so a build that would commit its groups (any but the
+/// host-only one, [`Deviations::host_only`]) refuses it, and so does one
+/// without record mode (`history`) or with its re-walk (`check`).
+fn floor_arm(
+    knob: Option<FloorRoute>,
+    host_only: bool,
+    history: bool,
+    check: usize,
+) -> Result<Option<FloorRoute>, Error> {
+    let Some(route) = knob else {
+        return Ok(None);
+    };
+    let refuse = |why: &str| Err(Error::Prover(format!("LAMBDA_VM_EXEC_HISTORY_FLOOR {why}")));
+    if !host_only {
+        return refuse(
+            "builds no side record, MEMW_A row, LOAD op or residual register row: a timing arm of              the host-only build, it refuses a prove",
+        );
+    }
+    if !history {
+        return refuse("needs record mode (LAMBDA_VM_EXEC_HISTORY=1)");
+    }
+    if check > 0 {
+        return refuse("re-walks no window (LAMBDA_VM_EXEC_HISTORY_CHECK=0)");
+    }
+    Ok(Some(route))
 }
 
 /// `LAMBDA_VM_EXEC_HISTORY_CHECK=N`: in record mode, a check thread runs
@@ -6397,6 +6454,13 @@ fn prove_streamed(
         // read it.
         let (kind, history) = exec_mode(walkers)?;
         let history_check = exec_history_check()?;
+        // The floor arm: host-only, record mode, no re-walk.
+        let floor = floor_arm(
+            exec_history_floor()?,
+            deviations.host_only,
+            history,
+            history_check,
+        )?;
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk;
@@ -6620,6 +6684,9 @@ fn prove_streamed(
                             builder.card_fill_streamed_fault(deviations.card_fill_streamed_fault);
                     }
                 }
+                if let Some(route) = floor {
+                    builder = builder.history_floor(route)?;
+                }
                 if let Some(ledger) = ledger {
                     ledger.image.store(builder.image_bytes(), Relaxed);
                     ledger.line("builder created");
@@ -6696,6 +6763,9 @@ fn prove_streamed(
                         ledger.walk.store(builder.state_bytes(), Relaxed);
                     }
                     eprintln!("{}", report.line());
+                    if let Some(floor) = builder.floor_stamps() {
+                        eprintln!("{}", floor.line());
+                    }
                     report.last
                 } else {
                     let (mut walker, mut accumulator) = builder.split();
@@ -9771,6 +9841,49 @@ mod producer_report_tests {
         ExecutorStamps, ProducerStamps, StreamTable,
     };
     use super::{exec_mode_from, parse_exec_history, parse_exec_history_check};
+    use super::{floor_arm, parse_exec_history_floor};
+    use crate::Error;
+    use crate::tables::trace_builder::FloorRoute;
+
+    /// `LAMBDA_VM_EXEC_HISTORY_FLOOR`: off unless `1` or `2`; anything else
+    /// refused; on, it refuses every build but the host-only one in record
+    /// mode with no re-walk: the arm makes no row of four families, so no
+    /// prove may take it.
+    #[test]
+    fn the_floor_arm_is_off_unless_asked_and_refuses_a_prove() {
+        for off in [None, Some(""), Some("0"), Some(" 0 ")] {
+            assert_eq!(parse_exec_history_floor(off).unwrap(), None, "{off:?}");
+        }
+        assert_eq!(
+            parse_exec_history_floor(Some("1")).unwrap(),
+            Some(FloorRoute::Accumulator)
+        );
+        assert_eq!(
+            parse_exec_history_floor(Some("2")).unwrap(),
+            Some(FloorRoute::Walkers)
+        );
+        for bad in ["on", "3", "walkers"] {
+            assert!(parse_exec_history_floor(Some(bad)).is_err(), "{bad}");
+        }
+        // Off: whatever the build.
+        for (host_only, history, check) in [(false, false, 0), (true, true, 0), (false, true, 4)] {
+            assert_eq!(floor_arm(None, host_only, history, check).unwrap(), None);
+        }
+        // On: only the host-only build, in record mode, with no re-walk.
+        for route in [FloorRoute::Accumulator, FloorRoute::Walkers] {
+            assert_eq!(floor_arm(Some(route), true, true, 0).unwrap(), Some(route));
+            let refused = |host_only, history, check| {
+                matches!(
+                    floor_arm(Some(route), host_only, history, check),
+                    Err(Error::Prover(line)) if line.starts_with("LAMBDA_VM_EXEC_HISTORY_FLOOR")
+                )
+            };
+            assert!(refused(false, true, 0), "a prove");
+            assert!(refused(false, false, 0), "a prove, no record mode");
+            assert!(refused(true, false, 0), "no record mode");
+            assert!(refused(true, true, 2), "a re-walk");
+        }
+    }
 
     /// Record mode on the fast engine unless `LAMBDA_VM_EXEC_HISTORY=0`, the
     /// reference engine named, or no walkers; `1` with the reference engine

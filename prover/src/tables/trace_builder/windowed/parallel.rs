@@ -45,6 +45,7 @@ use executor::vm::logs::Log;
 use executor::vm::memory::MemorySnapshot;
 
 use super::super::{ABSENT, HistoryOverlay, MemoryState, NO_PAGE, RegisterState, WalkSizes};
+use super::floor::{FloorRoute, FloorWorker, light_window};
 use super::head_log;
 use super::lean_pass::LeanPass;
 use super::{Accumulator, WalkCounts, WalkedWindow, WindowedTraceBuilder, walk_window};
@@ -145,6 +146,10 @@ struct WalkSettings {
     /// Record mode's check: where a walker sends the digest of a rechecked
     /// window's lists ([`check_thread`]).
     digests: Option<Mutex<std::sync::mpsc::Sender<(u32, u64)>>>,
+    /// The floor arm ([`WindowedTraceBuilder::history_floor`]): record mode's
+    /// windows get the light pass ([`light_window`]) instead of the walk,
+    /// routed as it says.
+    floor: Option<FloorRoute>,
 }
 
 /// One byte's cell hashed for the windows' boundary sums, under the run's
@@ -198,6 +203,8 @@ struct WindowWalker {
     /// What it counted of the rows it made, over its windows
     /// ([`WalkSettings::count_made`]); `None` when it counts none.
     counts: Option<WalkCounts>,
+    /// The floor arm's buffers, made with its first window.
+    floor: Option<Box<FloorWorker>>,
 }
 
 /// A walker's counts, when the walk counts where it makes the rows.
@@ -225,6 +232,7 @@ impl WindowWalker {
             record: MemoryState::new(),
             seeded: false,
             counts: settings_counts(&settings),
+            floor: None,
             settings,
         }
     }
@@ -260,22 +268,42 @@ impl WindowWalker {
                 ecall_cycles(history).into_iter().map(u64::from),
             )
         });
-        let walked = walk_window(
-            &s.decode,
-            s.order,
-            s.registers,
-            s.lookups,
-            s.batch,
-            s.defer_ecrec,
-            self.counts.as_mut(),
-            !(s.keep_logs && s.listless),
-            &mut self.sizes,
-            &mut self.record,
-            &mut self.registers,
-            job.first,
-            &job.logs,
-            words,
-        );
+        let walked = match (s.floor, self.counts.as_mut()) {
+            (Some(route), Some(counts)) => {
+                let worker = self
+                    .floor
+                    .get_or_insert_with(|| Box::new(FloorWorker::new(s.order)));
+                light_window(
+                    worker,
+                    counts,
+                    &s.decode,
+                    s.order,
+                    s.batch,
+                    s.defer_ecrec,
+                    route,
+                    &mut self.record,
+                    job.first,
+                    &job.logs,
+                    history,
+                )
+            }
+            _ => walk_window(
+                &s.decode,
+                s.order,
+                s.registers,
+                s.lookups,
+                s.batch,
+                s.defer_ecrec,
+                self.counts.as_mut(),
+                !(s.keep_logs && s.listless),
+                &mut self.sizes,
+                &mut self.record,
+                &mut self.registers,
+                job.first,
+                &job.logs,
+                words,
+            ),
+        };
         self.record.overlay = None;
         let mut walked = walked?;
         if s.keep_logs {
@@ -492,6 +520,11 @@ impl WindowWalker {
             .recv()
             .map_err(|_| Error::Prover(format!("window {}: {PASS_STOPPED}", job.window)))?;
         let t = Instant::now();
+        // The floor arm's light pass carries no register state out of a
+        // window: nothing to check against the next one.
+        if self.settings.floor.is_some() && job.history.is_some() {
+            return Ok((walked, busy, boundary));
+        }
         match after {
             After::Next {
                 registers,
@@ -661,7 +694,13 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         keep_logs: builder.keeps_logs(),
         words: builder.writes_words(),
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),
+        floor: builder.floor_route(),
     });
+    if builder.floor_route().is_some() && (record.is_none() || recheck > 0) {
+        return Err(Error::Prover(
+            "the floor arm walks record mode's windows, with no re-walk".into(),
+        ));
+    }
     let key = settings.key;
     let start_registers = builder.register_state.clone();
     let lean = builder.lean.memory;

@@ -113,6 +113,9 @@ pub(super) enum CountWork {
     Memw(Segments<MemwOperation>),
     Lt(Segments<LtOperation>),
     Shift(Segments<ShiftOperation>),
+    /// The floor arm's window (`super::floor`): its MEMW_A rows' `(old
+    /// timestamp, timestamp)` LT pairs, made where the rows were counted.
+    MemwAlignedPairs(Vec<(u64, u64)>),
 }
 
 /// Where the counter's thread spent its time, seconds, and what the builder
@@ -177,6 +180,12 @@ impl Counts {
                     lookups.then_some(&mut self.histogram),
                     (!stream_memw_lt).then_some(&mut self.memw_aligned_lt),
                 );
+                StreamTable::MemwAligned
+            }
+            CountWork::MemwAlignedPairs(pairs) => {
+                if !stream_memw_lt {
+                    self.memw_aligned_lt.extend_pairs(pairs);
+                }
                 StreamTable::MemwAligned
             }
             CountWork::Memw(ops) => {

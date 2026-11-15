@@ -93,6 +93,9 @@ use card_records::{
 
 mod handout_count;
 pub use handout_count::CountThreadStamps;
+
+mod floor;
+pub use floor::{FloorRoute, FloorStamps};
 use handout_count::{CountWork, HandoutCounter};
 
 /// Whether the host has room to hold a chunk of so many bytes as records
@@ -293,6 +296,9 @@ pub struct WindowedTraceBuilder<'a> {
     card_fill_streamed: Option<StreamedCardFill>,
     /// Where the hand-out's counting runs ([`Self::count_handout_on_thread`]).
     count: CountMode,
+    /// The floor arm ([`Self::history_floor`], a timing arm of the host-only
+    /// build): its route and what its windows counted.
+    floor: Option<floor::FloorState>,
 }
 
 /// Where the hand-out counts what the table phase reads from each chunk it
@@ -573,6 +579,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             card_fill_fault: 0,
             card_fill_streamed: None,
             count,
+            floor: None,
         })
     }
 
@@ -1415,6 +1422,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             walk,
             logs: None,
             made: None,
+            floor: None,
         };
         super::build_stamps::mark("p0 last window");
         let Self {
@@ -1681,6 +1689,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 card_stamps: &mut self.stamps.card_fill,
                 count: &mut self.count,
                 walked: &mut self.walked_rows,
+                floor: self.floor.as_mut(),
             },
             &self.image,
         )
@@ -1734,6 +1743,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 card_stamps: &mut self.stamps.card_fill,
                 count: &mut self.count,
                 walked: &mut self.walked_rows,
+                floor: self.floor.as_mut(),
             },
         )
     }
@@ -1754,6 +1764,9 @@ pub struct WalkedWindow {
     /// Its routing, made by its walker, which counted its rows
     /// ([`WindowedTraceBuilder::count_where_made`]); `None` otherwise.
     made: Option<WindowMade>,
+    /// The floor arm's light pass ([`WindowedTraceBuilder::history_floor`]):
+    /// what it counted instead of the rows it did not make.
+    floor: Option<Box<floor::FloorWindow>>,
 }
 
 impl WalkedWindow {
@@ -1993,6 +2006,7 @@ fn walk_window(
         walk,
         logs: None,
         made,
+        floor: None,
     })
 }
 
@@ -2161,6 +2175,8 @@ pub struct Accumulator<'b> {
     count: &'b mut CountMode,
     /// [`WindowedTraceBuilder::walked_rows`].
     walked: &'b mut WalkedRows,
+    /// The floor arm's state ([`WindowedTraceBuilder::history_floor`]).
+    floor: Option<&'b mut floor::FloorState>,
 }
 
 impl Accumulator<'_> {
@@ -2210,6 +2226,8 @@ impl Accumulator<'_> {
     /// lists now complete. Windows must come in run order.
     pub fn absorb(&mut self, mut window: WalkedWindow) -> Vec<ChunkJob> {
         let t = std::time::Instant::now();
+        // The floor arm's light window: what it counted instead of its rows.
+        let mut floor = window.floor.take();
         if self.stream_memw_lt {
             let walk = &mut window.walk;
             walk.lt_ops
@@ -2241,7 +2259,11 @@ impl Accumulator<'_> {
         // and LOAD ops when the walk left the lookups out (the list is then
         // empty), from the list otherwise. The one-pass routing appends to the
         // run's segments and counts the CPU ops' lookups as it goes.
-        if window.cpu_ops.len() != window.cycles {
+        if let Some(segments) = floor.as_mut().and_then(|f| f.segments.take()) {
+            // The floor arm's walker routed the window and counted its CPU
+            // ops' lookups as it went.
+            self.segments.append(segments);
+        } else if window.cpu_ops.len() != window.cycles {
             // Its walker kept no CPU list: routed from its logs, a batch at a
             // time ([`WindowedTraceBuilder::drop_cpu_list`]).
             let routed = match window.logs.as_deref() {
@@ -2298,13 +2320,27 @@ impl Accumulator<'_> {
             // Nothing else reads the in-walk lookups; MEMW_R's rows are
             // counted as their chunks leave.
             drop(std::mem::take(&mut window.walk.bitwise_ops));
+            // The floor arm: the window's counts and its CPU chunks' side
+            // records (zeros), queued before its lists join the run's.
+            let pairs = match (floor, self.floor.as_deref_mut()) {
+                (Some(f), Some(state)) => Some(state.absorb(*f, window.cycles, kept)),
+                _ => None,
+            };
             kept.append(window, self.decode);
             *self.route_secs += t.elapsed().as_secs_f64();
             let t = std::time::Instant::now();
             let counter = self
                 .count
                 .counter(self.decode, self.stream_memw_lt, self.counted);
-            let jobs = tail_jobs(
+            // MEMW_A's LT pairs, made where its rows were counted, in run
+            // order: as its chunks' would be.
+            if let Some(pairs) = pairs {
+                match counter {
+                    Some(counter) => counter.send(CountWork::MemwAlignedPairs(pairs)),
+                    None => self.counted.memw_aligned_lt.extend_pairs(pairs),
+                }
+            }
+            let mut jobs = tail_jobs(
                 self.max_rows,
                 self.stream_memw_lt,
                 counted_by_walker,
@@ -2317,6 +2353,22 @@ impl Accumulator<'_> {
                 self.card.map(|card| (card, &mut *self.card_stamps)),
                 counter,
             );
+            // The floor arm: the families' full chunks, cut from the counts;
+            // every row of theirs counted, so the finish counts its own
+            // lists whole.
+            if self.floor.is_some() {
+                let (m, e) = (self.max_rows, &mut *self.emitted);
+                if let Some(state) = self.floor.as_deref_mut() {
+                    jobs.extend(state.jobs(
+                        [m.memw_register, m.memw_aligned, m.load],
+                        [&mut e.memw_register, &mut e.memw_aligned, &mut e.load],
+                        self.handout,
+                    ));
+                }
+                self.walked.memw_register = e.memw_register * m.memw_register;
+                self.walked.memw_aligned = e.memw_aligned * m.memw_aligned;
+                jobs.sort_by_key(|job| floor::hand_out_rank(job.table));
+            }
             *self.handout_secs += t.elapsed().as_secs_f64();
             jobs
         } else {
@@ -3255,6 +3307,7 @@ impl Kept {
             walk,
             logs,
             made: _,
+            floor: _,
         } = window;
         // A window whose walker kept its list: the run goes back to the list
         // from here, the tail's ops rebuilt from its logs, and its logs
