@@ -599,6 +599,69 @@ fn the_cpu_and_register_airs_expose_the_columns_the_verifier_checks() {
     );
 }
 
+/// ⛔ Under the in-row register format the CPU and REGISTER AIRs hand the
+/// verifier the columns it checks: each CPU table its own height's clock, and
+/// REGISTER its six columns (the register index, both files a register a row,
+/// the PC flag) over the program's initial file and the halted one. Without
+/// them the verifier would check no preprocessed column of either table, and
+/// the clock, the files and the PC flag would be free main trace.
+#[test]
+fn the_in_row_cpu_and_register_airs_expose_the_columns_the_verifier_checks() {
+    use crate::tables::{cpu, register};
+
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let program =
+        executor::elf::Elf::load(&crate::test_utils::asm_elf_bytes("all_instructions_64"))
+            .expect("the ELF loads");
+    let heights = vec![16, 8, 4];
+    let counts = cpu_only_counts(heights.len());
+    let output = [7u8; 5];
+    let inputs = crate::BlockAirInputs::new(&opts, &program, heights.clone(), &output)
+        .expect("honest heights");
+    let airs = crate::block_airs(
+        &program,
+        &opts,
+        &[],
+        &counts,
+        &inputs,
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+        crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        crate::tables::register::RegisterFormat::InRow,
+    );
+    let refs = airs.air_refs();
+    let start = crate::cpu_proof_start(true, &counts);
+    for (k, &height) in heights.iter().enumerate() {
+        let air = refs[start + k];
+        assert_eq!(air.name(), format!("CPU[{k}]"));
+        assert_eq!(
+            air.num_precomputed_columns(),
+            cpu::NUM_PRECOMPUTED_COLS,
+            "CPU[{k}]: the verifier would check no clock"
+        );
+        assert_eq!(
+            air.precomputed_columns(),
+            vec![cpu::timestamp_column(height)],
+            "CPU[{k}]: the verifier would check another clock"
+        );
+    }
+    let register_air = refs
+        .iter()
+        .find(|air| air.name() == "REGISTER")
+        .expect("REGISTER is in the block");
+    let init = register::register_init_from_entry_point(program.entry_point);
+    let fini = register::halted_fini(output.len() as u32);
+    assert_eq!(
+        register_air.num_precomputed_columns(),
+        register::inrow::NUM_PREPROCESSED_COLS,
+        "REGISTER: the verifier would check none of its files"
+    );
+    assert_eq!(
+        register_air.precomputed_columns(),
+        register::inrow::preprocessed_columns(&init, &fini),
+        "REGISTER: the verifier would check other files"
+    );
+}
+
 /// A block's counts with `cpu` CPU tables and no other chunked or optional one.
 fn cpu_only_counts(cpu: usize) -> crate::TableCounts {
     crate::TableCounts {
