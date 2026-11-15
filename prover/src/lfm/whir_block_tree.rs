@@ -575,6 +575,7 @@ impl WhirTreeConfig {
             match format.memory {
                 MemoryFormat::Split => "split",
                 MemoryFormat::Fused => "fused",
+                MemoryFormat::Words => "words",
             }
         );
         let mut options = BlockOptions::production();

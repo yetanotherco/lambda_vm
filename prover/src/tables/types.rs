@@ -420,6 +420,21 @@ pub enum BusId {
     /// the timestamp one field element, one token a 64-bit register
     /// (`tables::register::RegisterFormat::InRow`).
     Reg = 39,
+
+    // =========================================================================
+    // Memory as 8-byte words (`tables::word_memory`)
+    // =========================================================================
+    /// Word tokens: `(address_lo, address_hi, timestamp, lo, hi)`, one token an
+    /// aligned 8-byte RAM word, the address two elements and the timestamp one
+    /// (`tables::fused_memory::MemoryFormat::Words`). Its own id, so no tuple
+    /// of another shape (a byte token, a register token) is ever read as one:
+    /// the fingerprint has no length term.
+    MemWord = 40,
+    /// A chip's access to one RAM word, received by MEMW_W: a write
+    /// `(1, address_lo, address_hi, timestamp, new_lo, new_hi)` or an access
+    /// `(0, address_lo, address_hi, timestamp, old_lo, old_hi, new_lo,
+    /// new_hi)` (a read sends old = new). Register accesses never travel on it.
+    MemWordMsg = 41,
 }
 
 impl BusId {
@@ -456,6 +471,8 @@ impl BusId {
             BusId::LfmPublic => "LfmPublic",
             BusId::Blake3Absorb => "Blake3Absorb",
             BusId::IsWh => "IsWh",
+            BusId::MemWord => "MemWord",
+            BusId::MemWordMsg => "MemWordMsg",
         }
     }
 }
@@ -495,6 +512,8 @@ impl TryFrom<u64> for BusId {
             38 => Ok(BusId::KeccakSponge),
             39 => Ok(BusId::Reg),
             37 => Ok(BusId::IsWh),
+            40 => Ok(BusId::MemWord),
+            41 => Ok(BusId::MemWordMsg),
             other => Err(other),
         }
     }

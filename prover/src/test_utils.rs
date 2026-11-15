@@ -1052,6 +1052,45 @@ pub fn create_mem_store_air(
     )
 }
 
+/// The MEMW_W AIR (`tables::memw_w`): a chip's access to one RAM word, under
+/// the word memory format.
+pub fn create_memw_w_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::memw_w::MemwWordConstraints> {
+    build_air(
+        crate::tables::memw_w::cols::NUM_COLUMNS,
+        crate::tables::memw_w::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::memw_w::MemwWordConstraints,
+        "MEMW_W",
+    )
+}
+
+/// The PAGE_W AIR of `config`'s page (`tables::page_w`), its preprocessed
+/// prefix by the page's kind, or the reason there is none (a base that is not
+/// page-aligned).
+pub fn create_page_w_air(
+    proof_options: &ProofOptions,
+    config: &crate::tables::page::PageConfig,
+) -> Result<VmAir, String> {
+    use crate::tables::page_w;
+    let air = build_air(
+        page_w::cols::NUM_COLUMNS,
+        page_w::bus_interactions(config.page_base, config.is_private_input)?,
+        proof_options,
+        1,
+        EmptyConstraints,
+        &format!("{}0x{:x}", page_w::NAME_PREFIX, config.page_base),
+    );
+    let columns = config.clone();
+    Ok(Box::new(air.with_lazy_preprocessed_columns(
+        page_w::lazy_commitment(config, proof_options),
+        page_w::num_preprocessed_cols(config),
+        std::sync::Arc::new(move || page_w::preprocessed_columns_of(&columns)),
+    )))
+}
+
 /// Create DECODE AIR with bus interactions.
 ///
 /// The DECODE table has no transition constraints (it's a pure lookup table).

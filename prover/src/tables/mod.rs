@@ -62,14 +62,19 @@ pub mod mem_store;
 pub mod memw;
 pub mod memw_aligned;
 pub mod memw_register;
+pub mod memw_w;
 pub mod mul;
 pub mod page;
+pub mod page_w;
 pub mod register;
 pub mod register_residual;
 pub mod shift;
 pub mod store;
 pub mod trace_builder;
 pub mod trace_hash;
+pub mod word_memory;
+#[cfg(test)]
+mod word_memory_tests;
 
 /// The card fill's records, synthetic sets and host known-answer vectors.
 #[cfg(test)]
