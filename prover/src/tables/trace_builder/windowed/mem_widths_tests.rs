@@ -67,6 +67,9 @@ struct Chip {
 #[derive(Clone, Copy, Debug, Default)]
 struct Calls {
     calls: u64,
+    /// A pointer operand (the chip's ABI's, from the registers before the
+    /// call) not 8-aligned.
+    unaligned_operand: u64,
     unaligned: u64,
     colliding_calls: u64,
     collisions: u64,
@@ -177,8 +180,27 @@ impl Census {
                     .find(|c| c.reg == r)
                     .map(|c| c.value)
             };
+            // The chip's pointer operands (its ABI): HINT's output address is
+            // the log's written value.
+            let pointers: Vec<Option<u64>> = match syscall {
+                n if n == KECCAK_SYSCALL_NUMBER || n == BLAKE3_SYSCALL_NUMBER => vec![reg(10)],
+                n if n == KECCAK256_SYSCALL_NUMBER => vec![reg(10), reg(12)],
+                n if n == BLAKE3_ABSORB_SYSCALL_NUMBER
+                    || n == DMA_MEMCPY_SYSCALL_NUMBER
+                    || n == DMA_MEMSET_SYSCALL_NUMBER =>
+                {
+                    vec![reg(10), reg(11)]
+                }
+                n if n == ECSM_SYSCALL_NUMBER || n == ECREC_SYSCALL_NUMBER => {
+                    vec![reg(10), reg(11), reg(12)]
+                }
+                n if n == HINT_SYSCALL_NUMBER => vec![Some(log.dst_val)],
+                64 => vec![reg(11)],
+                _ => Vec::new(),
+            };
             let calls = self.calls.entry(syscall).or_default();
             calls.calls += 1;
+            calls.unaligned_operand += u64::from(pointers.iter().flatten().any(|&p| p % 8 != 0));
             if syscall == KECCAK256_SYSCALL_NUMBER
                 && let Some(len) = reg(11)
             {
@@ -252,6 +274,7 @@ impl Census {
                 n if n == KECCAK256_SYSCALL_NUMBER => "KECCAK sponge (keccak256)",
                 n if n == BLAKE3_SYSCALL_NUMBER => "BLAKE3",
                 n if n == BLAKE3_ABSORB_SYSCALL_NUMBER => "BLAKE3 absorb",
+                // memcpy and memmove share one syscall.
                 n if n == DMA_MEMCPY_SYSCALL_NUMBER => "COPY memcpy/memmove",
                 n if n == DMA_MEMSET_SYSCALL_NUMBER => "COPY memset",
                 n if n == HINT_SYSCALL_NUMBER => "HINT",
@@ -260,8 +283,8 @@ impl Census {
                 _ => "other",
             };
             let mut line = format!(
-                "BLOCK MEM CHIPS: {block} {name} ({syscall:#x}): calls {} · with an unaligned buffer {} · with a same-timestamp word collision {} ({} messages)",
-                c.calls, c.unaligned, c.colliding_calls, c.collisions
+                "BLOCK MEM CHIPS: {block} {name} ({syscall:#x}): calls {} · with a pointer operand not 8-aligned {} · with an 8-byte message off an 8-byte boundary {} · with a same-timestamp word collision {} ({} messages)",
+                c.calls, c.unaligned_operand, c.unaligned, c.colliding_calls, c.collisions
             );
             if c.len_mod8.iter().any(|&n| n > 0) {
                 line.push_str(&format!(" · input length mod 8 {:?}", c.len_mod8));
@@ -444,6 +467,7 @@ fn the_memory_width_census_counts_every_access_once() {
         assert!(!c.calls.is_empty(), "{name}: no ECALL call counted");
         for k in c.calls.values() {
             assert!(k.unaligned <= k.calls && k.colliding_calls <= k.calls);
+            assert!(k.unaligned_operand <= k.calls);
         }
     }
     assert!(widths.len() >= 3, "{widths:?}");
