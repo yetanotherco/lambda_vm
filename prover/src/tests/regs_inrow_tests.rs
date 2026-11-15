@@ -13,7 +13,7 @@ use crate::tables::{MaxRowsConfig, cpu, halt, register_residual};
 use crate::test_utils::asm_elf_bytes;
 use multilinear::whir_chain::GkrPack;
 use stark::lookup::BusInteraction;
-use stark::multilinear_table::batched::{ArgueShape, chunking};
+use stark::multilinear_table::batched::{ArgueShape, VerifierChecks, chunking};
 use stark::proof::options::ProofOptions;
 
 /// The GKR input slots a table of `2^num_vars` rows and these interactions
@@ -293,6 +293,17 @@ fn prove_built(
     traces: &mut crate::tables::trace_builder::Traces,
     format: &BlockFormat,
 ) -> Result<block_whir::BlockWhirProof, crate::Error> {
+    prove_built_with(program, elf, traces, format, &Deviations::default())
+}
+
+/// [`prove_built`] under the prover's `deviations`.
+fn prove_built_with(
+    program: &executor::elf::Elf,
+    elf: &[u8],
+    traces: &mut crate::tables::trace_builder::Traces,
+    format: &BlockFormat,
+    deviations: &Deviations,
+) -> Result<block_whir::BlockWhirProof, crate::Error> {
     let options = super::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
     let mut stamps = block_whir::BlockStamps::default();
     block_whir::prove_traces(
@@ -302,23 +313,97 @@ fn prove_built(
         &ProofOptions::default_test_options(),
         format,
         &options,
-        &Deviations::default(),
+        deviations,
         true,
         &|_, _| {},
         &mut stamps,
     )
 }
 
+/// The verifier's check a forged block is meant to fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Check {
+    /// The buses' balance.
+    Balance,
+    /// The constraint sumcheck's final equation.
+    Constraint,
+    /// The preprocessed columns' openings.
+    Preprocessed,
+}
+
+impl Check {
+    /// The error the multilinear verifier refuses with at this check.
+    fn error(self) -> multilinear::Error {
+        match self {
+            Check::Balance => multilinear::Error::BusImbalance,
+            Check::Constraint => multilinear::Error::BatchMismatch,
+            Check::Preprocessed => multilinear::Error::EvaluationMismatch,
+        }
+    }
+
+    /// Every check but this one.
+    fn off(self) -> VerifierChecks {
+        let all = VerifierChecks::ALL;
+        match self {
+            Check::Balance => VerifierChecks {
+                balance: false,
+                ..all
+            },
+            Check::Constraint => VerifierChecks {
+                constraint: false,
+                ..all
+            },
+            Check::Preprocessed => VerifierChecks {
+                preprocessed: false,
+                ..all
+            },
+        }
+    }
+}
+
+/// How the verifier reads a forged block: with every check, and with every
+/// check but `check`. `None` when it is refused by `check` alone (that check's
+/// error with every check on, and verified with it off: the forgery is whole
+/// save for what `check` reads); otherwise both verdicts, to report.
+fn refused_by(
+    proof: &block_whir::BlockWhirProof,
+    elf: &[u8],
+    format: &BlockFormat,
+    check: Check,
+) -> Option<String> {
+    let verdict = |checks: VerifierChecks| {
+        block_whir::verify_block_whir_traced(
+            proof,
+            elf,
+            &ProofOptions::default_test_options(),
+            format,
+            false,
+            checks,
+        )
+        .map_err(|e| format!("{e:?}"))
+    };
+    let all = verdict(VerifierChecks::ALL);
+    let off = verdict(check.off());
+    let named = matches!(
+        &all,
+        Ok(Err(block_whir::BlockRefusal::Proof(e))) if *e == check.error()
+    );
+    let whole = matches!(&off, Ok(Ok(())));
+    (!(named && whole)).then(|| format!("every check: {all:?} · without {check:?}: {off:?}"))
+}
+
 /// ★ Box: the in-row forgeries proved (`tables::trace_builder::
 /// in_row_forgery_tests`, which reads each on the buses): every forged build
-/// proves, and the block verifier refuses it; the honest build of each
-/// program proves and verifies. With the PC chain run past the exit call
-/// (HALT's pc `(1, 0)`) among them, against the honest exit 0 of the program
-/// without its first exit.
+/// proves, and the block verifier refuses it at the check it targets, and
+/// verifies it with that check off; the honest build of each program proves
+/// and verifies. Each forged build has BITWISE's `IS_HALF` counts recounted,
+/// as its prover would, so a stale count cannot be what refuses it. With the
+/// PC chain run past the exit call (HALT's pc `(1, 0)`) among them, against
+/// the honest exit 0 of the program without its first exit.
 #[test]
 fn in_row_forgeries_are_refused_by_the_block_verifier() {
     use crate::tables::trace_builder::in_row_forgery_tests::{
-        Forgery, forge, program_of, with_verifier_files,
+        Forgery, forge, program_of, recount_is_half, with_verifier_files,
     };
     use crate::tests::halt_pc_forgery_poc::{
         FORGED_ROWS, GUEST, forged_logs, patched_elf, run_logs,
@@ -331,7 +416,8 @@ fn in_row_forgeries_are_refused_by_the_block_verifier() {
         with_verifier_files(&program, &mut traces);
         (program, traces)
     };
-    let mut refused = Vec::new();
+    let mut wrong = Vec::new();
+    let mut refused = 0;
     for forgery in [
         Forgery::SlotSelfLoop,
         Forgery::SlotCycle,
@@ -342,6 +428,10 @@ fn in_row_forgeries_are_refused_by_the_block_verifier() {
         Forgery::KeepAliveInventsValue,
         Forgery::ReadWithoutRequester,
     ] {
+        let check = match forgery {
+            Forgery::KeepAliveChangesValue => Check::Constraint,
+            _ => Check::Balance,
+        };
         let elf = asm_elf_bytes(program_of(forgery));
         let (program, mut honest) = run(&elf, None);
         let proof =
@@ -352,13 +442,14 @@ fn in_row_forgeries_are_refused_by_the_block_verifier() {
         );
         let (program, mut forged) = run(&elf, None);
         forge(forgery, &mut forged);
+        let recounted = recount_is_half(&program, &mut forged);
         let proof =
             prove_built(&program, &elf, &mut forged, &format).expect("the forged build proves");
-        assert!(
-            !verifies(&proof, &elf, &format),
-            "{forgery:?}: the forged build is refused"
-        );
-        refused.push(forgery);
+        match refused_by(&proof, &elf, &format, check) {
+            None => refused += 1,
+            Some(read) => wrong.push(format!("{forgery:?}: {read}")),
+        }
+        println!("IN-ROW FORGERY {forgery:?}: {recounted} IS_HALF value(s) recounted, {check:?}");
     }
     // The PC chain past the exit call.
     let patched = patched_elf(&asm_elf_bytes(GUEST));
@@ -378,13 +469,73 @@ fn in_row_forgeries_are_refused_by_the_block_verifier() {
         1,
     );
     with_verifier_files(&program, &mut forged);
+    let recounted = recount_is_half(&program, &mut forged);
     let proof = prove_built(&program, &elf, &mut forged, &format).expect("the forged run proves");
+    match refused_by(&proof, &elf, &format, Check::Balance) {
+        None => refused += 1,
+        Some(read) => wrong.push(format!("the PC chain past the exit: {read}")),
+    }
+    println!("IN-ROW FORGERY PC chain past the exit: {recounted} IS_HALF value(s) recounted");
     assert!(
-        !verifies(&proof, &elf, &format),
-        "the PC chain past the exit call is refused"
+        wrong.is_empty(),
+        "forgeries not refused by their check alone:\n{}",
+        wrong.join("\n")
+    );
+    println!("IN-ROW FORGERIES REFUSED: {refused}, each by its check alone");
+}
+
+/// ★ Box: REGISTER's files are the verifier's under the in-row register
+/// format. A block whose register that the run never touches starts and ends
+/// at another value (its initial and final words edited alike, so every bus
+/// balances), proved without the prover's own column check, is refused at
+/// REGISTER's preprocessed openings, and verifies with that check off: were
+/// REGISTER's columns not the verifier's, the files would be the prover's.
+#[test]
+fn an_in_row_block_with_other_register_files_is_refused_at_its_preprocessed_openings() {
+    use crate::tables::register::inrow;
+    use crate::tables::trace_builder::in_row_forgery_tests::with_verifier_files;
+    use crate::tests::halt_pc_forgery_poc::run_logs;
+    let format = in_row();
+    let elf = asm_elf_bytes("keep_alive_regs");
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let mut traces = in_row_build_as(&program, &run_logs(&elf), &format);
+    with_verifier_files(&program, &mut traces);
+    let table = &mut traces.register;
+    use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+    let cell = |t: &stark::trace::TraceTable<GoldilocksField, GoldilocksExtension>,
+                r: usize,
+                c: usize| t.get_main(r, c).canonical_u64();
+    let row = (0..crate::tables::register::NUM_REGISTERS)
+        .find(|&r| cell(table, r, inrow::cols::IS_PC) == 0 && cell(table, r, inrow::cols::TS) == 1)
+        .expect("a register the run never touches");
+    assert_eq!(
+        cell(table, row, inrow::cols::INIT_0),
+        cell(table, row, inrow::cols::FINI_0),
+        "an untouched register ends where it starts"
+    );
+    let other = crate::tables::types::FE::from(cell(table, row, inrow::cols::INIT_0) + 1);
+    table.main_table.set(row, inrow::cols::INIT_0, other);
+    table.main_table.set(row, inrow::cols::FINI_0, other);
+    let proof = prove_built_with(
+        &program,
+        &elf,
+        &mut traces,
+        &format,
+        &Deviations {
+            unchecked_preprocessed: true,
+            ..Default::default()
+        },
+    )
+    .expect("the edited build proves");
+    let read = refused_by(&proof, &elf, &format, Check::Preprocessed);
+    assert!(
+        read.is_none(),
+        "register x{}'s files edited: {}",
+        inrow::register_of_row(row),
+        read.unwrap_or_default()
     );
     println!(
-        "IN-ROW FORGERIES REFUSED: {} and the PC chain past the exit",
-        refused.len()
+        "IN-ROW REGISTER FILES: x{} at {other:?} refused at REGISTER's preprocessed openings alone",
+        inrow::register_of_row(row)
     );
 }
