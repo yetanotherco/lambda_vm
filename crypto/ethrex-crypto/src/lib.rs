@@ -242,8 +242,10 @@ where
 /// `recover_from_prehash`, which internally runs a *second* lincomb to
 /// re-verify the key — doubling the ECSM ecalls for no gain here.
 fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64], CryptoError> {
-    // riscv64: one ECREC call recovers the key; when it bails (an invalid signature, or
-    // one of the rare inputs its chains cannot represent) the path below decides.
+    // riscv64: one ECREC call recovers the key; when it bails (an invalid signature, one
+    // of the rare inputs its chains cannot represent, or any call the prover chooses to
+    // bail on: a bail is not proven) the path below decides. A bail must never be
+    // returned as an error.
     #[cfg(target_arch = "riscv64")]
     if let Some(pk) = ecrec_call(sig, recid, msg) {
         return Ok(pk);
@@ -252,6 +254,10 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
 }
 
 /// The key from the ECREC precompile, or `None` when the call bailed (status 1).
+///
+/// `None` means "recompute in software", never "invalid signature": nothing proves
+/// a bail, so a prover may bail on a valid signature, and only the software path
+/// (which the caller runs on `None`) may decide that a signature is invalid.
 ///
 /// A status-0 answer is proven by the ECREC chip: `Q = u1·G + u2·R` with `u1`, `u2`
 /// the scalars of `(r, s, z)` mod N and `R` the curve point with x = r and the

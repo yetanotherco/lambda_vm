@@ -7,6 +7,12 @@
 //! software. A bail proves nothing and needs nothing proven: the guest's software path
 //! decides the answer. Everything below is gated on `OK` (the row computed the key).
 //!
+//! So status 1 means "not computed, recompute in software", never "invalid
+//! signature": the prover may bail on any call, a valid signature included, and no
+//! constraint stops it. A caller that read status 1 as a rejection would let a
+//! prover refuse any valid signature it liked. Every caller must recover the key
+//! another way on status 1, as `ethrex-crypto`'s `ecrec_call` caller does.
+//!
 //! Under `OK` the row proves:
 //! - `0 < r < N`, `0 < s < N` (overflow chains, `Zero` lookups);
 //! - `w = r⁻¹`: `r·w − 1 − qw·N = 0`; `u1`: `z·w + u1 − qz·N = 0`; `u2`:
