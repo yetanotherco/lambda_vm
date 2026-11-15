@@ -96,6 +96,9 @@ pub use handout_count::CountThreadStamps;
 
 mod history_sides;
 use handout_count::{CountWork, HandoutCounter};
+// Wired into the windowed builder by the MEMW_A chunks held as refs.
+#[cfg_attr(not(test), allow(dead_code))]
+mod history_rows;
 pub(crate) use history_sides::card_trace_rows;
 
 /// Whether the host has room to hold a chunk of so many bytes as records
@@ -5295,6 +5298,9 @@ mod history_sides_tests;
 
 #[cfg(all(test, feature = "cuda", feature = "parallel"))]
 mod history_sides_card_tests;
+
+#[cfg(all(test, feature = "parallel"))]
+mod history_rows_tests;
 
 #[cfg(test)]
 mod tail_tests;
