@@ -223,7 +223,7 @@ fn chunks_start_at_their_heights_multiples() {
 }
 
 /// A Rust guest's ELF from `program_artifacts/rust`.
-fn rust_elf(name: &str) -> Elf {
+pub(super) fn rust_elf(name: &str) -> Elf {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../executor/program_artifacts/rust")
         .join(format!("{name}.elf"));
@@ -460,4 +460,144 @@ fn write_the_side_records_kernel_vectors() {
         with_ex > 0 && with_keep > 0,
         "{with_ex} with exceptions, {with_keep} with a keep-alive"
     );
+}
+
+/// The CPU chunks a record-mode run of `program` hands out as records under
+/// the in-row register format, with the side records derived on the card
+/// (`derive`) or held as the walk wrote them: `(index, records)`.
+pub(super) fn cpu_records_chunks(
+    program: &Elf,
+    input: &[u8],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    derive: bool,
+) -> Vec<(usize, multilinear::records::Records)> {
+    let room: super::RecordsRoom = Arc::new(|_| true);
+    let mut builder = WindowedTraceBuilder::new(program, input, max_rows)
+        .and_then(|b| b.register_format(RegisterFormat::InRow))
+        .and_then(WindowedTraceBuilder::drop_streamed_ops)
+        .and_then(|b| b.card_fill_streamed(room, true, false))
+        .and_then(|b| {
+            if derive {
+                b.card_derives_sides()
+            } else {
+                Ok(b)
+            }
+        })
+        .expect("the builder");
+    assert_eq!(builder.derives_sides().is_some(), derive);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
+    let mut chunks = Vec::new();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut fast = FastExecutor::new(program, input.to_vec()).expect("the fast engine");
+            fast.enable_history().expect("history mode");
+            while let Some((logs, history)) = fast.resume_history(window).expect("the run") {
+                let last = (fast.pc() == 0)
+                    .then(|| fast.take_history_final().map(Box::new))
+                    .flatten();
+                let window = ExecWindow {
+                    logs: Arc::new(logs),
+                    start: None,
+                    history: Some(Box::new(history)),
+                    last,
+                };
+                if tx.send(window).is_err() {
+                    break;
+                }
+            }
+        });
+        walk_windows_from_history(&mut builder, rx, 2, 0, |accumulator, walked, _| {
+            for job in accumulator.absorb(walked) {
+                if job.table == super::StreamTable::Cpu && job.is_records() {
+                    let index = job.index;
+                    let mut chunk = job.generate();
+                    chunks.extend(chunk.trace.take_records_main().map(|r| (index, r)));
+                }
+            }
+            Ok(())
+        })
+        .expect("the walk");
+    });
+    chunks
+}
+
+/// Whether a CPU chunk's records carry what the card derives its side
+/// records from.
+pub(super) fn derives(records: &multilinear::records::Records) -> bool {
+    matches!(
+        records.fill(),
+        multilinear::records::RecordsFill::Cpu {
+            history: Some(_),
+            ..
+        }
+    )
+}
+
+/// ★ Through the windowed builder (`LAMBDA_VM_CARD_TRACE=rows`): every full
+/// CPU chunk is handed out carrying its history records and exceptions, its
+/// host fill is the walk's chunk's word for word, its digest the same, its
+/// records 16 bytes a cycle and 12 an exception in place of 20 a cycle; and
+/// without the option the chunks are today's.
+#[test]
+fn the_builder_hands_out_cpu_chunks_whose_side_records_the_card_derives() {
+    let max_rows = MaxRowsConfig::small();
+    let mut checked = 0usize;
+    let mut cases: Vec<(String, Elf, Vec<u8>, usize)> =
+        ["test_keccak_multi", "all_instructions_64"]
+            .iter()
+            .flat_map(|name| [7usize, 33].map(|w| (name.to_string(), run(name).0, Vec::new(), w)))
+            .collect();
+    cases.push((
+        "dma_memmove_cases".to_string(),
+        rust_elf("dma_memmove_cases"),
+        Vec::new(),
+        97,
+    ));
+    for (name, program, input, window) in &cases {
+        let today = cpu_records_chunks(program, input, &max_rows, *window, false);
+        let derived = cpu_records_chunks(program, input, &max_rows, *window, true);
+        let what = format!("{name}, window {window}");
+        assert_eq!(today.len(), derived.len(), "{what}: the same chunks");
+        assert!(!today.is_empty(), "{what}: a CPU chunk held");
+        for ((i, a), (j, b)) in today.iter().zip(&derived) {
+            assert_eq!(i, j, "{what}");
+            assert!(!derives(a) && derives(b), "{what}, CPU[{i}]: the two forms");
+            let (wa, wb) = (
+                a.host_fill().expect("host fill"),
+                b.host_fill().expect("host fill"),
+            );
+            assert_eq!(wa.cols(), wb.cols(), "{what}, CPU[{i}]");
+            for c in 0..wa.cols() {
+                assert_eq!(wa.column(c), wb.column(c), "{what}, CPU[{i}], column {c}");
+            }
+            assert_eq!(a.digest(), b.digest(), "{what}, CPU[{i}]: the digest");
+            // 40 bytes a log and 20 a side record, against 40, 16 a history
+            // record and 12 an exception (tiny windows list many).
+            let multilinear::records::RecordsFill::Cpu {
+                history: Some(h), ..
+            } = b.fill()
+            else {
+                panic!("{what}, CPU[{i}]: derived");
+            };
+            let listed: usize = h.exceptions.iter().map(|p| p.len()).sum();
+            assert_eq!(a.bytes(), a.rows() * 60, "{what}, CPU[{i}]");
+            assert_eq!(b.bytes(), b.rows() * 56 + listed * 12, "{what}, CPU[{i}]");
+            checked += 1;
+        }
+    }
+    assert!(checked > 4, "{checked} chunks");
+}
+
+/// The knob reads `rows` or off, and refuses anything else.
+#[test]
+fn the_card_trace_knob_reads_rows_or_off() {
+    use super::history_sides::card_trace_setting as setting;
+    for off in [None, Some(""), Some("0"), Some("off"), Some(" off ")] {
+        assert_eq!(setting(off), Ok(false), "{off:?}");
+    }
+    assert_eq!(setting(Some("rows")), Ok(true));
+    for bad in ["1", "on", "row", "words"] {
+        assert!(setting(Some(bad)).is_err(), "{bad}");
+    }
 }
