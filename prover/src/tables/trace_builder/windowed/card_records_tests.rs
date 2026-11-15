@@ -45,6 +45,8 @@ fn row_table(table: StreamTable) -> bool {
             | StreamTable::Store
             | StreamTable::Memw
             | StreamTable::Shift
+            | StreamTable::MemLoad
+            | StreamTable::MemStore
     )
 }
 
@@ -55,13 +57,13 @@ fn families(s: &CardFillStamps) -> [[usize; 2]; 7] {
 }
 
 /// A room rule that admits every chunk.
-fn always() -> RecordsRoom {
+pub(super) fn always() -> RecordsRoom {
     Arc::new(|_| true)
 }
 
 /// A room rule that admits the first `n` chunks it is asked about, then none
 /// for `gap` asks, then every one again: a rule that changes its mind.
-fn for_first(n: usize, gap: usize) -> RecordsRoom {
+pub(super) fn for_first(n: usize, gap: usize) -> RecordsRoom {
     let asked = AtomicUsize::new(0);
     Arc::new(move |_| {
         let k = asked.fetch_add(1, Ordering::Relaxed);
@@ -97,7 +99,7 @@ fn unheld(mut chunk: StreamedChunk) -> (StreamedChunk, bool) {
 
 /// How a test hands the accumulator its windows.
 #[derive(Clone, Copy, Debug)]
-enum Walk {
+pub(super) enum Walk {
     /// The builder's own walker, keeping each window's logs.
     Own,
     /// The builder's own walker, window `k`'s logs swapped with window
@@ -150,7 +152,7 @@ fn held_in(
     registers: RegisterFormat,
 ) -> (Traces, usize, CardFillStamps) {
     let in_row = registers == RegisterFormat::InRow;
-    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)
+    let builder = WindowedTraceBuilder::new(program, &[], max_rows)
         .and_then(|b| b.register_format(registers))
         .and_then(WindowedTraceBuilder::drop_streamed_ops)
         .and_then(|b| b.card_fill_streamed(room, true, !in_row))
@@ -162,6 +164,22 @@ fn held_in(
             }
         })
         .expect("the builder");
+    held_by(builder, program, logs, window, walk, rows)
+}
+
+/// The run of `program` through `builder` (set up to hold CPU chunks as
+/// their logs, and with `rows` row families as their rows), by windows of
+/// `window` cycles walked as `walk` says, each records chunk then filled on
+/// the host, with the chunks put back; how many chunks were records; and the
+/// builder's stamps.
+pub(super) fn held_by(
+    mut builder: WindowedTraceBuilder<'_>,
+    program: &Elf,
+    logs: &[Log],
+    window: usize,
+    walk: Walk,
+    rows: bool,
+) -> (Traces, usize, CardFillStamps) {
     assert!(builder.keeps_logs());
     let mut jobs: Vec<ChunkJob> = Vec::new();
     let last = match walk {

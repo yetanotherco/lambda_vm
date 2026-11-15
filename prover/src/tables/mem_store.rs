@@ -162,6 +162,15 @@ impl MemStoreRow {
 /// The record's fields, for the tests that read a walk's rows back.
 #[cfg(test)]
 impl MemStoreRow {
+    /// A test's fault: the same row, its timestamp `cycles` later (its step
+    /// kept): a row the CPU never sent.
+    pub(crate) fn later(self, cycles: u64) -> Self {
+        Self {
+            timestamp: self.timestamp + cycles,
+            ..self
+        }
+    }
+
     #[inline]
     pub(crate) fn address(&self) -> u64 {
         self.address
