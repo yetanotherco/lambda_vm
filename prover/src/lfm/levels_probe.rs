@@ -11,7 +11,10 @@
 //! rows a compression; 15, about the 200 non-hash cells a compression a
 //! verified group spends), `RTP_RUNS` (timed runs after a warm-up; 1),
 //! `RTP_PROVE` (0: execute and fill only, no build or prove — the host seams
-//! alone, for a host without a card; 1 by default).
+//! alone, for a host without a card; 1 by default), `RTP_PREP_HOST` (1: the
+//! program's prepared stacks committed on the host, as a verifier commits
+//! them, so the card holds none of them through the prove; 0 by default: on
+//! the card).
 //!
 //! Each run prints its fill's split (the fixed chips' traces, the lean
 //! tables') and, when it proves, the prove's split (host preparation, phase A,
@@ -167,6 +170,7 @@ fn rtp_a_level_sized_lean_program_on_the_card() {
     let xalu: usize = env_list("RTP_XALU", "15")[0].parse().expect("RTP_XALU");
     let runs: usize = env_list("RTP_RUNS", "1")[0].parse().expect("RTP_RUNS");
     let prove_it = env_list("RTP_PROVE", "1")[0] != "0";
+    let prep_host = env_list("RTP_PREP_HOST", "0")[0] == "1";
     for logn in env_list("RTP_LOGN", "16") {
         let logn: u32 = logn.parse().expect("RTP_LOGN");
         let queries = (1usize << logn).div_ceil(PER_QUERY);
@@ -217,7 +221,7 @@ fn rtp_a_level_sized_lean_program_on_the_card() {
                 HASHER,
                 WlfmRate::Two,
                 WlfmLevers::with_family(family),
-                false,
+                prep_host,
             )
             .expect("builds");
             let built = t.elapsed().as_secs_f64();
@@ -233,7 +237,8 @@ fn rtp_a_level_sized_lean_program_on_the_card() {
                 .map(|(air, &(w, v))| format!("{} {w}x2^{v}", air.name()))
                 .collect();
             println!(
-                "RTP TABLES logn {logn} · family {family:?} · {} · groups {:?}",
+                "RTP TABLES logn {logn} · family {family:?} · prepared on the {} · {} · groups {:?}",
+                if prep_host { "host" } else { "card" },
                 tables.join(" · "),
                 a.sizes
             );
@@ -261,12 +266,20 @@ fn rtp_a_level_sized_lean_program_on_the_card() {
                 println!(
                     "RTP SPLIT logn {logn} · family {family:?} · run {run} · fill chips \
                      {chips:.3}s · fill lean {lean:.3}s · prove prep {:.3}s · phase A {:.3}s · \
-                     phase B {:.3}s · card budget {:.2} GiB · promised at the start {:.2} GiB",
+                     phase B {:.3}s · card budget {:.2} GiB · promised at the start {:.2} GiB · \
+                     prep parts: merge {:.3}s airs {:.3}s pairs {:.3}s check {:.3}s layouts \
+                     {:.3}s tables {:.3}s",
                     st.prep,
                     st.phase_a,
                     st.phase_b,
                     gib(st.card_budget),
                     gib(st.card_reserved_at_start),
+                    st.prep_parts[0],
+                    st.prep_parts[1],
+                    st.prep_parts[2],
+                    st.prep_parts[3],
+                    st.prep_parts[4],
+                    st.prep_parts[5],
                 );
                 if run == runs {
                     for (g, s) in st.groups.iter().enumerate() {
