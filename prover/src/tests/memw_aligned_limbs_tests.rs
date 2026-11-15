@@ -1250,11 +1250,19 @@ fn the_pinned_verifier_builds_the_limbs_air_for_every_memw_a_table() {
 #[cfg(feature = "parallel")]
 type TableInteractions = Vec<(String, Vec<BusInteraction>)>;
 
-/// The pinned block AIRs' interaction lists, one entry a table.
+/// The pinned block AIRs' interaction lists, plus one table of each fused
+/// memory kind, one entry a table.
 #[cfg(feature = "parallel")]
 fn block_interactions() -> TableInteractions {
-    pinned_block_airs()
-        .air_refs()
+    // The fused memory format's tables too (the production prover's format;
+    // the pinned verifier's is split): MEM_LOAD and MEM_STORE put their
+    // tokens on the memory bus themselves.
+    let mut airs = pinned_block_airs();
+    airs.with_fused_memory(
+        &stark::proof::options::ProofOptions::default_test_options(),
+        [1, 1],
+    );
+    airs.air_refs()
         .iter()
         .map(|air| (family(air.name()), air.bus_interactions().to_vec()))
         .collect()
@@ -1294,7 +1302,11 @@ fn column_ranges(columns: &[usize]) -> String {
 /// result of a `BYTE_ALU` lookup). The values that are neither are returned, a
 /// line a table, each column with the buses its table receives it on (where it
 /// comes from). A pure read (value = old, element by element) re-emits what it
-/// read and is skipped.
+/// read and is skipped. The same holds for the RAM tokens a table puts on the
+/// memory bus itself (the fused MEM_LOAD and MEM_STORE, PAGE): a new token's
+/// value is a constant byte, a byte-checked column, or the value of a token
+/// the table consumes (a read re-emits it; the census compares the forms, not
+/// the addresses). A token whose domain is a column relays MEMW messages.
 ///
 /// The census reads the interaction lists only: that a check's weight is on
 /// whenever the write's is, is read in each table's constraints (each write's
@@ -1403,6 +1415,62 @@ fn ram_values_without_a_byte_check(tables: &TableInteractions) -> Vec<UncheckedV
                 );
             }
         }
+        // The tokens a table puts on the memory bus itself (a receive there
+        // is the new token, a send the old one consumed): `(is_register,
+        // address low, address high, timestamp low, timestamp high, value)`.
+        let consumed: Vec<(u64, Vec<(usize, u64)>)> = interactions
+            .iter()
+            .filter(|i| i.bus_id == BusId::Memory as u64 && i.is_sender)
+            .map(|i| affine_elements(i)[5].clone())
+            .collect();
+        for i in interactions
+            .iter()
+            .filter(|i| i.bus_id == BusId::Memory as u64 && !i.is_sender)
+        {
+            let elements = affine_elements(i);
+            assert_eq!(elements.len(), 6, "{table}: a memory token of 6 elements");
+            match &elements[0] {
+                (1, terms) if terms.is_empty() => continue,
+                (0, terms) if terms.is_empty() => {}
+                // A token whose domain is a column: a relay of the MEMW bus's
+                // messages, whose senders the census above reads.
+                _ => {
+                    unchecked
+                        .entry(table.clone())
+                        .or_default()
+                        .1
+                        .insert("tokens relayed from MEMW messages".to_string());
+                    continue;
+                }
+            }
+            let value = &elements[5];
+            let source = match (value, single(value)) {
+                ((c, terms), _) if terms.is_empty() && *c < 256 => "a constant byte".to_string(),
+                (_, Some(column)) if checked.contains_key(&column) => checked[&column]
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ if consumed.contains(value) => "the value of a token it consumes".to_string(),
+                ((c, terms), _) => {
+                    let entry = unchecked.entry(table.clone()).or_default();
+                    match single(value) {
+                        Some(column) => {
+                            entry
+                                .0
+                                .entry(received_on(column))
+                                .or_default()
+                                .insert(column);
+                        }
+                        None => {
+                            entry.1.insert(format!("token {c} {terms:?}"));
+                        }
+                    }
+                    "unchecked".to_string()
+                }
+            };
+            println!("RAM TOKEN {table} at {:?}: {source}", i.multiplicity);
+        }
     }
     unchecked
         .into_iter()
@@ -1479,10 +1547,18 @@ const RAM_VALUES_WITHOUT_A_BYTE_CHECK: &[(&str, &str, &str)] = &[
         "OUTPUT_STATE: the round chip's reply at round 24, every byte of which is the result \
          of a BYTE_ALU XOR lookup in its round row",
     ),
+    (
+        "MEMW",
+        "tokens relayed from MEMW messages",
+        "its new tokens carry the value of the MEMW message it receives (is_register a \
+         column): the MEMW senders above are what the census reads",
+    ),
+    ("MEMW_A", "tokens relayed from MEMW messages", "as MEMW"),
 ];
 
 /// The census refuses a new unchecked writer: a table that loses its values'
-/// byte checks (STORE without its `ARE_BYTES` lookups), and a fake RAM writer
+/// byte checks (STORE, or MEM_STORE on the memory bus, without its `ARE_BYTES`
+/// lookups), and a fake RAM writer
 /// added to a table (HINT writing a column it never range-checks), each make
 /// [`every_value_written_to_ram_is_byte_checked_or_a_pinned_exception`]'s
 /// census differ from the pin, naming the table; the real lists match it.
@@ -1514,6 +1590,16 @@ fn an_unchecked_ram_writer_breaks_the_byte_census() {
         let before = list.len();
         list.retain(|i| !(i.bus_id == BusId::AreBytes as u64 && i.is_sender));
         assert!(list.len() < before, "STORE has ARE_BYTES lookups to drop");
+    });
+    // MEM_STORE, which writes its tokens on the memory bus itself, without
+    // its byte checks.
+    edited("MEM_STORE", &|list| {
+        let before = list.len();
+        list.retain(|i| !(i.bus_id == BusId::AreBytes as u64 && i.is_sender));
+        assert!(
+            list.len() < before,
+            "MEM_STORE has ARE_BYTES lookups to drop"
+        );
     });
     // HINT with a fake RAM write, at its own writes' weight, whose first value
     // is a column no lookup checks (the other elements constant 0).
