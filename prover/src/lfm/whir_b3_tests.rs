@@ -84,11 +84,12 @@ fn digest_words(bytes: &[u8; 32]) -> [LfmWord; 2] {
     })
 }
 
-/// The `LEAN_MUX` table's cells for `program`: a lean BLAKE3 program's
-/// one-output selects become mux rows of that narrower table (13 value
-/// columns, 4 bus interactions), which `airs::lfm_chip_census_with_hasher`
-/// does not count (it lists the LFM chips; the lean tables are apart). Every
-/// census that prices a leaf's field side adds these.
+/// The lean field tables' cells for `program`, which
+/// `airs::lfm_chip_census_with_hasher` does not count (it lists the LFM chips;
+/// the lean tables are apart): `LEAN_MUX` (a lean BLAKE3 program's one-output
+/// selects, 13 value columns), and under the indexed cap read `LEAN_CAP` (one
+/// row a cap node) and `LEAN_CAP_READ` (one row a read). Every census that
+/// prices a leaf's field side adds these.
 pub(crate) struct LeanMuxCells {
     /// Value cells at the table's padded heights (its chunks).
     pub padded_main: u64,
@@ -102,23 +103,48 @@ pub(crate) struct LeanMuxCells {
 
 pub(crate) fn lean_mux_cells(program: &LfmProgram) -> LeanMuxCells {
     use super::b3l_tables::B3lShape;
-    use super::chips::mux;
-    let main = (mux::cols::NUM_COLUMNS - super::layout::mux::PREP_WIDTH) as u64;
-    let aux = mux::bus_interactions().len().div_ceil(2) as u64;
+    use super::chips::{cap, cap_read, mux};
     let shape = B3lShape::of_program(program);
-    let padded: u64 = shape.muxes.iter().map(|&rows| rows as u64).sum();
-    // A program with no compression has no lean table, so no mux rows either.
-    let real = if shape.is_empty() {
-        0
-    } else {
-        program.groups.mux.real_rows as u64
+    // A program with no compression has no lean table, so none of these rows.
+    let lean = !shape.is_empty();
+    let g = &program.groups;
+    // (padded chunks, real rows, value columns, LogUp columns) of each lean
+    // field table: the one-output selects, the cap tables, the cap reads.
+    let tables = [
+        (
+            &shape.muxes,
+            g.mux.real_rows,
+            mux::cols::NUM_COLUMNS - super::layout::mux::PREP_WIDTH,
+            mux::bus_interactions().len().div_ceil(2),
+        ),
+        (
+            &shape.caps,
+            g.cap.real_rows,
+            cap::cols::NUM_COLUMNS - super::layout::cap::PREP_WIDTH,
+            cap::bus_interactions().len().div_ceil(2),
+        ),
+        (
+            &shape.cap_reads,
+            g.cap_read.real_rows,
+            cap_read::cols::NUM_COLUMNS - super::layout::cap_read::PREP_WIDTH,
+            cap_read::bus_interactions().len().div_ceil(2),
+        ),
+    ];
+    let mut cells = LeanMuxCells {
+        padded_main: 0,
+        padded_aux: 0,
+        real_main: 0,
+        real_aux: 0,
     };
-    LeanMuxCells {
-        padded_main: padded * main,
-        padded_aux: padded * aux,
-        real_main: real * main,
-        real_aux: real * aux,
+    for (chunks, real, main, aux) in tables {
+        let padded: u64 = chunks.iter().map(|&rows| rows as u64).sum();
+        let real = if lean { real as u64 } else { 0 };
+        cells.padded_main += padded * main as u64;
+        cells.padded_aux += padded * aux as u64;
+        cells.real_main += real * main as u64;
+        cells.real_aux += real * aux as u64;
     }
+    cells
 }
 
 fn publish_digest(b: &mut LfmBuilder, d: WrapDigest) {
@@ -1275,11 +1301,12 @@ mod chain {
         let mut config = format.chain_config(&[(1, n)]);
         config.format.group = multilinear::whir_chain::GroupFold::PerPoly;
         config.format.round0 = multilinear::whir_chain::Round0Trees::Each;
-        for (packed, cap) in [false, true]
+        use super::super::merkle_cap::{CAP_MUX_OVERRIDE, CapMux};
+        for (packed, cap) in [CapMux::Plain, CapMux::Packed, CapMux::Indexed]
             .into_iter()
             .flat_map(|p| (3u8..=8).map(move |c| (p, c)))
         {
-            super::super::merkle_cap::PACKED_MUX.with(|c| c.set(Some(packed)));
+            CAP_MUX_OVERRIDE.with(|c| c.set(Some(packed)));
             let mut c = config;
             c.format.cap = CapPolicy::Fixed(cap);
             let shape = ChainShape {
@@ -1319,7 +1346,7 @@ mod chain {
                 + muxes.real_main;
             let hash = compressions as u64 * 2_832;
             println!(
-                "CAP CELLS packed={packed} c={cap}: caps {:?} · {compressions} compressions ({hash} lean cells) · field main \
+                "CAP CELLS {packed:?} c={cap}: caps {:?} · {compressions} compressions ({hash} lean cells) · field main \
                  {field} (select {select}; with LogUp {field_aux}) · total {} (with LogUp {}) · rows {:?}",
                 shape.caps,
                 hash + field,
@@ -1327,7 +1354,7 @@ mod chain {
                 ChipRows::of(&leg)
             );
         }
-        super::super::merkle_cap::PACKED_MUX.with(|c| c.set(None));
+        CAP_MUX_OVERRIDE.with(|c| c.set(None));
         super::LEAN.with(|c| c.set(false));
     }
 
@@ -2495,13 +2522,12 @@ fn the_production_blake3_run_levers_by_closed_form() {
     report("query grind 24 + binary cap 6", &s, t);
 }
 
-/// Runs `f` with this thread's cap mux packed (`Some(true)`) or plain
-/// (`Some(false)`) whatever the knob says (`merkle_cap::PACKED_MUX`), then
-/// restores the knob's reading.
-fn with_cap_mux(packed: bool, f: impl FnOnce()) {
-    super::merkle_cap::PACKED_MUX.with(|c| c.set(Some(packed)));
+/// Runs `f` with this thread's cap check in `mode` whatever the knob says
+/// (`merkle_cap::CAP_MUX_OVERRIDE`), then restores the knob's reading.
+fn with_cap_mux(mode: super::merkle_cap::CapMux, f: impl FnOnce()) {
+    super::merkle_cap::CAP_MUX_OVERRIDE.with(|c| c.set(Some(mode)));
     f();
-    super::merkle_cap::PACKED_MUX.with(|c| c.set(None));
+    super::merkle_cap::CAP_MUX_OVERRIDE.with(|c| c.set(None));
 }
 
 /// ★ THE ROLLBACK MUX GATE. The cap is checked over packed digests by default
@@ -2512,7 +2538,7 @@ fn with_cap_mux(packed: bool, f: impl FnOnce()) {
 /// both lowerings.
 #[test]
 fn every_blake3_gate_holds_under_the_plain_cap_mux() {
-    with_cap_mux(false, || {
+    with_cap_mux(super::merkle_cap::CapMux::Plain, || {
         chain::a_blake3_chain_executes_on_a_proof_the_host_accepts();
         chain::a_blake3_chain_emits_its_compression_closed_form();
         chain::a_tampered_blake3_chain_cannot_execute();
@@ -2543,8 +2569,9 @@ fn the_packed_cap_mux_halves_the_muxs_select_rows() {
             .count()
     };
     let (mut plain, mut packed) = (None, None);
-    with_cap_mux(false, || plain = Some(chain::program(&shape)));
-    with_cap_mux(true, || packed = Some(chain::program(&shape)));
+    use super::merkle_cap::CapMux;
+    with_cap_mux(CapMux::Plain, || plain = Some(chain::program(&shape)));
+    with_cap_mux(CapMux::Packed, || packed = Some(chain::program(&shape)));
     let (plain, packed) = (
         plain.expect("the plain program"),
         packed.expect("the packed program"),
@@ -2593,7 +2620,8 @@ fn the_packed_cap_compare_admits_the_node_and_its_partners_only() {
     let l = Std::hash_new_parent(&nodes[0], &nodes[1]);
     let r = Std::hash_new_parent(&nodes[2], &nodes[3]);
     let root = Std::hash_new_parent(&l, &r);
-    let run = |packed: bool, idx: u64, leaf: [u8; 32]| -> bool {
+    use super::merkle_cap::{CAP_MUX_OVERRIDE, CapMux};
+    let run = |mode: CapMux, idx: u64, leaf: [u8; 32]| -> bool {
         let mut b = builder();
         // Words: four nodes, the leaf, the root (two words each), the index.
         let arena = b.declare_arena(13);
@@ -2604,12 +2632,12 @@ fn the_packed_cap_compare_admits_the_node_and_its_partners_only() {
         let leaf_d = digest(&mut b, 8);
         let root_d = digest(&mut b, 10);
         let root_lanes = [b.unpack(root_d[0]), b.unpack(root_d[1])];
-        super::merkle_cap::PACKED_MUX.with(|c| c.set(Some(packed)));
+        CAP_MUX_OVERRIDE.with(|c| c.set(Some(mode)));
         let cells = CapCells::authenticate(&mut b, &cap, &root_lanes);
         let index = b.hint_felt(arena, 12);
         let bits = b.bit_dec(index, 2);
         cells.verify_path(&mut b, leaf_d, &bits, &[]);
-        super::merkle_cap::PACKED_MUX.with(|c| c.set(None));
+        CAP_MUX_OVERRIDE.with(|c| c.set(None));
         let program = compile(b.finish());
         validate(&program).expect("admissible");
         let mut words: Vec<LfmWord> = Vec::new();
@@ -2622,24 +2650,24 @@ fn the_packed_cap_compare_admits_the_node_and_its_partners_only() {
         execute(&program, &[words], &crate::hash_pin::BLOCK_HASHER).is_ok()
     };
     under_both(|_lowering| {
-        for packed in [false, true] {
+        for packed in [CapMux::Plain, CapMux::Packed, CapMux::Indexed] {
             for idx in 0..4u64 {
                 assert!(
                     run(packed, idx, nodes[idx as usize]),
-                    "packed {packed}: node {idx} itself"
+                    "{packed:?}: node {idx} itself"
                 );
                 for lane in 0..8 {
                     let mut off = nodes[idx as usize];
                     off[4 * lane] ^= 0x01;
                     assert!(
                         !run(packed, idx, off),
-                        "packed {packed}: node {idx} with lane {lane} off"
+                        "{packed:?}: node {idx} with lane {lane} off"
                     );
                 }
             }
             assert!(
                 !run(packed, 1, nodes[2]),
-                "packed {packed}: another node's digest"
+                "{packed:?}: another node's digest"
             );
             // Node 2's partner: lane pair 0 from (a, 0) to (a + 1, 2^32 − 1).
             let mut partner = nodes[2];
@@ -2647,8 +2675,8 @@ fn the_packed_cap_compare_admits_the_node_and_its_partners_only() {
             partner[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
             assert_eq!(
                 run(packed, 2, partner),
-                packed,
-                "the partner digest passes the packed compare only (packed {packed})"
+                packed != CapMux::Plain,
+                "the partner digest passes the packed compare only ({packed:?})"
             );
         }
     });
@@ -2658,20 +2686,105 @@ fn the_packed_cap_compare_admits_the_node_and_its_partners_only() {
 /// `plain` the rollback, and anything else is refused.
 #[test]
 fn the_cap_mux_knob_reads_its_words_and_refuses_the_rest() {
-    use super::merkle_cap::{cap_mux_packed, cap_mux_setting};
-    assert!(
-        cap_mux_packed(),
+    use super::merkle_cap::{CapMux, cap_mux, cap_mux_setting};
+    assert_eq!(
+        cap_mux(),
+        CapMux::Packed,
         "no test sets the knob: the default is packed"
     );
     for (word, want) in [
-        (None, true),
-        (Some("plain"), false),
-        (Some(" packed "), true),
-        (Some("packed"), true),
+        (None, CapMux::Packed),
+        (Some("plain"), CapMux::Plain),
+        (Some(" packed "), CapMux::Packed),
+        (Some("packed"), CapMux::Packed),
+        (Some("indexed"), CapMux::Indexed),
     ] {
         assert_eq!(cap_mux_setting(word), Ok(want), "{word:?}");
     }
-    for word in ["", "on", "1", "Packed", "pack"] {
+    for word in ["", "on", "1", "Packed", "pack", "index", "Indexed"] {
         assert!(cap_mux_setting(Some(word)).is_err(), "{word:?}");
     }
+}
+
+/// ★ THE INDEXED CAP READ GATE. Every BLAKE3 chain and group gate again with
+/// the cap checked by an indexed read of a lookup table of its packed nodes
+/// (`LAMBDA_VM_LFM_CAP_MUX=indexed`): under the lean lowering the reads replace
+/// the mux, under `LFM_BLAKE3` the packed mux stands in. Honest proofs execute,
+/// every tamper has no execution, the compressions are the closed form's.
+#[test]
+fn every_blake3_gate_holds_under_the_indexed_cap_read() {
+    with_cap_mux(super::merkle_cap::CapMux::Indexed, || {
+        chain::a_blake3_chain_executes_on_a_proof_the_host_accepts();
+        chain::a_blake3_chain_emits_its_compression_closed_form();
+        chain::a_tampered_blake3_chain_cannot_execute();
+        chain::a_lean_blake3_chain_checks_its_tail_once_a_leaf();
+        chain::a_blake3_chain_with_a_final_polynomial_executes_and_refuses_its_tampers();
+        stacked::a_blake3_group_opening_executes_on_proofs_the_host_accepts();
+        stacked::a_tampered_joint_blake3_leg_cannot_execute();
+    });
+}
+
+/// The indexed read is the mode the gate above ran: in a lean program a
+/// capped chain emits one cap table a capped tree and one read an opening into
+/// it, in place of the packed mux's `Select` tree (fewer select-type rows, the
+/// same compressions); outside the lean lowering it emits no table and is the
+/// packed mux.
+#[test]
+fn the_indexed_cap_read_replaces_the_mux_in_a_lean_program() {
+    use super::merkle_cap::CapMux;
+    use super::whir_chain::ChainShape;
+    use multilinear::whir_chain::{CapPolicy, LeafOrder};
+    let cfg = chain::config(4, 0, CapPolicy::Fixed(4), LeafOrder::Coset, Some(6));
+    let shape = ChainShape::for_hash(&cfg, 12, WrapHash::Blake3);
+    let count =
+        |p: &LfmProgram, f: &dyn Fn(&Instr) -> bool| p.instrs.iter().filter(|i| f(i)).count();
+    let selects = |i: &Instr| matches!(i, Instr::Select { .. } | Instr::Mux { .. });
+    let tables = |i: &Instr| matches!(i, Instr::CapTable(_));
+    let reads = |i: &Instr| matches!(i, Instr::CapRead { .. });
+    under_both(|lowering| {
+        let (mut packed, mut indexed) = (None, None);
+        with_cap_mux(CapMux::Packed, || packed = Some(chain::program(&shape)));
+        with_cap_mux(CapMux::Indexed, || indexed = Some(chain::program(&shape)));
+        let (packed, indexed) = (packed.expect("packed"), indexed.expect("indexed"));
+        assert_eq!(
+            hash_rows(&packed),
+            hash_rows(&indexed),
+            "{lowering}: the read hashes nothing"
+        );
+        let capped_trees = shape.caps.iter().filter(|&&c| c > 0).count();
+        println!(
+            "INDEXED CAP READ {lowering}: caps {:?} · select-type rows {} -> {} · cap tables {} · reads {}",
+            shape.caps,
+            count(&packed, &selects),
+            count(&indexed, &selects),
+            count(&indexed, &tables),
+            count(&indexed, &reads)
+        );
+        if LEAN.with(std::cell::Cell::get) {
+            assert_eq!(
+                count(&indexed, &tables),
+                capped_trees,
+                "one table a capped tree"
+            );
+            assert!(
+                count(&indexed, &reads) > 0,
+                "the openings read their tables"
+            );
+            assert!(
+                count(&indexed, &selects) < count(&packed, &selects),
+                "the reads replace the mux"
+            );
+        } else {
+            assert_eq!(
+                count(&indexed, &tables) + count(&indexed, &reads),
+                0,
+                "no lean table outside the lean lowering"
+            );
+            assert_eq!(
+                indexed.instrs.len(),
+                packed.instrs.len(),
+                "the packed mux stands in"
+            );
+        }
+    });
 }
