@@ -72,7 +72,7 @@ pub(crate) fn aligned_row_from_access(
 ) -> Result<AlignedRow, String> {
     let refuse = |why: &str| format!("cycle {cycle}: {why}");
     // The clock's bound in history mode: every timestamp fits a `u32`.
-    if cycle >= executor::vm::history::HISTORY_MAX_CYCLES + 1 {
+    if cycle > executor::vm::history::HISTORY_MAX_CYCLES {
         return Err(refuse("past the history's clock"));
     }
     let row = decode
