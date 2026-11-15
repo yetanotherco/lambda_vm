@@ -279,6 +279,89 @@ fn a_block_one_table_short_of_the_real_rows_is_refused_on_the_bus() {
     }
 }
 
+/// ★ The same refusal at the pinned (production) format: lean KECCAK_RND,
+/// in-row registers, the limbs' MEMW_A order, one chain a group, the production
+/// stack. For each cut family, real-row tables left out three ways: the last
+/// one, a middle one (where the family has three or more), and all of them
+/// (the family's count 0). Each is refused as `BusImbalance` and accepted with
+/// the balance check off, so the balance alone objects.
+#[test]
+#[ignore = "proves small blocks at the production format, minutes on a CPU runner; box tier"]
+fn a_block_at_the_pinned_format_short_of_real_tables_is_refused_on_the_bus() {
+    let opts = ProofOptions::default_test_options();
+    let format = BlockFormat::pinned();
+    type Family = fn(
+        &mut Traces,
+    ) -> &mut Vec<
+        stark::trace::TraceTable<crate::test_utils::F, crate::test_utils::E>,
+    >;
+    let families: [(&str, &str, Family); 4] = [
+        ("test_keccak_multi", "KECCAK_RND", |t| &mut t.keccak_rnds),
+        ("test_keccak_multi", "KECCAK", |t| &mut t.keccaks),
+        ("test_ecsm_multi", "ECSM", |t| &mut t.ecsms),
+        ("test_ecsm_multi", "ECDAS", |t| &mut t.ecdases),
+    ];
+    type Edit = fn(&mut Vec<stark::trace::TraceTable<crate::test_utils::F, crate::test_utils::E>>);
+    let edits: [(&str, usize, Edit); 3] = [
+        ("the last", 1, |v| {
+            v.pop();
+        }),
+        ("a middle one", 3, |v| {
+            v.remove(1);
+        }),
+        ("all", 1, |v| v.clear()),
+    ];
+    let mut ran = 0;
+    for (program, family, tables) in families {
+        for (which, needs, edit) in edits {
+            let what = format!("{program} {family}: {which} left out");
+            let (elf_program, elf, mut traces) = traces(program, CutPadding::LastTable);
+            let real = tables(&mut traces).len();
+            if real < needs {
+                println!("BLOCK CUT PADDING PINNED SKIPPED: {what}: {real} real-row tables");
+                continue;
+            }
+            edit(tables(&mut traces));
+            let short = prove(&elf_program, &elf, &mut traces, &format);
+            let refusal =
+                verify_block_whir_traced(&short, &elf, &opts, &format, false, VerifierChecks::ALL)
+                    .unwrap_or_else(|e| panic!("{what}: the statement did not frame: {e:?}"));
+            assert!(
+                matches!(
+                    refusal,
+                    Err(BlockRefusal::Proof(multilinear::Error::BusImbalance))
+                ),
+                "{what}: refused for another reason, or accepted: {refusal:?}"
+            );
+            let unbalanced = verify_block_whir_traced(
+                &short,
+                &elf,
+                &opts,
+                &format,
+                false,
+                VerifierChecks {
+                    balance: false,
+                    ..VerifierChecks::ALL
+                },
+            )
+            .unwrap_or_else(|e| panic!("{what}: the statement did not frame: {e:?}"));
+            assert!(
+                unbalanced.is_ok(),
+                "{what}: with the balance check off another check refused: {unbalanced:?}"
+            );
+            println!(
+                "BLOCK CUT PADDING PINNED REFUSED: {what} ({real} real-row tables), refused as \
+                 BusImbalance; accepted with the balance check off"
+            );
+            ran += 1;
+        }
+    }
+    assert!(
+        ran >= 8,
+        "at least the last and all of each family ran: {ran}"
+    );
+}
+
 /// ★ The streamed prove, as the block runs it, counts the tables of its rule:
 /// test_keccak_multi's KECCAK_RND is three tables of 2^5 rows cut at the last
 /// real row (four with the whole run padded; KECCAK, ECSM and ECDAS at their
