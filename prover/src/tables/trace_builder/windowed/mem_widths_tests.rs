@@ -22,6 +22,11 @@ use std::sync::{Arc, Mutex};
 use executor::elf::Elf;
 use executor::vm::fast::FastExecutor;
 use executor::vm::history::{ECALL, NO_ACCESS, WindowHistory};
+use executor::vm::instruction::execution::{
+    BLAKE3_ABSORB_SYSCALL_NUMBER, BLAKE3_SYSCALL_NUMBER, DMA_MEMCPY_SYSCALL_NUMBER,
+    DMA_MEMSET_SYSCALL_NUMBER, ECREC_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER, HINT_SYSCALL_NUMBER,
+    KECCAK_SYSCALL_NUMBER, KECCAK256_SYSCALL_NUMBER,
+};
 use executor::vm::logs::Log;
 
 use super::WindowedTraceBuilder;
@@ -54,8 +59,25 @@ struct Chip {
     collide: u64,
 }
 
+/// An ECALL chip's calls: how many; with an 8-byte message off an 8-byte
+/// boundary (an unaligned buffer); with a message touching a word another
+/// message of the call touched at the same timestamp, and those messages;
+/// KECCAK256's input lengths mod 8; COPY's (memcpy, memmove, memset) source
+/// and destination offsets mod 8.
+#[derive(Clone, Copy, Debug, Default)]
+struct Calls {
+    calls: u64,
+    unaligned: u64,
+    colliding_calls: u64,
+    collisions: u64,
+    len_mod8: [u64; 8],
+    offsets: [[u64; 8]; 8],
+}
+
 #[derive(Default)]
 struct Census {
+    /// By syscall.
+    calls: BTreeMap<u64, Calls>,
     /// By (store, width).
     cpu: BTreeMap<(bool, u8), Class>,
     /// By (syscall, width).
@@ -121,43 +143,75 @@ impl Census {
         }
     }
 
-    /// The ECALL cycles' memory messages: `(cycle, address, width, timestamp)`
-    /// in walk order.
+    /// The ECALL cycles' memory messages `(address, width, timestamp)` (the
+    /// window's, in any order), grouped by cycle, and each call's registers
+    /// from the history (`x10`–`x12` before the call).
     fn chip_messages(
         &mut self,
         first: u64,
         logs: &[Log],
+        history: &WindowHistory,
         decode: &DecodeTable,
         messages: impl Iterator<Item = (u64, u8, u64)>,
     ) {
-        let mut seen: HashSet<(u64, u64)> = HashSet::new();
-        let mut cycle_of_seen = u64::MAX;
+        let mut by_cycle: BTreeMap<u64, Vec<(u64, u8, u64)>> = BTreeMap::new();
         for (addr, width, ts) in messages {
-            let cycle = (ts.saturating_sub(4)) / 4;
-            let Some(log) = cycle.checked_sub(first).and_then(|i| logs.get(i as usize)) else {
-                continue;
-            };
+            by_cycle
+                .entry(ts.saturating_sub(4) / 4)
+                .or_default()
+                .push((addr, width, ts));
+        }
+        for (i, log) in logs.iter().enumerate() {
             let is_ecall = decode
                 .row(log.current_pc)
                 .is_some_and(|r| decode.entry(r).fields.ecall);
             if !is_ecall {
                 continue;
             }
-            if cycle != cycle_of_seen {
-                seen.clear();
-                cycle_of_seen = cycle;
+            let syscall = log.src1_val;
+            let cycle = first + i as u64;
+            let reg = |r: u8| {
+                history
+                    .cycle_registers(i)
+                    .iter()
+                    .find(|c| c.reg == r)
+                    .map(|c| c.value)
+            };
+            let calls = self.calls.entry(syscall).or_default();
+            calls.calls += 1;
+            if syscall == KECCAK256_SYSCALL_NUMBER
+                && let Some(len) = reg(11)
+            {
+                calls.len_mod8[(len % 8) as usize] += 1;
             }
-            let width = width.max(1);
-            let words = (addr / 8)..=(addr.wrapping_add(u64::from(width) - 1) / 8);
-            let mut collide = false;
-            for word in words {
-                collide |= !seen.insert((word, ts));
+            if (syscall == DMA_MEMCPY_SYSCALL_NUMBER || syscall == DMA_MEMSET_SYSCALL_NUMBER)
+                && let (Some(dst), Some(src)) = (reg(10), reg(11))
+            {
+                calls.offsets[(src % 8) as usize][(dst % 8) as usize] += 1;
             }
-            let aligned = width == 1 || (addr as u32) & (u32::from(width) - 1) == 0;
-            let c = self.chips.entry((log.src1_val, width)).or_default();
-            c.count += 1;
-            c.aligned += u64::from(aligned);
-            c.collide += u64::from(collide);
+            let Some(messages) = by_cycle.get(&cycle) else {
+                continue;
+            };
+            let mut seen: HashSet<(u64, u64)> = HashSet::new();
+            let (mut unaligned8, mut collided) = (false, 0u64);
+            for &(addr, width, ts) in messages {
+                let width = width.max(1);
+                let mut collide = false;
+                for word in (addr / 8)..=(addr.wrapping_add(u64::from(width) - 1) / 8) {
+                    collide |= !seen.insert((word, ts));
+                }
+                let aligned = width == 1 || (addr as u32) & (u32::from(width) - 1) == 0;
+                unaligned8 |= width == 8 && addr % 8 != 0;
+                collided += u64::from(collide);
+                let c = self.chips.entry((syscall, width)).or_default();
+                c.count += 1;
+                c.aligned += u64::from(aligned);
+                c.collide += u64::from(collide);
+            }
+            let calls = self.calls.entry(syscall).or_default();
+            calls.unaligned += u64::from(unaligned8);
+            calls.colliding_calls += u64::from(collided > 0);
+            calls.collisions += collided;
         }
     }
 
@@ -190,6 +244,37 @@ impl Census {
                 "BLOCK MEM WIDTHS: {block} ECALL {syscall:#x} width {width}: {} · aligned {} · touch a word touched at the same timestamp {}",
                 c.count, c.aligned, c.collide
             );
+        }
+        for (&syscall, c) in &self.calls {
+            let name = match syscall {
+                64 => "COMMIT",
+                n if n == KECCAK_SYSCALL_NUMBER => "KECCAK permute",
+                n if n == KECCAK256_SYSCALL_NUMBER => "KECCAK sponge (keccak256)",
+                n if n == BLAKE3_SYSCALL_NUMBER => "BLAKE3",
+                n if n == BLAKE3_ABSORB_SYSCALL_NUMBER => "BLAKE3 absorb",
+                n if n == DMA_MEMCPY_SYSCALL_NUMBER => "COPY memcpy/memmove",
+                n if n == DMA_MEMSET_SYSCALL_NUMBER => "COPY memset",
+                n if n == HINT_SYSCALL_NUMBER => "HINT",
+                n if n == ECSM_SYSCALL_NUMBER => "ECSM",
+                n if n == ECREC_SYSCALL_NUMBER => "ECREC",
+                _ => "other",
+            };
+            let mut line = format!(
+                "BLOCK MEM CHIPS: {block} {name} ({syscall:#x}): calls {} · with an unaligned buffer {} · with a same-timestamp word collision {} ({} messages)",
+                c.calls, c.unaligned, c.colliding_calls, c.collisions
+            );
+            if c.len_mod8.iter().any(|&n| n > 0) {
+                line.push_str(&format!(" · input length mod 8 {:?}", c.len_mod8));
+            }
+            if c.offsets.iter().flatten().any(|&n| n > 0) {
+                let mix: Vec<String> = (0..8)
+                    .flat_map(|s| (0..8).map(move |d| (s, d)))
+                    .filter(|&(s, d)| c.offsets[s][d] > 0)
+                    .map(|(s, d)| format!("{s}/{d}:{}", c.offsets[s][d]))
+                    .collect();
+                line.push_str(&format!(" · (src mod 8)/(dst mod 8) {}", mix.join(" ")));
+            }
+            println!("{line}");
         }
         let routed: u64 = self.cpu.values().map(|c| c.memw_a).sum();
         println!(
@@ -263,7 +348,7 @@ fn census(program: &Elf, input: &[u8], window: usize, walkers: usize) -> Census 
                 .iter()
                 .filter(|op| !op.is_register)
                 .map(|op| (op.base_address, op.width, op.timestamp));
-            out.chip_messages(first, &logs, &decode, aligned.chain(general));
+            out.chip_messages(first, &logs, &history, &decode, aligned.chain(general));
             out.windows += 1;
             // The window's chunks are let go unbuilt.
             drop(accumulator.absorb(walked));
@@ -356,6 +441,10 @@ fn the_memory_width_census_counts_every_access_once() {
             !c.chips.is_empty(),
             "{name}: no ECALL memory message counted"
         );
+        assert!(!c.calls.is_empty(), "{name}: no ECALL call counted");
+        for k in c.calls.values() {
+            assert!(k.unaligned <= k.calls && k.colliding_calls <= k.calls);
+        }
     }
     assert!(widths.len() >= 3, "{widths:?}");
 }
