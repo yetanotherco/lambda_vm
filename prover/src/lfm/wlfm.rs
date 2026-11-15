@@ -564,17 +564,30 @@ impl TableIn<'_> {
         }
     }
 
-    fn column(&self, c: usize) -> Vec<FieldElement<F>> {
-        let wide = |t: &stark::trace::TraceTable<F, E>| {
-            (0..t.main_table.height)
-                .map(|r| *t.main_table.get(r, c))
-                .collect()
-        };
+    /// The cell at `(r, c)`, read where it lies.
+    fn get(&self, r: usize, c: usize) -> FieldElement<F> {
         match self {
-            TableIn::Wide(t) => wide(t),
-            TableIn::Owned(t) => wide(t),
-            TableIn::Held(h) => h.column(c),
+            TableIn::Wide(t) => *t.main_table.get(r, c),
+            TableIn::Owned(t) => *t.main_table.get(r, c),
+            TableIn::Held(h) => h.get(r, c),
         }
+    }
+
+    /// Whether the table's first `pinned.len()` columns are `pinned`, cell
+    /// for cell: rows in parallel, each row's cells read where they lie (no
+    /// column gathered, none widened).
+    fn prefix_is(&self, pinned: &[&[FieldElement<F>]]) -> bool {
+        use rayon::prelude::*;
+        let rows = self.shape().1;
+        if pinned.iter().any(|col| col.len() != rows) {
+            return false;
+        }
+        (0..rows).into_par_iter().with_min_len(1 << 14).all(|r| {
+            pinned
+                .iter()
+                .enumerate()
+                .all(|(c, col)| self.get(r, c) == col[r])
+        })
     }
 }
 
@@ -1217,6 +1230,9 @@ pub(crate) fn prove_wlfm_traces_as(
 #[derive(Clone, Debug, Default)]
 pub struct WlfmStamps {
     pub prep: f64,
+    /// `prep` by part: the merge split back, the AIR set and its shapes, the
+    /// trace pairs, the prefix check, the layouts, the committed tables.
+    pub prep_parts: [f64; 6],
     pub phase_a: f64,
     pub phase_b: f64,
     pub groups: Vec<multilinear_block::GroupStamps>,
@@ -1250,22 +1266,28 @@ fn prove_traces_under<H: WhirHash>(
         ));
     }
     let mut filled = filled;
+    let t_prep = std::time::Instant::now();
+    let mut parts = [0f64; 6];
     let mut b3l = filled.take_b3l();
     let (mut traces, public_words, hasher, execute_secs, fill_secs, exec_split) =
         filled.into_parts();
     // Every chip its own table: a set filled under the process's merge is
     // split back (a copy; [`execute_and_fill_unmerged`] fills it so).
     traces.merge_to(&Vec::new())?;
+    parts[0] = t_prep.elapsed().as_secs_f64();
     if hasher != artifacts.hasher {
         return Err(format!(
             "the traces were filled for {hasher:?} and the artifacts built for {:?}",
             artifacts.hasher
         ));
     }
-    let t_prep = std::time::Instant::now();
+    let t = std::time::Instant::now();
     let airs = artifacts.airs();
     let shapes = artifacts.shapes(&airs);
+    parts[1] = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
     let pairs = airs.air_trace_pairs(&mut traces, b3l.as_mut())?;
+    parts[2] = t.elapsed().as_secs_f64();
     if pairs.len() != shapes.len() {
         return Err(format!(
             "{} traces for {} tables",
@@ -1297,46 +1319,57 @@ fn prove_traces_under<H: WhirHash>(
         // check would fill it on the host, which the records exist to avoid,
         // so the prepared opening is what binds it. (The host-against-card
         // fill test and the proofs' byte equality check the fill.)
+        let t_check = std::time::Instant::now();
         if check_prefix
             && !table.is_records()
             && let Some((s, at, n)) = prefix_of[t]
         {
-            for (c, pinned) in stacks[s].columns[at..at + n].iter().enumerate() {
-                if table.column(c).as_slice() != pinned.evals() {
-                    return Err(format!(
-                        "{}: a preprocessed column is not the program's",
-                        air.name()
-                    ));
-                }
+            let pinned: Vec<&[FieldElement<F>]> = stacks[s].columns[at..at + n]
+                .iter()
+                .map(|col| col.evals())
+                .collect();
+            if !table.prefix_is(&pinned) {
+                return Err(format!(
+                    "{}: a preprocessed column is not the program's",
+                    air.name()
+                ));
             }
         }
         if check_prefix && artifacts.prep == WlfmPrep::Evaluated {
-            for (c, pinned) in artifacts.evaluated[t].iter().enumerate() {
-                if table.column(c).as_slice() != pinned.evals() {
-                    return Err(format!(
-                        "{}: a preprocessed column is not the program's",
-                        air.name()
-                    ));
-                }
+            let pinned: Vec<&[FieldElement<F>]> = artifacts.evaluated[t]
+                .iter()
+                .map(|col| col.evals())
+                .collect();
+            if !table.prefix_is(&pinned) {
+                return Err(format!(
+                    "{}: a preprocessed column is not the program's",
+                    air.name()
+                ));
             }
         }
+        parts[3] += t_check.elapsed().as_secs_f64();
+        let t_layout = std::time::Instant::now();
         let layout = layout_of(air, width, num_vars).map_err(|e| format!("{e:?}"))?;
+        parts[4] += t_layout.elapsed().as_secs_f64();
+        let t_table = std::time::Instant::now();
         let committed = match table {
+            // The row-major traces transposed by tiles (`columns_blocked`):
+            // each row's cache lines read once, not once a column.
             TableIn::Wide(trace) => {
-                let mut columns = trace.columns_main();
+                let mut columns = trace.main_table.columns_blocked();
                 CommittedTable::from_layout(layout, |col| {
                     core::mem::take(&mut columns[col as usize])
                 })
             }
             TableIn::Owned(trace) => {
-                let mut columns = trace.columns_main();
+                let mut columns = trace.main_table.columns_blocked();
                 CommittedTable::from_layout(layout, |col| {
                     core::mem::take(&mut columns[col as usize])
                 })
             }
             TableIn::Held(held) => match held.take() {
                 super::b3l_tables::HeldTable::Wide(trace) => {
-                    let mut columns = trace.columns_main();
+                    let mut columns = trace.main_table.columns_blocked();
                     CommittedTable::from_layout(layout, |col| {
                         core::mem::take(&mut columns[col as usize])
                     })
@@ -1350,6 +1383,7 @@ fn prove_traces_under<H: WhirHash>(
             },
         };
         tables.push(committed.map_err(|e| format!("{}: {e:?}", air.name()))?);
+        parts[5] += t_table.elapsed().as_secs_f64();
     }
     let prep_secs = t_prep.elapsed().as_secs_f64();
     let waited_before = super::device_permit::waited_secs();
@@ -1436,6 +1470,7 @@ fn prove_traces_under<H: WhirHash>(
     LAST_WLFM_STAMPS.with(|c| {
         *c.borrow_mut() = Some(WlfmStamps {
             prep: prep_secs,
+            prep_parts: parts,
             phase_a,
             phase_b,
             groups: group_stamps,
