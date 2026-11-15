@@ -5085,14 +5085,14 @@ static RECORDS_FILL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// [`RECORDS_FILL_LOCK`], taken through a poisoned lock (the test that failed
 /// holding it says why on its own).
-fn records_fill_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(super) fn records_fill_lock() -> std::sync::MutexGuard<'static, ()> {
     RECORDS_FILL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Every streamed CPU and MEMW_R chunk held as records
 /// ([`Deviations::card_fill_streamed`]), no row family's (whatever the
 /// knob's default), the room rule admitting every one.
-fn streamed_records(cpu: bool, memw_r: bool) -> Deviations {
+pub(super) fn streamed_records(cpu: bool, memw_r: bool) -> Deviations {
     Deviations {
         card_fill_streamed: Some([cpu, memw_r]),
         card_fill_rows: Some(RowFamilies::NONE),

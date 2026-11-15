@@ -123,6 +123,102 @@ fn a_fused_block_proves_and_verifies() {
     }
 }
 
+/// ★ A fused block whose streamed chunks are filled from their records moves
+/// no byte: every full MEM_LOAD and MEM_STORE chunk handed out as its rows,
+/// beside the CPU chunks as their logs and every other row family as its rows
+/// (chunks of four rows), each filled from them at its uploads (by the card in
+/// a build with one, by a host reader without), proves with the partition,
+/// tables and statement of the block built on the host, its bytes equal under
+/// the deterministic grind, and verifies.
+#[test]
+fn a_fused_block_filled_from_its_records_moves_no_byte() {
+    use crate::tables::trace_builder::RowFamilies;
+    let _fills = super::block_whir_tests::records_fill_lock();
+    let max_rows = MaxRowsConfig {
+        memw_aligned: 1 << 2,
+        load: 1 << 2,
+        store: 1 << 2,
+        memw: 1 << 2,
+        shift: 1 << 2,
+        mem_load: 1 << 2,
+        mem_store: 1 << 2,
+        ..MaxRowsConfig::small()
+    };
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    for name in ["fused_mem_cases", "all_loadstore_32"] {
+        let elf = asm_elf_bytes(name);
+        let proved = |deviations: Deviations| {
+            let mut o = super::block_whir_tests::streamed(max_rows.clone(), 5, 3);
+            o.drop_streamed_ops = true;
+            let (proof, stamps) = prove_block_whir_with(
+                &elf,
+                &[],
+                &ProofOptions::default_test_options(),
+                &fused(),
+                &o,
+                &deviations,
+            )
+            .expect("prove");
+            assert!(verifies(&proof, &elf, &fused()), "{name}");
+            (proof, stamps)
+        };
+        let (host, stamps) = proved(Deviations {
+            card_fill: Some(false),
+            card_fill_streamed: Some([false, false]),
+            card_fill_rows: Some(RowFamilies::NONE),
+            ..Deviations::default()
+        });
+        let off = stamps.windows.card_fill;
+        assert_eq!(
+            (off.mem_load, off.mem_store, off.records_bytes),
+            ([0, 0], [0, 0], 0),
+            "{name}: knob off"
+        );
+        // Regeneration is off here, and parked records need it: kept.
+        let (card, stamps) = proved(Deviations {
+            card_fill: Some(true),
+            card_fill_rows: Some(RowFamilies::ALL),
+            records_keep: Some(true),
+            ..super::block_whir_tests::streamed_records(true, true)
+        });
+        let c = stamps.windows.card_fill;
+        assert_eq!(c.room_out, None, "{name}: {c:?}");
+        assert!(
+            c.mem_load[0] > 0 && c.mem_store[0] > 0,
+            "{name}: fused chunks held: {c:?}"
+        );
+        assert_eq!(
+            (c.mem_load[1], c.mem_store[1]),
+            (0, 0),
+            "{name}: on the host: {c:?}"
+        );
+        let (on_card, on_host) = stamps.records_fills;
+        if cfg!(feature = "cuda") {
+            assert!(
+                on_card > 0,
+                "{name}: {on_card} on the card, {on_host} on the host"
+            );
+        } else {
+            assert_eq!(on_card, 0, "{name}: no card");
+        }
+        assert_eq!(host.groups, card.groups, "{name}: the partition");
+        assert_eq!(host.table_num_vars, card.table_num_vars, "{name}");
+        assert_eq!(host.fused_memory, card.fused_memory, "{name}");
+        assert_eq!(
+            format!("{:?}", host.table_counts),
+            format!("{:?}", card.table_counts),
+            "{name}"
+        );
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(&host), bytes(&card), "{name}: the proof");
+        }
+    }
+}
+
 /// ★ Each memory format refuses the other's proof: the format is the
 /// verifier's constant, never the proof's.
 #[test]

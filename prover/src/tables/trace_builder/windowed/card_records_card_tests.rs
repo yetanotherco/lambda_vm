@@ -779,3 +779,258 @@ fn the_card_fills_a_real_blocks_row_family_chunks_as_the_host_does() {
     }
     println!("CARD FILL REAL ROWS VERDICT PASS");
 }
+
+/// Chunks of four rows for the row families and the fused tables, so that the
+/// small programs fill several, their rows in one window part or many.
+fn fused_max() -> MaxRowsConfig {
+    MaxRowsConfig {
+        memw_aligned: 1 << 2,
+        load: 1 << 2,
+        store: 1 << 2,
+        memw: 1 << 2,
+        shift: 1 << 2,
+        mem_load: 1 << 2,
+        mem_store: 1 << 2,
+        ..MaxRowsConfig::small()
+    }
+}
+
+/// A builder under the block's formats with the fused memory format (in-row
+/// registers, MEMW_A in the step's limbs), its streamed ops dropped; with
+/// `held` (the test fault), its in-row CPU chunks held as their logs and every
+/// row family's as its rows.
+fn fused_builder<'a>(
+    program: &Elf,
+    input: &'a [u8],
+    max_rows: &MaxRowsConfig,
+    held: Option<u64>,
+) -> WindowedTraceBuilder<'a> {
+    use crate::tables::fused_memory::MemoryFormat;
+    let builder = WindowedTraceBuilder::new(program, input, max_rows)
+        .and_then(|b| b.register_format(RegisterFormat::InRow))
+        .and_then(|b| b.memw_aligned_order(MemwAlignedOrder::Limbs))
+        .and_then(|b| b.memory_format(MemoryFormat::Fused))
+        .and_then(WindowedTraceBuilder::drop_streamed_ops)
+        .expect("the builder");
+    match held {
+        None => builder,
+        Some(fault) => builder
+            .card_fill_streamed(always(), true, false)
+            .and_then(|b| b.card_fill_streamed_rows(RowFamilies::ALL))
+            .expect("the card fill")
+            .card_fill_streamed_fault(fault),
+    }
+}
+
+/// Every chunk the fused build of `program` streams by windows of `window`
+/// cycles (the finish's tables aside), in hand-out order: `(table, index,
+/// chunk)`, built as [`fused_builder`] says.
+fn fused_chunks(
+    program: &Elf,
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    held: Option<u64>,
+) -> Vec<(StreamTable, usize, super::StreamedChunk)> {
+    let mut builder = fused_builder(program, &[], max_rows, held);
+    let mut executor = Executor::new(program, Vec::new()).expect("the executor starts");
+    let (mut walker, mut accumulator) = builder.split();
+    let mut out = Vec::new();
+    let mut ahead: Option<Vec<Log>> = None;
+    while let Some(logs) = executor.resume_with_limit(window).expect("the run") {
+        // The run's last window is the finish's.
+        if let Some(previous) = ahead.replace(logs.to_vec()) {
+            let w = walker.walk_owned(previous).expect("a window");
+            for job in accumulator.absorb(w) {
+                out.push((job.table, job.index, job.generate()));
+            }
+        }
+    }
+    out
+}
+
+/// ★ The fused memory format's whole streamed build on the card: every chunk
+/// the build streams with every family held (the in-row CPU chunks as their
+/// logs, MEMW_A, LOAD, STORE, MEMW, SHIFT, MEM_LOAD and MEM_STORE as their
+/// rows) is, word for word, the chunk the same build makes without the card:
+/// each records chunk as the card fills it from its rows (counted as a card
+/// fill, and equal to its host fill), each other as built. The mutant: every
+/// held row moved 4 cycles later (the test fault) makes the card fill MEM_LOAD
+/// and MEM_STORE chunks other than the build's.
+#[test]
+fn the_card_fills_a_fused_build_as_the_host_builds_it() {
+    use crate::tables::card_fill_inputs::col_major;
+    use std::collections::HashMap;
+    let max_rows = fused_max();
+    // MEM_LOAD's and MEM_STORE's chunks filled on the card; and those in more
+    // than one window part.
+    let mut filled = [[0usize; 2]; 2];
+    let fused_at = |table: StreamTable| match table {
+        StreamTable::MemLoad => Some(0),
+        StreamTable::MemStore => Some(1),
+        _ => None,
+    };
+    for name in [
+        "fused_mem_cases",
+        "all_loadstore_32",
+        "all_instructions_64",
+        "test_blake3",
+    ] {
+        let (program, _) = run(name);
+        for window in [1, 7, 33] {
+            let plain: HashMap<(StreamTable, usize), Vec<u64>> =
+                fused_chunks(&program, &max_rows, window, None)
+                    .into_iter()
+                    .map(|(table, index, chunk)| ((table, index), col_major(&chunk.trace)))
+                    .collect();
+            let held = fused_chunks(&program, &max_rows, window, Some(0));
+            assert_eq!(held.len(), plain.len(), "{name}, window {window}: chunks");
+            for (table, index, mut chunk) in held {
+                let what = format!("{name}, window {window}, {table:?}[{index}]");
+                let want = plain.get(&(table, index)).expect("the same chunk");
+                match chunk.trace.take_records_main() {
+                    Some(records) => {
+                        check(&what, &records);
+                        let card = uploaded(&[TableColumns::Records(&records)]).concat();
+                        assert_eq!(
+                            card.iter().zip(want).filter(|(a, b)| a != b).count(),
+                            0,
+                            "{what}: the card's fill against the build's chunk"
+                        );
+                        assert_eq!(card.len(), want.len(), "{what}: words");
+                        if let Some(f) = fused_at(table) {
+                            filled[f][0] += 1;
+                            let pieces = row_family_pieces(&records);
+                            filled[f][1] += usize::from(pieces > 1);
+                        }
+                    }
+                    None => {
+                        assert_eq!(&col_major(&chunk.trace), want, "{what}: as built");
+                        assert!(fused_at(table).is_none(), "{what}: a fused chunk not held");
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        filled.iter().all(|f| f[0] > 1 && f[1] > 0),
+        "MEM_LOAD, MEM_STORE: {filled:?}"
+    );
+    // The mutant.
+    let (program, _) = run("fused_mem_cases");
+    let plain: HashMap<(StreamTable, usize), Vec<u64>> = fused_chunks(&program, &max_rows, 7, None)
+        .into_iter()
+        .map(|(table, index, chunk)| ((table, index), col_major(&chunk.trace)))
+        .collect();
+    let mut moved = [0usize; 2];
+    for (table, index, mut chunk) in fused_chunks(&program, &max_rows, 7, Some(4)) {
+        let Some(f) = fused_at(table) else {
+            continue;
+        };
+        let records = chunk.trace.take_records_main().expect("held as its rows");
+        let card = uploaded(&[TableColumns::Records(&records)]).concat();
+        moved[f] += usize::from(&card != plain.get(&(table, index)).expect("the same chunk"));
+    }
+    assert!(
+        moved.iter().all(|&n| n > 0),
+        "the fault moved no fused chunk's words: {moved:?}"
+    );
+}
+
+/// A fused family's records' pieces (window parts); 0 for another family.
+fn row_family_pieces(records: &Records) -> usize {
+    use multilinear::records::RecordsFill as R;
+    match records.fill() {
+        R::MemLoad { rows } => rows.len(),
+        R::MemStore { rows } => rows.len(),
+        _ => 0,
+    }
+}
+
+/// ★ A real block under the fused memory format (`BLOCK_WHIR_ELF`,
+/// `BLOCK_WHIR_INPUT`, the production heights): its first two MEM_LOAD and
+/// MEM_STORE chunks, held as their rows (each in the window parts of several
+/// windows), filled on the card with the words of the same chunks the build
+/// makes without the card, and of their host fills.
+#[test]
+#[ignore = "card: a box test (BLOCK_WHIR_ELF, BLOCK_WHIR_INPUT)"]
+fn the_card_fills_a_real_fused_blocks_chunks_as_the_host_builds_them() {
+    use crate::tables::card_fill_inputs::col_major;
+    let elf =
+        std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF")).expect("the ELF");
+    let input =
+        std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT")).expect("input");
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let options = crate::block_whir::BlockOptions::production();
+    let window = 1usize << options.window_log2.expect("the block streams");
+    let t = std::time::Instant::now();
+    let mut held = fused_builder(&program, &input, &options.max_rows, Some(0));
+    let mut plain = fused_builder(&program, &input, &options.max_rows, None);
+    let mut executor = Executor::new(&program, input.clone()).expect("the executor starts");
+    let (mut held_walker, mut held_acc) = held.split();
+    let (mut plain_walker, mut plain_acc) = plain.split();
+    // Per family: the chunks compared.
+    let mut compared = [0usize; 2];
+    let mut walked = 0usize;
+    let mut ahead: Option<Vec<Log>> = None;
+    while let Some(logs) = executor.resume_with_limit(window).expect("the run") {
+        if let Some(previous) = ahead.replace(logs.to_vec()) {
+            let logs = Arc::new(previous);
+            let built: Vec<_> = plain_acc
+                .absorb(
+                    plain_walker
+                        .walk_owned(Arc::clone(&logs))
+                        .expect("a window"),
+                )
+                .into_iter()
+                .filter(|job| matches!(job.table, StreamTable::MemLoad | StreamTable::MemStore))
+                .map(|job| (job.table, job.index, job.generate()))
+                .collect();
+            for job in held_acc.absorb(held_walker.walk_owned(logs).expect("a window")) {
+                let f = match job.table {
+                    StreamTable::MemLoad => 0,
+                    StreamTable::MemStore => 1,
+                    _ => continue,
+                };
+                let (table, index) = (job.table, job.index);
+                if compared[f] >= 2 {
+                    continue;
+                }
+                let what = format!("real fused {table:?}[{index}]");
+                let mut chunk = job.generate();
+                let records = chunk.trace.take_records_main().expect("held as its rows");
+                let (_, _, want) = built
+                    .iter()
+                    .find(|(t, i, _)| (*t, *i) == (table, index))
+                    .expect("the build without the card cut the same chunk");
+                let c = std::time::Instant::now();
+                check(&what, &records);
+                let card = uploaded(&[TableColumns::Records(&records)]).concat();
+                let want = col_major(&want.trace);
+                let differ = card.iter().zip(&want).filter(|(a, b)| a != b).count();
+                assert_eq!((differ, card.len()), (0, want.len()), "{what}");
+                println!(
+                    "CARD FILL REAL FUSED {table:?}[{index}] rows={} pieces={} windows={walked} \
+                     0 words differ secs={:.2}",
+                    records.rows(),
+                    row_family_pieces(&records),
+                    c.elapsed().as_secs_f64()
+                );
+                compared[f] += 1;
+            }
+            walked += 1;
+        }
+        if compared.iter().all(|&n| n >= 2) {
+            break;
+        }
+    }
+    assert!(
+        compared.iter().all(|&n| n > 0),
+        "{walked} windows walked: MEM_LOAD, MEM_STORE chunks compared {compared:?}"
+    );
+    println!(
+        "CARD FILL REAL FUSED VERDICT PASS mem_load={} mem_store={} windows={walked} secs={:.1}",
+        compared[0],
+        compared[1],
+        t.elapsed().as_secs_f64()
+    );
+}
