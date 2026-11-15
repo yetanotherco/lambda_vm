@@ -10310,7 +10310,7 @@ mod packer_tests {
                 registers,
                 ..BlockFormat::production()
             };
-            let airs = crate::block_airs(
+            let mut airs = crate::block_airs(
                 &program,
                 &opts,
                 &pages,
@@ -10320,6 +10320,8 @@ mod packer_tests {
                 format.memw_aligned,
                 registers,
             );
+            // The fused memory format's families, as a fused block holds them.
+            airs.with_fused_memory(&opts, [2, 2]);
             let stream = StreamAirs::new(
                 &opts,
                 TraceForm::Wide,
@@ -10348,6 +10350,8 @@ mod packer_tests {
                 (StreamTable::Shift, &airs.shifts),
                 (StreamTable::Store, &airs.stores),
                 (StreamTable::KeccakRnd, &airs.keccak_rnds),
+                (StreamTable::MemLoad, &airs.mem_loads),
+                (StreamTable::MemStore, &airs.mem_stores),
             ] {
                 let laid = stream.of(table).expect("the family's AIR");
                 for (i, air) in verifier.iter().enumerate() {
