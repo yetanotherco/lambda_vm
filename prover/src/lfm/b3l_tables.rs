@@ -450,7 +450,7 @@ impl HeldTable {
     pub fn get(&self, row: usize, col: usize) -> FE {
         match self {
             HeldTable::Wide(t) => *t.main_table.get(row, col),
-            HeldTable::Narrow(p) => FE::from(p.column(col)[row]),
+            HeldTable::Narrow(p) => FE::from(p.get(row, col)),
             HeldTable::Records(_) => self.column(col)[row],
         }
     }
@@ -760,6 +760,11 @@ const WRITE_TILE: usize = 8;
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 const BLOCKS_PER_WORKER_TURN: usize = 32;
 
+/// The fewest compressions the records path counts in one turn, for the same
+/// reason.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+const COMPRESSIONS_PER_COUNT_TURN: usize = 1 << 12;
+
 /// The bytes each round column's values need: tags and the word cells
 /// (`a`, `c` inputs, the message) four, everything else one (bytes, nibbles,
 /// bits, `MU`, `RND`).
@@ -1021,6 +1026,16 @@ fn fill_records<'p>(
         } else {
             (n, n)
         };
+        #[cfg(feature = "parallel")]
+        let ops: Vec<_> = {
+            use rayon::prelude::*;
+            (k_lo..k_hi)
+                .into_par_iter()
+                .with_min_len(1 << 12)
+                .map(op_of)
+                .collect()
+        };
+        #[cfg(not(feature = "parallel"))]
         let ops: Vec<_> = (k_lo..k_hi).map(op_of).collect();
         let skip = start.saturating_sub(l::ROUNDS * k_lo);
         rounds.push(HeldTable::Records(multilinear::records::Records(
@@ -1049,8 +1064,11 @@ fn fill_records<'p>(
     #[cfg(feature = "parallel")]
     let mut hist = {
         use rayon::prelude::*;
+        // A turn is many compressions long: each starts a fresh count of the
+        // byte table and ends merging it ([`BLOCKS_PER_WORKER_TURN`]'s reason).
         (0..n)
             .into_par_iter()
+            .with_min_len(COMPRESSIONS_PER_COUNT_TURN)
             .fold(
                 || {
                     (
