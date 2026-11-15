@@ -866,7 +866,8 @@ fn a_limbs_row_lays_out_counts_and_asks_lt_as_its_form_says() {
 
 /// The block verifier's AIRs under the pinned format ([`crate::block_airs`]
 /// with [`crate::block_whir::BlockFormat::pinned`]'s forms), one table of each
-/// family and two MEMW_A tables.
+/// family and two MEMW_A tables, and one MEM_LOAD and one MEM_STORE table of
+/// the fused memory format.
 #[cfg(feature = "parallel")]
 fn pinned_block_airs() -> crate::VmAirs {
     let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
@@ -907,7 +908,7 @@ fn pinned_block_airs() -> crate::VmAirs {
     let inputs =
         crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("the AIR inputs");
     let format = crate::block_whir::BlockFormat::pinned();
-    crate::block_airs(
+    let mut airs = crate::block_airs(
         &program,
         &opts,
         &pages,
@@ -916,7 +917,12 @@ fn pinned_block_airs() -> crate::VmAirs {
         format.keccak_rnd,
         format.memw_aligned,
         format.registers,
-    )
+    );
+    // One table of each fused memory kind (the production prover's memory
+    // format; the pinned verifier's is split): MEM_LOAD and MEM_STORE check
+    // memory themselves, so every census here reads them too.
+    airs.with_fused_memory(&opts, [1, 1]);
+    airs
 }
 
 /// A table's family: its AIR's name without the index.
@@ -1051,6 +1057,16 @@ const PINNED_HALF_WORD_SENDERS: &[(&str, &str, &str)] = &[
         "the residual register table's μ_read + μ_write + μ_keep, a bit (IS_BIT on the sum)",
     ),
     (
+        "MEM_LOAD",
+        "Column(20)",
+        "μ, a bit column (the fused load's span and limbs)",
+    ),
+    (
+        "MEM_STORE",
+        "Column(26)",
+        "μ, a bit column (the fused store's span and limbs)",
+    ),
+    (
         "MUL",
         "Sum(24, 25)",
         "μ_lo + μ_hi, each a byte by ARE_BYTES at weight 1",
@@ -1090,7 +1106,9 @@ fn affine_elements(i: &BusInteraction) -> Vec<(u64, Vec<(usize, u64)>)> {
 const CPU_FED: [BusId; 3] = [BusId::Ecall, BusId::Cpu32, BusId::MemoryOp];
 
 /// ★ The zero-high-word fact as a property of the AIRs, not of honest traces:
-/// on the block verifier's own AIR set, every sender on the MEMW bus puts at
+/// on the block verifier's own AIR set (with the fused memory tables, whose
+/// own RAM tokens are held to the same rule, being their own order check),
+/// every sender on the MEMW bus puts at
 /// the timestamp's high word either the constant 0 or one of its own columns,
 /// unscaled; and every such column is received, in the same table, on a bus
 /// only the CPU sends on (ECALL, CPU32, MEMORY_OP), where the CPU puts the
@@ -1182,6 +1200,68 @@ fn every_memw_sender_sends_the_clocks_zero_high_word() {
             }
         }
     }
+    // The tables that check memory order themselves rather than relaying
+    // MEMW messages (the fused MEM_LOAD and MEM_STORE: RAM tokens on the
+    // memory bus, the limbs' IS_HALF lookups, no MEMW receive): each RAM
+    // token's high word under the same rule.
+    for air in &refs {
+        let table = family(air.name());
+        let interactions = air.bus_interactions();
+        let checks_itself = interactions
+            .iter()
+            .any(|i| i.bus_id == BusId::IsHalfword as u64 && i.is_sender)
+            && !interactions
+                .iter()
+                .any(|i| i.bus_id == BusId::Memw as u64 && !i.is_sender);
+        if !checks_itself {
+            continue;
+        }
+        for i in interactions
+            .iter()
+            .filter(|i| i.bus_id == BusId::Memory as u64)
+        {
+            let elements = affine_elements(i);
+            if elements[0] != (0, Vec::new()) {
+                continue;
+            }
+            let (c, terms) = &elements[4];
+            assert_eq!(*c, 0, "{table}: a token high word with a constant part");
+            let [(column, 1)] = terms.as_slice() else {
+                assert!(terms.is_empty(), "{table}: a token high word {terms:?}");
+                census.insert(format!("{table} token 0"));
+                continue;
+            };
+            let mut sources: BTreeSet<String> = BTreeSet::new();
+            let mut from_cpu = false;
+            for r in interactions.iter().filter(|r| {
+                !r.is_sender && r.bus_id != BusId::Memw as u64 && r.bus_id != BusId::Memory as u64
+            }) {
+                for (k, (c, t)) in affine_elements(r).into_iter().enumerate() {
+                    if c == 0 && t == [(*column, 1)] {
+                        let bus = BusId::try_from(r.bus_id).expect("a bus id");
+                        sources.insert(format!("{bus:?}"));
+                        if CPU_FED.iter().any(|b| *b as u64 == r.bus_id) {
+                            let senders = &cpu_fed[&(r.bus_id, k)];
+                            assert!(
+                                senders.iter().all(|s| s.starts_with("CPU 0 []")),
+                                "{table}: {bus:?} element {k} is not the CPU's 0: {senders:?}"
+                            );
+                            from_cpu = true;
+                        }
+                    }
+                }
+            }
+            assert!(
+                from_cpu,
+                "{table}: its token high word, column {column}, comes from no CPU-fed bus \
+                 ({sources:?})"
+            );
+            census.insert(format!(
+                "{table} token column {column} from {}",
+                sources.into_iter().collect::<Vec<_>>().join(" + ")
+            ));
+        }
+    }
     for line in &census {
         println!("MEMW HIGH WORD {line}");
     }
@@ -1199,8 +1279,11 @@ fn every_memw_sender_sends_the_clocks_zero_high_word() {
 /// its sponge mode, its column 1 in its permute mode. The CPU sends no MEMW
 /// message under the pinned register format (its register accesses are
 /// tokens on the REG bus, checked in the row); its constant 0 was here before.
+/// The fused MEM_LOAD and MEM_STORE send no MEMW message: they check memory
+/// order themselves, so their RAM tokens' high word is pinned here (`token`),
+/// the row's own column received from the CPU's MEMORY_OP dispatch.
 #[cfg(feature = "parallel")]
-const PINNED_MEMW_HIGH_WORDS: [&str; 11] = [
+const PINNED_MEMW_HIGH_WORDS: [&str; 13] = [
     "BLAKE3 column 1 from Blake3Absorb + Ecall",
     "COPY column 1 from CopyNext + Ecall",
     "CPU32 column 1 from Cpu32",
@@ -1211,6 +1294,8 @@ const PINNED_MEMW_HIGH_WORDS: [&str; 11] = [
     "KECCAK 0",
     "KECCAK column 1 from Ecall + Keccak + KeccakSponge",
     "LOAD column 3 from MemoryOp",
+    "MEM_LOAD token column 4 from MemoryOp",
+    "MEM_STORE token column 4 from MemoryOp",
     "STORE column 3 from MemoryOp",
 ];
 
@@ -1250,19 +1335,12 @@ fn the_pinned_verifier_builds_the_limbs_air_for_every_memw_a_table() {
 #[cfg(feature = "parallel")]
 type TableInteractions = Vec<(String, Vec<BusInteraction>)>;
 
-/// The pinned block AIRs' interaction lists, plus one table of each fused
-/// memory kind, one entry a table.
+/// The pinned block AIRs' interaction lists (the fused memory tables among
+/// them), one entry a table.
 #[cfg(feature = "parallel")]
 fn block_interactions() -> TableInteractions {
-    // The fused memory format's tables too (the production prover's format;
-    // the pinned verifier's is split): MEM_LOAD and MEM_STORE put their
-    // tokens on the memory bus themselves.
-    let mut airs = pinned_block_airs();
-    airs.with_fused_memory(
-        &stark::proof::options::ProofOptions::default_test_options(),
-        [1, 1],
-    );
-    airs.air_refs()
+    pinned_block_airs()
+        .air_refs()
         .iter()
         .map(|air| (family(air.name()), air.bus_interactions().to_vec()))
         .collect()
