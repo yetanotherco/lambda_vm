@@ -2470,6 +2470,12 @@ impl<'a> FinishPlan<'a> {
         if split != TailSplit::Off {
             build_stamps::mark(&format!("p5 tail split {split:?}"));
         }
+        if !seeded_estimates() {
+            build_stamps::mark("p5 first estimates wide");
+        }
+        if crate::tables::gpack_seeds::cpu_seed_base() {
+            build_stamps::mark("p5 cpu seed base");
+        }
         if crate::tables::gpack_seeds::seed_widths_on() {
             let seeded = crate::tables::gpack_seeds::seed_finish_widths();
             build_stamps::mark(&format!("p5 seeded {seeded} kinds"));
@@ -3448,15 +3454,19 @@ impl<'a> FinishPlan<'a> {
         // BITWISE is the rest's first table: its position is 0.
         let last = (slide && self.header.bitwise_last).then_some(0);
         let keccak_rnd_first = slide && self.header.keccak_rnd_first;
+        // Tables written packed (G-pack): a family's first table is estimated
+        // at its kind's seeded widths, once `units_keeping` has seeded them.
+        let written_packed = self.skip.pack && self.skip.gpack && !cfg!(feature = "debug-checks");
         let (units, regen, side) = match self.units_keeping(keep) {
             Ok((units, regen, side)) => (Ok(units), regen, side),
             Err(e) => (Err(e), None, None),
         };
+        let first_rows = first_rows(written_packed && seeded_estimates());
         let first = match &units {
             Ok(units) if keccak_rnd_first => positions_of(units, family("KECCAK_RND")),
             _ => Vec::new(),
         };
-        emit_streamed_units_ordered(units, gate, send, slide, &first, last, side)?;
+        emit_streamed_units_ordered(units, gate, send, slide, &first, last, side, first_rows)?;
         Ok(regen)
     }
 }
@@ -3476,12 +3486,13 @@ fn emit_streamed_units<'a>(
     last: Option<usize>,
     side: Option<Side<'a>>,
 ) -> Result<(), Error> {
-    emit_streamed_units_ordered(units, gate, send, slide, &[], last, side)
+    emit_streamed_units_ordered(units, gate, send, slide, &[], last, side, NO_FIRST_ROWS)
 }
 
 /// [`emit_streamed_units`], sliding with the positions `first` (ascending)
 /// handed on before every other, in their order ([`hand_on_order_first`]).
 /// In waves `first` is ignored: AIR order.
+#[allow(clippy::too_many_arguments)]
 fn emit_streamed_units_ordered<'a>(
     units: Result<Vec<Unit<'a>>, Error>,
     gate: &gate::ByteGate,
@@ -3490,10 +3501,11 @@ fn emit_streamed_units_ordered<'a>(
     first: &[usize],
     last: Option<usize>,
     side: Option<Side<'a>>,
+    first_rows: FirstRows,
 ) -> Result<(), Error> {
     #[cfg(feature = "parallel")]
     let result = if slide {
-        emit_units_sliding(units, gate, send, first, last, side)
+        emit_units_sliding(units, gate, send, first, last, side, first_rows)
     } else {
         if let Some(side) = side {
             side();
@@ -3502,7 +3514,7 @@ fn emit_streamed_units_ordered<'a>(
     };
     #[cfg(not(feature = "parallel"))]
     let result = {
-        let _ = (slide, first, last);
+        let _ = (slide, first, last, first_rows);
         if let Some(side) = side {
             side();
         }
@@ -3514,16 +3526,63 @@ fn emit_streamed_units_ordered<'a>(
     result
 }
 
+/// A family's bytes a row before one of its tables is built, by [`FAMILIES`]
+/// index: `None` for eight bytes a cell.
+type FirstRows = [Option<f64>; FAMILIES.len()];
+
+/// No first estimates: every family's first table at eight bytes a cell.
+const NO_FIRST_ROWS: FirstRows = [None; FAMILIES.len()];
+
+/// `LAMBDA_VM_FINISH_SEEDED_ESTIMATES=0` estimates a family's first table at
+/// eight bytes a cell, as before; unset or any other word, at the bytes a row
+/// its kind's seeded widths take ([`first_rows`]), where its tables are
+/// written packed. Admission only: the tables are the same.
+fn seeded_estimates() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        seeded_estimates_from(
+            std::env::var("LAMBDA_VM_FINISH_SEEDED_ESTIMATES")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`seeded_estimates`]'s reading of `LAMBDA_VM_FINISH_SEEDED_ESTIMATES`.
+fn seeded_estimates_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+/// Each family's first-table bytes a row: its kind's packed row at the widths
+/// its hint holds ([`crate::tables::gpack_seeds::bytes_a_row`]) when `on`, for
+/// the kinds the seeds cover; none for the others, or when off.
+fn first_rows(on: bool) -> FirstRows {
+    let mut rows = NO_FIRST_ROWS;
+    if on {
+        for (slot, &(name, _)) in rows.iter_mut().zip(&FAMILIES) {
+            *slot = crate::tables::gpack_seeds::bytes_a_row(name).map(|b| b as f64);
+        }
+    }
+    rows
+}
+
 /// A table's bytes before it is built: its family's measured bytes a row once
-/// one of the family has been built, eight bytes a cell before.
+/// one of the family has been built; before, its first-table estimate
+/// ([`FirstRows`]), else eight bytes a cell.
 struct Estimates {
     per_row: [Option<f64>; FAMILIES.len()],
+    first: FirstRows,
 }
 
 impl Estimates {
     fn new() -> Self {
+        Self::with_first(NO_FIRST_ROWS)
+    }
+
+    fn with_first(first: FirstRows) -> Self {
         Self {
             per_row: [None; FAMILIES.len()],
+            first,
         }
     }
 
@@ -3534,6 +3593,7 @@ impl Estimates {
             .get(family)
             .copied()
             .flatten()
+            .or_else(|| self.first.get(family).copied().flatten())
             .unwrap_or(wide as f64);
         (a_row * rows as f64).ceil() as usize
     }
@@ -3669,6 +3729,7 @@ fn emit_units_sliding<'a>(
     first: &[usize],
     last: Option<usize>,
     side: Option<Side<'a>>,
+    first_rows: FirstRows,
 ) -> Result<(), Error> {
     let units = units?;
     let last_waits = side.is_some();
@@ -3680,7 +3741,7 @@ fn emit_units_sliding<'a>(
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(side));
             });
         }
-        slide_units(units, gate, send, first, last, last_waits)
+        slide_units(units, gate, send, first, last, last_waits, first_rows)
     })
 }
 
@@ -3693,9 +3754,10 @@ fn slide_units(
     first: &[usize],
     last: Option<usize>,
     last_waits: bool,
+    first_rows: FirstRows,
 ) -> Result<(), Error> {
     let total = units.len();
-    let mut estimates = Estimates::new();
+    let mut estimates = Estimates::with_first(first_rows);
     // Built, not yet handed on, by AIR position (`Some(None)`: a streamed
     // chunk's slot).
     let mut ready: Vec<Option<Option<Table>>> = (0..total).map(|_| None).collect();
@@ -3941,6 +4003,44 @@ mod page_direct_tests {
         assert!(page_direct_from(Some(" 1 ")));
         assert!(!page_direct_from(Some("0")));
         assert!(!page_direct_from(Some(" 0")));
+    }
+}
+
+#[cfg(test)]
+mod first_estimate_tests {
+    use super::{Estimates, FAMILIES, NO_FIRST_ROWS, family, first_rows, seeded_estimates_from};
+
+    /// Seeded first estimates are on unset and for any word but `0`.
+    #[test]
+    fn seeded_estimates_are_on_by_default_and_0_rolls_them_back() {
+        assert!(seeded_estimates_from(None));
+        assert!(seeded_estimates_from(Some("1")));
+        assert!(!seeded_estimates_from(Some("0")));
+        assert!(!seeded_estimates_from(Some(" 0 ")));
+    }
+
+    /// A family's first table is estimated at its seeded row once the seeds
+    /// are in, at eight bytes a cell without them or off, and at its measured
+    /// row once one of its tables is built; a kind without a seed (PAGE) stays
+    /// at eight bytes a cell.
+    #[test]
+    fn a_first_table_is_estimated_at_its_seeded_row() {
+        crate::tables::gpack_seeds::seed_finish_widths();
+        let (cpu, page) = (family("CPU"), family("PAGE"));
+        let wide = |f: usize| FAMILIES[f].1 * 8;
+        let on = first_rows(true);
+        let seeded = on[cpu].expect("CPU's seed is in") as usize;
+        assert!(
+            seeded > 0 && seeded < wide(cpu),
+            "CPU's packed row {seeded} under {}",
+            wide(cpu)
+        );
+        assert_eq!(on[page], None);
+        assert_eq!(first_rows(false), NO_FIRST_ROWS);
+        let estimates = Estimates::with_first(on);
+        assert_eq!(estimates.of(cpu, 1000), seeded * 1000);
+        assert_eq!(estimates.of(page, 1000), wide(page) * 1000);
+        assert_eq!(Estimates::new().of(cpu, 1000), wide(cpu) * 1000);
     }
 }
 

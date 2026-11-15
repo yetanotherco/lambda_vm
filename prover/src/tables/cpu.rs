@@ -877,7 +877,7 @@ pub(crate) fn generate_cpu_trace_split_as(
 pub(crate) use multilinear::records::CpuSide;
 
 /// The widths in-row CPU traces needed so far in this process.
-static WIDTHS_INROW: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS_INROW: WidthHint = WidthHint::new();
 
 /// [`generate_cpu_trace_segments_as`] under the in-row register format: the
 /// same rows at [`inrow_cols::NUM_COLUMNS_INROW`] columns, `sides` (one a CPU
