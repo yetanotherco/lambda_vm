@@ -434,6 +434,11 @@ pub enum BusId {
     /// The lean BLAKE3 round chain: `(tag, round, state, message)` from a
     /// compression's head row through its seven round rows and back.
     B3lRound = 41,
+    /// An authenticated Merkle cap read at a computed index: `(tag, index,
+    /// word)` against the `LEAN_CAP` table's rows (one a cap node, its word
+    /// bound to the authenticated cell), read by `LEAN_CAP_READ` rows
+    /// (`lfm::lean_cap`). ID 42: the next free one.
+    CapLookup = 42,
 }
 
 impl BusId {
@@ -472,6 +477,7 @@ impl BusId {
             BusId::IsWh => "IsWh",
             BusId::B3lXor => "B3lXor",
             BusId::B3lRound => "B3lRound",
+            BusId::CapLookup => "CapLookup",
         }
     }
 }
@@ -513,6 +519,7 @@ impl TryFrom<u64> for BusId {
             37 => Ok(BusId::IsWh),
             40 => Ok(BusId::B3lXor),
             41 => Ok(BusId::B3lRound),
+            42 => Ok(BusId::CapLookup),
             other => Err(other),
         }
     }

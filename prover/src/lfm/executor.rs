@@ -73,6 +73,14 @@ pub enum LfmExecError {
     /// cases the program is unprovable under that hasher, so failing here — with
     /// a reason — beats failing later inside the prover.
     HasherRejected(&'static str),
+    /// A cap read's handle names no cap table executed before it (`tag`).
+    NoCapTable(u64),
+    /// A cap read's index has no node in its table: the lookup has no row to
+    /// match, so the program would be unprovable.
+    CapIndexOutOfRange {
+        tag: u64,
+        index: u64,
+    },
     Internal(&'static str),
 }
 
@@ -101,6 +109,15 @@ pub struct SelectRow {
     pub in_r: LfmWord,
     pub out_l: LfmWord,
     pub out_r: LfmWord,
+}
+
+/// One `Instr::CapRead` row's values: the handle's tag, the index, the word
+/// read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapReadRow {
+    pub tag: FE,
+    pub index: FE,
+    pub out: LfmWord,
 }
 
 /// One `Instr::Mux` row's values: the bit, both arms, the chosen one.
@@ -180,6 +197,10 @@ pub struct LfmRecords {
     /// only; the mode, constants, addresses and read counts are the program's.
     pub b3l: Vec<B3lValues>,
     pub mux: Vec<MuxRow>,
+    /// One `LEAN_CAP` row a cap node: the node's word as its cell held it,
+    /// tables in program order. The reads' counts are the fill's.
+    pub cap: Vec<LfmWord>,
+    pub cap_read: Vec<CapReadRow>,
 }
 
 impl LfmRecords {
@@ -217,6 +238,8 @@ impl LfmRecords {
             public: Vec::with_capacity(groups.public.real_rows),
             b3l: Vec::with_capacity(groups.b3l.real_rows),
             mux: Vec::with_capacity(groups.mux.real_rows),
+            cap: Vec::with_capacity(groups.cap.real_rows),
+            cap_read: Vec::with_capacity(groups.cap_read.real_rows),
         }
     }
 }
@@ -257,7 +280,8 @@ impl LfmRecords {
             )+};
         }
         commit!(
-            balu, xalu, select, bitdec, keccak, blake3, lanes, hint, public, b3l, mux
+            balu, xalu, select, bitdec, keccak, blake3, lanes, hint, public, b3l, mux, cap,
+            cap_read
         );
         // `LFM_HASH`'s rows are one vector or the other, by the program's width.
         let rows = groups.hash.real_rows;
@@ -292,7 +316,11 @@ impl LfmRecords {
             + groups.blake3.real_rows * size_of::<Blake3Values>()
             + groups.b3l.real_rows * size_of::<B3lValues>()
             + groups.mux.real_rows * size_of::<MuxRow>()
-            + (groups.lanes.real_rows + groups.hint.real_rows + groups.public.real_rows)
+            + groups.cap_read.real_rows * size_of::<CapReadRow>()
+            + (groups.lanes.real_rows
+                + groups.hint.real_rows
+                + groups.public.real_rows
+                + groups.cap.real_rows)
                 * size_of::<LfmWord>()
     }
 }
@@ -340,6 +368,20 @@ impl Sink {
                     v.capacity()
                 );
                 unsafe { v.as_mut_ptr().add(n as usize).write(value) }
+            }
+        }
+    }
+
+    /// [`Self::put`] of an instruction that takes several rows of one chip
+    /// (a cap table, one a node): appended in order, or written from its
+    /// first row on.
+    fn put_run<T>(self, v: &mut Vec<T>, values: impl IntoIterator<Item = T>) {
+        match self {
+            Sink::Push => v.extend(values),
+            Sink::Slot(n) => {
+                for (k, value) in values.into_iter().enumerate() {
+                    Sink::Slot(n + k as u32).put(v, value);
+                }
             }
         }
     }
@@ -445,6 +487,9 @@ struct Machine<'a> {
     /// empty until its piece lands. Empty for every other execution, which
     /// reads `arenas`.
     pieces: Vec<Vec<(u32, u32, &'a [LfmWord])>>,
+    /// The cap tables executed so far, by tag: their nodes' words, which a
+    /// cap read returns from (the proof's lookup binds them to the cells).
+    caps: Vec<Vec<LfmWord>>,
 }
 
 /// Word `index` of a pieced arena: from the piece that holds it, once that
@@ -884,6 +929,49 @@ fn step(
                         in_l: l,
                         in_r: r,
                         out: chosen,
+                    },
+                );
+            }
+            Instr::CapTable(t) => {
+                let words = t
+                    .nodes
+                    .iter()
+                    .map(|&node| m.read_word(node))
+                    .collect::<Result<Vec<_>, _>>()?;
+                m.write(t.handle, base_word(FE::from(u64::from(t.tag))))?;
+                let tag = t.tag as usize;
+                if m.caps.len() <= tag {
+                    m.caps.resize_with(tag + 1, Vec::new);
+                }
+                if !m.caps[tag].is_empty() {
+                    return Err(LfmExecError::Internal("two cap tables share a tag"));
+                }
+                m.caps[tag] = words.clone();
+                sink.put_run(&mut records.cap, words);
+            }
+            Instr::CapRead {
+                handle, index, out, ..
+            } => {
+                let tag = m.read_base(*handle)?;
+                let at = m.read_base(*index)?;
+                let (t, i) = (tag.canonical(), at.canonical());
+                let table = usize::try_from(t)
+                    .ok()
+                    .and_then(|t| m.caps.get(t))
+                    .filter(|nodes| !nodes.is_empty())
+                    .ok_or(LfmExecError::NoCapTable(t))?;
+                let word = usize::try_from(i)
+                    .ok()
+                    .and_then(|i| table.get(i))
+                    .copied()
+                    .ok_or(LfmExecError::CapIndexOutOfRange { tag: t, index: i })?;
+                m.write(*out, word)?;
+                sink.put(
+                    &mut records.cap_read,
+                    CapReadRow {
+                        tag,
+                        index: at,
+                        out: word,
                     },
                 );
             }
@@ -1378,6 +1466,7 @@ fn execute_inner(
         memory: WriteOnceMemory::new(program.num_addrs as usize),
         arenas: arenas.iter().map(Vec::as_slice).collect(),
         pieces: Vec::new(),
+        caps: Vec::new(),
     };
     let mut records = LfmRecords::with_capacity(&program.groups, program.hash16());
     let mut public_words = Vec::with_capacity(program.groups.public.real_rows);
@@ -1721,6 +1810,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             memory: WriteOnceMemory::new(program.num_addrs as usize),
             arenas: vec![&[]; schema.len()],
             pieces: Vec::new(),
+            caps: Vec::new(),
         };
         let records = LfmRecords::with_capacity(&program.groups, program.hash16());
         let public_words = Vec::with_capacity(program.groups.public.real_rows);
@@ -2125,7 +2215,8 @@ pub fn locate_addr(program: &LfmProgram, addr: u64) -> String {
             Instr::Const { out, .. } => vec![out.0],
             Instr::BaseAlu { out, .. } | Instr::ExtAlu { out, .. } => vec![out.0],
             Instr::Select { out_l, out_r, .. } => vec![out_l.0, out_r.0],
-            Instr::Mux { out, .. } => vec![out.0],
+            Instr::Mux { out, .. } | Instr::CapRead { out, .. } => vec![out.0],
+            Instr::CapTable(t) => vec![t.handle.0],
             Instr::BitDec { bits, halves, .. } => bits
                 .iter()
                 .map(|(a, _)| a.0)

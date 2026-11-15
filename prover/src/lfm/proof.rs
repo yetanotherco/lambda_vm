@@ -336,15 +336,19 @@ pub(crate) fn lfm_fill_executed_under(
     // The one-output selects ride the lean tables (only a program with
     // compressions has them).
     let mux_records = core::mem::take(&mut records.mux);
+    let cap_records = core::mem::take(&mut records.cap);
+    let read_records = core::mem::take(&mut records.cap_read);
     if let Some(lean) = b3l.as_mut() {
         lean.muxes = super::b3l_tables::build_mux_tables(program, &mux_records);
+        (lean.caps, lean.cap_reads) =
+            super::b3l_tables::build_cap_tables(program, &cap_records, &read_records);
     } else {
         assert!(
-            mux_records.is_empty(),
-            "one-output selects in a program with no lean compression"
+            mux_records.is_empty() && cap_records.is_empty() && read_records.is_empty(),
+            "one-output selects or cap reads in a program with no lean compression"
         );
     }
-    drop(mux_records);
+    drop((mux_records, cap_records, read_records));
     let fill_secs = t.elapsed().as_secs_f64();
     LAST_FILL_SPLIT.with(|c| c.set(Some((chips_secs, fill_secs - chips_secs))));
     // Same reason, larger: the records are what the fill consumes, and they are

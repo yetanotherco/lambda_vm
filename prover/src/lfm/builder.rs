@@ -34,6 +34,21 @@ pub struct Cell(pub(crate) Addr);
 #[derive(Debug, Clone, Copy)]
 pub struct Bit(pub(crate) Addr);
 
+/// A cap table's handle ([`LfmBuilder::cap_table`]): the cell its reads take
+/// the table's tag from, and the table's node count.
+#[derive(Debug, Clone, Copy)]
+pub struct CapHandle {
+    cell: Felt,
+    nodes: usize,
+}
+
+impl CapHandle {
+    /// The table's node count.
+    pub fn nodes(&self) -> usize {
+        self.nodes
+    }
+}
+
 /// The chaining value of a [`LfmBuilder::b3_compress`].
 #[derive(Debug, Clone, Copy)]
 pub enum B3Cv {
@@ -153,6 +168,8 @@ pub struct LfmBuilder {
     /// `LFM_BLAKE3`'s. Off by default: every program today emits what it
     /// emitted. See [`Self::with_b3_lean`].
     b3_lean: bool,
+    /// Cap tables emitted so far ([`Self::cap_table`]): the next one's tag.
+    cap_tables: u32,
 }
 
 impl LfmBuilder {
@@ -863,6 +880,84 @@ impl LfmBuilder {
         let index = self.public_len;
         self.public_len += 1;
         self.instrs.push(Instr::Public { addr: c.0, index });
+    }
+
+    // ---- an authenticated cap read at a computed index (lean programs) ----
+
+    /// ★ `nodes` as a lookup table: one `LEAN_CAP` row a node, each reading
+    /// its node's cell once, so every word a read returns IS one of these
+    /// cells. Call it where the cap is authenticated, on the cells that were
+    /// checked against the root (one word a node: a packed digest, or one
+    /// word of each). Returns the handle reads name it by.
+    ///
+    /// Lean programs only ([`Self::with_b3_lean`] under BLAKE3, with lean
+    /// compressions): the W-LFM prover's lean tables prove the table and its
+    /// reads, and the admission validator refuses them anywhere else.
+    pub fn cap_table(&mut self, nodes: &[Cell]) -> CapHandle {
+        assert!(
+            self.b3_lean(),
+            "a cap table is a lean table: a lean BLAKE3 program only"
+        );
+        assert!(
+            !nodes.is_empty() && nodes.len() <= 1 << 32,
+            "a cap table holds 1..=2^32 nodes, got {}",
+            nodes.len()
+        );
+        for node in nodes {
+            self.read(node.0);
+        }
+        let handle = self.alloc();
+        let tag = self.cap_tables;
+        self.cap_tables += 1;
+        self.instrs
+            .push(Instr::CapTable(Box::new(super::instr::CapTableOperands {
+                tag,
+                nodes: nodes.iter().map(|n| n.0).collect(),
+                handle,
+                handle_mult: 0,
+            })));
+        CapHandle {
+            cell: Felt(handle),
+            nodes: nodes.len(),
+        }
+    }
+
+    /// ★ `nodes[index]` of `handle`'s table, the index from `bits` (LOW
+    /// first, `log2(nodes)` of them, so it cannot pass the table's last
+    /// node): one `LEAN_CAP_READ` row and `bits.len() − 1` `mul_add` rows for
+    /// the index, whatever the table's size.
+    pub fn cap_read(&mut self, handle: CapHandle, bits: &[Bit]) -> Cell {
+        assert!(
+            handle.nodes.is_power_of_two() && 1usize << bits.len() == handle.nodes,
+            "{} index bits for a {}-node cap table",
+            bits.len(),
+            handle.nodes
+        );
+        let index = match bits.split_last() {
+            None => self.felt_const(FE::zero()),
+            Some((top, rest)) => {
+                let two = self.felt_const(FE::from(2u64));
+                rest.iter().rev().fold(top.as_felt(), |acc, bit| {
+                    self.mul_add(acc, two, bit.as_felt())
+                })
+            }
+        };
+        self.cap_read_at(handle, index)
+    }
+
+    /// [`Self::cap_read`] at an index cell the caller built (a base felt). An
+    /// index with no node makes the program unexecutable, and unprovable.
+    pub fn cap_read_at(&mut self, handle: CapHandle, index: Felt) -> Cell {
+        self.read(handle.cell.0);
+        self.read(index.0);
+        let out = self.alloc();
+        self.instrs.push(Instr::CapRead {
+            handle: handle.cell.0,
+            index: index.0,
+            out,
+            mult: 0,
+        });
+        Cell(out)
     }
 
     pub fn finish(mut self) -> LfmProgramSource {

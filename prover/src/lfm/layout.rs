@@ -74,6 +74,31 @@ pub mod mux {
     pub const PREP_WIDTH: usize = 6;
 }
 
+/// `LEAN_CAP` — an authenticated Merkle cap as a lookup table
+/// (`Instr::CapTable`), a lean table of the W-LFM prover: one row a cap node.
+/// `H_ADDR` / `H_MULT` (the handle's write) are set on a table's index-0 row
+/// only.
+pub mod cap {
+    pub const TAG: usize = 0;
+    pub const INDEX: usize = 1;
+    pub const NODE_ADDR: usize = 2;
+    pub const H_ADDR: usize = 3;
+    pub const H_MULT: usize = 4;
+    pub const IS_REAL: usize = 5;
+    pub const PREP_WIDTH: usize = 6;
+}
+
+/// `LEAN_CAP_READ` — one read of a cap table at a computed index
+/// (`Instr::CapRead`), a lean table of the W-LFM prover: one row a read.
+pub mod cap_read {
+    pub const HANDLE_ADDR: usize = 0;
+    pub const INDEX_ADDR: usize = 1;
+    pub const OUT_ADDR: usize = 2;
+    pub const MULT: usize = 3;
+    pub const IS_REAL: usize = 4;
+    pub const PREP_WIDTH: usize = 5;
+}
+
 /// `LFM_BITDEC` — canonical 64-bit decomposition. Per-bit pairs
 /// `(BIT_ADDR_i, MULT_i)` at `2 + 2i` / `3 + 2i`.
 pub mod bitdec {

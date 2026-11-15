@@ -278,6 +278,22 @@ impl B3lOperands {
     }
 }
 
+/// One authenticated Merkle cap as a lookup table ([`Instr::CapTable`]).
+#[derive(Debug, Clone)]
+pub struct CapTableOperands {
+    /// The table's tag: its ordinal among the program's cap tables (`0, 1,
+    /// …` in program order), unique to it, and the value its handle holds.
+    pub tag: u32,
+    /// The cap's node cells, one word each, index order: row `i` reads node
+    /// `i` once and offers `(tag, i, word)` to the readers.
+    pub nodes: Vec<Addr>,
+    /// The handle cell this instruction writes (value: the tag as a base
+    /// felt). A read takes the table's tag from it, which orders every read
+    /// after the table in a schedule.
+    pub handle: Addr,
+    pub handle_mult: u64,
+}
+
 /// One LFM instruction. Operand-field conventions:
 ///
 /// - `c` on the ALU ops is meaningful iff the op is `MulAdd` (and is emitted
@@ -331,6 +347,25 @@ pub enum Instr {
         out: Addr,
         in_l: Addr,
         in_r: Addr,
+        mult: u64,
+    },
+    /// An authenticated Merkle cap as a lookup table: one `LEAN_CAP` row a
+    /// node, each reading its node's cell once (so the table's words ARE the
+    /// cells the caller authenticated) and offering `(tag, index, word)` on
+    /// `BusId::CapLookup` as often as the program reads it. Writes the handle
+    /// cell. Lean programs only (`LfmBuilder::with_b3_lean`): the W-LFM
+    /// prover's lean tables prove it, never a fixed chip.
+    ///
+    /// Boxed: the node list is the cap's length.
+    CapTable(Box<CapTableOperands>),
+    /// `out = nodes[index]` of the cap table whose handle is `handle`: one
+    /// `LEAN_CAP_READ` row, reading the handle (the table's tag) and the
+    /// index cell and looking `(tag, index, out)` up on `BusId::CapLookup`.
+    /// An index with no table row has nothing to match and is unprovable.
+    CapRead {
+        handle: Addr,
+        index: Addr,
+        out: Addr,
         mult: u64,
     },
     BitDec {
@@ -458,6 +493,8 @@ impl Instr {
                 out.push(*out_r);
             }
             Instr::Mux { out: o, .. } => out.push(*o),
+            Instr::CapTable(t) => out.push(t.handle),
+            Instr::CapRead { out: o, .. } => out.push(*o),
             Instr::BitDec { bits, halves, .. } => {
                 out.extend(bits.iter().map(|(a, _)| *a));
                 out.extend(halves.iter().flat_map(|hs| hs.iter().map(|(a, _)| *a)));
@@ -510,6 +547,12 @@ impl Instr {
                 out.push(*in_r);
             }
             Instr::BitDec { input, .. } => out.push(*input),
+            // Every node, once: the table's rows are what bind its words.
+            Instr::CapTable(t) => out.extend_from_slice(&t.nodes),
+            Instr::CapRead { handle, index, .. } => {
+                out.push(*handle);
+                out.push(*index);
+            }
             Instr::Hash { mode, ins, .. } => out.extend_from_slice(&ins[..mode.num_input_cells()]),
             Instr::Hash16(h) => out.extend_from_slice(&h.ins),
             Instr::Pack { lanes, .. } => out.extend_from_slice(lanes),

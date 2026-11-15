@@ -454,6 +454,132 @@ pub mod mux {
 }
 
 // =========================================================================
+// LEAN_CAP / LEAN_CAP_READ — an authenticated cap read at a computed index
+// (the W-LFM prover's lean tables)
+// =========================================================================
+
+/// The `(tag, index, word)` tuple on `BusId::CapLookup`.
+fn cap_tuple(tag: usize, index: usize, word0: usize) -> Vec<BusValue> {
+    let mut v = vec![direct(tag), direct(index)];
+    v.extend(word(word0));
+    v
+}
+
+pub mod cap {
+    use super::*;
+
+    pub mod cols {
+        pub use crate::lfm::layout::cap::*;
+        /// The node's word, as its cell holds it.
+        pub const W0: usize = PREP_WIDTH; // ..+3
+        /// The reads of this node: a witness the prover sets, as the lean
+        /// byte table's counts are.
+        pub const M: usize = PREP_WIDTH + 4;
+        pub const NUM_COLUMNS: usize = PREP_WIDTH + 5;
+    }
+
+    /// A table row's interactions: its node's cell read once (`IS_REAL`), the
+    /// `(tag, index, word)` it offers received `M` times, and on a table's
+    /// index-0 row the handle written (`(H_ADDR, TAG)`, `H_MULT` times).
+    /// `drop_node_read` is a TEST mutant: the table's word no longer bound to
+    /// the node's cell.
+    pub fn bus_interactions_with(drop_node_read: bool) -> Vec<BusInteraction> {
+        let mut v = Vec::with_capacity(3);
+        if !drop_node_read {
+            v.push(BusInteraction::receiver(
+                BusId::LfmMem,
+                Multiplicity::Column(cols::IS_REAL),
+                word_token(cols::NODE_ADDR, cols::W0),
+            ));
+        }
+        v.push(BusInteraction::receiver(
+            BusId::CapLookup,
+            Multiplicity::Column(cols::M),
+            cap_tuple(cols::TAG, cols::INDEX, cols::W0),
+        ));
+        v.push(BusInteraction::sender(
+            BusId::LfmMem,
+            Multiplicity::Column(cols::H_MULT),
+            base_token(cols::H_ADDR, cols::TAG),
+        ));
+        v
+    }
+
+    pub fn bus_interactions() -> Vec<BusInteraction> {
+        bus_interactions_with(false)
+    }
+
+    /// `M · (1 − IS_REAL) = 0`: a row that is not a node's (padding) offers
+    /// nothing. Its word is free (its node read is off), so a count there
+    /// would offer a forged `(0, 0, word)`.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct CapConstraints {
+        /// Test only: the padding gate left out (a mutant).
+        pub drop_real_gate: bool,
+    }
+
+    impl ConstraintSet<F, E> for CapConstraints {
+        fn max_degree(&self) -> usize {
+            2
+        }
+
+        fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
+            let m = b.main(0, cols::M);
+            let real = b.main(0, cols::IS_REAL);
+            let one = b.one();
+            if self.drop_real_gate {
+                b.emit_base(0, m.clone() - m);
+            } else {
+                b.emit_base(0, m * (one - real));
+            }
+        }
+    }
+}
+
+pub mod cap_read {
+    use super::*;
+
+    pub mod cols {
+        pub use crate::lfm::layout::cap_read::*;
+        /// The handle's value: the table's tag.
+        pub const TAG: usize = PREP_WIDTH;
+        /// The index cell's value.
+        pub const INDEX: usize = PREP_WIDTH + 1;
+        /// The word read.
+        pub const OUT0: usize = PREP_WIDTH + 2; // ..+5
+        pub const NUM_COLUMNS: usize = PREP_WIDTH + 6;
+    }
+
+    /// A read's interactions: the handle and the index cell read, the
+    /// `(tag, index, out)` looked up once, and `out` written with its reads.
+    /// No constraint: the lookup is the whole check.
+    pub fn bus_interactions() -> Vec<BusInteraction> {
+        vec![
+            BusInteraction::receiver(
+                BusId::LfmMem,
+                Multiplicity::Column(cols::IS_REAL),
+                base_token(cols::HANDLE_ADDR, cols::TAG),
+            ),
+            BusInteraction::receiver(
+                BusId::LfmMem,
+                Multiplicity::Column(cols::IS_REAL),
+                base_token(cols::INDEX_ADDR, cols::INDEX),
+            ),
+            BusInteraction::sender(
+                BusId::CapLookup,
+                Multiplicity::Column(cols::IS_REAL),
+                cap_tuple(cols::TAG, cols::INDEX, cols::OUT0),
+            ),
+            BusInteraction::sender(
+                BusId::LfmMem,
+                Multiplicity::Column(cols::MULT),
+                word_token(cols::OUT_ADDR, cols::OUT0),
+            ),
+        ]
+    }
+}
+
+// =========================================================================
 // LFM_BITDEC — canonical 64-bit decomposition over p = 2^64 − 2^32 + 1
 // =========================================================================
 

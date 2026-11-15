@@ -3037,10 +3037,19 @@ impl ChipRows {
         use super::instr::Instr;
         let mut rows = Self::default();
         for instr in instrs {
+            // A cap table's rows (one a node) and its reads stand where the
+            // cap's select rows did.
+            if let Instr::CapTable(t) = instr {
+                rows.select += t.nodes.len();
+                continue;
+            }
             let chip = match instr {
                 Instr::Hash { .. } | Instr::Hash16(_) => &mut rows.hash,
                 // A one-output select is a select row of a narrower table.
-                Instr::Select { .. } | Instr::Mux { .. } => &mut rows.select,
+                Instr::Select { .. } | Instr::Mux { .. } | Instr::CapRead { .. } => {
+                    &mut rows.select
+                }
+                Instr::CapTable(_) => unreachable!("counted above"),
                 Instr::BaseAlu { .. } => &mut rows.balu,
                 Instr::ExtAlu { .. } => &mut rows.xalu,
                 Instr::Pack { .. } | Instr::Unpack { .. } => &mut rows.lanes,
