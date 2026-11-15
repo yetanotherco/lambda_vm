@@ -37,6 +37,8 @@ fn host_words(records: &Records) -> Vec<Vec<u64>> {
 struct Run {
     name: String,
     memw_a: Vec<(Records, Option<Vec<Records>>)>,
+    /// The whole CPU chunks, from cycle 0.
+    cpu: Vec<Records>,
 }
 
 fn held(
@@ -96,6 +98,7 @@ fn held(
     Run {
         name: name.to_string(),
         memw_a,
+        cpu,
     }
 }
 
@@ -284,4 +287,104 @@ fn the_card_derives_every_memw_a_chunk_of_a_real_block() {
         t.elapsed().as_secs_f64()
     );
     assert_eq!(verdict, "PASS");
+}
+
+/// ★ LOAD and STORE chunks held as their rows' cycles (the walkers' lists)
+/// are derived on the card from the CPU chunks uploaded beside them, with the
+/// host fill's words: the run's loads and stores cut into chunks, every
+/// covered one.
+#[test]
+fn the_card_derives_load_and_store_chunks_held_as_cycles() {
+    use super::card_records::CycleRecords;
+    use crate::tables::load::LoadOperation;
+    use crate::tables::store::StoreOperation;
+    let order = MemwAlignedOrder::Limbs;
+    let (mut derived, mut chunks_n) = (0usize, 0usize);
+    for (name, window, rows, cpu_rows) in [
+        ("test_keccak_multi", 7usize, 4usize, 64usize),
+        ("dma_memmove_cases", 97, 1024, 4096),
+    ] {
+        let program = match name {
+            "dma_memmove_cases" => rust_elf(name),
+            _ => run(name).0,
+        };
+        let (w, decode) = walked(&program, &[], window, order);
+        let base = held(name, &w, Arc::clone(&decode), 1 << 30, cpu_rows);
+        let cpu = base.cpu;
+        let card = Arc::new(CardDecode::new(Arc::clone(&decode)).expect("DECODE rows"));
+        let logs: Vec<(u64, Arc<Vec<executor::vm::logs::Log>>)> =
+            w.iter().map(|x| (x.first, Arc::clone(&x.logs))).collect();
+        let covered = cpu.len() * cpu_rows;
+        let of = |store: bool| -> Vec<u32> {
+            let mut out = Vec::new();
+            for x in &w {
+                for (i, l) in x.logs.iter().enumerate() {
+                    let c = x.first + i as u64;
+                    let Some(r) = decode.row(l.current_pc) else {
+                        continue;
+                    };
+                    let f = &decode.entry(r).fields;
+                    let family = if store { f.is_store() } else { f.is_load() };
+                    if !f.ecall && family && (c as usize) < covered {
+                        out.push(c as u32);
+                    }
+                }
+            }
+            out
+        };
+        for store in [false, true] {
+            let cycles = of(store);
+            for part in cycles.chunks_exact(rows) {
+                let records = if store {
+                    Records(Arc::new(
+                        CycleRecords::<StoreOperation>::new(
+                            super::Segments::one(part.to_vec()),
+                            logs.clone(),
+                            Arc::clone(&card),
+                        )
+                        .unwrap_or_else(|_| panic!("{name}: a whole chunk")),
+                    ))
+                } else {
+                    Records(Arc::new(
+                        CycleRecords::<LoadOperation>::new(
+                            super::Segments::one(part.to_vec()),
+                            logs.clone(),
+                            Arc::clone(&card),
+                        )
+                        .unwrap_or_else(|_| panic!("{name}: a whole chunk")),
+                    ))
+                };
+                let (lo, hi) = (
+                    part[0] as usize / cpu_rows,
+                    part[rows - 1] as usize / cpu_rows,
+                );
+                let group: Vec<Records> = cpu[lo..=hi].to_vec();
+                let before = math_cuda::card_rows::stats();
+                let mut tables: Vec<TableColumns<'_, F>> =
+                    group.iter().map(TableColumns::Records).collect();
+                tables.push(TableColumns::Records(&records));
+                let mut columns = upload_tables(&tables)
+                    .and_then(|s| s.download())
+                    .expect("the card takes the group");
+                let after = math_cuda::card_rows::stats();
+                let on_card = if store {
+                    after.derived_store > before.derived_store
+                } else {
+                    after.derived_load > before.derived_load
+                };
+                let at = columns.len() - records.cols();
+                let card_words = columns.split_off(at);
+                assert!(on_card, "{name}: derived on the card (store {store})");
+                assert_eq!(
+                    mismatches(&card_words, &host_words(&records)),
+                    (0, None),
+                    "{name} (store {store})"
+                );
+                derived += 1;
+                chunks_n += 1;
+            }
+        }
+    }
+    println!("CARD CYCLES: {derived} of {chunks_n} LOAD and STORE chunks derived, 0 words differ");
+    assert!(derived >= 4, "{derived} chunks derived");
 }

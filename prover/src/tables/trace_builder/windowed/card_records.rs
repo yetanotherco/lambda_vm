@@ -15,7 +15,7 @@ use multilinear::records::{
     RecordsFill, TableRecords,
 };
 
-use super::history_rows::RefWindow;
+use super::history_rows::{CycleFamily, RefWindow, WindowLogs};
 use super::history_sides::{HistoryParts, HistorySides};
 use super::{Segments, StreamTable, Table};
 use crate::tables::decode::DecodeTable;
@@ -886,5 +886,134 @@ impl RowChunk for AlignedRefRecords {
             digest,
             memw_aligned::generate_memw_aligned_trace_segments_as(&[rows], form),
         )
+    }
+}
+
+/// A full LOAD or STORE chunk held as its rows' cycles, for the card to
+/// derive its rows from the CPU logs it holds ([`super::history_rows`]):
+/// the cycles in the window parts the chunk was cut from, and the windows'
+/// logs they lie in. Every host reader gets the ops the host rebuilds from
+/// those logs, once, on the first ask; the chunk digests and fills as the
+/// same ops held as ops.
+pub(crate) struct CycleRecords<T: CycleFamily> {
+    cycles: Segments<u32>,
+    logs: WindowLogs,
+    decode: Arc<CardDecode>,
+    ops: std::sync::OnceLock<Result<Vec<T>, String>>,
+}
+
+impl<T: CycleFamily> CycleRecords<T> {
+    /// The chunk `cycles` make, reading `logs`. Refused (the cycles given
+    /// back) unless they are a whole table.
+    pub(crate) fn new(
+        cycles: Segments<u32>,
+        logs: WindowLogs,
+        decode: Arc<CardDecode>,
+    ) -> Result<Self, Segments<u32>> {
+        if !whole_table(cycles.len()) {
+            return Err(cycles);
+        }
+        Ok(Self {
+            cycles,
+            logs,
+            decode,
+            ops: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The ops as the host rebuilds them, or why they cannot be.
+    pub(crate) fn ops(&self) -> Result<&[T], &str> {
+        self.ops
+            .get_or_init(|| {
+                super::history_rows::ops_of_cycles(
+                    &self.cycles.slices(),
+                    &self.logs,
+                    &self.decode.table,
+                )
+            })
+            .as_deref()
+            .map_err(String::as_str)
+    }
+
+    /// The ops back, as the host rebuilds them, or why they cannot be.
+    pub(crate) fn into_ops(self) -> Result<Vec<T>, String> {
+        let _ = self.ops();
+        match self.ops.into_inner() {
+            Some(result) => result,
+            None => Err("a chunk's ops were not rebuilt".to_string()),
+        }
+    }
+}
+
+impl<T: CycleFamily> std::fmt::Debug for CycleRecords<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} cycles: {} in {} pieces",
+            T::TABLE,
+            self.cycles.len(),
+            self.cycles.parts.len()
+        )
+    }
+}
+
+impl<T: CycleFamily> TableRecords for CycleRecords<T> {
+    fn rows(&self) -> usize {
+        self.cycles.len()
+    }
+
+    fn cols(&self) -> usize {
+        T::COLUMNS
+    }
+
+    /// The ops the host rebuilds (none where it cannot: the table then
+    /// digests and fills as no table its AIR takes).
+    fn fill(&self) -> RecordsFill<'_> {
+        T::fill(self.ops().map(|ops| vec![ops]).unwrap_or_default())
+    }
+
+    /// The ops' bytes, as held as ops: the same chunk held either way
+    /// digests alike.
+    fn bytes(&self) -> usize {
+        self.cycles.len() * std::mem::size_of::<T>()
+    }
+
+    fn host_fill(&self) -> Option<NarrowColumns> {
+        let ops = self.ops().ok()?;
+        let mut trace = T::host_fill(&[ops], TraceForm::Narrow);
+        // Written packed, except in a build that holds every trace wide.
+        trace.pack_main_narrow();
+        trace.take_narrow_main()
+    }
+
+    fn return_pages(&mut self) -> PagesReturned {
+        self.cycles.return_pages()
+    }
+
+    fn cycle_list(&self) -> Option<multilinear::records::CycleList<'_>> {
+        Some(multilinear::records::CycleList {
+            cycles: self.cycles.slices(),
+            store: T::STORE,
+        })
+    }
+}
+
+impl<T: CycleFamily> RowChunk for CycleRecords<T> {
+    fn op_bytes(&self) -> usize {
+        self.cycles.op_bytes()
+    }
+
+    fn op_count(&self) -> usize {
+        self.cycles.len()
+    }
+
+    fn into_trace(self: Box<Self>) -> Table {
+        held(Records(Arc::new(*self)))
+    }
+
+    fn regenerate(self: Box<Self>, form: TraceForm, digest: bool) -> (Option<[u64; 2]>, Table) {
+        let digest = digest.then(|| multilinear::records::digest_of(&*self));
+        let ops = self.ops().unwrap_or_default();
+        (digest, T::host_fill(&[ops], form))
     }
 }

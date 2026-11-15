@@ -326,3 +326,144 @@ impl RefTail {
             .sum()
     }
 }
+
+/// The windows' logs a chunk held as cycles reads its rows from, by first
+/// cycle, ascending and adjacent (the registry its host readers rebuild its
+/// rows from).
+pub(crate) type WindowLogs = Vec<(u64, Arc<Vec<Log>>)>;
+
+/// The log of `cycle` in `logs`.
+fn log_of(logs: &[(u64, Arc<Vec<Log>>)], cycle: u64) -> Option<&Log> {
+    let at = logs
+        .partition_point(|(first, _)| *first <= cycle)
+        .checked_sub(1)?;
+    let (first, window) = &logs[at];
+    window.get((cycle - first) as usize)
+}
+
+/// A family whose rows are a function of a cycle's log alone, held as the
+/// rows' cycles (`load_cycles`, `store_cycles` of the walkers' lists): LOAD's
+/// and STORE's ops, as the walk makes them.
+pub(crate) trait CycleFamily: super::card_records::RowFamily + Clone {
+    /// Whether it is STORE's (else LOAD's).
+    const STORE: bool;
+    /// The op of the cycle at `ts` from its CPU op; refused where the cycle
+    /// is not this family's.
+    fn of_op(op: crate::tables::cpu::CpuOp<'_>) -> Result<Self, String>;
+}
+
+impl CycleFamily for crate::tables::load::LoadOperation {
+    const STORE: bool = false;
+
+    /// `collect_load_op_from_cpu`'s LOAD op: the address, the width, the
+    /// sign, and the loaded bytes with their sign or zero fill.
+    fn of_op(op: crate::tables::cpu::CpuOp<'_>) -> Result<Self, String> {
+        let f = &op.decode.fields;
+        if f.ecall || !f.is_load() {
+            return Err("no load".to_string());
+        }
+        let width = f.mem_bytes();
+        let mut res = op.rvd.to_le_bytes();
+        if width < 8 {
+            let fill = if f.mem_signed() && res[width - 1] >> 7 == 1 {
+                0xFF
+            } else {
+                0
+            };
+            res[width..].iter_mut().for_each(|b| *b = fill);
+        }
+        Ok(Self::new(
+            op.res,
+            op.timestamp,
+            width as u8,
+            f.mem_signed(),
+            res,
+        ))
+    }
+}
+
+impl CycleFamily for crate::tables::store::StoreOperation {
+    const STORE: bool = true;
+
+    /// `route_store`'s STORE op.
+    fn of_op(op: crate::tables::cpu::CpuOp<'_>) -> Result<Self, String> {
+        let f = &op.decode.fields;
+        if f.ecall || !f.is_store() {
+            return Err("no store".to_string());
+        }
+        Ok(super::super::route_store(op))
+    }
+}
+
+/// The ops of the rows at `cycles` (in pieces, in order), each from its
+/// cycle's log in `logs`: the walk's. Refused where a cycle's log is not in
+/// `logs`, has no DECODE row, or is not the family's.
+pub(crate) fn ops_of_cycles<T: CycleFamily>(
+    cycles: &[&[u32]],
+    logs: &[(u64, Arc<Vec<Log>>)],
+    decode: &DecodeTable,
+) -> Result<Vec<T>, String> {
+    let n = cycles.iter().map(|p| p.len()).sum();
+    let mut ops = Vec::with_capacity(n);
+    for &c in cycles.iter().flat_map(|p| p.iter()) {
+        let cycle = u64::from(c);
+        let refuse = |why: &str| format!("cycle {cycle}: {why}");
+        if cycle > executor::vm::history::HISTORY_MAX_CYCLES {
+            return Err(refuse("past the history's clock"));
+        }
+        let log = log_of(logs, cycle).ok_or_else(|| refuse("no log held"))?;
+        let row = decode
+            .row(log.current_pc)
+            .ok_or_else(|| refuse("no DECODE row"))?;
+        let op = CpuOperation::from_log(log, 4 * cycle + 4, decode.entry(row), row);
+        ops.push(T::of_op(decode.op(&op)).map_err(|e| refuse(&e))?);
+    }
+    Ok(ops)
+}
+
+/// The windows' logs not yet let go, for the rows held as cycles: each
+/// window's, shared with the CPU tail's.
+#[derive(Default)]
+pub(crate) struct LogRegistry {
+    windows: std::collections::VecDeque<(u64, Arc<Vec<Log>>)>,
+}
+
+impl LogRegistry {
+    pub(crate) fn push(&mut self, first: u64, logs: Arc<Vec<Log>>) {
+        if !logs.is_empty() {
+            self.windows.push_back((first, logs));
+        }
+    }
+
+    /// The windows holding cycles `lo..=hi` (ascending), or `None` where one
+    /// is not held.
+    pub(crate) fn covering(&self, lo: u64, hi: u64) -> Option<WindowLogs> {
+        let start = self
+            .windows
+            .partition_point(|(first, logs)| first + logs.len() as u64 <= lo);
+        let mut out = Vec::new();
+        let mut next = lo;
+        for (first, logs) in self.windows.range(start..) {
+            if *first > next {
+                return None;
+            }
+            out.push((*first, Arc::clone(logs)));
+            next = first + logs.len() as u64;
+            if next > hi {
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    /// Lets go the windows that end at or before `cycle`.
+    pub(crate) fn release_before(&mut self, cycle: u64) {
+        while self
+            .windows
+            .front()
+            .is_some_and(|(first, logs)| first + logs.len() as u64 <= cycle)
+        {
+            self.windows.pop_front();
+        }
+    }
+}

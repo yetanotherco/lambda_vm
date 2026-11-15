@@ -557,6 +557,15 @@ pub fn cycles_of<T: Timestamped>(pieces: &[&[T]]) -> Option<(Vec<u32>, u64, u64)
     Some((out, lo, hi))
 }
 
+/// The cycles of a table held as them, in order, and the least and the
+/// greatest; `None` for none, or a cycle past the history's clock.
+pub fn listed_cycles(pieces: &[&[u32]]) -> Option<(Vec<u32>, u64, u64)> {
+    let cycles: Vec<u32> = pieces.iter().flat_map(|p| p.iter().copied()).collect();
+    let lo = u64::from(*cycles.iter().min()?);
+    let hi = u64::from(*cycles.iter().max()?);
+    (hi < (1 << 30) - 1).then_some((cycles, lo, hi))
+}
+
 /// Whether the ranges `held` (first cycle → length, disjoint) hold every
 /// cycle of `[lo, hi]`.
 pub fn covers(held: &BTreeMap<u64, u64>, lo: u64, hi: u64) -> bool {
@@ -947,6 +956,13 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 RecordsInput::Store { records, rows } if records_len(records) == *rows => {
                     (true, cycles_of(records))
                 }
+                // Held as their cycles: no op to read them from.
+                RecordsInput::LoadCycles { cycles, rows, .. } if records_len(cycles) == *rows => {
+                    (false, listed_cycles(cycles))
+                }
+                RecordsInput::StoreCycles { cycles, rows, .. } if records_len(cycles) == *rows => {
+                    (true, listed_cycles(cycles))
+                }
                 _ => continue,
             };
             let counter = if store {
@@ -1149,7 +1165,14 @@ pub(crate) fn upload_tables(tables: &[TableUpload<'_>]) -> Option<DeviceColumns>
                 crate::pinned::note_upload(cycles.as_ptr().cast(), cycles.len() * 4);
                 l = Some(stream.clone_htod(cycles).ok()?);
                 add(&counters().list_bytes, (cycles.len() * 4) as u64);
-                add(&counters().records_bytes_spared, records.bytes() as u64);
+                // Held as cycles, what is not sent is the ops they stand for.
+                let spared = match records {
+                    RecordsInput::LoadCycles { .. } | RecordsInput::StoreCycles { .. } => {
+                        cycles.len() * std::mem::size_of::<LoadOpC>()
+                    }
+                    _ => records.bytes(),
+                };
+                add(&counters().records_bytes_spared, spared as u64);
                 add(
                     if *store {
                         &counters().derived_store
@@ -1818,6 +1841,16 @@ mod tests {
             timestamp: ts,
             ..LoadOpC::default()
         }
+    }
+
+    /// A table held as cycles goes up as them, its ends their least and
+    /// greatest; none for none or a cycle past the history's clock.
+    #[test]
+    fn a_tables_listed_cycles_are_its_cycles() {
+        let (a, b) = ([7u32, 3], [9u32]);
+        assert_eq!(listed_cycles(&[&a, &b]), Some((vec![7, 3, 9], 3, 9)));
+        assert_eq!(listed_cycles(&[]), None);
+        assert_eq!(listed_cycles(&[&[(1 << 30) - 1]]), None);
     }
 
     /// A MEMW_A table's span is its regular rows' cycles, ECALL rows aside;

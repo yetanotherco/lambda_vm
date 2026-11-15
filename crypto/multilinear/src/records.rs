@@ -729,6 +729,12 @@ pub trait TableRecords: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// A LOAD or STORE chunk held as its rows' cycles ([`CycleList`]);
+    /// `None` (the default) for ops and every other family.
+    fn cycle_list(&self) -> Option<CycleList<'_>> {
+        None
+    }
+
     /// The records [`digest_of`] reads, when they are not [`Self::fill`]'s:
     /// a CPU table whose side records the card derives from the executor's
     /// history digests the side records derived (its host reference's), so
@@ -832,6 +838,15 @@ impl AlignedRefs<'_> {
     }
 }
 
+/// A LOAD or STORE chunk held as its rows' cycles
+/// ([`TableRecords::cycle_list`]): the card derives each row from its cycle's
+/// log among the CPU logs it holds (`math_cuda::card_rows`);
+/// [`TableRecords::fill`] still gives the ops, rebuilt on the host.
+pub struct CycleList<'a> {
+    pub cycles: Vec<&'a [u32]>,
+    pub store: bool,
+}
+
 /// A MEMW_R chunk as words ([`TableRecords::register_words`]): a word a row,
 /// `timestamp | old_timestamp << 32`, or a marker (low half 0) whose high half
 /// is the run index of its row in `whole` (the first at `whole_base`).
@@ -889,6 +904,11 @@ impl Records {
     /// [`TableRecords::aligned_refs`].
     pub fn aligned_refs(&self) -> Option<AlignedRefs<'_>> {
         self.0.aligned_refs()
+    }
+
+    /// [`TableRecords::cycle_list`].
+    pub fn cycle_list(&self) -> Option<CycleList<'_>> {
+        self.0.cycle_list()
     }
 
     /// [`TableRecords::decode_register_rows`].
