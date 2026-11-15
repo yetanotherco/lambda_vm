@@ -264,6 +264,15 @@ impl WindowWalker {
                 ecall_cycles(history).into_iter().map(u64::from),
             )
         });
+        // The card derives the window's CPU side records: the walk lists
+        // the rows the derivation cannot read and keeps no side record, and
+        // the window's history goes with it.
+        let mut exceptions = Vec::new();
+        let sides = s.sides_chunk.map(|rows| super::history_sides::SideHook {
+            extras: &history.extras,
+            chunk_rows: rows as u64,
+            out: &mut exceptions,
+        });
         let walked = walk_window(
             &s.decode,
             s.order,
@@ -279,24 +288,14 @@ impl WindowWalker {
             job.first,
             &job.logs,
             words,
+            sides,
         );
         self.record.overlay = None;
         let mut walked = walked?;
         if s.keep_logs {
             walked.keep_logs(Arc::clone(&job.logs));
         }
-        // The card derives the window's CPU side records: its history goes
-        // with it, and the rows the derivation cannot read are listed.
-        if let Some(rows) = s.sides_chunk {
-            let exceptions = super::history_sides::exceptions_of_walk(
-                &job.logs,
-                &history.extras,
-                walked.cpu_sides(),
-                job.first as u64,
-                rows as u64,
-                &s.decode,
-            )
-            .map_err(|e| Error::Prover(format!("window {}: {e}", job.window)))?;
+        if s.sides_chunk.is_some() {
             walked.keep_history_sides(Arc::clone(history), exceptions);
         }
         if self.record.take_missing() {
@@ -348,6 +347,7 @@ impl WindowWalker {
             &mut self.registers,
             job.first,
             &job.logs,
+            None,
             None,
         )?;
         if s.keep_logs {

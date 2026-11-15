@@ -1589,6 +1589,16 @@ impl<'a> WindowedTraceBuilder<'a> {
                 } else {
                     None
                 };
+                // The card derived the CPU side records: the tail's are the
+                // host's (the last window's, the finish walks itself).
+                kept.settle_history(&decode).map_err(|e| {
+                    Error::Prover(format!("the CPU side records from the history: {e}"))
+                })?;
+                if let Some(e) = kept.history_broken.take() {
+                    return Err(Error::Prover(format!(
+                        "the CPU side records from the history: {e}"
+                    )));
+                }
                 // The last window's ops, its in-walk lookups and its MEMW
                 // ops' LT ops are all still to count, as the tails are.
                 // Without the CPU list, the tail's ops rebuilt from its logs.
@@ -1876,11 +1886,6 @@ impl WalkedWindow {
         self.history_sides = Some((history, exceptions));
     }
 
-    /// Its walk's side records, under the in-row register format.
-    pub(crate) fn cpu_sides(&self) -> &[super::super::cpu::CpuSide] {
-        &self.walk.cpu_side
-    }
-
     /// Its cycles.
     pub fn cycles(&self) -> usize {
         self.cycles
@@ -1942,6 +1947,7 @@ impl Walker<'_> {
             *self.cycles,
             logs,
             None,
+            None,
         )?;
         *self.cycles += logs.len();
         *self.walk_secs += t.elapsed().as_secs_f64();
@@ -1986,6 +1992,7 @@ fn walk_window(
     first: usize,
     logs: &[Log],
     words: Option<super::register_words::WordWindow>,
+    mut sides: Option<history_sides::SideHook<'_>>,
 ) -> Result<WalkedWindow, Error> {
     // As a whole-run build: only the last cycle may halt.
     if logs.iter().any(|log| log.next_pc == 0) {
@@ -2030,6 +2037,21 @@ fn walk_window(
             lookups,
             defer_ecrec,
         )?;
+        // The card derives the side records: the batch's leave as the rows
+        // the derivation cannot read, and the window keeps none.
+        if let Some(hook) = sides.as_mut() {
+            history_sides::list_exceptions(
+                logs,
+                hook.extras,
+                &walk.cpu_side,
+                (first as u64, from - part.len()),
+                hook.chunk_rows,
+                decode,
+                hook.out,
+            )
+            .map_err(Error::Prover)?;
+            walk.cpu_side.clear();
+        }
         if let (Some(counts), Some(last_ecall)) = (counts.as_deref_mut(), made.as_mut()) {
             counts.count_batch(decode, &cpu_ops[start..], &walk, marks, last_ecall);
             // A walk that lists no lookup of its own still lists each in-row
@@ -2826,6 +2848,15 @@ impl<T: Clone> Tail<T> {
         (out, copied)
     }
 
+    /// The ops not handed out, as the parts they lie in (nothing taken).
+    fn slices(&self) -> Vec<&[T]> {
+        self.parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| &part[if i == 0 { self.start } else { 0 }..])
+            .collect()
+    }
+
     /// (ops not handed out, ops the parts hold).
     fn held(&self) -> (usize, usize) {
         (self.len, self.len + self.start)
@@ -3090,6 +3121,9 @@ struct Kept {
     /// exceptions of the CPU tail, in step with `logs`; `None` without, and
     /// from a window that came without them on.
     history: Option<history_sides::HistoryTail>,
+    /// What went wrong deriving a side record on the host under that mode.
+    /// Refused at the finish.
+    history_broken: Option<String>,
     register_rows: Tail<super::RegRow>,
     /// Words mode ([`WindowedTraceBuilder::card_writes_words`]): the register
     /// rows as words and whole rows, in place of `register_rows`.
@@ -3225,6 +3259,7 @@ impl Kept {
             cpu_side: Tail::new(),
             logs: None,
             history: None,
+            history_broken: None,
             register_rows: Tail::new(),
             words: None,
             aligned: Tail::new(),
@@ -3316,33 +3351,90 @@ impl Kept {
     /// tail's, when they are kept. A window without them, or with other than
     /// one log a CPU op, puts the logs out of step for good: every CPU chunk
     /// from then on is filled on the host.
+    /// Ends [`WindowedTraceBuilder::card_derives_sides`] for the rest of the
+    /// run: the side records of the CPU tail not handed out, derived on the
+    /// host from its logs and history ([`history_sides::cpu_sides_from_history`]),
+    /// join `cpu_side`, as the walk would have written them. Nothing without
+    /// the mode or with no cycle pending.
+    fn settle_history(&mut self, decode: &DecodeTable) -> Result<(), String> {
+        let Some(mut tail) = self.history.take() else {
+            return Ok(());
+        };
+        let (n, first) = tail.pending();
+        if n == 0 {
+            return Ok(());
+        }
+        let logs = self
+            .logs
+            .as_ref()
+            .filter(|logs| logs.len == n)
+            .ok_or_else(|| format!("the CPU tail's {n} history records without its logs"))?;
+        let (parts, exceptions) = tail.take(n);
+        let sides = history_sides::cpu_sides_from_history(
+            &logs.slices(),
+            &parts.slices(),
+            first,
+            decode,
+            &[&exceptions],
+        )?;
+        self.cpu_side.push(sides);
+        Ok(())
+    }
+
     fn append(&mut self, window: WalkedWindow, decode: &DecodeTable) {
         let WalkedWindow {
             cpu_ops,
             first,
             cycles,
-            walk,
+            mut walk,
             logs,
             made: _,
             history_sides,
         } = window;
-        // The card's side records need every window's history, in step with
-        // the logs: a window without stops them for the rest of the run.
-        if let Some(tail) = self.history.as_mut() {
-            match history_sides {
-                Some((history, exceptions)) if history.extras.len() == cycles => {
-                    tail.push(history, exceptions)
+        // The card derives the CPU side records: each window's history goes
+        // in step with the logs. A window without it, or the run going back
+        // to the CPU list, ends that: the tail's side records are derived on
+        // the host first, and from then on each window carries its own.
+        let switching = self.listless && !cpu_ops.is_empty();
+        match (self.history.as_mut(), history_sides) {
+            (Some(tail), Some((history, exceptions)))
+                if history.extras.len() == cycles && !switching =>
+            {
+                tail.push(history, exceptions)
+            }
+            (_, history_sides) => {
+                if let Err(e) = self.settle_history(decode) {
+                    self.history_broken.get_or_insert(e);
                 }
-                _ => self.history = None,
+                // A window whose walk kept no side record (it listed its
+                // exceptions instead): its own, derived here.
+                if let Some((history, exceptions)) = history_sides {
+                    match logs.as_deref().map(|l| {
+                        history_sides::cpu_sides_from_history(
+                            &[l],
+                            &[&history.extras],
+                            first as u64,
+                            decode,
+                            &[&exceptions],
+                        )
+                    }) {
+                        Some(Ok(sides)) => walk.cpu_side = sides,
+                        Some(Err(e)) => {
+                            self.history_broken.get_or_insert(e);
+                        }
+                        None => {
+                            self.history_broken
+                                .get_or_insert_with(|| "a window without its logs".to_string());
+                        }
+                    }
+                }
             }
         }
         // A window whose walker kept its list: the run goes back to the list
         // from here, the tail's ops rebuilt from its logs, and its logs
         // checked against its ops chunk by chunk as without the mode.
-        if self.listless && !cpu_ops.is_empty() {
+        if switching {
             self.listless = false;
-            // The logs' tail is rebuilt below: the history no longer in step.
-            self.history = None;
             let logs_tail = self.logs.as_mut().map_or(0, |tail| tail.len);
             if logs_tail > 0 {
                 let segments = self
@@ -3443,6 +3535,7 @@ impl Kept {
             cpu_side,
             logs: _,
             history: _,
+            history_broken: _,
             register_rows,
             words,
             aligned,
@@ -3597,7 +3690,7 @@ fn cpu_chunk_from_logs(
             let records = cpu_log_records(
                 logs.clone(),
                 sides.clone(),
-                history,
+                history.clone(),
                 first_cycle,
                 Arc::clone(decode),
             );
@@ -3618,7 +3711,38 @@ fn cpu_chunk_from_logs(
         stamps.cpu[1] += 1;
     }
     let ops = Segments::one(ops_of_logs(&logs, first_cycle, decode_table)?);
+    let sides = match sides {
+        Some(sides) => Some(sides),
+        None => sides_of_history(&logs, &history, first_cycle, decode_table)?,
+    };
     Ok(host_cpu_chunk(ops, sides, decode_table))
+}
+
+/// A CPU chunk's side records the host fills it with where the card would
+/// have derived them ([`WindowedTraceBuilder::card_derives_sides`]): derived
+/// here from its logs and history; `None` without a history.
+fn sides_of_history(
+    logs: &Segments<Log>,
+    history: &ChunkHistory,
+    first_cycle: usize,
+    decode: &DecodeTable,
+) -> Result<Option<Segments<super::super::cpu::CpuSide>>, Error> {
+    let Some((parts, exceptions)) = history else {
+        return Ok(None);
+    };
+    history_sides::cpu_sides_from_history(
+        &logs.slices(),
+        &parts.slices(),
+        first_cycle as u64,
+        decode,
+        &[exceptions],
+    )
+    .map(|sides| Some(Segments::one(sides)))
+    .map_err(|e| {
+        Error::Prover(format!(
+            "CPU chunk at cycle {first_cycle}'s side records: {e}"
+        ))
+    })
 }
 
 /// A CPU chunk the host fills: its ops, and under the in-row register format
@@ -3667,11 +3791,11 @@ fn cpu_log_records(
     decode: Arc<CardDecode>,
 ) -> Option<CpuLogRecords> {
     match (sides, history) {
-        (Some(_), Some((parts, exceptions))) => {
+        (_, Some((parts, exceptions))) => {
             CpuLogRecords::in_row_from_history(logs, parts, exceptions, first_cycle as u64, decode)
         }
         (Some(sides), None) => CpuLogRecords::in_row(logs, sides, first_cycle as u64, decode),
-        (None, _) => CpuLogRecords::new(logs, first_cycle as u64, decode),
+        (None, None) => CpuLogRecords::new(logs, first_cycle as u64, decode),
     }
 }
 
@@ -3686,15 +3810,32 @@ fn cpu_chunk_ops(
     decode_table: &Arc<DecodeTable>,
     card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
 ) -> ChunkOps {
+    let first_cycle = index * rows;
+    // A chunk the host fills: where the card would have derived its side
+    // records, derived here from its logs (when in step with its ops) and
+    // history. A chunk that cannot be is filled without, a table its AIR
+    // refuses.
+    let in_step = logs
+        .as_ref()
+        .filter(|logs| logs_in_step(&ops, logs, first_cycle, decode_table))
+        .cloned();
+    let host_sides = |sides: Option<Segments<super::super::cpu::CpuSide>>,
+                      history: &ChunkHistory| {
+        sides.or_else(|| {
+            in_step
+                .as_ref()
+                .and_then(|logs| sides_of_history(logs, history, first_cycle, decode_table).ok())
+                .flatten()
+        })
+    };
     let Some((card, stamps)) = card else {
-        return host_cpu_chunk(ops, sides, decode_table);
+        return host_cpu_chunk(ops, host_sides(sides, &history), decode_table);
     };
     let Some(decode) = card.cpu.as_ref() else {
-        return host_cpu_chunk(ops, sides, decode_table);
+        return host_cpu_chunk(ops, host_sides(sides, &history), decode_table);
     };
-    let first_cycle = index * rows;
-    let records = match logs {
-        Some(logs) if logs_in_step(&ops, &logs, first_cycle, decode_table) => card
+    let records = match in_step.clone() {
+        Some(logs) => card
             .admits(
                 cpu_records_bytes(&logs, sides.as_ref(), &history),
                 (StreamTable::Cpu, index),
@@ -3704,7 +3845,7 @@ fn cpu_chunk_ops(
                 let records = cpu_log_records(
                     logs,
                     sides.clone(),
-                    history,
+                    history.clone(),
                     first_cycle,
                     Arc::clone(decode),
                 );
@@ -3716,7 +3857,7 @@ fn cpu_chunk_ops(
                 records
             })
             .flatten(),
-        _ => {
+        None => {
             stamps.out_of_step += 1;
             None
         }
@@ -3732,7 +3873,7 @@ fn cpu_chunk_ops(
         }
         None => {
             stamps.cpu[1] += 1;
-            host_cpu_chunk(ops, sides, decode_table)
+            host_cpu_chunk(ops, host_sides(sides, &history), decode_table)
         }
     }
 }
