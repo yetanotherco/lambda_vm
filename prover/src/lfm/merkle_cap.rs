@@ -96,34 +96,53 @@ pub fn cap_root_permutations(nodes: usize, arity: usize) -> usize {
     perms
 }
 
-/// The knob that chooses how a BLAKE3 opening is checked against its cap: over
-/// PACKED digests ([`pack_digest`], the default), where the mux picks one word
-/// a node instead of two (half its `Select` rows), or over both digest words
-/// (`plain`, the rollback). Read by the in-guest verifier alone (the proof
-/// does not move; the leaf programs do): see [`cap_mux_setting`].
+/// How a BLAKE3 opening is checked against its tree's cap ([`CAP_MUX_ENV`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapMux {
+    /// A balanced `Select` tree over both digest words: `2·(2^c − 1)` rows an
+    /// opening. The rollback.
+    Plain,
+    /// The same tree over PACKED digests ([`pack_digest`]): one word a node,
+    /// `2^c − 1` rows an opening. The default.
+    Packed,
+    /// An indexed read of a lookup table of the packed nodes
+    /// (`LfmBuilder::cap_table` / `cap_read`): one `LEAN_CAP_READ` row and
+    /// `c − 1` index `mul_add`s an opening, one `LEAN_CAP` row a node a tree.
+    /// Lean BLAKE3 programs only (the tables are lean tables); any other
+    /// program takes [`CapMux::Packed`].
+    Indexed,
+}
+
+/// The knob that chooses how a BLAKE3 opening is checked against its cap
+/// ([`CapMux`]). Read by the in-guest verifier alone (the proof does not move;
+/// the leaf programs do): see [`cap_mux_setting`].
 pub const CAP_MUX_ENV: &str = "LAMBDA_VM_LFM_CAP_MUX";
 
-/// [`CAP_MUX_ENV`]'s value: unset or `packed` muxes the packed word (the
-/// default); `plain` muxes both digest words. Anything else is refused.
-pub fn cap_mux_setting(value: Option<&str>) -> Result<bool, String> {
+/// [`CAP_MUX_ENV`]'s value: unset or `packed` is [`CapMux::Packed`] (the
+/// default); `plain` is [`CapMux::Plain`]; `indexed` is [`CapMux::Indexed`].
+/// Anything else is refused.
+pub fn cap_mux_setting(value: Option<&str>) -> Result<CapMux, String> {
     match value.map(str::trim) {
-        None | Some("packed") => Ok(true),
-        Some("plain") => Ok(false),
-        Some(other) => Err(format!("{CAP_MUX_ENV}={other:?}: expected plain or packed")),
+        None | Some("packed") => Ok(CapMux::Packed),
+        Some("plain") => Ok(CapMux::Plain),
+        Some("indexed") => Ok(CapMux::Indexed),
+        Some(other) => Err(format!(
+            "{CAP_MUX_ENV}={other:?}: expected plain, packed or indexed"
+        )),
     }
 }
 
 /// [`CAP_MUX_ENV`] in this process, read once; a refused value aborts the
 /// process at its first read (a configuration error, before any program is
 /// emitted), as the process format does.
-pub fn cap_mux_packed() -> bool {
-    static PACKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PACKED.get_or_init(|| {
+pub fn cap_mux() -> CapMux {
+    static MODE: std::sync::OnceLock<CapMux> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
         let value = match std::env::var(CAP_MUX_ENV) {
             Ok(v) => Some(v),
             Err(std::env::VarError::NotPresent) => None,
             Err(std::env::VarError::NotUnicode(v)) => {
-                eprintln!("{CAP_MUX_ENV}={v:?}: expected plain or packed");
+                eprintln!("{CAP_MUX_ENV}={v:?}: expected plain, packed or indexed");
                 std::process::abort()
             }
         };
@@ -136,22 +155,29 @@ pub fn cap_mux_packed() -> bool {
 
 #[cfg(test)]
 thread_local! {
-    /// Test only: on this thread, the cap mux is packed (`Some(true)`) or
-    /// plain (`Some(false)`) whatever the knob says.
-    pub(crate) static PACKED_MUX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Test only: on this thread, the cap check takes this mode whatever the
+    /// knob says.
+    pub(crate) static CAP_MUX_OVERRIDE: std::cell::Cell<Option<CapMux>> = const { std::cell::Cell::new(None) };
 }
 
-/// Whether a cap authenticated on `b` muxes packed digests: under BLAKE3
-/// alone (two `u32`-lane words a digest), as [`cap_mux_packed`] says.
-fn packs(b: &LfmBuilder) -> bool {
+/// The mode a cap authenticated on `b` checks its openings in: [`cap_mux`]'s
+/// under BLAKE3 (two `u32`-lane words a digest), [`CapMux::Plain`] under any
+/// other hash, and [`CapMux::Packed`] in place of [`CapMux::Indexed`] in a
+/// program that is not lean.
+fn mode(b: &LfmBuilder) -> CapMux {
     if b.wrap_hash() != edsl::WrapHash::Blake3 {
-        return false;
+        return CapMux::Plain;
     }
     #[cfg(test)]
-    if let Some(packed) = PACKED_MUX.with(std::cell::Cell::get) {
-        return packed;
+    let chosen = CAP_MUX_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(cap_mux);
+    #[cfg(not(test))]
+    let chosen = cap_mux();
+    match chosen {
+        CapMux::Indexed if !b.b3_lean() => CapMux::Packed,
+        other => other,
     }
-    cap_mux_packed()
 }
 
 /// ★ A BLAKE3 digest's two words as ONE word: lanes `(l0..l7)` (each a `u32`,
@@ -183,9 +209,12 @@ pub struct CapCells {
     height: usize,
     /// Index bits the mux reads, `log2(cap.len())`.
     mux_bits: usize,
-    /// The cap's nodes packed ([`pack_digest`]) when this cap's mux is packed
-    /// ([`packs`]): one word a node, the same nodes the root check read.
+    /// The cap's nodes packed ([`pack_digest`]) when this cap's check is
+    /// packed or indexed ([`mode`]): one word a node, the same nodes the root
+    /// check read.
     packed: Option<Vec<Cell>>,
+    /// The lookup table of those packed nodes under [`CapMux::Indexed`].
+    table: Option<super::builder::CapHandle>,
 }
 
 impl CapCells {
@@ -234,12 +263,21 @@ impl CapCells {
         );
         let root = edsl::wrap_merkle_tree_root(b, cap);
         edsl::assert_digest_eq_lanes(b, root, root_lanes);
-        let packed = packs(b).then(|| cap.iter().map(|node| pack_digest(b, *node)).collect());
+        let mode = mode(b);
+        let packed: Option<Vec<Cell>> =
+            (mode != CapMux::Plain).then(|| cap.iter().map(|node| pack_digest(b, *node)).collect());
+        // The table holds the packed cells of the nodes the root check just
+        // hashed, so every word it offers is an authenticated node.
+        let table = match (&packed, mode) {
+            (Some(words), CapMux::Indexed) => Some(b.cap_table(words)),
+            _ => None,
+        };
         Self {
             cap: cap.to_vec(),
             height,
             mux_bits,
             packed,
+            table,
         }
     }
 
@@ -330,6 +368,13 @@ impl CapCells {
         } else {
             edsl::wrap_merkle_walk(b, leaf, walk_bits, siblings)
         };
+        if let Some(table) = self.table {
+            // The walked digest against the packed node read at the index.
+            let node = b.cap_read(table, top_bits);
+            let walked = pack_digest(b, walked);
+            edsl::assert_word_eq(b, walked, node);
+            return;
+        }
         if let Some(packed) = &self.packed {
             // The walked digest against the packed node: one word muxed.
             let node = Self::select_words(b, packed.clone(), top_bits);
