@@ -103,8 +103,9 @@ fn held(
 }
 
 /// The small runs and a Rust guest: asm programs in windows of 7 (MEMW_A
-/// chunks of 16 rows, CPU chunks of 64 cycles) and a guest in windows of 97
-/// (chunks of 4096, CPU chunks of 4096).
+/// chunks of 8 rows, CPU chunks of 16 cycles: 8 chunks whole CPU chunks
+/// cover) and a guest in windows of 97 (chunks of 4096, CPU chunks of 4096:
+/// 6 covered).
 fn small_runs() -> Vec<Run> {
     let order = MemwAlignedOrder::Limbs;
     let mut out = Vec::new();
@@ -116,7 +117,7 @@ fn small_runs() -> Vec<Run> {
     ] {
         let (program, _) = run(name);
         let (w, decode) = walked(&program, &[], 7, order);
-        out.push(held(name, &w, decode, 16, 64));
+        out.push(held(name, &w, decode, 8, 16));
     }
     let program = rust_elf("dma_memmove_cases");
     let (w, decode) = walked(&program, &[], 97, order);
@@ -153,7 +154,9 @@ fn the_card_derives_memw_a_rows_as_the_host_does() {
         chunks += run.memw_a.len();
     }
     println!("CARD MEMW_A SMALL: {derived} of {chunks} chunks derived, 0 words differ");
-    assert!(derived >= 8, "{derived} chunks derived");
+    // Every covered chunk is derived (asserted above): 8 of the asm runs'
+    // and 6 of the guest's.
+    assert!(derived >= 12, "{derived} chunks derived");
 }
 
 /// A store's old read as its value makes other words on some chunk; a chunk
@@ -177,34 +180,26 @@ fn the_card_catches_a_wrong_memw_a_row() {
     FAULT_MEMW_A.store(0, Relaxed);
     println!("CARD MEMW_A MUTANT store's old read as its value: caught on {caught} chunks");
     assert!(caught > 0);
-    // The edit: a covered chunk's first regular row's access stamped at its
-    // own timestamp, over a copy of that row's window.
+    // The edit: the first covered chunk with a regular row of one old
+    // timestamp, that row's access stamped at its own timestamp, over a copy
+    // of the row's window.
     let order = MemwAlignedOrder::Limbs;
-    let (program, _) = run("all_loadstore_32");
-    let (w, decode) = walked(&program, &[], 7, order);
-    let base = held("all_loadstore_32", &w, Arc::clone(&decode), 16, 64);
-    let k = base
-        .memw_a
-        .iter()
-        .position(|(_, cpu)| cpu.is_some())
-        .expect("a covered chunk");
-    let cpu = base.memw_a[k].1.clone().expect("covered");
-    let mut chunk = chunks(&w, 16).swap_remove(k);
-    let (part, r) = chunk
-        .refs
-        .slices()
-        .iter()
-        .enumerate()
-        .find_map(|(i, refs)| {
-            let accesses = &chunk.windows[i].history.accesses;
-            refs.iter()
-                .find(|r| {
-                    r.cycle & ALIGNED_ECALL == 0
-                        && accesses[r.at as usize].mixed == executor::vm::history::NO_ACCESS
-                })
-                .map(|r| (i, *r))
-        })
-        .expect("a regular row of one old timestamp");
+    let mut found = None;
+    'search: for name in ["test_keccak_multi", "all_loadstore_32", "test_copy_ecalls"] {
+        let (program, _) = run(name);
+        let (w, decode) = walked(&program, &[], 7, order);
+        let base = held(name, &w, Arc::clone(&decode), 8, 16);
+        let mut all = chunks(&w, 8);
+        for (k, (_, cpu)) in base.memw_a.iter().enumerate() {
+            let Some(cpu) = cpu else { continue };
+            if let Some((part, r)) = uniform_regular_row(&all[k]) {
+                found = Some((cpu.clone(), all.swap_remove(k), part, r, decode));
+                break 'search;
+            }
+        }
+    }
+    let (cpu, mut chunk, part, r, decode) =
+        found.expect("a covered chunk with a regular row of one old timestamp");
     let window = &chunk.windows[part];
     let mut history = (*window.history).clone();
     history.accesses[r.at as usize].ts = 4 * r.cycle + 4;
@@ -223,6 +218,27 @@ fn the_card_catches_a_wrong_memw_a_row() {
         card_memw_a(&cpu, &edited).is_none(),
         "a row with no step declines the group"
     );
+}
+
+/// The first regular row of `chunk` whose access shares one old timestamp:
+/// its part and its ref.
+fn uniform_regular_row(
+    chunk: &super::history_rows_tests::RefChunk,
+) -> Option<(usize, multilinear::records::AlignedRef)> {
+    chunk
+        .refs
+        .slices()
+        .iter()
+        .enumerate()
+        .find_map(|(i, refs)| {
+            let accesses = &chunk.windows[i].history.accesses;
+            refs.iter()
+                .find(|r| {
+                    r.cycle & ALIGNED_ECALL == 0
+                        && accesses[r.at as usize].mixed == executor::vm::history::NO_ACCESS
+                })
+                .map(|r| (i, *r))
+        })
 }
 
 /// ★ A real block (`BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`) walked at the
