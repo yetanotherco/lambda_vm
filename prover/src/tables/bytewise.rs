@@ -112,7 +112,7 @@ pub fn generate_bytewise_trace(
 }
 
 /// The widths BYTEWISE traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_bytewise_trace`] in `form` (`tables::gpack`).
 pub fn generate_bytewise_trace_as(

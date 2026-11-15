@@ -195,7 +195,7 @@ fn step_limbs(row: &RegRow) -> (u16, u16) {
 }
 
 /// The widths residual register traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// The table's trace from its rows (in order, then zero rows to a power of two of
 /// at least four), in `form`.

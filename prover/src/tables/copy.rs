@@ -271,7 +271,7 @@ pub fn generate_copy_trace(
 }
 
 /// The widths COPY traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_copy_trace`] in `form` (`tables::gpack`).
 pub fn generate_copy_trace_as(

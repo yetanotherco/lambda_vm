@@ -328,7 +328,7 @@ pub fn generate_dvrm_trace(
 }
 
 /// The widths DVRM traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_dvrm_trace`] in `form` (`tables::gpack`).
 pub fn generate_dvrm_trace_as(

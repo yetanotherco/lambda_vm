@@ -459,7 +459,7 @@ pub fn generate_ecrec_trace(
     generate_ecrec_trace_as(ops, TraceForm::Wide)
 }
 
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 pub fn generate_ecrec_trace_as(
     ops: &[EcrecOperation],

@@ -385,7 +385,7 @@ pub fn generate_shift_trace(
 }
 
 /// The widths SHIFT traces needed so far in this process (`tables::gpack`).
-static WIDTHS: WidthHint = WidthHint::new();
+pub(crate) static WIDTHS: WidthHint = WidthHint::new();
 
 /// [`generate_shift_trace`] in `form` (`tables::gpack`).
 pub fn generate_shift_trace_as(
