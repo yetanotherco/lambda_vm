@@ -548,7 +548,7 @@ __device__ __forceinline__ void fraction_pair(const Fe3 &p_lo, const Fe3 &p_hi, 
     q_up = ext3::mul(q_lo, q_hi);
 }
 
-extern "C" __global__ void fraction_fold2_ext3(const uint64_t *__restrict__ p,
+extern "C" __global__ __launch_bounds__(256) void fraction_fold2_ext3(const uint64_t *__restrict__ p,
                                                const uint64_t *__restrict__ q, uint64_t half,
                                                uint64_t *__restrict__ p_mid,
                                                uint64_t *__restrict__ q_mid,

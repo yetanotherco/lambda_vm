@@ -450,7 +450,13 @@ fn fold_upwards(
                     .arg(&mut p_out)
                     .arg(&mut q_out)
                     .arg(&fault)
-                    .launch(LaunchConfig::for_num_elems(quarter as u32))?;
+                    .launch(LaunchConfig {
+                        // 256 threads a block: the kernel takes 72 registers a
+                        // thread, past what a block of 1024 may hold.
+                        grid_dim: ((quarter as u64).div_ceil(256) as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
             }
             layers.push(DeviceLayer {
                 p: Arc::new(p_mid),
