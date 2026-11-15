@@ -118,13 +118,33 @@ fn census(air: &DynAir<'_>) -> Option<String> {
         .iter()
         .map(|i| i.numerator.terms().len() + i.denominator.terms().len())
         .sum();
+    // The card's lowered program and the threads its launches can take: the
+    // slot file is budgeted at 512 MiB (`argue_fused::ceiling`) and a launch is
+    // capped at 2^17 threads, split over the grid's points (rounds: nodes + 2).
+    let lowered = multilinear::gpu_fused::lower_fused(&constraints);
+    let (lowered_steps, slots) = lowered
+        .as_ref()
+        .map_or((0, 0), |l| (l.nodes.len() / 2, l.num_slots));
+    let threads = |bytes_a_thread: u64| -> u64 {
+        ((512u64 << 20) / bytes_a_thread.max(1))
+            .clamp(32, 1 << 20)
+            .min(1 << 17)
+    };
+    let d = base.constraint_degree as u64;
+    let points = ((d + 1) * (d + 1)).saturating_sub(4).max(1);
+    let grid_threads = threads(slots as u64 * 8);
+    let round_threads = threads(slots as u64 * 24);
     let mut line = format!(
         "ZC WORK {name} · factors {factors} · constraint reads {} · dag steps {} · roots {} · degree {} \
+         · lowered steps {lowered_steps} · live slots {slots} · grid threads {grid_threads} over {points} points \
+         (slot file {} MiB) · round threads {round_threads} (slot file {} MiB) \
          · interactions {} · raw bus terms {raw_terms} · bus column terms {} · bus-only factors {bus_only}",
         constraint_reads.len(),
         base.dag.steps(),
         base.roots,
         base.constraint_degree,
+        (grid_threads * slots as u64 * 8) >> 20,
+        (round_threads * slots as u64 * 24) >> 20,
         interactions.len(),
         bus_reads.len(),
     );

@@ -41,6 +41,20 @@ pub mod knobs {
         })
     }
 
+    /// The slot files' budget in bytes: `LAMBDA_VM_ZC_SLOT_BUDGET_MIB` (a
+    /// measurement arm: a launch's thread count, and so its summation order
+    /// only, changes; field sums are exact) or 512 MiB, the default.
+    pub fn slot_budget() -> u64 {
+        static BUDGET: OnceLock<u64> = OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            std::env::var("LAMBDA_VM_ZC_SLOT_BUDGET_MIB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&mib| (8..=4096).contains(&mib))
+                .map_or(super::SLOT_BUDGET_BYTES, |mib| mib << 20)
+        })
+    }
+
     /// Forces [`bus_twice`]; `None` back to the environment's word.
     #[doc(hidden)]
     pub fn force_bus_twice(on: Option<bool>) {
@@ -129,7 +143,7 @@ pub struct FusedZerocheck<'f> {
 
 /// Threads a slot file of `bytes_per_thread` affords under the budget.
 fn ceiling(bytes_per_thread: u64) -> u64 {
-    (SLOT_BUDGET_BYTES / bytes_per_thread.max(1)).clamp(32, MAX_THREADS)
+    (knobs::slot_budget() / bytes_per_thread.max(1)).clamp(32, MAX_THREADS)
 }
 
 /// Threads a fused launch takes in all: past this the card is full (170 SMs of
