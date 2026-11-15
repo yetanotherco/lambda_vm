@@ -113,6 +113,7 @@ fn the_levels_take_a_base_of_their_own_hash_only() {
             family,
             LevelStop::DEFAULT,
             true,
+            true,
         ) else {
             panic!("{family:?} levels proved over another hash's base");
         };
@@ -309,10 +310,11 @@ fn a_chain_stopped_at_one_group_is_its_own_verifiers() {
 }
 
 /// ★ THE DRIVER: a small block proved to its last level with level 1's
-/// program emitted the moment the statement is final and executed as phase B
-/// finishes its groups. The base verifies, every level verifies against its own
-/// artifacts, and the block's verifier — its plan derived on its own from the
-/// ELF and the statement — accepts the last level.
+/// program emitted the moment the statement is final, executed as phase B
+/// finishes its groups, and every level built beside phase B with its prepared
+/// stacks committed on the host. The base verifies, every level verifies
+/// against its own artifacts, and the block's verifier — its plan derived on
+/// its own from the ELF and the statement — accepts the last level.
 #[test]
 #[ignore = "proves a small block and its levels; box tier"]
 fn the_block_levels_driver_proves_a_small_block() {
@@ -329,6 +331,7 @@ fn the_block_levels_driver_proves_a_small_block() {
         &options,
         WlfmFamily::P1,
         LevelStop::DEFAULT,
+        true,
         true,
     )
     .expect("the block proves to its last level");
@@ -366,7 +369,8 @@ fn the_block_levels_driver_proves_a_small_block() {
 }
 
 /// ★ THE BLAKE3 DRIVER: a small block's 7-round BLAKE3 base proved with level
-/// 1 executed beside its phase B, then both levels under the BLAKE3 family.
+/// 1 executed and every level built (prepared stacks on the host) beside its
+/// phase B, then both levels proved under the BLAKE3 family.
 /// The base verifies, every level verifies against its own artifacts, and the
 /// block's verifier — its BLAKE3 plan derived on its own — accepts the last.
 #[test]
@@ -384,6 +388,7 @@ fn the_blake3_levels_driver_proves_a_small_block() {
         &small_block_options(),
         WlfmFamily::B3,
         LevelStop::DEFAULT,
+        true,
         true,
     )
     .expect("the BLAKE3 block proves to its last level");
@@ -462,8 +467,10 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
 /// `b3`: the 7-round BLAKE3 base at `prove-block-base --base b3`'s format —
 /// blowup 2, coset leaves, one tree a run, indexed groups — and BLAKE3
 /// levels), `RTA_BESIDE` (1, the default: level 1 executes beside phase B; 0
-/// the control), `RTA_LEVELS` (the chain's length; 2). Prints `RTA …` lines;
-/// everything is verified off the clock.
+/// the control), `RTA_BUILD_BESIDE` (1: every level built on the host beside
+/// phase B; 0, the default: on the card after the base), `RTA_LEVELS` (the
+/// chain's length; 2). Prints `RTA …` lines; everything is verified off the
+/// clock.
 #[test]
 #[ignore = "a real block and its levels: box only"]
 fn rta_a_real_block_through_its_levels() {
@@ -500,11 +507,13 @@ fn rta_a_real_block_through_its_levels() {
         assert_eq!(cfg.format.zf.base, BaseFormat::B3_WHIR);
     }
     let beside = std::env::var("RTA_BESIDE").map_or(true, |v| v.trim() != "0");
+    let build_beside = std::env::var("RTA_BUILD_BESIDE").is_ok_and(|v| v.trim() == "1");
     let levels: usize =
         std::env::var("RTA_LEVELS").map_or(2, |v| v.trim().parse().expect("RTA_LEVELS"));
     let opts = super::proof::block_base_options();
     println!(
-        "RTA CONFIG: base {:?} · family {family:?} · levels {levels} · beside {beside}",
+        "RTA CONFIG: base {:?} · family {family:?} · levels {levels} · beside {beside} · build \
+         beside {build_beside}",
         cfg.format.zf.base.hash
     );
     let run = prove_block_levels(
@@ -516,6 +525,7 @@ fn rta_a_real_block_through_its_levels() {
         family,
         LevelStop::Levels(levels),
         beside,
+        build_beside,
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let t = &run.times;
