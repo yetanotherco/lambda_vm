@@ -291,6 +291,9 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/p1w8_constants.cuh");
     compile_kernel("p1w16.cu", "p1w16.cubin", have_nvcc, &[]);
     compile_kernel("sumcheck.cu", "sumcheck.cubin", have_nvcc, &[]);
+    // The GKR step over two tree layers at once, a measurement against today's pair of steps
+    // (`src/gkr4_bench.rs`): loaded on first use by that module, never by the backend.
+    compile_kernel("gkr4_bench.cu", "gkr4_bench.cubin", have_nvcc, &[]);
     compile_kernel("whir_fold.cu", "whir_fold.cubin", have_nvcc, &[]);
     // The first-round cosets evaluated from the polynomial (`src/whir_coset.rs`),
     // a measurement module loaded on first use, never by the backend.

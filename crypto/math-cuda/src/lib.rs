@@ -43,6 +43,7 @@ pub mod faults;
 pub mod fill;
 pub mod fri;
 pub mod gkr;
+pub mod gkr4_bench;
 pub mod grinding;
 pub mod inverse;
 pub mod lde;
