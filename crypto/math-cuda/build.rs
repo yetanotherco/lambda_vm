@@ -24,7 +24,7 @@ fn nvcc_path() -> PathBuf {
 ///
 /// This is only reached when `nvcc` is present but the arch can't be detected
 /// (a toolkit-installed host with no visible GPU). A host without `nvcc` takes
-/// the empty-stub path in `compile_kernel` and never calls this.
+/// the empty-stub path in `Kernels::build` and never calls this.
 fn detect_arch() -> String {
     detect_arch_from_smi().unwrap_or_else(|| {
         panic!(
@@ -88,81 +88,171 @@ const BARY_MAX_EVAL_POINTS: usize = 8;
 /// table (`device.rs`) by the generated files below.
 const RPX_LIMB_PERMUTE_VARIANT: u32 = 5;
 
-fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool, defines: &[&str]) {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let src_path = manifest_dir.join("kernels").join(src);
-    let out_path = out_dir.join(out_name);
+/// One kernel's nvcc job: its source under `kernels/`, its cubin under
+/// `OUT_DIR`, and its `-D` defines.
+struct Kernel {
+    src: &'static str,
+    out: String,
+    defines: Vec<String>,
+}
 
-    println!("cargo:rerun-if-changed=kernels/{src}");
-    println!("cargo:rerun-if-env-changed=CUDA_HOME");
-    println!("cargo:rerun-if-env-changed=CUDA_PATH");
-    println!("cargo:rerun-if-env-changed=CUDARC_NVCC_ARCH");
-    println!("cargo:rerun-if-env-changed=LAMBDA_VM_NVCC_LINEINFO");
-    println!("cargo:rerun-if-env-changed=LAMBDA_VM_RPX_MAXRREGCOUNT");
+/// The kernels to compile, in the order `main` lists them. `add` emits each
+/// kernel's rerun-if lines; `build` compiles them all at the end, in parallel.
+#[derive(Default)]
+struct Kernels(Vec<Kernel>);
 
-    // When nvcc is missing from PATH, emit an empty cubin stub so the crate
-    // still compiles. include_bytes! in src/device.rs needs the file to exist
-    // at build time. Any runtime kernel call fails to load the empty module and
-    // the caller falls back to CPU. We can't run GPU code without nvcc on the
-    // build host anyway.
-    if !have_nvcc {
-        fs::write(&out_path, "").expect("failed to write empty cubin stub");
-        return;
+impl Kernels {
+    fn add(&mut self, src: &'static str, out_name: &str, defines: &[&str]) {
+        println!("cargo:rerun-if-changed=kernels/{src}");
+        self.0.push(Kernel {
+            src,
+            out: out_name.to_string(),
+            defines: defines.iter().map(|d| d.to_string()).collect(),
+        });
     }
 
-    // AOT-compile each kernel to a native cubin (SASS) for the host GPU's real
-    // arch, NOT to PTX. This sidesteps the driver's PTX-ISA JIT version check:
-    // a toolkit's PTX ISA is fixed by its CUDA version (e.g. CUDA 13.1 emits PTX
-    // .version 9.1), and a driver older than that toolkit rejects the module at
-    // load with CUDA_ERROR_UNSUPPORTED_PTX_VERSION -> every kernel silently
-    // falls back to CPU. A cubin carries pre-compiled SASS for a real arch, so
-    // the driver loads it directly as long as it supports that GPU (which the
-    // driver installed for that GPU always does) — regardless of the toolkit's
-    // CUDA version. See README "GPU Tests".
-    //
-    // Trade-off: a cubin is arch-specific (an `sm_120` cubin runs only on
-    // `sm_120`). We build+run on the same GPU box in every flow and detect the
-    // arch from that box's `nvidia-smi`, so this is exactly right. Override with
-    // CUDARC_NVCC_ARCH (compute_XX / sm_XX / bare XX all accepted) to
-    // cross-compile for a different arch. If nvcc is present but no GPU is
-    // detectable and no override is given, `detect_arch` hard-fails rather than
-    // guessing an arch that would load on one GPU model and CPU-fall-back on
-    // every other.
-    let arch = env::var("CUDARC_NVCC_ARCH")
-        .map(|a| to_real_arch(&a))
-        .unwrap_or_else(|_| detect_arch());
+    /// Compile every kernel to its cubin; with no nvcc, write empty stubs.
+    ///
+    /// The nvcc runs are independent processes (each its own source, flags
+    /// and `-o` path; nvcc names its temporary files by process), so they run
+    /// on a pool of `LAMBDA_VM_NVCC_JOBS` workers (default: cargo's
+    /// `NUM_JOBS`, else the host's parallelism), the largest sources first.
+    /// Each cubin is the serial build's byte for byte; `LAMBDA_VM_NVCC_JOBS=1`
+    /// compiles one at a time, as before. Every failure is reported after
+    /// the pool ends, each with nvcc's own output, then the build panics
+    /// naming them all.
+    fn build(self, have_nvcc: bool) {
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        println!("cargo:rerun-if-env-changed=CUDA_HOME");
+        println!("cargo:rerun-if-env-changed=CUDA_PATH");
+        println!("cargo:rerun-if-env-changed=CUDARC_NVCC_ARCH");
+        println!("cargo:rerun-if-env-changed=LAMBDA_VM_NVCC_LINEINFO");
+        println!("cargo:rerun-if-env-changed=LAMBDA_VM_RPX_MAXRREGCOUNT");
+        println!("cargo:rerun-if-env-changed=LAMBDA_VM_NVCC_JOBS");
 
-    let mut cmd = Command::new(nvcc_path());
-    cmd.args(["--cubin", "-O3", "-std=c++17", "-arch", &arch]);
-    cmd.args(defines);
-    // SASS→source line mapping for Nsight Compute. Unlike -G this does not
-    // change codegen, but keep it opt-in so production cubins stay byte-stable.
-    if env::var("LAMBDA_VM_NVCC_LINEINFO").is_ok_and(|v| v != "0" && !v.is_empty()) {
-        cmd.arg("-lineinfo");
-    }
-    // Opt-in per-thread register cap for the round-3 occupancy discriminator.
-    // Capping registers lets more blocks reside per SM, tracing the RPX
-    // permutation's throughput-vs-occupancy curve across separate builds (the
-    // production grind kernel cannot carry a per-kernel `__launch_bounds__`, and
-    // it is what this sweep must move). Empty/unset/"0" ⇒ no cap ⇒ production
-    // cubins stay byte-stable, exactly like `-lineinfo` above. Diagnostic only;
-    // never set in a production or bench build.
-    if let Ok(r) = env::var("LAMBDA_VM_RPX_MAXRREGCOUNT")
-        && !r.is_empty()
-        && r != "0"
-    {
-        cmd.arg(format!("-maxrregcount={r}"));
-    }
-    let status = cmd
-        .arg("-o")
-        .arg(&out_path)
-        .arg(&src_path)
-        .status()
-        .expect("failed to invoke nvcc — is CUDA installed and CUDA_HOME set?");
+        // When nvcc is missing from PATH, emit an empty cubin stub so the crate
+        // still compiles. include_bytes! in src/device.rs needs the file to exist
+        // at build time. Any runtime kernel call fails to load the empty module and
+        // the caller falls back to CPU. We can't run GPU code without nvcc on the
+        // build host anyway.
+        if !have_nvcc {
+            for k in &self.0 {
+                fs::write(out_dir.join(&k.out), "").expect("failed to write empty cubin stub");
+            }
+            return;
+        }
 
-    if !status.success() {
-        panic!("nvcc failed compiling {}", src_path.display());
+        // AOT-compile each kernel to a native cubin (SASS) for the host GPU's real
+        // arch, NOT to PTX. This sidesteps the driver's PTX-ISA JIT version check:
+        // a toolkit's PTX ISA is fixed by its CUDA version (e.g. CUDA 13.1 emits PTX
+        // .version 9.1), and a driver older than that toolkit rejects the module at
+        // load with CUDA_ERROR_UNSUPPORTED_PTX_VERSION -> every kernel silently
+        // falls back to CPU. A cubin carries pre-compiled SASS for a real arch, so
+        // the driver loads it directly as long as it supports that GPU (which the
+        // driver installed for that GPU always does) — regardless of the toolkit's
+        // CUDA version. See README "GPU Tests".
+        //
+        // Trade-off: a cubin is arch-specific (an `sm_120` cubin runs only on
+        // `sm_120`). We build+run on the same GPU box in every flow and detect the
+        // arch from that box's `nvidia-smi`, so this is exactly right. Override with
+        // CUDARC_NVCC_ARCH (compute_XX / sm_XX / bare XX all accepted) to
+        // cross-compile for a different arch. If nvcc is present but no GPU is
+        // detectable and no override is given, `detect_arch` hard-fails rather than
+        // guessing an arch that would load on one GPU model and CPU-fall-back on
+        // every other. Read once for every kernel.
+        let arch = env::var("CUDARC_NVCC_ARCH")
+            .map(|a| to_real_arch(&a))
+            .unwrap_or_else(|_| detect_arch());
+        let mut common: Vec<String> = ["--cubin", "-O3", "-std=c++17", "-arch", &arch]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        // SASS→source line mapping for Nsight Compute. Unlike -G this does not
+        // change codegen, but keep it opt-in so production cubins stay byte-stable.
+        if env::var("LAMBDA_VM_NVCC_LINEINFO").is_ok_and(|v| v != "0" && !v.is_empty()) {
+            common.push("-lineinfo".to_string());
+        }
+        // Opt-in per-thread register cap for the round-3 occupancy discriminator.
+        // Capping registers lets more blocks reside per SM, tracing the RPX
+        // permutation's throughput-vs-occupancy curve across separate builds (the
+        // production grind kernel cannot carry a per-kernel `__launch_bounds__`, and
+        // it is what this sweep must move). Empty/unset/"0" ⇒ no cap ⇒ production
+        // cubins stay byte-stable, exactly like `-lineinfo` above. Diagnostic only;
+        // never set in a production or bench build.
+        if let Ok(r) = env::var("LAMBDA_VM_RPX_MAXRREGCOUNT")
+            && !r.is_empty()
+            && r != "0"
+        {
+            common.push(format!("-maxrregcount={r}"));
+        }
+
+        // The largest sources first, so the longest compiles start at once and
+        // the pool's tail is short (a source's size stands in for its compile
+        // time; ties keep `main`'s order).
+        let size = |k: &Kernel| {
+            fs::metadata(manifest_dir.join("kernels").join(k.src)).map_or(0, |m| m.len())
+        };
+        let mut order: Vec<usize> = (0..self.0.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(size(&self.0[i])));
+        let workers = env::var("LAMBDA_VM_NVCC_JOBS")
+            .ok()
+            .or_else(|| env::var("NUM_JOBS").ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .min(order.len())
+            .max(1);
+
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results: std::sync::Mutex<Vec<Option<std::process::Output>>> =
+            std::sync::Mutex::new((0..self.0.len()).map(|_| None).collect());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&i) = order.get(at) else {
+                            break;
+                        };
+                        let k = &self.0[i];
+                        let output = Command::new(nvcc_path())
+                            .args(&common)
+                            .args(&k.defines)
+                            .arg("-o")
+                            .arg(out_dir.join(&k.out))
+                            .arg(manifest_dir.join("kernels").join(k.src))
+                            .output()
+                            .expect("failed to invoke nvcc — is CUDA installed and CUDA_HOME set?");
+                        results.lock().expect("an nvcc worker panicked")[i] = Some(output);
+                    }
+                });
+            }
+        });
+
+        // nvcc's own output, in `main`'s order whatever order the pool ran in;
+        // then every failure, named.
+        let results = results.into_inner().expect("an nvcc worker panicked");
+        let mut failed = Vec::new();
+        for (k, output) in self.0.iter().zip(results) {
+            let output = output.expect("every kernel compiled");
+            eprint!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            if !output.status.success() {
+                eprintln!(
+                    "nvcc failed compiling kernels/{} ({})",
+                    k.src, output.status
+                );
+                failed.push(format!("kernels/{} -> {}", k.src, k.out));
+            }
+        }
+        if !failed.is_empty() {
+            panic!(
+                "nvcc failed compiling {} kernel(s): {}",
+                failed.len(),
+                failed.join(", ")
+            );
+        }
     }
 }
 
@@ -221,48 +311,38 @@ fn main() {
         );
     }
 
-    compile_kernel("arith.cu", "arith.cubin", have_nvcc, &[]);
+    let mut kernels = Kernels::default();
+    kernels.add("arith.cu", "arith.cubin", &[]);
     // The table fills from records (`src/fill.rs`), loaded on first use, never
     // by the backend. Pinned on the host by `tests/host_kat/fill_host_kat.cpp`.
-    compile_kernel("fill.cu", "fill.cubin", have_nvcc, &[]);
+    kernels.add("fill.cu", "fill.cubin", &[]);
     // The card-built LOAD, STORE and MEMW_R rows from the cached CPU logs
     // (`src/card_rows.rs`, `LAMBDA_VM_CARD_ROWS`: the default, words, and a
     // test's derive and registers modes); includes fill.cu.
-    compile_kernel("card_rows.cu", "card_rows.cubin", have_nvcc, &[]);
-    compile_kernel("ntt.cu", "ntt.cubin", have_nvcc, &[]);
+    kernels.add("card_rows.cu", "card_rows.cubin", &[]);
+    kernels.add("ntt.cu", "ntt.cubin", &[]);
     // The column-major LDE engine (`src/lde_cm.rs`). Pinned on the host by
     // `tests/host_kat/ntt_cm_host_kat.cpp` (`make test-ntt-cm-host-kat`).
-    compile_kernel("ntt_cm.cu", "ntt_cm.cubin", have_nvcc, &[]);
-    compile_kernel("keccak.cu", "keccak.cubin", have_nvcc, &[]);
+    kernels.add("ntt_cm.cu", "ntt_cm.cubin", &[]);
+    kernels.add("keccak.cu", "keccak.cubin", &[]);
     let bary_define = format!("-DBARY_MAX_K={BARY_MAX_EVAL_POINTS}");
-    compile_kernel(
-        "barycentric.cu",
-        "barycentric.cubin",
-        have_nvcc,
-        &[&bary_define],
-    );
-    compile_kernel("deep.cu", "deep.cubin", have_nvcc, &[]);
-    compile_kernel("fri.cu", "fri.cubin", have_nvcc, &[]);
-    compile_kernel("inverse.cu", "inverse.cubin", have_nvcc, &[]);
+    kernels.add("barycentric.cu", "barycentric.cubin", &[&bary_define]);
+    kernels.add("deep.cu", "deep.cubin", &[]);
+    kernels.add("fri.cu", "fri.cubin", &[]);
+    kernels.add("inverse.cu", "inverse.cubin", &[]);
     // RPX256 (XHash12) leaves, parents and grind — the algebraic hash's device
     // kernels, pinned on the host by `tests/host_kat/rpx_host_kat.cpp` at every
     // variant. Built twice: at 0 (no `-D`, the source's default: the 64-bit
     // multiply) and at the limb variant, the default the backend loads.
-    compile_kernel("rpx.cu", "rpx_v0.cubin", have_nvcc, &[]);
+    kernels.add("rpx.cu", "rpx_v0.cubin", &[]);
     let limb_define = format!("-DRPX_PERMUTE_VARIANT={RPX_LIMB_PERMUTE_VARIANT}");
-    compile_kernel(
+    kernels.add(
         "rpx.cu",
         &format!("rpx_v{RPX_LIMB_PERMUTE_VARIANT}.cubin"),
-        have_nvcc,
         &[&limb_define],
     );
-    compile_kernel("logup.cu", "logup.cubin", have_nvcc, &[]);
-    compile_kernel(
-        "constraint_interp.cu",
-        "constraint_interp.cubin",
-        have_nvcc,
-        &[],
-    );
+    kernels.add("logup.cu", "logup.cubin", &[]);
+    kernels.add("constraint_interp.cu", "constraint_interp.cubin", &[]);
     // The BLAKE3 kernels' round count is a compile-time knob with the same
     // polarity as the host tree's `blake3-6round` feature: 7 rounds (standard
     // BLAKE3) unless the feature selects the 6-round variant. The `.cu` defaults
@@ -275,13 +355,13 @@ fn main() {
     } else {
         &[]
     };
-    compile_kernel("blake3.cu", "blake3.cubin", have_nvcc, blake3_defines);
+    kernels.add("blake3.cu", "blake3.cubin", blake3_defines);
     // The WHIR base proof's BLAKE3 kernels (`src/blake3_whir.rs`): `blake3.cu`
     // instantiated at 7 rounds by the file itself, so no define is passed —
     // least of all the 6-round one above. Loaded on first use, never by the
     // backend.
     println!("cargo:rerun-if-changed=kernels/blake3.cu");
-    compile_kernel("blake3_whir.cu", "blake3_whir.cubin", have_nvcc, &[]);
+    kernels.add("blake3_whir.cu", "blake3_whir.cubin", &[]);
     // The WHIR path's own kernels. They carry no compile-time knob, so they
     // take the empty define list rather than gaining a second signature.
     // D-HASH stage 1's Poseidon1 width-16 MEASUREMENT kernels (`src/p1w16.rs`),
@@ -289,10 +369,11 @@ fn main() {
     // that module, never by the backend.
     println!("cargo:rerun-if-changed=kernels/p1w16_constants.cuh");
     println!("cargo:rerun-if-changed=kernels/p1w8_constants.cuh");
-    compile_kernel("p1w16.cu", "p1w16.cubin", have_nvcc, &[]);
-    compile_kernel("sumcheck.cu", "sumcheck.cubin", have_nvcc, &[]);
-    compile_kernel("whir_fold.cu", "whir_fold.cubin", have_nvcc, &[]);
+    kernels.add("p1w16.cu", "p1w16.cubin", &[]);
+    kernels.add("sumcheck.cu", "sumcheck.cubin", &[]);
+    kernels.add("whir_fold.cu", "whir_fold.cubin", &[]);
     // The first-round cosets evaluated from the polynomial (`src/whir_coset.rs`),
     // a measurement module loaded on first use, never by the backend.
-    compile_kernel("whir_coset.cu", "whir_coset.cubin", have_nvcc, &[]);
+    kernels.add("whir_coset.cu", "whir_coset.cubin", &[]);
+    kernels.build(have_nvcc);
 }
