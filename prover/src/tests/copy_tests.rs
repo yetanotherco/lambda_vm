@@ -1138,3 +1138,127 @@ fn the_test_helper_matches_the_production_builder() {
         }
     }
 }
+
+/// The constraint indices of `copy:c:set_gap` (`dst = src + 8` as one 64-bit
+/// `ADD`, its two limbs) and of its no-wrap carry.
+const SET_GAP: [usize; 3] = [20, 21, 39];
+
+/// The COPY constraints evaluated on one row, as the indices that do not vanish.
+fn failing_on_row(row: &[FE]) -> Vec<usize> {
+    use crate::tables::copy::CopyConstraints;
+    use crate::tables::types::GoldilocksExtension;
+    use math::field::element::FieldElement;
+    use stark::constraints::builder::{ConstraintSet, ProverEvalFolder};
+    use stark::frame::Frame;
+    use stark::table::TableView;
+    use stark::traits::TransitionEvaluationContext;
+    let n = CopyConstraints.meta().len();
+    let frame = Frame::<crate::tables::types::GoldilocksField, GoldilocksExtension>::new(vec![
+        TableView::new(vec![row.to_vec()], vec![vec![]]),
+    ]);
+    let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![];
+    let offset_e = FieldElement::<GoldilocksExtension>::zero();
+    let ctx =
+        TransitionEvaluationContext::new_prover(frame.as_row_frame(), &no_e, &no_e, &offset_e);
+    let mut base = vec![FE::zero(); n];
+    let mut ext = vec![FieldElement::<GoldilocksExtension>::zero(); n];
+    let mut folder = ProverEvalFolder::new(&ctx, &mut base, &mut ext);
+    CopyConstraints.eval(&mut folder);
+    (0..n).filter(|&i| base[i] != FE::zero()).collect()
+}
+
+/// The RAM messages one row sends on MEMW, as `(is_read, address, timestamp,
+/// old, value)`; a write has no old values.
+#[allow(clippy::type_complexity)]
+fn memw_messages(row: &[FE]) -> Vec<(bool, [FE; 2], FE, Option<Vec<FE>>, Vec<FE>)> {
+    use crate::tables::types::BusId;
+    let g = |c: usize| row[c];
+    crate::tables::copy::bus_interactions()
+        .iter()
+        .filter(|i| i.is_sender && i.bus_id == BusId::Memw as u64)
+        .filter(|i| super::lt_multiplicity_poc::eval_mult(&i.multiplicity, &g) != FE::zero())
+        .map(|i| {
+            i.values
+                .iter()
+                .flat_map(|v| v.combine_from(g))
+                .collect::<Vec<FE>>()
+        })
+        // RAM only (the register reads of a first row carry is_register 1).
+        .filter(|t| t[if t.len() == 24 { 8 } else { 0 }] == FE::zero())
+        .map(|t| match t.len() {
+            24 => (
+                true,
+                [t[9], t[10]],
+                t[19],
+                Some(t[0..8].to_vec()),
+                t[11..19].to_vec(),
+            ),
+            16 => (false, [t[1], t[2]], t[11], None, t[3..11].to_vec()),
+            other => panic!("a MEMW message of {other} elements"),
+        })
+        .collect()
+}
+
+/// The memset gap is what keeps a non-byte out of RAM. A memset row whose `dst`
+/// equals its `src` writes its eight lanes at `T` and reads them back at
+/// `T + 1` from the same cell, so the memory argument closes on its own write:
+/// the lanes are whatever the prover puts there, here `2^16 + 5` and `p − 1`,
+/// and nothing else in the chip checks them (no byte lookup reaches `VALUE`).
+/// Such a row satisfies every COPY constraint except `copy:c:set_gap`, so with
+/// that one constraint removed it would put a non-byte in RAM (which ECREC,
+/// ECSM and LOAD read with no range check); with it, the row is refused. The
+/// control is the same non-byte lanes at `dst = src + 8`: every constraint
+/// holds there, and the read at `T + 1` is of another cell, which the memory
+/// argument binds to what RAM already held.
+#[test]
+fn a_memset_onto_its_own_source_writes_a_non_byte_refused_only_by_the_gap() {
+    let non_bytes = [FE::from((1u64 << 16) + 5), -FE::one()];
+    let row_of = |src: u64, dst: u64| -> Vec<FE> {
+        let mut trace = generate_copy_trace(&set_chain(src, dst, 8));
+        for (lane, v) in non_bytes.iter().enumerate() {
+            trace.main_table.set(0, cols::VALUE[lane], *v);
+        }
+        (0..cols::NUM_COLUMNS)
+            .map(|c| *trace.main_table.get(0, c))
+            .collect()
+    };
+
+    // The forgery: dst == src. Only the gap fails.
+    let forged = row_of(0x1000, 0x1000);
+    let failing = failing_on_row(&forged);
+    assert!(
+        !failing.is_empty() && failing.iter().all(|i| SET_GAP.contains(i)),
+        "dst == src must fail the memset gap and nothing else: {failing:?}"
+    );
+    // Its memory traffic closes on its own write: one write at T and one read
+    // at T + 1, of the same cell, the read's old value the write's value, the
+    // lanes the non-bytes.
+    let messages = memw_messages(&forged);
+    assert_eq!(
+        messages.len(),
+        2,
+        "a memset row sends one write and one read"
+    );
+    let (_, write_at, t_write, _, written) =
+        messages.iter().find(|m| !m.0).cloned().expect("a write");
+    let (_, read_at, t_read, old, read) = messages.iter().find(|m| m.0).cloned().expect("a read");
+    let old = old.expect("a read carries its old values");
+    assert_eq!(write_at, read_at, "the read is of the cell just written");
+    assert_eq!(t_read, t_write + FE::one(), "the read follows the write");
+    assert_eq!(old, written, "the read's old value is the write's value");
+    assert_eq!(read, written, "and the read leaves it unchanged");
+    assert_eq!(written[..2], non_bytes, "the lanes are the non-bytes");
+
+    // The control: the same lanes at dst = src + 8 satisfy every constraint,
+    // and the read is of another cell.
+    let control = row_of(0x1000, 0x1008);
+    assert_eq!(
+        failing_on_row(&control),
+        Vec::<usize>::new(),
+        "an honest gap fails nothing"
+    );
+    let messages = memw_messages(&control);
+    let addresses: Vec<[FE; 2]> = messages.iter().map(|m| m.1).collect();
+    assert_eq!(messages.len(), 2, "one write and one read");
+    assert_ne!(addresses[0], addresses[1], "the read is of another cell");
+}
