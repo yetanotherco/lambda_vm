@@ -1022,6 +1022,36 @@ pub fn create_load_air(proof_options: &ProofOptions) -> ConcreteVmAir<LoadConstr
     )
 }
 
+/// The MEM_LOAD AIR (`tables::mem_load`): a CPU load checked in one row with
+/// its memory tokens, under the fused memory format.
+pub fn create_mem_load_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::mem_load::MemLoadConstraints> {
+    build_air(
+        crate::tables::mem_load::cols::NUM_COLUMNS,
+        crate::tables::mem_load::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::mem_load::MemLoadConstraints,
+        "MEM_LOAD",
+    )
+}
+
+/// The MEM_STORE AIR (`tables::mem_store`): a CPU store checked in one row
+/// with its memory tokens, under the fused memory format.
+pub fn create_mem_store_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::mem_store::MemStoreConstraints> {
+    build_air(
+        crate::tables::mem_store::cols::NUM_COLUMNS,
+        crate::tables::mem_store::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::mem_store::MemStoreConstraints,
+        "MEM_STORE",
+    )
+}
+
 /// Create DECODE AIR with bus interactions.
 ///
 /// The DECODE table has no transition constraints (it's a pure lookup table).

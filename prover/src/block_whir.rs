@@ -313,6 +313,16 @@ pub struct BlockFormat {
     /// REGISTER and HALT, so their buses, the block's tables and the
     /// recursion's programs, follow it.
     pub registers: crate::tables::register::RegisterFormat,
+    /// How the CPU's loads and stores are checked
+    /// ([`MemoryFormat`](crate::tables::fused_memory::MemoryFormat)): each a
+    /// LOAD or STORE row and a MEMW message to MEMW_A or MEMW
+    /// ([`Split`](crate::tables::fused_memory::MemoryFormat::Split), the
+    /// production constant), or an access MEMW_A would take as one MEM_LOAD or
+    /// MEM_STORE row holding its own memory tokens
+    /// ([`Fused`](crate::tables::fused_memory::MemoryFormat::Fused), a variant
+    /// a caller names). The block's tables, so its buses and the recursion's
+    /// programs, follow it.
+    pub memory: crate::tables::fused_memory::MemoryFormat,
 }
 
 /// The most groups a block statement may declare: a verifier constant, never in
@@ -455,6 +465,7 @@ impl BlockFormat {
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
             registers: crate::tables::register::RegisterFormat::InRow,
+            memory: crate::tables::fused_memory::MemoryFormat::Split,
         }
     }
 
@@ -493,6 +504,7 @@ impl BlockFormat {
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
             registers: crate::tables::register::RegisterFormat::InRow,
+            memory: crate::tables::fused_memory::MemoryFormat::Split,
         }
     }
 
@@ -524,6 +536,13 @@ impl BlockFormat {
             memw_aligned,
             ..self
         }
+    }
+
+    /// This format with the CPU's loads and stores checked as `memory` says: a
+    /// named constant the prover and the verifier of one block both take,
+    /// never read from a proof.
+    pub fn with_memory(self, memory: crate::tables::fused_memory::MemoryFormat) -> Self {
+        Self { memory, ..self }
     }
 
     /// This format with its batched argue's GKR trees laid out per `pack`:
@@ -4412,6 +4431,21 @@ fn prove_block_whir_inner(
     proved
 }
 
+/// Refuses a memory format the block cannot build or check yet: the fused
+/// tables' AIRs exist, but no walk routes an access to them and no statement
+/// counts them, so a block under
+/// [`MemoryFormat::Fused`](crate::tables::fused_memory::MemoryFormat::Fused)
+/// is refused by its prover and its verifier alike rather than proved or
+/// checked as split.
+pub(crate) fn check_memory_format(format: &BlockFormat) -> Result<(), Error> {
+    match format.memory {
+        crate::tables::fused_memory::MemoryFormat::Split => Ok(()),
+        crate::tables::fused_memory::MemoryFormat::Fused => Err(Error::Prover(
+            "the fused memory format is not built into the block yet".to_string(),
+        )),
+    }
+}
+
 /// [`prove_block_whir_inner`] once the pool is locked.
 #[allow(clippy::too_many_arguments)]
 fn prove_block_whir_body(
@@ -4426,6 +4460,7 @@ fn prove_block_whir_body(
     lead: Option<&PhaseBLead>,
 ) -> Result<(BlockWhirProof, BlockStamps), Error> {
     let mut stamps = BlockStamps::default();
+    check_memory_format(format)?;
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
     if let Some(window_log2) = options.window_log2 {
@@ -8141,6 +8176,7 @@ pub(crate) fn block_frame(
     proof_options: &ProofOptions,
     format: &BlockFormat,
 ) -> Result<BlockFrame, Error> {
+    check_memory_format(format)?;
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
     validate_block_counts(statement.table_counts)?;

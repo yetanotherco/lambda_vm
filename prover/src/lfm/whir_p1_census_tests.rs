@@ -1243,6 +1243,7 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     // emits the leaves the lean check pinned before the flip.
     let tokens32 = |format: BlockFormat| BlockFormat {
         registers: crate::tables::register::RegisterFormat::Tokens32,
+        memory: crate::tables::fused_memory::MemoryFormat::Split,
         ..format
     };
     let owned_tokens32 = median_statement(

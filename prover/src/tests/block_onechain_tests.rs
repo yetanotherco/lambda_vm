@@ -58,6 +58,7 @@ fn format_at(
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
+        memory: crate::tables::fused_memory::MemoryFormat::Split,
     }
 }
 
@@ -75,6 +76,7 @@ fn production(group: GroupFold) -> BlockFormat {
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
+        memory: crate::tables::fused_memory::MemoryFormat::Split,
     }
 }
 

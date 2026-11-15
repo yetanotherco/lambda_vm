@@ -32,6 +32,7 @@ fn one_group(argue: ArgueFormat) -> BlockFormat {
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
+        memory: crate::tables::fused_memory::MemoryFormat::Split,
     }
 }
 
@@ -52,6 +53,7 @@ fn many_groups(argue: ArgueFormat) -> BlockFormat {
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
+        memory: crate::tables::fused_memory::MemoryFormat::Split,
     }
 }
 
@@ -671,6 +673,7 @@ fn the_card_argues_the_hosts_bytes() {
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
+        memory: crate::tables::fused_memory::MemoryFormat::Split,
     };
     for name in ["all_instructions_64", "test_keccak", "test_ecsm"] {
         let (program, elf, mut traces) = fixed_traces(name, &MaxRowsConfig::default(), 16);

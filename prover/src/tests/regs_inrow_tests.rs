@@ -95,6 +95,7 @@ fn the_verifier_caps_the_residual_tables_rows() {
 fn in_row() -> BlockFormat {
     BlockFormat {
         registers: RegisterFormat::InRow,
+        memory: crate::tables::fused_memory::MemoryFormat::Split,
         ..BlockFormat::production()
     }
 }
@@ -141,6 +142,7 @@ fn each_register_format_refuses_the_others_proof() {
     let elf = asm_elf_bytes("keep_alive_regs");
     let today = BlockFormat {
         registers: RegisterFormat::Tokens32,
+        memory: crate::tables::fused_memory::MemoryFormat::Split,
         ..BlockFormat::production()
     };
     let in_row_proof = prove(&elf, &in_row());
