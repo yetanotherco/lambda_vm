@@ -1033,6 +1033,8 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 /// Each is load-bearing (`tests::ecrec_tests::*_is_refused_only_by_its_bound`).
 #[derive(Clone, Copy, Debug)]
 pub enum Bound {
+    /// Without it a prover reads the signature's `r` as `r + N` (a different
+    /// curve x when it is below p) and recovers the key of a different R.
     RLtN,
     /// Without it `(r, s + N)`, which Ethereum refuses, recovers the same key.
     SLtN,
@@ -1042,6 +1044,9 @@ pub enum Bound {
     U1LtN,
     /// See [`Bound::U1LtN`].
     U2LtN,
+    /// Without it a prover who requests the parity opposite to a tiny root `y`
+    /// claims `y + p` (32 bytes, that parity, the same square) instead of
+    /// `p − y`, and recovers the key of −R.
     YrLtP,
     /// Canonical `xA`, `xB` make the `xA ≠ xB` witness mean `xA ≢ xB (mod p)`.
     XaLtP,
