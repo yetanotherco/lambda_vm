@@ -63,9 +63,31 @@ pub(super) fn walked(
     window: usize,
     order: MemwAlignedOrder,
 ) -> (Vec<Walked>, Arc<DecodeTable>) {
-    let mut builder = WindowedTraceBuilder::new(program, input, &MaxRowsConfig::small())
+    walked_for(
+        program,
+        input,
+        window,
+        order,
+        &MaxRowsConfig::small(),
+        false,
+    )
+}
+
+/// [`walked`] with the builder's chunk heights `max_rows`, and with `drop`
+/// its streamed ops dropped as they are handed out (a real block's run, whose
+/// whole trace the builder would otherwise keep).
+pub(super) fn walked_for(
+    program: &Elf,
+    input: &[u8],
+    window: usize,
+    order: MemwAlignedOrder,
+    max_rows: &MaxRowsConfig,
+    drop: bool,
+) -> (Vec<Walked>, Arc<DecodeTable>) {
+    let mut builder = WindowedTraceBuilder::new(program, input, max_rows)
         .and_then(|b| b.register_format(RegisterFormat::InRow))
         .and_then(|b| b.memw_aligned_order(order))
+        .and_then(|b| if drop { b.drop_streamed_ops() } else { Ok(b) })
         .expect("the builder");
     let decode = Arc::clone(&builder.decode);
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);

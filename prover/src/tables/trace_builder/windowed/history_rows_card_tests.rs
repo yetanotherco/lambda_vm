@@ -21,7 +21,7 @@ use multilinear::records::{ALIGNED_ECALL, Records};
 use super::card_records::{AlignedRefRecords, CardDecode, CpuLogRecords};
 use super::card_records_card_tests::mismatches;
 use super::history_rows::RefWindow;
-use super::history_rows_tests::{Walked, chunks, walked};
+use super::history_rows_tests::{Walked, chunks, walked, walked_for};
 use super::history_sides_tests::rust_elf;
 use crate::tables::memw_aligned::MemwAlignedOrder;
 use crate::tests::windowed_builder_tests::run;
@@ -48,20 +48,30 @@ fn held(
 ) -> Run {
     let order = MemwAlignedOrder::Limbs;
     let card = Arc::new(CardDecode::new(decode).expect("DECODE rows"));
-    let logs: Vec<executor::vm::logs::Log> =
-        walked.iter().flat_map(|w| w.logs.iter().cloned()).collect();
-    let cpu: Vec<Records> = (0..logs.len() / cpu_rows)
-        .map(|k| {
-            let range = k * cpu_rows..(k + 1) * cpu_rows;
-            let chunk = CpuLogRecords::new(
-                super::Segments::one(logs[range].to_vec()),
-                (k * cpu_rows) as u64,
-                Arc::clone(&card),
-            )
+    // The walked cycles' logs as the windows hold them (shared, not copied),
+    // cut into whole CPU chunks of `cpu_rows` cycles.
+    let total: usize = walked.iter().map(|w| w.logs.len()).sum();
+    let mut cpu: Vec<Records> = Vec::with_capacity(total / cpu_rows);
+    let (mut k, mut at) = (0usize, 0usize);
+    for c in 0..total / cpu_rows {
+        let mut logs = super::Segments { parts: Vec::new() };
+        let mut want = cpu_rows;
+        while want > 0 {
+            let w = &walked[k];
+            let take = (w.logs.len() - at).min(want);
+            if take > 0 {
+                logs.parts.push((Arc::clone(&w.logs), at..at + take));
+            }
+            at += take;
+            want -= take;
+            if at == w.logs.len() {
+                (k, at) = (k + 1, 0);
+            }
+        }
+        let chunk = CpuLogRecords::new(logs, (c * cpu_rows) as u64, Arc::clone(&card))
             .expect("a whole CPU chunk");
-            Records(Arc::new(chunk))
-        })
-        .collect();
+        cpu.push(Records(Arc::new(chunk)));
+    }
     let mut memw_a = Vec::new();
     for chunk in chunks(walked, rows) {
         let windows: Vec<Arc<RefWindow>> = chunk.windows.clone();
@@ -228,7 +238,14 @@ fn the_card_derives_every_memw_a_chunk_of_a_real_block() {
     let options = crate::block_whir::BlockOptions::production();
     let window = 1usize << options.window_log2.expect("the block streams");
     let t = std::time::Instant::now();
-    let (w, decode) = walked(&program, &input, window, MemwAlignedOrder::Limbs);
+    let (w, decode) = walked_for(
+        &program,
+        &input,
+        window,
+        MemwAlignedOrder::Limbs,
+        &options.max_rows,
+        true,
+    );
     let run = held(
         "real",
         &w,
