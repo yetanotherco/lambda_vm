@@ -83,6 +83,9 @@ pub mod eq_tests;
 #[cfg(test)]
 pub mod finish_direct_tests;
 #[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod fused_memory_block_tests;
+#[cfg(test)]
 pub mod gpack_tests;
 #[cfg(test)]
 pub mod grouped_run_claim_tests;
