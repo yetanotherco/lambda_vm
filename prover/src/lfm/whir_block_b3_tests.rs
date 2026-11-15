@@ -436,8 +436,16 @@ fn blake3_level0_census_on_a_real_block() {
             &program,
             program.hasher(<BlockFamily as ProofFamily>::SOCKET),
         );
-        let field_main: u64 = chips.iter().map(|c| c.main_cells()).sum();
-        let field_padded: u64 = chips.iter().map(|c| c.main_cells() + c.aux_cells()).sum();
+        // The leaf's one-output selects are LEAN_MUX rows (a lean table, outside
+        // the chip census): their cells belong to the field side too.
+        let muxes = super::whir_b3_tests::lean_mux_cells(&program);
+        let field_main: u64 = chips.iter().map(|c| c.main_cells()).sum::<u64>() + muxes.padded_main;
+        let field_padded: u64 = chips
+            .iter()
+            .map(|c| c.main_cells() + c.aux_cells())
+            .sum::<u64>()
+            + muxes.padded_main
+            + muxes.padded_aux;
         // The leaf's (front and group): its chips at their padded heights,
         // and its compressions at the lean tables' cells each.
         let hash_cells = leaf_b3l as u64 * lean_cells_per_compression;
