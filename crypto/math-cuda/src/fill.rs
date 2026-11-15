@@ -94,6 +94,32 @@ const _: () = {
     assert!(std::mem::offset_of!(CpuSideC, old_rd) == 12);
 };
 
+/// What the executor's history writes beside a cycle's log (the executor's
+/// `HistExtra`, field for field): the old timestamps of the cycle's `rs1`,
+/// `rs2` and `rd` accesses, and where its memory accesses are.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegisterStampsC {
+    pub regs_ts: [u32; 3],
+    pub side: u32,
+}
+
+/// A CPU row whose `rd` old value the card cannot read from its chunk's own
+/// logs: its cycle, and the value, low word then high word.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SideExceptionC {
+    pub cycle: u32,
+    pub old_rd: [u32; 2],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<RegisterStampsC>() == 16);
+    assert!(std::mem::offset_of!(RegisterStampsC, side) == 12);
+    assert!(std::mem::size_of::<SideExceptionC>() == 12);
+    assert!(std::mem::offset_of!(SideExceptionC, old_rd) == 4);
+};
+
 /// One MEMW_R row (the prover's `RegRow`): `address` the register index,
 /// `old_ts_lo` the old timestamp's low word, `is_read` 0 or 1, `pad` 0.
 #[repr(C)]
@@ -275,6 +301,8 @@ const _: () = {
 // padding), so its bytes on the card are the struct the kernel declares.
 unsafe impl DeviceRepr for LogC {}
 unsafe impl DeviceRepr for CpuSideC {}
+unsafe impl DeviceRepr for RegisterStampsC {}
+unsafe impl DeviceRepr for SideExceptionC {}
 unsafe impl DeviceRepr for RegRowC {}
 unsafe impl DeviceRepr for DecodeEntryC {}
 unsafe impl DeviceRepr for DecodeRunC {}
@@ -319,6 +347,7 @@ struct Module {
     shift: CudaFunction,
     memw: CudaFunction,
     cpu: CudaFunction,
+    cpu_sides: CudaFunction,
     keccak_rnd: CudaFunction,
     keccak_rnd_in: CudaFunction,
     lfm_p1w16_socket: CudaFunction,
@@ -339,6 +368,7 @@ fn module() -> Result<&'static Module> {
         shift: module.load_function("fill_shift")?,
         memw: module.load_function("fill_memw")?,
         cpu: module.load_function("fill_cpu_from_logs")?,
+        cpu_sides: module.load_function("derive_cpu_sides")?,
         keccak_rnd: module.load_function("fill_keccak_rnd")?,
         keccak_rnd_in: module.load_function("fill_keccak_rnd_in")?,
         lfm_p1w16_socket: module.load_function("fill_lfm_p1w16_socket")?,
@@ -676,9 +706,14 @@ pub enum RecordsInput<'a> {
     /// register format that checks a CPU row's register accesses in the row
     /// itself, `sides` holds one side record a log (in pieces of their own)
     /// and the table [`CPU_IN_ROW_COLUMNS`] columns; otherwise it is empty.
+    /// With `stamps` (one a log, in pieces of their own) and no `sides`, the
+    /// card derives the side records itself from them, from the logs and
+    /// from `exceptions` (ascending by cycle): `derive_cpu_sides`.
     Cpu {
         logs: &'a [&'a [LogC]],
         sides: &'a [&'a [CpuSideC]],
+        stamps: &'a [&'a [RegisterStampsC]],
+        exceptions: &'a [&'a [SideExceptionC]],
         decode: &'a Arc<CardDecode>,
         first_cycle: u64,
         hold: Option<&'a Arc<dyn std::any::Any + Send + Sync>>,
@@ -771,7 +806,12 @@ impl RecordsInput<'_> {
     pub fn cols(&self) -> usize {
         match self {
             Self::KeccakRnd { .. } => KECCAK_RND_COLUMNS,
-            Self::Cpu { sides, .. } if sides.iter().all(|piece| piece.is_empty()) => CPU_COLUMNS,
+            Self::Cpu { sides, stamps, .. }
+                if sides.iter().all(|piece| piece.is_empty())
+                    && stamps.iter().all(|piece| piece.is_empty()) =>
+            {
+                CPU_COLUMNS
+            }
             Self::Cpu { .. } => CPU_IN_ROW_COLUMNS,
             Self::MemwR { .. } | Self::MemwRWords { .. } => MEMW_R_COLUMNS,
             Self::MemwA { .. } => MEMW_A_COLUMNS,
@@ -787,9 +827,23 @@ impl RecordsInput<'_> {
     pub fn bytes(&self) -> usize {
         match self {
             Self::KeccakRnd { ops, .. } => size_of_val(*ops),
-            Self::Cpu { logs, sides, .. } => {
+            Self::Cpu {
+                logs,
+                sides,
+                stamps,
+                exceptions,
+                ..
+            } => {
                 logs.iter().map(|piece| size_of_val(*piece)).sum::<usize>()
                     + sides.iter().map(|piece| size_of_val(*piece)).sum::<usize>()
+                    + stamps
+                        .iter()
+                        .map(|piece| size_of_val(*piece))
+                        .sum::<usize>()
+                    + exceptions
+                        .iter()
+                        .map(|piece| size_of_val(*piece))
+                        .sum::<usize>()
             }
             Self::MemwR { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::MemwRWords { words, whole, .. } => {
@@ -968,44 +1022,11 @@ pub(crate) fn fill_col_major_into(
             let ops_dev = upload(stream, ops)?;
             launch_keccak_rnd(stream, &m.keccak_rnd_in, &ops_dev, nops, skip, rows, dst)
         }
-        RecordsInput::Cpu {
-            logs,
-            sides,
-            decode,
-            rows,
-            ..
-        } => {
-            let n = records.len() as u64;
-            let logs_dev = upload_pieces(stream, logs)?;
-            let sides_dev = upload_sides(stream, sides, records.len())?;
-            let height = rows as u64;
-            let missing = checks.missing(stream)?;
-            unsafe {
-                let mut launch = stream.launch_builder(&m.cpu);
-                launch
-                    .arg(&logs_dev)
-                    .arg(&n)
-                    .arg(&decode.entries)
-                    .arg(&decode.runs)
-                    .arg(&decode.nruns)
-                    .arg(&height)
-                    .arg(&mut *dst)
-                    .arg(missing);
-                match &sides_dev {
-                    Some(sides) => launch.arg(sides),
-                    None => launch.arg(&NO_SIDES),
-                };
-                launch.launch(LaunchConfig {
-                    grid_dim: (row_grid(rows, CPU_BLOCK)?, 1, 1),
-                    block_dim: (CPU_BLOCK, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-            }
-            #[cfg(feature = "test-faults")]
-            if let Some(pair) = fault_cpu_swap() {
-                swap_columns(stream, dst, rows, pair)?;
-            }
-            Ok(())
+        // Staged and launched as a group's upload does: the side records
+        // copied up, or derived on the card from the history.
+        RecordsInput::Cpu { rows, .. } => {
+            let staged = stage(stream, records)?;
+            launch_staged(stream, &staged, rows, dst, checks)
         }
         RecordsInput::MemwR {
             records: pieces,
@@ -1069,6 +1090,72 @@ pub(crate) fn fill_col_major_into(
 /// kernel writes today's columns alone.
 const NO_SIDES: u64 = 0;
 
+/// A card test's mutants of `derive_cpu_sides`, one bit each (0: none). The
+/// test must see other words, or the group declined.
+#[doc(hidden)]
+pub static FAULT_SIDES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// `rs2`'s previous timestamp read from `rs1`'s stamp.
+#[doc(hidden)]
+pub const SIDES_FAULT_SLOT: u32 = 1;
+/// The keep-alive rule dropped: the old timestamp whatever the step.
+#[doc(hidden)]
+pub const SIDES_FAULT_KEEP_ALIVE: u32 = 2;
+/// `rd`'s old value read as the written value of its old access's cycle,
+/// whatever the slot.
+#[doc(hidden)]
+pub const SIDES_FAULT_VALUE: u32 = 4;
+/// The exceptions ignored.
+#[doc(hidden)]
+pub const SIDES_FAULT_EXCEPTIONS: u32 = 8;
+const SIDES_FAULTS: u32 =
+    SIDES_FAULT_SLOT | SIDES_FAULT_KEEP_ALIVE | SIDES_FAULT_VALUE | SIDES_FAULT_EXCEPTIONS;
+
+/// A CPU table's side records on the card, under the in-row register format:
+/// copied up as the walk wrote them, or to derive there from the executor's
+/// history ([`RecordsInput::Cpu`]'s `stamps`); `None` without the format.
+pub(crate) enum SidesOnCard {
+    None,
+    Copied(CudaSlice<CpuSideC>),
+    Derive {
+        stamps: CudaSlice<RegisterStampsC>,
+        exceptions: CudaSlice<SideExceptionC>,
+        nexceptions: u32,
+        first_cycle: u64,
+    },
+}
+
+/// A CPU table's side records for its `n` logs, on the card: `sides` copied
+/// up, or else `stamps` (one a log) and `exceptions` to derive them from.
+/// Refused unless whichever is held has one a log.
+pub(crate) fn upload_cpu_sides(
+    stream: &Arc<CudaStream>,
+    sides: &[&[CpuSideC]],
+    stamps: &[&[RegisterStampsC]],
+    exceptions: &[&[SideExceptionC]],
+    n: usize,
+    first_cycle: u64,
+) -> Result<SidesOnCard> {
+    if let Some(copied) = upload_sides(stream, sides, n)? {
+        ensure!(
+            stamps.iter().all(|piece| piece.is_empty()),
+            "side records and their stamps both"
+        );
+        return Ok(SidesOnCard::Copied(copied));
+    }
+    let held: usize = stamps.iter().map(|piece| piece.len()).sum();
+    if held == 0 {
+        return Ok(SidesOnCard::None);
+    }
+    ensure_eq!(held, n, "one register stamp a log");
+    let nexceptions: usize = exceptions.iter().map(|piece| piece.len()).sum();
+    Ok(SidesOnCard::Derive {
+        stamps: upload_pieces(stream, stamps)?,
+        exceptions: upload_pieces(stream, exceptions)?,
+        nexceptions: u32::try_from(nexceptions).map_err(|_| crate::invalid_value())?,
+        first_cycle,
+    })
+}
+
 /// A CPU table's side records on the card, its `n` logs' (none: `None`),
 /// pieces in order. Refused unless there is one a log.
 pub(crate) fn upload_sides(
@@ -1106,8 +1193,8 @@ pub(crate) enum Staged<'a> {
         n: usize,
         decode: &'a CardDecode,
         /// The side records, under the in-row register format
-        /// ([`RecordsInput::Cpu`]); never cached.
-        sides: Option<CudaSlice<CpuSideC>>,
+        /// ([`RecordsInput::Cpu`]), or what derives them; never cached.
+        sides: SidesOnCard,
     },
     MemwR(CudaSlice<RegRowC>, usize),
     MemwA(CudaSlice<AlignedRowC>, usize),
@@ -1133,13 +1220,16 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
         RecordsInput::Cpu {
             logs,
             sides,
+            stamps,
+            exceptions,
             decode,
+            first_cycle,
             ..
         } => Staged::Cpu {
             logs: CpuLogsOnCard::Owned(upload_pieces(stream, logs)?),
             n,
             decode: decode.as_ref(),
-            sides: upload_sides(stream, sides, n)?,
+            sides: upload_cpu_sides(stream, sides, stamps, exceptions, n, first_cycle)?,
         },
         RecordsInput::MemwR { records, .. } => Staged::MemwR(upload_pieces(stream, records)?, n),
         RecordsInput::MemwRWords { decode, .. } => {
@@ -1182,8 +1272,50 @@ pub(crate) fn launch_staged(
             decode,
             sides,
         } => {
-            let (n, height) = (*n as u64, rows as u64);
+            let (count, n, height) = (*n, *n as u64, rows as u64);
             let missing = checks.missing(stream)?;
+            // The side records derived here first, on the same stream; a row
+            // that breaks a rule counts into the same check.
+            let derived = match sides {
+                SidesOnCard::Derive {
+                    stamps,
+                    exceptions,
+                    nexceptions,
+                    first_cycle,
+                } if count > 0 => {
+                    // SAFETY: the kernel writes every one of the `n` records.
+                    let mut out =
+                        unsafe { crate::device::alloc_or_trim::<CpuSideC>(stream, count) }?;
+                    let fault =
+                        FAULT_SIDES.load(std::sync::atomic::Ordering::Relaxed) & SIDES_FAULTS;
+                    unsafe {
+                        let mut launch = stream.launch_builder(&m.cpu_sides);
+                        match logs {
+                            CpuLogsOnCard::Owned(slice) => launch.arg(slice),
+                            CpuLogsOnCard::Cached(at) => launch.arg(at),
+                        };
+                        launch
+                            .arg(&n)
+                            .arg(first_cycle)
+                            .arg(stamps)
+                            .arg(exceptions)
+                            .arg(nexceptions)
+                            .arg(&decode.entries)
+                            .arg(&decode.runs)
+                            .arg(&decode.nruns)
+                            .arg(&mut out)
+                            .arg(&mut *missing)
+                            .arg(&fault);
+                        launch.launch(LaunchConfig {
+                            grid_dim: (row_grid(count, CPU_BLOCK)?, 1, 1),
+                            block_dim: (CPU_BLOCK, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                    }
+                    Some(out)
+                }
+                _ => None,
+            };
             let config = LaunchConfig {
                 grid_dim: (row_grid(rows, CPU_BLOCK)?, 1, 1),
                 block_dim: (CPU_BLOCK, 1, 1),
@@ -1203,9 +1335,12 @@ pub(crate) fn launch_staged(
                     .arg(&height)
                     .arg(&mut *dst)
                     .arg(missing);
-                match sides {
-                    Some(sides) => launch.arg(sides),
-                    None => launch.arg(&NO_SIDES),
+                match (sides, &derived) {
+                    (_, Some(derived)) => launch.arg(derived),
+                    (SidesOnCard::Copied(sides), None) => launch.arg(sides),
+                    // A table to derive with no log has no row to read them.
+                    (SidesOnCard::Derive { stamps, .. }, None) => launch.arg(stamps),
+                    (SidesOnCard::None, None) => launch.arg(&NO_SIDES),
                 };
                 launch.launch(config)?;
             }
