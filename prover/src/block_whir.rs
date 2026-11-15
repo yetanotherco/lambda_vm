@@ -314,13 +314,15 @@ pub struct BlockFormat {
     /// recursion's programs, follow it.
     pub registers: crate::tables::register::RegisterFormat,
     /// How the CPU's loads and stores are checked
-    /// ([`MemoryFormat`](crate::tables::fused_memory::MemoryFormat)): each a
-    /// LOAD or STORE row and a MEMW message to MEMW_A or MEMW
+    /// ([`MemoryFormat`](crate::tables::fused_memory::MemoryFormat)): an
+    /// access MEMW_A would take as one MEM_LOAD or MEM_STORE row holding its
+    /// own memory tokens
+    /// ([`Fused`](crate::tables::fused_memory::MemoryFormat::Fused), the
+    /// production format's, which the base proves), or each a LOAD or STORE
+    /// row and a MEMW message to MEMW_A or MEMW
     /// ([`Split`](crate::tables::fused_memory::MemoryFormat::Split), the
-    /// production constant), or an access MEMW_A would take as one MEM_LOAD or
-    /// MEM_STORE row holding its own memory tokens
-    /// ([`Fused`](crate::tables::fused_memory::MemoryFormat::Fused), a variant
-    /// a caller names). The block's tables, so its buses and the recursion's
+    /// pinned preset's, the only one the recursion's tree takes, and the
+    /// base's rollback). The block's tables, so its buses and the recursion's
     /// programs, follow it.
     pub memory: crate::tables::fused_memory::MemoryFormat,
 }
@@ -465,7 +467,7 @@ impl BlockFormat {
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
             registers: crate::tables::register::RegisterFormat::InRow,
-            memory: crate::tables::fused_memory::MemoryFormat::Split,
+            memory: crate::tables::fused_memory::MemoryFormat::Fused,
         }
     }
 
@@ -490,7 +492,8 @@ impl BlockFormat {
     /// format (its environment knobs, for the prover and its experiments),
     /// this reads nothing from the environment: a verifier's environment
     /// cannot choose the format, and with it the security, it checks a proof
-    /// against.
+    /// against. Its memory format is the split one, the only one the
+    /// recursion's tree takes (the production format's is the fused one).
     pub fn pinned() -> Self {
         Self {
             zf: ZfFormat::DEFAULT,

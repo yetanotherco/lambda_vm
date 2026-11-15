@@ -780,10 +780,12 @@ fn merge_census() {
     };
     let opts = super::proof::block_base_options();
     let production = BlockFormat::production();
+    // The tree recurses over the split memory format alone.
     let format = BlockFormat {
         zf: production
             .zf
             .with_base(stark::proof::options::BaseFormat::P1_WHIR),
+        memory: crate::tables::fused_memory::MemoryFormat::Split,
         ..production
     };
     let owned = super::whir_p1_census_tests::median_statement(&elf_bytes, &opts, &format);

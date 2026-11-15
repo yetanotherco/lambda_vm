@@ -69,9 +69,10 @@ fn the_fused_pair_is_read_under_the_verifiers_format() {
     assert!(block_whir::check_memory_format(&split()).is_ok());
     let lt = fused().with_memw_aligned(crate::tables::memw_aligned::MemwAlignedOrder::Lt);
     assert!(block_whir::check_memory_format(&lt).is_err());
-    // Neither the production format nor the verifier's pinned one is fused.
+    // The production format (the base's) is fused; the verifier's pinned
+    // preset, the only one the tree takes, is split.
     assert_eq!(BlockFormat::pinned().memory, MemoryFormat::Split);
-    assert_eq!(BlockFormat::production().memory, MemoryFormat::Split);
+    assert_eq!(BlockFormat::production().memory, MemoryFormat::Fused);
 }
 
 /// ★ The split format's statement is the one before the fused format: it

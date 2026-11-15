@@ -1531,15 +1531,17 @@ fn each_fused_constraint_refuses_its_violating_rows() {
     }
 }
 
-/// ★ The memory format is a verifier constant: the block's production and
-/// pinned formats are split, and the fused format needs MEMW_A's limbs.
+/// ★ The memory format is a verifier constant: the block's production format
+/// (the base's) is fused, its pinned preset (the tree's) split, a builder's
+/// default split, and the fused format needs MEMW_A's limbs.
 #[test]
-fn the_block_formats_are_split_and_the_fused_format_needs_the_limbs() {
+fn the_production_format_is_fused_and_the_fused_format_needs_the_limbs() {
     use crate::block_whir::{BlockFormat, check_memory_format};
     use crate::tables::fused_memory::MemoryFormat;
-    assert_eq!(BlockFormat::production().memory, MemoryFormat::Split);
+    assert_eq!(BlockFormat::production().memory, MemoryFormat::Fused);
     assert_eq!(BlockFormat::pinned().memory, MemoryFormat::Split);
     assert_eq!(MemoryFormat::default(), MemoryFormat::Split);
+    assert!(check_memory_format(&BlockFormat::production()).is_ok());
     assert!(check_memory_format(&BlockFormat::pinned()).is_ok());
     let fused = BlockFormat::pinned().with_memory(MemoryFormat::Fused);
     assert_eq!(fused.memory, MemoryFormat::Fused);

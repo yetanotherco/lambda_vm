@@ -508,7 +508,10 @@ enum Commands {
     /// The process declares itself base-only before anything is proved, so no
     /// recursion runs in it under either base. Prints the phase stamps, the
     /// base's seconds, its serialized bytes, the host verifier's seconds and
-    /// verdict. Needs a `--features cuda` build to run on the card.
+    /// verdict. Needs a `--features cuda` build to run on the card. The base
+    /// checks an aligned CPU load or store in one row with its memory tokens
+    /// (the production format); `BLOCK_WHIR_MEMORY=split` proves the split
+    /// format instead, the one `prove-block`'s tree takes.
     ProveBlockBase {
         /// Path to the guest ELF
         #[arg(value_parser, value_hint = ValueHint::FilePath)]

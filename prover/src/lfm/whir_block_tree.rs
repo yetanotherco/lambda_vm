@@ -450,14 +450,17 @@ pub fn registers_setting(knob: Option<&str>) -> Result<RegisterFormat, String> {
     }
 }
 
-/// `BLOCK_WHIR_MEMORY`'s reading: unset is the pinned preset's format
-/// ([`BlockFormat::pinned`], the CPU's loads and stores split); `fused` names
-/// the format that checks an aligned access in one row with its memory tokens
-/// ([`MemoryFormat`]). A format value: the prover and the verifier of one
-/// proof take the same one. Only the base proves it (`prove-block-base`): the
-/// tree refuses it.
-pub fn memory_setting(knob: Option<&str>) -> Result<MemoryFormat, String> {
+/// `BLOCK_WHIR_MEMORY`'s reading. Unset, a base-only process (`base_only`:
+/// `prove-block-base`) takes the production format's
+/// ([`BlockFormat::production`]: an aligned CPU load or store checked in one
+/// row with its memory tokens, [`MemoryFormat::Fused`]), and any other process
+/// the pinned preset's ([`BlockFormat::pinned`], the loads and stores split),
+/// the only one the tree recurses over. `split` and `fused` name either. A
+/// format value: the prover and the verifier of one proof take the same one.
+/// The tree refuses `fused`; `split` is the base's rollback.
+pub fn memory_setting(knob: Option<&str>, base_only: bool) -> Result<MemoryFormat, String> {
     match knob.map(str::trim) {
+        None if base_only => Ok(BlockFormat::production().memory),
         None => Ok(BlockFormat::pinned().memory),
         Some("split") => Ok(MemoryFormat::Split),
         Some("fused") => Ok(MemoryFormat::Fused),
@@ -534,7 +537,10 @@ impl WhirTreeConfig {
             keccak_rnd: keccak_rnd_setting(std::env::var("BLOCK_WHIR_KECCAK_RND").ok().as_deref())?,
             memw_aligned: memw_aligned_setting(std::env::var("BLOCK_WHIR_MEMW_A").ok().as_deref())?,
             registers: registers_setting(std::env::var("BLOCK_WHIR_REGISTERS").ok().as_deref())?,
-            memory: memory_setting(std::env::var("BLOCK_WHIR_MEMORY").ok().as_deref())?,
+            memory: memory_setting(
+                std::env::var("BLOCK_WHIR_MEMORY").ok().as_deref(),
+                crate::base_only::declared(),
+            )?,
             ..BlockFormat::production_with(group_setting(
                 std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
             )?)
@@ -6094,7 +6100,8 @@ mod tests {
             stream_leaf: STREAM_LEAF_DEFAULT,
             leaf_emitters: Some(LEAF_EMITTERS),
             argue: BlockFormat::production().argue,
-            format: BlockFormat::production(),
+            // The tree recurses over the split memory format alone.
+            format: BlockFormat::production().with_memory(MemoryFormat::Split),
             options: BlockOptions::production(),
             emit_threads: 4,
             node_times: false,
@@ -6166,6 +6173,37 @@ mod tests {
         let mut c = production.clone();
         c.format = c.format.with_memw_aligned(other);
         assert!(!c.at_presets(), "the other MEMW_A form");
+        // Nor the fused memory format, which the tree refuses.
+        let mut c = production.clone();
+        c.format = c.format.with_memory(MemoryFormat::Fused);
+        assert!(!c.at_presets(), "the fused memory format");
+    }
+
+    /// ★ `BLOCK_WHIR_MEMORY`: unset, a base-only process proves the production
+    /// format's fused memory format and any other process (the tree's) the
+    /// pinned split one; `split` (the base's rollback) and `fused` name
+    /// either, anything else is refused. The production format is fused, the
+    /// verifier's pinned preset split.
+    #[test]
+    fn the_memory_knob_defaults_to_fused_for_the_base_alone() {
+        assert_eq!(BlockFormat::production().memory, MemoryFormat::Fused);
+        assert_eq!(BlockFormat::pinned().memory, MemoryFormat::Split);
+        assert_eq!(memory_setting(None, true), Ok(MemoryFormat::Fused));
+        assert_eq!(memory_setting(None, false), Ok(MemoryFormat::Split));
+        for base_only in [true, false] {
+            assert_eq!(
+                memory_setting(Some("split"), base_only),
+                Ok(MemoryFormat::Split)
+            );
+            assert_eq!(
+                memory_setting(Some(" fused "), base_only),
+                Ok(MemoryFormat::Fused)
+            );
+            for bad in ["", "Fused", "on", "1"] {
+                let e = memory_setting(Some(bad), base_only).expect_err(bad);
+                assert!(e.contains("BLOCK_WHIR_MEMORY"), "{e}");
+            }
+        }
     }
 
     /// `W3_LEAF_EMITTERS`: unset is the default count, 0 is the control (one
