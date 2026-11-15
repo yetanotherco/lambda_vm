@@ -2189,19 +2189,21 @@ fn parse_exec_history(value: Option<&str>) -> Result<Option<bool>, Error> {
 }
 
 /// `LAMBDA_VM_LIGHT_WALK`: the walkers' light walk
-/// ([`WindowedTraceBuilder::light_walk`]). Unset, empty or `0`: today's walk;
-/// `1`: record mode's cycles that are no ECALL walked without their cells,
-/// each load or store from its access record; `2`: also each window routed by
-/// its walker. The tables are the same at every level. Anything else refuses
-/// the prove.
+/// ([`WindowedTraceBuilder::light_walk`]). Unset, empty or `2` (the default):
+/// record mode's cycles that are no ECALL walked without their cells, each
+/// load or store from its access record, and each window routed by its
+/// walker; `1`: the cells skipped, the accumulator routing; `0`: the walk
+/// before it (the rollback). The tables are the same at every level. Anything
+/// else refuses the prove.
 fn parse_light_walk(value: Option<&str>) -> Result<u8, Error> {
     match value.map(str::trim) {
-        None | Some("" | "0") => Ok(0),
+        None | Some("" | "2") => Ok(2),
+        Some("0") => Ok(0),
         Some("1") => Ok(1),
-        Some("2") => Ok(2),
         Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_LIGHT_WALK={v}: 0 (today's walk), 1 (record mode's cycles walked without \
-             their cells) or 2 (and each window routed by its walker)"
+            "LAMBDA_VM_LIGHT_WALK={v}: 2 (the default: record mode's cycles walked without their \
+             cells, each window routed by its walker), 1 (the cells skipped only) or 0 (the walk \
+             before it)"
         ))),
     }
 }
@@ -6166,10 +6168,10 @@ fn prove_streamed(
     eprintln!(
         "★ BLOCK LIGHT WALK: level {light_walk} ({}) (LAMBDA_VM_LIGHT_WALK)",
         match light_walk {
-            0 => "today's walk, the default",
+            0 => "the walk before it, the rollback",
             1 => "record mode's cycles walked without their cells",
             _ =>
-                "record mode's cycles walked without their cells, each window routed by its walker",
+                "record mode's cycles walked without their cells, each window routed by its walker, the default",
         }
     );
     // A card-rows word the uploads do not take refuses the prove, rather than
@@ -9802,16 +9804,16 @@ mod producer_report_tests {
     };
     use super::{exec_mode_from, parse_exec_history, parse_exec_history_check, parse_light_walk};
 
-    /// `LAMBDA_VM_LIGHT_WALK`: today's walk unless `1` or `2`; any other word
-    /// refused.
+    /// `LAMBDA_VM_LIGHT_WALK`: the light walk with the walkers routing unless
+    /// `1` or `0` (the rollback); any other word refused.
     #[test]
-    fn the_light_walk_is_today_s_walk_unless_asked() {
+    fn the_light_walk_routes_where_walked_unless_turned_down() {
         for (word, level) in [
-            (None, 0),
-            (Some(""), 0),
-            (Some("0"), 0),
-            (Some(" 1 "), 1),
+            (None, 2),
+            (Some(""), 2),
             (Some("2"), 2),
+            (Some(" 1 "), 1),
+            (Some("0"), 0),
         ] {
             assert_eq!(parse_light_walk(word).ok(), Some(level), "{word:?}");
         }
