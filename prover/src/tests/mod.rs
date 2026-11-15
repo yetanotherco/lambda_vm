@@ -97,6 +97,8 @@ pub mod is_wh_tests;
 #[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]
+pub mod keccak_slice_argue_bench;
+#[cfg(test)]
 pub mod keccak_tests;
 pub mod lean_program_census;
 #[cfg(test)]
