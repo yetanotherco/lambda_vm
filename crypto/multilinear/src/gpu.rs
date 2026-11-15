@@ -4264,6 +4264,10 @@ struct RecordsUp<'a> {
     /// A CPU table's side records (the in-row register format's), as the
     /// card's struct; empty without them.
     sides: Vec<&'a [math_cuda::fill::CpuSideC]>,
+    /// Or what the card derives them from: one register stamp a log and the
+    /// rows whose `rd` old value the logs do not give; empty otherwise.
+    stamps: Vec<&'a [math_cuda::fill::RegisterStampsC]>,
+    exceptions: Vec<&'a [math_cuda::fill::SideExceptionC]>,
     registers: Vec<&'a [math_cuda::fill::RegRowC]>,
     /// Words mode: a MEMW_R table as the walk wrote it
     /// ([`crate::records::Records::register_words`]), its whole rows as the
@@ -4282,13 +4286,21 @@ impl<'a> RecordsUp<'a> {
     /// DECODE rows cannot go up.
     fn of(records: &'a crate::records::Records) -> Option<Self> {
         use crate::records::{
-            AlignedRow, CpuLog, CpuSide, LoadOp, MemwOp, RecordsFill, RegisterRow, ShiftOp, StoreOp,
+            AlignedRow, CpuLog, CpuSide, LoadOp, MemwOp, RecordsFill, RegisterRow, RegisterStamps,
+            ShiftOp, SideException, StoreOp,
         };
         use math_cuda::fill::{
-            AlignedRowC, CpuSideC, LoadOpC, LogC, MemwOpC, RegRowC, ShiftOpC, StoreOpC,
+            AlignedRowC, CpuSideC, LoadOpC, LogC, MemwOpC, RegRowC, RegisterStampsC, ShiftOpC,
+            SideExceptionC, StoreOpC,
         };
         const _: () = {
             use std::mem::{align_of, offset_of, size_of};
+            assert!(size_of::<RegisterStamps>() == size_of::<RegisterStampsC>());
+            assert!(align_of::<RegisterStamps>() == align_of::<RegisterStampsC>());
+            assert!(offset_of!(RegisterStamps, side) == offset_of!(RegisterStampsC, side));
+            assert!(size_of::<SideException>() == size_of::<SideExceptionC>());
+            assert!(align_of::<SideException>() == align_of::<SideExceptionC>());
+            assert!(offset_of!(SideException, old_rd) == offset_of!(SideExceptionC, old_rd));
             assert!(size_of::<CpuSide>() == size_of::<CpuSideC>());
             assert!(align_of::<CpuSide>() == align_of::<CpuSideC>());
             assert!(offset_of!(CpuSide, old_rd) == offset_of!(CpuSideC, old_rd));
@@ -4375,6 +4387,8 @@ impl<'a> RecordsUp<'a> {
                 hold: None,
                 logs: Vec::new(),
                 sides: Vec::new(),
+                stamps: Vec::new(),
+                exceptions: Vec::new(),
                 registers: Vec::new(),
                 words: Some((w.words, whole, w.whole_base, decode)),
                 aligned: Vec::new(),
@@ -4393,6 +4407,8 @@ impl<'a> RecordsUp<'a> {
             hold: None,
             logs: Vec::new(),
             sides: Vec::new(),
+            stamps: Vec::new(),
+            exceptions: Vec::new(),
             registers: Vec::new(),
             words: None,
             aligned: Vec::new(),
@@ -4407,6 +4423,7 @@ impl<'a> RecordsUp<'a> {
                 logs,
                 sides,
                 decode,
+                history,
                 ..
             } => {
                 up.decode = Some(decode.on_card()?);
@@ -4415,6 +4432,12 @@ impl<'a> RecordsUp<'a> {
                 up.logs = unsafe { cast::<CpuLog, LogC>(logs) };
                 // SAFETY: five `u32`s in the same order (asserted above).
                 up.sides = unsafe { cast::<CpuSide, CpuSideC>(sides) };
+                if let Some(h) = history {
+                    // SAFETY: four and three `u32`s in the same order
+                    // (asserted above).
+                    up.stamps = unsafe { cast::<RegisterStamps, RegisterStampsC>(&h.stamps) };
+                    up.exceptions = unsafe { cast::<SideException, SideExceptionC>(&h.exceptions) };
+                }
             }
             // SAFETY: the same fields in the same order (asserted above).
             RecordsFill::MemwR { rows } => {
@@ -4536,6 +4559,8 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
         RecordsFill::Cpu { first_cycle, .. } => RecordsInput::Cpu {
             logs: &up.logs,
             sides: &up.sides,
+            stamps: &up.stamps,
+            exceptions: &up.exceptions,
             decode: up.decode.as_ref()?,
             first_cycle: *first_cycle,
             hold: up.hold.as_ref(),
