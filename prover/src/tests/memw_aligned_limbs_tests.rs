@@ -1241,3 +1241,297 @@ fn the_pinned_verifier_builds_the_limbs_air_for_every_memw_a_table() {
         assert_eq!(air.trace_layout().0, cols::NUM_COLUMNS);
     }
 }
+
+// =============================================================================
+// Every value written to RAM is a byte
+// =============================================================================
+
+/// One table's interactions, by family: what the RAM byte census reads.
+#[cfg(feature = "parallel")]
+type TableInteractions = Vec<(String, Vec<BusInteraction>)>;
+
+/// The pinned block AIRs' interaction lists, one entry a table.
+#[cfg(feature = "parallel")]
+fn block_interactions() -> TableInteractions {
+    pinned_block_airs()
+        .air_refs()
+        .iter()
+        .map(|air| (family(air.name()), air.bus_interactions().to_vec()))
+        .collect()
+}
+
+/// The RAM values a table writes with no byte check of its own, as one line:
+/// `(table, columns by range and the buses the table receives them on, then any
+/// value that is not a single column)`.
+#[cfg(feature = "parallel")]
+type UncheckedValues = (String, String);
+
+/// Inclusive ranges of sorted, distinct columns: `[2, 3, 4, 9]` -> `"2..=4, 9"`.
+#[cfg(feature = "parallel")]
+fn column_ranges(columns: &[usize]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut k = 0;
+    while k < columns.len() {
+        let start = columns[k];
+        while k + 1 < columns.len() && columns[k + 1] == columns[k] + 1 {
+            k += 1;
+        }
+        out.push(if columns[k] == start {
+            format!("{start}")
+        } else {
+            format!("{start}..={}", columns[k])
+        });
+        k += 1;
+    }
+    out.join(", ")
+}
+
+/// The RAM byte census over `tables`. For every MEMW sender whose
+/// `is_register` element is the constant 0 (a RAM access), every value element
+/// the access can change (a write, or a read whose value differs from its old
+/// value) must be a constant byte or a single column of the same table that the
+/// table sends to the byte table (an `ARE_BYTES` element, or an operand or the
+/// result of a `BYTE_ALU` lookup). The values that are neither are returned, a
+/// line a table, each column with the buses its table receives it on (where it
+/// comes from). A pure read (value = old, element by element) re-emits what it
+/// read and is skipped.
+///
+/// The census reads the interaction lists only: that a check's weight is on
+/// whenever the write's is, is read in each table's constraints (each write's
+/// weight is printed beside the weights of the checks of its values).
+#[cfg(feature = "parallel")]
+fn ram_values_without_a_byte_check(tables: &TableInteractions) -> Vec<UncheckedValues> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let single = |(c, terms): &(u64, Vec<(usize, u64)>)| match terms.as_slice() {
+        [(column, 1)] if *c == 0 => Some(*column),
+        _ => None,
+    };
+    // table -> (received-on buses -> columns), and the other forms.
+    let mut unchecked: BTreeMap<String, (BTreeMap<String, BTreeSet<usize>>, BTreeSet<String>)> =
+        BTreeMap::new();
+    for (table, interactions) in tables {
+        // The table's byte-checked columns, with the checks' weights.
+        let mut checked: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+        for i in interactions.iter().filter(|i| i.is_sender) {
+            let elements = affine_elements(i);
+            let range = if i.bus_id == BusId::AreBytes as u64 {
+                0..elements.len()
+            } else if i.bus_id == BusId::ByteAlu as u64 {
+                1..elements.len()
+            } else {
+                continue;
+            };
+            let bus = BusId::try_from(i.bus_id).expect("a bus id");
+            for e in &elements[range] {
+                if let Some(column) = single(e) {
+                    checked
+                        .entry(column)
+                        .or_default()
+                        .insert(format!("{bus:?} at {:?}", i.multiplicity));
+                }
+            }
+        }
+        // Where the table receives a column from (not memory's own buses).
+        let received_on = |column: usize| -> String {
+            let buses: BTreeSet<String> = interactions
+                .iter()
+                .filter(|r| {
+                    !r.is_sender
+                        && r.bus_id != BusId::Memw as u64
+                        && r.bus_id != BusId::Memory as u64
+                })
+                .filter(|r| affine_elements(r).iter().any(|e| single(e) == Some(column)))
+                .map(|r| format!("{:?}", BusId::try_from(r.bus_id).expect("a bus id")))
+                .collect();
+            if buses.is_empty() {
+                "nothing".to_string()
+            } else {
+                buses.into_iter().collect::<Vec<_>>().join(" + ")
+            }
+        };
+        for i in interactions
+            .iter()
+            .filter(|i| i.bus_id == BusId::Memw as u64 && i.is_sender)
+        {
+            let elements = affine_elements(i);
+            // (is_register, first value, first old value): a read carries
+            // the eight old values first, a write none.
+            let (is_register, value_at, old_at) = match elements.len() {
+                24 => (8, 11, Some(0)),
+                16 => (0, 3, None),
+                other => panic!("{table}: a MEMW message of {other} elements"),
+            };
+            match &elements[is_register] {
+                (1, terms) if terms.is_empty() => continue,
+                (0, terms) if terms.is_empty() => {}
+                other => panic!("{table}: a MEMW is_register of form {other:?}"),
+            }
+            let mut sources: BTreeSet<String> = BTreeSet::new();
+            for k in 0..8 {
+                let value = &elements[value_at + k];
+                if old_at.is_some_and(|o| elements[o + k] == *value) {
+                    continue;
+                }
+                let entry = unchecked.entry(table.clone()).or_default();
+                match (value, single(value)) {
+                    ((c, terms), _) if terms.is_empty() && *c < 256 => {
+                        sources.insert("a constant byte".to_string());
+                    }
+                    (_, Some(column)) if checked.contains_key(&column) => {
+                        sources.extend(checked[&column].iter().cloned());
+                    }
+                    (_, Some(column)) => {
+                        entry
+                            .0
+                            .entry(received_on(column))
+                            .or_default()
+                            .insert(column);
+                        sources.insert("unchecked".to_string());
+                    }
+                    ((c, terms), None) => {
+                        entry.1.insert(format!("{c} {terms:?}"));
+                        sources.insert("unchecked".to_string());
+                    }
+                }
+            }
+            if !sources.is_empty() {
+                println!(
+                    "RAM WRITE {table} at {:?}: {}",
+                    i.multiplicity,
+                    sources.into_iter().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+    }
+    unchecked
+        .into_iter()
+        .filter(|(_, (columns, others))| !columns.is_empty() || !others.is_empty())
+        .map(|(table, (columns, others))| {
+            let mut parts: Vec<String> = columns
+                .into_iter()
+                .map(|(from, set)| {
+                    let set: Vec<usize> = set.into_iter().collect();
+                    format!("columns {} from {from}", column_ranges(&set))
+                })
+                .collect();
+            parts.extend(others);
+            (table, parts.join("; "))
+        })
+        .collect()
+}
+
+/// ★ Every RAM cell holds a byte, as a property of the AIRs: on the block
+/// verifier's own AIR set, every value a MEMW sender writes to RAM is a
+/// constant byte or a column the same table sends to the byte table, except
+/// the pinned [`RAM_VALUES_WITHOUT_A_BYTE_CHECK`], each a value whose byte
+/// range comes from elsewhere (a copy of a value already in RAM, a reply of a
+/// table that checks it, or a difference of two bits). Readers rely on it with
+/// no check of their own (ECREC's signature and hash bytes, ECSM's base point,
+/// LOAD's result bytes), and MEMW checks no value. A new writer that puts an
+/// unchecked value in RAM, or a writer that loses a byte check, fails here, to
+/// be given a byte check or an argument before it lands.
+#[cfg(feature = "parallel")]
+#[test]
+fn every_value_written_to_ram_is_byte_checked_or_a_pinned_exception() {
+    let unchecked = ram_values_without_a_byte_check(&block_interactions());
+    for (table, line) in &unchecked {
+        println!("RAM UNCHECKED {table}: {line}");
+    }
+    let pinned: Vec<UncheckedValues> = RAM_VALUES_WITHOUT_A_BYTE_CHECK
+        .iter()
+        .map(|(t, line, _)| (t.to_string(), line.to_string()))
+        .collect();
+    assert_eq!(
+        unchecked, pinned,
+        "a RAM value without a byte check appeared or moved: byte-check it, or argue it here"
+    );
+}
+
+/// [`every_value_written_to_ram_is_byte_checked_or_a_pinned_exception`]'s
+/// allow-list: `(table, its unchecked RAM values, why each is a byte anyway)`.
+#[cfg(feature = "parallel")]
+const RAM_VALUES_WITHOUT_A_BYTE_CHECK: &[(&str, &str, &str)] = &[
+    (
+        "COPY",
+        "columns 2..=9 from nothing",
+        "VALUE, a copy: a memcpy or memmove row writes at T + 1 the bytes its source read \
+         returned at T; a memset row writes at T the bytes it reads back at T + 1 from \
+         dst − 8, which the dst = src + 8 constraint (with no wrap past 2^64) puts at a lower \
+         address, so every chain of copies ends at a checked writer",
+    ),
+    (
+        "ECREC",
+        "columns 1327..=1390 from Ecdas; 0 [(9, 1), (10, 18446744069414584320)]",
+        "the key XQ, YQ: the reply of the call's one ECDAS add row (whose XR, YR are \
+         byte-checked there), or zero on a bail; the status MU − OK, a difference of two bits \
+         with OK ≤ MU",
+    ),
+    (
+        "ECSM",
+        "columns 8..=39 from Ecdas",
+        "XR: the last ECDAS row's XR (byte-checked there) or, when the scalar is 1 and no \
+         ECDAS row runs, the row's own start token, so XR = XG, the bytes it read from RAM",
+    ),
+    (
+        "KECCAK",
+        "columns 210..=409 from Keccak",
+        "OUTPUT_STATE: the round chip's reply at round 24, every byte of which is the result \
+         of a BYTE_ALU XOR lookup in its round row",
+    ),
+];
+
+/// The census refuses a new unchecked writer: a table that loses its values'
+/// byte checks (STORE without its `ARE_BYTES` lookups), and a fake RAM writer
+/// added to a table (HINT writing a column it never range-checks), each make
+/// [`every_value_written_to_ram_is_byte_checked_or_a_pinned_exception`]'s
+/// census differ from the pin, naming the table; the real lists match it.
+#[cfg(feature = "parallel")]
+#[test]
+fn an_unchecked_ram_writer_breaks_the_byte_census() {
+    let real = block_interactions();
+    let pinned: Vec<UncheckedValues> = RAM_VALUES_WITHOUT_A_BYTE_CHECK
+        .iter()
+        .map(|(t, line, _)| (t.to_string(), line.to_string()))
+        .collect();
+    assert_eq!(ram_values_without_a_byte_check(&real), pinned, "control");
+    let edited = |table: &str, edit: &dyn Fn(&mut Vec<BusInteraction>)| {
+        let mut tables = real.clone();
+        let (_, list) = tables
+            .iter_mut()
+            .find(|(t, _)| t == table)
+            .expect("the table is in the block");
+        edit(list);
+        let census = ram_values_without_a_byte_check(&tables);
+        assert_ne!(census, pinned, "{table}: the census missed the edit");
+        assert!(
+            census.iter().any(|(t, _)| t == table),
+            "{table}: the census does not name it: {census:?}"
+        );
+    };
+    // STORE without its byte checks.
+    edited("STORE", &|list| {
+        let before = list.len();
+        list.retain(|i| !(i.bus_id == BusId::AreBytes as u64 && i.is_sender));
+        assert!(list.len() < before, "STORE has ARE_BYTES lookups to drop");
+    });
+    // HINT with a fake RAM write, at its own writes' weight, whose first value
+    // is a column no lookup checks (the other elements constant 0).
+    edited("HINT", &|list| {
+        let weight = list
+            .iter()
+            .find(|i| i.bus_id == BusId::Memw as u64 && i.is_sender)
+            .expect("a HINT write")
+            .multiplicity
+            .clone();
+        let values = (0..16)
+            .map(|k| {
+                if k == 3 {
+                    BusValue::column(100_000)
+                } else {
+                    BusValue::constant(0)
+                }
+            })
+            .collect();
+        list.push(BusInteraction::sender(BusId::Memw, weight, values));
+    });
+}
