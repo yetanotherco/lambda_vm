@@ -1790,6 +1790,15 @@ pub struct BlockWhirProof {
     /// (`stark::multilinear_block::commit_ood_point`). The verifier refuses
     /// any other count.
     pub commit_ood: Vec<FieldElement<E>>,
+    /// The fused memory format's tables: how many MEM_LOAD and MEM_STORE
+    /// tables the block holds, right after STORE's in [`VmAirs::air_refs`]
+    /// order. Absorbed into the statement under
+    /// [`MemoryFormat::Fused`](crate::tables::fused_memory::MemoryFormat::Fused)
+    /// alone (the verifier's format, never the proof's); under the split
+    /// format the verifier refuses any but `[0, 0]` ([`fused_tables`]). The
+    /// last field, so a split proof archives as before it with this pair
+    /// after.
+    pub fused_memory: [u64; 2],
 }
 
 /// Where a block's prove spent its time, for the readout. Seconds.
@@ -3044,8 +3053,79 @@ pub(crate) fn check_residual_rows(
     Ok(())
 }
 
+/// The word the statement of a block under the fused memory format absorbs
+/// right after the table counts, before its two fused counts: the format named
+/// in the transcript, so no statement of the split format (which absorbs
+/// neither) shares its bytes.
+pub(crate) const FUSED_MEMORY_WORD: u64 = u64::from_le_bytes(*b"MEMFUSED");
+
+/// What a block's statement absorbs right after the table counts under
+/// `memory`: nothing under the split format (the statement as it always
+/// was); under the fused format [`FUSED_MEMORY_WORD`] and the MEM_LOAD and
+/// MEM_STORE tables' counts (`fused`, [`BlockWhirProof::fused_memory`]).
+pub(crate) fn fused_statement_words(
+    memory: crate::tables::fused_memory::MemoryFormat,
+    fused: [u64; 2],
+) -> Vec<u64> {
+    match memory {
+        crate::tables::fused_memory::MemoryFormat::Split => Vec::new(),
+        crate::tables::fused_memory::MemoryFormat::Fused => {
+            vec![FUSED_MEMORY_WORD, fused[0], fused[1]]
+        }
+    }
+}
+
+/// The fused memory format's MEM_LOAD and MEM_STORE tables a block states,
+/// checked against the verifier's format ([`fused_tables_under`]).
+pub fn fused_tables(format: &BlockFormat, stated: [u64; 2]) -> Result<[usize; 2], Error> {
+    fused_tables_under(format.memory, stated)
+}
+
+/// The fused memory tables a block states under `memory`: under the split
+/// format none, and any other pair is refused (it is absorbed nowhere, so no
+/// value of it may ride in a proof); under the fused format the pair as
+/// counts.
+pub(crate) fn fused_tables_under(
+    memory: crate::tables::fused_memory::MemoryFormat,
+    stated: [u64; 2],
+) -> Result<[usize; 2], Error> {
+    #[cfg(test)]
+    if memory == crate::tables::fused_memory::MemoryFormat::Split
+        && FUSED_COUNTS_UNCHECKED.with(std::cell::Cell::get)
+    {
+        return Ok([0, 0]);
+    }
+    match memory {
+        crate::tables::fused_memory::MemoryFormat::Split if stated == [0, 0] => Ok([0, 0]),
+        crate::tables::fused_memory::MemoryFormat::Split => Err(Error::InvalidTableCounts(
+            format!("the split memory format states no fused table, not {stated:?}"),
+        )),
+        crate::tables::fused_memory::MemoryFormat::Fused => {
+            let count = |n: u64| {
+                usize::try_from(n).map_err(|_| {
+                    Error::InvalidTableCounts(format!("{n} fused tables do not fit a usize"))
+                })
+            };
+            Ok([count(stated[0])?, count(stated[1])?])
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test only: on this thread, the split format's verifier reads no fused
+    /// count ([`fused_tables_under`]'s refusal taken out, a control mutant).
+    pub(crate) static FUSED_COUNTS_UNCHECKED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The most rows a fused memory table may state, in variables: the block's
+/// chunk of every streamed family (`MaxRowsConfig::uniform(1 << 21)`).
+pub const BLOCK_FUSED_MAX_VARS: usize = 21;
+
 /// The block statement: the monolithic multilinear one under
-/// [`MULTILINEAR_BLOCK_TAG`], then the group partition — the count, then per
+/// [`MULTILINEAR_BLOCK_TAG`] (`more_counts` after its table counts:
+/// [`fused_statement_words`]), then the group partition — the count, then per
 /// group its size and its tables' indices, every value a little-endian `u64`
 /// (so the roots that follow stay on a field-element boundary).
 #[allow(clippy::too_many_arguments)]
@@ -3055,6 +3135,7 @@ pub(crate) fn absorb_block(
     elf_bytes: &[u8],
     public_output: &[u8],
     table_counts: &TableCounts,
+    more_counts: &[u64],
     num_private_input_pages: usize,
     runtime_page_ranges: &[RuntimePageRange],
     table_num_vars: &[u8],
@@ -3068,6 +3149,7 @@ pub(crate) fn absorb_block(
         &statement::elf_digest(elf_bytes),
         public_output,
         table_counts,
+        more_counts,
         num_private_input_pages,
         runtime_page_ranges,
         table_num_vars,
@@ -4431,18 +4513,21 @@ fn prove_block_whir_inner(
     proved
 }
 
-/// Refuses a memory format the block cannot build or check yet: the fused
-/// tables' AIRs exist, but no walk routes an access to them and no statement
-/// counts them, so a block under
+/// Refuses a memory format the block cannot hold: the fused tables check an
+/// access's step by MEMW_A's limbs, so
 /// [`MemoryFormat::Fused`](crate::tables::fused_memory::MemoryFormat::Fused)
-/// is refused by its prover and its verifier alike rather than proved or
-/// checked as split.
+/// needs MEMW_A's limbs' form
+/// ([`MemwAlignedOrder::Limbs`](crate::tables::memw_aligned::MemwAlignedOrder::Limbs)).
+/// Its prover and its verifier refuse alike.
 pub(crate) fn check_memory_format(format: &BlockFormat) -> Result<(), Error> {
-    match format.memory {
-        crate::tables::fused_memory::MemoryFormat::Split => Ok(()),
-        crate::tables::fused_memory::MemoryFormat::Fused => Err(Error::Prover(
-            "the fused memory format is not built into the block yet".to_string(),
+    match (format.memory, format.memw_aligned) {
+        (
+            crate::tables::fused_memory::MemoryFormat::Fused,
+            crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+        ) => Err(Error::Prover(
+            "the fused memory format needs MEMW_A's limbs' form".to_string(),
         )),
+        _ => Ok(()),
     }
 }
 
@@ -4499,6 +4584,13 @@ fn prove_block_whir_body(
         return Err(Error::Prover(format!(
             "the {:?} register format needs the windowed build (`window_log2`)",
             format.registers
+        )));
+    }
+    // And the memory in today's format alone.
+    if format.memory != crate::tables::fused_memory::MemoryFormat::Split {
+        return Err(Error::Prover(format!(
+            "the {:?} memory format needs the windowed build (`window_log2`)",
+            format.memory
         )));
     }
 
@@ -4651,6 +4743,9 @@ pub(crate) fn prove_traces(
     let t = Instant::now();
     let table_counts = traces.table_counts();
     validate_block_counts(&table_counts)?;
+    let fused = traces.fused_counts();
+    let fused_memory = fused.map(|n| n as u64);
+    fused_tables(format, fused_memory)?;
     let runtime_page_ranges = traces.runtime_page_ranges();
     let num_private_input_pages = traces
         .page_configs
@@ -4665,7 +4760,7 @@ pub(crate) fn prove_traces(
         crate::cpu_heights_from_traces(traces),
         &public_output,
     )?;
-    let airs = block_airs(
+    let mut airs = block_airs(
         program,
         proof_options,
         &traces.page_configs,
@@ -4675,6 +4770,7 @@ pub(crate) fn prove_traces(
         format.memw_aligned,
         format.registers,
     );
+    airs.with_fused_memory(proof_options, fused);
 
     let prepared_columns = prepared_tables(&airs, &traces.page_configs, format)?;
     let pairs = airs.air_trace_pairs(traces);
@@ -4721,6 +4817,7 @@ pub(crate) fn prove_traces(
             elf_bytes,
             &public_output,
             &table_counts,
+            &fused_statement_words(format.memory, fused_memory),
             num_private_input_pages,
             &runtime_page_ranges,
             &table_num_vars,
@@ -4782,6 +4879,7 @@ pub(crate) fn prove_traces(
                 public_output: &public_output,
                 num_private_input_pages,
                 groups: &groups,
+                fused_memory,
             },
             &prepared_roots(&prepared),
         );
@@ -4889,6 +4987,7 @@ pub(crate) fn prove_traces(
         prepared: proof.2,
         argues: proof.1,
         commit_ood: proof.3,
+        fused_memory,
     })
 }
 
@@ -4926,6 +5025,9 @@ struct StreamAirs {
     shift: crate::VmAir,
     store: crate::VmAir,
     keccak_rnd: crate::VmAir,
+    /// The fused memory format's families (streamed only under it).
+    mem_load: crate::VmAir,
+    mem_store: crate::VmAir,
 }
 
 type DynAir = dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
@@ -4965,6 +5067,8 @@ impl StreamAirs {
             shift: Box::new(create_shift_air(opts)),
             store: Box::new(create_store_air(opts)),
             keccak_rnd: Box::new(create_keccak_rnd_air_for(opts, keccak_rnd)),
+            mem_load: Box::new(create_mem_load_air(opts)),
+            mem_store: Box::new(create_mem_store_air(opts)),
         }
     }
 
@@ -5022,6 +5126,8 @@ impl StreamAirs {
             StreamTable::Shift => self.shift.as_ref(),
             StreamTable::Store => self.store.as_ref(),
             StreamTable::KeccakRnd => self.keccak_rnd.as_ref(),
+            StreamTable::MemLoad => self.mem_load.as_ref(),
+            StreamTable::MemStore => self.mem_store.as_ref(),
         })
     }
 }
@@ -5043,6 +5149,8 @@ fn stream_base(table: StreamTable) -> &'static str {
         StreamTable::Shift => "SHIFT",
         StreamTable::Store => "STORE",
         StreamTable::KeccakRnd => "KECCAK_RND",
+        StreamTable::MemLoad => "MEM_LOAD",
+        StreamTable::MemStore => "MEM_STORE",
     }
 }
 
@@ -5686,6 +5794,8 @@ fn stream_pipelined<'a, R>(
 /// started. `prepared` is `None` when it is left for after the packing.
 struct RestLaid<'a> {
     table_counts: TableCounts,
+    /// [`BlockWhirProof::fused_memory`].
+    fused_memory: [u64; 2],
     runtime_page_ranges: Vec<RuntimePageRange>,
     num_private_input_pages: usize,
     public_output: Vec<u8>,
@@ -5730,6 +5840,9 @@ fn lay_out_rest<'a>(
     let mut marks = vec![("rest received", at())];
     let table_counts = traces.table_counts();
     validate_block_counts(&table_counts)?;
+    let fused = traces.fused_counts();
+    let fused_memory = fused.map(|n| n as u64);
+    fused_tables(format, fused_memory)?;
     let runtime_page_ranges = traces.runtime_page_ranges();
     let num_private_input_pages = traces
         .page_configs
@@ -5744,7 +5857,7 @@ fn lay_out_rest<'a>(
         &public_output,
     )?;
     let airs = run_airs.get_or_init(|| {
-        block_airs(
+        let mut airs = block_airs(
             program,
             opts,
             &traces.page_configs,
@@ -5753,7 +5866,9 @@ fn lay_out_rest<'a>(
             format.keccak_rnd,
             format.memw_aligned,
             format.registers,
-        )
+        );
+        airs.with_fused_memory(opts, fused);
+        airs
     });
     marks.push(("airs", at()));
     let prepared = if prepared_now {
@@ -5898,6 +6013,7 @@ fn lay_out_rest<'a>(
     }
     Ok(RestLaid {
         table_counts,
+        fused_memory,
         runtime_page_ranges,
         num_private_input_pages,
         public_output,
@@ -5937,6 +6053,7 @@ fn lay_out_rest_streamed<'a>(
     keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
     memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
     registers: crate::tables::register::RegisterFormat,
+    memory: crate::tables::fused_memory::MemoryFormat,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
@@ -5945,6 +6062,9 @@ fn lay_out_rest_streamed<'a>(
     let mut marks = vec![("rest received", at())];
     let RestStream { header, tables } = *stream;
     validate_block_counts(&header.table_counts)?;
+    let fused = header.fused_counts;
+    let fused_memory = fused.map(|n| n as u64);
+    fused_tables_under(memory, fused_memory)?;
     let runtime_page_ranges = header.runtime_page_ranges();
     let num_private_input_pages = header
         .page_configs
@@ -5958,7 +6078,7 @@ fn lay_out_rest_streamed<'a>(
         &header.public_output_bytes,
     )?;
     let airs = run_airs.get_or_init(|| {
-        block_airs(
+        let mut airs = block_airs(
             program,
             opts,
             &header.page_configs,
@@ -5967,7 +6087,9 @@ fn lay_out_rest_streamed<'a>(
             keccak_rnd,
             memw_aligned,
             registers,
-        )
+        );
+        airs.with_fused_memory(opts, fused);
+        airs
     });
     marks.push(("airs", at()));
     let refs = airs.air_refs();
@@ -6075,6 +6197,7 @@ fn lay_out_rest_streamed<'a>(
     } = header;
     Ok(RestLaid {
         table_counts,
+        fused_memory,
         runtime_page_ranges,
         num_private_input_pages,
         public_output: public_output_bytes,
@@ -6117,6 +6240,8 @@ pub(crate) fn waves<T>(items: Vec<T>, budget: usize, bytes: impl Fn(&T) -> usize
 /// order's shapes, and each group's tables as AIR indices.
 struct Laid {
     table_counts: TableCounts,
+    /// [`BlockWhirProof::fused_memory`].
+    fused_memory: [u64; 2],
     runtime_page_ranges: Vec<RuntimePageRange>,
     num_private_input_pages: usize,
     public_output: Vec<u8>,
@@ -6648,6 +6773,7 @@ fn prove_streamed(
                 builder = builder.keccak_rnd_form(format.keccak_rnd);
                 builder = builder.memw_aligned_order(format.memw_aligned)?;
                 builder = builder.register_format(format.registers)?;
+                builder = builder.memory_format(format.memory)?;
                 if card_fill.keccak_rnd {
                     builder = builder.card_fill_keccak_rnd();
                     #[cfg(test)]
@@ -6942,6 +7068,7 @@ fn prove_streamed(
                                     form: stream_form,
                                     order: format.memw_aligned,
                                     registers: format.registers,
+                                    memory: format.memory,
                                     faults: deviations.regen_faults,
                                     policy: deviations.regen_windows.map_or_else(
                                         regen::ahead_policy,
@@ -7130,6 +7257,7 @@ fn prove_streamed(
                         format.keccak_rnd,
                         format.memw_aligned,
                         format.registers,
+                        format.memory,
                     ),
                 };
                 let (streamed, rest) = if inline {
@@ -7159,6 +7287,7 @@ fn prove_streamed(
                 } = streamed;
                 let RestLaid {
                     table_counts,
+                    fused_memory,
                     runtime_page_ranges,
                     num_private_input_pages,
                     public_output,
@@ -7263,6 +7392,7 @@ fn prove_streamed(
                     .collect();
                 Ok(Laid {
                     table_counts,
+                    fused_memory,
                     runtime_page_ranges,
                     num_private_input_pages,
                     public_output,
@@ -7394,6 +7524,7 @@ fn prove_streamed(
                 stream_form,
                 format.memw_aligned,
                 format.registers,
+                format.memory,
                 deviations.regen_drop_one_op,
             )
         });
@@ -7510,6 +7641,7 @@ fn prove_streamed(
                                 stream_form,
                                 format.memw_aligned,
                                 format.registers,
+                                format.memory,
                                 deviations.regen_faults,
                                 deviations
                                     .regen_windows
@@ -7554,6 +7686,7 @@ fn prove_streamed(
             elf_bytes,
             &laid.public_output,
             &laid.table_counts,
+            &fused_statement_words(format.memory, laid.fused_memory),
             laid.num_private_input_pages,
             &laid.runtime_page_ranges,
             &table_num_vars,
@@ -7574,6 +7707,7 @@ fn prove_streamed(
                 public_output: &laid.public_output,
                 num_private_input_pages: laid.num_private_input_pages,
                 groups: &laid.groups,
+                fused_memory: laid.fused_memory,
             },
             &prepared_roots(&prepared),
         );
@@ -7971,6 +8105,7 @@ fn prove_streamed(
             prepared: prepared_openings,
             argues,
             commit_ood,
+            fused_memory: laid.fused_memory,
         })
     })
 }
@@ -7983,6 +8118,7 @@ pub(crate) fn block_statement_bytes(
     tag: &[u8],
     elf_digest: &[u8; 32],
     config: &multilinear::whir_chain::ChainConfig,
+    memory: crate::tables::fused_memory::MemoryFormat,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(tag);
@@ -7991,6 +8127,9 @@ pub(crate) fn block_statement_bytes(
     bytes.extend_from_slice(statement.public_output);
     for count in statement::table_count_values(statement.table_counts) {
         bytes.extend_from_slice(&count.to_le_bytes());
+    }
+    for word in fused_statement_words(memory, statement.fused_memory) {
+        bytes.extend_from_slice(&word.to_le_bytes());
     }
     bytes.extend_from_slice(&(statement.num_private_input_pages as u64).to_le_bytes());
     bytes.extend_from_slice(&(statement.runtime_page_ranges.len() as u64).to_le_bytes());
@@ -8030,6 +8169,7 @@ pub(crate) fn block_statement_calls(
     tag: &[u8],
     elf_bytes: &[u8],
     config: &multilinear::whir_chain::ChainConfig,
+    memory: crate::tables::fused_memory::MemoryFormat,
 ) -> Result<Vec<Vec<u8>>, String> {
     let mut calls = StatementCalls::default();
     absorb_block(
@@ -8038,6 +8178,7 @@ pub(crate) fn block_statement_calls(
         elf_bytes,
         statement.public_output,
         statement.table_counts,
+        &fused_statement_words(memory, statement.fused_memory),
         statement.num_private_input_pages,
         statement.runtime_page_ranges,
         statement.table_num_vars,
@@ -8092,6 +8233,8 @@ pub struct BlockStatement<'a> {
     pub public_output: &'a [u8],
     pub num_private_input_pages: usize,
     pub groups: &'a [Vec<u32>],
+    /// [`BlockWhirProof::fused_memory`].
+    pub fused_memory: [u64; 2],
 }
 
 /// A [`BlockStatement`] owned: what a statement observer keeps
@@ -8104,6 +8247,7 @@ pub struct OwnedBlockStatement {
     pub public_output: Vec<u8>,
     pub num_private_input_pages: usize,
     pub groups: Vec<Vec<u32>>,
+    pub fused_memory: [u64; 2],
 }
 
 impl OwnedBlockStatement {
@@ -8115,6 +8259,7 @@ impl OwnedBlockStatement {
             public_output: &self.public_output,
             num_private_input_pages: self.num_private_input_pages,
             groups: &self.groups,
+            fused_memory: self.fused_memory,
         }
     }
 }
@@ -8128,6 +8273,7 @@ impl BlockStatement<'_> {
             public_output: self.public_output.to_vec(),
             num_private_input_pages: self.num_private_input_pages,
             groups: self.groups.to_vec(),
+            fused_memory: self.fused_memory,
         }
     }
 }
@@ -8142,6 +8288,7 @@ impl BlockWhirProof {
             public_output: &self.public_output,
             num_private_input_pages: self.num_private_input_pages,
             groups: &self.groups,
+            fused_memory: self.fused_memory,
         }
     }
 }
@@ -8187,6 +8334,9 @@ pub(crate) fn block_frame(
             statement.num_private_input_pages,
         )));
     }
+    // The fused memory tables, under the verifier's memory format: none under
+    // the split format, where any stated pair is refused.
+    let fused = fused_tables(format, statement.fused_memory)?;
     let num_tables = statement.table_num_vars.len();
     let page_configs = Traces::page_configs_from_elf_and_runtime(
         &program,
@@ -8199,6 +8349,8 @@ pub(crate) fn block_frame(
         .total()
         .and_then(|t| t.checked_add(FIXED_TABLE_COUNT))
         .and_then(|t| t.checked_add(page_configs.len()))
+        .and_then(|t| t.checked_add(fused[0]))
+        .and_then(|t| t.checked_add(fused[1]))
     else {
         return Err(Error::InvalidTableCounts(
             "the table counts do not sum to a usize".to_string(),
@@ -8220,7 +8372,7 @@ pub(crate) fn block_frame(
         cpu_heights,
         statement.public_output,
     )?;
-    let airs = block_airs(
+    let mut airs = block_airs(
         &program,
         proof_options,
         &page_configs,
@@ -8230,6 +8382,7 @@ pub(crate) fn block_frame(
         format.memw_aligned,
         format.registers,
     );
+    airs.with_fused_memory(proof_options, fused);
     // The CPU heights were read at `cpu_proof_start`: the tables must be there.
     airs.check_cpu_position(statement.table_counts)?;
     let air_refs = airs.air_refs();
@@ -8237,6 +8390,20 @@ pub(crate) fn block_frame(
         return Err(Error::InvalidTableCounts(format!(
             "the layout has {} tables, the statement {num_tables}",
             air_refs.len(),
+        )));
+    }
+    // Every fused memory table at most the block's chunk.
+    if let Some((air, &num_vars)) = air_refs
+        .iter()
+        .zip(statement.table_num_vars)
+        .filter(|(air, _)| {
+            air.name().starts_with("MEM_LOAD[") || air.name().starts_with("MEM_STORE[")
+        })
+        .find(|(_, num_vars)| usize::from(**num_vars) > BLOCK_FUSED_MAX_VARS)
+    {
+        return Err(Error::InvalidTableCounts(format!(
+            "{} states 2^{num_vars} rows — a block takes at most 2^{BLOCK_FUSED_MAX_VARS}",
+            air.name()
         )));
     }
     // Under the in-row register format MEMW_R's slot holds the residual register tables,
@@ -8415,6 +8582,7 @@ pub(crate) fn verify_block_whir_traced(
             elf_bytes,
             &proof.public_output,
             &proof.table_counts,
+            &fused_statement_words(format.memory, proof.fused_memory),
             proof.num_private_input_pages,
             &proof.runtime_page_ranges,
             &proof.table_num_vars,

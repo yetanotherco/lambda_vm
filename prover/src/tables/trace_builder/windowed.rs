@@ -79,6 +79,9 @@ use super::{
 use crate::Error;
 use crate::paged_mem::PagedMem;
 use crate::tables::decode::DecodeTable;
+use crate::tables::fused_memory::MemoryFormat;
+use crate::tables::mem_load::{self, MemLoadRow};
+use crate::tables::mem_store::{self, MemStoreRow};
 use crate::tables::memw_aligned::MemwAlignedOrder;
 use crate::tables::{
     cpu, decode, keccak_rnd, load, lt, memw, memw_aligned, memw_register, register, shift, store,
@@ -187,10 +190,14 @@ pub enum StreamTable {
     /// Only when the builder cuts KECCAK_RND into chunks
     /// ([`WindowedTraceBuilder::keccak_rnd_chunks`]).
     KeccakRnd,
+    /// Only under the fused memory format
+    /// ([`WindowedTraceBuilder::memory_format`]).
+    MemLoad,
+    MemStore,
 }
 
 impl StreamTable {
-    pub const ALL: [StreamTable; 9] = [
+    pub const ALL: [StreamTable; 11] = [
         StreamTable::Cpu,
         StreamTable::MemwRegister,
         StreamTable::MemwAligned,
@@ -200,6 +207,8 @@ impl StreamTable {
         StreamTable::Shift,
         StreamTable::Store,
         StreamTable::KeccakRnd,
+        StreamTable::MemLoad,
+        StreamTable::MemStore,
     ];
 
     /// Its place in [`Self::ALL`].
@@ -476,10 +485,10 @@ pub struct CardFillStamps {
 /// A measurement; the chunks are the same.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HandoutStamps {
-    pub take: [f64; 9],
-    pub count: [f64; 9],
-    pub chunks: [usize; 9],
-    pub copied: [usize; 9],
+    pub take: [f64; 11],
+    pub count: [f64; 11],
+    pub chunks: [usize; 11],
+    pub copied: [usize; 11],
 }
 
 impl HandoutStamps {
@@ -961,6 +970,28 @@ impl<'a> WindowedTraceBuilder<'a> {
         Ok(self)
     }
 
+    /// How the CPU's loads and stores are checked ([`MemoryFormat`], the block
+    /// format's): under [`MemoryFormat::Fused`] the walk makes one MEM_LOAD or
+    /// MEM_STORE row of each load or store it would route to MEMW_A (which
+    /// needs MEMW_A's limbs' form, [`Self::memw_aligned_order`]) and routes
+    /// every store itself, and both tables stream. Before the first window
+    /// only.
+    ///
+    /// [`MemoryFormat`]: super::super::fused_memory::MemoryFormat
+    /// [`MemoryFormat::Fused`]: super::super::fused_memory::MemoryFormat::Fused
+    pub fn memory_format(
+        mut self,
+        format: super::super::fused_memory::MemoryFormat,
+    ) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "memory_format after a window was walked".to_string(),
+            ));
+        }
+        self.emitted.memory_format = format;
+        Ok(self)
+    }
+
     /// A test's fault ([`StreamSkip::card_fill_fault`]): with
     /// [`Self::card_fill_keccak_rnd`], each KECCAK_RND table's records start
     /// `rows` rows late, the same wrong table however they are filled.
@@ -1212,11 +1243,11 @@ impl<'a> WindowedTraceBuilder<'a> {
         Ok(self)
     }
 
-    /// Per streamed table (CPU, MEMW_R, MEMW_A, MEMW, LOAD, LT, SHIFT, STORE),
-    /// the ops the builder holds that were not handed out in a chunk, and the
+    /// Per streamed table (CPU, MEMW_R, MEMW_A, MEMW, LOAD, LT, SHIFT, STORE,
+    /// MEM_LOAD, MEM_STORE), the ops the builder holds that were not handed out in a chunk, and the
     /// ops its held lists take room for (those plus a part's handed-out head):
     /// under [`Self::drop_streamed_ops`] only; `None` otherwise.
-    pub fn held_streamed_ops(&self) -> Option<[(usize, usize); 8]> {
+    pub fn held_streamed_ops(&self) -> Option<[(usize, usize); 10]> {
         let kept = self.kept.as_ref()?;
         let store = self.segments.store_ops.len();
         Some([
@@ -1228,6 +1259,8 @@ impl<'a> WindowedTraceBuilder<'a> {
             kept.lt.held(),
             kept.shift.held(),
             (store, store),
+            kept.mem_load.held(),
+            kept.mem_store.held(),
         ])
     }
 
@@ -1429,6 +1462,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         self.cycles += logs.len();
         let mut walk = WalkOutputs::with_capacity(cpu_ops.len(), self.emitted.memw_aligned_order);
         walk.memw.registers = self.emitted.register_format;
+        walk.memw.memory = self.emitted.memory_format;
         // The last window's in-walk lookups are listed and counted by the
         // table phase, lean or not.
         collect_ops_from_cpu_into(
@@ -1444,8 +1478,13 @@ impl<'a> WindowedTraceBuilder<'a> {
         } else {
             route_ops
         };
+        let stores = self.emitted.memory_format == MemoryFormat::Split;
         self.segments
-            .append(route(&cpu_ops, &self.decode, &walk.cpu32_ops));
+            .append(route(&cpu_ops, &self.decode, &walk.cpu32_ops, stores));
+        // Under the fused memory format STORE's segment is the walk's.
+        self.segments
+            .store_ops
+            .extend(std::mem::take(&mut walk.store_ops));
         let last = WalkedWindow {
             cycles: cpu_ops.len(),
             cpu_ops,
@@ -1511,8 +1550,12 @@ impl<'a> WindowedTraceBuilder<'a> {
         let (ops, decode_trace, skip, pre) = match kept {
             None => {
                 windows.push(last);
-                let (cpu_ops, mut walk) =
-                    concatenate(windows, emitted.memw_aligned_order, emitted.register_format);
+                let (cpu_ops, mut walk) = concatenate(
+                    windows,
+                    emitted.memw_aligned_order,
+                    emitted.register_format,
+                    emitted.memory_format,
+                );
                 super::build_stamps::mark("p0 concatenate");
                 let rest = KeptRest::from_walk(&mut walk);
                 let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state)?;
@@ -1613,8 +1656,12 @@ impl<'a> WindowedTraceBuilder<'a> {
                     kept.listless = false;
                 }
                 kept.append(last, &decode);
-                let (cpu_ops, walk, rest, decode_trace) =
-                    kept.into_run(&decode, emitted.memw_aligned_order, emitted.register_format)?;
+                let (cpu_ops, walk, rest, decode_trace) = kept.into_run(
+                    &decode,
+                    emitted.memw_aligned_order,
+                    emitted.register_format,
+                    emitted.memory_format,
+                )?;
                 super::build_stamps::mark("p0 concatenate");
                 let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state)?;
                 super::build_stamps::mark("p0 assemble");
@@ -1748,6 +1795,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 decode: &self.decode,
                 order: self.emitted.memw_aligned_order,
                 registers: self.emitted.register_format,
+                memory: self.emitted.memory_format,
                 lookups: !self.lean.lookups,
                 keep_logs: self.keeps_logs(),
                 batch: self.walk_batch,
@@ -1826,7 +1874,7 @@ impl WalkedWindow {
         let w = &self.walk;
         let _ = write!(
             d,
-            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
             self.cpu_ops,
             w.memw.register_rows,
             w.memw.aligned,
@@ -1844,6 +1892,9 @@ impl WalkedWindow {
             w.copy_ops,
             w.hint_ops,
             w.ecrec_ops,
+            w.mem_load_rows,
+            w.mem_store_rows,
+            w.store_ops,
         );
         d.0.finish()
     }
@@ -1875,6 +1926,8 @@ pub struct Walker<'b> {
     order: MemwAlignedOrder,
     /// The run's register format ([`WindowedTraceBuilder::register_format`]).
     registers: crate::tables::register::RegisterFormat,
+    /// The run's memory format ([`WindowedTraceBuilder::memory_format`]).
+    memory: MemoryFormat,
     /// List the in-walk lookups (`false` under [`WalkLean::lookups`]).
     lookups: bool,
     /// Keep each window's logs ([`WindowedTraceBuilder::keeps_logs`]).
@@ -1911,6 +1964,7 @@ impl Walker<'_> {
             self.decode,
             self.order,
             self.registers,
+            self.memory,
             self.lookups,
             self.batch,
             self.defer_ecrec,
@@ -1956,6 +2010,7 @@ fn walk_window(
     decode: &DecodeTable,
     order: MemwAlignedOrder,
     register_format: crate::tables::register::RegisterFormat,
+    memory_format: MemoryFormat,
     lookups: bool,
     batch: usize,
     defer_ecrec: bool,
@@ -1981,6 +2036,7 @@ fn walk_window(
     // Without `lookups`, the accumulator counts them (`absorb`).
     let mut walk = WalkOutputs::for_walk_sized(logs.len(), lookups, sizes, order);
     walk.memw.registers = register_format;
+    walk.memw.memory = memory_format;
     if register_format == crate::tables::register::RegisterFormat::InRow
         && super::inrow_sides_pinned()
     {
@@ -2001,8 +2057,10 @@ fn walk_window(
     // Routing where the ops are (`route`, with the counts): each batch's ops
     // routed and their own lookups counted while in cache, into segments
     // sized from the walker's last window.
-    let mut router = (route && counts.is_some())
-        .then(|| super::CpuRouter::with_capacities(sizes.routed_for(logs.len())));
+    let mut router = (route && counts.is_some()).then(|| {
+        super::CpuRouter::with_capacities(sizes.routed_for(logs.len()))
+            .routing_stores(memory_format == MemoryFormat::Split)
+    });
     // Without the list, each batch's ops in one buffer, reused.
     let mut from = 0usize;
     for part in logs.chunks(batch) {
@@ -2080,6 +2138,8 @@ struct BatchMarks {
     aligned: usize,
     load: usize,
     shift: usize,
+    mem_load: usize,
+    mem_store: usize,
     /// The in-walk lookups listed so far: under the in-row register format
     /// each CPU slot's `IS_HALF` (a walk that does not list the rest).
     bitwise: usize,
@@ -2095,6 +2155,8 @@ impl BatchMarks {
             aligned: walk.memw.aligned.len(),
             load: walk.load_ops.len(),
             shift: walk.shift_ops.len(),
+            mem_load: walk.mem_load_rows.len(),
+            mem_store: walk.mem_store_rows.len(),
         }
     }
 }
@@ -2138,6 +2200,13 @@ impl WalkCounts {
         }
         for op in &walk.load_ops[marks.load..] {
             op.count_bitwise_into(histogram);
+        }
+        // The fused rows' lookups are in-walk lookups, as LOAD's.
+        for row in &walk.mem_load_rows[marks.mem_load..] {
+            row.count_bitwise_into(histogram);
+        }
+        for row in &walk.mem_store_rows[marks.mem_store..] {
+            row.count_bitwise_into(histogram);
         }
         memw_register::collect_bitwise_from_memw_register(
             &walk.memw.register_rows[marks.register_rows..],
@@ -2262,8 +2331,9 @@ impl Accumulator<'_> {
 
     /// [`Self::absorb`], and the ops `window` added to each streamed table's
     /// list, in [`StreamTable::ALL`] order without KECCAK_RND (the MEMW-derived
-    /// LT ops of [`WindowedTraceBuilder::stream_memw_lt`] aside).
-    pub fn absorb_counted(&mut self, window: WalkedWindow) -> (Vec<ChunkJob>, [usize; 8]) {
+    /// LT ops of [`WindowedTraceBuilder::stream_memw_lt`] aside): CPU, MEMW_R,
+    /// MEMW_A, MEMW, LOAD, LT, SHIFT, STORE, MEM_LOAD, MEM_STORE.
+    pub fn absorb_counted(&mut self, window: WalkedWindow) -> (Vec<ChunkJob>, [usize; 10]) {
         let walk = &window.walk;
         let mut added = [
             window.cycles,
@@ -2274,6 +2344,8 @@ impl Accumulator<'_> {
             walk.lt_ops.len(),
             walk.shift_ops.len(),
             0,
+            walk.mem_load_rows.len(),
+            walk.mem_store_rows.len(),
         ];
         let stores_before = self.segments.store_ops.len();
         let jobs = self.absorb(window);
@@ -2325,7 +2397,10 @@ impl Accumulator<'_> {
         // The table phase's dominant BITWISE source, counted now: from the CPU
         // and LOAD ops when the walk left the lookups out (the list is then
         // empty), from the list otherwise. The one-pass routing appends to the
-        // run's segments and counts the CPU ops' lookups as it goes.
+        // run's segments and counts the CPU ops' lookups as it goes. Under the
+        // fused memory format no router routes a store: STORE's segment is the
+        // walk's list, appended after the routing.
+        let stores = self.emitted.memory_format == MemoryFormat::Split;
         if let Some(segments) = window.routed.take() {
             // Its walker routed it and counted its CPU ops' lookups.
             self.walked.routed += 1;
@@ -2341,6 +2416,7 @@ impl Accumulator<'_> {
                     &window.walk.cpu32_ops,
                     self.segments,
                     &mut self.counted.histogram,
+                    stores,
                 ),
                 None => Err(Error::Prover(
                     "a window without its CPU list came without its logs".to_string(),
@@ -2356,6 +2432,7 @@ impl Accumulator<'_> {
                 &window.walk.cpu32_ops,
                 self.segments,
                 &mut self.counted.histogram,
+                stores,
             );
         } else {
             let route = if self.lean.route {
@@ -2363,8 +2440,12 @@ impl Accumulator<'_> {
             } else {
                 route_ops
             };
-            self.segments
-                .append(route(&window.cpu_ops, self.decode, &window.walk.cpu32_ops));
+            self.segments.append(route(
+                &window.cpu_ops,
+                self.decode,
+                &window.walk.cpu32_ops,
+                stores,
+            ));
             if self.lean.lookups {
                 let histogram = &mut self.counted.histogram;
                 window
@@ -2373,13 +2454,21 @@ impl Accumulator<'_> {
                     .for_each(|op| self.decode.op(op).count_bitwise_into(histogram));
             }
         }
+        self.segments
+            .store_ops
+            .extend(std::mem::take(&mut window.walk.store_ops));
         if self.lean.lookups && !counted_by_walker {
             let histogram = &mut self.counted.histogram;
-            window
-                .walk
-                .load_ops
+            let walk = &window.walk;
+            walk.load_ops
                 .iter()
                 .for_each(|op| op.count_bitwise_into(histogram));
+            walk.mem_load_rows
+                .iter()
+                .for_each(|row| row.count_bitwise_into(histogram));
+            walk.mem_store_rows
+                .iter()
+                .for_each(|row| row.count_bitwise_into(histogram));
         }
         self.counted.histogram.add_ops(&window.walk.bitwise_ops);
         self.counted.bitwise_ops += window.walk.bitwise_ops.len();
@@ -2482,6 +2571,12 @@ fn list_shift(w: &WalkedWindow) -> &[super::ShiftOperation] {
 }
 fn list_keccak(w: &WalkedWindow) -> &[super::keccak::KeccakOperation] {
     &w.walk.keccak_ops
+}
+fn list_mem_load(w: &WalkedWindow) -> &[MemLoadRow] {
+    &w.walk.mem_load_rows
+}
+fn list_mem_store(w: &WalkedWindow) -> &[MemStoreRow] {
+    &w.walk.mem_store_rows
 }
 
 /// Every full chunk the run's lists hold that was not handed out yet, its ops
@@ -2593,6 +2688,21 @@ fn chunk_jobs(
         });
         e.store += 1;
     }
+    // The fused memory format's tables, after STORE.
+    full_chunks!(
+        StreamTable::MemLoad,
+        MemLoad,
+        list_mem_load,
+        m.mem_load,
+        e.mem_load
+    );
+    full_chunks!(
+        StreamTable::MemStore,
+        MemStore,
+        list_mem_store,
+        m.mem_store,
+        e.mem_store
+    );
     jobs
 }
 
@@ -3120,6 +3230,9 @@ struct Kept {
     load: Tail<super::LoadOperation>,
     lt: Tail<super::LtOperation>,
     shift: Tail<super::ShiftOperation>,
+    /// The fused memory format's rows; empty under the split format.
+    mem_load: Tail<MemLoadRow>,
+    mem_store: Tail<MemStoreRow>,
     /// Every other walk list, the run so far, in blocks (the in-walk lookups
     /// only hold what is left to count).
     rest: KeptRest,
@@ -3252,6 +3365,8 @@ impl Kept {
             load: Tail::new(),
             lt: Tail::new(),
             shift: Tail::new(),
+            mem_load: Tail::new(),
+            mem_store: Tail::new(),
             rest: KeptRest::new(max_rows),
             decode,
             listless: false,
@@ -3270,6 +3385,8 @@ impl Kept {
             + self.load.heap_bytes()
             + self.lt.heap_bytes()
             + self.shift.heap_bytes()
+            + self.mem_load.heap_bytes()
+            + self.mem_store.heap_bytes()
             + self
                 .rest
                 .sizes()
@@ -3293,6 +3410,8 @@ impl Kept {
             ("kept load".to_string(), self.load.heap_bytes()),
             ("kept lt".to_string(), self.lt.heap_bytes()),
             ("kept shift".to_string(), self.shift.heap_bytes()),
+            ("kept mem_load".to_string(), self.mem_load.heap_bytes()),
+            ("kept mem_store".to_string(), self.mem_store.heap_bytes()),
             ("kept decode".to_string(), self.decode.heap_bytes()),
         ];
         parts.extend(
@@ -3321,6 +3440,8 @@ impl Kept {
             ("kept load".to_string(), self.load.largest_bytes()),
             ("kept lt".to_string(), self.lt.largest_bytes()),
             ("kept shift".to_string(), self.shift.largest_bytes()),
+            ("kept mem_load".to_string(), self.mem_load.largest_bytes()),
+            ("kept mem_store".to_string(), self.mem_store.largest_bytes()),
             ("kept decode".to_string(), self.decode.heap_bytes()),
         ];
         parts.extend(
@@ -3406,6 +3527,10 @@ impl Kept {
             hint_ops,
             ecrec_ops,
             cpu_side,
+            mem_load_rows,
+            mem_store_rows,
+            // Moved to STORE's segment as the window was routed.
+            store_ops: _,
         } = walk;
         if !self.listless {
             self.cpu.push(cpu_ops);
@@ -3424,6 +3549,8 @@ impl Kept {
         self.load.push(load_ops);
         self.lt.push(lt_ops);
         self.shift.push(shift_ops);
+        self.mem_load.push(mem_load_rows);
+        self.mem_store.push(mem_store_rows);
         let rest = &mut self.rest;
         rest.bitwise_ops.extend(bitwise_ops);
         rest.copy_ops.extend(copy_ops);
@@ -3445,6 +3572,7 @@ impl Kept {
         decode_table: &DecodeTable,
         order: MemwAlignedOrder,
         registers: super::super::register::RegisterFormat,
+        memory: MemoryFormat,
     ) -> Result<(Vec<super::CpuOperation>, WalkOutputs, KeptRest, Table), Error> {
         let Kept {
             cpu,
@@ -3457,6 +3585,8 @@ impl Kept {
             load,
             lt,
             shift,
+            mem_load,
+            mem_store,
             rest,
             decode,
             listless: _,
@@ -3484,9 +3614,12 @@ impl Kept {
             words: None,
             order,
             registers,
+            memory,
             refused: None,
         };
         walk.cpu_side = cpu_side.into_vec();
+        walk.mem_load_rows = mem_load.into_vec();
+        walk.mem_store_rows = mem_store.into_vec();
         walk.load_ops = load.into_vec();
         walk.lt_ops = lt.into_vec();
         walk.shift_ops = shift.into_vec();
@@ -3567,6 +3700,7 @@ fn route_from_logs(
     cpu32_ops: &[super::cpu32::Cpu32Operation],
     segments: &mut RoutedBlocks,
     histogram: &mut bitwise::BitwiseHistogram,
+    stores: bool,
 ) -> Result<(), Error> {
     let dvrm_before = segments.dvrm_filter.len();
     let batch = WALK_BATCH;
@@ -3576,7 +3710,7 @@ fn route_from_logs(
         ops.clear();
         super::collect_cpu_ops_into(part, decode, at, &mut ops)?;
         at += part.len();
-        super::route_cpu_ops_into(&ops, decode, segments, histogram);
+        super::route_cpu_ops_into(&ops, decode, segments, histogram, stores);
     }
     super::route_window_tail_into(cpu32_ops, segments, dvrm_before);
     Ok(())
@@ -4170,6 +4304,22 @@ fn tail_jobs(
         });
         e.store += 1;
     }
+    // The fused memory format's tables, after STORE: their lookups are
+    // in-walk lookups, counted as their windows were.
+    take_chunks!(
+        StreamTable::MemLoad,
+        MemLoad,
+        kept.mem_load,
+        m.mem_load,
+        e.mem_load
+    );
+    take_chunks!(
+        StreamTable::MemStore,
+        MemStore,
+        kept.mem_store,
+        m.mem_store,
+        e.mem_store
+    );
     jobs
 }
 
@@ -4192,6 +4342,7 @@ fn concatenate(
     windows: Vec<WalkedWindow>,
     order: MemwAlignedOrder,
     registers: super::super::register::RegisterFormat,
+    memory: MemoryFormat,
 ) -> (Vec<super::CpuOperation>, WalkOutputs) {
     /// The windows' lists one after another, in window order. Under `parallel`
     /// each window's part is moved into its own disjoint slice of the output
@@ -4246,9 +4397,13 @@ fn concatenate(
     let mut hint = Vec::with_capacity(n);
     let mut ecrec = Vec::with_capacity(n);
     let mut cpu_side = Vec::with_capacity(n);
+    let mut mem_load = Vec::with_capacity(n);
+    let mut mem_store = Vec::with_capacity(n);
     for WalkedWindow { cpu_ops, walk, .. } in windows {
         cpu.push(cpu_ops);
         cpu_side.push(walk.cpu_side);
+        mem_load.push(walk.mem_load_rows);
+        mem_store.push(walk.mem_store_rows);
         register_rows.push(walk.memw.register_rows);
         aligned.push(walk.memw.aligned);
         general.push(walk.memw.general);
@@ -4283,9 +4438,14 @@ fn concatenate(
             words: None,
             order,
             registers,
+            memory,
             refused: None,
         },
         cpu_side: cat(cpu_side),
+        mem_load_rows: cat(mem_load),
+        mem_store_rows: cat(mem_store),
+        // Moved to STORE's segment as each window was routed.
+        store_ops: Vec::new(),
         load_ops: load,
         lt_ops: lt,
         shift_ops: shift,
@@ -4346,6 +4506,8 @@ enum ChunkOps {
         skip: usize,
         rows: usize,
     },
+    MemLoad(Segments<MemLoadRow>),
+    MemStore(Segments<MemStoreRow>),
 }
 
 impl ChunkJob {
@@ -4370,6 +4532,8 @@ impl ChunkJob {
             ChunkOps::Shift(ops) => ops.op_bytes(),
             ChunkOps::Store(ops) => b(ops),
             ChunkOps::KeccakRnd { ops, .. } => b(ops),
+            ChunkOps::MemLoad(rows) => rows.op_bytes(),
+            ChunkOps::MemStore(rows) => rows.op_bytes(),
         }
     }
 
@@ -4392,6 +4556,8 @@ impl ChunkJob {
             ChunkOps::Shift(ops) => ops.len(),
             ChunkOps::Store(ops) => ops.len(),
             ChunkOps::KeccakRnd { ops, .. } => ops.len(),
+            ChunkOps::MemLoad(rows) => rows.len(),
+            ChunkOps::MemStore(rows) => rows.len(),
         }
     }
 
@@ -4445,6 +4611,12 @@ impl ChunkJob {
                     })
                     .collect();
                 keccak_rnd::generate_keccak_rnd_rows_as(&ops, skip, rows, form)
+            }
+            ChunkOps::MemLoad(rows) => {
+                mem_load::generate_mem_load_trace_segments_as(&rows.slices(), form)
+            }
+            ChunkOps::MemStore(rows) => {
+                mem_store::generate_mem_store_trace_segments_as(&rows.slices(), form)
             }
         };
         StreamedChunk {
@@ -4597,6 +4769,8 @@ fn assemble(
         lt_ops,
         shift_ops,
         cpu_side,
+        mem_load_rows,
+        mem_store_rows,
         ..
     } = walk;
     let KeptRest {
@@ -4618,6 +4792,7 @@ fn assemble(
         words: _,
         order,
         registers,
+        memory: _,
         refused: _,
     } = memw;
     // HALT's register ops land at the end of their buckets, as in
@@ -4685,6 +4860,8 @@ fn assemble(
         ecdas_ops,
         hint_ops,
         ecrec_ops,
+        mem_load_rows,
+        mem_store_rows,
     })
 }
 
@@ -4726,6 +4903,9 @@ pub struct RegenBuilder {
     lt: Tail<super::LtOperation>,
     shift: Tail<super::ShiftOperation>,
     store: Tail<store::StoreOperation>,
+    /// The fused memory format's rows.
+    mem_load: Tail<MemLoadRow>,
+    mem_store: Tail<MemStoreRow>,
     /// [`Self::keep_cpu_logs`]: the CPU tail's logs, in step with it, and the
     /// DECODE rows a CPU chunk's records read.
     logs: Option<(Tail<Log>, Arc<CardDecode>)>,
@@ -4765,6 +4945,8 @@ impl RegenBuilder {
             lt: Tail::new(),
             shift: Tail::new(),
             store: Tail::new(),
+            mem_load: Tail::new(),
+            mem_store: Tail::new(),
             logs: None,
             cut: StreamSkip::default(),
             #[cfg(test)]
@@ -4797,6 +4979,18 @@ impl RegenBuilder {
             ));
         }
         self.cut.register_format = format;
+        Ok(self)
+    }
+
+    /// [`WindowedTraceBuilder::memory_format`], for the chunks this
+    /// regenerates. Before the first window only.
+    pub fn memory_format(mut self, format: MemoryFormat) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "memory_format after a window was walked".to_string(),
+            ));
+        }
+        self.cut.memory_format = format;
         Ok(self)
     }
 
@@ -4865,6 +5059,7 @@ impl RegenBuilder {
         self.cycles += logs.len();
         let mut walk = WalkOutputs::for_walk(cpu_ops.len(), false, self.cut.memw_aligned_order);
         walk.memw.registers = self.cut.register_format;
+        walk.memw.memory = self.cut.memory_format;
         super::collect_streamed_ops_from_cpu_into(
             &cpu_ops,
             &self.decode,
@@ -4872,14 +5067,18 @@ impl RegenBuilder {
             &mut self.register_state,
             &mut walk,
         )?;
-        // STORE's segment, as the routing filters it out of the CPU ops.
+        // STORE's segment, as the routing filters it out of the CPU ops; under
+        // the fused memory format, as the walk routed it.
         #[cfg_attr(not(test), allow(unused_mut))]
-        let mut stores: Vec<store::StoreOperation> = cpu_ops
-            .iter()
-            .map(|op| self.decode.op(op))
-            .filter(|op| op.decode.fields.is_store())
-            .map(super::route_store)
-            .collect();
+        let mut stores: Vec<store::StoreOperation> = match self.cut.memory_format {
+            MemoryFormat::Split => cpu_ops
+                .iter()
+                .map(|op| self.decode.op(op))
+                .filter(|op| op.decode.fields.is_store())
+                .map(super::route_store)
+                .collect(),
+            MemoryFormat::Fused => std::mem::take(&mut walk.store_ops),
+        };
         // Mutable for the tests' slicer bug (`drop_one_op`).
         #[cfg_attr(not(test), allow(unused_mut))]
         let MemwBuckets {
@@ -4889,10 +5088,13 @@ impl RegenBuilder {
             words: _,
             order: _,
             registers: _,
+            memory: _,
             refused: _,
         } = walk.memw;
         #[cfg_attr(not(test), allow(unused_mut))]
         let (mut load, mut lt, mut shift) = (walk.load_ops, walk.lt_ops, walk.shift_ops);
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let (mut mem_load, mut mem_store) = (walk.mem_load_rows, walk.mem_store_rows);
         #[cfg(test)]
         if let Some(table) = self.drop_one {
             fn drop_first<T>(list: &mut Vec<T>) -> bool {
@@ -4908,6 +5110,8 @@ impl RegenBuilder {
                 StreamTable::Shift => drop_first(&mut shift),
                 StreamTable::Store => drop_first(&mut stores),
                 StreamTable::KeccakRnd => false,
+                StreamTable::MemLoad => drop_first(&mut mem_load),
+                StreamTable::MemStore => drop_first(&mut mem_store),
             };
             if dropped {
                 self.drop_one = None;
@@ -4929,6 +5133,8 @@ impl RegenBuilder {
         self.lt.push(lt);
         self.shift.push(shift);
         self.store.push(stores);
+        self.mem_load.push(mem_load);
+        self.mem_store.push(mem_store);
         Ok(self.cut_chunks())
     }
 
@@ -5007,6 +5213,20 @@ impl RegenBuilder {
             });
             e.store += 1;
         }
+        cut!(
+            StreamTable::MemLoad,
+            MemLoad,
+            self.mem_load,
+            m.mem_load,
+            e.mem_load
+        );
+        cut!(
+            StreamTable::MemStore,
+            MemStore,
+            self.mem_store,
+            m.mem_store,
+            e.mem_store
+        );
         jobs
     }
 }
@@ -5028,6 +5248,8 @@ impl Traces {
                 StreamTable::Shift => &mut self.shifts,
                 StreamTable::Store => &mut self.stores,
                 StreamTable::KeccakRnd => &mut self.keccak_rnds,
+                StreamTable::MemLoad => &mut self.mem_loads,
+                StreamTable::MemStore => &mut self.mem_stores,
             };
             let len = slots.len();
             let slot = slots.get_mut(chunk.index).ok_or_else(|| {

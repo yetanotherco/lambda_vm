@@ -80,6 +80,7 @@ fn walked_from_entries_with(
         decode: Arc::clone(&builder.decode),
         order: builder.emitted.memw_aligned_order,
         registers: builder.emitted.register_format,
+        memory_format: builder.emitted.memory_format,
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
         defer_ecrec: builder.defer_ecrec,
@@ -703,7 +704,20 @@ fn walked_on_threads(
     walkers: usize,
     cut: Option<usize>,
 ) -> Result<Traces, Error> {
-    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)?.drop_streamed_ops()?;
+    walked_on_threads_as(program, max_rows, window, walkers, cut, &|b| Ok(b))
+}
+
+/// [`walked_on_threads`] with the builder `configure` returns.
+fn walked_on_threads_as(
+    program: &Elf,
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    walkers: usize,
+    cut: Option<usize>,
+    configure: &dyn Fn(WindowedTraceBuilder<'_>) -> Result<WindowedTraceBuilder<'_>, Error>,
+) -> Result<Traces, Error> {
+    let mut builder =
+        configure(WindowedTraceBuilder::new(program, &[], max_rows)?.drop_streamed_ops()?)?;
     let (tx, rx) = std::sync::mpsc::sync_channel(2);
     let mut chunks = Vec::new();
     let report = std::thread::scope(|scope| {
@@ -764,6 +778,67 @@ fn windows_walked_on_threads_build_the_whole_run_tables() {
                         panic!("{name}, window {window}, {walkers} walkers: {e:?}")
                     });
                 same_traces(&reference, &traces);
+            }
+        }
+    }
+}
+
+/// ★ Under the fused memory format (with the block's register format and
+/// MEMW_A order), walked on 1, 2 and 3 threads at window lengths 7 and 33,
+/// with the walkers routing their windows and counting where they make the
+/// rows (the light walk's routing) or not, the windows build the tables the
+/// single walker's windowed build makes: the walkers route no store, and each
+/// window's STORE segment is its walk's.
+#[test]
+fn fused_windows_walked_on_threads_build_the_windowed_tables() {
+    use crate::tables::fused_memory::MemoryFormat;
+    use crate::tables::memw_aligned::MemwAlignedOrder;
+    use crate::tables::register::RegisterFormat;
+    let max_rows = MaxRowsConfig::small();
+    fn formats(b: WindowedTraceBuilder<'_>) -> Result<WindowedTraceBuilder<'_>, Error> {
+        b.register_format(RegisterFormat::InRow)?
+            .memw_aligned_order(MemwAlignedOrder::Limbs)?
+            .memory_format(MemoryFormat::Fused)
+    }
+    for name in [
+        "fused_mem_cases",
+        "all_instructions_64",
+        "all_loadstore_32",
+        "test_keccak_multi",
+        "test_commit_split",
+    ] {
+        let (program, logs) = run(name);
+        let reference = {
+            let mut builder =
+                formats(WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder"))
+                    .expect("the formats");
+            let body = logs.len() - 1;
+            let cut = body - body % 7;
+            let mut chunks = Vec::new();
+            for w in logs[..cut].chunks(7) {
+                chunks.extend(builder.push(w).expect("a window"));
+            }
+            let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+            traces.insert_streamed(chunks).expect("placeholders");
+            traces
+        };
+        assert!(
+            name != "fused_mem_cases" || reference.fused_counts().iter().all(|&n| n > 0),
+            "{name}: {:?}",
+            reference.fused_counts()
+        );
+        for window in [7, 33] {
+            for walkers in [1, 2, 3] {
+                for light in [0u8, 2] {
+                    let traces =
+                        walked_on_threads_as(&program, &max_rows, window, walkers, None, &|b| {
+                            formats(b)?.light_walk(light)
+                        })
+                        .unwrap_or_else(|e| {
+                            panic!("{name}, window {window}, {walkers} walkers: {e:?}")
+                        });
+                    same_traces(&reference, &traces);
+                }
             }
         }
     }

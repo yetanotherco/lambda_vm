@@ -165,13 +165,6 @@ fn aligned_rows(tables: &[Table]) -> Vec<AlignedRow> {
     rows
 }
 
-/// A fused build: the split tables less the rows the fused ones replace.
-pub(crate) struct Fused {
-    pub(crate) traces: Traces,
-    pub(crate) mem_loads: Vec<Table>,
-    pub(crate) mem_stores: Vec<Table>,
-}
-
 /// What [`fuse`] joined: each fused row with the LOAD (STORE) op and the
 /// MEMW_A row it replaces.
 #[derive(Default)]
@@ -182,7 +175,7 @@ struct Joined {
 
 /// `traces` (a split build) with each CPU load or store that MEMW_A answered
 /// as one fused row: the honest fused build.
-fn fuse(mut traces: Traces) -> (Fused, Joined) {
+fn fuse(mut traces: Traces) -> (Traces, Joined) {
     let loads = load_ops(&traces.loads);
     let stores = store_ops(&traces.stores);
     let aligned = aligned_rows(&traces.memw_aligneds);
@@ -267,22 +260,19 @@ fn fuse(mut traces: Traces) -> (Fused, Joined) {
     )];
     let fused_loads: Vec<MemLoadRow> = joined.loads.iter().map(|j| j.0).collect();
     let fused_stores: Vec<MemStoreRow> = joined.stores.iter().map(|j| j.0).collect();
-    let fused = Fused {
-        traces,
-        mem_loads: vec![mem_load::generate_mem_load_trace_segments_as(
-            &[&fused_loads],
-            TraceForm::Wide,
-        )],
-        mem_stores: vec![mem_store::generate_mem_store_trace_segments_as(
-            &[&fused_stores],
-            TraceForm::Wide,
-        )],
-    };
-    (fused, joined)
+    traces.mem_loads = vec![mem_load::generate_mem_load_trace_segments_as(
+        &[&fused_loads],
+        TraceForm::Wide,
+    )];
+    traces.mem_stores = vec![mem_store::generate_mem_store_trace_segments_as(
+        &[&fused_stores],
+        TraceForm::Wide,
+    )];
+    (traces, joined)
 }
 
 /// The honest fused build of `logs`' run of `program`.
-fn fused_build(program: &Elf, logs: &[Log]) -> (Fused, Joined) {
+fn fused_build(program: &Elf, logs: &[Log]) -> (Traces, Joined) {
     fuse(split_build(program, logs))
 }
 
@@ -347,30 +337,32 @@ type Over<'a> = &'a dyn Fn(&str) -> Option<Vec<BusInteraction>>;
 /// The nets of `build` under the block's AIRs at the fused format (a table's
 /// interactions from `over` where it names the table), REGISTER's files the
 /// verifier's.
-fn left(program: &Elf, build: &mut Fused, over: Over<'_>) -> Left {
-    use crate::test_utils::{
-        create_mem_load_air, create_mem_store_air, create_memw_aligned_air_for,
-        halted_register_commitment,
-    };
-    with_verifier_files(program, &mut build.traces);
+fn left(program: &Elf, build: &mut Traces, over: Over<'_>) -> Left {
+    left_with(program, build, over, false)
+}
+
+/// [`left`], or with `exact` BITWISE's multiplicities read as the build
+/// counted them on every bus: then a check left over at all is unanswered
+/// (the build's collectors are what is read).
+fn left_with(program: &Elf, build: &mut Traces, over: Over<'_>, exact: bool) -> Left {
+    use crate::test_utils::{create_memw_aligned_air_for, halted_register_commitment};
+    with_verifier_files(program, build);
     let options = ProofOptions::default_test_options();
-    let traces = &mut build.traces;
-    let heights = crate::cpu_heights_from_traces(traces);
+    let heights = crate::cpu_heights_from_traces(build);
     let mut airs = crate::VmAirs::new(
         program,
         &options,
         false,
-        &traces.page_configs,
-        &traces.table_counts(),
+        &build.page_configs,
+        &build.table_counts(),
         &heights,
         None,
         true,
         None,
-        halted_register_commitment(&options, program, &traces.public_output_bytes).preprocessed(),
+        halted_register_commitment(&options, program, &build.public_output_bytes).preprocessed(),
     );
-    let inputs =
-        crate::BlockAirInputs::new(&options, program, heights, &traces.public_output_bytes)
-            .expect("the block's inputs");
+    let inputs = crate::BlockAirInputs::new(&options, program, heights, &build.public_output_bytes)
+        .expect("the block's inputs");
     airs.swap_in_row_registers(&options, &inputs);
     airs.memw_aligneds = (0..airs.memw_aligneds.len())
         .map(|i| {
@@ -380,16 +372,16 @@ fn left(program: &Elf, build: &mut Fused, over: Over<'_>) -> Left {
             ) as VmAir
         })
         .collect();
-    let mem_load_air = create_mem_load_air(&options);
-    let mem_store_air = create_mem_store_air(&options);
+    airs.with_fused_memory(&options, build.fused_counts());
 
     let checks: Vec<u64> = CHECKS.iter().map(|b| u64::from(*b)).collect();
     let outside: Vec<u64> = OUTSIDE.iter().map(|b| u64::from(*b)).collect();
     let mut net: HashMap<(u64, Vec<u64>), FE> = HashMap::new();
-    let mut add = |name: &str, interactions: &[BusInteraction], trace: &Table| {
-        let bitwise = name == "BITWISE";
+    for (air, trace, _) in airs.air_trace_pairs(build) {
+        let name = air.name();
+        let bitwise = name == "BITWISE" && !exact;
         let owned = over(name);
-        let interactions = owned.as_deref().unwrap_or(interactions);
+        let interactions = owned.as_deref().unwrap_or(air.bus_interactions());
         for row in 0..trace.num_rows() {
             let g = |c: usize| *trace.get_main(row, c);
             for bi in interactions {
@@ -410,23 +402,6 @@ fn left(program: &Elf, build: &mut Fused, over: Over<'_>) -> Left {
                 *e = if bi.is_sender { *e + m } else { *e - m };
             }
         }
-    };
-    for (air, trace, _) in airs.air_trace_pairs(traces) {
-        add(air.name(), air.bus_interactions(), trace);
-    }
-    for (i, t) in build.mem_loads.iter().enumerate() {
-        add(
-            &format!("MEM_LOAD[{i}]"),
-            stark::traits::AIR::bus_interactions(&mem_load_air),
-            t,
-        );
-    }
-    for (i, t) in build.mem_stores.iter().enumerate() {
-        add(
-            &format!("MEM_STORE[{i}]"),
-            stark::traits::AIR::bus_interactions(&mem_store_air),
-            t,
-        );
     }
     let mut out = Left::default();
     for ((bus, tuple), v) in net {
@@ -435,7 +410,7 @@ fn left(program: &Elf, build: &mut Fused, over: Over<'_>) -> Left {
         }
         if checks.contains(&bus) {
             let id = BusId::try_from(bus).expect("a bus id");
-            if !answered(id, &tuple) {
+            if exact || !answered(id, &tuple) {
                 out.unanswered.push((bus, tuple));
             }
         } else {
@@ -481,7 +456,7 @@ fn row_of(t: &Table, r: usize) -> Vec<FE> {
 
 /// Every `(table, row, constraint)` of the fused tables that does not read
 /// zero.
-fn broken(build: &Fused) -> Vec<(&'static str, usize, usize, usize)> {
+fn broken(build: &Traces) -> Vec<(&'static str, usize, usize, usize)> {
     let mut out = Vec::new();
     for (i, t) in build.mem_loads.iter().enumerate() {
         for r in 0..t.num_rows() {
@@ -509,7 +484,7 @@ fn broken(build: &Fused) -> Vec<(&'static str, usize, usize, usize)> {
 /// The honest fused build of `name`: every inner bus balances and every
 /// fused row's constraints read zero (the control each forgery is read
 /// against).
-fn honest(name: &str) -> (Elf, Vec<Log>, Fused) {
+fn honest(name: &str) -> (Elf, Vec<Log>, Traces) {
     let (program, logs) = run(name);
     let (mut build, _) = fused_build(&program, &logs);
     let control = left(&program, &mut build, &|_| None);
@@ -525,7 +500,7 @@ fn honest(name: &str) -> (Elf, Vec<Log>, Fused) {
 // ---- finding rows -----------------------------------------------------------------------------------------------------
 
 /// The MEM_LOAD rows of `build` (table, row) for which `matches` holds.
-fn load_rows(build: &Fused, matches: impl Fn(&Table, usize) -> bool) -> Vec<(usize, usize)> {
+fn load_rows(build: &Traces, matches: impl Fn(&Table, usize) -> bool) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for (i, t) in build.mem_loads.iter().enumerate() {
         for r in (0..t.num_rows()).filter(|&r| get(t, r, ml::MU) == 1 && matches(t, r)) {
@@ -536,7 +511,7 @@ fn load_rows(build: &Fused, matches: impl Fn(&Table, usize) -> bool) -> Vec<(usi
 }
 
 /// The MEM_STORE rows of `build` (table, row) for which `matches` holds.
-fn store_rows(build: &Fused, matches: impl Fn(&Table, usize) -> bool) -> Vec<(usize, usize)> {
+fn store_rows(build: &Traces, matches: impl Fn(&Table, usize) -> bool) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for (i, t) in build.mem_stores.iter().enumerate() {
         for r in (0..t.num_rows()).filter(|&r| get(t, r, ms::MU) == 1 && matches(t, r)) {
@@ -563,9 +538,9 @@ fn cycle_of(ts: u64) -> usize {
 }
 
 /// The row of `build`'s PAGE tables that holds `address`: (table, row).
-fn page_row(build: &Fused, address: u64) -> (usize, usize) {
-    for (i, config) in build.traces.page_configs.iter().enumerate() {
-        let rows = build.traces.pages[i].num_rows() as u64;
+fn page_row(build: &Traces, address: u64) -> (usize, usize) {
+    for (i, config) in build.page_configs.iter().enumerate() {
+        let rows = build.pages[i].num_rows() as u64;
         if let Some(offset) = address.checked_sub(config.page_base)
             && offset < rows
         {
@@ -687,12 +662,12 @@ fn the_honest_fused_builds_balance_every_bus() {
         let fused_loads = joined.loads.len();
         let fused_stores = joined.stores.len();
         assert_eq!(
-            load_ops(&build.traces.loads).len() + fused_loads,
+            load_ops(&build.loads).len() + fused_loads,
             loads,
             "{name}: every load is LOAD's or fused"
         );
         assert_eq!(
-            store_ops(&build.traces.stores).len() + fused_stores,
+            store_ops(&build.stores).len() + fused_stores,
             stores,
             "{name}: every store is STORE's or fused"
         );
@@ -701,11 +676,11 @@ fn the_honest_fused_builds_balance_every_bus() {
         assert!(broken(&build).is_empty(), "{name}: {:?}", broken(&build));
         if name == "fused_mem_cases" {
             // Unaligned: lw 2, lhu 3, ld 1; mixed: ld 32. sh 9, sd 17.
-            let rest_loads: Vec<(u64, u8)> = load_ops(&build.traces.loads)
+            let rest_loads: Vec<(u64, u8)> = load_ops(&build.loads)
                 .iter()
                 .map(|op| (op.base_address & 0x3F, op.width))
                 .collect();
-            let rest_stores: Vec<(u64, u8)> = store_ops(&build.traces.stores)
+            let rest_stores: Vec<(u64, u8)> = store_ops(&build.stores)
                 .iter()
                 .map(|op| {
                     let w = if op.write8 {
@@ -910,13 +885,13 @@ fn over_mem_store(list: Vec<BusInteraction>) -> impl Fn(&str) -> Option<Vec<BusI
 
 /// A program's run with the load at the CPU timestamp `ts` claiming `value`:
 /// the malicious prover's execution, whose fused build the tests then edit.
-fn claimed(program: &Elf, mut logs: Vec<Log>, ts: u64, value: u64) -> (Fused, Joined) {
+fn claimed(program: &Elf, mut logs: Vec<Log>, ts: u64, value: u64) -> (Traces, Joined) {
     logs[cycle_of(ts)].dst_val = value;
     fused_build(program, &logs)
 }
 
 /// The claimed load at `ts` of `build`: its (table, row).
-fn claimed_row(build: &Fused, ts: u64) -> (usize, usize) {
+fn claimed_row(build: &Traces, ts: u64) -> (usize, usize) {
     one(
         load_rows(build, |t, r| get(t, r, ml::TIMESTAMP_0) == ts),
         "the claimed load",
@@ -925,7 +900,7 @@ fn claimed_row(build: &Fused, ts: u64) -> (usize, usize) {
 
 /// The honest fused load of `fused_mem_cases` that `matches`, and its
 /// timestamp.
-fn load_at(honest: &Fused, what: &str, matches: impl Fn(&Table, usize) -> bool) -> u64 {
+fn load_at(honest: &Traces, what: &str, matches: impl Fn(&Table, usize) -> bool) -> u64 {
     let (i, r) = one(load_rows(honest, matches), what);
     get(&honest.mem_loads[i], r, ml::TIMESTAMP_0)
 }
@@ -1137,8 +1112,8 @@ fn a_read_consuming_its_own_token_is_refused_by_each_limbs_check() {
         set(&mut build.mem_loads[i], r, ml::STEP_0, steps.0);
         set(&mut build.mem_loads[i], r, ml::STEP_1, steps.1);
         let (page, row) = page_row(&build, address);
-        set(&mut build.traces.pages[page], row, pg::FINI, 7);
-        set(&mut build.traces.pages[page], row, pg::TIMESTAMP_LO, sb_ts);
+        set(&mut build.pages[page], row, pg::FINI, 7);
+        set(&mut build.pages[page], row, pg::TIMESTAMP_LO, sb_ts);
         let forged = left(&program, &mut build, &|_| None);
         assert!(forged.buses.is_empty(), "limb {limb}: {forged}");
         assert_eq!(
@@ -1557,10 +1532,9 @@ fn each_fused_constraint_refuses_its_violating_rows() {
 }
 
 /// ★ The memory format is a verifier constant: the block's production and
-/// pinned formats are split, and a block under the fused format is refused by
-/// its prover's and its verifier's first check until the block builds it.
+/// pinned formats are split, and the fused format needs MEMW_A's limbs.
 #[test]
-fn the_block_formats_are_split_and_the_fused_format_is_refused() {
+fn the_block_formats_are_split_and_the_fused_format_needs_the_limbs() {
     use crate::block_whir::{BlockFormat, check_memory_format};
     use crate::tables::fused_memory::MemoryFormat;
     assert_eq!(BlockFormat::production().memory, MemoryFormat::Split);
@@ -1569,7 +1543,9 @@ fn the_block_formats_are_split_and_the_fused_format_is_refused() {
     assert!(check_memory_format(&BlockFormat::pinned()).is_ok());
     let fused = BlockFormat::pinned().with_memory(MemoryFormat::Fused);
     assert_eq!(fused.memory, MemoryFormat::Fused);
-    assert!(check_memory_format(&fused).is_err());
+    assert!(check_memory_format(&fused).is_ok());
+    let lt = fused.with_memw_aligned(MemwAlignedOrder::Lt);
+    assert!(check_memory_format(&lt).is_err());
 }
 
 /// ★ What a fused row counts into BITWISE is what its row checks. On every
@@ -1659,5 +1635,211 @@ fn a_fused_rows_lookup_count_is_its_rows_checks() {
         counted.digest(),
         sent.digest(),
         "the counts are the rows' checks"
+    );
+}
+
+/// The walk's fused build of `program`'s run: windows of `window` cycles,
+/// tables of `max_rows`, the block's production register format and MEMW_A
+/// order and the fused memory format, the streamed ops dropped or kept.
+fn walk_fused(
+    program: &Elf,
+    logs: &[Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    dropped: bool,
+) -> Traces {
+    use crate::tables::fused_memory::MemoryFormat;
+    windowed(program, logs, max_rows, window, &|b| {
+        let b = b
+            .register_format(RegisterFormat::InRow)
+            .expect("before any window")
+            .memw_aligned_order(MemwAlignedOrder::Limbs)
+            .expect("before any window")
+            .memory_format(MemoryFormat::Fused)
+            .expect("before any window");
+        if dropped {
+            b.drop_streamed_ops().expect("before any window")
+        } else {
+            b
+        }
+    })
+}
+
+/// The active rows of `tables` (the rows whose `mu` columns sum to nonzero),
+/// every column, in order.
+fn active_rows(tables: &[Table], mu: &[usize]) -> Vec<Vec<u64>> {
+    let mut out = Vec::new();
+    for t in tables {
+        for r in 0..t.num_rows() {
+            if mu.iter().map(|&c| get(t, r, c)).sum::<u64>() != 0 {
+                out.push(row_of(t, r).iter().map(FE::canonical_u64).collect());
+            }
+        }
+    }
+    out
+}
+
+/// ★ The walk makes the fused tables the conversion makes. On every program,
+/// at small chunks and at chunks of 4 rows, windows of 7 and of 1000 cycles,
+/// the streamed ops kept or dropped, the walk's fused build holds, row for
+/// row and in order, the MEM_LOAD, MEM_STORE, LOAD, STORE and MEMW_A rows of
+/// the split build's conversion ([`fuse`]); every inner bus balances with
+/// BITWISE's multiplicities as the build counted them (its collectors count
+/// each fused row's checks); and every load and store of the run is a LOAD,
+/// STORE or fused row, once.
+#[test]
+fn the_walk_makes_the_fused_tables_the_conversion_makes() {
+    let mut failed = Vec::new();
+    let mut fused_rows = 0usize;
+    for (sizes, max_rows) in [
+        ("small", MaxRowsConfig::small()),
+        ("2^2", MaxRowsConfig::uniform(4)),
+    ] {
+        for name in PROGRAMS {
+            let (program, logs) = run(name);
+            let split = windowed(&program, &logs, &max_rows, 1000, &|b| {
+                b.register_format(RegisterFormat::InRow)
+                    .expect("before any window")
+                    .memw_aligned_order(MemwAlignedOrder::Limbs)
+                    .expect("before any window")
+            });
+            let (loads, stores) = (load_ops(&split.loads).len(), store_ops(&split.stores).len());
+            let (want, _) = fuse(split);
+            for window in [7, 1000] {
+                for dropped in [false, true] {
+                    let what = format!("{name} {sizes} window {window} dropped {dropped}");
+                    let mut got = walk_fused(&program, &logs, &max_rows, window, dropped);
+                    for (family, a, b, mu) in [
+                        ("MEM_LOAD", &got.mem_loads, &want.mem_loads, vec![ml::MU]),
+                        ("MEM_STORE", &got.mem_stores, &want.mem_stores, vec![ms::MU]),
+                        ("LOAD", &got.loads, &want.loads, vec![ld::MU]),
+                        ("STORE", &got.stores, &want.stores, vec![st::MU]),
+                        (
+                            "MEMW_A",
+                            &got.memw_aligneds,
+                            &want.memw_aligneds,
+                            vec![ma::MU_READ, ma::MU_WRITE],
+                        ),
+                    ] {
+                        if active_rows(a, &mu) != active_rows(b, &mu) {
+                            failed.push(format!("{what}: {family}'s rows differ"));
+                        }
+                    }
+                    let (l, s) = (
+                        active_rows(&got.mem_loads, &[ml::MU]).len(),
+                        active_rows(&got.mem_stores, &[ms::MU]).len(),
+                    );
+                    if load_ops(&got.loads).len() + l != loads
+                        || store_ops(&got.stores).len() + s != stores
+                    {
+                        failed.push(format!("{what}: an access lost or doubled"));
+                    }
+                    fused_rows += l + s;
+                    let left = left_with(&program, &mut got, &|_| None, true);
+                    if !left.accepted() {
+                        failed.push(format!("{what}: {left}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+    assert!(fused_rows > 0);
+}
+
+/// ★ The verifier's frame of a fused statement, with no proof: the statement
+/// a fused build states (its tables' heights in AIR order, the fused pair) is
+/// framed under the fused format, the fused tables right after STORE's; a
+/// pair one off either way, the same statement under the split format, and a
+/// fused table past the block's chunk are each refused.
+#[cfg(feature = "parallel")]
+#[test]
+fn the_verifier_frames_a_fused_statement_and_refuses_its_forgeries() {
+    use crate::block_whir::{BLOCK_FUSED_MAX_VARS, BlockFormat, OwnedBlockStatement, block_frame};
+    use crate::tables::fused_memory::MemoryFormat;
+    let (program, logs) = run("fused_mem_cases");
+    let elf = crate::test_utils::asm_elf_bytes("fused_mem_cases");
+    let mut build = walk_fused(&program, &logs, &MaxRowsConfig::small(), 1000, true);
+    let options = ProofOptions::default_test_options();
+    let heights = crate::cpu_heights_from_traces(&build);
+    let inputs =
+        crate::BlockAirInputs::new(&options, &program, heights, &build.public_output_bytes)
+            .expect("the block's inputs");
+    let format = BlockFormat::pinned().with_memory(MemoryFormat::Fused);
+    let mut airs = crate::block_airs(
+        &program,
+        &options,
+        &build.page_configs,
+        &build.table_counts(),
+        &inputs,
+        format.keccak_rnd,
+        format.memw_aligned,
+        format.registers,
+    );
+    let fused = build.fused_counts();
+    airs.with_fused_memory(&options, fused);
+    let pairs = airs.air_trace_pairs(&mut build);
+    let names: Vec<String> = pairs
+        .iter()
+        .map(|(air, _, _)| air.name().to_string())
+        .collect();
+    let table_num_vars: Vec<u8> = pairs
+        .iter()
+        .map(|(_, trace, _)| trace.num_rows().trailing_zeros() as u8)
+        .collect();
+    drop(pairs);
+    // The fused tables sit right after STORE's.
+    let last_store = names
+        .iter()
+        .rposition(|n| n.starts_with("STORE["))
+        .expect("STORE");
+    let first_fused = names
+        .iter()
+        .position(|n| n.starts_with("MEM_LOAD["))
+        .expect("MEM_LOAD");
+    assert_eq!(first_fused, last_store + 1, "{names:?}");
+    let statement = OwnedBlockStatement {
+        table_num_vars: table_num_vars.clone(),
+        runtime_page_ranges: build.runtime_page_ranges(),
+        table_counts: build.table_counts(),
+        public_output: build.public_output_bytes.clone(),
+        num_private_input_pages: 0,
+        groups: (0..table_num_vars.len() as u32).map(|t| vec![t]).collect(),
+        fused_memory: fused.map(|n| n as u64),
+    };
+    assert!(fused[0] > 0 && fused[1] > 0, "{fused:?}");
+    let frame = |s: &OwnedBlockStatement, f: &BlockFormat| block_frame(s.view(), &elf, &options, f);
+    assert!(
+        frame(&statement, &format).is_ok(),
+        "the honest statement frames"
+    );
+    for pair in [
+        [fused[0] as u64 + 1, fused[1] as u64],
+        [fused[0] as u64, fused[1] as u64 - 1],
+    ] {
+        let off = OwnedBlockStatement {
+            fused_memory: pair,
+            ..statement.clone()
+        };
+        assert!(frame(&off, &format).is_err(), "{pair:?} refused");
+    }
+    let split = BlockFormat::pinned();
+    assert!(
+        frame(&statement, &split).is_err(),
+        "the split format refuses a fused pair"
+    );
+    let unstated = OwnedBlockStatement {
+        fused_memory: [0, 0],
+        ..statement.clone()
+    };
+    assert!(
+        frame(&unstated, &split).is_err(),
+        "the split format has no slot for them"
+    );
+    let mut tall = statement.clone();
+    tall.table_num_vars[first_fused] = BLOCK_FUSED_MAX_VARS as u8 + 1;
+    assert!(
+        frame(&tall, &format).is_err(),
+        "a fused table past the chunk"
     );
 }

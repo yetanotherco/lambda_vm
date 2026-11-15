@@ -30,17 +30,13 @@
 //! flags' sum a bit, the sum ⇒ `MU`. They are MEMW_A's eight too, a store
 //! row's `μ_write` being `MU` and its `μ_read` 0.
 
-// No walk routes an access to the fused tables yet: until one does, only the
-// tests reach the records, the fills and the lookup counts.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
 use super::bitwise::{BitwiseHistogram, BitwiseOperation, BitwiseOperationType};
 use super::fused_memory::{
-    CheckColumns, count_memory_check_into, fused_step, memory_check_interactions, step_limbs,
+    CheckColumns, fused_step, memory_check_interactions, memory_check_lookups, step_limbs,
     width_flags,
 };
 use super::gpack::{TraceForm, WidthHint, generate_main};
@@ -138,6 +134,34 @@ impl MemStoreRow {
         })
     }
 
+    /// The row's BITWISE lookups: the four `ARE_BYTES` pairs of the value's
+    /// bytes, then the span's and the two limbs' `IS_HALF`.
+    #[inline]
+    pub(crate) fn bitwise_ops(&self) -> impl Iterator<Item = BitwiseOperation> {
+        let bytes = self.value.to_le_bytes();
+        (0..4)
+            .map(move |j| {
+                BitwiseOperation::byte_op(
+                    BitwiseOperationType::AreBytes,
+                    bytes[2 * j],
+                    bytes[2 * j + 1],
+                )
+            })
+            .chain(memory_check_lookups(self.address, self.width, self.step))
+    }
+
+    /// [`Self::bitwise_ops`] counted into `histogram`.
+    #[inline]
+    pub(crate) fn count_bitwise_into(&self, histogram: &mut BitwiseHistogram) {
+        for op in self.bitwise_ops() {
+            histogram.bump(op);
+        }
+    }
+}
+
+/// The record's fields, for the tests that read a walk's rows back.
+#[cfg(test)]
+impl MemStoreRow {
     #[inline]
     pub(crate) fn address(&self) -> u64 {
         self.address
@@ -173,22 +197,6 @@ impl MemStoreRow {
     #[inline]
     pub(crate) fn step(&self) -> u32 {
         self.step
-    }
-
-    /// The row's BITWISE lookups counted into `histogram`: the four
-    /// `ARE_BYTES` pairs of the value's bytes, the span's and the two limbs'
-    /// `IS_HALF`.
-    #[inline]
-    pub(crate) fn count_bitwise_into(&self, histogram: &mut BitwiseHistogram) {
-        let bytes = self.value.to_le_bytes();
-        for pair in bytes.chunks_exact(2) {
-            histogram.bump(BitwiseOperation::byte_op(
-                BitwiseOperationType::AreBytes,
-                pair[0],
-                pair[1],
-            ));
-        }
-        count_memory_check_into(self.address, self.width, self.step, histogram);
     }
 }
 

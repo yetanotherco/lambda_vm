@@ -4297,6 +4297,7 @@ fn front_draws_the_hosts_challenges(elf: &[u8], proof: &BlockWhirProof, format: 
         &elf,
         &proof.public_output,
         &proof.table_counts,
+        &[],
         proof.num_private_input_pages,
         &proof.runtime_page_ranges,
         &proof.table_num_vars,

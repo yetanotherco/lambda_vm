@@ -120,9 +120,9 @@ pub(super) enum CountWork {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CountThreadStamps {
     /// Counting, per streamed table in [`StreamTable::ALL`] order.
-    pub busy: [f64; 9],
+    pub busy: [f64; 11],
     /// The chunks counted, per streamed table.
-    pub chunks: [usize; 9],
+    pub chunks: [usize; 11],
     /// Waiting for a chunk.
     pub idle: f64,
     /// The builder's wait, once the windows were walked, for the chunks the

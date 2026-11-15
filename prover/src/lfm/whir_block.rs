@@ -893,9 +893,15 @@ impl WhirBlockPlan {
             .map_err(|e| format!("statement: {e:?}"))?;
         let elf_digest = crate::statement::elf_digest(elf_bytes);
         let tag = crate::block_whir::block_statement_tag(base);
-        let statement_bytes = block_statement_bytes(statement, &tag, &elf_digest, &frame.config);
-        let statement_calls =
-            crate::block_whir::block_statement_calls(statement, &tag, elf_bytes, &frame.config)?;
+        let statement_bytes =
+            block_statement_bytes(statement, &tag, &elf_digest, &frame.config, format.memory);
+        let statement_calls = crate::block_whir::block_statement_calls(
+            statement,
+            &tag,
+            elf_bytes,
+            &frame.config,
+            format.memory,
+        )?;
         let groups: Vec<Vec<usize>> = statement
             .groups
             .iter()

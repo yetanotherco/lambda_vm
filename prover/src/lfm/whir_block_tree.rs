@@ -23,6 +23,7 @@
 use multilinear::whir_chain::{ArgueFormat, GkrPack, GroupFold, LeafOrder, Round0Trees};
 
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
+use crate::tables::fused_memory::MemoryFormat;
 use crate::tables::keccak_rnd::KeccakRndForm;
 use crate::tables::memw_aligned::MemwAlignedOrder;
 use crate::tables::register::RegisterFormat;
@@ -449,6 +450,21 @@ pub fn registers_setting(knob: Option<&str>) -> Result<RegisterFormat, String> {
     }
 }
 
+/// `BLOCK_WHIR_MEMORY`'s reading: unset is the pinned preset's format
+/// ([`BlockFormat::pinned`], the CPU's loads and stores split); `fused` names
+/// the format that checks an aligned access in one row with its memory tokens
+/// ([`MemoryFormat`]). A format value: the prover and the verifier of one
+/// proof take the same one. Only the base proves it (`prove-block-base`): the
+/// tree refuses it.
+pub fn memory_setting(knob: Option<&str>) -> Result<MemoryFormat, String> {
+    match knob.map(str::trim) {
+        None => Ok(BlockFormat::pinned().memory),
+        Some("split") => Ok(MemoryFormat::Split),
+        Some("fused") => Ok(MemoryFormat::Fused),
+        Some(v) => Err(format!("BLOCK_WHIR_MEMORY={v}: split or fused")),
+    }
+}
+
 /// `argue` with its trees laid out per `pack`: only the batched argue has
 /// trees to pack.
 fn with_pack(argue: ArgueFormat, pack: GkrPack) -> Result<ArgueFormat, String> {
@@ -518,6 +534,7 @@ impl WhirTreeConfig {
             keccak_rnd: keccak_rnd_setting(std::env::var("BLOCK_WHIR_KECCAK_RND").ok().as_deref())?,
             memw_aligned: memw_aligned_setting(std::env::var("BLOCK_WHIR_MEMW_A").ok().as_deref())?,
             registers: registers_setting(std::env::var("BLOCK_WHIR_REGISTERS").ok().as_deref())?,
+            memory: memory_setting(std::env::var("BLOCK_WHIR_MEMORY").ok().as_deref())?,
             ..BlockFormat::production_with(group_setting(
                 std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
             )?)
@@ -544,6 +561,14 @@ impl WhirTreeConfig {
             match format.registers {
                 RegisterFormat::Tokens32 => "tokens32",
                 RegisterFormat::InRow => "in-row",
+            }
+        );
+        eprintln!(
+            "★ BLOCK MEMORY: {} (BLOCK_WHIR_MEMORY; fused checks an aligned load or store in one \
+             row with its memory tokens)",
+            match format.memory {
+                MemoryFormat::Split => "split",
+                MemoryFormat::Fused => "fused",
             }
         );
         let mut options = BlockOptions::production();
@@ -628,6 +653,7 @@ impl WhirTreeConfig {
             && self.format.keccak_rnd == BlockFormat::pinned().keccak_rnd
             && self.format.memw_aligned == BlockFormat::pinned().memw_aligned
             && self.format.registers == BlockFormat::pinned().registers
+            && self.format.memory == BlockFormat::pinned().memory
     }
 }
 
@@ -2618,6 +2644,14 @@ pub fn prove_whir_block_tree(
     // recursion (`crate::base_only`): both refused before anything is proved.
     crate::base_only::refuse_recursion()?;
     block_whir::checked_base(&format.zf.base).map_err(|e| format!("{e:?}"))?;
+    // The tree's leaves and its proof file carry the split memory format's
+    // statement alone.
+    if format.memory != MemoryFormat::Split {
+        return Err(format!(
+            "the block tree recurses over the split memory format alone, not {:?}",
+            format.memory
+        ));
+    }
     sink.line(&posture_line());
     sink.line(&base_line(&format.zf.base));
     sink.line(&format!("W3 ARGUE: {argue:?}"));
@@ -3839,6 +3873,8 @@ impl WhirBlockTreeProof {
             public_output: &self.public_output,
             num_private_input_pages: self.num_private_input_pages,
             groups: &self.groups,
+            // The tree recurses over the split memory format alone.
+            fused_memory: [0, 0],
         }
     }
 
@@ -4384,6 +4420,8 @@ impl WhirBlockCompressedProof {
             public_output: &self.public_output,
             num_private_input_pages: self.num_private_input_pages,
             groups: &self.groups,
+            // The tree recurses over the split memory format alone.
+            fused_memory: [0, 0],
         }
     }
 
@@ -5178,6 +5216,7 @@ mod tests {
             public_output: vec![1, 2, 3, 4, 5],
             num_private_input_pages: 2,
             groups: vec![vec![0, 2], vec![1]],
+            fused_memory: [0, 0],
         };
         let words: Vec<(u32, LfmWord)> = (0..3u32)
             .map(|i| (i, [crate::tables::types::FE::from(u64::from(i) + 7); 4]))

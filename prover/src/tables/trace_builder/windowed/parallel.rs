@@ -125,6 +125,8 @@ struct WalkSettings {
     order: crate::tables::memw_aligned::MemwAlignedOrder,
     /// The run's register format ([`WindowedTraceBuilder::register_format`]).
     registers: crate::tables::register::RegisterFormat,
+    /// The run's memory format ([`WindowedTraceBuilder::memory_format`]).
+    memory_format: crate::tables::fused_memory::MemoryFormat,
     lookups: bool,
     batch: usize,
     /// [`WindowedTraceBuilder::defer_ecrec_witnesses`].
@@ -270,6 +272,7 @@ impl WindowWalker {
             &s.decode,
             s.order,
             s.registers,
+            s.memory_format,
             s.lookups,
             s.batch,
             s.defer_ecrec,
@@ -327,6 +330,7 @@ impl WindowWalker {
             &s.decode,
             s.order,
             s.registers,
+            s.memory_format,
             s.lookups,
             s.batch,
             s.defer_ecrec,
@@ -660,6 +664,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         decode: Arc::clone(&builder.decode),
         order: builder.emitted.memw_aligned_order,
         registers: builder.emitted.register_format,
+        memory_format: builder.emitted.memory_format,
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
         defer_ecrec: builder.defer_ecrec,

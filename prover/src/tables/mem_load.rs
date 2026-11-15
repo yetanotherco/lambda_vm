@@ -29,17 +29,13 @@
 //! the sum ⇒ `MU`, the seven extension constraints, `MU` a bit. They are
 //! MEMW_A's eight too, a load row's `μ_read` being `MU` and its `μ_write` 0.
 
-// No walk routes an access to the fused tables yet: until one does, only the
-// tests reach the records, the fills and the lookup counts.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
 use super::bitwise::{BitwiseHistogram, BitwiseOperation, BitwiseOperationType};
 use super::fused_memory::{
-    CheckColumns, count_memory_check_into, fused_step, memory_check_interactions, step_limbs,
+    CheckColumns, fused_step, memory_check_interactions, memory_check_lookups, step_limbs,
     width_flags,
 };
 use super::gpack::{TraceForm, WidthHint, generate_main};
@@ -138,6 +134,38 @@ impl MemLoadRow {
         })
     }
 
+    /// The sign bit: the most significant bit of the highest byte read.
+    #[inline]
+    fn sign_bit(&self) -> bool {
+        self.res[usize::from(self.width.max(1)) - 1] >> 7 == 1
+    }
+
+    /// The row's BITWISE lookups: the sign bit's `MSB8` of a load narrower
+    /// than 8 bytes (LOAD's), then the span's and the two limbs' `IS_HALF`.
+    #[inline]
+    pub(crate) fn bitwise_ops(&self) -> impl Iterator<Item = BitwiseOperation> {
+        let sign = (self.width < 8).then(|| {
+            BitwiseOperation::single_byte(
+                BitwiseOperationType::Msb8,
+                self.res[usize::from(self.width.max(1)) - 1],
+            )
+        });
+        sign.into_iter()
+            .chain(memory_check_lookups(self.address, self.width, self.step))
+    }
+
+    /// [`Self::bitwise_ops`] counted into `histogram`.
+    #[inline]
+    pub(crate) fn count_bitwise_into(&self, histogram: &mut BitwiseHistogram) {
+        for op in self.bitwise_ops() {
+            histogram.bump(op);
+        }
+    }
+}
+
+/// The record's fields, for the tests that read a walk's rows back.
+#[cfg(test)]
+impl MemLoadRow {
     #[inline]
     pub(crate) fn address(&self) -> u64 {
         self.address
@@ -173,26 +201,6 @@ impl MemLoadRow {
     #[inline]
     pub(crate) fn step(&self) -> u32 {
         self.step
-    }
-
-    /// The sign bit: the most significant bit of the highest byte read.
-    #[inline]
-    fn sign_bit(&self) -> bool {
-        self.res[usize::from(self.width.max(1)) - 1] >> 7 == 1
-    }
-
-    /// The row's BITWISE lookups counted into `histogram`: the sign bit's
-    /// `MSB8` of a load narrower than 8 bytes (LOAD's), the span's and the two
-    /// limbs' `IS_HALF`.
-    #[inline]
-    pub(crate) fn count_bitwise_into(&self, histogram: &mut BitwiseHistogram) {
-        if self.width < 8 {
-            histogram.bump(BitwiseOperation::single_byte(
-                BitwiseOperationType::Msb8,
-                self.res[usize::from(self.width.max(1)) - 1],
-            ));
-        }
-        count_memory_check_into(self.address, self.width, self.step, histogram);
     }
 }
 

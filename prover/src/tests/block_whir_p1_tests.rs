@@ -229,13 +229,14 @@ fn the_statement_calls_are_absorb_blocks_own() {
         .expect("the frame")
         .config;
     let tag = block_statement_tag(&p1.zf.base);
-    let calls = block_whir::block_statement_calls(statement, &tag, &elf, &config)
+    let calls = block_whir::block_statement_calls(statement, &tag, &elf, &config, p1.memory)
         .expect("byte strings only");
     let bytes = block_whir::block_statement_bytes(
         statement,
         &tag,
         &crate::statement::elf_digest(&elf),
         &config,
+        p1.memory,
     );
     assert!(calls.len() > 10, "{} calls", calls.len());
     assert_eq!(calls.concat(), bytes, "the calls are the run, cut");
@@ -246,6 +247,7 @@ fn the_statement_calls_are_absorb_blocks_own() {
         &elf,
         statement.public_output,
         statement.table_counts,
+        &[],
         statement.num_private_input_pages,
         statement.runtime_page_ranges,
         statement.table_num_vars,

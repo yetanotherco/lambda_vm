@@ -244,9 +244,9 @@ fn the_frame_refuses_a_bitwise_table_off_its_fixed_height() {
 
 /// Format knobs a verifier's process could carry, each off the default: the
 /// WHIR blowup, grind bits and folds, the leaves' query check and scale, the
-/// leaves' share form, the GKR packing, the KECCAK_RND and MEMW_A forms and
-/// the register format.
-const OFF_DEFAULT: [(&str, &str); 10] = [
+/// leaves' share form, the GKR packing, the KECCAK_RND and MEMW_A forms, the
+/// register format and the memory format.
+const OFF_DEFAULT: [(&str, &str); 11] = [
     (crate::zf_format::ENV_WHIR_BLOWUP, "4"),
     (crate::zf_format::ENV_WHIR_GRIND_BITS, "20"),
     (crate::zf_format::ENV_WHIR_FOLDS, "uniform4"),
@@ -257,6 +257,7 @@ const OFF_DEFAULT: [(&str, &str); 10] = [
     ("BLOCK_WHIR_KECCAK_RND", "full"),
     ("BLOCK_WHIR_MEMW_A", "lt"),
     ("BLOCK_WHIR_REGISTERS", "tokens32"),
+    ("BLOCK_WHIR_MEMORY", "fused"),
 ];
 
 /// ★ The block verifier reads no format from its environment. In a process of
@@ -349,6 +350,16 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         crate::tables::register::RegisterFormat::InRow,
         "the prover's own production format reads no register knob"
     );
+    assert_eq!(
+        harness.format.memory,
+        crate::tables::fused_memory::MemoryFormat::Fused,
+        "the harness's memory format follows its knob"
+    );
+    assert_eq!(
+        production.memory,
+        crate::tables::fused_memory::MemoryFormat::Split,
+        "the prover's own production format reads no memory knob"
+    );
 
     // The verifier's is not.
     let debug = |o: &ProofOptions| format!("{o:?}");
@@ -376,6 +387,11 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         pinned.format.registers,
         crate::tables::register::RegisterFormat::InRow,
         "the verifier's register format is its named constant, not the environment's"
+    );
+    assert_eq!(
+        pinned.format.memory,
+        crate::tables::fused_memory::MemoryFormat::Split,
+        "the verifier's memory format is its named constant, not the environment's"
     );
     assert!(pinned.share_inverse);
     assert_eq!(
