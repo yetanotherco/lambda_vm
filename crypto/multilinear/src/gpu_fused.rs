@@ -511,6 +511,74 @@ pub fn take_tail() -> TailTimes {
     TAIL.with(|cell| cell.replace(TailTimes::default()))
 }
 
+/// Whether the zerocheck's optional timers are on (`LAMBDA_VM_ZC_KERNEL_TIMES=1`,
+/// measurement only: the messages are the same either way). Never without the
+/// card.
+pub fn zc_kernel_times() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::argue_fused::kernel_times::enabled()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
+/// The process's fused-zerocheck kernel time so far under [`zc_kernel_times`]:
+/// `(class, seconds, launches)` a kernel class, and the launches whose time
+/// could not be read. Empty without the card.
+pub fn zc_kernel_totals() -> (Vec<(&'static str, f64, u64)>, u64) {
+    #[cfg(feature = "cuda")]
+    {
+        use math_cuda::argue_fused::kernel_times;
+        let (totals, lost) = kernel_times::totals();
+        let rows = kernel_times::CLASSES
+            .iter()
+            .zip(totals)
+            .map(|(name, (secs, launches))| (*name, secs, launches))
+            .collect();
+        (rows, lost)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        (Vec::new(), 0)
+    }
+}
+
+/// The fused sessions' set-up on the host under [`zc_kernel_times`], since the
+/// last [`take_setup`] on this thread: the host's preparation (the program
+/// lowered, the bus column's coefficients), the session's allocations and
+/// uploads, and the grid pass's wall time with its read-backs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetupTimes {
+    pub sessions: u32,
+    pub prep: f64,
+    pub session: f64,
+    pub grid: f64,
+    /// The bus column's terms and the lowered program's steps, summed.
+    pub bus_terms: u64,
+    pub steps: u64,
+}
+
+thread_local! {
+    static SETUP: std::cell::Cell<SetupTimes> = std::cell::Cell::new(SetupTimes::default());
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn note_setup(note: impl FnOnce(&mut SetupTimes)) {
+    SETUP.with(|cell| {
+        let mut setup = cell.get();
+        note(&mut setup);
+        cell.set(setup);
+    });
+}
+
+/// The calling thread's [`SetupTimes`] since the last call, reset.
+pub fn take_setup() -> SetupTimes {
+    SETUP.with(|cell| cell.replace(SetupTimes::default()))
+}
+
 // ── the rounds ───────────────────────────────────────────────────────────────
 
 /// The device rounds' result: the messages, the challenges, and every factor
@@ -736,6 +804,8 @@ where
             coeffs: &coeffs,
             constant: raw(bus.constant())?,
         };
+        let timed = zc_kernel_times();
+        let prepared = Instant::now();
         let mut session = match math_cuda::argue_fused::FusedZerocheck::new(
             device,
             program,
@@ -760,6 +830,17 @@ where
         let Ok((t_sums, u_sums, violation)) = session.grid(&points, keep) else {
             return None;
         };
+        if timed {
+            let done = Instant::now();
+            note_setup(|setup| {
+                setup.sessions += 1;
+                setup.prep += prepared.duration_since(started).as_secs_f64();
+                setup.session += tick.duration_since(prepared).as_secs_f64();
+                setup.grid += done.duration_since(tick).as_secs_f64();
+                setup.bus_terms += slots.len() as u64;
+                setup.steps += steps as u64;
+            });
+        }
         if check_corners {
             if let Some(row) = violation
                 && !faults().corners_inert

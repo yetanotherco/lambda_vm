@@ -963,6 +963,13 @@ where
     let lambdas = vec![FieldElement::one(), lambda.clone(), &lambda * &lambda];
     let lambda2 = &lambda * &lambda;
     let started = std::time::Instant::now();
+    // The zerocheck's optional timers (measurement only): the kernel totals
+    // before this argue's zerocheck, and this thread's set-up parts cleared.
+    let zc_timed = multilinear::gpu_fused::zc_kernel_times();
+    let zc_kernels_before = zc_timed.then(multilinear::gpu_fused::zc_kernel_totals);
+    if zc_timed {
+        multilinear::gpu_fused::take_setup();
+    }
     // What each table's fused rounds read, held for as long as the rounds do:
     // the base columns on the card with no lift (`gpu::argue_no_lift`), the
     // lifted factors for a table they cannot read that way (lifted here, as the
@@ -995,6 +1002,7 @@ where
         constraints.push(made);
         columns.push(column);
     }
+    let zc_lowered = started.elapsed().as_secs_f64();
     let device: Vec<Option<Arc<multilinear::gpu::DeviceFactors>>> = tables
         .iter()
         .map(|table| match at {
@@ -1051,6 +1059,40 @@ where
     )?;
     split.zc_rounds += started.elapsed().as_secs_f64();
     let tail = multilinear::gpu_fused::take_tail();
+    let zc_report = zc_kernels_before.map(|(before, lost_before)| {
+        let (after, lost_after) = multilinear::gpu_fused::zc_kernel_totals();
+        let setup = multilinear::gpu_fused::take_setup();
+        let mut line = format!(
+            "BATCHED ARGUE ZC KERNELS: tables {} · set-up host: lowered + resident {:.3}s · fused \
+             sessions {} (prep {:.3}s · session {:.3}s · grid wall {:.3}s · bus terms {} · steps {}) \
+             | card, this argue:",
+            tables.len(),
+            zc_lowered,
+            setup.sessions,
+            setup.prep,
+            setup.session,
+            setup.grid,
+            setup.bus_terms,
+            setup.steps,
+        );
+        let mut card = 0.0;
+        for ((name, secs, launches), (_, was, was_launches)) in after.iter().zip(&before) {
+            card += secs - was;
+            line.push_str(&format!(
+                " {name} {:.4}s/{}",
+                secs - was,
+                launches - was_launches
+            ));
+        }
+        line.push_str(&format!(
+            " · sum {card:.4}s · lost {}",
+            lost_after - lost_before
+        ));
+        line
+    });
+    if let Some(line) = &zc_report {
+        eprintln!("{line}");
+    }
     let mut factor_values = Vec::with_capacity(tables.len());
     for (table, poly) in tables.iter().zip(&polys) {
         let values = table

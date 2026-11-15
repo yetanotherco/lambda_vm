@@ -975,6 +975,97 @@ fn the_fused_rounds_on_the_card_send_todays_messages() {
     );
 }
 
+/// ★ The zerocheck's kernel timers (`LAMBDA_VM_ZC_KERNEL_TIMES`, measurement
+/// only) change no message: the Q1 tables at 2^10 on the card with the timers
+/// off and then on send the same rounds, reach the same point and bind every
+/// factor to the same value — today's, checked against the host rounds — and
+/// the on run moves every class the fused rounds launch, with no time lost.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
+fn the_zerocheck_kernel_timers_change_no_message() {
+    use math_cuda::argue_fused::kernel_times;
+    use multilinear::gpu_fused::*;
+    struct TimersBack;
+    impl Drop for TimersBack {
+        fn drop(&mut self) {
+            kernel_times::force(None);
+        }
+    }
+    let _back = TimersBack;
+    let _switches = CardSwitches::set(
+        FusedFaults {
+            keep_corners: true,
+            ..FusedFaults::default()
+        },
+        false,
+    );
+    let vm = vm_airs();
+    let airs = every_air(&vm);
+    for (at, label) in THE_Q1_TABLES.iter().enumerate() {
+        let n = 10;
+        let air = airs.iter().find(|(_, l)| l == label).unwrap().0;
+        let mut rng = Rng::new(0x71AE + at as u64);
+        let table = Table::from_air(air, label, n, &mut rng);
+        let session = table.session(table.random_columns(n, &mut rng), &mut rng);
+        let claims = session.true_claims();
+        kernel_times::force(Some(false));
+        let sessions = fused_sessions();
+        let (untimed, untimed_point, untimed_bound) = session
+            .on_the_card(&claims)
+            .unwrap_or_else(|e| panic!("{label}: untimed: {e:?}"));
+        let (before, lost_before) = kernel_times::totals();
+        kernel_times::force(Some(true));
+        let timed = session.on_the_card(&claims);
+        let (after, lost_after) = kernel_times::totals();
+        assert_eq!(
+            fused_sessions(),
+            sessions + 2,
+            "{label}: both runs took the card"
+        );
+        let (proof, point, bound) = timed
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{label}: timed: {e:?}"));
+        assert_eq!(proof.rounds.len(), untimed.rounds.len(), "{label}");
+        for (round, (a, b)) in untimed.rounds.iter().zip(&proof.rounds).enumerate() {
+            assert_eq!(a.evaluations, b.evaluations, "{label}: round {round}");
+        }
+        assert_eq!(*point, untimed_point, "{label}: the point");
+        assert_eq!(*bound, untimed_bound, "{label}: the bound factors");
+        session.assert_card_is_today(&claims, timed, "timed");
+        for class in [
+            kernel_times::GRID,
+            kernel_times::BUS_U,
+            kernel_times::FOLD2,
+            kernel_times::BUS_COLUMN,
+            kernel_times::HALVE,
+            kernel_times::ROUNDS,
+            kernel_times::REDUCE,
+            kernel_times::FOLD,
+        ] {
+            assert!(
+                after[class].1 > before[class].1 && after[class].0 > before[class].0,
+                "{label}: the timed run moved class {}",
+                kernel_times::CLASSES[class]
+            );
+        }
+        assert_eq!(lost_after, lost_before, "{label}: no timer lost");
+        eprintln!(
+            "argue ZC timers: {label} n={n} same messages timed and untimed; card {:.4}s over {} launches",
+            after
+                .iter()
+                .zip(&before)
+                .map(|(a, b)| a.0 - b.0)
+                .sum::<f64>(),
+            after
+                .iter()
+                .zip(&before)
+                .map(|(a, b)| a.1 - b.1)
+                .sum::<u64>()
+        );
+    }
+}
+
 /// ★ The production switches (fused on, the corners skipped, no
 /// cross-check) on every table without roots: its constraint part is zero,
 /// so its grid `{0,1}²` is all corners, the corner skip is exact on random

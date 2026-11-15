@@ -19,6 +19,132 @@ use crate::Result;
 use crate::device::{DeviceReservation, alloc_or_trim, alloc_zeros_or_trim, backend, htod_or_trim};
 use crate::sumcheck::{FactorView, eq_table_ext3, launch_shape};
 
+/// Optional per-kernel timers for the fused zerocheck (measurement only).
+///
+/// With `LAMBDA_VM_ZC_KERNEL_TIMES=1` every launch a session makes is bracketed
+/// by two timing events on its stream, and the elapsed device time is summed
+/// per kernel class into process-wide counters once the stream has been waited
+/// for. Unset (the default), no event is made and nothing changes. The events
+/// sit on the session's own stream, so they order nothing the launches did not
+/// already order: the messages and the proof are the same either way.
+pub mod kernel_times {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+    /// The classes, in print order.
+    pub const CLASSES: [&str; 9] = [
+        "grid",
+        "bus_u",
+        "fold2",
+        "bus_column",
+        "halve",
+        "rounds",
+        "reduce",
+        "fold",
+        "gather",
+    ];
+    pub const GRID: usize = 0;
+    pub const BUS_U: usize = 1;
+    pub const FOLD2: usize = 2;
+    pub const BUS_COLUMN: usize = 3;
+    pub const HALVE: usize = 4;
+    pub const ROUNDS: usize = 5;
+    pub const REDUCE: usize = 6;
+    pub const FOLD: usize = 7;
+    pub const GATHER: usize = 8;
+
+    static NANOS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    static LAUNCHES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    /// Elapsed times that could not be read (an event error): counted, never
+    /// guessed.
+    static LOST: AtomicU64 = AtomicU64::new(0);
+
+    /// A test's override: 0 the environment's word, 1 on, 2 off.
+    static FORCED: AtomicU8 = AtomicU8::new(0);
+
+    /// Whether the timers are on (`LAMBDA_VM_ZC_KERNEL_TIMES=1`). Read once.
+    pub fn enabled() -> bool {
+        match FORCED.load(Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("LAMBDA_VM_ZC_KERNEL_TIMES").is_ok_and(|v| v == "1" || v == "true")
+        })
+    }
+
+    /// Forces the timers on or off for sessions made after it; `None` back to
+    /// the environment's word.
+    #[doc(hidden)]
+    pub fn force(on: Option<bool>) {
+        FORCED.store(
+            match on {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(super) fn add(class: usize, nanos: u64) {
+        NANOS[class].fetch_add(nanos, Ordering::Relaxed);
+        LAUNCHES[class].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn lost() {
+        LOST.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The process's totals so far: seconds and launches a class, in
+    /// [`CLASSES`] order, and the launches whose time was lost.
+    pub fn totals() -> ([(f64, u64); 9], u64) {
+        let mut out = [(0.0, 0); 9];
+        for (k, slot) in out.iter_mut().enumerate() {
+            *slot = (
+                NANOS[k].load(Ordering::Relaxed) as f64 * 1e-9,
+                LAUNCHES[k].load(Ordering::Relaxed),
+            );
+        }
+        (out, LOST.load(Ordering::Relaxed))
+    }
+}
+
+/// A session's pending timing events, settled after its stream is waited for.
+#[derive(Default)]
+struct Timer {
+    pending: Vec<(usize, cudarc::driver::CudaEvent, cudarc::driver::CudaEvent)>,
+    pool: Vec<cudarc::driver::CudaEvent>,
+}
+
+impl Timer {
+    fn event(&mut self, stream: &Arc<CudaStream>) -> Option<cudarc::driver::CudaEvent> {
+        let event = match self.pool.pop() {
+            Some(event) => event,
+            None => stream
+                .context()
+                .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .ok()?,
+        };
+        event.record(stream).ok()?;
+        Some(event)
+    }
+
+    /// Reads every pending pair; the stream must have been waited for.
+    fn settle(&mut self) {
+        for (class, start, end) in self.pending.drain(..) {
+            match start.elapsed_ms(&end) {
+                Ok(ms) => kernel_times::add(class, (f64::from(ms) * 1e6) as u64),
+                Err(_) => kernel_times::lost(),
+            }
+            self.pool.push(start);
+            self.pool.push(end);
+        }
+    }
+}
+
 const BLOCK_DIM: u32 = 256;
 const MAX_GRID: u32 = 4096;
 
@@ -82,6 +208,8 @@ pub struct FusedZerocheck<'f> {
     node_ints: CudaSlice<u32>,
     scratch: CudaSlice<u64>,
     violation: CudaSlice<u64>,
+    /// The optional kernel timers ([`kernel_times`]); `None` when they are off.
+    timer: Option<std::sync::Mutex<Timer>>,
     _room: DeviceReservation,
 }
 
@@ -261,8 +389,40 @@ impl<'f> FusedZerocheck<'f> {
             node_ints,
             scratch,
             violation,
+            timer: kernel_times::enabled().then(|| std::sync::Mutex::new(Timer::default())),
             _room: room,
         }))
+    }
+
+    /// A start event for the next launch, when the timers are on.
+    fn tick(&self) -> Option<cudarc::driver::CudaEvent> {
+        let timer = self.timer.as_ref()?;
+        let mut timer = timer.lock().ok()?;
+        timer.event(&self.stream)
+    }
+
+    /// The launch since `start` done: its end event, pending until the stream
+    /// is waited for.
+    fn tock(&self, class: usize, start: Option<cudarc::driver::CudaEvent>) {
+        let (Some(timer), Some(start)) = (self.timer.as_ref(), start) else {
+            return;
+        };
+        let Ok(mut timer) = timer.lock() else {
+            return;
+        };
+        match timer.event(&self.stream) {
+            Some(end) => timer.pending.push((class, start, end)),
+            None => kernel_times::lost(),
+        }
+    }
+
+    /// Settles the pending timers; called right after the stream is waited for.
+    fn settle(&self) {
+        if let Some(timer) = self.timer.as_ref()
+            && let Ok(mut timer) = timer.lock()
+        {
+            timer.settle();
+        }
     }
 
     /// A launch over `work` indices with `rows` block rows and `words` slot
@@ -284,6 +444,7 @@ impl<'f> FusedZerocheck<'f> {
         let be = backend()?;
         crate::round_slot::note_second_launch();
         let reduce_block = 256u32;
+        let t0 = self.tick();
         unsafe {
             self.stream
                 .launch_builder(&be.sum_partials_ext3)
@@ -296,6 +457,7 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: reduce_block * 3 * 8,
                 })?;
         }
+        self.tock(kernel_times::REDUCE, t0);
         Ok(())
     }
 
@@ -303,6 +465,7 @@ impl<'f> FusedZerocheck<'f> {
     pub fn collect(&self, rows: usize) -> Result<Vec<u64>> {
         let out = crate::readback::clone_dtoh(&self.stream, &self.sums.slice(0..rows * 3))?;
         self.stream.synchronize()?;
+        self.settle();
         Ok(out)
     }
 
@@ -332,6 +495,7 @@ impl<'f> FusedZerocheck<'f> {
             BLOCK_DIM,
         );
         let factors = self.source.ptrs;
+        let t0 = self.tick();
         unsafe {
             self.stream
                 .launch_builder(&be.zc_bus_u)
@@ -350,6 +514,7 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: block * 3 * 8,
                 })?;
         }
+        self.tock(kernel_times::BUS_U, t0);
         let u = self.reduce(4, grid)?;
         Ok((t, u, violation))
     }
@@ -374,6 +539,7 @@ impl<'f> FusedZerocheck<'f> {
         self.stream.memcpy_htod(&[u64::MAX], &mut self.violation)?;
         let (grid, block) = self.shape(q, points.len(), self.num_slots as u64)?;
         let factors = self.source.ptrs;
+        let t0 = self.tick();
         unsafe {
             self.stream
                 .launch_builder(&be.zc_grid01)
@@ -396,9 +562,11 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: block * 3 * 8,
                 })?;
         }
+        self.tock(kernel_times::GRID, t0);
         let t = self.reduce(points.len(), grid)?;
         let violation = crate::readback::clone_dtoh(&self.stream, &self.violation)?;
         self.stream.synchronize()?;
+        self.settle();
         Ok((t, (violation[0] != u64::MAX).then_some(violation[0])))
     }
 
@@ -414,6 +582,7 @@ impl<'f> FusedZerocheck<'f> {
         let total = width * q;
         let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
         let factors = self.source.ptrs;
+        let t0 = self.tick();
         unsafe {
             self.stream
                 .launch_builder(&be.zc_fold2)
@@ -429,6 +598,7 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: 0,
                 })?;
         }
+        self.tock(kernel_times::FOLD2, t0);
         self.len = q as usize;
         self.bus_column()?;
         self.halve_weights()
@@ -440,6 +610,7 @@ impl<'f> FusedZerocheck<'f> {
         let rows = self.len as u64;
         let grid = rows.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
         let q = self.rows / 4;
+        let t0 = self.tick();
         let mut l = self
             .folded
             .slice_mut(self.width * q * 3..(self.width + 1) * q * 3);
@@ -459,6 +630,7 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: 0,
                 })?;
         }
+        self.tock(kernel_times::BUS_COLUMN, t0);
         Ok(())
     }
 
@@ -468,6 +640,8 @@ impl<'f> FusedZerocheck<'f> {
         let be = backend()?;
         let half = (self.len / 2) as u64;
         let grid = half.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
+        // Both halvings under one timer pair: the loop holds both weights.
+        let t0 = self.tick();
         for table in [&mut self.eq_r, &mut self.eq_rho] {
             unsafe {
                 self.stream
@@ -481,6 +655,7 @@ impl<'f> FusedZerocheck<'f> {
                     })?;
             }
         }
+        self.tock(kernel_times::HALVE, t0);
         Ok(())
     }
 
@@ -516,6 +691,7 @@ impl<'f> FusedZerocheck<'f> {
         let l = self
             .folded
             .slice(self.width * q * 3..(self.width + 1) * q * 3);
+        let t0 = self.tick();
         unsafe {
             self.stream
                 .launch_builder(&be.zc_round_gruen)
@@ -538,6 +714,7 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: block * 3 * 8,
                 })?;
         }
+        self.tock(kernel_times::ROUNDS, t0);
         self.reduce_enqueue(rows, grid)?;
         Ok(rows)
     }
@@ -554,6 +731,7 @@ impl<'f> FusedZerocheck<'f> {
         let width = self.width as u64 + 1;
         let total = width * half;
         let grid = total.div_ceil(BLOCK_DIM as u64).clamp(1, MAX_GRID as u64) as u32;
+        let t0 = self.tick();
         unsafe {
             self.stream
                 .launch_builder(&be.sumcheck_fold_ext3)
@@ -567,6 +745,7 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: 0,
                 })?;
         }
+        self.tock(kernel_times::FOLD, t0);
         self.len /= 2;
         if more {
             self.halve_weights()?;
@@ -596,6 +775,7 @@ impl<'f> FusedZerocheck<'f> {
         let grid = (total as u64)
             .div_ceil(BLOCK_DIM as u64)
             .clamp(1, MAX_GRID as u64) as u32;
+        let t0 = self.tick();
         unsafe {
             self.stream
                 .launch_builder(&be.gather_factor_heads_ext3)
@@ -609,8 +789,10 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: 0,
                 })?;
         }
+        self.tock(kernel_times::GATHER, t0);
         let flat = crate::readback::clone_dtoh(&self.stream, &out)?;
         self.stream.synchronize()?;
+        self.settle();
         Ok(flat.chunks_exact(span).map(<[u64]>::to_vec).collect())
     }
 
@@ -621,7 +803,26 @@ impl<'f> FusedZerocheck<'f> {
         let out =
             crate::readback::clone_dtoh(&self.stream, &self.folded.slice(at..at + self.len * 3))?;
         self.stream.synchronize()?;
+        self.settle();
         Ok(out)
+    }
+}
+
+impl Drop for FusedZerocheck<'_> {
+    /// Settles what the timers left pending; nothing when they are off.
+    fn drop(&mut self) {
+        let pending = self
+            .timer
+            .as_ref()
+            .and_then(|timer| timer.lock().ok().map(|timer| !timer.pending.is_empty()))
+            .unwrap_or(false);
+        if pending {
+            if self.stream.synchronize().is_ok() {
+                self.settle();
+            } else {
+                kernel_times::lost();
+            }
+        }
     }
 }
 
