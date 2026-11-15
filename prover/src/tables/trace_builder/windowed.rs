@@ -104,6 +104,9 @@ pub type RecordsRoom = Arc<dyn Fn(usize) -> bool + Send + Sync>;
 
 /// The streamed families whose full chunks may be held as their rows, the
 /// walk's own structs ([`WindowedTraceBuilder::card_fill_streamed_rows`]).
+/// MEM_LOAD's and MEM_STORE's chunks exist only under the fused memory format
+/// ([`WindowedTraceBuilder::memory_format`]); asked under another, they hold
+/// nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RowFamilies {
     pub memw_a: bool,
@@ -111,6 +114,8 @@ pub struct RowFamilies {
     pub store: bool,
     pub memw: bool,
     pub shift: bool,
+    pub mem_load: bool,
+    pub mem_store: bool,
 }
 
 impl RowFamilies {
@@ -121,6 +126,8 @@ impl RowFamilies {
         store: false,
         memw: false,
         shift: false,
+        mem_load: false,
+        mem_store: false,
     };
     /// Every one.
     pub const ALL: Self = Self {
@@ -129,6 +136,8 @@ impl RowFamilies {
         store: true,
         memw: true,
         shift: true,
+        mem_load: true,
+        mem_store: true,
     };
 
     /// Whether any is.
@@ -472,6 +481,8 @@ pub struct CardFillStamps {
     pub store: [usize; 2],
     pub memw: [usize; 2],
     pub shift: [usize; 2],
+    pub mem_load: [usize; 2],
+    pub mem_store: [usize; 2],
     pub records_bytes: usize,
     pub room_out: Option<(StreamTable, usize)>,
     pub out_of_step: usize,
@@ -1050,7 +1061,8 @@ impl<'a> WindowedTraceBuilder<'a> {
 
     /// With [`Self::card_fill_streamed`], also hand out each full chunk of the
     /// families in `rows` as its rows, the walk's own structs (MEMW_A's
-    /// aligned rows, LOAD's, STORE's, MEMW's and SHIFT's ops), for the card to
+    /// aligned rows, LOAD's, STORE's, MEMW's and SHIFT's ops, MEM_LOAD's and
+    /// MEM_STORE's rows), for the card to
     /// fill its columns from, under the same room rule. Before the first
     /// window only. The words are the same.
     pub fn card_fill_streamed_rows(mut self, rows: RowFamilies) -> Result<Self, Error> {
@@ -4308,17 +4320,33 @@ fn tail_jobs(
     // in-walk lookups, counted as their windows were.
     take_chunks!(
         StreamTable::MemLoad,
-        MemLoad,
         kept.mem_load,
         m.mem_load,
-        e.mem_load
+        e.mem_load,
+        |rows| {},
+        |rows, index| row_chunk_ops(
+            rows,
+            index,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+            |c| c.rows.mem_load,
+            |s| &mut s.mem_load,
+            ChunkOps::MemLoad,
+        )
     );
     take_chunks!(
         StreamTable::MemStore,
-        MemStore,
         kept.mem_store,
         m.mem_store,
-        e.mem_store
+        e.mem_store,
+        |rows| {},
+        |rows, index| row_chunk_ops(
+            rows,
+            index,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+            |c| c.rows.mem_store,
+            |s| &mut s.mem_store,
+            ChunkOps::MemStore,
+        )
     );
     jobs
 }
@@ -4710,6 +4738,12 @@ impl ChunkJob {
                 table,
                 index,
             ),
+            ChunkOps::MemLoad(rows) if as_records => {
+                row_regenerate(rows, form, ChunkOps::MemLoad, table, index)
+            }
+            ChunkOps::MemStore(rows) if as_records => {
+                row_regenerate(rows, form, ChunkOps::MemStore, table, index)
+            }
             ops => (None, ChunkJob { table, index, ops }.generate_as(form).trace),
         };
         (
@@ -5275,6 +5309,9 @@ mod head_tests;
 
 #[cfg(test)]
 mod card_records_tests;
+
+#[cfg(test)]
+mod fused_card_records_tests;
 
 #[cfg(all(test, feature = "cuda"))]
 mod card_records_card_tests;

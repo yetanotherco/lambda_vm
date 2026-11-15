@@ -1,8 +1,9 @@
 //! A streamed CPU or MEMW_R chunk held as the records its rows come from
 //! (`multilinear::records`), for the card to fill its columns as its group
 //! uploads it: a CPU chunk as the executor's logs of its cycles, a MEMW_R
-//! chunk as its register rows, a MEMW_A, LOAD, STORE, MEMW or SHIFT chunk as
-//! its rows or ops ([`RowRecords`]), each in the window parts the chunk was cut from, shared
+//! chunk as its register rows, a MEMW_A, LOAD, STORE, MEMW, SHIFT, MEM_LOAD or
+//! MEM_STORE chunk as its rows or ops ([`RowRecords`]), each in the window
+//! parts the chunk was cut from, shared
 //! and never copied. A host reader gets the host fill of the same
 //! rows, which writes the same words.
 
@@ -16,12 +17,16 @@ use super::{Segments, StreamTable, Table};
 use crate::tables::decode::DecodeTable;
 use crate::tables::gpack::TraceForm;
 use crate::tables::load::LoadOperation;
+use crate::tables::mem_load::MemLoadRow;
+use crate::tables::mem_store::MemStoreRow;
 use crate::tables::memw::MemwOperation;
 use crate::tables::memw_aligned::AlignedRow;
 use crate::tables::memw_register::RegRow;
 use crate::tables::shift::ShiftOperation;
 use crate::tables::store::StoreOperation;
-use crate::tables::{cpu, load, memw, memw_aligned, memw_register, shift, store};
+use crate::tables::{
+    cpu, load, mem_card, mem_load, mem_store, memw, memw_aligned, memw_register, shift, store,
+};
 
 /// The program's DECODE table for the CPU chunks held as logs: the host's,
 /// which a host reader fills with, and its rows as the card reads them.
@@ -400,7 +405,8 @@ impl TableRecords for RegisterRowRecords {
 
 /// A streamed family whose full chunks may be held as their rows, one record a
 /// row, the walk's own structs read in place by the card (MEMW_A's aligned
-/// rows, LOAD's, STORE's, MEMW's and SHIFT's ops): the records as the card
+/// rows, LOAD's, STORE's, MEMW's and SHIFT's ops, MEM_LOAD's and MEM_STORE's
+/// rows): the records as the card
 /// reads them, and the host fill of the same rows.
 pub(crate) trait RowFamily: Sized + Send + Sync + 'static {
     const TABLE: StreamTable;
@@ -526,6 +532,46 @@ impl RowFamily for ShiftOperation {
         let mut op = self.clone();
         op.in_halves[0] = op.in_halves[0].wrapping_add(cycles as u16);
         op
+    }
+}
+
+impl RowFamily for MemLoadRow {
+    const TABLE: StreamTable = StreamTable::MemLoad;
+    const COLUMNS: usize = mem_load::cols::NUM_COLUMNS;
+
+    fn fill(pieces: Vec<&[Self]>) -> RecordsFill<'_> {
+        RecordsFill::MemLoad {
+            rows: pieces.into_iter().map(mem_card::card_load_rows).collect(),
+        }
+    }
+
+    fn host_fill(pieces: &[&[Self]], form: TraceForm) -> Table {
+        mem_load::generate_mem_load_trace_segments_as(pieces, form)
+    }
+
+    #[cfg(test)]
+    fn later(&self, cycles: u64) -> Self {
+        MemLoadRow::later(*self, cycles)
+    }
+}
+
+impl RowFamily for MemStoreRow {
+    const TABLE: StreamTable = StreamTable::MemStore;
+    const COLUMNS: usize = mem_store::cols::NUM_COLUMNS;
+
+    fn fill(pieces: Vec<&[Self]>) -> RecordsFill<'_> {
+        RecordsFill::MemStore {
+            rows: pieces.into_iter().map(mem_card::card_store_rows).collect(),
+        }
+    }
+
+    fn host_fill(pieces: &[&[Self]], form: TraceForm) -> Table {
+        mem_store::generate_mem_store_trace_segments_as(pieces, form)
+    }
+
+    #[cfg(test)]
+    fn later(&self, cycles: u64) -> Self {
+        MemStoreRow::later(*self, cycles)
     }
 }
 

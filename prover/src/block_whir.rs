@@ -1461,14 +1461,15 @@ pub(crate) struct CardFill {
     pub(crate) cpu: bool,
     pub(crate) memw_r: bool,
     /// Each full streamed chunk of these families, from its rows (MEMW_A's
-    /// aligned rows, LOAD's, STORE's, MEMW's and SHIFT's ops), under the same
+    /// aligned rows, LOAD's, STORE's, MEMW's and SHIFT's ops, and under the
+    /// fused memory format MEM_LOAD's and MEM_STORE's rows), under the same
     /// room rule ([`WindowedTraceBuilder::card_fill_streamed_rows`]).
     pub(crate) rows: RowFamilies,
 }
 
 impl CardFill {
     /// The families the card fills.
-    const NAMES: [&'static str; 8] = [
+    const NAMES: [&'static str; 10] = [
         "keccak_rnd",
         "cpu",
         "memw_r",
@@ -1477,6 +1478,8 @@ impl CardFill {
         "store",
         "memw",
         "shift",
+        "mem_load",
+        "mem_store",
     ];
 
     /// Every family.
@@ -1487,7 +1490,7 @@ impl CardFill {
         rows: RowFamilies::ALL,
     };
 
-    /// Unset or empty: every family (KECCAK_RND, CPU, MEMW_R and the five row
+    /// Unset or empty: every family (KECCAK_RND, CPU, MEMW_R and the row
     /// families) in a build with the card's kernels (the `cuda` feature),
     /// nothing in one without, where every fill from records would be the
     /// host's.
@@ -1508,7 +1511,7 @@ impl CardFill {
     }
 
     /// Each family's flag, in [`Self::NAMES`] order.
-    fn flags(&mut self) -> [&mut bool; 8] {
+    fn flags(&mut self) -> [&mut bool; 10] {
         let rows = &mut self.rows;
         [
             &mut self.keccak_rnd,
@@ -1519,6 +1522,8 @@ impl CardFill {
             &mut rows.store,
             &mut rows.memw,
             &mut rows.shift,
+            &mut rows.mem_load,
+            &mut rows.mem_store,
         ]
     }
 
@@ -1538,7 +1543,7 @@ impl CardFill {
 }
 
 /// `LAMBDA_VM_BLOCK_CARD_FILL`: `on` has the card fill every family's tables
-/// ([`CardFill`]: KECCAK_RND, CPU, MEMW_R and the five row families) from the
+/// ([`CardFill`]: KECCAK_RND, CPU, MEMW_R and the row families) from the
 /// records their rows come from as their groups upload them, `off` none (the
 /// host builds every table). Unset or empty is [`CardFill::DEFAULT`]: every
 /// family in a build with the card's kernels, nothing without. Where the card
@@ -2511,7 +2516,9 @@ impl BlockStamps {
                  tables {fill_s:.3} s · MEMW_A chunks {} as records, {} filled on the host · \
                  LOAD chunks {} as records, {} filled on the host · STORE chunks {} as records, \
                  {} filled on the host · MEMW chunks {} as records, {} filled on the host · \
-                 SHIFT chunks {} as records, {} filled on the host\n",
+                 SHIFT chunks {} as records, {} filled on the host · MEM_LOAD chunks {} as \
+                 records, {} filled on the host · MEM_STORE chunks {} as records, {} filled on \
+                 the host\n",
                 l.records_rest.0,
                 l.records_rest.1 as f64 / (1u64 << 20) as f64,
                 self.records_fills.0,
@@ -2536,6 +2543,10 @@ impl BlockStamps {
                 c.memw[1],
                 c.shift[0],
                 c.shift[1],
+                c.mem_load[0],
+                c.mem_load[1],
+                c.mem_store[0],
+                c.mem_store[1],
             ));
             let released = self.groups.iter().filter(|g| g.records_released > 0);
             let mut pages = multilinear::records::PagesReturned::default();
@@ -10525,7 +10536,7 @@ mod walkers_knob_tests {
         ] {
             assert_eq!(parse_card_fill(value).ok(), Some(want), "{value:?}");
         }
-        // ★ Unset is every family (KECCAK_RND, CPU, MEMW_R and the five row
+        // ★ Unset is every family (KECCAK_RND, CPU, MEMW_R and the row
         // families) with a card, nothing without.
         assert_eq!(CardFill::DEFAULT, default);
         assert_eq!(
@@ -10536,7 +10547,7 @@ mod walkers_knob_tests {
         assert_eq!(none.name(), "off");
         assert_eq!(
             every.name(),
-            "keccak_rnd,cpu,memw_r,memw_a,load,store,memw,shift"
+            "keccak_rnd,cpu,memw_r,memw_a,load,store,memw,shift,mem_load,mem_store"
         );
         for value in [
             "1",
