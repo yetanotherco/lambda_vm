@@ -999,6 +999,7 @@ pub(crate) use finish::hand_on_order_first;
 pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
 #[cfg(test)]
 pub(crate) use windowed::DECODE_TRACE_DELAY;
+pub(crate) use windowed::card_trace_rows;
 pub use windowed::{
     ALIGNED_ECALL, Accumulator, AlignedRef, CardFillStamps, ChunkJob, CountThreadStamps,
     RecordsRoom, RegenBuilder, RowFamilies, RowLists, SetupStamps, StreamTable, StreamedChunk,

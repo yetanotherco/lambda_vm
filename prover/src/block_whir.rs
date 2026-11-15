@@ -6643,6 +6643,27 @@ fn prove_streamed(
                             }
                         );
                     }
+                    // `LAMBDA_VM_CARD_TRACE=rows`: the card derives the in-row CPU
+                    // rows' side records from the executor's history. Needs record
+                    // mode, the walkers and the CPU logs kept; without them the side
+                    // records go up as the walk wrote them.
+                    if crate::tables::trace_builder::card_trace_rows().map_err(Error::Prover)? {
+                        let sides = history
+                            && walkers > 0
+                            && builder.keeps_logs()
+                            && format.registers == crate::tables::register::RegisterFormat::InRow;
+                        if sides {
+                            builder = builder.card_derives_sides()?;
+                        }
+                        eprintln!(
+                            "BLOCK CARD TRACE: rows · {}",
+                            if sides {
+                                "the card derives the CPU rows' side records from the history"
+                            } else {
+                                "off here (no record mode, no walkers, no CPU logs kept, or not the in-row format): the side records go up"
+                            }
+                        );
+                    }
                     #[cfg(test)]
                     if deviations.card_fill_streamed_fault > 0 {
                         builder =

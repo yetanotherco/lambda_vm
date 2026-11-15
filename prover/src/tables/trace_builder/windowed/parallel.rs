@@ -142,6 +142,10 @@ struct WalkSettings {
     /// Record mode, words: each walker writes its window's register rows as
     /// words, the CPU tables this long ([`WindowedTraceBuilder::writes_words`]).
     words: Option<usize>,
+    /// Record mode, the CPU side records derived on the card: each walker
+    /// keeps its window's history and lists its exceptions for CPU chunks
+    /// this long ([`WindowedTraceBuilder::derives_sides`]).
+    sides_chunk: Option<usize>,
     /// Record mode's check: where a walker sends the digest of a rechecked
     /// window's lists ([`check_thread`]).
     digests: Option<Mutex<std::sync::mpsc::Sender<(u32, u64)>>>,
@@ -290,6 +294,20 @@ impl WindowWalker {
         let mut walked = walked?;
         if s.keep_logs {
             walked.keep_logs(Arc::clone(&job.logs));
+        }
+        // The card derives the window's CPU side records: its history goes
+        // with it, and the rows the derivation cannot read are listed.
+        if let Some(rows) = s.sides_chunk {
+            let exceptions = super::history_sides::exceptions_of_walk(
+                &job.logs,
+                &history.extras,
+                walked.cpu_sides(),
+                job.first as u64,
+                rows as u64,
+                &s.decode,
+            )
+            .map_err(|e| Error::Prover(format!("window {}: {e}", job.window)))?;
+            walked.keep_history_sides(Arc::clone(history), exceptions);
         }
         if self.record.take_missing() {
             return Err(Error::Prover(format!(
@@ -672,6 +690,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         key: std::collections::hash_map::RandomState::new().hash_one(0u64),
         keep_logs: builder.keeps_logs(),
         words: builder.writes_words(),
+        sides_chunk: builder.derives_sides(),
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),
         light: builder.light_walks().0,
         route: builder.light_walks().1,

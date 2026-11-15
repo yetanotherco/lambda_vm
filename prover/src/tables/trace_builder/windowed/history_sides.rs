@@ -25,11 +25,6 @@
 //! list may name more rows than it must; the derivation refuses a row it can
 //! neither read nor find.
 
-// The walk's listing and the records' constructor are wired into the windowed
-// builder by the next change (`LAMBDA_VM_CARD_TRACE=rows`); until then the
-// tests are their only callers.
-#![allow(dead_code)]
-
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
@@ -41,6 +36,28 @@ use super::super::in_row_prev;
 use super::Segments;
 use crate::tables::cpu::CpuSide;
 use crate::tables::decode::DecodeTable;
+
+/// The knob of the trace's parts the card builds from the executor's
+/// records: unset, empty, `0` or `off` builds none of them here (today's
+/// trace); `rows` derives the in-row CPU rows' side records on the card from
+/// the history ([`super::WindowedTraceBuilder::card_derives_sides`]). The
+/// tables are the same either way.
+pub const CARD_TRACE_KNOB: &str = "LAMBDA_VM_CARD_TRACE";
+
+/// [`CARD_TRACE_KNOB`]'s reading of `word`: whether `rows` is on. Any other
+/// word is refused.
+pub(crate) fn card_trace_setting(word: Option<&str>) -> Result<bool, String> {
+    match word.map(str::trim) {
+        None | Some("") | Some("0") | Some("off") => Ok(false),
+        Some("rows") => Ok(true),
+        Some(other) => Err(format!("{CARD_TRACE_KNOB}={other}: expected off or rows")),
+    }
+}
+
+/// [`card_trace_setting`] of the process's environment.
+pub(crate) fn card_trace_rows() -> Result<bool, String> {
+    card_trace_setting(std::env::var(CARD_TRACE_KNOB).ok().as_deref())
+}
 
 /// A CPU chunk's history records ([`HistExtra`], one a cycle): pieces of the
 /// histories of the windows it was cut from, shared and never copied.
@@ -317,4 +334,67 @@ pub(crate) fn exceptions_of_walk(
         }
     }
     Ok(out)
+}
+
+/// The windows' history records not yet in a handed-out CPU chunk, in step
+/// with the logs' tail ([`super::WindowedTraceBuilder::card_derives_sides`]):
+/// each window's history (shared, the front's first `start` records gone) and
+/// the exceptions its walk listed, ascending by cycle.
+#[derive(Default)]
+pub(crate) struct HistoryTail {
+    parts: std::collections::VecDeque<Arc<WindowHistory>>,
+    start: usize,
+    len: usize,
+    exceptions: std::collections::VecDeque<SideException>,
+    /// The first cycle not handed out.
+    next: u64,
+}
+
+impl HistoryTail {
+    /// A window's history and its exceptions, after the windows before it.
+    pub(crate) fn push(&mut self, history: Arc<WindowHistory>, exceptions: Vec<SideException>) {
+        self.len += history.extras.len();
+        self.exceptions.extend(exceptions);
+        if !history.extras.is_empty() {
+            self.parts.push_back(history);
+        }
+    }
+
+    /// The next `n` cycles' history records (at most `len`), as the parts
+    /// they lie in, and their exceptions.
+    pub(crate) fn take(&mut self, n: usize) -> (HistoryParts, Vec<SideException>) {
+        let n = n.min(self.len);
+        self.len -= n;
+        let mut parts = HistoryParts::default();
+        let mut want = n;
+        while want > 0 {
+            let Some(front) = self.parts.front() else {
+                break;
+            };
+            let available = front.extras.len() - self.start;
+            if available <= want {
+                let range = self.start..front.extras.len();
+                if let Some(part) = self.parts.pop_front() {
+                    parts.push(part, range);
+                }
+                self.start = 0;
+                want -= available;
+            } else {
+                parts.push(Arc::clone(front), self.start..self.start + want);
+                self.start += want;
+                want = 0;
+            }
+        }
+        let end = self.next + n as u64;
+        let mut exceptions = Vec::new();
+        while self
+            .exceptions
+            .front()
+            .is_some_and(|x| u64::from(x.cycle) < end)
+        {
+            exceptions.extend(self.exceptions.pop_front());
+        }
+        self.next = end;
+        (parts, exceptions)
+    }
 }
