@@ -38,7 +38,7 @@
 //! every caller as cells of the one `sample_u64_pow2` decomposition; nothing
 //! here can tell a transcript bit from a hinted one.
 
-use super::builder::{Bit, Felt, LfmBuilder};
+use super::builder::{Bit, Cell, Felt, LfmBuilder};
 use super::edsl::{self, WrapDigest};
 use super::instr::ArenaId;
 use stark::config::Commitment;
@@ -96,6 +96,85 @@ pub fn cap_root_permutations(nodes: usize, arity: usize) -> usize {
     perms
 }
 
+/// The knob that checks a BLAKE3 opening against its cap over PACKED digests
+/// ([`pack_digest`]): the mux then picks one word a node instead of two, half
+/// its `Select` rows. Read by the in-guest verifier alone (the proof does not
+/// move; the leaf programs do): see [`cap_mux_setting`].
+pub const CAP_MUX_ENV: &str = "LAMBDA_VM_LFM_CAP_MUX";
+
+/// [`CAP_MUX_ENV`]'s value: unset or `plain` muxes both digest words (today);
+/// `packed` muxes the packed word. Anything else is refused.
+pub fn cap_mux_setting(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("plain") => Ok(false),
+        Some("packed") => Ok(true),
+        Some(other) => Err(format!("{CAP_MUX_ENV}={other:?}: expected plain or packed")),
+    }
+}
+
+/// [`CAP_MUX_ENV`] in this process, read once; a refused value aborts the
+/// process at its first read (a configuration error, before any program is
+/// emitted), as the process format does.
+pub fn cap_mux_packed() -> bool {
+    static PACKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PACKED.get_or_init(|| {
+        let value = match std::env::var(CAP_MUX_ENV) {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(v)) => {
+                eprintln!("{CAP_MUX_ENV}={v:?}: expected plain or packed");
+                std::process::abort()
+            }
+        };
+        cap_mux_setting(value.as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::abort()
+        })
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test only: on this thread, the cap mux is packed (`Some(true)`) or
+    /// plain (`Some(false)`) whatever the knob says.
+    pub(crate) static PACKED_MUX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a cap authenticated on `b` muxes packed digests: under BLAKE3
+/// alone (two `u32`-lane words a digest), as [`cap_mux_packed`] says.
+fn packs(b: &LfmBuilder) -> bool {
+    if b.wrap_hash() != edsl::WrapHash::Blake3 {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(packed) = PACKED_MUX.with(std::cell::Cell::get) {
+        return packed;
+    }
+    cap_mux_packed()
+}
+
+/// ★ A BLAKE3 digest's two words as ONE word: lanes `(l0..l7)` (each a `u32`,
+/// as the hash chip writes an output and range-checks an input) become the
+/// four felts `l_{2i} + 2^32 · l_{2i+1}`. Only the cap's compare reads it:
+/// the walk's hashes and the index bits stay unpacked.
+///
+/// ⚠ Not injective at the top of the range: a felt is `lo + 2^32·hi mod p`,
+/// so `(lo = a, hi = 0)` and `(lo = a + 1, hi = 2^32 − 1)` give the same felt
+/// (their integers differ by `p`), and no other pair of `u32` pairs does. A
+/// cap node therefore admits at most `2^4 = 16` packed-equal digests, and a
+/// walk passes against a node it is not only by its hash's output equalling
+/// one of those 16 fixed 256-bit values.
+pub fn pack_digest(b: &mut LfmBuilder, d: WrapDigest) -> Cell {
+    assert_eq!(d.len(), 2, "a BLAKE3 digest is two words");
+    let two32 = b.felt_const(crate::tables::types::FE::from(1u64 << 32));
+    let w0 = b.unpack(d[0]);
+    let w1 = b.unpack(d[1]);
+    let lanes = [w0[0], w0[1], w0[2], w0[3], w1[0], w1[1], w1[2], w1[3]];
+    let felts: [Felt; 4] =
+        core::array::from_fn(|i| b.mul_add(lanes[2 * i + 1], two32, lanes[2 * i]));
+    b.pack_word(felts)
+}
+
 /// One tree's authenticated Merkle cap.
 pub struct CapCells {
     cap: Vec<WrapDigest>,
@@ -103,6 +182,9 @@ pub struct CapCells {
     height: usize,
     /// Index bits the mux reads, `log2(cap.len())`.
     mux_bits: usize,
+    /// The cap's nodes packed ([`pack_digest`]) when this cap's mux is packed
+    /// ([`packs`]): one word a node, the same nodes the root check read.
+    packed: Option<Vec<Cell>>,
 }
 
 impl CapCells {
@@ -151,10 +233,12 @@ impl CapCells {
         );
         let root = edsl::wrap_merkle_tree_root(b, cap);
         edsl::assert_digest_eq_lanes(b, root, root_lanes);
+        let packed = packs(b).then(|| cap.iter().map(|node| pack_digest(b, *node)).collect());
         Self {
             cap: cap.to_vec(),
             height,
             mux_bits,
+            packed,
         }
     }
 
@@ -245,10 +329,30 @@ impl CapCells {
         } else {
             edsl::wrap_merkle_walk(b, leaf, walk_bits, siblings)
         };
+        if let Some(packed) = &self.packed {
+            // The walked digest against the packed node: one word muxed.
+            let node = Self::select_words(b, packed.clone(), top_bits);
+            let walked = pack_digest(b, walked);
+            edsl::assert_word_eq(b, walked, node);
+            return;
+        }
         let node = self.select(b, top_bits);
         for (x, y) in walked.iter().zip(node.iter()) {
             edsl::assert_word_eq(b, *x, *y);
         }
+    }
+
+    /// The packed mux: `words[index]` from the top bits, low first, one
+    /// `Select` row a pair a level (`words.len() − 1` in all).
+    fn select_words(b: &mut LfmBuilder, words: Vec<Cell>, top_bits: &[Bit]) -> Cell {
+        let mut level = words;
+        for bit in top_bits {
+            level = level
+                .chunks_exact(2)
+                .map(|pair| b.select(*bit, pair[0], pair[1]).0)
+                .collect();
+        }
+        level[0]
     }
 
     /// `cap[index >> (depth − mux_bits)]` from the index's top bits, LOW
