@@ -2448,21 +2448,24 @@ fn the_production_blake3_run_levers_by_closed_form() {
     report("query grind 24 + binary cap 6", &s, t);
 }
 
-/// Runs `f` with this thread's cap mux packed
-/// (`merkle_cap::PACKED_MUX`), then restores the knob's reading.
-fn with_packed_mux(f: impl FnOnce()) {
-    super::merkle_cap::PACKED_MUX.with(|c| c.set(Some(true)));
+/// Runs `f` with this thread's cap mux packed (`Some(true)`) or plain
+/// (`Some(false)`) whatever the knob says (`merkle_cap::PACKED_MUX`), then
+/// restores the knob's reading.
+fn with_cap_mux(packed: bool, f: impl FnOnce()) {
+    super::merkle_cap::PACKED_MUX.with(|c| c.set(Some(packed)));
     f();
     super::merkle_cap::PACKED_MUX.with(|c| c.set(None));
 }
 
-/// ★ THE PACKED MUX GATE. Every BLAKE3 chain and group gate again with the cap
-/// checked over packed digests (`LAMBDA_VM_LFM_CAP_MUX=packed`): honest proofs
-/// execute, every tamper has no execution, the compressions are the closed
-/// form's (the packing hashes nothing), under both lowerings.
+/// ★ THE ROLLBACK MUX GATE. The cap is checked over packed digests by default
+/// (`LAMBDA_VM_LFM_CAP_MUX` unset), so every gate above runs packed; this runs
+/// every BLAKE3 chain and group gate again with the plain mux
+/// (`LAMBDA_VM_LFM_CAP_MUX=plain`, the rollback): honest proofs execute, every
+/// tamper has no execution, the compressions are the closed form's, under
+/// both lowerings.
 #[test]
-fn every_blake3_gate_holds_under_the_packed_cap_mux() {
-    with_packed_mux(|| {
+fn every_blake3_gate_holds_under_the_plain_cap_mux() {
+    with_cap_mux(false, || {
         chain::a_blake3_chain_executes_on_a_proof_the_host_accepts();
         chain::a_blake3_chain_emits_its_compression_closed_form();
         chain::a_tampered_blake3_chain_cannot_execute();
@@ -2473,9 +2476,8 @@ fn every_blake3_gate_holds_under_the_packed_cap_mux() {
     });
 }
 
-/// The packed mux is the mode the gate above ran: a capped chain's program
-/// muxes one word a node instead of two (about half its cap `Select` rows),
-/// with the same compressions.
+/// The packed mux (the default) muxes one word a node instead of the plain
+/// mux's two (about half the cap's `Select` rows), with the same compressions.
 #[test]
 fn the_packed_cap_mux_halves_the_muxs_select_rows() {
     use super::whir_chain::ChainShape;
@@ -2493,10 +2495,19 @@ fn the_packed_cap_mux_halves_the_muxs_select_rows() {
             .filter(|i| matches!(i, Instr::Select { .. }))
             .count()
     };
-    let plain = chain::program(&shape);
-    let mut packed = None;
-    with_packed_mux(|| packed = Some(chain::program(&shape)));
-    let packed = packed.expect("the packed program");
+    let (mut plain, mut packed) = (None, None);
+    with_cap_mux(false, || plain = Some(chain::program(&shape)));
+    with_cap_mux(true, || packed = Some(chain::program(&shape)));
+    let (plain, packed) = (
+        plain.expect("the plain program"),
+        packed.expect("the packed program"),
+    );
+    let default = chain::program(&shape);
+    assert_eq!(
+        default.instrs.len(),
+        packed.instrs.len(),
+        "the default is the packed mux"
+    );
     assert_eq!(
         hash_rows(&plain),
         hash_rows(&packed),
@@ -2596,14 +2607,17 @@ fn the_packed_cap_compare_admits_the_node_and_its_partners_only() {
     });
 }
 
-/// The packed mux's knob: unset and `plain` are today's mux, `packed` the
-/// packed one, and anything else is refused.
+/// The cap mux's knob: unset and `packed` are the packed mux (the default),
+/// `plain` the rollback, and anything else is refused.
 #[test]
 fn the_cap_mux_knob_reads_its_words_and_refuses_the_rest() {
     use super::merkle_cap::{cap_mux_packed, cap_mux_setting};
-    assert!(!cap_mux_packed(), "no test sets the knob");
+    assert!(
+        cap_mux_packed(),
+        "no test sets the knob: the default is packed"
+    );
     for (word, want) in [
-        (None, false),
+        (None, true),
         (Some("plain"), false),
         (Some(" packed "), true),
         (Some("packed"), true),

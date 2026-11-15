@@ -96,18 +96,19 @@ pub fn cap_root_permutations(nodes: usize, arity: usize) -> usize {
     perms
 }
 
-/// The knob that checks a BLAKE3 opening against its cap over PACKED digests
-/// ([`pack_digest`]): the mux then picks one word a node instead of two, half
-/// its `Select` rows. Read by the in-guest verifier alone (the proof does not
-/// move; the leaf programs do): see [`cap_mux_setting`].
+/// The knob that chooses how a BLAKE3 opening is checked against its cap: over
+/// PACKED digests ([`pack_digest`], the default), where the mux picks one word
+/// a node instead of two (half its `Select` rows), or over both digest words
+/// (`plain`, the rollback). Read by the in-guest verifier alone (the proof
+/// does not move; the leaf programs do): see [`cap_mux_setting`].
 pub const CAP_MUX_ENV: &str = "LAMBDA_VM_LFM_CAP_MUX";
 
-/// [`CAP_MUX_ENV`]'s value: unset or `plain` muxes both digest words (today);
-/// `packed` muxes the packed word. Anything else is refused.
+/// [`CAP_MUX_ENV`]'s value: unset or `packed` muxes the packed word (the
+/// default); `plain` muxes both digest words. Anything else is refused.
 pub fn cap_mux_setting(value: Option<&str>) -> Result<bool, String> {
     match value.map(str::trim) {
-        None | Some("plain") => Ok(false),
-        Some("packed") => Ok(true),
+        None | Some("packed") => Ok(true),
+        Some("plain") => Ok(false),
         Some(other) => Err(format!("{CAP_MUX_ENV}={other:?}: expected plain or packed")),
     }
 }
