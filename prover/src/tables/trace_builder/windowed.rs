@@ -557,6 +557,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 cpu_decoded: 0,
                 memw_aligned_rows: 0,
                 shift_rows: 0,
+                store_rows: 0,
             },
             stamps: WindowStamps::default(),
             stream_memw_lt: false,
@@ -1785,6 +1786,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 // STORE's last rows listed as cycles, rebuilt from their
                 // logs, before any the finish's window routed.
                 let mut segments = segments;
+                let mut store_rebuilt = 0usize;
                 if !segments.store_cycles.is_empty() {
                     let cycles = std::mem::replace(
                         &mut segments.store_cycles,
@@ -1794,14 +1796,8 @@ impl<'a> WindowedTraceBuilder<'a> {
                     let mut ops: Vec<store::StoreOperation> =
                         rebuild_slices(&[&cycles], &kept.cycle_logs, &decode)?;
                     // Their lookups were counted where the walkers routed
-                    // them; the finish counts its STORE tail's again.
-                    for op in &ops {
-                        if !counted.histogram.remove_ops(&op.collect_bitwise_ops()) {
-                            return Err(Error::Prover(
-                                "STORE listed: a tail row's lookups were never counted".to_string(),
-                            ));
-                        }
-                    }
+                    // them: the finish counts the STORE tail from after them.
+                    store_rebuilt = ops.len();
                     ops.extend(
                         std::mem::replace(&mut segments.store_ops, BlockVec::from_vec(Vec::new()))
                             .into_vec(),
@@ -1845,6 +1841,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                     cpu_decoded,
                     memw_aligned_rows,
                     shift_rows,
+                    store_rows: store_rebuilt,
                     ..counted
                 };
                 (ops, decode_trace, skip, pre)

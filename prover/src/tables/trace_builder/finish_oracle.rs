@@ -89,9 +89,15 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     // The CPU, MEMW_A and SHIFT rows counted where they were made
     // ([`PreCounted::cpu_decoded`], `memw_aligned_rows`, `shift_rows`): the
     // counts below read the rest.
-    let (cpu_decoded, aligned_counted, shift_counted) = pre.as_ref().map_or((0, 0, 0), |pre| {
-        (pre.cpu_decoded, pre.memw_aligned_rows, pre.shift_rows)
-    });
+    let (cpu_decoded, aligned_counted, shift_counted, store_counted) =
+        pre.as_ref().map_or((0, 0, 0, 0), |pre| {
+            (
+                pre.cpu_decoded,
+                pre.memw_aligned_rows,
+                pre.shift_rows,
+                pre.store_rows,
+            )
+        });
     let aligned_uncounted = &memw_aligned_ops[aligned_counted.min(memw_aligned_ops.len())..];
     let shift_uncounted: Vec<&[ShiftOperation]> = {
         let mut skip = shift_counted;
@@ -310,7 +316,20 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         }));
     }
     let store_slice = p4_slice_len(P4Source::Store, mul_chunk, dvrm_chunk);
-    for slice in store_ops.parts().flat_map(|part| part.chunks(store_slice)) {
+    // The STORE rows counted where they were routed ([`PreCounted::store_rows`]).
+    let mut store_skip = store_counted;
+    let store_uncounted: Vec<&[store::StoreOperation]> = store_ops
+        .parts()
+        .filter_map(|part| {
+            let from = store_skip.min(part.len());
+            store_skip -= from;
+            (from < part.len()).then(|| &part[from..])
+        })
+        .collect();
+    for slice in store_uncounted
+        .into_iter()
+        .flat_map(|part| part.chunks(store_slice))
+    {
         collectors.push(Box::new(move |h| {
             for op in slice {
                 h.add_ops(&op.collect_bitwise_ops());
