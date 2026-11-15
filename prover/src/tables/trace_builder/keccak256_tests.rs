@@ -855,3 +855,138 @@ fn box_each_forgery_is_refused_by_the_verifier_and_accepted_without_its_checks()
     }
     assert!(wrong.is_empty(), "not as expected: {wrong:?}");
 }
+
+// =============================================================================
+// ★ Checks a single cell edit cannot isolate, each refusing an edit alone
+// =============================================================================
+//
+// On hand-built rows (no guest run): one keccak256 call of 141 bytes, two
+// blocks (the second reads five bytes, all in lane 0), and two padding rows.
+// Each edit below breaks exactly one check, every other KECCAK constraint
+// still holding (the edits move the cells a neighbouring check reads with
+// it); the check left out, the row satisfies every constraint. What the buses
+// add is not looked at here. Not isolatable, so not here: a non-bit `LAST`
+// (refused by "a row that is not last reads a whole block" or "the last block
+// holds at most 135 bytes"), a non-bit `FULL` and `FULL · PART ≠ 0` (each puts
+// a 2 or a hole in the mask, refused by the prefix rule).
+
+/// The rows: `(table, [first, last, padding, padding])`.
+fn hand_built() -> (Vec<Vec<FE>>, [usize; 4]) {
+    let input: Vec<u8> = (0..141u32).map(|i| (7 * i + 3) as u8).collect();
+    let ops = keccak::sponge_ops(400, 0x1000, 0x2000, &input);
+    assert_eq!(ops.len(), 2, "two blocks");
+    let trace = keccak::generate_keccak_trace(&ops);
+    let rows = (0..trace.num_rows())
+        .map(|r| {
+            (0..cols::NUM_COLUMNS)
+                .map(|c| *trace.get_main(r, c))
+                .collect()
+        })
+        .collect();
+    (rows, [0, 1, 2, 3])
+}
+
+/// The KECCAK constraints that do not vanish on `row`, with this thread's
+/// checks left out.
+fn failing_on(row: &[FE]) -> Vec<usize> {
+    use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+    use math::field::element::FieldElement;
+    use stark::constraints::builder::{ConstraintSet, ProverEvalFolder};
+    use stark::frame::Frame;
+    use stark::table::TableView;
+    use stark::traits::TransitionEvaluationContext;
+    let n = KeccakConstraints.meta().len();
+    let frame = Frame::<GoldilocksField, GoldilocksExtension>::new(vec![TableView::new(
+        vec![row.to_vec()],
+        vec![vec![]],
+    )]);
+    let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![];
+    let offset_e = FieldElement::<GoldilocksExtension>::zero();
+    let ctx =
+        TransitionEvaluationContext::new_prover(frame.as_row_frame(), &no_e, &no_e, &offset_e);
+    let mut base = vec![FE::zero(); n];
+    let mut ext = vec![FieldElement::<GoldilocksExtension>::zero(); n];
+    let mut folder = ProverEvalFolder::new(&ctx, &mut base, &mut ext);
+    KeccakConstraints.eval(&mut folder);
+    (0..n).filter(|&i| base[i] != FE::zero()).collect()
+}
+
+/// `edit` on row `at` breaks `check` alone: refused with every check in,
+/// accepted with `check` left out.
+fn refused_only_by(check: SpongeCheck, at: usize, edit: impl Fn(&mut Vec<FE>)) {
+    let (rows, _) = hand_built();
+    keccak::leave_out(&[]);
+    for (r, row) in rows.iter().enumerate() {
+        assert_eq!(failing_on(row), Vec::<usize>::new(), "honest row {r}");
+    }
+    let mut row = rows[at].clone();
+    edit(&mut row);
+    assert_ne!(
+        failing_on(&row),
+        Vec::<usize>::new(),
+        "{check:?}: the edit is refused"
+    );
+    keccak::leave_out(&[check]);
+    let without = failing_on(&row);
+    keccak::leave_out(&[]);
+    assert_eq!(
+        without,
+        Vec::<usize>::new(),
+        "{check:?}: with it left out the edit passes every other constraint"
+    );
+}
+
+/// `(FIRST + LAST)(1 − MU_S) = 0`: a padding row claiming to start a call.
+#[test]
+fn first_off_a_sponge_row_is_refused_only_by_its_check() {
+    let [_, _, padding, _] = hand_built().1;
+    refused_only_by(SpongeCheck::FlagsOnSponge, padding, |row| {
+        row[cols::FIRST] = FE::one();
+    });
+}
+
+/// `(1 − MU_S) · s_0 = 0`: a padding row reading lane 0 (the prefix rule holds:
+/// the lane is whole and nothing follows).
+#[test]
+fn a_read_off_a_sponge_row_is_refused_only_by_its_check() {
+    let [_, _, padding, _] = hand_built().1;
+    refused_only_by(SpongeCheck::ReadsOnSponge, padding, |row| {
+        row[cols::full(0)] = FE::one();
+    });
+}
+
+/// `FIRST · TIMESTAMP_1 = 0`: the first row claiming block 1.
+#[test]
+fn a_first_row_off_block_zero_is_refused_only_by_its_check() {
+    let [first, ..] = hand_built().1;
+    refused_only_by(SpongeCheck::FirstBlock, first, |row| {
+        row[cols::TIMESTAMP_1] = FE::one();
+    });
+}
+
+/// The `PART` bits: the last read byte of the last block counted twice
+/// (`PART = 2`), with `COUNT` one higher and that byte's `MSG` at 0 so that
+/// the count, the prefix rule and "bytes past the input are 0" all hold.
+#[test]
+fn a_part_bit_of_two_is_refused_only_by_the_mask_bits() {
+    let [_, last, ..] = hand_built().1;
+    refused_only_by(SpongeCheck::MaskBits, last, |row| {
+        assert_eq!(row[cols::part(0, 4)], FE::one(), "byte 4 is read");
+        assert_eq!(row[cols::part(0, 5)], FE::zero(), "byte 5 is not");
+        row[cols::part(0, 4)] = FE::from(2u64);
+        row[cols::COUNT] += FE::one();
+        row[cols::msg(4)] = FE::zero();
+    });
+}
+
+/// The `FIRST` bit (not a leave-out check: index 54 is the only constraint
+/// that fails): `FIRST = 2` on the first row, whose block index and starting
+/// state are 0, so every product with `FIRST` still vanishes.
+#[test]
+fn a_first_flag_of_two_is_refused_only_by_its_bit() {
+    let (rows, [first, ..]) = hand_built();
+    keccak::leave_out(&[]);
+    let mut row = rows[first].clone();
+    row[cols::FIRST] = FE::from(2u64);
+    assert_eq!(failing_on(&row), vec![54]);
+}
