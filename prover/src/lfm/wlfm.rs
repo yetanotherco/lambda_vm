@@ -506,19 +506,17 @@ impl WlfmAirs {
         for (i, (air, trace, _)) in self.lfm.air_trace_pairs(traces).into_iter().enumerate() {
             match self.lfm_chunks.get(i) {
                 Some(chunks) if chunks.len() > 1 => {
-                    // A cut chip: each chunk its own table, its rows copied out.
+                    // A cut chip: each chunk its own table, transposed straight
+                    // out of the row-major trace into its columns (one pass:
+                    // no row-major copy to transpose again).
                     let width = trace.main_table.width;
+                    let height = trace.main_table.height;
                     let data = trace.main_table.row_major_data();
                     let mut start = 0usize;
                     for &rows in chunks {
-                        let end = (start + rows).min(trace.main_table.height);
-                        let mut chunk = data[start * width..end * width].to_vec();
-                        chunk.resize(rows * width, FieldElement::zero());
                         pairs.push((
                             air,
-                            TableIn::Owned(Box::new(stark::trace::TraceTable::new_main(
-                                chunk, width, 1,
-                            ))),
+                            TableIn::Columns(chunk_columns(data, width, height, start, rows)),
                         ));
                         start += rows;
                     }
@@ -541,12 +539,54 @@ impl WlfmAirs {
     }
 }
 
+/// Rows `[start, start + rows)` of a `width`-wide row-major trace of `height`
+/// rows as columns, the rows past `height` zero: row blocks in parallel, each
+/// reading its rows once and writing its share of every column.
+fn chunk_columns(
+    data: &[FieldElement<F>],
+    width: usize,
+    height: usize,
+    start: usize,
+    rows: usize,
+) -> Vec<Vec<FieldElement<F>>> {
+    use rayon::prelude::*;
+    const BLOCK: usize = 1 << 12;
+    let mut cols: Vec<Vec<FieldElement<F>>> = (0..width)
+        .map(|_| crate::tables::types::zeroed_fe_vec(rows))
+        .collect();
+    let real = height.saturating_sub(start).min(rows);
+    let mut by_block: Vec<Vec<&mut [FieldElement<F>]>> = (0..real.div_ceil(BLOCK))
+        .map(|_| Vec::with_capacity(width))
+        .collect();
+    for col in cols.iter_mut() {
+        for (b, segment) in col[..real].chunks_mut(BLOCK).enumerate() {
+            by_block[b].push(segment);
+        }
+    }
+    by_block
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(b, mut segments)| {
+            let first = start + b * BLOCK;
+            let len = segments.first().map_or(0, |s| s.len());
+            for (i, row) in data[first * width..(first + len) * width]
+                .chunks_exact(width)
+                .enumerate()
+            {
+                for (segment, v) in segments.iter_mut().zip(row) {
+                    segment[i] = *v;
+                }
+            }
+        });
+    cols
+}
+
 /// One table's columns as the W-LFM prover takes them: an LFM chip's trace, or
 /// a lean table as its fill held it (wide or narrow).
 pub enum TableIn<'a> {
     Wide(&'a mut stark::trace::TraceTable<F, E>),
-    /// A chunk of a cut chip's trace.
-    Owned(Box<stark::trace::TraceTable<F, E>>),
+    /// A chunk of a cut chip's trace, its columns.
+    Columns(Vec<Vec<FieldElement<F>>>),
     Held(&'a mut super::b3l_tables::HeldTable),
 }
 
@@ -559,7 +599,7 @@ impl TableIn<'_> {
     fn shape(&self) -> (usize, usize) {
         match self {
             TableIn::Wide(t) => (t.main_table.width, t.main_table.height),
-            TableIn::Owned(t) => (t.main_table.width, t.main_table.height),
+            TableIn::Columns(cols) => (cols.len(), cols.first().map_or(0, Vec::len)),
             TableIn::Held(h) => (h.cols(), h.rows()),
         }
     }
@@ -568,7 +608,7 @@ impl TableIn<'_> {
     fn get(&self, r: usize, c: usize) -> FieldElement<F> {
         match self {
             TableIn::Wide(t) => *t.main_table.get(r, c),
-            TableIn::Owned(t) => *t.main_table.get(r, c),
+            TableIn::Columns(cols) => cols[c][r],
             TableIn::Held(h) => h.get(r, c),
         }
     }
@@ -1366,12 +1406,9 @@ fn prove_traces_under<H: WhirHash>(
                     core::mem::take(&mut columns[col as usize])
                 })
             }
-            TableIn::Owned(trace) => {
-                let mut columns = trace.main_table.columns_blocked();
-                CommittedTable::from_layout(layout, |col| {
-                    core::mem::take(&mut columns[col as usize])
-                })
-            }
+            TableIn::Columns(mut columns) => CommittedTable::from_layout(layout, |col| {
+                core::mem::take(&mut columns[col as usize])
+            }),
             TableIn::Held(held) => match held.take() {
                 super::b3l_tables::HeldTable::Wide(trace) => {
                     let mut columns = trace.main_table.columns_blocked();
