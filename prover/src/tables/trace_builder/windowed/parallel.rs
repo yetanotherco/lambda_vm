@@ -146,6 +146,10 @@ struct WalkSettings {
     /// keeps its window's history and lists its exceptions for CPU chunks
     /// this long ([`WindowedTraceBuilder::derives_sides`]).
     sides_chunk: Option<usize>,
+    /// A test's fault: the windows from this one on are walked as without
+    /// [`Self::sides_chunk`] ([`WindowedTraceBuilder::card_derives_sides_until`]).
+    #[cfg(test)]
+    sides_until: u32,
     /// Record mode's check: where a walker sends the digest of a rechecked
     /// window's lists ([`check_thread`]).
     digests: Option<Mutex<std::sync::mpsc::Sender<(u32, u64)>>>,
@@ -268,7 +272,10 @@ impl WindowWalker {
         // the rows the derivation cannot read and keeps no side record, and
         // the window's history goes with it.
         let mut exceptions = Vec::new();
-        let sides = s.sides_chunk.map(|rows| super::history_sides::SideHook {
+        let sides_chunk = s.sides_chunk;
+        #[cfg(test)]
+        let sides_chunk = sides_chunk.filter(|_| job.window < s.sides_until);
+        let sides = sides_chunk.map(|rows| super::history_sides::SideHook {
             extras: &history.extras,
             chunk_rows: rows as u64,
             out: &mut exceptions,
@@ -295,7 +302,7 @@ impl WindowWalker {
         if s.keep_logs {
             walked.keep_logs(Arc::clone(&job.logs));
         }
-        if s.sides_chunk.is_some() {
+        if sides_chunk.is_some() {
             walked.keep_history_sides(Arc::clone(history), exceptions);
         }
         if self.record.take_missing() {
@@ -679,6 +686,8 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         keep_logs: builder.keeps_logs(),
         words: builder.writes_words(),
         sides_chunk: builder.derives_sides(),
+        #[cfg(test)]
+        sides_until: builder.sides_until(),
         digests: (recheck > 0).then(|| Mutex::new(digest_tx)),
     });
     let key = settings.key;

@@ -637,6 +637,20 @@ fn in_row_build(
     listless: bool,
     derive: bool,
 ) -> (crate::tables::trace_builder::Traces, usize) {
+    in_row_build_until(program, input, max_rows, window, listless, derive, u32::MAX)
+}
+
+/// [`in_row_build`], the windows from `until` on coming without their
+/// history ([`WindowedTraceBuilder::card_derives_sides_until`]).
+fn in_row_build_until(
+    program: &Elf,
+    input: &[u8],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    listless: bool,
+    derive: bool,
+    until: u32,
+) -> (crate::tables::trace_builder::Traces, usize) {
     let room: super::RecordsRoom = Arc::new(|_| true);
     let mut builder = WindowedTraceBuilder::new(program, input, max_rows)
         .and_then(|b| b.register_format(RegisterFormat::InRow))
@@ -650,6 +664,7 @@ fn in_row_build(
                 Ok(b)
             }
         })
+        .map(|b| b.card_derives_sides_until(until))
         .expect("the builder");
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
     let mut chunks = Vec::new();
@@ -725,4 +740,33 @@ fn the_build_with_the_side_records_derived_is_todays() {
         }
     }
     assert!(held > 4, "{held} chunks held in the history form");
+}
+
+/// ★ A window that comes without its history in the middle of a run (as a
+/// rebuilt one would): the CPU tail pending is settled on the host, every
+/// later chunk carries side records, no chunk mixes the two, and the whole
+/// build is today's. The chunks before the window are in the history form,
+/// those after it not.
+#[test]
+fn a_window_without_its_history_ends_the_mode_and_the_build_is_todays() {
+    let max_rows = MaxRowsConfig::small();
+    let program = rust_elf("dma_memmove_cases");
+    let window = 97usize;
+    for listless in [true, false] {
+        let (today, _) = in_row_build(&program, &[], &max_rows, window, listless, false);
+        let (all, n_all) = in_row_build(&program, &[], &max_rows, window, listless, true);
+        crate::tests::windowed_builder_tests::same_traces(&today, &all);
+        for until in [0u32, 1, 7, 100, 333] {
+            let (part, n) =
+                in_row_build_until(&program, &[], &max_rows, window, listless, true, until);
+            crate::tests::windowed_builder_tests::same_traces(&today, &part);
+            assert!(n <= n_all, "until {until}: {n} of {n_all}");
+            if until == 0 {
+                assert_eq!(n, 0, "no window hooked, no chunk in the history form");
+            }
+            if until == 100 {
+                assert!(n > 0 && n < n_all, "until {until}: {n} of {n_all}");
+            }
+        }
+    }
 }

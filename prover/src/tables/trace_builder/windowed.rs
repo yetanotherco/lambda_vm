@@ -292,6 +292,9 @@ pub struct WindowedTraceBuilder<'a> {
     /// [`Self::card_fill_records_fault`].
     #[cfg(test)]
     card_fill_fault: usize,
+    /// [`Self::card_derives_sides_until`].
+    #[cfg(test)]
+    sides_until: u32,
     /// [`Self::card_fill_streamed`].
     card_fill_streamed: Option<StreamedCardFill>,
     /// Where the hand-out's counting runs ([`Self::count_handout_on_thread`]).
@@ -574,6 +577,8 @@ impl<'a> WindowedTraceBuilder<'a> {
             card_fill: false,
             #[cfg(test)]
             card_fill_fault: 0,
+            #[cfg(test)]
+            sides_until: u32::MAX,
             card_fill_streamed: None,
             count,
         })
@@ -1065,6 +1070,22 @@ impl<'a> WindowedTraceBuilder<'a> {
         };
         kept.history = Some(history_sides::HistoryTail::default());
         Ok(self)
+    }
+
+    /// A test's fault: with [`Self::card_derives_sides`], the walkers hook
+    /// the windows before `window` only; from it on each window comes as
+    /// without the mode (its side records written, no history), as a window
+    /// rebuilt without its history would.
+    #[cfg(test)]
+    pub(crate) fn card_derives_sides_until(mut self, window: u32) -> Self {
+        self.sides_until = window;
+        self
+    }
+
+    /// A test's [`Self::card_derives_sides_until`] (`u32::MAX` without).
+    #[cfg(test)]
+    pub(crate) fn sides_until(&self) -> u32 {
+        self.sides_until
     }
 
     /// The CPU chunks' height when each walked window keeps its history and
