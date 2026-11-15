@@ -375,5 +375,39 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CpuConstraints {
         idx += 1;
 
         debug_assert_eq!(idx, NUM_CPU_CONSTRAINTS);
+
+        // Measurement only (`LAMBDA_VM_PROBE_PC_CHAIN=1`): the PC chain as a
+        // next-row constraint beside the tokens that already imply it,
+        // `(1 − ECALL)·(PC[i+1] − NEXT_PC[i]) = 0` on every row but the last,
+        // each word — so the argue pays a next-row read on every CPU table.
+        if probe_pc_chain() {
+            for (pc, next) in [(cols::PC_0, cols::NEXT_PC_0), (cols::PC_1, cols::NEXT_PC_1)] {
+                let one = b.one();
+                let ecall = b.main(0, cols::ECALL);
+                let gate = one - ecall;
+                let following = b.main(1, pc);
+                let next_pc = b.main(0, next);
+                b.emit_base_rows(
+                    idx,
+                    stark::constraints::builder::RowDomain::except_last(1),
+                    gate * (following - next_pc),
+                );
+                idx += 1;
+            }
+        }
     }
+}
+
+/// `LAMBDA_VM_PROBE_PC_CHAIN=1`: [`CpuConstraints`] also chains the PC as a
+/// next-row constraint (a probe of the claim reduction's cost; redundant
+/// beside the PC tokens, so honest proofs verify). Unset, nothing changes.
+pub(crate) fn probe_pc_chain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("LAMBDA_VM_PROBE_PC_CHAIN").is_ok_and(|v| v.trim() == "1");
+        if on {
+            eprintln!("PROBE PC CHAIN: on (two next-row PC constraints a CPU table)");
+        }
+        on
+    })
 }
