@@ -115,8 +115,6 @@ impl CpuLogRecords {
     /// executor's history: `extras` (one a log) and `exceptions` (ascending
     /// by cycle, every row whose `rd` old value the logs do not give;
     /// [`super::history_sides`]). Refused unless there is one record a log.
-    // Its caller, the windowed builder's cut, comes with `LAMBDA_VM_CARD_TRACE`.
-    #[allow(dead_code)]
     pub(crate) fn in_row_from_history(
         logs: Segments<Log>,
         extras: HistoryParts,

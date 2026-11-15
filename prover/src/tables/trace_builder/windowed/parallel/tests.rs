@@ -88,6 +88,7 @@ fn walked_from_entries_with(
         key: 0x5eed_1234_abcd_0042,
         keep_logs: builder.keeps_logs(),
         words: builder.writes_words(),
+        sides_chunk: builder.derives_sides(),
         digests: None,
     });
     let mut pass = LeanPass::new(Arc::clone(&builder.decode), &builder.register_state)?;
