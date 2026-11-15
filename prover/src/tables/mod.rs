@@ -17,6 +17,7 @@
 //! - **MEMW**: Memory word read/write table (unaligned/split-timestamp path, 49 cols, 26 interactions)
 //! - **MEMW_A**: Memory word read/write table (aligned fast path, 29 cols, 20 interactions)
 //! - **LOAD**: Memory load with extension table
+//! - **MEM_LOAD**, **MEM_STORE**: a CPU load or store checked in one row with its memory tokens (the fused memory format)
 //! - **PAGE**: Paged memory init/final table (one per used page)
 //! - **REGISTER**: Register init/final table for x0-x31, x254, and x255 word addresses
 
@@ -38,6 +39,7 @@ pub mod ecdas;
 pub mod ecrec;
 pub mod ecsm;
 pub mod eq;
+pub mod fused_memory;
 pub mod global_memory;
 pub mod halt;
 pub mod hint;
@@ -48,6 +50,8 @@ pub mod keccak_rnd;
 pub mod load;
 pub mod local_to_global;
 pub mod lt;
+pub mod mem_load;
+pub mod mem_store;
 pub mod memw;
 pub mod memw_aligned;
 pub mod memw_register;
