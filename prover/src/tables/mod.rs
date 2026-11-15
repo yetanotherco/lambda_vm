@@ -50,6 +50,14 @@ pub mod keccak_rnd;
 pub mod load;
 pub mod local_to_global;
 pub mod lt;
+/// The fused memory tables' records as the card's fill reads them. Read by
+/// the streamed hand-out once the walk makes these rows.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod mem_card;
+/// The fused memory tables' card fills against the host's: a box test, with
+/// a card.
+#[cfg(all(test, feature = "cuda", feature = "parallel"))]
+mod mem_card_tests;
 pub mod mem_load;
 pub mod mem_store;
 pub mod memw;
