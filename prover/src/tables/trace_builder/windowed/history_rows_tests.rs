@@ -48,6 +48,8 @@ pub(super) struct Walked {
     pub(super) logs: Arc<Vec<Log>>,
     pub(super) history: Arc<WindowHistory>,
     pub(super) rows: Vec<AlignedRow>,
+    /// The LOAD ops its walk made.
+    pub(super) loads: Vec<crate::tables::load::LoadOperation>,
 }
 
 /// The windows the executor sent, by first cycle.
@@ -121,6 +123,7 @@ pub(super) fn walked_for(
         walk_windows_from_history(&mut builder, rx, 2, 0, |accumulator, walked, _| {
             let first = walked.first as u64;
             let rows = walked.walk.memw.aligned.clone();
+            let loads = walked.walk.load_ops.clone();
             let (logs, history) = sent
                 .lock()
                 .expect("the windows")
@@ -131,6 +134,7 @@ pub(super) fn walked_for(
                 logs,
                 history,
                 rows,
+                loads,
             });
             let _ = accumulator.absorb(walked);
             Ok(())
@@ -656,10 +660,27 @@ fn build(
     refs: bool,
     until: u32,
 ) -> (crate::tables::trace_builder::Traces, usize) {
-    use super::RowFamilies;
+    build_listed(program, input, window, refs, false, until)
+}
+
+/// [`build`], with `lists` the walkers listing LOAD's, STORE's and MEMW_A's
+/// rows in place of making them ([`WindowedTraceBuilder::card_row_lists`],
+/// on the light walk that routes in the walkers), the three families held as
+/// records. The chunks held as refs or cycles.
+fn build_listed(
+    program: &Elf,
+    input: &[u8],
+    window: usize,
+    refs: bool,
+    lists: bool,
+    until: u32,
+) -> (crate::tables::trace_builder::Traces, usize) {
+    use super::{RowFamilies, RowLists};
     let room: super::RecordsRoom = Arc::new(|_| true);
     let rows = RowFamilies {
         memw_a: true,
+        load: lists,
+        store: lists,
         ..RowFamilies::NONE
     };
     let mut builder = WindowedTraceBuilder::new(program, input, &MaxRowsConfig::small())
@@ -671,6 +692,19 @@ fn build(
         .and_then(WindowedTraceBuilder::card_derives_sides)
         .and_then(|b| if refs { b.card_derives_memw_a() } else { Ok(b) })
         .map(|b| b.card_derives_sides_until(until))
+        .and_then(|b| {
+            if lists {
+                b.count_where_made(true)
+                    .light_walk(2)?
+                    .card_row_lists(RowLists {
+                        load: true,
+                        store: true,
+                        memw_a: true,
+                    })
+            } else {
+                Ok(b)
+            }
+        })
         .expect("the builder");
     assert_eq!(builder.derives_memw_a(), refs);
     let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
@@ -699,7 +733,9 @@ fn build(
             for job in accumulator.absorb(walked) {
                 let chunk = job.generate();
                 if let Some(records) = chunk.trace.records_main() {
-                    held += usize::from(records.aligned_refs().is_some());
+                    held += usize::from(
+                        records.aligned_refs().is_some() || records.cycle_list().is_some(),
+                    );
                 }
                 // Held as records: the host fill's table, compared below.
                 chunks.push(super::card_records_tests::unheld(chunk).0);
@@ -764,4 +800,110 @@ fn a_window_without_its_history_ends_the_memw_a_refs_and_the_build_is_todays() {
         between |= n > 0 && n < n_all;
     }
     assert!(between, "no run ended the mode between its chunks");
+}
+
+/// ★ The whole build with the walkers listing LOAD's, STORE's and MEMW_A's
+/// rows (refs and cycles in place of rows, on the light walk) is today's,
+/// every table: the full chunks cut from the lists and held as them, the
+/// tails rebuilt on the host at the finish.
+#[test]
+fn the_build_from_the_walkers_lists_is_todays() {
+    let mut held = 0usize;
+    let mut cases: Vec<(String, Elf, usize)> = ["test_keccak_multi", "all_loadstore_32"]
+        .iter()
+        .flat_map(|name| [7usize, 33].map(|w| (name.to_string(), run(name).0, w)))
+        .collect();
+    cases.push((
+        "dma_memmove_cases".to_string(),
+        rust_elf("dma_memmove_cases"),
+        97,
+    ));
+    for (name, program, window) in &cases {
+        let (today, _) = build_listed(program, &[], *window, false, false, u32::MAX);
+        let (listed, n) = build_listed(program, &[], *window, true, true, u32::MAX);
+        crate::tests::windowed_builder_tests::same_traces(&today, &listed);
+        println!("{name}, window {window}: {n} chunks held as refs or cycles");
+        held += n;
+    }
+    assert!(held > 8, "{held} chunks held as refs or cycles");
+}
+
+/// A LOAD chunk held as its rows' cycles digests and host-fills as the walk's
+/// ops held as ops (the regeneration's form), and hands the card its cycles;
+/// a cycle whose log is not held, or not a load, is refused.
+#[test]
+fn a_load_chunk_held_as_cycles_reads_as_its_ops() {
+    use super::card_records::{CardDecode, CycleRecords, RowRecords};
+    use crate::tables::load::LoadOperation;
+    use multilinear::records::{TableRecords, digest_of};
+    let mut checked = 0usize;
+    for (name, window, rows) in [
+        ("all_loadstore_32", 7usize, 4usize),
+        ("test_keccak_multi", 7, 16),
+        ("dma_memmove_cases", 97, 1024),
+    ] {
+        let program = match name {
+            "dma_memmove_cases" => rust_elf(name),
+            _ => run(name).0,
+        };
+        let (walked, decode) = walked(&program, &[], window, MemwAlignedOrder::Limbs);
+        let card = Arc::new(CardDecode::new(Arc::clone(&decode)).expect("DECODE rows"));
+        let logs: Vec<(u64, Arc<Vec<Log>>)> = walked
+            .iter()
+            .map(|w| (w.first, Arc::clone(&w.logs)))
+            .collect();
+        let ops: Vec<LoadOperation> = walked
+            .iter()
+            .flat_map(|w| w.loads.iter().cloned())
+            .collect();
+        let cycles: Vec<u32> = ops
+            .iter()
+            .map(|op| ((op.timestamp - 4) / 4) as u32)
+            .collect();
+        for k in 0..ops.len() / rows {
+            let range = k * rows..(k + 1) * rows;
+            let held = CycleRecords::<LoadOperation>::new(
+                super::Segments::one(cycles[range.clone()].to_vec()),
+                logs.clone(),
+                Arc::clone(&card),
+            )
+            .unwrap_or_else(|_| panic!("{name}: a whole chunk"));
+            let as_ops = RowRecords::new(super::Segments::one(ops[range.clone()].to_vec()))
+                .unwrap_or_else(|_| panic!("{name}: ops"));
+            assert_eq!(digest_of(&held), digest_of(&as_ops), "{name}[{k}]");
+            assert_eq!(held.host_fill(), as_ops.host_fill(), "{name}[{k}]");
+            let list = held.cycle_list().expect("cycles");
+            assert!(!list.store);
+            assert_eq!(list.cycles.concat(), cycles[range].to_vec());
+            checked += 1;
+        }
+        // A cycle with no held log, and one that is no load.
+        let Some(&first) = cycles.first() else {
+            continue;
+        };
+        let past = (walked
+            .iter()
+            .map(|w| w.first + w.logs.len() as u64)
+            .max()
+            .unwrap_or(0)) as u32;
+        let not_load = (0..past).find(|&c| {
+            let log = logs
+                .iter()
+                .find(|(f, l)| u64::from(c) >= *f && u64::from(c) < f + l.len() as u64)
+                .map(|(f, l)| &l[(u64::from(c) - f) as usize]);
+            log.and_then(|l| decode.row(l.current_pc))
+                .is_some_and(|r| !decode.entry(r).fields.is_load())
+        });
+        for bad in [Some(past), not_load] {
+            let Some(bad) = bad else { continue };
+            let held = CycleRecords::<LoadOperation>::new(
+                super::Segments::one(vec![first, first, first, bad]),
+                logs.clone(),
+                Arc::clone(&card),
+            )
+            .unwrap_or_else(|_| panic!("{name}: a whole chunk"));
+            assert!(held.host_fill().is_none(), "{name}: cycle {bad} refused");
+        }
+    }
+    assert!(checked >= 4, "{checked} chunks");
 }

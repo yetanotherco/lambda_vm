@@ -4259,6 +4259,16 @@ type AlignedUp<'a> = (
     Box<math_cuda::fill::AlignedHostRows<'a>>,
 );
 
+/// A LOAD or STORE table going up as its rows' cycles: the cycles, whether it
+/// is STORE's, and its ops rebuilt on the host (LOAD's or STORE's).
+#[cfg(feature = "cuda")]
+type CyclesUp<'a> = (
+    Vec<&'a [u32]>,
+    bool,
+    Box<math_cuda::fill::LoadHostOps<'a>>,
+    Box<math_cuda::fill::StoreHostOps<'a>>,
+);
+
 /// A table's records as the card's fill reads them, before they go up: the
 /// fill, and a CPU table's DECODE rows on the card ([`records_input`] borrows
 /// both).
@@ -4288,6 +4298,9 @@ struct RecordsUp<'a> {
     /// A MEMW_A table held as refs, where the card derives its rows
     /// ([`crate::records::Records::aligned_refs`]).
     aligned_refs: Option<AlignedUp<'a>>,
+    /// A LOAD or STORE table held as its rows' cycles, where the card derives
+    /// its rows ([`crate::records::Records::cycle_list`]).
+    cycles: Option<CyclesUp<'a>>,
     loads: Vec<&'a [math_cuda::fill::LoadOpC]>,
     stores: Vec<&'a [math_cuda::fill::StoreOpC]>,
     shifts: Vec<&'a [math_cuda::fill::ShiftOpC]>,
@@ -4370,6 +4383,54 @@ impl<'a> RecordsUp<'a> {
                 .map(|p| unsafe { core::slice::from_raw_parts(p.as_ptr() as *const C, p.len()) })
                 .collect()
         }
+        // A LOAD or STORE table held as its rows' cycles goes up as them
+        // where the card derives (its ops not rebuilt on the host unless it
+        // declines).
+        if math_cuda::card_rows::mode().derives()
+            && let Some(c) = records.cycle_list()
+        {
+            let load: Box<math_cuda::fill::LoadHostOps<'a>> =
+                Box::new(move || match records.fill() {
+                    RecordsFill::Load { ops } => unsafe { cast::<LoadOp, LoadOpC>(&ops) }
+                        .into_iter()
+                        .flat_map(|piece| piece.iter().copied())
+                        .collect(),
+                    _ => Vec::new(),
+                });
+            let store: Box<math_cuda::fill::StoreHostOps<'a>> =
+                Box::new(move || match records.fill() {
+                    RecordsFill::Store { ops } => unsafe { cast::<StoreOp, StoreOpC>(&ops) }
+                        .into_iter()
+                        .flat_map(|piece| piece.iter().copied())
+                        .collect(),
+                    _ => Vec::new(),
+                });
+            let fill = if c.store {
+                RecordsFill::Store { ops: Vec::new() }
+            } else {
+                RecordsFill::Load { ops: Vec::new() }
+            };
+            return Some(Self {
+                rows: records.rows(),
+                cols: records.cols(),
+                fill,
+                decode: None,
+                hold: None,
+                logs: Vec::new(),
+                sides: Vec::new(),
+                stamps: Vec::new(),
+                exceptions: Vec::new(),
+                registers: Vec::new(),
+                words: None,
+                aligned: Vec::new(),
+                aligned_refs: None,
+                cycles: Some((c.cycles, c.store, load, store)),
+                loads: Vec::new(),
+                stores: Vec::new(),
+                shifts: Vec::new(),
+                memws: Vec::new(),
+            });
+        }
         // A MEMW_A table held as refs goes up as them where the card
         // derives (its rows not derived on the host unless it declines).
         if math_cuda::card_rows::mode().derives()
@@ -4443,6 +4504,7 @@ impl<'a> RecordsUp<'a> {
                 words: None,
                 aligned: Vec::new(),
                 aligned_refs: Some((parts, decode, a.limbs, host)),
+                cycles: None,
                 loads: Vec::new(),
                 stores: Vec::new(),
                 shifts: Vec::new(),
@@ -4486,6 +4548,7 @@ impl<'a> RecordsUp<'a> {
                 words: Some((w.words, whole, w.whole_base, decode)),
                 aligned: Vec::new(),
                 aligned_refs: None,
+                cycles: None,
                 loads: Vec::new(),
                 stores: Vec::new(),
                 shifts: Vec::new(),
@@ -4507,6 +4570,7 @@ impl<'a> RecordsUp<'a> {
             words: None,
             aligned: Vec::new(),
             aligned_refs: None,
+            cycles: None,
             loads: Vec::new(),
             stores: Vec::new(),
             shifts: Vec::new(),
@@ -4689,6 +4753,22 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
             records: &up.aligned,
             rows: up.rows,
         },
+        RecordsFill::Load { .. } if up.cycles.is_some() => {
+            let (cycles, _, host, _) = up.cycles.as_ref()?;
+            RecordsInput::LoadCycles {
+                cycles,
+                rows: up.rows,
+                host: &**host,
+            }
+        }
+        RecordsFill::Store { .. } if up.cycles.is_some() => {
+            let (cycles, _, _, host) = up.cycles.as_ref()?;
+            RecordsInput::StoreCycles {
+                cycles,
+                rows: up.rows,
+                host: &**host,
+            }
+        }
         RecordsFill::Load { .. } => RecordsInput::Load {
             records: &up.loads,
             rows: up.rows,

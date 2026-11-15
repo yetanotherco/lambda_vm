@@ -880,6 +880,21 @@ impl BitwiseHistogram {
         }
     }
 
+    /// Take a slice of lookups back out of the histogram (lookups counted
+    /// once where they were made, met again by a later count of the same
+    /// rows). `false`, the histogram then not to be used, where a lookup was
+    /// never counted.
+    pub(crate) fn remove_ops(&mut self, ops: &[BitwiseOperation]) -> bool {
+        for &op in ops {
+            let idx = lookup_type_index(op.lookup_type) * NUM_ROWS + row_index(op.x, op.y, op.z);
+            match self.counters[idx].checked_sub(1) {
+                Some(n) => self.counters[idx] = n,
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// Merge another histogram into this one (commutative, order-independent).
     pub(crate) fn merge(&mut self, other: &BitwiseHistogram) {
         for (a, b) in self.counters.iter_mut().zip(other.counters.iter()) {

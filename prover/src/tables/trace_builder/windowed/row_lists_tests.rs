@@ -3,8 +3,8 @@
 //! STORE's and MEMW_A's rows lists exactly the rows today's walk makes, in
 //! their order, makes every other list as today's and counts what today's
 //! walk and hand-out count; the builder and the walk refuse what the lists
-//! cannot take; and a run whose listed rows no chunk takes is refused at its
-//! finish.
+//! cannot take; a run listing LOAD or STORE finishes, one listing MEMW_A
+//! without the card's MEMW_A rows is refused at its finish.
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -397,11 +397,12 @@ fn finished(
     builder.finish(&report.last).map(drop)
 }
 
-/// ★ The builder and the walk refuse what the lists cannot take; a run whose
-/// listed rows no chunk takes is refused at its finish, LOAD's and MEMW_A's
-/// as STORE's, and nothing panics; with no list the run finishes.
+/// ★ The builder and the walk refuse what the lists cannot take; a run
+/// listing LOAD or STORE finishes, one listing MEMW_A without the card's
+/// MEMW_A rows is refused at its finish, and nothing panics; with no list
+/// the run finishes.
 #[test]
-fn listed_rows_no_chunk_takes_refuse_the_run() {
+fn the_lists_refusals_hold_and_a_listed_run_finishes() {
     let (program, _) = run("all_loadstore_32");
     let max_rows = MaxRowsConfig::small();
     let all = RowLists {
@@ -473,7 +474,9 @@ fn listed_rows_no_chunk_takes_refuse_the_run() {
     );
     let b = inrow(2).card_row_lists(all).expect("the lists");
     assert!(finished(b, &program, 33, 2, 3).is_err(), "a re-walk");
-    // The finish's: no chunk of this build takes the rows.
+    // The finish's: LOAD's and STORE's listed rows are cut from their cycles
+    // or rebuilt at the finish; MEMW_A's need the card's MEMW_A rows (the
+    // window's history beside its refs), without which the run is refused.
     for (what, lists) in [
         (
             "LOAD",
@@ -483,21 +486,22 @@ fn listed_rows_no_chunk_takes_refuse_the_run() {
             },
         ),
         ("STORE", store),
-        (
-            "MEMW_A",
-            RowLists {
-                memw_a: true,
-                ..RowLists::NONE
-            },
-        ),
     ] {
         let b = inrow(2).card_row_lists(lists).expect("the lists");
         let finish = finished(b, &program, 33, 3, 0);
-        assert!(
-            matches!(&finish, Err(crate::Error::Prover(line)) if line.contains("no chunk took")),
-            "{what}: {finish:?}"
-        );
+        assert!(finish.is_ok(), "{what}: {finish:?}");
     }
+    let b = inrow(2)
+        .card_row_lists(RowLists {
+            memw_a: true,
+            ..RowLists::NONE
+        })
+        .expect("the lists");
+    let finish = finished(b, &program, 33, 3, 0);
+    assert!(
+        matches!(&finish, Err(crate::Error::Prover(line)) if line.contains("MEMW_A listed without")),
+        "MEMW_A: {finish:?}"
+    );
     // No list: the run finishes.
     assert!(finished(inrow(2), &program, 33, 3, 0).is_ok(), "no list");
 }

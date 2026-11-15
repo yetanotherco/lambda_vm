@@ -264,6 +264,12 @@ impl AlignedPartIn<'_> {
 /// not derive them).
 pub type AlignedHostRows<'a> = dyn Fn() -> Vec<AlignedRowC> + Sync + 'a;
 
+/// A LOAD table's ops rebuilt on the host (where the card does not derive
+/// them from its rows' cycles).
+pub type LoadHostOps<'a> = dyn Fn() -> Vec<LoadOpC> + Sync + 'a;
+/// A STORE table's ops rebuilt on the host.
+pub type StoreHostOps<'a> = dyn Fn() -> Vec<StoreOpC> + Sync + 'a;
+
 /// One LOAD op (the prover's `LoadOperation`): the base address, the
 /// timestamp, the width, whether it sign-extends (0 or 1) and the result's
 /// bytes.
@@ -821,6 +827,20 @@ pub enum RecordsInput<'a> {
         records: &'a [&'a [LoadOpC]],
         rows: usize,
     },
+    /// LOAD's `rows` rows as their cycles, for the card to derive from the
+    /// CPU logs it holds ([`crate::card_rows`]); `host()` gives the ops
+    /// rebuilt on the host (every row, where the card does not derive them).
+    LoadCycles {
+        cycles: &'a [&'a [u32]],
+        rows: usize,
+        host: &'a LoadHostOps<'a>,
+    },
+    /// STORE's `rows` rows as their cycles, as [`Self::LoadCycles`].
+    StoreCycles {
+        cycles: &'a [&'a [u32]],
+        rows: usize,
+        host: &'a StoreHostOps<'a>,
+    },
     /// STORE's `rows` rows: `records`' pieces in order, then zero rows.
     Store {
         records: &'a [&'a [StoreOpC]],
@@ -848,6 +868,8 @@ impl std::fmt::Debug for RecordsInput<'_> {
             Self::MemwA { .. } => "MEMW_A",
             Self::MemwARefs { .. } => "MEMW_A (refs)",
             Self::Load { .. } => "LOAD",
+            Self::LoadCycles { .. } => "LOAD (cycles)",
+            Self::StoreCycles { .. } => "STORE (cycles)",
             Self::Store { .. } => "STORE",
             Self::Shift { .. } => "SHIFT",
             Self::Memw { .. } => "MEMW",
@@ -872,6 +894,8 @@ impl RecordsInput<'_> {
             | Self::MemwA { rows, .. }
             | Self::MemwARefs { rows, .. }
             | Self::Load { rows, .. }
+            | Self::LoadCycles { rows, .. }
+            | Self::StoreCycles { rows, .. }
             | Self::Store { rows, .. }
             | Self::Shift { rows, .. }
             | Self::Memw { rows, .. } => *rows,
@@ -891,8 +915,8 @@ impl RecordsInput<'_> {
             Self::Cpu { .. } => CPU_IN_ROW_COLUMNS,
             Self::MemwR { .. } | Self::MemwRWords { .. } => MEMW_R_COLUMNS,
             Self::MemwA { .. } | Self::MemwARefs { .. } => MEMW_A_COLUMNS,
-            Self::Load { .. } => LOAD_COLUMNS,
-            Self::Store { .. } => STORE_COLUMNS,
+            Self::Load { .. } | Self::LoadCycles { .. } => LOAD_COLUMNS,
+            Self::Store { .. } | Self::StoreCycles { .. } => STORE_COLUMNS,
             Self::Shift { .. } => SHIFT_COLUMNS,
             Self::Memw { .. } => MEMW_COLUMNS,
         }
@@ -929,6 +953,9 @@ impl RecordsInput<'_> {
             Self::MemwA { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::MemwARefs { parts, .. } => parts.iter().map(AlignedPartIn::bytes).sum(),
             Self::Load { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::LoadCycles { cycles, .. } | Self::StoreCycles { cycles, .. } => {
+                cycles.iter().map(|piece| size_of_val(*piece)).sum()
+            }
             Self::Store { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Shift { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Memw { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
@@ -945,6 +972,9 @@ impl RecordsInput<'_> {
             Self::MemwA { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::MemwARefs { parts, .. } => parts.iter().map(|part| part.refs.len()).sum(),
             Self::Load { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::LoadCycles { cycles, .. } | Self::StoreCycles { cycles, .. } => {
+                cycles.iter().map(|piece| piece.len()).sum()
+            }
             Self::Store { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Shift { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Memw { records, .. } => records.iter().map(|piece| piece.len()).sum(),
@@ -1152,6 +1182,27 @@ pub(crate) fn fill_col_major_into(
             let records_dev = upload_pieces(stream, pieces)?;
             launch_rows(stream, &m.load, &records_dev, records.len(), rows, dst)
         }
+        // Cycles where the card does not derive the rows: every op rebuilt on
+        // the host, then today's fill. Ops that could not be rebuilt come back
+        // short: refused.
+        RecordsInput::LoadCycles { rows, host, .. } => {
+            let n = records.len();
+            let ops = host();
+            if ops.len() != n {
+                return Err(crate::invalid_value());
+            }
+            let records_dev = upload_pieces(stream, &[&ops[..]])?;
+            launch_rows(stream, &m.load, &records_dev, n, rows, dst)
+        }
+        RecordsInput::StoreCycles { rows, host, .. } => {
+            let n = records.len();
+            let ops = host();
+            if ops.len() != n {
+                return Err(crate::invalid_value());
+            }
+            let records_dev = upload_pieces(stream, &[&ops[..]])?;
+            launch_rows(stream, &m.store, &records_dev, n, rows, dst)
+        }
         RecordsInput::Store {
             records: pieces,
             rows,
@@ -1338,6 +1389,20 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
             Staged::MemwA(upload_pieces(stream, &[&derived[..]])?, n)
         }
         RecordsInput::Load { records, .. } => Staged::Load(upload_pieces(stream, records)?, n),
+        RecordsInput::LoadCycles { host, .. } => {
+            let ops = host();
+            if ops.len() != n {
+                return Err(crate::invalid_value());
+            }
+            Staged::Load(upload_pieces(stream, &[&ops[..]])?, n)
+        }
+        RecordsInput::StoreCycles { host, .. } => {
+            let ops = host();
+            if ops.len() != n {
+                return Err(crate::invalid_value());
+            }
+            Staged::Store(upload_pieces(stream, &[&ops[..]])?, n)
+        }
         RecordsInput::Store { records, .. } => Staged::Store(upload_pieces(stream, records)?, n),
         RecordsInput::Shift { records, .. } => Staged::Shift(upload_pieces(stream, records)?, n),
         RecordsInput::Memw { records, .. } => Staged::Memw(upload_pieces(stream, records)?, n),

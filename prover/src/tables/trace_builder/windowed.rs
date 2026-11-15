@@ -88,8 +88,8 @@ type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
 mod card_records;
 use card_records::{
-    AlignedRefRecords, CardDecode, CpuLogRecords, RegisterRowRecords, RowChunk, RowFamily,
-    RowRecords,
+    AlignedRefRecords, CardDecode, CpuLogRecords, CycleRecords, RegisterRowRecords, RowChunk,
+    RowFamily, RowRecords,
 };
 
 mod handout_count;
@@ -1782,6 +1782,32 @@ impl<'a> WindowedTraceBuilder<'a> {
                     kept.listless = false;
                 }
                 kept.append(last, &decode);
+                // STORE's last rows listed as cycles, rebuilt from their
+                // logs, before any the finish's window routed.
+                let mut segments = segments;
+                if !segments.store_cycles.is_empty() {
+                    let cycles = std::mem::replace(
+                        &mut segments.store_cycles,
+                        BlockVec::from_vec(Vec::new()),
+                    )
+                    .into_vec();
+                    let mut ops: Vec<store::StoreOperation> =
+                        rebuild_slices(&[&cycles], &kept.cycle_logs, &decode)?;
+                    // Their lookups were counted where the walkers routed
+                    // them; the finish counts its STORE tail's again.
+                    for op in &ops {
+                        if !counted.histogram.remove_ops(&op.collect_bitwise_ops()) {
+                            return Err(Error::Prover(
+                                "STORE listed: a tail row's lookups were never counted".to_string(),
+                            ));
+                        }
+                    }
+                    ops.extend(
+                        std::mem::replace(&mut segments.store_ops, BlockVec::from_vec(Vec::new()))
+                            .into_vec(),
+                    );
+                    segments.store_ops = BlockVec::from_vec(ops);
+                }
                 let (cpu_ops, walk, rest, decode_trace) =
                     kept.into_run(&decode, emitted.memw_aligned_order, emitted.register_format)?;
                 super::build_stamps::mark("p0 concatenate");
@@ -1976,25 +2002,14 @@ impl RowLists {
     }
 }
 
-/// [`AlignedRef::cycle`]'s mark of an ECALL cycle's MEMW_A row, whose
-/// [`AlignedRef::at`] is then its index in the window's
-/// [`WindowRowLists::aligned_whole`]. A cycle stays below 2^30.
-pub const ALIGNED_ECALL: u32 = 1 << 31;
-
 /// A MEMW_A row as the walkers list it ([`WindowRowLists::aligned_rows`]): a
 /// regular row (a cycle's load or store) as its cycle and its access's index
 /// in the window's history (`history.accesses`, the cycle's
 /// `HistExtra::side`), from which and the cycle's log the row is derived; an
 /// ECALL cycle's row as its cycle marked with [`ALIGNED_ECALL`] and its
-/// index in the window's whole rows.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AlignedRef {
-    pub cycle: u32,
-    pub at: u32,
-}
-
-const _: () = assert!(std::mem::size_of::<AlignedRef>() == 8);
+/// index in the window's whole rows ([`WindowRowLists::aligned_whole`]). The
+/// card's records ([`history_rows`]).
+pub use multilinear::records::{ALIGNED_ECALL, AlignedRef};
 
 /// What a window's walker listed in place of the rows ([`RowLists`]), each
 /// list in today's row order.
@@ -2016,10 +2031,6 @@ impl WindowRowLists {
         super::vec_heap_bytes(&self.load_cycles)
             + super::vec_heap_bytes(&self.aligned_rows)
             + super::vec_heap_bytes(&self.aligned_whole)
-    }
-
-    fn rows(&self) -> usize {
-        self.load_cycles.len() + self.aligned_rows.len()
     }
 
     /// The rows of the batch from cycle `batch_first` (`cpu_ops`, one a
@@ -3535,9 +3546,16 @@ struct Kept {
     /// Under `listless`, what went wrong: a window without its logs, or logs
     /// that did not decode again. Refused at the finish.
     listless_broken: Option<String>,
-    /// Rows the walkers listed ([`WindowedTraceBuilder::card_row_lists`])
-    /// that no chunk took: refused at the finish.
-    unlisted: usize,
+    /// LOAD's rows as the walkers listed them, their cycles
+    /// ([`WindowedTraceBuilder::card_row_lists`]), in place of `load`.
+    load_cycles: Tail<u32>,
+    /// The windows' logs the rows held as cycles (LOAD's here, STORE's in
+    /// the routing's segments) are rebuilt from, until no pending cycle
+    /// lies in them.
+    cycle_logs: history_rows::LogRegistry,
+    /// What went wrong keeping or rebuilding the listed rows. Refused at the
+    /// finish.
+    lists_broken: Option<String>,
 }
 
 /// The walk lists a run keeps whole to its end, each appended window by
@@ -3666,7 +3684,9 @@ impl Kept {
             decode,
             listless: false,
             listless_broken: None,
-            unlisted: 0,
+            load_cycles: Tail::new(),
+            cycle_logs: history_rows::LogRegistry::default(),
+            lists_broken: None,
         }
     }
 
@@ -3816,10 +3836,34 @@ impl Kept {
             lists,
             history_sides,
         } = window;
-        // The rows its walker listed: no chunk of this build takes them, so
-        // the run is refused at its finish rather than built without them.
+        // The rows its walker listed ([`WindowedTraceBuilder::card_row_lists`]):
+        // its LOAD cycles to their tail, its logs to the registry they are
+        // rebuilt from; its MEMW_A refs below.
+        let mut listed_refs = None;
         if let Some(lists) = lists {
-            self.unlisted += lists.rows();
+            let WindowRowLists {
+                load_cycles,
+                aligned_rows,
+                aligned_whole,
+            } = *lists;
+            match logs.as_ref() {
+                Some(l) if l.len() == cycles => self.cycle_logs.push(first as u64, Arc::clone(l)),
+                _ => {
+                    self.lists_broken.get_or_insert_with(|| {
+                        "a window with listed rows came without its logs".to_string()
+                    });
+                }
+            }
+            if !load_cycles.is_empty() {
+                if self.load.len > 0 {
+                    self.lists_broken
+                        .get_or_insert_with(|| "LOAD listed after LOAD rows made".to_string());
+                }
+                self.load_cycles.push(load_cycles);
+            }
+            if !aligned_rows.is_empty() {
+                listed_refs = Some((aligned_rows, aligned_whole));
+            }
         }
         // The card derives MEMW_A's rows: the window's history and logs, for
         // its rows' refs to lie in.
@@ -3944,10 +3988,32 @@ impl Kept {
             Some(kept) => kept.append(first as u64, memw.words, memw.register_rows, logs_for_words),
             None => self.register_rows.push(memw.register_rows),
         }
-        // Under the card's MEMW_A rows the window's rows go as refs; a window
-        // that cannot (no history or logs, or a row no ref names) ends the
-        // mode, the pending refs' rows first.
+        // Under the card's MEMW_A rows the window's rows go as refs (the
+        // walkers' list, or the walk's rows converted); a window that cannot
+        // (no history or logs, or a row no ref names) ends the mode, the
+        // pending refs' rows first. Listed refs need the mode and the
+        // window's history: without, the run is refused.
+        if listed_refs.is_some() && (refs_window.is_none() || !memw.aligned.is_empty()) {
+            self.lists_broken.get_or_insert_with(|| {
+                "MEMW_A listed without the card's MEMW_A rows, the window's history, or beside \
+                 rows made"
+                    .to_string()
+            });
+        }
         match (self.refs.as_mut(), refs_window) {
+            (Some(tail), Some((history, logs))) if listed_refs.is_some() => {
+                if let Some((refs, whole)) = listed_refs {
+                    tail.push(
+                        refs,
+                        Arc::new(history_rows::RefWindow {
+                            first: first as u64,
+                            logs,
+                            history,
+                            whole,
+                        }),
+                    );
+                }
+            }
             (Some(tail), Some((history, logs))) => {
                 match history_rows::aligned_refs_of_rows(&memw.aligned, first as u64, &history) {
                     Ok((refs, whole)) => tail.push(
@@ -4016,12 +4082,12 @@ impl Kept {
             decode,
             listless: _,
             listless_broken: _,
-            unlisted,
+            load_cycles,
+            cycle_logs,
+            lists_broken,
         } = self;
-        if unlisted > 0 {
-            return Err(Error::Prover(format!(
-                "{unlisted} LOAD or MEMW_A rows listed by the walkers that no chunk took"
-            )));
+        if let Some(e) = lists_broken {
+            return Err(Error::Prover(format!("the walkers' row lists: {e}")));
         }
         // The card's MEMW_A rows: the run's last rows, derived from their
         // refs. A run whose rows could not all be derived is refused here.
@@ -4060,7 +4126,12 @@ impl Kept {
             refused: None,
         };
         walk.cpu_side = cpu_side.into_vec();
-        walk.load_ops = load.into_vec();
+        // LOAD's last rows listed as cycles, rebuilt from their logs, before
+        // any the walk made (the finish's window).
+        let mut load_ops =
+            rebuild_cycles::<super::LoadOperation>(load_cycles, &cycle_logs, decode_table)?;
+        load_ops.extend(load.into_vec());
+        walk.load_ops = load_ops;
         walk.lt_ops = lt.into_vec();
         walk.shift_ops = shift.into_vec();
         Ok((cpu.into_vec(), walk, rest, decode.into_table()))
@@ -4117,6 +4188,40 @@ fn logs_in_step(
 /// thread that lays it out to let go of.
 /// The CPU ops of `logs`, the cycles from `first_cycle` on, as the walk makes
 /// them ([`super::collect_cpu_ops_into`]).
+/// The ops of the rows the walkers listed as cycles that no chunk took (the
+/// tail of `cycles`), rebuilt on the host from their windows' logs, in order.
+fn rebuild_cycles<T: history_rows::CycleFamily>(
+    mut cycles: Tail<u32>,
+    logs: &history_rows::LogRegistry,
+    decode: &DecodeTable,
+) -> Result<Vec<T>, Error> {
+    let n = cycles.len;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let taken = cycles.take_segments(n);
+    rebuild_slices(&taken.slices(), logs, decode)
+}
+
+/// The ops of the rows at `cycles` (in pieces, in order), rebuilt from the
+/// windows' logs `logs` holds.
+fn rebuild_slices<T: history_rows::CycleFamily>(
+    cycles: &[&[u32]],
+    logs: &history_rows::LogRegistry,
+    decode: &DecodeTable,
+) -> Result<Vec<T>, Error> {
+    let all = cycles.iter().flat_map(|p| p.iter());
+    let (Some(&lo), Some(&hi)) = (all.clone().min(), all.max()) else {
+        return Ok(Vec::new());
+    };
+    let windows = logs.covering(u64::from(lo), u64::from(hi)).ok_or_else(|| {
+        Error::Prover(format!(
+            "listed rows of cycles {lo}..={hi} without their logs"
+        ))
+    })?;
+    history_rows::ops_of_cycles(cycles, &windows, decode).map_err(Error::Prover)
+}
+
 fn ops_of_logs(
     logs: &Segments<Log>,
     first_cycle: usize,
@@ -4401,6 +4506,57 @@ fn row_chunk_ops<T: RowFamily>(
             plain(rows)
         }
     }
+}
+
+/// A full LOAD or STORE chunk listed as cycles as handed out: held as them
+/// (`wanted`: the family is held as records) for the card to derive its
+/// rows while the host has room and the card holds the CPU chunks' decode, as
+/// `plain` makes the ops the host rebuilds otherwise; and what went wrong
+/// rebuilding them.
+#[allow(clippy::too_many_arguments)]
+fn cycle_chunk_ops<T: history_rows::CycleFamily>(
+    cycles: Segments<u32>,
+    logs: &history_rows::LogRegistry,
+    decode_table: &Arc<DecodeTable>,
+    index: usize,
+    card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
+    wanted: fn(&StreamedCardFill) -> bool,
+    counter: fn(&mut CardFillStamps) -> &mut [usize; 2],
+    plain: fn(Vec<T>) -> ChunkOps,
+) -> (ChunkOps, Option<String>) {
+    let failed = |e: String| (plain(Vec::new()), Some(e));
+    let (Some(&lo), Some(&hi)) = (cycles.iter().min(), cycles.iter().max()) else {
+        return failed("an empty chunk of listed cycles".to_string());
+    };
+    let Some(windows) = logs.covering(u64::from(lo), u64::from(hi)) else {
+        return failed(format!(
+            "listed rows of cycles {lo}..={hi} without their logs"
+        ));
+    };
+    let decode = card
+        .as_ref()
+        .and_then(|(c, _)| c.cpu.as_ref().map(Arc::clone));
+    let (Some(decode), Some((card, stamps))) = (decode, card.filter(|(c, _)| wanted(c))) else {
+        return match history_rows::ops_of_cycles(&cycles.slices(), &windows, decode_table) {
+            Ok(ops) => (plain(ops), None),
+            Err(e) => failed(e),
+        };
+    };
+    let records = match CycleRecords::<T>::new(cycles, windows, decode) {
+        Ok(records) => records,
+        Err(_) => return failed("a chunk of listed cycles that is not a whole table".to_string()),
+    };
+    let bytes = multilinear::records::TableRecords::bytes(&records);
+    if !card.admits(bytes, (T::TABLE, index), stamps) {
+        counter(stamps)[1] += 1;
+        return match records.into_ops() {
+            Ok(ops) => (plain(ops), None),
+            Err(e) => failed(e),
+        };
+    }
+    counter(stamps)[0] += 1;
+    stamps.records_bytes += bytes;
+    (ChunkOps::Rows(Box::new(records)), None)
 }
 
 /// A full MEMW_A chunk of refs as handed out
@@ -4843,6 +4999,35 @@ fn tail_jobs(
             ChunkOps::Memw,
         )
     );
+    // LOAD listed as cycles: each full chunk held as them while the host has
+    // room, as the ops the host rebuilds otherwise. Its lookups were counted
+    // where its walker made the rows.
+    while kept.load_cycles.len >= m.load {
+        let t = Instant::now();
+        let cycles = kept.load_cycles.take_segments(m.load);
+        let taken = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let (ops, broken) = cycle_chunk_ops::<super::LoadOperation>(
+            cycles,
+            &kept.cycle_logs,
+            decode_table,
+            e.load,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+            |c| c.rows.load,
+            |s| &mut s.load,
+            |ops| ChunkOps::Load(Segments::one(ops)),
+        );
+        if let Some(e) = broken {
+            kept.lists_broken.get_or_insert(e);
+        }
+        stamps.note(StreamTable::Load, taken, t.elapsed().as_secs_f64(), 0);
+        jobs.push(ChunkJob {
+            table: StreamTable::Load,
+            index: e.load,
+            ops,
+        });
+        e.load += 1;
+    }
     take_chunks!(
         StreamTable::Load,
         kept.load,
@@ -4912,6 +5097,56 @@ fn tail_jobs(
             e.keccak_rnd += 1;
         }
     }
+    // STORE listed as cycles: as LOAD's, its lookups counted where its walker
+    // routed it (not again here). A run that routed STORE both ways (cycles
+    // pending beside ops) cannot keep their order: refused at the finish.
+    if !segments.store_cycles.is_empty() && !segments.store_ops.is_empty() {
+        kept.lists_broken
+            .get_or_insert_with(|| "STORE listed as cycles beside ops routed".to_string());
+    }
+    while segments.store_cycles.len() >= m.store {
+        let t = Instant::now();
+        let cycles = Segments::one(segments.store_cycles.take_front(m.store));
+        let taken = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let (ops, broken) = cycle_chunk_ops::<store::StoreOperation>(
+            cycles,
+            &kept.cycle_logs,
+            decode_table,
+            e.store,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+            |c| c.rows.store,
+            |s| &mut s.store,
+            ChunkOps::Store,
+        );
+        if let Some(e) = broken {
+            kept.lists_broken.get_or_insert(e);
+        }
+        stamps.note(StreamTable::Store, taken, t.elapsed().as_secs_f64(), 0);
+        jobs.push(ChunkJob {
+            table: StreamTable::Store,
+            index: e.store,
+            ops,
+        });
+        e.store += 1;
+    }
+    // The windows no pending listed row lies in are let go.
+    let pending = [
+        kept.load_cycles
+            .slices()
+            .first()
+            .and_then(|p| p.first())
+            .copied(),
+        segments.store_cycles.iter().next().copied(),
+    ];
+    kept.cycle_logs.release_before(
+        pending
+            .into_iter()
+            .flatten()
+            .map(u64::from)
+            .min()
+            .unwrap_or(u64::MAX),
+    );
     // STORE's ops are a routing segment: its own tail, a chunk a block (its
     // copies are not counted).
     let store = &mut segments.store_ops;

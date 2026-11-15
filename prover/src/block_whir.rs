@@ -6668,6 +6668,28 @@ fn prove_streamed(
                         if memw_a {
                             builder = builder.card_derives_memw_a()?;
                         }
+                        // And the walkers list LOAD's, STORE's (on the light walk
+                        // that routes in the walkers) and MEMW_A's rows instead of
+                        // making them, for the card to derive: needs the walkers
+                        // counting where they make the rows.
+                        let lists = crate::tables::trace_builder::RowLists {
+                            load: sides && card_fill.rows.load,
+                            store: sides && card_fill.rows.store && light_walk >= 2,
+                            memw_a,
+                        };
+                        let lists = if lists.any() && builder.counts_where_made() {
+                            builder = builder.card_row_lists(lists)?;
+                            lists
+                        } else {
+                            crate::tables::trace_builder::RowLists::NONE
+                        };
+                        eprintln!(
+                            "BLOCK CARD TRACE LISTS: the walkers list {}{}{}{}",
+                            if lists.load { "LOAD " } else { "" },
+                            if lists.store { "STORE " } else { "" },
+                            if lists.memw_a { "MEMW_A " } else { "" },
+                            if lists.any() { "rows as cycles and refs" } else { "no rows (they make them)" }
+                        );
                         eprintln!(
                             "BLOCK CARD TRACE: rows · {} · {}",
                             if sides {
