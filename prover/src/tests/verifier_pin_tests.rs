@@ -245,7 +245,10 @@ fn the_frame_refuses_a_bitwise_table_off_its_fixed_height() {
 /// Format knobs a verifier's process could carry, each off the default: the
 /// WHIR blowup, grind bits and folds, the leaves' query check and scale, the
 /// leaves' share form, the GKR packing, the KECCAK_RND and MEMW_A forms, the
-/// register format and the memory format.
+/// register format and the memory format. The memory word is `split`, off the
+/// production format's fused tables; the parent also runs the child under
+/// `fused` ([`MEMORY_WORDS`]), off the verifier's pinned split format, so each
+/// side sees a word off its own default.
 const OFF_DEFAULT: [(&str, &str); 11] = [
     (crate::zf_format::ENV_WHIR_BLOWUP, "4"),
     (crate::zf_format::ENV_WHIR_GRIND_BITS, "20"),
@@ -257,8 +260,12 @@ const OFF_DEFAULT: [(&str, &str); 11] = [
     ("BLOCK_WHIR_KECCAK_RND", "full"),
     ("BLOCK_WHIR_MEMW_A", "lt"),
     ("BLOCK_WHIR_REGISTERS", "tokens32"),
-    ("BLOCK_WHIR_MEMORY", "fused"),
+    ("BLOCK_WHIR_MEMORY", "split"),
 ];
+
+/// The memory words the child runs under: `split`, off the production
+/// format's default, and `fused`, off the pinned format's.
+const MEMORY_WORDS: [&str; 2] = ["split", "fused"];
 
 /// ★ The block verifier reads no format from its environment. In a process of
 /// its own whose environment sets every knob in [`OFF_DEFAULT`]
@@ -272,23 +279,26 @@ const OFF_DEFAULT: [(&str, &str); 11] = [
 fn the_block_verifier_reads_no_format_from_its_environment() {
     let name =
         "tests::verifier_pin_tests::the_pinned_presets_hold_under_an_environment_off_the_default";
-    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-        .args([
-            "--exact",
-            name,
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .envs(OFF_DEFAULT)
-        .output()
-        .expect("the test binary runs");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success() && stdout.contains("1 passed"),
-        "the child under the knobs:\n{stdout}\n{stderr}"
-    );
+    for memory in MEMORY_WORDS {
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                name,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .envs(OFF_DEFAULT)
+            .env("BLOCK_WHIR_MEMORY", memory)
+            .output()
+            .expect("the test binary runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the child under the knobs, BLOCK_WHIR_MEMORY={memory}:\n{stdout}\n{stderr}"
+        );
+    }
 }
 
 /// Run by [`the_block_verifier_reads_no_format_from_its_environment`] in a
@@ -302,12 +312,19 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     use crate::lfm::whir_chain::LeafQuery;
     use crate::zf_format::WhirBlowup;
     use multilinear::whir_chain::LeafOrder;
+    let memory = std::env::var("BLOCK_WHIR_MEMORY").unwrap_or_default();
     assert!(
         OFF_DEFAULT
             .iter()
-            .all(|(k, v)| std::env::var(k).as_deref() == Ok(*v)),
+            .filter(|(k, _)| *k != "BLOCK_WHIR_MEMORY")
+            .all(|(k, v)| std::env::var(k).as_deref() == Ok(*v))
+            && MEMORY_WORDS.contains(&memory.as_str()),
         "run by its parent, under the knobs"
     );
+    let knob = match memory.as_str() {
+        "split" => crate::tables::fused_memory::MemoryFormat::Split,
+        _ => crate::tables::fused_memory::MemoryFormat::Fused,
+    };
     // The prover's format is the environment's.
     let production = BlockFormat::production();
     assert_eq!(production.zf.whir_blowup, 4);
@@ -351,13 +368,17 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         "the prover's own production format reads no register knob"
     );
     assert_eq!(
-        harness.format.memory,
-        crate::tables::fused_memory::MemoryFormat::Fused,
+        harness.format.memory, knob,
         "the harness's memory format follows its knob"
     );
     assert_eq!(
+        crate::lfm::whir_block_tree::memory_setting(Some(&memory), true),
+        Ok(knob),
+        "a base-only process's memory format follows its knob"
+    );
+    assert_eq!(
         production.memory,
-        crate::tables::fused_memory::MemoryFormat::Split,
+        crate::tables::fused_memory::MemoryFormat::Fused,
         "the prover's own production format reads no memory knob"
     );
 
