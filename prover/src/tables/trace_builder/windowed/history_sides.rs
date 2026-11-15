@@ -297,7 +297,9 @@ pub(crate) fn chunk_first(cycle: u64, chunk_rows: u64) -> u64 {
 /// The exceptions a window's walk would list, from what it wrote: each row
 /// of `sides` (the walk's, one a log of `logs`, the window's from
 /// `window_first`) with an `rd` slot that [`needs_exception`] names, with the
-/// walk's own old value. Ascending by cycle.
+/// walk's own old value. Ascending by cycle. (The walk lists them batch by
+/// batch, [`list_exceptions`]; the tests, from a whole window.)
+#[cfg(test)]
 pub(crate) fn exceptions_of_walk(
     logs: &[Log],
     extras: &[HistExtra],
@@ -306,16 +308,43 @@ pub(crate) fn exceptions_of_walk(
     chunk_rows: u64,
     decode: &DecodeTable,
 ) -> Result<Vec<SideException>, String> {
-    if logs.len() != extras.len() || logs.len() != sides.len() {
+    let mut out = Vec::new();
+    list_exceptions(
+        logs,
+        extras,
+        sides,
+        (window_first, 0),
+        chunk_rows,
+        decode,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// [`exceptions_of_walk`] of the side records of a part of a window, its
+/// cycles `window_first + from…` (`from` into the window's `logs` and
+/// `extras`), appended to `out`: what the walk lists batch by batch, writing
+/// no side record (the walk's hook, [`super::WindowedTraceBuilder::card_derives_sides`]).
+pub(crate) fn list_exceptions(
+    logs: &[Log],
+    extras: &[HistExtra],
+    sides: &[CpuSide],
+    (window_first, from): (u64, usize),
+    chunk_rows: u64,
+    decode: &DecodeTable,
+    out: &mut Vec<SideException>,
+) -> Result<(), String> {
+    if logs.len() != extras.len() || from + sides.len() > logs.len() {
         return Err(format!(
-            "{} logs, {} history records, {} side records",
+            "{} logs, {} history records, {} side records from {from}",
             logs.len(),
             extras.len(),
             sides.len()
         ));
     }
-    let mut out = Vec::new();
-    for (i, ((log, extra), side)) in logs.iter().zip(extras).zip(sides).enumerate() {
+    for (k, side) in sides.iter().enumerate() {
+        let i = from + k;
+        let (log, extra) = (&logs[i], &extras[i]);
         let cycle = window_first + i as u64;
         let Some(row) = decode.row(log.current_pc) else {
             continue;
@@ -333,7 +362,17 @@ pub(crate) fn exceptions_of_walk(
             });
         }
     }
-    Ok(out)
+    Ok(())
+}
+
+/// The walk's hook under [`super::WindowedTraceBuilder::card_derives_sides`]:
+/// the window's history records, the CPU chunks' height, and where the
+/// window's exceptions go. With it the walk lists each batch's exceptions and
+/// keeps no side record.
+pub(crate) struct SideHook<'a> {
+    pub(crate) extras: &'a [HistExtra],
+    pub(crate) chunk_rows: u64,
+    pub(crate) out: &'a mut Vec<SideException>,
 }
 
 /// The windows' history records not yet in a handed-out CPU chunk, in step
@@ -358,6 +397,11 @@ impl HistoryTail {
         if !history.extras.is_empty() {
             self.parts.push_back(history);
         }
+    }
+
+    /// The cycles not handed out, and the first of them.
+    pub(crate) fn pending(&self) -> (usize, u64) {
+        (self.len, self.next)
     }
 
     /// The next `n` cycles' history records (at most `len`), as the parts

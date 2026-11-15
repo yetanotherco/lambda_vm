@@ -71,7 +71,7 @@ fn for_first(n: usize, gap: usize) -> RecordsRoom {
 
 /// `chunk` with its records, if it holds them, replaced by their host fill at
 /// eight bytes a cell; and whether it held them.
-fn unheld(mut chunk: StreamedChunk) -> (StreamedChunk, bool) {
+pub(super) fn unheld(mut chunk: StreamedChunk) -> (StreamedChunk, bool) {
     let Some(records) = chunk.trace.take_records_main() else {
         return (chunk, false);
     };

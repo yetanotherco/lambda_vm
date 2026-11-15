@@ -305,7 +305,7 @@ fn rust_guests_and_ethrex_derive_the_walks_side_records() {
         let input = std::fs::read(fixtures.join(format!("{fixture}.bin"))).expect("the fixture");
         cases.push((fixture.to_string(), rust_elf("ethrex"), input, 1 << 16));
     }
-    let (mut rows, mut listed, mut at_ecall) = (0usize, 0usize, 0usize);
+    let (mut rows, mut listed, mut at_ecall, mut from_word) = (0usize, 0usize, 0usize, 0usize);
     for (name, program, input, window) in &cases {
         let (windows, decode) = walked_with(program, input, *window);
         let (logs, extras, sides, _) = concat(&windows);
@@ -333,12 +333,34 @@ fn rust_guests_and_ethrex_derive_the_walks_side_records() {
                         })
                 })
                 .count();
+            // The rows whose rd old value is read from a word instruction's
+            // log (its written value or a value it read): derived, unlisted.
+            from_word += (0..logs.len())
+                .filter(|&i| ex.binary_search_by_key(&(i as u32), |x| x.cycle).is_err())
+                .filter(|&i| sides[i].prev_ts[2] != 0)
+                .filter(|&i| {
+                    let o = u64::from(extras[i].regs_ts[2]);
+                    o >= 4
+                        && logs.get(((o - 4) / 4) as usize).is_some_and(|l| {
+                            decode
+                                .row(l.current_pc)
+                                .is_some_and(|r| decode.entry(r).fields.word_instr)
+                        })
+                })
+                .count();
             rows += got.len();
             listed += ex.len();
         }
         println!("{name}: {} walked cycles", logs.len());
     }
-    println!("rows {rows}, listed {listed}, of them at an ECALL {at_ecall}");
+    println!(
+        "rows {rows}, listed {listed}, of them at an ECALL {at_ecall}; read from a word \
+         instruction's log {from_word}"
+    );
+    assert!(
+        from_word > 0,
+        "no rd old value read from a word instruction"
+    );
     assert!(rows > 1_000_000, "{rows} rows");
     assert!(at_ecall > 0, "no row's rd was last touched by an ECALL");
     assert!(listed * 100 < rows, "{listed} of {rows} rows listed");
@@ -600,4 +622,107 @@ fn the_card_trace_knob_reads_rows_or_off() {
     for bad in ["1", "on", "row", "words"] {
         assert!(setting(Some(bad)).is_err(), "{bad}");
     }
+}
+
+/// The whole in-row build of a record-mode run, walked from the history on
+/// two walkers with the CPU chunks held as their logs (with or without the
+/// CPU list), the side records derived on the card (`derive`) or written by
+/// the walk, its streamed chunks put back; and the CPU chunks held with the
+/// history form.
+fn in_row_build(
+    program: &Elf,
+    input: &[u8],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    listless: bool,
+    derive: bool,
+) -> (crate::tables::trace_builder::Traces, usize) {
+    let room: super::RecordsRoom = Arc::new(|_| true);
+    let mut builder = WindowedTraceBuilder::new(program, input, max_rows)
+        .and_then(|b| b.register_format(RegisterFormat::InRow))
+        .and_then(WindowedTraceBuilder::drop_streamed_ops)
+        .map(|b| b.drop_cpu_list(listless))
+        .and_then(|b| b.card_fill_streamed(room, true, false))
+        .and_then(|b| {
+            if derive {
+                b.card_derives_sides()
+            } else {
+                Ok(b)
+            }
+        })
+        .expect("the builder");
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
+    let mut chunks = Vec::new();
+    let mut held = 0usize;
+    let report = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut fast = FastExecutor::new(program, input.to_vec()).expect("the fast engine");
+            fast.enable_history().expect("history mode");
+            while let Some((logs, history)) = fast.resume_history(window).expect("the run") {
+                let last = (fast.pc() == 0)
+                    .then(|| fast.take_history_final().map(Box::new))
+                    .flatten();
+                let window = ExecWindow {
+                    logs: Arc::new(logs),
+                    start: None,
+                    history: Some(Box::new(history)),
+                    last,
+                };
+                if tx.send(window).is_err() {
+                    break;
+                }
+            }
+        });
+        walk_windows_from_history(&mut builder, rx, 2, 0, |accumulator, walked, _| {
+            for job in accumulator.absorb(walked) {
+                let chunk = job.generate();
+                if let Some(records) = chunk.trace.records_main() {
+                    held += usize::from(derives(records));
+                }
+                // Held as records: the host fill's table, compared below.
+                chunks.push(super::card_records_tests::unheld(chunk).0);
+            }
+            Ok(())
+        })
+    })
+    .expect("the walk");
+    let mut traces = builder.finish(&report.last).expect("the finish");
+    traces
+        .insert_streamed(chunks)
+        .expect("every chunk has a placeholder");
+    (traces, held)
+}
+
+/// ★ The whole in-row build with the side records derived on the card (the
+/// walk writing none) is the build with the walk's, every table: with and
+/// without the CPU list, in windows that cut chunks inside windows, over the
+/// CPU tail the finish derives on the host; and every full CPU chunk is held
+/// in the history form.
+#[test]
+fn the_build_with_the_side_records_derived_is_todays() {
+    let max_rows = MaxRowsConfig::small();
+    let mut held = 0usize;
+    let mut cases: Vec<(String, Elf, usize)> = [
+        "test_keccak_multi",
+        "all_instructions_64",
+        "keep_alive_regs",
+    ]
+    .iter()
+    .flat_map(|name| [7usize, 33].map(|w| (name.to_string(), run(name).0, w)))
+    .collect();
+    cases.push((
+        "dma_memmove_cases".to_string(),
+        rust_elf("dma_memmove_cases"),
+        97,
+    ));
+    for (name, program, window) in &cases {
+        for listless in [true, false] {
+            let (today, none) = in_row_build(program, &[], &max_rows, *window, listless, false);
+            let (derived, n) = in_row_build(program, &[], &max_rows, *window, listless, true);
+            assert_eq!(none, 0, "{name}");
+            crate::tests::windowed_builder_tests::same_traces(&today, &derived);
+            held += n;
+        }
+    }
+    assert!(held > 4, "{held} chunks held in the history form");
 }
