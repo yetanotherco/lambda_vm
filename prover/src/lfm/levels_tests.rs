@@ -50,6 +50,14 @@ fn b3_small_block(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof)
     (elf, proof)
 }
 
+/// The small blocks' options, streamed (`window_log2`): what the levels
+/// driver needs, since only a streamed base tells it as each group opens.
+fn streamed_options() -> crate::block_whir::BlockOptions {
+    let mut options = small_block_options();
+    options.window_log2 = Some(4);
+    options
+}
+
 /// Level 1's BLAKE3 plan, as a verifier derives it (prepared roots on the
 /// host).
 fn b3_plan(elf: &[u8], proof: &BlockWhirProof, format: &BlockFormat) -> WhirBlockPlan {
@@ -119,6 +127,30 @@ fn the_levels_take_a_base_of_their_own_hash_only() {
         };
         assert!(err.contains("own hash's base"), "{err}");
     }
+}
+
+/// The driver refuses a whole-run (unstreamed) base before proving anything:
+/// only a streamed base tells it as each group opens, and without that level
+/// 1 would never get its groups.
+#[test]
+fn the_levels_driver_refuses_an_unstreamed_base() {
+    let opts = ProofOptions::default_test_options();
+    let mut unstreamed = small_block_options();
+    unstreamed.window_log2 = None;
+    let Err(err) = super::levels::prove_block_levels(
+        &[],
+        &[],
+        &opts,
+        &small_format(),
+        &unstreamed,
+        WlfmFamily::P1,
+        LevelStop::DEFAULT,
+        true,
+        true,
+    ) else {
+        panic!("the driver took an unstreamed base");
+    };
+    assert!(err.contains("must stream"), "{err}");
 }
 
 /// ★ Level 1 over a small block: one program over every group executes over
@@ -247,7 +279,9 @@ fn the_blake3_levels_prove_a_small_block_to_its_last_level() {
     let (elf, proof) = b3_small_block("test_commit_4", &format);
     let plan = b3_plan(&elf, &proof, &format);
     assert_eq!(plan.digest_words(), 2, "a BLAKE3 root is two words");
-    let levels = derive_levels(&plan, WlfmFamily::B3, false).expect("the levels derive");
+    // The prepared stacks on the host: a level's are gigabytes the card cannot
+    // hold beside a group's commit.
+    let levels = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
     assert_eq!(levels.len(), 2, "the default chain is two levels");
     for (k, level) in levels.iter().enumerate() {
         let rows = &level.program.groups;
@@ -322,7 +356,7 @@ fn the_block_levels_driver_proves_a_small_block() {
     let format = at_blowup_4(small_format());
     let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
     let opts = stark::proof::options::ProofOptions::default_test_options();
-    let options = small_block_options();
+    let options = streamed_options();
     let run = prove_block_levels(
         &elf,
         &[],
@@ -385,7 +419,7 @@ fn the_blake3_levels_driver_proves_a_small_block() {
         &[],
         &opts,
         &format,
-        &small_block_options(),
+        &streamed_options(),
         WlfmFamily::B3,
         LevelStop::DEFAULT,
         true,
