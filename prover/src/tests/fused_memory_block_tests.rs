@@ -220,6 +220,92 @@ fn a_fused_block_filled_from_its_records_moves_no_byte() {
     }
 }
 
+/// ★ A wrong MEM_LOAD or MEM_STORE table is refused by the verifier: with the
+/// family's streamed chunks held as their rows and each row moved four cycles
+/// later, its step kept ([`Deviations::card_fill_streamed_fault`]), every fill
+/// of them (the card's at both uploads, or a host reader's) writes the same
+/// wrong table, so the prover makes a proof of a run that did not happen. The
+/// unchanged verifier refuses it on the bus balance (the CPU's request and the
+/// moved row's memory tokens no longer cancel), and with the balance check
+/// alone switched off it would accept it: the balance is the check that
+/// refuses. The control, the same block with no fault, verifies.
+#[test]
+fn a_wrong_fused_table_is_refused_by_the_verifier() {
+    use crate::block_whir::{BlockRefusal, verify_block_whir_traced};
+    use crate::tables::trace_builder::RowFamilies;
+    use stark::multilinear_table::batched::VerifierChecks;
+    let _fills = super::block_whir_tests::records_fill_lock();
+    let opts = ProofOptions::default_test_options();
+    let max_rows = MaxRowsConfig {
+        mem_load: 1 << 2,
+        mem_store: 1 << 2,
+        ..MaxRowsConfig::small()
+    };
+    let elf = asm_elf_bytes("fused_mem_cases");
+    for family in ["MEM_LOAD", "MEM_STORE"] {
+        let mut rows = RowFamilies::NONE;
+        match family {
+            "MEM_LOAD" => rows.mem_load = true,
+            _ => rows.mem_store = true,
+        }
+        let proved = |fault: u64| {
+            let mut o = super::block_whir_tests::streamed(max_rows.clone(), 5, 3);
+            o.drop_streamed_ops = true;
+            let (proof, stamps) = prove_block_whir_with(
+                &elf,
+                &[],
+                &opts,
+                &fused(),
+                &o,
+                &Deviations {
+                    card_fill_streamed_fault: fault,
+                    card_fill_rows: Some(rows),
+                    // Regeneration is off here, and parked records need it: kept.
+                    records_keep: Some(true),
+                    ..super::block_whir_tests::streamed_records(false, false)
+                },
+            )
+            .unwrap_or_else(|e| {
+                panic!("{family}: the prover refused ({e:?}): the verifier was never asked")
+            });
+            let c = stamps.windows.card_fill;
+            let held = match family {
+                "MEM_LOAD" => c.mem_load[0],
+                _ => c.mem_store[0],
+            };
+            assert!(held > 0, "{family}: no chunk held as rows: {c:?}");
+            proof
+        };
+        let honest = proved(0);
+        assert!(verifies(&honest, &elf, &fused()), "{family}: the control");
+        let forged = proved(4);
+        let traced = |checks| {
+            verify_block_whir_traced(&forged, &elf, &opts, &fused(), false, checks)
+                .unwrap_or_else(|e| panic!("{family}: the statement did not frame: {e:?}"))
+        };
+        let refusal = traced(VerifierChecks::ALL);
+        assert!(
+            matches!(
+                refusal,
+                Err(BlockRefusal::Proof(multilinear::Error::BusImbalance))
+            ),
+            "{family}: refused for another reason, or accepted: {refusal:?}"
+        );
+        let unbalanced = traced(VerifierChecks {
+            balance: false,
+            ..VerifierChecks::ALL
+        });
+        assert!(
+            unbalanced.is_ok(),
+            "{family}: with the balance check off another check refused: {unbalanced:?}"
+        );
+        println!(
+            "FUSED FORGERY REFUSED: {family} rows four cycles later: refused as BusImbalance; \
+             accepted with the balance check off; the honest block verifies"
+        );
+    }
+}
+
 /// ★ Each memory format refuses the other's proof: the format is the
 /// verifier's constant, never the proof's.
 #[test]
