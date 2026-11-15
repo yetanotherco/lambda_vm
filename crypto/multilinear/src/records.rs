@@ -158,7 +158,8 @@ pub struct StoreOp {
 /// One fused aligned CPU load as its fill reads it (the prover's fused load
 /// row, field for field): the address, the timestamp, the step to its bytes'
 /// old timestamp less one (two 16-bit limbs), the result's bytes with their
-/// fill, the width, whether it sign-extends (0 or 1), and padding 0.
+/// fill, the width and whether it sign-extends (0 or 1). These records end in
+/// padding.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemLoadRow {
@@ -168,12 +169,12 @@ pub struct MemLoadRow {
     pub res: [u8; 8],
     pub width: u8,
     pub signed: u8,
-    pub pad: [u8; 2],
 }
 
 /// One fused aligned CPU store as its fill reads it (the prover's fused store
 /// row, field for field): the address, the timestamp, the step as a load's,
-/// the width, padding 0, and the bytes written and replaced, a word each.
+/// the width (padding after it), and the bytes written and replaced, a word
+/// each.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemStoreRow {
@@ -181,7 +182,6 @@ pub struct MemStoreRow {
     pub timestamp: u64,
     pub step: u32,
     pub width: u8,
-    pub pad: [u8; 3],
     pub value: u64,
     pub old: u64,
 }
@@ -578,7 +578,7 @@ impl RecordsFill<'_> {
                     );
                 }
             }
-            // The fields alone: the padding is named, but read here as 0 anyway.
+            // The fields alone: these records hold padding.
             Self::MemLoad { rows } => {
                 each(8);
                 for row in rows.iter().flat_map(|piece| piece.iter()) {

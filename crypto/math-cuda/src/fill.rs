@@ -189,7 +189,8 @@ pub struct AlignedRowC {
 /// One fused aligned CPU load (the prover's `MemLoadRow`; `fill.cu`'s
 /// `MemLoadRowC`): the address, the timestamp, the step to its bytes' old
 /// timestamp less one (two 16-bit limbs), the result's bytes with their fill,
-/// the width, whether it sign-extends (0 or 1), and padding 0.
+/// the width and whether it sign-extends (0 or 1); two bytes of padding, which
+/// no kernel reads.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemLoadRowC {
@@ -199,12 +200,12 @@ pub struct MemLoadRowC {
     pub res: [u8; 8],
     pub width: u8,
     pub is_signed: u8,
-    pub pad: [u8; 2],
 }
 
 /// One fused aligned CPU store (the prover's `MemStoreRow`; `fill.cu`'s
 /// `MemStoreRowC`): the address, the timestamp, the step as a load's, the
-/// width, padding 0, and the bytes written and replaced, a word each.
+/// width (three bytes of padding after it, which no kernel reads), and the
+/// bytes written and replaced, a word each.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemStoreRowC {
@@ -212,7 +213,6 @@ pub struct MemStoreRowC {
     pub timestamp: u64,
     pub step: u32,
     pub width: u8,
-    pub pad: [u8; 3],
     pub value: u64,
     pub old: u64,
 }
