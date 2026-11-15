@@ -119,6 +119,40 @@ pub mod knobs {
         STAGE_FAULT.load(Ordering::Relaxed)
     }
 
+    static SHARED_FORCED: AtomicU8 = AtomicU8::new(0);
+
+    /// `LAMBDA_VM_ZC_SHARED_SLOTS=<log2 half>` (1 to 30): a later round over at
+    /// most `2^<log2 half>` cube indices keeps each block's slot file in shared
+    /// memory (`zc_round_gruen_shared`) when it fits. The same sums. `None`
+    /// (unset, the default) is today's global slot file everywhere.
+    pub fn shared_slots() -> Option<u32> {
+        static WORD: OnceLock<Option<u32>> = OnceLock::new();
+        match SHARED_FORCED.load(Ordering::Relaxed) {
+            0 => *WORD.get_or_init(|| {
+                std::env::var("LAMBDA_VM_ZC_SHARED_SLOTS")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|bits| (1..=30).contains(bits))
+            }),
+            255 => None,
+            bits => Some(u32::from(bits)),
+        }
+    }
+
+    /// Forces [`shared_slots`]: `Some(None)` off, `Some(Some(bits))` on,
+    /// `None` back to the environment's word.
+    #[doc(hidden)]
+    pub fn force_shared_slots(mode: Option<Option<u8>>) {
+        SHARED_FORCED.store(
+            match mode {
+                None => 0,
+                Some(None) => 255,
+                Some(Some(bits)) => bits.clamp(1, 30),
+            },
+            Ordering::Relaxed,
+        );
+    }
+
     /// Forces the three words above; `None` back to the environment's.
     #[doc(hidden)]
     pub fn force_stage(bus_from_grid: Option<bool>, eq_levels: Option<bool>, at_end: Option<bool>) {
@@ -268,6 +302,39 @@ fn fit(work: u64, rows: usize, words: u64, cap_threads: u64) -> Option<(u32, u32
         grid -= 1;
     }
     Some((grid, block))
+}
+
+/// Dynamic shared memory a shared-slot round block may take.
+const SHARED_SLOT_BYTES: u32 = 96 * 1024;
+
+/// The block of the shared-slot rounds for a program of `num_slots` live ext3
+/// slots: the largest power of two up to 256 threads whose reduction words and
+/// slot files fit in [`SHARED_SLOT_BYTES`], or `None` when not even one thread's
+/// does (or the card refuses the size).
+fn shared_block(num_slots: u64) -> Option<u32> {
+    static ATTR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ready = *ATTR.get_or_init(|| {
+        backend().is_ok_and(|be| {
+            be.ctx
+                .bind_to_thread()
+                .and_then(|()| {
+                    be.zc_round_gruen_shared.set_attribute(
+                        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        SHARED_SLOT_BYTES as i32,
+                    )
+                })
+                .is_ok()
+        })
+    });
+    if !ready {
+        return None;
+    }
+    let per_thread = 24 + num_slots.max(1) * 24;
+    let mut block = 256u64;
+    while block > 1 && block * per_thread > u64::from(SHARED_SLOT_BYTES) {
+        block /= 2;
+    }
+    (block * per_thread <= u64::from(SHARED_SLOT_BYTES)).then_some(block as u32)
 }
 
 /// The slot file's u64s: the grid pass's first launch (base slots) or the
@@ -1136,7 +1203,18 @@ impl<'f> FusedZerocheck<'f> {
             };
             self.stream.memcpy_htod(&ints, &mut head)?;
         }
-        let (grid, block) = self.shape(half, rows, 3 * self.num_slots as u64)?;
+        // The shared-slot rounds ([`knobs::shared_slots`]): a block whose slot
+        // file fits in shared memory, at most `SHARED_SLOT_BYTES` a block.
+        let shared_block = knobs::shared_slots()
+            .filter(|bits| half <= 1u64 << bits)
+            .and_then(|_| shared_block(self.num_slots as u64));
+        let (grid, block) = match shared_block {
+            Some(block) => (
+                half.div_ceil(u64::from(block)).clamp(1, MAX_GRID as u64) as u32,
+                block,
+            ),
+            None => self.shape(half, rows, 3 * self.num_slots as u64)?,
+        };
         let num_a = nodes.len() as u32;
         let q = self.rows / 4;
         let l = self
@@ -1164,9 +1242,16 @@ impl<'f> FusedZerocheck<'f> {
         };
         for _ in 0..crate::ktime::times("zc.rounds") {
             let t0 = self.tick();
+            let (kernel, shared_bytes) = match shared_block {
+                Some(block) => (
+                    &be.zc_round_gruen_shared,
+                    block * 3 * 8 + block * self.num_slots as u32 * 24,
+                ),
+                None => (&be.zc_round_gruen, block * 3 * 8),
+            };
             unsafe {
                 self.stream
-                    .launch_builder(&be.zc_round_gruen)
+                    .launch_builder(kernel)
                     .arg(&self.folded_ptrs)
                     .arg(&half)
                     .arg(&self.nodes)
@@ -1183,7 +1268,7 @@ impl<'f> FusedZerocheck<'f> {
                     .launch(LaunchConfig {
                         grid_dim: (grid, rows as u32, 1),
                         block_dim: (block, 1, 1),
-                        shared_mem_bytes: block * 3 * 8,
+                        shared_mem_bytes: shared_bytes,
                     })?;
             }
             self.tock_at(

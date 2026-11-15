@@ -1179,6 +1179,7 @@ fn the_zerocheck_variants_send_todays_messages() {
         fn drop(&mut self) {
             knobs::force_stage(None, None, None);
             knobs::force_stage_fault(0);
+            knobs::force_shared_slots(None);
             force_zc_device_tail(None);
         }
     }
@@ -1205,17 +1206,22 @@ fn the_zerocheck_variants_send_todays_messages() {
         runs.push((label.to_string(), 10));
         runs.push((label.to_string(), 12));
     }
-    let variants: [(&str, (bool, bool, bool)); 4] = [
-        ("bus from grid", (true, false, false)),
-        ("eq levels", (false, true, false)),
-        ("unread at end", (false, false, true)),
-        ("all three", (true, true, true)),
+    // The fourth flag: every later round's slot file in shared memory
+    // (`LAMBDA_VM_ZC_SHARED_SLOTS`).
+    let variants: [(&str, (bool, bool, bool), bool); 6] = [
+        ("bus from grid", (true, false, false), false),
+        ("eq levels", (false, true, false), false),
+        ("unread at end", (false, false, true), false),
+        ("all three", (true, true, true), false),
+        ("shared slots", (false, false, false), true),
+        ("all four", (true, true, true), true),
     ];
     let mut checked = 0usize;
     for tail in [None, Some(Some(2usize))] {
         force_zc_device_tail(tail);
-        for (name, (grid, levels, end)) in variants {
+        for (name, (grid, levels, end), shared) in variants {
             knobs::force_stage(Some(grid), Some(levels), Some(end));
+            knobs::force_shared_slots(Some(shared.then_some(30)));
             for (at, (label, n)) in runs.iter().enumerate() {
                 let air = airs.iter().find(|(_, l)| l == label).unwrap().0;
                 let mut rng = Rng::new(0x57A6 + at as u64);
@@ -1235,6 +1241,7 @@ fn the_zerocheck_variants_send_todays_messages() {
         }
     }
     // The faults: each variant's own path broken must part from today.
+    knobs::force_shared_slots(Some(None));
     force_zc_device_tail(Some(Some(2)));
     for (fault, (grid, levels, end)) in [
         (1u8, (true, false, false)),

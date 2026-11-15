@@ -1115,7 +1115,8 @@ extern "C" __global__ void zc_halve(uint64_t *__restrict__ table, uint64_t half)
 // read at the integer node `k = node[y]` as `lo + k·(hi − lo)` (`lo` itself at
 // `k = 0`); row `num_a + b` sums `eq_rho[j]·L[j + b·half]`. The per-block sums go
 // to `d_partials[(y·gridDim.x + block)·3]`.
-extern "C" __global__ __launch_bounds__(256, 2) void zc_round_gruen(
+template <bool SHARED>
+__device__ __forceinline__ void zc_round_gruen_body(
     const uint64_t *const *__restrict__ d_factors, uint64_t half,
     const uint64_t *__restrict__ d_nodes, uint64_t num_nodes,
     const uint64_t *__restrict__ d_consts, const uint64_t *__restrict__ d_betas,
@@ -1123,9 +1124,19 @@ extern "C" __global__ __launch_bounds__(256, 2) void zc_round_gruen(
     const uint64_t *__restrict__ d_eq_r, const uint64_t *__restrict__ d_eq_rho,
     const uint64_t *__restrict__ d_l, uint64_t *__restrict__ d_slots,
     uint64_t *__restrict__ d_partials) {
-    uint64_t tid = ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
-    uint64_t num_threads = (uint64_t)gridDim.x * gridDim.y * blockDim.x;
-    uint64_t *slots = d_slots + tid;
+    extern __shared__ uint64_t shared[];
+    // The slot file: the launch's slab in global memory, or (`SHARED`) the
+    // block's own in shared memory after the reduction's `3·blockDim` words.
+    uint64_t *slots;
+    uint64_t stride;
+    if (SHARED) {
+        slots = shared + (uint64_t)blockDim.x * 3 + threadIdx.x;
+        stride = blockDim.x;
+    } else {
+        uint64_t tid = ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+        slots = d_slots + tid;
+        stride = (uint64_t)gridDim.x * gridDim.y * blockDim.x;
+    }
     uint64_t start = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t step = (uint64_t)gridDim.x * blockDim.x;
 
@@ -1145,33 +1156,33 @@ extern "C" __global__ __launch_bounds__(256, 2) void zc_round_gruen(
                         Fe3 hi = load_ext(column + (j + half) * 3);
                         v = ext3::add(lo, ext3::mul_base(ext3::sub(hi, lo), k));
                     }
-                    store_slot(slots, num_threads, nd.res, v);
+                    store_slot(slots, stride, nd.res, v);
                     break;
                 }
                 case OP_FIXED:
-                    store_slot(slots, num_threads, nd.res, load_ext(d_consts + (uint64_t)nd.a * 3));
+                    store_slot(slots, stride, nd.res, load_ext(d_consts + (uint64_t)nd.a * 3));
                     break;
                 case OP_ADD:
-                    store_slot(slots, num_threads, nd.res,
-                               ext3::add(load_slot(slots, num_threads, nd.a),
-                                         load_slot(slots, num_threads, nd.b)));
+                    store_slot(slots, stride, nd.res,
+                               ext3::add(load_slot(slots, stride, nd.a),
+                                         load_slot(slots, stride, nd.b)));
                     break;
                 case OP_SUB:
-                    store_slot(slots, num_threads, nd.res,
-                               ext3::sub(load_slot(slots, num_threads, nd.a),
-                                         load_slot(slots, num_threads, nd.b)));
+                    store_slot(slots, stride, nd.res,
+                               ext3::sub(load_slot(slots, stride, nd.a),
+                                         load_slot(slots, stride, nd.b)));
                     break;
                 case OP_MUL:
-                    store_slot(slots, num_threads, nd.res,
-                               ext3::mul(load_slot(slots, num_threads, nd.a),
-                                         load_slot(slots, num_threads, nd.b)));
+                    store_slot(slots, stride, nd.res,
+                               ext3::mul(load_slot(slots, stride, nd.a),
+                                         load_slot(slots, stride, nd.b)));
                     break;
                 case OP_NEG:
-                    store_slot(slots, num_threads, nd.res,
-                               ext3::neg(load_slot(slots, num_threads, nd.a)));
+                    store_slot(slots, stride, nd.res,
+                               ext3::neg(load_slot(slots, stride, nd.a)));
                     break;
                 case OP_ACC: {
-                    Fe3 v = load_slot(slots, num_threads, nd.a);
+                    Fe3 v = load_slot(slots, stride, nd.a);
                     if (nd.b != NO_SELECTOR) {
                         const uint64_t *column = d_factors[nd.b];
                         Fe3 lo = load_ext(column + j * 3);
@@ -1199,7 +1210,6 @@ extern "C" __global__ __launch_bounds__(256, 2) void zc_round_gruen(
         }
     }
 
-    extern __shared__ uint64_t shared[];
     shared[threadIdx.x * 3 + 0] = acc.a;
     shared[threadIdx.x * 3 + 1] = acc.b;
     shared[threadIdx.x * 3 + 2] = acc.c;
@@ -1220,6 +1230,35 @@ extern "C" __global__ __launch_bounds__(256, 2) void zc_round_gruen(
         d_partials[at + 1] = shared[1];
         d_partials[at + 2] = shared[2];
     }
+}
+
+
+extern "C" __global__ __launch_bounds__(256, 2) void zc_round_gruen(
+    const uint64_t *const *__restrict__ d_factors, uint64_t half,
+    const uint64_t *__restrict__ d_nodes, uint64_t num_nodes,
+    const uint64_t *__restrict__ d_consts, const uint64_t *__restrict__ d_betas,
+    const uint32_t *__restrict__ d_node_ints, uint32_t num_a,
+    const uint64_t *__restrict__ d_eq_r, const uint64_t *__restrict__ d_eq_rho,
+    const uint64_t *__restrict__ d_l, uint64_t *__restrict__ d_slots,
+    uint64_t *__restrict__ d_partials) {
+    zc_round_gruen_body<false>(d_factors, half, d_nodes, num_nodes, d_consts, d_betas, d_node_ints, num_a,
+                               d_eq_r, d_eq_rho, d_l, d_slots, d_partials);
+}
+
+// `zc_round_gruen` with each block's slot file in shared memory (dynamic shared:
+// `3·blockDim` words for the reduction, then `num_slots·3·blockDim`): for the
+// launches too small to fill the card, where every step's slot traffic is a
+// dependent global access. The same sums.
+extern "C" __global__ __launch_bounds__(256) void zc_round_gruen_shared(
+    const uint64_t *const *__restrict__ d_factors, uint64_t half,
+    const uint64_t *__restrict__ d_nodes, uint64_t num_nodes,
+    const uint64_t *__restrict__ d_consts, const uint64_t *__restrict__ d_betas,
+    const uint32_t *__restrict__ d_node_ints, uint32_t num_a,
+    const uint64_t *__restrict__ d_eq_r, const uint64_t *__restrict__ d_eq_rho,
+    const uint64_t *__restrict__ d_l, uint64_t *__restrict__ d_slots,
+    uint64_t *__restrict__ d_partials) {
+    zc_round_gruen_body<true>(d_factors, half, d_nodes, num_nodes, d_consts, d_betas, d_node_ints, num_a,
+                              d_eq_r, d_eq_rho, d_l, d_slots, d_partials);
 }
 
 // ── a GKR layer's rounds with Gruen's split (D-ARGUE S1-3, `crate::gkr::GruenLayer`) ─────────────
