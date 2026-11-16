@@ -1781,3 +1781,632 @@ fn a_copy_of_2_to_the_32_bytes_or_more_is_refused_by_the_count_read() {
     let v = verdict(&bench.with_interactions(copy_w::NAME, control));
     assert!(v.accepted(), "control: {v:?}");
 }
+
+// ---- the chain's other values and the count's limbs ----
+
+/// The chain tuple's source key low word, count, memset flag, commit flag.
+const CHAIN_SRC_LO: std::ops::Range<usize> = 3..4;
+const CHAIN_COUNT: std::ops::Range<usize> = 5..6;
+const CHAIN_SET: std::ops::Range<usize> = 6..7;
+const CHAIN_WRITE: std::ops::Range<usize> = 7..8;
+
+/// `bench` refused by the chain alone, and accepted with `positions` out of
+/// the chain's tuples.
+fn refused_by_the_chain_at(bench: Bench, positions: std::ops::Range<usize>) {
+    let v = verdict(&bench);
+    assert!(
+        v.refused_only_on(BusId::CopyWordNext),
+        "{positions:?}: {v:?}"
+    );
+    let v = verdict(&bench.with_interactions(copy_w::NAME, chain_without(positions.clone())));
+    assert!(v.accepted(), "control, {positions:?} out: {v:?}");
+}
+
+/// ★ The source key rides the chain: a 40-byte copy whose rows after the
+/// first read their source words 0x108 further on, so the bytes they place
+/// are not the source's. Refused by the chain alone; accepted with the
+/// source key's low word out of it.
+#[test]
+fn later_source_words_from_elsewhere_are_refused_by_the_chain() {
+    let mut run = Run::new();
+    let r = run.call_with(Functionality::Copy, ELF + 3, LOW + 0x400, 40, |rows| {
+        assert!(rows.len() >= 3);
+        for row in rows.iter_mut().skip(1) {
+            row.src_key += 0x108;
+        }
+    });
+    let row = run.rows[r.start + 1];
+    let honest = run
+        .memory
+        .clone()
+        .word(row.b_key() - 0x108)
+        .expect("held")
+        .0;
+    assert_ne!(row.b(), honest, "the placed bytes are not the source's");
+    refused_by_the_chain_at(run.bench(), CHAIN_SRC_LO);
+}
+
+/// ★ The count rides the chain: a 16-byte copy whose first row leaves 8 (as
+/// x12's 16 asks) and whose later rows run as a 24-byte call's, writing 24
+/// bytes. Refused by the chain alone; accepted with the count out of it.
+#[test]
+fn a_call_that_copies_past_its_count_is_refused_by_the_chain() {
+    let (src, dst) = (ELF + 0x40, LOW + 0x400);
+    let mut run = Run::new();
+    let ts = run.next_ts();
+    run.guest_call(Functionality::Copy, src, dst, 16, ts);
+    let mut rows = copy_w::call_rows(Functionality::Copy, ts, src, dst, 24).expect("rows");
+    assert_eq!(rows.len(), 3);
+    rows[0].count_decr = 8;
+    let memw = copy_w::run_call(&mut rows, src, dst, 24, &mut run.memory)
+        .unwrap_or_else(|why| panic!("the forged call runs: {why}"))
+        .expect("every word is held");
+    run.rows.extend(rows);
+    run.memw.extend(memw);
+    refused_by_the_chain_at(run.bench(), CHAIN_COUNT);
+}
+
+/// ★ The memset flag rides the chain: an aligned 24-byte memcpy to `src + 8`
+/// whose rows after the first run as a memset's (each writes its carried
+/// word at `T`, the next reads it back at `T + 1`), so the last word gets the
+/// second source word, not the third that memmove leaves. Refused by the
+/// chain alone; accepted with the flag out of it.
+#[test]
+fn a_copy_that_turns_into_a_memset_is_refused_by_the_chain() {
+    let src = ELF + 0x100;
+    let dst = src + 8;
+    let mut run = Run::new();
+    let ts = run.next_ts();
+    run.guest_call(Functionality::Copy, src, dst, 24, ts);
+    let mut rows = copy_w::call_rows(Functionality::Copy, ts, src, dst, 24).expect("rows");
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.shift == 0));
+    let s: Vec<u64> = (0..4u64)
+        .map(|k| run.memory.word(src + 8 * k).expect("held").0)
+        .collect();
+    assert_ne!(s[1], s[2], "distinct source words");
+    rows[0].set_words(s[0], s[1], s[1]);
+    rows[1].flags |= copy_w::FLAG_SET;
+    rows[1].set_words(s[1], 0, s[2]);
+    let back = rows[1].new_word();
+    assert_eq!(back, s[1]);
+    rows[1].set_words(s[1], back, s[2]);
+    rows[2].flags |= copy_w::FLAG_SET;
+    rows[2].set_words(back, 0, s[3]);
+    assert_eq!(
+        rows[2].new_word(),
+        s[1],
+        "the last word: the second source word"
+    );
+    run.rows = rows;
+    refused_by_the_chain_at(run.bench(), CHAIN_SET);
+}
+
+/// ★ The commit flag rides the chain: a commit `C` of 24 bytes from `s` at
+/// index 0 and a later memcpy `M` of the same 24 bytes to address 8 (whose
+/// words are the keys `C`'s commit index names) trade their rows after the
+/// first: `C`'s write `s`'s words to 16 and 24 at `C`'s time, `M`'s send `C`'s
+/// commit pairs. A commit `D` of the word at 16, between the two, then
+/// commits `s`'s bytes where the program held zeros: another public output.
+/// Refused by the chain alone; accepted with the commit flag out of it.
+#[test]
+fn a_commit_and_a_copy_that_trade_their_rows_are_refused_by_the_chain() {
+    let s = ELF + 0x40;
+    let mut run = Run::new();
+    let words: Vec<u64> = (0..3u64)
+        .map(|k| run.memory.word(s + 8 * k).expect("held").0)
+        .collect();
+    assert!(words.iter().all(|&w| w != 0));
+    let (t1, t2, t3) = (run.next_ts(), run.next_ts(), run.next_ts());
+    run.guest_call(Functionality::Write, s, 0, 24, t1);
+    run.guest_call(Functionality::Write, 16, 24, 8, t2);
+    run.guest_call(Functionality::Copy, s, 8, 24, t3);
+    let honest_output = run.commits.clone();
+    let mut c = copy_w::call_rows(Functionality::Write, t1, s, 0, 24).expect("C");
+    let mut d = copy_w::call_rows(Functionality::Write, t2, 16, 24, 8).expect("D");
+    let mut m = copy_w::call_rows(Functionality::Copy, t3, s, 8, 24).expect("M");
+    assert_eq!((c.len(), d.len(), m.len()), (3, 1, 3));
+    for k in 1..3 {
+        assert_eq!(
+            c[k].dst_key(),
+            m[k].dst_key(),
+            "the commit's keys are M's words"
+        );
+        c[k].flags &= !copy_w::FLAG_WRITE;
+        m[k].flags |= copy_w::FLAG_WRITE;
+    }
+    // At t1, C reads s's words and (its rows 1, 2 now copy rows) writes
+    // words 1 and 2 to 16 and 24, which held zeros.
+    c[0].set_words(words[0], words[1], 0);
+    c[1].set_words(words[1], words[2], 0);
+    c[2].set_words(words[2], 0, 0);
+    assert_eq!((c[1].new_word(), c[2].new_word()), (words[1], words[2]));
+    // At t2, D reads 16: word 1, where the program holds zeros until t3.
+    d[0].set_words(words[1], 0, 0);
+    // At t3, M's first row writes word 0 to 8; its rows 1, 2 (now commit
+    // rows) write nothing and send C's pairs.
+    m[0].set_words(words[0], words[1], 0);
+    m[1].set_words(words[1], words[2], 0);
+    m[2].set_words(words[2], 0, 0);
+    let rows: Vec<CopyWordRow> = c.into_iter().chain(d).chain(m).collect();
+    run.commits = rows.iter().flat_map(|r| r.commit_pairs()).collect();
+    run.commits.sort_unstable();
+    let mut honest = honest_output;
+    honest.sort_unstable();
+    assert_eq!(run.commits.len(), honest.len());
+    assert_ne!(run.commits, honest, "another public output");
+    run.rows = rows;
+    refused_by_the_chain_at(run.bench(), CHAIN_WRITE);
+}
+
+/// ★ The count's limbs are what keep it from running below zero: an 8-byte
+/// memcpy laid out as a 16-byte call's two rows, the first leaving 0 (and not
+/// the last), the second starting from 0 and leaving −8, held as limbs `(x,
+/// −x)` with `x·(1 − 2^16) = −8`, which the last row's rule (its limbs' sum
+/// zero) takes. Refused by the two `IS_HALF` on `COUNT_DECR` alone; accepted
+/// with them out: 16 bytes written for an 8-byte call.
+#[test]
+fn a_count_that_runs_below_zero_is_refused_by_its_limb_checks() {
+    let (src, dst) = (ELF + 0x40, LOW + 0x400);
+    let mut run = Run::new();
+    let ts = run.next_ts();
+    run.guest_call(Functionality::Copy, src, dst, 8, ts);
+    let mut rows = copy_w::call_rows(Functionality::Copy, ts, src, dst, 16).expect("rows");
+    assert_eq!(rows.len(), 2);
+    rows[0].count_decr = 0;
+    let memw = copy_w::run_call(&mut rows, src, dst, 16, &mut run.memory)
+        .unwrap_or_else(|why| panic!("the forged call runs: {why}"))
+        .expect("every word is held");
+    run.rows.extend(rows);
+    run.memw.extend(memw);
+    let mut bench = run.bench();
+    let x = FE::from(8u64) * FE::from((1u64 << 16) - 1).inv().expect("invertible");
+    bench.set(copy_w::NAME, 1, cw::COUNT_DECR[0], x);
+    bench.set(copy_w::NAME, 1, cw::COUNT_DECR[1], FE::zero() - x);
+    let v = verdict(&bench);
+    let mut limbs = vec![
+        (u64::from(BusId::IsHalfword), vec![x.canonical_u64()]),
+        (
+            u64::from(BusId::IsHalfword),
+            vec![(FE::zero() - x).canonical_u64()],
+        ),
+    ];
+    limbs.sort();
+    assert!(
+        v.left.is_empty()
+            && v.broken.is_empty()
+            && v.preprocessed.is_empty()
+            && v.unanswered == limbs,
+        "{v:?}"
+    );
+    let control = without_halfwords(&cw::COUNT_DECR);
+    let v = verdict(&bench.with_interactions(copy_w::NAME, control));
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// COPY_W's interactions with the `IS_HALF` lookups on `limbs` at
+/// multiplicity zero: a control mutant.
+fn without_halfwords(limbs: &[usize]) -> Vec<BusInteraction> {
+    let mut out = copy_w::bus_interactions();
+    let mut off = 0;
+    for bi in &mut out {
+        if bi.bus_id == u64::from(BusId::IsHalfword)
+            && limbs.iter().any(|&c| bi.values == vec![column(c)])
+        {
+            bi.multiplicity = Multiplicity::Linear(vec![LinearTerm::Constant(0)]);
+            off += 1;
+        }
+    }
+    assert_eq!(off, limbs.len(), "one IS_HALF a limb");
+    out
+}
+
+/// ★ The keys' limbs are a second check: COPY_W reads a key's two limbs only
+/// as their sum, and every key a row reads or writes is a PAGE_W key, which
+/// holds a low word below 2^32. A 24-byte copy to `2^32 − 16` whose middle
+/// row clears its `DST_CARRY` hands the last row `(2^32, 0)`, which the last
+/// row holds as limbs `(0, 2^16)`: refused by its `IS_HALF` and by the word
+/// bus (its write names a key no page has). With the destination limbs'
+/// lookups out it is refused by the word bus alone; with that key also
+/// minted (a spare row of the page below the line at `OFFSET = 2^15`, the
+/// write moved to it), accepted: the token range is the check.
+#[test]
+fn a_destination_key_past_its_low_range_is_refused_by_the_word_bus() {
+    let mut run = Run::with_pages(line_pages());
+    let r = run.copy(BELOW + 0x200, LINE - 16, 24);
+    let last = r.start + 2;
+    assert_eq!(run.rows[r.start + 1].carries(), [false, true, false]);
+    assert_eq!(run.rows[last].dst_key(), LINE);
+    let mut forged = run.bench();
+    forged.set(copy_w::NAME, r.start + 1, cw::DST_CARRY, FE::zero());
+    forged.set(copy_w::NAME, last, cw::DST_KEY_LO[0], FE::zero());
+    forged.set(copy_w::NAME, last, cw::DST_KEY_LO[1], FE::from(1u64 << 16));
+    forged.set(copy_w::NAME, last, cw::DST_KEY_HI, FE::zero());
+    let v = verdict(&forged);
+    assert_eq!(
+        v.unanswered,
+        vec![(u64::from(BusId::IsHalfword), vec![1 << 16])],
+        "{v:?}"
+    );
+    assert!(
+        v.left.keys().all(|&b| b == u64::from(BusId::MemWordMsg)) && v.broken.is_empty(),
+        "{v:?}"
+    );
+    let unchecked = forged.with_interactions(copy_w::NAME, without_halfwords(&cw::DST_KEY_LO));
+    let v = verdict(&unchecked);
+    assert!(v.refused_only_on(BusId::MemWordMsg), "{v:?}");
+    let mut control = unchecked;
+    let held = run.rows[last];
+    let t = &control.piece("MEMW_W").trace;
+    let access = (0..t.num_rows())
+        .find(|&m| {
+            *t.get_main(m, mw::ADDRESS_LO) == FE::zero()
+                && *t.get_main(m, mw::ADDRESS_HI) == FE::one()
+        })
+        .expect("the write to 2^32's word");
+    control.set("MEMW_W", access, mw::ADDRESS_LO, FE::from(LINE));
+    control.set("MEMW_W", access, mw::ADDRESS_HI, FE::zero());
+    let page = page_name(LINE);
+    control.set(&page, 0, pw::TIMESTAMP, FE::zero());
+    let init = run.memory.init_word(LINE).expect("held");
+    control.set(&page, 0, pw::FINI_LO, FE::from(init & 0xFFFF_FFFF));
+    control.set(&page, 0, pw::FINI_HI, FE::from(init >> 32));
+    mint_at(
+        &mut control,
+        BELOW,
+        100,
+        FE::from(DEFAULT_PAGE_SIZE as u64 / 8),
+        held.new_word(),
+        held.write_timestamp(),
+    );
+    // The minted word starts as the write's old word.
+    let quarters = [
+        held.old(),
+        held.old() >> 16,
+        held.old() >> 32,
+        held.old() >> 48,
+    ];
+    for (k, q) in quarters.into_iter().enumerate() {
+        control.set(&page_name(BELOW), 100, pw::INIT[k], FE::from(q & 0xFFFF));
+    }
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ The same for the source: an 11-byte copy from `2^32 − 3` (shift 5: its
+/// first row reads `A` at `2^32 − 8` and `B` at `(0, 1)`, its last row places
+/// the carried word's last three bytes and reads nothing) with the first row's `SRC_CARRY` cleared: `B` named `(2^32, 0)`
+/// and the chain hands the last row that key, which it holds as limbs `(0,
+/// 2^16)`. Refused by its `IS_HALF` and by the word bus; with the source
+/// limbs' lookups out, by the word bus alone; with `(2^32, 0)` minted and the
+/// read moved to it, accepted.
+#[test]
+fn a_source_key_past_its_low_range_is_refused_by_the_word_bus() {
+    let mut run = Run::with_pages(line_pages());
+    let r = run.copy(LINE - 3, LOW + 0x400, 11);
+    assert_eq!(r.len(), 2);
+    let (first, last) = (run.rows[r.start], run.rows[r.start + 1]);
+    assert!(first.reads_a() && first.reads_b() && first.b_key() == LINE);
+    assert!(
+        !last.reads_a() && !last.reads_b(),
+        "the last row reads nothing"
+    );
+    assert_eq!(first.carries(), [true, false, false]);
+    let mut forged = run.bench();
+    forged.set(copy_w::NAME, r.start, cw::SRC_CARRY, FE::zero());
+    forged.set(copy_w::NAME, r.start + 1, cw::SRC_KEY_LO[0], FE::zero());
+    forged.set(
+        copy_w::NAME,
+        r.start + 1,
+        cw::SRC_KEY_LO[1],
+        FE::from(1u64 << 16),
+    );
+    forged.set(copy_w::NAME, r.start + 1, cw::SRC_KEY_HI, FE::zero());
+    let v = verdict(&forged);
+    assert_eq!(
+        v.unanswered,
+        vec![(u64::from(BusId::IsHalfword), vec![1 << 16])],
+        "{v:?}"
+    );
+    assert!(
+        v.left.keys().all(|&b| b == u64::from(BusId::MemWordMsg)) && v.broken.is_empty(),
+        "{v:?}"
+    );
+    let unchecked = forged.with_interactions(copy_w::NAME, without_halfwords(&cw::SRC_KEY_LO));
+    let v = verdict(&unchecked);
+    assert!(v.refused_only_on(BusId::MemWordMsg), "{v:?}");
+    let mut control = unchecked;
+    let t = &control.piece("MEMW_W").trace;
+    let access = (0..t.num_rows())
+        .find(|&m| {
+            *t.get_main(m, mw::ADDRESS_LO) == FE::zero()
+                && *t.get_main(m, mw::ADDRESS_HI) == FE::one()
+        })
+        .expect("the read of 2^32's word");
+    control.set("MEMW_W", access, mw::ADDRESS_LO, FE::from(LINE));
+    control.set("MEMW_W", access, mw::ADDRESS_HI, FE::zero());
+    let page = page_name(LINE);
+    control.set(&page, 0, pw::TIMESTAMP, FE::zero());
+    mint_at(
+        &mut control,
+        BELOW,
+        100,
+        FE::from(DEFAULT_PAGE_SIZE as u64 / 8),
+        first.b(),
+        first.read_timestamp(),
+    );
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// The chain tuple's timestamp, and the keys' high words.
+const CHAIN_T: std::ops::Range<usize> = 0..1;
+const CHAIN_DST_HI: std::ops::Range<usize> = 2..3;
+const CHAIN_SRC_HI: std::ops::Range<usize> = 4..5;
+
+/// The columns a chain value reads.
+fn value_columns(value: &BusValue) -> Vec<usize> {
+    match value {
+        BusValue::Linear(terms) => terms
+            .iter()
+            .filter_map(|t| match *t {
+                LinearTerm::Column { column, .. } => Some(column),
+                _ => None,
+            })
+            .collect(),
+        other => {
+            let one = column(cw::TIMESTAMP);
+            assert_eq!(std::mem::discriminant(other), std::mem::discriminant(&one));
+            (0..cw::NUM_COLUMNS)
+                .filter(|&c| *other == column(c))
+                .collect()
+        }
+    }
+}
+
+/// The chain's positions the forgeries take out are the values they name:
+/// the timestamp, the keys, the count, the two flags.
+#[test]
+fn the_chain_tuple_positions_are_the_forgeries_ones() {
+    for bi in copy_w::bus_interactions()
+        .iter()
+        .filter(|bi| bi.bus_id == u64::from(BusId::CopyWordNext))
+    {
+        let at = |p: std::ops::Range<usize>| value_columns(&bi.values[p.start]);
+        assert_eq!(at(CHAIN_T), vec![cw::TIMESTAMP]);
+        assert!(at(CHAIN_DST).starts_with(&cw::DST_KEY_LO));
+        assert_eq!(at(CHAIN_DST_HI)[0], cw::DST_KEY_HI);
+        assert!(at(CHAIN_SRC_LO).starts_with(&cw::SRC_KEY_LO));
+        assert_eq!(at(CHAIN_SRC_HI)[0], cw::SRC_KEY_HI);
+        assert!(at(CHAIN_COUNT).starts_with(&cw::COUNT_DECR));
+        assert_eq!(at(CHAIN_SET), vec![cw::IS_SET]);
+        assert_eq!(at(CHAIN_WRITE), vec![cw::IS_WRITE]);
+    }
+}
+
+/// ★ The timestamp rides the chain: a 40-byte copy whose rows after the
+/// first sit 8 later (reads at `T + 8`, writes at `T + 9`), after whatever
+/// ran between. Refused by the chain alone; accepted with it out.
+#[test]
+fn rows_after_the_first_at_another_time_are_refused_by_the_chain() {
+    let run = forged(Functionality::Copy, ELF + 3, LOW + 0x400, 40, |rows| {
+        assert!(rows.len() >= 3);
+        for r in rows.iter_mut().skip(1) {
+            r.timestamp += 8;
+        }
+    });
+    refused_by_the_chain_at(run.bench(), CHAIN_T);
+}
+
+/// ★ The keys' high words ride the chain: a 40-byte copy whose rows after
+/// the first write, or read, 4 GiB away. Refused by the chain alone;
+/// accepted with that high word out of it.
+#[test]
+fn later_words_under_another_high_word_are_refused_by_the_chain() {
+    for (destination, positions) in [(true, CHAIN_DST_HI), (false, CHAIN_SRC_HI)] {
+        let mut run = Run::new();
+        run.memory.pages.push(PageConfig::zero_init(1 << 32));
+        run.memory
+            .pages
+            .push(PageConfig::zero_init((1 << 32) + ELF_BASE));
+        run.call_with(Functionality::Copy, ELF + 3, LOW + 0x400, 40, |rows| {
+            assert!(rows.len() >= 3);
+            for r in rows.iter_mut().skip(1) {
+                if destination {
+                    r.dst_key += 1 << 32;
+                } else {
+                    r.src_key += 1 << 32;
+                }
+            }
+        });
+        refused_by_the_chain_at(run.bench(), positions);
+    }
+}
+
+/// ★ A copy to `8m + 3` whose rows claim offset 0 and write the unaligned
+/// words at `8m + 3` and `8m + 11`: no page mints a token there, so refused
+/// on the word bus alone (every key left over is 3 mod 8). Control: PAGE_W's
+/// `OFFSET` the forger's (`m + k + 3/8`), which mints the two keys, accepted.
+#[test]
+fn a_copy_with_a_wrong_destination_offset_writes_words_nothing_minted() {
+    let m = (LOW + 0x400) / WORD_BYTES;
+    let (src, dst, n) = (ELF + 3, 8 * m + 3, 10u64);
+    let mut run = Run::new();
+    let ts = run.next_ts();
+    run.guest_call(Functionality::Copy, src, dst, n, ts);
+    // The rows of the same call to the aligned word (offset 0, shift 3),
+    // their destination keys the forger's.
+    let mut rows = copy_w::call_rows(Functionality::Copy, ts, src, 8 * m, n).expect("rows");
+    assert_eq!((rows.len(), rows[0].start, rows[0].shift), (2, 0, 3));
+    for (k, r) in rows.iter_mut().enumerate() {
+        r.dst_key = dst + 8 * k as u64;
+    }
+    read_words(&mut run, rows, false);
+    let bench = run.bench();
+    let v = verdict(&bench);
+    assert!(v.refused_only_on(BusId::MemWord), "{v:?}");
+    assert!(
+        v.left_on(BusId::MemWord)
+            .iter()
+            .all(|(tuple, _)| tuple.first().is_some_and(|lo| lo % 8 == 3)),
+        "{v:?}"
+    );
+    let mut control = bench;
+    let name = page_name(0);
+    let eighth = FE::from(8u64).inv().expect("8 is invertible");
+    for (k, r) in run.rows.iter().enumerate() {
+        let row = m as usize + k;
+        control.set(
+            &name,
+            row,
+            pw::OFFSET,
+            FE::from(m + k as u64) + FE::from(3u64) * eighth,
+        );
+        control.set(&name, row, pw::TIMESTAMP, FE::from(r.write_timestamp()));
+        let new = r.new_word();
+        control.set(&name, row, pw::FINI_LO, FE::from(new & 0xFFFF_FFFF));
+        control.set(&name, row, pw::FINI_HI, FE::from(new >> 32));
+    }
+    let t = &control.piece(&name).trace;
+    let column = (0..t.num_rows())
+        .map(|r| *t.get_main(r, pw::OFFSET))
+        .collect();
+    control.piece_mut(&name).preprocessed[pw::OFFSET] = column;
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+// ---- the byte pairs ----
+
+/// `run`'s bench with COPY_W row `row`'s new word the halves `(lo, hi)`
+/// (field values, so a half past 2^32 too), its MEMW_W write and its final
+/// following them (the forger's write).
+fn with_new_halves(run: &Run, row: usize, (lo, hi): (FE, FE)) -> Bench {
+    let r = run.rows[row];
+    let mut bench = with_new_word(run, row, r.new_word());
+    let (key, ts) = (r.dst_key(), r.write_timestamp());
+    bench.set(copy_w::NAME, row, cw::NEW_LO, lo);
+    bench.set(copy_w::NAME, row, cw::NEW_HI, hi);
+    let n = bench.piece("MEMW_W").trace.num_rows();
+    let m = (0..n)
+        .find(|&m| {
+            bench.get("MEMW_W", m, mw::ADDRESS_LO) == FE::from(key & 0xFFFF_FFFF)
+                && bench.get("MEMW_W", m, mw::TIMESTAMP) == FE::from(ts)
+        })
+        .expect("the row's write");
+    bench.set("MEMW_W", m, mw::NEW_LO, lo);
+    bench.set("MEMW_W", m, mw::NEW_HI, hi);
+    let page = run.memory.page_of(key).expect("a page").page_base;
+    let p = ((key - page) / WORD_BYTES) as usize;
+    bench.set(&page_name(page), p, pw::FINI_LO, lo);
+    bench.set(&page_name(page), p, pw::FINI_HI, hi);
+    bench
+}
+
+/// A split pair's case: which word, its columns, src, dst, count, whether
+/// the first row (else the last).
+type PairCase = (&'static str, [usize; 8], u64, u64, u64, bool);
+
+/// ★ Every byte pair is load-bearing where a window splits it: the pair's
+/// low byte takes 256 more and its high byte one less, so the word read or
+/// written is memory's, and the row's new word is another:
+/// - `OLD`, the first row's kept bytes below an odd `START`: the kept byte
+///   256 more, so the written byte above it comes out one more;
+/// - `A`, the first row's unused bytes below an odd `START + SHIFT`: the
+///   placed byte one less;
+/// - `B`, the last row's placed byte at an even `LAST + SHIFT − 8` (unused
+///   above it): 256 more, so the kept byte past the window comes out one
+///   more, or, when the placed byte tops its half, the half passes 2^32 (a
+///   word that is not canonical).
+///
+/// Each is refused by that pair's `ARE_BYTES` alone, and accepted with that
+/// pair out (the new word, its MEMW_W write and its final the forger's).
+#[test]
+fn every_byte_pair_refuses_a_word_split_across_a_window_edge() {
+    let byte = |word: u64, j: usize| (word >> (8 * j)) & 0xFF;
+    let minus_one = |x: u64| (FE::from(x) - FE::one()).canonical_u64();
+    // (which word, its columns, src, dst, count, first row or last).
+    let mut cases: Vec<PairCase> = Vec::new();
+    for odd in [1u64, 3, 5, 7] {
+        // OLD: dst offset `odd`, shift 0; A: dst aligned, shift `odd`.
+        cases.push((
+            "OLD",
+            cw::OLD,
+            ELF + 0x40 + odd,
+            LOW + 0x400 + odd,
+            12,
+            true,
+        ));
+        cases.push(("A", cw::A, ELF + 0x40 + odd, LOW + 0x400, 12, true));
+    }
+    for even in [0u64, 2, 4, 6] {
+        // B: dst aligned, shift 7, the last row's window 0..=even + 1.
+        cases.push(("B", cw::B, ELF + 0x47, LOW + 0x400, 10 + even, false));
+    }
+    let mut seen = Vec::new();
+    for (what, cols, src, dst, n, first) in cases {
+        let mut run = Run::new();
+        let r = run.copy(src, dst, n);
+        let row = if first { r.start } else { r.end - 1 };
+        let held = run.rows[row];
+        // The pair's first byte, and the destination byte whose half takes
+        // the change with what it takes: the kept byte 256 more (OLD), the
+        // placed byte one less (A) or 256 more (B), each inside its half.
+        let (word, lo, at, change) = match what {
+            "OLD" => {
+                let kept = usize::from(held.start) - 1;
+                (held.old(), kept, kept, FE::from(256u64))
+            }
+            "A" => {
+                let used = usize::from(held.start + held.shift);
+                assert!(
+                    byte(held.a(), used) >= 1,
+                    "A {used}: a byte to take one from"
+                );
+                (
+                    held.a(),
+                    used - 1,
+                    usize::from(held.start),
+                    FE::zero() - FE::one(),
+                )
+            }
+            _ => {
+                let used = usize::from(held.last + held.shift) - 8;
+                (held.b(), used, usize::from(held.last), FE::from(256u64))
+            }
+        };
+        assert_eq!(lo % 2, 0, "{what}: the window splits a pair");
+        seen.push((what, lo));
+        let (a, b) = (byte(word, lo) + 256, minus_one(byte(word, lo + 1)));
+        let honest = held.new_word();
+        let mut halves = [FE::from(honest & 0xFFFF_FFFF), FE::from(honest >> 32)];
+        halves[at / 4] += change * FE::from(1u64 << (8 * (at % 4)));
+        let mut bench = with_new_halves(&run, row, (halves[0], halves[1]));
+        bench.set(copy_w::NAME, row, cols[lo], FE::from(a));
+        bench.set(copy_w::NAME, row, cols[lo + 1], FE::from(b));
+        let v = verdict(&bench);
+        assert!(
+            v.left.is_empty()
+                && v.broken.is_empty()
+                && v.preprocessed.is_empty()
+                && v.unanswered == vec![(u64::from(BusId::AreBytes), vec![a, b])],
+            "{what} pair at {lo}: {v:?}"
+        );
+        let control: Vec<BusInteraction> = copy_w::bus_interactions()
+            .into_iter()
+            .filter(|bi| {
+                !(bi.bus_id == u64::from(BusId::AreBytes)
+                    && bi.values.first() == Some(&column(cols[lo])))
+            })
+            .collect();
+        assert_eq!(control.len() + 1, copy_w::bus_interactions().len());
+        let v = verdict(&bench.with_interactions(copy_w::NAME, control));
+        assert!(v.accepted(), "control, {what} pair at {lo}: {v:?}");
+    }
+    seen.sort_unstable();
+    let all: Vec<(&str, usize)> = ["A", "B", "OLD"]
+        .into_iter()
+        .flat_map(|w| [0, 2, 4, 6].map(|lo| (w, lo)))
+        .collect();
+    assert_eq!(seen, all, "every one of the twelve pairs");
+}
