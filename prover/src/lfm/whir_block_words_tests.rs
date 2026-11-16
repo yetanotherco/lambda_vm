@@ -745,7 +745,7 @@ fn every_route_mutant_refuses_the_word_leaves() {
 /// a power of two.
 fn runs_of(rows: usize, cap: usize) -> Vec<(usize, usize)> {
     let mut runs = vec![(cap, rows / cap)];
-    if rows % cap > 0 {
+    if !rows.is_multiple_of(cap) {
         runs.push(((rows % cap).next_power_of_two(), 1));
     }
     runs.retain(|&(_, c)| c > 0);
