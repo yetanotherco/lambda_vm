@@ -510,13 +510,16 @@ impl Decode {
 }
 
 /// One window's logs from cycle `first`: the register cells kept in `regs`,
-/// and (with `MEMORY`) the memory's accesses sent to `memory`.
+/// and (with `MEMORY`) the memory's accesses sent to `memory`. Under the word
+/// memory format (`words`) a load or store reads the words it touches, as the
+/// walk reads them ([`word_access`]).
 fn pass_window<M: Accesses, const MEMORY: bool>(
     decode: &Decode,
     memory: &mut M,
     regs: &mut Registers,
     logs: &[Log],
     first: usize,
+    words: bool,
 ) -> Result<(), Error> {
     let most = clock::window_max_timestamp(first, logs.len());
     clock::check_clock(most, "the lean pass")?;
@@ -536,7 +539,11 @@ fn pass_window<M: Accesses, const MEMORY: bool>(
         let op = CpuOperation::from_log(log, ts, entry, row);
         let f = &entry.fields;
         if MEMORY && f.memory {
-            memory.load_or_store(op.res, f.mem_bytes(), ts);
+            if words {
+                word_access(memory, op.res, f.mem_bytes(), ts);
+            } else {
+                memory.load_or_store(op.res, f.mem_bytes(), ts);
+            }
         }
         if f.read_register1 && f.rs1 != 0 {
             if f.rs1 == 255 {
@@ -559,12 +566,29 @@ fn pass_window<M: Accesses, const MEMORY: bool>(
     Ok(())
 }
 
+/// A load or store under the word memory format, as the word walk accesses
+/// it: the word holding `base` read, and the next one when the `count` bytes
+/// cross into it, then the bytes from `base` stamped `ts`.
+#[inline]
+fn word_access(memory: &mut impl Accesses, base: u64, count: usize, ts: u64) {
+    let word = base & !7;
+    let span = if (base & 7) as usize + count > 8 {
+        16
+    } else {
+        8
+    };
+    memory.access(word, span, None);
+    memory.access(base, count, Some(ts));
+}
+
 /// The walk's timestamps and registers, a window at a time, and each window's
 /// entries (see the module's documentation).
 pub(crate) struct LeanPass {
     decode: Decode,
     bytes: Bytes,
     registers: Registers,
+    /// Loads and stores read the words they touch (the word memory format).
+    words: bool,
 }
 
 impl LeanPass {
@@ -576,7 +600,16 @@ impl LeanPass {
             decode: Decode::new(decode)?,
             bytes: Bytes::new(),
             registers: Registers::of(registers),
+            words: false,
         })
+    }
+
+    /// Under the word memory format (`on`): each load or store reads the
+    /// words it touches, so its entries are those words' bytes, as the word
+    /// walk reads them.
+    pub(crate) fn words(mut self, on: bool) -> Self {
+        self.words = on;
+        self
     }
 
     /// Starts window `window` (its entries cleared). Windows are numbered
@@ -593,6 +626,7 @@ impl LeanPass {
             &mut self.registers,
             logs,
             first,
+            self.words,
         )
     }
 
@@ -606,6 +640,7 @@ impl LeanPass {
             &mut self.registers,
             logs,
             first,
+            self.words,
         )
     }
 

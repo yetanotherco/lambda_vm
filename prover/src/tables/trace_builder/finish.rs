@@ -191,6 +191,8 @@ pub(super) struct FinishPlan<'a> {
     /// The fused memory format's rows; empty under the split format.
     mem_load_rows: Vec<super::super::mem_load::MemLoadRow>,
     mem_store_rows: Vec<super::super::mem_store::MemStoreRow>,
+    /// The word memory format's CPU word-table rows; empty under any other.
+    word_rows: super::WordRows,
     /// IS_WH's rows ([`is_wh::dedup_is_wh_rows`] over KECCAK's state addresses),
     /// shared by its BITWISE lookups and its table.
     is_wh_rows: Vec<(is_wh::IsWhKey, u64)>,
@@ -1016,7 +1018,16 @@ impl<'a> FinishPlan<'a> {
             mut ecrec_ops,
             mem_load_rows,
             mem_store_rows,
+            word_rows,
         } = ops;
+        let words = skip.memory_format == super::super::fused_memory::MemoryFormat::Words;
+        // The word memory format keeps no cross-epoch table: a continuation
+        // epoch's bookend has no word form.
+        if words && l2g_memory_bookend {
+            return Err(Error::Prover(
+                "the word memory format proves a whole run, not a continuation epoch".to_string(),
+            ));
+        }
         // The ECREC witnesses the walkers handed to the pool, in place.
         super::resolve_deferred_ecrec(&mut ecdas_ops, &mut ecrec_ops)?;
 
@@ -1122,9 +1133,25 @@ impl<'a> FinishPlan<'a> {
         let is_wh_rows = is_wh::dedup_is_wh_rows(keccak_ops.parts().flat_map(keccak::is_wh_keys));
         // PAGE's lookups, from the initial image (a continuation epoch's L2G
         // table owns them).
+        // Under the word memory format PAGE_W's: `IS_HALF` on each initial
+        // half of a private-input page's words, none on any other page.
         let page = initial_image
             .filter(|_| !l2g_memory_bookend)
             .map(|image| -> PageCount<'a> {
+                if words {
+                    let private: Vec<PageConfig> =
+                        page_configs_of(image, memory_state, private_input)
+                            .into_iter()
+                            .filter(|config| config.is_private_input)
+                            .collect();
+                    return Box::new(move |h: &mut bitwise::BitwiseHistogram| {
+                        for config in &private {
+                            for op in super::super::page_w::bitwise_ops(config) {
+                                h.bump(op);
+                            }
+                        }
+                    });
+                }
                 Box::new(move |h: &mut bitwise::BitwiseHistogram| {
                     collect_bitwise_from_page(image, memory_state, l2g_memory_bookend, h)
                 })
@@ -1313,6 +1340,12 @@ impl<'a> FinishPlan<'a> {
                 true,
             )?,
         ];
+        // The word tables, the finish's alone (none streams), each family cut
+        // at the fused tables' rows.
+        let word_counts = super::word_walk::word_table_counts(
+            &word_rows,
+            super::word_walk::word_max_rows(max_rows),
+        );
         if cpu_heights.len() != table_counts.cpu {
             return Err(Error::InvalidTableCounts(format!(
                 "{} CPU heights for {} CPU tables",
@@ -1397,6 +1430,7 @@ impl<'a> FinishPlan<'a> {
             ecrec_ops,
             mem_load_rows,
             mem_store_rows,
+            word_rows,
             is_wh_rows,
             bitwise,
             num_padding_rows,
@@ -1413,7 +1447,7 @@ impl<'a> FinishPlan<'a> {
                 bitwise_from_tables: false,
                 keccak_rnd_first: false,
                 fused_counts,
-                word_counts: [0; 7],
+                word_counts,
             },
             cut_line,
             cpu_decoded,
@@ -1496,6 +1530,7 @@ impl<'a> FinishPlan<'a> {
             ecrec_ops,
             mem_load_rows,
             mem_store_rows,
+            word_rows,
             is_wh_rows,
             bitwise,
             num_padding_rows,
@@ -1840,12 +1875,37 @@ impl<'a> FinishPlan<'a> {
         };
         // The plan's page configs: none in a continuation epoch
         // (l2g_memory_bookend) or without an image ([`FinishPlan::new`]).
-        let gen_pages = || -> Vec<_> {
+        // Under the word memory format each is a PAGE_W table.
+        let words = skip.memory_format == super::super::fused_memory::MemoryFormat::Words;
+        let gen_pages = || -> Result<Vec<_>, Error> {
             header
                 .page_configs
                 .iter()
-                .map(|config| packed_if(pack, page_trace(config, memory_state, l2g_memory_bookend)))
+                .map(|config| {
+                    Ok(packed_if(
+                        pack,
+                        if words {
+                            super::word_walk::page_w_trace_from_state(config, memory_state)?
+                        } else {
+                            page_trace(config, memory_state, l2g_memory_bookend)
+                        },
+                    ))
+                })
                 .collect()
+        };
+        // The word memory format's CPU word tables (none under any other).
+        let gen_word_tables = || {
+            super::word_walk::word_tables(
+                &word_rows,
+                super::word_walk::word_max_rows(max_rows),
+                form,
+            )
+            .map(|tables| {
+                tables
+                    .into_iter()
+                    .map(|t| packed_if(pack, t))
+                    .collect::<Vec<_>>()
+            })
         };
         let gen_register = || {
             packed_if(
@@ -1922,6 +1982,7 @@ impl<'a> FinishPlan<'a> {
         let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
             (None, None, None, None);
         let (mut mem_loads_slot, mut mem_stores_slot) = (None, None);
+        let mut word_tables_slot = None;
         let (mut ecsms_slot, mut ecdases_slot) = (None, None);
         let mut hints_slot = None;
         let mut ecrecs_slot = None;
@@ -1971,6 +2032,7 @@ impl<'a> FinishPlan<'a> {
                 spawn_into!(ecrecs_slot, gen_ecrecs);
                 spawn_into!(mem_loads_slot, gen_mem_loads);
                 spawn_into!(mem_stores_slot, gen_mem_stores);
+                spawn_into!(word_tables_slot, gen_word_tables);
             });
         } else {
             cpus_slot = Some(gen_cpus());
@@ -2003,6 +2065,7 @@ impl<'a> FinishPlan<'a> {
             ecrecs_slot = Some(gen_ecrecs());
             mem_loads_slot = Some(gen_mem_loads());
             mem_stores_slot = Some(gen_mem_stores());
+            word_tables_slot = Some(gen_word_tables());
         }
 
         build_stamps::mark("p5 end");
@@ -2031,7 +2094,7 @@ impl<'a> FinishPlan<'a> {
         let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
         let blake3_trace = blake3_slot.expect(PHASE5_RAN);
         #[allow(unused_mut)]
-        let mut pages = pages_slot.expect(PHASE5_RAN);
+        let mut pages = pages_slot.expect(PHASE5_RAN)?;
         #[allow(unused_mut)]
         let mut register_trace = register_slot.expect(PHASE5_RAN);
         #[allow(unused_mut)]
@@ -2042,6 +2105,8 @@ impl<'a> FinishPlan<'a> {
         let ecrecs = ecrecs_slot.expect(PHASE5_RAN)?;
         let mem_loads = mem_loads_slot.expect(PHASE5_RAN)?;
         let mem_stores = mem_stores_slot.expect(PHASE5_RAN)?;
+        let [load8s, store8s, loadws, storews, load2ws, store2ws] =
+            word_tables_slot.expect(PHASE5_RAN);
         // IS_WH: one table of its rows, none when nothing sent `IS_WH`.
         let is_whs = generate_optional(&is_wh_rows, packed_by(pack, is_wh::generate_is_wh_trace))?;
 
@@ -2066,7 +2131,7 @@ impl<'a> FinishPlan<'a> {
             bitwise_from_tables: _,
             keccak_rnd_first: _,
             fused_counts,
-            word_counts: _,
+            word_counts,
         } = header;
         let traces = Traces {
             cpus,
@@ -2105,7 +2170,15 @@ impl<'a> FinishPlan<'a> {
             cpu32s,
             mem_loads,
             mem_stores,
-            word_tables: std::array::from_fn(|_| Vec::new()),
+            word_tables: [
+                load8s,
+                store8s,
+                loadws,
+                storews,
+                load2ws,
+                store2ws,
+                Vec::new(),
+            ],
         };
         // The tables are the ones the header counted, or the build is refused: the
         // header is what a statement can be read from before the tables exist.
@@ -2119,6 +2192,12 @@ impl<'a> FinishPlan<'a> {
             return Err(Error::Prover(format!(
                 "the finish built {:?} fused tables, its plan counted {fused_counts:?}",
                 traces.fused_counts()
+            )));
+        }
+        if traces.word_counts() != word_counts {
+            return Err(Error::Prover(format!(
+                "the finish built {:?} word tables, its plan counted {word_counts:?}",
+                traces.word_counts()
             )));
         }
         Ok(traces)
@@ -2162,7 +2241,7 @@ pub(crate) struct Emitted {
 /// The rest's families in AIR order (`VmAirs::air_refs`), each with its
 /// columns at eight bytes a cell: what a family's first table is estimated
 /// at, before one of them has been built.
-const FAMILIES: [(&str, usize); 31] = [
+const FAMILIES: [(&str, usize); 37] = [
     ("BITWISE", bitwise::cols::NUM_COLUMNS),
     ("DECODE", decode::cols::NUM_COLUMNS),
     ("KECCAK_RC", keccak_rc::cols::NUM_COLUMNS),
@@ -2193,6 +2272,12 @@ const FAMILIES: [(&str, usize); 31] = [
     ("STORE", store::cols::NUM_COLUMNS),
     ("MEM_LOAD", super::super::mem_load::cols::NUM_COLUMNS),
     ("MEM_STORE", super::super::mem_store::cols::NUM_COLUMNS),
+    ("MEM_LOAD8", super::super::mem_load8::cols::NUM_COLUMNS),
+    ("MEM_STORE8", super::super::mem_store8::cols::NUM_COLUMNS),
+    ("MEM_LOADW", super::super::mem_loadw::cols::NUM_COLUMNS),
+    ("MEM_STOREW", super::super::mem_storew::cols::NUM_COLUMNS),
+    ("MEM_LOAD2W", super::super::mem_load2w::cols::NUM_COLUMNS),
+    ("MEM_STORE2W", super::super::mem_store2w::cols::NUM_COLUMNS),
     ("CPU32", cpu32::cols::NUM_COLUMNS),
 ];
 
@@ -2421,6 +2506,7 @@ impl<'a> FinishPlan<'a> {
             ecrec_ops,
             mem_load_rows,
             mem_store_rows,
+            word_rows,
             is_wh_rows,
             bitwise,
             num_padding_rows,
@@ -2845,10 +2931,24 @@ impl<'a> FinishPlan<'a> {
                 },
             )?);
         }
-        // PAGE: one a config, from the memory state.
+        // PAGE: one a config, from the memory state; under the word memory
+        // format each is PAGE_W's, in PAGE's place.
         let page_configs = Arc::new(header.page_configs.clone());
+        let words = skip.memory_format == super::super::fused_memory::MemoryFormat::Words;
         units.extend((0..page_configs.len()).map(|k| {
             let configs = Arc::clone(&page_configs);
+            if words {
+                return Unit::Build {
+                    family: family("PAGE"),
+                    rows: super::super::page_w::ROWS,
+                    job: Box::new(move || {
+                        Ok(packed_if(
+                            pack,
+                            super::word_walk::page_w_trace_from_state(&configs[k], memory_state)?,
+                        ))
+                    }) as Job<'a>,
+                };
+            }
             Unit::Build {
                 family: family("PAGE"),
                 rows: page::DEFAULT_PAGE_SIZE,
@@ -2952,6 +3052,106 @@ impl<'a> FinishPlan<'a> {
                 )
             },
         )?);
+        // The word memory format's CPU word tables (none under any other),
+        // after the fused tables' place in AIR order: the finish's alone.
+        {
+            use super::super::{
+                mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew,
+            };
+            let caps = super::word_walk::word_max_rows(max_rows);
+            let super::WordRows {
+                load8,
+                store8,
+                loadw,
+                storew,
+                load2w,
+                store2w,
+            } = word_rows;
+            units.extend(vec_units(
+                family("MEM_LOAD8"),
+                Arc::new(load8),
+                caps[0],
+                0,
+                false,
+                true,
+                move |rows: &[mem_load8::Load8Row]| {
+                    packed_if(
+                        pack,
+                        mem_load8::generate_mem_load8_trace_segments_as(&[rows], form),
+                    )
+                },
+            )?);
+            units.extend(vec_units(
+                family("MEM_STORE8"),
+                Arc::new(store8),
+                caps[1],
+                0,
+                false,
+                true,
+                move |rows: &[mem_store8::Store8Row]| {
+                    packed_if(
+                        pack,
+                        mem_store8::generate_mem_store8_trace_segments_as(&[rows], form),
+                    )
+                },
+            )?);
+            units.extend(vec_units(
+                family("MEM_LOADW"),
+                Arc::new(loadw),
+                caps[2],
+                0,
+                false,
+                true,
+                move |rows: &[mem_loadw::LoadWRow]| {
+                    packed_if(
+                        pack,
+                        mem_loadw::generate_mem_loadw_trace_segments_as(&[rows], form),
+                    )
+                },
+            )?);
+            units.extend(vec_units(
+                family("MEM_STOREW"),
+                Arc::new(storew),
+                caps[3],
+                0,
+                false,
+                true,
+                move |rows: &[mem_storew::StoreWRow]| {
+                    packed_if(
+                        pack,
+                        mem_storew::generate_mem_storew_trace_segments_as(&[rows], form),
+                    )
+                },
+            )?);
+            units.extend(vec_units(
+                family("MEM_LOAD2W"),
+                Arc::new(load2w),
+                caps[4],
+                0,
+                false,
+                true,
+                move |rows: &[mem_load2w::Load2WRow]| {
+                    packed_if(
+                        pack,
+                        mem_load2w::generate_mem_load2w_trace_segments_as(&[rows], form),
+                    )
+                },
+            )?);
+            units.extend(vec_units(
+                family("MEM_STORE2W"),
+                Arc::new(store2w),
+                caps[5],
+                0,
+                false,
+                true,
+                move |rows: &[mem_store2w::Store2WRow]| {
+                    packed_if(
+                        pack,
+                        mem_store2w::generate_mem_store2w_trace_segments_as(&[rows], form),
+                    )
+                },
+            )?);
+        }
         units.extend(segmented_units(
             family("CPU32"),
             Arc::new(cpu32_ops),
@@ -2964,7 +3164,12 @@ impl<'a> FinishPlan<'a> {
         )?);
 
         // The units are the tables the header counted, or the build is refused.
-        check_units(&units, &header.table_counts, header.fused_counts)?;
+        check_units(
+            &units,
+            &header.table_counts,
+            header.fused_counts,
+            header.word_counts,
+        )?;
         if let Some(tables) = &from_tables {
             let adding = [family("LT"), family("BRANCH"), family("BYTEWISE")];
             let built = units
@@ -3333,6 +3538,7 @@ fn check_units(
     units: &[Unit<'_>],
     counts: &crate::TableCounts,
     fused: [usize; 2],
+    words: [usize; 7],
 ) -> Result<(), Error> {
     let mut made = [0usize; FAMILIES.len()];
     for unit in units {
@@ -3369,13 +3575,23 @@ fn check_units(
     };
     let fixed = ["BITWISE", "DECODE", "KECCAK_RC", "REGISTER", "HALT"];
     let units_fused = [of("MEM_LOAD"), of("MEM_STORE")];
+    let units_words = [
+        of("MEM_LOAD8"),
+        of("MEM_STORE8"),
+        of("MEM_LOADW"),
+        of("MEM_STOREW"),
+        of("MEM_LOAD2W"),
+        of("MEM_STORE2W"),
+        0,
+    ];
     if counts_of(&units_counts) != counts_of(counts)
         || units_fused != fused
+        || units_words != words
         || fixed.iter().any(|f| of(f) != 1)
     {
         return Err(Error::Prover(format!(
-            "the streamed finish would build {units_counts:?} and {units_fused:?} fused tables, \
-             its plan counted {counts:?} and {fused:?}"
+            "the streamed finish would build {units_counts:?}, {units_fused:?} fused tables and \
+             {units_words:?} word tables, its plan counted {counts:?}, {fused:?} and {words:?}"
         )));
     }
     Ok(())

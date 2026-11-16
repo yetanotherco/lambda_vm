@@ -110,10 +110,15 @@ fn air_order(t: &Traces) -> Vec<Option<&Table>> {
         &t.eqs,
         &t.bytewises,
         &t.stores,
-        &t.cpu32s,
+        &t.mem_loads,
+        &t.mem_stores,
     ] {
         out.extend(list.iter().map(slot));
     }
+    for list in &t.word_tables {
+        out.extend(list.iter().map(slot));
+    }
+    out.extend(t.cpu32s.iter().map(slot));
     out
 }
 
@@ -471,9 +476,19 @@ fn the_stream_is_the_monolithic_finish_in_air_order() {
 /// [`the_stream_is_the_monolithic_finish_in_air_order`] for one row
 /// configuration and one program.
 fn the_stream_is_the_finish_for(max_rows: &MaxRowsConfig, name: &str) {
+    the_stream_is_the_finish_under(max_rows, name, &configs());
+}
+
+/// [`the_stream_is_the_finish_for`] under the builder configurations
+/// `configs`.
+fn the_stream_is_the_finish_under(
+    max_rows: &MaxRowsConfig,
+    name: &str,
+    configs: &[(&'static str, Configure)],
+) {
     let (program, logs) = run(name);
     for window in [7, 1000] {
-        for (config, configure) in &configs() {
+        for (config, configure) in configs {
             let (builder, last) = pushed(&program, &logs, max_rows, window, configure.as_ref());
             let whole = builder.finish(last).expect("the monolithic finish");
             let want = air_order(&whole);
@@ -502,6 +517,93 @@ fn the_stream_is_the_finish_for(max_rows: &MaxRowsConfig, name: &str) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// The word memory format's builds (the in-row register format, MEMW_A's
+/// limbs): as they are, with the streamed ops dropped, and the block's
+/// configuration (cuts, packed, written packed, dropped, LT merged).
+fn word_configs() -> Vec<(&'static str, Configure)> {
+    fn words(b: WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_> {
+        use crate::tables::fused_memory::MemoryFormat;
+        use crate::tables::memw_aligned::MemwAlignedOrder;
+        use crate::tables::register::RegisterFormat;
+        b.register_format(RegisterFormat::InRow)
+            .expect("before any window")
+            .memw_aligned_order(MemwAlignedOrder::Limbs)
+            .expect("before any window")
+            .memory_format(MemoryFormat::Words)
+            .expect("before any window")
+    }
+    vec![
+        ("words", Box::new(words)),
+        (
+            "words, dropped",
+            Box::new(|b| words(b).drop_streamed_ops().expect("before any window")),
+        ),
+        (
+            "words, the block's",
+            Box::new(|b| words(cut(b, CutPadding::LastTable)).lt_merge()),
+        ),
+    ]
+}
+
+/// ★ Under the word memory format the stream is the monolithic finish in AIR
+/// order: its word tables after the fused tables' place and its PAGE_W tables
+/// in PAGE's, word for word, at any budget; and each streamed table is its
+/// AIR's width in the word format's set the verifier builds.
+#[test]
+fn under_the_word_format_the_stream_is_the_monolithic_finish() {
+    for name in ["fused_mem_cases", "all_loadstore_32", "misalign_lw"] {
+        the_stream_is_the_finish_under(&MaxRowsConfig::small(), name, &word_configs());
+    }
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let (program, logs) = run("fused_mem_cases");
+    let (_, configure) = word_configs().pop().expect("the block's");
+    let (builder, last) = pushed(
+        &program,
+        &logs,
+        &MaxRowsConfig::small(),
+        7,
+        configure.as_ref(),
+    );
+    let (header, got, _) = streamed(builder, last, 2 << 30);
+    assert!(
+        header.word_counts[..6].iter().all(|&n| n > 0),
+        "{:?}",
+        header.word_counts
+    );
+    let inputs = crate::BlockAirInputs::new(
+        &opts,
+        &program,
+        header.cpu_heights.clone(),
+        &header.public_output_bytes,
+    )
+    .expect("the inputs");
+    let mut airs = crate::block_airs(
+        &program,
+        &opts,
+        &header.page_configs,
+        &header.table_counts,
+        &inputs,
+        crate::tables::keccak_rnd::KeccakRndForm::default(),
+        crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+        crate::tables::register::RegisterFormat::InRow,
+    );
+    airs.with_word_memory(&opts, header.word_counts, &header.page_configs)
+        .expect("the word set");
+    let refs = airs.air_refs();
+    assert_eq!(refs.len(), got.len(), "one table an AIR");
+    for emitted in &got {
+        if let Some(table) = &emitted.table {
+            assert_eq!(
+                table.main_table.width,
+                refs[emitted.position].trace_layout().0,
+                "{} at {}",
+                refs[emitted.position].name(),
+                emitted.position
+            );
         }
     }
 }

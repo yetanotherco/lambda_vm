@@ -3328,13 +3328,14 @@ fn the_census_refuses_each_mutant() {
 
 // ---- the format ----
 
-/// ★ The word memory format is the verifier's to read and no prover's to
-/// make until its walk is built: the format check takes it (the verifier frames
-/// a statement under it), the prove's entry and the windowed build's setters
-/// refuse it. Under it the fused pair is `[0, 0]`; its statement words are its
-/// form word and each word family's count.
+/// ★ The word memory format is the verifier's to read, and the windowed
+/// build's and its regenerator's to build, but no prove's yet: the format
+/// check takes it (the verifier frames a statement under it), the windowed
+/// build's setters take it, and the prove's entry refuses it. Under it the
+/// fused pair is `[0, 0]`; its statement words are its form word and each
+/// word family's count.
 #[test]
-fn the_word_format_is_refused_on_every_prover_path() {
+fn the_word_format_is_refused_at_the_prove() {
     let words = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
     assert!(block_whir::check_memory_format(&words).is_ok());
     assert!(crate::tables::fused_memory::refuse_unbuilt(MemoryFormat::Words).is_err());
@@ -3359,14 +3360,14 @@ fn the_word_format_is_refused_on_every_prover_path() {
         &block_whir::Deviations::default(),
     );
     assert!(refused.is_err(), "the prover refuses the word format");
-    // The windowed build and its regenerator refuse it at their setters.
+    // The windowed build and its regenerator take it at their setters.
     use crate::tables::trace_builder::{RegenBuilder, WindowedTraceBuilder};
     let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
     let max_rows = crate::tables::MaxRowsConfig::small();
     let builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("a builder");
-    assert!(builder.memory_format(MemoryFormat::Words).is_err());
+    assert!(builder.memory_format(MemoryFormat::Words).is_ok());
     let regen = RegenBuilder::new(&program, &[], &max_rows).expect("a regenerator");
-    assert!(regen.memory_format(MemoryFormat::Words).is_err());
+    assert!(regen.memory_format(MemoryFormat::Words).is_ok());
     // Its statement words: its form word, then each family's count.
     assert_eq!(
         block_whir::fused_statement_words(MemoryFormat::Words, [0, 0], [1, 2, 3, 4, 5, 6, 7]),

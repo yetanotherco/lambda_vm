@@ -139,6 +139,65 @@ pub fn generate_page_w_trace(
     config: &PageConfig,
     finals: &FinalWordMap,
 ) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, String> {
+    page_w_trace_of(config, |row, init| {
+        let address = config.page_base + row as u64 * WORD_BYTES;
+        finals.get(&address).copied().unwrap_or(FinalWordState {
+            timestamp: 0,
+            value: init,
+        })
+    })
+}
+
+/// The PAGE_W trace of the page `config` from its bytes' final cells
+/// (`final_page`: each byte's value and last-access timestamp, the page's
+/// [`DEFAULT_PAGE_SIZE`] of them; `None` for a page no byte of which was
+/// set): a word's final value is its eight bytes and its timestamp the
+/// largest of theirs, a word whose bytes are all at 0 untouched (its initial
+/// word). Refuses a base [`check_page_base`] refuses, or a page that is not
+/// the page's size.
+pub fn generate_page_w_trace_from_bytes(
+    config: &PageConfig,
+    final_page: Option<&[(u8, u64)]>,
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, String> {
+    if let Some(page) = final_page
+        && page.len() != DEFAULT_PAGE_SIZE
+    {
+        return Err(format!(
+            "a page's final cells are {DEFAULT_PAGE_SIZE} bytes, not {}",
+            page.len()
+        ));
+    }
+    page_w_trace_of(config, |row, init| {
+        let Some(page) = final_page else {
+            return FinalWordState {
+                timestamp: 0,
+                value: init,
+            };
+        };
+        let cells = &page[row * WORD_BYTES as usize..(row + 1) * WORD_BYTES as usize];
+        let timestamp = cells.iter().map(|&(_, ts)| ts).max().unwrap_or(0);
+        if timestamp == 0 {
+            return FinalWordState {
+                timestamp: 0,
+                value: init,
+            };
+        }
+        let value = cells
+            .iter()
+            .enumerate()
+            .fold(0u64, |word, (k, &(byte, _))| {
+                word | u64::from(byte) << (8 * k)
+            });
+        FinalWordState { timestamp, value }
+    })
+}
+
+/// The PAGE_W trace of the page `config`, each row's final state
+/// `final_of(row, initial word)`.
+fn page_w_trace_of(
+    config: &PageConfig,
+    final_of: impl Fn(usize, u64) -> FinalWordState,
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, String> {
     check_page_base(config.page_base)?;
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(ROWS * cols::NUM_COLUMNS),
@@ -150,11 +209,7 @@ pub fn generate_page_w_trace(
         table.set_u64(row, cols::OFFSET, row as u64);
         let init = init_word(config, row);
         table.set_halves(row, cols::INIT[0], &quarters(init));
-        let address = config.page_base + row as u64 * WORD_BYTES;
-        let state = finals.get(&address).copied().unwrap_or(FinalWordState {
-            timestamp: 0,
-            value: init,
-        });
+        let state = final_of(row, init);
         let (fini_lo, fini_hi) = halves(state.value);
         table.set_word(row, cols::FINI_LO, fini_lo);
         table.set_word(row, cols::FINI_HI, fini_hi);
