@@ -1214,3 +1214,32 @@ fn imm_from_instruction(instruction: Instruction) -> u64 {
         _ => 0,
     }
 }
+
+#[cfg(test)]
+mod bus_id_tests {
+    use super::BusId;
+    use std::collections::BTreeSet;
+
+    /// ★ `BusId` is one registry of distinct ids: every id below 256 that
+    /// decodes decodes to the bus whose id it is, no two buses share a name,
+    /// and the word buses (40, 41, 42) are the last three. A bus added with
+    /// an id another holds, or decoded from the wrong id, fails here (the
+    /// enum's own discriminants are distinct by the compiler).
+    #[test]
+    fn every_bus_has_its_own_id_and_name() {
+        let mut ids = Vec::new();
+        let mut names = BTreeSet::new();
+        for id in 0u64..256 {
+            if let Ok(bus) = BusId::try_from(id) {
+                assert_eq!(u64::from(bus), id, "{} decodes from {id}", bus.name());
+                assert!(names.insert(bus.name()), "{} named twice", bus.name());
+                ids.push(id);
+            }
+        }
+        assert!(ids.ends_with(&[40, 41, 42]), "{ids:?}");
+        assert_eq!(
+            [40u64, 41, 42].map(|id| BusId::try_from(id).map(|b| b.name())),
+            [Ok("MemWord"), Ok("MemWordMsg"), Ok("CopyWordNext")]
+        );
+    }
+}

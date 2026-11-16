@@ -2123,6 +2123,198 @@ fn is_checked_half(
 /// The census of one table's word-bus interactions (rules c2–c6, c9–c10),
 /// `preprocessed` its preprocessed prefix's width, its constraints by name
 /// ([`evaluator`]). `Ok` if the table touches neither word bus.
+/// Whether `f` is a sum of bytes: two or more columns, each at a power of
+/// `2^8` below `2^32`, and not the two 16-bit halves `x + 2^16·y` (a word
+/// half read or written as bytes, however many of its bytes it has).
+fn is_byte_sum(f: &BTreeMap<Option<usize>, i128>) -> bool {
+    let at_byte = |c: i128| [1, 1 << 8, 1 << 16, 1 << 24].contains(&c);
+    let mut coefficients: Vec<i128> = f.values().copied().collect();
+    coefficients.sort();
+    columns(f).len() >= 2
+        && f.iter().all(|(k, c)| k.is_some() && at_byte(*c))
+        && coefficients != [1, 1 << 16]
+}
+
+/// Whether column `col` is range-checked by a lookup at multiplicity `mu`:
+/// in an `ARE_BYTES` pair, or an `IS_HALF` of the column alone.
+fn is_checked_column(
+    col: usize,
+    interactions: &[BusInteraction],
+    mu: &BTreeMap<Option<usize>, i128>,
+) -> bool {
+    let alone = BTreeMap::from([(Some(col), 1i128)]);
+    interactions.iter().any(|bi| {
+        bi.is_sender
+            && multiplicity_form(&bi.multiplicity) == *mu
+            && match bi.bus_id {
+                b if b == u64::from(BusId::AreBytes) => bi
+                    .values
+                    .iter()
+                    .any(|v| form(v).ok().as_ref() == Some(&alone)),
+                b if b == u64::from(BusId::IsHalfword) => {
+                    bi.values.len() == 1 && form(&bi.values[0]).ok() == Some(alone.clone())
+                }
+                _ => false,
+            }
+    })
+}
+
+/// An honest row of `name`'s table on which every constraint reads zero and
+/// the multiplicity is 1, if it is one of the CPU's word tables
+/// (`word_cpu_tests::active_rows`): where rule c13 reads what a constraint
+/// fixes on a row that is an access.
+fn active_row(name: &str) -> Option<Vec<FE>> {
+    static ROWS: std::sync::OnceLock<Vec<(&'static str, Vec<FE>)>> = std::sync::OnceLock::new();
+    let family = name.split('[').next()?;
+    ROWS.get_or_init(super::word_cpu_tests::active_rows)
+        .iter()
+        .find(|(f, _)| *f == family)
+        .map(|(_, row)| row.clone())
+}
+
+/// The constraints `eval` breaks on `row` with column `col` one more.
+fn broken_by(eval: Eval, row: &[FE], col: usize) -> BTreeSet<usize> {
+    let mut moved = row.to_vec();
+    moved[col] += FE::one();
+    eval(&moved)
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v != FE::zero())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Rule c13: a token pair the CPU's memory dispatch `d` drives is tied to it,
+/// read on an honest row of the table that is an access ([`active_row`]):
+/// - a load (the produced word the consumed one) returns its word: each
+///   column of the dispatch's result is the consumed word's, or one a
+///   constraint fixes on that row, and one at least is tied to the word by a
+///   constraint (the two moved apart break one);
+/// - a store writes the dispatch's value: its produced word is the value
+///   itself, each half checked by lookups at the pair's multiplicity; or
+///   each produced half is one column a constraint fixes on that row, the
+///   value's columns are not the consumed word's, the identity reads at
+///   least one of them, and each it reads is range-checked at the pair's
+///   multiplicity. A register's words need not be canonical, so a store
+///   that wrote them as they come would let such a word into memory.
+fn check_dispatch_tie(
+    name: &str,
+    interactions: &[BusInteraction],
+    d: &BusInteraction,
+    p: &BusInteraction,
+    c: &BusInteraction,
+    mu: &BTreeMap<Option<usize>, i128>,
+    eval: Option<(Eval, usize)>,
+) -> Result<(), String> {
+    let cols_of = |values: &[BusValue]| -> Result<BTreeSet<usize>, String> {
+        let mut out = BTreeSet::new();
+        for v in values {
+            out.extend(columns(&form(v)?));
+        }
+        Ok(out)
+    };
+    let consumed = cols_of(&c.values[3..5])?;
+    // The honest row and the constraints, with every constraint zero on it.
+    let on_row = || -> Result<(Eval, Vec<FE>), String> {
+        let (Some((eval, width)), Some(row)) = (eval, active_row(name)) else {
+            return Err(format!(
+                "{name}: no honest access row to read its dispatch's tie on"
+            ));
+        };
+        if row.len() != width || eval(&row).iter().any(|v| *v != FE::zero()) {
+            return Err(format!("{name}: its honest access row breaks a constraint"));
+        }
+        Ok((eval, row))
+    };
+    if p.values[3..5] == c.values[3..5] {
+        // A load.
+        let result = cols_of(&d.values[7..9])?;
+        let own: Vec<usize> = result.difference(&consumed).copied().collect();
+        if own.is_empty() {
+            return if result.is_empty() {
+                Err(format!("{name}: a load whose dispatch returns no column"))
+            } else {
+                Ok(())
+            };
+        }
+        let (eval, row) = on_row()?;
+        let mut tied = !result.is_disjoint(&consumed);
+        for &r in &own {
+            let fixes = broken_by(eval, &row, r);
+            if fixes.is_empty() {
+                return Err(format!(
+                    "{name}: a load's result column {r} no constraint fixes"
+                ));
+            }
+            tied |= consumed
+                .iter()
+                .any(|&w| !broken_by(eval, &row, w).is_disjoint(&fixes));
+        }
+        if !tied {
+            return Err(format!(
+                "{name}: a load's result no constraint ties to its word"
+            ));
+        }
+        return Ok(());
+    }
+    // A store.
+    if p.values[3..5] == d.values[4..6] {
+        for half in &p.values[3..5] {
+            if !is_checked_half(half, interactions, mu) {
+                return Err(format!(
+                    "{name}: a store writes a half {:?} that nothing holds",
+                    form(half)?
+                ));
+            }
+        }
+        return Ok(());
+    }
+    let value = cols_of(&d.values[4..6])?;
+    if !value.is_disjoint(&consumed) {
+        return Err(format!(
+            "{name}: a store whose dispatched value is its old word's"
+        ));
+    }
+    let (eval, row) = on_row()?;
+    let mut fixes = BTreeSet::new();
+    for half in &p.values[3..5] {
+        let f = form(half)?;
+        let single = (f.len() == 1)
+            .then(|| f.iter().next())
+            .flatten()
+            .and_then(|(k, c)| (*c == 1).then_some(*k))
+            .flatten();
+        let broken = single.map(|col| broken_by(eval, &row, col));
+        match broken {
+            Some(b) if !b.is_empty() => fixes.extend(b),
+            _ => {
+                return Err(format!(
+                    "{name}: a store writes a half {f:?} that nothing holds on a store row"
+                ));
+            }
+        }
+    }
+    let read: Vec<usize> = value
+        .iter()
+        .copied()
+        .filter(|&v| !broken_by(eval, &row, v).is_disjoint(&fixes))
+        .collect();
+    if read.is_empty() {
+        return Err(format!(
+            "{name}: a store whose new word reads nothing of its dispatched value"
+        ));
+    }
+    if let Some(v) = read
+        .iter()
+        .find(|&&v| !is_checked_column(v, interactions, mu))
+    {
+        return Err(format!(
+            "{name}: a store places value column {v}, which no lookup checks"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn census_table(
     name: &str,
     interactions: &[BusInteraction],
@@ -2339,48 +2531,20 @@ pub(super) fn census_table_with(
         // checked, at the pair's multiplicity.
         for half in c.values[3..5].iter().chain(&p.values[3..5]) {
             let f = form(half)?;
-            let bytes = f.len() == 4 && f.values().any(|&c| c == 1 << 8);
-            if bytes && !is_checked_half(half, interactions, &mu) {
+            if is_byte_sum(&f) && !is_checked_half(half, interactions, &mu) {
                 return Err(format!(
                     "{name}: a word's bytes {f:?} not each in a checked pair"
                 ));
             }
         }
-        // c13: a pair the CPU's dispatch drives passes its word through (a
-        // load: the produced word is the consumed one) or writes a word each
-        // half of which is held: checked by lookups at the pair's
-        // multiplicity, or one column a constraint fixes (that column at 1 on
-        // an all-zero row breaks one). A register's words need not be
-        // canonical, so a store that wrote them as they come would let such a
-        // word into memory.
-        let dispatched = clocks
+        // c13: a pair the CPU's dispatch drives is tied to the dispatch: a
+        // load returns the word it passes through, a store writes the value
+        // the dispatch carries, every byte of it checked.
+        if let Some((_, d)) = clocks
             .iter()
-            .any(|(_, bi)| bi.bus_id == u64::from(BusId::MemoryOp));
-        if dispatched && p.values[3..5] != c.values[3..5] {
-            for half in &p.values[3..5] {
-                if is_checked_half(half, interactions, &mu) {
-                    continue;
-                }
-                let f = form(half)?;
-                let single = (f.len() == 1)
-                    .then(|| f.iter().next())
-                    .flatten()
-                    .and_then(|(k, c)| (*c == 1).then_some(*k))
-                    .flatten();
-                let fixed = match (single, eval) {
-                    (Some(col), Some((eval, width))) if col < width => {
-                        let mut row = vec![FE::zero(); width];
-                        row[col] = FE::one();
-                        eval(&row).iter().any(|v| *v != FE::zero())
-                    }
-                    _ => false,
-                };
-                if !fixed {
-                    return Err(format!(
-                        "{name}: a store writes a half {f:?} that nothing holds"
-                    ));
-                }
-            }
+            .find(|(_, bi)| bi.bus_id == u64::from(BusId::MemoryOp))
+        {
+            check_dispatch_tie(name, interactions, d, p, c, &mu, eval)?;
         }
         // c5: the multiplicities held to bits, one message a row.
         check_bits(name, &columns(&mu), eval)?;
@@ -4055,4 +4219,376 @@ fn the_block_tree_refuses_a_word_format_block() {
         "{:?}",
         refused.err()
     );
+}
+
+/// ★ Rule c13 ties a CPU table's dispatch to its token words and checks
+/// every byte a store places, read on an honest access row (every other rule
+/// passes these mutants; each is refused by c13 alone, or by c12 for the
+/// three-byte halves):
+/// - MEM_STOREW without either `VALUE` pair, MEM_STORE2W without any one of
+///   its four: a register byte placed unchecked;
+/// - MEM_STOREW whose new-half identities hold only off a store row
+///   (`NEW·(1 − MU)`): its new word free on the row that writes it;
+/// - MEM_STORE8 whose dispatch carries the old word as the stored value, and
+///   MEM_STOREW whose dispatch carries columns its identity does not read;
+/// - MEM_LOAD8 whose dispatched result is two other columns;
+/// - MEM_LOADW whose token halves are three-byte sums with no pair.
+#[test]
+fn the_census_ties_each_dispatch_to_its_words_and_checks_every_placed_byte() {
+    use super::{mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew};
+    let refused_with = |verdict: Result<(), String>, why: &str| {
+        assert!(
+            matches!(&verdict, Err(e) if e.contains(why)),
+            "want {why:?}: {verdict:?}"
+        );
+    };
+    for (name, honest, value) in [
+        (
+            "MEM_STOREW[0]",
+            mem_storew::bus_interactions(),
+            mem_storew::cols::VALUE.to_vec(),
+        ),
+        (
+            "MEM_STORE2W[0]",
+            mem_store2w::bus_interactions(),
+            mem_store2w::cols::VALUE.to_vec(),
+        ),
+    ] {
+        census_table(name, &honest, 0).unwrap_or_else(|e| panic!("{e}"));
+        let pairs: Vec<usize> = honest
+            .iter()
+            .enumerate()
+            .filter(|(_, bi)| {
+                bi.bus_id == u64::from(BusId::AreBytes)
+                    && value.iter().any(|&c| bi.values[0] == column(c))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(pairs.len(), value.len() / 2, "{name}");
+        for i in pairs {
+            let mut mutant = honest.clone();
+            mutant.remove(i);
+            refused_with(census_table(name, &mutant, 0), "which no lookup checks");
+        }
+    }
+    // New halves held only off a store row.
+    fn storew_free_on_a_store_row(row: &[FE]) -> Vec<FE> {
+        let mut v = storew_constraints(row);
+        let off = FE::one() - row[super::mem_storew::cols::MU];
+        v[15] = row[super::mem_storew::cols::NEW_LO] * off;
+        v[16] = row[super::mem_storew::cols::NEW_HI] * off;
+        v
+    }
+    refused_with(
+        census_table_with(
+            "MEM_STOREW[0]",
+            &mem_storew::bus_interactions(),
+            0,
+            Some((
+                storew_free_on_a_store_row as Eval,
+                super::mem_storew::cols::NUM_COLUMNS,
+            )),
+        ),
+        "nothing holds on a store row",
+    );
+    let dispatch_of = |interactions: &[BusInteraction]| {
+        interactions
+            .iter()
+            .position(|bi| bi.bus_id == u64::from(BusId::MemoryOp))
+            .expect("the dispatch")
+    };
+    // A store whose dispatch is not its word.
+    let mut store8 = mem_store8::bus_interactions();
+    let d = dispatch_of(&store8);
+    store8[d].values[4] = column(mem_store8::cols::OLD_LO);
+    store8[d].values[5] = column(mem_store8::cols::OLD_HI);
+    refused_with(
+        census_table("MEM_STORE8[0]", &store8, 0),
+        "dispatched value is its old word's",
+    );
+    let mut storew = mem_storew::bus_interactions();
+    let d = dispatch_of(&storew);
+    storew[d].values[4] = column(mem_storew::cols::STEP_0);
+    storew[d].values[5] = column(mem_storew::cols::STEP_1);
+    refused_with(
+        census_table("MEM_STOREW[0]", &storew, 0),
+        "reads nothing of its dispatched value",
+    );
+    // A load whose dispatch is not its word.
+    let mut load8 = mem_load8::bus_interactions();
+    let d = dispatch_of(&load8);
+    load8[d].values[7] = column(mem_load8::cols::STEP_0);
+    load8[d].values[8] = column(mem_load8::cols::STEP_1);
+    refused_with(
+        census_table("MEM_LOAD8[0]", &load8, 0),
+        "no constraint fixes",
+    );
+    // Token halves of three bytes, no pair.
+    let cut: Vec<BusInteraction> = mem_loadw::bus_interactions()
+        .into_iter()
+        .filter(|bi| bi.bus_id != u64::from(BusId::AreBytes))
+        .map(|mut bi| {
+            if bi.bus_id == u64::from(BusId::MemWord) {
+                for v in bi.values.iter_mut().skip(3) {
+                    if let BusValue::Linear(terms) = v
+                        && terms.len() == 4
+                    {
+                        terms.pop();
+                    }
+                }
+            }
+            bi
+        })
+        .collect();
+    refused_with(
+        census_table("MEM_LOADW[0]", &cut, 0),
+        "not each in a checked pair",
+    );
+}
+
+/// ★ In a word-format frame that states no chip's table, under both register
+/// formats, the CPU's syscall send has one receiver: HALT's, at the constant
+/// 93. No table sends a RAM byte message, every `Memw` receive is a
+/// register's, and nothing touches the output bus. So a run with a syscall
+/// other than the halt, stated without the chip's tables, leaves its call on
+/// the syscall bus: a forger can rebuild the call's other traces, not the
+/// CPU's send, whose `ECALL` flag is DECODE's
+/// (`word_walk_tests::a_run_that_commits_stated_without_its_copy_tables_leaves_its_calls_on_the_syscall_bus`).
+#[test]
+fn the_chip_free_word_frame_has_one_syscall_receiver() {
+    for registers in [
+        crate::tables::register::RegisterFormat::InRow,
+        crate::tables::register::RegisterFormat::Tokens32,
+    ] {
+        let format = block_whir::BlockFormat {
+            registers,
+            ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
+        };
+        let frame = frame_of(
+            &words_statement(&format, &chip_free_counts(), CPU_WORD_TABLES),
+            &format,
+        )
+        .expect("the chip-free statement frames");
+        let mut ecall = Vec::new();
+        let mut ram_byte_senders = BTreeSet::new();
+        let mut memw_receives = Vec::new();
+        let mut commit = Vec::new();
+        for air in frame.airs.air_refs() {
+            let family = air.name().split('[').next().unwrap_or("").to_string();
+            for bi in air.bus_interactions() {
+                let at = |fill: u64| -> Vec<u64> {
+                    bi.values
+                        .iter()
+                        .flat_map(|v| v.combine_from(|_| FE::from(fill)))
+                        .map(|x: FE| x.canonical_u64())
+                        .collect()
+                };
+                let (zero, one) = (at(0), at(1));
+                // A position's constant, if it does not move with the columns.
+                let constant = |k: usize| (zero.get(k) == one.get(k)).then(|| zero[k]);
+                if bi.bus_id == u64::from(BusId::Ecall) {
+                    let constants: Vec<Option<u64>> = (0..zero.len()).map(constant).collect();
+                    ecall.push((family.clone(), bi.is_sender, constants));
+                }
+                if bi.bus_id == u64::from(BusId::Memw) {
+                    // The register flag: a read's ninth value, a write's first.
+                    let flag = if zero.len() == 24 { 8 } else { 0 };
+                    if bi.is_sender {
+                        if constant(flag) != Some(1) {
+                            ram_byte_senders.insert(family.clone());
+                        }
+                    } else {
+                        memw_receives.push((family.clone(), constant(flag)));
+                    }
+                }
+                if bi.bus_id == u64::from(BusId::Commit) {
+                    commit.push(family.clone());
+                }
+            }
+        }
+        let receivers: Vec<_> = ecall.iter().filter(|e| !e.1).collect();
+        assert_eq!(
+            receivers.len(),
+            1,
+            "{registers:?}: one Ecall receiver: {ecall:?}"
+        );
+        assert_eq!(receivers[0].0, "HALT", "{registers:?}");
+        assert!(
+            receivers[0].2.contains(&Some(93)),
+            "{registers:?}: HALT's receive carries the constant 93"
+        );
+        assert!(
+            ecall.iter().filter(|e| e.1).all(|e| e.0 == "CPU"),
+            "{registers:?}: the CPU alone sends a syscall"
+        );
+        assert!(
+            ram_byte_senders.is_empty(),
+            "{registers:?}: {ram_byte_senders:?}"
+        );
+        assert!(
+            memw_receives.iter().all(|(_, flag)| *flag == Some(1)),
+            "{registers:?}: every Memw receive a register's: {memw_receives:?}"
+        );
+        assert!(commit.is_empty(), "{registers:?}: {commit:?}");
+    }
+}
+
+/// ★ The chip rule reads exactly the chips the word format takes no call of
+/// yet: each table count set alone to 1 is refused by `chip_tables_under`
+/// under the word format if and only if it is IS_WH's, BLAKE3's, ECSM's or
+/// HINT's (`chip_counts` names every count, so a count added later is placed
+/// there before the verifier builds).
+#[test]
+fn the_chip_rule_reads_exactly_the_chips_the_word_format_does_not_take() {
+    type Set = fn(&mut crate::TableCounts);
+    let counts: [(&str, Set); 23] = [
+        ("cpu", |c| c.cpu = 1),
+        ("lt", |c| c.lt = 1),
+        ("memw", |c| c.memw = 1),
+        ("memw_aligned", |c| c.memw_aligned = 1),
+        ("load", |c| c.load = 1),
+        ("mul", |c| c.mul = 1),
+        ("dvrm", |c| c.dvrm = 1),
+        ("shift", |c| c.shift = 1),
+        ("branch", |c| c.branch = 1),
+        ("memw_register", |c| c.memw_register = 1),
+        ("eq", |c| c.eq = 1),
+        ("bytewise", |c| c.bytewise = 1),
+        ("store", |c| c.store = 1),
+        ("cpu32", |c| c.cpu32 = 1),
+        ("keccak", |c| c.keccak = 1),
+        ("keccak_rnd", |c| c.keccak_rnd = 1),
+        ("ecsm", |c| c.ecsm = 1),
+        ("ecdas", |c| c.ecdas = 1),
+        ("hint", |c| c.hint = 1),
+        ("copy", |c| c.copy = 1),
+        ("blake3", |c| c.blake3 = 1),
+        ("is_wh", |c| c.is_wh = 1),
+        ("ecrec", |c| c.ecrec = 1),
+    ];
+    let refused: BTreeSet<&str> = counts
+        .iter()
+        .filter(|(_, set)| {
+            let mut c = zero_counts();
+            set(&mut c);
+            block_whir::chip_tables_under(MemoryFormat::Words, &c, [0; 7]).is_err()
+        })
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(refused, BTreeSet::from(["blake3", "ecsm", "hint", "is_wh"]));
+}
+
+/// ★ Under the word format a statement's COPY, KECCAK and ECREC counts are
+/// COPY_W's, KECCAK_W's and ECREC_W's tables: the frame holds them in those
+/// chips' places (the positions the split and fused frames give COPY, KECCAK
+/// and ECREC) and never COPY, KECCAK or ECREC; the split and fused frames of
+/// the same counts hold the chips' own tables and no word table.
+#[test]
+fn the_word_frame_puts_the_word_chips_in_their_chips_places() {
+    let names_of = |frame: &block_whir::BlockFrame| -> Vec<String> {
+        frame
+            .airs
+            .air_refs()
+            .iter()
+            .map(|air| air.name().to_string())
+            .collect()
+    };
+    let at = |names: &[String], table: &str| -> Vec<usize> {
+        names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.split('[').next() == Some(table))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let words = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
+    let mut counts = chip_free_counts();
+    counts.copy = 2;
+    counts.keccak = 1;
+    counts.keccak_rnd = 1;
+    counts.ecrec = 1;
+    counts.ecdas = 1;
+    let mut stated = CPU_WORD_TABLES;
+    stated[6] = 1;
+    let frame = frame_of(&words_statement(&words, &counts, stated), &words).expect("frames");
+    let word_names = names_of(&frame);
+    for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
+        let f = block_whir::BlockFormat::pinned().with_memory(memory);
+        let frame = frame_of(&words_statement(&f, &counts, [0; 7]), &f).expect("frames");
+        let names = names_of(&frame);
+        for (chip, word_chip, n) in [
+            ("COPY", "COPY_W", 2usize),
+            ("KECCAK", "KECCAK_W", 1),
+            ("ECREC", "ECREC_W", 1),
+        ] {
+            assert_eq!(
+                at(&word_names, chip),
+                Vec::<usize>::new(),
+                "{chip} under words"
+            );
+            assert_eq!(
+                at(&names, word_chip),
+                Vec::<usize>::new(),
+                "{word_chip} under {memory:?}"
+            );
+            assert_eq!(at(&word_names, word_chip).len(), n, "{word_chip}");
+            assert_eq!(
+                at(&word_names, word_chip),
+                at(&names, chip),
+                "{word_chip} in {chip}'s place ({memory:?})"
+            );
+        }
+    }
+}
+
+/// ★ The downgrade pair on the chip counts: a word-format statement stating
+/// COPY_W, KECCAK_W and ECREC_W tables (and MEMW_W) is refused by the split
+/// and fused verifiers (they absorb no word count); a split statement stating
+/// COPY, KECCAK and ECREC tables with the MEMW_A table their byte messages
+/// need is refused by the word format's verifier (it retires MEMW_A). With
+/// each rule taken out (a control mutant) each frames, so the rule is what
+/// refuses it at the frame.
+#[test]
+fn a_chip_statement_is_refused_across_the_word_format() {
+    let words = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
+    let mut counts = chip_free_counts();
+    counts.copy = 2;
+    counts.keccak = 1;
+    counts.keccak_rnd = 1;
+    counts.ecrec = 1;
+    counts.ecdas = 1;
+    let mut stated = CPU_WORD_TABLES;
+    stated[6] = 1;
+    for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
+        let f = block_whir::BlockFormat::pinned().with_memory(memory);
+        let statement = words_statement(&f, &counts, stated);
+        let refused = frame_of(&statement, &f);
+        assert!(
+            matches!(&refused, Err(crate::Error::InvalidTableCounts(why)) if why.contains("states no word table")),
+            "{memory:?}: {:?}",
+            refused.err()
+        );
+        block_whir::WORD_COUNTS_UNCHECKED.with(|c| c.set(true));
+        let control = frame_of(&statement, &f);
+        block_whir::WORD_COUNTS_UNCHECKED.with(|c| c.set(false));
+        assert!(control.is_ok(), "{memory:?}: control: {:?}", control.err());
+    }
+    let split = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Split);
+    let mut theirs = words_counts();
+    theirs.copy = 2;
+    theirs.memw_aligned = 1;
+    assert!(frame_of(&words_statement(&split, &theirs, [0; 7]), &split).is_ok());
+    let statement = words_statement(&words, &theirs, CPU_WORD_TABLES);
+    let refused = frame_of(&statement, &words);
+    assert!(
+        matches!(&refused, Err(crate::Error::InvalidTableCounts(why)) if why.contains("states no MEMW_A table")),
+        "{:?}",
+        refused.err()
+    );
+    block_whir::RETIRED_COUNTS_UNCHECKED.with(|c| c.set(true));
+    block_whir::CHIP_COUNTS_UNCHECKED.with(|c| c.set(true));
+    let control = frame_of(&statement, &words);
+    block_whir::CHIP_COUNTS_UNCHECKED.with(|c| c.set(false));
+    block_whir::RETIRED_COUNTS_UNCHECKED.with(|c| c.set(false));
+    assert!(control.is_ok(), "control: {:?}", control.err());
 }

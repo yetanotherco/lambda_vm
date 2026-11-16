@@ -1353,3 +1353,78 @@ fn every_copy_w_constraint_breaks_alone_on_some_row() {
         "no lone break found for {missing:?}"
     );
 }
+
+/// The chain tuple's destination low key (both tuples).
+const CHAIN_DST_LO: std::ops::Range<usize> = 1..2;
+
+/// ★ A copy past the top of a low word, which the walk refuses (a
+/// completeness limit: `call_rows`). The forger's call writes 24 bytes from
+/// `2^32 − 16`; its third destination word is taken at address 0, the low
+/// key wrapped (`2^32 − 8 + 8` read as 0) under the same high word, so the
+/// write lands on a word every other check accepts. Refused by the chain
+/// alone, which carries the low key plus 8 as a field element. Control: the
+/// destination's low key taken out of the chain's tuples, accepted.
+#[test]
+fn a_copy_past_the_top_of_a_low_word_is_refused_by_the_chain() {
+    let mut run = Run::new();
+    run.memory.pages.push(PageConfig::zero_init(0xFFFC_0000));
+    let (src, dst, n) = (LOW + 0x200, 0xFFFF_FFF0u64, 24);
+    assert!(copy_w::call_rows(Functionality::Copy, 8, src, dst, n).is_err());
+    let ts = run.next_ts();
+    run.guest_call(Functionality::Copy, src, dst, n, ts);
+    // The rows of the same call at an aligned twin of the destination, the
+    // keys then moved to the forger's.
+    let mut rows = copy_w::call_rows(Functionality::Copy, ts, src, 0xFF0, n).expect("the twin");
+    assert_eq!(rows.len(), 3);
+    for (row, key) in rows.iter_mut().zip([dst, dst + 8, 0]) {
+        row.dst_key = key;
+    }
+    let memw = copy_w::run_call(&mut rows, src, dst, n, &mut run.memory)
+        .unwrap_or_else(|why| panic!("the forged call runs: {why}"))
+        .expect("every word is held");
+    run.rows.extend(rows);
+    run.memw.extend(memw);
+    let bench = run.bench();
+    let v = verdict(&bench);
+    assert!(v.refused_only_on(BusId::CopyWordNext), "{v:?}");
+    let control = bench.with_interactions(copy_w::NAME, chain_without(CHAIN_DST_LO));
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ A copy whose count is `2^32` or more, which the walk refuses: COPY_W
+/// reads the count register's high word as the constant 0, so a call whose
+/// x12 holds `2^32 + 8` and whose rows copy 8 bytes leaves the count read on
+/// the register bus alone. (The bound rests on that constant, not on a
+/// constraint.)
+#[test]
+fn a_copy_of_2_to_the_32_bytes_or_more_is_refused_by_the_count_read() {
+    let mut run = Run::new();
+    let (src, dst) = (LOW + 0x200, LOW + 0x400);
+    let count = (1u64 << 32) + 8;
+    assert!(copy_w::call_rows(Functionality::Copy, 8, src, dst, count).is_err());
+    let ts = run.next_ts();
+    run.calls.push((ts, DMA_MEMCPY_SYSCALL_NUMBER));
+    for (reg, value) in [(11, src), (12, count), (10, dst)] {
+        run.regs.push(RegAccess {
+            reg,
+            old: value,
+            new: value,
+            ts,
+        });
+    }
+    let mut rows = copy_w::call_rows(Functionality::Copy, ts, src, dst, 8).expect("8 bytes");
+    let memw = copy_w::run_call(&mut rows, src, dst, 8, &mut run.memory)
+        .unwrap_or_else(|why| panic!("the forged call runs: {why}"))
+        .expect("every word is held");
+    run.rows.extend(rows);
+    run.memw.extend(memw);
+    let v = verdict(&run.bench());
+    assert!(v.refused_only_on(BusId::Memw), "{v:?}");
+    assert!(
+        v.left_on(BusId::Memw)
+            .iter()
+            .any(|(tuple, _)| tuple.contains(&1)),
+        "the count's high word left over: {v:?}"
+    );
+}

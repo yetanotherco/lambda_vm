@@ -846,3 +846,130 @@ fn record_mode_under_the_word_format_builds_the_windowed_tables() {
         }
     }
 }
+
+/// ★ A run that commits output, stated as if it called no chip. As built,
+/// with its COPY_W tables and its output, it leaves nothing on any bus. The
+/// forger's statement drops the COPY_W tables and the output: each of the
+/// run's commit calls stays on the syscall bus, one send of `(T, 0, 64, 0)`
+/// no table receives (in a chip-free word frame HALT's is the one receiver,
+/// at 93: `word_memory_tests::the_chip_free_word_frame_has_one_syscall_receiver`).
+/// The other leftovers (the copy's word messages, its register reads and
+/// byte checks) a forger could rebuild; the CPU's send it cannot.
+#[test]
+fn a_run_that_commits_stated_without_its_copy_tables_leaves_its_calls_on_the_syscall_bus() {
+    let (program, logs) = run("test_commit_split");
+    let mut honest = word_build(&program, &logs, RegisterFormat::InRow, 1000);
+    let calls: usize = honest
+        .copies
+        .iter()
+        .map(|t| {
+            (0..t.num_rows())
+                .filter(|&r| {
+                    get(t, r, copy_w::cols::FIRST) == 1 && get(t, r, copy_w::cols::IS_WRITE) == 1
+                })
+                .count()
+        })
+        .sum();
+    assert!(calls >= 2, "the run commits twice or more: {calls}");
+    let as_built = left(&program, &mut honest, RegisterFormat::InRow);
+    assert!(
+        as_built.is_empty(),
+        "the honest build balances: {as_built:?}"
+    );
+    let mut forged = word_build(&program, &logs, RegisterFormat::InRow, 1000);
+    forged.copies.clear();
+    forged.public_output_bytes.clear();
+    let l = left(&program, &mut forged, RegisterFormat::InRow);
+    let ecall = l
+        .get(&u64::from(BusId::Ecall))
+        .expect("the syscall bus keeps the calls");
+    assert_eq!(ecall.len(), calls, "{ecall:?}");
+    assert!(
+        ecall
+            .iter()
+            .all(|(tuple, net)| *net == 1 && tuple[1..] == [0, 64, 0]),
+        "one unreceived commit send each: {ecall:?}"
+    );
+}
+
+/// ★ The word memory format under the 32-bit register tokens, which the
+/// prover refuses (the walk here, the prove's gate before it): a forger's
+/// walk skips the refusal. Its build states a MEMW_A table (the register
+/// accesses MEMW_R cannot take under the 32-bit tokens), and the verifier's
+/// retired-table rule refuses that statement. Control: the same build
+/// balances on every bus under the word format's set with those counts and
+/// breaks no word-table constraint, so the rule is the one check (its
+/// proof-level twin is `tests::word_memory_block_tests::a_word_block_under_the_32_bit_registers_is_refused_by_the_retired_table_rule_alone`).
+#[test]
+fn a_word_build_under_the_32_bit_registers_is_refused_by_the_retired_table_rule() {
+    use crate::tables::trace_builder::WORDS_UNDER_TOKENS32;
+    for name in ["all_instructions_64", "fused_mem_cases"] {
+        let (program, logs) = run(name);
+        WORDS_UNDER_TOKENS32.with(|c| c.set(true));
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            word_build(&program, &logs, RegisterFormat::Tokens32, 1000)
+        }));
+        WORDS_UNDER_TOKENS32.with(|c| c.set(false));
+        let mut build = built.unwrap_or_else(|_| panic!("{name}: the forger's walk"));
+        let counts = build.table_counts();
+        assert!(counts.memw_aligned >= 1, "{name}: a MEMW_A table");
+        let refused = crate::block_whir::word_tables_under(
+            MemoryFormat::Words,
+            &counts,
+            build.fused_counts().map(|n| n as u64),
+        );
+        assert!(
+            matches!(&refused, Err(crate::Error::InvalidTableCounts(why)) if why.contains("no MEMW_A table")),
+            "{name}: {refused:?}"
+        );
+        let l = left(&program, &mut build, RegisterFormat::Tokens32);
+        assert!(l.is_empty(), "{name}: control: {l:?}");
+        assert!(broken(&build).is_empty(), "{name}: control");
+    }
+    // Without the switch the walk refuses.
+    let (program, logs) = run("all_instructions_64");
+    let walked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        word_build(&program, &logs, RegisterFormat::Tokens32, 1000)
+    }));
+    assert!(walked.is_err(), "the honest walk refuses the 32-bit tokens");
+}
+
+/// ★ Completeness: word families cut into several tables. Two runs built
+/// with word tables of at most 4 rows, at windows of 1000 and 7 cycles: a
+/// family holds two tables or more, the rows are the uncut build's, every
+/// bus balances and every word-table constraint holds.
+#[test]
+fn a_word_family_cut_into_several_tables_balances() {
+    let tiny = MaxRowsConfig {
+        mem_load: 4,
+        mem_store: 4,
+        ..MaxRowsConfig::small()
+    };
+    for name in ["fused_mem_cases", "all_loadstore_32"] {
+        let (program, logs) = run(name);
+        for window in [1000, 7] {
+            let mut build = windowed(&program, &logs, &tiny, window, &|b| {
+                b.register_format(RegisterFormat::InRow)
+                    .expect("before any window")
+                    .memw_aligned_order(MemwAlignedOrder::Limbs)
+                    .expect("before any window")
+                    .memory_format(MemoryFormat::Words)
+                    .expect("before any window")
+            });
+            let counts = build.word_counts();
+            let uncut = word_build(&program, &logs, RegisterFormat::InRow, window);
+            assert!(
+                counts.iter().any(|&n| n > 1),
+                "{name} {window}: a family is cut"
+            );
+            assert_eq!(
+                word_accesses(&build),
+                word_accesses(&uncut),
+                "{name} {window}: the uncut build's rows"
+            );
+            let l = left(&program, &mut build, RegisterFormat::InRow);
+            assert!(l.is_empty(), "{name} {window}: {l:?}");
+            assert!(broken(&build).is_empty(), "{name} {window}");
+        }
+    }
+}
