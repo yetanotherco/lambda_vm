@@ -2516,7 +2516,13 @@ pub(super) fn census_table_with(
         // from a register read on the call's first row), plus a constant
         // below 2^8; c10, its timestamp and multiplicity its call's, the
         // multiplicity a bit, its written words checked; c16, a chained
-        // chip's message at its call's timestamp carried by its chain.
+        // chip's message at its call's timestamp carried by its chain; c19,
+        // a key's carry into the high word held by the chip's constraints.
+        check_carry_pairs(name, interactions)?;
+        let carries = chip_carries(interactions);
+        for &k in &carries {
+            check_chip_carry(name, k, eval)?;
+        }
         let chain = chain_of(interactions);
         for bi in &messages {
             check_message_source(name, interactions, bi, chain.as_ref())?;
@@ -2753,7 +2759,10 @@ fn check_message_source(
     message: &BusInteraction,
     chain: Option<&Chain>,
 ) -> Result<(), String> {
-    if check_address(&message.values[1..3], name)?.is_some() {
+    let carries = chip_carries(interactions);
+    if let Some(k) = check_address(&message.values[1..3], name)?
+        && !carries.contains(&k)
+    {
         return Err(format!("{name}: a word message at a carried key"));
     }
     let carried_registers = chain.map_or_else(BTreeSet::new, |c| chain_registered(interactions, c));
@@ -2777,7 +2786,10 @@ fn check_message_source(
             &[]
         };
         for &i in positions {
-            if let Some(Ok(f)) = bi.values.get(i).map(form)
+            if let Some(Ok(f)) = bi
+                .values
+                .get(i)
+                .map(|v| form(v).map(|f| strip(f, &carries)))
                 && f.len() == 1
                 && let Some((Some(c), 1)) = f.iter().next().map(|(k, v)| (*k, *v))
             {
@@ -2797,7 +2809,7 @@ fn check_message_source(
         })
         .collect();
     for (i, v) in message.values[1..3].iter().enumerate() {
-        let f = form(v)?;
+        let f = strip(form(v)?, &carries);
         let constant = f.get(&None).copied().unwrap_or(0);
         let cols = columns(&f);
         let from_register = cols.len() == 1
@@ -2839,6 +2851,105 @@ fn single(f: &BTreeMap<Option<usize>, i128>) -> Option<usize> {
     }
 }
 
+/// A chip's carry columns (rule c19): each a column at `−2^32` in one value
+/// of an interaction and at 1 in the next, a key's low and high word with the
+/// carry taken into the high word (a key 8 on from a low range's last word).
+fn chip_carries(interactions: &[BusInteraction]) -> BTreeSet<usize> {
+    let mut out = BTreeSet::new();
+    for bi in interactions {
+        for pair in bi.values.windows(2) {
+            if let (Ok(lo), Ok(hi)) = (form(&pair[0]), form(&pair[1]))
+                && let Some(k) = carry_of(&lo, &hi)
+            {
+                out.insert(k);
+            }
+        }
+    }
+    out
+}
+
+/// Rule c19's shape: a column at `−2^32` in a value of any of a chip's
+/// interactions (a message's key, its chain's, a register read's) is a carry,
+/// at 1 in the next value: a low word's carry always lands in its high word.
+fn check_carry_pairs(name: &str, interactions: &[BusInteraction]) -> Result<(), String> {
+    for bi in interactions {
+        for (i, v) in bi.values.iter().enumerate() {
+            let Ok(f) = form(v) else { continue };
+            let next = bi.values.get(i + 1).and_then(|n| form(n).ok());
+            for (k, &c) in &f {
+                if let Some(col) = k
+                    && c == -(1i128 << 32)
+                    && next.as_ref().and_then(|n| n.get(k)) != Some(&1)
+                {
+                    return Err(format!(
+                        "{name}: column {col} at −2^32 in a value whose next does not carry it"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `f` without the columns in `carries`.
+fn strip(
+    mut f: BTreeMap<Option<usize>, i128>,
+    carries: &BTreeSet<usize>,
+) -> BTreeMap<Option<usize>, i128> {
+    f.retain(|k, _| k.is_none_or(|c| !carries.contains(&c)));
+    f
+}
+
+/// A chip table's carry rows, if it has carries: per carry column, an honest
+/// row with that carry 1 (its key the last word of its range) and an honest
+/// row of a call with it 0 (`copy_w_tests::carry_rows`).
+fn chip_carry_rows(name: &str) -> Option<Vec<(usize, Vec<FE>, Vec<FE>)>> {
+    static ROWS: std::sync::OnceLock<Vec<(usize, Vec<FE>, Vec<FE>)>> = std::sync::OnceLock::new();
+    let family = name.split('[').next()?;
+    (family == super::copy_w::NAME)
+        .then(|| ROWS.get_or_init(super::copy_w_tests::carry_rows).clone())
+}
+
+/// Rule c19: a chip's carry `k` is held by its constraints on rows that meet
+/// every other one: on an honest row with the carry 1 (its key the last word
+/// of its low range), `k` at 2 or −1 breaks a constraint (a bit); on an honest
+/// row with it 0, `k` at 1 breaks one (a carry only from the last word).
+fn check_chip_carry(name: &str, k: usize, eval: Option<(Eval, usize)>) -> Result<(), String> {
+    let Some((eval, width)) = eval else {
+        return Err(format!("{name}: no constraint holds its carry {k}"));
+    };
+    let rows = chip_carry_rows(name).unwrap_or_default();
+    let Some((_, on, off)) = rows.iter().find(|(c, _, _)| *c == k) else {
+        return Err(format!("{name}: no honest rows to read its carry {k} on"));
+    };
+    let honest = |row: &Vec<FE>, value: FE| {
+        row.len() == width && row[k] == value && eval(row).iter().all(|v| *v == FE::zero())
+    };
+    if !honest(on, FE::one()) || !honest(off, FE::zero()) {
+        return Err(format!(
+            "{name}: its carry {k}'s rows are not honest rows at 1 and at 0"
+        ));
+    }
+    let breaks = |row: &[FE], at: FE| {
+        let mut moved = row.to_vec();
+        moved[k] = at;
+        eval(&moved).iter().any(|v| *v != FE::zero())
+    };
+    for bad in [FE::from(2u64), FE::zero() - FE::one()] {
+        if !breaks(on, bad) {
+            return Err(format!(
+                "{name}: carry {k} at {bad:?} on the last word breaks nothing"
+            ));
+        }
+    }
+    if !breaks(off, FE::one()) {
+        return Err(format!(
+            "{name}: carry {k} at 1 off the last word breaks nothing"
+        ));
+    }
+    Ok(())
+}
+
 /// The table's chain (rule c16), if it has one.
 pub(super) fn chain_of(interactions: &[BusInteraction]) -> Option<Chain> {
     let call = interactions
@@ -2873,12 +2984,15 @@ pub(super) fn chain_of(interactions: &[BusInteraction]) -> Option<Chain> {
         {
             continue;
         }
+        // A key's high word that the send carries into (`hi + carry`) is
+        // carried: the carry is held by rule c19.
+        let carries = chip_carries(interactions);
         let carried = send
             .values
             .iter()
             .zip(&receive.values)
             .filter_map(|(a, b)| {
-                let (a, b) = (form(a).ok()?, form(b).ok()?);
+                let (a, b) = (strip(form(a).ok()?, &carries), form(b).ok()?);
                 (a == b).then(|| single(&a)).flatten()
             })
             .collect();
@@ -2896,6 +3010,7 @@ pub(super) fn chain_of(interactions: &[BusInteraction]) -> Option<Chain> {
 /// column as one of their values, their multiplicities summing to `FIRST`.
 fn chain_registered(interactions: &[BusInteraction], chain: &Chain) -> BTreeSet<usize> {
     let one = BTreeMap::from([(None, 1i128)]);
+    let carries = chip_carries(interactions);
     let first = BTreeMap::from([(Some(chain.first), 1i128)]);
     chain
         .carried
@@ -2910,7 +3025,7 @@ fn chain_registered(interactions: &[BusInteraction], chain: &Chain) -> BTreeSet<
                     bi.values
                         .get(i)
                         .and_then(|v| form(v).ok())
-                        .is_some_and(|f| single(&f) == Some(c))
+                        .is_some_and(|f| single(&strip(f, &carries)) == Some(c))
                 });
                 if register && holds {
                     for (k, v) in multiplicity_form(&bi.multiplicity) {

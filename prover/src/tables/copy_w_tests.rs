@@ -267,9 +267,13 @@ struct Run {
 
 impl Run {
     fn new() -> Self {
+        Self::with_pages(pages())
+    }
+
+    fn with_pages(pages: Vec<PageConfig>) -> Self {
         Self {
             memory: Memory {
-                pages: pages(),
+                pages,
                 words: FinalWordMap::new(),
                 bytes: HashMap::new(),
             },
@@ -602,8 +606,109 @@ fn honest_calls_on_the_top_stack_page_are_accepted() {
     assert!(v.accepted(), "{v:?}");
 }
 
+// ---- across 2^32 ----
+
+/// `2^32`: low word 0 of high word 1, the word after the last of the low range.
+const LINE: u64 = 1 << 32;
+/// The private-input pages on either side of the line.
+const BELOW: u64 = LINE - DEFAULT_PAGE_SIZE as u64;
+
+/// The bench's pages and the two around the line.
+fn line_pages() -> Vec<PageConfig> {
+    let below: Vec<u8> = (0..DEFAULT_PAGE_SIZE as u32)
+        .map(|i| (i * 89 + 7) as u8)
+        .collect();
+    let above: Vec<u8> = (0..4096u32).map(|i| (i * 53 + 201) as u8).collect();
+    let mut out = pages();
+    out.push(PageConfig::with_private_input(BELOW, below));
+    out.push(PageConfig::with_private_input(LINE, above));
+    out
+}
+
+/// Calls across the line, every destination offset and shift: copies whose
+/// source crosses it (from just below the line, and from just above it, where
+/// a first source word the call does not read is the last below the line),
+/// copies whose destination crosses it, a memset across it and a commit from
+/// a source across it.
+fn across(run: &mut Run) {
+    for offset in 0..8u64 {
+        for shift in 0..8u64 {
+            let rot = (offset + shift) % 8;
+            run.copy(LINE - 16 + rot, BELOW + 0x400 + offset, 29);
+            run.copy(LINE + rot, BELOW + 0x500 + offset, 13);
+            run.copy(BELOW + 0x100 + 8 * shift + rot, LINE - 16 + offset, 27);
+        }
+    }
+    run.copy(LINE - 0x40 + 3, LINE - 13, 64);
+    run.copy(LINE - 13, LINE - 0x40 + 3, 64);
+    run.set(LINE - 13, 30);
+    run.commit(LINE - 5, 12);
+}
+
+/// ★ Calls across `2^32` (every destination offset and shift, sources and
+/// destinations across the line, a memset and a commit across it): the
+/// production runner moves the bytes as the calls must, its MEMW_W rows are
+/// its rows' messages, every carry is 1 on some row (`SRC_CARRY`, `DST_CARRY`,
+/// `OP_CARRY`), and the bench is accepted.
+#[test]
+fn honest_calls_across_2_to_the_32_are_accepted() {
+    let mut run = Run::with_pages(line_pages());
+    across(&mut run);
+    assert_eq!(
+        sorted(run.memw.iter().copied()),
+        sorted(run.replay().0.into_iter().map(|(r, _)| r)),
+        "the runner's MEMW_W rows are its rows' messages"
+    );
+    for (k, name) in ["SRC_CARRY", "DST_CARRY", "OP_CARRY"]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(
+            run.rows.iter().any(|r| r.carries()[k]),
+            "{name} is 1 on no row"
+        );
+    }
+    let v = verdict(&run.bench());
+    assert!(v.accepted(), "{v:?}");
+}
+
+/// For each of COPY_W's carries, an honest row of [`across`]'s calls with it
+/// 1 and an honest row of a call with every carry 0 and no key at the last
+/// word of its range: what the census's rule c19 reads each carry on
+/// (`word_memory_tests::check_chip_carry`).
+pub(super) fn carry_rows() -> Vec<(usize, Vec<FE>, Vec<FE>)> {
+    let mut run = Run::with_pages(line_pages());
+    across(&mut run);
+    let t = copy_w::generate_copy_w_trace_as(&run.rows, TraceForm::Wide);
+    let row = |r: usize| -> Vec<FE> { (0..cw::NUM_COLUMNS).map(|c| *t.get_main(r, c)).collect() };
+    let off = run
+        .rows
+        .iter()
+        .position(|r| {
+            r.first()
+                && !r.zero()
+                && r.carries() == [false; 3]
+                && [r.a_key(), r.dst_key()]
+                    .iter()
+                    .all(|k| k & 0xFFFF_FFFF != LINE - 8)
+        })
+        .expect("a call away from the line");
+    [cw::SRC_CARRY, cw::DST_CARRY, cw::OP_CARRY]
+        .into_iter()
+        .enumerate()
+        .map(|(k, c)| {
+            let on = run
+                .rows
+                .iter()
+                .position(|r| r.carries()[k])
+                .expect("a carried row");
+            (c, row(on), row(off))
+        })
+        .collect()
+}
+
 /// The rows refuse what COPY_W cannot hold (each a completeness limit the
-/// module documents) with its reason.
+/// module documents) with its reason, and take calls across `2^32`.
 #[test]
 fn calls_copy_w_cannot_hold_are_refused_with_their_reason() {
     let refused = |f: Functionality, src: u64, dst: u64, n: u64, why: &str| {
@@ -619,11 +724,23 @@ fn calls_copy_w_cannot_hold_are_refused_with_their_reason() {
         8,
         "passes 2^32",
     );
-    // A destination's words past the top of a low word.
-    refused(Functionality::Copy, 0x1000, (1 << 32) - 4, 8, "4 GiB");
-    // A source whose first word would sit below its high word's range.
-    refused(Functionality::Copy, 1 << 32, 7, 8, "below its high word");
-    assert!(copy_w::call_rows(Functionality::Copy, 8, 0x1000, (1 << 32) - 8, 8).is_ok());
+    // A destination's words past the top of the address space.
+    refused(Functionality::Copy, 0x1000, u64::MAX - 3, 8, "2^64");
+    // A source whose first word would sit below address 0.
+    refused(Functionality::Copy, 3, 7, 8, "below address 0");
+    // Across 2^32 (the keys carry into the high word): a destination, a
+    // source whose first word is the last below the line, a memset.
+    for (f, src, dst) in [
+        (Functionality::Copy, 0x1000, (1 << 32) - 4),
+        (Functionality::Copy, 1 << 32, 7),
+        (Functionality::Copy, 0x1000, (1 << 32) - 8),
+        (Functionality::Set, (1 << 32) - 13, (1 << 32) - 5),
+    ] {
+        assert!(
+            copy_w::call_rows(f, 8, src, dst, 8).is_ok(),
+            "{src:#x} → {dst:#x}"
+        );
+    }
 }
 
 // ---- forgeries ----
@@ -1042,10 +1159,13 @@ fn copy_w_without_new(row: &[FE]) -> Vec<FE> {
 
 /// ★ The census holds COPY_W to its call (its sender rules): the honest table
 /// passes; it has a chain (bus 42, carrying the timestamp and both keys' high
-/// words); and each mutant is refused: a message's timestamp on another
-/// column, the chain not carrying the timestamp, the chain not carrying a key's
-/// high word, a timestamp past the call's plus 2, the new word fixed by no
-/// constraint, a read word's bytes unchecked, `READ_A` set on an idle row.
+/// words, each with its carry); and each mutant is refused: a message's
+/// timestamp on another column, the chain not carrying the timestamp, the
+/// chain not carrying a key's high word, a timestamp past the call's plus 2,
+/// the new word fixed by no constraint, a read word's bytes unchecked,
+/// `READ_A` set on an idle row; each carry without its bit or its tie (rule
+/// c19), `B`'s carry at `−2^31`, the chain's destination carry left out of
+/// its high word.
 #[test]
 fn the_census_holds_copy_w_to_its_call() {
     let name = "COPY_W[0]";
@@ -1139,6 +1259,92 @@ fn the_census_holds_copy_w_to_its_call() {
         Some((copy_w_without::<43> as Eval, cw::NUM_COLUMNS)),
         "on an idle row breaks nothing",
     );
+    // Rule c19: each carry held by its bit and its tie.
+    for (what, eval, why) in [
+        (
+            "SRC_CARRY's bit removed",
+            copy_w_without::<59> as Eval,
+            "on the last word breaks nothing",
+        ),
+        (
+            "SRC_CARRY's tie removed",
+            copy_w_without::<60>,
+            "off the last word breaks nothing",
+        ),
+        (
+            "DST_CARRY's bit removed",
+            copy_w_without::<61>,
+            "on the last word breaks nothing",
+        ),
+        (
+            "DST_CARRY's tie removed",
+            copy_w_without::<62>,
+            "off the last word breaks nothing",
+        ),
+        (
+            "OP_CARRY's bit removed",
+            copy_w_without::<63>,
+            "on the last word breaks nothing",
+        ),
+        (
+            "OP_CARRY's tie removed",
+            copy_w_without::<64>,
+            "off the last word breaks nothing",
+        ),
+    ] {
+        refused(what, honest.clone(), Some((eval, cw::NUM_COLUMNS)), why);
+    }
+    // B's key carrying at −2^31: no carry, a column scaled past 2^16.
+    let mut half = honest.clone();
+    let b = message(1);
+    if let BusValue::Linear(terms) = &mut half[b].values[1] {
+        for t in terms.iter_mut() {
+            if let LinearTerm::Column {
+                coefficient,
+                column,
+            } = t
+                && *column == cw::SRC_CARRY
+            {
+                *coefficient = -(1 << 31);
+            }
+        }
+    }
+    refused(
+        "B's carry at −2^31",
+        half,
+        None,
+        "scales a column past 2^16",
+    );
+    // The chain's next destination high word without its carry: the key is
+    // still carried (its low word's carry alone is no carry pair).
+    let mut no_hi = honest.clone();
+    let send = no_hi
+        .iter()
+        .position(|bi| bi.bus_id == u64::from(BusId::CopyWordNext) && bi.is_sender)
+        .expect("the chain's send");
+    no_hi[send].values[2] = column(cw::DST_KEY_HI);
+    refused(
+        "the chain's destination carry in its low word only",
+        no_hi,
+        None,
+        "whose next does not carry it",
+    );
+    // x11's operand carry in its low word only (old and new value).
+    let mut x11_lo_only = honest.clone();
+    let x11 = x11_lo_only
+        .iter()
+        .position(|bi| {
+            bi.bus_id == u64::from(BusId::Memw) && bi.values.get(9) == Some(&BusValue::constant(22))
+        })
+        .expect("x11's read");
+    x11_lo_only[x11].values[1] = column(cw::SRC_KEY_HI);
+    x11_lo_only[x11].values[12] = column(cw::SRC_KEY_HI);
+    refused(
+        "x11's carry in its low word only",
+        x11_lo_only,
+        None,
+        "whose next does not carry it",
+    );
 }
 
 // ---- every constraint load-bearing ----
@@ -1208,9 +1414,10 @@ fn completed(mut row: Vec<FE>) -> Vec<FE> {
     row
 }
 
-/// ★ Every one of COPY_W's 59 constraints is one a row can break alone: for
+/// ★ Every one of COPY_W's 65 constraints is one a row can break alone: for
 /// each, from an honest row (every functionality, offset, shift and window
-/// shape, and padding), an edit breaks that constraint and no other — one
+/// shape, rows whose keys carry across `2^32`, and padding), an edit breaks
+/// that constraint and no other — one
 /// column set to a small value, a bound or its own plus or minus one; two of
 /// the flag and one-hot columns set to 0 or 1; or one one-hot column up one
 /// and another down one (its sum kept) — the columns an identity defines
@@ -1220,7 +1427,13 @@ fn completed(mut row: Vec<FE>) -> Vec<FE> {
 /// the rest (listed with why); every other must be found.
 #[test]
 fn every_copy_w_constraint_breaks_alone_on_some_row() {
-    let mut run = Run::new();
+    let mut run = Run::with_pages(line_pages());
+    // Each carry 1 on some row: a source's B, a destination, x11's operand,
+    // a memset across the line.
+    run.copy(LINE - 2, LOW + 0x404, 4);
+    run.copy(BELOW + 0x200, LINE - 16, 24);
+    run.copy(LINE + 3, LOW + 0x406, 5);
+    run.set(LINE - 13, 30);
     for offset in 0..8u64 {
         for shift in 0..8u64 {
             for &n in &[1u64, 3, 9, 17] {
@@ -1354,40 +1567,161 @@ fn every_copy_w_constraint_breaks_alone_on_some_row() {
     );
 }
 
-/// The chain tuple's destination low key (both tuples).
-const CHAIN_DST_LO: std::ops::Range<usize> = 1..2;
+/// The chain tuple's destination key, low and high word (both tuples).
+const CHAIN_DST: std::ops::Range<usize> = 1..3;
 
-/// ★ A copy past the top of a low word, which the walk refuses (a
-/// completeness limit: `call_rows`). The forger's call writes 24 bytes from
-/// `2^32 − 16`; its third destination word is taken at address 0, the low
-/// key wrapped (`2^32 − 8 + 8` read as 0) under the same high word, so the
-/// write lands on a word every other check accepts. Refused by the chain
-/// alone, which carries the low key plus 8 as a field element. Control: the
-/// destination's low key taken out of the chain's tuples, accepted.
-#[test]
-fn a_copy_past_the_top_of_a_low_word_is_refused_by_the_chain() {
-    let mut run = Run::new();
-    run.memory.pages.push(PageConfig::zero_init(0xFFFC_0000));
-    let (src, dst, n) = (LOW + 0x200, 0xFFFF_FFF0u64, 24);
-    assert!(copy_w::call_rows(Functionality::Copy, 8, src, dst, n).is_err());
-    let ts = run.next_ts();
-    run.guest_call(Functionality::Copy, src, dst, n, ts);
-    // The rows of the same call at an aligned twin of the destination, the
-    // keys then moved to the forger's.
-    let mut rows = copy_w::call_rows(Functionality::Copy, ts, src, 0xFF0, n).expect("the twin");
-    assert_eq!(rows.len(), 3);
-    for (row, key) in rows.iter_mut().zip([dst, dst + 8, 0]) {
-        row.dst_key = key;
+/// A control's mint: the spare (never touched) private-input row `spare` of
+/// the page at `base` at `OFFSET = offset` (the verifier's `OFFSET` column
+/// replaced by the trace's, so only the token range is taken out) mints `word`
+/// at `base + 8·offset` and takes it back, unchanged, at `ts`.
+fn mint_at(bench: &mut Bench, base: u64, spare: usize, offset: FE, word: u64, ts: u64) {
+    let page = page_name(base);
+    bench.set(&page, spare, pw::OFFSET, offset);
+    let quarters = [word, word >> 16, word >> 32, word >> 48].map(|q| q & 0xFFFF);
+    for (k, q) in quarters.into_iter().enumerate() {
+        bench.set(&page, spare, pw::INIT[k], FE::from(q));
     }
-    let memw = copy_w::run_call(&mut rows, src, dst, n, &mut run.memory)
-        .unwrap_or_else(|why| panic!("the forged call runs: {why}"))
-        .expect("every word is held");
-    run.rows.extend(rows);
-    run.memw.extend(memw);
-    let bench = run.bench();
-    let v = verdict(&bench);
+    bench.set(&page, spare, pw::FINI_LO, FE::from(word & 0xFFFF_FFFF));
+    bench.set(&page, spare, pw::FINI_HI, FE::from(word >> 32));
+    bench.set(&page, spare, pw::TIMESTAMP, FE::from(ts));
+    let t = &bench.piece(&page).trace;
+    let column = (0..t.num_rows())
+        .map(|r| *t.get_main(r, pw::OFFSET))
+        .collect();
+    bench.piece_mut(&page).preprocessed[pw::OFFSET] = column;
+}
+
+/// ★ A one-row copy whose `B` is low word 0 of high word 1 (4 bytes from
+/// `2^32 − 2`: `SRC_KEY = 2^32 − 8`, `B` read), its `SRC_CARRY` cleared: `B`'s
+/// message names `(2^32, 0)`, which MEMW_W does not take (its access is at the
+/// word's own key). Refused on the message bus alone (the bit and the tie hold
+/// at 0; a one-row call has no chain). Control: MEMW_W's access moved to
+/// `(2^32, 0)`, that key minted (the page below the line at `OFFSET = 2^15`,
+/// one past its last word) and `2^32`'s word left untouched: accepted, so the
+/// token range is the check.
+#[test]
+fn a_source_carry_cleared_at_the_last_word_names_a_key_nothing_minted() {
+    let mut run = Run::with_pages(line_pages());
+    let r = run.copy(LINE - 2, LOW + 0x404, 4);
+    let row = r.start;
+    let held = run.rows[row];
+    assert!(held.first() && held.end() && held.reads_b() && held.b_key() == LINE);
+    assert_eq!(held.carries(), [true, false, false]);
+    let mut forged = run.bench();
+    forged.set(copy_w::NAME, row, cw::SRC_CARRY, FE::zero());
+    let v = verdict(&forged);
+    assert!(v.refused_only_on(BusId::MemWordMsg), "{v:?}");
+    assert!(
+        v.left_on(BusId::MemWordMsg)
+            .iter()
+            .any(|(tuple, _)| tuple.get(1) == Some(&LINE) && tuple.get(2) == Some(&0)),
+        "the key (2^32, 0): {v:?}"
+    );
+    let mut control = forged;
+    let t = &control.piece("MEMW_W").trace;
+    let access = (0..t.num_rows())
+        .find(|&r| {
+            *t.get_main(r, mw::ADDRESS_LO) == FE::zero()
+                && *t.get_main(r, mw::ADDRESS_HI) == FE::one()
+        })
+        .expect("the access to 2^32's word");
+    control.set("MEMW_W", access, mw::ADDRESS_LO, FE::from(LINE));
+    control.set("MEMW_W", access, mw::ADDRESS_HI, FE::zero());
+    let page = page_name(LINE);
+    control.set(&page, 0, pw::TIMESTAMP, FE::zero());
+    mint_at(
+        &mut control,
+        BELOW,
+        100,
+        FE::from(DEFAULT_PAGE_SIZE as u64 / 8),
+        held.b(),
+        held.read_timestamp(),
+    );
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ A copy of 24 bytes to `2^32 − 16` whose middle row (the last word below
+/// the line) clears its `DST_CARRY`: it hands the next row the destination key
+/// `(2^32, 0)`, the next row holds `(0, 1)`. Refused by the chain alone (the
+/// bit and the tie hold at 0). Control: the destination key taken out of the
+/// chain's tuples, accepted.
+#[test]
+fn a_destination_carry_cleared_at_the_last_word_is_refused_by_the_chain() {
+    let mut run = Run::with_pages(line_pages());
+    let r = run.copy(BELOW + 0x200, LINE - 16, 24);
+    assert_eq!(r.len(), 3);
+    assert_eq!(run.rows[r.start + 1].carries(), [false, true, false]);
+    let mut forged = run.bench();
+    forged.set(copy_w::NAME, r.start + 1, cw::DST_CARRY, FE::zero());
+    let v = verdict(&forged);
     assert!(v.refused_only_on(BusId::CopyWordNext), "{v:?}");
-    let control = bench.with_interactions(copy_w::NAME, chain_without(CHAIN_DST_LO));
+    let control = forged.with_interactions(copy_w::NAME, chain_without(CHAIN_DST));
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ The same copy's first row (two words below the line) claiming a
+/// `DST_CARRY`: it hands the next row `(2^32 − 8 − 2^32, 1)`. Refused by its
+/// tie (constraint 62) and by the chain; with the tie taken out, by the chain
+/// alone; with the destination key also out of the chain, accepted.
+#[test]
+fn a_destination_carry_off_the_last_word_is_refused_by_its_tie_and_the_chain() {
+    let mut run = Run::with_pages(line_pages());
+    let r = run.copy(BELOW + 0x200, LINE - 16, 24);
+    let mut forged = run.bench();
+    forged.set(copy_w::NAME, r.start, cw::DST_CARRY, FE::one());
+    let v = verdict(&forged);
+    assert_eq!(
+        v.broken,
+        vec![(copy_w::NAME.to_string(), r.start, 62)],
+        "{v:?}"
+    );
+    assert!(
+        v.left.keys().all(|&b| b == u64::from(BusId::CopyWordNext))
+            && !v.left_on(BusId::CopyWordNext).is_empty(),
+        "{v:?}"
+    );
+    let untied = with_constraints(forged, copy_w_without::<62>);
+    let v = verdict(&untied);
+    assert!(v.refused_only_on(BusId::CopyWordNext), "{v:?}");
+    let control = untied.with_interactions(copy_w::NAME, chain_without(CHAIN_DST));
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ A copy from `2^32 + 3` to an offset-6 destination (`SHIFT = 5`, so
+/// `SRC_KEY = 2^32 − 8`, unread, and x11's operand `SRC_KEY + 11` carries into
+/// high word 1) with its `OP_CARRY` cleared: x11 then reads `(2^32 + 3, 0)`
+/// against the register's `(3, 1)`. Refused on the register bus alone (the bit
+/// and the tie hold at 0). Control: the x11 read out of COPY_W and the
+/// register file's answer to it left out, accepted.
+#[test]
+fn an_operand_carry_cleared_is_refused_by_the_register_read() {
+    let mut run = Run::with_pages(line_pages());
+    let r = run.copy(LINE + 3, LOW + 0x406, 5);
+    let held = run.rows[r.start];
+    assert!(held.first() && !held.reads_a() && held.a_key() == LINE - 8);
+    assert_eq!(held.carries(), [true, false, true]);
+    let mut forged = run.bench();
+    forged.set(copy_w::NAME, r.start, cw::OP_CARRY, FE::zero());
+    let v = verdict(&forged);
+    assert!(v.refused_only_on(BusId::Memw), "{v:?}");
+    let x11 = |bi: &BusInteraction| {
+        bi.bus_id == u64::from(BusId::Memw) && bi.values.get(9) == Some(&BusValue::constant(22))
+    };
+    let without: Vec<BusInteraction> = copy_w::bus_interactions()
+        .into_iter()
+        .filter(|bi| !x11(bi))
+        .collect();
+    assert_eq!(without.len() + 1, copy_w::bus_interactions().len());
+    let mut control = forged.with_interactions(copy_w::NAME, without);
+    let regs_row = run
+        .regs
+        .iter()
+        .position(|a| a.reg == 11 && a.old == LINE + 3)
+        .expect("x11's access");
+    control.set("REGS", regs_row, regs::MU, FE::zero());
     let v = verdict(&control);
     assert!(v.accepted(), "control: {v:?}");
 }
