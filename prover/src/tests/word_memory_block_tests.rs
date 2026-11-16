@@ -963,3 +963,70 @@ fn a_word_block_with_cut_word_families_proves_and_verifies() {
         Ok(true)
     ));
 }
+
+/// ★ A word block whose word families stream in chunks as the walk fills
+/// them (`Deviations::word_stream`, the knob `LAMBDA_VM_WORD_STREAM=1`)
+/// proves and verifies, and states what the finish-built block states: the
+/// same table counts, word tables, heights and public output. At word caps of
+/// 4 rows, so every family with rows cuts into chunks; on a CPU run and on
+/// runs that call COPY, keccak256 and ECREC.
+#[test]
+fn a_word_block_with_streamed_word_families_states_the_finish_built_block() {
+    let words = format(MemoryFormat::Words);
+    let tiny = MaxRowsConfig {
+        mem_load: 4,
+        mem_store: 4,
+        ..MaxRowsConfig::small()
+    };
+    let opts = ProofOptions::default_test_options();
+    for name in [
+        "fused_mem_cases",
+        "test_copy_ecalls",
+        "test_keccak256",
+        "test_ecrec",
+    ] {
+        let elf = asm_elf_bytes(name);
+        let options = super::block_whir_tests::streamed(tiny.clone(), 3, 9);
+        let prove_with = |stream: bool| {
+            prove_block_whir_with(
+                &elf,
+                &[],
+                &opts,
+                &words,
+                &options,
+                &Deviations {
+                    word_stream: Some(stream),
+                    ..Deviations::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name} stream {stream}: {e:?}"))
+            .0
+        };
+        let (built, streamed) = (prove_with(false), prove_with(true));
+        assert!(
+            matches!(verify_block_whir(&streamed, &elf, &opts, &words), Ok(true)),
+            "{name}"
+        );
+        assert_eq!(
+            format!("{:?}", streamed.table_counts),
+            format!("{:?}", built.table_counts),
+            "{name}: the counts"
+        );
+        assert_eq!(
+            streamed.word_memory, built.word_memory,
+            "{name}: the word tables"
+        );
+        assert_eq!(
+            streamed.table_num_vars, built.table_num_vars,
+            "{name}: the heights"
+        );
+        assert_eq!(
+            streamed.public_output, built.public_output,
+            "{name}: the output"
+        );
+        assert!(
+            streamed.word_memory.iter().any(|&n| n > 1),
+            "{name}: a family cut into several tables"
+        );
+    }
+}

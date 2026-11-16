@@ -4647,6 +4647,9 @@ pub(crate) struct Deviations {
     /// Whether streamed chunks held as records stay on the host instead of
     /// parking and dropping (`Some(true)`, the A/B control; `None` parks).
     pub records_keep: Option<bool>,
+    /// Whether the word memory format's word families stream in chunks as
+    /// the walk fills them, instead of the knob (`LAMBDA_VM_WORD_STREAM`).
+    pub word_stream: Option<bool>,
     /// Whether phase A's head is stamped, instead of the knob
     /// ([`head_log::knob`]).
     pub head_log: Option<bool>,
@@ -7136,7 +7139,10 @@ fn prove_streamed(
     // the walk fills them, or built at the finish: a word it does not take
     // refuses the prove. The tables are the same either way.
     let word_stream = format.memory == crate::tables::fused_memory::MemoryFormat::Words
-        && parse_word_stream(std::env::var("LAMBDA_VM_WORD_STREAM").ok().as_deref())?;
+        && match deviations.word_stream {
+            Some(on) => on,
+            None => parse_word_stream(std::env::var("LAMBDA_VM_WORD_STREAM").ok().as_deref())?,
+        };
     if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
         eprintln!(
             "★ BLOCK WORD STREAM: {} (LAMBDA_VM_WORD_STREAM)",
