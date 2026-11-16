@@ -194,6 +194,13 @@ fn the_page_w_leg_computes_what_the_hosts_rebuild_computes() {
         let route = Route::Page(columns);
         check_route_columns(&route, declared, num_vars, air.name(), 0).expect("held");
         let (program, targets, width) = leg_program(air.as_ref(), &route, num_vars, declared);
+        // PAGE_W's preprocessed columns are its leading committed columns: the
+        // prefix a prepared opening settles is the columns this leg checks.
+        assert_eq!(
+            targets,
+            (0..declared).collect::<Vec<_>>(),
+            "{kind}: PAGE_W's preprocessed columns lead the table"
+        );
         for seed in [0x5eed_0001u64, 0x5eed_0002] {
             let point = pseudo(seed, num_vars);
             let values = honest_values(&host, &targets, width, &point, seed ^ 0xA5);
@@ -1918,4 +1925,222 @@ fn pages_in_one_group_census() {
             }
         }
     }
+}
+
+// =============================================================================
+// The statement the leaves replay, fused at the tree, the tree prover's
+// register guard, and the pinned leaf programs
+// =============================================================================
+
+/// ★ The leaves replay the WORD statement: the calls a word plan's leaves
+/// absorb concatenate to the word statement's bytes, not the split one's, and
+/// their digest is the plan's identity (taken from the bytes by another
+/// call, so the identity tests alone would not see a leaf replaying another
+/// statement).
+#[test]
+fn the_word_plans_statement_calls_are_the_word_statements() {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let opts = super::super::proof::block_base_options();
+    let words = p1_format(MemoryFormat::Words, LeafScale::DoubledOneTop);
+    let owned = mix_statement(elf, &opts, &words, SMALL_WORDS, 2, 1);
+    let plan = small_words_plan(&words).expect("the word plan derives");
+    let tag = crate::block_whir::block_statement_tag(&words.zf.base);
+    let digest = crate::statement::elf_digest(elf);
+    let bytes = |memory: MemoryFormat| {
+        crate::block_whir::block_statement_bytes(
+            owned.view(),
+            &tag,
+            &digest,
+            &plan.frame.config,
+            memory,
+        )
+    };
+    let calls: Vec<u8> = plan.statement_calls.concat();
+    assert_eq!(calls, bytes(MemoryFormat::Words), "the word statement");
+    assert_ne!(calls, bytes(MemoryFormat::Split));
+    assert_eq!(crate::statement::elf_digest(&calls), *plan.id());
+}
+
+/// A small fused block's statement at the verifier's pinned presets:
+/// SMALL_SPLIT's tables and one MEM_LOAD and one MEM_STORE table (the AIR
+/// set's last two), in a group of their own.
+fn fused_statement() -> OwnedBlockStatement {
+    let mut owned = pinned_statement(MemoryFormat::Fused, SMALL_SPLIT);
+    let n = owned.table_num_vars.len() as u32;
+    owned.table_num_vars.extend([9u8, 8]);
+    owned.fused_memory = [1, 1];
+    owned.groups.push(vec![n, n + 1]);
+    owned
+}
+
+/// ★ Fused at the tree, and a split file's counts. A fused statement plans
+/// at the verifier's named choice and every leaf emits (MEM_LOAD and
+/// MEM_STORE among its tables); its file is refused under the split and the
+/// word format by the fused rule. Each of a split file's nine counts set to 1
+/// is refused under the split format by its rule; with the fused rule taken
+/// out (the control), a fused pair on a split file is no longer refused by
+/// it.
+#[test]
+fn fused_at_the_tree_and_a_split_files_counts() {
+    let fused = fused_statement();
+    let plan = verifier_plan_under(&fused, MemoryFormat::Fused).expect("the fused plan");
+    let names: Vec<String> = plan
+        .frame
+        .airs
+        .air_refs()
+        .iter()
+        .map(|a| a.name().to_string())
+        .collect();
+    assert!(names.iter().any(|n| n.starts_with("MEM_LOAD[")));
+    assert!(names.iter().any(|n| n.starts_with("MEM_STORE[")));
+    emit_leaves(&plan).expect("the fused leaves emit");
+    let file = WhirBlockTreeProof::new(fused.clone(), empty_top());
+    assert_eq!(file.fused_memory, [1, 1]);
+    for other in [MemoryFormat::Split, MemoryFormat::Words] {
+        let refused = verify_file_under(&file, other).expect_err("refused");
+        assert!(
+            refused.contains("states no fused table"),
+            "{other:?}: {refused}"
+        );
+    }
+    let split = pinned_statement(MemoryFormat::Split, SMALL_SPLIT);
+    for slot in 0..9 {
+        let mut moved = split.clone();
+        if slot < 2 {
+            moved.fused_memory[slot] = 1;
+        } else {
+            moved.word_memory[slot - 2] = 1;
+        }
+        let file = WhirBlockTreeProof::new(moved, empty_top());
+        let refused = verify_file_under(&file, MemoryFormat::Split).expect_err("refused");
+        let want = if slot < 2 {
+            "states no fused table"
+        } else {
+            "states no word table"
+        };
+        assert!(refused.contains(want), "slot {slot}: {refused}");
+        if slot < 2 {
+            crate::block_whir::FUSED_COUNTS_UNCHECKED.with(|c| c.set(true));
+            let control = verify_file_under(&file, MemoryFormat::Split);
+            crate::block_whir::FUSED_COUNTS_UNCHECKED.with(|c| c.set(false));
+            let control = control.expect_err("refused by another rule");
+            assert!(
+                !control.contains("states no fused table"),
+                "slot {slot} control: {control}"
+            );
+        }
+    }
+}
+
+/// ★ The tree's prover refuses the word memory format under the 32-bit
+/// register tokens, before anything is proved, naming why; the word format
+/// checks the registers in the CPU row.
+#[test]
+fn the_tree_prover_refuses_words_under_the_32_bit_register_tokens() {
+    use super::super::whir_block_tree::{StderrSink, WhirTreeConfig, prove_whir_block_tree};
+    let mut cfg = WhirTreeConfig::from_env().expect("the tree's configuration");
+    cfg.format.memory = MemoryFormat::Words;
+    cfg.format.registers = crate::tables::register::RegisterFormat::Tokens32;
+    match prove_whir_block_tree(&[], &[], &cfg, &StderrSink) {
+        Ok(_) => panic!("the tree proved words under the 32-bit register tokens"),
+        Err(refused) => assert!(
+            refused.contains("checks the registers in the CPU row"),
+            "{refused}"
+        ),
+    }
+}
+
+/// The leaf digests of `owned` under `format` (each leaf, in order) and the
+/// plan's identity's first eight bytes, with the prepared opening forced onto
+/// every ELF page with data when `dense`.
+fn leaf_digests(
+    format: &BlockFormat,
+    owned: &OwnedBlockStatement,
+    dense: bool,
+) -> (Vec<String>, [u8; 8]) {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let opts = super::super::proof::block_base_options_under(&format.zf);
+    crate::block_whir::DENSE_PAGES_FORCED.with(|c| c.set(dense));
+    let derived = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let plan = WhirBlockPlan::derive(elf, &opts, format, owned.view(), None)
+            .expect("the plan derives");
+        let digests = (0..plan.partition().num_leaves())
+            .map(|k| {
+                super::super::whir_chain_tests::program_digest(
+                    &plan.leaf_program(k).expect("the leaf emits"),
+                )
+            })
+            .collect();
+        let id: [u8; 8] = plan.id()[..8].try_into().expect("eight bytes");
+        (digests, id)
+    }));
+    crate::block_whir::DENSE_PAGES_FORCED.with(|c| c.set(false));
+    derived.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// ★ The split leaf programs with private-input pages, pinned: the small
+/// split block with one private-input page, its ELF pages on the sparse leg
+/// and on the prepared opening, at both leaf scales. The digests are the
+/// ones the same statements give at the word-tokens head this work started
+/// from (built there and here, equal), so the split format's leaves are
+/// unchanged on every page kind. Not blind: with a private page on an ELF
+/// page's route (its count check out), the leaf moves.
+#[test]
+fn the_split_leaves_with_a_private_page_are_pinned() {
+    const ID: [u8; 8] = [0x8d, 0x0b, 0x67, 0xfc, 0x2c, 0x1a, 0x33, 0x65];
+    const SPARSE: &str = "179d541abd410363f71e85372d945298d3bfef3ffce665f81efc79a9d0d6a6b4";
+    const PREPARED: &str = "d394a340579e07ff2085997f5b8ad09626e051726aff0930b7981227bbb4e4fa";
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let opts = super::super::proof::block_base_options();
+    for scale in [LeafScale::DoubledOneTop, LeafScale::Fixed] {
+        let format = p1_format(MemoryFormat::Split, scale);
+        let owned = mix_statement(elf, &opts, &format, SMALL_SPLIT, 2, 1);
+        for (dense, want) in [(false, SPARSE), (true, PREPARED)] {
+            let (digests, id) = leaf_digests(&format, &owned, dense);
+            assert_eq!(id, ID, "{scale}: the plan's identity");
+            assert_eq!(digests, vec![want.to_string()], "{scale}, dense {dense}");
+        }
+        let moved = route_faults::with(Fault::PrivateRouteSwapped, || {
+            route_faults::with(Fault::NoCountCheck, || {
+                route_faults::with(Fault::NoHeightCheck, || {
+                    leaf_digests(&format, &owned, false)
+                })
+            })
+        });
+        assert_ne!(
+            moved.0,
+            vec![SPARSE.to_string()],
+            "{scale}: the pin sees a page's route"
+        );
+    }
+}
+
+/// ★ The word-format and fused leaf programs of the small plans, pinned: the
+/// small word block (every word family, a private-input page) and the small
+/// fused block, each plan's identity and every leaf's digest. A change to a
+/// word leaf (a route, a leg, a word table) moves them. Not blind: with the
+/// page leg taken out, the word leaf moves.
+#[test]
+fn the_word_and_fused_leaves_are_pinned() {
+    const WORD_ID: [u8; 8] = [0xe7, 0xf5, 0x5a, 0xc7, 0x00, 0x9a, 0x6e, 0x04];
+    const WORD_LEAVES: &[&str] =
+        &["c2a6da70844ff4ae56241bdc4c7e339102d35d79bd6eefdf76491af522ca85fe"];
+    const FUSED_ID: [u8; 8] = [0x3e, 0x9b, 0xfb, 0x43, 0xf6, 0xcd, 0x9a, 0x49];
+    const FUSED_LEAVES: &[&str] =
+        &["1fe8687986e96b6e132dbdea0ed95f5d6f2dca9a6974f2f1fb663bcf23f8e93f"];
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let words = p1_format(MemoryFormat::Words, LeafScale::DoubledOneTop);
+    let opts = super::super::proof::block_base_options_under(&words.zf);
+    let owned = mix_statement(elf, &opts, &words, SMALL_WORDS, 2, 1);
+    let (digests, id) = leaf_digests(&words, &owned, false);
+    let fused_format = BlockFormat::pinned().with_memory(MemoryFormat::Fused);
+    let (fused_digests, fused_id) = leaf_digests(&fused_format, &fused_statement(), false);
+    assert_eq!(id, WORD_ID, "the word plan's identity");
+    assert_eq!(digests, WORD_LEAVES, "the word leaves");
+    assert_eq!(fused_id, FUSED_ID, "the fused plan's identity");
+    assert_eq!(fused_digests, FUSED_LEAVES, "the fused leaves");
+    let moved = route_faults::with(Fault::NoPageLeg, || {
+        route_faults::with(Fault::NoCountCheck, || leaf_digests(&words, &owned, false))
+    });
+    assert_ne!(moved.0, digests, "the pin sees the page leg");
 }
