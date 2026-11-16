@@ -3,15 +3,22 @@
 //! `formal/export/<table>.json` holds the operations of each Lean row circuit:
 //! the constraint polynomials (`assert`) and the bus interactions (`interact`),
 //! with variables numbered in Rust column order. For each of LT, EQ and SHIFT
-//! this test evaluates them on random rows next to the Rust `ConstraintSet` and
-//! `bus_interactions()`, and matches them as multisets of functions
-//! (Schwartz–Zippel over [`TRIALS`] rows). It also checks that the Lean
-//! constraints vanish on honest Rust traces, padding rows included.
+//! this test evaluates them on random rows next to what the verifier enforces,
+//! the captured Rust `ConstraintSet` program and, per interaction of
+//! `bus_interactions()`, the multiplicity and LogUp fingerprint expressions of
+//! `emit_multiplicity` and `emit_fingerprint` at fixed challenges, and matches
+//! them as multisets of functions (Schwartz–Zippel over [`TRIALS`] rows).
+//! The export signs each multiplicity (a pull is `−e`, a push `+e`), so a Rust
+//! sender, Clean's pull, is compared with its multiplicity negated. It also
+//! checks that the Lean constraints vanish on honest Rust traces, padding rows
+//! included. The three tables read the current row only; a constraint on
+//! another row or an aux column fails in `eval_program_roots`, it is not
+//! skipped.
 //!
 //! `formal/export/bitwise.json` holds the size of the Lean BITWISE table and of
 //! each static lookup channel, and a sample of the table: the precomputed
 //! columns of sampled rows and the message each channel serves there, checked
-//! against `generate_bitwise_row` and the receivers of
+//! against `generate_bitwise_row` and the fingerprints of the receivers of
 //! `bitwise::bus_interactions()`. Every one of the 2^20 rows is also checked
 //! against a transcription of the Lean row function, pinned to the Lean export
 //! on the sampled rows.
@@ -21,17 +28,21 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use stark::constraint_ir::eval_program_base;
-use stark::constraints::builder::{CaptureBuilder, ConstraintSet, num_base_from_meta};
-use stark::lookup::{BusInteraction, Multiplicity};
+use stark::constraint_ir::{ConstraintProgram, eval_program_roots};
+use stark::constraints::builder::{
+    CaptureBuilder, ConstraintBuilder, ConstraintSet, num_base_from_meta,
+};
+use stark::lookup::{BusInteraction, Multiplicity, emit_fingerprint, emit_multiplicity};
 
 use super::test_rng::SplitMix64;
-use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{BusId, FE, FEE, GoldilocksExtension, GoldilocksField};
 
 type Gl = GoldilocksField;
 type Gl3 = GoldilocksExtension;
 
 const TRIALS: usize = 64;
+/// More alpha powers than any interaction has bus elements.
+const MAX_BUS_ELEMENTS: usize = 64;
 
 // =============================================================================
 // Lean side: the exported operations
@@ -71,8 +82,7 @@ fn eval(e: &Expr, row: &[FE]) -> FE {
 
 struct LeanInteract {
     channel: String,
-    /// Clean's direction: a pull takes the message from the channel, a push adds it.
-    pull: bool,
+    /// Signed as in Clean: a pull is `−e`, a push `+e`.
     mult: Expr,
     msg: Vec<Expr>,
 }
@@ -103,11 +113,6 @@ fn load_lean(name: &str) -> LeanCircuit {
         } else if let Some(i) = op.get("interact") {
             interacts.push(LeanInteract {
                 channel: i["channel"].as_str().expect("channel").to_string(),
-                pull: match i["direction"].as_str().expect("direction") {
-                    "pull" => true,
-                    "push" => false,
-                    other => panic!("unknown direction {other}"),
-                },
                 mult: parse_expr(&i["multiplicity"]),
                 msg: i["message"]
                     .as_array()
@@ -154,30 +159,73 @@ fn assert_has_padding(label: &str, honest: &[Vec<FE>], mu: usize) {
 }
 
 // =============================================================================
-// Rust side: constraints and interactions evaluated on a row
+// Rust side: constraints and interactions as the verifier evaluates them
 // =============================================================================
 
-/// `(bus id, signed multiplicity, bus elements)` of a Rust interaction on a row, signed the way
-/// Clean signs it: a sender (Clean's pull) counts `−m`, a receiver (the table that answers the
-/// lookup, Clean's push) counts `+m`. This is the opposite of the prover's LogUp sum, where a
-/// sender adds `+m`; `lean_interaction_at` signs Lean's pulls the same way.
-fn rust_interaction_at(i: &BusInteraction, row: &[FE]) -> (u64, FE, Vec<FE>) {
-    let m = i.multiplicity.evaluate_with(|c| row[c]);
-    let m = if i.is_sender { -m } else { m };
-    let elems = i
-        .values
-        .iter()
-        .flat_map(|v| v.combine_from(|c| row[c]))
-        .collect();
-    (i.bus_id, m, elems)
+/// The LogUp challenges the fingerprints are taken at: `z` and the powers of `α`.
+struct Challenges {
+    z: FEE,
+    alphas: Vec<FEE>,
 }
 
-fn lean_interaction_at(i: &LeanInteract, row: &[FE]) -> (u64, FE, Vec<FE>) {
-    let m = eval(&i.mult, row);
+fn random_fee(rng: &mut SplitMix64) -> FEE {
+    FEE::new([
+        FE::from(rng.next_u64()),
+        FE::from(rng.next_u64()),
+        FE::from(rng.next_u64()),
+    ])
+}
+
+impl Challenges {
+    fn random(rng: &mut SplitMix64) -> Self {
+        let z = random_fee(rng);
+        let alpha = random_fee(rng);
+        let alphas = (0..=MAX_BUS_ELEMENTS as u64)
+            .map(|k| alpha.pow(k))
+            .collect();
+        Challenges { z, alphas }
+    }
+
+    /// `z − (bus + α·e₀ + α²·e₁ + …)`, the fingerprint `emit_fingerprint` folds.
+    fn fingerprint(&self, bus: u64, elements: &[FE]) -> FEE {
+        let terms = elements
+            .iter()
+            .enumerate()
+            .fold(FEE::zero(), |acc, (j, e)| {
+                acc + e.to_extension::<Gl3>() * self.alphas[j + 1]
+            });
+        self.z - FEE::from(bus) - terms
+    }
+}
+
+/// The multiplicity (root 0) and fingerprint (root 1) of a Rust interaction, captured from the
+/// expressions the verifier evaluates.
+fn capture_interaction(i: &BusInteraction) -> ConstraintProgram<Gl, Gl3> {
+    let mut cb = CaptureBuilder::<Gl, Gl3>::new();
+    let m = emit_multiplicity::<Gl, Gl3, _>(&cb, &i.multiplicity, 0);
+    cb.emit_base(0, m);
+    let fp = emit_fingerprint::<Gl, Gl3, _>(&cb, i, 0);
+    cb.emit_ext(1, fp);
+    cb.finish(1).0
+}
+
+/// `(multiplicity, fingerprint)` of a captured interaction on a row.
+fn rust_interaction_at(
+    prog: &ConstraintProgram<Gl, Gl3>,
+    row: &[FE],
+    ch: &Challenges,
+) -> (FEE, FEE) {
+    let v = eval_program_roots(prog, row, std::slice::from_ref(&ch.z), &ch.alphas);
+    (v[0], v[1])
+}
+
+/// `(multiplicity, fingerprint)` of a Lean interaction on a row, the message folded as
+/// `emit_fingerprint` folds the Rust bus elements.
+fn lean_interaction_at(i: &LeanInteract, row: &[FE], ch: &Challenges) -> (FEE, FEE) {
+    let msg: Vec<FE> = i.msg.iter().map(|e| eval(e, row)).collect();
     (
-        bus_id_of(&i.channel),
-        if i.pull { -m } else { m },
-        i.msg.iter().map(|e| eval(e, row)).collect(),
+        eval(&i.mult, row).to_extension::<Gl3>(),
+        ch.fingerprint(bus_id_of(&i.channel), &msg),
     )
 }
 
@@ -192,8 +240,7 @@ fn seed_of(label: &str) -> u64 {
     })
 }
 
-fn random_rows(num_cols: usize, seed: u64) -> Vec<Vec<FE>> {
-    let mut rng = SplitMix64(seed);
+fn random_rows(num_cols: usize, rng: &mut SplitMix64) -> Vec<Vec<FE>> {
     (0..TRIALS)
         .map(|_| (0..num_cols).map(|_| FE::from(rng.next_u64())).collect())
         .collect()
@@ -216,9 +263,23 @@ fn unmatched<K: std::hash::Hash + Eq + Clone>(lean: &[K], rust: &[K]) -> (Vec<us
     (lean_unmatched, rust_unmatched)
 }
 
-fn fp(x: &FE) -> u64 {
-    x.canonical_u64()
+/// A field element as a hashable key; a base value is its embedding.
+fn fp(x: &FEE) -> [u64; 3] {
+    let v = x.value();
+    [
+        v[0].canonical_u64(),
+        v[1].canonical_u64(),
+        v[2].canonical_u64(),
+    ]
 }
+
+fn fp_base(x: &FE) -> [u64; 3] {
+    fp(&x.to_extension::<Gl3>())
+}
+
+/// An interaction over the random rows: bus, signed multiplicity per row (a Rust sender,
+/// Clean's pull, negated), LogUp fingerprint per row.
+type InteractionKey = (u64, Vec<[u64; 3]>, Vec<[u64; 3]>);
 
 struct Report {
     lean_asserts_unmatched: Vec<usize>,
@@ -226,8 +287,9 @@ struct Report {
     lean_interacts_unmatched: Vec<String>,
     /// Indices into the Rust interactions.
     rust_interacts_unmatched: Vec<usize>,
-    /// The random rows the fingerprints were taken on.
+    /// The random rows and challenges the fingerprints were taken at.
     random_rows: Vec<Vec<FE>>,
+    challenges: Challenges,
 }
 
 fn compare<CS: ConstraintSet<Gl, Gl3>>(
@@ -240,49 +302,59 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
 ) -> Report {
     assert_eq!(lean.columns, num_cols, "[{label}] column count");
 
-    // The Rust constraints as an evaluable program.
+    // The Rust constraints as the program the verifier evaluates.
     let meta = set.meta();
     let n = meta.len();
     let mut cb = CaptureBuilder::<Gl, Gl3>::new();
     set.eval(&mut cb);
     let (prog, _) = cb.finish(num_base_from_meta(&meta));
+    let rust_roots = |row: &[FE]| eval_program_roots(&prog, row, &[], &[]);
 
     // Fingerprints over random rows.
-    let rows = random_rows(num_cols, seed_of(label));
-    let lean_fp: Vec<Vec<u64>> = lean
+    let mut rng = SplitMix64(seed_of(label));
+    let rows = random_rows(num_cols, &mut rng);
+    let ch = Challenges::random(&mut rng);
+    let lean_fp: Vec<Vec<[u64; 3]>> = lean
         .asserts
         .iter()
-        .map(|e| rows.iter().map(|r| fp(&eval(e, r))).collect())
+        .map(|e| rows.iter().map(|r| fp_base(&eval(e, r))).collect())
         .collect();
-    let rust_fp: Vec<Vec<u64>> = (0..n)
-        .map(|i| {
-            rows.iter()
-                .map(|r| fp(&eval_program_base(&prog, i, r)))
-                .collect()
-        })
+    let rust_by_row: Vec<Vec<FEE>> = rows.iter().map(|r| rust_roots(r)).collect();
+    let rust_fp: Vec<Vec<[u64; 3]>> = (0..n)
+        .map(|i| rust_by_row.iter().map(|roots| fp(&roots[i])).collect())
         .collect();
     let (lean_asserts_unmatched, rust_constraints_unmatched) = unmatched(&lean_fp, &rust_fp);
 
-    let lean_ifp: Vec<(u64, Vec<u64>, Vec<Vec<u64>>)> = lean
+    let lean_ifp: Vec<InteractionKey> = lean
         .interacts
         .iter()
         .map(|i| {
-            let evals: Vec<_> = rows.iter().map(|r| lean_interaction_at(i, r)).collect();
+            let evals: Vec<_> = rows
+                .iter()
+                .map(|r| lean_interaction_at(i, r, &ch))
+                .collect();
             (
-                evals[0].0,
+                bus_id_of(&i.channel),
+                evals.iter().map(|e| fp(&e.0)).collect(),
                 evals.iter().map(|e| fp(&e.1)).collect(),
-                evals.iter().map(|e| e.2.iter().map(fp).collect()).collect(),
             )
         })
         .collect();
-    let rust_ifp: Vec<(u64, Vec<u64>, Vec<Vec<u64>>)> = interactions
+    let rust_ifp: Vec<InteractionKey> = interactions
         .iter()
         .map(|i| {
-            let evals: Vec<_> = rows.iter().map(|r| rust_interaction_at(i, r)).collect();
+            let prog = capture_interaction(i);
+            let evals: Vec<_> = rows
+                .iter()
+                .map(|r| rust_interaction_at(&prog, r, &ch))
+                .collect();
             (
-                evals[0].0,
+                i.bus_id,
+                evals
+                    .iter()
+                    .map(|e| fp(&if i.is_sender { -e.0 } else { e.0 }))
+                    .collect(),
                 evals.iter().map(|e| fp(&e.1)).collect(),
-                evals.iter().map(|e| e.2.iter().map(fp).collect()).collect(),
             )
         })
         .collect();
@@ -308,10 +380,10 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
                 "[{label}] Lean assert {i} on honest row {r}"
             );
         }
-        for i in 0..n {
+        for (i, v) in rust_roots(row).iter().enumerate() {
             assert_eq!(
-                eval_program_base(&prog, i, row),
-                FE::zero(),
+                *v,
+                FEE::zero(),
                 "[{label}] Rust constraint {i} on honest row {r}"
             );
         }
@@ -340,6 +412,7 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
         lean_interacts_unmatched,
         rust_interacts_unmatched,
         random_rows: rows,
+        challenges: ch,
     }
 }
 
@@ -409,17 +482,18 @@ fn lean_diff_lt() {
         cols::NUM_COLUMNS,
         &honest,
     );
-    // Known deltas: the Lean model keeps `μ·(1 − μ) = 0` (assert 0), the Rust chip bounds
-    // `μ` with the `ARE_BYTES[μ, 0]` send instead. Both are pinned by content, not position.
-    assert_eq!(
-        report.lean_asserts_unmatched,
-        vec![0],
-        "[LT] only the μ bit constraint should be Lean-only"
-    );
+    // Known deltas: the Lean model keeps `μ·(1 − μ) = 0`, the Rust chip bounds `μ` with the
+    // `ARE_BYTES[μ, 0]` send instead. Both are found by content, not position.
+    let &[mu_assert] = report.lean_asserts_unmatched.as_slice() else {
+        panic!(
+            "[LT] only the μ bit constraint should be Lean-only, got {:?}",
+            report.lean_asserts_unmatched
+        )
+    };
     let mu_bit = |r: &[FE]| r[cols::MU] * (FE::one() - r[cols::MU]);
     for r in &report.random_rows {
         assert_eq!(
-            eval(&lean.asserts[0], r),
+            eval(&lean.asserts[mu_assert], r),
             mu_bit(r),
             "[LT] Lean-only assert is μ·(1 − μ)"
         );
@@ -429,7 +503,7 @@ fn lean_diff_lt() {
     for r in &honest {
         let mu = r[cols::MU].canonical_u64();
         assert_eq!(
-            eval(&lean.asserts[0], r) == FE::zero(),
+            eval(&lean.asserts[mu_assert], r) == FE::zero(),
             mu <= 1,
             "[LT] μ = {mu}"
         );
@@ -444,23 +518,26 @@ fn lean_diff_lt() {
         report.lean_interacts_unmatched.is_empty(),
         "[LT] Lean-only interactions"
     );
-    assert_eq!(
-        report.rust_interacts_unmatched.len(),
-        1,
-        "[LT] only ARE_BYTES[μ, 0] should be Rust-only"
-    );
-    let are_bytes = &interactions[report.rust_interacts_unmatched[0]];
+    let &[are_bytes] = report.rust_interacts_unmatched.as_slice() else {
+        panic!(
+            "[LT] only ARE_BYTES[μ, 0] should be Rust-only, got {:?}",
+            report.rust_interacts_unmatched
+        )
+    };
+    let are_bytes = &interactions[are_bytes];
     assert!(
         are_bytes.is_sender && matches!(are_bytes.multiplicity, Multiplicity::One),
         "[LT] the μ bound is sent with multiplicity One"
     );
+    let prog = capture_interaction(are_bytes);
     for r in &report.random_rows {
         assert_eq!(
-            rust_interaction_at(are_bytes, r),
+            rust_interaction_at(&prog, r, &report.challenges),
             (
-                BusId::AreBytes as u64,
-                -FE::one(),
-                vec![r[cols::MU], FE::zero()]
+                FEE::one(),
+                report
+                    .challenges
+                    .fingerprint(BusId::AreBytes as u64, &[r[cols::MU], FE::zero()])
             ),
             "[LT] the Rust-only interaction is ARE_BYTES[μ, 0]"
         );
@@ -609,6 +686,7 @@ fn lean_diff_bitwise() {
         NUM_PRECOMPUTED_COLS, NUM_ROWS, bus_interactions, cols, generate_bitwise_row,
     };
     let json = load_export("bitwise");
+    let challenges = Challenges::random(&mut SplitMix64(seed_of("BITWISE")));
     let as_u64s = |v: &Value| -> Vec<u64> {
         v.as_array()
             .expect("array")
@@ -695,25 +773,24 @@ fn lean_diff_bitwise() {
             indices.len(),
             "[BITWISE] {name}: one message list per sampled row"
         );
+        // The messages as the LogUp fingerprints the receivers emit.
+        let progs: Vec<_> = rust.iter().map(|&r| capture_interaction(r)).collect();
         for ((&i, row), lean) in indices.iter().zip(&rust_rows).zip(messages) {
-            let mut lean: Vec<Vec<u64>> = lean
+            let mut lean: Vec<[u64; 3]> = lean
                 .as_array()
                 .expect("messages of a row")
                 .iter()
-                .map(as_u64s)
-                .collect();
-            let mut rust: Vec<Vec<u64>> = rust
-                .iter()
-                .map(|r| {
-                    r.values
-                        .iter()
-                        .flat_map(|v| v.combine_from(|c| row[c]))
-                        .map(|e| e.canonical_u64())
-                        .collect()
+                .map(|m| {
+                    let elements: Vec<FE> = as_u64s(m).into_iter().map(FE::from).collect();
+                    fp(&challenges.fingerprint(bus, &elements))
                 })
                 .collect();
-            lean.sort();
-            rust.sort();
+            let mut rust: Vec<[u64; 3]> = progs
+                .iter()
+                .map(|p| fp(&rust_interaction_at(p, row, &challenges).1))
+                .collect();
+            lean.sort_unstable();
+            rust.sort_unstable();
             assert_eq!(lean, rust, "[BITWISE] {name} at row {i}");
         }
     }

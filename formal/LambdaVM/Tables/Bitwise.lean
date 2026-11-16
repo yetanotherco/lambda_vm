@@ -2,7 +2,6 @@ module
 
 public import LambdaVM.Field
 public import LambdaVM.AluOp
-public import LambdaVM.StaticLookup
 
 @[expose] public section
 
@@ -115,7 +114,7 @@ def areBytesTable : StaticLookupChannel (F p) fieldPair where
       exact ⟨by rw [val_natCast_of_lt_two_pow_40 (by linarith [row_x_lt i])]; exact row_x_lt i,
              by rw [val_natCast_of_lt_two_pow_40 (by linarith [row_y_lt i])]; exact row_y_lt i⟩
 
-abbrev AreBytes : Channel (F p) fieldPair := areBytesTable.toChannel
+abbrev AreBytes : Channel (F p) fieldPair := .fromStatic _ _ areBytesTable
 
 /-- `IS_HALF[X + 2^8·Y]` (`BusId::IsHalfword`): the value is a halfword. -/
 def isHalfTable : StaticLookupChannel (F p) field where
@@ -137,7 +136,7 @@ def isHalfTable : StaticLookupChannel (F p) field where
       have := row_x_lt i; have := row_y_lt i
       rw [val_natCast_of_lt_two_pow_40 (by omega)]; omega
 
-abbrev IsHalf : Channel (F p) field := isHalfTable.toChannel
+abbrev IsHalf : Channel (F p) field := .fromStatic _ _ isHalfTable
 
 /-- `IS_B20[X + 2^8·Y + 2^16·Z]` (`BusId::IsB20`): the value is below `2^20`. -/
 def isB20Table : StaticLookupChannel (F p) field where
@@ -159,7 +158,7 @@ def isB20Table : StaticLookupChannel (F p) field where
       have := row_x_lt i; have := row_y_lt i; have := row_z_lt i
       rw [val_natCast_of_lt_two_pow_40 (by omega)]; omega
 
-abbrev IsB20 : Channel (F p) field := isB20Table.toChannel
+abbrev IsB20 : Channel (F p) field := .fromStatic _ _ isB20Table
 
 /-! ## Bit-extraction channels -/
 
@@ -189,7 +188,7 @@ def msb8Table : StaticLookupChannel (F p) fieldPair where
         row_msb8]
       exact ⟨this, rfl⟩
 
-abbrev Msb8 : Channel (F p) fieldPair := msb8Table.toChannel
+abbrev Msb8 : Channel (F p) fieldPair := .fromStatic _ _ msb8Table
 
 /-- `MSB16[X + 2^8·Y] -> MSB16` (`BusId::Msb16`): a halfword and its top bit. -/
 def msb16Table : StaticLookupChannel (F p) fieldPair where
@@ -217,7 +216,7 @@ def msb16Table : StaticLookupChannel (F p) fieldPair where
         row_msb16]
       exact ⟨by omega, rfl⟩
 
-abbrev Msb16 : Channel (F p) fieldPair := msb16Table.toChannel
+abbrev Msb16 : Channel (F p) fieldPair := .fromStatic _ _ msb16Table
 
 /-- `ZERO[X + 2^8·Y + 2^16·Z] -> ZERO` (`BusId::Zero`): a 20-bit value and its zero flag. -/
 def zeroTable : StaticLookupChannel (F p) fieldPair where
@@ -252,7 +251,7 @@ def zeroTable : StaticLookupChannel (F p) fieldPair where
       simp only [hn]
       split_ifs <;> simp
 
-abbrev Zero : Channel (F p) fieldPair := zeroTable.toChannel
+abbrev Zero : Channel (F p) fieldPair := .fromStatic _ _ zeroTable
 
 /-! ## Byte ALU and halfword shift channels -/
 
@@ -314,7 +313,7 @@ def byteAluTable : StaticLookupChannel (F p) ByteAluMsg where
       · right; right; rw [row_xor, val_natCast_of_lt_two_pow_40 (by linarith [xor_lt_256 hx hy])]
         simp
 
-abbrev ByteAlu : Channel (F p) ByteAluMsg := byteAluTable.toChannel
+abbrev ByteAlu : Channel (F p) ByteAluMsg := .fromStatic _ _ byteAluTable
 
 /-- Message of `HWSL[X + 2^8·Y, Z] -> [SLL, SLLC]` (`BusId::Hwsl`). -/
 structure HwslMsg (F : Type) where
@@ -359,6 +358,6 @@ def hwslTable : StaticLookupChannel (F p) HwslMsg where
         row_sll, row_sllc, sll_eq hh, sllc_eq hh]
       exact ⟨hh, hz, rfl, rfl⟩
 
-abbrev Hwsl : Channel (F p) HwslMsg := hwslTable.toChannel
+abbrev Hwsl : Channel (F p) HwslMsg := .fromStatic _ _ hwslTable
 
 end LambdaVM.Bitwise

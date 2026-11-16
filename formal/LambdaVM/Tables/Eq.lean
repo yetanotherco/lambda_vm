@@ -97,7 +97,6 @@ def RowSpec (r : Row (F p)) : Prop :=
     r.res = ((eqBit r.invert.val (dword r.a0 r.a1) (dword r.b0 r.b1) : ℕ) : F p)
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
-  name := "EQ"
   main
   Spec r _ _ := RowSpec r
   channelsWithRequirements := [Alu.channel.toRaw]
@@ -108,8 +107,9 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     constructor
     · intro channel h; tauto
     · intro env h
-      -- each pull owes a multiplicity of 0 or 1: μ is a bit
-      exact mul_one_sub_eq_zero_iff.mp h.2.2.2.2
+      refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;>
+      · intro hne1 hne0
+        exact (requirement_vacuous h.2.2.2.2 hne1 hne0).elim
 
   soundness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, dword, Alu.channel,
@@ -166,7 +166,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       simp only [eqBit] <;>
       split_ifs <;> (try norm_num) <;> omega
     refine ⟨fun _ => key, by simp, by simp, by simp, by simp, by simp, ?_⟩
-    intro _
+    intro _ _
     -- the flag byte, read as a natural
     have hflagsV : (3 + 64 * input_invert : F p).val = 3 + 64 * input_invert.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)

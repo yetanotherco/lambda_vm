@@ -1416,7 +1416,7 @@ impl Multiplicity {
     ///
     /// Public so the prover's `lean_diff` test can evaluate multiplicities on a row.
     #[inline]
-    pub fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
+    fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
     where
         F: IsField,
         G: Fn(usize) -> FieldElement<F>,
@@ -1972,7 +1972,8 @@ impl LogUpLayout {
 
 /// Capture a [`Multiplicity`] as a base-field expression, mirroring
 /// [`Multiplicity::evaluate_with`].
-fn emit_multiplicity<F, E, B>(b: &B, multiplicity: &Multiplicity, offset: usize) -> B::Expr
+/// An interaction's multiplicity as the expression the verifier evaluates.
+pub fn emit_multiplicity<F, E, B>(b: &B, multiplicity: &Multiplicity, offset: usize) -> B::Expr
 where
     F: IsField,
     E: IsField,
@@ -2161,7 +2162,7 @@ where
 /// accumulator. The prover folder runs this body once per LDE row, where
 /// collecting the terms in a `Vec` costs a heap allocation per fingerprint
 /// per row.
-fn emit_fingerprint<F, E, B>(b: &B, interaction: &BusInteraction, offset: usize) -> B::ExprE
+pub fn emit_fingerprint<F, E, B>(b: &B, interaction: &BusInteraction, offset: usize) -> B::ExprE
 where
     F: IsField,
     E: IsField,

@@ -27,20 +27,29 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install elan
+        env:
+          ELAN_VERSION: v4.2.4
+          ELAN_SHA256: 42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63
         run: |
-          curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          cd "$(mktemp -d)"
+          curl -sSfL "https://github.com/leanprover/elan/releases/download/${ELAN_VERSION}/elan-x86_64-unknown-linux-gnu.tar.gz" -o elan.tar.gz
+          echo "${ELAN_SHA256}  elan.tar.gz" | sha256sum -c -
+          tar xzf elan.tar.gz
+          ./elan-init -y --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
-      # Clean and CompPoly are compiled from source; Mathlib comes from its own cache below.
-      # One entry per toolchain and manifest: the cache holds the dependency builds, and
-      # LambdaVM itself is rebuilt on top of them.
+      # Clean and CompPoly are compiled from source; Mathlib and its dependencies come from
+      # `lake exe cache get`. One entry per toolchain and manifest, holding the source-built
+      # packages and the LambdaVM build only (a directory in `path` is archived whole, so an
+      # exclusion under it has no effect).
       - name: Cache Lake builds
         uses: actions/cache@v4
         with:
           path: |
-            formal/.lake
-            !formal/.lake/packages/mathlib
-          key: lake-${{ hashFiles('formal/lean-toolchain', 'formal/lake-manifest.json') }}
+            formal/.lake/build
+            formal/.lake/packages/Clean
+            formal/.lake/packages/CompPoly
+          key: lake-src-${{ hashFiles('formal/lean-toolchain', 'formal/lake-manifest.json') }}
 
       - name: Fetch Mathlib binaries
         run: lake exe cache get
