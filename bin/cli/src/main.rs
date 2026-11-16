@@ -437,6 +437,16 @@ enum Commands {
         /// does not carry it.
         #[arg(long, value_parser = argue_pack_word, default_value = "22")]
         argue_pack: String,
+
+        /// How the base checks the CPU's loads and stores: `split` (the
+        /// default: byte tokens, the loads and stores in tables of their own),
+        /// `fused` (an aligned load or store in one row with its memory
+        /// tokens) or `words` (RAM by aligned 8-byte words). A format choice:
+        /// `verify-block` must be given the same one; the proof file carries
+        /// the format's table counts, never the format. A compressed file is
+        /// proved at `split` alone (give `--tree-file` for another).
+        #[arg(long, value_parser = ["split", "fused", "words"], default_value = "split")]
+        memory: String,
     },
 
     /// Verify a block proof produced by `prove-block`
@@ -497,6 +507,12 @@ enum Commands {
         /// from the proof.
         #[arg(long, value_parser = argue_pack_word, default_value = "22")]
         argue_pack: String,
+
+        /// The memory format the block was proved with (`prove-block
+        /// --memory`, default `split`): the verifier's constant, never read
+        /// from the proof.
+        #[arg(long, value_parser = ["split", "fused", "words"], default_value = "split")]
+        memory: String,
     },
 
     /// Prove a block's WHIR BASE proof alone — no recursion over it — and
@@ -657,6 +673,7 @@ fn main() -> ExitCode {
             leaf_double_from,
             leaf_query,
             argue_pack,
+            memory,
         } => cmd_prove_block(
             elf,
             input,
@@ -672,6 +689,7 @@ fn main() -> ExitCode {
                 leaf_double_from: &leaf_double_from,
                 leaf_query: &leaf_query,
                 argue_pack: &argue_pack,
+                memory: &memory,
             },
         ),
         Commands::VerifyBlock {
@@ -686,6 +704,7 @@ fn main() -> ExitCode {
             leaf_double_from,
             leaf_query,
             argue_pack,
+            memory,
         } => cmd_verify_block(
             proof,
             elf,
@@ -699,6 +718,7 @@ fn main() -> ExitCode {
                 leaf_double_from: &leaf_double_from,
                 leaf_query: &leaf_query,
                 argue_pack: &argue_pack,
+                memory: &memory,
             },
         ),
         Commands::ProveBlockBase {
@@ -824,6 +844,7 @@ fn at_pinned_choices(c: &BlockChoices<'_>) -> bool {
         && c.leaf_double_from == "one-top"
         && c.leaf_query == "lean"
         && c.argue_pack == "22"
+        && c.memory == "split"
 }
 
 struct BlockChoices<'a> {
@@ -834,6 +855,13 @@ struct BlockChoices<'a> {
     leaf_double_from: &'a str,
     leaf_query: &'a str,
     argue_pack: &'a str,
+    memory: &'a str,
+}
+
+/// The memory format of `--memory`: the caller's, as the tree's harness
+/// knob (`BLOCK_WHIR_MEMORY`, refused by the block commands) would read it.
+fn block_memory(word: &str) -> Result<prover::tables::fused_memory::MemoryFormat, String> {
+    prover::lfm::whir_block_tree::memory_setting(Some(word), false)
 }
 
 /// `--argue-pack`'s words: `off` or a price in 0..=40
@@ -896,6 +924,7 @@ fn cmd_prove_block(
         leaf_double_from,
         leaf_query,
         argue_pack,
+        memory,
     } = choices;
 
     // The group opening is the caller's constant, given on the command line
@@ -970,6 +999,15 @@ fn cmd_prove_block(
         }
     };
     eprintln!("BLOCK LEAF QUERY: {leaf_query:?}");
+    // So is the memory format.
+    let memory = match block_memory(memory) {
+        Ok(memory) => memory,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("BLOCK MEMORY FORMAT: {memory:?}");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
@@ -1001,6 +1039,7 @@ fn cmd_prove_block(
     eprintln!("BLOCK GROUP OPENING: {group}");
     cfg.format.leaf_scale = leaf_scale;
     cfg.format.leaf_query = leaf_query;
+    cfg.format.memory = memory;
     cfg.format = cfg.format.with_pack(pack);
     cfg.argue = cfg.format.argue;
     eprintln!("BLOCK ARGUE PACK: {argue_pack} ({pack:?})");
@@ -1135,6 +1174,7 @@ fn cmd_verify_block(
         leaf_double_from,
         leaf_query,
         argue_pack,
+        memory,
     } = choices;
 
     let fold = match group_setting(Some(group)) {
@@ -1165,6 +1205,13 @@ fn cmd_verify_block(
     };
     let leaf_query = match block_leaf_query(leaf_query) {
         Ok(query) => query,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let memory = match block_memory(memory) {
+        Ok(memory) => memory,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
@@ -1256,10 +1303,11 @@ fn cmd_verify_block(
     eprintln!("BLOCK LEAF SCALE: {leaf_scale}");
     eprintln!("BLOCK LEAF QUERY: {leaf_query:?}");
     eprintln!("BLOCK ARGUE PACK: {argue_pack} ({pack:?})");
+    eprintln!("BLOCK MEMORY FORMAT: {memory:?}");
     eprintln!("Verifying block proof...");
     let start = Instant::now();
     let result = verify_whir_block_tree_proof_at(
-        &elf_data, &proof, fold, blowup, order, round0, leaf_scale, leaf_query, pack,
+        &elf_data, &proof, fold, blowup, order, round0, leaf_scale, leaf_query, pack, memory,
     );
     let verify_elapsed = start.elapsed();
     match result {
@@ -2816,6 +2864,53 @@ mod tests {
                 install("2", "natural", Some("one")).expect_err("one tree under the natural order");
             assert!(err.contains("LAMBDA_VM_ZF_WHIR_TREES"), "{err}");
         }
+    }
+
+    /// Both block commands take the memory format, `split` unless told
+    /// otherwise, and nothing but `split`, `fused` or `words`; each reads to
+    /// the format it names, and only `split` is at the pinned choices a
+    /// compressed file is proved and verified at.
+    #[test]
+    fn the_block_commands_take_the_memory_format() {
+        use prover::tables::fused_memory::MemoryFormat;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let memory = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(Commands::ProveBlock { memory, .. } | Commands::VerifyBlock { memory, .. }) => {
+                    Some(memory)
+                }
+                _ => None,
+            };
+            assert_eq!(memory(cmd).as_deref(), Some("split"), "the default");
+            for (word, want) in [
+                ("split", MemoryFormat::Split),
+                ("fused", MemoryFormat::Fused),
+                ("words", MemoryFormat::Words),
+            ] {
+                let args = [cmd, &["--memory", word]].concat();
+                assert_eq!(memory(&args).as_deref(), Some(word));
+                assert_eq!(block_memory(word), Ok(want), "{word} reads");
+            }
+            for word in ["Words", "word", "bytes", ""] {
+                let args = [cmd, &["--memory", word]].concat();
+                assert!(parse(&args).is_err(), "--memory {word:?} is refused");
+            }
+        }
+        let choices = |memory| BlockChoices {
+            group: "indexed",
+            blowup: "2",
+            leaves: "coset",
+            trees: None,
+            leaf_double_from: "one-top",
+            leaf_query: "lean",
+            argue_pack: "22",
+            memory,
+        };
+        assert!(at_pinned_choices(&choices("split")));
+        assert!(!at_pinned_choices(&choices("words")));
+        assert!(!at_pinned_choices(&choices("fused")));
     }
 
     /// Both block commands take the leaf scale, production's threshold of 10
