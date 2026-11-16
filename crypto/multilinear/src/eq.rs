@@ -76,6 +76,87 @@ pub fn eq_mle<F: IsField + 'static>(r: &[FieldElement<F>]) -> Result<Mle<F>, Err
     Mle::new(eq_evals(r))
 }
 
+/// Each point's two half tables for [`add_eq_sum`]: `eq(p_hi, ·)` over the
+/// high `hi_bits = n / 2` variables and `scale·eq(p_lo, ·)` over the rest,
+/// so that `scale·eq(p, x) = hi[x >> lo_bits]·lo[x mod 2^lo_bits]` in the
+/// [`Mle`](crate::mle::Mle) order (variable 0 the index's top bit). Returns
+/// `lo_bits` and the tables. What the card's batched weight kernel is handed
+/// as well.
+#[allow(clippy::type_complexity)]
+pub fn eq_halves<F: IsField>(
+    points: &[Vec<FieldElement<F>>],
+    scales: &[FieldElement<F>],
+    num_vars: usize,
+) -> Result<(usize, Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<F>>>), Error>
+where
+    FieldElement<F>: Send + Sync,
+{
+    if points.len() != scales.len() {
+        return Err(Error::VariableCountMismatch {
+            expected: points.len(),
+            got: scales.len(),
+        });
+    }
+    if let Some(p) = points.iter().find(|p| p.len() != num_vars) {
+        return Err(Error::VariableCountMismatch {
+            expected: num_vars,
+            got: p.len(),
+        });
+    }
+    let hi_bits = num_vars / 2;
+    let lo_bits = num_vars - hi_bits;
+    let half = |(p, scale): (&Vec<FieldElement<F>>, &FieldElement<F>)| {
+        let hi = eq_evals(&p[..hi_bits]);
+        let mut lo = vec![FieldElement::<F>::zero(); 1usize << lo_bits];
+        eq_evals_into(&p[hi_bits..], scale, &mut lo).expect("the table is sized for p_lo");
+        (hi, lo)
+    };
+    #[cfg(feature = "parallel")]
+    let pairs: Vec<_> = points.par_iter().zip(scales.par_iter()).map(half).collect();
+    #[cfg(not(feature = "parallel"))]
+    let pairs: Vec<_> = points.iter().zip(scales.iter()).map(half).collect();
+    let (his, los) = pairs.into_iter().unzip();
+    Ok((lo_bits, his, los))
+}
+
+/// `dst[x] += Σ_j scales[j]·eq(points[j], x)` over the `2^n`-entry table
+/// `dst`: a weight gaining many claims' `eq` at once (the WHIR round form's
+/// shift claims).
+///
+/// Each `eq` is the product of its two half tables ([`eq_halves`]), so the
+/// sum is one pass over `dst` reading `Q` small tables, rather than `Q` tables
+/// of the full width built and added one by one. The same field values as
+/// `Σ_j` of [`eq_evals_into`] added in.
+pub fn add_eq_sum<F: IsField>(
+    dst: &mut [FieldElement<F>],
+    points: &[Vec<FieldElement<F>>],
+    scales: &[FieldElement<F>],
+) -> Result<(), Error>
+where
+    FieldElement<F>: Send + Sync,
+{
+    if !dst.len().is_power_of_two() {
+        return Err(Error::NotPowerOfTwo(dst.len()));
+    }
+    let num_vars = dst.len().trailing_zeros() as usize;
+    let (lo_bits, his, los) = eq_halves(points, scales, num_vars)?;
+    let row = |(x_hi, out): (usize, &mut [FieldElement<F>])| {
+        for (hi, lo) in his.iter().zip(&los) {
+            let h = &hi[x_hi];
+            for (d, l) in out.iter_mut().zip(lo) {
+                *d += h * l;
+            }
+        }
+    };
+    #[cfg(feature = "parallel")]
+    dst.par_chunks_mut(1usize << lo_bits)
+        .enumerate()
+        .for_each(row);
+    #[cfg(not(feature = "parallel"))]
+    dst.chunks_mut(1usize << lo_bits).enumerate().for_each(row);
+    Ok(())
+}
+
 /// Evaluates `eq(r, x)` directly, without materializing the table.
 pub fn eq_eval<F: IsField>(
     r: &[FieldElement<F>],
