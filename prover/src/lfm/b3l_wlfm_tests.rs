@@ -606,3 +606,106 @@ fn the_chunk_rule_keeps_what_fits_and_cuts_the_rest() {
     assert_eq!(chip_chunk_rows(1 << 21, 1 << 21, 22), vec![1 << 21]);
     assert_eq!(chip_chunk_rows(27_000_000, 1 << 25, 22).len(), 7);
 }
+
+// =============================================================================
+// Chips packed narrow
+// =============================================================================
+
+/// The chips packed narrow before the prove ([`super::wlfm::NARROW_CHIPS_ENV`])
+/// are the prover's holding: off by default, and on, a program of lean and
+/// chip tables, and one with a chip cut into chunks, prove the same bytes as
+/// with the chips wide, held and streamed; a forged constant in a cut chip's
+/// last chunk is still refused.
+#[test]
+fn chips_packed_narrow_prove_the_same_bytes() {
+    use super::wlfm::{WlfmProving, narrow_chips, prove_wlfm_as, take_wlfm_stamps};
+    assert!(!narrow_chips(), "the chips are wide by default");
+    let _fast = test_format::set(Some(2));
+    let bytes = |program: &LfmProgram, build: &WlfmBuild, on: bool, proving: WlfmProving| {
+        let _narrow = test_format::set_narrow_chips(on);
+        let _ = take_wlfm_stamps();
+        let proof = prove_wlfm_as(program, build, &[], proving).expect("proves");
+        let stamps = take_wlfm_stamps().expect("stamped");
+        assert_eq!(
+            stamps.narrow_tables > 0,
+            on,
+            "chips packed narrow iff on ({} tables)",
+            stamps.narrow_tables
+        );
+        verify_wlfm(&build.artifacts, &proof, &proof.public_words).expect("verifies");
+        rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+            .expect("serializes")
+            .to_vec()
+    };
+    let program = honest();
+    let built = build(&program);
+    let wide = bytes(&program, &built, false, WlfmProving::Held);
+    assert_eq!(
+        wide,
+        bytes(&program, &built, true, WlfmProving::Held),
+        "narrow"
+    );
+    assert_eq!(
+        wide,
+        bytes(&program, &built, true, WlfmProving::Streamed),
+        "narrow, streamed"
+    );
+    let _cut = test_format::set_chunk_log(3);
+    let program = constants(40, 77);
+    let built = build(&program);
+    assert!(built.artifacts.lfm_chunks.iter().any(|c| c.len() > 1));
+    let wide = bytes(&program, &built, false, WlfmProving::Streamed);
+    assert_eq!(
+        wide,
+        bytes(&program, &built, true, WlfmProving::Streamed),
+        "a cut chip narrow"
+    );
+    let _narrow = test_format::set_narrow_chips(true);
+    let filled = execute_and_fill_unmerged(&constants(40, 78), &[], HASHER).expect("executes");
+    let forged = prove_wlfm_traces(&built, filled, false).expect("the forger's prover");
+    assert!(verify_wlfm(&built.artifacts, &forged, &forged.public_words).is_err());
+}
+
+/// The chips' narrow pack is `NarrowColumns`' own of the same rows, the rows
+/// past the trace zero, over words of every width.
+#[test]
+fn the_chips_narrow_pack_is_the_row_major_pack() {
+    use super::wlfm::pack_rows_narrow;
+    let width = 5;
+    let real = 9_000; // past two of the pack's row blocks
+    let rows = 1 << 14;
+    let words: Vec<u64> = (0..real * width)
+        .map(|i| {
+            let (r, c) = ((i / width) as u64, i % width);
+            match c {
+                0 => r & 0xff,
+                1 => r * 7,
+                2 => r << 12,
+                3 => 0xFFFF_FFFF_0000_0000 - r, // p − 1 − r: canonical, eight bytes
+                _ => 0,
+            }
+        })
+        .collect();
+    let cells: Vec<FE> = words.iter().map(|&w| FE::from(w)).collect();
+    let packed = pack_rows_narrow(&cells, width, rows).expect("packs");
+    let mut padded: Vec<u64> = cells
+        .iter()
+        .map(|f| {
+            use math::field::traits::IsPrimeField;
+            crate::tables::types::GoldilocksField::canonical(f.value())
+        })
+        .collect();
+    padded.resize(rows * width, 0);
+    let expected =
+        multilinear::narrow::NarrowColumns::pack_row_major(&padded, width).expect("packs");
+    assert_eq!(packed.widths(), &[1, 2, 4, 8, 1]);
+    assert_eq!(packed, expected);
+    assert!(
+        pack_rows_narrow(&cells[..7], width, rows).is_err(),
+        "part of a row"
+    );
+    assert!(
+        pack_rows_narrow(&cells, width, 8).is_err(),
+        "more rows than the table"
+    );
+}

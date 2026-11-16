@@ -706,6 +706,8 @@ struct FirstGroupsRun {
     /// The fill's split: the fixed chips' traces, the lean tables'.
     fill_split: (f64, f64),
     prove: f64,
+    /// Narrow tables (and their cells) the prove widened on the host.
+    host_widens: (u64, u64),
     stamps: super::wlfm::WlfmStamps,
 }
 
@@ -751,10 +753,13 @@ fn prove_first_groups(
     let fill = t.elapsed().as_secs_f64();
     let fill_split = super::proof::take_fill_split().unwrap_or_default();
     let _ = take_wlfm_stamps();
+    let widens = multilinear::narrow::host_widens();
     let t = Instant::now();
     let proof = prove_wlfm_traces_as(&level.build, filled, prefix_check(), WlfmProving::Streamed)
         .map_err(|e| format!("the first {k} groups' level proves: {e}"))?;
     let prove = t.elapsed().as_secs_f64();
+    let after = multilinear::narrow::host_widens();
+    let host_widens = (after.0 - widens.0, after.1 - widens.1);
     let stamps = take_wlfm_stamps().unwrap_or_default();
     Ok(FirstGroupsRun {
         level,
@@ -768,6 +773,7 @@ fn prove_first_groups(
         fill,
         fill_split,
         prove,
+        host_widens,
         stamps,
     })
 }
@@ -930,6 +936,38 @@ fn rta_first_groups(
             st.prep_parts[4],
             st.prep_parts[5],
         );
+        println!(
+            "RTA L1 NARROW k {k} · run {run} · chips narrow {} · pack {:.3}s · tables {} · cells {} \
+             · bytes {} · host widens {} tables {} cells",
+            if super::wlfm::narrow_chips() {
+                "on"
+            } else {
+                "off"
+            },
+            st.narrow_pack,
+            st.narrow_tables,
+            st.narrow_cells,
+            st.narrow_bytes,
+            r.host_widens.0,
+            r.host_widens.1,
+        );
+        for (g, s) in st.groups.iter().enumerate() {
+            println!(
+                "RTA L1 STAMPS k {k} · run {run} · group {g} · wait A {:.3}s · retire {:.3}s · ood \
+                 {:.3}s · pack {:.3}s · pack busy {:.3}s · packed tables {} · packed cells {} · \
+                 packed bytes {} · open paid {:.3}s · overlapped {}",
+                s.wait_a,
+                s.retire,
+                s.ood,
+                s.pack,
+                s.pack_busy,
+                s.packed_tables,
+                s.packed_cells,
+                s.packed_bytes,
+                s.open_paid,
+                s.overlapped,
+            );
+        }
         for (g, s) in st.groups.iter().enumerate() {
             println!(
                 "RTA L1 GROUP k {k} · run {run} · group {g} · tables {} · polys {} · cells {} · \

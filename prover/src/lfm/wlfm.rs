@@ -297,6 +297,119 @@ fn chunk_log() -> u32 {
     WLFM_CHUNK_LOG
 }
 
+/// `LAMBDA_VM_WLFM_NARROW_CHIPS=1`: the LFM chips' traces packed narrow
+/// ([`multilinear::narrow::NarrowColumns`]) before the prove takes them, so
+/// their columns go up at the bytes their words need and the card widens
+/// them, as the lean tables' do. Off by default; a prover's choice, never the
+/// proof's: the card widens the same words. Read once a process.
+pub const NARROW_CHIPS_ENV: &str = "LAMBDA_VM_WLFM_NARROW_CHIPS";
+
+/// Whether the prove packs the LFM chips narrow: [`NARROW_CHIPS_ENV`], or a
+/// test's override.
+pub fn narrow_chips() -> bool {
+    #[cfg(test)]
+    if let Some(on) = test_format::narrow_chips() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(NARROW_CHIPS_ENV).is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The bytes a word needs: 1, 2, 4 or 8 (`NarrowColumns`' rule).
+fn narrow_width(max: u64) -> u8 {
+    match max {
+        0..=0xff => 1,
+        0x100..=0xffff => 2,
+        0x1_0000..=0xffff_ffff => 4,
+        _ => 8,
+    }
+}
+
+/// Writes `words` into `out` at `w` bytes each, little-endian.
+fn put_narrow(out: &mut [u8], w: usize, words: impl Iterator<Item = u64>) {
+    match w {
+        1 => out.iter_mut().zip(words).for_each(|(o, v)| *o = v as u8),
+        2 => out
+            .chunks_exact_mut(2)
+            .zip(words)
+            .for_each(|(o, v)| o.copy_from_slice(&(v as u16).to_le_bytes())),
+        4 => out
+            .chunks_exact_mut(4)
+            .zip(words)
+            .for_each(|(o, v)| o.copy_from_slice(&(v as u32).to_le_bytes())),
+        _ => out
+            .chunks_exact_mut(8)
+            .zip(words)
+            .for_each(|(o, v)| o.copy_from_slice(&v.to_le_bytes())),
+    }
+}
+
+/// A `width`-wide row-major trace's first `data.len() / width` rows as `rows`
+/// rows of narrow columns (the rows past the data zero): each column at the
+/// bytes its largest canonical word needs, row blocks in parallel, each block
+/// reading its rows once and writing its share of every column.
+pub(crate) fn pack_rows_narrow(
+    data: &[FieldElement<F>],
+    width: usize,
+    rows: usize,
+) -> Result<multilinear::narrow::NarrowColumns, String> {
+    use rayon::prelude::*;
+    const BLOCK: usize = 1 << 12;
+    if width == 0 || !data.len().is_multiple_of(width) || data.len() / width > rows {
+        return Err(format!(
+            "{} cells are not whole rows of {width} within {rows}",
+            data.len()
+        ));
+    }
+    let word = |f: &FieldElement<F>| GoldilocksField::canonical(f.value());
+    let max = data
+        .par_chunks(BLOCK * width)
+        .map(|block| {
+            let mut m = vec![0u64; width];
+            for row in block.chunks_exact(width) {
+                for (m, f) in m.iter_mut().zip(row) {
+                    *m = (*m).max(word(f));
+                }
+            }
+            m
+        })
+        .reduce(
+            || vec![0u64; width],
+            |mut a, b| {
+                a.iter_mut().zip(b).for_each(|(x, y)| *x = (*x).max(y));
+                a
+            },
+        );
+    let widths: Vec<u8> = max.into_iter().map(narrow_width).collect();
+    let total: usize = widths.iter().map(|&w| rows * w as usize).sum();
+    let mut bytes = multilinear::pinned::with_pinned(total, || vec![0u8; total]);
+    let mut by_block: Vec<Vec<&mut [u8]>> = (0..rows.div_ceil(BLOCK))
+        .map(|_| Vec::with_capacity(width))
+        .collect();
+    let mut rest = bytes.as_mut_slice();
+    for &w in &widths {
+        let (column, tail) = rest.split_at_mut(rows * w as usize);
+        rest = tail;
+        for (b, part) in column.chunks_mut(BLOCK * w as usize).enumerate() {
+            by_block[b].push(part);
+        }
+    }
+    let real = data.len() / width;
+    by_block.into_par_iter().enumerate().for_each(|(b, parts)| {
+        let first = (b * BLOCK).min(real);
+        let block = &data[first * width..((b + 1) * BLOCK).min(real) * width];
+        for (c, (out, &w)) in parts.into_iter().zip(&widths).enumerate() {
+            put_narrow(
+                out,
+                w as usize,
+                block.iter().skip(c).step_by(width).map(word),
+            );
+        }
+    });
+    multilinear::narrow::NarrowColumns::from_parts(rows, widths, bytes)
+        .ok_or_else(|| "the narrow parts do not fit".to_string())
+}
+
 /// The stack cap at [`WlfmRate::Sixteen`]: a grouped chain lives on
 /// `H_{n + m + lb}`, and Goldilocks' two-adicity (32) leaves `32 − 4 − 2 = 26`
 /// stacked variables at blowup 16 and the widest index; the default 27 would
@@ -503,8 +616,22 @@ impl WlfmAirs {
         b3l: Option<&'a mut B3lTraces>,
     ) -> Result<Vec<(DynLfmAir<'a>, TableIn<'a>)>, String> {
         let mut pairs: Vec<(DynLfmAir<'a>, TableIn<'a>)> = Vec::new();
+        let narrow = narrow_chips();
         for (i, (air, trace, _)) in self.lfm.air_trace_pairs(traces).into_iter().enumerate() {
             match self.lfm_chunks.get(i) {
+                // Packed narrow by the prove, straight from the rows.
+                Some(chunks) if chunks.len() > 1 && narrow => {
+                    let trace: &'a stark::trace::TraceTable<F, E> = trace;
+                    let (width, height) = (trace.main_table.width, trace.main_table.height);
+                    let data = trace.main_table.row_major_data();
+                    let mut start = 0usize;
+                    for &rows in chunks {
+                        let end = (start + rows).min(height).max(start.min(height));
+                        let cells = &data[start.min(height) * width..end * width];
+                        pairs.push((air, TableIn::Rows { cells, width, rows }));
+                        start += rows;
+                    }
+                }
                 Some(chunks) if chunks.len() > 1 => {
                     // A cut chip: each chunk its own table, transposed straight
                     // out of the row-major trace into its columns (one pass:
@@ -588,6 +715,14 @@ pub enum TableIn<'a> {
     /// A chunk of a cut chip's trace, its columns.
     Columns(Vec<Vec<FieldElement<F>>>),
     Held(&'a mut super::b3l_tables::HeldTable),
+    /// Under [`narrow_chips`]: a chunk of a cut chip, its first
+    /// `cells.len() / width` rows of `rows` (the rest zero), packed narrow by
+    /// the prove.
+    Rows {
+        cells: &'a [FieldElement<F>],
+        width: usize,
+        rows: usize,
+    },
 }
 
 impl TableIn<'_> {
@@ -601,6 +736,7 @@ impl TableIn<'_> {
             TableIn::Wide(t) => (t.main_table.width, t.main_table.height),
             TableIn::Columns(cols) => (cols.len(), cols.first().map_or(0, Vec::len)),
             TableIn::Held(h) => (h.cols(), h.rows()),
+            TableIn::Rows { width, rows, .. } => (*width, *rows),
         }
     }
 
@@ -610,6 +746,10 @@ impl TableIn<'_> {
             TableIn::Wide(t) => *t.main_table.get(r, c),
             TableIn::Columns(cols) => cols[c][r],
             TableIn::Held(h) => h.get(r, c),
+            TableIn::Rows { cells, width, .. } => cells
+                .get(r * width + c)
+                .copied()
+                .unwrap_or_else(FieldElement::zero),
         }
     }
 
@@ -1284,6 +1424,12 @@ pub struct WlfmStamps {
     /// `prep` by part: the merge split back, the AIR set and its shapes, the
     /// trace pairs, the prefix check, the layouts, the committed tables.
     pub prep_parts: [f64; 6],
+    /// Under [`narrow_chips`], the chips packed narrow before the prove takes
+    /// them (left out of `prep`): seconds, tables, cells, packed bytes.
+    pub narrow_pack: f64,
+    pub narrow_tables: usize,
+    pub narrow_cells: usize,
+    pub narrow_bytes: usize,
     pub phase_a: f64,
     pub phase_b: f64,
     pub groups: Vec<multilinear_block::GroupStamps>,
@@ -1356,6 +1502,8 @@ fn prove_traces_under<H: WhirHash>(
         }
     }
     let mut tables: Vec<CommittedTable<'_, F, E>> = Vec::with_capacity(pairs.len());
+    // The chips packed narrow: seconds, tables, cells, packed bytes.
+    let mut narrow = (0f64, 0usize, 0usize, 0usize);
     for (t, ((air, table), &(width, num_vars))) in pairs.into_iter().zip(&shapes).enumerate() {
         let (cols, rows) = table.shape();
         if cols != width || rows != 1usize << num_vars {
@@ -1403,7 +1551,31 @@ fn prove_traces_under<H: WhirHash>(
         let layout = layout_of(air, width, num_vars).map_err(|e| format!("{e:?}"))?;
         parts[4] += t_layout.elapsed().as_secs_f64();
         let t_table = std::time::Instant::now();
+        // Under `narrow_chips`, the chips packed narrow: stamped apart from
+        // the preparation, as the fill's own work.
+        let mut pack_narrow = |cells: &[FieldElement<F>], width: usize, rows: usize| {
+            let t = std::time::Instant::now();
+            let packed = pack_rows_narrow(cells, width, rows);
+            narrow.0 += t.elapsed().as_secs_f64();
+            if let Ok(p) = &packed {
+                narrow.1 += 1;
+                narrow.2 += p.rows() * p.cols();
+                narrow.3 += p.data().len();
+            }
+            packed.map_err(|e| format!("{}: {e}", air.name()))
+        };
         let committed = match table {
+            TableIn::Wide(trace) if narrow_chips() => CommittedTable::from_narrow(
+                layout,
+                pack_narrow(
+                    trace.main_table.row_major_data(),
+                    trace.main_table.width,
+                    trace.main_table.height,
+                )?,
+            ),
+            TableIn::Rows { cells, width, rows } => {
+                CommittedTable::from_narrow(layout, pack_narrow(cells, width, rows)?)
+            }
             // The row-major traces transposed by tiles (`columns_blocked`):
             // each row's cache lines read once, not once a column.
             TableIn::Wide(trace) => {
@@ -1433,7 +1605,8 @@ fn prove_traces_under<H: WhirHash>(
         tables.push(committed.map_err(|e| format!("{}: {e:?}", air.name()))?);
         parts[5] += t_table.elapsed().as_secs_f64();
     }
-    let prep_secs = t_prep.elapsed().as_secs_f64();
+    parts[5] -= narrow.0;
+    let prep_secs = t_prep.elapsed().as_secs_f64() - narrow.0;
     let waited_before = super::device_permit::waited_secs();
     let t_held = std::time::Instant::now();
     // ⛔ THE CARD, for the prove's device phases: the permit the STARK prover
@@ -1519,6 +1692,10 @@ fn prove_traces_under<H: WhirHash>(
         *c.borrow_mut() = Some(WlfmStamps {
             prep: prep_secs,
             prep_parts: parts,
+            narrow_pack: narrow.0,
+            narrow_tables: narrow.1,
+            narrow_cells: narrow.2,
+            narrow_bytes: narrow.3,
             phase_a,
             phase_b,
             groups: group_stamps,
@@ -1898,6 +2075,7 @@ pub(crate) mod test_format {
         static UNGROUND: Cell<bool> = const { Cell::new(false) };
         static QUERIES: Cell<Option<usize>> = const { Cell::new(None) };
         static CHUNK_LOG: Cell<Option<u32>> = const { Cell::new(None) };
+        static NARROW_CHIPS: Cell<Option<bool>> = const { Cell::new(None) };
     }
 
     /// Every W-LFM build on this thread cuts its chips at `2^log` rows until
@@ -1916,6 +2094,24 @@ pub(crate) mod test_format {
 
     pub(super) fn chunk_log() -> Option<u32> {
         CHUNK_LOG.with(Cell::get)
+    }
+
+    /// Every W-LFM prove on this thread packs its chips narrow (`Some(true)`)
+    /// or not until the guard drops.
+    pub(crate) struct NarrowOverride(Option<bool>);
+
+    impl Drop for NarrowOverride {
+        fn drop(&mut self) {
+            NARROW_CHIPS.with(|c| c.set(self.0));
+        }
+    }
+
+    pub(crate) fn set_narrow_chips(on: bool) -> NarrowOverride {
+        NarrowOverride(NARROW_CHIPS.with(|c| c.replace(Some(on))))
+    }
+
+    pub(super) fn narrow_chips() -> Option<bool> {
+        NARROW_CHIPS.with(Cell::get)
     }
 
     /// The override, restored when dropped.
