@@ -901,6 +901,12 @@ impl WhirBlockPlan {
         // A base-only process plans no recursion, over any base
         // (`crate::base_only`).
         crate::base_only::refuse_recursion()?;
+        // The tree's leaves read a page table's columns as PAGE's: a block
+        // under the word memory format, whose pages are PAGE_W's, is no
+        // tree's (its prover refuses every format but the split one).
+        if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
+            return Err("the block tree takes no block under the word memory format".to_string());
+        }
         let wrap_hash = <crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::WRAP;
         Self::derive_under(
             elf_bytes,

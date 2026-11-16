@@ -3735,3 +3735,27 @@ fn the_census_holds_a_stores_new_word_and_the_sets_byte_messages() {
         "{refused:?}"
     );
 }
+
+/// ★ The block tree takes no word-format block: its leaves read a page
+/// table's columns as PAGE's, and the word format's pages are PAGE_W's. A
+/// word-format statement the verifier frames is refused by the tree's plan
+/// with an error, before any leaf would read PAGE_W as PAGE (which asserted).
+#[test]
+fn the_block_tree_refuses_a_word_format_block() {
+    let format = block_whir::BlockFormat::production().with_memory(MemoryFormat::Words);
+    let statement = words_statement(&format, &chip_free_counts(), CPU_WORD_TABLES);
+    frame_of(&statement, &format).expect("the verifier frames it");
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let refused = crate::lfm::whir_block::WhirBlockPlan::derive(
+        &elf,
+        &ProofOptions::default_test_options(),
+        &format,
+        statement.view(),
+        None,
+    );
+    assert!(
+        matches!(&refused, Err(why) if why.contains("word memory format")),
+        "{:?}",
+        refused.err()
+    );
+}
