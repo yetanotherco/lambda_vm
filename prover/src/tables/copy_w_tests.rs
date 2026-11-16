@@ -1395,8 +1395,9 @@ fn a_copy_past_the_top_of_a_low_word_is_refused_by_the_chain() {
 /// ★ A copy whose count is `2^32` or more, which the walk refuses: COPY_W
 /// reads the count register's high word as the constant 0, so a call whose
 /// x12 holds `2^32 + 8` and whose rows copy 8 bytes leaves the count read on
-/// the register bus alone. (The bound rests on that constant, not on a
-/// constraint.)
+/// the register bus alone. (The bound rests on that constant, an in-circuit
+/// value, not on a constraint.) Control: the read's high word taken from a
+/// column (`FIRST`, 1 on the call's row) instead of the constant, accepted.
 #[test]
 fn a_copy_of_2_to_the_32_bytes_or_more_is_refused_by_the_count_read() {
     let mut run = Run::new();
@@ -1419,7 +1420,8 @@ fn a_copy_of_2_to_the_32_bytes_or_more_is_refused_by_the_count_read() {
         .expect("every word is held");
     run.rows.extend(rows);
     run.memw.extend(memw);
-    let v = verdict(&run.bench());
+    let bench = run.bench();
+    let v = verdict(&bench);
     assert!(v.refused_only_on(BusId::Memw), "{v:?}");
     assert!(
         v.left_on(BusId::Memw)
@@ -1427,4 +1429,21 @@ fn a_copy_of_2_to_the_32_bytes_or_more_is_refused_by_the_count_read() {
             .any(|(tuple, _)| tuple.contains(&1)),
         "the count's high word left over: {v:?}"
     );
+    // The x12 read's old and new high words (tuple positions 1 and 12).
+    let mut control = copy_w::bus_interactions();
+    let x12 = control
+        .iter_mut()
+        .find(|bi| {
+            bi.bus_id == u64::from(BusId::Memw) && bi.values.get(9) == Some(&BusValue::constant(24))
+        })
+        .expect("the count register's read");
+    assert_eq!(
+        (&x12.values[1], &x12.values[12]),
+        (&BusValue::constant(0), &BusValue::constant(0)),
+        "the count's high words are the constant 0"
+    );
+    x12.values[1] = column(cw::FIRST);
+    x12.values[12] = column(cw::FIRST);
+    let v = verdict(&bench.with_interactions(copy_w::NAME, control));
+    assert!(v.accepted(), "control: {v:?}");
 }
