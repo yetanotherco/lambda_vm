@@ -2505,6 +2505,39 @@ fn words_counts() -> crate::TableCounts {
     }
 }
 
+/// [`words_counts`] with no chip's table: what a word-format frame takes
+/// while the format takes no chip (`block_whir::chip_tables_under`).
+fn chip_free_counts() -> crate::TableCounts {
+    crate::TableCounts {
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        copy: 0,
+        blake3: 0,
+        is_wh: 0,
+        ecrec: 0,
+        ..words_counts()
+    }
+}
+
+/// One table of each CPU word family and no MEMW_W.
+const CPU_WORD_TABLES: [u64; 7] = [1, 1, 1, 1, 1, 1, 0];
+
+/// [`frame_of`] with the word format's chip refusal taken out: the census
+/// reads every table a word-format set can hold, the chips' and MEMW_W's
+/// included.
+fn frame_with_chips(
+    statement: &block_whir::OwnedBlockStatement,
+    format: &block_whir::BlockFormat,
+) -> Result<block_whir::BlockFrame, crate::Error> {
+    block_whir::CHIP_COUNTS_UNCHECKED.with(|c| c.set(true));
+    let frame = frame_of(statement, format);
+    block_whir::CHIP_COUNTS_UNCHECKED.with(|c| c.set(false));
+    frame
+}
+
 /// A block statement under `format` (its memory format the word one, or any
 /// other to show what that one refuses): `counts`, the fused pair `[0, 0]`,
 /// `words` word tables, one private-input page and the stack's zero page,
@@ -2588,17 +2621,18 @@ pub(super) fn frame_of(
 }
 
 /// The block's AIR set under the word memory format, as the verifier builds it
-/// (`block_frame` of a word-format statement with one table of every family),
-/// under the census: no byte PAGE table, no cross-epoch table, no RAM token on
-/// the byte bus; the word bus PAGE_W's, MEMW_W's and the CPU word tables'
-/// alone; MEMW_W alone receiving word messages; every table's rules (c2–c12).
+/// (`block_frame` of a word-format statement with one table of every family,
+/// the chips' included: [`frame_with_chips`]), under the census: no byte PAGE
+/// table, no cross-epoch table, no RAM token on the byte bus; the word bus
+/// PAGE_W's, MEMW_W's and the CPU word tables' alone; MEMW_W alone receiving
+/// word messages; every table's rules (c2–c12).
 fn word_format_census(registers: crate::tables::register::RegisterFormat) -> Result<(), String> {
     let format = block_whir::BlockFormat {
         registers,
         ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
     };
     let statement = words_statement(&format, &words_counts(), [1; 7]);
-    let frame = frame_of(&statement, &format).map_err(|e| format!("the frame: {e:?}"))?;
+    let frame = frame_with_chips(&statement, &format).map_err(|e| format!("the frame: {e:?}"))?;
     let set = frame.airs.air_refs();
     let mut on_words = BTreeSet::new();
     let mut message_receivers = BTreeSet::new();
@@ -2736,13 +2770,20 @@ fn chip_with_free_message_ts(kind: MessageKind) -> Vec<BusInteraction> {
 /// retires is refused by name (LOAD, STORE, MEMW, MEMW_A, MEM_LOAD,
 /// MEM_STORE); a PAGE_W table stated at `2^16` rows is refused, and so is a
 /// word table past the block's chunk. Each refusal is the rule's own, so a
-/// frame that skipped the rule fails here.
+/// frame that skipped the rule fails here. A chip-free statement frames as it
+/// is; the rules are read on the whole set, every chip's table and MEMW_W
+/// included, with the chip refusal taken out
+/// ([`the_word_format_refuses_every_chip_table`] holds that one).
 #[test]
 fn the_word_format_frame_holds_its_rules() {
     let format = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
     let counts = words_counts();
+    // A chip-free statement frames as it is; the rest reads the whole set,
+    // the chips' tables and MEMW_W included, with the chip refusal out.
+    let chip_free = words_statement(&format, &chip_free_counts(), CPU_WORD_TABLES);
+    frame_of(&chip_free, &format).expect("the chip-free statement frames");
     let honest = words_statement(&format, &counts, [1; 7]);
-    let frame = frame_of(&honest, &format).expect("the honest statement frames");
+    let frame = frame_with_chips(&honest, &format).expect("the honest statement frames");
     let names: Vec<String> = frame
         .airs
         .air_refs()
@@ -2790,7 +2831,7 @@ fn the_word_format_frame_holds_its_rules() {
         }
         let mut statement = words_statement(&format, &retired, [1; 7]);
         statement.fused_memory = fused;
-        let refused = frame_of(&statement, &format);
+        let refused = frame_with_chips(&statement, &format);
         // The fused pair is refused first by the fused tables' own rule
         // under the word format, then by the retired tables' rule.
         let why = if fused == [0, 0] {
@@ -2811,7 +2852,7 @@ fn the_word_format_frame_holds_its_rules() {
         .expect("a PAGE_W table");
     let mut tall = honest.clone();
     tall.table_num_vars[page] = page_w::NUM_VARS as u8 + 1;
-    let refused = frame_of(&tall, &format);
+    let refused = frame_with_chips(&tall, &format);
     assert!(
         matches!(&refused, Err(crate::Error::InvalidTableCounts(why)) if why.contains("a PAGE_W table is 2^15")),
         "{:?}",
@@ -2820,7 +2861,7 @@ fn the_word_format_frame_holds_its_rules() {
     for k in 0..7 {
         let mut tall = honest.clone();
         tall.table_num_vars[first_word + k] = block_whir::BLOCK_WORD_MAX_VARS as u8 + 1;
-        let refused = frame_of(&tall, &format);
+        let refused = frame_with_chips(&tall, &format);
         assert!(
             matches!(&refused, Err(crate::Error::InvalidTableCounts(why)) if why.contains("a block takes at most 2^21")),
             "{}: {:?}",
@@ -2832,9 +2873,77 @@ fn the_word_format_frame_holds_its_rules() {
     let mut short = honest.clone();
     short.word_memory[0] = 2;
     assert!(
-        frame_of(&short, &format).is_err(),
+        frame_with_chips(&short, &format).is_err(),
         "one more MEM_LOAD8 than stated heights"
     );
+}
+
+/// ★ Under the word memory format every chip's table is refused by count,
+/// each by name: KECCAK, KECCAK_RND, IS_WH, BLAKE3, COPY, ECSM, ECDAS, ECREC,
+/// HINT and MEMW_W. A chip-free statement frames; the same statement stating
+/// one table of one chip (its heights carried, the set built with it) is
+/// refused, and with the refusal taken out (a control mutant) it frames, so
+/// the rule alone is what refuses it. Under the split and fused formats the
+/// rule reads nothing.
+#[test]
+fn the_word_format_refuses_every_chip_table() {
+    let format = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
+    let chip_free = chip_free_counts();
+    frame_of(
+        &words_statement(&format, &chip_free, CPU_WORD_TABLES),
+        &format,
+    )
+    .expect("the chip-free statement frames");
+    let names = [
+        "KECCAK",
+        "KECCAK_RND",
+        "IS_WH",
+        "BLAKE3",
+        "COPY",
+        "ECSM",
+        "ECDAS",
+        "ECREC",
+        "HINT",
+        "MEMW_W",
+    ];
+    for table in names {
+        let mut counts = chip_free.clone();
+        let mut words = CPU_WORD_TABLES;
+        match table {
+            "KECCAK" => counts.keccak = 1,
+            "KECCAK_RND" => counts.keccak_rnd = 1,
+            "IS_WH" => counts.is_wh = 1,
+            "BLAKE3" => counts.blake3 = 1,
+            "COPY" => counts.copy = 1,
+            "ECSM" => counts.ecsm = 1,
+            "ECDAS" => counts.ecdas = 1,
+            "ECREC" => counts.ecrec = 1,
+            "HINT" => counts.hint = 1,
+            _ => words[6] = 1,
+        }
+        let statement = words_statement(&format, &counts, words);
+        let refused = frame_of(&statement, &format);
+        assert!(
+            matches!(&refused, Err(crate::Error::InvalidTableCounts(why))
+                if why.contains("takes no chip") && why.contains(&format!("no {table} table"))),
+            "{table}: {:?}",
+            refused.err()
+        );
+        assert!(
+            frame_with_chips(&statement, &format).is_ok(),
+            "{table}: without the refusal it frames"
+        );
+        assert!(
+            block_whir::chip_tables_under(MemoryFormat::Words, &counts, words).is_err(),
+            "{table}"
+        );
+        for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
+            assert!(
+                block_whir::chip_tables_under(memory, &counts, words).is_ok(),
+                "{memory:?} {table}"
+            );
+        }
+    }
 }
 
 /// ★ Under the split and fused formats the word tables' counts are absorbed
@@ -2945,8 +3054,11 @@ fn the_cpu_dispatches_a_range_checked_address() {
             registers,
             ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
         };
-        let frame = frame_of(&words_statement(&format, &words_counts(), [1; 7]), &format)
-            .expect("the frame");
+        let frame = frame_of(
+            &words_statement(&format, &chip_free_counts(), CPU_WORD_TABLES),
+            &format,
+        )
+        .expect("the frame");
         let cpus: Vec<_> = frame
             .airs
             .air_refs()
