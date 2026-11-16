@@ -108,15 +108,22 @@ fn a_split_and_a_fused_proof_are_the_bytes_before_the_word_counts_then_zeros() {
             &[0u8; 56],
             "{memory:?}: the counts, zero"
         );
+        // The comparison's mutant: a proof with one byte moved before the
+        // counts is not the struct before them, the counts still zero.
         let mut moved = proof.clone();
         moved.groups[0][0] ^= 1;
-        let moved_before =
-            rkyv::to_bytes::<rkyv::rancor::Error>(&BeforeWords::of(&moved)).expect("serialize");
-        assert_ne!(
-            &moved_before[..],
-            &before[..],
-            "a moved byte parts the prefix"
+        let moved_now = rkyv::to_bytes::<rkyv::rancor::Error>(&moved).expect("serialize");
+        assert_eq!(
+            moved_now.len(),
+            now.len(),
+            "{memory:?}: the moved proof's length"
         );
+        assert_ne!(
+            &moved_now[..before.len()],
+            &before[..],
+            "{memory:?}: a moved byte parts the prefix"
+        );
+        assert_eq!(&moved_now[before.len()..], &[0u8; 56], "{memory:?}");
     }
 }
 
@@ -154,17 +161,27 @@ fn a_split_or_fused_proof_stating_word_tables_is_refused() {
 }
 
 /// ★ A split or a fused proof does not verify under the word format: the
-/// format is the verifier's constant, and the word format's statement (its
-/// form word and counts, PAGE_W's height) is not theirs.
+/// format is the verifier's constant. Each is refused by the word format's
+/// own rule on what it retires: the split proof states LOAD tables, the fused
+/// one fused tables (both of `fused_mem_cases`).
 #[test]
 fn a_split_or_fused_proof_is_refused_under_the_word_format() {
     let elf = asm_elf_bytes("fused_mem_cases");
-    for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
+    for (memory, why) in [
+        (MemoryFormat::Split, "states no LOAD table"),
+        (MemoryFormat::Fused, "states no fused table"),
+    ] {
         let proof = prove(&elf, &format(memory));
         assert!(verifies(&proof, &elf, &format(memory)));
+        let refused = verify_block_whir(
+            &proof,
+            &elf,
+            &ProofOptions::default_test_options(),
+            &format(MemoryFormat::Words),
+        );
         assert!(
-            !verifies(&proof, &elf, &format(MemoryFormat::Words)),
-            "{memory:?}"
+            matches!(&refused, Err(crate::Error::InvalidTableCounts(w)) if w.contains(why)),
+            "{memory:?}: {refused:?}"
         );
     }
 }
@@ -275,10 +292,23 @@ fn a_word_block_proves_and_verifies() {
         let elf = asm_elf_bytes(name);
         let proof = prove(&elf, &words);
         assert!(verifies(&proof, &elf, &words), "{name}");
+        // Under the split and fused formats the word counts are absorbed
+        // nowhere: refused by that rule (every program here holds a word
+        // table but `all_instructions_64`, which loads and stores nothing).
         for other in [MemoryFormat::Split, MemoryFormat::Fused] {
+            let refused = verify_block_whir(
+                &proof,
+                &elf,
+                &ProofOptions::default_test_options(),
+                &format(other),
+            );
+            let by_rule = matches!(
+                &refused,
+                Err(crate::Error::InvalidTableCounts(w)) if w.contains("states no word table")
+            );
             assert!(
-                !verifies(&proof, &elf, &format(other)),
-                "{name}: refused under {other:?}"
+                by_rule || (proof.word_memory == [0; 7] && !matches!(refused, Ok(true))),
+                "{name}: under {other:?}: {refused:?}"
             );
         }
         let c = &proof.table_counts;
