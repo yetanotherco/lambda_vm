@@ -28,7 +28,10 @@
 //!   ([`super::word_memory::word_check_of`]): it consumes the word's token at
 //!   an earlier timestamp and produces the next at the dispatch's. The key's
 //!   low element is `A_lo − o` (`+ 8` for the second word), `o` the row's
-//!   one-hot `OFF` ([`one_hot_constraints`]), and the high element is `A_hi`.
+//!   one-hot `OFF` ([`one_hot_constraints`]), and the high element is `A_hi`;
+//!   a second word past the last word of a low range is keyed with the carry
+//!   taken into the high word, `(A_lo − o + 8 − 2^32, A_hi + 1)`
+//!   ([`second_word_key`], [`carry_constraints`]).
 //!   Tokens exist only at keys PAGE_W mints, integer multiples of 8 below
 //!   `2^32` (`super::word_memory`); `A_lo` is an integer below `2^32` (the
 //!   CPU's `IS_HALF` on each half of its address); and `o` is in `0..8`. So
@@ -86,8 +89,8 @@ pub(crate) enum WordClass {
 
 /// The class of a `width`-byte access at `address`, or the reason no word
 /// table takes it: a width the CPU never accesses, or a crossing access whose
-/// second word's low address would carry into the high word (no PAGE_W key
-/// has a low word of `2^32`).
+/// second word would wrap past `2^64` to address 0 (a two-word table's carry
+/// keys it at a high word of `2^32`, which no PAGE_W key has).
 pub(crate) fn word_class(address: u64, width: u8) -> Result<WordClass, String> {
     if !matches!(width, 1 | 2 | 4 | 8) {
         return Err(format!("a CPU access is 1, 2, 4 or 8 bytes, not {width}"));
@@ -100,15 +103,24 @@ pub(crate) fn word_class(address: u64, width: u8) -> Result<WordClass, String> {
             WordClass::Within
         });
     }
-    // The last word of a low 32-bit word's range: its next word's low address
-    // would be 2^32.
-    let last_word = !(WORD_BYTES as u32 - 1);
-    if (address as u32) & last_word == last_word {
+    if address - offset == u64::MAX - (WORD_BYTES - 1) {
         return Err(format!(
-            "an access at {address:#x} crosses into the next high word"
+            "an access at {address:#x} crosses past the top of the address space"
         ));
     }
     Ok(WordClass::Crossing)
+}
+
+/// The low word of a low range's last aligned word, `2^32 − 8`: a crossing
+/// access whose first word is there finds its second word at low word 0 of
+/// the next high word ([`second_word_key`]).
+pub(crate) const LAST_WORD_LO: u64 = (1 << 32) - WORD_BYTES;
+
+/// Whether a crossing access at `address` carries into the next high word:
+/// its first word is the last of its low range.
+#[inline]
+pub(crate) fn carries(address: u64) -> bool {
+    (address & 0xFFFF_FFFF) - address % WORD_BYTES == LAST_WORD_LO
 }
 
 /// The dispatch a word table receives at `mu`: the CPU's `MemoryOp` tuple
@@ -152,6 +164,7 @@ pub(crate) fn flags(constant: i64, flags: &[(i64, usize)]) -> BusValue {
 
 /// A word's key `(address_lo − Σ k·OFF_k + 8·word, address_hi)`: the word
 /// `word` (0 or 1) of an access at `address` with the one-hot offset `off`.
+/// The two-word tables key their second word with [`second_word_key`].
 pub(crate) fn word_key(address: [usize; 2], off: [usize; 8], word: i64) -> [BusValue; 2] {
     let mut lo = vec![term(1, address[0])];
     lo.extend((1..8).map(|k| term(-(k as i64), off[k])));
@@ -159,6 +172,45 @@ pub(crate) fn word_key(address: [usize; 2], off: [usize; 8], word: i64) -> [BusV
         lo.push(LinearTerm::Constant(WORD_BYTES as i64 * word));
     }
     [BusValue::linear(lo), column(address[1])]
+}
+
+/// The second word's key of an access across two words, at `address` with the
+/// one-hot offset `off` and the carry `carry`: `(address_lo − Σ k·OFF_k + 8 −
+/// 2^32·CARRY, address_hi + CARRY)`. `CARRY` is a bit that is 1 only on the
+/// last word of a low range ([`carry_constraints`]): there the next word is
+/// low word 0 of the next high word, the address plus 8 with the carry taken
+/// into the high word. A key's low element is a PAGE_W key's, an integer below
+/// `2^32`, only with the carry the address makes (0 there gives `2^32`), so
+/// the word bus refuses a wrong carry as well.
+pub(crate) fn second_word_key(address: [usize; 2], off: [usize; 8], carry: usize) -> [BusValue; 2] {
+    let mut lo = vec![term(1, address[0])];
+    lo.extend((1..8).map(|k| term(-(k as i64), off[k])));
+    lo.push(LinearTerm::Constant(WORD_BYTES as i64));
+    lo.push(term(-(1 << 32), carry));
+    [
+        BusValue::linear(lo),
+        BusValue::linear(vec![term(1, address[1]), term(1, carry)]),
+    ]
+}
+
+/// The carry's two constraints, from index `idx`: `CARRY` a bit, and
+/// `CARRY·(ADDRESS_LO − Σ k·OFF_k − (2^32 − 8)) = 0`, a carry only from the
+/// last word of a low range (degree 2). Returns the next index.
+pub(crate) fn carry_constraints<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &mut B,
+    idx: usize,
+    address_lo: usize,
+    off: [usize; 8],
+    carry: usize,
+) -> usize {
+    let root = bit(b, b.main(0, carry));
+    b.emit_base(idx, root);
+    let first_word = (1..8).fold(b.main(0, address_lo), |acc, k| {
+        acc - b.const_base(k as u64) * b.main(0, off[k])
+    });
+    let root = b.main(0, carry) * (first_word - b.const_base(LAST_WORD_LO));
+    b.emit_base(idx + 1, root);
+    idx + 2
 }
 
 /// An `MSB8` send of `(byte, sign_bit)` at `multiplicity`: `sign_bit` is the

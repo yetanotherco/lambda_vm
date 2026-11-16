@@ -4,17 +4,19 @@
 //!
 //! The row holds both words' sixteen bytes, all checked, and passes each
 //! word's token through, the first at `(ADDRESS_LO − o, ADDRESS_HI)` and the
-//! second at `(ADDRESS_LO − o + 8, ADDRESS_HI)`, each with its own old
-//! timestamp; the access crosses (`o + w > 8`). The result's bytes are the
-//! sixteen from `o`, the width's worth, then LOAD's extension
-//! (`super::word_cpu`).
+//! second at `(ADDRESS_LO − o + 8 − 2^32·CARRY, ADDRESS_HI + CARRY)`, each
+//! with its own old timestamp; the access crosses (`o + w > 8`). `CARRY` is 1
+//! exactly when the first word is the last of its low range, `2^32 − 8`: the
+//! second word is then low word 0 of the next high word
+//! ([`super::word_cpu::second_word_key`]). The result's bytes are the sixteen
+//! from `o`, the width's worth, then LOAD's extension (`super::word_cpu`).
 //!
-//! ## Columns (46)
+//! ## Columns (47)
 //!
 //! `ADDRESS_LO`, `ADDRESS_HI`, `TIMESTAMP`, `OFF[8]`, `READ2`, `READ4`,
 //! `READ8`, `SIGNED`, `BYTES[16]` (the first word's, then the second's),
 //! `RES[8]`, `SIGN_BIT`, `EXT`, `STEP_0`, `STEP_1` (the first word's step),
-//! `STEP2_0`, `STEP2_1` (the second's), `MU`.
+//! `STEP2_0`, `STEP2_1` (the second's), `MU`, `CARRY`.
 //!
 //! ## Interactions (19)
 //!
@@ -25,7 +27,7 @@
 //! - the dispatch at `MU`: `(TIMESTAMP, 0, ADDRESS_LO, ADDRESS_HI, 0, 0,
 //!   2·SIGNED + 4·READ2 + 8·READ4 + 16·READ8, RES as two words)`.
 //!
-//! ## Constraints (33, degree 3)
+//! ## Constraints (35, degree 3)
 //!
 //! - idx 0–8: the one-hot;
 //! - idx 9–12: `READ2`, `READ4`, `READ8`, `SIGNED` bits; 13: exactly one width
@@ -36,7 +38,10 @@
 //!   the width (`j < 2` always, `j < 4` under `READ4 + READ8`, `j < 8` under
 //!   `READ8`);
 //! - idx 25–30: the extension, `RES_j = 255·EXT` for `j` from the width;
-//! - idx 31: `EXT = SIGNED·SIGN_BIT`; 32: `MU` a bit.
+//! - idx 31: `EXT = SIGNED·SIGN_BIT`; 32: `MU` a bit;
+//! - idx 33: `CARRY` a bit; 34: `CARRY·(ADDRESS_LO − Σ k·OFF_k − (2^32 − 8))
+//!   = 0`, a carry only from a low range's last word
+//!   ([`super::word_cpu::carry_constraints`]).
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity};
@@ -46,8 +51,9 @@ use super::bitwise::{BitwiseHistogram, BitwiseOperation, BitwiseOperationType};
 use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{FE, GoldilocksExtension, GoldilocksField, VmTable};
 use super::word_cpu::{
-    FLAG_SIGNED, FLAG_W2, FLAG_W4, FLAG_W8, WordClass, bit, dispatch, flags, limb_lookups,
-    load_result, msb8, one_hot_constraints, pair_lookups, placed, sum, word_class, word_key,
+    FLAG_SIGNED, FLAG_W2, FLAG_W4, FLAG_W8, WordClass, bit, carries, carry_constraints, dispatch,
+    flags, limb_lookups, load_result, msb8, one_hot_constraints, pair_lookups, placed,
+    second_word_key, sum, word_class, word_key,
 };
 use super::word_memory::{
     WORD_BYTES, checked_word, halves, step_less_one, step_limbs, word_check_of, word_of_bytes,
@@ -86,7 +92,10 @@ pub mod cols {
     pub const STEP2_1: usize = 44;
     /// Whether the row is a load.
     pub const MU: usize = 45;
-    pub const NUM_COLUMNS: usize = 46;
+    /// 1 when the first word is the last of its low range: the second word's
+    /// key carries into the high word.
+    pub const CARRY: usize = 46;
+    pub const NUM_COLUMNS: usize = 47;
 }
 
 // =========================================================================
@@ -268,6 +277,7 @@ pub(crate) fn generate_mem_load2w_trace_segments_as(
                 table.set_half(row, c1, d1);
             }
             table.set_fe(row, cols::MU, FE::one());
+            table.set_bool(row, cols::CARRY, carries(r.address));
         }
     })
 }
@@ -286,8 +296,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         (0, [cols::STEP_0, cols::STEP_1]),
         (1, [cols::STEP2_0, cols::STEP2_1]),
     ] {
+        let key = if w == 0 {
+            word_key(address, cols::OFF, 0)
+        } else {
+            second_word_key(address, cols::OFF, cols::CARRY)
+        };
         interactions.extend(word_check_of(
-            word_key(address, cols::OFF, w as i64),
+            key,
             cols::TIMESTAMP,
             words[w].0.clone(),
             words[w].0.clone(),
@@ -334,7 +349,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Constraints
 // =========================================================================
 
-/// MEM_LOAD2W's 33 constraints (module docs).
+/// MEM_LOAD2W's 35 constraints (module docs).
 #[derive(Clone, Copy)]
 pub struct MemLoad2WConstraints;
 
@@ -393,5 +408,6 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemLoad2WConstraint
         b.emit_base(31, root);
         let root = bit(b, b.main(0, cols::MU));
         b.emit_base(32, root);
+        carry_constraints(b, 33, cols::ADDRESS_LO, cols::OFF, cols::CARRY);
     }
 }

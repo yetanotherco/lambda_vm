@@ -453,6 +453,69 @@ pub(super) fn active_rows() -> Vec<(&'static str, Vec<FE>)> {
     ]
 }
 
+// ---- the last word of a low range ----
+
+/// The last word of the low range `[0, 2^32)` and the next word, low word 0 of
+/// high word 1.
+const LAST: u64 = (1 << 32) - 8;
+const NEXT: u64 = 1 << 32;
+/// The two private-input pages around `2^32` (the guest's input crosses it
+/// when it is longer than 16 MiB).
+const BELOW_BASE: u64 = (1 << 32) - DEFAULT_PAGE_SIZE as u64;
+const ABOVE_BASE: u64 = 1 << 32;
+
+fn boundary_pages() -> Vec<PageConfig> {
+    let below: Vec<u8> = (0..DEFAULT_PAGE_SIZE as u32)
+        .map(|i| (i * 89 + 7) as u8)
+        .collect();
+    let above: Vec<u8> = (0..4096u32).map(|i| (i * 53 + 201) as u8).collect();
+    vec![
+        PageConfig::with_private_input(BELOW_BASE, below),
+        PageConfig::with_private_input(ABOVE_BASE, above),
+    ]
+}
+
+/// The program at the line: every width of crossing store and load whose first
+/// word is [`LAST`] (its second word [`NEXT`], the carry 1), signed and
+/// unsigned; the LD at `2^32 − 4` (the large block's) is the last access to
+/// [`NEXT`]; then a crossing LD from `LAST − 8` into [`LAST`] (no carry), the
+/// last access to [`LAST`].
+fn boundary() -> Cpu {
+    let mut c = Cpu::new(boundary_pages());
+    c.load(LAST + 4, 8, false);
+    c.store(LAST + 3, 8, 0xA1A2_A3A4_A5A6_A7A8);
+    c.store(LAST + 6, 4, 0x8899_AABB);
+    c.store(LAST + 7, 2, 0x9988);
+    c.load(LAST + 7, 2, true);
+    c.load(LAST + 7, 2, false);
+    c.load(LAST + 5, 4, true);
+    c.load(LAST + 6, 4, false);
+    c.load(LAST + 1, 8, false);
+    c.load(NEXT + 2, 1, true);
+    c.load(LAST + 4, 8, false);
+    c.load(LAST - 4, 8, false);
+    c
+}
+
+/// One honest row of each two-word table from [`boundary`]'s bench whose
+/// first word is [`LAST`]: an access (`MU = 1`) with the carry 1, breaking no
+/// constraint (the crossing LD's, the crossing SD's). The census's rule c18
+/// reads the carry on it (`word_memory_tests::check_carry`).
+pub(super) fn boundary_rows() -> Vec<(&'static str, Vec<FE>)> {
+    let b = boundary().bench();
+    let pick = |table: &'static str, flag: usize, carry: usize, width: usize| {
+        let t = &b.piece(table).trace;
+        let row = (0..t.num_rows())
+            .find(|&r| *t.get_main(r, flag) == FE::one() && *t.get_main(r, carry) == FE::one())
+            .unwrap_or_else(|| panic!("{table}: a carried access row"));
+        (table, (0..width).map(|c| *t.get_main(row, c)).collect())
+    };
+    vec![
+        pick("MEM_LOAD2W", l2::READ8, l2::CARRY, l2::NUM_COLUMNS),
+        pick("MEM_STORE2W", s2::WRITE8, s2::CARRY, s2::NUM_COLUMNS),
+    ]
+}
+
 /// The row of `table` holding the access at `ts` (its `TIMESTAMP` column).
 fn row_at(bench: &Bench, table: &str, ts_col: usize, ts: u64) -> usize {
     let t = &bench.piece(table).trace;
@@ -576,8 +639,8 @@ fn the_honest_bench_is_accepted() {
 
 /// ★ The tables have the shapes their docs give (interactions, columns,
 /// constraints), and each record refuses the accesses of the others' classes,
-/// a crossing access whose next word would carry into the high word, and a
-/// step the limbs cannot hold.
+/// a crossing access whose next word would wrap past `2^64`, and a step the
+/// limbs cannot hold; a crossing access from a low range's last word is taken.
 #[test]
 fn the_tables_have_their_documented_shapes() {
     let zero = |n: usize| vec![FE::zero(); n];
@@ -625,7 +688,7 @@ fn the_tables_have_their_documented_shapes() {
                 l2::NUM_COLUMNS,
                 load2w_constraints(&zero(l2::NUM_COLUMNS)).len(),
             ),
-            (19, 46, 33),
+            (19, 47, 35),
         ),
         (
             "MEM_STORE2W",
@@ -634,7 +697,7 @@ fn the_tables_have_their_documented_shapes() {
                 s2::NUM_COLUMNS,
                 store2w_constraints(&zero(s2::NUM_COLUMNS)).len(),
             ),
-            (21, 47, 21),
+            (21, 48, 23),
         ),
     ] {
         assert_eq!(got, want, "{name}: (interactions, columns, constraints)");
@@ -652,10 +715,13 @@ fn the_tables_have_their_documented_shapes() {
         StoreWRow::new(S + 3, 8, 4, 3, 0, 0).is_err(),
         "a width of 3"
     );
-    // A crossing access at the top of a low word would key the next word at
-    // a low word of 2^32.
-    assert!(Load2WRow::new(0x1_FFFF_FFFC, 8, [4, 4], 8, false, [0, 0]).is_err());
+    // A crossing access from a low range's last word carries into the next
+    // high word; from the address space's last word it would wrap to 0.
+    assert!(Load2WRow::new(0x1_FFFF_FFFC, 8, [4, 4], 8, false, [0, 0]).is_ok());
     assert!(Load2WRow::new(0x1_FFFF_FFF4, 8, [4, 4], 8, false, [0, 0]).is_ok());
+    assert!(Store2WRow::new(0xFFFF_FFFF, 8, [4, 4], 2, 0, [0, 0]).is_ok());
+    assert!(Load2WRow::new(u64::MAX - 3, 8, [4, 4], 8, false, [0, 0]).is_err());
+    assert!(Store2WRow::new(u64::MAX, 8, [4, 4], 2, 0, [0, 0]).is_err());
     // A token not earlier, or a step past 2^32.
     assert!(Load8Row::new(S, 8, 8, 0).is_err());
     assert!(StoreWRow::new(S + 1, 1 << 40, 0, 1, 0, 0).is_err());

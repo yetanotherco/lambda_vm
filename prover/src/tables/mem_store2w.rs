@@ -5,15 +5,17 @@
 //! The row holds both words' sixteen old bytes and the register's eight bytes,
 //! all checked; it consumes each old word's token and produces the new word's,
 //! the first at `(ADDRESS_LO − o, ADDRESS_HI)` and the second at
-//! `(ADDRESS_LO − o + 8, ADDRESS_HI)`, each with its own old timestamp. The new
-//! words are the old ones with bytes `o..o + w` of the sixteen replaced by the
+//! `(ADDRESS_LO − o + 8 − 2^32·CARRY, ADDRESS_HI + CARRY)`, each with its own
+//! old timestamp. `CARRY` is 1 exactly when the first word is the last of its
+//! low range, `2^32 − 8` ([`super::word_cpu::second_word_key`]). The new words
+//! are the old ones with bytes `o..o + w` of the sixteen replaced by the
 //! register's (`super::word_cpu`).
 //!
-//! ## Columns (47)
+//! ## Columns (48)
 //!
 //! `ADDRESS_LO`, `ADDRESS_HI`, `TIMESTAMP`, `OFF[8]`, `WRITE2`, `WRITE4`,
 //! `WRITE8`, `OLD[16]`, `VALUE[8]`, `NEW1_LO`, `NEW1_HI`, `NEW2_LO`,
-//! `NEW2_HI`, `STEP_0`, `STEP_1`, `STEP2_0`, `STEP2_1`, `MU`.
+//! `NEW2_HI`, `STEP_0`, `STEP_1`, `STEP2_0`, `STEP2_1`, `MU`, `CARRY`.
 //!
 //! ## Interactions (21)
 //!
@@ -23,14 +25,17 @@
 //! - the dispatch at `MU`: `(TIMESTAMP, 0, ADDRESS_LO, ADDRESS_HI, VALUE as
 //!   two words, 1 + 4·WRITE2 + 8·WRITE4 + 16·WRITE8, 0, 0)`.
 //!
-//! ## Constraints (21, degree 3)
+//! ## Constraints (23, degree 3)
 //!
 //! - idx 0–8: the one-hot;
 //! - idx 9–11: `WRITE2`, `WRITE4`, `WRITE8` bits; 12: their sum `MU`;
 //! - idx 13–15: the access crosses;
 //! - idx 16–19: the four new halves, the old ones with byte `o + j` replaced
 //!   by `VALUE_j` for `j` below the width;
-//! - idx 20: `MU` a bit.
+//! - idx 20: `MU` a bit;
+//! - idx 21: `CARRY` a bit; 22: `CARRY·(ADDRESS_LO − Σ k·OFF_k − (2^32 − 8))
+//!   = 0`, a carry only from a low range's last word
+//!   ([`super::word_cpu::carry_constraints`]).
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity};
@@ -40,8 +45,9 @@ use super::bitwise::{BitwiseHistogram, BitwiseOperation};
 use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{FE, GoldilocksExtension, GoldilocksField, VmTable};
 use super::word_cpu::{
-    FLAG_STORE, FLAG_W2, FLAG_W4, FLAG_W8, WordClass, bit, dispatch, flags, limb_lookups,
-    one_hot_constraints, pair_lookups, store_into, stored_half, sum, word_class, word_key,
+    FLAG_STORE, FLAG_W2, FLAG_W4, FLAG_W8, WordClass, bit, carries, carry_constraints, dispatch,
+    flags, limb_lookups, one_hot_constraints, pair_lookups, second_word_key, store_into,
+    stored_half, sum, word_class, word_key,
 };
 use super::word_memory::{
     WORD_BYTES, byte_pair_checks, checked_word, column, halves, step_less_one, step_limbs,
@@ -81,7 +87,10 @@ pub mod cols {
     pub const STEP2_1: usize = 45;
     /// Whether the row is a store.
     pub const MU: usize = 46;
-    pub const NUM_COLUMNS: usize = 47;
+    /// 1 when the first word is the last of its low range: the second word's
+    /// key carries into the high word.
+    pub const CARRY: usize = 47;
+    pub const NUM_COLUMNS: usize = 48;
 }
 
 // =========================================================================
@@ -263,6 +272,7 @@ pub(crate) fn generate_mem_store2w_trace_segments_as(
                 table.set_half(row, c1, d1);
             }
             table.set_fe(row, cols::MU, FE::one());
+            table.set_bool(row, cols::CARRY, carries(r.address));
         }
     })
 }
@@ -289,8 +299,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             [cols::STEP2_0, cols::STEP2_1],
         ),
     ] {
+        let key = if w == 0 {
+            word_key(address, cols::OFF, 0)
+        } else {
+            second_word_key(address, cols::OFF, cols::CARRY)
+        };
         interactions.extend(word_check_of(
-            word_key(address, cols::OFF, w as i64),
+            key,
             cols::TIMESTAMP,
             words[w].0.clone(),
             [column(new[0]), column(new[1])],
@@ -330,7 +345,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Constraints
 // =========================================================================
 
-/// MEM_STORE2W's 21 constraints (module docs).
+/// MEM_STORE2W's 23 constraints (module docs).
 #[derive(Clone, Copy)]
 pub struct MemStore2WConstraints;
 
@@ -381,5 +396,6 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemStore2WConstrain
         }
         let root = bit(b, b.main(0, cols::MU));
         b.emit_base(20, root);
+        carry_constraints(b, 21, cols::ADDRESS_LO, cols::OFF, cols::CARRY);
     }
 }
