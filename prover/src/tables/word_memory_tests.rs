@@ -41,13 +41,13 @@ use super::word_memory::{
 use crate::block_whir;
 use crate::tables::fused_memory::MemoryFormat;
 
-type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
+pub(super) type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
 /// A table's constraints evaluated on one row.
-type Eval = fn(&[FE]) -> Vec<FE>;
+pub(super) type Eval = fn(&[FE]) -> Vec<FE>;
 
 /// The field's order: `−k` reads as `P − k`.
-const P: u64 = 0xFFFF_FFFF_0000_0001;
+pub(super) const P: u64 = 0xFFFF_FFFF_0000_0001;
 
 /// The register the stand-in chips read their pointer from (HINT's `out`).
 const CHIP_REG: u64 = 12;
@@ -56,50 +56,54 @@ const CHIP_REG: u64 = 12;
 
 /// One table of a bench.
 #[derive(Clone)]
-struct Piece {
-    name: String,
-    interactions: Vec<BusInteraction>,
-    trace: Table,
+pub(super) struct Piece {
+    pub(super) name: String,
+    pub(super) interactions: Vec<BusInteraction>,
+    pub(super) trace: Table,
     /// The verifier's own values of the table's preprocessed prefix.
-    preprocessed: Vec<Vec<FE>>,
+    pub(super) preprocessed: Vec<Vec<FE>>,
     /// The table's constraints on one row.
-    constraints: Option<Eval>,
+    pub(super) constraints: Option<Eval>,
 }
 
 #[derive(Clone, Default)]
-struct Bench {
-    pieces: Vec<Piece>,
+pub(super) struct Bench {
+    pub(super) pieces: Vec<Piece>,
 }
 
 impl Bench {
-    fn piece(&self, name: &str) -> &Piece {
+    pub(super) fn piece(&self, name: &str) -> &Piece {
         self.pieces
             .iter()
             .find(|p| p.name == name)
             .unwrap_or_else(|| panic!("the bench holds {name}"))
     }
 
-    fn piece_mut(&mut self, name: &str) -> &mut Piece {
+    pub(super) fn piece_mut(&mut self, name: &str) -> &mut Piece {
         self.pieces
             .iter_mut()
             .find(|p| p.name == name)
             .unwrap_or_else(|| panic!("the bench holds {name}"))
     }
 
-    fn get(&self, name: &str, row: usize, col: usize) -> FE {
+    pub(super) fn get(&self, name: &str, row: usize, col: usize) -> FE {
         *self.piece(name).trace.get_main(row, col)
     }
 
-    fn set(&mut self, name: &str, row: usize, col: usize, value: FE) {
+    pub(super) fn set(&mut self, name: &str, row: usize, col: usize, value: FE) {
         self.piece_mut(name).trace.main_table.set(row, col, value);
     }
 
-    fn set_u64(&mut self, name: &str, row: usize, col: usize, value: u64) {
+    pub(super) fn set_u64(&mut self, name: &str, row: usize, col: usize, value: u64) {
         self.set(name, row, col, FE::from(value));
     }
 
     /// `name`'s interactions replaced by `interactions`: a control mutant.
-    fn with_interactions(mut self, name: &str, interactions: Vec<BusInteraction>) -> Self {
+    pub(super) fn with_interactions(
+        mut self,
+        name: &str,
+        interactions: Vec<BusInteraction>,
+    ) -> Self {
         self.piece_mut(name).interactions = interactions;
         self
     }
@@ -119,33 +123,33 @@ impl Bench {
 
 /// What a verifier would refuse a bench for.
 #[derive(Debug, Default)]
-struct Verdict {
+pub(super) struct Verdict {
     /// Per bus, the tuples whose net is not zero (trailing zeros stripped).
-    left: BTreeMap<u64, Vec<(Vec<u64>, i128)>>,
+    pub(super) left: BTreeMap<u64, Vec<(Vec<u64>, i128)>>,
     /// Lookups no BITWISE row answers: `(bus, tuple)`.
-    unanswered: Vec<(u64, Vec<u64>)>,
+    pub(super) unanswered: Vec<(u64, Vec<u64>)>,
     /// `(table, row, constraint)` that does not read zero.
-    broken: Vec<(String, usize, usize)>,
+    pub(super) broken: Vec<(String, usize, usize)>,
     /// `(table, row, column)` whose preprocessed value is not the verifier's.
-    preprocessed: Vec<(String, usize, usize)>,
+    pub(super) preprocessed: Vec<(String, usize, usize)>,
 }
 
 impl Verdict {
-    fn accepted(&self) -> bool {
+    pub(super) fn accepted(&self) -> bool {
         self.left.is_empty()
             && self.unanswered.is_empty()
             && self.broken.is_empty()
             && self.preprocessed.is_empty()
     }
 
-    fn left_on(&self, bus: BusId) -> &[(Vec<u64>, i128)] {
+    pub(super) fn left_on(&self, bus: BusId) -> &[(Vec<u64>, i128)] {
         self.left
             .get(&u64::from(bus))
             .map_or(&[][..], |v| v.as_slice())
     }
 
     /// Only `bus` is unbalanced, and nothing else is refused.
-    fn refused_only_on(&self, bus: BusId) -> bool {
+    pub(super) fn refused_only_on(&self, bus: BusId) -> bool {
         self.left.keys().all(|&b| b == u64::from(bus))
             && !self.left_on(bus).is_empty()
             && self.unanswered.is_empty()
@@ -154,7 +158,7 @@ impl Verdict {
     }
 }
 
-fn multiplicity(m: &Multiplicity, g: &dyn Fn(usize) -> FE) -> FE {
+pub(super) fn multiplicity(m: &Multiplicity, g: &dyn Fn(usize) -> FE) -> FE {
     let linear = |terms: &[LinearTerm]| {
         terms.iter().fold(FE::zero(), |acc, t| match *t {
             LinearTerm::Column {
@@ -186,12 +190,15 @@ fn answered(bus: u64, tuple: &[u64]) -> bool {
         tuple.len() <= 1 && at(0) < 1 << 16
     } else if bus == u64::from(BusId::AreBytes) {
         tuple.len() <= 2 && at(0) < 256 && at(1) < 256
+    } else if bus == u64::from(BusId::Msb8) {
+        // `(byte, its top bit)`.
+        tuple.len() <= 2 && at(0) < 256 && at(1) == at(0) >> 7
     } else {
         false
     }
 }
 
-const LOOKUPS: [BusId; 2] = [BusId::IsHalfword, BusId::AreBytes];
+const LOOKUPS: [BusId; 3] = [BusId::IsHalfword, BusId::AreBytes, BusId::Msb8];
 
 fn signed(v: FE) -> i128 {
     let v = v.canonical_u64();
@@ -202,7 +209,7 @@ fn signed(v: FE) -> i128 {
     }
 }
 
-fn verdict(bench: &Bench) -> Verdict {
+pub(super) fn verdict(bench: &Bench) -> Verdict {
     let mut net: HashMap<(u64, Vec<u64>), FE> = HashMap::new();
     let mut out = Verdict::default();
     for piece in &bench.pieces {
@@ -266,7 +273,7 @@ fn row_of(t: &Table, r: usize) -> Vec<FE> {
 }
 
 /// A constraint set's values on one row.
-fn constraint_values<CS: ConstraintSet<GoldilocksField, GoldilocksExtension>>(
+pub(super) fn constraint_values<CS: ConstraintSet<GoldilocksField, GoldilocksExtension>>(
     set: &CS,
     row: &[FE],
 ) -> Vec<FE> {
@@ -297,7 +304,7 @@ fn memw_w_constraints(row: &[FE]) -> Vec<FE> {
 
 /// A wide table of `rows` (padded with zero rows to a power of two, at least
 /// four) and `width` columns, `fill` writing each row.
-fn table(rows: usize, width: usize, fill: impl Fn(&mut Table, usize)) -> Table {
+pub(super) fn table(rows: usize, width: usize, fill: impl Fn(&mut Table, usize)) -> Table {
     let num_rows = rows.next_power_of_two().max(4);
     let mut t = TraceTable::new_main(vec![FE::zero(); num_rows * width], width, 1);
     for row in 0..rows {
@@ -307,7 +314,7 @@ fn table(rows: usize, width: usize, fill: impl Fn(&mut Table, usize)) -> Table {
 }
 
 /// `t` with `extra` zero columns appended.
-fn widen(t: &Table, extra: usize) -> Table {
+pub(super) fn widen(t: &Table, extra: usize) -> Table {
     let width = t.main_table.width + extra;
     let mut w = TraceTable::new_main(vec![FE::zero(); t.num_rows() * width], width, 1);
     for row in 0..t.num_rows() {
@@ -430,7 +437,7 @@ struct RegRow {
 
 /// The pages of the honest benches: a zero page at 0, an ELF page, a
 /// private-input page and the top stack page (high word `0xFFFFFFFF`).
-fn pages() -> Vec<PageConfig> {
+pub(super) fn pages() -> Vec<PageConfig> {
     let elf: Vec<u8> = (0..4096u32).map(|i| (i * 37 + 11) as u8).collect();
     let input: Vec<u8> = (0..4096u32).map(|i| (i * 101 + 3) as u8).collect();
     vec![
@@ -441,9 +448,9 @@ fn pages() -> Vec<PageConfig> {
     ]
 }
 
-const ELF_BASE: u64 = 0x40000;
-const STACK_BASE: u64 = 0xFFFF_FFFF_FFFC_0000;
-const INPUT_BASE: u64 = executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+pub(super) const ELF_BASE: u64 = 0x40000;
+pub(super) const STACK_BASE: u64 = 0xFFFF_FFFF_FFFC_0000;
+pub(super) const INPUT_BASE: u64 = executor::vm::memory::PRIVATE_INPUT_START_INDEX;
 
 /// Words in memory as the honest accesses leave them, and the rows they make.
 struct Model {
@@ -591,11 +598,11 @@ impl Model {
     }
 }
 
-fn page_name(base: u64) -> String {
+pub(super) fn page_name(base: u64) -> String {
     format!("{}{base:#x}", page_w::NAME_PREFIX)
 }
 
-fn page_piece(config: &PageConfig, words: &FinalWordMap) -> Piece {
+pub(super) fn page_piece(config: &PageConfig, words: &FinalWordMap) -> Piece {
     Piece {
         name: page_name(config.page_base),
         interactions: page_w::bus_interactions(config.page_base, config.is_private_input)
@@ -1031,13 +1038,13 @@ fn a_byte_past_255_is_refused_by_its_pair() {
     // the test's own.
     let bus = 1000u64;
     let split = {
-        let mut i = byte_pair_checks(BYTES, Multiplicity::Column(MU));
+        let mut i = byte_pair_checks(&BYTES, Multiplicity::Column(MU));
         i.push(BusInteraction::sender(
             bus,
             Multiplicity::Column(MU),
             vec![
-                word_of_bytes([0, 1, 2, 3]),
-                word_of_bytes([4, 5, 6, 7]),
+                word_of_bytes(&[0, 1, 2, 3]),
+                word_of_bytes(&[4, 5, 6, 7]),
                 column(BYTES[1]),
             ],
         ));

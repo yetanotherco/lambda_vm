@@ -155,15 +155,36 @@ pub(crate) struct WordCheck {
 /// at `(address, timestamp, new)`. The two tokens share the key expression and
 /// the multiplicity, so a row moves a token and never mints one.
 pub(crate) fn word_check_interactions(c: &WordCheck, mu: Multiplicity) -> Vec<BusInteraction> {
-    let address = || [column(c.address[0]), column(c.address[1])];
+    word_check_of(
+        [column(c.address[0]), column(c.address[1])],
+        c.timestamp,
+        [column(c.old[0]), column(c.old[1])],
+        [column(c.new[0]), column(c.new[1])],
+        c.step,
+        mu,
+    )
+}
+
+/// [`word_check_interactions`] over expressions: the key `address`, the
+/// consumed word `old` and the produced word `new` each any linear form (a
+/// CPU word table's key is its dispatched address less a one-hot offset, and
+/// its words are byte sums), the timestamp and the limbs columns.
+pub(crate) fn word_check_of(
+    address: [BusValue; 2],
+    timestamp: usize,
+    old: [BusValue; 2],
+    new: [BusValue; 2],
+    step: [usize; 2],
+    mu: Multiplicity,
+) -> Vec<BusInteraction> {
     let old_timestamp = BusValue::linear(vec![
-        term(1, c.timestamp),
-        term(-1, c.step[0]),
-        term(-(1 << 16), c.step[1]),
+        term(1, timestamp),
+        term(-1, step[0]),
+        term(-(1 << 16), step[1]),
         LinearTerm::Constant(-1),
     ]);
     let mut interactions = Vec::with_capacity(4);
-    for limb in c.step {
+    for limb in step {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
             mu.clone(),
@@ -173,20 +194,12 @@ pub(crate) fn word_check_interactions(c: &WordCheck, mu: Multiplicity) -> Vec<Bu
     interactions.push(BusInteraction::sender(
         BusId::MemWord,
         mu.clone(),
-        token(
-            address(),
-            old_timestamp,
-            [column(c.old[0]), column(c.old[1])],
-        ),
+        token(address.clone(), old_timestamp, old),
     ));
     interactions.push(BusInteraction::receiver(
         BusId::MemWord,
         mu,
-        token(
-            address(),
-            column(c.timestamp),
-            [column(c.new[0]), column(c.new[1])],
-        ),
+        token(address, column(timestamp), new),
     ));
     interactions
 }
@@ -215,8 +228,8 @@ pub(crate) fn step_limbs(step: u32) -> (u16, u16) {
 
 /// A word's half from four byte columns, little-endian:
 /// `b[0] + 2^8·b[1] + 2^16·b[2] + 2^24·b[3]`.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn word_of_bytes(bytes: [usize; 4]) -> BusValue {
+pub(crate) fn word_of_bytes(bytes: &[usize]) -> BusValue {
+    debug_assert_eq!(bytes.len(), 4, "a half is four bytes");
     BusValue::linear(
         bytes
             .iter()
@@ -226,10 +239,11 @@ pub(crate) fn word_of_bytes(bytes: [usize; 4]) -> BusValue {
     )
 }
 
-/// `ARE_BYTES` on a word's eight byte columns, two a lookup, all at `mu`:
-/// with all eight bytes checked, their sum is the word's one decomposition.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn byte_pair_checks(bytes: [usize; 8], mu: Multiplicity) -> Vec<BusInteraction> {
+/// `ARE_BYTES` on byte columns (an even count: a word's eight, or a
+/// register's bytes a table places), two a lookup, all at `mu`: with all eight
+/// of a word's bytes checked, their sum is the word's one decomposition.
+pub(crate) fn byte_pair_checks(bytes: &[usize], mu: Multiplicity) -> Vec<BusInteraction> {
+    debug_assert!(bytes.len().is_multiple_of(2), "bytes in pairs");
     bytes
         .chunks_exact(2)
         .map(|pair| {

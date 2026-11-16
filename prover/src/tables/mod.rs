@@ -18,6 +18,8 @@
 //! - **MEMW_A**: Memory word read/write table (aligned fast path, 29 cols, 20 interactions)
 //! - **LOAD**: Memory load with extension table
 //! - **MEM_LOAD**, **MEM_STORE**: a CPU load or store checked in one row with its memory tokens (the fused memory format)
+//! - **MEM_LOAD8**, **MEM_STORE8**, **MEM_LOADW**, **MEM_STOREW**, **MEM_LOAD2W**, **MEM_STORE2W**: a CPU load or store checked in one row with its words' tokens, by the words it touches (the word memory format, `word_cpu`)
+//! - **PAGE_W**, **MEMW_W**: a page's words' first and last tokens, and a chip's word access (the word memory format)
 //! - **PAGE**: Paged memory init/final table (one per used page)
 //! - **REGISTER**: Register init/final table for x0-x31, x254, and x255 word addresses
 
@@ -58,7 +60,13 @@ pub(crate) mod mem_card;
 #[cfg(all(test, feature = "cuda", feature = "parallel"))]
 mod mem_card_tests;
 pub mod mem_load;
+pub mod mem_load2w;
+pub mod mem_load8;
+pub mod mem_loadw;
 pub mod mem_store;
+pub mod mem_store2w;
+pub mod mem_store8;
+pub mod mem_storew;
 pub mod memw;
 pub mod memw_aligned;
 pub mod memw_register;
@@ -72,6 +80,9 @@ pub mod shift;
 pub mod store;
 pub mod trace_builder;
 pub mod trace_hash;
+pub mod word_cpu;
+#[cfg(test)]
+mod word_cpu_tests;
 pub mod word_memory;
 #[cfg(test)]
 mod word_memory_tests;
