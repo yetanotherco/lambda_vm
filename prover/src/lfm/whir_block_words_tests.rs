@@ -37,7 +37,9 @@ use super::super::whir_epoch::{emit_preprocessed_leg, preprocessed_targets};
 use super::super::whir_table::TableVerdictWires;
 use super::super::word::ext_word;
 use super::route_faults::{self, Fault};
-use super::{DynAir, LeafScale, Route, Shapes, WhirBlockPlan};
+use super::{
+    DECODE_NAME, DynAir, KECCAK_RC_NAME, LeafScale, REGISTER_NAME, Route, Shapes, WhirBlockPlan,
+};
 use super::{check_route_columns, page_columns, preprocessed_plan};
 
 /// A fixed-seed xorshift, so a failure names one reproducible value.
@@ -2143,4 +2145,100 @@ fn the_word_and_fused_leaves_are_pinned() {
         route_faults::with(Fault::NoCountCheck, || leaf_digests(&words, &owned, false))
     });
     assert_ne!(moved.0, digests, "the pin sees the page leg");
+}
+
+/// ★ Each fixed or prepared table stated off its columns' height, one at a
+/// time, is refused by the plan's route check naming that table: DECODE (on
+/// the prepared opening) by its opened columns' height, KECCAK_RC and
+/// REGISTER (folded constants) by their folded columns'. One table moves at a
+/// time, so each refusal is the one check's: with that check taken out, the
+/// plan's probe of the moved table asserts instead and the plan is refused
+/// with another error ("probe never ran"), which this test would not accept.
+/// (The checks' controls themselves are the unit test's,
+/// [`every_route_mutant_is_refused_by_its_named_check`]: the probes run on
+/// threads of their own, which the test faults do not reach.)
+#[test]
+fn each_fixed_or_prepared_table_off_its_height_is_refused_by_name() {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let format = p1_format(MemoryFormat::Words, LeafScale::DoubledOneTop);
+    let opts = super::super::proof::block_base_options_under(&format.zf);
+    let honest = mix_statement(elf, &opts, &format, SMALL_WORDS, 2, 1);
+    let plan =
+        WhirBlockPlan::derive(elf, &opts, &format, honest.view(), None).expect("the honest plan");
+    let names: Vec<String> = plan
+        .frame
+        .airs
+        .air_refs()
+        .iter()
+        .map(|a| a.name().to_string())
+        .collect();
+    for (name, check) in [
+        (DECODE_NAME, "prepared columns are"),
+        (KECCAK_RC_NAME, "route's columns are"),
+        (REGISTER_NAME, "route's columns are"),
+    ] {
+        let t = names.iter().position(|n| n == name).expect("a fixed table");
+        let mut moved = honest.clone();
+        moved.table_num_vars[t] = 2;
+        assert_ne!(
+            moved.table_num_vars[t], honest.table_num_vars[t],
+            "{name} moves"
+        );
+        let refused = WhirBlockPlan::derive(elf, &opts, &format, moved.view(), None)
+            .err()
+            .unwrap_or_else(|| panic!("{name} at 2^2 rows is refused"));
+        assert!(
+            refused.contains(&format!(
+                "table {t} ({name}) states 2^2 rows and its {check}"
+            )),
+            "{name}: {refused}"
+        );
+    }
+}
+
+/// ★ Every source file that names the `test_ecrec` program also takes the
+/// ECREC forgery lock (`trace_builder::ecrec_forge_free`, or the lock
+/// itself): a test that runs `test_ecrec` beside the forging test without it
+/// builds the forged call, and its block does not verify. A source check, so
+/// a test added later without the lock fails here rather than now and then
+/// in a threaded whole-library run.
+#[test]
+fn every_test_file_naming_test_ecrec_holds_the_forgery_lock() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("a source directory") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    let naming: Vec<_> = files
+        .iter()
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(path).expect("a source file");
+            text.contains("\"test_ecrec\"").then_some((path, text))
+        })
+        .collect();
+    assert!(naming.len() >= 10, "{} files name test_ecrec", naming.len());
+    let unlocked: Vec<String> = naming
+        .iter()
+        .filter(|(_, text)| {
+            !text.contains("ecrec_forge_free") && !text.contains("ECREC_FORGE_TEST_LOCK")
+        })
+        .map(|(path, _)| {
+            path.strip_prefix(&root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        unlocked.is_empty(),
+        "these files run test_ecrec without the ECREC forgery lock: {unlocked:?}"
+    );
 }
