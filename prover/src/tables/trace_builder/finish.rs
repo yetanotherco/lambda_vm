@@ -132,7 +132,7 @@ impl LtLists {
 /// first `skip` of them streamed ahead: [`chunk_and_generate_skipping`]'s and
 /// [`chunk_and_generate_segmented`]'s count (`tails`: the list holds only the
 /// ops past the streamed chunks; `optional`: an empty list makes no table).
-fn chunked(
+pub(super) fn chunked(
     len: usize,
     max: usize,
     skip: usize,
@@ -1358,12 +1358,14 @@ impl<'a> FinishPlan<'a> {
                 true,
             )?,
         ];
-        // The word tables, the finish's alone (none streams), each family cut
-        // at the fused tables' rows.
+        // The word tables, each family cut at the fused tables' rows, those the
+        // walk streamed ([`super::StreamSkip::words`]) first.
         let word_counts = super::word_walk::word_table_counts(
             &word_rows,
             super::word_walk::word_max_rows(max_rows),
-        );
+            skip.words,
+            tails,
+        )?;
         if cpu_heights.len() != table_counts.cpu {
             return Err(Error::InvalidTableCounts(format!(
                 "{} CPU heights for {} CPU tables",
@@ -1963,14 +1965,11 @@ impl<'a> FinishPlan<'a> {
             super::word_walk::word_tables(
                 &word_rows,
                 super::word_walk::word_max_rows(max_rows),
+                skip.words,
+                skip.tails,
+                |t| packed_if(pack, t),
                 form,
             )
-            .map(|tables| {
-                tables
-                    .into_iter()
-                    .map(|t| packed_if(pack, t))
-                    .collect::<Vec<_>>()
-            })
         };
         let gen_register = || {
             packed_if(
@@ -2177,7 +2176,7 @@ impl<'a> FinishPlan<'a> {
         let mem_loads = mem_loads_slot.expect(PHASE5_RAN)?;
         let mem_stores = mem_stores_slot.expect(PHASE5_RAN)?;
         let [load8s, store8s, loadws, storews, load2ws, store2ws, memw_ws] =
-            word_tables_slot.expect(PHASE5_RAN);
+            word_tables_slot.expect(PHASE5_RAN)?;
         // IS_WH: one table of its rows, none when nothing sent `IS_WH`.
         let is_whs = generate_optional(&is_wh_rows, packed_by(pack, is_wh::generate_is_wh_trace))?;
 
@@ -3168,7 +3167,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         // The word memory format's word tables (none under any other): the
         // CPU's six and MEMW_W, after the fused tables' place in AIR order;
-        // the finish's alone.
+        // those the walk streamed first ([`super::StreamSkip::words`]).
         {
             use super::super::{
                 mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew,
@@ -3188,8 +3187,8 @@ impl<'a> FinishPlan<'a> {
                 family("MEM_LOAD8"),
                 Arc::new(load8),
                 caps[0],
-                0,
-                false,
+                skip.words[0],
+                tails,
                 true,
                 move |rows: &[mem_load8::Load8Row]| {
                     packed_if(
@@ -3202,8 +3201,8 @@ impl<'a> FinishPlan<'a> {
                 family("MEM_STORE8"),
                 Arc::new(store8),
                 caps[1],
-                0,
-                false,
+                skip.words[1],
+                tails,
                 true,
                 move |rows: &[mem_store8::Store8Row]| {
                     packed_if(
@@ -3216,8 +3215,8 @@ impl<'a> FinishPlan<'a> {
                 family("MEM_LOADW"),
                 Arc::new(loadw),
                 caps[2],
-                0,
-                false,
+                skip.words[2],
+                tails,
                 true,
                 move |rows: &[mem_loadw::LoadWRow]| {
                     packed_if(
@@ -3230,8 +3229,8 @@ impl<'a> FinishPlan<'a> {
                 family("MEM_STOREW"),
                 Arc::new(storew),
                 caps[3],
-                0,
-                false,
+                skip.words[3],
+                tails,
                 true,
                 move |rows: &[mem_storew::StoreWRow]| {
                     packed_if(
@@ -3244,8 +3243,8 @@ impl<'a> FinishPlan<'a> {
                 family("MEM_LOAD2W"),
                 Arc::new(load2w),
                 caps[4],
-                0,
-                false,
+                skip.words[4],
+                tails,
                 true,
                 move |rows: &[mem_load2w::Load2WRow]| {
                     packed_if(
@@ -3258,8 +3257,8 @@ impl<'a> FinishPlan<'a> {
                 family("MEM_STORE2W"),
                 Arc::new(store2w),
                 caps[5],
-                0,
-                false,
+                skip.words[5],
+                tails,
                 true,
                 move |rows: &[mem_store2w::Store2WRow]| {
                     packed_if(
@@ -3272,8 +3271,8 @@ impl<'a> FinishPlan<'a> {
                 family("MEMW_W"),
                 Arc::new(memw),
                 caps[6],
-                0,
-                false,
+                skip.words[6],
+                tails,
                 true,
                 move |rows: &[super::super::memw_w::MemwWordRow]| {
                     packed_if(

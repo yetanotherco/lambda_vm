@@ -84,7 +84,8 @@ use crate::tables::mem_load::{self, MemLoadRow};
 use crate::tables::mem_store::{self, MemStoreRow};
 use crate::tables::memw_aligned::MemwAlignedOrder;
 use crate::tables::{
-    cpu, decode, keccak_rnd, load, lt, memw, memw_aligned, memw_register, register, shift, store,
+    cpu, decode, keccak_rnd, load, lt, mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8,
+    mem_storew, memw, memw_aligned, memw_register, memw_w, register, shift, store,
 };
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
@@ -203,10 +204,23 @@ pub enum StreamTable {
     /// ([`WindowedTraceBuilder::memory_format`]).
     MemLoad,
     MemStore,
+    /// Only under the word memory format with its families streamed
+    /// ([`WindowedTraceBuilder::stream_word_tables`]): the six CPU word
+    /// families and MEMW_W, in `block_whir::WORD_TABLES`' order.
+    MemLoad8,
+    MemStore8,
+    MemLoadW,
+    MemStoreW,
+    MemLoad2W,
+    MemStore2W,
+    MemwW,
 }
 
 impl StreamTable {
-    pub const ALL: [StreamTable; 11] = [
+    /// How many streamed tables there are.
+    pub const COUNT: usize = 18;
+
+    pub const ALL: [StreamTable; Self::COUNT] = [
         StreamTable::Cpu,
         StreamTable::MemwRegister,
         StreamTable::MemwAligned,
@@ -218,11 +232,35 @@ impl StreamTable {
         StreamTable::KeccakRnd,
         StreamTable::MemLoad,
         StreamTable::MemStore,
+        StreamTable::MemLoad8,
+        StreamTable::MemStore8,
+        StreamTable::MemLoadW,
+        StreamTable::MemStoreW,
+        StreamTable::MemLoad2W,
+        StreamTable::MemStore2W,
+        StreamTable::MemwW,
+    ];
+
+    /// The word families, in `block_whir::WORD_TABLES`' order.
+    pub const WORDS: [StreamTable; 7] = [
+        StreamTable::MemLoad8,
+        StreamTable::MemStore8,
+        StreamTable::MemLoadW,
+        StreamTable::MemStoreW,
+        StreamTable::MemLoad2W,
+        StreamTable::MemStore2W,
+        StreamTable::MemwW,
     ];
 
     /// Its place in [`Self::ALL`].
     pub fn position(self) -> usize {
         self as usize
+    }
+
+    /// A word family's place in [`Self::WORDS`] (and in
+    /// `Traces::word_tables`); `None` for any other table.
+    pub fn word_family(self) -> Option<usize> {
+        Self::WORDS.iter().position(|&t| t == self)
     }
 }
 
@@ -496,10 +534,10 @@ pub struct CardFillStamps {
 /// A measurement; the chunks are the same.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HandoutStamps {
-    pub take: [f64; 11],
-    pub count: [f64; 11],
-    pub chunks: [usize; 11],
-    pub copied: [usize; 11],
+    pub take: [f64; StreamTable::COUNT],
+    pub count: [f64; StreamTable::COUNT],
+    pub chunks: [usize; StreamTable::COUNT],
+    pub copied: [usize; StreamTable::COUNT],
 }
 
 impl HandoutStamps {
@@ -1000,6 +1038,22 @@ impl<'a> WindowedTraceBuilder<'a> {
             ));
         }
         self.emitted.memory_format = format;
+        Ok(self)
+    }
+
+    /// Under the word memory format, cuts the six CPU word families and
+    /// MEMW_W into chunks as the walk fills them, handed out as MEM_LOAD's and
+    /// MEM_STORE's are, so the finish builds only each family's tail
+    /// ([`StreamSkip::stream_words`]). The tables, their order and their counts
+    /// are the finish-built ones. Under any other format it streams nothing.
+    /// Before the first window only.
+    pub fn stream_word_tables(mut self) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "stream_word_tables after a window was walked".to_string(),
+            ));
+        }
+        self.emitted.stream_words = true;
         Ok(self)
     }
 
@@ -2735,6 +2789,36 @@ fn chunk_jobs(
         m.mem_store,
         e.mem_store
     );
+    // The word memory format's families, when streamed, after the fused
+    // tables: each chunk gathered out of the windows.
+    if e.stream_words && e.memory_format == MemoryFormat::Words {
+        jobs.extend(word_chunks(m, &mut e.words, |k, index, cap| {
+            macro_rules! gathered {
+                ($field:ident, $variant:ident, $row:ty) => {{
+                    fn list(w: &WalkedWindow) -> &[$row] {
+                        &w.walk.word_rows.$field
+                    }
+                    let len: usize = windows.iter().map(|w| list(w).len()).sum();
+                    ((index + 1) * cap <= len).then(|| {
+                        WordFamilyChunk::$variant(Segments::one(gather(
+                            windows,
+                            list,
+                            index * cap..(index + 1) * cap,
+                        )))
+                    })
+                }};
+            }
+            match k {
+                0 => gathered!(load8, Load8, mem_load8::Load8Row),
+                1 => gathered!(store8, Store8, mem_store8::Store8Row),
+                2 => gathered!(loadw, LoadW, mem_loadw::LoadWRow),
+                3 => gathered!(storew, StoreW, mem_storew::StoreWRow),
+                4 => gathered!(load2w, Load2W, mem_load2w::Load2WRow),
+                5 => gathered!(store2w, Store2W, mem_store2w::Store2WRow),
+                _ => gathered!(memw, MemwW, memw_w::MemwWordRow),
+            }
+        }));
+    }
     jobs
 }
 
@@ -4379,6 +4463,34 @@ fn tail_jobs(
             ChunkOps::MemStore,
         )
     );
+    // The word memory format's families, when streamed, after the fused
+    // tables: each chunk drained from the front of its kept list (what is
+    // left is less than a chunk, so each drain moves little); their lookups
+    // are in-walk lookups, counted as their windows were.
+    if e.stream_words && e.memory_format == MemoryFormat::Words {
+        let rows = &mut kept.word_rows;
+        jobs.extend(word_chunks(m, &mut e.words, |k, _, cap| {
+            macro_rules! drained {
+                ($field:ident, $variant:ident) => {{
+                    (cap > 0 && rows.$field.len() >= cap).then(|| {
+                        let t = Instant::now();
+                        let chunk: Vec<_> = rows.$field.drain(..cap).collect();
+                        stamps.note(StreamTable::WORDS[k], t.elapsed().as_secs_f64(), 0.0, cap);
+                        WordFamilyChunk::$variant(Segments::one(chunk))
+                    })
+                }};
+            }
+            match k {
+                0 => drained!(load8, Load8),
+                1 => drained!(store8, Store8),
+                2 => drained!(loadw, LoadW),
+                3 => drained!(storew, StoreW),
+                4 => drained!(load2w, Load2W),
+                5 => drained!(store2w, Store2W),
+                _ => drained!(memw, MemwW),
+            }
+        }));
+    }
     jobs
 }
 
@@ -4570,6 +4682,96 @@ enum ChunkOps {
     },
     MemLoad(Segments<MemLoadRow>),
     MemStore(Segments<MemStoreRow>),
+    /// A word family's chunk ([`WindowedTraceBuilder::stream_word_tables`]).
+    Word(WordFamilyChunk),
+}
+
+/// A word family's chunk, its rows ([`StreamTable::WORDS`]' order).
+pub enum WordFamilyChunk {
+    Load8(Segments<mem_load8::Load8Row>),
+    Store8(Segments<mem_store8::Store8Row>),
+    LoadW(Segments<mem_loadw::LoadWRow>),
+    StoreW(Segments<mem_storew::StoreWRow>),
+    Load2W(Segments<mem_load2w::Load2WRow>),
+    Store2W(Segments<mem_store2w::Store2WRow>),
+    MemwW(Segments<memw_w::MemwWordRow>),
+}
+
+impl WordFamilyChunk {
+    fn op_bytes(&self) -> usize {
+        match self {
+            WordFamilyChunk::Load8(r) => r.op_bytes(),
+            WordFamilyChunk::Store8(r) => r.op_bytes(),
+            WordFamilyChunk::LoadW(r) => r.op_bytes(),
+            WordFamilyChunk::StoreW(r) => r.op_bytes(),
+            WordFamilyChunk::Load2W(r) => r.op_bytes(),
+            WordFamilyChunk::Store2W(r) => r.op_bytes(),
+            WordFamilyChunk::MemwW(r) => r.op_bytes(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            WordFamilyChunk::Load8(r) => r.len(),
+            WordFamilyChunk::Store8(r) => r.len(),
+            WordFamilyChunk::LoadW(r) => r.len(),
+            WordFamilyChunk::StoreW(r) => r.len(),
+            WordFamilyChunk::Load2W(r) => r.len(),
+            WordFamilyChunk::Store2W(r) => r.len(),
+            WordFamilyChunk::MemwW(r) => r.len(),
+        }
+    }
+
+    /// Its table in `form`: the finish's generator on its rows, so the chunk
+    /// is the table the finish would build.
+    fn generate_as(self, form: TraceForm) -> Table {
+        match self {
+            WordFamilyChunk::Load8(r) => {
+                mem_load8::generate_mem_load8_trace_segments_as(&r.slices(), form)
+            }
+            WordFamilyChunk::Store8(r) => {
+                mem_store8::generate_mem_store8_trace_segments_as(&r.slices(), form)
+            }
+            WordFamilyChunk::LoadW(r) => {
+                mem_loadw::generate_mem_loadw_trace_segments_as(&r.slices(), form)
+            }
+            WordFamilyChunk::StoreW(r) => {
+                mem_storew::generate_mem_storew_trace_segments_as(&r.slices(), form)
+            }
+            WordFamilyChunk::Load2W(r) => {
+                mem_load2w::generate_mem_load2w_trace_segments_as(&r.slices(), form)
+            }
+            WordFamilyChunk::Store2W(r) => {
+                mem_store2w::generate_mem_store2w_trace_segments_as(&r.slices(), form)
+            }
+            WordFamilyChunk::MemwW(r) => {
+                memw_w::generate_memw_w_trace_segments_as(&r.slices(), form)
+            }
+        }
+    }
+}
+
+/// The word families' full chunks past the ones handed out (`done`, counted
+/// per family here): `take(k, index, cap)` takes family `k`'s chunk `index`,
+/// its next `cap` rows, or `None` when fewer remain.
+fn word_chunks(
+    m: &crate::tables::MaxRowsConfig,
+    done: &mut [usize; 7],
+    mut take: impl FnMut(usize, usize, usize) -> Option<WordFamilyChunk>,
+) -> Vec<ChunkJob> {
+    let caps = super::word_walk::word_max_rows(m);
+    let mut jobs = Vec::new();
+    for (k, &table) in StreamTable::WORDS.iter().enumerate() {
+        while let Some(chunk) = take(k, done[k], caps[k]) {
+            jobs.push(ChunkJob {
+                table,
+                index: done[k],
+                ops: ChunkOps::Word(chunk),
+            });
+            done[k] += 1;
+        }
+    }
+    jobs
 }
 
 impl ChunkJob {
@@ -4596,6 +4798,7 @@ impl ChunkJob {
             ChunkOps::KeccakRnd { ops, .. } => b(ops),
             ChunkOps::MemLoad(rows) => rows.op_bytes(),
             ChunkOps::MemStore(rows) => rows.op_bytes(),
+            ChunkOps::Word(rows) => rows.op_bytes(),
         }
     }
 
@@ -4620,6 +4823,7 @@ impl ChunkJob {
             ChunkOps::KeccakRnd { ops, .. } => ops.len(),
             ChunkOps::MemLoad(rows) => rows.len(),
             ChunkOps::MemStore(rows) => rows.len(),
+            ChunkOps::Word(rows) => rows.len(),
         }
     }
 
@@ -4680,6 +4884,7 @@ impl ChunkJob {
             ChunkOps::MemStore(rows) => {
                 mem_store::generate_mem_store_trace_segments_as(&rows.slices(), form)
             }
+            ChunkOps::Word(rows) => rows.generate_as(form),
         };
         StreamedChunk {
             table: self.table,
@@ -5184,6 +5389,10 @@ impl RegenBuilder {
                 StreamTable::KeccakRnd => false,
                 StreamTable::MemLoad => drop_first(&mut mem_load),
                 StreamTable::MemStore => drop_first(&mut mem_store),
+                word => {
+                    let k = word.word_family().expect("a word family");
+                    walk.word_rows.drop_first(k)
+                }
             };
             if dropped {
                 self.drop_one = None;
@@ -5322,6 +5531,10 @@ impl Traces {
                 StreamTable::KeccakRnd => &mut self.keccak_rnds,
                 StreamTable::MemLoad => &mut self.mem_loads,
                 StreamTable::MemStore => &mut self.mem_stores,
+                word => {
+                    let k = word.word_family().expect("a word family");
+                    &mut self.word_tables[k]
+                }
             };
             let len = slots.len();
             let slot = slots.get_mut(chunk.index).ok_or_else(|| {

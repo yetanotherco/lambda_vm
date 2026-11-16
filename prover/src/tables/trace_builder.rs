@@ -7833,6 +7833,15 @@ pub struct StreamSkip {
     /// format's).
     pub mem_load: usize,
     pub mem_store: usize,
+    /// Under the word memory format, the six CPU word families and MEMW_W are
+    /// cut into chunks as the walk fills them
+    /// ([`windowed::WindowedTraceBuilder::stream_word_tables`]); `false` (the
+    /// default): the finish builds every one of their tables. The tables are
+    /// the same.
+    pub stream_words: bool,
+    /// With [`Self::stream_words`], each word family's chunks already handed
+    /// out ([`windowed::StreamTable::WORDS`]' order).
+    pub words: [usize; 7],
 }
 
 /// How the tables a block cuts at a fixed number of rows (KECCAK_RND, KECCAK,
