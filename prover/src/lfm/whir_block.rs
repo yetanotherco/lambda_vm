@@ -3347,16 +3347,13 @@ fn commit_prepared(
     })
 }
 
-/// Test only: the leaf's mutations of its commit-time answers, one at a time,
-/// each of which a test must catch. Thread-local, so a test that sets one
-/// moves no other test's program.
-/// The route checks' mutants ([`route_of`]), each of which a test must
-/// catch: thread-local, so a test that sets one moves no other test's
-/// program.
 #[cfg(test)]
 #[path = "whir_block_words_tests.rs"]
 mod words_tests;
 
+/// The route checks' mutants ([`route_of`]), each of which a test must
+/// catch: thread-local, so a test that sets one moves no other test's
+/// program.
 #[cfg(test)]
 pub(crate) mod route_faults {
     /// One mutant; several may be on at once.
@@ -3401,6 +3398,9 @@ pub(crate) mod route_faults {
     }
 }
 
+/// Test only: the leaf's mutations of its commit-time answers, one at a time,
+/// each of which a test must catch. Thread-local, so a test that sets one
+/// moves no other test's program.
 #[cfg(test)]
 pub(crate) mod ood_faults {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
