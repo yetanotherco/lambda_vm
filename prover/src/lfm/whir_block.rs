@@ -1338,6 +1338,64 @@ impl WhirBlockPlan {
         finish(b)
     }
 
+    /// Test only, a measurement's program: level 1 over the FIRST `k` groups
+    /// of a one-leaf plan. The leaf walk over groups `0..k`, the COMMIT-bus
+    /// target left out, the bus left open: it publishes the groups' sum of
+    /// `p/q` as a non-carrier leaf does instead of asserting a closure it
+    /// cannot see. No verifier derives it; it sizes level 1's prove at a
+    /// chosen number of base groups. Returns its arena's marks as
+    /// [`Self::closed_block_program_marked`] does; its arena is
+    /// [`first_groups_arena`]'s.
+    #[cfg(test)]
+    pub(crate) fn first_groups_program_marked(
+        &self,
+        k: usize,
+    ) -> Result<(LfmProgram, Vec<u32>), String> {
+        let groups = self.first_groups(k)?;
+        let mut b = self.leaf_builder();
+        let mut marks = LeafMarks::default();
+        emit_leaf_over(
+            &mut b,
+            self,
+            groups,
+            false,
+            false,
+            LeafChecks::ALL,
+            Some(&mut marks),
+        )?;
+        let program = finish(b)?;
+        if marks.arena_ends.len() != k + 1
+            || marks.arena_ends.last().copied() != program.arena_schema.lens.first().copied()
+        {
+            return Err(format!(
+                "the first {k} groups' program: its arena's marks {:?} are not its front, its \
+                 groups and its length {:?}",
+                marks.arena_ends, program.arena_schema.lens
+            ));
+        }
+        Ok((program, marks.arena_ends))
+    }
+
+    /// The first `k` groups of a one-leaf plan, in its order; refused for
+    /// `k = 0`, more groups than the plan has, or a plan of several leaves.
+    #[cfg(test)]
+    fn first_groups(&self, k: usize) -> Result<&[usize], String> {
+        if self.partition.num_leaves() != 1 {
+            return Err(format!(
+                "the first groups of a one-leaf plan; the plan has {} leaves",
+                self.partition.num_leaves()
+            ));
+        }
+        let all = self.partition.leaf(0);
+        if k == 0 || k > all.len() {
+            return Err(format!(
+                "the first {k} groups of a plan of {} groups",
+                all.len()
+            ));
+        }
+        Ok(&all[..k])
+    }
+
     /// Leaf `k`, emitted and validated.
     pub fn leaf_program(&self, k: usize) -> Result<LfmProgram, String> {
         self.leaf_program_marked(k).map(|(program, _)| program)
@@ -2873,6 +2931,66 @@ pub fn leaf_arena(
     groups: Vec<Vec<LfmWord>>,
 ) -> Vec<Vec<LfmWord>> {
     leaf_arena_under(roots, answers, groups, super::edsl::WrapHash::Poseidon1)
+}
+
+/// Test only: the arena of [`WhirBlockPlan::first_groups_program_marked`]'s
+/// program over `k` groups: the front (every root and its commit-time
+/// answers, as leaf 0's), then the first `k` groups' words.
+#[cfg(test)]
+pub(crate) fn first_groups_arena(
+    plan: &WhirBlockPlan,
+    proof: &BlockWhirProof,
+    k: usize,
+) -> Result<Vec<Vec<LfmWord>>, String> {
+    plan.first_groups(k)?;
+    let mut groups = block_leaf_groups(plan, proof, 0)?;
+    groups.truncate(k);
+    Ok(leaf_arena_under(
+        &proof.proof.roots,
+        &proof.commit_ood,
+        groups,
+        plan.wrap_hash,
+    ))
+}
+
+/// Test only: the host's sum of `p/q` over the first `k` groups' bus outputs,
+/// read from the base proof as its verifier reads them (each table's output,
+/// or each batched argue's), as one published word: what
+/// [`WhirBlockPlan::first_groups_program_marked`]'s program publishes last.
+#[cfg(test)]
+pub(crate) fn first_groups_bus_sum(
+    plan: &WhirBlockPlan,
+    proof: &BlockWhirProof,
+    k: usize,
+) -> Result<LfmWord, String> {
+    use stark::multilinear_table::contribution;
+    let mut sum = FEE::zero();
+    for &g in plan.first_groups(k)? {
+        let outputs: Vec<&(FEE, FEE)> = match batched_cap(&plan.frame.config)? {
+            None => {
+                let start = plan.group_start(g);
+                proof
+                    .proof
+                    .tables
+                    .get(start..start + plan.groups[g].len())
+                    .ok_or("the proof is short of tables")?
+                    .iter()
+                    .map(|t| &t.bus_output)
+                    .collect()
+            }
+            Some(_) => proof
+                .argues
+                .get(g)
+                .ok_or("the proof is short of batched argues")?
+                .bus_outputs
+                .iter()
+                .collect(),
+        };
+        for output in outputs {
+            sum += contribution(output).ok_or(format!("group {g}: a bus denominator is zero"))?;
+        }
+    }
+    Ok(super::word::ext_word(&sum))
 }
 
 /// [`leaf_arena`] for a plan under `hash`: each root its digest width in words
