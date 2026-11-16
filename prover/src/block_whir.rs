@@ -3233,6 +3233,54 @@ pub(crate) fn word_tables_under(
     }
 }
 
+/// The chips' tables, by name: the accelerators' counts and MEMW_W's (the
+/// last word family) in a statement.
+fn chip_counts(counts: &TableCounts, words: [u64; 7]) -> [(&'static str, u64); 10] {
+    [
+        ("KECCAK", counts.keccak as u64),
+        ("KECCAK_RND", counts.keccak_rnd as u64),
+        ("IS_WH", counts.is_wh as u64),
+        ("BLAKE3", counts.blake3 as u64),
+        ("COPY", counts.copy as u64),
+        ("ECSM", counts.ecsm as u64),
+        ("ECDAS", counts.ecdas as u64),
+        ("ECREC", counts.ecrec as u64),
+        ("HINT", counts.hint as u64),
+        ("MEMW_W", words[6]),
+    ]
+}
+
+/// Under the word memory format, refuses a statement that states any chip's
+/// table: an accelerator (KECCAK and its rounds and IS_WH, BLAKE3, COPY, ECSM
+/// and ECDAS, ECREC, HINT; `counts`) or MEMW_W (`words`). The chips still
+/// read and write memory by byte messages, which nothing receives under the
+/// word format, and no chip sends MEMW_W a word message yet: a block that
+/// calls one is not provable under it, and the verifier says so by its counts
+/// instead of leaving it to the bus. Under any other format, nothing to
+/// check.
+pub(crate) fn chip_tables_under(
+    memory: crate::tables::fused_memory::MemoryFormat,
+    counts: &TableCounts,
+    words: [u64; 7],
+) -> Result<(), Error> {
+    if memory != crate::tables::fused_memory::MemoryFormat::Words {
+        return Ok(());
+    }
+    #[cfg(test)]
+    if CHIP_COUNTS_UNCHECKED.with(std::cell::Cell::get) {
+        return Ok(());
+    }
+    match chip_counts(counts, words)
+        .into_iter()
+        .find(|&(_, n)| n != 0)
+    {
+        Some((table, n)) => Err(Error::InvalidTableCounts(format!(
+            "the word memory format takes no chip yet: no {table} table, not {n}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Every PAGE_W table at its one height, [`crate::tables::page_w::NUM_VARS`]
 /// variables, by name: a taller one would mint the next page's words a second
 /// time. `tables` pairs each table's name with its stated height.
@@ -3278,6 +3326,10 @@ thread_local! {
     /// Test only: on this thread, a split or fused verifier reads no word
     /// count ([`word_counts_under`]'s refusal taken out, a control mutant).
     pub(crate) static WORD_COUNTS_UNCHECKED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Test only: on this thread, the word format takes any chip's table
+    /// ([`chip_tables_under`]'s refusal taken out, a control mutant).
+    pub(crate) static CHIP_COUNTS_UNCHECKED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -8560,6 +8612,8 @@ pub(crate) fn block_frame(
         statement.fused_memory,
     )?;
     let words = word_counts_under(format.memory, statement.word_memory)?;
+    // Under the word memory format no chip's table, MEMW_W's included.
+    chip_tables_under(format.memory, statement.table_counts, statement.word_memory)?;
     let num_tables = statement.table_num_vars.len();
     let page_configs = Traces::page_configs_from_elf_and_runtime(
         &program,
