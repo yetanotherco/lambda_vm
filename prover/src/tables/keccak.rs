@@ -1325,91 +1325,159 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
 
         // ---------------- sponge mode ----------------
         let mut idx = MODE_CONSTRAINTS;
-        // Every sponge constraint names its check, so a test can leave one out
-        // (`SpongeCheck`); outside the tests none is ever left out.
-        let mut emit = |b: &mut B, check: SpongeCheck, e: B::Expr| {
-            let e = if dropped(check) { b.zero() } else { e };
-            b.emit_base(idx, e);
-            idx += 1;
-        };
-
-        // FULL_k, PART_{k,b} bits.
-        for lane in 0..cols::RATE_LANES {
-            let f = b.main(0, cols::full(lane));
-            let e = f.clone() * (b.one() - f);
-            emit(b, SpongeCheck::MaskBits, e);
-            for byte in 0..7 {
-                let p = b.main(0, cols::part(lane, byte));
-                let e = p.clone() * (b.one() - p);
-                emit(b, SpongeCheck::MaskBits, e);
-            }
-        }
-        // FULL_k · PART_{k,b} = 0: each s_i is a bit.
-        for lane in 0..cols::RATE_LANES {
-            for byte in 0..7 {
-                let f = b.main(0, cols::full(lane));
-                let p = b.main(0, cols::part(lane, byte));
-                emit(b, SpongeCheck::OneRead, f * p);
-            }
-        }
-        // s_i as an expression.
-        let s = |b: &B, i: usize| -> B::Expr {
-            let (lane, byte) = (i / 8, i % 8);
-            let f = b.main(0, cols::full(lane));
-            if byte < 7 {
-                f + b.main(0, cols::part(lane, byte))
-            } else {
-                f
-            }
-        };
-        // Prefix: (1 − s_i) · s_{i+1} = 0.
-        for i in 0..cols::RATE - 1 {
-            let e = (b.one() - s(b, i)) * s(b, i + 1);
-            emit(b, SpongeCheck::Prefix, e);
-        }
-        // No read off a sponge row: (1 − MU_S) · s_0 = 0.
-        let e = (b.one() - mu_s.clone()) * s(b, 0);
-        emit(b, SpongeCheck::ReadsOnSponge, e);
-        // A row that is not last reads a whole block: (MU_S − LAST)(1 − FULL_16).
-        let full_last = b.main(0, cols::full(cols::RATE_LANES - 1));
-        let e = (mu_s.clone() - last.clone()) * (b.one() - full_last.clone());
-        emit(b, SpongeCheck::FullUnlessLast, e);
-        // The last block holds at most 135 input bytes: LAST · FULL_16 = 0.
-        emit(b, SpongeCheck::LastNotFull, last.clone() * full_last);
-        // The last block holds exactly COUNT bytes: LAST · (COUNT − Σ s_i) = 0.
-        let mut taken = b.zero();
-        for i in 0..cols::RATE {
-            taken = taken + s(b, i);
-        }
-        let count = b.main(0, cols::COUNT);
-        emit(b, SpongeCheck::CountOnLast, last.clone() * (count - taken));
-        // Bytes past the input are 0: (1 − s_i) · MSG_i = 0.
-        for i in 0..cols::RATE {
-            let e = (b.one() - s(b, i)) * b.main(0, cols::msg(i));
-            emit(b, SpongeCheck::MsgZero, e);
-        }
-        // The first row is block 0 and starts from the zero state.
-        let e = first.clone() * b.main(0, cols::TIMESTAMP_1);
-        emit(b, SpongeCheck::FirstBlock, e);
-        for i in 0..cols::RATE {
-            let e = first.clone() * b.main(0, cols::prev(i));
-            emit(b, SpongeCheck::FirstState, e);
-        }
-        for i in cols::RATE..200 {
-            let e = first.clone() * b.main(0, cols::input_byte(i));
-            emit(b, SpongeCheck::FirstState, e);
-        }
-        // SRC_LO + 135 and OUT_LO + 31 as halves (each half range-checked).
-        // SRC_END + 1 is also the next block's address on the link, so this
-        // equation is load-bearing at any address, not only near 2^32.
-        let c65536 = b.const_base(1 << 16);
-        let src_end = b.main(0, cols::SRC_END) + b.main(0, cols::SRC_END + 1) * c65536.clone();
-        let e = mu_s * (b.main(0, cols::SRC_LO) + b.const_base(135) - src_end);
-        emit(b, SpongeCheck::AddressHalves, e);
-        let out_end = b.main(0, cols::OUT_END) + b.main(0, cols::OUT_END + 1) * c65536;
-        let e = last * (b.main(0, cols::OUT_LO) + b.const_base(31) - out_end);
-        emit(b, SpongeCheck::AddressHalves, e);
-
+        emit_sponge_rules(b, &SPONGE_COLUMNS, &mut idx, |b, start| {
+            b.main(0, start) + b.main(0, start + 1) * b.const_base(1 << 16)
+        });
         debug_assert_eq!(idx, NUM_CONSTRAINTS);
     }
+}
+
+/// The columns the sponge rules read ([`emit_sponge_rules`]), so KECCAK and
+/// KECCAK_W (`tables::keccak_w`) emit those rules from one source.
+pub(crate) struct SpongeColumns {
+    /// The column that marks a sponge row: KECCAK's `MU_S`, KECCAK_W's `MU`.
+    pub sponge: usize,
+    pub first: usize,
+    pub last: usize,
+    pub count: usize,
+    pub timestamp_1: usize,
+    pub src_lo: usize,
+    pub src_end: usize,
+    pub out_lo: usize,
+    pub out_end: usize,
+    /// The first of the 136 `PREV`, 136 `MSG`, 17 `FULL`, 17 × 7 `PART`
+    /// (lane-major) and 200 permutation input columns.
+    pub prev: usize,
+    pub msg: usize,
+    pub full: usize,
+    pub part: usize,
+    pub input_state: usize,
+    /// Whether the rules include "bytes past the input are 0"
+    /// ([`SpongeCheck::MsgZero`]). KECCAK_W leaves it to its placement, which
+    /// writes `MSG_i = s_i · …`.
+    pub msg_zero: bool,
+}
+
+/// KECCAK's sponge columns.
+const SPONGE_COLUMNS: SpongeColumns = SpongeColumns {
+    sponge: cols::MU_S,
+    first: cols::FIRST,
+    last: cols::LAST,
+    count: cols::COUNT,
+    timestamp_1: cols::TIMESTAMP_1,
+    src_lo: cols::SRC_LO,
+    src_end: cols::SRC_END,
+    out_lo: cols::OUT_LO,
+    out_end: cols::OUT_END,
+    prev: cols::PREV,
+    msg: cols::MSG,
+    full: cols::FULL,
+    part: cols::PART,
+    input_state: cols::INPUT_STATE,
+    msg_zero: true,
+};
+
+/// The sponge mode's rules ([`KeccakConstraints`]' list from "`FULL_k`,
+/// `PART_{k,b}` bits" on), from constraint `*idx` on, for KECCAK and KECCAK_W
+/// alike: the mask's bits and one read a byte, the prefix, no read off a
+/// sponge row, whole blocks but the last, the last below 136 bytes and
+/// `COUNT` of them, (with [`SpongeColumns::msg_zero`]) bytes past the input
+/// 0, the first row block 0 from the zero state, and `SRC_END`, `OUT_END` the
+/// ends' halves. `halves(b, start)` reads two 16-bit halves from `start` as a
+/// word: the same value in both tables, written in the order each table's
+/// constraint program has always held. Each rule names its check, so a test
+/// can leave it out of either table ([`leave_out`]); outside the tests none is
+/// ever left out.
+pub(crate) fn emit_sponge_rules<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &mut B,
+    c: &SpongeColumns,
+    idx: &mut usize,
+    halves: impl Fn(&B, usize) -> B::Expr,
+) {
+    let mut emit = |b: &mut B, check: SpongeCheck, e: B::Expr| {
+        let e = if dropped(check) { b.zero() } else { e };
+        b.emit_base(*idx, e);
+        *idx += 1;
+    };
+    let sponge = b.main(0, c.sponge);
+    let first = b.main(0, c.first);
+    let last = b.main(0, c.last);
+    let full = |lane: usize| c.full + lane;
+    let part = |lane: usize, byte: usize| c.part + lane * 7 + byte;
+
+    // FULL_k, PART_{k,b} bits.
+    for lane in 0..cols::RATE_LANES {
+        let f = b.main(0, full(lane));
+        let e = f.clone() * (b.one() - f);
+        emit(b, SpongeCheck::MaskBits, e);
+        for byte in 0..7 {
+            let p = b.main(0, part(lane, byte));
+            let e = p.clone() * (b.one() - p);
+            emit(b, SpongeCheck::MaskBits, e);
+        }
+    }
+    // FULL_k · PART_{k,b} = 0: each s_i is a bit.
+    for lane in 0..cols::RATE_LANES {
+        for byte in 0..7 {
+            let f = b.main(0, full(lane));
+            let p = b.main(0, part(lane, byte));
+            emit(b, SpongeCheck::OneRead, f * p);
+        }
+    }
+    // s_i as an expression.
+    let s = |b: &B, i: usize| -> B::Expr {
+        let (lane, byte) = (i / 8, i % 8);
+        let f = b.main(0, full(lane));
+        if byte < 7 {
+            f + b.main(0, part(lane, byte))
+        } else {
+            f
+        }
+    };
+    // Prefix: (1 − s_i) · s_{i+1} = 0.
+    for i in 0..cols::RATE - 1 {
+        let e = (b.one() - s(b, i)) * s(b, i + 1);
+        emit(b, SpongeCheck::Prefix, e);
+    }
+    // No read off a sponge row: (1 − sponge) · s_0 = 0.
+    let e = (b.one() - sponge.clone()) * s(b, 0);
+    emit(b, SpongeCheck::ReadsOnSponge, e);
+    // A row that is not last reads a whole block: (sponge − LAST)(1 − FULL_16).
+    let full_last = b.main(0, full(cols::RATE_LANES - 1));
+    let e = (sponge.clone() - last.clone()) * (b.one() - full_last.clone());
+    emit(b, SpongeCheck::FullUnlessLast, e);
+    // The last block holds at most 135 input bytes: LAST · FULL_16 = 0.
+    emit(b, SpongeCheck::LastNotFull, last.clone() * full_last);
+    // The last block holds exactly COUNT bytes: LAST · (COUNT − Σ s_i) = 0.
+    let mut taken = b.zero();
+    for i in 0..cols::RATE {
+        taken = taken + s(b, i);
+    }
+    let count = b.main(0, c.count);
+    emit(b, SpongeCheck::CountOnLast, last.clone() * (count - taken));
+    // Bytes past the input are 0: (1 − s_i) · MSG_i = 0.
+    if c.msg_zero {
+        for i in 0..cols::RATE {
+            let e = (b.one() - s(b, i)) * b.main(0, c.msg + i);
+            emit(b, SpongeCheck::MsgZero, e);
+        }
+    }
+    // The first row is block 0 and starts from the zero state.
+    let e = first.clone() * b.main(0, c.timestamp_1);
+    emit(b, SpongeCheck::FirstBlock, e);
+    for i in 0..cols::RATE {
+        let e = first.clone() * b.main(0, c.prev + i);
+        emit(b, SpongeCheck::FirstState, e);
+    }
+    for i in cols::RATE..200 {
+        let e = first.clone() * b.main(0, c.input_state + i);
+        emit(b, SpongeCheck::FirstState, e);
+    }
+    // SRC_LO + 135 and OUT_LO + 31 as halves (each half range-checked).
+    // SRC_END + 1 is also the next block's address on the link, so this
+    // equation is load-bearing at any address, not only near 2^32.
+    let e = sponge * (b.main(0, c.src_lo) + b.const_base(135) - halves(b, c.src_end));
+    emit(b, SpongeCheck::AddressHalves, e);
+    let e = last * (b.main(0, c.out_lo) + b.const_base(31) - halves(b, c.out_end));
+    emit(b, SpongeCheck::AddressHalves, e);
 }
