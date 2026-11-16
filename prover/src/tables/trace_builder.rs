@@ -89,6 +89,10 @@ pub(crate) mod in_row_forgery_tests;
 #[cfg(test)]
 mod keccak256_tests;
 pub(crate) mod register_words;
+mod word_walk;
+#[cfg(test)]
+mod word_walk_tests;
+pub(crate) use word_walk::WordRows;
 #[cfg(test)]
 mod direct_count_tests {
     //! The direct counts of LT's and KECCAK's lookups against the lists the
@@ -1776,7 +1780,24 @@ impl MemwBuckets {
     /// memory format).
     #[inline]
     fn fused(&self) -> bool {
-        self.memory == super::fused_memory::MemoryFormat::Fused
+        match self.memory {
+            super::fused_memory::MemoryFormat::Fused => true,
+            super::fused_memory::MemoryFormat::Split | super::fused_memory::MemoryFormat::Words => {
+                false
+            }
+        }
+    }
+
+    /// Whether every CPU load and store is a word table's row (the word
+    /// memory format).
+    #[inline]
+    fn words(&self) -> bool {
+        match self.memory {
+            super::fused_memory::MemoryFormat::Words => true,
+            super::fused_memory::MemoryFormat::Split | super::fused_memory::MemoryFormat::Fused => {
+                false
+            }
+        }
     }
 
     /// Whether register accesses are residual register rows (the in-row register format).
@@ -2038,6 +2059,7 @@ fn collect_ops_from_cpu(
         mem_load_rows: _,
         mem_store_rows: _,
         store_ops: _,
+        word_rows: _,
     } = out;
     Ok((
         memw,
@@ -2143,6 +2165,9 @@ pub(crate) struct WalkOutputs {
     /// the ops' order (the walk routes every store there, the routing none);
     /// empty otherwise.
     store_ops: Vec<store::StoreOperation>,
+    /// Under the word memory format, every CPU load and store as its word
+    /// table's row, in the ops' order; empty otherwise.
+    word_rows: WordRows,
 }
 
 impl WalkOutputs {
@@ -2174,6 +2199,7 @@ impl WalkOutputs {
             mem_load_rows: Vec::new(),
             mem_store_rows: Vec::new(),
             store_ops: Vec::new(),
+            word_rows: WordRows::default(),
         }
     }
 
@@ -2242,6 +2268,7 @@ impl WalkOutputs {
             + vec_heap_bytes(&self.mem_load_rows)
             + vec_heap_bytes(&self.mem_store_rows)
             + vec_heap_bytes(&self.store_ops)
+            + self.word_rows.heap_bytes()
             + vec_heap_bytes(&self.bitwise_ops)
             + vec_heap_bytes(&self.keccak_ops)
             + vec_heap_bytes(&self.blake3_ops)
@@ -2436,9 +2463,20 @@ fn walk_cpu_ops<const REST: bool>(
         mem_load_rows,
         mem_store_rows,
         store_ops,
+        word_rows,
     } = out;
     let in_row = memw.in_row();
     let fused = memw.fused();
+    let words = memw.words();
+    // The word memory format retires MEMW and MEMW_A, which take the register
+    // accesses MEMW_R cannot under the 32-bit token format: it needs the
+    // in-row register format, where every other register access is a residual
+    // register row.
+    if words && !in_row {
+        return Err(Error::Prover(
+            "the word memory format needs the in-row register format".to_string(),
+        ));
+    }
     // This call's COPY rows start here; earlier calls' are already in the list.
     let copy_ops_before = copy_ops.len();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
@@ -2455,8 +2493,13 @@ fn walk_cpu_ops<const REST: bool>(
         // record walk makes no cell for a cycle that is no ECALL: its load
         // or store reads its access record.
         let mut light = false;
+        // Under the word memory format the format takes no syscall but the
+        // halt: any other is refused before it touches anything.
+        if words {
+            word_walk::refuse_syscall(op)?;
+        }
         if let Some(overlay) = memory_state.overlay.as_deref_mut() {
-            light = overlay.light && !op.decode.fields.ecall;
+            light = overlay.light && !op.decode.fields.ecall && !words;
             if light {
                 overlay.begin_light(op.timestamp);
             } else {
@@ -2475,8 +2518,23 @@ fn walk_cpu_ops<const REST: bool>(
 
         // --- MEMW and LOAD (require state tracking, order matters) ---
 
-        // Collect memory operations for Load/Store instructions
-        if op.decode.fields.is_load() {
+        // Collect memory operations for Load/Store instructions. Under the
+        // word memory format each is one word table's row.
+        if words && op.decode.fields.is_load() {
+            word_walk::word_load(
+                op,
+                memory_state,
+                word_rows,
+                lookups.then_some(&mut *bitwise_ops),
+            )?;
+        } else if words && op.decode.fields.is_store() {
+            word_walk::word_store(
+                op,
+                memory_state,
+                word_rows,
+                lookups.then_some(&mut *bitwise_ops),
+            )?;
+        } else if op.decode.fields.is_load() {
             let (memw_op, load_op) = if light {
                 collect_load_op_from_access(op, memory_state)
             } else {
@@ -7429,6 +7487,8 @@ struct CollectedOps {
     /// the split format.
     mem_load_rows: Vec<super::mem_load::MemLoadRow>,
     mem_store_rows: Vec<super::mem_store::MemStoreRow>,
+    /// The word memory format's CPU word-table rows; empty under any other.
+    word_rows: WordRows,
 }
 
 /// How many leading chunks of each streamed table a windowed build already
@@ -9054,6 +9114,7 @@ fn collect_all_ops(
         ecrec_ops: BlockVec::from_vec(ecrec_ops),
         mem_load_rows: Vec::new(),
         mem_store_rows: Vec::new(),
+        word_rows: WordRows::default(),
     })
 }
 

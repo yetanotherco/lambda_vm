@@ -999,7 +999,6 @@ impl<'a> WindowedTraceBuilder<'a> {
                 "memory_format after a window was walked".to_string(),
             ));
         }
-        super::super::fused_memory::refuse_unbuilt(format)?;
         self.emitted.memory_format = format;
         Ok(self)
     }
@@ -1491,7 +1490,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         } else {
             route_ops
         };
-        let stores = self.emitted.memory_format == MemoryFormat::Split;
+        let stores = routes_stores(self.emitted.memory_format);
         self.segments
             .append(route(&cpu_ops, &self.decode, &walk.cpu32_ops, stores));
         // Under the fused memory format STORE's segment is the walk's.
@@ -1887,7 +1886,7 @@ impl WalkedWindow {
         let w = &self.walk;
         let _ = write!(
             d,
-            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
             self.cpu_ops,
             w.memw.register_rows,
             w.memw.aligned,
@@ -1908,6 +1907,7 @@ impl WalkedWindow {
             w.mem_load_rows,
             w.mem_store_rows,
             w.store_ops,
+            w.word_rows,
         );
         d.0.finish()
     }
@@ -2015,6 +2015,17 @@ impl Walker<'_> {
     }
 }
 
+/// Whether the CPU router routes the CPU's stores to STORE's segment under
+/// `format`: under the split format alone. Under the fused format the walk
+/// routes every store itself; under the word format no store is a STORE op
+/// (each is a word table's row) and STORE has no table.
+fn routes_stores(format: MemoryFormat) -> bool {
+    match format {
+        MemoryFormat::Split => true,
+        MemoryFormat::Fused | MemoryFormat::Words => false,
+    }
+}
+
 /// One window (not the run's last) walked from `memory` and `registers` into
 /// fresh lists, its cycles numbered from `first`: [`Walker::walk`]'s body, and
 /// what a window walked from its entries runs.
@@ -2072,7 +2083,7 @@ fn walk_window(
     // sized from the walker's last window.
     let mut router = (route && counts.is_some()).then(|| {
         super::CpuRouter::with_capacities(sizes.routed_for(logs.len()))
-            .routing_stores(memory_format == MemoryFormat::Split)
+            .routing_stores(routes_stores(memory_format))
     });
     // Without the list, each batch's ops in one buffer, reused.
     let mut from = 0usize;
@@ -2153,6 +2164,8 @@ struct BatchMarks {
     shift: usize,
     mem_load: usize,
     mem_store: usize,
+    /// The word memory format's rows made so far, family by family.
+    word_rows: [usize; 6],
     /// The in-walk lookups listed so far: under the in-row register format
     /// each CPU slot's `IS_HALF` (a walk that does not list the rest).
     bitwise: usize,
@@ -2170,6 +2183,7 @@ impl BatchMarks {
             shift: walk.shift_ops.len(),
             mem_load: walk.mem_load_rows.len(),
             mem_store: walk.mem_store_rows.len(),
+            word_rows: walk.word_rows.lens(),
         }
     }
 }
@@ -2221,6 +2235,9 @@ impl WalkCounts {
         for row in &walk.mem_store_rows[marks.mem_store..] {
             row.count_bitwise_into(histogram);
         }
+        // And the word tables' rows'.
+        walk.word_rows
+            .count_bitwise_into(marks.word_rows, histogram);
         memw_register::collect_bitwise_from_memw_register(
             &walk.memw.register_rows[marks.register_rows..],
             histogram,
@@ -2413,7 +2430,7 @@ impl Accumulator<'_> {
         // run's segments and counts the CPU ops' lookups as it goes. Under the
         // fused memory format no router routes a store: STORE's segment is the
         // walk's list, appended after the routing.
-        let stores = self.emitted.memory_format == MemoryFormat::Split;
+        let stores = routes_stores(self.emitted.memory_format);
         if let Some(segments) = window.routed.take() {
             // Its walker routed it and counted its CPU ops' lookups.
             self.walked.routed += 1;
@@ -2482,6 +2499,7 @@ impl Accumulator<'_> {
             walk.mem_store_rows
                 .iter()
                 .for_each(|row| row.count_bitwise_into(histogram));
+            walk.word_rows.count_bitwise_into([0; 6], histogram);
         }
         self.counted.histogram.add_ops(&window.walk.bitwise_ops);
         self.counted.bitwise_ops += window.walk.bitwise_ops.len();
@@ -3246,6 +3264,9 @@ struct Kept {
     /// The fused memory format's rows; empty under the split format.
     mem_load: Tail<MemLoadRow>,
     mem_store: Tail<MemStoreRow>,
+    /// The word memory format's rows, the run so far (the finish builds
+    /// their tables: none streams); empty under any other format.
+    word_rows: super::WordRows,
     /// Every other walk list, the run so far, in blocks (the in-walk lookups
     /// only hold what is left to count).
     rest: KeptRest,
@@ -3380,6 +3401,7 @@ impl Kept {
             shift: Tail::new(),
             mem_load: Tail::new(),
             mem_store: Tail::new(),
+            word_rows: super::WordRows::default(),
             rest: KeptRest::new(max_rows),
             decode,
             listless: false,
@@ -3400,6 +3422,7 @@ impl Kept {
             + self.shift.heap_bytes()
             + self.mem_load.heap_bytes()
             + self.mem_store.heap_bytes()
+            + self.word_rows.heap_bytes()
             + self
                 .rest
                 .sizes()
@@ -3425,6 +3448,7 @@ impl Kept {
             ("kept shift".to_string(), self.shift.heap_bytes()),
             ("kept mem_load".to_string(), self.mem_load.heap_bytes()),
             ("kept mem_store".to_string(), self.mem_store.heap_bytes()),
+            ("kept word rows".to_string(), self.word_rows.heap_bytes()),
             ("kept decode".to_string(), self.decode.heap_bytes()),
         ];
         parts.extend(
@@ -3455,6 +3479,7 @@ impl Kept {
             ("kept shift".to_string(), self.shift.largest_bytes()),
             ("kept mem_load".to_string(), self.mem_load.largest_bytes()),
             ("kept mem_store".to_string(), self.mem_store.largest_bytes()),
+            ("kept word rows".to_string(), self.word_rows.heap_bytes()),
             ("kept decode".to_string(), self.decode.heap_bytes()),
         ];
         parts.extend(
@@ -3544,6 +3569,7 @@ impl Kept {
             mem_store_rows,
             // Moved to STORE's segment as the window was routed.
             store_ops: _,
+            word_rows,
         } = walk;
         if !self.listless {
             self.cpu.push(cpu_ops);
@@ -3564,6 +3590,7 @@ impl Kept {
         self.shift.push(shift_ops);
         self.mem_load.push(mem_load_rows);
         self.mem_store.push(mem_store_rows);
+        self.word_rows.append(word_rows);
         let rest = &mut self.rest;
         rest.bitwise_ops.extend(bitwise_ops);
         rest.copy_ops.extend(copy_ops);
@@ -3600,6 +3627,7 @@ impl Kept {
             shift,
             mem_load,
             mem_store,
+            word_rows,
             rest,
             decode,
             listless: _,
@@ -3633,6 +3661,7 @@ impl Kept {
         walk.cpu_side = cpu_side.into_vec();
         walk.mem_load_rows = mem_load.into_vec();
         walk.mem_store_rows = mem_store.into_vec();
+        walk.word_rows = word_rows;
         walk.load_ops = load.into_vec();
         walk.lt_ops = lt.into_vec();
         walk.shift_ops = shift.into_vec();
@@ -4428,11 +4457,13 @@ fn concatenate(
     let mut cpu_side = Vec::with_capacity(n);
     let mut mem_load = Vec::with_capacity(n);
     let mut mem_store = Vec::with_capacity(n);
+    let mut word_rows = Vec::with_capacity(n);
     for WalkedWindow { cpu_ops, walk, .. } in windows {
         cpu.push(cpu_ops);
         cpu_side.push(walk.cpu_side);
         mem_load.push(walk.mem_load_rows);
         mem_store.push(walk.mem_store_rows);
+        word_rows.push(walk.word_rows);
         register_rows.push(walk.memw.register_rows);
         aligned.push(walk.memw.aligned);
         general.push(walk.memw.general);
@@ -4475,6 +4506,7 @@ fn concatenate(
         mem_store_rows: cat(mem_store),
         // Moved to STORE's segment as each window was routed.
         store_ops: Vec::new(),
+        word_rows: super::WordRows::concat(word_rows),
         load_ops: load,
         lt_ops: lt,
         shift_ops: shift,
@@ -4806,6 +4838,7 @@ fn assemble(
         cpu_side,
         mem_load_rows,
         mem_store_rows,
+        word_rows,
         ..
     } = walk;
     let KeptRest {
@@ -4897,6 +4930,7 @@ fn assemble(
         ecrec_ops,
         mem_load_rows,
         mem_store_rows,
+        word_rows,
     })
 }
 
@@ -5025,7 +5059,6 @@ impl RegenBuilder {
                 "memory_format after a window was walked".to_string(),
             ));
         }
-        super::super::fused_memory::refuse_unbuilt(format)?;
         self.cut.memory_format = format;
         Ok(self)
     }
@@ -5114,11 +5147,8 @@ impl RegenBuilder {
                 .map(super::route_store)
                 .collect(),
             MemoryFormat::Fused => std::mem::take(&mut walk.store_ops),
-            MemoryFormat::Words => {
-                return Err(Error::Prover(
-                    "the word memory format is not built yet".to_string(),
-                ));
-            }
+            // No STORE table: every store is a word table's row.
+            MemoryFormat::Words => Vec::new(),
         };
         // Mutable for the tests' slicer bug (`drop_one_op`).
         #[cfg_attr(not(test), allow(unused_mut))]

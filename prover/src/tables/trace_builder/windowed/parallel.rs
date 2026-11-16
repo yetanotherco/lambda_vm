@@ -692,6 +692,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                 );
             let (permit_tx, permit_rx) = sync_channel::<()>(walkers + 2);
             let decode = Arc::clone(&settings.decode);
+            let words = settings.memory_format == crate::tables::fused_memory::MemoryFormat::Words;
             // Record mode's check thread, fed every window in order.
             let (check_tx, check_rx) = sync_channel::<CheckWindow>(4);
             let check = (recheck > 0).then(|| {
@@ -717,6 +718,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                     image,
                     lean,
                     key,
+                    words,
                     windows,
                     number,
                     job_tx,
@@ -921,6 +923,7 @@ fn pass_thread<W: Into<ExecWindow>>(
     image: &PagedMem<u8>,
     lean: bool,
     key: u64,
+    words: bool,
     windows: Receiver<W>,
     number: fn(u32) -> u32,
     jobs: SyncSender<Ticket>,
@@ -929,7 +932,7 @@ fn pass_thread<W: Into<ExecWindow>>(
     fn stopped<T>(_: T) -> Error {
         Error::Prover(WALKERS_STOPPED.into())
     }
-    let mut pass = LeanPass::new(decode, start_registers)?;
+    let mut pass = LeanPass::new(decode, start_registers)?.words(words);
     let mut last: Option<(Arc<Vec<Log>>, Arc<MemoryState>, RegisterState)> = None;
     let mut waiting: Option<SyncSender<After>> = None;
     let (mut k, mut first, mut busy, mut entries, mut most) = (0u32, 0usize, 0.0, 0usize, 0usize);
@@ -1205,7 +1208,8 @@ fn check_thread(
     image: &PagedMem<u8>,
     windows: Receiver<CheckWindow>,
 ) -> Result<Vec<(u32, u64)>, Error> {
-    let mut pass = LeanPass::new(Arc::clone(&settings.decode), start_registers)?;
+    let words = settings.memory_format == crate::tables::fused_memory::MemoryFormat::Words;
+    let mut pass = LeanPass::new(Arc::clone(&settings.decode), start_registers)?.words(words);
     let mut walker = WindowWalker::new(settings);
     // Its re-walks are compared, not counted.
     walker.counts = None;

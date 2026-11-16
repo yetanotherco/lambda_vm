@@ -161,6 +161,9 @@ pub(crate) fn same_traces(a: &Traces, b: &Traces) {
     same_list("BYTEWISE", &a.bytewises, &b.bytewises);
     same_list("MEM_LOAD", &a.mem_loads, &b.mem_loads);
     same_list("MEM_STORE", &a.mem_stores, &b.mem_stores);
+    for (k, family) in crate::block_whir::WORD_TABLES.iter().enumerate() {
+        same_list(family, &a.word_tables[k], &b.word_tables[k]);
+    }
     same("BITWISE", &a.bitwise, &b.bitwise);
     same("DECODE", &a.decode, &b.decode);
     same("REGISTER", &a.register, &b.register);
