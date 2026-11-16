@@ -22,6 +22,7 @@ use super::{
 use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise::BitwiseHistogram;
 use crate::tables::decode::DecodeTable;
+use crate::tables::fused_memory::MemoryFormat;
 use crate::tables::memw_aligned::MemwAlignedOrder;
 use crate::tables::register::RegisterFormat;
 use crate::tables::trace_builder::Traces;
@@ -91,6 +92,7 @@ fn walked(
     decode: &DecodeTable,
     order: MemwAlignedOrder,
     format: RegisterFormat,
+    memory: MemoryFormat,
     batch: usize,
     (light, route): (bool, bool),
     counts: &mut WalkCounts,
@@ -113,7 +115,7 @@ fn walked(
         decode,
         order,
         format,
-        crate::tables::fused_memory::MemoryFormat::Split,
+        memory,
         false,
         batch,
         false,
@@ -133,7 +135,7 @@ fn walked(
 }
 
 /// Every list a walked window emits, as text.
-fn lists(w: &WalkedWindow) -> [(&'static str, String); 17] {
+fn lists(w: &WalkedWindow) -> [(&'static str, String); 18] {
     let l = &w.walk;
     [
         ("CPU", dbg(&w.cpu_ops)),
@@ -153,6 +155,7 @@ fn lists(w: &WalkedWindow) -> [(&'static str, String); 17] {
         ("ECDAS", dbg(&l.ecdas_ops)),
         ("COPY", dbg(&l.copy_ops)),
         ("HINT", dbg(&l.hint_ops)),
+        ("word rows", dbg(&l.word_rows)),
     ]
 }
 
@@ -172,6 +175,30 @@ fn light_is_todays(
     order: MemwAlignedOrder,
     format: RegisterFormat,
 ) -> usize {
+    light_is_todays_under(
+        name,
+        program,
+        input,
+        (window, batch),
+        order,
+        format,
+        MemoryFormat::Split,
+    )
+}
+
+/// [`light_is_todays`] under the memory format `memory`: under the word
+/// format the run's history is the word history, and the windows' word rows
+/// are among the lists compared.
+fn light_is_todays_under(
+    name: &str,
+    program: &Elf,
+    input: &[u8],
+    (window, batch): (usize, usize),
+    order: MemwAlignedOrder,
+    format: RegisterFormat,
+    memory: MemoryFormat,
+) -> usize {
+    let words = memory == MemoryFormat::Words;
     let max_rows = MaxRowsConfig::small();
     let builder = WindowedTraceBuilder::new(program, input, &max_rows).expect("the builder");
     let decode = Arc::clone(&builder.decode);
@@ -181,16 +208,25 @@ fn light_is_todays(
     let mut sizes = levels.map(|_| WalkSizes::default());
     let mut cpu_lookups = BitwiseHistogram::new();
     let mut fast = FastExecutor::new(program, input.to_vec()).expect("the fast engine");
-    fast.enable_history().expect("history mode");
+    if words {
+        fast.enable_word_history().expect("the word history");
+    } else {
+        fast.enable_history().expect("history mode");
+    }
     let (mut first, mut k) = (0usize, 0usize);
     loop {
-        let Some((logs, history)) = fast.resume_history(window).expect("the run") else {
+        let next = if words {
+            fast.resume_word_history(window)
+        } else {
+            fast.resume_history(window)
+        };
+        let Some((logs, history)) = next.expect("the run") else {
             break;
         };
         if logs.last().is_some_and(|l| l.next_pc == 0) {
             break;
         }
-        let what = format!("{name}/{window}/{batch}/{order:?}/{format:?} window {k}");
+        let what = format!("{name}/{window}/{batch}/{order:?}/{format:?}/{memory:?} window {k}");
         let history = Arc::new(history);
         let mut walks = Vec::with_capacity(3);
         for (i, level) in levels.into_iter().enumerate() {
@@ -198,6 +234,7 @@ fn light_is_todays(
                 &decode,
                 order,
                 format,
+                memory,
                 batch,
                 level,
                 &mut counts[i],
@@ -212,7 +249,14 @@ fn light_is_todays(
         for op in &today.cpu_ops {
             decode.op(op).count_bitwise_into(&mut cpu_lookups);
         }
-        let routed = route_ops_one_pass(&today.cpu_ops, &decode, &today.walk.cpu32_ops, true);
+        // The accumulator routes the CPU's stores to STORE under the split
+        // format alone.
+        let routed = route_ops_one_pass(
+            &today.cpu_ops,
+            &decode,
+            &today.walk.cpu32_ops,
+            memory == MemoryFormat::Split,
+        );
         let want = lists(today);
         for (level, (light, refused)) in walks.iter().enumerate().skip(1) {
             let what = format!("{what} level {level}");
@@ -351,6 +395,7 @@ fn the_light_walk_refuses_a_history_without_the_access() {
                 &decode,
                 MemwAlignedOrder::Limbs,
                 RegisterFormat::InRow,
+                MemoryFormat::Split,
                 2048,
                 level,
                 &mut WalkCounts::default(),
@@ -369,6 +414,7 @@ fn the_light_walk_refuses_a_history_without_the_access() {
             &decode,
             MemwAlignedOrder::Limbs,
             RegisterFormat::InRow,
+            MemoryFormat::Split,
             2048,
             level,
             &mut WalkCounts::default(),
@@ -378,6 +424,122 @@ fn the_light_walk_refuses_a_history_without_the_access() {
             &history,
         );
         assert!(!refused, "the recorded history: level {level:?} refused it");
+    }
+}
+
+/// The programs the word memory format walks: the CPU's loads and stores of
+/// every width and alignment, and the chips it takes (COPY, keccak256,
+/// ECREC).
+const WORD_PROGRAMS: [&str; 8] = [
+    "all_instructions_64",
+    "all_loadstore_32",
+    "misalign_ld",
+    "misalign_sd",
+    "misalign_sh",
+    "test_commit_split",
+    "test_copy_ecalls",
+    "test_keccak256",
+];
+
+/// ★ Under the word memory format the light walk emits today's lists: every
+/// window of each run, walked from the word history at levels 1 and 2 (a
+/// load or store reading its words from its word access record, no cell
+/// made), emits the word rows and every other list the cell walk emits,
+/// refuses nothing, and counts today's lookups; at windows from one cycle to
+/// many and batches that cross them. ECREC's run too (its rows compared on
+/// their own).
+#[test]
+fn the_light_walk_emits_today_s_lists_under_the_word_format() {
+    let mut windows = 0;
+    for name in WORD_PROGRAMS.into_iter().chain(["test_ecrec"]) {
+        let (program, _) = run(name);
+        for (window, batch) in [(1, 2048), (7, 3), (33, 2048), (4096, 5)] {
+            windows += light_is_todays_under(
+                name,
+                &program,
+                &[],
+                (window, batch),
+                MemwAlignedOrder::Limbs,
+                RegisterFormat::InRow,
+                MemoryFormat::Words,
+            );
+        }
+    }
+    assert!(windows > 500, "{windows} windows compared");
+}
+
+/// ★ Under the word memory format the light walk refuses a window whose word
+/// history misses a load's or a store's word record, or names another address
+/// for it, as the cell walk refuses it for the cells the cycle lacks; the
+/// history as recorded is walked at every level.
+#[test]
+fn the_light_walk_refuses_a_word_history_without_the_access() {
+    let (program, _) = run("all_loadstore_32");
+    let max_rows = MaxRowsConfig::small();
+    let builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder");
+    let decode = Arc::clone(&builder.decode);
+    drop(builder);
+    let mut fast = FastExecutor::new(&program, Vec::new()).expect("the fast engine");
+    fast.enable_word_history().expect("the word history");
+    let accessed = |h: &WindowHistory| {
+        h.extras
+            .iter()
+            .position(|e| e.side != NO_ACCESS && e.side & executor::vm::history::ECALL == 0)
+    };
+    let (first, logs, history, at) = {
+        let mut first = 0usize;
+        loop {
+            let (logs, history) = fast
+                .resume_word_history(33)
+                .expect("the run")
+                .expect("a window with a load or store");
+            assert!(history.words, "a word history");
+            assert!(
+                logs.last().is_none_or(|l| l.next_pc != 0),
+                "the run halted before a load or store"
+            );
+            if let Some(at) = accessed(&history) {
+                break (first, logs, history, at);
+            }
+            first += logs.len();
+        }
+    };
+    let mut no_access = history.clone();
+    no_access.extras[at].side = NO_ACCESS;
+    let mut moved = history.clone();
+    let index = moved.extras[at].side as usize;
+    moved.word_accesses[index].addr ^= 8;
+    let walk = |history: &Arc<WindowHistory>, level| {
+        walked(
+            &decode,
+            MemwAlignedOrder::Limbs,
+            RegisterFormat::InRow,
+            MemoryFormat::Words,
+            2048,
+            level,
+            &mut WalkCounts::default(),
+            &mut WalkSizes::default(),
+            first,
+            &logs,
+            history,
+        )
+        .1
+    };
+    for (what, tampered) in [("no access", no_access), ("another address", moved)] {
+        let tampered = Arc::new(tampered);
+        for level in [(false, false), (true, false), (true, true)] {
+            assert!(
+                walk(&tampered, level),
+                "{what}: level {level:?} walked the window"
+            );
+        }
+    }
+    let history = Arc::new(history);
+    for level in [(false, false), (true, false), (true, true)] {
+        assert!(
+            !walk(&history, level),
+            "the recorded history: level {level:?} refused it"
+        );
     }
 }
 

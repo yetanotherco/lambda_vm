@@ -32,10 +32,11 @@ use super::super::page_w;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::super::word_cpu::{WordClass, word_class};
 use super::super::word_memory::WORD_BYTES;
-use super::{ABSENT, MemoryState, cpu_op_to_bytes_and_signed, vec_heap_bytes};
+use super::{ABSENT, HistoryOverlay, MemoryState, cpu_op_to_bytes_and_signed, vec_heap_bytes};
 use crate::Error;
 use crate::tables::cpu::CpuOp;
 use stark::trace::TraceTable;
+use std::sync::atomic::Ordering::Relaxed;
 
 /// The word tables' rows a walk makes, family by family, in the ops' order
 /// (`block_whir::WORD_TABLES`' order: MEM_LOAD8, MEM_STORE8, MEM_LOADW,
@@ -166,6 +167,43 @@ fn read_word(memory_state: &mut MemoryState, base: u64) -> (u64, u64) {
         word | (u64::from(byte) & 0xFF) << (8 * i)
     });
     (word, stamps.iter().copied().max().unwrap_or(0))
+}
+
+/// The words a load or store at `address` touches, each its value and its
+/// old timestamp: the word holding its first byte, and the next when it
+/// crosses (`(0, 0)` for none). Under the light record walk (`light`) from
+/// the cycle's word access record ([`HistoryOverlay::word_access`]), else
+/// from the walk's memory ([`read_word`]). A missing record, or one that is
+/// not this access's, marks the state missing and reads [`ABSENT`].
+fn touched_words(
+    memory_state: &mut MemoryState,
+    address: u64,
+    crossing: bool,
+    light: bool,
+) -> [(u64, u64); 2] {
+    let base = address - address % WORD_BYTES;
+    if !light {
+        let first = read_word(memory_state, base);
+        let second = if crossing {
+            read_word(memory_state, base + WORD_BYTES)
+        } else {
+            (0, 0)
+        };
+        return [first, second];
+    }
+    let record = memory_state
+        .overlay
+        .as_deref()
+        .and_then(HistoryOverlay::word_access)
+        .filter(|&(at, _, _)| at == address);
+    match record {
+        Some((_, first, None)) if !crossing => [first, (0, 0)],
+        Some((_, first, Some(second))) if crossing => [first, second],
+        _ => {
+            memory_state.missing.store(true, Relaxed);
+            [(0, ABSENT), (0, ABSENT)]
+        }
+    }
 }
 
 /// Refuses an ECALL under the word memory format that is neither the halt,
@@ -316,6 +354,7 @@ fn refused(table: &str, why: String) -> Error {
 pub(super) fn word_load(
     op: CpuOp<'_>,
     memory_state: &mut MemoryState,
+    light: bool,
     rows: &mut WordRows,
     lookups: Option<&mut Vec<BitwiseOperation>>,
 ) -> Result<(), Error> {
@@ -323,11 +362,12 @@ pub(super) fn word_load(
     let (count, signed) = cpu_op_to_bytes_and_signed(op);
     let width = count as u8;
     let class = word_class(address, width).map_err(|why| refused("a word load", why))?;
-    let base = address - address % WORD_BYTES;
     let ts = op.timestamp;
+    let [(first, old_first), (second, old_second)] =
+        touched_words(memory_state, address, class == WordClass::Crossing, light);
     let made = match class {
         WordClass::Whole => {
-            let (word, old) = read_word(memory_state, base);
+            let (word, old) = (first, old_first);
             (old != ABSENT)
                 .then(|| {
                     Load8Row::new(address, ts, old, word).map(|row| {
@@ -343,7 +383,7 @@ pub(super) fn word_load(
                 .map_err(|why| refused("MEM_LOAD8", why))?
         }
         WordClass::Within => {
-            let (word, old) = read_word(memory_state, base);
+            let (word, old) = (first, old_first);
             (old != ABSENT)
                 .then(|| {
                     LoadWRow::new(address, ts, old, width, signed, word).map(|row| {
@@ -358,31 +398,27 @@ pub(super) fn word_load(
                 .transpose()
                 .map_err(|why| refused("MEM_LOADW", why))?
         }
-        WordClass::Crossing => {
-            let (first, old_first) = read_word(memory_state, base);
-            let (second, old_second) = read_word(memory_state, base + WORD_BYTES);
-            (old_first != ABSENT && old_second != ABSENT)
-                .then(|| {
-                    Load2WRow::new(
-                        address,
-                        ts,
-                        [old_first, old_second],
-                        width,
-                        signed,
-                        [first, second],
-                    )
-                    .map(|row| {
-                        let result = u64::from_le_bytes(row.result().0);
-                        if let Some(out) = lookups {
-                            out.extend(row.bitwise_ops());
-                        }
-                        rows.load2w.push(row);
-                        result
-                    })
+        WordClass::Crossing => (old_first != ABSENT && old_second != ABSENT)
+            .then(|| {
+                Load2WRow::new(
+                    address,
+                    ts,
+                    [old_first, old_second],
+                    width,
+                    signed,
+                    [first, second],
+                )
+                .map(|row| {
+                    let result = u64::from_le_bytes(row.result().0);
+                    if let Some(out) = lookups {
+                        out.extend(row.bitwise_ops());
+                    }
+                    rows.load2w.push(row);
+                    result
                 })
-                .transpose()
-                .map_err(|why| refused("MEM_LOAD2W", why))?
-        }
+            })
+            .transpose()
+            .map_err(|why| refused("MEM_LOAD2W", why))?,
     };
     if let Some(result) = made
         && result != op.rvd
@@ -393,7 +429,10 @@ pub(super) fn word_load(
             op.rvd
         )));
     }
-    memory_state.write_bytes(address, op.rvd, count, ts);
+    // The light walk keeps no cells: the next cycle's record holds the write.
+    if !light {
+        memory_state.write_bytes(address, op.rvd, count, ts);
+    }
     Ok(())
 }
 
@@ -402,6 +441,7 @@ pub(super) fn word_load(
 pub(super) fn word_store(
     op: CpuOp<'_>,
     memory_state: &mut MemoryState,
+    light: bool,
     rows: &mut WordRows,
     lookups: Option<&mut Vec<BitwiseOperation>>,
 ) -> Result<(), Error> {
@@ -409,11 +449,12 @@ pub(super) fn word_store(
     let (count, _) = cpu_op_to_bytes_and_signed(op);
     let width = count as u8;
     let class = word_class(address, width).map_err(|why| refused("a word store", why))?;
-    let base = address - address % WORD_BYTES;
     let (ts, value) = (op.timestamp, op.rv2);
+    let [(first, old_first), (second, old_second)] =
+        touched_words(memory_state, address, class == WordClass::Crossing, light);
     match class {
         WordClass::Whole => {
-            let (old_word, old) = read_word(memory_state, base);
+            let (old_word, old) = (first, old_first);
             if old != ABSENT {
                 let row = Store8Row::new(address, ts, old, old_word, value)
                     .map_err(|why| refused("MEM_STORE8", why))?;
@@ -424,7 +465,7 @@ pub(super) fn word_store(
             }
         }
         WordClass::Within => {
-            let (old_word, old) = read_word(memory_state, base);
+            let (old_word, old) = (first, old_first);
             if old != ABSENT {
                 let row = StoreWRow::new(address, ts, old, width, value, old_word)
                     .map_err(|why| refused("MEM_STOREW", why))?;
@@ -435,8 +476,6 @@ pub(super) fn word_store(
             }
         }
         WordClass::Crossing => {
-            let (first, old_first) = read_word(memory_state, base);
-            let (second, old_second) = read_word(memory_state, base + WORD_BYTES);
             if old_first != ABSENT && old_second != ABSENT {
                 let row = Store2WRow::new(
                     address,
@@ -454,7 +493,10 @@ pub(super) fn word_store(
             }
         }
     }
-    memory_state.write_bytes(address, value, count, ts);
+    // The light walk keeps no cells: the next cycle's record holds the write.
+    if !light {
+        memory_state.write_bytes(address, value, count, ts);
+    }
     Ok(())
 }
 

@@ -1049,6 +1049,12 @@ struct MemoryState {
     overlay: Option<Box<HistoryOverlay>>,
 }
 
+/// A load's or store's words as the word history records them
+/// ([`HistoryOverlay::word_access`]): its address, the word holding its first
+/// byte (`(value, timestamp)` before the cycle) and, when it crosses, the
+/// next word's.
+pub(crate) type WordAccessRecord = (u64, (u64, u64), Option<(u64, u64)>);
+
 /// A window walked from the executor's history (record mode): the cells each
 /// cycle reads before it, as the executor wrote them
 /// ([`executor::vm::history::WindowHistory`]). The walk starts each cycle
@@ -1122,6 +1128,31 @@ impl HistoryOverlay {
             self.history.mixed.get(a.mixed as usize)?.map(u64::from)
         };
         Some((a.addr, a.old, ts))
+    }
+
+    /// Under the word history, the cycle's load or store as its record holds
+    /// it: its address, the word holding its first byte (that word's value
+    /// and timestamp before the cycle) and, when it crosses, the next word's;
+    /// `None` when the cycle has no record or none of a load or store, or the
+    /// history is not the word history.
+    fn word_access(&self) -> Option<WordAccessRecord> {
+        use executor::vm::history::{ECALL, NO_ACCESS};
+        if !self.history.words {
+            return None;
+        }
+        let side = self.history.extras.get(self.cycle?)?.side;
+        if side == NO_ACCESS || side & ECALL != 0 {
+            return None;
+        }
+        let a = self.history.word_accesses.get(side as usize)?;
+        let next = match a.next {
+            NO_ACCESS => None,
+            n => {
+                let cell = self.history.next_words.get(n as usize)?;
+                Some((cell.word, u64::from(cell.ts)))
+            }
+        };
+        Some((a.addr, (a.word, u64::from(a.ts)), next))
     }
 
     /// Whether the cycle's register accesses find, in the walk's register
@@ -2514,7 +2545,8 @@ fn walk_cpu_ops<const REST: bool>(
         // Record mode: the cycle's cells from the executor's history, its
         // register accesses checked against the walk's cells. The light
         // record walk makes no cell for a cycle that is no ECALL: its load
-        // or store reads its access record.
+        // or store reads its access record (under the word memory format, its
+        // words' record).
         let mut light = false;
         // Under the word memory format the format takes no syscall but the
         // halt and the COPY chip's: any other is refused before it touches
@@ -2523,7 +2555,7 @@ fn walk_cpu_ops<const REST: bool>(
             word_walk::refuse_syscall(op)?;
         }
         if let Some(overlay) = memory_state.overlay.as_deref_mut() {
-            light = overlay.light && !op.decode.fields.ecall && !words;
+            light = overlay.light && !op.decode.fields.ecall;
             if light {
                 overlay.begin_light(op.timestamp);
             } else {
@@ -2548,6 +2580,7 @@ fn walk_cpu_ops<const REST: bool>(
             word_walk::word_load(
                 op,
                 memory_state,
+                light,
                 word_rows,
                 lookups.then_some(&mut *bitwise_ops),
             )?;
@@ -2555,6 +2588,7 @@ fn walk_cpu_ops<const REST: bool>(
             word_walk::word_store(
                 op,
                 memory_state,
+                light,
                 word_rows,
                 lookups.then_some(&mut *bitwise_ops),
             )?;
