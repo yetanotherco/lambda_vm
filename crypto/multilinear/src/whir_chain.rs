@@ -400,6 +400,9 @@ pub struct ChainFormat {
     /// today: every round commits its successor and the last folds to a
     /// constant.
     pub final_poly: FinalPoly,
+    /// How a round checks the successor it commits ([`RoundForm`]).
+    /// [`RoundForm::Fri`] = today: each query opens the successor too.
+    pub rounds: RoundForm,
 }
 
 impl ChainFormat {
@@ -415,6 +418,7 @@ impl ChainFormat {
         leaves: LeafOrder::Natural,
         round0: Round0Trees::Each,
         final_poly: FinalPoly::Off,
+        rounds: RoundForm::Fri,
     };
 
     /// True when this is today's format (`Fixed(0)` counts as `Off`).
@@ -429,6 +433,7 @@ impl ChainFormat {
             && self.leaves == LeafOrder::Natural
             && self.round0 == Round0Trees::Each
             && self.final_poly == FinalPoly::Off
+            && self.rounds == RoundForm::Fri
     }
 
     /// The cap policy of trees with `arity` children per node:
@@ -702,6 +707,233 @@ impl FinalPoly {
 /// [`FOLD_WORD_INDEXED`] is bit 47, [`FOLD_WORD_COSET`] 46 and
 /// [`FOLD_WORD_ONE_TREE`] 45.
 pub const FOLD_WORD_FINAL: u64 = 1 << 44;
+
+/// How a round that commits a successor checks it.
+///
+/// [`Fri`](Self::Fri) is today's format: the successor is the current
+/// codeword folded, on the folded domain (the rate never moves), and every
+/// query opens BOTH trees — the current block, folded, must equal the
+/// successor's value there. A later tree is so opened twice per query: once as
+/// a successor, once as the next round's current tree.
+///
+/// [`Whir`](Self::Whir) is the round of the WHIR paper (Arnon, Chiesa, Fenzi
+/// and Yogev, 2024):
+/// - the successor is the bound message encoded on round `r`'s domain squared
+///   `s_r = min(shrink, k_r)` times — a bigger domain than the fold's when
+///   `shrink < k_r`, so the rate rises by `k_r − s_r` bits a round;
+/// - the successor is NOT opened. A query `j`'s fold value `v_j` is a claim
+///   `f_{r+1}(pow(y_j)) = v_j`, `y_j` the query's point of the FOLDED domain
+///   (round `r`'s domain squared `k_r` times) and `pow(y) = (y, y², y⁴, …)`
+///   ([`ood_point`]); after the round's openings one `γ` is drawn and the
+///   claims enter the next round's weight as `Σ_j γ^{j+1}·eq(pow(y_j), ·)`,
+///   beside the out-of-domain claim, which keeps its own challenge;
+/// - each round queries `Q_r` positions, the count for its own rate
+///   ([`ChainConfig::round_queries`]).
+///
+/// Round 0's opening, the out-of-domain point, the final round (a constant or
+/// [`FinalPoly`]'s polynomial) and a grouped or joint round 0 keep their
+/// meaning; only what a non-final round checks of its successor changes.
+///
+/// ★ A FORMAT VALUE, NOT A HINT. A verifier-side constant like the rest of
+/// [`ChainFormat`], bound into the statement through [`ChainConfig::fold_word`]
+/// ([`FOLD_WORD_WHIR`]), never read from a proof: a proof under one form, one
+/// shrink or one query target is refused under any other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RoundForm {
+    /// Every query opens the successor. Today's format.
+    #[default]
+    Fri,
+    /// Fold values become claims on the successor; see the type's doc.
+    Whir(WhirRounds),
+}
+
+/// The round form's parameters: the shrink and the query target the later
+/// rounds' counts are derived for.
+///
+/// ★ WHY THE TARGET IS HERE. Round 0's count is the config's
+/// [`ChainConfig::num_queries`]; a later round's is the same rule at its own
+/// rate, `query_count::num_queries(lb_r, union_rounds, security_bits,
+/// grind.query)`, and the rule's two inputs besides the rate are not in a
+/// [`ChainConfig`]. They are carried here, checked against round 0's count
+/// ([`check_round_form`]) and bound into the fold word, so every round's count
+/// is a verifier constant of the statement.
+///
+/// Constructed only through [`WhirRounds::new`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WhirRounds {
+    shrink: u8,
+    security_bits: u8,
+    union_rounds: u8,
+}
+
+impl WhirRounds {
+    /// `None` for a shrink outside `1..=MAX_FOLD` or a union outside
+    /// `1..=255` rounds.
+    pub const fn new(shrink: usize, security_bits: u8, union_rounds: usize) -> Option<Self> {
+        if shrink >= 1 && shrink <= MAX_FOLD && union_rounds >= 1 && union_rounds <= 255 {
+            Some(Self {
+                shrink: shrink as u8,
+                security_bits,
+                union_rounds: union_rounds as u8,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// `log2` of how much a round's domain shrinks, at most: a round folding
+    /// `k_r < shrink` variables shrinks it by `k_r`.
+    pub const fn shrink(self) -> usize {
+        self.shrink as usize
+    }
+
+    /// The security target the counts are derived for.
+    pub const fn security_bits(self) -> u8 {
+        self.security_bits
+    }
+
+    /// The union bound's round count the counts are charged.
+    pub const fn union_rounds(self) -> usize {
+        self.union_rounds as usize
+    }
+}
+
+/// The bit of [`ChainConfig::fold_word`] that says [`RoundForm::Whir`], always
+/// beside [`FOLD_WORD_TAG`]: the shrink in bits 40..=42, the security target
+/// in 24..=31 and the union's round count in 16..=23. No other word sets
+/// them: a `First` word's fields sit at bits 52+, 48 and the low nibble,
+/// [`FOLD_WORD_INDEXED`] is bit 47, [`FOLD_WORD_COSET`] 46,
+/// [`FOLD_WORD_ONE_TREE`] 45 and [`FOLD_WORD_FINAL`] 44 with its `v` in
+/// 36..=39.
+pub const FOLD_WORD_WHIR: u64 = 1 << 43;
+
+/// Refuses a [`RoundForm::Whir`] config whose query target does not give its
+/// own round-0 count: the target is then not the one the config was sized
+/// for, and the later rounds' counts would answer to another. Called before a
+/// chain is proved and before a proof is read.
+pub fn check_round_form(config: &ChainConfig) -> Result<(), Error> {
+    match config.format.rounds {
+        RoundForm::Fri => Ok(()),
+        RoundForm::Whir(w) => {
+            let derived = crate::query_count::num_queries(
+                config.log_blowup,
+                w.union_rounds(),
+                w.security_bits(),
+                config.grind.query,
+            );
+            if derived == config.num_queries {
+                Ok(())
+            } else {
+                Err(Error::RoundFormTarget {
+                    expected: derived,
+                    got: config.num_queries,
+                })
+            }
+        }
+    }
+}
+
+/// Test only: faults a round-form test switches on, one at a time, to show
+/// that each piece of the round form is load-bearing: under a verifier fault
+/// an honest proof is refused, and under [`Fault::DropShiftClaims`] (both
+/// sides) a forged evaluation is accepted. Thread-local, so a test that sets
+/// one moves no other test's prover or verifier.
+#[cfg(test)]
+pub(crate) mod round_form_faults {
+    /// Which piece of the round form is broken.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        #[default]
+        None,
+        /// Prover and verifier both leave the shift claims out: no weight
+        /// term, no claim term. The protocol stays complete; only the check
+        /// of the successor against the folds is gone.
+        DropShiftClaims,
+        /// The verifier takes a query's point in the round's own domain
+        /// rather than the folded one.
+        ShiftPointUnfolded,
+        /// The verifier evaluates a shift claim at `pow(y)` with its last
+        /// coordinate one squaring short (`y^(2^(n−2))` where
+        /// `y^(2^(n−1))` belongs).
+        ShiftPointOneSquaringShort,
+        /// The verifier weights every shift claim with `γ` itself.
+        ReuseGammaPower,
+        /// The verifier adds the shift claims to the claim but leaves their
+        /// `eq` out of the final weight.
+        ShiftClaimsNotInWeight,
+        /// The verifier leaves the out-of-domain claims out of the final
+        /// weight.
+        OodNotInWeight,
+        /// The verifier takes a round's query count from the proof's
+        /// openings.
+        QueriesFromProof,
+        /// The prover queries one position fewer than `Q_r` at every round
+        /// after round 0 (a cheating prover).
+        ProverQueriesShort,
+        /// The verifier draws a round's positions before it absorbs the
+        /// successor's root.
+        PositionsBeforeSuccessor,
+        /// The config derives a later round's rate as if its domain had not
+        /// shrunk at all (`lb_r = lb + Σ k_i`): the rate overstated, the
+        /// later rounds' counts too few.
+        RateIgnoresShrink,
+    }
+
+    std::thread_local! {
+        static FAULT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
+    }
+
+    pub(crate) fn get() -> Fault {
+        FAULT.with(std::cell::Cell::get)
+    }
+
+    /// Runs `f` under `fault`, restoring the previous one after.
+    pub(crate) fn with<R>(fault: Fault, f: impl FnOnce() -> R) -> R {
+        struct Restore(Fault);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAULT.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FAULT.with(|c| c.replace(fault)));
+        f()
+    }
+}
+
+/// Whether the test-only round-form fault `fault` is on (never outside a
+/// test build).
+#[inline]
+fn round_form_fault(fault: RoundFormFault) -> bool {
+    #[cfg(test)]
+    {
+        round_form_faults::get() == fault
+    }
+    #[cfg(not(test))]
+    {
+        let _ = fault;
+        false
+    }
+}
+
+#[cfg(test)]
+use round_form_faults::Fault as RoundFormFault;
+
+/// Outside a test build no fault exists: the one value `round_form_fault`
+/// takes and never matches.
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+enum RoundFormFault {
+    DropShiftClaims,
+    ShiftPointUnfolded,
+    ShiftPointOneSquaringShort,
+    ReuseGammaPower,
+    ShiftClaimsNotInWeight,
+    OodNotInWeight,
+    QueriesFromProof,
+    ProverQueriesShort,
+    PositionsBeforeSuccessor,
+    RateIgnoresShrink,
+}
 
 /// See [`WHIR_CAP_IMPLEMENTED`]. W2 is in: the host chain, the statement word,
 /// `agrees_with`, the production config, the GPU parity at k = 6 and the
@@ -1059,6 +1291,11 @@ impl ChainConfig {
     ///   [`FOLD_WORD_ONE_TREE`] set: a joint run's root and paths are another
     ///   tree's, so a statement with one tree a run shares no word with one
     ///   tree a polynomial.
+    /// - [`RoundForm::Whir`] → any word above with [`FOLD_WORD_TAG`] and
+    ///   [`FOLD_WORD_WHIR`] set, its shrink, security target and union round
+    ///   count beside it: every round's domain and query count follow from
+    ///   them, so a statement under one round form shares no word with
+    ///   another. [`RoundForm::Fri`] sets none of these bits: today's words.
     ///
     /// Every chain's schedule is a function of this word and its own
     /// `num_vars`, which the statement already binds, so binding the word
@@ -1087,6 +1324,16 @@ impl ChainConfig {
             FinalPoly::Off => word,
             FinalPoly::Vars(v) => {
                 word | FOLD_WORD_TAG | FOLD_WORD_FINAL | ((u64::from(v) & 0xf) << 36)
+            }
+        };
+        let word = match self.format.rounds {
+            RoundForm::Fri => word,
+            RoundForm::Whir(w) => {
+                word | FOLD_WORD_TAG
+                    | FOLD_WORD_WHIR
+                    | ((w.shrink() as u64 & 0x7) << 40)
+                    | (u64::from(w.security_bits()) << 24)
+                    | ((w.union_rounds() as u64 & 0xff) << 16)
             }
         };
         match self.format.leaves {
@@ -1134,6 +1381,20 @@ impl ChainConfig {
     /// hash's arity.
     pub fn tree_caps_at(&self, num_vars: usize, arity: usize) -> Vec<usize> {
         let policy = self.format.cap_policy_at(arity);
+        if let RoundForm::Whir(_) = self.format.rounds {
+            // Each tree is opened by its own round alone, `Q_t` times, and
+            // has depth `D_t − k_t` over its round's own domain.
+            let queries = self.round_queries(num_vars);
+            return self
+                .round_domain_logs(num_vars)
+                .iter()
+                .zip(self.schedule(num_vars))
+                .zip(queries)
+                .map(|((&domain_log, k), openings)| {
+                    crate::whir_commit::tree_cap_height(policy, openings, domain_log - k, arity)
+                })
+                .collect();
+        }
         let mut domain_log = num_vars + self.log_blowup;
         self.schedule(num_vars)
             .iter()
@@ -1148,6 +1409,116 @@ impl ChainConfig {
                 crate::whir_commit::tree_cap_height(policy, openings, domain_log, arity)
             })
             .collect()
+    }
+
+    /// `log2` of how much round `r`'s domain shrinks from round `r` to round
+    /// `r + 1`, for a round folding `k` variables: `k` under
+    /// [`RoundForm::Fri`] (the successor is the fold), `min(shrink, k)` under
+    /// [`RoundForm::Whir`] (the successor is the bound message encoded on a
+    /// domain at least as big as the fold's: the rate never falls).
+    pub fn shrink_of(&self, k: usize) -> usize {
+        match self.format.rounds {
+            RoundForm::Fri => k,
+            RoundForm::Whir(w) => w.shrink().min(k),
+        }
+    }
+
+    /// `log2` of each round's domain size for a chain over `num_vars`
+    /// variables (a polynomial's, without an index): `D_0 = num_vars +
+    /// log_blowup`, then `D_{r+1} = D_r − shrink_of(k_r)`. Under
+    /// [`RoundForm::Fri`] round `r + 1`'s domain is round `r`'s folded.
+    pub fn round_domain_logs(&self, num_vars: usize) -> Vec<usize> {
+        let mut d = num_vars + self.log_blowup;
+        self.schedule(num_vars)
+            .iter()
+            .map(|&k| {
+                let here = d;
+                d -= self.shrink_of(k);
+                here
+            })
+            .collect()
+    }
+
+    /// `log2` of each round's inverse rate: `lb_r = D_r − n_r`, `n_r` the
+    /// variables round `r`'s message has left. `log_blowup` every round under
+    /// [`RoundForm::Fri`]; `log_blowup + Σ_{i<r} (k_i − shrink_of(k_i))`
+    /// under [`RoundForm::Whir`].
+    pub fn round_log_blowups(&self, num_vars: usize) -> Vec<usize> {
+        let mut lb = self.log_blowup;
+        self.schedule(num_vars)
+            .iter()
+            .map(|&k| {
+                let here = lb;
+                lb += if round_form_fault(RoundFormFault::RateIgnoresShrink) {
+                    k
+                } else {
+                    k - self.shrink_of(k)
+                };
+                here
+            })
+            .collect()
+    }
+
+    /// ★ THE PER-ROUND Q RULE: how many positions each round of a chain over
+    /// `num_vars` variables queries.
+    ///
+    /// Under [`RoundForm::Fri`] every round queries
+    /// [`num_queries`](Self::num_queries), today's. Under [`RoundForm::Whir`]
+    /// round 0 queries `num_queries` (which [`check_round_form`] holds to the
+    /// target) and round `r ≥ 1` the count for its own rate under the same
+    /// target: `query_count::num_queries(lb_r, union_rounds, security_bits,
+    /// grind.query)`, `lb_r` from
+    /// [`round_log_blowups`](Self::round_log_blowups). A round with no query
+    /// (one after a final polynomial) is given a count all the same and opens
+    /// nothing.
+    pub fn round_queries(&self, num_vars: usize) -> Vec<usize> {
+        match self.format.rounds {
+            RoundForm::Fri => vec![self.num_queries; self.rounds(num_vars)],
+            RoundForm::Whir(w) => self
+                .round_log_blowups(num_vars)
+                .iter()
+                .enumerate()
+                .map(|(r, &lb)| {
+                    if r == 0 {
+                        self.num_queries
+                    } else {
+                        crate::query_count::num_queries(
+                            lb,
+                            w.union_rounds(),
+                            w.security_bits(),
+                            self.grind.query,
+                        )
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// This config under the round form at `shrink`, its later rounds'
+    /// counts derived for `security_bits` and the union over the rounds any
+    /// chain of at most `num_vars` variables runs — the target
+    /// [`with_security_folds`](Self::with_security_folds) sized
+    /// [`num_queries`](Self::num_queries) for when given the same three. `None`
+    /// for a shrink outside `1..=MAX_FOLD`.
+    pub fn with_whir_rounds(
+        self,
+        shrink: usize,
+        security_bits: u8,
+        num_vars: usize,
+    ) -> Option<Self> {
+        let union = (1..=num_vars)
+            .map(|m| self.rounds(m))
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let rounds = RoundForm::Whir(WhirRounds::new(shrink, security_bits, union)?);
+        Some(Self {
+            format: ChainFormat {
+                rounds,
+                ..self.format
+            },
+            ..self
+        })
     }
 
     /// The final-polynomial round of a chain over `num_vars` variables under
@@ -1842,6 +2213,100 @@ where
             Self::Lockstep { .. } | Self::DeviceLockstep { .. } => Err(Error::NoVariablesLeft),
         }
     }
+
+    /// The round form's successor ([`RoundForm::Whir`]): the message these
+    /// rounds bound, encoded on `codeword`'s domain squared `levels` times —
+    /// on the card when the factors and the codeword are both there, whatever
+    /// `gpu::encode_successor_in_effect` says (the fold is no alternative: it
+    /// lands on another domain). `None` sends the caller to the host encode.
+    fn encode_successor_always<C: IsField>(
+        &mut self,
+        codeword: &Codeword<C>,
+        levels: usize,
+    ) -> Option<Codeword<E>> {
+        match (self, codeword) {
+            (Self::Device(device), Codeword::Device(held)) => device
+                .encode_successor_always(held, levels)
+                .map(Codeword::Device),
+            (Self::Device(device), Codeword::Source(held)) => device
+                .encode_successor_from_always(held.source(), levels)
+                .map(Codeword::Device),
+            _ => None,
+        }
+    }
+
+    /// `weight += Σ_j scales[j]·eq(points[j], ·)`: the round form's shift
+    /// claims entering the weight the next group carries, all at once — on
+    /// the host one pass over the weight ([`crate::eq::add_eq_sum`]), on a
+    /// card one batched kernel over each point's two half tables.
+    fn add_shift_claims(
+        &mut self,
+        points: &[Vec<FieldElement<E>>],
+        scales: &[FieldElement<E>],
+    ) -> Result<(), Error> {
+        match self {
+            Self::Host { weight, .. } => {
+                let mut table =
+                    core::mem::replace(weight, Mle::new(vec![FieldElement::<E>::zero()])?)
+                        .evals()
+                        .to_vec();
+                crate::eq::add_eq_sum(&mut table, points, scales)?;
+                *weight = Mle::new(table)?;
+                Ok(())
+            }
+            Self::Device(device) => device.add_shift_claims(points, scales),
+            Self::Lockstep { .. } | Self::DeviceLockstep { .. } => Err(Error::NoVariablesLeft),
+        }
+    }
+}
+
+/// ★ The round form's successor ([`RoundForm::Whir`]): the message `factors`
+/// bound in round `r`, encoded on `domain` (round `r`'s) squared `levels =
+/// shrink_of(k_r)` times. On the card when it takes it; on the host
+/// otherwise, from the message the host holds or one read back off the card.
+/// Never a fold: a fold lands on the domain squared `k_r` times. Returns the
+/// successor and its domain.
+fn encode_round_successor<F, E, H>(
+    factors: &mut Factors<F, E>,
+    current: &Current<'_, F, E, H>,
+    domain: &Domain<F>,
+    levels: usize,
+) -> Result<(Codeword<E>, Domain<F>), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    H: WhirHash,
+{
+    let mut successor_domain = domain.clone();
+    for _ in 0..levels {
+        successor_domain = successor_domain.squared()?;
+    }
+    let on_card = match current {
+        Current::Base(held) | Current::Joint(held) => {
+            factors.encode_successor_always(held.codeword(), levels)
+        }
+        Current::Grouped(held) => held
+            .first()
+            .and_then(|first| factors.encode_successor_always(first.codeword(), levels)),
+        Current::Extension(held) => factors.encode_successor_always(held.codeword(), levels),
+    };
+    if let Some(encoded) = on_card {
+        return Ok((encoded, successor_domain));
+    }
+    let card_declined = factors.on_card();
+    let values = match factors.host_message() {
+        Some(message) => encode::<F, E>(&lift_coefficients(message), &successor_domain)?,
+        None => {
+            let message = factors.device_message()?.ok_or(Error::DeviceFailed {
+                stage: "the round form's successor message",
+            })?;
+            encode::<F, E>(&lift_coefficients(&message), &successor_domain)?
+        }
+    };
+    crate::gpu::note_round_form_host_encode(card_declined, levels);
+    Ok((Codeword::Host(values), successor_domain))
 }
 
 /// Round 0 of a grouped chain's sumcheck, on the host (D-ONECHAIN §2.1, §2.5).
@@ -2318,6 +2783,7 @@ where
 {
     check_leaf_order::<H>(&config.format)?;
     check_round0_trees::<H>(&config.format)?;
+    check_round_form(config)?;
     let round0: &[&CodewordCommitment<F, H>] = match &current {
         Current::Base(held) | Current::Joint(held) => std::slice::from_ref(held),
         Current::Grouped(held) => held,
@@ -2339,6 +2805,15 @@ where
     // One cap height per tree, in the hash's tree levels; all zero at the
     // default format.
     let caps = config.tree_caps_at(num_vars, crate::whir_hash::arity::<F, H>());
+    // Each round's query count: `num_queries` every round under the FRI-style
+    // form, the count for its own rate under the round form.
+    let mut queries = config.round_queries(num_vars);
+    if round_form_fault(RoundFormFault::ProverQueriesShort) {
+        for q in queries.iter_mut().skip(1) {
+            *q = q.saturating_sub(1);
+        }
+    }
+    let whir = matches!(config.format.rounds, RoundForm::Whir(_));
     // The codeword comes out of the commitment rather than being encoded
     // again: it is the same array, and the NTT is not cheap.
     let mut current_domain = domain.clone();
@@ -2419,12 +2894,14 @@ where
                 let mut proof = final_openings::<E, E, T, H>(
                     held,
                     &RoundConfig {
-                        num_queries: config.num_queries,
+                        num_queries: queries[r],
                         log_folding: k,
                     },
                     RoundCaps {
                         current: caps[r],
-                        current_owner: false,
+                        // Under the round form no successor opening came
+                        // first: this round's first opening owns the tree.
+                        current_owner: whir,
                         next: 0,
                     },
                     transcript,
@@ -2455,115 +2932,138 @@ where
         // is encoded from the message the rounds just bound instead: the same
         // codeword (`gpu::encode_successor_in_effect` off folds it).
         let __wc_fold = crate::whir_split::mark();
-        let (folded, folded_domain) = match &current {
-            Current::Base(held) => match factors.encode_successor(held.codeword(), k) {
-                Some(encoded) => {
-                    let mut folded_domain = current_domain.clone();
-                    for _ in 0..k {
-                        folded_domain = folded_domain.squared()?;
-                    }
-                    (encoded, folded_domain)
-                }
-                // ★ Under the coset order a round-0 codeword on the card, or
-                // held as its stack, is never folded: its successor is encoded
-                // from the bound message — on the host when the host built the
-                // factors — or the prove is refused, by cause. A codeword the
-                // host holds (a prover with no card) folds.
-                None if config.format.leaves == LeafOrder::Coset && held.codeword().on_device() => {
-                    match factors.host_message() {
-                        Some(message) if crate::gpu::encode_successor_in_effect() => {
-                            encode_successor_on_host::<F, E>(message, &current_domain, k)?
-                        }
-                        _ => {
-                            return Err(Error::CosetSuccessorNotEncoded {
-                                cause: UnencodedSuccessor::of(
-                                    crate::gpu::encode_successor_in_effect(),
-                                    factors.on_card(),
-                                ),
-                            });
-                        }
-                    }
-                }
-                None => fold_held::<F, F, E>(held.codeword(), &current_domain, alphas)?,
-            },
-            Current::Grouped(held) => match held
-                .first()
-                .and_then(|first| factors.encode_successor(first.codeword(), k))
-            {
-                // The run's combined bound message encoded: the successor
-                // `Σ_p eq(ρ, p)·Fold_α(C_p)` is, the fold and the encoding
-                // being linear and equal polynomial by polynomial.
-                Some(encoded) => {
-                    let mut folded_domain = current_domain.clone();
-                    for _ in 0..k {
-                        folded_domain = folded_domain.squared()?;
-                    }
-                    (encoded, folded_domain)
-                }
-                // ★ The same rule as a polynomial's own round 0: under the
-                // coset order a run whose round-0 codewords are on the card is
-                // never folded — its successor is encoded from the combined
-                // bound message, on the host when the host built the run's
-                // factors, or the prove is refused by cause (the knob off; the
-                // card declining the encode). A run whose codewords the host
-                // holds folds.
-                None if config.format.leaves == LeafOrder::Coset
-                    && held.iter().any(|c| c.codeword().on_device()) =>
-                {
-                    match factors.host_message() {
-                        Some(message) if crate::gpu::encode_successor_in_effect() => {
-                            encode_successor_on_host::<F, E>(message, &current_domain, k)?
-                        }
-                        _ => {
-                            return Err(Error::CosetSuccessorNotEncoded {
-                                cause: UnencodedSuccessor::of(
-                                    crate::gpu::encode_successor_in_effect(),
-                                    factors.on_card(),
-                                ),
-                            });
-                        }
-                    }
-                }
-                None => {
-                    let codewords: Vec<&Codeword<F>> = held.iter().map(|c| c.codeword()).collect();
-                    fold_grouped::<F, E>(&codewords, &current_domain, alphas, rho)?
-                }
-            },
-            // A joint tree's run folds as a grouped run's: its successor is
-            // the run's combined bound message encoded, by the same rules.
-            Current::Joint(held) => match factors.encode_successor(held.codeword(), k) {
-                Some(encoded) => {
-                    let mut folded_domain = current_domain.clone();
-                    for _ in 0..k {
-                        folded_domain = folded_domain.squared()?;
-                    }
-                    (encoded, folded_domain)
-                }
-                None if config.format.leaves == LeafOrder::Coset
-                    && held.codewords().any(Codeword::on_device) =>
-                {
-                    match factors.host_message() {
-                        Some(message) if crate::gpu::encode_successor_in_effect() => {
-                            encode_successor_on_host::<F, E>(message, &current_domain, k)?
-                        }
-                        _ => {
-                            return Err(Error::CosetSuccessorNotEncoded {
-                                cause: UnencodedSuccessor::of(
-                                    crate::gpu::encode_successor_in_effect(),
-                                    factors.on_card(),
-                                ),
-                            });
-                        }
-                    }
-                }
-                None => {
-                    let codewords: Vec<&Codeword<F>> = held.codewords().collect();
-                    fold_grouped::<F, E>(&codewords, &current_domain, alphas, rho)?
-                }
-            },
-            Current::Extension(held) => {
-                fold_held::<F, E, E>(held.codeword(), &current_domain, alphas)?
+        // ★ Under the round form a round that commits a successor encodes it
+        // from the bound message on its domain squared `shrink_of(k)` times;
+        // `folded_domain` stays the fold's (its queries' points live there).
+        let round_form_successor = whir && schedule.get(r + 1).is_some();
+        let (folded, folded_domain, successor_domain) = if round_form_successor {
+            let (successor, successor_domain) = encode_round_successor::<F, E, H>(
+                &mut factors,
+                &current,
+                &current_domain,
+                config.shrink_of(k),
+            )?;
+            let mut folded_domain = current_domain.clone();
+            for _ in 0..k {
+                folded_domain = folded_domain.squared()?;
             }
+            (successor, folded_domain, successor_domain)
+        } else {
+            let (folded, folded_domain) = match &current {
+                Current::Base(held) => match factors.encode_successor(held.codeword(), k) {
+                    Some(encoded) => {
+                        let mut folded_domain = current_domain.clone();
+                        for _ in 0..k {
+                            folded_domain = folded_domain.squared()?;
+                        }
+                        (encoded, folded_domain)
+                    }
+                    // ★ Under the coset order a round-0 codeword on the card, or
+                    // held as its stack, is never folded: its successor is encoded
+                    // from the bound message — on the host when the host built the
+                    // factors — or the prove is refused, by cause. A codeword the
+                    // host holds (a prover with no card) folds.
+                    None if config.format.leaves == LeafOrder::Coset
+                        && held.codeword().on_device() =>
+                    {
+                        match factors.host_message() {
+                            Some(message) if crate::gpu::encode_successor_in_effect() => {
+                                encode_successor_on_host::<F, E>(message, &current_domain, k)?
+                            }
+                            _ => {
+                                return Err(Error::CosetSuccessorNotEncoded {
+                                    cause: UnencodedSuccessor::of(
+                                        crate::gpu::encode_successor_in_effect(),
+                                        factors.on_card(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    None => fold_held::<F, F, E>(held.codeword(), &current_domain, alphas)?,
+                },
+                Current::Grouped(held) => match held
+                    .first()
+                    .and_then(|first| factors.encode_successor(first.codeword(), k))
+                {
+                    // The run's combined bound message encoded: the successor
+                    // `Σ_p eq(ρ, p)·Fold_α(C_p)` is, the fold and the encoding
+                    // being linear and equal polynomial by polynomial.
+                    Some(encoded) => {
+                        let mut folded_domain = current_domain.clone();
+                        for _ in 0..k {
+                            folded_domain = folded_domain.squared()?;
+                        }
+                        (encoded, folded_domain)
+                    }
+                    // ★ The same rule as a polynomial's own round 0: under the
+                    // coset order a run whose round-0 codewords are on the card is
+                    // never folded — its successor is encoded from the combined
+                    // bound message, on the host when the host built the run's
+                    // factors, or the prove is refused by cause (the knob off; the
+                    // card declining the encode). A run whose codewords the host
+                    // holds folds.
+                    None if config.format.leaves == LeafOrder::Coset
+                        && held.iter().any(|c| c.codeword().on_device()) =>
+                    {
+                        match factors.host_message() {
+                            Some(message) if crate::gpu::encode_successor_in_effect() => {
+                                encode_successor_on_host::<F, E>(message, &current_domain, k)?
+                            }
+                            _ => {
+                                return Err(Error::CosetSuccessorNotEncoded {
+                                    cause: UnencodedSuccessor::of(
+                                        crate::gpu::encode_successor_in_effect(),
+                                        factors.on_card(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    None => {
+                        let codewords: Vec<&Codeword<F>> =
+                            held.iter().map(|c| c.codeword()).collect();
+                        fold_grouped::<F, E>(&codewords, &current_domain, alphas, rho)?
+                    }
+                },
+                // A joint tree's run folds as a grouped run's: its successor is
+                // the run's combined bound message encoded, by the same rules.
+                Current::Joint(held) => match factors.encode_successor(held.codeword(), k) {
+                    Some(encoded) => {
+                        let mut folded_domain = current_domain.clone();
+                        for _ in 0..k {
+                            folded_domain = folded_domain.squared()?;
+                        }
+                        (encoded, folded_domain)
+                    }
+                    None if config.format.leaves == LeafOrder::Coset
+                        && held.codewords().any(Codeword::on_device) =>
+                    {
+                        match factors.host_message() {
+                            Some(message) if crate::gpu::encode_successor_in_effect() => {
+                                encode_successor_on_host::<F, E>(message, &current_domain, k)?
+                            }
+                            _ => {
+                                return Err(Error::CosetSuccessorNotEncoded {
+                                    cause: UnencodedSuccessor::of(
+                                        crate::gpu::encode_successor_in_effect(),
+                                        factors.on_card(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    None => {
+                        let codewords: Vec<&Codeword<F>> = held.codewords().collect();
+                        fold_grouped::<F, E>(&codewords, &current_domain, alphas, rho)?
+                    }
+                },
+                Current::Extension(held) => {
+                    fold_held::<F, E, E>(held.codeword(), &current_domain, alphas)?
+                }
+            };
+            let successor_domain = folded_domain.clone();
+            (folded, folded_domain, successor_domain)
         };
         crate::whir_split::add(&crate::whir_split::FOLD, __wc_fold);
 
@@ -2597,7 +3097,7 @@ where
         let ood_value = if next.is_some() {
             let __wc_ood_a = crate::whir_split::mark();
             let z0: FieldElement<E> = transcript.sample_field_element();
-            require_out_of_domain::<F, E>(&z0, &folded_domain)?;
+            require_out_of_domain::<F, E>(&z0, &successor_domain)?;
             let point = ood_point(&z0, factors.num_vars());
             let y0 = factors.evaluate_message(&point)?;
             transcript.append_field_element(&y0);
@@ -2620,19 +3120,29 @@ where
         nonces.query = grind::<E, T, H>(transcript, config.grind.query)?;
         crate::whir_split::add(&crate::whir_split::GRIND, __wc_g3);
         let round_config = RoundConfig {
-            num_queries: config.num_queries,
+            num_queries: queries[r],
             log_folding: k,
         };
         let __wc_q = crate::whir_split::mark();
         // Tree `r` is opened under `caps[r]`, and carries its cap on its first
         // opening in proof order: round 0's first current opening for tree 0,
-        // round `r − 1`'s first successor opening for every later tree.
+        // round `r − 1`'s first successor opening for every later tree — or,
+        // under the round form, round `r`'s own first current opening.
         let round_caps = RoundCaps {
             current: caps[r],
-            current_owner: r == 0,
+            current_owner: r == 0 || whir,
             next: caps.get(r + 1).copied().unwrap_or(0),
         };
-        let openings =
+        let openings = if round_form_successor {
+            round_form_openings::<F, E, T, H>(
+                &mut factors,
+                &current,
+                &folded_domain,
+                &round_config,
+                round_caps,
+                transcript,
+            )?
+        } else {
             match (&current, &next) {
                 (Current::Base(held), Some(next)) => RoundOpenings::Base(whir_round::prove(
                     *held,
@@ -2674,7 +3184,8 @@ where
                     round_caps,
                     transcript,
                 )?),
-            };
+            }
+        };
         crate::whir_split::add(&crate::whir_split::QUERIES, __wc_q);
 
         rounds.push(ChainRound {
@@ -2688,7 +3199,7 @@ where
         if let Some(next) = next {
             current = Current::Extension(next);
         }
-        current_domain = folded_domain;
+        current_domain = successor_domain;
     }
     // The sent polynomial at the tail's challenges: `f(α)`, as the verifier
     // computes it.
@@ -2700,6 +3211,97 @@ where
         rounds,
         final_value,
     })
+}
+
+/// The round form's openings of a round that commits a successor
+/// ([`RoundForm::Whir`]): `Q_r` positions drawn over the current tree's
+/// blocks (the folded domain's points), the current tree — or a grouped run's
+/// trees, or its joint tree — opened there and NOTHING of the successor; then
+/// one `γ` drawn, and each query's claim `f_{r+1}(pow(y_j)) = v_j` added to
+/// the weight the next group carries as `γ^{j+1}·eq(pow(y_j), ·)`, `y_j` the
+/// folded domain's point at the query's position. The verifier recomputes
+/// each `v_j` from the opened block ([`verify_chain`]).
+///
+/// The order is the protocol's: the successor was committed and its
+/// out-of-domain point answered before this draws a position, and `γ` comes
+/// after every position.
+fn round_form_openings<F, E, T, H>(
+    factors: &mut Factors<F, E>,
+    current: &Current<'_, F, E, H>,
+    folded_domain: &Domain<F>,
+    config: &RoundConfig,
+    caps: RoundCaps,
+    transcript: &mut T,
+) -> Result<RoundOpenings<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    let num_leaves = match current {
+        Current::Base(held) | Current::Joint(held) => held.num_leaves(),
+        Current::Grouped(held) => held
+            .first()
+            .ok_or(Error::GroupedShape(GroupedShape::RunWidth { polys: 0 }))?
+            .num_leaves(),
+        Current::Extension(held) => held.num_leaves(),
+    };
+    let __wq_sample = crate::whir_split::mark();
+    let positions = whir_round::sample_queries(transcript, config.num_queries, num_leaves);
+    crate::whir_split::add(&crate::whir_split::QUERY_SAMPLE, __wq_sample);
+    let openings = match current {
+        Current::Base(held) => RoundOpenings::Base(RoundProof {
+            current: held.open_many_capped(&positions, caps.current, caps.current_owner)?,
+            next: Vec::new(),
+        }),
+        Current::Joint(held) => RoundOpenings::BaseJoint(RoundProof {
+            current: held.open_many_capped(&positions, caps.current, caps.current_owner)?,
+            next: Vec::new(),
+        }),
+        Current::Grouped(held) => {
+            RoundOpenings::BaseGrouped(whir_round::prove_grouped_at(held, &positions, caps)?)
+        }
+        Current::Extension(held) => RoundOpenings::Extension(RoundProof {
+            current: held.open_many_capped(&positions, caps.current, caps.current_owner)?,
+            next: Vec::new(),
+        }),
+    };
+    let gamma: FieldElement<E> = transcript.sample_field_element();
+    if !round_form_fault(RoundFormFault::DropShiftClaims) {
+        let points = shift_points::<F, E>(folded_domain, &positions, factors.num_vars());
+        factors.add_shift_claims(&points, &shift_scales(&gamma, positions.len()))?;
+    }
+    Ok(openings)
+}
+
+/// `pow(y_j)` over `num_vars` variables for each queried position `q_j`,
+/// `y_j = g^{q_j}` with `g` the folded domain's generator: where the round
+/// form's shift claims sit ([`ood_point`]'s map, which puts variable `i` on
+/// `X^(2^i)` of the univariate lift).
+fn shift_points<F, E>(
+    folded_domain: &Domain<F>,
+    positions: &[usize],
+    num_vars: usize,
+) -> Vec<Vec<FieldElement<E>>>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let generator = folded_domain.generator();
+    positions
+        .iter()
+        .map(|&q| ood_point(&generator.pow(q as u64).to_extension::<E>(), num_vars))
+        .collect()
+}
+
+/// `[γ, γ², …, γ^count]`: query `j`'s shift claim is weighted by `γ^{j+1}`.
+fn shift_scales<E: IsField>(gamma: &FieldElement<E>, count: usize) -> Vec<FieldElement<E>> {
+    let mut powers = crate::challenge_powers(gamma, count + 1);
+    powers.remove(0);
+    powers
 }
 
 /// The `2^rem` hypercube values of the message `factors` bound, in
@@ -3176,6 +3778,7 @@ where
 {
     check_leaf_order::<H>(&config.format)?;
     check_round0_trees::<H>(&config.format)?;
+    check_round_form(config)?;
     // The domain is the caller's: held to the configuration's rate here.
     if domain.log_size() != num_vars + config.log_blowup {
         return Err(Error::DomainRateMismatch {
@@ -3243,6 +3846,13 @@ where
     // it entered the weight — the challenges after that are where its `eq`
     // lands.
     let mut ood: Vec<(FieldElement<E>, Vec<FieldElement<E>>, usize)> = Vec::new();
+    // Under the round form, each query's shift claim the same way: its
+    // `γ^{j+1}`, its point `pow(y_j)` and the variables bound when it entered.
+    let mut shift: Vec<(FieldElement<E>, Vec<FieldElement<E>>, usize)> = Vec::new();
+    // Each round's query count and, under the round form, its domain's
+    // shrink: verifier constants of the config, never the proof's.
+    let round_queries = config.round_queries(num_vars);
+    let whir = matches!(config.format.rounds, RoundForm::Whir(_));
     // Under `FinalPoly::Vars`, from the config alone: the final round, the
     // polynomial it sent, and the challenges of the sumcheck rounds after it.
     let final_at = config.final_round(num_vars);
@@ -3284,10 +3894,20 @@ where
         for _ in 0..k {
             next_domain = next_domain.squared()?;
         }
+        // The successor's domain: the folded one under the FRI-style form,
+        // round `r`'s squared `shrink_of(k)` times under the round form.
+        let mut successor_domain = current_domain.clone();
+        for _ in 0..config.shrink_of(k) {
+            successor_domain = successor_domain.squared()?;
+        }
         let bound = alphas.len() + group.point.len();
 
         let round_config = RoundConfig {
-            num_queries: config.num_queries,
+            num_queries: if round_form_fault(RoundFormFault::QueriesFromProof) {
+                opening_count(&round.openings)
+            } else {
+                round_queries[r]
+            },
             log_folding: k,
         };
         if let Some((final_r, rem)) = final_at
@@ -3364,6 +3984,40 @@ where
             round.ood_value.as_ref(),
             schedule.get(r + 1),
         ) {
+            (Some(next_root), Some(y0), Some(_)) if whir => {
+                round_form_round::<F, E, T, H>(
+                    RoundFormRound {
+                        r,
+                        round,
+                        next_root,
+                        y0,
+                        width,
+                        current,
+                        round0_trees: &round0_trees,
+                        current_domain: &current_domain,
+                        folded_domain: &next_domain,
+                        successor_domain: &successor_domain,
+                        data,
+                        rho,
+                        n_next: num_vars + index - bound,
+                        bound,
+                        layout,
+                    },
+                    config,
+                    &round_config,
+                    &mut claim,
+                    &mut ood,
+                    &mut shift,
+                    transcript,
+                )?;
+                // The successor's tree is opened first by round `r + 1`,
+                // which authenticates its cap there.
+                current = TreeCheck::Owner {
+                    root: next_root,
+                    cap_height: caps[r + 1],
+                    leaves: LeafOrder::Natural,
+                };
+            }
             (Some(next_root), Some(y0), Some(&next_k)) => {
                 transcript.append_bytes(next_root);
 
@@ -3414,6 +4068,7 @@ where
                             data,
                             rho,
                             &round_config,
+                            &mut Vec::new(),
                             transcript,
                         )?
                         .ok_or(Error::GroupedShape(
@@ -3436,6 +4091,7 @@ where
                         data,
                         rho,
                         &round_config,
+                        &mut Vec::new(),
                         transcript,
                     )?
                     .ok_or(Error::GroupedShape(GroupedShape::SuccessorBlocks {
@@ -3479,6 +4135,7 @@ where
                             data,
                             rho,
                             &round_config,
+                            &mut Vec::new(),
                             transcript,
                         )?;
                     }
@@ -3492,6 +4149,7 @@ where
                             data,
                             rho,
                             &round_config,
+                            &mut Vec::new(),
                             transcript,
                         )?;
                     }
@@ -3508,14 +4166,23 @@ where
         }
 
         alphas.extend(group.point);
-        current_domain = next_domain;
+        current_domain = successor_domain;
     }
 
     // The accumulated weight at the full challenge point: the caller's own,
-    // plus each round's batched `eq` over the challenges that came after it.
+    // plus each round's batched `eq` over the challenges that came after it —
+    // its out-of-domain claim's and, under the round form, every shift
+    // claim's.
     let mut weight = weight_at(&alphas)?;
-    for (gamma, point, bound) in &ood {
-        weight += gamma * eq_eval(point, &alphas[*bound..])?;
+    if !round_form_fault(RoundFormFault::OodNotInWeight) {
+        for (gamma, point, bound) in &ood {
+            weight += gamma * eq_eval(point, &alphas[*bound..])?;
+        }
+    }
+    if !round_form_fault(RoundFormFault::ShiftClaimsNotInWeight) {
+        for (scale, point, bound) in &shift {
+            weight += scale * eq_eval(point, &alphas[*bound..])?;
+        }
     }
 
     // The wire: the sumcheck's residual is w(α)·f(α), and the fully folded
@@ -3543,6 +4210,238 @@ where
     }
 
     Ok(())
+}
+
+/// What [`round_form_round`] reads of the round it checks.
+struct RoundFormRound<'a, 'b, F: IsField + 'static, E: IsField + 'static> {
+    r: usize,
+    round: &'a ChainRound<F, E>,
+    next_root: &'a Commitment,
+    y0: &'a FieldElement<E>,
+    /// The run's polynomials (the caller's derivation).
+    width: usize,
+    current: TreeCheck<'a>,
+    round0_trees: &'b [TreeCheck<'a>],
+    current_domain: &'b Domain<F>,
+    /// Round `r`'s domain squared `k_r` times: where its queries' points are.
+    folded_domain: &'b Domain<F>,
+    /// The successor's domain: round `r`'s squared `shrink_of(k_r)` times.
+    successor_domain: &'b Domain<F>,
+    data: &'b [FieldElement<E>],
+    rho: &'b [FieldElement<E>],
+    /// Variables round `r + 1`'s polynomial has.
+    n_next: usize,
+    /// Variables bound when this round's claims enter the weight.
+    bound: usize,
+    layout: NonceLayout,
+}
+
+/// The claims a chain's verifier collects: `(scale, point, bound)`.
+type Claims<E> = Vec<(FieldElement<E>, Vec<FieldElement<E>>, usize)>;
+
+/// ★ A round of the round form that commits a successor
+/// ([`RoundForm::Whir`]), checked: the successor's root absorbed, its
+/// out-of-domain point drawn (outside the SUCCESSOR's domain) and its answer
+/// batched into the claim as today; then the round's `Q_r` positions drawn
+/// over the current tree's blocks, the current tree — or the run's trees, or
+/// its joint tree — opened there and NO successor block (a proof carrying one
+/// is refused); each opened block folded at the round's challenges to `v_j`;
+/// one `γ` drawn after every position; each `v_j` a claim `f_{r+1}(pow(y_j)) =
+/// v_j` with `y_j = g^{q_j}`, `g` the folded domain's generator, weighted by
+/// `γ^{j+1}`: `claim += γ^{j+1}·v_j`, and its `eq` joins the final weight.
+#[allow(clippy::too_many_arguments)]
+fn round_form_round<'a, F, E, T, H>(
+    at: RoundFormRound<'a, '_, F, E>,
+    config: &ChainConfig,
+    round_config: &RoundConfig,
+    claim: &mut FieldElement<E>,
+    ood: &mut Claims<E>,
+    shift: &mut Claims<E>,
+    transcript: &mut T,
+) -> Result<(), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    let num_leaves = at.current_domain.size() >> round_config.log_folding;
+    if round_form_fault(RoundFormFault::PositionsBeforeSuccessor) {
+        let _ = whir_round::sample_queries(transcript, round_config.num_queries, num_leaves);
+    }
+    transcript.append_bytes(at.next_root);
+
+    let z0: FieldElement<E> = transcript.sample_field_element();
+    require_out_of_domain::<F, E>(&z0, at.successor_domain)?;
+    let point = ood_point(&z0, at.n_next);
+    transcript.append_field_element(at.y0);
+
+    check_nonce::<E, T, H>(transcript, config.grind.ood, at.round.nonces.ood, at.layout)?;
+    let gamma: FieldElement<E> = transcript.sample_field_element();
+    *claim += &gamma * at.y0;
+    ood.push((gamma, point, at.bound));
+
+    check_nonce::<E, T, H>(
+        transcript,
+        config.grind.query,
+        at.round.nonces.query,
+        at.layout,
+    )?;
+    // The current tree alone: each query's fold value comes back as a claim.
+    let mut folds: Vec<(usize, FieldElement<E>)> = Vec::new();
+    match &at.round.openings {
+        RoundOpenings::Base(openings) => {
+            if !openings.next.is_empty() {
+                return Err(Error::SuccessorOpened { round: at.r });
+            }
+            folds = round_form_folds::<F, F, E, T, H>(
+                &openings.current,
+                at.current,
+                at.current_domain,
+                at.data,
+                round_config,
+                transcript,
+            )?;
+        }
+        RoundOpenings::Extension(openings) => {
+            if !openings.next.is_empty() {
+                return Err(Error::SuccessorOpened { round: at.r });
+            }
+            folds = round_form_folds::<F, E, E, T, H>(
+                &openings.current,
+                at.current,
+                at.current_domain,
+                at.data,
+                round_config,
+                transcript,
+            )?;
+        }
+        // A grouped or joint round 0 with no successor block: the shape check
+        // inside refuses one (`GroupedShape::SuccessorBlocks`).
+        RoundOpenings::BaseGrouped(openings) => {
+            whir_round::verify_grouped::<F, E, T, H>(
+                openings,
+                at.round0_trees,
+                whir_round::GroupedEnd::Claims,
+                at.current_domain,
+                at.data,
+                at.rho,
+                round_config,
+                &mut folds,
+                transcript,
+            )?;
+        }
+        RoundOpenings::BaseJoint(openings) => {
+            whir_round::verify_joint::<F, E, T, H>(
+                openings,
+                at.current,
+                at.width,
+                whir_round::GroupedEnd::Claims,
+                at.current_domain,
+                at.data,
+                at.rho,
+                round_config,
+                &mut folds,
+                transcript,
+            )?;
+        }
+    }
+
+    let gamma: FieldElement<E> = transcript.sample_field_element();
+    let mut power = gamma.clone();
+    for (q, value) in folds {
+        let scale = if round_form_fault(RoundFormFault::ReuseGammaPower) {
+            gamma.clone()
+        } else {
+            power.clone()
+        };
+        power *= &gamma;
+        if round_form_fault(RoundFormFault::DropShiftClaims) {
+            continue;
+        }
+        let place = if round_form_fault(RoundFormFault::ShiftPointUnfolded) {
+            at.current_domain
+        } else {
+            at.folded_domain
+        };
+        let mut point = shift_points::<F, E>(place, &[q], at.n_next)
+            .pop()
+            .ok_or(Error::EmptyPolynomial)?;
+        if round_form_fault(RoundFormFault::ShiftPointOneSquaringShort) && point.len() >= 2 {
+            let short = point[point.len() - 2].clone();
+            *point.last_mut().expect("two coordinates") = short;
+        }
+        *claim += &scale * &value;
+        shift.push((scale, point, at.bound));
+    }
+    Ok(())
+}
+
+/// How many current-tree openings a round's proof carries — what a verifier
+/// would read as `Q` if it took it from the proof (a test fault only).
+fn opening_count<F: IsField, E: IsField>(openings: &RoundOpenings<F, E>) -> usize {
+    match openings {
+        RoundOpenings::Base(p) => p.current.len(),
+        RoundOpenings::Extension(p) => p.current.len(),
+        RoundOpenings::BaseGrouped(p) => p.current.len(),
+        RoundOpenings::BaseJoint(p) => p.current.len(),
+    }
+}
+
+/// The round form's current-tree queries of one tree: exactly `Q_r` openings,
+/// each authenticated at its position, each block folded at the round's
+/// challenges. Returns `(position, fold value)` in query order.
+///
+/// ⚠ ORDER. The count is checked before any opening is indexed or any cap is
+/// read, as [`verify_final_against`] does.
+fn round_form_folds<'a, F, C, N, T, H>(
+    current_openings: &'a [crate::whir_commit::CosetOpening<C>],
+    current: TreeCheck<'a>,
+    current_domain: &Domain<F>,
+    alphas: &[FieldElement<N>],
+    config: &RoundConfig,
+    transcript: &mut T,
+) -> Result<Vec<(usize, FieldElement<N>)>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<C> + IsSubFieldOf<N>,
+    C: IsField + IsSubFieldOf<N> + 'static,
+    N: IsField + 'static,
+    FieldElement<C>: AsBytes + Sync + Send,
+    T: IsTranscript<N>,
+    H: WhirHash,
+{
+    if current_openings.len() != config.num_queries {
+        return Err(Error::QueryCountMismatch {
+            expected: config.num_queries,
+            got: current_openings.len(),
+        });
+    }
+    let num_leaves = current_domain.size() >> config.log_folding;
+    let depth = num_leaves.trailing_zeros() as usize;
+    let Some(first) = current_openings.first() else {
+        return Ok(Vec::new());
+    };
+    let (check, first_siblings) = current.open::<C, H>(depth, first)?;
+    let positions = whir_round::sample_queries(transcript, config.num_queries, num_leaves);
+    let mut folds = Vec::with_capacity(positions.len());
+    for (i, (&q, opening)) in positions.iter().zip(current_openings).enumerate() {
+        let siblings = if i == 0 {
+            first_siblings
+        } else {
+            opening.proof.merkle_path.as_slice()
+        };
+        let at = current.position(q, depth);
+        if !verify_opening_capped::<C, H>(&check, at, opening, siblings) {
+            return Err(Error::OpeningRejected { query: i });
+        }
+        folds.push((
+            q,
+            fold_coset::<F, C, N>(&opening.values, current_domain, q, alphas)?,
+        ));
+    }
+    Ok(folds)
 }
 
 /// The last round: every queried block must fold to the constant that was sent.

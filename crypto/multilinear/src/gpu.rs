@@ -442,6 +442,36 @@ pub fn coset_host_encodes() -> u64 {
 
 /// Called where a coset-ordered round 0's successor is encoded on the host:
 /// counted, and said.
+/// Round-form successors encoded on the host (`whir_chain::RoundForm::Whir`):
+/// every one when no card holds the factors, and a card's decline otherwise.
+static ROUND_FORM_HOST_ENCODES: AtomicU64 = AtomicU64::new(0);
+
+/// Round-form shift-claim batches the card added to a weight in one kernel.
+static SHIFT_CLAIM_BATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a round-form successor encoded on the host, and says so when the
+/// factors were on a card (a decline: the bound message came back over the
+/// bus).
+pub(crate) fn note_round_form_host_encode(card_declined: bool, levels: usize) {
+    let count = ROUND_FORM_HOST_ENCODES.fetch_add(1, Ordering::Relaxed) + 1;
+    if card_declined {
+        eprintln!(
+            "[whir] a round-form successor encoded on the HOST: the card declined it \
+             (domain squared {levels} times); round-form host encodes {count}"
+        );
+    }
+}
+
+/// [`ROUND_FORM_HOST_ENCODES`] so far.
+pub fn round_form_host_encodes() -> u64 {
+    ROUND_FORM_HOST_ENCODES.load(Ordering::Relaxed)
+}
+
+/// [`SHIFT_CLAIM_BATCHES`] so far.
+pub fn shift_claim_batches() -> u64 {
+    SHIFT_CLAIM_BATCHES.load(Ordering::Relaxed)
+}
+
 pub(crate) fn note_coset_host_encode(levels: usize, num_vars: usize) {
     let count = COSET_HOST_ENCODES.fetch_add(1, Ordering::Relaxed) + 1;
     eprintln!(
@@ -6265,6 +6295,40 @@ impl OpeningFactors {
             .map_err(|_| failed("weight"))
     }
 
+    /// `weight += Σ_j scales[j]·eq(points[j], ·)`: the round form's shift
+    /// claims, in ONE kernel over each point's two half tables
+    /// ([`crate::eq::eq_halves`], built on the host — `Q·2^(n/2)` values
+    /// against the weight's `2^n`) rather than `Q` full `eq` tables.
+    pub(crate) fn add_shift_claims<E>(
+        &mut self,
+        points: &[Vec<math::field::element::FieldElement<E>>],
+        scales: &[math::field::element::FieldElement<E>],
+    ) -> Result<(), crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+        math::field::element::FieldElement<E>: Send + Sync,
+    {
+        let failed = |stage| crate::Error::DeviceFailed { stage };
+        let session = self.materialize()?;
+        let (lo_bits, his, los) = crate::eq::eq_halves(points, scales, session.num_vars())?;
+        let flatten = |tables: &[Vec<math::field::element::FieldElement<E>>]| {
+            let mut raw = Vec::with_capacity(tables.iter().map(|t| t.len() * 3).sum());
+            for table in tables {
+                for value in table {
+                    raw.extend_from_slice(&ext3_raw(value)?);
+                }
+            }
+            Some(raw)
+        };
+        let hi = flatten(&his).ok_or_else(|| failed("shift claims' high halves"))?;
+        let lo = flatten(&los).ok_or_else(|| failed("shift claims' low halves"))?;
+        session
+            .add_eq_tensor(&hi, &lo, points.len(), lo_bits)
+            .map_err(|_| failed("shift claims' weight"))?;
+        SHIFT_CLAIM_BATCHES.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Device bytes the factors hold right now — the share-form working set
     /// before the lean rounds are spent, the tables after.
     pub fn device_bytes(&self) -> u64 {
@@ -6293,6 +6357,17 @@ impl OpeningFactors {
         if !encode_successor() {
             return None;
         }
+        self.encode_successor_always(codeword, levels)
+    }
+
+    /// [`Self::encode_successor`] whatever `gpu::encode_successor_in_effect`
+    /// says: the round form's successor (`whir_chain::RoundForm::Whir`), which
+    /// no fold can stand in for. `None` is the card declining.
+    pub(crate) fn encode_successor_always(
+        &mut self,
+        codeword: &DeviceCodeword,
+        levels: usize,
+    ) -> Option<DeviceCodeword> {
         let encoded = if ENCODE_DECLINE_FORCED.load(Ordering::Relaxed) {
             None
         } else {
@@ -6322,6 +6397,16 @@ impl OpeningFactors {
         if !encode_successor() {
             return None;
         }
+        self.encode_successor_from_always(source, levels)
+    }
+
+    /// [`Self::encode_successor_from`] whatever the knob says (see
+    /// [`Self::encode_successor_always`]).
+    pub(crate) fn encode_successor_from_always(
+        &mut self,
+        source: &CosetSource,
+        levels: usize,
+    ) -> Option<DeviceCodeword> {
         let encoded = if ENCODE_DECLINE_FORCED.load(Ordering::Relaxed) {
             None
         } else {
@@ -6420,6 +6505,33 @@ impl OpeningFactors {
         _source: &CosetSource,
         _levels: usize,
     ) -> Option<DeviceCodeword> {
+        match self.0 {}
+    }
+
+    pub(crate) fn encode_successor_always(
+        &mut self,
+        _codeword: &DeviceCodeword,
+        _levels: usize,
+    ) -> Option<DeviceCodeword> {
+        match self.0 {}
+    }
+
+    pub(crate) fn encode_successor_from_always(
+        &mut self,
+        _source: &CosetSource,
+        _levels: usize,
+    ) -> Option<DeviceCodeword> {
+        match self.0 {}
+    }
+
+    pub(crate) fn add_shift_claims<E>(
+        &mut self,
+        _points: &[Vec<math::field::element::FieldElement<E>>],
+        _scales: &[math::field::element::FieldElement<E>],
+    ) -> Result<(), crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
         match self.0 {}
     }
 }

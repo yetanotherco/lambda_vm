@@ -184,7 +184,11 @@ pub struct GroupedRoundProof<C: IsField, N: IsField> {
 ///
 /// Positions index the *folded* codeword, which is also the block index of the
 /// current one.
-fn sample_queries<F, T>(transcript: &mut T, num_queries: usize, bound: usize) -> Vec<usize>
+pub(crate) fn sample_queries<F, T>(
+    transcript: &mut T,
+    num_queries: usize,
+    bound: usize,
+) -> Vec<usize>
 where
     F: IsField,
     T: IsTranscript<F>,
@@ -402,8 +406,51 @@ where
     })
 }
 
+/// Produces round 0's openings in a grouped chain at `queries`, positions
+/// the caller drew: every round-0 tree opened there and no successor block —
+/// the round form's round 0 ([`crate::whir_chain::RoundForm::Whir`]), whose
+/// successor is checked through its claims. Each tree is owned by this round,
+/// so each carries its cap on its first opening, `current[0][p]`.
+pub(crate) fn prove_grouped_at<C, N, H>(
+    current: &[&CodewordCommitment<C, H>],
+    queries: &[usize],
+    caps: RoundCaps,
+) -> Result<GroupedRoundProof<C, N>, Error>
+where
+    C: IsField + 'static,
+    N: IsField + 'static,
+    FieldElement<C>: AsBytes + Sync + Send,
+    H: WhirHash,
+{
+    if current.is_empty() {
+        return Err(Error::GroupedShape(
+            crate::whir_chain::GroupedShape::RunWidth { polys: 0 },
+        ));
+    }
+    let mut rows: Vec<Vec<CosetOpening<C>>> = (0..queries.len())
+        .map(|_| Vec::with_capacity(current.len()))
+        .collect();
+    crate::whir_split::bump_by(
+        &crate::whir_split::GROUPED_TREES,
+        current.len().saturating_sub(1) as u64,
+    );
+    for tree in current {
+        let opened = tree.open_many_capped(queries, caps.current, caps.current_owner)?;
+        for (row, opening) in rows.iter_mut().zip(opened) {
+            row.push(opening);
+        }
+    }
+    Ok(GroupedRoundProof {
+        current: rows,
+        next: Vec::new(),
+    })
+}
+
 /// Where a grouped round 0's folds must land: the committed successor, or,
-/// when round 0 is the chain's last round, the constant the prover sent.
+/// when round 0 is the chain's last round, the constant the prover sent, or
+/// — under the round form ([`crate::whir_chain::RoundForm::Whir`]) — nowhere
+/// here: each query's fold value is handed back as a claim on the successor
+/// ([`Claims`](Self::Claims)).
 #[derive(Debug)]
 pub enum GroupedEnd<'a, N: IsField> {
     Successor {
@@ -413,6 +460,9 @@ pub enum GroupedEnd<'a, N: IsField> {
         cap_height: usize,
     },
     Final(&'a FieldElement<N>),
+    /// No successor block is opened; each query's `(position, fold value)`
+    /// is written to the caller's list, in query order.
+    Claims,
 }
 
 // By hand: a derive would ask `N: Copy`, and the variants hold references.
@@ -521,7 +571,9 @@ where
 /// tree's block must open against that tree's own root, and the blocks'
 /// combination `Σ_p eq(ρ, p)·block_p`, folded by the data challenges, must be
 /// the successor's value there (or the final constant). Returns the
-/// successor tree's authenticated check, `None` on a final round.
+/// successor tree's authenticated check, `None` on a final round. Under
+/// [`GroupedEnd::Claims`] no successor block is read: each query's
+/// `(position, fold value)` is pushed to `folds` and `None` is returned.
 ///
 /// ⚠ ORDER. The whole shape is checked before any opening is indexed or any
 /// cap is read ([`check_grouped_shape`]), so a short or padded proof is
@@ -535,6 +587,7 @@ pub fn verify_grouped<'a, F, E, T, H>(
     alphas: &[FieldElement<E>],
     rho: &[FieldElement<E>],
     config: &RoundConfig,
+    folds: &mut Vec<(usize, FieldElement<E>)>,
     transcript: &mut T,
 ) -> Result<Option<CappedRoot<'a, Commitment>>, Error>
 where
@@ -565,7 +618,7 @@ where
     }
     let successors = match end {
         GroupedEnd::Successor { .. } => config.num_queries,
-        GroupedEnd::Final(_) => 0,
+        GroupedEnd::Final(_) | GroupedEnd::Claims => 0,
     };
     check_grouped_shape(
         proof,
@@ -588,7 +641,7 @@ where
             }
             Some((root, num_leaves, cap_height))
         }
-        GroupedEnd::Final(_) => None,
+        GroupedEnd::Final(_) | GroupedEnd::Claims => None,
     };
 
     // Every tree's check, built once from its first opening — after the shape
@@ -644,6 +697,7 @@ where
                     return Err(Error::FoldInconsistent { query: i });
                 }
             }
+            (GroupedEnd::Claims, _) => folds.push((q, folded)),
             (GroupedEnd::Successor { num_leaves, .. }, Some((check, next_first))) => {
                 let nxt = &proof.next[i];
                 let siblings = if i == 0 {
@@ -721,7 +775,8 @@ where
 /// joint leaf, and the blocks' combination `Σ_p eq(ρ, p)·block_p`, folded by
 /// the data challenges, must be the successor's value there (or the final
 /// constant). Returns the successor tree's authenticated check, `None` on a
-/// final round.
+/// final round. Under [`GroupedEnd::Claims`] each query's `(position, fold
+/// value)` is pushed to `folds` instead, and `None` is returned.
 ///
 /// ⚠ ORDER. The whole shape — `Q` openings of exactly `polys·2^k0` values, and
 /// the successor count — is checked before any opening is indexed or any cap
@@ -736,6 +791,7 @@ pub fn verify_joint<'a, F, E, T, H>(
     alphas: &[FieldElement<E>],
     rho: &[FieldElement<E>],
     config: &RoundConfig,
+    folds: &mut Vec<(usize, FieldElement<E>)>,
     transcript: &mut T,
 ) -> Result<Option<CappedRoot<'a, Commitment>>, Error>
 where
@@ -764,7 +820,7 @@ where
     }
     let successors = match end {
         GroupedEnd::Successor { .. } => config.num_queries,
-        GroupedEnd::Final(_) => 0,
+        GroupedEnd::Final(_) | GroupedEnd::Claims => 0,
     };
     let block = 1usize << config.log_folding;
     let width = polys * block;
@@ -804,7 +860,7 @@ where
             }
             Some((root, num_leaves, cap_height))
         }
-        GroupedEnd::Final(_) => None,
+        GroupedEnd::Final(_) | GroupedEnd::Claims => None,
     };
     let Some(first) = proof.current.first() else {
         return match next_tree {
@@ -857,6 +913,7 @@ where
                     return Err(Error::FoldInconsistent { query: i });
                 }
             }
+            (GroupedEnd::Claims, _) => folds.push((q, folded)),
             (GroupedEnd::Successor { num_leaves, .. }, Some((check, next_first))) => {
                 let nxt = &proof.next[i];
                 let siblings = if i == 0 {

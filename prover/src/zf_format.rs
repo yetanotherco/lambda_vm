@@ -810,6 +810,9 @@ impl ZfFormat {
             // `whir_trees`): only its groups' chains are grouped.
             round0: Round0Trees::Each,
             final_poly: multilinear::whir_chain::FinalPoly::Off,
+            // The BLAKE3 base's alone (`BlockFormat::chain_config` stamps its
+            // round form): every other chain opens its successors.
+            rounds: multilinear::whir_chain::RoundForm::Fri,
         }
     }
 
@@ -2090,6 +2093,7 @@ mod tests {
                 leaves: multilinear::whir_chain::LeafOrder::Natural,
                 round0: multilinear::whir_chain::Round0Trees::Each,
                 final_poly: multilinear::whir_chain::FinalPoly::Off,
+                rounds: multilinear::whir_chain::RoundForm::Fri,
             },
         };
         let opt_out = parse(&[

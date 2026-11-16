@@ -380,6 +380,54 @@ impl OpeningSession {
         )
     }
 
+    /// `weight += Σ_j hi_j ⊗ lo_j`: `points` scaled `eq` tables added to the
+    /// weight in one kernel (`add_eq_tensor_ext3`), each given as its high
+    /// half (`2^(n − lo_bits)` ext3 values, point-major in `hi`) and its
+    /// scaled low half (`2^lo_bits` values, point-major in `lo`): entry `x`
+    /// gains `Σ_j hi_j[x >> lo_bits]·lo_j[x mod 2^lo_bits]`. The WHIR round
+    /// form's shift claims.
+    pub fn add_eq_tensor(
+        &self,
+        hi: &[u64],
+        lo: &[u64],
+        points: usize,
+        lo_bits: usize,
+    ) -> Result<()> {
+        let n = self.num_vars();
+        ensure!(lo_bits <= n, "the low half fits the cube");
+        ensure!(
+            hi.len() == points * (3usize << (n - lo_bits))
+                && lo.len() == points * (3usize << lo_bits),
+            "each point's two halves span the cube"
+        );
+        if points == 0 {
+            return Ok(());
+        }
+        let be = backend()?;
+        let hi_dev = crate::device::htod_or_trim(&self.stream, hi)?;
+        let lo_dev = crate::device::htod_or_trim(&self.stream, lo)?;
+        let count = self.len as u64;
+        let points_arg = points as u64;
+        let lo_bits_arg = lo_bits as u32;
+        // Through a shared reference, as `add_scaled_eq` writes the weight:
+        // the stream orders the writes, and the weight has one owner.
+        unsafe {
+            self.stream
+                .launch_builder(&be.add_eq_tensor_ext3)
+                .arg(self.weight.as_ref())
+                .arg(&hi_dev)
+                .arg(&lo_dev)
+                .arg(&count)
+                .arg(&points_arg)
+                .arg(&lo_bits_arg)
+                .launch(LaunchConfig::for_num_elems(self.len as u32))?;
+        }
+        // The halves are freed on the stream, after the kernel that reads
+        // them.
+        drop((hi_dev, lo_dev));
+        Ok(())
+    }
+
     /// `weight += scale · eq(point, ·)`, the weight the next group carries.
     pub fn add_scaled_eq(&self, point: &[u64], scale: &[u64]) -> Result<()> {
         assert_eq!(point.len(), self.num_vars() * 3, "the point spans the cube");
