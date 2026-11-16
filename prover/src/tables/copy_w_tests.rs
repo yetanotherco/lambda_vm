@@ -676,7 +676,7 @@ fn honest_calls_across_2_to_the_32_are_accepted() {
 /// 1 and an honest row of a call with every carry 0 and no key at the last
 /// word of its range: what the census's rule c19 reads each carry on
 /// (`word_memory_tests::check_chip_carry`).
-pub(super) fn carry_rows() -> Vec<(usize, Vec<FE>, Vec<FE>)> {
+pub(super) fn carry_rows() -> Vec<super::word_memory_tests::CarryRows> {
     let mut run = Run::with_pages(line_pages());
     across(&mut run);
     let t = copy_w::generate_copy_w_trace_as(&run.rows, TraceForm::Wide);
