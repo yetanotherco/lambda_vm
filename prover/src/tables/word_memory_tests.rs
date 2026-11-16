@@ -4832,12 +4832,14 @@ fn the_census_holds_a_stores_new_word_and_the_sets_byte_messages() {
     );
 }
 
-/// ★ The block tree takes no word-format block: its leaves read a page
-/// table's columns as PAGE's, and the word format's pages are PAGE_W's. A
-/// word-format statement the verifier frames is refused by the tree's plan
-/// with an error, before any leaf would read PAGE_W as PAGE (which asserted).
+/// ★ The block tree plans word-format blocks, and refuses a statement it
+/// cannot check by an error, never a panic: this word-format statement, which
+/// the verifier frames, states its fixed tables at 2^2 rows where their
+/// preprocessed columns are taller, and the tree's plan refuses it naming a
+/// table whose route's or prepared columns are not its stated height (its
+/// leaves would otherwise assert while emitting).
 #[test]
-fn the_block_tree_refuses_a_word_format_block() {
+fn the_block_tree_refuses_a_word_block_with_a_fixed_table_off_its_height() {
     let format = block_whir::BlockFormat::production().with_memory(MemoryFormat::Words);
     let statement = words_statement(&format, &chip_free_counts(), CPU_WORD_TABLES);
     frame_of(&statement, &format).expect("the verifier frames it");
@@ -4850,7 +4852,8 @@ fn the_block_tree_refuses_a_word_format_block() {
         None,
     );
     assert!(
-        matches!(&refused, Err(why) if why.contains("word memory format")),
+        matches!(&refused, Err(why) if why.contains("states 2^2 rows and its")
+            && why.contains("columns are")),
         "{:?}",
         refused.err()
     );

@@ -713,6 +713,8 @@ pub struct PlannedPrepared {
     /// `(slot in the group's table order, AIR index, prefix length)`, in stack
     /// order.
     pub tables: Vec<(usize, usize, usize)>,
+    /// Each table's prepared columns' height in variables, in `tables`' order.
+    pub vars: Vec<usize>,
     /// Derived from the program and the partition, never read from a proof.
     pub roots: Vec<Commitment>,
     pub layout: StackedLayout,
@@ -726,6 +728,16 @@ impl PlannedPrepared {
             .iter()
             .find(|&&(_, table, _)| table == air)
             .map(|&(_, _, n)| n)
+    }
+
+    /// The prefix the stack settles of table `air` and its columns' height in
+    /// variables, when it holds it.
+    pub fn settles_at(&self, air: usize) -> Option<(usize, usize)> {
+        self.tables
+            .iter()
+            .zip(&self.vars)
+            .find(|((_, table, _), _)| *table == air)
+            .map(|(&(_, _, n), &vars)| (n, vars))
     }
 }
 
@@ -1027,6 +1039,7 @@ impl WhirBlockPlan {
                 .iter()
                 .map(|&(position, air, n)| (position - start, air, n))
                 .collect();
+            let vars: Vec<usize> = stack.shapes().iter().map(|&(_, v)| v).collect();
             let layout =
                 stark::multilinear_table::global_layout(&stack.shapes(), config.format.stack)
                     .map_err(|e| format!("prepared group {group}: {e:?}"))?;
@@ -1048,6 +1061,7 @@ impl WhirBlockPlan {
             prepared.push(PlannedPrepared {
                 group,
                 tables,
+                vars,
                 roots,
                 layout,
                 domain,
@@ -2256,7 +2270,12 @@ enum Route {
     Bitwise,
     ConstMle(Vec<Vec<FE>>),
     Page(Vec<Vec<FE>>),
-    Prepared(usize),
+    /// The prefix a prepared opening settles, and the height in variables of
+    /// the columns it opens.
+    Prepared {
+        settled: usize,
+        num_vars: usize,
+    },
     /// A CPU table's TIMESTAMP, by its closed form.
     Timestamp,
 }
@@ -2269,7 +2288,7 @@ impl Route {
             Route::None => 0,
             Route::Bitwise => crate::tables::bitwise::NUM_PRECOMPUTED_COLS,
             Route::ConstMle(columns) | Route::Page(columns) => columns.len(),
-            Route::Prepared(settled) => *settled,
+            Route::Prepared { settled, .. } => *settled,
             Route::Timestamp => crate::tables::cpu::NUM_PRECOMPUTED_COLS,
         }
     }
@@ -2359,9 +2378,13 @@ fn route_of(
     Ok(route)
 }
 
-/// The checks of [`route_of`]: the route checks `declared` columns, and a
-/// page route's columns are as tall as the table's stated `num_vars` (a page
-/// of the other family is not: PAGE's are `2^18` rows, PAGE_W's `2^15`).
+/// The checks of [`route_of`]: the route checks `declared` columns, and the
+/// columns a route folds are as tall as the table's stated `num_vars` — a
+/// page of the other family is not (PAGE's are `2^18` rows, PAGE_W's
+/// `2^15`), nor a fixed table (KECCAK_RC, REGISTER) a statement states at
+/// another height than its columns', nor a prepared table whose opened
+/// columns are another height. The legs would otherwise assert at emit time;
+/// a statement is refused by an error, never a panic.
 fn check_route_columns(
     route: &Route,
     declared: usize,
@@ -2376,14 +2399,26 @@ fn check_route_columns(
              checks {checked}"
         ));
     }
-    if let Route::Page(columns) = route
+    if let Route::Page(columns) | Route::ConstMle(columns) = route
         && !route_fault!(NoHeightCheck)
-        && let Some(column) = columns.iter().find(|c| c.len() != 1usize << num_vars)
+        && let Some(column) = columns
+            .iter()
+            .find(|c| Some(c.len()) != 1usize.checked_shl(num_vars as u32))
     {
         return Err(format!(
-            "page table {table} ({name}) states 2^{num_vars} rows and its route's columns are \
-             {} rows",
+            "table {table} ({name}) states 2^{num_vars} rows and its route's columns are {} rows",
             column.len()
+        ));
+    }
+    if let Route::Prepared {
+        num_vars: opened, ..
+    } = route
+        && *opened != num_vars
+        && !route_fault!(NoHeightCheck)
+    {
+        return Err(format!(
+            "table {table} ({name}) states 2^{num_vars} rows and its prepared columns are \
+             2^{opened} rows"
         ));
     }
     Ok(())
@@ -2397,13 +2432,13 @@ fn route_for(
     table: usize,
     first_page: usize,
 ) -> Result<Route, String> {
-    if let Some(n) = plan.prepared.iter().find_map(|p| p.settles(table)) {
-        let n = if route_fault!(SettleOneFewer) {
+    if let Some((n, num_vars)) = plan.prepared.iter().find_map(|p| p.settles_at(table)) {
+        let settled = if route_fault!(SettleOneFewer) {
             n.saturating_sub(1)
         } else {
             n
         };
-        return Ok(Route::Prepared(n));
+        return Ok(Route::Prepared { settled, num_vars });
     }
     let pages = first_page..first_page + plan.frame.page_configs.len();
     if pages.contains(&table) {
@@ -2462,7 +2497,7 @@ fn preprocessed_plan<'a>(
                 init: &view[1..],
             },
         },
-        Route::Prepared(settled) => PreprocessedPlan {
+        Route::Prepared { settled, .. } => PreprocessedPlan {
             settled: *settled,
             route: PreprocessedRoute::None,
         },
