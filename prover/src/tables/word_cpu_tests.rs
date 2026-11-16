@@ -1324,3 +1324,415 @@ fn a_store_of_a_word_that_is_not_canonical_is_refused_by_its_half_checks() {
     let v = verdict(&forged);
     assert!(v.accepted(), "control: {v:?}");
 }
+
+/// ★ A byte store whose new word changes a byte it does not write: the SB at
+/// `S + 1` produces a word whose byte 5 is one more, which the memory after it
+/// carries. Refused by the new high half's identity (MEM_STOREW constraint 16)
+/// alone; with that identity reading zero (a control mutant) it is accepted.
+#[test]
+fn a_store_changing_a_byte_it_does_not_write_is_refused_by_its_identity() {
+    let honest_cpu = honest();
+    let ts = honest_cpu.ts_of(S + 1, store_flags(1));
+    let mut forged_cpu = Cpu::new(pages());
+    let mut forged_word = None;
+    replay_with(&honest_cpu, &mut forged_cpu, |cpu, d| {
+        if d.ts == ts + 4 {
+            let word = cpu.current(S).value + (1 << 40);
+            cpu.poke(S, word);
+            forged_word = Some(word);
+        }
+    });
+    let forged_word = forged_word.expect("an access after the SB");
+    let mut forged = forged_cpu.bench();
+    let row = row_at(&forged, "MEM_STOREW", sw::TIMESTAMP, ts);
+    let (lo, hi) = halves(forged_word);
+    forged.set_u64("MEM_STOREW", row, sw::NEW_LO, u64::from(lo));
+    forged.set_u64("MEM_STOREW", row, sw::NEW_HI, u64::from(hi));
+    let v = verdict(&forged);
+    assert!(
+        refused_only_by_constraints(&v, "MEM_STOREW", &[16]),
+        "{v:?}"
+    );
+    let v = without_constraints(&forged, "MEM_STOREW", &[16]);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ A byte load that returns a byte memory does not hold: the LBU at
+/// `S + 7` reads `0x88` and claims `0x55`. Refused by the placement (MEM_LOADW
+/// constraint 16) alone; with it reading zero (a control mutant) accepted.
+#[test]
+fn a_load_returning_a_byte_memory_does_not_hold_is_refused_by_the_placement() {
+    let c = honest();
+    let mut forged = c.bench();
+    let ts = c.ts_of(S + 7, load_flags(1, false));
+    let row = row_at(&forged, "MEM_LOADW", lw::TIMESTAMP, ts);
+    assert_eq!(forged.get("MEM_LOADW", row, lw::RES[0]), fe(0x88));
+    forged.set_u64("MEM_LOADW", row, lw::RES[0], 0x55);
+    forged.set_u64("MEM_LOADW", row, lw::SIGN_BIT, 0);
+    forged.set_u64("CPU", c.dispatch_row(ts), cpu::RESULT_LO, 0x55);
+    let v = verdict(&forged);
+    assert!(refused_only_by_constraints(&v, "MEM_LOADW", &[16]), "{v:?}");
+    let v = without_constraints(&forged, "MEM_LOADW", &[16]);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ A byte store at an aligned address with an all-zero one-hot writes
+/// nothing: the key is the address (offset 0), the new word the old one, and
+/// a later load reads the old byte. Refused by the one-hot's sum (MEM_STOREW
+/// constraint 8) alone; with it reading zero (a control mutant) accepted.
+#[test]
+fn a_store_with_an_empty_one_hot_is_refused_by_its_sum() {
+    let mut honest_cpu = honest();
+    let at = S + 0x50;
+    honest_cpu.store(at, 1, 0x5A);
+    honest_cpu.load(at, 1, false);
+    let ts = honest_cpu.ts - 8;
+    // The forger's memory: the store never lands.
+    let mut forged_cpu = Cpu::new(pages());
+    replay_with(&honest_cpu, &mut forged_cpu, |cpu, d| {
+        if d.ts == ts + 4 {
+            cpu.poke(at, 0);
+        }
+    });
+    let mut forged = forged_cpu.bench();
+    let row = row_at(&forged, "MEM_STOREW", sw::TIMESTAMP, ts);
+    forged.set_u64("MEM_STOREW", row, sw::OFF[0], 0);
+    forged.set_u64("MEM_STOREW", row, sw::NEW_LO, 0);
+    forged.set_u64("MEM_STOREW", row, sw::NEW_HI, 0);
+    let load = forged_cpu.dispatch_row(ts + 4);
+    assert_eq!(
+        forged.get("CPU", load, cpu::RESULT_LO),
+        fe(0),
+        "the old byte"
+    );
+    let v = verdict(&forged);
+    assert!(refused_only_by_constraints(&v, "MEM_STOREW", &[8]), "{v:?}");
+    let v = without_constraints(&forged, "MEM_STOREW", &[8]);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// The values a search edit gives a column: small integers, a byte's and a
+/// half's bounds, minus one, and the column's own value plus one.
+fn search_values(own: FE) -> [FE; 8] {
+    [
+        FE::zero(),
+        FE::one(),
+        fe(2),
+        neg(1),
+        fe(255),
+        fe(256),
+        fe(1 << 16),
+        own + FE::one(),
+    ]
+}
+
+/// The constraints `eval` breaks on `row`, by index.
+fn broken_on(eval: Eval, row: &[FE]) -> Vec<usize> {
+    eval(row)
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v != FE::zero())
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// For each constraint of `eval`, whether some row of `bases` (those meeting
+/// every constraint) with one or two columns changed (to [`search_values`]),
+/// or three of the `selectors` (each to 0, 1 or 2), breaks that constraint and
+/// no other.
+fn lone_breaks(eval: Eval, bases: &[Vec<FE>], selectors: &[usize]) -> Vec<bool> {
+    let n = eval(&bases[0]).len();
+    let mut found = vec![false; n];
+    for base in bases.iter().filter(|base| broken_on(eval, base).is_empty()) {
+        let width = base.len();
+        let mut note = |row: &[FE]| {
+            if let [k] = broken_on(eval, row)[..] {
+                found[k] = true;
+            }
+        };
+        for a in 0..width {
+            for va in search_values(base[a]) {
+                let mut row = base.clone();
+                row[a] = va;
+                note(&row);
+                for b in a + 1..width {
+                    for vb in search_values(base[b]) {
+                        let mut row2 = row.clone();
+                        row2[b] = vb;
+                        note(&row2);
+                    }
+                }
+            }
+        }
+        let small = [FE::zero(), FE::one(), fe(2)];
+        for (i, &a) in selectors.iter().enumerate() {
+            for (j, &b) in selectors.iter().enumerate().skip(i + 1) {
+                for &c in &selectors[j + 1..] {
+                    for va in small {
+                        for vb in small {
+                            for vc in small {
+                                let mut row = base.clone();
+                                row[a] = va;
+                                row[b] = vb;
+                                row[c] = vc;
+                                note(&row);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The rows of `name` in the honest bench that hold an access, the zero row,
+/// and the minimal active rows: all zero but `MU`, one offset's one-hot column
+/// (any of the eight, where the table has a one-hot) and at most one width
+/// flag (of `flags`); the search starts from those that meet every
+/// constraint.
+fn base_rows(
+    bench: &Bench,
+    name: &str,
+    mu: usize,
+    off: Option<[usize; 8]>,
+    flags: &[usize],
+) -> Vec<Vec<FE>> {
+    let t = &bench.piece(name).trace;
+    let width = t.main_table.width;
+    let mut rows: Vec<Vec<FE>> = (0..t.num_rows())
+        .filter(|&r| *t.get_main(r, mu) == FE::one())
+        .map(|r| (0..width).map(|c| *t.get_main(r, c)).collect())
+        .collect();
+    rows.push(vec![FE::zero(); width]);
+    let offsets: Vec<Option<usize>> = match off {
+        Some(off) => off.into_iter().map(Some).collect(),
+        None => vec![None],
+    };
+    for o in offsets {
+        for flag in std::iter::once(None).chain(flags.iter().copied().map(Some)) {
+            let mut row = vec![FE::zero(); width];
+            row[mu] = FE::one();
+            for c in [o, flag].into_iter().flatten() {
+                row[c] = FE::one();
+            }
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+/// A table the constraint search reads: its name, its constraints, `MU`, its
+/// one-hot (if any), its width flags and the selectors a three-column edit
+/// sets.
+type SearchedTable = (
+    &'static str,
+    Eval,
+    usize,
+    Option<[usize; 8]>,
+    Vec<usize>,
+    Vec<usize>,
+);
+
+/// ★ Every constraint of the six word tables is one a row can break alone: for
+/// each, from an honest row of the bench (or a minimal active row), one or two
+/// columns changed break that constraint and no other. So each is load-bearing
+/// at the row: taken out, a row the table refused today meets every other.
+/// (The search: one or two columns of an honest or minimal row set to small
+/// values, bounds or their own plus one, or three of the one-hot, width,
+/// sign and multiplicity columns set to 0, 1 or 2.)
+#[test]
+fn every_word_table_constraint_breaks_alone_on_some_row() {
+    let c = honest();
+    let bench = c.bench();
+    let selectors = |off: [usize; 8], rest: &[usize]| -> Vec<usize> {
+        off.iter().chain(rest).copied().collect()
+    };
+    // (table, its constraints, MU, the one-hot, the width flags, the
+    // selectors a three-column edit sets).
+    let tables: [SearchedTable; 6] = [
+        (
+            "MEM_LOAD8",
+            load8_constraints,
+            l8::MU,
+            None,
+            vec![],
+            vec![l8::MU],
+        ),
+        (
+            "MEM_STORE8",
+            store8_constraints,
+            s8::MU,
+            None,
+            vec![],
+            vec![s8::MU],
+        ),
+        (
+            "MEM_LOADW",
+            loadw_constraints,
+            lw::MU,
+            Some(lw::OFF),
+            vec![lw::READ2, lw::READ4],
+            selectors(lw::OFF, &[lw::READ2, lw::READ4, lw::SIGNED, lw::MU]),
+        ),
+        (
+            "MEM_STOREW",
+            storew_constraints,
+            sw::MU,
+            Some(sw::OFF),
+            vec![sw::WRITE2, sw::WRITE4],
+            selectors(sw::OFF, &[sw::WRITE2, sw::WRITE4, sw::MU]),
+        ),
+        (
+            "MEM_LOAD2W",
+            load2w_constraints,
+            l2::MU,
+            Some(l2::OFF),
+            vec![l2::READ2, l2::READ4, l2::READ8],
+            selectors(
+                l2::OFF,
+                &[l2::READ2, l2::READ4, l2::READ8, l2::SIGNED, l2::MU],
+            ),
+        ),
+        (
+            "MEM_STORE2W",
+            store2w_constraints,
+            s2::MU,
+            Some(s2::OFF),
+            vec![s2::WRITE2, s2::WRITE4, s2::WRITE8],
+            selectors(s2::OFF, &[s2::WRITE2, s2::WRITE4, s2::WRITE8, s2::MU]),
+        ),
+    ];
+    let mut missing = Vec::new();
+    for (name, eval, mu, off, flags, selectors) in tables {
+        let found = lone_breaks(eval, &base_rows(&bench, name, mu, off, &flags), &selectors);
+        let lone: Vec<usize> = (0..found.len()).filter(|&k| !found[k]).collect();
+        if !lone.is_empty() {
+            missing.push(format!("{name}: no lone break for constraints {lone:?}"));
+        }
+    }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
+}
+
+/// ★ A signed load whose sign bit is forged clear: an LB of `0x88` (MEM_LOADW)
+/// and a crossing LH of `0x9988` (MEM_LOAD2W) each returned zero-extended,
+/// the row's sign bit, extension and extended bytes cleared to match and the
+/// CPU's result the forged one. Every constraint holds (the extension follows
+/// the forged sign bit); refused by the `MSB8` lookup alone, which ties the
+/// sign bit to the top byte read; with the table's `MSB8` sends taken out (a
+/// control mutant) each is accepted.
+#[test]
+fn a_signed_load_with_its_sign_bit_forged_clear_is_refused_by_its_msb8() {
+    let mut c = honest();
+    c.store(S + 0x30 + 0xF, 2, 0x9988);
+    c.load(S + 0x30 + 0xF, 2, true);
+    let honest_bench = c.bench();
+    for (table, ts, res, sign_bit, ext, width, interactions) in [
+        (
+            "MEM_LOADW",
+            c.ts_of(S + 7, load_flags(1, true)),
+            lw::RES.to_vec(),
+            lw::SIGN_BIT,
+            lw::EXT,
+            1usize,
+            mem_loadw::bus_interactions(),
+        ),
+        (
+            "MEM_LOAD2W",
+            c.ts_of(S + 0x3F, load_flags(2, true)),
+            l2::RES.to_vec(),
+            l2::SIGN_BIT,
+            l2::EXT,
+            2,
+            mem_load2w::bus_interactions(),
+        ),
+    ] {
+        let mut forged = honest_bench.clone();
+        let ts_col = if table == "MEM_LOADW" {
+            lw::TIMESTAMP
+        } else {
+            l2::TIMESTAMP
+        };
+        let row = row_at(&forged, table, ts_col, ts);
+        assert_eq!(
+            forged.get(table, row, sign_bit),
+            FE::one(),
+            "{table}: the sign set"
+        );
+        forged.set(table, row, sign_bit, FE::zero());
+        forged.set(table, row, ext, FE::zero());
+        for &col in &res[width..] {
+            forged.set(table, row, col, FE::zero());
+        }
+        let byte = |k: usize| forged.get(table, row, res[k]).canonical_u64();
+        let lo: u64 = (0..width).map(|k| byte(k) << (8 * k)).sum();
+        let d = c.dispatch_row(ts);
+        forged.set_u64("CPU", d, cpu::RESULT_LO, lo);
+        forged.set_u64("CPU", d, cpu::RESULT_HI, 0);
+        let v = verdict(&forged);
+        assert!(refused_only_by_lookup(&v, BusId::Msb8), "{table}: {v:?}");
+        let control: Vec<BusInteraction> = interactions
+            .into_iter()
+            .filter(|bi| bi.bus_id != u64::from(BusId::Msb8))
+            .collect();
+        let v = verdict(&forged.with_interactions(table, control));
+        assert!(v.accepted(), "{table}: control: {v:?}");
+    }
+}
+
+/// ★ A crossing store whose register bytes are split across the word
+/// boundary: the register byte placed at the first word's byte 7 is
+/// `x + 256` and the one at the second word's byte 0 is `y − 1`. The
+/// dispatch's value is unchanged (the two bytes sit in one of its words), but
+/// the first word's high half is `2^32` more and the second word's byte 0 one
+/// less: a store that writes another byte than the register's, which the
+/// pages' final words then carry. One store for each of MEM_STORE2W's four
+/// `VALUE` pairs (an SH at offset 7, an SW at 5, an SD at 3 and at 1, so the
+/// boundary falls in pair 0, 1, 2 and 3), each refused by its pair alone;
+/// with that pair taken out (a control mutant) each is accepted.
+#[test]
+fn a_crossing_store_splitting_its_bytes_at_the_word_boundary_is_refused_by_each_pair() {
+    let cases: [(u64, u8, usize); 4] = [(7, 2, 0), (5, 4, 2), (3, 8, 4), (1, 8, 6)];
+    let mut c = honest();
+    let mut stores = Vec::new();
+    for (k, &(offset, width, j)) in cases.iter().enumerate() {
+        let word = S + 0x80 + 0x10 * k as u64;
+        let at = word + offset;
+        c.store(at, width, 0x5152_5354_5556_5758);
+        stores.push((word, c.ts - 4, j));
+    }
+    let honest_bench = c.bench();
+    assert!(verdict(&honest_bench).accepted(), "the honest bench");
+    for (pair, &(word, ts, j)) in stores.iter().enumerate() {
+        let mut forged = honest_bench.clone();
+        let row = row_at(&forged, "MEM_STORE2W", s2::TIMESTAMP, ts);
+        let shift = |col: usize, by: FE| {
+            let v = forged.get("MEM_STORE2W", row, col);
+            (col, v + by)
+        };
+        let edits = [
+            shift(s2::VALUE[j], fe(256)),
+            shift(s2::VALUE[j + 1], neg(1)),
+            shift(s2::NEW1_HI, fe(1 << 32)),
+            shift(s2::NEW2_LO, neg(1)),
+        ];
+        for (col, v) in edits {
+            forged.set("MEM_STORE2W", row, col, v);
+        }
+        // The pages' final words: nothing touches the two words after it.
+        let (page, r) = page_row(STACK_BASE, word);
+        let hi = forged.get(&page, r, pw::FINI_HI);
+        forged.set(&page, r, pw::FINI_HI, hi + fe(1 << 32));
+        let lo = forged.get(&page, r + 1, pw::FINI_LO);
+        forged.set(&page, r + 1, pw::FINI_LO, lo - FE::one());
+        let v = verdict(&forged);
+        assert!(
+            refused_only_by_lookup(&v, BusId::AreBytes),
+            "pair {pair}: {v:?}"
+        );
+        let (a, b) = (s2::VALUE[2 * pair], s2::VALUE[2 * pair + 1]);
+        let control = without_pair(&mem_store2w::bus_interactions(), a, b);
+        let v = verdict(&forged.with_interactions("MEM_STORE2W", control));
+        assert!(v.accepted(), "pair {pair}: control: {v:?}");
+    }
+}
