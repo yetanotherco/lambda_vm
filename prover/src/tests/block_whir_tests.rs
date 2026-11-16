@@ -3186,20 +3186,28 @@ fn the_prover_refuses_a_partition_over_the_group_maximum() {
 /// every group, and a group's most fractions are a table alone at
 /// 2^[`block_whir::BLOCK_MAX_TABLE_VARS`] rows times the most bus interactions
 /// any block AIR carries a row (BLAKE3's 1475). The error is
-/// (len + 1)(|supp| − 1)/|F| with len the longest bus message (208: KECCAK's
-/// sponge link between two rows of one Keccak-256 call, 207 values and the bus
-/// id; 204 before it, the round chip's state messages) and |F| = p³, a
-/// committed word decoding to one codeword: 136.77 bits at 1024 groups, 140.77
-/// at 64 (136.79 and 140.79 at len 204). The census reads both constants from the block's
-/// AIRs, so a wider AIR or a larger maximum fails here before it moves the
-/// figure. It holds under both register formats: the in-row one's AIRs (the
-/// CPU's 24 interactions, the residual table's 6, REGISTER's 3, the REG
-/// bus's 4-value tokens) move neither constant. The census holds the fused
-/// memory format's MEM_LOAD and MEM_STORE AIRs too (23 and 24 interactions,
-/// 9-value messages), so a wider fused table fails here as well, and the word
-/// memory format's AIRs (PAGE_W, the CPU's six word tables, MEMW_W).
+/// (len + 1)(|supp| − 1)/|F| with len the longest bus message and |F| = p³, a
+/// committed word decoding to one codeword.
+///
+/// - Under the split and fused memory formats len is 208: KECCAK's sponge link
+///   between two rows of one Keccak-256 call, 207 values and the bus id (204
+///   before it, the round chip's state messages). 136.766 bits at 1024 groups,
+///   140.766 at 64.
+/// - Under the word memory format len is 217: KECCAK_W's sponge link, which
+///   carries KECCAK's 207 values plus the call's input offset and the eight
+///   bytes of the word two blocks share. 136.705 bits at 1024 groups, 140.705
+///   at 64. Every other AIR of the word set carries at most 208.
+///
+/// The census reads both constants from each format's AIRs, so a wider AIR or
+/// a larger maximum fails here before it moves a figure. It holds under both
+/// register formats: the in-row one's AIRs (the CPU's 24 interactions, the
+/// residual table's 6, REGISTER's 3, the REG bus's 4-value tokens) move
+/// neither constant. The fused set holds MEM_LOAD and MEM_STORE (23 and 24
+/// interactions, 9-value messages); the word set PAGE_W, the CPU's six word
+/// tables, MEMW_W and the word chips in their chips' places.
 #[test]
 fn block_wide_logup_at_the_group_maximum_is_pinned() {
+    use crate::tables::fused_memory::MemoryFormat;
     let elf = asm_elf_bytes("all_instructions_64");
     let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
     let opts = ProofOptions::default_test_options();
@@ -3237,11 +3245,11 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
     .expect("pages");
     let inputs =
         crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("the AIR inputs");
-    // The AIR set the block verifier builds: the pinned format's table forms
-    // with the fused memory format's two tables, then the same with the
-    // register format before it.
+    // The AIR set the block verifier builds under a memory format, with the
+    // pinned format's table forms and the given register format: each AIR's
+    // name, interactions a row and longest message.
     let pinned = BlockFormat::pinned();
-    let census = |registers| {
+    let census = |memory: MemoryFormat, registers| -> Vec<(String, usize, usize)> {
         let mut airs = crate::block_airs(
             &program,
             &opts,
@@ -3252,87 +3260,98 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
             pinned.memw_aligned,
             registers,
         );
-        airs.with_fused_memory(&opts, [1, 1]);
+        let held: Vec<String> = match memory {
+            MemoryFormat::Split => Vec::new(),
+            MemoryFormat::Fused => {
+                airs.with_fused_memory(&opts, [1, 1]);
+                vec!["MEM_LOAD[0]".to_string(), "MEM_STORE[0]".to_string()]
+            }
+            MemoryFormat::Words => {
+                airs.with_word_memory(&opts, [1; 7], &pages)
+                    .expect("the word tables");
+                block_whir::WORD_TABLES
+                    .iter()
+                    .map(|family| format!("{family}[0]"))
+                    .chain([
+                        format!("{}[0]", crate::tables::keccak_w::NAME),
+                        format!("{}[0]", crate::tables::copy_w::NAME),
+                        format!("{}[0]", crate::tables::ecrec_w::NAME),
+                    ])
+                    .collect()
+            }
+        };
         let refs = airs.air_refs();
-        for table in ["MEM_LOAD[0]", "MEM_STORE[0]"] {
+        for table in &held {
             assert!(
-                refs.iter().any(|air| air.name() == table),
-                "the census holds {table}"
+                refs.iter().any(|air| air.name() == *table),
+                "the {memory:?} census holds {table}"
             );
         }
+        assert_eq!(
+            refs.iter().any(|air| air.name().starts_with("PAGE_W:")),
+            memory == MemoryFormat::Words,
+            "PAGE_W under {memory:?}"
+        );
         refs.iter()
             .map(|air| {
                 let bus = air.bus_interactions();
                 let len = bus.iter().map(|b| b.num_bus_elements()).max().unwrap_or(0);
-                (bus.len(), len)
+                (air.name().to_string(), bus.len(), len)
             })
-            .fold((0, 0), |(f, l), (f2, l2)| (f.max(f2), l.max(l2)))
+            .collect()
     };
-    let (fractions, len) = census(pinned.registers);
-    assert_eq!(
-        (fractions, len),
-        (1475, 208),
-        "the census: fractions a row, message length"
-    );
-    assert_eq!(
-        census(crate::tables::register::RegisterFormat::Tokens32),
-        (fractions, len),
-        "the census under the register format before the pinned one"
-    );
-    // The word memory format's AIRs (PAGE_W in PAGE's place, the six CPU word
-    // tables and MEMW_W, at most 21 interactions and 9-value messages) move
-    // neither constant, under either register format.
-    let words_census = |registers| {
-        let mut airs = crate::block_airs(
-            &program,
-            &opts,
-            &pages,
-            &counts,
-            &inputs,
-            pinned.keccak_rnd,
-            pinned.memw_aligned,
-            registers,
-        );
-        airs.with_word_memory(&opts, [1; 7], &pages)
-            .expect("the word tables");
-        let refs = airs.air_refs();
-        for family in block_whir::WORD_TABLES {
-            let table = format!("{family}[0]");
-            assert!(
-                refs.iter().any(|air| air.name() == table),
-                "the census holds {table}"
-            );
-        }
-        assert!(refs.iter().any(|air| air.name().starts_with("PAGE_W:")));
-        refs.iter()
-            .map(|air| {
-                let bus = air.bus_interactions();
-                let len = bus.iter().map(|b| b.num_bus_elements()).max().unwrap_or(0);
-                (bus.len(), len)
-            })
-            .fold((0, 0), |(f, l), (f2, l2)| (f.max(f2), l.max(l2)))
+    let most = |airs: &[(String, usize, usize)]| {
+        airs.iter()
+            .fold((0, 0), |(f, l), (_, f2, l2)| (f.max(*f2), l.max(*l2)))
     };
     for registers in [
         pinned.registers,
         crate::tables::register::RegisterFormat::Tokens32,
     ] {
+        for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
+            assert_eq!(
+                most(&census(memory, registers)),
+                (1475, 208),
+                "the census under the {memory:?} memory format, {registers:?}: fractions a \
+                 row, message length"
+            );
+        }
+        let words = census(MemoryFormat::Words, registers);
         assert_eq!(
-            words_census(registers),
-            (fractions, len),
+            most(&words),
+            (1475, 217),
             "the census under the word memory format, {registers:?}"
         );
+        // The 217 is KECCAK_W's sponge link alone.
+        let longer: Vec<&str> = words
+            .iter()
+            .filter(|(_, _, len)| *len > 208)
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            longer,
+            [format!("{}[0]", crate::tables::keccak_w::NAME)],
+            "the word set's AIRs with a message longer than 208, {registers:?}"
+        );
     }
-    let bits = |groups: usize| {
+    let bits = |groups: usize, len: usize| {
         let support =
-            groups as f64 * 2f64.powi(block_whir::BLOCK_MAX_TABLE_VARS as i32) * fractions as f64;
+            groups as f64 * 2f64.powi(block_whir::BLOCK_MAX_TABLE_VARS as i32) * 1475f64;
         let field_log2 = 3.0 * (0xFFFF_FFFF_0000_0001u64 as f64).log2();
         field_log2 - ((len as f64 + 1.0) * (support - 1.0)).log2()
     };
+    // Split and fused.
     assert_eq!(
-        format!("{:.2}", bits(block_whir::BLOCK_MAX_GROUPS)),
-        "136.77"
+        format!("{:.3}", bits(block_whir::BLOCK_MAX_GROUPS, 208)),
+        "136.766"
     );
-    assert_eq!(format!("{:.2}", bits(64)), "140.77");
+    assert_eq!(format!("{:.3}", bits(64, 208)), "140.766");
+    // Words.
+    assert_eq!(
+        format!("{:.3}", bits(block_whir::BLOCK_MAX_GROUPS, 217)),
+        "136.705"
+    );
+    assert_eq!(format!("{:.3}", bits(64, 217)), "140.705");
 }
 
 /// ★ The group maximum's edge on the prover's plan: tables that fill a group each, at the
