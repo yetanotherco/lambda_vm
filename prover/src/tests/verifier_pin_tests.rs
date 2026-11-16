@@ -602,6 +602,7 @@ fn frame_counts(
             num_private_input_pages: 0,
             groups: &groups,
             fused_memory: fused,
+            word_memory: [0; 7],
         },
         elf,
         &ProofOptions::default_test_options(),

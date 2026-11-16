@@ -57,7 +57,7 @@ pub(super) fn many_groups() -> BlockFormat {
     }
 }
 
-pub(super) fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions {
+pub(crate) fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions {
     BlockOptions {
         max_rows,
         keccak_rnd_rows_log2,
@@ -1183,7 +1183,7 @@ fn a_block_with_a_negative_keccak_multiplicity_is_refused() {
     assert!(!verify(&negative, &elf, &format));
 }
 
-pub(super) fn streamed(
+pub(crate) fn streamed(
     max_rows: MaxRowsConfig,
     keccak_rnd_rows_log2: usize,
     window_log2: usize,
@@ -3174,7 +3174,8 @@ fn the_prover_refuses_a_partition_over_the_group_maximum() {
 /// CPU's 24 interactions, the residual table's 6, REGISTER's 3, the REG
 /// bus's 4-value tokens) move neither constant. The census holds the fused
 /// memory format's MEM_LOAD and MEM_STORE AIRs too (23 and 24 interactions,
-/// 9-value messages), so a wider fused table fails here as well.
+/// 9-value messages), so a wider fused table fails here as well, and the word
+/// memory format's AIRs (PAGE_W, the CPU's six word tables, MEMW_W).
 #[test]
 fn block_wide_logup_at_the_group_maximum_is_pinned() {
     let elf = asm_elf_bytes("all_instructions_64");
@@ -3256,6 +3257,49 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
         (fractions, len),
         "the census under the register format before the pinned one"
     );
+    // The word memory format's AIRs (PAGE_W in PAGE's place, the six CPU word
+    // tables and MEMW_W, at most 21 interactions and 9-value messages) move
+    // neither constant, under either register format.
+    let words_census = |registers| {
+        let mut airs = crate::block_airs(
+            &program,
+            &opts,
+            &pages,
+            &counts,
+            &inputs,
+            pinned.keccak_rnd,
+            pinned.memw_aligned,
+            registers,
+        );
+        airs.with_word_memory(&opts, [1; 7], &pages)
+            .expect("the word tables");
+        let refs = airs.air_refs();
+        for family in block_whir::WORD_TABLES {
+            let table = format!("{family}[0]");
+            assert!(
+                refs.iter().any(|air| air.name() == table),
+                "the census holds {table}"
+            );
+        }
+        assert!(refs.iter().any(|air| air.name().starts_with("PAGE_W:")));
+        refs.iter()
+            .map(|air| {
+                let bus = air.bus_interactions();
+                let len = bus.iter().map(|b| b.num_bus_elements()).max().unwrap_or(0);
+                (bus.len(), len)
+            })
+            .fold((0, 0), |(f, l), (f2, l2)| (f.max(f2), l.max(l2)))
+    };
+    for registers in [
+        pinned.registers,
+        crate::tables::register::RegisterFormat::Tokens32,
+    ] {
+        assert_eq!(
+            words_census(registers),
+            (fractions, len),
+            "the census under the word memory format, {registers:?}"
+        );
+    }
     let bits = |groups: usize| {
         let support =
             groups as f64 * 2f64.powi(block_whir::BLOCK_MAX_TABLE_VARS as i32) * fractions as f64;

@@ -41,6 +41,9 @@ pub(crate) struct RestHeader {
     /// split format): counted apart from [`crate::TableCounts`], which a proof
     /// archives as it always has.
     pub(crate) fused_counts: [usize; 2],
+    /// The word memory format's tables, family by family (none under any other
+    /// format), counted apart as the fused ones.
+    pub(crate) word_counts: [usize; 7],
 }
 
 impl RestHeader {
@@ -1410,6 +1413,7 @@ impl<'a> FinishPlan<'a> {
                 bitwise_from_tables: false,
                 keccak_rnd_first: false,
                 fused_counts,
+                word_counts: [0; 7],
             },
             cut_line,
             cpu_decoded,
@@ -2062,6 +2066,7 @@ impl<'a> FinishPlan<'a> {
             bitwise_from_tables: _,
             keccak_rnd_first: _,
             fused_counts,
+            word_counts: _,
         } = header;
         let traces = Traces {
             cpus,
@@ -2100,6 +2105,7 @@ impl<'a> FinishPlan<'a> {
             cpu32s,
             mem_loads,
             mem_stores,
+            word_tables: std::array::from_fn(|_| Vec::new()),
         };
         // The tables are the ones the header counted, or the build is refused: the
         // header is what a statement can be read from before the tables exist.

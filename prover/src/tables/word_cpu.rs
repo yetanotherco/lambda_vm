@@ -157,6 +157,39 @@ pub(crate) fn msb8(byte: usize, sign_bit: usize, multiplicity: Multiplicity) -> 
     )
 }
 
+/// Word family `k`'s main columns and interactions
+/// (`block_whir::WORD_TABLES`' order: the six CPU tables, then MEMW_W).
+pub(crate) fn word_table_shape(k: usize) -> (usize, usize) {
+    use super::{mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew, memw_w};
+    match k {
+        0 => (
+            mem_load8::cols::NUM_COLUMNS,
+            mem_load8::bus_interactions().len(),
+        ),
+        1 => (
+            mem_store8::cols::NUM_COLUMNS,
+            mem_store8::bus_interactions().len(),
+        ),
+        2 => (
+            mem_loadw::cols::NUM_COLUMNS,
+            mem_loadw::bus_interactions().len(),
+        ),
+        3 => (
+            mem_storew::cols::NUM_COLUMNS,
+            mem_storew::bus_interactions().len(),
+        ),
+        4 => (
+            mem_load2w::cols::NUM_COLUMNS,
+            mem_load2w::bus_interactions().len(),
+        ),
+        5 => (
+            mem_store2w::cols::NUM_COLUMNS,
+            mem_store2w::bus_interactions().len(),
+        ),
+        _ => (memw_w::cols::NUM_COLUMNS, memw_w::bus_interactions().len()),
+    }
+}
+
 // =========================================================================
 // Constraints
 // =========================================================================

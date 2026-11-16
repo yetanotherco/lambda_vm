@@ -3883,6 +3883,7 @@ impl WhirBlockTreeProof {
             groups: &self.groups,
             // The tree recurses over the split memory format alone.
             fused_memory: [0, 0],
+            word_memory: [0; 7],
         }
     }
 
@@ -4430,6 +4431,7 @@ impl WhirBlockCompressedProof {
             groups: &self.groups,
             // The tree recurses over the split memory format alone.
             fused_memory: [0, 0],
+            word_memory: [0; 7],
         }
     }
 
@@ -5233,6 +5235,7 @@ mod tests {
             num_private_input_pages: 2,
             groups: vec![vec![0, 2], vec![1]],
             fused_memory: [0, 0],
+            word_memory: [0; 7],
         };
         let words: Vec<(u32, LfmWord)> = (0..3u32)
             .map(|i| (i, [crate::tables::types::FE::from(u64::from(i) + 7); 4]))

@@ -80,9 +80,9 @@ fn the_fused_pair_is_read_under_the_verifiers_format() {
 /// counts right after the table counts.
 #[test]
 fn only_the_fused_format_absorbs_its_pair() {
-    assert!(block_whir::fused_statement_words(MemoryFormat::Split, [3, 4]).is_empty());
+    assert!(block_whir::fused_statement_words(MemoryFormat::Split, [3, 4], [0; 7]).is_empty());
     assert_eq!(
-        block_whir::fused_statement_words(MemoryFormat::Fused, [3, 4]),
+        block_whir::fused_statement_words(MemoryFormat::Fused, [3, 4], [0; 7]),
         vec![block_whir::FUSED_MEMORY_WORD, 3, 4]
     );
     assert_eq!(

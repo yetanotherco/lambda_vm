@@ -47,17 +47,18 @@ pub enum MemoryFormat {
     /// LOAD, STORE and MEMW take the rest (module docs).
     Fused,
     /// Memory checked by aligned 8-byte word, one token a word
-    /// ([`super::word_memory`]): PAGE_W mints a page's words, MEMW_W takes the
-    /// chips' word messages, and LOAD, STORE, MEMW_A, MEMW, MEM_LOAD and
-    /// MEM_STORE are not part of the block. Not built yet: every block path
-    /// refuses it.
+    /// ([`super::word_memory`]): PAGE_W mints a page's words, the CPU's loads
+    /// and stores are its six word tables' ([`super::word_cpu`]), MEMW_W takes
+    /// the chips' word messages, and LOAD, STORE, MEMW_A, MEMW, MEM_LOAD and
+    /// MEM_STORE are not part of the block. The verifier frames a statement
+    /// under it; its prover is not built yet ([`refuse_unbuilt`]).
     Words,
 }
 
-/// Refuses a memory format no block path proves or verifies yet: the word
-/// memory format, whose CPU and chip tables are not built. Every block path
-/// asks it before anything is laid out or checked (the block format check,
-/// the fused tables' check, the windowed build's format setters).
+/// Refuses a memory format no block prover makes yet: the word memory format,
+/// whose walk is not built. Every prover path asks it before anything is laid
+/// out (the prove's entry, the windowed build's format setters); the verifier
+/// does not.
 pub(crate) fn refuse_unbuilt(memory: MemoryFormat) -> Result<(), crate::Error> {
     match memory {
         MemoryFormat::Words => Err(crate::Error::Prover(

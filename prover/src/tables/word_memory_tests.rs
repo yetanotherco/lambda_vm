@@ -1884,16 +1884,97 @@ fn columns(f: &BTreeMap<Option<usize>, i128>) -> BTreeSet<usize> {
     f.keys().filter_map(|k| *k).collect()
 }
 
+pub(super) fn load8_constraints(row: &[FE]) -> Vec<FE> {
+    constraint_values(&super::mem_load8::MemLoad8Constraints, row)
+}
+pub(super) fn store8_constraints(row: &[FE]) -> Vec<FE> {
+    constraint_values(&super::mem_store8::MemStore8Constraints, row)
+}
+pub(super) fn loadw_constraints(row: &[FE]) -> Vec<FE> {
+    constraint_values(&super::mem_loadw::MemLoadWConstraints, row)
+}
+pub(super) fn storew_constraints(row: &[FE]) -> Vec<FE> {
+    constraint_values(&super::mem_storew::MemStoreWConstraints, row)
+}
+pub(super) fn load2w_constraints(row: &[FE]) -> Vec<FE> {
+    constraint_values(&super::mem_load2w::MemLoad2WConstraints, row)
+}
+pub(super) fn store2w_constraints(row: &[FE]) -> Vec<FE> {
+    constraint_values(&super::mem_store2w::MemStore2WConstraints, row)
+}
+
 /// A table's constraints on one row and its width, for the census's bit
-/// checks: by name.
+/// checks: by name (a table's family, before its index).
 fn evaluator(name: &str) -> Option<(Eval, usize)> {
-    if name.starts_with("MEMW_W") {
-        Some((memw_w_constraints as Eval, mw::NUM_COLUMNS))
-    } else if matches!(name, "CHIP" | "WRITER" | "READER") {
-        Some((chip_constraints as Eval, chip::NUM_COLUMNS))
-    } else {
-        None
+    use super::{mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew};
+    let family = name.split('[').next().unwrap_or(name);
+    match family {
+        "MEMW_W" => Some((memw_w_constraints as Eval, mw::NUM_COLUMNS)),
+        "CHIP" | "WRITER" | "READER" => Some((chip_constraints as Eval, chip::NUM_COLUMNS)),
+        "MEM_LOAD8" => Some((load8_constraints as Eval, mem_load8::cols::NUM_COLUMNS)),
+        "MEM_STORE8" => Some((store8_constraints as Eval, mem_store8::cols::NUM_COLUMNS)),
+        "MEM_LOADW" => Some((loadw_constraints as Eval, mem_loadw::cols::NUM_COLUMNS)),
+        "MEM_STOREW" => Some((storew_constraints as Eval, mem_storew::cols::NUM_COLUMNS)),
+        "MEM_LOAD2W" => Some((load2w_constraints as Eval, mem_load2w::cols::NUM_COLUMNS)),
+        "MEM_STORE2W" => Some((store2w_constraints as Eval, mem_store2w::cols::NUM_COLUMNS)),
+        _ => None,
     }
+}
+
+/// Rule c11, a CPU word table's key: the dispatch's timestamp's high word the
+/// constant 0, the key's high element the dispatch's high address word, and
+/// its low element the dispatch's low address word less a one-hot offset
+/// (`Σ k·OFF_k`, each `k` in `1..8` at most once) plus `8` or nothing; the
+/// one-hot's columns held to bits, one at a time, by the table's constraints.
+fn check_dispatch_key(
+    name: &str,
+    dispatch: &BusInteraction,
+    produced: &BusInteraction,
+    eval: Option<(Eval, usize)>,
+) -> Result<(), String> {
+    if dispatch.values.len() != 9 || form(&dispatch.values[1])? != BTreeMap::new() {
+        return Err(format!(
+            "{name}: a dispatch that is not the CPU's nine values with timestamp high word 0"
+        ));
+    }
+    if produced.values[1] != dispatch.values[3] {
+        return Err(format!(
+            "{name}: a key high word that is not the dispatch's"
+        ));
+    }
+    let mut diff = form(&produced.values[0])?;
+    for (k, v) in form(&dispatch.values[2])? {
+        *diff.entry(k).or_insert(0) -= v;
+    }
+    diff.retain(|_, c| *c != 0);
+    let constant = diff.remove(&None).unwrap_or(0);
+    let mut offsets: Vec<i128> = diff.values().map(|c| -c).collect();
+    offsets.sort();
+    let distinct = offsets.windows(2).all(|w| w[0] != w[1]);
+    if ![0, 8].contains(&constant) || !distinct || offsets.iter().any(|k| !(1..8).contains(k)) {
+        return Err(format!(
+            "{name}: a key low word that is not the dispatch's address less a one-hot offset"
+        ));
+    }
+    if diff.is_empty() {
+        return Ok(());
+    }
+    let Some((eval, width)) = eval else {
+        return Err(format!("{name}: no constraint holds its one-hot to bits"));
+    };
+    let cols: Vec<usize> = columns(&diff).into_iter().collect();
+    for &c in &cols {
+        for bad in [FE::from(2u64), FE::zero() - FE::one()] {
+            let mut row = vec![FE::zero(); width];
+            row[c] = bad;
+            if eval(&row).iter().all(|v| *v == FE::zero()) {
+                return Err(format!(
+                    "{name}: one-hot column {c} at {bad:?} breaks nothing"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Rule c5: the multiplicity columns `mu` held to bits, and to one message a
@@ -1933,13 +2014,15 @@ fn check_bits(name: &str, mu: &BTreeSet<usize>, eval: Option<(Eval, usize)>) -> 
     Ok(())
 }
 
-/// Rule c2: a word-bus tuple's address is two elements, never packed.
+/// Rule c2: a word-bus tuple's address is two elements, never packed: its low
+/// element's columns at `1`, `8` or `2^16` (an address, a word index, a limb),
+/// or at `−1..−7` (a one-hot offset taken off a CPU word table's address).
 fn check_address(values: &[BusValue], what: &str) -> Result<(), String> {
     let lo = form(&values[0])?;
     let hi = form(&values[1])?;
     if lo
         .iter()
-        .any(|(k, c)| k.is_some() && ![1, 8, 1 << 16].contains(c))
+        .any(|(k, c)| k.is_some() && ![1, 8, 1 << 16].contains(c) && !(-7..=-1).contains(c))
     {
         return Err(format!(
             "{what}: a low word {lo:?} scales a column past 2^16"
@@ -2132,18 +2215,26 @@ fn census_table_with(
         if mu != multiplicity_form(&c.multiplicity) {
             return Err(format!("{name}: a pair at two multiplicities"));
         }
-        // The produced timestamp is a clock-bound receive's, and the pair
-        // fires exactly when one of them does.
+        // The produced timestamp is a clock-bound receive's (a word
+        // message's at its fourth value, the CPU's dispatch's at its first),
+        // and the pair fires exactly when one of them does.
         let ts = &p.values[2];
         let clocks: Vec<_> = clocked
             .iter()
-            .filter(|(_, bi)| bi.values.get(3) == Some(ts))
+            .filter(|(_, bi)| {
+                (bi.bus_id == u64::from(BusId::MemWordMsg) && bi.values.get(3) == Some(ts))
+                    || (bi.bus_id == u64::from(BusId::MemoryOp) && bi.values.first() == Some(ts))
+            })
             .collect();
         let mut fired = BTreeMap::new();
         for (i, bi) in &clocks {
             claimed.insert(*i);
             for (k, v) in multiplicity_form(&bi.multiplicity) {
                 *fired.entry(k).or_insert(0) += v;
+            }
+            if bi.bus_id == u64::from(BusId::MemoryOp) {
+                check_dispatch_key(name, bi, p, eval)?;
+                continue;
             }
             if bi.values.get(1..3) != Some(&p.values[..2]) {
                 return Err(format!("{name}: a key that is not its message's"));
@@ -2199,6 +2290,17 @@ fn census_table_with(
             });
             if !ranged {
                 return Err(format!("{name}: a step limb no IS_HALF holds"));
+            }
+        }
+        // c12: a word a pair reads or writes as bytes has every byte
+        // checked, at the pair's multiplicity.
+        for half in c.values[3..5].iter().chain(&p.values[3..5]) {
+            let f = form(half)?;
+            let bytes = f.len() == 4 && f.values().any(|&c| c == 1 << 8);
+            if bytes && !is_checked_half(half, interactions, &mu) {
+                return Err(format!(
+                    "{name}: a word's bytes {f:?} not each in a checked pair"
+                ));
             }
         }
         // c5: the multiplicities held to bits, one message a row.
@@ -2376,19 +2478,12 @@ fn zero_counts() -> crate::TableCounts {
     }
 }
 
-/// The block's AIR set under the word memory format, as the verifier will
-/// build it: the split set with no LOAD, STORE, MEMW or MEMW_A table, PAGE_W
-/// in place of PAGE, and `memw_w` MEMW_W tables.
-fn word_format_census(registers: crate::tables::register::RegisterFormat) -> Result<(), String> {
-    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
-    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
-    let opts = ProofOptions::default_test_options();
-    let counts = crate::TableCounts {
+/// Counts the word-format frames take: one table of every family that is
+/// not retired (LOAD, STORE, MEMW, MEMW_A at 0).
+fn words_counts() -> crate::TableCounts {
+    crate::TableCounts {
         cpu: 1,
         lt: 1,
-        memw: 0,
-        memw_aligned: 0,
-        load: 0,
         mul: 1,
         dvrm: 1,
         shift: 1,
@@ -2396,7 +2491,6 @@ fn word_format_census(registers: crate::tables::register::RegisterFormat) -> Res
         memw_register: 1,
         eq: 1,
         bytewise: 1,
-        store: 0,
         cpu32: 1,
         keccak: 1,
         keccak_rnd: 1,
@@ -2407,57 +2501,116 @@ fn word_format_census(registers: crate::tables::register::RegisterFormat) -> Res
         blake3: 1,
         is_wh: 1,
         ecrec: 1,
-    };
-    block_whir::word_tables_under(MemoryFormat::Words, &counts, [0, 0])
-        .map_err(|e| format!("{e:?}"))?;
-    let mut pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        ..zero_counts()
+    }
+}
+
+/// A block statement under `format` (its memory format the word one, or any
+/// other to show what that one refuses): `counts`, the fused pair `[0, 0]`,
+/// `words` word tables, one private-input page and the stack's zero page,
+/// every table at 2^2 rows but BITWISE (its 2^20) and PAGE_W (its 2^15), one
+/// group a table: what the verifier frames. The heights are read off the AIR
+/// set the verifier builds for the word format.
+pub(super) fn words_statement(
+    format: &block_whir::BlockFormat,
+    counts: &crate::TableCounts,
+    words: [u64; 7],
+) -> block_whir::OwnedBlockStatement {
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let opts = ProofOptions::default_test_options();
+    let runtime_page_ranges = vec![crate::RuntimePageRange {
+        base: STACK_BASE,
+        count: 1,
+    }];
+    let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
         &program,
-        &[],
+        &runtime_page_ranges,
         1,
         1 << 20,
     )
     .expect("pages");
-    pages.push(PageConfig::zero_init(STACK_BASE));
     let inputs =
-        crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("the AIR inputs");
-    let pinned = block_whir::BlockFormat::pinned();
-    let airs = crate::block_airs(
+        crate::BlockAirInputs::new(&opts, &program, vec![4; counts.cpu], &[]).expect("inputs");
+    let mut airs = crate::block_airs(
         &program,
         &opts,
         &pages,
-        &counts,
+        counts,
         &inputs,
-        pinned.keccak_rnd,
-        pinned.memw_aligned,
-        registers,
+        format.keccak_rnd,
+        format.memw_aligned,
+        format.registers,
     );
-    let words: Vec<crate::test_utils::VmAir> = pages
-        .iter()
-        .map(|config| crate::test_utils::create_page_w_air(&opts, config))
-        .chain(std::iter::once(Ok(Box::new(
-            crate::test_utils::create_memw_w_air(&opts).with_name("MEMW_W[0]"),
-        ) as crate::test_utils::VmAir)))
-        .collect::<Result<_, _>>()?;
-    let mut set: Vec<
-        &dyn stark::traits::AIR<
-            Field = GoldilocksField,
-            FieldExtension = GoldilocksExtension,
-            PublicInputs = (),
-        >,
-    > = airs
+    if format.memory == MemoryFormat::Words {
+        airs.with_word_memory(&opts, words.map(|n| n as usize), &pages)
+            .expect("the word tables");
+    }
+    let table_num_vars: Vec<u8> = airs
         .air_refs()
-        .into_iter()
-        .filter(|air| !air.name().starts_with("PAGE:"))
+        .iter()
+        .map(|air| {
+            if air.name() == "BITWISE" {
+                crate::tables::bitwise::NUM_VARS as u8
+            } else if air.name().starts_with(page_w::NAME_PREFIX) {
+                page_w::NUM_VARS as u8
+            } else if air.name().starts_with("PAGE:") {
+                crate::continuation::PAGE_NUM_VARS as u8
+            } else {
+                2
+            }
+        })
         .collect();
-    set.extend(words.iter().map(|air| air.as_ref()));
+    block_whir::OwnedBlockStatement {
+        groups: (0..table_num_vars.len() as u32).map(|t| vec![t]).collect(),
+        table_num_vars,
+        runtime_page_ranges,
+        table_counts: counts.clone(),
+        public_output: Vec::new(),
+        num_private_input_pages: 1,
+        fused_memory: [0, 0],
+        word_memory: words,
+    }
+}
+
+/// The verifier's frame of `statement` under `format`.
+pub(super) fn frame_of(
+    statement: &block_whir::OwnedBlockStatement,
+    format: &block_whir::BlockFormat,
+) -> Result<block_whir::BlockFrame, crate::Error> {
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    block_whir::block_frame(
+        statement.view(),
+        &elf,
+        &ProofOptions::default_test_options(),
+        format,
+    )
+}
+
+/// The block's AIR set under the word memory format, as the verifier builds it
+/// (`block_frame` of a word-format statement with one table of every family),
+/// under the census: no byte PAGE table, no cross-epoch table, no RAM token on
+/// the byte bus; the word bus PAGE_W's, MEMW_W's and the CPU word tables'
+/// alone; MEMW_W alone receiving word messages; every table's rules (c2–c12).
+fn word_format_census(registers: crate::tables::register::RegisterFormat) -> Result<(), String> {
+    let format = block_whir::BlockFormat {
+        registers,
+        ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
+    };
+    let statement = words_statement(&format, &words_counts(), [1; 7]);
+    let frame = frame_of(&statement, &format).map_err(|e| format!("the frame: {e:?}"))?;
+    let set = frame.airs.air_refs();
     let mut on_words = BTreeSet::new();
     let mut message_receivers = BTreeSet::new();
     for air in &set {
         let name = air.name();
         let interactions = air.bus_interactions();
-        // c8: no cross-epoch table.
+        // c8: no cross-epoch table; no byte page.
         if name.starts_with("LOCAL_TO_GLOBAL") || name.starts_with("GLOBAL_MEMORY") {
             return Err(format!("{name}: a cross-epoch table under the word format"));
+        }
+        if name.starts_with("PAGE:") {
+            return Err(format!("{name}: a byte page under the word format"));
         }
         // c7: no RAM token on the byte bus.
         let one = BTreeMap::from([(None, 1i128)]);
@@ -2479,9 +2632,14 @@ fn word_format_census(registers: crate::tables::register::RegisterFormat) -> Res
         }
         census_table(name, interactions, air.num_precomputed_columns())?;
     }
-    // c1 and c6: the word bus is PAGE_W's and MEMW_W's alone, and MEMW_W
-    // alone receives word messages.
-    if on_words != BTreeSet::from(["PAGE_W".to_string(), "MEMW_W".to_string()]) {
+    // c1 and c6: the word bus is PAGE_W's, MEMW_W's and the CPU word tables'
+    // alone, and MEMW_W alone receives word messages.
+    let mut allowed: BTreeSet<String> = block_whir::WORD_TABLES
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+    allowed.insert("PAGE_W".to_string());
+    if on_words != allowed {
         return Err(format!("the word bus is touched by {on_words:?}"));
     }
     if message_receivers != BTreeSet::from(["MEMW_W".to_string()]) {
@@ -2569,6 +2727,238 @@ fn chip_with(kind: MessageKind, edit: impl Fn(&mut BusInteraction)) -> Vec<BusIn
 /// (after the chip's), not its call's: a control mutant.
 fn chip_with_free_message_ts(kind: MessageKind) -> Vec<BusInteraction> {
     chip_with(kind, |bi| bi.values[3] = column(chip::NUM_COLUMNS))
+}
+
+/// ★ The verifier's frame under the word memory format holds each of its
+/// rules, each by its own refusal: the honest statement frames, with PAGE_W
+/// in every page's place and the word tables after STORE's (where the fused
+/// tables sit) and before CPU32's; a statement stating any table the format
+/// retires is refused by name (LOAD, STORE, MEMW, MEMW_A, MEM_LOAD,
+/// MEM_STORE); a PAGE_W table stated at `2^16` rows is refused, and so is a
+/// word table past the block's chunk. Each refusal is the rule's own, so a
+/// frame that skipped the rule fails here.
+#[test]
+fn the_word_format_frame_holds_its_rules() {
+    let format = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
+    let counts = words_counts();
+    let honest = words_statement(&format, &counts, [1; 7]);
+    let frame = frame_of(&honest, &format).expect("the honest statement frames");
+    let names: Vec<String> = frame
+        .airs
+        .air_refs()
+        .iter()
+        .map(|air| air.name().to_string())
+        .collect();
+    assert!(names.iter().all(|n| !n.starts_with("PAGE:")), "{names:?}");
+    assert_eq!(
+        names
+            .iter()
+            .filter(|n| n.starts_with(page_w::NAME_PREFIX))
+            .count(),
+        frame.page_configs.len()
+    );
+    let first_word = names
+        .iter()
+        .position(|n| n == "MEM_LOAD8[0]")
+        .expect("the word tables");
+    let words: Vec<&str> = names[first_word..first_word + 7]
+        .iter()
+        .map(|n| n.split('[').next().unwrap_or(""))
+        .collect();
+    assert_eq!(words, block_whir::WORD_TABLES, "in their order");
+    assert!(names[first_word + 7].starts_with("CPU32["), "{names:?}");
+    assert!(
+        names[first_word - 1].starts_with("BYTEWISE["),
+        "after STORE's place: {names:?}"
+    );
+
+    // Each retired table, stated: refused by name.
+    for (table, mut retired, fused) in [
+        ("LOAD", counts.clone(), [0, 0]),
+        ("STORE", counts.clone(), [0, 0]),
+        ("MEMW", counts.clone(), [0, 0]),
+        ("MEMW_A", counts.clone(), [0, 0]),
+        ("MEM_LOAD", counts.clone(), [1, 0]),
+        ("MEM_STORE", counts.clone(), [0, 1]),
+    ] {
+        match table {
+            "LOAD" => retired.load = 1,
+            "STORE" => retired.store = 1,
+            "MEMW" => retired.memw = 1,
+            "MEMW_A" => retired.memw_aligned = 1,
+            _ => {}
+        }
+        let mut statement = words_statement(&format, &retired, [1; 7]);
+        statement.fused_memory = fused;
+        let refused = frame_of(&statement, &format);
+        // The fused pair is refused first by the fused tables' own rule
+        // under the word format, then by the retired tables' rule.
+        let why = if fused == [0, 0] {
+            format!("no {table} table")
+        } else {
+            "states no fused table".to_string()
+        };
+        assert!(
+            matches!(&refused, Err(crate::Error::InvalidTableCounts(w)) if w.contains(&why)),
+            "{table}: {:?}",
+            refused.err()
+        );
+    }
+    // A PAGE_W table at 2^16 rows, and a word table past the chunk.
+    let page = names
+        .iter()
+        .position(|n| n.starts_with(page_w::NAME_PREFIX))
+        .expect("a PAGE_W table");
+    let mut tall = honest.clone();
+    tall.table_num_vars[page] = page_w::NUM_VARS as u8 + 1;
+    let refused = frame_of(&tall, &format);
+    assert!(
+        matches!(&refused, Err(crate::Error::InvalidTableCounts(why)) if why.contains("a PAGE_W table is 2^15")),
+        "{:?}",
+        refused.err()
+    );
+    for k in 0..7 {
+        let mut tall = honest.clone();
+        tall.table_num_vars[first_word + k] = block_whir::BLOCK_WORD_MAX_VARS as u8 + 1;
+        let refused = frame_of(&tall, &format);
+        assert!(
+            matches!(&refused, Err(crate::Error::InvalidTableCounts(why)) if why.contains("a block takes at most 2^21")),
+            "{}: {:?}",
+            block_whir::WORD_TABLES[k],
+            refused.err()
+        );
+    }
+    // A count the heights do not carry.
+    let mut short = honest.clone();
+    short.word_memory[0] = 2;
+    assert!(
+        frame_of(&short, &format).is_err(),
+        "one more MEM_LOAD8 than stated heights"
+    );
+}
+
+/// ★ Under the split and fused formats the word tables' counts are absorbed
+/// nowhere, so any count but zero is refused: a statement that frames, its
+/// counts then set to `1` in one family or `2^32 − 1`, is refused under each;
+/// with the refusal taken out (a control mutant) each frames, the counts read
+/// as none, so the field would otherwise be free.
+#[test]
+fn a_split_or_fused_statement_stating_word_tables_is_refused() {
+    for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
+        let format = block_whir::BlockFormat::pinned().with_memory(memory);
+        let honest = words_statement(&format, &words_counts(), [0; 7]);
+        assert!(
+            frame_of(&honest, &format).is_ok(),
+            "{memory:?}: the honest statement"
+        );
+        for stated in [
+            [1, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, u64::from(u32::MAX)],
+        ] {
+            let mut forged = honest.clone();
+            forged.word_memory = stated;
+            let refused = frame_of(&forged, &format);
+            assert!(
+                matches!(&refused, Err(crate::Error::InvalidTableCounts(why)) if why.contains("states no word table")),
+                "{memory:?} {stated:?}: {:?}",
+                refused.err()
+            );
+            block_whir::WORD_COUNTS_UNCHECKED.with(|c| c.set(true));
+            let control = frame_of(&forged, &format);
+            block_whir::WORD_COUNTS_UNCHECKED.with(|c| c.set(false));
+            assert!(
+                control.is_ok(),
+                "{memory:?} {stated:?}: without the refusal it frames"
+            );
+        }
+    }
+}
+
+/// The CPU's memory dispatch (`cpu.rs`' MEMORY send) carries the address as
+/// `res`'s two words, and every row sends `IS_HALF` on each of `res`'s four
+/// halves at multiplicity one: the address is an integer below `2^64` by
+/// halves, its low word below `2^32`.
+fn check_cpu_address_halves(interactions: &[BusInteraction]) -> Result<(), String> {
+    use crate::tables::cpu::cols;
+    let dispatch: Vec<&BusInteraction> = interactions
+        .iter()
+        .filter(|bi| bi.bus_id == u64::from(BusId::MemoryOp))
+        .collect();
+    let [dispatch] = dispatch.as_slice() else {
+        return Err(format!("{} memory dispatches", dispatch.len()));
+    };
+    if !dispatch.is_sender
+        || dispatch.values.get(2)
+            != Some(&BusValue::Packed {
+                start_column: cols::RES_0,
+                packing: Packing::DWordHL,
+            })
+    {
+        return Err("the dispatch's address is not res's two words".to_string());
+    }
+    for res in cols::RES {
+        let held = interactions.iter().any(|bi| {
+            bi.is_sender
+                && bi.bus_id == u64::from(BusId::IsHalfword)
+                && bi.multiplicity == Multiplicity::One
+                && bi.values == vec![column(res)]
+        });
+        if !held {
+            return Err(format!("res column {res} has no IS_HALF at one"));
+        }
+    }
+    Ok(())
+}
+
+/// ★ The CPU range-checks the address it dispatches, under both register
+/// formats: `IS_HALF` at one on each half of `res`, the dispatch's address
+/// `res`'s two words. The word tables take that address's low word as an
+/// integer below `2^32` (their one-hot is forced to the address's offset by
+/// PAGE_W's keys, which hold the address to a key range of their own as well).
+/// Pinned on the AIRs the verifier builds; each of the four checks taken out
+/// (a mutant) fails the pin.
+#[test]
+fn the_cpu_dispatches_a_range_checked_address() {
+    use crate::tables::cpu;
+    for interactions in [cpu::bus_interactions(0), cpu::bus_interactions_inrow(0)] {
+        check_cpu_address_halves(&interactions).expect("the CPU's address halves");
+        for res in cpu::cols::RES {
+            let mutant: Vec<BusInteraction> = interactions
+                .iter()
+                .filter(|bi| {
+                    !(bi.bus_id == u64::from(BusId::IsHalfword) && bi.values == vec![column(res)])
+                })
+                .cloned()
+                .collect();
+            assert!(
+                check_cpu_address_halves(&mutant).is_err(),
+                "res {res} unchecked"
+            );
+        }
+    }
+    // The CPU tables of a word-format frame are those.
+    for registers in [
+        crate::tables::register::RegisterFormat::InRow,
+        crate::tables::register::RegisterFormat::Tokens32,
+    ] {
+        let format = block_whir::BlockFormat {
+            registers,
+            ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
+        };
+        let frame = frame_of(&words_statement(&format, &words_counts(), [1; 7]), &format)
+            .expect("the frame");
+        let cpus: Vec<_> = frame
+            .airs
+            .air_refs()
+            .into_iter()
+            .filter(|air| air.name().starts_with("CPU["))
+            .collect();
+        assert!(!cpus.is_empty());
+        for air in cpus {
+            check_cpu_address_halves(air.bus_interactions())
+                .unwrap_or_else(|e| panic!("{registers:?} {}: {e}", air.name()));
+        }
+    }
 }
 
 /// ★ The census refuses each mutant it exists for, and passes the honest
@@ -2702,6 +3092,109 @@ fn the_census_refuses_each_mutant() {
             "{kind:?}: an unconstrained multiplicity"
         );
     }
+    // The CPU's word tables: honest, then a key off the dispatch (the offset
+    // added, the second word 16 on, the high word another column), a dispatch
+    // whose timestamp high word is a column, a byte left out of its pair, a
+    // one-hot column no constraint holds to a bit.
+    use super::{mem_load2w, mem_load8, mem_loadw};
+    for (name, table) in [
+        ("MEM_LOAD8[0]", mem_load8::bus_interactions()),
+        ("MEM_LOADW[0]", mem_loadw::bus_interactions()),
+        ("MEM_LOAD2W[0]", mem_load2w::bus_interactions()),
+    ] {
+        assert!(census_table(name, &table, 0).is_ok(), "{name}");
+    }
+    let flip_offset = |interactions: Vec<BusInteraction>| -> Vec<BusInteraction> {
+        interactions
+            .into_iter()
+            .map(|mut bi| {
+                if bi.bus_id == u64::from(BusId::MemWord)
+                    && let BusValue::Linear(terms) = &mut bi.values[0]
+                {
+                    for t in terms.iter_mut() {
+                        if let LinearTerm::Column { coefficient, .. } = t
+                            && *coefficient < 0
+                        {
+                            *coefficient = -*coefficient;
+                        }
+                    }
+                }
+                bi
+            })
+            .collect()
+    };
+    assert!(
+        census_table(
+            "MEM_LOADW[0]",
+            &flip_offset(mem_loadw::bus_interactions()),
+            0
+        )
+        .is_err(),
+        "the offset added"
+    );
+    let mut sixteen = mem_load2w::bus_interactions();
+    for bi in &mut sixteen[4..8] {
+        if bi.bus_id == u64::from(BusId::MemWord)
+            && let BusValue::Linear(terms) = &mut bi.values[0]
+        {
+            for t in terms.iter_mut() {
+                if let LinearTerm::Constant(c) = t {
+                    *c = 16;
+                }
+            }
+        }
+    }
+    assert!(
+        census_table("MEM_LOAD2W[0]", &sixteen, 0).is_err(),
+        "the second word 16 on"
+    );
+    let mut high = mem_load8::bus_interactions();
+    for bi in &mut high {
+        if bi.bus_id == u64::from(BusId::MemWord) {
+            bi.values[1] = column(super::mem_load8::cols::LO);
+        }
+    }
+    assert!(
+        census_table("MEM_LOAD8[0]", &high, 0).is_err(),
+        "a high word not the dispatch's"
+    );
+    let mut ts_hi = mem_load8::bus_interactions();
+    let dispatch = ts_hi.len() - 1;
+    ts_hi[dispatch].values[1] = column(super::mem_load8::cols::HI);
+    assert!(
+        census_table("MEM_LOAD8[0]", &ts_hi, 0).is_err(),
+        "a timestamp high word"
+    );
+    let unpaired: Vec<BusInteraction> = mem_loadw::bus_interactions()
+        .into_iter()
+        .filter(|bi| {
+            !(bi.bus_id == u64::from(BusId::AreBytes)
+                && bi.values[0] == column(super::mem_loadw::cols::BYTES[2]))
+        })
+        .collect();
+    assert!(
+        census_table("MEM_LOADW[0]", &unpaired, 0).is_err(),
+        "a byte unpaired"
+    );
+    fn loadw_without_off3_bit(row: &[FE]) -> Vec<FE> {
+        let mut v = loadw_constraints(row);
+        v[3] = FE::zero();
+        // The sum `Σ OFF = MU` alone would still catch `OFF_3 = 2`: take it out
+        // too, so only the bits hold the one-hot.
+        v[8] = FE::zero();
+        v
+    }
+    assert!(
+        census_table_with(
+            "MEM_LOADW[0]",
+            &mem_loadw::bus_interactions(),
+            0,
+            Some((loadw_without_off3_bit, super::mem_loadw::cols::NUM_COLUMNS))
+        )
+        .is_err(),
+        "a one-hot column no constraint holds"
+    );
+
     // A writer whose written words are not range-checked.
     let unchecked: Vec<_> = chip_interactions(MessageKind::Write)
         .into_iter()
@@ -2723,33 +3216,49 @@ fn the_census_refuses_each_mutant() {
 
 // ---- the format ----
 
-/// ★ The word memory format is refused on every block path until it is built:
-/// the format check every prove and verify runs, the fused tables' check every
-/// lay-out runs, and the windowed build's setters.
+/// ★ The word memory format is the verifier's to read and no prover's to
+/// make until its walk is built: the format check takes it (the verifier frames
+/// a statement under it), the prove's entry and the windowed build's setters
+/// refuse it. Under it the fused pair is `[0, 0]`; its statement words are its
+/// form word and each word family's count.
 #[test]
-fn the_word_format_is_refused_on_every_block_path() {
+fn the_word_format_is_refused_on_every_prover_path() {
     let words = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
-    assert!(block_whir::check_memory_format(&words).is_err());
+    assert!(block_whir::check_memory_format(&words).is_ok());
     assert!(crate::tables::fused_memory::refuse_unbuilt(MemoryFormat::Words).is_err());
-    for stated in [[0, 0], [1, 0], [0, 1]] {
+    assert_eq!(
+        block_whir::fused_tables_under(MemoryFormat::Words, [0, 0]).ok(),
+        Some([0, 0])
+    );
+    for stated in [[1, 0], [0, 1]] {
         assert!(block_whir::fused_tables_under(MemoryFormat::Words, stated).is_err());
     }
     for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
         assert!(crate::tables::fused_memory::refuse_unbuilt(memory).is_ok());
     }
+    // The prove refuses it at its entry.
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let refused = block_whir::prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &words,
+        &crate::tests::block_whir_tests::streamed(crate::tables::MaxRowsConfig::small(), 3, 9),
+        &block_whir::Deviations::default(),
+    );
+    assert!(refused.is_err(), "the prover refuses the word format");
     // The windowed build and its regenerator refuse it at their setters.
     use crate::tables::trace_builder::{RegenBuilder, WindowedTraceBuilder};
-    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
     let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
     let max_rows = crate::tables::MaxRowsConfig::small();
     let builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("a builder");
     assert!(builder.memory_format(MemoryFormat::Words).is_err());
     let regen = RegenBuilder::new(&program, &[], &max_rows).expect("a regenerator");
     assert!(regen.memory_format(MemoryFormat::Words).is_err());
-    // Its statement word is its own.
+    // Its statement words: its form word, then each family's count.
     assert_eq!(
-        block_whir::fused_statement_words(MemoryFormat::Words, [0, 0]),
-        vec![block_whir::WORD_MEMORY_WORD]
+        block_whir::fused_statement_words(MemoryFormat::Words, [0, 0], [1, 2, 3, 4, 5, 6, 7]),
+        vec![block_whir::WORD_MEMORY_WORD, 1, 2, 3, 4, 5, 6, 7]
     );
     assert_ne!(block_whir::WORD_MEMORY_WORD, block_whir::FUSED_MEMORY_WORD);
 }
