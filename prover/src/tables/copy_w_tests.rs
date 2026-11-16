@@ -2435,3 +2435,274 @@ pub(super) fn census_rows() -> Vec<Vec<FE>> {
     across(&mut run);
     distinct_rows(&run)
 }
+
+// ---- the carries' constraints ----
+
+/// MEMW_W's row of the access at `(key, ts)` moved to the key `(lo, hi)`
+/// (field values), and `key`'s page row left untouched (its final the
+/// initial word at timestamp 0): the forger's access at a carried key.
+fn move_access(bench: &mut Bench, run: &Run, key: u64, ts: u64, (lo, hi): (FE, FE)) {
+    let t = &bench.piece("MEMW_W").trace;
+    let access = (0..t.num_rows())
+        .find(|&m| {
+            *t.get_main(m, mw::ADDRESS_LO) == FE::from(key & 0xFFFF_FFFF)
+                && *t.get_main(m, mw::ADDRESS_HI) == FE::from(key >> 32)
+                && *t.get_main(m, mw::TIMESTAMP) == FE::from(ts)
+        })
+        .expect("the access");
+    bench.set("MEMW_W", access, mw::ADDRESS_LO, lo);
+    bench.set("MEMW_W", access, mw::ADDRESS_HI, hi);
+    let page = run.memory.page_of(key).expect("a page").page_base;
+    let p = ((key - page) / WORD_BYTES) as usize;
+    bench.set(&page_name(page), p, pw::TIMESTAMP, FE::zero());
+}
+
+/// ★ A source carry off the last word names no word: a 16-byte copy far from
+/// `2^32` whose first row claims `SRC_CARRY`, `B`'s read and the next row's
+/// source key following it to `(lo + 8 − 2^32, hi + 1)`. Refused by the tie
+/// (constraint 60), on the word bus (no page holds that key) and by the next
+/// row's limb check; with the tie out, by the other two; with the source
+/// limbs' lookups also out and the key minted (the page above the line at
+/// `OFFSET = (lo + 8)/8 − 2^29`), accepted. The tie is one of three checks a
+/// carry off the line meets; it is the one in the row.
+#[test]
+fn a_source_carry_off_the_last_word_names_no_word() {
+    let mut run = Run::with_pages(line_pages());
+    let r = run.copy(ELF, LOW + 0x400, 16);
+    assert_eq!(r.len(), 2);
+    let (row, next) = (r.start, r.start + 1);
+    let held = run.rows[row];
+    assert!(held.first() && !held.end() && held.reads_b());
+    assert!(run.rows[next].end() && !run.rows[next].reads_b());
+    assert_eq!(held.carries(), [false, false, false]);
+    let b_key = held.b_key();
+    let forged_lo = FE::from(b_key & 0xFFFF_FFFF) - FE::from(1u64 << 32);
+    let forged_hi = FE::from((b_key >> 32) + 1);
+    let mut forged = run.bench();
+    forged.set(copy_w::NAME, row, cw::SRC_CARRY, FE::one());
+    move_access(
+        &mut forged,
+        &run,
+        b_key,
+        held.read_timestamp(),
+        (forged_lo, forged_hi),
+    );
+    forged.set(copy_w::NAME, next, cw::SRC_KEY_LO[0], forged_lo);
+    forged.set(copy_w::NAME, next, cw::SRC_KEY_LO[1], FE::zero());
+    forged.set(copy_w::NAME, next, cw::SRC_KEY_HI, forged_hi);
+    let limb = vec![(
+        u64::from(BusId::IsHalfword),
+        vec![forged_lo.canonical_u64()],
+    )];
+    let v = verdict(&forged);
+    assert_eq!(v.broken, vec![(copy_w::NAME.to_string(), row, 60)], "{v:?}");
+    assert!(
+        v.left.keys().all(|&b| b == u64::from(BusId::MemWord))
+            && !v.left_on(BusId::MemWord).is_empty()
+            && v.unanswered == limb
+            && v.preprocessed.is_empty(),
+        "{v:?}"
+    );
+    let untied = with_constraints(forged, copy_w_without::<60>);
+    let v = verdict(&untied);
+    assert!(
+        v.broken.is_empty()
+            && v.left.keys().all(|&b| b == u64::from(BusId::MemWord))
+            && !v.left_on(BusId::MemWord).is_empty()
+            && v.unanswered == limb,
+        "without the tie: {v:?}"
+    );
+    let mut control = untied.with_interactions(copy_w::NAME, without_halfwords(&cw::SRC_KEY_LO));
+    let offset = FE::from((b_key & 0xFFFF_FFFF) / WORD_BYTES) - FE::from(1u64 << 29);
+    mint_at(
+        &mut control,
+        LINE,
+        100,
+        offset,
+        held.b(),
+        held.read_timestamp(),
+    );
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ An operand carry claimed below the line: a 4-byte copy from `2^32 − 5`
+/// (its first source word, the last below the line, read) claiming
+/// `OP_CARRY`. Its bit and its tie hold (the key is the last word), so x11's
+/// read names `(2^32 − 5 − 2^32, 1)` against the register's `(2^32 − 5, 0)`:
+/// refused on the register bus alone. Control: x11's read out of COPY_W and
+/// the register file's answer to it left out, accepted (the source then any
+/// word the forger names).
+#[test]
+fn an_operand_carry_claimed_below_the_line_is_refused_by_the_register_read() {
+    let mut run = Run::with_pages(line_pages());
+    let r = run.copy(LINE - 8 + 3, LOW + 0x400, 4);
+    let row = r.start;
+    let held = run.rows[row];
+    assert!(held.first() && held.end() && held.reads_a() && !held.reads_b());
+    assert_eq!(held.carries(), [true, false, false]);
+    let mut forged = run.bench();
+    forged.set(copy_w::NAME, row, cw::OP_CARRY, FE::one());
+    let v = verdict(&forged);
+    assert!(v.refused_only_on(BusId::Memw), "{v:?}");
+    let x11 = |bi: &BusInteraction| {
+        bi.bus_id == u64::from(BusId::Memw) && bi.values.get(9) == Some(&BusValue::constant(22))
+    };
+    let without: Vec<BusInteraction> = copy_w::bus_interactions()
+        .into_iter()
+        .filter(|bi| !x11(bi))
+        .collect();
+    assert_eq!(without.len() + 1, copy_w::bus_interactions().len());
+    let mut control = forged.with_interactions(copy_w::NAME, without);
+    let regs_row = run
+        .regs
+        .iter()
+        .position(|a| a.reg == 11 && a.old == LINE - 5)
+        .expect("x11's access");
+    control.set("REGS", regs_row, regs::MU, FE::zero());
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ A carry that is not a bit: the one-row copy from `2^32 − 2` (`B` the
+/// word at `2^32`, its key `(0, 1)` by `SRC_CARRY = 1`) with `SRC_CARRY = 2`,
+/// so `B`'s key is `(2^32 − 8 + 8 − 2^33, 2) = (−2^32, 2)`; its tie holds (the
+/// key is the last word). Refused by the bit (constraint 59) and on the word
+/// bus; with that key minted (a page at high word 2, `OFFSET = −2^29`), by the
+/// bit alone; with the bit also out, accepted: a source word read 8 GiB from
+/// where the call names it.
+#[test]
+fn a_carry_of_two_is_refused_by_its_bit() {
+    let mut pages = line_pages();
+    let high = 2u64 << 32;
+    let data: Vec<u8> = (0..4096u32).map(|i| (i * 29 + 17) as u8).collect();
+    pages.push(PageConfig::with_private_input(high, data));
+    let mut run = Run::with_pages(pages);
+    let r = run.copy(LINE - 2, LOW + 0x404, 4);
+    let row = r.start;
+    let held = run.rows[row];
+    assert!(held.first() && held.end() && held.reads_b() && held.b_key() == LINE);
+    assert_eq!(held.carries(), [true, false, false]);
+    let carried = (FE::zero() - FE::from(1u64 << 32), FE::from(2u64));
+    let mut forged = run.bench();
+    forged.set(copy_w::NAME, row, cw::SRC_CARRY, FE::from(2u64));
+    move_access(&mut forged, &run, LINE, held.read_timestamp(), carried);
+    let v = verdict(&forged);
+    assert_eq!(v.broken, vec![(copy_w::NAME.to_string(), row, 59)], "{v:?}");
+    assert!(
+        v.left.keys().all(|&b| b == u64::from(BusId::MemWord)) && v.unanswered.is_empty(),
+        "{v:?}"
+    );
+    let mut minted = forged;
+    let offset = FE::zero() - FE::from(1u64 << 29);
+    mint_at(
+        &mut minted,
+        high,
+        100,
+        offset,
+        held.b(),
+        held.read_timestamp(),
+    );
+    refused_by_constraint(&minted, 59, &[row]).unwrap_or_else(|v| panic!("minted: {v}"));
+    let v = verdict(&with_constraints(minted, copy_w_without::<59>));
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// COPY_W's constraints with the memset gap rule's high word read without
+/// the source's carry (`IS_SET·(DST_KEY_HI − SRC_KEY_HI)`): a control mutant.
+fn copy_w_gap_without_its_carry(row: &[FE]) -> Vec<FE> {
+    let mut v = copy_w_constraints(row);
+    v[58] = row[cw::IS_SET] * (row[cw::DST_KEY_HI] - row[cw::SRC_KEY_HI]);
+    v
+}
+
+/// ★ A memset's gap takes the source's carry: a one-row memset whose source
+/// word is the last below the line (`src = 2^32 − 5`, `SRC_CARRY = 1`) and
+/// whose destination is `src + 8 − 2^32`, on the low page (the executor
+/// refuses the gap; the forger skips it). Its low words keep the gap (57
+/// holds through the carry); its high words do not: refused by constraint 58
+/// alone. Control: 58 without the carry, accepted: a memset that writes 4 GiB
+/// below `src + 8`.
+#[test]
+fn a_memset_four_gib_below_its_gap_is_refused_by_the_gap_rule_s_carry() {
+    let mut run = Run::with_pages(line_pages());
+    let (src, n) = (LINE - 8 + 3, 4u64);
+    let dst = src + 8 - LINE;
+    let ts = run.next_ts();
+    run.guest_call(Functionality::Set, src, dst, n, ts);
+    let mut rows = copy_w::call_rows(Functionality::Set, ts, src, src + 8, n).expect("rows");
+    assert_eq!(rows.len(), 1);
+    rows[0].dst_key -= LINE;
+    assert_eq!(rows[0].dst_key, dst - 3);
+    assert_eq!(rows[0].carries(), [true, false, false]);
+    assert!(rows[0].reads_a() && !rows[0].reads_b());
+    let a = run.memory.word(rows[0].a_key()).expect("held").0;
+    let old = run.memory.word(rows[0].dst_key()).expect("held").0;
+    rows[0].set_words(a, 0, old);
+    assert_ne!(
+        rows[0].new_word(),
+        old,
+        "the memset changes the low page's word"
+    );
+    run.rows = rows;
+    let bench = run.bench();
+    refused_by_constraint(&bench, 58, &[0]).unwrap_or_else(|v| panic!("{v}"));
+    let v = verdict(&with_constraints(bench, copy_w_gap_without_its_carry));
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ The commit path's destination carry: a commit of 15 bytes from index
+/// `2^32 − 16` (the walk refuses a commit whose index key passes the last
+/// word; the forger skips it) whose first row, at index key `2^32 − 8`,
+/// clears its `DST_CARRY` and hands the second row `2^32`, held as limbs
+/// `(0, 2^16)`. Its pairs are then the output's own (indices `2^32 − 8 + j`):
+/// refused by that limb's `IS_HALF` alone; with the destination limbs'
+/// lookups out, accepted, and what it commits is the call's. So on this path
+/// the limbs' lookups make such a commit unprovable (a completeness limit, as
+/// the walk's); nothing wrong is accepted without them. A real block needs an
+/// output of about 4 GiB to reach this key, which x254's final value against
+/// the output's length and the executor's one-mebibyte cap rule out.
+#[test]
+fn a_commit_whose_index_key_passes_the_last_word_is_refused_by_its_limb_check() {
+    let mut run = Run::with_pages(line_pages());
+    let (src, n) = (ELF + 0x40, 15u64);
+    let index = LINE - 16;
+    let ts = run.next_ts();
+    run.guest_call(Functionality::Write, src, index, n, ts);
+    assert!(copy_w::call_rows(Functionality::Write, ts, src, index, n).is_err());
+    let mut rows = copy_w::call_rows(Functionality::Write, ts, src, 0x100, n).expect("rows");
+    assert_eq!(rows.len(), 2);
+    for r in &mut rows {
+        r.dst_key += index - 0x100;
+    }
+    assert_eq!(rows[0].dst_key(), LINE - 8);
+    let a0 = run.memory.word(src).expect("held").0;
+    let a1 = run.memory.word(src + 8).expect("held").0;
+    rows[0].set_words(a0, a1, 0);
+    rows[1].set_words(a1, 0, 0);
+    run.rows = rows;
+    let mut forged = run.bench();
+    // The second row's index key 2^32 as limbs (0, 2^16) in high word 0, and
+    // the first row's carry cleared: the chain hands it (2^32, 0).
+    forged.set(copy_w::NAME, 0, cw::DST_CARRY, FE::zero());
+    forged.set(copy_w::NAME, 1, cw::DST_KEY_LO[0], FE::zero());
+    forged.set(copy_w::NAME, 1, cw::DST_KEY_LO[1], FE::from(1u64 << 16));
+    forged.set(copy_w::NAME, 1, cw::DST_KEY_HI, FE::zero());
+    let v = verdict(&forged);
+    assert!(
+        v.left.is_empty()
+            && v.broken.is_empty()
+            && v.preprocessed.is_empty()
+            && v.unanswered == vec![(u64::from(BusId::IsHalfword), vec![1 << 16])],
+        "{v:?}"
+    );
+    let v = verdict(&forged.with_interactions(copy_w::NAME, without_halfwords(&cw::DST_KEY_LO)));
+    assert!(v.accepted(), "control: {v:?}");
+    let committed: Vec<(u64, u8)> = run.commits.clone();
+    assert_eq!(committed.len(), n as usize);
+    assert!(
+        committed
+            .iter()
+            .all(|&(i, _)| (index..index + n).contains(&i))
+    );
+}
