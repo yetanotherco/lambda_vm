@@ -1069,10 +1069,23 @@ fn test_opts() -> ProofOptions {
     ProofOptions::default_test_options()
 }
 
+/// The box-tier blocks' options: the small chunks, streamed, KECCAK_RND cut at
+/// the block's own height ([`crate::block_whir::BLOCK_KECCAK_RND_ROWS_LOG2`]).
+/// Cut at 2^3 rows, a keccak256 run's rounds are some eighty tables, which the
+/// production stack puts in one group whose leaf rows no leaf holds
+/// ([`a_groups_heavy_tables_are_bounded_by_one_leaf`]).
+fn word_block_options() -> crate::block_whir::BlockOptions {
+    crate::tests::block_whir_tests::streamed(
+        MaxRowsConfig::small(),
+        crate::block_whir::BLOCK_KECCAK_RND_ROWS_LOG2,
+        9,
+    )
+}
+
 /// `elf` given `private` input, proved as a streamed block under `format`
 /// and verified by the host.
 fn prove_words(elf: &[u8], private: &[u8], format: &BlockFormat) -> BlockWhirProof {
-    let options = crate::tests::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
+    let options = word_block_options();
     let (proof, _) = crate::block_whir::prove_block_whir_with(
         elf,
         private,
@@ -1261,7 +1274,7 @@ fn prove_forged(
     format: &BlockFormat,
 ) -> BlockWhirProof {
     let program = executor::elf::Elf::load(elf).expect("the ELF loads");
-    let options = crate::tests::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
+    let options = word_block_options();
     let mut stamps = crate::block_whir::BlockStamps::default();
     crate::block_whir::prove_traces(
         &program,
@@ -1779,5 +1792,97 @@ fn every_word_rule_of_the_frame_refuses_the_tree_verifiers_file() {
     match verifier_plan_under(&moved, MemoryFormat::Words) {
         Err(e) => println!("MOVED WORD COUNT: refused: {e}"),
         Ok(plan) => assert_ne!(*plan.id(), honest_id, "a moved count is another block"),
+    }
+}
+
+/// ★ A group's leaf room bounds the heavy tables it holds, under any memory
+/// format: a KECCAK_RND table's leg costs a leaf about 47 thousand ext-ALU
+/// rows whatever its height (its constraint graph), so a block whose round
+/// chip is cut into tables of 2^3 rows puts some eighty of them in one group
+/// under the production stack, and the planner refuses it by naming the
+/// chip; forty still derive; the same rounds in one table of 2^16 rows (the
+/// block's own cut) cost one table's rows. A completeness bound, never a
+/// check a proof can pass: such a block is refused before any program is
+/// emitted. Under the word and the split format alike.
+#[test]
+fn a_groups_heavy_tables_are_bounded_by_one_leaf() {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    for memory in [MemoryFormat::Words, MemoryFormat::Split] {
+        let format = BlockFormat {
+            memory,
+            ..words_format()
+        };
+        let opts = super::super::proof::block_base_options_under(&format.zf);
+        let derive = |rows: usize, n: usize| {
+            let keccak: &[(usize, usize)] = &[(1 << 8, 1)];
+            let rnd: &[(usize, usize)] = &[(rows, n)];
+            let (base, family) = if memory == MemoryFormat::Words {
+                (SMALL_WORDS, crate::tables::keccak_w::NAME)
+            } else {
+                (SMALL_SPLIT, "KECCAK")
+            };
+            let mut mix: Vec<(&str, &[(usize, usize)])> = base.to_vec();
+            mix.push((family, keccak));
+            mix.push(("KECCAK_RND", rnd));
+            let owned = mix_statement(elf, &opts, &format, &mix, 2, 0);
+            WhirBlockPlan::derive(elf, &opts, &format, owned.view(), None)
+        };
+        let xalu = |plan: &WhirBlockPlan| plan.chip_loads().0.iter().map(|l| l.xalu).max();
+        let one = derive(8, 1).expect("one table");
+        let ten = derive(8, 10).expect("ten tables");
+        let per_table = (xalu(&ten).expect("a group") - xalu(&one).expect("a group")) / 9;
+        assert!(
+            (40_000..60_000).contains(&per_table),
+            "{memory:?}: {per_table} ext-ALU rows a KECCAK_RND table"
+        );
+        assert_eq!(ten.num_groups(), 1, "{memory:?}: one group");
+        derive(8, 40).expect("forty tables fit a leaf");
+        let refused = derive(8, 80).err().expect("eighty tables pass a leaf");
+        assert!(
+            refused.contains("ext-ALU rows — a leaf takes at most"),
+            "{memory:?}: {refused}"
+        );
+        let whole = derive(1 << crate::block_whir::BLOCK_KECCAK_RND_ROWS_LOG2, 1)
+            .expect("one table at the block's cut");
+        assert!(
+            xalu(&whole) < xalu(&ten),
+            "{memory:?}: one tall table costs one table's rows"
+        );
+    }
+}
+
+/// Instrument (`--exact`): one group's leaf rows as it gains zero pages, under
+/// the word and the split format (the production stack holds every page of
+/// these statements in one group).
+#[test]
+#[ignore = "laptop instrument: run alone with --exact"]
+fn pages_in_one_group_census() {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    for memory in [MemoryFormat::Words, MemoryFormat::Split] {
+        let format = BlockFormat {
+            memory,
+            ..words_format()
+        };
+        let opts = super::super::proof::block_base_options_under(&format.zf);
+        let mix = if memory == MemoryFormat::Words {
+            SMALL_WORDS
+        } else {
+            SMALL_SPLIT
+        };
+        for pages in [2usize, 50, 100, 200, 400] {
+            let owned = mix_statement(elf, &opts, &format, mix, pages, 0);
+            match WhirBlockPlan::derive(elf, &opts, &format, owned.view(), None) {
+                Ok(plan) => {
+                    let (loads, _) = plan.chip_loads();
+                    println!(
+                        "PAGES {memory:?} {pages}: {} groups · ext-ALU by group {:?} · socket by group {:?}",
+                        plan.num_groups(),
+                        loads.iter().map(|l| l.xalu).collect::<Vec<_>>(),
+                        loads.iter().map(|l| l.hash).collect::<Vec<_>>(),
+                    );
+                }
+                Err(e) => println!("PAGES {memory:?} {pages}: refused: {e}"),
+            }
+        }
     }
 }
