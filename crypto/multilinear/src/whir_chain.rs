@@ -4596,6 +4596,180 @@ mod tests {
         assert_eq!(values.evals(), read.evals());
     }
 
+    /// ★ CARD PARITY OF THE ROUND FORM'S WEIGHT KERNEL: the same factors on
+    /// the card and on the host, after the same group of rounds, gain the
+    /// same `Q` shift claims (the round form's points, repeats among them):
+    /// the card's weight, read back, is the host's value for value, and the
+    /// next group's sumcheck messages agree. One batch counted on the card.
+    /// Box tier: without a card the factors stay on the host and the test
+    /// fails rather than pass there.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a card; box tier"]
+    fn the_card_shift_claims_weight_is_the_hosts() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+        type X = FieldElement<Ext3>;
+        let word = |i: u64, k: u64| {
+            FE::from(
+                i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(k.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+                    >> 1,
+            )
+        };
+        for (n, k, q) in [(14usize, 4usize, 57usize), (15, 6, 114), (13, 4, 3)] {
+            let message = Mle::new((0..1u64 << n).map(|i| word(i, 0)).collect()).expect("message");
+            let weight = Mle::new(
+                (0..1u64 << n)
+                    .map(|i| X::new([word(i, 1), word(i, 2), word(i, 3)]))
+                    .collect(),
+            )
+            .expect("weight");
+            let mut card = Factors::<F, Ext3>::new(&message, weight.clone()).expect("factors");
+            assert!(
+                matches!(card, Factors::Device(_)),
+                "no card took the opening: this test needs one"
+            );
+            let mut host = Factors::<F, Ext3>::Host {
+                weight,
+                message: Mle::new(
+                    message
+                        .evals()
+                        .iter()
+                        .map(|v| v.to_extension::<Ext3>())
+                        .collect(),
+                )
+                .expect("lifted"),
+                field: core::marker::PhantomData,
+            };
+            let mut tc = DefaultTranscript::<Ext3>::new(b"card-shift-claims");
+            let mut th = DefaultTranscript::<Ext3>::new(b"card-shift-claims");
+            let (card_rounds, _) = card.rounds(k, &mut tc).expect("card rounds");
+            let (host_rounds, _) = host.rounds(k, &mut th).expect("host rounds");
+            let messages = |rounds: &[SumcheckRoundProof<Ext3>]| -> Vec<X> {
+                rounds.iter().flat_map(|r| r.evaluations.clone()).collect()
+            };
+            assert_eq!(
+                messages(&card_rounds),
+                messages(&host_rounds),
+                "n {n}: the first group"
+            );
+            // The round form's points over the folded domain of a 2^(n+1)
+            // codeword, two of them repeated.
+            let folded = Domain::<F>::new(n + 1 - k).expect("domain");
+            let mut positions: Vec<usize> =
+                (0..q).map(|j| (j * 7919 + 13) % folded.size()).collect();
+            if q > 3 {
+                positions[3] = positions[1];
+            }
+            let points = shift_points::<F, Ext3>(&folded, &positions, n - k);
+            let gamma = X::new([word(5, 9), word(6, 9), word(7, 9)]);
+            let scales = shift_scales(&gamma, q);
+            let before = crate::gpu::shift_claim_batches();
+            card.add_shift_claims(&points, &scales)
+                .expect("card claims");
+            host.add_shift_claims(&points, &scales)
+                .expect("host claims");
+            assert_eq!(
+                crate::gpu::shift_claim_batches(),
+                before + 1,
+                "one batch on the card"
+            );
+            let Factors::Device(device) = &mut card else {
+                unreachable!()
+            };
+            let card_weight = device.weight_to_host::<Ext3>().expect("read back");
+            let Factors::Host { weight, .. } = &host else {
+                unreachable!()
+            };
+            assert_eq!(card_weight.len(), weight.len());
+            for (i, (c, h)) in card_weight.iter().zip(weight.evals()).enumerate() {
+                assert_eq!(c, h, "n {n}, q {q}: weight index {i}");
+            }
+            let rest = (n - k).min(2);
+            let (card_next, _) = card.rounds(rest, &mut tc).expect("card rounds");
+            let (host_next, _) = host.rounds(rest, &mut th).expect("host rounds");
+            assert_eq!(
+                messages(&card_next),
+                messages(&host_next),
+                "n {n}: the group after the claims"
+            );
+        }
+    }
+
+    /// ★ CARD PARITY OF THE ROUND FORM'S BIGGER-DOMAIN ENCODE: a round-0
+    /// codeword committed on the card and the factors opened there, after a
+    /// group of `k` rounds, encode the bound message on the domain squared
+    /// `s < k` times — `2^(k − s)` times the fold's size — as the host
+    /// encodes it, value for value; then the same from that successor (an
+    /// extension codeword on the card) one round later. Whatever the encode
+    /// knob says. Box tier.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a card; box tier"]
+    fn the_card_round_form_successor_is_the_host_encode() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+        type X = FieldElement<Ext3>;
+        let n = 16;
+        let cfg = ChainConfig {
+            log_blowup: 1,
+            log_folding: 4,
+            num_queries: 4,
+            grind: GrindBits::default(),
+            format: ChainFormat::DEFAULT,
+        };
+        for knob in [None, Some(false)] {
+            crate::gpu::force_encode_successor(knob);
+            let f = pseudo_mle(n, 3);
+            let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).expect("commit");
+            assert!(
+                commitment.codeword().on_device(),
+                "the card did not take the commit: this test needs one"
+            );
+            let weight = Mle::new(
+                (0..1u64 << n)
+                    .map(|i| X::from(i.wrapping_mul(0x9E37_79B9) >> 3))
+                    .collect(),
+            )
+            .expect("weight");
+            let mut factors = Factors::<F, Ext3>::new(&f, weight).expect("factors");
+            assert!(
+                matches!(factors, Factors::Device(_)),
+                "the opening is on the card"
+            );
+            let mut t = DefaultTranscript::<Ext3>::new(b"card-round-form-encode");
+            let mut held_domain = domain.clone();
+            let mut held: Option<Codeword<Ext3>> = None;
+            for (k, s) in [(4usize, 2usize), (4, 3)] {
+                factors.rounds(k, &mut t).expect("rounds");
+                let card = match &held {
+                    None => factors.encode_successor_always(commitment.codeword(), s),
+                    Some(codeword) => factors.encode_successor_always(codeword, s),
+                }
+                .expect("the card encodes the round form's successor");
+                let card_values = card
+                    .device()
+                    .and_then(|d| d.values::<Ext3>())
+                    .expect("read back");
+                let mut target = held_domain.clone();
+                for _ in 0..s {
+                    target = target.squared().expect("domain");
+                }
+                let message = factors.device_message().expect("message").expect("on card");
+                let host =
+                    encode::<F, Ext3>(&lift_coefficients(&message), &target).expect("encode");
+                assert_eq!(
+                    card_values.len(),
+                    target.size(),
+                    "k {k}, s {s}: the bigger domain"
+                );
+                assert_eq!(card_values, host, "k {k}, s {s}, knob {knob:?}");
+                held = Some(card);
+                held_domain = target;
+            }
+        }
+        crate::gpu::force_encode_successor(None);
+    }
+
     /// The current codeword's blocks, whichever variant holds them. In these
     /// tests `F` and `E` coincide, so both arms read the same.
     fn current_blocks(openings: &RoundOpenings<F, F>) -> &[crate::whir_commit::CosetOpening<F>] {

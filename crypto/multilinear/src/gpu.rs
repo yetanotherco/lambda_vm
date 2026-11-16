@@ -714,6 +714,8 @@ pub fn reset_call_counters() {
     COSET_OPENINGS.store(0, Ordering::Relaxed);
     COSET_FALLBACKS.store(0, Ordering::Relaxed);
     COSET_HOST_ENCODES.store(0, Ordering::Relaxed);
+    ROUND_FORM_HOST_ENCODES.store(0, Ordering::Relaxed);
+    SHIFT_CLAIM_BATCHES.store(0, Ordering::Relaxed);
     COSET_INPLACE_OPENS.store(0, Ordering::Relaxed);
     COSET_INPLACE_ASSEMBLED.store(0, Ordering::Relaxed);
     COSET_ZERO_TILES.store(0, Ordering::Relaxed);
@@ -6327,6 +6329,24 @@ impl OpeningFactors {
             .map_err(|_| failed("shift claims' weight"))?;
         SHIFT_CLAIM_BATCHES.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The weight's live cube, read back (canonical): what a card test
+    /// compares with the host's weight.
+    #[cfg(test)]
+    pub(crate) fn weight_to_host<E>(
+        &mut self,
+    ) -> Result<Vec<math::field::element::FieldElement<E>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let (weight, _) =
+            self.materialize()?
+                .tables_to_host()
+                .map_err(|_| crate::Error::DeviceFailed {
+                    stage: "the weight read back",
+                })?;
+        Ok(weight.chunks_exact(3).map(ext3_from_raw::<E>).collect())
     }
 
     /// Device bytes the factors hold right now — the share-form working set
