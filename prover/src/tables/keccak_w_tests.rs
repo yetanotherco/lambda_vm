@@ -1448,3 +1448,20 @@ fn every_keccak_w_constraint_breaks_alone_on_some_row() {
         "the constraints no lone break was found for"
     );
 }
+
+/// KECCAK_W's honest rows for the census (`word_memory_tests`): calls at
+/// every input and digest offset, the last block at every length, middle
+/// rows and padding.
+pub(super) fn census_rows() -> Vec<Vec<FE>> {
+    let mut run = Run::new();
+    for offset in 0..8u64 {
+        for (k, &len) in [0u64, 1, 13, 136, 137, 271].iter().enumerate() {
+            run.call(
+                IN + offset + 0x200 * k as u64,
+                len,
+                OUT + 0x40 * k as u64 + offset,
+            );
+        }
+    }
+    distinct_rows(&run)
+}
