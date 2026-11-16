@@ -33,6 +33,9 @@ pub mod blake3;
 pub mod branch;
 pub mod bytewise;
 pub mod copy;
+pub mod copy_w;
+#[cfg(test)]
+mod copy_w_tests;
 pub mod cpu;
 pub mod cpu32;
 pub mod decode;
