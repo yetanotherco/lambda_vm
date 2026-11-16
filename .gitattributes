@@ -1,0 +1,3 @@
+# The Sail RISC-V model in Lean is generated (see sail-riscv-lean/README.md): collapse it in diffs.
+sail-riscv-lean/LeanRV64D/** linguist-generated=true
+sail-riscv-lean/LeanRV64D.lean linguist-generated=true
