@@ -106,7 +106,10 @@ fn built(
             fast.enable_history().expect("history mode");
             while let Some((logs, history)) = fast.resume_history(window).expect("the run") {
                 let last = (fast.pc() == 0)
-                    .then(|| fast.take_history_final().map(Box::new))
+                    .then(|| {
+                        fast.take_history_final()
+                            .map(crate::tables::trace_builder::windowed::parallel::RunEnd::boxed)
+                    })
                     .flatten();
                 let sent = tx.send(super::parallel::ExecWindow {
                     logs: Arc::new(logs),
@@ -316,7 +319,10 @@ fn memw_r_chunks(
             fast.enable_history().expect("history mode");
             while let Some((logs, history)) = fast.resume_history(window).expect("the run") {
                 let last = (fast.pc() == 0)
-                    .then(|| fast.take_history_final().map(Box::new))
+                    .then(|| {
+                        fast.take_history_final()
+                            .map(crate::tables::trace_builder::windowed::parallel::RunEnd::boxed)
+                    })
                     .flatten();
                 let sent = tx.send(super::parallel::ExecWindow {
                     logs: Arc::new(logs),
@@ -448,7 +454,10 @@ fn finish_of(
             fast.enable_history().expect("history mode");
             while let Some((logs, history)) = fast.resume_history(7).expect("the run") {
                 let last = (fast.pc() == 0)
-                    .then(|| fast.take_history_final().map(Box::new))
+                    .then(|| {
+                        fast.take_history_final()
+                            .map(crate::tables::trace_builder::windowed::parallel::RunEnd::boxed)
+                    })
                     .flatten();
                 let sent = tx.send(super::parallel::ExecWindow {
                     logs: Arc::new(logs),

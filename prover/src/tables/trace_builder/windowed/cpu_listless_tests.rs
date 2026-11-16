@@ -182,7 +182,11 @@ fn built_in(
                             break;
                         };
                         let last = (fast.pc() == 0)
-                            .then(|| fast.take_history_final().map(Box::new))
+                            .then(|| {
+                                fast.take_history_final().map(
+                                    crate::tables::trace_builder::windowed::parallel::RunEnd::boxed,
+                                )
+                            })
                             .flatten();
                         let sent = tx.send(super::parallel::ExecWindow {
                             logs: Arc::new(logs),

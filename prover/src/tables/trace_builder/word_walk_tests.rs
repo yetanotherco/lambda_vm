@@ -534,3 +534,111 @@ fn a_moved_word_row_or_a_changed_final_word_is_refused_on_the_buses() {
         super::bus_net_tests::named(&left)
     );
 }
+
+/// `program`'s run under the word memory format walked from the fast engine's
+/// word history (record mode) on `walkers` threads at light walk `level`, by
+/// windows of `window` cycles, its streamed ops dropped; with `recheck`, every
+/// `recheck`-th window is also walked from the lean pass's entries and its
+/// first cells compared with the history's, by word.
+fn word_record_build(
+    program: &Elf,
+    window: usize,
+    walkers: usize,
+    level: u8,
+    recheck: usize,
+) -> Result<Traces, crate::Error> {
+    use super::windowed::parallel::{ExecWindow, RunEnd, walk_windows_from_history};
+    use super::windowed::{ChunkJob, WindowedTraceBuilder};
+    use executor::vm::fast::FastExecutor;
+    let max_rows = MaxRowsConfig::small();
+    let mut builder = WindowedTraceBuilder::new(program, &[], &max_rows)?
+        .register_format(RegisterFormat::InRow)?
+        .memw_aligned_order(MemwAlignedOrder::Limbs)?
+        .memory_format(MemoryFormat::Words)?
+        .drop_streamed_ops()?
+        .light_walk(level)?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
+    let mut chunks = Vec::new();
+    let report = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut fast = FastExecutor::new(program, Vec::new()).expect("the fast engine");
+            fast.enable_word_history().expect("the word history");
+            let mut k = 0usize;
+            loop {
+                let start = (recheck > 0 && k.is_multiple_of(recheck)).then(|| fast.snapshot());
+                let Some((logs, history)) = fast.resume_word_history(window).expect("the run")
+                else {
+                    break;
+                };
+                assert!(history.words, "a word history");
+                let last = (fast.pc() == 0)
+                    .then(|| fast.take_word_history_final().map(RunEnd::boxed_words))
+                    .flatten();
+                let sent = tx.send(ExecWindow {
+                    logs: std::sync::Arc::new(logs),
+                    start,
+                    history: Some(Box::new(history)),
+                    last,
+                });
+                if sent.is_err() {
+                    break;
+                }
+                k += 1;
+            }
+        });
+        walk_windows_from_history(
+            &mut builder,
+            rx,
+            walkers,
+            recheck,
+            |accumulator, walked, _| {
+                chunks.extend(
+                    accumulator
+                        .absorb(walked)
+                        .into_iter()
+                        .map(ChunkJob::generate),
+                );
+                Ok(())
+            },
+        )
+    })?;
+    let mut traces = builder.finish(&report.last)?;
+    traces.insert_streamed(chunks)?;
+    Ok(traces)
+}
+
+/// ★ Record mode under the word memory format: a run walked from the
+/// executor's word history (a timestamp an aligned word, each word's bytes
+/// at it), on one walker and on three, at light walk levels 0 and 2, with
+/// every second window re-walked from the lean pass's entries and its first
+/// cells compared with the history's by word, builds the tables the
+/// sequential windowed build makes, and they balance every bus.
+#[test]
+fn record_mode_under_the_word_format_builds_the_windowed_tables() {
+    for name in [
+        "fused_mem_cases",
+        "all_loadstore_32",
+        "misalign_sw",
+        "loop_4096",
+    ] {
+        let (program, logs) = run(name);
+        let want = word_build(&program, &logs, RegisterFormat::InRow, 7);
+        for window in [7, 33] {
+            for (walkers, level) in [(1, 0u8), (3, 0), (3, 2)] {
+                for recheck in [0, 2] {
+                    let mut got = word_record_build(&program, window, walkers, level, recheck)
+                        .unwrap_or_else(|e| {
+                            panic!("{name}/{window}/{walkers}/{level}/{recheck}: {e:?}")
+                        });
+                    crate::tests::windowed_builder_tests::same_traces(&want, &got);
+                    let left = left(&program, &mut got, RegisterFormat::InRow);
+                    assert!(
+                        left.is_empty(),
+                        "{name}: {}",
+                        super::bus_net_tests::named(&left)
+                    );
+                }
+            }
+        }
+    }
+}
