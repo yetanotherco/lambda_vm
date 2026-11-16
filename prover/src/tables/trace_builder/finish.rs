@@ -1873,7 +1873,26 @@ impl<'a> FinishPlan<'a> {
             }
             generate_optional(&copy_ops.whole(), copy::generate_copy_trace)
         };
+        // Under the word memory format KECCAK's tables are KECCAK_W's (the
+        // sponge rows hold their words).
         let gen_keccaks = || {
+            if words {
+                use super::super::keccak_w;
+                if skip.keccak_rows > 0 {
+                    return cut_tables(
+                        &keccak_ops,
+                        skip.keccak_rows,
+                        skip.cut_padding,
+                        pack,
+                        form,
+                        keccak_w::rows_written_packed,
+                        keccak_w::generate_keccak_w_rows_as,
+                    );
+                }
+                return generate_optional(&keccak_ops.whole(), |ops| {
+                    keccak_w::generate_keccak_w_trace_as(ops, TraceForm::Wide)
+                });
+            }
             if skip.keccak_rows > 0 {
                 return cut_tables(
                     &keccak_ops,
@@ -2768,16 +2787,37 @@ impl<'a> FinishPlan<'a> {
             )?);
         }
         let keccak_ops = Arc::clone(&shared.keccak_ops);
-        units.extend(cut_units(
-            family("KECCAK"),
-            &keccak_ops,
-            skip.keccak_rows,
-            skip.cut_padding,
-            pack,
-            form,
-            Arc::new(keccak::generate_keccak_rows_as),
-            |ops| Box::new(move || Ok(keccak::generate_keccak_trace(&ops.whole()))),
-        )?);
+        if skip.memory_format == super::super::fused_memory::MemoryFormat::Words {
+            use super::super::keccak_w;
+            units.extend(cut_units(
+                family("KECCAK"),
+                &keccak_ops,
+                skip.keccak_rows,
+                skip.cut_padding,
+                pack,
+                form,
+                Arc::new(keccak_w::generate_keccak_w_rows_as),
+                |ops| {
+                    Box::new(move || {
+                        Ok(keccak_w::generate_keccak_w_trace_as(
+                            &ops.whole(),
+                            TraceForm::Wide,
+                        ))
+                    })
+                },
+            )?);
+        } else {
+            units.extend(cut_units(
+                family("KECCAK"),
+                &keccak_ops,
+                skip.keccak_rows,
+                skip.cut_padding,
+                pack,
+                form,
+                Arc::new(keccak::generate_keccak_rows_as),
+                |ops| Box::new(move || Ok(keccak::generate_keccak_trace(&ops.whole()))),
+            )?);
+        }
         units.extend(keccak_rnd_units(&keccak_ops, &skip, pack, form)?);
         // Tables held as their records are never dropped: nothing to keep.
         if let Some(regen) = regen.as_mut().filter(|_| !(skip.card_fill && pack)) {

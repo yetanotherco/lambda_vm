@@ -3658,11 +3658,11 @@ pub(crate) fn word_tables_under(
 
 /// The tables of the chips the word format takes no call of yet, by name:
 /// the accelerators' counts in a statement but COPY's (COPY_W's under the
-/// word format, whose word messages MEMW_W takes).
-fn chip_counts(counts: &TableCounts, _words: [u64; 7]) -> [(&'static str, u64); 8] {
+/// word format), KECCAK's (KECCAK_W's: keccak256 alone) and its round
+/// chip's, whose word messages MEMW_W takes. IS_WH holds the permute mode's
+/// pointers, which KECCAK_W has not.
+fn chip_counts(counts: &TableCounts, _words: [u64; 7]) -> [(&'static str, u64); 6] {
     [
-        ("KECCAK", counts.keccak as u64),
-        ("KECCAK_RND", counts.keccak_rnd as u64),
         ("IS_WH", counts.is_wh as u64),
         ("BLAKE3", counts.blake3 as u64),
         ("ECSM", counts.ecsm as u64),
@@ -3673,13 +3673,14 @@ fn chip_counts(counts: &TableCounts, _words: [u64; 7]) -> [(&'static str, u64); 
 }
 
 /// Under the word memory format, refuses a statement that states a table of
-/// a chip the format takes no call of yet: KECCAK and its rounds and IS_WH,
+/// a chip the format takes no call of yet: IS_WH (KECCAK's permute mode),
 /// BLAKE3, ECSM and ECDAS, ECREC, HINT. Those chips still read and write
 /// memory by byte messages, which nothing receives under the word format: a
 /// block that calls one is not provable under it, and the verifier says so
-/// by its counts instead of leaving it to the bus. COPY's tables (COPY_W's)
-/// and MEMW_W's, which takes their word messages, are the format's. Under
-/// any other format, nothing to check.
+/// by its counts instead of leaving it to the bus. COPY's tables (COPY_W's),
+/// KECCAK's (KECCAK_W's) and its round chip's, and MEMW_W's, which takes
+/// their word messages, are the format's. Under any other format, nothing
+/// to check.
 pub(crate) fn chip_tables_under(
     memory: crate::tables::fused_memory::MemoryFormat,
     counts: &TableCounts,
@@ -5283,7 +5284,12 @@ fn prove_block_whir_body(
         format.keccak_rnd,
     )?;
     split_ecdas(&mut traces, options.ecdas_rows_log2, padding);
-    split_keccak(&mut traces, options.keccak_rows_log2, padding);
+    split_keccak(
+        &mut traces,
+        options.keccak_rows_log2,
+        padding,
+        format.memory,
+    );
     split_ecsm(&mut traces, options.ecsm_rows_log2, padding);
     split_copy(&mut traces, options.copy_rows_log2, padding, format.memory);
     if deviations.omit_first_keccak_rnd && !traces.keccak_rnds.is_empty() {
@@ -5355,9 +5361,19 @@ pub(crate) fn split_ecdas(traces: &mut Traces, rows_log2: usize, padding: CutPad
 /// Cuts every KECCAK table into tables of at most `2^rows_log2` rows, as many
 /// as `padding` keeps ([`split_cut`]): a row is one whole permutation call, so
 /// a cut falls between calls ([`BLOCK_KECCAK_ROWS_LOG2`]).
-pub(crate) fn split_keccak(traces: &mut Traces, rows_log2: usize, padding: CutPadding) {
+pub(crate) fn split_keccak(
+    traces: &mut Traces,
+    rows_log2: usize,
+    padding: CutPadding,
+    memory: crate::tables::fused_memory::MemoryFormat,
+) {
     let rows = 1usize << rows_log2;
-    let mu = crate::tables::keccak::cols::MU;
+    // Under the word memory format KECCAK's tables are KECCAK_W's.
+    let mu = if memory == crate::tables::fused_memory::MemoryFormat::Words {
+        crate::tables::keccak_w::cols::MU
+    } else {
+        crate::tables::keccak::cols::MU
+    };
     traces.keccaks = std::mem::take(&mut traces.keccaks)
         .into_iter()
         .flat_map(|table| split_cut(table, rows, mu, padding))
@@ -7901,7 +7917,7 @@ fn prove_streamed(
                 // has no rows for `split_rows` to copy.
                 if !options.finish_cuts {
                     split_ecdas(&mut rest, options.ecdas_rows_log2, padding);
-                    split_keccak(&mut rest, options.keccak_rows_log2, padding);
+                    split_keccak(&mut rest, options.keccak_rows_log2, padding, format.memory);
                     split_ecsm(&mut rest, options.ecsm_rows_log2, padding);
                     split_copy(&mut rest, options.copy_rows_log2, padding, format.memory);
                 }

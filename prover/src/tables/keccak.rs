@@ -252,6 +252,9 @@ pub struct SpongeRow {
     /// The read mask `s`: `s[i]` = byte `i` of the block is input and read. All
     /// 136 on a row that is not the last, the first `count` on the last.
     pub mask: [bool; 136],
+    /// Under the word memory format, the block's words as the walk read them
+    /// (`tables::keccak_w`); `None` under any other.
+    pub words: Option<Box<super::keccak_w::SpongeWords>>,
 }
 
 impl SpongeRow {
@@ -328,6 +331,7 @@ pub fn sponge_ops(t: u64, ptr: u64, out: u64, input: &[u8]) -> Vec<KeccakOperati
                     last: j + 1 == n,
                     msg,
                     mask: SpongeRow::prefix(take),
+                    words: None,
                 }),
             }
         })

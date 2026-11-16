@@ -52,6 +52,9 @@ pub mod is_wh;
 pub mod keccak;
 pub mod keccak_rc;
 pub mod keccak_rnd;
+pub mod keccak_w;
+#[cfg(test)]
+mod keccak_w_tests;
 pub mod load;
 pub mod local_to_global;
 pub mod lt;

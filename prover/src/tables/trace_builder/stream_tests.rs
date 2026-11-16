@@ -561,6 +561,7 @@ fn under_the_word_format_the_stream_is_the_monolithic_finish() {
         "misalign_lw",
         "test_copy_ecalls",
         "test_commit_split",
+        "test_keccak256",
     ] {
         the_stream_is_the_finish_under(&MaxRowsConfig::small(), name, &word_configs());
     }

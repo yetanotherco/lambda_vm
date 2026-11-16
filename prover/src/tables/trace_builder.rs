@@ -2693,12 +2693,27 @@ fn walk_cpu_ops<const REST: bool>(
             }
         }
 
-        // Keccak256 ECALL: one KECCAK row per block of the input.
+        // Keccak256 ECALL: one KECCAK row per block of the input (under the
+        // word memory format a KECCAK_W row, its memory as words).
         if op.ecall_keccak256() {
-            let (sponge_memw, rows) = collect_keccak256_ops(op, memory_state, register_state);
-            memw.extend_ops(sponge_memw);
-            if REST {
-                keccak_ops.extend(rows);
+            if words {
+                let (register_memw, rows) = collect_keccak256_word_ops(
+                    op,
+                    memory_state,
+                    register_state,
+                    word_rows,
+                    lookups.then_some(&mut *bitwise_ops),
+                )?;
+                memw.extend_ops(register_memw);
+                if REST {
+                    keccak_ops.extend(rows);
+                }
+            } else {
+                let (sponge_memw, rows) = collect_keccak256_ops(op, memory_state, register_state);
+                memw.extend_ops(sponge_memw);
+                if REST {
+                    keccak_ops.extend(rows);
+                }
             }
         }
 
@@ -3969,6 +3984,47 @@ fn collect_keccak256_ops(
     }
 
     (memw_ops, rows)
+}
+
+/// [`collect_keccak256_ops`] under the word memory format: the same register
+/// reads and rows, the rows' memory as words
+/// ([`word_walk::keccak256_words`]): KECCAK_W's words on the rows and the
+/// MEMW_W rows in `word_rows`. A call whose words the state lacks makes no
+/// row (the state is marked missing and the window is refused).
+fn collect_keccak256_word_ops(
+    op: CpuOp<'_>,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+    word_rows: &mut WordRows,
+    lookups: Option<&mut Vec<BitwiseOperation>>,
+) -> Result<(Vec<MemwOperation>, Vec<KeccakOperation>), Error> {
+    let t = op.timestamp;
+    let ptr = register_state.read(10).0;
+    let len = register_state.read(11).0;
+    let out = register_state.read(12).0;
+    if !executor::vm::instruction::execution::keccak256_addresses_ok(ptr, len, out) {
+        return Err(Error::Prover(format!(
+            "keccak256 at timestamp {t}: operands the executor refuses"
+        )));
+    }
+    let mut memw_ops = Vec::with_capacity(3);
+    for (reg, value) in [(10u8, ptr), (11, len), (12, out)] {
+        let reg_value = pack_register_value(value);
+        let (_old_val, old_ts) = register_state.read(reg);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * reg as u64, reg_value, t, 2, true)
+                .with_old(reg_value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(reg, value, t);
+    }
+    let input: Vec<u8> = (0..len)
+        .map(|i| memory_state.read_byte(ptr.wrapping_add(i)).0)
+        .collect();
+    let mut rows = keccak::sponge_ops(t, ptr, out, &input);
+    if !word_walk::keccak256_words(&mut rows, ptr, len, out, memory_state, word_rows, lookups)? {
+        return Ok((memw_ops, Vec::new()));
+    }
+    Ok((memw_ops, rows))
 }
 
 /// Collects the memory operations for a `Hint` ecall.
@@ -6948,6 +7004,11 @@ fn emit_sponge_lookups(
     halves((sponge.src & 0xFFFF_FFFF) + 135, &mut *emit);
     if sponge.last {
         halves((sponge.out & 0xFFFF_FFFF) + 31, &mut *emit);
+    }
+    // Under the word memory format the row is KECCAK_W's: its keys' halves
+    // and its words' bytes.
+    if let Some(words) = sponge.words.as_deref() {
+        super::keccak_w::extra_bitwise_ops(kop, sponge, words, emit);
     }
 }
 

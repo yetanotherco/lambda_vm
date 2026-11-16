@@ -168,17 +168,18 @@ fn read_word(memory_state: &mut MemoryState, base: u64) -> (u64, u64) {
     (word, stamps.iter().copied().max().unwrap_or(0))
 }
 
-/// Refuses an ECALL under the word memory format that is neither the halt
-/// nor a COPY chip's call (memcpy and memmove, memset, the commit syscall):
+/// Refuses an ECALL under the word memory format that is neither the halt,
+/// nor a COPY chip's call (memcpy and memmove, memset, the commit syscall),
+/// nor keccak256:
 /// the other chips' memory messages have no receiver under it yet, and the
 /// verifier refuses their tables (`block_whir::chip_tables_under`).
 pub(super) fn refuse_syscall(op: CpuOp<'_>) -> Result<(), Error> {
     let halt = executor::vm::instruction::execution::SyscallNumbers::Halt as u64;
     let copy = op.ecall_commit() || op.ecall_dma_memcpy() || op.ecall_dma_memset();
-    if op.decode.fields.ecall && op.rv1 != halt && !copy {
+    if op.decode.fields.ecall && op.rv1 != halt && !copy && !op.ecall_keccak256() {
         return Err(Error::Prover(format!(
-            "the word memory format proves no syscall but the halt and the COPY chip's yet: \
-             syscall {:#x} at timestamp {}",
+            "the word memory format proves no syscall but the halt, the COPY chip's and \
+             keccak256 yet: syscall {:#x} at timestamp {}",
             op.rv1, op.timestamp
         )));
     }
@@ -399,6 +400,126 @@ pub(super) fn word_store(
     }
     memory_state.write_bytes(address, value, count, ts);
     Ok(())
+}
+
+/// A keccak256 call's memory under the word memory format: its rows
+/// (`ops`, [`super::super::keccak::sponge_ops`]'s) given their words
+/// ([`super::super::keccak_w::SpongeWords`]), and its MEMW_W rows: each block's
+/// covering words read at `T` (a word two blocks share once, by the earlier
+/// block), then the digest's words at `T + 1` (the edge words read and
+/// written, the middle ones written), the bytes stamped as the call touches
+/// them. `false` when the state lacks a word (marked missing; nothing made).
+pub(super) fn keccak256_words(
+    ops: &mut [crate::tables::keccak::KeccakOperation],
+    ptr: u64,
+    len: u64,
+    out: u64,
+    memory_state: &mut MemoryState,
+    rows: &mut WordRows,
+    lookups: Option<&mut Vec<BitwiseOperation>>,
+) -> Result<bool, Error> {
+    use super::super::keccak_w::{
+        BLOCK_WORDS, DIGEST, DigestWords, SpongeWords, digest_of, digest_words, reads,
+    };
+    use super::super::memw_w::MessageKind;
+    let refused = |why: String| Error::Prover(format!("KECCAK_W: {why}"));
+    let Some(t) = ops.first().map(|op| op.timestamp & 0xFFFF_FFFF) else {
+        return Ok(true);
+    };
+    let offset = (ptr % WORD_BYTES) as u8;
+    let src_key = ptr - u64::from(offset);
+    let q = (out % WORD_BYTES) as u8;
+    let out_key = out - u64::from(q);
+    let reads_of: Vec<[bool; BLOCK_WORDS]> = ops
+        .iter()
+        .map(|op| {
+            let sponge = op.sponge.as_ref().expect("a sponge row");
+            reads(&sponge.mask, offset, sponge.first)
+        })
+        .collect();
+    let block_key = |j: usize| src_key + 136 * j as u64;
+    let digest_keys: Vec<u64> = (0..if q == 0 { 4 } else { 5 })
+        .map(|v| out_key + 8 * v)
+        .collect();
+    let mut words = StateWords(memory_state);
+    let held = reads_of
+        .iter()
+        .enumerate()
+        .flat_map(|(j, r)| {
+            (0..BLOCK_WORDS)
+                .filter(|&w| r[w])
+                .map(move |w| block_key(j) + 8 * w as u64)
+        })
+        .chain(digest_keys.iter().copied())
+        .all(|key| words.word(key).is_some());
+    if !held {
+        return Ok(false);
+    }
+    let input = (ptr, len);
+    let mut made = Vec::new();
+    let mut blocks: Vec<[u64; BLOCK_WORDS]> = vec![[0; BLOCK_WORDS]; ops.len()];
+    for (j, r) in reads_of.iter().enumerate() {
+        for w in (0..BLOCK_WORDS).filter(|&w| r[w]) {
+            let key = block_key(j) + 8 * w as u64;
+            let (value, old_ts) = words.word(key).expect("held");
+            made.push(
+                MemwWordRow::new(MessageKind::Access, key, t, old_ts, value, value)
+                    .map_err(refused)?,
+            );
+            words.set(key, t, value, inside(key, input));
+            blocks[j][w] = value;
+        }
+    }
+    // The shared word: carried forward when the block is not aligned, the
+    // next block's first word otherwise (its own, read or not).
+    for j in 1..blocks.len() {
+        if offset != 0 {
+            blocks[j][0] = blocks[j - 1][17];
+        } else {
+            blocks[j - 1][17] = blocks[j][0];
+        }
+    }
+    let last = ops.last().expect("a row");
+    let digest = digest_of(&last.output);
+    let mut olds = [0u64; 5];
+    for (v, &key) in digest_keys.iter().enumerate() {
+        let (old, old_ts) = words.word(key).expect("held");
+        olds[v] = old;
+        let new = digest_words(&digest, q, olds[0], old)[v];
+        let kind = if v == 0 || v == 4 {
+            MessageKind::Access
+        } else {
+            MessageKind::Write
+        };
+        made.push(MemwWordRow::new(kind, key, t + 1, old_ts, old, new).map_err(refused)?);
+        words.set(key, t + 1, new, inside(key, (out, DIGEST as u64)));
+    }
+    let n = ops.len();
+    for (j, op) in ops.iter_mut().enumerate() {
+        let sponge = op.sponge.as_mut().expect("a sponge row");
+        sponge.words = Some(Box::new(SpongeWords {
+            offset,
+            words: blocks[j],
+            digest: (j + 1 == n).then_some(DigestWords {
+                q,
+                old0: olds[0],
+                old4: olds[4],
+            }),
+        }));
+    }
+    if let Some(out) = lookups {
+        out.extend(made.iter().flat_map(MemwWordRow::bitwise_ops));
+    }
+    rows.memw.extend(made);
+    Ok(true)
+}
+
+/// The bytes a range (`len` bytes from `start`) holds in the word at `key`:
+/// `(first address, length)`.
+fn inside(key: u64, (start, len): (u64, u64)) -> (u64, u8) {
+    let lo = u128::from(key).max(u128::from(start));
+    let hi = (u128::from(key) + u128::from(WORD_BYTES)).min(u128::from(start) + u128::from(len));
+    (lo as u64, hi.saturating_sub(lo) as u8)
 }
 
 /// The word tables of `rows`, family by family (MEM_LOAD8 … MEM_STORE2W,
