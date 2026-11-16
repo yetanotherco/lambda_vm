@@ -7,8 +7,13 @@
 //! the previous row's permutation ended in, asks the round chip for the
 //! permutation on the `Keccak` bus, and the last row writes the digest (the
 //! output's first 32 bytes) to `out`. The rows are linked on
-//! [`BusId::KeccakSponge`]. The mask `s` (`FULL`, `PART`), the padding, the
-//! absorb XORs, the count and the zero first state are KECCAK's, unchanged.
+//! [`BusId::KeccakSponge`]. The padding and the absorb XORs are KECCAK's
+//! interactions written over this table's columns. The sponge rules (the
+//! mask `s` in `FULL`, `PART`, the count, the zero first state, the ends'
+//! halves) are KECCAK's own code ([`keccak::emit_sponge_rules`]) with `MU`
+//! marking a sponge row, so one source serves both tables and KECCAK's
+//! forgeries pin the rules both use; "bytes past the input are 0" is this
+//! table's placement.
 //! KECCAK's permute mode is not here: under the word format the walk refuses a
 //! permute call.
 //!
@@ -69,7 +74,7 @@ use stark::trace::TraceTable;
 
 use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 use super::gpack::{TraceForm, WidthHint, generate_main};
-use super::keccak::{KeccakOperation, SpongeRow};
+use super::keccak::{self, KeccakOperation, SpongeCheck, SpongeColumns, SpongeRow};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use super::word_memory::{
     access_message, byte_pair_checks, column, term, word_of_bytes, write_message,
@@ -702,6 +707,27 @@ pub const DIGEST_HALVES: usize = W4_RULE + 1;
 #[derive(Clone, Copy)]
 pub struct KeccakWordConstraints;
 
+/// KECCAK_W's sponge columns: `MU` marks a sponge row (KECCAK_W has no
+/// permute mode), and the placement puts a zero past the input, so the rules
+/// leave out "bytes past the input are 0".
+const SPONGE_COLUMNS: SpongeColumns = SpongeColumns {
+    sponge: cols::MU,
+    first: cols::FIRST,
+    last: cols::LAST,
+    count: cols::COUNT,
+    timestamp_1: cols::TIMESTAMP_1,
+    src_lo: cols::SRC_LO,
+    src_end: cols::SRC_END,
+    out_lo: cols::OUT_LO,
+    out_end: cols::OUT_END,
+    prev: cols::PREV,
+    msg: cols::MSG,
+    full: cols::FULL,
+    part: cols::PART,
+    input_state: cols::INPUT_STATE,
+    msg_zero: false,
+};
+
 /// `s_i` as an expression.
 fn mask<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B, i: usize) -> Expr<B> {
     let (lane, byte) = (i / 8, i % 8);
@@ -746,62 +772,23 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakWordConstrain
             b.main(0, cols::FIRST),
             b.main(0, cols::LAST),
         );
-        b.emit_base(
-            3,
-            (first.clone() + last.clone()) * (one.clone() - mu.clone()),
-        );
+        // `FIRST`, `LAST` only on a row (a test can leave it out, as KECCAK's).
+        let e = if keccak::dropped(SpongeCheck::FlagsOnSponge) {
+            b.zero()
+        } else {
+            (first.clone() + last.clone()) * (one.clone() - mu.clone())
+        };
+        b.emit_base(3, e);
         let mut idx = 4;
+
+        // KECCAK's sponge rules, from KECCAK's own code, on this table's
+        // columns with `MU` marking a sponge row.
+        keccak::emit_sponge_rules(b, &SPONGE_COLUMNS, &mut idx, limbs_expr);
+
         let mut emit = |b: &mut B, e: Expr<B>| {
             b.emit_base(idx, e);
             idx += 1;
         };
-
-        // KECCAK's sponge rules.
-        for lane in 0..RATE_LANES {
-            let f = b.main(0, cols::full(lane));
-            let e = f.clone() * (b.one() - f);
-            emit(b, e);
-            for byte in 0..7 {
-                let p = b.main(0, cols::part(lane, byte));
-                let e = p.clone() * (b.one() - p);
-                emit(b, e);
-            }
-        }
-        for lane in 0..RATE_LANES {
-            for byte in 0..7 {
-                let e = b.main(0, cols::full(lane)) * b.main(0, cols::part(lane, byte));
-                emit(b, e);
-            }
-        }
-        for i in 0..RATE - 1 {
-            let e = (b.one() - mask(b, i)) * mask(b, i + 1);
-            emit(b, e);
-        }
-        let e = (b.one() - mu.clone()) * mask(b, 0);
-        emit(b, e);
-        let full_last = b.main(0, cols::full(RATE_LANES - 1));
-        let e = (mu.clone() - last.clone()) * (b.one() - full_last.clone());
-        emit(b, e);
-        emit(b, last.clone() * full_last);
-        let taken = (0..RATE).fold(b.zero(), |acc, i| acc + mask(b, i));
-        let e = last.clone() * (b.main(0, cols::COUNT) - taken);
-        emit(b, e);
-        let e = first.clone() * b.main(0, cols::TIMESTAMP_1);
-        emit(b, e);
-        for i in 0..RATE {
-            let e = first.clone() * b.main(0, cols::prev(i));
-            emit(b, e);
-        }
-        for i in RATE..200 {
-            let e = first.clone() * b.main(0, cols::input_byte(i));
-            emit(b, e);
-        }
-        let e = mu.clone()
-            * (b.main(0, cols::SRC_LO) + b.const_base(135) - limbs_expr(b, cols::SRC_END));
-        emit(b, e);
-        let e = last.clone()
-            * (b.main(0, cols::OUT_LO) + b.const_base(31) - limbs_expr(b, cols::OUT_END));
-        emit(b, e);
 
         // The offsets, one-hot: the block's on a row, the digest's on the last.
         for (start, on) in [(cols::OFF, mu.clone()), (cols::Q, last.clone())] {
