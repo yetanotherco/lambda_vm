@@ -4738,6 +4738,23 @@ fn prove_block_whir_inner(
     proved
 }
 
+/// Refuses a block format no prove makes a proof under: the word memory
+/// format under any register format but the in-row one (the 32-bit token
+/// format sends some register accesses to MEMW and MEMW_A, which the word
+/// format retires). The prover's alone: a verifier reads any statement under
+/// the format and refuses, by its counts, the tables it retires.
+pub(crate) fn refuse_unprovable(format: &BlockFormat) -> Result<(), Error> {
+    match (format.memory, format.registers) {
+        (
+            crate::tables::fused_memory::MemoryFormat::Words,
+            crate::tables::register::RegisterFormat::Tokens32,
+        ) => Err(Error::Prover(
+            "the word memory format needs the in-row register format".to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Refuses a memory format the block cannot hold: the fused tables check an
 /// access's step by MEMW_A's limbs, so
 /// [`MemoryFormat::Fused`](crate::tables::fused_memory::MemoryFormat::Fused)
@@ -4771,8 +4788,7 @@ fn prove_block_whir_body(
 ) -> Result<(BlockWhirProof, BlockStamps), Error> {
     let mut stamps = BlockStamps::default();
     check_memory_format(format)?;
-    // The verifier takes the word memory format; its prover is not built yet.
-    crate::tables::fused_memory::refuse_unbuilt(format.memory)?;
+    refuse_unprovable(format)?;
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
     if let Some(window_log2) = options.window_log2 {
@@ -6875,7 +6891,13 @@ fn prove_streamed(
                     .map(|every| ShadowCheck::new(program, every))
                     .transpose()
                     .map_err(failed)?;
-                if history {
+                // Under the word memory format the history keeps a timestamp
+                // an aligned word: what the word walk reads.
+                let word_history =
+                    format.memory == crate::tables::fused_memory::MemoryFormat::Words;
+                if history && word_history {
+                    executor.enable_word_history().map_err(failed)?;
+                } else if history {
                     executor.enable_history().map_err(failed)?;
                 }
                 own.setup = t.elapsed().as_secs_f64();
@@ -6917,7 +6939,11 @@ fn prove_streamed(
                     .then(|| executor.snapshot());
                     // `ran`: the window executed.
                     let (logs, ran) = if history {
-                        let window = executor.resume_history(window).map_err(failed)?;
+                        let window = if word_history {
+                            executor.resume_word_history(window).map_err(failed)?
+                        } else {
+                            executor.resume_history(window).map_err(failed)?
+                        };
                         (window.map(|(logs, h)| (logs, Some(h))), Instant::now())
                     } else {
                         let logs = executor.resume_owned(window).map_err(failed)?;
@@ -6940,7 +6966,15 @@ fn prove_streamed(
                     let start = std::mem::replace(&mut at_start, next);
                     // Record mode's last window carries the run's end.
                     let end = (history && executor.pc() == 0)
-                        .then(|| executor.take_history_final())
+                        .then(|| {
+                            if word_history {
+                                executor
+                                    .take_word_history_final()
+                                    .map(parallel::RunEnd::boxed_words)
+                            } else {
+                                executor.take_history_final().map(parallel::RunEnd::boxed)
+                            }
+                        })
                         .flatten();
                     let logs = std::sync::Arc::new(logs);
                     own.windows += 1;
@@ -6958,7 +6992,7 @@ fn prove_streamed(
                         logs,
                         start: if history { check_start } else { start },
                         history: window_history.map(Box::new),
-                        last: end.map(Box::new),
+                        last: end,
                     };
                     if ltx.send(sent_window).is_err() {
                         break;

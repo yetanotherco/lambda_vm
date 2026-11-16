@@ -1,19 +1,25 @@
-//! The word memory format's proof field on blocks (`BlockWhirProof::
-//! word_memory`): a split and a fused proof are the bytes before the field
-//! then its seven zero counts; any nonzero count on a split or fused proof is
-//! refused (and verifies with the refusal taken out, so the rule is what
-//! refuses it); a split or fused proof does not verify under the word
-//! format. The proving tests run where a block can be proved (the box's lib
-//! run and CI). The word format's statement checks on hand-built statements
-//! are `tables::word_memory_tests`'.
+//! The word memory format on blocks. Its proof field
+//! (`BlockWhirProof::word_memory`): a split and a fused proof are the bytes
+//! before the field then its seven zero counts; any nonzero count on a split
+//! or fused proof is refused (and verifies with the refusal taken out, so the
+//! rule is what refuses it); a split or fused proof does not verify under the
+//! word format. Its proofs: chip-free runs prove and verify under it (and not
+//! under the split or fused format), their word tables the ones the walk
+//! counts; a word row moved later is refused by the bus balance alone; a
+//! hand-built proof stating a chip's table is refused by the chip rule alone.
+//! The proving tests run where a block can be proved (the box's lib run and
+//! CI). The word format's statement checks on hand-built statements are
+//! `tables::word_memory_tests`', its walk's on the builders' traces
+//! `tables::trace_builder::word_walk_tests`'.
 
 use crate::block_whir::{
-    BlockFormat, BlockWhirProof, Deviations, WORD_COUNTS_UNCHECKED, prove_block_whir_with,
-    verify_block_whir,
+    self, BlockFormat, BlockWhirProof, CHIP_COUNTS_UNCHECKED, Deviations, WORD_COUNTS_UNCHECKED,
+    prove_block_whir_with, verify_block_whir,
 };
 use crate::tables::MaxRowsConfig;
 use crate::tables::fused_memory::MemoryFormat;
 use crate::test_utils::asm_elf_bytes;
+use stark::multilinear_table::batched::VerifierChecks;
 use stark::proof::options::ProofOptions;
 
 fn format(memory: MemoryFormat) -> BlockFormat {
@@ -161,4 +167,220 @@ fn a_split_or_fused_proof_is_refused_under_the_word_format() {
             "{memory:?}"
         );
     }
+}
+
+/// The chip-free programs a word block is proved of: every width, sign and
+/// alignment of the CPU's loads and stores, every instruction, the misaligned
+/// accesses one by one.
+const WORD_PROGRAMS: [&str; 11] = [
+    "fused_mem_cases",
+    "all_loadstore_32",
+    "all_instructions_64",
+    "misalign_ld",
+    "misalign_lh",
+    "misalign_lhu",
+    "misalign_lw",
+    "misalign_lwu",
+    "misalign_sd",
+    "misalign_sh",
+    "misalign_sw",
+];
+
+/// `elf`'s run built by the windowed builder under `format` (windows of 1000
+/// cycles, the small chunks), REGISTER's files the verifier's: what
+/// [`prove_built`] proves.
+fn word_build(elf: &[u8], format: &BlockFormat) -> crate::tables::trace_builder::Traces {
+    use crate::tables::trace_builder::WindowedTraceBuilder;
+    use crate::tables::trace_builder::in_row_forgery_tests::with_verifier_files;
+    let program = executor::elf::Elf::load(elf).expect("the ELF loads");
+    let logs = executor::vm::execution::Executor::new(&program, Vec::new())
+        .expect("the executor")
+        .run()
+        .expect("the run")
+        .logs;
+    let mut builder = WindowedTraceBuilder::new(&program, &[], &MaxRowsConfig::small())
+        .and_then(|b| b.register_format(format.registers))
+        .and_then(|b| b.memw_aligned_order(format.memw_aligned))
+        .map(|b| b.keccak_rnd_form(format.keccak_rnd))
+        .and_then(|b| b.memory_format(format.memory))
+        .expect("the builder");
+    let window = 1000;
+    let body = logs.len() - 1;
+    let cut = body - body % window;
+    let mut chunks = Vec::new();
+    for w in logs[..cut].chunks(window) {
+        chunks.extend(builder.push(w).expect("a window"));
+    }
+    let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+    traces
+        .insert_streamed(chunks)
+        .expect("every chunk has a placeholder");
+    with_verifier_files(&program, &mut traces);
+    traces
+}
+
+/// `traces` proved as a block under `format`: the prover takes any trace.
+fn prove_built(
+    elf: &[u8],
+    traces: &mut crate::tables::trace_builder::Traces,
+    format: &BlockFormat,
+) -> Result<BlockWhirProof, crate::Error> {
+    let program = executor::elf::Elf::load(elf).expect("the ELF loads");
+    let options = super::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
+    let mut stamps = block_whir::BlockStamps::default();
+    block_whir::prove_traces(
+        &program,
+        elf,
+        traces,
+        &ProofOptions::default_test_options(),
+        format,
+        &options,
+        &Deviations::default(),
+        true,
+        &|_, _| {},
+        &mut stamps,
+    )
+}
+
+/// The verifier's verdict on `proof` under `format` and `checks`.
+fn verdict(
+    proof: &BlockWhirProof,
+    elf: &[u8],
+    format: &BlockFormat,
+    checks: VerifierChecks,
+) -> Result<Result<(), block_whir::BlockRefusal>, String> {
+    block_whir::verify_block_whir_traced(
+        proof,
+        elf,
+        &ProofOptions::default_test_options(),
+        format,
+        false,
+        checks,
+    )
+    .map_err(|e| format!("{e:?}"))
+}
+
+/// ★ Word blocks prove and verify: every chip-free program, proved as a
+/// streamed block under the word memory format (the production register
+/// format and MEMW_A order; the prove's own walk, record mode and walkers),
+/// verifies under it and under neither the split nor the fused format. No
+/// retired table is stated and no fused or MEMW_W table; the word tables are
+/// the ones the walk makes of the run (each family's count the windowed
+/// build's), so every load and store is one row of one of them; on
+/// `fused_mem_cases` every CPU family holds a table.
+#[test]
+fn a_word_block_proves_and_verifies() {
+    let words = format(MemoryFormat::Words);
+    for name in WORD_PROGRAMS {
+        let elf = asm_elf_bytes(name);
+        let proof = prove(&elf, &words);
+        assert!(verifies(&proof, &elf, &words), "{name}");
+        for other in [MemoryFormat::Split, MemoryFormat::Fused] {
+            assert!(
+                !verifies(&proof, &elf, &format(other)),
+                "{name}: refused under {other:?}"
+            );
+        }
+        let c = &proof.table_counts;
+        assert_eq!(
+            (c.load, c.store, c.memw, c.memw_aligned),
+            (0, 0, 0, 0),
+            "{name}: no retired table"
+        );
+        assert_eq!(proof.fused_memory, [0, 0], "{name}");
+        assert_eq!(proof.word_memory[6], 0, "{name}: no MEMW_W");
+        let built = word_build(&elf, &words).word_counts().map(|n| n as u64);
+        assert_eq!(proof.word_memory, built, "{name}: the walk's word tables");
+        if name == "fused_mem_cases" {
+            assert!(
+                proof.word_memory[..6].iter().all(|&n| n > 0),
+                "{name}: {:?}",
+                proof.word_memory
+            );
+        }
+        println!("WORD BLOCK {name}: word tables {:?}", proof.word_memory);
+    }
+}
+
+/// ★ A word block whose first row of each CPU word family is moved four
+/// cycles later (its dispatch then names no CPU row, its tokens no word's
+/// timestamp), proved from the built traces, is refused by the bus balance,
+/// and verifies with that one check off: nothing but the balance reads the
+/// move. The honest build proves and verifies.
+#[test]
+fn a_word_block_with_a_moved_word_row_is_refused_by_the_balance_alone() {
+    use crate::tables::{mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew};
+    let words = format(MemoryFormat::Words);
+    let elf = asm_elf_bytes("fused_mem_cases");
+    let mut honest = word_build(&elf, &words);
+    let proof = prove_built(&elf, &mut honest, &words).expect("the honest build proves");
+    assert!(verifies(&proof, &elf, &words), "the honest build verifies");
+    let timestamps = [
+        mem_load8::cols::TIMESTAMP,
+        mem_store8::cols::TIMESTAMP,
+        mem_loadw::cols::TIMESTAMP,
+        mem_storew::cols::TIMESTAMP,
+        mem_load2w::cols::TIMESTAMP,
+        mem_store2w::cols::TIMESTAMP,
+    ];
+    let mut wrong = Vec::new();
+    for (family, &ts) in timestamps.iter().enumerate() {
+        let mut forged = word_build(&elf, &words);
+        let table = &mut forged.word_tables[family][0];
+        let moved = table.get_main(0, ts).canonical_u64() + 16;
+        table
+            .main_table
+            .set(0, ts, crate::tables::types::FE::from(moved));
+        let proof = prove_built(&elf, &mut forged, &words).expect("the forged build proves");
+        let all = verdict(&proof, &elf, &words, VerifierChecks::ALL);
+        let off = verdict(
+            &proof,
+            &elf,
+            &words,
+            VerifierChecks {
+                balance: false,
+                ..VerifierChecks::ALL
+            },
+        );
+        let named = matches!(
+            &all,
+            Ok(Err(block_whir::BlockRefusal::Proof(e))) if *e == multilinear::Error::BusImbalance
+        );
+        if !(named && matches!(&off, Ok(Ok(())))) {
+            wrong.push(format!(
+                "{}: every check {all:?} · without the balance {off:?}",
+                block_whir::WORD_TABLES[family]
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// ★ A hand-built word block stating a chip's table is refused by the chip
+/// rule alone: an honest chip-free build with one MEMW_W table of padding
+/// rows added (every message and token at multiplicity zero, so every bus
+/// still balances) proves, and the verifier refuses it for stating MEMW_W;
+/// with the chip rule taken out (a control mutant) it verifies. The verifier
+/// does not leave a chip's table under the word format to the bus.
+#[test]
+fn a_word_block_stating_a_chip_table_is_refused_by_the_chip_rule_alone() {
+    let words = format(MemoryFormat::Words);
+    let elf = asm_elf_bytes("fused_mem_cases");
+    let mut forged = word_build(&elf, &words);
+    forged.word_tables[6] = vec![crate::tables::memw_w::generate_memw_w_trace_segments_as(
+        &[],
+        crate::tables::gpack::TraceForm::Wide,
+    )];
+    assert_eq!(forged.word_counts()[6], 1);
+    let proof = prove_built(&elf, &mut forged, &words).expect("the forged build proves");
+    assert_eq!(proof.word_memory[6], 1, "the proof states one MEMW_W table");
+    let refused = verify_block_whir(&proof, &elf, &ProofOptions::default_test_options(), &words);
+    assert!(
+        matches!(&refused, Err(crate::Error::InvalidTableCounts(why)) if why.contains("no MEMW_W table")),
+        "refused by the chip rule: {refused:?}"
+    );
+    CHIP_COUNTS_UNCHECKED.with(|c| c.set(true));
+    let control = verifies(&proof, &elf, &words);
+    CHIP_COUNTS_UNCHECKED.with(|c| c.set(false));
+    assert!(control, "without the chip rule the forged block verifies");
 }

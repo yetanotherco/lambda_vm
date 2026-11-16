@@ -352,7 +352,10 @@ fn walked_from_history_with(
                     tampered.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 let last = (fast.pc() == 0)
-                    .then(|| fast.take_history_final().map(Box::new))
+                    .then(|| {
+                        fast.take_history_final()
+                            .map(crate::tables::trace_builder::windowed::parallel::RunEnd::boxed)
+                    })
                     .flatten();
                 let sent = tx.send(ExecWindow {
                     logs: Arc::new(logs),

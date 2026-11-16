@@ -435,7 +435,10 @@ fn built(
             fast.enable_history().expect("history mode");
             while let Some((logs, history)) = fast.resume_history(window).expect("the run") {
                 let last = (fast.pc() == 0)
-                    .then(|| fast.take_history_final().map(Box::new))
+                    .then(|| {
+                        fast.take_history_final()
+                            .map(crate::tables::trace_builder::windowed::parallel::RunEnd::boxed)
+                    })
                     .flatten();
                 let sent = tx.send(ExecWindow {
                     logs: Arc::new(logs),

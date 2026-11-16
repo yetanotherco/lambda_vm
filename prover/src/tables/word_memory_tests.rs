@@ -3328,17 +3328,27 @@ fn the_census_refuses_each_mutant() {
 
 // ---- the format ----
 
-/// ★ The word memory format is the verifier's to read, and the windowed
-/// build's and its regenerator's to build, but no prove's yet: the format
-/// check takes it (the verifier frames a statement under it), the windowed
-/// build's setters take it, and the prove's entry refuses it. Under it the
-/// fused pair is `[0, 0]`; its statement words are its form word and each
-/// word family's count.
+/// ★ The word memory format is the verifier's to read and the prover's to
+/// make under the in-row register format: the format check takes it (the
+/// verifier frames a statement under it), the windowed build's setters take
+/// it, and the prove refuses it at its entry under the 32-bit register
+/// format, whose register accesses MEMW_R cannot take go to tables the format
+/// retires. Under it the fused pair is `[0, 0]`; its statement words are its
+/// form word and each word family's count.
 #[test]
-fn the_word_format_is_refused_at_the_prove() {
-    let words = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
+fn the_word_format_is_proved_under_the_in_row_registers_alone() {
+    let words = block_whir::BlockFormat {
+        registers: crate::tables::register::RegisterFormat::Tokens32,
+        ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
+    };
     assert!(block_whir::check_memory_format(&words).is_ok());
-    assert!(crate::tables::fused_memory::refuse_unbuilt(MemoryFormat::Words).is_err());
+    assert!(block_whir::refuse_unprovable(&words).is_err());
+    let in_row = block_whir::BlockFormat::production().with_memory(MemoryFormat::Words);
+    assert!(block_whir::check_memory_format(&in_row).is_ok());
+    assert!(block_whir::refuse_unprovable(&in_row).is_ok());
+    for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
+        assert!(block_whir::refuse_unprovable(&words.with_memory(memory)).is_ok());
+    }
     assert_eq!(
         block_whir::fused_tables_under(MemoryFormat::Words, [0, 0]).ok(),
         Some([0, 0])
@@ -3346,10 +3356,8 @@ fn the_word_format_is_refused_at_the_prove() {
     for stated in [[1, 0], [0, 1]] {
         assert!(block_whir::fused_tables_under(MemoryFormat::Words, stated).is_err());
     }
-    for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
-        assert!(crate::tables::fused_memory::refuse_unbuilt(memory).is_ok());
-    }
-    // The prove refuses it at its entry.
+    // The prove refuses the 32-bit register format at its entry, before
+    // anything runs.
     let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
     let refused = block_whir::prove_block_whir_with(
         &elf,
@@ -3359,7 +3367,11 @@ fn the_word_format_is_refused_at_the_prove() {
         &crate::tests::block_whir_tests::streamed(crate::tables::MaxRowsConfig::small(), 3, 9),
         &block_whir::Deviations::default(),
     );
-    assert!(refused.is_err(), "the prover refuses the word format");
+    assert!(
+        matches!(&refused, Err(crate::Error::Prover(why)) if why.contains("in-row register format")),
+        "the prover refuses the word format's 32-bit registers: {:?}",
+        refused.err()
+    );
     // The windowed build and its regenerator take it at their setters.
     use crate::tables::trace_builder::{RegenBuilder, WindowedTraceBuilder};
     let program = executor::elf::Elf::load(&elf).expect("the ELF loads");

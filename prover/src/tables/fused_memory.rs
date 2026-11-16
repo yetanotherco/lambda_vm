@@ -50,22 +50,10 @@ pub enum MemoryFormat {
     /// ([`super::word_memory`]): PAGE_W mints a page's words, the CPU's loads
     /// and stores are its six word tables' ([`super::word_cpu`]), MEMW_W takes
     /// the chips' word messages, and LOAD, STORE, MEMW_A, MEMW, MEM_LOAD and
-    /// MEM_STORE are not part of the block. The verifier frames a statement
-    /// under it and the windowed build builds it; the prove does not take it
-    /// yet ([`refuse_unbuilt`]).
+    /// MEM_STORE are not part of the block. The prover takes it for a run
+    /// that calls no chip, under the in-row register format; the verifier
+    /// refuses every chip's table under it.
     Words,
-}
-
-/// Refuses a memory format no block prove makes yet: the word memory format,
-/// whose record mode is not built. The prove's entry asks it before anything
-/// is laid out; the windowed build and the verifier do not.
-pub(crate) fn refuse_unbuilt(memory: MemoryFormat) -> Result<(), crate::Error> {
-    match memory {
-        MemoryFormat::Words => Err(crate::Error::Prover(
-            "the word memory format is not built yet".to_string(),
-        )),
-        MemoryFormat::Split | MemoryFormat::Fused => Ok(()),
-    }
 }
 
 /// The columns a fused table's memory check reads.
