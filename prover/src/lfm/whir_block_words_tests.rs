@@ -1218,6 +1218,8 @@ fn assert_leaves_claim_the_block(
 #[test]
 #[ignore = "proves small word-format blocks and executes their leaves; box tier"]
 fn word_block_leaves_execute_and_close_the_bus() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let format = words_format();
     let private: Vec<u8> = (0..300u32).map(|i| (i * 7 + 3) as u8).collect();
     let runs: [(&str, &str, &[u8]); 6] = [

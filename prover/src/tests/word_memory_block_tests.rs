@@ -100,6 +100,8 @@ impl BeforeWords {
 /// group index).
 #[test]
 fn a_split_and_a_fused_proof_are_the_bytes_before_the_word_counts_then_zeros() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     for (name, memory) in [
         "fused_mem_cases",
         "test_commit_split",
@@ -191,6 +193,8 @@ fn a_split_or_fused_proof_stating_word_tables_is_refused() {
 /// one fused tables (both of `fused_mem_cases`).
 #[test]
 fn a_split_or_fused_proof_is_refused_under_the_word_format() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let elf = asm_elf_bytes("fused_mem_cases");
     for (memory, why) in [
         (MemoryFormat::Split, "states no LOAD table"),
@@ -597,6 +601,8 @@ fn a_word_block_with_a_moved_copy_row_is_refused_by_the_balance_alone() {
 /// the run's.
 #[test]
 fn a_word_block_calling_keccak256_and_ecrec_proves_and_verifies() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let words = format(MemoryFormat::Words);
     for name in ["test_keccak256", "test_ecrec"] {
         let elf = asm_elf_bytes(name);
@@ -975,6 +981,8 @@ fn a_word_block_with_cut_word_families_proves_and_verifies() {
 /// runs that call COPY, keccak256 and ECREC.
 #[test]
 fn a_word_block_with_streamed_word_families_states_the_finish_built_block() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let words = format(MemoryFormat::Words);
     let tiny = MaxRowsConfig {
         mem_load: 4,

@@ -556,6 +556,8 @@ fn word_configs() -> Vec<(&'static str, Configure)> {
 /// AIR's width in the word format's set the verifier builds.
 #[test]
 fn under_the_word_format_the_stream_is_the_monolithic_finish() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     for name in [
         "fused_mem_cases",
         "all_loadstore_32",

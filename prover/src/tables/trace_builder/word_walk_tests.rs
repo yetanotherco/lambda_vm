@@ -556,6 +556,8 @@ fn keccak256_calls_build_balanced_traces_under_the_word_walk() {
 /// the keys committed are the split build's.
 #[test]
 fn ecrec_calls_build_balanced_traces_under_the_word_walk() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let name = "test_ecrec";
     let (program, logs) = run(name);
     let split = split_build(&program, &logs);
@@ -916,6 +918,8 @@ fn word_record_build_with(
 /// sequential windowed build makes, and they balance every bus.
 #[test]
 fn record_mode_under_the_word_format_builds_the_windowed_tables() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     for name in [
         "fused_mem_cases",
         "cross_4gib",
@@ -1152,6 +1156,8 @@ const STREAMED: [&str; 6] = [
 /// in every run. Off (the default), none is.
 #[test]
 fn streamed_word_families_are_the_finish_built_tables() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let max_rows = tiny();
     let mut streamed = 0usize;
     for name in STREAMED {
@@ -1188,6 +1194,8 @@ fn streamed_word_families_are_the_finish_built_tables() {
 /// they balance every bus.
 #[test]
 fn record_mode_with_streamed_word_families_builds_the_finish_built_tables() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let max_rows = tiny();
     for name in STREAMED {
         let (program, logs) = run(name);
