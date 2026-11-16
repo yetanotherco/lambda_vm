@@ -174,19 +174,25 @@ const STACK_CARD_BYTES_PER_CELL: u64 = 20;
 /// (the same probe: 8.05 → 23.45 GiB through its first group's commit).
 const GROUP_COMMIT_ROOM: u64 = 19 << 30;
 
-/// Whether level `level`'s prepared stacks go on the host: when the card's
-/// ledger budget, read now, cannot hold them beside a group's commit, or there
-/// is no card. Printed. A prover's choice: the same roots either way.
-fn stacks_on_host(program: &LfmProgram, level: usize) -> bool {
-    let groups = super::wlfm::program_prep_groups(program)
+/// A program's prepared cells: its prepared stacks' columns at their padded
+/// heights, the fixed chips' and the lean tables'.
+pub(crate) fn prepared_cells(program: &LfmProgram) -> u64 {
+    super::wlfm::program_prep_groups(program)
         .into_iter()
         .map(|g| (g.width * g.padded_rows) as u64)
         .chain(
             super::b3l_tables::b3l_prep_groups(program)
                 .into_iter()
                 .map(|g| (g.width * g.padded_rows) as u64),
-        );
-    let cells: u64 = groups.sum();
+        )
+        .sum()
+}
+
+/// Whether level `level`'s prepared stacks go on the host: when the card's
+/// ledger budget, read now, cannot hold them beside a group's commit, or there
+/// is no card. Printed. A prover's choice: the same roots either way.
+pub(crate) fn stacks_on_host(program: &LfmProgram, level: usize) -> bool {
+    let cells = prepared_cells(program);
     let need = cells.saturating_mul(STACK_CARD_BYTES_PER_CELL);
     let budget = multilinear::gpu::reserve_budget();
     let host = budget == 0 || need > budget.saturating_sub(GROUP_COMMIT_ROOM);
@@ -201,7 +207,11 @@ fn stacks_on_host(program: &LfmProgram, level: usize) -> bool {
     host
 }
 
-fn build_level(program: LfmProgram, family: WlfmFamily, on_host: bool) -> Result<Level, String> {
+pub(crate) fn build_level(
+    program: LfmProgram,
+    family: WlfmFamily,
+    on_host: bool,
+) -> Result<Level, String> {
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
     let build = build_wlfm_under(&program, hasher, LEVEL_RATE, level_levers(family), on_host)?;
     Ok(Level { program, build })

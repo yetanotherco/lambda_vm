@@ -506,6 +506,13 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
 /// chain's length; 2), `RTA_RUNS` (runs in this process, the first a warm-up;
 /// 1). Prints `RTA …` lines, each run's tagged `run k`; everything is verified
 /// off the clock.
+///
+/// `RTA_L1_GROUPS=k1,k2,…` measures level 1's prove rate at a chosen size
+/// instead ([`rta_first_groups`]): the base proved once, then one level-1 run
+/// an entry over the base's first `k` groups (the first entry a warm-up when
+/// there are several); `RTA_L1_STACKS` (`card`, `host`, or unset: where the
+/// card holds them) places its prepared stacks. `RTA_BESIDE`,
+/// `RTA_BUILD_BESIDE`, `RTA_LEVELS` and `RTA_RUNS` do not apply to it.
 #[test]
 #[ignore = "a real block and its levels: box only"]
 fn rta_a_real_block_through_its_levels() {
@@ -553,6 +560,24 @@ fn rta_a_real_block_through_its_levels() {
         String::from_utf8_lossy(&crate::block_whir::block_format_tag(&cfg.format)),
         cfg.format.group_polys
     );
+    if let Ok(list) = std::env::var("RTA_L1_GROUPS") {
+        let ks: Vec<usize> = list
+            .split(',')
+            .map(|k| match k.trim().parse::<usize>() {
+                Ok(k) if k > 0 => k,
+                _ => panic!("RTA_L1_GROUPS is a list of positive group counts, not {list:?}"),
+            })
+            .collect();
+        let stacks = match std::env::var("RTA_L1_STACKS").as_deref().map(str::trim) {
+            Err(_) | Ok("") | Ok("auto") => None,
+            Ok("card") => Some(false),
+            Ok("host") => Some(true),
+            Ok(other) => panic!("RTA_L1_STACKS is card, host or auto, not {other}"),
+        };
+        rta_first_groups(&elf, &input, &opts, &cfg, family, &ks, stacks);
+        println!("RTA DONE");
+        return;
+    }
     for k in 0..runs.max(1) {
         println!(
             "RTA RUN {k}{}",
@@ -663,4 +688,349 @@ fn rta_one_run(
     .is_ok();
     println!("RTA VERIFIED: base {ok_base} · levels {ok_levels} · block {ok_last}");
     assert!(ok_base && ok_levels && ok_last, "everything verifies");
+}
+
+/// One run of level 1 over a block's first `k` groups
+/// ([`WhirBlockPlan::first_groups_program_marked`]): its level, its proof, where
+/// its prepared stacks went, and its seconds by part.
+struct FirstGroupsRun {
+    level: super::levels::Level,
+    proof: super::wlfm::WlfmProof,
+    on_host: bool,
+    prepared_cells: u64,
+    emit: f64,
+    arena: f64,
+    build: f64,
+    execute: f64,
+    fill: f64,
+    /// The fill's split: the fixed chips' traces, the lean tables'.
+    fill_split: (f64, f64),
+    prove: f64,
+    stamps: super::wlfm::WlfmStamps,
+}
+
+/// ★ Level 1 over the first `k` groups of `plan`'s block, as the levels'
+/// prover runs a level: emitted, its prepared stacks built (on the host when
+/// `stacks` is `Some(true)`, on the card when `Some(false)`, where the card
+/// holds them when `None`), executed over the base proof's witness, filled,
+/// and proved streamed. Not verified here.
+fn prove_first_groups(
+    plan: &WhirBlockPlan,
+    proof: &BlockWhirProof,
+    family: WlfmFamily,
+    k: usize,
+    stacks: Option<bool>,
+) -> Result<FirstGroupsRun, String> {
+    use super::levels::{build_level, prefix_check, prepared_cells, stacks_on_host};
+    use super::wlfm::{WlfmProving, prove_wlfm_traces_as, take_wlfm_stamps};
+    use std::time::Instant;
+    let t = Instant::now();
+    let (program, _) = plan.first_groups_program_marked(k)?;
+    let emit = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let arenas = super::whir_block::first_groups_arena(plan, proof, k)?;
+    let arena = t.elapsed().as_secs_f64();
+    let cells = prepared_cells(&program);
+    let on_host = stacks.unwrap_or_else(|| stacks_on_host(&program, 1));
+    let t = Instant::now();
+    let level = build_level(program, family, on_host)?;
+    let build = t.elapsed().as_secs_f64();
+    let hasher = level.build.artifacts.hasher;
+    let t = Instant::now();
+    let execution = execute(&level.program, &arenas, &hasher)
+        .map_err(|e| format!("the first {k} groups' level executes: {e:?}"))?;
+    let execute_secs = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let filled = super::proof::lfm_fill_executed_under(
+        &level.program,
+        execution,
+        hasher,
+        execute_secs,
+        &Vec::new(),
+    );
+    let fill = t.elapsed().as_secs_f64();
+    let fill_split = super::proof::take_fill_split().unwrap_or_default();
+    let _ = take_wlfm_stamps();
+    let t = Instant::now();
+    let proof = prove_wlfm_traces_as(&level.build, filled, prefix_check(), WlfmProving::Streamed)
+        .map_err(|e| format!("the first {k} groups' level proves: {e}"))?;
+    let prove = t.elapsed().as_secs_f64();
+    let stamps = take_wlfm_stamps().unwrap_or_default();
+    Ok(FirstGroupsRun {
+        level,
+        proof,
+        on_host,
+        prepared_cells: cells,
+        emit,
+        arena,
+        build,
+        execute: execute_secs,
+        fill,
+        fill_split,
+        prove,
+        stamps,
+    })
+}
+
+/// This process's resident and peak resident memory, in GiB (Linux; `NaN`
+/// elsewhere).
+fn rss_gib() -> (f64, f64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let read = |key: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|v| v.split_whitespace().next()?.parse::<f64>().ok())
+            .map_or(f64::NAN, |kb| kb / (1u64 << 20) as f64)
+    };
+    (read("VmRSS:"), read("VmHWM:"))
+}
+
+/// [`rta_a_real_block_through_its_levels`] under `RTA_L1_GROUPS`: the base
+/// proved once (its prepared roots handed to the plan, as the driver does)
+/// and verified, then one run of level 1 over the base's first `k` groups a
+/// list entry ([`prove_first_groups`]). Each run prints `RTA L1 RESULT` (its
+/// sizes, its seconds, the card prove — host preparation, phase A and phase
+/// B — and its rate a committed main cell and a compression), `RTA L1 SPLIT`
+/// and one `RTA L1 GROUP` line a group of the level, then, off the clock,
+/// `RTA L1 VERIFIED`: the level's proof verifies and its last word is the
+/// host's sum of `p/q` over those groups' bus outputs in the base proof.
+#[allow(clippy::too_many_arguments)]
+fn rta_first_groups(
+    elf: &[u8],
+    input: &[u8],
+    opts: &ProofOptions,
+    cfg: &super::whir_block_tree::WhirTreeConfig,
+    family: WlfmFamily,
+    ks: &[usize],
+    stacks: Option<bool>,
+) {
+    use std::time::Instant;
+    let roots: std::sync::Mutex<Option<Vec<crate::block_whir::PreparedRoots>>> =
+        std::sync::Mutex::new(None);
+    let observe = |_: crate::block_whir::BlockStatement<'_>,
+                   prepared: &[crate::block_whir::PreparedRoots]| {
+        *roots.lock().unwrap_or_else(|e| e.into_inner()) = Some(prepared.to_vec());
+    };
+    let on_group = |_: stark::multilinear_block::GroupOpened<'_, _, _>| {};
+    let t = Instant::now();
+    let prove_base = || {
+        crate::block_whir::prove_block_whir_observed_groups(
+            elf,
+            input,
+            opts,
+            &cfg.format,
+            &cfg.options,
+            &observe,
+            &on_group,
+        )
+    };
+    let (proof, s) = match family {
+        WlfmFamily::P1 => prove_base(),
+        WlfmFamily::B3 => crate::base_only::with_blake3_levels(prove_base),
+    }
+    .unwrap_or_else(|e| panic!("the base proves: {e}"));
+    let base = t.elapsed().as_secs_f64();
+    println!(
+        "RTA L1 BASE: prove {base:.3}s · execute {:.3}s · build {:.3}s · phase A {:.3}s · phase B \
+         {:.3}s",
+        s.execute, s.build, s.phase_a, s.phase_b
+    );
+    let ok_base = crate::base_only::with_permit(|| {
+        crate::block_whir::verify_block_whir(&proof, elf, opts, &cfg.format)
+    })
+    .expect("verify runs");
+    let roots = roots
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner())
+        .expect("the base stated");
+    let t = Instant::now();
+    let plan = level_plan(
+        elf,
+        opts,
+        &cfg.format,
+        proof.statement(),
+        family,
+        Some(&roots),
+    )
+    .unwrap_or_else(|e| panic!("the plan derives: {e}"));
+    println!(
+        "RTA L1 PLAN: base verified {ok_base} · base groups {} · planned {:.3}s",
+        plan.num_groups(),
+        t.elapsed().as_secs_f64()
+    );
+    assert!(ok_base, "the base verifies");
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    for (run, &k) in ks.iter().enumerate() {
+        let warm = if run == 0 && ks.len() > 1 {
+            " (warm-up)"
+        } else {
+            ""
+        };
+        let r = prove_first_groups(&plan, &proof, family, k, stacks)
+            .unwrap_or_else(|e| panic!("run {run}: {e}"));
+        let a = &r.level.build.artifacts;
+        let cells: usize = a.shapes(&a.airs()).iter().map(|&(w, v)| w << v).sum();
+        let group_cells: usize = r.stamps.groups.iter().map(|g| g.cells).sum();
+        let compressions = r.level.program.groups.b3l.real_rows;
+        let instructions = r.level.program.instrs.len();
+        let st = &r.stamps;
+        let card = st.prep + st.phase_a + st.phase_b;
+        let peak = st
+            .groups
+            .iter()
+            .flat_map(|g| {
+                [
+                    g.commit_reserved,
+                    g.argue_reserved,
+                    g.open_reserved,
+                    g.transition_reserved,
+                ]
+            })
+            .chain([st.card_reserved_at_start])
+            .max()
+            .unwrap_or(0);
+        let (rss, hwm) = rss_gib();
+        println!(
+            "RTA L1 RESULT k {k} · run {run}{warm} · base groups {k} of {} · level groups {} · \
+             instructions {instructions} · compressions {compressions} · committed cells {cells} \
+             · group cells {group_cells} · prepared cells {} · stacks {} · emit {:.3}s · arena \
+             {:.3}s · build {:.3}s · execute {:.3}s · fill {:.3}s · prove {:.3}s · card prove \
+             {card:.3}s (prep {:.3}s · phase A {:.3}s · phase B {:.3}s) · ns a cell {:.4} · us a \
+             compression {:.4} · execute ns an instruction {:.2} · card budget {:.2} GiB · ledger \
+             peak {:.2} GiB · VmRSS {rss:.2} GiB · VmHWM {hwm:.2} GiB",
+            plan.num_groups(),
+            a.sizes.len(),
+            r.prepared_cells,
+            if r.on_host { "host" } else { "card" },
+            r.emit,
+            r.arena,
+            r.build,
+            r.execute,
+            r.fill,
+            r.prove,
+            st.prep,
+            st.phase_a,
+            st.phase_b,
+            1e9 * card / cells as f64,
+            1e6 * card / compressions.max(1) as f64,
+            1e9 * r.execute / instructions.max(1) as f64,
+            gib(st.card_budget),
+            gib(peak),
+        );
+        println!(
+            "RTA L1 SPLIT k {k} · run {run} · fill chips {:.3}s · fill lean {:.3}s · prep parts: \
+             merge {:.3}s airs {:.3}s pairs {:.3}s check {:.3}s layouts {:.3}s tables {:.3}s",
+            r.fill_split.0,
+            r.fill_split.1,
+            st.prep_parts[0],
+            st.prep_parts[1],
+            st.prep_parts[2],
+            st.prep_parts[3],
+            st.prep_parts[4],
+            st.prep_parts[5],
+        );
+        for (g, s) in st.groups.iter().enumerate() {
+            println!(
+                "RTA L1 GROUP k {k} · run {run} · group {g} · tables {} · polys {} · cells {} · \
+                 up A {:.3}s (paid {:.3}) · commit {:.3}s · up B {:.3}s · argue {:.3}s · encode \
+                 {:.3}s · open {:.3}s · turn {:.3}-{:.3}s · GiB promised: commit {:.2}/{:.2} · \
+                 argue {:.2}/{:.2} · open {:.2}",
+                s.tables,
+                s.polys,
+                s.cells,
+                s.upload_a,
+                s.upload_paid,
+                s.commit,
+                s.upload_b,
+                s.argue,
+                s.encode,
+                s.open,
+                s.start_b,
+                s.end_b,
+                gib(s.commit_base),
+                gib(s.commit_reserved),
+                gib(s.argue_base),
+                gib(s.argue_reserved),
+                gib(s.open_reserved),
+            );
+        }
+        // Off the clock: the level verifies, and its words carry the base
+        // groups' bus sum.
+        let words = &r.proof.public_words;
+        let ok_proof = verify_wlfm(a, &r.proof, words).is_ok();
+        let sum = super::whir_block::first_groups_bus_sum(&plan, &proof, k)
+            .unwrap_or_else(|e| panic!("the host's sum: {e}"));
+        let ok_sum = words.len() == plan.child_layout().total()
+            && words.last().is_some_and(|(_, w)| *w == sum);
+        println!("RTA L1 VERIFIED k {k} · run {run} · proof {ok_proof} · sum {ok_sum}");
+        assert!(ok_proof && ok_sum, "the first {k} groups' level verifies");
+    }
+}
+
+/// ★ Level 1 over a small BLAKE3 block's first groups (the timing harness's
+/// `RTA_L1_GROUPS` program): over one group, its prepared stacks on the host,
+/// and over two, where the card holds them, it proves under the BLAKE3 family,
+/// verifies, and publishes as its last word the host's sum of `p/q` over those
+/// groups' bus outputs; a changed sum word is refused. Over every group its
+/// sum is the closed program's own with the COMMIT-bus target left out; no
+/// groups, or more than the block has, are refused at emission.
+#[test]
+#[ignore = "proves a small BLAKE3 block and a level over it; box tier"]
+fn the_first_groups_level_proves_and_publishes_their_bus_sum() {
+    use super::whir_block::{first_groups_arena, first_groups_bus_sum};
+    let format = b3_format();
+    let (elf, proof) = b3_small_block("test_commit_4", &format);
+    let plan = b3_plan(&elf, &proof, &format);
+    let n = plan.num_groups();
+    assert!(n >= 2, "the small block has {n} groups");
+    assert!(plan.first_groups_program_marked(0).is_err());
+    assert!(plan.first_groups_program_marked(n + 1).is_err());
+    for (k, stacks) in [(1, Some(true)), (2, None)] {
+        let run = prove_first_groups(&plan, &proof, WlfmFamily::B3, k, stacks)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let words = &run.proof.public_words;
+        let artifacts = &run.level.build.artifacts;
+        verify_wlfm(artifacts, &run.proof, words)
+            .unwrap_or_else(|e| panic!("the first {k} groups' level verifies: {e}"));
+        assert_eq!(words.len(), plan.child_layout().total());
+        let sum = first_groups_bus_sum(&plan, &proof, k).expect("the host's sum");
+        assert_eq!(words.last().expect("a sum").1, sum, "k = {k}: the bus sum");
+        let mut forged = run.proof.clone();
+        forged.public_words.last_mut().expect("a sum").1[0] += crate::tables::types::FE::one();
+        assert!(
+            verify_wlfm(artifacts, &forged, &forged.public_words).is_err(),
+            "k = {k}: a changed sum word is refused"
+        );
+        println!(
+            "LEVEL B3 FIRST {k}: {} level groups · {} instructions · {} lean compressions · \
+             stacks on the {} · prove {:.3}s",
+            artifacts.sizes.len(),
+            run.level.program.instrs.len(),
+            run.level.program.groups.b3l.real_rows,
+            if run.on_host { "host" } else { "card" },
+            run.prove
+        );
+    }
+    // Over every group, executed only: the same sum as the closed program's
+    // with the target left out and the bus open.
+    let (every, _) = plan.first_groups_program_marked(n).expect("emits");
+    let hasher =
+        every.hasher(<crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::SOCKET);
+    let arenas = first_groups_arena(&plan, &proof, n).expect("the arena");
+    let exec = execute(&every, &arenas, &hasher).expect("executes");
+    let sum = first_groups_bus_sum(&plan, &proof, n).expect("the host's sum");
+    assert_eq!(exec.public_words.last().expect("a sum").1, sum);
+    let open = plan
+        .closed_block_program_with(
+            LeafChecks {
+                prepared: true,
+                target: false,
+            },
+            false,
+        )
+        .expect("emits");
+    let closed_arenas = block_leaf_arena(&plan, &proof, 0).expect("the arena");
+    let exec = execute(&open, &closed_arenas, &hasher).expect("executes");
+    assert_eq!(exec.public_words.last().expect("a sum").1, sum);
 }
