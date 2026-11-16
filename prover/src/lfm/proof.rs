@@ -250,6 +250,10 @@ pub(crate) struct LfmFilled {
     /// The program's lean BLAKE3 tables, filled: the block prover's (W-LFM).
     /// Present refuses the STARK prove.
     b3l: Option<super::b3l_tables::B3lTraces>,
+    /// The chips held as their records (the W-LFM prover's, under its
+    /// chip-records knob), their own tables in `traces` empty. Present refuses
+    /// the STARK prove.
+    chips: Option<super::chip_records::LfmChipValues>,
 }
 
 /// The host half of [`lfm_prove_with_residency`]: execute `program` over
@@ -313,6 +317,22 @@ pub(crate) fn lfm_fill_executed_under(
     execute_secs: f64,
     plan: &super::merge::MergePlan,
 ) -> LfmFilled {
+    lfm_fill_executed_holding(program, execution, hasher, execute_secs, plan, false)
+}
+
+/// [`lfm_fill_executed_under`] with, when `hold_chips` (the W-LFM prover's
+/// chip-records knob) and `plan` is empty, the chips it can hold as records
+/// kept as the executor's records instead of filled
+/// ([`super::chip_records::LfmChipValues`]): their tables in the traces are
+/// empty, and only the W-LFM prove takes the result.
+pub(crate) fn lfm_fill_executed_holding(
+    program: &LfmProgram,
+    execution: LfmExecution,
+    hasher: HasherKind,
+    execute_secs: f64,
+    plan: &super::merge::MergePlan,
+    hold_chips: bool,
+) -> LfmFilled {
     let LfmExecution {
         mut records,
         public_words,
@@ -329,7 +349,12 @@ pub(crate) fn lfm_fill_executed_under(
     drop(memory);
 
     let t = Instant::now();
-    let traces = build_traces_with_merge(program, &records, hasher, plan);
+    let chips = (hold_chips && plan.is_empty())
+        .then(|| super::chip_records::LfmChipValues::take(&mut records));
+    let traces = match chips {
+        Some(_) => super::trace::build_traces_chips_held(program, &records, hasher),
+        None => build_traces_with_merge(program, &records, hasher, plan),
+    };
     let chips_secs = t.elapsed().as_secs_f64();
     let mut b3l = super::b3l_tables::build_b3l_traces(program, &b3l_records);
     drop(b3l_records);
@@ -364,6 +389,7 @@ pub(crate) fn lfm_fill_executed_under(
         fill_secs,
         exec_split,
         b3l,
+        chips,
     }
 }
 
@@ -395,6 +421,18 @@ impl LfmFilled {
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn take_b3l(&mut self) -> Option<super::b3l_tables::B3lTraces> {
         self.b3l.take()
+    }
+
+    /// The chips held as their records, moved out (the W-LFM prover's).
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn take_chips(&mut self) -> Option<super::chip_records::LfmChipValues> {
+        self.chips.take()
+    }
+
+    /// The chips held as their records, for a test that reads or forges them.
+    #[cfg(test)]
+    pub(crate) fn chips(&self) -> Option<&super::chip_records::LfmChipValues> {
+        self.chips.as_ref()
     }
 
     /// The program's lean BLAKE3 tables, for a test that corrupts one.
@@ -455,6 +493,7 @@ impl LfmFilled {
             fill_secs,
             exec_split,
             b3l,
+            chips,
         } = self;
         same_hasher(artifacts.hasher, hasher)?;
         // ⛔ The STARK chip set has no lean BLAKE3 tables: a program that
@@ -464,6 +503,13 @@ impl LfmFilled {
         if b3l.is_some() {
             return Err(LfmProveError::Prover(ProvingError::WrongParameter(
                 "lean BLAKE3 compressions: only the block prover (W-LFM) proves them".into(),
+            )));
+        }
+        // ⛔ Chips held as records have empty traces here: only the W-LFM
+        // prove fills their tables.
+        if chips.is_some() {
+            return Err(LfmProveError::Prover(ProvingError::WrongParameter(
+                "chips held as records: only the block prover (W-LFM) proves them".into(),
             )));
         }
         // The domains and twiddles this proof's tables need, built before it

@@ -103,7 +103,7 @@ fn program(flags_last: u8) -> LfmProgram {
     compile(b.finish())
 }
 
-fn honest() -> LfmProgram {
+pub(super) fn honest() -> LfmProgram {
     program(crypto::hash::blake3::chain::FLAGS_ONE_BLOCK as u8)
 }
 

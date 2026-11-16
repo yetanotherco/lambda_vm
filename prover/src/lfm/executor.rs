@@ -85,7 +85,15 @@ pub enum LfmExecError {
 }
 
 // ---- per-chip value records (values only; the program carries the rest) ----
+//
+// `BaluRow`, `XaluRow` and `SelectRow` are `#[repr(C)]` and their fields are
+// in their chips' value-column order (`chips::{balu, xalu, select}::cols`), so
+// a vector of them reads as its rows' value columns, row-major, one `u64` a
+// cell (`FE` is `repr(transparent)` over its `u64`): what the W-LFM prover
+// hands the card as the chips' records (`chip_records`). The asserts below
+// pin the layout.
 
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct BaluRow {
     pub a: FE,
@@ -94,6 +102,7 @@ pub struct BaluRow {
     pub out: FE,
 }
 
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct XaluRow {
     pub a: [FE; 3],
@@ -102,6 +111,7 @@ pub struct XaluRow {
     pub out: [FE; 3],
 }
 
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct SelectRow {
     pub bit: FE,
@@ -110,6 +120,25 @@ pub struct SelectRow {
     pub out_l: LfmWord,
     pub out_r: LfmWord,
 }
+
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<FE>() == 8 && align_of::<FE>() == 8);
+    assert!(size_of::<LfmWord>() == 32);
+    assert!(size_of::<BaluRow>() == 4 * 8 && align_of::<BaluRow>() == 8);
+    assert!(offset_of!(BaluRow, b) == 8);
+    assert!(offset_of!(BaluRow, c) == 16);
+    assert!(offset_of!(BaluRow, out) == 24);
+    assert!(size_of::<XaluRow>() == 12 * 8 && align_of::<XaluRow>() == 8);
+    assert!(offset_of!(XaluRow, b) == 3 * 8);
+    assert!(offset_of!(XaluRow, c) == 6 * 8);
+    assert!(offset_of!(XaluRow, out) == 9 * 8);
+    assert!(size_of::<SelectRow>() == 17 * 8 && align_of::<SelectRow>() == 8);
+    assert!(offset_of!(SelectRow, in_l) == 8);
+    assert!(offset_of!(SelectRow, in_r) == 5 * 8);
+    assert!(offset_of!(SelectRow, out_l) == 9 * 8);
+    assert!(offset_of!(SelectRow, out_r) == 13 * 8);
+};
 
 /// One `Instr::CapRead` row's values: the handle's tag, the index, the word
 /// read.

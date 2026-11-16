@@ -488,7 +488,19 @@ pub fn build_traces_with_merge(
     hasher: HasherKind,
     plan: &MergePlan,
 ) -> LfmTraces {
-    build_traces_merged(program, records, hasher, Walk::Parallel, plan)
+    build_traces_merged(program, records, hasher, Walk::Parallel, plan, false)
+}
+
+/// [`build_traces_with_hasher`] for the W-LFM prover with the chips it holds
+/// as records ([`super::chip_records::ChipKind`]: every chip of its set but
+/// `LFM_HASH`) left as empty tables, their records kept by the caller
+/// ([`super::chip_records::LfmChipValues`]) and no longer in `records`.
+pub(crate) fn build_traces_chips_held(
+    program: &LfmProgram,
+    records: &LfmRecords,
+    hasher: HasherKind,
+) -> LfmTraces {
+    build_traces_merged(program, records, hasher, Walk::Parallel, &Vec::new(), true)
 }
 
 /// [`build_traces_with_hasher`] with the row walk named.
@@ -503,17 +515,24 @@ pub(super) fn build_traces_walked(
     hasher: HasherKind,
     walk: Walk,
 ) -> LfmTraces {
-    build_traces_merged(program, records, hasher, walk, &Vec::new())
+    build_traces_merged(program, records, hasher, walk, &Vec::new(), false)
 }
 
-/// [`build_traces_walked`] under the merge `plan` ([`build_traces_with_merge`]).
+/// [`build_traces_walked`] under the merge `plan` ([`build_traces_with_merge`]);
+/// with `chips_held`, the chips held as records left empty
+/// ([`build_traces_chips_held`]: no merge then).
 pub(super) fn build_traces_merged(
     program: &LfmProgram,
     records: &LfmRecords,
     hasher: HasherKind,
     walk: Walk,
     plan: &MergePlan,
+    chips_held: bool,
 ) -> LfmTraces {
+    assert!(
+        !chips_held || plan.is_empty(),
+        "chips held as records are never merged"
+    );
     let g = &program.groups;
 
     let hash_modes: Vec<HashMode> = program
@@ -723,29 +742,43 @@ pub(super) fn build_traces_merged(
     // A merged chip's own table: empty, its rows are in its merged table.
     let own = |chip: MergeChip, group: &ColumnGroup| -> TraceTable<F, E> {
         let width = PartShape::of(chip).width;
-        if super::merge::group_of(plan, chip.slot()).is_some() {
+        if chips_held || super::merge::group_of(plan, chip.slot()).is_some() {
             TraceTable::new_main(Vec::new(), width, 1)
         } else {
             chip_trace(walk, group, width, fill_of(chip))
         }
     };
+    // A chip held as records: an empty table, its rows are its records'.
+    let held = |width: usize, build: &dyn Fn() -> TraceTable<F, E>| -> TraceTable<F, E> {
+        if chips_held {
+            TraceTable::new_main(Vec::new(), width, 1)
+        } else {
+            build()
+        }
+    };
 
     LfmTraces {
-        const_: chip_trace(walk, &g.const_, const_::cols::NUM_COLUMNS, |_, _| {}),
+        const_: held(const_::cols::NUM_COLUMNS, &|| {
+            chip_trace(walk, &g.const_, const_::cols::NUM_COLUMNS, |_, _| {})
+        }),
         balu: own(MergeChip::Balu, &g.balu),
-        xalu: chip_trace(walk, &g.xalu, xalu::cols::NUM_COLUMNS, |row, out| {
-            let r = &records.xalu[row];
-            out[xalu::cols::A0..xalu::cols::A0 + 3].copy_from_slice(&r.a);
-            out[xalu::cols::B0..xalu::cols::B0 + 3].copy_from_slice(&r.b);
-            out[xalu::cols::C0..xalu::cols::C0 + 3].copy_from_slice(&r.c);
-            out[xalu::cols::OUT0..xalu::cols::OUT0 + 3].copy_from_slice(&r.out);
+        xalu: held(xalu::cols::NUM_COLUMNS, &|| {
+            chip_trace(walk, &g.xalu, xalu::cols::NUM_COLUMNS, |row, out| {
+                let r = &records.xalu[row];
+                out[xalu::cols::A0..xalu::cols::A0 + 3].copy_from_slice(&r.a);
+                out[xalu::cols::B0..xalu::cols::B0 + 3].copy_from_slice(&r.b);
+                out[xalu::cols::C0..xalu::cols::C0 + 3].copy_from_slice(&r.c);
+                out[xalu::cols::OUT0..xalu::cols::OUT0 + 3].copy_from_slice(&r.out);
+            })
         }),
         select: own(MergeChip::Select, &g.select),
-        bitdec: chip_trace(walk, &g.bitdec, bitdec::cols::NUM_COLUMNS, |row, out| {
-            let r = &records.bitdec[row];
-            out[bitdec::cols::BITS0..bitdec::cols::BITS0 + 64].copy_from_slice(&r.bits);
-            out[bitdec::cols::Z] = r.z;
-            out[bitdec::cols::GINV] = r.ginv;
+        bitdec: held(bitdec::cols::NUM_COLUMNS, &|| {
+            chip_trace(walk, &g.bitdec, bitdec::cols::NUM_COLUMNS, |row, out| {
+                let r = &records.bitdec[row];
+                out[bitdec::cols::BITS0..bitdec::cols::BITS0 + 64].copy_from_slice(&r.bits);
+                out[bitdec::cols::Z] = r.z;
+                out[bitdec::cols::GINV] = r.ginv;
+            })
         }),
         hash: hash_trace(0),
         hash_tail: (1..hash_count).map(hash_trace).collect(),
@@ -766,15 +799,19 @@ pub(super) fn build_traces_merged(
         blake3: blake3_traces,
         lanes: own(MergeChip::Lanes, &g.lanes),
         hint: own(MergeChip::Hint, &g.hint),
-        public: chip_trace(walk, &g.public, public::cols::NUM_COLUMNS, |row, out| {
-            out[public::cols::V0..public::cols::V0 + 4].copy_from_slice(&records.public[row]);
+        public: held(public::cols::NUM_COLUMNS, &|| {
+            chip_trace(walk, &g.public, public::cols::NUM_COLUMNS, |row, out| {
+                out[public::cols::V0..public::cols::V0 + 4].copy_from_slice(&records.public[row]);
+            })
         }),
-        range: chip_trace(
-            walk,
-            &range_group(),
-            super::chips::range::cols::NUM_COLUMNS,
-            |_, _| {},
-        ),
+        range: held(super::chips::range::cols::NUM_COLUMNS, &|| {
+            chip_trace(
+                walk,
+                &range_group(),
+                super::chips::range::cols::NUM_COLUMNS,
+                |_, _| {},
+            )
+        }),
         keccak_rnd: keccak_rnd_traces,
         keccak_rc: keccak_rc_trace,
         bitwise: bitwise_trace,

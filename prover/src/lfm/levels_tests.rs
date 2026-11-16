@@ -701,6 +701,9 @@ struct FirstGroupsRun {
     emit: f64,
     arena: f64,
     build: f64,
+    /// Under the chip-records knob, the build's packing of the chip tables'
+    /// prefixes (part of `build`).
+    prefix_pack: f64,
     execute: f64,
     fill: f64,
     /// The fill's split: the fixed chips' traces, the lean tables'.
@@ -708,6 +711,9 @@ struct FirstGroupsRun {
     prove: f64,
     /// Narrow tables (and their cells) the prove widened on the host.
     host_widens: (u64, u64),
+    /// Tables filled from their records during the prove: on the card, on
+    /// the host.
+    records_fills: (u64, u64),
     stamps: super::wlfm::WlfmStamps,
 }
 
@@ -735,31 +741,37 @@ fn prove_first_groups(
     let cells = prepared_cells(&program);
     let on_host = stacks.unwrap_or_else(|| stacks_on_host(&program, 1));
     let t = Instant::now();
-    let level = build_level(program, family, on_host)?;
+    let mut level = build_level(program, family, on_host)?;
+    super::levels::hold_prefixes(&mut level.build)?;
     let build = t.elapsed().as_secs_f64();
+    let prefix_pack = level.build.chip_prefix_secs();
     let hasher = level.build.artifacts.hasher;
     let t = Instant::now();
     let execution = execute(&level.program, &arenas, &hasher)
         .map_err(|e| format!("the first {k} groups' level executes: {e:?}"))?;
     let execute_secs = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    let filled = super::proof::lfm_fill_executed_under(
+    let filled = super::proof::lfm_fill_executed_holding(
         &level.program,
         execution,
         hasher,
         execute_secs,
         &Vec::new(),
+        super::wlfm::chip_records(),
     );
     let fill = t.elapsed().as_secs_f64();
     let fill_split = super::proof::take_fill_split().unwrap_or_default();
     let _ = take_wlfm_stamps();
     let widens = multilinear::narrow::host_widens();
+    let fills = multilinear::records::fills();
     let t = Instant::now();
     let proof = prove_wlfm_traces_as(&level.build, filled, prefix_check(), WlfmProving::Streamed)
         .map_err(|e| format!("the first {k} groups' level proves: {e}"))?;
     let prove = t.elapsed().as_secs_f64();
     let after = multilinear::narrow::host_widens();
     let host_widens = (after.0 - widens.0, after.1 - widens.1);
+    let after = multilinear::records::fills();
+    let records_fills = (after.0 - fills.0, after.1 - fills.1);
     let stamps = take_wlfm_stamps().unwrap_or_default();
     Ok(FirstGroupsRun {
         level,
@@ -769,11 +781,13 @@ fn prove_first_groups(
         emit,
         arena,
         build,
+        prefix_pack,
         execute: execute_secs,
         fill,
         fill_split,
         prove,
         host_widens,
+        records_fills,
         stamps,
     })
 }
@@ -950,6 +964,22 @@ fn rta_first_groups(
             st.narrow_bytes,
             r.host_widens.0,
             r.host_widens.1,
+        );
+        println!(
+            "RTA L1 RECORDS k {k} · run {run} · chip records {} · prefix pack (build) {:.3}s · \
+             prefix pack (prove) {:.3}s · tables {} · cells {} · bytes {} · fills card {} host {}",
+            if super::wlfm::chip_records() {
+                "on"
+            } else {
+                "off"
+            },
+            r.prefix_pack,
+            st.records_prefix_pack,
+            st.records_tables,
+            st.records_cells,
+            st.records_bytes,
+            r.records_fills.0,
+            r.records_fills.1,
         );
         for (g, s) in st.groups.iter().enumerate() {
             println!(

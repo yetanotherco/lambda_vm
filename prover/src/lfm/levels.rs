@@ -217,6 +217,16 @@ pub(crate) fn build_level(
     Ok(Level { program, build })
 }
 
+/// The prover's half of a level's build when it holds its chips as records
+/// ([`super::wlfm::chip_records`]): each chip table's prefix packed once, on
+/// the builder's thread ([`WlfmBuild::hold_chip_prefixes`]). Nothing otherwise.
+pub(crate) fn hold_prefixes(build: &mut WlfmBuild) -> Result<(), String> {
+    if super::wlfm::chip_records() {
+        build.hold_chip_prefixes()?;
+    }
+    Ok(())
+}
+
 /// The levels after a chain's first (whose build is `first`), each the W-leg
 /// over the one below, built until `stop`. `place` says where each level's
 /// prepared stacks are committed: `Some(on_host)` for all, `None` level by
@@ -242,7 +252,9 @@ fn build_rest(
         let child = child_of_build(plan, last);
         let program = wlfm_leg_program(&child)?;
         let on_host = place.unwrap_or_else(|| stacks_on_host(&program, count + 1));
-        rest.push(build_level(program, family, on_host)?);
+        let mut level = build_level(program, family, on_host)?;
+        hold_prefixes(&mut level.build)?;
+        rest.push(level);
     }
 }
 
@@ -564,8 +576,9 @@ pub fn prove_block_levels(
                 let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
                 // Beside phase B the card is the base's: the stacks go on the
                 // host.
-                let first =
+                let mut first =
                     build_wlfm_under(program, hasher, LEVEL_RATE, level_levers(family), true)?;
+                hold_prefixes(&mut first)?;
                 let rest = build_rest(plan, &first, family, stop, Some(true))?;
                 Ok((first, rest, now()))
             })
@@ -734,7 +747,8 @@ pub fn prove_block_levels(
             // After the base the card is free: each level's stacks on it where
             // they fit.
             let on_host = stacks_on_host(&program, 1);
-            let first = build_level(program, family, on_host)?;
+            let mut first = build_level(program, family, on_host)?;
+            hold_prefixes(&mut first.build)?;
             let rest = build_rest(&plan, &first.build, family, stop, None)?;
             times.built = now();
             std::iter::once(first).chain(rest).collect::<Vec<_>>()
@@ -744,12 +758,13 @@ pub fn prove_block_levels(
     // Level 1: fill and prove; then each level over the one below.
     let mut proofs: Vec<WlfmProof> = Vec::with_capacity(levels.len());
     let t = std::time::Instant::now();
-    let filled = super::proof::lfm_fill_executed_under(
+    let filled = super::proof::lfm_fill_executed_holding(
         &levels[0].program,
         execution,
         levels[0].build.artifacts.hasher,
         executed - execute_from,
         &Vec::new(),
+        super::wlfm::chip_records(),
     );
     let fill = t.elapsed().as_secs_f64();
     let t = std::time::Instant::now();

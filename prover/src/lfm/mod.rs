@@ -26,6 +26,8 @@ pub mod blake3_lean;
 pub mod blake3_socket;
 pub mod block_node;
 pub mod builder;
+/// The LFM chips' tables held as their records (the W-LFM prover's holding).
+pub(crate) mod chip_records;
 pub mod chips;
 pub mod chunking;
 pub mod commit;
@@ -149,6 +151,10 @@ mod blake3_probe;
 mod blake3_socket_kats;
 #[cfg(test)]
 mod blake3_socket_tests;
+#[cfg(all(test, feature = "cuda", feature = "parallel"))]
+mod chip_records_card_tests;
+#[cfg(all(test, feature = "parallel"))]
+mod chip_records_tests;
 #[cfg(test)]
 mod commit_ood_leg_tests;
 #[cfg(test)]

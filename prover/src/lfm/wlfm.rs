@@ -300,7 +300,7 @@ fn chunk_log() -> u32 {
 // The narrow-chips knob is a prover's choice read from the environment, so it
 // lives outside this module, which holds the format and reads no environment
 // (`the_wlfm_format_reads_no_environment`).
-pub use super::wlfm_knobs::{NARROW_CHIPS_ENV, narrow_chips};
+pub use super::wlfm_knobs::{CHIP_RECORDS_ENV, NARROW_CHIPS_ENV, chip_records, narrow_chips};
 
 /// The bytes a word needs: 1, 2, 4 or 8 (`NarrowColumns`' rule).
 fn narrow_width(max: u64) -> u8 {
@@ -596,15 +596,48 @@ impl WlfmAirs {
     }
 
     /// Every AIR with its trace, in table order. `b3l` is the program's lean
-    /// tables: present exactly when the AIR set has them.
-    pub fn air_trace_pairs<'a>(
+    /// tables: present exactly when the AIR set has them. `chips` is the
+    /// chips the fill held as their records (their traces empty): each of
+    /// their tables becomes [`TableIn::Records`], its prefix `prefix(t)` (`t`
+    /// the table's position).
+    pub(crate) fn air_trace_pairs<'a>(
         &'a self,
         traces: &'a mut super::trace::LfmTraces,
         b3l: Option<&'a mut B3lTraces>,
+        chips: Option<&super::chip_records::LfmChipValues>,
+        prefix: &mut dyn FnMut(usize) -> Result<std::sync::Arc<NarrowPrefix>, String>,
     ) -> Result<Vec<(DynLfmAir<'a>, TableIn<'a>)>, String> {
         let mut pairs: Vec<(DynLfmAir<'a>, TableIn<'a>)> = Vec::new();
         let narrow = narrow_chips();
         for (i, (air, trace, _)) in self.lfm.air_trace_pairs(traces).into_iter().enumerate() {
+            let held = chips.zip(super::chip_records::ChipKind::of_air(air.name()));
+            if let Some((chips, kind)) = held {
+                if trace.main_table.height != 0 {
+                    return Err(format!(
+                        "{}: a chip held as records with a filled trace",
+                        air.name()
+                    ));
+                }
+                let chunks = self
+                    .lfm_chunks
+                    .get(i)
+                    .ok_or_else(|| format!("{}: no table heights", air.name()))?;
+                let mut start = 0usize;
+                for &rows in chunks {
+                    let t = pairs.len();
+                    let records = chips
+                        .table(kind, prefix(t)?, start, rows)
+                        .ok_or_else(|| format!("{}: no records held", air.name()))??;
+                    pairs.push((
+                        air,
+                        TableIn::Records(multilinear::records::Records(std::sync::Arc::new(
+                            records,
+                        ))),
+                    ));
+                    start += rows;
+                }
+                continue;
+            }
             match self.lfm_chunks.get(i) {
                 // Packed narrow by the prove, straight from the rows.
                 Some(chunks) if chunks.len() > 1 && narrow => {
@@ -695,10 +728,16 @@ fn chunk_columns(
     cols
 }
 
+/// A table's preprocessed prefix, packed narrow.
+pub(crate) type NarrowPrefix = multilinear::narrow::NarrowColumns;
+
 /// One table's columns as the W-LFM prover takes them: an LFM chip's trace, or
 /// a lean table as its fill held it (wide or narrow).
 pub enum TableIn<'a> {
     Wide(&'a mut stark::trace::TraceTable<F, E>),
+    /// Under [`chip_records`], an LFM chip's table held as its records
+    /// ([`super::chip_records::LfmChipRecords`]): the card fills its columns.
+    Records(multilinear::records::Records),
     /// A chunk of a cut chip's trace, its columns.
     Columns(Vec<Vec<FieldElement<F>>>),
     Held(&'a mut super::b3l_tables::HeldTable),
@@ -715,7 +754,7 @@ pub enum TableIn<'a> {
 impl TableIn<'_> {
     /// Whether the table is held as its records (the card fills its columns).
     fn is_records(&self) -> bool {
-        matches!(self, TableIn::Held(h) if h.is_records())
+        matches!(self, TableIn::Records(_)) || matches!(self, TableIn::Held(h) if h.is_records())
     }
 
     fn shape(&self) -> (usize, usize) {
@@ -724,6 +763,7 @@ impl TableIn<'_> {
             TableIn::Columns(cols) => (cols.len(), cols.first().map_or(0, Vec::len)),
             TableIn::Held(h) => (h.cols(), h.rows()),
             TableIn::Rows { width, rows, .. } => (*width, *rows),
+            TableIn::Records(r) => (r.cols(), r.rows()),
         }
     }
 
@@ -737,6 +777,11 @@ impl TableIn<'_> {
                 .get(r * width + c)
                 .copied()
                 .unwrap_or_else(FieldElement::zero),
+            // The host's fill of the whole table for one cell: a reader's
+            // last resort (the prove's checks skip a table held as records).
+            TableIn::Records(records) => records
+                .host_fill()
+                .map_or_else(FieldElement::zero, |p| FieldElement::from(p.get(r, c))),
         }
     }
 
@@ -776,6 +821,13 @@ pub enum WlfmProving {
 pub struct WlfmBuild {
     pub artifacts: WlfmArtifacts,
     stacks: WlfmStacks,
+    /// Under [`chip_records`], each chip table's preprocessed prefix packed
+    /// narrow once ([`Self::hold_chip_prefixes`]), by table position: the
+    /// prefix its records carry. Empty until then (a prove packs what it
+    /// needs from the stacks).
+    chip_prefixes: Vec<Option<std::sync::Arc<multilinear::narrow::NarrowColumns>>>,
+    /// The seconds [`Self::hold_chip_prefixes`] took.
+    chip_prefix_secs: f64,
 }
 
 /// The prover's prepared stacks, under the build's family.
@@ -837,8 +889,95 @@ impl WlfmBuild {
     pub(crate) fn without_stacks(mut self) -> Self {
         self.artifacts.stacks.clear();
         self.stacks.clear();
+        self.chip_prefixes.clear();
         self
     }
+
+    /// The prefixes [`Self::hold_chip_prefixes`] packed, by table position.
+    pub(crate) fn chip_prefixes(
+        &self,
+    ) -> &[Option<std::sync::Arc<multilinear::narrow::NarrowColumns>>] {
+        &self.chip_prefixes
+    }
+
+    /// The build with table `t`'s held prefix replaced: a test's forgery.
+    pub(crate) fn with_chip_prefix(
+        mut self,
+        t: usize,
+        prefix: multilinear::narrow::NarrowColumns,
+    ) -> Self {
+        self.chip_prefixes[t] = Some(std::sync::Arc::new(prefix));
+        self
+    }
+}
+
+impl WlfmBuild {
+    /// The prover's half of a build for a prove that holds its chips as
+    /// records ([`chip_records`]): every such chip table's preprocessed
+    /// prefix packed narrow, once, from the columns its prepared stack commits
+    /// (or, under [`WlfmPrep::Evaluated`], the ones the verifier evaluates):
+    /// the prefix those tables' records carry, so the prepared opening binds
+    /// exactly what the card writes. A builder's work, off the prove; a prove
+    /// on a build without it packs the prefixes it needs itself.
+    pub fn hold_chip_prefixes(&mut self) -> Result<(), String> {
+        let t = std::time::Instant::now();
+        let airs = self.artifacts.airs();
+        let refs = airs.air_refs();
+        let mut prefixes = vec![None; refs.len()];
+        for (table, air) in refs.iter().enumerate() {
+            if super::chip_records::ChipKind::of_air(air.name()).is_none() {
+                continue;
+            }
+            let packed = match &self.stacks {
+                WlfmStacks::P1(stacks) => table_prefix(&self.artifacts, stacks, table),
+                WlfmStacks::B3(stacks) => table_prefix(&self.artifacts, stacks, table),
+            }
+            .ok_or_else(|| format!("{}: no prefix columns for table {table}", air.name()))
+            .and_then(|columns| {
+                super::chip_records::pack_prefix(&columns)
+                    .ok_or_else(|| format!("{}: a prefix not one height", air.name()))
+            })?;
+            prefixes[table] = Some(std::sync::Arc::new(packed));
+        }
+        drop(refs);
+        self.chip_prefixes = prefixes;
+        self.chip_prefix_secs = t.elapsed().as_secs_f64();
+        Ok(())
+    }
+
+    /// The seconds [`Self::hold_chip_prefixes`] took (0 before it ran).
+    pub fn chip_prefix_secs(&self) -> f64 {
+        self.chip_prefix_secs
+    }
+}
+
+/// Table `t`'s preprocessed prefix's columns as the prover's build holds them:
+/// its prepared stack's (or, under [`WlfmPrep::Evaluated`], the evaluated
+/// ones). `None` for a table with none.
+fn table_prefix<'a, H: WhirHash>(
+    artifacts: &'a WlfmArtifacts,
+    stacks: &'a [GroupPrepared<H>],
+    t: usize,
+) -> Option<Vec<&'a [FieldElement<F>]>> {
+    if artifacts.prep == WlfmPrep::Evaluated {
+        let columns = artifacts.evaluated.get(t)?;
+        return (!columns.is_empty()).then(|| columns.iter().map(|c| c.evals()).collect());
+    }
+    for stack in stacks {
+        let mut at = 0usize;
+        for &(table, n) in &stack.tables {
+            if table == t {
+                return Some(
+                    stack.columns[at..at + n]
+                        .iter()
+                        .map(|c| c.evals())
+                        .collect(),
+                );
+            }
+            at += n;
+        }
+    }
+    None
 }
 
 /// A W-LFM proof and the words its execution published.
@@ -1093,6 +1232,8 @@ pub fn build_wlfm_under(
         return Ok(WlfmBuild {
             artifacts,
             stacks: WlfmStacks::empty(family),
+            chip_prefixes: Vec::new(),
+            chip_prefix_secs: 0.0,
         });
     }
     let stacks = group_stacks(columns, &group_lists).map_err(|e| format!("{e:?}"))?;
@@ -1133,6 +1274,8 @@ pub fn build_wlfm_under(
     Ok(WlfmBuild {
         artifacts,
         stacks: committed,
+        chip_prefixes: Vec::new(),
+        chip_prefix_secs: 0.0,
     })
 }
 
@@ -1387,12 +1530,18 @@ pub(crate) fn prove_wlfm_traces_as(
     proving: WlfmProving,
 ) -> Result<WlfmProof, String> {
     match &build.stacks {
-        WlfmStacks::P1(stacks) => {
-            prove_traces_under::<WlfmHash>(&build.artifacts, stacks, filled, check_prefix, proving)
-        }
+        WlfmStacks::P1(stacks) => prove_traces_under::<WlfmHash>(
+            &build.artifacts,
+            stacks,
+            &build.chip_prefixes,
+            filled,
+            check_prefix,
+            proving,
+        ),
         WlfmStacks::B3(stacks) => prove_traces_under::<WlfmB3Hash>(
             &build.artifacts,
             stacks,
+            &build.chip_prefixes,
             filled,
             check_prefix,
             proving,
@@ -1417,6 +1566,13 @@ pub struct WlfmStamps {
     pub narrow_tables: usize,
     pub narrow_cells: usize,
     pub narrow_bytes: usize,
+    /// Under [`chip_records`], the chip tables held as their records: tables,
+    /// cells, the records' bytes (prefix and values), and the seconds the
+    /// prove packed prefixes its build did not hold (left out of `prep`).
+    pub records_tables: usize,
+    pub records_cells: usize,
+    pub records_bytes: usize,
+    pub records_prefix_pack: f64,
     pub phase_a: f64,
     pub phase_b: f64,
     pub groups: Vec<multilinear_block::GroupStamps>,
@@ -1438,6 +1594,7 @@ pub fn take_wlfm_stamps() -> Option<WlfmStamps> {
 fn prove_traces_under<H: WhirHash>(
     artifacts: &WlfmArtifacts,
     stacks: &[GroupPrepared<H>],
+    held_prefixes: &[Option<std::sync::Arc<NarrowPrefix>>],
     filled: LfmFilled,
     check_prefix: bool,
     proving: WlfmProving,
@@ -1453,6 +1610,7 @@ fn prove_traces_under<H: WhirHash>(
     let t_prep = std::time::Instant::now();
     let mut parts = [0f64; 6];
     let mut b3l = filled.take_b3l();
+    let chips = filled.take_chips();
     let (mut traces, public_words, hasher, execute_secs, fill_secs, exec_split) =
         filled.into_parts();
     // Every chip its own table: a set filled under the process's merge is
@@ -1470,8 +1628,23 @@ fn prove_traces_under<H: WhirHash>(
     let shapes = artifacts.shapes(&airs);
     parts[1] = t.elapsed().as_secs_f64();
     let t = std::time::Instant::now();
-    let pairs = airs.air_trace_pairs(&mut traces, b3l.as_mut())?;
-    parts[2] = t.elapsed().as_secs_f64();
+    // A chip table held as records carries its prefix: the build's, or
+    // packed here from the stacks when the build holds none.
+    let mut prefix_pack = 0f64;
+    let mut prefix = |table: usize| -> Result<std::sync::Arc<NarrowPrefix>, String> {
+        if let Some(Some(p)) = held_prefixes.get(table) {
+            return Ok(std::sync::Arc::clone(p));
+        }
+        let t = std::time::Instant::now();
+        let packed = table_prefix(artifacts, stacks, table)
+            .and_then(|columns| super::chip_records::pack_prefix(&columns))
+            .ok_or_else(|| format!("table {table}: no prefix to hold its records"))?;
+        prefix_pack += t.elapsed().as_secs_f64();
+        Ok(std::sync::Arc::new(packed))
+    };
+    let pairs = airs.air_trace_pairs(&mut traces, b3l.as_mut(), chips.as_ref(), &mut prefix)?;
+    drop(chips);
+    parts[2] = t.elapsed().as_secs_f64() - prefix_pack;
     if pairs.len() != shapes.len() {
         return Err(format!(
             "{} traces for {} tables",
@@ -1491,6 +1664,8 @@ fn prove_traces_under<H: WhirHash>(
     let mut tables: Vec<CommittedTable<'_, F, E>> = Vec::with_capacity(pairs.len());
     // The chips packed narrow: seconds, tables, cells, packed bytes.
     let mut narrow = (0f64, 0usize, 0usize, 0usize);
+    // The chips held as records: tables, cells, records bytes.
+    let mut records_held = (0usize, 0usize, 0usize);
     for (t, ((air, table), &(width, num_vars))) in pairs.into_iter().zip(&shapes).enumerate() {
         let (cols, rows) = table.shape();
         if cols != width || rows != 1usize << num_vars {
@@ -1521,7 +1696,7 @@ fn prove_traces_under<H: WhirHash>(
                 ));
             }
         }
-        if check_prefix && artifacts.prep == WlfmPrep::Evaluated {
+        if check_prefix && artifacts.prep == WlfmPrep::Evaluated && !table.is_records() {
             let pinned: Vec<&[FieldElement<F>]> = artifacts.evaluated[t]
                 .iter()
                 .map(|col| col.evals())
@@ -1574,6 +1749,12 @@ fn prove_traces_under<H: WhirHash>(
             TableIn::Columns(mut columns) => CommittedTable::from_layout(layout, |col| {
                 core::mem::take(&mut columns[col as usize])
             }),
+            TableIn::Records(records) => {
+                records_held.0 += 1;
+                records_held.1 += records.rows() * records.cols();
+                records_held.2 += records.bytes();
+                CommittedTable::from_records(layout, records)
+            }
             TableIn::Held(held) => match held.take() {
                 super::b3l_tables::HeldTable::Wide(trace) => {
                     let mut columns = trace.main_table.columns_blocked();
@@ -1593,7 +1774,7 @@ fn prove_traces_under<H: WhirHash>(
         parts[5] += t_table.elapsed().as_secs_f64();
     }
     parts[5] -= narrow.0;
-    let prep_secs = t_prep.elapsed().as_secs_f64() - narrow.0;
+    let prep_secs = t_prep.elapsed().as_secs_f64() - narrow.0 - prefix_pack;
     let waited_before = super::device_permit::waited_secs();
     let t_held = std::time::Instant::now();
     // ⛔ THE CARD, for the prove's device phases: the permit the STARK prover
@@ -1683,6 +1864,10 @@ fn prove_traces_under<H: WhirHash>(
             narrow_tables: narrow.1,
             narrow_cells: narrow.2,
             narrow_bytes: narrow.3,
+            records_tables: records_held.0,
+            records_cells: records_held.1,
+            records_bytes: records_held.2,
+            records_prefix_pack: prefix_pack,
             phase_a,
             phase_b,
             groups: group_stamps,
@@ -1709,7 +1894,8 @@ fn prove_traces_under<H: WhirHash>(
 }
 
 /// `program` executed over `arenas` and its traces filled for `hasher` with
-/// every chip in its own table: the W-LFM AIR set is unmerged.
+/// every chip in its own table (the W-LFM AIR set is unmerged), the chips held
+/// as their records under [`chip_records`].
 pub(crate) fn execute_and_fill_unmerged(
     program: &LfmProgram,
     arenas: &[Vec<LfmWord>],
@@ -1718,12 +1904,13 @@ pub(crate) fn execute_and_fill_unmerged(
     let t = std::time::Instant::now();
     let execution = super::executor::execute(program, arenas, &hasher)
         .map_err(|e| format!("the program does not execute: {e:?}"))?;
-    Ok(super::proof::lfm_fill_executed_under(
+    Ok(super::proof::lfm_fill_executed_holding(
         program,
         execution,
         hasher,
         t.elapsed().as_secs_f64(),
         &Vec::new(),
+        chip_records(),
     ))
 }
 
@@ -2063,6 +2250,7 @@ pub(crate) mod test_format {
         static QUERIES: Cell<Option<usize>> = const { Cell::new(None) };
         static CHUNK_LOG: Cell<Option<u32>> = const { Cell::new(None) };
         static NARROW_CHIPS: Cell<Option<bool>> = const { Cell::new(None) };
+        static CHIP_RECORDS: Cell<Option<bool>> = const { Cell::new(None) };
     }
 
     /// Every W-LFM build on this thread cuts its chips at `2^log` rows until
@@ -2099,6 +2287,24 @@ pub(crate) mod test_format {
 
     pub(crate) fn narrow_chips() -> Option<bool> {
         NARROW_CHIPS.with(Cell::get)
+    }
+
+    /// Every W-LFM fill on this thread holds its chips as records
+    /// (`Some(true)`) or not until the guard drops.
+    pub(crate) struct ChipRecordsOverride(Option<bool>);
+
+    impl Drop for ChipRecordsOverride {
+        fn drop(&mut self) {
+            CHIP_RECORDS.with(|c| c.set(self.0));
+        }
+    }
+
+    pub(crate) fn set_chip_records(on: bool) -> ChipRecordsOverride {
+        ChipRecordsOverride(CHIP_RECORDS.with(|c| c.replace(Some(on))))
+    }
+
+    pub(crate) fn chip_records() -> Option<bool> {
+        CHIP_RECORDS.with(Cell::get)
     }
 
     /// The override, restored when dropped.
