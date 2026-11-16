@@ -877,13 +877,25 @@ const fn reg(index: u64) -> u64 {
     2 * index
 }
 
-/// `T + IS_SET` (the reads) or `T + 1 − IS_SET` (the write).
+/// The later of a call's two memory timestamps, `T + LATER`: a copy's
+/// writes, a memset's reads.
+const LATER: i64 = 1;
+
+// A call's memory timestamps `T` and `T + LATER` are distinct and stay below
+// the next CPU row's `T + TIMESTAMP_STRIDE`, so no two calls (and no CPU
+// access) share a timestamp: ECALL timestamps are multiples of the stride.
+const _: () = assert!(
+    0 < LATER && LATER < super::cpu::TIMESTAMP_STRIDE as i64,
+    "COPY_W's timestamp offsets must be distinct and below the CPU timestamp stride"
+);
+
+/// `T + IS_SET` (the reads) or `T + LATER − IS_SET` (the write).
 fn timestamp(write: bool) -> BusValue {
     BusValue::linear(if write {
         vec![
             term(1, cols::TIMESTAMP),
             term(-1, cols::IS_SET),
-            LinearTerm::Constant(1),
+            LinearTerm::Constant(LATER),
         ]
     } else {
         vec![term(1, cols::TIMESTAMP), term(1, cols::IS_SET)]
@@ -1021,7 +1033,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Diff(cols::FIRST, cols::FIRST_WRITE),
             memw_register(reg(10), dst_operand.clone(), dst_operand),
         ),
-        // x254, a commit's index `DST_KEY + START − 8`, advanced by the count.
+        // x254, a commit's index `DST_KEY + START − 8`, advanced by the count
+        // in its low word, its high word unchanged (no carry): the walk refuses
+        // a commit whose index would pass 2^32, and the verifier pins x254's
+        // final value to the output's length with a zero high word
+        // (`register::halted_fini`), so a run whose index would carry does not
+        // verify.
         BusInteraction::sender(
             BusId::Memw,
             first_write(),
