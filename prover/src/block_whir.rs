@@ -2661,18 +2661,17 @@ fn parse_exec_history(value: Option<&str>) -> Result<Option<bool>, Error> {
     }
 }
 
-/// `LAMBDA_VM_WORD_STREAM`'s reading: unset, empty or `0` (the default), the
-/// finish builds the word memory format's word families; `1`, they are cut
-/// into chunks as the walk fills them
-/// ([`WindowedTraceBuilder::stream_word_tables`]). The tables are the same.
-/// Anything else refuses the prove.
+/// `LAMBDA_VM_WORD_STREAM`'s reading: unset, empty or `1` (the default), the
+/// word memory format's word families are cut into chunks as the walk fills
+/// them ([`WindowedTraceBuilder::stream_word_tables`]); `0`, the finish builds
+/// them. The tables are the same. Anything else refuses the prove.
 fn parse_word_stream(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
+        None | Some("" | "1") => Ok(true),
+        Some("0") => Ok(false),
         Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_WORD_STREAM={v}: 0 (the default: the finish builds the word families) or 1 \
-             (cut into chunks as the walk fills them)"
+            "LAMBDA_VM_WORD_STREAM={v}: 1 (the default: cut into chunks as the walk fills them) \
+             or 0 (the finish builds the word families)"
         ))),
     }
 }
@@ -7147,9 +7146,9 @@ fn prove_streamed(
         eprintln!(
             "★ BLOCK WORD STREAM: {} (LAMBDA_VM_WORD_STREAM)",
             if word_stream {
-                "the word families cut into chunks as the walk fills them"
+                "the word families cut into chunks as the walk fills them, the default"
             } else {
-                "off: the finish builds the word families, the default"
+                "off: the finish builds the word families"
             }
         );
     }
@@ -10900,14 +10899,15 @@ mod producer_report_tests {
         parse_word_stream,
     };
 
-    /// `LAMBDA_VM_WORD_STREAM`: off unless `1`; any other word refused.
+    /// `LAMBDA_VM_WORD_STREAM`: on unless `0`; any other word refused.
     #[test]
-    fn the_word_stream_is_off_unless_turned_on() {
+    fn the_word_stream_is_on_unless_turned_off() {
         for (word, on) in [
-            (None, false),
-            (Some(""), false),
-            (Some("0"), false),
+            (None, true),
+            (Some(""), true),
             (Some(" 1 "), true),
+            (Some("0"), false),
+            (Some(" 0 "), false),
         ] {
             assert_eq!(parse_word_stream(word).ok(), Some(on), "{word:?}");
         }
