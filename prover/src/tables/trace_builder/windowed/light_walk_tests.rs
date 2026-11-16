@@ -306,6 +306,8 @@ fn light_is_todays_under(
 /// walker routes as today's accumulator.
 #[test]
 fn the_light_walk_emits_today_s_lists() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let mut windows = 0;
     for name in PROGRAMS {
         let (program, _) = run(name);
@@ -353,6 +355,8 @@ fn the_light_walk_emits_today_s_lists() {
 /// it for the cells the cycle lacks.
 #[test]
 fn the_light_walk_refuses_a_history_without_the_access() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let (program, _) = run("all_loadstore_32");
     let max_rows = MaxRowsConfig::small();
     let builder = WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder");
@@ -452,6 +456,8 @@ const WORD_PROGRAMS: [&str; 10] = [
 /// their own).
 #[test]
 fn the_light_walk_emits_today_s_lists_under_the_word_format() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let mut windows = 0;
     for name in WORD_PROGRAMS.into_iter().chain(["test_ecrec"]) {
         let (program, _) = run(name);
@@ -636,6 +642,8 @@ fn built(
 /// BITWISE, DECODE, LT and the routed tables among them.
 #[test]
 fn the_light_walk_builds_today_s_tables() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let max_rows = MaxRowsConfig::small();
     let mut chunks = 0usize;
     for name in PROGRAMS {

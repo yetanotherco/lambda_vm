@@ -2434,6 +2434,8 @@ fn test_hint_range_checks_its_output_bytes() {
 /// and the run proves and verifies.
 #[test]
 fn test_prove_elfs_ecrec() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let _ = env_logger::builder().is_test(true).try_init();
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecrec");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
@@ -2463,6 +2465,8 @@ fn test_prove_elfs_ecrec() {
 /// key is bound by the final addition's ECDAS tuple, the MEMW writes and `< p`).
 #[test]
 fn test_prove_elfs_ecrec_forged_key_rejected() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     use crate::tables::ecrec::cols as ecrec_cols;
     let _ = env_logger::builder().is_test(true).try_init();
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecrec");
@@ -2490,6 +2494,8 @@ fn test_prove_elfs_ecrec_forged_key_rejected() {
 /// messages without their ECREC counterparts.
 #[test]
 fn test_prove_elfs_ecrec_forged_bail_rejected() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     use crate::tables::ecrec::cols as ecrec_cols;
     let _ = env_logger::builder().is_test(true).try_init();
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecrec");
@@ -2515,6 +2521,8 @@ fn test_prove_elfs_ecrec_forged_bail_rejected() {
 /// only the bus refuses it.
 #[test]
 fn test_prove_elfs_ecrec_final_additions_swapped_between_calls_rejected() {
+    // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     use crate::tables::ecdas::cols as ec;
     use crate::tables::ecrec::cols as ecrec_cols;
     let _ = env_logger::builder().is_test(true).try_init();
