@@ -420,6 +420,8 @@ fn a_forged_prefix_word_in_a_later_chunk_is_refused() {
         "the sum's chip is cut: {} tables",
         balu.len()
     );
+    let honest = prove_wlfm_as(&program, &built, &arenas(), WlfmProving::Streamed).expect("proves");
+    verify_wlfm(&built.artifacts, &honest, &honest.public_words).expect("honest verifies");
     let last = *balu.last().expect("a last chunk");
     let forged = forge_prefix(built, last, 0, layout::balu::OUT_ADDR);
     let proof = prove_wlfm_as(&program, &forged, &arenas(), WlfmProving::Streamed)
@@ -438,6 +440,10 @@ fn a_forged_program_held_as_records_is_refused() {
     let _fast = test_format::set(Some(2));
     let _on = test_format::set_chip_records(true);
     let built = build(&every_chip(5, 9));
+    let filled = execute_and_fill_unmerged(&every_chip(5, 9), &arenas(), HASHER)
+        .expect("the honest program executes");
+    let honest = prove_wlfm_traces(&built, filled, false).expect("the honest prove");
+    verify_wlfm(&built.artifacts, &honest, &honest.public_words).expect("honest verifies");
     let filled = execute_and_fill_unmerged(&every_chip(5, 10), &arenas(), HASHER)
         .expect("the forged program executes");
     assert!(filled.chips().is_some());
