@@ -1,0 +1,44 @@
+name: Sail RISC-V Lean model
+
+on:
+  push:
+    branches: ["main"]
+    paths: ["sail-riscv-lean/**", ".github/workflows/sail-riscv-lean.yml"]
+  pull_request:
+    paths: ["sail-riscv-lean/**", ".github/workflows/sail-riscv-lean.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # Regenerates the model from the commits in sail-riscv-lean/PINS and fails if it differs from
+  # the committed one: the model is exactly what the Sail compiler outputs, nothing hand-written.
+  generated:
+    name: Model matches its pinned sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: sail-riscv-lean
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends opam libgmp-dev z3 pkg-config cmake
+          opam init -y --bare --disable-sandboxing
+
+      - name: Regenerate the model
+        run: scripts/generate.sh
+
+      - name: Model is up to date
+        run: |
+          paths="LeanRV64D LeanRV64D.lean lakefile.toml lean-toolchain"
+          git status --porcelain -- $paths
+          test -z "$(git status --porcelain -- $paths)"

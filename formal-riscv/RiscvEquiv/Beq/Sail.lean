@@ -1,4 +1,5 @@
 import LeanRV64D.InstsEnd
+import RiscvEquiv.FreeM
 
 /-!
 # BEQ and BNE in the Sail RISC-V model

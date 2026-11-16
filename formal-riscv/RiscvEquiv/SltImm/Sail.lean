@@ -20,7 +20,7 @@ theorem execute_SLTI (imm : BitVec 12) (rs1 rd : regidx) :
       let a ← rX_bits rs1
       wX_bits rd (sltPure a (imm.signExtend 64))
       pure RETIRE_SUCCESS) := by
-  simp only [execute_ITYPE, slt_bit]
+  simp only [execute_ITYPE, bind_assoc, pure_bind, slt_bit]
   rfl
 
 /-- Sail's `SLTIU` reads `rs1` and writes `sltuPure x[rs1] (signExtend imm)` to `rd`. -/
@@ -29,7 +29,7 @@ theorem execute_SLTIU (imm : BitVec 12) (rs1 rd : regidx) :
       let a ← rX_bits rs1
       wX_bits rd (sltuPure a (imm.signExtend 64))
       pure RETIRE_SUCCESS) := by
-  simp only [execute_ITYPE, sltu_bit]
+  simp only [execute_ITYPE, bind_assoc, pure_bind, sltu_bit]
   rfl
 
 end RiscvEquiv

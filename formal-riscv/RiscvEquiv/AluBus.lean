@@ -45,7 +45,7 @@ lemma shift_alu (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
     (x : ℕ) (b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = x)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
     dword m.outLo m.outHi = Alu.shiftResult 0 s d x b.toNat := by
-  obtain ⟨-, -, hshift⟩ := hg h1 h2 h3 h4
+  obtain ⟨-, -, hshift⟩ := hg
   obtain ⟨-, -, hout⟩ := hshift 0 s d (by norm_num) hs hd (by simpa using hflags)
   have hamt : m.in2Lo.val % 256 % 64 = b.toNat % 64 := by
     rw [← hb, dword]
@@ -62,7 +62,7 @@ lemma shift_word_alu_low (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
     (x : ℕ) (b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = x)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
     m.outLo.val = Alu.shiftResult 1 s d x b.toNat % 2^32 := by
-  obtain ⟨-, -, hshift⟩ := hg h1 h2 h3 h4
+  obtain ⟨-, -, hshift⟩ := hg
   obtain ⟨hlo, -, hout⟩ := hshift 1 s d (by norm_num) hs hd hflags
   have hamt : m.in2Lo.val % 256 % 32 = b.toNat % 32 := by
     rw [← hb, dword]
@@ -81,8 +81,8 @@ lemma lt_alu_bit (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
     (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = a.toNat)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
     dword m.outLo m.outHi = Alu.ltBit s i a.toNat b.toNat := by
-  obtain ⟨hlt, -, -⟩ := hg h1 h2 h3 h4
-  obtain ⟨hhi, hlo⟩ := hlt s i hs hi hflags
+  obtain ⟨hlt, -, -⟩ := hg
+  obtain ⟨hhi, hlo⟩ := hlt s i hs hi hflags h1 h3
   have hbit := ltBit_lt_two s i a.toNat b.toNat
   rw [dword, hhi, hlo, ha, hb, ZMod.val_zero, val_natCast_of_lt_two_pow_40 (by omega),
     mul_zero, add_zero]
@@ -96,8 +96,8 @@ lemma eq_alu_bit (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
     (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = a.toNat)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
     dword m.outLo m.outHi = Alu.eqBit i a.toNat b.toNat := by
-  obtain ⟨-, heq, -⟩ := hg h1 h2 h3 h4
-  obtain ⟨hhi, hlo⟩ := heq i hi hflags
+  obtain ⟨-, heq, -⟩ := hg
+  obtain ⟨hhi, hlo⟩ := heq i hi hflags h1 h2 h3 h4
   have hbit := eqBit_lt_two i a.toNat b.toNat
   rw [dword, hhi, hlo, ha, hb, ZMod.val_zero, val_natCast_of_lt_two_pow_40 (by omega),
     mul_zero, add_zero]

@@ -1,4 +1,5 @@
 import LeanRV64D.InstsEnd
+import RiscvEquiv.FreeM
 
 /-!
 # SRA in the Sail RISC-V model
@@ -22,8 +23,8 @@ theorem execute_SRA (rs2 rs1 rd : regidx) :
       let b ← rX_bits rs2
       wX_bits rd (sraPure a b)
       pure RETIRE_SUCCESS) := by
-  simp only [execute_RTYPE, shift_bits_right_arith, Sail.BitVec.extractLsb, sraPure,
-    Sail.BitVec.toNatInt, BitVec.extractLsb_toNat]
+  simp only [execute_RTYPE, bind_assoc, pure_bind, shift_bits_right_arith,
+    Sail.BitVec.extractLsb, sraPure, Sail.BitVec.toNatInt, BitVec.extractLsb_toNat]
   rfl
 
 end RiscvEquiv

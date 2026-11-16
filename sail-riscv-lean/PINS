@@ -1,0 +1,10 @@
+# The two upstream sources the Lean model is generated from.
+# To update the model: change these commits, run scripts/generate.sh and commit the result.
+
+# The Sail compiler, whose Lean backend translates the spec to Lean.
+SAIL_REPO=https://github.com/rems-project/sail.git
+SAIL_COMMIT=ef5dca5ac2048a19ab971f128bb13477561c021c
+
+# The official RISC-V spec, written in Sail.
+SAIL_RISCV_REPO=https://github.com/riscv/sail-riscv.git
+SAIL_RISCV_COMMIT=bcc5a0046052a88543bd4ebf2be3f6b0a8b5cf5f

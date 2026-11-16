@@ -35,9 +35,8 @@ theorem execute_SLLI (shamt : BitVec 6) (rs1 rd : regidx) :
       let a ← rX_bits rs1
       wX_bits rd (sllPure a (shamt.setWidth 64))
       pure RETIRE_SUCCESS) := by
-  simp only [execute_SHIFTIOP, shift_bits_left, BitVec.shiftLeft_eq', extract_shamt, sllPure,
-    shamt_toNat]
-  rfl
+  simp only [execute_SHIFTIOP, bind_assoc, pure_bind, shift_bits_left, BitVec.shiftLeft_eq',
+    extract_shamt, sllPure, shamt_toNat]
 
 /-- Sail's `SRLI` reads `rs1` and writes `srlPure x[rs1] shamt` to `rd`. -/
 theorem execute_SRLI (shamt : BitVec 6) (rs1 rd : regidx) :
@@ -45,9 +44,8 @@ theorem execute_SRLI (shamt : BitVec 6) (rs1 rd : regidx) :
       let a ← rX_bits rs1
       wX_bits rd (srlPure a (shamt.setWidth 64))
       pure RETIRE_SUCCESS) := by
-  simp only [execute_SHIFTIOP, shift_bits_right, BitVec.ushiftRight_eq', extract_shamt, srlPure,
-    shamt_toNat]
-  rfl
+  simp only [execute_SHIFTIOP, bind_assoc, pure_bind, shift_bits_right, BitVec.ushiftRight_eq',
+    extract_shamt, srlPure, shamt_toNat]
 
 /-- Sail's `SRAI` reads `rs1` and writes `sraPure x[rs1] shamt` to `rd`. -/
 theorem execute_SRAI (shamt : BitVec 6) (rs1 rd : regidx) :
@@ -55,8 +53,8 @@ theorem execute_SRAI (shamt : BitVec 6) (rs1 rd : regidx) :
       let a ← rX_bits rs1
       wX_bits rd (sraPure a (shamt.setWidth 64))
       pure RETIRE_SUCCESS) := by
-  simp only [execute_SHIFTIOP, shift_bits_right_arith, Sail.BitVec.toNatInt, extract_shamt,
-    sraPure, shamt_toNat]
+  simp only [execute_SHIFTIOP, bind_assoc, pure_bind, shift_bits_right_arith,
+    Sail.BitVec.toNatInt, extract_shamt, sraPure, shamt_toNat]
   rfl
 
 end RiscvEquiv
