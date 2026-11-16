@@ -277,6 +277,14 @@ fn proof_bytes(
         .to_vec()
 }
 
+/// A byte pin's case: its name, the program, its arenas, and the chip cut.
+type Case = (
+    &'static str,
+    LfmProgram,
+    Vec<Vec<super::word::LfmWord>>,
+    Option<u32>,
+);
+
 /// ★ PIN: the chips held as their records are the prover's holding: a program
 /// of every chip, one of lean compressions and chips, and one with chips cut
 /// into chunks, prove the same bytes with the chips wide, narrow and as
@@ -284,12 +292,7 @@ fn proof_bytes(
 #[test]
 fn chips_as_records_prove_the_same_bytes() {
     let _fast = test_format::set(Some(2));
-    let cases: Vec<(
-        &str,
-        LfmProgram,
-        Vec<Vec<super::word::LfmWord>>,
-        Option<u32>,
-    )> = vec![
+    let cases: Vec<Case> = vec![
         ("every chip", every_chip(5, 9), arenas(), None),
         (
             "lean and chips",
