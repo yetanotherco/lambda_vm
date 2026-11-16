@@ -1548,3 +1548,236 @@ fn a_moved_word_count_is_another_block() {
         }
     }
 }
+
+// =============================================================================
+// The tree's verifiers under a named memory format
+// =============================================================================
+
+use super::super::whir_block_tree::{WhirBlockTreeProof, verify_whir_block_tree_proof_at};
+
+/// A top with no proof in it: every check here stops before the top is read
+/// (the frame's refusals), so what reaches it is a statement the frame took.
+fn empty_top() -> super::super::proof::LfmProof {
+    super::super::proof::LfmProof {
+        proof: super::super::proof::LfmStarkProof {
+            multi: stark::proof::stark::MultiProof { proofs: vec![] },
+            commit_ood: vec![],
+        },
+        public_words: vec![],
+    }
+}
+
+/// The small word block's statement, packed under the verifier's pinned
+/// format with `memory`'s loads and stores (so its groups are the ones that
+/// verifier stacks).
+fn pinned_statement(memory: MemoryFormat, mix: Mix<'_>) -> OwnedBlockStatement {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let format = BlockFormat::pinned().with_memory(memory);
+    let opts = crate::lfm::proof::block_base_options_under(&format.zf);
+    mix_statement(elf, &opts, &format, mix, 2, 1)
+}
+
+/// The file verifier at every pinned named choice and `memory`.
+fn verify_file_under(file: &WhirBlockTreeProof, memory: MemoryFormat) -> Result<(), String> {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let pinned = BlockFormat::pinned();
+    verify_whir_block_tree_proof_at(
+        elf,
+        file,
+        pinned.group,
+        crate::zf_format::WhirBlowup::Two,
+        pinned.zf.whir_leaves,
+        pinned.zf.whir_trees,
+        pinned.leaf_scale,
+        pinned.leaf_query,
+        multilinear::whir_chain::GkrPack::PRODUCTION,
+        memory,
+    )
+}
+
+/// The verifier's plan of `owned` under the pinned named choices and
+/// `memory`: what the file verifier derives before it reads the top.
+fn verifier_plan_under(
+    owned: &OwnedBlockStatement,
+    memory: MemoryFormat,
+) -> Result<WhirBlockPlan, String> {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let pinned = BlockFormat::pinned();
+    let presets = super::verifier_presets_at(
+        pinned.group,
+        crate::zf_format::WhirBlowup::Two,
+        pinned.zf.whir_leaves,
+        pinned.zf.whir_trees,
+        pinned.leaf_scale,
+        pinned.leaf_query,
+        multilinear::whir_chain::GkrPack::PRODUCTION,
+        memory,
+    )?;
+    super::verifier_plan(elf, owned.view(), &presets)
+}
+
+/// The small split block: SMALL_WORDS' tables with the split format's memory
+/// tables in place of the word families.
+const SMALL_SPLIT: Mix<'static> = &[
+    ("CPU", &[(1 << 12, 2)]),
+    ("LT", &[(1 << 10, 1)]),
+    ("BRANCH", &[(1 << 9, 1)]),
+    ("MEMW_R", &[(1 << 10, 1)]),
+    ("COPY", &[(1 << 8, 1)]),
+    ("LOAD", &[(1 << 11, 1)]),
+    ("STORE", &[(1 << 10, 1)]),
+    ("MEMW_A", &[(1 << 11, 1)]),
+    ("MEMW", &[(1 << 9, 1)]),
+];
+
+/// ★ At the tree's verifier: the memory format is the caller's named
+/// choice and the file's counts are read under it. A word block's file is
+/// refused under the split and the fused format by their rule (they state no
+/// word table), and its verifier plan under the word format is the prover's
+/// own plan of it (the same block identity, so a top the prover's tree claims
+/// is the one this verifier asks for); a split block's file under the word
+/// format is refused by the retired-table rule, and under the split format
+/// its plan is the pinned verifier's (`pinned_verifier_presets`), as before
+/// the named choice. Each refusal's control: its rule taken out, the file
+/// passes the frame or is refused by another rule.
+#[test]
+fn the_tree_verifier_reads_a_file_under_its_named_memory_format() {
+    let words = pinned_statement(MemoryFormat::Words, SMALL_WORDS);
+    let file = WhirBlockTreeProof::new(words.clone(), empty_top());
+    assert_eq!(file.word_memory, words.word_memory);
+    for other in [MemoryFormat::Split, MemoryFormat::Fused] {
+        let refused = verify_file_under(&file, other).expect_err("refused");
+        assert!(
+            refused.contains(&format!("the {other:?} memory format states no word table")),
+            "{other:?}: {refused}"
+        );
+        crate::block_whir::WORD_COUNTS_UNCHECKED.with(|c| c.set(true));
+        let control = verify_file_under(&file, other);
+        crate::block_whir::WORD_COUNTS_UNCHECKED.with(|c| c.set(false));
+        let control = control.expect_err("refused by another rule");
+        assert!(
+            !control.contains("states no word table"),
+            "{other:?} control: {control}"
+        );
+    }
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let verifier = verifier_plan_under(&words, MemoryFormat::Words).expect("the word plan");
+    let format = BlockFormat::pinned().with_memory(MemoryFormat::Words);
+    let prover = WhirBlockPlan::derive(
+        elf,
+        &crate::lfm::proof::block_base_options_under(&format.zf),
+        &format,
+        words.view(),
+        None,
+    )
+    .expect("the prover's plan");
+    assert_eq!(
+        verifier.id(),
+        prover.id(),
+        "the verifier asks for the prover's block"
+    );
+
+    let split = pinned_statement(MemoryFormat::Split, SMALL_SPLIT);
+    let split_file = WhirBlockTreeProof::new(split.clone(), empty_top());
+    assert_eq!(
+        (split_file.fused_memory, split_file.word_memory),
+        ([0, 0], [0; 7])
+    );
+    let refused = verify_file_under(&split_file, MemoryFormat::Words).expect_err("refused");
+    assert!(refused.contains("states no LOAD table"), "{refused}");
+    crate::block_whir::RETIRED_COUNTS_UNCHECKED.with(|c| c.set(true));
+    let control = verify_file_under(&split_file, MemoryFormat::Words);
+    crate::block_whir::RETIRED_COUNTS_UNCHECKED.with(|c| c.set(false));
+    assert!(
+        !control
+            .expect_err("refused by another rule")
+            .contains("states no LOAD table"),
+        "the retired rule's control"
+    );
+    let named = verifier_plan_under(&split, MemoryFormat::Split).expect("the split plan");
+    let pinned = super::verifier_plan(
+        elf,
+        split.view(),
+        &super::pinned_verifier_presets(BlockFormat::pinned().group),
+    )
+    .expect("the pinned plan");
+    assert_eq!(
+        named.id(),
+        pinned.id(),
+        "the named split verifier is the pinned one"
+    );
+    assert_ne!(named.id(), verifier.id());
+}
+
+/// ★ At the tree's verifier, under the word format: each of the
+/// frame's word rules refuses a file that breaks it, through the file
+/// verifier (not only the host block verifier) — a retired table stated, a
+/// chip's table the format takes no call of yet, a PAGE_W table at another
+/// height, a word table past 2^21 rows — and a word count moved from one
+/// family to another (the total kept) derives another block's identity.
+/// The two count rules' controls: the rule taken out, another refuses.
+#[test]
+fn every_word_rule_of_the_frame_refuses_the_tree_verifiers_file() {
+    let honest = pinned_statement(MemoryFormat::Words, SMALL_WORDS);
+    let honest_id = *verifier_plan_under(&honest, MemoryFormat::Words)
+        .expect("the honest plan")
+        .id();
+    let refused = |owned: &OwnedBlockStatement| {
+        verify_file_under(
+            &WhirBlockTreeProof::new(owned.clone(), empty_top()),
+            MemoryFormat::Words,
+        )
+        .expect_err("refused")
+    };
+    let mut retired = honest.clone();
+    retired.table_counts.load = 1;
+    let e = refused(&retired);
+    assert!(e.contains("states no LOAD table"), "{e}");
+    crate::block_whir::RETIRED_COUNTS_UNCHECKED.with(|c| c.set(true));
+    let control = refused(&retired);
+    crate::block_whir::RETIRED_COUNTS_UNCHECKED.with(|c| c.set(false));
+    assert!(!control.contains("states no LOAD table"), "{control}");
+
+    let mut chip = honest.clone();
+    chip.table_counts.hint = 1;
+    let e = refused(&chip);
+    assert!(e.contains("takes no chip yet: no HINT table"), "{e}");
+    crate::block_whir::CHIP_COUNTS_UNCHECKED.with(|c| c.set(true));
+    let control = refused(&chip);
+    crate::block_whir::CHIP_COUNTS_UNCHECKED.with(|c| c.set(false));
+    assert!(!control.contains("takes no chip yet"), "{control}");
+
+    let plan = verifier_plan_under(&honest, MemoryFormat::Words).expect("the honest plan");
+    let names: Vec<String> = plan
+        .frame
+        .airs
+        .air_refs()
+        .iter()
+        .map(|a| a.name().to_string())
+        .collect();
+    let page = names
+        .iter()
+        .position(|n| n.starts_with(crate::tables::page_w::NAME_PREFIX))
+        .expect("a PAGE_W table");
+    let mut tall = honest.clone();
+    tall.table_num_vars[page] += 1;
+    let e = refused(&tall);
+    assert!(e.contains("a PAGE_W table is 2^15"), "{e}");
+    let word = names
+        .iter()
+        .position(|n| n.starts_with("MEM_LOAD8["))
+        .expect("a MEM_LOAD8 table");
+    let mut long = honest.clone();
+    long.table_num_vars[word] = 22;
+    let e = refused(&long);
+    assert!(e.contains("a block takes at most 2^21"), "{e}");
+
+    let mut moved = honest.clone();
+    assert!(moved.word_memory[0] > 1);
+    moved.word_memory[0] -= 1;
+    moved.word_memory[1] += 1;
+    match verifier_plan_under(&moved, MemoryFormat::Words) {
+        Err(e) => println!("MOVED WORD COUNT: refused: {e}"),
+        Ok(plan) => assert_ne!(*plan.id(), honest_id, "a moved count is another block"),
+    }
+}

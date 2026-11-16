@@ -439,6 +439,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         LeafScale::Fixed,
         LeafQuery::V1,
         multilinear::whir_chain::GkrPack::PRODUCTION,
+        crate::tables::fused_memory::MemoryFormat::Split,
     )
     .expect("named choices");
     assert_eq!(
@@ -533,6 +534,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         pinned_format.leaf_scale,
         pinned_format.leaf_query,
         multilinear::whir_chain::GkrPack::PRODUCTION,
+        crate::tables::fused_memory::MemoryFormat::Split,
     )
     .expect("the other trees");
     assert_eq!(named.format.zf.whir_trees, other);
@@ -556,6 +558,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
             pinned_format.leaf_scale,
             pinned_format.leaf_query,
             multilinear::whir_chain::GkrPack::PRODUCTION,
+            crate::tables::fused_memory::MemoryFormat::Split,
         )
         .is_err(),
         "one tree a run under the natural order is refused"
