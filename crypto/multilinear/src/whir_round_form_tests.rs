@@ -1153,3 +1153,103 @@ fn a_rate_that_ignores_the_shrink_drops_a_round_below_the_target() {
     let worst = b.shift.iter().copied().fold(b.final_round, f64::min);
     assert!(worst < 128.0, "{worst}");
 }
+
+// ───────────────────────────── the card ──────────────────────────────────────
+
+/// Runs `f` with every WHIR commit, re-encode, fold and opening declined by
+/// the card: the host arm of a card parity test, in the same binary.
+#[cfg(feature = "cuda")]
+fn on_the_host<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::gpu::force_host_whir_commit(false);
+            crate::gpu::force_shared_open_declined(false);
+        }
+    }
+    crate::gpu::force_host_whir_commit(true);
+    crate::gpu::force_shared_open_declined(true);
+    let _restore = Restore;
+    f()
+}
+
+/// A value's rkyv bytes.
+#[cfg(feature = "cuda")]
+macro_rules! bytes {
+    ($value:expr) => {
+        rkyv::to_bytes::<rkyv::rancor::Error>($value)
+            .unwrap()
+            .to_vec()
+    };
+}
+
+/// Commits, proves and verifies a stack under `cfg`, returning the proof's
+/// bytes.
+#[cfg(feature = "cuda")]
+fn stacked_bytes<B: WhirHash>(heights: &[usize], n_stack: usize, cfg: &ChainConfig) -> Vec<u8> {
+    let mut out = Vec::new();
+    stacked_round_trip::<B>(heights, n_stack, cfg, |proof| out = bytes!(&*proof))
+        .expect("the proof verifies");
+    out
+}
+
+/// ★★ A ROUND-FORM PROOF ON THE CARD IS THE HOST'S, BYTE FOR BYTE: a chain
+/// over a `2^16` polynomial (keccak trees, first fold 4, shrink 3) and a
+/// grouped stack of `2^16` polynomials (7-round BLAKE3, the coset leaf order,
+/// one joint round-0 tree a run, a final polynomial, shrink 2 and 3) proved
+/// with the commits, the openings, the successors' encodes and the shift
+/// claims' weights on the card, and again with the card declining all of it.
+/// The card arm encoded every round-form successor there (none on the host)
+/// and added the claims in batches; both proofs verify. Box tier: one
+/// `#[test]`, since the arms switch process-wide overrides.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a card; box tier"]
+fn a_round_form_proof_on_the_card_is_the_hosts_byte_for_byte() {
+    let n = 16;
+    let cfg = whir(1, Some(4), 4, 3, n, 48);
+    let host = on_the_host(|| single(&cfg, n, 3));
+    check_single_ok(&host, &cfg);
+    crate::gpu::reset_call_counters();
+    let card = single(&cfg, n, 3);
+    assert!(
+        card.commitment.codeword().on_device(),
+        "the card took the commit"
+    );
+    let successors = cfg.rounds(n) as u64 - 1;
+    assert_eq!(
+        crate::gpu::round_form_host_encodes(),
+        0,
+        "no successor on the host"
+    );
+    assert_eq!(
+        crate::gpu::encoded_successors(),
+        successors,
+        "every successor on the card"
+    );
+    assert_eq!(
+        crate::gpu::shift_claim_batches(),
+        successors,
+        "one batch a successor"
+    );
+    check_single_ok(&card, &cfg);
+    assert_eq!(bytes!(&card.proof), bytes!(&host.proof), "a single chain");
+    assert_eq!(card.commitment.root(), host.commitment.root());
+
+    let heights = [16usize, 16, 15, 16, 14, 16, 16];
+    for shrink in [2usize, 3] {
+        let mut stack = fri(1, Some(4), 4, 16, 48);
+        stack.format.group = GroupFold::Indexed;
+        stack.format.leaves = LeafOrder::Coset;
+        stack.format.round0 = Round0Trees::One;
+        stack.format.final_poly = FinalPoly::vars(5).unwrap();
+        stack.format.cap = CapPolicy::Fixed(3);
+        let stack = stack.with_whir_rounds(shrink, 48, 16).unwrap();
+        let host = on_the_host(|| stacked_bytes::<Blake3Whir>(&heights, 16, &stack));
+        crate::gpu::reset_call_counters();
+        let card = stacked_bytes::<Blake3Whir>(&heights, 16, &stack);
+        assert_eq!(crate::gpu::round_form_host_encodes(), 0, "shrink {shrink}");
+        assert!(crate::gpu::shift_claim_batches() > 0, "shrink {shrink}");
+        assert_eq!(card, host, "a grouped stack at shrink {shrink}");
+    }
+}
