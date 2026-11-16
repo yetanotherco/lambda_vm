@@ -50,8 +50,7 @@ use super::word_cpu::{
     msb8, one_hot_constraints, pair_lookups, placed, word_class, word_key,
 };
 use super::word_memory::{
-    WORD_BYTES, byte_pair_checks, halves, step_less_one, step_limbs, term, word_check_of,
-    word_of_bytes,
+    WORD_BYTES, checked_word, halves, step_less_one, step_limbs, term, word_check_of, word_of_bytes,
 };
 
 /// Column definitions for the MEM_LOADW table.
@@ -259,24 +258,16 @@ pub(crate) fn generate_mem_loadw_trace_segments_as(
 /// MEM_LOADW's 12 interactions (module docs).
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let address = [cols::ADDRESS_LO, cols::ADDRESS_HI];
-    let word = || {
-        [
-            word_of_bytes(&cols::BYTES[..4]),
-            word_of_bytes(&cols::BYTES[4..]),
-        ]
-    };
+    let (word, checks) = checked_word(&cols::BYTES, Multiplicity::Column(cols::MU));
     let mut interactions = word_check_of(
         word_key(address, cols::OFF, 0),
         cols::TIMESTAMP,
-        word(),
-        word(),
+        word.clone(),
+        word,
         [cols::STEP_0, cols::STEP_1],
         Multiplicity::Column(cols::MU),
     );
-    interactions.extend(byte_pair_checks(
-        &cols::BYTES,
-        Multiplicity::Column(cols::MU),
-    ));
+    interactions.extend(checks);
     // MSB8 on the highest byte read: byte 0 at `MU − READ2 − READ4` (one
     // byte), byte 1 at `READ2`, byte 3 at `READ4`.
     let read1 = Multiplicity::Linear(vec![

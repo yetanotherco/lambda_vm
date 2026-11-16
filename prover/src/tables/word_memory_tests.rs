@@ -13,11 +13,14 @@
 //! - every table's constraints on every row;
 //! - every preprocessed column against the verifier's own.
 //!
-//! The stand-in chips read their pointer from register x12 as HINT does
-//! (`hint.rs`' register read) and access two words at `pointer + 8i`; the
-//! stand-in register file answers a register read only with the register's
-//! true value (its value columns are the verifier's), though a forger may leave
-//! a read unanswered. A forgery is a malicious prover's edit of an honest
+//! The stand-in chips are held as a real chip is: each reads its pointer from
+//! register x12 as HINT does (`hint.rs`' register read), takes its call on the
+//! `Ecall` bus at the call's timestamp, accesses two words at `pointer + 8i`
+//! with messages at that timestamp and multiplicity (a bit), and a writer
+//! range-checks the 16-bit halves of the words it writes. The stand-in
+//! register file answers a register read only with the register's true value
+//! (its value columns are the verifier's), and the stand-in clock's calls are
+//! the verifier's, though a forger may leave a read unanswered. A forgery is a malicious prover's edit of an honest
 //! bench; each one a check refuses also runs with that one check taken out (a
 //! control mutant) and is then accepted, so the check is what refuses it.
 
@@ -35,8 +38,7 @@ use super::page::{DEFAULT_PAGE_SIZE, PageConfig};
 use super::page_w::{self, FinalWordMap, FinalWordState, cols as pw};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use super::word_memory::{
-    access_message, byte_pair_checks, column, halves, step_less_one, step_limbs, term,
-    word_of_bytes, write_message,
+    access_message, checked_word, column, halves, step_less_one, step_limbs, term, write_message,
 };
 use crate::block_whir;
 use crate::tables::fused_memory::MemoryFormat;
@@ -333,9 +335,60 @@ mod chip {
     pub const PTR_HI: usize = 1;
     pub const TS: usize = 2;
     pub const MU: usize = 3;
-    /// Word `i`'s halves at `W[2i]`, `W[2i + 1]`.
-    pub const W: [usize; 4] = [4, 5, 6, 7];
-    pub const NUM_COLUMNS: usize = 8;
+    /// Word `i`'s four 16-bit halves, low first, at `H[4i..4i + 4]`.
+    pub const H: [usize; 8] = [4, 5, 6, 7, 8, 9, 10, 11];
+    pub const NUM_COLUMNS: usize = 12;
+}
+
+/// The call number the stand-in chips answer on the `Ecall` bus.
+const CHIP_CALL: u64 = 0x5151;
+
+/// The stand-in clock's columns, all the verifier's: a call's timestamp and
+/// its multiplicity. The CPU sends each ECALL once, at its cycle's timestamp.
+mod clock {
+    pub const TS: usize = 0;
+    pub const MU: usize = 1;
+    pub const NUM_COLUMNS: usize = 2;
+}
+
+/// The stand-in clock's `Ecall` send `(TS, 0, CHIP_CALL, 0)`, the CPU's.
+fn clock_interactions() -> Vec<BusInteraction> {
+    vec![BusInteraction::sender(
+        BusId::Ecall,
+        Multiplicity::Column(clock::MU),
+        vec![
+            column(clock::TS),
+            BusValue::constant(0),
+            BusValue::constant(CHIP_CALL),
+            BusValue::constant(0),
+        ],
+    )]
+}
+
+/// Word `i` of a stand-in chip as its two 32-bit halves, each two 16-bit
+/// columns.
+fn chip_word(i: usize) -> [BusValue; 2] {
+    let h = |k: usize| chip::H[4 * i + k];
+    [
+        BusValue::linear(vec![term(1, h(0)), term(1 << 16, h(1))]),
+        BusValue::linear(vec![term(1, h(2)), term(1 << 16, h(3))]),
+    ]
+}
+
+/// The stand-in chips' constraint: `MU` a bit.
+fn chip_constraints(row: &[FE]) -> Vec<FE> {
+    vec![row[chip::MU] * (FE::one() - row[chip::MU])]
+}
+
+/// Sets word `i` of `piece`'s chip row `row` to `(lo, hi)` (each up to 48
+/// bits: a forger's half past 32 bits sits in its high 16-bit column).
+fn set_chip_word(bench: &mut Bench, piece: &str, row: usize, i: usize, lo: u64, hi: u64) {
+    for (k, half) in [lo & 0xFFFF, lo >> 16, hi & 0xFFFF, hi >> 16]
+        .into_iter()
+        .enumerate()
+    {
+        bench.set_u64(piece, row, chip::H[4 * i + k], half);
+    }
 }
 
 /// A register read of `reg` → `(lo, hi)` at `(ts, 0)` on `Memw`, in HINT's
@@ -361,8 +414,11 @@ fn register_read(reg: u64, lo: BusValue, hi: BusValue, ts: BusValue) -> Vec<BusV
     v
 }
 
-/// A stand-in chip: reads its pointer from x12 and writes (or reads) two words
-/// at `pointer + 8i`, one message a word.
+/// A stand-in chip, as a real one is held (the census's sender rules): it
+/// reads its pointer from x12, takes its call on the `Ecall` bus at the
+/// call's timestamp, and writes (or reads) two words at `pointer + 8i`, one
+/// message a word at the call's timestamp and multiplicity; a writer checks
+/// the 16-bit halves of each word it writes, a reader sends old = new.
 fn chip_interactions(kind: MessageKind) -> Vec<BusInteraction> {
     let mu = || Multiplicity::Column(chip::MU);
     let mut out = vec![BusInteraction::sender(
@@ -383,12 +439,28 @@ fn chip_interactions(kind: MessageKind) -> Vec<BusInteraction> {
             ]),
             column(chip::PTR_HI),
         ];
-        let word = || [column(chip::W[2 * i]), column(chip::W[2 * i + 1])];
         let message = match kind {
-            MessageKind::Write => write_message(address, column(chip::TS), word()),
-            MessageKind::Access => access_message(address, column(chip::TS), word(), word()),
+            MessageKind::Write => write_message(address, column(chip::TS), chip_word(i)),
+            MessageKind::Access => {
+                access_message(address, column(chip::TS), chip_word(i), chip_word(i))
+            }
         };
         out.push(BusInteraction::sender(BusId::MemWordMsg, mu(), message));
+    }
+    out.push(BusInteraction::receiver(
+        BusId::Ecall,
+        mu(),
+        vec![
+            column(chip::TS),
+            BusValue::constant(0),
+            BusValue::constant(CHIP_CALL),
+            BusValue::constant(0),
+        ],
+    ));
+    if kind == MessageKind::Write {
+        out.extend(
+            chip::H.map(|h| BusInteraction::sender(BusId::IsHalfword, mu(), vec![column(h)])),
+        );
     }
     out
 }
@@ -460,6 +532,8 @@ struct Model {
     writers: Vec<ChipRow>,
     readers: Vec<ChipRow>,
     regs: Vec<RegRow>,
+    /// The calls' timestamps, as the clock has them.
+    calls: Vec<u64>,
 }
 
 impl Model {
@@ -471,6 +545,7 @@ impl Model {
             writers: Vec::new(),
             readers: Vec::new(),
             regs: Vec::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -517,6 +592,7 @@ impl Model {
             self.touch(MessageKind::Write, ptr + 8 * i as u64, ts, w);
         }
         self.writers.push(ChipRow { ptr, ts, words });
+        self.calls.push(ts);
     }
 
     fn read(&mut self, ptr: u64, ts: u64) -> [u64; 2] {
@@ -530,6 +606,7 @@ impl Model {
             self.touch(MessageKind::Access, ptr + 8 * i as u64, ts, w);
         }
         self.readers.push(ChipRow { ptr, ts, words });
+        self.calls.push(ts);
         words
     }
 
@@ -560,17 +637,35 @@ impl Model {
                     t.main_table.set(row, chip::TS, FE::from(r.ts));
                     t.main_table.set(row, chip::MU, FE::one());
                     for (i, &w) in r.words.iter().enumerate() {
-                        let (lo, hi) = halves(w);
-                        t.main_table
-                            .set(row, chip::W[2 * i], FE::from(u64::from(lo)));
-                        t.main_table
-                            .set(row, chip::W[2 * i + 1], FE::from(u64::from(hi)));
+                        for k in 0..4 {
+                            let half = (w >> (16 * k)) & 0xFFFF;
+                            t.main_table.set(row, chip::H[4 * i + k], FE::from(half));
+                        }
                     }
                 }),
                 preprocessed: Vec::new(),
-                constraints: None,
+                constraints: Some(chip_constraints),
             });
         }
+        // The clock is the verifier's: a forger may not move a call.
+        let calls = table(self.calls.len(), clock::NUM_COLUMNS, |t, row| {
+            t.main_table.set(row, clock::TS, FE::from(self.calls[row]));
+            t.main_table.set(row, clock::MU, FE::one());
+        });
+        let truth = (0..clock::NUM_COLUMNS)
+            .map(|c| {
+                (0..calls.num_rows())
+                    .map(|r| *calls.get_main(r, c))
+                    .collect()
+            })
+            .collect();
+        pieces.push(Piece {
+            name: "CLOCK".into(),
+            interactions: clock_interactions(),
+            trace: calls,
+            preprocessed: truth,
+            constraints: None,
+        });
         let regs = table(self.regs.len(), regs::NUM_COLUMNS, |t, row| {
             let r = self.regs[row];
             let (lo, hi) = halves(r.value);
@@ -819,10 +914,12 @@ fn an_elf_page_init_word_is_the_verifiers() {
 
 // ---- canonical words at PAGE_W's mint ----
 
-/// ★ A private-input page's initial word is canonical: `INIT_1 = 2^16 + y`
-/// makes a low half of `2^32 + x`, carried through a chip's read to the page's
-/// final word, refused by `IS_HALF` on `INIT_1` alone. Control: that lookup
-/// removed, the chip reads a word that is not one.
+/// ★ A private-input page's initial word is canonical, each of its four
+/// 16-bit halves by its own `IS_HALF`: one half moved past 16 bits (`INIT_0`
+/// or `INIT_2` by `2^32`, `INIT_1` or `INIT_3` by `2^16`) makes a 32-bit half of
+/// `2^32 + x`, carried through a chip's read to the page's final word, and is
+/// refused by that half's lookup alone. Control: that lookup removed, the chip
+/// reads a word that is not one.
 #[test]
 fn a_private_init_word_past_32_bits_is_refused_by_its_half_check() {
     let (m, bench) = honest();
@@ -830,26 +927,45 @@ fn a_private_init_word_past_32_bits_is_refused_by_its_half_check() {
     let word = 0x10 / 8;
     let row = memw_w_row(&m, INPUT_BASE + 0x10, 24);
     let reader = m.readers.iter().position(|r| r.ts == 24).expect("the read");
-    let mut forged = bench.clone();
-    let lo = forged.get("MEMW_W", row, mw::OLD_LO) + FE::from(1u64 << 32);
-    let h1 = forged.get(&name, word, pw::INIT[1]) + FE::from(1u64 << 16);
-    forged.set(&name, word, pw::INIT[1], h1);
-    forged.set(&name, word, pw::FINI_LO, lo);
-    forged.set("MEMW_W", row, mw::OLD_LO, lo);
-    forged.set("MEMW_W", row, mw::NEW_LO, lo);
-    forged.set("READER", reader, chip::W[0], lo);
-    let v = verdict(&forged);
-    assert_eq!(
-        v.unanswered,
-        vec![(u64::from(BusId::IsHalfword), vec![h1.canonical_u64()])],
-        "{v:?}"
-    );
-    assert!(v.left.is_empty() && v.broken.is_empty() && v.preprocessed.is_empty());
+    let read = m.readers[reader].words[0];
+    for k in 0..4 {
+        let mut forged = bench.clone();
+        // The half `k` past 16 bits: its 32-bit half `2^32` more.
+        let (delta, upper) = match k {
+            0 | 2 => (FE::from(1u64 << 32), k == 2),
+            _ => (FE::from(1u64 << 16), k == 3),
+        };
+        let h = forged.get(&name, word, pw::INIT[k]) + delta;
+        forged.set(&name, word, pw::INIT[k], h);
+        let (fini, old, new) = if upper {
+            (pw::FINI_HI, mw::OLD_HI, mw::NEW_HI)
+        } else {
+            (pw::FINI_LO, mw::OLD_LO, mw::NEW_LO)
+        };
+        let half = forged.get("MEMW_W", row, old) + FE::from(1u64 << 32);
+        forged.set(&name, word, fini, half);
+        forged.set("MEMW_W", row, old, half);
+        forged.set("MEMW_W", row, new, half);
+        let (lo, hi) = (read & 0xFFFF_FFFF, read >> 32);
+        let (lo, hi) = if upper {
+            (lo, hi + (1 << 32))
+        } else {
+            (lo + (1 << 32), hi)
+        };
+        set_chip_word(&mut forged, "READER", reader, 0, lo, hi);
+        let v = verdict(&forged);
+        assert_eq!(
+            v.unanswered,
+            vec![(u64::from(BusId::IsHalfword), vec![h.canonical_u64()])],
+            "INIT_{k}: {v:?}"
+        );
+        assert!(v.left.is_empty() && v.broken.is_empty() && v.preprocessed.is_empty());
 
-    let mut control = page_w::bus_interactions(INPUT_BASE, true).expect("aligned");
-    control.remove(2 + 1);
-    let v = verdict(&forged.with_interactions(&name, control));
-    assert!(v.accepted(), "control: {v:?}");
+        let mut control = page_w::bus_interactions(INPUT_BASE, true).expect("aligned");
+        control.remove(2 + k);
+        let v = verdict(&forged.with_interactions(&name, control));
+        assert!(v.accepted(), "INIT_{k} control: {v:?}");
+    }
 }
 
 // ---- one access a word a timestamp ----
@@ -902,6 +1018,11 @@ fn a_word_written_twice_at_one_timestamp_is_refused_by_the_step() {
         .position(|r| r.ts == 9)
         .expect("the write at 9");
     forged.set_u64("WRITER", writer, chip::TS, 8);
+    // The clock's truth moves with it: the test posits two calls at 8, as one
+    // call that touches a word twice at its timestamp would.
+    let call = m.calls.iter().position(|&t| t == 9).expect("the call at 9");
+    forged.piece_mut("CLOCK").preprocessed[clock::TS][call] = FE::from(8u64);
+    forged.set_u64("CLOCK", call, clock::TS, 8);
     // x12 at 8 answers both calls.
     let reg_9 = m.regs.iter().position(|r| r.ts == 9).expect("x12 at 9");
     let reg_8 = m.regs.iter().position(|r| r.ts == 8).expect("x12 at 8");
@@ -951,6 +1072,7 @@ fn with_unaligned_calls(ptr: u64, write_ts: u64, words: [u64; 2], read_ts: Optio
             MessageKind::Write => m.writers.push(row),
             MessageKind::Access => m.readers.push(row),
         }
+        m.calls.push(ts);
         for (i, &w) in words.iter().enumerate() {
             // `MemwWordRow::new` refuses an unaligned address: lay out its
             // aligned twin, then move the address.
@@ -1027,81 +1149,83 @@ fn an_unaligned_chip_write_consumes_tokens_nothing_minted() {
 
 // ---- a word's bytes, all eight checked ----
 
-/// ★ The byte gadget: eight bytes summed into a word's halves, four pair
-/// checks. A forger keeping the word moves a byte to `256 + x` and its
-/// neighbour down one; the pair check refuses it. Control: that pair removed.
+/// ★ The byte gadget ([`checked_word`]): eight bytes summed into a word's
+/// halves, four pair checks on the same columns. For each pair, a forger
+/// keeping the word moves its first byte to `256 + x` and its second down one
+/// (a lie about the second byte); that pair's check refuses it, and nothing
+/// else. Control: that pair removed.
 #[test]
 fn a_byte_past_255_is_refused_by_its_pair() {
     const BYTES: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
     const MU: usize = 8;
-    // A table exposing a word's bytes, and one taking the word: on a bus of
-    // the test's own.
-    let bus = 1000u64;
-    let split = {
-        let mut i = byte_pair_checks(&BYTES, Multiplicity::Column(MU));
-        i.push(BusInteraction::sender(
+    let word: u64 = 0x8070_6050_4030_2010;
+    let bytes = word.to_le_bytes();
+    let (halves_of, checks) = checked_word(&BYTES, Multiplicity::Column(MU));
+    assert_eq!(checks.len(), 4, "every byte in a pair");
+    for j in 0..4usize {
+        // A table exposing the word's bytes and naming byte `2j + 1`, and one
+        // taking the word and that byte: on a bus of the test's own.
+        let bus = 1000u64;
+        let mut split = checks.clone();
+        split.push(BusInteraction::sender(
             bus,
             Multiplicity::Column(MU),
             vec![
-                word_of_bytes(&[0, 1, 2, 3]),
-                word_of_bytes(&[4, 5, 6, 7]),
-                column(BYTES[1]),
+                halves_of[0].clone(),
+                halves_of[1].clone(),
+                column(BYTES[2 * j + 1]),
             ],
         ));
-        i
-    };
-    let word: u64 = 0x8070_6050_4030_2010;
-    let take = BusInteraction::receiver(
-        bus,
-        Multiplicity::One,
-        vec![
-            BusValue::constant(word & 0xFFFF_FFFF),
-            BusValue::constant(word >> 32),
-            column(0),
-        ],
-    );
-    let bytes = word.to_le_bytes();
-    let mut split_row: Vec<FE> = bytes.iter().map(|&b| FE::from(u64::from(b))).collect();
-    split_row.push(FE::one());
-    let honest = Bench {
-        pieces: vec![
-            Piece {
-                name: "SPLIT".into(),
-                interactions: split.clone(),
-                trace: TraceTable::new_main(split_row, 9, 1),
-                preprocessed: Vec::new(),
-                constraints: None,
-            },
-            Piece {
-                name: "TAKE".into(),
-                interactions: vec![take],
-                trace: TraceTable::new_main(vec![FE::from(u64::from(bytes[1]))], 1, 1),
-                preprocessed: Vec::new(),
-                constraints: None,
-            },
-        ],
-    };
-    assert!(verdict(&honest).accepted());
+        let take = BusInteraction::receiver(
+            bus,
+            Multiplicity::One,
+            vec![
+                BusValue::constant(word & 0xFFFF_FFFF),
+                BusValue::constant(word >> 32),
+                column(0),
+            ],
+        );
+        let mut split_row: Vec<FE> = bytes.iter().map(|&b| FE::from(u64::from(b))).collect();
+        split_row.push(FE::one());
+        let honest = Bench {
+            pieces: vec![
+                Piece {
+                    name: "SPLIT".into(),
+                    interactions: split.clone(),
+                    trace: TraceTable::new_main(split_row, 9, 1),
+                    preprocessed: Vec::new(),
+                    constraints: None,
+                },
+                Piece {
+                    name: "TAKE".into(),
+                    interactions: vec![take],
+                    trace: TraceTable::new_main(vec![FE::from(u64::from(bytes[2 * j + 1]))], 1, 1),
+                    preprocessed: Vec::new(),
+                    constraints: None,
+                },
+            ],
+        };
+        assert!(verdict(&honest).accepted(), "pair {j}");
 
-    // Byte 0 + 256 and byte 1 − 1: the word is unchanged, byte 1 is a lie.
-    let mut forged = honest.clone();
-    forged.set("SPLIT", 0, BYTES[0], FE::from(u64::from(bytes[0]) + 256));
-    forged.set("SPLIT", 0, BYTES[1], FE::from(u64::from(bytes[1]) - 1));
-    forged.set("TAKE", 0, 0, FE::from(u64::from(bytes[1]) - 1));
-    let v = verdict(&forged);
-    assert_eq!(
-        v.unanswered,
-        vec![(
-            u64::from(BusId::AreBytes),
-            vec![u64::from(bytes[0]) + 256, u64::from(bytes[1]) - 1]
-        )],
-        "{v:?}"
-    );
-    assert!(v.left.is_empty());
-    let mut control = split;
-    control.remove(0);
-    let v = verdict(&forged.with_interactions("SPLIT", control));
-    assert!(v.accepted(), "control: {v:?}");
+        // Byte 2j + 256 and byte 2j + 1 − 1: the word is unchanged, the second
+        // byte is a lie.
+        let (first, second) = (u64::from(bytes[2 * j]), u64::from(bytes[2 * j + 1]));
+        let mut forged = honest.clone();
+        forged.set_u64("SPLIT", 0, BYTES[2 * j], first + 256);
+        forged.set_u64("SPLIT", 0, BYTES[2 * j + 1], second - 1);
+        forged.set_u64("TAKE", 0, 0, second - 1);
+        let v = verdict(&forged);
+        assert_eq!(
+            v.unanswered,
+            vec![(u64::from(BusId::AreBytes), vec![first + 256, second - 1])],
+            "pair {j}: {v:?}"
+        );
+        assert!(v.left.is_empty(), "pair {j}: {v:?}");
+        let mut control = split;
+        control.remove(j);
+        let v = verdict(&forged.with_interactions("SPLIT", control));
+        assert!(v.accepted(), "pair {j} control: {v:?}");
+    }
 }
 
 // ---- PAGE_W's final words ----
@@ -1352,12 +1476,39 @@ fn a_register_read_is_never_answered_from_ram() {
     forged.piece_mut("REGS").preprocessed[regs::VALUE_LO][r] = FE::from(0x100u64);
     forged.set_u64("REGS", r, regs::VALUE_LO, 0x100);
     forged.set_u64("REGS", r, regs::MU, 0);
+    let base = forged.clone();
+    // The attempt: a MEMW_W row reads RAM word 24 at 8. Its receive is on the
+    // word-message bus, so the chip's register read stays open on `Memw`,
+    // and the row's own message is sent by no one; the word bus balances.
+    let row = rows_used(&forged);
+    for (c, value) in [
+        (mw::ADDRESS_LO, 24),
+        (mw::TIMESTAMP, 8),
+        (mw::OLD_LO, 0x300),
+        (mw::NEW_LO, 0x300),
+        (mw::STEP_0, 8 - 2 - 1),
+        (mw::MU_ACCESS, 1),
+    ] {
+        forged.set_u64("MEMW_W", row, c, value);
+    }
+    forged.set_u64(&page_name(0), 24 / 8, pw::TIMESTAMP, 8);
     let v = verdict(&forged);
-    assert!(v.refused_only_on(BusId::Memw), "{v:?}");
+    assert_eq!(
+        v.left.keys().copied().collect::<Vec<_>>(),
+        vec![u64::from(BusId::Memw), u64::from(BusId::MemWordMsg)],
+        "{v:?}"
+    );
+    assert!(
+        v.left_on(BusId::MemWord).is_empty()
+            && v.unanswered.is_empty()
+            && v.broken.is_empty()
+            && v.preprocessed.is_empty(),
+        "{v:?}"
+    );
 
-    // Control: one more MEMW_W row reads RAM word 24 at 8 for the chip's
-    // register read; word 24's last token moves from 2 to 8.
-    let mut control = forged.with_interactions("MEMW_W", memw_w_receiving_memw());
+    // Control: MEMW_W receiving `Memw`, one more row reads RAM word 24 at 8
+    // for the chip's register read; word 24's last token moves from 2 to 8.
+    let mut control = base.with_interactions("MEMW_W", memw_w_receiving_memw());
     let wide = widen(&control.piece("MEMW_W").trace, 5);
     control.piece_mut("MEMW_W").trace = wide;
     let row = rows_used(&control);
@@ -1426,8 +1577,7 @@ fn a_minus_one_twin_is_refused_by_the_bit_constraint() {
     forged.set_u64("MEMW_W", read, mw::NEW_LO, 0x55);
     forged.set_u64("MEMW_W", read, mw::NEW_HI, 0);
     let reader = m.readers.iter().position(|r| r.ts == 12).expect("the read");
-    forged.set_u64("READER", reader, chip::W[0], 0x55);
-    forged.set_u64("READER", reader, chip::W[1], 0);
+    set_chip_word(&mut forged, "READER", reader, 0, 0x55, 0);
     let page = page_name(0);
     forged.set_u64(&page, 0x100 / 8, pw::FINI_LO, 0x55);
     forged.set_u64(&page, 0x100 / 8, pw::FINI_HI, 0);
@@ -1520,8 +1670,7 @@ fn the_message_kind_keeps_a_write_from_reading_as_an_access() {
         bench.set_u64("MEMW_W", r, c, 0);
     }
     let reader = m.readers.iter().position(|r| r.ts == 9).expect("the read");
-    bench.set_u64("READER", reader, chip::W[0], 0);
-    bench.set_u64("READER", reader, chip::W[1], 0);
+    set_chip_word(&mut bench, "READER", reader, 0, 0, 0);
     let page = page_name(ELF_BASE);
     bench.set_u64(&page, 0, pw::FINI_LO, 0);
     bench.set_u64(&page, 0, pw::FINI_HI, 0);
@@ -1536,6 +1685,118 @@ fn the_message_kind_keeps_a_write_from_reading_as_an_access() {
             }
         }
     }
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ A chip's word messages carry its call's timestamp. The honest bench's
+/// read of `0x100` at 12 claims `(0, 0)`, the words before the write at 8,
+/// by sending its messages at 5: MEMW_W's rows then read the page's first
+/// tokens and the write steps from 5. Refused on the `Ecall` and `Memw` buses
+/// alone (the call and its register read are at 12, the chip's row at 5).
+/// Control: the messages' timestamp a column of their own, the call left at
+/// 12, and the stale read balances; the census refuses that chip.
+#[test]
+fn a_chip_message_at_a_time_not_its_calls_is_refused() {
+    let (m, honest_bench) = honest();
+    let reader = m.readers.iter().position(|r| r.ts == 12).expect("the read");
+    let mut forged = honest_bench.clone();
+    for i in 0..2u64 {
+        let address = 0x100 + 8 * i;
+        let read = memw_w_row(&m, address, 12);
+        let write = memw_w_row(&m, address, 8);
+        forged.set_u64("MEMW_W", read, mw::TIMESTAMP, 5);
+        for c in [mw::OLD_LO, mw::OLD_HI, mw::NEW_LO, mw::NEW_HI] {
+            forged.set_u64("MEMW_W", read, c, 0);
+        }
+        forged.set_u64("MEMW_W", read, mw::STEP_0, 5 - 1);
+        forged.set_u64("MEMW_W", write, mw::STEP_0, 8 - 5 - 1);
+        forged.set_u64(&page_name(0), (address / 8) as usize, pw::TIMESTAMP, 8);
+        set_chip_word(&mut forged, "READER", reader, i as usize, 0, 0);
+    }
+    let mut real = forged.clone();
+    real.set_u64("READER", reader, chip::TS, 5);
+    let v = verdict(&real);
+    assert!(
+        !v.left_on(BusId::Ecall).is_empty()
+            && v.left
+                .keys()
+                .all(|&b| b == u64::from(BusId::Ecall) || b == u64::from(BusId::Memw))
+            && v.unanswered.is_empty()
+            && v.broken.is_empty()
+            && v.preprocessed.is_empty(),
+        "{v:?}"
+    );
+
+    // Control: the messages at a column of their own (5 on the forged row,
+    // the call's timestamp on every other).
+    let mut control =
+        forged.with_interactions("READER", chip_with_free_message_ts(MessageKind::Access));
+    control.piece_mut("READER").trace = widen(&control.piece("READER").trace, 1);
+    for r in 0..m.readers.len() {
+        let ts = control.get("READER", r, chip::TS);
+        control.set("READER", r, chip::NUM_COLUMNS, ts);
+    }
+    control.set_u64("READER", reader, chip::NUM_COLUMNS, 5);
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+    assert!(census_table("READER", &chip_with_free_message_ts(MessageKind::Access), 0).is_err());
+}
+
+/// ★ A converter row: MEMW_W at `(MU_WRITE, MU_ACCESS) = (−1, 1)` moves no
+/// token (its pair's multiplicity is 0), takes a chip's access message "read
+/// `0x55`", and its write receive at −1 sends "write `0x55`", which a second
+/// row takes, consuming the real word and producing `0x55`. The chip has read
+/// a word memory never held. Refused by constraint 0 (`MU_WRITE` a bit) on the
+/// converter row and nothing else. Control: constraint 0 reading zero.
+#[test]
+fn a_message_converter_row_is_refused_by_its_write_bit() {
+    let (m, bench) = honest();
+    let read = memw_w_row(&m, 0x100, 12);
+    let real = m.memw_w[read].old();
+    let mut forged = bench.clone();
+    for c in 0..mw::NUM_COLUMNS {
+        forged.set_u64("MEMW_W", read, c, 0);
+    }
+    let reader = m.readers.iter().position(|r| r.ts == 12).expect("the read");
+    set_chip_word(&mut forged, "READER", reader, 0, 0x55, 0);
+    let n = rows_used(&bench);
+    let converter = n;
+    let writer = n + 1;
+    for (c, value) in [
+        (mw::ADDRESS_LO, 0x100),
+        (mw::TIMESTAMP, 12),
+        (mw::OLD_LO, 0x55),
+        (mw::NEW_LO, 0x55),
+        (mw::MU_ACCESS, 1),
+    ] {
+        forged.set_u64("MEMW_W", converter, c, value);
+    }
+    forged.set("MEMW_W", converter, mw::MU_WRITE, FE::zero() - FE::one());
+    let (real_lo, real_hi) = halves(real);
+    for (c, value) in [
+        (mw::ADDRESS_LO, 0x100),
+        (mw::TIMESTAMP, 12),
+        (mw::OLD_LO, u64::from(real_lo)),
+        (mw::OLD_HI, u64::from(real_hi)),
+        (mw::NEW_LO, 0x55),
+        (mw::STEP_0, 12 - 8 - 1),
+        (mw::MU_WRITE, 1),
+    ] {
+        forged.set_u64("MEMW_W", writer, c, value);
+    }
+    let page = page_name(0);
+    forged.set_u64(&page, 0x100 / 8, pw::FINI_LO, 0x55);
+    forged.set_u64(&page, 0x100 / 8, pw::FINI_HI, 0);
+    let v = verdict(&forged);
+    assert!(v.left.is_empty() && v.unanswered.is_empty(), "{v:?}");
+    assert_eq!(
+        v.broken,
+        vec![("MEMW_W".to_string(), converter, 0)],
+        "{v:?}"
+    );
+    let mut control = forged;
+    control.piece_mut("MEMW_W").constraints = Some(memw_w_constraints_without_bit0);
     let v = verdict(&control);
     assert!(v.accepted(), "control: {v:?}");
 }
@@ -1624,10 +1885,52 @@ fn columns(f: &BTreeMap<Option<usize>, i128>) -> BTreeSet<usize> {
 }
 
 /// A table's constraints on one row and its width, for the census's bit
-/// check: by name.
+/// checks: by name.
 fn evaluator(name: &str) -> Option<(Eval, usize)> {
-    name.starts_with("MEMW_W")
-        .then_some((memw_w_constraints as Eval, mw::NUM_COLUMNS))
+    if name.starts_with("MEMW_W") {
+        Some((memw_w_constraints as Eval, mw::NUM_COLUMNS))
+    } else if matches!(name, "CHIP" | "WRITER" | "READER") {
+        Some((chip_constraints as Eval, chip::NUM_COLUMNS))
+    } else {
+        None
+    }
+}
+
+/// Rule c5: the multiplicity columns `mu` held to bits, and to one message a
+/// row: every assignment of them in `{−1, 0, 1, 2}^k` other than all zero and
+/// a unit vector (exactly one 1), all else zero, breaks a constraint.
+fn check_bits(name: &str, mu: &BTreeSet<usize>, eval: Option<(Eval, usize)>) -> Result<(), String> {
+    let Some((eval, width)) = eval else {
+        return Err(format!(
+            "{name}: no constraint holds its multiplicity to a bit"
+        ));
+    };
+    let cols: Vec<usize> = mu.iter().copied().collect();
+    let values = [-1i64, 0, 1, 2];
+    for code in 0..values.len().pow(cols.len() as u32) {
+        let assignment: Vec<i64> = (0..cols.len())
+            .map(|i| values[(code / values.len().pow(i as u32)) % values.len()])
+            .collect();
+        let ones = assignment.iter().filter(|&&v| v == 1).count();
+        let zeros = assignment.iter().filter(|&&v| v == 0).count();
+        if zeros == cols.len() || (ones == 1 && zeros == cols.len() - 1) {
+            continue;
+        }
+        let mut row = vec![FE::zero(); width];
+        for (&c, &v) in cols.iter().zip(&assignment) {
+            row[c] = if v < 0 {
+                FE::zero() - FE::from(v.unsigned_abs())
+            } else {
+                FE::from(v as u64)
+            };
+        }
+        if eval(&row).iter().all(|v| *v == FE::zero()) {
+            return Err(format!(
+                "{name}: multiplicities {assignment:?} on {cols:?} break no constraint"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Rule c2: a word-bus tuple's address is two elements, never packed.
@@ -1654,13 +1957,69 @@ fn check_address(values: &[BusValue], what: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The census of one table's word-bus interactions (rules c2–c6, c9),
-/// `preprocessed` its preprocessed prefix's width. `Ok` if the table touches
-/// neither word bus.
+/// Whether `half` (a 32-bit half of a word a row sends) is range-checked in
+/// the row at `mu`: two 16-bit columns `a + 2^16·b` each in an `IS_HALF`, or
+/// four bytes `Σ b_k·2^(8k)` each in an `ARE_BYTES` pair.
+fn is_checked_half(
+    half: &BusValue,
+    interactions: &[BusInteraction],
+    mu: &BTreeMap<Option<usize>, i128>,
+) -> bool {
+    let Ok(f) = form(half) else {
+        return false;
+    };
+    if f.contains_key(&None) {
+        return false;
+    }
+    let at_mu = |bi: &&BusInteraction| bi.is_sender && multiplicity_form(&bi.multiplicity) == *mu;
+    let halved: BTreeSet<usize> = interactions
+        .iter()
+        .filter(at_mu)
+        .filter(|bi| bi.bus_id == u64::from(BusId::IsHalfword) && bi.values.len() == 1)
+        .filter_map(|bi| form(&bi.values[0]).ok())
+        .filter(|g| g.len() == 1)
+        .filter_map(|g| {
+            g.into_iter()
+                .next()
+                .and_then(|(k, c)| (c == 1).then_some(k?))
+        })
+        .collect();
+    let bytes: BTreeSet<usize> = interactions
+        .iter()
+        .filter(at_mu)
+        .filter(|bi| bi.bus_id == u64::from(BusId::AreBytes))
+        .flat_map(|bi| bi.values.iter().filter_map(|v| form(v).ok()))
+        .filter(|g| g.len() == 1)
+        .filter_map(|g| {
+            g.into_iter()
+                .next()
+                .and_then(|(k, c)| (c == 1).then_some(k?))
+        })
+        .collect();
+    let mut coefficients: Vec<i128> = f.values().copied().collect();
+    coefficients.sort();
+    let cols = columns(&f);
+    (coefficients == [1, 1 << 16] && cols.iter().all(|c| halved.contains(c)))
+        || (coefficients == [1, 1 << 8, 1 << 16, 1 << 24] && cols.iter().all(|c| bytes.contains(c)))
+}
+
+/// The census of one table's word-bus interactions (rules c2–c6, c9–c10),
+/// `preprocessed` its preprocessed prefix's width, its constraints by name
+/// ([`evaluator`]). `Ok` if the table touches neither word bus.
 fn census_table(
     name: &str,
     interactions: &[BusInteraction],
     preprocessed: usize,
+) -> Result<(), String> {
+    census_table_with(name, interactions, preprocessed, evaluator(name))
+}
+
+/// [`census_table`] with the table's constraints given (`eval`).
+fn census_table_with(
+    name: &str,
+    interactions: &[BusInteraction],
+    preprocessed: usize,
+    eval: Option<(Eval, usize)>,
 ) -> Result<(), String> {
     let on = |bus: BusId| -> Vec<&BusInteraction> {
         interactions
@@ -1682,12 +2041,18 @@ fn census_table(
     let is_page = name.starts_with(page_w::NAME_PREFIX);
     if is_page {
         // c3: one mint at timestamp 0 and one final, at 1, at one key
-        // `base + 8·OFFSET` with OFFSET preprocessed.
+        // `base + 8·OFFSET` with OFFSET preprocessed and the base two 32-bit
+        // constants; each initial-word column preprocessed or held to a half.
         let [mint, last] = tokens.as_slice() else {
             return Err(format!("{name}: {} word tokens, not 2", tokens.len()));
         };
         let offset = Some(pw::OFFSET);
         let lo = form(&mint.values[0])?;
+        let hi = form(&mint.values[1])?;
+        let is_word = |c: Option<&i128>| c.is_none_or(|&c| (0..1i128 << 32).contains(&c));
+        let page_aligned = lo
+            .get(&None)
+            .is_none_or(|&c| c % DEFAULT_PAGE_SIZE as i128 == 0);
         if mint.is_sender
             || !last.is_sender
             || mint.multiplicity != Multiplicity::One
@@ -1697,19 +2062,44 @@ fn census_table(
             || columns(&lo) != BTreeSet::from([pw::OFFSET])
             || lo.get(&offset) != Some(&8)
             || !(0..preprocessed).contains(&pw::OFFSET)
-            || !columns(&form(&mint.values[1])?).is_empty()
+            || !columns(&hi).is_empty()
+            || !is_word(lo.get(&None))
+            || !page_aligned
+            || !is_word(hi.get(&None))
         {
             return Err(format!(
-                "{name}: not a mint at base + 8·OFFSET, OFFSET preprocessed"
+                "{name}: not a mint at base + 8·OFFSET, OFFSET preprocessed, the base two \
+                 page-aligned words"
             ));
+        }
+        let one = BTreeMap::from([(None, 1i128)]);
+        for half in &mint.values[3..5] {
+            for c in columns(&form(half)?) {
+                let held = c < preprocessed
+                    || interactions.iter().any(|bi| {
+                        bi.is_sender
+                            && bi.bus_id == u64::from(BusId::IsHalfword)
+                            && multiplicity_form(&bi.multiplicity) == one
+                            && bi.values.len() == 1
+                            && form(&bi.values[0]).ok() == Some(BTreeMap::from([(Some(c), 1)]))
+                    });
+                if !held {
+                    return Err(format!(
+                        "{name}: initial-word column {c} neither preprocessed nor a half"
+                    ));
+                }
+            }
         }
         return Ok(());
     }
     if tokens.is_empty() && messages.iter().all(|bi| bi.is_sender) {
         // A sender of word messages: c9, its address from a register read or
-        // `IS_HALF` limbs, plus a constant below 2^8.
+        // `IS_HALF` limbs, plus a constant below 2^8; c10, its timestamp and
+        // multiplicity its call's, the multiplicity a bit, its written words
+        // checked.
         for bi in &messages {
             check_message_source(name, interactions, bi)?;
+            check_sender(name, interactions, bi, eval)?;
         }
         return Ok(());
     }
@@ -1724,14 +2114,16 @@ fn census_table(
         ));
     }
     // The clock-bound receives: the word messages (and the CPU's dispatch).
-    let clocked: Vec<&BusInteraction> = interactions
+    let clocked: Vec<(usize, &BusInteraction)> = interactions
         .iter()
-        .filter(|bi| {
+        .enumerate()
+        .filter(|(_, bi)| {
             !bi.is_sender
                 && (bi.bus_id == u64::from(BusId::MemWordMsg)
                     || bi.bus_id == u64::from(BusId::MemoryOp))
         })
         .collect();
+    let mut claimed = BTreeSet::new();
     for (p, c) in produced.iter().zip(&consumed) {
         if p.values[..2] != c.values[..2] {
             return Err(format!("{name}: a pair at two keys"));
@@ -1745,15 +2137,29 @@ fn census_table(
         let ts = &p.values[2];
         let clocks: Vec<_> = clocked
             .iter()
-            .filter(|bi| bi.values.get(3) == Some(ts))
+            .filter(|(_, bi)| bi.values.get(3) == Some(ts))
             .collect();
         let mut fired = BTreeMap::new();
-        for bi in &clocks {
+        for (i, bi) in &clocks {
+            claimed.insert(*i);
             for (k, v) in multiplicity_form(&bi.multiplicity) {
                 *fired.entry(k).or_insert(0) += v;
             }
             if bi.values.get(1..3) != Some(&p.values[..2]) {
                 return Err(format!("{name}: a key that is not its message's"));
+            }
+            // c4: a word message's words are the pair's: an access's old
+            // word the consumed token's and its new word the produced one's,
+            // a write's word the produced one's.
+            if bi.bus_id == u64::from(BusId::MemWordMsg) {
+                let words_match = match form(&bi.values[0])?.get(&None).copied().unwrap_or(0) {
+                    0 => bi.values[4..6] == c.values[3..5] && bi.values[6..8] == p.values[3..5],
+                    1 => bi.values[4..6] == p.values[3..5],
+                    _ => false,
+                };
+                if !words_match {
+                    return Err(format!("{name}: a message's words are not its pair's"));
+                }
             }
         }
         if clocks.is_empty() || fired != mu {
@@ -1795,30 +2201,13 @@ fn census_table(
                 return Err(format!("{name}: a step limb no IS_HALF holds"));
             }
         }
-        // c5: the multiplicity is held to a bit by a constraint.
-        let Some((eval, width)) = evaluator(name) else {
-            return Err(format!(
-                "{name}: no constraint holds its multiplicity to a bit"
-            ));
-        };
-        for c in columns(&mu) {
-            for bad in [FE::from(2u64), FE::zero() - FE::one()] {
-                let mut row = vec![FE::zero(); width];
-                row[c] = bad;
-                if eval(&row).iter().all(|v| *v == FE::zero()) {
-                    return Err(format!(
-                        "{name}: column {c} at {bad:?} breaks no constraint"
-                    ));
-                }
-            }
-        }
-        let mut row = vec![FE::zero(); width];
-        for c in columns(&mu) {
-            row[c] = FE::one();
-        }
-        if columns(&mu).len() > 1 && eval(&row).iter().all(|v| *v == FE::zero()) {
-            return Err(format!("{name}: two messages at once break no constraint"));
-        }
+        // c5: the multiplicities held to bits, one message a row.
+        check_bits(name, &columns(&mu), eval)?;
+    }
+    // c4: every clock-bound receive belongs to a pair: a receive that moves
+    // no token is a sink.
+    if let Some((i, _)) = clocked.iter().find(|(i, _)| !claimed.contains(i)) {
+        return Err(format!("{name}: receive {i} belongs to no token pair"));
     }
     // c6: only a table that passes tokens through receives word messages, in
     // the two tagged shapes.
@@ -1843,32 +2232,90 @@ fn census_table(
     Ok(())
 }
 
-/// Rule c9: a word message's address is a register value or `IS_HALF` limbs
-/// read in the same row, plus a constant below 2^8.
+/// Rule c10: a sender's word message is its call's: its timestamp is the
+/// timestamp of an `Ecall` receive in the same row plus a constant in `0..=2`,
+/// at that receive's multiplicity, which a constraint holds to a bit; and the
+/// words it writes (a write's word, an access's new word unless it is the old
+/// one) are range-checked in the row at that multiplicity.
+fn check_sender(
+    name: &str,
+    interactions: &[BusInteraction],
+    message: &BusInteraction,
+    eval: Option<(Eval, usize)>,
+) -> Result<(), String> {
+    let mu = multiplicity_form(&message.multiplicity);
+    let ts = form(&message.values[3])?;
+    let called = interactions.iter().any(|bi| {
+        !bi.is_sender
+            && bi.bus_id == u64::from(BusId::Ecall)
+            && multiplicity_form(&bi.multiplicity) == mu
+            && form(&bi.values[0]).is_ok_and(|call| {
+                let mut diff = ts.clone();
+                for (k, v) in call {
+                    *diff.entry(k).or_insert(0) -= v;
+                }
+                diff.retain(|_, c| *c != 0);
+                columns(&diff).is_empty()
+                    && (0..=2).contains(&diff.get(&None).copied().unwrap_or(0))
+            })
+    });
+    if !called {
+        return Err(format!(
+            "{name}: a word message's timestamp or multiplicity is not its call's"
+        ));
+    }
+    check_bits(name, &columns(&mu), eval)?;
+    let written: &[BusValue] = match form(&message.values[0])?.get(&None).copied().unwrap_or(0) {
+        1 => &message.values[4..6],
+        0 if message.values[6..8] == message.values[4..6] => &[],
+        0 => &message.values[6..8],
+        _ => return Err(format!("{name}: a word message with no kind constant")),
+    };
+    if let Some(half) = written
+        .iter()
+        .find(|half| !is_checked_half(half, interactions, &mu))
+    {
+        return Err(format!(
+            "{name}: a written word's half {half:?} is not range-checked"
+        ));
+    }
+    Ok(())
+}
+
+/// Rule c9: a word message's address is a register's value read in the same
+/// row at the message's multiplicity, or `IS_HALF` limbs, plus a constant below
+/// 2^8.
 fn check_message_source(
     name: &str,
     interactions: &[BusInteraction],
     message: &BusInteraction,
 ) -> Result<(), String> {
     check_address(&message.values[1..3], name)?;
-    // Columns read as a register's value: a `Memw` tuple whose `is_register`
-    // is the constant 1 (position 0 of a write, 8 of a read), or the `Reg` bus.
+    let mu = multiplicity_form(&message.multiplicity);
+    // A register's value: the value positions of a register read on `Memw`
+    // (`is_register` the constant 1 at position 8; old value at 0 and 1, new
+    // at 11 and 12), or of a token on the `Reg` bus (2 and 3).
     let one = BTreeMap::from([(None, 1i128)]);
     let mut registered = BTreeSet::new();
     for bi in interactions {
-        let register = (bi.bus_id == u64::from(BusId::Memw)
-            && [0usize, 8]
-                .iter()
-                .any(|&i| bi.values.get(i).and_then(|v| form(v).ok()) == Some(one.clone())))
-            || bi.bus_id == u64::from(BusId::Reg);
-        if register {
-            for v in &bi.values {
-                if let Ok(f) = form(v)
-                    && f.len() == 1
-                    && let Some((Some(c), 1)) = f.iter().next().map(|(k, v)| (*k, *v))
-                {
-                    registered.insert(c);
-                }
+        if multiplicity_form(&bi.multiplicity) != mu {
+            continue;
+        }
+        let positions: &[usize] = if bi.bus_id == u64::from(BusId::Memw)
+            && bi.values.get(8).and_then(|v| form(v).ok()) == Some(one.clone())
+        {
+            &[0, 1, 11, 12]
+        } else if bi.bus_id == u64::from(BusId::Reg) {
+            &[2, 3]
+        } else {
+            &[]
+        };
+        for &i in positions {
+            if let Some(Ok(f)) = bi.values.get(i).map(form)
+                && f.len() == 1
+                && let Some((Some(c), 1)) = f.iter().next().map(|(k, v)| (*k, *v))
+            {
+                registered.insert(c);
             }
         }
     }
@@ -2061,10 +2508,79 @@ fn the_word_format_air_set_passes_the_census() {
     }
 }
 
-/// ★ The census refuses each mutant it exists for: a packed address, an
-/// unequal pair, a step without its `−1`, a PAGE_W with a main `OFFSET`, an
-/// untagged message; and it reads the stand-in chips' addresses as register
-/// values plus a small constant, refusing a chip whose pointer is free.
+/// Word-bus addresses packed into one element and a zero, `(lo + 2^32·hi, 0)`:
+/// still five values a token, refused by rule c2 alone.
+fn packed_five(interactions: Vec<BusInteraction>) -> Vec<BusInteraction> {
+    interactions
+        .into_iter()
+        .map(|mut bi| {
+            let at = if bi.bus_id == u64::from(BusId::MemWord) {
+                0
+            } else if bi.bus_id == u64::from(BusId::MemWordMsg) {
+                1
+            } else {
+                return bi;
+            };
+            let mut pair = bi.values[at..at + 2].to_vec();
+            let one = packed(vec![BusInteraction::sender(
+                BusId::MemWord,
+                Multiplicity::One,
+                std::mem::take(&mut pair),
+            )]);
+            bi.values[at] = one[0].values[0].clone();
+            bi.values[at + 1] = BusValue::constant(0);
+            bi
+        })
+        .collect()
+}
+
+/// MEMW_W with one more access receive on columns of its own, tied to no
+/// token pair: a sink that takes a chip's message and moves nothing.
+fn memw_w_with_a_sink() -> Vec<BusInteraction> {
+    let own = |k: usize| column(mw::NUM_COLUMNS + k);
+    let mut out = memw_w::bus_interactions();
+    out.push(BusInteraction::receiver(
+        BusId::MemWordMsg,
+        Multiplicity::Column(mw::NUM_COLUMNS + 5),
+        access_message([own(0), own(1)], own(2), [own(3), own(4)], [own(3), own(4)]),
+    ));
+    out
+}
+
+/// MEMW_W's constraints with constraint 0 (`MU_WRITE` a bit) reading zero.
+fn memw_w_constraints_without_bit0(row: &[FE]) -> Vec<FE> {
+    let mut v = memw_w_constraints(row);
+    v[0] = FE::zero();
+    v
+}
+
+/// A stand-in chip of `kind` with `edit` applied to each of its word messages.
+fn chip_with(kind: MessageKind, edit: impl Fn(&mut BusInteraction)) -> Vec<BusInteraction> {
+    let mut out = chip_interactions(kind);
+    for bi in &mut out {
+        if bi.bus_id == u64::from(BusId::MemWordMsg) {
+            edit(bi);
+        }
+    }
+    out
+}
+
+/// A stand-in chip whose word messages carry a timestamp column of their own
+/// (after the chip's), not its call's: a control mutant.
+fn chip_with_free_message_ts(kind: MessageKind) -> Vec<BusInteraction> {
+    chip_with(kind, |bi| bi.values[3] = column(chip::NUM_COLUMNS))
+}
+
+/// ★ The census refuses each mutant it exists for, and passes the honest
+/// tables: on PAGE_W, a main `OFFSET`, a packed key, a key whose base is not
+/// two 32-bit words, a private initial half held by no `IS_HALF`; on MEMW_W, a
+/// packed address (dropped or five values), an unequal pair, a step without
+/// its `−1`, an untagged message, a limb unranged, a sink receive, a message
+/// whose words are not its pair's (old or new), multiplicities that are not
+/// bits one by one (MEMW_W without constraint 0), a `Memw` receive; on the
+/// stand-in chips, a free pointer, an address that is not a register's value,
+/// a message timestamp or multiplicity that is not its call's, a written word
+/// not range-checked.
 #[test]
 fn the_census_refuses_each_mutant() {
     let page = page_w::bus_interactions(0, false).expect("aligned");
@@ -2077,13 +2593,47 @@ fn the_census_refuses_each_mutant() {
         census_table("PAGE_W:0x0", &packed(page.clone()), 1).is_err(),
         "packed"
     );
+    let stack = page_w::bus_interactions(STACK_BASE, false).expect("aligned");
+    assert!(census_table("PAGE_W:stack", &stack, page_w::NUM_PREPROCESSED_COLS).is_ok());
+    assert!(
+        census_table(
+            "PAGE_W:stack",
+            &packed_five(stack),
+            page_w::NUM_PREPROCESSED_COLS
+        )
+        .is_err(),
+        "a packed key of five values"
+    );
+    let private = page_w::bus_interactions(INPUT_BASE, true).expect("aligned");
+    assert!(census_table("PAGE_W:input", &private, 1).is_ok());
+    for k in 0..4 {
+        // The half's IS_HALF moved to the next half: `INIT_k` held by none.
+        let mut mutant = private.clone();
+        mutant[2 + k].values = vec![column(pw::INIT[(k + 1) % 4])];
+        assert!(
+            census_table("PAGE_W:input", &mutant, 1).is_err(),
+            "INIT_{k} unheld"
+        );
+    }
+
     let memw = memw_w::bus_interactions();
     assert!(census_table("MEMW_W", &memw, 0).is_ok());
+    let mut old_elsewhere = memw.clone();
+    old_elsewhere[5].values[4] = column(mw::NEW_LO);
+    old_elsewhere[5].values[5] = column(mw::NEW_HI);
+    let mut produces_old = memw.clone();
+    produces_old[3].values[3] = column(mw::OLD_LO);
+    produces_old[3].values[4] = column(mw::OLD_HI);
     for (what, mutant) in [
         ("packed", packed(memw.clone())),
+        ("packed, five values", packed_five(memw.clone())),
         ("unequal pair", memw_w_unequal_pair()),
         ("no −1", memw_w_without_the_minus_one()),
         ("untagged", memw_w_untagged()),
+        ("a sink", memw_w_with_a_sink()),
+        ("an access's old word elsewhere", old_elsewhere),
+        ("a produced token carrying the old word", produces_old),
+        ("a Memw receive", memw_w_receiving_memw()),
     ] {
         assert!(census_table("MEMW_W", &mutant, 0).is_err(), "{what}");
     }
@@ -2094,18 +2644,81 @@ fn the_census_refuses_each_mutant() {
         census_table("MEMW_W", &unranged, 0).is_err(),
         "a limb unranged"
     );
+    // Constraint 0 reading zero: `(MU_WRITE, MU_ACCESS) = (−1, 1)` breaks
+    // nothing, the converter row of `a_message_converter_row_is_refused_by_its_write_bit`.
+    assert!(
+        census_table_with(
+            "MEMW_W",
+            &memw,
+            0,
+            Some((memw_w_constraints_without_bit0, mw::NUM_COLUMNS))
+        )
+        .is_err(),
+        "a converter row"
+    );
 
-    // c9 on the stand-ins: their address is x12's value plus 0 or 8.
+    // The stand-ins: their address is x12's value plus 0 or 8, their messages
+    // their call's, a writer's words checked.
     for kind in [MessageKind::Write, MessageKind::Access] {
         let chip = chip_interactions(kind);
         assert!(census_table("CHIP", &chip, 0).is_ok(), "{kind:?}");
         // The register read dropped: the pointer is a free column.
-        let free: Vec<_> = chip.into_iter().skip(1).collect();
+        let free: Vec<_> = chip.iter().skip(1).cloned().collect();
         assert!(
             census_table("CHIP", &free, 0).is_err(),
             "{kind:?} free pointer"
         );
+        let mutants = [
+            (
+                "the address its timestamp column",
+                chip_with(kind, |bi| {
+                    bi.values[1] = column(chip::TS);
+                }),
+            ),
+            ("a free message timestamp", chip_with_free_message_ts(kind)),
+            (
+                "a message timestamp 3 after its call's",
+                chip_with(kind, |bi| {
+                    bi.values[3] =
+                        BusValue::linear(vec![term(1, chip::TS), LinearTerm::Constant(3)]);
+                }),
+            ),
+            (
+                "a free message multiplicity",
+                chip_with(kind, |bi| {
+                    bi.multiplicity = Multiplicity::Column(chip::NUM_COLUMNS);
+                }),
+            ),
+        ];
+        for (what, mutant) in mutants {
+            assert!(
+                census_table("CHIP", &mutant, 0).is_err(),
+                "{kind:?}: {what}"
+            );
+        }
+        // No constraint holds the multiplicity to a bit.
+        assert!(
+            census_table_with("CHIP", &chip, 0, None).is_err(),
+            "{kind:?}: an unconstrained multiplicity"
+        );
     }
+    // A writer whose written words are not range-checked.
+    let unchecked: Vec<_> = chip_interactions(MessageKind::Write)
+        .into_iter()
+        .filter(|bi| bi.bus_id != u64::from(BusId::IsHalfword))
+        .collect();
+    assert!(
+        census_table("CHIP", &unchecked, 0).is_err(),
+        "an unchecked written word"
+    );
+    // A reader whose new word is not its old one: a write, unchecked.
+    let reader_writes = chip_with(MessageKind::Access, |bi| {
+        bi.values[6] = column(chip::PTR_LO);
+    });
+    assert!(
+        census_table("CHIP", &reader_writes, 0).is_err(),
+        "an access writing an unchecked word"
+    );
 }
 
 // ---- the format ----

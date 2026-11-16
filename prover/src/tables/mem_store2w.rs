@@ -44,8 +44,8 @@ use super::word_cpu::{
     one_hot_constraints, pair_lookups, store_into, stored_half, sum, word_class, word_key,
 };
 use super::word_memory::{
-    WORD_BYTES, byte_pair_checks, column, halves, step_less_one, step_limbs, word_check_of,
-    word_of_bytes,
+    WORD_BYTES, byte_pair_checks, checked_word, column, halves, step_less_one, step_limbs,
+    word_check_of, word_of_bytes,
 };
 
 /// Column definitions for the MEM_STORE2W table.
@@ -274,6 +274,8 @@ pub(crate) fn generate_mem_store2w_trace_segments_as(
 /// MEM_STORE2W's 21 interactions (module docs).
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let address = [cols::ADDRESS_LO, cols::ADDRESS_HI];
+    let words = [&cols::OLD[..8], &cols::OLD[8..]]
+        .map(|bytes| checked_word(bytes, Multiplicity::Column(cols::MU)));
     let mut interactions = Vec::with_capacity(21);
     for (w, new, step) in [
         (
@@ -290,16 +292,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.extend(word_check_of(
             word_key(address, cols::OFF, w as i64),
             cols::TIMESTAMP,
-            [
-                word_of_bytes(&cols::OLD[8 * w..8 * w + 4]),
-                word_of_bytes(&cols::OLD[8 * w + 4..8 * w + 8]),
-            ],
+            words[w].0.clone(),
             [column(new[0]), column(new[1])],
             step,
             Multiplicity::Column(cols::MU),
         ));
     }
-    interactions.extend(byte_pair_checks(&cols::OLD, Multiplicity::Column(cols::MU)));
+    for (_, checks) in words {
+        interactions.extend(checks);
+    }
     interactions.extend(byte_pair_checks(
         &cols::VALUE,
         Multiplicity::Column(cols::MU),
