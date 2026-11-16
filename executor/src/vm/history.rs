@@ -23,6 +23,14 @@
 //! Timestamps are the walk's: cycle `c` is at `4·c + 4`, its accesses at that
 //! and up to two later. They are held as `u32`, so a run in history mode stops
 //! (cleanly, [`HISTORY_MAX_CYCLES`]) where the no-epoch clock already does.
+//!
+//! The word history ([`WordHistory`]) keeps one timestamp an aligned 8-byte
+//! word ([`WordShadow`]) instead of one a byte, for a run whose memory is
+//! checked by word: a load or store's record is the word holding its first
+//! byte and, when it crosses, the next word ([`WordAccess`]); an ECALL's
+//! memory is the words it covers. A word's timestamp is its last access's,
+//! which is the largest of its bytes' in the byte history. Both histories run
+//! one loop ([`Keeper`]).
 use std::collections::BTreeMap;
 
 use super::{
@@ -100,6 +108,50 @@ pub struct MemAccess {
 
 const _: () = assert!(std::mem::size_of::<HistExtra>() == 16);
 const _: () = assert!(std::mem::size_of::<MemAccess>() == 24);
+
+/// The bytes of a memory word, the word history's cell ([`WordShadow`]):
+/// words are aligned, the word holding `address` starts at
+/// `address & !(WORD_BYTES − 1)`.
+pub const WORD_BYTES: u64 = 8;
+
+/// A load or store under the word history ([`WordHistory`]): its address, the
+/// word holding its first byte with that word's value and timestamp before the
+/// cycle, and, when it crosses into the next word, that word's index in
+/// [`WindowHistory::next_words`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct WordAccess {
+    /// The access's address.
+    pub addr: u64,
+    /// The word holding its first byte, before the cycle, little-endian.
+    pub word: u64,
+    /// That word's timestamp before the cycle.
+    pub ts: u32,
+    /// [`NO_ACCESS`] when the access stays in that word; else the index of
+    /// the next word in [`WindowHistory::next_words`].
+    pub next: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<WordAccess>() == 24);
+
+/// A word's value and timestamp before a cycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WordCell {
+    pub word: u64,
+    pub ts: u32,
+}
+
+/// The aligned words `len` bytes from `address` cover (wrapping past `2^64`):
+/// the first word's address and their count, `(_, 0)` for none.
+#[inline(always)]
+pub fn covering_words(address: u64, len: u64) -> (u64, u64) {
+    if len == 0 {
+        return (address & !(WORD_BYTES - 1), 0);
+    }
+    let first = u128::from(address) / u128::from(WORD_BYTES);
+    let last = (u128::from(address) + u128::from(len) - 1) / u128::from(WORD_BYTES);
+    (address & !(WORD_BYTES - 1), (last - first + 1) as u64)
+}
 
 /// A register's cell before an access: x0 to x31, or 254 for the commit index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +233,23 @@ pub struct WindowHistory {
     /// first + count]`.
     pub reg_groups: Vec<SideGroup>,
     pub reg_cells: Vec<RegAccess>,
+    /// Kept by the word history ([`WordHistory`]): every memory cell is a
+    /// whole aligned 8-byte word with one timestamp, held in the word lists
+    /// below, and the byte lists above (`accesses`, `mixed`, `ranges`,
+    /// `values`, `ts`) stay empty.
+    pub words: bool,
+    /// Under the word history, the loads and stores, in order.
+    pub word_accesses: Vec<WordAccess>,
+    /// Under the word history, the second word of each load or store that
+    /// crosses into it ([`WordAccess::next`]).
+    pub next_words: Vec<WordCell>,
+    /// Under the word history, ECALLs' memory, one group an ECALL
+    /// (`groups`): `word_ranges[first..first + count]`, each `len` whole
+    /// words from the word at `addr`, their values and timestamps before the
+    /// cycle at `word_values[start..]` and `word_ts[start..]`.
+    pub word_ranges: Vec<SideRange>,
+    pub word_values: Vec<u64>,
+    pub word_ts: Vec<u32>,
 }
 
 impl WindowHistory {
@@ -195,6 +264,46 @@ impl WindowHistory {
             + self.ts.capacity() * 4
             + self.reg_groups.capacity() * std::mem::size_of::<SideGroup>()
             + self.reg_cells.capacity() * std::mem::size_of::<RegAccess>()
+            + self.word_accesses.capacity() * std::mem::size_of::<WordAccess>()
+            + self.next_words.capacity() * std::mem::size_of::<WordCell>()
+            + self.word_ranges.capacity() * std::mem::size_of::<SideRange>()
+            + self.word_values.capacity() * 8
+            + self.word_ts.capacity() * 4
+    }
+
+    /// [`Self::cycle_cells`] under the word history: each byte of every word
+    /// cycle `i` touches, at the word's timestamp.
+    fn cycle_word_cells(&self, i: usize, mut cell: impl FnMut(u64, u8, u32)) {
+        let mut word = |address: u64, value: u64, ts: u32| {
+            for (k, byte) in value.to_le_bytes().into_iter().enumerate() {
+                cell(address.wrapping_add(k as u64), byte, ts);
+            }
+        };
+        match self.extras[i].side {
+            NO_ACCESS => {}
+            side if side & ECALL == 0 => {
+                let a = self.word_accesses[side as usize];
+                let first = a.addr & !(WORD_BYTES - 1);
+                word(first, a.word, a.ts);
+                if a.next != NO_ACCESS {
+                    let next = self.next_words[a.next as usize];
+                    word(first.wrapping_add(WORD_BYTES), next.word, next.ts);
+                }
+            }
+            side => {
+                let g = self.groups[(side & !ECALL) as usize];
+                for r in &self.word_ranges[g.first as usize..(g.first + g.count) as usize] {
+                    for k in 0..r.len as usize {
+                        let at = r.start as usize + k;
+                        word(
+                            r.addr.wrapping_add(WORD_BYTES * k as u64),
+                            self.word_values[at],
+                            self.word_ts[at],
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Cycle `i`'s ECALL register accesses (empty for any other cycle).
@@ -211,8 +320,12 @@ impl WindowHistory {
 
     /// Calls `cell(address, value, timestamp)` for every byte cycle `i` of the
     /// window reads before the cycle, in order (a byte two ranges hold, once
-    /// a range).
+    /// a range). Under the word history, every byte of each word the cycle
+    /// touches, at the word's timestamp ([`Self::words`]).
     pub fn cycle_cells(&self, i: usize, mut cell: impl FnMut(u64, u8, u32)) {
+        if self.words {
+            return self.cycle_word_cells(i, cell);
+        }
         match self.extras[i].side {
             NO_ACCESS => {}
             side if side & ECALL == 0 => {
@@ -263,6 +376,202 @@ pub struct HistoryFinal {
     /// The register cells after the last cycle: what HALT's register reads
     /// find.
     pub registers: RegisterCells,
+}
+
+/// The run's end, under the word history: the memory and every word's
+/// timestamp after its last cycle.
+pub struct WordHistoryFinal {
+    pub memory: MemorySnapshot,
+    pub shadow: WordShadow,
+    /// The register cells after the last cycle.
+    pub registers: RegisterCells,
+}
+
+/// Words a 64 KiB page holds.
+const PAGE_WORDS: usize = PAGE_SIZE / WORD_BYTES as usize;
+
+/// A `u32` timestamp an aligned 8-byte word: [`TsShadow`]'s layout with one
+/// cell for eight bytes (an eighth of its cells). The word's timestamp is its
+/// last access's, whichever of its bytes that access touched. Zero until
+/// stamped.
+pub struct WordShadow {
+    layout: FlatLayout,
+    low: Region,
+    high: Region,
+    other: BTreeMap<u64, Box<[u32]>>,
+    /// One bit per flat page (low then high): stamped at least once.
+    stamped: Vec<u64>,
+    /// The flat pages stamped, by number, in the order first stamped.
+    pages: Vec<u64>,
+}
+
+// Owned memory, no interior sharing (see `Region`); through `&self` it is
+// only read, so shared reads from several threads are sound.
+unsafe impl Send for WordShadow {}
+unsafe impl Sync for WordShadow {}
+
+impl WordShadow {
+    /// An empty shadow over `layout`'s regions.
+    pub fn new(layout: FlatLayout) -> Result<Self, MemoryError> {
+        let low_pages = layout.low_len() >> PAGE_BITS;
+        let pages = low_pages + (layout.high_len() >> PAGE_BITS);
+        let cells = |len: usize| len / WORD_BYTES as usize * 4;
+        Ok(Self {
+            layout,
+            low: Region::new(cells(layout.low_len()))?,
+            high: Region::new(cells(layout.high_len()))?,
+            other: BTreeMap::new(),
+            stamped: vec![0u64; pages.div_ceil(64)],
+            pages: Vec::new(),
+        })
+    }
+
+    /// The flat cell of the word holding `address`, or `None` outside the
+    /// flat regions.
+    #[inline(always)]
+    fn flat(&self, address: u64) -> Option<*mut u32> {
+        // SAFETY: an index inside a region of `len / 8` words' cells.
+        unsafe {
+            if address < self.layout.low_end {
+                Some(
+                    self.low
+                        .ptr
+                        .cast::<u32>()
+                        .add((address / WORD_BYTES) as usize),
+                )
+            } else if address >= self.layout.high_base {
+                Some(
+                    self.high
+                        .ptr
+                        .cast::<u32>()
+                        .add(((address - self.layout.high_base) / WORD_BYTES) as usize),
+                )
+            } else {
+                None
+            }
+        }
+    }
+
+    /// The flat page number of `address` (low pages, then high ones).
+    #[inline(always)]
+    fn flat_page(&self, address: u64) -> usize {
+        if address < self.layout.low_end {
+            (address >> PAGE_BITS) as usize
+        } else {
+            (self.layout.low_len() >> PAGE_BITS)
+                + ((address - self.layout.high_base) >> PAGE_BITS) as usize
+        }
+    }
+
+    #[inline(always)]
+    fn mark(&mut self, address: u64) {
+        let page = self.flat_page(address);
+        if self.stamped[page / 64] >> (page % 64) & 1 == 0 {
+            self.stamped[page / 64] |= 1 << (page % 64);
+            self.pages.push(page as u64);
+        }
+    }
+
+    /// The timestamp of the word holding `address`.
+    #[inline(always)]
+    pub fn get(&self, address: u64) -> u32 {
+        match self.flat(address) {
+            // SAFETY: a cell of a live region.
+            Some(cell) => unsafe { *cell },
+            None => self.other.get(&(address >> PAGE_BITS)).map_or(0, |page| {
+                page[((address as usize) & (PAGE_SIZE - 1)) / WORD_BYTES as usize]
+            }),
+        }
+    }
+
+    /// Stamps the word holding `address` with `ts`.
+    #[inline(always)]
+    pub fn set(&mut self, address: u64, ts: u32) {
+        match self.flat(address) {
+            Some(cell) => {
+                self.mark(address);
+                // SAFETY: a cell of a live region, held exclusively.
+                unsafe { *cell = ts }
+            }
+            None => {
+                self.other
+                    .entry(address >> PAGE_BITS)
+                    .or_insert_with(|| vec![0u32; PAGE_WORDS].into_boxed_slice())
+                    [((address as usize) & (PAGE_SIZE - 1)) / WORD_BYTES as usize] = ts;
+            }
+        }
+    }
+
+    /// Stamps with `ts` every word holding a byte of the `len` bytes from
+    /// `address` (wrapping).
+    #[inline(always)]
+    pub fn fill(&mut self, address: u64, len: u64, ts: u32) {
+        let (first, count) = covering_words(address, len);
+        if count == 1 {
+            return self.set(first, ts);
+        }
+        let last = first.wrapping_add((count.wrapping_sub(1)).wrapping_mul(WORD_BYTES));
+        let inside = count > 0
+            && last >= first
+            && (last < self.layout.low_end || first >= self.layout.high_base);
+        if !inside {
+            return self.fill_slow(first, count, ts);
+        }
+        for page in self.flat_page(first)..=self.flat_page(last) {
+            if self.stamped[page / 64] >> (page % 64) & 1 == 0 {
+                self.stamped[page / 64] |= 1 << (page % 64);
+                self.pages.push(page as u64);
+            }
+        }
+        let cell = self.flat(first).expect("inside a flat region");
+        // SAFETY: `count` cells inside one live region (checked above), held
+        // exclusively.
+        unsafe { std::slice::from_raw_parts_mut(cell, count as usize) }.fill(ts);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill_slow(&mut self, first: u64, count: u64, ts: u32) {
+        for k in 0..count {
+            self.set(first.wrapping_add(k.wrapping_mul(WORD_BYTES)), ts);
+        }
+    }
+
+    /// Every page holding a stamped word: its base address and its 8,192
+    /// word timestamps (the word at `base + 8·k` at `k`).
+    pub fn pages(&self) -> Vec<(u64, &[u32])> {
+        let low_pages = (self.layout.low_len() >> PAGE_BITS) as u64;
+        let mut out: Vec<(u64, &[u32])> = self
+            .pages
+            .iter()
+            .map(|&page| {
+                let base = if page < low_pages {
+                    page << PAGE_BITS
+                } else {
+                    self.layout.high_base + ((page - low_pages) << PAGE_BITS)
+                };
+                let cell = self.flat(base).expect("a flat page");
+                // SAFETY: a whole page of cells inside one region.
+                (base, unsafe {
+                    std::slice::from_raw_parts(cell, PAGE_WORDS)
+                })
+            })
+            .collect();
+        out.extend(
+            self.other
+                .iter()
+                .map(|(&page, cells)| (page << PAGE_BITS, &cells[..])),
+        );
+        out
+    }
+}
+
+/// The word at an aligned `address` in `memory`, little-endian (an aligned
+/// word never wraps past `2^64`).
+#[inline(always)]
+fn read_word<M: GuestMemory>(memory: &M, address: u64) -> u64 {
+    debug_assert!(address.is_multiple_of(WORD_BYTES));
+    u64::from_le_bytes(memory.read_n::<8>(address))
 }
 
 /// A `u32` timestamp a byte: flat over the engine's flat regions (lazily
@@ -804,6 +1113,7 @@ impl History {
             ts: Vec::with_capacity(values),
             reg_groups: Vec::with_capacity(reg_groups),
             reg_cells: Vec::with_capacity(reg_cells),
+            ..WindowHistory::default()
         };
     }
 
@@ -912,5 +1222,240 @@ impl History {
                 shadow.fill(address, len, at as u32);
             }
         });
+    }
+}
+
+/// What history mode's run loop asks of a history: the byte one ([`History`])
+/// or the word one ([`WordHistory`]). One loop serves both
+/// ([`crate::vm::fast::FastExecutor`]), compiled apart for each.
+pub(crate) trait Keeper {
+    /// The register cells as the walk holds them.
+    fn cells(&mut self) -> &mut RegisterCells;
+    /// Before a load or store of `width` bytes at `address`: its record.
+    /// Returns the cycle's [`HistExtra::side`].
+    fn before_access<M: GuestMemory>(&mut self, memory: &M, address: u64, width: u8) -> u32;
+    /// After it: its first `count` bytes stamped `ts`.
+    fn after_access(&mut self, address: u64, count: u8, ts: u64);
+    /// Before an ECALL: its memory as the window's next group. Returns the
+    /// cycle's [`HistExtra::side`].
+    fn before_ecall<M: GuestMemory>(&mut self, memory: &M, log_before: &Log, ts: u64) -> u32;
+    /// After it: its stamps.
+    fn after_ecall(&mut self, log: &Log, cells_before: &RegisterCells, ts: u64);
+    /// Its register accesses.
+    fn ecall_registers(&mut self, log: &Log, ts: u64);
+    /// The cycle's extra.
+    fn push_extra(&mut self, extra: HistExtra);
+}
+
+impl Keeper for History {
+    #[inline(always)]
+    fn cells(&mut self) -> &mut RegisterCells {
+        &mut self.cells
+    }
+
+    #[inline(always)]
+    fn before_access<M: GuestMemory>(&mut self, memory: &M, address: u64, _width: u8) -> u32 {
+        History::before_access(self, memory, address)
+    }
+
+    #[inline(always)]
+    fn after_access(&mut self, address: u64, count: u8, ts: u64) {
+        History::after_access(self, address, count, ts)
+    }
+
+    #[inline(always)]
+    fn before_ecall<M: GuestMemory>(&mut self, memory: &M, log_before: &Log, ts: u64) -> u32 {
+        History::before_ecall(self, memory, log_before, ts)
+    }
+
+    #[inline(always)]
+    fn after_ecall(&mut self, log: &Log, cells_before: &RegisterCells, ts: u64) {
+        History::after_ecall(self, log, cells_before, ts)
+    }
+
+    #[inline(always)]
+    fn ecall_registers(&mut self, log: &Log, ts: u64) {
+        History::ecall_registers(self, log, ts)
+    }
+
+    #[inline(always)]
+    fn push_extra(&mut self, extra: HistExtra) {
+        self.window.extras.push(extra);
+    }
+}
+
+/// The engine's word history: a timestamp a word ([`WordShadow`]), the
+/// register cells, and the window being written, its memory cells whole
+/// words ([`WindowHistory::words`]). For a run whose memory is checked by
+/// word: a word's timestamp is its last access's, so the byte timestamps the
+/// byte history keeps are lost.
+pub(crate) struct WordHistory {
+    pub(crate) shadow: WordShadow,
+    pub(crate) cells: RegisterCells,
+    pub(crate) window: WindowHistory,
+    /// A buffer for a later window's extras ([`History::spare_extras`]).
+    pub(crate) spare_extras: Option<Vec<HistExtra>>,
+    /// The side lists' lengths in the last window handed out: `word_accesses`,
+    /// `next_words`, `groups`, `word_ranges`, `word_values` (and `word_ts`),
+    /// `reg_groups`, `reg_cells`.
+    last_sides: [usize; 7],
+}
+
+impl WordHistory {
+    pub(crate) fn new(layout: FlatLayout, entry_point: u64) -> Result<Self, MemoryError> {
+        Ok(Self {
+            shadow: WordShadow::new(layout)?,
+            cells: RegisterCells::at_start(entry_point),
+            window: WindowHistory {
+                words: true,
+                ..WindowHistory::default()
+            },
+            spare_extras: None,
+            last_sides: [0; 7],
+        })
+    }
+
+    /// Starts a window at cycle `first`, sized as [`History::begin`] sizes
+    /// one.
+    pub(crate) fn begin(&mut self, first: u64, capacity: usize) {
+        let extras = match self.spare_extras.take() {
+            Some(mut extras) if extras.capacity() == capacity => {
+                extras.clear();
+                extras
+            }
+            _ => Vec::with_capacity(capacity),
+        };
+        let [
+            accesses,
+            next_words,
+            groups,
+            ranges,
+            values,
+            reg_groups,
+            reg_cells,
+        ] = self.last_sides.map(|n| n + n / 4);
+        self.window = WindowHistory {
+            first,
+            registers: Some(self.cells),
+            extras,
+            groups: Vec::with_capacity(groups),
+            reg_groups: Vec::with_capacity(reg_groups),
+            reg_cells: Vec::with_capacity(reg_cells),
+            words: true,
+            word_accesses: Vec::with_capacity(accesses),
+            next_words: Vec::with_capacity(next_words),
+            word_ranges: Vec::with_capacity(ranges),
+            word_values: Vec::with_capacity(values),
+            word_ts: Vec::with_capacity(values),
+            ..WindowHistory::default()
+        };
+    }
+
+    /// The window written, handed out; the next one's side lists are sized
+    /// from it.
+    pub(crate) fn take_window(&mut self) -> WindowHistory {
+        let w = std::mem::replace(
+            &mut self.window,
+            WindowHistory {
+                words: true,
+                ..WindowHistory::default()
+            },
+        );
+        self.last_sides = [
+            w.word_accesses.len(),
+            w.next_words.len(),
+            w.groups.len(),
+            w.word_ranges.len(),
+            w.word_values.len(),
+            w.reg_groups.len(),
+            w.reg_cells.len(),
+        ];
+        w
+    }
+}
+
+impl Keeper for WordHistory {
+    #[inline(always)]
+    fn cells(&mut self) -> &mut RegisterCells {
+        &mut self.cells
+    }
+
+    /// The word holding the access's first byte, and the next word when the
+    /// access crosses into it: one [`WordAccess`].
+    #[inline(always)]
+    fn before_access<M: GuestMemory>(&mut self, memory: &M, address: u64, width: u8) -> u32 {
+        let first = address & !(WORD_BYTES - 1);
+        let word = read_word(memory, first);
+        let ts = self.shadow.get(first);
+        let w = &mut self.window;
+        let next = if (address & (WORD_BYTES - 1)) + u64::from(width) > WORD_BYTES {
+            let second = first.wrapping_add(WORD_BYTES);
+            w.next_words.push(WordCell {
+                word: read_word(memory, second),
+                ts: self.shadow.get(second),
+            });
+            w.next_words.len() as u32 - 1
+        } else {
+            NO_ACCESS
+        };
+        w.word_accesses.push(WordAccess {
+            addr: address,
+            word,
+            ts,
+            next,
+        });
+        w.word_accesses.len() as u32 - 1
+    }
+
+    #[inline(always)]
+    fn after_access(&mut self, address: u64, count: u8, ts: u64) {
+        self.shadow.fill(address, u64::from(count), ts as u32);
+    }
+
+    /// Every word an ECALL's walk touches, before the call, as the window's
+    /// next group (empty for none).
+    fn before_ecall<M: GuestMemory>(&mut self, memory: &M, log_before: &Log, ts: u64) -> u32 {
+        let (shadow, cells, w) = (&self.shadow, &self.cells, &mut self.window);
+        let first = w.word_ranges.len() as u32;
+        ecall_accesses(log_before, cells, ts, |address, len, _| {
+            let (base, count) = covering_words(address, len);
+            w.word_ranges.push(SideRange {
+                addr: base,
+                start: w.word_values.len() as u32,
+                len: count as u32,
+            });
+            for k in 0..count {
+                let at = base.wrapping_add(k.wrapping_mul(WORD_BYTES));
+                w.word_values.push(read_word(memory, at));
+                w.word_ts.push(shadow.get(at));
+            }
+        });
+        let count = w.word_ranges.len() as u32 - first;
+        w.groups.push(SideGroup { first, count });
+        ECALL | (w.groups.len() as u32 - 1)
+    }
+
+    fn after_ecall(&mut self, log: &Log, cells_before: &RegisterCells, ts: u64) {
+        let shadow = &mut self.shadow;
+        ecall_accesses(log, cells_before, ts, |address, len, stamp| {
+            if let Some(at) = stamp {
+                shadow.fill(address, len, at as u32);
+            }
+        });
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn ecall_registers(&mut self, log: &Log, ts: u64) {
+        let w = &mut self.window;
+        let first = w.reg_cells.len() as u32;
+        ecall_registers(&mut self.cells, log, ts, &mut w.reg_cells);
+        let count = w.reg_cells.len() as u32 - first;
+        w.reg_groups.push(SideGroup { first, count });
+    }
+
+    #[inline(always)]
+    fn push_extra(&mut self, extra: HistExtra) {
+        self.window.extras.push(extra);
     }
 }
