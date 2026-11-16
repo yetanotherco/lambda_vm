@@ -512,7 +512,9 @@ enum Commands {
     /// checks an aligned CPU load or store in one row with its memory tokens
     /// (the production format); `BLOCK_WHIR_MEMORY=split` proves the split
     /// format instead, the one `prove-block`'s tree takes, and
-    /// `BLOCK_WHIR_MEMORY=words` RAM checked by aligned 8-byte words.
+    /// `BLOCK_WHIR_MEMORY=words` RAM checked by aligned 8-byte words (its
+    /// word families streamed as the walk fills them unless
+    /// `LAMBDA_VM_WORD_STREAM=0`, which builds them at the finish).
     ProveBlockBase {
         /// Path to the guest ELF
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
