@@ -59,9 +59,10 @@ const PROGRAMS: [&str; 14] = [
 ];
 
 /// The asm and Rust programs that call the COPY chip: memcpy and memmove,
-/// memset, the commit syscall.
-const COPY_ASM: [&str; 4] = [
+/// memset, the commit syscall (across `2^32` too: `copy_4gib`).
+const COPY_ASM: [&str; 5] = [
     "test_copy_ecalls",
+    "copy_4gib",
     "test_copy_overlaps",
     "test_commit_4",
     "test_commit_split",
@@ -623,6 +624,42 @@ fn a_run_crossing_two_to_the_32_carries_into_the_high_word() {
     }
 }
 
+/// ★ A run whose COPY chip calls cross `2^32` (`copy_4gib`: memcpy and memmove
+/// with the source or the destination across it, one whose unread first
+/// source word is the last below it, a memset across it, a commit from a
+/// source across it) halts on its success path, and its word build carries
+/// keys into the high word: every one of COPY_W's carries is 1 on some row,
+/// at windows of 1000 and 7 cycles. The build balances, its commits against
+/// the public output (`copy_calls_build_balanced_traces_under_the_word_walk`,
+/// which runs it).
+#[test]
+fn a_run_copying_across_two_to_the_32_carries_its_keys() {
+    let (program, logs) = run("copy_4gib");
+    assert_eq!(logs[logs.len() - 3].dst_val, 0, "the program's checks hold");
+    for window in [1000, 7] {
+        let build = word_build(&program, &logs, RegisterFormat::InRow, window);
+        for carry in [
+            copy_w::cols::SRC_CARRY,
+            copy_w::cols::DST_CARRY,
+            copy_w::cols::OP_CARRY,
+        ] {
+            let rows: usize = build
+                .copies
+                .iter()
+                .map(|t| {
+                    (0..t.num_rows())
+                        .filter(|&r| get(t, r, copy_w::cols::MU) == 1 && get(t, r, carry) == 1)
+                        .count()
+                })
+                .sum();
+            assert!(
+                rows > 0,
+                "window {window}: carry column {carry} is 1 on no row"
+            );
+        }
+    }
+}
+
 /// ★ Every CPU load and store is exactly one word table's row, of the family
 /// its width and address name: the word build's rows, as (family,
 /// timestamp, address), are the split build's LOAD and STORE rows classed by
@@ -886,6 +923,7 @@ fn record_mode_under_the_word_format_builds_the_windowed_tables() {
         "misalign_sw",
         "loop_4096",
         "test_copy_ecalls",
+        "copy_4gib",
         "test_copy_overlaps",
         "test_commit_split",
         "test_keccak256",

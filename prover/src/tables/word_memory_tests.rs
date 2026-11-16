@@ -2900,11 +2900,14 @@ fn strip(
     f
 }
 
+/// A carry column, an honest row with it 1 and an honest row with it 0.
+pub(super) type CarryRows = (usize, Vec<FE>, Vec<FE>);
+
 /// A chip table's carry rows, if it has carries: per carry column, an honest
 /// row with that carry 1 (its key the last word of its range) and an honest
 /// row of a call with it 0 (`copy_w_tests::carry_rows`).
-fn chip_carry_rows(name: &str) -> Option<Vec<(usize, Vec<FE>, Vec<FE>)>> {
-    static ROWS: std::sync::OnceLock<Vec<(usize, Vec<FE>, Vec<FE>)>> = std::sync::OnceLock::new();
+fn chip_carry_rows(name: &str) -> Option<Vec<CarryRows>> {
+    static ROWS: std::sync::OnceLock<Vec<CarryRows>> = std::sync::OnceLock::new();
     let family = name.split('[').next()?;
     (family == super::copy_w::NAME)
         .then(|| ROWS.get_or_init(super::copy_w_tests::carry_rows).clone())

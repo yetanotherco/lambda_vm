@@ -475,10 +475,11 @@ fn a_word_block_stating_a_chip_table_is_refused_by_the_chip_rule_alone() {
 }
 
 /// The runs that call the COPY chip: asm programs of every row shape,
-/// overlapping copies and commits split across calls; Rust guests' memcpy,
-/// memmove, memset and commit cases.
-const COPY_ASM: [&str; 3] = [
+/// overlapping copies, commits split across calls and calls across `2^32`;
+/// Rust guests' memcpy, memmove, memset and commit cases.
+const COPY_ASM: [&str; 4] = [
     "test_copy_ecalls",
+    "copy_4gib",
     "test_copy_overlaps",
     "test_commit_split",
 ];
