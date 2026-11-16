@@ -2392,6 +2392,9 @@ fn route_for(
     }
     let pages = first_page..first_page + plan.frame.page_configs.len();
     if pages.contains(&table) {
+        if route_fault!(NoPageLeg) {
+            return Ok(Route::None);
+        }
         let config = &plan.frame.page_configs[table - first_page];
         return page_columns(plan.memory, config, air.name()).map(Route::Page);
     }
@@ -3320,6 +3323,9 @@ pub(crate) mod route_faults {
         OtherPageFamily = 8,
         /// A prepared opening settles one column fewer than it covers.
         SettleOneFewer = 16,
+        /// A page table's columns are checked by nothing (its route checks
+        /// none).
+        NoPageLeg = 32,
     }
 
     std::thread_local! {

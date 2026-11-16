@@ -4259,8 +4259,14 @@ fn the_p1_block_front_draws_the_hosts_challenges() {
     }
 }
 
-/// [`the_p1_block_front_draws_the_hosts_challenges`] under `format`.
-fn front_draws_the_hosts_challenges(elf: &[u8], proof: &BlockWhirProof, format: &BlockFormat) {
+/// [`the_p1_block_front_draws_the_hosts_challenges`] under `format`: the
+/// host's absorb takes the words the format's statement absorbs after the
+/// table counts (none under the split format).
+pub(crate) fn front_draws_the_hosts_challenges(
+    elf: &[u8],
+    proof: &BlockWhirProof,
+    format: &BlockFormat,
+) {
     use super::whir_block::ood_faults::{self, Fault};
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use crypto::fiat_shamir::p1_transcript::P1Transcript;
@@ -4305,7 +4311,7 @@ fn front_draws_the_hosts_challenges(elf: &[u8], proof: &BlockWhirProof, format: 
         &elf,
         &proof.public_output,
         &proof.table_counts,
-        &[],
+        &block_whir::fused_statement_words(format.memory, proof.fused_memory, proof.word_memory),
         proof.num_private_input_pages,
         &proof.runtime_page_ranges,
         &proof.table_num_vars,
