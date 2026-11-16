@@ -111,8 +111,8 @@ receivers of `bitwise::bus_interactions()` on the same bus, and checks all 2^20
 rows of `generate_bitwise_row` against a Rust transcription of `Bitwise.row`
 that the sampled rows pin to the Lean export.
 
-The models follow the multiplicity constraints of PR #1016, merged 2026-10-23.
-Result on `main` after that merge, 2026-10-28:
+The models follow the multiplicity constraints of PR #1016. What `lean_diff`
+enforces, on every PR:
 
 - EQ: 5 constraints and 6 interactions, exact match.
 - SHIFT: 22 constraints and 17 interactions, exact match.

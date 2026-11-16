@@ -164,6 +164,8 @@ def RowSpec (r : Row (F p)) : Prop :=
   r.mu = 1 → r.lhs0.val < 2^32 → r.rhs0.val < 2^32 →
     r.res = ((ltBit r.signed.val r.invert.val r.lhsVal r.rhsVal : ℕ) : F p)
 
+/-- The LT row with `μ ∈ {0, 1}`: soundness and completeness below do not cover the
+deduplicated rows (`μ ≥ 2`) that `lt.rs` produces; see README, "Known differences". -/
 def circuit : GeneralFormalCircuit (F p) Row unit where
   name := "LT"
   main

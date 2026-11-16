@@ -37,17 +37,17 @@ meta def rowJson (r : Bitwise.Row) : Json :=
 /-- The messages a static lookup channel serves at each sampled row: `perRow` consecutive
 entries of its table per BITWISE row (BYTE_ALU serves three, one per `opsel`). -/
 meta def channelJson {M : TypeMap} [ProvableType M] (slc : StaticLookupChannel (F p) M)
-    (perRow : ℕ) (indices : List ℕ) : Json :=
+    (perRow : ℕ) (indices : List ℕ) : IO Json := do
   let table := slc.table.toArray
-  let messages := indices.map fun i => (List.range perRow).map fun k =>
-    match table[perRow * i + k]? with
-    | some m => (toElements m).toList.map fun e : F p => e.val
-    | none => []
-  Json.mkObj [("channel", slc.name), ("size", table.size), ("messages", toJson messages)]
+  let messages ← indices.mapM fun i => (List.range perRow).mapM fun k => do
+    let some m := table[perRow * i + k]?
+      | throw <| IO.userError s!"{slc.name}: no entry {perRow * i + k} in a table of {table.size}"
+    pure ((toElements m).toList.map fun e : F p => e.val)
+  pure <| Json.mkObj [("channel", slc.name), ("size", table.size), ("messages", toJson messages)]
 
 meta def exportBitwise : IO Unit := do
   let indices := bitwiseIndices
-  let channels := [
+  let channels ← [
     channelJson Bitwise.areBytesTable 1 indices,
     channelJson Bitwise.isHalfTable 1 indices,
     channelJson Bitwise.isB20Table 1 indices,
@@ -55,7 +55,7 @@ meta def exportBitwise : IO Unit := do
     channelJson Bitwise.msb16Table 1 indices,
     channelJson Bitwise.zeroTable 1 indices,
     channelJson Bitwise.hwslTable 1 indices,
-    channelJson Bitwise.byteAluTable 3 indices]
+    channelJson Bitwise.byteAluTable 3 indices].mapM id
   let json := Json.mkObj [("name", "bitwise"), ("numRows", Bitwise.numRows),
     ("indices", toJson indices),
     ("rows", Json.arr (indices.map (rowJson ∘ Bitwise.row)).toArray),
