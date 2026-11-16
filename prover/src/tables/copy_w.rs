@@ -38,12 +38,18 @@
 //! ## What pins what
 //!
 //! - **Keys.** `DST_KEY`'s and `SRC_KEY`'s low words are `IS_HALF` limbs and
-//!   step by 8 along the chain; their high words ride the chain unchanged from
-//!   the first row, where the operand registers pin them. A word token exists
-//!   only at an aligned PAGE_W key, so the keys a row reads and writes are
-//!   aligned, and the one-hot `START` (the destination's offset) and `SHIFT`
-//!   are the true ones: x10 reads `DST_KEY + START`, x11 reads
-//!   `SRC_KEY + START + SHIFT`.
+//!   step by 8 along the chain; their high words ride the chain from the first
+//!   row, where the operand registers pin them. A word token exists only at an
+//!   aligned PAGE_W key, so the keys a row reads and writes are aligned, and
+//!   the one-hot `START` (the destination's offset) and `SHIFT` are the true
+//!   ones: x10 reads `DST_KEY + START`, x11 reads `SRC_KEY + START + SHIFT`.
+//! - **Carries.** A key 8 on from the last word of its low range (low word
+//!   `2^32 − 8`) is low word 0 of the next high word: `B`'s key and the next
+//!   row's source key carry by `SRC_CARRY`, the next row's destination key by
+//!   `DST_CARRY`, and x11's operand by `OP_CARRY` when the source's first word
+//!   (unread) is the last of the range below the operand. Each is a bit that
+//!   may be 1 only when its key's low word is `2^32 − 8`; a carry of 0 there
+//!   names low word `2^32`, which no limbs hold and no PAGE_W key has.
 //! - **The window.** `START` and `LAST` are one-hot, `LAST` never before
 //!   `START`; every row but the first starts at byte 0 and every row but the
 //!   last ends at byte 7; the count drops by the window's width and the last
@@ -56,17 +62,19 @@
 //!   degree-3 identity per half: a sum of checked bytes.
 //! - **Reads.** `READ_A` and `READ_B` are fixed by the window and the shift:
 //!   a word whose bytes the window places is always read.
-//! - **memset** keeps `DST_KEY = SRC_KEY + 8` and `SHIFT = 0`: `dst = src + 8`
-//!   exactly, as the executor demands. A commit keeps `SHIFT = 0`.
+//! - **memset** keeps `DST_KEY = SRC_KEY + 8` (with the source's carry) and
+//!   `SHIFT = 0`: `dst = src + 8` exactly, as the executor demands. A commit
+//!   keeps `SHIFT = 0`.
 //!
-//! ## Columns (77)
+//! ## Columns (80)
 //!
 //! `TIMESTAMP`; `COUNT_DECR` (two halves: the count left after the row);
 //! `SRC_KEY_LO` (two halves), `SRC_KEY_HI`; `DST_KEY_LO` (two halves),
 //! `DST_KEY_HI`; `FIRST`, `END`, `MU`, `ZERO` (a zero-length call's one row),
 //! `IS_SET`, `IS_WRITE`, `FIRST_WRITE`; `READ_A`, `READ_B`, `MU_W` (the
 //! destination access); `START[8]`, `LAST[8]`, `SHIFT[8]`; `A[8]`, `B[8]`,
-//! `OLD[8]`; `NEW_LO`, `NEW_HI`; `COMMIT[8]` (byte `j` committed).
+//! `OLD[8]`; `NEW_LO`, `NEW_HI`; `COMMIT[8]` (byte `j` committed);
+//! `SRC_CARRY`, `DST_CARRY`, `OP_CARRY`.
 //!
 //! ## Interactions (37)
 //!
@@ -76,11 +84,10 @@
 //!
 //! ## Limits (completeness only)
 //!
-//! A call whose words would cross a 4 GiB boundary (a key's low word past
-//! `2^32 − 8`, or `src` less its offset and shift below its high word's start),
-//! or whose count is `2^32` or more, has no rows: the walk refuses it. The
-//! executor caps a copy or memset at 256 bytes and a run's commits at one
-//! mebibyte.
+//! A call whose words would wrap past `2^64` or start below address 0, a
+//! commit whose index would pass `2^32`, or a call whose count is `2^32` or
+//! more, has no rows: the walk refuses it. The executor caps a copy or memset
+//! at 256 bytes and a run's commits at one mebibyte.
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity};
@@ -95,7 +102,7 @@ use super::copy::Functionality;
 use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::memw_w::{MemwWordRow, MessageKind};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use super::word_cpu::{bit, placed};
+use super::word_cpu::{LAST_WORD_LO, bit, placed};
 use super::word_memory::{
     WORD_BYTES, access_message, byte_pair_checks, column, term, word_of_bytes,
 };
@@ -158,7 +165,17 @@ pub mod cols {
     pub const NEW_HI: usize = 68;
     /// Whether a commit row commits its byte `j`: `IS_WRITE` on the window.
     pub const COMMIT: [usize; 8] = [69, 70, 71, 72, 73, 74, 75, 76];
-    pub const NUM_COLUMNS: usize = 77;
+    /// 1 when `SRC_KEY` is the last word of its low range: `B`'s key, and the
+    /// next row's source key, carry into the high word.
+    pub const SRC_CARRY: usize = 77;
+    /// 1 when `DST_KEY` is the last word of its low range: the next row's
+    /// destination key carries into the high word.
+    pub const DST_CARRY: usize = 78;
+    /// 1 when x11's operand `SRC_KEY + START + SHIFT` lies in the next high
+    /// word (a first row whose first source word, unread, is the last of the
+    /// range below).
+    pub const OP_CARRY: usize = 79;
+    pub const NUM_COLUMNS: usize = 80;
 
     /// `A ‖ B`: the sixteen bytes a window places from.
     pub const AB: [usize; 16] = [
@@ -320,6 +337,21 @@ impl CopyWordRow {
         self.src_key
     }
 
+    /// The row's carries: `SRC_CARRY`, `DST_CARRY`, `OP_CARRY` (x11's operand
+    /// is `SRC_KEY + START + SHIFT` on a first row).
+    pub(crate) fn carries(&self) -> [bool; 3] {
+        let last = |key: u64| key & 0xFFFF_FFFF == LAST_WORD_LO;
+        let (start, shift) = self.window().map_or((0, 0), |(start, _)| {
+            (u64::from(start), u64::from(self.shift))
+        });
+        let operand = self.src_key.wrapping_add(start + shift);
+        [
+            last(self.src_key),
+            last(self.dst_key),
+            self.first() && !same_high(operand, self.src_key),
+        ]
+    }
+
     pub(crate) fn b_key(&self) -> u64 {
         self.src_key.wrapping_add(WORD_BYTES)
     }
@@ -433,13 +465,10 @@ pub(crate) fn call_rows(
     } else {
         let offset = dst % WORD_BYTES;
         let shift = src.wrapping_sub(dst) % WORD_BYTES;
-        let src_key = src
-            .checked_sub(offset + shift)
-            .filter(|k| same_high(*k, src));
-        let Some(src_key) = src_key else {
+        let Some(src_key) = src.checked_sub(offset + shift) else {
             return Err(format!(
                 "a copy from {src:#x} (offset {offset}, shift {shift}) whose first source \
-                 word is below its high word's range"
+                 word is below address 0"
             ));
         };
         (offset, shift, src_key, dst - offset, dst)
@@ -457,20 +486,26 @@ pub(crate) fn call_rows(
         remaining -= width;
         let reads_a = first && u64::from(start) + shift < WORD_BYTES;
         let reads_b = !end || u64::from(last) + shift >= WORD_BYTES;
-        let row_src = src_key.wrapping_add(WORD_BYTES * k);
-        let row_dst = dst_key.wrapping_add(WORD_BYTES * k);
-        // Every key a row names, and the next row's, stays inside its high
-        // word: the low words are halves and step by 8, the high words ride
-        // the chain unchanged.
-        let src_top = row_src.wrapping_add(if reads_b || !end { WORD_BYTES } else { 0 });
-        let dst_top = row_dst.wrapping_add(if end { 0 } else { WORD_BYTES });
-        if !same_high(row_src, src_key)
-            || !same_high(src_top, src_key)
-            || !same_high(row_dst, dst_key)
-            || !same_high(dst_top, dst_key)
-        {
+        // Every key a row names, and the next row's, is an address: a key 8
+        // on from a low range's last word carries into the high word (the
+        // carries), but none wraps past 2^64. A commit's destination key is
+        // its index, which stays below 2^32 (checked above), so it never
+        // carries.
+        let tops = (|| {
+            let row_src = src_key.checked_add(WORD_BYTES * k)?;
+            let row_dst = dst_key.checked_add(WORD_BYTES * k)?;
+            row_src.checked_add(if reads_b || !end { WORD_BYTES } else { 0 })?;
+            let dst_top = row_dst.checked_add(if end { 0 } else { WORD_BYTES })?;
+            Some((row_src, row_dst, dst_top))
+        })();
+        let Some((row_src, row_dst, dst_top)) = tops else {
             return Err(format!(
-                "a copy from {src:#x} to {dst:#x} of {count:#x} bytes crosses a 4 GiB boundary"
+                "a copy from {src:#x} to {dst:#x} of {count:#x} bytes wraps past 2^64"
+            ));
+        };
+        if commit && !(same_high(row_dst, dst) && same_high(dst_top, dst)) {
+            return Err(format!(
+                "a commit from index {dst:#x} of {count:#x} bytes passes 2^32"
             ));
         }
         let mut flags = kind;
@@ -497,12 +532,6 @@ pub(crate) fn call_rows(
         });
     }
     debug_assert_eq!(remaining, 0, "the windows cover the count");
-    if functionality == Functionality::Set && rows.iter().any(|r| !same_high(r.src_key, r.dst_key))
-    {
-        return Err(format!(
-            "a memset from {src:#x} whose source and destination words straddle a 4 GiB boundary"
-        ));
-    }
     Ok(rows)
 }
 
@@ -770,6 +799,13 @@ pub(crate) fn generate_copy_w_rows_as(
             for (j, &c) in cols::COMMIT.iter().enumerate() {
                 table.set_bool(row, c, commit && r.in_window(j));
             }
+            for (on, c) in
+                r.carries()
+                    .into_iter()
+                    .zip([cols::SRC_CARRY, cols::DST_CARRY, cols::OP_CARRY])
+            {
+                table.set_bool(row, c, on);
+            }
         }
     })
 }
@@ -859,18 +895,45 @@ fn word(bytes: [usize; 8]) -> [BusValue; 2] {
     [word_of_bytes(&bytes[..4]), word_of_bytes(&bytes[4..])]
 }
 
+/// The key 8 on from `(lo, hi)` with `carry` taken into the high word:
+/// `(lo + 8 − 2^32·carry, hi + carry)`.
+fn next_key(lo: [usize; 2], hi: usize, carry: usize) -> [BusValue; 2] {
+    let mut terms = limbs(lo, WORD_BYTES as i64);
+    terms.push(term(-(1 << 32), carry));
+    [
+        BusValue::linear(terms),
+        BusValue::linear(vec![term(1, hi), term(1, carry)]),
+    ]
+}
+
 /// The chain's tuple: the timestamp, the destination key, the source key,
 /// the count, the functionality, the shift, the carried source word.
-/// `forward` is the sender's side (the next row's keys and count, `B`),
-/// else the receiver's (its own keys and count, `A`).
+/// `forward` is the sender's side (the next row's keys, each 8 on with its
+/// carry, and count, `B`), else the receiver's (its own keys and count, `A`).
 fn chain_tuple(forward: bool) -> Vec<BusValue> {
-    let step = if forward { WORD_BYTES as i64 } else { 0 };
+    let ([dst_lo, dst_hi], [src_lo, src_hi]) = if forward {
+        (
+            next_key(cols::DST_KEY_LO, cols::DST_KEY_HI, cols::DST_CARRY),
+            next_key(cols::SRC_KEY_LO, cols::SRC_KEY_HI, cols::SRC_CARRY),
+        )
+    } else {
+        (
+            [
+                BusValue::linear(limbs(cols::DST_KEY_LO, 0)),
+                column(cols::DST_KEY_HI),
+            ],
+            [
+                BusValue::linear(limbs(cols::SRC_KEY_LO, 0)),
+                column(cols::SRC_KEY_HI),
+            ],
+        )
+    };
     let mut tuple = vec![
         column(cols::TIMESTAMP),
-        BusValue::linear(limbs(cols::DST_KEY_LO, step)),
-        column(cols::DST_KEY_HI),
-        BusValue::linear(limbs(cols::SRC_KEY_LO, step)),
-        column(cols::SRC_KEY_HI),
+        dst_lo,
+        dst_hi,
+        src_lo,
+        src_hi,
         BusValue::linear(if forward {
             limbs(cols::COUNT_DECR, 0)
         } else {
@@ -889,17 +952,19 @@ fn chain_tuple(forward: bool) -> Vec<BusValue> {
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let first = || Multiplicity::Column(cols::FIRST);
     let first_write = || Multiplicity::Column(cols::FIRST_WRITE);
-    let src_key = |step: i64| {
-        [
-            BusValue::linear(limbs(cols::SRC_KEY_LO, step)),
-            column(cols::SRC_KEY_HI),
-        ]
-    };
+    let src_key = [
+        BusValue::linear(limbs(cols::SRC_KEY_LO, 0)),
+        column(cols::SRC_KEY_HI),
+    ];
     let src_operand = {
         let mut terms = limbs(cols::SRC_KEY_LO, 0);
         terms.extend(one_hot_value(cols::START, 1));
         terms.extend(one_hot_value(cols::SHIFT, 1));
-        [BusValue::linear(terms), column(cols::SRC_KEY_HI)]
+        terms.push(term(-(1 << 32), cols::OP_CARRY));
+        [
+            BusValue::linear(terms),
+            BusValue::linear(vec![term(1, cols::SRC_KEY_HI), term(1, cols::OP_CARRY)]),
+        ]
     };
     let count = [BusValue::linear(count_terms()), BusValue::constant(0)];
     let dst_operand = [
@@ -936,7 +1001,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 ]),
             ],
         ),
-        // x11, the source: `SRC_KEY + START + SHIFT`, read back unchanged.
+        // x11, the source: `SRC_KEY + START + SHIFT` (its carry into the high
+        // word `OP_CARRY`), read back unchanged.
         BusInteraction::sender(
             BusId::Memw,
             first(),
@@ -1003,12 +1069,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::MemWordMsg,
             Multiplicity::Column(cols::READ_A),
-            access_message(src_key(0), timestamp(false), a.clone(), a),
+            access_message(src_key, timestamp(false), a.clone(), a),
         ),
         BusInteraction::sender(
             BusId::MemWordMsg,
             Multiplicity::Column(cols::READ_B),
-            access_message(src_key(WORD_BYTES as i64), timestamp(false), b.clone(), b),
+            access_message(
+                next_key(cols::SRC_KEY_LO, cols::SRC_KEY_HI, cols::SRC_CARRY),
+                timestamp(false),
+                b.clone(),
+                b,
+            ),
         ),
         BusInteraction::sender(
             BusId::MemWordMsg,
@@ -1107,7 +1178,7 @@ fn limbs_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b.main(0, halves[0]) + b.const_base(1 << 16) * b.main(0, halves[1])
 }
 
-/// COPY_W's 59 constraints, degree 3:
+/// COPY_W's 65 constraints, degree 3:
 /// - idx 0–5: `FIRST`, `END`, `MU`, `ZERO`, `IS_SET`, `IS_WRITE` bits;
 /// - idx 6: `FIRST` or `END` only on an active row; 7, 8: one functionality,
 ///   only on an active row; 9: `FIRST_WRITE = FIRST·IS_WRITE`; 10, 11: a
@@ -1122,12 +1193,16 @@ fn limbs_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 /// - idx 46–53: `COMMIT_j = IS_WRITE·mask_j`;
 /// - idx 54, 55: the new word's halves, the old word with the window placed;
 /// - idx 56: a memset or commit does not shift; 57, 58: a memset's
-///   destination key is its source key plus 8.
+///   destination key is its source key plus 8 (`B`'s key, the source's carry
+///   taken into the high word);
+/// - idx 59–64: `SRC_CARRY`, `DST_CARRY`, `OP_CARRY` each a bit, and 1 only
+///   when its key's low word (`SRC_KEY`'s, `DST_KEY`'s, `SRC_KEY`'s) is the
+///   last of its range, `2^32 − 8`.
 #[derive(Clone, Copy)]
 pub struct CopyWordConstraints;
 
 /// How many constraints [`CopyWordConstraints`] emits.
-pub const NUM_CONSTRAINTS: usize = 59;
+pub const NUM_CONSTRAINTS: usize = 65;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyWordConstraints {
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
@@ -1228,15 +1303,27 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyWordConstraints
 
         b.emit_base(56, (is_set.clone() + is_write) * weighted(b, cols::SHIFT));
         let gap = b.const_base(DMA_MEMSET_GAP);
+        let carry = b.main(0, cols::SRC_CARRY);
         b.emit_base(
             57,
             is_set.clone()
-                * (limbs_expr(b, cols::DST_KEY_LO) - limbs_expr(b, cols::SRC_KEY_LO) - gap),
+                * (limbs_expr(b, cols::DST_KEY_LO) - limbs_expr(b, cols::SRC_KEY_LO) - gap
+                    + b.const_base(1 << 32) * carry.clone()),
         );
         b.emit_base(
             58,
-            is_set * (b.main(0, cols::DST_KEY_HI) - b.main(0, cols::SRC_KEY_HI)),
+            is_set * (b.main(0, cols::DST_KEY_HI) - b.main(0, cols::SRC_KEY_HI) - carry),
         );
+        // The carries: each a bit, 1 only from its key's low range's last word.
+        for (idx, carry, key) in [
+            (59, cols::SRC_CARRY, cols::SRC_KEY_LO),
+            (61, cols::DST_CARRY, cols::DST_KEY_LO),
+            (63, cols::OP_CARRY, cols::SRC_KEY_LO),
+        ] {
+            emit_is_bit(b, idx, carry, None);
+            let root = b.main(0, carry) * (limbs_expr(b, key) - b.const_base(LAST_WORD_LO));
+            b.emit_base(idx + 1, root);
+        }
     }
 
     fn max_degree(&self) -> usize {
