@@ -2879,7 +2879,7 @@ fn check_message_source(
     Ok(())
 }
 
-/// The census's rules tightened after the chip review, each of which a test
+/// The census's rules tightened for the word chips, each of which a test
 /// can loosen back to its earlier form on this thread (the control that shows
 /// the tightening is what refuses a mutant).
 #[derive(Clone, Copy, Debug)]
@@ -5393,7 +5393,7 @@ fn keccak_w_w4_off_a_row(row: &[FE]) -> Vec<FE> {
     v
 }
 
-/// ★ Each census rule the chip review tightened refuses a chip mutant its
+/// ★ Each census rule tightened for the word chips refuses a chip mutant its
 /// earlier form took, read on the chip's honest rows (rows that meet every
 /// other constraint), and takes it again loosened back (the control):
 /// - c9: COPY_W with the `IS_HALF` of a source key limb at multiplicity zero,
