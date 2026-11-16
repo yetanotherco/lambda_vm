@@ -77,11 +77,17 @@ const MSG: u64 = 0x2000;
 /// A bail row (r = 0) at `sig` (the zero page's bytes), as the walk makes
 /// one: the key zero, status 1.
 fn bail_op(sig: u64) -> EcrecOperation {
+    bail_op_at(sig, MSG, OUT)
+}
+
+/// A bail row with its signature at `sig`, its hash at `msg` and its key
+/// and status to `out`.
+fn bail_op_at(sig: u64, msg: u64, out: u64) -> EcrecOperation {
     EcrecOperation {
         timestamp: TS,
-        addr_out: OUT,
+        addr_out: out,
         addr_sig: sig,
-        addr_msg: MSG,
+        addr_msg: msg,
         witness: ecsm::compute_ecrec_witness(&[0u8; 64], &[0u8; 32], 0),
         pending: None,
         words: true,
@@ -132,8 +138,15 @@ fn messages(row: &[FE]) -> Vec<(MessageKind, u64, u64, u64, u64)> {
 /// message's own old word at 0), PAGE_W's finals, the CPU's call and the
 /// register file's four reads.
 fn bench(sig: u64) -> Bench {
+    bench_at([sig, MSG, OUT], |_| {})
+}
+
+/// The bench of one bail call with its operands at `[sig, msg, out]`, its
+/// ECREC_W row passed through `edit` before the messages are read off it.
+fn bench_at([sig, msg, out]: [u64; 3], edit: impl Fn(&mut Table)) -> Bench {
     let pages: Vec<PageConfig> = pages();
-    let ecrec = ecrec_w::generate_ecrec_w_trace(&[bail_op(sig)]);
+    let mut ecrec = ecrec_w::generate_ecrec_w_trace(&[bail_op_at(sig, msg, out)]);
+    edit(&mut ecrec);
     let row: Vec<FE> = (0..ecrec_w::cols::NUM_COLUMNS)
         .map(|c| *ecrec.get_main(0, c))
         .collect();
@@ -213,9 +226,9 @@ fn bench(sig: u64) -> Bench {
     ));
     let reads = [
         (11u64, sig, TS),
-        (12, MSG, TS + 1),
+        (12, msg, TS + 1),
         (13, 0, TS + 1),
-        (10, OUT, TS + 2),
+        (10, out, TS + 2),
     ];
     let regs = table(reads.len(), regs::NUM_COLUMNS, |t, row| {
         let (reg, value, ts) = reads[row];
@@ -402,4 +415,123 @@ pub(super) fn census_rows() -> Vec<Vec<FE>> {
                 .collect()
         })
         .collect()
+}
+
+/// ★ Each of a call's three operands at `8k + 4`, which the executor
+/// refuses and the forger lays out by hand: the signature (eight reads at
+/// `T`), the hash (four reads at `T + 1`), the key and status (nine writes at
+/// `T + 2`). Each is refused on the word bus alone, every key left over 4 mod
+/// 8. Control (a), each: PAGE_W's `OFFSET` the forger's (a main column at
+/// `k + i + 1/2`), minting the keys at `8k + 4 + 8i` from the zero page's
+/// zero words and closing them at the call's words, accepted. Control (b), the
+/// two read operands: the step without its `−1`, each forged read consuming
+/// the token it produces, accepted (a write changes its word, so it cannot
+/// consume its own token).
+#[test]
+fn an_unaligned_ecrec_operand_reads_or_writes_words_nothing_minted() {
+    let aligned = [0x1000u64, MSG, OUT];
+    for (which, what) in ["signature", "hash", "key and status"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut at = aligned;
+        at[which] += 4;
+        let k = (at[which] - 4) / WORD_BYTES;
+        let forged = bench_at(at, |_| {});
+        let v = verdict(&forged);
+        assert!(v.refused_only_on(BusId::MemWord), "{what}: {v:?}");
+        let left = v.left_on(BusId::MemWord);
+        assert!(
+            !left.is_empty() && left.iter().all(|(t, _)| t[0] % 8 == 4),
+            "{what}: {v:?}"
+        );
+
+        // (a) The zero page's rows from k at OFFSET + 1/2, each minting the
+        // forged key's zero word and closing it at the call's word.
+        let row: Vec<FE> = {
+            let t = &forged.piece(ecrec_w::NAME).trace;
+            (0..ecrec_w::cols::NUM_COLUMNS)
+                .map(|c| *t.get_main(0, c))
+                .collect()
+        };
+        let mut a = forged.clone();
+        let name = page_name(0);
+        let half = FE::from(2u64).inv().expect("2 is invertible");
+        let mut minted = 0;
+        for (_, key, ts, _, new) in messages(&row) {
+            if key % 8 != 4 {
+                continue;
+            }
+            let r = (key / WORD_BYTES) as usize;
+            assert!(r >= k as usize, "{what}: a key from k on");
+            a.set(&name, r, pw::OFFSET, FE::from(key / WORD_BYTES) + half);
+            a.set(&name, r, pw::TIMESTAMP, FE::from(ts));
+            a.set(&name, r, pw::FINI_LO, FE::from(new & 0xFFFF_FFFF));
+            a.set(&name, r, pw::FINI_HI, FE::from(new >> 32));
+            minted += 1;
+        }
+        assert_eq!(minted, [8, 4, 9][which], "{what}: the operand's words");
+        let t = &a.piece(&name).trace;
+        let offsets = (0..t.num_rows())
+            .map(|r| *t.get_main(r, pw::OFFSET))
+            .collect();
+        a.piece_mut(&name).preprocessed[pw::OFFSET] = offsets;
+        let v = verdict(&a);
+        assert!(v.accepted(), "{what}, control (a): {v:?}");
+
+        // (b) The read operands: no `−1`, the forged rows at step 0.
+        if which == 2 {
+            continue;
+        }
+        let mut b = forged.with_interactions("MEMW_W", memw_w_without_the_minus_one());
+        let n = b.piece("MEMW_W").trace.num_rows();
+        for r in 0..n {
+            let active = b.get("MEMW_W", r, mw::MU_WRITE) != FE::zero()
+                || b.get("MEMW_W", r, mw::MU_ACCESS) != FE::zero();
+            if !active {
+                continue;
+            }
+            if b.get("MEMW_W", r, mw::ADDRESS_LO).canonical_u64() % 8 == 4 {
+                b.set("MEMW_W", r, mw::STEP_0, FE::zero());
+                b.set("MEMW_W", r, mw::STEP_1, FE::zero());
+            } else {
+                let s = b.get("MEMW_W", r, mw::STEP_0) + FE::one();
+                b.set("MEMW_W", r, mw::STEP_0, s);
+            }
+        }
+        let v = verdict(&b);
+        assert!(v.accepted(), "{what}, control (b): {v:?}");
+    }
+}
+
+/// ★ The status word is `BAIL = MU − OK`, the one constraint ECREC_W adds: a
+/// bail call (no key recovered) whose status word claims success (0), or
+/// claims 5, is refused by that constraint alone; with it out, accepted (the
+/// status word written is the forger's, its MEMW_W write and its final
+/// following it).
+#[test]
+fn a_status_word_not_the_calls_is_refused_by_its_constraint() {
+    let status = ecrec_w::NUM_CONSTRAINTS - 1;
+    for claimed in [0u64, 5] {
+        let forged = bench_at([0x1000, MSG, OUT], |t| {
+            assert_eq!(*t.get_main(0, ecrec_w::cols::BAIL), FE::one(), "a bail");
+            t.main_table.set(0, ecrec_w::cols::BAIL, FE::from(claimed));
+        });
+        let v = verdict(&forged);
+        assert!(
+            v.left.is_empty()
+                && v.unanswered.is_empty()
+                && v.preprocessed.is_empty()
+                && v.broken == vec![(ecrec_w::NAME.to_string(), 0, status)],
+            "status {claimed}: {v:?}"
+        );
+        let mut control = forged;
+        control.piece_mut(ecrec_w::NAME).constraints = Some(|row: &[FE]| {
+            let mut v = constraint_values(&EcrecWordConstraints, row);
+            v[ecrec_w::NUM_CONSTRAINTS - 1] = FE::zero();
+            v
+        });
+        let v = verdict(&control);
+        assert!(v.accepted(), "control, status {claimed}: {v:?}");
+    }
 }
