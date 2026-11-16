@@ -237,14 +237,16 @@ Scope limits, not bugs. Each is also noted where it applies.
 
 - **The lookups a row makes are assumed, not proven.** Every chip theorem is
   about one row, given that each range check or lookup the row pulls is
-  answered correctly. Nothing discharges that for the whole system: the only
-  ensemble theorem, `eq_rows_correct`, is trivially true because no ALU
-  consumer is modelled, and LT and SHIFT have no ensemble. A negative
+  answered correctly. Nothing discharges that for the whole system:
+  `eq_rows_correct` is trivially true because no ALU consumer is modelled, the
+  ensembles this branch adds prove `Ensemble.TableSoundness` from providers
+  that assume their own answers, and SHIFT has no ensemble. A negative
   multiplicity in an unmodelled table that shares `IS_HALF` (the bug PR #1016
   fixed) leaves every theorem and `lean_diff` green.
-- **LT is proven for `μ ∈ {0, 1}` only.** The deduplicated rows `lt.rs`
-  produces (`μ = 2…255`, present on every real block) are covered by neither
-  soundness nor completeness. See "Counted pulls" and the next section.
+- **There is no `lt_rows_correct`.** LT's soundness and completeness do cover
+  the deduplicated rows `lt.rs` produces (`μ = 2…255`), but the `ARE_BYTES`,
+  `IS_HALF` and `MSB16` providers assume their own answers, so nothing
+  concludes about the LT rows of a real trace. See "Counted pulls".
 - **The Lean BITWISE table is compared with Rust on 656 sampled rows.** The
   loop over all 2^20 rows compares `generate_bitwise_row` with a Rust
   transcription of `Bitwise.row`, not with Lean.
