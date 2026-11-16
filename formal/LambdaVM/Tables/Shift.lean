@@ -228,8 +228,9 @@ def Honest (r : Row (F p)) : Prop :=
   r.out0.val = (shiftedOf r).1 + 65536 * (shiftedOf r).2.1 ∧
   r.out1.val = (shiftedOf r).2.2.1 + 65536 * (shiftedOf r).2.2.2
 
-/-- A padding row: `zbs = 1` and the columns below zero. `in`, `bitShift`, `shiftH1` and
-`shiftHigh` are left free, so this covers more rows than the all-zero Rust padding row. -/
+/-- A padding row as `generate_shift_trace` pads: `zbs = 1` and the columns below zero. `in`,
+`bitShift`, `shiftH1` and `shiftHigh` are left free, so this covers more rows than the Rust
+padding row. An all-zero row is not one of them: it pulls `HWSL` with multiplicity `1 − zbs`. -/
 def Padding (r : Row (F p)) : Prop :=
   r.mu = 0 ∧ r.direction = 0 ∧ r.signed = 0 ∧ r.wordInstr = 0 ∧ r.zbs = 1 ∧
   r.isNegative = 0 ∧ r.x0 = 0 ∧ r.x1 = 0 ∧ r.x2 = 0 ∧ r.x3 = 0 ∧ r.x4 = 0 ∧

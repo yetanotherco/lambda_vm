@@ -100,16 +100,20 @@ that they are the same polynomials and the same bus interactions is mechanical:
 
 For each table the test evaluates the Lean asserts and the Rust `ConstraintSet`
 on 64 random rows and matches them as multisets of functions, does the same for
-the interactions (bus id, signed multiplicity, message elements), and checks
-that every Lean constraint vanishes on honest traces from `generate_*_trace`,
-padding rows included; the Lean-only constraints of the documented deltas are
-skipped there. The sign of an interaction comes from its direction: a Rust
-sender is Clean's pull and counts `−m`, a receiver is Clean's push and counts
-`+m`. For BITWISE the test checks the table and channel sizes, compares the
-sampled rows with `generate_bitwise_row` and each channel's messages with the
-receivers of `bitwise::bus_interactions()` on the same bus, and checks all 2^20
-rows of `generate_bitwise_row` against a Rust transcription of `Bitwise.row`
-that the sampled rows pin to the Lean export.
+the interactions, and checks that every Lean constraint vanishes on honest
+traces from `generate_*_trace`, padding rows included; the Lean-only
+constraints of the documented deltas are skipped there. The Rust side of an
+interaction is what the verifier enforces: the multiplicity and the LogUp
+fingerprint `z − (bus + α·e₀ + α²·e₁ + …)` as `emit_multiplicity` and
+`emit_fingerprint` emit them, captured like the constraints and evaluated at
+fixed `z` and `α`; the Lean side folds the exported message the same way.
+Direction (a Rust sender is Clean's pull), multiplicity and fingerprint are
+matched separately. For BITWISE the test checks the table and channel sizes,
+compares the sampled rows with `generate_bitwise_row` and each channel's
+messages with the fingerprints of the receivers of
+`bitwise::bus_interactions()` on the same bus, and checks all 2^20 rows of
+`generate_bitwise_row` against a Rust transcription of `Bitwise.row` that the
+sampled rows pin to the Lean export.
 
 The models follow the multiplicity constraints of PR #1016. What `lean_diff`
 enforces, on every PR:
@@ -173,6 +177,27 @@ What upstream Clean needs for an end-to-end LT theorem with byte `μ`:
    which is a local constraint and makes the requirement vacuous at lawfulness.
 
 Until then LT keeps `μ ∈ {0, 1}` (see below).
+
+## What is intentionally not proven
+
+Scope limits, not bugs. Each is also noted where it applies.
+
+- **The lookups a row makes are assumed, not proven.** Every chip theorem is
+  about one row, given that each range check or lookup the row pulls is
+  answered correctly. Nothing discharges that for the whole system: the only
+  ensemble theorem, `eq_rows_correct`, is trivially true because no ALU
+  consumer is modelled, and LT and SHIFT have no ensemble. A negative
+  multiplicity in an unmodelled table that shares `IS_HALF` (the bug PR #1016
+  fixed) leaves every theorem and `lean_diff` green.
+- **LT is proven for `μ ∈ {0, 1}` only.** The deduplicated rows `lt.rs`
+  produces (`μ = 2…255`, present on every real block) are covered by neither
+  soundness nor completeness. See "Counted pulls" and the next section.
+- **The Lean BITWISE table is compared with Rust on 656 sampled rows.** The
+  loop over all 2^20 rows compares `generate_bitwise_row` with a Rust
+  transcription of `Bitwise.row`, not with Lean.
+- **The meaning side is not checked.** The ALU guarantee has no consumer,
+  since the CPU is not modelled. "Proved against the spec" means
+  `spec/main@2eaf1f080`, not the `spec/` copy in this repository.
 
 ## Known differences from the Rust prover
 

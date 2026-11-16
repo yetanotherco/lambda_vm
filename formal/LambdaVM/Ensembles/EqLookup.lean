@@ -53,8 +53,9 @@ lemma pushStatic_channelsWithRequirements {Message : TypeMap} [ProvableType Mess
     (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
     (pushStatic slc).channelsWithRequirements = [slc.toChannel.toRaw] := rfl
 
-/-- The provider as a component. Clean main asks every component for its witness generation;
-the multiplicities are counted from the demand on the channel. -/
+/-- The provider as a component. Clean asks every component for a witness generation; this one
+is a placeholder that fills every column with the demand's multiplicity, not a valid row. Only
+the circuit is used here. -/
 def pushStaticComponent {Message : TypeMap} [ProvableType Message]
     (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] : Component (F p) where
   circuit := pushStatic slc
@@ -63,9 +64,9 @@ def pushStaticComponent {Message : TypeMap} [ProvableType Message]
     trigger := .pull
     input _ := pure (fromElements (Vector.replicate slc.table.length .multiplicity)) }
 
-/-- The EQ chip as a component, generated from the demand on the ALU bus. EQ pushes its result,
-so the demand it answers is a pull: `Demand.direction` is `.pull` when a message was pulled more
-often than pushed. -/
+/-- The EQ chip as a component. EQ pushes its result, so the demand it answers is a pull:
+`Demand.direction` is `.pull` when a message was pulled more often than pushed. The generation
+is the same placeholder as in `pushStaticComponent`. -/
 def eqComponent : Component (F p) where
   circuit := EQ.circuit
   generation := .demand {
