@@ -1960,6 +1960,9 @@ pub(super) fn ecrec_w_constraints(row: &[FE]) -> Vec<FE> {
 /// its low element the dispatch's low address word less a one-hot offset
 /// (`Σ k·OFF_k`, each `k` in `1..8` at most once) plus `8` or nothing; the
 /// one-hot's columns held to bits, one at a time, by the table's constraints.
+/// The second word's key (plus 8) may carry: `−2^32·c` in the low element and
+/// `+c` in the high one, `c` a column of its own that rule c18 holds
+/// ([`check_carry`]).
 fn check_dispatch_key(
     name: &str,
     dispatch: &BusInteraction,
@@ -1971,12 +1974,19 @@ fn check_dispatch_key(
             "{name}: a dispatch that is not the CPU's nine values with timestamp high word 0"
         ));
     }
-    if produced.values[1] != dispatch.values[3] {
+    let mut lo = form(&produced.values[0])?;
+    let mut hi = form(&produced.values[1])?;
+    let carry = carry_of(&lo, &hi);
+    if let Some(c) = carry {
+        lo.remove(&Some(c));
+        hi.remove(&Some(c));
+    }
+    if hi != form(&dispatch.values[3])? {
         return Err(format!(
             "{name}: a key high word that is not the dispatch's"
         ));
     }
-    let mut diff = form(&produced.values[0])?;
+    let mut diff = lo;
     for (k, v) in form(&dispatch.values[2])? {
         *diff.entry(k).or_insert(0) -= v;
     }
@@ -1989,6 +1999,18 @@ fn check_dispatch_key(
         return Err(format!(
             "{name}: a key low word that is not the dispatch's address less a one-hot offset"
         ));
+    }
+    if let Some(c) = carry {
+        let address: BTreeSet<usize> = columns(&form(&dispatch.values[2])?)
+            .union(&columns(&form(&dispatch.values[3])?))
+            .copied()
+            .collect();
+        if constant != 8 || diff.contains_key(&Some(c)) || address.contains(&c) {
+            return Err(format!(
+                "{name}: a carry {c} that is not the second word's own column"
+            ));
+        }
+        check_carry(name, c, eval)?;
     }
     if diff.is_empty() {
         return Ok(());
@@ -2051,9 +2073,17 @@ fn check_bits(name: &str, mu: &BTreeSet<usize>, eval: Option<(Eval, usize)>) -> 
 /// Rule c2: a word-bus tuple's address is two elements, never packed: its low
 /// element's columns at `1`, `8` or `2^16` (an address, a word index, a limb),
 /// or at `−1..−7` (a one-hot offset taken off a CPU word table's address).
-fn check_address(values: &[BusValue], what: &str) -> Result<(), String> {
-    let lo = form(&values[0])?;
-    let hi = form(&values[1])?;
+/// One column may be a carry ([`carry_of`]): at `−2^32` in the low element and
+/// at 1 in the high element; it is returned, and the caller holds it (rule
+/// c18), or refuses the key.
+fn check_address(values: &[BusValue], what: &str) -> Result<Option<usize>, String> {
+    let mut lo = form(&values[0])?;
+    let mut hi = form(&values[1])?;
+    let carry = carry_of(&lo, &hi);
+    if let Some(c) = carry {
+        lo.remove(&Some(c));
+        hi.remove(&Some(c));
+    }
     if lo
         .iter()
         .any(|(k, c)| k.is_some() && ![1, 8, 1 << 16].contains(c) && !(-7..=-1).contains(c))
@@ -2071,7 +2101,19 @@ fn check_address(values: &[BusValue], what: &str) -> Result<(), String> {
             "{what}: a high word {hi:?} is not one column or a constant"
         ));
     }
-    Ok(())
+    Ok(carry)
+}
+
+/// A word key's carry column: the one column at `−2^32` in its low element and
+/// at 1 in its high element, the address plus 8 with a carry taken into the
+/// high word (`word_cpu::second_word_key`).
+fn carry_of(
+    lo: &BTreeMap<Option<usize>, i128>,
+    hi: &BTreeMap<Option<usize>, i128>,
+) -> Option<usize> {
+    lo.iter()
+        .find(|(k, c)| k.is_some() && **c == -(1i128 << 32) && hi.get(k) == Some(&1))
+        .and_then(|(k, _)| *k)
 }
 
 /// Whether `half` (a 32-bit half of a word a row sends) is range-checked in
@@ -2170,6 +2212,69 @@ fn active_row(name: &str) -> Option<Vec<FE>> {
         .iter()
         .find(|(f, _)| *f == family)
         .map(|(_, row)| row.clone())
+}
+
+/// An honest row of `name`'s table at a low range's last word, on which every
+/// constraint reads zero, the multiplicity is 1 and the carry 1, if it is one
+/// of the CPU's two-word tables (`word_cpu_tests::boundary_rows`).
+fn boundary_row(name: &str) -> Option<Vec<FE>> {
+    static ROWS: std::sync::OnceLock<Vec<(&'static str, Vec<FE>)>> = std::sync::OnceLock::new();
+    let family = name.split('[').next()?;
+    ROWS.get_or_init(super::word_cpu_tests::boundary_rows)
+        .iter()
+        .find(|(f, _)| *f == family)
+        .map(|(_, row)| row.clone())
+}
+
+/// The CPU's word tables, by an AIR name (`MEM_LOAD2W[0]`).
+fn is_cpu_word_table(name: &str) -> bool {
+    let family = name.split('[').next().unwrap_or(name);
+    super::word_cpu::WORD_TABLES[..6].contains(&family)
+}
+
+/// Rule c18: a carry `c` (a second word's key at `(lo − 2^32·c, hi + c)`) is
+/// held by the table's constraints on rows that meet every other one: on an
+/// honest row at a low range's last word ([`boundary_row`], `c = 1`), `c` at 2
+/// or −1 breaks a constraint (a bit); on an honest row elsewhere
+/// ([`active_row`], `c = 0`), `c` at 1 breaks one (a carry only from the last
+/// word). With both, a key's low element is a PAGE_W key's only with the
+/// address's own carry.
+fn check_carry(name: &str, c: usize, eval: Option<(Eval, usize)>) -> Result<(), String> {
+    let Some((eval, width)) = eval else {
+        return Err(format!("{name}: no constraint holds its carry"));
+    };
+    let breaks = |row: &[FE], at: FE| {
+        let mut moved = row.to_vec();
+        moved[c] = at;
+        eval(&moved).iter().any(|v| *v != FE::zero())
+    };
+    let honest = |row: Option<Vec<FE>>, carry: FE, what: &str| -> Result<Vec<FE>, String> {
+        match row {
+            Some(r)
+                if r.len() == width
+                    && r[c] == carry
+                    && eval(&r).iter().all(|v| *v == FE::zero()) =>
+            {
+                Ok(r)
+            }
+            _ => Err(format!("{name}: no honest {what} row to read its carry on")),
+        }
+    };
+    let at_boundary = honest(boundary_row(name), FE::one(), "boundary")?;
+    for bad in [FE::from(2u64), FE::zero() - FE::one()] {
+        if !breaks(&at_boundary, bad) {
+            return Err(format!(
+                "{name}: carry {c} at {bad:?} on the last word breaks nothing"
+            ));
+        }
+    }
+    let elsewhere = honest(active_row(name), FE::zero(), "access")?;
+    if !breaks(&elsewhere, FE::one()) {
+        return Err(format!(
+            "{name}: carry {c} at 1 off the last word breaks nothing"
+        ));
+    }
+    Ok(())
 }
 
 /// The constraints `eval` breaks on `row` with column `col` one more.
@@ -2345,7 +2450,11 @@ pub(super) fn census_table_with(
                 bi.values.len()
             ));
         }
-        check_address(&bi.values, name)?;
+        if check_address(&bi.values, name)?.is_some() && !is_cpu_word_table(name) {
+            return Err(format!(
+                "{name}: a carried key outside the CPU's two-word tables"
+            ));
+        }
     }
     let is_page = name.starts_with(page_w::NAME_PREFIX);
     if is_page {
@@ -2572,7 +2681,9 @@ pub(super) fn census_table_with(
                 bi.values.len()
             ));
         }
-        check_address(&bi.values[1..3], name)?;
+        if check_address(&bi.values[1..3], name)?.is_some() {
+            return Err(format!("{name}: a word message at a carried key"));
+        }
     }
     Ok(())
 }
@@ -2642,7 +2753,9 @@ fn check_message_source(
     message: &BusInteraction,
     chain: Option<&Chain>,
 ) -> Result<(), String> {
-    check_address(&message.values[1..3], name)?;
+    if check_address(&message.values[1..3], name)?.is_some() {
+        return Err(format!("{name}: a word message at a carried key"));
+    }
     let carried_registers = chain.map_or_else(BTreeSet::new, |c| chain_registered(interactions, c));
     let mu = multiplicity_form(&message.multiplicity);
     // A register's value: the value positions of a register read on `Memw`
