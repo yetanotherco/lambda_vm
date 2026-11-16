@@ -1236,6 +1236,369 @@ fn a_crossing_load_whose_second_word_is_elsewhere_is_refused() {
     assert!(v.accepted(), "control: {v:?}");
 }
 
+// ---- the carry at a low range's last word ----
+
+/// The timestamp of the last access at `address`.
+fn last_ts_of(c: &Cpu, address: u64) -> u64 {
+    c.dispatches
+        .iter()
+        .rev()
+        .find(|d| d.address == address)
+        .unwrap_or_else(|| panic!("an access at {address:#x}"))
+        .ts
+}
+
+/// A control's mint: the spare (never touched) private-input row `spare` of
+/// the page at `base` at `OFFSET = offset` (the verifier's `OFFSET` column
+/// replaced by the trace's, so only the token range is taken out) mints
+/// `init` at `base + 8·offset` and takes its final, `fini` at `ts`.
+fn mint_at(
+    bench: &mut Bench,
+    base: u64,
+    spare: usize,
+    offset: FE,
+    [init, fini]: [u64; 2],
+    ts: u64,
+) {
+    let page = page_name(base);
+    bench.set(&page, spare, pw::OFFSET, offset);
+    let quarters = [init, init >> 16, init >> 32, init >> 48].map(|q| q & 0xFFFF);
+    for (k, q) in quarters.into_iter().enumerate() {
+        bench.set_u64(&page, spare, pw::INIT[k], q);
+    }
+    let (lo, hi) = halves(fini);
+    bench.set_u64(&page, spare, pw::FINI_LO, u64::from(lo));
+    bench.set_u64(&page, spare, pw::FINI_HI, u64::from(hi));
+    bench.set_u64(&page, spare, pw::TIMESTAMP, ts);
+    let v = verdict(bench);
+    assert!(
+        v.preprocessed
+            .iter()
+            .all(|(t, r, c)| *t == page && *r == spare && *c == pw::OFFSET),
+        "only OFFSET refuses the mint: {v:?}"
+    );
+    let t = &bench.piece(&page).trace;
+    let column = (0..t.num_rows())
+        .map(|r| *t.get_main(r, pw::OFFSET))
+        .collect();
+    bench.piece_mut(&page).preprocessed[pw::OFFSET] = column;
+}
+
+/// ★ Every width of crossing load and store whose first word is the last of
+/// the low range `[0, 2^32)` is accepted, its second word keyed at low word 0
+/// of high word 1 by the carry, beside a crossing load into that last word
+/// (no carry): the large block's LD at `2^32 − 4` among them.
+#[test]
+fn a_crossing_access_at_a_low_ranges_last_word_is_accepted() {
+    let c = boundary();
+    let bench = c.bench();
+    let v = verdict(&bench);
+    assert!(v.accepted(), "{v:?}");
+    for (table, carry, lo, hi, off, mu, want) in [
+        (
+            "MEM_LOAD2W",
+            l2::CARRY,
+            l2::ADDRESS_LO,
+            l2::ADDRESS_HI,
+            l2::OFF,
+            l2::MU,
+            (7, 1),
+        ),
+        (
+            "MEM_STORE2W",
+            s2::CARRY,
+            s2::ADDRESS_LO,
+            s2::ADDRESS_HI,
+            s2::OFF,
+            s2::MU,
+            (3, 0),
+        ),
+    ] {
+        let t = &bench.piece(table).trace;
+        let mut counts = (0, 0);
+        for r in (0..t.num_rows()).filter(|&r| *t.get_main(r, mu) == FE::one()) {
+            let g = |col: usize| *t.get_main(r, col);
+            let first = (0..8).fold(g(lo), |acc, k| acc - fe(k as u64) * g(off[k]));
+            let second_lo = first + fe(8) - fe(1 << 32) * g(carry);
+            let second_hi = g(hi) + g(carry);
+            if g(carry) == FE::one() {
+                assert_eq!(
+                    first,
+                    fe(LAST),
+                    "{table} row {r}: carried from the last word"
+                );
+                assert_eq!(
+                    (second_lo, second_hi),
+                    (FE::zero(), FE::one()),
+                    "{table} row {r}"
+                );
+                counts.0 += 1;
+            } else {
+                assert_eq!(g(carry), FE::zero(), "{table} row {r}");
+                assert_eq!(
+                    (second_lo, second_hi),
+                    (first + fe(8), g(hi)),
+                    "{table} row {r}"
+                );
+                counts.1 += 1;
+            }
+        }
+        assert_eq!(counts, want, "{table}: (carried, not carried) rows");
+    }
+}
+
+/// ★ The large block's LD at `2^32 − 4` with its carry cleared keys its second
+/// word at `(2^32, 0)`, which no PAGE_W row mints (the bit and the last-word
+/// tie hold at 0): refused on the word bus alone, at that key. Control: a
+/// spare row of the page below the line at `OFFSET = 2^15` (one past its last
+/// word) mints that key, and the load is accepted, so the token range is what
+/// refuses it.
+#[test]
+fn a_crossing_access_at_the_last_word_without_its_carry_names_a_key_nothing_minted() {
+    let c = boundary();
+    let ts = last_ts_of(&c, LAST + 4);
+    let held = *c
+        .rows
+        .load2w
+        .iter()
+        .find(|r| r.timestamp() == ts)
+        .expect("its row");
+    let mut forged = c.bench();
+    let row = row_at(&forged, "MEM_LOAD2W", l2::TIMESTAMP, ts);
+    assert_eq!(forged.get("MEM_LOAD2W", row, l2::CARRY), FE::one());
+    forged.set_u64("MEM_LOAD2W", row, l2::CARRY, 0);
+    // The load no longer touches NEXT: its final is its state before it.
+    let (page, r) = page_row(ABOVE_BASE, NEXT);
+    forged.set_u64(&page, r, pw::TIMESTAMP, held.old_timestamps()[1]);
+    let v = verdict(&forged);
+    assert!(v.refused_only_on(BusId::MemWord), "{v:?}");
+    assert!(
+        v.left_on(BusId::MemWord)
+            .iter()
+            .all(|(tuple, _)| tuple.first() == Some(&(1 << 32)) && tuple.get(1) == Some(&0)),
+        "only the key (2^32, 0): {v:?}"
+    );
+
+    let mut control = forged;
+    set_step(
+        &mut control,
+        "MEM_LOAD2W",
+        row,
+        [l2::STEP2_0, l2::STEP2_1],
+        ts - 1,
+    );
+    mint_at(
+        &mut control,
+        BELOW_BASE,
+        100,
+        fe(DEFAULT_PAGE_SIZE as u64 / 8),
+        [held.words()[1]; 2],
+        ts,
+    );
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ A crossing LD into the last word (from `2^32 − 16`, no carry) claiming
+/// the carry keys its second word at `(2^32 − 8 − 2^32, 1)`, low word −8:
+/// refused by the last-word tie (MEM_LOAD2W constraint 34) and on the word bus
+/// (no PAGE_W key has that low word). With that key minted (a spare row of the
+/// page above the line at `OFFSET = −1`), by the tie alone; with the tie also
+/// taken out, accepted.
+#[test]
+fn a_carry_off_the_last_word_is_refused_by_the_tie_and_the_token_range() {
+    let c = boundary();
+    let ts = last_ts_of(&c, LAST - 4);
+    let held = *c
+        .rows
+        .load2w
+        .iter()
+        .find(|r| r.timestamp() == ts)
+        .expect("its row");
+    let mut forged = c.bench();
+    let row = row_at(&forged, "MEM_LOAD2W", l2::TIMESTAMP, ts);
+    assert_eq!(forged.get("MEM_LOAD2W", row, l2::CARRY), FE::zero());
+    forged.set_u64("MEM_LOAD2W", row, l2::CARRY, 1);
+    // The load no longer touches LAST: its final is its state before it.
+    let (page, r) = page_row(BELOW_BASE, LAST);
+    forged.set_u64(&page, r, pw::TIMESTAMP, held.old_timestamps()[1]);
+    let v = verdict(&forged);
+    assert!(
+        v.broken
+            .iter()
+            .all(|(t, b, k)| t == "MEM_LOAD2W" && *b == row && *k == 34)
+            && !v.broken.is_empty(),
+        "{v:?}"
+    );
+    assert!(
+        v.left.keys().all(|&b| b == u64::from(BusId::MemWord))
+            && !v.left_on(BusId::MemWord).is_empty()
+            && v.unanswered.is_empty()
+            && v.preprocessed.is_empty(),
+        "{v:?}"
+    );
+
+    let mut minted = forged;
+    set_step(
+        &mut minted,
+        "MEM_LOAD2W",
+        row,
+        [l2::STEP2_0, l2::STEP2_1],
+        ts - 1,
+    );
+    mint_at(
+        &mut minted,
+        ABOVE_BASE,
+        100,
+        neg(1),
+        [held.words()[1]; 2],
+        ts,
+    );
+    let v = verdict(&minted);
+    assert!(
+        refused_only_by_constraints(&v, "MEM_LOAD2W", &[34]),
+        "{v:?}"
+    );
+    let v = without_constraints(&minted, "MEM_LOAD2W", &[34]);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ The LD at `2^32 − 4` with a carry of 2 or −1 (the last-word tie reads 0
+/// at any carry there): refused by the carry's bit (MEM_LOAD2W constraint 33)
+/// and on the word bus, its second key `(−2^32, 2)` or `(2^33, −1)`. With the
+/// first minted (a page at high word 2, a spare row at `OFFSET = −2^29`), by the
+/// bit alone; with the bit also taken out, accepted.
+#[test]
+fn a_carry_that_is_not_a_bit_is_refused_by_its_bit() {
+    let c = boundary();
+    let ts = last_ts_of(&c, LAST + 4);
+    let held = *c
+        .rows
+        .load2w
+        .iter()
+        .find(|r| r.timestamp() == ts)
+        .expect("its row");
+    for bad in [fe(2), neg(1)] {
+        let mut forged = c.bench();
+        let row = row_at(&forged, "MEM_LOAD2W", l2::TIMESTAMP, ts);
+        forged.set("MEM_LOAD2W", row, l2::CARRY, bad);
+        let (page, r) = page_row(ABOVE_BASE, NEXT);
+        forged.set_u64(&page, r, pw::TIMESTAMP, held.old_timestamps()[1]);
+        let v = verdict(&forged);
+        assert!(
+            v.broken
+                .iter()
+                .all(|(t, b, k)| t == "MEM_LOAD2W" && *b == row && *k == 33)
+                && !v.broken.is_empty(),
+            "{bad:?}: {v:?}"
+        );
+        assert!(
+            v.left.keys().all(|&b| b == u64::from(BusId::MemWord))
+                && !v.left_on(BusId::MemWord).is_empty(),
+            "{bad:?}: {v:?}"
+        );
+        if bad != fe(2) {
+            continue;
+        }
+        // A page at high word 2 mints the forger's key `(−2^32, 2)`.
+        let high = 2u64 << 32;
+        let config = PageConfig::with_private_input(high, vec![0; 8]);
+        let mut minted = forged;
+        minted.pieces.push(page_piece(&config, &c.words));
+        set_step(
+            &mut minted,
+            "MEM_LOAD2W",
+            row,
+            [l2::STEP2_0, l2::STEP2_1],
+            ts - 1,
+        );
+        mint_at(
+            &mut minted,
+            high,
+            100,
+            neg(1 << 29),
+            [held.words()[1]; 2],
+            ts,
+        );
+        let v = verdict(&minted);
+        assert!(
+            refused_only_by_constraints(&v, "MEM_LOAD2W", &[33]),
+            "{v:?}"
+        );
+        let v = without_constraints(&minted, "MEM_LOAD2W", &[33]);
+        assert!(v.accepted(), "control: {v:?}");
+    }
+}
+
+/// ★ MEM_STORE2W's carry, as MEM_LOAD2W's. An SD at `2^32 − 5`, the only
+/// access to both its words, with its carry cleared writes its second word at
+/// `(2^32, 0)` and leaves `2^32`'s word as it was: refused on the word bus
+/// alone, at that key; with that key minted (the page below the line at
+/// `OFFSET = 2^15`), accepted. On the row alone, its carry at 2 breaks only
+/// the bit (MEM_STORE2W constraint 21), and an honest crossing store off the
+/// last word with its carry at 1 only the tie (22).
+#[test]
+fn a_crossing_store_at_the_last_word_holds_its_carry() {
+    let mut c = Cpu::new(boundary_pages());
+    c.store(LAST + 3, 8, 0xA1A2_A3A4_A5A6_A7A8);
+    let ts = c.ts - 4;
+    let held = c.rows.store2w[0];
+    assert_eq!(held.old_timestamps(), [0, 0], "untouched words");
+    let old_next = page_w::init_word(&boundary_pages()[1], 0);
+    let new_next = held.new_words()[1];
+    assert_ne!(old_next, new_next, "the store changes 2^32's word");
+    let mut forged = c.bench();
+    let row = row_at(&forged, "MEM_STORE2W", s2::TIMESTAMP, ts);
+    assert_eq!(forged.get("MEM_STORE2W", row, s2::CARRY), FE::one());
+    forged.set_u64("MEM_STORE2W", row, s2::CARRY, 0);
+    let (page, r) = page_row(ABOVE_BASE, NEXT);
+    let (lo, hi) = halves(old_next);
+    forged.set_u64(&page, r, pw::FINI_LO, u64::from(lo));
+    forged.set_u64(&page, r, pw::FINI_HI, u64::from(hi));
+    forged.set_u64(&page, r, pw::TIMESTAMP, 0);
+    let v = verdict(&forged);
+    assert!(v.refused_only_on(BusId::MemWord), "{v:?}");
+    assert!(
+        v.left_on(BusId::MemWord)
+            .iter()
+            .all(|(tuple, _)| tuple.first() == Some(&(1 << 32)) && tuple.get(1) == Some(&0)),
+        "only the key (2^32, 0): {v:?}"
+    );
+    let mut control = forged;
+    mint_at(
+        &mut control,
+        BELOW_BASE,
+        100,
+        fe(DEFAULT_PAGE_SIZE as u64 / 8),
+        [old_next, new_next],
+        ts,
+    );
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+
+    let row_of = |bench: &Bench, r: usize| -> Vec<FE> {
+        (0..s2::NUM_COLUMNS)
+            .map(|k| bench.get("MEM_STORE2W", r, k))
+            .collect()
+    };
+    let bench = c.bench();
+    let mut on_last = row_of(&bench, row);
+    assert!(broken_on(store2w_constraints, &on_last).is_empty());
+    on_last[s2::CARRY] = fe(2);
+    assert_eq!(broken_on(store2w_constraints, &on_last), vec![21]);
+    let h = honest();
+    let off = h.ts_of(S + 0x9, store_flags(8));
+    let honest_bench = h.bench();
+    let mut off_last = row_of(
+        &honest_bench,
+        row_at(&honest_bench, "MEM_STORE2W", s2::TIMESTAMP, off),
+    );
+    assert!(broken_on(store2w_constraints, &off_last).is_empty());
+    assert_eq!(off_last[s2::CARRY], FE::zero());
+    off_last[s2::CARRY] = FE::one();
+    assert_eq!(broken_on(store2w_constraints, &off_last), vec![22]);
+}
+
 // ---- the flags are the table's widths ----
 
 /// ★ The first LD (flags 16) taken by a MEM_LOADW row with `SIGNED = 4,
@@ -1696,9 +2059,25 @@ fn every_word_table_constraint_breaks_alone_on_some_row() {
             selectors(s2::OFF, &[s2::WRITE2, s2::WRITE4, s2::WRITE8, s2::MU]),
         ),
     ];
+    // The two-word tables' rows at a low range's last word (the carry 1) join
+    // the search: the carry's bit breaks alone only there.
+    let at_line = boundary().bench();
     let mut missing = Vec::new();
     for (name, eval, mu, off, flags, selectors) in tables {
-        let found = lone_breaks(eval, &base_rows(&bench, name, mu, off, &flags), &selectors);
+        let mut bases = base_rows(&bench, name, mu, off, &flags);
+        let carry = match name {
+            "MEM_LOAD2W" => Some(l2::CARRY),
+            "MEM_STORE2W" => Some(s2::CARRY),
+            _ => None,
+        };
+        if let Some(carry) = carry {
+            bases.extend(
+                base_rows(&at_line, name, mu, off, &flags)
+                    .into_iter()
+                    .filter(|row| row[carry] == FE::one()),
+            );
+        }
+        let found = lone_breaks(eval, &bases, &selectors);
         let lone: Vec<usize> = (0..found.len()).filter(|&k| !found[k]).collect();
         if !lone.is_empty() {
             missing.push(format!("{name}: no lone break for constraints {lone:?}"));
