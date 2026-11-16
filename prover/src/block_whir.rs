@@ -2230,6 +2230,22 @@ fn parse_exec_history(value: Option<&str>) -> Result<Option<bool>, Error> {
     }
 }
 
+/// `LAMBDA_VM_WORD_STREAM`'s reading: unset, empty or `0` (the default), the
+/// finish builds the word memory format's word families; `1`, they are cut
+/// into chunks as the walk fills them
+/// ([`WindowedTraceBuilder::stream_word_tables`]). The tables are the same.
+/// Anything else refuses the prove.
+fn parse_word_stream(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_WORD_STREAM={v}: 0 (the default: the finish builds the word families) or 1 \
+             (cut into chunks as the walk fills them)"
+        ))),
+    }
+}
+
 /// `LAMBDA_VM_LIGHT_WALK`: the walkers' light walk
 /// ([`WindowedTraceBuilder::light_walk`]). Unset, empty or `2` (the default):
 /// record mode's cycles that are no ECALL walked without their cells, each
@@ -5348,6 +5364,9 @@ struct StreamAirs {
     /// The fused memory format's families (streamed only under it).
     mem_load: crate::VmAir,
     mem_store: crate::VmAir,
+    /// The word families' AIRs ([`StreamTable::WORDS`]' order), for their
+    /// streamed chunks.
+    words: [crate::VmAir; 7],
 }
 
 type DynAir = dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
@@ -5389,6 +5408,15 @@ impl StreamAirs {
             keccak_rnd: Box::new(create_keccak_rnd_air_for(opts, keccak_rnd)),
             mem_load: Box::new(create_mem_load_air(opts)),
             mem_store: Box::new(create_mem_store_air(opts)),
+            words: [
+                Box::new(crate::test_utils::create_mem_load8_air(opts)),
+                Box::new(crate::test_utils::create_mem_store8_air(opts)),
+                Box::new(crate::test_utils::create_mem_loadw_air(opts)),
+                Box::new(crate::test_utils::create_mem_storew_air(opts)),
+                Box::new(crate::test_utils::create_mem_load2w_air(opts)),
+                Box::new(crate::test_utils::create_mem_store2w_air(opts)),
+                Box::new(crate::test_utils::create_memw_w_air(opts)),
+            ],
         }
     }
 
@@ -5448,6 +5476,7 @@ impl StreamAirs {
             StreamTable::KeccakRnd => self.keccak_rnd.as_ref(),
             StreamTable::MemLoad => self.mem_load.as_ref(),
             StreamTable::MemStore => self.mem_store.as_ref(),
+            word => self.words[word.word_family()?].as_ref(),
         })
     }
 }
@@ -5471,6 +5500,13 @@ fn stream_base(table: StreamTable) -> &'static str {
         StreamTable::KeccakRnd => "KECCAK_RND",
         StreamTable::MemLoad => "MEM_LOAD",
         StreamTable::MemStore => "MEM_STORE",
+        StreamTable::MemLoad8 => "MEM_LOAD8",
+        StreamTable::MemStore8 => "MEM_STORE8",
+        StreamTable::MemLoadW => "MEM_LOADW",
+        StreamTable::MemStoreW => "MEM_STOREW",
+        StreamTable::MemLoad2W => "MEM_LOAD2W",
+        StreamTable::MemStore2W => "MEM_STORE2W",
+        StreamTable::MemwW => "MEMW_W",
     }
 }
 
@@ -6665,6 +6701,21 @@ fn prove_streamed(
             }
         );
     }
+    // Under the word memory format, the word families streamed in chunks as
+    // the walk fills them, or built at the finish: a word it does not take
+    // refuses the prove. The tables are the same either way.
+    let word_stream = format.memory == crate::tables::fused_memory::MemoryFormat::Words
+        && parse_word_stream(std::env::var("LAMBDA_VM_WORD_STREAM").ok().as_deref())?;
+    if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
+        eprintln!(
+            "★ BLOCK WORD STREAM: {} (LAMBDA_VM_WORD_STREAM)",
+            if word_stream {
+                "the word families cut into chunks as the walk fills them"
+            } else {
+                "off: the finish builds the word families, the default"
+            }
+        );
+    }
     // The walkers' light walk: a word it does not take refuses the prove.
     let light_walk = parse_light_walk(std::env::var("LAMBDA_VM_LIGHT_WALK").ok().as_deref())?;
     eprintln!(
@@ -7134,6 +7185,9 @@ fn prove_streamed(
                 builder = builder.memw_aligned_order(format.memw_aligned)?;
                 builder = builder.register_format(format.registers)?;
                 builder = builder.memory_format(format.memory)?;
+                if word_stream {
+                    builder = builder.stream_word_tables()?;
+                }
                 if card_fill.keccak_rnd {
                     builder = builder.card_fill_keccak_rnd();
                     #[cfg(test)]
@@ -10404,7 +10458,26 @@ mod producer_report_tests {
         BLOCK_LAYOUT_AHEAD, BLOCK_LAYOUT_WORKERS, BLOCK_WINDOW_LOG2, BlockOptions, BlockStamps,
         ExecutorStamps, ProducerStamps, StreamTable,
     };
-    use super::{exec_mode_from, parse_exec_history, parse_exec_history_check, parse_light_walk};
+    use super::{
+        exec_mode_from, parse_exec_history, parse_exec_history_check, parse_light_walk,
+        parse_word_stream,
+    };
+
+    /// `LAMBDA_VM_WORD_STREAM`: off unless `1`; any other word refused.
+    #[test]
+    fn the_word_stream_is_off_unless_turned_on() {
+        for (word, on) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some(" 1 "), true),
+        ] {
+            assert_eq!(parse_word_stream(word).ok(), Some(on), "{word:?}");
+        }
+        for bad in ["2", "on", "true", "-1"] {
+            assert!(parse_word_stream(Some(bad)).is_err(), "{bad}");
+        }
+    }
 
     /// `LAMBDA_VM_LIGHT_WALK`: the light walk with the walkers routing unless
     /// `1` or `0` (the rollback); any other word refused.

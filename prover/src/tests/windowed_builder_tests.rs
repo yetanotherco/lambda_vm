@@ -1222,7 +1222,7 @@ fn the_handout_stamps_count_each_tables_chunks_and_copies() {
         let body = logs.len() - 1;
         let cut = body - body % window;
         let mut chunks = Vec::new();
-        let mut handed = [0usize; 11];
+        let mut handed = [0usize; StreamTable::COUNT];
         for w in logs[..cut].chunks(window) {
             let (mut walker, mut accumulator) = builder.split();
             let walked = walker.walk(w).expect("a window");

@@ -539,6 +539,14 @@ fn slot(table: StreamTable) -> Option<usize> {
         StreamTable::KeccakRnd => None,
         StreamTable::MemLoad => Some(8),
         StreamTable::MemStore => Some(9),
+        // A word family's chunks are never recorded: kept, not regenerated.
+        StreamTable::MemLoad8
+        | StreamTable::MemStore8
+        | StreamTable::MemLoadW
+        | StreamTable::MemStoreW
+        | StreamTable::MemLoad2W
+        | StreamTable::MemStore2W
+        | StreamTable::MemwW => None,
     }
 }
 

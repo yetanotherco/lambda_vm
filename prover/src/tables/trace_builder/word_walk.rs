@@ -60,6 +60,25 @@ pub(crate) struct WordRows {
 pub(crate) const WORD_ROW_LISTS: usize = 8;
 
 impl WordRows {
+    /// Removes family `k`'s first row (`StreamTable::WORDS`' order): the
+    /// tests' slicer bug (`WindowedTraceBuilder::drop_one_op`). Whether a row
+    /// was there.
+    #[cfg(test)]
+    pub(super) fn drop_first(&mut self, k: usize) -> bool {
+        fn first<T>(list: &mut Vec<T>) -> bool {
+            (!list.is_empty()).then(|| list.remove(0)).is_some()
+        }
+        match k {
+            0 => first(&mut self.load8),
+            1 => first(&mut self.store8),
+            2 => first(&mut self.loadw),
+            3 => first(&mut self.storew),
+            4 => first(&mut self.load2w),
+            5 => first(&mut self.store2w),
+            _ => first(&mut self.memw),
+        }
+    }
+
     /// Each list's row count ([`WORD_ROW_LISTS`]).
     pub(crate) fn lens(&self) -> [usize; WORD_ROW_LISTS] {
         [
@@ -626,53 +645,71 @@ fn inside(key: u64, (start, len): (u64, u64)) -> (u64, u8) {
 pub(super) fn word_tables(
     rows: &WordRows,
     max_rows: [usize; 7],
+    skip: [usize; 7],
+    tails: bool,
+    generated: impl Fn(
+        TraceTable<GoldilocksField, GoldilocksExtension>,
+    ) -> TraceTable<GoldilocksField, GoldilocksExtension>
+    + Send
+    + Sync,
     form: TraceForm,
-) -> [Vec<TraceTable<GoldilocksField, GoldilocksExtension>>; 7] {
-    fn cut<T>(
-        list: &[T],
-        max: usize,
-        make: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
-    ) -> Vec<TraceTable<GoldilocksField, GoldilocksExtension>> {
-        list.chunks(max.max(1)).map(make).collect()
-    }
-    [
-        cut(&rows.load8, max_rows[0], |r| {
-            mem_load8::generate_mem_load8_trace_segments_as(&[r], form)
-        }),
-        cut(&rows.store8, max_rows[1], |r| {
-            mem_store8::generate_mem_store8_trace_segments_as(&[r], form)
-        }),
-        cut(&rows.loadw, max_rows[2], |r| {
-            mem_loadw::generate_mem_loadw_trace_segments_as(&[r], form)
-        }),
-        cut(&rows.storew, max_rows[3], |r| {
-            mem_storew::generate_mem_storew_trace_segments_as(&[r], form)
-        }),
-        cut(&rows.load2w, max_rows[4], |r| {
-            mem_load2w::generate_mem_load2w_trace_segments_as(&[r], form)
-        }),
-        cut(&rows.store2w, max_rows[5], |r| {
-            mem_store2w::generate_mem_store2w_trace_segments_as(&[r], form)
-        }),
-        cut(&rows.memw, max_rows[6], |r| {
-            memw_w::generate_memw_w_trace_segments_as(&[r], form)
-        }),
-    ]
+) -> Result<[Vec<TraceTable<GoldilocksField, GoldilocksExtension>>; 7], Error> {
+    use super::chunk_and_generate_skipping as cut;
+    let g = &generated;
+    Ok([
+        cut(&rows.load8, max_rows[0], skip[0], tails, true, |r| {
+            g(mem_load8::generate_mem_load8_trace_segments_as(&[r], form))
+        })?,
+        cut(&rows.store8, max_rows[1], skip[1], tails, true, |r| {
+            g(mem_store8::generate_mem_store8_trace_segments_as(
+                &[r],
+                form,
+            ))
+        })?,
+        cut(&rows.loadw, max_rows[2], skip[2], tails, true, |r| {
+            g(mem_loadw::generate_mem_loadw_trace_segments_as(&[r], form))
+        })?,
+        cut(&rows.storew, max_rows[3], skip[3], tails, true, |r| {
+            g(mem_storew::generate_mem_storew_trace_segments_as(
+                &[r],
+                form,
+            ))
+        })?,
+        cut(&rows.load2w, max_rows[4], skip[4], tails, true, |r| {
+            g(mem_load2w::generate_mem_load2w_trace_segments_as(
+                &[r],
+                form,
+            ))
+        })?,
+        cut(&rows.store2w, max_rows[5], skip[5], tails, true, |r| {
+            g(mem_store2w::generate_mem_store2w_trace_segments_as(
+                &[r],
+                form,
+            ))
+        })?,
+        cut(&rows.memw, max_rows[6], skip[6], tails, true, |r| {
+            g(memw_w::generate_memw_w_trace_segments_as(&[r], form))
+        })?,
+    ])
 }
 
-/// How many tables [`word_tables`] makes of each family.
-pub(super) fn word_table_counts(rows: &WordRows, max_rows: [usize; 7]) -> [usize; 7] {
+/// How many tables [`word_tables`] makes of each family, the first `skip`
+/// of each streamed ([`super::StreamSkip::words`]; with `tails`, `rows` holds
+/// only the rows past them).
+pub(super) fn word_table_counts(
+    rows: &WordRows,
+    max_rows: [usize; 7],
+    skip: [usize; 7],
+    tails: bool,
+) -> Result<[usize; 7], Error> {
     let lens = rows.lens();
     let mut counts = [0usize; 7];
     for k in 0..7 {
-        counts[k] = lens[k].div_ceil(max_rows[k].max(1));
+        counts[k] = super::finish::chunked(lens[k], max_rows[k], skip[k], tails, true)?;
     }
-    counts
+    Ok(counts)
 }
 
-/// The word tables' row caps from the block's: the fused tables' (MEM_LOAD's
-/// for the loads, MEM_STORE's for the stores and MEMW_W), the chunk a block
-/// takes of each.
 pub(super) fn word_max_rows(max_rows: &crate::tables::MaxRowsConfig) -> [usize; 7] {
     let (load, store) = (max_rows.mem_load, max_rows.mem_store);
     [load, store, load, store, load, store, store]
