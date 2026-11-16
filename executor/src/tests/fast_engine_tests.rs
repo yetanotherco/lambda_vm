@@ -8,6 +8,7 @@ use crate::vm::engine::{Engine, EngineKind};
 use crate::vm::execution::{Executor, ExecutorError};
 use crate::vm::fast::FastExecutor;
 use crate::vm::flat_memory::{FlatLayout, FlatMemory};
+use crate::vm::history::NO_ACCESS;
 use crate::vm::instruction::execution::{
     BLAKE3_ABSORB_SYSCALL_NUMBER, BLAKE3_SYSCALL_NUMBER, DMA_MEMCPY_SYSCALL_NUMBER,
     DMA_MEMSET_SYSCALL_NUMBER, ECREC_SYSCALL_NUMBER, ECSM_SYSCALL_NUMBER, HINT_SYSCALL_NUMBER,
@@ -915,5 +916,245 @@ fn the_shadows_ranges_are_its_bytes() {
         let listed: BTreeSet<u64> = shadow.pages().into_iter().map(|(base, _)| base).collect();
         let reached: BTreeSet<u64> = model.keys().map(|a| a & !(page - 1)).collect();
         assert_eq!(listed, reached, "{layout:?}: the stamped pages");
+    }
+}
+
+// The word shadow's stamps and reads are word by word: ranges on and across
+// word and page edges, the flat regions' edges, the paged store between them
+// and the top of the space (wrapping); a range stamps every word holding one
+// of its bytes, and the stamped pages are those it reached.
+#[test]
+fn the_word_shadows_ranges_are_its_words() {
+    use crate::vm::history::{WORD_BYTES, WordShadow, covering_words};
+    use crate::vm::memory::PAGE_SIZE;
+    use std::collections::{BTreeMap, BTreeSet};
+    let page = PAGE_SIZE as u64;
+    assert_eq!(covering_words(5, 0), (0, 0));
+    assert_eq!(covering_words(5, 3), (0, 1));
+    assert_eq!(covering_words(5, 4), (0, 2));
+    assert_eq!(covering_words(u64::MAX - 1, 4), (u64::MAX - 7, 2));
+    for layout in LAYOUTS {
+        let mut shadow = WordShadow::new(layout).unwrap();
+        let mut model: BTreeMap<u64, u32> = BTreeMap::new();
+        let starts = [
+            0,
+            5,
+            page - 3,
+            3 * page - 1,
+            layout.low_end - 5,
+            layout.low_end - 1,
+            layout.high_base - 2,
+            layout.high_base,
+            layout.high_base + page - 4,
+            u64::MAX - 6,
+            u64::MAX,
+        ];
+        let mut ts = 10u32;
+        for &start in &starts {
+            for len in [1u64, 2, 7, 8, 9, 200] {
+                let (first, count) = covering_words(start, len);
+                for k in 0..count {
+                    let word = first.wrapping_add(k * WORD_BYTES);
+                    // Every byte of a word reads the word's stamp.
+                    for byte in [word, word + 3, word + 7] {
+                        assert_eq!(
+                            shadow.get(byte),
+                            model.get(&word).copied().unwrap_or(0),
+                            "{layout:?}: read {byte:#x} before {start:#x}+{len}"
+                        );
+                    }
+                }
+                shadow.fill(start, len, ts);
+                for k in 0..count {
+                    model.insert(first.wrapping_add(k * WORD_BYTES), ts);
+                }
+                ts += 4;
+            }
+        }
+        for (&word, &want) in &model {
+            assert_eq!(shadow.get(word), want, "{layout:?}: {word:#x}");
+            let next = word.wrapping_add(WORD_BYTES);
+            assert_eq!(
+                shadow.get(next),
+                model.get(&next).copied().unwrap_or(0),
+                "{layout:?}: {next:#x}"
+            );
+        }
+        let listed: BTreeSet<u64> = shadow.pages().into_iter().map(|(base, _)| base).collect();
+        let reached: BTreeSet<u64> = model.keys().map(|a| a & !(page - 1)).collect();
+        assert_eq!(listed, reached, "{layout:?}: the stamped pages");
+        for (base, cells) in shadow.pages() {
+            for (k, &ts) in cells.iter().enumerate() {
+                let word = base + k as u64 * WORD_BYTES;
+                assert_eq!(ts, model.get(&word).copied().unwrap_or(0), "{word:#x}");
+            }
+        }
+    }
+}
+
+/// The largest byte stamp of the word holding `address` in `bytes`: the
+/// word's stamp, as a run's words were last touched.
+fn word_of_bytes_stamp(bytes: &crate::vm::history::TsShadow, address: u64) -> u32 {
+    let word = address & !(crate::vm::history::WORD_BYTES - 1);
+    (0..crate::vm::history::WORD_BYTES)
+        .map(|k| bytes.get(word + k))
+        .max()
+        .expect("eight bytes")
+}
+
+/// Runs `program` with the byte history and with the word history, a cycle
+/// at a time (at most `cycles`), and checks that the word history is the
+/// byte history read by word: each cycle's logs, register stamps and ECALL
+/// register cells are the byte history's; each byte of every word the word
+/// history records holds, before the cycle, the memory's value and its word's
+/// largest byte stamp; and at the end every word's stamp is its bytes'
+/// largest, in every page either history stamped.
+pub(crate) fn same_words(
+    program: &Elf,
+    input: Vec<u8>,
+    layout: FlatLayout,
+    cycles: usize,
+) -> Result<usize, TestCaseError> {
+    use crate::vm::history::WORD_BYTES;
+    let (Ok(mut bytes), Ok(mut words)) = (
+        FastExecutor::with_layout(program, input.clone(), layout),
+        FastExecutor::with_layout(program, input, layout),
+    ) else {
+        return Ok(0);
+    };
+    bytes.enable_history().unwrap();
+    words.enable_word_history().unwrap();
+    prop_assert!(words.enable_history().is_err(), "one history a run");
+    let mut ran = 0;
+    while ran < cycles {
+        let got = words.resume_word_history(1);
+        // Before the byte engine runs the cycle: its memory and stamps are
+        // the state the word history read.
+        if let Ok(Some((_, w))) = &got {
+            prop_assert!(w.words && w.accesses.is_empty() && w.ranges.is_empty());
+            let stamps = bytes.byte_stamps().expect("the byte history");
+            let mut failed = None;
+            w.cycle_cells(0, |address, value, ts| {
+                let memory = GuestMemory::load_byte(bytes.memory(), address);
+                let want = word_of_bytes_stamp(stamps, address);
+                if failed.is_none() && (value != memory || ts != want) {
+                    failed = Some(format!(
+                        "{address:#x}: ({value}, {ts}), the bytes say ({memory}, {want})"
+                    ));
+                }
+            });
+            if let Some(why) = failed {
+                return Err(TestCaseError::fail(format!("cycle {ran}: {why}")));
+            }
+        }
+        let want = bytes.resume_history(1);
+        match (got, want) {
+            (Ok(Some((wl, w))), Ok(Some((bl, b)))) => {
+                prop_assert_eq!(
+                    wl.iter().map(record).collect::<Vec<_>>(),
+                    bl.iter().map(record).collect::<Vec<_>>()
+                );
+                let (we, be) = (w.extras[0], b.extras[0]);
+                prop_assert_eq!(we.regs_ts, be.regs_ts, "cycle {}", ran);
+                prop_assert_eq!(we.side == NO_ACCESS, be.side == NO_ACCESS, "cycle {}", ran);
+                prop_assert_eq!(w.cycle_registers(0), b.cycle_registers(0));
+                // After it, each word it recorded carries its bytes' largest
+                // stamp.
+                let (bs, ws) = (bytes.byte_stamps().unwrap(), words.word_stamps().unwrap());
+                let mut bad = None;
+                w.cycle_cells(0, |address, _, _| {
+                    let want = word_of_bytes_stamp(bs, address);
+                    if bad.is_none() && ws.get(address) != want {
+                        bad = Some(address);
+                    }
+                });
+                prop_assert_eq!(bad, None, "cycle {}", ran);
+            }
+            (Ok(None), Ok(None)) => break,
+            (Err(w), Err(b)) => {
+                prop_assert_eq!(error(&w), error(&b));
+                break;
+            }
+            (w, b) => {
+                return Err(TestCaseError::fail(format!(
+                    "cycle {ran}: word history {:?}, byte history {:?}",
+                    w.map(|o| o.is_some()).map_err(|e| error(&e)),
+                    b.map(|o| o.is_some()).map_err(|e| error(&e)),
+                )));
+            }
+        }
+        ran += 1;
+    }
+    let (bs, ws) = (bytes.byte_stamps().unwrap(), words.word_stamps().unwrap());
+    let mut pages: Vec<u64> = ws.pages().into_iter().map(|(b, _)| b).collect();
+    pages.extend(bs.pages().into_iter().map(|(b, _)| b));
+    pages.sort_unstable();
+    pages.dedup();
+    for base in pages {
+        for k in 0..(crate::vm::memory::PAGE_SIZE as u64 / WORD_BYTES) {
+            let word = base + k * WORD_BYTES;
+            prop_assert_eq!(ws.get(word), word_of_bytes_stamp(bs, word), "{:#x}", word);
+        }
+    }
+    Ok(ran)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(160))]
+
+    // The word history on random programs: loads and stores of every width,
+    // aligned or not, on and across the flat regions' edges.
+    #[test]
+    fn the_word_history_is_the_byte_history_by_word(
+        regs in prop::collection::vec(value(), 31),
+        a7 in prop::sample::select(RANDOM_ECALLS.to_vec()),
+        extra in prop::collection::vec(any::<u8>(), 0..256),
+        body in prop::collection::vec(word(), 1..80).prop_map(|w| w.concat()),
+        code in prop::sample::select(vec![0x1000u64, 0x4_0000, (1 << 20) - 0x100, 0xFF00_0000]),
+    ) {
+        let mut regs = regs;
+        regs[16] = a7 as i64 as u64;
+        for layout in LAYOUTS {
+            let elf = program(code, &regs, &extra, &body);
+            same_words(&elf, vec![], layout, 2_000)?;
+        }
+    }
+
+    // The word history over every ecall's memory, with operands where they
+    // are accepted and where they are refused (`ecalls_run_alike`'s).
+    #[test]
+    fn the_word_history_holds_every_ecalls_words(
+        calls in prop::collection::vec(
+            (
+                prop::sample::select(SYSCALLS.to_vec()),
+                prop::collection::vec(ecall_operand(), 4),
+            ),
+            1..5,
+        ),
+        extra in prop::collection::vec(any::<u8>(), 0..512),
+        input in prop::collection::vec(any::<u8>(), 0..64),
+    ) {
+        let mut regs = Vec::new();
+        let mut body = Vec::new();
+        for (number, operands) in &calls {
+            let mut operands = operands.clone();
+            if [1, 2, KECCAK256_SYSCALL_NUMBER].contains(number) {
+                operands[1] %= 4097;
+            }
+            let k = 31 + regs.len() as u64;
+            for (j, rd) in [10u32, 11, 12, 13].into_iter().enumerate() {
+                body.push(ld_data(rd, k + j as u64));
+            }
+            body.push(ld_data(17, k + 4));
+            body.push(0x73);
+            regs.extend_from_slice(&operands);
+            regs.push(*number);
+        }
+        let mut all: Vec<u64> = (1..32).map(|r| if r == 1 { 1 } else { r }).collect();
+        all.extend(regs);
+        for layout in LAYOUTS {
+            let elf = program(0x1000, &all, &extra, &body);
+            same_words(&elf, input.clone(), layout, 1_000)?;
+        }
     }
 }
