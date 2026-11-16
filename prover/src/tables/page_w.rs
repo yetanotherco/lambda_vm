@@ -18,7 +18,8 @@
 //! canonical). On a private-input page they hold the input and are main
 //! columns, each sent to `IS_HALF`, so the word they make is canonical too.
 //! The final word is two 32-bit halves and is not range-checked: it is the
-//! word the last access produced, and every producer keeps its words canonical.
+//! word the last access produced, and every producer keeps its words canonical
+//! (`super::word_memory`).
 //!
 //! ## Columns (8)
 //!
