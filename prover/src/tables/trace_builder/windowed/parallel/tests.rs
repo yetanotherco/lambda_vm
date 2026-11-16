@@ -867,6 +867,9 @@ fn word_windows_walked_on_threads_build_the_windowed_tables() {
         "all_loadstore_32",
         "misalign_sd",
         "misalign_lh",
+        "test_copy_ecalls",
+        "test_copy_overlaps",
+        "test_commit_split",
     ] {
         let (program, logs) = run(name);
         let reference = {

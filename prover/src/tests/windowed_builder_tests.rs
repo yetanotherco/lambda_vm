@@ -542,7 +542,12 @@ fn windowed_builds_the_cut_tables_as_the_split_whole_run_tables() {
             split_keccak(&mut want, log2, padding());
             split_ecsm(&mut want, log2, padding());
             split_ecdas(&mut want, log2, padding());
-            split_copy(&mut want, log2, padding());
+            split_copy(
+                &mut want,
+                log2,
+                padding(),
+                crate::tables::fused_memory::MemoryFormat::Split,
+            );
             for (any, (before, after)) in cut_any.iter_mut().zip(counts.iter().zip([
                 want.keccaks.len(),
                 want.ecsms.len(),

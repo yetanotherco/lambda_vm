@@ -4416,6 +4416,7 @@ fn copy_split_into_chunks_proves_and_verifies() {
             traces,
             block_whir::BLOCK_COPY_ROWS_LOG2,
             CutPadding::default(),
+            crate::tables::fused_memory::MemoryFormat::Split,
         );
     });
     assert_eq!(traces.copies.len(), 1, "COPY: production cut");
@@ -4437,7 +4438,12 @@ fn split_copy_chains_are_keyed_on_the_bus() {
     use crate::tables::types::FE;
     let build = || {
         split_traces("test_copy_ecalls", |traces| {
-            block_whir::split_copy(traces, 0, CutPadding::default());
+            block_whir::split_copy(
+                traces,
+                0,
+                CutPadding::default(),
+                crate::tables::fused_memory::MemoryFormat::Split,
+            );
             assert_eq!(traces.copies.len(), 17, "COPY: one row a table");
         })
     };

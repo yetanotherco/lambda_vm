@@ -3,7 +3,10 @@
 //! run's build balances under the verifier's AIR set for the format (BITWISE's
 //! multiplicities as the build counted them), every word table's and PAGE_W's
 //! constraints read zero, every CPU load and store is exactly one word table's
-//! row, and the format refuses a run that makes any syscall but the halt.
+//! row, and the format refuses a run that makes any syscall but the halt and
+//! the COPY chip's. Runs that call the COPY chip (memcpy and memmove, memset,
+//! the commit syscall) build COPY_W and MEMW_W tables that balance the same
+//! way, the commit bus against the public output as the verifier rebuilds it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -26,7 +29,7 @@ use crate::tables::store::cols as st;
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::tables::word_cpu::{WordClass, word_class};
 use crate::tables::{
-    mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew, page_w,
+    copy_w, mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew, memw_w, page_w,
 };
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
@@ -52,8 +55,43 @@ const PROGRAMS: [&str; 13] = [
     "misalign_sw",
 ];
 
-/// The buses a block's statement closes from outside the tables.
-const OUTSIDE: [BusId; 3] = [BusId::Commit, BusId::GlobalMemory, BusId::Decode];
+/// The asm and Rust programs that call the COPY chip: memcpy and memmove,
+/// memset, the commit syscall.
+const COPY_ASM: [&str; 4] = [
+    "test_copy_ecalls",
+    "test_copy_overlaps",
+    "test_commit_4",
+    "test_commit_split",
+];
+const COPY_RUST: [&str; 7] = [
+    "dma_memcpy_cases",
+    "dma_memmove_cases",
+    "dma_memset_cases",
+    "dma_memcpy_min",
+    "dma_memset_min",
+    "commit",
+    "pure_commit",
+];
+
+/// A Rust guest's run, from `program_artifacts/rust`.
+fn run_rust(name: &str) -> (Elf, Vec<Log>) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../executor/program_artifacts/rust")
+        .join(format!("{name}.elf"));
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let program = Elf::load(&bytes).expect("the ELF loads");
+    let logs = crate::Executor::new(&program, Vec::new())
+        .expect("the executor starts")
+        .run()
+        .expect("the program runs")
+        .logs;
+    (program, logs)
+}
+
+/// The buses a block's statement closes from outside the tables (the commit
+/// bus too, which [`left`] closes with the public output as the verifier
+/// does).
+const OUTSIDE: [BusId; 2] = [BusId::GlobalMemory, BusId::Decode];
 
 fn get(t: &Table, row: usize, col: usize) -> u64 {
     t.get_main(row, col).canonical_u64()
@@ -136,6 +174,14 @@ fn left(
             }
         }
     }
+    // The verifier's receives on the commit bus: `(index, byte)` for each
+    // byte of the public output.
+    for (i, &byte) in build.public_output_bytes.iter().enumerate() {
+        let e = net
+            .entry((u64::from(BusId::Commit), vec![i as u64, u64::from(byte)]))
+            .or_insert(FE::zero());
+        *e = *e - FE::one();
+    }
     let mut out: BTreeMap<u64, Vec<(Vec<u64>, i128)>> = BTreeMap::new();
     for ((bus, tuple), v) in net {
         if v == FE::zero() {
@@ -210,6 +256,9 @@ fn broken(build: &Traces) -> Vec<(usize, usize, usize, usize)> {
     each(3, &w[3], &mem_storew::MemStoreWConstraints, &mut out);
     each(4, &w[4], &mem_load2w::MemLoad2WConstraints, &mut out);
     each(5, &w[5], &mem_store2w::MemStore2WConstraints, &mut out);
+    each(6, &w[6], &memw_w::MemwWordConstraints, &mut out);
+    // COPY's tables, COPY_W's under the word format.
+    each(7, &build.copies, &copy_w::CopyWordConstraints, &mut out);
     out
 }
 
@@ -381,6 +430,61 @@ fn the_word_walk_builds_balanced_traces() {
     }
 }
 
+/// ★ Under the word memory format, every run that calls the COPY chip (the
+/// asm programs of every row shape, overlapping copies, commits split across
+/// calls; the Rust guests' memcpy, memmove, memset and commit cases) builds,
+/// by windows of 1000 cycles and of 7: COPY's tables are COPY_W's, MEMW_W
+/// holds the chips' word accesses, no retired table is built, every inner bus
+/// balances under the verifier's AIR set (the commit bus against the public
+/// output as the verifier rebuilds it), every word table's and COPY_W's row
+/// meets its constraints, and the public output is the split build's.
+#[test]
+fn copy_calls_build_balanced_traces_under_the_word_walk() {
+    let runs = COPY_ASM
+        .iter()
+        .map(|&name| (name, run(name)))
+        .chain(COPY_RUST.iter().map(|&name| (name, run_rust(name))));
+    for (name, (program, logs)) in runs {
+        let split = split_build(&program, &logs);
+        let registers = RegisterFormat::InRow;
+        for window in [1000, 7] {
+            let mut build = word_build(&program, &logs, registers, window);
+            let counts = build.table_counts();
+            assert_eq!(
+                (counts.load, counts.store, counts.memw, counts.memw_aligned),
+                (0, 0, 0, 0),
+                "{name} window {window}: the retired tables"
+            );
+            assert_eq!(build.fused_counts(), [0, 0], "{name}");
+            assert!(
+                counts.copy > 0 && build.word_counts()[6] > 0,
+                "{name}: COPY_W and MEMW_W tables, {counts:?} {:?}",
+                build.word_counts()
+            );
+            assert!(
+                build
+                    .copies
+                    .iter()
+                    .all(|t| t.main_table.width == copy_w::cols::NUM_COLUMNS),
+                "{name}: COPY's tables are COPY_W's"
+            );
+            assert_eq!(
+                build.public_output_bytes, split.public_output_bytes,
+                "{name}: the public output"
+            );
+            pages_hold_the_verifiers_columns(&build).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let left = left(&program, &mut build, registers);
+            assert!(
+                left.is_empty(),
+                "{name} window {window}: {}",
+                super::bus_net_tests::named(&left)
+            );
+            let broken = broken(&build);
+            assert!(broken.is_empty(), "{name}: {broken:?}");
+        }
+    }
+}
+
 /// ★ Every CPU load and store is exactly one word table's row, of the family
 /// its width and address name: the word build's rows, as (family,
 /// timestamp, address), are the split build's LOAD and STORE rows classed by
@@ -408,18 +512,13 @@ fn every_load_and_store_is_one_word_tables_row() {
     }
 }
 
-/// ★ The word format proves no syscall but the halt yet: a run that commits
-/// output, copies or hashes is refused by the walk, naming the syscall,
-/// before any table is built; the same runs build under the fused format.
+/// ★ The word format proves no syscall but the halt and the COPY chip's yet:
+/// a run that hashes is refused by the walk, naming the syscall, before any
+/// table is built; the same runs build under the fused format.
 #[test]
 fn a_run_calling_a_chip_is_refused_by_the_word_walk() {
     use super::windowed::WindowedTraceBuilder;
-    for name in [
-        "test_commit_split",
-        "test_keccak",
-        "test_blake3",
-        "test_dense_pages",
-    ] {
+    for name in ["test_keccak", "test_blake3", "test_keccak256"] {
         let (program, logs) = run(name);
         let mut builder = WindowedTraceBuilder::new(&program, &[], &MaxRowsConfig::small())
             .expect("the builder")
@@ -620,6 +719,9 @@ fn record_mode_under_the_word_format_builds_the_windowed_tables() {
         "all_loadstore_32",
         "misalign_sw",
         "loop_4096",
+        "test_copy_ecalls",
+        "test_copy_overlaps",
+        "test_commit_split",
     ] {
         let (program, logs) = run(name);
         let want = word_build(&program, &logs, RegisterFormat::InRow, 7);

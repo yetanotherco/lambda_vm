@@ -1750,8 +1750,9 @@ impl VmAirs {
     /// `counts[k]` tables of each word family `k`
     /// ([`crate::tables::word_cpu::WORD_TABLES`]: the CPU's six by the words an
     /// access touches, then MEMW_W), named `<family>[i]`, after the fused
-    /// tables' place. Refuses a page PAGE_W cannot hold (a base that is not
-    /// page-aligned) or a page list that is not this set's.
+    /// tables' place; and each COPY table COPY_W, in COPY's place. Refuses a
+    /// page PAGE_W cannot hold (a base that is not page-aligned) or a page
+    /// list that is not this set's.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn with_word_memory(
         &mut self,
@@ -1804,6 +1805,16 @@ impl VmAirs {
             }
         }
         self.word_tables = word_tables;
+        // COPY's tables are COPY_W's under the word format: the same count,
+        // in COPY's place.
+        self.copies = (0..self.copies.len())
+            .map(|i| {
+                Box::new(
+                    crate::test_utils::create_copy_w_air(opts)
+                        .with_name(&format!("{}[{i}]", crate::tables::copy_w::NAME)),
+                ) as VmAir
+            })
+            .collect();
         Ok(())
     }
 }

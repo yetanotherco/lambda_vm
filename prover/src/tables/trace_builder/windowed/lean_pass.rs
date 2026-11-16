@@ -346,14 +346,28 @@ impl Accesses for Bytes {
     }
 }
 
-/// An ECALL's register writes and accesses, as the walk makes them.
-fn ecall(memory: &mut impl Accesses, regs: &mut Registers, op: CpuOp<'_>, ts: u64) {
+/// The words `len` bytes from `address` cover, read: under the word memory
+/// format a chip's walk reads every byte of each word its range touches.
+fn covering(memory: &mut impl Accesses, address: u64, len: u64) {
+    let (base, words) = executor::vm::history::covering_words(address, len);
+    if words > 0 {
+        memory.access(base, (words * 8) as usize, None);
+    }
+}
+
+/// An ECALL's register writes and accesses, as the walk makes them (`words`:
+/// under the word memory format, where a chip's accesses read the words its
+/// ranges cover).
+fn ecall(memory: &mut impl Accesses, regs: &mut Registers, op: CpuOp<'_>, ts: u64, words: bool) {
     if op.ecall_commit() {
         let (buf, count) = (op.commit_buf_addr(), op.commit_count());
         regs.write(10, count, ts);
         regs.write(11, buf, ts);
         regs.write(12, count, ts);
         regs.index = (regs.index.0.wrapping_add(count as u32), ts);
+        if words {
+            covering(memory, buf, count);
+        }
         for k in 0..count {
             memory.access(buf.wrapping_add(k), 1, Some(ts));
         }
@@ -366,6 +380,10 @@ fn ecall(memory: &mut impl Accesses, regs: &mut Registers, op: CpuOp<'_>, ts: u6
         let (dst, src, count) = (regs.value(10), regs.value(11), regs.value(12));
         for (reg, value) in [(10u8, dst), (11, src), (12, count)] {
             regs.write(reg, value, ts);
+        }
+        if words {
+            covering(memory, src, count);
+            covering(memory, dst, count);
         }
         if op.ecall_dma_memcpy() {
             memory.access(src, count as usize, Some(ts));
@@ -560,7 +578,7 @@ fn pass_window<M: Accesses, const MEMORY: bool>(
         }
         regs.pc = (op.next_pc, ts + 1);
         if MEMORY && f.ecall {
-            ecall(memory, regs, CpuOp::new(entry, &op), ts);
+            ecall(memory, regs, CpuOp::new(entry, &op), ts, words);
         }
     }
     Ok(())

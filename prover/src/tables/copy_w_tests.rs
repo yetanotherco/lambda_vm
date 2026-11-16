@@ -25,8 +25,8 @@ use super::page_w::{self, FinalWordMap, FinalWordState, cols as pw};
 use super::types::{BusId, FE};
 use super::word_memory::{WORD_BYTES, column};
 use super::word_memory_tests::{
-    Bench, ELF_BASE, Eval, INPUT_BASE, Piece, STACK_BASE, Table, constraint_values, page_name,
-    page_piece, pages, table, verdict,
+    Bench, ELF_BASE, Eval, INPUT_BASE, Piece, STACK_BASE, Table, census_table, census_table_with,
+    chain_of, constraint_values, page_name, page_piece, pages, table, verdict,
 };
 use executor::vm::instruction::execution::{DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_SYSCALL_NUMBER};
 
@@ -62,7 +62,11 @@ fn refused_by_constraint(bench: &Bench, idx: usize, rows: &[usize]) -> Result<()
         .iter()
         .map(|&r| (copy_w::NAME.to_string(), r, idx))
         .collect();
-    if v.left.is_empty() && v.unanswered.is_empty() && v.preprocessed.is_empty() && v.broken == expected {
+    if v.left.is_empty()
+        && v.unanswered.is_empty()
+        && v.preprocessed.is_empty()
+        && v.broken == expected
+    {
         Ok(())
     } else {
         Err(format!("{v:?}"))
@@ -154,7 +158,11 @@ fn output_interactions() -> Vec<BusInteraction> {
 /// A table whose first `kept` columns are the verifier's.
 fn truth_piece(name: &str, interactions: Vec<BusInteraction>, trace: Table, kept: usize) -> Piece {
     let preprocessed = (0..kept)
-        .map(|c| (0..trace.num_rows()).map(|r| *trace.get_main(r, c)).collect())
+        .map(|c| {
+            (0..trace.num_rows())
+                .map(|r| *trace.get_main(r, c))
+                .collect()
+        })
         .collect();
     Piece {
         name: name.into(),
@@ -283,7 +291,14 @@ impl Run {
     /// The CPU's ECALL and the register accesses of a call `(functionality,
     /// src, dst, count)` at `ts`, as the guest made it; and the byte model
     /// moved as the call must move it.
-    fn guest_call(&mut self, functionality: Functionality, src: u64, dst: u64, count: u64, ts: u64) {
+    fn guest_call(
+        &mut self,
+        functionality: Functionality,
+        src: u64,
+        dst: u64,
+        count: u64,
+        ts: u64,
+    ) {
         let reg = |run: &mut Self, reg: u64, old: u64, new: u64| {
             run.regs.push(RegAccess { reg, old, new, ts });
         };
@@ -455,7 +470,8 @@ impl Run {
             t.main_table.set(row, cpu::TS, FE::from(ts));
             t.main_table
                 .set(row, cpu::NUMBER_LO, FE::from(number & 0xFFFF_FFFF));
-            t.main_table.set(row, cpu::NUMBER_HI, FE::from(number >> 32));
+            t.main_table
+                .set(row, cpu::NUMBER_HI, FE::from(number >> 32));
             t.main_table.set(row, cpu::MU, FE::one());
         });
         pieces.push(truth_piece(
@@ -596,7 +612,13 @@ fn calls_copy_w_cannot_hold_are_refused_with_their_reason() {
     };
     refused(Functionality::Copy, 0x1000, 0x2000, 1 << 32, "below 2^32");
     refused(Functionality::Set, 0x1000, 0x1009, 8, "not src");
-    refused(Functionality::Write, 0x1000, (1 << 32) - 4, 8, "passes 2^32");
+    refused(
+        Functionality::Write,
+        0x1000,
+        (1 << 32) - 4,
+        8,
+        "passes 2^32",
+    );
     // A destination's words past the top of a low word.
     refused(Functionality::Copy, 0x1000, (1 << 32) - 4, 8, "4 GiB");
     // A source whose first word would sit below its high word's range.
@@ -956,11 +978,23 @@ fn a_copy_with_a_wrong_shift_reads_a_word_nothing_minted() {
     let name = page_name(0);
     let row = m as usize;
     let eighth = FE::from(8u64).inv().expect("8 is invertible");
-    control.set(&name, row, pw::OFFSET, FE::from(m) + FE::from(3u64) * eighth);
-    control.set(&name, row, pw::TIMESTAMP, FE::from(run.rows[0].read_timestamp()));
+    control.set(
+        &name,
+        row,
+        pw::OFFSET,
+        FE::from(m) + FE::from(3u64) * eighth,
+    );
+    control.set(
+        &name,
+        row,
+        pw::TIMESTAMP,
+        FE::from(run.rows[0].read_timestamp()),
+    );
     assert_eq!(a, 0, "the zero page");
     let t = &control.piece(&name).trace;
-    let column = (0..t.num_rows()).map(|r| *t.get_main(r, pw::OFFSET)).collect();
+    let column = (0..t.num_rows())
+        .map(|r| *t.get_main(r, pw::OFFSET))
+        .collect();
     control.piece_mut(&name).preprocessed[pw::OFFSET] = column;
     let v = verdict(&control);
     assert!(v.accepted(), "control: {v:?}");
@@ -994,4 +1028,328 @@ fn the_chain_tuple_carries_the_shift_and_the_word() {
             assert_eq!(v, &column(carried[k]));
         }
     }
+}
+
+// ---- the census ----
+
+/// COPY_W's constraints without the new word's identities (54, 55).
+fn copy_w_without_new(row: &[FE]) -> Vec<FE> {
+    let mut v = copy_w_constraints(row);
+    v[54] = FE::zero();
+    v[55] = FE::zero();
+    v
+}
+
+/// ★ The census holds COPY_W to its call (its sender rules): the honest table
+/// passes; it has a chain (bus 42, carrying the timestamp and both keys' high
+/// words); and each mutant is refused: a message's timestamp on another
+/// column, the chain not carrying the timestamp, the chain not carrying a key's
+/// high word, a timestamp past the call's plus 2, the new word fixed by no
+/// constraint, a read word's bytes unchecked, `READ_A` set on an idle row.
+#[test]
+fn the_census_holds_copy_w_to_its_call() {
+    let name = "COPY_W[0]";
+    let honest = copy_w::bus_interactions();
+    census_table(name, &honest, 0).unwrap_or_else(|e| panic!("{e}"));
+    let chain = chain_of(&honest).expect("COPY_W's chain");
+    let message = |k: usize| {
+        honest
+            .iter()
+            .enumerate()
+            .filter(|(_, bi)| bi.bus_id == u64::from(BusId::MemWordMsg))
+            .nth(k)
+            .map(|(i, _)| i)
+            .expect("three messages")
+    };
+    let receive = honest
+        .iter()
+        .position(|bi| bi.bus_id == u64::from(BusId::CopyWordNext) && !bi.is_sender)
+        .expect("the chain's receive");
+    assert!(
+        [cw::TIMESTAMP, cw::SRC_KEY_HI, cw::DST_KEY_HI]
+            .iter()
+            .all(|c| chain.carried.contains(c)),
+        "the chain carries the timestamp and the high words"
+    );
+    let refused =
+        |what: &str, interactions: Vec<BusInteraction>, eval: Option<(Eval, usize)>, why: &str| {
+            let r = match eval {
+                Some(eval) => census_table_with(name, &interactions, 0, Some(eval)),
+                None => census_table(name, &interactions, 0),
+            };
+            assert!(matches!(&r, Err(e) if e.contains(why)), "{what}: {r:?}");
+        };
+    let mut free_ts = honest.clone();
+    free_ts[message(0)].values[3] = column(cw::OLD[0]);
+    refused("a free message timestamp", free_ts, None, "no bit at ±1");
+    let mut uncarried_ts = honest.clone();
+    uncarried_ts[receive].values[0] = BusValue::constant(0);
+    refused(
+        "the chain without the timestamp",
+        uncarried_ts,
+        None,
+        "its chain does not carry",
+    );
+    let mut uncarried_hi = honest.clone();
+    uncarried_hi[receive].values[4] = BusValue::constant(0);
+    refused(
+        "the chain without the source key's high word",
+        uncarried_hi,
+        None,
+        "no canonical source",
+    );
+    let mut late = honest.clone();
+    late[message(2)].values[3] = BusValue::linear(vec![
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cw::TIMESTAMP,
+        },
+        LinearTerm::Constant(3),
+    ]);
+    refused(
+        "a timestamp the call's plus 3",
+        late,
+        None,
+        "its call's plus 0..=2",
+    );
+    refused(
+        "the new word fixed by nothing",
+        honest.clone(),
+        Some((copy_w_without_new as Eval, cw::NUM_COLUMNS)),
+        "neither checked nor fixed",
+    );
+    let unchecked: Vec<BusInteraction> = honest
+        .iter()
+        .filter(|bi| {
+            !(bi.bus_id == u64::from(BusId::AreBytes)
+                && bi.values.first() == Some(&column(cw::A[0])))
+        })
+        .cloned()
+        .collect();
+    assert_eq!(unchecked.len() + 1, honest.len());
+    refused(
+        "A's first pair unchecked",
+        unchecked,
+        None,
+        "not each byte in a checked pair",
+    );
+    refused(
+        "READ_A's rule removed",
+        honest.clone(),
+        Some((copy_w_without::<43> as Eval, cw::NUM_COLUMNS)),
+        "on an idle row breaks nothing",
+    );
+}
+
+// ---- every constraint load-bearing ----
+
+/// The distinct rows of a run's COPY_W trace (padding rows once).
+fn distinct_rows(run: &Run) -> Vec<Vec<FE>> {
+    let t = copy_w::generate_copy_w_trace_as(&run.rows, TraceForm::Wide);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for r in 0..t.num_rows() {
+        let row: Vec<FE> = (0..cw::NUM_COLUMNS).map(|c| *t.get_main(r, c)).collect();
+        let key: Vec<u64> = row.iter().map(|v| v.canonical_u64()).collect();
+        if seen.insert(key) {
+            out.push(row);
+        }
+    }
+    out
+}
+
+/// `row` with the columns COPY_W defines by an identity recomputed from the
+/// rest (`FIRST_WRITE`, `READ_A`, `READ_B`, `MU_W`, `COMMIT`, `NEW_LO`,
+/// `NEW_HI`): an edit to the other columns then breaks only the constraints
+/// that read them otherwise.
+fn completed(mut row: Vec<FE>) -> Vec<FE> {
+    let g = |row: &[FE], c: usize| row[c];
+    let sum = |row: &[FE], cols: &[usize]| cols.iter().fold(FE::zero(), |a, &c| a + row[c]);
+    let one = FE::one();
+    let mask: Vec<FE> = (0..8)
+        .map(|j| sum(&row, &cw::START[..=j]) - sum(&row, &cw::LAST[..j]))
+        .collect();
+    let mut need_a = FE::zero();
+    let mut need_b = FE::zero();
+    for i in 0..8 {
+        for d in 0..8 {
+            if i + d < 8 {
+                need_a += g(&row, cw::START[i]) * g(&row, cw::SHIFT[d]);
+            } else {
+                need_b += g(&row, cw::LAST[i]) * g(&row, cw::SHIFT[d]);
+            }
+        }
+    }
+    let (first, end, mu, zero) = (
+        g(&row, cw::FIRST),
+        g(&row, cw::END),
+        g(&row, cw::MU),
+        g(&row, cw::ZERO),
+    );
+    let write = g(&row, cw::IS_WRITE);
+    row[cw::FIRST_WRITE] = first * write;
+    row[cw::READ_A] = first * need_a;
+    row[cw::READ_B] = (mu - end) + end * need_b;
+    row[cw::MU_W] = (mu - zero) * (one - write);
+    for j in 0..8 {
+        row[cw::COMMIT[j]] = write * mask[j];
+    }
+    for (half, bytes) in [(cw::NEW_LO, 0..4usize), (cw::NEW_HI, 4..8)] {
+        let mut acc = FE::zero();
+        for j in bytes.clone() {
+            let placed = (0..8).filter(|s| j + s < 16).fold(FE::zero(), |a, s| {
+                a + g(&row, cw::SHIFT[s]) * g(&row, cw::AB[j + s])
+            });
+            let byte = mask[j] * placed + (one - mask[j]) * g(&row, cw::OLD[j]);
+            acc += FE::from(1u64 << (8 * (j - bytes.start))) * byte;
+        }
+        row[half] = acc;
+    }
+    row
+}
+
+/// ★ Every one of COPY_W's 59 constraints is one a row can break alone: for
+/// each, from an honest row (every functionality, offset, shift and window
+/// shape, and padding), an edit breaks that constraint and no other — one
+/// column set to a small value, a bound or its own plus or minus one; two of
+/// the flag and one-hot columns set to 0 or 1; or one one-hot column up one
+/// and another down one (its sum kept) — the columns an identity defines
+/// recomputed from the rest, or edited alone; or `MU` at 2 or `ZERO` at −1
+/// with each one-hot given a second bit. So each is load-bearing at the row:
+/// taken out, a row the table refused meets every other. Three are implied by
+/// the rest (listed with why); every other must be found.
+#[test]
+fn every_copy_w_constraint_breaks_alone_on_some_row() {
+    let mut run = Run::new();
+    for offset in 0..8u64 {
+        for shift in 0..8u64 {
+            for &n in &[1u64, 3, 9, 17] {
+                run.copy(
+                    ELF + 8 * shift + (offset + shift) % 8,
+                    LOW + 0x400 + offset,
+                    n,
+                );
+            }
+        }
+        run.set(LOW + 0x700 + offset, 13);
+        run.commit(ELF + 0x40 + offset, 11);
+    }
+    run.copy(LOW, LOW + 0x100, 0);
+    run.commit(ELF, 0);
+    let rows = distinct_rows(&run);
+    let flags = [
+        cw::FIRST,
+        cw::END,
+        cw::MU,
+        cw::ZERO,
+        cw::IS_SET,
+        cw::IS_WRITE,
+    ];
+    let selectors: Vec<usize> = flags
+        .into_iter()
+        .chain([cw::FIRST_WRITE, cw::READ_A, cw::READ_B, cw::MU_W])
+        .chain(cw::START)
+        .chain(cw::LAST)
+        .chain(cw::SHIFT)
+        .chain(cw::COMMIT)
+        .collect();
+    let mut found = [false; copy_w::NUM_CONSTRAINTS];
+    let mut note = |row: &[FE]| {
+        let v = copy_w_constraints(row);
+        let broken: Vec<usize> = (0..v.len()).filter(|&k| v[k] != FE::zero()).collect();
+        if let [k] = broken.as_slice() {
+            found[*k] = true;
+        }
+    };
+    let small = |x: FE| {
+        [
+            FE::zero(),
+            FE::one(),
+            FE::from(2u64),
+            FE::zero() - FE::one(),
+            x + FE::one(),
+            x - FE::one(),
+            FE::from(1u64 << 32),
+        ]
+    };
+    for row in &rows {
+        for c in 0..cw::NUM_COLUMNS {
+            for v in small(row[c]) {
+                let mut edited = row.clone();
+                edited[c] = v;
+                note(&edited);
+                note(&completed(edited));
+            }
+        }
+        for (i, &a) in selectors.iter().enumerate() {
+            for &b in &selectors[i + 1..] {
+                for (va, vb) in [(0u64, 0u64), (0, 1), (1, 0), (1, 1)] {
+                    let mut edited = row.clone();
+                    edited[a] = FE::from(va);
+                    edited[b] = FE::from(vb);
+                    note(&edited);
+                    note(&completed(edited));
+                }
+            }
+        }
+        for one_hot in [cw::START, cw::LAST, cw::SHIFT] {
+            for &a in &one_hot {
+                for &b in &one_hot {
+                    if a != b {
+                        let mut edited = row.clone();
+                        edited[a] += FE::one();
+                        edited[b] = edited[b] - FE::one();
+                        note(&completed(edited));
+                    }
+                }
+            }
+        }
+        // The flags three at a time, each 0, 1 or 2.
+        for (i, &a) in flags.iter().enumerate() {
+            for (j, &b) in flags.iter().enumerate().skip(i + 1) {
+                for &c in &flags[j + 1..] {
+                    for code in 0..27u64 {
+                        let mut edited = row.clone();
+                        edited[a] = FE::from(code % 3);
+                        edited[b] = FE::from(code / 3 % 3);
+                        edited[c] = FE::from(code / 9);
+                        note(&completed(edited));
+                    }
+                }
+            }
+        }
+        // `MU` at 2 or `ZERO` at −1, each one-hot given a second bit (its
+        // sum `MU − ZERO` then 2).
+        for (col, value) in [(cw::MU, FE::from(2u64)), (cw::ZERO, FE::zero() - FE::one())] {
+            if row[cw::MU] != FE::one() || row[cw::ZERO] != FE::zero() {
+                continue;
+            }
+            for s in 0..8 {
+                for l in 0..8 {
+                    for d in 0..8 {
+                        let mut edited = row.clone();
+                        edited[col] = value;
+                        edited[cw::START[s]] += FE::one();
+                        edited[cw::LAST[l]] += FE::one();
+                        edited[cw::SHIFT[d]] += FE::one();
+                        note(&completed(edited));
+                    }
+                }
+            }
+        }
+    }
+    // Implied by the rest, so no row breaks them alone (kept as written):
+    // - 6, `FIRST` or `END` only on an active row: `FIRST = 1` makes
+    //   `(MU − FIRST)·(1 − START_0)` (40) ask `MU = 1` or `START_0 = 1`, and
+    //   `START_0 = 1` with the one-hot's sum `MU − ZERO` (20) and both bits
+    //   asks `MU = 1`; `END` likewise by 41 and 29;
+    // - 10 and 11, a zero-length row is first and last: `ZERO = 1` leaves the
+    //   one-hots empty (20, 29, so `MU = 1`), and then a row that is not first
+    //   breaks 40, one that is not last breaks 41.
+    let missing: Vec<usize> = (0..found.len()).filter(|&k| !found[k]).collect();
+    assert_eq!(
+        missing,
+        vec![6, 10, 11],
+        "no lone break found for {missing:?}"
+    );
 }

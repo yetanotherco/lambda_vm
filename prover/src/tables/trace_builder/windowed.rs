@@ -2164,8 +2164,8 @@ struct BatchMarks {
     shift: usize,
     mem_load: usize,
     mem_store: usize,
-    /// The word memory format's rows made so far, family by family.
-    word_rows: [usize; 6],
+    /// The word memory format's rows made so far, list by list.
+    word_rows: [usize; super::word_walk::WORD_ROW_LISTS],
     /// The in-walk lookups listed so far: under the in-row register format
     /// each CPU slot's `IS_HALF` (a walk that does not list the rest).
     bitwise: usize,
@@ -2499,7 +2499,8 @@ impl Accumulator<'_> {
             walk.mem_store_rows
                 .iter()
                 .for_each(|row| row.count_bitwise_into(histogram));
-            walk.word_rows.count_bitwise_into([0; 6], histogram);
+            walk.word_rows
+                .count_bitwise_into([0; super::word_walk::WORD_ROW_LISTS], histogram);
         }
         self.counted.histogram.add_ops(&window.walk.bitwise_ops);
         self.counted.bitwise_ops += window.walk.bitwise_ops.len();
