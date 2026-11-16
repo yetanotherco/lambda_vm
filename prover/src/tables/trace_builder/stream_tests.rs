@@ -88,6 +88,7 @@ fn air_order(t: &Traces) -> Vec<Option<&Table>> {
         &t.ecsms,
         &t.ecdases,
         &t.hints,
+        &t.ecrecs,
     ] {
         out.extend(list.iter().map(slot));
     }
@@ -562,6 +563,7 @@ fn under_the_word_format_the_stream_is_the_monolithic_finish() {
         "test_copy_ecalls",
         "test_commit_split",
         "test_keccak256",
+        "test_ecrec",
     ] {
         the_stream_is_the_finish_under(&MaxRowsConfig::small(), name, &word_configs());
     }

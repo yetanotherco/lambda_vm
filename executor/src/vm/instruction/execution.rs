@@ -1188,6 +1188,16 @@ impl Instruction {
                         if parity > 1 {
                             return Err(ExecutionError::EcrecParityOutOfRange(parity));
                         }
+                        // The three operands are 8-aligned: a prover that checks memory
+                        // by aligned words takes each doubleword as one word. This is a
+                        // rule on the guest (its wrapper takes the software path on an
+                        // unaligned operand), never what a proof's soundness rests on.
+                        if [addr_out, addr_sig, addr_msg]
+                            .iter()
+                            .any(|addr| !addr.is_multiple_of(8))
+                        {
+                            return Err(ExecutionError::EcrecMisaligned);
+                        }
                         let mut sig = [0u8; 64];
                         for i in 0..8u64 {
                             let dw = memory.load_doubleword(addr_sig + 8 * i)?;
@@ -1545,6 +1555,8 @@ pub enum ExecutionError {
     EcrecOperandOverlap,
     #[error("ECREC parity must be 0 or 1, got {0}")]
     EcrecParityOutOfRange(u64),
+    #[error("ECREC operands must be 8-aligned")]
+    EcrecMisaligned,
     #[error("DMA chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
     DmaChunkTooLarge(u64),
     #[error("DMA memset needs dst == src + {DMA_MEMSET_GAP}; got src {src:#x}, dst {dst:#x}")]

@@ -531,3 +531,55 @@ fn a_word_block_with_a_moved_copy_row_is_refused_by_the_balance_alone() {
     );
     assert!(matches!(&off, Ok(Ok(()))), "without the balance: {off:?}");
 }
+
+/// ★ Word blocks that call keccak256 and ECREC prove and verify: each run (an
+/// asm program of every keccak256 shape, one of ECREC calls with aligned
+/// operands), proved as a streamed block under the word memory format,
+/// verifies under it and under neither the split nor the fused format; it
+/// states KECCAK_W or ECREC_W tables in their chips' places and MEMW_W tables
+/// (the walk's count), no retired or fused table; and its public output is
+/// the run's.
+#[test]
+fn a_word_block_calling_keccak256_and_ecrec_proves_and_verifies() {
+    let words = format(MemoryFormat::Words);
+    for name in ["test_keccak256", "test_ecrec"] {
+        let elf = asm_elf_bytes(name);
+        let proof = prove(&elf, &words);
+        assert!(verifies(&proof, &elf, &words), "{name}");
+        for other in [MemoryFormat::Split, MemoryFormat::Fused] {
+            assert!(
+                !verifies(&proof, &elf, &format(other)),
+                "{name}: verifies under {other:?}"
+            );
+        }
+        let c = &proof.table_counts;
+        assert_eq!(
+            (c.load, c.store, c.memw, c.memw_aligned),
+            (0, 0, 0, 0),
+            "{name}: no retired table"
+        );
+        assert_eq!(proof.fused_memory, [0, 0], "{name}");
+        assert!(
+            (c.keccak > 0 || c.ecrec > 0) && proof.word_memory[6] > 0,
+            "{name}: KECCAK_W or ECREC_W, and MEMW_W"
+        );
+        let build = word_build(&elf, &words);
+        assert_eq!(
+            proof.word_memory,
+            build.word_counts().map(|n| n as u64),
+            "{name}: the walk's word tables"
+        );
+        assert_eq!(
+            proof.public_output, build.public_output_bytes,
+            "{name}: the run's public output"
+        );
+        println!(
+            "WORD CHIP BLOCK {name}: KECCAK_W {} ECREC_W {} ECDAS {}, word tables {:?}, output {} bytes",
+            c.keccak,
+            c.ecrec,
+            c.ecdas,
+            proof.word_memory,
+            proof.public_output.len()
+        );
+    }
+}

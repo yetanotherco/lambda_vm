@@ -29,8 +29,8 @@ use crate::tables::store::cols as st;
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::tables::word_cpu::{WordClass, word_class};
 use crate::tables::{
-    copy_w, keccak_w, mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew,
-    memw_w, page_w,
+    copy_w, ecrec_w, keccak_w, mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8,
+    mem_storew, memw_w, page_w,
 };
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
@@ -268,6 +268,7 @@ fn broken(build: &Traces) -> Vec<(usize, usize, usize, usize)> {
         &keccak_w::KeccakWordConstraints,
         &mut out,
     );
+    each(9, &build.ecrecs, &ecrec_w::EcrecWordConstraints, &mut out);
     out
 }
 
@@ -544,6 +545,44 @@ fn keccak256_calls_build_balanced_traces_under_the_word_walk() {
     }
 }
 
+/// ★ Under the word memory format, a run of ECREC calls (their operands
+/// aligned, as the executor demands) builds by windows of 1000 cycles and
+/// of 7: ECREC's tables are ECREC_W's, MEMW_W holds their word accesses,
+/// every inner bus balances under the verifier's set (ECDAS's chains
+/// included), every word table's and ECREC_W's row meets its constraints, and
+/// the keys committed are the split build's.
+#[test]
+fn ecrec_calls_build_balanced_traces_under_the_word_walk() {
+    let name = "test_ecrec";
+    let (program, logs) = run(name);
+    let split = split_build(&program, &logs);
+    for window in [1000, 7] {
+        let mut build = word_build(&program, &logs, RegisterFormat::InRow, window);
+        let counts = build.table_counts();
+        assert!(
+            counts.ecrec > 0 && counts.ecdas > 0 && build.word_counts()[6] > 0,
+            "ECREC_W, ECDAS and MEMW_W: {counts:?} {:?}",
+            build.word_counts()
+        );
+        assert!(
+            build
+                .ecrecs
+                .iter()
+                .all(|t| t.main_table.width == ecrec_w::cols::NUM_COLUMNS),
+            "ECREC's tables are ECREC_W's"
+        );
+        assert_eq!(build.public_output_bytes, split.public_output_bytes);
+        let left = left(&program, &mut build, RegisterFormat::InRow);
+        assert!(
+            left.is_empty(),
+            "window {window}: {}",
+            super::bus_net_tests::named(&left)
+        );
+        let broken = broken(&build);
+        assert!(broken.is_empty(), "{broken:?}");
+    }
+}
+
 /// ★ Every CPU load and store is exactly one word table's row, of the family
 /// its width and address name: the word build's rows, as (family,
 /// timestamp, address), are the split build's LOAD and STORE rows classed by
@@ -571,10 +610,10 @@ fn every_load_and_store_is_one_word_tables_row() {
     }
 }
 
-/// ★ The word format proves no syscall but the halt, the COPY chip's and
-/// keccak256 yet: a run that permutes a Keccak state, compresses with BLAKE3
-/// or multiplies a curve point is refused by the walk, naming the syscall,
-/// before any table is built.
+/// ★ The word format proves no syscall but the halt, the COPY chip's,
+/// keccak256 and ECREC yet: a run that permutes a Keccak state, compresses
+/// with BLAKE3 or multiplies a curve point is refused by the walk, naming the
+/// syscall, before any table is built.
 #[test]
 fn a_run_calling_a_chip_is_refused_by_the_word_walk() {
     use super::windowed::WindowedTraceBuilder;
@@ -784,6 +823,7 @@ fn record_mode_under_the_word_format_builds_the_windowed_tables() {
         "test_copy_overlaps",
         "test_commit_split",
         "test_keccak256",
+        "test_ecrec",
     ] {
         let (program, logs) = run(name);
         let want = word_build(&program, &logs, RegisterFormat::InRow, 7);

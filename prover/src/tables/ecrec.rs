@@ -147,6 +147,9 @@ pub struct EcrecOperation {
     /// `witness` is then [`EcrecWitness::unresolved`] with the key and status
     /// the walk wrote. `None` once the witness is in `witness`.
     pub(crate) pending: Option<std::sync::Arc<DeferredEcrec>>,
+    /// The row is ECREC_W's (the word memory format): its lookups add its
+    /// byte pairs (`tables::ecrec_w`).
+    pub(crate) words: bool,
 }
 
 impl EcrecOperation {

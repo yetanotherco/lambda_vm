@@ -455,16 +455,23 @@ pub fn registers_setting(knob: Option<&str>) -> Result<RegisterFormat, String> {
 /// ([`BlockFormat::production`]: an aligned CPU load or store checked in one
 /// row with its memory tokens, [`MemoryFormat::Fused`]), and any other process
 /// the pinned preset's ([`BlockFormat::pinned`], the loads and stores split),
-/// the only one the tree recurses over. `split` and `fused` name either. A
-/// format value: the prover and the verifier of one proof take the same one.
-/// The tree refuses `fused`; `split` is the base's rollback.
+/// the only one the tree recurses over. `split` and `fused` name either;
+/// `words` (RAM checked by aligned 8-byte words) a base-only process's alone.
+/// A format value: the prover and the verifier of one proof take the same
+/// one. The tree refuses `fused`; `split` is the base's rollback.
 pub fn memory_setting(knob: Option<&str>, base_only: bool) -> Result<MemoryFormat, String> {
     match knob.map(str::trim) {
         None if base_only => Ok(BlockFormat::production().memory),
         None => Ok(BlockFormat::pinned().memory),
         Some("split") => Ok(MemoryFormat::Split),
         Some("fused") => Ok(MemoryFormat::Fused),
-        Some(v) => Err(format!("BLOCK_WHIR_MEMORY={v}: split or fused")),
+        // RAM checked by aligned 8-byte words: a base-only process's alone,
+        // the tree proves no word-format block.
+        Some("words") if base_only => Ok(MemoryFormat::Words),
+        Some("words") => Err(
+            "BLOCK_WHIR_MEMORY=words: a base-only process's alone (prove-block-base)".to_string(),
+        ),
+        Some(v) => Err(format!("BLOCK_WHIR_MEMORY={v}: split, fused or words")),
     }
 }
 
@@ -6208,6 +6215,10 @@ mod tests {
                 assert!(e.contains("BLOCK_WHIR_MEMORY"), "{e}");
             }
         }
+        // The word format: a base-only process's alone.
+        assert_eq!(memory_setting(Some("words"), true), Ok(MemoryFormat::Words));
+        let e = memory_setting(Some("words"), false).expect_err("the tree's");
+        assert!(e.contains("base-only"), "{e}");
     }
 
     /// `W3_LEAF_EMITTERS`: unset is the default count, 0 is the control (one

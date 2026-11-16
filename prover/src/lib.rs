@@ -1750,8 +1750,8 @@ impl VmAirs {
     /// `counts[k]` tables of each word family `k`
     /// ([`crate::tables::word_cpu::WORD_TABLES`]: the CPU's six by the words an
     /// access touches, then MEMW_W), named `<family>[i]`, after the fused
-    /// tables' place; and each KECCAK table KECCAK_W and each COPY table
-    /// COPY_W, in their places. Refuses a page PAGE_W cannot hold (a base that
+    /// tables' place; and each KECCAK table KECCAK_W, each ECREC table
+    /// ECREC_W and each COPY table COPY_W, in their places. Refuses a page PAGE_W cannot hold (a base that
     /// is not page-aligned) or a page list that is not this set's.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn with_word_memory(
@@ -1805,8 +1805,16 @@ impl VmAirs {
             }
         }
         self.word_tables = word_tables;
-        // KECCAK's tables are KECCAK_W's under the word format, COPY's
-        // COPY_W's: the same counts, in their places.
+        // KECCAK's tables are KECCAK_W's under the word format, ECREC's
+        // ECREC_W's, COPY's COPY_W's: the same counts, in their places.
+        self.ecrecs = (0..self.ecrecs.len())
+            .map(|i| {
+                Box::new(
+                    crate::test_utils::create_ecrec_w_air(opts)
+                        .with_name(&format!("{}[{i}]", crate::tables::ecrec_w::NAME)),
+                ) as VmAir
+            })
+            .collect();
         self.keccaks = (0..self.keccaks.len())
             .map(|i| {
                 Box::new(

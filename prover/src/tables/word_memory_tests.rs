@@ -1935,6 +1935,10 @@ fn evaluator(name: &str) -> Option<(Eval, usize)> {
             keccak_w_constraints as Eval,
             super::keccak_w::cols::NUM_COLUMNS,
         )),
+        "ECREC_W" => Some((
+            ecrec_w_constraints as Eval,
+            super::ecrec_w::cols::NUM_COLUMNS,
+        )),
         _ => None,
     }
 }
@@ -1945,6 +1949,10 @@ pub(super) fn copy_w_constraints(row: &[FE]) -> Vec<FE> {
 
 pub(super) fn keccak_w_constraints(row: &[FE]) -> Vec<FE> {
     constraint_values(&super::keccak_w::KeccakWordConstraints, row)
+}
+
+pub(super) fn ecrec_w_constraints(row: &[FE]) -> Vec<FE> {
+    constraint_values(&super::ecrec_w::EcrecWordConstraints, row)
 }
 
 /// Rule c11, a CPU word table's key: the dispatch's timestamp's high word the
@@ -2409,7 +2417,8 @@ pub(super) fn census_table_with(
 /// timestamp of an `Ecall` receive in the same row plus a constant in `0..=2`,
 /// at that receive's multiplicity, which a constraint holds to a bit; and the
 /// words it writes (a write's word, an access's new word unless it is the old
-/// one) are range-checked in the row at that multiplicity.
+/// one) are range-checked in the row at that multiplicity, one column a
+/// constraint fixes, or a constant word.
 fn check_sender(
     name: &str,
     interactions: &[BusInteraction],
@@ -2444,13 +2453,18 @@ fn check_sender(
         0 => &message.values[6..8],
         _ => return Err(format!("{name}: a word message with no kind constant")),
     };
-    if let Some(half) = written
-        .iter()
-        .find(|half| !is_checked_half(half, interactions, &mu))
-    {
-        return Err(format!(
-            "{name}: a written word's half {half:?} is not range-checked"
-        ));
+    // A written half is checked by lookups, or one column a constraint fixes,
+    // or a constant word.
+    for half in written {
+        let f = form(half)?;
+        let fixed = single(&f).is_some_and(|c| breaks_alone(eval, c, FE::one()));
+        let constant = columns(&f).is_empty()
+            && (0..1i128 << 32).contains(&f.get(&None).copied().unwrap_or(0));
+        if !fixed && !constant && !is_checked_half(half, interactions, &mu) {
+            return Err(format!(
+                "{name}: a written word's half {half:?} is not range-checked"
+            ));
+        }
     }
     Ok(())
 }
@@ -3227,12 +3241,13 @@ fn the_word_format_frame_holds_its_rules() {
 
 /// ★ Under the word memory format the table of every chip the format takes
 /// no call of yet is refused by count, each by name: IS_WH (KECCAK's permute
-/// mode), BLAKE3, ECSM, ECDAS, ECREC and HINT. A chip-free statement frames;
-/// the same statement stating one table of one chip (its heights carried, the
-/// set built with it) is refused, and with the refusal taken out (a control
+/// mode), BLAKE3, ECSM and HINT. A chip-free statement frames; the same
+/// statement stating one table of one chip (its heights carried, the set
+/// built with it) is refused, and with the refusal taken out (a control
 /// mutant) it frames, so the rule alone is what refuses it. COPY's tables
 /// (COPY_W's under the word format), KECCAK's (KECCAK_W's) and its round
-/// chip's and MEMW_W's are the format's: a statement stating them frames. Under the split and fused formats the rule
+/// chip's, ECREC's (ECREC_W's) and ECDAS's, and MEMW_W's are the format's: a
+/// statement stating them frames. Under the split and fused formats the rule
 /// reads nothing.
 #[test]
 fn the_word_format_refuses_every_chip_table() {
@@ -3243,7 +3258,7 @@ fn the_word_format_refuses_every_chip_table() {
         &format,
     )
     .expect("the chip-free statement frames");
-    let names = ["IS_WH", "BLAKE3", "ECSM", "ECDAS", "ECREC", "HINT"];
+    let names = ["IS_WH", "BLAKE3", "ECSM", "HINT"];
     for table in names {
         let mut counts = chip_free.clone();
         let words = CPU_WORD_TABLES;
@@ -3251,8 +3266,6 @@ fn the_word_format_refuses_every_chip_table() {
             "IS_WH" => counts.is_wh = 1,
             "BLAKE3" => counts.blake3 = 1,
             "ECSM" => counts.ecsm = 1,
-            "ECDAS" => counts.ecdas = 1,
-            "ECREC" => counts.ecrec = 1,
             _ => counts.hint = 1,
         }
         let statement = words_statement(&format, &counts, words);
@@ -3282,11 +3295,13 @@ fn the_word_format_refuses_every_chip_table() {
     counts.copy = 2;
     counts.keccak = 1;
     counts.keccak_rnd = 1;
+    counts.ecrec = 1;
+    counts.ecdas = 1;
     let mut words = CPU_WORD_TABLES;
     words[6] = 1;
     assert!(block_whir::chip_tables_under(MemoryFormat::Words, &counts, words).is_ok());
     let statement = words_statement(&format, &counts, words);
-    frame_of(&statement, &format).expect("COPY_W's, KECCAK_W's and MEMW_W's tables frame");
+    frame_of(&statement, &format).expect("the word format's chip tables frame");
 }
 
 /// ★ Under the split and fused formats the word tables' counts are absorbed

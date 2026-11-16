@@ -3228,27 +3228,26 @@ pub(crate) fn word_tables_under(
 /// The tables of the chips the word format takes no call of yet, by name:
 /// the accelerators' counts in a statement but COPY's (COPY_W's under the
 /// word format), KECCAK's (KECCAK_W's: keccak256 alone) and its round
-/// chip's, whose word messages MEMW_W takes. IS_WH holds the permute mode's
+/// chip's, ECREC's (ECREC_W's) and ECDAS's (no memory: ECREC's chains),
+/// whose word messages MEMW_W takes. IS_WH holds the permute mode's
 /// pointers, which KECCAK_W has not.
-fn chip_counts(counts: &TableCounts, _words: [u64; 7]) -> [(&'static str, u64); 6] {
+fn chip_counts(counts: &TableCounts, _words: [u64; 7]) -> [(&'static str, u64); 4] {
     [
         ("IS_WH", counts.is_wh as u64),
         ("BLAKE3", counts.blake3 as u64),
         ("ECSM", counts.ecsm as u64),
-        ("ECDAS", counts.ecdas as u64),
-        ("ECREC", counts.ecrec as u64),
         ("HINT", counts.hint as u64),
     ]
 }
 
 /// Under the word memory format, refuses a statement that states a table of
 /// a chip the format takes no call of yet: IS_WH (KECCAK's permute mode),
-/// BLAKE3, ECSM and ECDAS, ECREC, HINT. Those chips still read and write
+/// BLAKE3, ECSM, HINT. Those chips still read and write
 /// memory by byte messages, which nothing receives under the word format: a
 /// block that calls one is not provable under it, and the verifier says so
 /// by its counts instead of leaving it to the bus. COPY's tables (COPY_W's),
-/// KECCAK's (KECCAK_W's) and its round chip's, and MEMW_W's, which takes
-/// their word messages, are the format's. Under any other format, nothing
+/// KECCAK's (KECCAK_W's) and its round chip's, ECREC's (ECREC_W's) and
+/// ECDAS's, and MEMW_W's, which takes their word messages, are the format's. Under any other format, nothing
 /// to check.
 pub(crate) fn chip_tables_under(
     memory: crate::tables::fused_memory::MemoryFormat,

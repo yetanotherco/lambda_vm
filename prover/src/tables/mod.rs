@@ -42,6 +42,9 @@ pub mod decode;
 pub mod dvrm;
 pub mod ecdas;
 pub mod ecrec;
+pub mod ecrec_w;
+#[cfg(test)]
+mod ecrec_w_tests;
 pub mod ecsm;
 pub mod eq;
 pub mod fused_memory;

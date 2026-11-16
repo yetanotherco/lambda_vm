@@ -2027,7 +2027,13 @@ impl<'a> FinishPlan<'a> {
             )
         };
         // ECREC table. Absent entirely for programs that make no ECREC call.
+        // Under the word memory format it is ECREC_W's.
         let gen_ecrecs = || {
+            if words {
+                return generate_optional(&ecrec_ops.whole(), |ops| {
+                    packed_if(pack, super::super::ecrec_w::generate_ecrec_w_trace(ops))
+                });
+            }
             generate_optional(
                 &ecrec_ops.whole(),
                 packed_by(pack, |ops| ecrec::generate_ecrec_trace_as(ops, form)),
@@ -2871,11 +2877,16 @@ impl<'a> FinishPlan<'a> {
             })
         }));
         let ecrec_ops = Arc::clone(&shared.ecrec_ops);
+        let ecrec_w = skip.memory_format == super::super::fused_memory::MemoryFormat::Words;
         units.extend(optional_unit(family("ECREC"), ecrec_ops.len(), || {
             Box::new(move || {
                 Ok(packed_if(
                     pack,
-                    ecrec::generate_ecrec_trace_as(&ecrec_ops.whole(), form),
+                    if ecrec_w {
+                        super::super::ecrec_w::generate_ecrec_w_trace(&ecrec_ops.whole())
+                    } else {
+                        ecrec::generate_ecrec_trace_as(&ecrec_ops.whole(), form)
+                    },
                 ))
             })
         }));
