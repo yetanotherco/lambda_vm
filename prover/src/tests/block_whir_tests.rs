@@ -3335,8 +3335,7 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
         );
     }
     let bits = |groups: usize, len: usize| {
-        let support =
-            groups as f64 * 2f64.powi(block_whir::BLOCK_MAX_TABLE_VARS as i32) * 1475f64;
+        let support = groups as f64 * 2f64.powi(block_whir::BLOCK_MAX_TABLE_VARS as i32) * 1475f64;
         let field_log2 = 3.0 * (0xFFFF_FFFF_0000_0001u64 as f64).log2();
         field_log2 - ((len as f64 + 1.0) * (support - 1.0)).log2()
     };
