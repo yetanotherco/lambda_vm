@@ -3645,6 +3645,10 @@ pub(crate) fn word_tables_under(
     if memory != crate::tables::fused_memory::MemoryFormat::Words {
         return Ok(());
     }
+    #[cfg(test)]
+    if RETIRED_COUNTS_UNCHECKED.with(std::cell::Cell::get) {
+        return Ok(());
+    }
     match retired_counts(counts, fused)
         .into_iter()
         .find(|&(_, n)| n != 0)
@@ -3663,11 +3667,42 @@ pub(crate) fn word_tables_under(
 /// whose word messages MEMW_W takes. IS_WH holds the permute mode's
 /// pointers, which KECCAK_W has not.
 fn chip_counts(counts: &TableCounts, _words: [u64; 7]) -> [(&'static str, u64); 4] {
+    // Every count named, so a table added to the counts is placed here before
+    // the verifier builds: refused below, or one of the format's.
+    let TableCounts {
+        // The CPU's, the ALU's and MEMW_R's: no memory messages of their own.
+        cpu: _,
+        lt: _,
+        mul: _,
+        dvrm: _,
+        shift: _,
+        branch: _,
+        memw_register: _,
+        eq: _,
+        bytewise: _,
+        cpu32: _,
+        // Retired under the word format (`retired_counts`).
+        memw: _,
+        memw_aligned: _,
+        load: _,
+        store: _,
+        // The chips the word format takes.
+        copy: _,
+        keccak: _,
+        keccak_rnd: _,
+        ecrec: _,
+        ecdas: _,
+        // The chips it takes no call of yet.
+        is_wh,
+        blake3,
+        ecsm,
+        hint,
+    } = counts;
     [
-        ("IS_WH", counts.is_wh as u64),
-        ("BLAKE3", counts.blake3 as u64),
-        ("ECSM", counts.ecsm as u64),
-        ("HINT", counts.hint as u64),
+        ("IS_WH", *is_wh as u64),
+        ("BLAKE3", *blake3 as u64),
+        ("ECSM", *ecsm as u64),
+        ("HINT", *hint as u64),
     ]
 }
 
@@ -3752,6 +3787,16 @@ thread_local! {
     /// Test only: on this thread, the word format takes any chip's table
     /// ([`chip_tables_under`]'s refusal taken out, a control mutant).
     pub(crate) static CHIP_COUNTS_UNCHECKED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Test only: on this thread, the word format takes the tables it retires
+    /// ([`word_tables_under`]'s refusal taken out, a control mutant).
+    pub(crate) static RETIRED_COUNTS_UNCHECKED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Test only: on this thread, every page with initial data is settled by
+    /// the prepared opening ([`prepared_tables`]' dense arm), on the prover's
+    /// side and the verifier's alike, so a test reaches that arm with a
+    /// program far below the density threshold.
+    pub(crate) static DENSE_PAGES_FORCED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -4207,7 +4252,15 @@ pub(crate) fn prepared_tables(
         crate::continuation::PAGE_NUM_VARS
     };
     let plan = crate::continuation::genesis_stack_plan(page_configs, first_page, num_vars);
-    for route in plan.routes.iter().filter(|route| route.dense) {
+    #[cfg(test)]
+    let forced = DENSE_PAGES_FORCED.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let forced = false;
+    for route in plan
+        .routes
+        .iter()
+        .filter(|route| route.dense || (forced && route.has_init && route.nonzero > 0))
+    {
         let config = &page_configs[route.table - first_page];
         let columns = if words {
             crate::tables::page_w::preprocessed_columns(config)

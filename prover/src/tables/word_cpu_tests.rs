@@ -426,6 +426,33 @@ fn honest() -> Cpu {
     c
 }
 
+/// One honest row of each CPU word table, from [`honest`]'s bench, by
+/// family: a row that is an access (`MU = 1`) and breaks no constraint, the
+/// stores' and the narrow and crossing loads' at their widest access (an SW,
+/// a crossing SD, an LW, a crossing LD). The census's rule c13 reads what a
+/// constraint fixes on it (`word_memory_tests::check_dispatch_tie`).
+pub(super) fn active_rows() -> Vec<(&'static str, Vec<FE>)> {
+    let b = honest().bench();
+    let pick = |table: &'static str, flag: Option<usize>, mu: usize, width: usize| {
+        let t = &b.piece(table).trace;
+        let row = (0..t.num_rows())
+            .find(|&r| {
+                *t.get_main(r, mu) == FE::one()
+                    && flag.is_none_or(|f| *t.get_main(r, f) == FE::one())
+            })
+            .unwrap_or_else(|| panic!("{table}: an access row"));
+        (table, (0..width).map(|c| *t.get_main(row, c)).collect())
+    };
+    vec![
+        pick("MEM_LOAD8", None, l8::MU, l8::NUM_COLUMNS),
+        pick("MEM_STORE8", None, s8::MU, s8::NUM_COLUMNS),
+        pick("MEM_LOADW", Some(lw::READ4), lw::MU, lw::NUM_COLUMNS),
+        pick("MEM_STOREW", Some(sw::WRITE4), sw::MU, sw::NUM_COLUMNS),
+        pick("MEM_LOAD2W", Some(l2::READ8), l2::MU, l2::NUM_COLUMNS),
+        pick("MEM_STORE2W", Some(s2::WRITE8), s2::MU, s2::NUM_COLUMNS),
+    ]
+}
+
 /// The row of `table` holding the access at `ts` (its `TIMESTAMP` column).
 fn row_at(bench: &Bench, table: &str, ts_col: usize, ts: u64) -> usize {
     let t = &bench.piece(table).trace;
@@ -1614,38 +1641,52 @@ fn every_word_table_constraint_breaks_alone_on_some_row() {
     assert!(missing.is_empty(), "{}", missing.join("\n"));
 }
 
-/// ★ A signed load whose sign bit is forged clear: an LB of `0x88` (MEM_LOADW)
-/// and a crossing LH of `0x9988` (MEM_LOAD2W) each returned zero-extended,
-/// the row's sign bit, extension and extended bytes cleared to match and the
-/// CPU's result the forged one. Every constraint holds (the extension follows
-/// the forged sign bit); refused by the `MSB8` lookup alone, which ties the
-/// sign bit to the top byte read; with the table's `MSB8` sends taken out (a
-/// control mutant) each is accepted.
+/// ★ A signed load whose sign bit is forged clear, at every width each table
+/// signs: an LB of `0x88`, an LH of `0x8877` and an LW of `0x88776655`
+/// (MEM_LOADW, the `MSB8` at `MU − READ2 − READ4`, `READ2`, `READ4`), a
+/// crossing LH of `0x9988` and a crossing LW of `0x8899AABB` (MEM_LOAD2W),
+/// each returned zero-extended, the row's sign bit, extension and extended
+/// bytes cleared to match and the CPU's result the forged one. Every
+/// constraint holds (the extension follows the forged sign bit); refused by
+/// the `MSB8` lookup alone, which ties the sign bit to the top byte read;
+/// with the table's `MSB8` sends taken out (a control mutant) each is
+/// accepted.
 #[test]
 fn a_signed_load_with_its_sign_bit_forged_clear_is_refused_by_its_msb8() {
     let mut c = honest();
     c.store(S + 0x30 + 0xF, 2, 0x9988);
     c.load(S + 0x30 + 0xF, 2, true);
+    c.store(S + 0x56, 4, 0x8899_AABB);
+    c.load(S + 0x56, 4, true);
     let honest_bench = c.bench();
-    for (table, ts, res, sign_bit, ext, width, interactions) in [
+    let narrow = |ts, width| {
         (
             "MEM_LOADW",
-            c.ts_of(S + 7, load_flags(1, true)),
+            ts,
             lw::RES.to_vec(),
             lw::SIGN_BIT,
             lw::EXT,
-            1usize,
+            width,
             mem_loadw::bus_interactions(),
-        ),
+        )
+    };
+    let crossing = |ts, width| {
         (
             "MEM_LOAD2W",
-            c.ts_of(S + 0x3F, load_flags(2, true)),
+            ts,
             l2::RES.to_vec(),
             l2::SIGN_BIT,
             l2::EXT,
-            2,
+            width,
             mem_load2w::bus_interactions(),
-        ),
+        )
+    };
+    for (table, ts, res, sign_bit, ext, width, interactions) in [
+        narrow(c.ts_of(S + 7, load_flags(1, true)), 1usize),
+        narrow(c.ts_of(S + 6, load_flags(2, true)), 2),
+        narrow(c.ts_of(S + 4, load_flags(4, true)), 4),
+        crossing(c.ts_of(S + 0x3F, load_flags(2, true)), 2),
+        crossing(c.ts_of(S + 0x56, load_flags(4, true)), 4),
     ] {
         let mut forged = honest_bench.clone();
         let ts_col = if table == "MEM_LOADW" {
@@ -1735,4 +1776,188 @@ fn a_crossing_store_splitting_its_bytes_at_the_word_boundary_is_refused_by_each_
         let v = verdict(&forged.with_interactions("MEM_STORE2W", control));
         assert!(v.accepted(), "pair {pair}: control: {v:?}");
     }
+}
+
+/// ★ An SW of a register whose low word is not canonical (`lo − 2^32`, the
+/// same integer with `hi + 1`) at an aligned stack word. MEM_STOREW's dispatch value is `Σ VALUE_j·2^(8j)`, so the forger puts
+/// the `−2^32` in one `VALUE` byte (byte 0, then byte 3 as `−256`); the new
+/// low half the row writes is then `lo − 2^32`, and the page's final word
+/// carries it. Refused by that byte's `ARE_BYTES` pair alone; with the pair
+/// out, accepted (so the pair is what keeps the word out of memory).
+#[test]
+fn a_narrow_store_of_a_non_canonical_low_word_is_refused_by_its_value_pairs() {
+    for (byte, shift) in [(0usize, 1u64 << 32), (3, 256)] {
+        let mut c = honest();
+        let at = S + 0x60;
+        c.store(at, 4, 0x1_0004);
+        let ts = c.ts - 4;
+        let mut forged = c.bench();
+        assert!(verdict(&forged).accepted(), "the honest bench");
+        let lo = fe(0x1_0004) - fe(1 << 32);
+        let d = c.dispatch_row(ts);
+        forged.piece_mut("CPU").preprocessed[cpu::VALUE_LO][d] = lo;
+        forged.piece_mut("CPU").preprocessed[cpu::VALUE_HI][d] = fe(1);
+        forged.set("CPU", d, cpu::VALUE_LO, lo);
+        forged.set("CPU", d, cpu::VALUE_HI, fe(1));
+        let row = row_at(&forged, "MEM_STOREW", sw::TIMESTAMP, ts);
+        let v = forged.get("MEM_STOREW", row, sw::VALUE[byte]);
+        forged.set("MEM_STOREW", row, sw::VALUE[byte], v - fe(shift));
+        forged.set("MEM_STOREW", row, sw::VALUE_HI, fe(1));
+        let new_lo = forged.get("MEM_STOREW", row, sw::NEW_LO);
+        forged.set("MEM_STOREW", row, sw::NEW_LO, new_lo - fe(1 << 32));
+        let (page, r) = page_row(STACK_BASE, at);
+        let fini = forged.get(&page, r, pw::FINI_LO);
+        forged.set(&page, r, pw::FINI_LO, fini - fe(1 << 32));
+        let v = verdict(&forged);
+        assert!(refused_only_by_lookup(&v, BusId::AreBytes), "{v:?}");
+        let pair = 2 * (byte / 2);
+        let control = without_pair(
+            &mem_storew::bus_interactions(),
+            sw::VALUE[pair],
+            sw::VALUE[pair + 1],
+        );
+        let v = verdict(&forged.with_interactions("MEM_STOREW", control));
+        assert!(v.accepted(), "control: {v:?}");
+    }
+}
+
+/// ★ A crossing SD of a register held as
+/// `(lo − 2^32, hi + 1)`. MEM_STORE2W's dispatch value is its eight `VALUE`
+/// bytes as two words; the forger moves the carry between byte 3 (`−256`) and
+/// byte 4 (`+1`). Refused by `ARE_BYTES` alone.
+#[test]
+fn a_crossing_store_of_a_non_canonical_word_is_refused_by_its_value_pairs() {
+    let mut c = honest();
+    let at = S + 0x71;
+    c.store(at, 8, 0x1_0004);
+    let ts = c.ts - 4;
+    let mut forged = c.bench();
+    assert!(verdict(&forged).accepted(), "the honest bench");
+    let lo = fe(0x1_0004) - fe(1 << 32);
+    let d = c.dispatch_row(ts);
+    forged.piece_mut("CPU").preprocessed[cpu::VALUE_LO][d] = lo;
+    forged.piece_mut("CPU").preprocessed[cpu::VALUE_HI][d] = fe(1);
+    forged.set("CPU", d, cpu::VALUE_LO, lo);
+    forged.set("CPU", d, cpu::VALUE_HI, fe(1));
+    let row = row_at(&forged, "MEM_STORE2W", s2::TIMESTAMP, ts);
+    let v3 = forged.get("MEM_STORE2W", row, s2::VALUE[3]);
+    forged.set("MEM_STORE2W", row, s2::VALUE[3], v3 - fe(256));
+    let v4 = forged.get("MEM_STORE2W", row, s2::VALUE[4]);
+    forged.set("MEM_STORE2W", row, s2::VALUE[4], v4 + fe(1));
+    let v = verdict(&forged);
+    assert!(refused_only_by_lookup(&v, BusId::AreBytes), "{v:?}");
+}
+
+/// ★ Every class of access (each offset in the word,
+/// each width, signed and unsigned loads, stores) on the bench, against a
+/// model that is not the tables' code: two adjacent words hold a 16-byte
+/// pattern; a load must return the pattern's bytes from its offset, sign- or
+/// zero-extended, and a store must leave the pattern with exactly its bytes
+/// replaced (read back by two whole-word loads). Every row meets every
+/// constraint. This is what holds each placement, extension and stored-half
+/// term to the right bytes at every offset: a crossing LD at offset 2 reading
+/// its result byte 5 from the wrong memory byte fails it, while the search
+/// for a row breaking each constraint alone still passes.
+#[test]
+fn every_class_of_access_is_accepted_and_is_the_models() {
+    let pattern: [u8; 16] = [
+        0x81, 0x12, 0xA3, 0x34, 0xC5, 0x56, 0xE7, 0x78, 0x99, 0x2A, 0xBB, 0x4C, 0xDD, 0x6E, 0xFF,
+        0x70,
+    ];
+    let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().expect("eight bytes"));
+    let base = S + 0x40;
+    let mut c = Cpu::new(pages());
+    let (mut loads, mut stores) = (0usize, 0usize);
+    for o in 0..8usize {
+        for width in [1usize, 2, 4, 8] {
+            for signed in [false, true] {
+                if width == 8 && signed {
+                    continue;
+                }
+                c.store(base, 8, word(&pattern[..8]));
+                c.store(base + 8, 8, word(&pattern[8..]));
+                let got = c.load(base + o as u64, width as u8, signed);
+                let mut bytes = [0u8; 8];
+                bytes[..width].copy_from_slice(&pattern[o..o + width]);
+                let mut want = u64::from_le_bytes(bytes);
+                if signed && pattern[o + width - 1] & 0x80 != 0 {
+                    want |= !0u64 << (8 * width);
+                }
+                assert_eq!(
+                    got, want,
+                    "a load at offset {o}, width {width}, signed {signed}"
+                );
+                loads += 1;
+                if !signed {
+                    let value = 0x0123_4567_89AB_CDEFu64;
+                    c.store(base + o as u64, width as u8, value);
+                    let mut model = pattern;
+                    model[o..o + width].copy_from_slice(&value.to_le_bytes()[..width]);
+                    let after = [c.load(base, 8, false), c.load(base + 8, 8, false)];
+                    assert_eq!(
+                        after,
+                        [word(&model[..8]), word(&model[8..])],
+                        "a store at offset {o}, width {width}"
+                    );
+                    stores += 1;
+                }
+            }
+        }
+    }
+    // Every offset × width, signed and not (8 bytes unsigned only): 56 loads;
+    // the unsigned ones also stored: 32 stores.
+    assert_eq!((loads, stores), (56, 32));
+    let v = verdict(&c.bench());
+    assert!(v.accepted(), "{:?}", v.broken);
+}
+
+/// ★ MEM_STOREW's second `VALUE` pair is load-bearing with a canonical
+/// register: an SW at offset 1 of an aligned word places
+/// the register's bytes 2 and 3 at the word's bytes 3 and 4, on either side of
+/// its two 32-bit halves. With `VALUE_2` 256 more and `VALUE_3` one less the
+/// dispatch's value is unchanged, the new low half is `2^32` more and the new
+/// high half one less: the same integer in two halves that are not canonical.
+/// An LD of the word then hands that pair to a register, and the page's final
+/// word carries it. Refused by the pair on `(VALUE_2, VALUE_3)` alone; with
+/// that pair out (the control) accepted.
+#[test]
+fn a_narrow_store_splitting_its_bytes_across_the_halves_is_refused_by_its_second_pair() {
+    let mut c = honest();
+    let at = S + 0x68;
+    c.store(at + 1, 4, 0x0403_0201);
+    c.load(at, 8, false);
+    let (ts_store, ts_load) = (c.ts - 8, c.ts - 4);
+    let mut forged = c.bench();
+    assert!(verdict(&forged).accepted(), "the honest bench");
+    let bump = |b: &mut Bench, table: &str, row: usize, col: usize, by: FE| {
+        let v = b.get(table, row, col);
+        b.set(table, row, col, v + by);
+    };
+    let (up, down) = (fe(1 << 32), neg(1));
+    let row = row_at(&forged, "MEM_STOREW", sw::TIMESTAMP, ts_store);
+    assert_eq!(forged.get("MEM_STOREW", row, sw::OFF[1]), FE::one());
+    bump(&mut forged, "MEM_STOREW", row, sw::VALUE[2], fe(256));
+    bump(&mut forged, "MEM_STOREW", row, sw::VALUE[3], down);
+    bump(&mut forged, "MEM_STOREW", row, sw::NEW_LO, up);
+    bump(&mut forged, "MEM_STOREW", row, sw::NEW_HI, down);
+    // The LD reads the word as stored and hands it to the register.
+    let row = row_at(&forged, "MEM_LOAD8", l8::TIMESTAMP, ts_load);
+    bump(&mut forged, "MEM_LOAD8", row, l8::LO, up);
+    bump(&mut forged, "MEM_LOAD8", row, l8::HI, down);
+    let d = c.dispatch_row(ts_load);
+    bump(&mut forged, "CPU", d, cpu::RESULT_LO, up);
+    bump(&mut forged, "CPU", d, cpu::RESULT_HI, down);
+    let (page, r) = page_row(STACK_BASE, at);
+    bump(&mut forged, &page, r, pw::FINI_LO, up);
+    bump(&mut forged, &page, r, pw::FINI_HI, down);
+    let loaded = (
+        forged.get("CPU", d, cpu::RESULT_LO).canonical_u64(),
+        forged.get("CPU", d, cpu::RESULT_HI).canonical_u64(),
+    );
+    assert!(loaded.0 >= 1 << 32, "the register's low word past 2^32");
+    let v = verdict(&forged);
+    assert!(refused_only_by_lookup(&v, BusId::AreBytes), "{v:?}");
+    let control = without_pair(&mem_storew::bus_interactions(), sw::VALUE[2], sw::VALUE[3]);
+    let v = verdict(&forged.with_interactions("MEM_STOREW", control));
+    assert!(v.accepted(), "control: {v:?}");
 }

@@ -1720,6 +1720,29 @@ fn classify_memw(op: &MemwOperation, order: MemwAlignedOrder) -> MemwRoute {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test only: on this thread the walk takes the word memory format under
+    /// the 32-bit register tokens (its refusal taken out, as a forger's
+    /// prover would), so a test can show what the verifier says of it.
+    pub(crate) static WORDS_UNDER_TOKENS32: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread's walk takes the word format under the 32-bit register
+/// tokens: never outside tests ([`WORDS_UNDER_TOKENS32`]).
+#[inline]
+fn words_under_tokens32() -> bool {
+    #[cfg(test)]
+    {
+        WORDS_UNDER_TOKENS32.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Routes each `MemwOperation` into its destination table bucket at CREATION time
 /// (register fast-path / aligned / general), so the walk fills the three buckets directly
 /// and no separate routing pass is needed downstream. Classification order is register
@@ -2472,7 +2495,7 @@ fn walk_cpu_ops<const REST: bool>(
     // accesses MEMW_R cannot under the 32-bit token format: it needs the
     // in-row register format, where every other register access is a residual
     // register row.
-    if words && !in_row {
+    if words && !in_row && !words_under_tokens32() {
         return Err(Error::Prover(
             "the word memory format needs the in-row register format".to_string(),
         ));
