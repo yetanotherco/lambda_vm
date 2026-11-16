@@ -234,9 +234,11 @@ fn a_split_or_fused_proof_is_refused_under_the_word_format() {
 
 /// The chip-free programs a word block is proved of: every width, sign and
 /// alignment of the CPU's loads and stores, every instruction, the misaligned
-/// accesses one by one.
-const WORD_PROGRAMS: [&str; 11] = [
+/// accesses one by one, and loads and stores across `2^32` (their second
+/// word's key carried into the high word).
+const WORD_PROGRAMS: [&str; 12] = [
     "fused_mem_cases",
+    "cross_4gib",
     "all_loadstore_32",
     "all_instructions_64",
     "misalign_ld",

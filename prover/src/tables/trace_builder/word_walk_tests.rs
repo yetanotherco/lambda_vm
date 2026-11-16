@@ -39,9 +39,11 @@ type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 const P: u64 = 0xFFFF_FFFF_0000_0001;
 
 /// The chip-free programs: every width, sign and alignment of the CPU's loads
-/// and stores (`fused_mem_cases`), every instruction, the misaligned ones.
-const PROGRAMS: [&str; 13] = [
+/// and stores (`fused_mem_cases`), every instruction, the misaligned ones, and
+/// loads and stores across `2^32` (`cross_4gib`).
+const PROGRAMS: [&str; 14] = [
     "fused_mem_cases",
+    "cross_4gib",
     "fused_mem_one_sb",
     "all_instructions_64",
     "all_loadstore_32",
@@ -583,6 +585,44 @@ fn ecrec_calls_build_balanced_traces_under_the_word_walk() {
     }
 }
 
+/// ★ A run whose loads and stores cross `2^32` at every width (`cross_4gib`:
+/// from the last aligned word of the low 4 GiB range into low word 0 of high
+/// word 1, the large block's LD at `2^32 − 4` among them) halts on its success
+/// path, and its word build carries each of those rows' second key into the
+/// high word (`CARRY` 1 on 9 MEM_LOAD2W and 3 MEM_STORE2W rows, every other
+/// row 0), at windows of 1000 and 7 cycles. The build balances and meets
+/// every constraint (`the_word_walk_builds_balanced_traces`, which runs it).
+#[test]
+fn a_run_crossing_two_to_the_32_carries_into_the_high_word() {
+    let (program, logs) = run("cross_4gib");
+    // `li a0, 0; li a7, 93; ecall` ends the success path (the failure path
+    // sets a0 to 1).
+    assert_eq!(logs[logs.len() - 3].dst_val, 0, "the program's checks hold");
+    for window in [1000, 7] {
+        let build = word_build(&program, &logs, RegisterFormat::InRow, window);
+        let count = |family: usize, carry: usize, mu: usize, value: u64| -> usize {
+            build.word_tables[family]
+                .iter()
+                .map(|t| {
+                    (0..t.num_rows())
+                        .filter(|&r| get(t, r, mu) == 1 && get(t, r, carry) == value)
+                        .count()
+                })
+                .sum()
+        };
+        for (family, carry, mu, carried, others) in [
+            (4, mem_load2w::cols::CARRY, mem_load2w::cols::MU, 9, 1),
+            (5, mem_store2w::cols::CARRY, mem_store2w::cols::MU, 3, 0),
+        ] {
+            assert_eq!(
+                (count(family, carry, mu, 1), count(family, carry, mu, 0)),
+                (carried, others),
+                "family {family}, window {window}: (carried, not carried) rows"
+            );
+        }
+    }
+}
+
 /// ★ Every CPU load and store is exactly one word table's row, of the family
 /// its width and address name: the word build's rows, as (family,
 /// timestamp, address), are the split build's LOAD and STORE rows classed by
@@ -841,6 +881,7 @@ fn word_record_build_with(
 fn record_mode_under_the_word_format_builds_the_windowed_tables() {
     for name in [
         "fused_mem_cases",
+        "cross_4gib",
         "all_loadstore_32",
         "misalign_sw",
         "loop_4096",

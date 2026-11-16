@@ -428,11 +428,12 @@ fn the_light_walk_refuses_a_history_without_the_access() {
 }
 
 /// The programs the word memory format walks: the CPU's loads and stores of
-/// every width and alignment, and the chips it takes (COPY, keccak256,
-/// ECREC).
-const WORD_PROGRAMS: [&str; 8] = [
+/// every width and alignment (across `2^32` too), and the chips it takes
+/// (COPY, keccak256, ECREC).
+const WORD_PROGRAMS: [&str; 9] = [
     "all_instructions_64",
     "all_loadstore_32",
+    "cross_4gib",
     "misalign_ld",
     "misalign_sd",
     "misalign_sh",

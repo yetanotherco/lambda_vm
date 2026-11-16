@@ -4705,3 +4705,158 @@ fn a_chip_statement_is_refused_across_the_word_format() {
     block_whir::RETIRED_COUNTS_UNCHECKED.with(|c| c.set(false));
     assert!(control.is_ok(), "control: {:?}", control.err());
 }
+
+fn load2w_without_carry_bit(row: &[FE]) -> Vec<FE> {
+    let mut v = load2w_constraints(row);
+    v[33] = FE::zero();
+    v
+}
+fn load2w_without_carry_tie(row: &[FE]) -> Vec<FE> {
+    let mut v = load2w_constraints(row);
+    v[34] = FE::zero();
+    v
+}
+fn store2w_without_carry_bit(row: &[FE]) -> Vec<FE> {
+    let mut v = store2w_constraints(row);
+    v[21] = FE::zero();
+    v
+}
+fn store2w_without_carry_tie(row: &[FE]) -> Vec<FE> {
+    let mut v = store2w_constraints(row);
+    v[22] = FE::zero();
+    v
+}
+
+/// The second word's tokens of a two-word table's `interactions` (the pair
+/// whose key's low element adds 8) with `edit` applied to each key.
+fn edit_second_key(
+    interactions: &[BusInteraction],
+    mut edit: impl FnMut(&mut [BusValue]),
+) -> Vec<BusInteraction> {
+    let mut out = interactions.to_vec();
+    let mut edited = 0;
+    for bi in &mut out {
+        if bi.bus_id == u64::from(BusId::MemWord)
+            && form(&bi.values[0]).is_ok_and(|f| f.get(&None) == Some(&8))
+        {
+            edit(&mut bi.values[..2]);
+            edited += 1;
+        }
+    }
+    assert_eq!(edited, 2, "the second word's two tokens");
+    out
+}
+
+/// ★ Rule c18 on the two-word tables' carried keys. The honest MEM_LOAD2W and
+/// MEM_STORE2W pass; each mutant is refused:
+/// - the carry at `−2^31` in the low element, or at 2 in the high element (no
+///   carry: a column scaled past `2^16`, a high word of two columns);
+/// - the carry on the first word's key too (a carry not the second word's);
+/// - `MU` as the carry (the column is not 0 on an access off the last word);
+/// - the table without the carry's bit (its value at 2 on the last word breaks
+///   nothing) or without the last-word tie (1 off the last word breaks
+///   nothing), or with no constraints at all.
+#[test]
+fn the_census_holds_a_carry_to_the_last_word() {
+    use super::{mem_load2w, mem_store2w};
+    // (name, interactions, CARRY, MU, the table without its bit and its tie).
+    type CarriedTable = (&'static str, Vec<BusInteraction>, usize, usize, [Eval; 2]);
+    let tables: [CarriedTable; 2] = [
+        (
+            "MEM_LOAD2W[0]",
+            mem_load2w::bus_interactions(),
+            mem_load2w::cols::CARRY,
+            mem_load2w::cols::MU,
+            [load2w_without_carry_bit, load2w_without_carry_tie],
+        ),
+        (
+            "MEM_STORE2W[0]",
+            mem_store2w::bus_interactions(),
+            mem_store2w::cols::CARRY,
+            mem_store2w::cols::MU,
+            [store2w_without_carry_bit, store2w_without_carry_tie],
+        ),
+    ];
+    for (name, honest, carry, mu, mutants) in tables {
+        assert!(census_table(name, &honest, 0).is_ok(), "{name}");
+        let (_, width) = evaluator(name).expect("a CPU word table");
+        let rescale = |lo_by: i64, hi_by: i64| {
+            edit_second_key(&honest, |key| {
+                for (v, by) in key.iter_mut().zip([lo_by, hi_by]) {
+                    if let BusValue::Linear(terms) = v {
+                        for t in terms.iter_mut() {
+                            if let LinearTerm::Column {
+                                coefficient,
+                                column,
+                            } = t
+                                && *column == carry
+                            {
+                                *coefficient = by;
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        for (what, mutant) in [
+            ("the carry at −2^31", rescale(-(1 << 31), 1)),
+            ("the carry at 2 in the high word", rescale(-(1 << 32), 2)),
+        ] {
+            let got = census_table(name, &mutant, 0);
+            assert!(got.is_err(), "{name}: {what}");
+        }
+        // The first word's key carried too.
+        let mut first = honest.clone();
+        for bi in &mut first {
+            if bi.bus_id == u64::from(BusId::MemWord)
+                && form(&bi.values[0]).is_ok_and(|f| !f.contains_key(&None))
+            {
+                if let BusValue::Linear(terms) = &mut bi.values[0] {
+                    terms.push(term(-(1 << 32), carry));
+                }
+                bi.values[1] = BusValue::linear(vec![
+                    term(
+                        1,
+                        columns(&form(&bi.values[1]).unwrap())
+                            .into_iter()
+                            .next()
+                            .unwrap(),
+                    ),
+                    term(1, carry),
+                ]);
+            }
+        }
+        assert!(
+            census_table(name, &first, 0).is_err(),
+            "{name}: a carry on the first word"
+        );
+        // MU in the carry's place.
+        let moved = edit_second_key(&honest, |key| {
+            for v in key.iter_mut() {
+                if let BusValue::Linear(terms) = v {
+                    for t in terms.iter_mut() {
+                        if let LinearTerm::Column { column, .. } = t
+                            && *column == carry
+                        {
+                            *column = mu;
+                        }
+                    }
+                }
+            }
+        });
+        assert!(
+            census_table(name, &moved, 0).is_err(),
+            "{name}: MU as the carry"
+        );
+        for (eval, what) in mutants.into_iter().zip(["the bit", "the tie"]) {
+            assert!(
+                census_table_with(name, &honest, 0, Some((eval, width))).is_err(),
+                "{name}: without {what}"
+            );
+        }
+        assert!(
+            census_table_with(name, &honest, 0, None).is_err(),
+            "{name}: no constraints"
+        );
+    }
+}
