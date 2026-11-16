@@ -107,6 +107,9 @@ pub mod wire;
 /// The block tree's LFM programs proved by the block's own WHIR prover.
 #[cfg(feature = "parallel")]
 pub mod wlfm;
+/// The W-LFM prover's knobs read from the environment (outside the format).
+#[cfg(feature = "parallel")]
+pub mod wlfm_knobs;
 /// The in-guest verifier of one W-LFM proof (the second compression step's leg).
 #[cfg(feature = "parallel")]
 pub mod wlfm_leg;

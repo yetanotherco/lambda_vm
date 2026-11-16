@@ -297,23 +297,10 @@ fn chunk_log() -> u32 {
     WLFM_CHUNK_LOG
 }
 
-/// `LAMBDA_VM_WLFM_NARROW_CHIPS=1`: the LFM chips' traces packed narrow
-/// ([`multilinear::narrow::NarrowColumns`]) before the prove takes them, so
-/// their columns go up at the bytes their words need and the card widens
-/// them, as the lean tables' do. Off by default; a prover's choice, never the
-/// proof's: the card widens the same words. Read once a process.
-pub const NARROW_CHIPS_ENV: &str = "LAMBDA_VM_WLFM_NARROW_CHIPS";
-
-/// Whether the prove packs the LFM chips narrow: [`NARROW_CHIPS_ENV`], or a
-/// test's override.
-pub fn narrow_chips() -> bool {
-    #[cfg(test)]
-    if let Some(on) = test_format::narrow_chips() {
-        return on;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var(NARROW_CHIPS_ENV).is_ok_and(|v| v.trim() == "1"))
-}
+// The narrow-chips knob is a prover's choice read from the environment, so it
+// lives outside this module, which holds the format and reads no environment
+// (`the_wlfm_format_reads_no_environment`).
+pub use super::wlfm_knobs::{NARROW_CHIPS_ENV, narrow_chips};
 
 /// The bytes a word needs: 1, 2, 4 or 8 (`NarrowColumns`' rule).
 fn narrow_width(max: u64) -> u8 {
@@ -2110,7 +2097,7 @@ pub(crate) mod test_format {
         NarrowOverride(NARROW_CHIPS.with(|c| c.replace(Some(on))))
     }
 
-    pub(super) fn narrow_chips() -> Option<bool> {
+    pub(crate) fn narrow_chips() -> Option<bool> {
         NARROW_CHIPS.with(Cell::get)
     }
 
