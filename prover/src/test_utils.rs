@@ -1052,6 +1052,51 @@ pub fn create_mem_store_air(
     )
 }
 
+/// The CPU word tables' AIRs (`tables::word_cpu`), under the word memory
+/// format, each named by its table.
+macro_rules! word_cpu_air {
+    ($(#[$doc:meta])* $fn:ident, $module:ident, $constraints:ident, $name:literal) => {
+        $(#[$doc])*
+        pub fn $fn(
+            proof_options: &ProofOptions,
+        ) -> ConcreteVmAir<crate::tables::$module::$constraints> {
+            build_air(
+                crate::tables::$module::cols::NUM_COLUMNS,
+                crate::tables::$module::bus_interactions(),
+                proof_options,
+                1,
+                crate::tables::$module::$constraints,
+                $name,
+            )
+        }
+    };
+}
+
+word_cpu_air!(
+    /// The MEM_LOAD8 AIR (`tables::mem_load8`): an LD of one whole word.
+    create_mem_load8_air, mem_load8, MemLoad8Constraints, "MEM_LOAD8"
+);
+word_cpu_air!(
+    /// The MEM_STORE8 AIR (`tables::mem_store8`): an SD of one whole word.
+    create_mem_store8_air, mem_store8, MemStore8Constraints, "MEM_STORE8"
+);
+word_cpu_air!(
+    /// The MEM_LOADW AIR (`tables::mem_loadw`): a narrower load inside one word.
+    create_mem_loadw_air, mem_loadw, MemLoadWConstraints, "MEM_LOADW"
+);
+word_cpu_air!(
+    /// The MEM_STOREW AIR (`tables::mem_storew`): a narrower store inside one word.
+    create_mem_storew_air, mem_storew, MemStoreWConstraints, "MEM_STOREW"
+);
+word_cpu_air!(
+    /// The MEM_LOAD2W AIR (`tables::mem_load2w`): a load across two words.
+    create_mem_load2w_air, mem_load2w, MemLoad2WConstraints, "MEM_LOAD2W"
+);
+word_cpu_air!(
+    /// The MEM_STORE2W AIR (`tables::mem_store2w`): a store across two words.
+    create_mem_store2w_air, mem_store2w, MemStore2WConstraints, "MEM_STORE2W"
+);
+
 /// The MEMW_W AIR (`tables::memw_w`): a chip's access to one RAM word, under
 /// the word memory format.
 pub fn create_memw_w_air(
