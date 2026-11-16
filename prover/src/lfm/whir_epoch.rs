@@ -154,14 +154,18 @@ pub enum PreprocessedRoute<'a> {
     /// own length rather than taking it from a caller — a page whose columns
     /// were not `2^num_vars` tall would be a table nobody meant to build.
     ///
-    /// `init` is `None` exactly on a private-input page, where INIT is a
-    /// committed main column the verifier never recomputes
-    /// (`continuation.rs:241-251`). That `None` is the ROUTE TABLE's decision,
-    /// taken from the page's own config, and never inferred from how many
-    /// columns the AIR happened to present.
+    /// `init` is the page's INIT columns after OFFSET, in the table's
+    /// preprocessed order: PAGE's one byte column, or PAGE_W's four 16-bit
+    /// halves of the initial word (`tables::page_w`), on an ELF or a zero
+    /// page. It is EMPTY exactly on a private-input page, where INIT is
+    /// committed main columns the verifier never recomputes
+    /// (`continuation.rs:241-251`). That emptiness is the ROUTE TABLE's
+    /// decision, taken from the page's own config, and never inferred from
+    /// how many columns the AIR happened to present; the route table also
+    /// holds the count to the AIR's own (`whir_block::route_of`).
     Page {
         offset: &'a [FE],
-        init: Option<&'a [FE]>,
+        init: &'a [&'a [FE]],
     },
     /// A CPU table's TIMESTAMP (main's preprocessed timestamp): the column
     /// `4·(i + 1)` of `2^num_vars` rows, whose extension is `4 + 4·Σ_k 2^k·r_k`
@@ -338,7 +342,7 @@ pub(crate) fn emit_preprocessed_leg(
                 "a cross-epoch page's columns are checked in the program, not settled \
                  by an opening the cross-epoch proof does not carry"
             );
-            let columns = 1 + usize::from(init.is_some());
+            let columns = 1 + init.len();
             let targets = preprocessed_targets(slot_of, shape.kinds, columns);
             assert_eq!(
                 offset.len(),
@@ -347,9 +351,13 @@ pub(crate) fn emit_preprocessed_leg(
             );
             let ramp = super::preprocessed::emit_offset_ramp(b, &verdict.point);
             b.assert_eq_ext(ramp, verdict.column_values[targets[0]]);
-            if let Some(init) = init {
-                let values = super::preprocessed::emit_sparse_mle_at(b, &[*init], &verdict.point);
-                b.assert_eq_ext(values[0], verdict.column_values[targets[1]]);
+            if !init.is_empty() {
+                // Each INIT column against its own claimed value, in the
+                // table's preprocessed order after OFFSET.
+                let values = super::preprocessed::emit_sparse_mle_at(b, init, &verdict.point);
+                for (value, &target) in values.iter().zip(&targets[1..]) {
+                    b.assert_eq_ext(*value, verdict.column_values[target]);
+                }
             }
             return;
         }
