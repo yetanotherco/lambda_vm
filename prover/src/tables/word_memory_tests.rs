@@ -1917,8 +1917,13 @@ fn evaluator(name: &str) -> Option<(Eval, usize)> {
         "MEM_STOREW" => Some((storew_constraints as Eval, mem_storew::cols::NUM_COLUMNS)),
         "MEM_LOAD2W" => Some((load2w_constraints as Eval, mem_load2w::cols::NUM_COLUMNS)),
         "MEM_STORE2W" => Some((store2w_constraints as Eval, mem_store2w::cols::NUM_COLUMNS)),
+        "COPY_W" => Some((copy_w_constraints as Eval, super::copy_w::cols::NUM_COLUMNS)),
         _ => None,
     }
+}
+
+pub(super) fn copy_w_constraints(row: &[FE]) -> Vec<FE> {
+    constraint_values(&super::copy_w::CopyWordConstraints, row)
 }
 
 /// Rule c11, a CPU word table's key: the dispatch's timestamp's high word the
@@ -2089,7 +2094,7 @@ fn is_checked_half(
 /// The census of one table's word-bus interactions (rules c2–c6, c9–c10),
 /// `preprocessed` its preprocessed prefix's width, its constraints by name
 /// ([`evaluator`]). `Ok` if the table touches neither word bus.
-fn census_table(
+pub(super) fn census_table(
     name: &str,
     interactions: &[BusInteraction],
     preprocessed: usize,
@@ -2098,7 +2103,7 @@ fn census_table(
 }
 
 /// [`census_table`] with the table's constraints given (`eval`).
-fn census_table_with(
+pub(super) fn census_table_with(
     name: &str,
     interactions: &[BusInteraction],
     preprocessed: usize,
@@ -2177,12 +2182,21 @@ fn census_table_with(
     }
     if tokens.is_empty() && messages.iter().all(|bi| bi.is_sender) {
         // A sender of word messages: c9, its address from a register read or
-        // `IS_HALF` limbs, plus a constant below 2^8; c10, its timestamp and
-        // multiplicity its call's, the multiplicity a bit, its written words
-        // checked.
+        // `IS_HALF` limbs (or, for a chained chip, a column its chain carries
+        // from a register read on the call's first row), plus a constant
+        // below 2^8; c10, its timestamp and multiplicity its call's, the
+        // multiplicity a bit, its written words checked; c16, a chained
+        // chip's message at its call's timestamp carried by its chain.
+        let chain = chain_of(interactions);
         for bi in &messages {
-            check_message_source(name, interactions, bi)?;
-            check_sender(name, interactions, bi, eval)?;
+            check_message_source(name, interactions, bi, chain.as_ref())?;
+            match &chain {
+                Some(chain) if !is_call_multiplicity(interactions, bi) => {
+                    check_chained_sender(name, interactions, bi, chain, eval)?
+                }
+                _ => check_sender(name, interactions, bi, eval)?,
+            }
+            check_read_bytes(name, interactions, bi)?;
         }
         return Ok(());
     }
@@ -2427,8 +2441,10 @@ fn check_message_source(
     name: &str,
     interactions: &[BusInteraction],
     message: &BusInteraction,
+    chain: Option<&Chain>,
 ) -> Result<(), String> {
     check_address(&message.values[1..3], name)?;
+    let carried_registers = chain.map_or_else(BTreeSet::new, |c| chain_registered(interactions, c));
     let mu = multiplicity_form(&message.multiplicity);
     // A register's value: the value positions of a register read on `Memw`
     // (`is_register` the constant 1 at position 8; old value at 0 and 1, new
@@ -2472,13 +2488,240 @@ fn check_message_source(
         let f = form(v)?;
         let constant = f.get(&None).copied().unwrap_or(0);
         let cols = columns(&f);
-        let from_register = cols.len() == 1 && cols.iter().all(|c| registered.contains(c));
+        let from_register = cols.len() == 1
+            && cols
+                .iter()
+                .all(|c| registered.contains(c) || carried_registers.contains(c));
         let from_limbs = cols.len() == 2
             && cols.iter().all(|c| halves.contains(c))
             && f.values().filter(|&&c| c == 1 << 16).count() == 1;
         if !(0..256).contains(&constant) || !(from_register || from_limbs || cols.is_empty()) {
             return Err(format!(
                 "{name}: a word message's address element {i} ({f:?}) has no canonical source"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A chained chip's chain (rule c16): a call's rows reach each other on a
+/// bus with one send in the table at `MU − END` and one receive at
+/// `MU − FIRST`, of one length, where `FIRST` is the multiplicity of the
+/// table's `Ecall` receive (the call's first row). The set's census checks no
+/// other table touches the bus. A column the chain carries unchanged (the
+/// send's and the receive's value at one position, the same single column)
+/// is, on every row of a call, its first row's.
+pub(super) struct Chain {
+    bus: u64,
+    /// `FIRST`: the call's first row.
+    first: usize,
+    /// The columns the chain carries unchanged.
+    pub(super) carried: BTreeSet<usize>,
+}
+
+/// The single column a form reads at coefficient 1 with no constant.
+fn single(f: &BTreeMap<Option<usize>, i128>) -> Option<usize> {
+    match f.iter().collect::<Vec<_>>().as_slice() {
+        [(Some(c), 1)] => Some(*c),
+        _ => None,
+    }
+}
+
+/// The table's chain (rule c16), if it has one.
+pub(super) fn chain_of(interactions: &[BusInteraction]) -> Option<Chain> {
+    let call = interactions
+        .iter()
+        .find(|bi| !bi.is_sender && bi.bus_id == u64::from(BusId::Ecall))?;
+    let first = single(&multiplicity_form(&call.multiplicity))?;
+    let buses: BTreeSet<u64> = interactions.iter().map(|bi| bi.bus_id).collect();
+    for bus in buses {
+        let on: Vec<&BusInteraction> = interactions.iter().filter(|bi| bi.bus_id == bus).collect();
+        let (sends, receives): (Vec<&BusInteraction>, Vec<&BusInteraction>) =
+            on.iter().copied().partition(|bi| bi.is_sender);
+        let ([send], [receive]) = (sends.as_slice(), receives.as_slice()) else {
+            continue;
+        };
+        if send.values.len() != receive.values.len() {
+            continue;
+        }
+        let back = multiplicity_form(&receive.multiplicity);
+        let forth = multiplicity_form(&send.multiplicity);
+        let Some(mu) = back
+            .iter()
+            .find_map(|(k, &c)| (c == 1).then_some(*k).flatten())
+        else {
+            continue;
+        };
+        if back != BTreeMap::from([(Some(mu), 1), (Some(first), -1)])
+            || forth.get(&Some(mu)) != Some(&1)
+            || forth.len() != 2
+            || forth
+                .iter()
+                .any(|(k, &c)| *k != Some(mu) && (k.is_none() || c != -1))
+        {
+            continue;
+        }
+        let carried = send
+            .values
+            .iter()
+            .zip(&receive.values)
+            .filter_map(|(a, b)| {
+                let (a, b) = (form(a).ok()?, form(b).ok()?);
+                (a == b).then(|| single(&a)).flatten()
+            })
+            .collect();
+        return Some(Chain {
+            bus,
+            first,
+            carried,
+        });
+    }
+    None
+}
+
+/// The columns a chain carries that a register read binds on every first
+/// row: register reads (`Memw`, `is_register` the constant 1) holding the
+/// column as one of their values, their multiplicities summing to `FIRST`.
+fn chain_registered(interactions: &[BusInteraction], chain: &Chain) -> BTreeSet<usize> {
+    let one = BTreeMap::from([(None, 1i128)]);
+    let first = BTreeMap::from([(Some(chain.first), 1i128)]);
+    chain
+        .carried
+        .iter()
+        .copied()
+        .filter(|&c| {
+            let mut sum: BTreeMap<Option<usize>, i128> = BTreeMap::new();
+            for bi in interactions {
+                let register = bi.bus_id == u64::from(BusId::Memw)
+                    && bi.values.get(8).and_then(|v| form(v).ok()) == Some(one.clone());
+                let holds = [0usize, 1, 11, 12].iter().any(|&i| {
+                    bi.values
+                        .get(i)
+                        .and_then(|v| form(v).ok())
+                        .is_some_and(|f| single(&f) == Some(c))
+                });
+                if register && holds {
+                    for (k, v) in multiplicity_form(&bi.multiplicity) {
+                        *sum.entry(k).or_insert(0) += v;
+                    }
+                }
+            }
+            sum.retain(|_, v| *v != 0);
+            sum == first
+        })
+        .collect()
+}
+
+/// Whether a message fires at its table's call's multiplicity (a one-row
+/// chip's message, rule c10).
+fn is_call_multiplicity(interactions: &[BusInteraction], message: &BusInteraction) -> bool {
+    let mu = multiplicity_form(&message.multiplicity);
+    interactions.iter().any(|bi| {
+        !bi.is_sender
+            && bi.bus_id == u64::from(BusId::Ecall)
+            && multiplicity_form(&bi.multiplicity) == mu
+    })
+}
+
+/// `col` set to `value` on an all-zero row breaks one of the table's
+/// constraints.
+fn breaks_alone(eval: Option<(Eval, usize)>, col: usize, value: FE) -> bool {
+    eval.is_some_and(|(eval, width)| {
+        col < width && {
+            let mut row = vec![FE::zero(); width];
+            row[col] = value;
+            eval(&row).iter().any(|v| *v != FE::zero())
+        }
+    })
+}
+
+/// Rule c16, a chained chip's word message: its timestamp the call's (the
+/// `Ecall` receive's timestamp column, which the chain carries unchanged)
+/// plus a constant and bit columns at ±1, from 0 to 2 whatever the bits;
+/// its multiplicity one column, a bit, set only on an active row (alone at 1
+/// on a zero row it breaks a constraint); and the words it writes checked
+/// halves or each half one column a constraint fixes.
+fn check_chained_sender(
+    name: &str,
+    interactions: &[BusInteraction],
+    message: &BusInteraction,
+    chain: &Chain,
+    eval: Option<(Eval, usize)>,
+) -> Result<(), String> {
+    let call = interactions
+        .iter()
+        .find(|bi| !bi.is_sender && bi.bus_id == u64::from(BusId::Ecall))
+        .ok_or_else(|| format!("{name}: a chained chip with no call"))?;
+    let call_ts = single(&form(&call.values[0])?)
+        .filter(|c| chain.carried.contains(c))
+        .ok_or_else(|| format!("{name}: a call timestamp its chain does not carry"))?;
+    let mut diff = form(&message.values[3])?;
+    *diff.entry(Some(call_ts)).or_insert(0) -= 1;
+    diff.retain(|_, c| *c != 0);
+    let constant = diff.remove(&None).unwrap_or(0);
+    let (mut low, mut high) = (constant, constant);
+    for (&k, &c) in &diff {
+        let col = k.expect("a column");
+        let bit = [FE::from(2u64), FE::zero() - FE::one()]
+            .into_iter()
+            .all(|bad| breaks_alone(eval, col, bad));
+        if !bit || c.abs() != 1 {
+            return Err(format!(
+                "{name}: a word message's timestamp reads column {col} that is no bit at ±1"
+            ));
+        }
+        low += c.min(0);
+        high += c.max(0);
+    }
+    if low < 0 || high > 2 {
+        return Err(format!(
+            "{name}: a word message's timestamp is not its call's plus 0..=2"
+        ));
+    }
+    let mu = multiplicity_form(&message.multiplicity);
+    let Some(m) = single(&mu) else {
+        return Err(format!(
+            "{name}: a chained message's multiplicity is not one column"
+        ));
+    };
+    if !breaks_alone(eval, m, FE::one()) {
+        return Err(format!(
+            "{name}: a message's multiplicity set on an idle row breaks nothing"
+        ));
+    }
+    check_bits(name, &columns(&mu), eval)?;
+    let written: &[BusValue] = match form(&message.values[0])?.get(&None).copied().unwrap_or(0) {
+        1 => &message.values[4..6],
+        0 if message.values[6..8] == message.values[4..6] => &[],
+        0 => &message.values[6..8],
+        _ => return Err(format!("{name}: a word message with no kind constant")),
+    };
+    for half in written {
+        let f = form(half)?;
+        let fixed = single(&f).is_some_and(|c| breaks_alone(eval, c, FE::one()));
+        if !fixed && !is_checked_half(half, interactions, &mu) {
+            return Err(format!(
+                "{name}: a written word's half {f:?} is neither checked nor fixed"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rule c17: a word a chip's message carries as bytes (a half that sums
+/// byte columns) has every byte checked at the message's multiplicity.
+fn check_read_bytes(
+    name: &str,
+    interactions: &[BusInteraction],
+    message: &BusInteraction,
+) -> Result<(), String> {
+    let mu = multiplicity_form(&message.multiplicity);
+    for half in &message.values[4..] {
+        let f = form(half)?;
+        let bytes = f.len() == 4 && f.values().any(|&c| c == 1 << 8);
+        if bytes && !is_checked_half(half, interactions, &mu) {
+            return Err(format!(
+                "{name}: a message's word {f:?} not each byte in a checked pair"
             ));
         }
     }
@@ -2672,6 +2915,7 @@ fn word_format_census(registers: crate::tables::register::RegisterFormat) -> Res
     let set = frame.airs.air_refs();
     let mut on_words = BTreeSet::new();
     let mut message_receivers = BTreeSet::new();
+    let mut chains = Vec::new();
     for air in &set {
         let name = air.name();
         let interactions = air.bus_interactions();
@@ -2702,6 +2946,22 @@ fn word_format_census(registers: crate::tables::register::RegisterFormat) -> Res
         }
         census_table(name, interactions, air.num_precomputed_columns())?;
         check_set_member(name, interactions)?;
+        if let Some(chain) = chain_of(interactions) {
+            chains.push((name.to_string(), chain.bus));
+        }
+    }
+    // c16: a chain's bus is its table's family's alone.
+    for (owner, bus) in &chains {
+        let family = owner.split('[').next().unwrap_or(owner);
+        if let Some(other) = set.iter().find(|air| {
+            air.name().split('[').next() != Some(family)
+                && air.bus_interactions().iter().any(|bi| bi.bus_id == *bus)
+        }) {
+            return Err(format!(
+                "{}: touches {owner}'s chain bus {bus}",
+                other.name()
+            ));
+        }
     }
     // c1 and c6: the word bus is PAGE_W's, MEMW_W's and the CPU word tables'
     // alone, and MEMW_W alone receives word messages.
@@ -2944,13 +3204,15 @@ fn the_word_format_frame_holds_its_rules() {
     );
 }
 
-/// ★ Under the word memory format every chip's table is refused by count,
-/// each by name: KECCAK, KECCAK_RND, IS_WH, BLAKE3, COPY, ECSM, ECDAS, ECREC,
-/// HINT and MEMW_W. A chip-free statement frames; the same statement stating
-/// one table of one chip (its heights carried, the set built with it) is
-/// refused, and with the refusal taken out (a control mutant) it frames, so
-/// the rule alone is what refuses it. Under the split and fused formats the
-/// rule reads nothing.
+/// ★ Under the word memory format the table of every chip the format takes
+/// no call of yet is refused by count, each by name: KECCAK, KECCAK_RND,
+/// IS_WH, BLAKE3, ECSM, ECDAS, ECREC and HINT. A chip-free statement frames;
+/// the same statement stating one table of one chip (its heights carried, the
+/// set built with it) is refused, and with the refusal taken out (a control
+/// mutant) it frames, so the rule alone is what refuses it. COPY's tables
+/// (COPY_W's under the word format) and MEMW_W's are the format's: a
+/// statement stating them frames. Under the split and fused formats the rule
+/// reads nothing.
 #[test]
 fn the_word_format_refuses_every_chip_table() {
     let format = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
@@ -2965,27 +3227,23 @@ fn the_word_format_refuses_every_chip_table() {
         "KECCAK_RND",
         "IS_WH",
         "BLAKE3",
-        "COPY",
         "ECSM",
         "ECDAS",
         "ECREC",
         "HINT",
-        "MEMW_W",
     ];
     for table in names {
         let mut counts = chip_free.clone();
-        let mut words = CPU_WORD_TABLES;
+        let words = CPU_WORD_TABLES;
         match table {
             "KECCAK" => counts.keccak = 1,
             "KECCAK_RND" => counts.keccak_rnd = 1,
             "IS_WH" => counts.is_wh = 1,
             "BLAKE3" => counts.blake3 = 1,
-            "COPY" => counts.copy = 1,
             "ECSM" => counts.ecsm = 1,
             "ECDAS" => counts.ecdas = 1,
             "ECREC" => counts.ecrec = 1,
-            "HINT" => counts.hint = 1,
-            _ => words[6] = 1,
+            _ => counts.hint = 1,
         }
         let statement = words_statement(&format, &counts, words);
         let refused = frame_of(&statement, &format);
@@ -3010,6 +3268,13 @@ fn the_word_format_refuses_every_chip_table() {
             );
         }
     }
+    let mut counts = chip_free.clone();
+    counts.copy = 2;
+    let mut words = CPU_WORD_TABLES;
+    words[6] = 1;
+    assert!(block_whir::chip_tables_under(MemoryFormat::Words, &counts, words).is_ok());
+    let statement = words_statement(&format, &counts, words);
+    frame_of(&statement, &format).expect("COPY_W's and MEMW_W's tables frame");
 }
 
 /// ★ Under the split and fused formats the word tables' counts are absorbed

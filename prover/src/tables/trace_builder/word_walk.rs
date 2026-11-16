@@ -11,10 +11,14 @@
 //! PAGE_W's final words are read the same way from the walk's final state
 //! ([`page_w_trace_from_state`]).
 //!
-//! The format takes no syscall but the halt yet: an ECALL that is another is
-//! refused ([`refuse_syscall`]), as the verifier refuses every chip's table.
+//! The chips' calls the format proves (the COPY chip's: memcpy and memmove,
+//! memset, the commit syscall) are COPY_W rows and MEMW_W rows
+//! ([`copy_call`]); any other ECALL but the halt is refused
+//! ([`refuse_syscall`]), as the verifier refuses every other chip's table.
 
 use super::super::bitwise::{BitwiseHistogram, BitwiseOperation};
+use super::super::copy::Functionality;
+use super::super::copy_w::{self, CallMemory, CopyWordRow};
 use super::super::gpack::TraceForm;
 use super::super::mem_load2w::{self, Load2WRow};
 use super::super::mem_load8::{self, Load8Row};
@@ -22,6 +26,7 @@ use super::super::mem_loadw::{self, LoadWRow};
 use super::super::mem_store2w::{self, Store2WRow};
 use super::super::mem_store8::{self, Store8Row};
 use super::super::mem_storew::{self, StoreWRow};
+use super::super::memw_w::{self, MemwWordRow};
 use super::super::page::PageConfig;
 use super::super::page_w;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
@@ -32,10 +37,10 @@ use crate::Error;
 use crate::tables::cpu::CpuOp;
 use stark::trace::TraceTable;
 
-/// The CPU's word-table rows a walk makes, family by family, in the ops'
-/// order (`block_whir::WORD_TABLES`' first six: MEM_LOAD8, MEM_STORE8,
-/// MEM_LOADW, MEM_STOREW, MEM_LOAD2W, MEM_STORE2W). Empty under any other
-/// memory format.
+/// The word tables' rows a walk makes, family by family, in the ops' order
+/// (`block_whir::WORD_TABLES`' order: MEM_LOAD8, MEM_STORE8, MEM_LOADW,
+/// MEM_STOREW, MEM_LOAD2W, MEM_STORE2W, MEMW_W), then COPY_W's (COPY's
+/// family under the word format). Empty under any other memory format.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WordRows {
     pub(crate) load8: Vec<Load8Row>,
@@ -44,11 +49,18 @@ pub(crate) struct WordRows {
     pub(crate) storew: Vec<StoreWRow>,
     pub(crate) load2w: Vec<Load2WRow>,
     pub(crate) store2w: Vec<Store2WRow>,
+    /// The chips' word accesses.
+    pub(crate) memw: Vec<MemwWordRow>,
+    /// COPY_W's rows.
+    pub(crate) copy: Vec<CopyWordRow>,
 }
 
+/// [`WordRows`]' lists: the seven word families, then COPY_W.
+pub(crate) const WORD_ROW_LISTS: usize = 8;
+
 impl WordRows {
-    /// Each family's row count.
-    pub(crate) fn lens(&self) -> [usize; 6] {
+    /// Each list's row count ([`WORD_ROW_LISTS`]).
+    pub(crate) fn lens(&self) -> [usize; WORD_ROW_LISTS] {
         [
             self.load8.len(),
             self.store8.len(),
@@ -56,6 +68,8 @@ impl WordRows {
             self.storew.len(),
             self.load2w.len(),
             self.store2w.len(),
+            self.memw.len(),
+            self.copy.len(),
         ]
     }
 
@@ -67,6 +81,8 @@ impl WordRows {
             + vec_heap_bytes(&self.storew)
             + vec_heap_bytes(&self.load2w)
             + vec_heap_bytes(&self.store2w)
+            + vec_heap_bytes(&self.memw)
+            + vec_heap_bytes(&self.copy)
     }
 
     /// `other`'s rows after this one's, family by family.
@@ -77,11 +93,13 @@ impl WordRows {
         self.storew.append(&mut other.storew);
         self.load2w.append(&mut other.load2w);
         self.store2w.append(&mut other.store2w);
+        self.memw.append(&mut other.memw);
+        self.copy.append(&mut other.copy);
     }
 
     /// `parts`' rows one after another, family by family.
     pub(crate) fn concat(parts: Vec<WordRows>) -> WordRows {
-        let mut lens = [0usize; 6];
+        let mut lens = [0usize; WORD_ROW_LISTS];
         for part in &parts {
             for (n, len) in lens.iter_mut().zip(part.lens()) {
                 *n += len;
@@ -94,6 +112,8 @@ impl WordRows {
             storew: Vec::with_capacity(lens[3]),
             load2w: Vec::with_capacity(lens[4]),
             store2w: Vec::with_capacity(lens[5]),
+            memw: Vec::with_capacity(lens[6]),
+            copy: Vec::with_capacity(lens[7]),
         };
         for part in parts {
             out.append(part);
@@ -104,7 +124,11 @@ impl WordRows {
     /// The BITWISE lookups of every row past `from` (each family's count of
     /// rows already counted), counted into `histogram`: the rows' lookups are
     /// in-walk lookups, as LOAD's are.
-    pub(crate) fn count_bitwise_into(&self, from: [usize; 6], histogram: &mut BitwiseHistogram) {
+    pub(crate) fn count_bitwise_into(
+        &self,
+        from: [usize; WORD_ROW_LISTS],
+        histogram: &mut BitwiseHistogram,
+    ) {
         for row in &self.load8[from[0]..] {
             row.count_bitwise_into(histogram);
         }
@@ -123,6 +147,12 @@ impl WordRows {
         for row in &self.store2w[from[5]..] {
             row.count_bitwise_into(histogram);
         }
+        for row in &self.memw[from[6]..] {
+            row.count_bitwise_into(histogram);
+        }
+        for row in &self.copy[from[7]..] {
+            row.count_bitwise_into(histogram);
+        }
     }
 }
 
@@ -138,16 +168,79 @@ fn read_word(memory_state: &mut MemoryState, base: u64) -> (u64, u64) {
     (word, stamps.iter().copied().max().unwrap_or(0))
 }
 
-/// Refuses an ECALL under the word memory format that is not the halt: the
-/// chips' memory messages have no receiver under it, and the verifier refuses
-/// every chip's table (`block_whir::chip_tables_under`).
+/// Refuses an ECALL under the word memory format that is neither the halt
+/// nor a COPY chip's call (memcpy and memmove, memset, the commit syscall):
+/// the other chips' memory messages have no receiver under it yet, and the
+/// verifier refuses their tables (`block_whir::chip_tables_under`).
 pub(super) fn refuse_syscall(op: CpuOp<'_>) -> Result<(), Error> {
     let halt = executor::vm::instruction::execution::SyscallNumbers::Halt as u64;
-    if op.decode.fields.ecall && op.rv1 != halt {
+    let copy = op.ecall_commit() || op.ecall_dma_memcpy() || op.ecall_dma_memset();
+    if op.decode.fields.ecall && op.rv1 != halt && !copy {
         return Err(Error::Prover(format!(
-            "the word memory format proves no syscall but the halt yet: syscall {:#x} at timestamp {}",
+            "the word memory format proves no syscall but the halt and the COPY chip's yet: \
+             syscall {:#x} at timestamp {}",
             op.rv1, op.timestamp
         )));
+    }
+    Ok(())
+}
+
+/// The walk's per-byte state as a call's word memory: a word is its eight
+/// bytes and the largest of their stamps; a call's access stamps the bytes
+/// of its range it touches (a read keeps their values).
+struct StateWords<'a>(&'a mut MemoryState);
+
+impl CallMemory for StateWords<'_> {
+    fn word(&mut self, key: u64) -> Option<(u64, u64)> {
+        let (word, ts) = read_word(self.0, key);
+        (ts != ABSENT).then_some((word, ts))
+    }
+
+    fn set(&mut self, key: u64, timestamp: u64, value: u64, (first, len): (u64, u8)) {
+        if len == 0 {
+            return;
+        }
+        let shift = 8 * (first - key);
+        self.0
+            .write_bytes(first, value >> shift, usize::from(len), timestamp);
+    }
+}
+
+/// A COPY chip's call under the word memory format (`functionality` at
+/// `timestamp`, the operands as the walk read them: a commit's `dst` is its
+/// commit index): its COPY_W rows (with `rest`) and its MEMW_W rows, the
+/// words read from `memory_state` and its bytes moved there, the rows'
+/// lookups appended to `lookups`. A word the state lacks makes no row: the
+/// state is marked missing and the window is refused. A call COPY_W cannot
+/// hold is the walk's error.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn copy_call(
+    functionality: Functionality,
+    timestamp: u64,
+    src: u64,
+    dst: u64,
+    count: u64,
+    memory_state: &mut MemoryState,
+    rows: &mut WordRows,
+    rest: bool,
+    lookups: Option<&mut Vec<BitwiseOperation>>,
+) -> Result<(), Error> {
+    let refused = |why: String| Error::Prover(format!("COPY_W: {why}"));
+    let mut call = copy_w::call_rows(functionality, timestamp, src, dst, count).map_err(refused)?;
+    let Some(memw) = copy_w::run_call(&mut call, src, dst, count, &mut StateWords(memory_state))
+        .map_err(refused)?
+    else {
+        return Ok(());
+    };
+    if let Some(out) = lookups {
+        out.extend(memw.iter().flat_map(MemwWordRow::bitwise_ops));
+        if rest {
+            out.extend(call.iter().flat_map(CopyWordRow::bitwise_ops));
+        }
+    }
+    rows.memw.extend(memw);
+    if rest {
+        rows.copy.extend(call);
     }
     Ok(())
 }
@@ -308,14 +401,14 @@ pub(super) fn word_store(
     Ok(())
 }
 
-/// The word tables of `rows`, family by family (MEM_LOAD8 … MEM_STORE2W),
-/// each cut into tables of at most `max_rows[k]` rows (a family without rows
-/// makes none), in `form`.
+/// The word tables of `rows`, family by family (MEM_LOAD8 … MEM_STORE2W,
+/// MEMW_W), each cut into tables of at most `max_rows[k]` rows (a family
+/// without rows makes none), in `form`.
 pub(super) fn word_tables(
     rows: &WordRows,
-    max_rows: [usize; 6],
+    max_rows: [usize; 7],
     form: TraceForm,
-) -> [Vec<TraceTable<GoldilocksField, GoldilocksExtension>>; 6] {
+) -> [Vec<TraceTable<GoldilocksField, GoldilocksExtension>>; 7] {
     fn cut<T>(
         list: &[T],
         max: usize,
@@ -342,25 +435,28 @@ pub(super) fn word_tables(
         cut(&rows.store2w, max_rows[5], |r| {
             mem_store2w::generate_mem_store2w_trace_segments_as(&[r], form)
         }),
+        cut(&rows.memw, max_rows[6], |r| {
+            memw_w::generate_memw_w_trace_segments_as(&[r], form)
+        }),
     ]
 }
 
 /// How many tables [`word_tables`] makes of each family.
-pub(super) fn word_table_counts(rows: &WordRows, max_rows: [usize; 6]) -> [usize; 7] {
+pub(super) fn word_table_counts(rows: &WordRows, max_rows: [usize; 7]) -> [usize; 7] {
     let lens = rows.lens();
     let mut counts = [0usize; 7];
-    for k in 0..6 {
+    for k in 0..7 {
         counts[k] = lens[k].div_ceil(max_rows[k].max(1));
     }
     counts
 }
 
 /// The word tables' row caps from the block's: the fused tables' (MEM_LOAD's
-/// for the loads, MEM_STORE's for the stores), the chunk a block takes of
-/// each.
-pub(super) fn word_max_rows(max_rows: &crate::tables::MaxRowsConfig) -> [usize; 6] {
+/// for the loads, MEM_STORE's for the stores and MEMW_W), the chunk a block
+/// takes of each.
+pub(super) fn word_max_rows(max_rows: &crate::tables::MaxRowsConfig) -> [usize; 7] {
     let (load, store) = (max_rows.mem_load, max_rows.mem_store);
-    [load, store, load, store, load, store]
+    [load, store, load, store, load, store, store]
 }
 
 /// The PAGE_W table of `config`'s page from the walk's final state: a word's

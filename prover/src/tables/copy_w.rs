@@ -205,26 +205,16 @@ pub struct CopyWordRow {
     pub(crate) old: u64,
 }
 
+// Some readers are the tests' alone.
+#[cfg_attr(not(test), allow(dead_code))]
 impl CopyWordRow {
     #[inline]
     fn flag(&self, f: u8) -> bool {
         self.flags & f != 0
     }
 
-    pub(crate) fn timestamp(&self) -> u64 {
-        self.timestamp
-    }
-
-    pub(crate) fn src_key(&self) -> u64 {
-        self.src_key
-    }
-
     pub(crate) fn dst_key(&self) -> u64 {
         self.dst_key
-    }
-
-    pub(crate) fn count_decr(&self) -> u32 {
-        self.count_decr
     }
 
     pub(crate) fn first(&self) -> bool {
@@ -265,16 +255,6 @@ impl CopyWordRow {
     /// The window's first and last byte (none on a zero-length call's row).
     pub(crate) fn window(&self) -> Option<(u8, u8)> {
         (!self.zero()).then_some((self.start, self.last))
-    }
-
-    pub(crate) fn shift(&self) -> u8 {
-        self.shift
-    }
-
-    /// The bytes the row moves.
-    pub(crate) fn width(&self) -> u64 {
-        self.window()
-            .map_or(0, |(start, last)| u64::from(last - start) + 1)
     }
 
     /// Whether byte `j` of the destination word is in the window.
@@ -362,25 +342,21 @@ impl CopyWordRow {
     /// halves, then `ARE_BYTES` on `A` (read), `B` (read) and the old
     /// destination word (written).
     pub(crate) fn bitwise_ops(&self) -> impl Iterator<Item = BitwiseOperation> {
-        let halves = [
-            self.count_decr,
-            self.src_key as u32,
-            self.dst_key as u32,
-        ]
-        .into_iter()
-        .flat_map(|w| [w as u16, (w >> 16) as u16])
-        .map(|h| BitwiseOperation::halfword(BitwiseOperationType::IsHalf, h as u8, (h >> 8) as u8));
+        let halves = [self.count_decr, self.src_key as u32, self.dst_key as u32]
+            .into_iter()
+            .flat_map(|w| [w as u16, (w >> 16) as u16])
+            .map(|h| {
+                BitwiseOperation::halfword(BitwiseOperationType::IsHalf, h as u8, (h >> 8) as u8)
+            });
         let pairs = |on: bool, word: u64| {
             let bytes = word.to_le_bytes();
-            (0..4)
-                .filter(move |_| on)
-                .map(move |p| {
-                    BitwiseOperation::byte_op(
-                        BitwiseOperationType::AreBytes,
-                        bytes[2 * p],
-                        bytes[2 * p + 1],
-                    )
-                })
+            (0..4).filter(move |_| on).map(move |p| {
+                BitwiseOperation::byte_op(
+                    BitwiseOperationType::AreBytes,
+                    bytes[2 * p],
+                    bytes[2 * p + 1],
+                )
+            })
         };
         halves
             .chain(pairs(self.reads_a(), self.a))
@@ -457,7 +433,9 @@ pub(crate) fn call_rows(
     } else {
         let offset = dst % WORD_BYTES;
         let shift = src.wrapping_sub(dst) % WORD_BYTES;
-        let src_key = src.checked_sub(offset + shift).filter(|k| same_high(*k, src));
+        let src_key = src
+            .checked_sub(offset + shift)
+            .filter(|k| same_high(*k, src));
         let Some(src_key) = src_key else {
             return Err(format!(
                 "a copy from {src:#x} (offset {offset}, shift {shift}) whose first source \
@@ -519,8 +497,7 @@ pub(crate) fn call_rows(
         });
     }
     debug_assert_eq!(remaining, 0, "the windows cover the count");
-    if functionality == Functionality::Set
-        && rows.iter().any(|r| !same_high(r.src_key, r.dst_key))
+    if functionality == Functionality::Set && rows.iter().any(|r| !same_high(r.src_key, r.dst_key))
     {
         return Err(format!(
             "a memset from {src:#x} whose source and destination words straddle a 4 GiB boundary"
@@ -609,7 +586,14 @@ pub(crate) fn run_call(
             if functionality == Functionality::Copy {
                 for r in rows.iter_mut() {
                     r.old = held(memory, r.dst_key).0;
-                    write(&mut out, memory, r.dst_key, write_ts, r.new_word(), destination)?;
+                    write(
+                        &mut out,
+                        memory,
+                        r.dst_key,
+                        write_ts,
+                        r.new_word(),
+                        destination,
+                    )?;
                 }
             }
         }
@@ -626,7 +610,14 @@ pub(crate) fn run_call(
                 let key = rows[k].dst_key;
                 let old = held(memory, key).0;
                 rows[k].set_words(a, 0, old);
-                write(&mut out, memory, key, write_ts, rows[k].new_word(), destination)?;
+                write(
+                    &mut out,
+                    memory,
+                    key,
+                    write_ts,
+                    rows[k].new_word(),
+                    destination,
+                )?;
             }
             for k in 0..rows.len() {
                 if rows[k].reads_a() {
@@ -711,6 +702,16 @@ fn write(
 
 /// The widths COPY_W traces needed so far in this process (`tables::gpack`).
 pub(crate) static WIDTHS: WidthHint = WidthHint::new();
+
+/// Whether [`generate_copy_w_rows_as`] in `form` writes its rows packed, with
+/// no 64-bit table on the way: in [`TraceForm::Narrow`] once an earlier
+/// COPY_W trace of this process left its widths (`tables::gpack`).
+pub(crate) fn rows_written_packed(form: TraceForm) -> bool {
+    matches!(
+        super::gpack::Plan::new(form, &WIDTHS, cols::NUM_COLUMNS),
+        super::gpack::Plan::Write(_)
+    )
+}
 
 /// The COPY_W trace of `rows`, then zero rows to a power of two of at least
 /// four, in `form`.
@@ -809,10 +810,7 @@ fn count_terms() -> Vec<LinearTerm> {
 /// The destination operand: `DST_KEY_LO + START` (x10), less the commit
 /// bias on a commit row (x254).
 fn dst_operand_terms(commit: bool) -> Vec<LinearTerm> {
-    let mut terms = limbs(
-        cols::DST_KEY_LO,
-        if commit { -COMMIT_KEY_BIAS } else { 0 },
-    );
+    let mut terms = limbs(cols::DST_KEY_LO, if commit { -COMMIT_KEY_BIAS } else { 0 });
     terms.extend(one_hot_value(cols::START, 1));
     terms
 }
@@ -1010,12 +1008,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::MemWordMsg,
             Multiplicity::Column(cols::READ_B),
-            access_message(
-                src_key(WORD_BYTES as i64),
-                timestamp(false),
-                b.clone(),
-                b,
-            ),
+            access_message(src_key(WORD_BYTES as i64), timestamp(false), b.clone(), b),
         ),
         BusInteraction::sender(
             BusId::MemWordMsg,
@@ -1152,7 +1145,12 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyWordConstraints
             emit_is_bit(b, idx, c, None);
         }
         let one = b.one();
-        let (first, end, mu, zero) = (b.main(0, cols::FIRST), b.main(0, cols::END), b.main(0, cols::MU), b.main(0, cols::ZERO));
+        let (first, end, mu, zero) = (
+            b.main(0, cols::FIRST),
+            b.main(0, cols::END),
+            b.main(0, cols::MU),
+            b.main(0, cols::ZERO),
+        );
         let (is_set, is_write) = (b.main(0, cols::IS_SET), b.main(0, cols::IS_WRITE));
         b.emit_base(
             6,

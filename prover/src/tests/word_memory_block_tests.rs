@@ -7,6 +7,10 @@
 //! under the split or fused format), their word tables the ones the walk
 //! counts; a word row moved later is refused by the bus balance alone; a
 //! hand-built proof stating a chip's table is refused by the chip rule alone.
+//! Runs that call the COPY chip (memcpy and memmove, memset, the commit
+//! syscall) prove and verify under it, COPY's tables COPY_W's and MEMW_W
+//! taking their word accesses; a COPY_W row moved later is refused by the
+//! bus balance alone.
 //! The proving tests run where a block can be proved (the box's lib run and
 //! CI). The word format's statement checks on hand-built statements are
 //! `tables::word_memory_tests`', its walk's on the builders' traces
@@ -386,31 +390,144 @@ fn a_word_block_with_a_moved_word_row_is_refused_by_the_balance_alone() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// ★ A hand-built word block stating a chip's table is refused by the chip
-/// rule alone: an honest chip-free build with one MEMW_W table of padding
-/// rows added (every message and token at multiplicity zero, so every bus
-/// still balances) proves, and the verifier refuses it for stating MEMW_W;
-/// with the chip rule taken out (a control mutant) it verifies. The verifier
-/// does not leave a chip's table under the word format to the bus.
+/// ★ A hand-built word block stating the table of a chip the format takes no
+/// call of yet is refused by the chip rule alone: an honest chip-free build
+/// with one HINT table of padding rows added (every interaction at
+/// multiplicity zero, so every bus still balances) proves, and the verifier
+/// refuses it for stating HINT; with the chip rule taken out (a control
+/// mutant) it verifies. The verifier does not leave such a chip's table under
+/// the word format to the bus.
 #[test]
 fn a_word_block_stating_a_chip_table_is_refused_by_the_chip_rule_alone() {
     let words = format(MemoryFormat::Words);
     let elf = asm_elf_bytes("fused_mem_cases");
     let mut forged = word_build(&elf, &words);
-    forged.word_tables[6] = vec![crate::tables::memw_w::generate_memw_w_trace_segments_as(
-        &[],
-        crate::tables::gpack::TraceForm::Wide,
-    )];
-    assert_eq!(forged.word_counts()[6], 1);
+    forged.hints = vec![crate::tables::hint::generate_hint_trace(&[])];
     let proof = prove_built(&elf, &mut forged, &words).expect("the forged build proves");
-    assert_eq!(proof.word_memory[6], 1, "the proof states one MEMW_W table");
+    assert_eq!(
+        proof.table_counts.hint, 1,
+        "the proof states one HINT table"
+    );
     let refused = verify_block_whir(&proof, &elf, &ProofOptions::default_test_options(), &words);
     assert!(
-        matches!(&refused, Err(crate::Error::InvalidTableCounts(why)) if why.contains("no MEMW_W table")),
+        matches!(&refused, Err(crate::Error::InvalidTableCounts(why)) if why.contains("no HINT table")),
         "refused by the chip rule: {refused:?}"
     );
     CHIP_COUNTS_UNCHECKED.with(|c| c.set(true));
     let control = verifies(&proof, &elf, &words);
     CHIP_COUNTS_UNCHECKED.with(|c| c.set(false));
     assert!(control, "without the chip rule the forged block verifies");
+}
+
+/// The runs that call the COPY chip: asm programs of every row shape,
+/// overlapping copies and commits split across calls; Rust guests' memcpy,
+/// memmove, memset and commit cases.
+const COPY_ASM: [&str; 3] = [
+    "test_copy_ecalls",
+    "test_copy_overlaps",
+    "test_commit_split",
+];
+const COPY_RUST: [&str; 4] = [
+    "dma_memcpy_cases",
+    "dma_memmove_cases",
+    "dma_memset_cases",
+    "commit",
+];
+
+fn rust_elf_bytes(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../executor/program_artifacts/rust")
+        .join(format!("{name}.elf"));
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// ★ Word blocks that call the COPY chip prove and verify: each run, proved
+/// as a streamed block under the word memory format, verifies under it and
+/// under neither the split nor the fused format; it states COPY_W tables in
+/// COPY's place and MEMW_W tables (the walk's count), no retired or fused
+/// table; and its public output is the run's.
+#[test]
+fn a_word_block_calling_the_copy_chip_proves_and_verifies() {
+    let words = format(MemoryFormat::Words);
+    let runs = COPY_ASM
+        .iter()
+        .map(|&name| (name, asm_elf_bytes(name)))
+        .chain(COPY_RUST.iter().map(|&name| (name, rust_elf_bytes(name))));
+    for (name, elf) in runs {
+        let proof = prove(&elf, &words);
+        assert!(verifies(&proof, &elf, &words), "{name}");
+        for other in [MemoryFormat::Split, MemoryFormat::Fused] {
+            assert!(
+                !verifies(&proof, &elf, &format(other)),
+                "{name}: verifies under {other:?}"
+            );
+        }
+        let c = &proof.table_counts;
+        assert_eq!(
+            (c.load, c.store, c.memw, c.memw_aligned),
+            (0, 0, 0, 0),
+            "{name}: no retired table"
+        );
+        assert_eq!(proof.fused_memory, [0, 0], "{name}");
+        assert!(
+            c.copy > 0 && proof.word_memory[6] > 0,
+            "{name}: COPY_W and MEMW_W"
+        );
+        let build = word_build(&elf, &words);
+        assert_eq!(
+            proof.word_memory,
+            build.word_counts().map(|n| n as u64),
+            "{name}: the walk's word tables"
+        );
+        assert_eq!(
+            proof.public_output, build.public_output_bytes,
+            "{name}: the run's public output"
+        );
+        println!(
+            "WORD COPY BLOCK {name}: COPY_W tables {}, word tables {:?}, output {} bytes",
+            c.copy,
+            proof.word_memory,
+            proof.public_output.len()
+        );
+    }
+}
+
+/// ★ A word block whose first COPY_W row is moved four cycles later (its
+/// call, its chain and its word messages then name no one's), proved from the
+/// built traces, is refused by the bus balance, and verifies with that one
+/// check off: no constraint reads the call's timestamp. The honest build
+/// proves and verifies.
+#[test]
+fn a_word_block_with_a_moved_copy_row_is_refused_by_the_balance_alone() {
+    let words = format(MemoryFormat::Words);
+    let elf = asm_elf_bytes("test_copy_ecalls");
+    let mut honest = word_build(&elf, &words);
+    let proof = prove_built(&elf, &mut honest, &words).expect("the honest build proves");
+    assert!(verifies(&proof, &elf, &words), "the honest build verifies");
+    let mut forged = word_build(&elf, &words);
+    let ts = crate::tables::copy_w::cols::TIMESTAMP;
+    let table = &mut forged.copies[0];
+    let moved = table.get_main(0, ts).canonical_u64() + 16;
+    table
+        .main_table
+        .set(0, ts, crate::tables::types::FE::from(moved));
+    let proof = prove_built(&elf, &mut forged, &words).expect("the forged build proves");
+    let all = verdict(&proof, &elf, &words, VerifierChecks::ALL);
+    let off = verdict(
+        &proof,
+        &elf,
+        &words,
+        VerifierChecks {
+            balance: false,
+            ..VerifierChecks::ALL
+        },
+    );
+    assert!(
+        matches!(
+            &all,
+            Ok(Err(block_whir::BlockRefusal::Proof(e))) if *e == multilinear::Error::BusImbalance
+        ),
+        "every check: {all:?}"
+    );
+    assert!(matches!(&off, Ok(Ok(()))), "without the balance: {off:?}");
 }

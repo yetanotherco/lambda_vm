@@ -2494,7 +2494,8 @@ fn walk_cpu_ops<const REST: bool>(
         // or store reads its access record.
         let mut light = false;
         // Under the word memory format the format takes no syscall but the
-        // halt: any other is refused before it touches anything.
+        // halt and the COPY chip's: any other is refused before it touches
+        // anything.
         if words {
             word_walk::refuse_syscall(op)?;
         }
@@ -2615,17 +2616,31 @@ fn walk_cpu_ops<const REST: bool>(
                 op.commit_count(),
                 register_state,
             )?);
-            let (write_memw, rows) = collect_copy_ops(
-                copy::Functionality::Write,
-                op.timestamp,
-                op.commit_buf_addr(),
-                index,
-                op.commit_count(),
-                memory_state,
-            );
-            memw.extend_ops(write_memw);
-            if REST {
-                copy_ops.extend(rows);
+            if words {
+                word_walk::copy_call(
+                    copy::Functionality::Write,
+                    op.timestamp,
+                    op.commit_buf_addr(),
+                    index,
+                    op.commit_count(),
+                    memory_state,
+                    word_rows,
+                    REST,
+                    lookups.then_some(&mut *bitwise_ops),
+                )?;
+            } else {
+                let (write_memw, rows) = collect_copy_ops(
+                    copy::Functionality::Write,
+                    op.timestamp,
+                    op.commit_buf_addr(),
+                    index,
+                    op.commit_count(),
+                    memory_state,
+                );
+                memw.extend_ops(write_memw);
+                if REST {
+                    copy_ops.extend(rows);
+                }
             }
             let count = u32::try_from(op.commit_count()).map_err(|_| {
                 Error::Prover(format!(
@@ -2791,17 +2806,31 @@ fn walk_cpu_ops<const REST: bool>(
                 count,
                 register_state,
             )?);
-            let (mm_memw, rows) = collect_copy_ops(
-                copy::Functionality::Copy,
-                op.timestamp,
-                src,
-                dst,
-                count,
-                memory_state,
-            );
-            memw.extend_ops(mm_memw);
-            if REST {
-                copy_ops.extend(rows);
+            if words {
+                word_walk::copy_call(
+                    copy::Functionality::Copy,
+                    op.timestamp,
+                    src,
+                    dst,
+                    count,
+                    memory_state,
+                    word_rows,
+                    REST,
+                    lookups.then_some(&mut *bitwise_ops),
+                )?;
+            } else {
+                let (mm_memw, rows) = collect_copy_ops(
+                    copy::Functionality::Copy,
+                    op.timestamp,
+                    src,
+                    dst,
+                    count,
+                    memory_state,
+                );
+                memw.extend_ops(mm_memw);
+                if REST {
+                    copy_ops.extend(rows);
+                }
             }
         }
 
@@ -2825,17 +2854,31 @@ fn walk_cpu_ops<const REST: bool>(
                 count,
                 register_state,
             )?);
-            let (memset_memw, rows) = collect_copy_ops(
-                copy::Functionality::Set,
-                op.timestamp,
-                src,
-                dst,
-                count,
-                memory_state,
-            );
-            memw.extend_ops(memset_memw);
-            if REST {
-                copy_ops.extend(rows);
+            if words {
+                word_walk::copy_call(
+                    copy::Functionality::Set,
+                    op.timestamp,
+                    src,
+                    dst,
+                    count,
+                    memory_state,
+                    word_rows,
+                    REST,
+                    lookups.then_some(&mut *bitwise_ops),
+                )?;
+            } else {
+                let (memset_memw, rows) = collect_copy_ops(
+                    copy::Functionality::Set,
+                    op.timestamp,
+                    src,
+                    dst,
+                    count,
+                    memory_state,
+                );
+                memw.extend_ops(memset_memw);
+                if REST {
+                    copy_ops.extend(rows);
+                }
             }
         }
 
