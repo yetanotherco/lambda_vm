@@ -680,25 +680,20 @@ fn every_route_mutant_refuses_the_word_leaves() {
     let words = p1_format(MemoryFormat::Words, LeafScale::DoubledOneTop);
     let plan = small_words_plan(&words).expect("the honest plan");
     emit_leaves(&plan).expect("the honest leaves");
-    let under = |faults: &[Fault]| -> Result<(), String> {
-        faults.iter().rev().fold(
-            Box::new(|| emit_leaves(&plan)) as Box<dyn Fn() -> _>,
-            |f, &fault| Box::new(move || route_faults::with(fault, &f)),
-        )()
-    };
-    let swapped = under(&[Fault::PrivateRouteSwapped]).expect_err("refused");
+    let leaves = |faults: &[Fault]| under(faults, || emit_leaves(&plan));
+    let swapped = leaves(&[Fault::PrivateRouteSwapped]).expect_err("refused");
     assert!(
         swapped.contains("preprocessed columns and its route checks"),
         "{swapped}"
     );
-    under(&[Fault::PrivateRouteSwapped, Fault::NoCountCheck]).expect("without the count check");
-    let other = under(&[Fault::OtherPageFamily]).expect_err("refused");
+    leaves(&[Fault::PrivateRouteSwapped, Fault::NoCountCheck]).expect("without the count check");
+    let other = leaves(&[Fault::OtherPageFamily]).expect_err("refused");
     assert!(
         other.contains("preprocessed columns and its route checks"),
         "{other}"
     );
     let leg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        under(&[
+        leaves(&[
             Fault::OtherPageFamily,
             Fault::NoCountCheck,
             Fault::NoHeightCheck,
@@ -739,5 +734,817 @@ fn every_route_mutant_refuses_the_word_leaves() {
     crate::block_whir::DENSE_PAGES_FORCED.with(|c| c.set(false));
     if let Err(panic) = checked {
         std::panic::resume_unwind(panic);
+    }
+}
+
+// =============================================================================
+// The leaf census under the word format
+// =============================================================================
+
+/// `rows` in tables of at most `cap` rows: full ones, then the rest padded to
+/// a power of two.
+fn runs_of(rows: usize, cap: usize) -> Vec<(usize, usize)> {
+    let mut runs = vec![(cap, rows / cap)];
+    if rows % cap > 0 {
+        runs.push(((rows % cap).next_power_of_two(), 1));
+    }
+    runs.retain(|&(_, c)| c > 0);
+    runs
+}
+
+/// A block's tables, by family: the families the word format keeps, the
+/// split format's memory tables, the word format's, and the pages.
+struct CensusMix {
+    kept: Vec<(&'static str, Vec<(usize, usize)>)>,
+    split_memory: Vec<(&'static str, Vec<(usize, usize)>)>,
+    words: Vec<(&'static str, Vec<(usize, usize)>)>,
+    pages: usize,
+}
+
+/// A family's tables of `heights` (variables), as runs.
+fn of_vars(heights: &[usize]) -> Vec<(usize, usize)> {
+    heights.iter().map(|&v| (1usize << v, 1)).collect()
+}
+
+/// ✗ A MODEL of the median and the large block (Poseidon1 base, in-row
+/// registers), never a measurement: each family's table count, and LT's,
+/// KECCAK_RND's, COPY's, KECCAK's and ECDAS's heights, are the split
+/// pipeline's on the box (`W3 GROUP TABLES`, `W3 LT HEIGHTS`, `W3 CHUNKED`
+/// lines); the other families' heights are guessed at their caps (CPU, SHIFT,
+/// the memory tables, MEMW_R at 2^21; BYTEWISE, MUL, CPU32 at 2^20; BRANCH at
+/// 2^19; EQ at 2^18; DVRM, ECREC at 2^14). The word families' rows are the
+/// word-format design's counts of the CPU's accesses (median, large), at
+/// 2^21 rows a table; MEMW_W's (the chips' word accesses) are guessed at 9 M
+/// and 18 M rows. The census prints its tables and cells beside the box's
+/// (split 403 / 12.657 G and 781 / 25.486 G; words 346 / 10.469 G and 666 /
+/// 21.043 G) so the model's error is read, not assumed.
+fn census_mix(large: bool) -> CensusMix {
+    const LT_MEDIAN: [usize; 38] = [
+        20, 20, 20, 17, 15, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 17, 15, 16, 16, 18, 19,
+        19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 18, 18, 19, 17,
+    ];
+    const LT_LARGE: [usize; 74] = [
+        20, 20, 20, 20, 20, 20, 18, 15, 15, 15, 15, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
+        19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 18, 15, 15, 15, 15, 16, 16, 15,
+        17, 19, 19, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 19, 20, 19, 19, 18, 19, 19, 18,
+        17, 17, 19, 19, 18,
+    ];
+    let k = if large { 2 } else { 1 };
+    let n = |median: usize, large_n: usize| if large { large_n } else { median };
+    let m = 1usize << 20;
+    // The word families' rows (millions): MEM_LOAD8, MEM_STORE8, MEM_LOADW,
+    // MEM_STOREW, MEM_LOAD2W, MEM_STORE2W, MEMW_W.
+    let word_rows: [f64; 7] = if large {
+        [46.42, 33.79, 13.22, 4.09, 4.74, 3.92, 18.0]
+    } else {
+        [22.72, 16.68, 6.30, 1.95, 2.31, 1.90, 9.0]
+    };
+    let words = crate::tables::word_cpu::WORD_TABLES
+        .iter()
+        .zip(word_rows)
+        .map(|(&family, rows)| (family, runs_of((rows * 1e6) as usize, 2 * m)))
+        .collect();
+    CensusMix {
+        kept: vec![
+            ("CPU", vec![(2 * m, n(58, 117))]),
+            (
+                "LT",
+                of_vars(if large { &LT_LARGE[..] } else { &LT_MEDIAN[..] }),
+            ),
+            ("KECCAK_RND", vec![(1 << 16, 33 * k)]),
+            ("SHIFT", vec![(2 * m, n(5, 9))]),
+            ("BRANCH", vec![(1 << 19, n(5, 11))]),
+            ("EQ", vec![(1 << 18, n(5, 9))]),
+            ("BYTEWISE", vec![(m, n(4, 7))]),
+            ("ECDAS", vec![(1 << 17, 2 * k)]),
+            ("MUL", vec![(m, k)]),
+            ("DVRM", vec![(1 << 14, 1)]),
+            ("MEMW_R", vec![(2 * m, k)]),
+            ("CPU32", vec![(m, 1)]),
+            ("COPY", vec![(m, 4 * k)]),
+            ("KECCAK", vec![(1 << 17, k)]),
+            ("ECREC", vec![(1 << 14, 1)]),
+        ],
+        split_memory: vec![
+            ("MEMW_A", vec![(2 * m, n(25, 51))]),
+            ("LOAD", vec![(2 * m, n(15, 31))]),
+            ("STORE", vec![(2 * m, n(10, 20))]),
+            ("MEMW", vec![(2 * m, n(5, 9))]),
+        ],
+        words,
+        pages: n(183, 351),
+    }
+}
+
+/// The mix's tables under `memory`, by the names its AIR set gives them.
+fn census_tables(
+    mix: &CensusMix,
+    memory: MemoryFormat,
+) -> Vec<(&'static str, Vec<(usize, usize)>)> {
+    let rename = |family: &'static str| match (memory, family) {
+        (MemoryFormat::Words, "COPY") => crate::tables::copy_w::NAME,
+        (MemoryFormat::Words, "KECCAK") => crate::tables::keccak_w::NAME,
+        (MemoryFormat::Words, "ECREC") => crate::tables::ecrec_w::NAME,
+        _ => family,
+    };
+    let mut tables: Vec<(&'static str, Vec<(usize, usize)>)> = mix
+        .kept
+        .iter()
+        .map(|(f, runs)| (rename(f), runs.clone()))
+        .collect();
+    let memory_tables = if memory == MemoryFormat::Words {
+        &mix.words
+    } else {
+        &mix.split_memory
+    };
+    tables.extend(memory_tables.iter().cloned());
+    tables
+}
+
+/// One census line for `plan`: its tables, cells, groups and leaves; each
+/// group's mean rows in the leaf's binding chips; and how many such groups a
+/// leaf at the plan's heights holds, chip by chip.
+fn census_line(label: &str, plan: &WhirBlockPlan) -> (usize, usize) {
+    let cells: f64 = plan
+        .frame
+        .shapes
+        .iter()
+        .map(|&(w, v)| (w as f64) * (1u64 << v) as f64)
+        .sum::<f64>()
+        / 1e9;
+    let (loads, front) = plan.chip_loads();
+    let n = loads.len();
+    let heights = plan
+        .leaf_bound()
+        .map_or(super::P1_LEAF_HEIGHTS_2X, |b| b.heights);
+    let names = super::super::whir_chain::ChipRows::NAMES;
+    let sums = loads.iter().fold([0usize; 10], |mut acc, l| {
+        for (a, r) in acc.iter_mut().zip(l.to_array()) {
+            *a += r;
+        }
+        acc
+    });
+    let room: Vec<String> = names
+        .iter()
+        .zip(sums)
+        .zip(heights.to_array())
+        .zip(front.to_array())
+        .filter(|(((_, s), h), _)| *s > 0 && *h < usize::MAX && *h > 0)
+        .map(|(((name, s), h), f)| {
+            let mean = s as f64 / n as f64;
+            format!("{name} {:.0}/group → {:.1}", mean, (h - f) as f64 / mean)
+        })
+        .collect();
+    let leaves = plan.partition().num_leaves();
+    println!(
+        "WORDS CENSUS {label}: tables {} · cells {cells:.3} G · groups {n} · leaves {leaves} \
+         ({:?}) · groups a leaf {:?} · costs Σ {} · a doubled leaf holds, by chip: {}",
+        plan.frame.shapes.len(),
+        plan.leaf_bound(),
+        plan.partition()
+            .leaves()
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
+        plan.costs().iter().sum::<usize>(),
+        room.join(" · ")
+    );
+    (n, leaves)
+}
+
+/// ★ The word format's leaf census (laptop instrument, `--exact`; ✗ a model,
+/// [`census_mix`]): the median and the large block's plans under the split
+/// format (the control) and the word format, at the default leaf scale (every
+/// leaf doubled, one top over at most three), each leaf emitted and held
+/// under its heights. Prints, per plan, the groups, the leaves, and how many
+/// of its groups a doubled leaf holds by each chip: the number that says
+/// whether the box's word-format group counts (29 at the median, 57–59 at
+/// the large, under a BLAKE3 base) take 2 and 3 leaves or 2 and 4.
+#[test]
+#[ignore = "laptop instrument: run alone with --exact"]
+fn words_leaf_census() {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let opts = super::super::proof::block_base_options();
+    let elf_pages = crate::tables::trace_builder::Traces::page_configs_from_elf(
+        &executor::elf::Elf::load(elf).expect("the ELF"),
+    )
+    .len();
+    for large in [false, true] {
+        let mix = census_mix(large);
+        for memory in [MemoryFormat::Split, MemoryFormat::Words] {
+            let format = p1_format(memory, LeafScale::DoubledOneTop);
+            let tables = census_tables(&mix, memory);
+            let refs: Vec<(&str, &[(usize, usize)])> = tables
+                .iter()
+                .map(|(f, runs)| (*f, runs.as_slice()))
+                .collect();
+            let owned = mix_statement(elf, &opts, &format, &refs, mix.pages - elf_pages, 0);
+            let plan = WhirBlockPlan::derive(elf, &opts, &format, owned.view(), None)
+                .expect("the plan derives");
+            let label = format!("{} {memory:?}", if large { "large" } else { "median" });
+            census_line(&label, &plan);
+            let bound = plan.leaf_bound().expect("bounded");
+            for k in 0..plan.partition().num_leaves() {
+                let rows = super::super::whir_chain::ChipRows::of(
+                    &plan.leaf_program(k).expect("the leaf emits"),
+                );
+                assert!(rows.under(bound.heights), "{label} leaf {k}: {rows:?}");
+            }
+        }
+    }
+}
+
+/// ★ The census over a REAL base proof (instrument, `--exact`): the plan of
+/// the base proof in `CENSUS_BASE_FILE` (a `prove-block-base -o` file) over
+/// the ELF in `CENSUS_ELF`, under `CENSUS_MEMORY` (`split` or `words`,
+/// default `words`) and the Poseidon1 base, at the default leaf scale; every
+/// leaf emitted and held under its heights. The box runs it on the median
+/// and the large block's word-format base proofs.
+#[test]
+#[ignore = "instrument: CENSUS_BASE_FILE and CENSUS_ELF, run alone with --exact"]
+fn words_leaf_census_of_a_base_file() {
+    let path = std::env::var("CENSUS_BASE_FILE").expect("CENSUS_BASE_FILE");
+    let elf = std::fs::read(std::env::var("CENSUS_ELF").expect("CENSUS_ELF")).expect("the ELF");
+    let memory = match std::env::var("CENSUS_MEMORY").as_deref() {
+        Ok("split") => MemoryFormat::Split,
+        Ok("fused") => MemoryFormat::Fused,
+        _ => MemoryFormat::Words,
+    };
+    let bytes = std::fs::read(&path).expect("the base proof");
+    let proof: crate::block_whir::BlockWhirProof =
+        rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).expect("a base proof");
+    let opts = super::super::proof::block_base_options();
+    let format = p1_format(memory, LeafScale::DoubledOneTop);
+    let plan = WhirBlockPlan::derive(&elf, &opts, &format, proof.statement(), None)
+        .expect("the plan derives");
+    let (groups, leaves) = census_line(&format!("{path} {memory:?}"), &plan);
+    let bound = plan.leaf_bound().expect("bounded");
+    for k in 0..leaves {
+        let rows =
+            super::super::whir_chain::ChipRows::of(&plan.leaf_program(k).expect("the leaf emits"));
+        println!("WORDS CENSUS LEAF {k}: {rows:?}");
+        assert!(rows.under(bound.heights), "leaf {k}: {rows:?}");
+    }
+    println!(
+        "WORDS CENSUS LEVELS: {:?} · {groups} groups",
+        plan.levels()
+            .into_iter()
+            .map(|l| l.arities)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// ★ R9: one statement's bytes under the three memory formats are three:
+/// the split format absorbs no format word, the fused one `MEMFUSED` and its
+/// two counts, the word one `MEMWORDS` and its seven, so the three give other
+/// challenges and other block identities (the id is a digest of the bytes).
+/// The bytes are the frame's own function, as the plan calls it.
+#[test]
+fn the_three_memory_formats_give_three_statements() {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let opts = super::super::proof::block_base_options();
+    let words = p1_format(MemoryFormat::Words, LeafScale::DoubledOneTop);
+    let owned = mix_statement(elf, &opts, &words, SMALL_WORDS, 2, 1);
+    let plan = small_words_plan(&words).expect("the word plan derives");
+    let tag = crate::block_whir::block_statement_tag(&words.zf.base);
+    let digest = crate::statement::elf_digest(elf);
+    let bytes = |memory: MemoryFormat| {
+        crate::block_whir::block_statement_bytes(
+            owned.view(),
+            &tag,
+            &digest,
+            &plan.frame.config,
+            memory,
+        )
+    };
+    let all = [
+        bytes(MemoryFormat::Split),
+        bytes(MemoryFormat::Fused),
+        bytes(MemoryFormat::Words),
+    ];
+    assert_ne!(all[0], all[1]);
+    assert_ne!(all[0], all[2]);
+    assert_ne!(all[1], all[2]);
+    assert_eq!(
+        crate::statement::elf_digest(&all[2]),
+        *plan.id(),
+        "the word plan's id is the digest of the word statement's bytes"
+    );
+    // The seven counts are in the bytes: each one moved moves them.
+    for family in 0..7 {
+        let mut moved = owned.clone();
+        moved.word_memory[family] += 1;
+        assert_ne!(
+            crate::block_whir::block_statement_bytes(
+                moved.view(),
+                &tag,
+                &digest,
+                &plan.frame.config,
+                MemoryFormat::Words,
+            ),
+            all[2],
+            "word count {family}"
+        );
+    }
+}
+
+// =============================================================================
+// The leaves over real word-format base proofs (box tier)
+// =============================================================================
+
+use crate::block_whir::{BlockWhirProof, Deviations, verify_block_whir};
+use crate::tables::MaxRowsConfig;
+use crate::test_utils::asm_elf_bytes;
+
+use super::super::word::{LfmWord, word_as_ext};
+use super::{LeafChecks, block_leaf_arena, id_words, leaf_program_with, out_halves};
+
+/// The word format the box-tier tests prove and plan under: the Poseidon1
+/// base (the tree's), the default leaf scale.
+fn words_format() -> BlockFormat {
+    p1_format(MemoryFormat::Words, LeafScale::DoubledOneTop)
+}
+
+fn test_opts() -> ProofOptions {
+    ProofOptions::default_test_options()
+}
+
+/// `elf` given `private` input, proved as a streamed block under `format`
+/// and verified by the host.
+fn prove_words(elf: &[u8], private: &[u8], format: &BlockFormat) -> BlockWhirProof {
+    let options = crate::tests::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
+    let (proof, _) = crate::block_whir::prove_block_whir_with(
+        elf,
+        private,
+        &test_opts(),
+        format,
+        &options,
+        &Deviations::default(),
+    )
+    .expect("the word block proves");
+    assert!(
+        verify_block_whir(&proof, elf, &test_opts(), format).expect("verify runs"),
+        "the host verifier accepts the word block"
+    );
+    proof
+}
+
+fn plan_over(elf: &[u8], proof: &BlockWhirProof, format: &BlockFormat) -> WhirBlockPlan {
+    WhirBlockPlan::derive(elf, &test_opts(), format, proof.statement(), None)
+        .expect("the plan derives")
+}
+
+/// Leaf `k` executed over the proof's arena: its published words, or why
+/// not.
+fn run_leaf(
+    plan: &WhirBlockPlan,
+    proof: &BlockWhirProof,
+    k: usize,
+    checks: LeafChecks,
+) -> Result<Vec<LfmWord>, String> {
+    let program = leaf_program_with(plan, k, checks)?;
+    let arenas = block_leaf_arena(plan, proof, k)?;
+    execute(
+        &program,
+        &arenas,
+        &program.hasher(<crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::SOCKET),
+    )
+    .map(|e| e.public_words.iter().map(|(_, w)| *w).collect())
+    .map_err(|e| format!("{e:?}"))
+}
+
+/// Every leaf over `proof`, or the first that does not execute.
+fn run_leaves(
+    plan: &WhirBlockPlan,
+    proof: &BlockWhirProof,
+    checks: LeafChecks,
+) -> Result<Vec<Vec<LfmWord>>, String> {
+    (0..plan.partition().num_leaves())
+        .map(|k| run_leaf(plan, proof, k, checks).map_err(|e| format!("leaf {k}: {e}")))
+        .collect()
+}
+
+/// The leaves' bus shares, summed: zero exactly when the bus closes.
+fn share_sum(plan: &WhirBlockPlan, words: &[Vec<LfmWord>]) -> FEE {
+    let layout = plan.child_layout();
+    words
+        .iter()
+        .map(|w| word_as_ext(&w[layout.sum()]).expect("an extension word"))
+        .fold(FEE::zero(), |a, b| a + b)
+}
+
+/// What every leaf publishes is the block's: the plan's id, one state, the
+/// public output; and the shares cancel.
+fn assert_leaves_claim_the_block(
+    name: &str,
+    plan: &WhirBlockPlan,
+    proof: &BlockWhirProof,
+    words: &[Vec<LfmWord>],
+) {
+    let layout = plan.child_layout();
+    let id = id_words(plan.id());
+    let out: Vec<LfmWord> = out_halves(&proof.public_output)
+        .into_iter()
+        .map(super::super::word::base_word)
+        .collect();
+    for w in words {
+        assert_eq!(w.len(), layout.total(), "{name}");
+        assert_eq!([w[layout.id(0)], w[layout.id(1)]], id, "{name}: the id");
+        assert_eq!(
+            w[layout.state(0)],
+            words[0][layout.state(0)],
+            "{name}: one state"
+        );
+        for (i, half) in out.iter().enumerate() {
+            assert_eq!(w[layout.out_half(i)], *half, "{name}: the output");
+        }
+    }
+    assert_eq!(
+        share_sum(plan, words),
+        FEE::zero(),
+        "{name}: the shares cancel"
+    );
+}
+
+/// ★ Every leaf of a word-format block executes over its base proof and the
+/// leaves close the bus: a chip-free run (every CPU word family), the same
+/// with private input (a private-input PAGE_W page), runs that call COPY
+/// (COPY_W and MEMW_W), keccak256 (KECCAK_W) and ECREC (ECREC_W), and a run
+/// with no load or store. Each plan's pages are PAGE_W tables.
+#[test]
+#[ignore = "proves small word-format blocks and executes their leaves; box tier"]
+fn word_block_leaves_execute_and_close_the_bus() {
+    let format = words_format();
+    let private: Vec<u8> = (0..300u32).map(|i| (i * 7 + 3) as u8).collect();
+    let runs: [(&str, &str, &[u8]); 6] = [
+        ("chip-free", "fused_mem_cases", &[]),
+        ("private input", "fused_mem_cases", &private),
+        ("COPY", "test_copy_ecalls", &[]),
+        ("keccak256", "test_keccak256", &[]),
+        ("ECREC", "test_ecrec", &[]),
+        ("no memory", "all_instructions_64", &[]),
+    ];
+    for (name, program, input) in runs {
+        let elf = asm_elf_bytes(program);
+        let proof = prove_words(&elf, input, &format);
+        let plan = plan_over(&elf, &proof, &format);
+        assert!(
+            plan.frame
+                .airs
+                .air_refs()
+                .iter()
+                .filter(|a| a.name().starts_with(crate::tables::page_w::NAME_PREFIX))
+                .count()
+                == plan.frame.page_configs.len(),
+            "{name}: every page a PAGE_W table"
+        );
+        assert_eq!(
+            plan.frame.page_configs.iter().any(|c| c.is_private_input),
+            !input.is_empty(),
+            "{name}"
+        );
+        let words = run_leaves(&plan, &proof, LeafChecks::ALL)
+            .unwrap_or_else(|e| panic!("{name}: an honest leaf executes: {e}"));
+        assert_leaves_claim_the_block(name, &plan, &proof, &words);
+        println!(
+            "WORD BLOCK LEAVES {name}: {} groups · {} leaves · word tables {:?} · {} prepared",
+            plan.num_groups(),
+            plan.partition().num_leaves(),
+            proof.word_memory,
+            plan.prepared().len()
+        );
+    }
+}
+
+/// `elf`'s run given `private`, built by the windowed builder under `format`
+/// (windows of 1000 cycles, the small chunks), REGISTER's files the
+/// verifier's: the traces a forger edits.
+fn word_build(
+    elf: &[u8],
+    format: &BlockFormat,
+    private: &[u8],
+) -> crate::tables::trace_builder::Traces {
+    use crate::tables::trace_builder::WindowedTraceBuilder;
+    use crate::tables::trace_builder::in_row_forgery_tests::with_verifier_files;
+    let program = executor::elf::Elf::load(elf).expect("the ELF loads");
+    let logs = executor::vm::execution::Executor::new(&program, private.to_vec())
+        .expect("the executor")
+        .run()
+        .expect("the run")
+        .logs;
+    let mut builder = WindowedTraceBuilder::new(&program, private, &MaxRowsConfig::small())
+        .and_then(|b| b.register_format(format.registers))
+        .and_then(|b| b.memw_aligned_order(format.memw_aligned))
+        .map(|b| b.keccak_rnd_form(format.keccak_rnd))
+        .and_then(|b| b.memory_format(format.memory))
+        .expect("the builder");
+    let window = 1000;
+    let body = logs.len() - 1;
+    let cut = body - body % window;
+    let mut chunks = Vec::new();
+    for w in logs[..cut].chunks(window) {
+        chunks.extend(builder.push(w).expect("a window"));
+    }
+    let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+    traces
+        .insert_streamed(chunks)
+        .expect("every chunk has a placeholder");
+    with_verifier_files(&program, &mut traces);
+    traces
+}
+
+/// `traces` proved by a prover that skips its own check of the preprocessed
+/// columns: a forger's, so the verifier answers for them.
+fn prove_forged(
+    elf: &[u8],
+    traces: &mut crate::tables::trace_builder::Traces,
+    format: &BlockFormat,
+) -> BlockWhirProof {
+    let program = executor::elf::Elf::load(elf).expect("the ELF loads");
+    let options = crate::tests::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
+    let mut stamps = crate::block_whir::BlockStamps::default();
+    crate::block_whir::prove_traces(
+        &program,
+        elf,
+        traces,
+        &test_opts(),
+        format,
+        &options,
+        &Deviations {
+            unchecked_preprocessed: true,
+            ..Deviations::default()
+        },
+        true,
+        &|_, _| {},
+        &mut stamps,
+    )
+    .expect("the forger proves")
+}
+
+/// The last row of PAGE_W table `page` no access touched (final timestamp 0).
+fn untouched(traces: &crate::tables::trace_builder::Traces, page: usize) -> usize {
+    use crate::tables::page_w::cols as pw;
+    let t = &traces.pages[page];
+    (1..t.num_rows() - 1)
+        .rev()
+        .find(|&r| t.get_main(r, pw::TIMESTAMP).canonical_u64() == 0)
+        .expect("an untouched word")
+}
+
+/// One edit of a PAGE_W row no access touched, whose first and last tokens
+/// are one token the row makes and takes, so every bus still balances:
+/// `"offset"` one more (the next word's key), `"init"` its initial word one
+/// more (and its final with it), `"half"` its initial low half `2^16` more
+/// (a private half past 16 bits; its final with it).
+fn edit_page(
+    traces: &mut crate::tables::trace_builder::Traces,
+    page: usize,
+    row: usize,
+    edit: &str,
+) {
+    use crate::tables::page_w::cols as pw;
+    let t = &mut traces.pages[page];
+    let mut bump = |col: usize, by: u64| {
+        let v = *t.get_main(row, col);
+        t.main_table.set(row, col, v + FE::from(by));
+    };
+    match edit {
+        "offset" => bump(pw::OFFSET, 1),
+        "init" => {
+            bump(pw::INIT[0], 1);
+            bump(pw::FINI_LO, 1);
+        }
+        _ => {
+            bump(pw::INIT[0], 1 << 16);
+            bump(pw::FINI_LO, 1 << 16);
+        }
+    }
+}
+
+/// The edited block's proof, refused by the host verifier.
+fn forged_page(
+    elf: &[u8],
+    format: &BlockFormat,
+    private: &[u8],
+    page: usize,
+    edit: &str,
+) -> BlockWhirProof {
+    let mut forged = word_build(elf, format, private);
+    let row = untouched(&forged, page);
+    edit_page(&mut forged, page, row, edit);
+    let proof = prove_forged(elf, &mut forged, format);
+    assert!(
+        !matches!(
+            verify_block_whir(&proof, elf, &test_opts(), format),
+            Ok(true)
+        ),
+        "page {page} {edit}: the host verifier refuses it"
+    );
+    proof
+}
+
+/// Runs `f` with each of `faults` on.
+fn under<R>(faults: &[Fault], f: impl FnOnce() -> R) -> R {
+    match faults.split_first() {
+        None => f(),
+        Some((&first, rest)) => route_faults::with(first, || under(rest, f)),
+    }
+}
+
+/// ★ R4 on real proofs: a word block whose zero page or ELF page has one
+/// untouched row's OFFSET moved (a key minted twice) or initial word changed,
+/// or whose private-input page has one untouched row's OFFSET moved, proved
+/// by a forger (the host verifier refuses each): a leaf refuses it. The
+/// controls, each taking out one check:
+/// - the page leg off (the route checks nothing, the count check off): every
+///   leaf executes and the shares cancel, so the page leg is what refuses;
+/// - an ELF or zero page on a private page's route (OFFSET alone, the count
+///   check off): an initial word changed executes, so the count check is
+///   what keeps the halves checked.
+///
+/// A private row's initial half past 16 bits is the bus's: every leaf
+/// executes and the shares do not cancel.
+#[test]
+#[ignore = "proves forged word-format blocks and executes their leaves; box tier"]
+fn a_word_block_leaf_refuses_forged_page_columns() {
+    let format = words_format();
+    let elf = asm_elf_bytes("fused_mem_cases");
+    let honest = word_build(&elf, &format, &[]);
+    let zero = honest
+        .page_configs
+        .iter()
+        .position(|c| !c.is_private_input && c.init_values.is_none())
+        .expect("a zero page");
+    let elf_page = honest
+        .page_configs
+        .iter()
+        .position(|c| !c.is_private_input && c.init_values.is_some())
+        .expect("an ELF page");
+    let mut wrong = Vec::new();
+    for (page, kind) in [(zero, "zero"), (elf_page, "ELF")] {
+        for edit in ["offset", "init"] {
+            let proof = forged_page(&elf, &format, &[], page, edit);
+            let plan = plan_over(&elf, &proof, &format);
+            let all = run_leaves(&plan, &proof, LeafChecks::ALL);
+            let off = under(&[Fault::NoPageLeg, Fault::NoCountCheck], || {
+                run_leaves(&plan, &proof, LeafChecks::ALL)
+            });
+            let closes = off
+                .as_ref()
+                .is_ok_and(|w| share_sum(&plan, w) == FEE::zero());
+            if all.is_ok() || !closes {
+                wrong.push(format!(
+                    "{kind} {edit}: every check {:?} · page leg off {:?}",
+                    all.err(),
+                    off.map(|w| share_sum(&plan, &w))
+                ));
+            }
+            if edit == "init" {
+                let swapped = under(&[Fault::PrivateRouteSwapped, Fault::NoCountCheck], || {
+                    run_leaves(&plan, &proof, LeafChecks::ALL)
+                });
+                if swapped.is_err() {
+                    wrong.push(format!(
+                        "{kind} init on the private route: {:?}",
+                        swapped.err()
+                    ));
+                }
+            }
+        }
+    }
+    let private: Vec<u8> = (0..300u32).map(|i| (i * 7 + 3) as u8).collect();
+    let page = word_build(&elf, &format, &private)
+        .page_configs
+        .iter()
+        .position(|c| c.is_private_input)
+        .expect("a private page");
+    let proof = forged_page(&elf, &format, &private, page, "offset");
+    let plan = plan_over(&elf, &proof, &format);
+    if run_leaves(&plan, &proof, LeafChecks::ALL).is_ok() {
+        wrong.push("private offset: every leaf executes".to_string());
+    }
+    let off = under(&[Fault::NoPageLeg, Fault::NoCountCheck], || {
+        run_leaves(&plan, &proof, LeafChecks::ALL)
+    });
+    if !off
+        .as_ref()
+        .is_ok_and(|w| share_sum(&plan, w) == FEE::zero())
+    {
+        wrong.push(format!("private offset, page leg off: {:?}", off.err()));
+    }
+    let proof = forged_page(&elf, &format, &private, page, "half");
+    let plan = plan_over(&elf, &proof, &format);
+    match run_leaves(&plan, &proof, LeafChecks::ALL) {
+        Ok(w) if share_sum(&plan, &w) != FEE::zero() => {}
+        other => wrong.push(format!(
+            "private half: every leaf executes, the shares do not cancel: {:?}",
+            other.map(|w| share_sum(&plan, &w))
+        )),
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// ★ R8 on real proofs: with every page that has initial data on the
+/// prepared opening on both sides (on this thread), a word block's plan
+/// settles a PAGE_W table's five columns by the opening and every leaf
+/// executes; an ELF page's initial word changed on an untouched row is
+/// refused by a leaf, and executes with the prepared openings left out (the
+/// control), so the opening is what refuses it.
+#[test]
+#[ignore = "proves word-format blocks over the prepared opening; box tier"]
+fn a_word_block_leaf_holds_its_prepared_pages() {
+    let format = words_format();
+    let elf = asm_elf_bytes("fused_mem_cases");
+    crate::block_whir::DENSE_PAGES_FORCED.with(|c| c.set(true));
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut honest = word_build(&elf, &format, &[]);
+        let proof = prove_forged(&elf, &mut honest, &format);
+        assert!(matches!(
+            verify_block_whir(&proof, &elf, &test_opts(), &format),
+            Ok(true)
+        ));
+        let plan = plan_over(&elf, &proof, &format);
+        let settled: Vec<usize> = plan
+            .prepared()
+            .iter()
+            .flat_map(|p| p.tables.iter().map(|&(_, _, n)| n))
+            .collect();
+        assert!(
+            settled.contains(&crate::tables::page_w::NUM_PREPROCESSED_COLS),
+            "{settled:?}"
+        );
+        let words = run_leaves(&plan, &proof, LeafChecks::ALL).expect("the honest leaves");
+        assert_leaves_claim_the_block("prepared pages", &plan, &proof, &words);
+        let page = honest
+            .page_configs
+            .iter()
+            .position(|c| !c.is_private_input && c.init_values.is_some())
+            .expect("an ELF page");
+        let proof = forged_page(&elf, &format, &[], page, "init");
+        let plan = plan_over(&elf, &proof, &format);
+        assert!(
+            run_leaves(&plan, &proof, LeafChecks::ALL).is_err(),
+            "the opening refuses the edited page"
+        );
+        let skip = LeafChecks {
+            prepared: false,
+            ..LeafChecks::ALL
+        };
+        assert!(
+            run_leaves(&plan, &proof, skip).is_ok(),
+            "with the openings left out it executes"
+        );
+    }));
+    crate::block_whir::DENSE_PAGES_FORCED.with(|c| c.set(false));
+    if let Err(panic) = checked {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// ★ R7: a word block's leaf front draws the host's challenges: the leaf
+/// replays the statement the host verifier absorbs (the word format's word
+/// and its seven counts after the table counts) and draws the host's `z`,
+/// `α`, `β`, the fork's first draw and a group's point.
+#[test]
+#[ignore = "executes a word block's leaf front; box tier"]
+fn the_word_block_front_draws_the_hosts_challenges() {
+    let format = words_format();
+    let elf = asm_elf_bytes("fused_mem_cases");
+    let proof = prove_words(&elf, &[], &format);
+    assert!(proof.word_memory.iter().any(|&n| n > 0));
+    super::super::whir_block_tests::front_draws_the_hosts_challenges(&elf, &proof, &format);
+}
+
+/// ★ R2: a word count moved from one family to another (the total kept, so
+/// the statement still states one height a table) is refused: its plan
+/// refuses, or derives another block's identity and no leaf of it executes
+/// over the proof.
+#[test]
+#[ignore = "proves a word-format block and executes its leaves; box tier"]
+fn a_moved_word_count_is_another_block() {
+    let format = words_format();
+    let elf = asm_elf_bytes("fused_mem_cases");
+    let proof = prove_words(&elf, &[], &format);
+    let honest = plan_over(&elf, &proof, &format);
+    let (from, to) = (0usize, 1usize);
+    assert!(proof.word_memory[from] > 0, "{:?}", proof.word_memory);
+    let mut moved = proof.clone();
+    moved.word_memory[from] -= 1;
+    moved.word_memory[to] += 1;
+    match WhirBlockPlan::derive(&elf, &test_opts(), &format, moved.statement(), None) {
+        Err(e) => println!("MOVED WORD COUNT: the plan refuses: {e}"),
+        Ok(plan) => {
+            assert_ne!(plan.id(), honest.id(), "another statement, another id");
+            assert!(
+                (0..plan.partition().num_leaves()).all(|k| run_leaf(
+                    &plan,
+                    &moved,
+                    k,
+                    LeafChecks::ALL
+                )
+                .is_err()),
+                "no leaf of the moved statement executes"
+            );
+        }
     }
 }
