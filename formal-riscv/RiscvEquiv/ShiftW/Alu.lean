@@ -21,71 +21,59 @@ open LambdaVM
 /-- An ALU message with the flags of `SLLW` whose first operand is the zero-extended low word
 of `a` carries, in `outLo`, Sail's 32-bit `SLLW` result. -/
 theorem sllw_alu_matches_sail (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
     (hflags : m.flags.val = opselSHIFT + 1)
     (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = a.toNat % 2^32)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
     m.outLo.val = (sllwPure a b).toNat := by
   rw [sllwPure_toNat]
-  exact shift_word_alu_low m hg h1 h2 h3 h4 0 0 (by norm_num) (by norm_num)
+  exact shift_word_alu_low m hg 0 0 (by norm_num) (by norm_num)
     (by simpa using hflags) _ b ha hb
 
 /-- An ALU message with the flags of `SRLW` whose first operand is the zero-extended low word
 of `a` carries, in `outLo`, Sail's 32-bit `SRLW` result. -/
 theorem srlw_alu_matches_sail (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
     (hflags : m.flags.val = opselSHIFT + 1 + 64)
     (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = a.toNat % 2^32)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
     m.outLo.val = (srlwPure a b).toNat := by
   rw [srlwPure_toNat]
-  exact shift_word_alu_low m hg h1 h2 h3 h4 0 1 (by norm_num) (by norm_num)
+  exact shift_word_alu_low m hg 0 1 (by norm_num) (by norm_num)
     (by simpa using hflags) _ b ha hb
 
 /-- An ALU message with the flags of `SRAW` whose first operand is the sign-extended low word
 of `a` carries, in `outLo`, Sail's 32-bit `SRAW` result. -/
 theorem sraw_alu_matches_sail (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
     (hflags : m.flags.val = opselSHIFT + 1 + 32 + 64)
     (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = ((a.setWidth 32).signExtend 64).toNat)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
     m.outLo.val = (srawPure a b).toNat := by
   rw [srawPure_toNat]
-  exact shift_word_alu_low m hg h1 h2 h3 h4 1 1 (by norm_num) (by norm_num)
+  exact shift_word_alu_low m hg 1 1 (by norm_num) (by norm_num)
     (by simpa using hflags) _ b ha hb
 
 /-- `SLLIW`: `SLLW` with the immediate `shamt` as the second operand. -/
 theorem slliw_alu_matches_sail (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
     (hflags : m.flags.val = opselSHIFT + 1)
     (a : BitVec 64) (shamt : BitVec 5) (ha : dword m.in1Lo m.in1Hi = a.toNat % 2^32)
     (hb : dword m.in2Lo m.in2Hi = shamt.toNat) :
     m.outLo.val = (sllwPure a (shamt.setWidth 64)).toNat :=
-  sllw_alu_matches_sail m hg h1 h2 h3 h4 hflags a _ ha (by simpa using hb)
+  sllw_alu_matches_sail m hg hflags a _ ha (by simpa using hb)
 
 /-- `SRLIW`: `SRLW` with the immediate `shamt` as the second operand. -/
 theorem srliw_alu_matches_sail (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
     (hflags : m.flags.val = opselSHIFT + 1 + 64)
     (a : BitVec 64) (shamt : BitVec 5) (ha : dword m.in1Lo m.in1Hi = a.toNat % 2^32)
     (hb : dword m.in2Lo m.in2Hi = shamt.toNat) :
     m.outLo.val = (srlwPure a (shamt.setWidth 64)).toNat :=
-  srlw_alu_matches_sail m hg h1 h2 h3 h4 hflags a _ ha (by simpa using hb)
+  srlw_alu_matches_sail m hg hflags a _ ha (by simpa using hb)
 
 /-- `SRAIW`: `SRAW` with the immediate `shamt` as the second operand. -/
 theorem sraiw_alu_matches_sail (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
     (hflags : m.flags.val = opselSHIFT + 1 + 32 + 64)
     (a : BitVec 64) (shamt : BitVec 5)
     (ha : dword m.in1Lo m.in1Hi = ((a.setWidth 32).signExtend 64).toNat)
     (hb : dword m.in2Lo m.in2Hi = shamt.toNat) :
     m.outLo.val = (srawPure a (shamt.setWidth 64)).toNat :=
-  sraw_alu_matches_sail m hg h1 h2 h3 h4 hflags a _ ha (by simpa using hb)
+  sraw_alu_matches_sail m hg hflags a _ ha (by simpa using hb)
 
 end RiscvEquiv

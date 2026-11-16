@@ -2,9 +2,10 @@
 
 Proves, instruction by instruction, that what the AIR's Clean model (`../formal`, PR #1027)
 computes is what the official RISC-V spec says. The spec is the Sail model
-([sail-riscv](https://github.com/riscv/sail-riscv)), translated to Lean by Sail's Lean
-backend and published as
-[`opencompl/sail-riscv-lean`](https://github.com/opencompl/sail-riscv-lean).
+([riscv/sail-riscv](https://github.com/riscv/sail-riscv)), translated to Lean by the Lean
+backend of the Sail compiler ([rems-project/sail](https://github.com/rems-project/sail)). The
+translation lives in `../sail-riscv-lean`, generated from the commits pinned in its `PINS`; CI
+checks that it is exactly what the Sail compiler outputs for them.
 The approach follows [zisk-fv](https://github.com/eth-act/zisk-fv) (`ZiskFv/SailSpec/`).
 
 ## Build
@@ -18,8 +19,10 @@ lake build
 The first build compiles Clean, the Clean model and the Sail model (the largest Sail module,
 `InstsEnd`, takes minutes).
 
-`../formal` is a path dependency, but this project has its own `lake-manifest.json`: when
-`formal/` updates Mathlib or Clean, run `lake update` here too so both use the same versions.
+`../formal` and `../sail-riscv-lean` are path dependencies, but this project has its own
+`lake-manifest.json`: when `formal/` updates Mathlib or Clean, run `lake update` here too so both
+use the same versions. `lean-toolchain` must match `formal/lean-toolchain`; `lake update` may set
+it to the Sail model's version, so check it afterwards.
 This folder is not built by CI (`.github/workflows/formal.yml` only covers `formal/**`).
 
 ## Structure
@@ -47,7 +50,12 @@ In one line: Sail = `*Pure`, `*Pure` = Clean function, Clean function = what arr
 
 `AluBus.lean` is shared: one lemma per clause of `Alu.Guarantees` (SHIFT, SHIFT with
 `word = 1`, LT, EQ) that reads a message's result as a natural. Each `Alu.lean` instantiates
-one of them at its flags, so it is one line per instruction.
+one of them at its flags, so it is one line per instruction. Each clause takes only the range
+hypotheses its chip's spec assumes: none for SHIFT, the low words for LT, all four for EQ.
+
+`FreeM.lean` is shared by the `Sail.lean` files: the Sail model runs in a free monad, and
+`FreeM.lean` proves its monad laws, which lean-sail does not provide, so the proofs can
+flatten Sail's nested `do` blocks.
 
 The immediate versions have no `Bridge.lean`: they are the register version with the
 immediate as the second operand, so they reuse its bridge and its `Alu` theorem.

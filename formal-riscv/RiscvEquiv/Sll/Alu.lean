@@ -16,20 +16,18 @@ namespace RiscvEquiv
 open LambdaVM
 
 /-- An ALU message with the flags of `SLL` (`opsel = SHIFT`, `word = 0`, `signed = 0`,
-`direction = 0`) and range-checked operands carries Sail's `SLL` result.
+`direction = 0`) carries Sail's `SLL` result.
 
 This theorem proves that, in the Clean model, an ALU message (`Alu.Msg`) with the flags of
-`SLL` that satisfies `Alu.Guarantees` and the range checks has `sllPure` as its result (which
+`SLL` that satisfies `Alu.Guarantees` has `sllPure` as its result (which
 `execute_SLL` proves equal to Sail's `SLL`). -/
 theorem sll_alu_matches_sail (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
     (hflags : m.flags.val = opselSHIFT)
     (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = a.toNat)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
     dword m.outLo m.outHi = (sllPure a b).toNat := by
   rw [sllPure_toNat]
-  exact shift_alu m hg h1 h2 h3 h4 0 0 (by norm_num) (by norm_num) (by simpa using hflags)
+  exact shift_alu m hg 0 0 (by norm_num) (by norm_num) (by simpa using hflags)
     _ b ha hb
 
 end RiscvEquiv

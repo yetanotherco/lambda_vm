@@ -37,10 +37,8 @@ lemma shiftResult_word_amt (s d x s₁ s₂ : ℕ) (h : s₁ % 32 = s₂ % 32) :
 
 /-- A SHIFT message with `word = 0` and flags `signed = s`, `direction = d` carries
 `shiftResult` of its operands. SHIFT reads only the low byte of the shift amount; mod 64 it is
-the low bits of `b`. -/
+the low bits of `b`. No range hypotheses: SHIFT range-checks its operands itself. -/
 lemma shift_alu (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
     (s d : ℕ) (hs : s < 2) (hd : d < 2) (hflags : m.flags.val = opselSHIFT + 32 * s + 64 * d)
     (x : ℕ) (b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = x)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
@@ -54,10 +52,8 @@ lemma shift_alu (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
 
 /-- A SHIFT message with `word = 1` and flags `signed = s`, `direction = d` carries, in `outLo`,
 the low word of `shiftResult` of its operands. Mod 32 the low byte of the shift amount is the
-low bits of `b`. -/
+low bits of `b`. No range hypotheses, as in `shift_alu`. -/
 lemma shift_word_alu_low (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
     (s d : ℕ) (hs : s < 2) (hd : d < 2) (hflags : m.flags.val = opselSHIFT + 1 + 32 * s + 64 * d)
     (x : ℕ) (b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = x)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
@@ -73,10 +69,10 @@ lemma shift_word_alu_low (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
   rw [hlow, hout, ha, shiftResult_word_amt _ _ _ _ _ hamt]
 
 /-- An LT message with flags `signed = s`, `invert = i` carries `ltBit s i` of its operands.
-The result travels as `(bit, 0)`. -/
+The result travels as `(bit, 0)`. Only the low words need a range hypothesis: LT range-checks
+the high ones itself. -/
 lemma lt_alu_bit (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
+    (h1 : m.in1Lo.val < 2^32) (h3 : m.in2Lo.val < 2^32)
     (s i : ℕ) (hs : s < 2) (hi : i < 2) (hflags : m.flags.val = opselLT + 32 * s + 64 * i)
     (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = a.toNat)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
