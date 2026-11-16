@@ -222,6 +222,7 @@ pub(crate) fn median_statement(
         num_private_input_pages: 0,
         groups,
         fused_memory: [0, 0],
+        word_memory: [0; 7],
     }
 }
 

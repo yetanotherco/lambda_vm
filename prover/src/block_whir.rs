@@ -1803,10 +1803,16 @@ pub struct BlockWhirProof {
     /// order. Absorbed into the statement under
     /// [`MemoryFormat::Fused`](crate::tables::fused_memory::MemoryFormat::Fused)
     /// alone (the verifier's format, never the proof's); under the split
-    /// format the verifier refuses any but `[0, 0]` ([`fused_tables`]). The
-    /// last field, so a split proof archives as before it with this pair
-    /// after.
+    /// format the verifier refuses any but `[0, 0]` ([`fused_tables`]).
     pub fused_memory: [u64; 2],
+    /// The word memory format's tables: how many of each family
+    /// ([`WORD_TABLES`]) the block holds, after the fused tables' place in
+    /// [`VmAirs::air_refs`] order. Absorbed into the statement under
+    /// [`MemoryFormat::Words`](crate::tables::fused_memory::MemoryFormat::Words)
+    /// alone; under any other format the verifier refuses any but all zero
+    /// ([`word_counts_under`]). The last field, so a split or fused proof
+    /// archives as before it with these counts after.
+    pub word_memory: [u64; 7],
 }
 
 /// Where a block's prove spent its time, for the readout. Seconds.
@@ -3078,22 +3084,69 @@ pub(crate) const FUSED_MEMORY_WORD: u64 = u64::from_le_bytes(*b"MEMFUSED");
 /// [`FUSED_MEMORY_WORD`] names the fused one.
 pub(crate) const WORD_MEMORY_WORD: u64 = u64::from_le_bytes(*b"MEMWORDS");
 
+/// The word memory format's table families, in [`VmAirs::air_refs`] order
+/// and [`BlockWhirProof::word_memory`]'s: the CPU's loads and stores by the
+/// words they touch (one whole word, inside one word, across two), then the
+/// chips' word table.
+pub const WORD_TABLES: [&str; 7] = [
+    "MEM_LOAD8",
+    "MEM_STORE8",
+    "MEM_LOADW",
+    "MEM_STOREW",
+    "MEM_LOAD2W",
+    "MEM_STORE2W",
+    "MEMW_W",
+];
+
 /// What a block's statement absorbs right after the table counts under
 /// `memory`: nothing under the split format (the statement as it always
 /// was); under the fused format [`FUSED_MEMORY_WORD`] and the MEM_LOAD and
-/// MEM_STORE tables' counts (`fused`, [`BlockWhirProof::fused_memory`]).
+/// MEM_STORE tables' counts (`fused`, [`BlockWhirProof::fused_memory`]);
+/// under the word format [`WORD_MEMORY_WORD`] and each word family's count
+/// (`words`, [`BlockWhirProof::word_memory`]).
 pub(crate) fn fused_statement_words(
     memory: crate::tables::fused_memory::MemoryFormat,
     fused: [u64; 2],
+    words: [u64; 7],
 ) -> Vec<u64> {
     match memory {
         crate::tables::fused_memory::MemoryFormat::Split => Vec::new(),
         crate::tables::fused_memory::MemoryFormat::Fused => {
             vec![FUSED_MEMORY_WORD, fused[0], fused[1]]
         }
-        // The word memory format's form word; its tables' counts join it once
-        // the format proves (every block path refuses it until then).
-        crate::tables::fused_memory::MemoryFormat::Words => vec![WORD_MEMORY_WORD],
+        crate::tables::fused_memory::MemoryFormat::Words => {
+            std::iter::once(WORD_MEMORY_WORD).chain(words).collect()
+        }
+    }
+}
+
+/// The word tables a block states under `memory`: under the word format the
+/// counts, each family's; under any other format none, and any other count is
+/// refused (it is absorbed nowhere, so no value of it may ride in a proof).
+pub(crate) fn word_counts_under(
+    memory: crate::tables::fused_memory::MemoryFormat,
+    stated: [u64; 7],
+) -> Result<[usize; 7], Error> {
+    #[cfg(test)]
+    if memory != crate::tables::fused_memory::MemoryFormat::Words
+        && WORD_COUNTS_UNCHECKED.with(std::cell::Cell::get)
+    {
+        return Ok([0; 7]);
+    }
+    match memory {
+        crate::tables::fused_memory::MemoryFormat::Words => {
+            let mut counts = [0usize; 7];
+            for (count, &n) in counts.iter_mut().zip(&stated) {
+                *count = usize::try_from(n).map_err(|_| {
+                    Error::InvalidTableCounts(format!("{n} word tables do not fit a usize"))
+                })?;
+            }
+            Ok(counts)
+        }
+        _ if stated == [0; 7] => Ok([0; 7]),
+        other => Err(Error::InvalidTableCounts(format!(
+            "the {other:?} memory format states no word table, not {stated:?}"
+        ))),
     }
 }
 
@@ -3133,7 +3186,6 @@ pub(crate) fn fused_tables_under(
         // The word memory format retires the fused tables: none, as under the
         // split format.
         crate::tables::fused_memory::MemoryFormat::Words => {
-            crate::tables::fused_memory::refuse_unbuilt(memory)?;
             if stated == [0, 0] {
                 Ok([0, 0])
             } else {
@@ -3199,13 +3251,39 @@ pub(crate) fn check_page_w_heights<'a>(
     }
 }
 
+/// Every word table (a [`WORD_TABLES`] family's) at most
+/// [`BLOCK_WORD_MAX_VARS`] variables, by name. `tables` pairs each table's name
+/// with its stated height.
+pub(crate) fn check_word_heights<'a>(
+    tables: impl IntoIterator<Item = (&'a str, u8)>,
+) -> Result<(), Error> {
+    match tables.into_iter().find(|(name, num_vars)| {
+        name.split_once('[')
+            .is_some_and(|(family, _)| WORD_TABLES.contains(&family))
+            && usize::from(*num_vars) > BLOCK_WORD_MAX_VARS
+    }) {
+        Some((name, num_vars)) => Err(Error::InvalidTableCounts(format!(
+            "{name} states 2^{num_vars} rows — a block takes at most 2^{BLOCK_WORD_MAX_VARS}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test only: on this thread, the split format's verifier reads no fused
     /// count ([`fused_tables_under`]'s refusal taken out, a control mutant).
     pub(crate) static FUSED_COUNTS_UNCHECKED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Test only: on this thread, a split or fused verifier reads no word
+    /// count ([`word_counts_under`]'s refusal taken out, a control mutant).
+    pub(crate) static WORD_COUNTS_UNCHECKED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
+
+/// The most rows a word table may state, in variables: the block's chunk of
+/// every streamed family, as a fused table's.
+pub const BLOCK_WORD_MAX_VARS: usize = BLOCK_FUSED_MAX_VARS;
 
 /// The most rows a fused memory table may state, in variables: the block's
 /// chunk of every streamed family (`MaxRowsConfig::uniform(1 << 21)`).
@@ -3646,16 +3724,23 @@ pub(crate) fn prepared_tables(
     let first_page = first_page_index(airs)?;
     let decode = decode_table_index(&refs)?;
     let mut tables = vec![(decode, refs[decode].precomputed_columns())];
-    let plan = crate::continuation::genesis_stack_plan(
-        page_configs,
-        first_page,
-        crate::continuation::PAGE_NUM_VARS,
-    );
+    // Under the word memory format the page tables are PAGE_W's: a word a
+    // row, its preprocessed columns `OFFSET` and the initial word's halves.
+    let words = format.memory == crate::tables::fused_memory::MemoryFormat::Words;
+    let num_vars = if words {
+        crate::tables::page_w::NUM_VARS
+    } else {
+        crate::continuation::PAGE_NUM_VARS
+    };
+    let plan = crate::continuation::genesis_stack_plan(page_configs, first_page, num_vars);
     for route in plan.routes.iter().filter(|route| route.dense) {
-        tables.push((
-            route.table,
-            crate::tables::page::preprocessed_columns(&page_configs[route.table - first_page]),
-        ));
+        let config = &page_configs[route.table - first_page];
+        let columns = if words {
+            crate::tables::page_w::preprocessed_columns(config)
+        } else {
+            crate::tables::page::preprocessed_columns(config)
+        };
+        tables.push((route.table, columns));
     }
     tables.sort_by_key(|&(table, _)| table);
     Ok(tables)
@@ -4608,7 +4693,6 @@ fn prove_block_whir_inner(
 /// ([`MemwAlignedOrder::Limbs`](crate::tables::memw_aligned::MemwAlignedOrder::Limbs)).
 /// Its prover and its verifier refuse alike.
 pub(crate) fn check_memory_format(format: &BlockFormat) -> Result<(), Error> {
-    crate::tables::fused_memory::refuse_unbuilt(format.memory)?;
     match (format.memory, format.memw_aligned) {
         (
             crate::tables::fused_memory::MemoryFormat::Fused,
@@ -4635,6 +4719,8 @@ fn prove_block_whir_body(
 ) -> Result<(BlockWhirProof, BlockStamps), Error> {
     let mut stamps = BlockStamps::default();
     check_memory_format(format)?;
+    // The verifier takes the word memory format; its prover is not built yet.
+    crate::tables::fused_memory::refuse_unbuilt(format.memory)?;
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
     if let Some(window_log2) = options.window_log2 {
@@ -4835,6 +4921,9 @@ pub(crate) fn prove_traces(
     let fused = traces.fused_counts();
     let fused_memory = fused.map(|n| n as u64);
     fused_tables(format, fused_memory)?;
+    let words = traces.word_counts();
+    let word_memory = words.map(|n| n as u64);
+    word_counts_under(format.memory, word_memory)?;
     let runtime_page_ranges = traces.runtime_page_ranges();
     let num_private_input_pages = traces
         .page_configs
@@ -4860,6 +4949,9 @@ pub(crate) fn prove_traces(
         format.registers,
     );
     airs.with_fused_memory(proof_options, fused);
+    if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
+        airs.with_word_memory(proof_options, words, &traces.page_configs)?;
+    }
 
     let prepared_columns = prepared_tables(&airs, &traces.page_configs, format)?;
     let pairs = airs.air_trace_pairs(traces);
@@ -4906,7 +4998,7 @@ pub(crate) fn prove_traces(
             elf_bytes,
             &public_output,
             &table_counts,
-            &fused_statement_words(format.memory, fused_memory),
+            &fused_statement_words(format.memory, fused_memory, word_memory),
             num_private_input_pages,
             &runtime_page_ranges,
             &table_num_vars,
@@ -4969,6 +5061,7 @@ pub(crate) fn prove_traces(
                 num_private_input_pages,
                 groups: &groups,
                 fused_memory,
+                word_memory,
             },
             &prepared_roots(&prepared),
         );
@@ -5077,6 +5170,7 @@ pub(crate) fn prove_traces(
         argues: proof.1,
         commit_ood: proof.3,
         fused_memory,
+        word_memory,
     })
 }
 
@@ -5885,6 +5979,8 @@ struct RestLaid<'a> {
     table_counts: TableCounts,
     /// [`BlockWhirProof::fused_memory`].
     fused_memory: [u64; 2],
+    /// [`BlockWhirProof::word_memory`].
+    word_memory: [u64; 7],
     runtime_page_ranges: Vec<RuntimePageRange>,
     num_private_input_pages: usize,
     public_output: Vec<u8>,
@@ -5932,6 +6028,9 @@ fn lay_out_rest<'a>(
     let fused = traces.fused_counts();
     let fused_memory = fused.map(|n| n as u64);
     fused_tables(format, fused_memory)?;
+    let words = traces.word_counts();
+    let word_memory = words.map(|n| n as u64);
+    word_counts_under(format.memory, word_memory)?;
     let runtime_page_ranges = traces.runtime_page_ranges();
     let num_private_input_pages = traces
         .page_configs
@@ -5945,6 +6044,7 @@ fn lay_out_rest<'a>(
         rest_cpu_heights(&traces, cpu_rows)?,
         &public_output,
     )?;
+    let mut built = Ok(());
     let airs = run_airs.get_or_init(|| {
         let mut airs = block_airs(
             program,
@@ -5957,8 +6057,12 @@ fn lay_out_rest<'a>(
             format.registers,
         );
         airs.with_fused_memory(opts, fused);
+        if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
+            built = airs.with_word_memory(opts, words, &traces.page_configs);
+        }
         airs
     });
+    built?;
     marks.push(("airs", at()));
     let prepared = if prepared_now {
         let prepared = prepared_tables(airs, &traces.page_configs, format)?;
@@ -6103,6 +6207,7 @@ fn lay_out_rest<'a>(
     Ok(RestLaid {
         table_counts,
         fused_memory,
+        word_memory,
         runtime_page_ranges,
         num_private_input_pages,
         public_output,
@@ -6154,6 +6259,9 @@ fn lay_out_rest_streamed<'a>(
     let fused = header.fused_counts;
     let fused_memory = fused.map(|n| n as u64);
     fused_tables_under(memory, fused_memory)?;
+    let words = header.word_counts;
+    let word_memory = words.map(|n| n as u64);
+    word_counts_under(memory, word_memory)?;
     let runtime_page_ranges = header.runtime_page_ranges();
     let num_private_input_pages = header
         .page_configs
@@ -6166,6 +6274,7 @@ fn lay_out_rest_streamed<'a>(
         header.cpu_heights.clone(),
         &header.public_output_bytes,
     )?;
+    let mut built = Ok(());
     let airs = run_airs.get_or_init(|| {
         let mut airs = block_airs(
             program,
@@ -6178,8 +6287,12 @@ fn lay_out_rest_streamed<'a>(
             registers,
         );
         airs.with_fused_memory(opts, fused);
+        if memory == crate::tables::fused_memory::MemoryFormat::Words {
+            built = airs.with_word_memory(opts, words, &header.page_configs);
+        }
         airs
     });
+    built?;
     marks.push(("airs", at()));
     let refs = airs.air_refs();
     let first = if header.keccak_rnd_first {
@@ -6287,6 +6400,7 @@ fn lay_out_rest_streamed<'a>(
     Ok(RestLaid {
         table_counts,
         fused_memory,
+        word_memory,
         runtime_page_ranges,
         num_private_input_pages,
         public_output: public_output_bytes,
@@ -6331,6 +6445,8 @@ struct Laid {
     table_counts: TableCounts,
     /// [`BlockWhirProof::fused_memory`].
     fused_memory: [u64; 2],
+    /// [`BlockWhirProof::word_memory`].
+    word_memory: [u64; 7],
     runtime_page_ranges: Vec<RuntimePageRange>,
     num_private_input_pages: usize,
     public_output: Vec<u8>,
@@ -7377,6 +7493,7 @@ fn prove_streamed(
                 let RestLaid {
                     table_counts,
                     fused_memory,
+                    word_memory,
                     runtime_page_ranges,
                     num_private_input_pages,
                     public_output,
@@ -7482,6 +7599,7 @@ fn prove_streamed(
                 Ok(Laid {
                     table_counts,
                     fused_memory,
+                    word_memory,
                     runtime_page_ranges,
                     num_private_input_pages,
                     public_output,
@@ -7775,7 +7893,7 @@ fn prove_streamed(
             elf_bytes,
             &laid.public_output,
             &laid.table_counts,
-            &fused_statement_words(format.memory, laid.fused_memory),
+            &fused_statement_words(format.memory, laid.fused_memory, laid.word_memory),
             laid.num_private_input_pages,
             &laid.runtime_page_ranges,
             &table_num_vars,
@@ -7797,6 +7915,7 @@ fn prove_streamed(
                 num_private_input_pages: laid.num_private_input_pages,
                 groups: &laid.groups,
                 fused_memory: laid.fused_memory,
+                word_memory: laid.word_memory,
             },
             &prepared_roots(&prepared),
         );
@@ -8195,6 +8314,7 @@ fn prove_streamed(
             argues,
             commit_ood,
             fused_memory: laid.fused_memory,
+            word_memory: laid.word_memory,
         })
     })
 }
@@ -8217,7 +8337,7 @@ pub(crate) fn block_statement_bytes(
     for count in statement::table_count_values(statement.table_counts) {
         bytes.extend_from_slice(&count.to_le_bytes());
     }
-    for word in fused_statement_words(memory, statement.fused_memory) {
+    for word in fused_statement_words(memory, statement.fused_memory, statement.word_memory) {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
     bytes.extend_from_slice(&(statement.num_private_input_pages as u64).to_le_bytes());
@@ -8267,7 +8387,7 @@ pub(crate) fn block_statement_calls(
         elf_bytes,
         statement.public_output,
         statement.table_counts,
-        &fused_statement_words(memory, statement.fused_memory),
+        &fused_statement_words(memory, statement.fused_memory, statement.word_memory),
         statement.num_private_input_pages,
         statement.runtime_page_ranges,
         statement.table_num_vars,
@@ -8324,6 +8444,8 @@ pub struct BlockStatement<'a> {
     pub groups: &'a [Vec<u32>],
     /// [`BlockWhirProof::fused_memory`].
     pub fused_memory: [u64; 2],
+    /// [`BlockWhirProof::word_memory`].
+    pub word_memory: [u64; 7],
 }
 
 /// A [`BlockStatement`] owned: what a statement observer keeps
@@ -8337,6 +8459,7 @@ pub struct OwnedBlockStatement {
     pub num_private_input_pages: usize,
     pub groups: Vec<Vec<u32>>,
     pub fused_memory: [u64; 2],
+    pub word_memory: [u64; 7],
 }
 
 impl OwnedBlockStatement {
@@ -8349,6 +8472,7 @@ impl OwnedBlockStatement {
             num_private_input_pages: self.num_private_input_pages,
             groups: &self.groups,
             fused_memory: self.fused_memory,
+            word_memory: self.word_memory,
         }
     }
 }
@@ -8363,6 +8487,7 @@ impl BlockStatement<'_> {
             num_private_input_pages: self.num_private_input_pages,
             groups: self.groups.to_vec(),
             fused_memory: self.fused_memory,
+            word_memory: self.word_memory,
         }
     }
 }
@@ -8378,6 +8503,7 @@ impl BlockWhirProof {
             num_private_input_pages: self.num_private_input_pages,
             groups: &self.groups,
             fused_memory: self.fused_memory,
+            word_memory: self.word_memory,
         }
     }
 }
@@ -8426,12 +8552,14 @@ pub(crate) fn block_frame(
     // The fused memory tables, under the verifier's memory format: none under
     // the split format, where any stated pair is refused.
     let fused = fused_tables(format, statement.fused_memory)?;
-    // Under the word memory format, none of the tables it retires.
+    // Under the word memory format, none of the tables it retires, and its
+    // own tables' counts; under any other format no word table.
     word_tables_under(
         format.memory,
         statement.table_counts,
         statement.fused_memory,
     )?;
+    let words = word_counts_under(format.memory, statement.word_memory)?;
     let num_tables = statement.table_num_vars.len();
     let page_configs = Traces::page_configs_from_elf_and_runtime(
         &program,
@@ -8446,6 +8574,7 @@ pub(crate) fn block_frame(
         .and_then(|t| t.checked_add(page_configs.len()))
         .and_then(|t| t.checked_add(fused[0]))
         .and_then(|t| t.checked_add(fused[1]))
+        .and_then(|t| words.iter().try_fold(t, |t, &n| t.checked_add(n)))
     else {
         return Err(Error::InvalidTableCounts(
             "the table counts do not sum to a usize".to_string(),
@@ -8478,6 +8607,9 @@ pub(crate) fn block_frame(
         format.registers,
     );
     airs.with_fused_memory(proof_options, fused);
+    if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
+        airs.with_word_memory(proof_options, words, &page_configs)?;
+    }
     // The CPU heights were read at `cpu_proof_start`: the tables must be there.
     airs.check_cpu_position(statement.table_counts)?;
     let air_refs = airs.air_refs();
@@ -8501,6 +8633,13 @@ pub(crate) fn block_frame(
             air.name()
         )));
     }
+    // Every word table at most the block's chunk.
+    check_word_heights(
+        air_refs
+            .iter()
+            .zip(statement.table_num_vars)
+            .map(|(air, &num_vars)| (air.name(), num_vars)),
+    )?;
     // Every PAGE_W table at its one height (none outside the word memory format).
     check_page_w_heights(
         air_refs
@@ -8684,7 +8823,7 @@ pub(crate) fn verify_block_whir_traced(
             elf_bytes,
             &proof.public_output,
             &proof.table_counts,
-            &fused_statement_words(format.memory, proof.fused_memory),
+            &fused_statement_words(format.memory, proof.fused_memory, proof.word_memory),
             proof.num_private_input_pages,
             &proof.runtime_page_ranges,
             &proof.table_num_vars,

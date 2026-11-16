@@ -17,20 +17,21 @@ use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 
 use super::bitwise::{BitwiseHistogram, BitwiseOperation, BitwiseOperationType};
 use super::gpack::TraceForm;
-use super::mem_load2w::{self, Load2WRow, MemLoad2WConstraints, cols as l2};
-use super::mem_load8::{self, Load8Row, MemLoad8Constraints, cols as l8};
-use super::mem_loadw::{self, LoadWRow, MemLoadWConstraints, cols as lw};
-use super::mem_store2w::{self, MemStore2WConstraints, Store2WRow, cols as s2};
-use super::mem_store8::{self, MemStore8Constraints, Store8Row, cols as s8};
-use super::mem_storew::{self, MemStoreWConstraints, StoreWRow, cols as sw};
+use super::mem_load2w::{self, Load2WRow, cols as l2};
+use super::mem_load8::{self, Load8Row, cols as l8};
+use super::mem_loadw::{self, LoadWRow, cols as lw};
+use super::mem_store2w::{self, Store2WRow, cols as s2};
+use super::mem_store8::{self, Store8Row, cols as s8};
+use super::mem_storew::{self, StoreWRow, cols as sw};
 use super::page::{DEFAULT_PAGE_SIZE, PageConfig};
 use super::page_w::{self, FinalWordMap, FinalWordState, cols as pw};
 use super::types::{BusId, FE};
 use super::word_cpu::{FLAG_SIGNED, FLAG_STORE, FLAG_W2, FLAG_W4, FLAG_W8, WordClass, word_class};
 use super::word_memory::{column, halves};
 use super::word_memory_tests::{
-    Bench, ELF_BASE, Eval, INPUT_BASE, Piece, STACK_BASE, Table, Verdict, constraint_values,
-    multiplicity, page_name, page_piece, pages, table, verdict, widen,
+    Bench, ELF_BASE, Eval, INPUT_BASE, Piece, STACK_BASE, Table, Verdict, load2w_constraints,
+    load8_constraints, loadw_constraints, multiplicity, page_name, page_piece, pages,
+    store2w_constraints, store8_constraints, storew_constraints, table, verdict, widen,
 };
 
 // ---- the stand-in CPU ----
@@ -372,25 +373,6 @@ fn replay_with(honest: &Cpu, into: &mut Cpu, mut before: impl FnMut(&mut Cpu, &D
             into.load(d.address, width, d.flags & 2 == 2);
         }
     }
-}
-
-fn load8_constraints(row: &[FE]) -> Vec<FE> {
-    constraint_values(&MemLoad8Constraints, row)
-}
-fn store8_constraints(row: &[FE]) -> Vec<FE> {
-    constraint_values(&MemStore8Constraints, row)
-}
-fn loadw_constraints(row: &[FE]) -> Vec<FE> {
-    constraint_values(&MemLoadWConstraints, row)
-}
-fn storew_constraints(row: &[FE]) -> Vec<FE> {
-    constraint_values(&MemStoreWConstraints, row)
-}
-fn load2w_constraints(row: &[FE]) -> Vec<FE> {
-    constraint_values(&MemLoad2WConstraints, row)
-}
-fn store2w_constraints(row: &[FE]) -> Vec<FE> {
-    constraint_values(&MemStore2WConstraints, row)
 }
 
 /// Where the honest program's stack accesses sit: a page's last 256 bytes,

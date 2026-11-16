@@ -1022,5 +1022,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         cpu32s,
         mem_loads: Vec::new(),
         mem_stores: Vec::new(),
+        word_tables: std::array::from_fn(|_| Vec::new()),
     })
 }

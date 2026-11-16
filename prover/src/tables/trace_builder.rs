@@ -7376,6 +7376,10 @@ pub struct Traces {
     /// chunks of their max_rows); empty under the split format.
     pub mem_loads: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub mem_stores: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    /// The word memory format's tables, one list a family in
+    /// `block_whir::WORD_TABLES`' order (chunks of their max_rows); empty
+    /// under any other format.
+    pub word_tables: [Vec<TraceTable<GoldilocksField, GoldilocksExtension>>; 7],
 }
 
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
@@ -9344,37 +9348,39 @@ impl Traces {
             cpu32s,
             mem_loads,
             mem_stores,
+            word_tables,
         } = self;
-        [
-            cpus,
-            lts,
-            shifts,
-            memws,
-            memw_aligneds,
-            loads,
-            muls,
-            dvrms,
-            pages,
-            branches,
-            copies,
-            keccaks,
-            keccak_rnds,
-            ecsms,
-            ecdases,
-            hints,
-            ecrecs,
-            is_whs,
-            memw_registers,
-            eqs,
-            bytewises,
-            stores,
-            cpu32s,
-            mem_loads,
-            mem_stores,
-        ]
-        .into_iter()
-        .map(|ts| all(ts))
-        .sum::<usize>()
+        word_tables.iter().map(|ts| all(ts)).sum::<usize>()
+            + [
+                cpus,
+                lts,
+                shifts,
+                memws,
+                memw_aligneds,
+                loads,
+                muls,
+                dvrms,
+                pages,
+                branches,
+                copies,
+                keccaks,
+                keccak_rnds,
+                ecsms,
+                ecdases,
+                hints,
+                ecrecs,
+                is_whs,
+                memw_registers,
+                eqs,
+                bytewises,
+                stores,
+                cpu32s,
+                mem_loads,
+                mem_stores,
+            ]
+            .into_iter()
+            .map(|ts| all(ts))
+            .sum::<usize>()
             + [
                 bitwise,
                 decode,
@@ -9546,6 +9552,7 @@ impl Traces {
             cpu32s,
             mem_loads,
             mem_stores,
+            word_tables,
             page_configs: _,
             public_output_bytes: _,
             local_to_global: _,
@@ -9619,6 +9626,12 @@ impl Traces {
         }
         for t in mem_stores {
             total += (t.num_rows() * super::mem_store::cols::NUM_COLUMNS) as u64;
+        }
+        for (k, ts) in word_tables.iter().enumerate() {
+            let (columns, _) = super::word_cpu::word_table_shape(k);
+            for t in ts {
+                total += (t.num_rows() * columns) as u64;
+            }
         }
         for t in ecsms {
             total += (t.num_rows() * ECSM_COLS) as u64;
@@ -9719,6 +9732,7 @@ impl Traces {
             cpu32s,
             mem_loads,
             mem_stores,
+            word_tables,
             page_configs: _,
             public_output_bytes: _,
             local_to_global: _,
@@ -9791,6 +9805,12 @@ impl Traces {
         for t in mem_stores {
             total += (t.num_rows() * n_mem_store) as u64;
         }
+        for (k, ts) in word_tables.iter().enumerate() {
+            let (_, interactions) = super::word_cpu::word_table_shape(k);
+            for t in ts {
+                total += (t.num_rows() * aux_cols(interactions)) as u64;
+            }
+        }
         for t in ecsms {
             total += (t.num_rows() * n_ecsm) as u64;
         }
@@ -9849,6 +9869,13 @@ impl Traces {
     /// [`Self::table_counts`]: a block states them in a field of its own.
     pub fn fused_counts(&self) -> [usize; 2] {
         [self.mem_loads.len(), self.mem_stores.len()]
+    }
+
+    /// The word memory format's tables, family by family
+    /// (`block_whir::WORD_TABLES`; none under any other format). Counted apart
+    /// from [`Self::table_counts`], as the fused ones.
+    pub fn word_counts(&self) -> [usize; 7] {
+        self.word_tables.each_ref().map(Vec::len)
     }
 
     /// Extract page configurations from ELF only (deterministic from binary).

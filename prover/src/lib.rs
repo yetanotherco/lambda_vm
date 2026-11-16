@@ -810,6 +810,10 @@ pub(crate) struct VmAirs {
     /// in any proof but a block's.
     pub mem_loads: Vec<VmAir>,
     pub mem_stores: Vec<VmAir>,
+    /// The word memory format's tables ([`Self::with_word_memory`]), one list
+    /// a family in [`crate::block_whir::WORD_TABLES`]' order; none under any
+    /// other format, and none in any proof but a block's.
+    pub word_tables: [Vec<VmAir>; 7],
 }
 
 /// What REGISTER is preprocessed against: the commitment **and** the two public
@@ -1053,7 +1057,8 @@ impl VmAirs {
                 self.stores.len(),
                 self.cpu32s.len(),
                 self.mem_loads.len(),
-                self.mem_stores.len()
+                self.mem_stores.len(),
+                self.word_tables.iter().map(Vec::len).sum::<usize>()
             ],
             [
                 traces.cpus.len(),
@@ -1080,7 +1085,8 @@ impl VmAirs {
                 traces.stores.len(),
                 traces.cpu32s.len(),
                 traces.mem_loads.len(),
-                traces.mem_stores.len()
+                traces.mem_stores.len(),
+                traces.word_tables.iter().map(Vec::len).sum::<usize>()
             ],
             "AIR set and traces disagree on table counts",
         );
@@ -1187,6 +1193,17 @@ impl VmAirs {
         }
         for (air, trace) in self.mem_stores.iter().zip(traces.mem_stores.iter_mut()) {
             pairs.push((air.as_ref(), trace, &()));
+        }
+        // The word memory format's tables, after the fused ones' place.
+        for (airs, traces) in self.word_tables.iter().zip(traces.word_tables.iter_mut()) {
+            assert_eq!(
+                airs.len(),
+                traces.len(),
+                "a word family's tables and traces"
+            );
+            for (air, trace) in airs.iter().zip(traces.iter_mut()) {
+                pairs.push((air.as_ref(), trace, &()));
+            }
         }
         for (air, trace) in self.cpu32s.iter().zip(traces.cpu32s.iter_mut()) {
             pairs.push((air.as_ref(), trace, &()));
@@ -1325,6 +1342,9 @@ impl VmAirs {
             refs.push(air.as_ref());
         }
         for air in &self.mem_stores {
+            refs.push(air.as_ref());
+        }
+        for air in self.word_tables.iter().flatten() {
             refs.push(air.as_ref());
         }
         for air in &self.cpu32s {
@@ -1696,6 +1716,7 @@ impl VmAirs {
             cpu32s,
             mem_loads: Vec::new(),
             mem_stores: Vec::new(),
+            word_tables: std::array::from_fn(|_| Vec::new()),
         }
     }
 
@@ -1721,6 +1742,69 @@ impl VmAirs {
                 ) as VmAir
             })
             .collect();
+    }
+
+    /// This set under the word memory format
+    /// (`tables::fused_memory::MemoryFormat::Words`): each page table PAGE_W
+    /// in PAGE's place (`page_configs` are this set's pages, in order), and
+    /// `counts[k]` tables of each word family `k`
+    /// ([`crate::block_whir::WORD_TABLES`]: the CPU's six by the words an
+    /// access touches, then MEMW_W), named `<family>[i]`, after the fused
+    /// tables' place. Refuses a page PAGE_W cannot hold (a base that is not
+    /// page-aligned) or a page list that is not this set's.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn with_word_memory(
+        &mut self,
+        opts: &ProofOptions,
+        counts: [usize; 7],
+        page_configs: &[crate::tables::page::PageConfig],
+    ) -> Result<(), Error> {
+        if page_configs.len() != self.pages.len() {
+            return Err(Error::Prover(format!(
+                "{} page configs for {} page tables",
+                page_configs.len(),
+                self.pages.len()
+            )));
+        }
+        self.pages = page_configs
+            .iter()
+            .map(|config| crate::test_utils::create_page_w_air(opts, config))
+            .collect::<Result<_, _>>()
+            .map_err(Error::Prover)?;
+        let mut word_tables: [Vec<VmAir>; 7] = std::array::from_fn(|_| Vec::new());
+        for ((family, &count), tables) in crate::block_whir::WORD_TABLES
+            .iter()
+            .zip(&counts)
+            .zip(word_tables.iter_mut())
+        {
+            for i in 0..count {
+                let name = format!("{family}[{i}]");
+                let air: VmAir = match *family {
+                    "MEM_LOAD8" => {
+                        Box::new(crate::test_utils::create_mem_load8_air(opts).with_name(&name))
+                    }
+                    "MEM_STORE8" => {
+                        Box::new(crate::test_utils::create_mem_store8_air(opts).with_name(&name))
+                    }
+                    "MEM_LOADW" => {
+                        Box::new(crate::test_utils::create_mem_loadw_air(opts).with_name(&name))
+                    }
+                    "MEM_STOREW" => {
+                        Box::new(crate::test_utils::create_mem_storew_air(opts).with_name(&name))
+                    }
+                    "MEM_LOAD2W" => {
+                        Box::new(crate::test_utils::create_mem_load2w_air(opts).with_name(&name))
+                    }
+                    "MEM_STORE2W" => {
+                        Box::new(crate::test_utils::create_mem_store2w_air(opts).with_name(&name))
+                    }
+                    _ => Box::new(crate::test_utils::create_memw_w_air(opts).with_name(&name)),
+                };
+                tables.push(air);
+            }
+        }
+        self.word_tables = word_tables;
+        Ok(())
     }
 }
 

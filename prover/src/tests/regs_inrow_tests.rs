@@ -153,6 +153,7 @@ fn the_block_frame_caps_the_rows_its_residual_register_tables_state() {
                 groups: &groups,
                 // The split memory format (`in_row()`): no fused tables.
                 fused_memory: [0, 0],
+                word_memory: [0; 7],
             },
             &elf,
             &opts,
