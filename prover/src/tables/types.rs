@@ -435,6 +435,12 @@ pub enum BusId {
     /// `(0, address_lo, address_hi, timestamp, old_lo, old_hi, new_lo,
     /// new_hi)` (a read sends old = new). Register accesses never travel on it.
     MemWordMsg = 41,
+    /// COPY_W's chain under the word memory format: a call's row sends the
+    /// next row's `(T, destination key, source key, count, functionality,
+    /// shift, the source word it read)`, which that row receives as its own
+    /// keys, count and first source word (`tables::copy_w`). Its own id: its
+    /// tuple carries a word, which COPY's chain does not.
+    CopyWordNext = 42,
 
     // =========================================================================
     // LFM — standard BLAKE3 on the lean tables (`lfm::blake3_lean`)
@@ -492,6 +498,7 @@ impl BusId {
             BusId::IsWh => "IsWh",
             BusId::MemWord => "MemWord",
             BusId::MemWordMsg => "MemWordMsg",
+            BusId::CopyWordNext => "CopyWordNext",
             BusId::B3lXor => "B3lXor",
             BusId::B3lRound => "B3lRound",
             BusId::CapLookup => "CapLookup",
@@ -536,6 +543,7 @@ impl TryFrom<u64> for BusId {
             37 => Ok(BusId::IsWh),
             40 => Ok(BusId::MemWord),
             41 => Ok(BusId::MemWordMsg),
+            42 => Ok(BusId::CopyWordNext),
             43 => Ok(BusId::B3lXor),
             44 => Ok(BusId::B3lRound),
             45 => Ok(BusId::CapLookup),

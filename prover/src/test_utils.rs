@@ -1248,6 +1248,19 @@ pub fn create_copy_air(
     )
 }
 
+pub fn create_copy_w_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::copy_w::CopyWordConstraints> {
+    build_air(
+        crate::tables::copy_w::cols::NUM_COLUMNS,
+        crate::tables::copy_w::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::copy_w::CopyWordConstraints,
+        crate::tables::copy_w::NAME,
+    )
+}
+
 /// Create PAGE AIR with bus interactions for a specific page.
 ///
 /// Each PAGE table instance has its own AIR because the bus interactions
