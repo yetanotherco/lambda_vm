@@ -50,7 +50,7 @@ use super::word_cpu::{
     load_result, msb8, one_hot_constraints, pair_lookups, placed, sum, word_class, word_key,
 };
 use super::word_memory::{
-    WORD_BYTES, byte_pair_checks, halves, step_less_one, step_limbs, word_check_of, word_of_bytes,
+    WORD_BYTES, checked_word, halves, step_less_one, step_limbs, word_check_of, word_of_bytes,
 };
 
 /// Column definitions for the MEM_LOAD2W table.
@@ -279,12 +279,8 @@ pub(crate) fn generate_mem_load2w_trace_segments_as(
 /// MEM_LOAD2W's 19 interactions (module docs).
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let address = [cols::ADDRESS_LO, cols::ADDRESS_HI];
-    let word = |w: usize| {
-        [
-            word_of_bytes(&cols::BYTES[8 * w..8 * w + 4]),
-            word_of_bytes(&cols::BYTES[8 * w + 4..8 * w + 8]),
-        ]
-    };
+    let words = [&cols::BYTES[..8], &cols::BYTES[8..]]
+        .map(|bytes| checked_word(bytes, Multiplicity::Column(cols::MU)));
     let mut interactions = Vec::with_capacity(19);
     for (w, step) in [
         (0, [cols::STEP_0, cols::STEP_1]),
@@ -293,16 +289,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.extend(word_check_of(
             word_key(address, cols::OFF, w as i64),
             cols::TIMESTAMP,
-            word(w),
-            word(w),
+            words[w].0.clone(),
+            words[w].0.clone(),
             step,
             Multiplicity::Column(cols::MU),
         ));
     }
-    interactions.extend(byte_pair_checks(
-        &cols::BYTES,
-        Multiplicity::Column(cols::MU),
-    ));
+    for (_, checks) in words {
+        interactions.extend(checks);
+    }
     interactions.push(msb8(
         cols::RES[1],
         cols::SIGN_BIT,

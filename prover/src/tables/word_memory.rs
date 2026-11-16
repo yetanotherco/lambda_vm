@@ -256,6 +256,21 @@ pub(crate) fn byte_pair_checks(bytes: &[usize], mu: Multiplicity) -> Vec<BusInte
         .collect()
 }
 
+/// A word held as eight byte columns: its two 32-bit halves
+/// ([`word_of_bytes`]) and the four `ARE_BYTES` pairs on the same columns
+/// ([`byte_pair_checks`]) at `mu`, from one list so the halves are sums of
+/// checked bytes only.
+pub(crate) fn checked_word(
+    bytes: &[usize],
+    mu: Multiplicity,
+) -> ([BusValue; 2], Vec<BusInteraction>) {
+    debug_assert_eq!(bytes.len(), 8, "a word is eight bytes");
+    (
+        [word_of_bytes(&bytes[..4]), word_of_bytes(&bytes[4..])],
+        byte_pair_checks(bytes, mu),
+    )
+}
+
 /// A 64-bit word's two 32-bit halves, low first.
 #[inline]
 pub(crate) fn halves(word: u64) -> (u32, u32) {
