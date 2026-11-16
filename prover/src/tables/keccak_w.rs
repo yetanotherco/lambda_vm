@@ -479,6 +479,19 @@ fn word(start: usize) -> [BusValue; 2] {
     [word_of_bytes(&b[..4]), word_of_bytes(&b[4..])]
 }
 
+/// The digest's words' timestamp offset: the block's words are read at `T`,
+/// the digest written at `T + DIGEST_AT`.
+const DIGEST_AT: i64 = 1;
+
+// A call's memory timestamps `T` and `T + DIGEST_AT` are distinct and stay
+// below the next CPU row's `T + TIMESTAMP_STRIDE`, so no two calls (and no
+// CPU access) share a timestamp: ECALL timestamps are multiples of the
+// stride.
+const _: () = assert!(
+    0 < DIGEST_AT && DIGEST_AT < super::cpu::TIMESTAMP_STRIDE as i64,
+    "KECCAK_W's timestamp offsets must be distinct and below the CPU timestamp stride"
+);
+
 /// The memory timestamp `T + plus`.
 fn at(plus: i64) -> BusValue {
     if plus == 0 {
@@ -637,19 +650,19 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     out.push(BusInteraction::sender(
         BusId::MemWordMsg,
         last(),
-        access_message(out_address(0), at(1), word(cols::OLD0), new(0)),
+        access_message(out_address(0), at(DIGEST_AT), word(cols::OLD0), new(0)),
     ));
     for v in 1..4 {
         out.push(BusInteraction::sender(
             BusId::MemWordMsg,
             last(),
-            write_message(out_address(v), at(1), new(v)),
+            write_message(out_address(v), at(DIGEST_AT), new(v)),
         ));
     }
     out.push(BusInteraction::sender(
         BusId::MemWordMsg,
         Multiplicity::Column(cols::W4),
-        access_message(out_address(4), at(1), word(cols::OLD4), new(4)),
+        access_message(out_address(4), at(DIGEST_AT), word(cols::OLD4), new(4)),
     ));
     let old0: Vec<usize> = (0..8).map(|b| cols::OLD0 + b).collect();
     let old4: Vec<usize> = (0..8).map(|b| cols::OLD4 + b).collect();

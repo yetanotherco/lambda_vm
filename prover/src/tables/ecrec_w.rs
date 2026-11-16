@@ -23,6 +23,11 @@
 //! plus `8i`, and only PAGE_W mints tokens, at aligned keys, so a call at an
 //! unaligned pointer consumes tokens nothing produced and its block does not
 //! verify.
+//!
+//! Under the split and fused formats the rule is the executor's alone: their
+//! ECREC takes an unaligned call (and proves the right key for it), so a
+//! prover that skips the executor proves one there. The acceptance sets
+//! differ; no result is wrong.
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
