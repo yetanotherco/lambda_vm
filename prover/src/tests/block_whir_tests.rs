@@ -118,16 +118,31 @@ fn groups_of(proof: &BlockWhirProof) -> usize {
     proof.proof.columns.len()
 }
 
-/// A split proof's archived bytes without its last field, the fused memory
-/// pair: the sixteen bytes of `[0, 0]` its archive ends with
-/// (`fused_memory_block_tests` checks the rest is the archive of the proof
-/// before the field); `None` for a fused proof.
+/// A split proof's archived bytes without its last two fields, the fused
+/// memory pair and the word counts: the sixteen bytes of `[0, 0]` then the
+/// 56 of `[0; 7]` its archive ends with (`fused_memory_block_tests` checks
+/// the rest is the archive of the proof before the pair); `None` for a fused
+/// or word proof.
 pub(super) fn before_fused_pair<'a>(proof: &BlockWhirProof, bytes: &'a [u8]) -> Option<&'a [u8]> {
-    if proof.fused_memory != [0, 0] {
+    if proof.fused_memory != [0, 0] || proof.word_memory != [0; 7] {
         return None;
     }
-    let (before, pair) = bytes.split_at(bytes.len() - 16);
-    assert_eq!(pair, &[0u8; 16], "the archive ends with the pair");
+    let before = before_word_counts(proof, bytes)?;
+    let (before, pair) = before.split_at(before.len() - 16);
+    assert_eq!(pair, &[0u8; 16], "the pair before the word counts");
+    Some(before)
+}
+
+/// A split or fused proof's archived bytes without its last field, the word
+/// counts: the 56 bytes of `[0; 7]` its archive ends with
+/// (`word_memory_block_tests` checks the rest is the archive of the proof
+/// before the field); `None` for a word proof.
+pub(super) fn before_word_counts<'a>(proof: &BlockWhirProof, bytes: &'a [u8]) -> Option<&'a [u8]> {
+    if proof.word_memory != [0; 7] {
+        return None;
+    }
+    let (before, counts) = bytes.split_at(bytes.len() - 56);
+    assert_eq!(counts, &[0u8; 56], "the archive ends with the word counts");
     Some(before)
 }
 
@@ -275,9 +290,18 @@ fn a_block_at_each_blowup_prints_its_proof_bytes() {
             bytes.len(),
             &blake3::hash(&bytes).to_hex()[..32]
         );
-        // The bytes before the fused memory pair (the proof's last field,
-        // `[0, 0]` under the split format): a build from before that field
-        // prints these as its RATE BLOCK DIGEST.
+        // The bytes before the word counts (the proof's last field, zero
+        // under the split and fused formats) and before the fused memory pair
+        // (`[0, 0]` under the split format): a build from before either
+        // field prints these as its RATE BLOCK DIGEST.
+        if let Some(before) = before_word_counts(&proof, &bytes) {
+            println!(
+                "RATE BLOCK DIGEST BEFORE WORDS blowup={blowup} groups={} bytes={} blake3={}",
+                groups_of(&proof),
+                before.len(),
+                &blake3::hash(before).to_hex()[..32]
+            );
+        }
         if let Some(before) = before_fused_pair(&proof, &bytes) {
             println!(
                 "RATE BLOCK DIGEST BEFORE FUSED blowup={blowup} groups={} bytes={} blake3={}",
@@ -4938,8 +4962,15 @@ fn block_whir_on_a_real_block() {
         &blake3::hash(&bytes).to_hex()[..32],
         bytes.len()
     );
-    // The bytes before the fused memory pair: a build from before that field
-    // prints these as its BLOCK PROOF DIGEST.
+    // The bytes before the word counts and before the fused memory pair: a
+    // build from before either field prints these as its BLOCK PROOF DIGEST.
+    if let Some(before) = before_word_counts(&proof, &bytes) {
+        println!(
+            "BLOCK PROOF DIGEST BEFORE WORDS: {} (blake3 of the {} proof bytes)",
+            &blake3::hash(before).to_hex()[..32],
+            before.len()
+        );
+    }
     if let Some(before) = before_fused_pair(&proof, &bytes) {
         println!(
             "BLOCK PROOF DIGEST BEFORE FUSED: {} (blake3 of the {} proof bytes)",

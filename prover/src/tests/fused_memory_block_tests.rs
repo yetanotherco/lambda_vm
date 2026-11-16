@@ -377,28 +377,34 @@ impl BeforeFused {
 }
 
 /// ★ A split proof's bytes are the format's before the fused pair, then the
-/// pair: the struct before it archives to exactly the split proof's bytes but
-/// its last sixteen, which are `[0, 0]`. So the bytes a pre-format binary
-/// proves are compared as this prefix, and a byte moved in any earlier field
-/// moves the prefix (the check's mutant: one flipped byte of a group index).
+/// pair, then the word counts: the struct before the pair archives to exactly
+/// the split proof's bytes but its last 72, the pair `[0, 0]` (sixteen bytes)
+/// and the word format's seven counts, zero (56). So the bytes a pre-format
+/// binary proves are compared as this prefix, and a byte moved in any earlier
+/// field moves the prefix (the check's mutant: one flipped byte of a group
+/// index).
 #[test]
 fn a_split_proof_is_the_bytes_before_the_fused_pair_then_the_pair() {
     let elf = asm_elf_bytes("all_instructions_64");
     let proof = prove(&elf, &split());
+    assert_eq!(proof.fused_memory, [0, 0]);
+    assert_eq!(proof.word_memory, [0; 7]);
     let now = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).expect("serialize");
     let before =
         rkyv::to_bytes::<rkyv::rancor::Error>(&BeforeFused::of(&proof)).expect("serialize");
     assert_eq!(
         now.len(),
-        before.len() + 16,
-        "the pair, sixteen bytes after"
+        before.len() + 16 + 56,
+        "the pair and the word counts, 72 bytes after"
     );
     assert_eq!(
         &now[..before.len()],
         &before[..],
         "the bytes before the pair"
     );
-    assert_eq!(&now[before.len()..], &[0u8; 16], "the pair, [0, 0]");
+    let pair = before.len()..before.len() + 16;
+    assert_eq!(&now[pair.clone()], &[0u8; 16], "the pair, [0, 0]");
+    assert_eq!(&now[pair.end..], &[0u8; 56], "the word counts, zero");
     let mut moved = proof.clone();
     moved.groups[0][0] ^= 1;
     let moved_before =
