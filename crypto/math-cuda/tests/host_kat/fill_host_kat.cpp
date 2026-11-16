@@ -36,6 +36,12 @@
 //      second and zero rows after it, and one cut at both ends: every row's
 //      fifteen column groups, by digest; the same through the entry that reads
 //      the records a table held as its keccak operations uploads.
+//   4. The LFM chips' value columns (`fill_lfm_values`, `fill_lfm_bitdec`):
+//      words copied canonical (non-canonical inputs among them) with zero rows
+//      past the real ones, and the bit decomposition's 64 bits, `Z` and
+//      `GINV` at its edges (p - 1, zero, a top of 2^32 - 2, a non-canonical
+//      word), each `GINV` checked by a 128-bit product, not the kernel's
+//      field multiply.
 //   Every cell of each table starts as a sentinel, so a cell no thread writes
 //   is a mismatch, and threads past the table must leave a guard alone.
 //
@@ -313,6 +319,83 @@ void test_keccak_rnd() {
     });
 }
 
+// The LFM chips' value columns. The expected words are computed here, by
+// plain integer arithmetic: canonical words, the bits of the canonical value,
+// and `GINV` checked as `g · GINV ≡ 1 (mod p)` through a 128-bit product.
+constexpr uint64_t P = 0xFFFFFFFF00000001ull;
+
+uint64_t canon(uint64_t v) { return v >= P ? v - P : v; }
+
+uint64_t mulmod(uint64_t a, uint64_t b) {
+    return (uint64_t)(((unsigned __int128)a * (unsigned __int128)b) % P);
+}
+
+void test_lfm_values() {
+    const uint64_t cols = 4, height = 13, real = 9;
+    std::vector<uint64_t> values(real * cols);
+    for (uint64_t i = 0; i < values.size(); ++i) {
+        // Every third word non-canonical: v + p for a small v.
+        values[i] = (i % 3 == 0) ? (i + 11) + P : i * 0x9E3779B97F4A7C15ull;
+    }
+    std::vector<uint64_t> want(cols * height, 0);
+    for (uint64_t r = 0; r < real; ++r) {
+        for (uint64_t c = 0; c < cols; ++c) want[c * height + r] = canon(values[r * cols + c]);
+    }
+    auto got = table(cols * height);
+    for (unsigned i = 0; i < cols * height + EXTRA_THREADS; ++i) {
+        blockIdx.x = 0;
+        blockDim.x = 0;
+        threadIdx.x = i;
+        fill_lfm_values(values.data(), cols, real, height, got.data());
+    }
+    check_words("LFM values", got, want.data(), height, cols);
+    // No records: every row zero.
+    auto zeros = table(2 * height);
+    for (unsigned i = 0; i < 2 * height + EXTRA_THREADS; ++i) {
+        blockIdx.x = 0;
+        blockDim.x = 0;
+        threadIdx.x = i;
+        fill_lfm_values(values.data(), 2, 0, height, zeros.data());
+    }
+    std::vector<uint64_t> none(2 * height, 0);
+    check_words("LFM zeros", zeros, none.data(), height, 2);
+}
+
+void test_lfm_bitdec() {
+    const uint64_t values[] = {
+        P - 1,                    // top 2^32 - 1: Z = 1, GINV = 0
+        0,                        // g = 2^32 - 1
+        5,
+        0x0000000100000000ull,    // top 1
+        0xFFFFFFFE00000005ull,    // top 2^32 - 2: g = 1, GINV = 1
+        P + 7,                    // non-canonical: decomposed as 7
+        0x123456789ABCDEF0ull,
+    };
+    const uint64_t real = sizeof(values) / sizeof(values[0]), height = 10, cols = 66;
+    auto got = table(cols * height);
+    each_row(height, 0, [&] { fill_lfm_bitdec(values, real, height, got.data()); });
+    std::vector<uint64_t> want(cols * height, 0);
+    for (uint64_t r = 0; r < real; ++r) {
+        const uint64_t v = canon(values[r]);
+        for (uint64_t i = 0; i < 64; ++i) want[i * height + r] = (v >> i) & 1;
+        const uint64_t g = 0xFFFFFFFFull - (v >> 32);
+        want[64 * height + r] = g == 0 ? 1 : 0;
+        // GINV is checked by its product below; take the kernel's word here.
+        want[65 * height + r] = got[65 * height + r];
+        if (g == 0) {
+            CHECK(got[65 * height + r] == 0, "LFM bitdec row %llu: GINV 0 when g = 0",
+                  (unsigned long long)r);
+        } else {
+            const uint64_t inv = got[65 * height + r];
+            CHECK(inv < P && mulmod(g, inv) == 1,
+                  "LFM bitdec row %llu: g %llu times GINV %llu is not 1", (unsigned long long)r,
+                  (unsigned long long)g, (unsigned long long)inv);
+        }
+    }
+    CHECK(got[65 * height + 4] == 1, "LFM bitdec: GINV of g = 1 is 1");
+    check_words("LFM bitdec", got, want.data(), height, cols);
+}
+
 }  // namespace
 
 int main() {
@@ -326,6 +409,8 @@ int main() {
     test_cpu();
     test_cpu_in_row();
     test_keccak_rnd();
+    test_lfm_values();
+    test_lfm_bitdec();
     std::printf("fill host KAT: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

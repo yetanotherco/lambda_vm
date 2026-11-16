@@ -396,6 +396,8 @@ struct Module {
     keccak_rnd_in: CudaFunction,
     b3l_round: CudaFunction,
     lfm_p1w16_socket: CudaFunction,
+    lfm_values: CudaFunction,
+    lfm_bitdec: CudaFunction,
 }
 
 fn module() -> Result<&'static Module> {
@@ -419,6 +421,8 @@ fn module() -> Result<&'static Module> {
         keccak_rnd_in: module.load_function("fill_keccak_rnd_in")?,
         b3l_round: module.load_function("fill_b3l_round")?,
         lfm_p1w16_socket: module.load_function("fill_lfm_p1w16_socket")?,
+        lfm_values: module.load_function("fill_lfm_values")?,
+        lfm_bitdec: module.load_function("fill_lfm_bitdec")?,
         _module: module,
     };
     Ok(MODULE.get_or_init(|| m))
@@ -821,7 +825,52 @@ pub enum RecordsInput<'a> {
         skip: usize,
         rows: usize,
     },
+    /// An LFM recursion chip's `rows` rows: `prefix` (its preprocessed
+    /// columns, packed narrow, every row) widened into the first columns, then
+    /// the columns `kind` writes from `values` (`real` rows of
+    /// `kind.words_per_row()` words, row-major), zero past `real`.
+    LfmChip {
+        prefix: NarrowInput<'a>,
+        values: &'a [u64],
+        kind: LfmValues,
+        real: usize,
+        rows: usize,
+    },
 }
+
+/// An LFM chip table's value columns ([`RecordsInput::LfmChip`]), as the
+/// multilinear crate's `records::LfmValues` names them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LfmValues {
+    /// `n` columns, a word each, in the records' order.
+    Words(usize),
+    /// One word a row decomposed: 64 bits low first, `Z`, `GINV`.
+    Bits,
+    /// `n` columns of zeros.
+    Zeros(usize),
+}
+
+impl LfmValues {
+    /// The value columns.
+    pub fn cols(self) -> usize {
+        match self {
+            Self::Words(n) | Self::Zeros(n) => n,
+            Self::Bits => LFM_BITDEC_VALUE_COLUMNS,
+        }
+    }
+
+    /// The records' words a row.
+    pub fn words_per_row(self) -> usize {
+        match self {
+            Self::Words(n) => n,
+            Self::Bits => 1,
+            Self::Zeros(_) => 0,
+        }
+    }
+}
+
+/// The value columns an LFM bit decomposition writes: 64 bits, `Z`, `GINV`.
+pub const LFM_BITDEC_VALUE_COLUMNS: usize = 66;
 
 impl std::fmt::Debug for RecordsInput<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -838,6 +887,7 @@ impl std::fmt::Debug for RecordsInput<'_> {
             Self::Shift { .. } => "SHIFT",
             Self::Memw { .. } => "MEMW",
             Self::B3lRound { .. } => "B3L_ROUND",
+            Self::LfmChip { .. } => "LFM_CHIP",
         };
         write!(
             f,
@@ -863,7 +913,8 @@ impl RecordsInput<'_> {
             | Self::Store { rows, .. }
             | Self::Shift { rows, .. }
             | Self::Memw { rows, .. }
-            | Self::B3lRound { rows, .. } => *rows,
+            | Self::B3lRound { rows, .. }
+            | Self::LfmChip { rows, .. } => *rows,
         }
     }
 
@@ -882,6 +933,7 @@ impl RecordsInput<'_> {
             Self::Shift { .. } => SHIFT_COLUMNS,
             Self::Memw { .. } => MEMW_COLUMNS,
             Self::B3lRound { .. } => B3L_ROUND_COLUMNS,
+            Self::LfmChip { prefix, kind, .. } => prefix.cols() + kind.cols(),
         }
     }
 
@@ -907,6 +959,13 @@ impl RecordsInput<'_> {
             Self::Shift { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Memw { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::B3lRound { ops, .. } => size_of_val(*ops),
+            Self::LfmChip { prefix, values, .. } => {
+                let (data, offsets, widths) = prefix.parts();
+                size_of_val(data)
+                    + size_of_val(offsets)
+                    + size_of_val(widths)
+                    + size_of_val(*values)
+            }
         }
     }
 
@@ -925,8 +984,33 @@ impl RecordsInput<'_> {
             Self::Shift { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Memw { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::B3lRound { ops, .. } => ops.len(),
+            Self::LfmChip { real, .. } => *real,
         }
     }
+}
+
+/// An LFM chip table's records checked against its shape: the prefix over
+/// every row, `real` within them, and `kind`'s words for each real row.
+fn check_lfm_chip(
+    prefix: &NarrowInput<'_>,
+    values: &[u64],
+    kind: LfmValues,
+    real: usize,
+    rows: usize,
+) -> Result<()> {
+    ensure_eq!(prefix.rows(), rows, "the prefix's rows");
+    ensure!(real <= rows, "real rows within the table");
+    ensure_eq!(
+        values.len(),
+        real * kind.words_per_row(),
+        "the values' words"
+    );
+    let cells = rows.checked_mul(prefix.cols().max(kind.cols()));
+    ensure!(
+        cells.is_some_and(|c| u32::try_from(c).is_ok()),
+        "a launch's cells"
+    );
+    Ok(())
 }
 
 /// What the fills of one upload check once the stream's work is done
@@ -1196,6 +1280,10 @@ pub(crate) fn fill_col_major_into(
             let ops_dev = upload(stream, ops)?;
             launch_b3l_round(stream, &m.b3l_round, &ops_dev, nops, skip, rows, dst)
         }
+        RecordsInput::LfmChip { .. } => {
+            let staged = stage(stream, records)?;
+            launch_staged(stream, &staged, records.rows(), dst, checks)
+        }
     }
 }
 
@@ -1285,6 +1373,17 @@ pub(crate) enum Staged<'a> {
         nops: u32,
         skip: usize,
     },
+    /// An LFM chip table's prefix (its packed bytes, offsets and widths) and
+    /// values on the card ([`RecordsInput::LfmChip`]).
+    LfmChip {
+        data: CudaSlice<u8>,
+        offsets: CudaSlice<u64>,
+        widths: CudaSlice<u8>,
+        prefix_cols: usize,
+        values: CudaSlice<u64>,
+        kind: LfmValues,
+        real: usize,
+    },
     /// Written by another launch (a derived table, [`crate::card_rows`]):
     /// nothing to launch here.
     Elsewhere,
@@ -1335,6 +1434,25 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
             ops: upload(stream, ops)?,
             skip,
         },
+        RecordsInput::LfmChip {
+            prefix,
+            values,
+            kind,
+            real,
+            rows,
+        } => {
+            check_lfm_chip(&prefix, values, kind, real, rows)?;
+            let (data, offsets, widths) = prefix.parts();
+            Staged::LfmChip {
+                data: upload(stream, data)?,
+                offsets: upload(stream, offsets)?,
+                widths: upload(stream, widths)?,
+                prefix_cols: prefix.cols(),
+                values: upload(stream, values)?,
+                kind,
+                real,
+            }
+        }
     })
 }
 
@@ -1407,8 +1525,159 @@ pub(crate) fn launch_staged(
         Staged::B3lRound { ops, nops, skip } => {
             launch_b3l_round(stream, &m.b3l_round, ops, *nops, *skip, rows, dst)
         }
+        Staged::LfmChip {
+            data,
+            offsets,
+            widths,
+            prefix_cols,
+            values,
+            kind,
+            real,
+        } => launch_lfm_chip(
+            stream,
+            m,
+            LfmChipOnCard {
+                data,
+                offsets,
+                widths,
+                prefix_cols: *prefix_cols,
+                values,
+                kind: *kind,
+                real: *real,
+            },
+            rows,
+            dst,
+        ),
         Staged::Elsewhere => Ok(()),
     }
+}
+
+/// An LFM chip table's records on the card ([`Staged::LfmChip`]), borrowed.
+struct LfmChipOnCard<'s> {
+    data: &'s CudaSlice<u8>,
+    offsets: &'s CudaSlice<u64>,
+    widths: &'s CudaSlice<u8>,
+    prefix_cols: usize,
+    values: &'s CudaSlice<u64>,
+    kind: LfmValues,
+    real: usize,
+}
+
+/// An LFM chip table into `dst` (`rows × cols` words, column-major), on
+/// `stream`: the prefix widened into its first `prefix_cols` columns (the
+/// kernel the packed tables widen with), then the value columns by `kind`.
+fn launch_lfm_chip(
+    stream: &Arc<CudaStream>,
+    m: &Module,
+    chip: LfmChipOnCard<'_>,
+    rows: usize,
+    dst: &mut CudaViewMut<u64>,
+) -> Result<()> {
+    let prefix_words = chip.prefix_cols * rows;
+    ensure_eq!(
+        dst.len(),
+        prefix_words + chip.kind.cols() * rows,
+        "the table's words"
+    );
+    ensure!(chip.real <= rows, "real rows within the table");
+    let rows_u64 = rows as u64;
+    if prefix_words > 0 {
+        let be = backend()?;
+        let cells = u32::try_from(prefix_words).map_err(|_| crate::invalid_value())?;
+        let cols_u64 = chip.prefix_cols as u64;
+        let mut prefix = dst.slice_mut(0..prefix_words);
+        unsafe {
+            stream
+                .launch_builder(&be.widen_narrow_col_major)
+                .arg(chip.data)
+                .arg(chip.offsets)
+                .arg(chip.widths)
+                .arg(&mut prefix)
+                .arg(&rows_u64)
+                .arg(&cols_u64)
+                .launch(LaunchConfig::for_num_elems(cells))?;
+        }
+    }
+    let value_words = chip.kind.cols() * rows;
+    if value_words == 0 {
+        return Ok(());
+    }
+    // The test fault: the values filled `skip` rows late.
+    #[cfg(feature = "test-faults")]
+    let (values, real) = {
+        let skip = fault_records_skip().min(chip.real);
+        let at = skip * chip.kind.words_per_row();
+        (chip.values.slice(at..), chip.real - skip)
+    };
+    #[cfg(not(feature = "test-faults"))]
+    let (values, real) = (chip.values.slice(..), chip.real);
+    let real_u64 = real as u64;
+    let mut out = dst.slice_mut(prefix_words..prefix_words + value_words);
+    match chip.kind {
+        LfmValues::Words(_) | LfmValues::Zeros(_) => {
+            // Zeros: no records, so every row is past `real`.
+            let (cols, real) = match chip.kind {
+                LfmValues::Words(n) => (n as u64, real_u64),
+                _ => (chip.kind.cols() as u64, 0),
+            };
+            unsafe {
+                stream
+                    .launch_builder(&m.lfm_values)
+                    .arg(&values)
+                    .arg(&cols)
+                    .arg(&real)
+                    .arg(&rows_u64)
+                    .arg(&mut out)
+                    .launch(LaunchConfig {
+                        grid_dim: (row_grid(value_words, ROW_BLOCK)?, 1, 1),
+                        block_dim: (ROW_BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+        }
+        LfmValues::Bits => unsafe {
+            stream
+                .launch_builder(&m.lfm_bitdec)
+                .arg(&values)
+                .arg(&real_u64)
+                .arg(&rows_u64)
+                .arg(&mut out)
+                .launch(LaunchConfig {
+                    grid_dim: (row_grid(rows, ROW_BLOCK)?, 1, 1),
+                    block_dim: (ROW_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        },
+    }
+    Ok(())
+}
+
+/// An LFM chip table filled on a stream of its own and downloaded,
+/// column-major (`rows × cols` words): what the card writes for
+/// [`RecordsInput::LfmChip`], for the tests that compare it with the host's
+/// fill.
+pub fn lfm_chip_to_host(
+    prefix: NarrowInput<'_>,
+    values: &[u64],
+    kind: LfmValues,
+    real: usize,
+) -> Result<Vec<u64>> {
+    let rows = prefix.rows();
+    let records = RecordsInput::LfmChip {
+        prefix,
+        values,
+        kind,
+        real,
+        rows,
+    };
+    let stream = backend()?.next_stream();
+    // SAFETY: the fill writes every word of the table.
+    let mut out = unsafe { stream.alloc::<u64>(rows * records.cols()) }?;
+    let mut checks = FillChecks::default();
+    fill_col_major_into(&stream, records, &mut out.slice_mut(..), &mut checks)?;
+    let words = crate::readback::clone_dtoh(&stream, &out)?;
+    stream.synchronize()?;
+    Ok(words)
 }
 
 /// A one-record-a-row family's fill over the `n` records on the card into

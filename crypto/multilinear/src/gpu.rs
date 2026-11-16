@@ -4420,7 +4420,9 @@ impl<'a> RecordsUp<'a> {
             memws: Vec::new(),
         };
         match &fill {
-            RecordsFill::KeccakRnd { .. } | RecordsFill::B3lRound { .. } => {}
+            RecordsFill::KeccakRnd { .. }
+            | RecordsFill::B3lRound { .. }
+            | RecordsFill::LfmChip { .. } => {}
             RecordsFill::Cpu {
                 logs,
                 sides,
@@ -4627,6 +4629,34 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
                     core::slice::from_raw_parts(ops.as_ptr() as *const B3lOpC, ops.len())
                 },
                 skip: *skip,
+                rows: up.rows,
+            }
+        }
+        RecordsFill::LfmChip {
+            prefix,
+            values,
+            kind,
+            real,
+        } => {
+            use crate::records::LfmValues;
+            use math_cuda::fill::LfmValues as Card;
+            const _: () =
+                assert!(LfmValues::BITS_COLUMNS == math_cuda::fill::LFM_BITDEC_VALUE_COLUMNS);
+            RecordsInput::LfmChip {
+                prefix: math_cuda::narrow::NarrowInput::new(
+                    prefix.data(),
+                    prefix.offsets(),
+                    prefix.widths(),
+                    prefix.rows(),
+                    prefix.cols(),
+                ),
+                values,
+                kind: match kind {
+                    LfmValues::Words(n) => Card::Words(*n),
+                    LfmValues::Bits => Card::Bits,
+                    LfmValues::Zeros(n) => Card::Zeros(*n),
+                },
+                real: *real,
                 rows: up.rows,
             }
         }

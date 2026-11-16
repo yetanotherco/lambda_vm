@@ -460,6 +460,61 @@ pub enum RecordsFill<'a> {
     /// The lean BLAKE3 round table's rows `[skip, skip + rows)` of the table
     /// `ops` make, 7 rows an op; rows past the last op are zero.
     B3lRound { ops: &'a [B3lRoundOp], skip: usize },
+    /// An LFM recursion chip's table: its preprocessed prefix as the program
+    /// commits it, packed narrow (its first columns, every row), then the
+    /// columns `kind` writes from `values` (`real` rows of `kind`'s words a
+    /// row, row-major), every value column zero past `real`.
+    LfmChip {
+        prefix: &'a NarrowColumns,
+        values: &'a [u64],
+        kind: LfmValues,
+        real: usize,
+    },
+}
+
+/// What an LFM chip table's value columns are, from its records' words
+/// ([`RecordsFill::LfmChip`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LfmValues {
+    /// `n` columns, a word each, in the records' order (`n` words a row).
+    Words(usize),
+    /// A canonical decomposition of one word a row: its 64 bits low first,
+    /// then `Z` (its top 32 bits all ones) and `GINV` (the inverse of
+    /// `2^32 − 1 − top` when that is nonzero, else 0): 66 columns.
+    Bits,
+    /// `n` columns of zeros (no records).
+    Zeros(usize),
+}
+
+impl LfmValues {
+    /// The bit decomposition's columns: 64 bits, `Z`, `GINV`.
+    pub const BITS_COLUMNS: usize = 66;
+
+    /// The value columns.
+    pub fn cols(self) -> usize {
+        match self {
+            Self::Words(n) | Self::Zeros(n) => n,
+            Self::Bits => Self::BITS_COLUMNS,
+        }
+    }
+
+    /// The records' words a row.
+    pub fn words_per_row(self) -> usize {
+        match self {
+            Self::Words(n) => n,
+            Self::Bits => 1,
+            Self::Zeros(_) => 0,
+        }
+    }
+
+    /// The kind as one word, for a digest.
+    fn code(self) -> u64 {
+        match self {
+            Self::Words(n) => n as u64,
+            Self::Bits => 1 << 32,
+            Self::Zeros(n) => (2 << 32) | n as u64,
+        }
+    }
 }
 
 impl RecordsFill<'_> {
@@ -486,6 +541,12 @@ impl RecordsFill<'_> {
             Self::Shift { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::Memw { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::B3lRound { ops, .. } => std::mem::size_of_val(*ops),
+            Self::LfmChip { prefix, values, .. } => {
+                prefix.data().len()
+                    + std::mem::size_of_val(prefix.offsets())
+                    + prefix.widths().len()
+                    + std::mem::size_of_val(*values)
+            }
         }
     }
 
@@ -503,6 +564,7 @@ impl RecordsFill<'_> {
             Self::Shift { ops } => ops.iter().map(|p| p.len()).sum(),
             Self::Memw { ops } => ops.iter().map(|p| p.len()).sum(),
             Self::B3lRound { ops, .. } => ops.len(),
+            Self::LfmChip { real, .. } => *real,
         }
     }
 
@@ -670,6 +732,25 @@ impl RecordsFill<'_> {
                     each(u64::from(op.block_len) | u64::from(op.flags) << 32);
                     each(op.tag);
                 }
+            }
+            Self::LfmChip {
+                prefix,
+                values,
+                kind,
+                real,
+            } => {
+                each(10);
+                each(kind.code());
+                each(*real as u64);
+                each(prefix.rows() as u64);
+                each(prefix.cols() as u64);
+                prefix.widths().iter().for_each(|&w| each(u64::from(w)));
+                for bytes in prefix.data().chunks(8) {
+                    let mut word = [0u8; 8];
+                    word[..bytes.len()].copy_from_slice(bytes);
+                    each(u64::from_le_bytes(word));
+                }
+                values.iter().copied().for_each(&mut each);
             }
         }
     }

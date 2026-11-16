@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "ext3_inv.cuh"
 #include "goldilocks.cuh"
 #include "p1w16_constants.cuh"
 
@@ -1383,4 +1384,53 @@ extern "C" __global__ void fill_b3l_round(const B3lOpC *ops, uint32_t nops, uint
         v[c] = c2;
         v[d] = d2;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The LFM recursion chips' value columns (`prover/src/lfm/chip_records.rs`,
+// the host's `trace.rs` fillers): a chip table's preprocessed prefix is
+// widened into its first columns by `widen_narrow_col_major`; `out` here is
+// the table's columns after it, column-major (`out[col * height + row]`).
+// Rows past `real` are zero, as the host's trace leaves them.
+// ---------------------------------------------------------------------------
+
+// `cols` columns from `values` (`cols` words a row, row-major): column `c` of
+// row `r` is `values[r * cols + c]`, canonical. One thread a cell, in the
+// columns' order, so the stores coalesce.
+extern "C" __global__ void fill_lfm_values(const uint64_t *__restrict__ values, uint64_t cols,
+                                           uint64_t real, uint64_t height,
+                                           uint64_t *__restrict__ out) {
+    const uint64_t cell = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (cell >= cols * height) return;
+    const uint64_t c = cell / height;
+    const uint64_t row = cell - c * height;
+    out[cell] = row < real ? goldilocks::canonical(values[row * cols + c]) : 0;
+}
+
+namespace lfm_bitdec {
+constexpr uint32_t BITS = 64;
+constexpr uint32_t Z = 64;
+constexpr uint32_t GINV = 65;
+constexpr uint32_t COLS = 66;
+}  // namespace lfm_bitdec
+
+// `LFM_BITDEC`'s value columns from one word a row (the decomposed value,
+// canonical): its 64 bits low first; `Z` = 1 when its top 32 bits are all
+// ones, else 0; `GINV` = the inverse of `(2^32 - 1) - top` when that is
+// nonzero, else 0 (the executor's `BitDecRow`). One thread a row.
+extern "C" __global__ void fill_lfm_bitdec(const uint64_t *__restrict__ values, uint64_t real,
+                                           uint64_t height, uint64_t *__restrict__ out) {
+    namespace b = lfm_bitdec;
+    const uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= real) {
+        w.zeros(0, b::COLS);
+        return;
+    }
+    const uint64_t v = goldilocks::canonical(values[row]);
+    for (uint32_t i = 0; i < b::BITS; ++i) w.word(i, (v >> i) & 1ull);
+    const uint64_t g = 0xFFFFFFFFull - (v >> 32);
+    w.word(b::Z, g == 0 ? 1ull : 0ull);
+    w.word(b::GINV, g == 0 ? 0ull : ext3_inv::gl_inv(g));
 }
