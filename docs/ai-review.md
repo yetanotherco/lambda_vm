@@ -47,16 +47,17 @@ do not apply to its review (the label trigger does run the PR's version of the w
 - [`.github/ai-review/config.toml`](../.github/ai-review/config.toml): which paths are ignored, test
   file patterns, and the review order for large PRs (`priority`; those parts also get twice the
   per-reviewer budget). Every reviewed file counts as security-sensitive, so every part gets all five
-  reviewers.
+  reviewers. Docs under the `sensitive` paths, such as `prover/README.md`, are reviewed like code.
 
 ## Cost and large PRs
 
 - A PR reviewed in one part costs about $3 (the comment shows each review's cost).
-- A PR over about 4,000 *effective* lines (changed code, whitespace-only changes and long deletions
-  compacted, plus half the test lines) is split into parts of about 2,500 lines. The parts are
-  reviewed in priority order (`priority` in the config, then the paths listed as `sensitive`) within
-  a $50 budget. Parts left unreviewed are listed at the top of the comment; `/ai-review continue`
-  reviews them.
+- A PR over about 4,000 *effective* lines (changed code, whitespace-only changes except in Python,
+  shell, YAML and Makefiles, and long deletions compacted, plus half the test lines) is split into
+  parts of about 2,500 lines. The parts are reviewed in priority order (`priority` in the config,
+  then the paths listed as `sensitive`) within a $50 budget. Parts left unreviewed are listed at the
+  top of the comment; `/ai-review continue` reviews them. Changed files that no reviewer saw (binary
+  to git, whitespace-only changes, unusual file names) are listed there too.
 - The parts of a split PR run one after another. No new part starts after 240 minutes, so a very
   large PR ends with a partial review and `continue` does the rest.
 
