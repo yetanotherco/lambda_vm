@@ -2410,3 +2410,28 @@ fn every_byte_pair_refuses_a_word_split_across_a_window_edge() {
         .collect();
     assert_eq!(seen, all, "every one of the twelve pairs");
 }
+
+/// COPY_W's honest rows for the census (`word_memory_tests`): every
+/// functionality, destination offset, shift and window shape, calls across
+/// `2^32`, a memcpy to `src + 8` (a copy row a memset's gap rule would take)
+/// and padding.
+pub(super) fn census_rows() -> Vec<Vec<FE>> {
+    let mut run = Run::with_pages(line_pages());
+    for offset in 0..8u64 {
+        for shift in 0..8u64 {
+            for &n in &[1u64, 9, 17] {
+                run.copy(
+                    ELF + 8 * shift + (offset + shift) % 8,
+                    LOW + 0x400 + offset,
+                    n,
+                );
+            }
+        }
+        run.set(LOW + 0x700 + offset, 13);
+        run.commit(ELF + 0x40 + offset, 11);
+    }
+    run.copy(ELF + 0x100, ELF + 0x108, 24);
+    run.copy(LOW, LOW + 0x100, 0);
+    across(&mut run);
+    distinct_rows(&run)
+}

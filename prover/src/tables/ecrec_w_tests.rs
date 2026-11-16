@@ -390,3 +390,16 @@ fn every_ecrec_w_byte_pair_is_held_by_the_census() {
         );
     }
 }
+
+/// ECREC_W's honest rows for the census (`word_memory_tests`): a bail call's
+/// row and a padding row.
+pub(super) fn census_rows() -> Vec<Vec<FE>> {
+    let t = ecrec_w::generate_ecrec_w_trace(&[bail_op(MSG + 0x100)]);
+    (0..2)
+        .map(|r| {
+            (0..ecrec_w::cols::NUM_COLUMNS)
+                .map(|c| *t.get_main(r, c))
+                .collect()
+        })
+        .collect()
+}

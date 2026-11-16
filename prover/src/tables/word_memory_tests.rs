@@ -2035,7 +2035,9 @@ fn check_dispatch_key(
 
 /// Rule c5: the multiplicity columns `mu` held to bits, and to one message a
 /// row: every assignment of them in `{−1, 0, 1, 2}^k` other than all zero and
-/// a unit vector (exactly one 1), all else zero, breaks a constraint.
+/// a unit vector (exactly one 1) breaks a constraint, all else zero, and all
+/// else an honest row's where one of them is 1 ([`honest_rows`]), so no
+/// constraint that only an idle row meets answers for the bit.
 fn check_bits(name: &str, mu: &BTreeSet<usize>, eval: Option<(Eval, usize)>) -> Result<(), String> {
     let Some((eval, width)) = eval else {
         return Err(format!(
@@ -2065,6 +2067,32 @@ fn check_bits(name: &str, mu: &BTreeSet<usize>, eval: Option<(Eval, usize)>) -> 
             return Err(format!(
                 "{name}: multiplicities {assignment:?} on {cols:?} break no constraint"
             ));
+        }
+        // And on each honest row where one of them is 1: a constraint the
+        // row's other columns cannot answer on a zero row.
+        let honest = if tight(Tightened::HonestBits) {
+            honest_rows(name, Some((eval, width)))
+        } else {
+            Vec::new()
+        };
+        for honest in honest {
+            if cols.iter().all(|&c| honest[c] != FE::one()) {
+                continue;
+            }
+            let mut moved = honest.to_vec();
+            for (&c, &v) in cols.iter().zip(&assignment) {
+                moved[c] = if v < 0 {
+                    FE::zero() - FE::from(v.unsigned_abs())
+                } else {
+                    FE::from(v as u64)
+                };
+            }
+            if eval(&moved).iter().all(|v| *v == FE::zero()) {
+                return Err(format!(
+                    "{name}: multiplicities {assignment:?} on {cols:?} break no constraint on an \
+                     honest row"
+                ));
+            }
         }
     }
     Ok(())
@@ -2525,7 +2553,7 @@ pub(super) fn census_table_with(
         }
         let chain = chain_of(interactions);
         for bi in &messages {
-            check_message_source(name, interactions, bi, chain.as_ref())?;
+            check_message_source(name, interactions, bi, chain.as_ref(), eval)?;
             match &chain {
                 Some(chain) if !is_call_multiplicity(interactions, bi) => {
                     check_chained_sender(name, interactions, bi, chain, eval)?
@@ -2533,6 +2561,11 @@ pub(super) fn census_table_with(
                 _ => check_sender(name, interactions, bi, eval)?,
             }
             check_read_bytes(name, interactions, bi)?;
+        }
+        if let Some(chain) = &chain
+            && tight(Tightened::ChainBinds)
+        {
+            check_chain_binds(name, interactions, chain, eval)?;
         }
         return Ok(());
     }
@@ -2746,18 +2779,28 @@ fn check_sender(
                 "{name}: a written word's half {half:?} is not range-checked"
             ));
         }
+        if fixed && !is_checked_half(half, interactions, &mu) && tight(Tightened::FixedReads) {
+            check_fixed_half(
+                name,
+                interactions,
+                single(&f).expect("one column"),
+                &mu,
+                eval,
+            )?;
+        }
     }
     Ok(())
 }
 
 /// Rule c9: a word message's address is a register's value read in the same
-/// row at the message's multiplicity, or `IS_HALF` limbs, plus a constant below
-/// 2^8.
+/// row at the message's multiplicity, or `IS_HALF` limbs sent at a
+/// multiplicity that covers the message's, plus a constant below 2^8.
 fn check_message_source(
     name: &str,
     interactions: &[BusInteraction],
     message: &BusInteraction,
     chain: Option<&Chain>,
+    eval: Option<(Eval, usize)>,
 ) -> Result<(), String> {
     let carries = chip_carries(interactions);
     if let Some(k) = check_address(&message.values[1..3], name)?
@@ -2797,9 +2840,17 @@ fn check_message_source(
             }
         }
     }
+    // A limb counts when an `IS_HALF` sends it at a multiplicity that covers
+    // the message's ([`covers`]).
     let halves: BTreeSet<usize> = interactions
         .iter()
-        .filter(|bi| bi.bus_id == u64::from(BusId::IsHalfword) && bi.values.len() == 1)
+        .filter(|bi| {
+            (bi.is_sender || !tight(Tightened::Covers))
+                && bi.bus_id == u64::from(BusId::IsHalfword)
+                && bi.values.len() == 1
+                && (!tight(Tightened::Covers)
+                    || covers(name, &multiplicity_form(&bi.multiplicity), &mu, eval))
+        })
         .filter_map(|bi| form(&bi.values[0]).ok())
         .filter(|f| f.len() == 1)
         .filter_map(|f| {
@@ -2823,6 +2874,350 @@ fn check_message_source(
             return Err(format!(
                 "{name}: a word message's address element {i} ({f:?}) has no canonical source"
             ));
+        }
+    }
+    Ok(())
+}
+
+/// The census's rules tightened after the chip review, each of which a test
+/// can loosen back to its earlier form on this thread (the control that shows
+/// the tightening is what refuses a mutant).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Tightened {
+    /// c9: a limb counts only when an `IS_HALF` sends it at a multiplicity
+    /// that covers the message's (before: any `IS_HALF` on the column).
+    Covers,
+    /// c10, c16: a written half one column a constraint fixes reads only
+    /// checked bytes and bits (before: any fixed column passed).
+    FixedReads,
+    /// c16: a later row's message keys and times are bound by the chain
+    /// (before: only the call's timestamp and the high words were asked).
+    ChainBinds,
+    /// c5: the bit rule also read on honest rows (before: an all-zero row).
+    HonestBits,
+}
+
+thread_local! {
+    static LOOSE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Loosens `rules` back to their earlier forms on this thread until the next
+/// call (an empty slice tightens every rule again).
+pub(super) fn loosen(rules: &[Tightened]) {
+    LOOSE.with(|l| l.set(rules.iter().fold(0, |a, r| a | 1 << *r as u8)));
+}
+
+fn tight(rule: Tightened) -> bool {
+    LOOSE.with(|l| l.get()) & (1 << rule as u8) == 0
+}
+
+/// The honest rows of a chip's table, for the rules that read what a
+/// constraint holds on a row meeting every other one: COPY_W's, KECCAK_W's
+/// and ECREC_W's benches (`*_w_tests::census_rows`); none for another table.
+fn chip_rows(name: &str) -> &'static [Vec<FE>] {
+    use std::sync::OnceLock;
+    static COPY: OnceLock<Vec<Vec<FE>>> = OnceLock::new();
+    static KECCAK: OnceLock<Vec<Vec<FE>>> = OnceLock::new();
+    static ECREC: OnceLock<Vec<Vec<FE>>> = OnceLock::new();
+    match name.split('[').next().unwrap_or(name) {
+        f if f == super::copy_w::NAME => COPY.get_or_init(super::copy_w_tests::census_rows),
+        f if f == super::keccak_w::NAME => KECCAK.get_or_init(super::keccak_w_tests::census_rows),
+        f if f == super::ecrec_w::NAME => ECREC.get_or_init(super::ecrec_w_tests::census_rows),
+        _ => &[],
+    }
+}
+
+/// `name`'s honest rows ([`chip_rows`]) on which `eval` reads zero
+/// everywhere (a mutant's constraints keep the rows it still holds).
+fn honest_rows(name: &str, eval: Option<(Eval, usize)>) -> Vec<&'static [FE]> {
+    type Cache = HashMap<(usize, usize), Vec<&'static [FE]>>;
+    thread_local! {
+        static HONEST: std::cell::RefCell<Cache> = std::cell::RefCell::new(HashMap::new());
+    }
+    let Some((eval, width)) = eval else {
+        return Vec::new();
+    };
+    let all = chip_rows(name);
+    let key = (eval as usize, all.as_ptr() as usize);
+    if let Some(hit) = HONEST.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let out: Vec<&'static [FE]> = all
+        .iter()
+        .filter(|r| r.len() == width && eval(r).iter().all(|v| *v == FE::zero()))
+        .map(|r| r.as_slice())
+        .collect();
+    HONEST.with(|c| c.borrow_mut().insert(key, out.clone()));
+    out
+}
+
+/// A linear form's value on `row`.
+fn value_on(f: &BTreeMap<Option<usize>, i128>, row: &[FE]) -> FE {
+    f.iter().fold(FE::zero(), |acc, (k, &c)| {
+        let c = if c < 0 {
+            FE::zero() - FE::from(c.unsigned_abs() as u64)
+        } else {
+            FE::from(c as u64)
+        };
+        acc + c * k.map_or(FE::one(), |k| row[k])
+    })
+}
+
+/// The constraints `eval` breaks on `row` with column `col` at `value`.
+fn broken_at(eval: Eval, row: &[FE], col: usize, value: FE) -> BTreeSet<usize> {
+    let mut moved = row.to_vec();
+    moved[col] = value;
+    eval(&moved)
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v != FE::zero())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Whether a lookup sent at multiplicity `lookup` checks what a message at
+/// `message` carries: the same multiplicity, or one column that is 1 on every
+/// honest row where the message fires and that, set to 0 there, breaks a
+/// constraint (so the message never fires without it). A table with no
+/// honest rows takes the same multiplicity only.
+fn covers(
+    name: &str,
+    lookup: &BTreeMap<Option<usize>, i128>,
+    message: &BTreeMap<Option<usize>, i128>,
+    eval: Option<(Eval, usize)>,
+) -> bool {
+    if lookup == message {
+        return true;
+    }
+    let (Some(m), Some((e, _))) = (single(lookup), eval) else {
+        return false;
+    };
+    let rows: Vec<&[FE]> = honest_rows(name, eval)
+        .into_iter()
+        .filter(|r| value_on(message, r) != FE::zero())
+        .collect();
+    !rows.is_empty()
+        && rows
+            .iter()
+            .all(|r| r[m] == FE::one() && !broken_at(e, r, m, FE::zero()).is_empty())
+}
+
+/// For each column of `row` (an honest row of a chip, `'static`), the
+/// constraints `eval` breaks with that column one more; computed once a row
+/// and constraint set on this thread.
+fn effects(eval: Eval, row: &'static [FE]) -> std::rc::Rc<Vec<BTreeSet<usize>>> {
+    type Cache = HashMap<(usize, usize), std::rc::Rc<Vec<BTreeSet<usize>>>>;
+    thread_local! {
+        static EFFECTS: std::cell::RefCell<Cache> = std::cell::RefCell::new(HashMap::new());
+    }
+    let key = (eval as usize, row.as_ptr() as usize);
+    if let Some(hit) = EFFECTS.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let out = std::rc::Rc::new(
+        (0..row.len())
+            .map(|c| broken_at(eval, row, c, row[c] + FE::one()))
+            .collect::<Vec<_>>(),
+    );
+    EFFECTS.with(|c| c.borrow_mut().insert(key, out.clone()));
+    out
+}
+
+/// The columns held to a bit by a constraint of their own: on an all-zero
+/// row, the column at 2 and at −1 each break one.
+fn bit_columns(eval: Eval, width: usize) -> std::rc::Rc<BTreeSet<usize>> {
+    type Cache = HashMap<usize, std::rc::Rc<BTreeSet<usize>>>;
+    thread_local! {
+        static BITS: std::cell::RefCell<Cache> = std::cell::RefCell::new(HashMap::new());
+    }
+    if let Some(hit) = BITS.with(|c| c.borrow().get(&(eval as usize)).cloned()) {
+        return hit;
+    }
+    let zero = vec![FE::zero(); width];
+    let out = std::rc::Rc::new(
+        (0..width)
+            .filter(|&col| {
+                [FE::from(2u64), FE::zero() - FE::one()]
+                    .into_iter()
+                    .all(|bad| !broken_at(eval, &zero, col, bad).is_empty())
+            })
+            .collect::<BTreeSet<usize>>(),
+    );
+    BITS.with(|c| c.borrow_mut().insert(eval as usize, out.clone()));
+    out
+}
+
+/// The chain's send and receive, if the table has a chain.
+fn chain_pair(interactions: &[BusInteraction]) -> Option<(&BusInteraction, &BusInteraction)> {
+    let chain = chain_of(interactions)?;
+    let send = interactions
+        .iter()
+        .find(|bi| bi.bus_id == chain.bus && bi.is_sender)?;
+    let receive = interactions
+        .iter()
+        .find(|bi| bi.bus_id == chain.bus && !bi.is_sender)?;
+    Some((send, receive))
+}
+
+/// Rules c10 and c16, a written half that is one column `h` a constraint
+/// fixes: on every honest row where the message (at `mu`) fires, each column
+/// the fixing constraints read (one more there breaks one of the constraints
+/// `h` one more breaks) is a bit of its own ([`bit_columns`]), a column a
+/// lookup checks at a multiplicity nonzero on that row, or a column the
+/// table's chain receives whose sent twin a lookup checks on every row the
+/// chain sends from. So the half is a sum of checked bytes under selectors,
+/// whatever its constraint reads.
+fn check_fixed_half(
+    name: &str,
+    interactions: &[BusInteraction],
+    h: usize,
+    mu: &BTreeMap<Option<usize>, i128>,
+    eval: Option<(Eval, usize)>,
+) -> Result<(), String> {
+    let Some((e, width)) = eval else {
+        return Err(format!("{name}: a fixed half {h} with no constraints"));
+    };
+    let rows = honest_rows(name, eval);
+    if rows.is_empty() {
+        // A table with no honest rows here keeps the shape rule alone.
+        return Ok(());
+    }
+    let fired: Vec<&'static [FE]> = rows
+        .iter()
+        .copied()
+        .filter(|r| value_on(mu, r) != FE::zero())
+        .collect();
+    if fired.is_empty() {
+        return Err(format!(
+            "{name}: no honest row writes the fixed half {h} to read its constraint on"
+        ));
+    }
+    let checked_on = |col: usize, row: &[FE]| {
+        let alone = BTreeMap::from([(Some(col), 1i128)]);
+        interactions.iter().any(|bi| {
+            bi.is_sender
+                && (bi.bus_id == u64::from(BusId::AreBytes)
+                    || bi.bus_id == u64::from(BusId::IsHalfword))
+                && bi
+                    .values
+                    .iter()
+                    .any(|v| form(v).ok().as_ref() == Some(&alone))
+                && value_on(&multiplicity_form(&bi.multiplicity), row) != FE::zero()
+        })
+    };
+    let pair = chain_pair(interactions);
+    let carried_checked = |col: usize| -> bool {
+        let Some((send, receive)) = pair else {
+            return false;
+        };
+        let Some(at) = receive
+            .values
+            .iter()
+            .position(|v| form(v).ok().and_then(|f| single(&f)) == Some(col))
+        else {
+            return false;
+        };
+        let Some(sent) = form(&send.values[at]).ok().and_then(|f| single(&f)) else {
+            return false;
+        };
+        let sends = multiplicity_form(&send.multiplicity);
+        let senders: Vec<&[FE]> = rows
+            .iter()
+            .copied()
+            .filter(|r| value_on(&sends, r) != FE::zero())
+            .collect();
+        !senders.is_empty() && senders.iter().all(|r| checked_on(sent, r))
+    };
+    let bits = bit_columns(e, width);
+    for row in fired {
+        let effect = effects(e, row);
+        let identity = &effect[h];
+        if identity.is_empty() {
+            return Err(format!(
+                "{name}: half {h} is fixed by no constraint on a row"
+            ));
+        }
+        for col in (0..width).filter(|&c| c != h) {
+            if !effect[col].is_disjoint(identity)
+                && !bits.contains(&col)
+                && !checked_on(col, row)
+                && !carried_checked(col)
+            {
+                return Err(format!(
+                    "{name}: the half {h} a constraint fixes reads column {col}, which no \
+                     lookup checks"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rule c16, what a chain binds: on every honest row of a call after its
+/// first where a word message fires, each column its key or timestamp reads
+/// (a carry aside, rule c19) is one the chain receives, or one a constraint
+/// fixes there from columns the chain receives, bits of their own, carries,
+/// or other columns of the message's key and timestamp. So a later row's keys
+/// and times are its call's, not the prover's.
+fn check_chain_binds(
+    name: &str,
+    interactions: &[BusInteraction],
+    chain: &Chain,
+    eval: Option<(Eval, usize)>,
+) -> Result<(), String> {
+    let Some((e, width)) = eval else {
+        return Err(format!("{name}: a chain with no constraints"));
+    };
+    let rows = honest_rows(name, eval);
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let carries = chip_carries(interactions);
+    let received: BTreeSet<usize> = interactions
+        .iter()
+        .filter(|bi| bi.bus_id == chain.bus && !bi.is_sender)
+        .flat_map(|bi| bi.values.iter().filter_map(|v| form(v).ok()))
+        .flat_map(|f| columns(&f))
+        .collect();
+    let bits = bit_columns(e, width);
+    let later: Vec<&'static [FE]> = rows
+        .iter()
+        .copied()
+        .filter(|r| r[chain.first] == FE::zero())
+        .collect();
+    for message in interactions
+        .iter()
+        .filter(|bi| bi.bus_id == u64::from(BusId::MemWordMsg) && bi.is_sender)
+    {
+        let mu = multiplicity_form(&message.multiplicity);
+        let read: BTreeSet<usize> = message.values[1..4]
+            .iter()
+            .filter_map(|v| form(v).ok())
+            .flat_map(|f| columns(&f))
+            .filter(|c| !carries.contains(c))
+            .collect();
+        let bound = |c: usize| {
+            received.contains(&c) || carries.contains(&c) || read.contains(&c) || bits.contains(&c)
+        };
+        for row in later.iter().filter(|r| value_on(&mu, r) != FE::zero()) {
+            let effect = effects(e, row);
+            for &col in read.iter().filter(|c| !received.contains(c)) {
+                let fixing = &effect[col];
+                if fixing.is_empty() {
+                    return Err(format!(
+                        "{name}: a later row's message reads column {col}, which its chain \
+                         does not carry and no constraint fixes"
+                    ));
+                }
+                if let Some(other) =
+                    (0..width).find(|&o| o != col && !effect[o].is_disjoint(fixing) && !bound(o))
+                {
+                    return Err(format!(
+                        "{name}: a later row's message reads column {col}, fixed by a \
+                         constraint on column {other}, which its chain does not carry"
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -3133,6 +3528,15 @@ fn check_chained_sender(
             return Err(format!(
                 "{name}: a written word's half {f:?} is neither checked nor fixed"
             ));
+        }
+        if fixed && !is_checked_half(half, interactions, &mu) && tight(Tightened::FixedReads) {
+            check_fixed_half(
+                name,
+                interactions,
+                single(&f).expect("one column"),
+                &mu,
+                eval,
+            )?;
         }
     }
     Ok(())
@@ -4975,6 +5379,251 @@ fn the_census_holds_a_carry_to_the_last_word() {
         assert!(
             census_table_with(name, &honest, 0, None).is_err(),
             "{name}: no constraints"
+        );
+    }
+}
+
+/// KECCAK_W's constraints with `W4`'s rule (`W4 = LAST·(1 − Q_0)`) replaced
+/// by "`W4` only on a row" (`(1 − MU)·W4`): a mutant whose `W4` an all-zero
+/// row still holds to a bit, an active row does not.
+fn keccak_w_w4_off_a_row(row: &[FE]) -> Vec<FE> {
+    use super::keccak_w::{W4_RULE, cols as kw};
+    let mut v = keccak_w_constraints(row);
+    v[W4_RULE] = (FE::one() - row[kw::MU]) * row[kw::W4];
+    v
+}
+
+/// ★ Each census rule the chip review tightened refuses a chip mutant its
+/// earlier form took, read on the chip's honest rows (rows that meet every
+/// other constraint), and takes it again loosened back (the control):
+/// - c9: COPY_W with the `IS_HALF` of a source key limb at multiplicity zero,
+///   or received instead of sent;
+/// - c10, c16: KECCAK_W without the 16 `ARE_BYTES` pairs on the digest's
+///   bytes, which the written digest halves' identities read;
+/// - c16: COPY_W whose chain does not carry the source key's low word, and
+///   KECCAK_W whose link does not carry the block's address;
+/// - c5: KECCAK_W whose `W4` is held only off a row.
+#[test]
+fn the_tightened_census_refuses_what_its_earlier_rules_took() {
+    use super::copy_w::{self, cols as cw};
+    use super::keccak_w::{self, cols as kw};
+    let check = |what: &str,
+                 name: &str,
+                 interactions: &[BusInteraction],
+                 eval: Option<(Eval, usize)>,
+                 rule: Tightened,
+                 why: &str| {
+        let eval = eval.or_else(|| evaluator(name));
+        loosen(&[]);
+        let tightened = census_table_with(name, interactions, 0, eval);
+        loosen(&[rule]);
+        let earlier = census_table_with(name, interactions, 0, eval);
+        loosen(&[]);
+        assert!(
+            matches!(&tightened, Err(e) if e.contains(why)),
+            "{what}: {tightened:?}"
+        );
+        assert!(
+            earlier.is_ok(),
+            "control, {what}, {rule:?} loosened: {earlier:?}"
+        );
+    };
+    let copy = copy_w::bus_interactions();
+    let keccak = keccak_w::bus_interactions();
+    loosen(&[]);
+    census_table("COPY_W[0]", &copy, 0).unwrap_or_else(|e| panic!("{e}"));
+    census_table("KECCAK_W[0]", &keccak, 0).unwrap_or_else(|e| panic!("{e}"));
+
+    let limb = |bi: &BusInteraction| {
+        bi.bus_id == u64::from(BusId::IsHalfword) && bi.values == vec![column(cw::SRC_KEY_LO[0])]
+    };
+    let mut at_zero = copy.clone();
+    let i = at_zero.iter().position(limb).expect("the limb's IS_HALF");
+    at_zero[i].multiplicity = Multiplicity::Linear(vec![LinearTerm::Constant(0)]);
+    check(
+        "COPY_W, a key limb's IS_HALF at multiplicity zero",
+        "COPY_W[0]",
+        &at_zero,
+        None,
+        Tightened::Covers,
+        "no canonical source",
+    );
+    let mut received = copy.clone();
+    received[i].is_sender = false;
+    check(
+        "COPY_W, a key limb's IS_HALF received",
+        "COPY_W[0]",
+        &received,
+        None,
+        Tightened::Covers,
+        "no canonical source",
+    );
+
+    let digest: Vec<usize> = (0..keccak_w::DIGEST).map(kw::output_byte).collect();
+    let unpaired: Vec<BusInteraction> = keccak
+        .iter()
+        .filter(|bi| {
+            !(bi.bus_id == u64::from(BusId::AreBytes)
+                && bi
+                    .values
+                    .first()
+                    .and_then(|v| form(v).ok())
+                    .and_then(|f| single(&f))
+                    .is_some_and(|c| digest.contains(&c)))
+        })
+        .cloned()
+        .collect();
+    assert_eq!(unpaired.len() + 16, keccak.len());
+    check(
+        "KECCAK_W without its digest's byte pairs",
+        "KECCAK_W[0]",
+        &unpaired,
+        None,
+        Tightened::FixedReads,
+        "which no lookup checks",
+    );
+
+    let mut copy_chain = copy.clone();
+    for bi in copy_chain
+        .iter_mut()
+        .filter(|bi| bi.bus_id == u64::from(BusId::CopyWordNext))
+    {
+        bi.values[3] = BusValue::constant(0);
+    }
+    check(
+        "COPY_W whose chain does not carry the source key's low word",
+        "COPY_W[0]",
+        &copy_chain,
+        None,
+        Tightened::ChainBinds,
+        "its chain does not carry",
+    );
+    let mut keccak_link = keccak.clone();
+    for bi in keccak_link
+        .iter_mut()
+        .filter(|bi| bi.bus_id == u64::from(BusId::KeccakSponge))
+    {
+        bi.values[3] = BusValue::constant(0);
+    }
+    check(
+        "KECCAK_W whose link does not carry the block's address",
+        "KECCAK_W[0]",
+        &keccak_link,
+        None,
+        Tightened::ChainBinds,
+        "its chain does not carry",
+    );
+
+    check(
+        "KECCAK_W whose W4 is held only off a row",
+        "KECCAK_W[0]",
+        &keccak,
+        Some((keccak_w_w4_off_a_row as Eval, kw::NUM_COLUMNS)),
+        Tightened::HonestBits,
+        "on an honest row",
+    );
+}
+
+/// ★ The word frame with the three word chips (COPY_W, KECCAK_W and its
+/// rounds, ECREC_W and ECDAS, MEMW_W), under both register formats: the
+/// CPU's syscall send has four receivers, HALT, COPY_W (memcpy, memset,
+/// commit), KECCAK_W (keccak256) and ECREC_W, and no other; no table sends a
+/// RAM byte message (every `Memw` send is a register's), and every `Memw`
+/// receive is a register's. So a word set cannot keep a byte-message chip
+/// beside or in place of a word chip.
+#[test]
+fn the_word_frame_with_chips_has_their_receivers_and_no_ram_byte_sender() {
+    use executor::vm::instruction::execution::{
+        DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_SYSCALL_NUMBER, ECREC_SYSCALL_NUMBER,
+        KECCAK256_SYSCALL_NUMBER,
+    };
+    for registers in [
+        crate::tables::register::RegisterFormat::InRow,
+        crate::tables::register::RegisterFormat::Tokens32,
+    ] {
+        let format = block_whir::BlockFormat {
+            registers,
+            ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
+        };
+        let mut counts = chip_free_counts();
+        counts.copy = 1;
+        counts.keccak = 1;
+        counts.keccak_rnd = 1;
+        counts.ecrec = 1;
+        counts.ecdas = 1;
+        let mut stated = CPU_WORD_TABLES;
+        stated[6] = 1;
+        let frame = frame_of(&words_statement(&format, &counts, stated), &format)
+            .expect("the statement frames");
+        let mut receivers: Vec<(String, BTreeSet<u64>)> = Vec::new();
+        let mut ram_byte_senders = BTreeSet::new();
+        let mut ram_byte_receivers = BTreeSet::new();
+        for air in frame.airs.air_refs() {
+            let family = air.name().split('[').next().unwrap_or("").to_string();
+            let width = air.trace_layout().0;
+            for bi in air.bus_interactions() {
+                let values = |row: &dyn Fn(usize) -> FE| -> Vec<u64> {
+                    bi.values
+                        .iter()
+                        .flat_map(|v| v.combine_from(row))
+                        .map(|x: FE| x.canonical_u64())
+                        .collect()
+                };
+                if bi.bus_id == u64::from(BusId::Ecall) && !bi.is_sender {
+                    // The numbers the receive takes: every flag column at 0,
+                    // and each alone at 1.
+                    let number = |row: &dyn Fn(usize) -> FE| {
+                        let v = values(row);
+                        let at = |k: usize| v.get(k).copied().unwrap_or(0) & 0xFFFF_FFFF;
+                        at(2) | at(3) << 32
+                    };
+                    let mut numbers = BTreeSet::from([number(&|_| FE::zero())]);
+                    for c in 0..width {
+                        numbers.insert(number(&|k| if k == c { FE::one() } else { FE::zero() }));
+                    }
+                    receivers.push((family.clone(), numbers));
+                }
+                if bi.bus_id == u64::from(BusId::Memw) {
+                    let (zero, one) = (values(&|_| FE::zero()), values(&|_| FE::one()));
+                    let flag = if zero.len() == 24 { 8 } else { 0 };
+                    let register = zero.get(flag) == Some(&1) && one.get(flag) == Some(&1);
+                    if !register {
+                        if bi.is_sender {
+                            ram_byte_senders.insert(family.clone());
+                        } else {
+                            ram_byte_receivers.insert(family.clone());
+                        }
+                    }
+                }
+            }
+        }
+        receivers.sort();
+        let families: Vec<&str> = receivers.iter().map(|(f, _)| f.as_str()).collect();
+        assert_eq!(
+            families,
+            ["COPY_W", "ECREC_W", "HALT", "KECCAK_W"],
+            "{registers:?}"
+        );
+        let takes = |family: &str| -> &BTreeSet<u64> {
+            &receivers
+                .iter()
+                .find(|(f, _)| f == family)
+                .expect("a receiver")
+                .1
+        };
+        for n in [DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_SYSCALL_NUMBER, 64] {
+            assert!(takes("COPY_W").contains(&n), "COPY_W takes {n:#x}");
+        }
+        assert!(takes("KECCAK_W").contains(&KECCAK256_SYSCALL_NUMBER));
+        assert!(takes("ECREC_W").contains(&ECREC_SYSCALL_NUMBER));
+        assert!(takes("HALT").contains(&93));
+        assert!(
+            ram_byte_senders.is_empty(),
+            "{registers:?}: {ram_byte_senders:?}"
+        );
+        assert!(
+            ram_byte_receivers.is_empty(),
+            "{registers:?}: {ram_byte_receivers:?}"
         );
     }
 }
