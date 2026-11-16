@@ -1248,6 +1248,19 @@ pub fn create_copy_air(
     )
 }
 
+pub fn create_keccak_w_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::keccak_w::KeccakWordConstraints> {
+    build_air(
+        crate::tables::keccak_w::cols::NUM_COLUMNS,
+        crate::tables::keccak_w::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::keccak_w::KeccakWordConstraints,
+        crate::tables::keccak_w::NAME,
+    )
+}
+
 pub fn create_copy_w_air(
     proof_options: &ProofOptions,
 ) -> ConcreteVmAir<crate::tables::copy_w::CopyWordConstraints> {

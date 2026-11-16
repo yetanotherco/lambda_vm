@@ -418,6 +418,10 @@ fn ecall(memory: &mut impl Accesses, regs: &mut Registers, op: CpuOp<'_>, ts: u6
         for (reg, value) in [(10u8, ptr), (11, len), (12, out)] {
             regs.write(reg, value, ts);
         }
+        if words {
+            covering(memory, ptr, len);
+            covering(memory, out, 32);
+        }
         memory.access(ptr, len as usize, Some(ts));
         for i in 0..4u64 {
             memory.access(out.wrapping_add(8 * i), 8, Some(ts + 1));

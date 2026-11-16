@@ -4518,7 +4518,12 @@ impl CallTable {
     /// The whole run padded: the padding row keeps its own table.
     fn split(self, traces: &mut crate::tables::trace_builder::Traces, rows_log2: usize) {
         match self {
-            CallTable::Keccak => block_whir::split_keccak(traces, rows_log2, CutPadding::WholeRun),
+            CallTable::Keccak => block_whir::split_keccak(
+                traces,
+                rows_log2,
+                CutPadding::WholeRun,
+                crate::tables::fused_memory::MemoryFormat::Split,
+            ),
             CallTable::Ecsm => block_whir::split_ecsm(traces, rows_log2, CutPadding::WholeRun),
         }
     }
@@ -4609,6 +4614,7 @@ fn keccak_and_ecsm_split_into_chunks_prove_and_verify() {
                 traces,
                 block_whir::BLOCK_KECCAK_ROWS_LOG2,
                 CutPadding::default(),
+                crate::tables::fused_memory::MemoryFormat::Split,
             );
             block_whir::split_ecsm(
                 traces,

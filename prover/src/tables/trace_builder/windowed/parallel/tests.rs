@@ -870,6 +870,7 @@ fn word_windows_walked_on_threads_build_the_windowed_tables() {
         "test_copy_ecalls",
         "test_copy_overlaps",
         "test_commit_split",
+        "test_keccak256",
     ] {
         let (program, logs) = run(name);
         let reference = {

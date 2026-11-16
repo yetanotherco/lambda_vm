@@ -29,7 +29,8 @@ use crate::tables::store::cols as st;
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::tables::word_cpu::{WordClass, word_class};
 use crate::tables::{
-    copy_w, mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew, memw_w, page_w,
+    copy_w, keccak_w, mem_load2w, mem_load8, mem_loadw, mem_store2w, mem_store8, mem_storew,
+    memw_w, page_w,
 };
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
@@ -100,11 +101,13 @@ fn get(t: &Table, row: usize, col: usize) -> u64 {
 /// `program`'s run built by windows of `window` cycles under the word memory
 /// format, the registers in `registers`, the small chunks.
 fn word_build(program: &Elf, logs: &[Log], registers: RegisterFormat, window: usize) -> Traces {
+    let keccak_rnd = crate::block_whir::BlockFormat::production().keccak_rnd;
     windowed(program, logs, &MaxRowsConfig::small(), window, &|b| {
         b.register_format(registers)
             .expect("before any window")
             .memw_aligned_order(MemwAlignedOrder::Limbs)
             .expect("before any window")
+            .keccak_rnd_form(keccak_rnd)
             .memory_format(MemoryFormat::Words)
             .expect("before any window")
     })
@@ -257,8 +260,14 @@ fn broken(build: &Traces) -> Vec<(usize, usize, usize, usize)> {
     each(4, &w[4], &mem_load2w::MemLoad2WConstraints, &mut out);
     each(5, &w[5], &mem_store2w::MemStore2WConstraints, &mut out);
     each(6, &w[6], &memw_w::MemwWordConstraints, &mut out);
-    // COPY's tables, COPY_W's under the word format.
+    // COPY's tables, COPY_W's under the word format; KECCAK's, KECCAK_W's.
     each(7, &build.copies, &copy_w::CopyWordConstraints, &mut out);
+    each(
+        8,
+        &build.keccaks,
+        &keccak_w::KeccakWordConstraints,
+        &mut out,
+    );
     out
 }
 
@@ -485,6 +494,56 @@ fn copy_calls_build_balanced_traces_under_the_word_walk() {
     }
 }
 
+/// ★ Under the word memory format, a run of keccak256 calls (every input
+/// offset and the lengths at each block edge, the digest at offsets of its
+/// own and once over its own input, then a commit of the digests) builds, by
+/// windows of 1000 cycles and of 7: KECCAK's tables are KECCAK_W's, MEMW_W
+/// holds their word accesses, every inner bus balances under the verifier's
+/// set (the round chip's included, the commit bus against the public
+/// output), every word table's, COPY_W's and KECCAK_W's row meets its
+/// constraints, and the digests committed are the split build's.
+#[test]
+fn keccak256_calls_build_balanced_traces_under_the_word_walk() {
+    let name = "test_keccak256";
+    let (program, logs) = run(name);
+    let split = split_build(&program, &logs);
+    let registers = RegisterFormat::InRow;
+    for window in [1000, 7] {
+        let mut build = word_build(&program, &logs, registers, window);
+        let counts = build.table_counts();
+        assert_eq!(
+            (counts.load, counts.store, counts.memw, counts.memw_aligned),
+            (0, 0, 0, 0),
+            "window {window}: the retired tables"
+        );
+        assert!(
+            counts.keccak > 0 && counts.keccak_rnd > 0 && build.word_counts()[6] > 0,
+            "KECCAK_W, its rounds and MEMW_W: {counts:?} {:?}",
+            build.word_counts()
+        );
+        assert!(
+            build
+                .keccaks
+                .iter()
+                .all(|t| t.main_table.width == keccak_w::cols::NUM_COLUMNS),
+            "KECCAK's tables are KECCAK_W's"
+        );
+        assert_eq!(
+            build.public_output_bytes, split.public_output_bytes,
+            "the digests committed"
+        );
+        pages_hold_the_verifiers_columns(&build).unwrap_or_else(|e| panic!("{e}"));
+        let left = left(&program, &mut build, registers);
+        assert!(
+            left.is_empty(),
+            "window {window}: {}",
+            super::bus_net_tests::named(&left)
+        );
+        let broken = broken(&build);
+        assert!(broken.is_empty(), "{broken:?}");
+    }
+}
+
 /// ★ Every CPU load and store is exactly one word table's row, of the family
 /// its width and address name: the word build's rows, as (family,
 /// timestamp, address), are the split build's LOAD and STORE rows classed by
@@ -512,13 +571,14 @@ fn every_load_and_store_is_one_word_tables_row() {
     }
 }
 
-/// ★ The word format proves no syscall but the halt and the COPY chip's yet:
-/// a run that hashes is refused by the walk, naming the syscall, before any
-/// table is built; the same runs build under the fused format.
+/// ★ The word format proves no syscall but the halt, the COPY chip's and
+/// keccak256 yet: a run that permutes a Keccak state, compresses with BLAKE3
+/// or multiplies a curve point is refused by the walk, naming the syscall,
+/// before any table is built.
 #[test]
 fn a_run_calling_a_chip_is_refused_by_the_word_walk() {
     use super::windowed::WindowedTraceBuilder;
-    for name in ["test_keccak", "test_blake3", "test_keccak256"] {
+    for name in ["test_keccak", "test_blake3", "test_ecsm"] {
         let (program, logs) = run(name);
         let mut builder = WindowedTraceBuilder::new(&program, &[], &MaxRowsConfig::small())
             .expect("the builder")
@@ -653,6 +713,7 @@ fn word_record_build(
     let mut builder = WindowedTraceBuilder::new(program, &[], &max_rows)?
         .register_format(RegisterFormat::InRow)?
         .memw_aligned_order(MemwAlignedOrder::Limbs)?
+        .keccak_rnd_form(crate::block_whir::BlockFormat::production().keccak_rnd)
         .memory_format(MemoryFormat::Words)?
         .drop_streamed_ops()?
         .light_walk(level)?;
@@ -722,6 +783,7 @@ fn record_mode_under_the_word_format_builds_the_windowed_tables() {
         "test_copy_ecalls",
         "test_copy_overlaps",
         "test_commit_split",
+        "test_keccak256",
     ] {
         let (program, logs) = run(name);
         let want = word_build(&program, &logs, RegisterFormat::InRow, 7);

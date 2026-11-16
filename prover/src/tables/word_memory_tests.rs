@@ -195,12 +195,25 @@ fn answered(bus: u64, tuple: &[u64]) -> bool {
     } else if bus == u64::from(BusId::Msb8) {
         // `(byte, its top bit)`.
         tuple.len() <= 2 && at(0) < 256 && at(1) == at(0) >> 7
+    } else if bus == u64::from(BusId::ByteAlu) {
+        // `(XOR, a, b, a ⊕ b)` on bytes (the only byte operation the word
+        // benches send).
+        tuple.len() <= 4
+            && at(0) == u64::from(super::types::alu_op::XOR)
+            && at(1) < 256
+            && at(2) < 256
+            && at(3) == at(1) ^ at(2)
     } else {
         false
     }
 }
 
-const LOOKUPS: [BusId; 3] = [BusId::IsHalfword, BusId::AreBytes, BusId::Msb8];
+const LOOKUPS: [BusId; 4] = [
+    BusId::IsHalfword,
+    BusId::AreBytes,
+    BusId::Msb8,
+    BusId::ByteAlu,
+];
 
 fn signed(v: FE) -> i128 {
     let v = v.canonical_u64();
@@ -1918,12 +1931,20 @@ fn evaluator(name: &str) -> Option<(Eval, usize)> {
         "MEM_LOAD2W" => Some((load2w_constraints as Eval, mem_load2w::cols::NUM_COLUMNS)),
         "MEM_STORE2W" => Some((store2w_constraints as Eval, mem_store2w::cols::NUM_COLUMNS)),
         "COPY_W" => Some((copy_w_constraints as Eval, super::copy_w::cols::NUM_COLUMNS)),
+        "KECCAK_W" => Some((
+            keccak_w_constraints as Eval,
+            super::keccak_w::cols::NUM_COLUMNS,
+        )),
         _ => None,
     }
 }
 
 pub(super) fn copy_w_constraints(row: &[FE]) -> Vec<FE> {
     constraint_values(&super::copy_w::CopyWordConstraints, row)
+}
+
+pub(super) fn keccak_w_constraints(row: &[FE]) -> Vec<FE> {
+    constraint_values(&super::keccak_w::KeccakWordConstraints, row)
 }
 
 /// Rule c11, a CPU word table's key: the dispatch's timestamp's high word the
@@ -3205,13 +3226,13 @@ fn the_word_format_frame_holds_its_rules() {
 }
 
 /// ★ Under the word memory format the table of every chip the format takes
-/// no call of yet is refused by count, each by name: KECCAK, KECCAK_RND,
-/// IS_WH, BLAKE3, ECSM, ECDAS, ECREC and HINT. A chip-free statement frames;
+/// no call of yet is refused by count, each by name: IS_WH (KECCAK's permute
+/// mode), BLAKE3, ECSM, ECDAS, ECREC and HINT. A chip-free statement frames;
 /// the same statement stating one table of one chip (its heights carried, the
 /// set built with it) is refused, and with the refusal taken out (a control
 /// mutant) it frames, so the rule alone is what refuses it. COPY's tables
-/// (COPY_W's under the word format) and MEMW_W's are the format's: a
-/// statement stating them frames. Under the split and fused formats the rule
+/// (COPY_W's under the word format), KECCAK's (KECCAK_W's) and its round
+/// chip's and MEMW_W's are the format's: a statement stating them frames. Under the split and fused formats the rule
 /// reads nothing.
 #[test]
 fn the_word_format_refuses_every_chip_table() {
@@ -3222,22 +3243,11 @@ fn the_word_format_refuses_every_chip_table() {
         &format,
     )
     .expect("the chip-free statement frames");
-    let names = [
-        "KECCAK",
-        "KECCAK_RND",
-        "IS_WH",
-        "BLAKE3",
-        "ECSM",
-        "ECDAS",
-        "ECREC",
-        "HINT",
-    ];
+    let names = ["IS_WH", "BLAKE3", "ECSM", "ECDAS", "ECREC", "HINT"];
     for table in names {
         let mut counts = chip_free.clone();
         let words = CPU_WORD_TABLES;
         match table {
-            "KECCAK" => counts.keccak = 1,
-            "KECCAK_RND" => counts.keccak_rnd = 1,
             "IS_WH" => counts.is_wh = 1,
             "BLAKE3" => counts.blake3 = 1,
             "ECSM" => counts.ecsm = 1,
@@ -3270,11 +3280,13 @@ fn the_word_format_refuses_every_chip_table() {
     }
     let mut counts = chip_free.clone();
     counts.copy = 2;
+    counts.keccak = 1;
+    counts.keccak_rnd = 1;
     let mut words = CPU_WORD_TABLES;
     words[6] = 1;
     assert!(block_whir::chip_tables_under(MemoryFormat::Words, &counts, words).is_ok());
     let statement = words_statement(&format, &counts, words);
-    frame_of(&statement, &format).expect("COPY_W's and MEMW_W's tables frame");
+    frame_of(&statement, &format).expect("COPY_W's, KECCAK_W's and MEMW_W's tables frame");
 }
 
 /// ★ Under the split and fused formats the word tables' counts are absorbed
