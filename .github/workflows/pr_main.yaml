@@ -103,7 +103,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile', '.cargo/config.toml') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -275,7 +275,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile', '.cargo/config.toml') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -391,7 +391,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile', '.cargo/config.toml') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -409,7 +409,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: executor/program_artifacts/recursion
-          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'prover/src/**', 'prover/Cargo.toml', 'crypto/**/src/**', 'crypto/**/Cargo.toml', 'executor/src/**', 'executor/Cargo.toml', 'syscalls/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'Makefile') }}
+          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'prover/src/**', 'prover/Cargo.toml', 'crypto/**/src/**', 'crypto/**/Cargo.toml', 'executor/src/**', 'executor/Cargo.toml', 'syscalls/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'Makefile', '.cargo/config.toml') }}
           restore-keys: |
             recursion-elf-artifacts-
 
@@ -480,7 +480,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile', '.cargo/config.toml') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -508,7 +508,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: executor/program_artifacts/recursion
-          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'prover/src/**', 'prover/Cargo.toml', 'crypto/**/src/**', 'crypto/**/Cargo.toml', 'executor/src/**', 'executor/Cargo.toml', 'syscalls/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'Makefile') }}
+          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'prover/src/**', 'prover/Cargo.toml', 'crypto/**/src/**', 'crypto/**/Cargo.toml', 'executor/src/**', 'executor/Cargo.toml', 'syscalls/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'Makefile', '.cargo/config.toml') }}
           restore-keys: |
             recursion-elf-artifacts-
 
@@ -564,7 +564,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile', '.cargo/config.toml') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -581,7 +581,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: executor/program_artifacts/recursion
-          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'prover/src/**', 'prover/Cargo.toml', 'crypto/**/src/**', 'crypto/**/Cargo.toml', 'executor/src/**', 'executor/Cargo.toml', 'syscalls/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'Makefile') }}
+          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'prover/src/**', 'prover/Cargo.toml', 'crypto/**/src/**', 'crypto/**/Cargo.toml', 'executor/src/**', 'executor/Cargo.toml', 'syscalls/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'Makefile', '.cargo/config.toml') }}
           restore-keys: |
             recursion-elf-artifacts-
 

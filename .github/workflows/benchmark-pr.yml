@@ -27,6 +27,13 @@ on:
       # listed: CI never runs it, so changing it cannot change the bytes proven
       # here.
       - 'Makefile'
+      # The guest's cargo config carries the rustflags every guest ELF is built with, so
+      # a change confined to it changes the bytes proven — the same reason 'syscalls/**'
+      # is here. Without it a config-only commit would leave main's baseline built from
+      # the previous flags, and every /bench until the next prover change would compare
+      # against it. hyperfine.yaml and pr_main.yaml hash this file into their guest-ELF
+      # cache keys for the same reason.
+      - '.cargo/config.toml'
   # Uncomment to auto-run on PRs:
   # pull_request:
   #   branches: [main]
@@ -36,6 +43,7 @@ on:
   #     - 'executor/**'
   #     - 'bin/cli/**'
   #     - 'syscalls/**'
+  #     - '.cargo/config.toml'
 
 permissions:
   contents: read
