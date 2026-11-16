@@ -11,7 +11,13 @@
 //! addresses (`2^64 − 2^32 ≡ −1`), so a stack word would answer for an
 //! unaligned low pointer. The timestamp is one element, as the register
 //! tokens' on [`BusId::Reg`]. `lo` and `hi` are the word's two 32-bit halves,
-//! little-endian; every table that produces a token keeps them canonical.
+//! little-endian; every table that produces a token keeps them canonical, each
+//! below `2^32`: PAGE_W's initial words are the verifier's or `IS_HALF`
+//! checked, a CPU store's new word is checked halves or the old word's checked
+//! bytes with the register's checked bytes placed, a load passes its word
+//! through, and a chip writes only checked words. A register's own words need
+//! not be canonical (the CPU holds a jump's return address by its carries
+//! alone), so no store writes them unchecked.
 //!
 //! ## Who makes tokens
 //!

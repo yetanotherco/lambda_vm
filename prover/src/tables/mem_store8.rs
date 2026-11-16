@@ -8,18 +8,27 @@
 //! the dispatch's `rv2`, both halves. A token exists only at an aligned
 //! address (`super::word_cpu`).
 //!
-//! ## Columns (10)
+//! The new word is held as four 16-bit halves, each range-checked, so the
+//! word the row writes is canonical: each 32-bit half below `2^32`. The CPU
+//! does not keep every register word canonical (a jump's return address is
+//! held by its carries alone), so a store that wrote the dispatch's words as
+//! they come would let such a word into memory, and back into any register
+//! by a load. The split and fused formats check a stored value's bytes for
+//! the same reason.
 //!
-//! `ADDRESS_LO`, `ADDRESS_HI`, `TIMESTAMP`, `OLD_LO`, `OLD_HI`, `NEW_LO`,
-//! `NEW_HI`, `STEP_0`, `STEP_1`, `MU`.
+//! ## Columns (12)
 //!
-//! ## Interactions (5)
+//! `ADDRESS_LO`, `ADDRESS_HI`, `TIMESTAMP`, `OLD_LO`, `OLD_HI`, `NEW[4]`
+//! (16-bit halves, low first), `STEP_0`, `STEP_1`, `MU`.
+//!
+//! ## Interactions (9)
 //!
 //! - the word check at `MU`: the limbs' two `IS_HALF`, the token consumed at
 //!   `(ADDRESS_LO, ADDRESS_HI)` with `(OLD_LO, OLD_HI)` and produced with
-//!   `(NEW_LO, NEW_HI)`;
-//! - the dispatch at `MU`: `(TIMESTAMP, 0, ADDRESS_LO, ADDRESS_HI, NEW_LO,
-//!   NEW_HI, 17, 0, 0)`.
+//!   `(NEW_0 + 2^16·NEW_1, NEW_2 + 2^16·NEW_3)`;
+//! - `IS_HALF` on each `NEW` half, at `MU`;
+//! - the dispatch at `MU`: `(TIMESTAMP, 0, ADDRESS_LO, ADDRESS_HI, NEW_0 +
+//!   2^16·NEW_1, NEW_2 + 2^16·NEW_3, 17, 0, 0)`.
 //!
 //! ## Constraints (1, degree 2)
 //!
@@ -27,6 +36,10 @@
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity};
+
+use super::bitwise::BitwiseOperationType;
+use super::types::BusId;
+use super::word_memory::term;
 use stark::trace::TraceTable;
 
 use super::bitwise::{BitwiseHistogram, BitwiseOperation};
@@ -46,15 +59,14 @@ pub mod cols {
     /// The word before the store, low and high halves.
     pub const OLD_LO: usize = 3;
     pub const OLD_HI: usize = 4;
-    /// The word stored: the register's value, low and high halves.
-    pub const NEW_LO: usize = 5;
-    pub const NEW_HI: usize = 6;
+    /// The word stored, the register's value: four 16-bit halves, low first.
+    pub const NEW: [usize; 4] = [5, 6, 7, 8];
     /// `ts − old_ts − 1`, low and high 16 bits.
-    pub const STEP_0: usize = 7;
-    pub const STEP_1: usize = 8;
+    pub const STEP_0: usize = 9;
+    pub const STEP_1: usize = 10;
     /// Whether the row is a store.
-    pub const MU: usize = 9;
-    pub const NUM_COLUMNS: usize = 10;
+    pub const MU: usize = 11;
+    pub const NUM_COLUMNS: usize = 12;
 }
 
 // =========================================================================
@@ -113,10 +125,19 @@ impl Store8Row {
         })
     }
 
-    /// The row's BITWISE lookups: the limbs' `IS_HALF`.
+    /// The row's BITWISE lookups: the limbs' `IS_HALF`, then the new word's
+    /// four halves' `IS_HALF`.
     #[inline]
     pub(crate) fn bitwise_ops(&self) -> impl Iterator<Item = BitwiseOperation> {
-        limb_lookups(self.step).into_iter()
+        limb_lookups(self.step)
+            .into_iter()
+            .chain(quarters(self.new).into_iter().map(|half| {
+                BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    half as u8,
+                    (half >> 8) as u8,
+                )
+            }))
     }
 
     /// [`Self::bitwise_ops`] counted into `histogram`.
@@ -154,6 +175,17 @@ impl Store8Row {
     }
 }
 
+/// A word's four 16-bit halves, low first.
+#[inline]
+fn quarters(word: u64) -> [u16; 4] {
+    [
+        word as u16,
+        (word >> 16) as u16,
+        (word >> 32) as u16,
+        (word >> 48) as u16,
+    ]
+}
+
 // =========================================================================
 // Trace generation
 // =========================================================================
@@ -180,9 +212,7 @@ pub(crate) fn generate_mem_store8_trace_segments_as(
             let (old_lo, old_hi) = halves(r.old);
             table.set_word(row, cols::OLD_LO, old_lo);
             table.set_word(row, cols::OLD_HI, old_hi);
-            let (new_lo, new_hi) = halves(r.new);
-            table.set_word(row, cols::NEW_LO, new_lo);
-            table.set_word(row, cols::NEW_HI, new_hi);
+            table.set_halves(row, cols::NEW[0], &quarters(r.new));
             let (d0, d1) = step_limbs(r.step);
             table.set_half(row, cols::STEP_0, d0);
             table.set_half(row, cols::STEP_1, d1);
@@ -195,9 +225,15 @@ pub(crate) fn generate_mem_store8_trace_segments_as(
 // Bus interactions
 // =========================================================================
 
-/// MEM_STORE8's 5 interactions (module docs).
+/// MEM_STORE8's 9 interactions (module docs).
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let new = || [column(cols::NEW_LO), column(cols::NEW_HI)];
+    let [n0, n1, n2, n3] = cols::NEW;
+    let new = || {
+        [
+            BusValue::linear(vec![term(1, n0), term(1 << 16, n1)]),
+            BusValue::linear(vec![term(1, n2), term(1 << 16, n3)]),
+        ]
+    };
     let mut interactions = word_check_of(
         [column(cols::ADDRESS_LO), column(cols::ADDRESS_HI)],
         cols::TIMESTAMP,
@@ -206,6 +242,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         [cols::STEP_0, cols::STEP_1],
         Multiplicity::Column(cols::MU),
     );
+    interactions.extend(cols::NEW.map(|half| {
+        BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![column(half)],
+        )
+    }));
     interactions.push(dispatch(
         cols::TIMESTAMP,
         [cols::ADDRESS_LO, cols::ADDRESS_HI],

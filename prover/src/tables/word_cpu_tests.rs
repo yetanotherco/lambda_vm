@@ -571,7 +571,7 @@ fn the_tables_have_their_documented_shapes() {
                 s8::NUM_COLUMNS,
                 store8_constraints(&zero(s8::NUM_COLUMNS)).len(),
             ),
-            (5, 10, 1),
+            (9, 12, 1),
         ),
         (
             "MEM_LOADW",
@@ -1265,4 +1265,62 @@ fn every_word_tables_multiplicity_is_a_bit() {
             );
         }
     }
+}
+
+/// ★ A store writes a canonical word: the CPU holds a jump's return address by
+/// its carries alone, so a register can hold `(lo − 2^32, hi + 1)`, the same
+/// integer in two words not below 2^32. An SD of such a register at an
+/// aligned stack word, then an LD of it, with the store's new word, the
+/// load's word, the page's final word and the load's result all carrying that
+/// pair: refused, by the `IS_HALF` on MEM_STORE8's new word alone (no 16-bit
+/// halves make it); with those four checks taken out of MEM_STORE8 (a control
+/// mutant) the forgery is accepted, so they are what keeps such a word out of
+/// memory.
+#[test]
+fn a_store_of_a_word_that_is_not_canonical_is_refused_by_its_half_checks() {
+    let mut c = honest();
+    let at = S + 0x48;
+    c.store(at, 8, 0x1_0004);
+    c.load(at, 8, false);
+    let (ts_store, ts_load) = (c.ts - 8, c.ts - 4);
+    let mut forged = c.bench();
+    assert!(verdict(&forged).accepted(), "the honest bench");
+    let lo = fe(0x1_0004) - fe(1 << 32);
+    let hi = fe(1);
+    assert!(lo.canonical_u64() >= 1 << 32, "a low half past 2^32");
+    let (d_store, d_load) = (c.dispatch_row(ts_store), c.dispatch_row(ts_load));
+    // The register's words as the CPU row holds them.
+    forged.piece_mut("CPU").preprocessed[cpu::VALUE_LO][d_store] = lo;
+    forged.piece_mut("CPU").preprocessed[cpu::VALUE_HI][d_store] = hi;
+    forged.set("CPU", d_store, cpu::VALUE_LO, lo);
+    forged.set("CPU", d_store, cpu::VALUE_HI, hi);
+    // MEM_STORE8's halves of the forged word: the low half's two 16-bit
+    // halves are any pair summing to `lo` (none in range).
+    let row = row_at(&forged, "MEM_STORE8", s8::TIMESTAMP, ts_store);
+    forged.set("MEM_STORE8", row, s8::NEW[0], lo);
+    forged.set("MEM_STORE8", row, s8::NEW[1], FE::zero());
+    forged.set("MEM_STORE8", row, s8::NEW[2], hi);
+    forged.set("MEM_STORE8", row, s8::NEW[3], FE::zero());
+    let row = row_at(&forged, "MEM_LOAD8", l8::TIMESTAMP, ts_load);
+    forged.set("MEM_LOAD8", row, l8::LO, lo);
+    forged.set("MEM_LOAD8", row, l8::HI, hi);
+    forged.set("CPU", d_load, cpu::RESULT_LO, lo);
+    forged.set("CPU", d_load, cpu::RESULT_HI, hi);
+    let (page, r) = page_row(STACK_BASE, at);
+    forged.set(&page, r, pw::FINI_LO, lo);
+    forged.set(&page, r, pw::FINI_HI, hi);
+    let v = verdict(&forged);
+    assert!(refused_only_by_lookup(&v, BusId::IsHalfword), "{v:?}");
+    // The control: MEM_STORE8 without its four new-half checks.
+    let unchecked: Vec<BusInteraction> = mem_store8::bus_interactions()
+        .into_iter()
+        .filter(|bi| {
+            !(bi.bus_id == u64::from(BusId::IsHalfword)
+                && s8::NEW.iter().any(|&c| bi.values == vec![column(c)]))
+        })
+        .collect();
+    assert_eq!(unchecked.len(), mem_store8::bus_interactions().len() - 4);
+    forged.piece_mut("MEM_STORE8").interactions = unchecked;
+    let v = verdict(&forged);
+    assert!(v.accepted(), "control: {v:?}");
 }

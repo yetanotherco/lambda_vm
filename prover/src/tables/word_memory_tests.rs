@@ -2303,6 +2303,42 @@ fn census_table_with(
                 ));
             }
         }
+        // c13: a pair the CPU's dispatch drives passes its word through (a
+        // load: the produced word is the consumed one) or writes a word each
+        // half of which is held: checked by lookups at the pair's
+        // multiplicity, or one column a constraint fixes (that column at 1 on
+        // an all-zero row breaks one). A register's words need not be
+        // canonical, so a store that wrote them as they come would let such a
+        // word into memory.
+        let dispatched = clocks
+            .iter()
+            .any(|(_, bi)| bi.bus_id == u64::from(BusId::MemoryOp));
+        if dispatched && p.values[3..5] != c.values[3..5] {
+            for half in &p.values[3..5] {
+                if is_checked_half(half, interactions, &mu) {
+                    continue;
+                }
+                let f = form(half)?;
+                let single = (f.len() == 1)
+                    .then(|| f.iter().next())
+                    .flatten()
+                    .and_then(|(k, c)| (*c == 1).then_some(*k))
+                    .flatten();
+                let fixed = match (single, eval) {
+                    (Some(col), Some((eval, width))) if col < width => {
+                        let mut row = vec![FE::zero(); width];
+                        row[col] = FE::one();
+                        eval(&row).iter().any(|v| *v != FE::zero())
+                    }
+                    _ => false,
+                };
+                if !fixed {
+                    return Err(format!(
+                        "{name}: a store writes a half {f:?} that nothing holds"
+                    ));
+                }
+            }
+        }
         // c5: the multiplicities held to bits, one message a row.
         check_bits(name, &columns(&mu), eval)?;
     }
@@ -2665,6 +2701,7 @@ fn word_format_census(registers: crate::tables::register::RegisterFormat) -> Res
             message_receivers.insert(name.split('[').next().unwrap_or("").to_string());
         }
         census_table(name, interactions, air.num_precomputed_columns())?;
+        check_set_member(name, interactions)?;
     }
     // c1 and c6: the word bus is PAGE_W's, MEMW_W's and the CPU word tables'
     // alone, and MEMW_W alone receives word messages.
@@ -2680,6 +2717,35 @@ fn word_format_census(registers: crate::tables::register::RegisterFormat) -> Res
         return Err(format!(
             "word messages are received by {message_receivers:?}"
         ));
+    }
+    Ok(())
+}
+
+/// Rules c14 and c15, on each table of a word-format set: every receive on
+/// the byte-message bus `Memw` is a register's (its register flag the
+/// constant 1: the first of a write's 16 values, the ninth of a read's 24,
+/// whose first eight are the old bytes), so no table takes a chip's RAM
+/// message once MEMW and MEMW_A are retired; and only a CPU table sends the
+/// memory dispatch the word tables take their timestamp and address from.
+fn check_set_member(name: &str, interactions: &[BusInteraction]) -> Result<(), String> {
+    let one = BTreeMap::from([(None, 1i128)]);
+    for bi in interactions {
+        let flag = match bi.values.len() {
+            16 => bi.values.first(),
+            24 => bi.values.get(8),
+            _ => None,
+        };
+        if bi.bus_id == u64::from(BusId::Memw)
+            && !bi.is_sender
+            && flag.and_then(|v| form(v).ok()) != Some(one.clone())
+        {
+            return Err(format!(
+                "{name}: receives a byte message that is not a register's"
+            ));
+        }
+        if bi.bus_id == u64::from(BusId::MemoryOp) && bi.is_sender && !name.starts_with("CPU[") {
+            return Err(format!("{name}: sends the CPU's memory dispatch"));
+        }
     }
     Ok(())
 }
@@ -3562,4 +3628,110 @@ fn the_split_and_fused_sets_carry_no_word_table() {
             );
         }
     }
+}
+
+/// ★ The census refuses a CPU store whose new word nothing holds (rule c13):
+/// MEM_STORE8 without the `IS_HALF` on its new word's halves, and MEM_STOREW
+/// without the identities that fix its new halves; the honest tables pass. And
+/// it refuses, in a word-format set, a table receiving a byte message that is
+/// not a register's, and a table other than the CPU sending the memory
+/// dispatch (rules c14, c15); the honest set's tables pass.
+#[test]
+fn the_census_holds_a_stores_new_word_and_the_sets_byte_messages() {
+    use super::{mem_store8, mem_storew};
+    let store8 = mem_store8::bus_interactions();
+    assert!(census_table("MEM_STORE8[0]", &store8, 0).is_ok());
+    let unchecked: Vec<BusInteraction> = store8
+        .iter()
+        .filter(|bi| {
+            !(bi.bus_id == u64::from(BusId::IsHalfword)
+                && mem_store8::cols::NEW
+                    .iter()
+                    .any(|&c| bi.values == vec![column(c)]))
+        })
+        .cloned()
+        .collect();
+    assert_eq!(unchecked.len(), store8.len() - 4);
+    let refused = census_table("MEM_STORE8[0]", &unchecked, 0);
+    assert!(
+        matches!(&refused, Err(why) if why.contains("nothing holds")),
+        "{refused:?}"
+    );
+    let storew = mem_storew::bus_interactions();
+    assert!(census_table("MEM_STOREW[0]", &storew, 0).is_ok());
+    fn storew_without_new_halves(row: &[FE]) -> Vec<FE> {
+        let mut v = storew_constraints(row);
+        let probe = |col: usize| {
+            let mut r = vec![FE::zero(); super::mem_storew::cols::NUM_COLUMNS];
+            r[col] = FE::one();
+            storew_constraints(&r)
+        };
+        for col in [
+            super::mem_storew::cols::NEW_LO,
+            super::mem_storew::cols::NEW_HI,
+        ] {
+            for (k, x) in probe(col).iter().enumerate() {
+                if *x != FE::zero() {
+                    v[k] = FE::zero();
+                }
+            }
+        }
+        v
+    }
+    let refused = census_table_with(
+        "MEM_STOREW[0]",
+        &storew,
+        0,
+        Some((
+            storew_without_new_halves as Eval,
+            super::mem_storew::cols::NUM_COLUMNS,
+        )),
+    );
+    assert!(
+        matches!(&refused, Err(why) if why.contains("nothing holds")),
+        "{refused:?}"
+    );
+    // c14, c15 on the honest set and on two stand-ins.
+    word_format_census(crate::tables::register::RegisterFormat::InRow)
+        .unwrap_or_else(|e| panic!("{e}"));
+    // A write's 16 values and a read's 24, the flag a column (any message)
+    // or the constant 1 (a register's).
+    let message = |flag: BusValue, read: bool| {
+        let mut values: Vec<BusValue> = (0..16).map(column).collect();
+        values[0] = flag;
+        if read {
+            let mut old: Vec<BusValue> = (16..24).map(column).collect();
+            old.extend(values);
+            values = old;
+        }
+        vec![BusInteraction::receiver(
+            BusId::Memw,
+            Multiplicity::One,
+            values,
+        )]
+    };
+    for read in [false, true] {
+        let refused = check_set_member("MEMW_LIKE[0]", &message(column(30), read));
+        assert!(
+            matches!(&refused, Err(why) if why.contains("not a register's")),
+            "read {read}: {refused:?}"
+        );
+        let refused = check_set_member("MEMW_LIKE[0]", &message(BusValue::constant(0), read));
+        assert!(refused.is_err(), "read {read}: a RAM message");
+        assert!(
+            check_set_member("MEMW_R[0]", &message(BusValue::constant(1), read)).is_ok(),
+            "read {read}: a register's"
+        );
+    }
+    let dispatch = vec![BusInteraction::sender(
+        BusId::MemoryOp,
+        Multiplicity::One,
+        vec![column(0)],
+    )];
+    assert!(check_set_member("CPU[0]", &dispatch).is_ok());
+    let refused = check_set_member("CPU32[0]", &dispatch);
+    assert!(
+        matches!(&refused, Err(why) if why.contains("memory dispatch")),
+        "{refused:?}"
+    );
 }
