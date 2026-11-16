@@ -176,14 +176,70 @@ fn read_word(memory_state: &mut MemoryState, base: u64) -> (u64, u64) {
 pub(super) fn refuse_syscall(op: CpuOp<'_>) -> Result<(), Error> {
     let halt = executor::vm::instruction::execution::SyscallNumbers::Halt as u64;
     let copy = op.ecall_commit() || op.ecall_dma_memcpy() || op.ecall_dma_memset();
-    if op.decode.fields.ecall && op.rv1 != halt && !copy && !op.ecall_keccak256() {
+    if op.decode.fields.ecall
+        && op.rv1 != halt
+        && !copy
+        && !op.ecall_keccak256()
+        && !op.ecall_ecrec()
+    {
         return Err(Error::Prover(format!(
-            "the word memory format proves no syscall but the halt, the COPY chip's and \
-             keccak256 yet: syscall {:#x} at timestamp {}",
+            "the word memory format proves no syscall but the halt, the COPY chip's, \
+             keccak256 and ECREC yet: syscall {:#x} at timestamp {}",
             op.rv1, op.timestamp
         )));
     }
     Ok(())
+}
+
+/// A chip's memory accesses made as byte MEMW operations (each an aligned
+/// doubleword, a read or a write, its old bytes and their stamps the walk's)
+/// as MEMW_W rows: the word's old value its old bytes, its old timestamp the
+/// largest of their stamps. `false` when the state lacked a word (marked
+/// missing; nothing made). An access that is not an aligned doubleword is
+/// the walk's error: the word format takes a chip's accesses by word (the
+/// executor refuses such a call).
+pub(super) fn chip_words(
+    table: &str,
+    ops: &[super::super::memw::MemwOperation],
+    rows: &mut WordRows,
+    lookups: Option<&mut Vec<BitwiseOperation>>,
+) -> Result<bool, Error> {
+    use super::super::memw_w::MessageKind;
+    let word = |bytes: &[u32; 8]| {
+        bytes
+            .iter()
+            .enumerate()
+            .fold(0u64, |w, (i, &b)| w | (u64::from(b) & 0xFF) << (8 * i))
+    };
+    let mut made = Vec::with_capacity(ops.len());
+    for op in ops {
+        if op.is_register || op.width != 8 || !op.base_address.is_multiple_of(WORD_BYTES) {
+            return Err(Error::Prover(format!(
+                "{table}: an access at {:#x} of {} bytes is no aligned word: the word memory \
+                 format takes a chip's memory by aligned words",
+                op.base_address, op.width
+            )));
+        }
+        let old_ts = op.old_timestamp.iter().copied().max().unwrap_or(0);
+        if old_ts == ABSENT {
+            return Ok(false);
+        }
+        let (old, new) = (word(&op.old), word(&op.value));
+        let kind = if op.is_read {
+            MessageKind::Access
+        } else {
+            MessageKind::Write
+        };
+        made.push(
+            MemwWordRow::new(kind, op.base_address, op.timestamp, old_ts, old, new)
+                .map_err(|why| Error::Prover(format!("{table}: {why}")))?,
+        );
+    }
+    if let Some(out) = lookups {
+        out.extend(made.iter().flat_map(MemwWordRow::bitwise_ops));
+    }
+    rows.memw.extend(made);
+    Ok(true)
 }
 
 /// The walk's per-byte state as a call's word memory: a word is its eight

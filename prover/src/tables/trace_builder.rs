@@ -2899,11 +2899,26 @@ fn walk_cpu_ops<const REST: bool>(
 
         // Collect ECREC ecall operations (memory I/O, the ECREC row, and the ECDAS rows of its
         // two chains and its final addition).
+        // Under the word memory format its memory is word rows (an ECREC_W
+        // row's), its register accesses as before.
         if op.ecall_ecrec()
-            && let Some((ecrec_memw, ecrec_op, ecrec_ecdas)) =
+            && let Some((ecrec_memw, mut ecrec_op, ecrec_ecdas)) =
                 collect_ecrec_ops(op, memory_state, register_state, REST && defer_ecrec)
         {
-            memw.extend_ops(ecrec_memw);
+            if words {
+                let (registers, ram): (Vec<_>, Vec<_>) =
+                    ecrec_memw.into_iter().partition(|m| m.is_register);
+                memw.extend_ops(registers);
+                word_walk::chip_words(
+                    "ECREC_W",
+                    &ram,
+                    word_rows,
+                    lookups.then_some(&mut *bitwise_ops),
+                )?;
+                ecrec_op.words = true;
+            } else {
+                memw.extend_ops(ecrec_memw);
+            }
             if REST {
                 ecrec_ops.push(ecrec_op);
                 ecdas_ops.extend(ecrec_ecdas);
@@ -3533,6 +3548,7 @@ fn collect_ecrec_ops(
         addr_msg,
         witness,
         pending,
+        words: false,
     };
     Some((memw_ops, ecrec_op, ecdas_ops))
 }
@@ -6596,6 +6612,9 @@ pub(crate) fn collect_bitwise_from_ecrec(ops: &[ecrec::EcrecOperation]) -> Vec<B
     let half = |bytes: &[u8; 32], i: usize| bytes[2 * i] as u16 + ((bytes[2 * i + 1] as u16) << 8);
     for op in ops {
         let w = &op.witness;
+        if op.words {
+            out.extend(super::ecrec_w::extra_bitwise_ops(op));
+        }
         if !w.ok {
             continue;
         }
