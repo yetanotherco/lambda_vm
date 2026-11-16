@@ -352,7 +352,38 @@ fn every_route_mutant_is_refused_by_its_named_check() {
         });
         assert!(control.is_ok(), "{kind}: without both checks: {control:?}");
     }
-    let five = Route::Prepared(4);
+    // A fixed table's folded columns and a prepared table's opened ones are
+    // held to the stated height too: a REGISTER-like column of 32 rows at a
+    // stated 2^2, an opening of 2^7-row columns at a stated 2^2, each refused
+    // by the height check, and passed by the route checks without it.
+    let register = Route::ConstMle(vec![vec![FE::zero(); 32]]);
+    let refused = check_route_columns(&register, 1, 2, "REGISTER", 3).expect_err("32 rows at 2^2");
+    assert!(
+        refused.contains("states 2^2 rows and its route's columns are 32 rows"),
+        "{refused}"
+    );
+    let decode = Route::Prepared {
+        settled: 3,
+        num_vars: 7,
+    };
+    let refused = check_route_columns(&decode, 3, 2, "DECODE", 1).expect_err("2^7 at 2^2");
+    assert!(
+        refused.contains("states 2^2 rows and its prepared columns are 2^7 rows"),
+        "{refused}"
+    );
+    for route in [&register, &decode] {
+        let declared = route.columns_checked();
+        assert!(
+            route_faults::with(Fault::NoHeightCheck, || {
+                check_route_columns(route, declared, 2, "fixed", 0)
+            })
+            .is_ok()
+        );
+    }
+    let five = Route::Prepared {
+        settled: 4,
+        num_vars,
+    };
     let refused = check_route_columns(&five, 5, num_vars, "PAGE_W:0x0", 0).expect_err("4 of 5");
     assert!(refused.contains("declares 5"), "{refused}");
     assert!(
