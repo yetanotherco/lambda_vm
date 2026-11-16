@@ -3516,18 +3516,10 @@ pub(crate) const FUSED_MEMORY_WORD: u64 = u64::from_le_bytes(*b"MEMFUSED");
 pub(crate) const WORD_MEMORY_WORD: u64 = u64::from_le_bytes(*b"MEMWORDS");
 
 /// The word memory format's table families, in [`VmAirs::air_refs`] order
-/// and [`BlockWhirProof::word_memory`]'s: the CPU's loads and stores by the
-/// words they touch (one whole word, inside one word, across two), then the
-/// chips' word table.
-pub const WORD_TABLES: [&str; 7] = [
-    "MEM_LOAD8",
-    "MEM_STORE8",
-    "MEM_LOADW",
-    "MEM_STOREW",
-    "MEM_LOAD2W",
-    "MEM_STORE2W",
-    "MEMW_W",
-];
+/// and [`BlockWhirProof::word_memory`]'s
+/// ([`crate::tables::word_cpu::WORD_TABLES`], defined where a build without
+/// the block prover sees it too).
+pub use crate::tables::word_cpu::WORD_TABLES;
 
 /// What a block's statement absorbs right after the table counts under
 /// `memory`: nothing under the split format (the statement as it always

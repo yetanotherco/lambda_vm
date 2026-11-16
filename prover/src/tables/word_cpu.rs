@@ -51,6 +51,20 @@ use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 use super::types::{BusId, GoldilocksExtension, GoldilocksField};
 use super::word_memory::{WORD_BYTES, column, step_limbs, term};
 
+/// The word memory format's table families, in the block's AIR order and
+/// its proof's word counts' (`block_whir::WORD_TABLES` re-exports it): the
+/// CPU's loads and stores by the words they touch (one whole word, inside one
+/// word, across two), then the chips' word table.
+pub const WORD_TABLES: [&str; 7] = [
+    "MEM_LOAD8",
+    "MEM_STORE8",
+    "MEM_LOADW",
+    "MEM_STOREW",
+    "MEM_LOAD2W",
+    "MEM_STORE2W",
+    "MEMW_W",
+];
+
 /// A load's flags (LOAD's `mem_flags`): `2·signed + 4·w2 + 8·w4 + 16·w8`.
 pub(crate) const FLAG_SIGNED: i64 = 2;
 pub(crate) const FLAG_W2: i64 = 4;
