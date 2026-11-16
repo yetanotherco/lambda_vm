@@ -1619,15 +1619,23 @@ pub fn verify_block_tree_grouped(
 
 /// [`verify_block_tree`] at the pinned format with the caller's NAMED choices:
 /// its group opening, its WHIR blowup, its round-0 leaf order, its round-0
-/// trees, its leaf scale and its leaves' query check (`verify-block --group /
-/// --blowup / --leaves / --trees / --leaf-double-from / --leaf-query`), every
+/// trees, its leaf scale, its leaves' query check, its GKR packing and its
+/// memory format (`verify-block --group / --blowup / --leaves / --trees /
+/// --leaf-double-from / --leaf-query / --argue-pack / --memory`), every
 /// other preset pinned as before
 /// (the folds, stack, grind and caps are [`crate::zf_format::ZfFormat::DEFAULT`]'s,
-/// never the environment's). All six are the verifier's constants; the proof
+/// never the environment's). All eight are the verifier's constants; the proof
 /// carries none of them. A caller cannot hand in a format of its own:
 /// `verify_block_tree_as` is crate-internal. The coset order is refused by name
 /// under a base whose trees do not take it, and one tree a run under the
 /// natural order.
+///
+/// The memory format chooses the block's AIR set, its statement's words (a
+/// fused or a word statement absorbs its format word and its tables' counts)
+/// and so every leaf program and the block's identity; the frame refuses a
+/// statement that states another format's tables. A word-format block's
+/// counts ride in its statement and are checked there: the format itself is
+/// never read from the statement.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_block_tree_at(
     elf_bytes: &[u8],
@@ -1640,14 +1648,18 @@ pub fn verify_block_tree_at(
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
     pack: multilinear::whir_chain::GkrPack,
+    memory: crate::tables::fused_memory::MemoryFormat,
 ) -> Result<(), String> {
-    let presets = verifier_presets_at(group, blowup, leaves, trees, leaf_scale, leaf_query, pack)?;
+    let presets = verifier_presets_at(
+        group, blowup, leaves, trees, leaf_scale, leaf_query, pack, memory,
+    )?;
     verify_block_tree_as(elf_bytes, statement, top, &presets)
 }
 
 /// [`verify_block_tree_at`]'s presets: [`BlockFormat::pinned_with`] `group`
-/// with the six named choices set (the GKR packing through
-/// [`BlockFormat::with_pack`]), the coset order refused under a base whose
+/// with the eight named choices set (the GKR packing through
+/// [`BlockFormat::with_pack`], the memory format through
+/// [`BlockFormat::with_memory`]), the coset order refused under a base whose
 /// trees do not take it and one tree a run refused under the natural order
 /// ([`crate::zf_format::ZfFormat::check_trees`]), whatever the two were set to.
 #[allow(clippy::too_many_arguments)]
@@ -1659,8 +1671,11 @@ pub(crate) fn verifier_presets_at(
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
     pack: multilinear::whir_chain::GkrPack,
+    memory: crate::tables::fused_memory::MemoryFormat,
 ) -> Result<VerifierPresets, String> {
-    let mut format = BlockFormat::pinned_with(group).with_pack(pack);
+    let mut format = BlockFormat::pinned_with(group)
+        .with_pack(pack)
+        .with_memory(memory);
     format.zf.whir_blowup = blowup.factor();
     format.zf.whir_leaves = leaves;
     format.zf.whir_trees = trees;

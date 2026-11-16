@@ -455,22 +455,16 @@ pub fn registers_setting(knob: Option<&str>) -> Result<RegisterFormat, String> {
 /// ([`BlockFormat::production`]: an aligned CPU load or store checked in one
 /// row with its memory tokens, [`MemoryFormat::Fused`]), and any other process
 /// the pinned preset's ([`BlockFormat::pinned`], the loads and stores split),
-/// the only one the tree recurses over. `split` and `fused` name either;
-/// `words` (RAM checked by aligned 8-byte words) a base-only process's alone.
-/// A format value: the prover and the verifier of one proof take the same
-/// one. The tree refuses `fused`; `split` is the base's rollback.
+/// the tree's default. `split`, `fused` and `words` (RAM checked by aligned
+/// 8-byte words) name each, in either process. A format value: the prover and
+/// the verifier of one proof take the same one (`verify-block --memory`).
 pub fn memory_setting(knob: Option<&str>, base_only: bool) -> Result<MemoryFormat, String> {
     match knob.map(str::trim) {
         None if base_only => Ok(BlockFormat::production().memory),
         None => Ok(BlockFormat::pinned().memory),
         Some("split") => Ok(MemoryFormat::Split),
         Some("fused") => Ok(MemoryFormat::Fused),
-        // RAM checked by aligned 8-byte words: a base-only process's alone,
-        // the tree proves no word-format block.
-        Some("words") if base_only => Ok(MemoryFormat::Words),
-        Some("words") => Err(
-            "BLOCK_WHIR_MEMORY=words: a base-only process's alone (prove-block-base)".to_string(),
-        ),
+        Some("words") => Ok(MemoryFormat::Words),
         Some(v) => Err(format!("BLOCK_WHIR_MEMORY={v}: split, fused or words")),
     }
 }
@@ -654,7 +648,9 @@ impl WhirTreeConfig {
     /// [`BLOCK_FAN_IN`] and the production argue — with its GKR trees laid out
     /// as the format's packing says, a named constant the block verifier is
     /// given too ([`BlockFormat::with_pack`]) — and the verifier's preset
-    /// KECCAK_RND and MEMW_A forms, which the CLI has no flag for.
+    /// KECCAK_RND, MEMW_A and register forms, which the CLI has no flag for.
+    /// The memory format is a named constant the block verifier is given too
+    /// (`--memory`), so any of the three is at the presets.
     pub fn at_presets(&self) -> bool {
         let pack = match self.argue {
             ArgueFormat::Batched { pack, .. } => pack,
@@ -667,7 +663,6 @@ impl WhirTreeConfig {
             && self.format.keccak_rnd == BlockFormat::pinned().keccak_rnd
             && self.format.memw_aligned == BlockFormat::pinned().memw_aligned
             && self.format.registers == BlockFormat::pinned().registers
-            && self.format.memory == BlockFormat::pinned().memory
     }
 }
 
@@ -2658,12 +2653,13 @@ pub fn prove_whir_block_tree(
     // recursion (`crate::base_only`): both refused before anything is proved.
     crate::base_only::refuse_recursion()?;
     block_whir::checked_base(&format.zf.base).map_err(|e| format!("{e:?}"))?;
-    // The tree's leaves and its proof file carry the split memory format's
-    // statement alone.
-    if format.memory != MemoryFormat::Split {
+    // The word memory format checks the registers in the CPU row: its base
+    // refuses the 32-bit register tokens, and so does the tree, before
+    // anything is proved.
+    if format.memory == MemoryFormat::Words && format.registers != RegisterFormat::InRow {
         return Err(format!(
-            "the block tree recurses over the split memory format alone, not {:?}",
-            format.memory
+            "the word memory format checks the registers in the CPU row, not under {:?}",
+            format.registers
         ));
     }
     sink.line(&posture_line());
@@ -3845,6 +3841,12 @@ pub const PIPELINE_WHIR: u8 = 1;
 /// from the trusted ELF and the statement, under the block presets — so
 /// nothing here is a format parameter: the file only carries what
 /// [`super::whir_block::verify_block_tree`] already takes from its caller.
+///
+/// The statement's fused and word tables' counts are its last fields
+/// ([`block_whir::BlockWhirProof`]'s two): zero under the split memory format,
+/// where a nonzero count is refused, so a split block's file is the bytes the
+/// file was before them, then their 72 zero bytes. Which memory format they
+/// are read under is the verifier's constant, never the file's.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct WhirBlockTreeProof {
     magic: [u8; 8],
@@ -3858,6 +3860,8 @@ pub struct WhirBlockTreeProof {
     pub groups: Vec<Vec<u32>>,
     pub top_proof: super::proof::LfmStarkProof,
     pub top_public_words: Vec<(u32, LfmWord)>,
+    pub fused_memory: [u64; 2],
+    pub word_memory: [u64; 7],
 }
 
 impl WhirBlockTreeProof {
@@ -3875,6 +3879,8 @@ impl WhirBlockTreeProof {
             groups: statement.groups,
             top_proof: top.proof,
             top_public_words: top.public_words,
+            fused_memory: statement.fused_memory,
+            word_memory: statement.word_memory,
         }
     }
 
@@ -3887,9 +3893,8 @@ impl WhirBlockTreeProof {
             public_output: &self.public_output,
             num_private_input_pages: self.num_private_input_pages,
             groups: &self.groups,
-            // The tree recurses over the split memory format alone.
-            fused_memory: [0, 0],
-            word_memory: [0; 7],
+            fused_memory: self.fused_memory,
+            word_memory: self.word_memory,
         }
     }
 
@@ -4351,6 +4356,10 @@ pub struct WhirBlockCompressedProof {
     pub num_private_input_pages: usize,
     pub groups: Vec<Vec<u32>>,
     pub compressed: super::wlfm::WlfmProof,
+    /// The statement's fused and word tables' counts, as
+    /// [`WhirBlockTreeProof`]'s.
+    pub fused_memory: [u64; 2],
+    pub word_memory: [u64; 7],
 }
 
 impl WhirBlockCompressedProof {
@@ -4377,6 +4386,8 @@ impl WhirBlockCompressedProof {
             num_private_input_pages: statement.num_private_input_pages,
             groups: statement.groups,
             compressed: c1,
+            fused_memory: statement.fused_memory,
+            word_memory: statement.word_memory,
         }
     }
 
@@ -4402,6 +4413,8 @@ impl WhirBlockCompressedProof {
             num_private_input_pages: statement.num_private_input_pages,
             groups: statement.groups,
             compressed: c2,
+            fused_memory: statement.fused_memory,
+            word_memory: statement.word_memory,
         })
     }
 
@@ -4423,6 +4436,8 @@ impl WhirBlockCompressedProof {
             num_private_input_pages: statement.num_private_input_pages,
             groups: statement.groups,
             compressed: c1,
+            fused_memory: statement.fused_memory,
+            word_memory: statement.word_memory,
         })
     }
 
@@ -4435,9 +4450,8 @@ impl WhirBlockCompressedProof {
             public_output: &self.public_output,
             num_private_input_pages: self.num_private_input_pages,
             groups: &self.groups,
-            // The tree recurses over the split memory format alone.
-            fused_memory: [0, 0],
-            word_memory: [0; 7],
+            fused_memory: self.fused_memory,
+            word_memory: self.word_memory,
         }
     }
 
@@ -4508,6 +4522,8 @@ impl WhirBlockCompressedProof {
             num_private_input_pages: self.num_private_input_pages,
             groups: self.groups.clone(),
             compact: super::wire::encode_as(&self.compressed, wire).unwrap_or_default(),
+            fused_memory: self.fused_memory,
+            word_memory: self.word_memory,
         };
         rkyv::to_bytes::<rkyv::rancor::Error>(&file).map_err(|e| format!("serialize: {e}"))
     }
@@ -4549,6 +4565,8 @@ impl WhirBlockCompressedProof {
             } else {
                 super::wire::decode(&file.compact)?
             },
+            fused_memory: file.fused_memory,
+            word_memory: file.word_memory,
         })
     }
 }
@@ -4566,7 +4584,8 @@ pub const PIPELINE_WHIR_COMPRESSED_COMPACT_FINAL: u8 = 8;
 pub const PIPELINE_WHIR_COMPRESSED_COMPACT_EVALUATED_FINAL: u8 = 9;
 
 /// The compact file: [`WhirBlockCompressedProof`]'s statement fields, rkyv as
-/// there, and C1's proof as [`super::wire`] bytes.
+/// there, and C1's proof as [`super::wire`] bytes; the fused and word tables'
+/// counts last, as there.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct WhirBlockCompactFile {
     magic: [u8; 8],
@@ -4579,6 +4598,8 @@ struct WhirBlockCompactFile {
     num_private_input_pages: usize,
     groups: Vec<Vec<u32>>,
     compact: Vec<u8>,
+    fused_memory: [u64; 2],
+    word_memory: [u64; 7],
 }
 
 /// A compact compressed file verified under `levers` once it carries `tag`:
@@ -4827,11 +4848,12 @@ pub fn verify_whir_block_tree_proof_grouped(
 
 /// [`verify_whir_block_tree_proof`] at the pinned format with the caller's
 /// named choices, its group opening, its WHIR blowup, its round-0 leaf order,
-/// its round-0 trees, its leaf scale, its leaves' query check and its GKR
-/// packing
+/// its round-0 trees, its leaf scale, its leaves' query check, its GKR
+/// packing and its memory format
 /// ([`super::whir_block::verify_block_tree_at`]); the file carries none of
-/// them, and the environment sets none of the rest. No public entry point
-/// takes a format of the caller's own.
+/// them (a word or fused block's file carries its tables' counts, read under
+/// the caller's memory format), and the environment sets none of the rest. No
+/// public entry point takes a format of the caller's own.
 ///
 /// ```no_run
 /// use lambda_vm_prover::lfm::whir_block::LeafScale;
@@ -4839,6 +4861,7 @@ pub fn verify_whir_block_tree_proof_grouped(
 ///     WhirBlockTreeProof, verify_whir_block_tree_proof_at,
 /// };
 /// use lambda_vm_prover::lfm::whir_chain::LeafQuery;
+/// use lambda_vm_prover::tables::fused_memory::MemoryFormat;
 /// use lambda_vm_prover::zf_format::WhirBlowup;
 /// use multilinear::whir_chain::{GkrPack, GroupFold, LeafOrder, Round0Trees};
 ///
@@ -4853,6 +4876,7 @@ pub fn verify_whir_block_tree_proof_grouped(
 ///         LeafScale::DoubleFrom(12),
 ///         LeafQuery::Lean,
 ///         GkrPack::Off,
+///         MemoryFormat::Words,
 ///     )
 /// }
 /// ```
@@ -4874,6 +4898,7 @@ pub fn verify_whir_block_tree_proof_at(
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
     pack: GkrPack,
+    memory: MemoryFormat,
 ) -> Result<(), String> {
     let top = LfmProof {
         proof: proof.top_proof.clone(),
@@ -4890,6 +4915,7 @@ pub fn verify_whir_block_tree_proof_at(
         leaf_scale,
         leaf_query,
         pack,
+        memory,
     )
 }
 
@@ -5359,6 +5385,218 @@ mod tests {
         assert_eq!(proof.pipeline(), PIPELINE_WHIR_COMPRESSED);
         assert_ne!(PIPELINE_WHIR_COMPRESSED, PIPELINE_WHIR_COMPRESSED_EVALUATED);
         assert_ne!(PIPELINE_WHIR, PIPELINE_WHIR_COMPRESSED_EVALUATED);
+    }
+
+    /// [`WhirBlockTreeProof`] as it was before the memory counts: every field
+    /// but the last two, in their order.
+    #[derive(rkyv::Archive, rkyv::Serialize)]
+    struct TreeFileBeforeCounts {
+        magic: [u8; 8],
+        version: u32,
+        pipeline: u8,
+        table_num_vars: Vec<u8>,
+        runtime_page_ranges: Vec<crate::RuntimePageRange>,
+        table_counts: crate::TableCounts,
+        public_output: Vec<u8>,
+        num_private_input_pages: usize,
+        groups: Vec<Vec<u32>>,
+        top_proof: super::super::proof::LfmStarkProof,
+        top_public_words: Vec<(u32, LfmWord)>,
+    }
+
+    /// [`WhirBlockCompressedProof`] (`compact: None`) or its compact twin's
+    /// file (`Some`: the wire bytes) as they were before the memory counts.
+    #[derive(rkyv::Archive, rkyv::Serialize)]
+    struct CompressedFileBeforeCounts {
+        magic: [u8; 8],
+        version: u32,
+        pipeline: u8,
+        table_num_vars: Vec<u8>,
+        runtime_page_ranges: Vec<crate::RuntimePageRange>,
+        table_counts: crate::TableCounts,
+        public_output: Vec<u8>,
+        num_private_input_pages: usize,
+        groups: Vec<Vec<u32>>,
+        compressed: super::super::wlfm::WlfmProof,
+    }
+    #[derive(rkyv::Archive, rkyv::Serialize)]
+    struct CompactFileBeforeCounts {
+        magic: [u8; 8],
+        version: u32,
+        pipeline: u8,
+        table_num_vars: Vec<u8>,
+        runtime_page_ranges: Vec<crate::RuntimePageRange>,
+        table_counts: crate::TableCounts,
+        public_output: Vec<u8>,
+        num_private_input_pages: usize,
+        groups: Vec<Vec<u32>>,
+        compact: Vec<u8>,
+    }
+
+    fn tree_before(p: &WhirBlockTreeProof, flip_group: bool) -> Vec<u8> {
+        let mut groups = p.groups.clone();
+        if flip_group {
+            groups[0][0] ^= 1;
+        }
+        let before = TreeFileBeforeCounts {
+            magic: p.magic,
+            version: p.version,
+            pipeline: p.pipeline,
+            table_num_vars: p.table_num_vars.clone(),
+            runtime_page_ranges: p.runtime_page_ranges.clone(),
+            table_counts: p.table_counts.clone(),
+            public_output: p.public_output.clone(),
+            num_private_input_pages: p.num_private_input_pages,
+            groups,
+            top_proof: p.top_proof.clone(),
+            top_public_words: p.top_public_words.clone(),
+        };
+        rkyv::to_bytes::<rkyv::rancor::Error>(&before)
+            .expect("serializes")
+            .to_vec()
+    }
+
+    fn compressed_before(p: &WhirBlockCompressedProof, flip_group: bool) -> Vec<u8> {
+        let mut groups = p.groups.clone();
+        if flip_group {
+            groups[0][0] ^= 1;
+        }
+        let before = CompressedFileBeforeCounts {
+            magic: p.magic,
+            version: p.version,
+            pipeline: p.pipeline,
+            table_num_vars: p.table_num_vars.clone(),
+            runtime_page_ranges: p.runtime_page_ranges.clone(),
+            table_counts: p.table_counts.clone(),
+            public_output: p.public_output.clone(),
+            num_private_input_pages: p.num_private_input_pages,
+            groups,
+            compressed: p.compressed.clone(),
+        };
+        rkyv::to_bytes::<rkyv::rancor::Error>(&before)
+            .expect("serializes")
+            .to_vec()
+    }
+
+    fn compact_before(
+        p: &WhirBlockCompressedProof,
+        wire: super::super::wire::WireFormat,
+    ) -> Vec<u8> {
+        use super::super::wire::WireFormat;
+        let pipeline = match wire {
+            WireFormat::Compact => compact_twin(p.pipeline),
+            WireFormat::Dedup => dedup_twin(p.pipeline),
+            WireFormat::Rkyv => Some(p.pipeline),
+        }
+        .expect("a twin");
+        let before = CompactFileBeforeCounts {
+            magic: p.magic,
+            version: p.version,
+            pipeline,
+            table_num_vars: p.table_num_vars.clone(),
+            runtime_page_ranges: p.runtime_page_ranges.clone(),
+            table_counts: p.table_counts.clone(),
+            public_output: p.public_output.clone(),
+            num_private_input_pages: p.num_private_input_pages,
+            groups: p.groups.clone(),
+            compact: super::super::wire::encode_as(&p.compressed, wire).unwrap_or_default(),
+        };
+        rkyv::to_bytes::<rkyv::rancor::Error>(&before)
+            .expect("serializes")
+            .to_vec()
+    }
+
+    /// `old` is `new` but its last 72 bytes, which are `counts` (the fused
+    /// pair then the seven word counts, little-endian).
+    fn holds_prefix_then_counts(name: &str, old: &[u8], new: &[u8], counts: &[u64; 9]) {
+        assert_eq!(new.len(), old.len() + 72, "{name}: 72 bytes more");
+        assert_eq!(
+            &new[..old.len()],
+            old,
+            "{name}: the bytes before the counts"
+        );
+        let tail: Vec<u8> = counts.iter().flat_map(|c| c.to_le_bytes()).collect();
+        assert_eq!(&new[old.len()..], &tail[..], "{name}: the counts, last");
+    }
+
+    fn aligned(bytes: &[u8]) -> rkyv::util::AlignedVec {
+        let mut out = rkyv::util::AlignedVec::new();
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    /// ★ The memory counts are each file's last 72 bytes. A split block's file
+    /// (the tree's top file, the compressed file, and its compact and dedup
+    /// twins) is the bytes the file was before the counts (every earlier
+    /// field, in its order), then 72 zero bytes; a byte moved in an earlier
+    /// field moves that prefix (the check's mutant: one flipped group index).
+    /// A word block's files end in its counts and read them back. A file
+    /// written before the counts (those bytes alone) is refused by its reader:
+    /// it is never read as a split file of the new layout.
+    #[test]
+    fn the_memory_counts_are_each_files_last_bytes() {
+        use super::super::wire::WireFormat;
+        let mut counts = [0u64; 9];
+        let split = synthetic_proof();
+        let new = split.to_bytes().expect("serializes");
+        let old = tree_before(&split, false);
+        holds_prefix_then_counts("tree file", &old, &new, &counts);
+        assert_ne!(
+            &new[..old.len()],
+            &tree_before(&split, true)[..],
+            "a moved group index moves the prefix"
+        );
+        assert!(
+            WhirBlockTreeProof::from_bytes(&aligned(&old)).is_err(),
+            "a tree file written before the counts is refused"
+        );
+        let compressed = synthetic_compressed();
+        let new = compressed.to_bytes().expect("serializes");
+        let old = compressed_before(&compressed, false);
+        holds_prefix_then_counts("compressed file", &old, &new, &counts);
+        assert_ne!(&new[..old.len()], &compressed_before(&compressed, true)[..]);
+        assert!(WhirBlockCompressedProof::from_bytes(&aligned(&old)).is_err());
+        for wire in [WireFormat::Compact, WireFormat::Dedup] {
+            let new = compressed.to_wire_bytes(wire).expect("serializes");
+            let old = compact_before(&compressed, wire);
+            holds_prefix_then_counts(&format!("{wire:?} file"), &old, &new, &counts);
+            assert!(WhirBlockCompressedProof::from_compact_bytes(&aligned(&old)).is_err());
+        }
+
+        // A word block's files: its counts last, read back.
+        let fused = [0u64, 0];
+        let words = [3u64, 1, 4, 1, 5, 9, 2];
+        counts[2..].copy_from_slice(&words);
+        let mut tree = synthetic_proof();
+        (tree.fused_memory, tree.word_memory) = (fused, words);
+        let new = tree.to_bytes().expect("serializes");
+        holds_prefix_then_counts("word tree file", &tree_before(&tree, false), &new, &counts);
+        let back = WhirBlockTreeProof::from_bytes(&new).expect("reads back");
+        assert_eq!(back.statement().word_memory, words);
+        assert_eq!(back.statement().fused_memory, fused);
+        let statement = back.statement().to_owned();
+        let word_compressed =
+            WhirBlockCompressedProof::new(statement, synthetic_compressed().compressed);
+        let new = word_compressed.to_bytes().expect("serializes");
+        holds_prefix_then_counts(
+            "word compressed file",
+            &compressed_before(&word_compressed, false),
+            &new,
+            &counts,
+        );
+        let back = WhirBlockCompressedProof::from_bytes(&new).expect("reads back");
+        assert_eq!(back.statement().word_memory, words);
+        for wire in [WireFormat::Compact, WireFormat::Dedup] {
+            let bytes = word_compressed.to_wire_bytes(wire).expect("serializes");
+            let back = WhirBlockCompressedProof::from_compact_bytes(&bytes).expect("reads back");
+            assert_eq!(back.statement().word_memory, words, "{wire:?}");
+        }
+        // The fused pair rides the same way.
+        let mut tree = synthetic_proof();
+        tree.fused_memory = [7, 8];
+        let back = WhirBlockTreeProof::from_bytes(&tree.to_bytes().expect("serializes"))
+            .expect("reads back");
+        assert_eq!(back.statement().fused_memory, [7, 8]);
     }
 
     /// Each compressed verifier refuses every other compressed tag before it
@@ -6184,17 +6422,24 @@ mod tests {
         let mut c = production.clone();
         c.format = c.format.with_memw_aligned(other);
         assert!(!c.at_presets(), "the other MEMW_A form");
-        // Nor the fused memory format, which the tree refuses.
-        let mut c = production.clone();
-        c.format = c.format.with_memory(MemoryFormat::Fused);
-        assert!(!c.at_presets(), "the fused memory format");
+        // The memory format is a named constant the block verifier is given
+        // (`--memory`): each of the three is at the presets.
+        for memory in [
+            MemoryFormat::Split,
+            MemoryFormat::Fused,
+            MemoryFormat::Words,
+        ] {
+            let mut c = production.clone();
+            c.format = c.format.with_memory(memory);
+            assert!(c.at_presets(), "the {memory:?} memory format");
+        }
     }
 
     /// ★ `BLOCK_WHIR_MEMORY`: unset, a base-only process proves the production
     /// format's fused memory format and any other process (the tree's) the
-    /// pinned split one; `split` (the base's rollback) and `fused` name
-    /// either, anything else is refused. The production format is fused, the
-    /// verifier's pinned preset split.
+    /// pinned split one; `split` (the base's rollback), `fused` and `words`
+    /// name each in either process, anything else is refused. The production
+    /// format is fused, the verifier's pinned preset split.
     #[test]
     fn the_memory_knob_defaults_to_fused_for_the_base_alone() {
         assert_eq!(BlockFormat::production().memory, MemoryFormat::Fused);
@@ -6215,10 +6460,13 @@ mod tests {
                 assert!(e.contains("BLOCK_WHIR_MEMORY"), "{e}");
             }
         }
-        // The word format: a base-only process's alone.
-        assert_eq!(memory_setting(Some("words"), true), Ok(MemoryFormat::Words));
-        let e = memory_setting(Some("words"), false).expect_err("the tree's");
-        assert!(e.contains("base-only"), "{e}");
+        // The word format, in either process: the tree recurses over it.
+        for base_only in [true, false] {
+            assert_eq!(
+                memory_setting(Some("words"), base_only),
+                Ok(MemoryFormat::Words)
+            );
+        }
     }
 
     /// `W3_LEAF_EMITTERS`: unset is the default count, 0 is the control (one
