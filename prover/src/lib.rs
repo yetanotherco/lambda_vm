@@ -811,7 +811,7 @@ pub(crate) struct VmAirs {
     pub mem_loads: Vec<VmAir>,
     pub mem_stores: Vec<VmAir>,
     /// The word memory format's tables ([`Self::with_word_memory`]), one list
-    /// a family in [`crate::block_whir::WORD_TABLES`]' order; none under any
+    /// a family in [`crate::tables::word_cpu::WORD_TABLES`]' order; none under any
     /// other format, and none in any proof but a block's.
     pub word_tables: [Vec<VmAir>; 7],
 }
@@ -1748,7 +1748,7 @@ impl VmAirs {
     /// (`tables::fused_memory::MemoryFormat::Words`): each page table PAGE_W
     /// in PAGE's place (`page_configs` are this set's pages, in order), and
     /// `counts[k]` tables of each word family `k`
-    /// ([`crate::block_whir::WORD_TABLES`]: the CPU's six by the words an
+    /// ([`crate::tables::word_cpu::WORD_TABLES`]: the CPU's six by the words an
     /// access touches, then MEMW_W), named `<family>[i]`, after the fused
     /// tables' place. Refuses a page PAGE_W cannot hold (a base that is not
     /// page-aligned) or a page list that is not this set's.
@@ -1772,7 +1772,7 @@ impl VmAirs {
             .collect::<Result<_, _>>()
             .map_err(Error::Prover)?;
         let mut word_tables: [Vec<VmAir>; 7] = std::array::from_fn(|_| Vec::new());
-        for ((family, &count), tables) in crate::block_whir::WORD_TABLES
+        for ((family, &count), tables) in crate::tables::word_cpu::WORD_TABLES
             .iter()
             .zip(&counts)
             .zip(word_tables.iter_mut())
