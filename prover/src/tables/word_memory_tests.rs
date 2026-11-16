@@ -3790,20 +3790,25 @@ fn a_page_w_table_is_held_to_its_height() {
 /// Whether `interactions` touch either word bus.
 fn on_word_buses(interactions: &[BusInteraction]) -> bool {
     interactions.iter().any(|bi| {
-        bi.bus_id == u64::from(BusId::MemWord) || bi.bus_id == u64::from(BusId::MemWordMsg)
+        bi.bus_id == u64::from(BusId::MemWord)
+            || bi.bus_id == u64::from(BusId::MemWordMsg)
+            || bi.bus_id == u64::from(BusId::CopyWordNext)
     })
 }
 
-/// ★ Buses 40 and 41 are the word tables' alone: `BusId` is the one registry
-/// of bus ids, the two ids decode to the word buses, and no table of the
-/// continuation path (the cross-epoch tables) or of the recursion's programs
-/// (every hasher's AIR set) touches them.
+/// ★ Buses 40, 41 and 42 are the word tables' alone: `BusId` is the one
+/// registry of bus ids, the three ids decode to the word buses (the tokens,
+/// the chips' messages, COPY_W's chain), and no table of the continuation
+/// path (the cross-epoch tables) or of the recursion's programs (every
+/// hasher's AIR set) touches them.
 #[test]
 fn no_other_table_or_program_uses_the_word_buses() {
     assert_eq!(BusId::try_from(40u64), Ok(BusId::MemWord));
     assert_eq!(BusId::try_from(41u64), Ok(BusId::MemWordMsg));
+    assert_eq!(BusId::try_from(42u64), Ok(BusId::CopyWordNext));
     assert_eq!(u64::from(BusId::MemWord), 40);
     assert_eq!(u64::from(BusId::MemWordMsg), 41);
+    assert_eq!(u64::from(BusId::CopyWordNext), 42);
     use crate::tables::{global_memory, local_to_global};
     for label in [
         local_to_global::epoch_label(0),
