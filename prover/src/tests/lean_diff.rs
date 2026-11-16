@@ -8,7 +8,8 @@
 //! `bus_interactions()`, the multiplicity and LogUp fingerprint expressions of
 //! `emit_multiplicity` and `emit_fingerprint` at fixed challenges, and matches
 //! them as multisets of functions (Schwartz–Zippel over [`TRIALS`] rows).
-//! Direction, multiplicity and fingerprint are matched separately. It also
+//! The export signs each multiplicity (a pull is `−e`, a push `+e`), so a Rust
+//! sender, Clean's pull, is compared with its multiplicity negated. It also
 //! checks that the Lean constraints vanish on honest Rust traces, padding rows
 //! included. The three tables read the current row only; a constraint on
 //! another row or an aux column fails in `eval_program_roots`, it is not
@@ -81,8 +82,7 @@ fn eval(e: &Expr, row: &[FE]) -> FE {
 
 struct LeanInteract {
     channel: String,
-    /// Clean's direction: a pull takes the message from the channel, a push adds it.
-    pull: bool,
+    /// Signed as in Clean: a pull is `−e`, a push `+e`.
     mult: Expr,
     msg: Vec<Expr>,
 }
@@ -113,11 +113,6 @@ fn load_lean(name: &str) -> LeanCircuit {
         } else if let Some(i) = op.get("interact") {
             interacts.push(LeanInteract {
                 channel: i["channel"].as_str().expect("channel").to_string(),
-                pull: match i["direction"].as_str().expect("direction") {
-                    "pull" => true,
-                    "push" => false,
-                    other => panic!("unknown direction {other}"),
-                },
                 mult: parse_expr(&i["multiplicity"]),
                 msg: i["message"]
                     .as_array()
@@ -282,9 +277,9 @@ fn fp_base(x: &FE) -> [u64; 3] {
     fp(&x.to_extension::<Gl3>())
 }
 
-/// An interaction over the random rows: bus, direction (`true` for a Rust sender, Clean's
-/// pull), multiplicity per row, LogUp fingerprint per row.
-type InteractionKey = (u64, bool, Vec<[u64; 3]>, Vec<[u64; 3]>);
+/// An interaction over the random rows: bus, signed multiplicity per row (a Rust sender,
+/// Clean's pull, negated), LogUp fingerprint per row.
+type InteractionKey = (u64, Vec<[u64; 3]>, Vec<[u64; 3]>);
 
 struct Report {
     lean_asserts_unmatched: Vec<usize>,
@@ -340,7 +335,6 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
                 .collect();
             (
                 bus_id_of(&i.channel),
-                i.pull,
                 evals.iter().map(|e| fp(&e.0)).collect(),
                 evals.iter().map(|e| fp(&e.1)).collect(),
             )
@@ -356,8 +350,10 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
                 .collect();
             (
                 i.bus_id,
-                i.is_sender,
-                evals.iter().map(|e| fp(&e.0)).collect(),
+                evals
+                    .iter()
+                    .map(|e| fp(&if i.is_sender { -e.0 } else { e.0 }))
+                    .collect(),
                 evals.iter().map(|e| fp(&e.1)).collect(),
             )
         })
