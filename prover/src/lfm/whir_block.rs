@@ -793,6 +793,10 @@ pub struct TreeProgram {
     pub derived: DerivedChild,
 }
 
+/// A marked level program and the seconds of its walk and its compile
+/// ([`WhirBlockPlan::closed_block_program_marked_timed`]).
+pub type TimedProgram = (LfmProgram, Vec<u32>, (f64, f64));
+
 impl WhirBlockPlan {
     /// Derive the plan over `num_leaves` leaves (when `None`, the fewest that
     /// keep every chip of every leaf under [`P1_LEAF_HEIGHTS`], or under
@@ -1285,6 +1289,23 @@ impl WhirBlockPlan {
     /// layout for leaf 0), so a caller can land them as phase B finishes the
     /// groups. The last mark is the arena's length.
     pub fn closed_block_program_marked(&self) -> Result<(LfmProgram, Vec<u32>), String> {
+        let (program, marks, _) = self.closed_block_program_marked_timed(false)?;
+        super::validator::validate(&program).map_err(|e| format!("not admissible: {e:?}"))?;
+        Ok((program, marks))
+    }
+
+    /// [`Self::closed_block_program_marked`] NOT yet checked by the admission
+    /// validator, compiled in parallel when `parallel`
+    /// ([`super::compiler::compile_parallel`], the same program row for row),
+    /// with the seconds of its walk and its compile: for a prover that
+    /// validates the program itself, before or beside its execution, and
+    /// refuses before it proves (`levels::program_fast`). A verifier derives
+    /// it compiled and validated as before ([`Self::closed_block_program`]).
+    pub fn closed_block_program_marked_timed(
+        &self,
+        parallel: bool,
+    ) -> Result<TimedProgram, String> {
+        let t = std::time::Instant::now();
         if self.partition.num_leaves() != 1 {
             return Err(format!(
                 "a closed block program covers every group in one leaf; the plan has {} leaves",
@@ -1302,7 +1323,15 @@ impl WhirBlockPlan {
             LeafChecks::ALL,
             Some(&mut marks),
         )?;
-        let program = finish(b)?;
+        let source = b.finish();
+        let walk = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let program = if parallel {
+            super::compiler::compile_parallel(source)
+        } else {
+            compile(source)
+        };
+        let compiled = t.elapsed().as_secs_f64();
         if marks.arena_ends.len() != self.partition.leaf(0).len() + 1
             || marks.arena_ends.last().copied() != program.arena_schema.lens.first().copied()
         {
@@ -1312,7 +1341,7 @@ impl WhirBlockPlan {
                 marks.arena_ends, program.arena_schema.lens
             ));
         }
-        Ok((program, marks.arena_ends))
+        Ok((program, marks.arena_ends, (walk, compiled)))
     }
 
     /// [`Self::closed_block_program`] under `checks`, with its bus assert
