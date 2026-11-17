@@ -940,7 +940,7 @@ fn prove_first_groups(
     let arenas = super::whir_block::first_groups_arena(plan, proof, k)?;
     let arena = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    let pre = prepare_level(&program, family)?;
+    let pre = prepare_level(&program, family, super::levels::level_rounds(plan))?;
     let cells = pre.prepared_cells();
     let place = stack_place(cells, 1, stacks);
     let build = pre.commit(place)?;
