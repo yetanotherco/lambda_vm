@@ -2738,3 +2738,99 @@ mod tests {
         );
     }
 }
+
+// ───────────────────────── the opening trace (`LAMBDA_VM_WHIR_OPEN_TRACE=1`) ─────
+
+/// `LAMBDA_VM_WHIR_OPEN_TRACE=1`: each WHIR chain's prove synchronizes the card
+/// at its stage boundaries and prints one `WHIR OPEN TRACE` line with the
+/// seconds each stage took, by round (round 0, round 1, the rest). A
+/// measurement for an untimed run: the synchronizations serialize what the
+/// card would otherwise overlap. It moves no proof byte. Off by default.
+pub fn open_trace_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_WHIR_OPEN_TRACE").as_deref() == Ok("1"))
+}
+
+/// The stages an opening trace attributes time to, in print order.
+pub const OPEN_TRACE_STAGES: [&str; 9] = [
+    "setup",
+    "grind",
+    "sumcheck",
+    "successor",
+    "tree",
+    "ood",
+    "openings",
+    "claims",
+    "final",
+];
+
+struct OpenTrace {
+    last: Instant,
+    /// `[stage][round bucket]`: round 0, round 1, rounds 2 and later.
+    secs: [[f64; 3]; 9],
+}
+
+std::thread_local! {
+    static OPEN_TRACE: std::cell::RefCell<Option<OpenTrace>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Starts this thread's opening trace (the card synchronized first), when the
+/// trace is on.
+pub fn open_trace_begin() {
+    if !open_trace_enabled() {
+        return;
+    }
+    crate::gpu::trace_sync();
+    OPEN_TRACE.with(|t| {
+        *t.borrow_mut() = Some(OpenTrace {
+            last: Instant::now(),
+            secs: [[0.0; 3]; 9],
+        })
+    });
+}
+
+/// Attributes the time since the last lap (the card synchronized first) to
+/// `stage` of round `round`, when the trace is on.
+pub fn open_trace_lap(stage: &str, round: usize) {
+    if !open_trace_enabled() {
+        return;
+    }
+    crate::gpu::trace_sync();
+    OPEN_TRACE.with(|t| {
+        if let Some(trace) = t.borrow_mut().as_mut() {
+            let now = Instant::now();
+            let i = OPEN_TRACE_STAGES
+                .iter()
+                .position(|s| *s == stage)
+                .unwrap_or(0);
+            trace.secs[i][round.min(2)] += now.duration_since(trace.last).as_secs_f64();
+            trace.last = now;
+        }
+    });
+}
+
+/// Ends this thread's opening trace and prints its line: the chain's
+/// variables, rounds and form, then each stage's milliseconds as
+/// `round 0/round 1/rest`.
+pub fn open_trace_end(num_vars: usize, rounds: usize, form: &str) {
+    if !open_trace_enabled() {
+        return;
+    }
+    let taken = OPEN_TRACE.with(|t| t.borrow_mut().take());
+    if let Some(trace) = taken {
+        let mut line = format!("WHIR OPEN TRACE: n {num_vars} · rounds {rounds} · {form}");
+        let mut total = 0.0;
+        for (stage, by_round) in OPEN_TRACE_STAGES.iter().zip(trace.secs.iter()) {
+            let sum: f64 = by_round.iter().sum();
+            total += sum;
+            line.push_str(&format!(
+                " · {stage} {:.2}/{:.2}/{:.2}",
+                by_round[0] * 1e3,
+                by_round[1] * 1e3,
+                by_round[2] * 1e3
+            ));
+        }
+        line.push_str(&format!(" · total {:.2} ms", total * 1e3));
+        eprintln!("{line}");
+    }
+}

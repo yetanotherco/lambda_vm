@@ -2949,6 +2949,7 @@ where
     check_leaf_order::<H>(&config.format)?;
     check_round0_trees::<H>(&config.format)?;
     check_round_form(config)?;
+    crate::whir_split::open_trace_begin();
     check_round_form_union(config, num_vars)?;
     let round0: &[&CodewordCommitment<F, H>] = match &current {
         Current::Base(held) | Current::Joint(held) => std::slice::from_ref(held),
@@ -2993,6 +2994,7 @@ where
     let mut final_poly: Option<Mle<E>> = None;
     let mut tail_alphas: Vec<FieldElement<E>> = Vec::new();
 
+    crate::whir_split::open_trace_lap("setup", 0);
     for (r, &k) in schedule.iter().enumerate() {
         // The loop's OWN wall, so the six are measured against the thing that
         // contains them rather than against `open_groups` two layers up. What
@@ -3014,10 +3016,12 @@ where
             ..RoundNonces::default()
         };
         crate::whir_split::add(&crate::whir_split::GRIND, __wc_g);
+        crate::whir_split::open_trace_lap("grind", r);
 
         let __wc_sc = crate::whir_split::mark();
         let (sumcheck_rounds, challenges) = factors.rounds(k, transcript)?;
         crate::whir_split::add(&crate::whir_split::SUMCHECK, __wc_sc);
+        crate::whir_split::open_trace_lap("sumcheck", r);
         // A grouped round 0 also bound its index: the challenges past the
         // first `k` are `ρ`, and only the first `k` fold a block.
         let (alphas, rho) = challenges.split_at(k.min(challenges.len()));
@@ -3079,6 +3083,7 @@ where
                     },
                 }];
                 crate::whir_split::add(&crate::whir_split::QUERIES, __wc_q);
+                crate::whir_split::open_trace_lap("final", r);
                 final_poly = Some(poly);
                 rounds.push(ChainRound {
                     sumcheck: sumcheck_rounds,
@@ -3232,6 +3237,7 @@ where
             (folded, folded_domain, successor_domain)
         };
         crate::whir_split::add(&crate::whir_split::FOLD, __wc_fold);
+        crate::whir_split::open_trace_lap("successor", r);
 
         // The successor is committed before the queries are drawn, so it cannot
         // be chosen to match them.
@@ -3249,6 +3255,7 @@ where
             }
         };
         crate::whir_split::add(&crate::whir_split::COMMIT_FOLDED, __wc_cf);
+        crate::whir_split::open_trace_lap("tree", r);
         let next_root = next.as_ref().map(|c| c.root());
 
         // Out of domain: a value the queries cannot vouch for, so answering it
@@ -3282,6 +3289,7 @@ where
             let gamma: FieldElement<E> = transcript.sample_field_element();
             factors.add_scaled_eq(&point, &gamma)?;
             crate::whir_split::add(&crate::whir_split::OOD, __wc_ood_b);
+            crate::whir_split::open_trace_lap("ood", r);
             Some(y0)
         } else {
             None
@@ -3295,6 +3303,7 @@ where
             RoundFormFault::SpoilRoundFormQueryNonces,
         )?;
         crate::whir_split::add(&crate::whir_split::GRIND, __wc_g3);
+        crate::whir_split::open_trace_lap("grind", r);
         let round_config = RoundConfig {
             num_queries: queries[r],
             log_folding: k,
@@ -3317,6 +3326,7 @@ where
                 &round_config,
                 round_caps,
                 transcript,
+                r,
             )?
         } else {
             match (&current, &next) {
@@ -3363,6 +3373,7 @@ where
             }
         };
         crate::whir_split::add(&crate::whir_split::QUERIES, __wc_q);
+        crate::whir_split::open_trace_lap("openings", r);
 
         rounds.push(ChainRound {
             sumcheck: sumcheck_rounds,
@@ -3382,6 +3393,11 @@ where
     if let Some(poly) = &final_poly {
         final_value = poly.evaluate(&tail_alphas)?;
     }
+    crate::whir_split::open_trace_end(
+        num_vars,
+        schedule.len(),
+        if whir { "round form" } else { "fri" },
+    );
 
     Ok(ChainProof {
         rounds,
@@ -3408,6 +3424,7 @@ fn round_form_openings<F, E, T, H>(
     config: &RoundConfig,
     caps: RoundCaps,
     transcript: &mut T,
+    round: usize,
 ) -> Result<RoundOpenings<F, E>, Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -3445,11 +3462,13 @@ where
             next: Vec::new(),
         }),
     };
+    crate::whir_split::open_trace_lap("openings", round);
     let gamma: FieldElement<E> = transcript.sample_field_element();
     if !round_form_fault(RoundFormFault::DropShiftClaims) {
         let points = shift_points::<F, E>(folded_domain, &positions, factors.num_vars());
         factors.add_shift_claims(&points, &shift_scales(&gamma, positions.len()))?;
     }
+    crate::whir_split::open_trace_lap("claims", round);
     Ok(openings)
 }
 
