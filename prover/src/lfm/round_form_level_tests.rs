@@ -104,7 +104,11 @@ fn level_1_executes(plan: &WhirBlockPlan, proof: &BlockWhirProof) -> Census {
     let arenas = first_groups_arena(plan, proof, 1).expect("the arena");
     let exec = execute(&first, &arenas, &hasher(&first)).expect("group 0's program accepts");
     let sum = first_groups_bus_sum(plan, proof, 1).expect("the host's sum");
-    assert_eq!(exec.public_words.last().expect("a sum").1, sum, "the bus sum");
+    assert_eq!(
+        exec.public_words.last().expect("a sum").1,
+        sum,
+        "the bus sum"
+    );
     Census {
         groups: plan.num_groups(),
         instructions: program.instrs.len(),
@@ -187,7 +191,10 @@ fn tampers(c: usize, r: usize) -> Vec<(&'static str, Tamper)> {
 #[test]
 fn level_1_executes_over_a_round_form_blake3_base_and_refuses_its_tampers() {
     let name = "test_commit_4";
-    for folds in [crate::zf_format::ZfFormat::DEFAULT.whir_folds, WhirFolds::Uniform] {
+    for folds in [
+        crate::zf_format::ZfFormat::DEFAULT.whir_folds,
+        WhirFolds::Uniform,
+    ] {
         let fri = format(B3Rounds::Fri, folds);
         let w3 = format(B3Rounds::WHIR3, folds);
         let (elf, today) = base(name, &fri);
@@ -237,7 +244,10 @@ fn level_1_executes_over_a_round_form_blake3_base_and_refuses_its_tampers() {
             let arenas = block_leaf_arena(&w3_plan, &proof, 0)
                 .unwrap_or_else(|e| panic!("{what}: the arena builds: {e}"));
             let why = execute(&program, &arenas, &hasher);
-            println!("LEVEL 1 ROUND FORM TAMPER {folds:?} {what}: {:?}", why.as_ref().err());
+            println!(
+                "LEVEL 1 ROUND FORM TAMPER {folds:?} {what}: {:?}",
+                why.as_ref().err()
+            );
             assert!(why.is_err(), "{what}: level 1 accepted it");
         }
     }
