@@ -972,6 +972,26 @@ pub fn set_up_device() {
 #[cfg(not(feature = "cuda"))]
 pub fn set_up_device() {}
 
+/// The card settled: every stream's pending frees landed and the memory
+/// pool's unused blocks handed back (`math_cuda::device::drain_and_trim`),
+/// then `(pool bytes in use, the pool's peak since the last call, the
+/// device's free bytes, its total)`, the peak started again. `None` without
+/// a device.
+#[cfg(feature = "cuda")]
+pub fn settle_card() -> Option<(u64, u64, u64, u64)> {
+    let be = math_cuda::device::backend().ok()?;
+    let _ = math_cuda::device::drain_and_trim();
+    let (used, peak) = math_cuda::device::pool_used_bytes().ok()?;
+    let _ = math_cuda::device::reset_pool_high_water();
+    let (free, total) = be.device_mem_info()?;
+    Some((used, peak, free, total))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn settle_card() -> Option<(u64, u64, u64, u64)> {
+    None
+}
+
 /// What the ledger may promise in all; 0 without a device.
 #[cfg(feature = "cuda")]
 pub fn reserve_budget() -> u64 {
