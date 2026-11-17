@@ -55,14 +55,14 @@ use multilinear::whir_chain::{ArgueFormat, ChainConfig, FinalPoly};
 use multilinear::whir_commit::Commitment;
 use multilinear::whir_hash::WhirHash;
 use stark::multilinear_block::{
-    self, BlockCommitted, BlockPrepared, BlockPreparedCheck, Narrowing,
+    self, BlockCommitted, BlockPrepared, BlockPreparedCheck, Narrowing, PreparedCommitment,
 };
 use stark::multilinear_table::batched::VerifierChecks;
 use stark::multilinear_table::{BatchedArgue, CommittedTable, MultiProof, TableStatement};
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
 use crate::block_whir::{
-    GroupPrepared, PreparedColumns, commit_groups, commit_groups_on_host, group_stacks,
+    GroupPrepared, GroupStack, PreparedColumns, commit_group, commit_groups_on_host, group_stacks,
 };
 use crate::multilinear_prove::{layout_of, stacks};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
@@ -823,6 +823,12 @@ pub enum WlfmProving {
 pub struct WlfmBuild {
     pub artifacts: WlfmArtifacts,
     stacks: WlfmStacks,
+    /// Where the prepared stacks were committed, and the build's seconds: the
+    /// host's part (the stacks' columns) and the commits'.
+    place: StackPlace,
+    secs: (f64, f64),
+    /// [`Self::release_prover_half`] ran.
+    released: bool,
     /// Under [`chip_records`], each chip table's preprocessed prefix packed
     /// narrow once ([`Self::hold_chip_prefixes`]), by table position: the
     /// prefix its records carry. Empty until then (a prove packs what it
@@ -834,8 +840,99 @@ pub struct WlfmBuild {
 
 /// The prover's prepared stacks, under the build's family.
 enum WlfmStacks {
-    P1(Vec<GroupPrepared<WlfmHash>>),
-    B3(Vec<GroupPrepared<WlfmB3Hash>>),
+    P1(Vec<WlfmPrepared<WlfmHash>>),
+    B3(Vec<WlfmPrepared<WlfmB3Hash>>),
+}
+
+/// Where a prover's build commits its prepared stacks. The roots are the same
+/// in every place, so the proofs are too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackPlace {
+    /// Encoded and hashed on the host, the codewords held there: a
+    /// verifier's build, or a prover with no card room.
+    Host,
+    /// Committed on the card and held there through the prove.
+    Card,
+    /// Committed on the card one stack at a time and let go at once, its
+    /// roots and tree tops kept on the host; each stack is revived from its
+    /// columns at its group's opening and let go after it
+    /// ([`PreparedCommitment::Retired`]). The card holds no stack between
+    /// the build and the prove, so a level's group commits keep their room.
+    CardRetired,
+}
+
+/// One group's prepared stack as the prover holds it: its columns, and its
+/// commitment held or retired ([`StackPlace`]).
+struct WlfmPrepared<H: WhirHash> {
+    group: usize,
+    tables: Vec<(usize, usize)>,
+    columns: Vec<Mle<F>>,
+    roots: Vec<Commitment>,
+    hold: PreparedHold<H>,
+}
+
+enum PreparedHold<H: WhirHash> {
+    Held(multilinear::stacked_eval::StackedCommitment<F, H>),
+    Retired(multilinear::stacked_eval::RetiredStack<F>),
+}
+
+impl<H: WhirHash> WlfmPrepared<H> {
+    fn held(p: GroupPrepared<H>) -> Self {
+        WlfmPrepared {
+            group: p.group,
+            tables: p.tables,
+            columns: p.columns,
+            roots: p.roots,
+            hold: PreparedHold::Held(p.commitment),
+        }
+    }
+
+    /// Committed, its codewords let go at once (`drop`: the tree levels it
+    /// keeps none of).
+    fn retired(
+        p: GroupPrepared<H>,
+        drop: multilinear::whir_commit::TreeDrop,
+        config: &ChainConfig,
+    ) -> Result<Self, String> {
+        let retired = p
+            .commitment
+            .retire(drop, config)
+            .map_err(|e| format!("group {}: retiring its prepared stack: {e:?}", p.group))?;
+        if retired.roots() != p.roots {
+            return Err(format!(
+                "group {}: a retired prepared stack's roots moved",
+                p.group
+            ));
+        }
+        Ok(WlfmPrepared {
+            group: p.group,
+            tables: p.tables,
+            columns: p.columns,
+            roots: p.roots,
+            hold: PreparedHold::Retired(retired),
+        })
+    }
+
+    fn layout(&self) -> &StackedLayout {
+        match &self.hold {
+            PreparedHold::Held(c) => c.layout(),
+            PreparedHold::Retired(r) => r.layout(),
+        }
+    }
+
+    fn domain(&self) -> &Domain<F> {
+        match &self.hold {
+            PreparedHold::Held(c) => c.domain(),
+            PreparedHold::Retired(r) => r.domain(),
+        }
+    }
+
+    fn commitment(&self) -> PreparedCommitment<'_, F, H> {
+        match &self.hold {
+            PreparedHold::Held(c) => PreparedCommitment::Held(c),
+            PreparedHold::Retired(r) => PreparedCommitment::Retired(r),
+        }
+    }
 }
 
 impl WlfmStacks {
@@ -855,32 +952,46 @@ impl WlfmStacks {
     }
 }
 
-/// Every group's prepared commitment under `H`, on the host when `on_host`
-/// (a verifier's build), else where the card is.
+/// Every group's prepared commitment under `H`, where `place` says (the
+/// host for a verifier's build).
 fn commit_under<H: WhirHash>(
-    stacks: Vec<crate::block_whir::GroupStack>,
+    stacks: Vec<GroupStack>,
     config: &ChainConfig,
-    on_host: bool,
-) -> Result<Vec<GroupPrepared<H>>, String> {
-    if on_host {
-        commit_groups_on_host::<H>(stacks, config).map_err(|e| format!("{e:?}"))
-    } else {
-        // ⛔ THE CARD, as `program_census::build_artifacts_counted` holds it
-        // for a STARK build: the prepared commits run on the device, so
-        // concurrent siblings serialize them. Inert unless a driver armed it.
-        let _card = super::device_permit::hold_labeled("build_artifacts");
-        commit_groups::<H>(stacks, config).map_err(|e| format!("{e:?}"))
+    place: StackPlace,
+) -> Result<Vec<WlfmPrepared<H>>, String> {
+    if place == StackPlace::Host {
+        return Ok(commit_groups_on_host::<H>(stacks, config)
+            .map_err(|e| format!("{e:?}"))?
+            .into_iter()
+            .map(WlfmPrepared::held)
+            .collect());
     }
+    // ⛔ THE CARD, as `program_census::build_artifacts_counted` holds it for a
+    // STARK build: the prepared commits run on the device, so concurrent
+    // siblings serialize them. Inert unless a driver armed it.
+    let _card = super::device_permit::hold_labeled("build_artifacts");
+    let drop = crate::block_whir::BlockOptions::production().drop_levels;
+    // One stack at a time: committed, then held or let go before the next.
+    stacks
+        .into_iter()
+        .map(|stack| {
+            let p = commit_group::<H>(stack, config).map_err(|e| format!("{e:?}"))?;
+            match place {
+                StackPlace::CardRetired => WlfmPrepared::retired(p, drop, config),
+                _ => Ok(WlfmPrepared::held(p)),
+            }
+        })
+        .collect()
 }
 
 /// What a build keeps of each prepared commitment, under any hash.
-fn stack_of<H: WhirHash>(p: &GroupPrepared<H>) -> WlfmStack {
+fn stack_of<H: WhirHash>(p: &WlfmPrepared<H>) -> WlfmStack {
     WlfmStack {
         group: p.group,
         tables: p.tables.clone(),
         roots: p.roots.clone(),
-        layout: p.commitment.layout().clone(),
-        domain: p.commitment.domain().clone(),
+        layout: p.layout().clone(),
+        domain: p.domain().clone(),
     }
 }
 
@@ -900,6 +1011,27 @@ impl WlfmBuild {
         &self,
     ) -> &[Option<std::sync::Arc<multilinear::narrow::NarrowColumns>>] {
         &self.chip_prefixes
+    }
+
+    /// The build with its first prepared stack's first column changed at
+    /// row 0 AFTER its commit: a prover whose stack's columns are not the
+    /// committed ones. Returns whether there was one.
+    pub(crate) fn with_prepared_column_moved(mut self) -> (Self, bool) {
+        fn moved<H: WhirHash>(stacks: &mut [WlfmPrepared<H>]) -> bool {
+            let Some(column) = stacks.first_mut().and_then(|s| s.columns.first_mut()) else {
+                return false;
+            };
+            let mut evals =
+                core::mem::replace(column, Mle::constant(FieldElement::zero())).into_evals();
+            evals[0] += FieldElement::<F>::one();
+            *column = Mle::new(evals).expect("the same length");
+            true
+        }
+        let done = match &mut self.stacks {
+            WlfmStacks::P1(s) => moved(s),
+            WlfmStacks::B3(s) => moved(s),
+        };
+        (self, done)
     }
 
     /// The build with table `t`'s held prefix replaced: a test's forgery.
@@ -951,6 +1083,26 @@ impl WlfmBuild {
     pub fn chip_prefix_secs(&self) -> f64 {
         self.chip_prefix_secs
     }
+
+    /// The prover's half let go: the prepared stacks (their columns and
+    /// commitments) and the held chip prefixes. The artifacts stay, for the
+    /// level above and the verifier. A released build proves no more.
+    pub fn release_prover_half(&mut self) {
+        self.stacks = WlfmStacks::empty(self.artifacts.family);
+        self.chip_prefixes = Vec::new();
+        self.released = true;
+    }
+
+    /// Where the prepared stacks were committed.
+    pub fn place(&self) -> StackPlace {
+        self.place
+    }
+
+    /// The build's seconds: its host part ([`prepare_wlfm`]) and its
+    /// commits ([`WlfmPrebuild::commit`]).
+    pub fn secs(&self) -> (f64, f64) {
+        self.secs
+    }
 }
 
 /// Table `t`'s preprocessed prefix's columns as the prover's build holds them:
@@ -958,7 +1110,7 @@ impl WlfmBuild {
 /// ones). `None` for a table with none.
 fn table_prefix<'a, H: WhirHash>(
     artifacts: &'a WlfmArtifacts,
-    stacks: &'a [GroupPrepared<H>],
+    stacks: &'a [WlfmPrepared<H>],
     t: usize,
 ) -> Option<Vec<&'a [FieldElement<F>]>> {
     if artifacts.prep == WlfmPrep::Evaluated {
@@ -1096,6 +1248,166 @@ pub fn build_wlfm_under(
     levers: WlfmLevers,
     on_host: bool,
 ) -> Result<WlfmBuild, String> {
+    let place = if on_host {
+        StackPlace::Host
+    } else {
+        StackPlace::Card
+    };
+    build_wlfm_placed(program, hasher, rate, levers, place)
+}
+
+/// [`build_wlfm_under`] with the prepared stacks committed where `place`
+/// says: [`prepare_wlfm`], then [`WlfmPrebuild::commit`].
+pub fn build_wlfm_placed(
+    program: &LfmProgram,
+    hasher: HasherKind,
+    rate: WlfmRate,
+    levers: WlfmLevers,
+    place: StackPlace,
+) -> Result<WlfmBuild, String> {
+    prepare_wlfm(program, hasher, rate, levers)?.commit(place)
+}
+
+/// A build's host part: the artifacts but the prepared roots, and the
+/// prepared stacks' columns, uncommitted ([`prepare_wlfm`]).
+pub struct WlfmPrebuild {
+    /// Every field but `stacks` and `program_id`, which the commit settles.
+    artifacts: WlfmArtifacts,
+    /// Under [`WlfmPrep::Stacked`], the stacks to commit; `None` otherwise.
+    stacks: Option<Vec<GroupStack>>,
+    secs: f64,
+    /// [`Self::hold_chip_prefixes`]'s prefixes and seconds, handed to the
+    /// build (empty until then).
+    chip_prefixes: Vec<Option<std::sync::Arc<multilinear::narrow::NarrowColumns>>>,
+    chip_prefix_secs: f64,
+}
+
+impl WlfmPrebuild {
+    /// The prepared cells the commit takes: every stack's columns at their
+    /// heights.
+    pub fn prepared_cells(&self) -> u64 {
+        self.stacks
+            .iter()
+            .flatten()
+            .map(|s| s.columns.iter().map(|c| c.len() as u64).sum::<u64>())
+            .sum()
+    }
+
+    /// The seconds [`prepare_wlfm`] took.
+    pub fn secs(&self) -> f64 {
+        self.secs
+    }
+
+    /// [`WlfmBuild::hold_chip_prefixes`] before the commit, from the columns
+    /// the stacks will commit (the same words, so the same prefixes): a
+    /// host's work that need not wait for the card.
+    pub fn hold_chip_prefixes(&mut self) -> Result<(), String> {
+        let t = std::time::Instant::now();
+        let airs = self.artifacts.airs();
+        let refs = airs.air_refs();
+        let mut prefixes = vec![None; refs.len()];
+        for (table, air) in refs.iter().enumerate() {
+            if super::chip_records::ChipKind::of_air(air.name()).is_none() {
+                continue;
+            }
+            let columns: Option<Vec<&[FieldElement<F>]>> = match &self.stacks {
+                None => self
+                    .artifacts
+                    .evaluated
+                    .get(table)
+                    .filter(|c| !c.is_empty())
+                    .map(|c| c.iter().map(|c| c.evals()).collect()),
+                Some(stacks) => stacks.iter().find_map(|stack| {
+                    let mut at = 0usize;
+                    for &(position, _, n) in &stack.tables {
+                        if position == table {
+                            return Some(
+                                stack.columns[at..at + n]
+                                    .iter()
+                                    .map(Vec::as_slice)
+                                    .collect(),
+                            );
+                        }
+                        at += n;
+                    }
+                    None
+                }),
+            };
+            let packed = columns
+                .ok_or_else(|| format!("{}: no prefix columns for table {table}", air.name()))
+                .and_then(|columns| {
+                    super::chip_records::pack_prefix(&columns)
+                        .ok_or_else(|| format!("{}: a prefix not one height", air.name()))
+                })?;
+            prefixes[table] = Some(std::sync::Arc::new(packed));
+        }
+        drop(refs);
+        self.chip_prefixes = prefixes;
+        self.chip_prefix_secs = t.elapsed().as_secs_f64();
+        Ok(())
+    }
+
+    /// The build: every prepared stack committed where `place` says, the
+    /// coverage rule checked, and the program's identity over the roots.
+    pub fn commit(self, place: StackPlace) -> Result<WlfmBuild, String> {
+        let t = std::time::Instant::now();
+        let WlfmPrebuild {
+            mut artifacts,
+            stacks,
+            secs,
+            chip_prefixes,
+            chip_prefix_secs,
+        } = self;
+        let family = artifacts.family;
+        let committed = match stacks {
+            None => WlfmStacks::empty(family),
+            Some(stacks) => {
+                let committed = match family {
+                    WlfmFamily::P1 => {
+                        WlfmStacks::P1(commit_under::<WlfmHash>(stacks, &artifacts.config, place)?)
+                    }
+                    WlfmFamily::B3 => WlfmStacks::B3(commit_under::<WlfmB3Hash>(
+                        stacks,
+                        &artifacts.config,
+                        place,
+                    )?),
+                };
+                let views: Vec<WlfmStack> = match &committed {
+                    WlfmStacks::P1(c) => c.iter().map(stack_of).collect(),
+                    WlfmStacks::B3(c) => c.iter().map(stack_of).collect(),
+                };
+                let plan: Vec<(usize, &[(usize, usize)])> = views
+                    .iter()
+                    .map(|s| (s.group, s.tables.as_slice()))
+                    .collect();
+                check_coverage(&artifacts.counts, &artifacts.sizes, &plan)?;
+                artifacts.stacks = views;
+                committed
+            }
+        };
+        artifacts.program_id = wlfm_program_id(&artifacts);
+        Ok(WlfmBuild {
+            artifacts,
+            stacks: committed,
+            place,
+            secs: (secs, t.elapsed().as_secs_f64()),
+            released: false,
+            chip_prefixes,
+            chip_prefix_secs,
+        })
+    }
+}
+
+/// The host's part of [`build_wlfm_under`]: the program's instruction
+/// columns cut, transposed and stacked, every artifact but the prepared
+/// roots derived. Touches no card.
+pub fn prepare_wlfm(
+    program: &LfmProgram,
+    hasher: HasherKind,
+    rate: WlfmRate,
+    levers: WlfmLevers,
+) -> Result<WlfmPrebuild, String> {
+    let t = std::time::Instant::now();
     let WlfmLevers {
         prep,
         final_poly,
@@ -1210,7 +1522,7 @@ pub fn build_wlfm_under(
                 .collect::<Result<_, _>>()?;
         }
         check_evaluated(&counts, &table_num_vars, &evaluated)?;
-        let mut artifacts = WlfmArtifacts {
+        let artifacts = WlfmArtifacts {
             rate,
             hasher,
             chip_set,
@@ -1230,29 +1542,16 @@ pub fn build_wlfm_under(
             evaluated,
             program_id: [0u8; 32],
         };
-        artifacts.program_id = wlfm_program_id(&artifacts);
-        return Ok(WlfmBuild {
+        return Ok(WlfmPrebuild {
             artifacts,
-            stacks: WlfmStacks::empty(family),
+            stacks: None,
+            secs: t.elapsed().as_secs_f64(),
             chip_prefixes: Vec::new(),
             chip_prefix_secs: 0.0,
         });
     }
     let stacks = group_stacks(columns, &group_lists).map_err(|e| format!("{e:?}"))?;
-    let committed = match family {
-        WlfmFamily::P1 => WlfmStacks::P1(commit_under::<WlfmHash>(stacks, &config, on_host)?),
-        WlfmFamily::B3 => WlfmStacks::B3(commit_under::<WlfmB3Hash>(stacks, &config, on_host)?),
-    };
-    let stacks: Vec<WlfmStack> = match &committed {
-        WlfmStacks::P1(c) => c.iter().map(stack_of).collect(),
-        WlfmStacks::B3(c) => c.iter().map(stack_of).collect(),
-    };
-    let plan: Vec<(usize, &[(usize, usize)])> = stacks
-        .iter()
-        .map(|s| (s.group, s.tables.as_slice()))
-        .collect();
-    check_coverage(&counts, &sizes, &plan)?;
-    let mut artifacts = WlfmArtifacts {
+    let artifacts = WlfmArtifacts {
         rate,
         hasher,
         chip_set,
@@ -1268,14 +1567,14 @@ pub fn build_wlfm_under(
         family,
         lfm_chunks,
         b3l,
-        stacks,
+        stacks: Vec::new(),
         evaluated: Vec::new(),
         program_id: [0u8; 32],
     };
-    artifacts.program_id = wlfm_program_id(&artifacts);
-    Ok(WlfmBuild {
+    Ok(WlfmPrebuild {
         artifacts,
-        stacks: committed,
+        stacks: Some(stacks),
+        secs: t.elapsed().as_secs_f64(),
         chip_prefixes: Vec::new(),
         chip_prefix_secs: 0.0,
     })
@@ -1531,6 +1830,9 @@ pub(crate) fn prove_wlfm_traces_as(
     check_prefix: bool,
     proving: WlfmProving,
 ) -> Result<WlfmProof, String> {
+    if build.released {
+        return Err("a build whose prover half was let go proves no more".into());
+    }
     match &build.stacks {
         WlfmStacks::P1(stacks) => prove_traces_under::<WlfmHash>(
             &build.artifacts,
@@ -1595,7 +1897,7 @@ pub fn take_wlfm_stamps() -> Option<WlfmStamps> {
 
 fn prove_traces_under<H: WhirHash>(
     artifacts: &WlfmArtifacts,
-    stacks: &[GroupPrepared<H>],
+    stacks: &[WlfmPrepared<H>],
     held_prefixes: &[Option<std::sync::Arc<NarrowPrefix>>],
     filled: LfmFilled,
     check_prefix: bool,
@@ -1828,7 +2130,7 @@ fn prove_traces_under<H: WhirHash>(
         .map(|(p, columns)| BlockPrepared {
             group: p.group,
             tables: p.tables.clone(),
-            commitment: &p.commitment,
+            commitment: p.commitment(),
             columns,
         })
         .collect();

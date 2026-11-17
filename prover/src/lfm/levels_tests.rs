@@ -14,7 +14,7 @@ use super::whir_block::{LeafChecks, WhirBlockPlan, block_leaf_arena, top_claims}
 use super::whir_block_tests::{
     at_blowup_4, plan_of, small_block, small_block_options, small_format,
 };
-use super::wlfm::{WlfmFamily, verify_wlfm};
+use super::wlfm::{StackPlace, WlfmFamily, verify_wlfm};
 use crate::block_whir::{BlockFormat, BlockWhirProof};
 use stark::proof::options::{BaseFormat, ProofOptions};
 
@@ -403,8 +403,9 @@ fn the_block_levels_driver_proves_a_small_block() {
 }
 
 /// ★ THE BLAKE3 DRIVER: a small block's 7-round BLAKE3 base proved with level
-/// 1 executed and every level built (prepared stacks on the host) beside its
-/// phase B, then both levels proved under the BLAKE3 family.
+/// 1 executed and its prepared stacks' columns built beside its phase B (the
+/// stacks committed on the card once the base ends), then both levels proved
+/// under the BLAKE3 family.
 /// The base verifies, every level verifies against its own artifacts, and the
 /// block's verifier — its BLAKE3 plan derived on its own — accepts the last.
 #[test]
@@ -462,6 +463,69 @@ fn the_blake3_levels_driver_proves_a_small_block() {
         t.built,
         t.levels
     );
+}
+
+/// ★ The driver's stacks are the prover's choice, never the proof's: a small
+/// BLAKE3 block driven with every level's prepared stacks committed on the
+/// card and let go (revived at each group's opening) proves each level's
+/// bytes as [`prove_levels`] does over the same base with the stacks held.
+/// Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1` (the grind may take any valid
+/// nonce otherwise); an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_with_retired_stacks_proves_the_held_levels_bytes() {
+    use super::levels::{prove_block_levels, set_stacks_for_test};
+    use super::wlfm::StackPlace;
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = {
+        let _retired = set_stacks_for_test(Some(StackPlace::CardRetired));
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level")
+    };
+    assert!(
+        run.times
+            .builds
+            .iter()
+            .all(|b| b.place == StackPlace::CardRetired || b.place == StackPlace::Host),
+        "every level's stacks retired (or on the host without a card): {:?}",
+        run.times.builds
+    );
+    let held = {
+        let _held = set_stacks_for_test(Some(StackPlace::Card));
+        derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive")
+    };
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(
+            a[..] == b[..],
+            "level {}: the held stacks' proof bytes",
+            k + 1
+        );
+        println!(
+            "LEVELS RETIRED IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
 }
 
 /// The BLAKE3 driver with level 1's lean round tables filled beside its
@@ -565,8 +629,9 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
 /// `b3`: the 7-round BLAKE3 base at `prove-block-base --base b3`'s format —
 /// blowup 2, coset leaves, one tree a run, indexed groups — and BLAKE3
 /// levels), `RTA_BESIDE` (1, the default: level 1 executes beside phase B; 0
-/// the control), `RTA_BUILD_BESIDE` (1: every level built on the host beside
-/// phase B; 0, the default: on the card after the base), `RTA_LEVELS` (the
+/// the control), `RTA_BUILD_BESIDE` (1: level 1's stacks' columns prepared on
+/// the host beside phase B; 0, the default: after the base; their commits are
+/// on the card either way, `LAMBDA_VM_LEVELS_STACKS`), `RTA_LEVELS` (the
 /// chain's length; 2), `RTA_RUNS` (runs in this process, the first a warm-up;
 /// 1). Prints `RTA …` lines, each run's tagged `run k`; everything is verified
 /// off the clock.
@@ -574,8 +639,8 @@ fn level_1_lands_in_at_most_64_pieces_that_tile_its_arena() {
 /// `RTA_L1_GROUPS=k1,k2,…` measures level 1's prove rate at a chosen size
 /// instead ([`rta_first_groups`]): the base proved once, then one level-1 run
 /// an entry over the base's first `k` groups (the first entry a warm-up when
-/// there are several); `RTA_L1_STACKS` (`card`, `host`, or unset: where the
-/// card holds them) places its prepared stacks. `RTA_BESIDE`,
+/// there are several); `RTA_L1_STACKS` (`card`, `retired`, `host`, or unset:
+/// as the levels' prover places them) places its prepared stacks. `RTA_BESIDE`,
 /// `RTA_BUILD_BESIDE`, `RTA_LEVELS` and `RTA_RUNS` do not apply to it.
 #[test]
 #[ignore = "a real block and its levels: box only"]
@@ -634,9 +699,10 @@ fn rta_a_real_block_through_its_levels() {
             .collect();
         let stacks = match std::env::var("RTA_L1_STACKS").as_deref().map(str::trim) {
             Err(_) | Ok("") | Ok("auto") => None,
-            Ok("card") => Some(false),
-            Ok("host") => Some(true),
-            Ok(other) => panic!("RTA_L1_STACKS is card, host or auto, not {other}"),
+            Ok("card") => Some(StackPlace::Card),
+            Ok("retired") => Some(StackPlace::CardRetired),
+            Ok("host") => Some(StackPlace::Host),
+            Ok(other) => panic!("RTA_L1_STACKS is card, retired, host or auto, not {other}"),
         };
         rta_first_groups(&elf, &input, &opts, &cfg, family, &ks, stacks);
         println!("RTA DONE");
@@ -738,19 +804,58 @@ fn rta_one_run(
         .enumerate()
     {
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(p).map_or(0, |b| b.len());
+        let (instructions, compressions) = t.sizes.get(k).copied().unwrap_or_default();
         println!(
-            "RTA LEVEL {}: groups {} · instructions {} · compressions {} · execute {:.3}s · fill \
-             {:.3}s · prove {:.3}s · end {:.3}s · proof {bytes} B",
+            "RTA LEVEL {}: groups {} · instructions {instructions} · compressions {compressions} · \
+             execute {:.3}s · fill {:.3}s · prove {:.3}s · end {:.3}s · proof {bytes} B",
             k + 1,
             level.build.artifacts.sizes.len(),
-            level.program.instrs.len(),
-            level.program.groups.b3l.real_rows,
             l.executed - l.execute_from,
             l.fill,
             l.prove,
             l.end
         );
+        if let Some(b) = t.builds.get(k) {
+            println!(
+                "RTA LEVEL {} BUILD: stacks {} · prepared cells {} · prepare {:.3}s · commit {:.3}s \
+                 · prefix pack {:.3}s · committed at {:.3}s",
+                k + 1,
+                place_word(b.place),
+                b.cells,
+                b.prepare,
+                b.commit,
+                b.prefix,
+                b.committed
+            );
+        }
+        if let Some(st) = t.stamps.get(k) {
+            print_level_stamps(&format!("RTA LEVEL {}", k + 1), st);
+        }
     }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let purge = |p: &Option<crate::alloc_purge::Purge>| match p {
+        Some(p) => format!(
+            "{:.3}s ({:.2} → {:.2} GiB)",
+            p.secs,
+            p.resident_before as f64 / (1u64 << 30) as f64,
+            p.resident_after as f64 / (1u64 << 30) as f64
+        ),
+        None => "none".to_string(),
+    };
+    let points: Vec<String> = t
+        .resident
+        .iter()
+        .map(|(at, b)| format!("{at} {:.2} GiB", gib(*b)))
+        .collect();
+    let (rss, hwm) = rss_gib();
+    println!(
+        "RTA MEMORY: peak reset {} · VmRSS {} · purge at the base's end {} · purge after the \
+         levels {} · now VmRSS {rss:.2} GiB · VmHWM {hwm:.2} GiB",
+        t.peak_reset,
+        points.join(" · "),
+        purge(&t.purges[0]),
+        purge(&t.purges[1]),
+    );
     let end = t.levels.last().map_or(t.base, |l| l.end);
     println!(
         "RTA RECURSION: {:.3}s after the base (end {end:.3}s)",
@@ -774,7 +879,17 @@ fn rta_one_run(
     )
     .is_ok();
     println!("RTA VERIFIED: base {ok_base} · levels {ok_levels} · block {ok_last}");
+    // A tampered last proof (one published word changed) is refused against
+    // the last level's artifacts.
+    let mut tampered = run.proofs.last().expect("a last level").clone();
+    if let Some((_, w)) = tampered.public_words.first_mut() {
+        w[0] += crate::tables::types::FE::one();
+    }
+    let top = &run.levels.last().expect("a last level").build.artifacts;
+    let refused = verify_wlfm(top, &tampered, &tampered.public_words).is_err();
+    println!("RTA TAMPER: a changed word of the last level refused {refused}");
     assert!(ok_base && ok_levels && ok_last, "everything verifies");
+    assert!(refused, "a tampered last level is refused");
 }
 
 /// One run of level 1 over a block's first `k` groups
@@ -783,7 +898,7 @@ fn rta_one_run(
 struct FirstGroupsRun {
     level: super::levels::Level,
     proof: super::wlfm::WlfmProof,
-    on_host: bool,
+    place: StackPlace,
     prepared_cells: u64,
     emit: f64,
     arena: f64,
@@ -805,18 +920,17 @@ struct FirstGroupsRun {
 }
 
 /// ★ Level 1 over the first `k` groups of `plan`'s block, as the levels'
-/// prover runs a level: emitted, its prepared stacks built (on the host when
-/// `stacks` is `Some(true)`, on the card when `Some(false)`, where the card
-/// holds them when `None`), executed over the base proof's witness, filled,
-/// and proved streamed. Not verified here.
+/// prover runs a level: emitted, its prepared stacks built where `stacks`
+/// says (as the levels' prover places them when `None`), executed over the
+/// base proof's witness, filled, and proved streamed. Not verified here.
 fn prove_first_groups(
     plan: &WhirBlockPlan,
     proof: &BlockWhirProof,
     family: WlfmFamily,
     k: usize,
-    stacks: Option<bool>,
+    stacks: Option<StackPlace>,
 ) -> Result<FirstGroupsRun, String> {
-    use super::levels::{build_level, prefix_check, prepared_cells, stacks_on_host};
+    use super::levels::{prefix_check, prepare_level, stack_place};
     use super::wlfm::{WlfmProving, prove_wlfm_traces_as, take_wlfm_stamps};
     use std::time::Instant;
     let t = Instant::now();
@@ -825,11 +939,12 @@ fn prove_first_groups(
     let t = Instant::now();
     let arenas = super::whir_block::first_groups_arena(plan, proof, k)?;
     let arena = t.elapsed().as_secs_f64();
-    let cells = prepared_cells(&program);
-    let on_host = stacks.unwrap_or_else(|| stacks_on_host(&program, 1));
     let t = Instant::now();
-    let mut level = build_level(program, family, on_host)?;
-    super::levels::hold_prefixes(&mut level.build)?;
+    let pre = prepare_level(&program, family)?;
+    let cells = pre.prepared_cells();
+    let place = stack_place(cells, 1, stacks);
+    let build = pre.commit(place)?;
+    let level = super::levels::Level { program, build };
     let build = t.elapsed().as_secs_f64();
     let prefix_pack = level.build.chip_prefix_secs();
     let hasher = level.build.artifacts.hasher;
@@ -863,7 +978,7 @@ fn prove_first_groups(
     Ok(FirstGroupsRun {
         level,
         proof,
-        on_host,
+        place,
         prepared_cells: cells,
         emit,
         arena,
@@ -877,6 +992,86 @@ fn prove_first_groups(
         records_fills,
         stamps,
     })
+}
+
+/// A level prove's stamps as `<tag> PROVE` and one `<tag> GROUP g` line a
+/// group: the card prove by phase, the ledger, and each group's turn.
+fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let peak = st
+        .groups
+        .iter()
+        .flat_map(|g| {
+            [
+                g.commit_reserved,
+                g.argue_reserved,
+                g.open_reserved,
+                g.transition_reserved,
+            ]
+        })
+        .chain([st.card_reserved_at_start])
+        .max()
+        .unwrap_or(0);
+    let cells: usize = st.groups.iter().map(|g| g.cells).sum();
+    println!(
+        "{tag} PROVE: prep {:.3}s · phase A {:.3}s · phase B {:.3}s · group cells {cells} · card \
+         budget {:.2} GiB · reserved at start {:.2} GiB · ledger peak {:.2} GiB · narrow {} tables \
+         · records {} tables · prep parts: merge {:.3}s airs {:.3}s pairs {:.3}s check {:.3}s \
+         layouts {:.3}s tables {:.3}s",
+        st.prep,
+        st.phase_a,
+        st.phase_b,
+        gib(st.card_budget),
+        gib(st.card_reserved_at_start),
+        gib(peak),
+        st.narrow_tables,
+        st.records_tables,
+        st.prep_parts[0],
+        st.prep_parts[1],
+        st.prep_parts[2],
+        st.prep_parts[3],
+        st.prep_parts[4],
+        st.prep_parts[5],
+    );
+    for (g, s) in st.groups.iter().enumerate() {
+        println!(
+            "{tag} GROUP {g}: tables {} · polys {} · cells {} · wait A {:.3}s · up A {:.3}s (paid \
+             {:.3}) · commit {:.3}s · retire {:.3}s · up B {:.3}s · argue {:.3}s · encode {:.3}s · \
+             open {:.3}s · prepared revive {:.3}s · open paid {:.3}s · overlapped {} · turn \
+             {:.3}-{:.3}s · GiB promised: commit {:.2}/{:.2} · argue {:.2}/{:.2} · open {:.2}",
+            s.tables,
+            s.polys,
+            s.cells,
+            s.wait_a,
+            s.upload_a,
+            s.upload_paid,
+            s.commit,
+            s.retire,
+            s.upload_b,
+            s.argue,
+            s.encode,
+            s.open,
+            s.prepared_revive,
+            s.open_paid,
+            s.overlapped,
+            s.start_b,
+            s.end_b,
+            gib(s.commit_base),
+            gib(s.commit_reserved),
+            gib(s.argue_base),
+            gib(s.argue_reserved),
+            gib(s.open_reserved),
+        );
+    }
+}
+
+/// A stack place as the harness's lines print it.
+fn place_word(place: StackPlace) -> &'static str {
+    match place {
+        StackPlace::Host => "host",
+        StackPlace::Card => "card",
+        StackPlace::CardRetired => "card retired",
+    }
 }
 
 /// This process's resident and peak resident memory, in GiB (Linux; `NaN`
@@ -910,7 +1105,7 @@ fn rta_first_groups(
     cfg: &super::whir_block_tree::WhirTreeConfig,
     family: WlfmFamily,
     ks: &[usize],
-    stacks: Option<bool>,
+    stacks: Option<StackPlace>,
 ) {
     use std::time::Instant;
     let roots: std::sync::Mutex<Option<Vec<crate::block_whir::PreparedRoots>>> =
@@ -1009,7 +1204,7 @@ fn rta_first_groups(
             plan.num_groups(),
             a.sizes.len(),
             r.prepared_cells,
-            if r.on_host { "host" } else { "card" },
+            place_word(r.place),
             r.emit,
             r.arena,
             r.build,
@@ -1141,7 +1336,11 @@ fn the_first_groups_level_proves_and_publishes_their_bus_sum() {
     assert!(n >= 2, "the small block has {n} groups");
     assert!(plan.first_groups_program_marked(0).is_err());
     assert!(plan.first_groups_program_marked(n + 1).is_err());
-    for (k, stacks) in [(1, Some(true)), (2, None)] {
+    for (k, stacks) in [
+        (1, Some(StackPlace::Host)),
+        (2, None),
+        (2, Some(StackPlace::CardRetired)),
+    ] {
         let run = prove_first_groups(&plan, &proof, WlfmFamily::B3, k, stacks)
             .unwrap_or_else(|e| panic!("{e}"));
         let words = &run.proof.public_words;
@@ -1163,7 +1362,7 @@ fn the_first_groups_level_proves_and_publishes_their_bus_sum() {
             artifacts.sizes.len(),
             run.level.program.instrs.len(),
             run.level.program.groups.b3l.real_rows,
-            if run.on_host { "host" } else { "card" },
+            place_word(run.place),
             run.prove
         );
     }

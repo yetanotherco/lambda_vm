@@ -543,6 +543,10 @@ where
 /// paths an opening sends are the whole tree's, byte for byte, because the
 /// dropped levels are re-hashed from the rebuilt codeword and checked against
 /// the kept node before a path leaves (`CodewordCommitment::retire`).
+///
+/// A clone is the same roots and tops: what a prover that opens the same
+/// commitment in more than one proof revives each time.
+#[derive(Clone)]
 pub struct RetiredStack<F: IsFFTField + IsPrimeField + 'static> {
     layout: StackedLayout,
     commitments: Vec<crate::whir_commit::RetiredCommitment>,
@@ -559,6 +563,10 @@ where
 
     pub fn layout(&self) -> &StackedLayout {
         &self.layout
+    }
+
+    pub fn domain(&self) -> &Domain<F> {
+        &self.domain
     }
 
     /// Host bytes kept of the trees.

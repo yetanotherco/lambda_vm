@@ -152,6 +152,10 @@ pub struct GroupStamps {
     pub argue: f64,
     pub encode: f64,
     pub open: f64,
+    /// Of `open`, the seconds the group's prepared stack took to come back
+    /// when it was committed and let go ([`PreparedCommitment::Retired`]); 0
+    /// for a held one.
+    pub prepared_revive: f64,
     /// Phase B: when the group's turn began and ended, seconds since phase B
     /// began (its columns back, up, argued, opened and let go). Under
     /// [`PhaseBOverlap::On`] a group's turn ends once the next group's
@@ -1394,9 +1398,54 @@ where
     /// The tables it settles, in stack order: each table's position in the
     /// proof's table order and the length of its leading prefix.
     pub tables: Vec<(usize, usize)>,
-    pub commitment: &'a StackedCommitment<F, H>,
+    pub commitment: PreparedCommitment<'a, F, H>,
     /// The tables' prefixes, concatenated in `tables`' order.
     pub columns: &'a [&'a Mle<F>],
+}
+
+/// Where a [`BlockPrepared`] stack's commitment is when its group opens it.
+pub enum PreparedCommitment<'a, F, H>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    /// Committed and held (its codewords on the card or the host): opened as
+    /// it is.
+    Held(&'a StackedCommitment<F, H>),
+    /// Committed and let go, its roots and tree tops kept
+    /// ([`StackedCommitment::retire`]): revived from [`BlockPrepared::columns`]
+    /// at its group's opening and let go after it, so the card holds a
+    /// prepared stack only while its own group opens it. The opening is the
+    /// held one's byte for byte: a revived tree serves the same paths, its
+    /// dropped levels re-hashed and checked against the kept nodes.
+    Retired(&'a RetiredStack<F>),
+}
+
+impl<F, H> PreparedCommitment<'_, F, H>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    /// The commitment's roots, held or retired alike.
+    pub fn roots(&self) -> Vec<Commitment> {
+        match self {
+            Self::Held(c) => c.roots(),
+            Self::Retired(r) => r.roots(),
+        }
+    }
+}
+
+impl<'a, F, H> From<&'a StackedCommitment<F, H>> for PreparedCommitment<'a, F, H>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    fn from(c: &'a StackedCommitment<F, H>) -> Self {
+        Self::Held(c)
+    }
 }
 
 /// What the verifier settles a [`BlockPrepared`] opening against.
@@ -2761,6 +2810,8 @@ struct Opened<F: IsField, E: IsField> {
     prepared: Option<StackedProof<F, E>>,
     encode: f64,
     open: f64,
+    /// Of `open`, the seconds a retired prepared stack took to come back.
+    prepared_revive: f64,
     /// What the revive added to the ledger, and the ledger's peak through the
     /// openings: read only when the openings had the ledger's window to
     /// themselves (0 and `None` otherwise).
@@ -2849,6 +2900,7 @@ where
             Some(at)
         })
         .collect();
+    let mut prepared_revive = 0.0;
     let prepared_opening = match prepared.iter().position(|p| p.group == argued.group) {
         Some(k) => {
             let p = &prepared[k];
@@ -2880,8 +2932,27 @@ where
                         .collect::<Result<_, _>>()?;
                 }
             }
+            // A retired stack comes back for this opening alone, and goes
+            // when it ends.
+            let t_revive = Instant::now();
+            let revived = match &p.commitment {
+                PreparedCommitment::Held(_) => None,
+                PreparedCommitment::Retired(r) => {
+                    Some((*r).clone().revive::<H, _>(p.columns, None, config)?)
+                }
+            };
+            prepared_revive = t_revive.elapsed().as_secs_f64();
+            let commitment = match (&p.commitment, &revived) {
+                (_, Some(revived)) => revived,
+                (PreparedCommitment::Held(c), None) => *c,
+                (PreparedCommitment::Retired(_), None) => {
+                    return Err(MlError::DeviceFailed {
+                        stage: "a retired prepared stack not revived",
+                    });
+                }
+            };
             Some(stacked_eval::prove::<F, E, T, H, _>(
-                p.commitment,
+                commitment,
                 p.columns,
                 None,
                 &Claimed::PerColumn(&at_points),
@@ -2901,6 +2972,7 @@ where
             prepared: prepared_opening,
             encode,
             open,
+            prepared_revive,
             open_room,
             open_reserved,
             draws: (
@@ -3383,6 +3455,7 @@ where
             stamps[g].transition_reserved = window;
             let s = &mut stamps[h];
             s.encode = opened.encode;
+            s.prepared_revive = opened.prepared_revive;
             s.open = opened.open;
             s.open_room = opened.open_room;
             s.open_reserved = window;
@@ -3450,6 +3523,7 @@ where
             overlap_faults.open_fails == Some(p),
         )?;
         stamps[g].encode = opened.encode;
+        stamps[g].prepared_revive = opened.prepared_revive;
         stamps[g].open_room = opened.open_room;
         stamps[g].open = opened.open;
         stamps[g].open_reserved = opened.open_reserved.unwrap_or(0);
