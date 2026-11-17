@@ -648,3 +648,43 @@ fn the_round_form_levels_prove_a_small_block_to_its_last_level() {
     // The round form's last level is not today's levels'.
     assert!(verify_levels(&today_plan, WlfmFamily::B3, last).is_err());
 }
+
+/// A lean BLAKE3 W-LFM proof's identity and bytes under each family,
+/// printed: the two-build check for a change to the lean tables' buses or
+/// layout (the lean fixture program of `b3l_wlfm_tests`, the tests' fast
+/// format). Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`.
+#[test]
+#[ignore = "two-build pin: run with LAMBDA_VM_DETERMINISTIC_GRIND=1 in both builds"]
+fn b3_lean_pin_print() {
+    use super::wlfm::{WlfmLevers, WlfmRate, build_wlfm_under, prove_wlfm, test_format};
+    use crypto::hash::blake3::Blake3Std;
+    use digest::Digest;
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the pin needs the deterministic grind"
+    );
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let _fast = test_format::set(Some(2));
+    let program = super::b3l_wlfm_tests::honest();
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let build = build_wlfm_under(
+            &program,
+            super::hash::HasherKind::Poseidon1W16,
+            WlfmRate::Two,
+            WlfmLevers::with_family(family),
+            false,
+        )
+        .expect("the lean fixture builds");
+        let proof = prove_wlfm(&program, &build, &[]).expect("the lean fixture proves");
+        super::wlfm::verify_wlfm(&build.artifacts, &proof, &proof.public_words)
+            .expect("and verifies");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).expect("serializes");
+        let digest: [u8; 32] = <Blake3Std as Digest>::digest(&bytes).into();
+        println!(
+            "B3L PIN {family:?}: id {} · proof {} bytes · proof digest {}",
+            hex(&build.artifacts.program_id),
+            bytes.len(),
+            hex(&digest)
+        );
+    }
+}
