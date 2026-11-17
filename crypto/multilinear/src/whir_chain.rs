@@ -1013,6 +1013,34 @@ pub(crate) mod round_form_faults {
         FAULT.with(std::cell::Cell::get)
     }
 
+    std::thread_local! {
+        static FORGED_SUCCESSOR: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The round whose committed successor a cheating prover forges, if any:
+    /// see [`with_forged_successor`].
+    pub(crate) fn forged_successor() -> Option<usize> {
+        FORGED_SUCCESSOR.with(std::cell::Cell::get)
+    }
+
+    /// Runs `f` with a cheating prover that, at round `round`, commits a
+    /// successor encoding ANOTHER polynomial than the message its sumcheck
+    /// carries on with (the message plus one at its first cube point), and
+    /// answers that round's out-of-domain point from the message, as an
+    /// honest prover would. Only the next round's openings — the folds of the
+    /// forged tree, checked as claims on the message — can tell. Restores
+    /// the previous setting after; composes with [`with`]'s fault.
+    pub(crate) fn with_forged_successor<R>(round: usize, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FORGED_SUCCESSOR.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FORGED_SUCCESSOR.with(|c| c.replace(Some(round))));
+        f()
+    }
+
     /// Runs `f` under `fault`, restoring the previous one after.
     pub(crate) fn with<R>(fault: Fault, f: impl FnOnce() -> R) -> R {
         struct Restore(Fault);
@@ -1043,6 +1071,21 @@ fn round_form_fault(fault: RoundFormFault) -> bool {
 
 #[cfg(test)]
 use round_form_faults::Fault as RoundFormFault;
+
+/// Whether the test-only cheating prover forges round `round`'s successor
+/// ([`round_form_faults::with_forged_successor`]); never outside a test build.
+#[inline]
+fn forges_successor_at(round: usize) -> bool {
+    #[cfg(test)]
+    {
+        round_form_faults::forged_successor() == Some(round)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = round;
+        false
+    }
+}
 
 /// Outside a test build no fault exists: the one value `round_form_fault`
 /// takes and never matches.
@@ -2436,6 +2479,7 @@ fn encode_round_successor<F, E, H>(
     current: &Current<'_, F, E, H>,
     domain: &Domain<F>,
     levels: usize,
+    round: usize,
 ) -> Result<(Codeword<E>, Domain<F>), Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -2461,6 +2505,20 @@ where
         return Ok((encoded, successor_domain));
     }
     let card_declined = factors.on_card();
+    if forges_successor_at(round) {
+        // The test-only cheating prover: another polynomial in the tree.
+        let message = match factors.host_message() {
+            Some(message) => message.clone(),
+            None => factors.device_message()?.ok_or(Error::DeviceFailed {
+                stage: "the round form's successor message",
+            })?,
+        };
+        let mut evals = message.evals().to_vec();
+        evals[0] += FieldElement::<E>::one();
+        let forged = Mle::new(evals)?;
+        let values = encode::<F, E>(&lift_coefficients(&forged), &successor_domain)?;
+        return Ok((Codeword::Host(values), successor_domain));
+    }
     let values = match factors.host_message() {
         Some(message) => encode::<F, E>(&lift_coefficients(message), &successor_domain)?,
         None => {
@@ -3113,6 +3171,7 @@ where
                 &current,
                 &current_domain,
                 config.shrink_of(k),
+                r,
             )?;
             let mut folded_domain = current_domain.clone();
             for _ in 0..k {

@@ -630,6 +630,56 @@ fn a_false_evaluation_is_refused_and_accepted_only_without_the_shift_claims() {
     }
 }
 
+/// ★★ A LATER-ROUND FORGERY, refused at every round: a cheating prover
+/// commits, at round `r`, a successor tree encoding another polynomial than
+/// the message its sumcheck carries on with (the message plus one at a cube
+/// point), and answers that round's out-of-domain point from the message, as
+/// an honest prover would. Only the next round's openings can tell: their
+/// folds are the forged polynomial's, and the round form checks them as
+/// claims on the message. Refused at every round, round 0's successor and
+/// the later ones alike; the last tree (opened by the final round against
+/// the final value) is refused too.
+///
+/// ★ THE MUTANT: with the shift claims dropped on both sides, every forgery
+/// of a tree that a successor-committing round opens is ACCEPTED — nothing
+/// else binds a later tree to the message.
+#[test]
+fn a_successor_that_is_not_the_message_is_refused_at_every_round() {
+    use crate::whir_chain::round_form_faults::with_forged_successor;
+    let n = 18;
+    let cfg = whir(1, Some(4), 4, 3, n, 40);
+    let rounds = cfg.rounds(n);
+    assert!(
+        rounds >= 5,
+        "three successors past round 0's: {rounds} rounds"
+    );
+    let honest = single(&cfg, n, 33);
+    check_single_ok(&honest, &cfg);
+    for r in 0..rounds - 1 {
+        let forged = with_forged_successor(r, || single(&cfg, n, 33));
+        assert_ne!(
+            forged.proof.rounds[r].next_root, honest.proof.rounds[r].next_root,
+            "round {r}: another tree"
+        );
+        assert!(
+            check(&forged, &forged.proof, &cfg).is_err(),
+            "round {r}: refused"
+        );
+        // A tree the final round opens is checked against the final value,
+        // claims or no claims; the earlier ones only through the claims.
+        if r + 2 < rounds {
+            with(Fault::DropShiftClaims, || {
+                let forged = with_forged_successor(r, || single(&cfg, n, 33));
+                assert_eq!(
+                    check(&forged, &forged.proof, &cfg),
+                    Ok(()),
+                    "round {r}: without the shift claims the forgery is accepted"
+                );
+            });
+        }
+    }
+}
+
 fn check_single_ok(s: &Single, cfg: &ChainConfig) {
     assert_eq!(check(s, &s.proof, cfg), Ok(()));
 }
