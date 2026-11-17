@@ -115,6 +115,15 @@ pub struct ProveSplit {
 thread_local! {
     static LAST_PROVE_SPLIT: Cell<Option<ProveSplit>> = const { Cell::new(None) };
     static LAST_FILL_SPLIT: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
+    static LAST_LEAN_PARTS: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
+}
+
+/// Take the most recent executed fill's lean part ON THIS THREAD, split,
+/// clearing it: the seconds of the lean BLAKE3 tables (rounds, heads, byte
+/// table), then of the one-output selects' and the cap tables'. `None` when
+/// nothing filled here since the last take.
+pub fn take_lean_parts() -> Option<(f64, f64)> {
+    LAST_LEAN_PARTS.with(|c| c.take())
 }
 
 /// Take the most recent executed fill's split ON THIS THREAD, clearing it:
@@ -386,11 +395,13 @@ pub(crate) fn lfm_fill_executed_prefilled(
         None => build_traces_with_merge(program, &records, hasher, plan),
     };
     let chips_secs = t.elapsed().as_secs_f64();
+    let t_lean = Instant::now();
     let prefilled =
         lean.and_then(|p| super::b3l_tables::build_b3l_traces_prefilled(program, &b3l_records, p));
     let lean_prefilled = prefilled.is_some();
     let mut b3l = prefilled.or_else(|| super::b3l_tables::build_b3l_traces(program, &b3l_records));
     drop(b3l_records);
+    let tables_secs = t_lean.elapsed().as_secs_f64();
     // The one-output selects ride the lean tables (only a program with
     // compressions has them).
     let mux_records = core::mem::take(&mut records.mux);
@@ -409,6 +420,12 @@ pub(crate) fn lfm_fill_executed_prefilled(
     drop((mux_records, cap_records, read_records));
     let fill_secs = t.elapsed().as_secs_f64();
     LAST_FILL_SPLIT.with(|c| c.set(Some((chips_secs, fill_secs - chips_secs))));
+    LAST_LEAN_PARTS.with(|c| {
+        c.set(Some((
+            tables_secs,
+            (fill_secs - chips_secs - tables_secs).max(0.0),
+        )))
+    });
     // Same reason, larger: the records are what the fill consumes, and they are
     // dead the moment it returns. The traces it produced are the live set from
     // here on; holding the records as well doubles the values through the card

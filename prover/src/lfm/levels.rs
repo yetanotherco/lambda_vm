@@ -419,9 +419,11 @@ pub struct LevelsTimes {
     /// when off.
     pub lean_beside: Option<(super::b3l_tables::LeanBesideStats, f64)>,
     /// Whether level 1's fill took that prefill, and its split: the chips'
-    /// seconds, the lean tables'.
+    /// seconds, the lean part's; and the lean part's own: the lean BLAKE3
+    /// tables', the one-output selects' and cap tables'.
     pub lean_prefilled: bool,
     pub fill_split: (f64, f64),
+    pub lean_parts: (f64, f64),
     pub levels: Vec<LevelClock>,
 }
 
@@ -846,6 +848,7 @@ pub fn prove_block_levels(
     let fill = t.elapsed().as_secs_f64();
     times.lean_prefilled = filled.lean_prefilled();
     times.fill_split = super::proof::take_fill_split().unwrap_or_default();
+    times.lean_parts = super::proof::take_lean_parts().unwrap_or_default();
     let t = std::time::Instant::now();
     proofs.push(
         super::wlfm::prove_wlfm_traces_as(

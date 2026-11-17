@@ -711,7 +711,8 @@ fn rta_one_run(
     let (lean, lean_wait) = t.lean_beside.unwrap_or_default();
     println!(
         "RTA LEAN BESIDE: {} · waves {} · compressions {} · fed {:.3}s · wait after the execution \
-         {:.3}s · prefilled {} · fill chips {:.3}s · fill lean {:.3}s",
+         {:.3}s · prefilled {} · fill chips {:.3}s · fill lean {:.3}s (tables {:.3}s · mux and cap \
+         {:.3}s)",
         if t.lean_beside.is_some() { "on" } else { "off" },
         lean.waves,
         lean.compressions,
@@ -719,7 +720,9 @@ fn rta_one_run(
         lean_wait,
         t.lean_prefilled,
         t.fill_split.0,
-        t.fill_split.1
+        t.fill_split.1,
+        t.lean_parts.0,
+        t.lean_parts.1
     );
     for (k, (l, (level, p))) in t
         .levels
