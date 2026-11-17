@@ -1632,6 +1632,26 @@ fn cap_bytes(cap: crypto::merkle_tree::cap::CapPolicy) -> [u8; 2] {
 /// stack (its group, its tables and its roots, which bind the instruction
 /// columns themselves), and the chain config's every word. Everything that
 /// makes the program this program under this format; nothing a proof states.
+/// The chain format's text a W-LFM program's identity hashes: its `Debug`
+/// form with the round form left out, which [`wlfm_program_id`] hashes on its
+/// own (and not at all under today's form). So the identity of every program
+/// under today's form is the one it had before the round form existed, byte
+/// for byte: the text is today's format as its `Debug` printed it then.
+pub(crate) fn format_identity_text(format: &multilinear::whir_chain::ChainFormat) -> String {
+    let today = multilinear::whir_chain::ChainFormat {
+        rounds: multilinear::whir_chain::RoundForm::Fri,
+        ..*format
+    };
+    let text = format!("{today:?}");
+    let field = ", rounds: Fri";
+    debug_assert_eq!(
+        text.matches(field).count(),
+        1,
+        "the chain format's Debug names its round form once"
+    );
+    text.replacen(field, "", 1)
+}
+
 pub fn wlfm_program_id(a: &WlfmArtifacts) -> Commitment {
     let mut h = Keccak256::new();
     h.update(WLFM_PROGRAM_TAG);
@@ -1680,7 +1700,18 @@ pub fn wlfm_program_id(a: &WlfmArtifacts) -> Commitment {
         ArgueFormat::Batched { bin_log_cells, .. } => h.update([1u8, bin_log_cells]),
     }
     // The rest of the format, whole: a lever added later moves the identity.
-    h.update(format!("{:?}", c.format).as_bytes());
+    h.update(format_identity_text(&c.format).as_bytes());
+    // The WHIR round form, when a chain takes it, explicitly: its shrink,
+    // target, union bound and cap rule. Today's form adds nothing here.
+    if let multilinear::whir_chain::RoundForm::Whir(w) = c.format.rounds {
+        h.update(b"ROUND FORM");
+        h.update([
+            w.shrink() as u8,
+            w.security_bits(),
+            w.union_rounds() as u8,
+            u8::from(w.caps_by_queries()),
+        ]);
+    }
     // The chips' cut, when any chip is cut: each chip's table count (their
     // heights are in the table list above). A program with no cut chip folds
     // nothing here.
