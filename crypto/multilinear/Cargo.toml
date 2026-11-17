@@ -31,3 +31,7 @@ math-cuda = { path = "../math-cuda", optional = true }
 parallel = ["dep:rayon", "math/parallel", "crypto/parallel"]
 # The device path: the grind through `crypto`, the kernels through `math-cuda`.
 cuda = ["crypto/cuda", "dep:math-cuda"]
+# Test only: the WHIR round form's fault hooks (`whir_chain::round_form_faults`)
+# for another crate's tests, which turn it on as a dev-dependency. Off by
+# default; no normal build compiles the hooks.
+test-faults = []

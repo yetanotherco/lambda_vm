@@ -948,12 +948,16 @@ pub fn check_round_form_union(config: &ChainConfig, num_vars: usize) -> Result<(
 /// that each piece of the round form is load-bearing: under a verifier fault
 /// an honest proof is refused, and under [`Fault::DropShiftClaims`] (both
 /// sides) a forged evaluation is accepted. Thread-local, so a test that sets
-/// one moves no other test's prover or verifier.
-#[cfg(test)]
-pub(crate) mod round_form_faults {
+/// one moves no other test's prover or verifier; off unless armed. Compiled
+/// into this crate's tests and, through the `test-faults` feature, into the
+/// tests of a crate that asks for it as a dev-dependency (the prover's
+/// in-guest verifier tests); never into a normal build.
+#[cfg(any(test, feature = "test-faults"))]
+#[doc(hidden)]
+pub mod round_form_faults {
     /// Which piece of the round form is broken.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub(crate) enum Fault {
+    pub enum Fault {
         #[default]
         None,
         /// Prover and verifier both leave the shift claims out: no weight
@@ -1009,7 +1013,7 @@ pub(crate) mod round_form_faults {
         static FAULT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
     }
 
-    pub(crate) fn get() -> Fault {
+    pub fn get() -> Fault {
         FAULT.with(std::cell::Cell::get)
     }
 
@@ -1019,7 +1023,7 @@ pub(crate) mod round_form_faults {
 
     /// The round whose committed successor a cheating prover forges, if any:
     /// see [`with_forged_successor`].
-    pub(crate) fn forged_successor() -> Option<usize> {
+    pub fn forged_successor() -> Option<usize> {
         FORGED_SUCCESSOR.with(std::cell::Cell::get)
     }
 
@@ -1030,7 +1034,7 @@ pub(crate) mod round_form_faults {
     /// honest prover would. Only the next round's openings — the folds of the
     /// forged tree, checked as claims on the message — can tell. Restores
     /// the previous setting after; composes with [`with`]'s fault.
-    pub(crate) fn with_forged_successor<R>(round: usize, f: impl FnOnce() -> R) -> R {
+    pub fn with_forged_successor<R>(round: usize, f: impl FnOnce() -> R) -> R {
         struct Restore(Option<usize>);
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -1042,7 +1046,7 @@ pub(crate) mod round_form_faults {
     }
 
     /// Runs `f` under `fault`, restoring the previous one after.
-    pub(crate) fn with<R>(fault: Fault, f: impl FnOnce() -> R) -> R {
+    pub fn with<R>(fault: Fault, f: impl FnOnce() -> R) -> R {
         struct Restore(Fault);
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -1058,29 +1062,29 @@ pub(crate) mod round_form_faults {
 /// test build).
 #[inline]
 fn round_form_fault(fault: RoundFormFault) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-faults"))]
     {
         round_form_faults::get() == fault
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-faults")))]
     {
         let _ = fault;
         false
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-faults"))]
 use round_form_faults::Fault as RoundFormFault;
 
 /// Whether the test-only cheating prover forges round `round`'s successor
 /// ([`round_form_faults::with_forged_successor`]); never outside a test build.
 #[inline]
 fn forges_successor_at(round: usize) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-faults"))]
     {
         round_form_faults::forged_successor() == Some(round)
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-faults")))]
     {
         let _ = round;
         false
@@ -1089,7 +1093,7 @@ fn forges_successor_at(round: usize) -> bool {
 
 /// Outside a test build no fault exists: the one value `round_form_fault`
 /// takes and never matches.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-faults")))]
 #[derive(Clone, Copy)]
 enum RoundFormFault {
     DropShiftClaims,

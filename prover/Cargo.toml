@@ -66,6 +66,9 @@ rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "byt
 libc = "0.2"
 
 [dev-dependencies]
+# Test only: the multilinear crate's round-form fault hooks, for the in-guest
+# verifier's forgery tests. A dev-dependency's features reach test builds only.
+multilinear = { path = "../crypto/multilinear", features = ["test-faults"] }
 env_logger = "*"
 # Test-only: tests that pin a guest guard on its ELF's sha256, because two
 # builds of the same guest from the same sources share a name and differ in
