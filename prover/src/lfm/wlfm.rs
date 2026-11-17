@@ -469,6 +469,47 @@ pub fn wlfm_config_under(
     config
 }
 
+/// [`wlfm_config_under`] with its chains under the WHIR round form at
+/// `shrink` when `rounds` is `Some(shrink)` (the later rounds' counts derived
+/// for the target and union bound round 0's count was sized for, each tree's
+/// cap held to its own openings, as the BLAKE3 base's chains); `None` is
+/// [`wlfm_config_under`]'s config, today's. A verifier constant of the level
+/// that builds it, never read from a proof. The round form is taken at the
+/// base's rate alone (the blowup-4 count is pinned apart, so its round 0 is
+/// not the calculator's).
+pub fn wlfm_config_rounds(
+    rate: WlfmRate,
+    final_poly: FinalPoly,
+    fold: Option<u8>,
+    grind: Option<u8>,
+    rounds: Option<u8>,
+    shapes: &[(usize, usize)],
+) -> Result<ChainConfig, String> {
+    let config = wlfm_config_under(rate, final_poly, fold, grind, shapes);
+    let Some(shrink) = rounds else {
+        return Ok(config);
+    };
+    if rate != WlfmRate::Two {
+        return Err(format!(
+            "the round form is taken at blowup 2, not {}",
+            rate.factor()
+        ));
+    }
+    let zf = ZfFormat {
+        whir_stack: config.format.stack,
+        ..ZfFormat::DEFAULT
+    };
+    let tallest = crate::multilinear_prove::tallest_stack(&zf, shapes);
+    config
+        .with_whir_rounds(
+            usize::from(shrink),
+            crate::multilinear_prove::CHAIN_SECURITY_BITS,
+            tallest,
+        )
+        .and_then(ChainConfig::with_caps_by_queries)
+        .ok_or_else(|| format!("shrink {shrink} is no round form"))
+}
+
 /// The AIR set's options: inert on the multilinear path (they reach only each
 /// AIR's STARK context), fixed so no caller's options move a layout.
 fn air_options() -> ProofOptions {
@@ -516,6 +557,10 @@ pub struct WlfmArtifacts {
     pub grind: Option<u8>,
     /// The hash family the proof commits, transcripts and grinds with.
     pub family: WlfmFamily,
+    /// The chains' round form: `Some(shrink)` under the WHIR round form
+    /// ([`wlfm_config_rounds`], folded into `config`), `None` today's. Held
+    /// here so the verifier re-derives the config from it.
+    pub rounds: Option<u8>,
     /// The padded rows of each table every LFM chip takes, in
     /// `LfmAirs::air_refs` order ([`chip_chunk_rows`]): one entry a chip
     /// unless it is cut.
@@ -1407,6 +1452,18 @@ pub fn prepare_wlfm(
     rate: WlfmRate,
     levers: WlfmLevers,
 ) -> Result<WlfmPrebuild, String> {
+    prepare_wlfm_rounds(program, hasher, rate, levers, None)
+}
+
+/// [`prepare_wlfm`] with the chains under the round form `rounds`
+/// ([`wlfm_config_rounds`]; `None` is [`prepare_wlfm`]).
+pub fn prepare_wlfm_rounds(
+    program: &LfmProgram,
+    hasher: HasherKind,
+    rate: WlfmRate,
+    levers: WlfmLevers,
+    rounds: Option<u8>,
+) -> Result<WlfmPrebuild, String> {
     let t = std::time::Instant::now();
     let WlfmLevers {
         prep,
@@ -1492,7 +1549,7 @@ pub fn prepare_wlfm(
         counts.push(count);
     }
     let shapes = table_shapes(&refs, &table_num_vars);
-    let config = wlfm_config_under(rate, final_poly, fold, grind, &shapes);
+    let config = wlfm_config_rounds(rate, final_poly, fold, grind, rounds, &shapes)?;
     let sizes = multilinear_block::block_groups(&shapes, config.format.stack, WLFM_GROUP_POLYS)
         .map_err(|e| format!("{e:?}"))?;
     let group_lists: Vec<Vec<u32>> = {
@@ -1536,6 +1593,7 @@ pub fn prepare_wlfm(
             fold,
             grind,
             family,
+            rounds,
             lfm_chunks,
             b3l,
             stacks: Vec::new(),
@@ -1565,6 +1623,7 @@ pub fn prepare_wlfm(
         fold,
         grind,
         family,
+        rounds,
         lfm_chunks,
         b3l,
         stacks: Vec::new(),
@@ -2296,13 +2355,14 @@ fn verifier_frame(artifacts: &WlfmArtifacts, airs: &WlfmAirs) -> Result<Verifier
         }
     }
     let shapes = artifacts.shapes(airs);
-    if wlfm_config_under(
+    if wlfm_config_rounds(
         artifacts.rate,
         artifacts.final_poly,
         artifacts.fold,
         artifacts.grind,
+        artifacts.rounds,
         &shapes,
-    ) != artifacts.config
+    )? != artifacts.config
     {
         return Err("the artifacts' config is not their rate's over their shapes".into());
     }

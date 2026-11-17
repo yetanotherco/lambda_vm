@@ -39,7 +39,7 @@ use super::edsl::WrapHash;
 use super::whir_block::{WhirBlockPlan, block_leaf_arena, top_claims};
 use super::wlfm::{
     StackPlace, WlfmBuild, WlfmFamily, WlfmLevers, WlfmPrebuild, WlfmProof, WlfmProving, WlfmRate,
-    build_wlfm_under, prepare_wlfm, prove_wlfm_traces_as, verify_wlfm,
+    prepare_wlfm_rounds, prove_wlfm_traces_as, verify_wlfm,
 };
 use super::wlfm_leg::{WlfmChild, wlfm_leg_arena, wlfm_leg_program, wlfm_wrap_hash};
 use crate::block_whir::BlockWhirProof;
@@ -272,9 +272,10 @@ impl Drop for StacksForTest {
 pub(crate) fn prepare_level(
     program: &LfmProgram,
     family: WlfmFamily,
+    rounds: Option<u8>,
 ) -> Result<WlfmPrebuild, String> {
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
-    let mut pre = prepare_wlfm(program, hasher, LEVEL_RATE, level_levers(family))?;
+    let mut pre = prepare_wlfm_rounds(program, hasher, LEVEL_RATE, level_levers(family), rounds)?;
     if super::wlfm::chip_records() {
         pre.hold_chip_prefixes()?;
     }
@@ -296,13 +297,14 @@ fn level_more(stop: LevelStop, count: usize, last: &WlfmBuild) -> bool {
 }
 
 /// The level after `child`'s, prepared on the host: its program (the W-leg
-/// over `child`) and its stacks' columns, uncommitted.
+/// over `child`) and its stacks' columns, uncommitted, its chains under the
+/// child's round form (every level's is the base's, [`level_rounds`]).
 fn prepare_next(
     child: WlfmChild,
     family: WlfmFamily,
 ) -> Result<(LfmProgram, WlfmPrebuild), String> {
     let program = wlfm_leg_program(&child)?;
-    let pre = prepare_level(&program, family)?;
+    let pre = prepare_level(&program, family, child.artifacts.rounds)?;
     Ok((program, pre))
 }
 
@@ -355,13 +357,36 @@ pub(crate) fn resident_now() -> Option<u64> {
         .map(|kib| kib << 10)
 }
 
+/// ★ The round form every level's chains take: the base's own
+/// (`Some(shrink)` when the plan's block chains run the WHIR round form,
+/// `None` under today's), so one format runs end to end. A function of the
+/// plan, which a verifier derives from its own format: never read from a
+/// proof.
+pub fn level_rounds(plan: &WhirBlockPlan) -> Option<u8> {
+    let (_, n_stack) = plan.group_stack(0);
+    match plan.chain_shape(n_stack).form {
+        multilinear::whir_chain::RoundForm::Fri => None,
+        multilinear::whir_chain::RoundForm::Whir(w) => u8::try_from(w.shrink()).ok(),
+    }
+}
+
+/// One level built from its program: under `family`'s levers at
+/// [`LEVEL_RATE`], its chains under `rounds` ([`level_rounds`]), its
+/// prepared stacks committed on the host when `on_host`.
 pub(crate) fn build_level(
     program: LfmProgram,
     family: WlfmFamily,
+    rounds: Option<u8>,
     on_host: bool,
 ) -> Result<Level, String> {
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
-    let build = build_wlfm_under(&program, hasher, LEVEL_RATE, level_levers(family), on_host)?;
+    let place = if on_host {
+        StackPlace::Host
+    } else {
+        StackPlace::Card
+    };
+    let build = prepare_wlfm_rounds(&program, hasher, LEVEL_RATE, level_levers(family), rounds)?
+        .commit(place)?;
     Ok(Level { program, build })
 }
 
@@ -409,10 +434,22 @@ pub fn derive_levels_to(
             LevelStop::Groups(_) => Ok(true),
         }
     };
-    let mut levels = vec![build_level(plan.closed_block_program()?, family, on_host)?];
+    let rounds = level_rounds(plan);
+    let mut levels = vec![build_level(
+        plan.closed_block_program()?,
+        family,
+        rounds,
+        on_host,
+    )?];
     while more(&levels)? {
         let child = child_of(plan, levels.last().expect("a level"));
-        levels.push(build_level(wlfm_leg_program(&child)?, family, on_host)?);
+        let rounds = child.artifacts.rounds;
+        levels.push(build_level(
+            wlfm_leg_program(&child)?,
+            family,
+            rounds,
+            on_host,
+        )?);
     }
     Ok(levels)
 }
@@ -757,7 +794,8 @@ pub fn prove_block_levels(
                 brx.recv()
                     .map_err(|_| "level 1's program was never emitted")?;
                 let program = program_ref.get().ok_or("the program is set")?;
-                prepare_level(program, family)
+                let plan = plan_ref.get().ok_or("the plan is set")?;
+                prepare_level(program, family, level_rounds(plan))
             })
         });
         // Level 1's thread: the plan, the program, then its execute, a piece
@@ -988,7 +1026,7 @@ pub fn prove_block_levels(
     let (first, prepare, cells, committed) = match built_beside {
         Some(built) => built?,
         None => {
-            let pre = prepare_level(&program, family)?;
+            let pre = prepare_level(&program, family, level_rounds(&plan))?;
             let (prepare, cells) = (pre.secs(), pre.prepared_cells());
             let build = commit_level(pre, 1)?;
             (build, prepare, cells, now())
@@ -1119,6 +1157,15 @@ pub fn prove_block_levels(
     if let Some(r) = resident_now() {
         times.resident.push(("levels proved", r));
     }
+    // Each level's chains' round form, as built: the base's under the round
+    // form, today's otherwise ([`level_rounds`]).
+    eprintln!(
+        "LEVELS ROUNDS: {:?}",
+        levels
+            .iter()
+            .map(|l| l.build.artifacts.rounds)
+            .collect::<Vec<_>>()
+    );
     // What the levels freed, back to the OS before the next block's base.
     times.purges[1] = crate::alloc_purge::purge_now();
     Ok(LevelsRun {

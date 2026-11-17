@@ -20,7 +20,7 @@ use crate::block_whir::{B3Rounds, BlockFormat, BlockWhirProof};
 use crate::hash_pin::{BlockFamily, ProofFamily};
 use crate::tables::types::{FE, GoldilocksExtension};
 use math::field::element::FieldElement;
-use multilinear::whir_chain::{ArgueFormat, GroupFold, RoundOpenings, WhirFolds};
+use multilinear::whir_chain::{ArgueFormat, FinalPoly, GroupFold, RoundOpenings, WhirFolds};
 use stark::proof::options::{BaseFormat, ProofOptions};
 
 type E = GoldilocksExtension;
@@ -464,4 +464,187 @@ fn rf_level_1_over_a_real_block() {
     }
     assert!(refused_all, "every tamper is refused in execution");
     println!("RF DONE");
+}
+
+/// The levels' chains follow the base's round form: `None` over today's
+/// base, the base's shrink over a round-form one; every level's config is
+/// then the round form's (and today's is unchanged where the base is today's),
+/// and the verifier's artifact check re-derives it. Level 2's program emits
+/// over a round-form level 1. Printed: each level's instructions and lean
+/// compressions under each form (emitted, not proved).
+#[test]
+fn the_levels_follow_the_bases_round_form() {
+    use super::levels::{derive_levels, level_rounds};
+    use multilinear::whir_chain::RoundForm;
+    let name = "test_commit_4";
+    let folds = WhirFolds::Uniform;
+    let mut counts = Vec::new();
+    for rounds in [B3Rounds::Fri, B3Rounds::WHIR3] {
+        let format = format(rounds, folds);
+        let (elf, proof) = base(name, &format);
+        let plan = plan(&elf, &proof, &format);
+        let want = match rounds {
+            B3Rounds::Fri => None,
+            B3Rounds::Whir { shrink, .. } => Some(shrink),
+        };
+        assert_eq!(
+            level_rounds(&plan),
+            want,
+            "{rounds:?}: the levels' round form"
+        );
+        let levels = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
+        assert_eq!(levels.len(), 2);
+        for (k, level) in levels.iter().enumerate() {
+            let a = &level.build.artifacts;
+            assert_eq!(a.rounds, want, "level {}", k + 1);
+            match (want, a.config.format.rounds) {
+                (None, RoundForm::Fri) => {
+                    let today = super::wlfm::wlfm_config_under(
+                        a.rate,
+                        a.final_poly,
+                        a.fold,
+                        a.grind,
+                        &a.shapes(&a.airs()),
+                    );
+                    assert_eq!(a.config, today, "level {}: today's config", k + 1);
+                }
+                (Some(s), RoundForm::Whir(w)) => {
+                    assert_eq!(w.shrink(), usize::from(s), "level {}", k + 1);
+                    assert!(w.caps_by_queries(), "level {}: caps by Q", k + 1);
+                }
+                (want, got) => panic!("level {}: {want:?} levels under {got:?}", k + 1),
+            }
+            counts.push((
+                rounds,
+                k + 1,
+                level.program.instrs.len(),
+                level.program.groups.b3l.real_rows,
+                a.sizes.len(),
+            ));
+        }
+    }
+    for (rounds, k, instructions, compressions, groups) in counts {
+        println!(
+            "LEVELS ROUND FORM {rounds:?} level {k}: {groups} groups · {instructions} \
+             instructions · {compressions} lean compressions"
+        );
+    }
+}
+
+/// A level's artifacts under one round form are not another's: the
+/// verifier's re-derivation from the held lever refuses a config the lever
+/// does not give, and the round form is refused off blowup 2.
+#[test]
+fn a_level_config_is_its_round_forms_alone() {
+    use super::wlfm::{WlfmRate, wlfm_config_rounds};
+    let shapes = [(20usize, 18usize), (8, 20), (64, 12)];
+    let today = wlfm_config_rounds(WlfmRate::Two, FinalPoly::Off, None, None, None, &shapes)
+        .expect("today's");
+    assert_eq!(
+        today,
+        super::wlfm::wlfm_config_under(WlfmRate::Two, FinalPoly::Off, None, None, &shapes),
+        "no round form is today's config"
+    );
+    let w3 = wlfm_config_rounds(WlfmRate::Two, FinalPoly::Off, None, None, Some(3), &shapes)
+        .expect("the round form");
+    let w2 = wlfm_config_rounds(WlfmRate::Two, FinalPoly::Off, None, None, Some(2), &shapes)
+        .expect("the round form");
+    assert_ne!(today, w3);
+    assert_ne!(w3, w2);
+    assert_ne!(
+        today.fold_word(),
+        w3.fold_word(),
+        "the fold word binds the form"
+    );
+    assert!(
+        wlfm_config_rounds(WlfmRate::Four, FinalPoly::Off, None, None, Some(3), &shapes).is_err(),
+        "the round form at blowup 4"
+    );
+}
+
+/// ★ Box tier: a small BLAKE3 block's base under the round form and its two
+/// levels, each under the round form, proved; each verifies against its own
+/// artifacts; the block's verifier, deriving every level itself, accepts the
+/// last; a changed word is refused; level 2 refuses (in execution) a level-1
+/// proof with one opened value changed; and the verifier of today's form
+/// refuses the round form's last level.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels; box tier"]
+fn the_round_form_levels_prove_a_small_block_to_its_last_level() {
+    use super::levels::{derive_levels, prove_levels, verify_levels};
+    use super::wlfm::verify_wlfm;
+    use super::wlfm_leg::{wlfm_leg_arena, wlfm_leg_program};
+    let format = format(B3Rounds::WHIR3, WhirFolds::Uniform);
+    let (elf, proof) = base("test_commit_4", &format);
+    // Today's verifier derives today's levels over the same statement.
+    let today_plan = plan(
+        &elf,
+        &proof,
+        &BlockFormat {
+            b3_rounds: B3Rounds::Fri,
+            ..format
+        },
+    );
+    let plan = plan(&elf, &proof, &format);
+    let levels = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
+    let (proofs, secs) = prove_levels(&plan, &levels, &proof).expect("every level proves");
+    for (k, (level, p)) in levels.iter().zip(&proofs).enumerate() {
+        verify_wlfm(&level.build.artifacts, p, &p.public_words)
+            .unwrap_or_else(|e| panic!("level {} verifies: {e}", k + 1));
+        println!(
+            "LEVEL ROUND FORM {}: {} groups · {} instructions · {} lean compressions · arena \
+             {:.3}s · prove {:.3}s",
+            k + 1,
+            level.build.artifacts.sizes.len(),
+            level.program.instrs.len(),
+            level.program.groups.b3l.real_rows,
+            secs[k].arena,
+            secs[k].prove
+        );
+    }
+    let last = proofs.last().expect("a last level");
+    verify_levels(&plan, WlfmFamily::B3, last).expect("the block's verifier accepts");
+    let mut forged = last.clone();
+    forged.public_words[0].1[0] += FE::one();
+    assert!(verify_levels(&plan, WlfmFamily::B3, &forged).is_err());
+
+    // Level 2 over a level-1 proof with one value of a later round changed.
+    let child = super::levels::child_of(&plan, &levels[0]);
+    let program = wlfm_leg_program(&child).expect("level 2 emits");
+    let hasher = levels[1].build.artifacts.hasher;
+    let mut tampered = proofs[0].clone();
+    let (g, c, r) = tampered
+        .proof
+        .columns
+        .iter()
+        .enumerate()
+        .find_map(|(g, column)| {
+            column.polys.iter().enumerate().find_map(|(c, chain)| {
+                chain
+                    .rounds
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find(|(_, round)| match &round.openings {
+                        RoundOpenings::Extension(p) => !p.current.is_empty(),
+                        _ => false,
+                    })
+                    .map(|(r, _)| (g, c, r))
+            })
+        })
+        .expect("a later round of level 1 opens its tree");
+    match &mut tampered.proof.columns[g].polys[c].rounds[r].openings {
+        RoundOpenings::Extension(o) => o.current[0].values[0] += FieldElement::<E>::one(),
+        other => panic!("an extension round: {other:?}"),
+    }
+    let arena = wlfm_leg_arena(&child, &tampered).expect("the arena builds");
+    let why = execute(&program, &[arena], &hasher);
+    println!(
+        "LEVEL ROUND FORM TAMPER level 1 round {r}: {:?}",
+        why.as_ref().err()
+    );
+    assert!(why.is_err(), "level 2 accepted a tampered level 1");
+
+    // The round form's last level is not today's levels'.
+    assert!(verify_levels(&today_plan, WlfmFamily::B3, last).is_err());
 }
