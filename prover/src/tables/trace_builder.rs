@@ -1011,7 +1011,7 @@ pub use windowed::{
     WindowedTraceBuilder,
 };
 #[cfg(feature = "parallel")]
-pub(crate) use windowed::{head_log, parallel};
+pub(crate) use windowed::{head_log, keccak_rnd_arrivals, parallel};
 
 // =============================================================================
 // Memory and Register State Tracking
