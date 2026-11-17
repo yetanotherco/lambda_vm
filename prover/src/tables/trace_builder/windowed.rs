@@ -3144,6 +3144,45 @@ impl<T: Clone> Tail<T> {
     }
 }
 
+impl<T: Copy + Send + Sync> Tail<T> {
+    /// [`Self::into_vec`], the parts copied side by side on the pool (under
+    /// `parallel`), each into its own disjoint slice of the list.
+    fn into_vec_par(self) -> Vec<T> {
+        #[cfg(feature = "parallel")]
+        if self.parts.len() > 1 {
+            let pieces: Vec<&[T]> = self
+                .parts
+                .iter()
+                .enumerate()
+                .map(|(i, part)| &part[if i == 0 { self.start } else { 0 }..])
+                .collect();
+            let total: usize = pieces.iter().map(|piece| piece.len()).sum();
+            let mut out = Vec::with_capacity(total);
+            let mut slots: Vec<&mut [std::mem::MaybeUninit<T>]> = Vec::with_capacity(pieces.len());
+            let mut rest = &mut out.spare_capacity_mut()[..total];
+            for piece in &pieces {
+                let (head, tail) = rest.split_at_mut(piece.len());
+                slots.push(head);
+                rest = tail;
+            }
+            pieces
+                .into_par_iter()
+                .zip(slots.into_par_iter())
+                .for_each(|(piece, slot)| {
+                    for (dst, src) in slot.iter_mut().zip(piece) {
+                        dst.write(*src);
+                    }
+                });
+            // SAFETY: the slots tile `0..total` of the spare capacity, and each
+            // was written element for element from its piece, whose length it
+            // has.
+            unsafe { out.set_len(total) };
+            return out;
+        }
+        self.into_vec()
+    }
+}
+
 /// The register rows in words mode ([`WindowedTraceBuilder::card_writes_words`]):
 /// the run's words and whole rows not yet handed out, where its markers lie,
 /// and the logs of the windows a chunk still to leave may decode from.
@@ -3344,17 +3383,44 @@ impl WordTails {
         self.copy.append(&mut copy);
     }
 
-    /// The rows not handed out, one list a family: the finish's.
+    /// The rows not handed out, one list a family: the finish's. Each family's
+    /// rows are the window parts their tail holds, copied into one list
+    /// part by part on the pool (up to a chunk of rows a family, on the
+    /// finish's path), the seven families side by side.
     fn into_rows(self) -> super::WordRows {
+        let Self {
+            load8,
+            store8,
+            loadw,
+            storew,
+            load2w,
+            store2w,
+            memw,
+            copy,
+        } = self;
+        let ((load8, store8), ((loadw, storew), ((load2w, store2w), memw))) = join(
+            || join(|| load8.into_vec_par(), || store8.into_vec_par()),
+            || {
+                join(
+                    || join(|| loadw.into_vec_par(), || storew.into_vec_par()),
+                    || {
+                        join(
+                            || join(|| load2w.into_vec_par(), || store2w.into_vec_par()),
+                            || memw.into_vec_par(),
+                        )
+                    },
+                )
+            },
+        );
         super::WordRows {
-            load8: self.load8.into_vec(),
-            store8: self.store8.into_vec(),
-            loadw: self.loadw.into_vec(),
-            storew: self.storew.into_vec(),
-            load2w: self.load2w.into_vec(),
-            store2w: self.store2w.into_vec(),
-            memw: self.memw.into_vec(),
-            copy: self.copy,
+            load8,
+            store8,
+            loadw,
+            storew,
+            load2w,
+            store2w,
+            memw,
+            copy,
         }
     }
 
