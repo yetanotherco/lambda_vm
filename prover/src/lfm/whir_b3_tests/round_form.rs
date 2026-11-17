@@ -64,6 +64,9 @@ pub(super) struct Case {
     pub(super) cap: CapPolicy,
     pub(super) leaves: LeafOrder,
     pub(super) final_vars: Option<u8>,
+    /// Under the round form: each tree's cap held to what its own openings
+    /// pay for (`WhirRounds::caps_by_queries`), the policy's the ceiling.
+    pub(super) caps_by_q: bool,
 }
 
 impl Case {
@@ -71,6 +74,7 @@ impl Case {
     fn fri(self) -> Self {
         Self {
             shrink: None,
+            caps_by_q: false,
             ..self
         }
     }
@@ -97,9 +101,16 @@ pub(super) fn config(c: &Case) -> ChainConfig {
         cfg.format.final_poly = FinalPoly::vars(v).expect("a tested final width");
     }
     match c.shrink {
-        Some(s) => cfg
-            .with_whir_rounds(s, c.bits, c.n)
-            .expect("a tested shrink"),
+        Some(s) => {
+            let cfg = cfg
+                .with_whir_rounds(s, c.bits, c.n)
+                .expect("a tested shrink");
+            if c.caps_by_q {
+                cfg.with_caps_by_queries().expect("a round-form config")
+            } else {
+                cfg
+            }
+        }
         None => cfg,
     }
 }
@@ -121,8 +132,20 @@ pub(super) fn cases() -> Vec<Case> {
         cap,
         leaves,
         final_vars,
+        caps_by_q: false,
+    };
+    // Caps by Q under a cap the later trees' counts do not pay for, so the
+    // rule moves a cap: natural and coset, a final polynomial, the automatic
+    // policy.
+    let q = |n, grind, cap, leaves, final_vars| Case {
+        caps_by_q: true,
+        ..c(n, 1, Some(4), 4, 3, grind, cap, leaves, final_vars)
     };
     vec![
+        q(12, 4, CapPolicy::Fixed(6), LeafOrder::Coset, None),
+        q(14, 0, CapPolicy::Fixed(8), LeafOrder::Natural, None),
+        q(14, 4, CapPolicy::Fixed(8), LeafOrder::Coset, Some(2)),
+        q(14, 0, CapPolicy::Auto, LeafOrder::Coset, None),
         c(
             9,
             2,
@@ -354,6 +377,28 @@ fn a_round_form_blake3_chain_executes_and_costs_its_closed_form() {
                 chain_perms(&f.shape, SpongeEntry::fresh_for(WrapHash::Blake3)),
                 "{lowering} {c:?}: the closed form"
             );
+            if c.caps_by_q {
+                let policy = ChainShape::for_hash(
+                    &config(&Case {
+                        caps_by_q: false,
+                        ..c
+                    }),
+                    c.n,
+                    WrapHash::Blake3,
+                );
+                assert!(
+                    f.shape
+                        .caps
+                        .iter()
+                        .zip(&policy.caps)
+                        .all(|(by_q, cap)| by_q <= cap),
+                    "{c:?}: caps by Q never raises a cap"
+                );
+                println!(
+                    "CAPS BY Q {c:?}: caps {:?} against the policy's {:?}",
+                    f.shape.caps, policy.caps
+                );
+            }
             let today = ChainShape::for_hash(&config(&c.fri()), c.n, WrapHash::Blake3);
             let today_perms = chain_perms(&today, SpongeEntry::fresh_for(WrapHash::Blake3));
             println!(
@@ -702,10 +747,12 @@ fn a_tampered_round_form_blake3_chain_cannot_execute() {
     });
 }
 
-/// ★ Domains and counts are verifier constants. A program under one shrink
-/// refuses the proof made under another (and so does the host), and today's
-/// program and the round form's refuse each other's proofs: the arena a proof
-/// would need under the other's shape is not the one the program reads.
+/// ★ Domains, counts and caps are verifier constants. A program under one
+/// shrink refuses the proof made under another (and so does the host); a
+/// program under caps by Q and one under the policy's caps refuse each other's
+/// proofs (the cap-rule mismatch); and today's program and the round form's
+/// refuse each other's proofs: the arena a proof would need under the other's
+/// shape is not the one the program reads.
 #[test]
 fn a_round_form_program_refuses_another_shrink_and_the_other_form() {
     under_both(|lowering| {
@@ -720,18 +767,35 @@ fn a_round_form_program_refuses_another_shrink_and_the_other_form() {
             cap: CapPolicy::Fixed(2),
             leaves: LeafOrder::Coset,
             final_vars: None,
+            caps_by_q: false,
         };
-        let three = fixture(&base);
+        let three = fixture(&Case {
+            cap: CapPolicy::Fixed(6),
+            ..base
+        });
+        let by_q = fixture(&Case {
+            cap: CapPolicy::Fixed(6),
+            caps_by_q: true,
+            ..base
+        });
+        assert_ne!(
+            three.shape.caps, by_q.shape.caps,
+            "caps by Q moves a cap at this shape"
+        );
         let two = fixture(&Case {
             shrink: Some(2),
             ..base
         });
         let today = fixture(&base.fri());
-        let programs: Vec<(&str, &Fixture, LfmProgram)> =
-            [("shrink 3", &three), ("shrink 2", &two), ("today", &today)]
-                .into_iter()
-                .map(|(name, f)| (name, f, program(&f.shape)))
-                .collect();
+        let programs: Vec<(&str, &Fixture, LfmProgram)> = [
+            ("shrink 3", &three),
+            ("shrink 3 caps by Q", &by_q),
+            ("shrink 2", &two),
+            ("today", &today),
+        ]
+        .into_iter()
+        .map(|(name, f)| (name, f, program(&f.shape)))
+        .collect();
         for (name, f, leg) in &programs {
             for (other_name, other, _) in &programs {
                 let accepted = runs(leg, arena_as(&f.shape, f, &other.proof));
@@ -796,20 +860,22 @@ fn grouped_program(shape: &ChainShape) -> LfmProgram {
 /// its final polynomial, one tree a run, coset leaves — under the leaf's lean
 /// query check), by closed form, for today's format, the first fold 4 alone
 /// (today's form), and the round form at the base's intended schedule (blowup 2,
-/// first fold 4, four a round, shrink 3; 128 bits) and at first fold 6. Then
-/// today's and that round form's programs are emitted (lean lowering,
+/// first fold 4, four a round, shrink 3; 128 bits), at first fold 6, and with
+/// caps by Q (each tree's cap held to what its own openings pay for: the
+/// base's own round-form config, checked equal here). Then today's and the two
+/// round forms' programs are emitted (lean lowering,
 /// no proof: the shape alone fixes the program), their compressions held to
 /// the closed form, and their cells priced: compressions at the lean tables'
 /// 2,832 cells each plus the field chips' real rows times their value columns
 /// (and with their LogUp columns). Prints; asserts the forms agree with the
 /// emission and that the round form spends fewer compressions.
 #[test]
-#[ignore = "census: emits two production-shape group chain programs"]
+#[ignore = "census: emits three production-shape group chain programs"]
 fn the_round_form_census_of_a_blake3_base_group() {
     use super::super::whir_chain::{
         ChipRows, LeafQuery, chain_cap_perms, chain_grind_perms, chain_opening_perms,
     };
-    use crate::block_whir::{B3_BASE_GROUP_POLYS, BlockFormat};
+    use crate::block_whir::{B3_BASE_GROUP_POLYS, B3Rounds, BlockFormat};
     use crate::hash_pin::{BlockFamily, ProofFamily};
     use crate::zf_format::ZfFormat;
     use stark::proof::options::BaseFormat;
@@ -821,34 +887,42 @@ fn the_round_form_census_of_a_blake3_base_group() {
     let n = zf.whir_stack.get();
     let polys = B3_BASE_GROUP_POLYS;
     let today = format.chain_config(&[(polys, n)]);
-    // Today's count, re-derived: the rule the levers below are sized by.
-    let sized = |folds: WhirFolds| {
-        ChainConfig::with_security_folds(today.log_blowup, 4, folds, n, 128, today.grind)
+    // The base's own configs at first fold 4: today's form, and the round
+    // form the base runs (shrink 3, caps by Q, its counts for the 128-bit
+    // target and the union over the tallest stack).
+    let mut zf4 = zf;
+    zf4.whir_folds = WhirFolds::First(FirstFold::new(4).expect("first fold 4"));
+    let at = |zf: ZfFormat, rounds: B3Rounds| {
+        BlockFormat {
+            zf,
+            b3_rounds: rounds,
+            ..BlockFormat::production()
+        }
+        .chain_config(&[(polys, n)])
     };
+    let fri4 = at(zf4, B3Rounds::Fri);
+    let base_w3 = at(zf4, B3Rounds::WHIR3);
+    let bits = crate::multilinear_prove::CHAIN_SECURITY_BITS;
+    let tallest = crate::multilinear_prove::tallest_stack(&zf4, &[(polys, n)]);
+    let w3 = fri4.with_whir_rounds(3, bits, tallest).expect("shrink 3");
     assert_eq!(
-        sized(today.format.folds).num_queries,
-        today.num_queries,
-        "today's count is the rule's at 128 bits"
+        w3.with_caps_by_queries(),
+        Some(base_w3),
+        "the base's round form is shrink 3 with caps by Q"
     );
-    let at_first = |k0: usize| {
-        let s = sized(WhirFolds::First(FirstFold::new(k0).expect("a first fold")));
-        let mut c = today;
-        c.log_folding = 4;
-        c.format.folds = s.format.folds;
-        c.num_queries = s.num_queries;
-        c
-    };
+    let w3_k0_6 = today
+        .with_whir_rounds(
+            3,
+            bits,
+            crate::multilinear_prove::tallest_stack(&zf, &[(polys, n)]),
+        )
+        .expect("shrink 3");
     let arms = [
         ("today's format", today),
-        ("first fold 4, today's form", at_first(4)),
-        (
-            "round form k0 4 s 3",
-            at_first(4).with_whir_rounds(3, 128, n).expect("shrink 3"),
-        ),
-        (
-            "round form k0 6 s 3",
-            at_first(6).with_whir_rounds(3, 128, n).expect("shrink 3"),
-        ),
+        ("first fold 4, today's form", fri4),
+        ("round form k0 4 s 3", w3),
+        ("round form k0 6 s 3", w3_k0_6),
+        ("round form k0 4 s 3, caps by Q (the base's)", base_w3),
     ];
     let shape_of = |cfg: &ChainConfig| {
         ChainShape {
@@ -889,10 +963,19 @@ fn the_round_form_census_of_a_blake3_base_group() {
         totals[2] as i64 - totals[0] as i64,
         100.0 * (totals[2] as f64 / totals[0] as f64 - 1.0)
     );
+    println!(
+        "CENSUS caps by Q: {} -> {} compressions ({:+}) against the round form without them; \
+         {:+.1} % against today's format",
+        totals[2],
+        totals[4],
+        totals[4] as i64 - totals[2] as i64,
+        100.0 * (totals[4] as f64 / totals[0] as f64 - 1.0)
+    );
     assert!(totals[2] < totals[0] && totals[2] < totals[1]);
+    assert!(totals[4] < totals[0]);
 
     super::LEAN.with(|c| c.set(true));
-    for (name, cfg) in [&arms[0], &arms[2]] {
+    for (name, cfg) in [&arms[0], &arms[2], &arms[4]] {
         let shape = shape_of(cfg);
         let leg = grouped_program(&shape);
         let (compressions, other) = hash_rows(&leg);
