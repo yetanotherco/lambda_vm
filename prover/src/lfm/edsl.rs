@@ -1099,6 +1099,31 @@ impl ByteWrapHash {
             }
         }
     }
+
+    /// [`ByteWrapHash::hash_bytes_with_rev`] also returning the last
+    /// compression's extended output (`out[8..16]`, two words of `u32`
+    /// lanes): a 64-byte squeeze. BLAKE3 only — keccak's output past its
+    /// digest is not what a sponge squeeze would hand out.
+    ///
+    /// # Panics
+    ///
+    /// Under keccak.
+    pub fn hash_bytes_with_rev_ext(
+        self,
+        b: &mut LfmBuilder,
+        stream: &[Felt],
+        len_bytes: usize,
+    ) -> (WrapDigest, [Cell; 2], [Cell; 2]) {
+        match self {
+            ByteWrapHash::Keccak => {
+                panic!("a 64-byte squeeze is BLAKE3's extended output; keccak has none here")
+            }
+            ByteWrapHash::Blake3 => {
+                let (d, rev, ext) = blake3_256_with_rev_ext(b, stream, len_bytes);
+                (WrapDigest::from_pair(d[0], d[1]), rev, ext)
+            }
+        }
+    }
 }
 
 // ============ the configured hash, as free functions ============
@@ -1281,15 +1306,15 @@ pub fn bits_to_felt(b: &mut LfmBuilder, bits: &[Bit]) -> Felt {
 /// is read from [`crypto::hash::blake3::chain`] rather than restated here — see
 /// [`blake3_absorb_all`].
 pub fn blake3_256(b: &mut LfmBuilder, stream: &[Felt], len_bytes: usize) -> Blake3Digest {
-    blake3_absorb_all(b, stream, len_bytes, false).0
+    blake3_absorb_all(b, stream, len_bytes, Outputs::DIGEST).digest
 }
 
 /// [`blake3_256`], returning the byte-REVERSED digest instead — the value the
 /// production `DefaultTranscript::sample()` both returns as the challenge and
 /// re-absorbs as the next segment's prefix.
 pub fn blake3_256_rev(b: &mut LfmBuilder, stream: &[Felt], len_bytes: usize) -> [Cell; 2] {
-    blake3_absorb_all(b, stream, len_bytes, true)
-        .1
+    blake3_absorb_all(b, stream, len_bytes, Outputs::REV)
+        .rev
         .expect("requested")
 }
 
@@ -1319,7 +1344,15 @@ pub fn blake3_256_resumed(
     );
     let _ = b.felt_const(FE::zero());
     let h = midstate_words(b, midstate);
-    blake3_chain_from(b, ChainStart::Words(h), skip, stream, len_bytes, false).0
+    blake3_chain_from(
+        b,
+        ChainStart::Words(h),
+        skip,
+        stream,
+        len_bytes,
+        Outputs::DIGEST,
+    )
+    .digest
 }
 
 /// A chaining value of program constants as its two interned words.
@@ -1444,8 +1477,24 @@ pub fn blake3_256_with_rev(
     stream: &[Felt],
     len_bytes: usize,
 ) -> (Blake3Digest, [Cell; 2]) {
-    let (digest, rev) = blake3_absorb_all(b, stream, len_bytes, true);
-    (digest, rev.expect("requested"))
+    let out = blake3_absorb_all(b, stream, len_bytes, Outputs::REV);
+    (out.digest, out.rev.expect("requested"))
+}
+
+/// [`blake3_256_with_rev`] also returning the last compression's extended
+/// output — the second 32 of its 64 output bytes (`out[8..16]`), as two words
+/// of `u32` lanes — off the same compression: a 64-byte transcript squeeze.
+pub fn blake3_256_with_rev_ext(
+    b: &mut LfmBuilder,
+    stream: &[Felt],
+    len_bytes: usize,
+) -> (Blake3Digest, [Cell; 2], [Cell; 2]) {
+    let out = blake3_absorb_all(b, stream, len_bytes, Outputs::REV_EXT);
+    (
+        out.digest,
+        out.rev.expect("requested"),
+        out.ext.expect("requested"),
+    )
 }
 
 /// The `Blake3Chain` framing, emitted.
@@ -1474,8 +1523,8 @@ fn blake3_absorb_all(
     b: &mut LfmBuilder,
     stream: &[Felt],
     len_bytes: usize,
-    want_rev: bool,
-) -> (Blake3Digest, Option<[Cell; 2]>) {
+    want: Outputs,
+) -> ChainOut {
     use super::blake3::BLAKE3_IV;
 
     // The zero cell first, then the IV: interning emits a `Const` at first use,
@@ -1483,7 +1532,7 @@ fn blake3_absorb_all(
     let _ = b.felt_const(FE::zero());
     if b.b3_lean() {
         // The lean IV row reads no chaining value: nothing to intern.
-        return blake3_chain_from(b, ChainStart::Iv, 0, stream, len_bytes, want_rev);
+        return blake3_chain_from(b, ChainStart::Iv, 0, stream, len_bytes, want);
     }
     // The initial chaining value: `BLAKE3_IV` as two interned constants. `h` is
     // `u32` words 0..8, so word 0 is `IV[0..4]` and word 1 is `IV[4..8]`.
@@ -1494,7 +1543,7 @@ fn blake3_absorb_all(
         .as_cell()
     };
     let h: [Cell; 2] = [iv_word(b, 0), iv_word(b, 1)];
-    blake3_chain_from(b, ChainStart::Words(h), 0, stream, len_bytes, want_rev)
+    blake3_chain_from(b, ChainStart::Words(h), 0, stream, len_bytes, want)
 }
 
 /// The chain of [`blake3_absorb_all`] from chaining value `h` at block
@@ -1507,8 +1556,8 @@ fn blake3_chain_from(
     first: usize,
     stream: &[Felt],
     len_bytes: usize,
-    want_rev: bool,
-) -> (Blake3Digest, Option<[Cell; 2]>) {
+    want: Outputs,
+) -> ChainOut {
     use super::blake3::chain::{BLOCK_LEN, block_flags, block_len_of, num_blocks};
     use super::keccak_host::{BYTES_PER_HALF, num_stream_halves};
 
@@ -1526,6 +1575,7 @@ fn blake3_chain_from(
     let zero = b.felt_const(FE::zero());
     let blocks = num_blocks(len_bytes);
     let mut rev: Option<[Cell; 2]> = None;
+    let mut ext: Option<[Cell; 2]> = None;
     let lean = b.b3_lean();
     let mut cv = start;
 
@@ -1546,13 +1596,30 @@ fn blake3_chain_from(
         if lean {
             // The lean tables' row: `block_len` and the flags are the row's
             // constants, the chaining value the IV or the last digest.
+            if last && want.ext {
+                // The squeeze's row: its reversed digest and its extended
+                // output (`out[8..16]`) besides the digest.
+                let (out, rev_words, ext_words) = b.b3_compress_rev_ext(
+                    match cv {
+                        ChainStart::Iv => super::builder::B3Cv::Iv,
+                        ChainStart::Words(w) => super::builder::B3Cv::Words(w),
+                    },
+                    super::builder::B3Block::Lanes(message),
+                    u8::try_from(block_len_of(block, len_bytes)).expect("a block is 64 bytes"),
+                    u8::try_from(block_flags(block, blocks)).expect("one byte of flags"),
+                );
+                rev = Some(rev_words);
+                ext = Some(ext_words);
+                cv = ChainStart::Words(out);
+                continue;
+            }
             let (out, rev_words) = b3_lean_compress(
                 b,
                 cv,
                 super::builder::B3Block::Lanes(message),
                 block_len_of(block, len_bytes),
                 block_flags(block, blocks),
-                last && want_rev,
+                last && want.rev,
             );
             if rev_words.is_some() {
                 rev = rev_words;
@@ -1575,13 +1642,18 @@ fn blake3_chain_from(
             ])
             .as_cell();
 
-        let out = if block + 1 == blocks && want_rev {
+        let out = if block + 1 == blocks && want.rev {
             let (out, rev_words) = b.blake3_compress_rev(h, message, params);
             rev = Some(rev_words);
             out
         } else {
             b.blake3_compress(h, message, params)
         };
+        // `LFM_BLAKE3` writes all 16 output words: the extended output is its
+        // words 2 and 3 (`out[8..16]`), free.
+        if last && want.ext {
+            ext = Some([out[2], out[3]]);
+        }
         // The next block's chaining value is `out[0..8]` — output words 0 and 1
         // — and so is the digest when this was the last block. One and the same,
         // which is what the truncation to `[out[0], out[1]]` says.
@@ -1589,9 +1661,44 @@ fn blake3_chain_from(
     }
 
     match cv {
-        ChainStart::Words([d0, d1]) => (WrapDigest::from_pair(d0, d1), rev),
+        ChainStart::Words([d0, d1]) => ChainOut {
+            digest: WrapDigest::from_pair(d0, d1),
+            rev,
+            ext,
+        },
         ChainStart::Iv => unreachable!("a chain compresses at least one block"),
     }
+}
+
+/// What a BLAKE3 chain's last compression hands back besides its digest.
+#[derive(Clone, Copy)]
+struct Outputs {
+    /// The byte-reversed digest (a transcript's `sample()`).
+    rev: bool,
+    /// The extended output, `out[8..16]` (a 64-byte squeeze). Only with `rev`.
+    ext: bool,
+}
+
+impl Outputs {
+    const DIGEST: Self = Self {
+        rev: false,
+        ext: false,
+    };
+    const REV: Self = Self {
+        rev: true,
+        ext: false,
+    };
+    const REV_EXT: Self = Self {
+        rev: true,
+        ext: true,
+    };
+}
+
+/// A BLAKE3 chain's results: its digest, and what [`Outputs`] asked for.
+struct ChainOut {
+    digest: Blake3Digest,
+    rev: Option<[Cell; 2]>,
+    ext: Option<[Cell; 2]>,
 }
 
 fn keccak256_absorb_all(

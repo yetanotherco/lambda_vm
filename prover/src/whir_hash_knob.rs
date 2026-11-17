@@ -149,7 +149,9 @@ macro_rules! with_block_hash {
 /// verify sites in `block_whir` — with one more arm: the 7-round BLAKE3 base
 /// (`stark::proof::options::BaseFormat::B3_WHIR`, `Blake3Whir`), admitted by
 /// [`crate::block_whir::checked_base_only`] only in a process that declared
-/// base-only ([`crate::base_only`]). Every other base takes
+/// base-only ([`crate::base_only`]) — or, when the process's BLAKE3 base
+/// squeezes 64 bytes ([`crate::block_whir::b3_base_squeeze64`], named in the
+/// base's statement tag), `Blake3Squeeze64Whir`. Every other base takes
 /// [`with_block_hash!`]'s path, byte for byte: the family's base binds the
 /// family's configuration and any other is refused. The recursion never
 /// dispatches here, so no BLAKE3 base reaches it.
@@ -158,9 +160,15 @@ macro_rules! with_base_hash {
     ($base:expr, |$h:ident| $body:block) => {{
         if $base.hash == stark::config::CommitmentHash::Blake3 {
             $crate::block_whir::checked_base_only(&$base)?;
-            #[allow(non_camel_case_types)]
-            type $h = multilinear::whir_hash::Blake3Whir;
-            $body
+            if $crate::block_whir::b3_base_squeeze64() {
+                #[allow(non_camel_case_types)]
+                type $h = multilinear::whir_hash::Blake3Squeeze64Whir;
+                $body
+            } else {
+                #[allow(non_camel_case_types)]
+                type $h = multilinear::whir_hash::Blake3Whir;
+                $body
+            }
         } else {
             $crate::with_block_hash!($base, |$h| $body)
         }

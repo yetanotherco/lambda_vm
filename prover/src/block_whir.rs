@@ -415,15 +415,7 @@ pub fn block_statement_tag(base: &BaseFormat) -> Vec<u8> {
     // two BLAKE3 geometries share a tag either; then its final polynomial's
     // width ([`b3_base_final`], `F0` without one).
     if *base == BaseFormat::B3_WHIR {
-        let mut tag = MULTILINEAR_BLOCK_TAG.to_vec();
-        tag.extend_from_slice(B3_BASE_TAG_SUFFIX);
-        tag.extend_from_slice(format!("/C{}", b3_base_cap()).as_bytes());
-        let final_vars = match b3_base_final() {
-            FinalPoly::Off => 0,
-            FinalPoly::Vars(v) => v,
-        };
-        tag.extend_from_slice(format!("/F{final_vars}").as_bytes());
-        return tag;
+        return b3_base_statement_tag(b3_base_cap(), b3_base_final(), b3_base_squeeze64());
     }
     let height = match base.arity4_cap {
         CapPolicy::Off | CapPolicy::Fixed(0) => "0".to_string(),
@@ -435,10 +427,77 @@ pub fn block_statement_tag(base: &BaseFormat) -> Vec<u8> {
     tag
 }
 
+/// The 7-round BLAKE3 base's statement tag (see [`block_statement_tag`]) at
+/// the cap height `cap`, the final polynomial `final_poly` and the squeeze
+/// width: `…/B3R7/C<cap>/F<vars>`, then `/S64` under 64-byte squeezes
+/// ([`b3_base_squeeze64`]) and nothing under 32-byte ones, so a base proved
+/// before the squeeze width was a setting keeps its tag.
+pub fn b3_base_statement_tag(cap: u8, final_poly: FinalPoly, squeeze64: bool) -> Vec<u8> {
+    let mut tag = MULTILINEAR_BLOCK_TAG.to_vec();
+    tag.extend_from_slice(B3_BASE_TAG_SUFFIX);
+    tag.extend_from_slice(format!("/C{cap}").as_bytes());
+    let final_vars = match final_poly {
+        FinalPoly::Off => 0,
+        FinalPoly::Vars(v) => v,
+    };
+    tag.extend_from_slice(format!("/F{final_vars}").as_bytes());
+    if squeeze64 {
+        tag.extend_from_slice(B3_BASE_SQUEEZE64_TAG);
+    }
+    tag
+}
+
 /// The 7-round BLAKE3 base's statement tag after
 /// `LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V2` (see [`block_statement_tag`]),
 /// before its cap height.
 pub const B3_BASE_TAG_SUFFIX: &[u8] = b"/B3R7";
+
+/// What the BLAKE3 base's statement tag ends with when its transcript's
+/// squeezes hand out 64 bytes ([`b3_base_statement_tag`]).
+pub const B3_BASE_SQUEEZE64_TAG: &[u8] = b"/S64";
+
+/// The knob that proves and verifies the 7-round BLAKE3 base with 64-byte
+/// transcript squeezes (`multilinear::whir_hash::Blake3Squeeze64Whir`: each
+/// squeeze hands out the final compression's 64 output bytes, eight
+/// candidates, where today's hands out its 32-byte digest, four). Opt-in:
+/// unset is today's transcript. Both sides of one process read it, and the
+/// tag names it ([`b3_base_statement_tag`]): see [`b3_base_squeeze_setting`].
+pub const B3_BASE_SQUEEZE_ENV: &str = "LAMBDA_VM_B3_BASE_SQUEEZE";
+
+/// [`B3_BASE_SQUEEZE_ENV`]'s value as "64-byte squeezes": unset or `32` is
+/// `false` (today's transcript), `64` is `true`. Anything else is refused.
+pub fn b3_base_squeeze_setting(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("32") => Ok(false),
+        Some("64") => Ok(true),
+        Some(other) => Err(format!(
+            "{B3_BASE_SQUEEZE_ENV}={other:?}: expected 32 or 64"
+        )),
+    }
+}
+
+/// Whether this process's BLAKE3 base squeezes 64 bytes
+/// ([`b3_base_squeeze_setting`] of [`B3_BASE_SQUEEZE_ENV`]), read once; a
+/// refused value aborts the process at its first read, as [`b3_base_final`]
+/// does. Read by the base's prove and verify dispatch
+/// ([`crate::with_base_hash!`]), its statement tag and the recursion's plan.
+pub fn b3_base_squeeze64() -> bool {
+    static SQUEEZE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SQUEEZE.get_or_init(|| {
+        let value = match std::env::var(B3_BASE_SQUEEZE_ENV) {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(v)) => {
+                eprintln!("{B3_BASE_SQUEEZE_ENV}={v:?}: expected 32 or 64");
+                std::process::abort()
+            }
+        };
+        b3_base_squeeze_setting(value.as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::abort()
+        })
+    })
+}
 
 /// The 7-round BLAKE3 base's binary cap height: every tree of its chains is
 /// cut to a cap of `2^8` nodes (or to the tree itself, when it is shallower),

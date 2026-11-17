@@ -181,7 +181,9 @@ impl WhirTranscript {
                     consts: Vec::new(),
                 });
             }
-            WrapHash::Blake3 => t.bytes = Some(TranscriptReplay::new(&[])),
+            WrapHash::Blake3 => {
+                t.bytes = Some(TranscriptReplay::new(&[]).with_squeeze64(b.b3_squeeze64()))
+            }
             WrapHash::Keccak | WrapHash::Algebraic => {}
         }
         t
@@ -590,12 +592,26 @@ pub struct SpongeEntry {
 
 /// Where the BLAKE3 byte sponge stands (`DefaultTranscript<_,
 /// Blake3StdTranscriptHash>`): bytes absorbed since the last squeeze, and
-/// 64-bit candidates of the last squeeze handed out
-/// ([`CANDIDATES_PER_SQUEEZE`] = none in hand).
+/// 64-bit candidates of the last squeeze handed out (the squeeze's candidate
+/// count, [`ByteSpongeEntry::candidates`], = none in hand).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteSpongeEntry {
     pub segment: usize,
     pub out_pos: usize,
+    /// Whether a squeeze hands out 64 bytes, eight candidates
+    /// (`Blake3StdSqueeze64TranscriptHash`), rather than 32, four.
+    pub squeeze64: bool,
+}
+
+impl ByteSpongeEntry {
+    /// Candidates one squeeze hands out: 4, or 8 under 64-byte squeezes.
+    pub const fn candidates(&self) -> usize {
+        if self.squeeze64 {
+            2 * CANDIDATES_PER_SQUEEZE
+        } else {
+            CANDIDATES_PER_SQUEEZE
+        }
+    }
 }
 
 /// Bytes a squeeze re-absorbs: its 32 reversed digest bytes.
@@ -634,6 +650,13 @@ impl SpongeEntry {
     /// The empty transcript of a program built under `hash`: [`Self::fresh`],
     /// or the empty Poseidon1 sponge (nothing pending, nothing to read).
     pub const fn fresh_for(hash: WrapHash) -> Self {
+        Self::fresh_for_squeeze(hash, false)
+    }
+
+    /// [`Self::fresh_for`], with a BLAKE3 byte sponge's 64-byte squeezes when
+    /// `squeeze64` (a program built `LfmBuilder::with_b3_squeeze64`); no
+    /// effect under any other hash.
+    pub const fn fresh_for_squeeze(hash: WrapHash, squeeze64: bool) -> Self {
         match hash {
             WrapHash::Poseidon1 => Self {
                 p1: Some(P1SpongeEntry {
@@ -645,7 +668,12 @@ impl SpongeEntry {
             WrapHash::Blake3 => Self {
                 bytes: Some(ByteSpongeEntry {
                     segment: 0,
-                    out_pos: CANDIDATES_PER_SQUEEZE,
+                    out_pos: if squeeze64 {
+                        2 * CANDIDATES_PER_SQUEEZE
+                    } else {
+                        CANDIDATES_PER_SQUEEZE
+                    },
+                    squeeze64,
                 }),
                 ..Self::fresh()
             },
@@ -724,7 +752,7 @@ impl SpongeSchedule {
         if let Some((t, _)) = &mut self.bytes {
             // A felt is its eight big-endian bytes.
             t.segment += BYTES_PER_FELT * felts;
-            t.out_pos = CANDIDATES_PER_SQUEEZE;
+            t.out_pos = t.candidates();
             return;
         }
         if let Some((p, perms)) = &mut self.p1 {
@@ -768,7 +796,7 @@ impl SpongeSchedule {
     /// `next_sample_u64`: refill only when nothing is in hand.
     pub fn candidate(&mut self) {
         if let Some((t, _)) = &self.bytes {
-            if t.out_pos >= CANDIDATES_PER_SQUEEZE {
+            if t.out_pos >= t.candidates() {
                 self.squeeze();
             }
             if let Some((t, _)) = &mut self.bytes {

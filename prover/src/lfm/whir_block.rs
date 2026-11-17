@@ -745,6 +745,11 @@ pub struct WhirBlockPlan {
     /// ([`LfmBuilder::with_b3_lean`]): on for a BLAKE3 plan, whose programs
     /// only the block prover proves; meaningless under any other hash.
     b3_lean: bool,
+    /// Whether the programs replay a base transcript with 64-byte squeezes
+    /// ([`LfmBuilder::with_b3_squeeze64`]): the BLAKE3 base's, when its
+    /// process proves it so (`block_whir::b3_base_squeeze64`, named in the
+    /// statement tag); off for every other plan.
+    b3_squeeze64: bool,
     public_output: Vec<u8>,
     /// The statement's groups: AIR indices in each group's order.
     groups: Vec<Vec<usize>>,
@@ -909,6 +914,7 @@ impl WhirBlockPlan {
             leaf_cap,
             share_inverse,
             wrap_hash,
+            false,
         )
     }
 
@@ -952,6 +958,9 @@ impl WhirBlockPlan {
             usize::MAX,
             share_inverse(),
             super::edsl::WrapHash::Blake3,
+            // The base's transcript width, a verifier constant of this
+            // process that the statement tag names (`block_format_tag`).
+            crate::block_whir::b3_base_squeeze64(),
         )
     }
 
@@ -968,6 +977,7 @@ impl WhirBlockPlan {
         leaf_cap: usize,
         share_inverse: bool,
         wrap_hash: super::edsl::WrapHash,
+        b3_squeeze64: bool,
     ) -> Result<Self, String> {
         let base = &format.zf.base;
         let frame = block_frame(statement, elf_bytes, proof_options, format)
@@ -1055,7 +1065,7 @@ impl WhirBlockPlan {
         for (g, list) in groups.iter().enumerate() {
             let owned = Shapes::build(&refs, &frame.shapes, list)?;
             let shapes = owned.table_shapes();
-            let entry = SpongeEntry::fresh_for(wrap_hash);
+            let entry = SpongeEntry::fresh_for_squeeze(wrap_hash, b3_squeeze64);
             let tables: usize = match batched_cap(config)? {
                 None => shapes
                     .iter()
@@ -1076,8 +1086,9 @@ impl WhirBlockPlan {
                 ..ChainShape::for_hash(config, layout.n_stack(), wrap_hash)
             };
             let opening = stacked_verify_cost_ood(layout, &group_of, &chain, entry, true).perms()
-                + commit_ood_point_perms(
+                + commit_ood_point_perms_squeeze(
                     wrap_hash,
+                    b3_squeeze64,
                     multilinear::stacked_eval::round0_trees(layout.num_polys(), config).len(),
                 );
             let prepared_perms: usize = prepared
@@ -1110,6 +1121,7 @@ impl WhirBlockPlan {
             statement_calls,
             wrap_hash,
             b3_lean: wrap_hash == super::edsl::WrapHash::Blake3,
+            b3_squeeze64,
             public_output: statement.public_output.to_vec(),
             groups,
             prepared,
@@ -1193,6 +1205,7 @@ impl WhirBlockPlan {
         LfmBuilder::new()
             .with_wrap_hash(self.wrap_hash)
             .with_b3_lean(self.b3_lean)
+            .with_b3_squeeze64(self.b3_squeeze64)
     }
 
     /// Test only: this plan with its BLAKE3 compressions lowered to
@@ -2431,7 +2444,19 @@ pub(crate) fn emit_commit_ood_point(
 /// own sponge over the prefix — under Poseidon1 one `append_bytes`, its length
 /// and nine felts — the roots, and one draw.
 pub(crate) fn commit_ood_point_perms(hash: super::edsl::WrapHash, polys: usize) -> usize {
-    let mut schedule = super::whir_transcript::SpongeSchedule::new(SpongeEntry::fresh_for(hash));
+    commit_ood_point_perms_squeeze(hash, false, polys)
+}
+
+/// [`commit_ood_point_perms`] for a sponge whose squeezes are 64 bytes when
+/// `squeeze64` (BLAKE3 only).
+pub(crate) fn commit_ood_point_perms_squeeze(
+    hash: super::edsl::WrapHash,
+    squeeze64: bool,
+    polys: usize,
+) -> usize {
+    let mut schedule = super::whir_transcript::SpongeSchedule::new(SpongeEntry::fresh_for_squeeze(
+        hash, squeeze64,
+    ));
     let prefix_felts = COMMIT_OOD_PREFIX_BYTES / 8;
     schedule.absorb(usize::from(hash == super::edsl::WrapHash::Poseidon1) + prefix_felts);
     for _ in 0..polys {

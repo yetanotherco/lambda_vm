@@ -69,6 +69,10 @@ const CANDIDATE_BYTES: usize = 8;
 /// Candidates one squeeze yields.
 const CANDIDATES_PER_SQUEEZE: usize = SQUEEZE_LEN / CANDIDATE_BYTES;
 
+/// Bytes a 64-byte squeeze hands out (`Blake3StdSqueeze64TranscriptHash`):
+/// the digest's, then the extended output's.
+const WIDE_SQUEEZE_LEN: usize = crypto::fiat_shamir::transcript_hash::WIDE_SQUEEZE_BYTES;
+
 /// `2^32 − 1` — the only `hi` half that can put a candidate at or above `p`.
 const HI_MAX: u64 = 0xFFFF_FFFF;
 
@@ -156,6 +160,10 @@ struct SqueezeBuf {
     // Carries its own width, so an algebraic squeeze (ONE cell) fits unchanged.
     words: edsl::WrapDigest,
     lanes: [Option<[Felt; 4]>; DIGEST_WORDS],
+    /// A 64-byte squeeze's extended output (`out[8..16]`, two words), whose
+    /// lanes hold candidates 4 to 7 exactly as the digest's hold 0 to 3.
+    ext: Option<[Cell; DIGEST_WORDS]>,
+    ext_lanes: [Option<[Felt; 4]>; DIGEST_WORDS],
 }
 
 /// Emit-time replay of `DefaultTranscript`.
@@ -191,6 +199,12 @@ pub struct TranscriptReplay {
     /// like [`Self::sponge`] and for the same reason. Every append drains into
     /// it in host order at the next builder-taking call.
     p1: Option<super::p1w16_emit::P1SpongeVar>,
+    /// ★ Whether a squeeze hands out 64 bytes, eight candidates
+    /// (`Blake3StdSqueeze64TranscriptHash`): the squeeze's compression also
+    /// writes its extended output, and the buffer is spent after eight. The
+    /// chain is unchanged — only the digest is re-absorbed. Set once, before
+    /// anything is drawn ([`Self::with_squeeze64`]); BLAKE3 only.
+    squeeze64: bool,
 }
 
 impl TranscriptReplay {
@@ -206,9 +220,37 @@ impl TranscriptReplay {
             out_pos: SQUEEZE_LEN,
             sponge: None,
             p1: None,
+            squeeze64: false,
         };
         t.append_const_bytes(seed);
         t
+    }
+
+    /// This replay with 64-byte squeezes when `squeeze64`
+    /// (`Blake3StdSqueeze64TranscriptHash`'s schedule): eight candidates a
+    /// squeeze, the last four off the same compression's extended output.
+    ///
+    /// # Panics
+    ///
+    /// When a squeeze has already been drawn from: the width is the
+    /// transcript's, from its start.
+    pub fn with_squeeze64(mut self, squeeze64: bool) -> Self {
+        assert!(
+            self.buf.is_none() && self.out_pos == SQUEEZE_LEN,
+            "the squeeze width is set before the first draw"
+        );
+        self.squeeze64 = squeeze64;
+        self.out_pos = self.squeeze_len();
+        self
+    }
+
+    /// Bytes one squeeze hands out: 32, or 64 under [`Self::with_squeeze64`].
+    fn squeeze_len(&self) -> usize {
+        if self.squeeze64 {
+            WIDE_SQUEEZE_LEN
+        } else {
+            SQUEEZE_LEN
+        }
     }
 
     /// Absorb machine-computed data: `4 · halves.len()` bytes, four per half,
@@ -232,7 +274,7 @@ impl TranscriptReplay {
         self.segment_len += BYTES_PER_HALF * halves.len();
         // Absorbing invalidates the buffer: a later challenge must depend on
         // this input, so bytes squeezed before it are dropped.
-        self.out_pos = SQUEEZE_LEN;
+        self.out_pos = self.squeeze_len();
         self.buf = None;
     }
 
@@ -461,7 +503,7 @@ impl TranscriptReplay {
     pub fn append_const_bytes(&mut self, bytes: &[u8]) {
         self.segment.push(Append::Const(bytes.to_vec()));
         self.segment_len += bytes.len();
-        self.out_pos = SQUEEZE_LEN;
+        self.out_pos = self.squeeze_len();
         self.buf = None;
     }
 
@@ -592,7 +634,7 @@ impl TranscriptReplay {
             byte_len: BYTES_PER_HALF * halves.len(),
         });
         self.segment_len += BYTES_PER_HALF * halves.len();
-        self.out_pos = SQUEEZE_LEN;
+        self.out_pos = self.squeeze_len();
         self.buf = None;
     }
 
@@ -616,7 +658,7 @@ impl TranscriptReplay {
             byte_len,
         });
         self.segment_len += byte_len;
-        self.out_pos = SQUEEZE_LEN;
+        self.out_pos = self.squeeze_len();
         self.buf = None;
     }
 
@@ -658,7 +700,7 @@ impl TranscriptReplay {
         };
         let (_plain, rev) = self.squeeze(b, h);
         self.buf = None;
-        self.out_pos = SQUEEZE_LEN;
+        self.out_pos = self.squeeze_len();
         edsl::WrapDigest::from_pair(rev[0], rev[1])
     }
 
@@ -671,8 +713,31 @@ impl TranscriptReplay {
         b: &mut LfmBuilder,
         h: ByteWrapHash,
     ) -> (edsl::WrapDigest, [Cell; DIGEST_WORDS]) {
+        let (plain, rev, _) = self.squeeze_out(b, h, false);
+        (plain, rev)
+    }
+
+    /// [`Self::squeeze`], with the compression's extended output when
+    /// `want_ext` (a 64-byte squeeze's last four candidates).
+    #[allow(clippy::type_complexity)]
+    fn squeeze_out(
+        &mut self,
+        b: &mut LfmBuilder,
+        h: ByteWrapHash,
+        want_ext: bool,
+    ) -> (
+        edsl::WrapDigest,
+        [Cell; DIGEST_WORDS],
+        Option<[Cell; DIGEST_WORDS]>,
+    ) {
         let packed = self.pack_segment(b);
-        let (plain, rev) = edsl::wrap_hash_bytes_with_rev(b, h, &packed, self.segment_len);
+        let (plain, rev, ext) = if want_ext {
+            let (plain, rev, ext) = h.hash_bytes_with_rev_ext(b, &packed, self.segment_len);
+            (plain, rev, Some(ext))
+        } else {
+            let (plain, rev) = edsl::wrap_hash_bytes_with_rev(b, h, &packed, self.segment_len);
+            (plain, rev, None)
+        };
         // The transcript absorbs the reversed bytes into a freshly reset hasher,
         // so they are the WHOLE of the next segment, not a suffix of this one.
         let mut halves = Vec::with_capacity(SQUEEZE_HALVES);
@@ -684,15 +749,23 @@ impl TranscriptReplay {
             byte_len: SQUEEZE_LEN,
         }];
         self.segment_len = SQUEEZE_LEN;
-        (plain, rev)
+        (plain, rev, ext)
     }
 
-    /// Refill the output buffer with one squeeze, as `next_sample_u64` does.
+    /// Refill the output buffer with one squeeze, as `next_sample_u64` does:
+    /// under [`Self::with_squeeze64`] its compression's extended output too.
     fn refill(&mut self, b: &mut LfmBuilder, h: ByteWrapHash) {
-        let (plain, _rev) = self.squeeze(b, h);
+        assert_eq!(
+            self.squeeze64,
+            b.b3_squeeze64(),
+            "the replay's squeeze width must be its builder's"
+        );
+        let (plain, _rev, ext) = self.squeeze_out(b, h, self.squeeze64);
         self.buf = Some(SqueezeBuf {
             words: plain,
             lanes: [None; DIGEST_WORDS],
+            ext,
+            ext_lanes: [None; DIGEST_WORDS],
         });
         self.out_pos = 0;
     }
@@ -712,7 +785,7 @@ impl TranscriptReplay {
     /// takes its own path there. None of them reaches here, which is why this
     /// method needs no arm rather than needing a guard.
     pub fn next_candidate(&mut self, b: &mut LfmBuilder, h: ByteWrapHash) -> Candidate {
-        if self.out_pos + CANDIDATE_BYTES > SQUEEZE_LEN {
+        if self.out_pos + CANDIDATE_BYTES > self.squeeze_len() {
             self.refill(b, h);
         }
         debug_assert_eq!(
@@ -721,28 +794,45 @@ impl TranscriptReplay {
             "candidates are the buffer's only consumer, so out_pos moves in 8s"
         );
         let i = self.out_pos / CANDIDATE_BYTES;
-        debug_assert!(i < CANDIDATES_PER_SQUEEZE);
-        // Candidate i is the plain digest's u64 lane 3 − i (the reversal
-        // cancellation), and lane j is halves 2j (low) and 2j + 1 (high).
-        let lo = self.half(b, 2 * (CANDIDATES_PER_SQUEEZE - 1 - i));
-        let hi = self.half(b, 2 * (CANDIDATES_PER_SQUEEZE - 1 - i) + 1);
+        debug_assert!(i < self.squeeze_len() / CANDIDATE_BYTES);
+        // Candidate i < 4 is the plain digest's u64 lane 3 − i (the reversal
+        // cancellation), and lane j is halves 2j (low) and 2j + 1 (high). A
+        // 64-byte squeeze reverses its second 32 bytes the same way, so
+        // candidate 4 + j is the extended output's lane 3 − j: halves 8 + 2(3 − j)
+        // and the one after, counting the extended words after the digest's.
+        let (base, j) = if i < CANDIDATES_PER_SQUEEZE {
+            (0, i)
+        } else {
+            (2 * CANDIDATES_PER_SQUEEZE, i - CANDIDATES_PER_SQUEEZE)
+        };
+        let lo = self.half(b, base + 2 * (CANDIDATES_PER_SQUEEZE - 1 - j));
+        let hi = self.half(b, base + 2 * (CANDIDATES_PER_SQUEEZE - 1 - j) + 1);
         self.out_pos += CANDIDATE_BYTES;
         Candidate { lo, hi }
     }
 
-    /// Half `h` of the buffered digest: lane `h % 4` of word `h / 4`, unpacking
-    /// that word on first use.
+    /// Half `h` of the buffered squeeze: lane `h % 4` of word `h / 4` — the
+    /// digest's two words, then a 64-byte squeeze's two extended words —
+    /// unpacking that word on first use.
     fn half(&mut self, b: &mut LfmBuilder, h: usize) -> Felt {
         let buf = self
             .buf
             .as_mut()
             .expect("next_candidate refills before reading");
         let (w, l) = (h / 4, h % 4);
-        let lanes = match buf.lanes[w] {
+        let (slot, word) = if w < DIGEST_WORDS {
+            (&mut buf.lanes[w], buf.words[w])
+        } else {
+            let ext = buf
+                .ext
+                .expect("only a 64-byte squeeze hands out a fifth candidate");
+            (&mut buf.ext_lanes[w - DIGEST_WORDS], ext[w - DIGEST_WORDS])
+        };
+        let lanes = match *slot {
             Some(lanes) => lanes,
             None => {
-                let lanes = b.unpack(buf.words[w]);
-                buf.lanes[w] = Some(lanes);
+                let lanes = b.unpack(word);
+                *slot = Some(lanes);
                 lanes
             }
         };

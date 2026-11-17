@@ -416,3 +416,41 @@ fn the_blake3_base_cap_knob_reads_its_words_and_refuses_the_rest() {
         assert!(b3_base_cap_setting(Some(word)).is_err(), "{word:?}");
     }
 }
+
+/// The BLAKE3 base's squeeze knob: unset and `32` are today's transcript, `64`
+/// is 64-byte squeezes, anything else is refused; no test sets it.
+#[test]
+fn the_blake3_base_squeeze_knob_reads_its_words_and_refuses_the_rest() {
+    use crate::block_whir::{b3_base_squeeze_setting, b3_base_squeeze64};
+    assert!(!b3_base_squeeze64(), "no test sets the knob");
+    for (word, want) in [
+        (None, false),
+        (Some("32"), false),
+        (Some(" 32 "), false),
+        (Some("64"), true),
+        (Some(" 64"), true),
+    ] {
+        assert_eq!(b3_base_squeeze_setting(word), Ok(want), "{word:?}");
+    }
+    for word in ["", "16", "128", "sixty-four", "wide", "on"] {
+        assert!(b3_base_squeeze_setting(Some(word)).is_err(), "{word:?}");
+    }
+}
+
+/// ★ The squeeze width is named in the BLAKE3 base's statement tag, and only
+/// when it is 64: at today's 32 the tag is byte for byte the one before the
+/// width was a setting, so every 32-byte base keeps its statement.
+#[test]
+fn the_blake3_base_tag_names_64_byte_squeezes_and_only_them() {
+    use crate::block_whir::{B3_BASE_CAP, b3_base_final, b3_base_statement_tag};
+    let today = b3_base_statement_tag(B3_BASE_CAP, b3_base_final(), false);
+    assert_eq!(
+        today,
+        b"LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V2/B3R7/C8/F9".to_vec()
+    );
+    assert_eq!(block_statement_tag(&BaseFormat::B3_WHIR), today);
+    let wide = b3_base_statement_tag(B3_BASE_CAP, b3_base_final(), true);
+    let mut want = today.clone();
+    want.extend_from_slice(b"/S64");
+    assert_eq!(wide, want);
+}

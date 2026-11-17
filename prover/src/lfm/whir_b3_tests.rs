@@ -31,6 +31,9 @@ std::thread_local! {
     /// Whether this thread's programs take the lean tables' rows
     /// ([`LfmBuilder::with_b3_lean`]): each gate runs under both lowerings.
     static LEAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this thread's programs replay 64-byte squeezes
+    /// ([`LfmBuilder::with_b3_squeeze64`]).
+    static SQUEEZE64: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs `f` once under each lowering — `LFM_BLAKE3`'s rows, then the lean
@@ -50,6 +53,7 @@ fn builder() -> LfmBuilder {
     LfmBuilder::new()
         .with_wrap_hash(WrapHash::Blake3)
         .with_b3_lean(LEAN.with(std::cell::Cell::get))
+        .with_b3_squeeze64(SQUEEZE64.with(std::cell::Cell::get))
 }
 
 fn run_program(program: &LfmProgram, arenas: &[Vec<LfmWord>]) -> Vec<LfmWord> {
@@ -311,6 +315,103 @@ fn the_blake3_arm_replays_the_blake3_std_transcript() {
             assert_eq!(other, 0, "{}: and with nothing else", script.name);
         }
     });
+}
+
+/// A script that reads every candidate a 64-byte squeeze hands out and runs
+/// past it: bounded draws one candidate each, then extension draws (six each)
+/// across refills, an absorb between them, and a draw of zero bits.
+const SQUEEZE64_SCRIPT: Script = Script {
+    name: "every candidate of a 64-byte squeeze",
+    steps: &[
+        Step::AbsorbBytes {
+            seed: 0x51,
+            len: 40,
+        },
+        Step::SampleU64 { bound: 1 << 20 },
+        Step::SampleU64 { bound: 1 << 21 },
+        Step::SampleU64 { bound: 1 << 22 },
+        Step::SampleU64 { bound: 1 << 23 },
+        Step::SampleU64 { bound: 1 << 24 },
+        Step::SampleU64 { bound: 1 << 25 },
+        Step::SampleU64 { bound: 1 << 26 },
+        Step::SampleU64 { bound: 1 << 27 },
+        Step::SampleU64 { bound: 1 << 28 },
+        Step::SampleExt,
+        Step::SampleExt,
+        Step::SampleExt,
+        Step::AbsorbExt { seed: 0x5151_5151 },
+        Step::SampleExt,
+        Step::SampleU64 { bound: 1 },
+        Step::SampleU64 { bound: 1 << 31 },
+        Step::SampleExt,
+    ],
+};
+
+/// The scripts a 64-byte-squeeze gate replays: the four sequence scripts and
+/// one that reads every candidate of a squeeze.
+fn squeeze64_scripts() -> Vec<&'static Script> {
+    let mut all: Vec<&'static Script> = super::whir_transcript_kat_tests::scripts().to_vec();
+    all.push(&SQUEEZE64_SCRIPT);
+    all
+}
+
+/// ★ THE 64-BYTE-SQUEEZE TRANSCRIPT GATE. Every script replayed by a BLAKE3
+/// builder built [`LfmBuilder::with_b3_squeeze64`] and by
+/// `DefaultTranscript<_, Blake3StdSqueeze64TranscriptHash>`: every extension
+/// challenge, every bounded draw and the final state agree, under both
+/// lowerings. The machine reads candidates 4 to 7 off the squeeze's extended
+/// output (`out[8..16]`), so a fifth candidate taken from anywhere else — a
+/// new squeeze, the digest, the extended words without the chaining value
+/// fed forward — moves a challenge.
+#[test]
+fn the_blake3_arm_replays_the_64_byte_squeeze_transcript() {
+    use crypto::fiat_shamir::transcript_hash::Blake3StdSqueeze64TranscriptHash;
+    SQUEEZE64.with(|c| c.set(true));
+    under_both(|lowering| {
+        for script in squeeze64_scripts() {
+            let emitted = emit_script(script);
+            let machine = observe(script, &emitted);
+            let host = run_with::<Blake3StdSqueeze64TranscriptHash>(script);
+            assert_eq!(
+                machine.ext, host.ext,
+                "{lowering} {}: challenges",
+                script.name
+            );
+            assert_eq!(machine.u64s, host.u64s, "{lowering} {}: draws", script.name);
+            assert_eq!(
+                machine.state, host.state,
+                "{lowering} {}: state",
+                script.name
+            );
+            let (blake3, other) = hash_rows(&emitted.program);
+            assert!(blake3 > 0 && other == 0, "{}: BLAKE3 alone", script.name);
+        }
+    });
+    SQUEEZE64.with(|c| c.set(false));
+}
+
+/// ★ The two widths are two transcripts on the machine as on the host: the
+/// 64-byte replay is refused by the 32-byte host's challenges wherever a draw
+/// reaches a fifth candidate, and the 64-byte program spends fewer
+/// compressions on the same script.
+#[test]
+fn the_64_byte_replay_is_not_the_32_byte_transcript_and_costs_less() {
+    use crypto::fiat_shamir::transcript_hash::Blake3StdSqueeze64TranscriptHash;
+    let compressions = |squeeze64: bool, script: &Script| -> (usize, Observed) {
+        SQUEEZE64.with(|c| c.set(squeeze64));
+        let emitted = emit_script(script);
+        let observed = observe(script, &emitted);
+        SQUEEZE64.with(|c| c.set(false));
+        (hash_rows(&emitted.program).0, observed)
+    };
+    let script = &SQUEEZE64_SCRIPT;
+    let (wide, w) = compressions(true, script);
+    let (narrow, n) = compressions(false, script);
+    assert_eq!(w, run_with::<Blake3StdSqueeze64TranscriptHash>(script));
+    assert_eq!(n, run_with::<Blake3StdTranscriptHash>(script));
+    assert_ne!(w.ext, n.ext, "the challenges differ");
+    assert_ne!(w.u64s, n.u64s, "the draws differ");
+    assert!(wide < narrow, "{wide} compressions against {narrow}");
 }
 
 /// The scripts' host vectors under BLAKE3 are not RPX's: a replay that fell
@@ -2787,4 +2888,79 @@ fn the_indexed_cap_read_replaces_the_mux_in_a_lean_program() {
             );
         }
     });
+}
+
+/// ★ THE 64-BYTE-SQUEEZE CENSUS, by closed form: what the in-guest verifier of
+/// one BLAKE3 base group spends with each squeeze width, from the cost model
+/// the emission gates hold to.
+///
+/// - A GKR sumcheck round (the argue's unit: its degree's values absorbed,
+///   one extension challenge drawn): the 32-byte squeeze hashes the 104-byte
+///   segment (2 compressions) and squeezes again for the fifth and sixth
+///   candidates (1), where the 64-byte one reads all six off the first.
+/// - The base's chain over a run of four 2^27 polynomials (the base format's
+///   group): its openings, caps and grinds are the same; its transcript —
+///   sumchecks, out-of-domain draws, 229 query indices a round — squeezes
+///   about half as often.
+///
+/// Prints `B3 SQUEEZE64 CENSUS …`; asserts the parts that cannot move do not
+/// and the rest only falls.
+#[test]
+fn the_64_byte_squeeze_census_by_closed_form() {
+    use super::whir_chain::{ChainShape, LeafQuery, chain_opening_perms, chain_perms};
+    use super::whir_gkr::GKR_SUMCHECK_DEGREE;
+    use super::whir_transcript::{SpongeEntry, SpongeSchedule};
+    use crate::block_whir::{B3_BASE_GROUP_POLYS, BlockFormat};
+    use crate::zf_format::ZfFormat;
+    use stark::proof::options::BaseFormat;
+
+    // One GKR sumcheck round, in the middle of a ladder (the sponge holds a
+    // squeeze's digest and nothing in hand).
+    let round = |squeeze64: bool| -> usize {
+        let mut s =
+            SpongeSchedule::new(SpongeEntry::fresh_for_squeeze(WrapHash::Blake3, squeeze64));
+        s.absorb(3);
+        s.draw_ext();
+        let before = s.perms();
+        s.absorb(3 * GKR_SUMCHECK_DEGREE);
+        s.draw_ext();
+        s.perms() - before
+    };
+    let (round32, round64) = (round(false), round(true));
+    assert_eq!(
+        (round32, round64),
+        (3, 2),
+        "a GKR round: 3 compressions, then 2"
+    );
+
+    let zf = ZfFormat::DEFAULT.with_base(BaseFormat::B3_WHIR);
+    let format = BlockFormat {
+        zf,
+        ..BlockFormat::production()
+    };
+    let n = zf.whir_stack.get();
+    let run = B3_BASE_GROUP_POLYS;
+    let config = format.chain_config(&[(run, n)]);
+    let shape = ChainShape {
+        query: LeafQuery::Lean,
+        ..ChainShape::for_hash(&config, n, WrapHash::Blake3)
+    }
+    .run(run);
+    let narrow = chain_perms(&shape, SpongeEntry::fresh_for(WrapHash::Blake3));
+    let wide = chain_perms(
+        &shape,
+        SpongeEntry::fresh_for_squeeze(WrapHash::Blake3, true),
+    );
+    let openings = chain_opening_perms(&shape);
+    assert!(wide < narrow, "the chain's transcript squeezes less");
+    assert!(openings < wide, "and its openings are the same");
+    println!(
+        "B3 SQUEEZE64 CENSUS: GKR round {round32} -> {round64} compressions · base chain (run of \
+         {run} at 2^{n}, Q {}) {narrow} -> {wide} ({:+}; transcript and grinds {} -> {}; openings \
+         and caps {openings} unchanged)",
+        shape.num_queries,
+        wide as i64 - narrow as i64,
+        narrow - openings,
+        wide - openings,
+    );
 }
