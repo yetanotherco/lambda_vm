@@ -2052,6 +2052,43 @@ fn the_tree_prover_refuses_words_under_the_32_bit_register_tokens() {
     }
 }
 
+/// ★ With a compression step planned, the tree's prover refuses a memory
+/// format other than the pinned one before anything is proved, naming the
+/// top's uncompressed file as the way to prove it: every compressed file's
+/// verifier checks the pinned format. Controls: the pinned format passes the
+/// check with compression planned, and every format passes it without.
+#[test]
+fn the_tree_prover_refuses_to_compress_another_memory_format() {
+    use super::super::whir_block_tree::{
+        StderrSink, WhirTreeConfig, compressed_memory_check, prove_whir_block_tree,
+    };
+    let pinned = BlockFormat::pinned().memory;
+    assert_eq!(pinned, MemoryFormat::Split, "the pinned memory format");
+    for memory in [MemoryFormat::Fused, MemoryFormat::Words] {
+        let mut cfg = WhirTreeConfig::from_env().expect("the tree's configuration");
+        cfg.format.memory = memory;
+        cfg.format.registers = crate::tables::register::RegisterFormat::InRow;
+        cfg.compress = Some(super::super::wlfm::WlfmRate::Two);
+        match prove_whir_block_tree(&[], &[], &cfg, &StderrSink) {
+            Ok(_) => panic!("the tree proved a compressed {memory:?} block"),
+            Err(refused) => assert!(
+                refused.contains(&format!(
+                    "a compressed block is proved at the Split memory format alone, not {memory:?}"
+                )) && refused.contains("uncompressed file"),
+                "{memory:?}: {refused}"
+            ),
+        }
+    }
+    assert_eq!(compressed_memory_check(pinned, true), Ok(()));
+    for memory in [
+        MemoryFormat::Split,
+        MemoryFormat::Fused,
+        MemoryFormat::Words,
+    ] {
+        assert_eq!(compressed_memory_check(memory, false), Ok(()), "{memory:?}");
+    }
+}
+
 /// The leaf digests of `owned` under `format` (each leaf, in order) and the
 /// plan's identity's first eight bytes, with the prepared opening forced onto
 /// every ELF page with data when `dense`.

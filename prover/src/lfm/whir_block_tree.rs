@@ -2626,6 +2626,22 @@ type Planned = (
     (Vec<EarlyLeaf>, Vec<String>),
 );
 
+/// Every compressed file's verifier checks it under the pinned memory format,
+/// so a tree of another memory format is refused before anything is proved
+/// when a compression step is planned, rather than its file at verify. The
+/// uncompressed file (the top's) is the way to prove another memory format.
+pub(crate) fn compressed_memory_check(memory: MemoryFormat, compress: bool) -> Result<(), String> {
+    let pinned = BlockFormat::pinned().memory;
+    if compress && memory != pinned {
+        return Err(format!(
+            "a compressed block is proved at the {pinned:?} memory format alone, not {memory:?}: \
+             turn compression off (LAMBDA_VM_BLOCK_COMPRESS=0) and ship the top's uncompressed \
+             file to prove another memory format"
+        ));
+    }
+    Ok(())
+}
+
 /// ★ W3 on a real block, run the way a prover runs it:
 /// - the block proved in one proof at the production format;
 /// - the moment its statement is final (after phase A), the plan derived and
@@ -2662,6 +2678,7 @@ pub fn prove_whir_block_tree(
             format.registers
         ));
     }
+    compressed_memory_check(format.memory, cfg.compress.is_some())?;
     sink.line(&posture_line());
     sink.line(&base_line(&format.zf.base));
     sink.line(&format!("W3 ARGUE: {argue:?}"));
