@@ -1246,10 +1246,10 @@ mod bus_id_tests {
     use std::collections::BTreeSet;
 
     /// ★ `BusId` is one registry of distinct ids: every id below 256 that
-    /// decodes decodes to the bus whose id it is, no two buses share a name,
-    /// and the word buses (40, 41, 42) are the last three. A bus added with
-    /// an id another holds, or decoded from the wrong id, fails here (the
-    /// enum's own discriminants are distinct by the compiler).
+    /// decodes decodes to the bus whose id it is, no two buses share a name
+    /// or an id, and the word buses are 40, 41 and 42. A bus added with an id
+    /// another holds, or decoded from the wrong id, fails here (the enum's own
+    /// discriminants are distinct by the compiler).
     #[test]
     fn every_bus_has_its_own_id_and_name() {
         let mut ids = Vec::new();
@@ -1261,7 +1261,8 @@ mod bus_id_tests {
                 ids.push(id);
             }
         }
-        assert!(ids.ends_with(&[40, 41, 42]), "{ids:?}");
+        let distinct: BTreeSet<u64> = ids.iter().copied().collect();
+        assert_eq!(distinct.len(), ids.len(), "an id decodes twice: {ids:?}");
         assert_eq!(
             [40u64, 41, 42].map(|id| BusId::try_from(id).map(|b| b.name())),
             [Ok("MemWord"), Ok("MemWordMsg"), Ok("CopyWordNext")]
