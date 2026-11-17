@@ -245,6 +245,221 @@ pub struct GroupStamps {
     /// many columns the card evaluated in place and the host did.
     pub ood: f64,
     pub ood_counts: OodCounts,
+    /// Phase A: the constraint-sumcheck probe after the group's commit
+    /// ([`CsProbe`]); [`CsProbeState::Off`] unless it is on.
+    pub cs_probe: CsProbeStamp,
+}
+
+/// ⛔ A MEASUREMENT KNOB, never a proof's: after each group's commit, while
+/// its columns are still on the card and no next group has arrived, phase A
+/// runs the group's constraint sumcheck as phase B would
+/// ([`batched::probe_constraint_sumcheck`]) on a throwaway transcript of its
+/// own, and drops what it proved. It reads how much of that sumcheck the card's
+/// idle time in phase A holds. The proof is the same byte for byte: nothing
+/// the probe draws or sends reaches the block's transcript or the proof.
+///
+/// Only with the next group taken while the current one commits
+/// (`upload_ahead`) and under [`ArgueFormat::Batched`]; otherwise it does
+/// nothing. Production reads `LAMBDA_VM_PHASE_A_CS_PROBE=1` (off by default).
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct CsProbe {
+    pub on: bool,
+    /// A table the card declines (or a group with no store on the card) is
+    /// run on the host: a test without a card. Off, such a group is not
+    /// probed ([`CsProbeState::Declined`]).
+    pub host: bool,
+    /// Counts each group whose probe was decided (run or not), after it ran:
+    /// a test's producer holds the next group back on it.
+    pub decided: Option<Arc<AtomicUsize>>,
+}
+
+impl CsProbe {
+    /// [`CsProbe`] as `LAMBDA_VM_PHASE_A_CS_PROBE` asks: `1` on, anything
+    /// else off.
+    pub fn from_env() -> Self {
+        Self::from_value(std::env::var("LAMBDA_VM_PHASE_A_CS_PROBE").ok().as_deref())
+    }
+
+    /// [`Self::from_env`]'s reading of its variable.
+    pub fn from_value(value: Option<&str>) -> Self {
+        Self {
+            on: value.map(str::trim) == Some("1"),
+            ..Self::default()
+        }
+    }
+}
+
+/// What became of a group's probe ([`CsProbe`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CsProbeState {
+    /// The probe is off, or does not apply to this phase A.
+    #[default]
+    Off,
+    /// It ran to its end.
+    Ran,
+    /// The next group had arrived when the commit ended: not run.
+    Waiting,
+    /// The card declined the group or one of its tables: not run (or stopped
+    /// before its rounds).
+    Declined,
+    /// It failed otherwise; the prove goes on.
+    Failed,
+}
+
+/// A group's probe ([`CsProbe`]), in seconds.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CsProbeStamp {
+    pub state: CsProbeState,
+    pub tables: usize,
+    pub on_card: usize,
+    /// On the committer's thread from the commit's end to the probe's: its
+    /// set-up and rounds (of them, the host's later rounds), and the rest.
+    pub secs: f64,
+    pub setup: f64,
+    pub rounds: f64,
+    pub host_tail: f64,
+    /// When the group's commit ended and when the probe did, seconds since
+    /// phase A started.
+    pub committed_at: f64,
+    pub ended_at: f64,
+    /// What the next group's commit (or, after the last group, phase A's
+    /// end) waited for it: `max(probe end, ready) − max(commit end, ready)`,
+    /// where `ready` is when the next group's columns were up (or when the
+    /// producer said there were no more). `secs − held` ran in time the
+    /// committer had nothing else to do.
+    pub held: f64,
+}
+
+/// The probe's lines for the block's readout ([`CsProbe`]): a summary, then
+/// each group's `index:state:seconds:held`. Empty when no group's probe was
+/// on.
+#[doc(hidden)]
+pub fn cs_probe_lines(stamps: &[GroupStamps]) -> String {
+    if stamps.iter().all(|g| g.cs_probe.state == CsProbeState::Off) {
+        return String::new();
+    }
+    let count = |state: CsProbeState| stamps.iter().filter(|g| g.cs_probe.state == state).count();
+    let ran: Vec<&CsProbeStamp> = stamps
+        .iter()
+        .map(|g| &g.cs_probe)
+        .filter(|p| p.state == CsProbeState::Ran)
+        .collect();
+    let sum = |f: &dyn Fn(&CsProbeStamp) -> f64| ran.iter().map(|p| f(p)).sum::<f64>();
+    let held_all: f64 = stamps.iter().map(|g| g.cs_probe.held).sum();
+    let secs = sum(&|p| p.secs);
+    let peak = stamps.iter().map(|g| g.commit_reserved).max().unwrap_or(0) >> 20;
+    let per_group: Vec<String> = stamps
+        .iter()
+        .enumerate()
+        .map(|(g, s)| {
+            let p = &s.cs_probe;
+            let state = match p.state {
+                CsProbeState::Off => "off",
+                CsProbeState::Ran => "ran",
+                CsProbeState::Waiting => "wait",
+                CsProbeState::Declined => "declined",
+                CsProbeState::Failed => "failed",
+            };
+            format!("{g}:{state}:{:.4}:{:.4}", p.secs, p.held)
+        })
+        .collect();
+    format!(
+        "BLOCK CS PROBE: groups {} · ran {} · skipped with a group waiting {} · declined {} · \
+         failed {} · tables {} ({} on the card) · sumcheck {:.3}s (setup {:.3}, rounds {:.3}, \
+         host tail {:.3}) · hidden {:.3}s · held the next commit {:.3}s · last ran ended at \
+         {:.3}s · phase-A ledger peak {} MiB\nBLOCK CS PROBE GROUPS (group:state:s:held): {}\n",
+        stamps.len(),
+        ran.len(),
+        count(CsProbeState::Waiting),
+        count(CsProbeState::Declined),
+        count(CsProbeState::Failed),
+        ran.iter().map(|p| p.tables).sum::<usize>(),
+        ran.iter().map(|p| p.on_card).sum::<usize>(),
+        secs,
+        sum(&|p| p.setup),
+        sum(&|p| p.rounds),
+        sum(&|p| p.host_tail),
+        secs - sum(&|p| p.held),
+        held_all,
+        ran.iter().map(|p| p.ended_at).fold(0.0, f64::max),
+        peak,
+        per_group.join(" "),
+    )
+}
+
+/// The label that opens a group's probe transcript ([`CsProbe`]): no proof's
+/// transcript opens with it.
+const CS_PROBE_LABEL: &[u8; 32] = b"LAMBDAVM_PHASE_A_CS_PROBE_ONLY_1";
+
+/// A group's probe ([`CsProbe`]) on the committer's thread, right after its
+/// commit: the group's constraint sumcheck on a transcript of its own (the
+/// label, the group's index and its roots), its result dropped.
+fn run_cs_probe<F, E, T>(
+    group: usize,
+    tables: &[CommittedTable<'_, F, E>],
+    roots: &[Commitment],
+    config: &ChainConfig,
+    on_card: bool,
+    host: bool,
+) -> CsProbeStamp
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    let ArgueFormat::Batched {
+        bin_log_cells,
+        pack,
+    } = config.format.argue
+    else {
+        return CsProbeStamp::default();
+    };
+    if !on_card && !host {
+        return CsProbeStamp {
+            state: CsProbeState::Declined,
+            ..Default::default()
+        };
+    }
+    // Behind the commits: every stream this thread draws is a background one.
+    let _background = multilinear::gpu::background_streams();
+    let mut transcript = T::default();
+    transcript.append_bytes(CS_PROBE_LABEL);
+    transcript.append_bytes(&(group as u64).to_le_bytes());
+    for root in roots {
+        transcript.append_bytes(root);
+    }
+    let at = if on_card { Where::Device } else { Where::Host };
+    match batched::probe_constraint_sumcheck(tables, bin_log_cells, pack, at, host, &mut transcript)
+    {
+        Ok(probe) => CsProbeStamp {
+            state: CsProbeState::Ran,
+            tables: probe.tables,
+            on_card: probe.on_card,
+            setup: probe.setup,
+            rounds: probe.rounds,
+            host_tail: probe.host_tail,
+            ..Default::default()
+        },
+        Err(MlError::DeviceFailed {
+            stage: batched::PROBE_DECLINED,
+        }) => CsProbeStamp {
+            state: CsProbeState::Declined,
+            ..Default::default()
+        },
+        Err(error) => {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("BLOCK CS PROBE: group {group} failed: {error:?}"));
+            CsProbeStamp {
+                state: CsProbeState::Failed,
+                ..Default::default()
+            }
+        }
+    }
 }
 
 /// The label that opens a group's commit-time out-of-domain transcript
@@ -1837,6 +2052,40 @@ where
         H: WhirHash,
         T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
     {
+        Self::commit_groups_probed::<H, T>(
+            groups,
+            config,
+            drop_levels,
+            narrow,
+            upload_ahead,
+            mem,
+            spill,
+            CsProbe::default(),
+        )
+    }
+
+    /// [`Self::commit_groups_logged`] with the constraint-sumcheck probe
+    /// ([`CsProbe`]) after each group's commit, when it is on. A measurement:
+    /// the commits, the roots and the proof are the same either way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_groups_probed<H, T>(
+        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        config: &ChainConfig,
+        drop_levels: multilinear::whir_commit::TreeDrop,
+        narrow: Narrowing,
+        upload_ahead: bool,
+        mem: Option<Arc<BlockMem>>,
+        spill: Option<BlockSpill>,
+        probe: CsProbe,
+    ) -> Result<Self, MlError>
+    where
+        H: WhirHash,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+    {
+        // The probe runs only where the next group is taken beside a commit,
+        // and over a batched argue's constraint sumcheck.
+        let probing =
+            probe.on && upload_ahead && matches!(config.format.argue, ArgueFormat::Batched { .. });
         let mut tables = Vec::new();
         let mut ood = Vec::new();
         let mut spilled: Vec<Option<Arc<Parked>>> = Vec::new();
@@ -1943,15 +2192,29 @@ where
             stamp.polys = layout.num_polys();
             stamp.commit_base = multilinear::gpu::ledger_reserved();
             multilinear::gpu::reset_reserved_window();
+            // The probe reads the group's columns where the commit read them:
+            // its tables point at the store until the commit's scope ends.
+            let probe_on_card = probing && store.is_some();
+            if probe_on_card && let Some(store) = &store {
+                let mut first = 0usize;
+                for table in group.iter_mut() {
+                    table.set_resident(store.clone(), first);
+                    first += table.num_committed_columns();
+                }
+            }
             // Handles, not field elements: a table held narrow is read on the
             // host only by a host fallback.
             let handles = group_columns(&group);
             let columns: Vec<&ColumnOf<'_, _>> = handles.iter().collect();
             let resident = store.as_ref().map(|store| (&**store, 0));
+            let mut probed: Option<CsProbeStamp> = None;
             let committed = if upload_ahead {
+                // Whether the next group (or the producer's end) has come.
+                let next_came = std::sync::atomic::AtomicBool::new(false);
                 let (committed, next) = std::thread::scope(|scope| {
                     let (room_tx, room_rx) = std::sync::mpsc::channel::<()>();
                     let columns = &columns;
+                    let (group_ref, next_came, probe) = (&group, &next_came, &probe);
                     let committer = scope.spawn(move || {
                         let signal = move || {
                             let _ = room_tx.send(());
@@ -1965,12 +2228,41 @@ where
                             drop_levels,
                             &signal,
                         );
-                        (committed, Instant::now())
+                        let commit_end = Instant::now();
+                        // The probe, when nothing waits to be committed.
+                        let probed = match (&committed, probing) {
+                            (Ok(done), true) => {
+                                let mut stamp =
+                                    if next_came.load(std::sync::atomic::Ordering::SeqCst) {
+                                        CsProbeStamp {
+                                            state: CsProbeState::Waiting,
+                                            ..Default::default()
+                                        }
+                                    } else {
+                                        run_cs_probe::<F, E, T>(
+                                            group_index,
+                                            group_ref,
+                                            &done.roots,
+                                            config,
+                                            probe_on_card,
+                                            probe.host,
+                                        )
+                                    };
+                                stamp.secs = commit_end.elapsed().as_secs_f64();
+                                if let Some(decided) = &probe.decided {
+                                    decided.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                Some(stamp)
+                            }
+                            _ => None,
+                        };
+                        (committed, commit_end, probed, Instant::now())
                     });
                     // Beside the commit: the next group, then its columns once
                     // the commit has asked for its room (or ended).
                     let next = incoming.next();
                     let arrived = Instant::now();
+                    next_came.store(true, std::sync::atomic::Ordering::SeqCst);
                     let next = next.map(|group| {
                         let wide = mem.as_ref().map_or(0, |mem| {
                             let held = group.iter().map(held_bytes).sum();
@@ -1988,9 +2280,23 @@ where
                             Instant::now(),
                         )
                     });
-                    let (committed, commit_end) = committer
+                    let (committed, commit_end, probe_stamp, probe_end) = committer
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    // What the probe held back: the next commit once the next
+                    // group's columns were up, or phase A's end once the
+                    // producer had none.
+                    probed = probe_stamp.map(|mut stamp| {
+                        let ready = next.as_ref().map_or(arrived, |next| next.4);
+                        stamp.held = probe_end
+                            .max(ready)
+                            .saturating_duration_since(commit_end.max(ready))
+                            .as_secs_f64();
+                        stamp.ended_at = probe_end.saturating_duration_since(started).as_secs_f64();
+                        stamp.committed_at =
+                            commit_end.saturating_duration_since(started).as_secs_f64();
+                        stamp
+                    });
                     let next = next.map(|(group, store, wide, upload, uploaded)| {
                         // What the committer waited for once its commit ended:
                         // the group's arrival, then the rest of its upload —
@@ -2028,6 +2334,11 @@ where
             let committed = committed?;
             drop(columns);
             drop(handles);
+            if probe_on_card {
+                for table in group.iter_mut() {
+                    table.clear_resident();
+                }
+            }
             roots.extend(committed.roots);
             let retired = committed.retired;
             stamp.commit = committed.commit;
@@ -2038,6 +2349,11 @@ where
             stamp.commit_reserved = multilinear::gpu::reserved_window_peak();
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
+            if let Some(probed) = probed {
+                // The commit's own end, not the probe's.
+                stamp.committed_at = probed.committed_at;
+                stamp.cs_probe = probed;
+            }
             if upload_ahead && let Some(packed) = packing.take() {
                 install_and_spill(
                     packed,

@@ -22,6 +22,7 @@ pub mod merkle_cap_tests;
 pub mod one_row_tests;
 pub mod opening_width_tests;
 pub mod path_length_tests;
+pub mod phase_a_cs_probe_tests;
 pub mod phase_b_overlap_tests;
 pub mod proof_options_tests;
 pub mod prove_verify_roundtrip_tests;
