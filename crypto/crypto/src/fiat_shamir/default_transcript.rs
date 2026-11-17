@@ -1,6 +1,6 @@
 use crate::fiat_shamir::is_transcript::{IsStarkTranscript, IsTranscript};
 use crate::fiat_shamir::transcript_hash::{
-    Blake3TranscriptHash, KeccakTranscriptHash, TranscriptHash,
+    Blake3TranscriptHash, KeccakTranscriptHash, SQUEEZE_BYTES, TranscriptHash, WIDE_SQUEEZE_BYTES,
 };
 
 use core::marker::PhantomData;
@@ -13,10 +13,15 @@ use math::{
     traits::AsBytes,
 };
 
-/// Bytes produced by one Keccak squeeze; the duplex output buffer holds this
-/// many bytes and hands them out `8` at a time (`SQUEEZE_LEN / 8` u64 candidates
-/// per squeeze).
-const SQUEEZE_LEN: usize = 32;
+/// Bytes the duplex output buffer can hold: a wide squeeze's
+/// ([`TranscriptHash::SQUEEZE_LEN`] is 32 for every configuration but a wide
+/// one, which hands out 64). It is handed out `8` at a time
+/// (`T::SQUEEZE_LEN / 8` u64 candidates per squeeze).
+const OUT_BUF_LEN: usize = WIDE_SQUEEZE_BYTES;
+
+/// Bytes a squeeze re-absorbs to advance the chain: the digest, whatever the
+/// configuration hands out.
+const SQUEEZE_LEN: usize = SQUEEZE_BYTES;
 
 /// Bytes in a field element, for the window alignment the counter reports.
 #[cfg(feature = "hash-metrics")]
@@ -42,11 +47,12 @@ const FELT_BYTES: usize = 8;
 pub struct DefaultTranscript<F: HasDefaultTranscript, T: TranscriptHash = KeccakTranscriptHash> {
     hasher: T::Digest,
     /// Duplex output buffer: bytes squeezed from the sponge, consumed 8 at a
-    /// time by field/`u64` sampling. Positions `[out_pos, SQUEEZE_LEN)` are the
-    /// bytes not yet handed out; `out_pos == SQUEEZE_LEN` means "empty, squeeze
-    /// to refill". Absorbing new data invalidates it (see `append_bytes`) so a
-    /// squeeze can never reflect input appended after it was produced.
-    out_buf: [u8; SQUEEZE_LEN],
+    /// time by field/`u64` sampling. Positions `[out_pos, T::SQUEEZE_LEN)` are
+    /// the bytes not yet handed out; `out_pos == T::SQUEEZE_LEN` means "empty,
+    /// squeeze to refill". Absorbing new data invalidates it (see
+    /// `append_bytes`) so a squeeze can never reflect input appended after it
+    /// was produced.
+    out_buf: [u8; OUT_BUF_LEN],
     out_pos: usize,
     /// ★ Bytes absorbed since the sponge was last reset by a squeeze — the
     /// WINDOW an in-guest verifier re-slices into field elements every 8 bytes.
@@ -113,9 +119,9 @@ where
     pub fn new(data: &[u8]) -> Self {
         let mut res = Self {
             hasher: T::Digest::new(),
-            out_buf: [0u8; SQUEEZE_LEN],
+            out_buf: [0u8; OUT_BUF_LEN],
             // Empty: the first sample forces a squeeze.
-            out_pos: SQUEEZE_LEN,
+            out_pos: T::SQUEEZE_LEN,
             #[cfg(feature = "hash-metrics")]
             window: 0,
             #[cfg(feature = "hash-metrics")]
@@ -150,30 +156,51 @@ where
     /// straight-line code — the keccak arm keeps the instruction sequence it
     /// had before this became a choice.
     pub fn sample(&mut self) -> [u8; 32] {
+        let out = self.squeeze();
+        let mut result_hash = [0u8; SQUEEZE_LEN];
+        result_hash.copy_from_slice(&out[..SQUEEZE_LEN]);
+        result_hash
+    }
+
+    /// One squeeze in the configuration's width: [`Self::sample`]'s 32 bytes,
+    /// then, under a wide configuration ([`TranscriptHash::SQUEEZE_LEN`] = 64),
+    /// the 32 output bytes the same final compression produced past them,
+    /// reversed under the same convention. Only the first 32 are re-absorbed.
+    ///
+    /// The buffer is invalidated here as in [`Self::sample`]; the caller that
+    /// hands the bytes out ([`Self::next_sample_u64`]) installs them.
+    fn squeeze(&mut self) -> [u8; OUT_BUF_LEN] {
+        const {
+            assert!(T::SQUEEZE_LEN == SQUEEZE_BYTES || T::SQUEEZE_LEN == WIDE_SQUEEZE_BYTES);
+        }
         // ★ Hash-agnostic, and deliberately here rather than inside a digest:
         // a counter that lives in keccak reads ZERO for an algebraic
         // transcript, which is indistinguishable from "no transcript ran".
         crate::hash_metrics::count_transcript_squeeze::<T::Digest>();
-        let mut result_hash: [u8; 32] = self.hasher.finalize_reset().into();
+        let mut out = [0u8; OUT_BUF_LEN];
+        T::finalize_squeeze_reset(&mut self.hasher, &mut out);
         if T::REVERSES_SQUEEZE {
-            result_hash.reverse();
+            out[..SQUEEZE_LEN].reverse();
+            if T::SQUEEZE_LEN == WIDE_SQUEEZE_BYTES {
+                out[SQUEEZE_LEN..].reverse();
+            }
         }
-        self.hasher.update(result_hash);
-        self.out_pos = SQUEEZE_LEN;
+        self.hasher.update(&out[..SQUEEZE_LEN]);
+        self.out_pos = T::SQUEEZE_LEN;
         // A new window, holding the 32 bytes just re-absorbed.
         #[cfg(feature = "hash-metrics")]
         {
             self.window = SQUEEZE_LEN;
         }
-        result_hash
+        out
     }
 
     /// Next 64-bit candidate from the duplex output buffer, refilling with one
     /// squeeze when fewer than 8 bytes remain. Big-endian, matching the byte
     /// order `sample_u64` used when it read directly from `sample()`.
     ///
-    /// ★ `SQUEEZE_LEN` is 32 and every read is 8, so `out_pos` only ever takes
-    /// the values `0, 8, 16, 24, 32` and a candidate is always a whole 8-byte
+    /// ★ `T::SQUEEZE_LEN` is 32 (or 64) and every read is 8, so `out_pos` only
+    /// ever takes multiples of 8 and a candidate is always a whole 8-byte
     /// group — never two halves of adjacent ones. That is what lets a
     /// configuration whose squeeze is four canonical felts promise
     /// `CANDIDATES_PER_COORDINATE = Some(1)`: the felt boundaries and the read
@@ -181,8 +208,8 @@ where
     /// buffer wholesale rather than partially, so the alignment survives
     /// interleaved absorbs.
     fn next_sample_u64(&mut self) -> u64 {
-        if self.out_pos + 8 > SQUEEZE_LEN {
-            self.out_buf = self.sample();
+        if self.out_pos + 8 > T::SQUEEZE_LEN {
+            self.out_buf = self.squeeze();
             self.out_pos = 0;
         }
         let mut bytes = [0u8; 8];
@@ -264,7 +291,7 @@ where
         // Absorbing new input invalidates any buffered squeeze output: a
         // subsequent challenge must depend on this input, so drop the bytes
         // squeezed before it.
-        self.out_pos = SQUEEZE_LEN;
+        self.out_pos = T::SQUEEZE_LEN;
         crate::hash_metrics::count_transcript_absorb::<T::Digest>();
         #[cfg(feature = "hash-metrics")]
         {
@@ -286,7 +313,7 @@ where
         // 24-byte buffer and calls the sink once, so the two happen to agree —
         // a field or a serialisation that streams in pieces would not, and the
         // counter should follow the sponge rather than the argument list.
-        self.out_pos = SQUEEZE_LEN;
+        self.out_pos = T::SQUEEZE_LEN;
         // ⚠ Per `update`, the unit the absorb counter already uses and the one
         // `WindowRecorder` mirrors: an element streamed in pieces is several
         // absorbs in both instruments or in neither.

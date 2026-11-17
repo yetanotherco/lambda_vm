@@ -585,18 +585,43 @@ impl Blake3Chain {
     /// `block_len = 0`, which is one compression, not zero — and is what
     /// `blake3::hash(b"")` is at 7 rounds.
     pub fn finalize_digest(&self) -> [u8; 32] {
-        let out = compress_block(
-            &self.cv,
-            &self.block_words(),
-            self.block_len as u32,
-            self.flags(true),
-            self.rounds,
-        );
+        let out = self.finalize_output_words();
         let mut digest = [0u8; 32];
         for i in 0..8 {
             digest[4 * i..4 * i + 4].copy_from_slice(&out[i].to_le_bytes());
         }
         digest
+    }
+
+    /// The final compression's whole 16-word output: words `0..8` are the
+    /// digest, words `8..16` the second half of BLAKE3's 64-byte output
+    /// (`out[i + 8] = v[i + 8] ⊕ h[i]`, the chaining value fed forward).
+    fn finalize_output_words(&self) -> [u32; 16] {
+        compress_block(
+            &self.cv,
+            &self.block_words(),
+            self.block_len as u32,
+            self.flags(true),
+            self.rounds,
+        )
+    }
+
+    /// ★ The final compression's 64 output bytes, little-endian word by word:
+    /// the [`Self::finalize_digest`] bytes, then the 32 bytes the same
+    /// compression produces past them. No extra compression.
+    ///
+    /// The final block carries `ROOT` and the counter is 0, so for a message
+    /// of at most 1024 bytes at 7 rounds this is the first 64 bytes of the
+    /// `blake3` crate's extended output (`Hasher::finalize_xof`)
+    /// (`the_64_byte_output_is_the_blake3_crates_xof`). Past one chunk it is
+    /// this construction's own, as the digest is.
+    pub fn finalize_xof64(&self) -> [u8; 64] {
+        let out = self.finalize_output_words();
+        let mut bytes = [0u8; 64];
+        for (i, w) in out.iter().enumerate() {
+            bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        bytes
     }
 }
 
@@ -718,6 +743,13 @@ impl Blake3Std {
     /// The 32-byte digest of the message absorbed so far.
     pub fn finalize_digest(&self) -> [u8; 32] {
         self.0.finalize_digest()
+    }
+
+    /// The final compression's 64 output bytes
+    /// ([`Blake3Chain::finalize_xof64`]): for a message of at most 1024 bytes,
+    /// the first 64 bytes of the `blake3` crate's extended output.
+    pub fn finalize_xof64(&self) -> [u8; 64] {
+        self.0.finalize_xof64()
     }
 }
 
@@ -1005,6 +1037,51 @@ mod tests {
             parent.finalize_digest(),
             blake3_parent_rounds(&l, &r, BLAKE3_STANDARD_ROUNDS)
         );
+    }
+
+    /// ★ The 64-byte output is the `blake3` crate's extended output: its first
+    /// 64 bytes, at every length up to one chunk (one block, several, an empty
+    /// message, a block boundary), through the same [`Blake3Std`] a transcript
+    /// holds. The first half is the digest.
+    #[test]
+    fn the_64_byte_output_is_the_blake3_crates_xof() {
+        for len in (0..=1024usize).step_by(7).chain([63, 64, 65, 128, 1023, 1024]) {
+            let msg = message(len);
+            let mut want = [0u8; 64];
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&msg);
+            hasher.finalize_xof().fill(&mut want);
+            let mut ours = Blake3Std::new();
+            digest::Update::update(&mut ours, &msg);
+            let got = ours.finalize_xof64();
+            assert_eq!(got, want, "64 bytes of output at length {len}");
+            assert_eq!(got[..32], *blake3::hash(&msg).as_bytes(), "length {len}");
+        }
+    }
+
+    /// NEGATIVE CONTROL for the 64-byte output: its second half is the state's
+    /// upper half fed forward with the chaining value (`v[i + 8] ⊕ h[i]`).
+    /// Without that XOR it is not the crate's, past the first block (where the
+    /// chaining value is a previous block's, not the IV) as on it.
+    #[test]
+    fn the_second_half_without_the_chaining_value_is_not_the_xof() {
+        for len in [0usize, 40, 64, 65, 200, 1024] {
+            let msg = message(len);
+            let mut chain = Blake3Chain::with_rounds(BLAKE3_STANDARD_ROUNDS);
+            chain.update(&msg);
+            let out = chain.finalize_output_words();
+            let unfed: [u32; 8] = core::array::from_fn(|i| out[i + 8] ^ chain.cv[i]);
+            let mut want = [0u8; 64];
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&msg);
+            hasher.finalize_xof().fill(&mut want);
+            let mut second = [0u8; 32];
+            for (i, w) in unfed.iter().enumerate() {
+                second[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            assert_ne!(second, want[32..], "length {len}");
+            assert_eq!(chain.finalize_xof64()[32..], want[32..], "length {len}");
+        }
     }
 
     /// NEGATIVE CONTROL for the anchor: at 6 rounds it must not match, or the

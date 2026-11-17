@@ -126,7 +126,33 @@ pub trait TranscriptHash: 'static {
     /// no candidates and returns an uninitialised one, and the representation
     /// that cannot spell it is better than the check that rejects it.
     const CANDIDATES_PER_COORDINATE: Option<NonZeroUsize>;
+
+    /// ★ Bytes one squeeze hands to the sampler: [`SQUEEZE_BYTES`] (the
+    /// digest), or [`WIDE_SQUEEZE_BYTES`] for a configuration whose hash's
+    /// final compression has 64 bytes of output
+    /// ([`Self::finalize_squeeze_reset`]).
+    ///
+    /// Only the first 32 bytes are re-absorbed to advance the chain, whatever
+    /// this says: the second 32 are output the same compression already
+    /// produced, so a wide squeeze hands out eight candidates for the cost of
+    /// one compression where a narrow one hands out four.
+    const SQUEEZE_LEN: usize = SQUEEZE_BYTES;
+
+    /// Finalize `hasher` into the first [`Self::SQUEEZE_LEN`] bytes of `out`,
+    /// UNREVERSED, and reset it. The first 32 bytes are the digest
+    /// (`finalize_reset`); a wide configuration writes the 32 its final
+    /// compression produces past them.
+    fn finalize_squeeze_reset(hasher: &mut Self::Digest, out: &mut [u8; WIDE_SQUEEZE_BYTES]) {
+        let digest: [u8; 32] = hasher.finalize_reset().into();
+        out[..SQUEEZE_BYTES].copy_from_slice(&digest);
+    }
 }
+
+/// Bytes of a squeeze that is the digest alone.
+pub const SQUEEZE_BYTES: usize = 32;
+
+/// Bytes of a squeeze that is a final compression's whole output.
+pub const WIDE_SQUEEZE_BYTES: usize = 64;
 
 /// The keccak-256 configuration — what every `DefaultTranscript` is unless a
 /// caller says otherwise, and byte-for-byte the transcript this system has
@@ -233,4 +259,48 @@ impl TranscriptHash for Blake3StdTranscriptHash {
 
     /// [`Blake3TranscriptHash`]'s schedule, for the same reason.
     const CANDIDATES_PER_COORDINATE: Option<NonZeroUsize> = NonZeroUsize::new(2);
+}
+
+/// ★ [`Blake3StdTranscriptHash`] with **64-byte squeezes**: a squeeze hands out
+/// the final compression's whole output — the digest, then the 32 bytes
+/// BLAKE3's own extended output puts after it ([`Blake3Std::finalize_xof64`])
+/// — so eight candidates a squeeze instead of four, at no extra compression.
+///
+/// Everything else is [`Blake3StdTranscriptHash`]'s: the hasher, the grind
+/// (`state()` is the 32-byte digest), the re-absorb of the 32 digest bytes
+/// that advances the chain, the reversal and the two-candidate schedule. The
+/// second 32 bytes are reversed as the first are, so every candidate is one
+/// little-endian `u64` of output words, as today's first four are, and a
+/// squeeze's first four candidates are the narrow configuration's.
+///
+/// The extended bytes are never absorbed: the next squeeze's input is the
+/// digest and what is appended after it, exactly as under
+/// [`Blake3StdTranscriptHash`]. They are pseudorandom output of the same
+/// compression whose first half the chain continues from, so a challenge
+/// drawn from them is as bound to the transcript so far as one drawn from the
+/// first half.
+///
+/// Opt-in: a proof under it is another proof format (its configuration is a
+/// verifier constant, named in the statement that binds it), and is refused by
+/// a verifier under [`Blake3StdTranscriptHash`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blake3StdSqueeze64TranscriptHash;
+
+impl TranscriptHash for Blake3StdSqueeze64TranscriptHash {
+    type Digest = Blake3Std;
+
+    const NAME: &'static str = "blake3-std-squeeze64";
+
+    /// [`Blake3StdTranscriptHash`]'s, for both halves.
+    const REVERSES_SQUEEZE: bool = true;
+
+    /// [`Blake3StdTranscriptHash`]'s schedule.
+    const CANDIDATES_PER_COORDINATE: Option<NonZeroUsize> = NonZeroUsize::new(2);
+
+    const SQUEEZE_LEN: usize = WIDE_SQUEEZE_BYTES;
+
+    fn finalize_squeeze_reset(hasher: &mut Self::Digest, out: &mut [u8; WIDE_SQUEEZE_BYTES]) {
+        *out = hasher.finalize_xof64();
+        digest::Reset::reset(hasher);
+    }
 }
