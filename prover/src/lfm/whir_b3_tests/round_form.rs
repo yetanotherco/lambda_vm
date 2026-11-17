@@ -285,7 +285,15 @@ enum Published {
 /// `publish`, every draw the chain makes and its closing claim and weight
 /// are published after it.
 fn emit(shape: &ChainShape, publish: bool) -> (LfmProgram, Vec<Published>, chain_draws::Draws) {
-    let mut b = builder();
+    emit_with(builder(), shape, publish)
+}
+
+/// [`emit`] on the builder `b`.
+fn emit_with(
+    mut b: super::super::builder::LfmBuilder,
+    shape: &ChainShape,
+    publish: bool,
+) -> (LfmProgram, Vec<Published>, chain_draws::Draws) {
     let head = (shape.num_vars + 4) as u32;
     let total = head
         + (0..shape.rounds())
@@ -1217,4 +1225,20 @@ fn a_round_form_chain_longer_than_its_union_emits_no_chain() {
         cfg.rounds(c.n + 2)
     );
     let _ = ChainShape::for_hash(&cfg, c.n + 2, WrapHash::Blake3);
+}
+
+/// ★ The round form is emitted only where a gate executes it against the
+/// host (binary BLAKE3 trees here, the felt hash's in the RPX chain gate):
+/// the same chain on a Keccak builder is refused at emission.
+#[test]
+#[should_panic(expected = "the round form is emitted over binary BLAKE3 or felt-hash trees only")]
+fn a_round_form_chain_under_another_hash_is_refused_at_emission() {
+    let c = cases()[0];
+    let shape = ChainShape::for_hash(&config(&c), c.n, WrapHash::Keccak);
+    assert!(shape.whir());
+    let _ = emit_with(
+        super::super::builder::LfmBuilder::new().with_wrap_hash(WrapHash::Keccak),
+        &shape,
+        false,
+    );
 }

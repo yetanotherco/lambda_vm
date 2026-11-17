@@ -1135,6 +1135,15 @@ fn emit_chain(
         "one set of wires per scheduled round"
     );
     assert_eq!(roots.len(), shape.trees_at(0), "one root per round-0 tree");
+    // The round form is executed against host proofs under BLAKE3's binary
+    // trees and the felt hash's: no other hash's or arity's round form is
+    // gated, and none is emitted.
+    assert!(
+        !shape.whir()
+            || (shape.arity == 2
+                && matches!(b.wrap_hash(), WrapHash::Blake3 | WrapHash::Algebraic)),
+        "the round form is emitted over binary BLAKE3 or felt-hash trees only"
+    );
     let one = b.ext_const(&FEE::one());
     let (grind_folding, grind_ood, grind_query) = shape.grind;
 

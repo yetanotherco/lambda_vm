@@ -2668,3 +2668,54 @@ fn the_legacy_nonce_layout_reproduces_the_bytes_from_before_p2() {
         );
     }
 }
+
+/// ★ THE RPX ROUND-FORM GATE. Under the felt hash's binary trees and the RPX
+/// transcript, every round-form chain of [`ROUND_FORM_COST_SHAPES`] the host
+/// accepts executes (the schedule and the closed forms are gated above), and
+/// its final value off, a later round's opened value off and a sumcheck
+/// evaluation off are each refused by the host and have no execution.
+#[test]
+fn a_round_form_chain_executes_on_a_proof_the_host_accepts() {
+    for &(n, k0, k, s, bits, g) in &ROUND_FORM_COST_SHAPES {
+        let cfg = round_form_config(n, k0, k, s, bits, g);
+        let f = fixture_with(&cfg, n);
+        assert!(f.shape.whir());
+        let program = chain_program(&f.shape);
+        let runs = |proof: &ChainProof<F, E>| {
+            execute(
+                &program,
+                &[chain_arena(&f, proof)],
+                &crate::hash_pin::BLOCK_HASHER,
+            )
+            .is_ok()
+        };
+        assert!(
+            runs(&f.proof),
+            "S={n} {:?} queries {:?}: the machine refused an accepted proof",
+            f.shape.schedule,
+            f.shape.round_queries
+        );
+        let host_accepts = |proof: &ChainProof<F, E>| {
+            let mut t = Recording::new();
+            verify::<F, E, _, RpxWhir>(proof, &f.root_bytes, &f.z, f.y, &f.domain, &cfg, &mut t)
+                .is_ok()
+        };
+        let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
+        let mut forged = f.proof.clone();
+        forged.final_value += FEE::one();
+        sites.push(("the final value", forged));
+        let mut forged = f.proof.clone();
+        forged.rounds[0].sumcheck[0].evaluations[1] += FEE::one();
+        sites.push(("a sumcheck evaluation", forged));
+        let mut forged = f.proof.clone();
+        match &mut forged.rounds[1].openings {
+            RoundOpenings::Extension(p) => p.current[0].values[0] += FEE::one(),
+            _ => unreachable!("round 1 is extension-valued"),
+        }
+        sites.push(("round 1's opened value", forged));
+        for (name, forged) in &sites {
+            assert!(!host_accepts(forged), "S={n} {name}: host");
+            assert!(!runs(forged), "S={n} {name}: no execution");
+        }
+    }
+}
