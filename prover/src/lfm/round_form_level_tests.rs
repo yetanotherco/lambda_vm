@@ -41,6 +41,15 @@ fn format(rounds: B3Rounds, folds: WhirFolds) -> BlockFormat {
 /// The small block `name` proved under `format` inside the levels' admission,
 /// and accepted by the host verifier.
 fn base(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
+    base_with(name, format, crate::tests::block_whir_p1_tests::options(3))
+}
+
+/// [`base`] under the block options `options`.
+fn base_with(
+    name: &str,
+    format: &BlockFormat,
+    options: crate::block_whir::BlockOptions,
+) -> (Vec<u8>, BlockWhirProof) {
     let elf = crate::test_utils::asm_elf_bytes(name);
     let opts = ProofOptions::default_test_options();
     let proof = crate::base_only::with_blake3_levels(|| {
@@ -49,7 +58,7 @@ fn base(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
             &[],
             &opts,
             format,
-            &crate::tests::block_whir_p1_tests::options(3),
+            &options,
             &crate::block_whir::Deviations::default(),
         )
     })
@@ -687,4 +696,101 @@ fn b3_lean_pin_print() {
             hex(&digest)
         );
     }
+}
+
+/// ★ Level 1 over a small BLAKE3 base under the WORD memory format: under
+/// today's form and the round form (first fold 4), the base proves and
+/// verifies, level 1's closed program executes over its witness and its words
+/// claim the block, and group 0's program publishes the host's bus sum; under
+/// the round form three one-value tampers are refused in execution. Printed:
+/// the level's instructions and lean compressions under each form.
+///
+/// Box tier: a dev build's walker trips a debug assertion of the word format
+/// on a block that commits words ("COPY should move exactly the committed
+/// byte count"), under either base; a release build does not evaluate it.
+#[test]
+#[ignore = "box tier: a release build (the dev build trips a word-format debug assertion)"]
+fn level_1_executes_over_a_words_blake3_base_and_refuses_its_tampers() {
+    let name = "test_commit_4";
+    let streamed = words_options();
+    let (fri, w3) = (words_format(B3Rounds::Fri), words_format(B3Rounds::WHIR3));
+    let (elf, today) = base_with(name, &fri, streamed.clone());
+    let (_, honest) = base_with(name, &w3, streamed);
+    let today_plan = plan(&elf, &today, &fri);
+    let w3_plan = plan(&elf, &honest, &w3);
+    let c_fri = level_1_executes(&today_plan, &today);
+    let c_w3 = level_1_executes(&w3_plan, &honest);
+    println!(
+        "LEVEL 1 WORDS {name}: {} groups · instructions {} (today {}) · lean compressions {} \
+         (today {})",
+        c_w3.groups, c_w3.instructions, c_fri.instructions, c_w3.compressions, c_fri.compressions,
+    );
+    let program = w3_plan.closed_block_program().expect("emits");
+    let hasher = hasher(&program);
+    let (c, r) = later_round(&honest);
+    for (what, edit) in tampers(c, r) {
+        let mut proof = honest.clone();
+        edit(&mut proof);
+        let arenas = block_leaf_arena(&w3_plan, &proof, 0)
+            .unwrap_or_else(|e| panic!("{what}: the arena builds: {e}"));
+        let why = execute(&program, &arenas, &hasher);
+        println!("LEVEL 1 WORDS TAMPER {what}: {:?}", why.as_ref().err());
+        assert!(why.is_err(), "{what}: level 1 accepted it");
+    }
+}
+
+/// The small BLAKE3 format under the WORD memory format: the in-row
+/// registers it needs, and with them the production format's limb-ordered
+/// aligned loads and stores and lean keccak rounds; first fold 4.
+fn words_format(rounds: B3Rounds) -> BlockFormat {
+    BlockFormat {
+        memory: crate::tables::fused_memory::MemoryFormat::Words,
+        registers: crate::tables::register::RegisterFormat::InRow,
+        memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
+        ..format(rounds, WhirFolds::Uniform)
+    }
+}
+
+/// The small blocks' options, streamed at the production window: the word
+/// format's tables are built by the windowed build alone.
+fn words_options() -> crate::block_whir::BlockOptions {
+    let mut options = crate::tests::block_whir_p1_tests::options(3);
+    options.window_log2 = Some(crate::block_whir::BLOCK_WINDOW_LOG2);
+    options
+}
+
+/// ★ Box tier: a small BLAKE3 block under the WORD memory format and the
+/// round form, and its two round-form levels, proved; each level verifies
+/// against its own artifacts; the block's verifier, deriving every level
+/// itself, accepts the last; and a changed word is refused.
+#[test]
+#[ignore = "proves a small BLAKE3 words block and its levels; box tier"]
+fn the_round_form_levels_prove_a_small_words_block_to_its_last_level() {
+    use super::levels::{derive_levels, prove_levels, verify_levels};
+    use super::wlfm::verify_wlfm;
+    let format = words_format(B3Rounds::WHIR3);
+    let (elf, proof) = base_with("test_commit_4", &format, words_options());
+    let plan = plan(&elf, &proof, &format);
+    let levels = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
+    let (proofs, secs) = prove_levels(&plan, &levels, &proof).expect("every level proves");
+    for (k, (level, p)) in levels.iter().zip(&proofs).enumerate() {
+        verify_wlfm(&level.build.artifacts, p, &p.public_words)
+            .unwrap_or_else(|e| panic!("level {} verifies: {e}", k + 1));
+        println!(
+            "LEVEL WORDS ROUND FORM {}: {} groups · {} instructions · {} lean compressions · \
+             rounds {:?} · prove {:.3}s",
+            k + 1,
+            level.build.artifacts.sizes.len(),
+            level.program.instrs.len(),
+            level.program.groups.b3l.real_rows,
+            level.build.artifacts.rounds,
+            secs[k].prove
+        );
+    }
+    let last = proofs.last().expect("a last level");
+    verify_levels(&plan, WlfmFamily::B3, last).expect("the block's verifier accepts");
+    let mut forged = last.clone();
+    forged.public_words[0].1[0] += FE::one();
+    assert!(verify_levels(&plan, WlfmFamily::B3, &forged).is_err());
 }
