@@ -556,3 +556,166 @@ fn blake3_level0_census_on_a_real_block() {
         "a tampered sent value is refused"
     );
 }
+
+/// Whether leaf `k` has no execution over `proof`: its arena is refused as
+/// laid out, or the executor refuses it (a length the program does not
+/// declare included).
+fn leaf_refuses(plan: &WhirBlockPlan, proof: &BlockWhirProof, k: usize) -> bool {
+    let program = plan.leaf_program(k).expect("the leaf emits");
+    match block_leaf_arena(plan, proof, k) {
+        Err(_) => true,
+        Ok(arenas) => execute(
+            &program,
+            &arenas,
+            &program.hasher(<BlockFamily as ProofFamily>::SOCKET),
+        )
+        .is_err(),
+    }
+}
+
+/// ★ THE ROUND-FORM LEAF GATE. A small block's BLAKE3 base under the WHIR
+/// round form (shrink 3, caps by Q: the base's own format word for it), one
+/// joint round-0 tree a run and grouped runs:
+/// - the leaf's statement is the host's: its id is the digest of the host's
+///   statement bytes, which carry the format's own tag (`block_format_tag`,
+///   the round form's word in it) and the chains' fold word with the round
+///   form's bit and the caps-by-Q bit;
+/// - every leaf executes over the honest proof under both lowerings, publishes
+///   the plan's id, and the leaves' shares cancel;
+/// - each form's leaves refuse the other form's proof of the same block
+///   (in-guest, by execution), and their ids differ;
+/// - a later round's opened value (the fold value its shift claim carries) is
+///   refused by the leaf holding its group, and by the host.
+#[test]
+#[ignore = "proves small BLAKE3 blocks; box tier"]
+fn blake3_round_form_leaves_execute_and_refuse_the_other_form() {
+    use crate::block_whir::{B3Rounds, block_format_tag, block_frame, block_statement_bytes};
+    use multilinear::whir_chain::{FOLD_WORD_WHIR, FOLD_WORD_WHIR_CAPS_BY_Q, RoundForm, WhirFolds};
+    let mut fri = many_groups(BaseFormat::B3_WHIR);
+    fri.group = GroupFold::Indexed;
+    fri.zf.whir_trees = Round0Trees::One;
+    fri.zf.whir_folds = WhirFolds::Uniform;
+    let w = BlockFormat {
+        b3_rounds: B3Rounds::WHIR3,
+        ..fri
+    };
+    let opts = ProofOptions::default_test_options();
+    for (name, leaves) in [("all_instructions_64", 2), ("test_commit_4", 1)] {
+        let (elf, honest) = b3_block(name, &w, 3);
+        let (_, today) = b3_block(name, &fri, 3);
+
+        // The statement: the host's bytes, the format's tag and fold word.
+        let config = block_frame(honest.statement(), &elf, &opts, &w)
+            .expect("the frame")
+            .config;
+        match config.format.rounds {
+            RoundForm::Whir(r) => assert!(r.caps_by_queries(), "{name}: caps by Q"),
+            RoundForm::Fri => panic!("{name}: the round form's config"),
+        }
+        let word = config.fold_word();
+        assert_ne!(word & FOLD_WORD_WHIR, 0, "{name}: the round form's bit");
+        assert_ne!(
+            word & FOLD_WORD_WHIR_CAPS_BY_Q,
+            0,
+            "{name}: the caps-by-Q bit"
+        );
+        let tag = block_format_tag(&w);
+        assert_ne!(tag, block_format_tag(&fri), "{name}: each form its tag");
+        let suffix = w.b3_rounds.tag_word();
+        assert!(
+            !suffix.is_empty() && tag.ends_with(suffix.as_bytes()),
+            "{name}: the tag ends with the round form's word {suffix}"
+        );
+        let bytes = block_statement_bytes(
+            honest.statement(),
+            &tag,
+            &crate::statement::elf_digest(&elf),
+            &config,
+            w.memory,
+        );
+        assert!(
+            bytes.starts_with(&tag),
+            "{name}: the statement opens on its tag"
+        );
+        assert!(
+            bytes.windows(8).any(|b| b == word.to_le_bytes()),
+            "{name}: the statement carries the fold word"
+        );
+        let plan = b3_plan(&elf, &honest, &w, leaves);
+        assert_eq!(
+            plan.id(),
+            &crate::statement::elf_digest(&bytes),
+            "{name}: the leaf's statement is the host's"
+        );
+
+        // Every leaf executes, under both lowerings.
+        for lean in [true, false] {
+            let plan = b3_plan(&elf, &honest, &w, leaves).with_b3_lean(lean);
+            let layout = plan.child_layout();
+            let id = id_words(plan.id());
+            let mut sum = FEE::zero();
+            for k in 0..plan.partition().num_leaves() {
+                let words = run_leaf(&plan, &honest, k)
+                    .unwrap_or_else(|e| panic!("{name} lean {lean} leaf {k}: refused: {e}"));
+                assert_eq!(words[layout.id(0)], id[0]);
+                assert_eq!(words[layout.id(1)], id[1]);
+                sum += word_as_ext(&words[layout.sum()]).expect("an extension share");
+            }
+            assert_eq!(sum, FEE::zero(), "{name} lean {lean}: the shares cancel");
+        }
+
+        // Each form's leaves refuse the other's proof.
+        let fri_plan = b3_plan(&elf, &today, &fri, leaves);
+        assert_ne!(fri_plan.id(), plan.id(), "{name}: the forms' ids differ");
+        for k in 0..fri_plan.partition().num_leaves() {
+            run_leaf(&fri_plan, &today, k)
+                .unwrap_or_else(|e| panic!("{name}: today's leaf {k} refused today's: {e}"));
+            assert!(
+                leaf_refuses(&fri_plan, &honest, k),
+                "{name}: today's leaf {k} on a round-form proof"
+            );
+        }
+        for k in 0..plan.partition().num_leaves() {
+            assert!(
+                leaf_refuses(&plan, &today, k),
+                "{name}: a round-form leaf {k} on today's proof"
+            );
+        }
+
+        // A later round's opened value: its claim's fold value moves.
+        let site = honest
+            .proof
+            .columns
+            .iter()
+            .enumerate()
+            .find_map(|(g, column)| {
+                column.polys.iter().enumerate().find_map(|(c, chain)| {
+                    chain.rounds.iter().enumerate().skip(1).find_map(|(r, round)| {
+                        matches!(&round.openings, RoundOpenings::Extension(p) if !p.current.is_empty())
+                            .then_some((g, c, r))
+                    })
+                })
+            });
+        let (g, c, r) = site.expect("a later round opens its tree");
+        let mut forged = honest.clone();
+        match &mut forged.proof.columns[g].polys[c].rounds[r].openings {
+            RoundOpenings::Extension(p) => p.current[0].values[0] += FEE::one(),
+            _ => unreachable!("found above"),
+        }
+        assert!(!host_accepts(&forged, &elf, &w), "{name}: the host refuses");
+        let k = (0..plan.partition().num_leaves())
+            .find(|&k| plan.partition().leaf(k).contains(&g))
+            .expect("a leaf holds the group");
+        assert!(
+            leaf_refuses(&plan, &forged, k),
+            "{name}: a later round's opened value must have no execution"
+        );
+        println!(
+            "B3 ROUND FORM LEAF {name}: {} leaves · groups {} · tag {:?} · fold word {word:#x} · \
+             tamper at group {g} chain {c} round {r} refused",
+            plan.partition().num_leaves(),
+            plan.num_groups(),
+            String::from_utf8_lossy(&tag)
+        );
+    }
+}
