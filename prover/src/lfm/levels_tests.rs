@@ -946,7 +946,8 @@ fn rta_one_run(
         })
         .collect();
     println!(
-        "RTA CARD: {}",
+        "RTA CARD: levels pad {:.2} GiB · {}",
+        gib(t.card_pad),
         if cards.is_empty() {
             "no card".to_string()
         } else {

@@ -215,3 +215,16 @@ fn a_prebuilds_chip_prefixes_are_the_builds() {
         );
     }
 }
+
+/// The levels' card pad knob: unset or empty is no pad, a whole number of
+/// MiB is that many bytes, anything else is refused.
+#[test]
+fn the_card_pad_knob_reads_mib_and_refuses_nonsense() {
+    use super::levels::parse_card_pad;
+    assert_eq!(parse_card_pad(None), Ok(0));
+    assert_eq!(parse_card_pad(Some(" ")), Ok(0));
+    assert_eq!(parse_card_pad(Some("0")), Ok(0));
+    assert_eq!(parse_card_pad(Some("3072")), Ok(3072u64 << 20));
+    assert!(parse_card_pad(Some("3G")).is_err());
+    assert!(parse_card_pad(Some("-1")).is_err());
+}
