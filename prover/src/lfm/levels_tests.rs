@@ -464,6 +464,70 @@ fn the_blake3_levels_driver_proves_a_small_block() {
     );
 }
 
+/// The BLAKE3 driver with level 1's lean round tables filled beside its
+/// execution (`LAMBDA_VM_WLFM_LEAN_BESIDE`, the round chunks held as their
+/// records): level 1's fill took the prefill, which was fed every one of its
+/// compressions, and the base, every level and the block's verifier accept.
+/// (The tables and the level proof's bytes against the fill after the
+/// execution: `lean_beside_tests`.)
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels; box tier"]
+fn the_blake3_levels_driver_fills_level_1_lean_tables_beside() {
+    use super::b3l_tables::{B3lHold, test_hold};
+    use super::levels::prove_block_levels;
+    use super::wlfm::test_format;
+    let _records = test_hold::set(B3lHold::Records);
+    let _beside = test_format::set_lean_beside(true);
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = prove_block_levels(
+        &elf,
+        &[],
+        &opts,
+        &format,
+        &streamed_options(),
+        WlfmFamily::B3,
+        LevelStop::DEFAULT,
+        true,
+        true,
+    )
+    .expect("the BLAKE3 block proves to its last level");
+    let t = &run.times;
+    let (stats, wait) = t.lean_beside.expect("level 1's lean fill ran beside");
+    let compressions = run.levels[0].program.groups.b3l.real_rows;
+    assert!(compressions > 0, "level 1 has compressions");
+    assert_eq!(stats.compressions, compressions, "every compression fed");
+    assert!(stats.waves >= 1, "fed by the waves");
+    assert!(t.lean_prefilled, "level 1's fill took the prefill");
+    assert!(
+        crate::base_only::with_permit(|| crate::block_whir::verify_block_whir(
+            &run.base_proof,
+            &elf,
+            &opts,
+            &format
+        )
+        .expect("verify runs")),
+        "the base verifies"
+    );
+    for (k, (level, p)) in run.levels.iter().zip(&run.proofs).enumerate() {
+        verify_wlfm(&level.build.artifacts, p, &p.public_words)
+            .unwrap_or_else(|e| panic!("level {} verifies: {e}", k + 1));
+    }
+    let plan = b3_plan(&elf, &run.base_proof, &format);
+    verify_levels(
+        &plan,
+        WlfmFamily::B3,
+        run.proofs.last().expect("a last level"),
+    )
+    .expect("the block's own verifier accepts the last level");
+    println!(
+        "LEVELS DRIVER B3 LEAN BESIDE: waves {} · compressions {} · fed {:.3}s · wait {:.3}s · \
+         fill chips {:.3}s · fill lean {:.3}s",
+        stats.waves, stats.compressions, stats.secs, wait, t.fill_split.0, t.fill_split.1
+    );
+}
+
 /// Level 1's pieces: the front, then the groups in order, one piece a group up
 /// to 63, consecutive groups merged beyond; the pieces tile the arena.
 #[test]

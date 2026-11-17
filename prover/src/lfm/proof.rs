@@ -255,6 +255,7 @@ pub(crate) struct LfmFilled {
     /// the STARK prove.
     chips: Option<super::chip_records::LfmChipValues>,
     /// The lean round tables came from a prefill made beside the execution.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     lean_prefilled: bool,
 }
 
@@ -429,6 +430,7 @@ pub(crate) fn lfm_fill_executed_prefilled(
 impl LfmFilled {
     /// Whether the lean round tables came from a prefill made beside the
     /// execution ([`lfm_fill_executed_prefilled`]).
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn lean_prefilled(&self) -> bool {
         self.lean_prefilled
     }
