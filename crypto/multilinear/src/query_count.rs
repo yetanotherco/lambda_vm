@@ -192,6 +192,32 @@ mod tests {
         assert_eq!(checked, 4 * 64 * 256 * 65, "the grid must be fully walked");
     }
 
+    /// ★ The same grid at the rates the WHIR round form reaches: its rate
+    /// rises a round, so a later round's count is the rule at log-blowup 5
+    /// (production's last queried round at first fold 4) up to 8 (first fold
+    /// 6) and beyond under smaller shrinks. Walked from 5 to 20.
+    #[test]
+    fn the_integer_derivation_agrees_at_the_round_forms_rates() {
+        let mut checked = 0u64;
+        for log_blowup in 5..=20usize {
+            for rounds in 1..=64usize {
+                for security_bits in 0..=255u8 {
+                    for grind_query in 0..=64u8 {
+                        let got = num_queries(log_blowup, rounds, security_bits, grind_query);
+                        let want = f64_reference(log_blowup, rounds, security_bits, grind_query);
+                        assert_eq!(
+                            got, want,
+                            "blowup 2^{log_blowup}, {rounds} rounds, {security_bits} bits, \
+                             grind {grind_query}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 16 * 64 * 256 * 65, "the grid must be fully walked");
+    }
+
     /// ✓ The grid above is worth walking only if the answers vary across it.
     #[test]
     fn the_grid_is_not_one_answer_everywhere() {
