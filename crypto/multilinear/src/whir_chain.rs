@@ -228,6 +228,31 @@ where
     Ok(nonce)
 }
 
+/// [`grind`], or at a round-form round (`spoil`) under the test fault
+/// `fault` (one of the `SpoilRoundForm…Nonces`), a nonce that fails the work,
+/// absorbed the same way. Outside a test build it is [`grind`].
+fn round_grind<E, T, H>(
+    transcript: &mut T,
+    bits: u8,
+    spoil: bool,
+    fault: RoundFormFault,
+) -> Result<u64, Error>
+where
+    E: IsField + Send + Sync + 'static,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    if bits > 0 && spoil && round_form_fault(fault) {
+        let state = transcript.state();
+        let nonce = (0u64..)
+            .find(|&n| !crypto::grinding::is_valid_nonce::<GrindingDigest<H>>(&state, n, bits))
+            .expect("a failing nonce");
+        transcript.append_bytes(&nonce.to_be_bytes());
+        return Ok(nonce);
+    }
+    grind::<E, T, H>(transcript, bits)
+}
+
 /// The verifier's half: the nonce must pass against the same state, and it is
 /// absorbed the same way.
 fn check_grind<E, T, H>(transcript: &mut T, bits: u8, nonce: u64) -> Result<(), Error>
@@ -274,6 +299,27 @@ where
         return check_unspent(layout, nonce);
     }
     check_grind::<E, T, H>(transcript, bits, nonce)
+}
+
+/// [`check_nonce`] for a round-form round's slot; under the test fault
+/// [`RoundFormFault::RoundFormNonceUnchecked`] the nonce is absorbed with no
+/// check of its work (the mutant). Outside a test build it is [`check_nonce`].
+fn round_form_nonce<E, T, H>(
+    transcript: &mut T,
+    bits: u8,
+    nonce: u64,
+    layout: NonceLayout,
+) -> Result<(), Error>
+where
+    E: IsField + Send + Sync + 'static,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    if bits > 0 && round_form_fault(RoundFormFault::RoundFormNonceUnchecked) {
+        transcript.append_bytes(&nonce.to_be_bytes());
+        return Ok(());
+    }
+    check_nonce::<E, T, H>(transcript, bits, nonce, layout)
 }
 
 /// `w + gamma·eq`, the weight the next group carries.
@@ -876,6 +922,28 @@ pub fn check_round_form(config: &ChainConfig) -> Result<(), Error> {
     }
 }
 
+/// Refuses a chain of `num_vars` variables under a [`RoundForm::Whir`] config
+/// whose union bound is smaller than the chain's round count: every round's
+/// count is charged `union_rounds` rounds, and a chain with more would be
+/// charged too few. Called beside [`check_round_form`], with the chain's own
+/// variables, before it is proved and before its proof is read.
+pub fn check_round_form_union(config: &ChainConfig, num_vars: usize) -> Result<(), Error> {
+    match config.format.rounds {
+        RoundForm::Fri => Ok(()),
+        RoundForm::Whir(w) => {
+            let rounds = config.rounds(num_vars);
+            if rounds <= w.union_rounds() {
+                Ok(())
+            } else {
+                Err(Error::RoundFormUnion {
+                    rounds,
+                    union: w.union_rounds(),
+                })
+            }
+        }
+    }
+}
+
 /// Test only: faults a round-form test switches on, one at a time, to show
 /// that each piece of the round form is load-bearing: under a verifier fault
 /// an honest proof is refused, and under [`Fault::DropShiftClaims`] (both
@@ -923,6 +991,18 @@ pub(crate) mod round_form_faults {
         /// The config takes each tree's cap from the policy alone, as if
         /// caps by Q were off.
         CapsIgnoreQueries,
+        /// The prover hands a nonce that fails its proof of work at every
+        /// out-of-domain grind of a round that commits a successor under the
+        /// round form (a cheating prover that skips the work).
+        SpoilRoundFormOodNonces,
+        /// The same at every query grind of such a round.
+        SpoilRoundFormQueryNonces,
+        /// The verifier absorbs a round-form round's out-of-domain and query
+        /// nonces without checking their proof of work.
+        RoundFormNonceUnchecked,
+        /// The verifier checks a round's out-of-domain point against the
+        /// folded domain instead of the successor's (a smaller subgroup).
+        OodAgainstFoldedDomain,
     }
 
     std::thread_local! {
@@ -980,6 +1060,10 @@ enum RoundFormFault {
     PositionsBeforeSuccessor,
     RateIgnoresShrink,
     CapsIgnoreQueries,
+    SpoilRoundFormOodNonces,
+    SpoilRoundFormQueryNonces,
+    RoundFormNonceUnchecked,
+    OodAgainstFoldedDomain,
 }
 
 /// See [`WHIR_CAP_IMPLEMENTED`]. W2 is in: the host chain, the statement word,
@@ -2865,6 +2949,7 @@ where
     check_leaf_order::<H>(&config.format)?;
     check_round0_trees::<H>(&config.format)?;
     check_round_form(config)?;
+    check_round_form_union(config, num_vars)?;
     let round0: &[&CodewordCommitment<F, H>] = match &current {
         Current::Base(held) | Current::Joint(held) => std::slice::from_ref(held),
         Current::Grouped(held) => held,
@@ -3185,7 +3270,12 @@ where
             crate::whir_split::add(&crate::whir_split::OOD, __wc_ood_a);
 
             let __wc_g2 = crate::whir_split::mark();
-            nonces.ood = grind::<E, T, H>(transcript, config.grind.ood)?;
+            nonces.ood = round_grind::<E, T, H>(
+                transcript,
+                config.grind.ood,
+                round_form_successor,
+                RoundFormFault::SpoilRoundFormOodNonces,
+            )?;
             crate::whir_split::add(&crate::whir_split::GRIND, __wc_g2);
 
             let __wc_ood_b = crate::whir_split::mark();
@@ -3198,7 +3288,12 @@ where
         };
 
         let __wc_g3 = crate::whir_split::mark();
-        nonces.query = grind::<E, T, H>(transcript, config.grind.query)?;
+        nonces.query = round_grind::<E, T, H>(
+            transcript,
+            config.grind.query,
+            round_form_successor,
+            RoundFormFault::SpoilRoundFormQueryNonces,
+        )?;
         crate::whir_split::add(&crate::whir_split::GRIND, __wc_g3);
         let round_config = RoundConfig {
             num_queries: queries[r],
@@ -3860,6 +3955,7 @@ where
     check_leaf_order::<H>(&config.format)?;
     check_round0_trees::<H>(&config.format)?;
     check_round_form(config)?;
+    check_round_form_union(config, num_vars)?;
     // The domain is the caller's: held to the configuration's rate here.
     if domain.log_size() != num_vars + config.log_blowup {
         return Err(Error::DomainRateMismatch {
@@ -4355,16 +4451,24 @@ where
     transcript.append_bytes(at.next_root);
 
     let z0: FieldElement<E> = transcript.sample_field_element();
-    require_out_of_domain::<F, E>(&z0, at.successor_domain)?;
+    if round_form_fault(RoundFormFault::OodAgainstFoldedDomain) {
+        let mut folded = at.current_domain.clone();
+        for _ in 0..round_config.log_folding {
+            folded = folded.squared()?;
+        }
+        require_out_of_domain::<F, E>(&z0, &folded)?;
+    } else {
+        require_out_of_domain::<F, E>(&z0, at.successor_domain)?;
+    }
     let point = ood_point(&z0, at.n_next);
     transcript.append_field_element(at.y0);
 
-    check_nonce::<E, T, H>(transcript, config.grind.ood, at.round.nonces.ood, at.layout)?;
+    round_form_nonce::<E, T, H>(transcript, config.grind.ood, at.round.nonces.ood, at.layout)?;
     let gamma: FieldElement<E> = transcript.sample_field_element();
     *claim += &gamma * at.y0;
     ood.push((gamma, point, at.bound));
 
-    check_nonce::<E, T, H>(
+    round_form_nonce::<E, T, H>(
         transcript,
         config.grind.query,
         at.round.nonces.query,
