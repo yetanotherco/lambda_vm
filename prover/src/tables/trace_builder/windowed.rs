@@ -2451,6 +2451,7 @@ impl Accumulator<'_> {
     /// lists now complete. Windows must come in run order.
     pub fn absorb(&mut self, mut window: WalkedWindow) -> Vec<ChunkJob> {
         let t = std::time::Instant::now();
+        keccak_rnd_arrivals::note(window.walk.keccak_ops.len());
         if self.stream_memw_lt {
             let walk = &mut window.walk;
             walk.lt_ops
@@ -5659,5 +5660,67 @@ mod block_tests {
         assert_eq!(name, "ecsm");
         assert_eq!(bytes, rest.ecsm_ops.heap_bytes() + steps);
         assert_eq!(largest, rest.ecsm_ops.largest_bytes().max(steps));
+    }
+}
+
+/// A measurement, never a byte of the proof: when each KECCAK_RND table of the
+/// run's cut (`rows` rows, 24 an operation) has all its operations, as the
+/// accumulator takes the windows in run order. Armed by the block's prove
+/// under `LAMBDA_VM_KECCAK_RND_ARRIVALS=1`; off, [`note`] is one relaxed load.
+pub(crate) mod keccak_rnd_arrivals {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use std::time::Instant;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    /// The tables' rows, the operations seen, and each complete table's stamp.
+    static STATE: Mutex<(usize, usize, Vec<Instant>)> = Mutex::new((1, 0, Vec::new()));
+
+    /// The tables of `rows` rows that `ops` operations fill completely.
+    pub(crate) fn complete(rows: usize, ops: usize) -> usize {
+        ops.saturating_mul(24) / rows.max(1)
+    }
+
+    /// Start a run's record: tables of `rows` rows, none complete yet.
+    pub(crate) fn arm(rows: usize) {
+        *STATE.lock().unwrap_or_else(|e| e.into_inner()) = (rows.max(1), 0, Vec::new());
+        ON.store(true, Relaxed);
+    }
+
+    /// A window's `ops` KECCAK operations, taken in run order: each table they
+    /// complete is stamped now.
+    pub(crate) fn note(ops: usize) {
+        if !ON.load(Relaxed) || ops == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let (rows, seen, at) = &mut *state;
+        *seen += ops;
+        let done = complete(*rows, *seen);
+        at.resize(done.max(at.len()), now);
+    }
+
+    /// Stop recording; the operations seen and each complete table's stamp.
+    pub(crate) fn take() -> (usize, Vec<Instant>) {
+        ON.store(false, Relaxed);
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        (state.1, std::mem::take(&mut state.2))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// A table is complete once its rows are covered: 24 rows an
+        /// operation, so a table of 48 rows takes two and one of 2^16 rows
+        /// 2,731 (its last operation's rows run into the next table).
+        #[test]
+        fn a_table_is_complete_when_its_operations_are_in() {
+            assert_eq!(super::complete(48, 1), 0);
+            assert_eq!(super::complete(48, 2), 1);
+            assert_eq!(super::complete(48, 7), 3);
+            assert_eq!(super::complete(1 << 16, 2730), 0);
+            assert_eq!(super::complete(1 << 16, 2731), 1);
+            assert_eq!(super::complete(1 << 16, 5462), 2);
+        }
     }
 }
