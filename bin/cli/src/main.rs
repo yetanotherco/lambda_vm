@@ -1448,10 +1448,10 @@ fn cmd_prove_block_base(
         prover::block_whir::host_commit_fallbacks()
     );
     if cfg.format.zf.base == BaseFormat::B3_WHIR {
-        let (host_encodes, claim_batches) = prover::block_whir::round_form_counts();
+        let (host_encodes, claim_batches, tiled) = prover::block_whir::round_form_counts();
         eprintln!(
             "BLOCK BASE ROUND FORM: {:?} · successors encoded on the host {host_encodes} · \
-             shift-claim batches on the card {claim_batches}",
+             shift-claim batches on the card {claim_batches} · row-tiled {tiled}",
             cfg.format.b3_rounds
         );
         let (from_stacks, reencoded) = prover::block_whir::coset_counts();
