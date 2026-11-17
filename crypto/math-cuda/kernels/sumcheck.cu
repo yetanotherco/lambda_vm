@@ -460,6 +460,41 @@ extern "C" __global__ void add_eq_tensor_ext3(uint64_t *__restrict__ dst,
     at[2] = acc.c;
 }
 
+// `add_eq_tensor_ext3` for base-field high halves, by row tiles: `dst[x] +=
+// Σ_j hi[j][x >> lo_bits] · lo[j][x mod 2^lo_bits]` with each `hi` a base
+// value (the eq of a base point's high coordinates, unscaled) and each `lo` an
+// ext3 value (the scaled low half), so a term is a base × ext3 product (three
+// multiplications, not nine). One thread a low index and `rows` consecutive
+// high rows: each `lo` value is read once for `rows` outputs, each `hi` value
+// is the same across a warp (a broadcast). The sum per output runs over the
+// points in order, as `add_eq_tensor_ext3`'s.
+#define EQ_TENSOR_MAX_ROWS 8
+extern "C" __global__ void add_eq_tensor_base_ext3(uint64_t *__restrict__ dst,
+                                                   const uint64_t *__restrict__ hi,
+                                                   const uint64_t *__restrict__ lo, uint64_t hi_len,
+                                                   uint64_t points, uint32_t lo_bits, uint32_t rows) {
+    uint64_t t = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t lo_len = 1ull << lo_bits;
+    uint64_t tiles = (hi_len + rows - 1) / rows;
+    if (t >= tiles * lo_len) return;
+    uint64_t x_lo = t & (lo_len - 1);
+    uint64_t row0 = (t >> lo_bits) * rows;
+    uint32_t n = (uint32_t)((hi_len - row0) < rows ? (hi_len - row0) : rows);
+    Fe3 acc[EQ_TENSOR_MAX_ROWS];
+    for (uint32_t r = 0; r < n; ++r) acc[r] = load_ext(dst + (((row0 + r) << lo_bits) | x_lo) * 3);
+    for (uint64_t j = 0; j < points; ++j) {
+        Fe3 l = load_ext(lo + (j * lo_len + x_lo) * 3);
+        const uint64_t *h = hi + j * hi_len + row0;
+        for (uint32_t r = 0; r < n; ++r) acc[r] = ext3::add(acc[r], ext3::mul_base(l, h[r]));
+    }
+    for (uint32_t r = 0; r < n; ++r) {
+        uint64_t *at = dst + (((row0 + r) << lo_bits) | x_lo) * 3;
+        at[0] = acc[r].a;
+        at[1] = acc[r].b;
+        at[2] = acc[r].c;
+    }
+}
+
 // One level of the eq table's doubling: `dst[j + half] = dst[j]·r` and
 // `dst[j] = dst[j]·(1 − r)`, the halves disjoint so one thread owns both. The
 // host seeds `dst[0]` and walks the variables back to front, which is what

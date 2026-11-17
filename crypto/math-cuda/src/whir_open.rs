@@ -428,6 +428,56 @@ impl OpeningSession {
         Ok(())
     }
 
+    /// [`Self::add_eq_tensor`] with base-field high halves (`hi`: `points`
+    /// tables of `2^(n − lo_bits)` base values, point-major; `lo`: `points`
+    /// tables of `2^lo_bits` ext3 values, the scales folded in), each thread
+    /// a low index and `rows` (1 to 8) consecutive high rows
+    /// (`add_eq_tensor_base_ext3`): a base × ext3 product a term, each `lo`
+    /// value read once for `rows` outputs. The same weight, value for value.
+    pub fn add_eq_tensor_base(
+        &self,
+        hi: &[u64],
+        lo: &[u64],
+        points: usize,
+        lo_bits: usize,
+        rows: usize,
+    ) -> Result<()> {
+        let n = self.num_vars();
+        ensure!(lo_bits <= n, "the low half fits the cube");
+        ensure!((1..=8).contains(&rows), "one to eight rows a thread");
+        let hi_len = 1usize << (n - lo_bits);
+        ensure!(
+            hi.len() == points * hi_len && lo.len() == points * (3usize << lo_bits),
+            "each point's two halves span the cube"
+        );
+        if points == 0 {
+            return Ok(());
+        }
+        let be = backend()?;
+        let hi_dev = crate::device::htod_or_trim(&self.stream, hi)?;
+        let lo_dev = crate::device::htod_or_trim(&self.stream, lo)?;
+        let threads = hi_len.div_ceil(rows) << lo_bits;
+        let hi_len_arg = hi_len as u64;
+        let points_arg = points as u64;
+        let lo_bits_arg = lo_bits as u32;
+        let rows_arg = rows as u32;
+        // Through a shared reference, as `add_eq_tensor` writes the weight.
+        unsafe {
+            self.stream
+                .launch_builder(&be.add_eq_tensor_base_ext3)
+                .arg(self.weight.as_ref())
+                .arg(&hi_dev)
+                .arg(&lo_dev)
+                .arg(&hi_len_arg)
+                .arg(&points_arg)
+                .arg(&lo_bits_arg)
+                .arg(&rows_arg)
+                .launch(LaunchConfig::for_num_elems(threads as u32))?;
+        }
+        drop((hi_dev, lo_dev));
+        Ok(())
+    }
+
     /// `weight += scale · eq(point, ·)`, the weight the next group carries.
     pub fn add_scaled_eq(&self, point: &[u64], scale: &[u64]) -> Result<()> {
         assert_eq!(point.len(), self.num_vars() * 3, "the point spans the cube");
