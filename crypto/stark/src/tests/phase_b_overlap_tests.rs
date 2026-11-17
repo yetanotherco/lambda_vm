@@ -232,7 +232,7 @@ fn prove_block_reordered(
         .map(|(((group, tables), commitment), columns)| BlockPrepared {
             group: *group,
             tables: tables.to_vec(),
-            commitment,
+            commitment: commitment.into(),
             columns,
         })
         .collect();

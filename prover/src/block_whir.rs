@@ -5113,7 +5113,7 @@ pub(crate) fn prove_traces(
             .map(|(p, columns)| multilinear_block::BlockPrepared {
                 group: p.group,
                 tables: p.tables.clone(),
-                commitment: &p.commitment,
+                commitment: (&p.commitment).into(),
                 columns,
             })
             .collect();
@@ -7941,7 +7941,7 @@ fn prove_streamed(
             .map(|(p, columns)| multilinear_block::BlockPrepared {
                 group: p.group,
                 tables: p.tables.clone(),
-                commitment: &p.commitment,
+                commitment: (&p.commitment).into(),
                 columns,
             })
             .collect();
