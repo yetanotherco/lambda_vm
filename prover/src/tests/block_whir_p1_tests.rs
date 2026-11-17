@@ -25,6 +25,7 @@ pub(crate) fn many_groups(base: BaseFormat) -> BlockFormat {
     BlockFormat {
         zf,
         group_polys: 2,
+        b3_rounds: crate::block_whir::B3Rounds::Fri,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue: ArgueFormat::PerTable,

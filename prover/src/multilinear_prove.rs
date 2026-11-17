@@ -117,12 +117,7 @@ pub fn chain_config(shapes: &[Shape]) -> ChainConfig {
 /// (`block_whir::check_bitwise_height`). Q moves only for a statement whose
 /// tallest stack is under 23, which only small test programs make.
 pub fn chain_config_under(format: &crate::zf_format::ZfFormat, shapes: &[Shape]) -> ChainConfig {
-    let widest_table = shapes
-        .iter()
-        .map(|&(width, num_vars)| multilinear::constraint_argument::one_stack(num_vars, width))
-        .max()
-        .unwrap_or(1);
-    let tallest = widest_table.max(multilinear_table::stack_height(shapes, format.whir_stack));
+    let tallest = tallest_stack(format, shapes);
     // The grind's bits come from the format with its nonce layout: P2's query
     // grind alone by default, all three under `LAMBDA_VM_ZF_WHIR_GRIND=all`. Q
     // reads the query grind only, so it is the same under both placements; at
@@ -135,10 +130,27 @@ pub fn chain_config_under(format: &crate::zf_format::ZfFormat, shapes: &[Shape])
         crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING,
         format.whir_folds,
         tallest,
-        128,
+        CHAIN_SECURITY_BITS,
         format.whir_grind_bits(),
     );
     format.chain(config)
+}
+
+/// The proven-bits target [`chain_config_under`] sizes the query count for.
+pub const CHAIN_SECURITY_BITS: u8 = 128;
+
+/// The stacked height [`chain_config_under`] charges `shapes` under `format`:
+/// the larger of the widest table's `one_stack` and the height all the shapes
+/// would stack to together under the format's cap. A config that derives
+/// further counts from the same target (the WHIR round form's later rounds)
+/// takes its union bound over the same height.
+pub fn tallest_stack(format: &crate::zf_format::ZfFormat, shapes: &[Shape]) -> usize {
+    let widest_table = shapes
+        .iter()
+        .map(|&(width, num_vars)| multilinear::constraint_argument::one_stack(num_vars, width))
+        .max()
+        .unwrap_or(1);
+    widest_table.max(multilinear_table::stack_height(shapes, format.whir_stack))
 }
 
 /// Binds the statement into the transcript before any challenge is drawn.

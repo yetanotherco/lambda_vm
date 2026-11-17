@@ -21,6 +21,7 @@ fn one_group() -> BlockFormat {
     BlockFormat {
         zf: ZfFormat::DEFAULT,
         group_polys: block_whir::BLOCK_GROUP_POLYS,
+        b3_rounds: crate::block_whir::B3Rounds::Fri,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue: ArgueFormat::PerTable,
@@ -42,6 +43,7 @@ pub(super) fn many_groups() -> BlockFormat {
     BlockFormat {
         zf,
         group_polys: 2,
+        b3_rounds: crate::block_whir::B3Rounds::Fri,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue: ArgueFormat::PerTable,
