@@ -37,6 +37,10 @@ when $u_1 = 0$ ($z equiv 0 mod N$), or when $x(u_1 G) = x(u_2 R)$ (the chord is
 undefined; this covers $Q$ at infinity). It stops with an error when `x13` is
 above 1, when the signature and hash regions overlap, or when an address's low
 32-bit limb plus its operand's last offset (71, 63, 31) reaches $2^32$.
+It also stops with an error when any of the three addresses (`x10`, `x11`,
+`x12`) is not a multiple of 8, under every memory format. The guest wrapper
+takes its software path for such buffers, so a guest built before this rule
+must be rebuilt.
 
 = #ecrec
 
