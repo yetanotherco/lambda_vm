@@ -146,6 +146,14 @@ pub(super) fn cases() -> Vec<Case> {
         q(14, 0, CapPolicy::Fixed(8), LeafOrder::Natural, None),
         q(14, 4, CapPolicy::Fixed(8), LeafOrder::Coset, Some(2)),
         q(14, 0, CapPolicy::Auto, LeafOrder::Coset, None),
+        // A rate rising 3 bits a round at a tiny target: the last round's
+        // one query pays for no cap (height 0, the tree checked against its
+        // root) where the policy's cap is 4.
+        Case {
+            shrink: Some(1),
+            bits: 2,
+            ..q(14, 0, CapPolicy::Fixed(4), LeafOrder::Natural, None)
+        },
         c(
             9,
             2,
@@ -276,7 +284,7 @@ enum Published {
 /// `z`, `y`, the root (two words), the final value, then the rounds; with
 /// `publish`, every draw the chain makes and its closing claim and weight
 /// are published after it.
-fn emit(shape: &ChainShape, publish: bool) -> (LfmProgram, Vec<Published>) {
+fn emit(shape: &ChainShape, publish: bool) -> (LfmProgram, Vec<Published>, chain_draws::Draws) {
     let mut b = builder();
     let head = (shape.num_vars + 4) as u32;
     let total = head
@@ -335,7 +343,7 @@ fn emit(shape: &ChainShape, publish: bool) -> (LfmProgram, Vec<Published>) {
     }
     let program = compile(b.finish());
     validate(&program).expect("the round-form chain leg is admissible");
-    (program, published)
+    (program, published, draws)
 }
 
 pub(super) fn program(shape: &ChainShape) -> LfmProgram {
@@ -398,6 +406,17 @@ fn a_round_form_blake3_chain_executes_and_costs_its_closed_form() {
                     "CAPS BY Q {c:?}: caps {:?} against the policy's {:?}",
                     f.shape.caps, policy.caps
                 );
+                if c.shrink == Some(1) {
+                    let last = (0..f.shape.rounds())
+                        .rfind(|&r| f.shape.queried(r))
+                        .expect("a queried round");
+                    assert_eq!(
+                        (f.shape.queries(last), f.shape.caps[last]),
+                        (1, 0),
+                        "{c:?}: one query pays for no cap"
+                    );
+                    assert!(policy.caps[last] > 0, "{c:?}: the policy caps it");
+                }
             }
             let today = ChainShape::for_hash(&config(&c.fri()), c.n, WrapHash::Blake3);
             let today_perms = chain_perms(&today, SpongeEntry::fresh_for(WrapHash::Blake3));
@@ -542,7 +561,7 @@ fn a_round_form_blake3_chain_draws_the_hosts_stream_and_closes_on_its_weight() {
     under_both(|lowering| {
         for c in cases().into_iter().flat_map(|c| [c, c.fri()]) {
             let f = fixture(&c);
-            let (leg, published) = emit(&f.shape, true);
+            let (leg, published, _) = emit(&f.shape, true);
             let exec = execute(&leg, &[arena(&f, &f.proof)], &crate::hash_pin::BLOCK_HASHER)
                 .unwrap_or_else(|e| panic!("{lowering} {c:?}: refused an accepted proof: {e:?}"));
             let words: Vec<LfmWord> = exec.public_words.iter().map(|(_, w)| *w).collect();
@@ -636,7 +655,7 @@ fn current_mut(
 #[test]
 fn a_tampered_round_form_blake3_chain_cannot_execute() {
     under_both(|lowering| {
-        for c in cases().into_iter().filter(|c| c.grind > 0) {
+        for c in cases().into_iter().filter(|c| c.grind > 0 || c.caps_by_q) {
             let f = fixture(&c);
             let leg = program(&f.shape);
             assert!(
@@ -663,7 +682,15 @@ fn a_tampered_round_form_blake3_chain_cannot_execute() {
                     sites.push((format!("round {r}'s out-of-domain value"), forged));
                 }
             }
-            for (slot, name) in [(0usize, "folding"), (1, "out-of-domain"), (2, "query")] {
+            let grinds = if c.grind > 0 {
+                &[0usize, 1, 2][..]
+            } else {
+                &[]
+            };
+            for (slot, name) in [(0usize, "folding"), (1, "out-of-domain"), (2, "query")]
+                .into_iter()
+                .filter(|(slot, _)| grinds.contains(slot))
+            {
                 let r = if slot == 1 { 0 } else { 1 };
                 let mut forged = f.proof.clone();
                 let nonces = &mut forged.rounds[r].nonces;
@@ -681,12 +708,18 @@ fn a_tampered_round_form_blake3_chain_cannot_execute() {
             }
             sites.push(("a round-0 base value".into(), forged));
             for &r in queried.iter().filter(|&&r| r >= 1) {
+                // The second opening, or the only one of a round of one query.
+                let i = 1.min(current_mut(&mut f.proof.clone(), r).len() - 1);
                 let mut forged = f.proof.clone();
-                current_mut(&mut forged, r)[1].values[0] += FEE::one();
+                current_mut(&mut forged, r)[i].values[0] += FEE::one();
                 sites.push((format!("round {r}'s opened value"), forged));
                 let mut forged = f.proof.clone();
-                if flip_first(&mut current_mut(&mut forged, r)[1].proof.merkle_path) {
-                    sites.push((format!("round {r}'s Merkle sibling"), forged));
+                if flip_first(&mut current_mut(&mut forged, r)[i].proof.merkle_path) {
+                    let height = f.shape.caps[r];
+                    sites.push((
+                        format!("round {r}'s Merkle sibling (cap height {height})"),
+                        forged,
+                    ));
                 }
                 if f.shape.caps[r] > 0 {
                     let mut forged = f.proof.clone();
@@ -973,6 +1006,13 @@ fn the_round_form_census_of_a_blake3_base_group() {
     );
     assert!(totals[2] < totals[0] && totals[2] < totals[1]);
     assert!(totals[4] < totals[0]);
+    // Pinned: today's format, the round form under the policy's caps (8 on
+    // every tree) and under caps by Q (the base's own, 8 7 7 6 6).
+    assert_eq!(
+        (totals[0], totals[2], totals[4]),
+        (28_768, 11_778, 11_538),
+        "the census's closed forms"
+    );
 
     super::LEAN.with(|c| c.set(true));
     for (name, cfg) in [&arms[0], &arms[2], &arms[4]] {
@@ -1012,4 +1052,127 @@ fn the_round_form_census_of_a_blake3_base_group() {
         );
     }
     super::LEAN.with(|c| c.set(false));
+}
+
+/// ★ A round-form config the host refuses is refused here: its stamped
+/// target gives another round-0 count than the one set (a count set by hand
+/// after the form was stamped), and `check_round_form` refuses it on both host
+/// sides, so no program is emitted for it.
+#[test]
+#[should_panic(expected = "no chain is emitted for a config the host refuses")]
+fn a_round_form_config_the_host_refuses_emits_no_chain() {
+    let c = cases()[3];
+    let mut cfg = config(&c);
+    assert!(multilinear::whir_chain::check_round_form(&cfg).is_ok());
+    cfg.num_queries += 1;
+    assert!(multilinear::whir_chain::check_round_form(&cfg).is_err());
+    let _ = ChainShape::for_hash(&cfg, c.n, WrapHash::Blake3);
+}
+
+/// ★ Each round's out-of-domain point is refused inside its SUCCESSOR's
+/// domain, the host's: the domains the emission checks are
+/// `ChainConfig::round_domain_logs`' successors', round by round — bigger
+/// than the folded ones under a shrink below the fold. And the check itself:
+/// a point of the successor's domain has no execution, one just outside it
+/// executes, and the same point is not refused by a check against the folded
+/// domain (so the domain the check takes is load-bearing).
+#[test]
+fn the_out_of_domain_check_takes_the_successors_domain() {
+    use super::super::whir_chain::emit_out_of_domain_point;
+    let mut moved = false;
+    for c in cases() {
+        let cfg = config(&c);
+        let shape = ChainShape::for_hash(&cfg, c.n, WrapHash::Blake3);
+        let (_, _, draws) = emit(&shape, false);
+        let domains = cfg.round_domain_logs(c.n);
+        let want: Vec<usize> = (0..shape.rounds())
+            .filter(|&r| shape.next_depth(r).is_some())
+            .map(|r| domains[r + 1])
+            .collect();
+        assert_eq!(draws.ood_domains, want, "{c:?}: the successors' domains");
+        let folded: Vec<usize> = (0..shape.rounds())
+            .filter(|&r| shape.next_depth(r).is_some())
+            .map(|r| shape.current_depth(r))
+            .collect();
+        moved |= want != folded;
+    }
+    assert!(moved, "some case's successor domain is not its fold's");
+
+    // The check alone: `z0` of order `2^d` lies in a domain of `2^d` points.
+    let refused = |z0_log: usize, domain_log: usize| {
+        let mut b = builder();
+        let arena = b.declare_arena(1);
+        let z0 = b.hint_word(arena, 0).as_ext();
+        let one = b.ext_const(&FEE::one());
+        let domain = Domain::<F>::new(domain_log).expect("a domain");
+        let point = emit_out_of_domain_point(&mut b, z0, &domain, 2, one);
+        b.public(point[1].as_cell());
+        let program = compile(b.finish());
+        let z0 = *Domain::<F>::new(z0_log).expect("a domain").generator();
+        !runs(&program, vec![[z0, FE::zero(), FE::zero(), FE::zero()]])
+    };
+    assert!(refused(10, 10), "a point of the successor's domain");
+    assert!(!refused(11, 10), "a point just outside it");
+    assert!(
+        !refused(10, 7),
+        "the folded domain's check would let the successor's point through"
+    );
+}
+
+/// ★ The lean all-leaf tail check stays off under the round form: its claims
+/// sit at the sampled positions, and the tail check reads a successor on the
+/// folded domain. A lean round-form chain whose later trees lie wholly in
+/// their caps with enough queries a leaf (today's form would check them once
+/// a leaf) has no tail round, and its honest proof executes.
+#[test]
+fn a_lean_round_form_chain_has_no_tail_round_and_executes() {
+    use super::super::whir_chain::LeafQuery;
+    under_both(|lowering| {
+        let c = Case {
+            n: 9,
+            lb: 1,
+            first: Some(6),
+            k: 1,
+            shrink: Some(6),
+            bits: 50,
+            grind: 0,
+            cap: CapPolicy::Fixed(4),
+            leaves: LeafOrder::Coset,
+            final_vars: None,
+            caps_by_q: false,
+        };
+        let f = fixture(&c);
+        let lean = ChainShape {
+            query: LeafQuery::Lean,
+            ..f.shape.clone()
+        };
+        let as_today = ChainShape {
+            form: multilinear::whir_chain::RoundForm::Fri,
+            round_queries: Vec::new(),
+            ..lean.clone()
+        };
+        let shaped: Vec<usize> = (0..lean.rounds())
+            .filter(|&r| as_today.tail_round(r))
+            .collect();
+        assert!(
+            !shaped.is_empty(),
+            "{c:?}: rounds {:?} caps {:?} Q {}: a tail-shaped round",
+            lean.domain_log,
+            lean.caps,
+            lean.num_queries
+        );
+        assert!(
+            (0..lean.rounds()).all(|r| !lean.tail_round(r)),
+            "no tail round under the round form"
+        );
+        let leg = program(&lean);
+        let words = arena_as(&lean, &f, &f.proof);
+        execute(&leg, &[words], &crate::hash_pin::BLOCK_HASHER)
+            .unwrap_or_else(|e| panic!("{lowering}: the lean round-form chain refused: {e:?}"));
+        assert_eq!(
+            hash_rows(&leg).0,
+            chain_perms(&lean, SpongeEntry::fresh_for(WrapHash::Blake3))
+        );
+        println!("LEAN ROUND FORM {lowering}: tail-shaped rounds {shaped:?} checked per query");
+    });
 }
