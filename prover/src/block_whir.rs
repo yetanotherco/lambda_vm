@@ -1133,14 +1133,16 @@ pub fn host_commit_fallbacks() -> u64 {
     multilinear::gpu::host_fallbacks()
 }
 
-/// The WHIR round form's successors encoded on the host and its shift-claim
-/// batches the card added (`multilinear::gpu`'s counters): what a base-only
+/// The WHIR round form's successors encoded on the host, its shift-claim
+/// batches the card added, and of those the row-tiled kernel's
+/// (`multilinear::gpu`'s counters): what a base-only
 /// run under [`B3Rounds::Whir`] prints, so a run whose successors left the
 /// card says so.
-pub fn round_form_counts() -> (u64, u64) {
+pub fn round_form_counts() -> (u64, u64, u64) {
     (
         multilinear::gpu::round_form_host_encodes(),
         multilinear::gpu::shift_claim_batches(),
+        multilinear::gpu::shift_claim_tiled_batches(),
     )
 }
 
