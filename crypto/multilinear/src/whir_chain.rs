@@ -758,12 +758,14 @@ pub enum RoundForm {
 /// ([`check_round_form`]) and bound into the fold word, so every round's count
 /// is a verifier constant of the statement.
 ///
-/// Constructed only through [`WhirRounds::new`].
+/// Constructed only through [`WhirRounds::new`] (and
+/// [`WhirRounds::with_caps_by_queries`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WhirRounds {
     shrink: u8,
     security_bits: u8,
     union_rounds: u8,
+    caps_by_queries: bool,
 }
 
 impl WhirRounds {
@@ -775,6 +777,7 @@ impl WhirRounds {
                 shrink: shrink as u8,
                 security_bits,
                 union_rounds: union_rounds as u8,
+                caps_by_queries: false,
             })
         } else {
             None
@@ -796,6 +799,46 @@ impl WhirRounds {
     pub const fn union_rounds(self) -> usize {
         self.union_rounds as usize
     }
+
+    /// These parameters with each tree's cap held to its own query count
+    /// ([`Self::caps_by_queries`]).
+    pub const fn with_caps_by_queries(self) -> Self {
+        Self {
+            caps_by_queries: true,
+            ..self
+        }
+    }
+
+    /// ★ CAPS BY Q: whether each tree's cap is at most the height its own
+    /// round's openings pay for — `⌈log2 Q_t⌉` binary levels (`⌈log4 Q_t⌉`
+    /// at arity 4) — below the policy's height
+    /// ([`ChainConfig::tree_caps_at`]). A binary cap of `c` levels costs
+    /// `2^c − 1` nodes once and saves one sibling an opening a level, so past
+    /// `2^c ≥ Q_t` it costs more than it saves: under the round form the later
+    /// trees are opened fewer times than round 0's (114, 76, 57, … against
+    /// 229) and want shorter caps. Bound into the fold word
+    /// ([`FOLD_WORD_WHIR_CAPS_BY_Q`]).
+    pub const fn caps_by_queries(self) -> bool {
+        self.caps_by_queries
+    }
+}
+
+/// The bit of [`ChainConfig::fold_word`] that says
+/// [`WhirRounds::caps_by_queries`], beside [`FOLD_WORD_WHIR`]: no other word
+/// sets bit 32 (the round form's fields sit at 16..=31 and 40..=43,
+/// [`FOLD_WORD_FINAL`]'s `v` at 36..=39).
+pub const FOLD_WORD_WHIR_CAPS_BY_Q: u64 = 1 << 32;
+
+/// `⌈log_arity(openings)⌉` in that arity's levels: the tallest cap
+/// `openings` openings of one tree pay for ([`WhirRounds::caps_by_queries`]).
+/// `0` for one opening or none.
+pub fn cap_paid_by(openings: usize, arity: usize) -> usize {
+    let bits = if openings <= 1 {
+        0
+    } else {
+        (usize::BITS - (openings - 1).leading_zeros()) as usize
+    };
+    if arity == 4 { bits.div_ceil(2) } else { bits }
 }
 
 /// The bit of [`ChainConfig::fold_word`] that says [`RoundForm::Whir`], always
@@ -877,6 +920,9 @@ pub(crate) mod round_form_faults {
         /// shrunk at all (`lb_r = lb + Σ k_i`): the rate overstated, the
         /// later rounds' counts too few.
         RateIgnoresShrink,
+        /// The config takes each tree's cap from the policy alone, as if
+        /// caps by Q were off.
+        CapsIgnoreQueries,
     }
 
     std::thread_local! {
@@ -933,6 +979,7 @@ enum RoundFormFault {
     ProverQueriesShort,
     PositionsBeforeSuccessor,
     RateIgnoresShrink,
+    CapsIgnoreQueries,
 }
 
 /// See [`WHIR_CAP_IMPLEMENTED`]. W2 is in: the host chain, the statement word,
@@ -1334,6 +1381,11 @@ impl ChainConfig {
                     | ((w.shrink() as u64 & 0x7) << 40)
                     | (u64::from(w.security_bits()) << 24)
                     | ((w.union_rounds() as u64 & 0xff) << 16)
+                    | if w.caps_by_queries() {
+                        FOLD_WORD_WHIR_CAPS_BY_Q
+                    } else {
+                        0
+                    }
             }
         };
         match self.format.leaves {
@@ -1381,9 +1433,12 @@ impl ChainConfig {
     /// hash's arity.
     pub fn tree_caps_at(&self, num_vars: usize, arity: usize) -> Vec<usize> {
         let policy = self.format.cap_policy_at(arity);
-        if let RoundForm::Whir(_) = self.format.rounds {
+        if let RoundForm::Whir(w) = self.format.rounds {
             // Each tree is opened by its own round alone, `Q_t` times, and
-            // has depth `D_t − k_t` over its round's own domain.
+            // has depth `D_t − k_t` over its round's own domain; under caps
+            // by Q no taller than those openings pay for.
+            let by_queries =
+                w.caps_by_queries() && !round_form_fault(RoundFormFault::CapsIgnoreQueries);
             let queries = self.round_queries(num_vars);
             return self
                 .round_domain_logs(num_vars)
@@ -1391,7 +1446,17 @@ impl ChainConfig {
                 .zip(self.schedule(num_vars))
                 .zip(queries)
                 .map(|((&domain_log, k), openings)| {
-                    crate::whir_commit::tree_cap_height(policy, openings, domain_log - k, arity)
+                    let c = crate::whir_commit::tree_cap_height(
+                        policy,
+                        openings,
+                        domain_log - k,
+                        arity,
+                    );
+                    if by_queries {
+                        c.min(cap_paid_by(openings, arity))
+                    } else {
+                        c
+                    }
                 })
                 .collect();
         }
@@ -1519,6 +1584,22 @@ impl ChainConfig {
             },
             ..self
         })
+    }
+
+    /// This round-form config with each tree's cap held to its own query
+    /// count ([`WhirRounds::caps_by_queries`]). `None` under
+    /// [`RoundForm::Fri`], whose trees keep the policy's caps.
+    pub fn with_caps_by_queries(self) -> Option<Self> {
+        match self.format.rounds {
+            RoundForm::Fri => None,
+            RoundForm::Whir(w) => Some(Self {
+                format: ChainFormat {
+                    rounds: RoundForm::Whir(w.with_caps_by_queries()),
+                    ..self.format
+                },
+                ..self
+            }),
+        }
     }
 
     /// The final-polynomial round of a chain over `num_vars` variables under

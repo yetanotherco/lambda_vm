@@ -1154,6 +1154,102 @@ fn a_rate_that_ignores_the_shrink_drops_a_round_below_the_target() {
     assert!(worst < 128.0, "{worst}");
 }
 
+// ───────────────────────────── caps by Q ─────────────────────────────────────
+
+/// ★ CAPS BY Q, the counts: `cap_paid_by` is `⌈log2 Q⌉` binary levels
+/// (`⌈log4 Q⌉` at arity 4), and at the production shape (blowup 2, first fold
+/// 4, shrink 3, a `2^27` stack, 18 query-grind bits, cap 8) each tree's cap
+/// is the design model's compression optimum, 8 · 7 · 7 · 6 · 6 over the
+/// queried rounds — against 8 at every tree without it. Round 0's is today's
+/// 8. The fold word differs by exactly [`FOLD_WORD_WHIR_CAPS_BY_Q`].
+#[test]
+fn caps_by_q_hold_each_tree_to_what_its_openings_pay_for() {
+    use crate::whir_chain::{FOLD_WORD_WHIR_CAPS_BY_Q, cap_paid_by};
+    for (q, want) in [
+        (0usize, 0usize),
+        (1, 0),
+        (2, 1),
+        (3, 2),
+        (4, 2),
+        (5, 3),
+        (229, 8),
+    ] {
+        assert_eq!(cap_paid_by(q, 2), want, "Q {q}");
+    }
+    assert_eq!(cap_paid_by(256, 2), 8);
+    assert_eq!(cap_paid_by(257, 2), 9);
+    assert_eq!(cap_paid_by(229, 4), 4);
+    assert_eq!(cap_paid_by(16, 4), 2);
+    assert_eq!(cap_paid_by(17, 4), 3);
+
+    let mut plain = production(1, 4, Some(3), 18);
+    plain.format.cap = CapPolicy::Fixed(8);
+    let by_q = plain.with_caps_by_queries().expect("a round-form config");
+    check_round_form(&by_q).unwrap();
+    assert_eq!(
+        by_q.fold_word(),
+        plain.fold_word() | FOLD_WORD_WHIR_CAPS_BY_Q
+    );
+    assert_ne!(by_q.fold_word(), plain.fold_word());
+    let (final_r, _) = by_q.final_round(27).expect("a final round");
+    let queried = final_r + 1;
+    assert_eq!(&by_q.round_queries(27)[..queried], &[229, 114, 76, 57, 46]);
+    assert_eq!(&by_q.tree_caps(27)[..queried], &[8, 7, 7, 6, 6]);
+    assert_eq!(&plain.tree_caps(27)[..queried], &[8, 8, 8, 8, 8]);
+    // The policy stays the ceiling: a lower fixed cap is never raised.
+    let mut low = by_q;
+    low.format.cap = CapPolicy::Fixed(6);
+    assert_eq!(&low.tree_caps(27)[..queried], &[6, 6, 6, 6, 6]);
+    // The FRI-style form has no caps by Q.
+    assert!(fri(1, Some(4), 4, 27, 128).with_caps_by_queries().is_none());
+}
+
+/// ★ A proof under caps by Q verifies, carries each tree's cap at its own
+/// height, and is refused under the same round form without caps by Q (and
+/// the other way round). THE MUTANT: a verifier that takes the policy's caps
+/// ([`Fault::CapsIgnoreQueries`]) refuses the honest proof — the rule is load-
+/// bearing on the verifier's side.
+#[test]
+fn a_proof_under_caps_by_q_is_refused_without_them() {
+    let n = 14;
+    let mut plain = whir(1, Some(4), 4, 3, n, 48);
+    plain.format.cap = CapPolicy::Fixed(8);
+    let by_q = plain.with_caps_by_queries().unwrap();
+    let caps = by_q.tree_caps(n);
+    let plain_caps = plain.tree_caps(n);
+    assert_ne!(caps, plain_caps, "the shape moves at least one cap");
+    let s_q = single(&by_q, n, 71);
+    let s_plain = single(&plain, n, 71);
+    check_single_ok(&s_q, &by_q);
+    check_single_ok(&s_plain, &plain);
+    assert!(
+        check(&s_q, &s_q.proof, &plain).is_err(),
+        "caps by Q under plain"
+    );
+    assert!(
+        check(&s_plain, &s_plain.proof, &by_q).is_err(),
+        "plain under caps by Q"
+    );
+    with(Fault::CapsIgnoreQueries, || {
+        assert!(
+            check(&s_q, &s_q.proof, &by_q).is_err(),
+            "the mutant refuses"
+        );
+    });
+    // A grouped run of BLAKE3 trees in the coset order, one joint tree a run.
+    let mut grouped = fri(1, Some(4), 4, 12, 40);
+    grouped.format.group = GroupFold::Indexed;
+    grouped.format.leaves = LeafOrder::Coset;
+    grouped.format.round0 = Round0Trees::One;
+    grouped.format.cap = CapPolicy::Fixed(8);
+    let grouped = grouped
+        .with_whir_rounds(3, 40, 12)
+        .unwrap()
+        .with_caps_by_queries()
+        .unwrap();
+    stacked_round_trip::<Blake3Whir>(&[12, 12, 11, 12], 12, &grouped, |_| {}).unwrap();
+}
+
 // ───────────────────────────── the card ──────────────────────────────────────
 
 /// Runs `f` with every WHIR commit, re-encode, fold and opening declined by
