@@ -1454,6 +1454,11 @@ fn cmd_prove_block_base(
              shift-claim batches on the card {claim_batches}",
             cfg.format.b3_rounds
         );
+        let (from_stacks, reencoded) = prover::block_whir::coset_counts();
+        eprintln!(
+            "BLOCK BASE COSET OPENINGS: from the stacks {from_stacks} · re-encoded {reencoded} \
+             (round-0 openings of coset-ordered trees)"
+        );
     }
     {
         let (host, one_copy, per_point) = prover::block_whir::final_message_reads();
