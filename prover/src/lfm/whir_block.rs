@@ -729,6 +729,32 @@ impl PlannedPrepared {
     }
 }
 
+/// ★ A chain the BLAKE3 base's round form may verify: at most
+/// [`B3_ROUND_FORM_STACK_BOUND`] variables.
+///
+/// That form charges every chain's counts ONE union bound that reads no
+/// shape, the rounds of a chain over the bound's variables. A taller chain
+/// need not have more rounds (under first fold 6 one of 28, 29 or 30
+/// variables has the seven of 27), so the chains' own union check
+/// (`check_round_form_union`) passes it, while its round-0 fold term falls
+/// below the target (127.34 bits at 28 variables, 128.34 at 27). The host
+/// refuses one through the frame's height caps (`block_frame`); a leaf
+/// refuses it here too, on its own: no table, group stack or prepared stack
+/// taller than the bound.
+///
+/// [`B3_ROUND_FORM_STACK_BOUND`]: crate::block_whir::B3_ROUND_FORM_STACK_BOUND
+pub(crate) fn check_round_form_height(what: &str, num_vars: usize) -> Result<(), String> {
+    let bound = crate::block_whir::B3_ROUND_FORM_STACK_BOUND;
+    if num_vars > bound {
+        Err(format!(
+            "{what} is over {num_vars} variables; the round form's counts are charged a stack of \
+             {bound} at most"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Every program of a block's tree, derived from the trusted ELF, the options,
 /// the format and the statement. See the module docs.
 pub struct WhirBlockPlan {
@@ -970,8 +996,27 @@ impl WhirBlockPlan {
         wrap_hash: super::edsl::WrapHash,
     ) -> Result<Self, String> {
         let base = &format.zf.base;
+        // The round form's stack bound, held by the leaf itself: no table
+        // taller than it, before anything is derived from the statement.
+        if *base == stark::proof::options::BaseFormat::B3_WHIR
+            && matches!(format.b3_rounds, crate::block_whir::B3Rounds::Whir { .. })
+        {
+            for (t, &n) in statement.table_num_vars.iter().enumerate() {
+                check_round_form_height(&format!("table {t}"), usize::from(n))?;
+            }
+        }
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;
+        // And no chain: every group's stack, under the config the frame took.
+        let round_form = matches!(
+            frame.config.format.rounds,
+            multilinear::whir_chain::RoundForm::Whir(_)
+        );
+        if round_form {
+            for (g, layout) in frame.stack_layouts.iter().enumerate() {
+                check_round_form_height(&format!("group {g}'s stack"), layout.n_stack())?;
+            }
+        }
         let elf_digest = crate::statement::elf_digest(elf_bytes);
         let tag = crate::block_whir::block_format_tag(format);
         let statement_bytes =
@@ -1023,6 +1068,12 @@ impl WhirBlockPlan {
             let layout =
                 stark::multilinear_table::global_layout(&stack.shapes(), config.format.stack)
                     .map_err(|e| format!("prepared group {group}: {e:?}"))?;
+            if round_form {
+                check_round_form_height(
+                    &format!("prepared group {group}'s stack"),
+                    layout.n_stack(),
+                )?;
+            }
             let domain = Domain::<GoldilocksField>::new(layout.n_stack() + config.log_blowup)
                 .map_err(|e| format!("prepared group {group}: {e:?}"))?;
             let roots = match prepared_roots {

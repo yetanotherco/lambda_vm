@@ -719,3 +719,86 @@ fn blake3_round_form_leaves_execute_and_refuse_the_other_form() {
         );
     }
 }
+
+/// ★ A ROUND-FORM LEAF REFUSES A CHAIN TALLER THAN ITS STACK BOUND, on its
+/// own. The base's round form charges every chain one union bound, the rounds
+/// of a [`B3_ROUND_FORM_STACK_BOUND`]-variable chain; one variable more has
+/// the same rounds, so the chains' union check passes it, while its counts
+/// were charged a shorter stack. The host's frame refuses such a statement by
+/// its height caps; the leaf's plan refuses it before the frame is built (so
+/// before the ELF is read: none is given), a table taller than the bound
+/// named. Laptop tier: nothing is proved.
+///
+/// [`B3_ROUND_FORM_STACK_BOUND`]: crate::block_whir::B3_ROUND_FORM_STACK_BOUND
+#[test]
+fn a_round_form_leaf_refuses_a_table_taller_than_its_stack_bound() {
+    use super::whir_block::check_round_form_height;
+    use crate::block_whir::{B3_ROUND_FORM_STACK_BOUND, B3Rounds, BlockStatement};
+    use multilinear::whir_chain::{RoundForm, check_round_form, check_round_form_union};
+    let bound = B3_ROUND_FORM_STACK_BOUND;
+    let w = BlockFormat {
+        b3_rounds: B3Rounds::WHIR3,
+        ..many_groups(BaseFormat::B3_WHIR)
+    };
+    // Why the union check cannot: the base's config, one variable past the
+    // bound, has the bound's rounds.
+    let cfg = w.chain_config(&[(64, 21), (8, 20)]);
+    assert!(matches!(cfg.format.rounds, RoundForm::Whir(_)));
+    assert_eq!(check_round_form(&cfg), Ok(()));
+    assert_eq!(cfg.rounds(bound + 1), cfg.rounds(bound));
+    assert_eq!(check_round_form_union(&cfg, bound + 1), Ok(()));
+    assert_eq!(check_round_form_height("a stack", bound), Ok(()));
+    assert!(check_round_form_height("a stack", bound + 1).is_err());
+
+    let counts = crate::TableCounts {
+        cpu: 1,
+        lt: 1,
+        memw: 1,
+        memw_aligned: 1,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 1,
+        memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        copy: 0,
+        blake3: 0,
+        is_wh: 0,
+        ecrec: 0,
+    };
+    let mut heights = vec![20u8; 24];
+    heights[3] = (bound + 1) as u8;
+    let groups: Vec<Vec<u32>> = vec![(0..heights.len() as u32).collect()];
+    let statement = BlockStatement {
+        table_num_vars: &heights,
+        runtime_page_ranges: &[],
+        table_counts: &counts,
+        public_output: &[],
+        num_private_input_pages: 0,
+        groups: &groups,
+        fused_memory: [0; 2],
+    };
+    // No ELF: the refusal comes before anything reads one.
+    let elf: Vec<u8> = Vec::new();
+    let opts = ProofOptions::default_test_options();
+    let e = WhirBlockPlan::derive_blake3(&elf, &opts, &w, statement, 1, None)
+        .err()
+        .expect("no plan for a table past the bound");
+    assert!(
+        e.contains(&format!("table 3 is over {} variables", bound + 1)),
+        "the leaf names the table: {e}"
+    );
+    println!(
+        "ROUND FORM HEIGHT: a 2^{} table refused by the leaf",
+        bound + 1
+    );
+}
