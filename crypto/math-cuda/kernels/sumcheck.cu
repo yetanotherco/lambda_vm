@@ -495,6 +495,51 @@ extern "C" __global__ void add_eq_tensor_base_ext3(uint64_t *__restrict__ dst,
     }
 }
 
+// The round form's claims' half tables, built on the card from each point's
+// base value `y_j` (the point is pow(y_j) = (y, y^2, y^4, ...), variable v at
+// y^(2^v)) and its ext3 scale: `hi[j][x] = prod_{v < hi_bits} (bit (hi_bits-1-v)
+// of x ? y^(2^v) : 1 - y^(2^v))` (base, unscaled) and `lo[j][x] = scale_j ·
+// prod_{v < lo_bits} (bit (lo_bits-1-v) of x ? y^(2^(hi_bits+v)) : 1 - ...)`
+// (ext3): `eq_halves`' tables (variable 0 the index's top bit), value for
+// value. One thread an entry.
+extern "C" __global__ void eq_pow_hi_base(uint64_t *__restrict__ hi, const uint64_t *__restrict__ ys,
+                                          uint64_t points, uint32_t hi_bits) {
+    uint64_t t = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t len = 1ull << hi_bits;
+    if (t >= points * len) return;
+    uint64_t j = t >> hi_bits, x = t & (len - 1);
+    uint64_t p = ys[j];
+    uint64_t acc = 1;
+    for (uint32_t v = 0; v < hi_bits; ++v) {
+        uint64_t bit = (x >> (hi_bits - 1 - v)) & 1;
+        acc = goldilocks::mul(acc, bit ? p : goldilocks::sub(1, p));
+        p = goldilocks::mul(p, p);
+    }
+    hi[t] = goldilocks::canonical(acc);
+}
+
+extern "C" __global__ void eq_pow_lo_ext3(uint64_t *__restrict__ lo, const uint64_t *__restrict__ ys,
+                                          const uint64_t *__restrict__ scales, uint64_t points,
+                                          uint32_t hi_bits, uint32_t lo_bits) {
+    uint64_t t = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t len = 1ull << lo_bits;
+    if (t >= points * len) return;
+    uint64_t j = t >> lo_bits, x = t & (len - 1);
+    uint64_t p = ys[j];
+    for (uint32_t v = 0; v < hi_bits; ++v) p = goldilocks::mul(p, p);
+    uint64_t acc = 1;
+    for (uint32_t v = 0; v < lo_bits; ++v) {
+        uint64_t bit = (x >> (lo_bits - 1 - v)) & 1;
+        acc = goldilocks::mul(acc, bit ? p : goldilocks::sub(1, p));
+        p = goldilocks::mul(p, p);
+    }
+    Fe3 r = ext3::mul_base(load_ext(scales + j * 3), acc);
+    uint64_t *at = lo + t * 3;
+    at[0] = r.a;
+    at[1] = r.b;
+    at[2] = r.c;
+}
+
 // One level of the eq table's doubling: `dst[j + half] = dst[j]·r` and
 // `dst[j] = dst[j]·(1 − r)`, the halves disjoint so one thread owns both. The
 // host seeds `dst[0]` and walks the variables back to front, which is what

@@ -4900,13 +4900,16 @@ mod tests {
         }
     }
 
-    /// ★ CARD PARITY OF THE ROW-TILED CLAIM KERNEL (`LAMBDA_VM_CLAIMS_TILED`):
-    /// the same factors on the card and on the host, after the same group of
-    /// rounds, gain the same shift claims (repeats among them; a weight whose
-    /// high half is shorter than a tile among the shapes): the card's weight
-    /// through the row-tiled base-half kernel is the host's value for value,
-    /// and the next group's sumcheck messages agree. THE MUTANT: the tiled
-    /// path handing its kernel one point fewer gives another weight. Box tier.
+    /// ★ CARD PARITY OF THE CLAIMS UNDER `LAMBDA_VM_CLAIMS_TILED`: the half
+    /// tables built on the card from the points' base values and the
+    /// row-tiled base-half kernel. The same factors on the card and on the
+    /// host, after the same group of rounds, gain the same shift claims
+    /// (repeats among them; a weight whose high half is shorter than a tile
+    /// among the shapes): the card's weight is the host's value for value,
+    /// and the next group's sumcheck messages agree. Points that are not
+    /// pow(y) of base values take today's kernel (the row-tiled count does
+    /// not move) and match the host too. THE MUTANT: the card path dropping
+    /// one point gives another weight. Box tier.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs a card; box tier"]
@@ -4973,7 +4976,13 @@ mod tests {
                 if q > 3 {
                     positions[3] = positions[1];
                 }
-                let points = shift_points::<F, Ext3>(&folded, &positions, n - k);
+                let mut points = shift_points::<F, Ext3>(&folded, &positions, n - k);
+                // The last shape's points with one coordinate moved: not pow(y),
+                // so today's kernel, which must match the host all the same.
+                let pow_shaped = n != 13 || k != 10;
+                if !pow_shaped {
+                    points[0][1] += X::one();
+                }
                 let gamma = X::new([word(5, 9), word(6, 9), word(7, 9)]);
                 let scales = shift_scales(&gamma, q);
                 let before = crate::gpu::shift_claim_tiled_batches();
@@ -4983,8 +4992,8 @@ mod tests {
                     .expect("host claims");
                 assert_eq!(
                     crate::gpu::shift_claim_tiled_batches(),
-                    before + 1,
-                    "n {n}: the row-tiled kernel took the batch"
+                    before + u64::from(pow_shaped),
+                    "n {n}: the card halves took the batch exactly when the points are pow(y)"
                 );
                 let Factors::Device(device) = &mut card else {
                     unreachable!()
@@ -4995,7 +5004,7 @@ mod tests {
                 };
                 let equal = card_weight.len() == weight.len()
                     && card_weight.iter().zip(weight.evals()).all(|(c, h)| c == h);
-                if mutant {
+                if mutant && pow_shaped {
                     assert!(!equal, "n {n}, q {q}: the mutant moves the weight");
                     continue;
                 }

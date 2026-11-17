@@ -478,6 +478,79 @@ impl OpeningSession {
         Ok(())
     }
 
+    /// [`Self::add_eq_tensor_base`] for points `pow(y_j) = (y_j, y_j^2,
+    /// y_j^4, …)` with each `y_j` a base value: the half tables built on the
+    /// card from the `y`s and the ext3 `scales` (`eq_pow_hi_base`,
+    /// `eq_pow_lo_ext3`; the high half over the first `n − lo_bits`
+    /// variables, as `eq_halves` splits them), so only `points` base values
+    /// and `points` scales cross the bus. The same weight, value for value.
+    pub fn add_eq_tensor_pow(
+        &self,
+        ys: &[u64],
+        scales: &[u64],
+        lo_bits: usize,
+        rows: usize,
+    ) -> Result<()> {
+        let n = self.num_vars();
+        let points = ys.len();
+        ensure!(lo_bits <= n, "the low half fits the cube");
+        ensure!((1..=8).contains(&rows), "one to eight rows a thread");
+        ensure!(scales.len() == points * 3, "one ext3 scale a point");
+        if points == 0 {
+            return Ok(());
+        }
+        let hi_bits = n - lo_bits;
+        let hi_len = 1usize << hi_bits;
+        let lo_len = 1usize << lo_bits;
+        let be = backend()?;
+        let ys_dev = crate::device::htod_or_trim(&self.stream, ys)?;
+        let scales_dev = crate::device::htod_or_trim(&self.stream, scales)?;
+        // SAFETY: both tables are written whole by the two kernels below
+        // before the tensor kernel reads them, in stream order.
+        let hi_dev = unsafe { crate::device::alloc_or_trim::<u64>(&self.stream, points * hi_len)? };
+        let lo_dev =
+            unsafe { crate::device::alloc_or_trim::<u64>(&self.stream, points * lo_len * 3)? };
+        let points_arg = points as u64;
+        let hi_bits_arg = hi_bits as u32;
+        let lo_bits_arg = lo_bits as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&be.eq_pow_hi_base)
+                .arg(&hi_dev)
+                .arg(&ys_dev)
+                .arg(&points_arg)
+                .arg(&hi_bits_arg)
+                .launch(LaunchConfig::for_num_elems((points * hi_len) as u32))?;
+            self.stream
+                .launch_builder(&be.eq_pow_lo_ext3)
+                .arg(&lo_dev)
+                .arg(&ys_dev)
+                .arg(&scales_dev)
+                .arg(&points_arg)
+                .arg(&hi_bits_arg)
+                .arg(&lo_bits_arg)
+                .launch(LaunchConfig::for_num_elems((points * lo_len) as u32))?;
+        }
+        let threads = hi_len.div_ceil(rows) << lo_bits;
+        let hi_len_arg = hi_len as u64;
+        let rows_arg = rows as u32;
+        // Through a shared reference, as `add_eq_tensor` writes the weight.
+        unsafe {
+            self.stream
+                .launch_builder(&be.add_eq_tensor_base_ext3)
+                .arg(self.weight.as_ref())
+                .arg(&hi_dev)
+                .arg(&lo_dev)
+                .arg(&hi_len_arg)
+                .arg(&points_arg)
+                .arg(&lo_bits_arg)
+                .arg(&rows_arg)
+                .launch(LaunchConfig::for_num_elems(threads as u32))?;
+        }
+        drop((ys_dev, scales_dev, hi_dev, lo_dev));
+        Ok(())
+    }
+
     /// `weight += scale · eq(point, ·)`, the weight the next group carries.
     pub fn add_scaled_eq(&self, point: &[u64], scale: &[u64]) -> Result<()> {
         assert_eq!(point.len(), self.num_vars() * 3, "the point spans the cube");

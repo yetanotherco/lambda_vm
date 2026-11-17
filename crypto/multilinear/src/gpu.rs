@@ -462,8 +462,8 @@ pub(crate) fn note_round_form_host_encode(card_declined: bool, levels: usize) {
     }
 }
 
-/// Shift-claim batches the card added with the row-tiled base-half kernel
-/// ([`claims_tiled`]).
+/// Shift-claim batches the card added with its own half tables and the
+/// row-tiled kernel ([`claims_tiled`]).
 static SHIFT_CLAIM_TILED_BATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// [`SHIFT_CLAIM_TILED_BATCHES`] so far.
@@ -472,12 +472,16 @@ pub fn shift_claim_tiled_batches() -> u64 {
 }
 
 /// `LAMBDA_VM_CLAIMS_TILED`: the round form's shift claims enter a card's
-/// weight through the row-tiled kernel over base-field high halves
-/// (`add_eq_tensor_base_ext3`: a base × ext3 product a term, each low value
-/// read once for eight outputs) rather than one ext3 product a term and a
-/// read a term (`add_eq_tensor_ext3`). The same weight, value for value; a
-/// prover's choice, no proof byte moves. `1` on; unset or anything else off
-/// (today's kernel), or a test's override ([`force_claims_tiled`]).
+/// weight with their half tables built on the card from the points' base
+/// values (each point is `pow(y)` of a folded-domain value: [`pow_point_ys`];
+/// a few KiB cross the bus, not `Q·2^(n/2)` values built on the host) and the
+/// row-tiled kernel over base-field high halves (`add_eq_tensor_base_ext3`:
+/// a base × ext3 product a term, each low value read once for eight
+/// outputs), rather than host-built tables and one ext3 product a term
+/// (`add_eq_tensor_ext3`). The same weight, value for value; a prover's
+/// choice, no proof byte moves; points of any other shape keep today's
+/// kernel. `1` on; unset or anything else off (today's), or a test's override
+/// ([`force_claims_tiled`]).
 pub fn claims_tiled() -> bool {
     match CLAIMS_TILED_FORCED.load(Ordering::Relaxed) {
         1 => true,
@@ -491,8 +495,8 @@ pub fn claims_tiled() -> bool {
 
 static CLAIMS_TILED_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Test only: the row-tiled path hands its kernel one point fewer than it
-/// was given (the mutant a card parity test must catch).
+/// Test only: the card-halves path drops one point before its kernels (the
+/// mutant a card parity test must catch).
 static CLAIMS_TILED_DROPS_A_POINT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1499,6 +1503,37 @@ where
         num_slots,
         root_slot: slot_of[program.root() as usize],
     })
+}
+
+/// ★ The base values `y_j` of claim points that are each `pow(y_j) = (y_j,
+/// y_j², y_j⁴, …)` (variable `v` at `y_j^(2^v)`, `whir_chain::ood_point`'s
+/// map) with `y_j` in the base field (an ext3 value whose upper limbs are
+/// zero), canonical; `None` when any point is not — another field, a `y`
+/// off the base field, or one coordinate not the square of the one before.
+/// What lets the card build the claims' half tables from the `y`s alone
+/// (`LAMBDA_VM_CLAIMS_TILED`); any other point keeps today's kernel.
+pub fn pow_point_ys<E>(points: &[Vec<math::field::element::FieldElement<E>>]) -> Option<Vec<u64>>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    points
+        .iter()
+        .map(|point| {
+            let first = point.first()?;
+            let [a, b, c] = ext3_raw(first)?;
+            if canonical_limb(b) != 0 || canonical_limb(c) != 0 {
+                return None;
+            }
+            let mut want = first.clone();
+            for coordinate in point {
+                if *coordinate != want {
+                    return None;
+                }
+                want = want.square();
+            }
+            Some(canonical_limb(a))
+        })
+        .collect()
 }
 
 /// An ext3 element's three limbs, or `None` when `E` is not that field.
@@ -6347,7 +6382,18 @@ impl OpeningFactors {
     {
         let failed = |stage| crate::Error::DeviceFailed { stage };
         let session = self.materialize()?;
-        let (lo_bits, his, los) = crate::eq::eq_halves(points, scales, session.num_vars())?;
+        if points.len() != scales.len() {
+            return Err(crate::Error::VariableCountMismatch {
+                expected: points.len(),
+                got: scales.len(),
+            });
+        }
+        if let Some(p) = points.iter().find(|p| p.len() != session.num_vars()) {
+            return Err(crate::Error::VariableCountMismatch {
+                expected: session.num_vars(),
+                got: p.len(),
+            });
+        }
         let flatten = |tables: &[Vec<math::field::element::FieldElement<E>>]| {
             let mut raw = Vec::with_capacity(tables.iter().map(|t| t.len() * 3).sum());
             for table in tables {
@@ -6357,44 +6403,37 @@ impl OpeningFactors {
             }
             Some(raw)
         };
-        let lo = flatten(&los).ok_or_else(|| failed("shift claims' low halves"))?;
-        // The round form's points are the folded domain's, base-field values
-        // lifted: their high halves are base values (no scale is folded into
-        // them), which the row-tiled kernel takes as they are. A point off
-        // the base field keeps today's kernel.
-        let base_hi = || -> Option<Vec<u64>> {
-            let mut raw = Vec::with_capacity(his.iter().map(Vec::len).sum());
-            for table in &his {
-                for value in table {
-                    let [a, b, c] = ext3_raw(value)?;
-                    if canonical_limb(b) != 0 || canonical_limb(c) != 0 {
-                        return None;
-                    }
-                    raw.push(a);
-                }
-            }
-            Some(raw)
+        // ★ The round form's points are pow(y) of the folded domain's base
+        // values: under the knob the card builds the half tables from the
+        // `y`s itself (a few KiB over the bus, not the tables) and takes the
+        // row-tiled kernel. Any other point keeps today's kernel.
+        let pow_ys = if claims_tiled() {
+            pow_point_ys(points)
+        } else {
+            None
         };
-        match base_hi().filter(|_| claims_tiled()) {
-            Some(hi) => {
-                let (hi, lo, count) =
-                    if CLAIMS_TILED_DROPS_A_POINT.load(Ordering::Relaxed) && !points.is_empty() {
-                        let (h, l) = (hi.len() / points.len(), lo.len() / points.len());
-                        (
-                            hi[..hi.len() - h].to_vec(),
-                            lo[..lo.len() - l].to_vec(),
-                            points.len() - 1,
-                        )
-                    } else {
-                        (hi, lo, points.len())
-                    };
+        match pow_ys {
+            Some(mut ys) => {
+                let mut raw_scales = Vec::with_capacity(scales.len() * 3);
+                for scale in scales {
+                    raw_scales.extend_from_slice(
+                        &ext3_raw(scale).ok_or_else(|| failed("shift claims' scales"))?,
+                    );
+                }
+                if CLAIMS_TILED_DROPS_A_POINT.load(Ordering::Relaxed) && !ys.is_empty() {
+                    ys.pop();
+                    raw_scales.truncate(ys.len() * 3);
+                }
+                let lo_bits = session.num_vars() - session.num_vars() / 2;
                 session
-                    .add_eq_tensor_base(&hi, &lo, count, lo_bits, 8)
-                    .map_err(|_| failed("shift claims' weight, row-tiled"))?;
+                    .add_eq_tensor_pow(&ys, &raw_scales, lo_bits, 8)
+                    .map_err(|_| failed("shift claims' weight, card halves"))?;
                 SHIFT_CLAIM_TILED_BATCHES.fetch_add(1, Ordering::Relaxed);
             }
             None => {
+                let (lo_bits, his, los) = crate::eq::eq_halves(points, scales, session.num_vars())?;
                 let hi = flatten(&his).ok_or_else(|| failed("shift claims' high halves"))?;
+                let lo = flatten(&los).ok_or_else(|| failed("shift claims' low halves"))?;
                 session
                     .add_eq_tensor(&hi, &lo, points.len(), lo_bits)
                     .map_err(|_| failed("shift claims' weight"))?;

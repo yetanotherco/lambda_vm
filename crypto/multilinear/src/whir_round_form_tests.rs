@@ -1326,6 +1326,45 @@ fn the_out_of_domain_point_is_kept_off_the_successors_domain() {
     });
 }
 
+/// ★ The card builds the claims' half tables from the points' base values only
+/// when every point is `pow(y)` with `y` in the base field
+/// (`gpu::pow_point_ys`): the round form's shift points are, and give back
+/// their `y`s; a point with one coordinate moved, a point whose `y` is off
+/// the base field (its powers still in order), or one such point among
+/// honest ones, is refused — those claims keep today's kernel.
+#[test]
+fn only_pow_points_of_base_values_take_the_card_halves() {
+    use crate::gpu::pow_point_ys;
+    use crate::whir_chain::ood_point;
+    let n = 13;
+    let folded = Domain::<F>::new(15).unwrap();
+    let g = folded.generator();
+    let positions = [0usize, 1, 7, 7, 4095, 32767];
+    let ys: Vec<FE> = positions.iter().map(|&q| g.pow(q as u64)).collect();
+    let points: Vec<Vec<EE>> = ys
+        .iter()
+        .map(|y| ood_point(&y.to_extension::<Ext>(), n))
+        .collect();
+    let want: Vec<u64> = ys.iter().map(|y| y.canonical()).collect();
+    assert_eq!(pow_point_ys(&points), Some(want));
+    assert_eq!(pow_point_ys::<Ext>(&[]), Some(Vec::new()));
+    // One coordinate moved.
+    let mut moved = points.clone();
+    moved[2][5] += EE::one();
+    assert_eq!(pow_point_ys(&moved), None);
+    let mut last = points.clone();
+    last[0][n - 1] += EE::one();
+    assert_eq!(pow_point_ys(&last), None);
+    // A `y` off the base field, its powers in order.
+    let off = EE::new([FE::from(3u64), FE::from(1u64), FE::zero()]);
+    let mut ext = points.clone();
+    ext.push(ood_point(&off, n));
+    assert_eq!(pow_point_ys(&ext), None);
+    // Not the extension field at all.
+    let base_points: Vec<Vec<FE>> = ys.iter().map(|y| ood_point(y, n)).collect();
+    assert_eq!(pow_point_ys(&base_points), None);
+}
+
 // ───────────────────────────── caps by Q ─────────────────────────────────────
 
 /// ★ CAPS BY Q, the counts: `cap_paid_by` is `⌈log2 Q⌉` binary levels
