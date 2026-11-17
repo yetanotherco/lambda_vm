@@ -161,3 +161,20 @@ fn ecrec_syscall_rejects_overlapping_operands_and_address_overflow() {
     }
     run_at(&sig, &msg, parity, 0xFFFF_FFB8, 0x2000, 0x3000).expect("output ending at the limb top");
 }
+
+#[test]
+fn ecrec_syscall_rejects_an_unaligned_operand() {
+    let msg = [0x44u8; 32];
+    let (sig, parity, _) = sign(5, 7, &msg);
+    for (out, s, m) in [
+        (0x1004, 0x2000, 0x3000),
+        (0x1000, 0x2001, 0x3000),
+        (0x1000, 0x2000, 0x3007),
+    ] {
+        assert!(matches!(
+            run_at(&sig, &msg, parity, out, s, m),
+            Err(ExecutionError::EcrecMisaligned)
+        ));
+    }
+    run_at(&sig, &msg, parity, 0x1008, 0x2010, 0x3018).expect("aligned operands");
+}

@@ -491,6 +491,7 @@ fn the_split_pass_is_the_pass() {
 /// A window the pass cannot mark is refused; the last it can is taken.
 #[test]
 fn the_pass_refuses_a_window_past_its_marks() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let elf = Elf::load(&asm_elf_bytes(PROGRAMS[0])).expect("the ELF loads");
     let builder =
         WindowedTraceBuilder::new(&elf, &[], &MaxRowsConfig::small()).expect("the builder");

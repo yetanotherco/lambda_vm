@@ -158,6 +158,53 @@ fn shapes() -> Vec<(&'static str, Shape)> {
     ]
 }
 
+/// The word memory format's eleven tables (PAGE_W on an ELF page and on a
+/// private-input page, whose interactions differ), laid out by the
+/// production `layout_of` at `num_vars`: the leaf runs each table's own
+/// constraint graph, so each is gated as the shapes above are.
+pub(crate) fn word_airs() -> Vec<(&'static str, crate::VmAir)> {
+    use crate::test_utils as t;
+    let opts = options();
+    let page = crate::tables::page::PageConfig::with_data(0x2000_0000, vec![7; 64]);
+    let private = crate::tables::page::PageConfig::with_private_input(0x2004_0000, vec![9; 64]);
+    vec![
+        (
+            "PAGE_W (ELF page)",
+            t::create_page_w_air(&opts, &page).expect("a page"),
+        ),
+        (
+            "PAGE_W (private page)",
+            t::create_page_w_air(&opts, &private).expect("a page"),
+        ),
+        ("MEM_LOAD8", Box::new(t::create_mem_load8_air(&opts))),
+        ("MEM_STORE8", Box::new(t::create_mem_store8_air(&opts))),
+        ("MEM_LOADW", Box::new(t::create_mem_loadw_air(&opts))),
+        ("MEM_STOREW", Box::new(t::create_mem_storew_air(&opts))),
+        ("MEM_LOAD2W", Box::new(t::create_mem_load2w_air(&opts))),
+        ("MEM_STORE2W", Box::new(t::create_mem_store2w_air(&opts))),
+        ("MEMW_W", Box::new(t::create_memw_w_air(&opts))),
+        ("COPY_W", Box::new(t::create_copy_w_air(&opts))),
+        ("KECCAK_W", Box::new(t::create_keccak_w_air(&opts))),
+        ("ECREC_W", Box::new(t::create_ecrec_w_air(&opts))),
+    ]
+}
+
+/// [`word_airs`]' constraint shapes at 4 and 6 variables (PAGE_W has none).
+fn word_shapes() -> Vec<(&'static str, Shape)> {
+    let mut out = Vec::new();
+    for (name, air) in word_airs() {
+        for num_vars in [4usize, 6] {
+            let layout =
+                crate::multilinear_prove::layout_of(air.as_ref(), air.trace_layout().0, num_vars)
+                    .expect("the table lays out");
+            if layout.shape().num_roots() > 0 {
+                out.push((name, layout.shape().clone()));
+            }
+        }
+    }
+    out
+}
+
 /// Values for every factor the shape can read, plus the two weight slots the
 /// woven factor vector carries (`multilinear_table.rs:616-618`).
 fn factor_values(shape: &Shape, seed: u64) -> Vec<FEE> {
@@ -218,7 +265,13 @@ fn marginal_rows(shape: &Shape, num_values: usize) -> usize {
 /// value would pass for an emitter that had baked them in.
 #[test]
 fn the_combine_leg_computes_what_the_host_computes() {
-    for (name, shape) in shapes() {
+    let words = word_shapes();
+    assert_eq!(
+        words.len(),
+        2 * 10,
+        "every word table but PAGE_W carries constraints, at two heights"
+    );
+    for (name, shape) in shapes().into_iter().chain(words) {
         let values = factor_values(&shape, 0xC0FFEE);
         let program = combine_program(&shape, values.len());
         for seed in [0x11u64, 0x22, 0x33] {
@@ -259,7 +312,7 @@ fn the_combine_leg_computes_what_the_host_computes() {
 /// ★ F1 for the leg: its rows against the closed form.
 #[test]
 fn the_combine_leg_emits_its_closed_form() {
-    for (name, shape) in shapes() {
+    for (name, shape) in shapes().into_iter().chain(word_shapes()) {
         let values = factor_values(&shape, 0xC0FFEE);
         let measured = marginal_rows(&shape, values.len());
         let predicted = combine_rows(&shape);

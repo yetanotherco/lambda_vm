@@ -844,6 +844,73 @@ fn fused_windows_walked_on_threads_build_the_windowed_tables() {
     }
 }
 
+/// ★ Under the word memory format (with the in-row register format), walked
+/// on 1, 2 and 3 threads at window lengths 7 and 33 from the lean pass's
+/// entries (each load or store's words, not the eight bytes from its address),
+/// with the walkers routing their windows or not, the windows build the tables
+/// the single walker's windowed build makes: the same word tables, PAGE_W
+/// tables and BITWISE.
+#[test]
+fn word_windows_walked_on_threads_build_the_windowed_tables() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    use crate::tables::fused_memory::MemoryFormat;
+    use crate::tables::memw_aligned::MemwAlignedOrder;
+    use crate::tables::register::RegisterFormat;
+    let max_rows = MaxRowsConfig::small();
+    fn formats(b: WindowedTraceBuilder<'_>) -> Result<WindowedTraceBuilder<'_>, Error> {
+        b.register_format(RegisterFormat::InRow)?
+            .memw_aligned_order(MemwAlignedOrder::Limbs)?
+            .memory_format(MemoryFormat::Words)
+    }
+    for name in [
+        "fused_mem_cases",
+        "all_instructions_64",
+        "all_loadstore_32",
+        "misalign_sd",
+        "misalign_lh",
+        "test_copy_ecalls",
+        "test_copy_overlaps",
+        "test_commit_split",
+        "test_keccak256",
+        "test_ecrec",
+    ] {
+        let (program, logs) = run(name);
+        let reference = {
+            let mut builder =
+                formats(WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder"))
+                    .expect("the formats");
+            let body = logs.len() - 1;
+            let cut = body - body % 7;
+            let mut chunks = Vec::new();
+            for w in logs[..cut].chunks(7) {
+                chunks.extend(builder.push(w).expect("a window"));
+            }
+            let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+            traces.insert_streamed(chunks).expect("placeholders");
+            traces
+        };
+        assert!(
+            name != "fused_mem_cases" || reference.word_counts()[..6].iter().all(|&n| n > 0),
+            "{name}: {:?}",
+            reference.word_counts()
+        );
+        for window in [7, 33] {
+            for walkers in [1, 2, 3] {
+                for light in [0u8, 2] {
+                    let traces =
+                        walked_on_threads_as(&program, &max_rows, window, walkers, None, &|b| {
+                            formats(b)?.light_walk(light)
+                        })
+                        .unwrap_or_else(|e| {
+                            panic!("{name}, window {window}, {walkers} walkers: {e:?}")
+                        });
+                    same_traces(&reference, &traces);
+                }
+            }
+        }
+    }
+}
+
 /// A window the executor sends without its memory stops every thread and is
 /// refused, wherever it falls; so is an error from the absorbing side.
 #[test]

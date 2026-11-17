@@ -713,6 +713,8 @@ pub struct PlannedPrepared {
     /// `(slot in the group's table order, AIR index, prefix length)`, in stack
     /// order.
     pub tables: Vec<(usize, usize, usize)>,
+    /// Each table's prepared columns' height in variables, in `tables`' order.
+    pub vars: Vec<usize>,
     /// Derived from the program and the partition, never read from a proof.
     pub roots: Vec<Commitment>,
     pub layout: StackedLayout,
@@ -726,6 +728,16 @@ impl PlannedPrepared {
             .iter()
             .find(|&&(_, table, _)| table == air)
             .map(|&(_, _, n)| n)
+    }
+
+    /// The prefix the stack settles of table `air` and its columns' height in
+    /// variables, when it holds it.
+    pub fn settles_at(&self, air: usize) -> Option<(usize, usize)> {
+        self.tables
+            .iter()
+            .zip(&self.vars)
+            .find(|((_, table, _), _)| *table == air)
+            .map(|(&(_, _, n), &vars)| (n, vars))
     }
 }
 
@@ -766,6 +778,9 @@ pub struct WhirBlockPlan {
     leaf_bound: Option<LeafBound>,
     /// How the leaves check each chain's queries: the format's.
     leaf_query: LeafQuery,
+    /// The block's memory format, the verifier's: which family a page table's
+    /// preprocessed columns are (PAGE's, or PAGE_W's under the word format).
+    memory: crate::tables::fused_memory::MemoryFormat,
     /// Whether a leaf's bus share is `p · (1/q)` ([`emit_share`]): the
     /// process's knob for a prover ([`share_inverse`]), always on for the
     /// pinned verifier.
@@ -1024,6 +1039,7 @@ impl WhirBlockPlan {
                 .iter()
                 .map(|&(position, air, n)| (position - start, air, n))
                 .collect();
+            let vars: Vec<usize> = stack.shapes().iter().map(|&(_, v)| v).collect();
             let layout =
                 stark::multilinear_table::global_layout(&stack.shapes(), config.format.stack)
                     .map_err(|e| format!("prepared group {group}: {e:?}"))?;
@@ -1045,6 +1061,7 @@ impl WhirBlockPlan {
             prepared.push(PlannedPrepared {
                 group,
                 tables,
+                vars,
                 roots,
                 layout,
                 domain,
@@ -1124,6 +1141,7 @@ impl WhirBlockPlan {
             partition,
             leaf_bound: None,
             leaf_query: format.leaf_query,
+            memory: format.memory,
             share_inverse,
             one_top: format.leaf_scale == LeafScale::DoubledOneTop,
             fan_in,
@@ -1899,15 +1917,23 @@ pub fn verify_block_tree_grouped(
 
 /// [`verify_block_tree`] at the pinned format with the caller's NAMED choices:
 /// its group opening, its WHIR blowup, its round-0 leaf order, its round-0
-/// trees, its leaf scale and its leaves' query check (`verify-block --group /
-/// --blowup / --leaves / --trees / --leaf-double-from / --leaf-query`), every
+/// trees, its leaf scale, its leaves' query check, its GKR packing and its
+/// memory format (`verify-block --group / --blowup / --leaves / --trees /
+/// --leaf-double-from / --leaf-query / --argue-pack / --memory`), every
 /// other preset pinned as before
 /// (the folds, stack, grind and caps are [`crate::zf_format::ZfFormat::DEFAULT`]'s,
-/// never the environment's). All six are the verifier's constants; the proof
+/// never the environment's). All eight are the verifier's constants; the proof
 /// carries none of them. A caller cannot hand in a format of its own:
 /// `verify_block_tree_as` is crate-internal. The coset order is refused by name
 /// under a base whose trees do not take it, and one tree a run under the
 /// natural order.
+///
+/// The memory format chooses the block's AIR set, its statement's words (a
+/// fused or a word statement absorbs its format word and its tables' counts)
+/// and so every leaf program and the block's identity; the frame refuses a
+/// statement that states another format's tables. A word-format block's
+/// counts ride in its statement and are checked there: the format itself is
+/// never read from the statement.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_block_tree_at(
     elf_bytes: &[u8],
@@ -1920,14 +1946,18 @@ pub fn verify_block_tree_at(
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
     pack: multilinear::whir_chain::GkrPack,
+    memory: crate::tables::fused_memory::MemoryFormat,
 ) -> Result<(), String> {
-    let presets = verifier_presets_at(group, blowup, leaves, trees, leaf_scale, leaf_query, pack)?;
+    let presets = verifier_presets_at(
+        group, blowup, leaves, trees, leaf_scale, leaf_query, pack, memory,
+    )?;
     verify_block_tree_as(elf_bytes, statement, top, &presets)
 }
 
 /// [`verify_block_tree_at`]'s presets: [`BlockFormat::pinned_with`] `group`
-/// with the six named choices set (the GKR packing through
-/// [`BlockFormat::with_pack`]), the coset order refused under a base whose
+/// with the eight named choices set (the GKR packing through
+/// [`BlockFormat::with_pack`], the memory format through
+/// [`BlockFormat::with_memory`]), the coset order refused under a base whose
 /// trees do not take it and one tree a run refused under the natural order
 /// ([`crate::zf_format::ZfFormat::check_trees`]), whatever the two were set to.
 #[allow(clippy::too_many_arguments)]
@@ -1939,8 +1969,11 @@ pub(crate) fn verifier_presets_at(
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
     pack: multilinear::whir_chain::GkrPack,
+    memory: crate::tables::fused_memory::MemoryFormat,
 ) -> Result<VerifierPresets, String> {
-    let mut format = BlockFormat::pinned_with(group).with_pack(pack);
+    let mut format = BlockFormat::pinned_with(group)
+        .with_pack(pack)
+        .with_memory(memory);
     format.zf.whir_blowup = blowup.factor();
     format.zf.whir_leaves = leaves;
     format.zf.whir_trees = trees;
@@ -2237,29 +2270,183 @@ enum Route {
     Bitwise,
     ConstMle(Vec<Vec<FE>>),
     Page(Vec<Vec<FE>>),
-    Prepared(usize),
+    /// The prefix a prepared opening settles, and the height in variables of
+    /// the columns it opens.
+    Prepared {
+        settled: usize,
+        num_vars: usize,
+    },
     /// A CPU table's TIMESTAMP, by its closed form.
     Timestamp,
 }
 
+impl Route {
+    /// How many of the table's preprocessed columns this route checks: every
+    /// column of its family's own, or the prefix a prepared opening settles.
+    fn columns_checked(&self) -> usize {
+        match self {
+            Route::None => 0,
+            Route::Bitwise => crate::tables::bitwise::NUM_PRECOMPUTED_COLS,
+            Route::ConstMle(columns) | Route::Page(columns) => columns.len(),
+            Route::Prepared { settled, .. } => *settled,
+            Route::Timestamp => crate::tables::cpu::NUM_PRECOMPUTED_COLS,
+        }
+    }
+
+    /// The columns the route folds, borrowed (none for a closed form or an
+    /// opening).
+    fn view(&self) -> Vec<&[FE]> {
+        match self {
+            Route::ConstMle(columns) | Route::Page(columns) => {
+                columns.iter().map(Vec::as_slice).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Whether the test fault `Fault::$name` of [`route_faults`] is on: never
+/// outside the tests.
+macro_rules! route_fault {
+    ($name:ident) => {{
+        #[cfg(test)]
+        let on = route_faults::on(route_faults::Fault::$name);
+        #[cfg(not(test))]
+        let on = false;
+        on
+    }};
+}
+
+/// The name of every PAGE table (`PAGE:0x<base>`).
+const PAGE_NAME_PREFIX: &str = "PAGE:";
+
+/// A page table's preprocessed columns, as the leaf checks them, under the
+/// block's memory format: PAGE's under the split and fused formats (OFFSET
+/// and INIT, a byte a row, `2^18` rows), PAGE_W's under the word format
+/// (OFFSET and the initial word's four 16-bit halves, a word a row, `2^15`
+/// rows); OFFSET alone on a private-input page, whose INIT is committed.
+///
+/// The family is the VERIFIER's memory format, never the proof's; the table's
+/// name must be that family's, which the frame built, so a page table of the
+/// other family is a plan nobody derived and is refused, never emitted.
+fn page_columns(
+    memory: crate::tables::fused_memory::MemoryFormat,
+    config: &crate::tables::page::PageConfig,
+    name: &str,
+) -> Result<Vec<Vec<FE>>, String> {
+    use crate::tables::fused_memory::MemoryFormat;
+    let private = config.is_private_input != route_fault!(PrivateRouteSwapped);
+    let words = (memory == MemoryFormat::Words) != route_fault!(OtherPageFamily);
+    let prefix = if words {
+        crate::tables::page_w::NAME_PREFIX
+    } else {
+        PAGE_NAME_PREFIX
+    };
+    // Off under the family mutant alone, so its run reaches the checks after.
+    if !name.starts_with(prefix) && !route_fault!(OtherPageFamily) {
+        return Err(format!(
+            "page table {name} under the {memory:?} memory format: its pages are {prefix} tables"
+        ));
+    }
+    Ok(match (words, private) {
+        (true, true) => vec![crate::tables::page_w::offset_column()],
+        (true, false) => crate::tables::page_w::preprocessed_columns(config),
+        (false, true) => vec![crate::tables::page::offset_column()],
+        (false, false) => crate::tables::page::preprocessed_columns(config),
+    })
+}
+
+/// Table `table`'s route ([`route_for`]), held to the AIR
+/// ([`check_route_columns`]): the route checks exactly as many preprocessed
+/// columns as the table declares. A route that checked fewer would leave a
+/// column nobody checks; one that checked more, a column the table does not
+/// have.
 fn route_of(
     plan: &WhirBlockPlan,
     air: &DynAir<'_>,
     table: usize,
     first_page: usize,
 ) -> Result<Route, String> {
-    if let Some(n) = plan.prepared.iter().find_map(|p| p.settles(table)) {
-        return Ok(Route::Prepared(n));
+    let route = route_for(plan, air, table, first_page)?;
+    check_route_columns(
+        &route,
+        air.num_precomputed_columns(),
+        plan.frame.shapes[table].1,
+        air.name(),
+        table,
+    )?;
+    Ok(route)
+}
+
+/// The checks of [`route_of`]: the route checks `declared` columns, and the
+/// columns a route folds are as tall as the table's stated `num_vars` — a
+/// page of the other family is not (PAGE's are `2^18` rows, PAGE_W's
+/// `2^15`), nor a fixed table (KECCAK_RC, REGISTER) a statement states at
+/// another height than its columns', nor a prepared table whose opened
+/// columns are another height. The legs would otherwise assert at emit time;
+/// a statement is refused by an error, never a panic.
+fn check_route_columns(
+    route: &Route,
+    declared: usize,
+    num_vars: usize,
+    name: &str,
+    table: usize,
+) -> Result<(), String> {
+    let checked = route.columns_checked();
+    if checked != declared && !route_fault!(NoCountCheck) {
+        return Err(format!(
+            "table {table} ({name}) declares {declared} preprocessed columns and its route \
+             checks {checked}"
+        ));
+    }
+    if let Route::Page(columns) | Route::ConstMle(columns) = route
+        && !route_fault!(NoHeightCheck)
+        && let Some(column) = columns
+            .iter()
+            .find(|c| Some(c.len()) != 1usize.checked_shl(num_vars as u32))
+    {
+        return Err(format!(
+            "table {table} ({name}) states 2^{num_vars} rows and its route's columns are {} rows",
+            column.len()
+        ));
+    }
+    if let Route::Prepared {
+        num_vars: opened, ..
+    } = route
+        && *opened != num_vars
+        && !route_fault!(NoHeightCheck)
+    {
+        return Err(format!(
+            "table {table} ({name}) states 2^{num_vars} rows and its prepared columns are \
+             2^{opened} rows"
+        ));
+    }
+    Ok(())
+}
+
+/// Table `table`'s route, before [`route_of`]'s checks: a prepared opening's
+/// prefix, the page route, the CPU's TIMESTAMP, or the epoch's routes by name.
+fn route_for(
+    plan: &WhirBlockPlan,
+    air: &DynAir<'_>,
+    table: usize,
+    first_page: usize,
+) -> Result<Route, String> {
+    if let Some((n, num_vars)) = plan.prepared.iter().find_map(|p| p.settles_at(table)) {
+        let settled = if route_fault!(SettleOneFewer) {
+            n.saturating_sub(1)
+        } else {
+            n
+        };
+        return Ok(Route::Prepared { settled, num_vars });
     }
     let pages = first_page..first_page + plan.frame.page_configs.len();
     if pages.contains(&table) {
+        if route_fault!(NoPageLeg) {
+            return Ok(Route::None);
+        }
         let config = &plan.frame.page_configs[table - first_page];
-        let columns = if config.is_private_input {
-            vec![crate::tables::page::offset_column()]
-        } else {
-            crate::tables::page::preprocessed_columns(config)
-        };
-        return Ok(Route::Page(columns));
+        return page_columns(plan.memory, config, air.name()).map(Route::Page);
     }
     // A CPU table's TIMESTAMP is checked by its closed form, by name and with its
     // AIR's one preprocessed column: never materialised (2^21 rows a table).
@@ -2280,6 +2467,44 @@ fn route_of(
             "table {table} ({other}) carries {} preprocessed columns and no route covers them",
             columns.len()
         )),
+    }
+}
+
+/// The leg's plan for a table on `route`, over `view` (the route's columns,
+/// borrowed: OFFSET first on a page) and the table's `num_vars`.
+fn preprocessed_plan<'a>(
+    route: &Route,
+    view: &'a [&'a [FE]],
+    num_vars: usize,
+) -> PreprocessedPlan<'a> {
+    match route {
+        Route::None => PreprocessedPlan {
+            settled: 0,
+            route: PreprocessedRoute::None,
+        },
+        Route::Bitwise => PreprocessedPlan {
+            settled: 0,
+            route: PreprocessedRoute::Bitwise,
+        },
+        Route::ConstMle(_) => PreprocessedPlan {
+            settled: 0,
+            route: PreprocessedRoute::ConstMle(view),
+        },
+        Route::Page(_) => PreprocessedPlan {
+            settled: 0,
+            route: PreprocessedRoute::Page {
+                offset: view[0],
+                init: &view[1..],
+            },
+        },
+        Route::Prepared { settled, .. } => PreprocessedPlan {
+            settled: *settled,
+            route: PreprocessedRoute::None,
+        },
+        Route::Timestamp => PreprocessedPlan {
+            settled: 0,
+            route: PreprocessedRoute::Timestamp { num_vars },
+        },
     }
 }
 
@@ -2603,50 +2828,12 @@ fn emit_leaf_over(
                 crate::tables::bitwise::NUM_VARS
             ));
         }
-        let views: Vec<Vec<&[FE]>> = routes
-            .iter()
-            .map(|route| match route {
-                Route::ConstMle(columns) | Route::Page(columns) => {
-                    columns.iter().map(Vec::as_slice).collect()
-                }
-                _ => Vec::new(),
-            })
-            .collect();
+        let views: Vec<Vec<&[FE]>> = routes.iter().map(Route::view).collect();
         let plans: Vec<PreprocessedPlan<'_>> = routes
             .iter()
             .zip(&views)
             .enumerate()
-            .map(|(index, (route, view))| match route {
-                Route::None => PreprocessedPlan {
-                    settled: 0,
-                    route: PreprocessedRoute::None,
-                },
-                Route::Bitwise => PreprocessedPlan {
-                    settled: 0,
-                    route: PreprocessedRoute::Bitwise,
-                },
-                Route::ConstMle(_) => PreprocessedPlan {
-                    settled: 0,
-                    route: PreprocessedRoute::ConstMle(view),
-                },
-                Route::Page(_) => PreprocessedPlan {
-                    settled: 0,
-                    route: PreprocessedRoute::Page {
-                        offset: view[0],
-                        init: view.get(1).copied(),
-                    },
-                },
-                Route::Prepared(settled) => PreprocessedPlan {
-                    settled: *settled,
-                    route: PreprocessedRoute::None,
-                },
-                Route::Timestamp => PreprocessedPlan {
-                    settled: 0,
-                    route: PreprocessedRoute::Timestamp {
-                        num_vars: shapes[index].num_vars,
-                    },
-                },
-            })
+            .map(|(index, (route, view))| preprocessed_plan(route, view, shapes[index].num_vars))
             .collect();
         let slots: Vec<&[usize]> = owned.layouts.iter().map(|l| l.slot_of()).collect();
         let ladder_len = shapes
@@ -3158,6 +3345,57 @@ fn commit_prepared(
     crate::with_block_hash!(*base, |H| {
         Ok(crate::block_whir::commit_group_on_host::<H>(stack, config)?.roots)
     })
+}
+
+#[cfg(test)]
+#[path = "whir_block_words_tests.rs"]
+mod words_tests;
+
+/// The route checks' mutants ([`route_of`]), each of which a test must
+/// catch: thread-local, so a test that sets one moves no other test's
+/// program.
+#[cfg(test)]
+pub(crate) mod route_faults {
+    /// One mutant; several may be on at once.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        /// The route's column count is not held to the table's.
+        NoCountCheck = 1,
+        /// A page route's column height is not held to the table's.
+        NoHeightCheck = 2,
+        /// A private-input page takes an ELF page's route, and the reverse.
+        PrivateRouteSwapped = 4,
+        /// A page table takes the other memory format's page columns (PAGE's
+        /// for PAGE_W, PAGE_W's for PAGE), its name unchecked.
+        OtherPageFamily = 8,
+        /// A prepared opening settles one column fewer than it covers.
+        SettleOneFewer = 16,
+        /// A page table's columns are checked by nothing (its route checks
+        /// none).
+        NoPageLeg = 32,
+    }
+
+    std::thread_local! {
+        static FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Whether `fault` is on, on this thread.
+    pub(crate) fn on(fault: Fault) -> bool {
+        FAULTS.with(|c| c.get() & fault as u8 != 0)
+    }
+
+    /// Runs `f` with `fault` on beside those already on, restoring the set
+    /// after.
+    pub(crate) fn with<R>(fault: Fault, f: impl FnOnce() -> R) -> R {
+        struct Restore(u8);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAULTS.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FAULTS.with(|c| c.replace(c.get() | fault as u8)));
+        f()
+    }
 }
 
 /// Test only: the leaf's mutations of its commit-time answers, one at a time,

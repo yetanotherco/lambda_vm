@@ -106,7 +106,10 @@ fn built(
             fast.enable_history().expect("history mode");
             while let Some((logs, history)) = fast.resume_history(window).expect("the run") {
                 let last = (fast.pc() == 0)
-                    .then(|| fast.take_history_final().map(Box::new))
+                    .then(|| {
+                        fast.take_history_final()
+                            .map(crate::tables::trace_builder::windowed::parallel::RunEnd::boxed)
+                    })
                     .flatten();
                 let sent = tx.send(super::parallel::ExecWindow {
                     logs: Arc::new(logs),
@@ -316,7 +319,10 @@ fn memw_r_chunks(
             fast.enable_history().expect("history mode");
             while let Some((logs, history)) = fast.resume_history(window).expect("the run") {
                 let last = (fast.pc() == 0)
-                    .then(|| fast.take_history_final().map(Box::new))
+                    .then(|| {
+                        fast.take_history_final()
+                            .map(crate::tables::trace_builder::windowed::parallel::RunEnd::boxed)
+                    })
                     .flatten();
                 let sent = tx.send(super::parallel::ExecWindow {
                     logs: Arc::new(logs),
@@ -395,6 +401,7 @@ fn the_real_blocks_words_decode_to_the_walks_rows() {
 /// cycles (`math_cuda::card_rows`): a chunk's rows must be in cycle order.
 #[test]
 fn a_words_chunks_rows_are_in_cycle_order() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let max_rows = MaxRowsConfig::small();
     let mut out_of_order = Vec::new();
     for name in PROGRAMS {
@@ -448,7 +455,10 @@ fn finish_of(
             fast.enable_history().expect("history mode");
             while let Some((logs, history)) = fast.resume_history(7).expect("the run") {
                 let last = (fast.pc() == 0)
-                    .then(|| fast.take_history_final().map(Box::new))
+                    .then(|| {
+                        fast.take_history_final()
+                            .map(crate::tables::trace_builder::windowed::parallel::RunEnd::boxed)
+                    })
                     .flatten();
                 let sent = tx.send(super::parallel::ExecWindow {
                     logs: Arc::new(logs),

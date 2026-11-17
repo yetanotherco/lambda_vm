@@ -48,7 +48,10 @@ fn walked(program: &Elf, max_rows: &MaxRowsConfig, window: usize) -> Walked {
                     .expect("the logs")
                     .extend_from_slice(&window_logs);
                 let last = (fast.pc() == 0)
-                    .then(|| fast.take_history_final().map(Box::new))
+                    .then(|| {
+                        fast.take_history_final()
+                            .map(crate::tables::trace_builder::windowed::parallel::RunEnd::boxed)
+                    })
                     .flatten();
                 let sent = tx.send(ExecWindow {
                     logs: Arc::new(window_logs),

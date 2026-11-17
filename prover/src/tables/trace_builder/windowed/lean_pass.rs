@@ -346,14 +346,28 @@ impl Accesses for Bytes {
     }
 }
 
-/// An ECALL's register writes and accesses, as the walk makes them.
-fn ecall(memory: &mut impl Accesses, regs: &mut Registers, op: CpuOp<'_>, ts: u64) {
+/// The words `len` bytes from `address` cover, read: under the word memory
+/// format a chip's walk reads every byte of each word its range touches.
+fn covering(memory: &mut impl Accesses, address: u64, len: u64) {
+    let (base, words) = executor::vm::history::covering_words(address, len);
+    if words > 0 {
+        memory.access(base, (words * 8) as usize, None);
+    }
+}
+
+/// An ECALL's register writes and accesses, as the walk makes them (`words`:
+/// under the word memory format, where a chip's accesses read the words its
+/// ranges cover).
+fn ecall(memory: &mut impl Accesses, regs: &mut Registers, op: CpuOp<'_>, ts: u64, words: bool) {
     if op.ecall_commit() {
         let (buf, count) = (op.commit_buf_addr(), op.commit_count());
         regs.write(10, count, ts);
         regs.write(11, buf, ts);
         regs.write(12, count, ts);
         regs.index = (regs.index.0.wrapping_add(count as u32), ts);
+        if words {
+            covering(memory, buf, count);
+        }
         for k in 0..count {
             memory.access(buf.wrapping_add(k), 1, Some(ts));
         }
@@ -366,6 +380,10 @@ fn ecall(memory: &mut impl Accesses, regs: &mut Registers, op: CpuOp<'_>, ts: u6
         let (dst, src, count) = (regs.value(10), regs.value(11), regs.value(12));
         for (reg, value) in [(10u8, dst), (11, src), (12, count)] {
             regs.write(reg, value, ts);
+        }
+        if words {
+            covering(memory, src, count);
+            covering(memory, dst, count);
         }
         if op.ecall_dma_memcpy() {
             memory.access(src, count as usize, Some(ts));
@@ -399,6 +417,10 @@ fn ecall(memory: &mut impl Accesses, regs: &mut Registers, op: CpuOp<'_>, ts: u6
         let (ptr, len, out) = (regs.value(10), regs.value(11), regs.value(12));
         for (reg, value) in [(10u8, ptr), (11, len), (12, out)] {
             regs.write(reg, value, ts);
+        }
+        if words {
+            covering(memory, ptr, len);
+            covering(memory, out, 32);
         }
         memory.access(ptr, len as usize, Some(ts));
         for i in 0..4u64 {
@@ -510,13 +532,16 @@ impl Decode {
 }
 
 /// One window's logs from cycle `first`: the register cells kept in `regs`,
-/// and (with `MEMORY`) the memory's accesses sent to `memory`.
+/// and (with `MEMORY`) the memory's accesses sent to `memory`. Under the word
+/// memory format (`words`) a load or store reads the words it touches, as the
+/// walk reads them ([`word_access`]).
 fn pass_window<M: Accesses, const MEMORY: bool>(
     decode: &Decode,
     memory: &mut M,
     regs: &mut Registers,
     logs: &[Log],
     first: usize,
+    words: bool,
 ) -> Result<(), Error> {
     let most = clock::window_max_timestamp(first, logs.len());
     clock::check_clock(most, "the lean pass")?;
@@ -536,7 +561,11 @@ fn pass_window<M: Accesses, const MEMORY: bool>(
         let op = CpuOperation::from_log(log, ts, entry, row);
         let f = &entry.fields;
         if MEMORY && f.memory {
-            memory.load_or_store(op.res, f.mem_bytes(), ts);
+            if words {
+                word_access(memory, op.res, f.mem_bytes(), ts);
+            } else {
+                memory.load_or_store(op.res, f.mem_bytes(), ts);
+            }
         }
         if f.read_register1 && f.rs1 != 0 {
             if f.rs1 == 255 {
@@ -553,10 +582,25 @@ fn pass_window<M: Accesses, const MEMORY: bool>(
         }
         regs.pc = (op.next_pc, ts + 1);
         if MEMORY && f.ecall {
-            ecall(memory, regs, CpuOp::new(entry, &op), ts);
+            ecall(memory, regs, CpuOp::new(entry, &op), ts, words);
         }
     }
     Ok(())
+}
+
+/// A load or store under the word memory format, as the word walk accesses
+/// it: the word holding `base` read, and the next one when the `count` bytes
+/// cross into it, then the bytes from `base` stamped `ts`.
+#[inline]
+fn word_access(memory: &mut impl Accesses, base: u64, count: usize, ts: u64) {
+    let word = base & !7;
+    let span = if (base & 7) as usize + count > 8 {
+        16
+    } else {
+        8
+    };
+    memory.access(word, span, None);
+    memory.access(base, count, Some(ts));
 }
 
 /// The walk's timestamps and registers, a window at a time, and each window's
@@ -565,6 +609,8 @@ pub(crate) struct LeanPass {
     decode: Decode,
     bytes: Bytes,
     registers: Registers,
+    /// Loads and stores read the words they touch (the word memory format).
+    words: bool,
 }
 
 impl LeanPass {
@@ -576,7 +622,16 @@ impl LeanPass {
             decode: Decode::new(decode)?,
             bytes: Bytes::new(),
             registers: Registers::of(registers),
+            words: false,
         })
+    }
+
+    /// Under the word memory format (`on`): each load or store reads the
+    /// words it touches, so its entries are those words' bytes, as the word
+    /// walk reads them.
+    pub(crate) fn words(mut self, on: bool) -> Self {
+        self.words = on;
+        self
     }
 
     /// Starts window `window` (its entries cleared). Windows are numbered
@@ -593,6 +648,7 @@ impl LeanPass {
             &mut self.registers,
             logs,
             first,
+            self.words,
         )
     }
 
@@ -606,6 +662,7 @@ impl LeanPass {
             &mut self.registers,
             logs,
             first,
+            self.words,
         )
     }
 

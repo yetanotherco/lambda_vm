@@ -422,6 +422,27 @@ pub enum BusId {
     Reg = 39,
 
     // =========================================================================
+    // Memory as 8-byte words (`tables::word_memory`)
+    // =========================================================================
+    /// Word tokens: `(address_lo, address_hi, timestamp, lo, hi)`, one token an
+    /// aligned 8-byte RAM word, the address two elements and the timestamp one
+    /// (`tables::fused_memory::MemoryFormat::Words`). Its own id, so no tuple
+    /// of another shape (a byte token, a register token) is ever read as one:
+    /// the fingerprint has no length term.
+    MemWord = 40,
+    /// A chip's access to one RAM word, received by MEMW_W: a write
+    /// `(1, address_lo, address_hi, timestamp, new_lo, new_hi)` or an access
+    /// `(0, address_lo, address_hi, timestamp, old_lo, old_hi, new_lo,
+    /// new_hi)` (a read sends old = new). Register accesses never travel on it.
+    MemWordMsg = 41,
+    /// COPY_W's chain under the word memory format: a call's row sends the
+    /// next row's `(T, destination key, source key, count, functionality,
+    /// shift, the source word it read)`, which that row receives as its own
+    /// keys, count and first source word (`tables::copy_w`). Its own id: its
+    /// tuple carries a word, which COPY's chain does not.
+    CopyWordNext = 42,
+
+    // =========================================================================
     // LFM — standard BLAKE3 on the lean tables (`lfm::blake3_lean`)
     // =========================================================================
     /// The lean BLAKE3 byte table's lookups: `(op, a, b, …)` against the
@@ -475,6 +496,9 @@ impl BusId {
             BusId::LfmPublic => "LfmPublic",
             BusId::Blake3Absorb => "Blake3Absorb",
             BusId::IsWh => "IsWh",
+            BusId::MemWord => "MemWord",
+            BusId::MemWordMsg => "MemWordMsg",
+            BusId::CopyWordNext => "CopyWordNext",
             BusId::B3lXor => "B3lXor",
             BusId::B3lRound => "B3lRound",
             BusId::CapLookup => "CapLookup",
@@ -517,6 +541,9 @@ impl TryFrom<u64> for BusId {
             38 => Ok(BusId::KeccakSponge),
             39 => Ok(BusId::Reg),
             37 => Ok(BusId::IsWh),
+            40 => Ok(BusId::MemWord),
+            41 => Ok(BusId::MemWordMsg),
+            42 => Ok(BusId::CopyWordNext),
             43 => Ok(BusId::B3lXor),
             44 => Ok(BusId::B3lRound),
             45 => Ok(BusId::CapLookup),
@@ -1210,5 +1237,34 @@ fn imm_from_instruction(instruction: Instruction) -> u64 {
             (imm as i32) as i64 as u64
         }
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod bus_id_tests {
+    use super::BusId;
+    use std::collections::BTreeSet;
+
+    /// ★ `BusId` is one registry of distinct ids: every id below 256 that
+    /// decodes decodes to the bus whose id it is, no two buses share a name,
+    /// and the word buses (40, 41, 42) are the last three. A bus added with
+    /// an id another holds, or decoded from the wrong id, fails here (the
+    /// enum's own discriminants are distinct by the compiler).
+    #[test]
+    fn every_bus_has_its_own_id_and_name() {
+        let mut ids = Vec::new();
+        let mut names = BTreeSet::new();
+        for id in 0u64..256 {
+            if let Ok(bus) = BusId::try_from(id) {
+                assert_eq!(u64::from(bus), id, "{} decodes from {id}", bus.name());
+                assert!(names.insert(bus.name()), "{} named twice", bus.name());
+                ids.push(id);
+            }
+        }
+        assert!(ids.ends_with(&[40, 41, 42]), "{ids:?}");
+        assert_eq!(
+            [40u64, 41, 42].map(|id| BusId::try_from(id).map(|b| b.name())),
+            [Ok("MemWord"), Ok("MemWordMsg"), Ok("CopyWordNext")]
+        );
     }
 }

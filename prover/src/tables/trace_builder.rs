@@ -89,6 +89,10 @@ pub(crate) mod in_row_forgery_tests;
 #[cfg(test)]
 mod keccak256_tests;
 pub(crate) mod register_words;
+mod word_walk;
+#[cfg(test)]
+mod word_walk_tests;
+pub(crate) use word_walk::WordRows;
 #[cfg(test)]
 mod direct_count_tests {
     //! The direct counts of LT's and KECCAK's lookups against the lists the
@@ -1045,6 +1049,12 @@ struct MemoryState {
     overlay: Option<Box<HistoryOverlay>>,
 }
 
+/// A load's or store's words as the word history records them
+/// ([`HistoryOverlay::word_access`]): its address, the word holding its first
+/// byte (`(value, timestamp)` before the cycle) and, when it crosses, the
+/// next word's.
+pub(crate) type WordAccessRecord = (u64, (u64, u64), Option<(u64, u64)>);
+
 /// A window walked from the executor's history (record mode): the cells each
 /// cycle reads before it, as the executor wrote them
 /// ([`executor::vm::history::WindowHistory`]). The walk starts each cycle
@@ -1118,6 +1128,31 @@ impl HistoryOverlay {
             self.history.mixed.get(a.mixed as usize)?.map(u64::from)
         };
         Some((a.addr, a.old, ts))
+    }
+
+    /// Under the word history, the cycle's load or store as its record holds
+    /// it: its address, the word holding its first byte (that word's value
+    /// and timestamp before the cycle) and, when it crosses, the next word's;
+    /// `None` when the cycle has no record or none of a load or store, or the
+    /// history is not the word history.
+    fn word_access(&self) -> Option<WordAccessRecord> {
+        use executor::vm::history::{ECALL, NO_ACCESS};
+        if !self.history.words {
+            return None;
+        }
+        let side = self.history.extras.get(self.cycle?)?.side;
+        if side == NO_ACCESS || side & ECALL != 0 {
+            return None;
+        }
+        let a = self.history.word_accesses.get(side as usize)?;
+        let next = match a.next {
+            NO_ACCESS => None,
+            n => {
+                let cell = self.history.next_words.get(n as usize)?;
+                Some((cell.word, u64::from(cell.ts)))
+            }
+        };
+        Some((a.addr, (a.word, u64::from(a.ts)), next))
     }
 
     /// Whether the cycle's register accesses find, in the walk's register
@@ -1716,6 +1751,29 @@ fn classify_memw(op: &MemwOperation, order: MemwAlignedOrder) -> MemwRoute {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test only: on this thread the walk takes the word memory format under
+    /// the 32-bit register tokens (its refusal taken out, as a forger's
+    /// prover would), so a test can show what the verifier says of it.
+    pub(crate) static WORDS_UNDER_TOKENS32: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread's walk takes the word format under the 32-bit register
+/// tokens: never outside tests ([`WORDS_UNDER_TOKENS32`]).
+#[inline]
+fn words_under_tokens32() -> bool {
+    #[cfg(test)]
+    {
+        WORDS_UNDER_TOKENS32.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Routes each `MemwOperation` into its destination table bucket at CREATION time
 /// (register fast-path / aligned / general), so the walk fills the three buckets directly
 /// and no separate routing pass is needed downstream. Classification order is register
@@ -1776,7 +1834,24 @@ impl MemwBuckets {
     /// memory format).
     #[inline]
     fn fused(&self) -> bool {
-        self.memory == super::fused_memory::MemoryFormat::Fused
+        match self.memory {
+            super::fused_memory::MemoryFormat::Fused => true,
+            super::fused_memory::MemoryFormat::Split | super::fused_memory::MemoryFormat::Words => {
+                false
+            }
+        }
+    }
+
+    /// Whether every CPU load and store is a word table's row (the word
+    /// memory format).
+    #[inline]
+    fn words(&self) -> bool {
+        match self.memory {
+            super::fused_memory::MemoryFormat::Words => true,
+            super::fused_memory::MemoryFormat::Split | super::fused_memory::MemoryFormat::Fused => {
+                false
+            }
+        }
     }
 
     /// Whether register accesses are residual register rows (the in-row register format).
@@ -2038,6 +2113,7 @@ fn collect_ops_from_cpu(
         mem_load_rows: _,
         mem_store_rows: _,
         store_ops: _,
+        word_rows: _,
     } = out;
     Ok((
         memw,
@@ -2143,6 +2219,9 @@ pub(crate) struct WalkOutputs {
     /// the ops' order (the walk routes every store there, the routing none);
     /// empty otherwise.
     store_ops: Vec<store::StoreOperation>,
+    /// Under the word memory format, every CPU load and store as its word
+    /// table's row, in the ops' order; empty otherwise.
+    word_rows: WordRows,
 }
 
 impl WalkOutputs {
@@ -2174,6 +2253,7 @@ impl WalkOutputs {
             mem_load_rows: Vec::new(),
             mem_store_rows: Vec::new(),
             store_ops: Vec::new(),
+            word_rows: WordRows::default(),
         }
     }
 
@@ -2242,6 +2322,7 @@ impl WalkOutputs {
             + vec_heap_bytes(&self.mem_load_rows)
             + vec_heap_bytes(&self.mem_store_rows)
             + vec_heap_bytes(&self.store_ops)
+            + self.word_rows.heap_bytes()
             + vec_heap_bytes(&self.bitwise_ops)
             + vec_heap_bytes(&self.keccak_ops)
             + vec_heap_bytes(&self.blake3_ops)
@@ -2436,9 +2517,20 @@ fn walk_cpu_ops<const REST: bool>(
         mem_load_rows,
         mem_store_rows,
         store_ops,
+        word_rows,
     } = out;
     let in_row = memw.in_row();
     let fused = memw.fused();
+    let words = memw.words();
+    // The word memory format retires MEMW and MEMW_A, which take the register
+    // accesses MEMW_R cannot under the 32-bit token format: it needs the
+    // in-row register format, where every other register access is a residual
+    // register row.
+    if words && !in_row && !words_under_tokens32() {
+        return Err(Error::Prover(
+            "the word memory format needs the in-row register format".to_string(),
+        ));
+    }
     // This call's COPY rows start here; earlier calls' are already in the list.
     let copy_ops_before = copy_ops.len();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
@@ -2453,8 +2545,15 @@ fn walk_cpu_ops<const REST: bool>(
         // Record mode: the cycle's cells from the executor's history, its
         // register accesses checked against the walk's cells. The light
         // record walk makes no cell for a cycle that is no ECALL: its load
-        // or store reads its access record.
+        // or store reads its access record (under the word memory format, its
+        // words' record).
         let mut light = false;
+        // Under the word memory format the format takes no syscall but the
+        // halt and the COPY chip's: any other is refused before it touches
+        // anything.
+        if words {
+            word_walk::refuse_syscall(op)?;
+        }
         if let Some(overlay) = memory_state.overlay.as_deref_mut() {
             light = overlay.light && !op.decode.fields.ecall;
             if light {
@@ -2475,8 +2574,25 @@ fn walk_cpu_ops<const REST: bool>(
 
         // --- MEMW and LOAD (require state tracking, order matters) ---
 
-        // Collect memory operations for Load/Store instructions
-        if op.decode.fields.is_load() {
+        // Collect memory operations for Load/Store instructions. Under the
+        // word memory format each is one word table's row.
+        if words && op.decode.fields.is_load() {
+            word_walk::word_load(
+                op,
+                memory_state,
+                light,
+                word_rows,
+                lookups.then_some(&mut *bitwise_ops),
+            )?;
+        } else if words && op.decode.fields.is_store() {
+            word_walk::word_store(
+                op,
+                memory_state,
+                light,
+                word_rows,
+                lookups.then_some(&mut *bitwise_ops),
+            )?;
+        } else if op.decode.fields.is_load() {
             let (memw_op, load_op) = if light {
                 collect_load_op_from_access(op, memory_state)
             } else {
@@ -2557,17 +2673,31 @@ fn walk_cpu_ops<const REST: bool>(
                 op.commit_count(),
                 register_state,
             )?);
-            let (write_memw, rows) = collect_copy_ops(
-                copy::Functionality::Write,
-                op.timestamp,
-                op.commit_buf_addr(),
-                index,
-                op.commit_count(),
-                memory_state,
-            );
-            memw.extend_ops(write_memw);
-            if REST {
-                copy_ops.extend(rows);
+            if words {
+                word_walk::copy_call(
+                    copy::Functionality::Write,
+                    op.timestamp,
+                    op.commit_buf_addr(),
+                    index,
+                    op.commit_count(),
+                    memory_state,
+                    word_rows,
+                    REST,
+                    lookups.then_some(&mut *bitwise_ops),
+                )?;
+            } else {
+                let (write_memw, rows) = collect_copy_ops(
+                    copy::Functionality::Write,
+                    op.timestamp,
+                    op.commit_buf_addr(),
+                    index,
+                    op.commit_count(),
+                    memory_state,
+                );
+                memw.extend_ops(write_memw);
+                if REST {
+                    copy_ops.extend(rows);
+                }
             }
             let count = u32::try_from(op.commit_count()).map_err(|_| {
                 Error::Prover(format!(
@@ -2620,12 +2750,27 @@ fn walk_cpu_ops<const REST: bool>(
             }
         }
 
-        // Keccak256 ECALL: one KECCAK row per block of the input.
+        // Keccak256 ECALL: one KECCAK row per block of the input (under the
+        // word memory format a KECCAK_W row, its memory as words).
         if op.ecall_keccak256() {
-            let (sponge_memw, rows) = collect_keccak256_ops(op, memory_state, register_state);
-            memw.extend_ops(sponge_memw);
-            if REST {
-                keccak_ops.extend(rows);
+            if words {
+                let (register_memw, rows) = collect_keccak256_word_ops(
+                    op,
+                    memory_state,
+                    register_state,
+                    word_rows,
+                    lookups.then_some(&mut *bitwise_ops),
+                )?;
+                memw.extend_ops(register_memw);
+                if REST {
+                    keccak_ops.extend(rows);
+                }
+            } else {
+                let (sponge_memw, rows) = collect_keccak256_ops(op, memory_state, register_state);
+                memw.extend_ops(sponge_memw);
+                if REST {
+                    keccak_ops.extend(rows);
+                }
             }
         }
 
@@ -2733,17 +2878,31 @@ fn walk_cpu_ops<const REST: bool>(
                 count,
                 register_state,
             )?);
-            let (mm_memw, rows) = collect_copy_ops(
-                copy::Functionality::Copy,
-                op.timestamp,
-                src,
-                dst,
-                count,
-                memory_state,
-            );
-            memw.extend_ops(mm_memw);
-            if REST {
-                copy_ops.extend(rows);
+            if words {
+                word_walk::copy_call(
+                    copy::Functionality::Copy,
+                    op.timestamp,
+                    src,
+                    dst,
+                    count,
+                    memory_state,
+                    word_rows,
+                    REST,
+                    lookups.then_some(&mut *bitwise_ops),
+                )?;
+            } else {
+                let (mm_memw, rows) = collect_copy_ops(
+                    copy::Functionality::Copy,
+                    op.timestamp,
+                    src,
+                    dst,
+                    count,
+                    memory_state,
+                );
+                memw.extend_ops(mm_memw);
+                if REST {
+                    copy_ops.extend(rows);
+                }
             }
         }
 
@@ -2767,27 +2926,56 @@ fn walk_cpu_ops<const REST: bool>(
                 count,
                 register_state,
             )?);
-            let (memset_memw, rows) = collect_copy_ops(
-                copy::Functionality::Set,
-                op.timestamp,
-                src,
-                dst,
-                count,
-                memory_state,
-            );
-            memw.extend_ops(memset_memw);
-            if REST {
-                copy_ops.extend(rows);
+            if words {
+                word_walk::copy_call(
+                    copy::Functionality::Set,
+                    op.timestamp,
+                    src,
+                    dst,
+                    count,
+                    memory_state,
+                    word_rows,
+                    REST,
+                    lookups.then_some(&mut *bitwise_ops),
+                )?;
+            } else {
+                let (memset_memw, rows) = collect_copy_ops(
+                    copy::Functionality::Set,
+                    op.timestamp,
+                    src,
+                    dst,
+                    count,
+                    memory_state,
+                );
+                memw.extend_ops(memset_memw);
+                if REST {
+                    copy_ops.extend(rows);
+                }
             }
         }
 
         // Collect ECREC ecall operations (memory I/O, the ECREC row, and the ECDAS rows of its
         // two chains and its final addition).
+        // Under the word memory format its memory is word rows (an ECREC_W
+        // row's), its register accesses as before.
         if op.ecall_ecrec()
-            && let Some((ecrec_memw, ecrec_op, ecrec_ecdas)) =
+            && let Some((ecrec_memw, mut ecrec_op, ecrec_ecdas)) =
                 collect_ecrec_ops(op, memory_state, register_state, REST && defer_ecrec)
         {
-            memw.extend_ops(ecrec_memw);
+            if words {
+                let (registers, ram): (Vec<_>, Vec<_>) =
+                    ecrec_memw.into_iter().partition(|m| m.is_register);
+                memw.extend_ops(registers);
+                word_walk::chip_words(
+                    "ECREC_W",
+                    &ram,
+                    word_rows,
+                    lookups.then_some(&mut *bitwise_ops),
+                )?;
+                ecrec_op.words = true;
+            } else {
+                memw.extend_ops(ecrec_memw);
+            }
             if REST {
                 ecrec_ops.push(ecrec_op);
                 ecdas_ops.extend(ecrec_ecdas);
@@ -3417,6 +3605,7 @@ fn collect_ecrec_ops(
         addr_msg,
         witness,
         pending,
+        words: false,
     };
     Some((memw_ops, ecrec_op, ecdas_ops))
 }
@@ -3868,6 +4057,47 @@ fn collect_keccak256_ops(
     }
 
     (memw_ops, rows)
+}
+
+/// [`collect_keccak256_ops`] under the word memory format: the same register
+/// reads and rows, the rows' memory as words
+/// ([`word_walk::keccak256_words`]): KECCAK_W's words on the rows and the
+/// MEMW_W rows in `word_rows`. A call whose words the state lacks makes no
+/// row (the state is marked missing and the window is refused).
+fn collect_keccak256_word_ops(
+    op: CpuOp<'_>,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+    word_rows: &mut WordRows,
+    lookups: Option<&mut Vec<BitwiseOperation>>,
+) -> Result<(Vec<MemwOperation>, Vec<KeccakOperation>), Error> {
+    let t = op.timestamp;
+    let ptr = register_state.read(10).0;
+    let len = register_state.read(11).0;
+    let out = register_state.read(12).0;
+    if !executor::vm::instruction::execution::keccak256_addresses_ok(ptr, len, out) {
+        return Err(Error::Prover(format!(
+            "keccak256 at timestamp {t}: operands the executor refuses"
+        )));
+    }
+    let mut memw_ops = Vec::with_capacity(3);
+    for (reg, value) in [(10u8, ptr), (11, len), (12, out)] {
+        let reg_value = pack_register_value(value);
+        let (_old_val, old_ts) = register_state.read(reg);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * reg as u64, reg_value, t, 2, true)
+                .with_old(reg_value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(reg, value, t);
+    }
+    let input: Vec<u8> = (0..len)
+        .map(|i| memory_state.read_byte(ptr.wrapping_add(i)).0)
+        .collect();
+    let mut rows = keccak::sponge_ops(t, ptr, out, &input);
+    if !word_walk::keccak256_words(&mut rows, ptr, len, out, memory_state, word_rows, lookups)? {
+        return Ok((memw_ops, Vec::new()));
+    }
+    Ok((memw_ops, rows))
 }
 
 /// Collects the memory operations for a `Hint` ecall.
@@ -6439,6 +6669,9 @@ pub(crate) fn collect_bitwise_from_ecrec(ops: &[ecrec::EcrecOperation]) -> Vec<B
     let half = |bytes: &[u8; 32], i: usize| bytes[2 * i] as u16 + ((bytes[2 * i + 1] as u16) << 8);
     for op in ops {
         let w = &op.witness;
+        if op.words {
+            out.extend(super::ecrec_w::extra_bitwise_ops(op));
+        }
         if !w.ok {
             continue;
         }
@@ -6847,6 +7080,11 @@ fn emit_sponge_lookups(
     halves((sponge.src & 0xFFFF_FFFF) + 135, &mut *emit);
     if sponge.last {
         halves((sponge.out & 0xFFFF_FFFF) + 31, &mut *emit);
+    }
+    // Under the word memory format the row is KECCAK_W's: its keys' halves
+    // and its words' bytes.
+    if let Some(words) = sponge.words.as_deref() {
+        super::keccak_w::extra_bitwise_ops(kop, sponge, words, emit);
     }
 }
 
@@ -7376,6 +7614,10 @@ pub struct Traces {
     /// chunks of their max_rows); empty under the split format.
     pub mem_loads: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub mem_stores: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    /// The word memory format's tables, one list a family in
+    /// `block_whir::WORD_TABLES`' order (chunks of their max_rows); empty
+    /// under any other format.
+    pub word_tables: [Vec<TraceTable<GoldilocksField, GoldilocksExtension>>; 7],
 }
 
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
@@ -7425,6 +7667,8 @@ struct CollectedOps {
     /// the split format.
     mem_load_rows: Vec<super::mem_load::MemLoadRow>,
     mem_store_rows: Vec<super::mem_store::MemStoreRow>,
+    /// The word memory format's CPU word-table rows; empty under any other.
+    word_rows: WordRows,
 }
 
 /// How many leading chunks of each streamed table a windowed build already
@@ -7589,6 +7833,16 @@ pub struct StreamSkip {
     /// format's).
     pub mem_load: usize,
     pub mem_store: usize,
+    /// Under the word memory format, the six CPU word families and MEMW_W are
+    /// cut into chunks as the walk fills them
+    /// ([`windowed::WindowedTraceBuilder::stream_word_tables`]); `false` (the
+    /// builder's default; the block prover streams them unless
+    /// `LAMBDA_VM_WORD_STREAM=0`): the finish builds every one of their
+    /// tables. The tables are the same.
+    pub stream_words: bool,
+    /// With [`Self::stream_words`], each word family's chunks already handed
+    /// out ([`windowed::StreamTable::WORDS`]' order).
+    pub words: [usize; 7],
 }
 
 /// How the tables a block cuts at a fixed number of rows (KECCAK_RND, KECCAK,
@@ -9050,6 +9304,7 @@ fn collect_all_ops(
         ecrec_ops: BlockVec::from_vec(ecrec_ops),
         mem_load_rows: Vec::new(),
         mem_store_rows: Vec::new(),
+        word_rows: WordRows::default(),
     })
 }
 
@@ -9344,37 +9599,39 @@ impl Traces {
             cpu32s,
             mem_loads,
             mem_stores,
+            word_tables,
         } = self;
-        [
-            cpus,
-            lts,
-            shifts,
-            memws,
-            memw_aligneds,
-            loads,
-            muls,
-            dvrms,
-            pages,
-            branches,
-            copies,
-            keccaks,
-            keccak_rnds,
-            ecsms,
-            ecdases,
-            hints,
-            ecrecs,
-            is_whs,
-            memw_registers,
-            eqs,
-            bytewises,
-            stores,
-            cpu32s,
-            mem_loads,
-            mem_stores,
-        ]
-        .into_iter()
-        .map(|ts| all(ts))
-        .sum::<usize>()
+        word_tables.iter().map(|ts| all(ts)).sum::<usize>()
+            + [
+                cpus,
+                lts,
+                shifts,
+                memws,
+                memw_aligneds,
+                loads,
+                muls,
+                dvrms,
+                pages,
+                branches,
+                copies,
+                keccaks,
+                keccak_rnds,
+                ecsms,
+                ecdases,
+                hints,
+                ecrecs,
+                is_whs,
+                memw_registers,
+                eqs,
+                bytewises,
+                stores,
+                cpu32s,
+                mem_loads,
+                mem_stores,
+            ]
+            .into_iter()
+            .map(|ts| all(ts))
+            .sum::<usize>()
             + [
                 bitwise,
                 decode,
@@ -9546,6 +9803,7 @@ impl Traces {
             cpu32s,
             mem_loads,
             mem_stores,
+            word_tables,
             page_configs: _,
             public_output_bytes: _,
             local_to_global: _,
@@ -9619,6 +9877,12 @@ impl Traces {
         }
         for t in mem_stores {
             total += (t.num_rows() * super::mem_store::cols::NUM_COLUMNS) as u64;
+        }
+        for (k, ts) in word_tables.iter().enumerate() {
+            let (columns, _) = super::word_cpu::word_table_shape(k);
+            for t in ts {
+                total += (t.num_rows() * columns) as u64;
+            }
         }
         for t in ecsms {
             total += (t.num_rows() * ECSM_COLS) as u64;
@@ -9719,6 +9983,7 @@ impl Traces {
             cpu32s,
             mem_loads,
             mem_stores,
+            word_tables,
             page_configs: _,
             public_output_bytes: _,
             local_to_global: _,
@@ -9791,6 +10056,12 @@ impl Traces {
         for t in mem_stores {
             total += (t.num_rows() * n_mem_store) as u64;
         }
+        for (k, ts) in word_tables.iter().enumerate() {
+            let (_, interactions) = super::word_cpu::word_table_shape(k);
+            for t in ts {
+                total += (t.num_rows() * aux_cols(interactions)) as u64;
+            }
+        }
         for t in ecsms {
             total += (t.num_rows() * n_ecsm) as u64;
         }
@@ -9849,6 +10120,13 @@ impl Traces {
     /// [`Self::table_counts`]: a block states them in a field of its own.
     pub fn fused_counts(&self) -> [usize; 2] {
         [self.mem_loads.len(), self.mem_stores.len()]
+    }
+
+    /// The word memory format's tables, family by family
+    /// (`block_whir::WORD_TABLES`; none under any other format). Counted apart
+    /// from [`Self::table_counts`], as the fused ones.
+    pub fn word_counts(&self) -> [usize; 7] {
+        self.word_tables.each_ref().map(Vec::len)
     }
 
     /// Extract page configurations from ELF only (deterministic from binary).

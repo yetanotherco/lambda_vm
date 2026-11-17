@@ -1808,6 +1808,7 @@ fn the_verifier_frames_a_fused_statement_and_refuses_its_forgeries() {
         num_private_input_pages: 0,
         groups: (0..table_num_vars.len() as u32).map(|t| vec![t]).collect(),
         fused_memory: fused.map(|n| n as u64),
+        word_memory: [0; 7],
     };
     assert!(fused[0] > 0 && fused[1] > 0, "{fused:?}");
     let frame = |s: &OwnedBlockStatement, f: &BlockFormat| block_frame(s.view(), &elf, &options, f);

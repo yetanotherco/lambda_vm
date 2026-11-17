@@ -40,7 +40,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use executor::vm::history::{HistoryFinal, RegisterCells, WindowHistory};
+use executor::vm::history::{HistoryFinal, RegisterCells, WindowHistory, WordHistoryFinal};
 use executor::vm::logs::Log;
 use executor::vm::memory::MemorySnapshot;
 
@@ -61,7 +61,64 @@ pub struct ExecWindow {
     pub logs: Arc<Vec<Log>>,
     pub start: Option<MemorySnapshot>,
     pub history: Option<Box<WindowHistory>>,
-    pub last: Option<Box<HistoryFinal>>,
+    pub last: Option<Box<RunEnd>>,
+}
+
+/// The run's end in record mode, as the executor's history kept it: every
+/// byte's timestamp ([`HistoryFinal`]) or, under the word memory format, every
+/// aligned word's ([`WordHistoryFinal`]).
+pub enum RunEnd {
+    Bytes(HistoryFinal),
+    Words(WordHistoryFinal),
+}
+
+impl RunEnd {
+    /// The byte history's end, boxed for an [`ExecWindow`].
+    pub fn boxed(end: HistoryFinal) -> Box<Self> {
+        Box::new(Self::Bytes(end))
+    }
+
+    /// The word history's end, boxed for an [`ExecWindow`].
+    pub fn boxed_words(end: WordHistoryFinal) -> Box<Self> {
+        Box::new(Self::Words(end))
+    }
+
+    /// The memory after the run's last cycle.
+    fn memory(&self) -> &MemorySnapshot {
+        match self {
+            Self::Bytes(end) => &end.memory,
+            Self::Words(end) => &end.memory,
+        }
+    }
+
+    /// Every 64 KiB page of the shadow with each of its bytes' timestamps: a
+    /// byte's own under the byte history, its word's under the word history
+    /// (a word's timestamp is the largest of its bytes', so the word walk
+    /// reads the same word stamps either way).
+    fn byte_stamps(&self) -> Vec<(u64, Vec<u64>)> {
+        use rayon::prelude::*;
+        match self {
+            Self::Bytes(end) => end
+                .shadow
+                .pages()
+                .into_par_iter()
+                .map(|(base, ts)| (base, ts.iter().map(|&t| u64::from(t)).collect()))
+                .collect(),
+            Self::Words(end) => end
+                .shadow
+                .pages()
+                .into_par_iter()
+                .map(|(base, words)| {
+                    let bytes = executor::vm::history::WORD_BYTES as usize;
+                    let ts = words
+                        .iter()
+                        .flat_map(|&t| std::iter::repeat_n(u64::from(t), bytes))
+                        .collect();
+                    (base, ts)
+                })
+                .collect(),
+        }
+    }
 }
 
 impl<L: Into<Arc<Vec<Log>>>> From<(L, Option<MemorySnapshot>)> for ExecWindow {
@@ -692,6 +749,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                 );
             let (permit_tx, permit_rx) = sync_channel::<()>(walkers + 2);
             let decode = Arc::clone(&settings.decode);
+            let words = settings.memory_format == crate::tables::fused_memory::MemoryFormat::Words;
             // Record mode's check thread, fed every window in order.
             let (check_tx, check_rx) = sync_channel::<CheckWindow>(4);
             let check = (recheck > 0).then(|| {
@@ -717,6 +775,7 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                     image,
                     lean,
                     key,
+                    words,
                     windows,
                     number,
                     job_tx,
@@ -921,6 +980,7 @@ fn pass_thread<W: Into<ExecWindow>>(
     image: &PagedMem<u8>,
     lean: bool,
     key: u64,
+    words: bool,
     windows: Receiver<W>,
     number: fn(u32) -> u32,
     jobs: SyncSender<Ticket>,
@@ -929,7 +989,7 @@ fn pass_thread<W: Into<ExecWindow>>(
     fn stopped<T>(_: T) -> Error {
         Error::Prover(WALKERS_STOPPED.into())
     }
-    let mut pass = LeanPass::new(decode, start_registers)?;
+    let mut pass = LeanPass::new(decode, start_registers)?.words(words);
     let mut last: Option<(Arc<Vec<Log>>, Arc<MemoryState>, RegisterState)> = None;
     let mut waiting: Option<SyncSender<After>> = None;
     let (mut k, mut first, mut busy, mut entries, mut most) = (0u32, 0usize, 0.0, 0usize, 0usize);
@@ -1177,6 +1237,17 @@ fn record_thread<W: Into<ExecWindow>>(
     })
 }
 
+/// `cells` (byte addresses and timestamps) by aligned word: each word once,
+/// with the largest timestamp of its bytes among them.
+fn by_word(cells: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut words: BTreeMap<u64, u64> = BTreeMap::new();
+    for &(address, ts) in cells {
+        let word = words.entry(address & !7).or_insert(0);
+        *word = (*word).max(ts);
+    }
+    words.into_iter().collect()
+}
+
 /// A window as record mode's check thread takes it.
 struct CheckWindow {
     window: u32,
@@ -1205,7 +1276,8 @@ fn check_thread(
     image: &PagedMem<u8>,
     windows: Receiver<CheckWindow>,
 ) -> Result<Vec<(u32, u64)>, Error> {
-    let mut pass = LeanPass::new(Arc::clone(&settings.decode), start_registers)?;
+    let words = settings.memory_format == crate::tables::fused_memory::MemoryFormat::Words;
+    let mut pass = LeanPass::new(Arc::clone(&settings.decode), start_registers)?.words(words);
     let mut walker = WindowWalker::new(settings);
     // Its re-walks are compared, not counted.
     walker.counts = None;
@@ -1244,6 +1316,13 @@ fn check_thread(
             }
         }
         let mut theirs: Vec<(u64, u64)> = theirs.into_iter().map(|(a, _, t)| (a, t)).collect();
+        // Under the word memory format the history keeps a timestamp a word,
+        // on each of its bytes: the pass's entries are compared by word, each
+        // word's timestamp the largest of its bytes'.
+        if words {
+            mine = by_word(&mine);
+            theirs = by_word(&theirs);
+        }
         mine.sort_unstable();
         theirs.sort_unstable();
         if mine != theirs {
@@ -1285,7 +1364,7 @@ fn check_thread(
 /// its cell at the end. As [`super::lean_pass::LeanPass::walked_state`], the
 /// state's pages are those holding such a byte, filled at once.
 fn finish_state(
-    end: &HistoryFinal,
+    end: &RunEnd,
     last: &WindowHistory,
     image: &PagedMem<u8>,
     lean: bool,
@@ -1305,13 +1384,11 @@ fn finish_state(
     // Each shadow page's cells at the window's start; a page holding none
     // stamped is left out.
     let mut pages: Vec<(u64, Vec<u64>, Vec<u8>)> = end
-        .shadow
-        .pages()
+        .byte_stamps()
         .into_par_iter()
-        .filter_map(|(base, ts)| {
-            let mut ts: Vec<u64> = ts.iter().map(|&t| u64::from(t)).collect();
+        .filter_map(|(base, mut ts)| {
             let mut values = vec![0u8; PAGE];
-            end.memory.read(base, &mut values);
+            end.memory().read(base, &mut values);
             if let Some(cells) = undo.get(&base) {
                 for &(off, value, before) in cells {
                     ts[off] = before;

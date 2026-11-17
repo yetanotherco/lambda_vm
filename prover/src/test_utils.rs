@@ -1052,6 +1052,90 @@ pub fn create_mem_store_air(
     )
 }
 
+/// The CPU word tables' AIRs (`tables::word_cpu`), under the word memory
+/// format, each named by its table.
+macro_rules! word_cpu_air {
+    ($(#[$doc:meta])* $fn:ident, $module:ident, $constraints:ident, $name:literal) => {
+        $(#[$doc])*
+        pub fn $fn(
+            proof_options: &ProofOptions,
+        ) -> ConcreteVmAir<crate::tables::$module::$constraints> {
+            build_air(
+                crate::tables::$module::cols::NUM_COLUMNS,
+                crate::tables::$module::bus_interactions(),
+                proof_options,
+                1,
+                crate::tables::$module::$constraints,
+                $name,
+            )
+        }
+    };
+}
+
+word_cpu_air!(
+    /// The MEM_LOAD8 AIR (`tables::mem_load8`): an LD of one whole word.
+    create_mem_load8_air, mem_load8, MemLoad8Constraints, "MEM_LOAD8"
+);
+word_cpu_air!(
+    /// The MEM_STORE8 AIR (`tables::mem_store8`): an SD of one whole word.
+    create_mem_store8_air, mem_store8, MemStore8Constraints, "MEM_STORE8"
+);
+word_cpu_air!(
+    /// The MEM_LOADW AIR (`tables::mem_loadw`): a narrower load inside one word.
+    create_mem_loadw_air, mem_loadw, MemLoadWConstraints, "MEM_LOADW"
+);
+word_cpu_air!(
+    /// The MEM_STOREW AIR (`tables::mem_storew`): a narrower store inside one word.
+    create_mem_storew_air, mem_storew, MemStoreWConstraints, "MEM_STOREW"
+);
+word_cpu_air!(
+    /// The MEM_LOAD2W AIR (`tables::mem_load2w`): a load across two words.
+    create_mem_load2w_air, mem_load2w, MemLoad2WConstraints, "MEM_LOAD2W"
+);
+word_cpu_air!(
+    /// The MEM_STORE2W AIR (`tables::mem_store2w`): a store across two words.
+    create_mem_store2w_air, mem_store2w, MemStore2WConstraints, "MEM_STORE2W"
+);
+
+/// The MEMW_W AIR (`tables::memw_w`): a chip's access to one RAM word, under
+/// the word memory format.
+pub fn create_memw_w_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::memw_w::MemwWordConstraints> {
+    build_air(
+        crate::tables::memw_w::cols::NUM_COLUMNS,
+        crate::tables::memw_w::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::memw_w::MemwWordConstraints,
+        "MEMW_W",
+    )
+}
+
+/// The PAGE_W AIR of `config`'s page (`tables::page_w`), its preprocessed
+/// prefix by the page's kind, or the reason there is none (a base that is not
+/// page-aligned).
+pub fn create_page_w_air(
+    proof_options: &ProofOptions,
+    config: &crate::tables::page::PageConfig,
+) -> Result<VmAir, String> {
+    use crate::tables::page_w;
+    let air = build_air(
+        page_w::cols::NUM_COLUMNS,
+        page_w::bus_interactions(config.page_base, config.is_private_input)?,
+        proof_options,
+        1,
+        EmptyConstraints,
+        &format!("{}0x{:x}", page_w::NAME_PREFIX, config.page_base),
+    );
+    let columns = config.clone();
+    Ok(Box::new(air.with_lazy_preprocessed_columns(
+        page_w::lazy_commitment(config, proof_options),
+        page_w::num_preprocessed_cols(config),
+        std::sync::Arc::new(move || page_w::preprocessed_columns_of(&columns)),
+    )))
+}
+
 /// Create DECODE AIR with bus interactions.
 ///
 /// The DECODE table has no transition constraints (it's a pure lookup table).
@@ -1161,6 +1245,45 @@ pub fn create_copy_air(
         1,
         crate::tables::copy::CopyConstraints,
         "COPY",
+    )
+}
+
+pub fn create_ecrec_w_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::ecrec_w::EcrecWordConstraints> {
+    build_air(
+        crate::tables::ecrec_w::cols::NUM_COLUMNS,
+        crate::tables::ecrec_w::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::ecrec_w::EcrecWordConstraints,
+        crate::tables::ecrec_w::NAME,
+    )
+}
+
+pub fn create_keccak_w_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::keccak_w::KeccakWordConstraints> {
+    build_air(
+        crate::tables::keccak_w::cols::NUM_COLUMNS,
+        crate::tables::keccak_w::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::keccak_w::KeccakWordConstraints,
+        crate::tables::keccak_w::NAME,
+    )
+}
+
+pub fn create_copy_w_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::copy_w::CopyWordConstraints> {
+    build_air(
+        crate::tables::copy_w::cols::NUM_COLUMNS,
+        crate::tables::copy_w::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::copy_w::CopyWordConstraints,
+        crate::tables::copy_w::NAME,
     )
 }
 

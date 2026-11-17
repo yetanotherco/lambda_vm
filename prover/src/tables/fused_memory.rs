@@ -46,6 +46,15 @@ pub enum MemoryFormat {
     /// which receives the CPU's dispatch and holds the bytes' tokens itself;
     /// LOAD, STORE and MEMW take the rest (module docs).
     Fused,
+    /// Memory checked by aligned 8-byte word, one token a word
+    /// ([`super::word_memory`]): PAGE_W mints a page's words, the CPU's loads
+    /// and stores are its six word tables' ([`super::word_cpu`]), MEMW_W takes
+    /// the chips' word messages, and LOAD, STORE, MEMW_A, MEMW, MEM_LOAD and
+    /// MEM_STORE are not part of the block. The prover takes it under the
+    /// in-row register format, for a run whose chip calls are COPY, keccak256
+    /// and ECREC (their word tables COPY_W, KECCAK_W and ECREC_W); the
+    /// verifier refuses a table of IS_WH, BLAKE3, ECSM or HINT under it.
+    Words,
 }
 
 /// The columns a fused table's memory check reads.

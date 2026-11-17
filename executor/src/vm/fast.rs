@@ -21,8 +21,9 @@ use super::{
     execution::{ExecutorError, InstructionCache, ReturnValues, load_program, step},
     flat_memory::{FlatLayout, FlatMemory},
     history::{
-        HISTORY_MAX_CYCLES, HistExtra, History, HistoryFinal, NO_ACCESS, RegUse, RegisterCells,
-        WindowHistory, cycle_timestamp, step_registers,
+        HISTORY_MAX_CYCLES, HistExtra, History, HistoryFinal, Keeper, NO_ACCESS, RegUse,
+        RegisterCells, WindowHistory, WordHistory, WordHistoryFinal, cycle_timestamp,
+        step_registers,
     },
     instruction::execution::{BLAKE3_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER},
     instruction::{
@@ -349,6 +350,9 @@ pub struct FastExecutor {
     /// each op's register and memory use (`None` where no instruction is
     /// decoded: found as the reference cycle finds it).
     history: Option<Box<History>>,
+    /// The word history ([`FastExecutor::enable_word_history`]): history
+    /// mode with a timestamp a word; never on beside `history`.
+    word_history: Option<Box<WordHistory>>,
     uses: Box<[Option<RegUse>]>,
 }
 
@@ -387,6 +391,7 @@ impl FastExecutor {
             spare: None,
             cycles: 0,
             history: None,
+            word_history: None,
             uses: Box::new([]),
         })
     }
@@ -396,16 +401,39 @@ impl FastExecutor {
     /// history beside the logs ([`FastExecutor::resume_history`]). Before the
     /// first cycle only.
     pub fn enable_history(&mut self) -> Result<(), ExecutorError> {
-        if self.cycles > 0 || self.history.is_some() {
+        self.refuse_second_history()?;
+        self.history = Some(Box::new(History::new(self.memory.layout(), self.pc)?));
+        self.decode_uses();
+        Ok(())
+    }
+
+    /// Turns the word history on: history mode with a timestamp an aligned
+    /// 8-byte word instead of a byte ([`WordHistory`]), for a run whose memory
+    /// is checked by word. Its windows come from
+    /// [`FastExecutor::resume_word_history`]. Before the first cycle only, and
+    /// never beside [`FastExecutor::enable_history`].
+    pub fn enable_word_history(&mut self) -> Result<(), ExecutorError> {
+        self.refuse_second_history()?;
+        self.word_history = Some(Box::new(WordHistory::new(self.memory.layout(), self.pc)?));
+        self.decode_uses();
+        Ok(())
+    }
+
+    /// Refuses a history turned on after the first cycle or beside another.
+    fn refuse_second_history(&self) -> Result<(), ExecutorError> {
+        if self.cycles > 0 || self.history.is_some() || self.word_history.is_some() {
             return Err(ExecutorError::History(
-                "history mode starts before the first cycle".into(),
+                "history mode starts before the first cycle, once".into(),
             ));
         }
-        self.history = Some(Box::new(History::new(self.memory.layout(), self.pc)?));
+        Ok(())
+    }
+
+    /// Each op's register and memory use, for history mode.
+    fn decode_uses(&mut self) {
         self.uses = (0..self.ops.len() as u64)
             .map(|i| self.instructions.get(self.ops_base + 4 * i).map(RegUse::of))
             .collect();
-        Ok(())
     }
 
     /// [`FastExecutor::resume_owned`] in history mode: the window's logs and
@@ -421,11 +449,7 @@ impl FastExecutor {
         if self.history.is_none() {
             return Err(ExecutorError::History("history mode is off".into()));
         }
-        if self.logs.capacity() < window {
-            self.logs.clear();
-            self.logs.reserve_exact(window);
-        }
-        self.logs.clear();
+        self.prepare_logs(window);
         let first = self.cycles;
         if let Some(history) = &mut self.history {
             history.begin(first, window);
@@ -434,14 +458,60 @@ impl FastExecutor {
         if self.logs.is_empty() {
             return Ok(None);
         }
-        let next = super::logs::next_buffer(&mut self.spare, window);
-        let mut logs = std::mem::replace(&mut self.logs, next);
-        logs.shrink_to_fit();
+        let logs = self.hand_out_logs(window);
         let history = match &mut self.history {
             Some(h) => h.take_window(),
             None => WindowHistory::default(),
         };
         Ok(Some((logs, history)))
+    }
+
+    /// [`FastExecutor::resume_history`] under the word history: the window's
+    /// logs and its [`WindowHistory`], whose memory cells are whole words
+    /// ([`WindowHistory::words`]).
+    pub fn resume_word_history(
+        &mut self,
+        limit: usize,
+    ) -> Result<Option<(Vec<Log>, WindowHistory)>, ExecutorError> {
+        let window = limit.min(MAX_RESERVED_LOGS);
+        if self.pc == 0 {
+            return Ok(None);
+        }
+        if self.word_history.is_none() {
+            return Err(ExecutorError::History("the word history is off".into()));
+        }
+        self.prepare_logs(window);
+        let first = self.cycles;
+        if let Some(history) = &mut self.word_history {
+            history.begin(first, window);
+        }
+        self.run_word_history(limit)?;
+        if self.logs.is_empty() {
+            return Ok(None);
+        }
+        let logs = self.hand_out_logs(window);
+        let history = match &mut self.word_history {
+            Some(h) => h.take_window(),
+            None => WindowHistory::default(),
+        };
+        Ok(Some((logs, history)))
+    }
+
+    /// The log buffer cleared, with room for a `window` of logs.
+    fn prepare_logs(&mut self, window: usize) {
+        if self.logs.capacity() < window {
+            self.logs.clear();
+            self.logs.reserve_exact(window);
+        }
+        self.logs.clear();
+    }
+
+    /// The window's logs handed out, a buffer for the next one in place.
+    fn hand_out_logs(&mut self, window: usize) -> Vec<Log> {
+        let next = super::logs::next_buffer(&mut self.spare, window);
+        let mut logs = std::mem::replace(&mut self.logs, next);
+        logs.shrink_to_fit();
+        logs
     }
 
     /// History mode's end: the memory and every byte's timestamp after the
@@ -455,6 +525,17 @@ impl FastExecutor {
         })
     }
 
+    /// The word history's end: the memory and every word's timestamp after
+    /// the last cycle (the word history ends with it).
+    pub fn take_word_history_final(&mut self) -> Option<WordHistoryFinal> {
+        let history = self.word_history.take()?;
+        Some(WordHistoryFinal {
+            memory: self.memory.snapshot(),
+            shadow: history.shadow,
+            registers: history.cells,
+        })
+    }
+
     /// Sets the cycles run so far (a test reaches the history's clock limit
     /// without running to it).
     #[cfg(test)]
@@ -462,9 +543,27 @@ impl FastExecutor {
         self.cycles = cycles;
     }
 
-    /// The register cells now, as the walk holds them (history mode).
+    /// The byte history's timestamps now (a test compares the word history
+    /// with them).
+    #[cfg(test)]
+    pub(crate) fn byte_stamps(&self) -> Option<&super::history::TsShadow> {
+        self.history.as_ref().map(|h| &h.shadow)
+    }
+
+    /// The word history's timestamps now.
+    #[cfg(test)]
+    pub(crate) fn word_stamps(&self) -> Option<&super::history::WordShadow> {
+        self.word_history.as_ref().map(|h| &h.shadow)
+    }
+
+    /// The register cells now, as the walk holds them (history mode, either
+    /// history).
     pub fn history_registers(&self) -> Option<RegisterCells> {
-        self.history.as_ref().map(|h| h.cells)
+        match (&self.history, &self.word_history) {
+            (Some(h), _) => Some(h.cells),
+            (None, Some(h)) => Some(h.cells),
+            (None, None) => None,
+        }
     }
 
     /// [`FastExecutor::run`] keeping the history.
@@ -473,84 +572,41 @@ impl FastExecutor {
         let Some(history) = self.history.as_deref_mut() else {
             return Err(ExecutorError::History("history mode is off".into()));
         };
-        let ops = &*self.ops;
-        let uses = &*self.uses;
-        let base = self.ops_base;
-        let regs = &mut self.regs;
-        let memory = &mut self.memory;
-        let instructions = &self.instructions;
-        let logs = &mut self.logs;
-        let mut pc = self.pc;
-        let mut cycle = self.cycles;
-        let result = loop {
-            if pc == 0 || RecordSink::cycles(logs) >= limit {
-                break Ok(());
-            }
-            if cycle > HISTORY_MAX_CYCLES {
-                break Err(ExecutorError::History(format!(
-                    "cycle {cycle} is past the {HISTORY_MAX_CYCLES} a history's timestamps hold"
-                )));
-            }
-            let ts = cycle_timestamp(cycle);
-            let index = pc.wrapping_sub(base).rotate_right(2);
-            let (op, uses, address) = if index < ops.len() as u64
-                && let Some(u) = uses[index as usize]
-            {
-                let op = ops[index as usize];
-                let address = effective_address(regs[op.rs1 as usize & 31], op.imm);
-                (op, u, address)
-            } else {
-                let (u, address) = fetched_use(pc, regs, memory, instructions);
-                (STEP, u, address)
-            };
-            // Only an ECALL needs the cells before it (a 0.5 KiB copy; an
-            // eager copy every cycle cost ≈ 0.9 s on the median block).
-            let cells_before = if uses.ecall {
-                Some(history.cells)
-            } else {
-                None
-            };
-            let side = if uses.mem > 0 {
-                history.before_access(memory, address)
-            } else if uses.ecall {
-                let a7 = regs[17];
-                let provisional = Log {
-                    current_pc: pc,
-                    next_pc: 0,
-                    src1_val: a7,
-                    src2_val: match a7 {
-                        64 => regs[11],
-                        n if n == KECCAK_SYSCALL_NUMBER || n == BLAKE3_SYSCALL_NUMBER => regs[10],
-                        _ => 0,
-                    },
-                    dst_val: if a7 == 64 { regs[12] } else { 0 },
-                };
-                history.before_ecall(memory, &provisional, ts)
-            } else {
-                NO_ACCESS
-            };
-            let log = match fast_cycle(op, pc, regs, memory) {
-                Some(log) => log,
-                None => match reference_cycle(pc, regs, memory, instructions) {
-                    Ok(log) => log,
-                    Err(e) => break Err(e),
-                },
-            };
-            if uses.mem > 0 {
-                history.after_access(address, uses.mem, ts);
-            }
-            if let Some(before) = &cells_before {
-                history.after_ecall(&log, before, ts);
-            }
-            let regs_ts = step_registers(&mut history.cells, uses, &log, ts);
-            if uses.ecall {
-                history.ecall_registers(&log, ts);
-            }
-            history.window.extras.push(HistExtra { regs_ts, side });
-            pc = log.next_pc;
-            logs.record(log);
-            cycle += 1;
+        let (pc, cycle, result) = run_kept(
+            history,
+            &self.ops,
+            &self.uses,
+            self.ops_base,
+            &mut self.regs,
+            &mut self.memory,
+            &self.instructions,
+            &mut self.logs,
+            (self.pc, self.cycles),
+            limit,
+        );
+        self.pc = pc;
+        self.cycles = cycle;
+        result
+    }
+
+    /// [`FastExecutor::run`] keeping the word history.
+    #[inline(never)]
+    fn run_word_history(&mut self, limit: usize) -> Result<(), ExecutorError> {
+        let Some(history) = self.word_history.as_deref_mut() else {
+            return Err(ExecutorError::History("the word history is off".into()));
         };
+        let (pc, cycle, result) = run_kept(
+            history,
+            &self.ops,
+            &self.uses,
+            self.ops_base,
+            &mut self.regs,
+            &mut self.memory,
+            &self.instructions,
+            &mut self.logs,
+            (self.pc, self.cycles),
+            limit,
+        );
         self.pc = pc;
         self.cycles = cycle;
         result
@@ -621,6 +677,8 @@ impl FastExecutor {
     /// logs.
     pub fn recycle_extras(&mut self, buffer: Vec<HistExtra>) {
         if let Some(history) = &mut self.history {
+            history.spare_extras = Some(buffer);
+        } else if let Some(history) = &mut self.word_history {
             history.spare_extras = Some(buffer);
         }
     }
@@ -698,6 +756,97 @@ impl RecordSink for Vec<Log> {
     fn cycles(&self) -> usize {
         self.len()
     }
+}
+
+/// History mode's run loop over either history ([`Keeper`]): runs from
+/// `(pc, cycle)` until the program halts or `limit` logs are written, and
+/// returns where it stopped. Inlined into each history's own entry
+/// ([`FastExecutor::run_history`], [`FastExecutor::run_word_history`]), so
+/// each is compiled for its history alone.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn run_kept<K: Keeper>(
+    history: &mut K,
+    ops: &[Op],
+    uses: &[Option<RegUse>],
+    base: u64,
+    regs: &mut [u64; 32],
+    memory: &mut FlatMemory,
+    instructions: &InstructionCache,
+    logs: &mut Vec<Log>,
+    (mut pc, mut cycle): (u64, u64),
+    limit: usize,
+) -> (u64, u64, Result<(), ExecutorError>) {
+    let result = loop {
+        if pc == 0 || RecordSink::cycles(logs) >= limit {
+            break Ok(());
+        }
+        if cycle > HISTORY_MAX_CYCLES {
+            break Err(ExecutorError::History(format!(
+                "cycle {cycle} is past the {HISTORY_MAX_CYCLES} a history's timestamps hold"
+            )));
+        }
+        let ts = cycle_timestamp(cycle);
+        let index = pc.wrapping_sub(base).rotate_right(2);
+        let (op, uses, address) = if index < ops.len() as u64
+            && let Some(u) = uses[index as usize]
+        {
+            let op = ops[index as usize];
+            let address = effective_address(regs[op.rs1 as usize & 31], op.imm);
+            (op, u, address)
+        } else {
+            let (u, address) = fetched_use(pc, regs, memory, instructions);
+            (STEP, u, address)
+        };
+        // Only an ECALL needs the cells before it (a 0.5 KiB copy; an
+        // eager copy every cycle cost ≈ 0.9 s on the median block).
+        let cells_before = if uses.ecall {
+            Some(*history.cells())
+        } else {
+            None
+        };
+        let side = if uses.mem > 0 {
+            history.before_access(memory, address, uses.mem)
+        } else if uses.ecall {
+            let a7 = regs[17];
+            let provisional = Log {
+                current_pc: pc,
+                next_pc: 0,
+                src1_val: a7,
+                src2_val: match a7 {
+                    64 => regs[11],
+                    n if n == KECCAK_SYSCALL_NUMBER || n == BLAKE3_SYSCALL_NUMBER => regs[10],
+                    _ => 0,
+                },
+                dst_val: if a7 == 64 { regs[12] } else { 0 },
+            };
+            history.before_ecall(memory, &provisional, ts)
+        } else {
+            NO_ACCESS
+        };
+        let log = match fast_cycle(op, pc, regs, memory) {
+            Some(log) => log,
+            None => match reference_cycle(pc, regs, memory, instructions) {
+                Ok(log) => log,
+                Err(e) => break Err(e),
+            },
+        };
+        if uses.mem > 0 {
+            history.after_access(address, uses.mem, ts);
+        }
+        if let Some(before) = &cells_before {
+            history.after_ecall(&log, before, ts);
+        }
+        let regs_ts = step_registers(history.cells(), uses, &log, ts);
+        if uses.ecall {
+            history.ecall_registers(&log, ts);
+        }
+        history.push_extra(HistExtra { regs_ts, side });
+        pc = log.next_pc;
+        logs.record(log);
+        cycle += 1;
+    };
+    (pc, cycle, result)
 }
 
 /// The register and memory use of the instruction at `pc` outside the

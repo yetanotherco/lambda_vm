@@ -439,6 +439,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         LeafScale::Fixed,
         LeafQuery::V1,
         multilinear::whir_chain::GkrPack::PRODUCTION,
+        crate::tables::fused_memory::MemoryFormat::Split,
     )
     .expect("named choices");
     assert_eq!(
@@ -533,6 +534,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         pinned_format.leaf_scale,
         pinned_format.leaf_query,
         multilinear::whir_chain::GkrPack::PRODUCTION,
+        crate::tables::fused_memory::MemoryFormat::Split,
     )
     .expect("the other trees");
     assert_eq!(named.format.zf.whir_trees, other);
@@ -556,6 +558,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
             pinned_format.leaf_scale,
             pinned_format.leaf_query,
             multilinear::whir_chain::GkrPack::PRODUCTION,
+            crate::tables::fused_memory::MemoryFormat::Split,
         )
         .is_err(),
         "one tree a run under the natural order is refused"
@@ -583,7 +586,8 @@ fn frame_counts(
     // One MEM_LOAD and one MEM_STORE table under the fused memory format.
     let fused: [u64; 2] = match format.memory {
         crate::tables::fused_memory::MemoryFormat::Fused => [1, 1],
-        crate::tables::fused_memory::MemoryFormat::Split => [0, 0],
+        crate::tables::fused_memory::MemoryFormat::Split
+        | crate::tables::fused_memory::MemoryFormat::Words => [0, 0],
     };
     let tables = counts.total().expect("a total")
         + crate::FIXED_TABLE_COUNT
@@ -601,6 +605,7 @@ fn frame_counts(
             num_private_input_pages: 0,
             groups: &groups,
             fused_memory: fused,
+            word_memory: [0; 7],
         },
         elf,
         &ProofOptions::default_test_options(),

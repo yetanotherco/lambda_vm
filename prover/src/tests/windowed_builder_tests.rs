@@ -161,6 +161,9 @@ pub(crate) fn same_traces(a: &Traces, b: &Traces) {
     same_list("BYTEWISE", &a.bytewises, &b.bytewises);
     same_list("MEM_LOAD", &a.mem_loads, &b.mem_loads);
     same_list("MEM_STORE", &a.mem_stores, &b.mem_stores);
+    for (k, family) in crate::block_whir::WORD_TABLES.iter().enumerate() {
+        same_list(family, &a.word_tables[k], &b.word_tables[k]);
+    }
     same("BITWISE", &a.bitwise, &b.bitwise);
     same("DECODE", &a.decode, &b.decode);
     same("REGISTER", &a.register, &b.register);
@@ -536,10 +539,20 @@ fn windowed_builds_the_cut_tables_as_the_split_whole_run_tables() {
                 want.ecdases.len(),
                 want.copies.len(),
             ];
-            split_keccak(&mut want, log2, padding());
+            split_keccak(
+                &mut want,
+                log2,
+                padding(),
+                crate::tables::fused_memory::MemoryFormat::Split,
+            );
             split_ecsm(&mut want, log2, padding());
             split_ecdas(&mut want, log2, padding());
-            split_copy(&mut want, log2, padding());
+            split_copy(
+                &mut want,
+                log2,
+                padding(),
+                crate::tables::fused_memory::MemoryFormat::Split,
+            );
             for (any, (before, after)) in cut_any.iter_mut().zip(counts.iter().zip([
                 want.keccaks.len(),
                 want.ecsms.len(),
@@ -1209,7 +1222,7 @@ fn the_handout_stamps_count_each_tables_chunks_and_copies() {
         let body = logs.len() - 1;
         let cut = body - body % window;
         let mut chunks = Vec::new();
-        let mut handed = [0usize; 11];
+        let mut handed = [0usize; StreamTable::COUNT];
         for w in logs[..cut].chunks(window) {
             let (mut walker, mut accumulator) = builder.split();
             let walked = walker.walk(w).expect("a window");

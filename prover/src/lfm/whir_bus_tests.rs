@@ -177,6 +177,29 @@ fn cases() -> Vec<BusCase> {
     vec![production_case(), stress_case()]
 }
 
+/// The word memory format's eleven tables' buses
+/// (`whir_air_tests::word_airs`), each through the production `layout_of`:
+/// the leaf builds each table's bus statements from its own interactions, so
+/// each is gated as the cases above are. Buses 40–42 (the word tokens, the
+/// word dispatch, the chips' word messages) are among them.
+fn word_cases() -> Vec<BusCase> {
+    super::whir_air_tests::word_airs()
+        .into_iter()
+        .map(|(name, air)| {
+            let width = air.trace_layout().0;
+            let layout = crate::multilinear_prove::layout_of(air.as_ref(), width, 4)
+                .expect("the table lays out");
+            BusCase {
+                name,
+                buses: air.bus_interactions().to_vec(),
+                width,
+                slots: layout.slot_of().to_vec(),
+                num_row_vars: 4,
+            }
+        })
+        .collect()
+}
+
 /// The arena a bus program reads: `z`, the alpha ladder, the claim point, then
 /// the factor values.
 struct Inputs {
@@ -382,7 +405,7 @@ fn the_weight_table_emits_its_closed_form() {
 /// compensating two errors passes a total and fails this.
 #[test]
 fn every_interaction_is_what_the_host_probes() {
-    for case in cases() {
+    for case in cases().into_iter().chain(word_cases()) {
         let shapes = case.shapes();
         for (index, (z, alpha)) in challenges().into_iter().enumerate() {
             let shape = inputs(&case, &shapes, z, alpha, 0xB0_5A11 + index as u64);
@@ -424,7 +447,7 @@ fn every_interaction_is_what_the_host_probes() {
 /// through `Rule::apply`, which is the quantity this leg has to land on.
 #[test]
 fn the_bus_statements_compute_what_the_host_computes() {
-    for case in cases() {
+    for case in cases().into_iter().chain(word_cases()) {
         let shapes = case.shapes();
         for (index, (z, alpha)) in challenges().into_iter().enumerate() {
             let shape = inputs(&case, &shapes, z, alpha, 0xC0_FFEE + index as u64);
@@ -650,7 +673,7 @@ fn the_row_form_recounts_from_the_shapes() {
 /// longer.
 #[test]
 fn the_alpha_ladder_is_as_long_as_the_widest_interaction() {
-    for case in cases() {
+    for case in cases().into_iter().chain(word_cases()) {
         let shapes = case.shapes();
         let widest = shapes.iter().map(|s| s.elements.len()).max().unwrap();
         assert_eq!(alpha_powers_read(&shapes), widest + 1);

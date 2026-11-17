@@ -7,7 +7,7 @@
 use super::{
     execution::{Executor, ExecutorError, ReturnValues},
     fast::FastExecutor,
-    history::{HistExtra, HistoryFinal, WindowHistory},
+    history::{HistExtra, HistoryFinal, WindowHistory, WordHistoryFinal},
     logs::Log,
     memory::{GuestMemory, MemorySnapshot},
     registers::Registers,
@@ -127,6 +127,38 @@ impl Engine {
         match self {
             Self::Reference(_) => None,
             Self::Fast(e) => e.take_history_final(),
+        }
+    }
+
+    /// Turns the fast engine's word history on
+    /// ([`FastExecutor::enable_word_history`]); the reference has none.
+    pub fn enable_word_history(&mut self) -> Result<(), ExecutorError> {
+        match self {
+            Self::Reference(_) => Err(ExecutorError::History(
+                "the word history needs the fast engine".into(),
+            )),
+            Self::Fast(e) => e.enable_word_history(),
+        }
+    }
+
+    /// [`FastExecutor::resume_word_history`].
+    pub fn resume_word_history(
+        &mut self,
+        limit: usize,
+    ) -> Result<Option<(Vec<Log>, WindowHistory)>, ExecutorError> {
+        match self {
+            Self::Reference(_) => Err(ExecutorError::History(
+                "the word history needs the fast engine".into(),
+            )),
+            Self::Fast(e) => e.resume_word_history(limit),
+        }
+    }
+
+    /// [`FastExecutor::take_word_history_final`].
+    pub fn take_word_history_final(&mut self) -> Option<WordHistoryFinal> {
+        match self {
+            Self::Reference(_) => None,
+            Self::Fast(e) => e.take_word_history_final(),
         }
     }
 
