@@ -2372,6 +2372,92 @@ fn page_direct_from(value: Option<&str>) -> bool {
     value.is_none_or(|v| v.trim() != "0")
 }
 
+/// `LAMBDA_VM_FINISH_KECCAK_W_SPLIT=1`: the sliding finish fills each KECCAK_W
+/// table as up to [`crate::tables::gpack::SPLIT_MAX_PARTS`] row ranges at once
+/// ([`keccak_w_bounds`]), on the pool it runs on; unset or any other word, one
+/// fill a table (today's). A KECCAK_W row reads its own operation alone, so the
+/// tables are the same, word for word and packed byte for byte.
+pub(crate) fn keccak_w_split() -> bool {
+    #[cfg(test)]
+    if let Some(on) = keccak_w_split_test::on() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        keccak_w_split_from(
+            std::env::var("LAMBDA_VM_FINISH_KECCAK_W_SPLIT")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`keccak_w_split`]'s reading of `LAMBDA_VM_FINISH_KECCAK_W_SPLIT`.
+fn keccak_w_split_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// The fewest rows a part of a split KECCAK_W fill holds: a table of 2^17 rows
+/// (`BLOCK_KECCAK_ROWS_LOG2`) is eight parts. A row is 1,031 cells, so a part
+/// is ≈ 17 M cells, a fill of tens of milliseconds.
+pub(crate) const KECCAK_W_SPLIT_MIN_ROWS: usize = 1 << 14;
+
+/// The row ranges a KECCAK_W table of `rows` rows is filled by under
+/// [`keccak_w_split`] ([`crate::tables::gpack::row_bounds_at`]).
+fn keccak_w_bounds(rows: usize) -> Vec<usize> {
+    #[cfg(test)]
+    if let Some(min_rows) = keccak_w_split_test::min_rows() {
+        return crate::tables::gpack::row_bounds_at(
+            rows,
+            min_rows,
+            crate::tables::gpack::SPLIT_MAX_PARTS,
+        );
+    }
+    crate::tables::gpack::row_bounds_at(
+        rows,
+        KECCAK_W_SPLIT_MIN_ROWS,
+        crate::tables::gpack::SPLIT_MAX_PARTS,
+    )
+}
+
+/// The tests' choice of [`keccak_w_split`] and of the parts' fewest rows, in
+/// place of the word and of [`KECCAK_W_SPLIT_MIN_ROWS`]: process-wide, so held
+/// under one lock. A split moves no byte, so another test's build that sees it
+/// builds the same tables.
+#[cfg(test)]
+pub(crate) mod keccak_w_split_test {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::Relaxed};
+
+    static MODE: AtomicU8 = AtomicU8::new(0);
+    static MIN_ROWS: AtomicUsize = AtomicUsize::new(0);
+    static HELD: Mutex<()> = Mutex::new(());
+
+    pub(super) fn on() -> Option<bool> {
+        match MODE.load(Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
+    pub(super) fn min_rows() -> Option<usize> {
+        let n = MIN_ROWS.load(Relaxed);
+        (n > 0).then_some(n)
+    }
+
+    /// `f` with the split `on` and parts of at least `min_rows` rows.
+    pub(crate) fn with<T>(on: bool, min_rows: usize, f: impl FnOnce() -> T) -> T {
+        let _held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        MODE.store(if on { 2 } else { 1 }, Relaxed);
+        MIN_ROWS.store(min_rows, Relaxed);
+        let out = f();
+        MODE.store(0, Relaxed);
+        MIN_ROWS.store(0, Relaxed);
+        out
+    }
+}
+
 /// [`FAMILIES`]' index of a family.
 fn family(name: &str) -> usize {
     FAMILIES
@@ -2600,6 +2686,10 @@ impl<'a> FinishPlan<'a> {
             let seeded = crate::tables::gpack_seeds::seed_finish_widths();
             build_stamps::mark(&format!("p5 seeded {seeded} kinds"));
         }
+        if keccak_w_split() && skip.memory_format == super::super::fused_memory::MemoryFormat::Words
+        {
+            build_stamps::mark("p5 KECCAK_W split by rows");
+        }
         let byte_checks = padding_byte_checks(shift_ops.len(), keccak_ops.len(), max_rows, &skip);
         let p4_mode = P4Mode::of(&skip);
         // BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables as each
@@ -2801,7 +2891,13 @@ impl<'a> FinishPlan<'a> {
                 skip.cut_padding,
                 pack,
                 form,
-                Arc::new(keccak_w::generate_keccak_w_rows_as),
+                if keccak_w_split() {
+                    Arc::new(|ops: &[KeccakOperation], rows: usize, form: TraceForm| {
+                        keccak_w::generate_keccak_w_rows_split_as(ops, rows, form, &keccak_w_bounds)
+                    })
+                } else {
+                    Arc::new(keccak_w::generate_keccak_w_rows_as)
+                },
                 |ops| {
                     Box::new(move || {
                         Ok(keccak_w::generate_keccak_w_trace_as(
