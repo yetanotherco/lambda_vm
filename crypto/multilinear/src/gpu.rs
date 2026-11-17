@@ -462,6 +462,60 @@ pub(crate) fn note_round_form_host_encode(card_declined: bool, levels: usize) {
     }
 }
 
+/// Shift-claim batches the card added with the row-tiled base-half kernel
+/// ([`claims_tiled`]).
+static SHIFT_CLAIM_TILED_BATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// [`SHIFT_CLAIM_TILED_BATCHES`] so far.
+pub fn shift_claim_tiled_batches() -> u64 {
+    SHIFT_CLAIM_TILED_BATCHES.load(Ordering::Relaxed)
+}
+
+/// `LAMBDA_VM_CLAIMS_TILED`: the round form's shift claims enter a card's
+/// weight through the row-tiled kernel over base-field high halves
+/// (`add_eq_tensor_base_ext3`: a base × ext3 product a term, each low value
+/// read once for eight outputs) rather than one ext3 product a term and a
+/// read a term (`add_eq_tensor_ext3`). The same weight, value for value; a
+/// prover's choice, no proof byte moves. `1` on; unset or anything else off
+/// (today's kernel), or a test's override ([`force_claims_tiled`]).
+pub fn claims_tiled() -> bool {
+    match CLAIMS_TILED_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var("LAMBDA_VM_CLAIMS_TILED").as_deref() == Ok("1"))
+        }
+    }
+}
+
+static CLAIMS_TILED_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test only: the row-tiled path hands its kernel one point fewer than it
+/// was given (the mutant a card parity test must catch).
+static CLAIMS_TILED_DROPS_A_POINT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arms [`CLAIMS_TILED_DROPS_A_POINT`]. Not for production callers.
+#[doc(hidden)]
+pub fn force_claims_tiled_drops_a_point(on: bool) {
+    CLAIMS_TILED_DROPS_A_POINT.store(on, Ordering::Relaxed);
+}
+
+/// Overrides [`claims_tiled`] for the whole process. `None` restores the
+/// knob's reading. Not for production callers.
+#[doc(hidden)]
+pub fn force_claims_tiled(on: Option<bool>) {
+    CLAIMS_TILED_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// Waits for every stream of the card to finish (the opening trace's
 /// stage boundary, `whir_split::open_trace_lap`); nothing without a card or
 /// before the card is up.
@@ -726,6 +780,7 @@ pub fn reset_call_counters() {
     COSET_HOST_ENCODES.store(0, Ordering::Relaxed);
     ROUND_FORM_HOST_ENCODES.store(0, Ordering::Relaxed);
     SHIFT_CLAIM_BATCHES.store(0, Ordering::Relaxed);
+    SHIFT_CLAIM_TILED_BATCHES.store(0, Ordering::Relaxed);
     COSET_INPLACE_OPENS.store(0, Ordering::Relaxed);
     COSET_INPLACE_ASSEMBLED.store(0, Ordering::Relaxed);
     COSET_ZERO_TILES.store(0, Ordering::Relaxed);
@@ -6302,11 +6357,49 @@ impl OpeningFactors {
             }
             Some(raw)
         };
-        let hi = flatten(&his).ok_or_else(|| failed("shift claims' high halves"))?;
         let lo = flatten(&los).ok_or_else(|| failed("shift claims' low halves"))?;
-        session
-            .add_eq_tensor(&hi, &lo, points.len(), lo_bits)
-            .map_err(|_| failed("shift claims' weight"))?;
+        // The round form's points are the folded domain's, base-field values
+        // lifted: their high halves are base values (no scale is folded into
+        // them), which the row-tiled kernel takes as they are. A point off
+        // the base field keeps today's kernel.
+        let base_hi = || -> Option<Vec<u64>> {
+            let mut raw = Vec::with_capacity(his.iter().map(Vec::len).sum());
+            for table in &his {
+                for value in table {
+                    let [a, b, c] = ext3_raw(value)?;
+                    if canonical_limb(b) != 0 || canonical_limb(c) != 0 {
+                        return None;
+                    }
+                    raw.push(a);
+                }
+            }
+            Some(raw)
+        };
+        match base_hi().filter(|_| claims_tiled()) {
+            Some(hi) => {
+                let (hi, lo, count) =
+                    if CLAIMS_TILED_DROPS_A_POINT.load(Ordering::Relaxed) && !points.is_empty() {
+                        let (h, l) = (hi.len() / points.len(), lo.len() / points.len());
+                        (
+                            hi[..hi.len() - h].to_vec(),
+                            lo[..lo.len() - l].to_vec(),
+                            points.len() - 1,
+                        )
+                    } else {
+                        (hi, lo, points.len())
+                    };
+                session
+                    .add_eq_tensor_base(&hi, &lo, count, lo_bits, 8)
+                    .map_err(|_| failed("shift claims' weight, row-tiled"))?;
+                SHIFT_CLAIM_TILED_BATCHES.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                let hi = flatten(&his).ok_or_else(|| failed("shift claims' high halves"))?;
+                session
+                    .add_eq_tensor(&hi, &lo, points.len(), lo_bits)
+                    .map_err(|_| failed("shift claims' weight"))?;
+            }
+        }
         SHIFT_CLAIM_BATCHES.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
