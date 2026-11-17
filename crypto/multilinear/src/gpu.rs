@@ -243,10 +243,16 @@ fn note_device_error(counter: &AtomicU64, kind: &str, describe: impl FnOnce() ->
 /// counts it too).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn note_commit_error(what: &str, log_evals: usize, log_blowup: usize, err: &dyn core::fmt::Debug) {
+    // The ledger's reading beside the error: an encode whose promise the
+    // ledger refuses reports the same out-of-memory as a card that is full.
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let (reserved, budget) = (ledger_reserved(), reserve_budget());
     note_device_error(&COMMIT_ERRORS, "commit errors", || {
         format!(
             "device commit ({what}) of 2^{log_evals} evaluations at blowup 2^{log_blowup} \
-             failed: {err:?}; encoding on the host"
+             failed: {err:?}; encoding on the host (ledger {:.2} of {:.2} GiB promised)",
+            gib(reserved),
+            gib(budget)
         )
     });
 }
