@@ -428,17 +428,17 @@ pub enum BusId {
     /// fixed 2^16-row `B3L_XOR` table (XOR, XOR split into nibbles, a byte
     /// pair, a 16-bit value).
     ///
-    /// IDs 40 and 41: 39 is the in-row register format's bus (20 and 29 stay
-    /// unused).
-    B3lXor = 40,
+    /// IDs 43 and 44: past the word memory format's buses (40–42), so the
+    /// two formats share no id.
+    B3lXor = 43,
     /// The lean BLAKE3 round chain: `(tag, round, state, message)` from a
     /// compression's head row through its seven round rows and back.
-    B3lRound = 41,
+    B3lRound = 44,
     /// An authenticated Merkle cap read at a computed index: `(tag, index,
     /// word)` against the `LEAN_CAP` table's rows (one a cap node, its word
     /// bound to the authenticated cell), read by `LEAN_CAP_READ` rows
-    /// (`lfm::lean_cap`). ID 42: the next free one.
-    CapLookup = 42,
+    /// (`lfm::lean_cap`). ID 45: the next free one after the lean buses.
+    CapLookup = 45,
 }
 
 impl BusId {
@@ -517,9 +517,9 @@ impl TryFrom<u64> for BusId {
             38 => Ok(BusId::KeccakSponge),
             39 => Ok(BusId::Reg),
             37 => Ok(BusId::IsWh),
-            40 => Ok(BusId::B3lXor),
-            41 => Ok(BusId::B3lRound),
-            42 => Ok(BusId::CapLookup),
+            43 => Ok(BusId::B3lXor),
+            44 => Ok(BusId::B3lRound),
+            45 => Ok(BusId::CapLookup),
             other => Err(other),
         }
     }
