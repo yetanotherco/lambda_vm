@@ -501,8 +501,20 @@ pub struct CardReading {
 
 /// [`CardReading`] now, the card drained and trimmed first, its pool's peak
 /// started again.
-pub(crate) fn card_settle() -> Option<CardReading> {
+pub(crate) fn card_settle(at: &str) -> Option<CardReading> {
     let (pool_used, pool_peak, free, total) = multilinear::gpu::settle_card()?;
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    // Said as it happens, so a run that fails later still shows it.
+    eprintln!(
+        "LEVELS CARD {at}: pool {:.2} GiB (peak before {:.2}) · free {:.2} of {:.2} GiB · ledger \
+         {:.2} of {:.2} GiB promised",
+        gib(pool_used),
+        gib(pool_peak),
+        gib(free),
+        gib(total),
+        gib(multilinear::gpu::ledger_reserved()),
+        gib(multilinear::gpu::reserve_budget())
+    );
     Some(CardReading {
         pool_used,
         pool_peak,
@@ -855,7 +867,7 @@ pub fn prove_block_levels(
     let _pad = PadRelease;
     let peak_reset = reset_peak_rss();
     // What an earlier block left in the card's pool goes back too.
-    let at_start = card_settle();
+    let at_start = card_settle("start");
     let t0 = std::time::Instant::now();
     let now = || t0.elapsed().as_secs_f64();
     type Statement = (
@@ -1153,10 +1165,10 @@ pub fn prove_block_levels(
                     if proved.is_err() {
                         return Err("the base did not prove".to_string());
                     }
-                    let settled = card_settle();
+                    let settled = card_settle("base end");
                     take_levels_pad()?;
                     let build = commit_level(pre, 1)?;
-                    let committed = card_settle();
+                    let committed = card_settle("level 1 committed");
                     Ok((build, prepare, cells, now(), [settled, committed]))
                 }))
             }
@@ -1220,10 +1232,10 @@ pub fn prove_block_levels(
         None => {
             let pre = prepare_level(&program, family)?;
             let (prepare, cells) = (pre.secs(), pre.prepared_cells());
-            let settled = card_settle();
+            let settled = card_settle("base end");
             take_levels_pad()?;
             let build = commit_level(pre, 1)?;
-            let committed = card_settle();
+            let committed = card_settle("level 1 committed");
             (build, prepare, cells, now(), [settled, committed])
         }
     };
@@ -1304,7 +1316,7 @@ pub fn prove_block_levels(
             .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());
         levels[0].build.release_prover_half();
         times.purges[2] = purge_filled.join().ok().flatten();
-        if let Some(card) = card_settle() {
+        if let Some(card) = card_settle("level 1 proved") {
             times.card.push(("level 1 proved".to_string(), card));
         }
         if let Some(r) = resident_now() {
@@ -1318,8 +1330,15 @@ pub fn prove_block_levels(
             let execute_from = now();
             let (prepare, cells) = (pre.secs(), pre.prepared_cells());
             // Its stacks on the card while its execution runs on the host.
-            let committer = scope
-                .spawn(move || commit_level(pre, k + 1).map(|build| (build, now(), card_settle())));
+            let committer = scope.spawn(move || {
+                commit_level(pre, k + 1).map(|build| {
+                    (
+                        build,
+                        now(),
+                        card_settle(&format!("level {} committed", k + 1)),
+                    )
+                })
+            });
             let child = child_of(&plan, &levels[k - 1]);
             let arena = wlfm_leg_arena(&child, &proofs[k - 1])?;
             let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
@@ -1366,7 +1385,7 @@ pub fn prove_block_levels(
                 .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());
             levels.push(Level { program, build });
             levels[k].build.release_prover_half();
-            if let Some(card) = card_settle() {
+            if let Some(card) = card_settle(&format!("level {} proved", k + 1)) {
                 times.card.push((format!("level {} proved", k + 1), card));
             }
             k += 1;

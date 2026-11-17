@@ -2841,7 +2841,7 @@ fn open_group<F, E, T, H>(
     config: &ChainConfig,
     own_window: bool,
     fails: bool,
-) -> Result<(Opened<F, E>, StackedCommitment<F, H>), MlError>
+) -> Result<(Opened<F, E>, Option<StackedCommitment<F, H>>), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
@@ -2889,6 +2889,14 @@ where
         config,
         &mut argued.fork,
     )?;
+    // A retired prepared stack is revived next: the group's own codewords,
+    // which nothing reads after their opening, and their room go back first,
+    // so the revive has the promise they held (on a level that opens beside
+    // the next group's argue, the ledger otherwise refuses the revive).
+    let retired_prepared = prepared
+        .iter()
+        .any(|p| p.group == argued.group && matches!(p.commitment, PreparedCommitment::Retired(_)));
+    let stacked = (!retired_prepared).then_some(stacked);
     // The group's prepared tables, in table order: each opened at its own
     // point for its own prefix, on this fork.
     let (at, points, values) = (argued.at, &argued.points, &argued.values);
