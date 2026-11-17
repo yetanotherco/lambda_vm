@@ -23,6 +23,7 @@ fn one_group(argue: ArgueFormat) -> BlockFormat {
     BlockFormat {
         zf: ZfFormat::DEFAULT,
         group_polys: block_whir::BLOCK_GROUP_POLYS,
+        b3_rounds: crate::block_whir::B3Rounds::Fri,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue,
@@ -44,6 +45,7 @@ fn many_groups(argue: ArgueFormat) -> BlockFormat {
     BlockFormat {
         zf,
         group_polys: 2,
+        b3_rounds: crate::block_whir::B3Rounds::Fri,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue,
@@ -664,6 +666,7 @@ fn the_card_argues_the_hosts_bytes() {
     let format = BlockFormat {
         zf,
         group_polys: 2,
+        b3_rounds: crate::block_whir::B3Rounds::Fri,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue: BATCHED,

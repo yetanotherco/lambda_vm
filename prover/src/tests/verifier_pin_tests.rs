@@ -143,6 +143,7 @@ fn small_format() -> BlockFormat {
     BlockFormat {
         zf,
         group_polys: block_whir::BLOCK_GROUP_POLYS,
+        b3_rounds: crate::block_whir::B3Rounds::Fri,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue: ArgueFormat::PerTable,

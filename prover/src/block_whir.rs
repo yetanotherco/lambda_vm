@@ -201,12 +201,42 @@ pub const BLOCK_TREE_DROP_LEVELS_DEVICE: usize = 8;
 /// refuses the prove ([`tree_drop_refusal`]), so a mistyped value never runs
 /// as the default unnoticed.
 pub fn tree_drop_from_env() -> multilinear::whir_commit::TreeDrop {
-    parse_tree_drop(
-        std::env::var("LAMBDA_VM_BLOCK_TREE_DROP_LEVELS")
-            .ok()
-            .as_deref(),
-    )
-    .unwrap_or(TREE_DROP_DEFAULT)
+    let value = std::env::var("LAMBDA_VM_BLOCK_TREE_DROP_LEVELS").ok();
+    match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        None => tree_drop_for(ZfFormat::global()),
+        Some(v) => parse_tree_drop(Some(v)).unwrap_or(TREE_DROP_DEFAULT),
+    }
+}
+
+/// Levels below a round-0 coset that the card's coset openings fold from a
+/// group's stacks at most (`math_cuda::whir_coset::CosetPlan`: a 256-value
+/// tile, then one warp's lanes, 8 + 5). A coset spans `2^(k0 + dropped)`
+/// values, so a `2^n` stack needs `k0 + dropped ≥ n − 13`; past that the plan
+/// declines and the opening re-encodes every codeword of the run on the card.
+pub const CARD_COSET_FOLD_LEVELS: usize = 13;
+
+/// The levels a retired tree drops under `zf` when the knob is unset: the
+/// card drops [`BLOCK_TREE_DROP_LEVELS_DEVICE`], or more where the format's
+/// first fold is under 6 — enough that a `2^whir_stack` stack's round-0
+/// cosets stay within [`CARD_COSET_FOLD_LEVELS`] (first fold 4 at a `2^27`
+/// stack: 10). The host drops [`BLOCK_TREE_DROP_LEVELS`]. A prover's choice:
+/// the proof does not depend on it, and at the default format (first fold 6)
+/// it is today's.
+pub fn tree_drop_for(zf: &ZfFormat) -> multilinear::whir_commit::TreeDrop {
+    let first_fold = match zf.whir_folds {
+        multilinear::whir_chain::WhirFolds::Uniform => {
+            crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING
+        }
+        multilinear::whir_chain::WhirFolds::First(k0) => k0.get(),
+    };
+    let needed = zf
+        .whir_stack
+        .get()
+        .saturating_sub(CARD_COSET_FOLD_LEVELS + first_fold);
+    multilinear::whir_commit::TreeDrop {
+        device: BLOCK_TREE_DROP_LEVELS_DEVICE.max(needed),
+        host: BLOCK_TREE_DROP_LEVELS,
+    }
 }
 
 /// The prove's refusal of a `LAMBDA_VM_BLOCK_TREE_DROP_LEVELS` value
@@ -255,6 +285,10 @@ pub struct BlockFormat {
     /// The most stacked polynomials a group may take: the prover packs to it,
     /// and the verifier refuses a group whose stack needs more.
     pub group_polys: usize,
+    /// How the BLAKE3 base's chains check their successors ([`B3Rounds`]):
+    /// read by [`Self::chain_config`] and [`block_format_tag`] under the
+    /// BLAKE3 base alone. `Fri` in every other format.
+    pub b3_rounds: B3Rounds,
     /// The most groups a block statement may declare (the verifier refuses
     /// more, and the prover refuses as its groups close). The proven bits are
     /// quoted at this count (I-NOEPOCH-W.md §8).
@@ -608,11 +642,102 @@ pub fn b3_base_group_polys() -> usize {
     })
 }
 
+/// How the 7-round BLAKE3 base's chains check the successors they commit
+/// ([`BlockFormat::b3_rounds`]).
+///
+/// [`Fri`](Self::Fri) is today's: every query opens the successor too
+/// (`multilinear::whir_chain::RoundForm::Fri`). [`Whir`](Self::Whir) is the
+/// WHIR paper's round (`RoundForm::Whir`): the successor is the bound message
+/// encoded on a domain that shrinks by `shrink` bits a round (the rate rises
+/// by `k − shrink` bits a round), it is never opened, and each query's fold
+/// value is a claim on it at the folded domain's point; each round queries the
+/// count for its own rate under the base's target, and each tree's cap is held
+/// to what its own openings pay for (caps by Q, under the base's cap as the
+/// ceiling).
+///
+/// ★ A FORMAT VALUE. The prover and the verifier of one block take it from
+/// their [`BlockFormat`] (production: [`b3_base_rounds`], the base's knob;
+/// the pinned verifier: `Fri`); it reaches the proof through the chains'
+/// config ([`BlockFormat::chain_config`], bound by the fold word) and the
+/// statement tag (`/W<shrink>`, [`block_format_tag`]). Never read from a
+/// proof. The BLAKE3 base's alone: a Poseidon1 format's chains are `Fri`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum B3Rounds {
+    /// Every query opens the successor. Today's.
+    #[default]
+    Fri,
+    /// The WHIR round form at this shrink (1 to 3), caps by Q.
+    Whir { shrink: u8 },
+}
+
+impl B3Rounds {
+    /// The round form the design picked: shrink 3 under four variables a
+    /// round, so the rate doubles every round after round 0.
+    pub const WHIR3: Self = Self::Whir { shrink: 3 };
+
+    /// The statement tag's word for it: `` for `Fri`, `/W<shrink>` for the
+    /// round form.
+    pub fn tag_word(self) -> String {
+        match self {
+            Self::Fri => String::new(),
+            Self::Whir { shrink } => format!("/W{shrink}"),
+        }
+    }
+}
+
+/// The knob that proves and verifies the BLAKE3 base under the WHIR round
+/// form ([`B3Rounds`]); both sides of one process read it, and the tag names
+/// it: see [`b3_base_rounds_setting`]. Read here, never by the format module
+/// (`zf_format`), whose knobs a pinned verifier refuses.
+pub const B3_BASE_ROUNDS_ENV: &str = "LAMBDA_VM_B3_BASE_ROUNDS";
+
+/// [`B3_BASE_ROUNDS_ENV`]'s value: unset, `0` or `fri` is [`B3Rounds::Fri`]
+/// (today's); `1` or `w3` is [`B3Rounds::WHIR3`]; `w2` and `w1` are the round
+/// form at shrink 2 and 1 (measurements). Only these words turn it on:
+/// anything else is refused.
+pub fn b3_base_rounds_setting(value: Option<&str>) -> Result<B3Rounds, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(B3Rounds::Fri),
+        Some(v) => match v.as_str() {
+            "0" | "fri" => Ok(B3Rounds::Fri),
+            "1" | "w3" => Ok(B3Rounds::WHIR3),
+            "w2" => Ok(B3Rounds::Whir { shrink: 2 }),
+            "w1" => Ok(B3Rounds::Whir { shrink: 1 }),
+            other => Err(format!(
+                "{B3_BASE_ROUNDS_ENV}={other:?}: expected 0, fri, 1, w3, w2 or w1"
+            )),
+        },
+    }
+}
+
+/// The BLAKE3 base's round form in this process ([`b3_base_rounds_setting`]
+/// of [`B3_BASE_ROUNDS_ENV`]), read once; a refused value aborts the process
+/// at its first read, as [`b3_base_final`] does.
+pub fn b3_base_rounds() -> B3Rounds {
+    static ROUNDS: std::sync::OnceLock<B3Rounds> = std::sync::OnceLock::new();
+    *ROUNDS.get_or_init(|| {
+        let value = match std::env::var(B3_BASE_ROUNDS_ENV) {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(v)) => {
+                eprintln!("{B3_BASE_ROUNDS_ENV}={v:?}: expected 0, fri, 1, w3, w2 or w1");
+                std::process::abort()
+            }
+        };
+        b3_base_rounds_setting(value.as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::abort()
+        })
+    })
+}
+
 /// The statement tag of a block proved under `format`: [`block_statement_tag`]
 /// of its base, and under the 7-round BLAKE3 base its group size too
 /// (`/G<n>`, the format's [`BlockFormat::group_polys`]), so no two BLAKE3
-/// group sizes share a tag. Every block statement's prover and verifier (and
-/// the recursion's plan) take their tag here.
+/// group sizes share a tag, then its round form (`/W<shrink>` under the WHIR
+/// round form, nothing under today's: [`B3Rounds::tag_word`]). Every block
+/// statement's prover and verifier (and the recursion's plan) take their tag
+/// here.
 pub fn block_format_tag(format: &BlockFormat) -> Vec<u8> {
     let mut tag = block_statement_tag(&format.zf.base);
     if format.zf.base == BaseFormat::B3_WHIR {
@@ -621,6 +746,7 @@ pub fn block_format_tag(format: &BlockFormat) -> Vec<u8> {
             return tag;
         }
         tag.extend_from_slice(format!("/G{}", format.group_polys).as_bytes());
+        tag.extend_from_slice(format.b3_rounds.tag_word().as_bytes());
     }
     tag
 }
@@ -657,6 +783,19 @@ impl BlockFormat {
                 b3_base_group_polys()
             } else {
                 BLOCK_GROUP_POLYS
+            },
+            // The BLAKE3 base's round form ([`b3_base_rounds`]); the knob on
+            // any other base is a configuration error.
+            b3_rounds: match (zf.base == BaseFormat::B3_WHIR, b3_base_rounds()) {
+                (true, rounds) => rounds,
+                (false, B3Rounds::Fri) => B3Rounds::Fri,
+                (false, rounds) => {
+                    eprintln!(
+                        "{B3_BASE_ROUNDS_ENV} asks for {rounds:?}: the round form is the BLAKE3 \
+                         base's alone"
+                    );
+                    std::process::abort()
+                }
             },
             max_groups: BLOCK_MAX_GROUPS,
             prepared: true,
@@ -698,6 +837,7 @@ impl BlockFormat {
         Self {
             zf: ZfFormat::DEFAULT,
             group_polys: BLOCK_GROUP_POLYS,
+            b3_rounds: B3Rounds::Fri,
             max_groups: BLOCK_MAX_GROUPS,
             prepared: true,
             leaf_scale: crate::lfm::whir_block::LeafScale::DEFAULT,
@@ -786,6 +926,23 @@ impl BlockFormat {
             GroupFold::Indexed => self.zf.whir_trees,
             GroupFold::PerPoly => multilinear::whir_chain::Round0Trees::Each,
         };
+        // ★ The BLAKE3 base's round form ([`B3Rounds`]): the later rounds'
+        // counts derived for the same target and union bound round 0's count
+        // was sized for (the chains' `check_round_form` refuses any other on
+        // both sides), each tree's cap held to its own openings.
+        if let (true, B3Rounds::Whir { shrink }) =
+            (self.zf.base == BaseFormat::B3_WHIR, self.b3_rounds)
+        {
+            let tallest = crate::multilinear_prove::tallest_stack(&self.zf, shapes);
+            config = config
+                .with_whir_rounds(
+                    usize::from(shrink),
+                    crate::multilinear_prove::CHAIN_SECURITY_BITS,
+                    tallest,
+                )
+                .and_then(ChainConfig::with_caps_by_queries)
+                .expect("a shrink from 1 to 3 is a round form");
+        }
         config
     }
 }
@@ -931,6 +1088,17 @@ pub struct BlockOptions {
 /// card every commit is counted.
 pub fn host_commit_fallbacks() -> u64 {
     multilinear::gpu::host_fallbacks()
+}
+
+/// The WHIR round form's successors encoded on the host and its shift-claim
+/// batches the card added (`multilinear::gpu`'s counters): what a base-only
+/// run under [`B3Rounds::Whir`] prints, so a run whose successors left the
+/// card says so.
+pub fn round_form_counts() -> (u64, u64) {
+    (
+        multilinear::gpu::round_form_host_encodes(),
+        multilinear::gpu::shift_claim_batches(),
+    )
 }
 
 /// The host's memory target, against which live regeneration's `auto` rule
