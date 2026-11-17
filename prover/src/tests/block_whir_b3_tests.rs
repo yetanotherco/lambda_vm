@@ -420,8 +420,8 @@ fn the_blake3_base_cap_knob_reads_its_words_and_refuses_the_rest() {
 // ───────────────────────────── the WHIR round form ───────────────────────────
 
 /// The BLAKE3 base's round-form knob: unset, `0` and `fri` are today's form;
-/// only `1` and `w3` (the design's shrink 3) or `w2` / `w1` turn the round
-/// form on; anything else is refused. No test sets it, and neither the
+/// only `1` and `w3` (shrink 3, caps by Q) turn the round form on; anything
+/// else, the other shrinks among it, is refused. No test sets it, and neither the
 /// pinned verifier's format nor a production format without it carries the
 /// round form.
 #[test]
@@ -435,24 +435,12 @@ fn the_blake3_base_rounds_knob_reads_its_words_and_refuses_the_rest() {
         (Some("1"), B3Rounds::WHIR3),
         (Some("w3"), B3Rounds::WHIR3),
         (Some(" W3 "), B3Rounds::WHIR3),
-        (
-            Some("w2"),
-            B3Rounds::Whir {
-                shrink: 2,
-                caps_by_q: true,
-            },
-        ),
-        (
-            Some("w1"),
-            B3Rounds::Whir {
-                shrink: 1,
-                caps_by_q: true,
-            },
-        ),
     ] {
         assert_eq!(b3_base_rounds_setting(word), Ok(want), "{word:?}");
     }
-    for word in ["", "2", "3", "on", "true", "whir", "w0", "w4", "w", "yes"] {
+    for word in [
+        "", "2", "3", "on", "true", "whir", "w0", "w1", "w2", "w4", "w", "yes",
+    ] {
         assert!(b3_base_rounds_setting(Some(word)).is_err(), "{word:?}");
     }
     assert_eq!(b3_base_rounds(), B3Rounds::Fri, "no test sets the knob");
@@ -762,6 +750,51 @@ fn a_blake3_round_form_proof_under_another_cap_rule_is_refused_and_the_drop_move
     });
 }
 
+/// ★★ THE PRODUCTION PATH: the streamed prove (windows, the production
+/// options' and the levels driver's), whose phase A commits under the config
+/// of no shapes before the block's are known, and requires the block's own
+/// config to carry the same format — the fold word every commit-time
+/// out-of-domain point absorbed. A BLAKE3 base under the round form proves and
+/// verifies on it at first fold 4 and 6, beside today's form, at a stack cap
+/// (2^10) under the block's tallest stack: the round form's union bound reads
+/// no shape.
+#[test]
+fn a_streamed_blake3_base_under_the_round_form_proves_and_verifies() {
+    use crate::block_whir::{B3Rounds, prove_block_whir_with};
+    use multilinear::whir_chain::{ArgueFormat, FirstFold, GroupFold, WhirFolds};
+    let elf = asm_elf_bytes("test_commit_4");
+    let mut streamed = options(3);
+    streamed.window_log2 = Some(4);
+    for (rounds, folds) in [
+        (B3Rounds::Fri, WhirFolds::Uniform),
+        (B3Rounds::WHIR3, WhirFolds::Uniform),
+        (
+            B3Rounds::WHIR3,
+            WhirFolds::First(FirstFold::new(6).unwrap()),
+        ),
+    ] {
+        let mut format = many_groups(BaseFormat::B3_WHIR);
+        format.group = GroupFold::Indexed;
+        format.argue = ArgueFormat::BATCHED;
+        format.zf.whir_folds = folds;
+        format.b3_rounds = rounds;
+        let label = format!("{rounds:?} {folds:?}");
+        crate::base_only::with_permit(|| {
+            let proof = prove_block_whir_with(
+                &elf,
+                &[],
+                &ProofOptions::default_test_options(),
+                &format,
+                &streamed,
+                &crate::block_whir::Deviations::default(),
+            )
+            .unwrap_or_else(|e| panic!("{label}: the streamed prove: {e}"))
+            .0;
+            assert_eq!(refusal(&proof, &elf, &format), None, "{label}");
+        });
+    }
+}
+
 /// The card's drop under the format: today's 8 at the default (first fold 6),
 /// and under a first fold of 4 or 5 enough levels that a `2^27` stack's
 /// round-0 cosets stay within the card's coset plan (`k0 + dropped ≥ 27 −
@@ -784,6 +817,19 @@ fn the_card_drop_keeps_round_zero_cosets_within_the_cards_plan() {
         tree_drop_for(&ZfFormat::DEFAULT).device,
         BLOCK_TREE_DROP_LEVELS_DEVICE
     );
+    // ★ One process, one drop: the production options' drop (the knob unset,
+    // as here) follows the process format, the same one the production block
+    // format takes its first fold and stack from; the round form is not an
+    // input, so a process proving both forms takes one drop, right for both.
+    let production = BlockFormat::production();
+    assert_eq!(production.zf, *ZfFormat::global());
+    assert_eq!(
+        crate::block_whir::tree_drop_from_env(),
+        tree_drop_for(&production.zf)
+    );
+    let mut either = production.zf;
+    either.base = BaseFormat::B3_WHIR;
+    assert_eq!(tree_drop_for(&either), tree_drop_for(&production.zf));
     assert_eq!(BLOCK_TREE_DROP_LEVELS_DEVICE, 8);
     assert_eq!(at(first(6), 27).device, 8);
     assert_eq!(at(first(5), 27).device, 9);
