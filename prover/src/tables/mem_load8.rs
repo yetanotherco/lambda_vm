@@ -216,3 +216,13 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemLoad8Constraints
         emit_is_bit(b, 0, cols::MU, None);
     }
 }
+
+#[cfg(test)]
+impl Load8Row {
+    /// A test's fault: the same row, its timestamp `cycles` later (a row the
+    /// CPU never dispatched).
+    pub(crate) fn later(mut self, cycles: u64) -> Self {
+        self.timestamp += cycles;
+        self
+    }
+}

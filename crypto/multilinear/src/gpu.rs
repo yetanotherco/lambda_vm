@@ -4276,6 +4276,108 @@ struct RecordsUp<'a> {
     mem_stores: Vec<&'a [math_cuda::fill::MemStoreRowC]>,
     shifts: Vec<&'a [math_cuda::fill::ShiftOpC]>,
     memws: Vec<&'a [math_cuda::fill::MemwOpC]>,
+    /// A word family's rows as the card's structs.
+    words_rows: Option<WordPiecesC<'a>>,
+}
+
+/// A word family's rows as the card's structs, the pieces in order
+/// ([`crate::records::WordRowsFill`]).
+#[cfg(feature = "cuda")]
+enum WordPiecesC<'a> {
+    Load8(Vec<&'a [math_cuda::fill::Load8RowC]>),
+    Store8(Vec<&'a [math_cuda::fill::Store8RowC]>),
+    LoadW(Vec<&'a [math_cuda::fill::LoadWRowC]>),
+    StoreW(Vec<&'a [math_cuda::fill::StoreWRowC]>),
+    Load2W(Vec<&'a [math_cuda::fill::Load2WRowC]>),
+    Store2W(Vec<&'a [math_cuda::fill::Store2WRowC]>),
+    MemwW(Vec<&'a [math_cuda::fill::MemwWordRowC]>),
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> WordPiecesC<'a> {
+    /// `rows`' pieces read as the card's structs.
+    fn of(rows: &crate::records::WordRowsFill<'a>) -> Self {
+        use crate::records::{
+            Load2WRow, Load8Row, LoadWRow, MemwWordRow, Store2WRow, Store8Row, StoreWRow,
+            WordRowsFill,
+        };
+        use math_cuda::fill::{
+            Load2WRowC, Load8RowC, LoadWRowC, MemwWordRowC, Store2WRowC, Store8RowC, StoreWRowC,
+        };
+        use std::mem::{align_of, offset_of, size_of};
+        const _: () = {
+            assert!(size_of::<Load8Row>() == size_of::<Load8RowC>());
+            assert!(align_of::<Load8Row>() == align_of::<Load8RowC>());
+            assert!(offset_of!(Load8Row, step) == offset_of!(Load8RowC, step));
+            assert!(offset_of!(Load8Row, word) == offset_of!(Load8RowC, word));
+            assert!(size_of::<Store8Row>() == size_of::<Store8RowC>());
+            assert!(align_of::<Store8Row>() == align_of::<Store8RowC>());
+            assert!(offset_of!(Store8Row, step) == offset_of!(Store8RowC, step));
+            assert!(offset_of!(Store8Row, old) == offset_of!(Store8RowC, old));
+            assert!(offset_of!(Store8Row, new) == offset_of!(Store8RowC, new_word));
+            assert!(size_of::<LoadWRow>() == size_of::<LoadWRowC>());
+            assert!(align_of::<LoadWRow>() == align_of::<LoadWRowC>());
+            assert!(offset_of!(LoadWRow, width) == offset_of!(LoadWRowC, width));
+            assert!(offset_of!(LoadWRow, signed) == offset_of!(LoadWRowC, is_signed));
+            assert!(offset_of!(LoadWRow, word) == offset_of!(LoadWRowC, word));
+            assert!(size_of::<StoreWRow>() == size_of::<StoreWRowC>());
+            assert!(align_of::<StoreWRow>() == align_of::<StoreWRowC>());
+            assert!(offset_of!(StoreWRow, width) == offset_of!(StoreWRowC, width));
+            assert!(offset_of!(StoreWRow, value) == offset_of!(StoreWRowC, value));
+            assert!(offset_of!(StoreWRow, old) == offset_of!(StoreWRowC, old));
+            assert!(size_of::<Load2WRow>() == size_of::<Load2WRowC>());
+            assert!(align_of::<Load2WRow>() == align_of::<Load2WRowC>());
+            assert!(offset_of!(Load2WRow, steps) == offset_of!(Load2WRowC, steps));
+            assert!(offset_of!(Load2WRow, words) == offset_of!(Load2WRowC, words));
+            assert!(offset_of!(Load2WRow, width) == offset_of!(Load2WRowC, width));
+            assert!(offset_of!(Load2WRow, signed) == offset_of!(Load2WRowC, is_signed));
+            assert!(size_of::<Store2WRow>() == size_of::<Store2WRowC>());
+            assert!(align_of::<Store2WRow>() == align_of::<Store2WRowC>());
+            assert!(offset_of!(Store2WRow, steps) == offset_of!(Store2WRowC, steps));
+            assert!(offset_of!(Store2WRow, value) == offset_of!(Store2WRowC, value));
+            assert!(offset_of!(Store2WRow, old) == offset_of!(Store2WRowC, old));
+            assert!(offset_of!(Store2WRow, width) == offset_of!(Store2WRowC, width));
+            assert!(size_of::<MemwWordRow>() == size_of::<MemwWordRowC>());
+            assert!(align_of::<MemwWordRow>() == align_of::<MemwWordRowC>());
+            assert!(offset_of!(MemwWordRow, step) == offset_of!(MemwWordRowC, step));
+            assert!(offset_of!(MemwWordRow, kind) == offset_of!(MemwWordRowC, kind));
+            assert!(offset_of!(MemwWordRow, old) == offset_of!(MemwWordRowC, old));
+            assert!(offset_of!(MemwWordRow, new) == offset_of!(MemwWordRowC, new_word));
+        };
+        /// SAFETY (the callers'): `R` and `C` are `#[repr(C)]` with the same
+        /// fields in the same order (asserted above).
+        unsafe fn cast<'p, R, C>(pieces: &[&'p [R]]) -> Vec<&'p [C]> {
+            pieces
+                .iter()
+                .map(|p| unsafe { core::slice::from_raw_parts(p.as_ptr() as *const C, p.len()) })
+                .collect()
+        }
+        // SAFETY: the same fields in the same order (asserted above).
+        unsafe {
+            match rows {
+                WordRowsFill::Load8(p) => Self::Load8(cast::<Load8Row, Load8RowC>(p)),
+                WordRowsFill::Store8(p) => Self::Store8(cast::<Store8Row, Store8RowC>(p)),
+                WordRowsFill::LoadW(p) => Self::LoadW(cast::<LoadWRow, LoadWRowC>(p)),
+                WordRowsFill::StoreW(p) => Self::StoreW(cast::<StoreWRow, StoreWRowC>(p)),
+                WordRowsFill::Load2W(p) => Self::Load2W(cast::<Load2WRow, Load2WRowC>(p)),
+                WordRowsFill::Store2W(p) => Self::Store2W(cast::<Store2WRow, Store2WRowC>(p)),
+                WordRowsFill::MemwW(p) => Self::MemwW(cast::<MemwWordRow, MemwWordRowC>(p)),
+            }
+        }
+    }
+
+    fn records(&self) -> math_cuda::fill::WordRecords<'_> {
+        use math_cuda::fill::WordRecords;
+        match self {
+            Self::Load8(p) => WordRecords::Load8(p),
+            Self::Store8(p) => WordRecords::Store8(p),
+            Self::LoadW(p) => WordRecords::LoadW(p),
+            Self::StoreW(p) => WordRecords::StoreW(p),
+            Self::Load2W(p) => WordRecords::Load2W(p),
+            Self::Store2W(p) => WordRecords::Store2W(p),
+            Self::MemwW(p) => WordRecords::MemwW(p),
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -4398,6 +4500,7 @@ impl<'a> RecordsUp<'a> {
                 mem_stores: Vec::new(),
                 shifts: Vec::new(),
                 memws: Vec::new(),
+                words_rows: None,
             });
         }
         let fill = records.fill();
@@ -4418,6 +4521,7 @@ impl<'a> RecordsUp<'a> {
             mem_stores: Vec::new(),
             shifts: Vec::new(),
             memws: Vec::new(),
+            words_rows: None,
         };
         match &fill {
             RecordsFill::KeccakRnd { .. } => {}
@@ -4451,6 +4555,7 @@ impl<'a> RecordsUp<'a> {
             }
             RecordsFill::Shift { ops } => up.shifts = unsafe { cast::<ShiftOp, ShiftOpC>(ops) },
             RecordsFill::Memw { ops } => up.memws = unsafe { cast::<MemwOp, MemwOpC>(ops) },
+            RecordsFill::Words(rows) => up.words_rows = Some(WordPiecesC::of(rows)),
         }
         up.fill = fill;
         Some(up)
@@ -4605,6 +4710,10 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
         },
         RecordsFill::Memw { .. } => RecordsInput::Memw {
             records: &up.memws,
+            rows: up.rows,
+        },
+        RecordsFill::Words(_) => RecordsInput::Words {
+            records: up.words_rows.as_ref()?.records(),
             rows: up.rows,
         },
     };

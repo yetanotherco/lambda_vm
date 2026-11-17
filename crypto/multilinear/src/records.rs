@@ -216,6 +216,211 @@ pub struct MemwOp {
     pub is_read: u8,
 }
 
+/// MEM_LOAD8's row as its fill reads it (the prover's word-format row, field
+/// for field): the address, the timestamp, the step to the word's old
+/// timestamp less one, the word read. Padding after the step.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Load8Row {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub word: u64,
+}
+
+/// MEM_STORE8's row: the address, the timestamp, the step, the word before
+/// and the word stored.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Store8Row {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub old: u64,
+    pub new: u64,
+}
+
+/// MEM_LOADW's row: the address, the timestamp, the step, the width, whether
+/// it sign-extends (0 or 1), the word read.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadWRow {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub width: u8,
+    pub signed: u8,
+    pub word: u64,
+}
+
+/// MEM_STOREW's row: the address, the timestamp, the step, the width, the
+/// register's value and the word before.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreWRow {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub width: u8,
+    pub value: u64,
+    pub old: u64,
+}
+
+/// MEM_LOAD2W's row: the address, the timestamp, each word's step, the two
+/// words (the one holding the address first), the width, whether it
+/// sign-extends (0 or 1). Padding at the end.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Load2WRow {
+    pub address: u64,
+    pub timestamp: u64,
+    pub steps: [u32; 2],
+    pub words: [u64; 2],
+    pub width: u8,
+    pub signed: u8,
+}
+
+/// MEM_STORE2W's row: the address, the timestamp, each word's step, the
+/// register's value, the two words before, the width. Padding at the end.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Store2WRow {
+    pub address: u64,
+    pub timestamp: u64,
+    pub steps: [u32; 2],
+    pub value: u64,
+    pub old: [u64; 2],
+    pub width: u8,
+}
+
+/// MEMW_W's row: the address, the timestamp, the step, the message kind (0
+/// an access, 1 a write), the word before and after.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemwWordRow {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub kind: u8,
+    pub old: u64,
+    pub new: u64,
+}
+
+/// A word family's rows as its fill reads them, the pieces in order
+/// ([`RecordsFill::Words`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WordRowsFill<'a> {
+    Load8(Vec<&'a [Load8Row]>),
+    Store8(Vec<&'a [Store8Row]>),
+    LoadW(Vec<&'a [LoadWRow]>),
+    StoreW(Vec<&'a [StoreWRow]>),
+    Load2W(Vec<&'a [Load2WRow]>),
+    Store2W(Vec<&'a [Store2WRow]>),
+    MemwW(Vec<&'a [MemwWordRow]>),
+}
+
+impl WordRowsFill<'_> {
+    /// The rows' bytes and count.
+    fn bytes_and_len(&self) -> (usize, usize) {
+        fn of<T>(pieces: &[&[T]]) -> (usize, usize) {
+            (
+                pieces.iter().map(|p| std::mem::size_of_val(*p)).sum(),
+                pieces.iter().map(|p| p.len()).sum(),
+            )
+        }
+        match self {
+            Self::Load8(p) => of(p),
+            Self::Store8(p) => of(p),
+            Self::LoadW(p) => of(p),
+            Self::StoreW(p) => of(p),
+            Self::Load2W(p) => of(p),
+            Self::Store2W(p) => of(p),
+            Self::MemwW(p) => of(p),
+        }
+    }
+
+    /// The family's tag and the rows' fields, in order ([`RecordsFill::words`]):
+    /// the fields alone, these rows hold padding.
+    fn words(&self, each: &mut impl FnMut(u64)) {
+        fn rows<'s, 'p: 's, T: 'p>(pieces: &'s [&'p [T]]) -> impl Iterator<Item = &'p T> + 's {
+            pieces.iter().flat_map(|piece| piece.iter())
+        }
+        match self {
+            Self::Load8(p) => {
+                each(10);
+                for r in rows(p) {
+                    each(r.address);
+                    each(r.timestamp);
+                    each(u64::from(r.step));
+                    each(r.word);
+                }
+            }
+            Self::Store8(p) => {
+                each(11);
+                for r in rows(p) {
+                    each(r.address);
+                    each(r.timestamp);
+                    each(u64::from(r.step));
+                    each(r.old);
+                    each(r.new);
+                }
+            }
+            Self::LoadW(p) => {
+                each(12);
+                for r in rows(p) {
+                    each(r.address);
+                    each(r.timestamp);
+                    each(u64::from(r.step) | u64::from(r.width) << 32 | u64::from(r.signed) << 40);
+                    each(r.word);
+                }
+            }
+            Self::StoreW(p) => {
+                each(13);
+                for r in rows(p) {
+                    each(r.address);
+                    each(r.timestamp);
+                    each(u64::from(r.step) | u64::from(r.width) << 32);
+                    each(r.value);
+                    each(r.old);
+                }
+            }
+            Self::Load2W(p) => {
+                each(14);
+                for r in rows(p) {
+                    each(r.address);
+                    each(r.timestamp);
+                    each(u64::from(r.steps[0]) | u64::from(r.steps[1]) << 32);
+                    each(r.words[0]);
+                    each(r.words[1]);
+                    each(u64::from(r.width) | u64::from(r.signed) << 8);
+                }
+            }
+            Self::Store2W(p) => {
+                each(15);
+                for r in rows(p) {
+                    each(r.address);
+                    each(r.timestamp);
+                    each(u64::from(r.steps[0]) | u64::from(r.steps[1]) << 32);
+                    each(r.value);
+                    each(r.old[0]);
+                    each(r.old[1]);
+                    each(u64::from(r.width));
+                }
+            }
+            Self::MemwW(p) => {
+                each(16);
+                for r in rows(p) {
+                    each(r.address);
+                    each(r.timestamp);
+                    each(u64::from(r.step) | u64::from(r.kind) << 32);
+                    each(r.old);
+                    each(r.new);
+                }
+            }
+        }
+    }
+}
+
 /// One DECODE row as CPU's fill reads it: the pc, the extended immediate,
 /// then the decoded fields as bytes (flags 0 or 1).
 #[repr(C)]
@@ -285,6 +490,25 @@ const _: () = {
     assert!(offset_of!(ShiftOp, word_instr) == 19);
     assert!(size_of::<MemwOp>() == 152);
     assert!(offset_of!(MemwOp, is_read) == 146);
+    assert!(size_of::<Load8Row>() == 32);
+    assert!(offset_of!(Load8Row, word) == 24);
+    assert!(size_of::<Store8Row>() == 40);
+    assert!(offset_of!(Store8Row, new) == 32);
+    assert!(size_of::<LoadWRow>() == 32);
+    assert!(offset_of!(LoadWRow, signed) == 21);
+    assert!(offset_of!(LoadWRow, word) == 24);
+    assert!(size_of::<StoreWRow>() == 40);
+    assert!(offset_of!(StoreWRow, width) == 20);
+    assert!(offset_of!(StoreWRow, old) == 32);
+    assert!(size_of::<Load2WRow>() == 48);
+    assert!(offset_of!(Load2WRow, words) == 24);
+    assert!(offset_of!(Load2WRow, signed) == 41);
+    assert!(size_of::<Store2WRow>() == 56);
+    assert!(offset_of!(Store2WRow, old) == 32);
+    assert!(offset_of!(Store2WRow, width) == 48);
+    assert!(size_of::<MemwWordRow>() == 40);
+    assert!(offset_of!(MemwWordRow, kind) == 20);
+    assert!(offset_of!(MemwWordRow, new) == 32);
 };
 
 /// A program's DECODE rows as CPU's fill reads them, shared by every CPU
@@ -440,6 +664,9 @@ pub enum RecordsFill<'a> {
     Shift { ops: Vec<&'a [ShiftOp]> },
     /// MEMW's rows: one an op of the pieces in order, then zero rows.
     Memw { ops: Vec<&'a [MemwOp]> },
+    /// A word family's rows (the word memory format): the pieces in order,
+    /// then zero rows.
+    Words(WordRowsFill<'a>),
 }
 
 impl RecordsFill<'_> {
@@ -465,6 +692,7 @@ impl RecordsFill<'_> {
             Self::MemStore { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::Shift { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::Memw { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
+            Self::Words(rows) => rows.bytes_and_len().0,
         }
     }
 
@@ -481,6 +709,7 @@ impl RecordsFill<'_> {
             Self::MemStore { rows } => rows.iter().map(|p| p.len()).sum(),
             Self::Shift { ops } => ops.iter().map(|p| p.len()).sum(),
             Self::Memw { ops } => ops.iter().map(|p| p.len()).sum(),
+            Self::Words(rows) => rows.bytes_and_len().1,
         }
     }
 
@@ -638,6 +867,7 @@ impl RecordsFill<'_> {
                     );
                 }
             }
+            Self::Words(rows) => rows.words(&mut each),
         }
     }
 }
@@ -983,6 +1213,9 @@ mod tests {
         Store(Vec<Vec<StoreOp>>),
         Shift(Vec<Vec<ShiftOp>>),
         Memw(Vec<Vec<MemwOp>>),
+        LoadW(Vec<Vec<LoadWRow>>),
+        Store2W(Vec<Vec<Store2WRow>>),
+        MemwW(Vec<Vec<MemwWordRow>>),
     }
 
     impl TableRecords for Pieces {
@@ -1000,6 +1233,9 @@ mod tests {
                 Self::Store(_) => 16,
                 Self::Shift(_) => 29,
                 Self::Memw(_) => 49,
+                Self::LoadW(_) => 31,
+                Self::Store2W(_) => 48,
+                Self::MemwW(_) => 11,
             }
         }
 
@@ -1035,6 +1271,15 @@ mod tests {
                 Self::Memw(pieces) => RecordsFill::Memw {
                     ops: pieces.iter().map(Vec::as_slice).collect(),
                 },
+                Self::LoadW(pieces) => RecordsFill::Words(WordRowsFill::LoadW(
+                    pieces.iter().map(Vec::as_slice).collect(),
+                )),
+                Self::Store2W(pieces) => RecordsFill::Words(WordRowsFill::Store2W(
+                    pieces.iter().map(Vec::as_slice).collect(),
+                )),
+                Self::MemwW(pieces) => RecordsFill::Words(WordRowsFill::MemwW(
+                    pieces.iter().map(Vec::as_slice).collect(),
+                )),
             }
         }
 
@@ -1192,6 +1437,103 @@ mod tests {
                     byte => op.res[byte - 4] ^= 1 << (byte % 8),
                 }
                 assert_ne!(load(cut(&moved, &[1])), whole, "op {at}, field {field}");
+            }
+        }
+    }
+
+    /// ★ A word family's table's digest reads every field of every row, in
+    /// order, whatever pieces they lie in (MEM_LOADW, MEM_STORE2W and MEMW_W:
+    /// every field kind the seven hold): one bit moved in any field, or a row
+    /// fewer, moves it; and two families' rows of the same bytes differ.
+    #[test]
+    fn the_word_records_digest_reads_every_field_and_not_the_pieces() {
+        let loadw: Vec<LoadWRow> = (0..5u64)
+            .map(|i| LoadWRow {
+                address: 0x8000 + i,
+                timestamp: 4 * i + 8,
+                step: (3 * i) as u32,
+                width: 1 << (i % 3),
+                signed: (i % 2) as u8,
+                word: i.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            })
+            .collect();
+        let d = |pieces| Records(Arc::new(Pieces::LoadW(pieces))).digest();
+        let whole = d(cut(&loadw, &[]));
+        assert_eq!(d(cut(&loadw, &[2])), whole);
+        assert_eq!(d(cut(&loadw, &[0, 1, 5])), whole);
+        assert_ne!(d(cut(&loadw[..4], &[])), whole, "a row fewer");
+        for at in 0..loadw.len() {
+            for field in 0..6 {
+                let mut moved = loadw.clone();
+                let r = &mut moved[at];
+                match field {
+                    0 => r.address ^= 1 << 63,
+                    1 => r.timestamp ^= 1,
+                    2 => r.step ^= 1 << 31,
+                    3 => r.width ^= 0x80,
+                    4 => r.signed ^= 1,
+                    _ => r.word ^= 1 << (at % 64),
+                }
+                assert_ne!(d(cut(&moved, &[3])), whole, "row {at}, field {field}");
+            }
+        }
+        let store2w: Vec<Store2WRow> = (0..5u64)
+            .map(|i| Store2WRow {
+                address: 0x9000 + 8 * i + 5,
+                timestamp: 4 * i + 8,
+                steps: [i as u32, (7 * i) as u32],
+                value: !i,
+                old: [i << 8, i << 16],
+                width: 8,
+            })
+            .collect();
+        let d = |pieces| Records(Arc::new(Pieces::Store2W(pieces))).digest();
+        let whole = d(cut(&store2w, &[]));
+        assert_eq!(d(cut(&store2w, &[4])), whole);
+        assert_ne!(d(cut(&store2w[1..], &[])), whole, "a row fewer");
+        for at in 0..store2w.len() {
+            for field in 0..8 {
+                let mut moved = store2w.clone();
+                let r = &mut moved[at];
+                match field {
+                    0 => r.address ^= 1 << 40,
+                    1 => r.timestamp ^= 1 << 63,
+                    2 => r.steps[0] ^= 1,
+                    3 => r.steps[1] ^= 1 << 31,
+                    4 => r.value ^= 1,
+                    5 => r.old[0] ^= 1 << 63,
+                    6 => r.old[1] ^= 1,
+                    _ => r.width ^= 0x80,
+                }
+                assert_ne!(d(cut(&moved, &[1])), whole, "row {at}, field {field}");
+            }
+        }
+        let memw_w: Vec<MemwWordRow> = (0..5u64)
+            .map(|i| MemwWordRow {
+                address: 0xA000 + 8 * i,
+                timestamp: 4 * i + 8,
+                step: i as u32,
+                kind: (i % 2) as u8,
+                old: i,
+                new: !i,
+            })
+            .collect();
+        let d = |pieces| Records(Arc::new(Pieces::MemwW(pieces))).digest();
+        let whole = d(cut(&memw_w, &[]));
+        assert_eq!(d(cut(&memw_w, &[2, 3])), whole);
+        for at in 0..memw_w.len() {
+            for field in 0..6 {
+                let mut moved = memw_w.clone();
+                let r = &mut moved[at];
+                match field {
+                    0 => r.address ^= 1,
+                    1 => r.timestamp ^= 1 << 32,
+                    2 => r.step ^= 1 << 16,
+                    3 => r.kind ^= 1,
+                    4 => r.old ^= 1 << 63,
+                    _ => r.new ^= 1,
+                }
+                assert_ne!(d(cut(&moved, &[3])), whole, "row {at}, field {field}");
             }
         }
     }

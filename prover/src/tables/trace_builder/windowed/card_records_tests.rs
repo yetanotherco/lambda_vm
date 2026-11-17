@@ -47,7 +47,7 @@ fn row_table(table: StreamTable) -> bool {
             | StreamTable::Shift
             | StreamTable::MemLoad
             | StreamTable::MemStore
-    )
+    ) || table.word_family().is_some()
 }
 
 /// Every family's `[as records, on the host]`: CPU, MEMW_R, then the row

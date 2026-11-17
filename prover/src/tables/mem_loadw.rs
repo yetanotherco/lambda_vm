@@ -367,3 +367,13 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemLoadWConstraints
         b.emit_base(24, root);
     }
 }
+
+#[cfg(test)]
+impl LoadWRow {
+    /// A test's fault: the same row, its timestamp `cycles` later (a row the
+    /// CPU never dispatched).
+    pub(crate) fn later(mut self, cycles: u64) -> Self {
+        self.timestamp += cycles;
+        self
+    }
+}

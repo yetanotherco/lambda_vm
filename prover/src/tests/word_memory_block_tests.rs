@@ -979,7 +979,8 @@ fn a_word_block_with_cut_word_families_proves_and_verifies() {
 /// same table counts, word tables, heights and public output; so does one
 /// whose streamed ops are dropped as handed out and whose word chunks leave
 /// as the windows' parts their rows lie in (`Deviations::word_chunks`, the
-/// knob `LAMBDA_VM_WORD_CHUNKS=part`). At word caps of 4 rows, so every
+/// knob `LAMBDA_VM_WORD_CHUNKS=part`), and held as those rows for the card
+/// (`card`; filled on the card where it admits them). At word caps of 4 rows, so every
 /// family with rows cuts into chunks; on a CPU run and on runs that call
 /// COPY, keccak256 and ECREC.
 #[test]
@@ -1000,7 +1001,9 @@ fn a_word_block_with_streamed_word_families_states_the_finish_built_block() {
         "test_ecrec",
     ] {
         let elf = asm_elf_bytes(name);
-        let prove_with = |stream: bool, in_place: bool| {
+        use crate::block_whir::WordChunks;
+        let prove_with = |stream: bool, chunks: WordChunks| {
+            let in_place = chunks != WordChunks::Copy;
             let mut options = super::block_whir_tests::streamed(tiny.clone(), 3, 9);
             options.drop_streamed_ops = in_place;
             prove_block_whir_with(
@@ -1011,23 +1014,19 @@ fn a_word_block_with_streamed_word_families_states_the_finish_built_block() {
                 &options,
                 &Deviations {
                     word_stream: Some(stream),
-                    word_chunks: Some(if in_place {
-                        crate::block_whir::WordChunks::Parts
-                    } else {
-                        crate::block_whir::WordChunks::Copy
-                    }),
+                    word_chunks: Some(chunks),
                     ..Deviations::default()
                 },
             )
-            .unwrap_or_else(|e| panic!("{name} stream {stream} in place {in_place}: {e:?}"))
+            .unwrap_or_else(|e| panic!("{name} stream {stream} {chunks:?}: {e:?}"))
             .0
         };
-        let built = prove_with(false, false);
-        for in_place in [false, true] {
-            let streamed = prove_with(true, in_place);
+        let built = prove_with(false, WordChunks::Copy);
+        for chunks in [WordChunks::Copy, WordChunks::Parts, WordChunks::Card] {
+            let streamed = prove_with(true, chunks);
             assert!(
                 matches!(verify_block_whir(&streamed, &elf, &opts, &words), Ok(true)),
-                "{name} {in_place}"
+                "{name} {chunks:?}"
             );
             assert_eq!(
                 format!("{:?}", streamed.table_counts),

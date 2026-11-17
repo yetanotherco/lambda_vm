@@ -89,6 +89,12 @@ pub mod shift;
 pub mod store;
 pub mod trace_builder;
 pub mod trace_hash;
+/// The word memory format's rows as the card's fills read them, as the
+/// in-place hand-out holds their chunks.
+pub(crate) mod word_card;
+/// The word tables' card fills against the host's: a test that needs a card.
+#[cfg(all(test, feature = "cuda", feature = "parallel"))]
+mod word_card_tests;
 pub mod word_cpu;
 #[cfg(test)]
 mod word_cpu_tests;

@@ -2255,18 +2255,24 @@ pub(crate) enum WordChunks {
     /// `part`: the windows' lists kept as they are, each chunk handed out as
     /// the parts its rows lie in ([`WindowedTraceBuilder::word_chunks_in_place`]).
     Parts,
+    /// `card`: handed out as `part` does, and each full chunk held as those
+    /// rows for the card to fill its table from as its group uploads it,
+    /// under the streamed records' room rule (`RowFamilies::words`).
+    Card,
 }
 
 /// `LAMBDA_VM_WORD_CHUNKS`'s reading: unset, empty or `copy` (the default),
-/// [`WordChunks::Copy`]; `part`, [`WordChunks::Parts`]. Anything else refuses
-/// the prove.
+/// [`WordChunks::Copy`]; `part`, [`WordChunks::Parts`]; `card`,
+/// [`WordChunks::Card`]. Anything else refuses the prove.
 fn parse_word_chunks(value: Option<&str>) -> Result<WordChunks, Error> {
     match value.map(str::trim) {
         None | Some("" | "copy") => Ok(WordChunks::Copy),
         Some("part") => Ok(WordChunks::Parts),
+        Some("card") => Ok(WordChunks::Card),
         Some(v) => Err(Error::Prover(format!(
             "LAMBDA_VM_WORD_CHUNKS={v}: copy (the default: each chunk copied out of one list a \
-             family) or part (each chunk handed out as the windows' parts its rows lie in)"
+             family), part (each chunk handed out as the windows' parts its rows lie in) or card \
+             (handed out so and filled on the card from its rows)"
         ))),
     }
 }
@@ -2568,7 +2574,7 @@ impl BlockStamps {
                  {} filled on the host · MEMW chunks {} as records, {} filled on the host · \
                  SHIFT chunks {} as records, {} filled on the host · MEM_LOAD chunks {} as \
                  records, {} filled on the host · MEM_STORE chunks {} as records, {} filled on \
-                 the host\n",
+                 the host · word chunks {} as records, {} filled on the host\n",
                 l.records_rest.0,
                 l.records_rest.1 as f64 / (1u64 << 20) as f64,
                 self.records_fills.0,
@@ -2597,6 +2603,8 @@ impl BlockStamps {
                 c.mem_load[1],
                 c.mem_store[0],
                 c.mem_store[1],
+                c.words[0],
+                c.words[1],
             ));
             let released = self.groups.iter().filter(|g| g.records_released > 0);
             let mut pages = multilinear::records::PagesReturned::default();
@@ -6763,6 +6771,9 @@ fn prove_streamed(
                 WordChunks::Copy => "copy: each chunk copied out of one list a family, the default",
                 WordChunks::Parts =>
                     "part: each chunk handed out as the windows' parts its rows lie in",
+                WordChunks::Card =>
+                    "card: each chunk handed out as the windows' parts its rows lie in and \
+                     filled on the card from them",
             }
         );
     }
@@ -6993,6 +7004,10 @@ fn prove_streamed(
         if format.registers == crate::tables::register::RegisterFormat::InRow {
             card_fill.memw_r = false;
         }
+        // The word families' chunks held as their rows for the card, when
+        // they are handed out in place and asked of it.
+        card_fill.rows.words =
+            word_stream && options.drop_streamed_ops && word_chunks == WordChunks::Card;
         // The streamed chunks held as records ([`records_admission`]):
         // G-pack's narrow chunks only, from a build that drops its streamed
         // ops, with live regeneration to drop them (or kept on purpose),
@@ -7023,8 +7038,13 @@ fn prove_streamed(
             }
         });
         eprintln!(
-            "BLOCK CARD FILL: families {} · streamed chunks as records: {}",
+            "BLOCK CARD FILL: families {}{} · streamed chunks as records: {}",
             card_fill.name(),
+            if card_fill.rows.words {
+                " + the word families"
+            } else {
+                ""
+            },
             admission.err().unwrap_or("while the host has room")
         );
         // Record mode: the fast engine writes the walk's history, the walkers
@@ -10516,7 +10536,8 @@ mod producer_report_tests {
         parse_word_chunks, parse_word_stream,
     };
 
-    /// `LAMBDA_VM_WORD_CHUNKS`: copied unless `part`; any other word refused.
+    /// `LAMBDA_VM_WORD_CHUNKS`: copied unless `part` or `card`; any other word
+    /// refused.
     #[test]
     fn the_word_chunks_are_copied_unless_handed_out_in_parts() {
         for (word, chunks) in [
@@ -10525,10 +10546,11 @@ mod producer_report_tests {
             (Some(" copy "), WordChunks::Copy),
             (Some("part"), WordChunks::Parts),
             (Some(" part "), WordChunks::Parts),
+            (Some("card"), WordChunks::Card),
         ] {
             assert_eq!(parse_word_chunks(word).ok(), Some(chunks), "{word:?}");
         }
-        for bad in ["parts", "1", "0", "Part", "copied"] {
+        for bad in ["parts", "1", "0", "Part", "copied", "cards"] {
             assert!(parse_word_chunks(Some(bad)).is_err(), "{bad}");
         }
     }

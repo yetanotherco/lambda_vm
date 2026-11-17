@@ -62,6 +62,77 @@ pub const KECCAK_RND_COLUMNS: usize = 1480;
 /// Rows a keccak operation fills.
 pub const KECCAK_RND_ROWS_PER_OP: usize = 24;
 
+/// The word memory format's tables the card fills from the walk's rows, one a
+/// family (the prover's `windowed::StreamTable::WORDS` order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WordFamily {
+    /// MEM_LOAD8: an aligned load of a whole word.
+    Load8,
+    /// MEM_STORE8: an aligned store of a whole word.
+    Store8,
+    /// MEM_LOADW: a load of 1, 2 or 4 bytes inside one word.
+    LoadW,
+    /// MEM_STOREW: a store of 1, 2 or 4 bytes inside one word.
+    StoreW,
+    /// MEM_LOAD2W: a load across two words.
+    Load2W,
+    /// MEM_STORE2W: a store across two words.
+    Store2W,
+    /// MEMW_W: a chip's word access.
+    MemwW,
+}
+
+impl WordFamily {
+    /// Every family, in order.
+    pub const ALL: [Self; 7] = [
+        Self::Load8,
+        Self::Store8,
+        Self::LoadW,
+        Self::StoreW,
+        Self::Load2W,
+        Self::Store2W,
+        Self::MemwW,
+    ];
+
+    /// The family's columns (its table module's `cols::NUM_COLUMNS`).
+    pub const fn columns(self) -> usize {
+        match self {
+            Self::Load8 => 8,
+            Self::Store8 => 12,
+            Self::LoadW | Self::StoreW => 31,
+            Self::Load2W => 47,
+            Self::Store2W => 48,
+            Self::MemwW => 11,
+        }
+    }
+
+    /// The table's name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Load8 => "MEM_LOAD8",
+            Self::Store8 => "MEM_STORE8",
+            Self::LoadW => "MEM_LOADW",
+            Self::StoreW => "MEM_STOREW",
+            Self::Load2W => "MEM_LOAD2W",
+            Self::Store2W => "MEM_STORE2W",
+            Self::MemwW => "MEMW_W",
+        }
+    }
+
+    /// Its kernel in `fill.cu`.
+    const fn kernel(self) -> &'static str {
+        match self {
+            Self::Load8 => "fill_mem_load8",
+            Self::Store8 => "fill_mem_store8",
+            Self::LoadW => "fill_mem_loadw",
+            Self::StoreW => "fill_mem_storew",
+            Self::Load2W => "fill_mem_load2w",
+            Self::Store2W => "fill_mem_store2w",
+            Self::MemwW => "fill_memw_w",
+        }
+    }
+}
+
 /// The column sections the KECCAK_RND kernel's grid splits a row into
 /// (`FILL_KECCAK_SECTIONS`).
 const KECCAK_SECTIONS: u32 = 3;
@@ -217,6 +288,97 @@ pub struct MemStoreRowC {
     pub old: u64,
 }
 
+/// MEM_LOAD8's row (the prover's `Load8Row`; `fill.cu`'s `Load8RowC`): the
+/// address, the timestamp, the step to the word's old timestamp less one, the
+/// word read; four bytes of padding after the step, which no kernel reads.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Load8RowC {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub word: u64,
+}
+
+/// MEM_STORE8's row (the prover's `Store8Row`): the address, the timestamp,
+/// the step, the word before and the word stored.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Store8RowC {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub old: u64,
+    pub new_word: u64,
+}
+
+/// MEM_LOADW's row (the prover's `LoadWRow`): the address, the timestamp, the
+/// step, the width, whether it sign-extends (0 or 1), the word read.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadWRowC {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub width: u8,
+    pub is_signed: u8,
+    pub word: u64,
+}
+
+/// MEM_STOREW's row (the prover's `StoreWRow`): the address, the timestamp,
+/// the step, the width, the register's value and the word before.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreWRowC {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub width: u8,
+    pub value: u64,
+    pub old: u64,
+}
+
+/// MEM_LOAD2W's row (the prover's `Load2WRow`): the address, the timestamp,
+/// each word's step, the two words, the width, whether it sign-extends; six
+/// bytes of padding at the end, which no kernel reads.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Load2WRowC {
+    pub address: u64,
+    pub timestamp: u64,
+    pub steps: [u32; 2],
+    pub words: [u64; 2],
+    pub width: u8,
+    pub is_signed: u8,
+}
+
+/// MEM_STORE2W's row (the prover's `Store2WRow`): the address, the timestamp,
+/// each word's step, the register's value, the two words before, the width;
+/// seven bytes of padding at the end.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Store2WRowC {
+    pub address: u64,
+    pub timestamp: u64,
+    pub steps: [u32; 2],
+    pub value: u64,
+    pub old: [u64; 2],
+    pub width: u8,
+}
+
+/// MEMW_W's row (the prover's `MemwWordRow`): the address, the timestamp, the
+/// step, the message kind (0 an access, 1 a write), the word before and after.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemwWordRowC {
+    pub address: u64,
+    pub timestamp: u64,
+    pub step: u32,
+    pub kind: u8,
+    pub old: u64,
+    pub new_word: u64,
+}
+
 /// One LOAD op (the prover's `LoadOperation`): the base address, the
 /// timestamp, the width, whether it sign-extends (0 or 1) and the result's
 /// bytes.
@@ -302,6 +464,33 @@ const _: () = {
     assert!(size_of::<MemStoreRowC>() == 40);
     assert!(offset_of!(MemStoreRowC, width) == 20);
     assert!(offset_of!(MemStoreRowC, value) == 24);
+    assert!(size_of::<Load8RowC>() == 32);
+    assert!(offset_of!(Load8RowC, step) == 16);
+    assert!(offset_of!(Load8RowC, word) == 24);
+    assert!(size_of::<Store8RowC>() == 40);
+    assert!(offset_of!(Store8RowC, old) == 24);
+    assert!(offset_of!(Store8RowC, new_word) == 32);
+    assert!(size_of::<LoadWRowC>() == 32);
+    assert!(offset_of!(LoadWRowC, width) == 20);
+    assert!(offset_of!(LoadWRowC, is_signed) == 21);
+    assert!(offset_of!(LoadWRowC, word) == 24);
+    assert!(size_of::<StoreWRowC>() == 40);
+    assert!(offset_of!(StoreWRowC, width) == 20);
+    assert!(offset_of!(StoreWRowC, value) == 24);
+    assert!(offset_of!(StoreWRowC, old) == 32);
+    assert!(size_of::<Load2WRowC>() == 48);
+    assert!(offset_of!(Load2WRowC, steps) == 16);
+    assert!(offset_of!(Load2WRowC, words) == 24);
+    assert!(offset_of!(Load2WRowC, width) == 40);
+    assert!(offset_of!(Load2WRowC, is_signed) == 41);
+    assert!(size_of::<Store2WRowC>() == 56);
+    assert!(offset_of!(Store2WRowC, value) == 24);
+    assert!(offset_of!(Store2WRowC, old) == 32);
+    assert!(offset_of!(Store2WRowC, width) == 48);
+    assert!(size_of::<MemwWordRowC>() == 40);
+    assert!(offset_of!(MemwWordRowC, kind) == 20);
+    assert!(offset_of!(MemwWordRowC, old) == 24);
+    assert!(offset_of!(MemwWordRowC, new_word) == 32);
     assert!(offset_of!(StoreOpC, write2) == 24);
     assert!(size_of::<ShiftOpC>() == 24);
     assert!(offset_of!(ShiftOpC, in_halves) == 8);
@@ -328,6 +517,13 @@ unsafe impl DeviceRepr for MemLoadRowC {}
 unsafe impl DeviceRepr for MemStoreRowC {}
 unsafe impl DeviceRepr for ShiftOpC {}
 unsafe impl DeviceRepr for MemwOpC {}
+unsafe impl DeviceRepr for Load8RowC {}
+unsafe impl DeviceRepr for Store8RowC {}
+unsafe impl DeviceRepr for LoadWRowC {}
+unsafe impl DeviceRepr for StoreWRowC {}
+unsafe impl DeviceRepr for Load2WRowC {}
+unsafe impl DeviceRepr for Store2WRowC {}
+unsafe impl DeviceRepr for MemwWordRowC {}
 
 impl DecodeRunC {
     /// The DECODE row of `pc` in `runs` (ascending and disjoint), as the CPU
@@ -367,6 +563,8 @@ struct Module {
     keccak_rnd: CudaFunction,
     keccak_rnd_in: CudaFunction,
     lfm_p1w16_socket: CudaFunction,
+    /// The word families' kernels, in [`WordFamily::ALL`]'s order.
+    words: Vec<CudaFunction>,
 }
 
 fn module() -> Result<&'static Module> {
@@ -389,6 +587,10 @@ fn module() -> Result<&'static Module> {
         keccak_rnd: module.load_function("fill_keccak_rnd")?,
         keccak_rnd_in: module.load_function("fill_keccak_rnd_in")?,
         lfm_p1w16_socket: module.load_function("fill_lfm_p1w16_socket")?,
+        words: WordFamily::ALL
+            .iter()
+            .map(|family| module.load_function(family.kernel()))
+            .collect::<std::result::Result<_, _>>()?,
         _module: module,
     };
     Ok(MODULE.get_or_init(|| m))
@@ -784,6 +986,111 @@ pub enum RecordsInput<'a> {
         records: &'a [&'a [MemwOpC]],
         rows: usize,
     },
+    /// A word family's `rows` rows: `records`' pieces in order, then zero
+    /// rows.
+    Words {
+        records: WordRecords<'a>,
+        rows: usize,
+    },
+}
+
+/// A word family's rows as the card's structs, the pieces in order.
+#[derive(Clone, Copy, Debug)]
+pub enum WordRecords<'a> {
+    Load8(&'a [&'a [Load8RowC]]),
+    Store8(&'a [&'a [Store8RowC]]),
+    LoadW(&'a [&'a [LoadWRowC]]),
+    StoreW(&'a [&'a [StoreWRowC]]),
+    Load2W(&'a [&'a [Load2WRowC]]),
+    Store2W(&'a [&'a [Store2WRowC]]),
+    MemwW(&'a [&'a [MemwWordRowC]]),
+}
+
+impl WordRecords<'_> {
+    pub fn family(&self) -> WordFamily {
+        match self {
+            Self::Load8(_) => WordFamily::Load8,
+            Self::Store8(_) => WordFamily::Store8,
+            Self::LoadW(_) => WordFamily::LoadW,
+            Self::StoreW(_) => WordFamily::StoreW,
+            Self::Load2W(_) => WordFamily::Load2W,
+            Self::Store2W(_) => WordFamily::Store2W,
+            Self::MemwW(_) => WordFamily::MemwW,
+        }
+    }
+
+    /// The rows' bytes and count.
+    fn bytes_and_len(&self) -> (usize, usize) {
+        fn of<T>(pieces: &[&[T]]) -> (usize, usize) {
+            (
+                pieces.iter().map(|piece| size_of_val(*piece)).sum(),
+                pieces.iter().map(|piece| piece.len()).sum(),
+            )
+        }
+        match self {
+            Self::Load8(p) => of(p),
+            Self::Store8(p) => of(p),
+            Self::LoadW(p) => of(p),
+            Self::StoreW(p) => of(p),
+            Self::Load2W(p) => of(p),
+            Self::Store2W(p) => of(p),
+            Self::MemwW(p) => of(p),
+        }
+    }
+
+    /// The rows copied up on `stream`, piece by piece into one buffer.
+    fn stage(&self, stream: &Arc<CudaStream>) -> Result<StagedWords> {
+        Ok(match self {
+            Self::Load8(p) => StagedWords::Load8(upload_pieces(stream, p)?),
+            Self::Store8(p) => StagedWords::Store8(upload_pieces(stream, p)?),
+            Self::LoadW(p) => StagedWords::LoadW(upload_pieces(stream, p)?),
+            Self::StoreW(p) => StagedWords::StoreW(upload_pieces(stream, p)?),
+            Self::Load2W(p) => StagedWords::Load2W(upload_pieces(stream, p)?),
+            Self::Store2W(p) => StagedWords::Store2W(upload_pieces(stream, p)?),
+            Self::MemwW(p) => StagedWords::MemwW(upload_pieces(stream, p)?),
+        })
+    }
+}
+
+/// A word family's rows on the card ([`Staged::Words`]).
+pub(crate) enum StagedWords {
+    Load8(CudaSlice<Load8RowC>),
+    Store8(CudaSlice<Store8RowC>),
+    LoadW(CudaSlice<LoadWRowC>),
+    StoreW(CudaSlice<StoreWRowC>),
+    Load2W(CudaSlice<Load2WRowC>),
+    Store2W(CudaSlice<Store2WRowC>),
+    MemwW(CudaSlice<MemwWordRowC>),
+}
+
+impl StagedWords {
+    /// The family's kernel over the `n` rows on the card into `dst`'s `rows`
+    /// rows (zero past them), on `stream`.
+    fn launch(
+        &self,
+        stream: &Arc<CudaStream>,
+        m: &Module,
+        n: usize,
+        rows: usize,
+        dst: &mut CudaViewMut<u64>,
+    ) -> Result<()> {
+        let f = |family: WordFamily| -> Result<&CudaFunction> {
+            let at = WordFamily::ALL
+                .iter()
+                .position(|&k| k == family)
+                .ok_or_else(crate::invalid_value)?;
+            m.words.get(at).ok_or_else(crate::invalid_value)
+        };
+        match self {
+            Self::Load8(r) => launch_rows(stream, f(WordFamily::Load8)?, r, n, rows, dst),
+            Self::Store8(r) => launch_rows(stream, f(WordFamily::Store8)?, r, n, rows, dst),
+            Self::LoadW(r) => launch_rows(stream, f(WordFamily::LoadW)?, r, n, rows, dst),
+            Self::StoreW(r) => launch_rows(stream, f(WordFamily::StoreW)?, r, n, rows, dst),
+            Self::Load2W(r) => launch_rows(stream, f(WordFamily::Load2W)?, r, n, rows, dst),
+            Self::Store2W(r) => launch_rows(stream, f(WordFamily::Store2W)?, r, n, rows, dst),
+            Self::MemwW(r) => launch_rows(stream, f(WordFamily::MemwW)?, r, n, rows, dst),
+        }
+    }
 }
 
 impl std::fmt::Debug for RecordsInput<'_> {
@@ -800,6 +1107,7 @@ impl std::fmt::Debug for RecordsInput<'_> {
             Self::Store { .. } => "STORE",
             Self::Shift { .. } => "SHIFT",
             Self::Memw { .. } => "MEMW",
+            Self::Words { records, .. } => records.family().name(),
         };
         write!(
             f,
@@ -824,7 +1132,8 @@ impl RecordsInput<'_> {
             | Self::MemStore { rows, .. }
             | Self::Store { rows, .. }
             | Self::Shift { rows, .. }
-            | Self::Memw { rows, .. } => *rows,
+            | Self::Memw { rows, .. }
+            | Self::Words { rows, .. } => *rows,
         }
     }
 
@@ -842,6 +1151,7 @@ impl RecordsInput<'_> {
             Self::Store { .. } => STORE_COLUMNS,
             Self::Shift { .. } => SHIFT_COLUMNS,
             Self::Memw { .. } => MEMW_COLUMNS,
+            Self::Words { records, .. } => records.family().columns(),
         }
     }
 
@@ -866,6 +1176,7 @@ impl RecordsInput<'_> {
             Self::Store { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Shift { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Memw { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::Words { records, .. } => records.bytes_and_len().0,
         }
     }
 
@@ -883,6 +1194,7 @@ impl RecordsInput<'_> {
             Self::Store { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Shift { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Memw { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::Words { records, .. } => records.bytes_and_len().1,
         }
     }
 }
@@ -1143,6 +1455,12 @@ pub(crate) fn fill_col_major_into(
             let records_dev = upload_pieces(stream, pieces)?;
             launch_rows(stream, &m.memw, &records_dev, records.len(), rows, dst)
         }
+        RecordsInput::Words {
+            records: pieces,
+            rows,
+        } => pieces
+            .stage(stream)?
+            .launch(stream, m, records.len(), rows, dst),
     }
 }
 
@@ -1198,6 +1516,8 @@ pub(crate) enum Staged<'a> {
     MemStore(CudaSlice<MemStoreRowC>, usize),
     Shift(CudaSlice<ShiftOpC>, usize),
     Memw(CudaSlice<MemwOpC>, usize),
+    /// A word family's rows and their count.
+    Words(StagedWords, usize),
     /// Written by another launch (a derived table, [`crate::card_rows`]):
     /// nothing to launch here.
     Elsewhere,
@@ -1243,6 +1563,7 @@ pub(crate) fn stage<'a>(stream: &Arc<CudaStream>, records: RecordsInput<'a>) -> 
         RecordsInput::Store { records, .. } => Staged::Store(upload_pieces(stream, records)?, n),
         RecordsInput::Shift { records, .. } => Staged::Shift(upload_pieces(stream, records)?, n),
         RecordsInput::Memw { records, .. } => Staged::Memw(upload_pieces(stream, records)?, n),
+        RecordsInput::Words { records, .. } => Staged::Words(records.stage(stream)?, n),
     })
 }
 
@@ -1312,6 +1633,7 @@ pub(crate) fn launch_staged(
         Staged::MemStore(records, n) => launch_rows(stream, &m.mem_store, records, *n, rows, dst),
         Staged::Shift(records, n) => launch_rows(stream, &m.shift, records, *n, rows, dst),
         Staged::Memw(records, n) => launch_rows(stream, &m.memw, records, *n, rows, dst),
+        Staged::Words(records, n) => records.launch(stream, m, *n, rows, dst),
         Staged::Elsewhere => Ok(()),
     }
 }

@@ -26,6 +26,7 @@ use crate::tables::shift::ShiftOperation;
 use crate::tables::store::StoreOperation;
 use crate::tables::{
     cpu, load, mem_card, mem_load, mem_store, memw, memw_aligned, memw_register, shift, store,
+    word_card,
 };
 
 /// The program's DECODE table for the CPU chunks held as logs: the host's,
@@ -574,6 +575,90 @@ impl RowFamily for MemStoreRow {
         MemStoreRow::later(*self, cycles)
     }
 }
+
+/// The word memory format's families, each a [`RowFamily`]: the walk's rows
+/// read in place by the card (`word_card`'s views), the host fill the
+/// family's generator.
+macro_rules! word_family {
+    ($row:ty, $table:ident, $module:ident, $variant:ident, $view:ident, $generate:ident) => {
+        impl RowFamily for $row {
+            const TABLE: StreamTable = StreamTable::$table;
+            const COLUMNS: usize = crate::tables::$module::cols::NUM_COLUMNS;
+
+            fn fill(pieces: Vec<&[Self]>) -> RecordsFill<'_> {
+                RecordsFill::Words(multilinear::records::WordRowsFill::$variant(
+                    pieces.into_iter().map(word_card::$view).collect(),
+                ))
+            }
+
+            fn host_fill(pieces: &[&[Self]], form: TraceForm) -> Table {
+                crate::tables::$module::$generate(pieces, form)
+            }
+
+            #[cfg(test)]
+            fn later(&self, cycles: u64) -> Self {
+                <$row>::later(*self, cycles)
+            }
+        }
+    };
+}
+
+word_family!(
+    crate::tables::mem_load8::Load8Row,
+    MemLoad8,
+    mem_load8,
+    Load8,
+    card_load8_rows,
+    generate_mem_load8_trace_segments_as
+);
+word_family!(
+    crate::tables::mem_store8::Store8Row,
+    MemStore8,
+    mem_store8,
+    Store8,
+    card_store8_rows,
+    generate_mem_store8_trace_segments_as
+);
+word_family!(
+    crate::tables::mem_loadw::LoadWRow,
+    MemLoadW,
+    mem_loadw,
+    LoadW,
+    card_loadw_rows,
+    generate_mem_loadw_trace_segments_as
+);
+word_family!(
+    crate::tables::mem_storew::StoreWRow,
+    MemStoreW,
+    mem_storew,
+    StoreW,
+    card_storew_rows,
+    generate_mem_storew_trace_segments_as
+);
+word_family!(
+    crate::tables::mem_load2w::Load2WRow,
+    MemLoad2W,
+    mem_load2w,
+    Load2W,
+    card_load2w_rows,
+    generate_mem_load2w_trace_segments_as
+);
+word_family!(
+    crate::tables::mem_store2w::Store2WRow,
+    MemStore2W,
+    mem_store2w,
+    Store2W,
+    card_store2w_rows,
+    generate_mem_store2w_trace_segments_as
+);
+word_family!(
+    crate::tables::memw_w::MemwWordRow,
+    MemwW,
+    memw_w,
+    MemwW,
+    card_memw_w_rows,
+    generate_memw_w_trace_segments_as
+);
 
 /// A full chunk of a [`RowFamily`] held as its rows.
 pub(crate) struct RowRecords<T: RowFamily> {

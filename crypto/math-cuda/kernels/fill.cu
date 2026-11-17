@@ -1228,3 +1228,479 @@ extern "C" __global__ void fill_lfm_p1w16_socket(const uint64_t *__restrict__ na
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The word memory format's tables (`mem_load8.rs`, `mem_store8.rs`, `mem_loadw.rs`,
+// `mem_storew.rs`, `mem_load2w.rs`, `mem_store2w.rs`, `memw_w.rs`: each one's
+// `generate_*_trace_segments_as`), filled from the walk's rows. Each row is the
+// prover's struct, field for field; padding rows are zero in every column.
+// ---------------------------------------------------------------------------
+
+// MEM_LOAD8's row: an aligned LD of `word`, `step` = ts − old_ts − 1.
+struct Load8RowC {
+    uint64_t address;
+    uint64_t timestamp;
+    uint32_t step;
+    uint8_t pad[4];
+    uint64_t word;
+};
+static_assert(sizeof(Load8RowC) == 32, "Load8RowC is 32 bytes");
+static_assert(offsetof(Load8RowC, step) == 16, "Load8RowC field order");
+static_assert(offsetof(Load8RowC, word) == 24, "Load8RowC field order");
+
+// MEM_STORE8's row: an aligned SD of `new_word` over `old`.
+struct Store8RowC {
+    uint64_t address;
+    uint64_t timestamp;
+    uint32_t step;
+    uint8_t pad[4];
+    uint64_t old;
+    uint64_t new_word;
+};
+static_assert(sizeof(Store8RowC) == 40, "Store8RowC is 40 bytes");
+static_assert(offsetof(Store8RowC, old) == 24, "Store8RowC field order");
+static_assert(offsetof(Store8RowC, new_word) == 32, "Store8RowC field order");
+
+// MEM_LOADW's row: a load of 1, 2 or 4 bytes inside one word.
+struct LoadWRowC {
+    uint64_t address;
+    uint64_t timestamp;
+    uint32_t step;
+    uint8_t width;
+    uint8_t is_signed;
+    uint8_t pad[2];
+    uint64_t word;
+};
+static_assert(sizeof(LoadWRowC) == 32, "LoadWRowC is 32 bytes");
+static_assert(offsetof(LoadWRowC, width) == 20, "LoadWRowC field order");
+static_assert(offsetof(LoadWRowC, is_signed) == 21, "LoadWRowC field order");
+static_assert(offsetof(LoadWRowC, word) == 24, "LoadWRowC field order");
+
+// MEM_STOREW's row: a store of 1, 2 or 4 bytes of `value` inside the word `old`.
+struct StoreWRowC {
+    uint64_t address;
+    uint64_t timestamp;
+    uint32_t step;
+    uint8_t width;
+    uint8_t pad[3];
+    uint64_t value;
+    uint64_t old;
+};
+static_assert(sizeof(StoreWRowC) == 40, "StoreWRowC is 40 bytes");
+static_assert(offsetof(StoreWRowC, width) == 20, "StoreWRowC field order");
+static_assert(offsetof(StoreWRowC, value) == 24, "StoreWRowC field order");
+static_assert(offsetof(StoreWRowC, old) == 32, "StoreWRowC field order");
+
+// MEM_LOAD2W's row: a load of 2, 4 or 8 bytes across two words, the one holding
+// `address` first.
+struct Load2WRowC {
+    uint64_t address;
+    uint64_t timestamp;
+    uint32_t steps[2];
+    uint64_t words[2];
+    uint8_t width;
+    uint8_t is_signed;
+    uint8_t pad[6];
+};
+static_assert(sizeof(Load2WRowC) == 48, "Load2WRowC is 48 bytes");
+static_assert(offsetof(Load2WRowC, steps) == 16, "Load2WRowC field order");
+static_assert(offsetof(Load2WRowC, words) == 24, "Load2WRowC field order");
+static_assert(offsetof(Load2WRowC, width) == 40, "Load2WRowC field order");
+static_assert(offsetof(Load2WRowC, is_signed) == 41, "Load2WRowC field order");
+
+// MEM_STORE2W's row: a store of 2, 4 or 8 bytes of `value` across the two words `old`.
+struct Store2WRowC {
+    uint64_t address;
+    uint64_t timestamp;
+    uint32_t steps[2];
+    uint64_t value;
+    uint64_t old[2];
+    uint8_t width;
+    uint8_t pad[7];
+};
+static_assert(sizeof(Store2WRowC) == 56, "Store2WRowC is 56 bytes");
+static_assert(offsetof(Store2WRowC, value) == 24, "Store2WRowC field order");
+static_assert(offsetof(Store2WRowC, old) == 32, "Store2WRowC field order");
+static_assert(offsetof(Store2WRowC, width) == 48, "Store2WRowC field order");
+
+// MEMW_W's row: a chip's word access, `kind` 0 (an access message) or 1 (a write).
+struct MemwWordRowC {
+    uint64_t address;
+    uint64_t timestamp;
+    uint32_t step;
+    uint8_t kind;
+    uint8_t pad[3];
+    uint64_t old;
+    uint64_t new_word;
+};
+static_assert(sizeof(MemwWordRowC) == 40, "MemwWordRowC is 40 bytes");
+static_assert(offsetof(MemwWordRowC, kind) == 20, "MemwWordRowC field order");
+static_assert(offsetof(MemwWordRowC, old) == 24, "MemwWordRowC field order");
+static_assert(offsetof(MemwWordRowC, new_word) == 32, "MemwWordRowC field order");
+
+namespace mem_load8_cols {
+constexpr uint32_t ADDRESS_LO = 0;
+constexpr uint32_t ADDRESS_HI = 1;
+constexpr uint32_t TIMESTAMP = 2;
+constexpr uint32_t LO = 3;
+constexpr uint32_t HI = 4;
+constexpr uint32_t STEP_0 = 5;
+constexpr uint32_t STEP_1 = 6;
+constexpr uint32_t MU = 7;
+constexpr uint32_t NUM_COLUMNS = 8;
+}  // namespace mem_load8_cols
+
+namespace mem_store8_cols {
+constexpr uint32_t ADDRESS_LO = 0;
+constexpr uint32_t ADDRESS_HI = 1;
+constexpr uint32_t TIMESTAMP = 2;
+constexpr uint32_t OLD_LO = 3;
+constexpr uint32_t OLD_HI = 4;
+constexpr uint32_t NEW_0 = 5;  // 4 columns
+constexpr uint32_t STEP_0 = 9;
+constexpr uint32_t STEP_1 = 10;
+constexpr uint32_t MU = 11;
+constexpr uint32_t NUM_COLUMNS = 12;
+}  // namespace mem_store8_cols
+
+namespace mem_loadw_cols {
+constexpr uint32_t ADDRESS_LO = 0;
+constexpr uint32_t ADDRESS_HI = 1;
+constexpr uint32_t TIMESTAMP = 2;
+constexpr uint32_t OFF_0 = 3;  // 8 columns
+constexpr uint32_t READ2 = 11;
+constexpr uint32_t READ4 = 12;
+constexpr uint32_t SIGNED = 13;
+constexpr uint32_t BYTES_0 = 14;  // 8 columns
+constexpr uint32_t RES_0 = 22;    // 4 columns
+constexpr uint32_t SIGN_BIT = 26;
+constexpr uint32_t EXT = 27;
+constexpr uint32_t STEP_0 = 28;
+constexpr uint32_t STEP_1 = 29;
+constexpr uint32_t MU = 30;
+constexpr uint32_t NUM_COLUMNS = 31;
+}  // namespace mem_loadw_cols
+
+namespace mem_storew_cols {
+constexpr uint32_t ADDRESS_LO = 0;
+constexpr uint32_t ADDRESS_HI = 1;
+constexpr uint32_t TIMESTAMP = 2;
+constexpr uint32_t OFF_0 = 3;  // 8 columns
+constexpr uint32_t WRITE2 = 11;
+constexpr uint32_t WRITE4 = 12;
+constexpr uint32_t OLD_0 = 13;    // 8 columns
+constexpr uint32_t VALUE_0 = 21;  // 4 columns
+constexpr uint32_t VALUE_HI = 25;
+constexpr uint32_t NEW_LO = 26;
+constexpr uint32_t NEW_HI = 27;
+constexpr uint32_t STEP_0 = 28;
+constexpr uint32_t STEP_1 = 29;
+constexpr uint32_t MU = 30;
+constexpr uint32_t NUM_COLUMNS = 31;
+}  // namespace mem_storew_cols
+
+namespace mem_load2w_cols {
+constexpr uint32_t ADDRESS_LO = 0;
+constexpr uint32_t ADDRESS_HI = 1;
+constexpr uint32_t TIMESTAMP = 2;
+constexpr uint32_t OFF_0 = 3;  // 8 columns
+constexpr uint32_t READ2 = 11;
+constexpr uint32_t READ4 = 12;
+constexpr uint32_t READ8 = 13;
+constexpr uint32_t SIGNED = 14;
+constexpr uint32_t BYTES_0 = 15;  // 16 columns
+constexpr uint32_t RES_0 = 31;    // 8 columns
+constexpr uint32_t SIGN_BIT = 39;
+constexpr uint32_t EXT = 40;
+constexpr uint32_t STEP_0 = 41;
+constexpr uint32_t STEP_1 = 42;
+constexpr uint32_t STEP2_0 = 43;
+constexpr uint32_t STEP2_1 = 44;
+constexpr uint32_t MU = 45;
+constexpr uint32_t CARRY = 46;
+constexpr uint32_t NUM_COLUMNS = 47;
+}  // namespace mem_load2w_cols
+
+namespace mem_store2w_cols {
+constexpr uint32_t ADDRESS_LO = 0;
+constexpr uint32_t ADDRESS_HI = 1;
+constexpr uint32_t TIMESTAMP = 2;
+constexpr uint32_t OFF_0 = 3;  // 8 columns
+constexpr uint32_t WRITE2 = 11;
+constexpr uint32_t WRITE4 = 12;
+constexpr uint32_t WRITE8 = 13;
+constexpr uint32_t OLD_0 = 14;    // 16 columns
+constexpr uint32_t VALUE_0 = 30;  // 8 columns
+constexpr uint32_t NEW1_LO = 38;
+constexpr uint32_t NEW1_HI = 39;
+constexpr uint32_t NEW2_LO = 40;
+constexpr uint32_t NEW2_HI = 41;
+constexpr uint32_t STEP_0 = 42;
+constexpr uint32_t STEP_1 = 43;
+constexpr uint32_t STEP2_0 = 44;
+constexpr uint32_t STEP2_1 = 45;
+constexpr uint32_t MU = 46;
+constexpr uint32_t CARRY = 47;
+constexpr uint32_t NUM_COLUMNS = 48;
+}  // namespace mem_store2w_cols
+
+namespace memw_w_cols {
+constexpr uint32_t ADDRESS_LO = 0;
+constexpr uint32_t ADDRESS_HI = 1;
+constexpr uint32_t TIMESTAMP = 2;
+constexpr uint32_t OLD_LO = 3;
+constexpr uint32_t OLD_HI = 4;
+constexpr uint32_t NEW_LO = 5;
+constexpr uint32_t NEW_HI = 6;
+constexpr uint32_t STEP_0 = 7;
+constexpr uint32_t STEP_1 = 8;
+constexpr uint32_t MU_WRITE = 9;
+constexpr uint32_t MU_ACCESS = 10;
+constexpr uint32_t NUM_COLUMNS = 11;
+}  // namespace memw_w_cols
+
+namespace fill {
+
+// A word table's address, timestamp and steps: `ADDRESS_LO`, `ADDRESS_HI`
+// (`halves`), `TIMESTAMP` (`set_u64`).
+__device__ __forceinline__ void word_head(const RowWriter &w, uint64_t address, uint64_t timestamp) {
+    w.word(0, address & 0xFFFFFFFFull);
+    w.word(1, address >> 32);
+    w.word(2, timestamp);
+}
+
+// `step_limbs`: the step's low and high 16 bits.
+__device__ __forceinline__ void step_limbs(const RowWriter &w, uint32_t col0, uint32_t col1, uint32_t step) {
+    w.word(col0, step & 0xFFFFu);
+    w.word(col1, step >> 16);
+}
+
+// The one-hot offset columns `OFF[0..8]`: 1 at the address's offset in its word.
+__device__ __forceinline__ void offset_one_hot(const RowWriter &w, uint32_t col, uint32_t offset) {
+#pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) w.word(col + k, k == offset);
+}
+
+// `word_cpu::load_result` over `N` little-endian bytes: the result's eight bytes
+// (the `width` bytes from `offset`, then the sign or zero fill) and the sign bit
+// (the top bit of the highest byte read). Indices wrap at `N`, which a row the
+// prover made (its offset and width inside the bytes) never reaches.
+template <uint32_t N>
+__device__ __forceinline__ bool load_result(const uint8_t (&bytes)[N], uint32_t offset, uint32_t width,
+                                            bool is_signed, uint8_t (&res)[8]) {
+    const bool sign_bit = (bytes[(offset + width - 1) & (N - 1)] >> 7) & 1;
+    const uint8_t fill_byte = (is_signed && sign_bit) ? 0xFF : 0;
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) res[i] = i < width ? bytes[(offset + i) & (N - 1)] : fill_byte;
+    return sign_bit;
+}
+
+// `word_cpu::store_into`: the `width` low bytes of `value` written over `bytes`
+// from `offset` (indices wrapping as above).
+template <uint32_t N>
+__device__ __forceinline__ void store_into(uint8_t (&bytes)[N], uint32_t offset, uint32_t width, uint64_t value) {
+    for (uint32_t i = 0; i < width && i < 8; ++i) bytes[(offset + i) & (N - 1)] = (value >> (8 * i)) & 0xFF;
+}
+
+__device__ __forceinline__ void le_bytes(uint64_t v, uint8_t *out) {
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) out[i] = (v >> (8 * i)) & 0xFF;
+}
+
+__device__ __forceinline__ uint64_t le_word(const uint8_t *bytes) {
+    uint64_t v = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) v |= (uint64_t)bytes[i] << (8 * i);
+    return v;
+}
+
+// `word_cpu::carries`: the first word is the last of its low 2^32 range, so the
+// second word's key carries into the high word.
+__device__ __forceinline__ bool carries(uint64_t address) {
+    return (address & 0xFFFFFFFFull) - (address & 7) == 0xFFFFFFF8ull;
+}
+
+}  // namespace fill
+
+// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_mem_load8(const Load8RowC *rows, uint64_t n, uint64_t height, uint64_t *out) {
+    namespace c = mem_load8_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const Load8RowC r = rows[row];
+    fill::word_head(w, r.address, r.timestamp);
+    w.dword_wl(c::LO, r.word);
+    fill::step_limbs(w, c::STEP_0, c::STEP_1, r.step);
+    w.word(c::MU, 1);
+}
+
+// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_mem_store8(const Store8RowC *rows, uint64_t n, uint64_t height, uint64_t *out) {
+    namespace c = mem_store8_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const Store8RowC r = rows[row];
+    fill::word_head(w, r.address, r.timestamp);
+    w.dword_wl(c::OLD_LO, r.old);
+    w.dword_hl(c::NEW_0, r.new_word);
+    fill::step_limbs(w, c::STEP_0, c::STEP_1, r.step);
+    w.word(c::MU, 1);
+}
+
+// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_mem_loadw(const LoadWRowC *rows, uint64_t n, uint64_t height, uint64_t *out) {
+    namespace c = mem_loadw_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const LoadWRowC r = rows[row];
+    const uint32_t offset = (uint32_t)(r.address & 7);
+    const bool is_signed = r.is_signed != 0;
+    fill::word_head(w, r.address, r.timestamp);
+    fill::offset_one_hot(w, c::OFF_0, offset);
+    w.word(c::READ2, r.width == 2);
+    w.word(c::READ4, r.width == 4);
+    w.word(c::SIGNED, is_signed);
+    uint8_t bytes[8];
+    fill::le_bytes(r.word, bytes);
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) w.word(c::BYTES_0 + i, bytes[i]);
+    uint8_t res[8];
+    const bool sign_bit = fill::load_result(bytes, offset, r.width, is_signed, res);
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) w.word(c::RES_0 + i, res[i]);
+    w.word(c::SIGN_BIT, sign_bit);
+    w.word(c::EXT, is_signed && sign_bit);
+    fill::step_limbs(w, c::STEP_0, c::STEP_1, r.step);
+    w.word(c::MU, 1);
+}
+
+// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_mem_storew(const StoreWRowC *rows, uint64_t n, uint64_t height, uint64_t *out) {
+    namespace c = mem_storew_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const StoreWRowC r = rows[row];
+    const uint32_t offset = (uint32_t)(r.address & 7);
+    fill::word_head(w, r.address, r.timestamp);
+    fill::offset_one_hot(w, c::OFF_0, offset);
+    w.word(c::WRITE2, r.width == 2);
+    w.word(c::WRITE4, r.width == 4);
+    uint8_t bytes[8];
+    fill::le_bytes(r.old, bytes);
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) w.word(c::OLD_0 + i, bytes[i]);
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) w.word(c::VALUE_0 + i, (r.value >> (8 * i)) & 0xFF);
+    w.word(c::VALUE_HI, r.value >> 32);
+    fill::store_into(bytes, offset, r.width, r.value);
+    w.dword_wl(c::NEW_LO, fill::le_word(bytes));
+    fill::step_limbs(w, c::STEP_0, c::STEP_1, r.step);
+    w.word(c::MU, 1);
+}
+
+// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_mem_load2w(const Load2WRowC *rows, uint64_t n, uint64_t height, uint64_t *out) {
+    namespace c = mem_load2w_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const Load2WRowC r = rows[row];
+    const uint32_t offset = (uint32_t)(r.address & 7);
+    const bool is_signed = r.is_signed != 0;
+    fill::word_head(w, r.address, r.timestamp);
+    fill::offset_one_hot(w, c::OFF_0, offset);
+    w.word(c::READ2, r.width == 2);
+    w.word(c::READ4, r.width == 4);
+    w.word(c::READ8, r.width == 8);
+    w.word(c::SIGNED, is_signed);
+    uint8_t bytes[16];
+    fill::le_bytes(r.words[0], bytes);
+    fill::le_bytes(r.words[1], bytes + 8);
+#pragma unroll
+    for (uint32_t i = 0; i < 16; ++i) w.word(c::BYTES_0 + i, bytes[i]);
+    uint8_t res[8];
+    const bool sign_bit = fill::load_result(bytes, offset, r.width, is_signed, res);
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) w.word(c::RES_0 + i, res[i]);
+    w.word(c::SIGN_BIT, sign_bit);
+    w.word(c::EXT, is_signed && sign_bit);
+    fill::step_limbs(w, c::STEP_0, c::STEP_1, r.steps[0]);
+    fill::step_limbs(w, c::STEP2_0, c::STEP2_1, r.steps[1]);
+    w.word(c::MU, 1);
+    w.word(c::CARRY, fill::carries(r.address));
+}
+
+// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_mem_store2w(const Store2WRowC *rows, uint64_t n, uint64_t height, uint64_t *out) {
+    namespace c = mem_store2w_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const Store2WRowC r = rows[row];
+    const uint32_t offset = (uint32_t)(r.address & 7);
+    fill::word_head(w, r.address, r.timestamp);
+    fill::offset_one_hot(w, c::OFF_0, offset);
+    w.word(c::WRITE2, r.width == 2);
+    w.word(c::WRITE4, r.width == 4);
+    w.word(c::WRITE8, r.width == 8);
+    uint8_t bytes[16];
+    fill::le_bytes(r.old[0], bytes);
+    fill::le_bytes(r.old[1], bytes + 8);
+#pragma unroll
+    for (uint32_t i = 0; i < 16; ++i) w.word(c::OLD_0 + i, bytes[i]);
+    w.dword_bl(c::VALUE_0, r.value);
+    fill::store_into(bytes, offset, r.width, r.value);
+    w.dword_wl(c::NEW1_LO, fill::le_word(bytes));
+    w.dword_wl(c::NEW2_LO, fill::le_word(bytes + 8));
+    fill::step_limbs(w, c::STEP_0, c::STEP_1, r.steps[0]);
+    fill::step_limbs(w, c::STEP2_0, c::STEP2_1, r.steps[1]);
+    w.word(c::MU, 1);
+    w.word(c::CARRY, fill::carries(r.address));
+}
+
+// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_memw_w(const MemwWordRowC *rows, uint64_t n, uint64_t height, uint64_t *out) {
+    namespace c = memw_w_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const MemwWordRowC r = rows[row];
+    fill::word_head(w, r.address, r.timestamp);
+    w.dword_wl(c::OLD_LO, r.old);
+    w.dword_wl(c::NEW_LO, r.new_word);
+    fill::step_limbs(w, c::STEP_0, c::STEP_1, r.step);
+    w.word(c::MU_WRITE, r.kind == 1);
+    w.word(c::MU_ACCESS, r.kind != 1);
+}

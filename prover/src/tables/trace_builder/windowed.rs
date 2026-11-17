@@ -117,6 +117,11 @@ pub struct RowFamilies {
     pub shift: bool,
     pub mem_load: bool,
     pub mem_store: bool,
+    /// The word memory format's seven families, when their chunks are handed
+    /// out in place ([`WindowedTraceBuilder::word_chunks_in_place`]); asked
+    /// apart from [`Self::ALL`]. Without the in-place hand-out, or under
+    /// another format, they hold nothing.
+    pub words: bool,
 }
 
 impl RowFamilies {
@@ -129,8 +134,9 @@ impl RowFamilies {
         shift: false,
         mem_load: false,
         mem_store: false,
+        words: false,
     };
-    /// Every one.
+    /// Every one but the word families ([`Self::words`]).
     pub const ALL: Self = Self {
         memw_a: true,
         load: true,
@@ -139,6 +145,7 @@ impl RowFamilies {
         shift: true,
         mem_load: true,
         mem_store: true,
+        words: false,
     };
 
     /// Whether any is.
@@ -521,6 +528,8 @@ pub struct CardFillStamps {
     pub shift: [usize; 2],
     pub mem_load: [usize; 2],
     pub mem_store: [usize; 2],
+    /// The word families' chunks, summed over the seven.
+    pub words: [usize; 2],
     pub records_bytes: usize,
     pub room_out: Option<(StreamTable, usize)>,
     pub out_of_step: usize,
@@ -2820,11 +2829,11 @@ fn chunk_jobs(
                     }
                     let len: usize = windows.iter().map(|w| list(w).len()).sum();
                     ((index + 1) * cap <= len).then(|| {
-                        WordFamilyChunk::$variant(Segments::one(gather(
+                        ChunkOps::Word(WordFamilyChunk::$variant(Segments::one(gather(
                             windows,
                             list,
                             index * cap..(index + 1) * cap,
-                        )))
+                        ))))
                     })
                 }};
             }
@@ -4601,14 +4610,14 @@ fn tail_jobs(
         && e.memory_format == MemoryFormat::Words
         && let Some(tails) = kept.word_tails.as_mut()
     {
-        // In place: each chunk the parts its rows lie in, nothing copied.
-        jobs.extend(word_chunks(m, &mut e.words, |k, _, cap| {
+        // In place: each chunk the parts its rows lie in, nothing copied;
+        // with the word families asked of the card, held as those rows.
+        jobs.extend(word_chunks(m, &mut e.words, |k, index, cap| {
             let t = Instant::now();
-            let chunk = tails.take(k, cap);
-            if chunk.is_some() {
-                stamps.note(StreamTable::WORDS[k], t.elapsed().as_secs_f64(), 0.0, 0);
-            }
-            chunk
+            let chunk = tails.take(k, cap)?;
+            stamps.note(StreamTable::WORDS[k], t.elapsed().as_secs_f64(), 0.0, 0);
+            let card = card.as_mut().map(|(c, s)| (*c, &mut **s));
+            Some(word_chunk_ops(chunk, index, card))
         }));
     } else if e.stream_words && e.memory_format == MemoryFormat::Words {
         let rows = &mut kept.word_rows;
@@ -4619,7 +4628,7 @@ fn tail_jobs(
                         let t = Instant::now();
                         let chunk: Vec<_> = rows.$field.drain(..cap).collect();
                         stamps.note(StreamTable::WORDS[k], t.elapsed().as_secs_f64(), 0.0, cap);
-                        WordFamilyChunk::$variant(Segments::one(chunk))
+                        ChunkOps::Word(WordFamilyChunk::$variant(Segments::one(chunk)))
                     })
                 }};
             }
@@ -4894,22 +4903,50 @@ impl WordFamilyChunk {
     }
 }
 
+/// A word family's chunk as handed out: held as its rows for the card to fill
+/// it from when the card asks for the word families and admits the room
+/// ([`row_chunk_ops`]), else the rows the host's generator builds it from.
+fn word_chunk_ops(
+    chunk: WordFamilyChunk,
+    index: usize,
+    card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
+) -> ChunkOps {
+    fn ops<T: RowFamily>(
+        rows: Segments<T>,
+        index: usize,
+        card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
+        plain: fn(Segments<T>) -> ChunkOps,
+    ) -> ChunkOps {
+        row_chunk_ops(rows, index, card, |c| c.rows.words, |s| &mut s.words, plain)
+    }
+    use WordFamilyChunk as W;
+    match chunk {
+        W::Load8(r) => ops(r, index, card, |r| ChunkOps::Word(W::Load8(r))),
+        W::Store8(r) => ops(r, index, card, |r| ChunkOps::Word(W::Store8(r))),
+        W::LoadW(r) => ops(r, index, card, |r| ChunkOps::Word(W::LoadW(r))),
+        W::StoreW(r) => ops(r, index, card, |r| ChunkOps::Word(W::StoreW(r))),
+        W::Load2W(r) => ops(r, index, card, |r| ChunkOps::Word(W::Load2W(r))),
+        W::Store2W(r) => ops(r, index, card, |r| ChunkOps::Word(W::Store2W(r))),
+        W::MemwW(r) => ops(r, index, card, |r| ChunkOps::Word(W::MemwW(r))),
+    }
+}
+
 /// The word families' full chunks past the ones handed out (`done`, counted
 /// per family here): `take(k, index, cap)` takes family `k`'s chunk `index`,
-/// its next `cap` rows, or `None` when fewer remain.
+/// its next `cap` rows, as handed out, or `None` when fewer remain.
 fn word_chunks(
     m: &crate::tables::MaxRowsConfig,
     done: &mut [usize; 7],
-    mut take: impl FnMut(usize, usize, usize) -> Option<WordFamilyChunk>,
+    mut take: impl FnMut(usize, usize, usize) -> Option<ChunkOps>,
 ) -> Vec<ChunkJob> {
     let caps = super::word_walk::word_max_rows(m);
     let mut jobs = Vec::new();
     for (k, &table) in StreamTable::WORDS.iter().enumerate() {
-        while let Some(chunk) = take(k, done[k], caps[k]) {
+        while let Some(ops) = take(k, done[k], caps[k]) {
             jobs.push(ChunkJob {
                 table,
                 index: done[k],
-                ops: ChunkOps::Word(chunk),
+                ops,
             });
             done[k] += 1;
         }
@@ -5706,6 +5743,8 @@ mod card_records_tests;
 
 #[cfg(test)]
 mod fused_card_records_tests;
+#[cfg(test)]
+mod word_card_records_tests;
 
 #[cfg(all(test, feature = "cuda"))]
 mod card_records_card_tests;

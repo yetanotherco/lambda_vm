@@ -411,3 +411,13 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemLoad2WConstraint
         carry_constraints(b, 33, cols::ADDRESS_LO, cols::OFF, cols::CARRY);
     }
 }
+
+#[cfg(test)]
+impl Load2WRow {
+    /// A test's fault: the same row, its timestamp `cycles` later (a row the
+    /// CPU never dispatched).
+    pub(crate) fn later(mut self, cycles: u64) -> Self {
+        self.timestamp += cycles;
+        self
+    }
+}
