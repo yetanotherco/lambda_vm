@@ -528,6 +528,58 @@ fn the_blake3_driver_with_retired_stacks_proves_the_held_levels_bytes() {
     }
 }
 
+/// ★ Level 1's program compiled in parallel and validated beside its
+/// execution (`LAMBDA_VM_LEVELS_PROGRAM_FAST`) is the same program and the
+/// same proofs: a small BLAKE3 block driven with
+/// the knob on proves each level's bytes as [`prove_levels`] does over the
+/// same base, and the driver reports the validator's verdict. Needs
+/// `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_with_its_program_fast_proves_the_same_level_bytes() {
+    use super::levels::{prove_block_levels, set_program_fast_for_test};
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = {
+        let _beside = set_program_fast_for_test(true);
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level")
+    };
+    let (secs, _) = run
+        .times
+        .validated_beside
+        .expect("level 1 was validated beside its execution");
+    assert!(secs > 0.0);
+    let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
+        println!(
+            "LEVELS VALIDATE BESIDE IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
+}
+
 /// The BLAKE3 driver with level 1's lean round tables filled beside its
 /// execution (`LAMBDA_VM_WLFM_LEAN_BESIDE`, the round chunks held as their
 /// records): level 1's fill took the prefill, which was fed every one of its
@@ -774,6 +826,22 @@ fn rta_one_run(
         t.built,
         l1_prove_from - t.base
     );
+    println!(
+        "RTA LEVEL1 EMIT: program fast {} · walk {:.3}s · compile {:.3}s · validate before the \
+         execution {:.3}s",
+        t.validated_beside.is_some(),
+        t.emit_split.0,
+        t.emit_split.1,
+        t.emit_split.2
+    );
+    match t.validated_beside {
+        Some((secs, at)) => println!(
+            "RTA LEVEL1 VALIDATE: beside on · {secs:.3}s · done by {at:.3}s · the execution ended at \
+             {:.3}s",
+            t.levels.first().map_or(0.0, |l| l.executed)
+        ),
+        None => println!("RTA LEVEL1 VALIDATE: beside off"),
+    }
     let (lean, lean_wait) = t.lean_beside.unwrap_or_default();
     println!(
         "RTA LEAN BESIDE: {} · waves {} · compressions {} · fed {:.3}s · wait after the execution \

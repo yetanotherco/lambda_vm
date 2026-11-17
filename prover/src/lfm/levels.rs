@@ -267,6 +267,82 @@ impl Drop for StacksForTest {
     }
 }
 
+/// `LAMBDA_VM_LEVELS_PROGRAM_FAST=1`: level 1's program is ready sooner, so
+/// more of its execution runs beside the base's phase B. The driver compiles
+/// it in parallel ([`super::compiler::compile_parallel`], the same program
+/// row for row) and does not validate it before executing: the admission
+/// validator runs on a thread of its own beside the execution, and level 1
+/// is refused before anything is filled or proved when the program is not
+/// admissible. Off by default (and for any word but `1`): the program is
+/// compiled and validated before the execution, as it always has been. The
+/// same program and the same proofs either way; a verifier derives its own
+/// copy, compiled and validated as before.
+pub const PROGRAM_FAST_ENV: &str = "LAMBDA_VM_LEVELS_PROGRAM_FAST";
+
+/// Whether the driver makes level 1's program the fast way:
+/// [`PROGRAM_FAST_ENV`], or a test's override.
+pub fn program_fast() -> bool {
+    #[cfg(test)]
+    if let Some(on) = *PROGRAM_FAST_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(PROGRAM_FAST_ENV).ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+static PROGRAM_FAST_FOR_TEST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// A test's [`program_fast`] for every thread until the guard drops.
+#[cfg(test)]
+pub(crate) fn set_program_fast_for_test(on: bool) -> ProgramFastForTest {
+    let before = PROGRAM_FAST_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(on);
+    ProgramFastForTest(before)
+}
+
+#[cfg(test)]
+pub(crate) struct ProgramFastForTest(Option<bool>);
+
+#[cfg(test)]
+impl Drop for ProgramFastForTest {
+    fn drop(&mut self) {
+        *PROGRAM_FAST_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = self.0;
+    }
+}
+
+/// The admission validator over `program` on a thread of `scope`'s: its
+/// seconds, or why the program is not admissible.
+pub(crate) fn spawn_validation<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    program: &'env LfmProgram,
+) -> std::thread::ScopedJoinHandle<'scope, Result<f64, String>> {
+    scope.spawn(move || {
+        let t = std::time::Instant::now();
+        super::validator::validate(program)
+            .map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
+        Ok(t.elapsed().as_secs_f64())
+    })
+}
+
+/// [`spawn_validation`]'s verdict: its seconds, or the refusal.
+pub(crate) fn joined_validation(
+    handle: std::thread::ScopedJoinHandle<'_, Result<f64, String>>,
+) -> Result<f64, String> {
+    handle
+        .join()
+        .map_err(|_| "level 1's validator panicked".to_string())?
+}
+
 /// A level's host part ([`prepare_wlfm`]), its chip prefixes packed with it
 /// when it holds its chips as records: nothing here waits for the card.
 pub(crate) fn prepare_level(
@@ -520,6 +596,13 @@ pub struct LevelsTimes {
     pub waves_before_base: usize,
     pub wave_secs_before_base: f64,
     pub execute_tail: f64,
+    /// Under [`PROGRAM_FAST_ENV`], level 1's validator beside its
+    /// execution: its seconds, and when the execution's end found it done
+    /// (the driver's clock). `None` when off.
+    pub validated_beside: Option<(f64, f64)>,
+    /// Level 1's program: its walk's, its compile's and (off the knob) its
+    /// validation's seconds before its execution could start.
+    pub emit_split: (f64, f64, f64),
     /// Level 1's lean round tables filled beside its execution
     /// (`LAMBDA_VM_WLFM_LEAN_BESIDE`): what the fill did, and the seconds
     /// level 1's thread waited for it once the execution had ended. `None`
@@ -737,6 +820,8 @@ pub fn prove_block_levels(
         usize,
         f64,
         Option<LeanBeside>,
+        Option<(f64, f64)>,
+        (f64, f64, f64),
     );
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
@@ -773,13 +858,25 @@ pub fn prove_block_levels(
                 Some(&roots),
             )?;
             let planned = now();
-            let (program, marks) = plan.closed_block_program_marked()?;
+            let beside_check = program_fast();
+            let (program, marks, (walk, compiled)) =
+                plan.closed_block_program_marked_timed(beside_check)?;
+            // Off the knob, validated before the execution, as always.
+            let t = std::time::Instant::now();
+            if !beside_check {
+                super::validator::validate(&program)
+                    .map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
+            }
+            let emit_split = (walk, compiled, t.elapsed().as_secs_f64());
             let emitted = now();
             let _ = plan_ref.set(plan);
             let plan = plan_ref.get().ok_or("the plan is set")?;
             let _ = program_ref.set(program);
             let program = program_ref.get().ok_or("the program is set")?;
             let _ = btx.send(());
+            // Under the knob, the admission validator runs beside the
+            // execution; level 1 is refused at the execution's end if it fails.
+            let checker = beside_check.then(|| spawn_validation(scope, program));
             let pieces = level1_pieces(&marks);
             let npieces = pieces.len();
             let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
@@ -881,6 +978,10 @@ pub fn prove_block_levels(
                 .finish()
                 .map_err(|e| format!("level 1's execution: {e:?}"))?;
             let executed = now();
+            let validated = match checker {
+                Some(handle) => Some((joined_validation(handle)?, now())),
+                None => None,
+            };
             drop(lean_tx);
             let lean = match lean_fill {
                 Some(fill) => {
@@ -901,6 +1002,8 @@ pub fn prove_block_levels(
                 waves_before,
                 wave_secs_before,
                 lean,
+                validated,
+                emit_split,
             ))
         });
         let prove_base = || {
@@ -961,8 +1064,21 @@ pub fn prove_block_levels(
     }
     let (base_proof, base_stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
     times.base = base_end.get().copied().unwrap_or_else(now);
-    let (planned, emitted, execution, execute_from, executed, npieces, waves, wave_secs, lean) =
-        level1.map_err(|_| "level 1's thread panicked")??;
+    let (
+        planned,
+        emitted,
+        execution,
+        execute_from,
+        executed,
+        npieces,
+        waves,
+        wave_secs,
+        lean,
+        validated,
+        emit_split,
+    ) = level1.map_err(|_| "level 1's thread panicked")??;
+    times.validated_beside = validated;
+    times.emit_split = emit_split;
     // A lean fill beside that was fed a compression twice, or missed one, is
     // refused here: never a wrong count handed to the prove.
     let lean = match lean {

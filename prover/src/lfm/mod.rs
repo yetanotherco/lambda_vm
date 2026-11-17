@@ -190,6 +190,8 @@ mod lean_mux_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod lean_upload_tests;
 #[cfg(all(test, feature = "parallel"))]
+mod levels_emit_timing;
+#[cfg(all(test, feature = "parallel"))]
 mod levels_probe;
 #[cfg(all(test, feature = "parallel"))]
 mod levels_tests;
@@ -223,6 +225,8 @@ mod p1w16_socket_tests;
 mod per_table_aggregator_tests;
 #[cfg(test)]
 mod preprocessed_tests;
+#[cfg(all(test, feature = "parallel"))]
+mod program_fast_tests;
 #[cfg(test)]
 mod program_shape_tests;
 #[cfg(test)]
