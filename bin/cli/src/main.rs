@@ -527,7 +527,7 @@ enum Commands {
     /// verdict. Needs a `--features cuda` build to run on the card. The base
     /// checks an aligned CPU load or store in one row with its memory tokens
     /// (the production format); `BLOCK_WHIR_MEMORY=split` proves the split
-    /// format instead, the one `prove-block`'s tree takes, and
+    /// format instead, `prove-block`'s default, and
     /// `BLOCK_WHIR_MEMORY=words` RAM checked by aligned 8-byte words (its
     /// word families streamed as the walk fills them unless
     /// `LAMBDA_VM_WORD_STREAM=0`, which builds them at the finish).

@@ -3618,8 +3618,9 @@ fn words_counts() -> crate::TableCounts {
     }
 }
 
-/// [`words_counts`] with no chip's table: what a word-format frame takes
-/// while the format takes no chip (`block_whir::chip_tables_under`).
+/// [`words_counts`] with no chip's table: a word-format frame with no chip
+/// call (`block_whir::chip_tables_under` refuses IS_WH, BLAKE3, ECSM and
+/// HINT; the others are left out here too).
 fn chip_free_counts() -> crate::TableCounts {
     crate::TableCounts {
         keccak: 0,
@@ -4071,7 +4072,7 @@ fn the_word_format_refuses_every_chip_table() {
         let refused = frame_of(&statement, &format);
         assert!(
             matches!(&refused, Err(crate::Error::InvalidTableCounts(why))
-                if why.contains("takes no chip") && why.contains(&format!("no {table} table"))),
+                if why.contains(&format!("takes no {table} call yet: no {table} table"))),
             "{table}: {:?}",
             refused.err()
         );
