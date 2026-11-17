@@ -495,19 +495,68 @@ pub fn wlfm_config_rounds(
             rate.factor()
         ));
     }
+    // The query count was sized over today's schedule before a hand-set fold
+    // or a final polynomial was stamped on; the union bound below would read
+    // the stamped schedule, and the two need not agree. The levels take
+    // neither (a W-leg refuses both), so the round form takes neither.
+    if fold.is_some() || final_poly != FinalPoly::Off {
+        return Err(format!(
+            "the round form is taken over today's schedule, not fold {fold:?} final {final_poly:?}"
+        ));
+    }
     let zf = ZfFormat {
         whir_stack: config.format.stack,
         ..ZfFormat::DEFAULT
     };
     let tallest = crate::multilinear_prove::tallest_stack(&zf, shapes);
-    config
+    let config = config
         .with_whir_rounds(
             usize::from(shrink),
             crate::multilinear_prove::CHAIN_SECURITY_BITS,
             tallest,
         )
         .and_then(ChainConfig::with_caps_by_queries)
-        .ok_or_else(|| format!("shrink {shrink} is no round form"))
+        .ok_or_else(|| format!("shrink {shrink} is no round form"))?;
+    check_round_form_config(&config, tallest)?;
+    Ok(config)
+}
+
+/// The host's own round-form checks on a level's config: round 0's count is
+/// the one the target and the union bound give
+/// ([`multilinear::whir_chain::check_round_form`]), and a chain of `num_vars`
+/// variables takes no more rounds than the union bound charged
+/// ([`multilinear::whir_chain::check_round_form_union`]). Nothing under
+/// today's form.
+fn check_round_form_config(config: &ChainConfig, num_vars: usize) -> Result<(), String> {
+    multilinear::whir_chain::check_round_form(config)
+        .and_then(|()| multilinear::whir_chain::check_round_form_union(config, num_vars))
+        .map_err(|e| format!("the level's round form at {num_vars} variables: {e:?}"))
+}
+
+/// ★ Every chain a W-LFM program's artifacts open passes the host's
+/// round-form checks: each group's stack (`layouts`) and each prepared stack,
+/// against the artifacts' config. Called by the verifier's frame and by a
+/// W-leg before it emits a child's chains, so no chain is verified or emitted
+/// under a round form the host would refuse. Nothing under today's form.
+pub fn check_wlfm_round_form(
+    artifacts: &WlfmArtifacts,
+    layouts: &[StackedLayout],
+) -> Result<(), String> {
+    let config = &artifacts.config;
+    if matches!(
+        config.format.rounds,
+        multilinear::whir_chain::RoundForm::Fri
+    ) {
+        return Ok(());
+    }
+    for n in layouts
+        .iter()
+        .map(StackedLayout::n_stack)
+        .chain(artifacts.stacks.iter().map(|s| s.layout.n_stack()))
+    {
+        check_round_form_config(config, n)?;
+    }
+    Ok(())
 }
 
 /// The AIR set's options: inert on the multilinear path (they reach only each
@@ -2423,6 +2472,7 @@ fn verifier_frame(artifacts: &WlfmArtifacts, airs: &WlfmAirs) -> Result<Verifier
     }
     let (layouts, domains) =
         stacks(&shapes, &artifacts.sizes, &artifacts.config).map_err(|e| format!("{e:?}"))?;
+    check_wlfm_round_form(artifacts, &layouts)?;
     Ok((shapes, layouts, domains))
 }
 

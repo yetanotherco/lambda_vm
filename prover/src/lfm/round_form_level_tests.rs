@@ -506,6 +506,14 @@ fn the_levels_follow_the_bases_round_form() {
         for (k, level) in levels.iter().enumerate() {
             let a = &level.build.artifacts;
             assert_eq!(a.rounds, want, "level {}", k + 1);
+            // Every chain the level opens passes the host's round-form checks.
+            let (layouts, _) =
+                crate::multilinear_prove::stacks(&a.shapes(&a.airs()), &a.sizes, &a.config)
+                    .expect("the level's layouts");
+            super::wlfm::check_wlfm_round_form(a, &layouts)
+                .unwrap_or_else(|e| panic!("level {}: {e}", k + 1));
+            multilinear::whir_chain::check_round_form(&a.config)
+                .unwrap_or_else(|e| panic!("level {}: {e:?}", k + 1));
             match (want, a.config.format.rounds) {
                 (None, RoundForm::Fri) => {
                     let today = super::wlfm::wlfm_config_under(
@@ -793,4 +801,118 @@ fn the_round_form_levels_prove_a_small_words_block_to_its_last_level() {
     let mut forged = last.clone();
     forged.public_words[0].1[0] += FE::one();
     assert!(verify_levels(&plan, WlfmFamily::B3, &forged).is_err());
+}
+
+/// ★ A level's round form passes the host's checks or is never built,
+/// verified or emitted: the config refuses a schedule stamped after its count
+/// was sized (a hand-set fold, a final polynomial); and a W-leg over a child
+/// whose round form charges a union bound short of its chains' rounds (or a
+/// round-0 count the bound does not give) refuses to emit, where the honest
+/// child emits. Printed: whether stamping a fold after the count, as the
+/// config once allowed, gives a config the host's `check_round_form` refuses.
+#[test]
+fn a_level_round_form_the_host_refuses_is_never_built_or_emitted() {
+    use super::levels::derive_levels;
+    use super::wlfm::{WlfmRate, wlfm_config_rounds, wlfm_config_under};
+    use super::wlfm_leg::{WlfmChild, wlfm_leg_program};
+    use multilinear::whir_chain::{check_round_form, check_round_form_union};
+    let shapes = [(20usize, 18usize), (8, 20), (64, 12), (300, 22)];
+    for (fold, final_poly) in [(Some(5u8), FinalPoly::Off), (None, FinalPoly::Vars(6))] {
+        let refused = wlfm_config_rounds(WlfmRate::Two, final_poly, fold, None, Some(3), &shapes)
+            .expect_err("a stamped schedule under the round form");
+        assert!(refused.contains("today's schedule"), "{refused}");
+    }
+    // The stamping order the config refuses: today's count, then a fold, then
+    // the union bound over the folded schedule, at the config's own tallest
+    // stack. The pinned fold stamps nothing and passes; a fold that moves the
+    // union's round count leaves a count the host refuses.
+    let tallest = {
+        let today = wlfm_config_under(WlfmRate::Two, FinalPoly::Off, None, None, &shapes);
+        let zf = crate::zf_format::ZfFormat {
+            whir_stack: today.format.stack,
+            ..crate::zf_format::ZfFormat::DEFAULT
+        };
+        crate::multilinear_prove::tallest_stack(&zf, &shapes)
+    };
+    let mut refused_any = false;
+    for k in [2u8, 3, 4, 5, 6] {
+        let stamped = wlfm_config_under(WlfmRate::Two, FinalPoly::Off, Some(k), None, &shapes)
+            .with_whir_rounds(3, crate::multilinear_prove::CHAIN_SECURITY_BITS, tallest)
+            .expect("a round form");
+        let count = check_round_form(&stamped).err();
+        let union = check_round_form_union(&stamped, tallest).err();
+        println!("STAMPED fold {k} at {tallest} variables: count {count:?} · union {union:?}");
+        assert!(
+            union.is_none(),
+            "the union is taken over the stamped schedule"
+        );
+        if usize::from(k) == crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING {
+            assert!(count.is_none(), "the pinned fold stamps nothing");
+        }
+        refused_any |= count.is_some();
+    }
+    assert!(
+        refused_any,
+        "some stamped fold leaves a count the host refuses"
+    );
+
+    let format = format(B3Rounds::WHIR3, WhirFolds::Uniform);
+    let (elf, proof) = base("test_commit_4", &format);
+    let plan = plan(&elf, &proof, &format);
+    let levels = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
+    let honest = super::levels::child_of(&plan, &levels[0]);
+    wlfm_leg_program(&honest).expect("the honest child emits");
+    let a = &honest.artifacts;
+    let (layouts, _) = crate::multilinear_prove::stacks(&a.shapes(&a.airs()), &a.sizes, &a.config)
+        .expect("the layouts");
+    let tallest = layouts
+        .iter()
+        .map(|l| l.n_stack())
+        .chain(a.stacks.iter().map(|s| s.layout.n_stack()))
+        .max()
+        .expect("a stack");
+    // A union bound over chains a few variables short of the tallest.
+    let short = a
+        .config
+        .with_whir_rounds(
+            3,
+            crate::multilinear_prove::CHAIN_SECURITY_BITS,
+            tallest.saturating_sub(8),
+        )
+        .and_then(multilinear::whir_chain::ChainConfig::with_caps_by_queries)
+        .expect("a round form");
+    let child = WlfmChild {
+        artifacts: super::wlfm::WlfmArtifacts {
+            config: short,
+            ..a.clone()
+        },
+        num_public_words: honest.num_public_words,
+    };
+    let why = wlfm_leg_program(&child).expect_err("a child the host refuses");
+    println!("SHORT UNION CHILD: {why}");
+    assert!(why.contains("RoundFormTarget"), "{why}");
+    // The same short bound with round 0's count re-sized for it: the count
+    // check holds, and only the union check refuses the taller chains.
+    let mut resized = short;
+    let union = match resized.format.rounds {
+        multilinear::whir_chain::RoundForm::Whir(w) => w.union_rounds(),
+        multilinear::whir_chain::RoundForm::Fri => unreachable!("a round form"),
+    };
+    resized.num_queries = multilinear::query_count::num_queries(
+        resized.log_blowup,
+        union,
+        crate::multilinear_prove::CHAIN_SECURITY_BITS,
+        resized.grind.query,
+    );
+    check_round_form(&resized).expect("the count is the bound's");
+    let child = WlfmChild {
+        artifacts: super::wlfm::WlfmArtifacts {
+            config: resized,
+            ..a.clone()
+        },
+        num_public_words: honest.num_public_words,
+    };
+    let why = wlfm_leg_program(&child).expect_err("a chain past the union bound");
+    println!("SHORT UNION, COUNT RESIZED: {why}");
+    assert!(why.contains("RoundFormUnion"), "{why}");
 }
