@@ -47,23 +47,34 @@ pub struct ColumnGroup {
 /// row-major offsets, and the tail is zero-padded to the same height.
 struct ColumnGroupBuilder {
     width: usize,
+    /// The ordinal of this builder's first row in the whole group: 0, or a
+    /// later slice's start when a program's rows are laid out in slices
+    /// ([`compile_parallel`]).
+    first: usize,
     real_rows: usize,
     data: Vec<FE>,
 }
 
 impl ColumnGroupBuilder {
     fn new(width: usize) -> Self {
+        Self::starting_at(width, 0)
+    }
+
+    /// A builder whose first row is the group's row `first`.
+    fn starting_at(width: usize, first: usize) -> Self {
         ColumnGroupBuilder {
             width,
+            first,
             real_rows: 0,
             data: Vec::new(),
         }
     }
 
-    /// The ordinal the next row will take. `LFM_KECCAK` binds it into the row
-    /// as a structural tag, so it has to be read before [`Self::open_row`].
+    /// The ordinal the next row will take in the whole group. `LFM_KECCAK`
+    /// and the lean head bind it into the row as a structural tag, so it has
+    /// to be read before [`Self::open_row`].
     fn next_row(&self) -> usize {
-        self.real_rows
+        self.first + self.real_rows
     }
 
     /// Append a zero-filled row, returning its base offset for [`Self::set`].
@@ -338,6 +349,96 @@ impl LfmBackend for CircuitBackend {
     }
 }
 
+/// Pass 1 for one instruction: each written address's multiplicity, as
+/// `take` gives it.
+fn backfill(instr: &mut Instr, take_mult: &mut impl FnMut(Addr) -> u64) {
+    match instr {
+        Instr::Const { out, mult, .. }
+        | Instr::BaseAlu { out, mult, .. }
+        | Instr::ExtAlu { out, mult, .. }
+        | Instr::Hint { out, mult, .. }
+        | Instr::HintOn { out, mult, .. }
+        | Instr::Pack { out, mult, .. } => {
+            *mult = take_mult(*out);
+        }
+        Instr::Unpack { outs, mults, .. } => {
+            for i in 0..4 {
+                mults[i] = take_mult(outs[i]);
+            }
+        }
+        Instr::KeccakF(k) => {
+            for i in 0..layout::keccak::NUM_WORDS {
+                k.mults[i] = take_mult(k.outs[i]);
+            }
+            if let Some(rev) = &mut k.rev {
+                for i in 0..layout::keccak::DIGEST_WORDS {
+                    rev.mults[i] = take_mult(rev.outs[i]);
+                }
+            }
+        }
+        Instr::Blake3(k) => {
+            for i in 0..layout::blake3::OUT_WORDS {
+                k.mults[i] = take_mult(k.outs[i]);
+            }
+            if let Some(rev) = &mut k.rev {
+                for i in 0..layout::blake3::DIGEST_WORDS {
+                    rev.mults[i] = take_mult(rev.outs[i]);
+                }
+            }
+        }
+        Instr::Select {
+            out_l,
+            out_r,
+            mult_l,
+            mult_r,
+            ..
+        } => {
+            *mult_l = take_mult(*out_l);
+            *mult_r = take_mult(*out_r);
+        }
+        Instr::Mux { out, mult, .. } | Instr::CapRead { out, mult, .. } => {
+            *mult = take_mult(*out);
+        }
+        Instr::CapTable(t) => {
+            t.handle_mult = take_mult(t.handle);
+        }
+        Instr::BitDec { bits, halves, .. } => {
+            for (addr, mult) in bits.iter_mut() {
+                *mult = take_mult(*addr);
+            }
+            if let Some(hs) = halves {
+                for (addr, mult) in hs.iter_mut() {
+                    *mult = take_mult(*addr);
+                }
+            }
+        }
+        Instr::Hash {
+            mode, outs, mults, ..
+        } => {
+            let num_outs = mode.num_output_cells();
+            for i in 0..num_outs {
+                mults[i] = take_mult(outs[i]);
+            }
+        }
+        Instr::Hash16(h) => {
+            for i in 0..4 {
+                h.mults[i] = take_mult(h.outs[i]);
+            }
+        }
+        Instr::B3l(k) => {
+            for i in 0..layout::b3l::DIGEST_WORDS {
+                k.mults[i] = take_mult(k.outs[i]);
+            }
+            if let Some(rev) = &mut k.rev {
+                for i in 0..layout::b3l::DIGEST_WORDS {
+                    rev.mults[i] = take_mult(rev.outs[i]);
+                }
+            }
+        }
+        Instr::Public { .. } => {}
+    }
+}
+
 pub fn compile(source: LfmProgramSource) -> LfmProgram {
     let LfmProgramSource {
         mut instrs,
@@ -361,91 +462,10 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
         // check below still means "every read had a writer".
         core::mem::take(&mut counts[addr.0 as usize])
     };
-    for instr in &mut instrs {
-        match instr {
-            Instr::Const { out, mult, .. }
-            | Instr::BaseAlu { out, mult, .. }
-            | Instr::ExtAlu { out, mult, .. }
-            | Instr::Hint { out, mult, .. }
-            | Instr::HintOn { out, mult, .. }
-            | Instr::Pack { out, mult, .. } => {
-                *mult = take(*out, &mut written, &mut read_counts);
-            }
-            Instr::Unpack { outs, mults, .. } => {
-                for i in 0..4 {
-                    mults[i] = take(outs[i], &mut written, &mut read_counts);
-                }
-            }
-            Instr::KeccakF(k) => {
-                for i in 0..layout::keccak::NUM_WORDS {
-                    k.mults[i] = take(k.outs[i], &mut written, &mut read_counts);
-                }
-                if let Some(rev) = &mut k.rev {
-                    for i in 0..layout::keccak::DIGEST_WORDS {
-                        rev.mults[i] = take(rev.outs[i], &mut written, &mut read_counts);
-                    }
-                }
-            }
-            Instr::Blake3(k) => {
-                for i in 0..layout::blake3::OUT_WORDS {
-                    k.mults[i] = take(k.outs[i], &mut written, &mut read_counts);
-                }
-                if let Some(rev) = &mut k.rev {
-                    for i in 0..layout::blake3::DIGEST_WORDS {
-                        rev.mults[i] = take(rev.outs[i], &mut written, &mut read_counts);
-                    }
-                }
-            }
-            Instr::Select {
-                out_l,
-                out_r,
-                mult_l,
-                mult_r,
-                ..
-            } => {
-                *mult_l = take(*out_l, &mut written, &mut read_counts);
-                *mult_r = take(*out_r, &mut written, &mut read_counts);
-            }
-            Instr::Mux { out, mult, .. } | Instr::CapRead { out, mult, .. } => {
-                *mult = take(*out, &mut written, &mut read_counts);
-            }
-            Instr::CapTable(t) => {
-                t.handle_mult = take(t.handle, &mut written, &mut read_counts);
-            }
-            Instr::BitDec { bits, halves, .. } => {
-                for (addr, mult) in bits.iter_mut() {
-                    *mult = take(*addr, &mut written, &mut read_counts);
-                }
-                if let Some(hs) = halves {
-                    for (addr, mult) in hs.iter_mut() {
-                        *mult = take(*addr, &mut written, &mut read_counts);
-                    }
-                }
-            }
-            Instr::Hash {
-                mode, outs, mults, ..
-            } => {
-                let num_outs = mode.num_output_cells();
-                for i in 0..num_outs {
-                    mults[i] = take(outs[i], &mut written, &mut read_counts);
-                }
-            }
-            Instr::Hash16(h) => {
-                for i in 0..4 {
-                    h.mults[i] = take(h.outs[i], &mut written, &mut read_counts);
-                }
-            }
-            Instr::B3l(k) => {
-                for i in 0..layout::b3l::DIGEST_WORDS {
-                    k.mults[i] = take(k.outs[i], &mut written, &mut read_counts);
-                }
-                if let Some(rev) = &mut k.rev {
-                    for i in 0..layout::b3l::DIGEST_WORDS {
-                        rev.mults[i] = take(rev.outs[i], &mut written, &mut read_counts);
-                    }
-                }
-            }
-            Instr::Public { .. } => {}
+    {
+        let mut take_one = |addr: Addr| take(addr, &mut written, &mut read_counts);
+        for instr in &mut instrs {
+            backfill(instr, &mut take_one);
         }
     }
     assert!(
@@ -483,25 +503,240 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
     }
 }
 
+/// One chip's slices joined into its group, padded: each cell copied once, in
+/// parallel, into the group's one buffer.
+#[cfg(feature = "parallel")]
+fn join_slices(slices: Vec<ColumnGroupBuilder>) -> ColumnGroup {
+    use rayon::prelude::*;
+    let width = slices[0].width;
+    let real_rows: usize = slices.iter().map(|b| b.real_rows).sum();
+    let padded = padded_rows(real_rows);
+    let ends: Vec<usize> = slices
+        .iter()
+        .scan(0usize, |at, b| {
+            *at += b.data.len();
+            Some(*at)
+        })
+        .collect();
+    let mut data = Vec::new();
+    (0..padded * width)
+        .into_par_iter()
+        .with_min_len(1 << 14)
+        .map(|i| {
+            let k = ends.partition_point(|&end| end <= i);
+            match slices.get(k) {
+                Some(b) => b.data[i + b.data.len() - ends[k]],
+                None => FE::zero(),
+            }
+        })
+        .collect_into_vec(&mut data);
+    ColumnGroup {
+        width,
+        real_rows,
+        padded_rows: padded,
+        data,
+    }
+}
+
+/// [`compile`] with both passes cut into slices run in parallel: the same
+/// program, instruction for instruction and row for row, for every source
+/// the admission validator accepts. Its invariant checks are left to the
+/// validator: a source with an address written twice, or read and never
+/// written, compiles to a program [`super::validator::validate`] refuses,
+/// where [`compile`] panics. For a prover that validates the program anyway
+/// before it proves (the levels' driver, `levels::PROGRAM_FAST_ENV`); a
+/// verifier compiles with [`compile`].
+#[cfg(feature = "parallel")]
+pub fn compile_parallel(source: LfmProgramSource) -> LfmProgram {
+    compile_parallel_sliced(source, 1 << 20)
+}
+
+/// [`compile_parallel`] at `slice` instructions a slice.
+#[cfg(feature = "parallel")]
+pub(crate) fn compile_parallel_sliced(source: LfmProgramSource, slice: usize) -> LfmProgram {
+    use rayon::prelude::*;
+    let LfmProgramSource {
+        mut instrs,
+        num_addrs,
+        read_counts,
+        arena_schema,
+        public_len,
+    } = source;
+    let slice = slice.max(1);
+    // Pass 1: each written address's multiplicity is its read count.
+    instrs.par_chunks_mut(slice).for_each(|chunk| {
+        let mut count = |addr: Addr| read_counts.get(addr.0 as usize).copied().unwrap_or(0);
+        for instr in chunk {
+            backfill(instr, &mut count);
+        }
+    });
+    drop(read_counts);
+    // Pass 2: each slice's rows from where its ordinal-bound groups start.
+    let counts: Vec<(usize, usize)> = instrs
+        .par_chunks(slice)
+        .map(|c| {
+            c.iter().fold((0, 0), |(k, b), i| match i {
+                Instr::KeccakF(_) => (k + 1, b),
+                Instr::B3l(_) => (k, b + 1),
+                _ => (k, b),
+            })
+        })
+        .collect();
+    let mut at = (0usize, 0usize);
+    let starts: Vec<(usize, usize)> = counts
+        .iter()
+        .map(|&(k, b)| {
+            let start = at;
+            at = (at.0 + k, at.1 + b);
+            start
+        })
+        .collect();
+    let mut parts: Vec<[ColumnGroupBuilder; 15]> = instrs
+        .par_chunks(slice)
+        .zip(starts.par_iter())
+        .map(|(c, &(k, b))| emit_rows(c, k, b).into_array())
+        .collect();
+    if parts.is_empty() {
+        parts.push(emit_rows(&[], 0, 0).into_array());
+    }
+    // Chip by chip, the slices' rows in order, padded: each cell copied once,
+    // in parallel, into the group's one buffer.
+    let mut by_chip: Vec<Vec<ColumnGroupBuilder>> = (0..15).map(|_| Vec::new()).collect();
+    for part in parts {
+        for (chip, builder) in part.into_iter().enumerate() {
+            by_chip[chip].push(builder);
+        }
+    }
+    let joined: Vec<ColumnGroup> = by_chip.into_iter().map(join_slices).collect();
+    let groups = GroupBuilders::groups_from(joined);
+    let hash16 = instrs.par_iter().any(|i| matches!(i, Instr::Hash16(_)));
+    LfmProgram {
+        hash16,
+        instrs,
+        num_addrs,
+        arena_schema,
+        public_len,
+        chunking: KeccakChunking::default(),
+        blake3_chunking: Blake3Chunking::default(),
+        hash_chunking: HashChunking::for_process(groups.hash.real_rows),
+        groups,
+    }
+}
+
 fn fe(v: u64) -> FE {
     FE::from(v)
+}
+
+/// Every chip's rows of one slice of a program, unfinished: what pass 2 lays
+/// out, slice by slice when [`compile_parallel`] cuts the program.
+struct GroupBuilders {
+    const_: ColumnGroupBuilder,
+    balu: ColumnGroupBuilder,
+    xalu: ColumnGroupBuilder,
+    select: ColumnGroupBuilder,
+    bitdec: ColumnGroupBuilder,
+    hash: ColumnGroupBuilder,
+    keccak: ColumnGroupBuilder,
+    blake3: ColumnGroupBuilder,
+    lanes: ColumnGroupBuilder,
+    hint: ColumnGroupBuilder,
+    public: ColumnGroupBuilder,
+    b3l: ColumnGroupBuilder,
+    mux: ColumnGroupBuilder,
+    cap: ColumnGroupBuilder,
+    cap_read: ColumnGroupBuilder,
+}
+
+impl GroupBuilders {
+    /// The chips' builders in [`LfmColumnGroups`]' order.
+    #[cfg(feature = "parallel")]
+    fn into_array(self) -> [ColumnGroupBuilder; 15] {
+        [
+            self.const_,
+            self.balu,
+            self.xalu,
+            self.select,
+            self.bitdec,
+            self.hash,
+            self.keccak,
+            self.blake3,
+            self.lanes,
+            self.hint,
+            self.public,
+            self.b3l,
+            self.mux,
+            self.cap,
+            self.cap_read,
+        ]
+    }
+
+    /// The finished groups in [`Self::into_array`]'s order.
+    #[cfg(feature = "parallel")]
+    fn groups_from(groups: Vec<ColumnGroup>) -> LfmColumnGroups {
+        let mut groups = groups.into_iter();
+        let mut next = || groups.next().expect("fifteen chips");
+        LfmColumnGroups {
+            const_: next(),
+            balu: next(),
+            xalu: next(),
+            select: next(),
+            bitdec: next(),
+            hash: next(),
+            keccak: next(),
+            blake3: next(),
+            lanes: next(),
+            hint: next(),
+            public: next(),
+            b3l: next(),
+            mux: next(),
+            cap: next(),
+            cap_read: next(),
+        }
+    }
+
+    fn finish(self) -> LfmColumnGroups {
+        LfmColumnGroups {
+            const_: self.const_.finish(),
+            balu: self.balu.finish(),
+            xalu: self.xalu.finish(),
+            select: self.select.finish(),
+            bitdec: self.bitdec.finish(),
+            hash: self.hash.finish(),
+            keccak: self.keccak.finish(),
+            blake3: self.blake3.finish(),
+            lanes: self.lanes.finish(),
+            hint: self.hint.finish(),
+            public: self.public.finish(),
+            b3l: self.b3l.finish(),
+            mux: self.mux.finish(),
+            cap: self.cap.finish(),
+            cap_read: self.cap_read.finish(),
+        }
+    }
 }
 
 /// Pass 2: partition instructions per chip (program order preserved) and lay
 /// out each chip's instruction fields per [`super::layout`].
 fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
+    emit_rows(instrs, 0, 0).finish()
+}
+
+/// Pass 2 over a slice of a program whose `LFM_KECCAK` rows start at the
+/// group's row `keccak_first` and whose lean head rows at `b3l_first` (the
+/// two groups whose rows bind their ordinal).
+fn emit_rows(instrs: &[Instr], keccak_first: usize, b3l_first: usize) -> GroupBuilders {
     let mut const_ = ColumnGroupBuilder::new(layout::const_::PREP_WIDTH);
     let mut balu = ColumnGroupBuilder::new(layout::balu::PREP_WIDTH);
     let mut xalu = ColumnGroupBuilder::new(layout::xalu::PREP_WIDTH);
     let mut select = ColumnGroupBuilder::new(layout::select::PREP_WIDTH);
     let mut bitdec = ColumnGroupBuilder::new(layout::bitdec::PREP_WIDTH);
     let mut hash = ColumnGroupBuilder::new(layout::hash::PREP_WIDTH);
-    let mut keccak = ColumnGroupBuilder::new(layout::keccak::PREP_WIDTH);
+    let mut keccak = ColumnGroupBuilder::starting_at(layout::keccak::PREP_WIDTH, keccak_first);
     let mut blake3 = ColumnGroupBuilder::new(layout::blake3::PREP_WIDTH);
     let mut lanes = ColumnGroupBuilder::new(layout::lanes::PREP_WIDTH);
     let mut hint = ColumnGroupBuilder::new(layout::hint::PREP_WIDTH);
     let mut public = ColumnGroupBuilder::new(layout::public::PREP_WIDTH);
-    let mut b3l = ColumnGroupBuilder::new(layout::b3l::PREP_WIDTH);
+    let mut b3l = ColumnGroupBuilder::starting_at(layout::b3l::PREP_WIDTH, b3l_first);
     let mut mux = ColumnGroupBuilder::new(layout::mux::PREP_WIDTH);
     let mut cap = ColumnGroupBuilder::new(layout::cap::PREP_WIDTH);
     let mut cap_read = ColumnGroupBuilder::new(layout::cap_read::PREP_WIDTH);
@@ -826,21 +1061,21 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
         }
     }
 
-    LfmColumnGroups {
-        const_: const_.finish(),
-        balu: balu.finish(),
-        xalu: xalu.finish(),
-        select: select.finish(),
-        bitdec: bitdec.finish(),
-        hash: hash.finish(),
-        keccak: keccak.finish(),
-        blake3: blake3.finish(),
-        lanes: lanes.finish(),
-        hint: hint.finish(),
-        public: public.finish(),
-        b3l: b3l.finish(),
-        mux: mux.finish(),
-        cap: cap.finish(),
-        cap_read: cap_read.finish(),
+    GroupBuilders {
+        const_,
+        balu,
+        xalu,
+        select,
+        bitdec,
+        hash,
+        keccak,
+        blake3,
+        lanes,
+        hint,
+        public,
+        b3l,
+        mux,
+        cap,
+        cap_read,
     }
 }
