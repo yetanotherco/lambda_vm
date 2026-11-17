@@ -3509,6 +3509,7 @@ impl BlockStamps {
             "BLOCK PHASE-A POOL: per group reserved before/after its commit [{}] MiB\n",
             pool.join(", "),
         ));
+        out.push_str(&multilinear_block::cs_probe_lines(&self.groups));
         if let Some(p) = self.pinned {
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             out.push_str(&format!(
@@ -9444,7 +9445,7 @@ fn prove_streamed(
                 drained.at = start.elapsed().as_secs_f64();
                 Err(drained)
             } else {
-                Ok(BlockCommitted::commit_groups_logged::<
+                Ok(BlockCommitted::commit_groups_probed::<
                     H,
                     <H as multilinear::whir_hash::WhirHash>::Sponge,
                 >(
@@ -9459,6 +9460,8 @@ fn prove_streamed(
                     options.upload_ahead,
                     ledger.map(|ledger| ledger.block.clone()),
                     spill.clone(),
+                    // A measurement, off unless asked: the proof is the same.
+                    multilinear_block::CsProbe::from_env(),
                 ))
             };
             (block, builder.join(), layout.join(), executor.join())
