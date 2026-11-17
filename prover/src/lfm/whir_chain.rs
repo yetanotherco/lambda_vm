@@ -172,10 +172,22 @@ pub struct ChainShape {
     /// Variables folded in each round.
     pub schedule: Vec<usize>,
     /// `log2` of the domain each round starts at: `D_0 = num_vars +
-    /// log_blowup`, then `D_{r+1} = D_r − k_r`.
+    /// log_blowup`, then `D_{r+1} = D_r − k_r` (`ChainConfig::round_domain_logs`:
+    /// under the WHIR round form `D_{r+1} = D_r − min(shrink, k_r)`).
     pub domain_log: Vec<usize>,
     pub num_vars: usize,
+    /// Round 0's query count: every round's under [`RoundForm::Fri`].
     pub num_queries: usize,
+    /// How a round checks its successor: the config's own. Under
+    /// [`RoundForm::Whir`] no successor is opened; each query's fold value is
+    /// a claim on the successor, and the rounds query
+    /// [`Self::round_queries`].
+    pub form: RoundForm,
+    /// Each round's query count under [`RoundForm::Whir`]
+    /// (`ChainConfig::round_queries`, the host's own); empty under
+    /// [`RoundForm::Fri`], whose every round queries [`Self::num_queries`].
+    /// Read through [`Self::queries`].
+    pub round_queries: Vec<usize>,
     pub grind: (usize, usize, usize),
     /// Each tree's Merkle cap height (W1): tree `r` is round `r`'s current
     /// tree. From the same `ChainConfig::tree_caps` the host prover and
@@ -258,21 +270,15 @@ impl ChainShape {
     /// [`Self::new`] over trees of `arity` children per node: the hash's
     /// arity, as the host's prover and verifier take it.
     pub fn new_at(config: &ChainConfig, num_vars: usize, arity: usize) -> Self {
-        // The emitter checks a successor by opening it: a chain under the
-        // WHIR round form (its successors checked through claims, its rate
-        // rising) has no in-guest verifier yet, and none is emitted for one.
-        assert!(
-            config.format.rounds == RoundForm::Fri,
-            "the in-guest chain verifier opens each successor: no program is emitted for a chain \
-             under the WHIR round form"
-        );
         let schedule = config.schedule(num_vars);
-        let mut domain_log = Vec::with_capacity(schedule.len());
-        let mut d = num_vars + config.log_blowup;
-        for &k in &schedule {
-            domain_log.push(d);
-            d -= k;
-        }
+        // The host's own domains and counts: each round's domain shrinks by
+        // its fold under `Fri` and by `min(shrink, k)` under the round form.
+        let domain_log = config.round_domain_logs(num_vars);
+        debug_assert_eq!(domain_log.len(), schedule.len(), "one domain a round");
+        let round_queries = match config.format.rounds {
+            RoundForm::Fri => Vec::new(),
+            RoundForm::Whir(_) => config.round_queries(num_vars),
+        };
         let caps = config.tree_caps_at(num_vars, arity);
         debug_assert_eq!(caps.len(), schedule.len(), "one cap height per tree");
         Self {
@@ -281,6 +287,8 @@ impl ChainShape {
             domain_log,
             num_vars,
             num_queries: config.num_queries,
+            form: config.format.rounds,
+            round_queries,
             digest_words: 1,
             final_at: config.final_round(num_vars),
             caps,
@@ -329,6 +337,42 @@ impl ChainShape {
         self.schedule.len()
     }
 
+    /// Whether the chain runs the WHIR round form ([`RoundForm::Whir`]): a
+    /// round with a successor opens its current tree alone, and each query's
+    /// fold value becomes a claim on the successor at `pow(y_j)`.
+    pub fn whir(&self) -> bool {
+        matches!(self.form, RoundForm::Whir(_))
+    }
+
+    /// ★ Round `r`'s query count: [`Self::num_queries`] every round under
+    /// [`RoundForm::Fri`], the count for the round's own rate under the round
+    /// form (`ChainConfig::round_queries`, a verifier constant of the config).
+    pub fn queries(&self, r: usize) -> usize {
+        match self.form {
+            RoundForm::Fri => self.num_queries,
+            RoundForm::Whir(_) => self.round_queries[r],
+        }
+    }
+
+    /// `log2` of how much round `r`'s domain shrinks into its successor's: its
+    /// fold `k_r` under [`RoundForm::Fri`], `min(shrink, k_r)` under the round
+    /// form (`ChainConfig::shrink_of`).
+    pub fn shrink(&self, r: usize) -> usize {
+        match self.form {
+            RoundForm::Fri => self.schedule[r],
+            RoundForm::Whir(w) => w.shrink().min(self.schedule[r]),
+        }
+    }
+
+    /// Whether round `r` owns its current tree, whose first opening then
+    /// carries the tree's cap: round 0 always; under the round form every
+    /// queried round (no successor opening came before it). Under
+    /// [`RoundForm::Fri`] a later tree's cap rides on the round before's first
+    /// successor opening.
+    pub fn owns_current(&self, r: usize) -> bool {
+        r == 0 || (self.whir() && self.queried(r))
+    }
+
     /// ★ Whether round `r` is a tail round under [`LeafQuery::Lean`]: checked
     /// at every leaf of its current tree once instead of at each query. Round
     /// `r ≥ 1`, and it and every later round have a single current tree lying
@@ -339,6 +383,7 @@ impl ChainShape {
     pub fn tail_round(&self, r: usize) -> bool {
         self.query == LeafQuery::Lean
             && self.final_at.is_none()
+            && !self.whir()
             && r >= 1
             && r < self.rounds()
             && (r..self.rounds()).all(|t| self.tail_shaped(t))
@@ -588,6 +633,9 @@ pub fn chain_opening_perms(shape: &ChainShape) -> usize {
     // A tail round ([`ChainShape::tail_round`]) hashes each leaf's block once
     // (no walked level) and opens no successor a query.
     let mut tail = 0;
+    // Under the round form each round opens its current tree alone, at its
+    // own count of queries.
+    let mut by_round = 0;
     for r in 0..shape.rounds() {
         if !shape.queried(r) {
             continue;
@@ -601,12 +649,16 @@ pub fn chain_opening_perms(shape: &ChainShape) -> usize {
             tail += shape.current_leaves(r) * current;
             continue;
         }
+        if shape.whir() {
+            by_round += shape.queries(r) * shape.trees_at(r) * current;
+            continue;
+        }
         per_query += shape.trees_at(r) * current;
         if let Some(depth) = shape.next_depth(r) {
             per_query += shape.opening_perms(3 << shape.schedule[r + 1], depth, shape.caps[r + 1]);
         }
     }
-    shape.num_queries * per_query + tail + chain_cap_perms(shape)
+    shape.num_queries * per_query + by_round + tail + chain_cap_perms(shape)
 }
 
 /// PERMUTATIONS the chain's cap checks cost: each capped tree's cap hashed up
@@ -622,6 +674,13 @@ pub fn chain_cap_perms(shape: &ChainShape) -> usize {
 
 /// INSTRUCTIONS one chain's query phase costs: per round, per query, the two
 /// openings, the fold, the successor slot's mux and the assert that closes it.
+///
+/// Under the round form a round with a successor opens its current tree alone
+/// at its own count of queries, and each query's fold value becomes a shift
+/// claim: the position's point `y = ω^q` (a `Select` and a `Mul` a bit), its
+/// squarings up to the successor's variables, and the claim's `MulAdd`; the
+/// round's `γ` is one `Pack` and its powers one `Mul` a query after the first. The claims' `eq`s
+/// are the tail's ([`chain_fixed_rows`]).
 pub fn chain_query_rows(shape: &ChainShape) -> usize {
     let mut per_round = 0;
     for r in 0..shape.rounds() {
@@ -654,6 +713,12 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
             + combine_rows(shape, r)
             + fold_coset_rows_lean(1usize << shape.schedule[r], depth);
         match shape.next_depth(r) {
+            Some(_) if shape.whir() => {
+                let n_next = shape.chain_vars() - shape.bound(r);
+                q += 2 * depth + n_next.saturating_sub(1) + 1;
+                // `γ`'s `Pack`, then its powers.
+                per_round += 1 + shape.queries(r).saturating_sub(1);
+            }
             Some(next_depth) => {
                 let next_block = 1usize << shape.schedule[r + 1];
                 // The successor opening, the slot mux, and `folded == claimed`.
@@ -677,7 +742,7 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
             // `folded == final_value`.
             None => q += 2,
         }
-        per_round += shape.num_queries * q;
+        per_round += shape.queries(r) * q;
         // The lean fold's once-a-round `½·α`.
         per_round += lean_prepare_rows(shape.schedule[r]);
     }
@@ -696,7 +761,6 @@ pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
     let (folding, ood, query) = shape.grind;
     let mut rows = 0;
     for r in 0..shape.rounds() {
-        let k = shape.schedule[r];
         rows += grind_fixed(folding);
         // Per sumcheck round: two absorbed evaluations (one `Unpack` each), one
         // drawn challenge (one `Pack`), and the round itself. Round 0 of a
@@ -707,7 +771,9 @@ pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
         }
         match shape.next_depth(r) {
             Some(_) => {
-                let next_domain_log = shape.domain_log[r] - k;
+                // The successor's domain: the folded one under `Fri`, round
+                // `r`'s shrunk by `min(shrink, k)` under the round form.
+                let next_domain_log = shape.domain_log[r] - shape.shrink(r);
                 // The successor root: one `Unpack` into four absorbed felts.
                 rows += 1;
                 // `z0`: one `Pack`.
@@ -737,6 +803,7 @@ pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
     for r in (0..shape.rounds()).filter(|&r| shape.next_depth(r).is_some()) {
         rows += eq_eval_rows_again(shape.chain_vars() - shape.bound(r)) + 1;
     }
+    rows += shift_claim_tail_rows(shape);
     rows += 1 + 1 + 2;
     // Under a final polynomial: its value at the tail's challenges (a `Sub` and
     // a `MulAdd` a fold) and the assert.
@@ -753,6 +820,26 @@ pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
         .map(|(r, &c)| shape.trees_at(r) * cap_check_rows(c))
         .sum::<usize>();
     rows
+}
+
+/// INSTRUCTIONS the round form's shift claims cost in the tail
+/// ([`emit_shift_weight`]): `1 − α_i` and `2α_i − 1` once a challenge any claim
+/// reads, then per claim over `n` variables `n` `MulAdd`s (each factor
+/// `(1 − α_i) + (2α_i − 1)·y^(2^i)`), `n − 1` products and the `MulAdd` into the
+/// weight. None under [`RoundForm::Fri`].
+pub fn shift_claim_tail_rows(shape: &ChainShape) -> usize {
+    let rounds: Vec<usize> = (0..shape.rounds())
+        .filter(|&r| shape.whir() && shape.next_depth(r).is_some())
+        .collect();
+    let Some(&first) = rounds.first() else {
+        return 0;
+    };
+    let prepared = 2 * (shape.chain_vars() - shape.bound(first));
+    prepared
+        + rounds
+            .iter()
+            .map(|&r| shape.queries(r) * 2 * (shape.chain_vars() - shape.bound(r)))
+            .sum::<usize>()
 }
 
 /// INSTRUCTIONS round `r`'s query spends combining its run's blocks: one
@@ -889,8 +976,13 @@ pub fn chain_sponge(shape: &ChainShape, sponge: &mut SpongeSchedule) {
             }
         }
         if shape.queried(r) {
-            for _ in 0..shape.num_queries {
+            for _ in 0..shape.queries(r) {
                 sponge.candidate();
+            }
+            // The round form's `γ`, drawn after every position of a round
+            // with a successor.
+            if shape.whir() && shape.next_depth(r).is_some() {
+                sponge.draw_ext();
             }
         }
     }
@@ -1077,6 +1169,10 @@ fn emit_chain(
     );
     let mut final_sent: Option<&[Ext]> = None;
     let mut tail_alphas: Vec<Ext> = Vec::new();
+    // Under the round form, each query's shift claim: its `γ^{j+1}`, its point
+    // `pow(y_j)` (base felts) and how many variables were bound when it
+    // entered — the out-of-domain claims' bookkeeping, a query at a time.
+    let mut shift: Vec<(Ext, Vec<Felt>, usize)> = Vec::new();
 
     for (r, round) in rounds.iter().enumerate() {
         let k = shape.schedule[r];
@@ -1102,6 +1198,8 @@ fn emit_chain(
                 transcript.absorb_ext(b, *e);
             }
             let challenge = transcript.sample_ext(b);
+            #[cfg(test)]
+            chain_draws::ext(challenge);
             claim = emit_sumcheck_round(b, claim, evaluations, challenge);
             point.push(challenge);
         }
@@ -1131,6 +1229,20 @@ fn emit_chain(
                 .squared()
                 .expect("the schedule never folds past the domain");
         }
+        // The successor's domain: the folded one under `Fri`; round `r`'s
+        // squared `min(shrink, k)` times under the round form, where the
+        // queries' points stay on the folded one (`next_domain`).
+        let successor_domain = if shape.whir() {
+            let mut d = current_domain.clone();
+            for _ in 0..shape.shrink(r) {
+                d = d
+                    .squared()
+                    .expect("the schedule never shrinks past the domain");
+            }
+            d
+        } else {
+            next_domain.clone()
+        };
         let bound = alphas.len() + sent;
 
         #[cfg(test)]
@@ -1193,11 +1305,14 @@ fn emit_chain(
                 transcript.absorb_digest_lanes(b, lanes.words());
 
                 let z0 = transcript.sample_ext(b);
+                #[cfg(test)]
+                chain_draws::ext(z0);
 
                 // ONE squaring chain for two consumers. `powers[j] = z0^(2^j)`:
                 // the out-of-domain point takes the first `n + m − bound` of
-                // them and the domain check takes the last.
-                let depth = next_domain.log_size();
+                // them and the domain check takes the last — the SUCCESSOR's
+                // domain, which the round form keeps bigger than the fold's.
+                let depth = successor_domain.log_size();
                 let mut powers = Vec::with_capacity(depth + 1);
                 powers.push(z0);
                 for j in 0..depth {
@@ -1210,16 +1325,30 @@ fn emit_chain(
                 transcript.absorb_ext(b, y0);
                 emit_spent_grind(b, transcript, grind_ood, round.nonces.ood);
                 let gamma = transcript.sample_ext(b);
+                #[cfg(test)]
+                chain_draws::ext(gamma);
                 claim = b.emul_add(gamma, y0, claim);
                 ood.push((gamma, ood_point, bound));
 
                 emit_spent_grind(b, transcript, grind_query, round.nonces.query);
+                // The successor's cap: carried by this round's successor side
+                // under `Fri`, by the successor's own round under the round
+                // form (its first opening owns the tree).
+                let next_cap = if shape.whir() {
+                    assert!(
+                        round.next_cap.is_empty(),
+                        "round {r} opens no successor under the round form"
+                    );
+                    rounds[r + 1].current_cap
+                } else {
+                    round.next_cap
+                };
                 Some(tree_auth(
                     b,
                     shape,
                     shape.current_depth(r + 1),
                     shape.caps[r + 1],
-                    round.next_cap,
+                    next_cap,
                     &lanes,
                 ))
             }
@@ -1249,6 +1378,31 @@ fn emit_chain(
                 next_blocks,
                 final_value,
             );
+        } else if shape.whir() && next_tree.is_some() {
+            // The round form: the current trees opened alone, each query's
+            // fold value a claim on the successor.
+            let folds = emit_claim_queries(
+                b,
+                transcript,
+                round,
+                shape,
+                r,
+                &current_domain,
+                data,
+                &current_trees,
+                if r == 0 { combine_eqs } else { &[] },
+            );
+            claim = emit_shift_claims(
+                b,
+                transcript,
+                shape,
+                r,
+                &next_domain,
+                &folds,
+                bound,
+                claim,
+                &mut shift,
+            );
         } else {
             emit_query_phase(
                 b,
@@ -1269,7 +1423,7 @@ fn emit_chain(
             current_trees = vec![tree];
         }
         alphas.extend(point);
-        current_domain = next_domain;
+        current_domain = successor_domain;
     }
 
     // The accumulated weight: the caller's own, plus each out-of-domain claim's
@@ -1281,6 +1435,11 @@ fn emit_chain(
         let eq = emit_eq_eval(b, point, &alphas[*bound..]);
         weight = b.emul_add(*gamma, eq, weight);
     }
+    // The round form's shift claims, each `γ^{j+1}·eq(pow(y_j), α_{bound..})`
+    // as the host's final weight sums them; none under `Fri`.
+    weight = emit_shift_weight(b, &shift, &alphas, weight, one);
+    #[cfg(test)]
+    chain_draws::closing(claim, weight);
 
     emit_final_check(b, claim, weight, final_value, one);
     // Under a final polynomial, `f(α)` is the sent polynomial's value at the
@@ -1319,11 +1478,13 @@ fn emit_final_poly_phase(
     let depth = shape.current_depth(r);
     assert!(r >= 1, "a final round folds an extension codeword");
     assert_eq!(current_trees.len(), 1, "the final round opens one tree");
-    assert_eq!(round.current.len(), shape.num_queries);
+    assert_eq!(round.current.len(), shape.queries(r));
     assert!(round.next.is_empty(), "the final round opens no successor");
-    let queries: Vec<Vec<Bit>> = (0..shape.num_queries)
+    let queries: Vec<Vec<Bit>> = (0..shape.queries(r))
         .map(|_| transcript.sample_u64_pow2(b, depth))
         .collect();
+    #[cfg(test)]
+    queries.iter().for_each(|bits| chain_draws::index(bits));
     let fold = RoundFold::prepare(b, alphas);
     let coefficients = emit_power_coefficients(b, round.final_poly, rem);
     let omega = *next_domain.generator();
@@ -1719,7 +1880,7 @@ fn emit_query_phase(
             .iter()
             .all(|t| t.cap_height() == shape.caps[r])
     );
-    assert_eq!(round.current.len(), shape.num_queries * trees);
+    assert_eq!(round.current.len(), shape.queries(r) * trees);
     // A joint round 0's one leaf holds every polynomial's block.
     let joint = r == 0 && shape.joint();
     assert_eq!(
@@ -1731,9 +1892,11 @@ fn emit_query_phase(
         },
         "one eq(ρ, p) a polynomial of the run"
     );
-    let queries: Vec<Vec<_>> = (0..shape.num_queries)
+    let queries: Vec<Vec<_>> = (0..shape.queries(r))
         .map(|_| transcript.sample_u64_pow2(b, depth))
         .collect();
+    #[cfg(test)]
+    queries.iter().for_each(|bits| chain_draws::index(bits));
     // The current trees are walked at the block's tree position; the fold, the
     // successor's leaf and its slot read the index itself.
     let walks: Vec<std::borrow::Cow<'_, [Bit]>> = queries
@@ -1747,6 +1910,7 @@ fn emit_query_phase(
     match (next_tree, shape.next_depth(r)) {
         (Some(next_tree), Some(next_depth)) => {
             let next_block = 1usize << shape.schedule[r + 1];
+            assert!(!shape.whir(), "the round form opens no successor");
             assert_eq!(round.next.len(), shape.num_queries);
             for (q, bits) in queries.iter().enumerate() {
                 // Each tree's block at the query's one position, against that
@@ -1823,6 +1987,235 @@ fn emit_query_phase(
     }
 }
 
+/// ★ The round form's queries of a round that commits a successor
+/// ([`RoundForm::Whir`], the host's `round_form_folds` and `verify_grouped` /
+/// `verify_joint` under `GroupedEnd::Claims`): its `Q_r` draws, then per query
+/// each current tree's opening at the drawn position (a grouped round 0's
+/// every tree at the one draw, a joint one's one leaf) and the block — a
+/// run's blocks combined — folded at the round's challenges. NO successor
+/// block is read: each `(position bits, fold value)` comes back, in query
+/// order, for [`emit_shift_claims`].
+#[allow(clippy::too_many_arguments)]
+fn emit_claim_queries(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    round: &ChainRoundWires<'_>,
+    shape: &ChainShape,
+    r: usize,
+    current_domain: &Domain<GoldilocksField>,
+    alphas: &[Ext],
+    current_trees: &[TreeAuth],
+    eqs: &[Ext],
+) -> Vec<(Vec<Bit>, Ext)> {
+    let depth = shape.current_depth(r);
+    let trees = shape.trees_at(r);
+    let count = shape.queries(r);
+    assert!(shape.whir(), "round {r}: claims are the round form's");
+    assert_eq!(current_trees.len(), trees, "round {r} opens {trees} trees");
+    assert_eq!(round.current.len(), count * trees);
+    assert!(
+        round.next.is_empty(),
+        "round {r} opens no successor block under the round form"
+    );
+    let joint = r == 0 && shape.joint();
+    let queries: Vec<Vec<Bit>> = (0..count)
+        .map(|_| transcript.sample_u64_pow2(b, depth))
+        .collect();
+    #[cfg(test)]
+    queries.iter().for_each(|bits| chain_draws::index(bits));
+    let walks: Vec<std::borrow::Cow<'_, [Bit]>> = queries
+        .iter()
+        .map(|bits| walk_bits(shape, r, bits))
+        .collect();
+    let fold = RoundFold::prepare(b, alphas);
+    let mut folds = Vec::with_capacity(count);
+    for (q, bits) in queries.iter().enumerate() {
+        let blocks = &round.current[q * trees..(q + 1) * trees];
+        for (p, current) in blocks.iter().enumerate() {
+            #[cfg(test)]
+            onechain_steps::mark(b, onechain_steps::opening(r, q, p));
+            if joint {
+                current_trees[p].verify_joint_opening(
+                    b,
+                    current.values,
+                    shape.trees,
+                    &walks[q],
+                    current.siblings,
+                );
+            } else {
+                current_trees[p].verify_opening(b, current.values, &walks[q], current.siblings);
+            }
+        }
+        #[cfg(test)]
+        onechain_steps::mark(b, onechain_steps::Step::Fold { round: r, query: q });
+        let block = folded_block(b, blocks, eqs);
+        let folded = fold.fold(b, &block, current_domain, bits);
+        folds.push((bits.clone(), folded));
+    }
+    folds
+}
+
+/// ★ The round form's shift claims of round `r` (the host's `round_form_round`
+/// after its openings): `γ` drawn after every position, then per query `j`
+/// the claim `f_{r+1}(pow(y_j)) = v_j` with `y_j = ω^{q_j}`, `ω` the FOLDED
+/// domain's generator (`folded_domain`, round `r`'s squared `k_r` times) and
+/// `pow(y) = (y, y², y⁴, …)` over the successor's variables: `claim +=
+/// γ^{j+1}·v_j`, and `(γ^{j+1}, pow(y_j), bound)` kept for the tail's weight
+/// ([`emit_shift_weight`]). A repeated position is its own claim, as on the
+/// host. Returns the claim.
+///
+/// `y_j` is a base felt: one `Select` and one `Mul` a position bit, then one
+/// `Mul` a squaring. `γ^{j+1}` is one `Mul` a query after the first.
+#[allow(clippy::too_many_arguments)]
+fn emit_shift_claims(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    shape: &ChainShape,
+    r: usize,
+    folded_domain: &Domain<GoldilocksField>,
+    folds: &[(Vec<Bit>, Ext)],
+    bound: usize,
+    mut claim: Ext,
+    shift: &mut Vec<(Ext, Vec<Felt>, usize)>,
+) -> Ext {
+    let depth = shape.current_depth(r);
+    assert_eq!(
+        folded_domain.log_size(),
+        depth,
+        "round {r}: the queries' points live on the folded domain"
+    );
+    let n_next = shape.chain_vars() - bound;
+    assert!(n_next >= 1, "a successor has a variable left");
+    let gamma = transcript.sample_ext(b);
+    #[cfg(test)]
+    chain_draws::ext(gamma);
+    let omega = *folded_domain.generator();
+    let factors: Vec<FE> = (0..depth).map(|i| omega.pow(1u64 << i)).collect();
+    let mut power = gamma;
+    for (j, (bits, value)) in folds.iter().enumerate() {
+        if j > 0 {
+            power = b.emul(power, gamma);
+        }
+        let y = super::edsl::pow_bits(b, bits, &factors, FE::one());
+        let mut point = Vec::with_capacity(n_next);
+        point.push(y);
+        for i in 1..n_next {
+            let squared = b.mul(point[i - 1], point[i - 1]);
+            point.push(squared);
+        }
+        claim = b.emul_add(power, *value, claim);
+        shift.push((power, point, bound));
+    }
+    claim
+}
+
+/// ★ The shift claims' share of the final weight: `Σ γ^{j+1}·eq(pow(y_j),
+/// α_{bound..})`, added to `weight` claim by claim in the order they entered,
+/// as the host's `verify_chain` sums them. A claim's point is base, so each
+/// factor of its `eq` is `(1 − α_i) + (2α_i − 1)·y^(2^i)` — one `MulAdd` — with
+/// `1 − α_i` and `2α_i − 1` emitted once a challenge for every claim that
+/// reads it. Returns `weight` unchanged when there is no claim.
+pub fn emit_shift_weight(
+    b: &mut LfmBuilder,
+    shift: &[(Ext, Vec<Felt>, usize)],
+    alphas: &[Ext],
+    mut weight: Ext,
+    one: Ext,
+) -> Ext {
+    let Some(first) = shift.iter().map(|(_, _, bound)| *bound).min() else {
+        return weight;
+    };
+    // `(1 − α_i, 2α_i − 1)` for every challenge a claim reads.
+    let prepared: Vec<(Ext, Ext)> = alphas[first..]
+        .iter()
+        .map(|&alpha| {
+            let low = b.esub(one, alpha);
+            let slope = b.esub(alpha, low);
+            (low, slope)
+        })
+        .collect();
+    for (scale, point, bound) in shift {
+        assert_eq!(
+            point.len(),
+            alphas.len() - bound,
+            "a shift claim's point has the successor's variables"
+        );
+        let mut eq: Option<Ext> = None;
+        for (i, y) in point.iter().enumerate() {
+            let (low, slope) = prepared[bound - first + i];
+            let factor = b.emul_add(slope, y.as_ext(), low);
+            eq = Some(match eq {
+                None => factor,
+                Some(acc) => b.emul(acc, factor),
+            });
+        }
+        let eq = eq.expect("a shift claim has a variable");
+        weight = b.emul_add(*scale, eq, weight);
+    }
+    weight
+}
+
+/// Test only: every value the emitted chain draws from its transcript, in
+/// draw order — each extension challenge (sumcheck, `z0`, the out-of-domain
+/// `γ`, the round form's `γ`) and each query position's bits — and the claim
+/// and weight the tail closes on, so a test publishes them and compares the
+/// machine's stream with the host verifier's, draw for draw. Recording only:
+/// nothing is emitted, and nothing is kept outside [`chain_draws::record`].
+#[cfg(test)]
+pub(crate) mod chain_draws {
+    use super::super::builder::{Bit, Ext};
+
+    /// One draw of the emitted chain.
+    #[derive(Clone, Debug)]
+    pub(crate) enum Draw {
+        Ext(Ext),
+        Index(Vec<Bit>),
+    }
+
+    /// What one chain's emission drew, and its closing claim and weight.
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Draws {
+        pub(crate) draws: Vec<Draw>,
+        pub(crate) closing: Vec<(Ext, Ext)>,
+    }
+
+    std::thread_local! {
+        static DRAWS: std::cell::RefCell<Option<Draws>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) fn ext(value: Ext) {
+        DRAWS.with(|d| {
+            if let Some(d) = d.borrow_mut().as_mut() {
+                d.draws.push(Draw::Ext(value));
+            }
+        });
+    }
+
+    pub(crate) fn index(bits: &[Bit]) {
+        DRAWS.with(|d| {
+            if let Some(d) = d.borrow_mut().as_mut() {
+                d.draws.push(Draw::Index(bits.to_vec()));
+            }
+        });
+    }
+
+    pub(crate) fn closing(claim: Ext, weight: Ext) {
+        DRAWS.with(|d| {
+            if let Some(d) = d.borrow_mut().as_mut() {
+                d.closing.push((claim, weight));
+            }
+        });
+    }
+
+    /// Runs `f` and returns what its emission drew.
+    pub(crate) fn record<R>(f: impl FnOnce() -> R) -> (R, Draws) {
+        let previous = DRAWS.with(|d| d.replace(Some(Draws::default())));
+        let out = f();
+        let draws = DRAWS.with(|d| d.replace(previous)).unwrap_or_default();
+        (out, draws)
+    }
+}
+
 /// ★ A tail round's check ([`ChainShape::tail_round`], [`LeafQuery::Lean`]):
 /// the query draws, as [`emit_query_phase`] makes them, then EVERY leaf of the
 /// current tree at once.
@@ -1866,7 +2259,9 @@ fn emit_tail_phase(
         "a tail round opens no successor block a query"
     );
     for _ in 0..shape.num_queries {
-        let _ = transcript.sample_u64_pow2(b, depth);
+        let _bits = transcript.sample_u64_pow2(b, depth);
+        #[cfg(test)]
+        chain_draws::index(&_bits);
     }
     let fold = RoundFold::prepare(b, alphas);
     let [TreeAuth::Cap(cap)] = current_trees else {
@@ -2212,9 +2607,10 @@ impl RoundStorage {
 
             // W1: tree 0's cap, right after round 0's nonces (the words the
             // owner path carried after its siblings) — a grouped round 0's
-            // trees' caps, in tree order.
-            let current_cap: Vec<WrapDigest> = if r == 0 {
-                (0..shape.trees_at(0) * shape.cap_words(shape.current_depth(0), shape.caps[0]))
+            // trees' caps, in tree order. Under the round form every queried
+            // round owns its tree and carries its cap here alike.
+            let current_cap: Vec<WrapDigest> = if shape.owns_current(r) {
+                (0..shape.trees_at(r) * shape.cap_words(shape.current_depth(r), shape.caps[r]))
                     .map(|_| next_digest(b, &mut at))
                     .collect()
             } else {
@@ -2236,7 +2632,7 @@ impl RoundStorage {
             } else if shape.tail_round(r) {
                 shape.current_leaves(r)
             } else {
-                shape.num_queries * shape.trees_at(r)
+                shape.queries(r) * shape.trees_at(r)
             };
             let current: Vec<(CurrentBlock, PathStore)> = (0..openings)
                 .map(|_| {
@@ -2276,6 +2672,14 @@ impl RoundStorage {
                 .collect();
 
             let (next_root, ood_value, next, next_cap) = match shape.next_depth(r) {
+                // The round form opens no successor: its root and its
+                // out-of-domain value alone (the successor's round carries
+                // its cap).
+                Some(_) if shape.whir() => {
+                    let nr = next_digest(b, &mut at);
+                    let ov = next_word(b, &mut at).as_ext();
+                    (Some(nr), Some(ov), Vec::new(), Vec::new())
+                }
                 Some(next_depth) => {
                     let nr = next_digest(b, &mut at);
                     let ov = next_word(b, &mut at).as_ext();
@@ -2425,14 +2829,18 @@ pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
         } else {
             block
         };
-        n += (shape.num_queries * shape.trees_at(r) * (words + depth)) as u32;
+        n += (shape.queries(r) * shape.trees_at(r) * (words + depth)) as u32;
     }
-    if r == 0 {
-        // W1: tree 0's cap words, a grouped round 0's trees' each.
-        n += (dw * shape.trees_at(0) * shape.cap_words(shape.current_depth(0), shape.caps[0]))
+    if shape.owns_current(r) {
+        // W1: tree 0's cap words, a grouped round 0's trees' each; under the
+        // round form every queried round's own.
+        n += (dw * shape.trees_at(r) * shape.cap_words(shape.current_depth(r), shape.caps[r]))
             as u32;
     }
-    if let Some(next_depth) = shape.next_depth(r) {
+    if shape.whir() && shape.next_depth(r).is_some() {
+        // The successor root and its out-of-domain value: no successor block.
+        n += (dw + 1) as u32;
+    } else if let Some(next_depth) = shape.next_depth(r) {
         // The successor root, its out-of-domain value, its cap, and per query
         // its block and path.
         let c = shape.caps[r + 1];
@@ -2497,8 +2905,11 @@ pub fn try_push_round_words(
         let current = PathSide {
             depth: shape.current_depth(r),
             cap: shape.caps[r],
-            owner: r == 0,
+            owner: shape.owns_current(r),
         };
+        if shape.whir() && shape.queried(r) {
+            check_round_form_openings(shape, round, r)?;
+        }
         if !shape.queried(r) {
             // A sumcheck after a final-polynomial round: its proof carries no
             // opening, and the arena none.
@@ -2516,6 +2927,10 @@ pub fn try_push_round_words(
             words.push(ext_word(
                 round.ood_value.as_ref().expect("an out-of-domain value"),
             ));
+            // The round form opens no successor: its round carries its cap.
+            if shape.whir() {
+                continue;
+            }
             let next = PathSide {
                 depth: next_depth,
                 cap: shape.caps[r + 1],
@@ -2553,6 +2968,43 @@ pub fn try_push_round_words(
             }
             words.extend(sent.values.iter().map(ext_word));
         }
+    }
+    Ok(())
+}
+
+/// ★ The round form's shape of round `r`'s openings, refused before a word is
+/// laid out: exactly `Q_r` current openings a tree (the config's count, never
+/// the proof's), and no successor block on a round that commits one (the
+/// host's `SuccessorOpened`). A proof of another shape has no arena.
+fn check_round_form_openings(
+    shape: &ChainShape,
+    round: &ChainRound<GoldilocksField, GoldilocksExtension>,
+    r: usize,
+) -> Result<(), String> {
+    let (current, trees) = match &round.openings {
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => (p.current.len(), 1),
+        RoundOpenings::Extension(p) => (p.current.len(), 1),
+        RoundOpenings::BaseGrouped(p) => {
+            let trees = shape.trees_at(r);
+            if p.current.iter().any(|row| row.len() != trees) {
+                return Err(format!(
+                    "round {r}: a grouped opening row without one block a tree"
+                ));
+            }
+            (p.current.len(), trees)
+        }
+    };
+    if current != shape.queries(r) || trees != shape.trees_at(r) {
+        return Err(format!(
+            "round {r}: {current} openings of {trees} trees, the round form queries {} of {}",
+            shape.queries(r),
+            shape.trees_at(r)
+        ));
+    }
+    if shape.next_depth(r).is_some() && !next_openings(round).is_empty() {
+        return Err(format!(
+            "round {r}: a successor block, which the round form never opens"
+        ));
     }
     Ok(())
 }
