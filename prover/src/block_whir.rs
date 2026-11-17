@@ -1867,6 +1867,23 @@ fn keccak_rnd_first_or_default(deviation: Option<bool>) -> bool {
     deviation.unwrap_or(true)
 }
 
+/// A measurement's knob ([`parse_keccak_rnd_arrivals`]).
+const KECCAK_RND_ARRIVALS_ENV: &str = "LAMBDA_VM_KECCAK_RND_ARRIVALS";
+
+/// `LAMBDA_VM_KECCAK_RND_ARRIVALS`: `1` logs when each KECCAK_RND table's
+/// operations are all in as the windows are taken (`BLOCK KECCAK_RND
+/// ARRIVALS`); unset, empty or `0` (the default) does not. It moves no byte of
+/// the proof. Anything else refuses the prove.
+fn parse_keccak_rnd_arrivals(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{KECCAK_RND_ARRIVALS_ENV}={v}: 0 (the default) or 1 (log KECCAK_RND's arrivals)"
+        ))),
+    }
+}
+
 /// The knob of [`rest_airs_beside`].
 const REST_AIRS_BESIDE_ENV: &str = "LAMBDA_VM_REST_AIRS_BESIDE";
 
@@ -7427,6 +7444,13 @@ fn prove_streamed(
     let commit_config = format.chain_config(&[]);
     let cap = commit_config.format.stack;
     let start = Instant::now();
+    // A measurement ([`KECCAK_RND_ARRIVALS_ENV`]): when each KECCAK_RND table's
+    // operations are all in, as the windows are taken.
+    let arrivals =
+        parse_keccak_rnd_arrivals(std::env::var(KECCAK_RND_ARRIVALS_ENV).ok().as_deref())?;
+    if arrivals {
+        crate::tables::trace_builder::keccak_rnd_arrivals::arm(1 << options.keccak_rnd_rows_log2);
+    }
     head_log::begin(start, deviations.head_log.map_or_else(head_log::knob, Ok)?);
     set_up_card();
     // A memory log (`BlockOptions::memlog`): its sampler runs until the
@@ -8509,6 +8533,19 @@ fn prove_streamed(
         stamps.head = head_log::take_lines();
         for line in &stamps.head {
             eprintln!("{line}");
+        }
+        if arrivals {
+            let (ops, at) = crate::tables::trace_builder::keccak_rnd_arrivals::take();
+            eprintln!(
+                "BLOCK KECCAK_RND ARRIVALS: tables of {} rows (24 an operation) · {ops} operations in the \
+                 windows · {} table(s) complete during the windows, at [{}] s since the prove began",
+                1usize << options.keccak_rnd_rows_log2,
+                at.len(),
+                at.iter()
+                    .map(|t| format!("{:.2}", t.duration_since(start).as_secs_f64()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         (stamps.execute, stamps.executor) =
             executed.map_err(|_| Error::Prover("the block's executor panicked".into()))??;
@@ -12135,6 +12172,17 @@ mod rest_airs_beside_tests {
     use crate::tables::keccak_rnd::KeccakRndForm;
     use crate::test_utils::create_keccak_rnd_air_for;
     use stark::proof::options::ProofOptions;
+
+    /// The arrivals measurement's knob: off unset, empty or `0`; on at `1`;
+    /// any other word refuses.
+    #[test]
+    fn the_arrivals_knob_is_off_by_default_and_refuses_other_words() {
+        for off in [None, Some(""), Some("0")] {
+            assert!(!super::parse_keccak_rnd_arrivals(off).expect("a word it takes"));
+        }
+        assert!(super::parse_keccak_rnd_arrivals(Some("1")).expect("on"));
+        assert!(super::parse_keccak_rnd_arrivals(Some("yes")).is_err());
+    }
 
     /// The knob: on unset, empty or `1`; off at `0` (the rollback); any other
     /// word refuses.
