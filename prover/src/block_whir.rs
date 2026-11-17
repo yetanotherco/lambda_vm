@@ -1867,6 +1867,36 @@ fn keccak_rnd_first_or_default(deviation: Option<bool>) -> bool {
     deviation.unwrap_or(true)
 }
 
+/// The knob of [`rest_airs_beside`].
+const REST_AIRS_BESIDE_ENV: &str = "LAMBDA_VM_REST_AIRS_BESIDE";
+
+/// Whether the streamed rest builds the run's AIR set on a thread of its own
+/// while the KECCAK_RND tables handed on first are laid out with their own
+/// AIRs ([`lay_out_rest_streamed`]), so they reach the packer as the finish
+/// hands them on rather than once the whole set exists: a deviation's choice,
+/// else `LAMBDA_VM_REST_AIRS_BESIDE`. The AIRs, the tables, their order and
+/// the proof's bytes are the same either way.
+fn rest_airs_beside(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => parse_rest_airs_beside(std::env::var(REST_AIRS_BESIDE_ENV).ok().as_deref()),
+    }
+}
+
+/// `LAMBDA_VM_REST_AIRS_BESIDE`: unset, empty or `0` (the default) builds the
+/// AIR set before the rest's first table; `1` builds it beside the first
+/// KECCAK_RND tables. Anything else refuses the prove.
+fn parse_rest_airs_beside(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{REST_AIRS_BESIDE_ENV}={v}: 0 (the default: the AIR set before the rest's first \
+             table) or 1 (built beside the first KECCAK_RND tables)"
+        ))),
+    }
+}
+
 /// How the rest's layout bytes ([`BlockOptions::rest_layout_bytes`]) bound
 /// the rest, for the harnesses' `BLOCK REST LAYOUT CONFIG` line: waves of
 /// them where the rest is laid out in waves, and the streamed finish's gate
@@ -4605,6 +4635,16 @@ pub(crate) struct Deviations {
     /// order (`Some(false)`), instead of the default (`None`: first;
     /// [`keccak_rnd_first_or_default`]).
     pub keccak_rnd_first: Option<bool>,
+    /// The run's AIR set built on a thread of its own while the first
+    /// KECCAK_RND tables are laid out (`Some(true)`), or before the rest's
+    /// first table (`Some(false)`), instead of the knob
+    /// ([`rest_airs_beside`]).
+    pub rest_airs_beside: Option<bool>,
+    /// With the AIR set built beside them, each early KECCAK_RND table laid
+    /// out with the AIR named for the next table: an AIR the run's set does
+    /// not have at that place, which the prove must refuse.
+    #[cfg(test)]
+    pub rest_airs_beside_misnamed: bool,
     /// The hand-out's counting on a thread of its own (`Some(true)`) or on
     /// the accumulator's (`Some(false)`), instead of the default (`None`: a
     /// thread of its own; [`WindowedTraceBuilder::count_handout_on_thread`]).
@@ -6836,17 +6876,64 @@ fn lay_out_rest<'a>(
     })
 }
 
+/// The KECCAK_RND tables' own AIRs, for the streamed rest that lays them out
+/// while the run's set is built beside them ([`rest_airs_beside`]): built on
+/// first use as [`crate::block_airs`] builds that family, and checked against
+/// the run's set once it exists.
+#[derive(Clone, Copy)]
+struct EarlyAirs<'a> {
+    airs: &'a std::sync::OnceLock<Vec<crate::VmAir>>,
+    /// A test's fault: each AIR named for the next table.
+    misnamed: bool,
+}
+
+/// An AIR borrowed for `'a` (the run's set's, or a table's own).
+type AirRef<'a> = &'a dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
+
+/// KECCAK_RND's places in AIR order: its range among the chunked tables.
+fn keccak_rnd_range(counts: &TableCounts) -> Result<std::ops::Range<usize>, Error> {
+    chunked_table_ranges(counts)
+        .into_iter()
+        .find(|(name, ..)| *name == "KECCAK_RND")
+        .map(|(_, range, _)| range)
+        .ok_or_else(|| Error::Prover("no KECCAK_RND range among the chunked tables".into()))
+}
+
+/// Refuses an AIR a table was laid out with that is not the run's AIR at its
+/// place: its name, shape, constraint count and interactions.
+fn same_air(laid: AirRef<'_>, run: AirRef<'_>) -> Result<(), Error> {
+    if laid.name() != run.name()
+        || laid.trace_layout() != run.trace_layout()
+        || laid.num_transition_constraints() != run.num_transition_constraints()
+        || laid.bus_interactions() != run.bus_interactions()
+    {
+        return Err(Error::Prover(format!(
+            "a table laid out with {}, the run's AIR at its place is {}",
+            laid.name(),
+            run.name()
+        )));
+    }
+    Ok(())
+}
+
 /// The rest as the finish streams it ([`RestStream`]): each table laid out
 /// narrow as it comes (wide ones through [`table_of`]) and sent to the packer
 /// in AIR order (`sink`), every table checked against the run's AIRs built
 /// from the header ([`RestOrder`]). The prepared columns are left for after
 /// the packing, as on the pipelined path.
+///
+/// With `early` and KECCAK_RND handed on first, the run's AIR set is built on
+/// a thread of its own while the KECCAK_RND tables are laid out with their
+/// own AIRs ([`EarlyAirs`]) and sent on; the first table after them waits for
+/// the set, which then admits the early tables in their order and checks
+/// their AIRs against its own ([`same_air`]).
 #[allow(clippy::too_many_arguments)]
 fn lay_out_rest_streamed<'a>(
     stream: Box<RestStream>,
     program: &Elf,
     opts: &ProofOptions,
     run_airs: &'a std::sync::OnceLock<VmAirs>,
+    early: Option<EarlyAirs<'a>>,
     start: Instant,
     sink: Option<std::sync::mpsc::Sender<RestDone<'a>>>,
     ledger: Option<&memlog::Ledger>,
@@ -6875,31 +6962,148 @@ fn lay_out_rest_streamed<'a>(
         .iter()
         .filter(|c| c.is_private_input)
         .count();
-    let inputs = BlockAirInputs::new(
-        opts,
-        program,
-        header.cpu_heights.clone(),
-        &header.public_output_bytes,
-    )?;
-    let mut built = Ok(());
-    let airs = run_airs.get_or_init(|| {
-        let mut airs = block_airs(
-            program,
+    let build_airs = || -> Result<&'a VmAirs, Error> {
+        let inputs = BlockAirInputs::new(
             opts,
-            &header.page_configs,
-            &header.table_counts,
-            &inputs,
-            keccak_rnd,
-            memw_aligned,
-            registers,
-        );
-        airs.with_fused_memory(opts, fused);
-        if memory == crate::tables::fused_memory::MemoryFormat::Words {
-            built = airs.with_word_memory(opts, words, &header.page_configs);
+            program,
+            header.cpu_heights.clone(),
+            &header.public_output_bytes,
+        )?;
+        let mut built = Ok(());
+        let airs = run_airs.get_or_init(|| {
+            let mut airs = block_airs(
+                program,
+                opts,
+                &header.page_configs,
+                &header.table_counts,
+                &inputs,
+                keccak_rnd,
+                memw_aligned,
+                registers,
+            );
+            airs.with_fused_memory(opts, fused);
+            if memory == crate::tables::fused_memory::MemoryFormat::Words {
+                built = airs.with_word_memory(opts, words, &header.page_configs);
+            }
+            airs
+        });
+        built?;
+        Ok(airs)
+    };
+    let mut timed: Vec<(usize, f64)> = Vec::new();
+    let mut laid_at: Vec<(usize, f64)> = Vec::new();
+    let (mut narrow_tables, mut narrow_bytes) = (0usize, 0usize);
+    let (mut records_tables, mut records_bytes) = (0usize, 0usize);
+    let mut k = 0usize;
+    // One table laid out with `air` and sent to the packer.
+    let mut lay_one = |air: AirRef<'a>,
+                       position: usize,
+                       mut trace: TraceTable<F, E>,
+                       marks: &mut Vec<(&'static str, f64)>| {
+        if k == 0 {
+            marks.push(("rest first received", at()));
         }
-        airs
-    });
-    built?;
+        let t = Instant::now();
+        let shape = (
+            trace.main_table.width,
+            trace.main_table.height.trailing_zeros() as usize,
+        );
+        let rows = memlog::rows_bytes(&trace);
+        let laid = if let Some(records) = trace.records_main() {
+            // Never dropped, so never one phase B builds again.
+            records_tables += 1;
+            records_bytes += records.bytes();
+            table_of_records(air, &mut trace, shape)
+        } else if let Some(packed) = trace.narrow_main() {
+            narrow_tables += 1;
+            narrow_bytes += packed.data().len();
+            // A table phase B can build again from the kept lists (N3): its
+            // place among the rest's, before the packer places it.
+            if let (Some(recorder), Some((family, j))) = (
+                recorder,
+                crate::tables::trace_builder::RegenFamily::of_air(air.name()),
+            ) {
+                recorder.rest_tag(k, family, j);
+            }
+            table_of_narrow(air, &mut trace, shape)
+        } else {
+            table_of(air, &mut trace, shape, true)
+        };
+        let secs = t.elapsed().as_secs_f64();
+        timed.push((position, secs));
+        laid_at.push((position, at()));
+        if let (Some(ledger), Ok(table)) = (ledger, &laid) {
+            ledger.rest.fetch_sub(rows, Relaxed);
+            ledger
+                .rest_laid
+                .fetch_add(memlog::table_bytes(table), Relaxed);
+        }
+        // A packer that stopped has its own error to report.
+        let _ = sink.send((k, secs, laid.map(|table| (position, shape, table))));
+        k += 1;
+    };
+    let mut tables = tables.into_iter();
+    // The tables laid out before the AIR set was there, by position and
+    // width (`None`: not built here), with the AIR each was laid out with;
+    // the first table after them, held for the set.
+    let mut before: Vec<(usize, Option<usize>, Option<AirRef<'a>>)> = Vec::new();
+    let mut held = None;
+    let airs = match early.filter(|_| header.keccak_rnd_first) {
+        Some(early) => {
+            let range = keccak_rnd_range(&header.table_counts)?;
+            let own = early.airs.get_or_init(|| {
+                (0..range.len())
+                    .map(|i| {
+                        let i = if early.misnamed { i + 1 } else { i };
+                        Box::new(
+                            crate::test_utils::create_keccak_rnd_air_for(opts, keccak_rnd)
+                                .with_name(&format!("KECCAK_RND[{i}]")),
+                        ) as crate::VmAir
+                    })
+                    .collect()
+            });
+            marks.push(("rest airs beside", at()));
+            let (airs, ready) = std::thread::scope(|scope| -> Result<_, Error> {
+                let build = std::thread::Builder::new()
+                    .name("rest-airs".into())
+                    .spawn_scoped(scope, build_airs)
+                    .map_err(|e| Error::Prover(format!("the AIR set's thread: {e}")))?;
+                // The early tables laid out while the set was still building.
+                let mut ready = 0usize;
+                while before.len() < range.len() {
+                    let Some(emitted) = tables.next() else {
+                        break;
+                    };
+                    let crate::tables::trace_builder::Emitted { position, table } = emitted;
+                    if !range.contains(&position) {
+                        held = Some(crate::tables::trace_builder::Emitted { position, table });
+                        break;
+                    }
+                    let Some(trace) = table else {
+                        before.push((position, None, None));
+                        continue;
+                    };
+                    let air: AirRef<'a> = own[position - range.start].as_ref();
+                    before.push((position, Some(trace.main_table.width), Some(air)));
+                    if !build.is_finished() {
+                        ready += 1;
+                    }
+                    lay_one(air, position, trace, &mut marks);
+                }
+                let airs = build
+                    .join()
+                    .map_err(|_| Error::Prover("the AIR set's thread panicked".into()))??;
+                Ok((airs, ready))
+            })?;
+            eprintln!(
+                "BLOCK REST AIRS: beside · {} KECCAK_RND table(s) laid out before the rest's \
+                 next table, {ready} of them while the AIR set was building",
+                before.len()
+            );
+            airs
+        }
+        None => build_airs()?,
+    };
     marks.push(("airs", at()));
     let refs = airs.air_refs();
     let first = if header.keccak_rnd_first {
@@ -6929,57 +7133,24 @@ fn lay_out_rest_streamed<'a>(
                 .join(",")
         );
     }
-    let mut timed: Vec<(usize, f64)> = Vec::new();
-    let mut laid_at: Vec<(usize, f64)> = Vec::new();
-    let (mut narrow_tables, mut narrow_bytes) = (0usize, 0usize);
-    let (mut records_tables, mut records_bytes) = (0usize, 0usize);
-    let mut k = 0usize;
-    for crate::tables::trace_builder::Emitted { position, table } in tables {
+    // The tables laid out before the set: admitted in their order, each AIR
+    // the run's own.
+    for &(position, width, air) in &before {
+        order.admit(position, width)?;
+        if let Some(air) = air {
+            let run = refs
+                .get(position)
+                .ok_or_else(|| Error::Prover(format!("table {position} is past the AIR set")))?;
+            same_air(air, *run)?;
+        }
+    }
+    for crate::tables::trace_builder::Emitted { position, table } in held.into_iter().chain(tables)
+    {
         order.admit(position, table.as_ref().map(|t| t.main_table.width))?;
-        let Some(mut trace) = table else {
+        let Some(trace) = table else {
             continue;
         };
-        if k == 0 {
-            marks.push(("rest first received", at()));
-        }
-        let t = Instant::now();
-        let shape = (
-            trace.main_table.width,
-            trace.main_table.height.trailing_zeros() as usize,
-        );
-        let rows = memlog::rows_bytes(&trace);
-        let laid = if let Some(records) = trace.records_main() {
-            // Never dropped, so never one phase B builds again.
-            records_tables += 1;
-            records_bytes += records.bytes();
-            table_of_records(refs[position], &mut trace, shape)
-        } else if let Some(packed) = trace.narrow_main() {
-            narrow_tables += 1;
-            narrow_bytes += packed.data().len();
-            // A table phase B can build again from the kept lists (N3): its
-            // place among the rest's, before the packer places it.
-            if let (Some(recorder), Some((family, j))) = (
-                recorder,
-                crate::tables::trace_builder::RegenFamily::of_air(refs[position].name()),
-            ) {
-                recorder.rest_tag(k, family, j);
-            }
-            table_of_narrow(refs[position], &mut trace, shape)
-        } else {
-            table_of(refs[position], &mut trace, shape, true)
-        };
-        let secs = t.elapsed().as_secs_f64();
-        timed.push((position, secs));
-        laid_at.push((position, at()));
-        if let (Some(ledger), Ok(table)) = (ledger, &laid) {
-            ledger.rest.fetch_sub(rows, Relaxed);
-            ledger
-                .rest_laid
-                .fetch_add(memlog::table_bytes(table), Relaxed);
-        }
-        // A packer that stopped has its own error to report.
-        let _ = sink.send((k, secs, laid.map(|table| (position, shape, table))));
-        k += 1;
+        lay_one(refs[position], position, trace, &mut marks);
     }
     order.finish()?;
     marks.push(("rest laid out", at()));
@@ -7245,6 +7416,9 @@ fn prove_streamed(
     // its frontier, so the regenerator does not rebuild beside the finish.
     let early_paced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
+    // The KECCAK_RND tables' AIRs the streamed rest lays them out with while
+    // the run's set is built beside them ([`rest_airs_beside`]).
+    let rest_keccak_airs: std::sync::OnceLock<Vec<crate::VmAir>> = std::sync::OnceLock::new();
     // Phase A's commits read the blowup, the fold schedule and the format of
     // the config and nothing else; the full config (its query count reads every
     // shape) is built when the shapes are known, and must agree on those.
@@ -7349,6 +7523,19 @@ fn prove_streamed(
         let walkers = block_walkers()?;
         let bitwise_last = deviations.rest_bitwise_last;
         let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
+        let airs_beside = rest_airs_beside(deviations.rest_airs_beside)?;
+        #[cfg(test)]
+        let misnamed = deviations.rest_airs_beside_misnamed;
+        #[cfg(not(test))]
+        let misnamed = false;
+        eprintln!(
+            "★ BLOCK REST AIRS: {} ({REST_AIRS_BESIDE_ENV})",
+            if airs_beside {
+                "built beside the first KECCAK_RND tables"
+            } else {
+                "built before the rest's first table (the default)"
+            }
+        );
         let from_tables = bitwise_from_tables_or_default(deviations.bitwise_from_tables);
         let mut card_fill = match (
             deviations.card_fill,
@@ -8060,6 +8247,7 @@ fn prove_streamed(
             let (gtx, grx) = std::sync::mpsc::sync_channel::<Vec<CommittedTable<'_, F, E>>>(1);
             let stream_airs = &stream_airs;
             let run_airs = &run_airs;
+            let rest_keccak_airs = &rest_keccak_airs;
             let layout = scope.spawn(move || -> Result<Laid, Error> {
                 if let Some(ledger) = ledger {
                     ledger.thread("layout");
@@ -8101,6 +8289,10 @@ fn prove_streamed(
                         program,
                         opts,
                         run_airs,
+                        airs_beside.then_some(EarlyAirs {
+                            airs: rest_keccak_airs,
+                            misnamed,
+                        }),
                         start,
                         sink,
                         ledger,
@@ -8319,9 +8511,15 @@ fn prove_streamed(
         (stamps.execute, stamps.executor) =
             executed.map_err(|_| Error::Prover("the block's executor panicked".into()))??;
         // A thread's error names the cause; a commit that ran out of groups only
-        // says that it did.
-        let (windows_done, finished, streamed, window_stamps, finish_marks, rest_regen) =
-            built.map_err(|_| Error::Prover("the block's builder panicked".into()))??;
+        // says that it did. A builder that stopped because the layout thread
+        // stopped taking its tables names the layout's error, when it has one.
+        let built = built.map_err(|_| Error::Prover("the block's builder panicked".into()))?;
+        if let (Err(Error::Prover(message)), Ok(Err(cause))) = (&built, &laid)
+            && message.starts_with("the layout thread stopped")
+        {
+            return Err(Error::Prover(format!("{message}: {cause}")));
+        }
+        let (windows_done, finished, streamed, window_stamps, finish_marks, rest_regen) = built?;
         stamps.windows = window_stamps;
         stamps.build_marks = finish_marks;
         stamps.producer = waits.stamps();
@@ -11926,5 +12124,320 @@ mod records_layout_tests {
                 "KECCAK_RC, {wrong} declared: {refused:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rest_airs_beside_tests {
+    use super::{AirRef, keccak_rnd_range, parse_rest_airs_beside, same_air};
+    use crate::tables::keccak_rnd::KeccakRndForm;
+    use crate::test_utils::create_keccak_rnd_air_for;
+    use stark::proof::options::ProofOptions;
+
+    /// The knob: off unset, empty or `0`; on at `1`; any other word refuses.
+    #[test]
+    fn the_rest_airs_knob_is_off_by_default_and_refuses_other_words() {
+        for off in [None, Some(""), Some("0"), Some(" 0 ")] {
+            assert!(
+                !parse_rest_airs_beside(off).expect("a word it takes"),
+                "{off:?}"
+            );
+        }
+        assert!(parse_rest_airs_beside(Some("1")).expect("on"));
+        for bad in ["2", "on", "true", "yes"] {
+            assert!(parse_rest_airs_beside(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// ★ The early KECCAK_RND AIRs, built as the streamed rest builds them,
+    /// are the run's set's at KECCAK_RND's places under either form, and
+    /// [`same_air`] refuses another name, another form, or another table's
+    /// AIR.
+    #[test]
+    fn the_early_keccak_rnd_airs_are_the_run_sets() {
+        let opts = ProofOptions::default_test_options();
+        let elf = crate::test_utils::asm_elf_bytes("test_keccak_multi");
+        let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+        let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+            &program,
+            &[],
+            0,
+            1 << 20,
+        )
+        .expect("pages");
+        let counts = crate::TableCounts {
+            cpu: 1,
+            lt: 1,
+            memw: 1,
+            memw_aligned: 1,
+            load: 1,
+            mul: 1,
+            dvrm: 1,
+            shift: 1,
+            branch: 1,
+            memw_register: 1,
+            eq: 1,
+            bytewise: 1,
+            store: 1,
+            cpu32: 1,
+            keccak: 1,
+            keccak_rnd: 3,
+            ecsm: 1,
+            ecdas: 1,
+            hint: 1,
+            copy: 2,
+            blake3: 1,
+            is_wh: 1,
+            ecrec: 1,
+        };
+        let inputs =
+            crate::BlockAirInputs::new(&opts, &program, vec![1 << 4], &[]).expect("the AIR inputs");
+        let range = keccak_rnd_range(&counts).expect("KECCAK_RND's range");
+        assert_eq!(range.len(), counts.keccak_rnd);
+        for form in [KeccakRndForm::Lean, KeccakRndForm::Full] {
+            let airs = crate::block_airs(
+                &program,
+                &opts,
+                &pages,
+                &counts,
+                &inputs,
+                form,
+                crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+                crate::tables::register::RegisterFormat::InRow,
+            );
+            let refs = airs.air_refs();
+            let early = |i: usize, form: KeccakRndForm| {
+                Box::new(
+                    create_keccak_rnd_air_for(&opts, form).with_name(&format!("KECCAK_RND[{i}]")),
+                ) as crate::VmAir
+            };
+            for (i, position) in range.clone().enumerate() {
+                let own = early(i, form);
+                same_air(own.as_ref(), refs[position])
+                    .unwrap_or_else(|e| panic!("{form:?} KECCAK_RND[{i}]: {e:?}"));
+                // Named for another table, or of the other form: refused.
+                let misnamed = early(i + 1, form);
+                assert!(same_air(misnamed.as_ref(), refs[position]).is_err());
+                let other = match form {
+                    KeccakRndForm::Lean => KeccakRndForm::Full,
+                    KeccakRndForm::Full => KeccakRndForm::Lean,
+                };
+                assert!(
+                    same_air(early(i, other).as_ref(), refs[position]).is_err(),
+                    "{form:?}: the other form's AIR at {position}"
+                );
+            }
+            // Another table's AIR at a KECCAK_RND place.
+            let first: AirRef<'_> = refs[0];
+            assert!(same_air(first, refs[range.start]).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod rest_airs_probe {
+    use super::StreamAirs;
+    use crate::tables::gpack::TraceForm;
+    use crate::tables::trace_builder::StreamTable;
+    use std::time::Instant;
+
+    /// An instrument, never a gate: the run's AIR set for a large block's
+    /// table counts, built as the streamed rest builds it (the streamed
+    /// chunks' AIRs first), timed step by step; then each family's
+    /// constructors alone under options no AIR was built with yet.
+    /// `PROBE_ELF` names the guest.
+    #[test]
+    #[ignore = "an instrument: PROBE_ELF names the guest"]
+    fn rest_airs_build_seconds() {
+        use crate::tables::fused_memory::MemoryFormat;
+        use crate::tables::keccak_rnd::KeccakRndForm;
+        use crate::tables::memw_aligned::MemwAlignedOrder;
+        use crate::tables::register::RegisterFormat;
+        let path = std::env::var("PROBE_ELF").expect("PROBE_ELF");
+        let bytes = std::fs::read(path).expect("the guest");
+        let program = executor::elf::Elf::load(&bytes).expect("the ELF loads");
+        let opts = crate::lfm::proof::block_base_options();
+        let cpu_rows = 1usize << 21;
+        let mut heights = vec![cpu_rows; 116];
+        heights.push(1 << 20);
+        let mut pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+            &program,
+            &[],
+            0,
+            1 << 20,
+        )
+        .expect("pages");
+        let mut base = 0x4000_0000u64;
+        while pages.len() < 351 {
+            pages.push(crate::tables::page::PageConfig::zero_init(base));
+            base += 1 << 18;
+        }
+        let counts = crate::TableCounts {
+            cpu: heights.len(),
+            lt: 7,
+            memw: 0,
+            memw_aligned: 0,
+            load: 0,
+            mul: 2,
+            dvrm: 1,
+            shift: 9,
+            branch: 11,
+            memw_register: 2,
+            eq: 9,
+            bytewise: 7,
+            store: 0,
+            cpu32: 1,
+            keccak: 2,
+            keccak_rnd: 66,
+            ecsm: 0,
+            hint: 0,
+            ecdas: 4,
+            copy: 8,
+            blake3: 0,
+            is_wh: 0,
+            ecrec: 1,
+        };
+        let words = [23, 17, 7, 2, 3, 2, 9];
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+        // The streamed chunks' AIRs, as phase A builds them before the rest.
+        let t = Instant::now();
+        let stream = StreamAirs::new(
+            &opts,
+            TraceForm::Narrow,
+            cpu_rows,
+            KeccakRndForm::Lean,
+            MemwAlignedOrder::Limbs,
+            RegisterFormat::InRow,
+        );
+        for i in 0..116 {
+            stream
+                .of_chunk(StreamTable::Cpu, i, cpu_rows)
+                .expect("a CPU chunk's AIR");
+        }
+        eprintln!("PROBE stream AIRs {:.1} ms", ms(t));
+        // The rest's AIR set, step by step as `block_airs` and the streamed
+        // rest build it.
+        let t0 = Instant::now();
+        let t = Instant::now();
+        let inputs = crate::BlockAirInputs::new(&opts, &program, heights.clone(), &[])
+            .expect("the AIR inputs");
+        let inputs_ms = ms(t);
+        let t = Instant::now();
+        let mut airs = crate::block_airs(
+            &program,
+            &opts,
+            &pages,
+            &counts,
+            &inputs,
+            KeccakRndForm::Lean,
+            MemwAlignedOrder::Limbs,
+            RegisterFormat::InRow,
+        );
+        let block_ms = ms(t);
+        let t = Instant::now();
+        airs.with_fused_memory(&opts, [0, 0]);
+        airs.with_word_memory(&opts, words, &pages)
+            .expect("the word tables");
+        let words_ms = ms(t);
+        let t = Instant::now();
+        let refs = airs.air_refs();
+        let refs_ms = ms(t);
+        eprintln!(
+            "PROBE rest AIR set {:.1} ms: inputs {inputs_ms:.1} · block_airs {block_ms:.1} · \
+             words {words_ms:.1} · refs {refs_ms:.1} · {} AIRs",
+            ms(t0),
+            refs.len()
+        );
+        // Each family alone, under options whose cache keys are all new.
+        let mut cold = opts.clone();
+        cold.grinding_factor = cold.grinding_factor.wrapping_add(1);
+        let o = &cold;
+        let full = crate::tables::cpu::TIMESTAMP_STRIDE * cpu_rows as u64;
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            let t = Instant::now();
+            f();
+            eprintln!("PROBE cold {label} {:.1} ms", ms(t));
+        };
+        use crate::test_utils::*;
+        time("inputs (register files)", &mut || {
+            let _ = crate::BlockAirInputs::new(o, &program, heights.clone(), &[]);
+        });
+        time("decode instructions", &mut || {
+            let _ = crate::tables::decode::instructions_from_elf(&program);
+        });
+        time("zero page commitment", &mut || {
+            let _ = crate::tables::page::zero_init_preprocessed_commitment(o);
+        });
+        time("117 CPU (split)", &mut || {
+            for i in 0..117u64 {
+                let _ = create_cpu_air(o, i * full);
+            }
+        });
+        time("117 CPU (in-row)", &mut || {
+            for i in 0..117u64 {
+                let _ = create_cpu_air_inrow(o, i * full);
+            }
+        });
+        time("117 CPU (in-row) again", &mut || {
+            for i in 0..117u64 {
+                let _ = create_cpu_air_inrow(o, i * full);
+            }
+        });
+        time("66 KECCAK_RND full", &mut || {
+            for _ in 0..66 {
+                let _ = create_keccak_rnd_air_for(o, KeccakRndForm::Full);
+            }
+        });
+        time("66 KECCAK_RND lean", &mut || {
+            for _ in 0..66 {
+                let _ = create_keccak_rnd_air_for(o, KeccakRndForm::Lean);
+            }
+        });
+        time("351 PAGE", &mut || {
+            for p in &pages {
+                let _ = create_page_air(o, p.page_base);
+            }
+        });
+        time("351 PAGE_W", &mut || {
+            for p in &pages {
+                let _ = create_page_w_air(o, p).expect("PAGE_W");
+            }
+        });
+        time("351 PAGE_W again", &mut || {
+            for p in &pages {
+                let _ = create_page_w_air(o, p).expect("PAGE_W");
+            }
+        });
+        time("8 COPY + 8 COPY_W", &mut || {
+            for _ in 0..8 {
+                let _ = create_copy_air(o);
+                let _ = create_copy_w_air(o);
+            }
+        });
+        time("2 KECCAK + 2 KECCAK_W", &mut || {
+            for _ in 0..2 {
+                let _ = create_keccak_air(o);
+                let _ = create_keccak_w_air(o);
+            }
+        });
+        time("4 ECDAS + ECREC + ECREC_W", &mut || {
+            for _ in 0..4 {
+                let _ = create_ecdas_air(o);
+            }
+            let _ = create_ecrec_air(o);
+            let _ = create_ecrec_w_air(o);
+        });
+        time("the word families (64)", &mut || {
+            for _ in 0..9 {
+                let _ = create_mem_load8_air(o);
+                let _ = create_mem_store8_air(o);
+                let _ = create_mem_loadw_air(o);
+                let _ = create_mem_storew_air(o);
+                let _ = create_mem_load2w_air(o);
+                let _ = create_mem_store2w_air(o);
+                let _ = create_memw_w_air(o);
+            }
+        });
+        let _ = MemoryFormat::Words;
     }
 }
