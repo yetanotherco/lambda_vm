@@ -709,15 +709,22 @@ fn rta_one_run(
         l1_prove_from - t.base
     );
     let (lean, lean_wait) = t.lean_beside.unwrap_or_default();
+    // Level 1's thread ends once its execution and the lean fill beside it
+    // have: what of that is after the base is in series.
+    let thread_tail = t
+        .levels
+        .first()
+        .map_or(0.0, |l| (l.executed + lean_wait - t.base).max(0.0));
     println!(
         "RTA LEAN BESIDE: {} · waves {} · compressions {} · fed {:.3}s · wait after the execution \
-         {:.3}s · prefilled {} · fill chips {:.3}s · fill lean {:.3}s (tables {:.3}s · mux and cap \
-         {:.3}s)",
+         {:.3}s · thread tail after the base {:.3}s · prefilled {} · fill chips {:.3}s · fill lean \
+         {:.3}s (tables {:.3}s · mux and cap {:.3}s)",
         if t.lean_beside.is_some() { "on" } else { "off" },
         lean.waves,
         lean.compressions,
         lean.secs,
         lean_wait,
+        thread_tail,
         t.lean_prefilled,
         t.fill_split.0,
         t.fill_split.1,
