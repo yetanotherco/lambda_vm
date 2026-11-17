@@ -2949,6 +2949,7 @@ where
     check_leaf_order::<H>(&config.format)?;
     check_round0_trees::<H>(&config.format)?;
     check_round_form(config)?;
+    crate::whir_split::open_trace_begin();
     check_round_form_union(config, num_vars)?;
     let round0: &[&CodewordCommitment<F, H>] = match &current {
         Current::Base(held) | Current::Joint(held) => std::slice::from_ref(held),
@@ -2993,6 +2994,7 @@ where
     let mut final_poly: Option<Mle<E>> = None;
     let mut tail_alphas: Vec<FieldElement<E>> = Vec::new();
 
+    crate::whir_split::open_trace_lap("setup", 0);
     for (r, &k) in schedule.iter().enumerate() {
         // The loop's OWN wall, so the six are measured against the thing that
         // contains them rather than against `open_groups` two layers up. What
@@ -3014,10 +3016,12 @@ where
             ..RoundNonces::default()
         };
         crate::whir_split::add(&crate::whir_split::GRIND, __wc_g);
+        crate::whir_split::open_trace_lap("grind", r);
 
         let __wc_sc = crate::whir_split::mark();
         let (sumcheck_rounds, challenges) = factors.rounds(k, transcript)?;
         crate::whir_split::add(&crate::whir_split::SUMCHECK, __wc_sc);
+        crate::whir_split::open_trace_lap("sumcheck", r);
         // A grouped round 0 also bound its index: the challenges past the
         // first `k` are `ρ`, and only the first `k` fold a block.
         let (alphas, rho) = challenges.split_at(k.min(challenges.len()));
@@ -3079,6 +3083,7 @@ where
                     },
                 }];
                 crate::whir_split::add(&crate::whir_split::QUERIES, __wc_q);
+                crate::whir_split::open_trace_lap("final", r);
                 final_poly = Some(poly);
                 rounds.push(ChainRound {
                     sumcheck: sumcheck_rounds,
@@ -3232,6 +3237,7 @@ where
             (folded, folded_domain, successor_domain)
         };
         crate::whir_split::add(&crate::whir_split::FOLD, __wc_fold);
+        crate::whir_split::open_trace_lap("successor", r);
 
         // The successor is committed before the queries are drawn, so it cannot
         // be chosen to match them.
@@ -3249,6 +3255,7 @@ where
             }
         };
         crate::whir_split::add(&crate::whir_split::COMMIT_FOLDED, __wc_cf);
+        crate::whir_split::open_trace_lap("tree", r);
         let next_root = next.as_ref().map(|c| c.root());
 
         // Out of domain: a value the queries cannot vouch for, so answering it
@@ -3282,6 +3289,7 @@ where
             let gamma: FieldElement<E> = transcript.sample_field_element();
             factors.add_scaled_eq(&point, &gamma)?;
             crate::whir_split::add(&crate::whir_split::OOD, __wc_ood_b);
+            crate::whir_split::open_trace_lap("ood", r);
             Some(y0)
         } else {
             None
@@ -3295,6 +3303,7 @@ where
             RoundFormFault::SpoilRoundFormQueryNonces,
         )?;
         crate::whir_split::add(&crate::whir_split::GRIND, __wc_g3);
+        crate::whir_split::open_trace_lap("grind", r);
         let round_config = RoundConfig {
             num_queries: queries[r],
             log_folding: k,
@@ -3317,6 +3326,7 @@ where
                 &round_config,
                 round_caps,
                 transcript,
+                r,
             )?
         } else {
             match (&current, &next) {
@@ -3363,6 +3373,7 @@ where
             }
         };
         crate::whir_split::add(&crate::whir_split::QUERIES, __wc_q);
+        crate::whir_split::open_trace_lap("openings", r);
 
         rounds.push(ChainRound {
             sumcheck: sumcheck_rounds,
@@ -3382,6 +3393,11 @@ where
     if let Some(poly) = &final_poly {
         final_value = poly.evaluate(&tail_alphas)?;
     }
+    crate::whir_split::open_trace_end(
+        num_vars,
+        schedule.len(),
+        if whir { "round form" } else { "fri" },
+    );
 
     Ok(ChainProof {
         rounds,
@@ -3408,6 +3424,7 @@ fn round_form_openings<F, E, T, H>(
     config: &RoundConfig,
     caps: RoundCaps,
     transcript: &mut T,
+    round: usize,
 ) -> Result<RoundOpenings<F, E>, Error>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -3445,11 +3462,13 @@ where
             next: Vec::new(),
         }),
     };
+    crate::whir_split::open_trace_lap("openings", round);
     let gamma: FieldElement<E> = transcript.sample_field_element();
     if !round_form_fault(RoundFormFault::DropShiftClaims) {
         let points = shift_points::<F, E>(folded_domain, &positions, factors.num_vars());
         factors.add_shift_claims(&points, &shift_scales(&gamma, positions.len()))?;
     }
+    crate::whir_split::open_trace_lap("claims", round);
     Ok(openings)
 }
 
@@ -4878,6 +4897,121 @@ mod tests {
                 messages(&host_next),
                 "n {n}: the group after the claims"
             );
+        }
+    }
+
+    /// ★ CARD PARITY OF THE ROW-TILED CLAIM KERNEL (`LAMBDA_VM_CLAIMS_TILED`):
+    /// the same factors on the card and on the host, after the same group of
+    /// rounds, gain the same shift claims (repeats among them; a weight whose
+    /// high half is shorter than a tile among the shapes): the card's weight
+    /// through the row-tiled base-half kernel is the host's value for value,
+    /// and the next group's sumcheck messages agree. THE MUTANT: the tiled
+    /// path handing its kernel one point fewer gives another weight. Box tier.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a card; box tier"]
+    fn the_card_tiled_shift_claims_weight_is_the_hosts() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+        type X = FieldElement<Ext3>;
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::gpu::force_claims_tiled(None);
+                crate::gpu::force_claims_tiled_drops_a_point(false);
+            }
+        }
+        let _restore = Restore;
+        crate::gpu::force_claims_tiled(Some(true));
+        let word = |i: u64, k: u64| {
+            FE::from(
+                i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(k.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+                    >> 1,
+            )
+        };
+        for mutant in [false, true] {
+            crate::gpu::force_claims_tiled_drops_a_point(mutant);
+            for (n, k, q) in [
+                (14usize, 4usize, 57usize),
+                (15, 6, 114),
+                (13, 4, 3),
+                (17, 4, 229),
+                (13, 10, 5),
+            ] {
+                let message =
+                    Mle::new((0..1u64 << n).map(|i| word(i, 0)).collect()).expect("message");
+                let weight = Mle::new(
+                    (0..1u64 << n)
+                        .map(|i| X::new([word(i, 1), word(i, 2), word(i, 3)]))
+                        .collect(),
+                )
+                .expect("weight");
+                let mut card = Factors::<F, Ext3>::new(&message, weight.clone()).expect("factors");
+                assert!(
+                    matches!(card, Factors::Device(_)),
+                    "no card took the opening: this test needs one"
+                );
+                let mut host = Factors::<F, Ext3>::Host {
+                    weight,
+                    message: Mle::new(
+                        message
+                            .evals()
+                            .iter()
+                            .map(|v| v.to_extension::<Ext3>())
+                            .collect(),
+                    )
+                    .expect("lifted"),
+                    field: core::marker::PhantomData,
+                };
+                let mut tc = DefaultTranscript::<Ext3>::new(b"card-tiled-claims");
+                let mut th = DefaultTranscript::<Ext3>::new(b"card-tiled-claims");
+                card.rounds(k, &mut tc).expect("card rounds");
+                host.rounds(k, &mut th).expect("host rounds");
+                let folded = Domain::<F>::new(n + 1 - k).expect("domain");
+                let mut positions: Vec<usize> =
+                    (0..q).map(|j| (j * 7919 + 13) % folded.size()).collect();
+                if q > 3 {
+                    positions[3] = positions[1];
+                }
+                let points = shift_points::<F, Ext3>(&folded, &positions, n - k);
+                let gamma = X::new([word(5, 9), word(6, 9), word(7, 9)]);
+                let scales = shift_scales(&gamma, q);
+                let before = crate::gpu::shift_claim_tiled_batches();
+                card.add_shift_claims(&points, &scales)
+                    .expect("card claims");
+                host.add_shift_claims(&points, &scales)
+                    .expect("host claims");
+                assert_eq!(
+                    crate::gpu::shift_claim_tiled_batches(),
+                    before + 1,
+                    "n {n}: the row-tiled kernel took the batch"
+                );
+                let Factors::Device(device) = &mut card else {
+                    unreachable!()
+                };
+                let card_weight = device.weight_to_host::<Ext3>().expect("read back");
+                let Factors::Host { weight, .. } = &host else {
+                    unreachable!()
+                };
+                let equal = card_weight.len() == weight.len()
+                    && card_weight.iter().zip(weight.evals()).all(|(c, h)| c == h);
+                if mutant {
+                    assert!(!equal, "n {n}, q {q}: the mutant moves the weight");
+                    continue;
+                }
+                assert!(equal, "n {n}, q {q}: the tiled weight is the host's");
+                let rest = (n - k).min(2);
+                let messages = |rounds: &[SumcheckRoundProof<Ext3>]| -> Vec<X> {
+                    rounds.iter().flat_map(|r| r.evaluations.clone()).collect()
+                };
+                let (card_next, _) = card.rounds(rest, &mut tc).expect("card rounds");
+                let (host_next, _) = host.rounds(rest, &mut th).expect("host rounds");
+                assert_eq!(
+                    messages(&card_next),
+                    messages(&host_next),
+                    "n {n}: after the claims"
+                );
+            }
         }
     }
 
