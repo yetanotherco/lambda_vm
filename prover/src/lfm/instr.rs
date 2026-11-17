@@ -253,6 +253,18 @@ pub struct B3lOperands {
     /// When set, the row ALSO writes the byte-reversed digest as two words —
     /// the transcript's `sample()`. Free on the bus.
     pub rev: Option<B3lReversed>,
+    /// When set, the row ALSO writes the compression's extended output, the
+    /// second 32 of its 64 output bytes (`out[8..16]`, each `v[i + 8] ⊕ h[i]`),
+    /// as two words of `u32` lanes: a 64-byte transcript squeeze's last four
+    /// candidates.
+    pub ext: Option<B3lExtended>,
+}
+
+/// The extended-output words of a [`B3lOperands`] row.
+#[derive(Debug, Clone)]
+pub struct B3lExtended {
+    pub outs: [Addr; layout::b3l::DIGEST_WORDS],
+    pub mults: [u64; layout::b3l::DIGEST_WORDS],
 }
 
 /// The reversed-digest outputs of a [`B3lOperands`] row.
@@ -507,6 +519,9 @@ impl Instr {
                 out.extend_from_slice(&k.outs);
                 if let Some(rev) = &k.rev {
                     out.extend_from_slice(&rev.outs);
+                }
+                if let Some(ext) = &k.ext {
+                    out.extend_from_slice(&ext.outs);
                 }
             }
             Instr::Public { .. } => {}

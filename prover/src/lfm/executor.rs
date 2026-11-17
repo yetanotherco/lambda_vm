@@ -714,7 +714,7 @@ fn hash16_compute(
 fn b3l_compute(
     memory: &WriteOnceMemory,
     op: &super::instr::B3lOperands,
-) -> Result<(B3lValues, [u32; 8]), LfmExecError> {
+) -> Result<(B3lValues, [u32; 16]), LfmExecError> {
     use super::instr::{B3lBlock, B3lCv};
     let u32_word = |cell: Addr| -> Result<[u32; 4], LfmExecError> {
         let w = memory.read(cell)?;
@@ -749,19 +749,27 @@ fn b3l_compute(
         }
     };
     let values = B3lValues { h, block };
-    let digest = values.digest(op.block_len, op.flags);
-    Ok((values, digest))
+    let out = values.output(op.block_len, op.flags);
+    Ok((values, out))
 }
 
-/// A lean BLAKE3 compression's writes: the digest's two words, and the
-/// reversed digest's when the row has them.
+/// A lean BLAKE3 compression's writes from its 16 output words: the digest's
+/// two words, the reversed digest's when the row has them, and the extended
+/// output's (`out[8..16]`) when it has those.
 fn b3l_apply(
     memory: &mut WriteOnceMemory,
     op: &super::instr::B3lOperands,
-    digest: &[u32; 8],
+    out: &[u32; 16],
 ) -> Result<(), LfmExecError> {
+    let digest: [u32; 8] = core::array::from_fn(|i| out[i]);
+    let digest = &digest;
     for (cell, word) in op.outs.iter().zip(super::b3l::digest_words(digest)) {
         memory.write(*cell, word)?;
+    }
+    if let Some(ext) = &op.ext {
+        for (cell, word) in ext.outs.iter().zip(super::b3l::extended_words(out)) {
+            memory.write(*cell, word)?;
+        }
     }
     if let Some(rev) = &op.rev {
         for (cell, word) in rev
@@ -2195,8 +2203,8 @@ fn run_levels(
 enum HashOut {
     Narrow(HashRow),
     Wide(Box<Hash16Row>),
-    /// A lean BLAKE3 compression's values and digest.
-    Lean(B3lValues, [u32; 8]),
+    /// A lean BLAKE3 compression's values and its 16 output words.
+    Lean(B3lValues, [u32; 16]),
 }
 
 /// One hash instruction's read-only half, dispatched from a program index.

@@ -168,6 +168,10 @@ pub struct LfmBuilder {
     /// `LFM_BLAKE3`'s. Off by default: every program today emits what it
     /// emitted. See [`Self::with_b3_lean`].
     b3_lean: bool,
+    /// Whether a [`WrapHash::Blake3`] program replays a transcript whose
+    /// squeezes hand out 64 bytes (`Blake3StdSqueeze64TranscriptHash`). Off by
+    /// default. See [`Self::with_b3_squeeze64`].
+    b3_squeeze64: bool,
     /// Cap tables emitted so far ([`Self::cap_table`]): the next one's tag.
     cap_tables: u32,
 }
@@ -208,6 +212,27 @@ impl LfmBuilder {
         );
         self.b3_lean = lean;
         self
+    }
+
+    /// Replay a [`WrapHash::Blake3`] program's byte transcript with 64-byte
+    /// squeezes: each squeeze's compression also writes its extended output
+    /// (`out[8..16]`), and a squeeze hands out eight candidates before the
+    /// next, as `Blake3StdSqueeze64TranscriptHash` does. The base's format
+    /// names which transcript it ran, so this is program shape, chosen before
+    /// emission like the wrap hash.
+    pub fn with_b3_squeeze64(mut self, squeeze64: bool) -> Self {
+        assert!(
+            self.instrs.is_empty(),
+            "the transcript's squeeze width is program shape and must be chosen before emission"
+        );
+        self.b3_squeeze64 = squeeze64;
+        self
+    }
+
+    /// Whether this program's byte transcript squeezes 64 bytes: a
+    /// [`WrapHash::Blake3`] program built [`Self::with_b3_squeeze64`].
+    pub fn b3_squeeze64(&self) -> bool {
+        self.b3_squeeze64 && self.wrap_hash == WrapHash::Blake3
     }
 
     /// Whether this program's BLAKE3 compressions are the lean tables' rows:
@@ -751,7 +776,7 @@ impl LfmBuilder {
         block_len: u8,
         flags: u8,
     ) -> [Cell; layout::b3l::DIGEST_WORDS] {
-        self.emit_b3l(cv, block, block_len, flags, false).0
+        self.emit_b3l(cv, block, block_len, flags, false, false).0
     }
 
     /// [`LfmBuilder::b3_compress`], additionally writing the byte-REVERSED
@@ -767,10 +792,32 @@ impl LfmBuilder {
         [Cell; layout::b3l::DIGEST_WORDS],
         [Cell; layout::b3l::DIGEST_WORDS],
     ) {
-        let (digest, rev) = self.emit_b3l(cv, block, block_len, flags, true);
+        let (digest, rev, _) = self.emit_b3l(cv, block, block_len, flags, true, false);
         (digest, rev.expect("requested"))
     }
 
+    /// [`LfmBuilder::b3_compress_rev`], additionally writing the compression's
+    /// extended output — the second 32 of its 64 output bytes, `out[8..16]` —
+    /// as two more words of `u32` lanes: a 64-byte transcript squeeze, whose
+    /// last four candidates they hold. A program with such a row has the
+    /// wider head ([`layout::b3l::PREP_WIDTH_XOF`]).
+    #[allow(clippy::type_complexity)]
+    pub fn b3_compress_rev_ext(
+        &mut self,
+        cv: B3Cv,
+        block: B3Block,
+        block_len: u8,
+        flags: u8,
+    ) -> (
+        [Cell; layout::b3l::DIGEST_WORDS],
+        [Cell; layout::b3l::DIGEST_WORDS],
+        [Cell; layout::b3l::DIGEST_WORDS],
+    ) {
+        let (digest, rev, ext) = self.emit_b3l(cv, block, block_len, flags, true, true);
+        (digest, rev.expect("requested"), ext.expect("requested"))
+    }
+
+    #[allow(clippy::type_complexity)]
     fn emit_b3l(
         &mut self,
         cv: B3Cv,
@@ -778,8 +825,10 @@ impl LfmBuilder {
         block_len: u8,
         flags: u8,
         want_rev: bool,
+        want_ext: bool,
     ) -> (
         [Cell; layout::b3l::DIGEST_WORDS],
+        Option<[Cell; layout::b3l::DIGEST_WORDS]>,
         Option<[Cell; layout::b3l::DIGEST_WORDS]>,
     ) {
         assert!(
@@ -802,6 +851,7 @@ impl LfmBuilder {
             outs: [Addr(0); layout::b3l::DIGEST_WORDS],
             mults: [0; layout::b3l::DIGEST_WORDS],
             rev: None,
+            ext: None,
         };
         let reads: Vec<Addr> = op.read_words().collect();
         for a in reads {
@@ -814,10 +864,17 @@ impl LfmBuilder {
                 mults: [0; layout::b3l::DIGEST_WORDS],
             });
         }
+        if want_ext {
+            op.ext = Some(super::instr::B3lExtended {
+                outs: core::array::from_fn(|_| self.alloc()),
+                mults: [0; layout::b3l::DIGEST_WORDS],
+            });
+        }
         let outs = op.outs.map(Cell);
         let rev = op.rev.as_ref().map(|r| r.outs.map(Cell));
+        let ext = op.ext.as_ref().map(|x| x.outs.map(Cell));
         self.instrs.push(Instr::B3l(Box::new(op)));
-        (outs, rev)
+        (outs, rev, ext)
     }
 
     // ---- hints / public ----

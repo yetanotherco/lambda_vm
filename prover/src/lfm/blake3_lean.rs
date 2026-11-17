@@ -19,7 +19,10 @@
 //!   and the message block from `LfmMem`, range-checks them, sends the round-0
 //!   token, receives the round-7 token and computes the feed-forward of a
 //!   **256-bit digest** (`out[i] = v[i] ⊕ v[i+8]`, `i < 8`), which it writes
-//!   back to `LfmMem`.
+//!   back to `LfmMem`. In a program whose rows may also write the
+//!   compression's extended output (a 64-byte transcript squeeze), the head
+//!   is a wider one ([`HeadLayout::XOF`]) that computes `out[i + 8] =
+//!   v[i + 8] ⊕ h[i]` too.
 //! - [`table`] (`B3L_XOR`): the fixed 2^16-row byte table every lookup closes
 //!   against — XOR, XOR split into nibbles, byte pair, 16-bit value.
 //!
@@ -611,39 +614,132 @@ pub mod head {
     pub const CG: usize = CZ + 8;
     pub const NUM_COLUMNS: usize = CG + 8;
     pub const MAIN_COLUMNS: usize = NUM_COLUMNS - PREP_WIDTH;
+
+    /// A head with the extended output ([`super::HeadLayout::xof`]): the
+    /// instruction group's two extended words and their read counts
+    /// ([`crate::lfm::layout::b3l::XADDR0`], `XCNT0`), every main column
+    /// above four places later, then after them the extended output's 32
+    /// bytes (`XB`) and `h[0..4]`'s 16 bytes (`HLB`), the XOR's operands.
+    pub use crate::lfm::layout::b3l::{PREP_WIDTH_XOF, XADDR0 as XADDR, XCNT0 as XCNT};
+    pub const XOF_MAIN_EXTRA: usize = 32 + 16;
+}
+
+/// ★ Where a head's columns are: today's head, or the head of a program
+/// whose rows may write the compression's extended output (`xof`), whose
+/// instruction group is four columns wider and so every main column four
+/// later, with [`head::XOF_MAIN_EXTRA`] more main columns at its end.
+///
+/// One head table has one layout: a program writes no extended output (and
+/// keeps today's head, byte for byte) or its every head row has the wider
+/// layout, the extended words' read counts zero where a row writes none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct HeadLayout {
+    pub xof: bool,
+}
+
+impl HeadLayout {
+    /// Today's head.
+    pub const NARROW: Self = Self { xof: false };
+    /// The head with the extended output.
+    pub const XOF: Self = Self { xof: true };
+
+    pub const fn prep_width(self) -> usize {
+        crate::lfm::layout::b3l::prep_width(self.xof)
+    }
+    const fn shift(self) -> usize {
+        self.prep_width() - head::PREP_WIDTH
+    }
+    pub const fn mb(self) -> usize {
+        head::MB + self.shift()
+    }
+    pub const fn hl(self) -> usize {
+        head::HL + self.shift()
+    }
+    pub const fn hb(self) -> usize {
+        head::HB + self.shift()
+    }
+    pub const fn fs(self) -> usize {
+        head::FS + self.shift()
+    }
+    pub const fn ob(self) -> usize {
+        head::OB + self.shift()
+    }
+    pub const fn cz(self) -> usize {
+        head::CZ + self.shift()
+    }
+    pub const fn cg(self) -> usize {
+        head::CG + self.shift()
+    }
+    /// The extended output, 8 words of 4 bytes (`out[8..16]`): xof only.
+    pub const fn xb(self) -> usize {
+        head::NUM_COLUMNS + self.shift()
+    }
+    /// `h[0..4]` as bytes: xof only. `HL`'s limbs are their pairs.
+    pub const fn hlb(self) -> usize {
+        self.xb() + 32
+    }
+    pub const fn num_columns(self) -> usize {
+        if self.xof {
+            head::NUM_COLUMNS + self.shift() + head::XOF_MAIN_EXTRA
+        } else {
+            head::NUM_COLUMNS
+        }
+    }
+    pub const fn main_columns(self) -> usize {
+        self.num_columns() - self.prep_width()
+    }
+    /// [`HEAD_CONSTRAINTS`], and the eight limb decompositions of `h[0..4]`
+    /// under xof.
+    pub const fn constraints(self) -> usize {
+        if self.xof {
+            HEAD_CONSTRAINTS + 8
+        } else {
+            HEAD_CONSTRAINTS
+        }
+    }
 }
 
 const MAX_HALF: i64 = 0xFFFF_FFFF;
 
 /// Message word `i` (little-endian over the block bytes).
-fn m_word(i: usize) -> Lin {
-    word_of(&cols4(head::MB + 4 * i))
+fn m_word(lay: HeadLayout, i: usize) -> Lin {
+    word_of(&cols4(lay.mb() + 4 * i))
 }
 
 /// Felt `f` of a leaf block: its 8 bytes big-endian.
-fn felt_value(f: usize) -> Lin {
+fn felt_value(lay: HeadLayout, f: usize) -> Lin {
     (0..8).fold(Lin::default(), |acc, k| {
-        acc.plus(&Lin::col(head::MB + 8 * f + k).scaled(1i64 << (8 * (7 - k))))
+        acc.plus(&Lin::col(lay.mb() + 8 * f + k).scaled(1i64 << (8 * (7 - k))))
     })
 }
 
 /// The high (`half = 0`) or low (`half = 1`) `u32` of leaf felt `f`.
-fn felt_half(f: usize, half: usize) -> Lin {
+fn felt_half(lay: HeadLayout, f: usize, half: usize) -> Lin {
     (0..4).fold(Lin::default(), |acc, k| {
-        acc.plus(&Lin::col(head::MB + 8 * f + 4 * half + k).scaled(1i64 << (8 * (3 - k))))
+        acc.plus(&Lin::col(lay.mb() + 8 * f + 4 * half + k).scaled(1i64 << (8 * (3 - k))))
     })
 }
 
-fn h_word(i: usize) -> Lin {
+fn h_word(lay: HeadLayout, i: usize) -> Lin {
     if i < 4 {
-        Lin::col(head::HL + 2 * i).plus(&Lin::col(head::HL + 2 * i + 1).scaled(1 << 16))
+        Lin::col(lay.hl() + 2 * i).plus(&Lin::col(lay.hl() + 2 * i + 1).scaled(1 << 16))
     } else {
-        word_of(&cols4(head::HB + 4 * (i - 4)))
+        word_of(&cols4(lay.hb() + 4 * (i - 4)))
     }
 }
 
-fn fs_bytes(i: usize) -> Bytes {
-    cols4(head::FS + 4 * i)
+fn fs_bytes(lay: HeadLayout, i: usize) -> Bytes {
+    cols4(lay.fs() + 4 * i)
+}
+
+/// `h[i]`'s bytes on an xof head: `h[0..4]` from `HLB`, `h[4..8]` from `HB`.
+fn h_bytes_xof(lay: HeadLayout, i: usize) -> Bytes {
+    debug_assert!(lay.xof);
+    if i < 4 {
+        cols4(lay.hlb() + 4 * i)
+    } else {
+        cols4(lay.hb() + 4 * (i - 4))
+    }
 }
 
 /// `Q_r`: round `r`'s schedule as indices into the block's message,
@@ -665,14 +761,20 @@ fn mem_token(addr: usize, lanes: [Lin; 4]) -> Vec<BusValue> {
     v
 }
 
+/// Today's head's interactions ([`head_interactions_for`] of
+/// [`HeadLayout::NARROW`]).
 pub fn head_interactions() -> Vec<BusInteraction> {
+    head_interactions_for(HeadLayout::NARROW)
+}
+
+pub fn head_interactions_for(lay: HeadLayout) -> Vec<BusInteraction> {
     let mu = || Multiplicity::Column(head::MU);
     let mut out = Vec::with_capacity(84);
 
     // The round-0 token: h, IV, (t = 0, block_len, flags), the block.
     let h_words: [Lin; 8] = core::array::from_fn(|i| {
         if i < 4 {
-            h_word(i)
+            h_word(lay, i)
         } else {
             Lin::konst(BLAKE3_IV[i - 4] as i64)
         }
@@ -682,12 +784,12 @@ pub fn head_interactions() -> Vec<BusInteraction> {
     v12[3][0] = Lin::col(head::FLAGS);
     let h_bytes: [Bytes; 8] = core::array::from_fn(|i| {
         if i < 4 {
-            cols4(head::HB + 4 * i)
+            cols4(lay.hb() + 4 * i)
         } else {
             v12[i - 4].clone()
         }
     });
-    let msg0: [Lin; 16] = core::array::from_fn(m_word);
+    let msg0: [Lin; 16] = core::array::from_fn(|i| m_word(lay, i));
     out.push(BusInteraction::sender(
         ROUND_BUS,
         mu(),
@@ -701,10 +803,11 @@ pub fn head_interactions() -> Vec<BusInteraction> {
     ));
     // The round-7 token: the final state, the message after seven permutations.
     let fs_words: [Lin; 8] =
-        core::array::from_fn(|i| word_of(&fs_bytes(if i < 4 { i } else { i + 4 })));
-    let fs_b: [Bytes; 8] = core::array::from_fn(|i| fs_bytes(if i < 4 { 4 + i } else { 8 + i }));
+        core::array::from_fn(|i| word_of(&fs_bytes(lay, if i < 4 { i } else { i + 4 })));
+    let fs_b: [Bytes; 8] =
+        core::array::from_fn(|i| fs_bytes(lay, if i < 4 { 4 + i } else { 8 + i }));
     let q7 = schedule(ROUNDS);
-    let msg7: [Lin; 16] = core::array::from_fn(|i| m_word(q7[i]));
+    let msg7: [Lin; 16] = core::array::from_fn(|i| m_word(lay, q7[i]));
     out.push(BusInteraction::receiver(
         ROUND_BUS,
         mu(),
@@ -724,8 +827,8 @@ pub fn head_interactions() -> Vec<BusInteraction> {
             mu(),
             vec![
                 Lin::konst(OP_PAIR).bus(),
-                Lin::col(head::MB + 2 * j).bus(),
-                Lin::col(head::MB + 2 * j + 1).bus(),
+                Lin::col(lay.mb() + 2 * j).bus(),
+                Lin::col(lay.mb() + 2 * j + 1).bus(),
             ],
         ));
     }
@@ -733,12 +836,16 @@ pub fn head_interactions() -> Vec<BusInteraction> {
         out.push(BusInteraction::sender(
             XOR_BUS,
             mu(),
-            vec![Lin::konst(OP_R16).bus(), Lin::col(head::HL + k).bus()],
+            vec![Lin::konst(OP_R16).bus(), Lin::col(lay.hl() + k).bus()],
         ));
     }
     // The feed-forward of a 256-bit digest.
     for i in 0..8 {
-        let (lo, hi, o) = (fs_bytes(i), fs_bytes(i + 8), cols4(head::OB + 4 * i));
+        let (lo, hi, o) = (
+            fs_bytes(lay, i),
+            fs_bytes(lay, i + 8),
+            cols4(lay.ob() + 4 * i),
+        );
         for k in 0..4 {
             out.push(BusInteraction::sender(
                 XOR_BUS,
@@ -754,14 +861,20 @@ pub fn head_interactions() -> Vec<BusInteraction> {
         out.push(BusInteraction::receiver(
             BusId::LfmMem,
             Multiplicity::Diff(head::MU, head::IVF),
-            mem_token(head::HADDR + w, core::array::from_fn(|l| h_word(4 * w + l))),
+            mem_token(
+                head::HADDR + w,
+                core::array::from_fn(|l| h_word(lay, 4 * w + l)),
+            ),
         ));
     }
     for w in 0..4 {
         out.push(BusInteraction::receiver(
             BusId::LfmMem,
             Multiplicity::Column(head::MLANES),
-            mem_token(head::MADDR + w, core::array::from_fn(|l| m_word(4 * w + l))),
+            mem_token(
+                head::MADDR + w,
+                core::array::from_fn(|l| m_word(lay, 4 * w + l)),
+            ),
         ));
     }
     for w in 0..2 {
@@ -770,7 +883,7 @@ pub fn head_interactions() -> Vec<BusInteraction> {
             Multiplicity::Column(head::MFELTS),
             mem_token(
                 head::MADDR + w,
-                core::array::from_fn(|l| felt_value(4 * w + l)),
+                core::array::from_fn(|l| felt_value(lay, 4 * w + l)),
             ),
         ));
     }
@@ -780,7 +893,7 @@ pub fn head_interactions() -> Vec<BusInteraction> {
             Multiplicity::Column(head::OCNT + w),
             mem_token(
                 head::OADDR + w,
-                core::array::from_fn(|l| word_of(&cols4(head::OB + 4 * (4 * w + l)))),
+                core::array::from_fn(|l| word_of(&cols4(lay.ob() + 4 * (4 * w + l)))),
             ),
         ));
     }
@@ -793,18 +906,92 @@ pub fn head_interactions() -> Vec<BusInteraction> {
             Multiplicity::Column(head::RCNT + w),
             mem_token(
                 head::RADDR + w,
-                core::array::from_fn(|l| reversed_lane(w, l)),
+                core::array::from_fn(|l| reversed_lane(lay, w, l)),
             ),
         ));
+    }
+    if lay.xof {
+        push_extended_output(lay, &mut out);
     }
     out
 }
 
+/// ★ The extended output on an xof head: `out[i + 8] = fs[i + 8] ⊕ h[i]` for
+/// `i < 8` (BLAKE3's feed-forward of the chaining value into the upper half),
+/// as 32 XOR lookups over bytes — `fs[8..16]`'s, range-checked by the
+/// digest's lookups, and `h`'s (`HLB`, the limbs' bytes, and `HB`) — and the
+/// two words of it sent to `LfmMem` at the extended addresses, inert where
+/// their read counts are zero. On every real row whatever its read counts, so
+/// a row's extended bytes are always its compression's.
+fn push_extended_output(lay: HeadLayout, out: &mut Vec<BusInteraction>) {
+    let mu = || Multiplicity::Column(head::MU);
+    for i in 0..8 {
+        let (fs, h, x) = (
+            fs_bytes(lay, i + 8),
+            h_bytes_xof(lay, i),
+            cols4(lay.xb() + 4 * i),
+        );
+        #[cfg(test)]
+        let h = if mutants::ext_without_cv() {
+            konst_bytes(0)
+        } else {
+            h
+        };
+        for k in 0..4 {
+            out.push(BusInteraction::sender(
+                XOR_BUS,
+                mu(),
+                xor_tuple(&fs[k], &h[k], &x[k]),
+            ));
+        }
+    }
+    for w in 0..2 {
+        out.push(BusInteraction::sender(
+            BusId::LfmMem,
+            Multiplicity::Column(head::XCNT + w),
+            mem_token(
+                head::XADDR + w,
+                core::array::from_fn(|l| word_of(&cols4(lay.xb() + 4 * (4 * w + l)))),
+            ),
+        ));
+    }
+}
+
+/// Test-only mutants of the head's wiring, each switched on for one thread
+/// while its guard lives.
+#[cfg(test)]
+pub(crate) mod mutants {
+    use std::cell::Cell;
+
+    thread_local! {
+        static EXT_WITHOUT_CV: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The extended output's lookups XOR `fs[i + 8]` with zero rather than
+    /// with `h[i]`: the extended words without the chaining value fed forward.
+    pub(crate) fn ext_without_cv() -> bool {
+        EXT_WITHOUT_CV.with(Cell::get)
+    }
+
+    pub(crate) struct ExtWithoutCv;
+
+    impl Drop for ExtWithoutCv {
+        fn drop(&mut self) {
+            EXT_WITHOUT_CV.with(|c| c.set(false));
+        }
+    }
+
+    pub(crate) fn set_ext_without_cv() -> ExtWithoutCv {
+        EXT_WITHOUT_CV.with(|c| c.set(true));
+        ExtWithoutCv
+    }
+}
+
 /// Lane `l` of reversed-digest word `w`: reversed bytes `16w + 4l .. + 4`
 /// little-endian, i.e. digest bytes `31 − (16w + 4l + k)` for `k = 0..4`.
-fn reversed_lane(w: usize, l: usize) -> Lin {
+fn reversed_lane(lay: HeadLayout, w: usize, l: usize) -> Lin {
     (0..4).fold(Lin::default(), |acc, k| {
-        acc.plus(&Lin::col(head::OB + 31 - (16 * w + 4 * l + k)).scaled(1 << (8 * k)))
+        acc.plus(&Lin::col(lay.ob() + 31 - (16 * w + 4 * l + k)).scaled(1 << (8 * k)))
     })
 }
 
@@ -815,6 +1002,9 @@ pub struct HeadConstraints {
     /// A test's mutation: the felt canonicity triples return zero, to show
     /// they are what refuses a felt whose bytes encode `v + p`.
     pub drop_canonicity: bool,
+    /// The head's layout: an xof head adds `h[0..4]`'s limb decompositions
+    /// into the bytes its extended output XORs (8, degree 1).
+    pub xof: bool,
 }
 
 pub const HEAD_CONSTRAINTS: usize = 24 + 24;
@@ -825,11 +1015,12 @@ impl ConstraintSet<F, E> for HeadConstraints {
     }
 
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
+        let lay = HeadLayout { xof: self.xof };
         let mut idx = 0usize;
         let ivf = || Lin::col(head::IVF);
         for (i, &iv) in BLAKE3_IV[..4].iter().enumerate() {
             for (k, limb) in [iv & 0xFFFF, iv >> 16].into_iter().enumerate() {
-                let d = Lin::col(head::HL + 2 * i + k).plus(&Lin::konst(-(limb as i64)));
+                let d = Lin::col(lay.hl() + 2 * i + k).plus(&Lin::konst(-(limb as i64)));
                 let e = ivf().expr(b) * d.expr(b);
                 b.emit_base(idx, e);
                 idx += 1;
@@ -839,7 +1030,7 @@ impl ConstraintSet<F, E> for HeadConstraints {
             let iv = BLAKE3_IV[4 + i];
             for k in 0..4 {
                 let byte = ((iv >> (8 * k)) & 0xFF) as i64;
-                let d = Lin::col(head::HB + 4 * i + k).plus(&Lin::konst(-byte));
+                let d = Lin::col(lay.hb() + 4 * i + k).plus(&Lin::konst(-byte));
                 let e = ivf().expr(b) * d.expr(b);
                 b.emit_base(idx, e);
                 idx += 1;
@@ -857,19 +1048,32 @@ impl ConstraintSet<F, E> for HeadConstraints {
                 continue;
             }
             let mode = b.main(0, head::MFELTS);
-            let z = b.main(0, head::CZ + f);
-            let ginv = b.main(0, head::CG + f);
+            let z = b.main(0, lay.cz() + f);
+            let ginv = b.main(0, lay.cg() + f);
             let g = Lin::konst(MAX_HALF)
-                .plus(&felt_half(f, 0).scaled(-1))
+                .plus(&felt_half(lay, f, 0).scaled(-1))
                 .expr(b);
-            let lo = felt_half(f, 1).expr(b);
+            let lo = felt_half(lay, f, 1).expr(b);
             b.emit_base(idx, mode.clone() * z.clone() * g.clone());
             let one = b.one();
             b.emit_base(idx + 1, mode.clone() * (one - z.clone() - g * ginv));
             b.emit_base(idx + 2, mode * z * lo);
             idx += 3;
         }
-        debug_assert_eq!(idx, HEAD_CONSTRAINTS);
+        // `h[0..4]`'s limbs are their bytes' pairs: the limbs are 16-bit
+        // range-checked and the bytes are XOR operands, so the split is the
+        // integer one and the extended output XORs `h`'s own bytes.
+        if lay.xof {
+            for limb in 0..8 {
+                let d = Lin::col(lay.hl() + limb)
+                    .plus(&Lin::col(lay.hlb() + 2 * limb).scaled(-1))
+                    .plus(&Lin::col(lay.hlb() + 2 * limb + 1).scaled(-256));
+                let e = d.expr(b);
+                b.emit_base(idx, e);
+                idx += 1;
+            }
+        }
+        debug_assert_eq!(idx, lay.constraints());
     }
 }
 
@@ -1283,7 +1487,8 @@ pub fn final_state(values: &B3lValues, block_len: u32, flags: u32) -> [u32; 16] 
 
 /// Fill one head row: its instruction group `prep` (the program's
 /// `B3L_HEAD` row, [`super::layout::b3l`]), then the values of `values` and
-/// the final state `fs`; records the head's lookups.
+/// the final state `fs`; records the head's lookups. Today's head
+/// ([`fill_head_for`] of [`HeadLayout::NARROW`]).
 pub fn fill_head(
     row: &mut [FE],
     prep: &[FE],
@@ -1291,8 +1496,20 @@ pub fn fill_head(
     fs: &[u32; 16],
     hist: &mut TableHist,
 ) {
-    fill_head_uninverted(row, prep, values, fs, hist);
-    invert_heads(row);
+    fill_head_for(HeadLayout::NARROW, row, prep, values, fs, hist);
+}
+
+/// [`fill_head`] under `lay`.
+pub fn fill_head_for(
+    lay: HeadLayout,
+    row: &mut [FE],
+    prep: &[FE],
+    values: &B3lValues,
+    fs: &[u32; 16],
+    hist: &mut TableHist,
+) {
+    fill_head_uninverted_for(lay, row, prep, values, fs, hist);
+    invert_heads_for(lay, row);
 }
 
 /// [`fill_head`] with each felt slot's canonicity witness `CG` left as the
@@ -1305,21 +1522,36 @@ pub fn fill_head_uninverted(
     fs: &[u32; 16],
     hist: &mut TableHist,
 ) {
-    row[..head::PREP_WIDTH].copy_from_slice(&prep[..head::PREP_WIDTH]);
+    fill_head_uninverted_for(HeadLayout::NARROW, row, prep, values, fs, hist);
+}
+
+/// [`fill_head_uninverted`] under `lay`: on an xof head also the extended
+/// output's bytes (`out[i + 8] = fs[i + 8] ⊕ h[i]`), `h[0..4]`'s bytes and
+/// their lookups.
+pub fn fill_head_uninverted_for(
+    lay: HeadLayout,
+    row: &mut [FE],
+    prep: &[FE],
+    values: &B3lValues,
+    fs: &[u32; 16],
+    hist: &mut TableHist,
+) {
+    let pw = lay.prep_width();
+    row[..pw].copy_from_slice(&prep[..pw]);
     for (k, &byte) in values.block.iter().enumerate() {
-        row[head::MB + k] = FE::from(u64::from(byte));
+        row[lay.mb() + k] = FE::from(u64::from(byte));
     }
     let h = values.h;
     for i in 0..4 {
-        row[head::HL + 2 * i] = FE::from(u64::from(h[i] & 0xFFFF));
-        row[head::HL + 2 * i + 1] = FE::from(u64::from(h[i] >> 16));
-        set_bytes(row, head::HB + 4 * i, h[4 + i]);
+        row[lay.hl() + 2 * i] = FE::from(u64::from(h[i] & 0xFFFF));
+        row[lay.hl() + 2 * i + 1] = FE::from(u64::from(h[i] >> 16));
+        set_bytes(row, lay.hb() + 4 * i, h[4 + i]);
     }
     for (i, &w) in fs.iter().enumerate() {
-        set_bytes(row, head::FS + 4 * i, w);
+        set_bytes(row, lay.fs() + 4 * i, w);
     }
     for i in 0..8 {
-        set_bytes(row, head::OB + 4 * i, fs[i] ^ fs[i + 8]);
+        set_bytes(row, lay.ob() + 4 * i, fs[i] ^ fs[i + 8]);
     }
     // The canonicity witnesses for every felt slot, whatever the mode: the
     // constraints are gated by `MFELTS`, so on a lane block they are inert.
@@ -1327,9 +1559,9 @@ pub fn fill_head_uninverted(
         let hi = u32::from_be_bytes(values.block[8 * f..8 * f + 4].try_into().expect("4 bytes"));
         let g = u64::from(0xFFFF_FFFFu32 - hi);
         if g == 0 {
-            row[head::CZ + f] = FE::one();
+            row[lay.cz() + f] = FE::one();
         } else {
-            row[head::CG + f] = FE::from(g);
+            row[lay.cg() + f] = FE::from(g);
         }
     }
     let op = values;
@@ -1354,6 +1586,21 @@ pub fn fill_head_uninverted(
             );
         }
     }
+    if lay.xof {
+        for i in 0..4 {
+            set_bytes(row, lay.hlb() + 4 * i, h[i]);
+        }
+        for i in 0..8 {
+            set_bytes(row, lay.xb() + 4 * i, fs[i + 8] ^ h[i]);
+            for k in 0..4 {
+                hist.add(
+                    OP_XOR as usize,
+                    (fs[i + 8] >> (8 * k)) & 0xFF,
+                    (h[i] >> (8 * k)) & 0xFF,
+                );
+            }
+        }
+    }
 }
 
 /// The canonicity witnesses of whole head rows `rows` (each
@@ -1361,11 +1608,17 @@ pub fn fill_head_uninverted(
 /// in one batch: every nonzero `CG` cell. A zero one is a slot whose `CZ` is
 /// set, or a padding row's, and stays zero.
 pub fn invert_heads(rows: &mut [FE]) {
-    let width = head::NUM_COLUMNS;
+    invert_heads_for(HeadLayout::NARROW, rows);
+}
+
+/// [`invert_heads`] over rows of `lay`.
+pub fn invert_heads_for(lay: HeadLayout, rows: &mut [FE]) {
+    let width = lay.num_columns();
+    let cg = lay.cg();
     debug_assert_eq!(rows.len() % width, 0, "whole head rows");
     let zero = FE::zero();
     let at: Vec<usize> = (0..rows.len() / width)
-        .flat_map(|r| (0..8).map(move |f| r * width + head::CG + f))
+        .flat_map(|r| (0..8).map(move |f| r * width + cg + f))
         .filter(|&i| rows[i] != zero)
         .collect();
     let mut values: Vec<FE> = at.iter().map(|&i| rows[i]).collect();

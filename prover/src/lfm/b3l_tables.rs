@@ -39,7 +39,7 @@ use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField, zeroed_fe_v
 use super::airs::{DynLfmAir, LfmAir, build_lfm_air};
 use super::b3l::B3lValues;
 use super::blake3_lean::{
-    self as lean, HeadConstraints, RoundConstraints, TableHist, head, round, table,
+    self as lean, HeadConstraints, RoundConstraints, TableHist, round, table,
 };
 use super::chips::cap::{CapConstraints, cols as cap};
 use super::chips::cap_read::cols as cap_read;
@@ -86,6 +86,10 @@ pub struct B3lShape {
     /// compressions, after the mux chunks, each cut as the mux's.
     pub caps: Vec<usize>,
     pub cap_reads: Vec<usize>,
+    /// The head chunks' layout: whether the program's compressions may write
+    /// their extended output ([`lean::HeadLayout`]), read off its instruction
+    /// group's width. Today's head for every program that writes none.
+    pub head: lean::HeadLayout,
 }
 
 impl B3lShape {
@@ -100,6 +104,7 @@ impl B3lShape {
             muxes: Vec::new(),
             caps: Vec::new(),
             cap_reads: Vec::new(),
+            head: lean::HeadLayout::NARROW,
         }
     }
 
@@ -107,6 +112,9 @@ impl B3lShape {
     pub fn of_program(program: &LfmProgram) -> Self {
         let mut shape = Self::of(program.groups.b3l.real_rows);
         if !shape.is_empty() {
+            shape.head = lean::HeadLayout {
+                xof: program.groups.b3l.width == l::PREP_WIDTH_XOF,
+            };
             let g = &program.groups;
             shape.muxes = lean::chunk_rows(g.mux.real_rows, MUX_CHUNK_LOG, MIN_CHUNK_LOG);
             shape.caps = lean::chunk_rows(g.cap.real_rows, MUX_CHUNK_LOG, MIN_CHUNK_LOG);
@@ -207,13 +215,16 @@ impl B3lAirs {
                 .iter()
                 .map(|_| {
                     build_lfm_air(
-                        head::NUM_COLUMNS,
-                        lean::head_interactions(),
+                        shape.head.num_columns(),
+                        lean::head_interactions_for(shape.head),
                         options,
-                        heads,
+                        HeadConstraints {
+                            xof: shape.head.xof,
+                            ..heads
+                        },
                         HEAD_NAME,
                         zero,
-                        head::PREP_WIDTH,
+                        shape.head.prep_width(),
                     )
                 })
                 .collect(),
@@ -923,7 +934,7 @@ pub fn build_b3l_traces_held(
     if n == 0 {
         return None;
     }
-    let shape = B3lShape::of(n);
+    let shape = B3lShape::of_program(program);
     let consts = |k: usize| head_consts(g, k);
     // The card's path: the round chunks held as their records (the card fills
     // them), the heads and the byte table narrow.
@@ -1008,17 +1019,18 @@ pub fn build_b3l_traces_held(
     let mut start = 0usize;
     for &size in &shape.heads {
         let end = (start + size).min(n);
-        let mut data = zeroed_fe_vec(size * head::NUM_COLUMNS);
+        let width = shape.head.num_columns();
+        let mut data = zeroed_fe_vec(size * width);
         let fill = |k: usize, hrow: &mut [FE], hist: &mut TableHist| {
             let (prep, block_len, flags) = consts(k);
             let fs = lean::final_state(&records[k], block_len, flags);
-            lean::fill_head(hrow, prep, &records[k], &fs, hist);
+            lean::fill_head_for(shape.head, hrow, prep, &records[k], &fs, hist);
         };
-        let live = &mut data[..(end - start) * head::NUM_COLUMNS];
+        let live = &mut data[..(end - start) * width];
         #[cfg(feature = "parallel")]
         let part = {
             use rayon::prelude::*;
-            live.par_chunks_mut(head::NUM_COLUMNS)
+            live.par_chunks_mut(width)
                 .enumerate()
                 .fold(TableHist::default, |mut h, (i, row)| {
                     fill(start + i, row, &mut h);
@@ -1029,13 +1041,13 @@ pub fn build_b3l_traces_held(
         #[cfg(not(feature = "parallel"))]
         let part = {
             let mut h = TableHist::default();
-            for (i, row) in live.chunks_mut(head::NUM_COLUMNS).enumerate() {
+            for (i, row) in live.chunks_mut(width).enumerate() {
                 fill(start + i, row, &mut h);
             }
             h
         };
         hist = hist.merge(&part);
-        heads.push(HeldTable::from_rows(data, head::NUM_COLUMNS, hold));
+        heads.push(HeldTable::from_rows(data, width, hold));
         start += size;
     }
 
@@ -1093,9 +1105,9 @@ fn round_widths() -> Vec<u8> {
 
 /// The bytes each head column's values need: addresses eight, tags and read
 /// counts four, the `h` limbs two, the canonicity inverses eight, the rest
-/// one.
-fn head_widths() -> Vec<u8> {
-    let mut w = vec![1u8; head::NUM_COLUMNS];
+/// one (the extended output's and `h[0..4]`'s bytes too).
+fn head_widths(lay: lean::HeadLayout) -> Vec<u8> {
+    let mut w = vec![1u8; lay.num_columns()];
     w[l::TAG] = 4;
     for j in 0..l::DIGEST_WORDS {
         w[l::haddr(j)] = 8;
@@ -1103,13 +1115,17 @@ fn head_widths() -> Vec<u8> {
         w[l::raddr(j)] = 8;
         w[l::ocnt(j)] = 4;
         w[l::rcnt(j)] = 4;
+        if lay.xof {
+            w[l::xaddr(j)] = 8;
+            w[l::xcnt(j)] = 4;
+        }
     }
     for j in 0..l::LANE_WORDS {
         w[l::maddr(j)] = 8;
     }
     for k in 0..8 {
-        w[head::HL + k] = 2;
-        w[head::CG + k] = 8;
+        w[lay.hl() + k] = 2;
+        w[lay.cg() + k] = 8;
     }
     w
 }
@@ -1262,8 +1278,8 @@ fn fill_narrow_direct<'p>(
         rounds.push(HeldTable::Narrow(packed));
         start += size;
     }
-    let widths = head_widths();
-    let width = head::NUM_COLUMNS;
+    let widths = head_widths(shape.head);
+    let width = shape.head.num_columns();
     let mut heads = Vec::with_capacity(shape.heads.len());
     let mut start = 0usize;
     for &size in &shape.heads {
@@ -1278,7 +1294,8 @@ fn fill_narrow_direct<'p>(
                 let (prep, block_len, flags) = consts(k);
                 let fs = lean::final_state(record, block_len, flags);
                 let at = (k - lo) * width;
-                lean::fill_head_uninverted(
+                lean::fill_head_uninverted_for(
+                    shape.head,
                     &mut scratch[at..at + width],
                     prep,
                     record,
@@ -1286,7 +1303,7 @@ fn fill_narrow_direct<'p>(
                     &mut hists.counted,
                 );
             }
-            lean::invert_heads(scratch);
+            lean::invert_heads_for(shape.head, scratch);
         })?;
         hist = hist.merge(&part);
         heads.push(HeldTable::Narrow(packed));
@@ -1383,8 +1400,8 @@ fn fill_heads_narrow<'p>(
     consts: &(dyn Fn(usize) -> (&'p [FE], u32, u32) + Sync),
     records: &[B3lValues],
 ) -> Option<(Vec<HeldTable>, TableHist)> {
-    let widths = head_widths();
-    let width = head::NUM_COLUMNS;
+    let widths = head_widths(shape.head);
+    let width = shape.head.num_columns();
     let mut hist = TableHist::default();
     let mut heads = Vec::with_capacity(shape.heads.len());
     let mut start = 0usize;
@@ -1400,7 +1417,8 @@ fn fill_heads_narrow<'p>(
                 let (prep, block_len, flags) = consts(k);
                 let fs = lean::final_state(record, block_len, flags);
                 let at = (k - lo) * width;
-                lean::fill_head_uninverted(
+                lean::fill_head_uninverted_for(
+                    shape.head,
                     &mut scratch[at..at + width],
                     prep,
                     record,
@@ -1408,7 +1426,7 @@ fn fill_heads_narrow<'p>(
                     &mut hists.counted,
                 );
             }
-            lean::invert_heads(scratch);
+            lean::invert_heads_for(shape.head, scratch);
         })?;
         hist = hist.merge(&part);
         heads.push(HeldTable::Narrow(packed));
@@ -1688,7 +1706,7 @@ pub fn build_b3l_traces_prefilled(
     if n == 0 || records.len() != n || prefilled.ops.len() != n {
         return None;
     }
-    let shape = B3lShape::of(n);
+    let shape = B3lShape::of_program(program);
     let consts = |k: usize| head_consts(g, k);
     let LeanPrefilled { ops, hist } = prefilled;
     let ops = std::sync::Arc::new(ops);

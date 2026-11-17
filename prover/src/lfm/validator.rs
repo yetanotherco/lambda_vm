@@ -376,6 +376,11 @@ fn check_multiplicities_with(program: &LfmProgram, dense: bool) -> Result<(), Lf
                         check(rev.outs[i], rev.mults[i])?;
                     }
                 }
+                if let Some(ext) = &k.ext {
+                    for i in 0..layout::b3l::DIGEST_WORDS {
+                        check(ext.outs[i], ext.mults[i])?;
+                    }
+                }
             }
             Instr::Public { .. } => {}
         }

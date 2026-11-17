@@ -444,6 +444,11 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
                         rev.mults[i] = take(rev.outs[i], &mut written, &mut read_counts);
                     }
                 }
+                if let Some(ext) = &mut k.ext {
+                    for i in 0..layout::b3l::DIGEST_WORDS {
+                        ext.mults[i] = take(ext.outs[i], &mut written, &mut read_counts);
+                    }
+                }
             }
             Instr::Public { .. } => {}
         }
@@ -501,7 +506,12 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
     let mut lanes = ColumnGroupBuilder::new(layout::lanes::PREP_WIDTH);
     let mut hint = ColumnGroupBuilder::new(layout::hint::PREP_WIDTH);
     let mut public = ColumnGroupBuilder::new(layout::public::PREP_WIDTH);
-    let mut b3l = ColumnGroupBuilder::new(layout::b3l::PREP_WIDTH);
+    // Wider only when some row writes the extended output: every other
+    // program's group, and its bytes, are as before.
+    let b3l_xof = instrs
+        .iter()
+        .any(|i| matches!(i, Instr::B3l(op) if op.ext.is_some()));
+    let mut b3l = ColumnGroupBuilder::new(layout::b3l::prep_width(b3l_xof));
     let mut mux = ColumnGroupBuilder::new(layout::mux::PREP_WIDTH);
     let mut cap = ColumnGroupBuilder::new(layout::cap::PREP_WIDTH);
     let mut cap_read = ColumnGroupBuilder::new(layout::cap_read::PREP_WIDTH);
@@ -781,6 +791,14 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                     for j in 0..l::DIGEST_WORDS {
                         b3l.set(r, l::raddr(j), fe(rev.outs[j].0));
                         b3l.set(r, l::rcnt(j), fe(rev.mults[j]));
+                    }
+                }
+                // Only in a group laid out for them (`l::prep_width`): the
+                // compiler widens the group when any row writes them.
+                if let Some(ext) = &op.ext {
+                    for j in 0..l::DIGEST_WORDS {
+                        b3l.set(r, l::xaddr(j), fe(ext.outs[j].0));
+                        b3l.set(r, l::xcnt(j), fe(ext.mults[j]));
                     }
                 }
             }

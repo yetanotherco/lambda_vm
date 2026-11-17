@@ -262,6 +262,7 @@ fn a_non_canonical_felt_encoding_needs_the_canonicity_check() {
             RoundConstraints::default(),
             HeadConstraints {
                 drop_canonicity: drop,
+                ..HeadConstraints::default()
             },
         );
         let build = build(&program);
@@ -708,4 +709,184 @@ fn the_chips_narrow_pack_is_the_row_major_pack() {
         pack_rows_narrow(&cells, width, 8).is_err(),
         "more rows than the table"
     );
+}
+
+// =============================================================================
+// The extended output (`out[8..16]`): a 64-byte transcript squeeze's head.
+// =============================================================================
+
+/// [`honest`]'s compressions with its parent asked for its extended output
+/// too ([`LfmBuilder::b3_compress_rev_ext`]), every digest and the extended
+/// words published: the head is the wider one, every row of it.
+fn program_ext() -> LfmProgram {
+    use crypto::hash::blake3::chain::{FLAGS_ONE_BLOCK, block_flags, block_len_of, num_blocks};
+    let mut b = LfmBuilder::new();
+    let msg: Vec<u8> = (0..150u32).map(|i| (i * 7 + 3) as u8).collect();
+    let n = num_blocks(msg.len());
+    let mut cv = B3Cv::Iv;
+    let mut chain = None;
+    for i in 0..n {
+        let mut block = [0u8; 64];
+        let end = ((i + 1) * 64).min(msg.len());
+        block[..end - i * 64].copy_from_slice(&msg[i * 64..end]);
+        let words = lane_words(&mut b, &block);
+        let d = b.b3_compress(
+            cv,
+            B3Block::Lanes(words),
+            block_len_of(i, msg.len()) as u8,
+            block_flags(i, n) as u8,
+        );
+        cv = B3Cv::Words(d);
+        chain = Some(d);
+    }
+    let chain = chain.expect("three blocks");
+    let (parent, rev, ext) = b.b3_compress_rev_ext(
+        B3Cv::Iv,
+        B3Block::Lanes([chain[0], chain[1], chain[0], chain[1]]),
+        64,
+        FLAGS_ONE_BLOCK as u8,
+    );
+    // A squeeze past the first block: its chaining value is not the IV.
+    let mut tail = [0u8; 64];
+    tail[..9].copy_from_slice(b"a-segment");
+    let sevens = lane_words(&mut b, &[7u8; 64]);
+    let first = b.b3_compress(
+        B3Cv::Iv,
+        B3Block::Lanes(sevens),
+        64,
+        block_flags(0, 2) as u8,
+    );
+    let tail = lane_words(&mut b, &tail);
+    let (second, _, ext2) = b.b3_compress_rev_ext(
+        B3Cv::Words(first),
+        B3Block::Lanes(tail),
+        block_len_of(1, 73) as u8,
+        block_flags(1, 2) as u8,
+    );
+    for c in chain
+        .iter()
+        .chain(&parent)
+        .chain(&rev)
+        .chain(&ext)
+        .chain(&second)
+        .chain(&ext2)
+    {
+        b.public(*c);
+    }
+    compile(b.finish())
+}
+
+/// The `blake3` crate's 64 output bytes of `msg`.
+fn xof64(msg: &[u8]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    let mut h = blake3::Hasher::new();
+    h.update(msg);
+    h.finalize_xof().fill(&mut out);
+    out
+}
+
+/// A published digest-width value's bytes, lane by lane.
+fn word_bytes(words: &[(u32, LfmWord)]) -> Vec<u8> {
+    words
+        .iter()
+        .flat_map(|(_, w)| w.iter())
+        .flat_map(|v| super::b3l::lane_u32(v).expect("a u32 lane").to_le_bytes())
+        .collect()
+}
+
+/// ★ THE ANCHOR, 64-byte output: a program whose compressions write their
+/// extended output proves and verifies through W-LFM under the wider head,
+/// and the published extended words are the second 32 of the `blake3`
+/// crate's 64 output bytes — from the IV and from a previous block's digest.
+#[test]
+fn lean_extended_output_round_trips_through_wlfm() {
+    let _fast = test_format::set(Some(2));
+    let program = program_ext();
+    super::validator::validate(&program).expect("admissible");
+    assert_eq!(program.groups.b3l.width, l::PREP_WIDTH_XOF);
+    let build = build(&program);
+    let a = &build.artifacts;
+    assert!(a.b3l.head.xof, "the wider head");
+    let proof = prove(&program, &build);
+    verify_wlfm(a, &proof, &proof.public_words)
+        .unwrap_or_else(|e| panic!("the honest extended-output proof must verify: {e}"));
+    let w = &proof.public_words;
+    let msg: Vec<u8> = (0..150u32).map(|i| (i * 7 + 3) as u8).collect();
+    let chain = blake3::hash(&msg);
+    let mut pair = chain.as_bytes().to_vec();
+    pair.extend_from_slice(chain.as_bytes());
+    let want = xof64(&pair);
+    assert_eq!(
+        word_bytes(&w[2..4]),
+        want[..32].to_vec(),
+        "the parent's digest"
+    );
+    assert_eq!(
+        word_bytes(&w[6..8]),
+        want[32..].to_vec(),
+        "its extended output"
+    );
+    let mut two = vec![7u8; 64];
+    two.extend_from_slice(b"a-segment");
+    let want2 = xof64(&two);
+    assert_eq!(word_bytes(&w[8..10]), want2[..32].to_vec());
+    assert_eq!(word_bytes(&w[10..12]), want2[32..].to_vec(), "past the IV");
+}
+
+/// A tampered published extended word is refused: the head's extended sends
+/// no longer balance the claimed words' reads.
+#[test]
+fn a_tampered_extended_word_is_refused() {
+    let _fast = test_format::set(Some(2));
+    let program = program_ext();
+    let build = build(&program);
+    let proof = prove(&program, &build);
+    for at in [6usize, 11] {
+        let mut claimed = proof.public_words.clone();
+        claimed[at].1[3] += FE::one();
+        assert!(
+            verify_wlfm(&build.artifacts, &proof, &claimed).is_err(),
+            "extended word {at}"
+        );
+    }
+}
+
+/// ★ MUTANT: the head's extended output without the chaining value fed
+/// forward (its lookups XOR `fs[i + 8]` with zero, not `h[i]`). The honest
+/// trace then carries lookups the byte table does not hold, so the mutant
+/// AIR set refuses what the real one accepts — the XOR with `h` is what binds
+/// the extended words to BLAKE3's.
+#[test]
+fn the_extended_output_without_the_chaining_value_is_refused() {
+    let _fast = test_format::set(Some(2));
+    let program = program_ext();
+    let honest_build = build(&program);
+    let proof = prove(&program, &honest_build);
+    verify_wlfm(&honest_build.artifacts, &proof, &proof.public_words).expect("the honest set");
+    let _mutant = super::blake3_lean::mutants::set_ext_without_cv();
+    let mutant_build = build(&program);
+    let refused = match prove_wlfm(&program, &mutant_build, &[]) {
+        Err(_) => true,
+        Ok(p) => verify_wlfm(&mutant_build.artifacts, &p, &p.public_words).is_err(),
+    };
+    assert!(
+        refused,
+        "the mutant head must not prove the honest compressions"
+    );
+}
+
+/// The head's instruction group in a wider head's trace is the program's,
+/// the extended words' addresses and read counts included.
+#[test]
+fn the_wider_heads_prefixes_are_the_programs() {
+    let program = program_ext();
+    let mut filled = execute_and_fill_unmerged(&program, &[], HASHER).expect("executes");
+    let t = filled.b3l_mut().expect("lean tables");
+    let g = &program.groups.b3l;
+    assert_eq!(g.width, l::PREP_WIDTH_XOF);
+    for k in 0..g.real_rows {
+        for c in 0..l::PREP_WIDTH_XOF {
+            assert_eq!(t.heads[0].get(k, c), *g.at(k, c), "head row {k} column {c}");
+        }
+    }
 }

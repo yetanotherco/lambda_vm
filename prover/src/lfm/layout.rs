@@ -391,6 +391,14 @@ pub mod b3l {
     pub const RADDR0: usize = 17; // ..19
     pub const RCNT0: usize = 19; // ..21
     pub const PREP_WIDTH: usize = 21;
+    /// A program whose rows may write the compression's extended output (the
+    /// second 32 of its 64 output bytes, `out[8..16]`) carries two more words
+    /// and their read counts after the prefix above, 0 on a row that writes
+    /// none: the group is [`PREP_WIDTH_XOF`] wide, every row of it. A program
+    /// that writes none keeps [`PREP_WIDTH`] ([`prep_width`]).
+    pub const XADDR0: usize = PREP_WIDTH; // ..23
+    pub const XCNT0: usize = PREP_WIDTH + 2; // ..25
+    pub const PREP_WIDTH_XOF: usize = PREP_WIDTH + 4;
 
     /// Words in a digest (and in a chaining value).
     pub const DIGEST_WORDS: usize = 2;
@@ -418,6 +426,18 @@ pub mod b3l {
     }
     pub const fn rcnt(word: usize) -> usize {
         RCNT0 + word
+    }
+    pub const fn xaddr(word: usize) -> usize {
+        XADDR0 + word
+    }
+    pub const fn xcnt(word: usize) -> usize {
+        XCNT0 + word
+    }
+
+    /// The instruction group's width: [`PREP_WIDTH_XOF`] when the program
+    /// writes any extended output, else [`PREP_WIDTH`].
+    pub const fn prep_width(xof: bool) -> usize {
+        if xof { PREP_WIDTH_XOF } else { PREP_WIDTH }
     }
 
     /// The round-chain tag of the compression on head row `row` (0-based):

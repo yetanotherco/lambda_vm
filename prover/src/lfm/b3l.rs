@@ -83,6 +83,15 @@ pub fn digest_words(d: &[u32; 8]) -> [LfmWord; 2] {
     core::array::from_fn(|w| core::array::from_fn(|lane| FE::from(u64::from(d[4 * w + lane]))))
 }
 
+/// The extended output, `out[8..16]` of a compression's 16 output words, as
+/// two memory words of four `u32` lanes: the second 32 of BLAKE3's 64 output
+/// bytes, each word `v[i + 8] ⊕ h[i]` (the chaining value fed forward).
+pub fn extended_words(out: &[u32; 16]) -> [LfmWord; 2] {
+    core::array::from_fn(|w| {
+        core::array::from_fn(|lane| FE::from(u64::from(out[8 + 4 * w + lane])))
+    })
+}
+
 /// The digest's 32 bytes, little-endian word by word: what `Blake3Std`
 /// returns.
 pub fn digest_bytes(d: &[u32; 8]) -> [u8; 32] {
@@ -561,5 +570,82 @@ mod tests {
                 assert_eq!(at(r, c), 0, "padding row {r} column {c}");
             }
         }
+    }
+
+    /// ★ KAT: a compression asked for its extended output writes, past its
+    /// digest, the second 32 of the `blake3` crate's 64 bytes of extended
+    /// output — on a one-block message (chaining value the IV) and past the
+    /// first block (a previous block's digest fed forward). Its group is the
+    /// wider one, with the extended words' addresses and read counts on that
+    /// row and zero on every other.
+    #[test]
+    fn the_extended_output_is_the_blake3_crates_xof() {
+        for &len in &[0usize, 40, 64, 65, 200, 1024] {
+            let bytes = message(len, 3 + len as u8);
+            let n = num_blocks(len);
+            let mut b = LfmBuilder::new();
+            let mut cv = B3Cv::Iv;
+            let mut last = None;
+            for i in 0..n {
+                let mut block = [0u8; BLOCK_LEN];
+                let start = (i * BLOCK_LEN).min(len);
+                let end = ((i + 1) * BLOCK_LEN).min(len);
+                block[..end - start].copy_from_slice(&bytes[start..end]);
+                let m: [u32; 16] = core::array::from_fn(|k| {
+                    u32::from_le_bytes(block[4 * k..4 * k + 4].try_into().expect("4 bytes"))
+                });
+                let words = lane_words(&mut b, &m);
+                let block = B3Block::Lanes([words[0], words[1], words[2], words[3]]);
+                let (blen, flags) = (block_len_of(i, len) as u8, block_flags(i, n) as u8);
+                if i + 1 == n {
+                    last = Some(b.b3_compress_rev_ext(cv, block, blen, flags));
+                } else {
+                    cv = B3Cv::Words(b.b3_compress(cv, block, blen, flags));
+                }
+            }
+            let (digest, _rev, ext) = last.expect("a last block");
+            for c in digest.iter().chain(&ext).chain(&ext) {
+                b.public(*c);
+            }
+            let program = compile(b.finish());
+            crate::lfm::validator::validate(&program).expect("admissible");
+            let exec = run(&program);
+            let mut want = [0u8; 64];
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&bytes);
+            hasher.finalize_xof().fill(&mut want);
+            assert_eq!(read_digest(&exec, digest), want[..32], "digest at {len}");
+            assert_eq!(
+                read_digest(&exec, ext),
+                want[32..],
+                "extended output at {len}"
+            );
+            let g = &program.groups.b3l;
+            assert_eq!((g.width, g.real_rows), (l::PREP_WIDTH_XOF, n));
+            let at = |r: usize, c: usize| GoldilocksField::canonical(g.at(r, c).value());
+            for r in 0..g.padded_rows {
+                let is_last = r + 1 == n;
+                for j in 0..l::DIGEST_WORDS {
+                    let (addr, cnt) = (at(r, l::xaddr(j)), at(r, l::xcnt(j)));
+                    if is_last {
+                        assert_eq!((addr, cnt), (ext[j].addr().0, 2), "row {r} word {j}");
+                    } else {
+                        assert_eq!((addr, cnt), (0, 0), "row {r} word {j}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A program with no extended output keeps today's group width.
+    #[test]
+    fn no_extended_output_keeps_the_narrow_group() {
+        let mut b = LfmBuilder::new();
+        let d = emit_std(&mut b, &message(100, 9));
+        for c in d {
+            b.public(c);
+        }
+        let program = compile(b.finish());
+        assert_eq!(program.groups.b3l.width, l::PREP_WIDTH);
     }
 }
