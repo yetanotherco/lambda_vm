@@ -970,6 +970,17 @@ fn numbered_on_a_thread(
     walkers: usize,
     number: fn(u32) -> u32,
 ) -> Option<Result<(), Error>> {
+    numbered_on_a_thread_tail(name, walkers, number, 0)
+}
+
+/// [`numbered_on_a_thread`] with `extra` tail walkers, their gate open from
+/// the start (none at `0`).
+fn numbered_on_a_thread_tail(
+    name: &'static str,
+    walkers: usize,
+    number: fn(u32) -> u32,
+    extra: usize,
+) -> Option<Result<(), Error>> {
     let (out_tx, out_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let (program, _) = run(name);
@@ -995,7 +1006,12 @@ fn numbered_on_a_thread(
                         }
                     }
                 });
-                walk_numbered(&mut builder, rx, walkers, number, None, |_, _, _| Ok(()))
+                let gate = super::TailGate::default();
+                gate.open();
+                let tail = (extra > 0).then_some(super::WalkTail { extra, gate: &gate });
+                walk_numbered(&mut builder, rx, walkers, number, None, tail, |_, _, _| {
+                    Ok(())
+                })
             })
             .map(|_| ())
         });
@@ -1023,5 +1039,32 @@ fn a_window_never_walked_or_walked_twice_is_refused() {
             matches!(&repeated, Some(Err(Error::Prover(m))) if m == "window 1 was walked twice"),
             "{walkers} walkers, window 1 repeated: {repeated:?}"
         );
+    }
+}
+
+/// With tail walkers walking from the start (their permits let go, so more
+/// windows are out), a window number the pass never hands out is still
+/// refused, not waited for forever; one handed out twice is refused; and the
+/// run numbered right walks.
+#[test]
+fn with_tail_walkers_a_window_never_walked_or_walked_twice_is_refused() {
+    let name = "test_keccak_multi";
+    let (_, logs) = run(name);
+    assert!(logs.len() > 7 * 12, "{} cycles", logs.len());
+    for (walkers, extra) in [(1, 1), (1, 4), (2, 2)] {
+        let what = format!("{walkers} walkers + {extra}");
+        let skipped = numbered_on_a_thread_tail(name, walkers, |k| k + (k > 0) as u32, extra);
+        assert!(
+            matches!(&skipped, Some(Err(Error::Prover(m))) if m == "window 1 was never walked"),
+            "{what}, window 1 skipped: {skipped:?}"
+        );
+        let repeated =
+            numbered_on_a_thread_tail(name, walkers, |k| if k == 2 { 1 } else { k }, extra);
+        assert!(
+            matches!(&repeated, Some(Err(Error::Prover(m))) if m == "window 1 was walked twice"),
+            "{what}, window 1 repeated: {repeated:?}"
+        );
+        let right = numbered_on_a_thread_tail(name, walkers, |k| k, extra);
+        assert!(matches!(right, Some(Ok(()))), "{what}: {right:?}");
     }
 }

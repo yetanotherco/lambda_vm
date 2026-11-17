@@ -1610,6 +1610,32 @@ fn block_walkers() -> Result<usize, Error> {
     parse_walkers(std::env::var("LAMBDA_VM_BLOCK_WALKERS").ok().as_deref())
 }
 
+/// The most walkers the walk's tail adds once the run has ended
+/// (`LAMBDA_VM_BLOCK_TAIL_WALKERS`).
+const MAX_TAIL_WALKERS: usize = 8;
+
+/// `LAMBDA_VM_BLOCK_TAIL_WALKERS`: unset, empty or `0` (the default) walks
+/// every window on the walkers alone; `1` to [`MAX_TAIL_WALKERS`] adds that
+/// many walkers once the run has ended ([`parallel::WalkTail`]), each letting
+/// one more window be out, so the windows the executor left are walked on
+/// more threads. The windows, the tables and the proof are the same. Anything
+/// else refuses the prove.
+fn parse_tail_walkers(value: Option<&str>) -> Result<usize, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(0),
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=MAX_TAIL_WALKERS).contains(n))
+            .ok_or_else(|| {
+                Error::Prover(format!(
+                    "LAMBDA_VM_BLOCK_TAIL_WALKERS={v}: 0 (the default: no walker added) or 1 to \
+                     {MAX_TAIL_WALKERS} walkers added once the run has ended"
+                ))
+            }),
+    }
+}
+
 /// [`block_walkers`] of the knob's value.
 fn parse_walkers(value: Option<&str>) -> Result<usize, Error> {
     match value.map(str::trim) {
@@ -4256,6 +4282,9 @@ pub(crate) struct Deviations {
     /// How the streamed word families' chunks leave the walk, instead of the
     /// knob (`LAMBDA_VM_WORD_CHUNKS`).
     pub word_chunks: Option<WordChunks>,
+    /// The walkers added once the run has ended, instead of the knob
+    /// (`LAMBDA_VM_BLOCK_TAIL_WALKERS`).
+    pub tail_walkers: Option<usize>,
     /// Whether phase A's head is stamped, instead of the knob
     /// ([`head_log::knob`]).
     pub head_log: Option<bool>,
@@ -6973,6 +7002,27 @@ fn prove_streamed(
     let tag = block_statement_tag(&format.zf.base);
     crate::with_base_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
+        // The walk's tail: walkers added once the run has ended.
+        let tail_walkers = match deviations.tail_walkers {
+            Some(n) => n,
+            None => parse_tail_walkers(
+                std::env::var("LAMBDA_VM_BLOCK_TAIL_WALKERS")
+                    .ok()
+                    .as_deref(),
+            )?,
+        };
+        if walkers > 0 {
+            eprintln!(
+                "★ BLOCK TAIL WALKERS: {tail_walkers} {} (LAMBDA_VM_BLOCK_TAIL_WALKERS)",
+                if tail_walkers == 0 {
+                    "added once the run has ended, the default"
+                } else {
+                    "added once the run has ended"
+                }
+            );
+        }
+        let tail_gate = parallel::TailGate::default();
+        let tail_gate = &tail_gate;
         let bitwise_last = deviations.rest_bitwise_last;
         let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
         let from_tables = bitwise_from_tables_or_default(deviations.bitwise_from_tables);
@@ -7060,6 +7110,9 @@ fn prove_streamed(
             // The logs shared between the walk and the card fill.
             let (ltx, lrx) = std::sync::mpsc::sync_channel::<parallel::ExecWindow>(2);
             let executor = scope.spawn(move || -> Result<(f64, ExecutorStamps), Error> {
+                // The run's end opens the walk's tail, however the executor
+                // stops; the run halting opens it before its last send.
+                let _open = parallel::OpensOnDrop(Some(tail_gate));
                 if let Some(ledger) = ledger {
                     ledger.thread("executor");
                 }
@@ -7146,6 +7199,7 @@ fn prove_streamed(
                         break;
                     };
                     cycles += logs.len() as u64;
+                    let halted = logs.last().is_some_and(|log| log.next_pc == 0);
                     if let Some(check) = &mut shadow {
                         if let Some(start) = sampled {
                             check.submit(start, &logs, executor.pc(), executor.registers());
@@ -7178,6 +7232,9 @@ fn prove_streamed(
                         ledger
                             .exec
                             .store(executor.heap_bytes() + bytes, Relaxed);
+                    }
+                    if halted {
+                        tail_gate.open();
                     }
                     let t = Instant::now();
                     let sent_window = parallel::ExecWindow {
@@ -7324,11 +7381,15 @@ fn prove_streamed(
                     // the walk's start to the first window, then between
                     // windows (the `accumulator recv-wait` term).
                     let mut idle_from = Instant::now();
-                    let report = parallel::walk_windows_with(
+                    let mut report = parallel::walk_windows_with(
                         &mut builder,
                         lrx,
                         walkers,
                         history.then_some(history_check),
+                        (tail_walkers > 0).then_some(parallel::WalkTail {
+                            extra: tail_walkers,
+                            gate: tail_gate,
+                        }),
                         |accumulator, walked, states| {
                             ProducerWaits::add(&waits.accumulator_recv, idle_from);
                             // The walked windows wait in the walk's reorder
@@ -7378,6 +7439,9 @@ fn prove_streamed(
                         ledger.walk.store(builder.state_bytes(), Relaxed);
                     }
                     eprintln!("{}", report.line());
+                    // The run's end, stamped by the executor with no tail too.
+                    report.opened = report.opened.or(tail_gate.opened());
+                    eprintln!("{}", report.tail_line(start));
                     report.last
                 } else {
                     let (mut walker, mut accumulator) = builder.split();
@@ -10535,8 +10599,28 @@ mod producer_report_tests {
     };
     use super::{
         WordChunks, exec_mode_from, parse_exec_history, parse_exec_history_check, parse_light_walk,
-        parse_word_chunks, parse_word_stream,
+        parse_tail_walkers, parse_word_chunks, parse_word_stream,
     };
+
+    /// `LAMBDA_VM_BLOCK_TAIL_WALKERS`: none added unless 1 to 8; any other
+    /// word refused.
+    #[test]
+    fn the_tail_adds_no_walker_unless_asked() {
+        for (word, n) in [
+            (None, 0),
+            (Some(""), 0),
+            (Some("0"), 0),
+            (Some(" 0 "), 0),
+            (Some("1"), 1),
+            (Some("4"), 4),
+            (Some(" 8 "), 8),
+        ] {
+            assert_eq!(parse_tail_walkers(word).ok(), Some(n), "{word:?}");
+        }
+        for bad in ["9", "-1", "four", "4 walkers", "on"] {
+            assert!(parse_tail_walkers(Some(bad)).is_err(), "{bad}");
+        }
+    }
 
     /// `LAMBDA_VM_WORD_CHUNKS`: handed out in parts unless `copy` (the
     /// rollback) or `card`; any other word refused.

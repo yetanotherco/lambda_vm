@@ -576,3 +576,134 @@ fn a_wrong_history_is_refused() {
             .expect("an untouched history");
     }
 }
+
+/// When a run's executor opens the walk's tail ([`super::TailGate`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Opens {
+    /// Before the first window: the tail walkers walk from the start.
+    AtStart,
+    /// As the run halts, before the last window is sent (as the block does).
+    AtHalt,
+    /// Never: the pass's end opens it.
+    Never,
+}
+
+/// The run of `program` walked from the fast engine's history in windows of
+/// `window` cycles on `walkers` threads and `extra` tail walkers whose gate
+/// opens as `opens` says, and the walk's report.
+fn walked_from_history_tail(
+    program: &Elf,
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    walkers: usize,
+    recheck: usize,
+    extra: usize,
+    opens: Opens,
+) -> Result<(Traces, super::ParallelWalk), Error> {
+    let mut builder = WindowedTraceBuilder::new(program, &[], max_rows)?.drop_streamed_ops()?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ExecWindow>(2);
+    let gate = super::TailGate::default();
+    let gate = &gate;
+    let mut chunks = Vec::new();
+    let report = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _open = super::OpensOnDrop((opens != Opens::Never).then_some(gate));
+            if opens == Opens::AtStart {
+                gate.open();
+            }
+            let mut fast = FastExecutor::new(program, Vec::new()).expect("the fast engine");
+            fast.enable_history().expect("history mode");
+            let mut k = 0;
+            loop {
+                let start = (recheck > 0 && k % recheck == 0).then(|| fast.snapshot());
+                let Some((logs, history)) = fast.resume_history(window).expect("the run") else {
+                    break;
+                };
+                let last = (fast.pc() == 0)
+                    .then(|| {
+                        fast.take_history_final()
+                            .map(crate::tables::trace_builder::windowed::parallel::RunEnd::boxed)
+                    })
+                    .flatten();
+                if last.is_some() && opens == Opens::AtHalt {
+                    gate.open();
+                }
+                let sent = tx.send(ExecWindow {
+                    logs: Arc::new(logs),
+                    start,
+                    history: Some(Box::new(history)),
+                    last,
+                });
+                if sent.is_err() {
+                    break;
+                }
+                k += 1;
+            }
+        });
+        super::walk_windows_from_history_tail(
+            &mut builder,
+            rx,
+            walkers,
+            recheck,
+            super::WalkTail { extra, gate },
+            |accumulator, walked, _| {
+                chunks.extend(
+                    accumulator
+                        .absorb(walked)
+                        .into_iter()
+                        .map(ChunkJob::generate),
+                );
+                Ok(())
+            },
+        )
+    })?;
+    let mut traces = builder.finish(&report.last)?;
+    traces.insert_streamed(chunks)?;
+    Ok((traces, report))
+}
+
+/// ★ Walked from the executor's history with 1 and 4 walkers added once the
+/// run ends (`LAMBDA_VM_BLOCK_TAIL_WALKERS`), their gate opened before the
+/// first window, as the run halts, or only by the pass's end, on 1 and 3
+/// walkers, rechecked or not, the windows build the whole-run tables; the
+/// tail walkers opened from the start walk windows, and a gate opened as the
+/// run halts opens before the window that halts reaches the pass.
+#[test]
+fn windows_walked_from_history_with_tail_walkers_build_the_whole_run_tables() {
+    let max_rows = MaxRowsConfig::small();
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "test_copy_ecalls",
+        "test_ecsm",
+    ] {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, &max_rows);
+        for window in [1, 7, 33] {
+            for (walkers, recheck) in [(1, 0), (3, 2)] {
+                for extra in [1, 4] {
+                    for opens in [Opens::AtStart, Opens::AtHalt, Opens::Never] {
+                        let what = format!(
+                            "{name}, window {window}, {walkers} walkers + {extra}, recheck \
+                             {recheck}, {opens:?}"
+                        );
+                        let (traces, report) = walked_from_history_tail(
+                            &program, &max_rows, window, walkers, recheck, extra, opens,
+                        )
+                        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                        same_traces(&reference, &traces);
+                        assert_eq!(report.tail_walkers, extra, "{what}");
+                        let (opened, halted) = (report.opened, report.halted);
+                        assert!(opened.is_some() && halted.is_some(), "{what}");
+                        if opens != Opens::Never {
+                            assert!(opened <= halted, "{what}: opened after the halt passed");
+                        }
+                        if opens == Opens::AtStart && window == 1 {
+                            assert!(report.tail_walked > 0, "{what}: the tail walked nothing");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

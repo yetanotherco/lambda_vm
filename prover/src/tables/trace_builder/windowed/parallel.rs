@@ -36,8 +36,9 @@
 
 use std::collections::BTreeMap;
 use std::hash::BuildHasher;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Instant;
 
 use executor::vm::history::{HistoryFinal, RegisterCells, WindowHistory, WordHistoryFinal};
@@ -605,6 +606,10 @@ struct PassEnd {
     /// The bytes the windows touched: their cells handed to the finish less
     /// their cells at the run's start, hashed and summed ([`cell_hash`]).
     boundaries: u64,
+    /// When the window that halts reached the pass, and when the finish's
+    /// state was built from it.
+    halted: Option<Instant>,
+    state_built: Option<Instant>,
 }
 
 /// What a run walked on several threads reports (the `BLOCK WALKERS` line).
@@ -626,6 +631,18 @@ pub struct ParallelWalk {
     pub state_bytes: usize,
     /// Walked from the executor's history ([`walk_windows_from_history`]).
     pub from_history: bool,
+    /// The walk's tail ([`WalkTail`]): the walkers that started only once
+    /// the run ended, and the windows they walked.
+    pub tail_walkers: usize,
+    pub tail_walked: usize,
+    /// When the run's end opened the tail's gate (none without a tail), the
+    /// window that halts reached the pass, the finish's state was built,
+    /// the last window was walked and the last absorbed.
+    pub opened: Option<Instant>,
+    pub halted: Option<Instant>,
+    pub state_built: Option<Instant>,
+    pub last_walked: Option<Instant>,
+    pub last_absorbed: Option<Instant>,
 }
 
 impl ParallelWalk {
@@ -647,6 +664,81 @@ impl ParallelWalk {
             ""
         }
     }
+
+    /// The walk's tail, in seconds since `start` (the `BLOCK WALK TAIL` line).
+    pub fn tail_line(&self, start: Instant) -> String {
+        let at = |t: Option<Instant>| {
+            t.map_or("-".to_string(), |t| {
+                format!("{:.3}", t.saturating_duration_since(start).as_secs_f64())
+            })
+        };
+        format!(
+            "BLOCK WALK TAIL: {} walkers once the run ended · the run ended at {} · the halting window passed at {} · the finish's state built at {} · the last window walked at {} · absorbed at {} · the tail walkers walked {} windows",
+            self.tail_walkers,
+            at(self.opened),
+            at(self.halted),
+            at(self.state_built),
+            at(self.last_walked),
+            at(self.last_absorbed),
+            self.tail_walked,
+        )
+    }
+}
+
+/// The run's end, for the walkers that start only then ([`WalkTail`]):
+/// opened once, by the executor as the run halts and in any case as the pass
+/// ends, however it ends.
+#[derive(Debug, Default)]
+pub struct TailGate {
+    opened: Mutex<Option<Instant>>,
+    open: Condvar,
+}
+
+impl TailGate {
+    /// Opens the gate (the first call stamps when) and wakes its waiters.
+    pub fn open(&self) {
+        let mut opened = self.opened.lock().unwrap_or_else(PoisonError::into_inner);
+        opened.get_or_insert_with(Instant::now);
+        self.open.notify_all();
+    }
+
+    /// When the gate opened, if it has.
+    pub fn opened(&self) -> Option<Instant> {
+        *self.opened.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits for the gate to open.
+    fn wait(&self) {
+        let mut opened = self.opened.lock().unwrap_or_else(PoisonError::into_inner);
+        while opened.is_none() {
+            opened = self
+                .open
+                .wait(opened)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// Opens its gate when dropped: on every way out of the thread holding it.
+pub struct OpensOnDrop<'g>(pub Option<&'g TailGate>);
+
+impl Drop for OpensOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(gate) = self.0 {
+            gate.open();
+        }
+    }
+}
+
+/// The walk's tail (`LAMBDA_VM_BLOCK_TAIL_WALKERS`): `extra` walkers more,
+/// which start once `gate` opens, each then letting one more window be out
+/// (handed out and not absorbed). Until then the walk is the one without
+/// them; after, the windows the executor left are walked on more threads.
+/// The windows, their order and what is absorbed are the same.
+#[derive(Clone, Copy, Debug)]
+pub struct WalkTail<'g> {
+    pub extra: usize,
+    pub gate: &'g TailGate,
 }
 
 /// The run's windows, as the executor sends them (each with its memory at the
@@ -666,7 +758,7 @@ pub fn walk_windows<W: Into<ExecWindow> + Send>(
     walkers: usize,
     absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
 ) -> Result<ParallelWalk, Error> {
-    walk_numbered(builder, windows, walkers, |k| k, None, absorb)
+    walk_numbered(builder, windows, walkers, |k| k, None, None, absorb)
 }
 
 /// [`walk_windows`] (`record` `None`) or [`walk_windows_from_history`]
@@ -676,9 +768,10 @@ pub fn walk_windows_with<W: Into<ExecWindow> + Send>(
     windows: Receiver<W>,
     walkers: usize,
     record: Option<usize>,
+    tail: Option<WalkTail<'_>>,
     absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
 ) -> Result<ParallelWalk, Error> {
-    walk_numbered(builder, windows, walkers, |k| k, record, absorb)
+    walk_numbered(builder, windows, walkers, |k| k, record, tail, absorb)
 }
 
 /// [`walk_windows`] in record mode: each window comes with the executor's
@@ -699,17 +792,48 @@ pub fn walk_windows_from_history<W: Into<ExecWindow> + Send>(
     recheck: usize,
     absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
 ) -> Result<ParallelWalk, Error> {
-    walk_numbered(builder, windows, walkers, |k| k, Some(recheck), absorb)
+    walk_numbered(
+        builder,
+        windows,
+        walkers,
+        |k| k,
+        Some(recheck),
+        None,
+        absorb,
+    )
+}
+
+/// [`walk_windows_from_history`] with the walk's tail ([`WalkTail`]).
+#[cfg(test)]
+pub fn walk_windows_from_history_tail<W: Into<ExecWindow> + Send>(
+    builder: &mut WindowedTraceBuilder<'_>,
+    windows: Receiver<W>,
+    walkers: usize,
+    recheck: usize,
+    tail: WalkTail<'_>,
+    absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
+) -> Result<ParallelWalk, Error> {
+    walk_numbered(
+        builder,
+        windows,
+        walkers,
+        |k| k,
+        Some(recheck),
+        Some(tail),
+        absorb,
+    )
 }
 
 /// [`walk_windows`], each job numbered `number(k)` for the run's window `k`:
-/// a test numbers them wrong to show the absorbing side refuses it.
+/// a test numbers them wrong to show the absorbing side refuses it. With a
+/// `tail`, its walkers start as its gate opens ([`WalkTail`]).
 fn walk_numbered<W: Into<ExecWindow> + Send>(
     builder: &mut WindowedTraceBuilder<'_>,
     windows: Receiver<W>,
     walkers: usize,
     number: fn(u32) -> u32,
     record: Option<usize>,
+    tail: Option<WalkTail<'_>>,
     mut absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
 ) -> Result<ParallelWalk, Error> {
     assert!(walkers >= 1, "walk_windows needs a walker");
@@ -737,17 +861,44 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
     let key = settings.key;
     let start_registers = builder.register_state.clone();
     let lean = builder.lean.memory;
-    let (end, walk_secs, held_most, state_bytes, counts) = {
+    let (extra, gate) = tail.map_or((0, None), |tail| (tail.extra, Some(tail.gate)));
+    let (end, walk_secs, held_most, state_bytes, counts, stamps) = {
         let (mut accumulator, image) = builder.accumulator_and_image();
         let (job_tx, job_rx) = sync_channel::<Ticket>(walkers);
         let job_rx = Mutex::new(job_rx);
+        // A permit for each window out (handed out and not absorbed). The
+        // tail walkers' are taken from the start, one each: until the gate
+        // opens at most `walkers + 2` windows are out, as without them; each
+        // tail walker lets its permit go as it starts (`released` counts
+        // them, before they go). A permit is taken before its window is
+        // handed out, so the permits held never fall below those not yet let
+        // go, and letting one go never waits.
+        let (permit_tx, permit_rx) = sync_channel::<()>(walkers + 2 + extra);
+        for _ in 0..extra {
+            permit_tx
+                .try_send(())
+                .map_err(|_| Error::Prover("the tail walkers' permits".into()))?;
+        }
+        let permit_rx = Mutex::new(Some(permit_rx));
+        let released = AtomicUsize::new(0);
+        let (permit_rx, released) = (&permit_rx, &released);
+        // A permit let go: the absorbing side's for each window absorbed, a
+        // tail walker's as it starts. Gone (an error), nothing to let go.
+        let let_go = move || {
+            if let Some(rx) = permit_rx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            {
+                let _ = rx.recv();
+            }
+        };
         std::thread::scope(|scope| -> Result<_, Error> {
             #[allow(clippy::type_complexity)]
             let (done_tx, done_rx) =
                 sync_channel::<(u32, usize, Result<(WalkedWindow, f64, usize, u64), Error>)>(
                     walkers + 2,
                 );
-            let (permit_tx, permit_rx) = sync_channel::<()>(walkers + 2);
             let decode = Arc::clone(&settings.decode);
             let words = settings.memory_format == crate::tables::fused_memory::MemoryFormat::Words;
             // Record mode's check thread, fed every window in order.
@@ -757,35 +908,47 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                 scope.spawn(move || check_thread(settings, &registers, image, check_rx))
             });
             let check_tx = check.is_some().then_some(check_tx);
-            let pass = scope.spawn(move || match record {
-                Some(recheck) => record_thread(
-                    &start_registers,
-                    image,
-                    lean,
-                    windows,
-                    number,
-                    recheck,
-                    check_tx,
-                    job_tx,
-                    permit_tx,
-                ),
-                None => pass_thread(
-                    decode,
-                    &start_registers,
-                    image,
-                    lean,
-                    key,
-                    words,
-                    windows,
-                    number,
-                    job_tx,
-                    permit_tx,
-                ),
+            let pass = scope.spawn(move || {
+                // The pass's end opens the tail's gate however it ends.
+                let _open = OpensOnDrop(gate);
+                match record {
+                    Some(recheck) => record_thread(
+                        &start_registers,
+                        image,
+                        lean,
+                        windows,
+                        number,
+                        recheck,
+                        check_tx,
+                        job_tx,
+                        permit_tx,
+                    ),
+                    None => pass_thread(
+                        decode,
+                        &start_registers,
+                        image,
+                        lean,
+                        key,
+                        words,
+                        windows,
+                        number,
+                        job_tx,
+                        permit_tx,
+                    ),
+                }
             });
-            let mut threads = Vec::with_capacity(walkers);
-            for w in 0..walkers {
+            let mut threads = Vec::with_capacity(walkers + extra);
+            for w in 0..walkers + extra {
                 let (job_rx, done_tx, settings) = (&job_rx, done_tx.clone(), Arc::clone(&settings));
                 threads.push(scope.spawn(move || {
+                    // A tail walker: from the run's end, its permit let go.
+                    if w >= walkers {
+                        if let Some(gate) = gate {
+                            gate.wait();
+                        }
+                        released.fetch_add(1, Relaxed);
+                        let_go();
+                    }
                     let mut walker = WindowWalker::new(settings);
                     // After an error (its own or the absorbing side's), the
                     // walker takes the jobs still coming and drops them, so the
@@ -828,7 +991,11 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
             let (mut held, mut next, mut held_most) = (BTreeMap::new(), 0u32, 0usize);
             // Each walker's window state as of its last window, and the most
             // they took at once.
-            let (mut walk_secs, mut states, mut state_bytes) = (0.0, vec![0usize; walkers], 0);
+            let (mut walk_secs, mut states, mut state_bytes) =
+                (0.0, vec![0usize; walkers + extra], 0);
+            // The tail: the windows its walkers walked, when the last window
+            // was walked and when the last was absorbed.
+            let (mut tail_walked, mut last_walked, mut last_absorbed) = (0usize, None, None);
             // The walked windows' boundary sums, added as they come.
             let mut boundaries = 0u64;
             // The first error from a walker or from absorbing; an absorbing
@@ -843,6 +1010,8 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                     }
                 };
                 walk_secs += busy;
+                last_walked = Some(Instant::now());
+                tail_walked += usize::from(w >= walkers);
                 boundaries = boundaries.wrapping_add(boundary);
                 states[w] = bytes;
                 state_bytes = state_bytes.max(states.iter().sum());
@@ -857,23 +1026,28 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                         break 'windows;
                     }
                     head_log::window_absorbed(next as usize);
+                    last_absorbed = Some(Instant::now());
                     // One window fewer handed out and not absorbed.
-                    let _ = permit_rx.recv();
+                    let_go();
                     next += 1;
                 }
                 // On a correct run window `next` is handed out before every
                 // window held, so the permits leave room for at most
-                // `walkers + 1` held. With `walkers + 2` the pass waits for a
-                // permit only window `next` frees: it was never handed out.
-                if held.len() >= walkers + 2 {
+                // `walkers + 1` held (and one more for each tail walker's let
+                // go). With `walkers + 2` the pass waits for a permit only
+                // window `next` frees: it was never handed out.
+                if held.len() >= walkers + 2 + released.load(Relaxed) {
                     failure = Some(Error::Prover(format!("window {next} was never walked")));
                     break;
                 }
             }
             // On a failure the other threads see their channels close.
             drop(done_rx);
-            drop(permit_rx);
-            let mut counts = Vec::with_capacity(walkers);
+            permit_rx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let mut counts = Vec::with_capacity(walkers + extra);
             for thread in threads {
                 match thread.join() {
                     Ok(mine) => counts.extend(mine),
@@ -931,7 +1105,8 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
                 }
                 (None, Ok(end)) => {
                     check_boundaries(boundaries, end.boundaries)?;
-                    Ok((end, walk_secs, held_most, state_bytes, counts))
+                    let stamps = (tail_walked, last_walked, last_absorbed);
+                    Ok((end, walk_secs, held_most, state_bytes, counts, stamps))
                 }
             }
         })?
@@ -947,7 +1122,10 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         entries,
         most_entries,
         boundaries: _,
+        halted,
+        state_built,
     } = end;
+    let (tail_walked, last_walked, last_absorbed) = stamps;
     // The walkers' counts, for the finish to add.
     builder.made_counts.extend(counts);
     let state = Arc::try_unwrap(state)
@@ -965,6 +1143,13 @@ fn walk_numbered<W: Into<ExecWindow> + Send>(
         held_most,
         state_bytes,
         from_history: record.is_some(),
+        tail_walkers: extra,
+        tail_walked,
+        opened: gate.and_then(TailGate::opened),
+        halted,
+        state_built,
+        last_walked,
+        last_absorbed,
     })
 }
 
@@ -994,6 +1179,7 @@ fn pass_thread<W: Into<ExecWindow>>(
     let mut waiting: Option<SyncSender<After>> = None;
     let (mut k, mut first, mut busy, mut entries, mut most) = (0u32, 0usize, 0.0, 0usize, 0usize);
     let (mut sent, mut state_secs, mut boundaries) = (false, 0.0, 0u64);
+    let (mut halted, mut state_built) = (None, None);
     for window in windows {
         let ExecWindow { logs, start, .. } = window.into();
         sent = true;
@@ -1013,6 +1199,7 @@ fn pass_thread<W: Into<ExecWindow>>(
             let state = Arc::new(pass.walked_state(&start, image, lean));
             boundaries = pass.boundaries(&state, image, key);
             state_secs = t.elapsed().as_secs_f64();
+            (halted, state_built) = (Some(t), Some(Instant::now()));
             busy += state_secs;
             if let Some(after) = waiting.take() {
                 let _ = after.send(After::Finish {
@@ -1080,6 +1267,8 @@ fn pass_thread<W: Into<ExecWindow>>(
         entries,
         most_entries: most,
         boundaries,
+        halted,
+        state_built,
     })
 }
 
@@ -1108,6 +1297,7 @@ fn record_thread<W: Into<ExecWindow>>(
     // The previous job's follow-up.
     let mut waiting: Option<SyncSender<After>> = None;
     let (mut k, mut first, mut busy, mut state_secs) = (0u32, 0usize, 0.0, 0.0);
+    let (mut halted, mut state_built) = (None, None);
     let no_memory = Arc::new(executor::vm::memory::Memory::default().snapshot());
     let mut sent = false;
     for window in windows {
@@ -1182,6 +1372,7 @@ fn record_thread<W: Into<ExecWindow>>(
                 Error::Prover("record mode: the run's last window came without its end".into())
             })?;
             let state = Arc::new(finish_state(&end, &history, image, lean));
+            (halted, state_built) = (Some(t), Some(Instant::now()));
             if let Some(after) = waiting.take() {
                 let _ = after.send(After::Finish {
                     registers: registers.clone(),
@@ -1234,6 +1425,8 @@ fn record_thread<W: Into<ExecWindow>>(
         entries: 0,
         most_entries: 0,
         boundaries: 0,
+        halted,
+        state_built,
     })
 }
 
