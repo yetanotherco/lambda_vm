@@ -63,7 +63,7 @@ do not apply to its review (the label trigger does run the PR's version of the w
 
 ## Secrets
 
-- `AI_REVIEW_OPENROUTER_KEY`: OpenRouter key for every model but Claude (an organization secret,
+- `OPENROUTER_API_KEY`: OpenRouter key for every model but Claude (an organization secret,
   shared across repositories). It must come from the OpenRouter account that holds the review's
   provider presets. Its credit limit is the hard ceiling on those models' spend.
 - `ANTHROPIC_API_KEY`: Anthropic API key for the Opus reviewer. Opus is billed by Anthropic, outside
