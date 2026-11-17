@@ -43,8 +43,8 @@ use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use crypto::fiat_shamir::p1_transcript::{P1Transcript, P1TranscriptHash};
 use crypto::fiat_shamir::transcript_hash::{
-    Blake3StdTranscriptHash, HasTranscriptHash, KeccakTranscriptHash, RpxTranscriptHash,
-    TranscriptHash,
+    Blake3StdSqueeze64TranscriptHash, Blake3StdTranscriptHash, HasTranscriptHash,
+    KeccakTranscriptHash, RpxTranscriptHash, TranscriptHash,
 };
 use crypto::merkle_tree::backends::p1::P1BatchBackend;
 use crypto::merkle_tree::backends::types::{
@@ -348,6 +348,52 @@ impl WhirHash for Blake3Whir {
     }
 }
 
+/// ★ [`Blake3Whir`] with **64-byte squeezes**: the same trees, leaves, joint
+/// leaf, device kernels and grind, under the sponge
+/// [`Blake3StdSqueeze64TranscriptHash`], whose squeeze hands out the final
+/// compression's 64 output bytes (eight candidates) where
+/// [`Blake3StdTranscriptHash`]'s hands out its 32-byte digest (four).
+///
+/// Opt-in, for the BLAKE3 base whose format names it (the base's statement
+/// tag): a recursion verifies each squeeze's eight candidates off one
+/// compression, where today's draws past the fourth cost a second. Its roots
+/// are [`Blake3Whir`]'s, and its [`WhirHash::NAME`] is theirs; the sponge's
+/// name tells the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Blake3Squeeze64Whir;
+
+impl WhirHash for Blake3Squeeze64Whir {
+    const NAME: &'static str = Blake3Whir::NAME;
+
+    const DEVICE: DeviceHashKey = Blake3Whir::DEVICE;
+
+    const JOINT_LEAF: bool = Blake3Whir::JOINT_LEAF;
+
+    type Transcript = Blake3StdSqueeze64TranscriptHash;
+
+    type Backend<F>
+        = BatchBlake3StdBackend<F>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send;
+
+    type Sponge =
+        DefaultTranscript<Degree3GoldilocksExtensionField, Blake3StdSqueeze64TranscriptHash>;
+
+    fn sponge() -> Self::Sponge {
+        DefaultTranscript::new(&[])
+    }
+
+    /// [`Blake3Whir::joint_leaf`]: the trees are the same.
+    fn joint_leaf<F>(values: &[FieldElement<F>], blocks: usize) -> Option<Commitment>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+    {
+        Blake3Whir::joint_leaf(values, blocks)
+    }
+}
+
 /// Children per node of `H`'s trees over `F` (2, or 4 under [`P1Whir`]).
 pub fn arity<F, H>() -> usize
 where
@@ -380,6 +426,7 @@ const _: fn() = || {
     assert_usable::<RpxWhir>();
     assert_usable::<P1Whir>();
     assert_usable::<Blake3Whir>();
+    assert_usable::<Blake3Squeeze64Whir>();
 };
 
 /// ✓ Each configuration's transcript is ITS OWN, not the other's.
@@ -404,6 +451,12 @@ const _: fn() = || {
         core::marker::PhantomData::<(
             Blake3StdTranscriptHash,
             <Blake3Whir as WhirHash>::Transcript,
+        )>,
+    );
+    assert_same::<Blake3StdSqueeze64TranscriptHash>(
+        core::marker::PhantomData::<(
+            Blake3StdSqueeze64TranscriptHash,
+            <Blake3Squeeze64Whir as WhirHash>::Transcript,
         )>,
     );
 };
@@ -435,11 +488,21 @@ const _: () = {
     assert!(same(Blake3Whir::NAME, Blake3Whir::DEVICE.name()));
     // The sponge's hash is the configuration's name too.
     assert!(same(Blake3Whir::NAME, Blake3StdTranscriptHash::NAME));
+    // The 64-byte-squeeze configuration's trees are BLAKE3's under BLAKE3's
+    // kernels; its sponge is the one name that differs.
+    assert!(same(
+        Blake3Squeeze64Whir::NAME,
+        Blake3Squeeze64Whir::DEVICE.name()
+    ));
+    assert!(!same(
+        Blake3Squeeze64Whir::NAME,
+        Blake3StdSqueeze64TranscriptHash::NAME
+    ));
 };
 
 #[cfg(test)]
 mod sponge_default_tests {
-    use super::{Blake3Whir, KeccakWhir, P1Whir, RpxWhir, WhirHash};
+    use super::{Blake3Squeeze64Whir, Blake3Whir, KeccakWhir, P1Whir, RpxWhir, WhirHash};
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use math::field::{
         element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
@@ -465,5 +528,22 @@ mod sponge_default_tests {
         same::<RpxWhir>();
         same::<P1Whir>();
         same::<Blake3Whir>();
+        same::<Blake3Squeeze64Whir>();
+    }
+
+    /// The two BLAKE3 configurations are two transcripts: the same state and
+    /// the same first four candidates, then the 64-byte squeeze's fifth where
+    /// the 32-byte one squeezes again, so their first extension challenge
+    /// differs (it takes six).
+    #[test]
+    fn the_two_blake3_sponges_part_at_the_first_challenge() {
+        let (mut narrow, mut wide) = (Blake3Whir::sponge(), Blake3Squeeze64Whir::sponge());
+        for t in [&mut narrow as &mut dyn IsTranscript<Ext>, &mut wide] {
+            t.append_bytes(b"a statement");
+        }
+        assert_eq!(narrow.state(), wide.state());
+        let a: FieldElement<Ext> = narrow.sample_field_element();
+        let b: FieldElement<Ext> = wide.sample_field_element();
+        assert_ne!(a, b);
     }
 }
