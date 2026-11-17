@@ -348,22 +348,26 @@ fn fixture_with(cfg: &ChainConfig, num_vars: usize) -> Fixture {
 
     // ★ The host's draw stream has the shape the emitter's order assumes: one
     // challenge per sumcheck round, `z0` and `gamma` on every round but the
-    // last, and `Q` bounded draws a round. Derived from the schedule, not read
-    // off the recorder.
+    // last (and under the round form a second `gamma` after the positions),
+    // and `Q` bounded draws a round (`Q_r` under the round form). Derived from
+    // the schedule, not read off the recorder.
     let shape = ChainShape::new(cfg, num_vars);
     let rounds = shape.rounds();
+    let per_successor = if shape.whir() { 3 } else { 2 };
     assert_eq!(
         recorded.sampled.len(),
-        num_vars + 2 * (rounds - 1),
-        "extension draws: one a sumcheck round ({num_vars} in all), plus z0 and gamma on \
+        num_vars + per_successor * (rounds - 1),
+        "extension draws: one a sumcheck round ({num_vars} in all), plus {per_successor} on \
          each of the {} rounds with a successor",
         rounds - 1
     );
+    let positions: usize = (0..rounds).map(|r| shape.queries(r)).sum();
     assert_eq!(
         recorded.drawn_u64.len(),
-        num_queries * rounds,
-        "bounded draws: {num_queries} query positions in each of {rounds} rounds"
+        positions,
+        "bounded draws: the query positions of each of {rounds} rounds"
     );
+    assert!(shape.whir() || positions == num_queries * rounds);
 
     Fixture {
         proof,
@@ -797,8 +801,40 @@ const KNOB_COST_SHAPES: [(usize, usize, u8, usize); 6] = [
     (7, 3, 8, 6),
 ];
 
+/// ★ The WHIR round form's shapes: `(num_vars, k0, k, shrink, security
+/// bits, grind)` at blowup 4, the counts sized for the bits by
+/// `with_security_folds` and each later round's for its own rate. A shrink
+/// below the fold (the rate rising), equal to it (the rate fixed), the
+/// base's intended first fold 4 and shrink 3, a first fold of 6; grind 0
+/// and 8 for [`COST_SHAPES`]' reason.
+const ROUND_FORM_COST_SHAPES: [(usize, Option<usize>, usize, usize, u8, u8); 5] = [
+    (9, None, 2, 1, 16, 0),
+    (9, None, 2, 2, 16, 8),
+    (11, Some(5), 3, 2, 16, 8),
+    (12, Some(4), 4, 3, 20, 0),
+    (11, Some(6), 4, 3, 16, 8),
+];
+
+/// A round-form config of [`ROUND_FORM_COST_SHAPES`].
+fn round_form_config(
+    n: usize,
+    k0: Option<usize>,
+    k: usize,
+    shrink: usize,
+    bits: u8,
+    grind: u8,
+) -> ChainConfig {
+    let folds = k0.map_or(WhirFolds::Uniform, |k0| {
+        WhirFolds::First(FirstFold::new(k0).expect("a tested first fold"))
+    });
+    ChainConfig::with_security_folds(2, k, folds, n, bits, GrindBits::uniform(grind))
+        .with_whir_rounds(shrink, bits, n)
+        .expect("a tested shrink")
+}
+
 /// Every shape the cost forms are gated at: [`COST_SHAPES`] under today's
-/// schedule, then [`KNOB_COST_SHAPES`] under their first folds.
+/// schedule, then [`KNOB_COST_SHAPES`] under their first folds, then
+/// [`ROUND_FORM_COST_SHAPES`] under the round form.
 fn cost_configs() -> Vec<(ChainConfig, usize)> {
     COST_SHAPES
         .iter()
@@ -807,6 +843,11 @@ fn cost_configs() -> Vec<(ChainConfig, usize)> {
             KNOB_COST_SHAPES
                 .iter()
                 .map(|&(n, q, g, k0)| (first_fold_config(q, g, k0), n)),
+        )
+        .chain(
+            ROUND_FORM_COST_SHAPES
+                .iter()
+                .map(|&(n, k0, k, s, bits, g)| (round_form_config(n, k0, k, s, bits, g), n)),
         )
         .collect()
 }
