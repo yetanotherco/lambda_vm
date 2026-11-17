@@ -976,9 +976,12 @@ fn a_word_block_with_cut_word_families_proves_and_verifies() {
 /// ★ A word block whose word families stream in chunks as the walk fills
 /// them (`Deviations::word_stream`, the knob `LAMBDA_VM_WORD_STREAM=1`)
 /// proves and verifies, and states what the finish-built block states: the
-/// same table counts, word tables, heights and public output. At word caps of
-/// 4 rows, so every family with rows cuts into chunks; on a CPU run and on
-/// runs that call COPY, keccak256 and ECREC.
+/// same table counts, word tables, heights and public output; so does one
+/// whose streamed ops are dropped as handed out and whose word chunks leave
+/// as the windows' parts their rows lie in (`Deviations::word_chunks`, the
+/// knob `LAMBDA_VM_WORD_CHUNKS=part`). At word caps of 4 rows, so every
+/// family with rows cuts into chunks; on a CPU run and on runs that call
+/// COPY, keccak256 and ECREC.
 #[test]
 fn a_word_block_with_streamed_word_families_states_the_finish_built_block() {
     // Runs `test_ecrec`: the ECREC forgery switch stays off meanwhile.
@@ -997,8 +1000,9 @@ fn a_word_block_with_streamed_word_families_states_the_finish_built_block() {
         "test_ecrec",
     ] {
         let elf = asm_elf_bytes(name);
-        let options = super::block_whir_tests::streamed(tiny.clone(), 3, 9);
-        let prove_with = |stream: bool| {
+        let prove_with = |stream: bool, in_place: bool| {
+            let mut options = super::block_whir_tests::streamed(tiny.clone(), 3, 9);
+            options.drop_streamed_ops = in_place;
             prove_block_whir_with(
                 &elf,
                 &[],
@@ -1007,37 +1011,45 @@ fn a_word_block_with_streamed_word_families_states_the_finish_built_block() {
                 &options,
                 &Deviations {
                     word_stream: Some(stream),
+                    word_chunks: Some(if in_place {
+                        crate::block_whir::WordChunks::Parts
+                    } else {
+                        crate::block_whir::WordChunks::Copy
+                    }),
                     ..Deviations::default()
                 },
             )
-            .unwrap_or_else(|e| panic!("{name} stream {stream}: {e:?}"))
+            .unwrap_or_else(|e| panic!("{name} stream {stream} in place {in_place}: {e:?}"))
             .0
         };
-        let (built, streamed) = (prove_with(false), prove_with(true));
-        assert!(
-            matches!(verify_block_whir(&streamed, &elf, &opts, &words), Ok(true)),
-            "{name}"
-        );
-        assert_eq!(
-            format!("{:?}", streamed.table_counts),
-            format!("{:?}", built.table_counts),
-            "{name}: the counts"
-        );
-        assert_eq!(
-            streamed.word_memory, built.word_memory,
-            "{name}: the word tables"
-        );
-        assert_eq!(
-            streamed.table_num_vars, built.table_num_vars,
-            "{name}: the heights"
-        );
-        assert_eq!(
-            streamed.public_output, built.public_output,
-            "{name}: the output"
-        );
-        assert!(
-            streamed.word_memory.iter().any(|&n| n > 1),
-            "{name}: a family cut into several tables"
-        );
+        let built = prove_with(false, false);
+        for in_place in [false, true] {
+            let streamed = prove_with(true, in_place);
+            assert!(
+                matches!(verify_block_whir(&streamed, &elf, &opts, &words), Ok(true)),
+                "{name} {in_place}"
+            );
+            assert_eq!(
+                format!("{:?}", streamed.table_counts),
+                format!("{:?}", built.table_counts),
+                "{name}: the counts"
+            );
+            assert_eq!(
+                streamed.word_memory, built.word_memory,
+                "{name}: the word tables"
+            );
+            assert_eq!(
+                streamed.table_num_vars, built.table_num_vars,
+                "{name}: the heights"
+            );
+            assert_eq!(
+                streamed.public_output, built.public_output,
+                "{name}: the output"
+            );
+            assert!(
+                streamed.word_memory.iter().any(|&n| n > 1),
+                "{name}: a family cut into several tables"
+            );
+        }
     }
 }
