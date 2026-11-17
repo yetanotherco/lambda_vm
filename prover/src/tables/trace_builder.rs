@@ -2532,7 +2532,9 @@ fn walk_cpu_ops<const REST: bool>(
         ));
     }
     // This call's COPY rows start here; earlier calls' are already in the list.
+    // Under the word memory format COPY_W's rows move the bytes instead.
     let copy_ops_before = copy_ops.len();
+    let copy_w_before = word_rows.copy.len();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
     // register binding transports across epochs. Resetting to 0 here would drift
@@ -3032,15 +3034,25 @@ fn walk_cpu_ops<const REST: bool>(
     // There is no COMMIT table any more: COPY receives the `write` ECALL itself. The
     // committed length is checked against the rows that actually move the bytes, and
     // a zero-length `write` contributes a single row that moves none. Only this call's
-    // rows count, so the carried start index is subtracted.
+    // rows count, so the carried start index is subtracted. Under the word memory
+    // format the rows are COPY_W's, each moving its window's bytes; a window whose
+    // state lacks a word makes none and is refused (its state marked missing), so it
+    // is not checked.
     debug_assert!(
-        !REST
-            || copy_ops[copy_ops_before..]
+        !REST || (words && memory_state.is_missing()) || {
+            let copied: u64 = copy_ops[copy_ops_before..]
                 .iter()
                 .filter(|op| op.functionality == copy::Functionality::Write && op.count != 0)
                 .map(|op| op.width as u64)
-                .sum::<u64>()
-                == u64::from(current_commit_index - start_commit_index),
+                .sum();
+            let copied_words: u64 = word_rows.copy[copy_w_before..]
+                .iter()
+                .filter(|row| row.functionality() == copy::Functionality::Write)
+                .filter_map(|row| row.window())
+                .map(|(start, last)| u64::from(last - start) + 1)
+                .sum();
+            copied + copied_words == u64::from(current_commit_index - start_commit_index)
+        },
         "COPY should move exactly the committed byte count"
     );
     memw.refusal()
