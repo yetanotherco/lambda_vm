@@ -60,6 +60,8 @@ mod whir_joint_tree_tests;
 mod whir_p1_tests;
 pub mod whir_round;
 #[cfg(test)]
+mod whir_round_form_tests;
+#[cfg(test)]
 mod whir_run_claim_tests;
 pub mod whir_split;
 pub mod zerocheck;
@@ -257,4 +259,21 @@ pub enum Error {
     CosetSuccessorNotEncoded {
         cause: whir_chain::UnencodedSuccessor,
     },
+    /// A [`whir_chain::RoundForm::Whir`] config whose query target gives
+    /// another round-0 count than the config's own
+    /// ([`whir_chain::check_round_form`]). Refused before a chain is proved or
+    /// a proof is read.
+    #[error("the round form's query target gives {expected} round-0 queries, the config {got}")]
+    RoundFormTarget { expected: usize, got: usize },
+    /// A chain under [`whir_chain::RoundForm::Whir`] runs more rounds than
+    /// the union bound its counts were charged for
+    /// ([`whir_chain::check_round_form_union`]): its counts would answer to a
+    /// smaller union. Refused before the chain is proved or its proof read.
+    #[error("a chain of {rounds} rounds under a round form charged for {union}")]
+    RoundFormUnion { rounds: usize, union: usize },
+    /// Under [`whir_chain::RoundForm::Whir`] a round opened its successor's
+    /// tree: the round form checks a successor through its claims, and a
+    /// proof carries no successor block there.
+    #[error("round {round} opens its successor, which the round form never does")]
+    SuccessorOpened { round: usize },
 }

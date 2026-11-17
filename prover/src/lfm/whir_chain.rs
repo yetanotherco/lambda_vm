@@ -84,7 +84,7 @@ use multilinear::stacked_eval::index_chains;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
     ChainConfig, ChainProof, ChainRound, GroupFold, LeafOrder, MAX_INDEX_POLYS, NonceLayout,
-    Round0Trees, RoundOpenings, index_vars,
+    Round0Trees, RoundForm, RoundOpenings, index_vars,
 };
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
@@ -258,6 +258,14 @@ impl ChainShape {
     /// [`Self::new`] over trees of `arity` children per node: the hash's
     /// arity, as the host's prover and verifier take it.
     pub fn new_at(config: &ChainConfig, num_vars: usize, arity: usize) -> Self {
+        // The emitter checks a successor by opening it: a chain under the
+        // WHIR round form (its successors checked through claims, its rate
+        // rising) has no in-guest verifier yet, and none is emitted for one.
+        assert!(
+            config.format.rounds == RoundForm::Fri,
+            "the in-guest chain verifier opens each successor: no program is emitted for a chain \
+             under the WHIR round form"
+        );
         let schedule = config.schedule(num_vars);
         let mut domain_log = Vec::with_capacity(schedule.len());
         let mut d = num_vars + config.log_blowup;

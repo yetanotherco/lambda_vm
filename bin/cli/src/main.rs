@@ -1392,6 +1392,12 @@ fn cmd_prove_block_base(
             prover::block_whir::B3_BASE_GROUP_ENV,
             String::from_utf8_lossy(&prover::block_whir::block_format_tag(&cfg.format))
         );
+        eprintln!(
+            "BLOCK BASE ROUNDS: {:?} ({} reads 0, fri, 1 or w3) · card drop {}",
+            cfg.format.b3_rounds,
+            prover::block_whir::B3_BASE_ROUNDS_ENV,
+            cfg.options.drop_levels
+        );
     }
     eprintln!(
         "BLOCK BASE ONLY: base {:?} · group {group} · blowup {blowup} · leaves {leaves} · trees \
@@ -1441,6 +1447,19 @@ fn cmd_prove_block_base(
         "BLOCK BASE HOST COMMITS: {} (stacked commits the card declined)",
         prover::block_whir::host_commit_fallbacks()
     );
+    if cfg.format.zf.base == BaseFormat::B3_WHIR {
+        let (host_encodes, claim_batches) = prover::block_whir::round_form_counts();
+        eprintln!(
+            "BLOCK BASE ROUND FORM: {:?} · successors encoded on the host {host_encodes} · \
+             shift-claim batches on the card {claim_batches}",
+            cfg.format.b3_rounds
+        );
+        let (from_stacks, reencoded) = prover::block_whir::coset_counts();
+        eprintln!(
+            "BLOCK BASE COSET OPENINGS: from the stacks {from_stacks} · re-encoded {reencoded} \
+             (round-0 openings of coset-ordered trees)"
+        );
+    }
     {
         let (host, one_copy, per_point) = prover::block_whir::final_message_reads();
         eprintln!(

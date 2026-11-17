@@ -432,6 +432,34 @@ extern "C" __global__ void add_scaled_ext3(uint64_t *__restrict__ dst,
     at[2] = sum.c;
 }
 
+// `dst[x] += Σ_j hi[j][x >> lo_bits] · lo[j][x mod 2^lo_bits]`: a weight
+// gaining `points` scaled `eq` tables at once (the WHIR round form's shift
+// claims), each split into its high half and its scaled low half. The halves
+// are `points · 2^(n/2)` values against the weight's `2^n`, so they stay in
+// cache; one thread an index, its row's high values a broadcast, its low
+// values read in order. The sum per index runs over the points in order.
+extern "C" __global__ void add_eq_tensor_ext3(uint64_t *__restrict__ dst,
+                                              const uint64_t *__restrict__ hi,
+                                              const uint64_t *__restrict__ lo, uint64_t count,
+                                              uint64_t points, uint32_t lo_bits) {
+    uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= count) return;
+    uint64_t lo_len = 1ull << lo_bits;
+    uint64_t hi_len = count >> lo_bits;
+    uint64_t x_hi = x >> lo_bits;
+    uint64_t x_lo = x & (lo_len - 1);
+    Fe3 acc = load_ext(dst + x * 3);
+    for (uint64_t j = 0; j < points; ++j) {
+        Fe3 h = load_ext(hi + (j * hi_len + x_hi) * 3);
+        Fe3 l = load_ext(lo + (j * lo_len + x_lo) * 3);
+        acc = ext3::add(acc, ext3::mul(h, l));
+    }
+    uint64_t *at = dst + x * 3;
+    at[0] = acc.a;
+    at[1] = acc.b;
+    at[2] = acc.c;
+}
+
 // One level of the eq table's doubling: `dst[j + half] = dst[j]·r` and
 // `dst[j] = dst[j]·(1 − r)`, the halves disjoint so one thread owns both. The
 // host seeds `dst[0]` and walks the variables back to front, which is what
