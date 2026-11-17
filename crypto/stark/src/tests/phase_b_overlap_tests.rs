@@ -56,7 +56,7 @@ pub(super) const SIZES: [usize; 7] = [1, 2, 1, 1, 1, 2, 1];
 /// The prepared stacks: a group and its tables' prefixes, `(table, columns)`.
 const PREPARED: [(usize, &[(usize, usize)]); 2] = [(1, &[(1, 1), (2, 2)]), (5, &[(6, 2), (7, 1)])];
 
-fn config(argue: ArgueFormat) -> ChainConfig {
+pub(super) fn config(argue: ArgueFormat) -> ChainConfig {
     config_for(argue, GroupFold::PerPoly)
 }
 
@@ -183,7 +183,7 @@ fn prepared_commitments<Hh: WhirHash>(
 }
 
 /// One group's share as the observer was handed it, serialized.
-type Heard = (usize, Vec<u8>);
+pub(super) type Heard = (usize, Vec<u8>);
 
 /// The block proved under `overlap`, its groups taken in `order`, with a
 /// test's `faults`: the proof and every group's stamps, or the prove's error,
@@ -245,6 +245,26 @@ fn prove_block_placed<Hh: WhirHash>(
     reorder: Option<&PhaseBReorder<'_>>,
     retired: bool,
 ) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
+    prove_block_with::<Hh>(config, overlap, order, faults, fault, reorder, retired, None)
+}
+
+/// A phase A of a test's own over the block's tables, in place of
+/// [`BlockCommitted::commit`] one group after another.
+pub(super) type PhaseA<'c> = dyn for<'a> Fn(Vec<CommittedTable<'a, Fp, Ext>>, &ChainConfig) -> BlockCommitted<'a, Fp, Ext>
+    + 'c;
+
+/// [`prove_block_placed`] with `phase_a` committing the block when given.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prove_block_with<Hh: WhirHash>(
+    config: &ChainConfig,
+    overlap: PhaseBOverlap,
+    order: &[usize],
+    faults: OverlapFaults,
+    fault: &dyn Fn(&mut BlockCommitted<'_, Fp, Ext>),
+    reorder: Option<&PhaseBReorder<'_>>,
+    retired: bool,
+    phase_a: Option<&PhaseA<'_>>,
+) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
     let airs = airs();
     let config = *config;
     let columns = prepared_columns();
@@ -277,17 +297,21 @@ fn prove_block_placed<Hh: WhirHash>(
             packed: None,
         })
         .collect();
-    let mut block = BlockCommitted::commit::<Hh, <Hh as WhirHash>::Sponge>(
-        tables(&airs),
-        &SIZES,
-        &config,
-        TreeDrop::uniform(1),
-        Narrowing::Wide,
-        false,
-    )
-    .expect("phase A")
-    .with_phase_b_overlap(overlap)
-    .with_overlap_faults(faults);
+    let committed = match phase_a {
+        Some(phase_a) => phase_a(tables(&airs), &config),
+        None => BlockCommitted::commit::<Hh, <Hh as WhirHash>::Sponge>(
+            tables(&airs),
+            &SIZES,
+            &config,
+            TreeDrop::uniform(1),
+            Narrowing::Wide,
+            false,
+        )
+        .expect("phase A"),
+    };
+    let mut block = committed
+        .with_phase_b_overlap(overlap)
+        .with_overlap_faults(faults);
     fault(&mut block);
     let heard: Mutex<Vec<Heard>> = Mutex::new(Vec::new());
     let on_group = |opened: GroupOpened<'_, Fp, Ext>| {
@@ -330,7 +354,7 @@ pub(super) fn bytes(proved: &BlockProved<Fp, Ext>) -> Vec<u8> {
 
 /// The verifier's reading of `proved`, against the shapes and the split it
 /// rebuilds itself and the prepared stacks' roots.
-fn verify(argue: ArgueFormat, proved: &BlockProved<Fp, Ext>) -> Result<(), MlError> {
+pub(super) fn verify(argue: ArgueFormat, proved: &BlockProved<Fp, Ext>) -> Result<(), MlError> {
     verify_block(&config(argue), proved, &proved.4, VerifierChecks::ALL)
 }
 
@@ -443,12 +467,12 @@ pub(super) const ARGUES: [ArgueFormat; 2] = [ArgueFormat::PerTable, ArgueFormat:
 /// group at a time: re-pinned when every block proof gained those answers
 /// (before them, at 76a950dc2, phase B proved the bytes the overlap was first
 /// pinned against). One group at a time still proves these bytes.
-const BEFORE_THE_OVERLAP: [&str; 2] = [
+pub(super) const BEFORE_THE_OVERLAP: [&str; 2] = [
     "fef46d1082e57b1c835f97af901a8d6d6b5d8104e33f0d577af8482580284563",
     "0fe883d9d0241ddf41a7eda3eece5adbe2b7be4af2440a6f248357cca5a3bec0",
 ];
 
-fn digest(proved: &BlockProved<Fp, Ext>) -> String {
+pub(super) fn digest(proved: &BlockProved<Fp, Ext>) -> String {
     use sha3::{Digest, Sha3_256};
     Sha3_256::digest(bytes(proved))
         .iter()

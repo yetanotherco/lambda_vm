@@ -1491,6 +1491,214 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
+/// What [`probe_constraint_sumcheck`] ran. A measurement; no proof holds it.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConstraintProbe {
+    pub tables: usize,
+    /// Of them, the tables whose rounds the card ran.
+    pub on_card: usize,
+    /// Seconds: the rules, the weights and the card's sessions set up; the
+    /// rounds; and of the long programs' later rounds, the host's.
+    pub setup: f64,
+    pub rounds: f64,
+    pub host_tail: f64,
+}
+
+/// The stage [`probe_constraint_sumcheck`] names when a table's rounds would
+/// have gone to the host and the probe was told not to take them there.
+#[doc(hidden)]
+pub const PROBE_DECLINED: &str = "a probe table the card declined";
+
+/// ⛔ A MEASUREMENT, never part of a proof: the constraint sumcheck of
+/// [`prove_argue`] (its phase C) over `tables`, with every challenge and every
+/// input claim drawn from `transcript` — a throwaway the caller made for it —
+/// and every message discarded. It costs what phase C costs over these
+/// columns: the same rules, weights and rounds, where the batched argue would
+/// run them. The claims' values are not the ladders' (no ladder runs), so the
+/// messages are not a proof of anything; the work is the same.
+///
+/// Under [`Where::Device`] a table whose rounds the card declines is refused
+/// ([`PROBE_DECLINED`]) instead of folded on the host; `host` lets the host
+/// take it (a test without a card). Every table's device factors are let go
+/// before it returns, whatever it returns.
+#[doc(hidden)]
+pub fn probe_constraint_sumcheck<F, E, T>(
+    tables: &[CommittedTable<'_, F, E>],
+    bin_log_cells: u8,
+    pack: GkrPack,
+    at: Where,
+    host: bool,
+    transcript: &mut T,
+) -> Result<ConstraintProbe, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    let probed = probe_constraint_rounds(tables, bin_log_cells, pack, at, host, transcript);
+    for table in tables {
+        table.trace.release_device();
+    }
+    probed
+}
+
+/// [`probe_constraint_sumcheck`] before its tables let go of their device
+/// factors: phase C of [`prove_argue`], line for line, over drawn claims.
+fn probe_constraint_rounds<F, E, T>(
+    tables: &[CommittedTable<'_, F, E>],
+    bin_log_cells: u8,
+    pack: GkrPack,
+    at: Where,
+    host: bool,
+    transcript: &mut T,
+) -> Result<ConstraintProbe, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    let started = std::time::Instant::now();
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    let beta: FieldElement<E> = transcript.sample_field_element();
+    let statements: Vec<TableStatement<'_, F, E>> = tables.iter().map(|t| t.statement()).collect();
+    let shapes: Vec<ArgueShape> = statements.iter().map(ArgueShape::of).collect();
+    let plan = argue_plan_packed(&shapes, bin_log_cells, pack);
+    let interactions: Vec<Vec<Interaction<E>>> = tables
+        .iter()
+        .map(|table| {
+            multilinear_logup::interactions(
+                table.layout.interactions,
+                table.slot_of().len(),
+                &z,
+                &alpha,
+                |col| slot(table.slot_of(), col),
+            )
+        })
+        .collect::<Result<_, _>>()?;
+    // Where the ladders would leave each table's input claim: a point over its
+    // input layer's variables, drawn here; the claimed values stay zero.
+    let claims: Vec<GkrClaim<E>> = shapes
+        .iter()
+        .map(|shape| GkrClaim {
+            point: (0..shape.input_vars)
+                .map(|_| transcript.sample_field_element())
+                .collect(),
+            p: FieldElement::zero(),
+            q: FieldElement::zero(),
+        })
+        .collect();
+
+    // From here, phase C of `prove_argue` as it runs today.
+    let xi: Vec<FieldElement<E>> = (0..plan.num_vars)
+        .map(|_| transcript.sample_field_element())
+        .collect();
+    let lambda: FieldElement<E> = transcript.sample_field_element();
+    let weights = table_weights(&lambda, tables.len());
+    let lambdas = vec![FieldElement::one(), lambda.clone(), &lambda * &lambda];
+    let lambda2 = &lambda * &lambda;
+    let mut constraints: Vec<Option<multilinear::fused::Constraints<F>>> =
+        Vec::with_capacity(tables.len());
+    let mut columns: Vec<Option<multilinear::gpu::ColumnFactors>> =
+        Vec::with_capacity(tables.len());
+    for table in tables {
+        let shape = table.shape();
+        let made = (at == Where::Device && multilinear::gpu_fused::argue_fused())
+            .then(|| {
+                multilinear::fused::Constraints::<F>::from_extension(
+                    &shape.steps_as_ops(),
+                    shape.root_steps(),
+                    shape.selector_of_root(),
+                    shape.degree(),
+                )
+                .ok()
+            })
+            .flatten();
+        let column = (at == Where::Device
+            && multilinear::gpu::argue_no_lift()
+            && table.trace.device_factors().is_none())
+        .then(|| made.as_ref().and_then(|_| table.trace.column_factors()))
+        .flatten();
+        if at == Where::Device && made.is_some() && column.is_none() {
+            let _ = table.trace.reside_from_columns();
+        }
+        constraints.push(made);
+        columns.push(column);
+    }
+    let device: Vec<Option<Arc<multilinear::gpu::DeviceFactors>>> = tables
+        .iter()
+        .map(|table| match at {
+            Where::Host => None,
+            Where::Device => table.trace.device_factors(),
+        })
+        .collect();
+    let on_host = at == Where::Host || host;
+    let mut polys = Vec::with_capacity(tables.len());
+    for (t, table) in tables.iter().enumerate() {
+        let n = table.num_vars();
+        let (rules, row_point) =
+            table_rules(&statements[t], &interactions[t], &claims[t].point, &beta)?;
+        let xi_t = &xi[..n];
+        let betas = multilinear_air::beta_powers(&beta, table.shape().num_roots());
+        let fused = constraints[t]
+            .as_ref()
+            .map(|constraints| multilinear::gpu_fused::FusedInput {
+                constraints,
+                betas: &betas,
+                interactions: &interactions[t],
+                claim_point: &claims[t].point,
+                r: xi_t,
+                columns: columns[t].as_ref(),
+            });
+        let claim = &lambda * &claims[t].p + &lambda2 * &claims[t].q;
+        polys.push(front_loaded::TableRounds::new(
+            rules,
+            lambdas.clone(),
+            &claim,
+            [xi_t, &row_point],
+            n,
+            device[t].as_deref(),
+            columns[t].as_ref(),
+            fused,
+            || {
+                if on_host {
+                    table.trace.factors()
+                } else {
+                    Err(MlError::DeviceFailed {
+                        stage: PROBE_DECLINED,
+                    })
+                }
+            },
+        )?);
+    }
+    let on_card = polys.iter().filter(|p| p.on_device()).count();
+    let setup = started.elapsed().as_secs_f64();
+    // What this thread's tail held before is not the probe's.
+    multilinear::gpu_fused::take_tail();
+    let started = std::time::Instant::now();
+    front_loaded::prove_with(
+        &mut polys,
+        &weights,
+        plan.degree,
+        transcript,
+        PaddingFault::default(),
+    )?;
+    let rounds = started.elapsed().as_secs_f64();
+    let tail = multilinear::gpu_fused::take_tail();
+    Ok(ConstraintProbe {
+        tables: tables.len(),
+        on_card,
+        setup,
+        rounds,
+        host_tail: tail.host[0] + tail.host[1],
+    })
+}
+
 /// Where a batched argue's time goes, printed under `LAMBDA_VM_BASE_SPLIT=1`.
 #[derive(Default)]
 struct ArgueSplit {
