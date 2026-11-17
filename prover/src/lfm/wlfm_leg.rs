@@ -164,7 +164,10 @@ fn child_frame(
         .map(|s| (s.group, s.tables.as_slice()))
         .collect();
     check_coverage(&a.counts, &a.sizes, &plan)?;
-    stacks(shapes, &a.sizes, &a.config).map_err(|e| format!("{e:?}"))
+    let (layouts, domains) = stacks(shapes, &a.sizes, &a.config).map_err(|e| format!("{e:?}"))?;
+    // No chain emitted under a round form the host refuses.
+    super::wlfm::check_wlfm_round_form(a, &layouts)?;
+    Ok((layouts, domains))
 }
 
 /// ★ Emits ONE W-LFM child's complete verification over `arena`, which it
