@@ -203,7 +203,7 @@ pub fn parse_stacks(value: Option<&str>) -> Result<Option<StackPlace>, String> {
 /// only when there is no card. Printed.
 pub(crate) fn stack_place(cells: u64, level: usize, forced: Option<StackPlace>) -> StackPlace {
     let need = cells.saturating_mul(STACK_CARD_BYTES_PER_CELL);
-    let budget = multilinear::gpu::reserve_budget();
+    let budget = multilinear::gpu::reserve_budget().saturating_sub(levels_pad_held());
     let place = if budget == 0 {
         StackPlace::Host
     } else if let Some(place) = forced {
@@ -388,6 +388,71 @@ fn prepare_next(
 /// guard reads the peak. Best effort: `false` where it cannot.
 pub(crate) fn reset_peak_rss() -> bool {
     std::fs::write("/proc/self/clear_refs", "5").is_ok()
+}
+
+/// `LAMBDA_VM_LEVELS_CARD_PAD_MB=<MiB>`: while the levels prove, the card
+/// ledger promises at most its budget less this many MiB: the driver holds a
+/// promise of that size from the base's end to its own (one the card never
+/// allocates), so the levels' commits, openings and revives together stay
+/// that far under the budget while the base keeps all of it. Unset or 0 (the
+/// default): no pad. Read once a process; nonsense is refused.
+pub const CARD_PAD_ENV: &str = "LAMBDA_VM_LEVELS_CARD_PAD_MB";
+
+/// What [`CARD_PAD_ENV`] says, in bytes.
+pub fn parse_card_pad(value: Option<&str>) -> Result<u64, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(0),
+        Some(v) => v
+            .parse::<u64>()
+            .map(|mb| mb << 20)
+            .map_err(|_| format!("{CARD_PAD_ENV} must be a whole number of MiB, got `{v}`")),
+    }
+}
+
+fn card_pad_bytes() -> Result<u64, String> {
+    static PAD: std::sync::OnceLock<Result<u64, String>> = std::sync::OnceLock::new();
+    PAD.get_or_init(|| parse_card_pad(std::env::var(CARD_PAD_ENV).ok().as_deref()))
+        .clone()
+}
+
+/// The levels' pad, while the driver holds it, and its size.
+static LEVELS_PAD: std::sync::Mutex<Option<(multilinear::gpu::DeviceRoom, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// The bytes of the levels' pad held now (0 when none).
+fn levels_pad_held() -> u64 {
+    LEVELS_PAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |(_, b)| *b)
+}
+
+/// Takes the levels' pad ([`CARD_PAD_ENV`]): the bytes held, 0 when there is
+/// none to take or no card, or the ledger would not promise it.
+fn take_levels_pad() -> Result<u64, String> {
+    let bytes = card_pad_bytes()?;
+    if bytes == 0 {
+        return Ok(0);
+    }
+    let held = multilinear::gpu::reserve_room(bytes).map(|room| (room, bytes));
+    let got = held.as_ref().map_or(0, |(_, b)| *b);
+    *LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = held;
+    Ok(got)
+}
+
+/// Gives the levels' pad back.
+fn release_levels_pad() {
+    *LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Gives the levels' pad back when the driver returns, by any path.
+struct PadRelease;
+
+impl Drop for PadRelease {
+    fn drop(&mut self) {
+        release_levels_pad();
+    }
 }
 
 /// A filled level's program let go: its instructions and instruction
@@ -663,6 +728,8 @@ pub struct LevelsTimes {
     /// The card at named points, each after a drain and a trim
     /// ([`card_settle`]).
     pub card: Vec<(String, CardReading)>,
+    /// The levels' card pad held ([`CARD_PAD_ENV`]), in bytes.
+    pub card_pad: u64,
 }
 
 /// One level's build, as the driver ran it.
@@ -784,6 +851,8 @@ pub fn prove_block_levels(
     // verification) goes back to the OS first, so the peak this block's base
     // reads starts from what is live, not from pages the allocator keeps.
     let purge_at_start = crate::alloc_purge::purge_now();
+    card_pad_bytes()?;
+    let _pad = PadRelease;
     let peak_reset = reset_peak_rss();
     // What an earlier block left in the card's pool goes back too.
     let at_start = card_settle();
@@ -1085,6 +1154,7 @@ pub fn prove_block_levels(
                         return Err("the base did not prove".to_string());
                     }
                     let settled = card_settle();
+                    take_levels_pad()?;
                     let build = commit_level(pre, 1)?;
                     let committed = card_settle();
                     Ok((build, prepare, cells, now(), [settled, committed]))
@@ -1151,11 +1221,13 @@ pub fn prove_block_levels(
             let pre = prepare_level(&program, family)?;
             let (prepare, cells) = (pre.secs(), pre.prepared_cells());
             let settled = card_settle();
+            take_levels_pad()?;
             let build = commit_level(pre, 1)?;
             let committed = card_settle();
             (build, prepare, cells, now(), [settled, committed])
         }
     };
+    times.card_pad = levels_pad_held();
     for (at, card) in ["base end", "level 1 committed"].into_iter().zip(cards) {
         if let Some(card) = card {
             times.card.push((at.to_string(), card));
