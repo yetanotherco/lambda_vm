@@ -265,6 +265,12 @@ pub enum Error {
     /// a proof is read.
     #[error("the round form's query target gives {expected} round-0 queries, the config {got}")]
     RoundFormTarget { expected: usize, got: usize },
+    /// A chain under [`whir_chain::RoundForm::Whir`] runs more rounds than
+    /// the union bound its counts were charged for
+    /// ([`whir_chain::check_round_form_union`]): its counts would answer to a
+    /// smaller union. Refused before the chain is proved or its proof read.
+    #[error("a chain of {rounds} rounds under a round form charged for {union}")]
+    RoundFormUnion { rounds: usize, union: usize },
     /// Under [`whir_chain::RoundForm::Whir`] a round opened its successor's
     /// tree: the round form checks a successor through its claims, and a
     /// proof carries no successor block there.

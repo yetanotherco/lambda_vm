@@ -1154,6 +1154,178 @@ fn a_rate_that_ignores_the_shrink_drops_a_round_below_the_target() {
     assert!(worst < 128.0, "{worst}");
 }
 
+// ───────────────────────────── the round form's grinds and OOD domain ────────
+
+/// ★ A ROUND-FORM ROUND CHECKS ITS NONCES' WORK. Under nonzero grinds (5
+/// out-of-domain bits, 6 query bits) an honest proof verifies; a prover that
+/// skips the work at the round form's rounds — its out-of-domain nonces alone,
+/// or its query nonces alone — is refused by that grind's bits; THE MUTANT, a
+/// verifier that absorbs those nonces unchecked, accepts either cheat. A nonce
+/// changed in an honest proof is refused too.
+#[test]
+fn a_round_form_round_checks_its_nonces_work() {
+    let n = 13;
+    let grind = GrindBits {
+        folding: 0,
+        ood: 5,
+        query: 6,
+    };
+    let cfg = ChainConfig::with_security_folds(1, 4, folds(Some(4)), n, 40, grind)
+        .with_whir_rounds(3, 40, n)
+        .unwrap();
+    check_round_form(&cfg).unwrap();
+    let s = single(&cfg, n, 17);
+    check_single_ok(&s, &cfg);
+    let rounds = s.proof.rounds.len();
+    assert!(rounds >= 3, "two rounds that commit a successor at least");
+    for (fault, bits) in [
+        (Fault::SpoilRoundFormOodNonces, 5u8),
+        (Fault::SpoilRoundFormQueryNonces, 6),
+    ] {
+        let cheat = with(fault, || single(&cfg, n, 17));
+        assert_eq!(
+            check(&cheat, &cheat.proof, &cfg),
+            Err(Error::GrindingRejected { bits }),
+            "{fault:?}"
+        );
+        with(Fault::RoundFormNonceUnchecked, || {
+            assert_eq!(
+                check(&cheat, &cheat.proof, &cfg),
+                Ok(()),
+                "{fault:?}: the mutant accepts"
+            );
+        });
+    }
+    // An honest proof with one round-form nonce moved: refused at that round
+    // (a moved nonce fails the work but for a chance of 2^-bits; one of the
+    // first sixteen candidates past it fails).
+    for r in 0..rounds - 1 {
+        for slot in ["ood", "query"] {
+            let refused = (1u64..=16).any(|d| {
+                let mut proof = s.proof.clone();
+                match slot {
+                    "ood" => proof.rounds[r].nonces.ood ^= d,
+                    _ => proof.rounds[r].nonces.query ^= d,
+                }
+                matches!(check(&s, &proof, &cfg), Err(Error::GrindingRejected { .. }))
+            });
+            assert!(refused, "round {r} {slot}");
+        }
+    }
+}
+
+/// ★ A chain that runs more rounds than its config's union bound is refused
+/// on both sides: a config sized for chains of 8 variables proves no chain
+/// of 13, and reads no proof of one (its counts would be charged too few
+/// rounds).
+#[test]
+fn a_chain_past_the_union_bound_is_refused() {
+    let small = whir(1, Some(4), 4, 3, 8, 40);
+    check_round_form(&small).unwrap();
+    let n = 13;
+    let w = match small.format.rounds {
+        RoundForm::Whir(w) => w,
+        RoundForm::Fri => unreachable!(),
+    };
+    assert!(small.rounds(n) > w.union_rounds());
+    let f = mle(n, 3);
+    let z = point(n, 3);
+    let (commitment, domain) = commit::<F, H>(&f, &small, true).unwrap();
+    assert!(matches!(
+        prove::<F, Ext, _, H>(&f, &z, &commitment, &domain, &small, &mut sponge()),
+        Err(Error::RoundFormUnion { .. })
+    ));
+    let sized = whir(1, Some(4), 4, 3, n, 40);
+    let s = single(&sized, n, 3);
+    check_single_ok(&s, &sized);
+    assert!(matches!(
+        check(&s, &s.proof, &small),
+        Err(Error::RoundFormUnion { .. })
+    ));
+}
+
+/// A transcript that hands out `forced` at its `at`-th field-element draw and
+/// the inner transcript's draws otherwise (the inner one still draws).
+struct Forced<T> {
+    inner: T,
+    draws: usize,
+    at: usize,
+    forced: EE,
+}
+
+impl<T: IsTranscript<Ext>> IsTranscript<Ext> for Forced<T> {
+    fn append_field_element(&mut self, element: &EE) {
+        self.inner.append_field_element(element);
+    }
+    fn append_bytes(&mut self, new_bytes: &[u8]) {
+        self.inner.append_bytes(new_bytes);
+    }
+    fn state(&self) -> [u8; 32] {
+        self.inner.state()
+    }
+    fn sample_field_element(&mut self) -> EE {
+        let drawn = self.inner.sample_field_element();
+        self.draws += 1;
+        if self.draws == self.at {
+            self.forced
+        } else {
+            drawn
+        }
+    }
+    fn sample_u64(&mut self, upper_bound: u64) -> u64 {
+        self.inner.sample_u64(upper_bound)
+    }
+}
+
+/// ★ The out-of-domain point is checked against the SUCCESSOR's domain, the
+/// larger one under the round form (round `r`'s domain squared `shrink`
+/// times, not `k` times): a verifier whose draw lands on a point of the
+/// successor's domain that the folded domain does not hold refuses it as in
+/// the domain. THE MUTANT: checked against the folded domain, the same point
+/// passes that check (and the proof fails later, for another cause).
+#[test]
+fn the_out_of_domain_point_is_kept_off_the_successors_domain() {
+    let n = 12;
+    let cfg = whir(1, Some(4), 4, 3, n, 40);
+    let s = single(&cfg, n, 2);
+    check_single_ok(&s, &cfg);
+    // Round 0's domain is 2^(n+1); its successor's 2^(n+1−3), its folded
+    // domain 2^(n+1−4). The successor's generator lies off the folded domain.
+    let successor = Domain::<F>::new(n + 1 - 3).unwrap();
+    let z = successor.generator().to_extension::<Ext>();
+    let mut folded_power = z;
+    for _ in 0..(n + 1 - 4) {
+        folded_power = folded_power.square();
+    }
+    assert_ne!(folded_power, EE::one(), "not in the folded domain");
+    // Round 0's out-of-domain point is the fifth draw: four sumcheck
+    // challenges first (`the_order_of_a_round_form_round_is_pinned`).
+    let rigged = |s: &Single| {
+        verify::<F, Ext, _, H>(
+            &s.proof,
+            &s.commitment.root(),
+            &s.z,
+            s.y,
+            &s.domain,
+            &cfg,
+            &mut Forced {
+                inner: sponge(),
+                draws: 0,
+                at: 5,
+                forced: z,
+            },
+        )
+    };
+    assert_eq!(rigged(&s), Err(Error::OodPointInDomain));
+    with(Fault::OodAgainstFoldedDomain, || {
+        let r = rigged(&s);
+        assert!(
+            r.is_err() && r != Err(Error::OodPointInDomain),
+            "the mutant passes the point: {r:?}"
+        );
+    });
+}
+
 // ───────────────────────────── caps by Q ─────────────────────────────────────
 
 /// ★ CAPS BY Q, the counts: `cap_paid_by` is `⌈log2 Q⌉` binary levels
