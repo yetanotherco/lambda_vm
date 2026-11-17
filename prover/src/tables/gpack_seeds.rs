@@ -169,9 +169,10 @@ fn cpu_seed_base_from(value: Option<&str>) -> bool {
 }
 
 /// Whether the finish also seeds the word memory format's kinds
-/// ([`WORD_SEEDS`]): on at `LAMBDA_VM_FINISH_SEED_WORDS=1`, off unset or at
-/// any other word (today's default), read once a process. The packed bytes
-/// are the same either way.
+/// ([`WORD_SEEDS`]): on unless `LAMBDA_VM_FINISH_SEED_WORDS=0` (the rollback),
+/// read once a process. The packed bytes are the same either way. On the
+/// large block COPY's tables took 9.0 → 2.8 thread-seconds, phase A −0.24 s
+/// (the median's −0.06 s), and the host's peak 5.7 GiB less.
 pub(crate) fn seed_words_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -179,9 +180,10 @@ pub(crate) fn seed_words_on() -> bool {
     })
 }
 
-/// [`seed_words_on`]'s reading of `LAMBDA_VM_FINISH_SEED_WORDS`.
+/// [`seed_words_on`]'s reading of `LAMBDA_VM_FINISH_SEED_WORDS`: unset or any
+/// word but `0` seeds; `0` is the rollback.
 fn seed_words_from(value: Option<&str>) -> bool {
-    value.is_some_and(|v| v.trim() == "1")
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 /// The seeds the finish takes: every kind's, and the word kinds' when `words`.
@@ -265,7 +267,7 @@ mod tests {
     }
 
     /// The word kinds' seeds parse to their tables' column counts, each width
-    /// 1, 2, 4 or 8, and are taken only with the word knob.
+    /// 1, 2, 4 or 8, and are taken unless the word knob is `0`.
     #[test]
     fn every_word_seed_parses_to_its_kinds_columns() {
         let today = [
@@ -285,11 +287,11 @@ mod tests {
         }
         assert_eq!(seeds(false).count(), SEEDS.len());
         assert_eq!(seeds(true).count(), SEEDS.len() + WORD_SEEDS.len());
-        assert!(!seed_words_from(None));
-        assert!(!seed_words_from(Some("0")));
-        assert!(!seed_words_from(Some("on")));
+        assert!(seed_words_from(None));
         assert!(seed_words_from(Some("1")));
         assert!(seed_words_from(Some(" 1\n")));
+        assert!(!seed_words_from(Some("0")));
+        assert!(!seed_words_from(Some(" 0\n")));
     }
 
     /// ★ COPY_W's seed is the widths its writer needs on a run at the clock
