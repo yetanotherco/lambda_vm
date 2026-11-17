@@ -79,5 +79,5 @@ The opencode swarm (`.github/scripts/ai_review.py`, its prompts and `.opencode/`
   instead.
 - The comment must start with the command (it used to match anywhere in the comment).
 - A second request waits for the running review instead of cancelling it.
-- The secrets `OPENAI_API_KEY`, `MINIMAX_API_KEY`, `ZRO_API_KEY` and `OPENROUTER_API_KEY` are no
-  longer used by this workflow.
+- The secrets `OPENAI_API_KEY`, `MINIMAX_API_KEY` and `ZRO_API_KEY` are no longer used by this
+  workflow.
