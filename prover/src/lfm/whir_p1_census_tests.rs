@@ -307,7 +307,7 @@ fn whir_p1_leaf_census() {
     // The block admits its proof family's base only (D-P3B P3): the RPX arm is gone.
     for (name, base) in [("P1", BaseFormat::P1_WHIR)] {
         let production = BlockFormat::production();
-        // The tree recurses over the split memory format alone.
+        // The tree's default memory format, the pinned split one.
         let format = BlockFormat {
             zf: production.zf.with_base(base),
             memory: crate::tables::fused_memory::MemoryFormat::Split,
@@ -369,7 +369,7 @@ fn whir_p1_leaf_census() {
     // the hash table one doubling down from D8a's.
     {
         let production = BlockFormat::production();
-        // The tree recurses over the split memory format alone.
+        // The tree's default memory format, the pinned split one.
         let format = BlockFormat {
             zf: production.zf.with_base(BaseFormat::P1_WHIR),
             memory: crate::tables::fused_memory::MemoryFormat::Split,
@@ -669,7 +669,7 @@ use super::whir_chain::ChipRows;
 
 fn p1_format() -> BlockFormat {
     let production = BlockFormat::production();
-    // The tree recurses over the split memory format alone.
+    // The tree's default memory format, the pinned split one.
     BlockFormat {
         zf: production.zf.with_base(BaseFormat::P1_WHIR),
         memory: crate::tables::fused_memory::MemoryFormat::Split,
@@ -1508,7 +1508,7 @@ fn whir_s6b_census() {
     let mut widths: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut s6b: Option<(Vec<ChipRows>, ChipRows, Vec<usize>)> = None;
     for (name, base, cap) in arms {
-        // The tree recurses over the split memory format alone.
+        // The tree's default memory format, the pinned split one.
         let format = BlockFormat {
             zf: production.zf.with_base(base),
             memory: crate::tables::fused_memory::MemoryFormat::Split,

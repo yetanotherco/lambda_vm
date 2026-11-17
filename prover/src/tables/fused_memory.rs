@@ -50,9 +50,10 @@ pub enum MemoryFormat {
     /// ([`super::word_memory`]): PAGE_W mints a page's words, the CPU's loads
     /// and stores are its six word tables' ([`super::word_cpu`]), MEMW_W takes
     /// the chips' word messages, and LOAD, STORE, MEMW_A, MEMW, MEM_LOAD and
-    /// MEM_STORE are not part of the block. The prover takes it for a run
-    /// that calls no chip, under the in-row register format; the verifier
-    /// refuses every chip's table under it.
+    /// MEM_STORE are not part of the block. The prover takes it under the
+    /// in-row register format, for a run whose chip calls are COPY, keccak256
+    /// and ECREC (their word tables COPY_W, KECCAK_W and ECREC_W); the
+    /// verifier refuses a table of IS_WH, BLAKE3, ECSM or HINT under it.
     Words,
 }
 

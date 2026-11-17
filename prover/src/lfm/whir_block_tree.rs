@@ -6382,7 +6382,7 @@ mod tests {
             stream_leaf: STREAM_LEAF_DEFAULT,
             leaf_emitters: Some(LEAF_EMITTERS),
             argue: BlockFormat::production().argue,
-            // The tree recurses over the split memory format alone.
+            // The tree's default memory format, the pinned split one.
             format: BlockFormat::production().with_memory(MemoryFormat::Split),
             options: BlockOptions::production(),
             emit_threads: 4,

@@ -780,7 +780,7 @@ fn merge_census() {
     };
     let opts = super::proof::block_base_options();
     let production = BlockFormat::production();
-    // The tree recurses over the split memory format alone.
+    // The tree's default memory format, the pinned split one.
     let format = BlockFormat {
         zf: production
             .zf

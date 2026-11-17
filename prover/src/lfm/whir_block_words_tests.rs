@@ -1796,11 +1796,11 @@ fn every_word_rule_of_the_frame_refuses_the_tree_verifiers_file() {
     let mut chip = honest.clone();
     chip.table_counts.hint = 1;
     let e = refused(&chip);
-    assert!(e.contains("takes no chip yet: no HINT table"), "{e}");
+    assert!(e.contains("takes no HINT call yet: no HINT table"), "{e}");
     crate::block_whir::CHIP_COUNTS_UNCHECKED.with(|c| c.set(true));
     let control = refused(&chip);
     crate::block_whir::CHIP_COUNTS_UNCHECKED.with(|c| c.set(false));
-    assert!(!control.contains("takes no chip yet"), "{control}");
+    assert!(!control.contains("takes no HINT call yet"), "{control}");
 
     let plan = verifier_plan_under(&honest, MemoryFormat::Words).expect("the honest plan");
     let names: Vec<String> = plan

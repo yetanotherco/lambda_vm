@@ -355,8 +355,9 @@ pub struct BlockFormat {
     /// production format's, which the base proves), or each a LOAD or STORE
     /// row and a MEMW message to MEMW_A or MEMW
     /// ([`Split`](crate::tables::fused_memory::MemoryFormat::Split), the
-    /// pinned preset's, the only one the recursion's tree takes, and the
-    /// base's rollback). The block's tables, so its buses and the recursion's
+    /// pinned preset's, the recursion's tree's default, and the base's
+    /// rollback; the tree also takes the other two, each named to its
+    /// verifier). The block's tables, so its buses and the recursion's
     /// programs, follow it.
     pub memory: crate::tables::fused_memory::MemoryFormat,
 }
@@ -855,8 +856,8 @@ impl BlockFormat {
     /// format (its environment knobs, for the prover and its experiments),
     /// this reads nothing from the environment: a verifier's environment
     /// cannot choose the format, and with it the security, it checks a proof
-    /// against. Its memory format is the split one, the only one the
-    /// recursion's tree takes (the production format's is the fused one).
+    /// against. Its memory format is the split one, the recursion's tree's
+    /// default (the production format's is the fused one).
     pub fn pinned() -> Self {
         Self {
             zf: ZfFormat::DEFAULT,
@@ -3728,8 +3729,8 @@ fn chip_counts(counts: &TableCounts, _words: [u64; 7]) -> [(&'static str, u64); 
 /// block that calls one is not provable under it, and the verifier says so
 /// by its counts instead of leaving it to the bus. COPY's tables (COPY_W's),
 /// KECCAK's (KECCAK_W's) and its round chip's, ECREC's (ECREC_W's) and
-/// ECDAS's, and MEMW_W's, which takes their word messages, are the format's. Under any other format, nothing
-/// to check.
+/// ECDAS's, and MEMW_W's, which takes their word messages, are the format's.
+/// Under any other format, nothing to check.
 pub(crate) fn chip_tables_under(
     memory: crate::tables::fused_memory::MemoryFormat,
     counts: &TableCounts,
@@ -3747,7 +3748,7 @@ pub(crate) fn chip_tables_under(
         .find(|&(_, n)| n != 0)
     {
         Some((table, n)) => Err(Error::InvalidTableCounts(format!(
-            "the word memory format takes no chip yet: no {table} table, not {n}"
+            "the word memory format takes no {table} call yet: no {table} table, not {n}"
         ))),
         None => Ok(()),
     }
@@ -9205,7 +9206,8 @@ pub(crate) fn block_frame(
         statement.fused_memory,
     )?;
     let words = word_counts_under(format.memory, statement.word_memory)?;
-    // Under the word memory format no chip's table, MEMW_W's included.
+    // Under the word memory format no table of a chip it takes no call of
+    // (IS_WH, BLAKE3, ECSM, HINT).
     chip_tables_under(format.memory, statement.table_counts, statement.word_memory)?;
     let num_tables = statement.table_num_vars.len();
     let page_configs = Traces::page_configs_from_elf_and_runtime(
