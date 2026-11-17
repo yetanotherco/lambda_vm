@@ -413,6 +413,15 @@ pub struct LevelsTimes {
     pub waves_before_base: usize,
     pub wave_secs_before_base: f64,
     pub execute_tail: f64,
+    /// Level 1's lean round tables filled beside its execution
+    /// (`LAMBDA_VM_WLFM_LEAN_BESIDE`): what the fill did, and the seconds
+    /// level 1's thread waited for it once the execution had ended. `None`
+    /// when off.
+    pub lean_beside: Option<(super::b3l_tables::LeanBesideStats, f64)>,
+    /// Whether level 1's fill took that prefill, and its split: the chips'
+    /// seconds, the lean tables'.
+    pub lean_prefilled: bool,
+    pub fill_split: (f64, f64),
     pub levels: Vec<LevelClock>,
 }
 
@@ -440,6 +449,21 @@ pub(crate) fn level1_pieces(marks: &[u32]) -> Vec<(std::ops::Range<u32>, std::op
         g = hi;
     }
     out
+}
+
+/// The compressions level 1's waves wrote since the last call, handed to the
+/// lean fill beside the execution (`to`, when it runs).
+fn hand_on_lean<H: super::hash::LfmHasher + Sync>(
+    ex: &mut super::executor::StreamedExecution<'_, '_, H>,
+    to: Option<&std::sync::mpsc::Sender<Vec<(u32, super::b3l::B3lValues)>>>,
+) {
+    if let Some(to) = to {
+        let wave = ex.take_lean_tap();
+        if !wave.is_empty() {
+            // A closed receiver is the fill's thread gone: its join says why.
+            let _ = to.send(wave);
+        }
+    }
 }
 
 /// ★ A block proved to the end of its level chain: the base proof
@@ -547,7 +571,13 @@ pub fn prove_block_levels(
     let mut times = LevelsTimes::default();
     // What level 1's thread hands back: when the plan and the program were
     // ready, the program, its execution, when it could start and when it
-    // ended, and its waves before the base ended.
+    // ended, its waves before the base ended, and the lean fill beside it
+    // (its result, and when level 1's thread had it).
+    type LeanBeside = (
+        Result<super::b3l_tables::LeanPrefilled, String>,
+        super::b3l_tables::LeanBesideStats,
+        f64,
+    );
     type Level1 = (
         f64,
         f64,
@@ -557,7 +587,12 @@ pub fn prove_block_levels(
         usize,
         usize,
         f64,
+        Option<LeanBeside>,
     );
+    // Level 1's lean round tables filled beside its execution: under the
+    // knob, and only where they are held as their records.
+    let lean_beside = super::wlfm::lean_beside()
+        && super::b3l_tables::fill_hold() == super::b3l_tables::B3lHold::Records;
     let base_end: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     let base_end_ref = &base_end;
     // Level 1's program, emitted by its thread and read by the builder's.
@@ -620,8 +655,26 @@ pub fn prove_block_levels(
                 (0..npieces).map(|_| std::cell::OnceCell::new()).collect();
             let mut by_group: Vec<Option<Vec<LfmWord>>> = vec![None; marks.len() - 1];
             let execute_from = now();
-            let mut ex = StreamedExecution::new_pieced(program, arena_pieces, &hasher)
-                .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
+            let mut ex =
+                StreamedExecution::new_pieced_tapped(program, arena_pieces, &hasher, lean_beside)
+                    .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
+            // Under the knob, each wave's compressions go to a thread of their
+            // own that makes the round records and counts as they come.
+            let (lean_tx, lean_fill) = if lean_beside {
+                let (tx, rx) = mpsc::channel::<Vec<(u32, super::b3l::B3lValues)>>();
+                let fill = scope.spawn(move || {
+                    let mut fill = super::b3l_tables::LeanFillBeside::new(program);
+                    for wave in rx {
+                        fill.feed(&wave);
+                    }
+                    let stats = fill.stats();
+                    (fill.finish(), stats)
+                });
+                (Some(tx), Some(fill))
+            } else {
+                (None, None)
+            };
+            hand_on_lean(&mut ex, lean_tx.as_ref());
             let mut landed = vec![false; npieces];
             let (mut waves_before, mut wave_secs_before) = (0usize, 0.0f64);
             // Beside phase B, each group as it comes; otherwise (the control)
@@ -645,6 +698,7 @@ pub fn prove_block_levels(
                     held[0].set(front).map_err(|_| "the front landed twice")?;
                     ex.land_piece(0, held[0].get().ok_or("the front")?)
                         .map_err(|e| format!("level 1's front: {e:?}"))?;
+                    hand_on_lean(&mut ex, lean_tx.as_ref());
                     landed[0] = true;
                 }
                 let words = super::whir_block::group_arena_words(
@@ -670,6 +724,7 @@ pub fn prove_block_levels(
                     let t = std::time::Instant::now();
                     ex.land_piece(i, held[i].get().ok_or("a piece")?)
                         .map_err(|e| format!("level 1's piece {i}: {e:?}"))?;
+                    hand_on_lean(&mut ex, lean_tx.as_ref());
                     if base_end_ref.get().is_none() {
                         waves_before += 1;
                         wave_secs_before += t.elapsed().as_secs_f64();
@@ -684,6 +739,16 @@ pub fn prove_block_levels(
                 .finish()
                 .map_err(|e| format!("level 1's execution: {e:?}"))?;
             let executed = now();
+            drop(lean_tx);
+            let lean = match lean_fill {
+                Some(fill) => {
+                    let (prefilled, stats) = fill
+                        .join()
+                        .map_err(|_| "level 1's lean fill thread panicked")?;
+                    Some((prefilled, stats, now()))
+                }
+                None => None,
+            };
             Ok((
                 planned,
                 emitted,
@@ -693,6 +758,7 @@ pub fn prove_block_levels(
                 npieces,
                 waves_before,
                 wave_secs_before,
+                lean,
             ))
         });
         let prove_base = || {
@@ -722,8 +788,18 @@ pub fn prove_block_levels(
     let (proved, level1, built_beside) = result;
     let (base_proof, base_stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
     times.base = base_end.get().copied().unwrap_or_else(now);
-    let (planned, emitted, execution, execute_from, executed, npieces, waves, wave_secs) =
+    let (planned, emitted, execution, execute_from, executed, npieces, waves, wave_secs, lean) =
         level1.map_err(|_| "level 1's thread panicked")??;
+    // A lean fill beside that was fed a compression twice, or missed one, is
+    // refused here: never a wrong count handed to the prove.
+    let lean = match lean {
+        Some((prefilled, stats, done)) => {
+            let prefilled = prefilled.map_err(|e| format!("level 1: {e}"))?;
+            times.lean_beside = Some((stats, (done - executed).max(0.0)));
+            Some(prefilled)
+        }
+        None => None,
+    };
     let program = program_cell.into_inner().ok_or("no level 1 program")?;
     times.planned = planned;
     times.emitted = emitted;
@@ -758,15 +834,18 @@ pub fn prove_block_levels(
     // Level 1: fill and prove; then each level over the one below.
     let mut proofs: Vec<WlfmProof> = Vec::with_capacity(levels.len());
     let t = std::time::Instant::now();
-    let filled = super::proof::lfm_fill_executed_holding(
+    let filled = super::proof::lfm_fill_executed_prefilled(
         &levels[0].program,
         execution,
         levels[0].build.artifacts.hasher,
         executed - execute_from,
         &Vec::new(),
         super::wlfm::chip_records(),
+        lean,
     );
     let fill = t.elapsed().as_secs_f64();
+    times.lean_prefilled = filled.lean_prefilled();
+    times.fill_split = super::proof::take_fill_split().unwrap_or_default();
     let t = std::time::Instant::now();
     proofs.push(
         super::wlfm::prove_wlfm_traces_as(

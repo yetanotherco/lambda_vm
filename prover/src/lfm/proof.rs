@@ -254,6 +254,8 @@ pub(crate) struct LfmFilled {
     /// chip-records knob), their own tables in `traces` empty. Present refuses
     /// the STARK prove.
     chips: Option<super::chip_records::LfmChipValues>,
+    /// The lean round tables came from a prefill made beside the execution.
+    lean_prefilled: bool,
 }
 
 /// The host half of [`lfm_prove_with_residency`]: execute `program` over
@@ -333,6 +335,33 @@ pub(crate) fn lfm_fill_executed_holding(
     plan: &super::merge::MergePlan,
     hold_chips: bool,
 ) -> LfmFilled {
+    lfm_fill_executed_prefilled(
+        program,
+        execution,
+        hasher,
+        execute_secs,
+        plan,
+        hold_chips,
+        None,
+    )
+}
+
+/// [`lfm_fill_executed_holding`] with, when `lean` is given, the lean round
+/// tables' work already done beside the execution
+/// ([`super::b3l_tables::LeanFillBeside`]): the round chunks are held as
+/// those records and only the head chunks and the byte table are filled here
+/// ([`super::b3l_tables::build_b3l_traces_prefilled`]). A prefill the tables
+/// cannot take falls back to the usual fill; [`LfmFilled::lean_prefilled`]
+/// says which ran.
+pub(crate) fn lfm_fill_executed_prefilled(
+    program: &LfmProgram,
+    execution: LfmExecution,
+    hasher: HasherKind,
+    execute_secs: f64,
+    plan: &super::merge::MergePlan,
+    hold_chips: bool,
+    lean: Option<super::b3l_tables::LeanPrefilled>,
+) -> LfmFilled {
     let LfmExecution {
         mut records,
         public_words,
@@ -356,7 +385,10 @@ pub(crate) fn lfm_fill_executed_holding(
         None => build_traces_with_merge(program, &records, hasher, plan),
     };
     let chips_secs = t.elapsed().as_secs_f64();
-    let mut b3l = super::b3l_tables::build_b3l_traces(program, &b3l_records);
+    let prefilled =
+        lean.and_then(|p| super::b3l_tables::build_b3l_traces_prefilled(program, &b3l_records, p));
+    let lean_prefilled = prefilled.is_some();
+    let mut b3l = prefilled.or_else(|| super::b3l_tables::build_b3l_traces(program, &b3l_records));
     drop(b3l_records);
     // The one-output selects ride the lean tables (only a program with
     // compressions has them).
@@ -390,10 +422,17 @@ pub(crate) fn lfm_fill_executed_holding(
         exec_split,
         b3l,
         chips,
+        lean_prefilled,
     }
 }
 
 impl LfmFilled {
+    /// Whether the lean round tables came from a prefill made beside the
+    /// execution ([`lfm_fill_executed_prefilled`]).
+    pub(crate) fn lean_prefilled(&self) -> bool {
+        self.lean_prefilled
+    }
+
     /// The filled traces, for a caller that warms their domains before the
     /// prove ([`super::domain_warm`]).
     pub(crate) fn traces(&self) -> &LfmTraces {
@@ -494,6 +533,7 @@ impl LfmFilled {
             exec_split,
             b3l,
             chips,
+            lean_prefilled: _,
         } = self;
         same_hasher(artifacts.hasher, hasher)?;
         // ⛔ The STARK chip set has no lean BLAKE3 tables: a program that

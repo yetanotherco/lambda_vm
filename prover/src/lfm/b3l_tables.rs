@@ -29,6 +29,7 @@
 //! `(tag, round)` tokens (`BusId::B3lRound`); rows meet only through them, so
 //! a compression may straddle two round chunks.
 
+use multilinear::records::B3lRoundOp;
 use stark::constraints::builder::EmptyConstraints;
 use stark::proof::options::ProofOptions;
 use stark::trace::TraceTable;
@@ -391,9 +392,20 @@ pub fn fill_hold() -> B3lHold {
 /// [`fill_round_rows`]'s narrow fill of the same rows.
 #[derive(Debug)]
 pub struct B3lRoundRecords {
-    ops: Vec<multilinear::records::B3lRoundOp>,
+    /// The compressions `lo .. hi` of `ops` are this chunk's: a chunk's own
+    /// list, or a range of every compression's (the fill beside the
+    /// execution, [`LeanFillBeside`], shares one list among the chunks).
+    ops: std::sync::Arc<Vec<multilinear::records::B3lRoundOp>>,
+    lo: usize,
+    hi: usize,
     skip: usize,
     rows: usize,
+}
+
+impl B3lRoundRecords {
+    fn ops(&self) -> &[multilinear::records::B3lRoundOp] {
+        &self.ops[self.lo..self.hi]
+    }
 }
 
 impl multilinear::records::TableRecords for B3lRoundRecords {
@@ -407,18 +419,19 @@ impl multilinear::records::TableRecords for B3lRoundRecords {
 
     fn fill(&self) -> multilinear::records::RecordsFill<'_> {
         multilinear::records::RecordsFill::B3lRound {
-            ops: &self.ops,
+            ops: self.ops(),
             skip: self.skip,
         }
     }
 
     fn host_fill(&self) -> Option<multilinear::narrow::NarrowColumns> {
-        let total = l::ROUNDS * self.ops.len();
+        let ops = self.ops();
+        let total = l::ROUNDS * ops.len();
         let (packed, _) = fill_narrow(self.rows, &round_widths(), |first, len, scratch, hists| {
             let lo = self.skip + first;
             let hi = (lo + len).min(total);
             fill_round_rows(lo, hi, scratch, hists, |k| {
-                let op = &self.ops[k];
+                let op = &ops[k];
                 (op_values(op), op.block_len, op.flags, op.tag)
             });
         })?;
@@ -911,12 +924,7 @@ pub fn build_b3l_traces_held(
         return None;
     }
     let shape = B3lShape::of(n);
-    let consts = |k: usize| {
-        use math::field::traits::IsPrimeField;
-        let prep = &g.data[k * g.width..(k + 1) * g.width];
-        let canon = |c: usize| GoldilocksField::canonical(prep[c].value()) as u32;
-        (prep, canon(l::BLEN), canon(l::FLAGS))
-    };
+    let consts = |k: usize| head_consts(g, k);
     // The card's path: the round chunks held as their records (the card fills
     // them), the heads and the byte table narrow.
     if hold == B3lHold::Records
@@ -1300,27 +1308,47 @@ fn fill_narrow_direct<'p>(
     })
 }
 
-/// [`build_b3l_traces_held`]'s records path: each round chunk held as the
-/// compressions that reach into it, the byte table's counts made on the host
-/// from every compression once (its rows written to a scratch and dropped),
-/// the head chunks filled narrow.
-fn fill_records<'p>(
+/// A compression's record as the round table's fill reads it: `values`,
+/// its block length and flags (`consts`), and the tag of compression `k`.
+fn round_op(k: usize, values: &B3lValues, block_len: u32, flags: u32) -> B3lRoundOp {
+    B3lRoundOp {
+        h: values.h,
+        m: values.message(),
+        block_len,
+        flags,
+        tag: l::tag_for_row(k),
+    }
+}
+
+/// Compression `k`'s round lookups counted into `hist` (its seven round rows
+/// written into `rows`, a scratch of seven rows, and dropped).
+fn count_rounds(
+    k: usize,
+    values: &B3lValues,
+    block_len: u32,
+    flags: u32,
+    rows: &mut [FE],
+    hist: &mut TableHist,
+) {
+    lean::fill_rounds(
+        rows,
+        l::tag_for_row(k),
+        values,
+        block_len,
+        flags,
+        None,
+        l::ROUNDS,
+        hist,
+    );
+}
+
+/// The round chunks of `shape` held as the compressions that reach into
+/// each, `ops(k_lo, k_hi)` giving a chunk's compressions `k_lo .. k_hi`.
+fn round_chunks_as_records(
     n: usize,
     shape: &B3lShape,
-    consts: &(dyn Fn(usize) -> (&'p [FE], u32, u32) + Sync),
-    records: &[B3lValues],
-) -> Option<B3lTraces> {
-    let op_of = |k: usize| {
-        let (_, block_len, flags) = consts(k);
-        let values = &records[k];
-        multilinear::records::B3lRoundOp {
-            h: values.h,
-            m: values.message(),
-            block_len,
-            flags,
-            tag: l::tag_for_row(k),
-        }
-    };
+    mut ops: impl FnMut(usize, usize) -> (std::sync::Arc<Vec<B3lRoundOp>>, usize, usize),
+) -> Vec<HeldTable> {
     let total = l::ROUNDS * n;
     let mut rounds = Vec::with_capacity(shape.rounds.len());
     let mut start = 0usize;
@@ -1331,75 +1359,33 @@ fn fill_records<'p>(
         } else {
             (n, n)
         };
-        #[cfg(feature = "parallel")]
-        let ops: Vec<_> = {
-            use rayon::prelude::*;
-            (k_lo..k_hi)
-                .into_par_iter()
-                .with_min_len(1 << 12)
-                .map(op_of)
-                .collect()
-        };
-        #[cfg(not(feature = "parallel"))]
-        let ops: Vec<_> = (k_lo..k_hi).map(op_of).collect();
+        let (ops, lo, hi) = ops(k_lo, k_hi);
         let skip = start.saturating_sub(l::ROUNDS * k_lo);
         rounds.push(HeldTable::Records(multilinear::records::Records(
             std::sync::Arc::new(B3lRoundRecords {
                 ops,
+                lo,
+                hi,
                 skip,
                 rows: size,
             }),
         )));
         start += size;
     }
-    // The byte table counts every compression's round lookups once.
-    let count = |k: usize, rows: &mut Vec<FE>, hist: &mut TableHist| {
-        let (_, block_len, flags) = consts(k);
-        lean::fill_rounds(
-            rows,
-            l::tag_for_row(k),
-            &records[k],
-            block_len,
-            flags,
-            None,
-            l::ROUNDS,
-            hist,
-        );
-    };
-    #[cfg(feature = "parallel")]
-    let mut hist = {
-        use rayon::prelude::*;
-        // A turn is many compressions long: each starts a fresh count of the
-        // byte table and ends merging it ([`BLOCKS_PER_WORKER_TURN`]'s reason).
-        (0..n)
-            .into_par_iter()
-            .with_min_len(COMPRESSIONS_PER_COUNT_TURN)
-            .fold(
-                || {
-                    (
-                        TableHist::default(),
-                        zeroed_fe_vec(l::ROUNDS * round::NUM_COLUMNS),
-                    )
-                },
-                |(mut hist, mut rows), k| {
-                    count(k, &mut rows, &mut hist);
-                    (hist, rows)
-                },
-            )
-            .map(|(hist, _)| hist)
-            .reduce(TableHist::default, |a, b| a.merge(&b))
-    };
-    #[cfg(not(feature = "parallel"))]
-    let mut hist = {
-        let mut hist = TableHist::default();
-        let mut rows = zeroed_fe_vec(l::ROUNDS * round::NUM_COLUMNS);
-        for k in 0..n {
-            count(k, &mut rows, &mut hist);
-        }
-        hist
-    };
+    rounds
+}
+
+/// The head chunks of `shape` filled narrow from `records`, with the counts
+/// of their lookups; `None` when a value does not fit its column's width.
+fn fill_heads_narrow<'p>(
+    n: usize,
+    shape: &B3lShape,
+    consts: &(dyn Fn(usize) -> (&'p [FE], u32, u32) + Sync),
+    records: &[B3lValues],
+) -> Option<(Vec<HeldTable>, TableHist)> {
     let widths = head_widths();
     let width = head::NUM_COLUMNS;
+    let mut hist = TableHist::default();
     let mut heads = Vec::with_capacity(shape.heads.len());
     let mut start = 0usize;
     for &size in &shape.heads {
@@ -1428,16 +1414,291 @@ fn fill_records<'p>(
         heads.push(HeldTable::Narrow(packed));
         start += size;
     }
-    let table = lean::table_trace(&hist);
-    let table = HeldTable::from_rows(
+    Some((heads, hist))
+}
+
+/// The byte table over every lookup's count, held narrow.
+fn byte_table(hist: &TableHist) -> HeldTable {
+    let table = lean::table_trace(hist);
+    HeldTable::from_rows(
         table.main_table.row_major_data().to_vec(),
         table::NUM_COLUMNS,
         B3lHold::Narrow,
-    );
+    )
+}
+
+/// [`build_b3l_traces_held`]'s records path: each round chunk held as the
+/// compressions that reach into it, the byte table's counts made on the host
+/// from every compression once (its rows written to a scratch and dropped),
+/// the head chunks filled narrow.
+fn fill_records<'p>(
+    n: usize,
+    shape: &B3lShape,
+    consts: &(dyn Fn(usize) -> (&'p [FE], u32, u32) + Sync),
+    records: &[B3lValues],
+) -> Option<B3lTraces> {
+    let op_of = |k: usize| {
+        let (_, block_len, flags) = consts(k);
+        round_op(k, &records[k], block_len, flags)
+    };
+    let rounds = round_chunks_as_records(n, shape, |k_lo, k_hi| {
+        #[cfg(feature = "parallel")]
+        let ops: Vec<_> = {
+            use rayon::prelude::*;
+            (k_lo..k_hi)
+                .into_par_iter()
+                .with_min_len(1 << 12)
+                .map(op_of)
+                .collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let ops: Vec<_> = (k_lo..k_hi).map(op_of).collect();
+        let len = ops.len();
+        (std::sync::Arc::new(ops), 0, len)
+    });
+    // The byte table counts every compression's round lookups once.
+    let count = |k: usize, rows: &mut Vec<FE>, hist: &mut TableHist| {
+        let (_, block_len, flags) = consts(k);
+        count_rounds(k, &records[k], block_len, flags, rows, hist);
+    };
+    #[cfg(feature = "parallel")]
+    let hist = {
+        use rayon::prelude::*;
+        // A turn is many compressions long: each starts a fresh count of the
+        // byte table and ends merging it ([`BLOCKS_PER_WORKER_TURN`]'s reason).
+        (0..n)
+            .into_par_iter()
+            .with_min_len(COMPRESSIONS_PER_COUNT_TURN)
+            .fold(
+                || {
+                    (
+                        TableHist::default(),
+                        zeroed_fe_vec(l::ROUNDS * round::NUM_COLUMNS),
+                    )
+                },
+                |(mut hist, mut rows), k| {
+                    count(k, &mut rows, &mut hist);
+                    (hist, rows)
+                },
+            )
+            .map(|(hist, _)| hist)
+            .reduce(TableHist::default, |a, b| a.merge(&b))
+    };
+    #[cfg(not(feature = "parallel"))]
+    let hist = {
+        let mut hist = TableHist::default();
+        let mut rows = zeroed_fe_vec(l::ROUNDS * round::NUM_COLUMNS);
+        for k in 0..n {
+            count(k, &mut rows, &mut hist);
+        }
+        hist
+    };
+    let (heads, part) = fill_heads_narrow(n, shape, consts, records)?;
+    let hist = hist.merge(&part);
     Some(B3lTraces {
         rounds,
         heads,
-        table,
+        table: byte_table(&hist),
+        muxes: Vec::new(),
+        caps: Vec::new(),
+        cap_reads: Vec::new(),
+    })
+}
+
+/// A program's `B3L_HEAD` row `k`: its instruction group's prefix, block
+/// length and flags.
+fn head_consts(g: &ColumnGroup, k: usize) -> (&[FE], u32, u32) {
+    use math::field::traits::IsPrimeField;
+    let prep = &g.data[k * g.width..(k + 1) * g.width];
+    let canon = |c: usize| GoldilocksField::canonical(prep[c].value()) as u32;
+    (prep, canon(l::BLEN), canon(l::FLAGS))
+}
+
+/// ★ The records path's round work done while the execution runs (the level
+/// driver's, `LAMBDA_VM_WLFM_LEAN_BESIDE`): each wave's compressions, as the
+/// execution writes them ([`super::executor::StreamedExecution::take_lean_tap`]),
+/// made into their round records at their rows of one presized list and
+/// their round lookups counted into one running byte-table count. Both are
+/// free of the order the waves come in: a record is written at its row, a
+/// count is a sum. [`Self::finish`] refuses a compression fed twice, a row
+/// outside the program, or one never fed, so a missed or doubled wave is an
+/// error and never a wrong count.
+pub struct LeanFillBeside<'p> {
+    program: &'p LfmProgram,
+    ops: Vec<B3lRoundOp>,
+    fed: Vec<bool>,
+    count: usize,
+    /// Rows fed twice or past the program's compressions.
+    refused: usize,
+    hist: TableHist,
+    waves: usize,
+    secs: f64,
+}
+
+/// What [`LeanFillBeside`] did: its waves, the compressions they held, and
+/// the seconds its feeding took on its own thread.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LeanBesideStats {
+    pub waves: usize,
+    pub compressions: usize,
+    pub secs: f64,
+}
+
+/// The round records and the round lookups' count of every compression,
+/// checked complete: [`build_b3l_traces_prefilled`] takes them in place of
+/// the records path's own.
+pub struct LeanPrefilled {
+    ops: Vec<B3lRoundOp>,
+    hist: TableHist,
+}
+
+impl<'p> LeanFillBeside<'p> {
+    /// An empty fill of `program`'s compressions.
+    pub fn new(program: &'p LfmProgram) -> Self {
+        let n = program.groups.b3l.real_rows;
+        LeanFillBeside {
+            program,
+            ops: vec![B3lRoundOp::default(); n],
+            fed: vec![false; n],
+            count: 0,
+            refused: 0,
+            hist: TableHist::default(),
+            waves: 0,
+            secs: 0.0,
+        }
+    }
+
+    /// One wave's compressions: `(row, values)`, the row a compression's
+    /// ordinal in the program.
+    pub fn feed(&mut self, wave: &[(u32, B3lValues)]) {
+        let t = std::time::Instant::now();
+        let g = &self.program.groups.b3l;
+        let n = self.fed.len();
+        for (k, values) in wave {
+            let k = *k as usize;
+            match self.fed.get_mut(k) {
+                Some(fed) if !*fed => {
+                    *fed = true;
+                    self.count += 1;
+                    let (_, block_len, flags) = head_consts(g, k);
+                    self.ops[k] = round_op(k, values, block_len, flags);
+                }
+                _ => self.refused += 1,
+            }
+        }
+        let count = |(k, values): &(u32, B3lValues), rows: &mut Vec<FE>, hist: &mut TableHist| {
+            let k = *k as usize;
+            if k < n {
+                let (_, block_len, flags) = head_consts(g, k);
+                count_rounds(k, values, block_len, flags, rows, hist);
+            }
+        };
+        #[cfg(feature = "parallel")]
+        let part = {
+            use rayon::prelude::*;
+            wave.par_iter()
+                .with_min_len(COMPRESSIONS_PER_COUNT_TURN)
+                .fold(
+                    || {
+                        (
+                            TableHist::default(),
+                            zeroed_fe_vec(l::ROUNDS * round::NUM_COLUMNS),
+                        )
+                    },
+                    |(mut hist, mut rows), entry| {
+                        count(entry, &mut rows, &mut hist);
+                        (hist, rows)
+                    },
+                )
+                .map(|(hist, _)| hist)
+                .reduce(TableHist::default, |a, b| a.merge(&b))
+        };
+        #[cfg(not(feature = "parallel"))]
+        let part = {
+            let mut hist = TableHist::default();
+            let mut rows = zeroed_fe_vec(l::ROUNDS * round::NUM_COLUMNS);
+            for entry in wave {
+                count(entry, &mut rows, &mut hist);
+            }
+            hist
+        };
+        self.hist = part.merge(&self.hist);
+        self.waves += 1;
+        self.secs += t.elapsed().as_secs_f64();
+    }
+
+    pub fn stats(&self) -> LeanBesideStats {
+        LeanBesideStats {
+            waves: self.waves,
+            compressions: self.count,
+            secs: self.secs,
+        }
+    }
+
+    /// The records and the count, once every compression has been fed exactly
+    /// once; an error otherwise.
+    pub fn finish(self) -> Result<LeanPrefilled, String> {
+        let n = self.fed.len();
+        if self.refused > 0 {
+            return Err(format!(
+                "the lean fill beside the execution was fed {} compressions twice or past the \
+                 program's {n}",
+                self.refused
+            ));
+        }
+        if self.count != n {
+            return Err(format!(
+                "the lean fill beside the execution was fed {} of the program's {n} compressions",
+                self.count
+            ));
+        }
+        Ok(LeanPrefilled {
+            ops: self.ops,
+            hist: self.hist,
+        })
+    }
+}
+
+impl LeanPrefilled {
+    /// A TEST-ONLY prefill that skips [`LeanFillBeside::finish`]'s check: what
+    /// a fill fed a wave twice would hand on without it.
+    #[cfg(test)]
+    pub(crate) fn unchecked(fill: LeanFillBeside<'_>) -> Self {
+        LeanPrefilled {
+            ops: fill.ops,
+            hist: fill.hist,
+        }
+    }
+}
+
+/// [`build_b3l_traces_held`]'s records path with its round work done beside
+/// the execution (`prefilled`, every compression's): the round chunks share
+/// the prefill's one list, each holding its range; the byte table takes the
+/// prefill's count plus the heads'; the head chunks are filled here, narrow,
+/// from `records`. The same tables as the records path's, column for column.
+/// `None` for a program with no compression, a prefill of another program, or
+/// a head value past its column's width (the caller then fills as usual).
+pub fn build_b3l_traces_prefilled(
+    program: &LfmProgram,
+    records: &[B3lValues],
+    prefilled: LeanPrefilled,
+) -> Option<B3lTraces> {
+    let g = &program.groups.b3l;
+    let n = g.real_rows;
+    if n == 0 || records.len() != n || prefilled.ops.len() != n {
+        return None;
+    }
+    let shape = B3lShape::of(n);
+    let consts = |k: usize| head_consts(g, k);
+    let LeanPrefilled { ops, hist } = prefilled;
+    let ops = std::sync::Arc::new(ops);
+    let rounds = round_chunks_as_records(n, &shape, |k_lo, k_hi| (ops.clone(), k_lo, k_hi));
+    let (heads, part) = fill_heads_narrow(n, &shape, &consts, records)?;
+    let hist = hist.merge(&part);
+    Some(B3lTraces {
+        rounds,
+        heads,
+        table: byte_table(&hist),
         muxes: Vec::new(),
         caps: Vec::new(),
         cap_reads: Vec::new(),

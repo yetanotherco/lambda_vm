@@ -300,7 +300,9 @@ fn chunk_log() -> u32 {
 // The narrow-chips knob is a prover's choice read from the environment, so it
 // lives outside this module, which holds the format and reads no environment
 // (`the_wlfm_format_reads_no_environment`).
-pub use super::wlfm_knobs::{CHIP_RECORDS_ENV, NARROW_CHIPS_ENV, chip_records, narrow_chips};
+pub use super::wlfm_knobs::{
+    CHIP_RECORDS_ENV, LEAN_BESIDE_ENV, NARROW_CHIPS_ENV, chip_records, lean_beside, narrow_chips,
+};
 
 /// The bytes a word needs: 1, 2, 4 or 8 (`NarrowColumns`' rule).
 fn narrow_width(max: u64) -> u8 {
@@ -2251,6 +2253,7 @@ pub(crate) mod test_format {
         static CHUNK_LOG: Cell<Option<u32>> = const { Cell::new(None) };
         static NARROW_CHIPS: Cell<Option<bool>> = const { Cell::new(None) };
         static CHIP_RECORDS: Cell<Option<bool>> = const { Cell::new(None) };
+        static LEAN_BESIDE: Cell<Option<bool>> = const { Cell::new(None) };
     }
 
     /// Every W-LFM build on this thread cuts its chips at `2^log` rows until
@@ -2305,6 +2308,25 @@ pub(crate) mod test_format {
 
     pub(crate) fn chip_records() -> Option<bool> {
         CHIP_RECORDS.with(Cell::get)
+    }
+
+    /// Every level run started on this thread fills level 1's lean round
+    /// tables beside its execution (`Some(true)`) or not until the guard
+    /// drops.
+    pub(crate) struct LeanBesideOverride(Option<bool>);
+
+    impl Drop for LeanBesideOverride {
+        fn drop(&mut self) {
+            LEAN_BESIDE.with(|c| c.set(self.0));
+        }
+    }
+
+    pub(crate) fn set_lean_beside(on: bool) -> LeanBesideOverride {
+        LeanBesideOverride(LEAN_BESIDE.with(|c| c.replace(Some(on))))
+    }
+
+    pub(crate) fn lean_beside() -> Option<bool> {
+        LEAN_BESIDE.with(Cell::get)
     }
 
     /// The override, restored when dropped.

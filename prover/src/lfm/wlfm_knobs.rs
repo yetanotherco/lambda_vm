@@ -45,3 +45,23 @@ pub fn chip_records() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| knob_word_on(std::env::var(CHIP_RECORDS_ENV).ok().as_deref()))
 }
+
+/// `LAMBDA_VM_WLFM_LEAN_BESIDE=1`: the level driver fills level 1's lean round
+/// tables while level 1 executes, a wave at a time on a thread of its own
+/// ([`super::b3l_tables::LeanFillBeside`]), so after the execution only the
+/// head chunks and the byte table are left to fill. Taken only when the round
+/// chunks are held as their records (`LAMBDA_VM_B3L_RECORDS=1`). Off by
+/// default (and for any word but `1`); a prover's choice, never the proof's:
+/// the tables are the records path's, column for column. Read once a process.
+pub const LEAN_BESIDE_ENV: &str = "LAMBDA_VM_WLFM_LEAN_BESIDE";
+
+/// Whether the level driver fills level 1's lean round tables beside its
+/// execution: [`LEAN_BESIDE_ENV`], or a test's override.
+pub fn lean_beside() -> bool {
+    #[cfg(test)]
+    if let Some(on) = super::wlfm::test_format::lean_beside() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| knob_word_on(std::env::var(LEAN_BESIDE_ENV).ok().as_deref()))
+}
