@@ -38,8 +38,8 @@ use super::compiler::LfmProgram;
 use super::edsl::WrapHash;
 use super::whir_block::{WhirBlockPlan, block_leaf_arena, top_claims};
 use super::wlfm::{
-    WlfmBuild, WlfmFamily, WlfmLevers, WlfmProof, WlfmProving, WlfmRate, build_wlfm_under,
-    prove_wlfm_traces_as, verify_wlfm,
+    StackPlace, WlfmBuild, WlfmFamily, WlfmLevers, WlfmPrebuild, WlfmProof, WlfmProving, WlfmRate,
+    build_wlfm_under, prepare_wlfm, prove_wlfm_traces_as, verify_wlfm,
 };
 use super::wlfm_leg::{WlfmChild, wlfm_leg_arena, wlfm_leg_program, wlfm_wrap_hash};
 use crate::block_whir::BlockWhirProof;
@@ -174,37 +174,185 @@ const STACK_CARD_BYTES_PER_CELL: u64 = 20;
 /// (the same probe: 8.05 → 23.45 GiB through its first group's commit).
 const GROUP_COMMIT_ROOM: u64 = 19 << 30;
 
-/// A program's prepared cells: its prepared stacks' columns at their padded
-/// heights, the fixed chips' and the lean tables'.
-pub(crate) fn prepared_cells(program: &LfmProgram) -> u64 {
-    super::wlfm::program_prep_groups(program)
-        .into_iter()
-        .map(|g| (g.width * g.padded_rows) as u64)
-        .chain(
-            super::b3l_tables::b3l_prep_groups(program)
-                .into_iter()
-                .map(|g| (g.width * g.padded_rows) as u64),
-        )
-        .sum()
+/// `LAMBDA_VM_LEVELS_STACKS`: where the levels' prover commits each level's
+/// prepared stacks. `auto` (unset or empty, the default): on the card, held
+/// through the prove where the card holds them beside a group's commit, else
+/// committed and let go at once and revived at each group's opening
+/// ([`StackPlace::CardRetired`]); `held`, `retired`: that, on the card,
+/// whatever the room; `host`: encoded and hashed on the host (a measurement's
+/// control). Without a card, the host whatever it says. The same roots in
+/// every place, so the same proofs: a prover's choice, never a format.
+pub const STACKS_ENV: &str = "LAMBDA_VM_LEVELS_STACKS";
+
+/// What [`STACKS_ENV`] says: `None` for `auto`; nonsense is an error.
+pub fn parse_stacks(value: Option<&str>) -> Result<Option<StackPlace>, String> {
+    match value.map(str::trim) {
+        None | Some("" | "auto") => Ok(None),
+        Some("held") => Ok(Some(StackPlace::Card)),
+        Some("retired") => Ok(Some(StackPlace::CardRetired)),
+        Some("host") => Ok(Some(StackPlace::Host)),
+        Some(v) => Err(format!(
+            "{STACKS_ENV} must be auto, held, retired or host, got `{v}`"
+        )),
+    }
 }
 
-/// Whether level `level`'s prepared stacks go on the host: when the card's
-/// ledger budget, read now, cannot hold them beside a group's commit, or there
-/// is no card. Printed. A prover's choice: the same roots either way.
-pub(crate) fn stacks_on_host(program: &LfmProgram, level: usize) -> bool {
-    let cells = prepared_cells(program);
+/// Where level `level`'s `cells` prepared cells are committed: `forced` when
+/// given, else on the card, held when the card's ledger budget, read now,
+/// holds them beside a group's commit and retired when it does not; the host
+/// only when there is no card. Printed.
+pub(crate) fn stack_place(cells: u64, level: usize, forced: Option<StackPlace>) -> StackPlace {
     let need = cells.saturating_mul(STACK_CARD_BYTES_PER_CELL);
     let budget = multilinear::gpu::reserve_budget();
-    let host = budget == 0 || need > budget.saturating_sub(GROUP_COMMIT_ROOM);
+    let place = if budget == 0 {
+        StackPlace::Host
+    } else if let Some(place) = forced {
+        place
+    } else if need > budget.saturating_sub(GROUP_COMMIT_ROOM) {
+        StackPlace::CardRetired
+    } else {
+        StackPlace::Card
+    };
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     eprintln!(
         "LEVELS STACKS level {level}: {cells} prepared cells · ≈ {:.2} GiB on the card · budget \
          {:.2} GiB · committed on the {}",
         gib(need),
         gib(budget),
-        if host { "host" } else { "card" }
+        match place {
+            StackPlace::Host => "host",
+            StackPlace::Card => "card, held",
+            StackPlace::CardRetired => "card, retired",
+        }
     );
-    host
+    place
+}
+
+/// The place [`STACKS_ENV`] forces, read once a process (a test's
+/// [`set_stacks_for_test`] first).
+fn stacks_forced() -> Result<Option<StackPlace>, String> {
+    #[cfg(test)]
+    if let Some(place) = *STACKS_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()) {
+        return Ok(place);
+    }
+    static FORCED: std::sync::OnceLock<Result<Option<StackPlace>, String>> =
+        std::sync::OnceLock::new();
+    FORCED
+        .get_or_init(|| parse_stacks(std::env::var(STACKS_ENV).ok().as_deref()))
+        .clone()
+}
+
+/// A test's placement, for every thread of the process (the driver commits
+/// on threads of its own): `Some(p)` as [`STACKS_ENV`] would say `p`.
+#[cfg(test)]
+static STACKS_FOR_TEST: std::sync::Mutex<Option<Option<StackPlace>>> = std::sync::Mutex::new(None);
+
+/// Sets [`STACKS_FOR_TEST`] until the guard drops.
+#[cfg(test)]
+pub(crate) fn set_stacks_for_test(place: Option<StackPlace>) -> StacksForTest {
+    let before = STACKS_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(place);
+    StacksForTest(before)
+}
+
+#[cfg(test)]
+pub(crate) struct StacksForTest(Option<Option<StackPlace>>);
+
+#[cfg(test)]
+impl Drop for StacksForTest {
+    fn drop(&mut self) {
+        *STACKS_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()) = self.0;
+    }
+}
+
+/// A level's host part ([`prepare_wlfm`]), its chip prefixes packed with it
+/// when it holds its chips as records: nothing here waits for the card.
+pub(crate) fn prepare_level(
+    program: &LfmProgram,
+    family: WlfmFamily,
+) -> Result<WlfmPrebuild, String> {
+    let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+    let mut pre = prepare_wlfm(program, hasher, LEVEL_RATE, level_levers(family))?;
+    if super::wlfm::chip_records() {
+        pre.hold_chip_prefixes()?;
+    }
+    Ok(pre)
+}
+
+/// A prepared level committed where [`stack_place`] puts it.
+pub(crate) fn commit_level(pre: WlfmPrebuild, level: usize) -> Result<WlfmBuild, String> {
+    let place = stack_place(pre.prepared_cells(), level, stacks_forced()?);
+    pre.commit(place)
+}
+
+/// Whether a chain whose last level (its `count`-th) built `last` goes on.
+fn level_more(stop: LevelStop, count: usize, last: &WlfmBuild) -> bool {
+    match stop {
+        LevelStop::Levels(n) => count < n.clamp(1, MAX_LEVELS),
+        LevelStop::Groups(g) => count < MAX_LEVELS && last.artifacts.sizes.len() > g,
+    }
+}
+
+/// The level after `child`'s, prepared on the host: its program (the W-leg
+/// over `child`) and its stacks' columns, uncommitted.
+fn prepare_next(
+    child: WlfmChild,
+    family: WlfmFamily,
+) -> Result<(LfmProgram, WlfmPrebuild), String> {
+    let program = wlfm_leg_program(&child)?;
+    let pre = prepare_level(&program, family)?;
+    Ok((program, pre))
+}
+
+/// Starts this process's peak resident set again from its current resident
+/// set (Linux `/proc/self/clear_refs` 5), so a block proved after another
+/// reads its own peak, not the earlier block's levels': the base's memory
+/// guard reads the peak. Best effort: `false` where it cannot.
+pub(crate) fn reset_peak_rss() -> bool {
+    std::fs::write("/proc/self/clear_refs", "5").is_ok()
+}
+
+/// A proved level's prover-side memory let go: its program's instructions
+/// and instruction columns (their counts kept in `sizes`), and its build's
+/// prepared stacks. The artifacts stay: they are what the level above and
+/// the verifier read.
+fn release_proved(level: &mut Level, sizes: &mut Vec<(usize, usize)>) {
+    let p = &mut level.program;
+    sizes.push((p.instrs.len(), p.groups.b3l.real_rows));
+    p.instrs = Vec::new();
+    let g = &mut p.groups;
+    for group in [
+        &mut g.const_,
+        &mut g.balu,
+        &mut g.xalu,
+        &mut g.select,
+        &mut g.bitdec,
+        &mut g.hash,
+        &mut g.keccak,
+        &mut g.blake3,
+        &mut g.lanes,
+        &mut g.hint,
+        &mut g.public,
+        &mut g.b3l,
+        &mut g.mux,
+        &mut g.cap,
+        &mut g.cap_read,
+    ] {
+        group.data = Vec::new();
+    }
+    level.build.release_prover_half();
+}
+
+/// This process's resident set, in bytes (Linux; `None` elsewhere).
+pub(crate) fn resident_now() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        .map(|kib| kib << 10)
 }
 
 pub(crate) fn build_level(
@@ -215,47 +363,6 @@ pub(crate) fn build_level(
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
     let build = build_wlfm_under(&program, hasher, LEVEL_RATE, level_levers(family), on_host)?;
     Ok(Level { program, build })
-}
-
-/// The prover's half of a level's build when it holds its chips as records
-/// ([`super::wlfm::chip_records`]): each chip table's prefix packed once, on
-/// the builder's thread ([`WlfmBuild::hold_chip_prefixes`]). Nothing otherwise.
-pub(crate) fn hold_prefixes(build: &mut WlfmBuild) -> Result<(), String> {
-    if super::wlfm::chip_records() {
-        build.hold_chip_prefixes()?;
-    }
-    Ok(())
-}
-
-/// The levels after a chain's first (whose build is `first`), each the W-leg
-/// over the one below, built until `stop`. `place` says where each level's
-/// prepared stacks are committed: `Some(on_host)` for all, `None` level by
-/// level by what the card can hold ([`stacks_on_host`]).
-fn build_rest(
-    plan: &WhirBlockPlan,
-    first: &WlfmBuild,
-    family: WlfmFamily,
-    stop: LevelStop,
-    place: Option<bool>,
-) -> Result<Vec<Level>, String> {
-    let mut rest: Vec<Level> = Vec::new();
-    loop {
-        let last = rest.last().map_or(first, |l| &l.build);
-        let count = 1 + rest.len();
-        let more = match stop {
-            LevelStop::Levels(n) => count < n.clamp(1, MAX_LEVELS),
-            LevelStop::Groups(g) => count < MAX_LEVELS && last.artifacts.sizes.len() > g,
-        };
-        if !more {
-            return Ok(rest);
-        }
-        let child = child_of_build(plan, last);
-        let program = wlfm_leg_program(&child)?;
-        let on_host = place.unwrap_or_else(|| stacks_on_host(&program, count + 1));
-        let mut level = build_level(program, family, on_host)?;
-        hold_prefixes(&mut level.build)?;
-        rest.push(level);
-    }
 }
 
 /// Level `k + 1`'s view of level `k`: its artifacts and the top's word count.
@@ -425,6 +532,36 @@ pub struct LevelsTimes {
     pub fill_split: (f64, f64),
     pub lean_parts: (f64, f64),
     pub levels: Vec<LevelClock>,
+    /// Each level's prove stamps ([`super::wlfm::take_wlfm_stamps`]): its
+    /// host preparation, phases and groups.
+    pub stamps: Vec<super::wlfm::WlfmStamps>,
+    /// Each level's build: where its stacks went, its host part's and its
+    /// commits' seconds, its prepared cells, and when its commits ended (the
+    /// driver's clock).
+    pub builds: Vec<LevelBuild>,
+    /// Each level's instructions and lean compressions (its program is let
+    /// go once the level is proved).
+    pub sizes: Vec<(usize, usize)>,
+    /// Whether the process's peak resident set was started again before the
+    /// base ([`reset_peak_rss`]).
+    pub peak_reset: bool,
+    /// The allocator purge at the base's end, on a thread beside level 1:
+    /// its seconds and jemalloc's resident bytes before and after; and the
+    /// one after the last level, before the driver returns.
+    pub purges: [Option<crate::alloc_purge::Purge>; 2],
+    /// The process's resident set at named points (bytes; Linux).
+    pub resident: Vec<(&'static str, u64)>,
+}
+
+/// One level's build, as the driver ran it.
+#[derive(Clone, Copy, Debug)]
+pub struct LevelBuild {
+    pub place: StackPlace,
+    pub prepare: f64,
+    pub commit: f64,
+    pub prefix: f64,
+    pub cells: u64,
+    pub committed: f64,
 }
 
 /// A block proved to its last level.
@@ -479,12 +616,21 @@ fn hand_on_lean<H: super::hash::LfmHasher + Sync>(
 /// groups land only once the base has ended.
 ///
 /// A level's prepared stacks are its program's instruction columns,
-/// gigabytes at a level's size. `build_beside` builds every level on a thread
-/// of its own the moment level 1's program is emitted, beside phase B, its
-/// stacks committed on the HOST (the card is the base's then); `false` builds
-/// them after the base, each level's stacks on the card where they fit beside
-/// a group's commit and on the host otherwise ([`stacks_on_host`]). The same
-/// roots either way, so the same proofs.
+/// gigabytes at a level's size. They are committed on the CARD, never on the
+/// host while there is one ([`stack_place`]): held through the prove where
+/// they fit beside a group's commit, else committed and let go at once and
+/// revived at each group's opening. Level 1's are committed the moment the
+/// base ends, while level 1's execution finishes on the host; each later
+/// level's program and columns are prepared on the host while the level
+/// below proves, and its stacks committed while its own execution runs.
+/// `build_beside` prepares level 1's columns on a thread of its own the
+/// moment its program is emitted, beside phase B; `false` prepares them
+/// after the base. The same roots in every place, so the same proofs.
+///
+/// Memory: the process's peak resident set is started again before the base
+/// ([`reset_peak_rss`]), the allocator's freed pages are handed back at the
+/// base's end (beside level 1) and after the last level, and each level's
+/// program and prover-side stacks are let go once it is proved.
 ///
 /// Under [`WlfmFamily::B3`] the base is the 7-round BLAKE3 base
 /// (`format.zf.base` must be `BaseFormat::B3_WHIR`, [`check_base`]), admitted
@@ -519,6 +665,7 @@ pub fn prove_block_levels(
                 .into(),
         );
     }
+    let peak_reset = reset_peak_rss();
     let t0 = std::time::Instant::now();
     let now = || t0.elapsed().as_secs_f64();
     type Statement = (
@@ -602,22 +749,15 @@ pub fn prove_block_levels(
     let program_ref = &program_cell;
     let (btx, brx) = mpsc::channel::<()>();
     let result = std::thread::scope(|scope| {
-        // The builder's thread (`build_beside`): every level, on the host, as
-        // soon as level 1's program exists.
+        // The builder's thread (`build_beside`): level 1's stacks' columns,
+        // on the host, as soon as its program exists. The card is the base's
+        // until it ends: nothing is committed here.
         let builder = build_beside.then(|| {
-            scope.spawn(move || -> Result<(WlfmBuild, Vec<Level>, f64), String> {
+            scope.spawn(move || -> Result<WlfmPrebuild, String> {
                 brx.recv()
                     .map_err(|_| "level 1's program was never emitted")?;
-                let plan = plan_ref.get().ok_or("the plan is set")?;
                 let program = program_ref.get().ok_or("the program is set")?;
-                let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
-                // Beside phase B the card is the base's: the stacks go on the
-                // host.
-                let mut first =
-                    build_wlfm_under(program, hasher, LEVEL_RATE, level_levers(family), true)?;
-                hold_prefixes(&mut first)?;
-                let rest = build_rest(plan, &first, family, stop, Some(true))?;
-                Ok((first, rest, now()))
+                prepare_level(program, family)
             })
         });
         // Level 1's thread: the plan, the program, then its execute, a piece
@@ -781,13 +921,44 @@ pub fn prove_block_levels(
             WlfmFamily::B3 => crate::base_only::with_blake3_levels(prove_base),
         };
         let _ = base_end_ref.set(now());
+        let at_base = resident_now();
         *stx.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ptx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // The base's freed pages back to the OS, on a thread of their own
+        // beside level 1: the levels' threads would not reuse them.
+        let purge = proved
+            .is_ok()
+            .then(|| scope.spawn(crate::alloc_purge::purge_now));
+        // The card is free: level 1's stacks are committed on it now, while
+        // level 1's execution finishes on the host.
+        let first = match builder {
+            Some(b) => {
+                let pre = b
+                    .join()
+                    .map_err(|_| "the builder's thread panicked".to_string());
+                Some(pre.and_then(|pre| {
+                    let pre = pre?;
+                    let prepare = pre.secs();
+                    let cells = pre.prepared_cells();
+                    if proved.is_err() {
+                        return Err("the base did not prove".to_string());
+                    }
+                    let build = commit_level(pre, 1)?;
+                    Ok((build, prepare, cells, now()))
+                }))
+            }
+            None => None,
+        };
         let level1 = level1.join();
-        let built = builder.map(|b| b.join());
-        (proved, level1, built)
+        let purge = purge.and_then(|p| p.join().ok().flatten());
+        (proved, level1, first, purge, at_base)
     });
-    let (proved, level1, built_beside) = result;
+    let (proved, level1, built_beside, purge, at_base) = result;
+    times.peak_reset = peak_reset;
+    times.purges[0] = purge;
+    if let Some(r) = at_base {
+        times.resident.push(("base end", r));
+    }
     let (base_proof, base_stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
     times.base = base_end.get().copied().unwrap_or_else(now);
     let (planned, emitted, execution, execute_from, executed, npieces, waves, wave_secs, lean) =
@@ -811,89 +982,145 @@ pub fn prove_block_levels(
     times.execute_tail = (executed - times.base).max(0.0);
     let plan = plan_cell.into_inner().ok_or("no plan")?;
 
-    // Every level's build: beside phase B on the host (`build_beside`), or on
-    // the card after the base (today's).
-    let levels = match built_beside {
-        Some(built) => {
-            let (build, rest, at) = built.map_err(|_| "the builder's thread panicked")??;
-            times.built = at;
-            std::iter::once(Level { program, build })
-                .chain(rest)
-                .collect::<Vec<_>>()
-        }
+    // Level 1's build: its stacks committed on the card at the base's end
+    // (prepared beside phase B under `build_beside`), or prepared and
+    // committed now.
+    let (first, prepare, cells, committed) = match built_beside {
+        Some(built) => built?,
         None => {
-            // After the base the card is free: each level's stacks on it where
-            // they fit.
-            let on_host = stacks_on_host(&program, 1);
-            let mut first = build_level(program, family, on_host)?;
-            hold_prefixes(&mut first.build)?;
-            let rest = build_rest(&plan, &first.build, family, stop, None)?;
-            times.built = now();
-            std::iter::once(first).chain(rest).collect::<Vec<_>>()
+            let pre = prepare_level(&program, family)?;
+            let (prepare, cells) = (pre.secs(), pre.prepared_cells());
+            let build = commit_level(pre, 1)?;
+            (build, prepare, cells, now())
         }
     };
-
-    // Level 1: fill and prove; then each level over the one below.
-    let mut proofs: Vec<WlfmProof> = Vec::with_capacity(levels.len());
-    let t = std::time::Instant::now();
-    let filled = super::proof::lfm_fill_executed_prefilled(
-        &levels[0].program,
-        execution,
-        levels[0].build.artifacts.hasher,
-        executed - execute_from,
-        &Vec::new(),
-        super::wlfm::chip_records(),
-        lean,
-    );
-    let fill = t.elapsed().as_secs_f64();
-    times.lean_prefilled = filled.lean_prefilled();
-    times.fill_split = super::proof::take_fill_split().unwrap_or_default();
-    times.lean_parts = super::proof::take_lean_parts().unwrap_or_default();
-    let t = std::time::Instant::now();
-    proofs.push(
-        super::wlfm::prove_wlfm_traces_as(
-            &levels[0].build,
-            filled,
-            prefix_check(),
-            WlfmProving::Streamed,
-        )
-        .map_err(|e| format!("level 1: {e}"))?,
-    );
-    times.levels.push(LevelClock {
-        execute_from,
-        executed,
-        fill,
-        prove: t.elapsed().as_secs_f64(),
-        end: now(),
+    times.built = committed;
+    times.builds.push(LevelBuild {
+        place: first.place(),
+        prepare,
+        commit: first.secs().1,
+        prefix: first.chip_prefix_secs(),
+        cells,
+        committed,
     });
-    for k in 1..levels.len() {
-        let execute_from = now();
-        let child = child_of(&plan, &levels[k - 1]);
-        let arena = wlfm_leg_arena(&child, &proofs[k - 1])?;
-        let filled = super::wlfm::execute_and_fill_unmerged(
-            &levels[k].program,
-            &[arena],
-            levels[k].build.artifacts.hasher,
-        )?;
-        let executed = now();
+    if let Some(r) = resident_now() {
+        times.resident.push(("level 1 built", r));
+    }
+    let mut levels = vec![Level {
+        program,
+        build: first,
+    }];
+
+    // Level 1: fill and prove; then each level over the one below, its
+    // program and columns prepared while the one below proves, its stacks
+    // committed on the card while its own execution runs.
+    let mut proofs: Vec<WlfmProof> = Vec::with_capacity(2);
+    std::thread::scope(|scope| -> Result<(), String> {
+        let spawn_next = |build: &WlfmBuild, count: usize| {
+            let child = child_of_build(&plan, build);
+            level_more(stop, count, build).then(|| scope.spawn(move || prepare_next(child, family)))
+        };
+        let mut next = spawn_next(&levels[0].build, 1);
+        let t = std::time::Instant::now();
+        let filled = super::proof::lfm_fill_executed_prefilled(
+            &levels[0].program,
+            execution,
+            levels[0].build.artifacts.hasher,
+            executed - execute_from,
+            &Vec::new(),
+            super::wlfm::chip_records(),
+            lean,
+        );
+        let fill = t.elapsed().as_secs_f64();
+        times.lean_prefilled = filled.lean_prefilled();
+        times.fill_split = super::proof::take_fill_split().unwrap_or_default();
+        times.lean_parts = super::proof::take_lean_parts().unwrap_or_default();
+        if let Some(r) = resident_now() {
+            times.resident.push(("level 1 filled", r));
+        }
+        let _ = super::wlfm::take_wlfm_stamps();
         let t = std::time::Instant::now();
         proofs.push(
             super::wlfm::prove_wlfm_traces_as(
-                &levels[k].build,
+                &levels[0].build,
                 filled,
                 prefix_check(),
                 WlfmProving::Streamed,
             )
-            .map_err(|e| format!("level {}: {e}", k + 1))?,
+            .map_err(|e| format!("level 1: {e}"))?,
         );
         times.levels.push(LevelClock {
             execute_from,
             executed,
-            fill: 0.0,
+            fill,
             prove: t.elapsed().as_secs_f64(),
             end: now(),
         });
+        times
+            .stamps
+            .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());
+        release_proved(&mut levels[0], &mut times.sizes);
+        if let Some(r) = resident_now() {
+            times.resident.push(("level 1 proved", r));
+        }
+        let mut k = 1usize;
+        while let Some(handle) = next.take() {
+            let (program, pre) = handle
+                .join()
+                .map_err(|_| format!("level {}'s preparation panicked", k + 1))??;
+            let execute_from = now();
+            let (prepare, cells) = (pre.secs(), pre.prepared_cells());
+            // Its stacks on the card while its execution runs on the host.
+            let committer =
+                scope.spawn(move || commit_level(pre, k + 1).map(|build| (build, now())));
+            let child = child_of(&plan, &levels[k - 1]);
+            let arena = wlfm_leg_arena(&child, &proofs[k - 1])?;
+            let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+            let filled = super::wlfm::execute_and_fill_unmerged(&program, &[arena], hasher)?;
+            let executed = now();
+            let (build, committed) = committer
+                .join()
+                .map_err(|_| format!("level {}'s commit panicked", k + 1))??;
+            times.builds.push(LevelBuild {
+                place: build.place(),
+                prepare,
+                commit: build.secs().1,
+                prefix: build.chip_prefix_secs(),
+                cells,
+                committed,
+            });
+            next = spawn_next(&build, k + 1);
+            let t = std::time::Instant::now();
+            proofs.push(
+                super::wlfm::prove_wlfm_traces_as(
+                    &build,
+                    filled,
+                    prefix_check(),
+                    WlfmProving::Streamed,
+                )
+                .map_err(|e| format!("level {}: {e}", k + 1))?,
+            );
+            times.levels.push(LevelClock {
+                execute_from,
+                executed,
+                fill: 0.0,
+                prove: t.elapsed().as_secs_f64(),
+                end: now(),
+            });
+            times
+                .stamps
+                .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());
+            levels.push(Level { program, build });
+            release_proved(&mut levels[k], &mut times.sizes);
+            k += 1;
+        }
+        Ok(())
+    })?;
+    if let Some(r) = resident_now() {
+        times.resident.push(("levels proved", r));
     }
+    // What the levels freed, back to the OS before the next block's base.
+    times.purges[1] = crate::alloc_purge::purge_now();
     Ok(LevelsRun {
         base_proof,
         base_stamps,
