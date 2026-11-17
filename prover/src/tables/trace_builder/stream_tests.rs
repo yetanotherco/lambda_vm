@@ -1897,3 +1897,99 @@ fn with_the_knob_the_plan_leaves_the_count_to_bitwise() {
         );
     }
 }
+
+/// ★ KECCAK_W filled by row ranges (`LAMBDA_VM_FINISH_KECCAK_W_SPLIT=1`,
+/// `tables::gpack::generate_main_rows`) streams the tables the sliding finish
+/// streams without it, at their AIR positions, word for word and, held
+/// packed, byte for byte: the word format with KECCAK cut at 8 and at 4 rows,
+/// windows of 7 and 1000 cycles, parts of at least 1 and 3 rows. The split
+/// did run.
+#[test]
+fn the_keccak_w_split_streams_the_same_tables() {
+    use super::keccak_w_split_test;
+    use crate::tables::gpack::split_fills;
+    fn words(b: WindowedTraceBuilder<'_>, keccak_rows: usize) -> WindowedTraceBuilder<'_> {
+        use crate::tables::fused_memory::MemoryFormat;
+        use crate::tables::memw_aligned::MemwAlignedOrder;
+        use crate::tables::register::RegisterFormat;
+        b.register_format(RegisterFormat::InRow)
+            .expect("before any window")
+            .memw_aligned_order(MemwAlignedOrder::Limbs)
+            .expect("before any window")
+            .memory_format(MemoryFormat::Words)
+            .expect("before any window")
+            .keccak_rnd_chunks_at_finish(32)
+            .expect("rows")
+            .cuts_at_finish(keccak_rows, 1, 16, 1)
+            .expect("rows")
+            .pack_finished_tables()
+            .generate_packed()
+            .drop_streamed_ops()
+            .expect("before any window")
+    }
+    let max_rows = MaxRowsConfig::small();
+    let (program, logs) = run("test_keccak256");
+    let mut fills = 0usize;
+    for keccak_rows in [8, 4] {
+        for window in [7, 1000] {
+            let emit = |on, min_rows| {
+                keccak_w_split_test::with(on, min_rows, || {
+                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                        words(b, keccak_rows).slide_rest()
+                    });
+                    streamed(builder, last, usize::MAX).1
+                })
+            };
+            let want = emit(false, 1);
+            for min_rows in [1, 3] {
+                let what = format!("KECCAK at {keccak_rows} window {window} parts of {min_rows}");
+                let before = split_fills();
+                let got = emit(true, min_rows);
+                fills += split_fills() - before;
+                assert_eq!(got.len(), want.len(), "{what}: tables");
+                for (g, w) in got.iter().zip(&want) {
+                    assert_eq!(g.position, w.position, "{what}");
+                    let (g, w) = (g.table.as_ref(), w.table.as_ref());
+                    assert_eq!(
+                        g.map(shape_and_words),
+                        w.map(shape_and_words),
+                        "{what}: words"
+                    );
+                    assert_eq!(
+                        g.and_then(packed_bytes),
+                        w.and_then(packed_bytes),
+                        "{what}: packed bytes"
+                    );
+                }
+            }
+        }
+    }
+    assert!(fills > 0, "no KECCAK_W table was split");
+}
+
+/// The KECCAK_W split's knob: on at `1` alone; its bounds cut a 2^17-row table
+/// into eight parts and keep a table under two parts' rows whole.
+#[test]
+fn the_keccak_w_split_is_off_by_default_and_cuts_eight_parts() {
+    use super::{KECCAK_W_SPLIT_MIN_ROWS, keccak_w_split_from};
+    assert!(!keccak_w_split_from(None));
+    assert!(!keccak_w_split_from(Some("0")));
+    assert!(!keccak_w_split_from(Some("on")));
+    assert!(keccak_w_split_from(Some("1")));
+    assert!(keccak_w_split_from(Some(" 1\n")));
+    let b = crate::tables::gpack::row_bounds_at(
+        1 << 17,
+        KECCAK_W_SPLIT_MIN_ROWS,
+        crate::tables::gpack::SPLIT_MAX_PARTS,
+    );
+    assert_eq!(b.len(), 9);
+    assert_eq!((b[0], b[8]), (0, 1 << 17));
+    assert_eq!(
+        crate::tables::gpack::row_bounds_at(
+            2 * KECCAK_W_SPLIT_MIN_ROWS - 1,
+            KECCAK_W_SPLIT_MIN_ROWS,
+            8
+        ),
+        vec![0, 2 * KECCAK_W_SPLIT_MIN_ROWS - 1]
+    );
+}

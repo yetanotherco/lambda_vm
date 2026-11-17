@@ -1465,3 +1465,79 @@ pub(super) fn census_rows() -> Vec<Vec<FE>> {
     }
     distinct_rows(&run)
 }
+
+// ---- the fill split by rows ----
+
+/// The calls of [`honest_keccak256_calls_are_accepted`]: 73 sponge rows at
+/// every offset and length class.
+fn honest_run() -> Run {
+    let mut run = Run::new();
+    for offset in 0..8u64 {
+        for (k, &len) in [0u64, 1, 7, 8, 135, 136, 137, 271, 300].iter().enumerate() {
+            let ptr = IN + offset + 0x40 * k as u64;
+            let out = OUT + 0x100 * offset + 0x30 * k as u64 + offset;
+            run.call(ptr, len, out);
+        }
+    }
+    run.call(IN + 4, 140, IN + 4 + 10);
+    run
+}
+
+/// A trace's cells, column by column, and its packed bytes when it is packed.
+fn cells(t: &super::gpack::Trace) -> (Vec<Vec<u64>>, Option<Vec<u8>>) {
+    let main = &t.main_table;
+    let columns = match t.narrow_main() {
+        Some(n) => (0..n.cols()).map(|c| n.column(c)).collect(),
+        None => (0..main.width)
+            .map(|c| (0..main.height).map(|r| *main.get(r, c).value()).collect())
+            .collect(),
+    };
+    (columns, t.narrow_main().map(|n| n.data().to_vec()))
+}
+
+/// ★ KECCAK_W filled as row ranges at once is the table filled in one pass,
+/// column for column and (packed) byte for byte: ranges of one row, of
+/// unequal rows, past the ops (zero rows), of no rows, and one range; wide
+/// and packed. The mutant: a split whose parts skip their first row differs,
+/// so the comparison sees a fill that leaves a range's row unwritten.
+#[test]
+fn keccak_w_filled_by_row_ranges_is_the_table_filled_in_one_pass() {
+    let run = honest_run();
+    let n = run.ops.len();
+    let rows = n.next_power_of_two().max(4) * 2;
+    assert!(n > 40 && rows > n + 8, "{n} ops in {rows} rows");
+    let splits: [Vec<usize>; 5] = [
+        vec![0, rows],
+        vec![0, 1, rows],
+        vec![0, 17, n / 2, n / 2, n - 1, rows],
+        vec![0, n, n + 3, rows],
+        crate::tables::gpack::row_bounds_at(rows, 8, crate::tables::gpack::SPLIT_MAX_PARTS),
+    ];
+    for form in [TraceForm::Wide, TraceForm::Narrow] {
+        let whole = cells(&keccak_w::generate_keccak_w_rows_as(&run.ops, rows, form));
+        for bounds in &splits {
+            let b = bounds.clone();
+            let split =
+                keccak_w::generate_keccak_w_rows_split_as(&run.ops, rows, form, &|_| b.clone());
+            let split = cells(&split);
+            assert_eq!(split.0.len(), whole.0.len(), "{form:?} {bounds:?}: columns");
+            for (c, (a, b)) in split.0.iter().zip(&whole.0).enumerate() {
+                assert_eq!(a, b, "{form:?} {bounds:?}: column {c}");
+            }
+            assert_eq!(split.1, whole.1, "{form:?} {bounds:?}: packed bytes");
+        }
+        // The mutant: each part skips its first row.
+        let bounds = crate::tables::gpack::row_bounds_at(rows, 8, 8);
+        let skipped = crate::tables::gpack::generate_main_rows!(
+            form,
+            &keccak_w::WIDTHS,
+            rows,
+            keccak_w::cols::NUM_COLUMNS,
+            &bounds,
+            |table, range| {
+                keccak_w::fill_keccak_w_range(table, &run.ops, range.start + 1..range.end)
+            }
+        );
+        assert_ne!(cells(&skipped).0, whole.0, "{form:?}: the mutant is seen");
+    }
+}
