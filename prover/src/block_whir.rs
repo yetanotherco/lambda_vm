@@ -651,36 +651,52 @@ pub fn b3_base_group_polys() -> usize {
 /// encoded on a domain that shrinks by `shrink` bits a round (the rate rises
 /// by `k − shrink` bits a round), it is never opened, and each query's fold
 /// value is a claim on it at the folded domain's point; each round queries the
-/// count for its own rate under the base's target, and each tree's cap is held
-/// to what its own openings pay for (caps by Q, under the base's cap as the
-/// ceiling).
+/// count for its own rate under the base's target. Its trees' cap rule is part
+/// of it: caps by Q (each tree's cap held to what its own openings pay for,
+/// under the base's cap as the ceiling — production) or the base's cap at
+/// every tree.
 ///
 /// ★ A FORMAT VALUE. The prover and the verifier of one block take it from
 /// their [`BlockFormat`] (production: [`b3_base_rounds`], the base's knob;
 /// the pinned verifier: `Fri`); it reaches the proof through the chains'
 /// config ([`BlockFormat::chain_config`], bound by the fold word) and the
-/// statement tag (`/W<shrink>`, [`block_format_tag`]). Never read from a
+/// statement tag (`/W<shrink>` and the cap rule, `/Cq` for caps by Q, both
+/// from [`B3Rounds::tag_word`], [`block_format_tag`]). Never read from a
 /// proof. The BLAKE3 base's alone: a Poseidon1 format's chains are `Fri`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum B3Rounds {
     /// Every query opens the successor. Today's.
     #[default]
     Fri,
-    /// The WHIR round form at this shrink (1 to 3), caps by Q.
-    Whir { shrink: u8 },
+    /// The WHIR round form at this shrink (1 to 3); each tree's cap by its
+    /// own query count when `caps_by_q`, else the base's cap at every tree.
+    Whir { shrink: u8, caps_by_q: bool },
 }
 
 impl B3Rounds {
     /// The round form the design picked: shrink 3 under four variables a
     /// round, so the rate doubles every round after round 0.
-    pub const WHIR3: Self = Self::Whir { shrink: 3 };
+    /// Its trees' caps by Q.
+    pub const WHIR3: Self = Self::Whir {
+        shrink: 3,
+        caps_by_q: true,
+    };
 
-    /// The statement tag's word for it: `` for `Fri`, `/W<shrink>` for the
-    /// round form.
+    /// The statement tag's word for it, the round form and its cap rule in one
+    /// place: nothing for `Fri`; `/W<shrink>/Cq` for the round form with caps
+    /// by Q, `/W<shrink>` with the base's cap at every tree (whose height the
+    /// tag already names, `/C<h>`).
     pub fn tag_word(self) -> String {
         match self {
             Self::Fri => String::new(),
-            Self::Whir { shrink } => format!("/W{shrink}"),
+            Self::Whir {
+                shrink,
+                caps_by_q: true,
+            } => format!("/W{shrink}/Cq"),
+            Self::Whir {
+                shrink,
+                caps_by_q: false,
+            } => format!("/W{shrink}"),
         }
     }
 }
@@ -693,16 +709,22 @@ pub const B3_BASE_ROUNDS_ENV: &str = "LAMBDA_VM_B3_BASE_ROUNDS";
 
 /// [`B3_BASE_ROUNDS_ENV`]'s value: unset, `0` or `fri` is [`B3Rounds::Fri`]
 /// (today's); `1` or `w3` is [`B3Rounds::WHIR3`]; `w2` and `w1` are the round
-/// form at shrink 2 and 1 (measurements). Only these words turn it on:
-/// anything else is refused.
+/// form at shrink 2 and 1 (measurements), each with caps by Q. Only these
+/// words turn it on: anything else is refused.
 pub fn b3_base_rounds_setting(value: Option<&str>) -> Result<B3Rounds, String> {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
         None => Ok(B3Rounds::Fri),
         Some(v) => match v.as_str() {
             "0" | "fri" => Ok(B3Rounds::Fri),
             "1" | "w3" => Ok(B3Rounds::WHIR3),
-            "w2" => Ok(B3Rounds::Whir { shrink: 2 }),
-            "w1" => Ok(B3Rounds::Whir { shrink: 1 }),
+            "w2" => Ok(B3Rounds::Whir {
+                shrink: 2,
+                caps_by_q: true,
+            }),
+            "w1" => Ok(B3Rounds::Whir {
+                shrink: 1,
+                caps_by_q: true,
+            }),
             other => Err(format!(
                 "{B3_BASE_ROUNDS_ENV}={other:?}: expected 0, fri, 1, w3, w2 or w1"
             )),
@@ -734,8 +756,9 @@ pub fn b3_base_rounds() -> B3Rounds {
 /// The statement tag of a block proved under `format`: [`block_statement_tag`]
 /// of its base, and under the 7-round BLAKE3 base its group size too
 /// (`/G<n>`, the format's [`BlockFormat::group_polys`]), so no two BLAKE3
-/// group sizes share a tag, then its round form (`/W<shrink>` under the WHIR
-/// round form, nothing under today's: [`B3Rounds::tag_word`]). Every block
+/// group sizes share a tag, then its round form and cap rule (`/W<shrink>/Cq`
+/// under the WHIR round form with caps by Q, nothing under today's:
+/// [`B3Rounds::tag_word`]). Every block
 /// statement's prover and verifier (and the recursion's plan) take their tag
 /// here.
 pub fn block_format_tag(format: &BlockFormat) -> Vec<u8> {
@@ -929,8 +952,8 @@ impl BlockFormat {
         // ★ The BLAKE3 base's round form ([`B3Rounds`]): the later rounds'
         // counts derived for the same target and union bound round 0's count
         // was sized for (the chains' `check_round_form` refuses any other on
-        // both sides), each tree's cap held to its own openings.
-        if let (true, B3Rounds::Whir { shrink }) =
+        // both sides), and its cap rule.
+        if let (true, B3Rounds::Whir { shrink, caps_by_q }) =
             (self.zf.base == BaseFormat::B3_WHIR, self.b3_rounds)
         {
             let tallest = crate::multilinear_prove::tallest_stack(&self.zf, shapes);
@@ -940,8 +963,12 @@ impl BlockFormat {
                     crate::multilinear_prove::CHAIN_SECURITY_BITS,
                     tallest,
                 )
-                .and_then(ChainConfig::with_caps_by_queries)
                 .expect("a shrink from 1 to 3 is a round form");
+            if caps_by_q {
+                config = config
+                    .with_caps_by_queries()
+                    .expect("a round-form config takes caps by Q");
+            }
         }
         config
     }
@@ -1098,6 +1125,18 @@ pub fn round_form_counts() -> (u64, u64) {
     (
         multilinear::gpu::round_form_host_encodes(),
         multilinear::gpu::shift_claim_batches(),
+    )
+}
+
+/// Round-0 openings of coset-ordered trees served from their stacks on the
+/// card, and those that re-encoded their codewords instead (a plan the card's
+/// kernels do not take, or a decline: `multilinear::gpu`'s counters). What a
+/// base-only run prints, so a first fold whose cosets outgrew the card's plan
+/// ([`CARD_COSET_FOLD_LEVELS`]) shows as re-encodes.
+pub fn coset_counts() -> (u64, u64) {
+    (
+        multilinear::gpu::coset_openings(),
+        multilinear::gpu::coset_fallbacks(),
     )
 }
 

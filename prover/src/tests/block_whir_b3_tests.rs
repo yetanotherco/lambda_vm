@@ -435,8 +435,20 @@ fn the_blake3_base_rounds_knob_reads_its_words_and_refuses_the_rest() {
         (Some("1"), B3Rounds::WHIR3),
         (Some("w3"), B3Rounds::WHIR3),
         (Some(" W3 "), B3Rounds::WHIR3),
-        (Some("w2"), B3Rounds::Whir { shrink: 2 }),
-        (Some("w1"), B3Rounds::Whir { shrink: 1 }),
+        (
+            Some("w2"),
+            B3Rounds::Whir {
+                shrink: 2,
+                caps_by_q: true,
+            },
+        ),
+        (
+            Some("w1"),
+            B3Rounds::Whir {
+                shrink: 1,
+                caps_by_q: true,
+            },
+        ),
     ] {
         assert_eq!(b3_base_rounds_setting(word), Ok(want), "{word:?}");
     }
@@ -447,7 +459,15 @@ fn the_blake3_base_rounds_knob_reads_its_words_and_refuses_the_rest() {
     assert_eq!(BlockFormat::pinned().b3_rounds, B3Rounds::Fri);
     assert_eq!(BlockFormat::production().b3_rounds, B3Rounds::Fri);
     assert_eq!(B3Rounds::Fri.tag_word(), "");
-    assert_eq!(B3Rounds::WHIR3.tag_word(), "/W3");
+    assert_eq!(B3Rounds::WHIR3.tag_word(), "/W3/Cq");
+    assert_eq!(
+        B3Rounds::Whir {
+            shrink: 3,
+            caps_by_q: false
+        }
+        .tag_word(),
+        "/W3"
+    );
 }
 
 /// Shapes whose stack is the production `2^27` (one table of 2^21 rows and
@@ -484,13 +504,28 @@ fn the_blake3_round_form_is_named_in_the_tag_and_bound_by_the_fold_word() {
     today.extend_from_slice(b"/G4");
     assert_eq!(block_format_tag(&fri), today);
     let mut want = today.clone();
-    want.extend_from_slice(b"/W3");
+    want.extend_from_slice(b"/W3/Cq");
     assert_eq!(block_format_tag(&w), want);
     let w2 = BlockFormat {
-        b3_rounds: B3Rounds::Whir { shrink: 2 },
+        b3_rounds: B3Rounds::Whir {
+            shrink: 2,
+            caps_by_q: true,
+        },
         ..fri
     };
     assert_ne!(block_format_tag(&w2), block_format_tag(&w));
+    // The cap rule is named beside the round form: the base's cap at every
+    // tree is another tag and another fold word.
+    let w_policy = BlockFormat {
+        b3_rounds: B3Rounds::Whir {
+            shrink: 3,
+            caps_by_q: false,
+        },
+        ..fri
+    };
+    let mut policy_tag = today.clone();
+    policy_tag.extend_from_slice(b"/W3");
+    assert_eq!(block_format_tag(&w_policy), policy_tag);
 
     let shapes = production_shapes();
     assert_eq!(
@@ -665,6 +700,65 @@ fn a_blake3_base_under_the_round_form_proves_and_each_form_refuses_the_other() {
                 other => panic!("an extension round: {other:?}"),
             },
         );
+    });
+}
+
+/// ★ The cap rule is a verifier constant: a BLAKE3 base under the round form
+/// with caps by Q (`/W3/Cq`, production) and one with the base's cap at every
+/// tree (`/W3`) each verify under their own format and are refused under the
+/// other's. And the trees' drop is the prover's alone: the same block under
+/// the round form at first fold 4 (one joint round-0 tree a run) proved with 3,
+/// 5, 8 and 10 dropped levels verifies, and is the same proof byte for byte
+/// when the grind is deterministic (`LAMBDA_VM_DETERMINISTIC_GRIND`, read once
+/// per process: run this test alone with it to see the bytes; otherwise a
+/// parallel grind's nonces differ between any two proves).
+#[test]
+fn a_blake3_round_form_proof_under_another_cap_rule_is_refused_and_the_drop_moves_no_byte() {
+    use crate::block_whir::B3Rounds;
+    use multilinear::whir_chain::{GroupFold, WhirFolds};
+    let elf = asm_elf_bytes("all_instructions_64");
+    let mut base = many_groups(BaseFormat::B3_WHIR);
+    base.group = GroupFold::Indexed;
+    base.zf.whir_folds = WhirFolds::Uniform;
+    let by_q = BlockFormat {
+        b3_rounds: B3Rounds::WHIR3,
+        ..base
+    };
+    let policy = BlockFormat {
+        b3_rounds: B3Rounds::Whir {
+            shrink: 3,
+            caps_by_q: false,
+        },
+        ..base
+    };
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    crate::base_only::with_permit(|| {
+        let q = prove(&elf, &by_q, 3);
+        let p = prove(&elf, &policy, 3);
+        assert_eq!(refusal(&q, &elf, &by_q), None, "caps by Q verifies");
+        assert_eq!(refusal(&p, &elf, &policy), None, "the base's caps verify");
+        assert!(
+            !verify(&q, &elf, &policy),
+            "a caps-by-Q proof under the base's caps"
+        );
+        assert!(
+            !verify(&p, &elf, &by_q),
+            "a base's-caps proof under caps by Q"
+        );
+
+        let reference = bytes(&q);
+        for drop in [5usize, 8, 10] {
+            let other = prove(&elf, &by_q, drop);
+            assert_eq!(refusal(&other, &elf, &by_q), None, "drop {drop} verifies");
+            if crypto::grinding::deterministic() {
+                assert_eq!(bytes(&other), reference, "drop {drop} against drop 3");
+                println!("B3 ROUND FORM DROP {drop}: the same bytes as drop 3");
+            }
+        }
     });
 }
 
