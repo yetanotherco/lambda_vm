@@ -3017,6 +3017,93 @@ fn keccak_rnd_first_is_the_default_moves_the_partition_and_verifies() {
     );
 }
 
+/// ★ The run's AIR set built beside the first KECCAK_RND tables
+/// ([`Deviations::rest_airs_beside`]): the KECCAK_RND tables handed on first
+/// are laid out with their own AIRs while the set is built on a thread of its
+/// own, then checked against it. The proof's bytes are the ones the set built
+/// before the rest's first table proves, and it verifies; only the beside arm
+/// takes the early path.
+#[test]
+fn the_rest_airs_built_beside_prove_the_same_bytes() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    assert!(o.rest_streams(), "the rest streams");
+    let proved = |beside: bool| {
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                rest_airs_beside: Some(beside),
+                ..Deviations::default()
+            },
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "beside {beside}");
+        let early = stamps
+            .layout
+            .marks
+            .iter()
+            .any(|&(label, _)| label == "rest airs beside");
+        assert_eq!(early, beside, "the early path taken");
+        proof
+    };
+    let before = proved(false);
+    let beside = proved(true);
+    assert_eq!(before.groups, beside.groups, "the partition");
+    assert_eq!(before.table_num_vars, beside.table_num_vars);
+    assert_eq!(
+        format!("{:?}", before.table_counts),
+        format!("{:?}", beside.table_counts)
+    );
+    // The bytes, when the grind is deterministic (`LAMBDA_VM_DETERMINISTIC_GRIND`
+    // and `LAMBDA_VM_FIXED_TRACE_HASH`, read once a process: run this test alone).
+    if crypto::grinding::deterministic() {
+        let bytes = |p: &BlockWhirProof| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                .expect("serialize")
+                .to_vec()
+        };
+        assert_eq!(bytes(&before), bytes(&beside), "the proof's bytes");
+    }
+}
+
+/// With the AIR set built beside them, an early KECCAK_RND table laid out
+/// with an AIR that is not the run's at its place (each named for the next
+/// table) is refused once the set exists: the prove ends in an error, not a
+/// proof.
+#[test]
+fn an_early_keccak_rnd_table_laid_out_with_another_air_is_refused() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    let refused = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &format,
+        &o,
+        &Deviations {
+            rest_airs_beside: Some(true),
+            rest_airs_beside_misnamed: true,
+            ..Deviations::default()
+        },
+    );
+    let Err(e) = refused else {
+        panic!("a table laid out with another AIR proved");
+    };
+    let message = format!("{e:?}");
+    assert!(
+        message.contains("laid out with KECCAK_RND[1]") && message.contains("KECCAK_RND[0]"),
+        "{message}"
+    );
+}
+
 /// The bounded layout (D-EXEC E3): with three workers and `layout_ahead =
 /// Some(k)`, at most `k + 1` streamed chunks are laid out (or in the making)
 /// and not yet packed at once, and the groups are the inline layout's.
