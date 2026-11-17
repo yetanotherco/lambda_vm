@@ -237,6 +237,18 @@ pub(super) struct Fixture {
 
 /// One chain proved over `Blake3Whir` under `c`, accepted by the host.
 pub(super) fn fixture(c: &Case) -> Fixture {
+    let fx = proved(c);
+    assert!(
+        host_accepts(&fx, &fx.proof),
+        "{c:?}: the host accepts its own proof"
+    );
+    assert_eq!(fx.shape.whir(), c.shrink.is_some());
+    fx
+}
+
+/// One chain proved over `Blake3Whir` under `c` by whatever prover the
+/// thread's test faults arm, unchecked.
+fn proved(c: &Case) -> Fixture {
     let cfg = config(c);
     let f = super::chain::pseudo_mle(c.n, 23);
     let z = point(c.n);
@@ -252,7 +264,7 @@ pub(super) fn fixture(c: &Case) -> Fixture {
         &mut HostTranscript::new(&[]),
     )
     .expect("the chain proves");
-    let fx = Fixture {
+    Fixture {
         shape: ChainShape::for_hash(&cfg, c.n, WrapHash::Blake3),
         cfg,
         proof,
@@ -260,13 +272,7 @@ pub(super) fn fixture(c: &Case) -> Fixture {
         y,
         root: commitment.root(),
         domain,
-    };
-    assert!(
-        host_accepts(&fx, &fx.proof),
-        "{c:?}: the host accepts its own proof"
-    );
-    assert_eq!(fx.shape.whir(), c.shrink.is_some());
-    fx
+    }
 }
 
 pub(super) fn host_accepts(f: &Fixture, proof: &ChainProof<F, E>) -> bool {
@@ -1241,4 +1247,100 @@ fn a_round_form_chain_under_another_hash_is_refused_at_emission() {
         &shape,
         false,
     );
+}
+
+/// ★★ A LATER-ROUND FORGERY HAS NO EXECUTION. A cheating prover commits, at
+/// round `r`, a successor tree encoding another polynomial than the message
+/// its sumcheck carries on with, and answers that round's out-of-domain point
+/// from the message (`round_form_faults::with_forged_successor`); only the
+/// next round's openings, checked as shift claims on the message, can tell.
+/// Over a five-round chain at the base's schedule (first fold 4, then 4,
+/// shrink 3, caps by Q), the forgery at every round `r = 0..3` is refused by
+/// the host and has no execution, under both lowerings.
+///
+/// ★ THE MUTANT, both sides: with the shift claims dropped by the prover and
+/// the verifier (the host's `DropShiftClaims`; the guest's
+/// `with_shift_claims_dropped`), the forgery of every tree a
+/// successor-committing round opens (`r = 0..2`) is accepted by the host AND
+/// executes in the guest without its claims, while the honest guest still
+/// refuses it; the last tree, opened by the final round against the final
+/// value, is refused either way.
+#[test]
+fn a_successor_that_is_not_the_message_has_no_execution_at_any_round() {
+    use super::super::whir_chain::guest_faults::with_shift_claims_dropped;
+    use multilinear::whir_chain::round_form_faults::{Fault, with, with_forged_successor};
+    let c = Case {
+        n: 17,
+        lb: 1,
+        first: Some(4),
+        k: 4,
+        shrink: Some(3),
+        bits: 20,
+        grind: 4,
+        cap: CapPolicy::Fixed(8),
+        leaves: LeafOrder::Coset,
+        final_vars: None,
+        caps_by_q: true,
+    };
+    let honest = fixture(&c);
+    let rounds = honest.shape.rounds();
+    assert!(rounds >= 5, "four successors: {rounds} rounds");
+    // Each forgery proved once: by the cheating prover, and by the cheating
+    // prover that also leaves its shift claims out.
+    let forged: Vec<(Fixture, Fixture)> = (0..rounds - 1)
+        .map(|r| {
+            (
+                with_forged_successor(r, || proved(&c)),
+                with(Fault::DropShiftClaims, || {
+                    with_forged_successor(r, || proved(&c))
+                }),
+            )
+        })
+        .collect();
+    under_both(|lowering| {
+        let strict = program(&honest.shape);
+        let lax = with_shift_claims_dropped(|| program(&honest.shape));
+        assert!(
+            runs(&strict, arena(&honest, &honest.proof)),
+            "{lowering}: the honest proof executes"
+        );
+        for (r, (forged, unclaimed)) in forged.iter().enumerate() {
+            assert_ne!(
+                forged.proof.rounds[r].next_root, honest.proof.rounds[r].next_root,
+                "round {r}: another tree"
+            );
+            assert!(!host_accepts(forged, &forged.proof), "round {r}: host");
+            assert!(
+                !runs(&strict, arena(forged, &forged.proof)),
+                "{lowering} round {r}: the forgery has no execution"
+            );
+            // Without the claims, a tree a successor-committing round opens
+            // is bound to nothing else.
+            let opened_by_a_successor_round = r + 2 < rounds;
+            assert_eq!(
+                with(Fault::DropShiftClaims, || host_accepts(
+                    unclaimed,
+                    &unclaimed.proof
+                )),
+                opened_by_a_successor_round,
+                "round {r}: the host without its claims"
+            );
+            assert_eq!(
+                runs(&lax, arena(unclaimed, &unclaimed.proof)),
+                opened_by_a_successor_round,
+                "{lowering} round {r}: the guest without its claims"
+            );
+            assert!(
+                !runs(&strict, arena(unclaimed, &unclaimed.proof)),
+                "{lowering} round {r}: the honest guest refuses it"
+            );
+        }
+        println!(
+            "FORGED SUCCESSOR {lowering}: {rounds} rounds · queries {:?} · refused at rounds 0..{} \
+             · accepted without the claims at 0..{}",
+            honest.shape.round_queries,
+            rounds - 2,
+            rounds - 3
+        );
+    });
 }

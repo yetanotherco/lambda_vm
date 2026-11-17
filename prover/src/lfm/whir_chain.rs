@@ -2143,6 +2143,10 @@ fn emit_shift_claims(
         if j > 0 {
             power = b.emul(power, gamma);
         }
+        #[cfg(test)]
+        if guest_faults::drops_shift_claims() {
+            continue;
+        }
         let y = super::edsl::pow_bits(b, bits, &factors, FE::one());
         let mut point = Vec::with_capacity(n_next);
         point.push(y);
@@ -2271,6 +2275,37 @@ pub(crate) mod chain_draws {
         let out = f();
         let draws = DRAWS.with(|d| d.replace(previous)).unwrap_or_default();
         (out, draws)
+    }
+}
+
+/// Test only: an in-guest verifier with the round form's shift claims left
+/// out (no claim term, no weight term), the twin of the host's
+/// `round_form_faults::Fault::DropShiftClaims`. It shows that the claims are
+/// what binds a later tree to the sumcheck's message in the guest too: a
+/// forged successor that the honest program refuses executes under this one.
+/// Thread-local and off unless armed; compiled into tests only.
+#[cfg(test)]
+pub(crate) mod guest_faults {
+    std::thread_local! {
+        static DROP_SHIFT_CLAIMS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether the emission in progress leaves the shift claims out.
+    pub(crate) fn drops_shift_claims() -> bool {
+        DROP_SHIFT_CLAIMS.with(std::cell::Cell::get)
+    }
+
+    /// Runs `f` (an emission) with the shift claims left out, restoring the
+    /// previous setting after.
+    pub(crate) fn with_shift_claims_dropped<R>(f: impl FnOnce() -> R) -> R {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DROP_SHIFT_CLAIMS.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(DROP_SHIFT_CLAIMS.with(|c| c.replace(true)));
+        f()
     }
 }
 
