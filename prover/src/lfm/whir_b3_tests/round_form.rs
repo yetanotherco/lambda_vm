@@ -24,8 +24,8 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use multilinear::eq::eq_eval;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
-    CapPolicy, ChainConfig, ChainProof, FinalPoly, FirstFold, GrindBits, LeafOrder, RoundOpenings,
-    WhirFolds, commit, ood_point, prove, verify,
+    CapPolicy, ChainConfig, ChainFormat, ChainProof, FinalPoly, FirstFold, GrindBits, LeafOrder,
+    RoundForm, RoundOpenings, WhirFolds, WhirRounds, commit, ood_point, prove, verify,
 };
 use multilinear::whir_hash::Blake3Whir;
 
@@ -935,26 +935,33 @@ fn the_round_form_census_of_a_blake3_base_group() {
     };
     let fri4 = at(zf4, B3Rounds::Fri);
     let base_w3 = at(zf4, B3Rounds::WHIR3);
-    let bits = crate::multilinear_prove::CHAIN_SECURITY_BITS;
-    let tallest = crate::multilinear_prove::tallest_stack(&zf4, &[(polys, n)]);
-    let w3 = fri4.with_whir_rounds(3, bits, tallest).expect("shrink 3");
+    // The base's round form with the policy's caps: its own shrink, target
+    // and union bound (never re-derived here), caps by Q off.
+    let RoundForm::Whir(w) = base_w3.format.rounds else {
+        panic!("the base's round form")
+    };
+    assert!(w.caps_by_queries(), "the base's round form takes caps by Q");
+    let policy_caps = ChainConfig {
+        format: ChainFormat {
+            rounds: RoundForm::Whir(
+                WhirRounds::new(w.shrink(), w.security_bits(), w.union_rounds())
+                    .expect("the base's parameters"),
+            ),
+            ..base_w3.format
+        },
+        ..base_w3
+    };
+    assert_eq!(policy_caps.with_caps_by_queries(), Some(base_w3));
     assert_eq!(
-        w3.with_caps_by_queries(),
-        Some(base_w3),
-        "the base's round form is shrink 3 with caps by Q"
+        multilinear::whir_chain::check_round_form(&policy_caps),
+        Ok(()),
+        "the same counts"
     );
-    let w3_k0_6 = today
-        .with_whir_rounds(
-            3,
-            bits,
-            crate::multilinear_prove::tallest_stack(&zf, &[(polys, n)]),
-        )
-        .expect("shrink 3");
     let arms = [
         ("today's format", today),
         ("first fold 4, today's form", fri4),
-        ("round form k0 4 s 3", w3),
-        ("round form k0 6 s 3", w3_k0_6),
+        ("round form k0 4 s 3, policy caps", policy_caps),
+        ("round form k0 6 s 3, caps by Q", at(zf, B3Rounds::WHIR3)),
         ("round form k0 4 s 3, caps by Q (the base's)", base_w3),
     ];
     let shape_of = |cfg: &ChainConfig| {
@@ -1010,7 +1017,7 @@ fn the_round_form_census_of_a_blake3_base_group() {
     // every tree) and under caps by Q (the base's own, 8 7 7 6 6).
     assert_eq!(
         (totals[0], totals[2], totals[4]),
-        (28_768, 11_778, 11_538),
+        (28_768, 11_705, 11_461),
         "the census's closed forms"
     );
 
