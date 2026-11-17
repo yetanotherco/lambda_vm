@@ -701,6 +701,16 @@ impl B3Rounds {
     }
 }
 
+/// The stack height the BLAKE3 base's round form charges its union bound
+/// for ([`BlockFormat::chain_config`]): no chain of a block is taller — a
+/// group stacks at its cap ([`multilinear::whir_chain::StackVars::WIDEST`]
+/// at most) or at its tallest table ([`BLOCK_MAX_TABLE_VARS`] at most, a
+/// verifier constant), whichever is taller — and a chain that were is refused
+/// by the chains themselves (`check_round_form_union`).
+pub const B3_ROUND_FORM_STACK_BOUND: usize = 27;
+const _: () = assert!(B3_ROUND_FORM_STACK_BOUND >= BLOCK_MAX_TABLE_VARS);
+const _: () = assert!(B3_ROUND_FORM_STACK_BOUND >= multilinear::whir_chain::StackVars::WIDEST);
+
 /// The knob that proves and verifies the BLAKE3 base under the WHIR round
 /// form ([`B3Rounds`]); both sides of one process read it, and the tag names
 /// it: see [`b3_base_rounds_setting`]. Read here, never by the format module
@@ -708,25 +718,16 @@ impl B3Rounds {
 pub const B3_BASE_ROUNDS_ENV: &str = "LAMBDA_VM_B3_BASE_ROUNDS";
 
 /// [`B3_BASE_ROUNDS_ENV`]'s value: unset, `0` or `fri` is [`B3Rounds::Fri`]
-/// (today's); `1` or `w3` is [`B3Rounds::WHIR3`]; `w2` and `w1` are the round
-/// form at shrink 2 and 1 (measurements), each with caps by Q. Only these
-/// words turn it on: anything else is refused.
+/// (today's); `1` or `w3` is [`B3Rounds::WHIR3`] (shrink 3, caps by Q). Only
+/// these two words turn it on: anything else is refused.
 pub fn b3_base_rounds_setting(value: Option<&str>) -> Result<B3Rounds, String> {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
         None => Ok(B3Rounds::Fri),
         Some(v) => match v.as_str() {
             "0" | "fri" => Ok(B3Rounds::Fri),
             "1" | "w3" => Ok(B3Rounds::WHIR3),
-            "w2" => Ok(B3Rounds::Whir {
-                shrink: 2,
-                caps_by_q: true,
-            }),
-            "w1" => Ok(B3Rounds::Whir {
-                shrink: 1,
-                caps_by_q: true,
-            }),
             other => Err(format!(
-                "{B3_BASE_ROUNDS_ENV}={other:?}: expected 0, fri, 1, w3, w2 or w1"
+                "{B3_BASE_ROUNDS_ENV}={other:?}: expected 0, fri, 1 or w3"
             )),
         },
     }
@@ -742,7 +743,7 @@ pub fn b3_base_rounds() -> B3Rounds {
             Ok(v) => Some(v),
             Err(std::env::VarError::NotPresent) => None,
             Err(std::env::VarError::NotUnicode(v)) => {
-                eprintln!("{B3_BASE_ROUNDS_ENV}={v:?}: expected 0, fri, 1, w3, w2 or w1");
+                eprintln!("{B3_BASE_ROUNDS_ENV}={v:?}: expected 0, fri, 1 or w3");
                 std::process::abort()
             }
         };
@@ -949,21 +950,36 @@ impl BlockFormat {
             GroupFold::Indexed => self.zf.whir_trees,
             GroupFold::PerPoly => multilinear::whir_chain::Round0Trees::Each,
         };
-        // ★ The BLAKE3 base's round form ([`B3Rounds`]): the later rounds'
-        // counts derived for the same target and union bound round 0's count
-        // was sized for (the chains' `check_round_form` refuses any other on
-        // both sides), and its cap rule.
+        // ★ The BLAKE3 base's round form ([`B3Rounds`]): every round's count,
+        // round 0's among them, derived for the 128-bit target over ONE union
+        // bound that reads no shape — the rounds of a chain over
+        // [`B3_ROUND_FORM_STACK_BOUND`] variables, which no chain of a block
+        // exceeds (the chains themselves refuse one that does,
+        // `check_round_form_union`). So the config's format, and the fold word
+        // every commit-time out-of-domain point absorbs, is the same whether
+        // phase A builds it before the block's shapes are known or the
+        // verifier builds it from the statement; and the chains'
+        // `check_round_form` takes it on both sides. Round 0 queries what
+        // today's form queries over a `2^27` stack (229 at the default), never
+        // fewer. Then its cap rule.
         if let (true, B3Rounds::Whir { shrink, caps_by_q }) =
             (self.zf.base == BaseFormat::B3_WHIR, self.b3_rounds)
         {
-            let tallest = crate::multilinear_prove::tallest_stack(&self.zf, shapes);
             config = config
                 .with_whir_rounds(
                     usize::from(shrink),
                     crate::multilinear_prove::CHAIN_SECURITY_BITS,
-                    tallest,
+                    B3_ROUND_FORM_STACK_BOUND,
                 )
                 .expect("a shrink from 1 to 3 is a round form");
+            if let multilinear::whir_chain::RoundForm::Whir(w) = config.format.rounds {
+                config.num_queries = multilinear::query_count::num_queries(
+                    config.log_blowup,
+                    w.union_rounds(),
+                    w.security_bits(),
+                    config.grind.query,
+                );
+            }
             if caps_by_q {
                 config = config
                     .with_caps_by_queries()

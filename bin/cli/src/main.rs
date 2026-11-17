@@ -1393,7 +1393,7 @@ fn cmd_prove_block_base(
             String::from_utf8_lossy(&prover::block_whir::block_format_tag(&cfg.format))
         );
         eprintln!(
-            "BLOCK BASE ROUNDS: {:?} ({} reads 0, fri, 1, w3, w2 or w1) · card drop {}",
+            "BLOCK BASE ROUNDS: {:?} ({} reads 0, fri, 1 or w3) · card drop {}",
             cfg.format.b3_rounds,
             prover::block_whir::B3_BASE_ROUNDS_ENV,
             cfg.options.drop_levels
