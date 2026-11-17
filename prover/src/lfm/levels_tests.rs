@@ -923,12 +923,14 @@ fn rta_one_run(
     let (rss, hwm) = rss_gib();
     println!(
         "RTA MEMORY: peak reset {} · VmRSS {} · purge at the base's end {} · purge after the \
-         levels {} · purge after level 1's fill {} · now VmRSS {rss:.2} GiB · VmHWM {hwm:.2} GiB",
+         levels {} · purge after level 1's fill {} · purge at the start {} · now VmRSS {rss:.2} GiB · \
+         VmHWM {hwm:.2} GiB",
         t.peak_reset,
         points.join(" · "),
         purge(&t.purges[0]),
         purge(&t.purges[1]),
         purge(&t.purges[2]),
+        purge(&t.purges[3]),
     );
     let cards: Vec<String> = t
         .card

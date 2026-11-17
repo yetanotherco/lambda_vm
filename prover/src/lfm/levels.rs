@@ -692,9 +692,9 @@ pub struct LevelsTimes {
     pub peak_reset: bool,
     /// The allocator purges: at the base's end, on a thread beside level 1;
     /// after the last level, before the driver returns; after level 1's fill,
-    /// on a thread beside its prove. Each its seconds and jemalloc's resident
-    /// bytes before and after.
-    pub purges: [Option<crate::alloc_purge::Purge>; 3],
+    /// on a thread beside its prove; at the driver's start, before its clock.
+    /// Each its seconds and jemalloc's resident bytes before and after.
+    pub purges: [Option<crate::alloc_purge::Purge>; 4],
     /// The process's resident set at named points (bytes; Linux).
     pub resident: Vec<(&'static str, u64)>,
     /// The card at named points, each after a drain and a trim
@@ -817,8 +817,12 @@ pub fn prove_block_levels(
                 .into(),
         );
     }
+    // What the process freed before this block (an earlier block, its
+    // verification) goes back to the OS first, so the peak this block's base
+    // reads starts from what is live, not from pages the allocator keeps.
+    let purge_at_start = crate::alloc_purge::purge_now();
     let peak_reset = reset_peak_rss();
-    // What an earlier block left in the card's pool goes back first.
+    // What an earlier block left in the card's pool goes back too.
     let at_start = card_settle();
     let t0 = std::time::Instant::now();
     let now = || t0.elapsed().as_secs_f64();
@@ -1132,6 +1136,7 @@ pub fn prove_block_levels(
     });
     let (proved, level1, built_beside, purge, at_base) = result;
     times.peak_reset = peak_reset;
+    times.purges[3] = purge_at_start;
     if let Some(card) = at_start {
         times.card.push(("start".to_string(), card));
     }
