@@ -625,10 +625,10 @@ mod tests {
             let at = |r: usize, c: usize| GoldilocksField::canonical(g.at(r, c).value());
             for r in 0..g.padded_rows {
                 let is_last = r + 1 == n;
-                for j in 0..l::DIGEST_WORDS {
+                for (j, word) in ext.iter().enumerate() {
                     let (addr, cnt) = (at(r, l::xaddr(j)), at(r, l::xcnt(j)));
                     if is_last {
-                        assert_eq!((addr, cnt), (ext[j].addr().0, 2), "row {r} word {j}");
+                        assert_eq!((addr, cnt), (word.addr().0, 2), "row {r} word {j}");
                     } else {
                         assert_eq!((addr, cnt), (0, 0), "row {r} word {j}");
                     }

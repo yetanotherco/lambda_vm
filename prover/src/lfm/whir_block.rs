@@ -2443,6 +2443,7 @@ pub(crate) fn emit_commit_ood_point(
 /// PERMUTATIONS [`emit_commit_ood_point`] costs a group of `polys` roots: its
 /// own sponge over the prefix — under Poseidon1 one `append_bytes`, its length
 /// and nine felts — the roots, and one draw.
+#[cfg(test)]
 pub(crate) fn commit_ood_point_perms(hash: super::edsl::WrapHash, polys: usize) -> usize {
     commit_ood_point_perms_squeeze(hash, false, polys)
 }

@@ -1587,8 +1587,8 @@ pub fn fill_head_uninverted_for(
         }
     }
     if lay.xof {
-        for i in 0..4 {
-            set_bytes(row, lay.hlb() + 4 * i, h[i]);
+        for (i, &w) in h[..4].iter().enumerate() {
+            set_bytes(row, lay.hlb() + 4 * i, w);
         }
         for i in 0..8 {
             set_bytes(row, lay.xb() + 4 * i, fs[i + 8] ^ h[i]);
