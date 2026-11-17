@@ -979,7 +979,7 @@ fn a_word_block_with_cut_word_families_proves_and_verifies() {
 /// same table counts, word tables, heights and public output; so does one
 /// whose streamed ops are dropped as handed out and whose word chunks leave
 /// as the windows' parts their rows lie in (`Deviations::word_chunks`, the
-/// knob `LAMBDA_VM_WORD_CHUNKS=part`), and held as those rows for the card
+/// knob `LAMBDA_VM_WORD_CHUNKS=part`, the default), and held as those rows for the card
 /// (`card`; filled on the card where it admits them). At word caps of 4 rows, so every
 /// family with rows cuts into chunks; on a CPU run and on runs that call
 /// COPY, keccak256 and ECREC.

@@ -2249,11 +2249,12 @@ fn parse_word_stream(value: Option<&str>) -> Result<bool, Error> {
 /// (`LAMBDA_VM_WORD_CHUNKS`). The tables are the same under every one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WordChunks {
-    /// `copy` (the default): every window's rows appended to one list a
+    /// `copy` (the rollback): every window's rows appended to one list a
     /// family, each chunk copied out of its front.
     Copy,
-    /// `part`: the windows' lists kept as they are, each chunk handed out as
-    /// the parts its rows lie in ([`WindowedTraceBuilder::word_chunks_in_place`]).
+    /// `part` (the default): the windows' lists kept as they are, each chunk
+    /// handed out as the parts its rows lie in
+    /// ([`WindowedTraceBuilder::word_chunks_in_place`]).
     Parts,
     /// `card`: handed out as `part` does, and each full chunk held as those
     /// rows for the card to fill its table from as its group uploads it,
@@ -2261,18 +2262,18 @@ pub(crate) enum WordChunks {
     Card,
 }
 
-/// `LAMBDA_VM_WORD_CHUNKS`'s reading: unset, empty or `copy` (the default),
-/// [`WordChunks::Copy`]; `part`, [`WordChunks::Parts`]; `card`,
-/// [`WordChunks::Card`]. Anything else refuses the prove.
+/// `LAMBDA_VM_WORD_CHUNKS`'s reading: unset, empty or `part` (the default),
+/// [`WordChunks::Parts`]; `copy` (the rollback), [`WordChunks::Copy`];
+/// `card`, [`WordChunks::Card`]. Anything else refuses the prove.
 fn parse_word_chunks(value: Option<&str>) -> Result<WordChunks, Error> {
     match value.map(str::trim) {
-        None | Some("" | "copy") => Ok(WordChunks::Copy),
-        Some("part") => Ok(WordChunks::Parts),
+        None | Some("" | "part") => Ok(WordChunks::Parts),
+        Some("copy") => Ok(WordChunks::Copy),
         Some("card") => Ok(WordChunks::Card),
         Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_WORD_CHUNKS={v}: copy (the default: each chunk copied out of one list a \
-             family), part (each chunk handed out as the windows' parts its rows lie in) or card \
-             (handed out so and filled on the card from its rows)"
+            "LAMBDA_VM_WORD_CHUNKS={v}: part (the default: each chunk handed out as the windows' \
+             parts its rows lie in), copy (the rollback: each chunk copied out of one list a \
+             family) or card (handed out in parts and filled on the card from its rows)"
         ))),
     }
 }
@@ -6768,9 +6769,10 @@ fn prove_streamed(
         eprintln!(
             "★ BLOCK WORD CHUNKS: {} (LAMBDA_VM_WORD_CHUNKS)",
             match word_chunks {
-                WordChunks::Copy => "copy: each chunk copied out of one list a family, the default",
+                WordChunks::Copy =>
+                    "copy: each chunk copied out of one list a family, the rollback",
                 WordChunks::Parts =>
-                    "part: each chunk handed out as the windows' parts its rows lie in",
+                    "part: each chunk handed out as the windows' parts its rows lie in, the default",
                 WordChunks::Card =>
                     "card: each chunk handed out as the windows' parts its rows lie in and \
                      filled on the card from them",
@@ -10536,14 +10538,15 @@ mod producer_report_tests {
         parse_word_chunks, parse_word_stream,
     };
 
-    /// `LAMBDA_VM_WORD_CHUNKS`: copied unless `part` or `card`; any other word
-    /// refused.
+    /// `LAMBDA_VM_WORD_CHUNKS`: handed out in parts unless `copy` (the
+    /// rollback) or `card`; any other word refused.
     #[test]
-    fn the_word_chunks_are_copied_unless_handed_out_in_parts() {
+    fn the_word_chunks_are_handed_out_in_parts_unless_copied() {
         for (word, chunks) in [
-            (None, WordChunks::Copy),
-            (Some(""), WordChunks::Copy),
+            (None, WordChunks::Parts),
+            (Some(""), WordChunks::Parts),
             (Some(" copy "), WordChunks::Copy),
+            (Some("copy"), WordChunks::Copy),
             (Some("part"), WordChunks::Parts),
             (Some(" part "), WordChunks::Parts),
             (Some("card"), WordChunks::Card),
