@@ -84,7 +84,7 @@ use multilinear::stacked_eval::index_chains;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
     ChainConfig, ChainProof, ChainRound, GroupFold, LeafOrder, MAX_INDEX_POLYS, NonceLayout,
-    Round0Trees, RoundForm, RoundOpenings, index_vars,
+    Round0Trees, RoundForm, RoundOpenings, check_round_form, index_vars,
 };
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
@@ -270,6 +270,13 @@ impl ChainShape {
     /// [`Self::new`] over trees of `arity` children per node: the hash's
     /// arity, as the host's prover and verifier take it.
     pub fn new_at(config: &ChainConfig, num_vars: usize, arity: usize) -> Self {
+        // The host's prover and verifier refuse a round-form config whose
+        // stamped target does not give its own round-0 count (a count or fold
+        // set by hand after the form was stamped); no program is emitted for
+        // one, whose later rounds would answer to another target.
+        if let Err(e) = check_round_form(config) {
+            panic!("no chain is emitted for a config the host refuses: {e}");
+        }
         let schedule = config.schedule(num_vars);
         // The host's own domains and counts: each round's domain shrinks by
         // its fold under `Fri` and by `min(shrink, k)` under the round form.
@@ -1308,19 +1315,15 @@ fn emit_chain(
                 #[cfg(test)]
                 chain_draws::ext(z0);
 
-                // ONE squaring chain for two consumers. `powers[j] = z0^(2^j)`:
-                // the out-of-domain point takes the first `n + m − bound` of
-                // them and the domain check takes the last — the SUCCESSOR's
-                // domain, which the round form keeps bigger than the fold's.
-                let depth = successor_domain.log_size();
-                let mut powers = Vec::with_capacity(depth + 1);
-                powers.push(z0);
-                for j in 0..depth {
-                    let squared = b.emul(powers[j], powers[j]);
-                    powers.push(squared);
-                }
-                emit_require_out_of_domain(b, powers[depth], one);
-                let ood_point: Vec<Ext> = powers[..shape.chain_vars() - bound].to_vec();
+                // The domain check is against the SUCCESSOR's domain, which
+                // the round form keeps bigger than the fold's.
+                let ood_point = emit_out_of_domain_point(
+                    b,
+                    z0,
+                    &successor_domain,
+                    shape.chain_vars() - bound,
+                    one,
+                );
 
                 transcript.absorb_ext(b, y0);
                 emit_spent_grind(b, transcript, grind_ood, round.nonces.ood);
@@ -1809,6 +1812,37 @@ fn tree_auth(
     }
 }
 
+/// ★ The out-of-domain point of a round's successor: `z0` refused inside
+/// `successor_domain` ([`emit_require_out_of_domain`]) and `ood_point(z0,
+/// vars)`, from ONE squaring chain. `powers[j] = z0^(2^j)`: the point takes the
+/// first `vars` of them and the domain check the last, `z0^|domain|`. The
+/// domain is the successor's: the fold's under `Fri`, the bigger one the round
+/// form encodes it on.
+pub fn emit_out_of_domain_point(
+    b: &mut LfmBuilder,
+    z0: Ext,
+    successor_domain: &Domain<GoldilocksField>,
+    vars: usize,
+    one: Ext,
+) -> Vec<Ext> {
+    let depth = successor_domain.log_size();
+    #[cfg(test)]
+    chain_draws::ood_domain(depth);
+    assert!(
+        vars <= depth + 1,
+        "the point is a prefix of the domain's squarings"
+    );
+    let mut powers = Vec::with_capacity(depth + 1);
+    powers.push(z0);
+    for j in 0..depth {
+        let squared = b.emul(powers[j], powers[j]);
+        powers.push(squared);
+    }
+    emit_require_out_of_domain(b, powers[depth], one);
+    powers.truncate(vars);
+    powers
+}
+
 /// ★ `require_out_of_domain` (`whir_chain.rs:88-101`), emitted as a REFUSAL.
 ///
 /// The host rejects `z0` whose `2^log_size`-th power is one, because such a
@@ -2157,8 +2191,9 @@ pub fn emit_shift_weight(
 
 /// Test only: every value the emitted chain draws from its transcript, in
 /// draw order — each extension challenge (sumcheck, `z0`, the out-of-domain
-/// `γ`, the round form's `γ`) and each query position's bits — and the claim
-/// and weight the tail closes on, so a test publishes them and compares the
+/// `γ`, the round form's `γ`) and each query position's bits — the claim and
+/// weight the tail closes on, and each domain an out-of-domain point is
+/// refused inside, so a test publishes them and compares the
 /// machine's stream with the host verifier's, draw for draw. Recording only:
 /// nothing is emitted, and nothing is kept outside [`chain_draws::record`].
 #[cfg(test)]
@@ -2177,6 +2212,8 @@ pub(crate) mod chain_draws {
     pub(crate) struct Draws {
         pub(crate) draws: Vec<Draw>,
         pub(crate) closing: Vec<(Ext, Ext)>,
+        /// `log2` of each domain an out-of-domain point is refused inside.
+        pub(crate) ood_domains: Vec<usize>,
     }
 
     std::thread_local! {
@@ -2195,6 +2232,14 @@ pub(crate) mod chain_draws {
         DRAWS.with(|d| {
             if let Some(d) = d.borrow_mut().as_mut() {
                 d.draws.push(Draw::Index(bits.to_vec()));
+            }
+        });
+    }
+
+    pub(crate) fn ood_domain(log_size: usize) {
+        DRAWS.with(|d| {
+            if let Some(d) = d.borrow_mut().as_mut() {
+                d.ood_domains.push(log_size);
             }
         });
     }
