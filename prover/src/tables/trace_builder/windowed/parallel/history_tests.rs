@@ -140,6 +140,7 @@ fn history_is_the_lean_passs(name: &str, program: &Elf, input: &[u8], window: us
 /// pass's and its logs the reference's.
 #[test]
 fn the_executors_history_is_the_lean_passs() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     for name in PROGRAMS {
         let (program, _) = run(name);
         for window in [1, 7, 32, 33, 4096] {
@@ -404,6 +405,7 @@ fn walked_from_history_with(
 /// the whole-run tables.
 #[test]
 fn windows_walked_from_history_build_the_whole_run_tables() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let max_rows = MaxRowsConfig::small();
     for name in PROGRAMS {
         let (program, logs) = run(name);

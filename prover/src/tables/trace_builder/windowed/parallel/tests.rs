@@ -852,6 +852,7 @@ fn fused_windows_walked_on_threads_build_the_windowed_tables() {
 /// tables and BITWISE.
 #[test]
 fn word_windows_walked_on_threads_build_the_windowed_tables() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     use crate::tables::fused_memory::MemoryFormat;
     use crate::tables::memw_aligned::MemwAlignedOrder;
     use crate::tables::register::RegisterFormat;

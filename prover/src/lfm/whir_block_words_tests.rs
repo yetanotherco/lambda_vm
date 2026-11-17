@@ -2233,14 +2233,149 @@ fn each_fixed_or_prepared_table_off_its_height_is_refused_by_name() {
     }
 }
 
-/// ★ Every source file that names the `test_ecrec` program also takes the
-/// ECREC forgery lock (`trace_builder::ecrec_forge_free`, or the lock
-/// itself): a test that runs `test_ecrec` beside the forging test without it
-/// builds the forged call, and its block does not verify. A source check, so
-/// a test added later without the lock fails here rather than now and then
-/// in a threaded whole-library run.
+/// The test functions in one source file that run the `test_ecrec` program
+/// without the ECREC forgery lock (`trace_builder::ecrec_forge_free`, or the
+/// lock itself), by name and line. A source reading, by item:
+/// - an item names the program if its text holds `"test_ecrec"`, or the name
+///   of another item of the file that names it: a program list (`const` or
+///   `static`) or a helper (a function that is not a test) that does not take
+///   the lock itself, followed to a fixed point;
+/// - a test function (`#[test]` among the attributes and comments above it)
+///   that names the program must take the lock in its own body.
+fn tests_running_test_ecrec_unlocked(text: &str) -> Vec<String> {
+    const LOCKS: [&str; 2] = ["ecrec_forge_free", "ECREC_FORGE_TEST_LOCK"];
+    struct Item<'a> {
+        name: &'a str,
+        line: usize,
+        body: &'a str,
+        test: bool,
+    }
+    fn ident_at(s: &str) -> &str {
+        let end = s
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(s.len());
+        &s[..end]
+    }
+    // The text from `from`'s first `{` to its matching `}`.
+    fn braced(text: &str, from: usize) -> Option<&str> {
+        let open = from + text[from..].find('{')?;
+        let mut depth = 0usize;
+        for (i, c) in text[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&text[open..=open + i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    fn names(body: &str, name: &str) -> bool {
+        if name.starts_with('"') {
+            return body.contains(name);
+        }
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        body.match_indices(name).any(|(i, _)| {
+            !body[..i].chars().next_back().is_some_and(word)
+                && !body[i + name.len()..].chars().next().is_some_and(word)
+        })
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut at = 0;
+    for line in &lines {
+        starts.push(at);
+        at += line.len() + 1;
+    }
+    let mut items = Vec::new();
+    for (n, line) in lines.iter().enumerate() {
+        let mut rest = line.trim_start();
+        for vis in ["pub(crate) ", "pub(super) ", "pub "] {
+            rest = rest.strip_prefix(vis).unwrap_or(rest);
+        }
+        let (kind, after) = match ["fn ", "const ", "static "]
+            .iter()
+            .find_map(|k| rest.strip_prefix(k).map(|a| (*k, a)))
+        {
+            Some(found) => found,
+            None => continue,
+        };
+        let name = ident_at(after);
+        if name.is_empty() {
+            continue;
+        }
+        let from = starts[n];
+        let body = if kind == "fn " {
+            // Its body, or none for a declaration (a trait's): the first `{`
+            // or `;` outside the signature's parentheses and brackets.
+            let mut depth = 0i32;
+            let open = text[from..].chars().find(|&c| {
+                match c {
+                    '(' | '[' => depth += 1,
+                    ')' | ']' => depth -= 1,
+                    '{' | ';' => return depth == 0,
+                    _ => {}
+                }
+                false
+            });
+            match (open, braced(text, from)) {
+                (Some('{'), Some(body)) => body,
+                _ => continue,
+            }
+        } else {
+            let end = text[from..]
+                .find(";\n")
+                .map_or(text.len(), |i| from + i + 1);
+            &text[from..end]
+        };
+        let test = lines[..n]
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .take_while(|l| l.starts_with("#[") || l.starts_with("//"))
+            .any(|l| l == "#[test]");
+        items.push(Item {
+            name,
+            line: n + 1,
+            body,
+            test: test && kind == "fn ",
+        });
+    }
+    let locked = |body: &str| LOCKS.iter().any(|l| body.contains(l));
+    let mut naming: Vec<&str> = vec!["\"test_ecrec\""];
+    loop {
+        let more: Vec<&str> = items
+            .iter()
+            .filter(|it| !it.test && !naming.contains(&it.name) && !locked(it.body))
+            .filter(|it| naming.iter().any(|n| names(it.body, n)))
+            .map(|it| it.name)
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        naming.extend(more);
+    }
+    items
+        .iter()
+        .filter(|it| it.test && !locked(it.body))
+        .filter(|it| naming.iter().any(|n| names(it.body, n)))
+        .map(|it| format!("{}:{}", it.name, it.line))
+        .collect()
+}
+
+/// ★ Every test function that runs the `test_ecrec` program takes the ECREC
+/// forgery lock in its own body: a test that runs `test_ecrec` beside the
+/// forging test without it builds the forged call, and its block does not
+/// verify (or its two builds differ). The program is reached by name, through
+/// a program list, or through a helper ([`tests_running_test_ecrec_unlocked`]).
+/// A source check, so a test added later without the lock fails here rather
+/// than now and then in a threaded whole-library run.
 #[test]
-fn every_test_file_naming_test_ecrec_holds_the_forgery_lock() {
+fn every_test_running_test_ecrec_holds_the_forgery_lock() {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("a source directory") {
             let path = entry.expect("an entry").path();
@@ -2254,28 +2389,139 @@ fn every_test_file_naming_test_ecrec_holds_the_forgery_lock() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     walk(&root, &mut files);
-    let naming: Vec<_> = files
-        .iter()
-        .filter_map(|path| {
-            let text = std::fs::read_to_string(path).expect("a source file");
-            text.contains("\"test_ecrec\"").then_some((path, text))
-        })
-        .collect();
-    assert!(naming.len() >= 10, "{} files name test_ecrec", naming.len());
-    let unlocked: Vec<String> = naming
-        .iter()
-        .filter(|(_, text)| {
-            !text.contains("ecrec_forge_free") && !text.contains("ECREC_FORGE_TEST_LOCK")
-        })
-        .map(|(path, _)| {
-            path.strip_prefix(&root)
-                .unwrap_or(path)
-                .display()
-                .to_string()
-        })
-        .collect();
+    let mut naming = 0;
+    let mut unlocked = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path).expect("a source file");
+        if !text.contains("\"test_ecrec\"") {
+            continue;
+        }
+        naming += 1;
+        let shown = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        unlocked.extend(
+            tests_running_test_ecrec_unlocked(&text)
+                .into_iter()
+                .map(|t| format!("{shown}: {t}")),
+        );
+    }
+    assert!(naming >= 10, "{naming} files name test_ecrec");
     assert!(
         unlocked.is_empty(),
-        "these files run test_ecrec without the ECREC forgery lock: {unlocked:?}"
+        "these tests run test_ecrec without the ECREC forgery lock: {unlocked:?}"
+    );
+}
+
+/// The reading of [`tests_running_test_ecrec_unlocked`] on a made-up file: a
+/// test that names the program, one that runs a list holding it, and two that
+/// call a helper running it (one with a `;` in its signature), each without
+/// the lock, are named; the same
+/// with the lock, a test that names neither, a helper taking the lock itself
+/// and a trait's declaration are not. Not blind: the lock taken out of one
+/// test names that test.
+#[test]
+fn the_ecrec_lock_reading_names_each_unlocked_test() {
+    let file = r#"
+const PROGRAMS: [&str; 2] = ["all_instructions_64", ECREC_PROGRAM];
+const OTHERS: [&str; 1] = ["test_keccak256"];
+
+trait Runs {
+    fn run(name: &str);
+}
+
+fn proves(name: &str) {
+    let _ = name;
+}
+
+fn proves_ecrec() {
+    proves(ECREC_PROGRAM);
+}
+
+fn listed() -> [&'static str; 1] {
+    [ECREC_PROGRAM]
+}
+
+fn proves_ecrec_locked() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    proves(ECREC_PROGRAM);
+}
+
+#[test]
+fn by_name_unlocked() {
+    proves(ECREC_PROGRAM);
+}
+
+/// A list.
+#[test]
+#[ignore = "a box test"]
+fn by_list_unlocked() {
+    for name in PROGRAMS {
+        proves(name);
+    }
+}
+
+#[test]
+fn by_helper_unlocked() {
+    proves_ecrec();
+}
+
+#[test]
+fn by_a_listing_helper_unlocked() {
+    for name in listed() {
+        proves(name);
+    }
+}
+
+#[test]
+fn by_name_locked() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
+    proves(ECREC_PROGRAM);
+}
+
+#[test]
+fn by_list_locked() {
+    let _ecrec = ecrec_forge_free();
+    for name in PROGRAMS {
+        proves(name);
+    }
+}
+
+#[test]
+fn by_a_locking_helper() {
+    proves_ecrec_locked();
+}
+
+#[test]
+fn others() {
+    for name in OTHERS {
+        proves(name);
+    }
+}
+"#;
+    // The program's name spelled apart, so the real check of this file does
+    // not read the made-up tests as its own.
+    let file = &file.replace("ECREC_PROGRAM", concat!("\"test", "_ecrec\""));
+    assert_eq!(
+        tests_running_test_ecrec_unlocked(file),
+        vec![
+            "by_name_unlocked:27".to_string(),
+            "by_list_unlocked:34".to_string(),
+            "by_helper_unlocked:41".to_string(),
+            "by_a_listing_helper_unlocked:46".to_string(),
+        ]
+    );
+    let unlocked = file.replacen(
+        "fn by_name_locked() {\n    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();\n",
+        "fn by_name_locked() {\n",
+        1,
+    );
+    assert_ne!(&unlocked, file, "the mutant moves the file");
+    assert!(
+        tests_running_test_ecrec_unlocked(&unlocked).contains(&"by_name_locked:53".to_string()),
+        "{:?}",
+        tests_running_test_ecrec_unlocked(&unlocked)
     );
 }
