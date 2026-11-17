@@ -193,6 +193,8 @@ mod lean_upload_tests;
 mod levels_probe;
 #[cfg(all(test, feature = "parallel"))]
 mod levels_tests;
+#[cfg(all(test, feature = "parallel"))]
+mod round_form_level_tests;
 #[cfg(test)]
 mod logup_tests;
 #[cfg(test)]
