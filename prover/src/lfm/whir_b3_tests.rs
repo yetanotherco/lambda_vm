@@ -1756,7 +1756,8 @@ mod stacked {
     type F = GoldilocksField;
     type E = GoldilocksExtension;
 
-    struct Case {
+    #[derive(Clone)]
+    pub(super) struct Case {
         heights: Vec<usize>,
         n_stack: usize,
         first: Option<usize>,
@@ -1764,9 +1765,31 @@ mod stacked {
         leaves: LeafOrder,
         round0: Round0Trees,
         grind: u8,
+        /// The WHIR round form at `(shrink, security bits)`, its counts
+        /// sized for the bits; `None` is today's form at four queries.
+        whir: Option<(usize, u8)>,
     }
 
     fn config(case: &Case) -> ChainConfig {
+        if let Some((shrink, bits)) = case.whir {
+            let mut cfg = ChainConfig::with_security_folds(
+                2,
+                4,
+                case.first.map_or(WhirFolds::Uniform, |k| {
+                    WhirFolds::First(FirstFold::new(k).expect("a tested first fold"))
+                }),
+                case.n_stack,
+                bits,
+                GrindBits::uniform(case.grind),
+            );
+            cfg.format.group = GroupFold::Indexed;
+            cfg.format.leaves = case.leaves;
+            cfg.format.round0 = case.round0;
+            cfg.format.cap = case.cap;
+            return cfg
+                .with_whir_rounds(shrink, bits, case.n_stack)
+                .expect("a tested shrink");
+        }
         ChainConfig {
             log_blowup: 2,
             log_folding: 4,
@@ -1793,7 +1816,7 @@ mod stacked {
         ])
     }
 
-    struct Fixture {
+    pub(super) struct Fixture {
         cfg: ChainConfig,
         layout: StackedLayout,
         points: Vec<Vec<FEE>>,
@@ -1804,7 +1827,7 @@ mod stacked {
         shape: ChainShape,
     }
 
-    fn build(case: &Case) -> Fixture {
+    pub(super) fn build(case: &Case) -> Fixture {
         let cfg = config(case);
         let layout = StackedLayout::build(&case.heights, case.n_stack).expect("the layout packs");
         let columns: Vec<Mle<F>> = case
@@ -1888,7 +1911,7 @@ mod stacked {
 
     /// Each column's point, the values, then per run its roots (two words
     /// each), its final value and its rounds. Publishes the batching draw.
-    fn program(f: &Fixture) -> LfmProgram {
+    pub(super) fn program(f: &Fixture) -> LfmProgram {
         let mut b = builder();
         let runs = f.shape.chains(f.layout.num_polys());
         let trees = run_trees(f);
@@ -1998,7 +2021,7 @@ mod stacked {
         t.sample_field_element()
     }
 
-    fn cases() -> Vec<(&'static str, Case)> {
+    pub(super) fn cases() -> Vec<(&'static str, Case)> {
         let base = |heights: &[usize], n_stack| Case {
             heights: heights.to_vec(),
             n_stack,
@@ -2007,6 +2030,7 @@ mod stacked {
             leaves: LeafOrder::Natural,
             round0: Round0Trees::Each,
             grind: 4,
+            whir: None,
         };
         let mut cases = Vec::new();
         for round0 in [Round0Trees::Each, Round0Trees::One] {
@@ -2110,6 +2134,7 @@ mod stacked {
                         leaves,
                         round0: Round0Trees::One,
                         grind: 0,
+                        whir: None,
                     };
                     let f = build(&case);
                     let program = program(&f);
@@ -2176,12 +2201,149 @@ mod stacked {
                 leaves: LeafOrder::Coset,
                 round0,
                 grind: 0,
+                whir: None,
             };
             let each = build(&at(Round0Trees::Each));
             let one = build(&at(Round0Trees::One));
             let (each_program, one_program) = (program(&each), program(&one));
             assert!(runs(&one_program, arena(&each, &each.proof)).is_err());
             assert!(runs(&each_program, arena(&one, &one.proof)).is_err());
+        });
+    }
+
+    /// The group openings the round-form gates run: every case above under
+    /// the round form at shrink 3 (and the three-polynomial runs at shrink 2),
+    /// their counts sized for 20 bits.
+    fn round_form_cases() -> Vec<(&'static str, Case)> {
+        let mut out = Vec::new();
+        for (name, case) in cases() {
+            if name == "three polys" && case.cap == CapPolicy::Off {
+                out.push((
+                    "three polys, shrink 2",
+                    Case {
+                        whir: Some((2, 20)),
+                        ..case.clone()
+                    },
+                ));
+            }
+            out.push((
+                name,
+                Case {
+                    whir: Some((3, 20)),
+                    ..case
+                },
+            ));
+        }
+        out
+    }
+
+    /// ★ THE ROUND-FORM GROUPED GATE. Under the round form — round 0 one tree
+    /// a polynomial or one a run, its every tree (or its joint leaf) opened at
+    /// each drawn position and the blocks combined and folded into a claim on
+    /// the successor — the emitted leg executes on every proof the host
+    /// accepts, under both lowerings; its batching draw is the host's; and it
+    /// hashes with BLAKE3 alone, fewer compressions than today's form.
+    #[test]
+    fn a_round_form_blake3_group_opening_executes_on_proofs_the_host_accepts() {
+        super::under_both(|lowering| {
+            for (name, case) in round_form_cases() {
+                let f = build(&case);
+                assert!(f.shape.whir(), "{name}: the round form");
+                let program = program(&f);
+                let (blake3, other) = hash_rows(&program);
+                assert_eq!(other, 0, "{name}: BLAKE3 alone");
+                let gamma = runs(&program, arena(&f, &f.proof)).unwrap_or_else(|e| {
+                    panic!(
+                        "{lowering} {name} ({:?}, {:?}, {:?}): refused an accepted proof: {e}",
+                        case.round0, case.leaves, case.cap
+                    )
+                });
+                assert_eq!(gamma, host_gamma(&f), "{name}: the batching draw");
+                println!(
+                    "ROUND FORM GROUP {lowering} {name} ({:?}, {:?}, {:?}): queries {:?} · {blake3} \
+                     compressions",
+                    case.round0, case.leaves, case.cap, f.shape.round_queries
+                );
+            }
+        });
+    }
+
+    /// ★ THE ROUND-FORM JOINT TAMPER ARM. One tree a run, natural and coset:
+    /// a value off in a joint leaf's block, a joint path node, a later round's
+    /// opened value, and an out-of-domain value are refused by the host and
+    /// have no execution; a successor block at round 0 is refused by the
+    /// arena too.
+    #[test]
+    fn a_tampered_round_form_joint_blake3_leg_cannot_execute() {
+        super::under_both(|lowering| {
+            for leaves in [LeafOrder::Natural, LeafOrder::Coset] {
+                let case = Case {
+                    heights: vec![9; 3],
+                    n_stack: 9,
+                    first: Some(6),
+                    cap: CapPolicy::Fixed(2),
+                    leaves,
+                    round0: Round0Trees::One,
+                    grind: 0,
+                    whir: Some((3, 20)),
+                };
+                let f = build(&case);
+                let program = program(&f);
+                runs(&program, arena(&f, &f.proof)).expect("the control executes");
+                let mut forgeries = Vec::new();
+                for t in [0usize, 64 + 5] {
+                    let mut forged = f.proof.clone();
+                    match &mut forged.polys[0].rounds[0].openings {
+                        RoundOpenings::BaseJoint(p) => p.current[1].values[t] += FE::one(),
+                        _ => panic!("chain 0 is joint"),
+                    }
+                    forgeries.push((format!("value {t}"), forged));
+                }
+                let mut node = f.proof.clone();
+                match &mut node.polys[0].rounds[0].openings {
+                    RoundOpenings::BaseJoint(p) => p.current[2].proof.merkle_path[0][31] ^= 1,
+                    _ => panic!("chain 0 is joint"),
+                }
+                forgeries.push(("a path node".to_string(), node));
+                let mut later = f.proof.clone();
+                match &mut later.polys[0].rounds[1].openings {
+                    RoundOpenings::Extension(p) => p.current[0].values[1] += FEE::one(),
+                    _ => panic!("round 1 is extension-valued"),
+                }
+                forgeries.push(("round 1's opened value".to_string(), later));
+                let mut ood = f.proof.clone();
+                if let Some(v) = ood.polys[0].rounds[0].ood_value.as_mut() {
+                    *v += FEE::one();
+                }
+                forgeries.push(("round 0's out-of-domain value".to_string(), ood));
+                let mut successor = f.proof.clone();
+                let block = match &successor.polys[0].rounds[1].openings {
+                    RoundOpenings::Extension(p) => p.current[0].clone(),
+                    _ => panic!("round 1 is extension-valued"),
+                };
+                match &mut successor.polys[0].rounds[0].openings {
+                    RoundOpenings::BaseJoint(p) => p.next.push(block),
+                    _ => panic!("chain 0 is joint"),
+                }
+                let mut words = Vec::new();
+                assert!(
+                    super::super::whir_chain::try_push_round_words(
+                        &mut words,
+                        &f.shape.run(3),
+                        &successor.polys[0]
+                    )
+                    .is_err(),
+                    "a successor block: the arena refuses it"
+                );
+                forgeries.push(("a successor block at round 0".to_string(), successor));
+                for (what, forged) in &forgeries {
+                    assert!(!host_accepts(&f, forged), "{what} ({leaves:?}): host");
+                    assert!(
+                        runs(&program, arena(&f, forged)).is_err(),
+                        "{lowering} {what} ({leaves:?}): must have no execution"
+                    );
+                }
+            }
         });
     }
 }
@@ -2788,3 +2950,114 @@ fn the_indexed_cap_read_replaces_the_mux_in_a_lean_program() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// Today's chain programs, pinned across the round form's arrival.
+// ---------------------------------------------------------------------------
+
+/// The digest of a program's emission: its instructions, address count,
+/// arena lengths and public words, in order.
+fn emission_digest(program: &LfmProgram) -> [u8; 32] {
+    use digest::Digest;
+    let text = format!(
+        "{:?}|{}|{:?}|{}",
+        program.instrs, program.num_addrs, program.arena_schema.lens, program.public_len
+    );
+    <Blake3Std as Digest>::digest(text.as_bytes()).into()
+}
+
+/// ★ TODAY'S FORM EMITS WHAT IT EMITTED. Every chain program the suites above
+/// gate under today's form (`RoundForm::Fri`) — the BLAKE3 chain cases under
+/// both lowerings, the lean tail chain, the final-polynomial chains, the
+/// grouped and joint group openings, and the RPX chain at the cost shapes —
+/// hashed instruction for instruction into one digest, pinned at the value
+/// the emitter gave before the round form's in-guest verifier existed. Shape
+/// only: no proof is read but the group openings' layouts.
+#[test]
+fn todays_chain_programs_are_byte_identical() {
+    use multilinear::whir_chain::{
+        CapPolicy, ChainConfig, ChainFormat, FinalPoly, FirstFold, GrindBits, LeafOrder, WhirFolds,
+    };
+    let mut all = Vec::new();
+    let mut count = 0usize;
+    let mut push = |program: &LfmProgram| {
+        all.extend_from_slice(&emission_digest(program));
+        count += 1;
+    };
+    under_both(|_| {
+        for (num_vars, cfg) in chain::cases() {
+            push(&chain::program(&super::whir_chain::ChainShape::for_hash(
+                &cfg,
+                num_vars,
+                WrapHash::Blake3,
+            )));
+        }
+        let mut tail = chain::config(400, 0, CapPolicy::Fixed(4), LeafOrder::Coset, Some(6));
+        tail.log_folding = 1;
+        push(&chain::program(&super::whir_chain::ChainShape {
+            query: super::whir_chain::LeafQuery::Lean,
+            ..super::whir_chain::ChainShape::for_hash(&tail, 9, WrapHash::Blake3)
+        }));
+        for (num_vars, v) in [(10usize, 2u8), (12, 4), (12, 2)] {
+            let mut cfg = chain::config(5, 4, CapPolicy::Fixed(2), LeafOrder::Coset, Some(6));
+            cfg.format.final_poly = FinalPoly::vars(v).expect("a final width");
+            push(&chain::program(&super::whir_chain::ChainShape::for_hash(
+                &cfg,
+                num_vars,
+                WrapHash::Blake3,
+            )));
+        }
+        for (_, case) in stacked::cases() {
+            push(&stacked::program(&stacked::build(&case)));
+        }
+    });
+    let rpx = |q: usize, g: u8, k0: Option<usize>| ChainConfig {
+        log_blowup: 2,
+        log_folding: 4,
+        num_queries: q,
+        grind: GrindBits::uniform(g),
+        format: ChainFormat {
+            folds: k0.map_or(WhirFolds::Uniform, |k| {
+                WhirFolds::First(FirstFold::new(k).expect("a tested first fold"))
+            }),
+            ..ChainFormat::DEFAULT
+        },
+    };
+    for (n, q, g, k0) in [
+        (6usize, 3usize, 0u8, None),
+        (6, 5, 0, None),
+        (5, 3, 0, None),
+        (6, 3, 8, None),
+        (9, 3, 8, None),
+        (9, 3, 8, Some(6)),
+        (11, 3, 8, Some(5)),
+        (7, 3, 8, Some(6)),
+    ] {
+        push(&super::whir_chain_tests::chain_program(
+            &super::whir_chain::ChainShape::new(&rpx(q, g, k0), n),
+        ));
+    }
+    let digest: [u8; 32] = {
+        use digest::Digest;
+        <Blake3Std as Digest>::digest(&all).into()
+    };
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    println!("TODAY'S CHAIN PROGRAMS: {count} programs · digest {hex}");
+    assert_eq!(count, TODAYS_CHAIN_PROGRAMS);
+    assert_eq!(hex, TODAYS_CHAIN_DIGEST, "today's chain emission moved");
+}
+
+/// [`todays_chain_programs_are_byte_identical`]'s programs.
+const TODAYS_CHAIN_PROGRAMS: usize = 120;
+
+/// [`todays_chain_programs_are_byte_identical`]'s digest, as the emitter gave
+/// it before the round form's in-guest verifier (the same test run against
+/// that emitter printed this value).
+const TODAYS_CHAIN_DIGEST: &str =
+    "5a3d66026ae7e08355567afb26735fa516a5f8dbbf68b6cd99e9965484901c0c";
+
+// ---------------------------------------------------------------------------
+// The WHIR round form's in-guest verifier, against the host.
+// ---------------------------------------------------------------------------
+
+mod round_form;
