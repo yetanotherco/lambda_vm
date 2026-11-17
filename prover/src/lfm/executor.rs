@@ -1532,6 +1532,7 @@ fn execute_inner(
                 &mut public_words,
                 &mut split,
                 None,
+                None,
             )?;
             public_rows_fit(&public_words, program.groups.public.real_rows)?;
             // SAFETY: `run_levels` returned `Ok`, so every instruction ran and
@@ -1655,6 +1656,10 @@ pub struct StreamedExecution<'p, 'a, H: LfmHasher + Sync> {
     records: LfmRecords,
     public_words: Vec<(u32, LfmWord)>,
     split: ExecSplit,
+    /// Under [`Self::new_pieced_tapped`], a copy of each lean BLAKE3
+    /// compression's record as its wave writes it, with its record row, until
+    /// [`Self::take_lean_tap`] takes them; `None` otherwise.
+    lean_tap: Option<Vec<(u32, B3lValues)>>,
 }
 
 impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
@@ -1684,7 +1689,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             |arena: ArenaId, _index: u32| group_of.get(arena as usize).map_or(0, |&g| 1u64 << g);
         let need = Self::need_of(program, hint_group);
         let groups = group_of.iter().fold(0u64, |a, &g| a | (1u64 << g));
-        Self::start(program, hasher, need, group_of, Vec::new(), groups)
+        Self::start(program, hasher, need, group_of, Vec::new(), groups, false)
     }
 
     /// A streamed execution of `program` whose arenas land in PIECES: each
@@ -1701,6 +1706,19 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         program: &'p LfmProgram,
         pieces: Vec<ArenaPiece>,
         hasher: &'p H,
+    ) -> Result<Self, LfmExecError> {
+        Self::new_pieced_tapped(program, pieces, hasher, false)
+    }
+
+    /// [`Self::new_pieced`] with, when `lean_tap`, a copy of every lean BLAKE3
+    /// compression's record kept as its wave writes it ([`Self::take_lean_tap`]),
+    /// so a fill can start on a wave's compressions while the next groups are
+    /// awaited. The execution itself is the same.
+    pub fn new_pieced_tapped(
+        program: &'p LfmProgram,
+        pieces: Vec<ArenaPiece>,
+        hasher: &'p H,
+        lean_tap: bool,
     ) -> Result<Self, LfmExecError> {
         let schema = &program.arena_schema.lens;
         let mut sorted = pieces.clone();
@@ -1757,7 +1775,8 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             }
         };
         let need = Self::need_of_pieced(program, group_at);
-        let mut streamed = Self::start(program, hasher, need, Vec::new(), sorted, groups)?;
+        let mut streamed =
+            Self::start(program, hasher, need, Vec::new(), sorted, groups, lean_tap)?;
         streamed.m.pieces = by_arena
             .iter()
             .map(|ps| {
@@ -1825,6 +1844,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         group_of: Vec<usize>,
         pieces: Vec<ArenaPiece>,
         groups: u64,
+        lean_tap: bool,
     ) -> Result<Self, LfmExecError> {
         let schema = &program.arena_schema.lens;
         let t = Instant::now();
@@ -1859,6 +1879,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             records,
             public_words,
             split,
+            lean_tap: lean_tap.then(Vec::new),
         };
         streamed.wave(None)?;
         Ok(streamed)
@@ -1952,6 +1973,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             &mut self.public_words,
             &mut self.split,
             Some(&keep),
+            self.lean_tap.as_mut(),
         )?;
         Ok(())
     }
@@ -1959,6 +1981,17 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
     /// Instructions run so far.
     pub fn ran(&self) -> usize {
         self.ran
+    }
+
+    /// The lean BLAKE3 compressions the waves since the last take wrote, each
+    /// with its record row (a compression's ordinal), in the order they ran;
+    /// empty unless the execution taps them ([`Self::new_pieced_tapped`]).
+    /// Every compression comes out exactly once over the execution.
+    pub fn take_lean_tap(&mut self) -> Vec<(u32, B3lValues)> {
+        self.lean_tap
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
     }
 
     /// The execution, once every group has landed: [`execute`]'s, word for word.
@@ -2034,6 +2067,7 @@ fn run_levels(
     public_words: &mut Vec<(u32, LfmWord)>,
     split: &mut ExecSplit,
     keep: Option<&dyn Fn(usize) -> bool>,
+    mut lean_tap: Option<&mut Vec<(u32, B3lValues)>>,
 ) -> Result<usize, LfmExecError> {
     // One buffer, reused by every level, so a 2,237-level program allocates once
     // rather than 2,237 times. It grows to the widest level and stays there:
@@ -2113,6 +2147,9 @@ fn run_levels(
                 }
                 (Instr::B3l(op), HashOut::Lean(values, digest)) => {
                     b3l_apply(&mut m.memory, op, digest)?;
+                    if let Some(tap) = lean_tap.as_deref_mut() {
+                        tap.push((slot, *values));
+                    }
                     Sink::Slot(slot).put(&mut records.b3l, *values);
                 }
                 _ => {
