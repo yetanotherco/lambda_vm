@@ -720,6 +720,99 @@ fn blake3_round_form_leaves_execute_and_refuse_the_other_form() {
     }
 }
 
+/// ★ THE SAME LAYOUT UNDER ANOTHER STATEMENT. Two BLAKE3 round-form formats
+/// that differ in the cap rule alone (`/W3/Cq`, caps by Q, against `/W3`, the
+/// base's cap at every tree) over small blocks where the rule moves no cap:
+/// every chain has the same caps, counts and domains, so each leaf reads the
+/// same words in the same places and one form's proof lays out under the
+/// other's plan. A chain's own transcript absorbs no config word, so what
+/// tells them apart is the statement the leaf absorbs (the tag's cap-rule
+/// word and the fold word's bit), and it must: each form's leaves execute
+/// over their own proof and have NO EXECUTION over the other form's (its
+/// arena accepted as laid out), and the host refuses it too.
+///
+/// Run alone under `LAMBDA_VM_B3_BASE_CAP=4`: at the base's cap of 8 the rule
+/// can move a later cap of a tall group's chain (a round of 114 queries pays
+/// for 7 levels), and the layouts differ; at 4 every tree's queries pay for
+/// the whole cap.
+#[test]
+#[ignore = "proves small BLAKE3 blocks; box tier"]
+fn blake3_round_form_same_layout_other_statement_is_refused() {
+    use crate::block_whir::B3Rounds;
+    use multilinear::whir_chain::WhirFolds;
+    let mut fri = many_groups(BaseFormat::B3_WHIR);
+    fri.group = GroupFold::Indexed;
+    fri.zf.whir_trees = Round0Trees::One;
+    fri.zf.whir_folds = WhirFolds::Uniform;
+    let cq = BlockFormat {
+        b3_rounds: B3Rounds::WHIR3,
+        ..fri
+    };
+    let plain = BlockFormat {
+        b3_rounds: B3Rounds::Whir {
+            shrink: 3,
+            caps_by_q: false,
+        },
+        ..fri
+    };
+    for (name, leaves) in [("all_instructions_64", 2), ("test_commit_4", 1)] {
+        let (elf, cq_proof) = b3_block(name, &cq, 3);
+        let (_, plain_proof) = b3_block(name, &plain, 3);
+        let cq_plan = b3_plan(&elf, &cq_proof, &cq, leaves);
+        let plain_plan = b3_plan(&elf, &plain_proof, &plain, leaves);
+        assert_ne!(cq_plan.id(), plain_plan.id(), "{name}: two statements");
+        assert_eq!(cq_plan.num_groups(), plain_plan.num_groups());
+        for g in 0..cq_plan.num_groups() {
+            let (_, n) = cq_plan.group_stack(g);
+            let (a, b) = (cq_plan.chain_shape(n), plain_plan.chain_shape(n));
+            assert!(a.whir() && b.whir(), "{name} group {g}: the round form");
+            assert_eq!(
+                (&a.caps, &a.round_queries, &a.domain_log),
+                (&b.caps, &b.round_queries, &b.domain_log),
+                "{name} group {g}: the cap rule moves no cap at this shape \
+                 (run under LAMBDA_VM_B3_BASE_CAP=4)"
+            );
+        }
+        for (label, plan, own, other) in [
+            ("/W3/Cq", &cq_plan, &cq_proof, &plain_proof),
+            ("/W3", &plain_plan, &plain_proof, &cq_proof),
+        ] {
+            for k in 0..plan.partition().num_leaves() {
+                run_leaf(plan, own, k)
+                    .unwrap_or_else(|e| panic!("{name} {label} leaf {k}: its own proof: {e}"));
+                let program = plan.leaf_program(k).expect("the leaf emits");
+                let arenas = block_leaf_arena(plan, other, k).unwrap_or_else(|e| {
+                    panic!("{name} {label} leaf {k}: the other proof lays out: {e}")
+                });
+                assert_eq!(
+                    program.arena_schema.lens,
+                    vec![arenas[0].len() as u32],
+                    "{name} {label} leaf {k}: the same layout"
+                );
+                let refused = execute(
+                    &program,
+                    &arenas,
+                    &program.hasher(<BlockFamily as ProofFamily>::SOCKET),
+                )
+                .is_err();
+                assert!(
+                    refused,
+                    "{name} {label} leaf {k}: the other cap rule's proof must have no execution"
+                );
+            }
+        }
+        assert!(
+            !host_accepts(&plain_proof, &elf, &cq) && !host_accepts(&cq_proof, &elf, &plain),
+            "{name}: the host refuses each under the other"
+        );
+        println!(
+            "B3 SAME LAYOUT {name}: {} leaves · groups {} · each cap rule's leaves refuse the other's proof",
+            cq_plan.partition().num_leaves(),
+            cq_plan.num_groups()
+        );
+    }
+}
+
 /// ★ A ROUND-FORM LEAF REFUSES A CHAIN TALLER THAN ITS STACK BOUND, on its
 /// own. The base's round form charges every chain one union bound, the rounds
 /// of a [`B3_ROUND_FORM_STACK_BOUND`]-variable chain; one variable more has

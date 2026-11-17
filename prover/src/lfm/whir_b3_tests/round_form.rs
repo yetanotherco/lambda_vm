@@ -798,8 +798,14 @@ fn a_tampered_round_form_blake3_chain_cannot_execute() {
 /// shrink refuses the proof made under another (and so does the host); a
 /// program under caps by Q and one under the policy's caps refuse each other's
 /// proofs (the cap-rule mismatch); and today's program and the round form's
-/// refuse each other's proofs: the arena a proof would need under the other's
-/// shape is not the one the program reads.
+/// refuse each other's proofs.
+///
+/// ⚠ BY LAYOUT: each pair's arena differs in length (counts, caps, successor
+/// blocks), and the executor refuses a length the program does not declare.
+/// A chain's transcript absorbs no config word, so two cap rules that move no
+/// cap give ONE program: what separates them is the block statement (the
+/// tag's cap-rule word, the fold word's bit), executed by the block-level
+/// gate `blake3_round_form_same_layout_other_statement_is_refused`.
 #[test]
 fn a_round_form_program_refuses_another_shrink_and_the_other_form() {
     under_both(|lowering| {
