@@ -462,6 +462,16 @@ pub(crate) fn note_round_form_host_encode(card_declined: bool, levels: usize) {
     }
 }
 
+/// Waits for every stream of the card to finish (the opening trace's
+/// stage boundary, `whir_split::open_trace_lap`); nothing without a card or
+/// before the card is up.
+pub(crate) fn trace_sync() {
+    #[cfg(feature = "cuda")]
+    if let Some(be) = math_cuda::device::backend_if_ready() {
+        let _ = be.ctx.synchronize();
+    }
+}
+
 /// [`ROUND_FORM_HOST_ENCODES`] so far.
 pub fn round_form_host_encodes() -> u64 {
     ROUND_FORM_HOST_ENCODES.load(Ordering::Relaxed)
