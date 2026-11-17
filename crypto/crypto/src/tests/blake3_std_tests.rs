@@ -208,8 +208,15 @@ mod squeeze64 {
         let draws = |t: &mut dyn FnMut() -> u64| -> Vec<u64> { (0..5).map(|_| t()).collect() };
         let w = draws(&mut || wide.sample_u64(1 << 40));
         let n = draws(&mut || narrow.sample_u64(1 << 40));
-        assert_eq!(w[..4], n[..4], "the first four candidates are the same bytes");
-        assert_ne!(w[4], n[4], "the fifth is the extended output, not a new squeeze");
+        assert_eq!(
+            w[..4],
+            n[..4],
+            "the first four candidates are the same bytes"
+        );
+        assert_ne!(
+            w[4], n[4],
+            "the fifth is the extended output, not a new squeeze"
+        );
     }
 
     /// The configuration is the narrow one but for the squeeze's width.

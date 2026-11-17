@@ -1045,7 +1045,10 @@ mod tests {
     /// holds. The first half is the digest.
     #[test]
     fn the_64_byte_output_is_the_blake3_crates_xof() {
-        for len in (0..=1024usize).step_by(7).chain([63, 64, 65, 128, 1023, 1024]) {
+        for len in (0..=1024usize)
+            .step_by(7)
+            .chain([63, 64, 65, 128, 1023, 1024])
+        {
             let msg = message(len);
             let mut want = [0u8; 64];
             let mut hasher = blake3::Hasher::new();
