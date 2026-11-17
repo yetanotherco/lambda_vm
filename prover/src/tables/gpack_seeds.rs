@@ -96,6 +96,29 @@ const SEEDS: &[(&str, usize, &WidthHint, &str)] = &[
     ("STORE", 16, &super::store::WIDTHS, "4x3,1x13"),
 ];
 
+/// The word memory format's kinds the finish builds, seeded only under
+/// [`seed_words_on`]. COPY_W's tables are cut at 2^20 rows and, unseeded, every
+/// one of a block's (they start together) is built at 8 bytes a cell and packed
+/// after: 671 MB a table where its packed form is ≈ 90. Each width is the most
+/// its column's writer can store on a run under the 2^30-cycle clock wall
+/// (timestamps under 2^32, keys' high words 32 bits, halves 16, bytes and flags
+/// one), and KECCAK_W's `(T, j)` and input count at KECCAK's census: a block that
+/// needs more writes its table again, one that needs less narrows it after.
+const WORD_SEEDS: &[(&str, usize, &WidthHint, &str)] = &[
+    (
+        "COPY_W",
+        80,
+        &super::copy_w::WIDTHS,
+        "4,2x4,4,2x2,4,1x58,4x2,1x11",
+    ),
+    (
+        "KECCAK_W",
+        1031,
+        &super::keccak_w::WIDTHS,
+        "4,2,1x403,4,4x4,2x4,1x578,2x2,1x8,2x2,1x16,4x10,1",
+    ),
+];
+
 /// `widths`'s runs, `w` or `wxn`, comma-separated; `None` if one does not parse.
 fn parse(widths: &str) -> Option<Vec<u8>> {
     let mut out = Vec::new();
@@ -145,6 +168,29 @@ fn cpu_seed_base_from(value: Option<&str>) -> bool {
     value.is_some_and(|v| v.trim() == "base")
 }
 
+/// Whether the finish also seeds the word memory format's kinds
+/// ([`WORD_SEEDS`]): on at `LAMBDA_VM_FINISH_SEED_WORDS=1`, off unset or at
+/// any other word (today's default), read once a process. The packed bytes
+/// are the same either way.
+pub(crate) fn seed_words_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        seed_words_from(std::env::var("LAMBDA_VM_FINISH_SEED_WORDS").ok().as_deref())
+    })
+}
+
+/// [`seed_words_on`]'s reading of `LAMBDA_VM_FINISH_SEED_WORDS`.
+fn seed_words_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// The seeds the finish takes: every kind's, and the word kinds' when `words`.
+fn seeds(
+    words: bool,
+) -> impl Iterator<Item = &'static (&'static str, usize, &'static WidthHint, &'static str)> {
+    SEEDS.iter().chain(WORD_SEEDS.iter().filter(move |_| words))
+}
+
 /// A kind's seed hint: CPU's in-row one, or under [`cpu_seed_base`] the base
 /// one.
 fn seed_hint(name: &str, hint: &'static WidthHint) -> &'static WidthHint {
@@ -160,7 +206,7 @@ pub(crate) fn seed_finish_widths() -> usize {
     static SEEDED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SEEDED.get_or_init(|| {
         let mut seeded = 0;
-        for &(name, cols, hint, widths) in SEEDS {
+        for &(name, cols, hint, widths) in seeds(seed_words_on()) {
             let hint = seed_hint(name, hint);
             if let Some(widths) = parse(widths).filter(|w| w.len() == cols)
                 && !hint.known(cols)
@@ -215,6 +261,72 @@ mod tests {
                 w.iter().all(|w| [1, 2, 4, 8].contains(w)),
                 "{name}: widths are 1, 2, 4 or 8"
             );
+        }
+    }
+
+    /// The word kinds' seeds parse to their tables' column counts, each width
+    /// 1, 2, 4 or 8, and are taken only with the word knob.
+    #[test]
+    fn every_word_seed_parses_to_its_kinds_columns() {
+        let today = [
+            ("COPY_W", super::super::copy_w::cols::NUM_COLUMNS),
+            ("KECCAK_W", super::super::keccak_w::cols::NUM_COLUMNS),
+        ];
+        assert_eq!(WORD_SEEDS.len(), today.len());
+        for (&(name, cols, _, widths), &(kind, columns)) in WORD_SEEDS.iter().zip(&today) {
+            assert_eq!(name, kind);
+            assert_eq!(
+                cols, columns,
+                "{name}: the seed's column count is the table's"
+            );
+            let w = parse(widths).expect("the seed parses");
+            assert_eq!(w.len(), cols, "{name}");
+            assert!(w.iter().all(|w| [1, 2, 4, 8].contains(w)), "{name}");
+        }
+        assert_eq!(seeds(false).count(), SEEDS.len());
+        assert_eq!(seeds(true).count(), SEEDS.len() + WORD_SEEDS.len());
+        assert!(!seed_words_from(None));
+        assert!(!seed_words_from(Some("0")));
+        assert!(!seed_words_from(Some("on")));
+        assert!(seed_words_from(Some("1")));
+        assert!(seed_words_from(Some(" 1\n")));
+    }
+
+    /// ★ COPY_W's seed is the widths its writer needs on a run at the clock
+    /// wall's limits (timestamp 2^32 − 1, keys' high words 2^32 − 1, counts
+    /// 2^32 − 1, every byte 0xff): a table of such rows, built wide and packed,
+    /// needs exactly the seed, so the seed never writes a table again on a run
+    /// under the wall, and a seed one byte narrower in any column would.
+    #[test]
+    fn copy_w_seed_is_the_writers_widest_words() {
+        use super::super::copy_w::{self, CopyWordRow};
+        use super::super::gpack::TraceForm;
+        let row = |flags: u8| CopyWordRow {
+            timestamp: u32::MAX as u64,
+            src_key: u64::MAX - 7,
+            dst_key: u64::MAX - 15,
+            count_decr: u32::MAX,
+            start: 0,
+            last: 7,
+            shift: 7,
+            flags,
+            a: u64::MAX,
+            b: u64::MAX,
+            old: u64::MAX,
+        };
+        let rows = [
+            row(copy_w::FLAG_FIRST | copy_w::FLAG_READ_A | copy_w::FLAG_READ_B),
+            row(copy_w::FLAG_READ_B),
+            row(copy_w::FLAG_WRITE | copy_w::FLAG_END),
+        ];
+        let mut trace = copy_w::generate_copy_w_rows_as(&rows, 4, TraceForm::Wide);
+        assert!(trace.pack_main_narrow(), "packed");
+        let needed = trace.narrow_main().expect("packed").widths().to_vec();
+        let &(_, cols, _, widths) = &WORD_SEEDS[0];
+        let seed = parse(widths).expect("the seed parses");
+        assert_eq!(seed.len(), cols);
+        for (c, (&n, &s)) in needed.iter().zip(&seed).enumerate() {
+            assert_eq!(n, s, "COPY_W column {c}: needed {n}, seeded {s}");
         }
     }
 
