@@ -36,3 +36,30 @@ fn wlfm_pin_print() {
         hex(&digest)
     );
 }
+
+/// ★ The fixture program's W-LFM identity at the production config, pinned:
+/// the identity it had before the WHIR round form existed (the round form is
+/// hashed only when a chain takes it). Grind-free: no proof is made.
+#[test]
+fn the_default_wlfm_program_id_is_unmoved() {
+    let program = honest();
+    let build = build(&program, WlfmRate::Two);
+    let id = hex(&build.artifacts.program_id);
+    println!("WLFM ID: {id}");
+    assert_eq!(
+        id,
+        "75c808decaf786f67e9a0d7105843270a2c612a32c86b47183a9ed320e26b670"
+    );
+    // The text the identity hashes names no round form, under either form:
+    // the round form is hashed on its own, and only when a chain takes it.
+    let fri = build.artifacts.config.format;
+    let text = super::wlfm::format_identity_text(&fri);
+    assert!(!text.contains("rounds"), "{text}");
+    let whir = build
+        .artifacts
+        .config
+        .with_whir_rounds(3, 128, 20)
+        .expect("a round form")
+        .format;
+    assert_eq!(super::wlfm::format_identity_text(&whir), text);
+}
