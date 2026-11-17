@@ -84,7 +84,7 @@ use multilinear::stacked_eval::index_chains;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
     ChainConfig, ChainProof, ChainRound, GroupFold, LeafOrder, MAX_INDEX_POLYS, NonceLayout,
-    Round0Trees, RoundForm, RoundOpenings, check_round_form, index_vars,
+    Round0Trees, RoundForm, RoundOpenings, check_round_form, check_round_form_union, index_vars,
 };
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
@@ -274,7 +274,11 @@ impl ChainShape {
         // stamped target does not give its own round-0 count (a count or fold
         // set by hand after the form was stamped); no program is emitted for
         // one, whose later rounds would answer to another target.
-        if let Err(e) = check_round_form(config) {
+        // Nor for a chain of more rounds than the union its counts were
+        // charged (`check_round_form_union`, refused on both host sides too).
+        if let Err(e) =
+            check_round_form(config).and_then(|()| check_round_form_union(config, num_vars))
+        {
             panic!("no chain is emitted for a config the host refuses: {e}");
         }
         let schedule = config.schedule(num_vars);

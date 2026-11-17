@@ -1068,8 +1068,21 @@ fn the_round_form_census_of_a_blake3_base_group() {
 #[test]
 #[should_panic(expected = "no chain is emitted for a config the host refuses")]
 fn a_round_form_config_the_host_refuses_emits_no_chain() {
-    let c = cases()[3];
+    // A caps-by-Q case whose rule moves a cap.
+    let c = cases()
+        .into_iter()
+        .find(|c| c.caps_by_q && c.cap == CapPolicy::Fixed(6))
+        .expect("a caps-by-Q case under a cap of 6");
     let mut cfg = config(&c);
+    let policy = config(&Case {
+        caps_by_q: false,
+        ..c
+    });
+    assert_ne!(
+        cfg.tree_caps_at(c.n, 2),
+        policy.tree_caps_at(c.n, 2),
+        "{c:?}: the rule moves a cap"
+    );
     assert!(multilinear::whir_chain::check_round_form(&cfg).is_ok());
     cfg.num_queries += 1;
     assert!(multilinear::whir_chain::check_round_form(&cfg).is_err());
@@ -1182,4 +1195,26 @@ fn a_lean_round_form_chain_has_no_tail_round_and_executes() {
         );
         println!("LEAN ROUND FORM {lowering}: tail-shaped rounds {shaped:?} checked per query");
     });
+}
+
+/// ★ Nor is a chain emitted that is longer than the union its counts were
+/// charged: a config sized for 9 variables (5 rounds of 2) emitted at 11 (6
+/// rounds), which the host's `check_round_form_union` refuses on both sides.
+#[test]
+#[should_panic(expected = "no chain is emitted for a config the host refuses")]
+fn a_round_form_chain_longer_than_its_union_emits_no_chain() {
+    use multilinear::whir_chain::{check_round_form, check_round_form_union};
+    let c = cases()
+        .into_iter()
+        .find(|c| c.first.is_none() && c.k == 2 && c.shrink == Some(1))
+        .expect("the uniform fold-2 case");
+    let cfg = config(&c);
+    assert_eq!(check_round_form(&cfg), Ok(()));
+    assert_eq!(check_round_form_union(&cfg, c.n), Ok(()));
+    assert!(
+        check_round_form_union(&cfg, c.n + 2).is_err(),
+        "the host refuses {} rounds against its union",
+        cfg.rounds(c.n + 2)
+    );
+    let _ = ChainShape::for_hash(&cfg, c.n + 2, WrapHash::Blake3);
 }
