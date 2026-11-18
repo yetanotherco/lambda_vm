@@ -848,6 +848,30 @@ fn rta_one_run(
         ),
         None => println!("RTA LEVEL1 VALIDATE: beside off"),
     }
+    let landing = &t.landing;
+    let list = |xs: Vec<String>| xs.join(" ");
+    println!(
+        "RTA LEVEL1 LANDING: setup {:.3}s · front at {:.3}s (wave {:.3}s) · base end {:.3}s · arrivals {} · \
+         landed {}",
+        landing.setup,
+        landing.front.0,
+        landing.front.1,
+        t.base,
+        list(
+            landing
+                .arrivals
+                .iter()
+                .map(|(g, at)| format!("{g}@{at:.3}"))
+                .collect()
+        ),
+        list(
+            landing
+                .landed
+                .iter()
+                .map(|(i, at, secs)| format!("{i}@{at:.3}+{secs:.3}"))
+                .collect()
+        ),
+    );
     let (lean, lean_wait) = t.lean_beside.unwrap_or_default();
     println!(
         "RTA LEAN BESIDE: {} · waves {} · compressions {} · fed {:.3}s · wait after the execution \
