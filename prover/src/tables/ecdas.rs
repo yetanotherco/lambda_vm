@@ -863,6 +863,7 @@ impl HalvesLimbs {
         let dx: [i64; 16] = std::array::from_fn(|i| self.xg[i] - self.xa[i]);
         let ax: [i64; 16] = std::array::from_fn(|i| self.xa[i] - self.xr[i]);
         let mut out = [[0i64; HALVES_POSITIONS]; 3];
+        #[allow(clippy::needless_range_loop)]
         for k in 0..HALVES_POSITIONS {
             let add = conv(&self.lambda, &dx, k) + at(&self.ya, k) - at(&self.yg, k);
             let dbl = 2 * conv(&self.lambda, &self.ya, k) - 3 * conv(&self.xa, &self.xa, k);
@@ -1191,7 +1192,8 @@ impl EcdasHalvesConstraints {
                 .map(|j| a[j].clone() * a[k - j].clone())
                 .reduce(|s, t| s + t)
                 .map(|s| b.const_base(2) * s);
-            let middle = (k % 2 == 0 && k / 2 < 16).then(|| a[k / 2].clone() * a[k / 2].clone());
+            let middle =
+                (k.is_multiple_of(2) && k / 2 < 16).then(|| a[k / 2].clone() * a[k / 2].clone());
             match (cross, middle) {
                 (Some(c), Some(m)) => Some(c + m),
                 (c, m) => c.or(m),
