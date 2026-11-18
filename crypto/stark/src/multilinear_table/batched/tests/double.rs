@@ -564,13 +564,20 @@ fn the_two_layer_ladder_is_deterministic() {
 /// The device path (on the card where there is one; its host fallbacks
 /// where there is none) proves the host reference's bytes on the two-layer
 /// ladder: a device tree's two-layer step is stepped on the host over its
-/// layer.
+/// layer, and its input layer, which the card keeps apart from its levels,
+/// is written on the host. Tables tall enough for the card's trees (CPU
+/// 2^13 rows) in one bin and in bins of 2^14 cells, and small ones.
+///
+/// ```text
+/// cargo test --release -p stark --features cuda,multilinear/cuda --lib -- \
+///     multilinear_table::batched::tests::double::the_device_path_proves_the_host_references_bytes_on_the_two_layer_ladder --exact --nocapture
+/// ```
 #[test]
 fn the_device_path_proves_the_host_references_bytes_on_the_two_layer_ladder() {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     let _switches = card_switches();
     let airs = airs();
-    for (a, pad, cap) in [(3usize, 1usize, 27u8), (2, 2, 3)] {
+    for (a, pad, cap) in [(12usize, 1usize, 27u8), (12, 1, 14), (3, 1, 27), (2, 2, 3)] {
         let cfg = double(cap);
         let cols = columns(a, pad);
         let run = |at: Where| {
@@ -592,6 +599,11 @@ fn the_device_path_proves_the_host_references_bytes_on_the_two_layer_ladder() {
             )
         };
         let (host, device) = (run(Where::Host), run(Where::Device));
+        eprintln!(
+            "two-layer ladder a={a} pad={pad} cap={cap}: {} bytes, a device {}",
+            host.0.len(),
+            a_device()
+        );
         assert!(
             host == device,
             "a={a} pad={pad} cap={cap}: the bytes differ"
