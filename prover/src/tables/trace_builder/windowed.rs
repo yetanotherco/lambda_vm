@@ -874,6 +874,22 @@ impl<'a> WindowedTraceBuilder<'a> {
         Ok(self)
     }
 
+    /// With [`Self::keccak_rnd_chunks`]: each KECCAK_RND chunk handed out
+    /// during the windows holds the keccak operations its rows come from
+    /// (`keccak_rnd::KeccakRndRecords`, about 208 bytes an op), for the card to
+    /// fill its columns as its group uploads it, instead of columns built on
+    /// the layout's thread. The words are the same; such a chunk is never
+    /// dropped.
+    pub fn stream_keccak_rnd_records(mut self) -> Result<Self, Error> {
+        if self.emitted.keccak_rnd_rows == 0 {
+            return Err(Error::Prover(
+                "KECCAK_RND's streamed chunks as records need KECCAK_RND cut into chunks".into(),
+            ));
+        }
+        self.emitted.keccak_rnd_records = true;
+        Ok(self)
+    }
+
     /// `finish` builds KECCAK_RND as tables of `rows` rows — the tables the
     /// block's split makes of the whole one, each built from the ops that reach
     /// it — instead of one table, without handing any out during the windows
@@ -1063,6 +1079,8 @@ impl<'a> WindowedTraceBuilder<'a> {
     #[cfg(test)]
     pub(crate) fn card_fill_records_fault(mut self, rows: usize) -> Self {
         self.card_fill_fault = rows;
+        // The streamed chunks' records too ([`Self::stream_keccak_rnd_records`]).
+        self.emitted.card_fill_fault = rows;
         self
     }
 
@@ -2755,6 +2773,8 @@ fn chunk_jobs(
                     ops: gather(windows, list_keccak, first..end),
                     skip: index * rows - first * 24,
                     rows,
+                    records: e.keccak_rnd_records,
+                    fault: records_fault(e),
                 },
             });
             e.keccak_rnd += 1;
@@ -4397,6 +4417,8 @@ fn tail_jobs(
                     ops,
                     skip: index * rows - first * 24,
                     rows,
+                    records: e.keccak_rnd_records,
+                    fault: records_fault(e),
                 },
             });
             e.keccak_rnd += 1;
@@ -4638,6 +4660,17 @@ fn concatenate(
     (cpu, walk)
 }
 
+/// The rows a streamed KECCAK_RND chunk's records start late by: a test's
+/// fault ([`StreamSkip::card_fill_fault`]), 0 otherwise.
+fn records_fault(e: &StreamSkip) -> usize {
+    let _ = e;
+    #[cfg(test)]
+    let fault = e.card_fill_fault;
+    #[cfg(not(test))]
+    let fault = 0;
+    fault
+}
+
 /// A completed chunk not generated yet: which chunk it is, and its ops.
 /// [`generate`](Self::generate) builds the table a whole-run build puts in that
 /// slot, with the same function.
@@ -4680,6 +4713,10 @@ enum ChunkOps {
         ops: Vec<super::keccak::KeccakOperation>,
         skip: usize,
         rows: usize,
+        /// Held as its records ([`StreamSkip::keccak_rnd_records`]), the
+        /// first starting `fault` rows late (a test's fault, 0 otherwise).
+        records: bool,
+        fault: usize,
     },
     MemLoad(Segments<MemLoadRow>),
     MemStore(Segments<MemStoreRow>),
@@ -4868,7 +4905,34 @@ impl ChunkJob {
             ChunkOps::Lt(ops) => lt::generate_lt_trace_segments_as(&ops.slices(), form),
             ChunkOps::Shift(ops) => shift::generate_shift_trace_segments_as(&ops.slices(), form),
             ChunkOps::Store(ops) => store::generate_store_trace_as(&ops, form),
-            ChunkOps::KeccakRnd { ops, skip, rows } => {
+            ChunkOps::KeccakRnd {
+                ops,
+                skip,
+                rows,
+                records,
+                fault,
+            } => {
+                // Held as its records: the card fills its columns from them.
+                let held = records
+                    .then(|| {
+                        keccak_rnd::KeccakRndRecords::new(
+                            ops.iter().map(|op| multilinear::records::KeccakRndOp {
+                                timestamp: op.timestamp,
+                                input: op.input,
+                            }),
+                            skip + fault,
+                            rows,
+                        )
+                        .into_trace()
+                    })
+                    .flatten();
+                if let Some(table) = held {
+                    return StreamedChunk {
+                        table: self.table,
+                        index: self.index,
+                        trace: table,
+                    };
+                }
                 let ops: Vec<keccak_rnd::KeccakRoundOperation> = ops
                     .iter()
                     .map(|op| keccak_rnd::KeccakRoundOperation {
@@ -5001,7 +5065,10 @@ impl ChunkJob {
     pub fn is_records(&self) -> bool {
         matches!(
             self.ops,
-            ChunkOps::CpuRecords { .. } | ChunkOps::MemwRegisterRecords(_) | ChunkOps::Rows(_)
+            ChunkOps::CpuRecords { .. }
+                | ChunkOps::MemwRegisterRecords(_)
+                | ChunkOps::Rows(_)
+                | ChunkOps::KeccakRnd { records: true, .. }
         )
     }
 }
