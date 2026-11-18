@@ -48,6 +48,15 @@ const SEEDS: &[(&str, usize, &WidthHint, &str)] = &[
         &super::ecdas::WIDTHS,
         "4,1x260,8x63,1x34,8x5,2x57,1x35,8x16,2x32,8,2,8x12,1x4",
     ),
+    // ECDAS's limb form (`ecdas::EcdasForm::Halves`): the byte form's columns
+    // up to `Q0`'s end, then each relation's `LO` (16 bits) and `HI` (a byte)
+    // and the next quotient's bytes; widths by the columns' checked ranges.
+    (
+        "ECDAS~halves",
+        515,
+        &super::ecdas::WIDTHS_HALVES,
+        "4,1x260,2x31,1x64,2x31,1x64,2x31,1x33",
+    ),
     (
         "ECREC",
         1543,
@@ -242,6 +251,10 @@ mod tests {
             ("CPU32", super::super::cpu32::cols::NUM_COLUMNS),
             ("DVRM", super::super::dvrm::cols::NUM_COLUMNS),
             ("ECDAS", super::super::ecdas::cols::NUM_COLUMNS),
+            (
+                "ECDAS~halves",
+                super::super::ecdas::halves_cols::NUM_COLUMNS,
+            ),
             ("ECREC", super::super::ecrec::cols::NUM_COLUMNS),
             ("EQ", super::super::eq::cols::NUM_COLUMNS),
             ("KECCAK", super::super::keccak::cols::NUM_COLUMNS),
