@@ -837,6 +837,14 @@ impl PartialEq for BitwiseHistogram {
     }
 }
 
+/// The byte-pair lanes of a [`BitwiseHistogram`]
+/// ([`BitwiseHistogram::byte_lanes_mut`]): each counter at `x + 256·y`.
+pub(crate) struct ByteLanes<'a> {
+    pub(crate) are_bytes: &'a mut [u64; 256 * 256],
+    pub(crate) and: &'a mut [u64; 256 * 256],
+    pub(crate) xor: &'a mut [u64; 256 * 256],
+}
+
 impl BitwiseHistogram {
     /// Allocate a zeroed histogram (80 MiB).
     // No `Default` impl on purpose: `new()` allocates 80 MiB, so a stray
@@ -846,6 +854,37 @@ impl BitwiseHistogram {
         Self {
             counters: vec![0u64; NUM_ROWS * NUM_LOOKUP_TYPES].into_boxed_slice(),
         }
+    }
+
+    /// The counters of the byte-pair lookups ARE_BYTES, BYTE_ALU[AND] and
+    /// BYTE_ALU[XOR] (`z = 0`), each `x + 256·y`: what a counter that knows
+    /// its lookups' types bumps directly ([`BitwiseOperation::byte_op`]'s
+    /// rows, the same cells [`Self::bump`] reaches). `None` only if the
+    /// histogram is not this table's shape.
+    pub(crate) fn byte_lanes_mut(&mut self) -> Option<ByteLanes<'_>> {
+        const PAIRS: usize = 256 * 256;
+        let at = |t| lookup_type_index(t) * NUM_ROWS;
+        let (are, and, xor) = (
+            at(BitwiseOperationType::AreBytes),
+            at(BitwiseOperationType::ByteAluAnd),
+            at(BitwiseOperationType::ByteAluXor),
+        );
+        const _: () = assert!(
+            lookup_type_index(BitwiseOperationType::AreBytes)
+                < lookup_type_index(BitwiseOperationType::ByteAluAnd)
+                && lookup_type_index(BitwiseOperationType::ByteAluAnd)
+                    < lookup_type_index(BitwiseOperationType::ByteAluXor)
+        );
+        if self.counters.len() < xor + PAIRS {
+            return None;
+        }
+        let (low, high) = self.counters.split_at_mut(and);
+        let (mid, high) = high.split_at_mut(xor - and);
+        Some(ByteLanes {
+            are_bytes: low.get_mut(are..)?.first_chunk_mut::<PAIRS>()?,
+            and: mid.first_chunk_mut::<PAIRS>()?,
+            xor: high.first_chunk_mut::<PAIRS>()?,
+        })
     }
 
     /// Increment the counter for one lookup.

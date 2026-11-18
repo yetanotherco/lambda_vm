@@ -7030,7 +7030,193 @@ pub(crate) fn count_bitwise_from_keccak_for(
     form: KeccakRndForm,
     histogram: &mut bitwise::BitwiseHistogram,
 ) {
-    for_each_keccak_lookup(keccak_ops, form, |op| histogram.bump(op));
+    if keccak_count_direct() {
+        count_bitwise_from_keccak_direct(keccak_ops, form, histogram);
+    } else {
+        for_each_keccak_lookup(keccak_ops, form, |op| histogram.bump(op));
+    }
+}
+
+static KECCAK_COUNT_DIRECT_FORCED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Whether KECCAK's BITWISE lookups are counted straight into the
+/// histogram's byte-pair lanes ([`count_bitwise_from_keccak_direct`]) rather
+/// than made one by one and bumped (`LAMBDA_VM_KECCAK_COUNT_DIRECT=1`; off by
+/// default). The counts are the same. Read once, with a banner.
+pub(crate) fn keccak_count_direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match KECCAK_COUNT_DIRECT_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => *ON.get_or_init(|| {
+            let on = keccak_count_direct_from(
+                std::env::var("LAMBDA_VM_KECCAK_COUNT_DIRECT")
+                    .ok()
+                    .as_deref(),
+            );
+            eprintln!(
+                "★ KECCAK COUNT DIRECT: {} (LAMBDA_VM_KECCAK_COUNT_DIRECT)",
+                if on {
+                    "on (the rounds' lookups counted straight into the byte-pair lanes)"
+                } else {
+                    "off (the default; each lookup made and bumped)"
+                }
+            );
+            on
+        }),
+    }
+}
+
+/// The knob's word: on for `1` only.
+fn keccak_count_direct_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// Overrides `LAMBDA_VM_KECCAK_COUNT_DIRECT` for the whole process — for a
+/// test that counts both ways in one binary. `None` restores the
+/// environment's.
+#[cfg(test)]
+pub(crate) fn force_keccak_count_direct(on: Option<bool>) {
+    KECCAK_COUNT_DIRECT_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// [`count_bitwise_from_keccak_for`] with each permutation's rounds counted
+/// straight into the histogram's byte-pair lanes ([`count_round_lookups_direct`]):
+/// the same lookups as [`for_each_keccak_lookup`], none of them made. A sponge
+/// row's and a permute row's own lookups (a few hundred) are made and bumped
+/// as before.
+fn count_bitwise_from_keccak_direct(
+    keccak_ops: &[KeccakOperation],
+    form: KeccakRndForm,
+    histogram: &mut bitwise::BitwiseHistogram,
+) {
+    for kop in keccak_ops {
+        {
+            let mut bump = |op| histogram.bump(op);
+            if let Some(sponge) = &kop.sponge {
+                emit_sponge_lookups(kop, sponge, &mut bump);
+            } else {
+                emit_permute_lookups(kop, &mut bump);
+            }
+        }
+        match histogram.byte_lanes_mut() {
+            Some(mut lanes) => count_round_lookups_direct(kop, form, &mut lanes),
+            None => emit_round_lookups(kop, form, &mut |op| histogram.bump(op)),
+        }
+    }
+}
+
+/// One byte-pair lookup per byte of the lanes `a` and `b`: byte `k` of each,
+/// `x = a_k`, `y = b_k`.
+#[inline(always)]
+fn count_pairs(lane: &mut [u64; 256 * 256], a: u64, b: u64) {
+    for k in 0..8 {
+        let x = (a >> (8 * k)) & 0xFF;
+        let y = (b >> (8 * k)) & 0xFF;
+        lane[((x | (y << 8)) & 0xFFFF) as usize] += 1;
+    }
+}
+
+/// [`emit_round_lookups`]' lookups, counted: theta's column chain, its
+/// shifted columns' ARE_BYTES (when `form` sends them), D and the final XOR,
+/// rho's ARE_BYTES, chi's AND and XOR, iota's XOR, round by round, on whole
+/// lanes. Every lookup is a byte pair (`z = 0`) of ARE_BYTES, AND or XOR.
+fn count_round_lookups_direct(
+    kop: &KeccakOperation,
+    form: KeccakRndForm,
+    lanes: &mut bitwise::ByteLanes<'_>,
+) {
+    use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
+    let mut state = kop.input;
+    let cxz_left = form.checks_cxz_left();
+    for &rc in KECCAK_RC.iter().take(24) {
+        // theta: the column chain, Cxz = A[x,0] ^ A[x,1] ^ … one XOR a stage.
+        let mut c = [0u64; 5];
+        for (x, cx) in c.iter_mut().enumerate() {
+            let mut acc = state[x];
+            for y in 1..5 {
+                let next = state[x + 5 * y];
+                count_pairs(lanes.xor, acc, next);
+                acc ^= next;
+            }
+            *cx = acc;
+        }
+        // theta: ARE_BYTES on each column's halfwords shifted left by one.
+        if cxz_left {
+            for &cx in &c {
+                for hw in 0..4 {
+                    let half = (cx >> (16 * hw)) & 0xFFFF;
+                    let shifted = (half << 1) & 0xFFFF;
+                    lanes.are_bytes[shifted as usize] += 1;
+                }
+            }
+        }
+        // theta: D = C[x−1] ^ rot(C[x+1], 1), then the final XOR.
+        let mut d = [0u64; 5];
+        for (x, dx) in d.iter_mut().enumerate() {
+            let left = c[(x + 4) % 5];
+            let right = c[(x + 1) % 5].rotate_left(1);
+            count_pairs(lanes.xor, left, right);
+            *dx = left ^ right;
+        }
+        let mut theta = [0u64; 25];
+        for y in 0..5 {
+            for x in 0..5 {
+                let lane = state[x + 5 * y];
+                count_pairs(lanes.xor, lane, d[x]);
+                theta[x + 5 * y] = lane ^ d[x];
+            }
+        }
+        // rho: ARE_BYTES on each halfword shifted by the lane's offset mod 16,
+        // paired with what it carries out.
+        for x in 0..5 {
+            for y in 0..5 {
+                let r = KECCAK_RHO[x][y] % 16;
+                let lane = theta[x + 5 * y];
+                for hw in 0..4 {
+                    let half = (lane >> (16 * hw)) & 0xFFFF;
+                    let (shifted, carry) = if r == 0 {
+                        (half, 0)
+                    } else {
+                        ((half << r) & 0xFFFF, half >> (16 - r))
+                    };
+                    lanes.are_bytes[((shifted & 0xFF) | ((carry & 0xFF) << 8)) as usize] += 1;
+                    lanes.are_bytes[((shifted >> 8) | ((carry >> 8) << 8)) as usize] += 1;
+                }
+            }
+        }
+        // pi.
+        let mut pi = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                pi[y + 5 * ((2 * x + 3 * y) % 5)] = theta[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
+            }
+        }
+        // chi: AND(¬B[x+1], B[x+2]), then XOR with B[x].
+        let mut chi = [0u64; 25];
+        for y in 0..5 {
+            for x in 0..5 {
+                let not_next = !pi[(x + 1) % 5 + 5 * y];
+                let next2 = pi[(x + 2) % 5 + 5 * y];
+                let and = not_next & next2;
+                count_pairs(lanes.and, not_next, next2);
+                count_pairs(lanes.xor, pi[x + 5 * y], and);
+                chi[x + 5 * y] = pi[x + 5 * y] ^ and;
+            }
+        }
+        // iota.
+        count_pairs(lanes.xor, chi[0], rc);
+        chi[0] ^= rc;
+        state = chi;
+    }
 }
 
 /// Every BITWISE lookup the keccak chips send for `keccak_ops`, permutation by
