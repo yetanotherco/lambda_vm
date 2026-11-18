@@ -1,31 +1,23 @@
 {"operations":
  [{"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 11},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 11},
     "message": [{"type": "var", "index": 6}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 11},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 11},
     "message": [{"type": "var", "index": 7}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 11},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 11},
     "message": [{"type": "var", "index": 8}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 11},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 11},
     "message": [{"type": "var", "index": 9}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"assert":
    {"type": "mul",
@@ -172,10 +164,7 @@
          "lhs": {"type": "var", "index": 8}},
         "lhs": {"type": "var", "index": 3}}}}}}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 11},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 11},
     "message":
     [{"type": "add",
       "rhs": {"type": "var", "index": 9},
@@ -185,6 +174,7 @@
        "lhs":
        {"type": "add", "rhs": {"type": "var", "index": 7}, "lhs": {"type": "var", "index": 6}}}},
      {"type": "var", "index": 10}],
+    "direction": "pull",
     "channel": "ZERO"}},
   {"assert":
    {"type": "add",
@@ -229,6 +219,7 @@
       "lhs": {"value": 3, "type": "const"}},
      {"type": "var", "index": 5},
      {"value": 0, "type": "const"}],
+    "direction": "push",
     "channel": "ALU"}}],
  "name": "eq",
  "columns": 12}

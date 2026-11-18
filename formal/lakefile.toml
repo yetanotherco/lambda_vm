@@ -9,7 +9,7 @@ relaxedAutoImplicit = false
 [[require]]
 name = "Clean"
 git = "https://github.com/Verified-zkEVM/clean"
-rev = "1a6c28426372bb99af79e533aa7b9a0788eff0d7"
+rev = "f3abad7c099e49f847836c1883dd9e7c539f06f9"
 
 [[lean_lib]]
 name = "LambdaVM"
