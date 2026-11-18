@@ -892,12 +892,14 @@ where
                 // lifted factors on the card, else here — and a big host tree
                 // still folds on a device. The same tree every way.
                 let started = std::time::Instant::now();
+                let mut resident_seen = None;
                 let on_card = (multilinear::gpu::argue_no_lift()
                     && trace.device_factors().is_none())
                 .then(columns_tree)
                 .flatten()
                 .or_else(|| {
                     let resident = trace.reside_from_columns();
+                    resident_seen = Some(resident.is_some());
                     let from_columns = (multilinear::gpu::argue_gkr_input() && resident.is_some())
                         .then(columns_tree)
                         .flatten();
@@ -914,6 +916,15 @@ where
                     }
                     None => {
                         split.trees_host += 1;
+                        let why = match resident_seen {
+                            Some(false) => "no resident columns or factors for its table",
+                            _ => "the card declined the build",
+                        };
+                        multilinear::gpu::note_gkr_tree_host_built(
+                            why,
+                            t,
+                            interactions.len().next_power_of_two() << trace.num_vars(),
+                        );
                         Pending::Ready(host_built(t, interactions)?)
                     }
                 };
@@ -933,6 +944,11 @@ where
                     Some(tree) => Ok(BinTree::Built(Box::new(tree))),
                     None => {
                         split.trees_host_late += 1;
+                        multilinear::gpu::note_gkr_tree_host_built(
+                            "its queued card build could not be read",
+                            t,
+                            lists[i].len().next_power_of_two() << tables[t].trace.num_vars(),
+                        );
                         host_built(t, &lists[i])
                     }
                 },

@@ -171,6 +171,7 @@ static ROOMS_TURN_SIZED: AtomicU64 = AtomicU64::new(0);
 /// factors and tree. See [`note_gkr_tree_refusal`]; each one is also a
 /// `math_cuda::device::device_fallbacks`.
 static GKR_TREE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+static GKR_TREE_HOST_BUILDS: AtomicU64 = AtomicU64::new(0);
 /// Fraction trees whose input layer was written from the base columns
 /// (`gpu::argue_gkr_input`).
 static INPUT_COLUMNS_TREES: AtomicU64 = AtomicU64::new(0);
@@ -643,6 +644,36 @@ pub(crate) fn note_commit_room_refused() {
 /// GKR fraction trees the host built because the card refused their promise.
 pub fn gkr_tree_refusals() -> u64 {
     GKR_TREE_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// GKR fraction trees a batched argue built on the host because its card
+/// path returned none ([`note_gkr_tree_host_built`]).
+pub fn gkr_tree_host_builds() -> u64 {
+    GKR_TREE_HOST_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts a GKR tree a batched argue built on the host because its card
+/// path declined it with no refusal of its own, and says so as it happens:
+/// `why` the card path gave none, `cells` the tree's input cells. Only with
+/// a device: without one every tree is the host's by design.
+pub fn note_gkr_tree_host_built(why: &str, table: usize, cells: usize) {
+    if math_cuda_backend_absent() {
+        return;
+    }
+    let count = GKR_TREE_HOST_BUILDS.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[gkr] tree built on the host: {why} · table {table} · {cells} cells · host-built trees {count}"
+    );
+}
+
+#[cfg(feature = "cuda")]
+fn math_cuda_backend_absent() -> bool {
+    math_cuda::device::backend().is_err()
+}
+
+#[cfg(not(feature = "cuda"))]
+fn math_cuda_backend_absent() -> bool {
+    true
 }
 
 /// Rooms a group sized, for its commits or its openings' turn.
