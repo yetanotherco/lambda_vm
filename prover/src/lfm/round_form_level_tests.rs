@@ -713,11 +713,10 @@ fn b3_lean_pin_print() {
 /// the round form three one-value tampers are refused in execution. Printed:
 /// the level's instructions and lean compressions under each form.
 ///
-/// Box tier: a dev build's walker trips a debug assertion of the word format
-/// on a block that commits words ("COPY should move exactly the committed
-/// byte count"), under either base; a release build does not evaluate it.
+/// Ignored for its cost (two small bases proved); a dev build runs it too,
+/// its word-format debug assertions on.
 #[test]
-#[ignore = "box tier: a release build (the dev build trips a word-format debug assertion)"]
+#[ignore = "proves two small BLAKE3 words bases; run by name"]
 fn level_1_executes_over_a_words_blake3_base_and_refuses_its_tampers() {
     let name = "test_commit_4";
     let streamed = words_options();
