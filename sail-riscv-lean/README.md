@@ -17,4 +17,6 @@ fails if the result differs from what is committed.
 3. Run `lake update` here and `lake update Lean_RV64D` in `formal-riscv`, then build `formal-riscv`.
    Lake may set `formal-riscv/lean-toolchain` to the model's version; put it back to the one in
    `formal/lean-toolchain`, which `formal-riscv` must match.
+   This folder's `lean-toolchain` is the compiler's output and stays as it is: Lake builds the
+   model with `formal-riscv`'s toolchain, since it is only used as a dependency.
 4. Commit the result.

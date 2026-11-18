@@ -92,3 +92,7 @@ Done so far:
   operand (`x[rs2]`, `shamt`, or the immediate sign-extended to 64 bits) on the bus. Proving
   that also needs the CPU in Clean; it will be a fourth step per instruction on top of these
   three.
+- The `Alu` theorems also assume (hypothesis `hflags`) the flag byte of each instruction: that
+  the circuit decodes the opcode to those flags is not proven here.
+- Word shifts with a register operand: CPU32 sends the low word of `rs2` sign-extended, not
+  `x[rs2]`, so `hb` asks only that the shift amount agrees mod 32, which is all RISC-V reads.

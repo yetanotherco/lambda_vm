@@ -1,4 +1,6 @@
 # The two upstream sources the Lean model is generated from.
+# The Lean runtime it needs (lean-sail) is set by the compiler (lakefile.toml) and pinned to a
+# commit in lake-manifest.json.
 # To update the model: change these commits, run scripts/generate.sh and commit the result.
 
 # The Sail compiler, whose Lean backend translates the spec to Lean.

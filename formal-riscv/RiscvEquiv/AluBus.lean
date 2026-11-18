@@ -51,12 +51,13 @@ lemma shift_alu (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
   rw [hout, ha, shiftResult_amt _ _ _ _ _ hamt]
 
 /-- A SHIFT message with `word = 1` and flags `signed = s`, `direction = d` carries, in `outLo`,
-the low word of `shiftResult` of its operands. Mod 32 the low byte of the shift amount is the
-low bits of `b`. No range hypotheses, as in `shift_alu`. -/
+the low word of `shiftResult` of its operands. Only the shift amount mod 32 matters, so `hb`
+asks only that: CPU32 sends the low word of `rs2` sign-extended, not `x[rs2]`. No range
+hypotheses, as in `shift_alu`. -/
 lemma shift_word_alu_low (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
     (s d : ℕ) (hs : s < 2) (hd : d < 2) (hflags : m.flags.val = opselSHIFT + 1 + 32 * s + 64 * d)
     (x : ℕ) (b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = x)
-    (hb : dword m.in2Lo m.in2Hi = b.toNat) :
+    (hb : dword m.in2Lo m.in2Hi % 32 = b.toNat % 32) :
     m.outLo.val = Alu.shiftResult 1 s d x b.toNat % 2^32 := by
   obtain ⟨-, -, hshift⟩ := hg
   obtain ⟨hlo, -, hout⟩ := hshift 1 s d (by norm_num) hs hd hflags
