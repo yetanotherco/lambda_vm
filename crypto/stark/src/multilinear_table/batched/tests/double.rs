@@ -16,7 +16,7 @@ fn double(bin_log_cells: u8) -> ChainConfig {
 
 /// `cfg` with its ladder replaced.
 fn on(cfg: &ChainConfig, ladder: GkrLadder) -> ChainConfig {
-    let mut cfg = cfg.clone();
+    let mut cfg = *cfg;
     cfg.format.argue = cfg.format.argue.with_ladder(ladder);
     cfg
 }

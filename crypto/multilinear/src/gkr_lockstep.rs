@@ -2813,7 +2813,7 @@ mod tests {
         let next = random_layer(5, 5);
         let point: Vec<FE> = (0..4).map(|i| FE::from(91 + i as u64)).collect();
         let weights = [FE::from(3u64), FE::from(11u64)];
-        let mut step = HostStep::over(&next, &point, weights.clone()).unwrap();
+        let mut step = HostStep::over(&next, &point, weights).unwrap();
         let HostRelation::Single(relation) = &step.0 else {
             unreachable!()
         };
@@ -2833,11 +2833,14 @@ mod tests {
         }
     }
 
-    /// The step at `layer`'s index in the proof under the two-layer form.
+    /// Every layer of each tree, output first.
+    type Trees = Vec<Vec<FractionLayer<F>>>;
+
+    /// A round trip's trees, their outputs and the proof.
     fn outputs_and_proof(
         heights: &[usize],
         form: GkrLadder,
-    ) -> (Vec<Vec<FractionLayer<F>>>, Vec<(FE, FE)>, LockstepProof<F>) {
+    ) -> (Trees, Vec<(FE, FE)>, LockstepProof<F>) {
         let (trees, proof) = round_trip_as(heights, form);
         let outputs = outputs_of(&trees);
         (trees, outputs, proof)
@@ -3112,28 +3115,14 @@ mod tests {
     }
 
     /// A ladder proved with one tree [`Faulted`].
-    fn faulted(
-        heights: &[usize],
-        target: usize,
-        fault: StepFault,
-    ) -> (
-        Vec<Vec<FractionLayer<F>>>,
-        LockstepProof<F>,
-        Result<Vec<GkrClaim<F>>, Error>,
-    ) {
+    /// A faulted ladder's trees, proof and verdict.
+    type Departure = (Trees, LockstepProof<F>, Result<Vec<GkrClaim<F>>, Error>);
+
+    fn faulted(heights: &[usize], target: usize, fault: StepFault) -> Departure {
         faulted_at(heights, target, fault, 2)
     }
 
-    fn faulted_at(
-        heights: &[usize],
-        target: usize,
-        fault: StepFault,
-        layer: usize,
-    ) -> (
-        Vec<Vec<FractionLayer<F>>>,
-        LockstepProof<F>,
-        Result<Vec<GkrClaim<F>>, Error>,
-    ) {
+    fn faulted_at(heights: &[usize], target: usize, fault: StepFault, layer: usize) -> Departure {
         let trees = trees_of(heights, 61);
         let hosts: Vec<HostLayers<'_, F>> = trees.iter().map(|t| HostLayers(t)).collect();
         let armed = Faulted::at(&hosts[target], fault, layer);
