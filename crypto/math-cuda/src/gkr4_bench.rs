@@ -12,7 +12,7 @@
 //! The module is loaded on first use from its own cubin, never by
 //! [`crate::device::Backend::init`], so a proving process never loads it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{
@@ -31,9 +31,78 @@ const MAX_GRID: u32 = 2048;
 /// Rows a round can write: `H(1), H(2), H(3), H(4)`, then `H(0)`.
 pub const ROWS: usize = 5;
 
+/// The round kernels the bench compares, all over the same layout and rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variant {
+    /// The first bench's value-form kernel, one thread a cube index, as it
+    /// was compiled (`__launch_bounds__(256)`): the reference.
+    V0,
+    /// The same body held to two 256-thread blocks an SM.
+    V1,
+    /// One thread a cube index, the coefficient form, two blocks an SM.
+    V2,
+    /// A thread pair a cube index (each lane owns one half of the middle
+    /// layer and trades a quadratic with its partner), two blocks an SM.
+    V3,
+    /// V3 at three blocks an SM. Information only.
+    V3b,
+}
+
+impl Variant {
+    pub const ALL: [Variant; 5] = [
+        Variant::V0,
+        Variant::V1,
+        Variant::V2,
+        Variant::V3,
+        Variant::V3b,
+    ];
+
+    /// The name the bench prints.
+    pub fn label(self) -> &'static str {
+        match self {
+            Variant::V0 => "v0",
+            Variant::V1 => "v1",
+            Variant::V2 => "v2",
+            Variant::V3 => "v3",
+            Variant::V3b => "v3b",
+        }
+    }
+
+    /// Lanes a cube index.
+    fn lanes(self) -> u64 {
+        match self {
+            Variant::V3 | Variant::V3b => 2,
+            _ => 1,
+        }
+    }
+
+    /// The value form takes `want_h0` as an argument; the others have an
+    /// instance with `H(0)` and one without.
+    fn value_form(self) -> bool {
+        matches!(self, Variant::V0 | Variant::V1)
+    }
+}
+
 struct Module {
     _module: Arc<CudaModule>,
-    round: CudaFunction,
+    v0: CudaFunction,
+    v1: CudaFunction,
+    v2: [CudaFunction; 2],
+    v3: [CudaFunction; 2],
+    v3b: [CudaFunction; 2],
+}
+
+impl Module {
+    fn function(&self, variant: Variant, want_h0: bool) -> &CudaFunction {
+        let h0 = usize::from(want_h0);
+        match variant {
+            Variant::V0 => &self.v0,
+            Variant::V1 => &self.v1,
+            Variant::V2 => &self.v2[h0],
+            Variant::V3 => &self.v3[h0],
+            Variant::V3b => &self.v3b[h0],
+        }
+    }
 }
 
 fn module() -> Result<&'static Module> {
@@ -43,27 +112,51 @@ fn module() -> Result<&'static Module> {
     }
     let be = backend()?;
     let module = be.ctx.load_module(Ptx::from_binary(CUBIN.to_vec()))?;
+    let pair = |name: &str| -> Result<[CudaFunction; 2]> {
+        Ok([
+            module.load_function(name)?,
+            module.load_function(&format!("{name}_h0"))?,
+        ])
+    };
     let m = Module {
-        round: module.load_function("gkr4_round_gruen")?,
+        v0: module.load_function("gkr4_round_gruen")?,
+        v1: module.load_function("gkr4_round_gruen_lb2")?,
+        v2: pair("gkr2_round_v2")?,
+        v3: pair("gkr2_round_v3")?,
+        v3b: pair("gkr2_round_v3b")?,
         _module: module,
     };
     Ok(MODULE.get_or_init(|| m))
 }
 
-static FAULT: AtomicBool = AtomicBool::new(false);
-
-/// ⛔ A FAULT, a negative control's only: in a round without a fold, the last
-/// quarter's lower cell is read one index off.
+/// ⛔ The negative controls' faults, for the card gate only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
-pub fn force_fault(on: bool) {
-    FAULT.store(on, Ordering::Relaxed);
+pub enum Fault {
+    None = 0,
+    /// In a round without a fold, the last quarter's lower cell is read one
+    /// index off (every variant).
+    OneCell = 1,
+    /// The pair kernels trade with lane `^ 2` (the next pair) instead of the
+    /// partner. The other variants ignore it.
+    Exchange = 2,
 }
 
-/// Today's launch shape for a Gruen round: 256-thread blocks for a wide cube,
-/// down to a warp for a narrow one, at most [`MAX_GRID`] blocks.
-fn shape(quarter: u64) -> (u32, u32) {
-    let block = quarter.next_power_of_two().clamp(32, 256) as u32;
-    let grid = quarter.div_ceil(block as u64).clamp(1, MAX_GRID as u64) as u32;
+static FAULT: AtomicU32 = AtomicU32::new(0);
+
+/// ⛔ A FAULT, a negative control's only. Process-global: the tests that set
+/// it run alone.
+#[doc(hidden)]
+pub fn force_fault(fault: Fault) {
+    FAULT.store(fault as u32, Ordering::Relaxed);
+}
+
+/// Today's launch shape for a Gruen round over `lanes` lanes: 256-thread
+/// blocks for a wide cube, down to a warp for a narrow one, at most
+/// [`MAX_GRID`] blocks.
+fn shape(lanes: u64) -> (u32, u32) {
+    let block = lanes.next_power_of_two().clamp(32, 256) as u32;
+    let grid = lanes.div_ceil(block as u64).clamp(1, MAX_GRID as u64) as u32;
     (grid, block)
 }
 
@@ -167,11 +260,12 @@ impl DoubleStep {
         Ok(eq)
     }
 
-    /// The next round's launches, queued: the round and the reduction of its
-    /// rows. `fold_by` is the previous round's challenge. Returns the rows
-    /// [`round_collect`](Self::round_collect) reads.
+    /// The next round's launches, queued: the round by `variant` and the
+    /// reduction of its rows. `fold_by` is the previous round's challenge.
+    /// Returns the rows [`round_collect`](Self::round_collect) reads.
     pub fn round_enqueue(
         &mut self,
+        variant: Variant,
         fold_by: Option<&[u64; 3]>,
         lambda: &[u64; 3],
         want_h0: bool,
@@ -185,7 +279,7 @@ impl DoubleStep {
         let be = backend()?;
         let m = self.stride.trailing_zeros() as usize;
         let quarter = 1u64 << (m - self.done - 1);
-        let (grid, block) = shape(quarter);
+        let (grid, block) = shape(quarter * variant.lanes());
         let rows = if want_h0 { 5u32 } else { 4 };
         let s = fold_by.copied().unwrap_or([0; 3]);
         let fold = u32::from(fold_by.is_some());
@@ -198,10 +292,20 @@ impl DoubleStep {
         let stride = self.stride as u64;
         let low = self.low as u32;
         let want = u32::from(want_h0);
-        let fault = u32::from(FAULT.load(Ordering::Relaxed));
+        let fault = FAULT.load(Ordering::Relaxed);
+        let function = module()?.function(variant, want_h0);
+        // The value form reduces through a 256-row tree in shared memory; the
+        // others through warp shuffles, one ext3 a warp and row.
+        let shared_mem_bytes = if variant.value_form() {
+            block * 3 * 8
+        } else {
+            (block / 32) * rows * 3 * 8
+        };
+        // The value form knows one fault, the cell; the others both.
+        let value_fault = u32::from(fault == Fault::OneCell as u32);
         unsafe {
-            self.stream
-                .launch_builder(&module()?.round)
+            let mut launch = self.stream.launch_builder(function);
+            launch
                 .arg(&self.p_at)
                 .arg(&self.q_at)
                 .arg(&stride)
@@ -215,15 +319,17 @@ impl DoubleStep {
                 .arg(&lambda[2])
                 .arg(&e_hi)
                 .arg(&e_lo)
-                .arg(&low)
-                .arg(&want)
-                .arg(&fault)
-                .arg(&mut self.partials)
-                .launch(LaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: block * 3 * 8,
-                })?;
+                .arg(&low);
+            if variant.value_form() {
+                launch.arg(&want).arg(&value_fault);
+            } else {
+                launch.arg(&fault);
+            }
+            launch.arg(&mut self.partials).launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes,
+            })?;
             self.stream
                 .launch_builder(&be.sum_partials_ext3)
                 .arg(&self.partials)
@@ -303,138 +409,8 @@ mod tests {
     struct Back;
     impl Drop for Back {
         fn drop(&mut self) {
-            force_fault(false);
+            force_fault(Fault::None);
         }
-    }
-
-    /// ★ The double step's rounds are the pair's composed values, and the
-    /// comparison is load-bearing. Over random layers of 2^10 and 2^12 cells:
-    /// (1) round 0's rows at `t = 0` and `t = 1` equal today's step
-    /// (`gkr_round_gruen`) over the middle layer the production fold makes,
-    /// at the same point and `λ` — at Boolean `t` the two relations agree
-    /// cell by cell; (2) every card round's rows `H(1)..H(4), H(0)` equal a
-    /// host reference that composes the two folds over the quarters, folded
-    /// by the same challenges; (3) the last quarter's lower cell one off parts
-    /// from the reference and from today's `H(0)`, and leaves `H(1)`, which
-    /// reads no lower cell.
-    #[test]
-    #[ignore = "a card; flips a process-global fault: run alone, --ignored --test-threads=1"]
-    fn the_double_step_is_the_pair_composed() {
-        let _back = Back;
-        let be = backend().expect("a card");
-        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        let low = 2usize;
-        let mut checked = 0;
-        for num_vars in [10usize, 12] {
-            let cells = 1usize << num_vars;
-            let m = num_vars - 2;
-            let (p, q) = (rng.limbs(cells), rng.limbs(cells));
-            let point = rng.limbs(m);
-            let lambda = rng.ext();
-            let stream = be.next_stream();
-
-            // Today's step over the middle layer, as the production fold makes it.
-            let tree = DeviceFractionTree::build(&p, &q).expect("the tree");
-            assert_eq!(tree.layer_num_vars(num_vars - 1), num_vars - 1);
-            let (mid_p, mid_q) = tree.layer_to_host(num_vars - 1).expect("the middle layer");
-            let middle = InputLayer::new(
-                stream.clone(),
-                crate::device::htod_or_trim(&stream, &mid_p).unwrap(),
-                crate::device::htod_or_trim(&stream, &mid_q).unwrap(),
-                num_vars - 1,
-            );
-            let mut today = middle.gruen(&point, low).expect("today's step");
-            let today_rows = fes(&today.round(None, &lambda, true).expect("today's round 0"));
-
-            let open = |stream: &Arc<CudaStream>| {
-                let pd = Arc::new(crate::device::htod_or_trim(stream, &p).unwrap());
-                let qd = Arc::new(crate::device::htod_or_trim(stream, &q).unwrap());
-                DoubleStep::new(stream, &pd, &qd, num_vars, &point, low).expect("the double step")
-            };
-            let mut step = open(&stream);
-            let eq = fes(&step.eq_levels().expect("eq"));
-            let rounds = step.rounds();
-
-            // The host's quarters: `f[k]` for k = 0..4 numerators, 4..8 denominators.
-            let (hp, hq) = (fes(&p), fes(&q));
-            let stride = 1usize << m;
-            let mut f: Vec<Vec<Fp3>> = (0..8)
-                .map(|k| {
-                    let src = if k < 4 { &hp } else { &hq };
-                    src[(k & 3) * stride..((k & 3) + 1) * stride].to_vec()
-                })
-                .collect();
-            let lam = fe(&lambda);
-            let challenges: Vec<[u64; 3]> = (0..rounds).map(|_| rng.ext()).collect();
-            let mut first: Vec<Fp3> = Vec::new();
-            for j in 0..rounds {
-                let fold_by = (j > 0).then(|| challenges[j - 1]);
-                if let Some(s) = fold_by {
-                    let s = fe(&s);
-                    for fk in f.iter_mut() {
-                        let half = fk.len() / 2;
-                        let folded: Vec<Fp3> = (0..half)
-                            .map(|x| &fk[x] + &s * &(&fk[x + half] - &fk[x]))
-                            .collect();
-                        *fk = folded;
-                    }
-                }
-                let quarter = 1usize << (m - j - 1);
-                let at = (1usize << low) + (1usize << rounds) - (1usize << (rounds - j));
-                let mask = (1usize << low) - 1;
-                let mut want = vec![Fp3::zero(); ROWS];
-                for x in 0..quarter {
-                    let w = &eq[at + (x >> low)] * &eq[x & mask];
-                    let lo: [Fp3; 8] = std::array::from_fn(|k| f[k][x]);
-                    let hi: [Fp3; 8] = std::array::from_fn(|k| f[k][x + quarter]);
-                    for (row, t) in [1u64, 2, 3, 4, 0].into_iter().enumerate() {
-                        let t = Fp3::from(t);
-                        let v: [Fp3; 8] = std::array::from_fn(|k| &lo[k] + &t * &(&hi[k] - &lo[k]));
-                        want[row] = &want[row] + &w * composed(&v, &lam);
-                    }
-                }
-                let rows = step
-                    .round_enqueue(fold_by.as_ref(), &lambda, true)
-                    .expect("a round");
-                let got = fes(&step.round_collect(rows).expect("its rows"));
-                assert_eq!(got, want, "2^{num_vars}, round {j}: the rows");
-                if j == 0 {
-                    first = got;
-                }
-                checked += 1;
-            }
-            // Round 0 at t = 1 and t = 0 against today's step: rows H(1) and H(0).
-            assert_eq!(first[0], today_rows[0], "2^{num_vars}: H(1) is today's");
-            assert_eq!(first[4], today_rows[2], "2^{num_vars}: H(0) is today's");
-
-            // The off-by-one parts from both.
-            force_fault(true);
-            let mut faulted = open(&stream);
-            let rows = faulted
-                .round_enqueue(None, &lambda, true)
-                .expect("a faulted round");
-            let bad = fes(&faulted.round_collect(rows).expect("its rows"));
-            force_fault(false);
-            assert_ne!(
-                bad, first,
-                "2^{num_vars}: the off-by-one must part from the reference"
-            );
-            // The fault reads only a lower-half cell, so H(1) (built from the
-            // upper half alone) keeps today's value and H(0) must leave it.
-            assert_eq!(
-                bad[0], today_rows[0],
-                "2^{num_vars}: the off-by-one leaves H(1), which reads no lower cell"
-            );
-            assert_ne!(
-                bad[4], today_rows[2],
-                "2^{num_vars}: the off-by-one must part from today's H(0)"
-            );
-        }
-        eprintln!(
-            "GKR4 GATE equality PASS: {checked} card rounds at 2^10 and 2^12 equal the composed \
-             pair; round 0's H(1), H(0) equal today's step over the middle layer; the off-by-one \
-             parted from the reference and from today's H(0)"
-        );
     }
 
     /// The host reference itself, no card: at Boolean `t` the composed
@@ -476,6 +452,315 @@ mod tests {
         }
     }
 
+    /// A quadratic in `t` as the coefficient-form kernels hold it: its values
+    /// at 0 and 1 and its `t²` coefficient.
+    #[derive(Clone)]
+    struct Quad {
+        v0: Fp3,
+        v1: Fp3,
+        c2: Fp3,
+    }
+
+    impl Quad {
+        /// The product of two linear factors given at `t = 0` and `t = 1`.
+        fn prod(lo_a: &Fp3, hi_a: &Fp3, lo_b: &Fp3, hi_b: &Fp3) -> Quad {
+            Quad {
+                v0: lo_a * lo_b,
+                v1: hi_a * hi_b,
+                c2: (hi_a - lo_a) * (hi_b - lo_b),
+            }
+        }
+        fn add(&self, o: &Quad) -> Quad {
+            Quad {
+                v0: &self.v0 + &o.v0,
+                v1: &self.v1 + &o.v1,
+                c2: &self.c2 + &o.c2,
+            }
+        }
+        fn scale(&self, s: &Fp3) -> Quad {
+            Quad {
+                v0: s * &self.v0,
+                v1: s * &self.v1,
+                c2: s * &self.c2,
+            }
+        }
+        /// Its value at `t`, walked from `t = 1` by finite differences as the
+        /// kernels walk it (`t = 0` is `v0`).
+        fn at(&self, t: u64) -> Fp3 {
+            if t == 0 {
+                return self.v0;
+            }
+            let dd = &self.c2 + &self.c2;
+            let mut d = &self.v1 - &self.v0 + &dd;
+            let mut val = self.v1;
+            for _ in 1..t {
+                val = &val + &d;
+                d = &d + &dd;
+            }
+            val
+        }
+    }
+
+    /// `X_r, Y_r`: the middle layer's half `r` from quarters `r` and `r + 2`.
+    fn half(lo: &[Fp3; 8], hi: &[Fp3; 8], r: usize) -> (Quad, Quad) {
+        let (a, b, c, d) = (r, r + 2, 4 + r, 4 + r + 2);
+        let x = Quad::prod(&lo[a], &hi[a], &lo[d], &hi[d])
+            .add(&Quad::prod(&lo[b], &hi[b], &lo[c], &hi[c]));
+        let y = Quad::prod(&lo[c], &hi[c], &lo[d], &hi[d]);
+        (x, y)
+    }
+
+    /// ★ The coefficient forms the new kernels compute are the composition,
+    /// at `t = 0..5`, for random factors: the one-thread form
+    /// `(X_0 + λY_0)(t)·Y_1(t) + X_1(t)·Y_0(t)` and the pair form, where lane
+    /// `r` adds `(X_r + λ_r·Y_r)(t)·W(t)` with `λ_0 = λ`, `λ_1 = 0` and `W`
+    /// the partner's `Y`. And an exchange with the wrong lane parts.
+    #[test]
+    fn the_coefficient_forms_are_the_composition() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        for _ in 0..16 {
+            let lambda = fe(&rng.ext());
+            let w = fe(&rng.ext());
+            let lo: [Fp3; 8] = std::array::from_fn(|_| fe(&rng.ext()));
+            let hi: [Fp3; 8] = std::array::from_fn(|_| fe(&rng.ext()));
+            let (x0, y0) = half(&lo, &hi, 0);
+            let (x1, y1) = half(&lo, &hi, 1);
+            // One thread.
+            let z = x0.add(&y0.scale(&lambda)).scale(&w);
+            let v = x1.scale(&w);
+            // A pair: lane 0 and lane 1, each with its partner's Y.
+            let lanes = [
+                (x0.add(&y0.scale(&lambda)).scale(&w), y1.clone()),
+                (x1.add(&y1.scale(&Fp3::zero())).scale(&w), y0.clone()),
+            ];
+            for t in 0..=5u64 {
+                let tt = Fp3::from(t);
+                let at: [Fp3; 8] = std::array::from_fn(|k| &lo[k] + &tt * (&hi[k] - &lo[k]));
+                let want = &w * composed(&at, &lambda);
+                let one = z.at(t) * y1.at(t) + v.at(t) * y0.at(t);
+                assert_eq!(one, want, "the one-thread form at t = {t}");
+                let pair =
+                    lanes[0].0.at(t) * lanes[0].1.at(t) + lanes[1].0.at(t) * lanes[1].1.at(t);
+                assert_eq!(pair, want, "the pair form at t = {t}");
+                if t >= 2 {
+                    // Lane 1 holding its own Y instead of the partner's.
+                    let wrong = lanes[0].0.at(t) * lanes[0].1.at(t) + lanes[1].0.at(t) * y1.at(t);
+                    assert_ne!(wrong, want, "a wrong exchange parts at t = {t}");
+                }
+            }
+        }
+    }
+
+    /// ★ The card gate of one variant: its rounds are the pair's composed
+    /// values, and the comparison is load-bearing. Over random layers of 2^10
+    /// and 2^12 cells, with and without `H(0)`: (1) every card round's rows
+    /// `H(1)..H(4)` (and `H(0)`) equal a host reference that composes the two
+    /// folds over the quarters, folded by the same challenges; (2) the quarters
+    /// the last round leaves equal the reference's; (3) round 0's rows at
+    /// `t = 1` and `t = 0` equal today's step (`gkr_round_gruen`) over the
+    /// middle layer the production fold makes, at the same point and `λ`;
+    /// (4) the last quarter's lower cell one off parts from the reference and
+    /// from today's `H(0)`, and leaves `H(1)`, which reads no lower cell;
+    /// (5) for the pair kernels, trading with the wrong lane parts.
+    fn equal_gate(variant: Variant) {
+        let _back = Back;
+        let be = backend().expect("a card");
+        let label = variant.label();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let low = 2usize;
+        let mut checked = 0;
+        let mut faults = 0;
+        for num_vars in [10usize, 12] {
+            let cells = 1usize << num_vars;
+            let m = num_vars - 2;
+            let (p, q) = (rng.limbs(cells), rng.limbs(cells));
+            let point = rng.limbs(m);
+            let lambda = rng.ext();
+            let stream = be.next_stream();
+
+            // Today's step over the middle layer, as the production fold makes it.
+            let tree = DeviceFractionTree::build(&p, &q).expect("the tree");
+            assert_eq!(tree.layer_num_vars(num_vars - 1), num_vars - 1);
+            let (mid_p, mid_q) = tree.layer_to_host(num_vars - 1).expect("the middle layer");
+            let middle = InputLayer::new(
+                stream.clone(),
+                crate::device::htod_or_trim(&stream, &mid_p).unwrap(),
+                crate::device::htod_or_trim(&stream, &mid_q).unwrap(),
+                num_vars - 1,
+            );
+            let mut today = middle.gruen(&point, low).expect("today's step");
+            let today_rows = fes(&today.round(None, &lambda, true).expect("today's round 0"));
+
+            let upload = |stream: &Arc<CudaStream>| {
+                let pd = Arc::new(crate::device::htod_or_trim(stream, &p).unwrap());
+                let qd = Arc::new(crate::device::htod_or_trim(stream, &q).unwrap());
+                (pd, qd)
+            };
+            let challenges: Vec<[u64; 3]> = (0..m).map(|_| rng.ext()).collect();
+            let lam = fe(&lambda);
+            let mut first: Vec<Fp3> = Vec::new();
+            for want_h0 in [true, false] {
+                let (pd, qd) = upload(&stream);
+                let mut step = DoubleStep::new(&stream, &pd, &qd, num_vars, &point, low)
+                    .expect("the double step");
+                let eq = fes(&step.eq_levels().expect("eq"));
+                let rounds = step.rounds();
+
+                // The host's quarters: `f[k]` for k = 0..4 numerators, 4..8 denominators.
+                let (hp, hq) = (fes(&p), fes(&q));
+                let stride = 1usize << m;
+                let mut f: Vec<Vec<Fp3>> = (0..8)
+                    .map(|k| {
+                        let src = if k < 4 { &hp } else { &hq };
+                        src[(k & 3) * stride..((k & 3) + 1) * stride].to_vec()
+                    })
+                    .collect();
+                let points: &[u64] = if want_h0 {
+                    &[1, 2, 3, 4, 0]
+                } else {
+                    &[1, 2, 3, 4]
+                };
+                let mut last_quarter = 0;
+                for j in 0..rounds {
+                    let fold_by = (j > 0).then(|| challenges[j - 1]);
+                    if let Some(s) = fold_by {
+                        let s = fe(&s);
+                        for fk in f.iter_mut() {
+                            let half = fk.len() / 2;
+                            let folded: Vec<Fp3> = (0..half)
+                                .map(|x| &fk[x] + &s * &(&fk[x + half] - &fk[x]))
+                                .collect();
+                            *fk = folded;
+                        }
+                    }
+                    let quarter = 1usize << (m - j - 1);
+                    last_quarter = quarter;
+                    let at = (1usize << low) + (1usize << rounds) - (1usize << (rounds - j));
+                    let mask = (1usize << low) - 1;
+                    let mut want = vec![Fp3::zero(); points.len()];
+                    for x in 0..quarter {
+                        let w = &eq[at + (x >> low)] * &eq[x & mask];
+                        let lo: [Fp3; 8] = std::array::from_fn(|k| f[k][x]);
+                        let hi: [Fp3; 8] = std::array::from_fn(|k| f[k][x + quarter]);
+                        for (row, t) in points.iter().enumerate() {
+                            let t = Fp3::from(*t);
+                            let v: [Fp3; 8] =
+                                std::array::from_fn(|k| &lo[k] + &t * &(&hi[k] - &lo[k]));
+                            want[row] = &want[row] + &w * composed(&v, &lam);
+                        }
+                    }
+                    let rows = step
+                        .round_enqueue(variant, fold_by.as_ref(), &lambda, want_h0)
+                        .expect("a round");
+                    let got = fes(&step.round_collect(rows).expect("its rows"));
+                    assert_eq!(
+                        got, want,
+                        "{label} 2^{num_vars} h0 {want_h0}, round {j}: the rows"
+                    );
+                    if j == 0 && want_h0 {
+                        first = got;
+                    }
+                    checked += 1;
+                }
+                // The quarters the last round leaves: 2·quarter cells each.
+                let raw_p = crate::readback::clone_dtoh(&stream, pd.as_ref()).unwrap();
+                let raw_q = crate::readback::clone_dtoh(&stream, qd.as_ref()).unwrap();
+                stream.synchronize().unwrap();
+                let (dp, dq) = (fes(&raw_p), fes(&raw_q));
+                for (k, fk) in f.iter().enumerate() {
+                    let dev = if k < 4 { &dp } else { &dq };
+                    let base = (k & 3) * stride;
+                    assert_eq!(
+                        &dev[base..base + 2 * last_quarter],
+                        &fk[..2 * last_quarter],
+                        "{label} 2^{num_vars} h0 {want_h0}: quarter {k} as the last round leaves it"
+                    );
+                }
+            }
+            // Round 0 at t = 1 and t = 0 against today's step: rows H(1) and H(0).
+            assert_eq!(
+                first[0], today_rows[0],
+                "{label} 2^{num_vars}: H(1) is today's"
+            );
+            assert_eq!(
+                first[4], today_rows[2],
+                "{label} 2^{num_vars}: H(0) is today's"
+            );
+
+            // The faults part.
+            let faulted = |fault: Fault| {
+                let (pd, qd) = upload(&stream);
+                let mut step = DoubleStep::new(&stream, &pd, &qd, num_vars, &point, low)
+                    .expect("a faulted step");
+                force_fault(fault);
+                let rows = step
+                    .round_enqueue(variant, None, &lambda, true)
+                    .expect("a faulted round");
+                force_fault(Fault::None);
+                fes(&step.round_collect(rows).expect("its rows"))
+            };
+            let bad = faulted(Fault::OneCell);
+            assert_ne!(
+                bad, first,
+                "{label} 2^{num_vars}: the off-by-one must part from the reference"
+            );
+            // The fault reads only a lower-half cell, so H(1) (built from the
+            // upper half alone) keeps today's value and H(0) must leave it.
+            assert_eq!(
+                bad[0], today_rows[0],
+                "{label} 2^{num_vars}: the off-by-one leaves H(1), which reads no lower cell"
+            );
+            assert_ne!(
+                bad[4], today_rows[2],
+                "{label} 2^{num_vars}: the off-by-one must part from today's H(0)"
+            );
+            faults += 1;
+            if variant.lanes() == 2 {
+                let bad = faulted(Fault::Exchange);
+                assert_ne!(
+                    bad, first,
+                    "{label} 2^{num_vars}: the wrong exchange must part from the reference"
+                );
+                faults += 1;
+            }
+        }
+        eprintln!(
+            "GKR2 GATE {label} PASS: {checked} card rounds at 2^10 and 2^12 (with and without \
+             H(0)) equal the composed pair, the folded quarters equal the reference's, round 0's \
+             H(1), H(0) equal today's step over the middle layer; {faults} faults parted"
+        );
+    }
+
+    #[test]
+    #[ignore = "a card; flips a process-global fault: run alone, --ignored --test-threads=1"]
+    fn equal_gate_v0() {
+        equal_gate(Variant::V0);
+    }
+
+    #[test]
+    #[ignore = "a card; flips a process-global fault: run alone, --ignored --test-threads=1"]
+    fn equal_gate_v1() {
+        equal_gate(Variant::V1);
+    }
+
+    #[test]
+    #[ignore = "a card; flips a process-global fault: run alone, --ignored --test-threads=1"]
+    fn equal_gate_v2() {
+        equal_gate(Variant::V2);
+    }
+
+    #[test]
+    #[ignore = "a card; flips a process-global fault: run alone, --ignored --test-threads=1"]
+    fn equal_gate_v3() {
+        equal_gate(Variant::V3);
+    }
+
+    #[test]
+    #[ignore = "a card; flips a process-global fault: run alone, --ignored --test-threads=1"]
+    fn equal_gate_v3b() {
+        equal_gate(Variant::V3b);
+    }
+
     /// Bytes a round moves by the kernels' own reads and writes: `factors`
     /// factors, each read at two cells a cube index (four with a fold, and
     /// two written back).
@@ -484,10 +769,16 @@ mod tests {
         factors * cells * quarter * 24
     }
 
+    /// Rounds over a cube of at least this many indices are the big,
+    /// bandwidth-bound ones.
+    const BIG: u64 = 4096;
+
     struct Arm {
         total_ms: f64,
         big_ms: f64,
         big_bytes: u64,
+        small_ms: f64,
+        small_n: usize,
     }
 
     /// Queues `rounds` rounds through `round`, an event after each, and
@@ -522,16 +813,17 @@ mod tests {
     }
 
     fn arm(per_round: &[(u64, f64)], factors: u64) -> Arm {
-        let big = 4096u64;
         Arm {
             total_ms: per_round.iter().map(|r| r.1).sum(),
-            big_ms: per_round.iter().filter(|r| r.0 >= big).map(|r| r.1).sum(),
+            big_ms: per_round.iter().filter(|r| r.0 >= BIG).map(|r| r.1).sum(),
             big_bytes: per_round
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| r.0 >= big)
+                .filter(|(_, r)| r.0 >= BIG)
                 .map(|(j, r)| round_bytes(factors, r.0, j > 0))
                 .sum(),
+            small_ms: per_round.iter().filter(|r| r.0 < BIG).map(|r| r.1).sum(),
+            small_n: per_round.iter().filter(|r| r.0 < BIG).count(),
         }
     }
 
@@ -545,14 +837,40 @@ mod tests {
         }
     }
 
-    /// The bench: at depths 24 and 22, the double step's card rounds over a
-    /// random layer against today's two steps over the same cells — the layer
-    /// itself, then the middle layer the production fold makes of it. Both
-    /// arms run every card round down to today's host tail (`2^6` cells), the
-    /// round kernel and its reduction each, with no read-back between rounds;
-    /// CUDA events time each round. Five repetitions, arm order alternating;
-    /// medians. `LAMBDA_VM_GKR4_BENCH_DEPTHS` (comma-separated) overrides the
-    /// depths.
+    /// One arm's medians over the repetitions.
+    #[derive(Default)]
+    struct Tally {
+        total: Vec<f64>,
+        big: Vec<f64>,
+        gbs: Vec<f64>,
+        small_us: Vec<f64>,
+        small_n: usize,
+    }
+
+    impl Tally {
+        fn push(&mut self, arms: &[&Arm]) {
+            let total: f64 = arms.iter().map(|a| a.total_ms).sum();
+            let big: f64 = arms.iter().map(|a| a.big_ms).sum();
+            let bytes: u64 = arms.iter().map(|a| a.big_bytes).sum();
+            let small: f64 = arms.iter().map(|a| a.small_ms).sum();
+            let n: usize = arms.iter().map(|a| a.small_n).sum();
+            self.total.push(total);
+            self.big.push(big);
+            self.gbs.push(bytes as f64 / big / 1e6);
+            self.small_us
+                .push(if n > 0 { small * 1e3 / n as f64 } else { 0.0 });
+            self.small_n = n;
+        }
+    }
+
+    /// The bench: at depths 24, 22 and 20, the double step's card rounds over
+    /// a random layer by each variant against today's two steps over the same
+    /// cells — the layer itself, then the middle layer the production fold
+    /// makes of it. Every arm runs every card round down to today's host tail
+    /// (`2^6` cells), the round kernel and its reduction each, with no
+    /// read-back between rounds; CUDA events time each round. Five
+    /// repetitions, the arm order rotating by one each repetition; medians.
+    /// `LAMBDA_VM_GKR4_BENCH_DEPTHS` (comma-separated) overrides the depths.
     #[test]
     #[ignore = "a card, gigabytes of layers: run alone, --ignored --test-threads=1"]
     fn the_double_step_against_todays_pair_on_the_card() {
@@ -564,10 +882,19 @@ mod tests {
                     .map(|d| d.trim().parse().expect("a depth"))
                     .collect()
             })
-            .unwrap_or_else(|| vec![24, 22]);
+            .unwrap_or_else(|| vec![24, 22, 20]);
         let low = 6usize;
         let reps = 5usize;
         let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        // Arm 0 is today's pair; arm 1 + i is `Variant::ALL[i]`.
+        let n_arms = 1 + Variant::ALL.len();
+        let arm_label = |a: usize| {
+            if a == 0 {
+                "pair"
+            } else {
+                Variant::ALL[a - 1].label()
+            }
+        };
         for depth in depths {
             let cells = 1usize << depth;
             let stream = be.next_stream();
@@ -593,85 +920,99 @@ mod tests {
             let challenges: Vec<[u64; 3]> = (0..depth).map(|_| rng.ext()).collect();
             let fold_by = |j: usize| (j > 0).then(|| challenges[j - 1]);
 
-            let (mut pair, mut step_a, mut step_b, mut double) = (vec![], vec![], vec![], vec![]);
-            let (mut pair_big, mut double_big) = (vec![], vec![]);
-            let (mut pair_gbs, mut double_gbs) = (vec![], vec![]);
-            for rep in 0..reps {
-                let run_pair = || {
-                    let a = InputLayer::new(
-                        stream.clone(),
-                        stream.clone_dtod(&g_p).unwrap(),
-                        stream.clone_dtod(&g_q).unwrap(),
-                        depth,
-                    );
-                    let mut a = a.gruen(&point_a, low).expect("step a");
-                    let b = InputLayer::new(
-                        stream.clone(),
-                        stream.clone_dtod(&m_p).unwrap(),
-                        stream.clone_dtod(&m_q).unwrap(),
-                        depth - 1,
-                    );
-                    let mut b = b.gruen(&point_b, low).expect("step b");
-                    let ra = a.rounds();
-                    let ta = timed(&stream, ra, depth - 1, |j| {
-                        a.round_enqueue(fold_by(j).as_ref(), &lambda, false)
-                    });
-                    let rb = b.rounds();
-                    let tb = timed(&stream, rb, depth - 2, |j| {
-                        b.round_enqueue(fold_by(j).as_ref(), &lambda, false)
-                    });
-                    (arm(&ta, 4), arm(&tb, 4))
-                };
-                let run_double = || {
-                    let pd = Arc::new(stream.clone_dtod(&g_p).unwrap());
-                    let qd = Arc::new(stream.clone_dtod(&g_q).unwrap());
-                    let mut d = DoubleStep::new(&stream, &pd, &qd, depth, &point_b, low)
-                        .expect("the double step");
-                    let rd = d.rounds();
-                    let td = timed(&stream, rd, depth - 2, |j| {
-                        d.round_enqueue(fold_by(j).as_ref(), &lambda, false)
-                    });
-                    arm(&td, 8)
-                };
-                let ((a, b), d) = if rep % 2 == 0 {
-                    let ab = run_pair();
-                    (ab, run_double())
-                } else {
-                    let d = run_double();
-                    (run_pair(), d)
-                };
-                let pair_ms = a.total_ms + b.total_ms;
-                eprintln!(
-                    "GKR4 REP depth {depth} rep {rep}: pair {pair_ms:.3} ms (step {depth} {:.3}, \
-                     step {} {:.3}) · double {:.3} ms",
-                    a.total_ms,
-                    depth - 1,
-                    b.total_ms,
-                    d.total_ms
+            let run_pair = || {
+                let a = InputLayer::new(
+                    stream.clone(),
+                    stream.clone_dtod(&g_p).unwrap(),
+                    stream.clone_dtod(&g_q).unwrap(),
+                    depth,
                 );
-                pair.push(pair_ms);
-                step_a.push(a.total_ms);
-                step_b.push(b.total_ms);
-                double.push(d.total_ms);
-                pair_big.push(a.big_ms + b.big_ms);
-                double_big.push(d.big_ms);
-                pair_gbs.push((a.big_bytes + b.big_bytes) as f64 / (a.big_ms + b.big_ms) / 1e6);
-                double_gbs.push(d.big_bytes as f64 / d.big_ms / 1e6);
+                let mut a = a.gruen(&point_a, low).expect("step a");
+                let b = InputLayer::new(
+                    stream.clone(),
+                    stream.clone_dtod(&m_p).unwrap(),
+                    stream.clone_dtod(&m_q).unwrap(),
+                    depth - 1,
+                );
+                let mut b = b.gruen(&point_b, low).expect("step b");
+                let ra = a.rounds();
+                let ta = timed(&stream, ra, depth - 1, |j| {
+                    a.round_enqueue(fold_by(j).as_ref(), &lambda, false)
+                });
+                let rb = b.rounds();
+                let tb = timed(&stream, rb, depth - 2, |j| {
+                    b.round_enqueue(fold_by(j).as_ref(), &lambda, false)
+                });
+                (arm(&ta, 4), arm(&tb, 4))
+            };
+            let run_double = |variant: Variant| {
+                let pd = Arc::new(stream.clone_dtod(&g_p).unwrap());
+                let qd = Arc::new(stream.clone_dtod(&g_q).unwrap());
+                let mut d = DoubleStep::new(&stream, &pd, &qd, depth, &point_b, low)
+                    .expect("the double step");
+                let rd = d.rounds();
+                let td = timed(&stream, rd, depth - 2, |j| {
+                    d.round_enqueue(variant, fold_by(j).as_ref(), &lambda, false)
+                });
+                arm(&td, 8)
+            };
+
+            let mut tallies: Vec<Tally> = (0..n_arms).map(|_| Tally::default()).collect();
+            let (mut step_a, mut step_b) = (vec![], vec![]);
+            for rep in 0..reps {
+                let order: Vec<usize> = (0..n_arms).map(|i| (i + rep) % n_arms).collect();
+                let mut shown = vec![0f64; n_arms];
+                for &a in &order {
+                    if a == 0 {
+                        let (x, y) = run_pair();
+                        tallies[0].push(&[&x, &y]);
+                        step_a.push(x.total_ms);
+                        step_b.push(y.total_ms);
+                        shown[0] = x.total_ms + y.total_ms;
+                    } else {
+                        let d = run_double(Variant::ALL[a - 1]);
+                        tallies[a].push(&[&d]);
+                        shown[a] = d.total_ms;
+                    }
+                }
+                let line: Vec<String> = (0..n_arms)
+                    .map(|a| format!("{} {:.3}", arm_label(a), shown[a]))
+                    .collect();
+                let order: Vec<&str> = order.iter().map(|&a| arm_label(a)).collect();
+                eprintln!(
+                    "GKR2 REP depth {depth} rep {rep} order {}: {} ms",
+                    order.join(","),
+                    line.join(" · ")
+                );
             }
-            let (pm, dm) = (median(pair), median(double));
-            let (pbm, dbm) = (median(pair_big), median(double_big));
+            let pair = &tallies[0];
+            let (pm, pbm) = (median(pair.total.clone()), median(pair.big.clone()));
+            let (pg, pus) = (median(pair.gbs.clone()), median(pair.small_us.clone()));
             eprintln!(
-                "GKR4 BENCH depth {depth}: pair {pm:.3} ms (step {depth} {:.3}, step {} {:.3}) · \
-                 double {dm:.3} ms · ratio {:.3} · big rounds (quarter >= 4096): pair {pbm:.3} ms \
-                 at {:.0} GB/s, double {dbm:.3} ms at {:.0} GB/s, ratio {:.3} · reps {reps}",
-                median(step_a),
+                "GKR2 PAIR depth {depth}: pair {pm:.3} ms (step {depth} {:.3}, step {} {:.3}) · \
+                 big rounds {pbm:.3} ms at {pg:.0} GB/s · small rounds {} at {pus:.1} us each · \
+                 reps {reps}",
+                median(step_a.clone()),
                 depth - 1,
-                median(step_b),
-                dm / pm,
-                median(pair_gbs),
-                median(double_gbs),
-                dbm / pbm
+                median(step_b.clone()),
+                pair.small_n
             );
+            for (i, variant) in Variant::ALL.iter().enumerate() {
+                let t = &tallies[1 + i];
+                let (dm, dbm) = (median(t.total.clone()), median(t.big.clone()));
+                let (dg, dus) = (median(t.gbs.clone()), median(t.small_us.clone()));
+                eprintln!(
+                    "GKR2 BENCH depth {depth} {}: pair {pm:.3} ms · double {dm:.3} ms · ratio \
+                     {:.3} · big rounds (quarter >= {BIG}): pair {pbm:.3} ms at {pg:.0} GB/s, \
+                     double {dbm:.3} ms at {dg:.0} GB/s, ratio {:.3} · small rounds: pair {} at \
+                     {pus:.1} us, double {} at {dus:.1} us · reps {reps}",
+                    variant.label(),
+                    dm / pm,
+                    dbm / pbm,
+                    pair.small_n,
+                    t.small_n
+                );
+            }
         }
     }
 }

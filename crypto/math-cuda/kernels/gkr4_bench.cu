@@ -37,7 +37,10 @@ __device__ __forceinline__ Fe3 b2_h(const Fe3 *v, const Fe3 &lambda) {
     return ext3::add(num, ext3::mul(lambda, ext3::mul(lo_q, hi_q)));
 }
 
-extern "C" __global__ __launch_bounds__(256) void gkr4_round_gruen(
+// The value-form round: one thread a cube index, the eight factors' values at each `t`, the
+// composition evaluated at every point. `gkr4_round_gruen` (the first bench's kernel, compiled as
+// it was) and `gkr4_round_gruen_lb2` (the same body held to two 256-thread blocks an SM) share it.
+__device__ __forceinline__ void gkr4_value_body(
     uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,
     uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
     const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
@@ -106,3 +109,278 @@ extern "C" __global__ __launch_bounds__(256) void gkr4_round_gruen(
         __syncthreads();
     }
 }
+
+extern "C" __global__ __launch_bounds__(256) void gkr4_round_gruen(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint32_t want_h0, uint32_t fault, uint64_t *__restrict__ d_partials) {
+    gkr4_value_body(p, q, stride, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi, e_lo, low, want_h0,
+                    fault, d_partials);
+}
+
+// The same round held to two 256-thread blocks an SM: does a register cap alone help, or spill?
+extern "C" __global__ __launch_bounds__(256, 2) void gkr4_round_gruen_lb2(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint32_t want_h0, uint32_t fault, uint64_t *__restrict__ d_partials) {
+    gkr4_value_body(p, q, stride, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi, e_lo, low, want_h0,
+                    fault, d_partials);
+}
+
+// ── The coefficient form ───────────────────────────────────────────────────────────────────────
+//
+// Write the middle layer's two halves at one node as `M_r = (X_r, Y_r)`, `r = 0, 1`, each the fold
+// of quarters `r` (`b₁ = 0`) and `r + 2` (`b₁ = 1`):
+//
+//   X_r = p_r·q_{r+2} + p_{r+2}·q_r,   Y_r = q_r·q_{r+2}
+//
+// and the parent is `N + λQ = X_0·Y_1 + X_1·Y_0 + λ·Y_0·Y_1 = (X_0 + λY_0)·Y_1 + X_1·Y_0`. Every
+// factor is linear in the round's `t`, so `X_r` and `Y_r` are quadratics, held by their values at
+// `t = 0` and `t = 1` and their `t²` coefficient: a product of two linear factors costs three
+// multiplications (`lo·lo`, `hi·hi`, `Δ·Δ`) where the value form costs one a point. The rows walk
+// `t = 1..4` by finite differences, additions only.
+
+// A quadratic in `t`: its values at 0 and 1 and its `t²` coefficient.
+struct B2Quad {
+    Fe3 v0, v1, c2;
+};
+
+// The product of two linear factors given at `t = 0` (`lo`) and `t = 1` (`hi`).
+__device__ __forceinline__ B2Quad b2_prod(const Fe3 &lo_a, const Fe3 &hi_a, const Fe3 &lo_b,
+                                          const Fe3 &hi_b) {
+    B2Quad r;
+    r.v0 = ext3::mul(lo_a, lo_b);
+    r.v1 = ext3::mul(hi_a, hi_b);
+    r.c2 = ext3::mul(ext3::sub(hi_a, lo_a), ext3::sub(hi_b, lo_b));
+    return r;
+}
+
+__device__ __forceinline__ B2Quad b2_qadd(const B2Quad &a, const B2Quad &b) {
+    B2Quad r;
+    r.v0 = ext3::add(a.v0, b.v0);
+    r.v1 = ext3::add(a.v1, b.v1);
+    r.c2 = ext3::add(a.c2, b.c2);
+    return r;
+}
+
+__device__ __forceinline__ B2Quad b2_qscale(const Fe3 &s, const B2Quad &a) {
+    B2Quad r;
+    r.v0 = ext3::mul(s, a.v0);
+    r.v1 = ext3::mul(s, a.v1);
+    r.c2 = ext3::mul(s, a.c2);
+    return r;
+}
+
+// A quadratic walked from `t = 1` by finite differences: `val` is its value at the current `t`,
+// `d` the step to the next, `dd` the constant second difference `2·c2`.
+struct B2Walk {
+    Fe3 val, d, dd;
+};
+
+__device__ __forceinline__ B2Walk b2_walk(const B2Quad &a) {
+    B2Walk w;
+    w.dd = ext3::add(a.c2, a.c2);
+    w.d = ext3::add(ext3::sub(a.v1, a.v0), w.dd);
+    w.val = a.v1;
+    return w;
+}
+
+__device__ __forceinline__ void b2_step(B2Walk &w) {
+    w.val = ext3::add(w.val, w.d);
+    w.d = ext3::add(w.d, w.dd);
+}
+
+// One factor's cells at cube index `x`, bound to `s` on the way in when the round folds (and
+// written back), as the value-form round reads them. `faulty` reads the lower cell one index off
+// in a round without a fold: a negative control's fault only.
+__device__ __forceinline__ void b2_factor(uint64_t *f, uint64_t x, uint64_t quarter, bool fold,
+                                          const Fe3 &s, bool faulty, Fe3 &lo, Fe3 &hi) {
+    if (fold) {
+        Fe3 a = b2_load(f + x * 3);
+        Fe3 b = b2_load(f + (x + quarter) * 3);
+        Fe3 c = b2_load(f + (x + 2 * quarter) * 3);
+        Fe3 d = b2_load(f + (x + 3 * quarter) * 3);
+        lo = ext3::add(a, ext3::mul(s, ext3::sub(c, a)));
+        hi = ext3::add(b, ext3::mul(s, ext3::sub(d, b)));
+        b2_store(f + x * 3, lo);
+        b2_store(f + (x + quarter) * 3, hi);
+    } else {
+        uint64_t at = faulty ? ((x + 1) & (quarter - 1)) : x;
+        lo = b2_load(f + at * 3);
+        hi = b2_load(f + (x + quarter) * 3);
+    }
+}
+
+__device__ __forceinline__ Fe3 b2_shfl(const Fe3 &v, int src) {
+    return ext3::make(__shfl_sync(0xffffffffu, v.a, src), __shfl_sync(0xffffffffu, v.b, src),
+                      __shfl_sync(0xffffffffu, v.c, src));
+}
+
+// The block's rows by warp shuffles: each warp sums its lanes in five levels, lane 0 of each warp
+// puts its sums in shared memory (`rows × warps` ext3), and thread 0 adds the warps' sums into
+// `d_partials[(row·gridDim.x + block)·3]`. Every lane of the block must reach it. `rows` is a
+// constant at every call, so the loops unroll and `acc` stays in registers.
+__device__ __forceinline__ void b2_block_rows(const Fe3 *acc, int rows,
+                                              uint64_t *__restrict__ d_partials) {
+    extern __shared__ uint64_t shared[];
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+#pragma unroll
+    for (int row = 0; row < 5; row++) {
+        if (row >= rows) break;
+        Fe3 v = acc[row];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v = ext3::add(v, b2_shfl(v, (int)(lane ^ off)));
+        if (lane == 0) b2_store(shared + ((uint64_t)row * warps + warp) * 3, v);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int row = 0; row < 5; row++) {
+            if (row >= rows) break;
+            Fe3 sum = ext3::zero();
+            for (unsigned w = 0; w < warps; w++)
+                sum = ext3::add(sum, b2_load(shared + ((uint64_t)row * warps + w) * 3));
+            b2_store(d_partials + ((uint64_t)row * gridDim.x + blockIdx.x) * 3, sum);
+        }
+    }
+}
+
+// The rows `H(1)..H(4)` (and `H(0)` as row 4 with `H0`) of `w·(Z(t)·W(t))`, `Z` already weighted.
+template <bool H0>
+__device__ __forceinline__ void b2_accumulate(const B2Quad &Z, const B2Quad &W, Fe3 (&acc)[5]) {
+    if (H0) acc[4] = ext3::add(acc[4], ext3::mul(Z.v0, W.v0));
+    B2Walk z = b2_walk(Z), u = b2_walk(W);
+    acc[0] = ext3::add(acc[0], ext3::mul(z.val, u.val));
+#pragma unroll
+    for (int t = 1; t < 4; t++) {
+        b2_step(z);
+        b2_step(u);
+        acc[t] = ext3::add(acc[t], ext3::mul(z.val, u.val));
+    }
+}
+
+// ── V2: one thread a cube index, the coefficient form ───────────────────────────────────────────
+//
+// The thread folds and combines quarters `0, 2` (`X_0, Y_0`), then quarters `1, 3` (`X_1, Y_1`), so
+// only four factors' cells need be in flight at once, then sums `w·[(X_0 + λY_0)(t)·Y_1(t) +
+// X_1(t)·Y_0(t)]` at `t = 1..4`. Same layout, rows and partials as the value-form round.
+template <bool H0>
+__device__ __forceinline__ void gkr2_v2_body(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint32_t fault, uint64_t *__restrict__ d_partials) {
+    Fe3 s = ext3::make(s0, s1, s2);
+    Fe3 lambda = ext3::make(l0, l1, l2);
+    uint64_t mask = ((uint64_t)1 << low) - 1;
+    Fe3 acc[5];
+#pragma unroll
+    for (int r = 0; r < 5; r++) acc[r] = ext3::zero();
+    for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < quarter;
+         x += (uint64_t)gridDim.x * blockDim.x) {
+        B2Quad X[2], Y[2];
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            // p_r, p_{r+2}, q_r, q_{r+2}
+            Fe3 a_lo, a_hi, b_lo, b_hi, c_lo, c_hi, d_lo, d_hi;
+            b2_factor(p + (uint64_t)r * stride * 3, x, quarter, fold, s, false, a_lo, a_hi);
+            b2_factor(p + (uint64_t)(r + 2) * stride * 3, x, quarter, fold, s, false, b_lo, b_hi);
+            b2_factor(q + (uint64_t)r * stride * 3, x, quarter, fold, s, false, c_lo, c_hi);
+            b2_factor(q + (uint64_t)(r + 2) * stride * 3, x, quarter, fold, s,
+                      fault == 1 && r == 1, d_lo, d_hi);
+            X[r] = b2_qadd(b2_prod(a_lo, a_hi, d_lo, d_hi), b2_prod(b_lo, b_hi, c_lo, c_hi));
+            Y[r] = b2_prod(c_lo, c_hi, d_lo, d_hi);
+        }
+        Fe3 w = ext3::mul(b2_load(e_hi + (x >> low) * 3), b2_load(e_lo + (x & mask) * 3));
+        B2Quad Z = b2_qscale(w, b2_qadd(X[0], b2_qscale(lambda, Y[0])));
+        B2Quad V = b2_qscale(w, X[1]);
+        b2_accumulate<H0>(Z, Y[1], acc);
+        b2_accumulate<H0>(V, Y[0], acc);
+    }
+    b2_block_rows(acc, H0 ? 5 : 4, d_partials);
+}
+
+#define GKR2_V2(NAME, H0, BOUNDS)                                                                 \
+    extern "C" __global__ BOUNDS void NAME(                                                       \
+        uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,    \
+        uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1,           \
+        uint64_t l2, const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo,        \
+        uint32_t low, uint32_t fault, uint64_t *__restrict__ d_partials) {                        \
+        gkr2_v2_body<H0>(p, q, stride, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi, e_lo, low,    \
+                         fault, d_partials);                                                      \
+    }
+GKR2_V2(gkr2_round_v2, false, __launch_bounds__(256, 2))
+GKR2_V2(gkr2_round_v2_h0, true, __launch_bounds__(256, 2))
+
+// ── V3: a thread pair a cube index ──────────────────────────────────────────────────────────────
+//
+// Lanes `2i, 2i + 1` take cube index `x`; lane `r = lane & 1` owns quarters `r` and `r + 2` of both
+// `p` and `q`, so it loads, folds and writes back four factors, as one thread of today's round
+// does. It makes `X_r, Y_r`, then `Z_r = X_r + λ_r·Y_r` with `λ_0 = λ`, `λ_1 = 0` (one code path),
+// trades `Y` with its partner (`W = Y_{1−r}`, nine limbs by `__shfl_sync`) and sums
+// `w·Z_r(t)·W(t)`: lane 0 adds `(X_0 + λY_0)·Y_1` and lane 1 `X_1·Y_0`, which is `N + λQ`.
+//
+// The lane loop runs whole warps: a warp past the last cube index still reaches every shuffle,
+// with zero values and a zero weight. `fault` 1 reads lane 1's last quarter one cell off in a round
+// without a fold; `fault` 2 trades with lane `^ 2` (the next pair) instead of the partner.
+template <bool H0>
+__device__ __forceinline__ void gkr2_v3_body(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint32_t fault, uint64_t *__restrict__ d_partials) {
+    Fe3 s = ext3::make(s0, s1, s2);
+    const unsigned lane = threadIdx.x & 31u;
+    const uint32_t r = lane & 1u;
+    Fe3 lambda_r = r == 0 ? ext3::make(l0, l1, l2) : ext3::zero();
+    const int partner = (int)(lane ^ (fault == 2 ? 2u : 1u));
+    uint64_t mask = ((uint64_t)1 << low) - 1;
+    uint64_t lanes = 2 * quarter;
+    uint64_t *pa = p + (uint64_t)r * stride * 3, *pb = p + (uint64_t)(r + 2) * stride * 3;
+    uint64_t *qa = q + (uint64_t)r * stride * 3, *qb = q + (uint64_t)(r + 2) * stride * 3;
+    Fe3 acc[5];
+#pragma unroll
+    for (int k = 0; k < 5; k++) acc[k] = ext3::zero();
+    for (uint64_t base = (uint64_t)blockIdx.x * blockDim.x + (threadIdx.x & ~31u); base < lanes;
+         base += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t g = base + lane;
+        bool live = g < lanes;
+        uint64_t x = g >> 1;
+        Fe3 a_lo = ext3::zero(), a_hi = ext3::zero(), b_lo = ext3::zero(), b_hi = ext3::zero();
+        Fe3 c_lo = ext3::zero(), c_hi = ext3::zero(), d_lo = ext3::zero(), d_hi = ext3::zero();
+        Fe3 w = ext3::zero();
+        if (live) {
+            b2_factor(pa, x, quarter, fold, s, false, a_lo, a_hi);
+            b2_factor(pb, x, quarter, fold, s, false, b_lo, b_hi);
+            b2_factor(qa, x, quarter, fold, s, false, c_lo, c_hi);
+            b2_factor(qb, x, quarter, fold, s, fault == 1 && r == 1, d_lo, d_hi);
+            w = ext3::mul(b2_load(e_hi + (x >> low) * 3), b2_load(e_lo + (x & mask) * 3));
+        }
+        B2Quad X = b2_qadd(b2_prod(a_lo, a_hi, d_lo, d_hi), b2_prod(b_lo, b_hi, c_lo, c_hi));
+        B2Quad Y = b2_prod(c_lo, c_hi, d_lo, d_hi);
+        B2Quad Z = b2_qscale(w, b2_qadd(X, b2_qscale(lambda_r, Y)));
+        B2Quad W;
+        W.v0 = b2_shfl(Y.v0, partner);
+        W.v1 = b2_shfl(Y.v1, partner);
+        W.c2 = b2_shfl(Y.c2, partner);
+        b2_accumulate<H0>(Z, W, acc);
+    }
+    b2_block_rows(acc, H0 ? 5 : 4, d_partials);
+}
+
+#define GKR2_V3(NAME, H0, BOUNDS)                                                                 \
+    extern "C" __global__ BOUNDS void NAME(                                                       \
+        uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,    \
+        uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1,           \
+        uint64_t l2, const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo,        \
+        uint32_t low, uint32_t fault, uint64_t *__restrict__ d_partials) {                        \
+        gkr2_v3_body<H0>(p, q, stride, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi, e_lo, low,    \
+                         fault, d_partials);                                                      \
+    }
+GKR2_V3(gkr2_round_v3, false, __launch_bounds__(256, 2))
+GKR2_V3(gkr2_round_v3_h0, true, __launch_bounds__(256, 2))
+// V3b: the same pair kernel at three blocks an SM (≤ 85 registers). Information only.
+GKR2_V3(gkr2_round_v3b, false, __launch_bounds__(256, 3))
+GKR2_V3(gkr2_round_v3b_h0, true, __launch_bounds__(256, 3))
