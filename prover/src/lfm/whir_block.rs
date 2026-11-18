@@ -1929,12 +1929,12 @@ pub fn verify_block_tree_grouped(
 
 /// [`verify_block_tree`] at the pinned format with the caller's NAMED choices:
 /// its group opening, its WHIR blowup, its round-0 leaf order, its round-0
-/// trees, its leaf scale, its leaves' query check, its GKR packing and its
-/// memory format (`verify-block --group / --blowup / --leaves / --trees /
-/// --leaf-double-from / --leaf-query / --argue-pack / --memory`), every
-/// other preset pinned as before
+/// trees, its leaf scale, its leaves' query check, its GKR packing, its
+/// memory format and its page runs (`verify-block --group / --blowup /
+/// --leaves / --trees / --leaf-double-from / --leaf-query / --argue-pack /
+/// --memory / --page-run`), every other preset pinned as before
 /// (the folds, stack, grind and caps are [`crate::zf_format::ZfFormat::DEFAULT`]'s,
-/// never the environment's). All eight are the verifier's constants; the proof
+/// never the environment's). All nine are the verifier's constants; the proof
 /// carries none of them. A caller cannot hand in a format of its own:
 /// `verify_block_tree_as` is crate-internal. The coset order is refused by name
 /// under a base whose trees do not take it, and one tree a run under the
@@ -1959,17 +1959,27 @@ pub fn verify_block_tree_at(
     leaf_query: LeafQuery,
     pack: multilinear::whir_chain::GkrPack,
     memory: crate::tables::fused_memory::MemoryFormat,
+    page_run_log2: u8,
 ) -> Result<(), String> {
     let presets = verifier_presets_at(
-        group, blowup, leaves, trees, leaf_scale, leaf_query, pack, memory,
+        group,
+        blowup,
+        leaves,
+        trees,
+        leaf_scale,
+        leaf_query,
+        pack,
+        memory,
+        page_run_log2,
     )?;
     verify_block_tree_as(elf_bytes, statement, top, &presets)
 }
 
 /// [`verify_block_tree_at`]'s presets: [`BlockFormat::pinned_with`] `group`
-/// with the eight named choices set (the GKR packing through
+/// with the nine named choices set (the GKR packing through
 /// [`BlockFormat::with_pack`], the memory format through
-/// [`BlockFormat::with_memory`]), the coset order refused under a base whose
+/// [`BlockFormat::with_memory`], the page runs through
+/// [`BlockFormat::with_page_run`]), the coset order refused under a base whose
 /// trees do not take it and one tree a run refused under the natural order
 /// ([`crate::zf_format::ZfFormat::check_trees`]), whatever the two were set to.
 #[allow(clippy::too_many_arguments)]
@@ -1982,10 +1992,12 @@ pub(crate) fn verifier_presets_at(
     leaf_query: LeafQuery,
     pack: multilinear::whir_chain::GkrPack,
     memory: crate::tables::fused_memory::MemoryFormat,
+    page_run_log2: u8,
 ) -> Result<VerifierPresets, String> {
     let mut format = BlockFormat::pinned_with(group)
         .with_pack(pack)
-        .with_memory(memory);
+        .with_memory(memory)
+        .with_page_run(page_run_log2);
     format.zf.whir_blowup = blowup.factor();
     format.zf.whir_leaves = leaves;
     format.zf.whir_trees = trees;
@@ -2368,6 +2380,40 @@ fn page_columns(
     })
 }
 
+/// A page table's preprocessed columns, as the leaf checks them: a page's
+/// ([`page_columns`] of its config), or under the word memory format's page
+/// runs a block's, `OFFSET` alone at the block's height (a zero block has no
+/// `INIT`; a private block's is committed). A block's table must be named
+/// for its class, base and pages, as the frame cut it, so a route never
+/// takes another table's block; a block under another memory format is a
+/// plan nobody derived.
+fn page_table_columns(
+    memory: crate::tables::fused_memory::MemoryFormat,
+    page: &crate::tables::page_w::PageTable,
+    configs: &[crate::tables::page::PageConfig],
+    name: &str,
+) -> Result<Vec<Vec<FE>>, String> {
+    use crate::tables::page_w::{self, PageTableKind};
+    if page.kind == PageTableKind::Page {
+        let config = configs
+            .get(page.first)
+            .ok_or_else(|| format!("page table {name} is past the page list"))?;
+        return page_columns(memory, config, name);
+    }
+    if memory != crate::tables::fused_memory::MemoryFormat::Words {
+        return Err(format!(
+            "page table {name}: a page block under the {memory:?} memory format, which has none"
+        ));
+    }
+    if name != page.name() && !route_fault!(OtherPageKind) {
+        return Err(format!(
+            "page table {name}: the verifier's page table here is {}",
+            page.name()
+        ));
+    }
+    page_w::page_table_preprocessed_columns(page, configs)
+}
+
 /// Table `table`'s route ([`route_for`]), held to the AIR
 /// ([`check_route_columns`]): the route checks exactly as many preprocessed
 /// columns as the table declares. A route that checked fewer would leave a
@@ -2452,13 +2498,14 @@ fn route_for(
         };
         return Ok(Route::Prepared { settled, num_vars });
     }
-    let pages = first_page..first_page + plan.frame.page_configs.len();
+    let pages = first_page..first_page + plan.frame.page_tables.len();
     if pages.contains(&table) {
         if route_fault!(NoPageLeg) {
             return Ok(Route::None);
         }
-        let config = &plan.frame.page_configs[table - first_page];
-        return page_columns(plan.memory, config, air.name()).map(Route::Page);
+        let page = &plan.frame.page_tables[table - first_page];
+        return page_table_columns(plan.memory, page, &plan.frame.page_configs, air.name())
+            .map(Route::Page);
     }
     // A CPU table's TIMESTAMP is checked by its closed form, by name and with its
     // AIR's one preprocessed column: never materialised (2^21 rows a table).
@@ -3385,6 +3432,9 @@ pub(crate) mod route_faults {
         /// A page table's columns are checked by nothing (its route checks
         /// none).
         NoPageLeg = 32,
+        /// A page block's route is not held to its table's name: it takes
+        /// whatever block the plan has at that place.
+        OtherPageKind = 64,
     }
 
     std::thread_local! {

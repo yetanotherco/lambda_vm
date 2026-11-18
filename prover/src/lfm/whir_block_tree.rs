@@ -5006,6 +5006,7 @@ pub fn verify_whir_block_tree_proof_grouped(
 ///         LeafQuery::Lean,
 ///         GkrPack::Off,
 ///         MemoryFormat::Words,
+///         0,
 ///     )
 /// }
 /// ```
@@ -5028,6 +5029,7 @@ pub fn verify_whir_block_tree_proof_at(
     leaf_query: LeafQuery,
     pack: GkrPack,
     memory: MemoryFormat,
+    page_run_log2: u8,
 ) -> Result<(), String> {
     let top = LfmProof {
         proof: proof.top_proof.clone(),
@@ -5045,6 +5047,7 @@ pub fn verify_whir_block_tree_proof_at(
         leaf_query,
         pack,
         memory,
+        page_run_log2,
     )
 }
 
