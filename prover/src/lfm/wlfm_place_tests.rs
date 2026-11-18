@@ -275,3 +275,187 @@ fn the_card_budget_knob_reads_a_percent_and_refuses_nonsense() {
         assert!(parse_card_budget(Some(bad)).is_err(), "{bad}");
     }
 }
+
+/// Restores this thread's revive-beside knob and phase-B faults.
+struct ReviveRestore;
+
+impl Drop for ReviveRestore {
+    fn drop(&mut self) {
+        super::wlfm::set_revive_beside_for_test(None);
+        super::wlfm::set_overlap_faults_for_test(Default::default());
+    }
+}
+
+/// `program`'s build in `place`, streamed under the revive-beside knob `on`
+/// and phase-B `faults`: its bytes and its groups' stamps.
+fn streamed_with(
+    program: &LfmProgram,
+    build: &WlfmBuild,
+    arenas: &[Vec<super::word::LfmWord>],
+    on: bool,
+    faults: stark::multilinear_block::OverlapFaults,
+) -> Result<(Vec<u8>, Vec<stark::multilinear_block::GroupStamps>), String> {
+    super::wlfm::set_revive_beside_for_test(Some(on));
+    super::wlfm::set_overlap_faults_for_test(faults);
+    let _ = super::wlfm::take_wlfm_stamps();
+    let filled = super::wlfm::execute_and_fill_unmerged(program, arenas, build.artifacts.hasher)?;
+    let proof =
+        super::wlfm::prove_wlfm_traces_as(build, filled, true, super::wlfm::WlfmProving::Streamed)?;
+    verify_wlfm(&build.artifacts, &proof, &proof.public_words)?;
+    let groups = super::wlfm::take_wlfm_stamps()
+        .map(|s| s.groups)
+        .unwrap_or_default();
+    Ok((bytes(&proof), groups))
+}
+
+/// ★ Phase B's revive beside the argue (`LAMBDA_VM_LEVELS_REVIVE_BESIDE`)
+/// moves no byte in any place: under both families, a retired build streamed
+/// with each group's retired prepared stack revived beside its upload and
+/// argue proves the held build's bytes, and says so in its stamps (some group
+/// revived beside, none fell back); held and host builds have nothing retired
+/// and revive nothing beside. Off, nothing is revived beside.
+#[test]
+fn a_prepared_stack_revived_beside_the_argue_proves_the_same_bytes_in_every_place() {
+    let _restore = ReviveRestore;
+    let _fast = test_format::set(Some(2));
+    let fixtures: [(LfmProgram, WlfmFamily, Vec<Vec<super::word::LfmWord>>); 2] = [
+        (
+            super::wlfm_tests::honest(),
+            WlfmFamily::P1,
+            super::wlfm_tests::arenas(),
+        ),
+        (super::b3l_wlfm_tests::honest(), WlfmFamily::B3, Vec::new()),
+    ];
+    for (program, family, arenas) in &fixtures {
+        let held = placed(
+            program,
+            super::wlfm_tests::HASHER,
+            *family,
+            StackPlace::Card,
+        );
+        let (want, _) = streamed_with(program, &held, arenas, false, Default::default())
+            .expect("the held build proves");
+        for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
+            let build = placed(program, super::wlfm_tests::HASHER, *family, place);
+            for on in [false, true] {
+                let (got, groups) = streamed_with(program, &build, arenas, on, Default::default())
+                    .unwrap_or_else(|e| panic!("{family:?} {place:?} {on}: {e}"));
+                assert!(
+                    got == want,
+                    "{family:?} {place:?} beside {on}: the held bytes"
+                );
+                let beside = groups.iter().filter(|s| s.revive_beside).count();
+                assert!(
+                    groups.iter().all(|s| !s.revive_fell_back),
+                    "{family:?} {place:?} {on}: nothing fell back"
+                );
+                if on && place == StackPlace::CardRetired {
+                    assert!(beside > 0, "{family:?}: a retired stack revived beside");
+                } else {
+                    assert_eq!(beside, 0, "{family:?} {place:?} {on}: nothing beside");
+                }
+            }
+        }
+    }
+}
+
+/// The revive beside falls back to today's revive in the group's openings,
+/// with the same bytes, where the plan refuses it, where it fails, and after a
+/// turn in which the card refused a promise (every later group). A moved
+/// prepared column is refused with the revive beside as without it.
+#[test]
+fn a_refused_or_failed_revive_beside_falls_back_to_the_same_bytes() {
+    use stark::multilinear_block::OverlapFaults;
+    let _restore = ReviveRestore;
+    let _fast = test_format::set(Some(2));
+    // One stacked polynomial a group: the fixture's prepared stacks fall in
+    // several groups, so the latch has a later group to send back.
+    let _groups = test_format::set_group_polys(1);
+    // The level-shaped probe: lean compressions over hinted leaves and paths,
+    // extension multiply-adds; its prepared stacks span several groups.
+    let (program, arenas) = super::levels_probe::level_program(4, 256);
+    let build = placed(
+        &program,
+        super::wlfm_tests::HASHER,
+        WlfmFamily::B3,
+        StackPlace::CardRetired,
+    );
+    let (want, groups) = streamed_with(&program, &build, &arenas, true, Default::default())
+        .expect("the retired build proves beside");
+    // Phase B's order is the groups' (0, 1, …): a place is its group.
+    let revived: Vec<usize> = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.revive_beside)
+        .map(|(g, _)| g)
+        .collect();
+    assert!(
+        revived.len() >= 2,
+        "two groups revived beside, so the latch has a later one ({revived:?})"
+    );
+    let first = revived[0];
+    for (what, faults) in [
+        (
+            "the plan refuses",
+            OverlapFaults {
+                revive_refused_at: Some(first),
+                ..Default::default()
+            },
+        ),
+        (
+            "the revive fails",
+            OverlapFaults {
+                revive_fails_at: Some(first),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let (got, groups) = streamed_with(&program, &build, &arenas, true, faults)
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(got == want, "{what}: the same bytes");
+        assert!(
+            groups[first].revive_fell_back && !groups[first].revive_beside,
+            "{what}: group {first} revived in its openings"
+        );
+    }
+    // A refusal in the first revived turn: every later group revives in its
+    // openings (the refused turn's own revive stands).
+    let (got, groups) = streamed_with(
+        &program,
+        &build,
+        &arenas,
+        true,
+        OverlapFaults {
+            refusal_at: Some(first),
+            ..Default::default()
+        },
+    )
+    .expect("proves after a refusal");
+    assert!(got == want, "after a refusal: the same bytes");
+    assert!(
+        groups[first].revive_beside,
+        "the refused turn's revive stands"
+    );
+    assert!(
+        groups[first + 1..].iter().all(|s| !s.revive_beside),
+        "after a refusal: no later revive beside"
+    );
+    // The control's tampered twin: a moved prepared column is refused beside.
+    let (moved, done) = build.with_prepared_column_moved();
+    assert!(done, "the fixture has a prepared column");
+    assert!(
+        streamed_with(&program, &moved, &arenas, true, Default::default()).is_err(),
+        "a moved prepared column is refused with the revive beside"
+    );
+}
+
+/// The revive-beside knob's name; it is off by default, and only `1` turns it
+/// on.
+#[test]
+fn the_revive_beside_knob_is_named_and_off_by_default() {
+    use super::wlfm::{REVIVE_BESIDE_ENV, revive_beside};
+    assert_eq!(REVIVE_BESIDE_ENV, "LAMBDA_VM_LEVELS_REVIVE_BESIDE");
+    if std::env::var_os(REVIVE_BESIDE_ENV).is_none() {
+        assert!(!revive_beside());
+    }
+}
