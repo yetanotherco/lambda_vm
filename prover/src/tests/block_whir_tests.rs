@@ -764,7 +764,10 @@ fn the_rest_is_cut_into_waves_within_the_budget() {
 /// [`Deviations::pages_first`] off): with b1 on three workers the rest streams
 /// and slides, where KECCAK_RND's and the page tables would otherwise go
 /// first, while with b1 off it is built whole in AIR order, so the partitions
-/// would differ by that order alone.
+/// would differ by that order alone. KECCAK_RND is built at the finish in every
+/// arm ([`finish_keccak_rnd`]): on a card build with b1 and b2 both on it would
+/// otherwise be handed out during the windows in groups of its own (its
+/// tables cut and filled from their records), which the other arms cannot do.
 #[test]
 fn the_rest_in_waves_and_the_finish_packed_move_no_byte() {
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -787,7 +790,7 @@ fn the_rest_in_waves_and_the_finish_packed_move_no_byte() {
                 &Deviations {
                     keccak_rnd_first: Some(false),
                     pages_first: Some(false),
-                    ..Deviations::default()
+                    ..finish_keccak_rnd()
                 },
             )
             .expect("prove");
