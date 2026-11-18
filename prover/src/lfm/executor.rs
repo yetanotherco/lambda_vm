@@ -1693,7 +1693,10 @@ struct WaveBuckets {
 }
 
 impl WaveBuckets {
-    fn build(levels: &LevelSchedule, need: &[u64]) -> Self {
+    /// `cached`: each instruction's bucket is found from the one before it
+    /// when they wait for the same groups (most neighbours do), and from the
+    /// map only otherwise. The same buckets.
+    fn build(levels: &LevelSchedule, need: &[u64], cached: bool) -> Self {
         let mut index: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
         let mut b = Self {
             masks: Vec::new(),
@@ -1702,16 +1705,25 @@ impl WaveBuckets {
             other_runs: Vec::new(),
             other_pos: Vec::new(),
         };
-        let bucket =
+        let mut last: Option<(u64, usize)> = None;
+        let mut bucket =
             |b: &mut Self, index: &mut std::collections::BTreeMap<u64, usize>, mask: u64| {
-                *index.entry(mask).or_insert_with(|| {
+                if cached
+                    && let Some((m, k)) = last
+                    && m == mask
+                {
+                    return k;
+                }
+                let k = *index.entry(mask).or_insert_with(|| {
                     b.masks.push(mask);
                     b.hash_runs.push(Vec::new());
                     b.hash_pos.push(Vec::new());
                     b.other_runs.push(Vec::new());
                     b.other_pos.push(Vec::new());
                     b.masks.len() - 1
-                })
+                });
+                last = Some((mask, k));
+                k
             };
         let push = |runs: &mut Vec<(u32, u32, u32)>, pos: &mut Vec<u32>, d: u32, p: u32| {
             match runs.last_mut() {
@@ -1786,6 +1798,8 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             groups,
             false,
             false,
+            None,
+            false,
         )
     }
 
@@ -1818,7 +1832,24 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         lean_tap: bool,
         bucketed: bool,
     ) -> Result<Self, LfmExecError> {
-        Self::pieced_with(program, pieces, hasher, lean_tap, bucketed)
+        Self::pieced_with(program, pieces, hasher, lean_tap, bucketed, false)
+    }
+
+    /// [`Self::new_pieced_bucketed`] with its setup made the fast way when
+    /// `setup_fast`: the level schedule built on a thread of its own while
+    /// this one makes the need pass, and the wave buckets built with each
+    /// instruction's bucket found from the one before it when they share
+    /// their groups. The same schedule, needs and buckets: the same
+    /// execution.
+    pub fn new_pieced_setup(
+        program: &'p LfmProgram,
+        pieces: Vec<ArenaPiece>,
+        hasher: &'p H,
+        lean_tap: bool,
+        bucketed: bool,
+        setup_fast: bool,
+    ) -> Result<Self, LfmExecError> {
+        Self::pieced_with(program, pieces, hasher, lean_tap, bucketed, setup_fast)
     }
 
     /// [`Self::new_pieced`] with, when `lean_tap`, a copy of every lean BLAKE3
@@ -1831,7 +1862,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         hasher: &'p H,
         lean_tap: bool,
     ) -> Result<Self, LfmExecError> {
-        Self::pieced_with(program, pieces, hasher, lean_tap, false)
+        Self::pieced_with(program, pieces, hasher, lean_tap, false, false)
     }
 
     fn pieced_with(
@@ -1840,6 +1871,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         hasher: &'p H,
         lean_tap: bool,
         bucketed: bool,
+        setup_fast: bool,
     ) -> Result<Self, LfmExecError> {
         let schema = &program.arena_schema.lens;
         let mut sorted = pieces.clone();
@@ -1895,9 +1927,28 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
                 _ => 0,
             }
         };
-        let t = Instant::now();
-        let need = Self::need_of_pieced(program, group_at);
-        let need_pass = t.elapsed().as_secs_f64();
+        let (need, need_pass, prebuilt) = if setup_fast {
+            // The schedule on a thread of its own, beside the need pass: both
+            // read the program and nothing else.
+            std::thread::scope(|scope| {
+                let schedule = scope.spawn(|| {
+                    let t = Instant::now();
+                    let levels = exec_schedule::build_with_merge(program, 1);
+                    (levels, t.elapsed().as_secs_f64())
+                });
+                let t = Instant::now();
+                let need = Self::need_of_pieced(program, group_at);
+                let need_pass = t.elapsed().as_secs_f64();
+                let prebuilt = schedule
+                    .join()
+                    .map_err(|_| LfmExecError::Internal("the schedule's thread panicked"))?;
+                Ok::<_, LfmExecError>((need, need_pass, Some(prebuilt)))
+            })?
+        } else {
+            let t = Instant::now();
+            let need = Self::need_of_pieced(program, group_at);
+            (need, t.elapsed().as_secs_f64(), None)
+        };
         let mut streamed = Self::start(
             program,
             hasher,
@@ -1907,6 +1958,8 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             groups,
             lean_tap,
             bucketed,
+            prebuilt,
+            setup_fast,
         )?;
         streamed.split.need_pass = need_pass;
         streamed.m.pieces = by_arena
@@ -1979,17 +2032,26 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         groups: u64,
         lean_tap: bool,
         bucketed: bool,
+        prebuilt: Option<(LevelSchedule, f64)>,
+        cached_buckets: bool,
     ) -> Result<Self, LfmExecError> {
         let schema = &program.arena_schema.lens;
         let t = Instant::now();
-        let levels = exec_schedule::build_with_merge(program, 1);
+        let (levels, schedule_secs) = match prebuilt {
+            Some(built) => built,
+            None => {
+                let levels = exec_schedule::build_with_merge(program, 1);
+                let secs = t.elapsed().as_secs_f64();
+                (levels, secs)
+            }
+        };
         let t_buckets = Instant::now();
-        let buckets = bucketed.then(|| WaveBuckets::build(&levels, &need));
+        let buckets = bucketed.then(|| WaveBuckets::build(&levels, &need, cached_buckets));
         let bucket_build = t_buckets.elapsed().as_secs_f64();
         // Bucketed, the waves read the buckets' sets, never `need` again.
         let need = if bucketed { Vec::new() } else { need };
         let mut split = ExecSplit {
-            depth_pass: t.elapsed().as_secs_f64(),
+            depth_pass: schedule_secs,
             levels: levels.levels(),
             ..ExecSplit::default()
         };

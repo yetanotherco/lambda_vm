@@ -333,6 +333,23 @@ pub fn bucket_waves() -> bool {
     })
 }
 
+/// `LAMBDA_VM_LEVELS_SETUP_FAST=1`: level 1's streamed execution makes its
+/// setup the fast way ([`super::executor::StreamedExecution::new_pieced_setup`]):
+/// the level schedule on a thread of its own beside the need pass, and the
+/// wave buckets found from each instruction's neighbour when they share
+/// their groups. On a real median the setup took ≈ 2.5 s after the program,
+/// and level 1's waves wait for it. The same schedule, needs and buckets:
+/// the same execution and proofs. Off by default (and for any word but `1`).
+pub const SETUP_FAST_ENV: &str = "LAMBDA_VM_LEVELS_SETUP_FAST";
+
+/// Whether level 1's execution makes its setup the fast way ([`SETUP_FAST_ENV`]).
+pub fn setup_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(SETUP_FAST_ENV).ok().as_deref())
+    })
+}
+
 /// How level 1's streamed execution met the base's groups, on the driver's
 /// clock: what it ran before any group (its setup and first wave), when the
 /// front landed and its wave, when each group's share arrived from phase B,
@@ -1240,12 +1257,13 @@ pub fn prove_block_levels(
                 (0..npieces).map(|_| std::cell::OnceCell::new()).collect();
             let mut by_group: Vec<Option<Vec<LfmWord>>> = vec![None; marks.len() - 1];
             let execute_from = now();
-            let mut ex = StreamedExecution::new_pieced_bucketed(
+            let mut ex = StreamedExecution::new_pieced_setup(
                 program,
                 arena_pieces,
                 &hasher,
                 lean_beside,
                 bucket_waves(),
+                setup_fast(),
             )
             .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
             let mut landing = Level1Landing {

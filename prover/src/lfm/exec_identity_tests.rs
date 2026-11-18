@@ -864,6 +864,67 @@ fn bucketed_waves_run_each_level_in_the_levels_own_order() {
     );
 }
 
+/// ★ A setup made the fast way (the schedule beside the need pass, the
+/// buckets found from a neighbour) is the setup: on the leaf case and every
+/// identity case, landing in several orders, the bucketed execution set up
+/// the fast way runs the same rows and instructions in the same order, wave
+/// by wave and level by level, and gives the serial reference's witness.
+#[test]
+fn a_fast_setup_runs_the_same_waves() {
+    use super::executor::{StreamedExecution, wave_trace};
+    let run = |case: &Case, pieces: &[super::executor::ArenaPiece], order: &[usize], fast: bool| {
+        let mut ex = StreamedExecution::new_pieced_setup(
+            &case.program,
+            pieces.to_vec(),
+            &case.hasher,
+            false,
+            true,
+            fast,
+        )
+        .unwrap_or_else(|e| panic!("{}: starts: {e:?}", case.name));
+        for &i in order {
+            let p = pieces[i];
+            let words =
+                &case.arenas[p.arena as usize][p.start as usize..(p.start + p.len) as usize];
+            ex.land_piece(p.group, words)
+                .unwrap_or_else(|e| panic!("{}: piece {i} lands: {e:?}", case.name));
+        }
+        ex.finish()
+            .unwrap_or_else(|e| panic!("{}: finishes: {e:?}", case.name))
+    };
+    let (leaf, halves) = one_arena_case();
+    let leaf_pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    let mut runs: Vec<(&Case, Vec<super::executor::ArenaPiece>, Vec<usize>)> = vec![
+        (&leaf, leaf_pieces.clone(), vec![0, 1, 2]),
+        (&leaf, leaf_pieces, vec![2, 0, 1]),
+    ];
+    let cases = cases();
+    for case in &cases {
+        let pieces = pieces_of(case, 3);
+        let n = pieces.len();
+        runs.push((case, pieces.clone(), (0..n).collect()));
+        runs.push((case, pieces, (0..n).rev().collect()));
+    }
+    for (case, pieces, order) in &runs {
+        let (plain, plain_trace) = wave_trace::record(|| run(case, pieces, order, false));
+        let (fast, fast_trace) = wave_trace::record(|| run(case, pieces, order, true));
+        assert!(
+            plain_trace == fast_trace,
+            "{}: {order:?}: the fast setup ran another order",
+            case.name
+        );
+        assert_executions_identical(case.name, case.program.num_addrs, &plain, &fast);
+        assert_executions_identical(case.name, case.program.num_addrs, &reference(case), &fast);
+    }
+}
+
 /// ★ The pieced execution's gate: one arena landing in pieces, in any order,
 /// gives the serial reference's witness word for word — on the leaf-shaped
 /// case in all six orders (its `HintOn` reads the first and the last piece)
