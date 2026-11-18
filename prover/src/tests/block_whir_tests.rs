@@ -1652,6 +1652,66 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
     }
 }
 
+/// ★ Phase B with the group of the most tables first
+/// ([`Deviations::phase_b_many_first`]) proves the bytes of phase B's own
+/// order under the deterministic grind (run this test alone), with the same
+/// partition, takes that group first (the stamps record the order), and
+/// verifies; off, the order is the prove's own.
+#[test]
+fn phase_b_many_first_proves_the_same_bytes() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    let proved = |many_first: Option<bool>| {
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                phase_b_many_first: many_first,
+                ..Deviations::default()
+            },
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "many first {many_first:?}");
+        (proof, stamps.phase_b_order)
+    };
+    let (own, own_order) = proved(Some(false));
+    let (default, default_order) = proved(None);
+    let (first, first_order) = proved(Some(true));
+    assert!(own.groups.len() > 3, "{} groups", own.groups.len());
+    let most = (0..own.groups.len())
+        .max_by(|&i, &j| {
+            own.groups[i]
+                .len()
+                .cmp(&own.groups[j].len())
+                .then(j.cmp(&i))
+        })
+        .expect("a group");
+    assert_eq!(default_order, own_order, "off by default");
+    assert_eq!(
+        first_order.first(),
+        Some(&most),
+        "the group of the most tables first"
+    );
+    if own_order.first() != Some(&most) {
+        assert_ne!(first_order, own_order, "the order moved");
+    }
+    assert_eq!(first.groups, own.groups, "the partition");
+    if crypto::grinding::deterministic() {
+        let bytes = |p: &BlockWhirProof| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                .expect("serialize")
+                .to_vec()
+        };
+        assert_eq!(bytes(&first), bytes(&own), "the proof's bytes");
+        assert_eq!(bytes(&default), bytes(&own), "the default's bytes");
+    }
+}
+
 /// ★ Phase B led by a leaf (the early leaf first, [`block_whir::PhaseBLead`]) on a
 /// streamed block: with a leaf offered before phase B starts, phase B moves
 /// that leaf's groups ahead at its first turn and takes that order (the
