@@ -201,13 +201,13 @@ fn the_beside_pool_prepares_the_same_level() {
     assert!(beside.chip_prefixes() == plain.chip_prefixes());
 }
 
-/// The bucket-waves knob's name; only `1` turns it on, and it is off by
-/// default.
+/// The bucket-waves knob's name; it is on by default, and only `0` turns it
+/// off.
 #[test]
-fn the_bucket_waves_knob_is_named_and_off_by_default() {
+fn the_bucket_waves_knob_is_named_and_on_by_default() {
     use super::levels::{BUCKET_WAVES_ENV, bucket_waves};
     assert_eq!(BUCKET_WAVES_ENV, "LAMBDA_VM_LEVELS_BUCKET_WAVES");
     if std::env::var_os(BUCKET_WAVES_ENV).is_none() {
-        assert!(!bucket_waves());
+        assert!(bucket_waves());
     }
 }
