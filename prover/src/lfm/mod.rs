@@ -65,6 +65,9 @@ pub mod p1w16_chip;
 pub mod p1w16_emit;
 pub mod p1w16_socket;
 pub mod per_table_aggregator;
+/// Where level 1's streamed execution ran (a report).
+#[cfg(feature = "parallel")]
+pub mod placement;
 pub(crate) mod prep_pinned;
 pub mod preprocessed;
 pub mod program_budget;

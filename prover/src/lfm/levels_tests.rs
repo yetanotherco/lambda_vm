@@ -889,6 +889,47 @@ fn rta_one_run(
         multilinear::logup::host_tree_lean(),
         super::levels::setup_fast(),
     );
+    if let Some(p) = &landing.placement {
+        let usage = |u: Option<super::placement::Usage>| match u {
+            Some((minor, major, vol, invol)) => {
+                format!(
+                    "faults minor {minor} major {major} · switches voluntary {vol} involuntary {invol}"
+                )
+            }
+            None => "unread".to_string(),
+        };
+        let mut totals = [0u64; super::placement::MAX_L3];
+        for (_, jobs) in &p.waves {
+            for (t, j) in totals.iter_mut().zip(jobs) {
+                *t += j;
+            }
+        }
+        let used = totals.iter().rposition(|&j| j > 0).map_or(1, |i| i + 1);
+        let per_l3 = |jobs: &[u64]| {
+            jobs[..used]
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        println!(
+            "RTA LEVEL1 PLACEMENT: driver cpu@l3 per wave {} · hash jobs per L3 per wave {} · hash jobs per L3 in all {} \
+             · driver thread {} · process {}",
+            list(
+                p.waves
+                    .iter()
+                    .map(|(cpu, _)| match cpu {
+                        Some((cpu, l3)) => format!("{cpu}@{l3}"),
+                        None => "?".to_string(),
+                    })
+                    .collect()
+            ),
+            list(p.waves.iter().map(|(_, jobs)| per_l3(jobs)).collect()),
+            per_l3(&totals),
+            usage(p.thread),
+            usage(p.process),
+        );
+    }
     if let Some(x) = &t.level1_exec {
         println!(
             "RTA LEVEL1 EXEC: schedule {:.3}s · need pass {:.3}s · buckets {:.3}s · first wave {:.3}s · setup {:.3}s · \
