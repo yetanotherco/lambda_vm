@@ -840,6 +840,74 @@ fn the_order_of_a_round_form_round_is_pinned() {
     });
 }
 
+/// ★ THE ORDER UNDER NONZERO GRINDS (5 out-of-domain bits, 6 query bits),
+/// both sides one log: after round 0's successor root, the out-of-domain
+/// point, its answer, the out-of-domain nonce, the batching challenge, the
+/// query nonce and only then round 0's positions. At every round the
+/// positions come right after a nonce: no round draws its positions before
+/// its query grind. THE MUTANT: the query grind moved after the positions on
+/// both sides (the two logs still agree, the grind buys nothing).
+#[test]
+fn the_order_of_a_round_form_round_is_pinned_under_nonzero_grinds() {
+    let n = 12;
+    let grind = GrindBits {
+        folding: 0,
+        ood: 5,
+        query: 6,
+    };
+    let cfg = ChainConfig::with_security_folds(1, 4, folds(Some(4)), n, 40, grind)
+        .with_whir_rounds(3, 40, n)
+        .unwrap();
+    check_round_form(&cfg).unwrap();
+    let f = mle(n, 2);
+    let z = point(n, 2);
+    let y = f.evaluate_in(&z).unwrap();
+    let (commitment, domain) = commit::<F, H>(&f, &cfg, true).unwrap();
+    let mut t = Recording {
+        inner: sponge(),
+        ops: Vec::new(),
+    };
+    let proof = prove::<F, Ext, _, H>(&f, &z, &commitment, &domain, &cfg, &mut t).unwrap();
+    let prover = t.ops;
+    let mut t = Recording {
+        inner: sponge(),
+        ops: Vec::new(),
+    };
+    verify::<F, Ext, _, H>(&proof, &commitment.root(), &z, y, &domain, &cfg, &mut t).unwrap();
+    assert_eq!(prover, t.ops, "the prover's and the verifier's transcripts");
+
+    let q0 = cfg.round_queries(n)[0];
+    let leaves0 = 1u64 << (n + 1 - 4);
+    let root = prover
+        .iter()
+        .position(|op| *op == Op::Bytes(32))
+        .expect("the successor's root");
+    assert_eq!(prover[..root], [Op::Fe, Op::Fe, Op::SampleFe].repeat(4));
+    let mut want = vec![
+        Op::Bytes(32),
+        Op::SampleFe,
+        Op::Fe,
+        Op::Bytes(8),
+        Op::SampleFe,
+        Op::Bytes(8),
+    ];
+    want.extend(std::iter::repeat_n(Op::SampleU64(leaves0), q0));
+    want.push(Op::SampleFe);
+    want.push(Op::Fe);
+    assert_eq!(prover[root..root + want.len()], want[..]);
+    // Every run of positions, at every round, starts right after a nonce.
+    let mut runs = 0;
+    for (i, op) in prover.iter().enumerate() {
+        let starts_a_run =
+            matches!(op, Op::SampleU64(_)) && !matches!(prover[i - 1], Op::SampleU64(_));
+        if starts_a_run {
+            runs += 1;
+            assert_eq!(prover[i - 1], Op::Bytes(8), "positions at op {i}");
+        }
+    }
+    assert!(runs >= 2, "{runs} rounds draw positions");
+}
+
 // ───────────────────────────── obligation 3: constants ───────────────────────
 
 /// ★ A proof under another shrink, another form, or another target is refused
@@ -1287,6 +1355,54 @@ fn a_chain_past_the_union_bound_is_refused() {
     ));
     let sized = whir(1, Some(4), 4, 3, n, 40);
     let s = single(&sized, n, 3);
+    check_single_ok(&s, &sized);
+    assert!(matches!(
+        check(&s, &s.proof, &small),
+        Err(Error::RoundFormUnion { .. })
+    ));
+}
+
+/// ★ THE UNION'S EDGE: a chain of exactly the union's round count proves and
+/// verifies under its config, and a chain of one round more is refused on
+/// both sides (the prover will not prove it; the verifier will not read a
+/// proof of it made under a config sized for it). THE MUTANT: a check that
+/// lets one round past the union through accepts the longer chain.
+#[test]
+fn a_chain_one_round_past_the_union_is_refused_and_one_at_it_is_taken() {
+    use crate::whir_chain::check_round_form_union;
+    let small = whir(1, Some(4), 4, 3, 8, 40);
+    let w = match small.format.rounds {
+        RoundForm::Whir(w) => w,
+        RoundForm::Fri => unreachable!(),
+    };
+    let at = (1..=20)
+        .filter(|&n| small.rounds(n) == w.union_rounds())
+        .max()
+        .expect("a height at the union");
+    let past = at + 1;
+    assert_eq!(small.rounds(past), w.union_rounds() + 1);
+    assert_eq!(check_round_form_union(&small, at), Ok(()));
+    assert_eq!(
+        check_round_form_union(&small, past),
+        Err(Error::RoundFormUnion {
+            rounds: w.union_rounds() + 1,
+            union: w.union_rounds(),
+        })
+    );
+    // At the union: proved and verified under the small config.
+    let s = single(&small, at, 5);
+    check_single_ok(&s, &small);
+    // One round past: the prover refuses it.
+    let f = mle(past, 5);
+    let z = point(past, 5);
+    let (commitment, domain) = commit::<F, H>(&f, &small, true).unwrap();
+    assert!(matches!(
+        prove::<F, Ext, _, H>(&f, &z, &commitment, &domain, &small, &mut sponge()),
+        Err(Error::RoundFormUnion { .. })
+    ));
+    // And the verifier refuses a proof of it made under a config sized for it.
+    let sized = whir(1, Some(4), 4, 3, past, 40);
+    let s = single(&sized, past, 5);
     check_single_ok(&s, &sized);
     assert!(matches!(
         check(&s, &s.proof, &small),
