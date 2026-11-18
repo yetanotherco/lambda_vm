@@ -204,6 +204,15 @@ pub struct GroupStamps {
     /// The group opened alone with a retired prepared stack, and its columns
     /// went off the card before that stack was revived.
     pub columns_gone_before_revive: bool,
+    /// Under the revive beside ([`BlockCommitted::with_prepared_revive_beside`]):
+    /// the group's retired prepared stack came back beside its upload and
+    /// argue, the revive's own seconds there, and of them the seconds the
+    /// driver waited for after the argue ended; or the plan (or a failed
+    /// revive) sent it back into the group's openings.
+    pub revive_beside: bool,
+    pub revive_beside_secs: f64,
+    pub revive_paid: f64,
+    pub revive_fell_back: bool,
     /// Under [`PhaseBOverlap::On`], the group's openings ran alone because an
     /// earlier transition saw the card refuse a promise.
     pub serial_after_refusal: bool,
@@ -1630,6 +1639,12 @@ pub struct OverlapFaults {
     /// The transition that argues the group at this place reads as one in
     /// which the card refused a promise.
     pub refusal_at: Option<usize>,
+    /// Under the revive beside: the plan refuses the group at this place's
+    /// revive beside its argue (it revives in its openings).
+    pub revive_refused_at: Option<usize>,
+    /// Under the revive beside: the group at this place's revive beside its
+    /// argue fails (it revives in its openings again).
+    pub revive_fails_at: Option<usize>,
 }
 
 /// Every count of a promise the card refused, or of a wait on every stream at
@@ -1694,6 +1709,10 @@ where
     /// Phase B puts the next group's columns on the card beside this group's
     /// argue ([`Self::with_phase_b_upload_beside`]); `true` unless set.
     upload_beside: bool,
+    /// Phase B revives a group's retired prepared stack beside the group's
+    /// upload and argue ([`Self::with_prepared_revive_beside`]); `false`
+    /// unless set.
+    revive_beside: bool,
     /// Phase B stamps its driver thread's schedstat a group turn
     /// ([`Self::with_sched_stamps`]).
     sched: bool,
@@ -2124,6 +2143,7 @@ where
             overlap: PhaseBOverlap::Off,
             overlap_faults: OverlapFaults::default(),
             upload_beside: true,
+            revive_beside: false,
             sched: false,
             ood,
             ood_unbound: false,
@@ -2157,6 +2177,18 @@ where
     /// [`Self::with_phase_b_upload_beside`] in place.
     pub fn set_phase_b_upload_beside(&mut self, beside: bool) {
         self.upload_beside = beside;
+    }
+
+    /// Phase B revives a group's retired prepared stack on a thread of its own
+    /// while the group's columns go up and its argue runs (`true`), instead of
+    /// inside the group's openings (`false`, the default), for a group that
+    /// opens alone and where the plan says the card holds the revive beside the
+    /// argue ([`revive_beside_fits`]); after a turn in which the card refused a
+    /// promise, every later group revives in its openings again. The same
+    /// revive over the same columns: the same proof.
+    pub fn with_prepared_revive_beside(mut self, beside: bool) -> Self {
+        self.revive_beside = beside;
+        self
     }
 
     /// A test's faults in phase B's overlap ([`OverlapFaults`]).
@@ -2878,7 +2910,9 @@ where
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
 {
     let own = open_own::<F, E, T, H>(argued, group, prepared, config, own_window, fails)?;
-    open_prepared::<F, E, T, H>(argued, group, prepared, deviations, config, own_window, own)
+    open_prepared::<F, E, T, H>(
+        argued, group, prepared, deviations, config, own_window, own, None,
+    )
 }
 
 /// A group's own opening done ([`open_own`]), for its prepared opening
@@ -2900,6 +2934,36 @@ where
     /// When the opening began, and the stream draws when the openings began.
     started: Instant,
     draws: (u64, u64),
+}
+
+/// Under the revive beside, the most card bytes a group's argue is planned to
+/// promise a committed cell of the group, its columns' upload included: the
+/// W-LFM levels' real median peaked at 41 (level 1's group 1: 17.81 GiB
+/// promised through the argue for 465.7 M cells) and the others at 23–27.
+const REVIVE_BESIDE_ARGUE_BYTES_PER_CELL: u64 = 48;
+
+/// Under the revive beside, the card kept free beside the plan.
+const REVIVE_BESIDE_MARGIN_BYTES: u64 = 1 << 30;
+
+/// Whether the card holds `retired`'s revive beside the argue of a group of
+/// `cells` committed cells: what the ledger holds now, the revive's planned
+/// bytes ([`RetiredStack::revive_card_bytes`]), the argue's planned bound and
+/// a margin, within the ledger's budget. Without a card (no budget) the revive
+/// is the host's and always fits.
+fn revive_beside_fits<F>(retired: &RetiredStack<F>, config: &ChainConfig, cells: usize) -> bool
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    let budget = multilinear::gpu::reserve_budget();
+    if budget == 0 {
+        return true;
+    }
+    let need = retired
+        .revive_card_bytes(config)
+        .saturating_add((cells as u64).saturating_mul(REVIVE_BESIDE_ARGUE_BYTES_PER_CELL))
+        .saturating_add(REVIVE_BESIDE_MARGIN_BYTES);
+    multilinear::gpu::ledger_reserved().saturating_add(need) <= budget
 }
 
 /// Whether `group`'s prepared stack was committed and let go: it is revived
@@ -2994,7 +3058,7 @@ where
 /// retired, over the prepared columns on the host). It reads the group's
 /// tables only for their column counts, so the caller may have let their
 /// columns go off the card between the halves.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn open_prepared<F, E, T, H>(
     argued: &mut Argued<F, E, T>,
     group: &[CommittedTable<'_, F, E>],
@@ -3003,6 +3067,7 @@ fn open_prepared<F, E, T, H>(
     config: &ChainConfig,
     own_window: bool,
     own: OwnOpened<F, E, H>,
+    pre_revived: Option<StackedCommitment<F, H>>,
 ) -> Result<(Opened<F, E>, Option<StackedCommitment<F, H>>), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -3065,11 +3130,13 @@ where
                 }
             }
             // A retired stack comes back for this opening alone, and goes
-            // when it ends.
+            // when it ends: revived here, or already beside the group's argue
+            // (the same revive over the same columns).
             let t_revive = Instant::now();
-            let revived = match &p.commitment {
-                PreparedCommitment::Held(_) => None,
-                PreparedCommitment::Retired(r) => {
+            let revived = match (&p.commitment, pre_revived) {
+                (PreparedCommitment::Held(_), _) => None,
+                (PreparedCommitment::Retired(_), Some(revived)) => Some(revived),
+                (PreparedCommitment::Retired(r), None) => {
                     Some((*r).clone().revive::<H, _>(p.columns, None, config)?)
                 }
             };
@@ -3293,6 +3360,7 @@ where
         overlap,
         overlap_faults,
         upload_beside,
+        revive_beside,
         sched,
         ood,
         ood_unbound,
@@ -3362,6 +3430,10 @@ where
     let _pinned = (overlap == PhaseBOverlap::Pinned).then(multilinear::gpu::pinned_readbacks);
     let mut prev: Option<Argued<F, E, T>> = None;
     let mut latched = false;
+    // Under the revive beside: a turn whose revive ran beside its argue and
+    // saw the card refuse a promise sends every later revive back into its
+    // group's openings.
+    let mut revive_latched = false;
     // The driver thread's schedstat at the start of the turn under way, and
     // its group: each turn's share is closed at the next turn's start.
     let mut turn_sched: Option<((u64, u64), usize)> = None;
@@ -3427,44 +3499,93 @@ where
             got: order.len(),
         })?;
 
-        let t = Instant::now();
-        let store = match pre_uploaded.take() {
-            Some(store) => store,
-            None => upload_group(&tables[at..at + size]),
-        };
-        if let Some(store) = &store {
-            let mut first = 0usize;
-            for table in tables[at..at + size].iter_mut() {
-                table.set_resident(store.clone(), first);
-                first += table.num_committed_columns();
+        // Under the revive beside, a group that opens alone with a retired
+        // prepared stack has it revived on a thread of its own (the card's
+        // background streams) while its columns go up and its argue runs,
+        // where the plan says the card holds both; otherwise in its openings.
+        let opens_alone = !(overlapping && !latched && next_g.is_some());
+        let revive_from: Option<(usize, &RetiredStack<F>)> =
+            if revive_beside && !revive_latched && opens_alone {
+                prepared
+                    .iter()
+                    .enumerate()
+                    .find_map(|(k, q)| match q.commitment {
+                        PreparedCommitment::Retired(r) if q.group == g => Some((k, r)),
+                        _ => None,
+                    })
+            } else {
+                None
+            };
+        let revive_from = revive_from.filter(|&(_, r)| {
+            let fits = overlap_faults.revive_refused_at != Some(p)
+                && revive_beside_fits(r, config, stamps[g].cells);
+            stamps[g].revive_fell_back |= !fits;
+            fits
+        });
+        let refusals_before_revive = revive_from.map(|_| phase_b_refusals());
+        let (
+            store,
+            t,
+            refusals_before,
+            points,
+            values,
+            proofs,
+            batched_argue,
+            (argue_result, argue_end, next_store, joined, opened, open_paid),
+            revived,
+        ) = std::thread::scope(|outer| {
+            let reviver = revive_from.map(|(k, r)| {
+                let columns = prepared[k].columns;
+                let fails = overlap_faults.revive_fails_at == Some(p);
+                outer.spawn(move || -> Result<(StackedCommitment<F, H>, f64), MlError> {
+                    let _background = multilinear::gpu::background_streams();
+                    if fails {
+                        return Err(MlError::DeviceFailed {
+                            stage: "a test's failed revive beside the argue",
+                        });
+                    }
+                    let t = Instant::now();
+                    let revived = r.clone().revive::<H, _>(columns, None, config)?;
+                    Ok((revived, t.elapsed().as_secs_f64()))
+                })
+            });
+            let t = Instant::now();
+            let store = match pre_uploaded.take() {
+                Some(store) => store,
+                None => upload_group(&tables[at..at + size]),
+            };
+            if let Some(store) = &store {
+                let mut first = 0usize;
+                for table in tables[at..at + size].iter_mut() {
+                    table.set_resident(store.clone(), first);
+                    first += table.num_committed_columns();
+                }
             }
-        }
-        stamps[g].upload_b += t.elapsed().as_secs_f64();
+            stamps[g].upload_b += t.elapsed().as_secs_f64();
 
-        // The group's tables, one after another, each leaving its columns
-        // claimed at its own point — or, batched, all of them in one argue —
-        // with the next group's upload beside them, and under the overlap the
-        // previous group's openings too.
-        let t = Instant::now();
-        stamps[g].argue_base = multilinear::gpu::ledger_reserved();
-        multilinear::gpu::reset_reserved_window();
-        multilinear::gpu::card_window_start();
-        let refusals_before = prev.as_ref().map(|_| phase_b_refusals());
-        let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
-        let mut values: Vec<FieldElement<E>> = Vec::new();
-        let mut proofs: Vec<TableProof<E>> = Vec::new();
-        let mut batched_argue: Option<BatchedArgue<E>> = None;
-        let all: &[CommittedTable<'_, F, E>] = &tables;
-        let group_ref = &all[at..at + size];
-        // Under `upload_beside` off the next group's columns go up at its own
-        // turn instead (`pre_uploaded` stays empty).
-        let next = next_g
-            .filter(|_| upload_beside)
-            .map(|next| &all[starts[next]..starts[next] + sizes[next]]);
-        let roots_ref = &roots;
-        let answers_ref = &answers;
-        let (argue_result, argue_end, next_store, joined, opened, open_paid) =
-            std::thread::scope(|scope| {
+            // The group's tables, one after another, each leaving its columns
+            // claimed at its own point — or, batched, all of them in one argue —
+            // with the next group's upload beside them, and under the overlap the
+            // previous group's openings too.
+            let t = Instant::now();
+            stamps[g].argue_base = multilinear::gpu::ledger_reserved();
+            multilinear::gpu::reset_reserved_window();
+            multilinear::gpu::card_window_start();
+            let refusals_before = prev.as_ref().map(|_| phase_b_refusals());
+            let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
+            let mut values: Vec<FieldElement<E>> = Vec::new();
+            let mut proofs: Vec<TableProof<E>> = Vec::new();
+            let mut batched_argue: Option<BatchedArgue<E>> = None;
+            let all: &[CommittedTable<'_, F, E>] = &tables;
+            let group_ref = &all[at..at + size];
+            // Under `upload_beside` off the next group's columns go up at its own
+            // turn instead (`pre_uploaded` stays empty).
+            let next = next_g
+                .filter(|_| upload_beside)
+                .map(|next| &all[starts[next]..starts[next] + sizes[next]]);
+            let roots_ref = &roots;
+            let answers_ref = &answers;
+            let argued_out = std::thread::scope(|scope| {
                 let uploader = next.map(|next| scope.spawn(move || upload_group(next)));
                 let opener = prev.as_mut().map(|earlier| {
                     let its_tables = &all[earlier.at..earlier.at + earlier.size];
@@ -3561,6 +3682,50 @@ where
                     waited.elapsed().as_secs_f64(),
                 )
             });
+            // The revive beside: what of it outlasted the argue and the upload.
+            let revived = reviver.map(|handle| {
+                let waited = Instant::now();
+                let revived = handle.join();
+                (revived, waited.elapsed().as_secs_f64())
+            });
+            (
+                store,
+                t,
+                refusals_before,
+                points,
+                values,
+                proofs,
+                batched_argue,
+                argued_out,
+                revived,
+            )
+        });
+        // A revive beside that failed goes back into the group's openings (the
+        // same revive, again); one whose thread panicked is refused.
+        let pre_revived = match revived {
+            None => None,
+            Some((Ok(Ok((revived, secs))), paid)) => {
+                stamps[g].revive_beside = true;
+                stamps[g].revive_beside_secs = secs;
+                stamps[g].revive_paid = paid;
+                Some(revived)
+            }
+            Some((Ok(Err(_)), paid)) => {
+                stamps[g].revive_fell_back = true;
+                stamps[g].revive_paid = paid;
+                None
+            }
+            Some((Err(_), _)) => {
+                return Err(MlError::DeviceFailed {
+                    stage: "the revive beside the argue",
+                });
+            }
+        };
+        if refusals_before_revive.is_some_and(|before| phase_b_refusals() > before)
+            || (refusals_before_revive.is_some() && overlap_faults.refusal_at == Some(p))
+        {
+            revive_latched = true;
+        }
         // The previous group's openings answer first: their error is the one
         // one group at a time would have met first. A panic on their thread
         // is refused, never resumed.
@@ -3679,6 +3844,7 @@ where
             config,
             true,
             own,
+            pre_revived,
         )?;
         stamps[g].encode = opened.encode;
         stamps[g].prepared_revive = opened.prepared_revive;
