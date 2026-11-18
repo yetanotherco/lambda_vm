@@ -934,8 +934,10 @@ where
                         // A chunk that reads a public factor (a selector) has no
                         // plan over the table's columns: built on the card from
                         // the columns it reads and its selectors
-                        // (`LAMBDA_VM_ARGUE_PUBLIC_COLUMNS`).
-                        (logup::public_columns() && trace.device_factors().is_none())
+                        // (`LAMBDA_VM_ARGUE_PUBLIC_COLUMNS`), in a bin that hands
+                        // its trees back. Elsewhere the table's factors are
+                        // lifted as before, which costs less where they fit.
+                        (logup::public_columns() && hand_back && trace.device_factors().is_none())
                             .then(|| {
                                 public_tried = true;
                                 logup::resident_tree_with_public(interactions, trace)

@@ -206,15 +206,19 @@ fn the_beside_pool_prepares_the_same_level() {
     }
 }
 
-/// The setup-fast knob's name; only `1` turns it on, and it is off by
-/// default.
+/// The setup-fast knob's name; it is on by default, and only `0` turns it
+/// off.
 #[test]
-fn the_setup_fast_knob_is_named_and_off_by_default() {
+fn the_setup_fast_knob_is_named_and_on_by_default() {
     use super::levels::{SETUP_FAST_ENV, setup_fast};
+    use super::wlfm_knobs::knob_word_off;
     assert_eq!(SETUP_FAST_ENV, "LAMBDA_VM_LEVELS_SETUP_FAST");
     if std::env::var_os(SETUP_FAST_ENV).is_none() {
-        assert!(!setup_fast());
+        assert!(setup_fast());
     }
+    assert!(knob_word_off(Some("0")));
+    assert!(!knob_word_off(Some("1")));
+    assert!(!knob_word_off(None));
 }
 
 /// The bucket-waves knob's name; it is on by default, and only `0` turns it
@@ -226,4 +230,42 @@ fn the_bucket_waves_knob_is_named_and_on_by_default() {
     if std::env::var_os(BUCKET_WAVES_ENV).is_none() {
         assert!(bucket_waves());
     }
+}
+
+/// A build's columns gathered on the pool (`LAMBDA_VM_LEVELS_PREPARE_PAR`) are
+/// the serial gather's, at widths from one column to many and heights below,
+/// at and above a task's block of rows; and the knob is named and opt-in.
+#[test]
+fn the_pooled_column_gather_is_the_serial_one() {
+    use super::compiler::ColumnGroup;
+    use math::field::element::FieldElement;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    for (width, rows) in [
+        (1usize, 1usize),
+        (1, 1 << 17),
+        (3, (1 << 16) + 8),
+        (7, 1 << 10),
+        (40, 1 << 12),
+    ] {
+        let data = (0..width * rows)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                FieldElement::from(seed)
+            })
+            .collect();
+        let group = ColumnGroup {
+            width,
+            real_rows: rows,
+            padded_rows: rows,
+            data,
+        };
+        assert_eq!(
+            super::wlfm::group_columns_par(&group),
+            super::wlfm::group_columns(&group),
+            "{width} columns of {rows} rows"
+        );
+    }
+    assert_eq!(super::wlfm::PREPARE_PAR_ENV, "LAMBDA_VM_LEVELS_PREPARE_PAR");
 }

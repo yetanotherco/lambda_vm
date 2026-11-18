@@ -333,20 +333,20 @@ pub fn bucket_waves() -> bool {
     })
 }
 
-/// `LAMBDA_VM_LEVELS_SETUP_FAST=1`: level 1's streamed execution makes its
+/// `LAMBDA_VM_LEVELS_SETUP_FAST`: level 1's streamed execution makes its
 /// setup the fast way ([`super::executor::StreamedExecution::new_pieced_setup`]):
 /// the level schedule on a thread of its own beside the need pass, and the
 /// wave buckets found from each instruction's neighbour when they share
 /// their groups. On a real median the setup took ≈ 2.5 s after the program,
 /// and level 1's waves wait for it. The same schedule, needs and buckets:
-/// the same execution and proofs. Off by default (and for any word but `1`).
+/// the same execution and proofs. On by default; only `0` turns it off.
 pub const SETUP_FAST_ENV: &str = "LAMBDA_VM_LEVELS_SETUP_FAST";
 
 /// Whether level 1's execution makes its setup the fast way ([`SETUP_FAST_ENV`]).
 pub fn setup_fast() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(SETUP_FAST_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(std::env::var(SETUP_FAST_ENV).ok().as_deref())
     })
 }
 
@@ -366,6 +366,8 @@ pub struct Level1Landing {
     pub arrivals: Vec<(usize, f64)>,
     /// When each piece landed, in landing order: `(piece, at, wave seconds)`.
     pub landed: Vec<(usize, f64, f64)>,
+    /// Where the execution ran, under `LAMBDA_VM_LEVELS_PLACEMENT`.
+    pub placement: Option<super::placement::Placement>,
 }
 
 /// Whether the driver lowers its beside work ([`BESIDE_NICE_ENV`]), or a
@@ -1028,6 +1030,8 @@ pub struct LevelsTimes {
 pub struct LevelBuild {
     pub place: StackPlace,
     pub prepare: f64,
+    /// The prepare's seconds by part: `[groups, columns, stacks]`.
+    pub prepare_split: [f64; 3],
     pub commit: f64,
     pub prefix: f64,
     pub cells: u64,
@@ -1295,6 +1299,18 @@ pub fn prove_block_levels(
             let held: Vec<std::cell::OnceCell<Vec<LfmWord>>> =
                 (0..npieces).map(|_| std::cell::OnceCell::new()).collect();
             let mut by_group: Vec<Option<Vec<LfmWord>>> = vec![None; marks.len() - 1];
+            let placing = super::placement::placement();
+            let usage_from = placing.then(|| {
+                (
+                    super::placement::thread_usage(),
+                    super::placement::process_usage(),
+                )
+            });
+            if placing {
+                let _ = super::placement::take_jobs();
+                super::placement::count_jobs(true);
+            }
+            let mut placed = super::placement::Placement::default();
             let execute_from = now();
             let mut ex = StreamedExecution::new_pieced_setup(
                 program,
@@ -1375,6 +1391,10 @@ pub fn prove_block_levels(
                         .flat_map(|h| by_group[h].take().unwrap_or_default())
                         .collect();
                     held[i].set(words).map_err(|_| "a piece landed twice")?;
+                    let cpu = placing.then(super::placement::this_cpu).flatten();
+                    if placing {
+                        let _ = super::placement::take_jobs();
+                    }
                     let t = std::time::Instant::now();
                     ex.land_piece(i, held[i].get().ok_or("a piece")?)
                         .map_err(|e| format!("level 1's piece {i}: {e:?}"))?;
@@ -1384,6 +1404,9 @@ pub fn prove_block_levels(
                         wave_secs_before += t.elapsed().as_secs_f64();
                     }
                     let secs = t.elapsed().as_secs_f64();
+                    if placing {
+                        placed.waves.push((cpu, super::placement::take_jobs()));
+                    }
                     landing.landed.push((i, now() - secs, secs));
                     landed[i] = true;
                 }
@@ -1395,6 +1418,16 @@ pub fn prove_block_levels(
                 .finish()
                 .map_err(|e| format!("level 1's execution: {e:?}"))?;
             let executed = now();
+            if let Some((thread_from, process_from)) = usage_from {
+                super::placement::count_jobs(false);
+                placed.thread = thread_from
+                    .zip(super::placement::thread_usage())
+                    .map(|(a, b)| super::placement::usage_delta(a, b));
+                placed.process = process_from
+                    .zip(super::placement::process_usage())
+                    .map(|(a, b)| super::placement::usage_delta(a, b));
+                landing.placement = Some(placed);
+            }
             let validated = match checker {
                 Some(handle) => Some((joined_validation(handle)?, now())),
                 None => None,
@@ -1459,7 +1492,7 @@ pub fn prove_block_levels(
                     .map_err(|_| "the builder's thread panicked".to_string());
                 Some(pre.and_then(|pre| {
                     let pre = pre?;
-                    let prepare = pre.secs();
+                    let prepare = (pre.secs(), pre.prepare_split());
                     let cells = pre.prepared_cells();
                     if proved.is_err() {
                         return Err("the base did not prove".to_string());
@@ -1534,7 +1567,7 @@ pub fn prove_block_levels(
         Some(built) => built?,
         None => {
             let pre = prepare_level(&program, family, level_rounds(&plan))?;
-            let (prepare, cells) = (pre.secs(), pre.prepared_cells());
+            let (prepare, cells) = ((pre.secs(), pre.prepare_split()), pre.prepared_cells());
             let settled = card_settle("base end");
             take_levels_budget(settled.map(|c| c.total))?;
             take_levels_pad()?;
@@ -1552,7 +1585,8 @@ pub fn prove_block_levels(
     times.built = committed;
     times.builds.push(LevelBuild {
         place: first.place(),
-        prepare,
+        prepare: prepare.0,
+        prepare_split: prepare.1,
         commit: first.secs().1,
         prefix: first.chip_prefix_secs(),
         cells,
@@ -1632,7 +1666,8 @@ pub fn prove_block_levels(
                 .join()
                 .map_err(|_| format!("level {}'s preparation panicked", k + 1))??;
             let execute_from = now();
-            let (prepare, cells) = (pre.secs(), pre.prepared_cells());
+            let (prepare, prepare_split, cells) =
+                (pre.secs(), pre.prepare_split(), pre.prepared_cells());
             // Its stacks on the card while its execution runs on the host.
             let committer = scope.spawn(move || {
                 commit_level(pre, k + 1).map(|build| {
@@ -1661,6 +1696,7 @@ pub fn prove_block_levels(
             times.builds.push(LevelBuild {
                 place: build.place(),
                 prepare,
+                prepare_split,
                 commit: build.secs().1,
                 prefix: build.chip_prefix_secs(),
                 cells,
