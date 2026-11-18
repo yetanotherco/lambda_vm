@@ -561,12 +561,12 @@ fn the_two_layer_ladder_is_deterministic() {
     assert!(run(&batched(27)) != a, "the ladders give the same bytes");
 }
 
-/// The device path (on the card where there is one; its host fallbacks
+/// ★ The device path (on the card where there is one; its host fallbacks
 /// where there is none) proves the host reference's bytes on the two-layer
-/// ladder: a device tree's two-layer step is stepped on the host over its
-/// layer, and its input layer, which the card keeps apart from its levels,
-/// is written on the host. Tables tall enough for the card's trees (CPU
-/// 2^13 rows) in one bin and in bins of 2^14 cells, and small ones.
+/// ladder: a card tree's two-layer steps run on the card's two-layer rounds
+/// (and they did, where there is a card), its odd tables' last steps on
+/// today's. Tables tall enough for the card's trees (CPU 2^13 rows) in one
+/// bin and in bins of 2^14 cells, and small ones.
 ///
 /// ```text
 /// cargo test --release -p stark --features cuda,multilinear/cuda --lib -- \
@@ -598,12 +598,18 @@ fn the_device_path_proves_the_host_references_bytes_on_the_two_layer_ladder() {
                 transcript.state(),
             )
         };
-        let (host, device) = (run(Where::Host), run(Where::Device));
+        let host = run(Where::Host);
+        let before = multilinear::gkr_gruen::gruen2_layers();
+        let device = run(Where::Device);
+        let card_steps = multilinear::gkr_gruen::gruen2_layers() - before;
         eprintln!(
-            "two-layer ladder a={a} pad={pad} cap={cap}: {} bytes, a device {}",
+            "two-layer ladder a={a} pad={pad} cap={cap}: {} bytes, a device {}, {card_steps} card two-layer steps",
             host.0.len(),
             a_device()
         );
+        if a_device() && a >= 12 {
+            assert!(card_steps > 0, "a={a}: the card ran two-layer steps");
+        }
         assert!(
             host == device,
             "a={a} pad={pad} cap={cap}: the bytes differ"
