@@ -118,6 +118,40 @@ impl<F: IsField + 'static> FractionTree<F> {
         })
     }
 
+    /// [`Self::build`] on the host whatever devices there are: every layer
+    /// folded here and kept. A reference for checks that a device's tree is
+    /// the host's.
+    #[doc(hidden)]
+    pub fn build_on_host(input: FractionLayer<F>) -> Result<Self, Error>
+    where
+        FieldElement<F>: Send + Sync,
+    {
+        let mut layers = vec![input];
+        while layers.last().expect("non-empty").num_vars() > 0 {
+            let next = layers.last().expect("non-empty").fold()?;
+            layers.push(next);
+        }
+        layers.reverse();
+        let top = &layers[0];
+        let output = (top.p.evals()[0].clone(), top.q.evals()[0].clone());
+        let num_layers = layers.len();
+        Ok(Self {
+            layers,
+            device: None,
+            num_layers,
+            output,
+        })
+    }
+
+    /// This tree with its host layers dropped and no device: a test's stand-in
+    /// for a tree whose layers live elsewhere (its `layers` empty), so a check
+    /// can be shown never to index them directly.
+    #[doc(hidden)]
+    pub fn without_host_layers(mut self) -> Self {
+        self.layers.clear();
+        self
+    }
+
     /// A tree a device already holds, layers and all.
     pub fn from_device(device: crate::gpu::DeviceTree) -> Result<Self, Error> {
         let num_layers = device.num_layers();

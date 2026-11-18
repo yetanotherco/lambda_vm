@@ -83,7 +83,9 @@ fn table_and_chunk() -> (TraceData<Gl, Ext3>, Vec<Interaction<Ext3>>) {
 }
 
 /// Every layer the card holds (all but an input layer it handed back by
-/// design) against the host tree's, and the outputs: how many layers compared.
+/// design) against the host reference's, and the outputs: how many layers
+/// compared. Both trees' layers are read through `layer_copy`, never indexed:
+/// a tree whose layers live on the card keeps none here.
 fn compare(card: &FractionTree<Ext3>, host: &FractionTree<Ext3>) -> Result<usize, String> {
     if card.num_layers() != host.num_layers() {
         return Err(format!(
@@ -92,24 +94,32 @@ fn compare(card: &FractionTree<Ext3>, host: &FractionTree<Ext3>) -> Result<usize
             host.num_layers()
         ));
     }
-    if card.output() != host.output() {
-        return Err("the outputs differ".into());
-    }
     let mut compared = 0usize;
     for i in 0..host.num_layers() {
+        let want = host
+            .layer_copy(i)
+            .ok_or_else(|| format!("the host reference has no layer {i}"))?;
         match card.layer_copy(i) {
             Some(layer) => {
-                let want = host.layer(i);
                 if layer.p.evals() != want.p.evals() || layer.q.evals() != want.q.evals() {
                     return Err(format!("layer {i} differs"));
                 }
                 compared += 1;
             }
-            None if i + 1 == host.num_layers() => {}
+            None if i + 1 == host.num_layers() && card.device().is_some() => {}
             None => return Err(format!("the card has no layer {i}")),
         }
     }
+    if card.output() != host.output() {
+        return Err("the outputs differ".into());
+    }
     Ok(compared)
+}
+
+/// The host reference: the tree folded on the host whatever devices there
+/// are, every layer kept here.
+fn host_tree(trace: &TraceData<Gl, Ext3>, chunk: &[Interaction<Ext3>]) -> FractionTree<Ext3> {
+    FractionTree::build_on_host(input_layer(chunk, &trace.factors().unwrap()).unwrap()).unwrap()
 }
 
 fn trees(shifted: bool) -> (FractionTree<Ext3>, FractionTree<Ext3>) {
@@ -118,8 +128,7 @@ fn trees(shifted: bool) -> (FractionTree<Ext3>, FractionTree<Ext3>) {
         "this test needs the card (box tier)"
     );
     let (trace, chunk) = table_and_chunk();
-    let host =
-        FractionTree::build(input_layer(&chunk, &trace.factors().unwrap()).unwrap()).unwrap();
+    let host = host_tree(&trace, &chunk);
     multilinear::logup::fault_public_selector_shift(shifted);
     let card = multilinear::logup::resident_tree_with_public(&chunk, &trace);
     multilinear::logup::fault_public_selector_shift(false);
@@ -146,14 +155,73 @@ fn a_public_reading_tree_on_the_card_is_the_hosts() {
     );
 }
 
-/// The check sees a selector one row off: with a test's fault moving each
-/// selector one row, the card's tree is not the host's.
+/// The check sees a selector one row off, and only it: the honest card tree
+/// compares equal in full (every layer read), and with a test's fault moving
+/// each selector one row the comparison reports a differing layer or output.
 #[test]
 #[ignore = "box tier: needs the card"]
 fn a_selector_one_row_off_builds_another_tree() {
-    let (card, host) = trees(true);
+    let (card, host) = trees(false);
+    let compared = compare(&card, &host).unwrap_or_else(|e| panic!("the honest tree: {e}"));
     assert!(
-        compare(&card, &host).is_err(),
-        "a selector one row off went unseen"
+        compared + 1 >= host.num_layers(),
+        "the honest comparison read {compared} layers"
     );
+    let (card, host) = trees(true);
+    let err = compare(&card, &host).expect_err("a selector one row off went unseen");
+    assert!(
+        err.contains("differs"),
+        "the shifted tree was refused for another reason: {err}"
+    );
+}
+
+/// On the laptop: the comparison never indexes a tree's layers directly. A
+/// stand-in for a card tree whose layers live elsewhere (its host `layers`
+/// empty, no device) is refused with a reason, never a panic; a tree compares
+/// equal to the same tree folded again, every layer read; a tree folded from
+/// another chunk is told apart.
+#[test]
+fn the_comparison_reads_layers_without_indexing_them() {
+    let num_vars = 6usize;
+    let rows = 1usize << num_vars;
+    let mut seed = 0xFEED_u64;
+    let columns: Vec<Mle<Gl>> = (0..3)
+        .map(|_| {
+            Mle::new(
+                (0..rows)
+                    .map(|_| FieldElement::<Gl>::from(next(&mut seed) % 0xFFFF_FFFF_0000_0001))
+                    .collect(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut kinds: Vec<FactorKind> = (0..3).map(FactorKind::direct).collect();
+    kinds.push(FactorKind::Public);
+    let public = vec![Selector::except_last(1).table::<Ext3>(num_vars).unwrap()];
+    let trace = TraceData::<Gl, Ext3>::new(columns, kinds, public).unwrap();
+    let chunk = vec![Interaction::new(
+        Affine::factor(3),
+        Affine::new(
+            vec![(0, EE::from(5u64)), (2, EE::from(7u64))],
+            EE::from(11u64),
+        ),
+    )];
+    let host = host_tree(&trace, &chunk);
+    assert_eq!(
+        compare(&host_tree(&trace, &chunk), &host),
+        Ok(host.num_layers())
+    );
+    let empty = host_tree(&trace, &chunk).without_host_layers();
+    let err = compare(&empty, &host).expect_err("an empty stand-in compares nothing");
+    assert!(err.contains("has no layer"), "{err}");
+    // The reference side too: the bug a card run met was a reference built
+    // on the card, its host layers empty, indexed directly.
+    let empty = host_tree(&trace, &chunk).without_host_layers();
+    let err = compare(&host, &empty).expect_err("an empty reference compares nothing");
+    assert!(err.contains("the host reference has no layer"), "{err}");
+    let other = vec![Interaction::new(
+        Affine::factor(1),
+        Affine::new(vec![(2, EE::from(3u64))], EE::from(9u64)),
+    )];
+    assert!(compare(&host_tree(&trace, &other), &host).is_err());
 }
