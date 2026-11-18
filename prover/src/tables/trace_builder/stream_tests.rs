@@ -2093,14 +2093,15 @@ fn the_keccak_w_split_streams_the_same_tables() {
     assert!(fills > 0, "no KECCAK_W table was split");
 }
 
-/// The KECCAK_W split's knob: on at `1` alone; its bounds cut a 2^17-row table
-/// into eight parts and keep a table under two parts' rows whole.
+/// The KECCAK_W split's knob: on unless `0` (the rollback); its bounds cut a
+/// 2^17-row table into eight parts and keep a table under two parts' rows
+/// whole.
 #[test]
-fn the_keccak_w_split_is_off_by_default_and_cuts_eight_parts() {
+fn the_keccak_w_split_is_on_by_default_and_cuts_eight_parts() {
     use super::{KECCAK_W_SPLIT_MIN_ROWS, keccak_w_split_from};
-    assert!(!keccak_w_split_from(None));
+    assert!(keccak_w_split_from(None));
     assert!(!keccak_w_split_from(Some("0")));
-    assert!(!keccak_w_split_from(Some("on")));
+    assert!(!keccak_w_split_from(Some(" 0\n")));
     assert!(keccak_w_split_from(Some("1")));
     assert!(keccak_w_split_from(Some(" 1\n")));
     let b = crate::tables::gpack::row_bounds_at(

@@ -1207,6 +1207,16 @@ fn a_block_with_a_negative_keccak_multiplicity_is_refused() {
     assert!(!verify(&negative, &elf, &format));
 }
 
+/// The default deviations with KECCAK_RND built at the finish
+/// ([`Deviations::stream_keccak_rnd`] off): for the tests of the finish's
+/// KECCAK_RND tables, its records and the regenerators' classes.
+pub(crate) fn finish_keccak_rnd() -> Deviations {
+    Deviations {
+        stream_keccak_rnd: Some(false),
+        ..Deviations::default()
+    }
+}
+
 pub(crate) fn streamed(
     max_rows: MaxRowsConfig,
     keccak_rnd_rows_log2: usize,
@@ -1491,11 +1501,11 @@ fn the_shadow_regenerates_every_streamed_chunk_and_moves_no_byte() {
                 &ProofOptions::default_test_options(),
                 &format,
                 &o,
-                &Deviations::default(),
+                &finish_keccak_rnd(),
             )
             .expect("prove");
             assert!(plain_stamps.regen.is_none(), "off records nothing");
-            let (proof, stamps) = shadowed(&elf, &format, &o, &Deviations::default());
+            let (proof, stamps) = shadowed(&elf, &format, &o, &finish_keccak_rnd());
             let at = format!("{name}, {workers} layout threads, ops dropped {drop_ops}");
             let r = stamps.regen.as_ref().expect("the shadow's readout");
             let lines = r.lines.join("\n");
@@ -2169,6 +2179,9 @@ fn regenerated_with(
     let deviations = Deviations {
         card_fill: deviations.card_fill.or(Some(false)),
         card_fill_streamed: deviations.card_fill_streamed.or(Some([false, false])),
+        // KECCAK_RND built at the finish unless a test asks otherwise: the
+        // rest's regenerator then rebuilds its tables with LT's.
+        stream_keccak_rnd: deviations.stream_keccak_rnd.or(Some(false)),
         ..deviations
     };
     prove_block_whir_with(
@@ -2231,7 +2244,7 @@ fn live_regeneration_proves_the_same_bytes() {
             .to_vec()
     };
     let (plain, plain_stamps) =
-        regenerated(&elf, &format, RegenMode::Off, Deviations::default()).expect("prove");
+        regenerated(&elf, &format, RegenMode::Off, finish_keccak_rnd()).expect("prove");
     assert!(plain_stamps.regen.is_none());
     assert!(plain_stamps.drops.is_none(), "{:?}", plain_stamps.drops);
     let streamed = plain_stamps.streamed.1;
@@ -2248,7 +2261,7 @@ fn live_regeneration_proves_the_same_bytes() {
             mode,
             Deviations {
                 memory_target: target,
-                ..Deviations::default()
+                ..finish_keccak_rnd()
             },
             MaxRowsConfig::small(),
             |o| o.phase_b_overlap = overlap,
@@ -2310,7 +2323,7 @@ fn live_regeneration_proves_the_same_bytes() {
         RegenMode::Auto,
         Deviations {
             memory_target: Some(u64::MAX),
-            ..Deviations::default()
+            ..finish_keccak_rnd()
         },
     )
     .expect("prove");
@@ -2962,7 +2975,7 @@ fn keccak_rnd_first_is_the_default_moves_the_partition_and_verifies() {
             &o,
             &Deviations {
                 keccak_rnd_first,
-                ..Deviations::default()
+                ..finish_keccak_rnd()
             },
         );
         assert!(verify(&proof, &elf, &format), "{what}");
@@ -3041,7 +3054,7 @@ fn the_rest_airs_built_beside_prove_the_same_bytes() {
             &o,
             &Deviations {
                 rest_airs_beside: Some(beside),
-                ..Deviations::default()
+                ..finish_keccak_rnd()
             },
         )
         .expect("prove");
@@ -3093,7 +3106,7 @@ fn an_early_keccak_rnd_table_laid_out_with_another_air_is_refused() {
         &Deviations {
             rest_airs_beside: Some(true),
             rest_airs_beside_misnamed: true,
-            ..Deviations::default()
+            ..finish_keccak_rnd()
         },
     );
     let Err(e) = refused else {
@@ -5161,7 +5174,7 @@ fn keccak_rnd_filled_from_records_moves_no_byte() {
                 &o,
                 &Deviations {
                     card_fill: Some(card_fill),
-                    ..Deviations::default()
+                    ..finish_keccak_rnd()
                 },
             )
             .expect("prove");
@@ -5296,7 +5309,7 @@ fn a_wrong_records_table_is_refused_by_the_verifier() {
         &Deviations {
             card_fill: Some(true),
             card_fill_records_fault: 1,
-            ..Deviations::default()
+            ..finish_keccak_rnd()
         },
     )
     .unwrap_or_else(|e| panic!("the prover refused ({e:?}): the verifier was never asked"));
@@ -5311,13 +5324,14 @@ fn a_wrong_records_table_is_refused_by_the_verifier() {
 }
 
 /// ★ KECCAK_RND handed out during the windows ([`Deviations::stream_keccak_rnd`],
-/// the `LAMBDA_VM_STREAM_KECCAK_RND` knob): with the card filling KECCAK_RND,
-/// each table whose operations are all in before the run ends goes out as its
-/// records with the streamed chunks, the finish holds the others, and the
-/// proof verifies with the same tables and statement counts and a partition
-/// of its own (the prover's, bound in the statement). Off, unset and `false`
-/// prove the same partition; under the deterministic grind their bytes are
-/// equal, and the streamed arm's bytes are the same twice.
+/// the `LAMBDA_VM_STREAM_KECCAK_RND` knob, on by default): with the card
+/// filling KECCAK_RND, each table whose operations are all in before the run
+/// ends goes out as its records with the streamed chunks, the finish holds the
+/// others, and the proof verifies with the same tables and statement counts
+/// and a partition of its own (the prover's, bound in the statement). Unset
+/// proves the partition of `true`; under the deterministic grind their bytes
+/// are equal, and the streamed arm's bytes are the same twice. `false` (the
+/// rollback) builds every KECCAK_RND table at the finish.
 #[test]
 fn keccak_rnd_streamed_during_the_windows_proves_and_verifies() {
     let _fills = records_fill_lock();
@@ -5366,7 +5380,7 @@ fn keccak_rnd_streamed_during_the_windows_proves_and_verifies() {
         tables - streamed,
         "the finish holds the ones not streamed"
     );
-    assert_eq!(unset.groups, off.groups, "unset is off");
+    assert_eq!(unset.groups, on.groups, "unset is on");
     assert_eq!(on.table_num_vars, off.table_num_vars);
     assert_eq!(
         format!("{:?}", on.table_counts),
@@ -5377,7 +5391,7 @@ fn keccak_rnd_streamed_during_the_windows_proves_and_verifies() {
         "the streamed tables kept the partition"
     );
     if crypto::grinding::deterministic() {
-        assert_eq!(bytes(&unset), bytes(&off), "unset is off, byte for byte");
+        assert_eq!(bytes(&unset), bytes(&on), "unset is on, byte for byte");
         let (again, _) = proved(Some(true));
         assert_eq!(bytes(&on), bytes(&again), "the streamed arm, twice");
     }
@@ -5602,7 +5616,7 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
             let (host, host_stamps) = proved(Deviations {
                 card_fill: Some(false),
                 card_fill_streamed: Some([false, false]),
-                ..Deviations::default()
+                ..finish_keccak_rnd()
             });
             let off = host_stamps.windows.card_fill;
             assert_eq!(
@@ -5996,7 +6010,7 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
     assert!(stamps.windows.card_fill.records_bytes > 0);
     assert_eq!(released(&stamps), 0, "no spill: no records let go");
     let (built, stamps) =
-        regenerated(&elf, &format, RegenMode::Always, Deviations::default()).expect("prove");
+        regenerated(&elf, &format, RegenMode::Always, finish_keccak_rnd()).expect("prove");
     let all = readout(&stamps);
     assert_eq!(as_records(&all), 0, "{:?}", all.lines);
     let (parked, stamps) = regenerated(
@@ -6177,7 +6191,7 @@ fn row_families_filled_from_their_rows_move_no_byte() {
                 card_fill: Some(false),
                 card_fill_streamed: Some([false, false]),
                 card_fill_rows: Some(RowFamilies::NONE),
-                ..Deviations::default()
+                ..finish_keccak_rnd()
             });
             let off = host_stamps.windows.card_fill;
             assert!(
