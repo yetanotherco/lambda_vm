@@ -1436,6 +1436,56 @@ fn keccak_rnd_first_or_default(deviation: Option<bool>) -> bool {
     deviation.unwrap_or(true)
 }
 
+/// The knob of [`pages_first`].
+const PAGES_FIRST_ENV: &str = "LAMBDA_VM_PAGES_FIRST";
+
+/// Whether the streamed finish hands the page tables on right after
+/// KECCAK_RND's ([`WindowedTraceBuilder::pages_first`]) when it slides: a
+/// deviation's choice, else `LAMBDA_VM_PAGES_FIRST` (off by default). The
+/// group the page tables fill (hundreds of them) is then committed and argued
+/// early instead of near the end, so a level proved beside phase B receives
+/// it while phase B still runs. The tables are the same; the groups, and so
+/// the proof's bytes, are not; the verifier takes any partition the statement
+/// declares.
+fn pages_first(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => parse_pages_first(std::env::var(PAGES_FIRST_ENV).ok().as_deref()),
+    }
+}
+
+/// `LAMBDA_VM_PAGES_FIRST`: unset, empty or `0` (the default) keeps AIR
+/// order after KECCAK_RND; `1` hands the page tables on next. Anything else
+/// refuses the prove.
+fn parse_pages_first(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{PAGES_FIRST_ENV}={v}: 0 (the default: AIR order after KECCAK_RND) or 1 (the page \
+             tables next)"
+        ))),
+    }
+}
+
+/// The page tables' positions in the run's AIR order, each named for a page
+/// (`PAGE…`): the positions the finish hands on after KECCAK_RND's under
+/// [`pages_first`].
+pub(crate) fn page_positions(airs: &VmAirs) -> Result<Vec<usize>, Error> {
+    let first = first_page_index(airs)?;
+    let refs = airs.air_refs();
+    let range = first..first + airs.pages.len();
+    for p in range.clone() {
+        let name = refs.get(p).map(|air| air.name());
+        if !name.is_some_and(|n| n.starts_with("PAGE")) {
+            return Err(Error::Prover(format!(
+                "the page tables go next, but the rest's table {p} is {name:?}"
+            )));
+        }
+    }
+    Ok(range.collect())
+}
+
 /// A measurement's knob ([`parse_keccak_rnd_arrivals`]).
 const KECCAK_RND_ARRIVALS_ENV: &str = "LAMBDA_VM_KECCAK_RND_ARRIVALS";
 
@@ -4299,6 +4349,9 @@ pub(crate) struct Deviations {
     /// order (`Some(false)`), instead of the default (`None`: first;
     /// [`keccak_rnd_first_or_default`]).
     pub keccak_rnd_first: Option<bool>,
+    /// The page tables handed on right after KECCAK_RND's (`Some(true)`) or
+    /// in AIR order (`Some(false)`), instead of the knob ([`pages_first`]).
+    pub pages_first: Option<bool>,
     /// The run's AIR set built on a thread of its own while the first
     /// KECCAK_RND tables are laid out (`Some(true)`), or before the rest's
     /// first table (`Some(false)`), instead of the knob
@@ -6885,12 +6938,16 @@ fn lay_out_rest_streamed<'a>(
     };
     marks.push(("airs", at()));
     let refs = airs.air_refs();
-    let first = if header.keccak_rnd_first {
+    let mut first = if header.keccak_rnd_first {
         let names: Vec<&str> = refs.iter().map(|air| air.name()).collect();
         keccak_rnd_positions(&header.table_counts, &names)?
     } else {
         Vec::new()
     };
+    let keccak_rnd_due = first.len();
+    if header.pages_first {
+        first.extend(page_positions(airs)?);
+    }
     let mut order = RestOrder::with_first(
         refs.iter().map(|air| air.trace_layout().0).collect(),
         &first,
@@ -6904,12 +6961,21 @@ fn lay_out_rest_streamed<'a>(
     if header.keccak_rnd_first {
         eprintln!(
             "BLOCK REST ORDER: KECCAK_RND first · {} table(s) at [{}]",
-            first.len(),
-            first
+            keccak_rnd_due,
+            first[..keccak_rnd_due]
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",")
+        );
+    }
+    if header.pages_first {
+        let pages = &first[keccak_rnd_due..];
+        eprintln!(
+            "BLOCK REST ORDER: the page tables next · {} table(s) at {}..{}",
+            pages.len(),
+            pages.first().copied().unwrap_or(0),
+            pages.last().map_or(0, |p| p + 1)
         );
     }
     // The tables laid out before the set: admitted in their order, each AIR
@@ -7312,6 +7378,15 @@ fn prove_streamed(
         let walkers = block_walkers()?;
         let bitwise_last = deviations.rest_bitwise_last;
         let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
+        let pages_first = pages_first(deviations.pages_first)?;
+        eprintln!(
+            "★ BLOCK PAGES FIRST: {} ({PAGES_FIRST_ENV})",
+            if pages_first {
+                "the page tables handed on right after KECCAK_RND's"
+            } else {
+                "AIR order after KECCAK_RND (the default)"
+            }
+        );
         let airs_beside = rest_airs_beside(deviations.rest_airs_beside)?;
         #[cfg(test)]
         let misnamed = deviations.rest_airs_beside_misnamed;
@@ -7637,6 +7712,9 @@ fn prove_streamed(
                 }
                 if keccak_rnd_first {
                     builder = builder.keccak_rnd_first();
+                }
+                if pages_first {
+                    builder = builder.pages_first();
                 }
                 builder = builder.slide_rest();
                 builder = builder.keccak_rnd_form(format.keccak_rnd);
@@ -12095,6 +12173,18 @@ mod rest_airs_beside_tests {
         assert!(!parse_rest_airs_beside(Some(" 0\n")).expect("off"));
         for bad in ["2", "on", "true", "yes"] {
             assert!(parse_rest_airs_beside(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// The page tables go next only when the knob says `1`.
+    #[test]
+    fn the_pages_first_knob_is_off_by_default_and_refuses_other_words() {
+        for off in [None, Some(""), Some("0"), Some(" 0\n")] {
+            assert!(!super::parse_pages_first(off).expect("off"), "{off:?}");
+        }
+        assert!(super::parse_pages_first(Some("1")).expect("on"));
+        for bad in ["2", "on", "true", "yes"] {
+            assert!(super::parse_pages_first(Some(bad)).is_err(), "{bad}");
         }
     }
 
