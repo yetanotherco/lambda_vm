@@ -3164,6 +3164,51 @@ fn the_rest_airs_built_beside_prove_the_same_bytes() {
     }
 }
 
+/// ★ The rest's AIR set and layout on a pool of their own
+/// ([`Deviations::rest_own_pool`]) prove what the shared pool proves: the
+/// same partition, shapes and counts, a proof that verifies, and the same
+/// bytes when the grind is deterministic (run this test alone).
+#[test]
+fn the_rest_on_its_own_pool_proves_the_same_bytes() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    assert!(o.rest_streams(), "the rest streams");
+    let proved = |own: bool| {
+        let (proof, _) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                rest_own_pool: Some(own),
+                ..Deviations::default()
+            },
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "own pool {own}");
+        proof
+    };
+    let shared = proved(false);
+    let own = proved(true);
+    assert_eq!(shared.groups, own.groups, "the partition");
+    assert_eq!(shared.table_num_vars, own.table_num_vars);
+    assert_eq!(
+        format!("{:?}", shared.table_counts),
+        format!("{:?}", own.table_counts)
+    );
+    if crypto::grinding::deterministic() {
+        let bytes = |p: &BlockWhirProof| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                .expect("serialize")
+                .to_vec()
+        };
+        assert_eq!(bytes(&shared), bytes(&own), "the proof's bytes");
+    }
+}
+
 /// With the AIR set built beside them, an early KECCAK_RND table laid out
 /// with an AIR that is not the run's at its place (each named for the next
 /// table) is refused once the set exists: the prove ends in an error, not a
