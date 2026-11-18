@@ -4901,6 +4901,28 @@ where
     Some(ResidentColumns(store))
 }
 
+/// A small store of `columns` of `store` (copied on the card) followed by
+/// `extra` columns from the host ([`math_cuda::columns::DeviceColumns::gather`]).
+/// `None` when the card will not promise it.
+#[cfg(feature = "cuda")]
+pub fn gather_resident(
+    store: &ResidentColumns,
+    columns: &[usize],
+    extra: &[&[u64]],
+) -> Option<ResidentColumns> {
+    math_cuda::device::backend().ok()?;
+    math_cuda::columns::DeviceColumns::gather(&store.0, columns, extra).map(ResidentColumns)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gather_resident(
+    _store: &ResidentColumns,
+    _columns: &[usize],
+    _extra: &[&[u64]],
+) -> Option<ResidentColumns> {
+    None
+}
+
 #[cfg(not(feature = "cuda"))]
 pub fn upload_tables<F>(_tables: &[TableColumns<'_, F>]) -> Option<ResidentColumns>
 where
