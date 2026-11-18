@@ -3494,6 +3494,8 @@ impl BlockStamps {
             multilinear::gpu::room_commit_refusals(),
         ));
         out.push_str(&multilinear_block::cs_probe_lines(&self.groups));
+        out.push_str(&multilinear_block::zc_lane_lines(&self.groups));
+        out.push_str(&multilinear_block::merge_probe_lines(&self.groups));
         if let Some(p) = self.pinned {
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             out.push_str(&format!(
@@ -8031,6 +8033,9 @@ fn prove_streamed(
     regen::refuse_removed_spill_words(|name| std::env::var(name).ok())?;
     // A switch that is gone refuses the prove when set, rather than being ignored.
     refuse_retired_words(|name| std::env::var(name).ok())?;
+    // The constraint-sumcheck probes: measurements, off unless asked (the
+    // proof is the same); a word they do not take refuses the prove.
+    let cs_probe = multilinear_block::CsProbe::from_env().map_err(Error::Prover)?;
     // Where the in-row side records are walked into: a word it does not take
     // refuses the prove.
     let sides_pinned = crate::tables::trace_builder::inrow_sides_pinned_setting(
@@ -9354,7 +9359,7 @@ fn prove_streamed(
                     ledger.map(|ledger| ledger.block.clone()),
                     spill.clone(),
                     // A measurement, off unless asked: the proof is the same.
-                    multilinear_block::CsProbe::from_env(),
+                    cs_probe.clone(),
                 ))
             };
             (block, builder.join(), layout.join(), executor.join())
