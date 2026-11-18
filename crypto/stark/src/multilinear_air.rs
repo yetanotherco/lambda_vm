@@ -1012,6 +1012,45 @@ where
         builder.finish(root)
     }
 
+    /// ⛔ A MEASUREMENT'S SHAPE, never a proof's: the program whose roots are
+    /// the factor slots this program reads, one root each, in slot order, with
+    /// no selector — so [`combine`](Self::combine) under batching powers `κ^j`
+    /// is `Σ_j κ^j·factor_j`, a degree-1 program. Its factor kinds are this
+    /// shape's (the public selectors stay, unread). The slots it reads, in its
+    /// roots' order, come back beside it.
+    #[doc(hidden)]
+    pub fn reads_only(&self) -> (Self, Vec<usize>) {
+        let mut slots: Vec<usize> = self
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Var(i) => Some(*i as usize),
+                _ => None,
+            })
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let steps: Vec<Step<E>> = if slots.is_empty() {
+            vec![Step::Fixed(FieldElement::zero())]
+        } else {
+            slots.iter().map(|&s| Step::Var(s as u32)).collect()
+        };
+        let roots: Vec<u32> = (0..steps.len() as u32).collect();
+        (
+            Self {
+                field: PhantomData,
+                selector_of_root: vec![None; steps.len()],
+                root_steps: roots.clone(),
+                roots,
+                steps,
+                public_selectors: self.public_selectors.clone(),
+                degree: 1,
+                num_vars: self.num_vars,
+            },
+            slots,
+        )
+    }
+
     pub fn combine(
         &self,
         beta_powers: &[FieldElement<E>],
@@ -1335,6 +1374,59 @@ mod tests {
                 .unwrap_err(),
             MlError::NotPowerOfTwo(3)
         );
+    }
+
+    /// The merge probe's program ([`IrShape::reads_only`]) is `Σ_j κ^j·f_j`
+    /// over the factors the program reads — here `a`, `b`, `next(a)` and `c`:
+    /// one root a slot, degree 1, its compiled rule the weight times that sum.
+    #[test]
+    fn reads_only_is_the_weighted_sum_of_the_factors_read() {
+        let num_vars = 3;
+        let prog = program();
+        let leaves = leaves_from(&satisfying_columns(num_vars), num_vars);
+        let poly = IrPolynomial::new_unselected(&prog, leaves, Uniforms::default(), ExtE::from(5))
+            .unwrap();
+        let shape = poly.shape();
+        let kinds = poly.committed().1.len();
+        let (reads, slots) = shape.reads_only();
+        assert_eq!(slots.len(), 4, "a, b, next(a), c: {slots:?}");
+        assert!(
+            slots.windows(2).all(|w| w[0] < w[1]),
+            "slot order, once each"
+        );
+        assert!(slots.iter().all(|&s| s < kinds), "{slots:?} of {kinds}");
+        assert_eq!((reads.degree(), reads.num_roots()), (1, 4));
+        let kappa = ExtE::from(7u64);
+        let kappas = multilinear::challenge_powers(&kappa, slots.len());
+        // A distinct value a factor slot, and the weight after them.
+        let values: Vec<ExtE> = (0..kinds + 2)
+            .map(|i| ExtE::from(3 + 5 * i as u64))
+            .collect();
+        let sum = slots
+            .iter()
+            .zip(&kappas)
+            .fold(ExtE::zero(), |acc, (&s, k)| acc + k * &values[s]);
+        assert_eq!(reads.combine(&kappas, &values), sum, "combine");
+        let rule = multilinear::batch::Rule::compiled(2, reads.program(&kappas, kinds).unwrap());
+        assert_eq!(rule.apply(&values), &values[kinds] * &sum, "the rule");
+        // A program that reads nothing reads no factor.
+        let (_, none) = reads_only_of_nothing();
+        assert!(none.is_empty());
+    }
+
+    /// `reads_only` of a shape with no step.
+    fn reads_only_of_nothing() -> (IrShape<Fp, Ext>, Vec<usize>) {
+        let shape = IrShape::<Fp, Ext> {
+            field: PhantomData,
+            steps: Vec::new(),
+            root_steps: Vec::new(),
+            roots: Vec::new(),
+            selector_of_root: Vec::new(),
+            public_selectors: Vec::new(),
+            degree: 0,
+            num_vars: 3,
+        };
+        shape.reads_only()
     }
 
     #[test]
