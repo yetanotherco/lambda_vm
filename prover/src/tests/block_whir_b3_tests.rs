@@ -649,10 +649,17 @@ fn a_blake3_base_on_the_two_layer_ladder_proves_and_each_ladder_refuses_the_othe
             .find_map(|(g, a)| {
                 a.gkr
                     .iter()
-                    .position(|l| l.layers.len() > 1 && l.layers[1].halves.len() > 1)
+                    .position(|l| {
+                        l.layers.len() > 1
+                            && l.layers[1]
+                                .sumcheck
+                                .rounds
+                                .first()
+                                .is_some_and(|r| r.evaluations.len() == 5)
+                    })
                     .map(|b| (g, b))
             })
-            .expect("a ladder of two steps or more");
+            .expect("a ladder whose second step is of degree 5");
         tampered("a half's value at step 1", &|p| {
             p.argues[g].gkr[b].layers[1].halves[1].q_lo += FieldElement::<E>::one();
         });
