@@ -342,12 +342,12 @@ pub fn bucket_waves() -> bool {
 /// the same execution and proofs. On by default; only `0` turns it off.
 pub const SETUP_FAST_ENV: &str = "LAMBDA_VM_LEVELS_SETUP_FAST";
 
-/// `LAMBDA_VM_LEVELS_FILL_BESIDE=1`: level 1's fill (its traces filled from
+/// `LAMBDA_VM_LEVELS_FILL_BESIDE`: level 1's fill (its traces filled from
 /// its execution) runs on level 1's own thread as soon as the execution ends,
 /// beside the stacks' commit on the card at the base's end, where it otherwise
 /// runs after that commit. Level 1's prove then starts at the later of the two
-/// rather than after both. The same fill, so the same proofs. Off by default
-/// (and for any word but `1`); read once a process.
+/// rather than after both. The same fill, so the same proofs. On by default;
+/// only `0` turns it off. Read once a process.
 pub const FILL_BESIDE_ENV: &str = "LAMBDA_VM_LEVELS_FILL_BESIDE";
 
 std::thread_local! {
@@ -369,7 +369,7 @@ pub fn fill_beside() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(FILL_BESIDE_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(std::env::var(FILL_BESIDE_ENV).ok().as_deref())
     })
 }
 
