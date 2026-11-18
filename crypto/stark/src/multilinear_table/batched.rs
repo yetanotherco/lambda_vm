@@ -44,7 +44,7 @@ use multilinear::{
     gkr_lockstep::{self, LockstepProof},
     logup::{Affine, Interaction},
     sumcheck::{self, SumcheckProof},
-    whir_chain::GkrPack,
+    whir_chain::{GkrLadder, GkrPack},
 };
 
 /// One table's shape as the batched argue sees it: all it needs to plan.
@@ -330,6 +330,10 @@ pub struct ProverFaults {
     /// honest over the lists so changed. The table's last chunk must hold a
     /// padding slot of its own (a short last chunk).
     pub pad_mass: Option<usize>,
+    /// This table's first tree departs from a two-layer ladder at its first
+    /// two-layer step, as [`gkr_lockstep::StepFault`] says, and steps
+    /// honestly after.
+    pub ladder: Option<(usize, gkr_lockstep::StepFault)>,
 }
 
 /// Which of the batched verifier's checks run. Every one, except in the
@@ -675,6 +679,7 @@ where
     let ArgueFormat::Batched {
         bin_log_cells,
         pack,
+        ladder,
     } = config.format.argue
     else {
         return Err(MlError::ArgueFormatMismatch);
@@ -702,6 +707,7 @@ where
         &beta,
         bin_log_cells,
         pack,
+        ladder,
         transcript,
         faults,
         at,
@@ -755,6 +761,7 @@ pub fn prove_argue<F, E, T>(
     beta: &FieldElement<E>,
     bin_log_cells: u8,
     pack: GkrPack,
+    ladder: GkrLadder,
     transcript: &mut T,
     faults: ProverFaults,
     at: Where,
@@ -1063,6 +1070,29 @@ where
                 (None, None) => unreachable!("a host tree has its layers"),
             })
             .collect();
+        // The fault `ladder`: one tree of this bin departs from the ladder.
+        let armed: Option<(usize, gkr_lockstep::Faulted<'_, E>)> =
+            faults.ladder.and_then(|(target, fault)| {
+                let tree = plan.first_tree(target);
+                members
+                    .iter()
+                    .position(|&(_, i)| i == tree)
+                    .map(|k| (k, gkr_lockstep::Faulted::new(refs[k], fault)))
+            });
+        let refs: Vec<&dyn gkr_lockstep::LadderTree<E>> = match &armed {
+            Some((k, faulted)) => refs
+                .iter()
+                .enumerate()
+                .map(|(j, &tree)| {
+                    if j == *k {
+                        faulted as &dyn gkr_lockstep::LadderTree<E>
+                    } else {
+                        tree
+                    }
+                })
+                .collect(),
+            None => refs,
+        };
         for (&(_, i), tree) in members.iter().zip(&refs) {
             let mut output = tree.output();
             if let Some((target, p)) = &fake_output
@@ -1076,7 +1106,7 @@ where
         }
         let started = std::time::Instant::now();
         let trims_before = multilinear::gpu::rewrite_trims();
-        let (ladder, inputs) = gkr_lockstep::prove_trees(&refs, transcript)?;
+        let (steps, inputs) = gkr_lockstep::prove_trees(&refs, ladder, transcript)?;
         split.rewrite_trims += multilinear::gpu::rewrite_trims() - trims_before;
         split.ladders += started.elapsed().as_secs_f64();
         split.ledger_ladder = split.ledger_ladder.max(multilinear::gpu::ledger_reserved());
@@ -1091,7 +1121,7 @@ where
             at_tree += count;
             claims[t] = Some(table_claim(chunk_claims, &plan.chunks[t], transcript)?);
         }
-        gkr.push(ladder);
+        gkr.push(steps);
     }
     let bus_outputs: Vec<(FieldElement<E>, FieldElement<E>)> = bus_outputs
         .into_iter()
@@ -1412,6 +1442,29 @@ where
             Err(failed) => Err(failed),
         }
     }
+
+    fn step_double(
+        &self,
+        layer: usize,
+        point: &[FieldElement<E>],
+        weights: [FieldElement<E>; 2],
+        claim: &(FieldElement<E>, FieldElement<E>),
+    ) -> Result<Box<dyn gkr_lockstep::TreeStep<E> + '_>, MlError> {
+        match gkr_lockstep::LadderTree::step_double(self.tree, layer, point, weights.clone(), claim)
+        {
+            Ok(step) => Ok(step),
+            Err(failed) if layer == gkr_lockstep::LadderTree::input_vars(self.tree) => {
+                let input = (self.write)()?;
+                multilinear::gpu::note_input_written_on_host(
+                    &format!("{failed:?}"),
+                    self.table,
+                    self.cells,
+                );
+                gkr_lockstep::host_step_double(&input, point, weights)
+            }
+            Err(failed) => Err(failed),
+        }
+    }
 }
 
 fn gib(bytes: u64) -> f64 {
@@ -1553,6 +1606,7 @@ where
     let ArgueFormat::Batched {
         bin_log_cells,
         pack,
+        ladder,
     } = config.format.argue
     else {
         return Err(MlError::ArgueFormatMismatch);
@@ -1583,6 +1637,7 @@ where
         statements,
         bin_log_cells,
         pack,
+        ladder,
         &z,
         &alpha,
         &beta,
@@ -1646,6 +1701,7 @@ pub fn verify_argue<F, E, T>(
     statements: &[TableStatement<'_, F, E>],
     bin_log_cells: u8,
     pack: GkrPack,
+    ladder: GkrLadder,
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
     beta: &FieldElement<E>,
@@ -1687,7 +1743,7 @@ where
 
     // ── G ─────────────────────────────────────────────────────────────────
     let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; n];
-    for (bin, ladder) in plan.bins.iter().zip(&argue.gkr) {
+    for (bin, steps) in plan.bins.iter().zip(&argue.gkr) {
         let mut outputs = Vec::with_capacity(bin.len());
         let mut heights = Vec::with_capacity(bin.len());
         for &t in bin {
@@ -1699,8 +1755,14 @@ where
                 heights.push(plan.tree_vars(t));
             }
         }
-        let inputs =
-            gkr_lockstep::verify_with(ladder, &outputs, &heights, transcript, checks.residual)?;
+        let inputs = gkr_lockstep::verify_with(
+            steps,
+            &outputs,
+            &heights,
+            ladder,
+            transcript,
+            checks.residual,
+        )?;
         let mut at_tree = 0;
         for &t in bin {
             let count = plan.chunks[t].count;

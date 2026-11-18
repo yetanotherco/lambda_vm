@@ -474,9 +474,17 @@ pub fn memory_setting(knob: Option<&str>, base_only: bool) -> Result<MemoryForma
 fn with_pack(argue: ArgueFormat, pack: GkrPack) -> Result<ArgueFormat, String> {
     match (argue, pack) {
         (ArgueFormat::PerTable, GkrPack::Off) => Ok(argue),
-        (ArgueFormat::Batched { bin_log_cells, .. }, pack) => Ok(ArgueFormat::Batched {
+        (
+            ArgueFormat::Batched {
+                bin_log_cells,
+                ladder,
+                ..
+            },
+            pack,
+        ) => Ok(ArgueFormat::Batched {
             bin_log_cells,
             pack,
+            ladder,
         }),
         (ArgueFormat::PerTable, _) => {
             Err("BLOCK_WHIR_ARGUE_PACK packs the batched argue's trees: not per-table".to_string())

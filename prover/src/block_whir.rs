@@ -30,7 +30,7 @@ use executor::vm::execution::Executor;
 use executor::vm::shadow::{ShadowCheck, WindowStart};
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
-use multilinear::whir_chain::{ArgueFormat, ChainConfig, FinalPoly, GroupFold};
+use multilinear::whir_chain::{ArgueFormat, ChainConfig, FinalPoly, GkrLadder, GroupFold};
 use rayon::prelude::*;
 use stark::multilinear_block::{self, BlockCommitted, GroupStamps, block_groups};
 use stark::multilinear_table::{
@@ -755,14 +755,68 @@ pub fn b3_base_rounds() -> B3Rounds {
     })
 }
 
+/// The knob that proves and verifies the BLAKE3 base's batched argues on the
+/// two-layer GKR ladder ([`GkrLadder::Double`]: each ladder step proves a
+/// tree layer against its grandchildren); both sides of one process read it,
+/// and the tag names it: see [`b3_base_gkr_setting`]. Read here, never by
+/// the format module (`zf_format`), whose knobs a pinned verifier refuses.
+pub const B3_BASE_GKR_ENV: &str = "LAMBDA_VM_B3_BASE_GKR";
+
+/// [`B3_BASE_GKR_ENV`]'s value: unset, `0` or `single` is
+/// [`GkrLadder::Single`] (today's); `1` or `double` is [`GkrLadder::Double`].
+/// Only these words are read: anything else is refused.
+pub fn b3_base_gkr_setting(value: Option<&str>) -> Result<GkrLadder, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(GkrLadder::Single),
+        Some(v) => match v.as_str() {
+            "0" | "single" => Ok(GkrLadder::Single),
+            "1" | "double" => Ok(GkrLadder::Double),
+            other => Err(format!(
+                "{B3_BASE_GKR_ENV}={other:?}: expected 0, single, 1 or double"
+            )),
+        },
+    }
+}
+
+/// The BLAKE3 base's GKR ladder in this process ([`b3_base_gkr_setting`] of
+/// [`B3_BASE_GKR_ENV`]), read once; a refused value aborts the process at
+/// its first read, as [`b3_base_rounds`] does.
+pub fn b3_base_gkr() -> GkrLadder {
+    static LADDER: std::sync::OnceLock<GkrLadder> = std::sync::OnceLock::new();
+    *LADDER.get_or_init(|| {
+        let value = match std::env::var(B3_BASE_GKR_ENV) {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(v)) => {
+                eprintln!("{B3_BASE_GKR_ENV}={v:?}: expected 0, single, 1 or double");
+                std::process::abort()
+            }
+        };
+        b3_base_gkr_setting(value.as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::abort()
+        })
+    })
+}
+
+/// The statement tag's word for a batched argue's GKR ladder: nothing for
+/// today's one-layer steps, `/L2` for two layers a step.
+pub fn gkr_ladder_tag_word(ladder: GkrLadder) -> &'static str {
+    match ladder {
+        GkrLadder::Single => "",
+        GkrLadder::Double => "/L2",
+    }
+}
+
 /// The statement tag of a block proved under `format`: [`block_statement_tag`]
 /// of its base, and under the 7-round BLAKE3 base its group size too
 /// (`/G<n>`, the format's [`BlockFormat::group_polys`]), so no two BLAKE3
 /// group sizes share a tag, then its round form and cap rule (`/W<shrink>/Cq`
 /// under the WHIR round form with caps by Q, nothing under today's:
-/// [`B3Rounds::tag_word`]). Every block
-/// statement's prover and verifier (and the recursion's plan) take their tag
-/// here.
+/// [`B3Rounds::tag_word`]); then, under any base, its argue's GKR ladder
+/// (`/L2` for two layers a step, nothing under today's:
+/// [`gkr_ladder_tag_word`]). Every block statement's prover and verifier
+/// (and the recursion's plan) take their tag here.
 pub fn block_format_tag(format: &BlockFormat) -> Vec<u8> {
     let mut tag = block_statement_tag(&format.zf.base);
     if format.zf.base == BaseFormat::B3_WHIR {
@@ -773,7 +827,20 @@ pub fn block_format_tag(format: &BlockFormat) -> Vec<u8> {
         tag.extend_from_slice(format!("/G{}", format.group_polys).as_bytes());
         tag.extend_from_slice(format.b3_rounds.tag_word().as_bytes());
     }
+    #[cfg(test)]
+    if LADDER_TAG_OMITTED.with(std::cell::Cell::get) {
+        return tag;
+    }
+    tag.extend_from_slice(gkr_ladder_tag_word(format.argue.ladder()).as_bytes());
     tag
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test only: on this thread, a statement's tag leaves its GKR ladder's
+    /// word out (the tag's mutation). Thread-local, so a test that sets it
+    /// moves no other test's statement.
+    pub(crate) static LADDER_TAG_OMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -826,7 +893,21 @@ impl BlockFormat {
             prepared: true,
             leaf_scale: crate::lfm::whir_block::process_leaf_scale(),
             leaf_query: crate::lfm::whir_block::process_leaf_query(),
-            argue: ArgueFormat::BATCHED,
+            // The BLAKE3 base's GKR ladder ([`b3_base_gkr`]); the knob on any
+            // other base is a configuration error.
+            argue: ArgueFormat::BATCHED.with_ladder(
+                match (zf.base == BaseFormat::B3_WHIR, b3_base_gkr()) {
+                    (true, ladder) => ladder,
+                    (false, GkrLadder::Single) => GkrLadder::Single,
+                    (false, ladder) => {
+                        eprintln!(
+                            "{B3_BASE_GKR_ENV} asks for {ladder:?}: the two-layer GKR ladder is \
+                             the BLAKE3 base's alone"
+                        );
+                        std::process::abort()
+                    }
+                },
+            ),
             group: GroupFold::Indexed,
             keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
@@ -921,9 +1002,14 @@ impl BlockFormat {
     /// table. A per-table argue has no trees to pack and is returned as it is.
     pub fn with_pack(self, pack: multilinear::whir_chain::GkrPack) -> Self {
         let argue = match self.argue {
-            ArgueFormat::Batched { bin_log_cells, .. } => ArgueFormat::Batched {
+            ArgueFormat::Batched {
+                bin_log_cells,
+                ladder,
+                ..
+            } => ArgueFormat::Batched {
                 bin_log_cells,
                 pack,
+                ladder,
             },
             ArgueFormat::PerTable => ArgueFormat::PerTable,
         };

@@ -1786,9 +1786,11 @@ fn cap_bytes(cap: crypto::merkle_tree::cap::CapPolicy) -> [u8; 2] {
 /// makes the program this program under this format; nothing a proof states.
 /// The chain format's text a W-LFM program's identity hashes: its `Debug`
 /// form with the round form left out, which [`wlfm_program_id`] hashes on its
-/// own (and not at all under today's form). So the identity of every program
-/// under today's form is the one it had before the round form existed, byte
-/// for byte: the text is today's format as its `Debug` printed it then.
+/// own (and not at all under today's form), and with a batched argue's
+/// one-layer GKR ladder left out (a two-layer ladder stays in the text). So
+/// the identity of every program under today's form is the one it had before
+/// the round form and the ladder existed, byte for byte: the text is today's
+/// format as its `Debug` printed it then.
 pub(crate) fn format_identity_text(format: &multilinear::whir_chain::ChainFormat) -> String {
     let today = multilinear::whir_chain::ChainFormat {
         rounds: multilinear::whir_chain::RoundForm::Fri,
@@ -1801,7 +1803,12 @@ pub(crate) fn format_identity_text(format: &multilinear::whir_chain::ChainFormat
         1,
         "the chain format's Debug names its round form once"
     );
-    text.replacen(field, "", 1)
+    let ladder = ", ladder: Single";
+    debug_assert!(
+        text.matches(ladder).count() <= 1,
+        "the chain format's Debug names its GKR ladder at most once"
+    );
+    text.replacen(field, "", 1).replacen(ladder, "", 1)
 }
 
 pub fn wlfm_program_id(a: &WlfmArtifacts) -> Commitment {

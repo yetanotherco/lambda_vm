@@ -2247,15 +2247,26 @@ impl<'a> Shapes<'a> {
 }
 
 /// The batched argue's planning constants when the block's format batches its
-/// groups: its bin cap and its GKR packing, both the format's.
+/// groups: its bin cap and its GKR packing, both the format's. A ladder of
+/// two tree layers a step is refused by name: the leaf verifies one-layer
+/// ladders only.
 pub(crate) fn batched_cap(
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<Option<BatchedPlanning>, String> {
-    use multilinear::whir_chain::ArgueFormat;
+    use multilinear::whir_chain::{ArgueFormat, GkrLadder};
     match config.format.argue {
+        ArgueFormat::Batched {
+            ladder: GkrLadder::Double,
+            ..
+        } => Err(
+            "the recursion's leaf verifies one tree layer a GKR ladder step: a base argued two \
+             layers a step has no leaf yet"
+                .to_string(),
+        ),
         ArgueFormat::Batched {
             bin_log_cells,
             pack,
+            ladder: GkrLadder::Single,
         } => Ok(Some(BatchedPlanning {
             bin_log_cells,
             pack,
@@ -3483,6 +3494,7 @@ mod pack_tests {
         let packed = ArgueFormat::Batched {
             bin_log_cells: 26,
             pack,
+            ladder: multilinear::whir_chain::GkrLadder::Single,
         };
         assert_eq!(
             super::batched_cap(&config(packed)),
@@ -3490,6 +3502,21 @@ mod pack_tests {
                 bin_log_cells: 26,
                 pack
             }))
+        );
+    }
+
+    /// A batched group argued two tree layers a GKR step has no leaf yet:
+    /// the recursion refuses to plan it, by name, rather than verify it as
+    /// one layer a step.
+    #[test]
+    fn the_recursion_refuses_a_two_layer_ladder() {
+        use multilinear::whir_chain::GkrLadder;
+        let double = ArgueFormat::BATCHED.with_ladder(GkrLadder::Double);
+        let refused = super::batched_cap(&config(double)).expect_err("refused");
+        assert!(refused.contains("two"), "{refused}");
+        assert_eq!(
+            super::batched_cap(&config(ArgueFormat::BATCHED.with_ladder(GkrLadder::Single))),
+            super::batched_cap(&config(ArgueFormat::BATCHED))
         );
     }
 }

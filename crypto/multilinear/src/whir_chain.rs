@@ -523,6 +523,9 @@ pub enum ArgueFormat {
         /// [`GkrPack::PRODUCTION`]; [`GkrPack::Off`] is one tree a table, its
         /// interactions padded to a power of two.
         pack: GkrPack,
+        /// How many tree layers each step of a bin's ladder proves:
+        /// [`GkrLadder::Single`] (one, today's) or [`GkrLadder::Double`].
+        ladder: GkrLadder,
     },
 }
 
@@ -540,8 +543,60 @@ impl ArgueFormat {
         Self::Batched {
             bin_log_cells,
             pack: GkrPack::PRODUCTION,
+            ladder: GkrLadder::Single,
         }
     }
+
+    /// The ladder a batched argue's bins step by; a per-table argue has no
+    /// bins, and its trees step one layer at a time.
+    pub const fn ladder(&self) -> GkrLadder {
+        match self {
+            Self::Batched { ladder, .. } => *ladder,
+            Self::PerTable => GkrLadder::Single,
+        }
+    }
+
+    /// This format with its bins' ladders stepped per `ladder`; a per-table
+    /// argue is returned as it is.
+    pub const fn with_ladder(self, ladder: GkrLadder) -> Self {
+        match self {
+            Self::Batched {
+                bin_log_cells,
+                pack,
+                ..
+            } => Self::Batched {
+                bin_log_cells,
+                pack,
+                ladder,
+            },
+            Self::PerTable => Self::PerTable,
+        }
+    }
+}
+
+/// How many tree layers one step of a bin's lockstep GKR ladder proves
+/// ([`crate::gkr_lockstep`]).
+///
+/// [`Single`](Self::Single) is today's: each step proves one layer against
+/// its children, one degree-3 sumcheck and four values a tree.
+/// [`Double`](Self::Double) proves a layer against its grandchildren: one
+/// sumcheck of degree 5 over the layer's variables, eight values a tree, and
+/// two challenges for the next point, so a ladder takes about half the
+/// steps. A tree of odd height takes the one-layer relation inside the step
+/// that reaches its input layer. Which trees take which relation, the
+/// degrees and the counts are derived by [`crate::gkr_lockstep::ladder_steps`]
+/// from the trees' heights and this value alone.
+///
+/// ★ A FORMAT VALUE: the rounds and the values a step sends are part of the
+/// proof, so a verifier steps under its own value, never a proof's. A
+/// verifier-side constant like the rest of [`ChainFormat`], and not absorbed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GkrLadder {
+    /// One tree layer a step: today's.
+    #[default]
+    Single,
+    /// Two tree layers a step.
+    Double,
 }
 
 /// How the batched argue lays a table's interactions into LogUp-GKR trees.

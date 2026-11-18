@@ -3518,6 +3518,7 @@ where
                         ArgueFormat::Batched {
                             bin_log_cells,
                             pack,
+                            ladder,
                         } => {
                             let faults = match argue.group {
                                 Some(faulty) if faulty == g => argue.faults,
@@ -3530,6 +3531,7 @@ where
                                 &beta,
                                 bin_log_cells,
                                 pack,
+                                ladder,
                                 &mut fork,
                                 faults,
                                 argue.at,
@@ -3970,15 +3972,17 @@ where
             ArgueFormat::Batched {
                 bin_log_cells,
                 pack,
+                ladder,
             } => {
                 // The group's bins and trees come from its statements and the
-                // verifier's cap and packing, never from the proof.
+                // verifier's cap, packing and ladder, never from the proof.
                 let argue = &argues[g];
                 let reduced = batched::verify_argue(
                     argue,
                     group_statements,
                     bin_log_cells,
                     pack,
+                    ladder,
                     &z,
                     &alpha,
                     &beta,
