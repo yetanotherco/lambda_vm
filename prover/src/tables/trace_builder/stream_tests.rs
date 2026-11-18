@@ -601,6 +601,7 @@ fn under_the_word_format_the_stream_is_the_monolithic_finish() {
         crate::tables::keccak_rnd::KeccakRndForm::default(),
         crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
         crate::tables::register::RegisterFormat::InRow,
+        crate::tables::ecdas::EcdasForm::Bytes,
     );
     airs.with_word_memory(&opts, header.word_counts, &header.page_configs)
         .expect("the word set");

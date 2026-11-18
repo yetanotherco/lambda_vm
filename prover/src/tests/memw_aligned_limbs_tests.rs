@@ -917,6 +917,7 @@ fn pinned_block_airs() -> crate::VmAirs {
         format.keccak_rnd,
         format.memw_aligned,
         format.registers,
+        format.ecdas,
     );
     // One table of each fused memory kind (the production prover's memory
     // format; the pinned verifier's is split): MEM_LOAD and MEM_STORE check

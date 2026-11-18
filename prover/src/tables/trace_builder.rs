@@ -6730,14 +6730,63 @@ pub(crate) fn collect_bitwise_from_ecrec(ops: &[ecrec::EcrecOperation]) -> Vec<B
 /// BITWISE lookups sent by every ECDAS row (range checks on the byte limbs +
 /// carries), over the rows a build keeps compact, each widened back to its op
 /// as it is read ([`ecdas::CompactEcdasOp`]).
+#[cfg(test)]
 pub(crate) fn collect_bitwise_from_compact_ecdas(
     rows: &[ecdas::CompactEcdasOp],
 ) -> Vec<BitwiseOperation> {
+    collect_bitwise_from_compact_ecdas_in(rows, ecdas::EcdasForm::Bytes)
+}
+
+/// [`collect_bitwise_from_compact_ecdas`] for ECDAS's table in `form`.
+pub(crate) fn collect_bitwise_from_compact_ecdas_in(
+    rows: &[ecdas::CompactEcdasOp],
+    form: ecdas::EcdasForm,
+) -> Vec<BitwiseOperation> {
     let mut out = Vec::new();
     for row in rows {
-        ecdas_lookups(&row.to_op(), &mut out);
+        match form {
+            ecdas::EcdasForm::Bytes => ecdas_lookups(&row.to_op(), &mut out),
+            ecdas::EcdasForm::Halves => ecdas_halves_lookups(&row.to_op(), &mut out),
+        }
     }
     out
+}
+
+/// One ECDAS row's BITWISE lookups under [`ecdas::EcdasForm::Halves`],
+/// appended to `out`, as `ecdas::bus_interactions_for` sends them: the
+/// checked bytes two to a lookup, then each relation's carries — `LO` to
+/// `IS_HALF`, the `HI`s two to a lookup (the last with 0).
+pub(crate) fn ecdas_halves_lookups(op: &ecdas::EcdasOperation, out: &mut Vec<BitwiseOperation>) {
+    let s = &op.step;
+    let mut bytes = Vec::with_capacity(196);
+    bytes.push(s.round);
+    bytes.extend_from_slice(&s.lambda);
+    bytes.extend_from_slice(&s.q0);
+    bytes.extend_from_slice(&s.x_r);
+    bytes.extend_from_slice(&s.q1);
+    bytes.extend_from_slice(&s.y_r);
+    bytes.extend_from_slice(&s.q2);
+    for pair in bytes.chunks(2) {
+        out.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::AreBytes,
+            pair[0],
+            pair[1],
+        ));
+    }
+    for carries in ecdas::halves_carries(s) {
+        let split = carries.map(ecdas::split_carry);
+        for &(lo, _) in &split {
+            out.push(is_half_op(lo as u16));
+        }
+        for pair in split.chunks(2) {
+            let hi = |i: usize| pair.get(i).map_or(0, |&(_, h)| h as u8);
+            out.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                hi(0),
+                hi(1),
+            ));
+        }
+    }
 }
 
 /// One ECDAS row's BITWISE lookups, appended to `out`.
@@ -7836,6 +7885,10 @@ pub struct StreamSkip {
     /// format's): BITWISE counts those and no others. The default is today's
     /// table.
     pub keccak_rnd_form: KeccakRndForm,
+    /// Which relations ECDAS proves its steps with ([`ecdas::EcdasForm`], the
+    /// block format's): the table's columns and the lookups BITWISE counts of
+    /// it follow it. The default is today's table.
+    pub ecdas_form: ecdas::EcdasForm,
     /// How MEMW_A proves its timestamp order ([`MemwAlignedOrder`], the block
     /// format's): what the walk routes by and lays each aligned row out in, so
     /// what BITWISE and LT count of it. The default is the per-table STARK's.

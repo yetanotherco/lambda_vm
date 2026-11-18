@@ -32,6 +32,7 @@ fn one_group() -> BlockFormat {
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
+        ecdas: crate::tables::ecdas::EcdasForm::Bytes,
     }
 }
 
@@ -54,6 +55,7 @@ pub(super) fn many_groups() -> BlockFormat {
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
+        ecdas: crate::tables::ecdas::EcdasForm::Bytes,
     }
 }
 
@@ -3507,6 +3509,7 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
             pinned.keccak_rnd,
             pinned.memw_aligned,
             registers,
+            pinned.ecdas,
         );
         let held: Vec<String> = match memory {
             MemoryFormat::Split => Vec::new(),
@@ -4443,7 +4446,12 @@ fn ecsm_multi_split() -> (
     crate::tables::trace_builder::Traces,
 ) {
     split_traces("test_ecsm_multi", |traces| {
-        block_whir::split_ecdas(traces, 4, CutPadding::WholeRun);
+        block_whir::split_ecdas(
+            traces,
+            4,
+            CutPadding::WholeRun,
+            crate::tables::ecdas::EcdasForm::Bytes,
+        );
         assert_eq!(traces.ecdases.len(), 4);
     })
 }

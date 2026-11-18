@@ -1427,6 +1427,37 @@ pub fn create_ecdas_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcdasCons
     )
 }
 
+/// The ECDAS AIR under [`EcdasForm::Halves`](crate::tables::ecdas::EcdasForm):
+/// the relations at 16-bit limb positions. Its own prototype in
+/// [`air_prototype_cache`] (`ECDAS~halves`), its clone named `ECDAS`.
+pub fn create_ecdas_halves_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::ecdas::EcdasHalvesConstraints> {
+    use crate::tables::ecdas::{EcdasForm, EcdasHalvesConstraints, bus_interactions_for};
+    build_air(
+        EcdasForm::Halves.num_columns(),
+        bus_interactions_for(EcdasForm::Halves),
+        proof_options,
+        1,
+        EcdasHalvesConstraints,
+        "ECDAS~halves",
+    )
+    .with_name("ECDAS")
+}
+
+/// The ECDAS AIR in `form`, named `name`.
+pub fn create_ecdas_air_for(
+    proof_options: &ProofOptions,
+    form: crate::tables::ecdas::EcdasForm,
+    name: &str,
+) -> VmAir {
+    use crate::tables::ecdas::EcdasForm;
+    match form {
+        EcdasForm::Bytes => Box::new(create_ecdas_air(proof_options).with_name(name)),
+        EcdasForm::Halves => Box::new(create_ecdas_halves_air(proof_options).with_name(name)),
+    }
+}
+
 /// Create ECREC AIR (one ECDSA public-key recovery a row).
 pub fn create_ecrec_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcrecConstraints> {
     build_air(

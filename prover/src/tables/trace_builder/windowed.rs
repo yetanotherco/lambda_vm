@@ -999,6 +999,15 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// ECDAS's relations in `form` (the block format's
+    /// [`EcdasForm`](crate::tables::ecdas::EcdasForm)): the finish builds its
+    /// tables in that form and BITWISE counts that form's lookups. The default
+    /// is today's table.
+    pub fn ecdas_form(mut self, form: crate::tables::ecdas::EcdasForm) -> Self {
+        self.emitted.ecdas_form = form;
+        self
+    }
+
     /// MEMW_A's timestamp order in `order`'s form (the block format's
     /// [`MemwAlignedOrder`]): the walk routes each aligned access by it and
     /// lays its row out in it, so BITWISE counts the limbs' lookups and LT
