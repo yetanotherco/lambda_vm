@@ -725,6 +725,54 @@ pub fn pool_used_bytes() -> Result<(u64, u64)> {
     ))
 }
 
+/// The default pool's bytes reserved from the device, `(now, high-water)`:
+/// what the pool holds of the card, used or not.
+pub fn pool_reserved_bytes() -> Result<(u64, u64)> {
+    use cudarc::driver::sys;
+    let be = backend()?;
+    let read = |attribute| -> Result<u64> {
+        let mut value = 0u64;
+        // SAFETY: as in `pool_used_bytes`.
+        unsafe {
+            let pool = default_mempool(&be.ctx).ok_or(cudarc::driver::DriverError(
+                sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+            ))?;
+            sys::cuMemPoolGetAttribute(
+                pool,
+                attribute,
+                &mut value as *mut u64 as *mut core::ffi::c_void,
+            )
+            .result()?;
+        }
+        Ok(value)
+    };
+    Ok((
+        read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
+        read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH)?,
+    ))
+}
+
+/// Restarts [`pool_reserved_bytes`]'s high-water mark (as
+/// [`reset_pool_high_water`] does the used one's).
+pub fn reset_pool_reserved_high_water() -> Result<()> {
+    use cudarc::driver::sys;
+    let be = backend()?;
+    let zero = 0u64;
+    // SAFETY: as in `reset_pool_high_water`.
+    unsafe {
+        let pool = default_mempool(&be.ctx).ok_or(cudarc::driver::DriverError(
+            sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+        ))?;
+        sys::cuMemPoolSetAttribute(
+            pool,
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+            &zero as *const u64 as *mut core::ffi::c_void,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Restarts [`pool_used_bytes`]'s high-water mark. The driver only resets it
 /// to zero, and the next allocation raises it to what is then in use — so a
 /// reader takes the larger of it and the `now` it read before the reset.
