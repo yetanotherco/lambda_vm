@@ -183,6 +183,12 @@ pub trait TreeStep<F: IsField> {
     fn to_host(&mut self) -> Result<(), Error> {
         Ok(())
     }
+    /// The host relation this step is stepped on now, or `None` while its
+    /// rounds run on a device: a ladder with many such steps may run their
+    /// rounds and binds side by side ([`host_rounds_parallel`]).
+    fn host_step(&mut self) -> Option<&mut HostStep<F>> {
+        None
+    }
 }
 
 /// A tree the ladder descends: where its layers are is its own business — on
@@ -205,8 +211,8 @@ pub trait LadderTree<F: IsField> {
     ) -> Result<Box<dyn TreeStep<F> + '_>, Error>;
 }
 
-/// The step over a layer the host holds: one tree's [`LockstepRelation`].
-struct HostStep<F: IsField>(LockstepRelation<F>);
+/// The step over a layer the host holds: one tree's relation.
+pub struct HostStep<F: IsField>(LockstepRelation<F>);
 
 impl<F: IsField + 'static> HostStep<F>
 where
@@ -241,6 +247,10 @@ where
 
     fn bind(&mut self, r: &FieldElement<F>) -> Result<(), Error> {
         self.0.fix_first_variable(r)
+    }
+
+    fn host_step(&mut self) -> Option<&mut HostStep<F>> {
+        Some(self)
     }
 
     fn halves(&self) -> Result<TreeHalves<F>, Error> {
@@ -392,6 +402,13 @@ where
 
     fn to_host(&mut self) -> Result<(), Error> {
         self.hand_over()
+    }
+
+    fn host_step(&mut self) -> Option<&mut HostStep<F>> {
+        if self.session.is_some() {
+            return None;
+        }
+        self.host.as_mut()
     }
 }
 
@@ -611,6 +628,13 @@ where
         }
     }
 
+    fn host_step(&mut self) -> Option<&mut HostStep<F>> {
+        if self.session.is_some() {
+            return None;
+        }
+        self.host.as_mut()
+    }
+
     // `device_cube` stays zero and `to_host` does nothing: a Gruen step leaves
     // the card at its own tail (`LAMBDA_VM_ARGUE_GKR_GRUEN_TAIL`), the cube
     // today's per-table layers leave it at.
@@ -737,8 +761,11 @@ pub fn prove_trees<F, T>(
 ) -> Result<(LockstepProof<F>, Vec<GkrClaim<F>>), Error>
 where
     F: IsField + 'static,
+    FieldElement<F>: Send + Sync,
     T: IsTranscript<F>,
 {
+    let side_by_side = argue_host_parallel();
+    let mut host_times = HostRoundTimes::start(trees.len());
     let input_vars: Vec<usize> = trees.iter().map(|t| t.input_vars()).collect();
     let steps = input_vars.iter().copied().max().unwrap_or(0);
 
@@ -782,9 +809,24 @@ where
             for step in stepping.iter_mut() {
                 step.prefetch()?;
             }
+            // The host steps' rounds side by side, when there are enough of
+            // them: each tree's message is its own, and the sum below still
+            // adds them in tree order.
+            let parallel = side_by_side && stepping.len() >= HOST_PARALLEL_MIN_STEPS;
+            let mut ahead = if parallel {
+                host_times.time(|| host_rounds_parallel(&mut stepping))?
+            } else {
+                Vec::new()
+            };
             let mut sent = vec![FieldElement::<F>::zero(); 3];
-            for step in stepping.iter_mut() {
-                let own = step.round()?;
+            for (k, step) in stepping.iter_mut().enumerate() {
+                let own = match ahead.get_mut(k).and_then(Option::take) {
+                    Some(own) => own,
+                    None if host_times.on && step.host_step().is_some() => {
+                        host_times.time(|| step.round())?
+                    }
+                    None => step.round()?,
+                };
                 if own.len() != 3 {
                     return Err(Error::RoundDegreeMismatch {
                         round: rounds.len(),
@@ -800,8 +842,20 @@ where
                 transcript.append_field_element(e);
             }
             let r: FieldElement<F> = transcript.sample_field_element();
-            for step in stepping.iter_mut() {
-                step.bind(&r)?;
+            let bound = if parallel {
+                host_times.time(|| host_binds_parallel(&mut stepping, &r))?
+            } else {
+                Vec::new()
+            };
+            for (k, step) in stepping.iter_mut().enumerate() {
+                if bound.get(k).copied().unwrap_or(false) {
+                    continue;
+                }
+                if host_times.on && step.host_step().is_some() {
+                    host_times.time(|| step.bind(&r))?;
+                } else {
+                    step.bind(&r)?;
+                }
             }
             rounds.push(sumcheck::RoundProof { evaluations: sent });
             z.push(r);
@@ -834,11 +888,225 @@ where
         });
     }
 
+    host_times.print(side_by_side);
     let inputs = inputs
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or(Error::NoVariablesLeft)?;
     Ok((LockstepProof { layers }, inputs))
+}
+
+/// The fewest steps in a round whose host rounds go side by side
+/// ([`argue_host_parallel`]): the many-table groups' ladders (hundreds of
+/// trees) qualify, a usual group's (a handful) keeps one thread.
+pub const HOST_PARALLEL_MIN_STEPS: usize = 32;
+
+/// The fewest host steps one task takes: a small layer's round is a microsecond
+/// or two, so a task must hold enough of them to pay for itself.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+const HOST_PARALLEL_CHUNK: usize = 16;
+
+static HOST_PARALLEL_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether a ladder round with at least [`HOST_PARALLEL_MIN_STEPS`] steps runs
+/// its host steps' rounds and binds side by side on the calling thread's pool
+/// (`LAMBDA_VM_ARGUE_HOST_PARALLEL=1`; off by default, and without the
+/// `parallel` feature). Each step's message and bind are its own and the
+/// round's sum still adds the messages in tree order, so the proof is the
+/// same. Read once, with a banner.
+pub fn argue_host_parallel() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = match HOST_PARALLEL_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => *ON.get_or_init(|| {
+            let on = host_parallel_from(
+                std::env::var("LAMBDA_VM_ARGUE_HOST_PARALLEL")
+                    .ok()
+                    .as_deref(),
+            );
+            eprintln!(
+                "★ ARGUE HOST PARALLEL: {}",
+                if on {
+                    "on (a ladder round's host steps side by side when it has many)"
+                } else {
+                    "off (the default; one host step after another)"
+                }
+            );
+            on
+        }),
+    };
+    on && cfg!(feature = "parallel")
+}
+
+/// The knob's word: on for `1` only.
+fn host_parallel_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// Overrides `LAMBDA_VM_ARGUE_HOST_PARALLEL` for the whole process — for a
+/// test that proves both ways in one binary. `None` restores the environment's.
+#[doc(hidden)]
+pub fn force_argue_host_parallel(on: Option<bool>) {
+    HOST_PARALLEL_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+static HOST_PARALLEL_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many ladder rounds have run their host steps side by side in this
+/// process (for a test that they did).
+#[doc(hidden)]
+pub fn host_parallel_passes() -> u64 {
+    HOST_PARALLEL_PASSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The host steps among `stepping`, with their places.
+fn host_steps<'s, F: IsField>(
+    stepping: &'s mut [Box<dyn TreeStep<F> + '_>],
+) -> (Vec<usize>, Vec<&'s mut HostStep<F>>) {
+    let mut at = Vec::new();
+    let mut hosts = Vec::new();
+    for (k, step) in stepping.iter_mut().enumerate() {
+        if let Some(host) = step.host_step() {
+            at.push(k);
+            hosts.push(host);
+        }
+    }
+    (at, hosts)
+}
+
+/// The host steps' messages this round, computed side by side, at their
+/// places among `stepping`; `None` where a step is on a device.
+fn host_rounds_parallel<F>(
+    stepping: &mut [Box<dyn TreeStep<F> + '_>],
+) -> Result<Vec<Option<Vec<FieldElement<F>>>>, Error>
+where
+    F: IsField + 'static,
+    FieldElement<F>: Send + Sync,
+{
+    let n = stepping.len();
+    let (at, mut hosts) = host_steps(stepping);
+    HOST_PARALLEL_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let owns: Vec<Vec<FieldElement<F>>> = side_by_side(&mut hosts, |host| host.round())?;
+    let mut ahead: Vec<Option<Vec<FieldElement<F>>>> = (0..n).map(|_| None).collect();
+    for (k, own) in at.into_iter().zip(owns) {
+        ahead[k] = Some(own);
+    }
+    Ok(ahead)
+}
+
+/// Binds the host steps to `r` side by side; `true` at the places bound.
+fn host_binds_parallel<F>(
+    stepping: &mut [Box<dyn TreeStep<F> + '_>],
+    r: &FieldElement<F>,
+) -> Result<Vec<bool>, Error>
+where
+    F: IsField + 'static,
+    FieldElement<F>: Send + Sync,
+{
+    let n = stepping.len();
+    let (at, mut hosts) = host_steps(stepping);
+    side_by_side(&mut hosts, |host| host.bind(r))?;
+    let mut bound = vec![false; n];
+    for k in at {
+        bound[k] = true;
+    }
+    Ok(bound)
+}
+
+/// `work` on every host step, in chunks of at least [`HOST_PARALLEL_CHUNK`] on
+/// the calling thread's pool; the results in step order, the first error in
+/// step order.
+#[cfg(feature = "parallel")]
+fn side_by_side<F, R, W>(hosts: &mut [&mut HostStep<F>], work: W) -> Result<Vec<R>, Error>
+where
+    F: IsField + 'static,
+    FieldElement<F>: Send + Sync,
+    R: Send,
+    W: Fn(&mut HostStep<F>) -> Result<R, Error> + Sync,
+{
+    use rayon::prelude::*;
+    let chunk = hosts
+        .len()
+        .div_ceil(rayon::current_num_threads().max(1))
+        .max(HOST_PARALLEL_CHUNK);
+    let parts: Vec<Result<Vec<R>, Error>> = hosts
+        .par_chunks_mut(chunk)
+        .map(|part| part.iter_mut().map(|host| work(host)).collect())
+        .collect();
+    let mut out = Vec::with_capacity(hosts.len());
+    for part in parts {
+        out.extend(part?);
+    }
+    Ok(out)
+}
+
+/// Without `parallel`: one after another.
+#[cfg(not(feature = "parallel"))]
+fn side_by_side<F, R, W>(hosts: &mut [&mut HostStep<F>], work: W) -> Result<Vec<R>, Error>
+where
+    F: IsField + 'static,
+    W: Fn(&mut HostStep<F>) -> Result<R, Error>,
+{
+    hosts.iter_mut().map(|host| work(host)).collect()
+}
+
+/// A measurement, never a byte of the proof
+/// (`LAMBDA_VM_ARGUE_HOST_ROUND_TIMES=1`): one ladder's host rounds and binds
+/// in wall seconds, printed as one `LADDER HOST ROUNDS` line at its end.
+struct HostRoundTimes {
+    on: bool,
+    trees: usize,
+    started: std::time::Instant,
+    spent: f64,
+    calls: u64,
+}
+
+impl HostRoundTimes {
+    fn start(trees: usize) -> Self {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| {
+            std::env::var("LAMBDA_VM_ARGUE_HOST_ROUND_TIMES").is_ok_and(|v| v.trim() == "1")
+        });
+        Self {
+            on,
+            trees,
+            started: std::time::Instant::now(),
+            spent: 0.0,
+            calls: 0,
+        }
+    }
+
+    fn time<R>(&mut self, work: impl FnOnce() -> R) -> R {
+        if !self.on {
+            return work();
+        }
+        let at = std::time::Instant::now();
+        let out = work();
+        self.spent += at.elapsed().as_secs_f64();
+        self.calls += 1;
+        out
+    }
+
+    fn print(&self, side_by_side: bool) {
+        if self.on {
+            eprintln!(
+                "LADDER HOST ROUNDS: trees {} · total {:.3} ms · host rounds and binds {:.3} ms ({} passes) · side by side {}",
+                self.trees,
+                self.started.elapsed().as_secs_f64() * 1e3,
+                self.spent * 1e3,
+                self.calls,
+                if side_by_side { "on" } else { "off" },
+            );
+        }
+    }
 }
 
 /// Verifies a ladder against the trees' claimed outputs and their input
@@ -1365,5 +1633,135 @@ mod tests {
             }
         }
         crate::gkr_gruen::force_gkr_gruen_direct_h0(false);
+    }
+
+    /// ★ A ladder of many trees — host trees and Gruen steps that hand their
+    /// layers to the host part way (tails of one cell up to the whole layer)
+    /// — proves the same bytes, claims and transcript with its host steps run
+    /// side by side as one after another, and its rounds did go side by side.
+    #[test]
+    fn host_steps_side_by_side_prove_the_same_bytes() {
+        let heights: Vec<usize> = (0..72)
+            .map(|t| [6usize, 3, 0, 5, 4, 1, 6, 2][t % 8])
+            .collect();
+        let trees: Vec<Vec<FractionLayer<F>>> = heights
+            .iter()
+            .enumerate()
+            .map(|(t, &k)| layers(random_layer(k, 301 + t as u64)))
+            .collect();
+        let host: Vec<HostLayers<'_, F>> = trees[..36].iter().map(|t| HostLayers(t)).collect();
+        let gruen: Vec<GruenHostTree<'_>> = trees[36..]
+            .iter()
+            .enumerate()
+            .map(|(t, layers)| GruenHostTree {
+                layers,
+                low: [0usize, 1, 2, 6][t % 4],
+            })
+            .collect();
+        let dyns: Vec<&dyn LadderTree<F>> = host
+            .iter()
+            .map(|t| t as &dyn LadderTree<F>)
+            .chain(gruen.iter().map(|t| t as &dyn LadderTree<F>))
+            .collect();
+        let mut runs = Vec::new();
+        for on in [false, true] {
+            force_argue_host_parallel(Some(on));
+            let passes = host_parallel_passes();
+            let mut prover = transcript();
+            let (proof, claims) = prove_trees(&dyns, &mut prover).unwrap();
+            let ran = host_parallel_passes() - passes;
+            if on && cfg!(feature = "parallel") {
+                assert!(ran > 0, "no round went side by side");
+            } else {
+                assert_eq!(ran, 0, "a round went side by side with the knob off");
+            }
+            let outputs: Vec<(FE, FE)> = trees
+                .iter()
+                .map(|t| (t[0].p.evals()[0], t[0].q.evals()[0]))
+                .collect();
+            let mut verifier = transcript();
+            let got = verify(&proof, &outputs, &heights, &mut verifier).unwrap();
+            assert_eq!(got, claims, "side by side {on}: the verifier's claims");
+            assert_eq!(prover.state(), verifier.state());
+            runs.push((proof, claims, prover.state()));
+        }
+        force_argue_host_parallel(None);
+        assert!(
+            runs[0] == runs[1],
+            "the side-by-side host steps moved a byte"
+        );
+    }
+
+    /// The knob is on for `1` only.
+    #[test]
+    fn the_host_parallel_knob_is_on_for_one_only() {
+        assert!(host_parallel_from(Some("1")));
+        assert!(host_parallel_from(Some(" 1 ")));
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("yes"),
+            Some("2"),
+            Some("on"),
+        ] {
+            assert!(!host_parallel_from(off), "{off:?}");
+        }
+    }
+
+    /// A probe, never a gate: a ladder of `n` host trees over the cubic
+    /// extension of `2^k` input cells (`k` 6 and 10: the many-table group's
+    /// host part — its first steps whole, its later ones' tails), one host
+    /// step after another against side by side (ms, best of five).
+    #[test]
+    #[ignore = "a timing probe"]
+    fn host_steps_side_by_side_seconds() {
+        use math::field::element::FieldElement as FEl;
+        type E3 = FEl<Ext3>;
+        for k in [6usize, 10] {
+            for n in [8usize, 64, 192, 366] {
+                let trees: Vec<Vec<FractionLayer<Ext3>>> = (0..n)
+                    .map(|t| {
+                        let mut s = 0x9E37_79B9_7F4A_7C15u64 ^ (t as u64 * 7919 + k as u64);
+                        let mut next = || {
+                            s ^= s << 13;
+                            s ^= s >> 7;
+                            s ^= s << 17;
+                            E3::from(s)
+                        };
+                        let p: Vec<E3> = (0..1usize << k).map(|_| next()).collect();
+                        let q: Vec<E3> = (0..1usize << k).map(|_| next()).collect();
+                        let mut layers = vec![
+                            FractionLayer::new(Mle::new(p).unwrap(), Mle::new(q).unwrap()).unwrap(),
+                        ];
+                        while layers.last().unwrap().num_vars() > 0 {
+                            let next = layers.last().unwrap().fold().unwrap();
+                            layers.push(next);
+                        }
+                        layers.reverse();
+                        layers
+                    })
+                    .collect();
+                let host: Vec<HostLayers<'_, Ext3>> = trees.iter().map(|t| HostLayers(t)).collect();
+                let dyns: Vec<&dyn LadderTree<Ext3>> =
+                    host.iter().map(|t| t as &dyn LadderTree<Ext3>).collect();
+                let mut best = [f64::MAX; 2];
+                for _ in 0..5 {
+                    for (j, on) in [false, true].into_iter().enumerate() {
+                        force_argue_host_parallel(Some(on));
+                        let mut t = DefaultTranscript::<Ext3>::new(b"probe");
+                        let start = std::time::Instant::now();
+                        prove_trees(&dyns, &mut t).unwrap();
+                        best[j] = best[j].min(start.elapsed().as_secs_f64());
+                    }
+                }
+                force_argue_host_parallel(None);
+                println!(
+                    "HOST STEPS PROBE: {n} trees of 2^{k} cells · one after another {:.3} ms · side by side {:.3} ms",
+                    best[0] * 1e3,
+                    best[1] * 1e3
+                );
+            }
+        }
     }
 }
