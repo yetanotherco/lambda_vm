@@ -1336,6 +1336,13 @@ pub struct ExecSplit {
     /// schedule is wrong", and those want opposite fixes.
     pub serial_hashes: usize,
     pub serial_hash_secs: f64,
+    /// A streamed execution's own setup, by step: the forward pass that
+    /// gives each instruction the groups it waits for, the wave buckets
+    /// built from them ([`WaveBuckets`]; 0 unbucketed), and the first wave
+    /// (the instructions that read no arena). 0 for a plain execution.
+    pub need_pass: f64,
+    pub bucket_build: f64,
+    pub first_wave: f64,
 }
 
 impl ExecSplit {
@@ -1888,7 +1895,9 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
                 _ => 0,
             }
         };
+        let t = Instant::now();
         let need = Self::need_of_pieced(program, group_at);
+        let need_pass = t.elapsed().as_secs_f64();
         let mut streamed = Self::start(
             program,
             hasher,
@@ -1899,6 +1908,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             lean_tap,
             bucketed,
         )?;
+        streamed.split.need_pass = need_pass;
         streamed.m.pieces = by_arena
             .iter()
             .map(|ps| {
@@ -1973,7 +1983,9 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         let schema = &program.arena_schema.lens;
         let t = Instant::now();
         let levels = exec_schedule::build_with_merge(program, 1);
+        let t_buckets = Instant::now();
         let buckets = bucketed.then(|| WaveBuckets::build(&levels, &need));
+        let bucket_build = t_buckets.elapsed().as_secs_f64();
         // Bucketed, the waves read the buckets' sets, never `need` again.
         let need = if bucketed { Vec::new() } else { need };
         let mut split = ExecSplit {
@@ -2009,7 +2021,10 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             lean_tap: lean_tap.then(Vec::new),
             buckets,
         };
+        streamed.split.bucket_build = bucket_build;
+        let t = Instant::now();
         streamed.wave(None)?;
+        streamed.split.first_wave = t.elapsed().as_secs_f64();
         Ok(streamed)
     }
 
@@ -2192,6 +2207,11 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         }
         self.ran += ran;
         Ok(())
+    }
+
+    /// Where the execution's time has gone so far ([`ExecSplit`]).
+    pub fn split(&self) -> &ExecSplit {
+        &self.split
     }
 
     /// Instructions run so far.

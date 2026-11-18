@@ -888,9 +888,13 @@ fn rta_one_run(
     );
     if let Some(x) = &t.level1_exec {
         println!(
-            "RTA LEVEL1 EXEC: schedule {:.3}s · setup {:.3}s · levels {} (on the pool {}, {} hashes) · hashing {:.3}s \
-             (on the driver's thread {} hashes in {:.3}s) · apply {:.3}s · the rest {:.3}s",
+            "RTA LEVEL1 EXEC: schedule {:.3}s · need pass {:.3}s · buckets {:.3}s · first wave {:.3}s · setup {:.3}s · \
+             levels {} (on the pool {}, {} hashes) · hashing {:.3}s (on the driver's thread {} hashes in {:.3}s) · apply \
+             {:.3}s · the rest {:.3}s",
             x.depth_pass,
+            x.need_pass,
+            x.bucket_build,
+            x.first_wave,
             x.setup,
             x.levels,
             x.parallel_levels,
