@@ -1128,3 +1128,171 @@ fn page_runs_need_the_word_format_and_stay_under_their_cap() {
     assert!(block_whir::check_memory_format(&words().with_page_run(MAX_PAGE_RUN_LOG2)).is_ok());
     assert!(block_whir::check_memory_format(&BlockFormat::pinned()).is_ok());
 }
+
+// =========================================================================
+// The prepared opening's pages and the page list's own checks
+// =========================================================================
+
+/// Every page of data (a nonzero byte) is the first page of a page table of
+/// its own at every run, on every list of the stream: the genesis rule's
+/// dense pages, which the prepared opening settles, are tables of their own
+/// whatever the run.
+#[test]
+fn every_page_of_data_is_a_table_of_its_own_at_every_run() {
+    for (case, list) in lists().iter().enumerate() {
+        for run_log2 in 0..=MAX_PAGE_RUN_LOG2 {
+            let tables = page_tables(list, run_log2).expect("cut");
+            for (i, config) in list.iter().enumerate() {
+                if crate::continuation::nonzero_entries(config) > 0 && !config.is_private_input {
+                    assert!(
+                        tables.iter().any(|t| t.first == i
+                            && t.kind == PageTableKind::Page
+                            && t.pages() == 1),
+                        "{case}: page {i} at 2^{run_log2}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The prepared tables of `format`'s frame of [`statement_at`], each by its
+/// table's name: what the opening settles, and on which table.
+fn prepared_by_name(format: &BlockFormat) -> Vec<(String, Vec<Vec<FE>>)> {
+    let (statement, _) = statement_at(format);
+    let frame = super::word_memory_tests::frame_of(&statement, format).expect("frames");
+    let refs = frame.airs.air_refs();
+    block_whir::prepared_tables(&frame.airs, &frame.page_configs, format)
+        .expect("the prepared tables")
+        .into_iter()
+        .map(|(table, columns)| (refs[table].name().to_string(), columns))
+        .collect()
+}
+
+/// ★ The prepared opening settles the same pages at every run: the genesis
+/// rule reads the pages (its page count and each page's candidacy), never the
+/// tables, and a dense page is a page of data, a table of its own, so the
+/// opening's columns and the PAGE_W tables they settle (by name) are the same
+/// with runs off and on. As the program's pages fall (none dense: DECODE
+/// alone), and with every page of data dense (forced, on this thread).
+#[test]
+fn the_dense_pages_are_the_same_at_every_page_run() {
+    for forced in [false, true] {
+        block_whir::DENSE_PAGES_FORCED.with(|c| c.set(forced));
+        let checked = std::panic::catch_unwind(|| {
+            let today = prepared_by_name(&words());
+            assert_eq!(today[0].0, "DECODE");
+            if forced {
+                assert!(
+                    today
+                        .iter()
+                        .any(|(n, _)| n.starts_with(page_w::NAME_PREFIX)),
+                    "a page settled by the opening"
+                );
+            }
+            for run_log2 in [1, 2, 4] {
+                assert!(
+                    prepared_by_name(&words().with_page_run(run_log2)) == today,
+                    "forced {forced}: the opening at 2^{run_log2} is today's"
+                );
+            }
+        });
+        block_whir::DENSE_PAGES_FORCED.with(|c| c.set(false));
+        if let Err(panic) = checked {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+/// ★ F7: a runtime range overlapping a page of the program, or another
+/// range, is refused by the page list's one-page-a-base check before any
+/// table is cut, at every run; and the rule refuses such a list itself.
+#[test]
+fn an_overlapping_runtime_range_is_refused_at_every_run() {
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let elf_page =
+        crate::tables::trace_builder::Traces::page_configs_from_elf(&program)[0].page_base;
+    for run_log2 in [0u8, 2, 4] {
+        let format = words().with_page_run(run_log2);
+        let (statement, _) = statement_at(&format);
+        for overlap in [
+            crate::RuntimePageRange {
+                base: elf_page,
+                count: 1,
+            },
+            crate::RuntimePageRange {
+                base: 70 * PAGE,
+                count: 2,
+            },
+        ] {
+            let base = overlap.base;
+            let mut bad = statement.clone();
+            bad.runtime_page_ranges.push(overlap);
+            let refused = super::word_memory_tests::frame_of(&bad, &format);
+            assert!(
+                matches!(&refused, Err(crate::Error::MalformedPageLayout(e)) if e.contains("two page tables cover")),
+                "at 2^{run_log2}, {base:#x}: {:?}",
+                refused.err()
+            );
+        }
+    }
+    let mut doubled = run(64 * PAGE, 4, PageConfig::zero_init);
+    doubled.push(PageConfig::zero_init(65 * PAGE));
+    doubled.sort_by_key(|c| c.page_base);
+    for run_log2 in 0..=MAX_PAGE_RUN_LOG2 {
+        assert!(page_tables(&doubled, run_log2).is_err());
+    }
+}
+
+/// ★ The census reads the page blocks: at runs of 16 pages every page table of
+/// the verifier's set passes its page rule (one mint at timestamp 0 at
+/// `base + 8·OFFSET`, `OFFSET` preprocessed, the base aligned to the table's
+/// span, each initial-word column preprocessed or held to a half). Refused: a
+/// zero block minting a committed column as its word, a private block without
+/// one `INIT` half's check, a block whose name says a span its base is not
+/// aligned to.
+#[test]
+fn the_census_reads_the_page_blocks() {
+    use super::word_memory_tests::census_table;
+    let format = words().with_page_run(4);
+    let (statement, tables) = statement_at(&format);
+    let frame = super::word_memory_tests::frame_of(&statement, &format).expect("frames");
+    let first = block_whir::first_page_index(&frame.airs).expect("the pages");
+    let refs = frame.airs.air_refs();
+    for (i, table) in tables.iter().enumerate() {
+        let air = refs[first + i];
+        census_table(
+            air.name(),
+            air.bus_interactions(),
+            air.num_precomputed_columns(),
+        )
+        .unwrap_or_else(|e| panic!("{}: {e}", table.name()));
+    }
+    let zero = tables
+        .iter()
+        .find(|t| t.kind == PageTableKind::Zero && t.pages() == 16)
+        .expect("a block of 16");
+    let own = page_w::page_table_interactions(zero, &frame.page_configs).expect("its own");
+    let mut minted = own.clone();
+    minted[0].values[3] = super::word_memory::column(zw::FINI_LO);
+    assert!(census_table(&zero.name(), &minted, 1).is_err());
+    let wide = PageTable {
+        log_pages: 7,
+        ..*zero
+    };
+    assert!(
+        census_table(&wide.name(), &own, 1).is_err(),
+        "{}",
+        wide.name()
+    );
+    let private = tables
+        .iter()
+        .find(|t| t.kind == PageTableKind::Private)
+        .expect("the private block");
+    let mut unchecked =
+        page_w::page_table_interactions(private, &frame.page_configs).expect("its own");
+    assert!(census_table(&private.name(), &unchecked, 1).is_ok());
+    unchecked.remove(2);
+    assert!(census_table(&private.name(), &unchecked, 1).is_err());
+}

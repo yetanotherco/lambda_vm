@@ -2498,11 +2498,18 @@ pub(super) fn census_table_with(
             ));
         }
     }
-    let is_page = name.starts_with(page_w::NAME_PREFIX);
+    // A page table: PAGE_W's page, or under page runs a zero or private
+    // block, whose name ends in its page count (`:<pages>`).
+    let block_pages = [page_w::ZERO_NAME_PREFIX, page_w::PRIVATE_NAME_PREFIX]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        .then(|| name.rsplit(':').next().and_then(|n| n.parse::<i128>().ok()));
+    let is_page = name.starts_with(page_w::NAME_PREFIX) || block_pages.is_some();
     if is_page {
         // c3: one mint at timestamp 0 and one final, at 1, at one key
         // `base + 8·OFFSET` with OFFSET preprocessed and the base two 32-bit
-        // constants; each initial-word column preprocessed or held to a half.
+        // constants, the low one aligned to the table's span; each
+        // initial-word column preprocessed or held to a half.
         let [mint, last] = tokens.as_slice() else {
             return Err(format!("{name}: {} word tokens, not 2", tokens.len()));
         };
@@ -2510,9 +2517,14 @@ pub(super) fn census_table_with(
         let lo = form(&mint.values[0])?;
         let hi = form(&mint.values[1])?;
         let is_word = |c: Option<&i128>| c.is_none_or(|&c| (0..1i128 << 32).contains(&c));
-        let page_aligned = lo
-            .get(&None)
-            .is_none_or(|&c| c % DEFAULT_PAGE_SIZE as i128 == 0);
+        let span = match block_pages {
+            None => DEFAULT_PAGE_SIZE as i128,
+            Some(Some(pages)) if pages > 0 && pages & (pages - 1) == 0 => {
+                DEFAULT_PAGE_SIZE as i128 * pages
+            }
+            Some(_) => return Err(format!("{name}: a block without its page count")),
+        };
+        let page_aligned = lo.get(&None).is_none_or(|&c| c % span == 0);
         if mint.is_sender
             || !last.is_sender
             || mint.multiplicity != Multiplicity::One
