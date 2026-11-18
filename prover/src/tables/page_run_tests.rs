@@ -375,3 +375,757 @@ fn malformed_lists_and_tables_are_refused() {
     );
     assert!(block(PAGE, 1, PageTableKind::Zero).configs(&list).is_err());
 }
+
+// =========================================================================
+// The page tables on the bench (`word_memory_tests`' model, no proof)
+// =========================================================================
+
+use super::memw_w::cols as mw;
+use super::page_w::{FinalWordMap, cols as pw, zero_cols as zw};
+use super::types::{BusId, FE};
+use super::word_memory_tests::{
+    Bench, CPU_WORD_TABLES, Model, Piece, chip_free_counts, memw_w_row, set_chip_word, verdict,
+};
+use crate::block_whir::{self, BlockFormat, OwnedBlockStatement};
+use crate::tables::fused_memory::MemoryFormat;
+use stark::lookup::{BusValue, LinearTerm};
+use stark::proof::options::ProofOptions;
+
+const DATA_BASE: u64 = 8 * PAGE;
+const ZERO_BLOCK: u64 = 4 * PAGE;
+
+/// A page table's bench piece, as the verifier builds its table: its
+/// interactions and preprocessed columns, its trace from `words`.
+fn piece_of(table: &PageTable, configs: &[PageConfig], words: &FinalWordMap) -> Piece {
+    Piece {
+        name: table.name(),
+        interactions: page_w::page_table_interactions(table, configs).expect("its interactions"),
+        trace: page_w::generate_page_table_trace(table, configs, words).expect("its trace"),
+        preprocessed: page_w::page_table_preprocessed_columns(table, configs).expect("its columns"),
+        constraints: None,
+    }
+}
+
+/// `m`'s bench, its pages in the page tables of runs of at most `2^run_log2`
+/// pages.
+fn bench_runs(m: &Model, run_log2: u8) -> Bench {
+    let tables = page_tables(&m.pages, run_log2).expect("the pages cut");
+    m.bench_with(
+        tables
+            .iter()
+            .map(|t| piece_of(t, &m.pages, &m.words))
+            .collect(),
+    )
+}
+
+fn elf_data() -> Vec<u8> {
+    (0..4096u32).map(|i| (i * 37 + 11) as u8).collect()
+}
+
+/// The pages of the page-run benches: a zero page at index 3 (odd: a block
+/// of one), zero pages 4..8 (one block of four from runs of 4 pages on), a
+/// page of data at 8, two private-input pages (one block of two from runs of
+/// 2 on), the stack's top page.
+fn run_pages() -> Vec<PageConfig> {
+    let input: Vec<u8> = (0..(DEFAULT_PAGE_SIZE + 4096) as u32)
+        .map(|i| (i * 101 + 3) as u8)
+        .collect();
+    let mut pages = run(3 * PAGE, 5, PageConfig::zero_init);
+    pages.push(PageConfig::with_data(DATA_BASE, elf_data()));
+    pages.push(PageConfig::with_private_input(
+        INPUT_BASE,
+        input[..DEFAULT_PAGE_SIZE].to_vec(),
+    ));
+    pages.push(PageConfig::with_private_input(
+        INPUT_BASE + PAGE,
+        input[DEFAULT_PAGE_SIZE..].to_vec(),
+    ));
+    pages.push(PageConfig::zero_init(STACK_TOP_PAGE));
+    pages
+}
+
+/// `pages` with the honest accesses of the page-run benches, but the read of
+/// the page of data unless `data_read`: two words across the zero block's
+/// first internal page boundary written and read back, a zero page read, a
+/// word of the second private page read, the stack written and read.
+fn run_model(pages: Vec<PageConfig>, data_read: bool) -> Model {
+    let mut m = Model::new(pages);
+    m.write(ZERO_BLOCK + PAGE - 8, 8, [0x1122_3344_5566_7788, u64::MAX]);
+    m.read(ZERO_BLOCK + PAGE - 8, 12);
+    m.read(3 * PAGE + 0x100, 16);
+    if data_read {
+        m.read(DATA_BASE + 0x40, 20);
+    }
+    m.read(INPUT_BASE + PAGE + 0x10, 24);
+    m.write(STACK_TOP_PAGE + 0x3_FF00, 28, [0xDEAD_BEEF, 0xCAFE]);
+    m.read(STACK_TOP_PAGE + 0x3_FF00, 32);
+    m
+}
+
+/// The names of a bench's pieces.
+fn names(bench: &Bench) -> Vec<String> {
+    bench.pieces.iter().map(|p| p.name.clone()).collect()
+}
+
+/// ★ The honest bench at every run: accepted, the same accesses balancing
+/// whatever tables the pages are cut into. With runs off its pieces are
+/// today's, piece for piece (names, interactions, every cell, the
+/// preprocessed columns); at runs of 4 pages the zero run 3..8 is two tables,
+/// the private pages one, the page of data and the stack's top page their
+/// own.
+#[test]
+fn the_page_run_bench_is_accepted_at_every_run_and_is_todays_with_runs_off() {
+    let m = run_model(run_pages(), true);
+    let today = m.bench();
+    let off = bench_runs(&m, 0);
+    assert_eq!(names(&off), names(&today));
+    for (a, b) in off.pieces.iter().zip(&today.pieces) {
+        assert!(a.interactions == b.interactions, "{}", a.name);
+        assert_eq!(a.preprocessed, b.preprocessed, "{}", a.name);
+        let (s, t) = (&a.trace, &b.trace);
+        assert_eq!(
+            (s.num_rows(), s.main_table.width),
+            (t.num_rows(), t.main_table.width)
+        );
+        for r in 0..s.num_rows() {
+            for c in 0..s.main_table.width {
+                assert_eq!(s.get_main(r, c), t.get_main(r, c), "{} {r} {c}", a.name);
+            }
+        }
+    }
+    for run_log2 in 0..=MAX_PAGE_RUN_LOG2 {
+        let v = verdict(&bench_runs(&m, run_log2));
+        assert!(v.accepted(), "at 2^{run_log2}: {v:?}");
+    }
+    let at2 = bench_runs(&m, 2);
+    assert_eq!(
+        names(&at2)[..5],
+        [
+            "PAGE_Z:0xc0000:1",
+            "PAGE_Z:0x100000:4",
+            "PAGE_W:0x200000",
+            "PAGE_P:0xff000000:2",
+            "PAGE_Z:0xfffffffffffc0000:1",
+        ]
+    );
+    // The zero block: 4 columns, the words across its internal boundary its
+    // rows 2^15 − 1 and 2^15.
+    let block = at2.piece("PAGE_Z:0x100000:4");
+    assert_eq!(block.trace.main_table.width, zw::NUM_COLUMNS);
+    assert_eq!(block.trace.num_rows(), 4 * page_w::ROWS);
+    let at = |r: usize, c: usize| block.trace.get_main(r, c).canonical_u64();
+    let edge = page_w::ROWS;
+    assert_eq!(
+        (at(edge - 1, zw::OFFSET), at(edge, zw::OFFSET)),
+        (edge as u64 - 1, edge as u64)
+    );
+    assert_eq!(
+        (at(edge - 1, zw::TIMESTAMP), at(edge, zw::TIMESTAMP)),
+        (12, 12)
+    );
+    assert_eq!(
+        (at(edge, zw::FINI_LO), at(edge, zw::FINI_HI)),
+        (0xFFFF_FFFF, 0xFFFF_FFFF)
+    );
+    // Its mint: `(base_lo + 8·OFFSET, base_hi, 0, 0, 0)`.
+    assert_eq!(
+        block.interactions[0].values,
+        vec![
+            BusValue::linear(vec![
+                LinearTerm::Constant(ZERO_BLOCK as i64),
+                super::word_memory::term(8, zw::OFFSET),
+            ]),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+        ]
+    );
+}
+
+/// A bench's piece `name` replaced by `piece`.
+fn replace(bench: &mut Bench, name: &str, piece: Piece) {
+    let at = bench
+        .pieces
+        .iter()
+        .position(|p| p.name == name)
+        .unwrap_or_else(|| panic!("the bench holds {name}"));
+    bench.pieces[at] = piece;
+}
+
+/// A zero block's piece laid out by hand, whatever its alignment or height:
+/// `interactions` (a zero block's), `rows` rows from `base`, each row's final
+/// state from `words` at its byte address `base + 8·row`, `OFFSET` the row
+/// index and preprocessed at that height.
+fn zero_piece_by_hand(
+    name: &str,
+    base: u64,
+    rows: usize,
+    words: &FinalWordMap,
+    interactions: Vec<stark::lookup::BusInteraction>,
+) -> Piece {
+    let trace = super::word_memory_tests::table(rows, zw::NUM_COLUMNS, |t, r| {
+        let state = words
+            .get(&(base + 8 * r as u64))
+            .copied()
+            .unwrap_or_default();
+        let (lo, hi) = super::word_memory::halves(state.value);
+        t.main_table.set(r, zw::OFFSET, FE::from(r as u64));
+        t.main_table.set(r, zw::FINI_LO, FE::from(u64::from(lo)));
+        t.main_table.set(r, zw::FINI_HI, FE::from(u64::from(hi)));
+        t.main_table
+            .set(r, zw::TIMESTAMP, FE::from(state.timestamp));
+    });
+    Piece {
+        name: name.into(),
+        interactions,
+        trace,
+        preprocessed: vec![page_w::offset_column_of(rows)],
+        constraints: None,
+    }
+}
+
+/// ★ F1, a block taller than its pages: the zero block of pages 4..8 stated
+/// at 8 pages' rows (its interactions its own, its `OFFSET` at that height, as
+/// a verifier without the height rule would build it) mints the next page's
+/// words a second time, the page of data's included, with the word 0; a
+/// forged read of the data page's first words as 0 then balances every bus,
+/// the data page's own table left untouched. The frame's height rule refuses
+/// that statement ([`a_page_table_is_held_to_its_place_name_and_height`]).
+#[test]
+fn a_taller_block_would_mint_the_next_pages_words_twice() {
+    // The forger's accesses: the honest ones, and the data page's first two
+    // words read as 0 (what the taller block minted for them).
+    let mut forger_pages = run_pages();
+    let data = forger_pages
+        .iter()
+        .position(|c| c.page_base == DATA_BASE)
+        .expect("the data page");
+    forger_pages[data] = PageConfig::zero_init(DATA_BASE);
+    let mut m = run_model(forger_pages, false);
+    assert_eq!(m.read(DATA_BASE, 36), [0, 0], "read as the word 0");
+    let honest = page_tables(&run_pages(), 2).expect("cut");
+    let mut forged = m.bench_with(
+        honest
+            .iter()
+            .map(|t| {
+                // The data page's own table as the verifier has it, untouched.
+                let words = if t.base == DATA_BASE {
+                    FinalWordMap::new()
+                } else {
+                    m.words.clone()
+                };
+                piece_of(t, &run_pages(), &words)
+            })
+            .collect(),
+    );
+    let block = PageTable {
+        kind: PageTableKind::Zero,
+        base: ZERO_BLOCK,
+        log_pages: 2,
+        first: 0,
+    };
+    let own_pages = run(ZERO_BLOCK, 4, PageConfig::zero_init);
+    let own = page_w::page_table_interactions(&block, &own_pages).expect("its own");
+    let taller = zero_piece_by_hand("TALLER", ZERO_BLOCK, 8 * page_w::ROWS, &m.words, own);
+    replace(&mut forged, &block.name(), taller);
+    let v = verdict(&forged);
+    assert!(
+        v.accepted(),
+        "control: a taller block's forgery balances: {v:?}"
+    );
+    // With the block at its own height the read of 0 is left unanswered.
+    let mut held = forged.clone();
+    replace(&mut held, "TALLER", piece_of(&block, &own_pages, &m.words));
+    let v = verdict(&held);
+    assert!(v.refused_only_on(BusId::MemWord), "{v:?}");
+}
+
+/// ★ F3, a page of data presented as zero: the verifier's cut never puts a
+/// data page in a block, and a zero block over one is refused by the table's
+/// own constructor; so the forger's read of the data page as 0 consumes a
+/// token no table of the verifier's mints, and only the word bus refuses it.
+/// Control: the classification taken from the forger (the page zero, its
+/// run one block), and the forged read balances.
+#[test]
+fn a_page_of_data_in_a_zero_block_is_refused_by_the_verifiers_cut() {
+    let pages = run_pages();
+    let mut forger_pages = pages.clone();
+    let data = forger_pages
+        .iter()
+        .position(|c| c.page_base == DATA_BASE)
+        .expect("the data page");
+    forger_pages[data] = PageConfig::zero_init(DATA_BASE);
+    let mut m = run_model(forger_pages.clone(), false);
+    assert_eq!(m.read(DATA_BASE, 36), [0, 0]);
+    // The verifier's tables over the forger's accesses.
+    let tables = page_tables(&pages, 3).expect("cut");
+    assert!(
+        tables
+            .iter()
+            .any(|t| t.kind == PageTableKind::Page && t.base == DATA_BASE),
+        "the data page is a table of its own"
+    );
+    let verifiers = m.bench_with(
+        tables
+            .iter()
+            .map(|t| piece_of(t, &pages, &m.words))
+            .collect(),
+    );
+    let v = verdict(&verifiers);
+    assert!(v.refused_only_on(BusId::MemWord), "{v:?}");
+    // The forger's cut: the data page joins the zero run 3..9 as a block.
+    let theirs = page_tables(&forger_pages, 3).expect("cut");
+    let block = theirs
+        .iter()
+        .find(|t| {
+            t.kind == PageTableKind::Zero && t.base <= DATA_BASE && DATA_BASE < t.base + t.span()
+        })
+        .expect("the forger's zero table over the data page");
+    let v = verdict(&bench_runs(&m, 3));
+    assert!(v.accepted(), "control: {v:?}");
+    // That table over the true pages: no constructor builds it.
+    assert!(block.configs(&pages).is_err());
+    assert!(page_w::page_table_interactions(block, &pages).is_err());
+    assert!(page_w::generate_page_table_trace(block, &pages, &FinalWordMap::new()).is_err());
+    let opts = ProofOptions::default_test_options();
+    assert!(crate::test_utils::create_page_table_air(&opts, block, &pages).is_err());
+}
+
+/// A zero block's interactions at any `base`, aligned or not: an aligned
+/// block's with its base's two constants moved.
+fn zero_block_interactions_at(base: u64) -> Vec<stark::lookup::BusInteraction> {
+    let aligned = PageTable {
+        kind: PageTableKind::Zero,
+        base: 0,
+        log_pages: 1,
+        first: 0,
+    };
+    let mut out = page_w::page_table_interactions(&aligned, &run(0, 2, PageConfig::zero_init))
+        .expect("aligned");
+    for bi in &mut out {
+        bi.values[0] = BusValue::linear(vec![
+            LinearTerm::Constant((base & 0xFFFF_FFFF) as i64),
+            super::word_memory::term(8, zw::OFFSET),
+        ]);
+        bi.values[1] = BusValue::constant(base >> 32);
+    }
+    out
+}
+
+/// ★ F4, a block off its span's alignment: the derivation never cuts one
+/// (`every_cut_is_an_aligned_partition_and_the_lists_alone_decide_it`) and
+/// no constructor builds one. Its words would run past `2^32` in the key's
+/// low half: two pages from `2^32 − 2^18` as one block mint `(2^32, 0)`, a key
+/// no aligned table names (the word at `2^32` is `(0, 1)`). A read whose
+/// second word is named `(2^32, 0)` (a pointer at `2^32 − 8`, its next word
+/// `+ 8` in the low half) consumes a token no aligned table minted and is
+/// refused on the word bus alone; control: the misaligned block, which mints
+/// it, and the read balances.
+#[test]
+fn a_block_off_its_alignment_would_mint_past_two_to_the_32() {
+    let low = (1u64 << 32) - PAGE;
+    let pages = vec![PageConfig::zero_init(low), PageConfig::zero_init(1 << 32)];
+    let misaligned = PageTable {
+        kind: PageTableKind::Zero,
+        base: low,
+        log_pages: 1,
+        first: 0,
+    };
+    assert!(check_page_table(&misaligned).is_err());
+    let opts = ProofOptions::default_test_options();
+    assert!(crate::test_utils::create_page_table_air(&opts, &misaligned, &pages).is_err());
+    assert!(page_w::page_table_interactions(&misaligned, &pages).is_err());
+    assert!(
+        page_tables(&pages, 1)
+            .expect("cut")
+            .iter()
+            .all(|t| t.log_pages == 0),
+        "the verifier cuts two pages of one"
+    );
+    // The read at `2^32 − 8`, its second word's key `(2^32, 0)`: the model's
+    // rows at the true word `2^32`, its MEMW_W row's key moved.
+    let mut m = Model::new(pages.clone());
+    m.read((1 << 32) - 8, 8);
+    let row = memw_w_row(&m, 1 << 32, 8);
+    let mut bench = bench_runs(&m, 0);
+    bench.set_u64("MEMW_W", row, mw::ADDRESS_LO, 1 << 32);
+    bench.set_u64("MEMW_W", row, mw::ADDRESS_HI, 0);
+    // The aligned tables: the read's tokens at `(0, 1)` were the page's.
+    let at_2_32 = page_tables(&pages, 0).expect("cut")[1];
+    replace(
+        &mut bench,
+        &at_2_32.name(),
+        piece_of(&at_2_32, &pages, &FinalWordMap::new()),
+    );
+    let v = verdict(&bench);
+    assert!(v.refused_only_on(BusId::MemWord), "{v:?}");
+    // Control: one misaligned block over both pages, its rows by hand.
+    // Its row 2^15 is the word at 2^32, its key `(2^32, 0)`.
+    let mut control = bench_runs(&m, 0);
+    control.set_u64("MEMW_W", row, mw::ADDRESS_LO, 1 << 32);
+    control.set_u64("MEMW_W", row, mw::ADDRESS_HI, 0);
+    control
+        .pieces
+        .retain(|p| !p.name.starts_with(page_w::NAME_PREFIX));
+    control.pieces.push(zero_piece_by_hand(
+        "MISALIGNED",
+        low,
+        2 * page_w::ROWS,
+        &m.words,
+        zero_block_interactions_at(low),
+    ));
+    let v = verdict(&control);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ F5, a block's internal page boundary (rows `2^15 − 1` and `2^15` of the
+/// zero block, the last word of its first page and the first of its second,
+/// both written and read): a final word or timestamp moved there is refused
+/// by the word bus alone. Its `OFFSET` is the verifier's across the boundary:
+/// a forger's row of the second page re-minting the first page's word 0
+/// (`OFFSET` 0) answers a read of 0 after that word was written, and is
+/// refused by the preprocessed check alone; control: that `OFFSET` the
+/// forger's, and the forged read balances.
+#[test]
+fn a_blocks_internal_page_boundary_is_held() {
+    let name = "PAGE_Z:0x100000:4";
+    let edge = page_w::ROWS;
+    let m = run_model(run_pages(), true);
+    let bench = bench_runs(&m, 2);
+    for (row, col) in [
+        (edge, zw::FINI_LO),
+        (edge, zw::FINI_HI),
+        (edge - 1, zw::TIMESTAMP),
+        (edge, zw::TIMESTAMP),
+    ] {
+        let mut forged = bench.clone();
+        let v = forged.get(name, row, col) + FE::one();
+        forged.set(name, row, col, v);
+        let v = verdict(&forged);
+        assert!(v.refused_only_on(BusId::MemWord), "{row} {col}: {v:?}");
+    }
+
+    // The re-mint: page 4's word 0 written at 36, then read at 40 as 0 from a
+    // second chain minted by row 2^15 + 2 (page 5's word 2) with OFFSET 0.
+    let mut m = run_model(run_pages(), true);
+    m.write(ZERO_BLOCK, 36, [0x77, 0x88]);
+    m.read(ZERO_BLOCK, 40);
+    let mut forged = bench_runs(&m, 2);
+    let r = memw_w_row(&m, ZERO_BLOCK, 40);
+    for (col, value) in [
+        (mw::OLD_LO, 0),
+        (mw::OLD_HI, 0),
+        (mw::NEW_LO, 0),
+        (mw::NEW_HI, 0),
+        (mw::STEP_0, 39),
+        (mw::STEP_1, 0),
+    ] {
+        forged.set_u64("MEMW_W", r, col, value);
+    }
+    let reader = m.readers.iter().position(|c| c.ts == 40).expect("the read");
+    set_chip_word(&mut forged, "READER", reader, 0, 0, 0);
+    // Chain A ends at the write; chain B at the forged read, on row 2^15 + 2.
+    forged.set_u64(name, 0, zw::TIMESTAMP, 36);
+    forged.set_u64(name, 0, zw::FINI_LO, 0x77);
+    let b = edge + 2;
+    forged.set_u64(name, b, zw::OFFSET, 0);
+    forged.set_u64(name, b, zw::TIMESTAMP, 40);
+    forged.set_u64(name, b, zw::FINI_LO, 0);
+    forged.set_u64(name, b, zw::FINI_HI, 0);
+    let v = verdict(&forged);
+    assert_eq!(
+        v.preprocessed,
+        vec![(name.to_string(), b, zw::OFFSET)],
+        "{v:?}"
+    );
+    assert!(
+        v.left.is_empty() && v.unanswered.is_empty() && v.broken.is_empty(),
+        "{v:?}"
+    );
+    let column = (0..forged.piece(name).trace.num_rows())
+        .map(|r| forged.get(name, r, zw::OFFSET))
+        .collect();
+    forged.piece_mut(name).preprocessed[zw::OFFSET] = column;
+    let v = verdict(&forged);
+    assert!(v.accepted(), "control: {v:?}");
+}
+
+/// ★ F6, a private block's initial words are canonical, each 16-bit half by
+/// its own `IS_HALF`, on its second page too: one half of a word of the
+/// second private page moved past 16 bits (carried through the read to the
+/// block's final word) is refused by that half's lookup alone; control: that
+/// lookup removed, the read takes a word that is not one.
+#[test]
+fn a_private_blocks_init_word_past_32_bits_is_refused_by_its_half_check() {
+    let m = run_model(run_pages(), true);
+    let bench = bench_runs(&m, 2);
+    let table = page_tables(&m.pages, 2)
+        .expect("cut")
+        .into_iter()
+        .find(|t| t.kind == PageTableKind::Private)
+        .expect("the private block");
+    assert_eq!(table.pages(), 2);
+    let name = table.name();
+    let word = page_w::ROWS + 0x10 / 8;
+    let row = memw_w_row(&m, INPUT_BASE + PAGE + 0x10, 24);
+    let reader = m.readers.iter().position(|r| r.ts == 24).expect("the read");
+    let read = m.readers[reader].words[0];
+    for k in 0..4 {
+        let mut forged = bench.clone();
+        let (delta, upper) = match k {
+            0 | 2 => (FE::from(1u64 << 32), k == 2),
+            _ => (FE::from(1u64 << 16), k == 3),
+        };
+        let h = forged.get(&name, word, pw::INIT[k]) + delta;
+        forged.set(&name, word, pw::INIT[k], h);
+        let (fini, old, new) = if upper {
+            (pw::FINI_HI, mw::OLD_HI, mw::NEW_HI)
+        } else {
+            (pw::FINI_LO, mw::OLD_LO, mw::NEW_LO)
+        };
+        let half = forged.get("MEMW_W", row, old) + FE::from(1u64 << 32);
+        forged.set(&name, word, fini, half);
+        forged.set("MEMW_W", row, old, half);
+        forged.set("MEMW_W", row, new, half);
+        let (lo, hi) = (read & 0xFFFF_FFFF, read >> 32);
+        let (lo, hi) = if upper {
+            (lo, hi + (1 << 32))
+        } else {
+            (lo + (1 << 32), hi)
+        };
+        set_chip_word(&mut forged, "READER", reader, 0, lo, hi);
+        let v = verdict(&forged);
+        assert_eq!(
+            v.unanswered,
+            vec![(u64::from(BusId::IsHalfword), vec![h.canonical_u64()])],
+            "INIT_{k}: {v:?}"
+        );
+        assert!(v.left.is_empty() && v.broken.is_empty() && v.preprocessed.is_empty());
+        let mut control = page_w::page_table_interactions(&table, &m.pages).expect("its own");
+        control.remove(2 + k);
+        let v = verdict(&forged.with_interactions(&name, control));
+        assert!(v.accepted(), "INIT_{k} control: {v:?}");
+    }
+}
+
+// =========================================================================
+// The frame: the page tables are the verifier's
+// =========================================================================
+
+/// A word-format statement under `format` (no chip call, one table of each
+/// CPU word family): the program `all_instructions_64`'s pages of data, a
+/// heap of 20 zero pages from page 64, two private-input pages and the
+/// stack's top page; every table at 2^2 rows but BITWISE's 2^20 and each page
+/// table at its own height; one group a table. With the page tables it was
+/// cut into.
+fn statement_at(format: &BlockFormat) -> (OwnedBlockStatement, Vec<PageTable>) {
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let opts = ProofOptions::default_test_options();
+    let runtime_page_ranges = vec![
+        crate::RuntimePageRange {
+            base: 64 * PAGE,
+            count: 20,
+        },
+        crate::RuntimePageRange {
+            base: STACK_TOP_PAGE,
+            count: 1,
+        },
+    ];
+    let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &runtime_page_ranges,
+        2,
+        1 << 20,
+    )
+    .expect("pages");
+    let counts = chip_free_counts();
+    let inputs =
+        crate::BlockAirInputs::new(&opts, &program, vec![4; counts.cpu], &[]).expect("inputs");
+    let mut airs = crate::block_airs(
+        &program,
+        &opts,
+        &pages,
+        &counts,
+        &inputs,
+        format.keccak_rnd,
+        format.memw_aligned,
+        format.registers,
+        format.ecdas,
+    );
+    airs.with_word_memory_at(
+        &opts,
+        CPU_WORD_TABLES.map(|n| n as usize),
+        &pages,
+        format.page_run_log2,
+    )
+    .expect("the word tables");
+    let tables = page_tables(&pages, format.page_run_log2).expect("cut");
+    let first = block_whir::first_page_index(&airs).expect("the pages");
+    let table_num_vars: Vec<u8> = airs
+        .air_refs()
+        .iter()
+        .enumerate()
+        .map(|(i, air)| {
+            if air.name() == "BITWISE" {
+                crate::tables::bitwise::NUM_VARS as u8
+            } else if (first..first + tables.len()).contains(&i) {
+                tables[i - first].num_vars() as u8
+            } else {
+                2
+            }
+        })
+        .collect();
+    let statement = OwnedBlockStatement {
+        groups: (0..table_num_vars.len() as u32).map(|t| vec![t]).collect(),
+        table_num_vars,
+        runtime_page_ranges,
+        table_counts: counts,
+        public_output: Vec::new(),
+        num_private_input_pages: 2,
+        fused_memory: [0, 0],
+        word_memory: CPU_WORD_TABLES,
+    };
+    (statement, tables)
+}
+
+fn words() -> BlockFormat {
+    BlockFormat::pinned().with_memory(MemoryFormat::Words)
+}
+
+/// ★ The verifier frames a word statement at its own page run, its page
+/// tables cut by the rule from its own page list: their AIRs in PAGE's place,
+/// named for their class, base and pages, at their widths and with `OFFSET`
+/// (and a page of data's `INIT`) preprocessed. A statement cut at another run
+/// is refused whenever the cuts differ; where they are the same cut, the
+/// verifiers are one.
+#[test]
+fn a_word_statement_frames_at_its_own_page_run_alone() {
+    let runs = [0u8, 1, 2, 4];
+    for run_log2 in runs {
+        let format = words().with_page_run(run_log2);
+        let (statement, tables) = statement_at(&format);
+        let frame = super::word_memory_tests::frame_of(&statement, &format)
+            .unwrap_or_else(|e| panic!("at 2^{run_log2}: {e:?}"));
+        assert_eq!(frame.page_tables, tables);
+        let first = block_whir::first_page_index(&frame.airs).expect("the pages");
+        let refs = frame.airs.air_refs();
+        for (i, table) in tables.iter().enumerate() {
+            let air = refs[first + i];
+            assert_eq!(air.name(), table.name());
+            assert_eq!(air.trace_layout().0, page_w::page_table_width(table));
+            assert_eq!(
+                air.num_precomputed_columns(),
+                page_w::page_table_num_preprocessed_cols(table, &frame.page_configs)
+                    .expect("its columns")
+            );
+        }
+        if run_log2 == 4 {
+            // The heap's 20 pages from 64: 16 then 4.
+            assert!(tables.iter().any(|t| t.name() == "PAGE_Z:0x1000000:16"));
+            assert!(tables.iter().any(|t| t.name() == "PAGE_Z:0x1400000:4"));
+            assert!(tables.iter().any(|t| t.name() == "PAGE_P:0xff000000:2"));
+        }
+        for other in runs.into_iter().filter(|&o| o != run_log2) {
+            let theirs = words().with_page_run(other);
+            let same = page_tables(&frame.page_configs, other).expect("cut") == tables;
+            let framed = super::word_memory_tests::frame_of(&statement, &theirs);
+            assert_eq!(
+                framed.is_ok(),
+                same,
+                "cut at 2^{run_log2}, framed at 2^{other}"
+            );
+        }
+    }
+}
+
+/// ★ F1 and F2 in the frame: every page table is held to its place, name and
+/// height, which the verifier derives. A page table stated a row taller (or
+/// shorter) is refused; so is a statement with two tables' heights swapped,
+/// whose total is the same. `check_page_table_heights` refuses a table at a
+/// page table's place under another base, page count or class.
+#[test]
+fn a_page_table_is_held_to_its_place_name_and_height() {
+    let format = words().with_page_run(4);
+    let (statement, tables) = statement_at(&format);
+    let frame = super::word_memory_tests::frame_of(&statement, &format).expect("frames");
+    let first = block_whir::first_page_index(&frame.airs).expect("the pages");
+    let big = tables
+        .iter()
+        .position(|t| t.pages() == 16)
+        .expect("a block of 16")
+        + first;
+    let small = tables
+        .iter()
+        .position(|t| t.pages() == 4)
+        .expect("a block of 4")
+        + first;
+    for (at, by) in [(big, 1i8), (big, -1), (small, 1), (small, -1)] {
+        let mut bad = statement.clone();
+        bad.table_num_vars[at] = bad.table_num_vars[at].wrapping_add_signed(by);
+        let refused = super::word_memory_tests::frame_of(&bad, &format);
+        assert!(
+            matches!(&refused, Err(crate::Error::InvalidTableCounts(e)) if e.contains("PAGE_Z")),
+            "{at} {by}: {:?}",
+            refused.err()
+        );
+    }
+    let mut swapped = statement.clone();
+    swapped.table_num_vars.swap(big, small);
+    assert!(super::word_memory_tests::frame_of(&swapped, &format).is_err());
+
+    // By name: another base, page count or class at a page table's place.
+    let named = |names: &[String]| -> Vec<(String, u8)> {
+        names
+            .iter()
+            .zip(&tables)
+            .map(|(n, t)| (n.clone(), t.num_vars() as u8))
+            .collect()
+    };
+    let own: Vec<String> = tables.iter().map(PageTable::name).collect();
+    let check = |list: Vec<(String, u8)>| {
+        block_whir::check_page_table_heights(&tables, 0, list.iter().map(|(n, v)| (n.as_str(), *v)))
+    };
+    assert!(check(named(&own)).is_ok());
+    let b = big - first;
+    for other in [
+        PageTable {
+            base: tables[b].base + 16 * PAGE,
+            ..tables[b]
+        },
+        PageTable {
+            log_pages: 3,
+            ..tables[b]
+        },
+        PageTable {
+            kind: PageTableKind::Private,
+            ..tables[b]
+        },
+    ] {
+        let mut names = own.clone();
+        names[b] = other.name();
+        assert!(check(named(&names)).is_err(), "{}", other.name());
+    }
+    // One page table short or one more.
+    assert!(check(named(&own[..own.len() - 1])).is_err());
+}
+
+/// Page runs are the word memory format's alone, and at most
+/// [`MAX_PAGE_RUN_LOG2`]: the verifier refuses either before framing.
+#[test]
+fn page_runs_need_the_word_format_and_stay_under_their_cap() {
+    let (statement, _) = statement_at(&words().with_page_run(2));
+    for format in [
+        BlockFormat::pinned().with_page_run(2),
+        BlockFormat::pinned()
+            .with_memory(MemoryFormat::Fused)
+            .with_page_run(2),
+        words().with_page_run(MAX_PAGE_RUN_LOG2 + 1),
+    ] {
+        assert!(block_whir::check_memory_format(&format).is_err());
+        assert!(super::word_memory_tests::frame_of(&statement, &format).is_err());
+    }
+    assert!(block_whir::check_memory_format(&words().with_page_run(MAX_PAGE_RUN_LOG2)).is_ok());
+    assert!(block_whir::check_memory_format(&BlockFormat::pinned()).is_ok());
+}
