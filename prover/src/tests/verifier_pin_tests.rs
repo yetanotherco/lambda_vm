@@ -342,6 +342,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         multilinear::whir_chain::ArgueFormat::Batched {
             bin_log_cells: 26,
             pack: multilinear::whir_chain::GkrPack::Off,
+            ladder: multilinear::whir_chain::GkrLadder::Single,
         },
         "the harness's argue follows its packing knob"
     );

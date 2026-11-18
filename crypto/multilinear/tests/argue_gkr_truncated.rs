@@ -163,7 +163,8 @@ fn prove_ladder(tables: &[Table]) -> Alone {
     let ladder: Vec<&dyn LadderTree<Ext>> =
         trees.iter().map(|t| t as &dyn LadderTree<Ext>).collect();
     let mut tr = transcript();
-    let (proof, claims) = lockstep::prove_trees(&ladder, &mut tr).expect("the ladder proves");
+    let (proof, claims) = lockstep::prove_trees(&ladder, lockstep::GkrLadder::Single, &mut tr)
+        .expect("the ladder proves");
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
         .unwrap()
         .to_vec();
@@ -175,7 +176,14 @@ fn prove_ladder(tables: &[Table]) -> Alone {
     // The verifier takes it, from the outputs and heights alone.
     let outputs: Vec<(EE, EE)> = trees.iter().map(|t| t.output()).collect();
     let heights: Vec<usize> = trees.iter().map(|t| t.input_vars()).collect();
-    lockstep::verify(&proof, &outputs, &heights, &mut transcript()).expect("the ladder verifies");
+    lockstep::verify(
+        &proof,
+        &outputs,
+        &heights,
+        lockstep::GkrLadder::Single,
+        &mut transcript(),
+    )
+    .expect("the ladder verifies");
     let state = tr.state();
     (bytes, values, state, tr.sample_field_element())
 }

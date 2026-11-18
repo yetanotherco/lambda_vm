@@ -261,6 +261,7 @@ impl Fixture {
             &beta,
             cap,
             self.pack,
+            multilinear::whir_chain::GkrLadder::Single,
             &mut prover,
             ARGUE_FAULTS.with(std::cell::Cell::get),
             Where::Host,
@@ -510,6 +511,7 @@ fn with_run_on<R>(
             &statements,
             cap,
             fixture.pack,
+            multilinear::whir_chain::GkrLadder::Single,
             &z,
             &alpha,
             &beta,
@@ -727,6 +729,7 @@ fn the_production_cap_bins_the_fixture_once() {
     let ArgueFormat::Batched {
         bin_log_cells,
         pack,
+        ..
     } = ArgueFormat::BATCHED
     else {
         unreachable!()

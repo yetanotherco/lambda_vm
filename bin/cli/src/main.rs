@@ -1457,6 +1457,11 @@ fn cmd_prove_block_base(
             prover::block_whir::B3_BASE_ROUNDS_ENV,
             cfg.options.drop_levels
         );
+        eprintln!(
+            "BLOCK BASE GKR LADDER: {:?} ({} reads 0, single, 1 or double)",
+            cfg.format.argue.ladder(),
+            prover::block_whir::B3_BASE_GKR_ENV
+        );
     }
     eprintln!(
         "BLOCK BASE ONLY: base {:?} · group {group} · blowup {blowup} · leaves {leaves} · trees \

@@ -8,10 +8,11 @@ use multilinear::mle::Mle;
 
 use crate::lookup::{BusInteraction, Multiplicity, Packing};
 
-fn packed(bin_log_cells: u8, tree_log_cells: u8) -> ChainConfig {
+pub(super) fn packed(bin_log_cells: u8, tree_log_cells: u8) -> ChainConfig {
     config(ArgueFormat::Batched {
         bin_log_cells,
         pack: GkrPack::Chunks { tree_log_cells },
+        ladder: GkrLadder::Single,
     })
 }
 
@@ -20,6 +21,7 @@ fn unpacked(bin_log_cells: u8) -> ChainConfig {
     config(ArgueFormat::Batched {
         bin_log_cells,
         pack: GkrPack::Off,
+        ladder: GkrLadder::Single,
     })
 }
 
@@ -316,12 +318,12 @@ fn fan_columns(num_vars: usize, salt: u64) -> Vec<Vec<FE>> {
 /// The fan tables of a run: `(interactions, height)`.
 const FANS: [(usize, usize); 4] = [(5, 3), (7, 5), (9, 3), (11, 3)];
 
-fn fan_airs() -> Vec<Air<EmptyConstraints>> {
+pub(super) fn fan_airs() -> Vec<Air<EmptyConstraints>> {
     FANS.iter().map(|&(m, _)| fan_air(m)).collect()
 }
 
 /// CPU, ADD and MUL over `columns(3, 1)`, then the fans.
-fn packed_tables<'a>(
+pub(super) fn packed_tables<'a>(
     airs: &'a Airs,
     fans: &'a [Air<EmptyConstraints>],
     fan_cols: &[Vec<Vec<FE>>],
@@ -334,17 +336,21 @@ fn packed_tables<'a>(
     all
 }
 
-fn fan_cols() -> Vec<Vec<Vec<FE>>> {
+pub(super) fn fan_cols() -> Vec<Vec<Vec<FE>>> {
     FANS.iter()
         .enumerate()
         .map(|(i, &(_, n))| fan_columns(n, i as u64 + 1))
         .collect()
 }
 
-fn plan_of(committed: &CommittedTables<'_, Fp, Ext, KeccakWhir>, cfg: &ChainConfig) -> ArguePlan {
+pub(super) fn plan_of(
+    committed: &CommittedTables<'_, Fp, Ext, KeccakWhir>,
+    cfg: &ChainConfig,
+) -> ArguePlan {
     let ArgueFormat::Batched {
         bin_log_cells,
         pack,
+        ..
     } = cfg.format.argue
     else {
         unreachable!("a batched config")
