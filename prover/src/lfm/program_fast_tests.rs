@@ -205,3 +205,25 @@ fn the_beside_pool_prepares_the_same_level() {
         assert!(beside.chip_prefixes() == plain.chip_prefixes());
     }
 }
+
+/// The setup-fast knob's name; only `1` turns it on, and it is off by
+/// default.
+#[test]
+fn the_setup_fast_knob_is_named_and_off_by_default() {
+    use super::levels::{SETUP_FAST_ENV, setup_fast};
+    assert_eq!(SETUP_FAST_ENV, "LAMBDA_VM_LEVELS_SETUP_FAST");
+    if std::env::var_os(SETUP_FAST_ENV).is_none() {
+        assert!(!setup_fast());
+    }
+}
+
+/// The bucket-waves knob's name; it is on by default, and only `0` turns it
+/// off.
+#[test]
+fn the_bucket_waves_knob_is_named_and_on_by_default() {
+    use super::levels::{BUCKET_WAVES_ENV, bucket_waves};
+    assert_eq!(BUCKET_WAVES_ENV, "LAMBDA_VM_LEVELS_BUCKET_WAVES");
+    if std::env::var_os(BUCKET_WAVES_ENV).is_none() {
+        assert!(bucket_waves());
+    }
+}

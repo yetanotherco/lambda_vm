@@ -171,6 +171,7 @@ static ROOMS_TURN_SIZED: AtomicU64 = AtomicU64::new(0);
 /// factors and tree. See [`note_gkr_tree_refusal`]; each one is also a
 /// `math_cuda::device::device_fallbacks`.
 static GKR_TREE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+static GKR_TREE_HOST_BUILDS: AtomicU64 = AtomicU64::new(0);
 /// Fraction trees whose input layer was written from the base columns
 /// (`gpu::argue_gkr_input`).
 static INPUT_COLUMNS_TREES: AtomicU64 = AtomicU64::new(0);
@@ -739,6 +740,36 @@ pub fn gkr_tree_refusals() -> u64 {
     GKR_TREE_REFUSALS.load(Ordering::Relaxed)
 }
 
+/// GKR fraction trees a batched argue built on the host because its card
+/// path returned none ([`note_gkr_tree_host_built`]).
+pub fn gkr_tree_host_builds() -> u64 {
+    GKR_TREE_HOST_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts a GKR tree a batched argue built on the host because its card
+/// path declined it with no refusal of its own, and says so as it happens:
+/// `why` the card path gave none, `cells` the tree's input cells. Only with
+/// a device: without one every tree is the host's by design.
+pub fn note_gkr_tree_host_built(why: &str, table: usize, cells: usize) {
+    if math_cuda_backend_absent() {
+        return;
+    }
+    let count = GKR_TREE_HOST_BUILDS.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[gkr] tree built on the host: {why} · table {table} · {cells} cells · host-built trees {count}"
+    );
+}
+
+#[cfg(feature = "cuda")]
+fn math_cuda_backend_absent() -> bool {
+    math_cuda::device::backend().is_err()
+}
+
+#[cfg(not(feature = "cuda"))]
+fn math_cuda_backend_absent() -> bool {
+    true
+}
+
 /// Rooms a group sized, for its commits or its openings' turn.
 pub fn room_sizings() -> u64 {
     ROOM_SIZINGS.load(Ordering::Relaxed)
@@ -1167,6 +1198,20 @@ pub fn card_window_end() -> Option<CardWindow> {
     })
 }
 
+/// The pool's reserved high-water mark since the last [`card_window_start`]
+/// (or what it reserves now, if more); 0 without a device. A report.
+#[cfg(feature = "cuda")]
+pub fn pool_reserved_high() -> u64 {
+    math_cuda::device::pool_reserved_bytes()
+        .map(|(now, high)| high.max(now))
+        .unwrap_or(0)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn pool_reserved_high() -> u64 {
+    0
+}
+
 #[cfg(not(feature = "cuda"))]
 pub fn card_window_start() {}
 
@@ -1507,6 +1552,165 @@ static HAND_BACK_FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 #[doc(hidden)]
 pub fn force_hand_back_for_tests(on: bool) {
     HAND_BACK_FORCED.store(on, Ordering::Relaxed);
+}
+
+/// `LAMBDA_VM_ARGUE_BIN_HAND_BACK`: a batched argue's bin whose trees the
+/// card cannot all carry at once has its trees hand their input layers back
+/// ([`prefer_hand_back`]), so each promises `3·cells` where carrying it
+/// promises `4·cells` and the bin's every tree fits where today the last
+/// ones go to the host. The same trees, so the same proof. On by default;
+/// only `0` turns it off. Read once a process.
+pub const BIN_HAND_BACK_ENV: &str = "LAMBDA_VM_ARGUE_BIN_HAND_BACK";
+
+/// Whether [`BIN_HAND_BACK_ENV`] is on (or a test has made every bin hand
+/// back, [`force_bin_hand_back_for_tests`]).
+pub fn bin_hand_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    bin_hand_back_forced()
+        || *ON.get_or_init(|| {
+            crate::logup::knob_on_unless_zero(std::env::var(BIN_HAND_BACK_ENV).ok().as_deref())
+        })
+}
+
+/// A test's switch: every bin hands back, whether or not it fits.
+static BIN_HAND_BACK_FORCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Tests only: every batched argue bin hands its trees' input layers back as
+/// one the card cannot carry would ([`BIN_HAND_BACK_ENV`]), so a test can
+/// reach that path on tables that fit. Process-wide: a test that sets it
+/// holds its suite's switch lock.
+#[doc(hidden)]
+pub fn force_bin_hand_back_for_tests(on: bool) {
+    BIN_HAND_BACK_FORCED.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`force_bin_hand_back_for_tests`] is on.
+pub fn bin_hand_back_forced() -> bool {
+    BIN_HAND_BACK_FORCED.load(Ordering::Relaxed)
+}
+
+/// The bytes a tree over `cells` input cells promises when it carries its
+/// input layer: the layer and every level above it, both sides, the levels
+/// summing to the layer again (`4·cells` extension elements of 24 bytes).
+pub fn carry_bytes(cells: usize) -> u64 {
+    (4 * cells) as u64 * 24
+}
+
+/// Whether a bin whose trees carry `carries` bytes each cannot carry them all
+/// at once on a ledger that has promised `held` of `budget`: then its trees
+/// hand their input layers back ([`BIN_HAND_BACK_ENV`]).
+pub fn bin_cannot_carry(held: u64, budget: u64, carries: &[u64]) -> bool {
+    let need = carries.iter().fold(0u64, |a, &b| a.saturating_add(b));
+    held.saturating_add(need) > budget
+}
+
+std::thread_local! {
+    /// Set while this thread builds a bin's trees under [`prefer_hand_back`].
+    static HAND_BACK_PREFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Trees that handed their input layer back because their bin preferred it.
+static HANDED_BACK_BY_PREFERENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Trees built on this thread inside `f` hand their input layer back and
+/// write it again for its last sumcheck when they would otherwise carry it:
+/// the whole-tree promise of today's handed-back tree
+/// (`math_cuda::gkr::padded_peak_bytes`) in place of the carry. A tree the
+/// card would write without its padding still is. The flag is this thread's
+/// and is restored when `f` returns or unwinds.
+pub fn prefer_hand_back<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HAND_BACK_PREFERRED.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(HAND_BACK_PREFERRED.with(|c| c.replace(on)));
+    f()
+}
+
+/// Whether this thread's tree builds prefer to hand their layer back.
+#[cfg(feature = "cuda")]
+fn hand_back_preferred() -> bool {
+    HAND_BACK_PREFERRED.with(std::cell::Cell::get)
+}
+
+/// Trees that handed their input layer back under [`prefer_hand_back`].
+pub fn handed_back_by_preference() -> u64 {
+    HANDED_BACK_BY_PREFERENCE.load(Ordering::Relaxed)
+}
+
+/// A test's fault: every input layer a card tree writes again for its last
+/// sumcheck (handed back, or kept without its padding) fails to be written,
+/// as a card with no room left for it would.
+static INPUT_REWRITE_FAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Tests only: sets [`INPUT_REWRITE_FAULT`]. Process-wide: a test that sets
+/// it holds its suite's switch lock.
+#[doc(hidden)]
+pub fn fault_input_rewrites_for_tests(on: bool) {
+    INPUT_REWRITE_FAULT.store(on, Ordering::Relaxed);
+}
+
+/// Whether an input layer's rewrite is faulted ([`fault_input_rewrites_for_tests`]).
+#[cfg(feature = "cuda")]
+fn input_rewrite_faulted() -> bool {
+    INPUT_REWRITE_FAULT.load(Ordering::Relaxed)
+}
+
+/// Input layers written again after the pool handed its unused blocks back
+/// (`DeviceTree::rewrite_input`).
+static REWRITE_TRIMS: AtomicU64 = AtomicU64::new(0);
+
+/// Trees built under [`prefer_hand_back`] after the pool handed its unused
+/// blocks back (`input_layer_tree_impl`).
+static BUILD_TRIMS: AtomicU64 = AtomicU64::new(0);
+
+/// See [`BUILD_TRIMS`].
+pub fn build_trims() -> u64 {
+    BUILD_TRIMS.load(Ordering::Relaxed)
+}
+
+/// See [`REWRITE_TRIMS`].
+pub fn rewrite_trims() -> u64 {
+    REWRITE_TRIMS.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "cuda")]
+impl DeviceTree {
+    /// Writes the input layer again for its last sumcheck, the levels above
+    /// it already let go. A tree its bin preferred to hand back first lands
+    /// every pending free and has the pool hand its unused blocks back: the
+    /// pool keeps freed blocks, and the levels just let go are smaller pieces
+    /// than the layer, so without it each rewrite grows what the pool holds by
+    /// a layer while the live set does not grow at all.
+    fn rewrite_input(&self) -> Option<math_cuda::gkr::InputLayer> {
+        if self.trim_before_rewrite && math_cuda::device::drain_and_trim().is_ok() {
+            REWRITE_TRIMS.fetch_add(1, Ordering::Relaxed);
+        }
+        (self.rebuild.as_ref()?)()
+    }
+}
+
+/// Input layers a batched argue wrote on the host because the card could not
+/// write them again for their last sumcheck ([`note_input_written_on_host`]).
+static INPUT_WRITTEN_ON_HOST: AtomicU64 = AtomicU64::new(0);
+
+/// See [`INPUT_WRITTEN_ON_HOST`].
+pub fn inputs_written_on_host() -> u64 {
+    INPUT_WRITTEN_ON_HOST.load(Ordering::Relaxed)
+}
+
+/// Counts a card tree's input layer written on the host for its last
+/// sumcheck, and says so as it happens: `why` the card's step failed.
+pub fn note_input_written_on_host(why: &str, table: usize, cells: usize) {
+    let count = INPUT_WRITTEN_ON_HOST.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[gkr] input layer written on the host for its last sumcheck: the card's step failed ({why}) · table \
+         {table} · {cells} cells · input layers written on the host {count}"
+    );
 }
 
 /// Cells — factors times rows — below which the host wins.
@@ -3299,6 +3503,10 @@ pub struct DeviceTree {
     /// ([`crate::gkr_input_real`]): its Gruen rounds open the kept layer, and
     /// only today's session writes it again.
     input_truncated: bool,
+    /// Whether the pool hands its unused blocks back before the input layer
+    /// is written again ([`DeviceTree::rewrite_input`]): set for a tree its
+    /// bin preferred to hand back ([`prefer_hand_back`]).
+    trim_before_rewrite: bool,
     num_layers: usize,
     input_num_vars: usize,
     /// The output fraction, read off the top level.
@@ -3443,6 +3651,7 @@ where
         tree: std::sync::Mutex::new(Some(tree)),
         rebuild: None,
         input_truncated: false,
+        trim_before_rewrite: false,
         num_layers,
         input_num_vars,
         output: output_cell,
@@ -3572,7 +3781,7 @@ impl DeviceTree {
                 return None;
             }
             drop(self.tree.lock().ok()?.take());
-            let rebuilt = (self.rebuild.as_ref()?)()?;
+            let rebuilt = self.rewrite_input()?;
             if self.input_truncated {
                 crate::gkr_input_real::note_rebuild();
             }
@@ -3710,7 +3919,7 @@ impl DeviceTree {
                 return None;
             }
             drop(self.tree.lock().ok()?.take());
-            let rebuilt = (self.rebuild.as_ref()?)()?;
+            let rebuilt = self.rewrite_input()?;
             rebuilt.gruen(&raw_point, low)
         } else {
             let held = self.tree.lock().ok()?;
@@ -3935,7 +4144,7 @@ impl DeviceTree {
                 return None;
             }
             drop(self.tree.lock().ok()?.take());
-            let rebuilt = (self.rebuild.as_ref()?)()?;
+            let rebuilt = self.rewrite_input()?;
             whir_split_bump_rebuild();
             if self.input_truncated {
                 crate::gkr_input_real::note_rebuild();
@@ -4161,7 +4370,7 @@ impl DeviceTree {
                 return None;
             }
             drop(self.tree.lock().ok()?.take());
-            let rebuilt = (self.rebuild.as_ref()?)()?;
+            let rebuilt = self.rewrite_input()?;
             whir_split_bump_rebuild();
             rebuilt.gruen(&raw_point, low)
         } else {
@@ -4967,6 +5176,28 @@ where
     Some(ResidentColumns(store))
 }
 
+/// A small store of `columns` of `store` (copied on the card) followed by
+/// `extra` columns from the host ([`math_cuda::columns::DeviceColumns::gather`]).
+/// `None` when the card will not promise it.
+#[cfg(feature = "cuda")]
+pub fn gather_resident(
+    store: &ResidentColumns,
+    columns: &[usize],
+    extra: &[&[u64]],
+) -> Option<ResidentColumns> {
+    math_cuda::device::backend().ok()?;
+    math_cuda::columns::DeviceColumns::gather(&store.0, columns, extra).map(ResidentColumns)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn gather_resident(
+    _store: &ResidentColumns,
+    _columns: &[usize],
+    _extra: &[&[u64]],
+) -> Option<ResidentColumns> {
+    None
+}
+
 #[cfg(not(feature = "cuda"))]
 pub fn upload_tables<F>(_tables: &[TableColumns<'_, F>]) -> Option<ResidentColumns>
 where
@@ -5599,6 +5830,15 @@ fn input_layer_tree_impl(
 ) -> Option<DeviceTree> {
     use crate::gkr_input_real::{self as input_real, InputReal};
 
+    // A bin that hands its trees back builds them one after another on
+    // different streams; a tree's freed input layer is not the next one's to
+    // reuse until its stream has reached the free, so without a wait the pool
+    // reserves a fresh layer a tree while the live set does not grow. Each
+    // such tree first lands every pending free and has the pool hand its
+    // unused blocks back.
+    if hand_back_preferred() && math_cuda::device::drain_and_trim().is_ok() {
+        BUILD_TRIMS.fetch_add(1, Ordering::Relaxed);
+    }
     let full = interactions.next_power_of_two() * rows;
     let real = interactions * rows;
     let padded = real < full;
@@ -5675,6 +5915,9 @@ fn truncated_tree(
     let num_layers = tree.num_layers();
     let (write, stream) = (write.clone(), stream.clone());
     let rebuild = move || {
+        if input_rewrite_faulted() {
+            return None;
+        }
         let (p, q) = write(true)?;
         Some(math_cuda::gkr::InputLayer::new(
             stream.clone(),
@@ -5689,6 +5932,7 @@ fn truncated_tree(
         tree: std::sync::Mutex::new(Some(tree)),
         rebuild: Some(Box::new(rebuild)),
         input_truncated: true,
+        trim_before_rewrite: false,
         num_layers,
         input_num_vars: num_vars,
         output,
@@ -5717,11 +5961,18 @@ fn carried_or_handed_back(
     // that is what the card cannot do **and** the difference is worth the
     // second chance to fail — which is the widest precompiles, where it is
     // gigabytes, and nothing else.
-    let eager = (4 * full) as u64 * 24;
+    let eager = carry_bytes(full);
     let lazy = math_cuda::gkr::padded_peak_bytes(real, full);
-    let carried =
-        math_cuda::device::reserve(eager).filter(|_| !HAND_BACK_FORCED.load(Ordering::Relaxed));
-    let hand_back = HAND_BACK_FORCED.load(Ordering::Relaxed);
+    // A bin that cannot carry all its trees prefers each to hand back
+    // (`prefer_hand_back`): no carry is asked for, the promise below is.
+    let preferred = hand_back_preferred() && lazy < eager;
+    let forced = HAND_BACK_FORCED.load(Ordering::Relaxed);
+    let carried = if preferred {
+        None
+    } else {
+        math_cuda::device::reserve(eager).filter(|_| !forced)
+    };
+    let hand_back = forced || preferred;
     if !hand_back && (carried.is_some() || eager - lazy < worth_handing_back()) {
         drop(carried);
         let t = crate::whir_split::tick();
@@ -5750,6 +6001,7 @@ fn carried_or_handed_back(
             tree: std::sync::Mutex::new(Some(tree)),
             rebuild: None,
             input_truncated: false,
+            trim_before_rewrite: false,
             num_layers,
             input_num_vars,
             output,
@@ -5772,6 +6024,9 @@ fn carried_or_handed_back(
         }
         return None;
     };
+    if preferred {
+        HANDED_BACK_BY_PREFERENCE.fetch_add(1, Ordering::Relaxed);
+    }
 
     let t = crate::whir_split::tick();
     let (p, q) = write(false)?;
@@ -5791,6 +6046,9 @@ fn carried_or_handed_back(
     let num_layers = tree.num_layers();
 
     let rebuild = move || {
+        if input_rewrite_faulted() {
+            return None;
+        }
         let (p, q) = write(true)?;
         Some(math_cuda::gkr::InputLayer::new(
             stream.clone(),
@@ -5805,6 +6063,7 @@ fn carried_or_handed_back(
         tree: std::sync::Mutex::new(Some(tree)),
         rebuild: Some(Box::new(rebuild)),
         input_truncated: false,
+        trim_before_rewrite: preferred,
         num_layers,
         input_num_vars: num_vars,
         output,
@@ -8698,5 +8957,73 @@ mod tests {
              `note_gkr_tree_refusal`, and that called once, at the whole-tree \
              promise's refusal (found {bumps} bumps, {notes} calls)"
         );
+    }
+
+    /// A bin hands back exactly when the ledger cannot promise every tree's
+    /// carry on top of what it holds; a bin that fits carries as today.
+    #[test]
+    fn a_bin_hands_back_only_when_its_carries_do_not_fit() {
+        let gib = 1u64 << 30;
+        // 2^25 cells carry 3 GiB.
+        assert_eq!(carry_bytes(1 << 25), 3 * gib);
+        let nine = vec![carry_bytes(1 << 25); 9];
+        // A ledger holding 3.25 GiB of a 26.5 GiB budget cannot carry nine.
+        assert!(bin_cannot_carry(
+            3 * gib + gib / 4,
+            26 * gib + gib / 2,
+            &nine
+        ));
+        // Seven fit, as the card built them.
+        assert!(!bin_cannot_carry(
+            3 * gib + gib / 4,
+            26 * gib + gib / 2,
+            &nine[..7]
+        ));
+        // The boundary: exactly the budget fits.
+        assert!(!bin_cannot_carry(gib, 4 * gib, &[3 * gib]));
+        assert!(bin_cannot_carry(gib + 1, 4 * gib, &[3 * gib]));
+        // No overflow on absurd sizes.
+        assert!(bin_cannot_carry(
+            u64::MAX,
+            u64::MAX - 1,
+            &[u64::MAX, u64::MAX]
+        ));
+    }
+
+    /// The two argue knobs are on by default: only `0` turns either off.
+    #[test]
+    fn the_argue_knobs_are_on_unless_zero() {
+        use crate::logup::knob_on_unless_zero as on;
+        assert!(on(None));
+        assert!(on(Some("1")));
+        assert!(on(Some("")));
+        assert!(on(Some("yes")));
+        assert!(!on(Some("0")));
+        assert!(!on(Some(" 0 ")));
+        assert_eq!(BIN_HAND_BACK_ENV, "LAMBDA_VM_ARGUE_BIN_HAND_BACK");
+        assert_eq!(
+            crate::logup::PUBLIC_COLUMNS_ENV,
+            "LAMBDA_VM_ARGUE_PUBLIC_COLUMNS"
+        );
+    }
+
+    /// The preference is this thread's, scoped to the call, and restored even
+    /// when the call unwinds.
+    #[test]
+    fn the_hand_back_preference_is_scoped_to_its_call() {
+        let get = || HAND_BACK_PREFERRED.with(std::cell::Cell::get);
+        assert!(!get());
+        prefer_hand_back(true, || {
+            assert!(get());
+            prefer_hand_back(false, || assert!(!get()));
+            assert!(get());
+            std::thread::spawn(move || assert!(!HAND_BACK_PREFERRED.with(std::cell::Cell::get)))
+                .join()
+                .unwrap();
+        });
+        assert!(!get());
+        let unwound = std::panic::catch_unwind(|| prefer_hand_back(true, || panic!("unwinds")));
+        assert!(unwound.is_err());
+        assert!(!get());
     }
 }

@@ -70,3 +70,91 @@ fn level_emission_split() {
         );
     }
 }
+
+/// Where a streamed execution's setup goes, for the BLAKE3 W-leg's program
+/// with its one arena landing in 27 pieces (level 1's shape): the schedule,
+/// the need pass, the wave buckets and the first wave, in ns an instruction.
+/// An instrument, test-only: run alone with `--ignored --exact --nocapture`.
+#[test]
+#[ignore = "instrument: run alone with --exact"]
+fn streamed_setup_split() {
+    use super::executor::{ArenaPiece, StreamedExecution};
+    let program = super::b3l_wlfm_tests::honest();
+    let build = build_wlfm_under(
+        &program,
+        super::wlfm_tests::HASHER,
+        WlfmRate::Two,
+        WlfmLevers::with_family(WlfmFamily::B3),
+        true,
+    )
+    .expect("builds");
+    let child = WlfmChild {
+        artifacts: build.artifacts.clone(),
+        num_public_words: 8,
+    };
+    let mut b = wlfm_leg_builder(WlfmFamily::B3);
+    let arena = b.declare_arena(0);
+    let leg = emit_wlfm_leg(&mut b, &child, arena).expect("emits");
+    for word in &leg.publics {
+        let packed = b.pack_word([word.lanes[0], word.lanes[1], word.lanes[2], word.lanes[3]]);
+        b.public(packed);
+    }
+    let compiled = compile(b.finish());
+    let len = compiled.arena_schema.lens[0];
+    let n_pieces = 27u32.min(len);
+    let pieces: Vec<ArenaPiece> = (0..n_pieces)
+        .map(|k| {
+            let start = len * k / n_pieces;
+            let end = len * (k + 1) / n_pieces;
+            ArenaPiece {
+                arena: 0,
+                start,
+                len: end - start,
+                group: k as usize,
+            }
+        })
+        .filter(|p| p.len > 0)
+        .collect();
+    let hasher =
+        compiled.hasher(<crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::SOCKET);
+    let n = compiled.instrs.len();
+    let ns = |s: f64| 1e9 * s / n as f64;
+    for (bucketed, fast) in [
+        (false, false),
+        (true, false),
+        (true, false),
+        (true, true),
+        (true, true),
+    ] {
+        let t = Instant::now();
+        let ex = StreamedExecution::new_pieced_setup(
+            &compiled,
+            pieces.clone(),
+            &hasher,
+            false,
+            bucketed,
+            fast,
+        )
+        .expect("starts");
+        let total = t.elapsed().as_secs_f64();
+        let x = *ex.split();
+        println!(
+            "STREAMED SETUP bucketed {bucketed} fast {fast}: {n} instructions · {} pieces · total {total:.3}s ({:.1} ns) · schedule \
+             {:.3}s ({:.1} ns) · need pass {:.3}s ({:.1} ns) · buckets {:.3}s ({:.1} ns) · first wave {:.3}s ({:.1} ns) · \
+             machine {:.3}s ({:.1} ns) · first wave ran {}",
+            pieces.len(),
+            ns(total),
+            x.depth_pass,
+            ns(x.depth_pass),
+            x.need_pass,
+            ns(x.need_pass),
+            x.bucket_build,
+            ns(x.bucket_build),
+            x.first_wave,
+            ns(x.first_wave),
+            x.setup,
+            ns(x.setup),
+            ex.ran()
+        );
+    }
+}

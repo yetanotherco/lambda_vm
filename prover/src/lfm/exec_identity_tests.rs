@@ -733,6 +733,198 @@ fn pieced(
     (done, ran)
 }
 
+/// [`pieced`] with its waves walking only the buckets each landing completes
+/// (`StreamedExecution::new_pieced_bucketed`).
+fn pieced_bucketed(
+    case: &Case,
+    pieces: &[super::executor::ArenaPiece],
+    order: &[usize],
+) -> (LfmExecution, Vec<usize>) {
+    use super::executor::StreamedExecution;
+    let mut ex = StreamedExecution::new_pieced_bucketed(
+        &case.program,
+        pieces.to_vec(),
+        &case.hasher,
+        false,
+        true,
+    )
+    .unwrap_or_else(|e| panic!("{}: a bucketed execution starts: {e:?}", case.name));
+    let mut ran = vec![ex.ran()];
+    for &i in order {
+        let p = pieces[i];
+        let words = &case.arenas[p.arena as usize][p.start as usize..(p.start + p.len) as usize];
+        ex.land_piece(p.group, words)
+            .unwrap_or_else(|e| panic!("{}: piece {i} lands bucketed: {e:?}", case.name));
+        ran.push(ex.ran());
+    }
+    let done = ex
+        .finish()
+        .unwrap_or_else(|e| panic!("{}: the bucketed execution finishes: {e:?}", case.name));
+    (done, ran)
+}
+
+/// ★ Bucketed waves are the pieced execution: on the leaf-shaped case in all
+/// six landing orders and on every identity case cut in three pieces an arena
+/// (forwards, backwards and interleaved), the bucketed execution gives the
+/// serial reference's witness word for word and runs, wave by wave, as many
+/// instructions as the filtering waves do.
+#[test]
+fn bucketed_waves_are_the_pieced_execution_in_any_landing_order() {
+    let (leaf, halves) = one_arena_case();
+    let reference_leaf = reference(&leaf);
+    let pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let (got, ran) = pieced_bucketed(&leaf, &pieces, &order);
+        assert_executions_identical(leaf.name, leaf.program.num_addrs, &reference_leaf, &got);
+        let (_, filtered) = pieced(&leaf, &pieces, &order);
+        assert_eq!(ran, filtered, "{order:?}: the same instructions each wave");
+    }
+    for case in cases() {
+        let a = reference(&case);
+        let pieces = pieces_of(&case, 3);
+        let n = pieces.len();
+        let forward: Vec<usize> = (0..n).collect();
+        let backward: Vec<usize> = (0..n).rev().collect();
+        let interleaved: Vec<usize> = (0..n).step_by(2).chain((1..n).step_by(2)).collect();
+        for order in [forward, backward, interleaved] {
+            let (b, ran) = pieced_bucketed(&case, &pieces, &order);
+            assert_executions_identical(case.name, case.program.num_addrs, &a, &b);
+            let (_, filtered) = pieced(&case, &pieces, &order);
+            assert_eq!(
+                ran, filtered,
+                "{}: {order:?}: the same instructions each wave",
+                case.name
+            );
+        }
+    }
+}
+
+/// ★ Bucketed waves run each level's share in the level's own order: wave by
+/// wave and level by level, the bucketed execution runs the very rows and
+/// instructions, in the very order, the filtering waves do — on cases whose
+/// waves pick several buckets at once (a landing that completes more than one
+/// set of groups) with their rows interleaved within a level, where an order
+/// a bucket at a time would differ.
+#[test]
+fn bucketed_waves_run_each_level_in_the_levels_own_order() {
+    use super::executor::wave_trace;
+    let (leaf, halves) = one_arena_case();
+    let leaf_pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    let mut runs: Vec<(&Case, Vec<super::executor::ArenaPiece>, Vec<usize>)> = Vec::new();
+    for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0]] {
+        runs.push((&leaf, leaf_pieces.clone(), order.to_vec()));
+    }
+    let cases = cases();
+    for case in &cases {
+        let pieces = pieces_of(case, 3);
+        let n = pieces.len();
+        runs.push((case, pieces.clone(), (0..n).rev().collect()));
+        runs.push((
+            case,
+            pieces,
+            (0..n).step_by(2).chain((1..n).step_by(2)).collect(),
+        ));
+    }
+    let reordered_before = wave_trace::reordered();
+    for (case, pieces, order) in &runs {
+        let (_, filtered) = wave_trace::record(|| pieced(case, pieces, order));
+        let (_, bucketed) = wave_trace::record(|| pieced_bucketed(case, pieces, order));
+        assert!(
+            filtered == bucketed,
+            "{}: {order:?}: the bucketed waves ran another order",
+            case.name
+        );
+    }
+    // The cases put two buckets' rows interleaved in one level's share at
+    // least once, so the order above is a check, not a coincidence.
+    assert!(
+        wave_trace::reordered() > reordered_before,
+        "no wave merged two buckets out of a level's order: the test sees nothing"
+    );
+}
+
+/// ★ A setup made the fast way (the schedule beside the need pass, the
+/// buckets found from a neighbour) is the setup: on the leaf case and every
+/// identity case, landing in several orders, the bucketed execution set up
+/// the fast way runs the same rows and instructions in the same order, wave
+/// by wave and level by level, and gives the serial reference's witness.
+#[test]
+fn a_fast_setup_runs_the_same_waves() {
+    use super::executor::{StreamedExecution, wave_trace};
+    let run = |case: &Case, pieces: &[super::executor::ArenaPiece], order: &[usize], fast: bool| {
+        let mut ex = StreamedExecution::new_pieced_setup(
+            &case.program,
+            pieces.to_vec(),
+            &case.hasher,
+            false,
+            true,
+            fast,
+        )
+        .unwrap_or_else(|e| panic!("{}: starts: {e:?}", case.name));
+        for &i in order {
+            let p = pieces[i];
+            let words =
+                &case.arenas[p.arena as usize][p.start as usize..(p.start + p.len) as usize];
+            ex.land_piece(p.group, words)
+                .unwrap_or_else(|e| panic!("{}: piece {i} lands: {e:?}", case.name));
+        }
+        ex.finish()
+            .unwrap_or_else(|e| panic!("{}: finishes: {e:?}", case.name))
+    };
+    let (leaf, halves) = one_arena_case();
+    let leaf_pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    let mut runs: Vec<(&Case, Vec<super::executor::ArenaPiece>, Vec<usize>)> = vec![
+        (&leaf, leaf_pieces.clone(), vec![0, 1, 2]),
+        (&leaf, leaf_pieces, vec![2, 0, 1]),
+    ];
+    let cases = cases();
+    for case in &cases {
+        let pieces = pieces_of(case, 3);
+        let n = pieces.len();
+        runs.push((case, pieces.clone(), (0..n).collect()));
+        runs.push((case, pieces, (0..n).rev().collect()));
+    }
+    for (case, pieces, order) in &runs {
+        let (plain, plain_trace) = wave_trace::record(|| run(case, pieces, order, false));
+        let (fast, fast_trace) = wave_trace::record(|| run(case, pieces, order, true));
+        assert!(
+            plain_trace == fast_trace,
+            "{}: {order:?}: the fast setup ran another order",
+            case.name
+        );
+        assert_executions_identical(case.name, case.program.num_addrs, &plain, &fast);
+        assert_executions_identical(case.name, case.program.num_addrs, &reference(case), &fast);
+    }
+}
+
 /// ★ The pieced execution's gate: one arena landing in pieces, in any order,
 /// gives the serial reference's witness word for word — on the leaf-shaped
 /// case in all six orders (its `HintOn` reads the first and the last piece)

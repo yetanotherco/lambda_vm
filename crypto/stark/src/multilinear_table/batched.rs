@@ -843,7 +843,10 @@ where
             Some((target, -(rest * &outputs[target].1)))
         }
     };
-    let mut split = ArgueSplit::default();
+    let mut split = ArgueSplit {
+        ledger_start: multilinear::gpu::ledger_reserved(),
+        ..ArgueSplit::default()
+    };
     let gruen_layers = multilinear::gkr_gruen::gruen_layers();
     // ── G: a ladder per bin, its outputs absorbed just before it ──────────
     let mut bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>> = vec![None; plan.trees()];
@@ -854,9 +857,15 @@ where
     let queue = multilinear::round_slot::argue_round_slot()
         != multilinear::round_slot::RoundSlotSetting::Off;
     let host_built = |t: usize, list: &[Interaction<E>]| -> Result<BinTree<E>, MlError> {
-        let factors = tables[t].trace.factors()?;
+        // Lean: only the factors this tree's interactions read are lifted
+        // (`LAMBDA_VM_ARGUE_HOST_TREE_LEAN`); the same layer either way.
+        let layer = if logup::host_tree_lean() {
+            logup::input_layer_lean(list, &tables[t].trace)?
+        } else {
+            logup::input_layer(list, &tables[t].trace.factors()?)?
+        };
         Ok(BinTree::Built(Box::new(
-            multilinear::gkr::FractionTree::build(logup::input_layer(list, &factors)?)?,
+            multilinear::gkr::FractionTree::build(layer)?,
         )))
     };
     for bin in &plan.bins {
@@ -868,53 +877,122 @@ where
                 (0..plan.chunks[t].count).map(move |j| (t, first + j))
             })
             .collect();
-        let pending: Vec<Pending<E>> = members
-            .iter()
-            .map(|&(t, i)| -> Result<Pending<E>, MlError> {
-                let (trace, interactions) = (&tables[t].trace, &lists[i][..]);
-                if at == Where::Host {
-                    return Ok(Pending::Ready(BinTree::Host(host_tree(
-                        interactions,
-                        trace,
-                    )?)));
-                }
-                let columns_tree = || {
-                    if queue {
-                        logup::resident_tree_from_columns_deferred(interactions, trace)
-                            .map(Pending::Queued)
-                    } else {
-                        logup::resident_tree_from_columns(interactions, trace)
-                            .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
+        // A bin the card cannot carry whole hands its trees' input layers
+        // back (`LAMBDA_VM_ARGUE_BIN_HAND_BACK`): each promises less, so the
+        // bin's last trees are built on the card too. The same trees.
+        let hand_back = at != Where::Host && multilinear::gpu::bin_hand_back() && {
+            let carries: Vec<u64> = members
+                .iter()
+                .map(|&(t, i)| {
+                    multilinear::gpu::carry_bytes(
+                        lists[i].len().next_power_of_two() << tables[t].trace.num_vars(),
+                    )
+                })
+                .collect();
+            multilinear::gpu::bin_hand_back_forced()
+                || multilinear::gpu::bin_cannot_carry(
+                    multilinear::gpu::ledger_reserved(),
+                    multilinear::gpu::reserve_budget(),
+                    &carries,
+                )
+        };
+        let handed_before = multilinear::gpu::handed_back_by_preference();
+        let build_trims_before = multilinear::gpu::build_trims();
+        let pending: Vec<Pending<E>> = multilinear::gpu::prefer_hand_back(hand_back, || {
+            members
+                .iter()
+                .map(|&(t, i)| -> Result<Pending<E>, MlError> {
+                    let (trace, interactions) = (&tables[t].trace, &lists[i][..]);
+                    if at == Where::Host {
+                        return Ok(Pending::Ready(BinTree::Host(host_tree(
+                            interactions,
+                            trace,
+                        )?)));
                     }
-                };
-                // Where today's argue builds it: written from the base columns
-                // with no lift (`gpu::argue_no_lift`), else from the
-                // lifted factors on the card, else here — and a big host tree
-                // still folds on a device. The same tree every way.
-                let started = std::time::Instant::now();
-                let on_card = (multilinear::gpu::argue_no_lift()
-                    && trace.device_factors().is_none())
-                .then(columns_tree)
-                .flatten()
-                .or_else(|| {
-                    let resident = trace.reside_from_columns();
-                    let from_columns = (multilinear::gpu::argue_gkr_input() && resident.is_some())
-                        .then(columns_tree)
-                        .flatten();
-                    from_columns.or_else(|| {
-                        resident
-                            .and_then(|resident| logup::resident_tree(interactions, resident))
+                    let columns_tree = || {
+                        if queue {
+                            logup::resident_tree_from_columns_deferred(interactions, trace)
+                                .map(Pending::Queued)
+                        } else {
+                            logup::resident_tree_from_columns(interactions, trace)
+                                .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
+                        }
+                    };
+                    // Where today's argue builds it: written from the base columns
+                    // with no lift (`gpu::argue_no_lift`), else from the
+                    // lifted factors on the card, else here — and a big host tree
+                    // still folds on a device. The same tree every way.
+                    let started = std::time::Instant::now();
+                    let mut resident_seen = None;
+                    let mut public_tried = false;
+                    let mut public_why: Option<String> = None;
+                    let on_card = (multilinear::gpu::argue_no_lift()
+                        && trace.device_factors().is_none())
+                    .then(columns_tree)
+                    .flatten()
+                    .or_else(|| {
+                        // A chunk that reads a public factor (a selector) has no
+                        // plan over the table's columns: built on the card from
+                        // the columns it reads and its selectors
+                        // (`LAMBDA_VM_ARGUE_PUBLIC_COLUMNS`).
+                        (logup::public_columns() && trace.device_factors().is_none())
+                            .then(|| {
+                                public_tried = true;
+                                logup::resident_tree_with_public(interactions, trace)
+                                    .map_err(|why| public_why = Some(why))
+                                    .ok()
+                            })
+                            .flatten()
                             .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
                     })
-                });
-                let tree = match on_card {
-                    Some(tree) => tree,
-                    None => Pending::Ready(host_built(t, interactions)?),
-                };
-                split.trees += started.elapsed().as_secs_f64();
-                Ok(tree)
-            })
-            .collect::<Result<_, _>>()?;
+                    .or_else(|| {
+                        let resident = trace.reside_from_columns();
+                        resident_seen = Some(resident.is_some());
+                        let from_columns = (multilinear::gpu::argue_gkr_input()
+                            && resident.is_some())
+                        .then(columns_tree)
+                        .flatten();
+                        from_columns.or_else(|| {
+                            resident
+                                .and_then(|resident| logup::resident_tree(interactions, resident))
+                                .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
+                        })
+                    });
+                    let tree = match on_card {
+                        Some(tree) => {
+                            split.trees_card += 1;
+                            tree
+                        }
+                        None => {
+                            split.trees_host += 1;
+                            let why = match (public_tried, resident_seen) {
+                                (true, _) => format!(
+                                    "its public-columns card build was declined: {}",
+                                    public_why.as_deref().unwrap_or("no reason given")
+                                ),
+                                (false, Some(false)) => {
+                                    "no resident columns or factors for its table".to_string()
+                                }
+                                _ => "the card declined the build".to_string(),
+                            };
+                            multilinear::gpu::note_gkr_tree_host_built(
+                                &why,
+                                t,
+                                interactions.len().next_power_of_two() << trace.num_vars(),
+                            );
+                            Pending::Ready(host_built(t, interactions)?)
+                        }
+                    };
+                    split.trees += started.elapsed().as_secs_f64();
+                    Ok(tree)
+                })
+                .collect::<Result<_, _>>()
+        })?;
+        if hand_back {
+            split.bins_handed_back += 1;
+            split.trees_handed_back +=
+                multilinear::gpu::handed_back_by_preference() - handed_before;
+        }
         // The queued trees' outputs, now that the bin's every tree is queued;
         // one that cannot be read is built here, before anything is absorbed.
         let started = std::time::Instant::now();
@@ -925,11 +1003,24 @@ where
                 Pending::Ready(tree) => Ok(tree),
                 Pending::Queued(queued) => match queued.into_tree() {
                     Some(tree) => Ok(BinTree::Built(Box::new(tree))),
-                    None => host_built(t, &lists[i]),
+                    None => {
+                        split.trees_host_late += 1;
+                        multilinear::gpu::note_gkr_tree_host_built(
+                            "its queued card build could not be read",
+                            t,
+                            lists[i].len().next_power_of_two() << tables[t].trace.num_vars(),
+                        );
+                        host_built(t, &lists[i])
+                    }
                 },
             })
             .collect::<Result<_, MlError>>()?;
         split.trees += started.elapsed().as_secs_f64();
+        split.ledger_trees = split.ledger_trees.max(multilinear::gpu::ledger_reserved());
+        split.build_trims += multilinear::gpu::build_trims() - build_trims_before;
+        split.pool_high_trees = split
+            .pool_high_trees
+            .max(multilinear::gpu::pool_reserved_high());
         let hosts: Vec<Option<gkr_lockstep::HostLayers<'_, E>>> = trees
             .iter()
             .map(|tree| match tree {
@@ -937,13 +1028,37 @@ where
                 BinTree::Built(_) => None,
             })
             .collect();
-        let refs: Vec<&dyn gkr_lockstep::LadderTree<E>> = trees
+        // A built tree whose input layer the card cannot write again for its
+        // last sumcheck has it written here instead (`InputOnHost`): the same
+        // layer, so the same rounds.
+        let writers: Vec<_> = members
+            .iter()
+            .map(|&(t, i)| {
+                let (list, trace) = (&lists[i][..], &tables[t].trace);
+                move || logup::input_layer_lean(list, trace)
+            })
+            .collect();
+        let built: Vec<Option<InputOnHost<'_, E>>> = trees
+            .iter()
+            .zip(&members)
+            .zip(&writers)
+            .map(|((tree, &(t, i)), write)| match tree {
+                BinTree::Built(tree) => Some(InputOnHost {
+                    tree,
+                    write,
+                    table: t,
+                    cells: lists[i].len().next_power_of_two() << tables[t].trace.num_vars(),
+                }),
+                BinTree::Host(_) => None,
+            })
+            .collect();
+        let refs: Vec<&dyn gkr_lockstep::LadderTree<E>> = built
             .iter()
             .zip(&hosts)
-            .map(|(tree, host)| match (tree, host) {
+            .map(|(built, host)| match (built, host) {
                 (_, Some(host)) => host as &dyn gkr_lockstep::LadderTree<E>,
-                (BinTree::Built(tree), None) => &**tree as &dyn gkr_lockstep::LadderTree<E>,
-                (BinTree::Host(_), None) => unreachable!("a host tree has its layers"),
+                (Some(built), None) => built as &dyn gkr_lockstep::LadderTree<E>,
+                (None, None) => unreachable!("a host tree has its layers"),
             })
             .collect();
         for (&(_, i), tree) in members.iter().zip(&refs) {
@@ -958,8 +1073,14 @@ where
             bus_outputs[i] = Some(output);
         }
         let started = std::time::Instant::now();
+        let trims_before = multilinear::gpu::rewrite_trims();
         let (ladder, inputs) = gkr_lockstep::prove_trees(&refs, transcript)?;
+        split.rewrite_trims += multilinear::gpu::rewrite_trims() - trims_before;
         split.ladders += started.elapsed().as_secs_f64();
+        split.ledger_ladder = split.ledger_ladder.max(multilinear::gpu::ledger_reserved());
+        split.pool_high_ladder = split
+            .pool_high_ladder
+            .max(multilinear::gpu::pool_reserved_high());
         let inputs: Vec<GkrClaim<E>> = inputs;
         let mut at_tree = 0;
         for &t in bin {
@@ -1073,6 +1194,7 @@ where
         )?);
     }
     split.zc_setup += started.elapsed().as_secs_f64();
+    split.ledger_zc = multilinear::gpu::ledger_reserved();
     // What an earlier argue on this thread left, so the line below is this one's.
     multilinear::gpu_fused::take_tail();
     let started = std::time::Instant::now();
@@ -1204,14 +1326,30 @@ where
         );
         // The trees the ladders ran: one a table, or a cut table's chunks.
         eprintln!(
-            "BATCHED ARGUE TREES: tables {} · trees {} · cut {} · tree log2 cells {:.2}",
+            "BATCHED ARGUE TREES: tables {} · trees {} · cut {} · tree log2 cells {:.2} · built on the card \
+             {} · on the host {} (after a queued build {}) · ledger GiB: at the start {:.2} · the bin's trees \
+             built {:.2} · after its ladder {:.2} · zerocheck set up {:.2} · handed back {} trees in {} bins · pool trimmed before {} rewrites · pool trimmed before {} \
+             builds · pool reserved high GiB: the bin's trees built {:.2} · after its ladder {:.2}",
             tables.len(),
             plan.trees(),
             plan.chunks.iter().filter(|c| c.count > 1).count(),
             (0..tables.len())
                 .map(|t| plan.chunks[t].count as f64 * (plan.tree_vars(t) as f64).exp2())
                 .sum::<f64>()
-                .log2()
+                .log2(),
+            split.trees_card - split.trees_host_late,
+            split.trees_host + split.trees_host_late,
+            split.trees_host_late,
+            gib(split.ledger_start),
+            gib(split.ledger_trees),
+            gib(split.ledger_ladder),
+            gib(split.ledger_zc),
+            split.trees_handed_back,
+            split.bins_handed_back,
+            split.rewrite_trims,
+            split.build_trims,
+            gib(split.pool_high_trees),
+            gib(split.pool_high_ladder)
         );
     }
     Ok((
@@ -1226,10 +1364,89 @@ where
     ))
 }
 
+/// A card-built tree in a bin's ladder whose input layer, when the card's step
+/// over it fails (its layer handed back or kept without its padding, and the
+/// card cannot write it again), is written here and stepped on the host: the
+/// same layer, so the same rounds and bytes, where today the argue fails. Any
+/// other layer's failure is the argue's, as before.
+struct InputOnHost<'a, E: IsField> {
+    tree: &'a multilinear::gkr::FractionTree<E>,
+    write: &'a dyn Fn() -> Result<FractionLayer<E>, MlError>,
+    table: usize,
+    cells: usize,
+}
+
+impl<E> gkr_lockstep::LadderTree<E> for InputOnHost<'_, E>
+where
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: Send + Sync,
+{
+    fn input_vars(&self) -> usize {
+        gkr_lockstep::LadderTree::input_vars(self.tree)
+    }
+
+    fn output(&self) -> (FieldElement<E>, FieldElement<E>) {
+        gkr_lockstep::LadderTree::output(self.tree)
+    }
+
+    fn step(
+        &self,
+        layer: usize,
+        point: &[FieldElement<E>],
+        weights: [FieldElement<E>; 2],
+        claim: &(FieldElement<E>, FieldElement<E>),
+    ) -> Result<Box<dyn gkr_lockstep::TreeStep<E> + '_>, MlError> {
+        match gkr_lockstep::LadderTree::step(self.tree, layer, point, weights.clone(), claim) {
+            Ok(step) => Ok(step),
+            Err(failed) if layer == gkr_lockstep::LadderTree::input_vars(self.tree) => {
+                let input = (self.write)()?;
+                multilinear::gpu::note_input_written_on_host(
+                    &format!("{failed:?}"),
+                    self.table,
+                    self.cells,
+                );
+                gkr_lockstep::host_step(&input, point, weights)
+            }
+            Err(failed) => Err(failed),
+        }
+    }
+}
+
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
 /// Where a batched argue's time goes, printed under `LAMBDA_VM_BASE_SPLIT=1`.
 #[derive(Default)]
 struct ArgueSplit {
     trees: f64,
+    /// Trees built on the card (queued or at once), and built on the host
+    /// because the card path declined them (`host_built`): at once, or after
+    /// a queued build could not be read.
+    trees_card: usize,
+    trees_host: usize,
+    trees_host_late: usize,
+    /// The device ledger's promise (bytes): when the argue began, the most
+    /// any bin's trees held once built, the most after a bin's ladder (its
+    /// trees still held), and once the zerocheck was set up.
+    ledger_start: u64,
+    ledger_trees: u64,
+    ledger_ladder: u64,
+    ledger_zc: u64,
+    /// Bins whose trees handed their input layers back because the card
+    /// could not carry them all (`LAMBDA_VM_ARGUE_BIN_HAND_BACK`), and the
+    /// trees that did.
+    bins_handed_back: usize,
+    trees_handed_back: u64,
+    /// Input layers written again after the pool handed its unused blocks
+    /// back (`multilinear::gpu::rewrite_trims`).
+    rewrite_trims: u64,
+    /// Trees built after the pool handed its unused blocks back
+    /// (`multilinear::gpu::build_trims`), and the pool's reserved high-water
+    /// mark (bytes) once a bin's trees were built and after its ladder.
+    build_trims: u64,
+    pool_high_trees: u64,
+    pool_high_ladder: u64,
     ladders: f64,
     zc_setup: f64,
     zc_rounds: f64,

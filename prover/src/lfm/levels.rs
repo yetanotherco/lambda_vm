@@ -314,6 +314,42 @@ pub const BESIDE_NICE_ENV: &str = "LAMBDA_VM_LEVELS_BESIDE_NICE";
 /// The nice value [`BESIDE_NICE_ENV`]'s threads run at on Linux.
 pub const BESIDE_NICE: i32 = 10;
 
+/// `LAMBDA_VM_LEVELS_BUCKET_WAVES`: level 1's streamed execution buckets its
+/// instructions by the groups each waits for, and each landed piece's wave
+/// walks only the buckets that landing completes
+/// ([`super::executor::StreamedExecution::new_pieced_bucketed`]). Today each
+/// wave filters the whole program: on a real median, 48 M instructions, ≈ 0.1 s
+/// a wave before its own work, 27 waves after the base's end; bucketed, the
+/// median's recursion took 1.56 s less and the large's 5.8 s less. The same
+/// instructions run in the same order each wave: the same execution and the
+/// same proofs. On by default; `0` (and only `0`) turns it off.
+pub const BUCKET_WAVES_ENV: &str = "LAMBDA_VM_LEVELS_BUCKET_WAVES";
+
+/// Whether level 1's execution buckets its waves ([`BUCKET_WAVES_ENV`]).
+pub fn bucket_waves() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !super::wlfm_knobs::knob_word_off(std::env::var(BUCKET_WAVES_ENV).ok().as_deref())
+    })
+}
+
+/// `LAMBDA_VM_LEVELS_SETUP_FAST=1`: level 1's streamed execution makes its
+/// setup the fast way ([`super::executor::StreamedExecution::new_pieced_setup`]):
+/// the level schedule on a thread of its own beside the need pass, and the
+/// wave buckets found from each instruction's neighbour when they share
+/// their groups. On a real median the setup took ≈ 2.5 s after the program,
+/// and level 1's waves wait for it. The same schedule, needs and buckets:
+/// the same execution and proofs. Off by default (and for any word but `1`).
+pub const SETUP_FAST_ENV: &str = "LAMBDA_VM_LEVELS_SETUP_FAST";
+
+/// Whether level 1's execution makes its setup the fast way ([`SETUP_FAST_ENV`]).
+pub fn setup_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(SETUP_FAST_ENV).ok().as_deref())
+    })
+}
+
 /// How level 1's streamed execution met the base's groups, on the driver's
 /// clock: what it ran before any group (its setup and first wave), when the
 /// front landed and its wave, when each group's share arrived from phase B,
@@ -936,6 +972,10 @@ pub struct LevelsTimes {
     pub wave_secs_before_base: f64,
     /// How level 1's pieces landed ([`Level1Landing`]).
     pub landing: Level1Landing,
+    /// Level 1's execution split ([`super::executor::ExecSplit`]): its
+    /// schedule, setup, hashing (on the pool and on the driver's thread),
+    /// applying and the rest. `None` before level 1 executes.
+    pub level1_exec: Option<super::executor::ExecSplit>,
     pub execute_tail: f64,
     /// Under [`PROGRAM_FAST_ENV`] (the default), level 1's validator beside
     /// its execution: its seconds, and when the execution's end found it done
@@ -1256,9 +1296,15 @@ pub fn prove_block_levels(
                 (0..npieces).map(|_| std::cell::OnceCell::new()).collect();
             let mut by_group: Vec<Option<Vec<LfmWord>>> = vec![None; marks.len() - 1];
             let execute_from = now();
-            let mut ex =
-                StreamedExecution::new_pieced_tapped(program, arena_pieces, &hasher, lean_beside)
-                    .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
+            let mut ex = StreamedExecution::new_pieced_setup(
+                program,
+                arena_pieces,
+                &hasher,
+                lean_beside,
+                bucket_waves(),
+                setup_fast(),
+            )
+            .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
             let mut landing = Level1Landing {
                 setup: now() - execute_from,
                 ..Level1Landing::default()
@@ -1459,6 +1505,7 @@ pub fn prove_block_levels(
         landing,
     ) = level1.map_err(|_| "level 1's thread panicked")??;
     times.landing = landing;
+    times.level1_exec = Some(execution.split);
     times.validated_beside = validated;
     times.emit_split = emit_split;
     // A lean fill beside that was fed a compression twice, or missed one, is

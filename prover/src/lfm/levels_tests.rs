@@ -865,7 +865,7 @@ fn rta_one_run(
     let list = |xs: Vec<String>| xs.join(" ");
     println!(
         "RTA LEVEL1 LANDING: setup {:.3}s · front at {:.3}s (wave {:.3}s) · base end {:.3}s · arrivals {} · \
-         landed {}",
+         landed {} · bucketed waves {} · public columns {} · host tree lean {} · setup fast {}",
         landing.setup,
         landing.front.0,
         landing.front.1,
@@ -884,7 +884,31 @@ fn rta_one_run(
                 .map(|(i, at, secs)| format!("{i}@{at:.3}+{secs:.3}"))
                 .collect()
         ),
+        super::levels::bucket_waves(),
+        multilinear::logup::public_columns(),
+        multilinear::logup::host_tree_lean(),
+        super::levels::setup_fast(),
     );
+    if let Some(x) = &t.level1_exec {
+        println!(
+            "RTA LEVEL1 EXEC: schedule {:.3}s · need pass {:.3}s · buckets {:.3}s · first wave {:.3}s · setup {:.3}s · \
+             levels {} (on the pool {}, {} hashes) · hashing {:.3}s (on the driver's thread {} hashes in {:.3}s) · apply \
+             {:.3}s · the rest {:.3}s",
+            x.depth_pass,
+            x.need_pass,
+            x.bucket_build,
+            x.first_wave,
+            x.setup,
+            x.levels,
+            x.parallel_levels,
+            x.parallel_hashes,
+            x.hash_phase,
+            x.serial_hashes,
+            x.serial_hash_secs,
+            x.apply,
+            x.residue
+        );
+    }
     let (lean, lean_wait) = t.lean_beside.unwrap_or_default();
     // Level 1's thread ends once its execution and the lean fill beside it
     // have: what of that is after the base is in series.
