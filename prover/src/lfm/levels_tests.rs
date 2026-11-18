@@ -689,11 +689,19 @@ fn the_blake3_driver_with_revive_beside_proves_the_same_level_bytes() {
         .times
         .stamps
         .iter()
-        .map(|st| st.groups.iter().filter(|g| g.revive_fell_back).count())
+        .map(|st| {
+            st.groups
+                .iter()
+                .filter(|g| g.revive_fell_back || g.revive_planned_out)
+                .count()
+        })
         .sum();
     println!("LEVELS REVIVE BESIDE: {beside} groups revived beside · {fell_back} fell back");
     assert!(beside > 0, "some group revived beside its argue");
-    assert_eq!(fell_back, 0, "no revive beside fell back on a small block");
+    assert_eq!(
+        fell_back, 0,
+        "no revive beside fell back or was planned out on a small block"
+    );
     let held = {
         let _held = set_stacks_for_test(Some(StackPlace::Card));
         derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive")
@@ -1427,7 +1435,8 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
             "{tag} GROUP {g}: tables {} · polys {} · cells {} · wait A {:.3}s · up A {:.3}s (paid \
              {:.3}) · commit {:.3}s · retire {:.3}s · up B {:.3}s · argue {:.3}s · encode {:.3}s · \
              open {:.3}s · prepared revive {:.3}s · open paid {:.3}s · overlapped {} · columns gone \
-             before revive {} · revive beside {} ({:.3}s, paid {:.3}s, fell back {}) · turn {:.3}-{:.3}s · GiB \
+             before revive {} · revive beside {} ({:.3}s, paid {:.3}s, planned out {} at {:.2} of {:.2} GiB, fell \
+             back {}) · turn {:.3}-{:.3}s · GiB \
              promised: commit {:.2}/{:.2} · argue {:.2}/{:.2} · open {:.2}{}",
             s.tables,
             s.polys,
@@ -1448,6 +1457,9 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
             s.revive_beside,
             s.revive_beside_secs,
             s.revive_paid,
+            s.revive_planned_out,
+            gib(s.revive_plan_need),
+            gib(s.revive_plan_free),
             s.revive_fell_back,
             s.start_b,
             s.end_b,
