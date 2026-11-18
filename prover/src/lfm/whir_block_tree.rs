@@ -3853,15 +3853,19 @@ const PROOF_VERSION: u32 = 4;
 
 /// The bytes version 4 added at the end of every block proof file's root: the
 /// memory counts, `fused_memory: [u64; 2]` then `word_memory: [u64; 7]`. A
-/// version-3 file's root is this much shorter, so it sits this much nearer
-/// the end of its bytes (rkyv writes the root last).
+/// file of the last version-3 layout has a root this much shorter, so it sits
+/// this much nearer the end of its bytes (rkyv writes the root last). Version
+/// 3 had an earlier layout too, for the tree's top file only (before
+/// `TableCounts` gained `ecrec`): its root is shorter again, so neither place
+/// opens with the magic and the archive check refuses such a file unnamed.
 const COUNTS_BYTES: usize = 72;
 
 /// The layout version a block proof file states, read before the file is
 /// checked as this build's layout: the magic and the version word open its
 /// root, which ends the file and is `root` bytes long under this layout and
-/// [`COUNTS_BYTES`] fewer under version 3. `None` when neither place opens
-/// with the magic; the archive check then refuses the file.
+/// [`COUNTS_BYTES`] fewer under the last version-3 layout. `None` when neither
+/// place opens with the magic (any other shape, an earlier version-3 tree
+/// file among them); the archive check then refuses the file.
 fn stated_version(bytes: &[u8], root: usize) -> Option<u32> {
     [Some(root), root.checked_sub(COUNTS_BYTES)]
         .into_iter()
@@ -3877,7 +3881,8 @@ fn stated_version(bytes: &[u8], root: usize) -> Option<u32> {
 /// Refuses, naming both versions, a block proof file that states a layout
 /// version this build does not read, before the archive check would refuse it
 /// for its shape alone. Every reader runs it first; the version is checked
-/// again on the file it reads.
+/// again on the file it reads, a backstop this check leaves no file to
+/// refuse.
 fn check_stated_version(bytes: &[u8], root: usize) -> Result<(), String> {
     match stated_version(bytes, root) {
         Some(version) if version != PROOF_VERSION => Err(format!(

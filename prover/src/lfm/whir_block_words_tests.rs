@@ -1012,7 +1012,10 @@ fn words_leaf_census_of_a_base_file() {
     };
     let bytes = std::fs::read(&path).expect("the base proof");
     let proof: crate::block_whir::BlockWhirProof =
-        rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).expect("a base proof");
+        rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).expect(
+            "a base proof written by this build (a base proof file has no version: one written by another \
+             build reads as some other shape)",
+        );
     let opts = super::super::proof::block_base_options();
     let format = p1_format(memory, LeafScale::DoubledOneTop);
     let plan = WhirBlockPlan::derive(&elf, &opts, &format, proof.statement(), None)
