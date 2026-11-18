@@ -855,6 +855,8 @@ where
         ..ArgueSplit::default()
     };
     let gruen_layers = multilinear::gkr_gruen::gruen_layers();
+    let gruen2_layers = multilinear::gkr_gruen::gruen2_layers();
+    let gruen_rounds = multilinear::gkr_gruen::gruen_rounds();
     // ── G: a ladder per bin, its outputs absorbed just before it ──────────
     let mut bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>> = vec![None; plan.trees()];
     let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; tables.len()];
@@ -1306,7 +1308,8 @@ where
         // adds its layers too.
         eprintln!(
             "BATCHED ARGUE SPLIT: tables {} · bins {} · trees {:.3}s · ladders {:.3}s · zc setup \
-             {:.3}s · zc rounds {:.3}s · reduce {:.3}s · Gruen layers (process) +{}",
+             {:.3}s · zc rounds {:.3}s · reduce {:.3}s · Gruen layers (process) +{} · two-layer \
+             Gruen layers (process) +{} · Gruen card rounds (process) +{}",
             tables.len(),
             plan.bins.len(),
             split.trees,
@@ -1314,7 +1317,9 @@ where
             split.zc_setup,
             split.zc_rounds,
             split.reduce,
-            multilinear::gkr_gruen::gruen_layers() - gruen_layers
+            multilinear::gkr_gruen::gruen_layers() - gruen_layers,
+            multilinear::gkr_gruen::gruen2_layers() - gruen2_layers,
+            multilinear::gkr_gruen::gruen_rounds() - gruen_rounds
         );
         // The fused tables' later rounds by program length: the card's, and the
         // host's over what the card folded.
