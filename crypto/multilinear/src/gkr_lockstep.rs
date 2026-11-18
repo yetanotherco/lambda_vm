@@ -259,6 +259,20 @@ where
     }
 }
 
+/// The step over `next`, a layer the host holds: what [`HostLayers`] steps
+/// over, for a tree whose layer is written here only when it is needed (a
+/// card tree whose input layer the card could not write again).
+pub fn host_step<F: IsField + 'static>(
+    next: &FractionLayer<F>,
+    point: &[FieldElement<F>],
+    weights: [FieldElement<F>; 2],
+) -> Result<Box<dyn TreeStep<F>>, Error>
+where
+    FieldElement<F>: Send + Sync,
+{
+    Ok(Box::new(HostStep::over(next, point, weights)?))
+}
+
 /// A tree's layers held here, output first.
 pub struct HostLayers<'a, F: IsField>(pub &'a [FractionLayer<F>]);
 

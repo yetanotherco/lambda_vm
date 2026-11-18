@@ -1625,6 +1625,44 @@ pub fn handed_back_by_preference() -> u64 {
     HANDED_BACK_BY_PREFERENCE.load(Ordering::Relaxed)
 }
 
+/// A test's fault: every input layer a card tree writes again for its last
+/// sumcheck (handed back, or kept without its padding) fails to be written,
+/// as a card with no room left for it would.
+static INPUT_REWRITE_FAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Tests only: sets [`INPUT_REWRITE_FAULT`]. Process-wide: a test that sets
+/// it holds its suite's switch lock.
+#[doc(hidden)]
+pub fn fault_input_rewrites_for_tests(on: bool) {
+    INPUT_REWRITE_FAULT.store(on, Ordering::Relaxed);
+}
+
+/// Whether an input layer's rewrite is faulted ([`fault_input_rewrites_for_tests`]).
+#[cfg(feature = "cuda")]
+fn input_rewrite_faulted() -> bool {
+    INPUT_REWRITE_FAULT.load(Ordering::Relaxed)
+}
+
+/// Input layers a batched argue wrote on the host because the card could not
+/// write them again for their last sumcheck ([`note_input_written_on_host`]).
+static INPUT_WRITTEN_ON_HOST: AtomicU64 = AtomicU64::new(0);
+
+/// See [`INPUT_WRITTEN_ON_HOST`].
+pub fn inputs_written_on_host() -> u64 {
+    INPUT_WRITTEN_ON_HOST.load(Ordering::Relaxed)
+}
+
+/// Counts a card tree's input layer written on the host for its last
+/// sumcheck, and says so as it happens: `why` the card's step failed.
+pub fn note_input_written_on_host(why: &str, table: usize, cells: usize) {
+    let count = INPUT_WRITTEN_ON_HOST.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[gkr] input layer written on the host for its last sumcheck: the card's step failed ({why}) · table \
+         {table} · {cells} cells · input layers written on the host {count}"
+    );
+}
+
 /// Cells — factors times rows — below which the host wins.
 ///
 /// The precompiles are short and very wide: a thousand factors over four
@@ -5813,6 +5851,9 @@ fn truncated_tree(
     let num_layers = tree.num_layers();
     let (write, stream) = (write.clone(), stream.clone());
     let rebuild = move || {
+        if input_rewrite_faulted() {
+            return None;
+        }
         let (p, q) = write(true)?;
         Some(math_cuda::gkr::InputLayer::new(
             stream.clone(),
@@ -5939,6 +5980,9 @@ fn carried_or_handed_back(
     let num_layers = tree.num_layers();
 
     let rebuild = move || {
+        if input_rewrite_faulted() {
+            return None;
+        }
         let (p, q) = write(true)?;
         Some(math_cuda::gkr::InputLayer::new(
             stream.clone(),
