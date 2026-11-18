@@ -82,6 +82,8 @@ pub mod memw_register;
 pub mod memw_w;
 pub mod mul;
 pub mod page;
+#[cfg(test)]
+mod page_run_tests;
 pub mod page_w;
 pub mod register;
 pub mod register_residual;

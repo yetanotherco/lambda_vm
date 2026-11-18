@@ -105,6 +105,241 @@ pub fn check_page_base(page_base: u64) -> Result<(), String> {
     }
 }
 
+// =========================================================================
+// Page runs: the page tables a block holds
+// =========================================================================
+
+/// The most pages a page block holds, as a power of two: a verifier constant
+/// bound, so a block is at most `2^(15 + 6)` rows and its span `2^24` bytes,
+/// far below the `2^32` a block's span must divide.
+pub const MAX_PAGE_RUN_LOG2: u8 = 6;
+
+/// The name prefix of a zero block (`PAGE_Z:0x<base>:<pages>`).
+pub const ZERO_NAME_PREFIX: &str = "PAGE_Z:";
+
+/// The name prefix of a private-input block (`PAGE_P:0x<base>:<pages>`).
+pub const PRIVATE_NAME_PREFIX: &str = "PAGE_P:";
+
+/// What a page table holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PageTableKind {
+    /// One page, a PAGE_W table of its own ([`NAME_PREFIX`]): every page when
+    /// page runs are off, and a page of initialized data when they are on.
+    Page,
+    /// A block of zero-initialized pages ([`ZERO_NAME_PREFIX`]): no `INIT`
+    /// column, every word it mints the constant 0.
+    Zero,
+    /// A block of private-input pages ([`PRIVATE_NAME_PREFIX`]): a
+    /// private-input page's columns at the block's height.
+    Private,
+}
+
+/// One page table: `2^log_pages` consecutive pages from `base`, the page
+/// configs `first..first + 2^log_pages` of the list it was cut from
+/// ([`page_tables`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageTable {
+    pub kind: PageTableKind,
+    pub base: u64,
+    pub log_pages: u8,
+    pub first: usize,
+}
+
+impl PageTable {
+    /// Its pages.
+    pub fn pages(&self) -> usize {
+        1 << self.log_pages
+    }
+
+    /// Its height in variables: [`NUM_VARS`] a page.
+    pub fn num_vars(&self) -> usize {
+        NUM_VARS + usize::from(self.log_pages)
+    }
+
+    /// Its rows: one a word of its pages.
+    pub fn rows(&self) -> usize {
+        1 << self.num_vars()
+    }
+
+    /// The bytes it covers.
+    pub fn span(&self) -> u64 {
+        (DEFAULT_PAGE_SIZE as u64) << self.log_pages
+    }
+
+    /// Its table's name: a page's `PAGE_W:0x<base>`, a block's
+    /// `PAGE_Z:0x<base>:<pages>` or `PAGE_P:0x<base>:<pages>`.
+    pub fn name(&self) -> String {
+        match self.kind {
+            PageTableKind::Page => format!("{NAME_PREFIX}0x{:x}", self.base),
+            PageTableKind::Zero => {
+                format!("{ZERO_NAME_PREFIX}0x{:x}:{}", self.base, self.pages())
+            }
+            PageTableKind::Private => {
+                format!("{PRIVATE_NAME_PREFIX}0x{:x}:{}", self.base, self.pages())
+            }
+        }
+    }
+
+    /// Its pages' configs in `configs` (the list it was cut from), or the
+    /// reason they are not its pages: past the list, or a page whose base or
+    /// class ([`page_kind`]) is not the table's.
+    pub fn configs<'a>(&self, configs: &'a [PageConfig]) -> Result<&'a [PageConfig], String> {
+        let mine = self
+            .first
+            .checked_add(self.pages())
+            .and_then(|end| configs.get(self.first..end))
+            .ok_or_else(|| format!("{} is past the page list", self.name()))?;
+        for (k, config) in mine.iter().enumerate() {
+            let base = (k as u64)
+                .checked_mul(DEFAULT_PAGE_SIZE as u64)
+                .and_then(|offset| self.base.checked_add(offset))
+                .ok_or_else(|| format!("{} runs past the address space", self.name()))?;
+            let kind = match self.kind {
+                // A page table of one page takes the page whatever its class
+                // (page runs off: every page is one).
+                PageTableKind::Page => PageTableKind::Page,
+                _ => page_kind(config),
+            };
+            if config.page_base != base || kind != self.kind {
+                return Err(format!(
+                    "{} holds page {k} at {base:#x}, not the {:?} page at {:#x}",
+                    self.name(),
+                    page_kind(config),
+                    config.page_base
+                ));
+            }
+        }
+        Ok(mine)
+    }
+}
+
+/// The class a page takes under page runs: a private-input page's is
+/// [`PageTableKind::Private`]; a page with a nonzero initial byte (the
+/// program's data) is a table of its own, [`PageTableKind::Page`]; every
+/// other page (a runtime page, an all-zero page of the program) is
+/// [`PageTableKind::Zero`]. It reads the private flag first and no private
+/// byte, so the prover's configs and the verifier's give the same class.
+pub fn page_kind(config: &PageConfig) -> PageTableKind {
+    if config.is_private_input {
+        PageTableKind::Private
+    } else if config
+        .init_values
+        .as_ref()
+        .is_some_and(|values| values.iter().any(|&b| b != 0))
+    {
+        PageTableKind::Page
+    } else {
+        PageTableKind::Zero
+    }
+}
+
+/// Whether `table` can be a page table: at most [`MAX_PAGE_RUN_LOG2`] pages
+/// as a power of two, and its base a multiple of its span. Then every address
+/// it names, `base_lo + 8·OFFSET`, is below `2^32` (the span divides `2^32`,
+/// so the block never crosses a multiple of it) and never carries into the
+/// high word.
+pub fn check_page_table(table: &PageTable) -> Result<(), String> {
+    if table.log_pages > MAX_PAGE_RUN_LOG2 {
+        return Err(format!(
+            "{} holds 2^{} pages, a page table at most 2^{MAX_PAGE_RUN_LOG2}",
+            table.name(),
+            table.log_pages
+        ));
+    }
+    if !table.base.is_multiple_of(table.span()) {
+        return Err(format!(
+            "{} is not aligned to its span {:#x}",
+            table.name(),
+            table.span()
+        ));
+    }
+    Ok(())
+}
+
+/// ★ The page-run rule: the page tables of `configs` (a block's page list,
+/// which the verifier derives from the program and the statement: sorted, one
+/// page a base, every base page-aligned) when a run of pages takes at most
+/// `2^run_log2` pages a table. A verifier constant computes it from public
+/// inputs alone, never from a proof.
+///
+/// - `run_log2 = 0`: one [`PageTableKind::Page`] table a page, today's
+///   tables.
+/// - Otherwise each page is classed ([`page_kind`]); a page of data is a
+///   table of its own, and each maximal run of contiguous pages of one other
+///   class (zero, or private input) is cut from its first page into the
+///   largest **aligned** blocks that fit: a block of `2^c` pages, `c ≤
+///   run_log2`, starts at a page index divisible by `2^c`.
+///
+/// The tables are a partition of the list in its order. Refuses a
+/// `run_log2` past [`MAX_PAGE_RUN_LOG2`], and a list that is not sorted
+/// strictly by base or holds an unaligned base.
+pub fn page_tables(configs: &[PageConfig], run_log2: u8) -> Result<Vec<PageTable>, String> {
+    if run_log2 > MAX_PAGE_RUN_LOG2 {
+        return Err(format!(
+            "page runs of 2^{run_log2} pages: at most 2^{MAX_PAGE_RUN_LOG2}"
+        ));
+    }
+    for config in configs {
+        check_page_base(config.page_base)?;
+    }
+    if let Some(w) = configs
+        .windows(2)
+        .find(|w| w[0].page_base >= w[1].page_base)
+    {
+        return Err(format!(
+            "the page list is not sorted strictly by base: {:#x} then {:#x}",
+            w[0].page_base, w[1].page_base
+        ));
+    }
+    let page = DEFAULT_PAGE_SIZE as u64;
+    let single = |first: usize| PageTable {
+        kind: PageTableKind::Page,
+        base: configs[first].page_base,
+        log_pages: 0,
+        first,
+    };
+    if run_log2 == 0 {
+        return Ok((0..configs.len()).map(single).collect());
+    }
+    let mut tables = Vec::new();
+    let mut i = 0;
+    while i < configs.len() {
+        let kind = page_kind(&configs[i]);
+        if kind == PageTableKind::Page {
+            tables.push(single(i));
+            i += 1;
+            continue;
+        }
+        // The run: the pages of this class each one page past the last.
+        let mut end = i + 1;
+        while end < configs.len()
+            && page_kind(&configs[end]) == kind
+            && configs[end - 1].page_base.checked_add(page) == Some(configs[end].page_base)
+        {
+            end += 1;
+        }
+        // Cut from its first page, each block the largest aligned one left.
+        let mut at = i;
+        while at < end {
+            let index = configs[at].page_base / page;
+            let left = end - at;
+            let mut log = 0u8;
+            while log < run_log2 && (2usize << log) <= left && index.is_multiple_of(2u64 << log) {
+                log += 1;
+            }
+            tables.push(PageTable {
+                kind,
+                base: configs[at].page_base,
+                log_pages: log,
+                first: at,
+            });
+            at += 1 << log;
+        }
+        i = end;
+    }
+    Ok(tables)
+}
+
 /// The initial word at `word` (its index in the page): the config's eight
 /// bytes there, little-endian, a missing byte zero.
 pub fn init_word(config: &PageConfig, word: usize) -> u64 {
