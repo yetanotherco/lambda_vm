@@ -110,12 +110,62 @@ fn tail_from(value: Option<&str>) -> usize {
     }
 }
 
+/// Whether a ladder step's small Gruen layers run their card rounds together
+/// (`LAMBDA_VM_ARGUE_GRUEN_BATCH=1`; off by default): each round of every
+/// active tree whose round spans at most
+/// `math_cuda::gkr::GRUEN_BATCH_QUARTER` cube indices is one launch and one
+/// read-back for all of them (one a stream), instead of one of each a tree.
+/// The sums are the same field values, so the proof is the same. Read once,
+/// with a banner.
+pub fn argue_gruen_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    forced(&BATCH_FORCED, || {
+        *ON.get_or_init(|| {
+            let on = on_from(std::env::var("LAMBDA_VM_ARGUE_GRUEN_BATCH").ok().as_deref());
+            eprintln!(
+                "★ ARGUE GRUEN BATCH: {}",
+                if on {
+                    "on (a ladder step's small layers' card rounds in one launch a round)"
+                } else {
+                    "off (the default; one launch a tree a round)"
+                }
+            );
+            on
+        })
+    })
+}
+
+/// Overrides `LAMBDA_VM_ARGUE_GRUEN_BATCH` for the whole process — for a test
+/// that proves both ways in one binary. `None` restores the environment's.
+#[doc(hidden)]
+pub fn force_argue_gruen_batch(on: Option<bool>) {
+    store_forced(&BATCH_FORCED, on);
+}
+
+static BATCH_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static BATCH_LAYER_ROUNDS: AtomicU64 = AtomicU64::new(0);
+
+/// One batched launch of `layers` layers' rounds.
+pub(crate) fn note_batch(layers: usize) {
+    BATCH_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+    BATCH_LAYER_ROUNDS.fetch_add(layers as u64, Ordering::Relaxed);
+}
+
+/// The process's batched launches and the layer rounds they ran.
+pub fn batch_counts() -> (u64, u64) {
+    (
+        BATCH_LAUNCHES.load(Ordering::Relaxed),
+        BATCH_LAYER_ROUNDS.load(Ordering::Relaxed),
+    )
+}
+
 fn on_from(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 static GRUEN_FORCED: AtomicU8 = AtomicU8::new(0);
 static XCHECK_FORCED: AtomicU8 = AtomicU8::new(0);
+static BATCH_FORCED: AtomicU8 = AtomicU8::new(0);
 static TAIL_FORCED: AtomicUsize = AtomicUsize::new(0);
 
 fn forced(cell: &AtomicU8, env: impl FnOnce() -> bool) -> bool {

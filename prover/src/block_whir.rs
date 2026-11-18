@@ -2875,6 +2875,16 @@ impl BlockStamps {
         let argue = sum(|g| g.argue);
         let open = sum(|g| g.open);
         let tax = sum(|g| g.upload_b + g.encode);
+        // The process's batched Gruen launches (`LAMBDA_VM_ARGUE_GRUEN_BATCH`).
+        let (launches, layer_rounds) = multilinear::gkr_gruen::batch_counts();
+        out.push_str(&format!(
+            "BLOCK GRUEN BATCH: {} · launches {launches} · layer rounds {layer_rounds}\n",
+            if multilinear::gkr_gruen::argue_gruen_batch() {
+                "on"
+            } else {
+                "off"
+            }
+        ));
         out.push_str(&format!(
             "BLOCK PREPARED: tables {} · derived in {:.3}\n",
             self.prepared.0, self.prepared.1

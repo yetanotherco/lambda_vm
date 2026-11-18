@@ -4014,6 +4014,73 @@ impl GruenSession {
         self.layer.rounds()
     }
 
+    /// Whether this session's next round can join a [`Self::batch_sums`]
+    /// (folding by a challenge: `fold`): nothing queued, no whole layer
+    /// checked beside it, and a layer `math_cuda::gkr::GruenLayer::batchable`
+    /// on the stream of `with`'s, or on its own when `with` is `None`.
+    pub(crate) fn batchable(&self, fold: bool, with: Option<&Self>) -> bool {
+        let stream = with.map_or_else(|| self.layer.stream(), |other| other.layer.stream());
+        self.pending.is_none() && self.whole.is_none() && self.layer.batchable(fold, stream)
+    }
+
+    /// One round of each of `sessions` in one launch, read back at once:
+    /// `rounds[k]` is session `k`'s `(previous, want_h0)` as [`Self::sums`]
+    /// takes them, and so is each result (`math_cuda::gkr::gruen_round_batch`:
+    /// the same field values). Every session must be [`Self::batchable`];
+    /// sessions on different streams run as one launch a stream.
+    pub(crate) fn batch_sums<E>(
+        sessions: &mut [&mut Self],
+        rounds: &[(Option<math::field::element::FieldElement<E>>, bool)],
+    ) -> Result<Vec<Vec<math::field::element::FieldElement<E>>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        let failed = || crate::Error::DeviceFailed {
+            stage: "gruen round batch",
+        };
+        if sessions.len() != rounds.len() {
+            return Err(failed());
+        }
+        // One launch a stream: the sessions' layers grouped by the stream
+        // their rounds run on, in first-seen order.
+        type Group<'s> = (
+            Vec<usize>,
+            Vec<&'s mut math_cuda::gkr::GruenLayer>,
+            Vec<math_cuda::gkr::GruenBatchRound>,
+        );
+        let mut groups: Vec<(*const (), Group<'_>)> = Vec::new();
+        for (k, (session, (previous, want_h0))) in sessions.iter_mut().zip(rounds).enumerate() {
+            let fold_by = match previous {
+                Some(r) => Some(ext3_raw(r).ok_or_else(failed)?),
+                None => None,
+            };
+            let lambda = session.lambda;
+            let key = std::sync::Arc::as_ptr(session.layer.stream()).cast::<()>();
+            let at = match groups.iter().position(|(k, _)| *k == key) {
+                Some(at) => at,
+                None => {
+                    groups.push((key, (Vec::new(), Vec::new(), Vec::new())));
+                    groups.len() - 1
+                }
+            };
+            let (places, layers, args) = &mut groups[at].1;
+            places.push(k);
+            layers.push(&mut session.layer);
+            args.push((fold_by, lambda, *want_h0));
+        }
+        let mut out: Vec<Vec<math::field::element::FieldElement<E>>> =
+            vec![Vec::new(); rounds.len()];
+        for (_, (places, mut layers, args)) in groups {
+            let sums =
+                math_cuda::gkr::gruen_round_batch(&mut layers, &args).map_err(|_| failed())?;
+            for (k, limbs) in places.into_iter().zip(sums) {
+                out[k] = limbs.chunks_exact(3).map(ext3_from_raw::<E>).collect();
+            }
+        }
+        SUMCHECK_ROUNDS.fetch_add(out.len() as u64, Ordering::Relaxed);
+        Ok(out)
+    }
+
     /// Queues the next round — folding by `previous`, the last round's
     /// challenge — without waiting for it.
     pub(crate) fn enqueue<E>(
@@ -4128,6 +4195,23 @@ impl GruenSession {
 impl GruenSession {
     pub(crate) fn rounds(&self) -> usize {
         match self.0 {}
+    }
+
+    pub(crate) fn batchable(&self, _fold: bool, _with: Option<&Self>) -> bool {
+        match self.0 {}
+    }
+
+    pub(crate) fn batch_sums<E>(
+        sessions: &mut [&mut Self],
+        _rounds: &[(Option<math::field::element::FieldElement<E>>, bool)],
+    ) -> Result<Vec<Vec<math::field::element::FieldElement<E>>>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match sessions.first() {
+            Some(session) => match session.0 {},
+            None => Ok(Vec::new()),
+        }
     }
 
     pub(crate) fn enqueue<E>(

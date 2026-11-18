@@ -398,6 +398,8 @@ pub struct Backend {
     // D-ARGUE S1-3's GKR layer rounds (`crate::gkr::GruenLayer`).
     pub gkr_eq_levels_ext3: CudaFunction,
     pub gkr_round_gruen: CudaFunction,
+    /// Many small layers' rounds in one launch (`crate::gkr::gruen_round_batch`).
+    pub gkr_round_gruen_batch: CudaFunction,
     pub gkr_gruen_finish: CudaFunction,
     // The same over an input layer kept without its padding
     // (`crate::gkr::DeviceFractionTree::from_truncated_input`).
@@ -1329,6 +1331,7 @@ impl Backend {
             zc_round_gruen: sumcheck.load_function("zc_round_gruen")?,
             gkr_eq_levels_ext3: sumcheck.load_function("gkr_eq_levels_ext3")?,
             gkr_round_gruen: sumcheck.load_function("gkr_round_gruen")?,
+            gkr_round_gruen_batch: sumcheck.load_function("gkr_round_gruen_batch")?,
             gkr_gruen_finish: sumcheck.load_function("gkr_gruen_finish")?,
             gkr_round_gruen_real: sumcheck.load_function("gkr_round_gruen_real")?,
             gkr_gruen_finish_real: sumcheck.load_function("gkr_gruen_finish_real")?,

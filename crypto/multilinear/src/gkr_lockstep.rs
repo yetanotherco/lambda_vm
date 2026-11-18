@@ -183,6 +183,29 @@ pub trait TreeStep<F: IsField> {
     fn to_host(&mut self) -> Result<(), Error> {
         Ok(())
     }
+    /// This round as a card request that can run in one launch with other
+    /// trees' (`gkr_gruen::argue_gruen_batch`): the session, the challenge to
+    /// fold by and whether `H(0)` is summed there — or `None`, and the ladder
+    /// calls [`Self::round`]. Nothing is queued for it.
+    fn batch_request(
+        &mut self,
+    ) -> Option<(&mut crate::gpu::GruenSession, Option<FieldElement<F>>, bool)> {
+        None
+    }
+    /// Whether [`Self::batch_request`] would make one now.
+    fn batchable(&self) -> bool {
+        false
+    }
+    /// This round's polynomial from the sums a batch read back for the
+    /// request [`Self::batch_request`] made: what [`Self::round`] returns.
+    fn round_from_sums(
+        &mut self,
+        _sums: Vec<FieldElement<F>>,
+    ) -> Result<Vec<FieldElement<F>>, Error> {
+        Err(Error::DeviceFailed {
+            stage: "gruen round batch",
+        })
+    }
 }
 
 /// A tree the ladder descends: where its layers are is its own business — on
@@ -410,6 +433,15 @@ trait GruenCard<F: IsField> {
     ) -> Result<Vec<FieldElement<F>>, Error>;
     /// After the last round: `p_lo, p_hi, q_lo, q_hi` bound to it.
     fn finish(&mut self, previous: Option<&FieldElement<F>>) -> Result<Vec<Mle<F>>, Error>;
+    /// The card's session, when this is one: a batch takes its round.
+    fn as_session(&mut self) -> Option<&mut crate::gpu::GruenSession> {
+        None
+    }
+    /// Whether the next round can join a batch (folding by a challenge:
+    /// `fold`).
+    fn batchable(&self, _fold: bool) -> bool {
+        false
+    }
 }
 
 impl<F: IsField + 'static> GruenCard<F> for crate::gpu::GruenSession {
@@ -431,6 +463,14 @@ impl<F: IsField + 'static> GruenCard<F> for crate::gpu::GruenSession {
 
     fn finish(&mut self, previous: Option<&FieldElement<F>>) -> Result<Vec<Mle<F>>, Error> {
         crate::gpu::GruenSession::finish(self, previous)
+    }
+
+    fn as_session(&mut self) -> Option<&mut crate::gpu::GruenSession> {
+        Some(self)
+    }
+
+    fn batchable(&self, fold: bool) -> bool {
+        crate::gpu::GruenSession::batchable(self, fold, None)
     }
 }
 
@@ -561,8 +601,36 @@ where
         let Some(session) = self.session.as_mut() else {
             return self.host.as_mut().ok_or(Error::NoVariablesLeft)?.round();
         };
+        let want_h0 = self.lefts[self.round].is_none();
+        let sums = session.sums(self.previous.as_ref(), want_h0)?;
+        self.round_from_sums(sums)
+    }
+
+    fn batch_request(
+        &mut self,
+    ) -> Option<(&mut crate::gpu::GruenSession, Option<FieldElement<F>>, bool)> {
+        if !TreeStep::batchable(self) {
+            return None;
+        }
+        let want_h0 = self.lefts.get(self.round)?.is_none();
+        let previous = self.previous.clone();
+        let session = self.session.as_mut()?.as_session()?;
+        Some((session, previous, want_h0))
+    }
+
+    fn batchable(&self) -> bool {
+        self.lefts.get(self.round).is_some()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.batchable(self.previous.is_some()))
+    }
+
+    fn round_from_sums(
+        &mut self,
+        sums: Vec<FieldElement<F>>,
+    ) -> Result<Vec<FieldElement<F>>, Error> {
         let left = self.lefts[self.round].as_ref();
-        let sums = session.sums(self.previous.as_ref(), left.is_none())?;
         if left.is_none() {
             crate::gkr_gruen::note_direct_h0();
         }
@@ -697,6 +765,43 @@ where
     }
 }
 
+/// The rounds of the steps `joins` marks, run in one card launch and read
+/// back at once ([`crate::gpu::GruenSession::batch_sums`]): each one's round
+/// polynomial, by its place in `stepping`, `None` for the rest.
+fn batch_round<F>(
+    stepping: &mut [Box<dyn TreeStep<F> + '_>],
+    joins: &[bool],
+) -> Result<Vec<Option<Vec<FieldElement<F>>>>, Error>
+where
+    F: IsField + 'static,
+{
+    let mut out: Vec<Option<Vec<FieldElement<F>>>> = vec![None; stepping.len()];
+    if !joins.iter().any(|&j| j) {
+        return Ok(out);
+    }
+    let mut places = Vec::new();
+    let mut sessions = Vec::new();
+    let mut asks = Vec::new();
+    for (k, (step, &joins)) in stepping.iter_mut().zip(joins).enumerate() {
+        if !joins {
+            continue;
+        }
+        let (session, previous, want_h0) = step.batch_request().ok_or(Error::DeviceFailed {
+            stage: "gruen round batch",
+        })?;
+        places.push(k);
+        sessions.push(session);
+        asks.push((previous, want_h0));
+    }
+    let sums = crate::gpu::GruenSession::batch_sums(&mut sessions, &asks)?;
+    drop(sessions);
+    crate::gkr_gruen::note_batch(places.len());
+    for (k, sums) in places.into_iter().zip(sums) {
+        out[k] = Some(stepping[k].round_from_sums(sums)?);
+    }
+    Ok(out)
+}
+
 /// Proves every tree's layers in lockstep, on the host.
 ///
 /// `trees[t]` is tree `t`'s layers, output first (`trees[t][0]` has no
@@ -755,6 +860,7 @@ where
         .collect();
     let mut point: Vec<FieldElement<F>> = Vec::new();
     let mut layers = Vec::with_capacity(steps);
+    let batch = crate::gkr_gruen::argue_gruen_batch();
 
     for i in 0..steps {
         let active = active(&input_vars, i);
@@ -779,12 +885,31 @@ where
                     step.to_host()?;
                 }
             }
-            for step in stepping.iter_mut() {
-                step.prefetch()?;
+            // The small card layers' rounds in one launch
+            // (`gkr_gruen::argue_gruen_batch`); every other step's queued
+            // first, then read back in turn.
+            let joins: Vec<bool> = if batch {
+                let joins: Vec<bool> = stepping.iter().map(|step| step.batchable()).collect();
+                if joins.iter().filter(|&&j| j).count() >= 2 {
+                    joins
+                } else {
+                    vec![false; stepping.len()]
+                }
+            } else {
+                vec![false; stepping.len()]
+            };
+            for (step, &joins) in stepping.iter_mut().zip(&joins) {
+                if !joins {
+                    step.prefetch()?;
+                }
             }
+            let mut batched = batch_round(&mut stepping, &joins)?;
             let mut sent = vec![FieldElement::<F>::zero(); 3];
-            for step in stepping.iter_mut() {
-                let own = step.round()?;
+            for (k, step) in stepping.iter_mut().enumerate() {
+                let own = match batched[k].take() {
+                    Some(own) => own,
+                    None => step.round()?,
+                };
                 if own.len() != 3 {
                     return Err(Error::RoundDegreeMismatch {
                         round: rounds.len(),

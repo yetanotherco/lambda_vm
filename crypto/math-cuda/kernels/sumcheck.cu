@@ -1427,6 +1427,95 @@ __device__ __forceinline__ void gkr_round_gruen_body(
     if (SLOT) slot_sums(d_partials, rows, d_ticket, d_slot, seq);
 }
 
+// Many small layers' Gruen rounds in one launch (`crate::gkr::gruen_round_batch`): layer `l` is
+// `blockIdx.y`, its arguments the `GKR_BATCH_WORDS` u64 at `d_desc + l·GKR_BATCH_WORDS` — `p`,
+// `q`, `half`, `quarter`, `fold`, `s` (3), `λ` (3), `e_hi`, `e_lo`, `low`, `want_h0` — and its
+// round exactly `gkr_round_gruen`'s over a layer stored whole. Block `b`'s partials go to
+// `d_partials[((l·3 + row)·gridDim.x + b)·3]`, all three rows (`H(0)` zero where not asked), so
+// `sum_partials_ext3` over `3·layers` rows of `gridDim.x` partials gives each layer's sums at
+// `(l·3 + row)·3`. Field addition is exact, so the sums are a lone round's values (a limb may be
+// the other representation of the same value); the folds write the lone round's limbs.
+#define GKR_BATCH_WORDS 16
+extern "C" __global__ __launch_bounds__(256) void gkr_round_gruen_batch(
+    const uint64_t *__restrict__ d_desc, uint64_t *__restrict__ d_partials) {
+    const uint64_t *d = d_desc + (uint64_t)blockIdx.y * GKR_BATCH_WORDS;
+    uint64_t *p = (uint64_t *)d[0];
+    uint64_t *q = (uint64_t *)d[1];
+    uint64_t half = d[2], quarter = d[3];
+    uint32_t fold = (uint32_t)d[4];
+    Fe3 s = ext3::make(d[5], d[6], d[7]);
+    Fe3 lambda = ext3::make(d[8], d[9], d[10]);
+    const uint64_t *e_hi = (const uint64_t *)d[11];
+    const uint64_t *e_lo = (const uint64_t *)d[12];
+    uint32_t low = (uint32_t)d[13];
+    uint32_t want_h0 = (uint32_t)d[14];
+    uint64_t *factors[4] = {p, p + half * 3, q, q + half * 3};
+    uint64_t mask = ((uint64_t)1 << low) - 1;
+    Fe3 acc1 = ext3::zero(), acc2 = ext3::zero(), acc0 = ext3::zero();
+    for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < quarter;
+         x += (uint64_t)gridDim.x * blockDim.x) {
+        Fe3 lo[4], hi[4];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            uint64_t *f = factors[k];
+            if (fold) {
+                Fe3 a = load_ext(f + x * 3);
+                Fe3 b = load_ext(f + (x + quarter) * 3);
+                Fe3 c = load_ext(f + (x + 2 * quarter) * 3);
+                Fe3 e = load_ext(f + (x + 3 * quarter) * 3);
+                lo[k] = ext3::add(a, ext3::mul(s, ext3::sub(c, a)));
+                hi[k] = ext3::add(b, ext3::mul(s, ext3::sub(e, b)));
+                f[x * 3 + 0] = lo[k].a;
+                f[x * 3 + 1] = lo[k].b;
+                f[x * 3 + 2] = lo[k].c;
+                f[(x + quarter) * 3 + 0] = hi[k].a;
+                f[(x + quarter) * 3 + 1] = hi[k].b;
+                f[(x + quarter) * 3 + 2] = hi[k].c;
+            } else {
+                lo[k] = load_ext(f + x * 3);
+                hi[k] = load_ext(f + (x + quarter) * 3);
+            }
+        }
+        Fe3 w = ext3::mul(load_ext(e_hi + (x >> low) * 3), load_ext(e_lo + (x & mask) * 3));
+        acc1 = ext3::add(acc1, ext3::mul(w, gkr_h(hi[0], hi[1], hi[2], hi[3], lambda)));
+        Fe3 two[4];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            two[k] = ext3::sub(ext3::add(hi[k], hi[k]), lo[k]);
+        }
+        acc2 = ext3::add(acc2, ext3::mul(w, gkr_h(two[0], two[1], two[2], two[3], lambda)));
+        if (want_h0) {
+            acc0 = ext3::add(acc0, ext3::mul(w, gkr_h(lo[0], lo[1], lo[2], lo[3], lambda)));
+        }
+    }
+
+    extern __shared__ uint64_t shared[];
+    for (uint32_t row = 0; row < 3; row++) {
+        Fe3 mine = row == 0 ? acc1 : row == 1 ? acc2 : acc0;
+        shared[threadIdx.x * 3 + 0] = mine.a;
+        shared[threadIdx.x * 3 + 1] = mine.b;
+        shared[threadIdx.x * 3 + 2] = mine.c;
+        __syncthreads();
+        for (uint32_t width = blockDim.x / 2; width > 0; width >>= 1) {
+            if (threadIdx.x < width) {
+                Fe3 sum = ext3::add(load_ext(shared + threadIdx.x * 3),
+                                    load_ext(shared + (threadIdx.x + width) * 3));
+                shared[threadIdx.x * 3 + 0] = sum.a;
+                shared[threadIdx.x * 3 + 1] = sum.b;
+                shared[threadIdx.x * 3 + 2] = sum.c;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            uint64_t at = (((uint64_t)blockIdx.y * 3 + row) * gridDim.x + blockIdx.x) * 3;
+            d_partials[at + 0] = shared[0];
+            d_partials[at + 1] = shared[1];
+            d_partials[at + 2] = shared[2];
+        }
+        __syncthreads();
+    }
+}
+
 // The rounds' end: each half bound to the last challenge `s` (with `fold`) from its `2·cells` cube
 // down to `cells`, written in place and to `out[(k·cells + y)·3]`, halves in the order `p_lo, p_hi,
 // q_lo, q_hi` — what the host tail starts from. Thread `y` reads cells `y` and `y + cells` and

@@ -1016,6 +1016,143 @@ impl GruenLayer {
     }
 }
 
+/// The widest round a [`gruen_round_batch`] takes, in cube indices: a batch is
+/// for the many small layers whose rounds each cost a launch more than their
+/// work (the many-table group's trees).
+pub const GRUEN_BATCH_QUARTER: u64 = 1 << 14;
+
+/// One layer's round in a [`gruen_round_batch`]: the challenge to fold by
+/// (`None` on the first round), `λ`, and whether `H(0)` is summed.
+pub type GruenBatchRound = (Option<[u64; 3]>, [u64; 3], bool);
+
+/// The u64 words of one layer's arguments in a batch (`GKR_BATCH_WORDS` in
+/// `sumcheck.cu`).
+const GRUEN_BATCH_WORDS: usize = 16;
+
+impl GruenLayer {
+    /// The cube indices this layer's next round runs over.
+    fn next_quarter(&self) -> u64 {
+        let m = self.half.trailing_zeros() as usize;
+        1u64 << (m - self.done - 1)
+    }
+
+    /// Whether this layer's next round can run in a [`gruen_round_batch`]:
+    /// rounds left on the card, a round of at most [`GRUEN_BATCH_QUARTER`]
+    /// indices, and halves that hold every cell that round reads (no padding
+    /// read as constants), on `stream`.
+    pub fn batchable(&self, fold: bool, stream: &Arc<CudaStream>) -> bool {
+        if self.done >= self.rounds || fold != (self.done > 0) {
+            return false;
+        }
+        let quarter = self.next_quarter();
+        let cube = if fold { 4 } else { 2 } * quarter;
+        quarter <= GRUEN_BATCH_QUARTER
+            && self.stored as u64 >= cube
+            && Arc::ptr_eq(&self.stream, stream)
+    }
+
+    /// The stream this layer's rounds run on.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+}
+
+/// One round of each of `layers` in one launch, and their sums read back at
+/// once: `rounds[l]` is layer `l`'s `(fold_by, λ, want_h0)`, as
+/// [`GruenLayer::round`] takes them, and the result is layer `l`'s sums as
+/// [`GruenLayer::round_collect`] gives them (`H(1)`, `H(2)`, then `H(0)` when
+/// asked; three u64 each) — the same field values: the kernel is the lone
+/// round's over a layer stored whole and field addition is exact, though a
+/// limb may come back as `v + P` where the lone round's reduction gave `v`. The
+/// folds write the same limbs. Every layer must be
+/// [`GruenLayer::batchable`] on one stream; anything else is refused before a
+/// launch.
+pub fn gruen_round_batch(
+    layers: &mut [&mut GruenLayer],
+    rounds: &[GruenBatchRound],
+) -> Result<Vec<Vec<u64>>> {
+    if layers.is_empty() || layers.len() != rounds.len() {
+        return Err(invalid());
+    }
+    let stream = layers[0].stream.clone();
+    for (layer, (fold_by, _, _)) in layers.iter().zip(rounds) {
+        if !layer.batchable(fold_by.is_some(), &stream) {
+            return Err(invalid());
+        }
+    }
+    let be = backend()?;
+    let n = layers.len();
+    let mut desc = Vec::with_capacity(n * GRUEN_BATCH_WORDS);
+    let mut grid = 1u32;
+    for (layer, (fold_by, lambda, want_h0)) in layers.iter().zip(rounds) {
+        let quarter = layer.next_quarter();
+        grid = grid.max(gruen_shape(quarter).0);
+        let s = fold_by.unwrap_or([0; 3]);
+        let at = (1usize << layer.low) + (1usize << layer.rounds)
+            - (1usize << (layer.rounds - layer.done));
+        let eq_at = {
+            let (at, _guard) = layer.eq.device_ptr(&stream);
+            at
+        };
+        desc.extend_from_slice(&[
+            layer.p_at,
+            layer.q_at,
+            layer.half as u64,
+            quarter,
+            u64::from(fold_by.is_some()),
+            s[0],
+            s[1],
+            s[2],
+            lambda[0],
+            lambda[1],
+            lambda[2],
+            eq_at + (at * 3 * 8) as u64,
+            eq_at,
+            layer.low as u64,
+            u64::from(*want_h0),
+            0,
+        ]);
+    }
+    let desc = crate::device::htod_or_trim(&stream, &desc)?;
+    // SAFETY: the batch kernel writes every partial.
+    let mut partials =
+        unsafe { crate::device::alloc_or_trim::<u64>(&stream, n * 3 * grid as usize * 3) }?;
+    let mut sums = crate::device::alloc_zeros_or_trim::<u64>(&stream, n * 3 * 3)?;
+    let block = 256u32;
+    unsafe {
+        stream
+            .launch_builder(&be.gkr_round_gruen_batch)
+            .arg(&desc)
+            .arg(&mut partials)
+            .launch(LaunchConfig {
+                grid_dim: (grid, n as u32, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: block * 3 * 8,
+            })?;
+        stream
+            .launch_builder(&be.sum_partials_ext3)
+            .arg(&partials)
+            .arg(&(grid as u64))
+            .arg(&mut sums)
+            .launch(LaunchConfig {
+                grid_dim: (n as u32 * 3, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 256 * 3 * 8,
+            })?;
+    }
+    let all = crate::readback::clone_dtoh(&stream, &sums)?;
+    stream.synchronize()?;
+    let mut out = Vec::with_capacity(n);
+    for (l, (layer, (_, _, want_h0))) in layers.iter_mut().zip(rounds).enumerate() {
+        let quarter = layer.next_quarter();
+        layer.stored = stored_after_round(layer.stored, quarter as usize);
+        layer.done += 1;
+        let rows = if *want_h0 { 3 } else { 2 };
+        out.push(all[l * 9..l * 9 + rows * 3].to_vec());
+    }
+    Ok(out)
+}
+
 /// A Gruen round's launch: 256-thread blocks for a wide cube, narrower ones —
 /// down to a warp — for a narrow one, and at most [`GRUEN_MAX_GRID`] blocks.
 fn gruen_shape(quarter: u64) -> (u32, u32) {
