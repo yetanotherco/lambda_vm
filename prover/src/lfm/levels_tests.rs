@@ -987,14 +987,19 @@ fn rta_one_run(
         if let Some(b) = t.builds.get(k) {
             println!(
                 "RTA LEVEL {} BUILD: stacks {} · prepared cells {} · prepare {:.3}s · commit {:.3}s \
-                 · prefix pack {:.3}s · committed at {:.3}s",
+                 · prefix pack {:.3}s · committed at {:.3}s · prepare groups {:.3}s · columns {:.3}s · \
+                 stacks {:.3}s · columns on the pool {}",
                 k + 1,
                 place_word(b.place),
                 b.cells,
                 b.prepare,
                 b.commit,
                 b.prefix,
-                b.committed
+                b.committed,
+                b.prepare_split[0],
+                b.prepare_split[1],
+                b.prepare_split[2],
+                super::wlfm::prepare_par(),
             );
         }
         if let Some(st) = t.stamps.get(k) {

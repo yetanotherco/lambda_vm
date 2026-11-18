@@ -992,6 +992,8 @@ pub struct LevelsTimes {
 pub struct LevelBuild {
     pub place: StackPlace,
     pub prepare: f64,
+    /// The prepare's seconds by part: `[groups, columns, stacks]`.
+    pub prepare_split: [f64; 3],
     pub commit: f64,
     pub prefix: f64,
     pub cells: u64,
@@ -1451,7 +1453,7 @@ pub fn prove_block_levels(
                     .map_err(|_| "the builder's thread panicked".to_string());
                 Some(pre.and_then(|pre| {
                     let pre = pre?;
-                    let prepare = pre.secs();
+                    let prepare = (pre.secs(), pre.prepare_split());
                     let cells = pre.prepared_cells();
                     if proved.is_err() {
                         return Err("the base did not prove".to_string());
@@ -1526,7 +1528,7 @@ pub fn prove_block_levels(
         Some(built) => built?,
         None => {
             let pre = prepare_level(&program, family)?;
-            let (prepare, cells) = (pre.secs(), pre.prepared_cells());
+            let (prepare, cells) = ((pre.secs(), pre.prepare_split()), pre.prepared_cells());
             let settled = card_settle("base end");
             take_levels_budget(settled.map(|c| c.total))?;
             take_levels_pad()?;
@@ -1544,7 +1546,8 @@ pub fn prove_block_levels(
     times.built = committed;
     times.builds.push(LevelBuild {
         place: first.place(),
-        prepare,
+        prepare: prepare.0,
+        prepare_split: prepare.1,
         commit: first.secs().1,
         prefix: first.chip_prefix_secs(),
         cells,
@@ -1624,7 +1627,8 @@ pub fn prove_block_levels(
                 .join()
                 .map_err(|_| format!("level {}'s preparation panicked", k + 1))??;
             let execute_from = now();
-            let (prepare, cells) = (pre.secs(), pre.prepared_cells());
+            let (prepare, prepare_split, cells) =
+                (pre.secs(), pre.prepare_split(), pre.prepared_cells());
             // Its stacks on the card while its execution runs on the host.
             let committer = scope.spawn(move || {
                 commit_level(pre, k + 1).map(|build| {
@@ -1653,6 +1657,7 @@ pub fn prove_block_levels(
             times.builds.push(LevelBuild {
                 place: build.place(),
                 prepare,
+                prepare_split,
                 commit: build.secs().1,
                 prefix: build.chip_prefix_secs(),
                 cells,

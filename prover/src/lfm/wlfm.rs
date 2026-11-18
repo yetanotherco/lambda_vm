@@ -1293,6 +1293,9 @@ pub struct WlfmPrebuild {
     /// Under [`WlfmPrep::Stacked`], the stacks to commit; `None` otherwise.
     stacks: Option<Vec<GroupStack>>,
     secs: f64,
+    /// [`prepare_wlfm`]'s seconds by part: the tables' row-major groups, their
+    /// columns, the stacks.
+    split: [f64; 3],
     /// [`Self::hold_chip_prefixes`]'s prefixes and seconds, handed to the
     /// build (empty until then).
     chip_prefixes: Vec<Option<std::sync::Arc<multilinear::narrow::NarrowColumns>>>,
@@ -1300,6 +1303,11 @@ pub struct WlfmPrebuild {
 }
 
 impl WlfmPrebuild {
+    /// [`prepare_wlfm`]'s seconds by part: `[groups, columns, stacks]`.
+    pub fn prepare_split(&self) -> [f64; 3] {
+        self.split
+    }
+
     /// The prepared cells the commit takes: every stack's columns at their
     /// heights.
     pub fn prepared_cells(&self) -> u64 {
@@ -1372,6 +1380,7 @@ impl WlfmPrebuild {
             mut artifacts,
             stacks,
             secs,
+            split: _,
             chip_prefixes,
             chip_prefix_secs,
         } = self;
@@ -1487,6 +1496,7 @@ pub fn prepare_wlfm(
             groups.len()
         ));
     }
+    let groups_secs = t.elapsed().as_secs_f64();
     let mut table_num_vars = Vec::with_capacity(refs.len());
     let mut counts = Vec::with_capacity(refs.len());
     for (air, group) in refs.iter().zip(&groups) {
@@ -1523,13 +1533,26 @@ pub fn prepare_wlfm(
             })
             .collect()
     };
-    let columns: Vec<PreparedColumns> = groups
-        .iter()
-        .zip(&counts)
-        .enumerate()
-        .filter(|&(_, (_, &count))| count > 0)
-        .map(|(table, (group, _))| (table, group_columns(group)))
-        .collect();
+    let columns_from = std::time::Instant::now();
+    let columns: Vec<PreparedColumns> = if prepare_par() {
+        use rayon::prelude::*;
+        groups
+            .par_iter()
+            .zip(&counts)
+            .enumerate()
+            .filter(|&(_, (_, &count))| count > 0)
+            .map(|(table, (group, _))| (table, group_columns_par(group)))
+            .collect()
+    } else {
+        groups
+            .iter()
+            .zip(&counts)
+            .enumerate()
+            .filter(|&(_, (_, &count))| count > 0)
+            .map(|(table, (group, _))| (table, group_columns(group)))
+            .collect()
+    };
+    let columns_secs = columns_from.elapsed().as_secs_f64();
     if prep == WlfmPrep::Evaluated {
         let mut evaluated: Vec<Vec<Mle<F>>> = vec![Vec::new(); counts.len()];
         for (table, cols) in columns {
@@ -1563,11 +1586,14 @@ pub fn prepare_wlfm(
             artifacts,
             stacks: None,
             secs: t.elapsed().as_secs_f64(),
+            split: [groups_secs, columns_secs, 0.0],
             chip_prefixes: Vec::new(),
             chip_prefix_secs: 0.0,
         });
     }
+    let stacks_from = std::time::Instant::now();
     let stacks = group_stacks(columns, &group_lists).map_err(|e| format!("{e:?}"))?;
+    let stacks_secs = stacks_from.elapsed().as_secs_f64();
     let artifacts = WlfmArtifacts {
         rate,
         hasher,
@@ -1592,6 +1618,7 @@ pub fn prepare_wlfm(
         artifacts,
         stacks: Some(stacks),
         secs: t.elapsed().as_secs_f64(),
+        split: [groups_secs, columns_secs, stacks_secs],
         chip_prefixes: Vec::new(),
         chip_prefix_secs: 0.0,
     })
@@ -2569,6 +2596,50 @@ pub(crate) fn program_prep_groups(program: &LfmProgram) -> Vec<Cow<'_, ColumnGro
     out.push(Cow::Borrowed(&g.public));
     out.push(Cow::Owned(range_group()));
     out
+}
+
+/// `LAMBDA_VM_LEVELS_PREPARE_PAR=1`: a W-LFM build's host part turns its
+/// tables' row-major groups into columns on the prover's pool
+/// ([`group_columns_par`]), every table at once, where it otherwise does one
+/// table, one column, at a time. The same columns. Off by default (and for any
+/// word but `1`); read once a process.
+pub const PREPARE_PAR_ENV: &str = "LAMBDA_VM_LEVELS_PREPARE_PAR";
+
+/// Whether [`PREPARE_PAR_ENV`] is on.
+pub fn prepare_par() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(PREPARE_PAR_ENV).ok().as_deref())
+    })
+}
+
+/// Rows a [`group_columns_par`] task gathers of one column.
+const COLUMN_BLOCK_ROWS: usize = 1 << 16;
+
+/// [`group_columns`] on the pool: each column, and each block of
+/// [`COLUMN_BLOCK_ROWS`] rows of it, gathered by a task of its own, so a group
+/// of a few columns over many rows is as parallel as a wide one. The same
+/// columns.
+pub(crate) fn group_columns_par(group: &ColumnGroup) -> Vec<Vec<FieldElement<F>>> {
+    use rayon::prelude::*;
+    let (width, rows) = (group.width, group.padded_rows);
+    let mut columns: Vec<Vec<FieldElement<F>>> = (0..width)
+        .map(|_| vec![FieldElement::zero(); rows])
+        .collect();
+    columns
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(column, out)| {
+            out.par_chunks_mut(COLUMN_BLOCK_ROWS)
+                .enumerate()
+                .for_each(|(block, cells)| {
+                    let first = block * COLUMN_BLOCK_ROWS;
+                    for (i, cell) in cells.iter_mut().enumerate() {
+                        *cell = group.data[(first + i) * width + column];
+                    }
+                });
+        });
+    columns
 }
 
 /// A row-major group as its columns.
