@@ -991,6 +991,44 @@ mod tests {
         layers
     }
 
+    /// A probe, never a gate: the host's lockstep over one Ext3 tree of
+    /// `2^k` input cells, for `k` 10, 13, 15 and 16 (ms, best of three).
+    #[test]
+    #[ignore = "a timing probe"]
+    fn host_ladder_seconds_by_tree_height() {
+        use math::field::element::FieldElement as FEl;
+        type E3 = FEl<Ext3>;
+        for k in [10usize, 13, 15, 16] {
+            let mut s = 0x9E37_79B9_7F4A_7C15u64 ^ k as u64;
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                E3::from(s)
+            };
+            let p: Vec<E3> = (0..1usize << k).map(|_| next()).collect();
+            let q: Vec<E3> = (0..1usize << k).map(|_| next()).collect();
+            let input = FractionLayer::new(Mle::new(p).unwrap(), Mle::new(q).unwrap()).unwrap();
+            let mut layers = vec![input];
+            while layers.last().unwrap().num_vars() > 0 {
+                let next = layers.last().unwrap().fold().unwrap();
+                layers.push(next);
+            }
+            layers.reverse();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let mut t = DefaultTranscript::<Ext3>::new(b"probe");
+                let start = std::time::Instant::now();
+                prove(&[layers.as_slice()], &mut t).unwrap();
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            println!(
+                "HOST LADDER PROBE: 2^{k} input cells · {:.3} ms",
+                best * 1e3
+            );
+        }
+    }
+
     fn round_trip(heights: &[usize]) -> (Vec<Vec<FractionLayer<F>>>, LockstepProof<F>) {
         let trees: Vec<Vec<FractionLayer<F>>> = heights
             .iter()
