@@ -2023,6 +2023,24 @@ pub(crate) fn prove_wlfm_traces_as(
     check_prefix: bool,
     proving: WlfmProving,
 ) -> Result<WlfmProof, String> {
+    prove_wlfm_traces_observed(build, filled, check_prefix, proving, &|_| {})
+}
+
+/// What a W-LFM prove hands an observer as each group is opened: the group's
+/// share of the proof, every root and every commit-time answer
+/// ([`multilinear_block::GroupOpened`]).
+pub(crate) type WlfmObserver<'a> = &'a (dyn Fn(multilinear_block::GroupOpened<'_, F, E>) + Sync);
+
+/// [`prove_wlfm_traces_as`], calling `on_group` as each group is opened: what
+/// a caller that streams the next level's execution over this proof reads.
+/// The observer reads; the proof is the same with any observer.
+pub(crate) fn prove_wlfm_traces_observed(
+    build: &WlfmBuild,
+    filled: LfmFilled,
+    check_prefix: bool,
+    proving: WlfmProving,
+    on_group: WlfmObserver<'_>,
+) -> Result<WlfmProof, String> {
     if build.released {
         return Err("a build whose prover half was let go proves no more".into());
     }
@@ -2034,6 +2052,7 @@ pub(crate) fn prove_wlfm_traces_as(
             filled,
             check_prefix,
             proving,
+            on_group,
         ),
         WlfmStacks::B3(stacks) => prove_traces_under::<WlfmB3Hash>(
             &build.artifacts,
@@ -2042,6 +2061,7 @@ pub(crate) fn prove_wlfm_traces_as(
             filled,
             check_prefix,
             proving,
+            on_group,
         ),
     }
 }
@@ -2129,6 +2149,7 @@ fn prove_traces_under<H: WhirHash>(
     filled: LfmFilled,
     check_prefix: bool,
     proving: WlfmProving,
+    on_group: WlfmObserver<'_>,
 ) -> Result<WlfmProof, String> {
     if artifacts.family.hash_name() != H::NAME {
         return Err(format!(
@@ -2366,15 +2387,18 @@ fn prove_traces_under<H: WhirHash>(
         .collect();
     let order: Vec<usize> = (0..artifacts.sizes.len()).collect();
     let (proof, argues, prepared, group_stamps, commit_ood) = match proving {
-        WlfmProving::Held => multilinear_block::block_prove_on_forks::<F, E, H::Sponge, H>(
-            block,
-            config,
-            &mut transcript,
-            &openings,
-            &[],
-            &|g| g,
-            &multilinear_block::ArgueDeviation::default(),
-        ),
+        WlfmProving::Held => {
+            multilinear_block::block_prove_on_forks_observed::<F, E, H::Sponge, H>(
+                block,
+                config,
+                &mut transcript,
+                &openings,
+                &[],
+                &|g| g,
+                &multilinear_block::ArgueDeviation::default(),
+                on_group,
+            )
+        }
         WlfmProving::Streamed => multilinear_block::block_prove_in_order::<F, E, H::Sponge, H>(
             block,
             config,
@@ -2383,7 +2407,7 @@ fn prove_traces_under<H: WhirHash>(
             &[],
             &|g| g,
             &multilinear_block::ArgueDeviation::default(),
-            &|_| {},
+            on_group,
             &order,
             None,
         ),
