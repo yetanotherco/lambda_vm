@@ -1547,6 +1547,31 @@ fn input_rewrite_faulted() -> bool {
     INPUT_REWRITE_FAULT.load(Ordering::Relaxed)
 }
 
+/// Input layers written again after the pool handed its unused blocks back
+/// (`DeviceTree::rewrite_input`).
+static REWRITE_TRIMS: AtomicU64 = AtomicU64::new(0);
+
+/// See [`REWRITE_TRIMS`].
+pub fn rewrite_trims() -> u64 {
+    REWRITE_TRIMS.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "cuda")]
+impl DeviceTree {
+    /// Writes the input layer again for its last sumcheck, the levels above
+    /// it already let go. A tree its bin preferred to hand back first lands
+    /// every pending free and has the pool hand its unused blocks back: the
+    /// pool keeps freed blocks, and the levels just let go are smaller pieces
+    /// than the layer, so without it each rewrite grows what the pool holds by
+    /// a layer while the live set does not grow at all.
+    fn rewrite_input(&self) -> Option<math_cuda::gkr::InputLayer> {
+        if self.trim_before_rewrite && math_cuda::device::drain_and_trim().is_ok() {
+            REWRITE_TRIMS.fetch_add(1, Ordering::Relaxed);
+        }
+        (self.rebuild.as_ref()?)()
+    }
+}
+
 /// Input layers a batched argue wrote on the host because the card could not
 /// write them again for their last sumcheck ([`note_input_written_on_host`]).
 static INPUT_WRITTEN_ON_HOST: AtomicU64 = AtomicU64::new(0);
@@ -3356,6 +3381,10 @@ pub struct DeviceTree {
     /// ([`crate::gkr_input_real`]): its Gruen rounds open the kept layer, and
     /// only today's session writes it again.
     input_truncated: bool,
+    /// Whether the pool hands its unused blocks back before the input layer
+    /// is written again ([`DeviceTree::rewrite_input`]): set for a tree its
+    /// bin preferred to hand back ([`prefer_hand_back`]).
+    trim_before_rewrite: bool,
     num_layers: usize,
     input_num_vars: usize,
     /// The output fraction, read off the top level.
@@ -3500,6 +3529,7 @@ where
         tree: std::sync::Mutex::new(Some(tree)),
         rebuild: None,
         input_truncated: false,
+        trim_before_rewrite: false,
         num_layers,
         input_num_vars,
         output: output_cell,
@@ -3629,7 +3659,7 @@ impl DeviceTree {
                 return None;
             }
             drop(self.tree.lock().ok()?.take());
-            let rebuilt = (self.rebuild.as_ref()?)()?;
+            let rebuilt = self.rewrite_input()?;
             if self.input_truncated {
                 crate::gkr_input_real::note_rebuild();
             }
@@ -3767,7 +3797,7 @@ impl DeviceTree {
                 return None;
             }
             drop(self.tree.lock().ok()?.take());
-            let rebuilt = (self.rebuild.as_ref()?)()?;
+            let rebuilt = self.rewrite_input()?;
             rebuilt.gruen(&raw_point, low)
         } else {
             let held = self.tree.lock().ok()?;
@@ -3992,7 +4022,7 @@ impl DeviceTree {
                 return None;
             }
             drop(self.tree.lock().ok()?.take());
-            let rebuilt = (self.rebuild.as_ref()?)()?;
+            let rebuilt = self.rewrite_input()?;
             whir_split_bump_rebuild();
             if self.input_truncated {
                 crate::gkr_input_real::note_rebuild();
@@ -4218,7 +4248,7 @@ impl DeviceTree {
                 return None;
             }
             drop(self.tree.lock().ok()?.take());
-            let rebuilt = (self.rebuild.as_ref()?)()?;
+            let rebuilt = self.rewrite_input()?;
             whir_split_bump_rebuild();
             rebuilt.gruen(&raw_point, low)
         } else {
@@ -5771,6 +5801,7 @@ fn truncated_tree(
         tree: std::sync::Mutex::new(Some(tree)),
         rebuild: Some(Box::new(rebuild)),
         input_truncated: true,
+        trim_before_rewrite: false,
         num_layers,
         input_num_vars: num_vars,
         output,
@@ -5839,6 +5870,7 @@ fn carried_or_handed_back(
             tree: std::sync::Mutex::new(Some(tree)),
             rebuild: None,
             input_truncated: false,
+            trim_before_rewrite: false,
             num_layers,
             input_num_vars,
             output,
@@ -5900,6 +5932,7 @@ fn carried_or_handed_back(
         tree: std::sync::Mutex::new(Some(tree)),
         rebuild: Some(Box::new(rebuild)),
         input_truncated: false,
+        trim_before_rewrite: preferred,
         num_layers,
         input_num_vars: num_vars,
         output,
