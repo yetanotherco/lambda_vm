@@ -2150,6 +2150,10 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
                     hash_at[j] += 1;
                 }
             }
+            #[cfg(test)]
+            if pos.windows(2).any(|w| w[0] > w[1]) {
+                wave_trace::note_reordered();
+            }
             pos.sort_unstable();
             let level_rows = self.levels.hashes_at(d);
             rows.clear();
@@ -2162,6 +2166,10 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
                     pos.extend_from_slice(&b.other_pos[k][start as usize..(start + len) as usize]);
                     other_at[j] += 1;
                 }
+            }
+            #[cfg(test)]
+            if pos.windows(2).any(|w| w[0] > w[1]) {
+                wave_trace::note_reordered();
             }
             pos.sort_unstable();
             let level_others = self.levels.others_at(d);
@@ -2343,6 +2351,8 @@ fn run_level(
     computed: &mut Vec<Result<HashOut, LfmExecError>>,
     mut lean_tap: Option<&mut Vec<(u32, B3lValues)>>,
 ) -> Result<usize, LfmExecError> {
+    #[cfg(test)]
+    wave_trace::note(rows, others);
     let mut ran = rows.len();
 
     let t = Instant::now();
@@ -2563,4 +2573,50 @@ pub fn locate_addr(program: &LfmProgram, addr: u64) -> String {
         let _ = writeln!(out, "  {marker} [{}] {i:?}", lo + k);
     }
     out
+}
+
+/// A test's record of what each level's share of each wave ran, in the order
+/// it ran: `(hash rows, other instructions)` per non-empty level, across the
+/// waves of this thread while recording ([`wave_trace::record`]).
+#[cfg(test)]
+pub(crate) mod wave_trace {
+    use std::cell::RefCell;
+
+    type Trace = Vec<(Vec<u32>, Vec<u32>)>;
+
+    std::thread_local! {
+        static TRACE: RefCell<Option<Trace>> = const { RefCell::new(None) };
+        static REORDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A bucketed wave's level share whose buckets' positions, one bucket
+    /// after another, were not the level's order (the merge reordered them).
+    pub(super) fn note_reordered() {
+        REORDERED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The level shares the merge reordered on this thread so far.
+    pub(crate) fn reordered() -> usize {
+        REORDERED.with(std::cell::Cell::get)
+    }
+
+    pub(super) fn note(rows: &[u32], others: &[u32]) {
+        if rows.is_empty() && others.is_empty() {
+            return;
+        }
+        TRACE.with(|t| {
+            if let Some(trace) = t.borrow_mut().as_mut() {
+                trace.push((rows.to_vec(), others.to_vec()));
+            }
+        });
+    }
+
+    /// Runs `f` with this thread's waves recorded; returns its result and
+    /// the record.
+    pub(crate) fn record<R>(f: impl FnOnce() -> R) -> (R, Trace) {
+        TRACE.with(|t| *t.borrow_mut() = Some(Vec::new()));
+        let out = f();
+        let trace = TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        (out, trace)
+    }
 }
