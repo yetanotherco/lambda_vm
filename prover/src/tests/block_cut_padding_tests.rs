@@ -45,6 +45,7 @@ fn many_groups(argue: ArgueFormat) -> BlockFormat {
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
         ecdas: crate::tables::ecdas::EcdasForm::Bytes,
+        page_run_log2: 0,
     }
 }
 

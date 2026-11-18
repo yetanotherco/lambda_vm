@@ -1759,12 +1759,27 @@ impl VmAirs {
     /// tables' place; and each KECCAK table KECCAK_W, each ECREC table
     /// ECREC_W and each COPY table COPY_W, in their places. Refuses a page PAGE_W cannot hold (a base that
     /// is not page-aligned) or a page list that is not this set's.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn with_word_memory(
         &mut self,
         opts: &ProofOptions,
         counts: [usize; 7],
         page_configs: &[crate::tables::page::PageConfig],
+    ) -> Result<(), Error> {
+        self.with_word_memory_at(opts, counts, page_configs, 0)
+    }
+
+    /// [`Self::with_word_memory`] with the pages in page tables of runs of at
+    /// most `2^page_run_log2` pages ([`crate::tables::page_w::page_tables`]),
+    /// each table's AIR in PAGE's place, in the tables' order: one PAGE_W
+    /// table a page at 0. Refuses a page list or a run the rule refuses.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn with_word_memory_at(
+        &mut self,
+        opts: &ProofOptions,
+        counts: [usize; 7],
+        page_configs: &[crate::tables::page::PageConfig],
+        page_run_log2: u8,
     ) -> Result<(), Error> {
         if page_configs.len() != self.pages.len() {
             return Err(Error::Prover(format!(
@@ -1773,9 +1788,11 @@ impl VmAirs {
                 self.pages.len()
             )));
         }
-        self.pages = page_configs
+        let tables = crate::tables::page_w::page_tables(page_configs, page_run_log2)
+            .map_err(Error::Prover)?;
+        self.pages = tables
             .iter()
-            .map(|config| crate::test_utils::create_page_w_air(opts, config))
+            .map(|table| crate::test_utils::create_page_table_air(opts, table, page_configs))
             .collect::<Result<_, _>>()
             .map_err(Error::Prover)?;
         let mut word_tables: [Vec<VmAir>; 7] = std::array::from_fn(|_| Vec::new());

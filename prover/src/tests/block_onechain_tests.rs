@@ -61,6 +61,7 @@ fn format_at(
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
         ecdas: crate::tables::ecdas::EcdasForm::Bytes,
+        page_run_log2: 0,
     }
 }
 
@@ -81,6 +82,7 @@ fn production(group: GroupFold) -> BlockFormat {
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
         ecdas: crate::tables::ecdas::EcdasForm::Bytes,
+        page_run_log2: 0,
     }
 }
 

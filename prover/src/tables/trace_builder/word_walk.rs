@@ -9,7 +9,7 @@
 //! each byte it touches, so the latest access touching any of a word's bytes
 //! is the word's last access, which is the token the word tables consume.
 //! PAGE_W's final words are read the same way from the walk's final state
-//! ([`page_w_trace_from_state`]).
+//! ([`page_table_trace_from_state`]).
 //!
 //! The chips' calls the format proves (the COPY chip's: memcpy and memmove,
 //! memset, the commit syscall) are COPY_W rows and MEMW_W rows
@@ -715,13 +715,18 @@ pub(super) fn word_max_rows(max_rows: &crate::tables::MaxRowsConfig) -> [usize; 
     [load, store, load, store, load, store, store]
 }
 
-/// The PAGE_W table of `config`'s page from the walk's final state: a word's
-/// final value its eight bytes, its timestamp the largest of their stamps (0:
-/// untouched, its initial word). Refuses a page PAGE_W cannot hold.
-pub(super) fn page_w_trace_from_state(
-    config: &PageConfig,
+/// The table of `table`, one of the page tables cut from `configs`
+/// (`page_w::page_tables`), from the walk's final state: a word's final value
+/// its eight bytes, its timestamp the largest of their stamps (0: untouched,
+/// its initial word); a page's PAGE_W table, or a block's, its pages' rows in
+/// order. Refuses a table its pages cannot make.
+pub(super) fn page_table_trace_from_state(
+    table: &page_w::PageTable,
+    configs: &[PageConfig],
     memory_state: &MemoryState,
 ) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, Error> {
-    page_w::generate_page_w_trace_from_bytes(config, memory_state.cells.page_data(config.page_base))
-        .map_err(Error::Prover)
+    page_w::generate_page_table_trace_from_bytes(table, configs, |base| {
+        memory_state.cells.page_data(base)
+    })
+    .map_err(Error::Prover)
 }

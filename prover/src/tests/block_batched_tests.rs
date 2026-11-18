@@ -35,6 +35,7 @@ fn one_group(argue: ArgueFormat) -> BlockFormat {
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
         ecdas: crate::tables::ecdas::EcdasForm::Bytes,
+        page_run_log2: 0,
     }
 }
 
@@ -58,6 +59,7 @@ fn many_groups(argue: ArgueFormat) -> BlockFormat {
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
         ecdas: crate::tables::ecdas::EcdasForm::Bytes,
+        page_run_log2: 0,
     }
 }
 
@@ -680,6 +682,7 @@ fn the_card_argues_the_hosts_bytes() {
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
         ecdas: crate::tables::ecdas::EcdasForm::Bytes,
+        page_run_log2: 0,
     };
     for name in ["all_instructions_64", "test_keccak", "test_ecsm"] {
         let (program, elf, mut traces) = fixed_traces(name, &MaxRowsConfig::default(), 16);

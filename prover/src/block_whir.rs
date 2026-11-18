@@ -368,6 +368,18 @@ pub struct BlockFormat {
     /// it, a variant a caller names). Its columns, constraints and interactions, so its GKR
     /// trees and the recursion's programs, follow it.
     pub ecdas: crate::tables::ecdas::EcdasForm,
+    /// How many pages a page table holds under the word memory format
+    /// ([`page_tables`](crate::tables::page_w::page_tables)): `0`, one PAGE_W
+    /// table a page (every preset's); `k` in
+    /// `1..=`[`MAX_PAGE_RUN_LOG2`](crate::tables::page_w::MAX_PAGE_RUN_LOG2),
+    /// each run of contiguous zero pages, or of private-input pages, cut into
+    /// blocks of up to `2^k` pages aligned to their span, a table each, a page
+    /// of program data still a table of its own. A constant the prover and the
+    /// verifier of one block both take, never read from a proof: the page
+    /// tables, so the table count, their heights and the recursion's
+    /// programs, follow it. Any value but 0 needs the word memory format
+    /// ([`check_memory_format`]).
+    pub page_run_log2: u8,
 }
 
 /// The most groups a block statement may declare: a verifier constant, never in
@@ -841,6 +853,7 @@ impl BlockFormat {
             registers: crate::tables::register::RegisterFormat::InRow,
             memory: crate::tables::fused_memory::MemoryFormat::Fused,
             ecdas: crate::tables::ecdas::EcdasForm::Halves,
+            page_run_log2: 0,
         }
     }
 
@@ -883,6 +896,7 @@ impl BlockFormat {
             registers: crate::tables::register::RegisterFormat::InRow,
             memory: crate::tables::fused_memory::MemoryFormat::Split,
             ecdas: crate::tables::ecdas::EcdasForm::Halves,
+            page_run_log2: 0,
         }
     }
 
@@ -928,6 +942,16 @@ impl BlockFormat {
     /// never read from a proof.
     pub fn with_memory(self, memory: crate::tables::fused_memory::MemoryFormat) -> Self {
         Self { memory, ..self }
+    }
+
+    /// This format with its page tables at runs of up to `2^page_run_log2`
+    /// pages ([`Self::page_run_log2`]): a named constant the prover and the
+    /// verifier of one block both take, never read from a proof.
+    pub fn with_page_run(self, page_run_log2: u8) -> Self {
+        Self {
+            page_run_log2,
+            ..self
+        }
     }
 
     /// This format with its batched argue's GKR trees laid out per `pack`:
@@ -3964,6 +3988,47 @@ pub(crate) fn check_page_w_heights<'a>(
     }
 }
 
+/// Every page table at its place, under its name and at its height, each
+/// derived by the verifier from its page tables `pages`
+/// ([`block_page_tables`]): the tables `first..first + pages.len()` of `tables`
+/// (each table's name and stated height, in AIR order) are the page tables in
+/// their order, each named [`PageTable::name`](crate::tables::page_w::PageTable::name)
+/// and stated at exactly its
+/// [`num_vars`](crate::tables::page_w::PageTable::num_vars). A page table
+/// stated a row taller would mint the next page's first word a second time; a
+/// block's name is its class, base and pages, so a statement can present no
+/// block the verifier did not cut.
+pub(crate) fn check_page_table_heights<'a>(
+    pages: &[crate::tables::page_w::PageTable],
+    first: usize,
+    tables: impl IntoIterator<Item = (&'a str, u8)>,
+) -> Result<(), Error> {
+    let stated: Vec<(&str, u8)> = tables.into_iter().skip(first).take(pages.len()).collect();
+    if stated.len() != pages.len() {
+        return Err(Error::InvalidTableCounts(format!(
+            "{} page tables from table {first}, the statement states {}",
+            pages.len(),
+            stated.len()
+        )));
+    }
+    for (page, (name, num_vars)) in pages.iter().zip(stated) {
+        if name != page.name() {
+            return Err(Error::InvalidTableCounts(format!(
+                "page table {} is {name}",
+                page.name()
+            )));
+        }
+        if usize::from(num_vars) != page.num_vars() {
+            return Err(Error::InvalidTableCounts(format!(
+                "{name} states 2^{num_vars} rows — its {} pages are 2^{}",
+                page.pages(),
+                page.num_vars()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Every word table (a [`WORD_TABLES`] family's) at most
 /// [`BLOCK_WORD_MAX_VARS`] variables, by name. `tables` pairs each table's name
 /// with its stated height.
@@ -4441,10 +4506,13 @@ pub(crate) fn prepared_tables(
         return Ok(Vec::new());
     }
     let refs = airs.air_refs();
-    if page_configs.len() != airs.pages.len() {
+    // The page tables, cut as the AIR set's were: one a page but under the
+    // word memory format's page runs.
+    let page_tables = block_page_tables(page_configs, format)?;
+    if page_tables.len() != airs.pages.len() {
         return Err(Error::Prover(format!(
-            "{} page configs for {} page tables",
-            page_configs.len(),
+            "{} page tables for {} page AIRs",
+            page_tables.len(),
             airs.pages.len()
         )));
     }
@@ -4459,7 +4527,9 @@ pub(crate) fn prepared_tables(
     } else {
         crate::continuation::PAGE_NUM_VARS
     };
-    let plan = crate::continuation::genesis_stack_plan(page_configs, first_page, num_vars);
+    // The rule reads the pages, never the tables: the page count it is
+    // charged at and each page's candidacy are the same at any page run.
+    let plan = crate::continuation::genesis_stack_plan(page_configs, 0, num_vars);
     #[cfg(test)]
     let forced = DENSE_PAGES_FORCED.with(std::cell::Cell::get);
     #[cfg(not(test))]
@@ -4469,13 +4539,25 @@ pub(crate) fn prepared_tables(
         .iter()
         .filter(|route| route.dense || (forced && route.has_init && route.nonzero > 0))
     {
-        let config = &page_configs[route.table - first_page];
+        // A dense page has a nonzero byte: a page of data, a table of its own
+        // at any page run.
+        let page = route.table;
+        let table = page_tables
+            .iter()
+            .position(|t| t.first == page && t.kind == crate::tables::page_w::PageTableKind::Page)
+            .ok_or_else(|| {
+                Error::Prover(format!(
+                    "the dense page {:#x} is not a page table of its own",
+                    route.page_base
+                ))
+            })?;
+        let config = &page_configs[page];
         let columns = if words {
             crate::tables::page_w::preprocessed_columns(config)
         } else {
             crate::tables::page::preprocessed_columns(config)
         };
-        tables.push((route.table, columns));
+        tables.push((first_page + table, columns));
     }
     tables.sort_by_key(|&(table, _)| table);
     Ok(tables)
@@ -4497,6 +4579,18 @@ pub(crate) fn first_page_index(airs: &VmAirs) -> Result<usize, Error> {
             .ok_or_else(|| Error::Prover("the page tables are not in the AIR set".into())),
         None => Ok(refs.len()),
     }
+}
+
+/// The page traces a build made, `pages` of them, against the AIR set's page
+/// tables: one each, or the build cut its pages otherwise than the format.
+pub(crate) fn check_page_traces(airs: &VmAirs, pages: usize) -> Result<(), Error> {
+    if pages != airs.pages.len() {
+        return Err(Error::Prover(format!(
+            "the build made {pages} page tables, the format's AIR set holds {}",
+            airs.pages.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Commits one group's prepared stack under `config`.
@@ -5470,9 +5564,24 @@ pub(crate) fn refuse_unprovable(format: &BlockFormat) -> Result<(), Error> {
 /// access's step by MEMW_A's limbs, so
 /// [`MemoryFormat::Fused`](crate::tables::fused_memory::MemoryFormat::Fused)
 /// needs MEMW_A's limbs' form
-/// ([`MemwAlignedOrder::Limbs`](crate::tables::memw_aligned::MemwAlignedOrder::Limbs)).
-/// Its prover and its verifier refuse alike.
+/// ([`MemwAlignedOrder::Limbs`](crate::tables::memw_aligned::MemwAlignedOrder::Limbs));
+/// and page runs ([`BlockFormat::page_run_log2`]) past their cap, or under a
+/// memory format without PAGE_W. Its prover and its verifier refuse alike.
 pub(crate) fn check_memory_format(format: &BlockFormat) -> Result<(), Error> {
+    use crate::tables::page_w::MAX_PAGE_RUN_LOG2;
+    if format.page_run_log2 > MAX_PAGE_RUN_LOG2 {
+        return Err(Error::Prover(format!(
+            "page runs of 2^{} pages: at most 2^{MAX_PAGE_RUN_LOG2}",
+            format.page_run_log2
+        )));
+    }
+    if format.page_run_log2 > 0 && format.memory != crate::tables::fused_memory::MemoryFormat::Words
+    {
+        return Err(Error::Prover(format!(
+            "page runs (2^{} pages) cut PAGE_W's tables: the {:?} memory format has none",
+            format.page_run_log2, format.memory
+        )));
+    }
     match (format.memory, format.memw_aligned) {
         (
             crate::tables::fused_memory::MemoryFormat::Fused,
@@ -5482,6 +5591,19 @@ pub(crate) fn check_memory_format(format: &BlockFormat) -> Result<(), Error> {
         )),
         _ => Ok(()),
     }
+}
+
+/// The block's page tables under `format`
+/// ([`page_tables`](crate::tables::page_w::page_tables) of `page_configs` at
+/// the format's page runs, which only the word memory format takes: one table
+/// a page under any other). The prover's AIR set and the verifier's both cut
+/// their pages here.
+pub(crate) fn block_page_tables(
+    page_configs: &[crate::tables::page::PageConfig],
+    format: &BlockFormat,
+) -> Result<Vec<crate::tables::page_w::PageTable>, Error> {
+    check_memory_format(format)?;
+    crate::tables::page_w::page_tables(page_configs, format.page_run_log2).map_err(Error::Prover)
 }
 
 /// [`prove_block_whir_inner`] once the pool is locked.
@@ -5767,8 +5889,14 @@ pub(crate) fn prove_traces(
     );
     airs.with_fused_memory(proof_options, fused);
     if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
-        airs.with_word_memory(proof_options, words, &traces.page_configs)?;
+        airs.with_word_memory_at(
+            proof_options,
+            words,
+            &traces.page_configs,
+            format.page_run_log2,
+        )?;
     }
+    check_page_traces(&airs, traces.pages.len())?;
 
     let prepared_columns = prepared_tables(&airs, &traces.page_configs, format)?;
     let pairs = airs.air_trace_pairs(traces);
@@ -7003,11 +7131,13 @@ fn lay_out_rest<'a>(
         );
         airs.with_fused_memory(opts, fused);
         if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
-            built = airs.with_word_memory(opts, words, &traces.page_configs);
+            built =
+                airs.with_word_memory_at(opts, words, &traces.page_configs, format.page_run_log2);
         }
         airs
     });
     built?;
+    check_page_traces(airs, traces.pages.len())?;
     marks.push(("airs", at()));
     let prepared = if prepared_now {
         let prepared = prepared_tables(airs, &traces.page_configs, format)?;
@@ -7241,6 +7371,7 @@ fn lay_out_rest_streamed<'a>(
     registers: crate::tables::register::RegisterFormat,
     memory: crate::tables::fused_memory::MemoryFormat,
     ecdas: crate::tables::ecdas::EcdasForm,
+    page_run_log2: u8,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
@@ -7249,6 +7380,13 @@ fn lay_out_rest_streamed<'a>(
     let mut marks = vec![("rest received", at())];
     let RestStream { header, tables } = *stream;
     validate_block_counts(&header.table_counts)?;
+    // The finish cut its page tables at the format's page runs.
+    if header.page_run_log2 != page_run_log2 {
+        return Err(Error::Prover(format!(
+            "the finish cut its pages at runs of 2^{}, the format's are 2^{page_run_log2}",
+            header.page_run_log2
+        )));
+    }
     let fused = header.fused_counts;
     let fused_memory = fused.map(|n| n as u64);
     fused_tables_under(memory, fused_memory)?;
@@ -7283,7 +7421,7 @@ fn lay_out_rest_streamed<'a>(
             );
             airs.with_fused_memory(opts, fused);
             if memory == crate::tables::fused_memory::MemoryFormat::Words {
-                built = airs.with_word_memory(opts, words, &header.page_configs);
+                built = airs.with_word_memory_at(opts, words, &header.page_configs, page_run_log2);
             }
             airs
         });
@@ -8190,6 +8328,7 @@ fn prove_streamed(
                 builder = builder.memw_aligned_order(format.memw_aligned)?;
                 builder = builder.register_format(format.registers)?;
                 builder = builder.memory_format(format.memory)?;
+                builder = builder.page_run_log2(format.page_run_log2)?;
                 if word_stream {
                     builder = builder.stream_word_tables()?;
                 }
@@ -8698,6 +8837,7 @@ fn prove_streamed(
                         format.registers,
                         format.memory,
                         format.ecdas,
+                        format.page_run_log2,
                     ),
                 };
                 let (streamed, rest) = if inline {
@@ -9836,6 +9976,9 @@ impl BlockWhirProof {
 /// plan both start from it, so they check one statement the same way.
 pub(crate) struct BlockFrame {
     pub(crate) page_configs: Vec<crate::tables::page::PageConfig>,
+    /// The page tables cut from [`Self::page_configs`] under the format's page
+    /// runs ([`block_page_tables`]), in AIR order.
+    pub(crate) page_tables: Vec<crate::tables::page_w::PageTable>,
     pub(crate) airs: VmAirs,
     /// Per table in [`VmAirs::air_refs`] order: the AIR's width and the stated
     /// height in variables.
@@ -9893,11 +10036,14 @@ pub(crate) fn block_frame(
         statement.num_private_input_pages,
         num_tables,
     )?;
+    // The page tables: cut by the verifier from its own page list, at its own
+    // page runs.
+    let page_tables = block_page_tables(&page_configs, format)?;
     let Some(expected) = statement
         .table_counts
         .total()
         .and_then(|t| t.checked_add(FIXED_TABLE_COUNT))
-        .and_then(|t| t.checked_add(page_configs.len()))
+        .and_then(|t| t.checked_add(page_tables.len()))
         .and_then(|t| t.checked_add(fused[0]))
         .and_then(|t| t.checked_add(fused[1]))
         .and_then(|t| words.iter().try_fold(t, |t, &n| t.checked_add(n)))
@@ -9935,7 +10081,7 @@ pub(crate) fn block_frame(
     );
     airs.with_fused_memory(proof_options, fused);
     if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
-        airs.with_word_memory(proof_options, words, &page_configs)?;
+        airs.with_word_memory_at(proof_options, words, &page_configs, format.page_run_log2)?;
     }
     // The CPU heights were read at `cpu_proof_start`: the tables must be there.
     airs.check_cpu_position(statement.table_counts)?;
@@ -9974,6 +10120,18 @@ pub(crate) fn block_frame(
             .zip(statement.table_num_vars)
             .map(|(air, &num_vars)| (air.name(), num_vars)),
     )?;
+    // Under the word memory format every page table at its place, name and
+    // height, as the verifier cut them.
+    if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
+        check_page_table_heights(
+            &page_tables,
+            first_page_index(&airs)?,
+            air_refs
+                .iter()
+                .zip(statement.table_num_vars)
+                .map(|(air, &num_vars)| (air.name(), num_vars)),
+        )?;
+    }
     // Under the in-row register format MEMW_R's slot holds the residual register tables,
     // their rows capped.
     if format.registers == crate::tables::register::RegisterFormat::InRow {
@@ -10017,6 +10175,7 @@ pub(crate) fn block_frame(
     }
     Ok(BlockFrame {
         page_configs,
+        page_tables,
         airs,
         shapes,
         config,
