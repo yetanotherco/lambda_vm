@@ -196,6 +196,9 @@ pub struct GroupStamps {
     pub open_paid: f64,
     /// The group's openings ran beside the next group's argue.
     pub overlapped: bool,
+    /// The group opened alone with a retired prepared stack, and its columns
+    /// went off the card before that stack was revived.
+    pub columns_gone_before_revive: bool,
     /// Under [`PhaseBOverlap::On`], the group's openings ran alone because an
     /// earlier transition saw the card refuse a promise.
     pub serial_after_refusal: bool,
@@ -1683,6 +1686,9 @@ where
     /// in it.
     overlap: PhaseBOverlap,
     overlap_faults: OverlapFaults,
+    /// Phase B puts the next group's columns on the card beside this group's
+    /// argue ([`Self::with_phase_b_upload_beside`]); `true` unless set.
+    upload_beside: bool,
     /// Phase B stamps its driver thread's schedstat a group turn
     /// ([`Self::with_sched_stamps`]).
     sched: bool,
@@ -2112,6 +2118,7 @@ where
             spilled,
             overlap: PhaseBOverlap::Off,
             overlap_faults: OverlapFaults::default(),
+            upload_beside: true,
             sched: false,
             ood,
             ood_unbound: false,
@@ -2131,6 +2138,20 @@ where
     pub fn with_phase_b_overlap(mut self, overlap: PhaseBOverlap) -> Self {
         self.overlap = overlap;
         self
+    }
+
+    /// Phase B uploads the next group's columns beside this group's argue
+    /// (`true`, the default), or at the next group's own turn, after this
+    /// group's argue and openings (`false`): the argue then has the card's
+    /// room to itself. The proof is the same.
+    pub fn with_phase_b_upload_beside(mut self, beside: bool) -> Self {
+        self.set_phase_b_upload_beside(beside);
+        self
+    }
+
+    /// [`Self::with_phase_b_upload_beside`] in place.
+    pub fn set_phase_b_upload_beside(&mut self, beside: bool) {
+        self.upload_beside = beside;
     }
 
     /// A test's faults in phase B's overlap ([`OverlapFaults`]).
@@ -2851,6 +2872,64 @@ where
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
 {
+    let own = open_own::<F, E, T, H>(argued, group, prepared, config, own_window, fails)?;
+    open_prepared::<F, E, T, H>(argued, group, prepared, deviations, config, own_window, own)
+}
+
+/// A group's own opening done ([`open_own`]), for its prepared opening
+/// ([`open_prepared`]) to finish.
+struct OwnOpened<F, E, H>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    E: IsField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes,
+{
+    opening: StackedProof<F, E>,
+    /// The revived stack for the caller to let go; `None` when the group's
+    /// prepared stack is retired (its codewords went right after the
+    /// opening).
+    stacked: Option<StackedCommitment<F, H>>,
+    encode: f64,
+    open_room: u64,
+    /// When the opening began, and the stream draws when the openings began.
+    started: Instant,
+    draws: (u64, u64),
+}
+
+/// Whether `group`'s prepared stack was committed and let go: it is revived
+/// at the group's opening ([`open_prepared`]).
+fn prepared_is_retired<F, H>(prepared: &[BlockPrepared<'_, F, H>], group: usize) -> bool
+where
+    F: IsFFTField + IsPrimeField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes,
+{
+    prepared
+        .iter()
+        .any(|p| p.group == group && matches!(p.commitment, PreparedCommitment::Retired(_)))
+}
+
+/// [`open_group`]'s first half: the group's stack revived over its columns
+/// and opened on its fork.
+#[allow(clippy::type_complexity)]
+fn open_own<F, E, T, H>(
+    argued: &mut Argued<F, E, T>,
+    group: &[CommittedTable<'_, F, E>],
+    prepared: &[BlockPrepared<'_, F, H>],
+    config: &ChainConfig,
+    own_window: bool,
+    fails: bool,
+) -> Result<OwnOpened<F, E, H>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
+{
     if fails {
         return Err(MlError::DeviceFailed {
             stage: "a test's failed opening",
@@ -2893,10 +2972,50 @@ where
     // which nothing reads after their opening, and their room go back first,
     // so the revive has the promise they held (on a level that opens beside
     // the next group's argue, the ledger otherwise refuses the revive).
-    let retired_prepared = prepared
-        .iter()
-        .any(|p| p.group == argued.group && matches!(p.commitment, PreparedCommitment::Retired(_)));
+    let retired_prepared = prepared_is_retired(prepared, argued.group);
     let stacked = (!retired_prepared).then_some(stacked);
+    Ok(OwnOpened {
+        opening,
+        stacked,
+        encode,
+        open_room,
+        started: t,
+        draws,
+    })
+}
+
+/// [`open_group`]'s second half: the group's prepared stack, when it has one,
+/// opened on the same fork after its own opening (revived first when it is
+/// retired, over the prepared columns on the host). It reads the group's
+/// tables only for their column counts, so the caller may have let their
+/// columns go off the card between the halves.
+#[allow(clippy::type_complexity)]
+fn open_prepared<F, E, T, H>(
+    argued: &mut Argued<F, E, T>,
+    group: &[CommittedTable<'_, F, E>],
+    prepared: &[BlockPrepared<'_, F, H>],
+    deviations: &[PreparedDeviation],
+    config: &ChainConfig,
+    own_window: bool,
+    own: OwnOpened<F, E, H>,
+) -> Result<(Opened<F, E>, Option<StackedCommitment<F, H>>), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
+{
+    let OwnOpened {
+        opening,
+        stacked,
+        encode,
+        open_room,
+        started: t,
+        draws,
+    } = own;
     // The group's prepared tables, in table order: each opened at its own
     // point for its own prefix, on this fork.
     let (at, points, values) = (argued.at, &argued.points, &argued.values);
@@ -3168,6 +3287,7 @@ where
         mut spilled,
         overlap,
         overlap_faults,
+        upload_beside,
         sched,
         ood,
         ood_unbound,
@@ -3330,7 +3450,11 @@ where
         let mut batched_argue: Option<BatchedArgue<E>> = None;
         let all: &[CommittedTable<'_, F, E>] = &tables;
         let group_ref = &all[at..at + size];
-        let next = next_g.map(|next| &all[starts[next]..starts[next] + sizes[next]]);
+        // Under `upload_beside` off the next group's columns go up at its own
+        // turn instead (`pre_uploaded` stays empty).
+        let next = next_g
+            .filter(|_| upload_beside)
+            .map(|next| &all[starts[next]..starts[next] + sizes[next]]);
         let roots_ref = &roots;
         let answers_ref = &answers;
         let (argue_result, argue_end, next_store, joined, opened, open_paid) =
@@ -3521,14 +3645,33 @@ where
         }
         stamps[g].serial_after_refusal = overlapping && latched && next_g.is_some();
         let paid = Instant::now();
-        let (opened, stacked) = open_group::<F, E, T, H>(
+        let own = open_own::<F, E, T, H>(
+            &mut argued,
+            &tables[at..at + size],
+            prepared,
+            config,
+            true,
+            overlap_faults.open_fails == Some(p),
+        )?;
+        // A retired prepared stack is revived next, over its own columns on
+        // the host: the group's columns go off the card first (nothing reads
+        // them after the group's own opening), so the revive has their room
+        // as well as its codewords'.
+        if prepared_is_retired(prepared, g) {
+            for table in tables[at..at + size].iter_mut() {
+                table.clear_resident();
+            }
+            argued.store = None;
+            stamps[g].columns_gone_before_revive = true;
+        }
+        let (opened, stacked) = open_prepared::<F, E, T, H>(
             &mut argued,
             &tables[at..at + size],
             prepared,
             deviations,
             config,
             true,
-            overlap_faults.open_fails == Some(p),
+            own,
         )?;
         stamps[g].encode = opened.encode;
         stamps[g].prepared_revive = opened.prepared_revive;

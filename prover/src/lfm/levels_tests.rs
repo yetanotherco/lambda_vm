@@ -1135,8 +1135,8 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
         println!(
             "{tag} GROUP {g}: tables {} · polys {} · cells {} · wait A {:.3}s · up A {:.3}s (paid \
              {:.3}) · commit {:.3}s · retire {:.3}s · up B {:.3}s · argue {:.3}s · encode {:.3}s · \
-             open {:.3}s · prepared revive {:.3}s · open paid {:.3}s · overlapped {} · turn \
-             {:.3}-{:.3}s · GiB promised: commit {:.2}/{:.2} · argue {:.2}/{:.2} · open {:.2}",
+             open {:.3}s · prepared revive {:.3}s · open paid {:.3}s · overlapped {} · columns gone \
+             before revive {} · turn {:.3}-{:.3}s · GiB promised: commit {:.2}/{:.2} · argue {:.2}/{:.2} · open {:.2}",
             s.tables,
             s.polys,
             s.cells,
@@ -1152,6 +1152,7 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
             s.prepared_revive,
             s.open_paid,
             s.overlapped,
+            s.columns_gone_before_revive,
             s.start_b,
             s.end_b,
             gib(s.commit_base),

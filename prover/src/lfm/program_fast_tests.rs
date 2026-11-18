@@ -2,7 +2,7 @@
 //! the parallel compile is the sequential one, instruction for instruction and
 //! row for row, at every slicing; the admission validator's verdict beside the
 //! execution is the validator's, and an inadmissible program is refused by it;
-//! the knob reads only `1` as on. (The driver's level bytes with the knob on against the
+//! the knob is on unless its word is `0`. (The driver's level bytes with the knob on against the
 //! levels proved with it off: the box-tier
 //! `levels_tests::the_blake3_driver_with_its_program_fast_proves_the_same_level_bytes`.)
 
@@ -47,13 +47,24 @@ fn an_inadmissible_program_is_refused_by_the_beside_validator() {
     assert!(err.contains("not admissible"), "{err}");
 }
 
-/// The knob's name, and only `1` turns it on.
+/// The knob's name; it is on by default, and only `0` turns it off.
 #[test]
 fn the_program_fast_knob_is_named_and_value_based() {
-    use super::wlfm_knobs::knob_word_on;
+    use super::wlfm_knobs::knob_word_off;
     assert_eq!(PROGRAM_FAST_ENV, "LAMBDA_VM_LEVELS_PROGRAM_FAST");
-    assert!(knob_word_on(Some("1")) && knob_word_on(Some(" 1 ")));
-    assert!(!knob_word_on(Some("0")) && !knob_word_on(Some("")) && !knob_word_on(None));
+    assert!(knob_word_off(Some("0")) && knob_word_off(Some(" 0 ")));
+    for on in [None, Some(""), Some("1"), Some("yes"), Some("00")] {
+        assert!(!knob_word_off(on), "{on:?} leaves it on");
+    }
+}
+
+/// With no word in the environment the driver makes level 1's program the
+/// fast way (unless a test overrides it).
+#[test]
+fn the_program_fast_knob_is_on_by_default() {
+    if std::env::var_os(PROGRAM_FAST_ENV).is_none() {
+        assert!(super::levels::program_fast());
+    }
 }
 
 /// A program source, made afresh at each call.

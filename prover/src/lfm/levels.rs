@@ -267,16 +267,16 @@ impl Drop for StacksForTest {
     }
 }
 
-/// `LAMBDA_VM_LEVELS_PROGRAM_FAST=1`: level 1's program is ready sooner, so
+/// `LAMBDA_VM_LEVELS_PROGRAM_FAST`: level 1's program is ready sooner, so
 /// more of its execution runs beside the base's phase B. The driver compiles
 /// it in parallel ([`super::compiler::compile_parallel`], the same program
 /// row for row) and does not validate it before executing: the admission
 /// validator runs on a thread of its own beside the execution, and level 1
 /// is refused before anything is filled or proved when the program is not
-/// admissible. Off by default (and for any word but `1`): the program is
-/// compiled and validated before the execution, as it always has been. The
-/// same program and the same proofs either way; a verifier derives its own
-/// copy, compiled and validated as before.
+/// admissible. On by default; `0` (and only `0`) turns it off, and the
+/// program is then compiled and validated before the execution. The same
+/// program and the same proofs either way; a verifier derives its own copy,
+/// compiled and validated as before.
 pub const PROGRAM_FAST_ENV: &str = "LAMBDA_VM_LEVELS_PROGRAM_FAST";
 
 /// Whether the driver makes level 1's program the fast way:
@@ -291,7 +291,7 @@ pub fn program_fast() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(PROGRAM_FAST_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(std::env::var(PROGRAM_FAST_ENV).ok().as_deref())
     })
 }
 
@@ -735,8 +735,8 @@ pub struct LevelsTimes {
     pub waves_before_base: usize,
     pub wave_secs_before_base: f64,
     pub execute_tail: f64,
-    /// Under [`PROGRAM_FAST_ENV`], level 1's validator beside its
-    /// execution: its seconds, and when the execution's end found it done
+    /// Under [`PROGRAM_FAST_ENV`] (the default), level 1's validator beside
+    /// its execution: its seconds, and when the execution's end found it done
     /// (the driver's clock). `None` when off.
     pub validated_beside: Option<(f64, f64)>,
     /// Level 1's program: its walk's, its compile's and (off the knob) its
