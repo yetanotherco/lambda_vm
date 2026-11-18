@@ -920,13 +920,18 @@ fn a_private_blocks_init_word_past_32_bits_is_refused_by_its_half_check() {
 /// table at its own height; one group a table. With the page tables it was
 /// cut into.
 fn statement_at(format: &BlockFormat) -> (OwnedBlockStatement, Vec<PageTable>) {
+    statement_with_heap(format, 20)
+}
+
+/// [`statement_at`] with a heap of `heap` zero pages from page 64.
+fn statement_with_heap(format: &BlockFormat, heap: u64) -> (OwnedBlockStatement, Vec<PageTable>) {
     let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
     let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
     let opts = ProofOptions::default_test_options();
     let runtime_page_ranges = vec![
         crate::RuntimePageRange {
             base: 64 * PAGE,
-            count: 20,
+            count: heap,
         },
         crate::RuntimePageRange {
             base: STACK_TOP_PAGE,
@@ -1154,6 +1159,68 @@ fn every_page_of_data_is_a_table_of_its_own_at_every_run() {
                 }
             }
         }
+    }
+}
+
+/// ★ More pages than tables: with page runs on, a page table holds up to
+/// `2^k` pages, so an honest statement may list more pages than it states
+/// tables. A heap of 1,024 zero pages at runs of 64 is 16 blocks, the
+/// statement some 40 tables: it frames, and with runs off the same pages (one
+/// table a page) are refused by the cap as before. The cap, `tables × 2^k`,
+/// still refuses before the page list is built: a range one page past it, and
+/// one of `2^62` pages.
+#[test]
+fn a_statement_with_more_pages_than_tables_frames_under_page_runs() {
+    let format = words().with_page_run(6);
+    let (statement, tables) = statement_with_heap(&format, 1024);
+    let pages: usize = tables.iter().map(PageTable::pages).sum();
+    let num_tables = statement.table_num_vars.len();
+    assert!(
+        pages > 1024 && num_tables < 64,
+        "{pages} pages, {num_tables} tables"
+    );
+    let frame = super::word_memory_tests::frame_of(&statement, &format)
+        .unwrap_or_else(|e| panic!("more pages than tables: {e:?}"));
+    assert_eq!(frame.page_configs.len(), pages);
+    assert_eq!(frame.page_tables, tables);
+    assert_eq!(
+        block_whir::max_block_pages(num_tables, &format),
+        num_tables << 6
+    );
+    assert_eq!(
+        block_whir::max_block_pages(num_tables, &words()),
+        num_tables
+    );
+    // Runs off: one table a page, the same page list past the table count.
+    let off = super::word_memory_tests::frame_of(&statement, &words());
+    assert!(
+        matches!(&off, Err(crate::Error::MalformedPageLayout(e)) if e.contains("needs more than")),
+        "{:?}",
+        off.err()
+    );
+    // Past the cap: refused by the cap, the range itself past it before any of
+    // it is listed. At the cap exactly the list is built, and the statement is
+    // refused by its table count instead (the pages need more tables).
+    let cap = (num_tables << 6) as u64;
+    let listed = pages as u64;
+    for (count, by_cap) in [
+        (cap - listed, false),
+        (cap - listed + 1, true),
+        (cap + 1, true),
+        (1 << 62, true),
+    ] {
+        let mut bad = statement.clone();
+        bad.runtime_page_ranges.push(crate::RuntimePageRange {
+            base: 1 << 40,
+            count,
+        });
+        let refused = super::word_memory_tests::frame_of(&bad, &format);
+        let capped = matches!(&refused, Err(crate::Error::MalformedPageLayout(e)) if e.contains("needs more than"));
+        assert!(
+            refused.is_err() && capped == by_cap,
+            "{count}: {:?}",
+            refused.err()
+        );
     }
 }
 
