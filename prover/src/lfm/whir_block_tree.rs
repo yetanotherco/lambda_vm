@@ -3845,8 +3845,47 @@ const PROOF_MAGIC: [u8; 8] = *b"LVMBLKTR";
 
 /// The proof file's layout version. 2: the archived `TableCounts` gained
 /// `is_wh`, so a version-1 file is a different layout. 3: the top proof
-/// carries its commitment-time answers.
-const PROOF_VERSION: u32 = 3;
+/// carries its commitment-time answers. 4: every block proof file (the tree's
+/// top file, the compressed file and its compact and dedup twins) ends in the
+/// statement's fused and word tables' counts, under every memory format, the
+/// split one included; one constant names that layout for all of them.
+const PROOF_VERSION: u32 = 4;
+
+/// The bytes version 4 added at the end of every block proof file's root: the
+/// memory counts, `fused_memory: [u64; 2]` then `word_memory: [u64; 7]`. A
+/// version-3 file's root is this much shorter, so it sits this much nearer
+/// the end of its bytes (rkyv writes the root last).
+const COUNTS_BYTES: usize = 72;
+
+/// The layout version a block proof file states, read before the file is
+/// checked as this build's layout: the magic and the version word open its
+/// root, which ends the file and is `root` bytes long under this layout and
+/// [`COUNTS_BYTES`] fewer under version 3. `None` when neither place opens
+/// with the magic; the archive check then refuses the file.
+fn stated_version(bytes: &[u8], root: usize) -> Option<u32> {
+    [Some(root), root.checked_sub(COUNTS_BYTES)]
+        .into_iter()
+        .flatten()
+        .find_map(|size| {
+            let at = bytes.len().checked_sub(size)?;
+            let head = bytes.get(at..at.checked_add(12)?)?;
+            (head[..8] == PROOF_MAGIC)
+                .then(|| u32::from_le_bytes([head[8], head[9], head[10], head[11]]))
+        })
+}
+
+/// Refuses, naming both versions, a block proof file that states a layout
+/// version this build does not read, before the archive check would refuse it
+/// for its shape alone. Every reader runs it first; the version is checked
+/// again on the file it reads.
+fn check_stated_version(bytes: &[u8], root: usize) -> Result<(), String> {
+    match stated_version(bytes, root) {
+        Some(version) if version != PROOF_VERSION => Err(format!(
+            "block proof file version {version}, this build reads {PROOF_VERSION}"
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// Which tree a proof file holds: the STARK block tree (0) or this one. A
 /// verifier refuses the other's file by its tag, before reading it as its own.
@@ -3861,9 +3900,10 @@ pub const PIPELINE_WHIR: u8 = 1;
 ///
 /// The statement's fused and word tables' counts are its last fields
 /// ([`block_whir::BlockWhirProof`]'s two): zero under the split memory format,
-/// where a nonzero count is refused, so a split block's file is the bytes the
-/// file was before them, then their 72 zero bytes. Which memory format they
-/// are read under is the verifier's constant, never the file's.
+/// where a nonzero count is refused, so a split block's file is a version-3
+/// file's bytes with its version word 4, then their 72 zero bytes. Which
+/// memory format they are read under is the verifier's constant, never the
+/// file's.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct WhirBlockTreeProof {
     magic: [u8; 8],
@@ -3923,6 +3963,7 @@ impl WhirBlockTreeProof {
     /// A file read back: refused unless it is this layout's W3 block tree.
     /// `bytes` must be aligned for rkyv (an `AlignedVec`).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        check_stated_version(bytes, size_of::<<Self as rkyv::Archive>::Archived>())?;
         let proof = rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
             .map_err(|e| format!("not a W3 block proof file: {e}"))?;
         if proof.magic != PROOF_MAGIC {
@@ -4480,6 +4521,7 @@ impl WhirBlockCompressedProof {
     /// A file read back: refused unless it is this layout's compressed W3
     /// block. `bytes` must be aligned for rkyv (an `AlignedVec`).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        check_stated_version(bytes, size_of::<<Self as rkyv::Archive>::Archived>())?;
         let proof = rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
             .map_err(|e| format!("not a compressed W3 block proof file: {e}"))?;
         if proof.magic != PROOF_MAGIC {
@@ -4550,6 +4592,10 @@ impl WhirBlockCompressedProof {
     /// this layout's compact compressed W3 block and C1's bytes are exactly one
     /// proof's encoding. `bytes` must be aligned for rkyv.
     pub fn from_compact_bytes(bytes: &[u8]) -> Result<Self, String> {
+        check_stated_version(
+            bytes,
+            size_of::<<WhirBlockCompactFile as rkyv::Archive>::Archived>(),
+        )?;
         let file = rkyv::from_bytes::<WhirBlockCompactFile, rkyv::rancor::Error>(bytes)
             .map_err(|e| format!("not a compact compressed W3 block proof file: {e}"))?;
         if file.magic != PROOF_MAGIC {
@@ -5540,6 +5586,105 @@ mod tests {
         let mut out = rkyv::util::AlignedVec::new();
         out.extend_from_slice(bytes);
         out
+    }
+
+    /// ★ A version-3 file (the layout before the memory counts, stating
+    /// version 3) is refused by every reader of this build with an error that
+    /// names both versions, before the archive check would refuse it for its
+    /// shape alone: the tree's top file, the compressed file, and its compact
+    /// and dedup twins. The old layout's root is [`COUNTS_BYTES`] shorter than
+    /// this one's (pinned here, per file), and a file this build writes states
+    /// [`PROOF_VERSION`] where its readers look.
+    #[test]
+    fn a_version_3_file_is_refused_naming_both_versions() {
+        use super::super::wire::WireFormat;
+        use std::mem::size_of;
+        assert_eq!(PROOF_VERSION, 4);
+        let want = "block proof file version 3, this build reads 4";
+        assert_eq!(
+            size_of::<ArchivedTreeFileBeforeCounts>() + COUNTS_BYTES,
+            size_of::<ArchivedWhirBlockTreeProof>(),
+            "the tree file's root grew by the counts alone"
+        );
+        assert_eq!(
+            size_of::<ArchivedCompressedFileBeforeCounts>() + COUNTS_BYTES,
+            size_of::<ArchivedWhirBlockCompressedProof>(),
+            "the compressed file's root grew by the counts alone"
+        );
+        assert_eq!(
+            size_of::<ArchivedCompactFileBeforeCounts>() + COUNTS_BYTES,
+            size_of::<ArchivedWhirBlockCompactFile>(),
+            "the compact file's root grew by the counts alone"
+        );
+
+        let tree = synthetic_proof();
+        let new = tree.to_bytes().expect("serializes");
+        let root = size_of::<ArchivedWhirBlockTreeProof>();
+        assert_eq!(stated_version(&new, root), Some(PROOF_VERSION));
+        let mut v3 = synthetic_proof();
+        v3.version = 3;
+        let old = aligned(&tree_before(&v3, false));
+        assert_eq!(stated_version(&old, root), Some(3));
+        let why = WhirBlockTreeProof::from_bytes(&old)
+            .err()
+            .expect("a version-3 tree file");
+        assert_eq!(why, want, "the tree file");
+
+        let compressed = synthetic_compressed();
+        let root = size_of::<ArchivedWhirBlockCompressedProof>();
+        assert_eq!(
+            stated_version(&compressed.to_bytes().expect("serializes"), root),
+            Some(PROOF_VERSION)
+        );
+        let mut v3 = synthetic_compressed();
+        v3.version = 3;
+        let old = aligned(&compressed_before(&v3, false));
+        let why = WhirBlockCompressedProof::from_bytes(&old)
+            .err()
+            .expect("a version-3 compressed file");
+        assert_eq!(why, want, "the compressed file");
+
+        let root = size_of::<ArchivedWhirBlockCompactFile>();
+        for wire in [WireFormat::Compact, WireFormat::Dedup] {
+            let new = compressed.to_wire_bytes(wire).expect("serializes");
+            assert_eq!(stated_version(&new, root), Some(PROOF_VERSION), "{wire:?}");
+            let old = aligned(&compact_before(&v3, wire));
+            let why = WhirBlockCompressedProof::from_compact_bytes(&old)
+                .err()
+                .unwrap_or_else(|| panic!("a version-3 {wire:?} file"));
+            assert_eq!(why, want, "the {wire:?} file");
+        }
+    }
+
+    /// ★ A file of this layout that states another version is refused naming
+    /// both, by the early check and not only by the one after the archive is
+    /// read: a version-4 tree file restated as version 3, and as version 5.
+    /// The check reads the stated version only; a file it lets through is
+    /// still checked whole as this layout.
+    #[test]
+    fn a_file_of_this_layout_stating_another_version_is_refused_naming_both() {
+        use std::mem::size_of;
+        let root = size_of::<ArchivedWhirBlockTreeProof>();
+        for other in [3u32, 5] {
+            let mut tree = synthetic_proof();
+            tree.version = other;
+            let bytes = tree.to_bytes().expect("serializes");
+            assert_eq!(stated_version(&bytes, root), Some(other));
+            assert_eq!(
+                check_stated_version(&bytes, root),
+                Err(format!(
+                    "block proof file version {other}, this build reads 4"
+                ))
+            );
+            assert_eq!(
+                WhirBlockTreeProof::from_bytes(&bytes).err().as_deref(),
+                Some(format!("block proof file version {other}, this build reads 4").as_str())
+            );
+        }
+        // Bytes that open no root with the magic state no version; the
+        // archive check speaks for them.
+        assert_eq!(stated_version(&[0u8; 64], root), None);
+        assert_eq!(stated_version(&[], root), None);
     }
 
     /// ★ The memory counts are each file's last 72 bytes. A split block's file
