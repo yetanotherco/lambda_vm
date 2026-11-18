@@ -104,6 +104,7 @@ const SEEDS: &[(&str, usize, &WidthHint, &str)] = &[
 /// (timestamps under 2^32, keys' high words 32 bits, halves 16, bytes and flags
 /// one), and KECCAK_W's `(T, j)` and input count at KECCAK's census: a block that
 /// needs more writes its table again, one that needs less narrows it after.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 const WORD_SEEDS: &[(&str, usize, &WidthHint, &str)] = &[
     (
         "COPY_W",
@@ -173,6 +174,7 @@ fn cpu_seed_base_from(value: Option<&str>) -> bool {
 /// read once a process. The packed bytes are the same either way. On the
 /// large block COPY's tables took 9.0 → 2.8 thread-seconds, phase A −0.24 s
 /// (the median's −0.06 s), and the host's peak 5.7 GiB less.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn seed_words_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -182,11 +184,13 @@ pub(crate) fn seed_words_on() -> bool {
 
 /// [`seed_words_on`]'s reading of `LAMBDA_VM_FINISH_SEED_WORDS`: unset or any
 /// word but `0` seeds; `0` is the rollback.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 fn seed_words_from(value: Option<&str>) -> bool {
     value.is_none_or(|v| v.trim() != "0")
 }
 
 /// The seeds the finish takes: every kind's, and the word kinds' when `words`.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 fn seeds(
     words: bool,
 ) -> impl Iterator<Item = &'static (&'static str, usize, &'static WidthHint, &'static str)> {

@@ -5749,6 +5749,7 @@ pub(crate) mod keccak_rnd_arrivals {
     }
 
     /// Start a run's record: tables of `rows` rows, none complete yet.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn arm(rows: usize) {
         *STATE.lock().unwrap_or_else(|e| e.into_inner()) = (rows.max(1), 0, Vec::new());
         ON.store(true, Relaxed);
@@ -5769,6 +5770,7 @@ pub(crate) mod keccak_rnd_arrivals {
     }
 
     /// Stop recording; the operations seen and each complete table's stamp.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn take() -> (usize, Vec<Instant>) {
         ON.store(false, Relaxed);
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
