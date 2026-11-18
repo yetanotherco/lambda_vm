@@ -39,10 +39,18 @@ def Honest (r : MinToy.Row (F p)) : Prop :=
   r.mu.val < 2^8 ∧ r.lt = ((Alu.ltBit 0 0 (dword r.a0 r.a1) (dword r.b0 r.b1) : ℕ) : F p) ∧
   r.out0 = r.lt * r.a0 + (1 - r.lt) * r.b0 ∧ r.out1 = r.lt * r.a1 + (1 - r.lt) * r.b1
 
+/-- What an active row establishes: with range-checked operand limbs, `out` is the unsigned
+minimum of the two operands. Guarded by `μ ≠ 0`, unlike `MinToy.RowSpec`: the LT answer is
+pulled `μ` times, so a `μ = 0` row pulls nothing and learns nothing. -/
+def RowSpec (r : MinToy.Row (F p)) : Prop :=
+  r.mu ≠ 0 → r.a0.val < 2^32 → r.a1.val < 2^32 → r.b0.val < 2^32 → r.b1.val < 2^32 →
+    r.out0.val < 2^32 ∧ r.out1.val < 2^32 ∧
+    dword r.out0 r.out1 = min (dword r.a0 r.a1) (dword r.b0 r.b1)
+
 def circuit : GeneralFormalCircuit (F p) MinToy.Row unit where
   name := "CMIN"
   main
-  Spec _ _ _ := True
+  Spec r _ _ := RowSpec r
   channelsWithRequirements := [AluC]
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨a0, a1, b0, b1, lt, out0, out1, mu⟩ := input_var
@@ -50,40 +58,33 @@ def circuit : GeneralFormalCircuit (F p) MinToy.Row unit where
     intro channel h
     tauto
   soundness := by
-    circuit_proof_start [main, Alu.channel, Alu.Guarantees, Bitwise.areBytesTable]
+    circuit_proof_start [main, Alu.channel, Alu.Guarantees, Bitwise.areBytesTable, RowSpec]
     obtain ⟨⟨h_mu, -⟩, h_pull, h_o0, h_o1⟩ := h_holds
-    -- with μ = 0 nothing is owed
+    -- with μ = 0 nothing is owed and the spec is vacuous
     by_cases h0 : input_mu = 0
     · simp [h0]
     -- otherwise ARE_BYTES[μ, 0] makes μ a count of at most 255
     have hcount : Channel.CountUpTo muMax input_mu :=
       Channel.countUpTo_of_val h0 (by simp only [muMax]; omega)
-    refine ⟨.inr hcount, fun _ => ?_⟩
     have h4 : (4 : F p).val = 4 := by simpa using MinToy.val_lit 4 (by norm_num)
     have h9 : (9 : F p).val = 9 := by simpa using MinToy.val_lit 9 (by norm_num)
     obtain ⟨hLT, -⟩ := h_pull hcount
+    -- The content of the row, proven once and used twice: as the circuit's own spec, and as the
+    -- MIN clause of what this row owes the ALU bus.
+    have key : input_a0.val < 2^32 → input_a1.val < 2^32 → input_b0.val < 2^32 →
+        input_b1.val < 2^32 → input_out0.val < 2^32 ∧ input_out1.val < 2^32 ∧
+        dword input_out0 input_out1 =
+          min (dword input_a0 input_a1) (dword input_b0 input_b1) := by
+      intro ha0 ha1 hb0 hb1
+      -- the LT result this row pulled μ times; everything after it is shared with MIN
+      exact MinToy.min_of_lt_answer ha0 ha1 hb0 hb1
+        (hLT 0 0 (by norm_num) (by norm_num) (by rw [h4]; simp [opselLT]) ha0 hb0) h_o0 h_o1
+    refine ⟨fun _ ha0 ha1 hb0 hb1 => key ha0 ha1 hb0 hb1, .inr hcount, fun _ => ?_⟩
     rw [h9]
-    refine ⟨fun s i hs hi h => by simp only [opselLT] at h; omega,
+    exact ⟨fun s i hs hi h => by simp only [opselLT] at h; omega,
       fun i hi h => by simp only [opselEQ] at h; omega,
       fun w s d hw hs hd h => by simp only [opselSHIFT] at h; omega,
-      fun _ ha0 ha1 hb0 hb1 => ?_⟩
-    -- the pulled LT result
-    have hlt := hLT 0 0 (by norm_num) (by norm_num) (by rw [h4]; simp [opselLT]) ha0 hb0
-    have hL : dword input_a0 input_a1 < 2^64 := by unfold dword; omega
-    have hR : dword input_b0 input_b1 < 2^64 := by unfold dword; omega
-    by_cases hLR : dword input_a0 input_a1 < dword input_b0 input_b1
-    · have h1 : input_lt = 1 := by
-        rw [hlt]; simp [Alu.ltBit, Alu.ltRaw, Alu.ult_ofNat_iff hL hR, hLR]
-      have e0 : input_out0 = input_a0 := by rw [h1] at h_o0; linear_combination h_o0
-      have e1 : input_out1 = input_a1 := by rw [h1] at h_o1; linear_combination h_o1
-      rw [e0, e1, min_eq_left hLR.le]
-      exact ⟨ha0, ha1, rfl⟩
-    · have h1 : input_lt = 0 := by
-        rw [hlt]; simp [Alu.ltBit, Alu.ltRaw, Alu.ult_ofNat_iff hL hR, hLR]
-      have e0 : input_out0 = input_b0 := by rw [h1] at h_o0; linear_combination h_o0
-      have e1 : input_out1 = input_b1 := by rw [h1] at h_o1; linear_combination h_o1
-      rw [e0, e1, min_eq_right (not_lt.mp hLR)]
-      exact ⟨hb0, hb1, rfl⟩
+      fun _ ha0 ha1 hb0 hb1 => key ha0 ha1 hb0 hb1⟩
 
   ProverAssumptions r _ _ := Honest r
   completeness := by
@@ -103,7 +104,7 @@ def circuit : GeneralFormalCircuit (F p) MinToy.Row unit where
 /-! ## The ensemble: ARE_BYTES, the LT answers, CMIN -/
 
 open Air.Flat
-open Ensembles.LtStaged (providerComponent countedProviderComponent demandOn isMinMsg
+open Ensembles.LtStaged (providerComponent countedProviderComponent countedConsumer demandOn isMinMsg
   isMinMsg_toElements msg_eval mu_count providerComponent_guarantees
   providerComponent_requirements countedProviderComponent_guarantees
   countedProviderComponent_requirements)
@@ -122,13 +123,26 @@ def stages : List (Stage (F p)) :=
   [{ channel := AluC, cls := isMinMsg }, { channel := AluC, cls := fun m => !isMinMsg m },
    { channel := Bitwise.AreBytes.toRaw }]
 
+/-- A consumer of the ALU bus: it pulls one message per row and owes nothing. Without it the MIN
+messages CMIN emits are never pulled, a balanced witness has to send every `μ` on the bus to
+zero, and `RowSpec` — guarded by `μ ≠ 0` — holds vacuously on every row. -/
+def aluConsumerComponent : Component (F p) where
+  circuit := countedConsumer muMax (by norm_num) Alu.channel
+  generation := demandOn Alu.channel _
+
+@[circuit_norm] lemma aluConsumerComponent_guarantees :
+    aluConsumerComponent.circuit.channelsWithGuarantees = [AluC] := rfl
+@[circuit_norm] lemma aluConsumerComponent_requirements :
+    aluConsumerComponent.circuit.channelsWithRequirements = [AluC] := rfl
+
 /-- The LT answers stand for the LT table: a provider of ALU messages on the counted bus. -/
 def ensemble : Ensemble (F p) unit where
   tables := [providerComponent Bitwise.AreBytes, countedProviderComponent muMax Alu.channel,
-    cminComponent]
+    cminComponent, aluConsumerComponent]
   unique_names := by
-    simp [providerComponent, countedProviderComponent, cminComponent, Ensembles.LtStaged.provider,
-      Ensembles.LtStaged.countedProvider, circuit, Alu.channel, Bitwise.AreBytes,
+    simp [providerComponent, countedProviderComponent, cminComponent, aluConsumerComponent,
+      Ensembles.LtStaged.provider, Ensembles.LtStaged.countedProvider,
+      countedConsumer, circuit, Alu.channel, Bitwise.AreBytes,
       Bitwise.areBytesTable, StaticLookupChannel.toChannel]
   channels := [AluC, Bitwise.AreBytes.toRaw]
   unique_channel_names := by
@@ -136,11 +150,12 @@ def ensemble : Ensemble (F p) unit where
   tables_channels := by
     intro table h
     simp only [List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl <;>
+    rcases h with rfl | rfl | rfl | rfl <;>
       simp only [GeneralFormalCircuit.channels, providerComponent_guarantees,
         providerComponent_requirements, countedProviderComponent_guarantees,
         countedProviderComponent_requirements, cminComponent_guarantees,
-        cminComponent_requirements] <;>
+        cminComponent_requirements, aluConsumerComponent_guarantees,
+        aluConsumerComponent_requirements] <;>
       simp [AluC]
   verifier_channels := by simp [circuit_norm]
 
@@ -165,6 +180,23 @@ lemma bytes_ne_alu : Bitwise.AreBytes.toRaw ≠ Channel.counted muMax Alu.channe
   have := congrArg RawChannel.name h
   simp [circuit_norm, Alu.channel, Bitwise.AreBytes, Bitwise.areBytesTable, StaticLookupChannel.toChannel,
     Channel.counted, Channel.toRaw] at this
+
+/-- Every interaction of the ALU consumer is its single pull, and a pull of multiplicity one
+meets the counted channel's range requirement outright: no byte check needed. -/
+lemma aluConsumer_requirements {table : Table (F p)}
+    (h_comp : table.component = aluConsumerComponent)
+    {i : Interaction (F p)} (h_i : i ∈ table.interactionsWith AluC) :
+    i.Requirements table.data := by
+  cases table
+  simp only at h_comp
+  subst h_comp
+  simp [Table.interactionsWith, List.mem_flatMap, Operations.interactionValuesWith_eq_map,
+    Component.interactionsWith_eq, Component.rowOperations, aluConsumerComponent, countedConsumer,
+    AluC, circuit_norm] at h_i
+  obtain ⟨row, -, rfl⟩ := h_i
+  simp only [AbstractInteraction.eval, Channel.pulledUpTo, Interaction.Requirements,
+    Channel.counted]
+  exact .inr ⟨1, le_refl 1, by norm_num, by simp [circuit_norm]⟩
 
 /-- Each row of CMIN has two interactions on the ALU bus: the LT pull, which is not a MIN message,
 and the MIN push. -/
@@ -230,7 +262,7 @@ theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
     rcases hs with rfl | rfl | rfl <;> simp [ensemble]
   · intro component h c hc msg
     simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl
+    rcases h with rfl | rfl | rfl | rfl
     iterate 2 simp [providerComponent_guarantees, countedProviderComponent_guarantees] at hc
     · rw [cminComponent_guarantees] at hc
       simp only [List.mem_cons, List.not_mem_nil, or_false] at hc
@@ -240,13 +272,20 @@ theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
         · exact ⟨{ channel := AluC, cls := fun m => !isMinMsg m }, by simp [stages], rfl,
             by simp [h]⟩
         · exact ⟨{ channel := AluC, cls := isMinMsg }, by simp [stages], rfl, h⟩
+    · rw [aluConsumerComponent_guarantees] at hc
+      simp only [List.mem_singleton] at hc
+      subst hc
+      cases h : isMinMsg msg
+      · exact ⟨{ channel := AluC, cls := fun m => !isMinMsg m }, by simp [stages], rfl,
+          by simp [h]⟩
+      · exact ⟨{ channel := AluC, cls := isMinMsg }, by simp [stages], rfl, h⟩
   · intro s hs
     show s.channel.ConsistentUpTo muMax
     simp only [stages, List.mem_cons, List.not_mem_nil, or_false] at hs
     rcases hs with rfl | rfl | rfl <;> infer_instance
   · intro component h
     simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl
+    rcases h with rfl | rfl | rfl | rfl
     -- the providers pull nothing
     iterate 2
       refine ⟨?_, ?_, ?_, trivial⟩ <;>
@@ -277,5 +316,14 @@ theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
       have := congrArg RawChannel.name h
       simp [circuit_norm, AluC, Alu.channel, Bitwise.AreBytes, Bitwise.areBytesTable,
         StaticLookupChannel.toChannel, Channel.counted, Channel.toRaw] at this
+    -- the consumer pulls once per row on both ALU classes, and owes nothing on ARE_BYTES
+    refine ⟨?_, ?_, ?_, trivial⟩
+    · rintro table h_comp - - - i h_i -
+      exact aluConsumer_requirements h_comp h_i
+    · rintro table h_comp - - - i h_i -
+      exact aluConsumer_requirements h_comp h_i
+    · apply Component.requirementsAfterOn_of_not_mem
+      rw [aluConsumerComponent_requirements, List.mem_singleton]
+      exact bytes_ne_alu
 
 end LambdaVM.CountedMin

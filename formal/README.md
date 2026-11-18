@@ -145,7 +145,9 @@ After PR #1016 a deduplicated row pulls its range checks with multiplicity `μ`,
 `μ` a byte. Clean's typed channel grants the guarantee to a pull of multiplicity
 `1` only, and requires every pull to carry `0` or `1`; any other nonzero
 multiplicity is a requirement the row cannot meet.
-`LambdaVM/Channels/Counted.lean` is the generalisation:
+`LambdaVM/Channels/Counted.lean` is this model's own generalisation. It is **not**
+the channel LT and CMIN pull on — those use the fork's `Channel.counted`, whose
+semantics differ; see the comparison at the end of this section.
 
 - `counted N channel` grants the guarantee to a pull of `1, …, N` and charges
   every other nonzero interaction, mirroring `Channel.toRaw`. `pullIf`/`emit`
@@ -202,6 +204,13 @@ order of channels, and of message classes within a channel). On top of it:
 - `Ensembles/CountedSameBus.lean` (CMIN) does the same with the ALU bus itself
   counted: a row answers `μ` identical MIN requests, the full shape of DVRM.
 
+What the MIN halves conclude about rows: `MinToy.RowSpec`, that a MIN row with
+range-checked operand limbs carries `out = min(a, b)` as a 64-bit unsigned
+value — on every row, since MIN pulls its LT answer unconditionally; and
+`CountedMin.RowSpec`, the same for a CMIN row, guarded by `μ ≠ 0` because that
+row pulls its LT answer `μ` times and a `μ = 0` row pulls nothing. The provider
+and consumer stand-ins conclude `True`, which is what the next paragraphs are about.
+
 That is not an end-to-end LT theorem. `TableSoundness` is one premise of a
 sound ensemble, not the conclusion: it reads `witness.Assumptions →
 witness.Constraints → witness.InteractionsFit balance → witness.Balanced
@@ -215,6 +224,17 @@ into the ensemble. Each provider assumes its own answers are correct; nothing
 in the file derives that from a row of BITWISE. `CountedSameBus` reuses those
 two components, so the LT answers it feeds to CMIN are assumed in the same way.
 
+Both ensembles also carry a consumer of the ALU bus (`consumer` and
+`countedConsumer` in `LtStaged.lean`), and that stand-in is not a concession. A
+pull gains the channel's guarantee instead of owing it, so a consumer assumes
+nothing on the soundness side; what the honest prover must know — that it pulls
+a message the bus really answers — is a `ProverAssumptions`, which only
+completeness may use. Without a consumer the bus would carry pushes and no
+pulls at all, a balanced witness would have to send every `μ` on it to zero, and
+every row spec guarded by `μ ≠ 0` would hold vacuously: `LT.RowSpec` in
+`LtStaged.tableSoundness`, `CountedMin.RowSpec` in `CountedMin.tableSoundness`.
+`MinToy.RowSpec` carries no such guard, so it does not depend on this.
+
 `EqLookup`, already in the model (PR #1027), is the contrast. Its `pushStatic` emits the
 entries of a real `StaticLookupChannel` and proves the guarantee from
 membership in the table, so `eq_rows_correct` discharges `witness.Assumptions`
@@ -226,10 +246,19 @@ has neither. What `LtStaged` and `CountedSameBus` do establish is that the
 staged finishing order admits counted pulls, which is what they were written
 for.
 
-`Channels/Counted.lean` above predates the fork. Its `not_consistent` is the
-reason the fork's balance carries the `N * count` bound; its `consistentUpTo`
-shows the counted channel is consistent under the fork's `BalancedUpTo N`.
-Nothing else uses it.
+`Channels/Counted.lean` above predates the fork, and its `counted` is a different
+channel from the fork's, not a copy. They part on what a pull of an out-of-range
+multiplicity costs:
+
+| | out-of-range pull |
+|---|---|
+| this file | `mult ≠ 0 → ¬ IsPull N mult → Guarantees` — charged like a push: the row must justify the message |
+| the fork (`Channel.counted`) | `mult = 0 ∨ CountUpTo N mult` — forbidden: a range obligation the row must discharge |
+
+LT, MIN and CMIN are all on the fork's. This file's channel has one consumer,
+`Demo.circuit`, and keeping it is deliberate: its `not_consistent` is the reason
+the fork's balance carries the `N * count` bound, and its `consistentUpTo` shows
+the channel is consistent under the fork's `BalancedUpTo N`. Nothing else uses it.
 
 ## What is intentionally not proven
 

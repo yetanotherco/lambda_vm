@@ -58,8 +58,18 @@ jobs:
       - name: Fetch Mathlib binaries
         run: lake exe cache get
 
-      - name: Build
-        run: lake build
+      # `lake build` only *warns* on a `sorry`, so without this check a sorry anywhere in the
+      # library merges green, including in declarations the axiom gate below does not reach.
+      - name: Build, and no sorry anywhere in the library
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/build.log"
+          lake build 2>&1 | tee "$log"
+          if grep -q "declaration uses 'sorry'" "$log"; then
+            echo "::error::a declaration uses sorry"
+            grep -n "declaration uses 'sorry'" "$log"
+            exit 1
+          fi
 
       # `LambdaVM/Axioms.lean` is a list of `#print axioms` lines, one per modelled circuit and
       # per ensemble theorem. It is not part of the library, so `lake build` does not see it.
