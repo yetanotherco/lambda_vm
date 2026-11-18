@@ -190,8 +190,9 @@ pub struct Backend {
     /// Free-list of pre-created events for [`Backend::take_event`].
     event_pool: Mutex<Vec<cudarc::driver::CudaEvent>>,
     /// VRAM budget (bytes) for admission control. See
-    /// [`detect_vram_budget_bytes`].
-    vram_budget_bytes: u64,
+    /// [`detect_vram_budget_bytes`]; a caller may move it for a phase of its
+    /// own ([`Backend::set_vram_budget_bytes`]).
+    vram_budget_bytes: AtomicU64,
     /// Device bytes promised to structures that are still alive. See
     /// [`Backend::reserve`].
     reserved: AtomicU64,
@@ -593,7 +594,7 @@ impl DeviceReservation {
         let Ok(be) = backend() else { return false };
         let mut held = be.reserved.load(Ordering::Relaxed);
         loop {
-            if held.saturating_add(extra) > be.vram_budget_bytes {
+            if held.saturating_add(extra) > be.vram_budget_bytes() {
                 return false;
             }
             match be.reserved.compare_exchange_weak(
@@ -1372,7 +1373,7 @@ impl Backend {
             staging_pairs: StagingPool::default(),
             event_pool,
             util_stream,
-            vram_budget_bytes,
+            vram_budget_bytes: AtomicU64::new(vram_budget_bytes),
             reserved: AtomicU64::new(0),
         })
     }
@@ -1380,7 +1381,16 @@ impl Backend {
     /// VRAM budget in bytes for admission control. `u64::MAX`
     /// when budgeting is disabled (query failed). See the field docs.
     pub fn vram_budget_bytes(&self) -> u64 {
-        self.vram_budget_bytes
+        self.vram_budget_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Moves the budget to `bytes` and returns the one it replaces. Promises
+    /// already made stay made; only later ones are checked against the new
+    /// budget. For a phase that knows its own card room better than the
+    /// detected default (the recursion levels after the base), which puts the
+    /// old budget back when it ends.
+    pub fn set_vram_budget_bytes(&self, bytes: u64) -> u64 {
+        self.vram_budget_bytes.swap(bytes, Ordering::Relaxed)
     }
 
     /// Live `(free, total)` device memory in bytes, for diagnostics — the
@@ -1460,7 +1470,7 @@ impl Backend {
         let mut evicted = !evict;
         let mut held = self.reserved.load(Ordering::Relaxed);
         loop {
-            if held.saturating_add(bytes) > self.vram_budget_bytes {
+            if held.saturating_add(bytes) > self.vram_budget_bytes() {
                 // ★ Before giving up, ask the retention for spare bytes ONCE. The
                 // retention holds only genuinely-spare leaf layers and gives them
                 // back here, so a real caller (argue) is never displaced by a
@@ -1473,7 +1483,9 @@ impl Backend {
                 // as it would after evicting them.
                 if !evicted {
                     evicted = true;
-                    let deficit = held.saturating_add(bytes) - self.vram_budget_bytes;
+                    let deficit = held
+                        .saturating_add(bytes)
+                        .saturating_sub(self.vram_budget_bytes());
                     if try_evict_retained(deficit) > 0 {
                         held = self.reserved.load(Ordering::Relaxed);
                         continue;

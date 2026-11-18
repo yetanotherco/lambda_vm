@@ -564,6 +564,81 @@ impl Drop for PadRelease {
     }
 }
 
+/// `LAMBDA_VM_LEVELS_CARD_BUDGET_PCT=<percent>`: from the base's end to the
+/// driver's return, the card ledger's budget is this share of the card's
+/// memory instead of the base's (80 %, or `LAMBDA_VM_VRAM_BUDGET_MB`); the
+/// base's comes back when the driver returns, by any path. The base runs
+/// beside its own pools, staging and caches; after it the driver settles the
+/// card (every stream drained, the pool trimmed), and the levels' one table
+/// of 2^29 cells on a large block needs its GKR trees on the card at once: at
+/// 80 % its argue was refused a 1.73 GiB tree with 0.86 GiB of room and built
+/// on the host (13.4 s). Unset or empty (the default): the base's budget. A
+/// whole number from 50 to 95; anything else is refused. A prover's choice,
+/// never the proof's: a refused promise has a host path.
+pub const CARD_BUDGET_ENV: &str = "LAMBDA_VM_LEVELS_CARD_BUDGET_PCT";
+
+/// What [`CARD_BUDGET_ENV`] says: the percent, `None` when unset or empty.
+pub fn parse_card_budget(value: Option<&str>) -> Result<Option<u64>, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(v) => match v.parse::<u64>() {
+            Ok(pct) if (50..=95).contains(&pct) => Ok(Some(pct)),
+            _ => Err(format!(
+                "{CARD_BUDGET_ENV} must be a whole percent from 50 to 95, got `{v}`"
+            )),
+        },
+    }
+}
+
+fn card_budget_pct() -> Result<Option<u64>, String> {
+    static PCT: std::sync::OnceLock<Result<Option<u64>, String>> = std::sync::OnceLock::new();
+    PCT.get_or_init(|| parse_card_budget(std::env::var(CARD_BUDGET_ENV).ok().as_deref()))
+        .clone()
+}
+
+/// The base's budget while the levels' own is in force ([`CARD_BUDGET_ENV`]).
+static BASE_BUDGET: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// Puts the levels' budget in force ([`CARD_BUDGET_ENV`]) on a card of
+/// `total` bytes: the budget now (unchanged when the knob is unset or there is
+/// no card).
+fn take_levels_budget(total: Option<u64>) -> Result<u64, String> {
+    let (Some(pct), Some(total)) = (card_budget_pct()?, total) else {
+        return Ok(multilinear::gpu::reserve_budget());
+    };
+    let bytes = total / 100 * pct;
+    let base = multilinear::gpu::set_reserve_budget(bytes);
+    let mut held = BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_none() {
+        *held = Some(base);
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    eprintln!(
+        "LEVELS CARD budget: {:.2} GiB ({pct} % of {:.2}) for the levels, the base's {:.2} GiB back at \
+         the driver's return",
+        gib(bytes),
+        gib(total),
+        gib(held.unwrap_or(base))
+    );
+    Ok(bytes)
+}
+
+/// Puts the base's budget back, if the levels' was in force.
+fn release_levels_budget() {
+    if let Some(base) = BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        multilinear::gpu::set_reserve_budget(base);
+    }
+}
+
+/// Puts the base's budget back when the driver returns, by any path.
+struct BudgetRelease;
+
+impl Drop for BudgetRelease {
+    fn drop(&mut self) {
+        release_levels_budget();
+    }
+}
+
 /// A filled level's program let go: its instructions and instruction
 /// columns (their counts kept in `sizes`). The prove reads the build and the
 /// filled traces, never the program; the heights stay.
@@ -1010,7 +1085,9 @@ pub fn prove_block_levels(
     // reads starts from what is live, not from pages the allocator keeps.
     let purge_at_start = crate::alloc_purge::purge_now();
     card_pad_bytes()?;
+    card_budget_pct()?;
     let _pad = PadRelease;
+    let _budget = BudgetRelease;
     let peak_reset = reset_peak_rss();
     // What an earlier block left in the card's pool goes back too.
     let at_start = card_settle("start");
@@ -1324,6 +1401,7 @@ pub fn prove_block_levels(
                         return Err("the base did not prove".to_string());
                     }
                     let settled = card_settle("base end");
+                    take_levels_budget(settled.map(|c| c.total))?;
                     take_levels_pad()?;
                     let build = commit_level(pre, 1)?;
                     let committed = card_settle("level 1 committed");
@@ -1393,6 +1471,7 @@ pub fn prove_block_levels(
             let pre = prepare_level(&program, family, level_rounds(&plan))?;
             let (prepare, cells) = (pre.secs(), pre.prepared_cells());
             let settled = card_settle("base end");
+            take_levels_budget(settled.map(|c| c.total))?;
             take_levels_pad()?;
             let build = commit_level(pre, 1)?;
             let committed = card_settle("level 1 committed");

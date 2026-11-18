@@ -256,3 +256,20 @@ fn a_retired_build_opens_each_group_alone() {
         );
     }
 }
+
+/// The levels' card budget knob: unset or empty keeps the base's budget, a
+/// whole percent from 50 to 95 is that share of the card, anything else is
+/// refused.
+#[test]
+fn the_card_budget_knob_reads_a_percent_and_refuses_nonsense() {
+    use super::levels::{CARD_BUDGET_ENV, parse_card_budget};
+    assert_eq!(CARD_BUDGET_ENV, "LAMBDA_VM_LEVELS_CARD_BUDGET_PCT");
+    assert_eq!(parse_card_budget(None), Ok(None));
+    assert_eq!(parse_card_budget(Some("")), Ok(None));
+    assert_eq!(parse_card_budget(Some("85")), Ok(Some(85)));
+    assert_eq!(parse_card_budget(Some(" 50 ")), Ok(Some(50)));
+    assert_eq!(parse_card_budget(Some("95")), Ok(Some(95)));
+    for bad in ["49", "96", "100", "0", "85%", "0.85", "-1", "x"] {
+        assert!(parse_card_budget(Some(bad)).is_err(), "{bad}");
+    }
+}
