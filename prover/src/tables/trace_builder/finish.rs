@@ -37,6 +37,10 @@ pub(crate) struct RestHeader {
     /// ([`StreamSkip::keccak_rnd_first`], [`hand_on_order_first`]): the order
     /// the layout admits.
     pub(crate) keccak_rnd_first: bool,
+    /// The page tables are handed on right after KECCAK_RND's (or first,
+    /// without them), in their AIR order ([`StreamSkip::pages_first`]): the
+    /// order the layout admits.
+    pub(crate) pages_first: bool,
     /// The fused memory format's MEM_LOAD and MEM_STORE tables (none under the
     /// split format): counted apart from [`crate::TableCounts`], which a proof
     /// archives as it always has.
@@ -1475,6 +1479,7 @@ impl<'a> FinishPlan<'a> {
                 bitwise_last: false,
                 bitwise_from_tables: false,
                 keccak_rnd_first: false,
+                pages_first: false,
                 fused_counts,
                 word_counts,
             },
@@ -1499,6 +1504,12 @@ impl<'a> FinishPlan<'a> {
     /// ([`RestHeader::keccak_rnd_first`]): for a sliding finish.
     pub(crate) fn hand_keccak_rnd_first(&mut self) {
         self.header.keccak_rnd_first = true;
+    }
+
+    /// The rest handed on with the page tables right after KECCAK_RND's
+    /// ([`RestHeader::pages_first`]): for a sliding finish.
+    pub(crate) fn hand_pages_first(&mut self) {
+        self.header.pages_first = true;
     }
 
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables as each is
@@ -2200,6 +2211,7 @@ impl<'a> FinishPlan<'a> {
             bitwise_last: _,
             bitwise_from_tables: _,
             keccak_rnd_first: _,
+            pages_first: _,
             fused_counts,
             word_counts,
         } = header;
@@ -3863,12 +3875,22 @@ impl<'a> FinishPlan<'a> {
         // BITWISE is the rest's first table: its position is 0.
         let last = (slide && self.header.bitwise_last).then_some(0);
         let keccak_rnd_first = slide && self.header.keccak_rnd_first;
+        let pages_first = slide && self.header.pages_first;
         let (units, regen, side) = match self.units_keeping(keep) {
             Ok((units, regen, side)) => (Ok(units), regen, side),
             Err(e) => (Err(e), None, None),
         };
         let first = match &units {
-            Ok(units) if keccak_rnd_first => positions_of(units, family("KECCAK_RND")),
+            Ok(units) => {
+                let mut first = Vec::new();
+                if keccak_rnd_first {
+                    first.extend(positions_of(units, family("KECCAK_RND")));
+                }
+                if pages_first {
+                    first.extend(positions_of(units, family("PAGE")));
+                }
+                first
+            }
             _ => Vec::new(),
         };
         emit_streamed_units_ordered(units, gate, send, slide, &first, last, side)?;

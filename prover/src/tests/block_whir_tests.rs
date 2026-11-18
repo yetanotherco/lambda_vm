@@ -2955,6 +2955,72 @@ fn bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies() {
     );
 }
 
+/// ★ The page tables handed on right after KECCAK_RND's
+/// ([`Deviations::pages_first`], off by default): every page table is packed
+/// before DECODE, the first other table of the rest in AIR order, and by
+/// default every one after it. The partition moves, the tables and their
+/// counts do not, and both proofs verify under the unchanged verifier.
+#[test]
+fn pages_first_moves_the_partition_and_verifies() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    assert!(o.rest_streams(), "the rest streams");
+    let proved = |what: &str, pages_first: Option<bool>| {
+        let proof = prove_with(
+            &elf,
+            &format,
+            &o,
+            &Deviations {
+                pages_first,
+                ..Deviations::default()
+            },
+        );
+        assert!(verify(&proof, &elf, &format), "{what}");
+        proof
+    };
+    let default = proved("the default", None);
+    let first = proved("the pages next", Some(true));
+    let opts = ProofOptions::default_test_options();
+    let frame = block_whir::block_frame(default.statement(), &elf, &opts, &format).expect("frame");
+    let names: Vec<String> = frame
+        .airs
+        .air_refs()
+        .iter()
+        .map(|air| air.name().to_string())
+        .collect();
+    let pages: Vec<u32> = (0..names.len())
+        .filter(|&i| names[i].starts_with("PAGE"))
+        .map(|i| i as u32)
+        .collect();
+    let decode = names
+        .iter()
+        .position(|n| n == "DECODE")
+        .expect("a DECODE table") as u32;
+    assert!(!pages.is_empty(), "no page table");
+    let flat = |p: &BlockWhirProof| p.groups.iter().flatten().copied().collect::<Vec<u32>>();
+    let at = |order: &[u32], t: u32| order.iter().position(|&x| x == t).expect("in a group");
+    let before_decode = |p: &BlockWhirProof| {
+        let order = flat(p);
+        let d = at(&order, decode);
+        pages.iter().filter(|&&t| at(&order, t) < d).count()
+    };
+    assert_eq!(before_decode(&default), 0, "the default: AIR order");
+    assert_eq!(before_decode(&first), pages.len(), "the pages next");
+    assert_ne!(first.groups, default.groups, "the partition did not move");
+    let sorted = |p: &BlockWhirProof| {
+        let mut v = flat(p);
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(sorted(&first), sorted(&default), "the same tables");
+    assert_eq!(
+        format!("{:?}", first.table_counts),
+        format!("{:?}", default.table_counts)
+    );
+}
+
 /// ★ KECCAK_RND's tables handed on first ([`Deviations::keccak_rnd_first`],
 /// the block's default; `keccak_rnd_first: Some(false)` rolls it back):
 /// every KECCAK_RND table is packed before DECODE, the first table of the rest
