@@ -22,8 +22,9 @@ use super::phase_b_overlap_tests::{
     ARGUES, BEFORE_THE_OVERLAP, H, SIZES, config, digest, in_order, prove_block_with, verify,
 };
 use crate::multilinear_block::{
-    BlockCommitted, CsProbe, CsProbeStamp, CsProbeState, GroupStamps, OverlapFaults, PhaseBOverlap,
-    cs_probe_lines,
+    BlockCommitted, CsProbe, CsProbeMode, CsProbeStamp, CsProbeState, GroupStamps, LaneDefer,
+    LaneLimits, LaneState, MergeStamp, OverlapFaults, PhaseBOverlap, ZcLaneStamp, cs_probe_lines,
+    merge_probe_lines, zc_lane_lines,
 };
 use crate::multilinear_table::CommittedTable;
 
@@ -100,9 +101,10 @@ fn probes(stamps: &[GroupStamps]) -> Vec<CsProbeStamp> {
 fn the_probe_runs_after_each_commit_and_moves_no_byte() {
     let decided = Arc::new(AtomicUsize::new(0));
     let on = CsProbe {
-        on: true,
+        mode: CsProbeMode::AfterCommit,
         host: true,
         decided: Some(decided.clone()),
+        ..Default::default()
     };
     let batched = ArgueFormat::BATCHED;
     let before = BEFORE_THE_OVERLAP[1];
@@ -166,9 +168,10 @@ fn the_probe_runs_after_each_commit_and_moves_no_byte() {
 #[test]
 fn a_group_with_no_store_is_declined_off_the_host() {
     let probe = CsProbe {
-        on: true,
+        mode: CsProbeMode::AfterCommit,
         host: false,
         decided: Some(Arc::new(AtomicUsize::new(0))),
+        ..Default::default()
     };
     let proved = prove_probed(ArgueFormat::BATCHED, probe);
     assert_eq!(digest(&proved), BEFORE_THE_OVERLAP[1]);
@@ -186,14 +189,32 @@ fn a_group_with_no_store_is_declined_off_the_host() {
     );
 }
 
-/// `LAMBDA_VM_PHASE_A_CS_PROBE`: `1` is on; unset, `0` or another word is off.
+/// `LAMBDA_VM_PHASE_A_CS_PROBE`: unset, empty or `0` off, `1` after each
+/// commit, `queue` the lane; `LAMBDA_VM_PHASE_B_MERGE_PROBE`: unset, empty or
+/// `0` off, `1` on. Any other word is refused, never read as off.
 #[test]
-fn the_knob_reads_one_as_on() {
-    assert!(CsProbe::from_value(Some("1")).on);
-    assert!(CsProbe::from_value(Some(" 1 ")).on);
-    for value in [None, Some("0"), Some("on"), Some("")] {
-        assert!(!CsProbe::from_value(value).on, "{value:?}");
+fn the_knobs_read_their_words_and_refuse_the_rest() {
+    let read = |a, b| CsProbe::from_values(a, b).map(|p| (p.mode, p.merge));
+    assert_eq!(read(None, None), Ok((CsProbeMode::Off, false)));
+    assert_eq!(read(Some("0"), Some("0")), Ok((CsProbeMode::Off, false)));
+    assert_eq!(read(Some(""), Some("")), Ok((CsProbeMode::Off, false)));
+    assert_eq!(read(Some("1"), None), Ok((CsProbeMode::AfterCommit, false)));
+    assert_eq!(
+        read(Some(" 1 "), None),
+        Ok((CsProbeMode::AfterCommit, false))
+    );
+    assert_eq!(read(Some("queue"), None), Ok((CsProbeMode::Lane, false)));
+    assert_eq!(
+        read(Some("queue"), Some("1")),
+        Ok((CsProbeMode::Lane, true))
+    );
+    assert_eq!(read(None, Some("1")), Ok((CsProbeMode::Off, true)));
+    for bad in ["on", "2", "Queue", "lane", "true"] {
+        assert!(read(Some(bad), None).is_err(), "phase A {bad:?}");
+        assert!(read(None, Some(bad)).is_err(), "merge {bad:?}");
     }
+    assert!(!CsProbe::default().any());
+    assert!(CsProbe::from_values(None, Some("1")).unwrap().any());
 }
 
 /// The readout's hidden seconds are the ran groups' seconds less what they
@@ -235,5 +256,251 @@ fn the_readout_counts_hidden_seconds_and_skips() {
              1:wait:0.0000:0.0000 2:ran:0.2500:0.1250\n"
         ),
         "{lines}"
+    );
+}
+
+/// The lane's probe, gated so each group's job is decided before the next
+/// group is handed over.
+fn lane(merge: bool, host: bool, limits: LaneLimits) -> (CsProbe, Arc<AtomicUsize>) {
+    let decided = Arc::new(AtomicUsize::new(0));
+    (
+        CsProbe {
+            mode: CsProbeMode::Lane,
+            host,
+            decided: Some(decided.clone()),
+            merge,
+            limits,
+        },
+        decided,
+    )
+}
+
+/// ★ The lane (`queue`) moves no byte. On the host, each group's job is
+/// handed to the lane after its commit and runs there — the constraint
+/// sumcheck alone, over the group's tables — and the proof is the one pinned
+/// before any probe existed, and it verifies. Phase B records each group's
+/// own constraint sumcheck, and the hidden credit is their sum over the groups
+/// whose job ran.
+#[test]
+fn the_lane_runs_each_group_and_moves_no_byte() {
+    let (probe, decided) = lane(false, true, LaneLimits::default());
+    let proved = prove_probed(ArgueFormat::BATCHED, probe);
+    assert_eq!(
+        digest(&proved),
+        BEFORE_THE_OVERLAP[1],
+        "the lane: the bytes moved"
+    );
+    verify(ArgueFormat::BATCHED, &proved).expect("the lane: verifies");
+    assert_eq!(decided.load(SeqCst), SIZES.len(), "every group decided");
+    let stamps = &proved.3;
+    for (g, (s, &size)) in stamps.iter().zip(&SIZES).enumerate() {
+        let job = &s.zc_lane;
+        assert_eq!(job.state, LaneState::Ran, "group {g}: {job:?}");
+        assert_eq!(job.tables, size, "group {g}: its tables");
+        assert!(job.rounds > 0.0, "group {g}: {job:?}");
+        assert!(
+            job.committed_at <= job.started_at && job.started_at <= job.ended_at,
+            "group {g}: after its commit: {job:?}"
+        );
+        assert!(s.zc_b > 0.0, "group {g}: phase B's own sumcheck");
+        assert_eq!(
+            s.cs_probe.state,
+            CsProbeState::Off,
+            "group {g}: no probe after the commit"
+        );
+        assert_eq!(s.merge.state, LaneState::Off, "group {g}: no merge");
+    }
+    let hidden: f64 = stamps.iter().map(|s| s.zc_b).sum();
+    let lines = zc_lane_lines(stamps);
+    assert!(
+        lines.contains(&format!(
+            "BLOCK ZC LANE SUM: groups {n} · ran {n} · deferred 0 (hold 0 · memory 0 · tail 0 · no \
+             store 0) · declined 0 · failed 0 · hidden credit {hidden:.3}s · ",
+            n = SIZES.len()
+        )),
+        "{lines}"
+    );
+    assert_eq!(
+        lines.matches("BLOCK ZC LANE: group ").count(),
+        SIZES.len(),
+        "{lines}"
+    );
+    assert_eq!(cs_probe_lines(stamps), "");
+    assert_eq!(merge_probe_lines(stamps), "");
+}
+
+/// ★ The lane and phase B's merge probe together move no byte:
+/// after each group's argue the merge runs over the group's tables on a
+/// throwaway copy of its fork, and the proof is the pinned one and verifies.
+/// The merge alone does too, and under the per-table argue it does not run.
+#[test]
+fn the_merge_probe_runs_after_each_argue_and_moves_no_byte() {
+    let (probe, _) = lane(true, true, LaneLimits::default());
+    let proved = prove_probed(ArgueFormat::BATCHED, probe);
+    assert_eq!(
+        digest(&proved),
+        BEFORE_THE_OVERLAP[1],
+        "lane + merge: the bytes moved"
+    );
+    verify(ArgueFormat::BATCHED, &proved).expect("lane + merge: verifies");
+    for (g, (s, &size)) in proved.3.iter().zip(&SIZES).enumerate() {
+        assert_eq!(s.zc_lane.state, LaneState::Ran, "group {g}");
+        assert_eq!(s.merge.state, LaneState::Ran, "group {g}: {:?}", s.merge);
+        assert_eq!(s.merge.tables, size, "group {g}: its tables");
+        assert!(s.merge.rounds > 0.0, "group {g}: {:?}", s.merge);
+    }
+    let lines = merge_probe_lines(&proved.3);
+    assert!(
+        lines.starts_with(&format!(
+            "BLOCK MERGE PROBE: groups {} · ran {} · declined 0 · failed 0 · tables {} (",
+            SIZES.len(),
+            SIZES.len(),
+            SIZES.iter().sum::<usize>()
+        )),
+        "{lines}"
+    );
+
+    let merge_only = CsProbe {
+        merge: true,
+        host: true,
+        ..Default::default()
+    };
+    let proved = prove_probed(ArgueFormat::BATCHED, merge_only.clone());
+    assert_eq!(
+        digest(&proved),
+        BEFORE_THE_OVERLAP[1],
+        "merge alone: the bytes moved"
+    );
+    verify(ArgueFormat::BATCHED, &proved).expect("merge alone: verifies");
+    assert!(
+        proved
+            .3
+            .iter()
+            .all(|s| s.merge.state == LaneState::Ran && s.zc_lane.state == LaneState::Off)
+    );
+    assert_eq!(zc_lane_lines(&proved.3), "");
+
+    let proved = prove_probed(ArgueFormat::PerTable, merge_only);
+    assert_eq!(
+        digest(&proved),
+        BEFORE_THE_OVERLAP[0],
+        "per table: the bytes moved"
+    );
+    verify(ArgueFormat::PerTable, &proved).expect("per table: verifies");
+    assert!(
+        proved
+            .3
+            .iter()
+            .all(|s| s.merge.state == LaneState::Off && s.zc_b == 0.0)
+    );
+    assert_eq!(merge_probe_lines(&proved.3), "");
+}
+
+/// The lane holds a group only while it may: a full ledger (no bytes to hold),
+/// no room for a job (hold 0), or no store and no host each defer every
+/// group, by name; nothing runs, and the bytes are the same.
+#[test]
+fn the_lane_defers_a_group_it_may_not_hold() {
+    for (limits, host, why) in [
+        (
+            LaneLimits {
+                hold_bytes: Some(0),
+                ..LaneLimits::default()
+            },
+            true,
+            LaneDefer::Memory,
+        ),
+        (
+            LaneLimits {
+                hold: 0,
+                ..LaneLimits::default()
+            },
+            true,
+            LaneDefer::Hold,
+        ),
+        (LaneLimits::default(), false, LaneDefer::NoStore),
+    ] {
+        let (probe, decided) = lane(false, host, limits);
+        let proved = prove_probed(ArgueFormat::BATCHED, probe);
+        assert_eq!(
+            digest(&proved),
+            BEFORE_THE_OVERLAP[1],
+            "{why:?}: the bytes moved"
+        );
+        assert_eq!(
+            decided.load(SeqCst),
+            SIZES.len(),
+            "{why:?}: every group decided"
+        );
+        for (g, s) in proved.3.iter().enumerate() {
+            assert_eq!(s.zc_lane.state, LaneState::Deferred(why), "group {g}");
+            assert_eq!(s.zc_lane.rounds, 0.0, "group {g}");
+        }
+        let lines = zc_lane_lines(&proved.3);
+        assert!(
+            lines.contains(&format!("· ran 0 · deferred {} (", SIZES.len()))
+                && lines.contains("· hidden credit 0.000s ·"),
+            "{why:?}: {lines}"
+        );
+    }
+}
+
+/// The lane's readout: the hidden credit is phase B's own constraint sumcheck
+/// summed over the groups whose job ran, and only those; the groups not run
+/// are listed with theirs.
+#[test]
+fn the_lane_readout_credits_only_the_groups_that_ran() {
+    let stamp = |state, zc_b| GroupStamps {
+        commit_reserved: 5 << 20,
+        zc_b,
+        zc_lane: ZcLaneStamp {
+            state,
+            tables: 2,
+            setup: 0.125,
+            rounds: 0.25,
+            ended_at: 1.5,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let stamps = [
+        stamp(LaneState::Ran, 0.5),
+        stamp(LaneState::Deferred(LaneDefer::Tail), 0.75),
+        stamp(LaneState::Ran, 0.25),
+        stamp(LaneState::Declined, 1.0),
+    ];
+    let lines = zc_lane_lines(&stamps);
+    assert!(
+        lines.contains(
+            "BLOCK ZC LANE SUM: groups 4 · ran 2 · deferred 1 (hold 0 · memory 0 · tail 1 · no store 0) \
+             · declined 1 · failed 0 · hidden credit 0.750s · lane card 0.750s (setup 0.250, rounds \
+             0.500, host tail 0.000) · zc in phase B 2.500s (of groups not run 1.750s) · last job ended \
+             at 1.500s · phase A's end waited 0.000s · phase-A ledger peak 5 MiB · deferred groups \
+             [1:tail:0.750 3:declined:1.000]\n"
+        ),
+        "{lines}"
+    );
+
+    let merged = |state, secs: f64| GroupStamps {
+        zc_b: 1.0,
+        merge: MergeStamp {
+            state,
+            tables: 3,
+            on_card: 3,
+            setup: secs / 2.0,
+            rounds: secs / 2.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let lines = merge_probe_lines(&[
+        merged(LaneState::Ran, 0.5),
+        merged(LaneState::Declined, 0.0),
+    ]);
+    assert_eq!(
+        lines,
+        "BLOCK MERGE PROBE: groups 2 · ran 1 · declined 1 · failed 0 · tables 3 (3 on the card) · \
+         merge 0.500s (setup 0.250, rounds 0.250, host tail 0.000) · zc in phase B 2.000s\n\
+         BLOCK MERGE PROBE GROUPS (group:state:s): 0:ran:0.5000 1:declined:0.0000\n"
     );
 }

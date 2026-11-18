@@ -314,45 +314,119 @@ pub struct GroupStamps {
     /// Phase A: the constraint-sumcheck probe after the group's commit
     /// ([`CsProbe`]); [`CsProbeState::Off`] unless it is on.
     pub cs_probe: CsProbeStamp,
+    /// Phase A: the group's job on the constraint-sumcheck lane
+    /// ([`CsProbeMode::Lane`]); [`LaneState::Off`] unless it is on.
+    pub zc_lane: ZcLaneStamp,
+    /// Phase B: the batched argue's constraint sumcheck (its set-up and
+    /// rounds), seconds; 0 under the per-table argue.
+    pub zc_b: f64,
+    /// Phase B: the merge probe after the group's argue ([`CsProbe::merge`]).
+    pub merge: MergeStamp,
 }
 
-/// ⛔ A MEASUREMENT KNOB, never a proof's: after each group's commit, while
-/// its columns are still on the card and no next group has arrived, phase A
-/// runs the group's constraint sumcheck as phase B would
-/// ([`batched::probe_constraint_sumcheck`]) on a throwaway transcript of its
-/// own, and drops what it proved. It reads how much of that sumcheck the card's
-/// idle time in phase A holds. The proof is the same byte for byte: nothing
-/// the probe draws or sends reaches the block's transcript or the proof.
+/// ⛔ A MEASUREMENT KNOB, never a proof's: phase A runs each group's
+/// constraint sumcheck after its commit, as phase B would
+/// ([`batched::probe_constraint_sumcheck`]), on a throwaway transcript of its
+/// own, and drops what it proved; and, with [`Self::merge`], phase B runs after
+/// each group's argue the sumcheck a format that moved the constraint sumcheck
+/// into phase A would run there instead ([`batched::probe_merge_sumcheck`]),
+/// on a throwaway copy of the group's fork. It reads how much of that sumcheck
+/// the card's idle time in phase A holds, and what the phase-B sumcheck in its
+/// place would cost. The proof is the same byte for byte: nothing either probe
+/// draws or sends reaches the block's transcript or the proof.
 ///
-/// Only with the next group taken while the current one commits
-/// (`upload_ahead`) and under [`ArgueFormat::Batched`]; otherwise it does
-/// nothing. Production reads `LAMBDA_VM_PHASE_A_CS_PROBE=1` (off by default).
+/// Phase A's probe runs only with the next group taken while the current one
+/// commits (`upload_ahead`) and under [`ArgueFormat::Batched`]; the merge only
+/// under [`ArgueFormat::Batched`]; otherwise they do nothing. Production reads
+/// `LAMBDA_VM_PHASE_A_CS_PROBE` and `LAMBDA_VM_PHASE_B_MERGE_PROBE`
+/// ([`Self::from_env`]; both off by default).
 #[doc(hidden)]
 #[derive(Clone, Debug, Default)]
 pub struct CsProbe {
-    pub on: bool,
+    pub mode: CsProbeMode,
     /// A table the card declines (or a group with no store on the card) is
     /// run on the host: a test without a card. Off, such a group is not
-    /// probed ([`CsProbeState::Declined`]).
+    /// probed ([`CsProbeState::Declined`], [`LaneState::Declined`]).
     pub host: bool,
     /// Counts each group whose probe was decided (run or not), after it ran:
     /// a test's producer holds the next group back on it.
     pub decided: Option<Arc<AtomicUsize>>,
+    /// Phase B: the merge probe after each group's argue.
+    pub merge: bool,
+    /// What the lane ([`CsProbeMode::Lane`]) may hold.
+    pub limits: LaneLimits,
 }
 
+/// Where phase A's probe runs ([`CsProbe`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CsProbeMode {
+    /// No probe in phase A.
+    #[default]
+    Off,
+    /// On the committer's thread right after the group's commit, when no next
+    /// group has arrived; today's whole phase-C batch (`LAMBDA_VM_PHASE_A_CS_PROBE=1`).
+    AfterCommit,
+    /// On a lane of its own beside phase A ([`zc_lane`]): each committed
+    /// group's columns held on the card as a job, the jobs run oldest first on
+    /// background streams, never started while a commit runs, and stopped at
+    /// phase A's end; the constraint sumcheck alone, the bus weighted 0
+    /// (`LAMBDA_VM_PHASE_A_CS_PROBE=queue`).
+    Lane,
+}
+
+/// The environment variable that sets phase A's probe ([`CsProbe::mode`]).
+#[doc(hidden)]
+pub const CS_PROBE_ENV: &str = "LAMBDA_VM_PHASE_A_CS_PROBE";
+/// The environment variable that sets phase B's merge probe ([`CsProbe::merge`]).
+#[doc(hidden)]
+pub const MERGE_PROBE_ENV: &str = "LAMBDA_VM_PHASE_B_MERGE_PROBE";
+
 impl CsProbe {
-    /// [`CsProbe`] as `LAMBDA_VM_PHASE_A_CS_PROBE` asks: `1` on, anything
-    /// else off.
-    pub fn from_env() -> Self {
-        Self::from_value(std::env::var("LAMBDA_VM_PHASE_A_CS_PROBE").ok().as_deref())
+    /// [`CsProbe`] as `LAMBDA_VM_PHASE_A_CS_PROBE` and
+    /// `LAMBDA_VM_PHASE_B_MERGE_PROBE` ask ([`Self::from_values`]).
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_values(
+            std::env::var(CS_PROBE_ENV).ok().as_deref(),
+            std::env::var(MERGE_PROBE_ENV).ok().as_deref(),
+        )
     }
 
-    /// [`Self::from_env`]'s reading of its variable.
-    pub fn from_value(value: Option<&str>) -> Self {
-        Self {
-            on: value.map(str::trim) == Some("1"),
+    /// [`Self::from_env`]'s reading of its variables: phase A's unset, empty
+    /// or `0` off, `1` [`CsProbeMode::AfterCommit`], `queue`
+    /// [`CsProbeMode::Lane`]; phase B's unset, empty or `0` off, `1` on.
+    /// Anything else is refused.
+    pub fn from_values(phase_a: Option<&str>, merge: Option<&str>) -> Result<Self, String> {
+        let mode = match phase_a.map(str::trim) {
+            None | Some("" | "0") => CsProbeMode::Off,
+            Some("1") => CsProbeMode::AfterCommit,
+            Some("queue") => CsProbeMode::Lane,
+            Some(v) => {
+                return Err(format!(
+                    "{CS_PROBE_ENV}={v}: 0 (off, the default), 1 (after each commit) or queue \
+                     (a lane beside phase A)"
+                ));
+            }
+        };
+        let merge = match merge.map(str::trim) {
+            None | Some("" | "0") => false,
+            Some("1") => true,
+            Some(v) => {
+                return Err(format!(
+                    "{MERGE_PROBE_ENV}={v}: 0 (off, the default) or 1 (on)"
+                ));
+            }
+        };
+        Ok(Self {
+            mode,
+            merge,
             ..Self::default()
-        }
+        })
+    }
+
+    /// Whether anything is on.
+    pub fn any(&self) -> bool {
+        self.mode != CsProbeMode::Off || self.merge
     }
 }
 
@@ -456,6 +530,12 @@ pub fn cs_probe_lines(stamps: &[GroupStamps]) -> String {
     )
 }
 
+mod zc_lane;
+#[doc(hidden)]
+pub use zc_lane::{
+    LaneDefer, LaneLimits, LaneState, MergeStamp, ZcLaneStamp, merge_probe_lines, zc_lane_lines,
+};
+
 /// The label that opens a group's probe transcript ([`CsProbe`]): no proof's
 /// transcript opens with it.
 const CS_PROBE_LABEL: &[u8; 32] = b"LAMBDAVM_PHASE_A_CS_PROBE_ONLY_1";
@@ -500,8 +580,15 @@ where
         transcript.append_bytes(root);
     }
     let at = if on_card { Where::Device } else { Where::Host };
-    match batched::probe_constraint_sumcheck(tables, bin_log_cells, pack, at, host, &mut transcript)
-    {
+    match batched::probe_constraint_sumcheck(
+        tables,
+        bin_log_cells,
+        pack,
+        at,
+        host,
+        false,
+        &mut transcript,
+    ) {
         Ok(probe) => CsProbeStamp {
             state: CsProbeState::Ran,
             tables: probe.tables,
@@ -2023,6 +2110,10 @@ where
     /// A test's fault ([`Self::fault_commit_ood`]): no chain carries the
     /// answers.
     ood_unbound: bool,
+    /// Phase B runs the merge probe after each group's argue
+    /// ([`CsProbe::merge`]), the host taking a table the card declines when
+    /// `Some(true)`.
+    merge_probe: Option<bool>,
 }
 
 /// A test's fault in a block's commit-time answers
@@ -2171,8 +2262,12 @@ where
     }
 
     /// [`Self::commit_groups_logged`] with the constraint-sumcheck probe
-    /// ([`CsProbe`]) after each group's commit, when it is on. A measurement:
-    /// the commits, the roots and the proof are the same either way.
+    /// ([`CsProbe`]) after each group's commit, when it is on, and phase B's
+    /// merge probe set as it asks. A measurement: the commits, the roots and
+    /// the proof are the same either way.
+    ///
+    /// Under [`CsProbeMode::Lane`] the lane's thread ([`zc_lane`]) runs beside
+    /// the commits, and phase A ends once its job under way has.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_groups_probed<H, T>(
         groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
@@ -2188,10 +2283,77 @@ where
         H: WhirHash,
         T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
     {
+        let lane = (probe.mode == CsProbeMode::Lane && upload_ahead)
+            .then(|| zc_lane::ZcLane::<F, E>::new(&probe, config))
+            .flatten();
+        let Some(lane) = lane else {
+            return Self::commit_groups_with::<H, T>(
+                groups,
+                config,
+                drop_levels,
+                narrow,
+                upload_ahead,
+                mem,
+                spill,
+                &probe,
+                None,
+            );
+        };
+        let (block, close_wait) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| lane.run::<T>());
+            let block = Self::commit_groups_with::<H, T>(
+                groups,
+                config,
+                drop_levels,
+                narrow,
+                upload_ahead,
+                mem,
+                spill,
+                &probe,
+                Some(&lane),
+            );
+            // Phase A's loop ended: the job under way finishes, the rest go.
+            let closing = Instant::now();
+            lane.close();
+            if let Err(panic) = worker.join() {
+                std::panic::resume_unwind(panic);
+            }
+            (block, closing.elapsed().as_secs_f64())
+        });
+        let mut block = block?;
+        for (g, stamp) in lane.into_stamps() {
+            if let Some(stamps) = block.stamps.get_mut(g) {
+                stamps.zc_lane = stamp;
+            }
+        }
+        if let Some(last) = block.stamps.last_mut() {
+            last.zc_lane.close_wait = close_wait;
+        }
+        Ok(block)
+    }
+
+    /// [`Self::commit_groups_probed`]'s phase A, with the lane's handle when
+    /// it runs.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_groups_with<H, T>(
+        groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
+        config: &ChainConfig,
+        drop_levels: multilinear::whir_commit::TreeDrop,
+        narrow: Narrowing,
+        upload_ahead: bool,
+        mem: Option<Arc<BlockMem>>,
+        spill: Option<BlockSpill>,
+        probe: &CsProbe,
+        lane: Option<&zc_lane::ZcLane<'a, F, E>>,
+    ) -> Result<Self, MlError>
+    where
+        H: WhirHash,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+    {
+        let batched = matches!(config.format.argue, ArgueFormat::Batched { .. });
         // The probe runs only where the next group is taken beside a commit,
         // and over a batched argue's constraint sumcheck.
-        let probing =
-            probe.on && upload_ahead && matches!(config.format.argue, ArgueFormat::Batched { .. });
+        let probing = probe.mode == CsProbeMode::AfterCommit && upload_ahead && batched;
         // What this phase A commits of joint runs, and streams of them, and
         // how many commits fell back to the host.
         let runs_from = multilinear::gpu::joint_runs();
@@ -2309,7 +2471,7 @@ where
             multilinear::gpu::reset_reserved_window();
             // The probe reads the group's columns where the commit read them:
             // its tables point at the store until the commit's scope ends.
-            let probe_on_card = probing && store.is_some();
+            let probe_on_card = (probing || lane.is_some()) && store.is_some();
             if probe_on_card && let Some(store) = &store {
                 let mut first = 0usize;
                 for table in group.iter_mut() {
@@ -2329,11 +2491,14 @@ where
                 let (committed, next) = std::thread::scope(|scope| {
                     let (room_tx, room_rx) = std::sync::mpsc::channel::<()>();
                     let columns = &columns;
-                    let (group_ref, next_came, probe) = (&group, &next_came, &probe);
+                    let (group_ref, next_came) = (&group, &next_came);
                     let committer = scope.spawn(move || {
                         let signal = move || {
                             let _ = room_tx.send(());
                         };
+                        if let Some(lane) = lane {
+                            lane.commit_begins();
+                        }
                         let committed = commit_and_retire::<F, E, H, T, _>(
                             group_index,
                             layout,
@@ -2344,6 +2509,19 @@ where
                             &signal,
                         );
                         let commit_end = Instant::now();
+                        // The lane's job: the group's columns held for it.
+                        if let Some(lane) = lane {
+                            if let Ok(done) = &committed {
+                                lane.submit(
+                                    group_index,
+                                    group_ref,
+                                    &done.roots,
+                                    probe_on_card,
+                                    commit_end,
+                                );
+                            }
+                            lane.commit_ends();
+                        }
                         // The probe, when nothing waits to be committed.
                         let probed = match (&committed, probing) {
                             (Ok(done), true) => {
@@ -2474,6 +2652,9 @@ where
                 .add_back(multilinear::stacked_eval::round0_trees(stamp.polys, config).len());
             stamp.commit_host_fallbacks =
                 multilinear::gpu::host_fallbacks().saturating_sub(fallbacks_before);
+            if let Some(lane) = lane {
+                lane.note_growth(stamp.commit_reserved.saturating_sub(stamp.commit_base));
+            }
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
             if let Some(probed) = probed {
@@ -2586,6 +2767,7 @@ where
             sched: false,
             ood,
             ood_unbound: false,
+            merge_probe: (probe.merge && batched).then_some(probe.host),
         })
     }
 
@@ -4250,6 +4432,7 @@ where
         sched,
         ood,
         ood_unbound,
+        merge_probe,
     } = committed;
     let n = sizes.len();
     let mut seen = vec![false; n];
@@ -4408,6 +4591,8 @@ where
         let mut values: Vec<FieldElement<E>> = Vec::new();
         let mut proofs: Vec<TableProof<E>> = Vec::new();
         let mut batched_argue: Option<BatchedArgue<E>> = None;
+        let mut zc_b = 0.0f64;
+        let mut merged = MergeStamp::default();
         let all: &[CommittedTable<'_, F, E>] = &tables;
         let group_ref = &all[at..at + size];
         // Under `upload_beside` off the next group's columns go up at its own
@@ -4490,6 +4675,21 @@ where
                                 faults,
                                 argue.at,
                             )?;
+                            zc_b = batched::take_last_zc_secs();
+                            if let Some(host) = merge_probe {
+                                // A measurement on a throwaway copy of the
+                                // fork: the proof is the same.
+                                merged = zc_lane::run_merge_probe(
+                                    group_ref,
+                                    &z,
+                                    &alpha,
+                                    bin_log_cells,
+                                    pack,
+                                    argue.at,
+                                    host,
+                                    fork.clone(),
+                                );
+                            }
                             for (table, claim) in group_ref.iter().zip(reduced) {
                                 for _ in 0..table.num_committed_columns() {
                                     points.push(claim.point.clone());
@@ -4531,6 +4731,8 @@ where
             }
         };
         argue_result?;
+        stamps[g].zc_b = zc_b;
+        stamps[g].merge = merged;
         stamps[g].argue = argue_end.saturating_duration_since(t).as_secs_f64();
         stamps[g].argue_reserved = multilinear::gpu::reserved_window_peak();
         stamps[g].argue_card = multilinear::gpu::card_window_end();
