@@ -256,4 +256,14 @@ mod ecdas {
     fn ecdas_constraint_set_folder_capture_agree() {
         check_set("ecdas", &EcdasConstraints, cols::NUM_COLUMNS);
     }
+
+    #[test]
+    fn ecdas_halves_constraint_set_folder_capture_agree() {
+        use crate::tables::ecdas::{EcdasHalvesConstraints, halves_cols};
+        check_set(
+            "ecdas halves",
+            &EcdasHalvesConstraints,
+            halves_cols::NUM_COLUMNS,
+        );
+    }
 }
