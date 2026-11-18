@@ -20,7 +20,7 @@
 //! leaves unset, and the driver's first line says how the running process
 //! compares with it.
 
-use multilinear::whir_chain::{ArgueFormat, GkrPack, GroupFold, LeafOrder, Round0Trees};
+use multilinear::whir_chain::{ArgueFormat, GkrLadder, GkrPack, GroupFold, LeafOrder, Round0Trees};
 
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
 use crate::tables::ecdas::EcdasForm;
@@ -485,6 +485,39 @@ pub fn memory_setting(knob: Option<&str>, base_only: bool) -> Result<MemoryForma
     }
 }
 
+/// `BLOCK_WHIR_ARGUE`'s reading against the `production` argue: unset, the
+/// production argue; `batched` (at `cap`, `BLOCK_WHIR_ARGUE_CAP`, when given)
+/// with the production argue's GKR ladder, so the BLAKE3 base's ladder knob
+/// (`LAMBDA_VM_B3_BASE_GKR`) reaches it as it reaches the production argue;
+/// `per-table`, refused when the ladder knob asks for two layers a step, which
+/// a per-table argue has no ladder to take.
+fn argue_setting(
+    word: Option<&str>,
+    cap: Option<usize>,
+    production: ArgueFormat,
+) -> Result<ArgueFormat, String> {
+    match word.map(str::trim) {
+        None => Ok(production),
+        Some("batched") => {
+            let batched = match cap {
+                Some(cap) => ArgueFormat::batched(
+                    u8::try_from(cap)
+                        .map_err(|_| format!("BLOCK_WHIR_ARGUE_CAP={cap}: a cap below 2^256"))?,
+                ),
+                None => ArgueFormat::BATCHED,
+            };
+            Ok(batched.with_ladder(production.ladder()))
+        }
+        Some("per-table") if production.ladder() != GkrLadder::Single => Err(
+            "BLOCK_WHIR_ARGUE=per-table has no GKR ladder to step two layers at a time \
+             (LAMBDA_VM_B3_BASE_GKR)"
+                .to_string(),
+        ),
+        Some("per-table") => Ok(ArgueFormat::PerTable),
+        Some(other) => Err(format!("BLOCK_WHIR_ARGUE={other}: per-table or batched")),
+    }
+}
+
 /// `argue` with its trees laid out per `pack`: only the batched argue has
 /// trees to pack.
 fn with_pack(argue: ArgueFormat, pack: GkrPack) -> Result<ArgueFormat, String> {
@@ -537,18 +570,13 @@ impl WhirTreeConfig {
         let node_domains_early = node_domains_early_setting(count_knob("W3_NODE_DOMAINS_EARLY")?)?;
         let readouts_after = readouts_after_setting(count_knob("W3_READOUTS_AFTER")?)?;
         let leaf_emitters = leaf_emitters_setting(count_knob("W3_LEAF_EMITTERS")?);
-        let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
-            Ok("batched") => match count_knob("BLOCK_WHIR_ARGUE_CAP")? {
-                Some(cap) => ArgueFormat::batched(
-                    u8::try_from(cap)
-                        .map_err(|_| format!("BLOCK_WHIR_ARGUE_CAP={cap}: a cap below 2^256"))?,
-                ),
-                None => ArgueFormat::BATCHED,
-            },
-            Ok("per-table") => ArgueFormat::PerTable,
-            Err(_) => BlockFormat::production().argue,
-            Ok(other) => return Err(format!("BLOCK_WHIR_ARGUE={other}: per-table or batched")),
+        let argue_word = std::env::var("BLOCK_WHIR_ARGUE").ok();
+        let cap = if argue_word.as_deref().map(str::trim) == Some("batched") {
+            count_knob("BLOCK_WHIR_ARGUE_CAP")?
+        } else {
+            None
         };
+        let argue = argue_setting(argue_word.as_deref(), cap, BlockFormat::production().argue)?;
         // Unset, the argue keeps its own packing (the production one when
         // batched); set, the knob's packing replaces it.
         let argue = match std::env::var("BLOCK_WHIR_ARGUE_PACK") {
@@ -5034,6 +5062,41 @@ pub fn verify_whir_block_tree_proof_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ The harness's argue knob carries the production argue's GKR ladder:
+    /// `batched`, at the production cap or another, steps as many layers as
+    /// the production argue does (so the BLAKE3 base's ladder knob is never
+    /// dropped by naming the argue); unset is the production argue; a
+    /// per-table argue under a two-layer ladder is refused; a word it does not
+    /// know is refused.
+    #[test]
+    fn the_argue_knob_keeps_the_production_ladder() {
+        for ladder in [GkrLadder::Single, GkrLadder::Double] {
+            let production = ArgueFormat::BATCHED.with_ladder(ladder);
+            assert_eq!(argue_setting(None, None, production), Ok(production));
+            assert_eq!(
+                argue_setting(Some("batched"), None, production),
+                Ok(ArgueFormat::BATCHED.with_ladder(ladder))
+            );
+            assert_eq!(
+                argue_setting(Some(" batched "), Some(20), production),
+                Ok(ArgueFormat::batched(20).with_ladder(ladder))
+            );
+            assert!(argue_setting(Some("batched"), Some(300), production).is_err());
+            assert!(argue_setting(Some("lockstep"), None, production).is_err());
+        }
+        assert_eq!(
+            argue_setting(Some("per-table"), None, ArgueFormat::BATCHED),
+            Ok(ArgueFormat::PerTable)
+        );
+        let refused = argue_setting(
+            Some("per-table"),
+            None,
+            ArgueFormat::BATCHED.with_ladder(GkrLadder::Double),
+        )
+        .expect_err("a per-table argue has no ladder");
+        assert!(refused.contains("LAMBDA_VM_B3_BASE_GKR"), "{refused}");
+    }
 
     /// With the early leaf first, the tree's order takes
     /// that leaf before every other and is otherwise [`tree_order`]'s: a
