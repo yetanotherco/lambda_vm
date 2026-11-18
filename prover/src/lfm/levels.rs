@@ -342,6 +342,74 @@ pub fn bucket_waves() -> bool {
 /// the same execution and proofs. On by default; only `0` turns it off.
 pub const SETUP_FAST_ENV: &str = "LAMBDA_VM_LEVELS_SETUP_FAST";
 
+/// `LAMBDA_VM_LEVELS_FILL_BESIDE=1`: level 1's fill (its traces filled from
+/// its execution) runs on level 1's own thread as soon as the execution ends,
+/// beside the stacks' commit on the card at the base's end, where it otherwise
+/// runs after that commit. Level 1's prove then starts at the later of the two
+/// rather than after both. The same fill, so the same proofs. Off by default
+/// (and for any word but `1`); read once a process.
+pub const FILL_BESIDE_ENV: &str = "LAMBDA_VM_LEVELS_FILL_BESIDE";
+
+std::thread_local! {
+    /// A test's [`fill_beside`] on this thread.
+    static FILL_BESIDE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`fill_beside`] forced on this thread (`None` restores the
+/// knob). The driver reads it on its own thread.
+#[doc(hidden)]
+pub fn set_fill_beside_for_test(on: Option<bool>) {
+    FILL_BESIDE_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`FILL_BESIDE_ENV`] is on (or this thread's test override).
+pub fn fill_beside() -> bool {
+    if let Some(on) = FILL_BESIDE_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(FILL_BESIDE_ENV).ok().as_deref())
+    })
+}
+
+/// Level 1's execution as its thread hands it on: executed, for the driver to
+/// fill after the stacks' commit, or already filled beside it
+/// ([`fill_beside`]).
+#[allow(clippy::large_enum_variant)] // moved once, from level 1's thread to the driver
+enum Level1Out {
+    Executed(
+        super::executor::LfmExecution,
+        Option<(
+            Result<super::b3l_tables::LeanPrefilled, String>,
+            super::b3l_tables::LeanBesideStats,
+            f64,
+        )>,
+    ),
+    Filled {
+        filled: super::proof::LfmFilled,
+        split: super::executor::ExecSplit,
+        lean: Option<(super::b3l_tables::LeanBesideStats, f64)>,
+        lean_prefilled: bool,
+        fill_split: (f64, f64),
+        lean_parts: (f64, f64),
+        /// The fill's seconds and when it ended (the driver's clock).
+        fill: f64,
+        done: f64,
+    },
+}
+
+/// Level 1's execution as the driver takes it after the base: to fill, or
+/// filled ([`Level1Out`]).
+#[allow(clippy::large_enum_variant)] // moved once, from level 1's thread to the driver
+enum Level1Ready {
+    Executed(
+        super::executor::LfmExecution,
+        Option<super::b3l_tables::LeanPrefilled>,
+    ),
+    Filled(super::proof::LfmFilled, f64),
+}
+
 /// Whether level 1's execution makes its setup the fast way ([`SETUP_FAST_ENV`]).
 pub fn setup_fast() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -997,6 +1065,10 @@ pub struct LevelsTimes {
     pub lean_prefilled: bool,
     pub fill_split: (f64, f64),
     pub lean_parts: (f64, f64),
+    /// Under [`FILL_BESIDE_ENV`], level 1's fill on its own thread beside the
+    /// stacks' commit: its seconds and when it ended (the driver's clock).
+    /// `None` when the driver filled after the commit.
+    pub fill_beside: Option<(f64, f64)>,
     pub levels: Vec<LevelClock>,
     /// Each level's prove stamps ([`super::wlfm::take_wlfm_stamps`]): its
     /// host preparation, phases and groups.
@@ -1206,28 +1278,24 @@ pub fn prove_block_levels(
     let plan_ref = &plan_cell;
     let mut times = LevelsTimes::default();
     // What level 1's thread hands back: when the plan and the program were
-    // ready, the program, its execution, when it could start and when it
-    // ended, its waves before the base ended, and the lean fill beside it
-    // (its result, and when level 1's thread had it).
-    type LeanBeside = (
-        Result<super::b3l_tables::LeanPrefilled, String>,
-        super::b3l_tables::LeanBesideStats,
-        f64,
-    );
+    // ready, its execution (with the lean fill beside it), or the execution
+    // filled ([`Level1Out`]), when it could start and when it ended, and its
+    // waves before the base ended.
     type Level1 = (
         f64,
         f64,
-        super::executor::LfmExecution,
+        Level1Out,
         f64,
         f64,
         usize,
         usize,
         f64,
-        Option<LeanBeside>,
         Option<(f64, f64)>,
         (f64, f64, f64),
         Level1Landing,
     );
+    // Read on the driver's thread (a test's override is that thread's).
+    let fill_beside_on = fill_beside();
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
     let lean_beside = super::wlfm::lean_beside()
@@ -1442,6 +1510,41 @@ pub fn prove_block_levels(
                 }
                 None => None,
             };
+            // Under the knob, level 1 filled here, beside the stacks' commit
+            // the driver makes at the base's end.
+            let execution = if fill_beside_on {
+                let split = execution.split;
+                let (prefilled, lean) = match lean {
+                    Some((prefilled, stats, done)) => (
+                        Some(prefilled.map_err(|e| format!("level 1: {e}"))?),
+                        Some((stats, done)),
+                    ),
+                    None => (None, None),
+                };
+                let t = std::time::Instant::now();
+                let filled = super::proof::lfm_fill_executed_prefilled(
+                    program,
+                    execution,
+                    hasher,
+                    executed - execute_from,
+                    &Vec::new(),
+                    super::wlfm::chip_records(),
+                    prefilled,
+                );
+                let fill = t.elapsed().as_secs_f64();
+                Level1Out::Filled {
+                    lean_prefilled: filled.lean_prefilled(),
+                    fill_split: super::proof::take_fill_split().unwrap_or_default(),
+                    lean_parts: super::proof::take_lean_parts().unwrap_or_default(),
+                    filled,
+                    split,
+                    lean,
+                    fill,
+                    done: now(),
+                }
+            } else {
+                Level1Out::Executed(execution, lean)
+            };
             Ok((
                 planned,
                 emitted,
@@ -1451,7 +1554,6 @@ pub fn prove_block_levels(
                 npieces,
                 waves_before,
                 wave_secs_before,
-                lean,
                 validated,
                 emit_split,
                 landing,
@@ -1532,24 +1634,49 @@ pub fn prove_block_levels(
         npieces,
         waves,
         wave_secs,
-        lean,
         validated,
         emit_split,
         landing,
     ) = level1.map_err(|_| "level 1's thread panicked")??;
     times.landing = landing;
-    times.level1_exec = Some(execution.split);
     times.validated_beside = validated;
     times.emit_split = emit_split;
     // A lean fill beside that was fed a compression twice, or missed one, is
-    // refused here: never a wrong count handed to the prove.
-    let lean = match lean {
-        Some((prefilled, stats, done)) => {
-            let prefilled = prefilled.map_err(|e| format!("level 1: {e}"))?;
-            times.lean_beside = Some((stats, (done - executed).max(0.0)));
-            Some(prefilled)
+    // refused here (or on level 1's thread, filled beside): never a wrong
+    // count handed to the prove.
+    let execution = match execution {
+        Level1Out::Executed(execution, lean) => {
+            times.level1_exec = Some(execution.split);
+            let lean = match lean {
+                Some((prefilled, stats, done)) => {
+                    let prefilled = prefilled.map_err(|e| format!("level 1: {e}"))?;
+                    times.lean_beside = Some((stats, (done - executed).max(0.0)));
+                    Some(prefilled)
+                }
+                None => None,
+            };
+            Level1Ready::Executed(execution, lean)
         }
-        None => None,
+        Level1Out::Filled {
+            filled,
+            split,
+            lean,
+            lean_prefilled,
+            fill_split,
+            lean_parts,
+            fill,
+            done,
+        } => {
+            times.level1_exec = Some(split);
+            if let Some((stats, lean_done)) = lean {
+                times.lean_beside = Some((stats, (lean_done - executed).max(0.0)));
+            }
+            times.lean_prefilled = lean_prefilled;
+            times.fill_split = fill_split;
+            times.lean_parts = lean_parts;
+            times.fill_beside = Some((fill, done));
+            Level1Ready::Filled(filled, fill)
+        }
     };
     let program = program_cell.into_inner().ok_or("no level 1 program")?;
     times.planned = planned;
@@ -1610,24 +1737,30 @@ pub fn prove_block_levels(
             level_more(stop, count, build).then(|| scope.spawn(move || prepare_next(child, family)))
         };
         let mut next = spawn_next(&levels[0].build, 1);
-        let t = std::time::Instant::now();
-        let filled = super::proof::lfm_fill_executed_prefilled(
-            &levels[0].program,
-            execution,
-            levels[0].build.artifacts.hasher,
-            executed - execute_from,
-            &Vec::new(),
-            super::wlfm::chip_records(),
-            lean,
-        );
-        let fill = t.elapsed().as_secs_f64();
+        let (filled, fill) = match execution {
+            Level1Ready::Executed(execution, lean) => {
+                let t = std::time::Instant::now();
+                let filled = super::proof::lfm_fill_executed_prefilled(
+                    &levels[0].program,
+                    execution,
+                    levels[0].build.artifacts.hasher,
+                    executed - execute_from,
+                    &Vec::new(),
+                    super::wlfm::chip_records(),
+                    lean,
+                );
+                let fill = t.elapsed().as_secs_f64();
+                times.lean_prefilled = filled.lean_prefilled();
+                times.fill_split = super::proof::take_fill_split().unwrap_or_default();
+                times.lean_parts = super::proof::take_lean_parts().unwrap_or_default();
+                (filled, fill)
+            }
+            Level1Ready::Filled(filled, fill) => (filled, fill),
+        };
         release_program(&mut levels[0].program, &mut times.sizes);
         // What the execution and the program held, back to the OS on a
         // thread of its own beside the prove.
         let purge_filled = scope.spawn(crate::alloc_purge::purge_now);
-        times.lean_prefilled = filled.lean_prefilled();
-        times.fill_split = super::proof::take_fill_split().unwrap_or_default();
-        times.lean_parts = super::proof::take_lean_parts().unwrap_or_default();
         if let Some(r) = resident_now() {
             times.resident.push(("level 1 filled", r));
         }
