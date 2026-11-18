@@ -1924,6 +1924,40 @@ fn parse_stream_keccak_rnd(value: Option<&str>) -> Result<Option<bool>, Error> {
     }
 }
 
+/// The knob of [`own_keccak_rnd_groups`].
+const KECCAK_RND_OWN_GROUPS_ENV: &str = "LAMBDA_VM_KECCAK_RND_OWN_GROUPS";
+
+/// Whether KECCAK_RND's streamed tables are packed into groups of their own
+/// ([`OwnGroups`]) instead of among the other streamed chunks in arrival order:
+/// a deviation's choice, else `LAMBDA_VM_KECCAK_RND_OWN_GROUPS` (off by
+/// default). Among the 2^21-row chunks the 2^16-row tables stack worse than in
+/// groups of their own (four a group, as the finish's are packed), and each
+/// stacked polynomial more costs phase B its opening. Only with KECCAK_RND
+/// streamed ([`stream_keccak_rnd_records`]). The tables and their words are the
+/// same; the groups (the prover's, bound in the statement) are not.
+fn own_keccak_rnd_groups(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => {
+            parse_own_keccak_rnd_groups(std::env::var(KECCAK_RND_OWN_GROUPS_ENV).ok().as_deref())
+        }
+    }
+}
+
+/// `LAMBDA_VM_KECCAK_RND_OWN_GROUPS`: `1` packs KECCAK_RND's streamed tables in
+/// groups of their own; unset, empty or `0` (the default) among the other
+/// streamed chunks. Anything else refuses the prove.
+fn parse_own_keccak_rnd_groups(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{KECCAK_RND_OWN_GROUPS_ENV}={v}: 0 (the default: among the streamed chunks) or 1 \
+             (KECCAK_RND's streamed tables in groups of their own)"
+        ))),
+    }
+}
+
 /// The knob of [`rest_airs_beside`].
 const REST_AIRS_BESIDE_ENV: &str = "LAMBDA_VM_REST_AIRS_BESIDE";
 
@@ -4703,6 +4737,10 @@ pub(crate) struct Deviations {
     /// built at the finish (`Some(false)`), instead of the knob
     /// ([`stream_keccak_rnd_records`]).
     pub stream_keccak_rnd: Option<bool>,
+    /// KECCAK_RND's streamed tables in groups of their own (`Some(true)`) or
+    /// among the other streamed chunks (`Some(false)`), instead of the knob
+    /// ([`own_keccak_rnd_groups`]).
+    pub keccak_rnd_own_groups: Option<bool>,
     /// With the AIR set built beside them, each early KECCAK_RND table laid
     /// out with the AIR named for the next table: an AIR the run's set does
     /// not have at that place, which the prove must refuse.
@@ -6188,7 +6226,9 @@ enum Key {
 type Placed<'a> = (usize, (usize, usize), CommittedTable<'a, F, E>);
 
 /// Packs tables, in the order they come, into groups of at most `max_polys`
-/// stacked polynomials, and sends each group to phase A as it closes.
+/// stacked polynomials, and sends each group to phase A as it closes. With
+/// [`Self::own`], KECCAK_RND's streamed chunks are packed apart, in groups of
+/// their own ([`OwnGroups`]).
 struct Packer<'a> {
     open: Vec<CommittedTable<'a, F, E>>,
     open_shapes: Vec<(usize, usize)>,
@@ -6208,17 +6248,78 @@ struct Packer<'a> {
     /// A memory log, and the open group's bytes in it.
     ledger: Option<&'a memlog::Ledger>,
     open_bytes: usize,
+    /// KECCAK_RND's streamed chunks' own open group, when they are packed
+    /// apart (`None`: packed with the others).
+    own: Option<OwnGroups<'a>>,
+}
+
+/// KECCAK_RND's streamed chunks packed apart from the other streamed chunks
+/// ([`own_keccak_rnd_groups`]): its open group, the hand-out place of each
+/// table of either open group, and the regeneration recorder told each closed
+/// group's places, since the groups then close out of hand-out order.
+struct OwnGroups<'a> {
+    open: Vec<CommittedTable<'a, F, E>>,
+    shapes: Vec<(usize, usize)>,
+    keys: Vec<Key>,
+    places: Vec<Option<usize>>,
+    bytes: usize,
+    /// The other open group's tables' hand-out places.
+    main_places: Vec<Option<usize>>,
+    /// The streamed chunks placed so far: the next one's hand-out place.
+    placed: usize,
+    recorder: Option<&'a regen::Recorder>,
 }
 
 impl<'a> Packer<'a> {
     /// A group closes, and goes to the card, when the next table would take
-    /// it past its polynomial budget.
+    /// it past its polynomial budget. Under [`Self::own`] a KECCAK_RND chunk
+    /// joins its own open group, which closes by the same rule, and is closed
+    /// as it stands before the rest's first table.
     fn place(
         &mut self,
         key: Key,
         shape: (usize, usize),
         table: CommittedTable<'a, F, E>,
     ) -> Result<(), Error> {
+        let place = self.own.as_mut().and_then(|own| match key {
+            Key::Streamed(..) => {
+                own.placed += 1;
+                Some(own.placed - 1)
+            }
+            Key::Air(_) => None,
+        });
+        if let Some(own) = self.own.as_mut() {
+            if let Key::Streamed(StreamTable::KeccakRnd, _) = key {
+                own.shapes.push(shape);
+                let polys = stark::multilinear_table::global_layout(&own.shapes, self.cap)
+                    .map_err(|e| Error::Prover(format!("{e:?}")))?
+                    .num_polys();
+                if polys > self.max_polys && !own.open.is_empty() {
+                    self.close_own()?;
+                }
+                let own = self.own.as_mut().expect("packed apart");
+                if own.shapes.is_empty() {
+                    own.shapes.push(shape);
+                }
+                let bytes = self.ledger.map_or(0, |ledger| {
+                    let bytes = memlog::table_bytes(&table);
+                    ledger
+                        .open
+                        .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+                    bytes
+                });
+                own.bytes += bytes;
+                own.open.push(table);
+                own.keys.push(key);
+                own.places.push(place);
+                return Ok(());
+            }
+            // The rest begins: KECCAK_RND's open group goes first, so every
+            // streamed chunk is committed before the rest's first table.
+            if matches!(key, Key::Air(_)) && !own.open.is_empty() {
+                self.close_own()?;
+            }
+        }
         self.open_shapes.push(shape);
         let polys = stark::multilinear_table::global_layout(&self.open_shapes, self.cap)
             .map_err(|e| Error::Prover(format!("{e:?}")))?
@@ -6243,10 +6344,46 @@ impl<'a> Packer<'a> {
         }
         self.open.push(table);
         self.open_keys.push(key);
+        if let Some(own) = self.own.as_mut() {
+            own.main_places.push(place);
+        }
         Ok(())
     }
 
     fn close(&mut self) -> Result<(), Error> {
+        let tables = std::mem::take(&mut self.open);
+        let keys = std::mem::take(&mut self.open_keys);
+        let bytes = std::mem::take(&mut self.open_bytes);
+        let places = self
+            .own
+            .as_mut()
+            .map(|own| std::mem::take(&mut own.main_places));
+        self.send(tables, keys, bytes, places)
+    }
+
+    /// KECCAK_RND's own open group, closed and sent.
+    fn close_own(&mut self) -> Result<(), Error> {
+        let Some(own) = self.own.as_mut() else {
+            return Ok(());
+        };
+        let tables = std::mem::take(&mut own.open);
+        let keys = std::mem::take(&mut own.keys);
+        let bytes = std::mem::take(&mut own.bytes);
+        let places = std::mem::take(&mut own.places);
+        own.shapes.clear();
+        self.send(tables, keys, bytes, Some(places))
+    }
+
+    /// One group to phase A: its tables, keys and ledger bytes, and under
+    /// [`Self::own`] each table's hand-out place, told to the recorder before
+    /// phase A can take the group.
+    fn send(
+        &mut self,
+        tables: Vec<CommittedTable<'a, F, E>>,
+        keys: Vec<Key>,
+        bytes: usize,
+        places: Option<Vec<Option<usize>>>,
+    ) -> Result<(), Error> {
         // As its groups close the prover knows only how far the block got, not
         // its total: the refusal says so, so the index is not read as a count.
         let reached = self.group_keys.len() + 1;
@@ -6258,24 +6395,32 @@ impl<'a> Packer<'a> {
         }
         if let Some(ledger) = self.ledger {
             use std::sync::atomic::Ordering::Relaxed;
-            let bytes = std::mem::take(&mut self.open_bytes);
             ledger.open.fetch_sub(bytes, Relaxed);
             ledger.sent.fetch_add(bytes, Relaxed);
         }
-        self.group_keys.push(std::mem::take(&mut self.open_keys));
+        if let (Some(places), Some(recorder)) =
+            (places, self.own.as_ref().and_then(|own| own.recorder))
+        {
+            recorder.committed(&places);
+        }
+        self.group_keys.push(keys);
         self.closed_at.push(self.start.elapsed().as_secs_f64());
         let t = Instant::now();
         let sent = self
             .out
-            .send(std::mem::take(&mut self.open))
+            .send(tables)
             .map_err(|_| Error::Prover("phase A stopped".into()));
         self.blocked += t.elapsed().as_secs_f64();
         sent
     }
 
-    /// Sends the last group; hands back every group's tables, when each
-    /// closed and the seconds spent waiting on phase A.
+    /// Sends the last groups (KECCAK_RND's own first, if any is open); hands
+    /// back every group's tables, when each closed and the seconds spent
+    /// waiting on phase A.
     fn finish(mut self) -> Result<Packed, Error> {
+        if self.own.as_ref().is_some_and(|own| !own.open.is_empty()) {
+            self.close_own()?;
+        }
         if !self.open.is_empty() {
             self.close()?;
         }
@@ -7438,10 +7583,13 @@ fn prove_streamed(
             // Class 0: the streamed chunks (the replay); class 1: KECCAK_RND's
             // and LT's tables of the rest (the kept lists, N3).
             multilinear_block::BlockRegen::new(
+                // A streamed chunk's rank is its hand-out place, which is its
+                // block index unless phase A commits out of hand-out order
+                // (KECCAK_RND's own groups: [`Recorder::handout_place`]).
                 std::sync::Arc::new(move |t| {
                     recorder
-                        .chunk_at(t)
-                        .map(|_| (0, t as u64))
+                        .handout_place(t)
+                        .and_then(|r| recorder.chunk_at(r).map(|_| (0, r as u64)))
                         .or_else(|| recorder.rest_at(t).map(|_| (1, t as u64)))
                 }),
                 &match deviations.regen_windows {
@@ -7656,6 +7804,21 @@ fn prove_streamed(
                 "built at the finish"
             }
         );
+        let own_groups =
+            stream_keccak_rnd && own_keccak_rnd_groups(deviations.keccak_rnd_own_groups)?;
+        if stream_keccak_rnd {
+            eprintln!(
+                "★ BLOCK KECCAK_RND GROUPS: {} ({KECCAK_RND_OWN_GROUPS_ENV})",
+                if own_groups {
+                    "the streamed tables packed in groups of their own"
+                } else {
+                    "the streamed tables packed among the other chunks (the default)"
+                }
+            );
+        }
+        if let (true, Some(recorder)) = (own_groups, recorder) {
+            recorder.commits_out_of_order();
+        }
         // Under the in-row register format MEMW_R's slot holds the residual
         // register table, which the host builds (MEMW_R's kernel fills MEMW_R's
         // columns, never the residual table's): MEMW_R's records, its words and
@@ -8371,6 +8534,16 @@ fn prove_streamed(
                     blocked: 0.0,
                     ledger,
                     open_bytes: 0,
+                    own: own_groups.then(|| OwnGroups {
+                        open: Vec::new(),
+                        shapes: Vec::new(),
+                        keys: Vec::new(),
+                        places: Vec::new(),
+                        bytes: 0,
+                        main_places: Vec::new(),
+                        placed: 0,
+                        recorder,
+                    }),
                 };
                 // Off the inline path, the prepared columns wait until the
                 // groups are sent.
@@ -11657,6 +11830,7 @@ mod packer_tests {
                 blocked: 0.0,
                 ledger: None,
                 open_bytes: 0,
+                own: None,
             };
             for (index, &ops) in heights.iter().enumerate() {
                 let ops: Vec<LtOperation> = (0..ops as u64)
@@ -12306,6 +12480,22 @@ mod rest_airs_beside_tests {
         );
         for bad in ["yes", "2", "on", "off"] {
             assert!(super::parse_stream_keccak_rnd(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// KECCAK_RND's own groups knob: off unset, empty or `0` (the default);
+    /// on at `1`; any other word refuses.
+    #[test]
+    fn the_keccak_rnd_own_groups_knob_is_off_by_default_and_refuses_other_words() {
+        for off in [None, Some(""), Some("0"), Some(" 0\n")] {
+            assert!(!super::parse_own_keccak_rnd_groups(off).expect("a word it takes"));
+        }
+        assert!(super::parse_own_keccak_rnd_groups(Some("1")).expect("on"));
+        for bad in ["yes", "2", "on"] {
+            assert!(
+                super::parse_own_keccak_rnd_groups(Some(bad)).is_err(),
+                "{bad}"
+            );
         }
     }
 

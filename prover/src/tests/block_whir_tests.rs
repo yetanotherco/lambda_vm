@@ -5454,6 +5454,154 @@ fn streamed_keccak_rnd_chunks_keep_the_regenerators_ranks() {
     }
 }
 
+/// ★ KECCAK_RND's streamed tables in groups of their own
+/// ([`Deviations::keccak_rnd_own_groups`], the `LAMBDA_VM_KECCAK_RND_OWN_GROUPS`
+/// knob, off by default): every group holding a streamed KECCAK_RND table
+/// holds KECCAK_RND's tables alone, the tables and statement counts are the
+/// arrival-order packing's, and the proof verifies under the unchanged
+/// verifier. Unset is off (the same partition); under the deterministic grind
+/// the bytes of unset and off are equal, and the own groups' twice.
+#[test]
+fn keccak_rnd_in_its_own_groups_proves_and_verifies() {
+    let _fills = records_fill_lock();
+    let elf = asm_elf_bytes("test_keccak_multi");
+    // A stack a few KECCAK_RND tables of 2^5 rows share with the chunks.
+    let mut format = many_groups();
+    format.zf.whir_stack = StackVars::new(16).expect("a valid stack");
+    format.group_polys = 3;
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let proved = |own: Option<bool>| {
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                card_fill: Some(true),
+                stream_keccak_rnd: Some(true),
+                keccak_rnd_own_groups: own,
+                ..Deviations::default()
+            },
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "own {own:?}");
+        (proof, stamps)
+    };
+    let (unset, _) = proved(None);
+    let (off, off_stamps) = proved(Some(false));
+    let (own, own_stamps) = proved(Some(true));
+    let range = block_whir::chunked_table_ranges(&own.table_counts)
+        .into_iter()
+        .find(|(name, ..)| *name == "KECCAK_RND")
+        .map(|(_, range, _)| range)
+        .expect("KECCAK_RND's range");
+    let kr = |t: &u32| range.contains(&(*t as usize));
+    // The finish's KECCAK_RND tables, handed on first, may share the rest's
+    // first group; every other group with a KECCAK_RND table holds only them.
+    let mixed = |p: &BlockWhirProof| {
+        p.groups
+            .iter()
+            .filter(|g| g.iter().any(kr) && !g.iter().all(kr))
+            .count()
+    };
+    assert!(own_stamps.streamed.1 > off_stamps.streamed.1 / 2 && own_stamps.streamed.1 > 0);
+    assert_eq!(
+        own_stamps.streamed.1, off_stamps.streamed.1,
+        "the same hand-out"
+    );
+    let alone = |p: &BlockWhirProof| p.groups.iter().filter(|g| g.iter().all(kr)).count();
+    // At this stack the arrival order mixes the streamed tables with the
+    // chunks; their own groups hold them alone.
+    assert!(
+        mixed(&off) >= 1 && alone(&off) == 0,
+        "off: {:?}",
+        off.groups
+    );
+    assert!(
+        mixed(&own) <= 1 && alone(&own) >= 1,
+        "own groups: {:?}",
+        own.groups
+    );
+    assert_ne!(own.groups, off.groups, "the partition did not move");
+    assert_eq!(unset.groups, off.groups, "unset is off");
+    assert_eq!(own.table_num_vars, off.table_num_vars);
+    assert_eq!(
+        format!("{:?}", own.table_counts),
+        format!("{:?}", off.table_counts)
+    );
+    let sorted = |p: &BlockWhirProof| {
+        let mut v: Vec<u32> = p.groups.iter().flatten().copied().collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(sorted(&own), sorted(&off), "the same tables");
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&unset), bytes(&off), "unset is off, byte for byte");
+        let (again, _) = proved(Some(true));
+        assert_eq!(bytes(&own), bytes(&again), "own groups, twice");
+    }
+}
+
+/// ★ KECCAK_RND's own groups close out of hand-out order, and live
+/// regeneration still names each dropped chunk by its hand-out place: with
+/// every streamed chunk it can dropped, no mismatch, and the proof is the one
+/// without regeneration.
+#[test]
+fn keccak_rnd_in_its_own_groups_keeps_the_regenerators_ranks() {
+    let _fills = records_fill_lock();
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    // The stack at which KECCAK_RND's own group commits ahead of chunks handed
+    // out before it ([`keccak_rnd_in_its_own_groups_proves_and_verifies`]).
+    let mut format = many_groups();
+    format.zf.whir_stack = StackVars::new(16).expect("a valid stack");
+    format.group_polys = 3;
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    for card_fill in [false, true] {
+        let arm = |mode| {
+            regenerated(
+                &elf,
+                &format,
+                mode,
+                Deviations {
+                    card_fill: Some(card_fill),
+                    stream_keccak_rnd: Some(true),
+                    keccak_rnd_own_groups: Some(true),
+                    ..Deviations::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("card fill {card_fill}, {mode:?}: {e:?}"))
+        };
+        let (plain, _) = arm(RegenMode::Off);
+        let (dropped, stamps) = arm(RegenMode::Always);
+        let what = format!("card fill {card_fill}");
+        let r = stamps.regen.as_ref().expect("live regeneration's readout");
+        assert_eq!((r.mismatches, r.failed), (0, 0), "{what}: {:?}", r.lines);
+        assert!(r.error.is_none(), "{what}: {:?}", r.lines);
+        assert!(
+            r.dropped > r.rest_dropped && r.regenerated >= r.dropped,
+            "{what}: no streamed chunk dropped and rebuilt: {:?}",
+            r.lines
+        );
+        assert!(verify(&dropped, &elf, &format), "{what}: regenerated");
+        assert_eq!(dropped.groups, plain.groups, "{what}: the partition");
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(&dropped), bytes(&plain), "{what}: the proof");
+        }
+    }
+}
+
 /// ★ A streamed KECCAK_RND proof refuses what the streamed tables could get
 /// wrong: a wrong table (its records starting a row late, the streamed chunks'
 /// and the finish's alike: the prover makes a proof the verifier refuses), and
@@ -5462,6 +5610,20 @@ fn streamed_keccak_rnd_chunks_keep_the_regenerators_ranks() {
 /// in two groups, or left out.
 #[test]
 fn a_streamed_keccak_rnd_proof_refuses_a_wrong_table_and_a_tampered_partition() {
+    refuses_a_wrong_table_and_a_tampered_partition(Some(false));
+}
+
+/// ★ [`a_streamed_keccak_rnd_proof_refuses_a_wrong_table_and_a_tampered_partition`]
+/// with KECCAK_RND's streamed tables packed in groups of their own
+/// ([`Deviations::keccak_rnd_own_groups`]).
+#[test]
+fn keccak_rnd_in_its_own_groups_refuses_a_wrong_table_and_a_tampered_partition() {
+    refuses_a_wrong_table_and_a_tampered_partition(Some(true));
+}
+
+/// The two tests' body: `own`, KECCAK_RND's streamed tables in groups of
+/// their own or not.
+fn refuses_a_wrong_table_and_a_tampered_partition(own: Option<bool>) {
     let _fills = records_fill_lock();
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
@@ -5478,6 +5640,7 @@ fn a_streamed_keccak_rnd_proof_refuses_a_wrong_table_and_a_tampered_partition() 
                 card_fill: Some(true),
                 card_fill_records_fault: fault,
                 stream_keccak_rnd: Some(true),
+                keccak_rnd_own_groups: own,
                 ..Deviations::default()
             },
         )
