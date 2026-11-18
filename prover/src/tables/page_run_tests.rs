@@ -543,6 +543,59 @@ fn the_page_run_bench_is_accepted_at_every_run_and_is_todays_with_runs_off() {
     );
 }
 
+/// ★ Blocks of 16 and 64 pages, the proposed size and the cap, on the bench:
+/// 64 zero pages from page 64 (aligned to 64) are four blocks of 16 at runs of
+/// 16 and one block of 64 at runs of 64. Words written and read back across
+/// each 16-page block's last internal page boundary (rows `2^15·15 − 1` and
+/// `2^15·15`, the 64-page block's rows `2^15·63 − 1` and `2^15·63` among them),
+/// at each block's first and last rows, balance at both runs; a final word
+/// moved at the 64-page block's last internal boundary is refused by the word
+/// bus alone.
+#[test]
+fn blocks_of_16_and_64_pages_hold_their_last_internal_boundaries() {
+    let base = 64 * PAGE;
+    let mut m = Model::new(run(base, 64, PageConfig::zero_init));
+    let mut ts = 8;
+    for block in 0..4u64 {
+        let start = base + block * 16 * PAGE;
+        for ptr in [start, start + 15 * PAGE - 8, start + 16 * PAGE - 16] {
+            m.write(ptr, ts, [ts, u64::MAX - ts]);
+            m.read(ptr, ts + 4);
+            ts += 8;
+        }
+    }
+    for (run_log2, blocks, pages) in [(4u8, 4usize, 16usize), (6, 1, 64)] {
+        let tables = page_tables(&m.pages, run_log2).expect("cut");
+        assert_eq!(
+            tables
+                .iter()
+                .map(|t| (t.kind, t.pages()))
+                .collect::<Vec<_>>(),
+            vec![(PageTableKind::Zero, pages); blocks]
+        );
+        let bench = bench_runs(&m, run_log2);
+        let v = verdict(&bench);
+        assert!(v.accepted(), "at 2^{run_log2}: {v:?}");
+        let last = &tables[blocks - 1];
+        let piece = bench.piece(&last.name());
+        assert_eq!(piece.trace.num_rows(), pages * page_w::ROWS);
+        let edge = (pages - 1) * page_w::ROWS;
+        let at = |r: usize, c: usize| piece.trace.get_main(r, c).canonical_u64();
+        assert_eq!(
+            (at(edge - 1, zw::OFFSET), at(edge, zw::OFFSET)),
+            (edge as u64 - 1, edge as u64)
+        );
+        assert!(at(edge - 1, zw::TIMESTAMP) > 0 && at(edge, zw::TIMESTAMP) > 0);
+        if run_log2 == 6 {
+            let mut forged = bench.clone();
+            let v = forged.get(&last.name(), edge, zw::FINI_LO) + FE::one();
+            forged.set(&last.name(), edge, zw::FINI_LO, v);
+            let v = verdict(&forged);
+            assert!(v.refused_only_on(BusId::MemWord), "{v:?}");
+        }
+    }
+}
+
 /// A bench's piece `name` replaced by `piece`.
 fn replace(bench: &mut Bench, name: &str, piece: Piece) {
     let at = bench
