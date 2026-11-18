@@ -5420,6 +5420,9 @@ fn streamed_keccak_rnd_chunks_keep_the_regenerators_ranks() {
                 Deviations {
                     card_fill: Some(card_fill),
                     stream_keccak_rnd: Some(true),
+                    // Among the chunks, in hand-out order (the own groups'
+                    // ranks: `keccak_rnd_in_its_own_groups_keeps_the_regenerators_ranks`).
+                    keccak_rnd_own_groups: Some(false),
                     ..Deviations::default()
                 },
             )
@@ -5454,11 +5457,11 @@ fn streamed_keccak_rnd_chunks_keep_the_regenerators_ranks() {
 
 /// ★ KECCAK_RND's streamed tables in groups of their own
 /// ([`Deviations::keccak_rnd_own_groups`], the `LAMBDA_VM_KECCAK_RND_OWN_GROUPS`
-/// knob, off by default): every group holding a streamed KECCAK_RND table
+/// knob, on by default): every group holding a streamed KECCAK_RND table
 /// holds KECCAK_RND's tables alone, the tables and statement counts are the
 /// arrival-order packing's, and the proof verifies under the unchanged
-/// verifier. Unset is off (the same partition); under the deterministic grind
-/// the bytes of unset and off are equal, and the own groups' twice.
+/// verifier. Unset is on (the same partition); under the deterministic grind
+/// the bytes of unset and on are equal, and the own groups' twice.
 #[test]
 fn keccak_rnd_in_its_own_groups_proves_and_verifies() {
     let _fills = records_fill_lock();
@@ -5528,7 +5531,7 @@ fn keccak_rnd_in_its_own_groups_proves_and_verifies() {
         own.groups
     );
     assert_ne!(own.groups, off.groups, "the partition did not move");
-    assert_eq!(unset.groups, off.groups, "unset is off");
+    assert_eq!(unset.groups, own.groups, "unset is on");
     assert_eq!(own.table_num_vars, off.table_num_vars);
     assert_eq!(
         format!("{:?}", own.table_counts),
@@ -5541,7 +5544,7 @@ fn keccak_rnd_in_its_own_groups_proves_and_verifies() {
     };
     assert_eq!(sorted(&own), sorted(&off), "the same tables");
     if crypto::grinding::deterministic() {
-        assert_eq!(bytes(&unset), bytes(&off), "unset is off, byte for byte");
+        assert_eq!(bytes(&unset), bytes(&own), "unset is on, byte for byte");
         let (again, _) = proved(Some(true));
         assert_eq!(bytes(&own), bytes(&again), "own groups, twice");
     }

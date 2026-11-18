@@ -1498,10 +1498,12 @@ const KECCAK_RND_OWN_GROUPS_ENV: &str = "LAMBDA_VM_KECCAK_RND_OWN_GROUPS";
 
 /// Whether KECCAK_RND's streamed tables are packed into groups of their own
 /// ([`OwnGroups`]) instead of among the other streamed chunks in arrival order:
-/// a deviation's choice, else `LAMBDA_VM_KECCAK_RND_OWN_GROUPS` (off by
+/// a deviation's choice, else `LAMBDA_VM_KECCAK_RND_OWN_GROUPS` (on by
 /// default). Among the 2^21-row chunks the 2^16-row tables stack worse than in
 /// groups of their own (four a group, as the finish's are packed), and each
-/// stacked polynomial more costs phase B its opening. Only with KECCAK_RND
+/// stacked polynomial more costs phase B its opening: on by default, the
+/// large block's phase B 0.21 s and its prove 0.26 s shorter (the median's
+/// prove 0.09 s), three stacked polynomials fewer. Only with KECCAK_RND
 /// streamed ([`stream_keccak_rnd_records`]). The tables and their words are the
 /// same; the groups (the prover's, bound in the statement) are not.
 fn own_keccak_rnd_groups(deviation: Option<bool>) -> Result<bool, Error> {
@@ -1513,16 +1515,16 @@ fn own_keccak_rnd_groups(deviation: Option<bool>) -> Result<bool, Error> {
     }
 }
 
-/// `LAMBDA_VM_KECCAK_RND_OWN_GROUPS`: `1` packs KECCAK_RND's streamed tables in
-/// groups of their own; unset, empty or `0` (the default) among the other
-/// streamed chunks. Anything else refuses the prove.
+/// `LAMBDA_VM_KECCAK_RND_OWN_GROUPS`: unset, empty or `1` (the default) packs
+/// KECCAK_RND's streamed tables in groups of their own; `0` among the other
+/// streamed chunks (the rollback). Anything else refuses the prove.
 fn parse_own_keccak_rnd_groups(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
+        None | Some("" | "1") => Ok(true),
+        Some("0") => Ok(false),
         Some(v) => Err(Error::Prover(format!(
-            "{KECCAK_RND_OWN_GROUPS_ENV}={v}: 0 (the default: among the streamed chunks) or 1 \
-             (KECCAK_RND's streamed tables in groups of their own)"
+            "{KECCAK_RND_OWN_GROUPS_ENV}={v}: 1 (the default: KECCAK_RND's streamed tables in \
+             groups of their own) or 0 (among the streamed chunks)"
         ))),
     }
 }
@@ -7379,9 +7381,9 @@ fn prove_streamed(
             eprintln!(
                 "★ BLOCK KECCAK_RND GROUPS: {} ({KECCAK_RND_OWN_GROUPS_ENV})",
                 if own_groups {
-                    "the streamed tables packed in groups of their own"
+                    "the streamed tables packed in groups of their own (the default)"
                 } else {
-                    "the streamed tables packed among the other chunks (the default)"
+                    "the streamed tables packed among the other chunks"
                 }
             );
         }
@@ -12052,14 +12054,14 @@ mod rest_airs_beside_tests {
         }
     }
 
-    /// KECCAK_RND's own groups knob: off unset, empty or `0` (the default);
-    /// on at `1`; any other word refuses.
+    /// KECCAK_RND's own groups knob: on unset, empty or `1` (the default);
+    /// off at `0` (the rollback); any other word refuses.
     #[test]
-    fn the_keccak_rnd_own_groups_knob_is_off_by_default_and_refuses_other_words() {
-        for off in [None, Some(""), Some("0"), Some(" 0\n")] {
-            assert!(!super::parse_own_keccak_rnd_groups(off).expect("a word it takes"));
+    fn the_keccak_rnd_own_groups_knob_is_on_by_default_and_refuses_other_words() {
+        for on in [None, Some(""), Some("1"), Some(" 1\n")] {
+            assert!(super::parse_own_keccak_rnd_groups(on).expect("a word it takes"));
         }
-        assert!(super::parse_own_keccak_rnd_groups(Some("1")).expect("on"));
+        assert!(!super::parse_own_keccak_rnd_groups(Some("0")).expect("off"));
         for bad in ["yes", "2", "on"] {
             assert!(
                 super::parse_own_keccak_rnd_groups(Some(bad)).is_err(),
