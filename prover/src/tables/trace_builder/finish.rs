@@ -48,6 +48,9 @@ pub(crate) struct RestHeader {
     /// The word memory format's tables, family by family (none under any other
     /// format), counted apart as the fused ones.
     pub(crate) word_counts: [usize; 7],
+    /// The page runs the plan cut its page tables at
+    /// ([`StreamSkip::page_run_log2`]): one table a page at 0.
+    pub(crate) page_run_log2: u8,
 }
 
 impl RestHeader {
@@ -1036,6 +1039,13 @@ impl<'a> FinishPlan<'a> {
                 "the word memory format proves a whole run, not a continuation epoch".to_string(),
             ));
         }
+        // Page runs cut PAGE_W's tables: the word memory format's alone.
+        if skip.page_run_log2 > 0 && !words {
+            return Err(Error::Prover(format!(
+                "page runs (2^{} pages) cut PAGE_W's tables: the {:?} memory format has none",
+                skip.page_run_log2, skip.memory_format
+            )));
+        }
         // The ECREC witnesses the walkers handed to the pool, in place.
         super::resolve_deferred_ecrec(&mut ecdas_ops, &mut ecrec_ops)?;
 
@@ -1260,6 +1270,10 @@ impl<'a> FinishPlan<'a> {
             }
             _ => Vec::new(),
         };
+        // The page tables the plan builds: refused here if the rule refuses
+        // the pages.
+        super::super::page_w::page_tables(&page_configs, skip.page_run_log2)
+            .map_err(Error::Prover)?;
         let num_blake3_ops = blake3_ops.len() + blake3_absorb_ops.len();
 
         // Every table the plan builds, counted without building one.
@@ -1486,6 +1500,7 @@ impl<'a> FinishPlan<'a> {
                 pages_first: false,
                 fused_counts,
                 word_counts,
+                page_run_log2: skip.page_run_log2,
             },
             cut_line,
             cpu_decoded,
@@ -1958,19 +1973,33 @@ impl<'a> FinishPlan<'a> {
         };
         // The plan's page configs: none in a continuation epoch
         // (l2g_memory_bookend) or without an image ([`FinishPlan::new`]).
-        // Under the word memory format each is a PAGE_W table.
+        // Under the word memory format a PAGE_W table a page table, the pages
+        // cut at the plan's page runs.
         let gen_pages = || -> Result<Vec<_>, Error> {
+            if words {
+                let configs = &header.page_configs;
+                return super::super::page_w::page_tables(configs, header.page_run_log2)
+                    .map_err(Error::Prover)?
+                    .iter()
+                    .map(|table| {
+                        Ok(packed_if(
+                            pack,
+                            super::word_walk::page_table_trace_from_state(
+                                table,
+                                configs,
+                                memory_state,
+                            )?,
+                        ))
+                    })
+                    .collect();
+            }
             header
                 .page_configs
                 .iter()
                 .map(|config| {
                     Ok(packed_if(
                         pack,
-                        if words {
-                            super::word_walk::page_w_trace_from_state(config, memory_state)?
-                        } else {
-                            page_trace(config, memory_state, l2g_memory_bookend)
-                        },
+                        page_trace(config, memory_state, l2g_memory_bookend),
                     ))
                 })
                 .collect()
@@ -2222,6 +2251,7 @@ impl<'a> FinishPlan<'a> {
             pages_first: _,
             fused_counts,
             word_counts,
+            page_run_log2: _,
         } = header;
         let traces = Traces {
             cpus,
@@ -3170,23 +3200,33 @@ impl<'a> FinishPlan<'a> {
             )?);
         }
         // PAGE: one a config, from the memory state; under the word memory
-        // format each is PAGE_W's, in PAGE's place.
+        // format a PAGE_W table a page table (the pages cut at the plan's page
+        // runs), in PAGE's place.
         let page_configs = Arc::new(header.page_configs.clone());
         let words = skip.memory_format == super::super::fused_memory::MemoryFormat::Words;
-        units.extend((0..page_configs.len()).map(|k| {
-            let configs = Arc::clone(&page_configs);
-            if words {
-                return Unit::Build {
+        if words {
+            let tables = super::super::page_w::page_tables(&page_configs, header.page_run_log2)
+                .map_err(Error::Prover)?;
+            units.extend(tables.into_iter().map(|table| {
+                let configs = Arc::clone(&page_configs);
+                Unit::Build {
                     family: family("PAGE"),
-                    rows: super::super::page_w::ROWS,
+                    rows: table.rows(),
                     job: Box::new(move || {
                         Ok(packed_if(
                             pack,
-                            super::word_walk::page_w_trace_from_state(&configs[k], memory_state)?,
+                            super::word_walk::page_table_trace_from_state(
+                                &table,
+                                &configs,
+                                memory_state,
+                            )?,
                         ))
                     }) as Job<'a>,
-                };
-            }
+                }
+            }));
+        }
+        units.extend((0..page_configs.len()).filter(|_| !words).map(|k| {
+            let configs = Arc::clone(&page_configs);
             Unit::Build {
                 family: family("PAGE"),
                 rows: page::DEFAULT_PAGE_SIZE,

@@ -410,22 +410,29 @@ pub fn generate_page_w_trace_from_bytes(
                 value: init,
             };
         };
-        let cells = &page[row * WORD_BYTES as usize..(row + 1) * WORD_BYTES as usize];
-        let timestamp = cells.iter().map(|&(_, ts)| ts).max().unwrap_or(0);
-        if timestamp == 0 {
-            return FinalWordState {
-                timestamp: 0,
-                value: init,
-            };
-        }
-        let value = cells
-            .iter()
-            .enumerate()
-            .fold(0u64, |word, (k, &(byte, _))| {
-                word | u64::from(byte) << (8 * k)
-            });
-        FinalWordState { timestamp, value }
+        final_of_cells(page, row, init)
     })
+}
+
+/// Word `row`'s final state from its page's final cells: its eight bytes and
+/// the largest of their stamps, or untouched (timestamp 0, `init`) when every
+/// stamp is 0.
+fn final_of_cells(page: &[(u8, u64)], row: usize, init: u64) -> FinalWordState {
+    let cells = &page[row * WORD_BYTES as usize..(row + 1) * WORD_BYTES as usize];
+    let timestamp = cells.iter().map(|&(_, ts)| ts).max().unwrap_or(0);
+    if timestamp == 0 {
+        return FinalWordState {
+            timestamp: 0,
+            value: init,
+        };
+    }
+    let value = cells
+        .iter()
+        .enumerate()
+        .fold(0u64, |word, (k, &(byte, _))| {
+            word | u64::from(byte) << (8 * k)
+        });
+    FinalWordState { timestamp, value }
 }
 
 /// The PAGE_W trace of the page `config`, each row's final state
@@ -454,6 +461,145 @@ fn page_w_trace_of(
     Ok(trace)
 }
 
+// =========================================================================
+// Page blocks (page runs on)
+// =========================================================================
+
+/// Column definitions of a zero block (PAGE_Z): PAGE_W's without `INIT`,
+/// since every word it mints is the constant 0.
+pub mod zero_cols {
+    /// The word's index in the block, `0..rows` (preprocessed).
+    pub const OFFSET: usize = 0;
+    /// The final word's low and high 32-bit halves.
+    pub const FINI_LO: usize = 1;
+    pub const FINI_HI: usize = 2;
+    /// The final token's timestamp (0 if the word is never touched).
+    pub const TIMESTAMP: usize = 3;
+    pub const NUM_COLUMNS: usize = 4;
+}
+
+/// Preprocessed columns of a block of either class: `OFFSET` alone (a zero
+/// block has no `INIT`; a private block's `INIT` is the input, committed).
+pub const NUM_PREPROCESSED_COLS_BLOCK: usize = 1;
+
+/// A page table's width: a zero block's [`zero_cols::NUM_COLUMNS`], PAGE_W's
+/// [`cols::NUM_COLUMNS`] otherwise (a private block has a private page's
+/// columns).
+pub fn page_table_width(table: &PageTable) -> usize {
+    match table.kind {
+        PageTableKind::Zero => zero_cols::NUM_COLUMNS,
+        PageTableKind::Page | PageTableKind::Private => cols::NUM_COLUMNS,
+    }
+}
+
+/// The trace of `table`, one of the page tables cut from `configs`, its
+/// words' final states read from `finals` (a word missing from it is
+/// untouched: timestamp 0, its initial word). A page's is
+/// [`generate_page_w_trace`]'s. Refuses a table [`check_page_table`] refuses or
+/// whose pages are not its own ([`PageTable::configs`]).
+pub fn generate_page_table_trace(
+    table: &PageTable,
+    configs: &[PageConfig],
+    finals: &FinalWordMap,
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, String> {
+    check_page_table(table)?;
+    let pages = table.configs(configs)?;
+    if table.kind == PageTableKind::Page {
+        return generate_page_w_trace(&pages[0], finals);
+    }
+    block_trace_of(table, pages, |page, row, init| {
+        let address = pages[page].page_base + row as u64 * WORD_BYTES;
+        finals.get(&address).copied().unwrap_or(FinalWordState {
+            timestamp: 0,
+            value: init,
+        })
+    })
+}
+
+/// The trace of `table` from its pages' final cells (`final_page` of a page's
+/// base, as [`generate_page_w_trace_from_bytes`] takes them). A page's is
+/// [`generate_page_w_trace_from_bytes`]'s. Refuses what
+/// [`generate_page_table_trace`] refuses, or a page's cells that are not the
+/// page's size.
+pub fn generate_page_table_trace_from_bytes<'a>(
+    table: &PageTable,
+    configs: &[PageConfig],
+    final_page: impl Fn(u64) -> Option<&'a [(u8, u64)]>,
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, String> {
+    check_page_table(table)?;
+    let pages = table.configs(configs)?;
+    if table.kind == PageTableKind::Page {
+        return generate_page_w_trace_from_bytes(&pages[0], final_page(table.base));
+    }
+    let finals: Vec<Option<&[(u8, u64)]>> = pages.iter().map(|c| final_page(c.page_base)).collect();
+    if let Some(page) = finals
+        .iter()
+        .flatten()
+        .find(|p| p.len() != DEFAULT_PAGE_SIZE)
+    {
+        return Err(format!(
+            "a page's final cells are {DEFAULT_PAGE_SIZE} bytes, not {}",
+            page.len()
+        ));
+    }
+    block_trace_of(table, pages, |page, row, init| match finals[page] {
+        Some(cells) => final_of_cells(cells, row, init),
+        None => FinalWordState {
+            timestamp: 0,
+            value: init,
+        },
+    })
+}
+
+/// A block's trace: its pages' rows in address order, `OFFSET` the row's index
+/// in the block, each row's final state `final_of(page, row in the page,
+/// initial word)`; a private block's `INIT` halves its input's words.
+fn block_trace_of(
+    table: &PageTable,
+    pages: &[PageConfig],
+    final_of: impl Fn(usize, usize, u64) -> FinalWordState,
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, String> {
+    let width = page_table_width(table);
+    let (offset, fini_lo, fini_hi, timestamp) = match table.kind {
+        PageTableKind::Zero => (
+            zero_cols::OFFSET,
+            zero_cols::FINI_LO,
+            zero_cols::FINI_HI,
+            zero_cols::TIMESTAMP,
+        ),
+        PageTableKind::Private => (cols::OFFSET, cols::FINI_LO, cols::FINI_HI, cols::TIMESTAMP),
+        PageTableKind::Page => return Err(format!("{} is a page, not a block", table.name())),
+    };
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(table.rows() * width),
+        width,
+        1,
+    );
+    let t = &mut trace.main_table;
+    for (page, config) in pages.iter().enumerate() {
+        for row in 0..ROWS {
+            let at = page * ROWS + row;
+            t.set_u64(at, offset, at as u64);
+            let init = init_word(config, row);
+            if table.kind == PageTableKind::Private {
+                t.set_halves(at, cols::INIT[0], &quarters(init));
+            } else if init != 0 {
+                return Err(format!(
+                    "{}: page {:#x} holds a nonzero word at {row}",
+                    table.name(),
+                    config.page_base
+                ));
+            }
+            let state = final_of(page, row, init);
+            let (lo, hi) = halves(state.value);
+            t.set_word(at, fini_lo, lo);
+            t.set_word(at, fini_hi, hi);
+            t.set_u64(at, timestamp, state.timestamp);
+        }
+    }
+    Ok(trace)
+}
+
 /// The BITWISE lookups a page sends: on a private-input page, `IS_HALF` on
 /// each of every row's four `INIT` halves; none on any other page.
 pub fn bitwise_ops(config: &PageConfig) -> impl Iterator<Item = BitwiseOperation> + '_ {
@@ -471,7 +617,12 @@ pub fn bitwise_ops(config: &PageConfig) -> impl Iterator<Item = BitwiseOperation
 
 /// `OFFSET` alone: `0..ROWS`, the same for every page.
 pub fn offset_column() -> Vec<FE> {
-    (0..ROWS as u64).map(FE::from).collect()
+    offset_column_of(ROWS)
+}
+
+/// `OFFSET` of a table of `rows` rows: `0..rows`, the row's word in it.
+pub fn offset_column_of(rows: usize) -> Vec<FE> {
+    (0..rows as u64).map(FE::from).collect()
 }
 
 /// The preprocessed columns of an ELF or a zero page: `OFFSET` and the four
@@ -526,6 +677,57 @@ pub fn lazy_commitment(config: &PageConfig, options: &ProofOptions) -> LazyCommi
     base.with_one_row(move || Some(commitment(&c, &o, LeafLayout::Row)))
 }
 
+/// A page table's preprocessed columns: a page's
+/// ([`preprocessed_columns_of`]), or a block's `OFFSET` at its height alone.
+/// Refuses a table [`check_page_table`] refuses or whose pages are not its own.
+pub fn page_table_preprocessed_columns(
+    table: &PageTable,
+    configs: &[PageConfig],
+) -> Result<Vec<Vec<FE>>, String> {
+    check_page_table(table)?;
+    let pages = table.configs(configs)?;
+    Ok(match table.kind {
+        PageTableKind::Page => preprocessed_columns_of(&pages[0]),
+        PageTableKind::Zero | PageTableKind::Private => vec![offset_column_of(table.rows())],
+    })
+}
+
+/// The number of a page table's preprocessed columns, as
+/// [`page_table_preprocessed_columns`] makes them.
+pub fn page_table_num_preprocessed_cols(
+    table: &PageTable,
+    configs: &[PageConfig],
+) -> Result<usize, String> {
+    check_page_table(table)?;
+    let pages = table.configs(configs)?;
+    Ok(match table.kind {
+        PageTableKind::Page => num_preprocessed_cols(&pages[0]),
+        PageTableKind::Zero | PageTableKind::Private => NUM_PREPROCESSED_COLS_BLOCK,
+    })
+}
+
+/// A page table's preprocessed commitment for both leaf layouts, each computed
+/// on first use: a page's [`lazy_commitment`], a block's of its `OFFSET`.
+pub fn page_table_lazy_commitment(
+    table: &PageTable,
+    configs: &[PageConfig],
+    options: &ProofOptions,
+) -> Result<LazyCommitment, String> {
+    check_page_table(table)?;
+    let pages = table.configs(configs)?;
+    if table.kind == PageTableKind::Page {
+        return Ok(lazy_commitment(&pages[0], options));
+    }
+    let rows = table.rows();
+    let commit = move |o: &ProofOptions, layout| {
+        super::page::commit_preprocessed_columns(&[offset_column_of(rows)], rows, o, layout)
+    };
+    let o = options.clone();
+    let base = LazyCommitment::deferred(move || commit(&o, LeafLayout::RowPair));
+    let o = options.clone();
+    Ok(base.with_one_row(move || Some(commit(&o, LeafLayout::Row))))
+}
+
 // =========================================================================
 // Bus interactions
 // =========================================================================
@@ -576,4 +778,55 @@ pub fn bus_interactions(page_base: u64, private: bool) -> Result<Vec<BusInteract
         }));
     }
     Ok(interactions)
+}
+
+/// The interactions of `table`, one of the page tables cut from `configs`,
+/// or the reason there are none ([`check_page_table`], [`PageTable::configs`]):
+/// - a page's, [`bus_interactions`];
+/// - a private block's, a private page's at the block's base (its `OFFSET`
+///   runs over the block's words);
+/// - a zero block's, the first token minted with the constant 0 as its word
+///   and timestamp 0, and the last consumed, at 1 on every row.
+pub fn page_table_interactions(
+    table: &PageTable,
+    configs: &[PageConfig],
+) -> Result<Vec<BusInteraction>, String> {
+    check_page_table(table)?;
+    let pages = table.configs(configs)?;
+    match table.kind {
+        PageTableKind::Page => bus_interactions(table.base, pages[0].is_private_input),
+        PageTableKind::Private => bus_interactions(table.base, true),
+        PageTableKind::Zero => {
+            let (base_lo, base_hi) = halves(table.base);
+            let address = || {
+                [
+                    BusValue::linear(vec![
+                        LinearTerm::Constant(i64::from(base_lo)),
+                        term(WORD_BYTES as i64, zero_cols::OFFSET),
+                    ]),
+                    BusValue::constant(u64::from(base_hi)),
+                ]
+            };
+            Ok(vec![
+                BusInteraction::receiver(
+                    BusId::MemWord,
+                    Multiplicity::One,
+                    token(
+                        address(),
+                        BusValue::constant(0),
+                        [BusValue::constant(0), BusValue::constant(0)],
+                    ),
+                ),
+                BusInteraction::sender(
+                    BusId::MemWord,
+                    Multiplicity::One,
+                    token(
+                        address(),
+                        column(zero_cols::TIMESTAMP),
+                        [column(zero_cols::FINI_LO), column(zero_cols::FINI_HI)],
+                    ),
+                ),
+            ])
+        }
+    }
 }

@@ -1136,6 +1136,38 @@ pub fn create_page_w_air(
     )))
 }
 
+/// The AIR of `table`, one of the page tables cut from `configs`
+/// (`tables::page_w::page_tables`): a page's [`create_page_w_air`], or a
+/// block's, named for its class, base and pages, its `OFFSET` preprocessed at
+/// the block's height; or the reason there is none (a table not aligned to its
+/// span, past the cap, or whose pages are not its own).
+pub fn create_page_table_air(
+    proof_options: &ProofOptions,
+    table: &crate::tables::page_w::PageTable,
+    configs: &[crate::tables::page::PageConfig],
+) -> Result<VmAir, String> {
+    use crate::tables::page_w::{self, PageTableKind};
+    page_w::check_page_table(table)?;
+    let pages = table.configs(configs)?;
+    if table.kind == PageTableKind::Page {
+        return create_page_w_air(proof_options, &pages[0]);
+    }
+    let air = build_air(
+        page_w::page_table_width(table),
+        page_w::page_table_interactions(table, configs)?,
+        proof_options,
+        1,
+        EmptyConstraints,
+        &table.name(),
+    );
+    let rows = table.rows();
+    Ok(Box::new(air.with_lazy_preprocessed_columns(
+        page_w::page_table_lazy_commitment(table, configs, proof_options)?,
+        page_w::page_table_num_preprocessed_cols(table, configs)?,
+        std::sync::Arc::new(move || vec![page_w::offset_column_of(rows)]),
+    )))
+}
+
 /// Create DECODE AIR with bus interactions.
 ///
 /// The DECODE table has no transition constraints (it's a pure lookup table).
