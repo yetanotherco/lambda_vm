@@ -585,7 +585,7 @@ fn zero_piece_by_hand(
     }
 }
 
-/// ★ F1, a block taller than its pages: the zero block of pages 4..8 stated
+/// ★ A block taller than its pages: the zero block of pages 4..8 stated
 /// at 8 pages' rows (its interactions its own, its `OFFSET` at that height, as
 /// a verifier without the height rule would build it) mints the next page's
 /// words a second time, the page of data's included, with the word 0; a
@@ -641,7 +641,7 @@ fn a_taller_block_would_mint_the_next_pages_words_twice() {
     assert!(v.refused_only_on(BusId::MemWord), "{v:?}");
 }
 
-/// ★ F3, a page of data presented as zero: the verifier's cut never puts a
+/// ★ A page of data presented as zero: the verifier's cut never puts a
 /// data page in a block, and a zero block over one is refused by the table's
 /// own constructor; so the forger's read of the data page as 0 consumes a
 /// token no table of the verifier's mints, and only the word bus refuses it.
@@ -713,7 +713,7 @@ fn zero_block_interactions_at(base: u64) -> Vec<stark::lookup::BusInteraction> {
     out
 }
 
-/// ★ F4, a block off its span's alignment: the derivation never cuts one
+/// ★ A block off its span's alignment: the derivation never cuts one
 /// (`every_cut_is_an_aligned_partition_and_the_lists_alone_decide_it`) and
 /// no constructor builds one. Its words would run past `2^32` in the key's
 /// low half: two pages from `2^32 − 2^18` as one block mint `(2^32, 0)`, a key
@@ -779,7 +779,7 @@ fn a_block_off_its_alignment_would_mint_past_two_to_the_32() {
     assert!(v.accepted(), "control: {v:?}");
 }
 
-/// ★ F5, a block's internal page boundary (rows `2^15 − 1` and `2^15` of the
+/// ★ A block's internal page boundary (rows `2^15 − 1` and `2^15` of the
 /// zero block, the last word of its first page and the first of its second,
 /// both written and read): a final word or timestamp moved there is refused
 /// by the word bus alone. Its `OFFSET` is the verifier's across the boundary:
@@ -851,7 +851,7 @@ fn a_blocks_internal_page_boundary_is_held() {
     assert!(v.accepted(), "control: {v:?}");
 }
 
-/// ★ F6, a private block's initial words are canonical, each 16-bit half by
+/// ★ A private block's initial words are canonical, each 16-bit half by
 /// its own `IS_HALF`, on its second page too: one half of a word of the
 /// second private page moved past 16 bits (carried through the read to the
 /// block's final word) is refused by that half's lookup alone; control: that
@@ -1039,7 +1039,7 @@ fn a_word_statement_frames_at_its_own_page_run_alone() {
     }
 }
 
-/// ★ F1 and F2 in the frame: every page table is held to its place, name and
+/// ★ In the frame, every page table is held to its place, name and
 /// height, which the verifier derives. A page table stated a row taller (or
 /// shorter) is refused; so is a statement with two tables' heights swapped,
 /// whose total is the same. `check_page_table_heights` refuses a table at a
@@ -1268,7 +1268,7 @@ fn the_dense_pages_are_the_same_at_every_page_run() {
     }
 }
 
-/// ★ F7: a runtime range overlapping a page of the program, or another
+/// ★ A runtime range overlapping a page of the program, or another
 /// range, is refused by the page list's one-page-a-base check before any
 /// table is cut, at every run; and the rule refuses such a list itself.
 #[test]
