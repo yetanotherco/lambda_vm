@@ -1529,6 +1529,61 @@ fn parse_own_keccak_rnd_groups(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
+/// The knob of [`rest_own_pool`].
+const REST_OWN_POOL_ENV: &str = "LAMBDA_VM_REST_OWN_POOL";
+
+/// Whether the streamed rest builds its AIR set and lays out its tables on a
+/// small pool of their own ([`on_rest_pool`]) rather than the shared one: a
+/// deviation's choice, else `LAMBDA_VM_REST_OWN_POOL` (off by default). Their
+/// parallel parts (the row-to-column copies, BITWISE's precomputed columns)
+/// are short, and from a thread outside the shared pool they queue behind the
+/// finish's long builds; on a pool of their own they only share the cores.
+/// The AIRs, the tables, their order and the proof's bytes are the same
+/// either way.
+fn rest_own_pool(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => parse_rest_own_pool(std::env::var(REST_OWN_POOL_ENV).ok().as_deref()),
+    }
+}
+
+/// `LAMBDA_VM_REST_OWN_POOL`: unset, empty or `0` (the default) keeps the
+/// shared pool; `1` takes the rest's own. Anything else refuses the prove.
+fn parse_rest_own_pool(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{REST_OWN_POOL_ENV}={v}: 0 (the default: the shared pool) or 1 (the rest's own pool)"
+        ))),
+    }
+}
+
+/// The threads of the rest's own pool ([`rest_own_pool`]).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+const REST_POOL_THREADS: usize = 4;
+
+/// `work` on the rest's own pool when `on` (its rayon calls stay there),
+/// else here. Without `parallel`, or if the pool cannot be built, here.
+fn on_rest_pool<R: Send>(on: bool, work: impl FnOnce() -> R + Send) -> R {
+    #[cfg(feature = "parallel")]
+    if on {
+        static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+        let pool = POOL.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(REST_POOL_THREADS)
+                .thread_name(|i| format!("rest-pool-{i}"))
+                .build()
+                .ok()
+        });
+        if let Some(pool) = pool {
+            return pool.install(work);
+        }
+    }
+    let _ = on;
+    work()
+}
+
 /// The knob of [`rest_airs_beside`].
 const REST_AIRS_BESIDE_ENV: &str = "LAMBDA_VM_REST_AIRS_BESIDE";
 
@@ -4304,6 +4359,10 @@ pub(crate) struct Deviations {
     /// first table (`Some(false)`), instead of the knob
     /// ([`rest_airs_beside`]).
     pub rest_airs_beside: Option<bool>,
+    /// The rest's AIR set and layout on a pool of their own (`Some(true)`)
+    /// or the shared one (`Some(false)`), instead of the knob
+    /// ([`rest_own_pool`]).
+    pub rest_own_pool: Option<bool>,
     /// KECCAK_RND's tables handed out during the windows (`Some(true)`) or
     /// built at the finish (`Some(false)`), instead of the knob
     /// ([`stream_keccak_rnd_records`]).
@@ -6721,10 +6780,12 @@ fn lay_out_rest_streamed<'a>(
     memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
     registers: crate::tables::register::RegisterFormat,
     memory: crate::tables::fused_memory::MemoryFormat,
+    own_pool: bool,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
         sink.ok_or_else(|| Error::Prover("a streamed rest needs the packer's sink".into()))?;
+    let airs_secs = std::sync::Mutex::new(0.0f64);
     let at = || start.elapsed().as_secs_f64();
     let mut marks = vec![("rest received", at())];
     let RestStream { header, tables } = *stream;
@@ -6741,7 +6802,7 @@ fn lay_out_rest_streamed<'a>(
         .iter()
         .filter(|c| c.is_private_input)
         .count();
-    let build_airs = || -> Result<&'a VmAirs, Error> {
+    let build_airs_here = || -> Result<&'a VmAirs, Error> {
         let inputs = BlockAirInputs::new(
             opts,
             program,
@@ -6769,6 +6830,15 @@ fn lay_out_rest_streamed<'a>(
         built?;
         Ok(airs)
     };
+    // The set's own time (`BLOCK REST AIRS`), on the rest's pool or here.
+    let build_airs = || -> Result<&'a VmAirs, Error> {
+        let t = Instant::now();
+        let airs = on_rest_pool(own_pool, build_airs_here);
+        if let Ok(mut secs) = airs_secs.lock() {
+            *secs = t.elapsed().as_secs_f64();
+        }
+        airs
+    };
     let mut timed: Vec<(usize, f64)> = Vec::new();
     let mut laid_at: Vec<(usize, f64)> = Vec::new();
     let (mut narrow_tables, mut narrow_bytes) = (0usize, 0usize);
@@ -6792,7 +6862,7 @@ fn lay_out_rest_streamed<'a>(
             // Never dropped, so never one phase B builds again.
             records_tables += 1;
             records_bytes += records.bytes();
-            table_of_records(air, &mut trace, shape)
+            on_rest_pool(own_pool, || table_of_records(air, &mut trace, shape))
         } else if let Some(packed) = trace.narrow_main() {
             narrow_tables += 1;
             narrow_bytes += packed.data().len();
@@ -6804,9 +6874,9 @@ fn lay_out_rest_streamed<'a>(
             ) {
                 recorder.rest_tag(k, family, j);
             }
-            table_of_narrow(air, &mut trace, shape)
+            on_rest_pool(own_pool, || table_of_narrow(air, &mut trace, shape))
         } else {
-            table_of(air, &mut trace, shape, true)
+            on_rest_pool(own_pool, || table_of(air, &mut trace, shape, true))
         };
         let secs = t.elapsed().as_secs_f64();
         timed.push((position, secs));
@@ -6884,6 +6954,15 @@ fn lay_out_rest_streamed<'a>(
         None => build_airs()?,
     };
     marks.push(("airs", at()));
+    eprintln!(
+        "BLOCK REST AIRS: the set built in {:.3} s on {}",
+        airs_secs.lock().map_or(0.0, |secs| *secs),
+        if own_pool {
+            "the rest's own pool"
+        } else {
+            "the shared pool"
+        }
+    );
     let refs = airs.air_refs();
     let first = if header.keccak_rnd_first {
         let names: Vec<&str> = refs.iter().map(|air| air.name()).collect();
@@ -7313,6 +7392,15 @@ fn prove_streamed(
         let bitwise_last = deviations.rest_bitwise_last;
         let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
         let airs_beside = rest_airs_beside(deviations.rest_airs_beside)?;
+        let own_pool = rest_own_pool(deviations.rest_own_pool)?;
+        eprintln!(
+            "★ BLOCK REST POOL: {} ({REST_OWN_POOL_ENV})",
+            if own_pool {
+                "the rest's AIR set and layout on a pool of their own"
+            } else {
+                "the shared pool (the default)"
+            }
+        );
         #[cfg(test)]
         let misnamed = deviations.rest_airs_beside_misnamed;
         #[cfg(not(test))]
@@ -8150,6 +8238,7 @@ fn prove_streamed(
                         format.memw_aligned,
                         format.registers,
                         format.memory,
+                        own_pool,
                     ),
                 };
                 let (streamed, rest) = if inline {
@@ -12096,6 +12185,74 @@ mod rest_airs_beside_tests {
         for bad in ["2", "on", "true", "yes"] {
             assert!(parse_rest_airs_beside(Some(bad)).is_err(), "{bad}");
         }
+    }
+
+    /// The rest's own pool is off unless the knob says `1`.
+    #[test]
+    fn the_rest_pool_knob_is_off_by_default_and_refuses_other_words() {
+        for off in [None, Some(""), Some("0"), Some(" 0\n")] {
+            assert!(!super::parse_rest_own_pool(off).expect("off"), "{off:?}");
+        }
+        assert!(super::parse_rest_own_pool(Some("1")).expect("on"));
+        for bad in ["2", "on", "true", "yes"] {
+            assert!(super::parse_rest_own_pool(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// `on_rest_pool` runs the work on the rest's own pool when on (its
+    /// rayon calls stay there) and here when off.
+    #[test]
+    fn work_on_the_rest_pool_runs_there() {
+        let here = super::on_rest_pool(false, rayon::current_thread_index);
+        assert_eq!(here, None, "off: on the calling thread");
+        let (index, threads, name) = super::on_rest_pool(true, || {
+            (
+                rayon::current_thread_index(),
+                rayon::current_num_threads(),
+                std::thread::current().name().map(str::to_string),
+            )
+        });
+        assert!(index.is_some(), "on: a pool thread");
+        assert_eq!(threads, super::REST_POOL_THREADS);
+        assert!(name.is_some_and(|n| n.starts_with("rest-pool-")));
+    }
+
+    /// A probe, never a gate: BITWISE's precomputed columns (a short
+    /// `into_par_iter`) asked for from a thread outside the shared pool while
+    /// that pool is busy with long jobs (twice its threads, 300 ms each, as the
+    /// finish's builds keep it), against the same from the rest's own pool, and
+    /// against an idle pool (ms).
+    #[test]
+    #[ignore = "a timing probe"]
+    fn rest_pool_against_a_busy_shared_pool_seconds() {
+        let ask = |own: bool| {
+            let t = std::time::Instant::now();
+            drop(super::on_rest_pool(
+                own,
+                crate::tables::bitwise::preprocessed_columns,
+            ));
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        let idle = ask(false);
+        let busy = |own: bool| {
+            let threads = rayon::current_num_threads();
+            let stop = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            for _ in 0..2 * threads {
+                rayon::spawn(move || while std::time::Instant::now() < stop {});
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let got = std::thread::spawn(move || ask(own))
+                .join()
+                .expect("the asking thread");
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            got
+        };
+        let shared = busy(false);
+        let own = busy(true);
+        println!(
+            "REST POOL PROBE: BITWISE's precomputed columns · idle shared pool {idle:.1} ms · busy shared pool \
+             {shared:.1} ms · busy shared pool, asked on the rest's own {own:.1} ms"
+        );
     }
 
     /// A probe, never a gate: what building a block's AIR set costs, by
