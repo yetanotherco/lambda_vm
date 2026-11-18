@@ -896,7 +896,8 @@ fn page_run_word(word: &str) -> Result<String, String> {
 }
 
 /// The page runs of `--page-run`: the caller's, as the tree's harness knob
-/// (`BLOCK_WHIR_PAGE_RUN`, refused by the block commands) would read them.
+/// (`BLOCK_WHIR_PAGE_RUN`, which `prove-block` refuses and `verify-block` never
+/// reads) would read them.
 fn block_page_run(word: &str) -> Result<u8, String> {
     prover::lfm::whir_block_tree::page_run_setting(Some(word))
 }
@@ -939,6 +940,48 @@ fn block_leaf_query(word: &str) -> Result<prover::lfm::whir_chain::LeafQuery, St
     leaf_query_setting(Some(word))
 }
 
+/// The harness's environment words `prove-block` refuses (each a format choice
+/// the caller gives on the command line, or the verifier's form), in order, each
+/// with its refusal: the first one `set` says is set, or none.
+fn refused_harness_knob(set: impl Fn(&str) -> bool) -> Option<String> {
+    const KNOBS: [(&str, &str); 8] = [
+        ("LAMBDA_VM_WHIR_GROUP", "give the CLI --group instead"),
+        ("BLOCK_WHIR_ARGUE_PACK", "give the CLI --argue-pack instead"),
+        (
+            "BLOCK_WHIR_KECCAK_RND",
+            "the CLI proves the verifier's form",
+        ),
+        ("BLOCK_WHIR_MEMW_A", "the CLI proves the verifier's form"),
+        ("BLOCK_WHIR_ECDAS", "the CLI proves the verifier's form"),
+        ("BLOCK_WHIR_REGISTERS", "the CLI proves the verifier's form"),
+        ("BLOCK_WHIR_MEMORY", "the CLI proves the verifier's form"),
+        ("BLOCK_WHIR_PAGE_RUN", "give the CLI --page-run instead"),
+    ];
+    KNOBS
+        .iter()
+        .find(|(knob, _)| set(knob))
+        .map(|(knob, why)| format!("{knob} is the harness's knob: {why}"))
+}
+
+/// `format` with `prove-block`'s named choices the tree's format takes from the
+/// command line: the leaves' scale and query check, the memory format and the
+/// page runs (the group opening and the GKR packing are set beside).
+fn with_named_choices(
+    format: prover::block_whir::BlockFormat,
+    leaf_scale: prover::lfm::whir_block::LeafScale,
+    leaf_query: prover::lfm::whir_chain::LeafQuery,
+    memory: prover::tables::fused_memory::MemoryFormat,
+    page_run: u8,
+) -> prover::block_whir::BlockFormat {
+    prover::block_whir::BlockFormat {
+        leaf_scale,
+        leaf_query,
+        memory,
+        page_run_log2: page_run,
+        ..format
+    }
+}
+
 fn cmd_prove_block(
     elf_path: PathBuf,
     input_path: Option<PathBuf>,
@@ -965,48 +1008,11 @@ fn cmd_prove_block(
         page_run,
     } = choices;
 
-    // The group opening is the caller's constant, given on the command line
-    // and to `verify-block` alike; the harness's environment word for it is
+    // The format choices are the caller's constants, given on the command line
+    // and to `verify-block` alike; the harness's environment words for them are
     // refused here rather than silently outranked.
-    if std::env::var_os("LAMBDA_VM_WHIR_GROUP").is_some() {
-        eprintln!("LAMBDA_VM_WHIR_GROUP is the harness's knob: give the CLI --group instead");
-        return ExitCode::FAILURE;
-    }
-    // So is the GKR packing.
-    if std::env::var_os("BLOCK_WHIR_ARGUE_PACK").is_some() {
-        eprintln!("BLOCK_WHIR_ARGUE_PACK is the harness's knob: give the CLI --argue-pack instead");
-        return ExitCode::FAILURE;
-    }
-    // So is KECCAK_RND's form.
-    if std::env::var_os("BLOCK_WHIR_KECCAK_RND").is_some() {
-        eprintln!(
-            "BLOCK_WHIR_KECCAK_RND is the harness's knob: the CLI proves the verifier's form"
-        );
-        return ExitCode::FAILURE;
-    }
-    // So is MEMW_A's.
-    if std::env::var_os("BLOCK_WHIR_MEMW_A").is_some() {
-        eprintln!("BLOCK_WHIR_MEMW_A is the harness's knob: the CLI proves the verifier's form");
-        return ExitCode::FAILURE;
-    }
-    // So is ECDAS's.
-    if std::env::var_os("BLOCK_WHIR_ECDAS").is_some() {
-        eprintln!("BLOCK_WHIR_ECDAS is the harness's knob: the CLI proves the verifier's form");
-        return ExitCode::FAILURE;
-    }
-    // So is the register format.
-    if std::env::var_os("BLOCK_WHIR_REGISTERS").is_some() {
-        eprintln!("BLOCK_WHIR_REGISTERS is the harness's knob: the CLI proves the verifier's form");
-        return ExitCode::FAILURE;
-    }
-    // So is the memory format.
-    if std::env::var_os("BLOCK_WHIR_MEMORY").is_some() {
-        eprintln!("BLOCK_WHIR_MEMORY is the harness's knob: the CLI proves the verifier's form");
-        return ExitCode::FAILURE;
-    }
-    // So are the page runs.
-    if std::env::var_os("BLOCK_WHIR_PAGE_RUN").is_some() {
-        eprintln!("BLOCK_WHIR_PAGE_RUN is the harness's knob: give the CLI --page-run instead");
+    if let Some(refusal) = refused_harness_knob(|knob| std::env::var_os(knob).is_some()) {
+        eprintln!("{refusal}");
         return ExitCode::FAILURE;
     }
     let pack = match prover::lfm::whir_block_tree::pack_setting(Some(argue_pack)) {
@@ -1093,10 +1099,7 @@ fn cmd_prove_block(
         }
     };
     eprintln!("BLOCK GROUP OPENING: {group}");
-    cfg.format.leaf_scale = leaf_scale;
-    cfg.format.leaf_query = leaf_query;
-    cfg.format.memory = memory;
-    cfg.format.page_run_log2 = page_run;
+    cfg.format = with_named_choices(cfg.format, leaf_scale, leaf_query, memory, page_run);
     cfg.format = cfg.format.with_pack(pack);
     cfg.argue = cfg.format.argue;
     eprintln!("BLOCK ARGUE PACK: {argue_pack} ({pack:?})");
@@ -3066,6 +3069,53 @@ mod tests {
         };
         assert!(at_pinned_choices(&choices("0")));
         assert!(!at_pinned_choices(&choices("4")));
+        // `prove-block` sets the tree's format to the flag's run, the other
+        // named choices with it.
+        use prover::tables::fused_memory::MemoryFormat;
+        let pinned = prover::block_whir::BlockFormat::pinned();
+        for k in [0u8, 4, 6] {
+            let format = with_named_choices(
+                pinned,
+                pinned.leaf_scale,
+                pinned.leaf_query,
+                MemoryFormat::Words,
+                k,
+            );
+            assert_eq!(format.page_run_log2, k);
+            assert_eq!(format.memory, MemoryFormat::Words);
+            assert_eq!(
+                format.group_polys, pinned.group_polys,
+                "the rest is the format's"
+            );
+        }
+    }
+
+    /// `prove-block` refuses each of the harness's format words, the page
+    /// runs' among them, by name and with what to give instead, the first set
+    /// in order; with none set it refuses nothing.
+    #[test]
+    fn prove_block_refuses_the_harness_format_words() {
+        assert_eq!(refused_harness_knob(|_| false), None);
+        let refusal = refused_harness_knob(|knob| knob == "BLOCK_WHIR_PAGE_RUN").expect("refused");
+        assert_eq!(
+            refusal,
+            "BLOCK_WHIR_PAGE_RUN is the harness's knob: give the CLI --page-run instead"
+        );
+        for knob in [
+            "LAMBDA_VM_WHIR_GROUP",
+            "BLOCK_WHIR_ARGUE_PACK",
+            "BLOCK_WHIR_KECCAK_RND",
+            "BLOCK_WHIR_MEMW_A",
+            "BLOCK_WHIR_ECDAS",
+            "BLOCK_WHIR_REGISTERS",
+            "BLOCK_WHIR_MEMORY",
+        ] {
+            let refusal = refused_harness_knob(|k| k == knob).expect("refused");
+            assert!(refusal.starts_with(knob), "{refusal}");
+        }
+        let first =
+            refused_harness_knob(|k| k == "BLOCK_WHIR_MEMORY" || k == "BLOCK_WHIR_PAGE_RUN");
+        assert!(first.is_some_and(|r| r.starts_with("BLOCK_WHIR_MEMORY")));
     }
 
     /// Both block commands take the leaf scale, production's threshold of 10
