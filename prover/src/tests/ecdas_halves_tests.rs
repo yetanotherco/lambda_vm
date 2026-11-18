@@ -946,59 +946,213 @@ fn field_solved_carries_with_lo_in_range_are_refused_by_the_hi_checks() {
     assert_eq!(refusal(EcdasForm::Halves, &control, &row, None), None);
 }
 
-/// ★ T3. A λ relation off by exactly `2^512`: `λ·Δx + yA − yG + (R − q)·P =
-/// 2^512`, so `λ` is not the slope (`2^512 ≢ 0 mod P`), every carry below
-/// the top is an in-range integer and the top carry is 1. The closing rule
-/// `C_31 = 0` refuses it; the mutant that keeps a `C_31` column (the
-/// control) accepts it with that column 1. Every check passes either way.
-#[test]
-fn a_relation_off_by_two_to_the_512_is_refused_by_the_closing_rule() {
+/// A step whose relation `rel` (0 λ, 1 xR, 2 yR) is off by exactly `2^512`
+/// and whose other two hold: λ's by `yG` and `q0`, xR's by `xR` and `q1`, yR's
+/// by `yR` and `q2`, each pair the quotient and remainder by `P` of the total
+/// less `2^512`. The relation's value is then `2^512 ≢ 0 mod P`: λ is not the
+/// slope, or `xR`, `yR` are not the sum's.
+fn off_by_two_to_the_512(rel: usize) -> Operands {
     let p = p_big();
     let r = r_big();
     let honest = steps_for(&k_le(0xABCD));
     let step = honest.iter().find(|s| s.op == 1).expect("an add");
     let big = |b: &[u8]| big_of(&b.iter().map(|&v| u64::from(v)).collect::<Vec<_>>());
     let (xa, ya, xg) = (big(&step.x_a), big(&step.y_a), big(&step.x_g));
-    let lambda = big(&step.lambda) + 1;
-    let two_512 = BigInt::one() << 512;
-    // λ·Δx + yA + R·P − 2^512 = yG + q·P, yG below P.
-    let x: BigInt = &lambda * (&xg - &xa) + &ya + &r * &p - &two_512;
-    let (q0, yg) = x.div_mod_floor(&p);
+    let two_512: BigInt = BigInt::one() << 512;
+    let mut lambda = big(&step.lambda);
+    if rel == 0 {
+        lambda += 1;
+    }
     let mut s = Operands::honest(1, &xa, &ya, &xg, &lambda);
-    s.yg = bytes_of(&yg);
-    s.q[0] = bytes_of(&q0);
-    let t = s.limbs().terms();
-    assert_eq!(
-        t[0].iter()
-            .rev()
-            .fold(BigInt::zero(), |acc, &v| (acc << 16) + BigInt::from(v)),
-        two_512,
-        "the λ relation's total is 2^512"
-    );
-    assert_ne!(two_512.mod_floor(&p), BigInt::zero());
-    // Its chain below the top is exact; the top carry would be 1.
-    let (c, exact) = halves_chain(&t[0]);
-    assert!(!exact);
-    assert_eq!(c[HALVES_CARRIES - 1] + t[0][HALVES_POSITIONS - 1], 1 << 16);
-    let mut carries = [[(FE::zero(), FE::zero()); HALVES_CARRIES]; 3];
-    for (rel, t) in t.iter().enumerate() {
-        let (c, _) = halves_chain(t);
-        for (k, &c) in c.iter().enumerate() {
-            let (l, high) = split_carry(c);
-            assert!((0..256).contains(&high));
-            carries[rel][k] = (FE::from(l), fe(high));
+    match rel {
+        0 => {
+            // λ·Δx + yA + R·P − 2^512 = yG + q0·P.
+            let x: BigInt = &lambda * (&xg - &xa) + &ya + &r * &p - &two_512;
+            let (q0, yg) = x.div_mod_floor(&p);
+            s.yg = bytes_of(&yg);
+            s.q[0] = bytes_of(&q0);
+        }
+        1 => {
+            // λ² − xA − xG + R·P − 2^512 = xR + q1·P; yR's relation re-made for that xR.
+            let x: BigInt = &lambda * &lambda - &xa - &xg + &r * &p - &two_512;
+            let (q1, xr) = x.div_mod_floor(&p);
+            let y: BigInt = &lambda * (&xa - &xr) - &ya;
+            let (q2, yr) = y.div_mod_floor(&p);
+            s.xr = bytes_of(&xr);
+            s.q[1] = bytes_of(&q1);
+            s.yr = bytes_of(&yr);
+            s.q[2] = bytes_of(&(&r + q2));
+        }
+        _ => {
+            // λ·(xA − xR) − yA + R·P − 2^512 = yR + q2·P.
+            let xr = big_of(&s.xr);
+            let y: BigInt = &lambda * (&xa - &xr) - &ya + &r * &p - &two_512;
+            let (q2, yr) = y.div_mod_floor(&p);
+            s.yr = bytes_of(&yr);
+            s.q[2] = bytes_of(&q2);
         }
     }
+    let t = s.limbs().terms();
+    for (k, t) in t.iter().enumerate() {
+        let total = t
+            .iter()
+            .rev()
+            .fold(BigInt::zero(), |acc, &v| (acc << 16) + BigInt::from(v));
+        let want = if k == rel {
+            two_512.clone()
+        } else {
+            BigInt::zero()
+        };
+        assert_eq!(total, want, "relation {k}'s total");
+    }
+    assert_ne!(two_512.mod_floor(&p), BigInt::zero());
+    s
+}
+
+/// ★ T3, each relation. A relation off by exactly `2^512`
+/// ([`off_by_two_to_the_512`]): every carry below the top is an in-range
+/// integer and the top carry is 1. The closing rule `C_31 = 0` refuses it,
+/// the one identity at the relation's top failing (36 λ, 68 xR, 100 yR); the
+/// mutant that keeps a `C_31` column (the control) accepts it with that
+/// column 1. Every check passes either way.
+#[test]
+fn a_relation_off_by_two_to_the_512_is_refused_by_the_closing_rule() {
     let all = bus_interactions_for(EcdasForm::Halves);
-    let row = s.row(&carries, 0);
-    let why = refusal(EcdasForm::Halves, &all, &row, None).expect("refused");
-    assert_eq!(why, format!("constraints [{}]", 5 + HALVES_POSITIONS - 1));
-    // The mutant: each relation's C_31 a column of its own (λ's 1, the others 0).
-    let mut mutant = s.row(&carries, 3);
-    mutant[h::NUM_COLUMNS] = FE::one();
+    for rel in 0..3 {
+        let s = off_by_two_to_the_512(rel);
+        let t = s.limbs().terms();
+        let mut carries = [[(FE::zero(), FE::zero()); HALVES_CARRIES]; 3];
+        for (k, t) in t.iter().enumerate() {
+            let (c, exact) = halves_chain(t);
+            assert_eq!(exact, k != rel, "relation {k}'s chain");
+            if k == rel {
+                assert_eq!(c[HALVES_CARRIES - 1] + t[HALVES_POSITIONS - 1], 1 << 16);
+            }
+            for (j, &c) in c.iter().enumerate() {
+                let (l, high) = split_carry(c);
+                assert!((0..256).contains(&high));
+                carries[k][j] = (FE::from(l), fe(high));
+            }
+        }
+        let row = s.row(&carries, 0);
+        let why = refusal(EcdasForm::Halves, &all, &row, None).expect("refused");
+        assert_eq!(
+            why,
+            format!(
+                "constraints [{}]",
+                5 + HALVES_POSITIONS * rel + HALVES_POSITIONS - 1
+            ),
+            "relation {rel}"
+        );
+        // The mutant: each relation's C_31 a column of its own (this one's 1).
+        let mut mutant = s.row(&carries, 3);
+        mutant[h::NUM_COLUMNS + rel] = FE::one();
+        assert_eq!(
+            refusal(EcdasForm::Halves, &all, &mutant, Some(h::NUM_COLUMNS)),
+            None,
+            "relation {rel}: the control"
+        );
+    }
+}
+
+/// The failing constraints of the limb form on `row`.
+fn failing(row: &[FE]) -> Vec<usize> {
+    eval_row(EcdasForm::Halves, row, None)
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v != FE::zero())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// ★ Every carry identity is load-bearing, one at a time: on honest rows (an
+/// add and a double), `LO_k + 1` of relation `r` (the carry `C_k` one more)
+/// breaks exactly the two identities that read `C_k` — `k`'s
+/// (`2^16·C_k − C_{k−1} − S'_k`) and `k + 1`'s — at `5 + 32r + k` and
+/// `5 + 32r + k + 1`. An identity emitted as zero would leave its index out.
+#[test]
+fn each_carry_identity_reads_its_two_carries() {
+    let mut rng = Rng(21);
+    for op in [1, 0] {
+        let s = loop {
+            let s = random_step(&mut rng);
+            if s.op == op {
+                break s;
+            }
+        };
+        let row = s.honest_row();
+        assert!(failing(&row).is_empty(), "op {op}: the honest row");
+        for (r, &(lo, _, _)) in h::RELATIONS.iter().enumerate() {
+            for k in 0..HALVES_CARRIES {
+                let mut bumped = row.clone();
+                bumped[lo + k] += FE::one();
+                let at = 5 + HALVES_POSITIONS * r + k;
+                assert_eq!(
+                    failing(&bumped),
+                    vec![at, at + 1],
+                    "op {op} relation {r} carry {k}"
+                );
+            }
+        }
+    }
+}
+
+/// ★ The five flag constraints of the limb form, each the only one (or among
+/// those) to refuse its row: `NEXT_OP = 2` on a double → `[2]`; `NEXT_OP = 1`
+/// on a padding row (op 0, every carry zero) → `[4]`; `OP = NEXT_OP = 1` → 3
+/// among them; `OP = 2` → 1 among them; `MU = 2` → 0 among them.
+#[test]
+fn each_flag_constraint_refuses_its_row() {
+    let mut rng = Rng(23);
+    let step = |op: u64, rng: &mut Rng| loop {
+        let s = random_step(rng);
+        if s.op == op {
+            break s;
+        }
+    };
+    let double = step(0, &mut rng).honest_row();
+    let add = step(1, &mut rng).honest_row();
+    assert!(failing(&double).is_empty() && failing(&add).is_empty());
+    // A padding row: everything zero but each carry's zero split; op 0.
+    let mut padding = vec![FE::zero(); h::NUM_COLUMNS];
+    let (_, hi_zero) = split_carry(0);
+    for &(_, hi, _) in &h::RELATIONS {
+        for k in 0..HALVES_CARRIES {
+            padding[hi + k] = fe(hi_zero);
+        }
+    }
+    assert!(failing(&padding).is_empty(), "the padding row holds");
+
+    let mut row = double.clone();
+    row[h::NEXT_OP] = FE::from(2u64);
+    assert_eq!(failing(&row), vec![2], "NEXT_OP = 2 on a double");
+
+    let mut row = padding.clone();
+    row[h::NEXT_OP] = FE::one();
+    assert_eq!(failing(&row), vec![4], "NEXT_OP = 1 on a padding row");
+
+    let mut row = add.clone();
+    row[h::NEXT_OP] = FE::one();
+    assert!(failing(&row).contains(&3), "OP = NEXT_OP = 1");
+
+    let mut row = add.clone();
+    row[h::OP] = FE::from(2u64);
+    assert!(failing(&row).contains(&1), "OP = 2");
+
+    let mut row = add;
+    row[h::MU] = FE::from(2u64);
+    assert!(failing(&row).contains(&0), "MU = 2");
+}
+
+/// The limb form's captured program (constraints and LogUp emission), pinned
+/// as built at the commit that added it. Moved by any change to the limb
+/// form's constraint body or interactions.
+#[test]
+fn the_limb_forms_air_is_pinned() {
+    let opts = stark::proof::options::ProofOptions::default_test_options();
     assert_eq!(
-        refusal(EcdasForm::Halves, &all, &mutant, Some(h::NUM_COLUMNS)),
-        None
+        program_digest(&create_ecdas_halves_air(&opts)),
+        "f1bf6c4e32dba2a323b17780313069093061dc7606e6b7f38fadff6efafb8b09"
     );
 }
 
