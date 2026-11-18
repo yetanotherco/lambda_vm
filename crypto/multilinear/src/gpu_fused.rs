@@ -296,6 +296,14 @@ pub fn force_argue_fused(on: Option<bool>) {
     store_forced(&FUSED_FORCED, on);
 }
 
+/// Whether each fused table's card times are logged as its rounds end
+/// (`LAMBDA_VM_ARGUE_FUSED_TIMES=1`; default off): a measurement, moving no
+/// byte. Read once.
+pub fn argue_fused_times() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_is("LAMBDA_VM_ARGUE_FUSED_TIMES"))
+}
+
 /// Whether the fused rounds are cross-checked against today's
 /// (`LAMBDA_VM_ARGUE_FUSED_XCHECK=1`; default off). Read once.
 pub fn argue_fused_xcheck() -> bool {
@@ -465,6 +473,8 @@ pub struct FusedTimes {
     pub roots: usize,
     pub terms: usize,
     pub slots: usize,
+    /// The table's variables (`2^vars` rows).
+    pub vars: usize,
 }
 
 static DEVICE_TAILS: AtomicU64 = AtomicU64::new(0);
@@ -786,6 +796,7 @@ where
             roots: constraints.roots().len(),
             terms: slots.len(),
             slots: lowered.num_slots,
+            vars: num_vars,
             ..FusedTimes::default()
         };
         Some(Ok(Self {

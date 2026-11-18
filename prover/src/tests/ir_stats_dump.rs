@@ -129,5 +129,9 @@ fn dump_ir_stats() {
     stats(&create_keccak_rc_air(&opts), "KECCAK_RC");
     stats(&create_ecsm_air(&opts), "ECSM");
     stats(&create_ecdas_air(&opts), "ECDAS");
+    stats(&create_ecrec_air(&opts), "ECREC");
+    stats(&create_ecrec_w_air(&opts), "ECREC_W");
+    stats(&create_keccak_w_air(&opts), "KECCAK_W");
+    stats(&create_copy_w_air(&opts), "COPY_W");
     stats(&create_is_wh_air(&opts), "IS_WH");
 }
