@@ -605,6 +605,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 cpu_decoded: 0,
                 memw_aligned_rows: 0,
                 shift_rows: 0,
+                keccak_ops: 0,
             },
             stamps: WindowStamps::default(),
             stream_memw_lt: false,
@@ -872,6 +873,19 @@ impl<'a> WindowedTraceBuilder<'a> {
         }
         self.emitted.keccak_rnd_rows = rows;
         Ok(self)
+    }
+
+    /// With [`Self::drop_streamed_ops`] and the hand-out counted on a thread of
+    /// its own ([`Self::count_handout_on_thread`]): each window's keccak
+    /// operations have their BITWISE lookups counted on that thread as the
+    /// window arrives, and the finish counts only the last window's
+    /// ([`super::PreCounted::keccak_ops`]). The histogram is a sum, so the
+    /// multiplicities are the same; the finish's count of BITWISE's other
+    /// sources no longer waits for the run's keccak work. Without that thread
+    /// nothing changes.
+    pub fn count_keccak_in_windows(mut self) -> Self {
+        self.emitted.count_keccak_in_windows = true;
+        self
     }
 
     /// With [`Self::keccak_rnd_chunks`]: each KECCAK_RND chunk handed out
@@ -2587,6 +2601,22 @@ impl Accumulator<'_> {
             let counter = self
                 .count
                 .counter(self.decode, self.stream_memw_lt, self.counted);
+            // The window's keccak operations' BITWISE lookups, on the
+            // counting thread ([`WindowedTraceBuilder::count_keccak_in_windows`]):
+            // a copy of the operations the list gained, in run order.
+            if self.emitted.count_keccak_in_windows
+                && let Some(counter) = counter
+            {
+                let list = &kept.rest.keccak_ops;
+                let (from, to) = (self.counted.keccak_ops, list.len());
+                if to > from {
+                    counter.send(CountWork::Keccak(
+                        list.range(from, to).into_owned(),
+                        self.emitted.keccak_rnd_form,
+                    ));
+                    self.counted.keccak_ops = to;
+                }
+            }
             let jobs = tail_jobs(
                 self.max_rows,
                 self.stream_memw_lt,

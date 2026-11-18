@@ -337,6 +337,19 @@ fn count_bitwise(
     let (aligned_counted, shift_counted) = pre
         .as_ref()
         .map_or((0, 0), |pre| (pre.memw_aligned_rows, pre.shift_rows));
+    // The keccak operations counted as their windows arrived
+    // ([`PreCounted::keccak_ops`]): the rest.
+    let keccak_parts: Vec<&[KeccakOperation]> = {
+        let mut skip = pre.as_ref().map_or(0, |pre| pre.keccak_ops);
+        keccak_ops
+            .parts()
+            .filter_map(|part| {
+                let from = skip.min(part.len());
+                skip -= from;
+                (from < part.len()).then(|| &part[from..])
+            })
+            .collect()
+    };
     let memw_aligned_ops = &memw_aligned_ops[aligned_counted.min(memw_aligned_ops.len())..];
     let shift_parts: Vec<&[ShiftOperation]> = {
         let mut skip = shift_counted;
@@ -499,8 +512,8 @@ fn count_bitwise(
     }
     starts.push(("KECCAK", collectors.len()));
     let keccak_slice = p4_slice_len(P4Source::Keccak, mul_chunk, dvrm_chunk);
-    for slice in keccak_ops
-        .parts()
+    for slice in keccak_parts
+        .iter()
         .flat_map(|part| part.chunks(keccak_slice))
     {
         collectors.push(Box::new(move |h| {

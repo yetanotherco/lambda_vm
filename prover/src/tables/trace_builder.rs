@@ -7700,6 +7700,14 @@ pub struct StreamSkip {
     ///
     /// [`WindowedTraceBuilder::stream_keccak_rnd_records`]: windowed::WindowedTraceBuilder::stream_keccak_rnd_records
     pub keccak_rnd_records: bool,
+    /// The keccak operations' BITWISE lookups counted on the hand-out's
+    /// counting thread as their windows arrive, so the finish counts only the
+    /// operations past them ([`PreCounted::keccak_ops`],
+    /// [`WindowedTraceBuilder::count_keccak_in_windows`]). The multiplicities
+    /// are the same. `false` everywhere else.
+    ///
+    /// [`WindowedTraceBuilder::count_keccak_in_windows`]: windowed::WindowedTraceBuilder::count_keccak_in_windows
+    pub count_keccak_in_windows: bool,
     /// Rows per KECCAK, ECSM, ECDAS and COPY table when the build cuts them
     /// into the tables the block's split makes ([`cut_tables`], each packed as
     /// it is built with [`Self::pack`]); zero builds each whole, as every build
@@ -7918,6 +7926,11 @@ pub(crate) struct PreCounted {
     pub(crate) cpu_decoded: usize,
     pub(crate) memw_aligned_rows: usize,
     pub(crate) shift_rows: usize,
+    /// How many of the run's first keccak operations had their BITWISE
+    /// lookups counted into the histogram as their windows arrived
+    /// (`WindowedTraceBuilder::count_keccak_in_windows`): the finish counts
+    /// from there. Zero otherwise.
+    pub(crate) keccak_ops: usize,
 }
 
 impl PreCounted {

@@ -113,6 +113,12 @@ pub(super) enum CountWork {
     Memw(Segments<MemwOperation>),
     Lt(Segments<LtOperation>),
     Shift(Segments<ShiftOperation>),
+    /// A window's keccak operations (a copy), whose BITWISE lookups are
+    /// counted as KECCAK_RND's byte checks are sent under the form.
+    Keccak(
+        Vec<super::super::keccak::KeccakOperation>,
+        crate::tables::keccak_rnd::KeccakRndForm,
+    ),
 }
 
 /// Where the counter's thread spent its time, seconds, and what the builder
@@ -190,6 +196,10 @@ impl Counts {
             CountWork::Shift(ops) => {
                 count_shift(&ops, &mut self.histogram);
                 StreamTable::Shift
+            }
+            CountWork::Keccak(ops, form) => {
+                super::super::count_bitwise_from_keccak_for(&ops, form, &mut self.histogram);
+                StreamTable::KeccakRnd
             }
         }
     }

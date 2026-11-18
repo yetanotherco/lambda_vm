@@ -1942,6 +1942,63 @@ fn keccak_rnd_streamed_as_records_are_the_finishs_tables() {
     assert!(streamed_any > 0, "no KECCAK_RND table streamed");
 }
 
+/// ★ The keccak operations' BITWISE lookups counted on the hand-out's thread
+/// as their windows arrive ([`WindowedTraceBuilder::count_keccak_in_windows`])
+/// build the finish's tables of a build that counts them at the finish, table
+/// for table — BITWISE's multiplicities included — under both padding rules,
+/// at windows of 1, 7 and 1000 cycles; the counting thread took keccak work
+/// wherever a window before the last held some.
+#[test]
+fn keccak_lookups_counted_in_the_windows_build_the_same_tables() {
+    let max_rows = MaxRowsConfig::small();
+    let mut counted_any = 0usize;
+    for name in ["test_keccak_multi", "test_keccak"] {
+        let (program, logs) = run(name);
+        for padding in [CutPadding::LastTable, CutPadding::WholeRun] {
+            for window in [1, 7, 1000] {
+                let what = format!("{name} {padding:?} window {window}");
+                let at_finish = move |b| cut(b, padding).count_handout_on_thread(true);
+                let in_windows = move |b| {
+                    cut(b, padding)
+                        .count_handout_on_thread(true)
+                        .count_keccak_in_windows()
+                };
+                let (builder, last) = pushed(&program, &logs, &max_rows, window, &at_finish);
+                let (want, _) = streamed_keeping(builder, last, false);
+                let (mut builder, last) = pushed(&program, &logs, &max_rows, window, &in_windows);
+                builder.join_handout_count().expect("the counting thread");
+                let keccak_chunks = builder
+                    .stamps()
+                    .count_thread
+                    .map_or(0, |stamps| stamps.chunks[StreamTable::KeccakRnd.position()]);
+                counted_any += keccak_chunks;
+                let (got, _) = streamed_keeping(builder, last, false);
+                assert_eq!(got.len(), want.len(), "{what}: the tables");
+                for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(g.position, w.position, "{what}: position {k}");
+                    let (Some(g), Some(w)) = (&g.table, &w.table) else {
+                        assert!(g.table.is_none() && w.table.is_none(), "{what}: slot {k}");
+                        continue;
+                    };
+                    assert_eq!(
+                        first_difference(&packed_bytes(g), &packed_bytes(w)),
+                        None,
+                        "{what}: table {k}"
+                    );
+                    assert!(
+                        shape_and_words(g) == shape_and_words(w),
+                        "{what}: table {k}'s words"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        counted_any > 0,
+        "no window's keccak work was counted on the thread"
+    );
+}
+
 /// The records fault a block test plants ([`WindowedTraceBuilder::card_fill_records_fault`])
 /// moves the records themselves: every KECCAK_RND table with a real row is
 /// then another table than the finish builds without it, however it is

@@ -1529,6 +1529,38 @@ fn parse_own_keccak_rnd_groups(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
+/// The knob of [`count_keccak_in_windows`].
+const COUNT_KECCAK_IN_WINDOWS_ENV: &str = "LAMBDA_VM_COUNT_KECCAK_IN_WINDOWS";
+
+/// Whether the keccak operations' BITWISE lookups are counted on the
+/// hand-out's counting thread as their windows arrive, leaving the finish's
+/// count of BITWISE's other sources only the last window's
+/// ([`WindowedTraceBuilder::count_keccak_in_windows`]): a deviation's choice,
+/// else `LAMBDA_VM_COUNT_KECCAK_IN_WINDOWS` (off by default). The
+/// multiplicities, and so the proof, are the same.
+fn count_keccak_in_windows(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => parse_count_keccak_in_windows(
+            std::env::var(COUNT_KECCAK_IN_WINDOWS_ENV).ok().as_deref(),
+        ),
+    }
+}
+
+/// `LAMBDA_VM_COUNT_KECCAK_IN_WINDOWS`: `1` counts the keccak operations'
+/// BITWISE lookups as their windows arrive; unset, empty or `0` (the default)
+/// at the finish. Anything else refuses the prove.
+fn parse_count_keccak_in_windows(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{COUNT_KECCAK_IN_WINDOWS_ENV}={v}: 0 (the default: at the finish) or 1 (as the \
+             windows arrive)"
+        ))),
+    }
+}
+
 /// The knob of [`rest_airs_beside`].
 const REST_AIRS_BESIDE_ENV: &str = "LAMBDA_VM_REST_AIRS_BESIDE";
 
@@ -4321,6 +4353,10 @@ pub(crate) struct Deviations {
     /// the accumulator's (`Some(false)`), instead of the default (`None`: a
     /// thread of its own; [`WindowedTraceBuilder::count_handout_on_thread`]).
     pub handout_count_thread: Option<bool>,
+    /// The keccak operations' BITWISE lookups counted as their windows arrive
+    /// (`Some(true)`) or at the finish (`Some(false)`), instead of the knob
+    /// ([`count_keccak_in_windows`]).
+    pub count_keccak_in_windows: Option<bool>,
     /// The host's memory target, in bytes, instead of the machine's
     /// ([`memory_target_bytes`]): 0 makes the `auto` rule want every table out.
     pub memory_target: Option<u64>,
@@ -7375,6 +7411,15 @@ fn prove_streamed(
                 "built at the finish"
             }
         );
+        let keccak_in_windows = count_keccak_in_windows(deviations.count_keccak_in_windows)?;
+        eprintln!(
+            "★ BLOCK KECCAK COUNT: {} ({COUNT_KECCAK_IN_WINDOWS_ENV})",
+            if keccak_in_windows {
+                "BITWISE lookups counted as the windows arrive"
+            } else {
+                "BITWISE lookups counted at the finish (the default)"
+            }
+        );
         let own_groups =
             stream_keccak_rnd && own_keccak_rnd_groups(deviations.keccak_rnd_own_groups)?;
         if stream_keccak_rnd {
@@ -7621,6 +7666,9 @@ fn prove_streamed(
                 }
                 if let Some(on) = deviations.handout_count_thread {
                     builder = builder.count_handout_on_thread(on);
+                }
+                if keccak_in_windows {
+                    builder = builder.count_keccak_in_windows();
                 }
                 if options.drop_streamed_ops {
                     builder = builder.drop_streamed_ops()?;
@@ -12051,6 +12099,22 @@ mod rest_airs_beside_tests {
         );
         for bad in ["yes", "2", "on", "off"] {
             assert!(super::parse_stream_keccak_rnd(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// The keccak-in-windows count's knob: off unset, empty or `0` (the
+    /// default); on at `1`; any other word refuses.
+    #[test]
+    fn the_keccak_count_knob_is_off_by_default_and_refuses_other_words() {
+        for off in [None, Some(""), Some("0"), Some(" 0\n")] {
+            assert!(!super::parse_count_keccak_in_windows(off).expect("a word it takes"));
+        }
+        assert!(super::parse_count_keccak_in_windows(Some("1")).expect("on"));
+        for bad in ["yes", "2", "on"] {
+            assert!(
+                super::parse_count_keccak_in_windows(Some(bad)).is_err(),
+                "{bad}"
+            );
         }
     }
 
