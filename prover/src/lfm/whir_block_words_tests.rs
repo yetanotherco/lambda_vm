@@ -467,8 +467,9 @@ fn p1_format(memory: MemoryFormat, leaf_scale: LeafScale) -> BlockFormat {
 /// groups packed as the prover packs them
 /// ([`stark::multilinear_block::block_groups`]). The AIR set is the frame's
 /// (`crate::block_airs`, and under the word format
-/// `VmAirs::with_word_memory`), so the heights land on the tables the
-/// verifier builds. The word families' counts are its `word_memory`.
+/// `VmAirs::with_word_memory_at` at the format's page runs, each page table at
+/// its own height), so the heights land on the tables the verifier builds. The
+/// word families' counts are its `word_memory`.
 fn mix_statement(
     elf_bytes: &[u8],
     opts: &ProofOptions,
@@ -556,9 +557,15 @@ fn mix_statement(
         format.ecdas,
     );
     if format.memory == MemoryFormat::Words {
-        airs.with_word_memory(opts, words, &page_configs)
+        airs.with_word_memory_at(opts, words, &page_configs, format.page_run_log2)
             .expect("the word tables");
     }
+    let page_rows: std::collections::HashMap<String, usize> =
+        crate::tables::page_w::page_tables(&page_configs, format.page_run_log2)
+            .expect("the page tables")
+            .iter()
+            .map(|t| (t.name(), t.rows()))
+            .collect();
     let rows: Vec<usize> = airs
         .air_refs()
         .iter()
@@ -567,6 +574,11 @@ fn mix_statement(
             let name = air.name();
             if i < crate::FIXED_TABLE_COUNT {
                 return air.precomputed_columns().first().map_or(32, Vec::len);
+            }
+            if format.memory == MemoryFormat::Words
+                && let Some(&rows) = page_rows.get(name)
+            {
+                return rows;
             }
             if name.starts_with(crate::tables::page_w::NAME_PREFIX) {
                 return crate::tables::page_w::ROWS;
@@ -2809,4 +2821,131 @@ fn a_word_block_leaf_refuses_a_forged_block_offset() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The small word block's statement with `runtime_pages` zero pages from a
+/// 64-page-aligned base and two private-input pages, cut at `page_run_log2`
+/// under the verifier's pinned format with the word memory format.
+fn pinned_statement_at(page_run_log2: u8, runtime_pages: usize) -> OwnedBlockStatement {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let format = BlockFormat::pinned()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(page_run_log2);
+    let opts = crate::lfm::proof::block_base_options_under(&format.zf);
+    mix_statement(elf, &opts, &format, SMALL_WORDS, runtime_pages, 2)
+}
+
+/// The verifier's plan of `owned` under the pinned named choices, the word
+/// memory format and `page_run_log2` (the tree verifier's presets).
+fn verifier_plan_at(
+    owned: &OwnedBlockStatement,
+    page_run_log2: u8,
+) -> Result<WhirBlockPlan, String> {
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let pinned = BlockFormat::pinned();
+    let presets = super::verifier_presets_at(
+        pinned.group,
+        crate::zf_format::WhirBlowup::Two,
+        pinned.zf.whir_leaves,
+        pinned.zf.whir_trees,
+        pinned.leaf_scale,
+        pinned.leaf_query,
+        multilinear::whir_chain::GkrPack::PRODUCTION,
+        MemoryFormat::Words,
+        page_run_log2,
+    )?;
+    assert_eq!(
+        presets.format.page_run_log2, page_run_log2,
+        "the presets' page run"
+    );
+    super::verifier_plan(elf, owned.view(), &presets)
+}
+
+/// ★ The tree verifier's named page run is its own: `verifier_presets_at`
+/// takes it into the verifier's format, and its plan of a word statement cut
+/// at runs of 4 pages (8 zero pages, two private-input pages: two zero blocks
+/// and a private one) derives at 4, its page tables those blocks, the prover's
+/// own plan of it (the same block identity). At runs off and at 8 pages, whose
+/// cuts differ, the same statement is refused; and a statement cut with runs
+/// off is refused at 4.
+#[test]
+fn the_tree_verifier_takes_its_named_page_run() {
+    use crate::tables::page_w::PageTableKind;
+    let at2 = pinned_statement_at(2, 8);
+    let plan = verifier_plan_at(&at2, 2).expect("the plan at runs of 4");
+    let blocks: Vec<(PageTableKind, usize)> = plan
+        .frame
+        .page_tables
+        .iter()
+        .filter(|t| t.kind != PageTableKind::Page)
+        .map(|t| (t.kind, t.pages()))
+        .collect();
+    assert_eq!(
+        blocks,
+        [
+            (PageTableKind::Zero, 4),
+            (PageTableKind::Zero, 4),
+            (PageTableKind::Private, 2)
+        ]
+    );
+    let elf: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let format = BlockFormat::pinned()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(2);
+    let prover = WhirBlockPlan::derive(
+        elf,
+        &crate::lfm::proof::block_base_options_under(&format.zf),
+        &format,
+        at2.view(),
+        None,
+    )
+    .expect("the prover's plan");
+    assert_eq!(
+        plan.id(),
+        prover.id(),
+        "the verifier asks for the prover's block"
+    );
+    for other in [0u8, 3] {
+        let refused = verifier_plan_at(&at2, other).err().expect("another cut");
+        assert!(refused.contains("statement"), "at 2^{other}: {refused}");
+    }
+    let off = pinned_statement_at(0, 8);
+    assert!(verifier_plan_at(&off, 0).is_ok());
+    assert!(verifier_plan_at(&off, 2).is_err());
+}
+
+/// ★ Every table of a plan with page blocks takes its route, and every leaf
+/// emits: a zero block's and a private block's route checks `OFFSET` alone at
+/// the block's height, a page of data's PAGE_W's five columns; the leaves
+/// route every table of their groups ([`route_of`] on each).
+#[test]
+fn every_route_of_a_plan_with_page_blocks_is_held_and_its_leaves_emit() {
+    use crate::tables::page_w::PageTableKind;
+    let plan = verifier_plan_at(&pinned_statement_at(2, 8), 2).expect("the plan at runs of 4");
+    let refs = plan.frame.airs.air_refs();
+    let first = crate::block_whir::first_page_index(&plan.frame.airs).expect("the pages");
+    for (i, table) in plan.frame.page_tables.iter().enumerate() {
+        let t = first + i;
+        let route = super::route_of(&plan, refs[t], t, first).expect("its route");
+        let Route::Page(columns) = &route else {
+            panic!("{}: not a page route", table.name())
+        };
+        let want = match table.kind {
+            PageTableKind::Page => {
+                crate::tables::page_w::num_preprocessed_cols(&plan.frame.page_configs[table.first])
+            }
+            PageTableKind::Zero | PageTableKind::Private => 1,
+        };
+        assert_eq!(columns.len(), want, "{}", table.name());
+        assert!(
+            columns.iter().all(|c| c.len() == table.rows()),
+            "{}: its columns at its height",
+            table.name()
+        );
+    }
+    for t in 0..refs.len() {
+        super::route_of(&plan, refs[t], t, first)
+            .unwrap_or_else(|e| panic!("table {t} ({}): {e}", refs[t].name()));
+    }
+    emit_leaves(&plan).expect("every leaf emits");
 }
