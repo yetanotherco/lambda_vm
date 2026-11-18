@@ -506,6 +506,7 @@ fn term_ranges() -> [[(i64, i64); HALVES_POSITIONS]; 3] {
             .sum()
     };
     let mut out = [[(0, 0); HALVES_POSITIONS]; 3];
+    #[allow(clippy::needless_range_loop)]
     for k in 0..HALVES_POSITIONS {
         let c = pairs(k) * M * M;
         // op = 1: Σ λ·Δx in [−c, c], + yA − yG; op = 0: 2·Σ λ·yA − 3·Σ xA·xA.
@@ -974,7 +975,7 @@ fn a_relation_off_by_two_to_the_512_is_refused_by_the_closing_rule() {
         two_512,
         "the λ relation's total is 2^512"
     );
-    assert_ne!((&two_512).mod_floor(&p), BigInt::zero());
+    assert_ne!(two_512.mod_floor(&p), BigInt::zero());
     // Its chain below the top is exact; the top carry would be 1.
     let (c, exact) = halves_chain(&t[0]);
     assert!(!exact);
@@ -1224,15 +1225,16 @@ fn a_limb_form_block_proves_and_each_form_refuses_the_other() {
 #[test]
 fn the_whole_run_build_refuses_the_limb_form() {
     let elf = crate::test_utils::asm_elf_bytes("test_ecsm");
-    let err = crate::block_whir::prove_block_whir_with(
+    let refused = crate::block_whir::prove_block_whir_with(
         &elf,
         &[],
         &stark::proof::options::ProofOptions::default_test_options(),
         &block_format(EcdasForm::Halves),
         &crate::tests::block_whir_p1_tests::options(0),
         &crate::block_whir::Deviations::default(),
-    )
-    .err()
-    .expect("refused");
+    );
+    let Err(err) = refused else {
+        panic!("the whole-run build proved the limb form");
+    };
     assert!(format!("{err:?}").contains("ECDAS"), "{err:?}");
 }
