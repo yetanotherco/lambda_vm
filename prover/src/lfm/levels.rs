@@ -572,15 +572,22 @@ impl Drop for PadRelease {
 /// card (every stream drained, the pool trimmed), and the levels' one table
 /// of 2^29 cells on a large block needs its GKR trees on the card at once: at
 /// 80 % its argue was refused a 1.73 GiB tree with 0.86 GiB of room and built
-/// on the host (13.4 s). Unset or empty (the default): the base's budget. A
-/// whole number from 50 to 95; anything else is refused. A prover's choice,
-/// never the proof's: a refused promise has a host path.
+/// on the host (13.4 s). At 85 % the card's real peak through every argue is
+/// read beside the ledger (`card at the argue`, phase B's card windows).
+/// Unset or empty: [`LEVELS_CARD_BUDGET_DEFAULT_PCT`]. A whole number from 50
+/// to 95 overrides it (80 gives the levels the base's default share);
+/// anything else is refused. A prover's choice, never the proof's: a refused
+/// promise has a host path.
 pub const CARD_BUDGET_ENV: &str = "LAMBDA_VM_LEVELS_CARD_BUDGET_PCT";
 
-/// What [`CARD_BUDGET_ENV`] says: the percent, `None` when unset or empty.
+/// The levels' share of the card when [`CARD_BUDGET_ENV`] says nothing.
+pub const LEVELS_CARD_BUDGET_DEFAULT_PCT: u64 = 85;
+
+/// What [`CARD_BUDGET_ENV`] says: the percent ([`LEVELS_CARD_BUDGET_DEFAULT_PCT`]
+/// when unset or empty).
 pub fn parse_card_budget(value: Option<&str>) -> Result<Option<u64>, String> {
     match value.map(str::trim) {
-        None | Some("") => Ok(None),
+        None | Some("") => Ok(Some(LEVELS_CARD_BUDGET_DEFAULT_PCT)),
         Some(v) => match v.parse::<u64>() {
             Ok(pct) if (50..=95).contains(&pct) => Ok(Some(pct)),
             _ => Err(format!(
@@ -590,18 +597,29 @@ pub fn parse_card_budget(value: Option<&str>) -> Result<Option<u64>, String> {
     }
 }
 
+/// The levels' share of the card: [`CARD_BUDGET_ENV`], or its default; `None`
+/// (the base's budget kept) when the knob says nothing and the process set
+/// its whole card budget itself (`LAMBDA_VM_VRAM_BUDGET_MB`, a test's
+/// throttle).
 fn card_budget_pct() -> Result<Option<u64>, String> {
     static PCT: std::sync::OnceLock<Result<Option<u64>, String>> = std::sync::OnceLock::new();
-    PCT.get_or_init(|| parse_card_budget(std::env::var(CARD_BUDGET_ENV).ok().as_deref()))
-        .clone()
+    PCT.get_or_init(|| {
+        let word = std::env::var(CARD_BUDGET_ENV).ok();
+        let silent = word.as_deref().is_none_or(|w| w.trim().is_empty());
+        if silent && std::env::var_os("LAMBDA_VM_VRAM_BUDGET_MB").is_some() {
+            return Ok(None);
+        }
+        parse_card_budget(word.as_deref())
+    })
+    .clone()
 }
 
 /// The base's budget while the levels' own is in force ([`CARD_BUDGET_ENV`]).
 static BASE_BUDGET: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 
-/// Puts the levels' budget in force ([`CARD_BUDGET_ENV`]) on a card of
-/// `total` bytes: the budget now (unchanged when the knob is unset or there is
-/// no card).
+/// Puts the levels' budget in force ([`CARD_BUDGET_ENV`], 85 % by default) on
+/// a card of `total` bytes: the budget now (unchanged without a card, or when
+/// the process set its own card budget and the knob says nothing).
 fn take_levels_budget(total: Option<u64>) -> Result<u64, String> {
     let (Some(pct), Some(total)) = (card_budget_pct()?, total) else {
         return Ok(multilinear::gpu::reserve_budget());
