@@ -1097,6 +1097,168 @@ fn the_three_memory_formats_give_three_statements() {
 
 use crate::block_whir::{BlockWhirProof, Deviations, verify_block_whir};
 use crate::tables::MaxRowsConfig;
+/// The page tables of the block route tests: zero pages 4..8 from [`BASE`]'s
+/// page (one block of four at runs of 4), a page of data after them, two
+/// private-input pages (one block of two).
+fn block_pages() -> Vec<PageConfig> {
+    let size = crate::tables::page::DEFAULT_PAGE_SIZE as u64;
+    let mut pages: Vec<PageConfig> = (0..4)
+        .map(|i| PageConfig::zero_init(BASE + i * size))
+        .collect();
+    pages.push(page_kinds()[0].1.clone());
+    pages[4].page_base = BASE + 4 * size;
+    let input = executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+    for i in 0..2 {
+        pages.push(PageConfig::with_private_input(
+            input + i * size,
+            vec![i as u8 + 1; 700],
+        ));
+    }
+    pages
+}
+
+/// ★ A page block's route under page runs: `OFFSET` alone at the block's
+/// height, the table's own preprocessed column, held by the count and the
+/// height checks; a page of data keeps its PAGE_W route. Refused: a block
+/// route for a table named another block (another base, page count or
+/// class) — control, the name check taken out ([`Fault::OtherPageKind`]),
+/// and the route passes the route checks; a block under the split or fused
+/// format; a block's column at another stated height.
+#[test]
+fn a_page_blocks_route_is_its_own_offset_at_its_height() {
+    use crate::tables::page_w::{self, PageTable, PageTableKind};
+    let pages = block_pages();
+    let tables = page_w::page_tables(&pages, 2).expect("cut");
+    assert_eq!(
+        tables
+            .iter()
+            .map(|t| (t.kind, t.pages()))
+            .collect::<Vec<_>>(),
+        [
+            (PageTableKind::Zero, 4),
+            (PageTableKind::Page, 1),
+            (PageTableKind::Private, 2)
+        ]
+    );
+    for table in &tables {
+        let air = crate::test_utils::create_page_table_air(&opts(), table, &pages)
+            .expect("the verifier's table");
+        let columns = super::page_table_columns(MemoryFormat::Words, table, &pages, air.name())
+            .expect("its route");
+        assert_eq!(
+            columns,
+            air.precomputed_columns(),
+            "{}: the route's columns are the table's own",
+            air.name()
+        );
+        let declared = air.num_precomputed_columns();
+        let route = Route::Page(columns);
+        check_route_columns(&route, declared, table.num_vars(), air.name(), 0).expect("held");
+        if table.kind == PageTableKind::Page {
+            assert_eq!(
+                route.columns_checked(),
+                page_columns(MemoryFormat::Words, &pages[table.first], air.name())
+                    .expect("PAGE_W's")
+                    .len()
+            );
+            continue;
+        }
+        assert_eq!(declared, 1, "{}: OFFSET alone", air.name());
+        for wrong in [table.num_vars() - 1, table.num_vars() + 1] {
+            assert!(
+                check_route_columns(&route, declared, wrong, air.name(), 0).is_err(),
+                "{} stated at 2^{wrong}",
+                air.name()
+            );
+        }
+        let others = [
+            PageTable {
+                base: table.base + table.span(),
+                ..*table
+            },
+            PageTable {
+                log_pages: table.log_pages - 1,
+                ..*table
+            },
+            PageTable {
+                kind: if table.kind == PageTableKind::Zero {
+                    PageTableKind::Private
+                } else {
+                    PageTableKind::Zero
+                },
+                ..*table
+            },
+        ];
+        for other in others {
+            let name = other.name();
+            let refused = super::page_table_columns(MemoryFormat::Words, table, &pages, &name)
+                .expect_err("another block's name");
+            assert!(
+                refused.contains("the verifier's page table here"),
+                "{refused}"
+            );
+            let control = route_faults::with(Fault::OtherPageKind, || {
+                super::page_table_columns(MemoryFormat::Words, table, &pages, &name)
+            })
+            .map(Route::Page)
+            .and_then(|route| check_route_columns(&route, declared, table.num_vars(), &name, 0));
+            assert!(
+                control.is_ok(),
+                "{name}: without the name check: {control:?}"
+            );
+        }
+        for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
+            let refused = super::page_table_columns(memory, table, &pages, air.name())
+                .expect_err("no block under this format");
+            assert!(refused.contains("a page block under"), "{refused}");
+        }
+    }
+}
+
+/// ★ A page block's leg, on the route the leaf takes, at the block's height
+/// (`2^17` rows for four pages, `2^16` for two): it executes at the values the
+/// host's rebuild of the table's own `OFFSET` gives, at two points; `OFFSET`'s
+/// value one more is refused (the ramp's closed form at the block's height);
+/// a committed column is free.
+#[test]
+fn a_page_blocks_leg_holds_its_offset_at_the_blocks_height() {
+    use crate::tables::page_w::{self, PageTableKind};
+    let pages = block_pages();
+    let tables = page_w::page_tables(&pages, 2).expect("cut");
+    for table in tables.iter().filter(|t| t.kind != PageTableKind::Page) {
+        let num_vars = table.num_vars();
+        let air = crate::test_utils::create_page_table_air(&opts(), table, &pages)
+            .expect("the verifier's table");
+        let route = Route::Page(
+            super::page_table_columns(MemoryFormat::Words, table, &pages, air.name())
+                .expect("its route"),
+        );
+        let declared = air.num_precomputed_columns();
+        let host = air.precomputed_columns();
+        let (program, targets, width) = leg_program(air.as_ref(), &route, num_vars, declared);
+        assert_eq!(targets, vec![0], "{}: OFFSET leads the table", air.name());
+        for seed in [0x5eed_0011u64, 0x5eed_0012] {
+            let point = pseudo(seed, num_vars);
+            let values = honest_values(&host, &targets, width, &point, seed ^ 0x3C);
+            assert!(run_leg(&program, &point, &values), "{}: honest", air.name());
+            let mut wrong = values.clone();
+            wrong[targets[0]] += FEE::one();
+            assert!(
+                !run_leg(&program, &point, &wrong),
+                "{}: OFFSET moved is refused",
+                air.name()
+            );
+            let mut free = values.clone();
+            free[1] += FEE::one();
+            assert!(
+                run_leg(&program, &point, &free),
+                "{}: column 1 is committed",
+                air.name()
+            );
+        }
+    }
+}
+
 use crate::test_utils::asm_elf_bytes;
 
 use super::super::word::{LfmWord, word_as_ext};
@@ -1295,6 +1457,7 @@ fn word_build(
         .and_then(|b| b.memw_aligned_order(format.memw_aligned))
         .map(|b| b.keccak_rnd_form(format.keccak_rnd))
         .and_then(|b| b.memory_format(format.memory))
+        .and_then(|b| b.page_run_log2(format.page_run_log2))
         .expect("the builder");
     let window = 1000;
     let body = logs.len() - 1;
@@ -1650,6 +1813,7 @@ fn verify_file_under(file: &WhirBlockTreeProof, memory: MemoryFormat) -> Result<
         pinned.leaf_query,
         multilinear::whir_chain::GkrPack::PRODUCTION,
         memory,
+        0,
     )
 }
 
@@ -1670,6 +1834,7 @@ fn verifier_plan_under(
         pinned.leaf_query,
         multilinear::whir_chain::GkrPack::PRODUCTION,
         memory,
+        0,
     )?;
     super::verifier_plan(elf, owned.view(), &presets)
 }
@@ -2527,4 +2692,119 @@ fn others() {
         "{:?}",
         tests_running_test_ecrec_unlocked(&unlocked)
     );
+}
+
+/// The private input of the page-run leaves: two pages' worth.
+fn two_pages_of_input() -> Vec<u8> {
+    (0..(crate::tables::page::DEFAULT_PAGE_SIZE as u32 + 300))
+        .map(|i| (i * 7 + 3) as u8)
+        .collect()
+}
+
+/// ★ Every leaf of a word block whose pages are cut into blocks executes over
+/// its base proof and the leaves close the bus: `page_runs` (runs of zero
+/// pages from pages 64 and 81, two private-input pages) at runs of 2 and 16
+/// pages, each plan's page tables the rule's cut with zero and private blocks
+/// among them, and the two plans claiming two blocks (their ids differ).
+#[test]
+#[ignore = "proves word-format blocks with page runs and executes their leaves; box tier"]
+fn word_block_leaves_over_page_blocks_execute_and_close_the_bus() {
+    use crate::tables::page_w::{self, PageTableKind};
+    let elf = asm_elf_bytes("page_runs");
+    let input = two_pages_of_input();
+    let mut ids = Vec::new();
+    for run_log2 in [1u8, 4] {
+        let format = words_format().with_page_run(run_log2);
+        let proof = prove_words(&elf, &input, &format);
+        let plan = plan_over(&elf, &proof, &format);
+        assert_eq!(
+            plan.frame.page_tables,
+            page_w::page_tables(&plan.frame.page_configs, run_log2).expect("cut")
+        );
+        for kind in [PageTableKind::Zero, PageTableKind::Private] {
+            assert!(
+                plan.frame
+                    .page_tables
+                    .iter()
+                    .any(|t| t.kind == kind && t.pages() > 1),
+                "at 2^{run_log2}: a {kind:?} block"
+            );
+        }
+        let name = format!("page runs 2^{run_log2}");
+        let words = run_leaves(&plan, &proof, LeafChecks::ALL)
+            .unwrap_or_else(|e| panic!("{name}: an honest leaf executes: {e}"));
+        assert_leaves_claim_the_block(&name, &plan, &proof, &words);
+        ids.push(*plan.id());
+        println!(
+            "WORD BLOCK LEAVES {name}: {} groups · {} leaves · {} page tables",
+            plan.num_groups(),
+            plan.partition().num_leaves(),
+            plan.frame.page_tables.len()
+        );
+    }
+    assert_ne!(ids[0], ids[1], "two cuts, two blocks");
+}
+
+/// The last row of page table `page` no access touched (final timestamp 0),
+/// not its last row: a zero block's timestamp is its fourth column.
+fn untouched_row(traces: &crate::tables::trace_builder::Traces, page: usize) -> usize {
+    use crate::tables::page_w::{cols as pw, zero_cols as zw};
+    let t = &traces.pages[page];
+    let ts = if t.main_table.width == zw::NUM_COLUMNS {
+        zw::TIMESTAMP
+    } else {
+        pw::TIMESTAMP
+    };
+    (1..t.num_rows() - 1)
+        .rev()
+        .find(|&r| t.get_main(r, ts).canonical_u64() == 0)
+        .expect("an untouched word")
+}
+
+/// ★ On real proofs at runs of 16 pages: a zero block's and a private
+/// block's untouched row's `OFFSET` moved (a key minted twice), proved by a
+/// forger (the host verifier refuses each): a leaf refuses it, by the ramp at
+/// the block's height. Control: the page leg off (and the count check), every
+/// leaf executes and the shares cancel, so the page leg is what refuses.
+#[test]
+#[ignore = "proves forged word-format blocks with page runs and executes their leaves; box tier"]
+fn a_word_block_leaf_refuses_a_forged_block_offset() {
+    use crate::tables::page_w::{self, PageTableKind};
+    let format = words_format().with_page_run(4);
+    let elf = asm_elf_bytes("page_runs");
+    let input = two_pages_of_input();
+    let honest = word_build(&elf, &format, &input);
+    let tables = page_w::page_tables(&honest.page_configs, 4).expect("cut");
+    let mut wrong = Vec::new();
+    for kind in [PageTableKind::Zero, PageTableKind::Private] {
+        let page = tables
+            .iter()
+            .position(|t| t.kind == kind && t.pages() > 1)
+            .expect("a block of the class");
+        let mut forged = word_build(&elf, &format, &input);
+        let row = untouched_row(&forged, page);
+        edit_page(&mut forged, page, row, "offset");
+        let proof = prove_forged(&elf, &mut forged, &format);
+        assert!(
+            !matches!(
+                verify_block_whir(&proof, &elf, &test_opts(), &format),
+                Ok(true)
+            ),
+            "{kind:?}: the host verifier refuses it"
+        );
+        let plan = plan_over(&elf, &proof, &format);
+        if run_leaves(&plan, &proof, LeafChecks::ALL).is_ok() {
+            wrong.push(format!("{kind:?} offset: every leaf executes"));
+        }
+        let off = under(&[Fault::NoPageLeg, Fault::NoCountCheck], || {
+            run_leaves(&plan, &proof, LeafChecks::ALL)
+        });
+        if !off
+            .as_ref()
+            .is_ok_and(|w| share_sum(&plan, w) == FEE::zero())
+        {
+            wrong.push(format!("{kind:?} offset, page leg off: {:?}", off.err()));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
