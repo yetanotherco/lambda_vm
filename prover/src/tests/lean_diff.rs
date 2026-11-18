@@ -8,8 +8,7 @@
 //! `bus_interactions()`, the multiplicity and LogUp fingerprint expressions of
 //! `emit_multiplicity` and `emit_fingerprint` at fixed challenges, and matches
 //! them as multisets of functions (Schwartz–Zippel over [`TRIALS`] rows).
-//! The export signs each multiplicity (a pull is `−e`, a push `+e`), so a Rust
-//! sender, Clean's pull, is compared with its multiplicity negated. It also
+//! Direction, multiplicity and fingerprint are matched separately. It also
 //! checks that the Lean constraints vanish on honest Rust traces, padding rows
 //! included. The three tables read the current row only; a constraint on
 //! another row or an aux column fails in `eval_program_roots`, it is not
@@ -32,7 +31,7 @@ use stark::constraint_ir::{ConstraintProgram, eval_program_roots};
 use stark::constraints::builder::{
     CaptureBuilder, ConstraintBuilder, ConstraintSet, num_base_from_meta,
 };
-use stark::lookup::{BusInteraction, Multiplicity, emit_fingerprint, emit_multiplicity};
+use stark::lookup::{BusInteraction, emit_fingerprint, emit_multiplicity};
 
 use super::test_rng::SplitMix64;
 use crate::tables::types::{BusId, FE, FEE, GoldilocksExtension, GoldilocksField};
@@ -82,7 +81,8 @@ fn eval(e: &Expr, row: &[FE]) -> FE {
 
 struct LeanInteract {
     channel: String,
-    /// Signed as in Clean: a pull is `−e`, a push `+e`.
+    /// Clean's direction: a pull takes the message from the channel, a push adds it.
+    pull: bool,
     mult: Expr,
     msg: Vec<Expr>,
 }
@@ -113,6 +113,11 @@ fn load_lean(name: &str) -> LeanCircuit {
         } else if let Some(i) = op.get("interact") {
             interacts.push(LeanInteract {
                 channel: i["channel"].as_str().expect("channel").to_string(),
+                pull: match i["direction"].as_str().expect("direction") {
+                    "pull" => true,
+                    "push" => false,
+                    other => panic!("unknown direction {other}"),
+                },
                 mult: parse_expr(&i["multiplicity"]),
                 msg: i["message"]
                     .as_array()
@@ -277,9 +282,9 @@ fn fp_base(x: &FE) -> [u64; 3] {
     fp(&x.to_extension::<Gl3>())
 }
 
-/// An interaction over the random rows: bus, signed multiplicity per row (a Rust sender,
-/// Clean's pull, negated), LogUp fingerprint per row.
-type InteractionKey = (u64, Vec<[u64; 3]>, Vec<[u64; 3]>);
+/// An interaction over the random rows: bus, direction (`true` for a Rust sender, Clean's
+/// pull), multiplicity per row, LogUp fingerprint per row.
+type InteractionKey = (u64, bool, Vec<[u64; 3]>, Vec<[u64; 3]>);
 
 struct Report {
     lean_asserts_unmatched: Vec<usize>,
@@ -287,9 +292,6 @@ struct Report {
     lean_interacts_unmatched: Vec<String>,
     /// Indices into the Rust interactions.
     rust_interacts_unmatched: Vec<usize>,
-    /// The random rows and challenges the fingerprints were taken at.
-    random_rows: Vec<Vec<FE>>,
-    challenges: Challenges,
 }
 
 fn compare<CS: ConstraintSet<Gl, Gl3>>(
@@ -335,6 +337,7 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
                 .collect();
             (
                 bus_id_of(&i.channel),
+                i.pull,
                 evals.iter().map(|e| fp(&e.0)).collect(),
                 evals.iter().map(|e| fp(&e.1)).collect(),
             )
@@ -350,10 +353,8 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
                 .collect();
             (
                 i.bus_id,
-                evals
-                    .iter()
-                    .map(|e| fp(&if i.is_sender { -e.0 } else { e.0 }))
-                    .collect(),
+                i.is_sender,
+                evals.iter().map(|e| fp(&e.0)).collect(),
                 evals.iter().map(|e| fp(&e.1)).collect(),
             )
         })
@@ -366,9 +367,10 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
     let mut rust_interacts_unmatched = ri;
     rust_interacts_unmatched.sort_unstable();
 
-    // Every Lean constraint with a Rust counterpart vanishes on the honest trace. The
-    // Lean-only ones are the documented deltas (LT's `μ·(1 − μ)` does not hold on a
-    // deduplicated Rust row with `μ > 1`).
+    // Every Lean constraint with a Rust counterpart vanishes on the honest trace. There are no
+    // Lean-only constraints left: LT's `μ·(1 − μ)` became a pull of `ARE_BYTES[μ, 0]`, as in
+    // `lt.rs`, and every test below asserts that both unmatched lists are empty. The skip is kept
+    // for the next table added here, which may land before its Rust side does.
     for (r, row) in honest_rows.iter().enumerate() {
         for (i, e) in lean.asserts.iter().enumerate() {
             if lean_asserts_unmatched.contains(&i) {
@@ -411,8 +413,6 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
         rust_constraints_unmatched,
         lean_interacts_unmatched,
         rust_interacts_unmatched,
-        random_rows: rows,
-        challenges: ch,
     }
 }
 
@@ -482,34 +482,12 @@ fn lean_diff_lt() {
         cols::NUM_COLUMNS,
         &honest,
     );
-    // Known deltas: the Lean model keeps `μ·(1 − μ) = 0`, the Rust chip bounds `μ` with the
-    // `ARE_BYTES[μ, 0]` send instead. Both are found by content, not position.
-    let &[mu_assert] = report.lean_asserts_unmatched.as_slice() else {
-        panic!(
-            "[LT] only the μ bit constraint should be Lean-only, got {:?}",
-            report.lean_asserts_unmatched
-        )
-    };
-    let mu_bit = |r: &[FE]| r[cols::MU] * (FE::one() - r[cols::MU]);
-    for r in &report.random_rows {
-        assert_eq!(
-            eval(&lean.asserts[mu_assert], r),
-            mu_bit(r),
-            "[LT] Lean-only assert is μ·(1 − μ)"
-        );
-    }
-    // The delta is real on honest rows: it fails exactly on the deduplicated rows.
-    let mut dedup_rows = 0;
-    for r in &honest {
-        let mu = r[cols::MU].canonical_u64();
-        assert_eq!(
-            eval(&lean.asserts[mu_assert], r) == FE::zero(),
-            mu <= 1,
-            "[LT] μ = {mu}"
-        );
-        dedup_rows += usize::from(mu > 1);
-    }
-    assert!(dedup_rows >= 2, "[LT] the trace has deduplicated rows");
+    // The Lean model bounds `μ` with the `ARE_BYTES[μ, 0]` pull, as the Rust chip does, so the
+    // two agree exactly: no constraint and no interaction is left on one side only.
+    assert!(
+        report.lean_asserts_unmatched.is_empty(),
+        "[LT] Lean-only constraints"
+    );
     assert!(
         report.rust_constraints_unmatched.is_empty(),
         "[LT] Rust-only constraints"
@@ -518,30 +496,18 @@ fn lean_diff_lt() {
         report.lean_interacts_unmatched.is_empty(),
         "[LT] Lean-only interactions"
     );
-    let &[are_bytes] = report.rust_interacts_unmatched.as_slice() else {
-        panic!(
-            "[LT] only ARE_BYTES[μ, 0] should be Rust-only, got {:?}",
-            report.rust_interacts_unmatched
-        )
-    };
-    let are_bytes = &interactions[are_bytes];
     assert!(
-        are_bytes.is_sender && matches!(are_bytes.multiplicity, Multiplicity::One),
-        "[LT] the μ bound is sent with multiplicity One"
+        report.rust_interacts_unmatched.is_empty(),
+        "[LT] Rust-only interactions"
     );
-    let prog = capture_interaction(are_bytes);
-    for r in &report.random_rows {
-        assert_eq!(
-            rust_interaction_at(&prog, r, &report.challenges),
-            (
-                FEE::one(),
-                report
-                    .challenges
-                    .fingerprint(BusId::AreBytes as u64, &[r[cols::MU], FE::zero()])
-            ),
-            "[LT] the Rust-only interaction is ARE_BYTES[μ, 0]"
-        );
-    }
+    // The fixture has to contain what this model is about: rows that answer several identical
+    // queries at once. Without this the test still passes if `generate_lt_trace` stops
+    // deduplicating, and the comment above about `μ = 3` becomes quietly false.
+    let dedup_rows = honest
+        .iter()
+        .filter(|r| r[cols::MU].canonical_u64() > 1)
+        .count();
+    assert!(dedup_rows >= 2, "[LT] the trace has deduplicated rows");
 }
 
 #[test]

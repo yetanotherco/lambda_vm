@@ -19,24 +19,30 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   yet (SHIFT pulls `ARE_BYTES` directly).
 - `LambdaVM/AluOp.lean` — the `alu_op` descriptors of `types.rs`, one enumeration
   for the `opsel` of BYTE_ALU and the low bits of the ALU flag byte.
+- `LambdaVM/StaticLookup.lean` — `StaticLookupChannel`: a table the verifier
+  knows, given as a list of rows, with `guarantees_iff` relating the list to the
+  semantic reading of a row, and `toChannel` for the components that read it.
+  Clean main replaced its own `StaticLookupChannel` by `Air.Flat.Lookup`, whose
+  rows are witness programs of the row index, so the structure lives here.
 - `LambdaVM/Buses/` — the buses that are not static tables. `Alu.lean` is the
   unified ALU bus: message layout as in `BusId::Alu` and one `Guarantees` clause
-  per `opsel` (LT, EQ and SHIFT), each taking as hypotheses the `IS_WORD`
-  assumptions of its chip's spec (LT: the low words; EQ: all four words; SHIFT:
-  none). The flag byte is read as a natural, so a chip
-  pushing with one `opsel` discharges the other clauses by `omega`.
+  per `opsel` (LT, EQ, SHIFT and the toy MIN of the counted-pulls PoC), each
+  taking as hypotheses the `IS_WORD` assumptions of its chip's spec (LT: the low
+  words; EQ: all four words; SHIFT: none; MIN: all four). The flag byte is read
+  as a natural, so a chip pushing with one `opsel` discharges the other clauses
+  by `omega`.
 - `LambdaVM/Tables/` — one file per chip. `Bitwise.lean` transcribes the
   precomputed row function of `prover/src/tables/bitwise.rs` and defines each bus
-  the table serves as a `StaticLookupChannel`, with the semantic `Guarantees`
-  proven equivalent to table membership. `Lt.lean` is the LT chip: the row
-  circuit has the constraints and interactions of `lt.rs` (in the spec's order,
-  except the `μ` delta below), `core` is the arithmetic argument of
-  `spec/src/lt.toml` on naturals, `Honest` is the row
+  the table serves as a `StaticLookupChannel` (read through `toChannel`), with
+  the semantic `Guarantees` proven equivalent to table membership. `Lt.lean` is
+  the LT chip: the row circuit has the constraints and interactions of `lt.rs`
+  (in the spec's order, except the `μ` delta below), `core` is the
+  arithmetic argument of `spec/src/lt.toml` on naturals, `Honest` is the row
   `generate_lt_trace` produces, `RowSpec` is what an active row establishes, and
   the `GeneralFormalCircuit` proves that a row that pulls its range checks
   satisfies `RowSpec` and pushes a correct ALU result (soundness) and that an
-  honest row satisfies everything (completeness), for rows with `μ ∈ {0, 1}`
-  only (see "Known differences"). `Eq.lean` is the EQ chip in the
+  honest row satisfies everything (completeness), for byte multiplicities
+  `μ ∈ [0, 255]`, deduplicated rows included. `Eq.lean` is the EQ chip in the
   same shape: the `sub` template, four IS_HALF pulls, a ZERO pull on the sum of
   the halves, `res = eq xor invert`; its `μ` is a bit, as in the spec and `eq.rs`. Completeness covers
   the honest row and the all-zero padding row.
@@ -53,7 +59,8 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   trivially true. That IS_HALF → ZERO → EQ compose is shown by `eqLookup`
   itself, which only type-checks as a `SoundEnsemble` because every channel is
   finished before the tables that pull from it; the theorem says something
-  about active rows once a component pulls from ALU.
+  about active rows once a component pulls from ALU. `LtStaged.lean` and
+  `CountedSameBus.lean` are the counted-pulls ensembles (see below).
 - `LambdaVM/Tables/ShiftCore.lean` and `Shift.lean` — the SHIFT chip. `ShiftCore`
   is the two-phase shift argument of `spec/src/shift.toml` on naturals (HWSL
   per limb, then whole limbs, left and right, logical and arithmetic), ending in
@@ -62,6 +69,10 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   overrides) and concludes `shiftResult`. `Shift.lean` mirrors the 22 constraints
   and 17 interactions of `shift.rs` and proves soundness and completeness, the
   latter for both the honest active row and the padding row.
+- `LambdaVM/Tables/MinToy.lean` — MIN, a toy ALU operation with the shape of
+  DVRM: it pulls an LT result on the ALU bus and pushes its own result on the
+  same bus. Not an RV64IM operation; it stands in for DVRM until DVRM is
+  modelled.
 
 ## Lessons for big chips (from SHIFT)
 
@@ -84,8 +95,8 @@ that they are the same polynomials and the same bus interactions is mechanical:
 
 1. `lake env lean --run LambdaVM/Export.lean` writes `export/{lt,eq,shift}.json`:
    every `assert` as an expression tree and every `interact` with its channel,
-   multiplicity and message, variables numbered in Rust column order.
-   Multiplicities are signed: a pull is `−e`, a push `+e`. It also writes
+   direction, multiplicity and message, variables numbered in Rust column order.
+   Multiplicities are nonnegative; the direction carries the sign. It also writes
    `export/bitwise.json`: the size of the BITWISE table and of every static
    lookup channel, and a sample of the table (every `z` with edge bytes, which
    includes the last row, and 256 pseudo-random rows) with the precomputed
@@ -96,16 +107,17 @@ that they are the same polynomials and the same bus interactions is mechanical:
 For each table the test evaluates the Lean asserts and the Rust `ConstraintSet`
 on 64 random rows and matches them as multisets of functions, does the same for
 the interactions, and checks that every Lean constraint vanishes on honest
-traces from `generate_*_trace`, padding rows included; the Lean-only
-constraints of the documented deltas are skipped there. The Rust side of an
-interaction is what the verifier enforces: the multiplicity and the LogUp
-fingerprint `z − (bus + α·e₀ + α²·e₁ + …)` as `emit_multiplicity` and
-`emit_fingerprint` emit them, captured like the constraints and evaluated at
-fixed `z` and `α`; the Lean side folds the exported message the same way.
-Multiplicities are signed as in the export, so a Rust sender, Clean's pull, is
-compared with its multiplicity negated. For BITWISE the test checks the table
-and channel sizes, compares the sampled rows with `generate_bitwise_row` and each channel's
-messages with the fingerprints of the receivers of
+traces from `generate_*_trace`, padding rows included. Each test asserts that
+all four unmatched lists are empty: no table has a Lean-only or a Rust-only
+constraint or interaction left. The Rust side of an interaction is what the
+verifier enforces: the multiplicity and the LogUp fingerprint
+`z − (bus + α·e₀ + α²·e₁ + …)` as `emit_multiplicity` and `emit_fingerprint`
+emit them, captured like the constraints and evaluated at fixed `z` and `α`;
+the Lean side folds the exported message the same way. Direction (a Rust sender
+is Clean's pull), multiplicity and fingerprint are matched separately. For
+BITWISE the test checks the table and channel sizes, compares the sampled rows
+with `generate_bitwise_row` and each channel's messages with the fingerprints of
+the receivers of
 `bitwise::bus_interactions()` on the same bus, and checks all 2^20 rows of
 `generate_bitwise_row` against a Rust transcription of `Bitwise.row` that the
 sampled rows pin to the Lean export.
@@ -115,10 +127,8 @@ enforces, on every PR:
 
 - EQ: 5 constraints and 6 interactions, exact match.
 - SHIFT: 22 constraints and 17 interactions, exact match.
-- LT: exact match except the two documented deltas: `μ·(1 − μ) = 0` exists
-  only in Lean, `ARE_BYTES[μ, 0]` with multiplicity one exists only in Rust.
-  The test pins both by content, and its trace has deduplicated rows (`μ ≥ 2`),
-  where the Lean-only constraint fails as expected.
+- LT: 6 constraints and 10 interactions, exact match, with `μ` a byte as in
+  `lt.rs`.
 - BITWISE: same size, all 2^20 rows, 656 sampled rows and 8 channels (10 Rust
   receivers), exact match.
 
@@ -131,36 +141,95 @@ The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
 
 ## Counted pulls (`μ ∈ [0, 255]`)
 
-After PR #1016 a deduplicated row pulls its range checks with multiplicity `-μ`,
-`μ` a byte. Clean's typed channel grants the guarantee at `-1` only; any other
-nonzero multiplicity is a requirement the row cannot meet.
+After PR #1016 a deduplicated row pulls its range checks with multiplicity `μ`,
+`μ` a byte. Clean's typed channel grants the guarantee to a pull of multiplicity
+`1` only, and requires every pull to carry `0` or `1`; any other nonzero
+multiplicity is a requirement the row cannot meet.
 `LambdaVM/Channels/Counted.lean` is the generalisation:
 
-- `counted N channel` grants the guarantee at `-1, …, -N` and charges every
-  other nonzero multiplicity, mirroring `Channel.toRaw`. `pullIf`/`emit` are the
-  circuit operations, with `ExplicitCircuits` instances so elaboration works.
+- `counted N channel` grants the guarantee to a pull of `1, …, N` and charges
+  every other nonzero interaction, mirroring `Channel.toRaw`. `pullIf`/`emit`
+  are the circuit operations, with `ExplicitCircuits` instances so elaboration
+  works.
 - `exists_push_of_pull` and `consistent` are Clean's lemmas for this channel.
-  Their balance premise is `N · length < char F`, not Clean's `length < char F`.
-- `not_consistent` proves the premise cannot be weakened: for `2 ≤ N ≤ 255`
-  over Goldilocks, `p / N` pulls of `-N` plus `p % N` pulls of `-1` on a message
-  outside the table balance to `-p = 0` with fewer than `p` interactions, so
+  Their balance premise is `N · length < char F`. Clean's `BalancedInteractions`
+  carries no length bound of its own: the bound is the `fits` of the `Balance`
+  the ensemble is checked against, and reaches soundness as the
+  `InteractionsFit` premise of `TableSoundness`. For `Balance.logUp`, `fits` is
+  `count < char F`.
+- `not_consistent` shows that Clean's `BalancedInteractions` is too weak a
+  premise for a counted channel (the field-sum premise of `consistent` cannot be
+  replaced by it): for `2 ≤ N ≤ 255`
+  over Goldilocks, one pull of `N` and one pull of `1` on a message outside the
+  table satisfy `BalancedInteractions` — Clean counts the pull of `N` as a push
+  of the message, so the pull of `1` is matched — while the counted channel
+  reads both as pulls and the guarantee of the second is false. So
   `RawChannel.Consistent` is false and the channel cannot be finished in a
   `SoundEnsemble`. With `N = 1` the channel is `Normal`, as in Clean.
 - `Demo.circuit` is the shape of a dedup row: `ARE_BYTES[μ, 0]` then a counted
-  `IS_HALF` pull with multiplicity `-μ`. The counted channel sits in
+  `IS_HALF` pull with multiplicity `μ`. The counted channel sits in
   `channelsWithRequirements`: an out-of-range `μ` is only ruled out by the byte
   guarantee, which lawfulness does not see but soundness does.
 
-What upstream Clean needs for an end-to-end LT theorem with byte `μ`:
+Counted pulls in the LT model need two things Clean main lacks:
 
-1. A per-channel multiplicity bound in `BalancedInteractions`
-   (`bound * length < ringChar F`), threaded through `BalancedChannels`.
-2. Either a dependency-aware `OrderedChannel` (a table may hold guarantees and
+1. A `Balance` for counted pulls: `BalancedInteractions` matching a pull of
+   `1, …, N`, and a `fits` that bounds `N * count` rather than `count` by the
+   characteristic.
+2. A dependency-aware finishing order: a table may hold guarantees and
    requirements on the same channel when the requirements depend only on
-   channels finished earlier), or the range check of `μ` as a static `lookup`,
-   which is a local constraint and makes the requirement vacuous at lawfulness.
+   channels finished earlier.
 
-Until then LT keeps `μ ∈ {0, 1}` (see below).
+The model takes both from the `yetanotherco/clean` fork, pinned in
+`lakefile.toml` by sha at
+[`98e339e9`](https://github.com/yetanotherco/clean/commit/98e339e9ae2a02e8e0c4d6cfe81c2a5ce9467729)
+— by sha, not by branch name, so the pin survives the branch being renamed or
+deleted once the upstream PRs land. That is Clean main `f3abad7c` plus three
+commits, and four review fixes answering the audit of them: `Balance.logUpUpTo N` with
+`RawChannel.ConsistentUpTo N`, the typed `Channel.counted N`, and
+`Ensemble.tableSoundness_of_staged` / `_stagedOn` (soundness by finishing
+order of channels, and of message classes within a channel). On top of it:
+
+- `Tables/Lt.lean` pulls `IS_HALF` and `MSB16` with multiplicity `μ` through
+  `Channel.counted 255`, bounded by its own pull of `ARE_BYTES[μ, 0]`, exactly
+  as `lt.rs`.
+- `Ensembles/LtStaged.lean` proves `tableSoundness`, that is
+  `Ensemble.TableSoundness (Balance.logUpUpTo 255)` for the LT ensemble,
+  finishing `ARE_BYTES` before the counted `IS_HALF` and `MSB16` and those
+  before ALU. Its second half adds MIN, which pulls LT and pushes MIN on the
+  ALU bus: ALU is finished in two stages, the non-MIN messages first and the
+  MIN messages after.
+- `Ensembles/CountedSameBus.lean` (CMIN) does the same with the ALU bus itself
+  counted: a row answers `μ` identical MIN requests, the full shape of DVRM.
+
+That is not an end-to-end LT theorem. `TableSoundness` is one premise of a
+sound ensemble, not the conclusion: it reads `witness.Assumptions →
+witness.Constraints → witness.InteractionsFit balance → witness.Balanced
+balance → witness.Spec`, and leaves `witness.Assumptions` for the caller to
+discharge. In `LtStaged` that premise is not free, because the `ARE_BYTES`,
+`IS_HALF` and `MSB16` providers are not tables. `provider` and
+`countedProvider` are rows that push whatever value they are handed, under
+`Assumptions input data := channel.Guarantees input.1 data`, and
+`providerComponent` and `countedProviderComponent` carry the same assumption
+into the ensemble. Each provider assumes its own answers are correct; nothing
+in the file derives that from a row of BITWISE. `CountedSameBus` reuses those
+two components, so the LT answers it feeds to CMIN are assumed in the same way.
+
+`EqLookup`, already in the model (PR #1027), is the contrast. Its `pushStatic` emits the
+entries of a real `StaticLookupChannel` and proves the guarantee from
+membership in the table, so `eq_rows_correct` discharges `witness.Assumptions`
+outright — "no component assumes anything" — and states a conclusion about
+rows: every EQ row with `μ = 1` and range-checked operands carries the
+equality bit. There is no `lt_rows_correct`. Writing one needs `pushStatic`,
+or a counted analogue of it, behind LT's three range checks, and this branch
+has neither. What `LtStaged` and `CountedSameBus` do establish is that the
+staged finishing order admits counted pulls, which is what they were written
+for.
+
+`Channels/Counted.lean` above predates the fork. Its `not_consistent` is the
+reason the fork's balance carries the `N * count` bound; its `consistentUpTo`
+shows the counted channel is consistent under the fork's `BalancedUpTo N`.
+Nothing else uses it.
 
 ## What is intentionally not proven
 
@@ -168,14 +237,16 @@ Scope limits, not bugs. Each is also noted where it applies.
 
 - **The lookups a row makes are assumed, not proven.** Every chip theorem is
   about one row, given that each range check or lookup the row pulls is
-  answered correctly. Nothing discharges that for the whole system: the only
-  ensemble theorem, `eq_rows_correct`, is trivially true because no ALU
-  consumer is modelled, and LT and SHIFT have no ensemble. A negative
+  answered correctly. Nothing discharges that for the whole system:
+  `eq_rows_correct` is trivially true because no ALU consumer is modelled, the
+  ensembles this branch adds prove `Ensemble.TableSoundness` from providers
+  that assume their own answers, and SHIFT has no ensemble. A negative
   multiplicity in an unmodelled table that shares `IS_HALF` (the bug PR #1016
   fixed) leaves every theorem and `lean_diff` green.
-- **LT is proven for `μ ∈ {0, 1}` only.** The deduplicated rows `lt.rs`
-  produces (`μ = 2…255`, present on every real block) are covered by neither
-  soundness nor completeness. See "Counted pulls" and the next section.
+- **There is no `lt_rows_correct`.** LT's soundness and completeness do cover
+  the deduplicated rows `lt.rs` produces (`μ = 2…255`), but the `ARE_BYTES`,
+  `IS_HALF` and `MSB16` providers assume their own answers, so nothing
+  concludes about the LT rows of a real trace. See "Counted pulls".
 - **The Lean BITWISE table is compared with Rust on 656 sampled rows.** The
   loop over all 2^20 rows compares `generate_bitwise_row` with a Rust
   transcription of `Bitwise.row`, not with Lean.
@@ -185,12 +256,8 @@ Scope limits, not bugs. Each is also noted where it applies.
 
 ## Known differences from the Rust prover
 
-- `LT` constrains `μ·(1 − μ) = 0`. The spec types `μ` as `Byte` with
-  `IS_BYTE[μ]` and `lt.rs` sends `ARE_BYTES[μ, 0]`, because LT deduplicates
-  rows and `μ` is a count. Clean only grants a channel guarantee to a pull with
-  multiplicity exactly 1, so until the counted pulls above land upstream the
-  model keeps `μ` a bit. Every chip whose `μ` the spec types as `Byte` (MUL,
-  DVRM, BRANCH, BYTEWISE) will need the same treatment.
+- Every chip whose `μ` the spec types as `Byte` (MUL, DVRM, BRANCH, BYTEWISE)
+  needs the counted treatment LT got above; none of them is modelled yet.
 - `isByte` sends `ARE_BYTES[X, 0]`, as every single-byte check in the prover
   does; `spec/src/is_byte.toml` writes `[0, X]`.
 - The `spec/` copy in this repository lags the `spec/main` branch; the spec the
@@ -224,5 +291,6 @@ Clean itself is compiled from source; only the modules we import are built.
   helper used inside a `main` needs an `ExplicitCircuit` instance, bridged to
   its body with `ExplicitCircuit.of_eq rfl (by infer_explicit_circuit)`.
 - A conditional interaction (`pullIf cond`) is only lawful when the same circuit
-  constrains `cond` to be boolean; multiplicities outside `{0, 1}` turn the
-  channel guarantee into a proof obligation.
+  constrains `cond` to be boolean: Clean requires every pull to carry
+  multiplicity `0` or `1`, and a pull outside `{0, 1}` is a requirement the
+  circuit cannot discharge at lawfulness.
