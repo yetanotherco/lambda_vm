@@ -169,6 +169,7 @@ fn dump_ir_stats() {
 /// memory, so a slot file past the card's L2 makes each step a trip to DRAM.
 #[test]
 #[ignore = "analysis dump, not a test"]
+#[allow(clippy::needless_range_loop)]
 fn dump_fused_slots_by_schedule() {
     use multilinear::fused::Constraints;
     use multilinear::program::Op as P;
@@ -238,10 +239,6 @@ fn dump_fused_slots_by_schedule() {
         };
         let compiled: Vec<usize> = (0..n).filter(|&s| !leaf(s)).collect();
         // Greedy: among ready steps, the one whose operands it ends most.
-        let mut done = vec![false; n];
-        for s in 0..n {
-            done[s] = leaf(s);
-        }
         let mut left = readers.clone();
         let mut users: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut waiting = vec![0usize; n];
@@ -274,7 +271,6 @@ fn dump_fused_slots_by_schedule() {
                 .expect("a ready step");
             ready.remove(&pick);
             greedy.push(pick);
-            done[pick] = true;
             for o in operands(pick) {
                 if !leaf(o) {
                     left[o] -= 1;
