@@ -1063,6 +1063,425 @@ impl InputLayer {
     }
 }
 
+/// A GKR step's device rounds over TWO tree layers (`multilinear::gkr_lockstep`'s two-layer
+/// ladder) with Gruen's split: the step proves layer `ℓ` against layer `ℓ + 2`, whose four
+/// quarters (`p` and `q` at cell `j·2^m`, `m = ℓ`) are its factors. A round sums `H(1)..H(4)` of
+/// `N + λQ` — `N = N₀D₁ + N₁D₀`, `Q = D₀D₁` over the middle layer's halves `N_r = p_r q_{r+2} +
+/// p_{r+2} q_r`, `D_r = q_r q_{r+2}` — under `eq(u_{>j}, ·)`, and `H(0)` where asked; the host
+/// puts `eq(u_{≤j})` back in. The kernels are `sumcheck.cu`'s `gkr2_*`: a lane pair a cube index,
+/// each lane one half of the middle layer.
+///
+/// Folds the quarters in place, as [`GruenLayer`] folds its halves: GKR visits each layer once.
+pub struct Gruen2Layer {
+    stream: Arc<CudaStream>,
+    /// The buffers the quarters live in, kept alive; the kernels see addresses.
+    _p: Arc<CudaSlice<u64>>,
+    _q: Arc<CudaSlice<u64>>,
+    p_at: u64,
+    q_at: u64,
+    /// Cells in each quarter: `2^m`.
+    stride: usize,
+    /// The runs of cells quarters 2 and 3 hold before the next fold — every cell of the cube they
+    /// hold now, for a layer stored whole. Past them is the padding of an input layer kept without
+    /// it ([`DeviceFractionTree::from_truncated_input`]), read as `0/1`.
+    stored: [usize; 2],
+    truncated: bool,
+    /// `L`: the variables left to the host, `2^L` cells a quarter.
+    low: usize,
+    /// `J = m − L`: the rounds this layer runs here.
+    rounds: usize,
+    /// Every `eq` level, as [`GruenLayer`] lays them out.
+    eq: CudaSlice<u64>,
+    partials: CudaSlice<u64>,
+    sums: CudaSlice<u64>,
+    done: usize,
+    slot: Option<crate::round_slot::SlotRounds>,
+    /// Whether the round queued last handed its sums to the slot.
+    slotted: bool,
+}
+
+/// The rows a two-layer round sums: `H(1)..H(4)`, and `H(0)` fifth.
+const GRUEN2_ROWS: usize = 5;
+
+impl Gruen2Layer {
+    /// Over layer `ℓ + 2`'s `p` and `q`, `2^num_vars` cells each — or the first `real` of them,
+    /// more than half, for an input layer kept without its padding — the point `m = num_vars − 2`
+    /// ext3 values, and at most `low` variables left to the host (fewer when the layer is
+    /// smaller).
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        stream: &Arc<CudaStream>,
+        p: &Arc<CudaSlice<u64>>,
+        q: &Arc<CudaSlice<u64>>,
+        num_vars: usize,
+        real: usize,
+        point: &[u64],
+        low: usize,
+    ) -> Result<Self> {
+        if num_vars < 2 {
+            return Err(invalid());
+        }
+        let m = num_vars - 2;
+        if point.len() != m * 3 {
+            return Err(invalid());
+        }
+        let stride = 1usize << m;
+        if p.len() != real * 3 || q.len() != real * 3 || real <= 2 * stride || real > 4 * stride {
+            return Err(invalid());
+        }
+        let low = low.min(m);
+        let rounds = m - low;
+
+        let be = backend()?;
+        let cells = (1usize << low) + (1usize << rounds) - 1;
+        // SAFETY: the kernel writes every cell.
+        let mut eq = unsafe { crate::device::alloc_or_trim::<u64>(stream, cells * 3) }?;
+        let point_dev = crate::device::htod_or_trim(
+            stream,
+            if point.is_empty() { &[0u64][..] } else { point },
+        )?;
+        let low_arg = low as u32;
+        let rounds_arg = rounds as u32;
+        unsafe {
+            stream
+                .launch_builder(&be.gkr_eq_levels_ext3)
+                .arg(&point_dev)
+                .arg(&low_arg)
+                .arg(&rounds_arg)
+                .arg(&mut eq)
+                .launch(LaunchConfig {
+                    grid_dim: ((cells as u64).div_ceil(256).min(4096) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        let partials = unsafe {
+            crate::device::alloc_or_trim::<u64>(stream, GRUEN2_ROWS * GRUEN_MAX_GRID as usize * 3)
+        }?;
+        let sums = crate::device::alloc_zeros_or_trim::<u64>(stream, GRUEN2_ROWS * 3)?;
+        let p_at = {
+            let (at, _guard) = p.device_ptr(stream);
+            at
+        };
+        let q_at = {
+            let (at, _guard) = q.device_ptr(stream);
+            at
+        };
+        let upper = real - 2 * stride;
+        Ok(Self {
+            stream: stream.clone(),
+            _p: p.clone(),
+            _q: q.clone(),
+            p_at,
+            q_at,
+            stride,
+            stored: [upper.min(stride), upper.saturating_sub(stride)],
+            truncated: real < 4 * stride,
+            low,
+            rounds,
+            eq,
+            partials,
+            sums,
+            done: 0,
+            slot: None,
+            slotted: false,
+        })
+    }
+
+    /// The rounds' sums through a slot from here on (`crate::round_slot`) when `mode` asks for
+    /// one and one can be had; `false` keeps the second launch and read-back. A round that sums
+    /// `H(0)` runs without it.
+    pub fn use_slot(&mut self, mode: crate::round_slot::RoundSlot) -> bool {
+        self.slot = crate::round_slot::SlotRounds::open(&self.stream, mode);
+        self.slot.is_some()
+    }
+
+    /// The rounds this layer runs on the card, `J`.
+    pub fn rounds(&self) -> usize {
+        self.rounds
+    }
+
+    /// Whether the layer was opened without its padding.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The variables left to the host, `L`: the factors come back over `2^L` cells.
+    pub fn low(&self) -> usize {
+        self.low
+    }
+
+    /// The next round's sums, `H(1)..H(4)` — and `H(0)` fifth with `want_h0` — three u64 each.
+    /// `fold_by` is the previous round's challenge, and every round but the first has one;
+    /// `half_lambda` is `λ/2`, which the round takes, and `lambda` the `H(0)` pass's.
+    pub fn round(
+        &mut self,
+        fold_by: Option<&[u64; 3]>,
+        lambda: &[u64; 3],
+        half_lambda: &[u64; 3],
+        want_h0: bool,
+    ) -> Result<Vec<u64>> {
+        let rows = self.round_enqueue(fold_by, lambda, half_lambda, want_h0)?;
+        self.round_collect(rows)
+    }
+
+    /// [`round`](Self::round)'s launches, queued without waiting for them. Returns the rows
+    /// [`round_collect`](Self::round_collect) reads.
+    pub fn round_enqueue(
+        &mut self,
+        fold_by: Option<&[u64; 3]>,
+        lambda: &[u64; 3],
+        half_lambda: &[u64; 3],
+        want_h0: bool,
+    ) -> Result<u32> {
+        assert!(self.done < self.rounds, "every card round has run");
+        assert_eq!(
+            fold_by.is_some(),
+            self.done > 0,
+            "a challenge to fold by after the first round"
+        );
+        let be = backend()?;
+        let m = self.stride.trailing_zeros() as usize;
+        let quarter = 1u64 << (m - self.done - 1);
+        let (grid, block) = gruen2_shape(quarter);
+        let rows = if want_h0 { 5u32 } else { 4 };
+        let s = fold_by.copied().unwrap_or([0; 3]);
+        let fold = u32::from(fold_by.is_some());
+        let at =
+            (1usize << self.low) + (1usize << self.rounds) - (1usize << (self.rounds - self.done));
+        let e_lo = self.eq.slice(0..(1usize << self.low) * 3);
+        let e_hi = self
+            .eq
+            .slice(at * 3..(at + (1usize << (self.rounds - 1 - self.done))) * 3);
+        let stride = self.stride as u64;
+        let low = self.low as u32;
+        let [stored2, stored3] = self.stored.map(|run| run as u64);
+        // The cube the quarters hold coming into this round; once both stored runs cover it, the
+        // padding is spent and the whole-layer kernel reads every cell.
+        let cube = if fold_by.is_some() { 4 } else { 2 } * quarter;
+        let real = stored2 < cube || stored3 < cube;
+        let slotted = self.slot.is_some() && !want_h0;
+        let kernel = match (real, slotted) {
+            (true, false) => &be.gkr2_round_real,
+            (false, false) => &be.gkr2_round,
+            (true, true) => &be.gkr2_round_real_slot,
+            (false, true) => &be.gkr2_round_slot,
+        };
+        let shared = if slotted {
+            gruen2_shared(block).max(crate::round_slot::shared_bytes(block))
+        } else {
+            gruen2_shared(block)
+        };
+        let second = !slotted || self.slot.as_ref().is_some_and(|slot| slot.checking());
+        let mut slot_args = if slotted {
+            self.slot.as_mut().map(|slot| slot.launch())
+        } else {
+            None
+        };
+        unsafe {
+            let mut launch = self.stream.launch_builder(kernel);
+            launch
+                .arg(&self.p_at)
+                .arg(&self.q_at)
+                .arg(&stride)
+                .arg(&quarter)
+                .arg(&fold)
+                .arg(&s[0])
+                .arg(&s[1])
+                .arg(&s[2])
+                .arg(&half_lambda[0])
+                .arg(&half_lambda[1])
+                .arg(&half_lambda[2])
+                .arg(&e_hi)
+                .arg(&e_lo)
+                .arg(&low)
+                .arg(&stored2)
+                .arg(&stored3)
+                .arg(&mut self.partials);
+            if let Some((ticket, dev, seq)) = slot_args.as_mut() {
+                launch.arg(&mut **ticket).arg(&*dev).arg(&*seq);
+            }
+            launch.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: shared,
+            })?;
+        }
+        self.stored = self
+            .stored
+            .map(|run| stored_after_round(run, quarter as usize));
+        if want_h0 {
+            // On the round's grid and block, so its partials sit where the round's would; it reads
+            // the cells the round left, under the runs after its fold.
+            let [stored2, stored3] = self.stored.map(|run| run as u64);
+            let kernel = if stored2 < 2 * quarter || stored3 < 2 * quarter {
+                &be.gkr2_round_h0_real
+            } else {
+                &be.gkr2_round_h0
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(kernel)
+                    .arg(&self.p_at)
+                    .arg(&self.q_at)
+                    .arg(&stride)
+                    .arg(&quarter)
+                    .arg(&lambda[0])
+                    .arg(&lambda[1])
+                    .arg(&lambda[2])
+                    .arg(&e_hi)
+                    .arg(&e_lo)
+                    .arg(&low)
+                    .arg(&stored2)
+                    .arg(&stored3)
+                    .arg(&mut self.partials)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: (block / 32).max(1) * 3 * 8,
+                    })?;
+            }
+        }
+        if second {
+            crate::round_slot::note_second_launch();
+            let reduce_block = 256u32;
+            unsafe {
+                self.stream
+                    .launch_builder(&be.sum_partials_ext3)
+                    .arg(&self.partials)
+                    .arg(&(grid as u64))
+                    .arg(&mut self.sums)
+                    .launch(LaunchConfig {
+                        grid_dim: (rows, 1, 1),
+                        block_dim: (reduce_block, 1, 1),
+                        shared_mem_bytes: reduce_block * 3 * 8,
+                    })?;
+            }
+        }
+        self.slotted = slotted;
+        self.done += 1;
+        Ok(rows)
+    }
+
+    /// The sums a [`round_enqueue`](Self::round_enqueue) queued, `rows` of them, three u64 each.
+    pub fn round_collect(&self, rows: u32) -> Result<Vec<u64>> {
+        let today = || -> Result<Vec<u64>> {
+            let sums =
+                crate::readback::clone_dtoh(&self.stream, &self.sums.slice(0..rows as usize * 3))?;
+            self.stream.synchronize()?;
+            Ok(sums)
+        };
+        match self.slot.as_ref().filter(|_| self.slotted) {
+            Some(slot) => slot.collect(rows as usize, today),
+            None => today(),
+        }
+    }
+
+    /// After the last card round: the eight factors bound to its challenge (`fold_by`, `None` for
+    /// a layer that ran no card round), over `2^L` cells each, laid end to end in the order a step
+    /// sends its two halves — `h₀`'s `p_lo, p_hi, q_lo, q_hi` (quarters 0 and 2), then `h₁`'s
+    /// (quarters 1 and 3) — three u64 a cell.
+    pub fn finish(&mut self, fold_by: Option<&[u64; 3]>) -> Result<Vec<u64>> {
+        assert_eq!(self.done, self.rounds, "the card's rounds are done");
+        assert_eq!(
+            fold_by.is_some(),
+            self.rounds > 0,
+            "a challenge to fold by after a card round"
+        );
+        let be = backend()?;
+        let cells = 1u64 << self.low;
+        // SAFETY: the kernel writes every cell.
+        let mut out =
+            unsafe { crate::device::alloc_or_trim::<u64>(&self.stream, 8 * cells as usize * 3) }?;
+        let s = fold_by.copied().unwrap_or([0; 3]);
+        let fold = u32::from(fold_by.is_some());
+        let stride = self.stride as u64;
+        let [stored2, stored3] = self.stored.map(|run| run as u64);
+        let cube = if fold_by.is_some() { 2 * cells } else { cells };
+        let real = stored2 < cube || stored3 < cube;
+        let config = LaunchConfig {
+            grid_dim: ((8 * cells).div_ceil(256).min(4096) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            let mut launch = self.stream.launch_builder(if real {
+                &be.gkr2_finish_real
+            } else {
+                &be.gkr2_finish
+            });
+            launch
+                .arg(&self.p_at)
+                .arg(&self.q_at)
+                .arg(&stride)
+                .arg(&cells)
+                .arg(&fold)
+                .arg(&s[0])
+                .arg(&s[1])
+                .arg(&s[2]);
+            if real {
+                launch.arg(&stored2).arg(&stored3);
+            }
+            launch.arg(&mut out).launch(config)?;
+        }
+        let values = crate::readback::clone_dtoh(&self.stream, &out)?;
+        self.stream.synchronize()?;
+        Ok(values)
+    }
+}
+
+/// A two-layer round's launch: a lane pair a cube index, 256-lane blocks for a wide cube and
+/// narrower ones — down to a warp — for a narrow one, at most [`GRUEN_MAX_GRID`] blocks.
+fn gruen2_shape(quarter: u64) -> (u32, u32) {
+    let lanes = 2 * quarter;
+    let block = lanes.next_power_of_two().clamp(32, 256) as u32;
+    let grid = lanes.div_ceil(block as u64).clamp(1, GRUEN_MAX_GRID as u64) as u32;
+    (grid, block)
+}
+
+/// The shared memory a two-layer round takes at `block` lanes: each lane's four row sums
+/// (`12·block` u64), then the reduction's `4·warps·3`.
+fn gruen2_shared(block: u32) -> u32 {
+    (12 * block + 12 * (block / 32).max(1)) * 8
+}
+
+impl DeviceFractionTree {
+    /// The two-layer step over layer `layer`'s quarters ([`Gruen2Layer`]), at most `low`
+    /// variables left to the host.
+    pub fn layer_gruen2(&self, layer: usize, point: &[u64], low: usize) -> Result<Gruen2Layer> {
+        let level = match self.layers.get(layer) {
+            Some(level) => level,
+            None => self.input.as_ref().ok_or(cudarc::driver::DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+            ))?,
+        };
+        Gruen2Layer::new(
+            &self.stream,
+            &level.p,
+            &level.q,
+            level.num_vars,
+            level.real,
+            point,
+            low,
+        )
+    }
+}
+
+impl InputLayer {
+    /// The input layer's two-layer step, the one that ends GKR for an even-height tree.
+    pub fn gruen2(&self, point: &[u64], low: usize) -> Result<Gruen2Layer> {
+        Gruen2Layer::new(
+            &self.stream,
+            &self.p,
+            &self.q,
+            self.num_vars,
+            1usize << self.num_vars,
+            point,
+            low,
+        )
+    }
+}
+
 /// An input layer's plan on the card (D-BATCH M1-2): each side's range of
 /// terms, the terms — where a term's column starts in the table's run of base
 /// columns and its shift — their ext3 coefficients, and each side's constant.
