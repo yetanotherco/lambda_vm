@@ -910,10 +910,10 @@ static HOST_PARALLEL_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::At
 
 /// Whether a ladder round with at least [`HOST_PARALLEL_MIN_STEPS`] steps runs
 /// its host steps' rounds and binds side by side on the calling thread's pool
-/// (`LAMBDA_VM_ARGUE_HOST_PARALLEL=1`; off by default, and without the
-/// `parallel` feature). Each step's message and bind are its own and the
-/// round's sum still adds the messages in tree order, so the proof is the
-/// same. Read once, with a banner.
+/// (on by default; `LAMBDA_VM_ARGUE_HOST_PARALLEL=0` turns it off, and so
+/// does a build without the `parallel` feature). Each step's message and
+/// bind are its own and the round's sum still adds the messages in tree
+/// order, so the proof is the same. Read once, with a banner.
 pub fn argue_host_parallel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = match HOST_PARALLEL_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -928,9 +928,9 @@ pub fn argue_host_parallel() -> bool {
             eprintln!(
                 "★ ARGUE HOST PARALLEL: {}",
                 if on {
-                    "on (a ladder round's host steps side by side when it has many)"
+                    "on (the default; a ladder round's host steps side by side when it has many)"
                 } else {
-                    "off (the default; one host step after another)"
+                    "off (one host step after another)"
                 }
             );
             on
@@ -939,9 +939,9 @@ pub fn argue_host_parallel() -> bool {
     on && cfg!(feature = "parallel")
 }
 
-/// The knob's word: on for `1` only.
+/// The knob's word: off for `0` only.
 fn host_parallel_from(value: Option<&str>) -> bool {
-    value.is_some_and(|v| v.trim() == "1")
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 /// Overrides `LAMBDA_VM_ARGUE_HOST_PARALLEL` for the whole process — for a
@@ -1692,19 +1692,13 @@ mod tests {
         );
     }
 
-    /// The knob is on for `1` only.
+    /// The knob is on by default and off for `0` only.
     #[test]
-    fn the_host_parallel_knob_is_on_for_one_only() {
-        assert!(host_parallel_from(Some("1")));
-        assert!(host_parallel_from(Some(" 1 ")));
-        for off in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("yes"),
-            Some("2"),
-            Some("on"),
-        ] {
+    fn the_host_parallel_knob_is_on_by_default_and_off_for_zero_only() {
+        for on in [None, Some(""), Some("1"), Some(" 1 "), Some("yes")] {
+            assert!(host_parallel_from(on), "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0\n")] {
             assert!(!host_parallel_from(off), "{off:?}");
         }
     }
