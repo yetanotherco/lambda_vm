@@ -540,7 +540,10 @@ enum Commands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         input: Option<PathBuf>,
 
-        /// Where to write the base proof's rkyv bytes (not written when omitted)
+        /// Where to write the base proof's rkyv bytes (not written when omitted).
+        /// The file has no version: only a build with the same base proof layout
+        /// reads it back, and a file made by another build is refused as one of
+        /// another shape.
         #[arg(short, long, value_hint = ValueHint::FilePath)]
         output: Option<PathBuf>,
 
