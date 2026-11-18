@@ -2261,14 +2261,44 @@ fn the_tree_prover_refuses_to_compress_another_memory_format() {
             ),
         }
     }
-    assert_eq!(compressed_memory_check(pinned, true), Ok(()));
+    assert_eq!(compressed_memory_check(pinned, 0, true), Ok(()));
     for memory in [
         MemoryFormat::Split,
         MemoryFormat::Fused,
         MemoryFormat::Words,
     ] {
-        assert_eq!(compressed_memory_check(memory, false), Ok(()), "{memory:?}");
+        assert_eq!(
+            compressed_memory_check(memory, 0, false),
+            Ok(()),
+            "{memory:?}"
+        );
     }
+}
+
+/// ★ With a compression step planned, the tree's prover refuses a page run
+/// other than the pinned one (every compressed file's verifier checks the
+/// pinned runs), naming the top's uncompressed file; at the pinned memory
+/// format, so the page run's own rule answers (today a run above 0 also needs
+/// the word format, which the memory rule refuses first). Controls: the pinned
+/// run passes with compression planned, and every run passes without.
+#[test]
+fn the_tree_prover_refuses_to_compress_another_page_run() {
+    use super::super::whir_block_tree::compressed_memory_check;
+    let pinned = BlockFormat::pinned();
+    assert_eq!(pinned.page_run_log2, 0, "the pinned page runs");
+    for run in [1u8, 4, 6] {
+        let refused = compressed_memory_check(pinned.memory, run, true).expect_err("refused");
+        assert!(
+            refused.contains(&format!("page runs of 2^0 pages alone, not 2^{run}"))
+                && refused.contains("uncompressed file"),
+            "{run}: {refused}"
+        );
+        assert_eq!(compressed_memory_check(pinned.memory, run, false), Ok(()));
+        // Under the word format the memory rule answers first.
+        let words = compressed_memory_check(MemoryFormat::Words, run, true).expect_err("refused");
+        assert!(words.contains("memory format alone"), "{words}");
+    }
+    assert_eq!(compressed_memory_check(pinned.memory, 0, true), Ok(()));
 }
 
 /// The leaf digests of `owned` under `format` (each leaf, in order) and the
