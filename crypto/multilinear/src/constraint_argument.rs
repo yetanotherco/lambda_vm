@@ -226,6 +226,30 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         self.resident = Some((store, first));
     }
 
+    /// ⛔ A MEASUREMENT'S VIEW, never a prover's: this table's shape, factor
+    /// kinds and public tables, pointed at the same device copy of its columns
+    /// (when one is set), with no device factors of its own — and, with
+    /// `host_columns`, a copy of its columns on the host (a test without a
+    /// card); without, no host columns at all, so a host reader of the view
+    /// gets none and is refused. A probe reads the view while the table goes
+    /// on to its packing, spilling and argument.
+    #[doc(hidden)]
+    pub fn probe_view(&self, host_columns: bool) -> Self {
+        Self {
+            columns: Held::Wide(if host_columns {
+                self.columns().to_vec()
+            } else {
+                Vec::new()
+            }),
+            num_columns: self.num_columns,
+            num_vars: self.num_vars,
+            public: self.public.clone(),
+            kinds: self.kinds.clone(),
+            device: std::sync::Mutex::new(None),
+            resident: self.resident.clone(),
+        }
+    }
+
     /// Forgets the device copy [`set_resident`](Self::set_resident) pointed at,
     /// so the store can go while the table (and its host columns) stay: the
     /// block prover gives a group's columns back to the card between its commit
