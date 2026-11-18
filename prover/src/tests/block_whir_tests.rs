@@ -1591,6 +1591,57 @@ fn the_shadow_stays_off_where_it_cannot_rebuild_the_chunks() {
     assert!(verify(&proof, &elf, &format), "64-bit");
 }
 
+/// ★ The packer's open group closed ahead of BITWISE
+/// ([`Deviations::close_before_bitwise`]): under groups of two polynomials
+/// BITWISE (2^20 rows) never fits an open group, so with the knob on the last
+/// group before it closes as soon as BITWISE alone is left; the groups, and
+/// under the deterministic grind the proof's bytes, are the knob-off ones,
+/// and both proofs verify. Run alone for the bytes.
+#[test]
+fn closing_ahead_of_bitwise_moves_no_byte() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    assert!(o.rest_streams(), "the rest streams");
+    let proved = |on: bool| {
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                close_before_bitwise: Some(on),
+                ..finish_keccak_rnd()
+            },
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "close ahead {on}");
+        (proof, stamps)
+    };
+    let (off, off_stamps) = proved(false);
+    let (on, on_stamps) = proved(true);
+    assert!(
+        !off_stamps.layout.closed_before_bitwise,
+        "off: closed ahead"
+    );
+    assert!(
+        on_stamps.layout.closed_before_bitwise,
+        "on: the last group did not close ahead of BITWISE"
+    );
+    assert_eq!(off.groups, on.groups, "the partition");
+    assert_eq!(off.table_num_vars, on.table_num_vars);
+    if crypto::grinding::deterministic() {
+        let bytes = |p: &BlockWhirProof| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                .expect("serialize")
+                .to_vec()
+        };
+        assert_eq!(bytes(&off), bytes(&on), "the proof's bytes");
+    }
+}
+
 /// ★ Phase B's order moves no byte (D-WHIR-NODISK §2.3): each group proves on
 /// its own fork `S_post ‖ g`, so taking the groups reversed or odd ones first
 /// proves the bytes of group order under the deterministic grind, with the
