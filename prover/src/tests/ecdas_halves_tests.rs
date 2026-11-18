@@ -330,7 +330,10 @@ fn eval_row(form: EcdasForm, row: &[FE], top: Option<usize>) -> Vec<FE> {
     let mut folder = ProverEvalFolder::new(&ctx, &mut base, &mut ext);
     match form {
         EcdasForm::Bytes => EcdasConstraints.eval(&mut folder),
-        EcdasForm::Halves => EcdasHalvesConstraints::eval_with(&mut folder, top),
+        EcdasForm::Halves => match top {
+            None => EcdasHalvesConstraints.eval(&mut folder),
+            Some(first) => EcdasHalvesConstraints::eval_with_top_columns(&mut folder, first),
+        },
     }
     base
 }
