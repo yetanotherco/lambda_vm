@@ -1035,6 +1035,88 @@ fn with_keccak_rnd_first_the_sliding_stream_hands_keccak_rnd_on_first() {
     );
 }
 
+/// ★ With the page tables handed on next ([`WindowedTraceBuilder::pages_first`])
+/// after KECCAK_RND's and BITWISE last, the sliding stream hands on the
+/// monolithic finish's tables word for word, each once, in the order
+/// KECCAK_RND's, the page tables' (exactly the positions the layout expects:
+/// `block_whir::page_positions` of the run's AIR set), the rest in AIR order,
+/// BITWISE, under a header that says so; in waves the order stays AIR order.
+#[test]
+fn with_pages_first_the_sliding_stream_hands_the_pages_on_next() {
+    let max_rows = MaxRowsConfig::small();
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let mut pages_seen = 0usize;
+    for name in ["test_keccak_multi", "all_instructions_64"] {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| b);
+            let want = air_order(&builder.finish(last).expect("the monolithic finish"))
+                .into_iter()
+                .map(|t| t.map(shape_and_words))
+                .collect::<Vec<_>>();
+            for slide in [true, false] {
+                let what = format!("{name} window {window} slide {slide}");
+                let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                    let b = b.rest_bitwise_last().keccak_rnd_first().pages_first();
+                    if slide { b.slide_rest() } else { b }
+                });
+                let (header, got, _) = streamed_capped(builder, last, usize::MAX, None);
+                let reordered = slide && cfg!(feature = "parallel");
+                assert_eq!(header.pages_first, reordered, "{what}: the header");
+                let first: Vec<usize> = if reordered {
+                    let inputs = crate::BlockAirInputs::new(
+                        &opts,
+                        &program,
+                        header.cpu_heights.clone(),
+                        &header.public_output_bytes,
+                    )
+                    .expect("the AIR inputs");
+                    let airs = crate::block_airs(
+                        &program,
+                        &opts,
+                        &header.page_configs,
+                        &header.table_counts,
+                        &inputs,
+                        crate::tables::keccak_rnd::KeccakRndForm::Full,
+                        crate::tables::memw_aligned::MemwAlignedOrder::Lt,
+                        crate::tables::register::RegisterFormat::Tokens32,
+                    );
+                    let mut first: Vec<usize> =
+                        crate::block_whir::chunked_table_ranges(&header.table_counts)
+                            .into_iter()
+                            .find(|(family, ..)| *family == "KECCAK_RND")
+                            .map(|(_, range, _)| range.collect())
+                            .expect("KECCAK_RND's range");
+                    let pages = crate::block_whir::page_positions(&airs).expect("the pages");
+                    assert!(!pages.is_empty(), "{what}: no page table");
+                    pages_seen += pages.len();
+                    first.extend(pages);
+                    first
+                } else {
+                    Vec::new()
+                };
+                let positions: Vec<usize> = got.iter().map(|e| e.position).collect();
+                assert_eq!(
+                    positions,
+                    hand_on_order_first(want.len(), &first, reordered.then_some(0)),
+                    "{what}: the hand-on order"
+                );
+                for e in &got {
+                    assert!(
+                        e.table.as_ref().map(shape_and_words) == want[e.position],
+                        "{what}: table {}",
+                        e.position
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        pages_seen > 0 || !cfg!(feature = "parallel"),
+        "no stream handed a page table on next"
+    );
+}
+
 /// Handed on first under a one-byte budget, with BITWISE last, the tables go
 /// one at a time in the order `first`, AIR order, BITWISE, and the stream
 /// completes (a named timeout, not a hang, if the gate's lowest-pending rule
