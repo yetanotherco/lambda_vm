@@ -2941,9 +2941,9 @@ fn every_route_of_a_plan_with_page_blocks_is_held_and_its_leaves_emit() {
             table.name()
         );
     }
-    for t in 0..refs.len() {
-        super::route_of(&plan, refs[t], t, first)
-            .unwrap_or_else(|e| panic!("table {t} ({}): {e}", refs[t].name()));
+    for (t, air) in refs.iter().enumerate() {
+        super::route_of(&plan, *air, t, first)
+            .unwrap_or_else(|e| panic!("table {t} ({}): {e}", air.name()));
     }
     emit_leaves(&plan).expect("every leaf emits");
 }
