@@ -1068,7 +1068,9 @@ where
             bus_outputs[i] = Some(output);
         }
         let started = std::time::Instant::now();
+        let trims_before = multilinear::gpu::rewrite_trims();
         let (ladder, inputs) = gkr_lockstep::prove_trees(&refs, transcript)?;
+        split.rewrite_trims += multilinear::gpu::rewrite_trims() - trims_before;
         split.ladders += started.elapsed().as_secs_f64();
         split.ledger_ladder = split.ledger_ladder.max(multilinear::gpu::ledger_reserved());
         let inputs: Vec<GkrClaim<E>> = inputs;
@@ -1318,7 +1320,7 @@ where
         eprintln!(
             "BATCHED ARGUE TREES: tables {} · trees {} · cut {} · tree log2 cells {:.2} · built on the card \
              {} · on the host {} (after a queued build {}) · ledger GiB: at the start {:.2} · the bin's trees \
-             built {:.2} · after its ladder {:.2} · zerocheck set up {:.2} · handed back {} trees in {} bins",
+             built {:.2} · after its ladder {:.2} · zerocheck set up {:.2} · handed back {} trees in {} bins · pool trimmed before {} rewrites",
             tables.len(),
             plan.trees(),
             plan.chunks.iter().filter(|c| c.count > 1).count(),
@@ -1334,7 +1336,8 @@ where
             gib(split.ledger_ladder),
             gib(split.ledger_zc),
             split.trees_handed_back,
-            split.bins_handed_back
+            split.bins_handed_back,
+            split.rewrite_trims
         );
     }
     Ok((
@@ -1423,6 +1426,9 @@ struct ArgueSplit {
     /// trees that did.
     bins_handed_back: usize,
     trees_handed_back: u64,
+    /// Input layers written again after the pool handed its unused blocks
+    /// back (`multilinear::gpu::rewrite_trims`).
+    rewrite_trims: u64,
     ladders: f64,
     zc_setup: f64,
     zc_rounds: f64,
