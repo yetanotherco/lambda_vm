@@ -5,13 +5,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 

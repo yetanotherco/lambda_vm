@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -255,7 +248,7 @@ def ext_exc_type_bits_forwards (arg_ : Unit) : (BitVec 6) :=
   | () => 0b011000#6
 
 def ext_exc_type_bits_backwards (arg_ : (BitVec 6)) : SailM Unit := do
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b011000 => (pure ())
   | _ =>
     (do
@@ -267,7 +260,7 @@ def ext_exc_type_bits_forwards_matches (arg_ : Unit) : Bool :=
   | () => true
 
 def ext_exc_type_bits_backwards_matches (arg_ : (BitVec 6)) : Bool :=
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b011000 => true
   | _ => false
 

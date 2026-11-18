@@ -29,13 +29,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -266,7 +259,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_csrop_backwards (arg_ : (BitVec 2)) : SailM csrop := do
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b01 => (pure CSRRW)
   | 0b10 => (pure CSRRS)
   | 0b11 => (pure CSRRC)
@@ -282,7 +275,7 @@ def encdec_csrop_forwards_matches (arg_ : csrop) : Bool :=
   | .CSRRC => true
 
 def encdec_csrop_backwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b01 => true
   | 0b10 => true
   | 0b11 => true
@@ -315,7 +308,7 @@ def read_sireg_hpmevent (index : Nat) : SailM (BitVec 64) := do
 /-- Type quantifiers: arg2 : Nat, 1 ≤ arg2 ∧ arg2 ≤ 6 -/
 def get_ireg (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat) : SailM (BitVec 64) := do
   let merge_var := (arg0, arg1, arg2)
-  match (merge_var : (_ × BitVec 64 × _)) with
+  match merge_var with
   | (.Sireg, sel, 1) =>
     (do
       if (((BitVec.toNatInt sel) == (BitVec.toNatInt 0x40#8)) : Bool)
@@ -329,7 +322,7 @@ def get_ireg (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat) : SailM (BitVec
               if ((is_hpm_sel sel) : Bool)
               then (read_mhpmcounter (← (hpmidx_from_bits (Sail.BitVec.extractLsb sel 4 0))))
               else
-                (match ((Sireg, sel, 1) : (_ × BitVec 64 × _)) with
+                (match (Sireg, sel, 1) with
                 | (_, _, _) => (pure (zeros (n := 64)))))))
   | (.Sireg, sel, 4) =>
     (do
@@ -344,7 +337,7 @@ def get_ireg (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat) : SailM (BitVec
               if (((xlen == 32) && (is_hpm_sel sel)) : Bool)
               then (read_mhpmcounterh (← (hpmidx_from_bits (Sail.BitVec.extractLsb sel 4 0))))
               else
-                (match ((Sireg, sel, 4) : (_ × BitVec 64 × _)) with
+                (match (Sireg, sel, 4) with
                 | (_, _, _) => (pure (zeros (n := 64)))))))
   | (.Sireg, sel, 2) =>
     (do
@@ -363,7 +356,7 @@ def get_ireg (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat) : SailM (BitVec
                     (← (read_sireg_hpmevent
                         (← (hpmidx_from_bits (Sail.BitVec.extractLsb sel 4 0))))) (xlen -i 1) 0))
               else
-                (match ((Sireg, sel, 2) : (_ × BitVec 64 × _)) with
+                (match (Sireg, sel, 2) with
                 | (_, _, _) => (pure (zeros (n := 64)))))))
   | (.Sireg, sel, 5) =>
     (do
@@ -381,7 +374,7 @@ def get_ireg (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat) : SailM (BitVec
                     (← (read_sireg_hpmevent
                         (← (hpmidx_from_bits (Sail.BitVec.extractLsb sel 4 0))))) 63 32))
               else
-                (match ((Sireg, sel, 5) : (_ × BitVec 64 × _)) with
+                (match (Sireg, sel, 5) with
                 | (_, _, _) => (pure (zeros (n := 64)))))))
   | (_, _, _) => (pure (zeros (n := 64)))
 
@@ -597,7 +590,7 @@ def read_CSR (b__0 : (BitVec 12)) : SailM (BitVec 64) := do
                                                                                                                               if ((b__0 == (0x100#12 : (BitVec 12))) : Bool)
                                                                                                                               then
                                                                                                                                 (pure (Sail.BitVec.extractLsb
-                                                                                                                                    (← (do
+                                                                                                                                    (← do
                                                                                                                                       if ((← (inVirtualPrivilege
                                                                                                                                              ())) : Bool)
                                                                                                                                       then
@@ -607,7 +600,7 @@ def read_CSR (b__0 : (BitVec 12)) : SailM (BitVec 64) := do
                                                                                                                                       else
                                                                                                                                         (lower_mstatus
                                                                                                                                           (← readReg mstatus)
-                                                                                                                                          false)))
+                                                                                                                                          false))
                                                                                                                                     (xlen -i 1)
                                                                                                                                     0))
                                                                                                                               else
@@ -909,13 +902,13 @@ def read_CSR (b__0 : (BitVec 12)) : SailM (BitVec 64) := do
                                                                                                                                                                                                                                                                       if ((b__0 == (0x141#12 : (BitVec 12))) : Bool)
                                                                                                                                                                                                                                                                       then
                                                                                                                                                                                                                                                                         (get_xepc
-                                                                                                                                                                                                                                                                          (← (do
+                                                                                                                                                                                                                                                                          (← do
                                                                                                                                                                                                                                                                             if ((← (inVirtualPrivilege
                                                                                                                                                                                                                                                                                    ())) : Bool)
                                                                                                                                                                                                                                                                             then
                                                                                                                                                                                                                                                                               (pure VirtualSupervisor)
                                                                                                                                                                                                                                                                             else
-                                                                                                                                                                                                                                                                              (pure Supervisor))))
+                                                                                                                                                                                                                                                                              (pure Supervisor)))
                                                                                                                                                                                                                                                                       else
                                                                                                                                                                                                                                                                         (do
                                                                                                                                                                                                                                                                           if ((b__0 == (0x305#12 : (BitVec 12))) : Bool)
@@ -1720,7 +1713,7 @@ def read_CSR (b__0 : (BitVec 12)) : SailM (BitVec 64) := do
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       (← (get_mtime
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ()))
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       (xlen -i 1)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      0) + (← (do
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      0) + (← do
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       if ((← (inVirtualPrivilege
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              ())) : Bool)
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       then
@@ -1730,7 +1723,7 @@ def read_CSR (b__0 : (BitVec 12)) : SailM (BitVec 64) := do
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             0))
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       else
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         (pure (zeros
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            (n := 64)))))))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            (n := 64))))))
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               else
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 (do
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   if ((b__0 == (0xC02#12 : (BitVec 12))) : Bool)
@@ -1753,14 +1746,14 @@ def read_CSR (b__0 : (BitVec 12)) : SailM (BitVec 64) := do
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           then
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             (pure (Sail.BitVec.extractLsb
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 ((← (get_mtime
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ())) + (← (do
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ())) + (← do
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     if ((← (inVirtualPrivilege
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            ())) : Bool)
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     then
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       readReg htimedelta
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     else
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       (pure (zeros
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          (n := 64))))))
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          (n := 64)))))
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 63
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 32))
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           else
@@ -1824,17 +1817,17 @@ def write_sireg_cfg (c : (BitVec 64)) (v : (BitVec 64)) : SailM (BitVec 64) := d
 /-- Type quantifiers: index : Nat, 3 ≤ index ∧ index ≤ 31 -/
 def write_sireg_hpmevent (index : Nat) (value : (BitVec 64)) : SailM Unit := do
   (write_mhpmevent index
-    (← (do
+    (← do
       if ((← (currentlyEnabled Ext_Sscofpmf)) : Bool)
       then
         (pure (_update_HpmEvent_MINH (Mk_HpmEvent value)
             (_get_HpmEvent_MINH (Mk_HpmEvent (GetElem?.getElem! (← readReg mhpmevent) index)))))
-      else (pure value))))
+      else (pure value)))
 
 /-- Type quantifiers: arg2 : Nat, 1 ≤ arg2 ∧ arg2 ≤ 6 -/
 def set_ireg (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat) (arg3 : (BitVec 64)) : SailM (Result (BitVec 64) Unit) := do
   let merge_var := (arg0, arg1, arg2, arg3)
-  match (merge_var : (_ × BitVec 64 × _ × BitVec 64)) with
+  match merge_var with
   | (.Sireg, sel, 1, value) =>
     (do
       if (((BitVec.toNatInt sel) == (BitVec.toNatInt 0x40#8)) : Bool)
@@ -1866,7 +1859,7 @@ def set_ireg (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat) (arg3 : (BitVec
                   (write_mhpmcounter index full_value)
                   (pure (Ok (← (read_mhpmcounter index)))))
               else
-                (match ((Sireg, sel, 1, value) : (_ × BitVec 64 × _ × BitVec 64)) with
+                (match (Sireg, sel, 1, value) with
                 | (_, _, _, _) => (pure (Err ()))))))
   | (.Sireg, sel, 4, value) =>
     (do
@@ -1894,7 +1887,7 @@ def set_ireg (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat) (arg3 : (BitVec
                         (GetElem?.getElem! (← readReg mhpmcounter) index) 31 0)))
                   (pure (Ok (← (read_mhpmcounterh index)))))
               else
-                (match ((Sireg, sel, 4, value) : (_ × BitVec 64 × _ × BitVec 64)) with
+                (match (Sireg, sel, 4, value) with
                 | (_, _, _, _) => (pure (Err ()))))))
   | (.Sireg, sel, 2, value) =>
     (do
@@ -1948,7 +1941,7 @@ def set_ireg (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat) (arg3 : (BitVec
                               (Sail.BitVec.extractLsb (← (read_sireg_hpmevent index)) (xlen -i 1)
                                 0))))
                       else
-                        (match ((Sireg, sel, 2, value) : (_ × BitVec 64 × _ × BitVec 64)) with
+                        (match (Sireg, sel, 2, value) with
                         | (_, _, _, _) => (pure (Err ()))))))))
   | (.Sireg, sel, 5, value) =>
     (do
@@ -1977,7 +1970,7 @@ def set_ireg (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat) (arg3 : (BitVec
                         (GetElem?.getElem! (← readReg mhpmevent) index) 31 0)))
                   (pure (Ok (Sail.BitVec.extractLsb (← (read_sireg_hpmevent index)) 63 32))))
               else
-                (match ((Sireg, sel, 5, value) : (_ × BitVec 64 × _ × BitVec 64)) with
+                (match (Sireg, sel, 5, value) with
                 | (_, _, _, _) => (pure (Err ()))))))
   | (_, _, _, _) => (pure (Err ()))
 
@@ -2090,14 +2083,14 @@ def write_CSR (b__0 : (BitVec 12)) (value : (BitVec 64)) : SailM (Result (BitVec
                                                   let new ← do
                                                     (legalize_senvcfg (← readReg senvcfg)
                                                       (zero_extend (m := 64) value))
-                                                  writeReg senvcfg (← (do
+                                                  writeReg senvcfg (← do
                                                     if ((←((inVirtualPrivilege ()) <&&> (do
                                                          (pure ((_get_HEnvcfg_SSE
                                                                (← (read_henvcfg ()))) == 0#1))))) : Bool)
                                                     then
                                                       (pure (_update_SEnvcfg_SSE new
                                                           (_get_SEnvcfg_SSE (← readReg senvcfg))))
-                                                    else (pure new)))
+                                                    else (pure new))
                                                   (pure (Ok
                                                       (Sail.BitVec.extractLsb
                                                         (← (read_senvcfg ())) (xlen -i 1) 0))))
@@ -2857,7 +2850,7 @@ def write_CSR (b__0 : (BitVec 12)) (value : (BitVec 64)) : SailM (Result (BitVec
                                                                                                                                                                                                                                                                   if ((b__0 == (0x105#12 : (BitVec 12))) : Bool)
                                                                                                                                                                                                                                                                   then
                                                                                                                                                                                                                                                                     (pure (Ok
-                                                                                                                                                                                                                                                                        (← (do
+                                                                                                                                                                                                                                                                        (← do
                                                                                                                                                                                                                                                                           if ((← (inVirtualPrivilege
                                                                                                                                                                                                                                                                                  ())) : Bool)
                                                                                                                                                                                                                                                                           then
@@ -2865,20 +2858,20 @@ def write_CSR (b__0 : (BitVec 12)) (value : (BitVec 64)) : SailM (Result (BitVec
                                                                                                                                                                                                                                                                               value)
                                                                                                                                                                                                                                                                           else
                                                                                                                                                                                                                                                                             (set_stvec
-                                                                                                                                                                                                                                                                              value)))))
+                                                                                                                                                                                                                                                                              value))))
                                                                                                                                                                                                                                                                   else
                                                                                                                                                                                                                                                                     (do
                                                                                                                                                                                                                                                                       if ((b__0 == (0x141#12 : (BitVec 12))) : Bool)
                                                                                                                                                                                                                                                                       then
                                                                                                                                                                                                                                                                         (pure (Ok
                                                                                                                                                                                                                                                                             (← (set_xepc
-                                                                                                                                                                                                                                                                                (← (do
+                                                                                                                                                                                                                                                                                (← do
                                                                                                                                                                                                                                                                                   if ((← (inVirtualPrivilege
                                                                                                                                                                                                                                                                                          ())) : Bool)
                                                                                                                                                                                                                                                                                   then
                                                                                                                                                                                                                                                                                     (pure VirtualSupervisor)
                                                                                                                                                                                                                                                                                   else
-                                                                                                                                                                                                                                                                                    (pure Supervisor)))
+                                                                                                                                                                                                                                                                                    (pure Supervisor))
                                                                                                                                                                                                                                                                                 value))))
                                                                                                                                                                                                                                                                       else
                                                                                                                                                                                                                                                                         (do
@@ -4204,7 +4197,7 @@ def doCSR (csr : (BitVec 12)) (rs1_val : (BitVec 64)) (rd : regidx) (op : csrop)
             then (read_CSR csr)
             else (pure (zeros (n := 64))) ) : SailM xlenbits )
           let dest_val ← (( do
-            match (csr : BitVec 12) with
+            match csr with
             | 0x344 => (read_mip IncludePlatformInterrupts)
             | 0x144 => (read_sip IncludePlatformInterrupts)
             | _ => (pure read_val) ) : SailM xlenbits )

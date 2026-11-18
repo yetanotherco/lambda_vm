@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -268,7 +261,7 @@ def software_check_cause_forwards (arg_ : Software_Check_Code) : (BitVec 2) :=
   | .SWC_SHADOW_STACK_FAULT => 0b11#2
 
 def software_check_cause_backwards (arg_ : (BitVec 2)) : SailM Software_Check_Code := do
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => (pure SWC_NO_INFO)
   | 0b10 => (pure SWC_LANDING_PAD_FAULT)
   | 0b11 => (pure SWC_SHADOW_STACK_FAULT)
@@ -284,7 +277,7 @@ def software_check_cause_forwards_matches (arg_ : Software_Check_Code) : Bool :=
   | .SWC_SHADOW_STACK_FAULT => true
 
 def software_check_cause_backwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => true
   | 0b10 => true
   | 0b11 => true

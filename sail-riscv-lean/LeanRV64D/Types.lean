@@ -7,13 +7,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -276,7 +269,7 @@ def architecture_bits_forwards_matches (arg_ : Architecture) : Bool :=
   | .RV128 => true
 
 def architecture_bits_backwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b01 => true
   | 0b10 => true
   | 0b11 => true
@@ -301,7 +294,7 @@ def num_of_Privilege (arg_ : Privilege) : Int :=
   | .Machine => 4
 
 def privLevel_bits_forwards (arg_ : ((BitVec 2) × (BitVec 1))) : SailM Privilege := do
-  match (arg_ : (BitVec 2 × BitVec 1)) with
+  match arg_ with
   | (0b00, 0) => (pure User)
   | (0b00, 1) => (pure VirtualUser)
   | (0b01, 0) => (pure Supervisor)
@@ -318,7 +311,7 @@ def privLevel_bits_backwards (arg_ : Privilege) : ((BitVec 2) × (BitVec 1)) :=
   | .Machine => (0b11#2, 0#1)
 
 def privLevel_bits_forwards_matches (arg_ : ((BitVec 2) × (BitVec 1))) : Bool :=
-  match (arg_ : (BitVec 2 × BitVec 1)) with
+  match arg_ with
   | (0b00, 0) => true
   | (0b00, 1) => true
   | (0b01, 0) => true
@@ -451,7 +444,7 @@ def interruptType_bits_forwards (arg_ : InterruptType) : (BitVec 6) :=
   | .I_Reserved_15 => 0b001111#6
 
 def interruptType_bits_backwards (arg_ : (BitVec 6)) : SailM InterruptType := do
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b000000 => (pure I_Reserved_0)
   | 0b000001 => (pure I_S_Software)
   | 0b000010 => (pure I_VS_Software)
@@ -493,7 +486,7 @@ def interruptType_bits_forwards_matches (arg_ : InterruptType) : Bool :=
   | .I_Reserved_15 => true
 
 def interruptType_bits_backwards_matches (arg_ : (BitVec 6)) : Bool :=
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b000000 => true
   | 0b000001 => true
   | 0b000010 => true
@@ -574,8 +567,8 @@ def exceptionType_bits_forwards (arg_ : ExceptionType) : (BitVec 6) :=
 
 def exceptionType_bits_backwards (arg_ : (BitVec 6)) : SailM ExceptionType := do
   let head_exp_ := arg_
-  match (← (do
-    match (head_exp_ : BitVec 6) with
+  match (← do
+    match head_exp_ with
     | 0b000000 => (pure (some (E_Fetch_Addr_Align ())))
     | 0b000001 => (pure (some (E_Fetch_Access_Fault ())))
     | 0b000010 => (pure (some (E_Illegal_Instr ())))
@@ -607,7 +600,7 @@ def exceptionType_bits_backwards (arg_ : (BitVec 6)) : SailM ExceptionType := do
           (do
             match (← (ext_exc_type_bits_backwards mapping0_)) with
             | e => (pure (some (E_Extension e))))
-        else (pure none)))) with
+        else (pure none))) with
   | .some result => (pure result)
   | _ =>
     (do
@@ -645,8 +638,8 @@ def exceptionType_bits_forwards_matches (arg_ : ExceptionType) : Bool :=
 
 def exceptionType_bits_backwards_matches (arg_ : (BitVec 6)) : SailM Bool := do
   let head_exp_ := arg_
-  match (← (do
-    match (head_exp_ : BitVec 6) with
+  match (← do
+    match head_exp_ with
     | 0b000000 => (pure (some true))
     | 0b000001 => (pure (some true))
     | 0b000010 => (pure (some true))
@@ -678,10 +671,10 @@ def exceptionType_bits_backwards_matches (arg_ : (BitVec 6)) : SailM Bool := do
           (do
             match (← (ext_exc_type_bits_backwards mapping0_)) with
             | e => (pure (some true)))
-        else (pure none)))) with
+        else (pure none))) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 6) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def is_reserved_or_custom_exception (e : ExceptionType) : Bool :=
@@ -750,7 +743,7 @@ def num_of_TrapVectorMode (arg_ : TrapVectorMode) : Int :=
   | .TV_Reserved => 2
 
 def trapVectorMode_forwards (arg_ : (BitVec 2)) : TrapVectorMode :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => TV_Direct
   | 0b01 => TV_Vector
   | 0b10 => TV_Reserved
@@ -763,7 +756,7 @@ def trapVectorMode_backwards (arg_ : TrapVectorMode) : (BitVec 2) :=
   | .TV_Reserved => 0b10#2
 
 def trapVectorMode_forwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => true
   | 0b01 => true
   | 0b10 => true
@@ -816,7 +809,7 @@ def extStatus_map_forwards (arg_ : ExtStatus) : (BitVec 2) :=
   | .Dirty => 0b11#2
 
 def extStatus_map_backwards (arg_ : (BitVec 2)) : ExtStatus :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => Off
   | 0b01 => Initial
   | 0b10 => Clean
@@ -830,7 +823,7 @@ def extStatus_map_forwards_matches (arg_ : ExtStatus) : Bool :=
   | .Dirty => true
 
 def extStatus_map_backwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => true
   | 0b01 => true
   | 0b10 => true
@@ -867,7 +860,7 @@ def num_of_HGATPMode (arg_ : HGATPMode) : Int :=
   | .Sv57x4 => 4
 
 def hgatpMode_of_bits (a : Architecture) (m : (BitVec 4)) : SailM (Option HGATPMode) := do
-  match ((a, m) : (_ × BitVec 4)) with
+  match (a, m) with
   | (_, 0x0) => (pure (some HBare))
   | (.RV32, 0x1) => (pure (some Sv32x4))
   | (.RV64, 0x8) => (pure (some Sv39x4))
@@ -896,7 +889,7 @@ def num_of_SATPMode (arg_ : SATPMode) : Int :=
   | .Sv57 => 4
 
 def satpMode_of_bits (a : Architecture) (m : (BitVec 4)) : SailM (Option SATPMode) := do
-  match ((a, m) : (_ × BitVec 4)) with
+  match (a, m) with
   | (_, 0x0) => (pure (some Bare))
   | (.RV32, 0x1) => (pure (some Sv32))
   | (.RV64, 0x8) => (pure (some Sv39))
@@ -934,7 +927,7 @@ def wait_name_backwards_matches (arg_ : String) : Bool :=
   | _ => false
 
 def width_enc_backwards (arg_ : (BitVec 2)) : Int :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => 1
   | 0b01 => 2
   | 0b10 => 4
@@ -950,7 +943,7 @@ def width_enc_forwards_matches (arg_ : Nat) : Bool :=
   | _ => false
 
 def width_enc_backwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => true
   | 0b01 => true
   | 0b10 => true
@@ -986,7 +979,7 @@ def width_mnemonic_backwards_matches (arg_ : String) : Bool :=
   | _ => false
 
 def width_enc_wide_backwards (arg_ : (BitVec 3)) : SailM Int := do
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => (pure 1)
   | 0b001 => (pure 2)
   | 0b010 => (pure 4)
@@ -1008,7 +1001,7 @@ def width_enc_wide_forwards_matches (arg_ : Nat) : Bool :=
   | _ => false
 
 def width_enc_wide_backwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => true
   | 0b001 => true
   | 0b010 => true

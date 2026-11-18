@@ -14,13 +14,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -379,7 +372,7 @@ def pmpCheck (addr : physaddr) (width : Nat) (access : (MemoryAccessType mem_pay
           match (← (pmpMatchAddr addr width cfg (← (pmpReadAddrReg i)) prev_pmpaddr)) with
           | .PMP_NoMatch => (pure ())
           | .PMP_PartialMatch =>
-            SailME.throw (← (do
+            SailME.throw (← do
                 let _ : Unit :=
                   if ((get_config_print_pmp ()) : Bool)
                   then
@@ -387,9 +380,9 @@ def pmpCheck (addr : physaddr) (width : Nat) (access : (MemoryAccessType mem_pay
                       (HAppend.hAppend "PMP check failed with a partial match at entry #"
                         (HAppend.hAppend (Int.repr i) ".")))
                   else ()
-                (pure (some (← (accessFaultFromAccessType access))))))
+                (pure (some (← (accessFaultFromAccessType access)))))
           | .PMP_Match =>
-            SailME.throw (← (do
+            SailME.throw (← do
                 if (((← (pmpCheckRWX cfg access)) || ((priv == Machine) && (not (pmpLocked cfg)))) : Bool)
                 then (pure none)
                 else
@@ -401,7 +394,7 @@ def pmpCheck (addr : physaddr) (width : Nat) (access : (MemoryAccessType mem_pay
                           (HAppend.hAppend "PMP check failed at matching entry #"
                             (HAppend.hAppend (Int.repr i) ".")))
                       else ()
-                    (pure (some (← (accessFaultFromAccessType access)))))))
+                    (pure (some (← (accessFaultFromAccessType access))))))
       (pure loop_vars)
       if ((priv == Machine) : Bool)
       then (pure none)

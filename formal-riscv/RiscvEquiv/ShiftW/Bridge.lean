@@ -29,7 +29,7 @@ theorem srlwPure_toNat (a b : BitVec 64) :
     rw [Nat.shiftRight_eq_div_pow]
     exact lt_of_le_of_lt (Nat.div_le_self _ _) (Nat.mod_lt _ (by norm_num))
   simp only [srlwPure, Alu.shiftResult, BitVec.toNat_ushiftRight, BitVec.toNat_setWidth]
-  simp only [if_pos, one_ne_zero, ite_false]
+  simp only [ite_eq_left, one_ne_zero, ite_false]
   exact (Nat.mod_eq_of_lt hx).symm
 
 /-- Shifting a sign-extended word arithmetically and keeping the low word is shifting the

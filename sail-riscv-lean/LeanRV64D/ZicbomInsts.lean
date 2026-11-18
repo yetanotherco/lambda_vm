@@ -16,13 +16,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -253,7 +246,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_cbop_backwards (arg_ : (BitVec 12)) : SailM cbop_zicbom := do
-  match (arg_ : BitVec 12) with
+  match arg_ with
   | 0b000000000001 => (pure CBO_CLEAN)
   | 0b000000000010 => (pure CBO_FLUSH)
   | 0b000000000000 => (pure CBO_INVAL)
@@ -269,7 +262,7 @@ def encdec_cbop_forwards_matches (arg_ : cbop_zicbom) : Bool :=
   | .CBO_INVAL => true
 
 def encdec_cbop_backwards_matches (arg_ : (BitVec 12)) : Bool :=
-  match (arg_ : BitVec 12) with
+  match arg_ with
   | 0b000000000001 => true
   | 0b000000000010 => true
   | 0b000000000000 => true
@@ -321,7 +314,7 @@ def encdec_cbie_forwards (arg_ : cbie) : (BitVec 2) :=
   | .CBIE_EXEC_INVAL => 0b11#2
 
 def encdec_cbie_backwards (arg_ : (BitVec 2)) : SailM cbie := do
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => (pure CBIE_ILLEGAL)
   | 0b01 => (pure CBIE_EXEC_FLUSH)
   | 0b11 => (pure CBIE_EXEC_INVAL)
@@ -334,7 +327,7 @@ def encdec_cbie_forwards_matches (arg_ : cbie) : Bool :=
   | .CBIE_EXEC_INVAL => true
 
 def encdec_cbie_backwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => true
   | 0b01 => true
   | 0b11 => true

@@ -62,10 +62,10 @@ theorem sshiftRight_toNat (a : BitVec 64) (k : ℕ) (hk : k < 64) :
   by_cases h : a.toNat < 2^63
   · have h' : ¬ (2^(64-1) ≤ a.toNat) := by omega
     simp only [decide_eq_true_eq]
-    rw [if_neg h', if_pos h]
+    rw [ite_eq_right h', ite_eq_left h]
   · have h' : 2^(64-1) ≤ a.toNat := by omega
     simp only [decide_eq_true_eq]
-    rw [if_pos h', if_neg h]
+    rw [ite_eq_left h', ite_eq_right h]
     have e : a.toNat + (2^128 - 2^64) = 2^128 - 1 - (2^64 - 1 - a.toNat) := by omega
     rw [e, Nat.shiftRight_eq_div_pow, Nat.shiftRight_eq_div_pow,
       complement_div_two_pow _ _ (by omega) (by omega)]

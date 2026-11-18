@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -290,7 +283,7 @@ def ntl_name_backwards_matches (arg_ : String) : Bool :=
   | _ => false
 
 def encdec_ntl_backwards (arg_ : (BitVec 5)) : SailM ntl_type := do
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00010 => (pure NTL_P1)
   | 0b00011 => (pure NTL_PALL)
   | 0b00100 => (pure NTL_S1)
@@ -308,7 +301,7 @@ def encdec_ntl_forwards_matches (arg_ : ntl_type) : Bool :=
   | .NTL_ALL => true
 
 def encdec_ntl_backwards_matches (arg_ : (BitVec 5)) : Bool :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00010 => true
   | 0b00011 => true
   | 0b00100 => true

@@ -13,13 +13,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -359,7 +352,7 @@ def check_PTE_permission (access : (MemoryAccessType mem_payload)) (priv : Privi
         (do
           if (((not pte_R) && (pte_W && (not pte_X))) : Bool)
           then
-            SailME.throw (← (do
+            SailME.throw (← do
                 sail_assert (bool_bit_backwards (_get_MEnvcfg_SSE (← readReg menvcfg))) "sys/vmem_pte.sail:186.33-186.34"
                 let shadow_stack_ok ← (( do
                   match access with
@@ -402,7 +395,7 @@ def check_PTE_permission (access : (MemoryAccessType mem_payload)) (priv : Privi
                 else
                   (match access with
                   | .LoadExecute .Data => (pure (PTE_Check_Failure ((), (PTE_No_Permission ()))))
-                  | _ => (pure (PTE_Check_Success ())))))
+                  | _ => (pure (PTE_Check_Success ()))))
           else
             (do
               if ((← (is_shadow_stack_access access)) : Bool)

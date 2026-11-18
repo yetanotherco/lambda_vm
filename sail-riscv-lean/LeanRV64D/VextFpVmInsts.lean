@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -246,7 +239,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_fvvmfunct6_backwards (arg_ : (BitVec 6)) : SailM fvvmfunct6 := do
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b011000 => (pure FVVM_VMFEQ)
   | 0b011001 => (pure FVVM_VMFLE)
   | 0b011011 => (pure FVVM_VMFLT)
@@ -264,7 +257,7 @@ def encdec_fvvmfunct6_forwards_matches (arg_ : fvvmfunct6) : Bool :=
   | .FVVM_VMFNE => true
 
 def encdec_fvvmfunct6_backwards_matches (arg_ : (BitVec 6)) : Bool :=
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b011000 => true
   | 0b011001 => true
   | 0b011011 => true
@@ -298,7 +291,7 @@ def fvvmtype_mnemonic_backwards_matches (arg_ : String) : Bool :=
   | _ => false
 
 def encdec_fvfmfunct6_backwards (arg_ : (BitVec 6)) : SailM fvfmfunct6 := do
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b011000 => (pure VFM_VMFEQ)
   | 0b011001 => (pure VFM_VMFLE)
   | 0b011011 => (pure VFM_VMFLT)
@@ -320,7 +313,7 @@ def encdec_fvfmfunct6_forwards_matches (arg_ : fvfmfunct6) : Bool :=
   | .VFM_VMFGE => true
 
 def encdec_fvfmfunct6_backwards_matches (arg_ : (BitVec 6)) : Bool :=
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b011000 => true
   | 0b011001 => true
   | 0b011011 => true

@@ -11,13 +11,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -258,7 +251,7 @@ def encdec_creg_forwards (arg_ : cregidx) : (BitVec 3) :=
   | .Cregidx r => r
 
 def encdec_creg_backwards (arg_ : (BitVec 3)) : cregidx :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | r => (Cregidx r)
 
 def encdec_creg_forwards_matches (arg_ : cregidx) : Bool :=
@@ -266,7 +259,7 @@ def encdec_creg_forwards_matches (arg_ : cregidx) : Bool :=
   | .Cregidx r => true
 
 def encdec_creg_backwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | r => true
 
 def reg_abi_name_raw_backwards (arg_ : String) : SailM (BitVec 5) := do
@@ -310,7 +303,7 @@ def reg_abi_name_raw_backwards (arg_ : String) : SailM (BitVec 5) := do
       throw Error.Exit)
 
 def reg_abi_name_raw_forwards_matches (arg_ : (BitVec 5)) : Bool :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00000 => true
   | 0b00001 => true
   | 0b00010 => true
@@ -423,7 +416,7 @@ def reg_arch_name_raw_backwards (arg_ : String) : SailM (BitVec 5) := do
       throw Error.Exit)
 
 def reg_arch_name_raw_forwards_matches (arg_ : (BitVec 5)) : Bool :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00000 => true
   | 0b00001 => true
   | 0b00010 => true
@@ -496,25 +489,25 @@ def reg_arch_name_raw_backwards_matches (arg_ : String) : Bool :=
 
 def reg_name_backwards (arg_ : String) : SailM regidx := do
   let head_exp_ := arg_
-  match (← (do
+  match (← do
     let mapping0_ := head_exp_
     if ((reg_abi_name_raw_backwards_matches mapping0_) : Bool)
     then
       (do
-        match ((← (reg_abi_name_raw_backwards mapping0_)) : BitVec 5) with
+        match (← (reg_abi_name_raw_backwards mapping0_)) with
         | i => (pure (some (← (encdec_reg_backwards i)))))
-    else (pure none))) with
+    else (pure none)) with
   | .some result => (pure result)
   | none =>
     (do
-      match (← (do
+      match (← do
         let mapping1_ := head_exp_
         if ((reg_arch_name_raw_backwards_matches mapping1_) : Bool)
         then
           (do
-            match ((← (reg_arch_name_raw_backwards mapping1_)) : BitVec 5) with
+            match (← (reg_arch_name_raw_backwards mapping1_)) with
             | i => (pure (some (← (encdec_reg_backwards i)))))
-        else (pure none))) with
+        else (pure none)) with
       | .some result => (pure result)
       | _ =>
         (do
@@ -548,25 +541,25 @@ def reg_name_forwards_matches (arg_ : regidx) : Bool :=
 
 def reg_name_backwards_matches (arg_ : String) : SailM Bool := do
   let head_exp_ := arg_
-  match (← (do
+  match (← do
     let mapping0_ := head_exp_
     if ((reg_abi_name_raw_backwards_matches mapping0_) : Bool)
     then
       (do
-        match ((← (reg_abi_name_raw_backwards mapping0_)) : BitVec 5) with
+        match (← (reg_abi_name_raw_backwards mapping0_)) with
         | i => (pure (some true)))
-    else (pure none))) with
+    else (pure none)) with
   | .some result => (pure result)
   | none =>
     (do
-      match (← (do
+      match (← do
         let mapping1_ := head_exp_
         if ((reg_arch_name_raw_backwards_matches mapping1_) : Bool)
         then
           (do
-            match ((← (reg_arch_name_raw_backwards mapping1_)) : BitVec 5) with
+            match (← (reg_arch_name_raw_backwards mapping1_)) with
             | i => (pure (some true)))
-        else (pure none))) with
+        else (pure none)) with
       | .some result => (pure result)
       | none =>
         (match head_exp_ with
@@ -599,7 +592,7 @@ def sp_reg_name_backwards_matches (arg_ : String) : Bool :=
 
 def creg_name_backwards (arg_ : String) : SailM cregidx := do
   let head_exp_ := arg_
-  match (← (do
+  match (← do
     let mapping0_ := head_exp_
     if ((← (reg_name_backwards_matches mapping0_)) : Bool)
     then
@@ -619,7 +612,7 @@ def creg_name_backwards (arg_ : String) : SailM cregidx := do
         | none =>
           (match head_exp_ with
           | _ => (pure none)))
-    else (pure none))) with
+    else (pure none)) with
   | .some result => (pure result)
   | _ =>
     (do
@@ -632,7 +625,7 @@ def creg_name_forwards_matches (arg_ : cregidx) : Bool :=
 
 def creg_name_backwards_matches (arg_ : String) : SailM Bool := do
   let head_exp_ := arg_
-  match (← (do
+  match (← do
     let mapping0_ := head_exp_
     if ((← (reg_name_backwards_matches mapping0_)) : Bool)
     then
@@ -650,7 +643,7 @@ def creg_name_backwards_matches (arg_ : String) : SailM Bool := do
         | none =>
           (match head_exp_ with
           | _ => (pure none)))
-    else (pure none))) with
+    else (pure none)) with
   | .some result => (pure result)
   | none =>
     (match head_exp_ with

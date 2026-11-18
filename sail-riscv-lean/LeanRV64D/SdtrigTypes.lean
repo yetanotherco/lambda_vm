@@ -11,13 +11,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -281,7 +274,7 @@ def num_of_Trig_Type (arg_ : Trig_Type) : Int :=
   | .TT_reserved => 10
 
 def trig_type_bits_forwards (arg_ : (BitVec 4)) : Trig_Type :=
-  match (arg_ : BitVec 4) with
+  match arg_ with
   | 0b0000 => TT_none
   | 0b0001 => TT_legacy
   | 0b0010 => TT_mcontrol
@@ -316,7 +309,7 @@ def trig_type_bits_backwards (arg_ : Trig_Type) : SailM (BitVec 4) := do
       throw Error.Exit)
 
 def trig_type_bits_forwards_matches (arg_ : (BitVec 4)) : Bool :=
-  match (arg_ : BitVec 4) with
+  match arg_ with
   | 0b0000 => true
   | 0b0001 => true
   | 0b0010 => true
@@ -471,7 +464,7 @@ def num_of_Trig_Action (arg_ : Trig_Action) : Int :=
   | .TA_Ext_Trigger_1 => 6
 
 def trig_action_forwards (arg_ : (BitVec 6)) : SailM Trig_Action := do
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b000000 => (pure TA_Breakpoint)
   | 0b000001 => (pure TA_Enter_Debug)
   | 0b000010 => (pure TA_Trace_On)
@@ -495,7 +488,7 @@ def trig_action_backwards (arg_ : Trig_Action) : (BitVec 6) :=
   | .TA_Ext_Trigger_1 => 0b001001#6
 
 def trig_action_forwards_matches (arg_ : (BitVec 6)) : Bool :=
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b000000 => true
   | 0b000001 => true
   | 0b000010 => true
@@ -587,7 +580,7 @@ def num_of_Hit (arg_ : Hit) : Int :=
   | .Hit_imm_after => 3
 
 def hit_bits_forwards (arg_ : (BitVec 2)) : Hit :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => Hit_false
   | 0b01 => Hit_before
   | 0b10 => Hit_after
@@ -601,7 +594,7 @@ def hit_bits_backwards (arg_ : Hit) : (BitVec 2) :=
   | .Hit_imm_after => 0b11#2
 
 def hit_bits_forwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => true
   | 0b01 => true
   | 0b10 => true
@@ -663,7 +656,7 @@ def num_of_Compare_Selection (arg_ : Compare_Selection) : Int :=
   | .Compare_Data => 1
 
 def compare_select_bits_forwards (arg_ : (BitVec 1)) : Compare_Selection :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 0 => Compare_Address
   | _ => Compare_Data
 
@@ -673,7 +666,7 @@ def compare_select_bits_backwards (arg_ : Compare_Selection) : (BitVec 1) :=
   | .Compare_Data => 1#1
 
 def compare_select_bits_forwards_matches (arg_ : (BitVec 1)) : Bool :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 0 => true
   | 1 => true
   | _ => false
@@ -684,7 +677,7 @@ def compare_select_bits_backwards_matches (arg_ : Compare_Selection) : Bool :=
   | .Compare_Data => true
 
 def trig_match_size_forwards (arg_ : (BitVec 3)) : SailM Int := do
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => (pure 0)
   | 0b001 => (pure 8)
   | 0b010 => (pure 16)
@@ -709,7 +702,7 @@ def trig_match_size_backwards (arg_ : Nat) : (BitVec 3) :=
   | _ => 0b110#3
 
 def trig_match_size_forwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => true
   | 0b001 => true
   | 0b010 => true
@@ -812,7 +805,7 @@ def num_of_Trig_Match (arg_ : Trig_Match) : Int :=
   | .TM_NOT_MASK_HI => 9
 
 def trig_match_val_forwards (arg_ : (BitVec 4)) : SailM Trig_Match := do
-  match (arg_ : BitVec 4) with
+  match arg_ with
   | 0b0000 => (pure TM_EQ)
   | 0b0001 => (pure TM_NAPOT)
   | 0b0010 => (pure TM_GE)
@@ -842,7 +835,7 @@ def trig_match_val_backwards (arg_ : Trig_Match) : (BitVec 4) :=
   | .TM_NOT_MASK_HI => 0b1101#4
 
 def trig_match_val_forwards_matches (arg_ : (BitVec 4)) : Bool :=
-  match (arg_ : BitVec 4) with
+  match arg_ with
   | 0b0000 => true
   | 0b0001 => true
   | 0b0010 => true
@@ -992,11 +985,11 @@ def sselect_scontext_match : Bool := true
 def sselect_asid_match : Bool := true
 
 def undefined_TExtra (_ : Unit) : SailM TExtra := do
-  (pure { mhvalue := ← (do (undefined_bitvector 13))
-          mhselect := ← (do (undefined_bitvector 3))
-          sbytemask := ← (do (undefined_bitvector 4))
-          svalue := ← (do (undefined_bitvector 32))
-          sselect := ← (do (undefined_bitvector 2)) })
+  (pure { mhvalue := ← (undefined_bitvector 13)
+          mhselect := ← (undefined_bitvector 3)
+          sbytemask := ← (undefined_bitvector 4)
+          svalue := ← (undefined_bitvector 32)
+          sselect := ← (undefined_bitvector 2) })
 
 def sdtrig_mhvalue_len : Nat := 13
 
@@ -1015,7 +1008,7 @@ def TExtra_to_bits (t : TExtra) : (BitVec 64) :=
           t.mhselect) t.sbytemask) t.svalue) t.sselect)
 
 def legalize_mhselect (mhselect : (BitVec 3)) : (BitVec 3) :=
-  match (mhselect : BitVec 3) with
+  match mhselect with
   | 0b000 => mhselect
   | 0b001 =>
     (if (((hartSupports Ext_H) && mhselect_mcontext_match) : Bool)
@@ -1041,7 +1034,7 @@ def legalize_mhselect (mhselect : (BitVec 3)) : (BitVec 3) :=
   | _ => 0b000#3
 
 def legalize_sselect (sselect : (BitVec 2)) : (BitVec 2) :=
-  match (sselect : BitVec 2) with
+  match sselect with
   | 0b00 => sselect
   | 0b01 =>
     (if (sselect_scontext_match : Bool)
@@ -1057,12 +1050,10 @@ def make_textra (v : (BitVec 64)) : TExtra :=
   let data := (Mk_Trigger_Extra_RV64 v)
   { mhvalue := ((_get_Trigger_Extra_RV64_mhvalue data) &&& mhvalue_mask)
     mhselect := (legalize_mhselect (_get_Trigger_Extra_RV64_mhselect data))
-    sbytemask := 
-      if (sselect_scontext_match : Bool)
+    sbytemask := if (sselect_scontext_match : Bool)
       then (_get_Trigger_Extra_RV64_sbytemask data)
       else (zeros (n := 4))
-    svalue := 
-      if ((hartSupports Ext_S) : Bool)
+    svalue := if ((hartSupports Ext_S) : Bool)
       then ((_get_Trigger_Extra_RV64_svalue data) &&& svalue_mask)
       else (zeros (n := 32))
     sselect := (legalize_sselect (_get_Trigger_Extra_RV64_sselect data)) }
@@ -1084,10 +1075,10 @@ def num_of_trigger_addr_type (arg_ : trigger_addr_type) : Int :=
   | .TriggerAddress_AMO => 2
 
 def undefined_TDisabled (_ : Unit) : SailM TDisabled := do
-  (pure { dmode := ← (do (undefined_bool ()))
-          data := ← (do (undefined_bitvector (64 -i 5)))
-          tdata2 := ← (do (undefined_bitvector 64))
-          textra := ← (do (undefined_TExtra ())) })
+  (pure { dmode := ← (undefined_bool ())
+          data := ← (undefined_bitvector (64 -i 5))
+          tdata2 := ← (undefined_bitvector 64)
+          textra := ← (undefined_TExtra ()) })
 
 def undefined_TDisabled_bits (_ : Unit) : SailM (BitVec 64) := do
   (undefined_bitvector 64)
@@ -1680,31 +1671,31 @@ def ICount_to_bits (t : ICount) : SailM (BitVec 64) := do
       (zero_extend (m := 6) (trig_action_backwards t.action))))
 
 def undefined_ITrigger (_ : Unit) : SailM ITrigger := do
-  (pure { dmode := ← (do (undefined_bool ()))
-          hit := ← (do (undefined_bool ()))
-          vs := ← (do (undefined_bool ()))
-          vu := ← (do (undefined_bool ()))
-          nmi := ← (do (undefined_bool ()))
-          m := ← (do (undefined_bool ()))
-          s := ← (do (undefined_bool ()))
-          u := ← (do (undefined_bool ()))
-          action := ← (do (undefined_Trig_Action ()))
-          tdata2 := ← (do (undefined_bitvector 64))
-          textra := ← (do (undefined_TExtra ()))
-          pending := ← (do (undefined_bool ())) })
+  (pure { dmode := ← (undefined_bool ())
+          hit := ← (undefined_bool ())
+          vs := ← (undefined_bool ())
+          vu := ← (undefined_bool ())
+          nmi := ← (undefined_bool ())
+          m := ← (undefined_bool ())
+          s := ← (undefined_bool ())
+          u := ← (undefined_bool ())
+          action := ← (undefined_Trig_Action ())
+          tdata2 := ← (undefined_bitvector 64)
+          textra := ← (undefined_TExtra ())
+          pending := ← (undefined_bool ()) })
 
 def undefined_ETrigger (_ : Unit) : SailM ETrigger := do
-  (pure { dmode := ← (do (undefined_bool ()))
-          hit := ← (do (undefined_bool ()))
-          vs := ← (do (undefined_bool ()))
-          vu := ← (do (undefined_bool ()))
-          m := ← (do (undefined_bool ()))
-          s := ← (do (undefined_bool ()))
-          u := ← (do (undefined_bool ()))
-          action := ← (do (undefined_Trig_Action ()))
-          tdata2 := ← (do (undefined_bitvector 64))
-          textra := ← (do (undefined_TExtra ()))
-          pending := ← (do (undefined_bool ())) })
+  (pure { dmode := ← (undefined_bool ())
+          hit := ← (undefined_bool ())
+          vs := ← (undefined_bool ())
+          vu := ← (undefined_bool ())
+          m := ← (undefined_bool ())
+          s := ← (undefined_bool ())
+          u := ← (undefined_bool ())
+          action := ← (undefined_Trig_Action ())
+          tdata2 := ← (undefined_bitvector 64)
+          textra := ← (undefined_TExtra ())
+          pending := ← (undefined_bool ()) })
 
 def undefined_IETrigger_bits (_ : Unit) : SailM (BitVec 64) := do
   (undefined_bitvector 64)
@@ -1997,28 +1988,24 @@ def make_trigger (idx : Nat) (tdata1 : (BitVec 64)) (tdata2 : (BitVec 64)) (text
           then
             (pure (T_icount
                 { dmode := false
-                  vs := ← (do 
-                    if ((← (currentlyEnabled Ext_H)) : Bool)
+                  vs := ← if ((← (currentlyEnabled Ext_H)) : Bool)
                     then (pure (bool_bit_backwards (_get_ICount_bits_vs v)))
-                    else (pure false))
-                  vu := ← (do 
-                    if ((← (currentlyEnabled Ext_H)) : Bool)
+                    else (pure false)
+                  vu := ← if ((← (currentlyEnabled Ext_H)) : Bool)
                     then (pure (bool_bit_backwards (_get_ICount_bits_vu v)))
-                    else (pure false))
+                    else (pure false)
                   hit := (bool_bit_backwards (_get_ICount_bits_hit v))
                   count := count
                   new_count := (some count)
                   m := (bool_bit_backwards (_get_ICount_bits_m v))
                   pending := (bool_bit_backwards (_get_ICount_bits_pending v))
-                  s := ← (do 
-                    if ((← (currentlyEnabled Ext_S)) : Bool)
+                  s := ← if ((← (currentlyEnabled Ext_S)) : Bool)
                     then (pure (bool_bit_backwards (_get_ICount_bits_s v)))
-                    else (pure false))
-                  u := ← (do 
-                    if ((← (currentlyEnabled Ext_U)) : Bool)
+                    else (pure false)
+                  u := ← if ((← (currentlyEnabled Ext_U)) : Bool)
                     then (pure (bool_bit_backwards (_get_ICount_bits_u v)))
-                    else (pure false))
-                  action := ← (do (trig_action_forwards act))
+                    else (pure false)
+                  action := ← (trig_action_forwards act)
                   active := false
                   tdata2 := tdata2
                   textra := textra }))
@@ -2045,25 +2032,21 @@ def make_trigger (idx : Nat) (tdata1 : (BitVec 64)) (tdata2 : (BitVec 64)) (text
             (pure (T_itrigger
                 { dmode := false
                   hit := (bool_bit_backwards (_get_IETrigger_bits_hit v))
-                  vs := ← (do 
-                    if ((← (currentlyEnabled Ext_H)) : Bool)
+                  vs := ← if ((← (currentlyEnabled Ext_H)) : Bool)
                     then (pure (bool_bit_backwards (_get_IETrigger_bits_vs v)))
-                    else (pure false))
-                  vu := ← (do 
-                    if ((← (currentlyEnabled Ext_H)) : Bool)
+                    else (pure false)
+                  vu := ← if ((← (currentlyEnabled Ext_H)) : Bool)
                     then (pure (bool_bit_backwards (_get_IETrigger_bits_vu v)))
-                    else (pure false))
+                    else (pure false)
                   nmi := (bool_bit_backwards (_get_IETrigger_bits_nmi v))
                   m := (bool_bit_backwards (_get_IETrigger_bits_m v))
-                  s := ← (do 
-                    if ((← (currentlyEnabled Ext_S)) : Bool)
+                  s := ← if ((← (currentlyEnabled Ext_S)) : Bool)
                     then (pure (bool_bit_backwards (_get_IETrigger_bits_s v)))
-                    else (pure false))
-                  u := ← (do 
-                    if ((← (currentlyEnabled Ext_U)) : Bool)
+                    else (pure false)
+                  u := ← if ((← (currentlyEnabled Ext_U)) : Bool)
                     then (pure (bool_bit_backwards (_get_IETrigger_bits_u v)))
-                    else (pure false))
-                  action := ← (do (trig_action_forwards act))
+                    else (pure false)
+                  action := ← (trig_action_forwards act)
                   tdata2 := (tdata2 &&& supported_itrigger_mask)
                   textra := textra
                   pending := false }))
@@ -2104,24 +2087,20 @@ def make_trigger (idx : Nat) (tdata1 : (BitVec 64)) (tdata2 : (BitVec 64)) (text
             (pure (T_etrigger
                 { dmode := false
                   hit := (bool_bit_backwards (_get_IETrigger_bits_hit v))
-                  vs := ← (do 
-                    if ((← (currentlyEnabled Ext_H)) : Bool)
+                  vs := ← if ((← (currentlyEnabled Ext_H)) : Bool)
                     then (pure (bool_bit_backwards (_get_IETrigger_bits_vs v)))
-                    else (pure false))
-                  vu := ← (do 
-                    if ((← (currentlyEnabled Ext_H)) : Bool)
+                    else (pure false)
+                  vu := ← if ((← (currentlyEnabled Ext_H)) : Bool)
                     then (pure (bool_bit_backwards (_get_IETrigger_bits_vu v)))
-                    else (pure false))
+                    else (pure false)
                   m := (bool_bit_backwards (_get_IETrigger_bits_m v))
-                  s := ← (do 
-                    if ((← (currentlyEnabled Ext_S)) : Bool)
+                  s := ← if ((← (currentlyEnabled Ext_S)) : Bool)
                     then (pure (bool_bit_backwards (_get_IETrigger_bits_s v)))
-                    else (pure false))
-                  u := ← (do 
-                    if ((← (currentlyEnabled Ext_U)) : Bool)
+                    else (pure false)
+                  u := ← if ((← (currentlyEnabled Ext_U)) : Bool)
                     then (pure (bool_bit_backwards (_get_IETrigger_bits_u v)))
-                    else (pure false))
-                  action := ← (do (trig_action_forwards act))
+                    else (pure false)
+                  action := ← (trig_action_forwards act)
                   tdata2 := (tdata2 &&& supported_etrigger_mask)
                   textra := textra
                   pending := false }))
@@ -2176,29 +2155,25 @@ def make_trigger (idx : Nat) (tdata1 : (BitVec 64)) (tdata2 : (BitVec 64)) (text
                 { dmode := false
                   uncertain := false
                   hit := Hit_false
-                  vs := ← (do 
-                    if ((← (currentlyEnabled Ext_H)) : Bool)
+                  vs := ← if ((← (currentlyEnabled Ext_H)) : Bool)
                     then (pure (bool_bit_backwards (_get_MControl6_bits_vs v)))
-                    else (pure false))
-                  vu := ← (do 
-                    if ((← (currentlyEnabled Ext_H)) : Bool)
+                    else (pure false)
+                  vu := ← if ((← (currentlyEnabled Ext_H)) : Bool)
                     then (pure (bool_bit_backwards (_get_MControl6_bits_vu v)))
-                    else (pure false))
+                    else (pure false)
                   select := select
-                  size := ← (do (trig_match_size_forwards (_get_MControl6_bits_size v)))
-                  action := ← (do (trig_action_forwards (zero_extend (m := 6) act)))
+                  size := ← (trig_match_size_forwards (_get_MControl6_bits_size v))
+                  action := ← (trig_action_forwards (zero_extend (m := 6) act))
                   chain := allow_chain
-                  t_match := ← (do (trig_match_val_forwards (_get_MControl6_bits_t_match v)))
+                  t_match := ← (trig_match_val_forwards (_get_MControl6_bits_t_match v))
                   m := (bool_bit_backwards (_get_MControl6_bits_m v))
                   uncertainen := false
-                  s := ← (do 
-                    if ((← (currentlyEnabled Ext_S)) : Bool)
+                  s := ← if ((← (currentlyEnabled Ext_S)) : Bool)
                     then (pure (bool_bit_backwards (_get_MControl6_bits_s v)))
-                    else (pure false))
-                  u := ← (do 
-                    if ((← (currentlyEnabled Ext_U)) : Bool)
+                    else (pure false)
+                  u := ← if ((← (currentlyEnabled Ext_U)) : Bool)
                     then (pure (bool_bit_backwards (_get_MControl6_bits_u v)))
-                    else (pure false))
+                    else (pure false)
                   execute := (bool_bit_backwards (_get_MControl6_bits_execute v))
                   store := (bool_bit_backwards (_get_MControl6_bits_store v))
                   load := (bool_bit_backwards (_get_MControl6_bits_load v))
@@ -2312,8 +2287,8 @@ def trigger_write_tdata1 (idx : Nat) (t : Trigger) (tdata1 : (BitVec 64)) : Sail
                         (HAppend.hAppend ", count <- " (BitVec.toFormatted count))))))))
           else ()
         (pure (T_icount
-            { s with hit := (bool_bit_backwards hit), pending := (bool_bit_backwards pending), new_count := 
-              (some count) })))
+            { s with hit := (bool_bit_backwards hit), pending := (bool_bit_backwards pending), new_count := (some
+                count) })))
       | .T_itrigger s =>
         (let data := (Mk_IETrigger_bits tdata1)
         let hit := (_get_IETrigger_bits_hit data)

@@ -24,13 +24,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -343,11 +336,11 @@ def update_and_write_pte_mutrec_vvvv_zG_Stagev (pteAddr : physaddr) (pteWidth : 
               (Store PageTableEntry) ext_ptw) with
             | .Ok (pa, _, _) => (pure pa)
             | .Err (e, _) =>
-              SailME.throw (← (do
+              SailME.throw (← do
                   (pure (Err
                       (PTW_Implicit_Error
                         ((← (translationException access e)), (bits_of_physaddr pteAddr), (Store
-                          PageTableEntry)))))))
+                          PageTableEntry))))))
           match (← (write_pte write_paddr pteWidth pte)) with
           | .Ok _ => (pure (Ok (some pte)))
           | .Err _ => (pure (Err (PTW_No_Access ()))))
@@ -420,11 +413,11 @@ def pt_walk_mutrec_vvv_zUservvvvv_zG_Stagev (sv_width : Nat) (vpn : (BitVec (sv_
       (Load PageTableEntry) ext_ptw) with
     | .Ok (pa, _, _) => (pure pa)
     | .Err (e, _) =>
-      SailME.throw (← (do
+      SailME.throw (← do
           (pure (Err
               ((PTW_Implicit_Error
                 ((← (translationException access e)), (zero_extend (m := 64) pte_addr), (Load
-                  PageTableEntry))), ext_ptw)))))
+                  PageTableEntry))), ext_ptw))))
   match (← (read_pte pte_addr (2 ^i log_pte_size_bytes))) with
   | .Err _ =>
     (let _ : Unit :=
@@ -552,11 +545,11 @@ def pt_walk_mutrec_vvv_zUservvvvF_zG_Stagev (sv_width : Nat) (vpn : (BitVec (sv_
       (Load PageTableEntry) ext_ptw) with
     | .Ok (pa, _, _) => (pure pa)
     | .Err (e, _) =>
-      SailME.throw (← (do
+      SailME.throw (← do
           (pure (Err
               ((PTW_Implicit_Error
                 ((← (translationException access e)), (zero_extend (m := 64) pte_addr), (Load
-                  PageTableEntry))), ext_ptw)))))
+                  PageTableEntry))), ext_ptw))))
   match (← (read_pte pte_addr (2 ^i log_pte_size_bytes))) with
   | .Err _ =>
     (let _ : Unit :=
@@ -772,11 +765,11 @@ def pt_walk (sv_width : Nat) (vpn : (BitVec (sv_width - 12))) (access : (MemoryA
         ext_ptw)) with
     | .Ok (pa, _, _) => (pure pa)
     | .Err (e, _) =>
-      SailME.throw (← (do
+      SailME.throw (← do
           (pure (Err
               ((PTW_Implicit_Error
                 ((← (translationException access e)), (zero_extend (m := 64) pte_addr), (Load
-                  PageTableEntry))), ext_ptw))))) ) : SailME
+                  PageTableEntry))), ext_ptw)))) ) : SailME
     (Result ((PTW_Output sv_width) × Unit) (PTW_Error × Unit)) physaddr )
   match (← (read_pte pte_addr (2 ^i log_pte_size_bytes))) with
   | .Err _ =>
@@ -886,11 +879,11 @@ def update_and_write_pte (pteAddr : physaddr) (pteWidth : Nat) (pte : (BitVec (p
                 ext_ptw)) with
             | .Ok (pa, _, _) => (pure pa)
             | .Err (e, _) =>
-              SailME.throw (← (do
+              SailME.throw (← do
                   (pure (Err
                       (PTW_Implicit_Error
                         ((← (translationException access e)), (bits_of_physaddr pteAddr), (Store
-                          PageTableEntry))))))) ) : SailME
+                          PageTableEntry)))))) ) : SailME
             (Result (Option (BitVec (pteWidth * 8))) PTW_Error) physaddr )
           match (← (write_pte write_paddr pteWidth pte)) with
           | .Ok _ => (pure (Ok (some pte)))
@@ -1115,7 +1108,7 @@ def translate_vs_stage (vaddr : virtaddr) (access : (MemoryAccessType mem_payloa
 def build_exception_context (gva : virtaddr) (gpa : (BitVec (if ( 64 = 32  : Bool) then 34 else 64))) (access : (MemoryAccessType mem_payload)) (ptw_error : PTW_Error) (stage : TranslationStage) : SailM ExceptionContext := do
   match stage with
   | .S_Stage =>
-    (pure { trap := ← (do (translationException access ptw_error))
+    (pure { trap := ← (translationException access ptw_error)
             excinfo_is_gva := false
             excinfo := (zero_extend (m := 64) (bits_of_virtaddr gva))
             excinfo2 := none
@@ -1139,8 +1132,7 @@ def build_exception_context (gva : virtaddr) (gpa : (BitVec (if ( 64 = 32  : Boo
                   excinfo_is_gva := true
                   excinfo := (zero_extend (m := 64) (bits_of_virtaddr gva))
                   excinfo2 := (some tval2)
-                  excinst := 
-                    if ((tval2 != (zeros (n := 64))) : Bool)
+                  excinst := if ((tval2 != (zeros (n := 64))) : Bool)
                     then
                       (some
                         (if (is_write : Bool)
@@ -1150,7 +1142,7 @@ def build_exception_context (gva : virtaddr) (gpa : (BitVec (if ( 64 = 32  : Boo
                   excinst_offset := (zeros (n := 5))
                   ext := none }))
       | _ =>
-        (pure { trap := ← (do (translationException access ptw_error))
+        (pure { trap := ← (translationException access ptw_error)
                 excinfo_is_gva := true
                 excinfo := (zero_extend (m := 64) (bits_of_virtaddr gva))
                 excinfo2 := (some (zeros (n := 64)))

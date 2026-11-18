@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -265,7 +258,7 @@ def hex_bits_backwards_matches (tuple_0 : (Nat × String)) : Bool :=
 
 def hex_bits_1_forwards (arg_ : (BitVec 1)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 1) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -290,7 +283,7 @@ def hex_bits_1_backwards (arg_ : String) : SailM (BitVec 1) := do
 
 def hex_bits_1_forwards_matches (arg_ : (BitVec 1)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 1) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -300,7 +293,7 @@ def hex_bits_1_forwards_matches (arg_ : (BitVec 1)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 1) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_1_backwards_matches (arg_ : String) : Bool :=
@@ -311,7 +304,7 @@ def hex_bits_1_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_2_forwards (arg_ : (BitVec 2)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 2) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -336,7 +329,7 @@ def hex_bits_2_backwards (arg_ : String) : SailM (BitVec 2) := do
 
 def hex_bits_2_forwards_matches (arg_ : (BitVec 2)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 2) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -346,7 +339,7 @@ def hex_bits_2_forwards_matches (arg_ : (BitVec 2)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 2) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_2_backwards_matches (arg_ : String) : Bool :=
@@ -357,7 +350,7 @@ def hex_bits_2_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_3_forwards (arg_ : (BitVec 3)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 3) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -382,7 +375,7 @@ def hex_bits_3_backwards (arg_ : String) : SailM (BitVec 3) := do
 
 def hex_bits_3_forwards_matches (arg_ : (BitVec 3)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 3) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -392,7 +385,7 @@ def hex_bits_3_forwards_matches (arg_ : (BitVec 3)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 3) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_3_backwards_matches (arg_ : String) : Bool :=
@@ -403,7 +396,7 @@ def hex_bits_3_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_4_forwards (arg_ : (BitVec 4)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 4) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -428,7 +421,7 @@ def hex_bits_4_backwards (arg_ : String) : SailM (BitVec 4) := do
 
 def hex_bits_4_forwards_matches (arg_ : (BitVec 4)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 4) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -438,7 +431,7 @@ def hex_bits_4_forwards_matches (arg_ : (BitVec 4)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 4) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_4_backwards_matches (arg_ : String) : Bool :=
@@ -449,7 +442,7 @@ def hex_bits_4_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_5_forwards (arg_ : (BitVec 5)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 5) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -474,7 +467,7 @@ def hex_bits_5_backwards (arg_ : String) : SailM (BitVec 5) := do
 
 def hex_bits_5_forwards_matches (arg_ : (BitVec 5)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 5) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -484,7 +477,7 @@ def hex_bits_5_forwards_matches (arg_ : (BitVec 5)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 5) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_5_backwards_matches (arg_ : String) : Bool :=
@@ -495,7 +488,7 @@ def hex_bits_5_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_6_forwards (arg_ : (BitVec 6)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 6) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -520,7 +513,7 @@ def hex_bits_6_backwards (arg_ : String) : SailM (BitVec 6) := do
 
 def hex_bits_6_forwards_matches (arg_ : (BitVec 6)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 6) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -530,7 +523,7 @@ def hex_bits_6_forwards_matches (arg_ : (BitVec 6)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 6) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_6_backwards_matches (arg_ : String) : Bool :=
@@ -541,7 +534,7 @@ def hex_bits_6_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_7_forwards (arg_ : (BitVec 7)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 7) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -566,7 +559,7 @@ def hex_bits_7_backwards (arg_ : String) : SailM (BitVec 7) := do
 
 def hex_bits_7_forwards_matches (arg_ : (BitVec 7)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 7) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -576,7 +569,7 @@ def hex_bits_7_forwards_matches (arg_ : (BitVec 7)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 7) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_7_backwards_matches (arg_ : String) : Bool :=
@@ -587,7 +580,7 @@ def hex_bits_7_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_8_forwards (arg_ : (BitVec 8)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 8) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -612,7 +605,7 @@ def hex_bits_8_backwards (arg_ : String) : SailM (BitVec 8) := do
 
 def hex_bits_8_forwards_matches (arg_ : (BitVec 8)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 8) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -622,7 +615,7 @@ def hex_bits_8_forwards_matches (arg_ : (BitVec 8)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 8) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_8_backwards_matches (arg_ : String) : Bool :=
@@ -633,7 +626,7 @@ def hex_bits_8_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_9_forwards (arg_ : (BitVec 9)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 9) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -658,7 +651,7 @@ def hex_bits_9_backwards (arg_ : String) : SailM (BitVec 9) := do
 
 def hex_bits_9_forwards_matches (arg_ : (BitVec 9)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 9) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -668,7 +661,7 @@ def hex_bits_9_forwards_matches (arg_ : (BitVec 9)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 9) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_9_backwards_matches (arg_ : String) : Bool :=
@@ -679,7 +672,7 @@ def hex_bits_9_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_10_forwards (arg_ : (BitVec 10)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 10) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -704,7 +697,7 @@ def hex_bits_10_backwards (arg_ : String) : SailM (BitVec 10) := do
 
 def hex_bits_10_forwards_matches (arg_ : (BitVec 10)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 10) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -714,7 +707,7 @@ def hex_bits_10_forwards_matches (arg_ : (BitVec 10)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 10) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_10_backwards_matches (arg_ : String) : Bool :=
@@ -725,7 +718,7 @@ def hex_bits_10_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_11_forwards (arg_ : (BitVec 11)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 11) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -750,7 +743,7 @@ def hex_bits_11_backwards (arg_ : String) : SailM (BitVec 11) := do
 
 def hex_bits_11_forwards_matches (arg_ : (BitVec 11)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 11) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -760,7 +753,7 @@ def hex_bits_11_forwards_matches (arg_ : (BitVec 11)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 11) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_11_backwards_matches (arg_ : String) : Bool :=
@@ -771,7 +764,7 @@ def hex_bits_11_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_12_forwards (arg_ : (BitVec 12)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 12) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -796,7 +789,7 @@ def hex_bits_12_backwards (arg_ : String) : SailM (BitVec 12) := do
 
 def hex_bits_12_forwards_matches (arg_ : (BitVec 12)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 12) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -806,7 +799,7 @@ def hex_bits_12_forwards_matches (arg_ : (BitVec 12)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 12) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_12_backwards_matches (arg_ : String) : Bool :=
@@ -817,7 +810,7 @@ def hex_bits_12_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_13_forwards (arg_ : (BitVec 13)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 13) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -842,7 +835,7 @@ def hex_bits_13_backwards (arg_ : String) : SailM (BitVec 13) := do
 
 def hex_bits_13_forwards_matches (arg_ : (BitVec 13)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 13) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -852,7 +845,7 @@ def hex_bits_13_forwards_matches (arg_ : (BitVec 13)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 13) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_13_backwards_matches (arg_ : String) : Bool :=
@@ -863,7 +856,7 @@ def hex_bits_13_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_14_forwards (arg_ : (BitVec 14)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 14) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -888,7 +881,7 @@ def hex_bits_14_backwards (arg_ : String) : SailM (BitVec 14) := do
 
 def hex_bits_14_forwards_matches (arg_ : (BitVec 14)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 14) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -898,7 +891,7 @@ def hex_bits_14_forwards_matches (arg_ : (BitVec 14)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 14) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_14_backwards_matches (arg_ : String) : Bool :=
@@ -909,7 +902,7 @@ def hex_bits_14_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_15_forwards (arg_ : (BitVec 15)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 15) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -934,7 +927,7 @@ def hex_bits_15_backwards (arg_ : String) : SailM (BitVec 15) := do
 
 def hex_bits_15_forwards_matches (arg_ : (BitVec 15)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 15) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -944,7 +937,7 @@ def hex_bits_15_forwards_matches (arg_ : (BitVec 15)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 15) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_15_backwards_matches (arg_ : String) : Bool :=
@@ -955,7 +948,7 @@ def hex_bits_15_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_16_forwards (arg_ : (BitVec 16)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 16) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -980,7 +973,7 @@ def hex_bits_16_backwards (arg_ : String) : SailM (BitVec 16) := do
 
 def hex_bits_16_forwards_matches (arg_ : (BitVec 16)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 16) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -990,7 +983,7 @@ def hex_bits_16_forwards_matches (arg_ : (BitVec 16)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 16) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_16_backwards_matches (arg_ : String) : Bool :=
@@ -1001,7 +994,7 @@ def hex_bits_16_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_17_forwards (arg_ : (BitVec 17)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 17) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1026,7 +1019,7 @@ def hex_bits_17_backwards (arg_ : String) : SailM (BitVec 17) := do
 
 def hex_bits_17_forwards_matches (arg_ : (BitVec 17)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 17) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1036,7 +1029,7 @@ def hex_bits_17_forwards_matches (arg_ : (BitVec 17)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 17) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_17_backwards_matches (arg_ : String) : Bool :=
@@ -1047,7 +1040,7 @@ def hex_bits_17_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_18_forwards (arg_ : (BitVec 18)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 18) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1072,7 +1065,7 @@ def hex_bits_18_backwards (arg_ : String) : SailM (BitVec 18) := do
 
 def hex_bits_18_forwards_matches (arg_ : (BitVec 18)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 18) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1082,7 +1075,7 @@ def hex_bits_18_forwards_matches (arg_ : (BitVec 18)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 18) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_18_backwards_matches (arg_ : String) : Bool :=
@@ -1093,7 +1086,7 @@ def hex_bits_18_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_19_forwards (arg_ : (BitVec 19)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 19) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1118,7 +1111,7 @@ def hex_bits_19_backwards (arg_ : String) : SailM (BitVec 19) := do
 
 def hex_bits_19_forwards_matches (arg_ : (BitVec 19)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 19) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1128,7 +1121,7 @@ def hex_bits_19_forwards_matches (arg_ : (BitVec 19)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 19) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_19_backwards_matches (arg_ : String) : Bool :=
@@ -1139,7 +1132,7 @@ def hex_bits_19_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_20_forwards (arg_ : (BitVec 20)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 20) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1164,7 +1157,7 @@ def hex_bits_20_backwards (arg_ : String) : SailM (BitVec 20) := do
 
 def hex_bits_20_forwards_matches (arg_ : (BitVec 20)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 20) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1174,7 +1167,7 @@ def hex_bits_20_forwards_matches (arg_ : (BitVec 20)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 20) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_20_backwards_matches (arg_ : String) : Bool :=
@@ -1185,7 +1178,7 @@ def hex_bits_20_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_21_forwards (arg_ : (BitVec 21)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 21) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1210,7 +1203,7 @@ def hex_bits_21_backwards (arg_ : String) : SailM (BitVec 21) := do
 
 def hex_bits_21_forwards_matches (arg_ : (BitVec 21)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 21) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1220,7 +1213,7 @@ def hex_bits_21_forwards_matches (arg_ : (BitVec 21)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 21) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_21_backwards_matches (arg_ : String) : Bool :=
@@ -1231,7 +1224,7 @@ def hex_bits_21_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_22_forwards (arg_ : (BitVec 22)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 22) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1256,7 +1249,7 @@ def hex_bits_22_backwards (arg_ : String) : SailM (BitVec 22) := do
 
 def hex_bits_22_forwards_matches (arg_ : (BitVec 22)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 22) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1266,7 +1259,7 @@ def hex_bits_22_forwards_matches (arg_ : (BitVec 22)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 22) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_22_backwards_matches (arg_ : String) : Bool :=
@@ -1277,7 +1270,7 @@ def hex_bits_22_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_23_forwards (arg_ : (BitVec 23)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 23) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1302,7 +1295,7 @@ def hex_bits_23_backwards (arg_ : String) : SailM (BitVec 23) := do
 
 def hex_bits_23_forwards_matches (arg_ : (BitVec 23)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 23) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1312,7 +1305,7 @@ def hex_bits_23_forwards_matches (arg_ : (BitVec 23)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 23) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_23_backwards_matches (arg_ : String) : Bool :=
@@ -1323,7 +1316,7 @@ def hex_bits_23_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_24_forwards (arg_ : (BitVec 24)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 24) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1348,7 +1341,7 @@ def hex_bits_24_backwards (arg_ : String) : SailM (BitVec 24) := do
 
 def hex_bits_24_forwards_matches (arg_ : (BitVec 24)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 24) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1358,7 +1351,7 @@ def hex_bits_24_forwards_matches (arg_ : (BitVec 24)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 24) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_24_backwards_matches (arg_ : String) : Bool :=
@@ -1369,7 +1362,7 @@ def hex_bits_24_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_25_forwards (arg_ : (BitVec 25)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 25) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1394,7 +1387,7 @@ def hex_bits_25_backwards (arg_ : String) : SailM (BitVec 25) := do
 
 def hex_bits_25_forwards_matches (arg_ : (BitVec 25)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 25) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1404,7 +1397,7 @@ def hex_bits_25_forwards_matches (arg_ : (BitVec 25)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 25) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_25_backwards_matches (arg_ : String) : Bool :=
@@ -1415,7 +1408,7 @@ def hex_bits_25_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_26_forwards (arg_ : (BitVec 26)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 26) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1440,7 +1433,7 @@ def hex_bits_26_backwards (arg_ : String) : SailM (BitVec 26) := do
 
 def hex_bits_26_forwards_matches (arg_ : (BitVec 26)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 26) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1450,7 +1443,7 @@ def hex_bits_26_forwards_matches (arg_ : (BitVec 26)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 26) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_26_backwards_matches (arg_ : String) : Bool :=
@@ -1461,7 +1454,7 @@ def hex_bits_26_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_27_forwards (arg_ : (BitVec 27)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 27) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1486,7 +1479,7 @@ def hex_bits_27_backwards (arg_ : String) : SailM (BitVec 27) := do
 
 def hex_bits_27_forwards_matches (arg_ : (BitVec 27)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 27) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1496,7 +1489,7 @@ def hex_bits_27_forwards_matches (arg_ : (BitVec 27)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 27) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_27_backwards_matches (arg_ : String) : Bool :=
@@ -1507,7 +1500,7 @@ def hex_bits_27_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_28_forwards (arg_ : (BitVec 28)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 28) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1532,7 +1525,7 @@ def hex_bits_28_backwards (arg_ : String) : SailM (BitVec 28) := do
 
 def hex_bits_28_forwards_matches (arg_ : (BitVec 28)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 28) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1542,7 +1535,7 @@ def hex_bits_28_forwards_matches (arg_ : (BitVec 28)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 28) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_28_backwards_matches (arg_ : String) : Bool :=
@@ -1553,7 +1546,7 @@ def hex_bits_28_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_29_forwards (arg_ : (BitVec 29)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 29) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1578,7 +1571,7 @@ def hex_bits_29_backwards (arg_ : String) : SailM (BitVec 29) := do
 
 def hex_bits_29_forwards_matches (arg_ : (BitVec 29)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 29) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1588,7 +1581,7 @@ def hex_bits_29_forwards_matches (arg_ : (BitVec 29)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 29) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_29_backwards_matches (arg_ : String) : Bool :=
@@ -1599,7 +1592,7 @@ def hex_bits_29_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_30_forwards (arg_ : (BitVec 30)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 30) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1624,7 +1617,7 @@ def hex_bits_30_backwards (arg_ : String) : SailM (BitVec 30) := do
 
 def hex_bits_30_forwards_matches (arg_ : (BitVec 30)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 30) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1634,7 +1627,7 @@ def hex_bits_30_forwards_matches (arg_ : (BitVec 30)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 30) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_30_backwards_matches (arg_ : String) : Bool :=
@@ -1645,7 +1638,7 @@ def hex_bits_30_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_31_forwards (arg_ : (BitVec 31)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 31) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1670,7 +1663,7 @@ def hex_bits_31_backwards (arg_ : String) : SailM (BitVec 31) := do
 
 def hex_bits_31_forwards_matches (arg_ : (BitVec 31)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 31) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1680,7 +1673,7 @@ def hex_bits_31_forwards_matches (arg_ : (BitVec 31)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 31) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_31_backwards_matches (arg_ : String) : Bool :=
@@ -1691,7 +1684,7 @@ def hex_bits_31_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_32_forwards (arg_ : (BitVec 32)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 32) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1716,7 +1709,7 @@ def hex_bits_32_backwards (arg_ : String) : SailM (BitVec 32) := do
 
 def hex_bits_32_forwards_matches (arg_ : (BitVec 32)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 32) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1726,7 +1719,7 @@ def hex_bits_32_forwards_matches (arg_ : (BitVec 32)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 32) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_32_backwards_matches (arg_ : String) : Bool :=
@@ -1737,7 +1730,7 @@ def hex_bits_32_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_33_forwards (arg_ : (BitVec 33)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 33) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1762,7 +1755,7 @@ def hex_bits_33_backwards (arg_ : String) : SailM (BitVec 33) := do
 
 def hex_bits_33_forwards_matches (arg_ : (BitVec 33)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 33) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1772,7 +1765,7 @@ def hex_bits_33_forwards_matches (arg_ : (BitVec 33)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 33) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_33_backwards_matches (arg_ : String) : Bool :=
@@ -1783,7 +1776,7 @@ def hex_bits_33_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_34_forwards (arg_ : (BitVec 34)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 34) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1808,7 +1801,7 @@ def hex_bits_34_backwards (arg_ : String) : SailM (BitVec 34) := do
 
 def hex_bits_34_forwards_matches (arg_ : (BitVec 34)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 34) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1818,7 +1811,7 @@ def hex_bits_34_forwards_matches (arg_ : (BitVec 34)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 34) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_34_backwards_matches (arg_ : String) : Bool :=
@@ -1829,7 +1822,7 @@ def hex_bits_34_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_35_forwards (arg_ : (BitVec 35)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 35) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1854,7 +1847,7 @@ def hex_bits_35_backwards (arg_ : String) : SailM (BitVec 35) := do
 
 def hex_bits_35_forwards_matches (arg_ : (BitVec 35)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 35) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1864,7 +1857,7 @@ def hex_bits_35_forwards_matches (arg_ : (BitVec 35)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 35) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_35_backwards_matches (arg_ : String) : Bool :=
@@ -1875,7 +1868,7 @@ def hex_bits_35_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_36_forwards (arg_ : (BitVec 36)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 36) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1900,7 +1893,7 @@ def hex_bits_36_backwards (arg_ : String) : SailM (BitVec 36) := do
 
 def hex_bits_36_forwards_matches (arg_ : (BitVec 36)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 36) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1910,7 +1903,7 @@ def hex_bits_36_forwards_matches (arg_ : (BitVec 36)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 36) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_36_backwards_matches (arg_ : String) : Bool :=
@@ -1921,7 +1914,7 @@ def hex_bits_36_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_37_forwards (arg_ : (BitVec 37)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 37) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1946,7 +1939,7 @@ def hex_bits_37_backwards (arg_ : String) : SailM (BitVec 37) := do
 
 def hex_bits_37_forwards_matches (arg_ : (BitVec 37)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 37) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1956,7 +1949,7 @@ def hex_bits_37_forwards_matches (arg_ : (BitVec 37)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 37) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_37_backwards_matches (arg_ : String) : Bool :=
@@ -1967,7 +1960,7 @@ def hex_bits_37_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_38_forwards (arg_ : (BitVec 38)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 38) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -1992,7 +1985,7 @@ def hex_bits_38_backwards (arg_ : String) : SailM (BitVec 38) := do
 
 def hex_bits_38_forwards_matches (arg_ : (BitVec 38)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 38) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2002,7 +1995,7 @@ def hex_bits_38_forwards_matches (arg_ : (BitVec 38)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 38) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_38_backwards_matches (arg_ : String) : Bool :=
@@ -2013,7 +2006,7 @@ def hex_bits_38_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_39_forwards (arg_ : (BitVec 39)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 39) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2038,7 +2031,7 @@ def hex_bits_39_backwards (arg_ : String) : SailM (BitVec 39) := do
 
 def hex_bits_39_forwards_matches (arg_ : (BitVec 39)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 39) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2048,7 +2041,7 @@ def hex_bits_39_forwards_matches (arg_ : (BitVec 39)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 39) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_39_backwards_matches (arg_ : String) : Bool :=
@@ -2059,7 +2052,7 @@ def hex_bits_39_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_40_forwards (arg_ : (BitVec 40)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 40) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2084,7 +2077,7 @@ def hex_bits_40_backwards (arg_ : String) : SailM (BitVec 40) := do
 
 def hex_bits_40_forwards_matches (arg_ : (BitVec 40)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 40) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2094,7 +2087,7 @@ def hex_bits_40_forwards_matches (arg_ : (BitVec 40)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 40) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_40_backwards_matches (arg_ : String) : Bool :=
@@ -2105,7 +2098,7 @@ def hex_bits_40_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_41_forwards (arg_ : (BitVec 41)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 41) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2130,7 +2123,7 @@ def hex_bits_41_backwards (arg_ : String) : SailM (BitVec 41) := do
 
 def hex_bits_41_forwards_matches (arg_ : (BitVec 41)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 41) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2140,7 +2133,7 @@ def hex_bits_41_forwards_matches (arg_ : (BitVec 41)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 41) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_41_backwards_matches (arg_ : String) : Bool :=
@@ -2151,7 +2144,7 @@ def hex_bits_41_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_42_forwards (arg_ : (BitVec 42)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 42) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2176,7 +2169,7 @@ def hex_bits_42_backwards (arg_ : String) : SailM (BitVec 42) := do
 
 def hex_bits_42_forwards_matches (arg_ : (BitVec 42)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 42) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2186,7 +2179,7 @@ def hex_bits_42_forwards_matches (arg_ : (BitVec 42)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 42) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_42_backwards_matches (arg_ : String) : Bool :=
@@ -2197,7 +2190,7 @@ def hex_bits_42_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_43_forwards (arg_ : (BitVec 43)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 43) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2222,7 +2215,7 @@ def hex_bits_43_backwards (arg_ : String) : SailM (BitVec 43) := do
 
 def hex_bits_43_forwards_matches (arg_ : (BitVec 43)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 43) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2232,7 +2225,7 @@ def hex_bits_43_forwards_matches (arg_ : (BitVec 43)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 43) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_43_backwards_matches (arg_ : String) : Bool :=
@@ -2243,7 +2236,7 @@ def hex_bits_43_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_44_forwards (arg_ : (BitVec 44)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 44) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2268,7 +2261,7 @@ def hex_bits_44_backwards (arg_ : String) : SailM (BitVec 44) := do
 
 def hex_bits_44_forwards_matches (arg_ : (BitVec 44)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 44) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2278,7 +2271,7 @@ def hex_bits_44_forwards_matches (arg_ : (BitVec 44)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 44) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_44_backwards_matches (arg_ : String) : Bool :=
@@ -2289,7 +2282,7 @@ def hex_bits_44_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_45_forwards (arg_ : (BitVec 45)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 45) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2314,7 +2307,7 @@ def hex_bits_45_backwards (arg_ : String) : SailM (BitVec 45) := do
 
 def hex_bits_45_forwards_matches (arg_ : (BitVec 45)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 45) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2324,7 +2317,7 @@ def hex_bits_45_forwards_matches (arg_ : (BitVec 45)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 45) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_45_backwards_matches (arg_ : String) : Bool :=
@@ -2335,7 +2328,7 @@ def hex_bits_45_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_46_forwards (arg_ : (BitVec 46)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 46) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2360,7 +2353,7 @@ def hex_bits_46_backwards (arg_ : String) : SailM (BitVec 46) := do
 
 def hex_bits_46_forwards_matches (arg_ : (BitVec 46)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 46) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2370,7 +2363,7 @@ def hex_bits_46_forwards_matches (arg_ : (BitVec 46)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 46) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_46_backwards_matches (arg_ : String) : Bool :=
@@ -2381,7 +2374,7 @@ def hex_bits_46_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_47_forwards (arg_ : (BitVec 47)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 47) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2406,7 +2399,7 @@ def hex_bits_47_backwards (arg_ : String) : SailM (BitVec 47) := do
 
 def hex_bits_47_forwards_matches (arg_ : (BitVec 47)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 47) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2416,7 +2409,7 @@ def hex_bits_47_forwards_matches (arg_ : (BitVec 47)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 47) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_47_backwards_matches (arg_ : String) : Bool :=
@@ -2427,7 +2420,7 @@ def hex_bits_47_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_48_forwards (arg_ : (BitVec 48)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 48) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2452,7 +2445,7 @@ def hex_bits_48_backwards (arg_ : String) : SailM (BitVec 48) := do
 
 def hex_bits_48_forwards_matches (arg_ : (BitVec 48)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 48) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2462,7 +2455,7 @@ def hex_bits_48_forwards_matches (arg_ : (BitVec 48)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 48) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_48_backwards_matches (arg_ : String) : Bool :=
@@ -2473,7 +2466,7 @@ def hex_bits_48_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_49_forwards (arg_ : (BitVec 49)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 49) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2498,7 +2491,7 @@ def hex_bits_49_backwards (arg_ : String) : SailM (BitVec 49) := do
 
 def hex_bits_49_forwards_matches (arg_ : (BitVec 49)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 49) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2508,7 +2501,7 @@ def hex_bits_49_forwards_matches (arg_ : (BitVec 49)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 49) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_49_backwards_matches (arg_ : String) : Bool :=
@@ -2519,7 +2512,7 @@ def hex_bits_49_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_50_forwards (arg_ : (BitVec 50)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 50) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2544,7 +2537,7 @@ def hex_bits_50_backwards (arg_ : String) : SailM (BitVec 50) := do
 
 def hex_bits_50_forwards_matches (arg_ : (BitVec 50)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 50) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2554,7 +2547,7 @@ def hex_bits_50_forwards_matches (arg_ : (BitVec 50)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 50) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_50_backwards_matches (arg_ : String) : Bool :=
@@ -2565,7 +2558,7 @@ def hex_bits_50_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_51_forwards (arg_ : (BitVec 51)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 51) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2590,7 +2583,7 @@ def hex_bits_51_backwards (arg_ : String) : SailM (BitVec 51) := do
 
 def hex_bits_51_forwards_matches (arg_ : (BitVec 51)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 51) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2600,7 +2593,7 @@ def hex_bits_51_forwards_matches (arg_ : (BitVec 51)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 51) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_51_backwards_matches (arg_ : String) : Bool :=
@@ -2611,7 +2604,7 @@ def hex_bits_51_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_52_forwards (arg_ : (BitVec 52)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 52) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2636,7 +2629,7 @@ def hex_bits_52_backwards (arg_ : String) : SailM (BitVec 52) := do
 
 def hex_bits_52_forwards_matches (arg_ : (BitVec 52)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 52) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2646,7 +2639,7 @@ def hex_bits_52_forwards_matches (arg_ : (BitVec 52)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 52) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_52_backwards_matches (arg_ : String) : Bool :=
@@ -2657,7 +2650,7 @@ def hex_bits_52_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_53_forwards (arg_ : (BitVec 53)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 53) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2682,7 +2675,7 @@ def hex_bits_53_backwards (arg_ : String) : SailM (BitVec 53) := do
 
 def hex_bits_53_forwards_matches (arg_ : (BitVec 53)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 53) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2692,7 +2685,7 @@ def hex_bits_53_forwards_matches (arg_ : (BitVec 53)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 53) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_53_backwards_matches (arg_ : String) : Bool :=
@@ -2703,7 +2696,7 @@ def hex_bits_53_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_54_forwards (arg_ : (BitVec 54)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 54) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2728,7 +2721,7 @@ def hex_bits_54_backwards (arg_ : String) : SailM (BitVec 54) := do
 
 def hex_bits_54_forwards_matches (arg_ : (BitVec 54)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 54) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2738,7 +2731,7 @@ def hex_bits_54_forwards_matches (arg_ : (BitVec 54)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 54) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_54_backwards_matches (arg_ : String) : Bool :=
@@ -2749,7 +2742,7 @@ def hex_bits_54_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_55_forwards (arg_ : (BitVec 55)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 55) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2774,7 +2767,7 @@ def hex_bits_55_backwards (arg_ : String) : SailM (BitVec 55) := do
 
 def hex_bits_55_forwards_matches (arg_ : (BitVec 55)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 55) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2784,7 +2777,7 @@ def hex_bits_55_forwards_matches (arg_ : (BitVec 55)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 55) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_55_backwards_matches (arg_ : String) : Bool :=
@@ -2795,7 +2788,7 @@ def hex_bits_55_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_56_forwards (arg_ : (BitVec 56)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 56) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2820,7 +2813,7 @@ def hex_bits_56_backwards (arg_ : String) : SailM (BitVec 56) := do
 
 def hex_bits_56_forwards_matches (arg_ : (BitVec 56)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 56) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2830,7 +2823,7 @@ def hex_bits_56_forwards_matches (arg_ : (BitVec 56)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 56) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_56_backwards_matches (arg_ : String) : Bool :=
@@ -2841,7 +2834,7 @@ def hex_bits_56_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_57_forwards (arg_ : (BitVec 57)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 57) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2866,7 +2859,7 @@ def hex_bits_57_backwards (arg_ : String) : SailM (BitVec 57) := do
 
 def hex_bits_57_forwards_matches (arg_ : (BitVec 57)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 57) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2876,7 +2869,7 @@ def hex_bits_57_forwards_matches (arg_ : (BitVec 57)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 57) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_57_backwards_matches (arg_ : String) : Bool :=
@@ -2887,7 +2880,7 @@ def hex_bits_57_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_58_forwards (arg_ : (BitVec 58)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 58) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2912,7 +2905,7 @@ def hex_bits_58_backwards (arg_ : String) : SailM (BitVec 58) := do
 
 def hex_bits_58_forwards_matches (arg_ : (BitVec 58)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 58) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2922,7 +2915,7 @@ def hex_bits_58_forwards_matches (arg_ : (BitVec 58)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 58) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_58_backwards_matches (arg_ : String) : Bool :=
@@ -2933,7 +2926,7 @@ def hex_bits_58_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_59_forwards (arg_ : (BitVec 59)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 59) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2958,7 +2951,7 @@ def hex_bits_59_backwards (arg_ : String) : SailM (BitVec 59) := do
 
 def hex_bits_59_forwards_matches (arg_ : (BitVec 59)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 59) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -2968,7 +2961,7 @@ def hex_bits_59_forwards_matches (arg_ : (BitVec 59)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 59) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_59_backwards_matches (arg_ : String) : Bool :=
@@ -2979,7 +2972,7 @@ def hex_bits_59_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_60_forwards (arg_ : (BitVec 60)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 60) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -3004,7 +2997,7 @@ def hex_bits_60_backwards (arg_ : String) : SailM (BitVec 60) := do
 
 def hex_bits_60_forwards_matches (arg_ : (BitVec 60)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 60) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -3014,7 +3007,7 @@ def hex_bits_60_forwards_matches (arg_ : (BitVec 60)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 60) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_60_backwards_matches (arg_ : String) : Bool :=
@@ -3025,7 +3018,7 @@ def hex_bits_60_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_61_forwards (arg_ : (BitVec 61)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 61) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -3050,7 +3043,7 @@ def hex_bits_61_backwards (arg_ : String) : SailM (BitVec 61) := do
 
 def hex_bits_61_forwards_matches (arg_ : (BitVec 61)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 61) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -3060,7 +3053,7 @@ def hex_bits_61_forwards_matches (arg_ : (BitVec 61)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 61) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_61_backwards_matches (arg_ : String) : Bool :=
@@ -3071,7 +3064,7 @@ def hex_bits_61_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_62_forwards (arg_ : (BitVec 62)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 62) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -3096,7 +3089,7 @@ def hex_bits_62_backwards (arg_ : String) : SailM (BitVec 62) := do
 
 def hex_bits_62_forwards_matches (arg_ : (BitVec 62)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 62) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -3106,7 +3099,7 @@ def hex_bits_62_forwards_matches (arg_ : (BitVec 62)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 62) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_62_backwards_matches (arg_ : String) : Bool :=
@@ -3117,7 +3110,7 @@ def hex_bits_62_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_63_forwards (arg_ : (BitVec 63)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 63) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -3142,7 +3135,7 @@ def hex_bits_63_backwards (arg_ : String) : SailM (BitVec 63) := do
 
 def hex_bits_63_forwards_matches (arg_ : (BitVec 63)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 63) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -3152,7 +3145,7 @@ def hex_bits_63_forwards_matches (arg_ : (BitVec 63)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 63) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_63_backwards_matches (arg_ : String) : Bool :=
@@ -3163,7 +3156,7 @@ def hex_bits_63_backwards_matches (arg_ : String) : Bool :=
 
 def hex_bits_64_forwards (arg_ : (BitVec 64)) : SailM String := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 64) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -3188,7 +3181,7 @@ def hex_bits_64_backwards (arg_ : String) : SailM (BitVec 64) := do
 
 def hex_bits_64_forwards_matches (arg_ : (BitVec 64)) : SailM Bool := do
   let head_exp_ := arg_
-  match (match (head_exp_ : BitVec 64) with
+  match (match head_exp_ with
   | mapping0_ =>
     (if ((hex_bits_forwards_matches mapping0_) : Bool)
     then
@@ -3198,7 +3191,7 @@ def hex_bits_64_forwards_matches (arg_ : (BitVec 64)) : SailM Bool := do
     else none)) with
   | .some result => (pure result)
   | none =>
-    (match (head_exp_ : BitVec 64) with
+    (match head_exp_ with
     | _ => (pure false))
 
 def hex_bits_64_backwards_matches (arg_ : String) : Bool :=

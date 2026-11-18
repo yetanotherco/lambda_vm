@@ -12,13 +12,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -280,7 +273,7 @@ def pmpAddrMatchType_encdec_forwards (arg_ : PmpAddrMatchType) : (BitVec 2) :=
   | .NAPOT => 0b11#2
 
 def pmpAddrMatchType_encdec_backwards (arg_ : (BitVec 2)) : PmpAddrMatchType :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => OFF
   | 0b01 => TOR
   | 0b10 => NA4
@@ -294,7 +287,7 @@ def pmpAddrMatchType_encdec_forwards_matches (arg_ : PmpAddrMatchType) : Bool :=
   | .NAPOT => true
 
 def pmpAddrMatchType_encdec_backwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => true
   | 0b01 => true
   | 0b10 => true
@@ -323,7 +316,7 @@ def pmpReadAddrReg (n : Nat) : SailM (BitVec 64) := do
   let G := sys_pmp_grain
   let match_type ← do (pure (_get_Pmpcfg_ent_A (GetElem?.getElem! (← readReg pmpcfg_n) n)))
   let addr ← do (pure (GetElem?.getElem! (← readReg pmpaddr_n) n))
-  match ((BitVec.access match_type 1) : BitVec 1) with
+  match (BitVec.access match_type 1) with
   | 1 =>
     (if ((G ≥b 2) : Bool)
     then
@@ -401,9 +394,9 @@ def pmpWriteAddrReg (n : Nat) (v : (BitVec 64)) : SailM Unit := do
   then
     writeReg pmpaddr_n (vectorUpdate (← readReg pmpaddr_n) n
       (pmpWriteAddr (pmpLocked (GetElem?.getElem! (← readReg pmpcfg_n) n))
-        (← (do
+        (← do
           if (((n +i 1) <b 64) : Bool)
           then (pure (pmpTORLocked (GetElem?.getElem! (← readReg pmpcfg_n) (n +i 1))))
-          else (pure false))) (GetElem?.getElem! (← readReg pmpaddr_n) n) v))
+          else (pure false)) (GetElem?.getElem! (← readReg pmpaddr_n) n) v))
   else (pure ())
 

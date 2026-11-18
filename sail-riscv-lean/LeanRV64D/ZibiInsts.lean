@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -246,7 +239,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_biop_backwards (arg_ : (BitVec 3)) : SailM biop := do
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b010 => (pure BEQI)
   | 0b011 => (pure BNEI)
   | _ =>
@@ -260,7 +253,7 @@ def encdec_biop_forwards_matches (arg_ : biop) : Bool :=
   | .BNEI => true
 
 def encdec_biop_backwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b010 => true
   | 0b011 => true
   | _ => false

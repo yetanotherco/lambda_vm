@@ -13,13 +13,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -258,7 +251,7 @@ def vregno_to_vregidx (app_0 : vregno) : vregidx :=
   (Vregidx (to_bits (l := 5) b))
 
 def encdec_vreg_backwards (arg_ : (BitVec 5)) : vregidx :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | r => (Vregidx r)
 
 def encdec_vreg_forwards_matches (arg_ : vregidx) : Bool :=
@@ -266,7 +259,7 @@ def encdec_vreg_forwards_matches (arg_ : vregidx) : Bool :=
   | .Vregidx r => true
 
 def encdec_vreg_backwards_matches (arg_ : (BitVec 5)) : Bool :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | r => true
 
 def vreg_write_callback (x_0 : vregidx) (x_1 : (BitVec (2 ^ 8))) : Unit :=
@@ -314,7 +307,7 @@ def vreg_name_raw_backwards (arg_ : String) : SailM (BitVec 5) := do
       throw Error.Exit)
 
 def vreg_name_raw_forwards_matches (arg_ : (BitVec 5)) : Bool :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00000 => true
   | 0b00001 => true
   | 0b00010 => true
@@ -387,14 +380,14 @@ def vreg_name_raw_backwards_matches (arg_ : String) : Bool :=
 
 def vreg_name_backwards (arg_ : String) : SailM vregidx := do
   let head_exp_ := arg_
-  match (← (do
+  match (← do
     let mapping0_ := head_exp_
     if ((vreg_name_raw_backwards_matches mapping0_) : Bool)
     then
       (do
-        match ((← (vreg_name_raw_backwards mapping0_)) : BitVec 5) with
+        match (← (vreg_name_raw_backwards mapping0_)) with
         | i => (pure (some (Vregidx i))))
-    else (pure none))) with
+    else (pure none)) with
   | .some result => (pure result)
   | _ =>
     (do
@@ -407,14 +400,14 @@ def vreg_name_forwards_matches (arg_ : vregidx) : Bool :=
 
 def vreg_name_backwards_matches (arg_ : String) : SailM Bool := do
   let head_exp_ := arg_
-  match (← (do
+  match (← do
     let mapping0_ := head_exp_
     if ((vreg_name_raw_backwards_matches mapping0_) : Bool)
     then
       (do
-        match ((← (vreg_name_raw_backwards mapping0_)) : BitVec 5) with
+        match (← (vreg_name_raw_backwards mapping0_)) with
         | i => (pure (some true)))
-    else (pure none))) with
+    else (pure none)) with
   | .some result => (pure result)
   | none =>
     (match head_exp_ with
@@ -647,7 +640,7 @@ def num_of_agtype (arg_ : agtype) : Int :=
   | .AGNOSTIC => 1
 
 def decode_agtype (ag : (BitVec 1)) : agtype :=
-  match (ag : BitVec 1) with
+  match ag with
   | 0 => UNDISTURBED
   | _ => AGNOSTIC
 

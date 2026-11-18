@@ -15,13 +15,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -262,7 +255,7 @@ def maybe_vmask_forwards_matches (arg_ : String) : SailM Bool := do
   | _ => throw Error.Exit
 
 def maybe_vmask_backwards_matches (arg_ : (BitVec 1)) : Bool :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => true
   | 0 => true
   | _ => false
@@ -773,7 +766,7 @@ def get_fixed_rounding_incr (vec_elem : (BitVec k_m)) (shift_amount : Nat) : Sai
     (do
       let rounding_mode ← do (pure (_get_Vcsr_vxrm (← readReg vcsr)))
       sail_assert (shift_amount <b (Sail.BitVec.length vec_elem)) "extensions/V/vext_utils_insts.sail:612.28-612.29"
-      match (rounding_mode : BitVec 2) with
+      match rounding_mode with
       | 0b00 => (pure (BitVec.access vec_elem (shift_amount -i 1)))
       | 0b01 =>
         (pure (bool_to_bit

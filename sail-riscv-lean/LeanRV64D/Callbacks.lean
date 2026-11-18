@@ -7,13 +7,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -291,7 +284,7 @@ def trigger_fire_callback (x_0 : Nat) : Unit :=
 
 def csr_name_map_backwards (arg_ : String) : SailM (BitVec 12) := do
   let head_exp_ := arg_
-  match (← (do
+  match (← do
     match head_exp_ with
     | "misa" => (pure (some 0x301#12))
     | "mstatus" => (pure (some 0x300#12))
@@ -698,9 +691,9 @@ def csr_name_map_backwards (arg_ : String) : SailM (BitVec 12) := do
         if ((hex_bits_12_backwards_matches mapping0_) : Bool)
         then
           (do
-            match ((← (hex_bits_12_backwards mapping0_)) : BitVec 12) with
+            match (← (hex_bits_12_backwards mapping0_)) with
             | reg => (pure (some reg)))
-        else (pure none)))) with
+        else (pure none))) with
   | .some result => (pure result)
   | _ =>
     (do

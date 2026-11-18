@@ -6,13 +6,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -244,7 +237,7 @@ open AmocasOddRegisterReservedBehavior
 
 def exception_context (e : ExceptionType) (excinfo : (BitVec 64)) : SailM ExceptionContext := do
   (pure { trap := e
-          excinfo_is_gva := ← (do (inVirtualPrivilege ()))
+          excinfo_is_gva := ← (inVirtualPrivilege ())
           excinfo := excinfo
           excinfo2 := none
           excinst := none

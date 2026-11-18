@@ -12,13 +12,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -249,7 +242,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_uop_backwards (arg_ : (BitVec 7)) : SailM uop := do
-  match (arg_ : BitVec 7) with
+  match arg_ with
   | 0b0110111 => (pure LUI)
   | 0b0010111 => (pure AUIPC)
   | _ =>
@@ -263,7 +256,7 @@ def encdec_uop_forwards_matches (arg_ : uop) : Bool :=
   | .AUIPC => true
 
 def encdec_uop_backwards_matches (arg_ : (BitVec 7)) : Bool :=
-  match (arg_ : BitVec 7) with
+  match arg_ with
   | 0b0110111 => true
   | 0b0010111 => true
   | _ => false
@@ -302,7 +295,7 @@ def jump_to (target : (BitVec 64)) : SailM ExecutionResult := SailME.run do
       (pure RETIRE_SUCCESS))
 
 def encdec_bop_backwards (arg_ : (BitVec 3)) : SailM bop := do
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => (pure BEQ)
   | 0b001 => (pure BNE)
   | 0b100 => (pure BLT)
@@ -324,7 +317,7 @@ def encdec_bop_forwards_matches (arg_ : bop) : Bool :=
   | .BGEU => true
 
 def encdec_bop_backwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => true
   | 0b001 => true
   | 0b100 => true
@@ -366,7 +359,7 @@ def btype_mnemonic_backwards_matches (arg_ : String) : Bool :=
   | _ => false
 
 def encdec_iop_backwards (arg_ : (BitVec 3)) : SailM iop := do
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => (pure ADDI)
   | 0b010 => (pure SLTI)
   | 0b011 => (pure SLTIU)
@@ -388,7 +381,7 @@ def encdec_iop_forwards_matches (arg_ : iop) : Bool :=
   | .XORI => true
 
 def encdec_iop_backwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => true
   | 0b010 => true
   | 0b011 => true
@@ -436,7 +429,7 @@ def encdec_sop_forwards (arg_ : sop) : (BitVec 3) :=
   | .SRAI => 0b101#3
 
 def encdec_sop_backwards (arg_ : (BitVec 3)) : SailM sop := do
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b001 => (pure SLLI)
   | 0b101 => (pure SRLI)
   | _ =>
@@ -451,7 +444,7 @@ def encdec_sop_forwards_matches (arg_ : sop) : Bool :=
   | .SRAI => true
 
 def encdec_sop_backwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b001 => true
   | 0b101 => true
   | 0b101 => true
@@ -621,7 +614,7 @@ def bit_maybe_r_backwards (arg_ : String) : SailM (BitVec 1) := do
       throw Error.Exit)
 
 def bit_maybe_r_forwards_matches (arg_ : (BitVec 1)) : Bool :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => true
   | 0 => true
   | _ => false
@@ -642,7 +635,7 @@ def bit_maybe_w_backwards (arg_ : String) : SailM (BitVec 1) := do
       throw Error.Exit)
 
 def bit_maybe_w_forwards_matches (arg_ : (BitVec 1)) : Bool :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => true
   | 0 => true
   | _ => false
@@ -663,7 +656,7 @@ def bit_maybe_i_backwards (arg_ : String) : SailM (BitVec 1) := do
       throw Error.Exit)
 
 def bit_maybe_i_forwards_matches (arg_ : (BitVec 1)) : Bool :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => true
   | 0 => true
   | _ => false
@@ -684,7 +677,7 @@ def bit_maybe_o_backwards (arg_ : String) : SailM (BitVec 1) := do
       throw Error.Exit)
 
 def bit_maybe_o_forwards_matches (arg_ : (BitVec 1)) : Bool :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => true
   | 0 => true
   | _ => false

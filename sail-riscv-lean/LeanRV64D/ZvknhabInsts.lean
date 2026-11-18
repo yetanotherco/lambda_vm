@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -246,7 +239,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_vsha2_backwards (arg_ : (BitVec 6)) : SailM zvk_vsha2_funct6 := do
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b101110 => (pure ZVK_VSHA2CH_VV)
   | 0b101111 => (pure ZVK_VSHA2CL_VV)
   | _ =>
@@ -260,7 +253,7 @@ def encdec_vsha2_forwards_matches (arg_ : zvk_vsha2_funct6) : Bool :=
   | .ZVK_VSHA2CL_VV => true
 
 def encdec_vsha2_backwards_matches (arg_ : (BitVec 6)) : Bool :=
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b101110 => true
   | 0b101111 => true
   | _ => false

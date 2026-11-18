@@ -15,13 +15,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -755,7 +748,7 @@ def lowest_supported_privLevel (_ : Unit) : SailM Privilege := do
   else (pure Machine)
 
 def have_nominal_privLevel (priv : (BitVec 2)) : SailM Bool := do
-  match (priv : BitVec 2) with
+  match priv with
   | 0b00 => (currentlyEnabled Ext_U)
   | 0b01 => (currentlyEnabled Ext_S)
   | 0b10 => (pure false)
@@ -1173,75 +1166,75 @@ def legalize_mstatus (o : (BitVec 64)) (v : (BitVec 64)) : SailM (BitVec 64) := 
                                           (_update_Mstatus_MPV
                                             (_update_Mstatus_MPELP
                                               (_update_Mstatus_MDT o
-                                                (← (do
+                                                (← do
                                                   if ((← (currentlyEnabled Ext_Smdbltrp)) : Bool)
                                                   then (pure (_get_Mstatus_MDT v))
-                                                  else (pure 0#1))))
+                                                  else (pure 0#1)))
                                               (if ((hartSupports Ext_Zicfilp) : Bool)
                                               then (_get_Mstatus_MPELP v)
                                               else 0#1))
-                                            (← (do
+                                            (← do
                                               if ((← (currentlyEnabled Ext_H)) : Bool)
                                               then (pure (_get_Mstatus_MPV v))
-                                              else (pure 0#1))))
-                                          (← (do
+                                              else (pure 0#1)))
+                                          (← do
                                             if ((← (currentlyEnabled Ext_H)) : Bool)
                                             then (pure (_get_Mstatus_GVA v))
-                                            else (pure 0#1))))
-                                        (← (do
+                                            else (pure 0#1)))
+                                        (← do
                                           if ((← (currentlyEnabled Ext_Ssdbltrp)) : Bool)
                                           then (pure (_get_Mstatus_SDT v))
-                                          else (pure 0#1))))
-                                      (← (do
+                                          else (pure 0#1)))
+                                      (← do
                                         if ((←((pure (hartSupports Ext_Zicfilp)) <&&> (do
                                              (currentlyEnabled Ext_S)))) : Bool)
                                         then (pure (_get_Mstatus_SPELP v))
-                                        else (pure 0#1))))
-                                    (← (do
+                                        else (pure 0#1)))
+                                    (← do
                                       if ((← (currentlyEnabled Ext_S)) : Bool)
                                       then (pure (_get_Mstatus_TSR v))
-                                      else (pure 0#1))))
-                                  (← (do
+                                      else (pure 0#1)))
+                                  (← do
                                     if ((← (currentlyEnabled Ext_U)) : Bool)
                                     then (pure (_get_Mstatus_TW v))
-                                    else (pure 0#1))))
-                                (← (do
+                                    else (pure 0#1)))
+                                (← do
                                   if ((← (virtual_memory_supported ())) : Bool)
                                   then (pure (_get_Mstatus_TVM v))
-                                  else (pure 0#1))))
-                              (← (do
+                                  else (pure 0#1)))
+                              (← do
                                 if ((← (virtual_memory_supported ())) : Bool)
                                 then (pure (_get_Mstatus_MXR v))
-                                else (pure 0#1))))
-                            (← (do
+                                else (pure 0#1)))
+                            (← do
                               if ((← (virtual_memory_supported ())) : Bool)
                               then (pure (_get_Mstatus_SUM v))
-                              else (pure 0#1))))
-                          (← (do
+                              else (pure 0#1)))
+                          (← do
                             if ((← (currentlyEnabled Ext_U)) : Bool)
                             then (pure (_get_Mstatus_MPRV v))
-                            else (pure 0#1)))) (extStatus_map_forwards Off))
+                            else (pure 0#1))) (extStatus_map_forwards Off))
                       (legalize_extStatus plat_mstatus_legal_fs (_get_Mstatus_FS v)))
                     (legalize_extStatus plat_mstatus_legal_vs (_get_Mstatus_VS v)))
                   (← (legalize_nominal_privLevel (_get_Mstatus_MPP v) (_get_Mstatus_MPP o))))
-                (← (do
+                (← do
                   if ((← (currentlyEnabled Ext_S)) : Bool)
                   then (pure (_get_Mstatus_SPP v))
-                  else (pure 0#1)))) (_get_Mstatus_MPIE v))
-            (← (do
+                  else (pure 0#1))) (_get_Mstatus_MPIE v))
+            (← do
               if ((← (currentlyEnabled Ext_S)) : Bool)
               then (pure (_get_Mstatus_SPIE v))
-              else (pure 0#1))))
-          (← (do
+              else (pure 0#1)))
+          (← do
             if ((not ((← (currentlyEnabled Ext_Smdbltrp)) && ((_get_Mstatus_MDT v) == 1#1))) : Bool)
             then (pure (_get_Mstatus_MIE v))
-            else (pure 0#1))))
-        (← (do
+            else (pure 0#1)))
+        (← do
           if ((←((pure (not
                  ((← (currentlyEnabled Ext_Ssdbltrp)) && ((_get_Mstatus_SDT v) == 1#1)))) <&&> (do
                (currentlyEnabled Ext_S)))) : Bool)
           then (pure (_get_Mstatus_SIE v))
-          else (pure 0#1)))))
+          else (pure 0#1))))
   let dirty :=
     (((extStatus_map_backwards (_get_Mstatus_FS o)) == Dirty) || (((extStatus_map_backwards
             (_get_Mstatus_XS o)) == Dirty) || ((extStatus_map_backwards (_get_Mstatus_VS o)) == Dirty)))
@@ -1249,10 +1242,10 @@ def legalize_mstatus (o : (BitVec 64)) (v : (BitVec 64)) : SailM (BitVec 64) := 
 
 def read_mstatus (_ : Unit) : SailM (BitVec 64) := do
   (pure (_update_Mstatus_SDT (← readReg mstatus)
-      (← (do
+      (← do
         if ((← (currentlyEnabled Ext_Ssdbltrp)) : Bool)
         then (pure (_get_Mstatus_SDT (← readReg mstatus)))
-        else (pure 0#1)))))
+        else (pure 0#1))))
 
 def undefined_Hstatus (_ : Unit) : SailM (BitVec 64) := do
   (undefined_bitvector 64)
@@ -1373,15 +1366,15 @@ def legalize_hstatus (h : (BitVec 64)) (v : (BitVec 64)) : SailM (BitVec 64) := 
                   (_update_Hstatus_VTSR
                     (_update_Hstatus_HUKTE
                       (_update_Hstatus_HUPMM h
-                        (← (do
+                        (← do
                           if (((← (currentlyEnabled Ext_Ssnpm)) && (is_supported_pmm PM_SSNPM
                                  (pmm_mode_backwards (_get_Hstatus_HUPMM v)))) : Bool)
                           then (pure (_get_Hstatus_HUPMM v))
-                          else (pure (_get_Hstatus_HUPMM h)))))
-                      (← (do
+                          else (pure (_get_Hstatus_HUPMM h))))
+                      (← do
                         if ((← (currentlyEnabled Ext_Svukte)) : Bool)
                         then (pure (_get_Hstatus_HUKTE v))
-                        else (pure 0#1)))) (_get_Hstatus_VTSR v)) (_get_Hstatus_VTW v))
+                        else (pure 0#1))) (_get_Hstatus_VTSR v)) (_get_Hstatus_VTW v))
                 (_get_Hstatus_VTVM v))
               (if (((BitVec.toNatInt (_get_Hstatus_VGEIN v)) ≤b geilen) : Bool)
               then (_get_Hstatus_VGEIN v)
@@ -1886,12 +1879,12 @@ def lower_mstatus (m : (BitVec 64)) (virt : Bool) : SailM (BitVec 64) := do
                       (_update_Sstatus_SDT
                         (_update_Sstatus_UXL (_update_Sstatus_SD s (_get_Mstatus_SD m))
                           (_get_Mstatus_UXL m))
-                        (← (do
+                        (← do
                           if ((←((currentlyEnabled Ext_Ssdbltrp) <&&> (do
                                (pure (not virt)) <||> (do
                                  (pure ((_get_HEnvcfg_DTE (← (read_henvcfg ()))) == 1#1)))))) : Bool)
                           then (pure (_get_Mstatus_SDT m))
-                          else (pure 0#1)))) (_get_Mstatus_SPELP m)) (_get_Mstatus_MXR m))
+                          else (pure 0#1))) (_get_Mstatus_SPELP m)) (_get_Mstatus_MXR m))
                   (_get_Mstatus_SUM m)) (_get_Mstatus_XS m)) (_get_Mstatus_FS m))
             (_get_Mstatus_VS m)) (_get_Mstatus_SPP m)) (_get_Mstatus_SPIE m)) (_get_Mstatus_SIE m)))
 
@@ -1920,11 +1913,11 @@ def legalize_sstatus (m : (BitVec 64)) (v : (BitVec 64)) (virt : Bool) : SailM (
   let s := (Mk_Sstatus (zero_extend (m := 64) v))
   let s ← do
     (pure (_update_Sstatus_SDT s
-        (← (do
+        (← do
           if ((←((pure virt) <&&> (do
                (pure ((_get_HEnvcfg_DTE (← (read_henvcfg ()))) == 0#1))))) : Bool)
           then (pure 0#1)
-          else (pure (_get_Sstatus_SDT s))))))
+          else (pure (_get_Sstatus_SDT s)))))
   (legalize_mstatus m (lift_sstatus m s))
 
 def undefined_Hgatp64 (_ : Unit) : SailM (BitVec 64) := do

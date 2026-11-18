@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -246,7 +239,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_zilx_mode_backwards (arg_ : (BitVec 5)) : SailM zilx_mode := do
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b10010 => (pure ZILX_UNSCALED)
   | 0b11010 => (pure ZILX_SCALED)
   | 0b11110 => (pure ZILX_SCALED_UW)
@@ -262,7 +255,7 @@ def encdec_zilx_mode_forwards_matches (arg_ : zilx_mode) : Bool :=
   | .ZILX_SCALED_UW => true
 
 def encdec_zilx_mode_backwards_matches (arg_ : (BitVec 5)) : Bool :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b10010 => true
   | 0b11010 => true
   | 0b11110 => true

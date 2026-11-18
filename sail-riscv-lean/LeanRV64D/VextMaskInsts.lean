@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -246,7 +239,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_mmfunct6_backwards (arg_ : (BitVec 6)) : SailM mmfunct6 := do
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b011001 => (pure MM_VMAND)
   | 0b011101 => (pure MM_VMNAND)
   | 0b011000 => (pure MM_VMANDN)
@@ -272,7 +265,7 @@ def encdec_mmfunct6_forwards_matches (arg_ : mmfunct6) : Bool :=
   | .MM_VMXNOR => true
 
 def encdec_mmfunct6_backwards_matches (arg_ : (BitVec 6)) : Bool :=
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b011001 => true
   | 0b011101 => true
   | 0b011000 => true

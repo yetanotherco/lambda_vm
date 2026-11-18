@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -260,7 +253,7 @@ def num_of_landing_pad_expectation (arg_ : landing_pad_expectation) : Int :=
   | .LP_EXPECTED => 1
 
 def landing_pad_bits_forwards (arg_ : (BitVec 1)) : landing_pad_expectation :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 0 => NO_LP_EXPECTED
   | _ => LP_EXPECTED
 
@@ -270,7 +263,7 @@ def landing_pad_bits_backwards (arg_ : landing_pad_expectation) : (BitVec 1) :=
   | .LP_EXPECTED => 1#1
 
 def landing_pad_bits_forwards_matches (arg_ : (BitVec 1)) : Bool :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 0 => true
   | 1 => true
   | _ => false
@@ -333,8 +326,8 @@ def zicfilp_restore_elp_on_xret (xret : xRET_type) (x : Privilege) (y : Privileg
             writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 23 23
               (landing_pad_bits_backwards NO_LP_EXPECTED))
             (pure pelp))) ) : SailM (BitVec 1) )
-  writeReg elp (← (do
+  writeReg elp (← do
     if ((← (get_xLPE y)) : Bool)
     then (pure pelp)
-    else (pure (landing_pad_bits_backwards NO_LP_EXPECTED))))
+    else (pure (landing_pad_bits_backwards NO_LP_EXPECTED)))
 

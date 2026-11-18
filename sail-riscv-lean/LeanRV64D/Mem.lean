@@ -21,13 +21,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -295,14 +288,14 @@ def write_kind_of_flags (aq : Bool) (rl : Bool) (con : Bool) : SailM write_kind 
       "Store-conditional with acquire semantics should be unreachable")
 
 def undefined_Phys_Mem_Access_Info (_ : Unit) : SailM Phys_Mem_Access_Info := do
-  (pure { splittable := ← (do (undefined_Splittability ()))
-          granule_size_exp := ← (do (undefined_range 0 12)) })
+  (pure { splittable := ← (undefined_Splittability ())
+          granule_size_exp := ← (undefined_range 0 12) })
 
 /-- Type quantifiers: k_ex1851866_ : Bool, width : Nat, 0 < width ∧ width ≤ max_mem_access -/
 def pmaCheck (paddr : physaddr) (width : Nat) (access : (MemoryAccessType mem_payload)) (pbmt : page_based_mem_type) (res_or_con : Bool) : SailM (Result Phys_Mem_Access_Info ExceptionType) := SailME.run do
   let attributes ← (( do
     match (matching_pma_region (← readReg pma_regions) paddr width) with
-    | none => SailME.throw (← (do (pure (Err (← (accessFaultFromAccessType access))))))
+    | none => SailME.throw (← do (pure (Err (← (accessFaultFromAccessType access)))))
     | .some { attributes := attributes, size := _, include_in_device_tree := _, base := _ } =>
       (pure (override_PMA attributes pbmt)) ) : SailME (Result Phys_Mem_Access_Info ExceptionType)
     PMA )

@@ -7,13 +7,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -626,10 +619,10 @@ def undefined_Sstateen3 (_ : Unit) : SailM (BitVec 32) := do
 
 /-- Type quantifiers: idx : Nat, 0 ≤ idx ∧ idx ≤ 3 -/
 def get_sstateen_mask (idx : Nat) : SailM (BitVec 64) := do
-  (pure ((← (get_mstateen idx)) &&& (← (do
+  (pure ((← (get_mstateen idx)) &&& (← do
         if ((← (inVirtualPrivilege ())) : Bool)
         then (get_hstateen idx)
-        else (pure (ones (n := 64)))))))
+        else (pure (ones (n := 64))))))
 
 def legalize_sstateen0 (s : (BitVec 32)) (v : (BitVec 32)) : SailM (BitVec 32) := do
   let v := (Mk_Sstateen0 v)

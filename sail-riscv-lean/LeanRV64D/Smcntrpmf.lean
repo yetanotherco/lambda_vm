@@ -6,13 +6,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -254,22 +247,22 @@ def legalize_smcntrpmf (c : (BitVec 64)) (value : (BitVec 64)) : SailM (BitVec 6
       (_update_CountSmcntrpmf_VSINH
         (_update_CountSmcntrpmf_UINH
           (_update_CountSmcntrpmf_SINH (_update_CountSmcntrpmf_MINH c (_get_CountSmcntrpmf_MINH v))
-            (← (do
+            (← do
               if ((← (currentlyEnabled Ext_S)) : Bool)
               then (pure (_get_CountSmcntrpmf_SINH v))
-              else (pure 0#1))))
-          (← (do
+              else (pure 0#1)))
+          (← do
             if ((← (currentlyEnabled Ext_U)) : Bool)
             then (pure (_get_CountSmcntrpmf_UINH v))
-            else (pure 0#1))))
-        (← (do
+            else (pure 0#1)))
+        (← do
           if ((← (currentlyEnabled Ext_H)) : Bool)
           then (pure (_get_CountSmcntrpmf_VSINH v))
-          else (pure 0#1))))
-      (← (do
+          else (pure 0#1)))
+      (← do
         if ((← (currentlyEnabled Ext_H)) : Bool)
         then (pure (_get_CountSmcntrpmf_VUINH v))
-        else (pure 0#1)))))
+        else (pure 0#1))))
 
 def counter_priv_filter_bit (reg : (BitVec 64)) (priv : Privilege) : (BitVec 1) :=
   match priv with

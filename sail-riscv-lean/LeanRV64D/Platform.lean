@@ -13,13 +13,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -692,7 +685,7 @@ def htif_store (addr : physaddr) (width : Nat) (data : (BitVec (8 * width))) : S
   then
     (do
       let cmd ← do (pure (Mk_htif_cmd (← readReg htif_tohost)))
-      match ((_get_htif_cmd_device cmd) : BitVec 8) with
+      match (_get_htif_cmd_device cmd) with
       | 0x00 =>
         (do
           let _ : Unit :=
@@ -716,7 +709,7 @@ def htif_store (addr : physaddr) (width : Nat) (data : (BitVec (8 * width))) : S
               (print_endline
                 (HAppend.hAppend "htif-term cmd: " (BitVec.toFormatted (_get_htif_cmd_payload cmd))))
             else ()
-          match ((_get_htif_cmd_cmd cmd) : BitVec 8) with
+          match (_get_htif_cmd_cmd cmd) with
           | 0x00 => (pure ())
           | 0x01 => (plat_term_write (Sail.BitVec.extractLsb (_get_htif_cmd_payload cmd) 7 0))
           | c => (pure (print (HAppend.hAppend "Unknown term cmd: " (BitVec.toFormatted c))))

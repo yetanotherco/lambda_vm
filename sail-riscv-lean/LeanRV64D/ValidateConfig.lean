@@ -21,13 +21,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -841,14 +834,14 @@ def check_pma_region (region : PMA_Region) : Bool := ExceptM.run do
           (pure true)))
 
 def undefined_pma_check_opts (_ : Unit) : SailM pma_check_opts := do
-  (pure { zama16b := ← (do (undefined_bool ()))
-          ziccamoa := ← (do (undefined_bool ()))
-          ziccamoc := ← (do (undefined_bool ()))
-          ziccif := ← (do (undefined_bool ()))
-          zicclsm := ← (do (undefined_bool ()))
-          ziccrse := ← (do (undefined_bool ()))
-          ssccptr := ← (do (undefined_bool ()))
-          svadu := ← (do (undefined_bool ())) })
+  (pure { zama16b := ← (undefined_bool ())
+          ziccamoa := ← (undefined_bool ())
+          ziccamoc := ← (undefined_bool ())
+          ziccif := ← (undefined_bool ())
+          zicclsm := ← (undefined_bool ())
+          ziccrse := ← (undefined_bool ())
+          ssccptr := ← (undefined_bool ())
+          svadu := ← (undefined_bool ()) })
 
 /-- Type quantifiers: k_ex1852253_ : Bool -/
 def check_pma_regions (regions : (List PMA_Region)) (prev_base : (BitVec 64)) (prev_size : (BitVec 64)) (check_opts : pma_check_opts) (found_valid_svadu_pma : Bool) : Bool := ExceptM.run do

@@ -16,13 +16,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -272,7 +265,7 @@ def sew_flag_forwards_matches (arg_ : String) : Bool :=
   | _ => false
 
 def sew_flag_backwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => true
   | 0b001 => true
   | 0b010 => true
@@ -288,7 +281,7 @@ def maybe_lmul_flag_forwards_matches (arg_ : String) : SailM Bool := do
   | _ => throw Error.Exit
 
 def maybe_lmul_flag_backwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b101 => true
   | 0b110 => true
   | 0b111 => true
@@ -307,7 +300,7 @@ def ta_flag_forwards_matches (arg_ : String) : SailM Bool := do
   | _ => throw Error.Exit
 
 def ta_flag_backwards_matches (arg_ : (BitVec 1)) : Bool :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => true
   | 0 => true
   | _ => false
@@ -321,7 +314,7 @@ def ma_flag_forwards_matches (arg_ : String) : SailM Bool := do
   | _ => throw Error.Exit
 
 def ma_flag_backwards_matches (arg_ : (BitVec 1)) : Bool :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => true
   | 0 => true
   | _ => false
@@ -333,7 +326,7 @@ def vtype_assembly_backwards (arg_ : String) : SailM ((BitVec 3) × (BitVec 1) �
   throw Error.Exit
 
 def vtype_assembly_forwards_matches (arg_ : ((BitVec 3) × (BitVec 1) × (BitVec 1) × (BitVec 3) × (BitVec 3))) : Bool :=
-  match (arg_ : (BitVec 3 × BitVec 1 × BitVec 1 × BitVec 3 × BitVec 3)) with
+  match arg_ with
   | (vtr, ma, ta, sew, lmul) =>
     (if ((((BitVec.access sew 2) != 1#1) && ((lmul != 0b100#3) && (vtr == 0b000#3))) : Bool)
     then true

@@ -6,13 +6,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -295,7 +288,7 @@ def aes_mixcolumn_inv (x : (BitVec 32)) : (BitVec 32) :=
 
 def aes_decode_rcon (r : (BitVec 4)) : SailM (BitVec 32) := do
   sail_assert (zopz0zI_u r 0xA#4) "extensions/K/types_kext.sail:77.18-77.19"
-  match (r : BitVec 4) with
+  match r with
   | 0x0 => (pure 0x00000001#32)
   | 0x1 => (pure 0x00000002#32)
   | 0x2 => (pure 0x00000004#32)

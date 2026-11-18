@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -287,7 +280,7 @@ def pmm_mode_forwards (arg_ : PointerMaskingMode) : (BitVec 2) :=
   | .PMM_PMLEN_16 => 0b11#2
 
 def pmm_mode_backwards (arg_ : (BitVec 2)) : PointerMaskingMode :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => PMM_Disabled
   | 0b01 => PMM_Reserved
   | 0b10 => PMM_PMLEN_7
@@ -301,7 +294,7 @@ def pmm_mode_forwards_matches (arg_ : PointerMaskingMode) : Bool :=
   | .PMM_PMLEN_16 => true
 
 def pmm_mode_backwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => true
   | 0b01 => true
   | 0b10 => true

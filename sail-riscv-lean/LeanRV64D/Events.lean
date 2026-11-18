@@ -6,13 +6,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -312,18 +305,14 @@ def generate_trap_event (trap : TrapCause) : SailM Unit := do
   | _ => (pure ())
 
 def undefined_event_selector (_ : Unit) : SailM event_selector := do
-  (pure { event := ← (do (undefined_Event ()))
-          selector := ← (do (undefined_bitvector 64)) })
+  (pure { event := ← (undefined_Event ())
+          selector := ← (undefined_bitvector 64) })
 
 def platform_event_selectors : (List event_selector) :=
   [{ event := EV_FENCE
-     selector := 0b0000000000000000000000000000000000000000000000000000000000000001#64 }, { event := 
-                                                                                              EV_MISALIGNED_LOAD_EXCEPTION
-                                                                                            selector := 
-                                                                                              0b0000000000000000000000000000000000000000000000000000000000000010#64 }, { event := 
-                                                                                                                                                                           EV_MISALIGNED_STORE_EXCEPTION
-                                                                                                                                                                         selector := 
-                                                                                                                                                                           0b0000000000000000000000000000000000000000000000000000000000000011#64 }]
+     selector := 0b0000000000000000000000000000000000000000000000000000000000000001#64 }, { event := EV_MISALIGNED_LOAD_EXCEPTION
+                                                                                            selector := 0b0000000000000000000000000000000000000000000000000000000000000010#64 }, { event := EV_MISALIGNED_STORE_EXCEPTION
+                                                                                                                                                                                   selector := 0b0000000000000000000000000000000000000000000000000000000000000011#64 }]
 
 def event_selector_width (_ : Unit) : Nat :=
   plat_hpmevent_width_bits

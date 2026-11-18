@@ -11,13 +11,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -332,14 +325,13 @@ def num_of_barrier_kind (arg_ : barrier_kind) : Int :=
 def write_ram (wk : write_kind) (access : (MemoryAccessType mem_payload)) (app_2 : physaddr) (width : Nat) (data : (BitVec (8 * width))) (meta' : Unit) : SailM Bool := do
   let .Physaddr addr := app_2
   let request ← (( do
-    (pure { access_kind := ← (do 
-              match wk with
+    (pure { access_kind := ← match wk with
               | .Write_RISCV_release =>
                 (internal_error "core/phys_mem_interface.sail" 146 "Write_RISCV_release is unused")
               | .Write_RISCV_strong_release =>
                 (internal_error "core/phys_mem_interface.sail" 147
                   "Write_RISCV_strong_release is unused")
-              | _ => (pure (AK_Write (wk, access))))
+              | _ => (pure (AK_Write (wk, access)))
             address := addr
             address_space := ()
             size := width
@@ -354,14 +346,13 @@ def write_ram (wk : write_kind) (access : (MemoryAccessType mem_payload)) (app_2
 def write_ram_ea (wk : write_kind) (access : (MemoryAccessType mem_payload)) (app_2 : physaddr) (width : Nat) : SailM Unit := do
   let .Physaddr addr := app_2
   let request ← (( do
-    (pure { access_kind := ← (do 
-              match wk with
+    (pure { access_kind := ← match wk with
               | .Write_RISCV_release =>
                 (internal_error "core/phys_mem_interface.sail" 183 "Write_RISCV_release is unused")
               | .Write_RISCV_strong_release =>
                 (internal_error "core/phys_mem_interface.sail" 184
                   "Write_RISCV_strong_release is unused")
-              | _ => (pure (AK_Write (wk, access))))
+              | _ => (pure (AK_Write (wk, access)))
             address := addr
             address_space := ()
             size := width
@@ -377,14 +368,13 @@ def read_ram (rk : read_kind) (access : (MemoryAccessType mem_payload)) (app_2 :
     then (__ReadRAM_Meta addr width)
     else default_meta
   let request ← (( do
-    (pure { access_kind := ← (do 
-              match rk with
+    (pure { access_kind := ← match rk with
               | .Read_RISCV_acquire =>
                 (internal_error "core/phys_mem_interface.sail" 219 "Read_RISCV_acquire is unused")
               | .Read_RISCV_strong_acquire =>
                 (internal_error "core/phys_mem_interface.sail" 220
                   "Read_RISCV_strong_acquire is unused")
-              | _ => (pure (AK_Read (rk, access))))
+              | _ => (pure (AK_Read (rk, access)))
             address := addr
             address_space := ()
             size := width

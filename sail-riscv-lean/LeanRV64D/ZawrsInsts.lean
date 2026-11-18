@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -246,7 +239,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_wrsop_backwards (arg_ : (BitVec 12)) : SailM wrsop := do
-  match (arg_ : BitVec 12) with
+  match arg_ with
   | 0b000000011101 => (pure WRS_STO)
   | 0b000000001101 => (pure WRS_NTO)
   | _ =>
@@ -260,7 +253,7 @@ def encdec_wrsop_forwards_matches (arg_ : wrsop) : Bool :=
   | .WRS_NTO => true
 
 def encdec_wrsop_backwards_matches (arg_ : (BitVec 12)) : Bool :=
-  match (arg_ : BitVec 12) with
+  match arg_ with
   | 0b000000011101 => true
   | 0b000000001101 => true
   | _ => false

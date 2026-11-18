@@ -15,13 +15,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -355,11 +348,9 @@ def override_PMA (pma : PMA) (pbmt : page_based_mem_type) : PMA :=
   match pbmt with
   | .PBMT_PMA => pma
   | .PBMT_NC =>
-    { pma with mem_type := MainMemory, cacheable := false, read_idempotent := true, write_idempotent := 
-      true }
+    { pma with mem_type := MainMemory, cacheable := false, read_idempotent := true, write_idempotent := true }
   | .PBMT_IO =>
-    { pma with mem_type := IOMemory, cacheable := false, read_idempotent := false, write_idempotent := 
-      false }
+    { pma with mem_type := IOMemory, cacheable := false, read_idempotent := false, write_idempotent := false }
 
 def pma_misaligned_exception (pma : PMA) (access : (MemoryAccessType mem_payload)) : SailM (Option misaligned_exception) := do
   let exceptions := pma.misaligned_exceptions

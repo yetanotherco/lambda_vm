@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -272,7 +265,7 @@ def vlewidth_bitsnumberstr_backwards_matches (arg_ : String) : Bool :=
   | _ => false
 
 def encdec_vlewidth_backwards (arg_ : (BitVec 3)) : SailM vlewidth := do
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => (pure VLE8)
   | 0b101 => (pure VLE16)
   | 0b110 => (pure VLE32)
@@ -290,7 +283,7 @@ def encdec_vlewidth_forwards_matches (arg_ : vlewidth) : Bool :=
   | .VLE64 => true
 
 def encdec_vlewidth_backwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => true
   | 0b101 => true
   | 0b110 => true
@@ -322,7 +315,7 @@ def vlewidth_pow_backwards_matches (arg_ : Nat) : Bool :=
   | _ => false
 
 def encdec_indexed_mop_backwards (arg_ : (BitVec 2)) : SailM indexed_mop := do
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b01 => (pure INDEXED_UNORDERED)
   | 0b11 => (pure INDEXED_ORDERED)
   | _ =>
@@ -336,7 +329,7 @@ def encdec_indexed_mop_forwards_matches (arg_ : indexed_mop) : Bool :=
   | .INDEXED_ORDERED => true
 
 def encdec_indexed_mop_backwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b01 => true
   | 0b11 => true
   | _ => false
@@ -362,7 +355,7 @@ def indexed_mop_mnemonic_backwards_matches (arg_ : String) : Bool :=
   | _ => false
 
 def encdec_lsop_backwards (arg_ : (BitVec 7)) : SailM vmlsop := do
-  match (arg_ : BitVec 7) with
+  match arg_ with
   | 0b0000111 => (pure VLM)
   | 0b0100111 => (pure VSM)
   | _ =>
@@ -376,7 +369,7 @@ def encdec_lsop_forwards_matches (arg_ : vmlsop) : Bool :=
   | .VSM => true
 
 def encdec_lsop_backwards_matches (arg_ : (BitVec 7)) : Bool :=
-  match (arg_ : BitVec 7) with
+  match arg_ with
   | 0b0000111 => true
   | 0b0100111 => true
   | _ => false

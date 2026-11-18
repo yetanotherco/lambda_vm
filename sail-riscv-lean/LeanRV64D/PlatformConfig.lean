@@ -19,13 +19,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -391,7 +384,7 @@ def atomic_support_str_forwards (arg_ : AtomicSupport) : String :=
   | .AMOCASQ => "AMOCASQ"
 
 def csr_name_map_forwards (arg_ : (BitVec 12)) : SailM String := do
-  match (arg_ : BitVec 12) with
+  match arg_ with
   | 0x301 => (pure "misa")
   | 0x300 => (pure "mstatus")
   | 0x310 => (pure "mstatush")
@@ -850,7 +843,7 @@ def cbop_mnemonic_forwards (arg_ : cbop_zicbom) : String :=
   | .CBO_INVAL => "cbo.inval"
 
 def freg_abi_name_raw_forwards (arg_ : (BitVec 5)) : String :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00000 => "ft0"
   | 0b00001 => "ft1"
   | 0b00010 => "ft2"
@@ -885,7 +878,7 @@ def freg_abi_name_raw_forwards (arg_ : (BitVec 5)) : String :=
   | _ => "ft11"
 
 def freg_arch_name_raw_forwards (arg_ : (BitVec 5)) : String :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00000 => "f0"
   | 0b00001 => "f1"
   | 0b00010 => "f2"
@@ -960,7 +953,7 @@ def encdec_reg_forwards_matches (arg_ : regidx) : Bool :=
   | .Regidx r => true
 
 def reg_abi_name_raw_forwards (arg_ : (BitVec 5)) : String :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00000 => "zero"
   | 0b00001 => "ra"
   | 0b00010 => "sp"
@@ -996,7 +989,7 @@ def reg_abi_name_raw_forwards (arg_ : (BitVec 5)) : String :=
   | _ => "t6"
 
 def reg_arch_name_raw_forwards (arg_ : (BitVec 5)) : String :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00000 => "x0"
   | 0b00001 => "x1"
   | 0b00010 => "x2"
@@ -1235,22 +1228,22 @@ def f_un_x_type_mnemonic_H_forwards (arg_ : f_un_x_op_H) : String :=
   | .FCLASS_H => "fclass.h"
 
 def bit_maybe_i_forwards (arg_ : (BitVec 1)) : String :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => "i"
   | _ => ""
 
 def bit_maybe_o_forwards (arg_ : (BitVec 1)) : String :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => "o"
   | _ => ""
 
 def bit_maybe_r_forwards (arg_ : (BitVec 1)) : String :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => "r"
   | _ => ""
 
 def bit_maybe_w_forwards (arg_ : (BitVec 1)) : String :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => "w"
   | _ => ""
 
@@ -1592,7 +1585,7 @@ def maybe_u_forwards (arg_ : Bool) : String :=
   | false => ""
 
 def maybe_vmask_backwards (arg_ : (BitVec 1)) : String :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => ""
   | _ => (String.append (sep_forwards ()) (String.append "v0.t" ""))
 
@@ -1947,7 +1940,7 @@ def vmtype_mnemonic_forwards (arg_ : vmlsop) : String :=
   | .VSM => "vsm.v"
 
 def vreg_name_raw_forwards (arg_ : (BitVec 5)) : String :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00000 => "v0"
   | 0b00001 => "v1"
   | 0b00010 => "v2"
@@ -1996,12 +1989,12 @@ def vsm4r_mnemonic_forwards (arg_ : zvk_vsm4r_funct6) : String :=
   | .ZVK_VSM4R_VS => "vsm4r.vs"
 
 def ma_flag_backwards (arg_ : (BitVec 1)) : String :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => (String.append (sep_forwards ()) (String.append "ma" ""))
   | _ => (String.append (sep_forwards ()) (String.append "mu" ""))
 
 def maybe_lmul_flag_backwards (arg_ : (BitVec 3)) : SailM String := do
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b101 => (pure (String.append (sep_forwards ()) (String.append "mf8" "")))
   | 0b110 => (pure (String.append (sep_forwards ()) (String.append "mf4" "")))
   | 0b111 => (pure (String.append (sep_forwards ()) (String.append "mf2" "")))
@@ -2015,7 +2008,7 @@ def maybe_lmul_flag_backwards (arg_ : (BitVec 3)) : SailM String := do
       throw Error.Exit)
 
 def sew_flag_backwards (arg_ : (BitVec 3)) : SailM String := do
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => (pure "e8")
   | 0b001 => (pure "e16")
   | 0b010 => (pure "e32")
@@ -2026,7 +2019,7 @@ def sew_flag_backwards (arg_ : (BitVec 3)) : SailM String := do
       throw Error.Exit)
 
 def ta_flag_backwards (arg_ : (BitVec 1)) : String :=
-  match (arg_ : BitVec 1) with
+  match arg_ with
   | 1 => (String.append (sep_forwards ()) (String.append "ta" ""))
   | _ => (String.append (sep_forwards ()) (String.append "tu" ""))
 
@@ -2034,7 +2027,7 @@ def vtr_mnemonic_forwards (_vtr : (BitVec 3)) : String :=
   ""
 
 def vtype_assembly_forwards (arg_ : ((BitVec 3) × (BitVec 1) × (BitVec 1) × (BitVec 3) × (BitVec 3))) : SailM String := do
-  match (arg_ : (BitVec 3 × BitVec 1 × BitVec 1 × BitVec 3 × BitVec 3)) with
+  match arg_ with
   | (vtr, ma, ta, sew, lmul) =>
     (do
       if ((((BitVec.access sew 2) != 1#1) && ((lmul != 0b100#3) && (vtr == 0b000#3))) : Bool)
@@ -2225,7 +2218,7 @@ def wxtype_mnemonic_forwards (arg_ : wxfunct6) : String :=
   | .WX_VSUBU => "vwsubu.wx"
 
 def zba_rtype_mnemonic_forwards (arg_ : (BitVec 2)) : SailM String := do
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b01 => (pure "sh1add")
   | 0b10 => (pure "sh2add")
   | 0b11 => (pure "sh3add")
@@ -2235,7 +2228,7 @@ def zba_rtype_mnemonic_forwards (arg_ : (BitVec 2)) : SailM String := do
       throw Error.Exit)
 
 def zba_rtypeuw_mnemonic_forwards (arg_ : (BitVec 2)) : String :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => "add.uw"
   | 0b01 => "sh1add.uw"
   | 0b10 => "sh2add.uw"
@@ -6014,10 +6007,10 @@ def read_henvcfg (_ : Unit) : SailM (BitVec 64) := do
 
 def read_senvcfg (_ : Unit) : SailM (BitVec 64) := do
   (pure (_update_SEnvcfg_SSE (← readReg senvcfg)
-      ((_get_MEnvcfg_SSE (← readReg menvcfg)) &&& ((_get_SEnvcfg_SSE (← readReg senvcfg)) &&& (← (do
+      ((_get_MEnvcfg_SSE (← readReg menvcfg)) &&& ((_get_SEnvcfg_SSE (← readReg senvcfg)) &&& (← do
             if ((← (inVirtualPrivilege ())) : Bool)
             then (pure (_get_HEnvcfg_SSE (← readReg henvcfg)))
-            else (pure 1#1)))))))
+            else (pure 1#1))))))
 
 
 mutual
@@ -6323,7 +6316,7 @@ termination_by (let _ := idx
 7).toNat
 /-- Type quantifiers: idx : Nat, 0 ≤ idx ∧ idx ≤ 3 -/
 def get_sstateen (idx : Nat) : SailM (BitVec 64) := do
-  (pure (0xFFFFFFFF#32 +++ (← (do
+  (pure (0xFFFFFFFF#32 +++ (← do
         if ((not (← (is_sstateen_accessible ()))) : Bool)
         then (pure (ones (n := (64 -i 32))))
         else
@@ -6332,7 +6325,7 @@ def get_sstateen (idx : Nat) : SailM (BitVec 64) := do
             | 0 => readReg sstateen0
             | 1 => readReg sstateen1
             | 2 => readReg sstateen2
-            | _ => readReg sstateen3)))))
+            | _ => readReg sstateen3))))
 termination_by (let _ := idx
 3).toNat
 def get_xLPE (p : Privilege) : SailM Bool := do
@@ -6412,47 +6405,47 @@ def legalize_henvcfg (h : (BitVec 64)) (v : (BitVec 64)) : SailM (BitVec 64) := 
                     (_update_HEnvcfg_ADUE
                       (_update_HEnvcfg_PBMTE
                         (_update_HEnvcfg_STCE h
-                          (← (do
+                          (← do
                             if ((←((currentlyEnabled Ext_Sstc) <&&> (do
                                  (pure ((_get_MEnvcfg_STCE (← readReg menvcfg)) == 1#1))))) : Bool)
                             then (pure (_get_HEnvcfg_STCE v))
-                            else (pure 0#1))))
-                        (← (do
+                            else (pure 0#1)))
+                        (← do
                           if ((←((currentlyEnabled Ext_Svpbmt) <&&> (do
                                (pure ((_get_MEnvcfg_PBMTE (← readReg menvcfg)) == 1#1))))) : Bool)
                           then (pure (_get_HEnvcfg_PBMTE v))
-                          else (pure 0#1))))
-                      (← (do
+                          else (pure 0#1)))
+                      (← do
                         if ((←((currentlyEnabled Ext_Svadu) <&&> (do
                              (pure ((_get_MEnvcfg_ADUE (← readReg menvcfg)) == 1#1))))) : Bool)
                         then (pure (_get_HEnvcfg_ADUE v))
-                        else (pure 0#1))))
-                    (← (do
+                        else (pure 0#1)))
+                    (← do
                       if ((← (currentlyEnabled Ext_Ssdbltrp)) : Bool)
                       then (pure (_get_HEnvcfg_DTE v))
-                      else (pure 0#1))))
-                  (← (do
+                      else (pure 0#1)))
+                  (← do
                     if (((← (currentlyEnabled Ext_Ssnpm)) && (is_supported_pmm PM_SSNPM
                            (pmm_mode_backwards (_get_HEnvcfg_PMM v)))) : Bool)
                     then (pure (_get_HEnvcfg_PMM v))
-                    else (pure (_get_HEnvcfg_PMM h)))))
-                (← (do
+                    else (pure (_get_HEnvcfg_PMM h))))
+                (← do
                   if ((← (currentlyEnabled Ext_Zicboz)) : Bool)
                   then (pure (_get_HEnvcfg_CBZE v))
-                  else (pure 0#1))))
-              (← (do
+                  else (pure 0#1)))
+              (← do
                 if ((← (currentlyEnabled Ext_Zicbom)) : Bool)
                 then (pure (_get_HEnvcfg_CBCFE v))
-                else (pure 0#1))))
-            (← (do
+                else (pure 0#1)))
+            (← do
               if ((← (currentlyEnabled Ext_Zicbom)) : Bool)
               then (legalize_xenvcfg_cbie (_get_HEnvcfg_CBIE h) (_get_HEnvcfg_CBIE v))
-              else (pure 0b00#2))))
-          (← (do
+              else (pure 0b00#2)))
+          (← do
             if ((←((currentlyEnabled Ext_Zicfiss) <&&> (do
                  (pure ((_get_MEnvcfg_SSE (← readReg menvcfg)) == 1#1))))) : Bool)
             then (pure (_get_HEnvcfg_SSE v))
-            else (pure 0#1))))
+            else (pure 0#1)))
         (if ((hartSupports Ext_Zicfilp) : Bool)
         then (_get_HEnvcfg_LPE v)
         else 0#1))
@@ -6483,42 +6476,42 @@ def legalize_menvcfg (o : (BitVec 64)) (v : (BitVec 64)) : SailM (BitVec 64) := 
                         (if ((hartSupports Ext_Zicfiss) : Bool)
                         then (_get_MEnvcfg_SSE v)
                         else 0#1))
-                      (← (do
+                      (← do
                         if ((← (currentlyEnabled Ext_Zicboz)) : Bool)
                         then (pure (_get_MEnvcfg_CBZE v))
-                        else (pure 0#1))))
-                    (← (do
+                        else (pure 0#1)))
+                    (← do
                       if ((← (currentlyEnabled Ext_Zicbom)) : Bool)
                       then (pure (_get_MEnvcfg_CBCFE v))
-                      else (pure 0#1))))
-                  (← (do
+                      else (pure 0#1)))
+                  (← do
                     if ((← (currentlyEnabled Ext_Zicbom)) : Bool)
                     then (legalize_xenvcfg_cbie (_get_MEnvcfg_CBIE o) (_get_MEnvcfg_CBIE v))
-                    else (pure 0b00#2))))
-                (← (do
+                    else (pure 0b00#2)))
+                (← do
                   if ((← (currentlyEnabled Ext_Sstc)) : Bool)
                   then (pure (_get_MEnvcfg_STCE v))
-                  else (pure 0#1))))
-              (← (do
+                  else (pure 0#1)))
+              (← do
                 if (((← (currentlyEnabled Ext_Smnpm)) && (is_supported_pmm PM_SMNPM
                        (pmm_mode_backwards (_get_MEnvcfg_PMM v)))) : Bool)
                 then (pure (_get_MEnvcfg_PMM v))
-                else (pure (_get_MEnvcfg_PMM o)))))
+                else (pure (_get_MEnvcfg_PMM o))))
             (if ((hartSupports Ext_Ssdbltrp) : Bool)
             then (_get_MEnvcfg_DTE v)
             else 0#1))
-          (← (do
+          (← do
             if ((← (currentlyEnabled Ext_Svadu)) : Bool)
             then (pure (_get_MEnvcfg_ADUE v))
-            else (pure 0#1))))
-        (← (do
+            else (pure 0#1)))
+        (← do
           if ((← (currentlyEnabled Ext_Smcdeleg)) : Bool)
           then (pure (_get_MEnvcfg_CDE v))
-          else (pure 0#1))))
-      (← (do
+          else (pure 0#1)))
+      (← do
         if ((← (currentlyEnabled Ext_Svpbmt)) : Bool)
         then (pure (_get_MEnvcfg_PBMTE v))
-        else (pure 0#1)))))
+        else (pure 0#1))))
 
 def legalize_mseccfg (o : (BitVec 64)) (v : (BitVec 64)) : SailM (BitVec 64) := do
   let sseed_read_only_zero ← do
@@ -6534,11 +6527,11 @@ def legalize_mseccfg (o : (BitVec 64)) (v : (BitVec 64)) : SailM (BitVec 64) := 
       (_update_Seccfg_SSEED
         (_update_Seccfg_MLPE
           (_update_Seccfg_PMM o
-            (← (do
+            (← do
               if (((← (currentlyEnabled Ext_Smmpm)) && (is_supported_pmm PM_SMMPM
                      (pmm_mode_backwards (_get_Seccfg_PMM v)))) : Bool)
               then (pure (_get_Seccfg_PMM v))
-              else (pure (_get_Seccfg_PMM o)))))
+              else (pure (_get_Seccfg_PMM o))))
           (if ((hartSupports Ext_Zicfilp) : Bool)
           then (_get_Seccfg_MLPE v)
           else 0#1))
@@ -6568,27 +6561,27 @@ def legalize_senvcfg (o : (BitVec 64)) (v : (BitVec 64)) : SailM (BitVec 64) := 
                 (if ((hartSupports Ext_Zicfiss) : Bool)
                 then (_get_SEnvcfg_SSE v)
                 else 0#1))
-              (← (do
+              (← do
                 if ((← (currentlyEnabled Ext_Zicboz)) : Bool)
                 then (pure (_get_SEnvcfg_CBZE v))
-                else (pure 0#1))))
-            (← (do
+                else (pure 0#1)))
+            (← do
               if ((← (currentlyEnabled Ext_Zicbom)) : Bool)
               then (pure (_get_SEnvcfg_CBCFE v))
-              else (pure 0#1))))
-          (← (do
+              else (pure 0#1)))
+          (← do
             if ((← (currentlyEnabled Ext_Zicbom)) : Bool)
             then (legalize_xenvcfg_cbie (_get_SEnvcfg_CBIE o) (_get_SEnvcfg_CBIE v))
-            else (pure 0b00#2))))
-        (← (do
+            else (pure 0b00#2)))
+        (← do
           if (((← (currentlyEnabled Ext_Ssnpm)) && (is_supported_pmm PM_SSNPM
                  (pmm_mode_backwards (_get_SEnvcfg_PMM v)))) : Bool)
           then (pure (_get_SEnvcfg_PMM v))
-          else (pure (_get_SEnvcfg_PMM o)))))
-      (← (do
+          else (pure (_get_SEnvcfg_PMM o))))
+      (← do
         if ((← (currentlyEnabled Ext_Svukte)) : Bool)
         then (pure (_get_SEnvcfg_UKTE v))
-        else (pure 0#1)))))
+        else (pure 0#1))))
 
 def amocas_odd_register_reserved_behavior : AmocasOddRegisterReservedBehavior := AMOCAS_Illegal
 
@@ -7317,7 +7310,7 @@ def _get_Mstatus_UXL (v : (BitVec 64)) : (BitVec 2) :=
   (Sail.BitVec.extractLsb v 33 32)
 
 def architecture_bits_backwards (arg_ : (BitVec 2)) : SailM Architecture := do
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b01 => (pure RV32)
   | 0b10 => (pure RV64)
   | 0b11 => (pure RV128)
@@ -7325,13 +7318,13 @@ def architecture_bits_backwards (arg_ : (BitVec 2)) : SailM Architecture := do
 
 def architecture (priv : Privilege) : SailM Architecture := do
   (architecture_bits_backwards
-    (← (do
+    (← do
       match priv with
       | .Machine => (pure (_get_Misa_MXL (← readReg misa)))
       | .Supervisor => (pure (_get_Mstatus_SXL (← readReg mstatus)))
       | .User => (pure (_get_Mstatus_UXL (← readReg mstatus)))
       | .VirtualSupervisor => (pure (_get_Hstatus_VSXL (← readReg hstatus)))
-      | .VirtualUser => (pure (_get_Mstatus_UXL (← readReg vsstatus))))))
+      | .VirtualUser => (pure (_get_Mstatus_UXL (← readReg vsstatus)))))
 
 def in32BitMode (_ : Unit) : SailM Bool := do
   (pure ((← (architecture (← readReg cur_privilege))) == RV32))

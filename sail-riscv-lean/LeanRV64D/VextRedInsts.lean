@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -246,7 +239,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_rivvfunct6_backwards (arg_ : (BitVec 6)) : SailM rivvfunct6 := do
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b110000 => (pure IVV_VWREDSUMU)
   | 0b110001 => (pure IVV_VWREDSUM)
   | _ =>
@@ -260,7 +253,7 @@ def encdec_rivvfunct6_forwards_matches (arg_ : rivvfunct6) : Bool :=
   | .IVV_VWREDSUM => true
 
 def encdec_rivvfunct6_backwards_matches (arg_ : (BitVec 6)) : Bool :=
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b110000 => true
   | 0b110001 => true
   | _ => false
@@ -286,7 +279,7 @@ def rivvtype_mnemonic_backwards_matches (arg_ : String) : Bool :=
   | _ => false
 
 def encdec_rmvvfunct6_backwards (arg_ : (BitVec 6)) : SailM rmvvfunct6 := do
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b000000 => (pure MVV_VREDSUM)
   | 0b000001 => (pure MVV_VREDAND)
   | 0b000010 => (pure MVV_VREDOR)
@@ -312,7 +305,7 @@ def encdec_rmvvfunct6_forwards_matches (arg_ : rmvvfunct6) : Bool :=
   | .MVV_VREDMAX => true
 
 def encdec_rmvvfunct6_backwards_matches (arg_ : (BitVec 6)) : Bool :=
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b000000 => true
   | 0b000001 => true
   | 0b000010 => true

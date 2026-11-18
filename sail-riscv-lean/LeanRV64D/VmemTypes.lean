@@ -6,13 +6,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -401,7 +394,7 @@ def num_of_page_based_mem_type (arg_ : page_based_mem_type) : Int :=
   | .PBMT_IO => 2
 
 def page_based_mem_type_forwards (arg_ : (BitVec 2)) : SailM page_based_mem_type := do
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => (pure PBMT_PMA)
   | 0b01 => (pure PBMT_NC)
   | 0b10 => (pure PBMT_IO)
@@ -417,7 +410,7 @@ def page_based_mem_type_backwards (arg_ : page_based_mem_type) : (BitVec 2) :=
   | .PBMT_IO => 0b10#2
 
 def page_based_mem_type_forwards_matches (arg_ : (BitVec 2)) : Bool :=
-  match (arg_ : BitVec 2) with
+  match arg_ with
   | 0b00 => true
   | 0b01 => true
   | 0b10 => true

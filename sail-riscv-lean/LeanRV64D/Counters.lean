@@ -13,13 +13,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -394,34 +387,34 @@ def legalize_hpmevent (v : (BitVec 64)) : SailM (BitVec 64) := do
                 (_update_HpmEvent_SINH
                   (_update_HpmEvent_MINH
                     (_update_HpmEvent_OF (Mk_HpmEvent (zeros (n := 64)))
-                      (← (do
+                      (← do
                         if ((← (currentlyEnabled Ext_Sscofpmf)) : Bool)
                         then (pure (_get_HpmEvent_OF v))
-                        else (pure 0#1))))
-                    (← (do
+                        else (pure 0#1)))
+                    (← do
                       if ((← (currentlyEnabled Ext_Sscofpmf)) : Bool)
                       then (pure (_get_HpmEvent_MINH v))
-                      else (pure 0#1))))
-                  (← (do
+                      else (pure 0#1)))
+                  (← do
                     if ((←((currentlyEnabled Ext_Sscofpmf) <&&> (do
                          (currentlyEnabled Ext_S)))) : Bool)
                     then (pure (_get_HpmEvent_SINH v))
-                    else (pure 0#1))))
-                (← (do
+                    else (pure 0#1)))
+                (← do
                   if ((←((currentlyEnabled Ext_Sscofpmf) <&&> (do
                        (currentlyEnabled Ext_U)))) : Bool)
                   then (pure (_get_HpmEvent_UINH v))
-                  else (pure 0#1))))
-              (← (do
+                  else (pure 0#1)))
+              (← do
                 if ((←((currentlyEnabled Ext_Sscofpmf) <&&> (do
                      (currentlyEnabled Ext_H)))) : Bool)
                 then (pure (_get_HpmEvent_VSINH v))
-                else (pure 0#1))))
-            (← (do
+                else (pure 0#1)))
+            (← do
               if ((←((currentlyEnabled Ext_Sscofpmf) <&&> (do
                    (currentlyEnabled Ext_H)))) : Bool)
               then (pure (_get_HpmEvent_VUINH v))
-              else (pure 0#1))))
+              else (pure 0#1)))
           (zero_extend (m := 56)
             (Sail.BitVec.extractLsb (_get_HpmEvent_event v) (plat_hpmevent_width_bits -i 1) 0)))))
 

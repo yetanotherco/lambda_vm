@@ -41,7 +41,7 @@ theorem execute_SLT (rs2 rs1 rd : regidx) :
       let b ← rX_bits rs2
       wX_bits rd (sltPure a b)
       pure RETIRE_SUCCESS) := by
-  simp only [execute_RTYPE, bind_assoc, pure_bind, slt_bit]
+  simp only [execute_RTYPE, pure_bind, slt_bit]
 
 /-- Sail's `SLTU` reads `rs1` and `rs2` and writes `sltuPure x[rs1] x[rs2]` to `rd`. -/
 theorem execute_SLTU (rs2 rs1 rd : regidx) :
@@ -50,6 +50,6 @@ theorem execute_SLTU (rs2 rs1 rd : regidx) :
       let b ← rX_bits rs2
       wX_bits rd (sltuPure a b)
       pure RETIRE_SUCCESS) := by
-  simp only [execute_RTYPE, bind_assoc, pure_bind, sltu_bit]
+  simp only [execute_RTYPE, pure_bind, sltu_bit]
 
 end RiscvEquiv

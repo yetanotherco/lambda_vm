@@ -18,13 +18,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -280,7 +273,7 @@ def prevent_reentrance (act : Trig_Action) (priv : Privilege) : SailM Bool := do
 
 def sselect_match (t : TExtra) (priv : Privilege) : SailM Bool := do
   let ctx ← do (pure (_get_SContext_data (← readReg scontext)))
-  match (t.sselect : BitVec 2) with
+  match t.sselect with
   | 0b00 => (pure true)
   | 0b01 =>
     (pure ((((BitVec.access t.sbytemask 0) == 1#1) || ((Sail.BitVec.extractLsb ctx 7 0) == (Sail.BitVec.extractLsb
@@ -299,7 +292,7 @@ def sselect_match (t : TExtra) (priv : Privilege) : SailM Bool := do
 def mhselect_match (t : TExtra) : SailM Bool := do
   let ctx ← do (pure (_get_MContext_hcontext (← readReg mcontext)))
   let v := (t.mhvalue +++ (Sail.BitVec.extractLsb t.mhselect 2 2))
-  match (t.mhselect : BitVec 3) with
+  match t.mhselect with
   | 0b000 => (pure true)
   | 0b001 => (pure (ctx == v))
   | 0b010 => (pure ((← (get_vmid VS_Stage)) == (trunc (m := 14) v)))
@@ -350,8 +343,7 @@ def match_icount_triggers (priv : Privilege) (reentrance : Bool) : SailM Unit :=
                     match (BitVec.toNatInt t.count) with
                     | 0 => t
                     | 1 =>
-                      { t with count := 
-                        if (icount_count_is_hardwired_one : Bool)
+                      { t with count := if (icount_count_is_hardwired_one : Bool)
                         then t.count
                         else (zeros (n := 14)), pending := set_pending }
                     | _ => { t with count := (BitVec.subInt t.count 1) }
@@ -960,8 +952,7 @@ def fire_trigger_after (idx : Nat) : SailM Bool := do
             sail_assert (t.chain || (hit == Hit_imm_after)) "extensions/Sdtrig/sdtrig_control.sail:543.45-543.46"
             let fire := (not t.chain)
             (pure ((T_mcontrol6
-                { t with hit := 
-                  if (fire : Bool)
+                { t with hit := if (fire : Bool)
                   then Hit_imm_after
                   else t.hit, match_info := none }), t.action, fire)))
         | none => (pure ((T_mcontrol6 t), t.action, false)))

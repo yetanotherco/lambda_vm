@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -246,7 +239,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_cbop_zicbop_backwards (arg_ : (BitVec 5)) : SailM cbop_zicbop := do
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00000 => (pure PREFETCH_I)
   | 0b00001 => (pure PREFETCH_R)
   | 0b00011 => (pure PREFETCH_W)
@@ -262,7 +255,7 @@ def encdec_cbop_zicbop_forwards_matches (arg_ : cbop_zicbop) : Bool :=
   | .PREFETCH_W => true
 
 def encdec_cbop_zicbop_backwards_matches (arg_ : (BitVec 5)) : Bool :=
-  match (arg_ : BitVec 5) with
+  match arg_ with
   | 0b00000 => true
   | 0b00001 => true
   | 0b00011 => true

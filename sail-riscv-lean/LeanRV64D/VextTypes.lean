@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -246,7 +239,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_nfields_forwards (arg_ : (BitVec 3)) : Int :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => 1
   | 0b001 => 2
   | 0b010 => 3
@@ -257,7 +250,7 @@ def encdec_nfields_forwards (arg_ : (BitVec 3)) : Int :=
   | _ => 8
 
 def encdec_nfields_forwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => true
   | 0b001 => true
   | 0b010 => true
@@ -322,7 +315,7 @@ def nfields_string_backwards_matches (arg_ : String) : Bool :=
   | _ => false
 
 def encdec_nfields_pow2_forwards (arg_ : (BitVec 3)) : SailM Int := do
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => (pure 1)
   | 0b001 => (pure 2)
   | 0b011 => (pure 4)
@@ -333,7 +326,7 @@ def encdec_nfields_pow2_forwards (arg_ : (BitVec 3)) : SailM Int := do
       throw Error.Exit)
 
 def encdec_nfields_pow2_forwards_matches (arg_ : (BitVec 3)) : Bool :=
-  match (arg_ : BitVec 3) with
+  match arg_ with
   | 0b000 => true
   | 0b001 => true
   | 0b011 => true

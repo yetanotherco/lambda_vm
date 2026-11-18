@@ -22,7 +22,7 @@ theorem execute_SRL (rs2 rs1 rd : regidx) :
       let b ← rX_bits rs2
       wX_bits rd (srlPure a b)
       pure RETIRE_SUCCESS) := by
-  simp only [execute_RTYPE, bind_assoc, pure_bind, shift_bits_right, Sail.BitVec.extractLsb,
+  simp only [execute_RTYPE, pure_bind, shift_bits_right, Sail.BitVec.extractLsb,
     srlPure, BitVec.ushiftRight_eq', BitVec.extractLsb_toNat]
   rfl
 

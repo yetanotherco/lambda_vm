@@ -15,13 +15,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -288,6 +281,6 @@ def rvfi_fetch (_ : Unit) : SailM FetchResult := SailME.run do
           | .some e => SailME.throw ((F_Ext_Error e) : FetchResult)
           | none => (pure ())
           match (← (translateAddr (Virtaddr PC_hi) access eff_priv)) with
-          | .Err (e, _) => (pure (F_Error { e with excinfo := ← (do readReg PC) }))
+          | .Err (e, _) => (pure (F_Error { e with excinfo := ← readReg PC }))
           | .Ok (_, _, _) => (pure (F_Base i))))
 

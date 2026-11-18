@@ -11,13 +11,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -261,7 +254,7 @@ def float_class_onehot_bits_forwards (arg_ : float_class) : (BitVec 10) :=
   | .float_class_qnan => 0b1000000000#10
 
 def float_class_onehot_bits_backwards (arg_ : (BitVec 10)) : SailM float_class := do
-  match (arg_ : BitVec 10) with
+  match arg_ with
   | 0b0000000001 => (pure float_class_negative_inf)
   | 0b0000000010 => (pure float_class_negative_normal)
   | 0b0000000100 => (pure float_class_negative_subnormal)
@@ -291,7 +284,7 @@ def float_class_onehot_bits_forwards_matches (arg_ : float_class) : Bool :=
   | .float_class_qnan => true
 
 def float_class_onehot_bits_backwards_matches (arg_ : (BitVec 10)) : Bool :=
-  match (arg_ : BitVec 10) with
+  match arg_ with
   | 0b0000000001 => true
   | 0b0000000010 => true
   | 0b0000000100 => true

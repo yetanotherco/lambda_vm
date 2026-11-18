@@ -5,13 +5,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -242,7 +235,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def undefined_mul_op (_ : Unit) : SailM mul_op := do
-  (pure { result_part := ← (do (undefined_VectorHalf ()))
-          signed_rs1 := ← (do (undefined_Signedness ()))
-          signed_rs2 := ← (do (undefined_Signedness ())) })
+  (pure { result_part := ← (undefined_VectorHalf ())
+          signed_rs1 := ← (undefined_Signedness ())
+          signed_rs2 := ← (undefined_Signedness ()) })
 

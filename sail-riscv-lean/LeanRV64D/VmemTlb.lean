@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -380,8 +373,7 @@ def add_to_TLB (sv_width : Nat) (asid : (BitVec (if ( 64 = 32  : Bool) then 9 el
       pteAddr := pteAddr
       pbmt := pbmt
       levelMask := (zero_extend (m := (59 -i 12)) levelMask)
-      vpn := 
-        if ((stage == G_Stage) : Bool)
+      vpn := if ((stage == G_Stage) : Bool)
         then (zero_extend (m := (59 -i 12)) vpn)
         else (sign_extend (m := (59 -i 12)) vpn)
       ppn := (zero_extend (m := 44) ppn) }

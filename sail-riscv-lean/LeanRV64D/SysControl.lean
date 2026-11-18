@@ -28,13 +28,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -300,7 +293,7 @@ def check_CSR_access (csr : (BitVec 12)) (access_type : CSRAccessType) : Bool :=
 /-- Type quantifiers: arg2 : Nat, 1 ≤ arg2 ∧ arg2 ≤ 6 -/
 def indirect_reg_implemented (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat) : SailM Bool := do
   let merge_var := (arg0, arg1, arg2)
-  match (merge_var : (_ × BitVec 64 × _)) with
+  match merge_var with
   | (.Sireg, sel, i) =>
     (do
       if ((((BitVec.toNatInt 0x40#8) ≤b (BitVec.toNatInt sel)) && (((BitVec.toNatInt sel) ≤b (BitVec.toNatInt
@@ -308,7 +301,7 @@ def indirect_reg_implemented (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat)
       then
         (do
           let state_exists ← (( do
-            match (((Sail.BitVec.extractLsb sel 7 0), i) : (BitVec 8 × _)) with
+            match ((Sail.BitVec.extractLsb sel 7 0), i) with
             | (0x40, 1) => (currentlyEnabled Ext_Zicntr)
             | (0x40, 2) => (currentlyEnabled Ext_Smcntrpmf)
             | (0x40, 4) => (pure (xlen == 32)) <&&> (do (currentlyEnabled Ext_Zicntr))
@@ -328,7 +321,7 @@ def indirect_reg_implemented (arg0 : IregType) (arg1 : (BitVec 64)) (arg2 : Nat)
               (pure (((BitVec.access (← readReg mcounteren)
                       (BitVec.toNatInt (Sail.BitVec.extractLsb sel 4 0))) == 1#1) && state_exists)))))
       else
-        (match ((Sireg, sel, i) : (_ × BitVec 64 × _)) with
+        (match (Sireg, sel, i) with
         | (_, _, _) => (pure false)))
   | (_, _, _) => (pure false)
 
@@ -1557,7 +1550,7 @@ def is_sireg_exception_virtual (priv : Privilege) : SailM Bool := do
 
 def is_CSR_exception_virtual (arg0 : (BitVec 12)) (arg1 : Privilege) (arg2 : CSRAccessType) : SailM Bool := do
   let merge_var := (arg0, arg1, arg2)
-  match (merge_var : (BitVec 12 × _ × _)) with
+  match merge_var with
   | (0x008, g__2, g__3) => (pure false)
   | (0x009, g__4, g__5) => (pure false)
   | (0x00A, g__6, g__7) => (pure false)
@@ -1843,21 +1836,21 @@ def trap_handler_inner (del_priv : Privilege) (c : TrapCause) (pc : (BitVec 64))
           (_get_Mstatus_SIE (← readReg mstatus)))
         writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 1 1 0#1)
         writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 8 8
-          (← (do
+          (← do
             match (← readReg cur_privilege) with
             | .User => (pure 0#1)
             | .VirtualUser => (pure 0#1)
             | .Supervisor => (pure 1#1)
             | .VirtualSupervisor => (pure 1#1)
             | .Machine =>
-              (internal_error "sys/sys_control.sail" 336 "invalid privilege for s-mode trap"))))
+              (internal_error "sys/sys_control.sail" 336 "invalid privilege for s-mode trap")))
         writeReg hstatus (Sail.BitVec.updateSubrange (← readReg hstatus) 7 7
           (bool_to_bit (← (inVirtualPrivilege ()))))
         writeReg hstatus (Sail.BitVec.updateSubrange (← readReg hstatus) 8 8
-          (← (do
+          (← do
             if ((← (inVirtualPrivilege ())) : Bool)
             then (pure (_get_Mstatus_SPP (← readReg mstatus)))
-            else (pure (_get_Hstatus_SPVP (← readReg hstatus))))))
+            else (pure (_get_Hstatus_SPVP (← readReg hstatus)))))
         writeReg hstatus (Sail.BitVec.updateSubrange (← readReg hstatus) 6 6
           (bool_to_bit excinfo_is_gva))
         writeReg stval (tval excinfo)
@@ -1881,11 +1874,11 @@ def trap_handler_inner (del_priv : Privilege) (c : TrapCause) (pc : (BitVec 64))
           (_get_Mstatus_SIE (← readReg vsstatus)))
         writeReg vsstatus (Sail.BitVec.updateSubrange (← readReg vsstatus) 1 1 0#1)
         writeReg vsstatus (Sail.BitVec.updateSubrange (← readReg vsstatus) 8 8
-          (← (do
+          (← do
             match (← readReg cur_privilege) with
             | .VirtualUser => (pure 0#1)
             | .VirtualSupervisor => (pure 1#1)
-            | _ => (internal_error "sys/sys_control.sail" 369 "invalid privilege for vs-mode trap"))))
+            | _ => (internal_error "sys/sys_control.sail" 369 "invalid privilege for vs-mode trap")))
         writeReg vsepc pc
         writeReg vstval (tval excinfo)
         writeReg cur_privilege del_priv
@@ -1953,9 +1946,9 @@ def trap_handler (del_priv : Privilege) (c : TrapCause) (pc : (BitVec 64)) : Sai
                 else ()
               writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 24 24 1#1))
           else
-            SailME.throw (← (do
+            SailME.throw (← do
                 (machine_trap_set_mdt ())
-                (trap_handler_inner Machine (double_trap_cause c) pc))))
+                (trap_handler_inner Machine (double_trap_cause c) pc)))
       else (pure ()))
   | .VirtualSupervisor =>
     (do
@@ -1972,9 +1965,9 @@ def trap_handler (del_priv : Privilege) (c : TrapCause) (pc : (BitVec 64)) : Sai
                 else ()
               writeReg vsstatus (Sail.BitVec.updateSubrange (← readReg vsstatus) 24 24 1#1))
           else
-            SailME.throw (← (do
+            SailME.throw (← do
                 (machine_trap_set_mdt ())
-                (trap_handler_inner Machine (double_trap_cause c) pc))))
+                (trap_handler_inner Machine (double_trap_cause c) pc)))
       else (pure ()))
   | .User => (pure ())
   | .VirtualUser => (pure ())

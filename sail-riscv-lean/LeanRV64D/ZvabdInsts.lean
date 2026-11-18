@@ -9,13 +9,6 @@ set_option maxRecDepth 1_000_000
 set_option linter.unusedVariables false
 set_option match.ignoreUnusedAlts true
 
--- https://github.com/leanprover/lean4/issues/13858
--- https://github.com/leanprover/lean4/issues/15685
-set_option backward.do.legacy true
-
--- https://github.com/leanprover/lean4/issues/15661
-set_option cleanup.letToHave false
-
 open Sail
 open Sail.ArchSem
 
@@ -246,7 +239,7 @@ open Architecture
 open AmocasOddRegisterReservedBehavior
 
 def encdec_zvabd_vabd_func6_backwards (arg_ : (BitVec 6)) : SailM zvabd_vabd_func6 := do
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b010101 => (pure VABD)
   | 0b010110 => (pure VABDU)
   | _ =>
@@ -260,7 +253,7 @@ def encdec_zvabd_vabd_func6_forwards_matches (arg_ : zvabd_vabd_func6) : Bool :=
   | .VABDU => true
 
 def encdec_zvabd_vabd_func6_backwards_matches (arg_ : (BitVec 6)) : Bool :=
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b010101 => true
   | 0b010110 => true
   | _ => false
@@ -306,7 +299,7 @@ def vabd_vx_mnemonic_backwards_matches (arg_ : String) : Bool :=
   | _ => false
 
 def encdec_zvabd_vwabda_func6_backwards (arg_ : (BitVec 6)) : SailM zvabd_vwabda_func6 := do
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b111101 => (pure VWABDA)
   | 0b111110 => (pure VWABDAU)
   | _ =>
@@ -320,7 +313,7 @@ def encdec_zvabd_vwabda_func6_forwards_matches (arg_ : zvabd_vwabda_func6) : Boo
   | .VWABDAU => true
 
 def encdec_zvabd_vwabda_func6_backwards_matches (arg_ : (BitVec 6)) : Bool :=
-  match (arg_ : BitVec 6) with
+  match arg_ with
   | 0b111101 => true
   | 0b111110 => true
   | _ => false
