@@ -350,25 +350,47 @@ pub fn public_columns() -> bool {
 pub fn resident_tree_with_public<F: IsField + 'static, E: IsField + 'static>(
     interactions: &[Interaction<E>],
     trace: &crate::constraint_argument::TraceData<F, E>,
-) -> Option<crate::gkr::FractionTree<E>> {
+) -> Result<crate::gkr::FractionTree<E>, String> {
     if interactions.is_empty() {
-        return None;
+        return Err("no interactions".into());
     }
-    let (store, first) = trace.resident_shared()?;
+    let (store, first) = trace
+        .resident_shared()
+        .ok_or("its table's columns are not on the card")?;
     let rows = 1usize << trace.num_vars();
-    let gathered = public_plan(interactions, trace.kinds(), trace.public_tables(), rows)?;
+    let gathered = public_plan(interactions, trace.kinds(), trace.public_tables(), rows).ok_or(
+        "no plan over its columns and selectors (a selector not base-valued, or an unknown slot)",
+    )?;
     let store_columns: Vec<usize> = gathered.columns.iter().map(|c| first + c).collect();
     let extra: Vec<&[u64]> = gathered.public.iter().map(Vec::as_slice).collect();
-    let small = crate::gpu::gather_resident(&store, &store_columns, &extra)?;
     let width = store_columns.len() + extra.len();
+    let gib = (width * rows * 8) as f64 / (1u64 << 30) as f64;
+    let small = crate::gpu::gather_resident(&store, &store_columns, &extra).ok_or_else(|| {
+        format!(
+            "the card refused its gathered store ({} columns + {} selectors at {rows} rows, {gib:.2} GiB; ledger \
+             {:.2} of {:.2} GiB promised)",
+            store_columns.len(),
+            extra.len(),
+            crate::gpu::ledger_reserved() as f64 / (1u64 << 30) as f64,
+            crate::gpu::reserve_budget() as f64 / (1u64 << 30) as f64,
+        )
+    })?;
     let tree = crate::gpu::input_layer_tree_from_columns(
         std::sync::Arc::new(small),
         0,
         width,
         rows,
         &gathered.plan,
-    )?;
-    crate::gkr::FractionTree::from_device(tree).ok()
+    )
+    .ok_or_else(|| {
+        format!(
+            "the card declined the tree's build over its gathered store ({width} columns, {gib:.2} GiB; ledger \
+             {:.2} of {:.2} GiB promised)",
+            crate::gpu::ledger_reserved() as f64 / (1u64 << 30) as f64,
+            crate::gpu::reserve_budget() as f64 / (1u64 << 30) as f64,
+        )
+    })?;
+    crate::gkr::FractionTree::from_device(tree).map_err(|e| format!("its device tree: {e:?}"))
 }
 
 /// What [`resident_tree_with_public`] gathers: the table's columns the
