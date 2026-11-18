@@ -7818,6 +7818,14 @@ pub struct StreamSkip {
     /// are built. The tables are the same; the groups they are packed into,
     /// and so the proof's bytes, are not. In waves it changes nothing.
     pub keccak_rnd_first: bool,
+    /// With the slide, the page tables are handed on right after
+    /// KECCAK_RND's (before every other table without them), in their AIR
+    /// order, so the group they fill is committed and argued early: in a
+    /// block proved through its levels, the many-table group then reaches
+    /// level 1 while phase B still runs, not last. The tables are the same;
+    /// the groups, and so the proof's bytes, are not. In waves it changes
+    /// nothing.
+    pub pages_first: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table
     /// phase's counts, its
