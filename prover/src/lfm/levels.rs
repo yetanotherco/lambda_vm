@@ -203,7 +203,7 @@ pub fn parse_stacks(value: Option<&str>) -> Result<Option<StackPlace>, String> {
 /// only when there is no card. Printed.
 pub(crate) fn stack_place(cells: u64, level: usize, forced: Option<StackPlace>) -> StackPlace {
     let need = cells.saturating_mul(STACK_CARD_BYTES_PER_CELL);
-    let budget = multilinear::gpu::reserve_budget();
+    let budget = multilinear::gpu::reserve_budget().saturating_sub(levels_pad_held());
     let place = if budget == 0 {
         StackPlace::Host
     } else if let Some(place) = forced {
@@ -392,12 +392,75 @@ pub(crate) fn reset_peak_rss() -> bool {
     std::fs::write("/proc/self/clear_refs", "5").is_ok()
 }
 
-/// A proved level's prover-side memory let go: its program's instructions
-/// and instruction columns (their counts kept in `sizes`), and its build's
-/// prepared stacks. The artifacts stay: they are what the level above and
-/// the verifier read.
-fn release_proved(level: &mut Level, sizes: &mut Vec<(usize, usize)>) {
-    let p = &mut level.program;
+/// `LAMBDA_VM_LEVELS_CARD_PAD_MB=<MiB>`: while the levels prove, the card
+/// ledger promises at most its budget less this many MiB: the driver holds a
+/// promise of that size from the base's end to its own (one the card never
+/// allocates), so the levels' commits, openings and revives together stay
+/// that far under the budget while the base keeps all of it. Unset or 0 (the
+/// default): no pad. Read once a process; nonsense is refused.
+pub const CARD_PAD_ENV: &str = "LAMBDA_VM_LEVELS_CARD_PAD_MB";
+
+/// What [`CARD_PAD_ENV`] says, in bytes.
+pub fn parse_card_pad(value: Option<&str>) -> Result<u64, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(0),
+        Some(v) => v
+            .parse::<u64>()
+            .map(|mb| mb << 20)
+            .map_err(|_| format!("{CARD_PAD_ENV} must be a whole number of MiB, got `{v}`")),
+    }
+}
+
+fn card_pad_bytes() -> Result<u64, String> {
+    static PAD: std::sync::OnceLock<Result<u64, String>> = std::sync::OnceLock::new();
+    PAD.get_or_init(|| parse_card_pad(std::env::var(CARD_PAD_ENV).ok().as_deref()))
+        .clone()
+}
+
+/// The levels' pad, while the driver holds it, and its size.
+static LEVELS_PAD: std::sync::Mutex<Option<(multilinear::gpu::DeviceRoom, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// The bytes of the levels' pad held now (0 when none).
+fn levels_pad_held() -> u64 {
+    LEVELS_PAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |(_, b)| *b)
+}
+
+/// Takes the levels' pad ([`CARD_PAD_ENV`]): the bytes held, 0 when there is
+/// none to take or no card, or the ledger would not promise it.
+fn take_levels_pad() -> Result<u64, String> {
+    let bytes = card_pad_bytes()?;
+    if bytes == 0 {
+        return Ok(0);
+    }
+    let held = multilinear::gpu::reserve_room(bytes).map(|room| (room, bytes));
+    let got = held.as_ref().map_or(0, |(_, b)| *b);
+    *LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = held;
+    Ok(got)
+}
+
+/// Gives the levels' pad back.
+fn release_levels_pad() {
+    *LEVELS_PAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Gives the levels' pad back when the driver returns, by any path.
+struct PadRelease;
+
+impl Drop for PadRelease {
+    fn drop(&mut self) {
+        release_levels_pad();
+    }
+}
+
+/// A filled level's program let go: its instructions and instruction
+/// columns (their counts kept in `sizes`). The prove reads the build and the
+/// filled traces, never the program; the heights stay.
+fn release_program(p: &mut LfmProgram, sizes: &mut Vec<(usize, usize)>) {
     sizes.push((p.instrs.len(), p.groups.b3l.real_rows));
     p.instrs = Vec::new();
     let g = &mut p.groups;
@@ -420,7 +483,46 @@ fn release_proved(level: &mut Level, sizes: &mut Vec<(usize, usize)>) {
     ] {
         group.data = Vec::new();
     }
-    level.build.release_prover_half();
+}
+
+/// The card at a point of the driver, after every stream's pending frees
+/// landed and the memory pool handed back what it holds unused
+/// (`math_cuda::device::drain_and_trim`): the pool's bytes in use and its
+/// peak since the last reading, and the device's free and total bytes. A
+/// pool holds freed blocks, and a block freed on one stream is not free to
+/// another until that stream reaches the free: without this, a level's first
+/// group commit can find the card full of what the stacks' commits or the
+/// base let go. `None` without a card.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CardReading {
+    pub pool_used: u64,
+    pub pool_peak: u64,
+    pub free: u64,
+    pub total: u64,
+}
+
+/// [`CardReading`] now, the card drained and trimmed first, its pool's peak
+/// started again.
+pub(crate) fn card_settle(at: &str) -> Option<CardReading> {
+    let (pool_used, pool_peak, free, total) = multilinear::gpu::settle_card()?;
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    // Said as it happens, so a run that fails later still shows it.
+    eprintln!(
+        "LEVELS CARD {at}: pool {:.2} GiB (peak before {:.2}) · free {:.2} of {:.2} GiB · ledger \
+         {:.2} of {:.2} GiB promised",
+        gib(pool_used),
+        gib(pool_peak),
+        gib(free),
+        gib(total),
+        gib(multilinear::gpu::ledger_reserved()),
+        gib(multilinear::gpu::reserve_budget())
+    );
+    Some(CardReading {
+        pool_used,
+        pool_peak,
+        free,
+        total,
+    })
 }
 
 /// This process's resident set, in bytes (Linux; `None` elsewhere).
@@ -665,12 +767,18 @@ pub struct LevelsTimes {
     /// Whether the process's peak resident set was started again before the
     /// base ([`reset_peak_rss`]).
     pub peak_reset: bool,
-    /// The allocator purge at the base's end, on a thread beside level 1:
-    /// its seconds and jemalloc's resident bytes before and after; and the
-    /// one after the last level, before the driver returns.
-    pub purges: [Option<crate::alloc_purge::Purge>; 2],
+    /// The allocator purges: at the base's end, on a thread beside level 1;
+    /// after the last level, before the driver returns; after level 1's fill,
+    /// on a thread beside its prove; at the driver's start, before its clock.
+    /// Each its seconds and jemalloc's resident bytes before and after.
+    pub purges: [Option<crate::alloc_purge::Purge>; 4],
     /// The process's resident set at named points (bytes; Linux).
     pub resident: Vec<(&'static str, u64)>,
+    /// The card at named points, each after a drain and a trim
+    /// ([`card_settle`]).
+    pub card: Vec<(String, CardReading)>,
+    /// The levels' card pad held ([`CARD_PAD_ENV`]), in bytes.
+    pub card_pad: u64,
 }
 
 /// One level's build, as the driver ran it.
@@ -749,8 +857,11 @@ fn hand_on_lean<H: super::hash::LfmHasher + Sync>(
 ///
 /// Memory: the process's peak resident set is started again before the base
 /// ([`reset_peak_rss`]), the allocator's freed pages are handed back at the
-/// base's end (beside level 1) and after the last level, and each level's
-/// program and prover-side stacks are let go once it is proved.
+/// base's end (beside level 1) and after the last level, each level's
+/// program is let go once it is filled and its prover-side stacks once it is
+/// proved. The card is drained and its pool trimmed ([`card_settle`]) before
+/// and after level 1's stacks are committed and after each level's prove, so
+/// a level's group commits find the card's memory, not the pool's leftovers.
 ///
 /// Under [`WlfmFamily::B3`] the base is the 7-round BLAKE3 base
 /// (`format.zf.base` must be `BaseFormat::B3_WHIR`, [`check_base`]), admitted
@@ -785,7 +896,15 @@ pub fn prove_block_levels(
                 .into(),
         );
     }
+    // What the process freed before this block (an earlier block, its
+    // verification) goes back to the OS first, so the peak this block's base
+    // reads starts from what is live, not from pages the allocator keeps.
+    let purge_at_start = crate::alloc_purge::purge_now();
+    card_pad_bytes()?;
+    let _pad = PadRelease;
     let peak_reset = reset_peak_rss();
+    // What an earlier block left in the card's pool goes back too.
+    let at_start = card_settle("start");
     let t0 = std::time::Instant::now();
     let now = || t0.elapsed().as_secs_f64();
     type Statement = (
@@ -1084,8 +1203,11 @@ pub fn prove_block_levels(
                     if proved.is_err() {
                         return Err("the base did not prove".to_string());
                     }
+                    let settled = card_settle("base end");
+                    take_levels_pad()?;
                     let build = commit_level(pre, 1)?;
-                    Ok((build, prepare, cells, now()))
+                    let committed = card_settle("level 1 committed");
+                    Ok((build, prepare, cells, now(), [settled, committed]))
                 }))
             }
             None => None,
@@ -1096,6 +1218,10 @@ pub fn prove_block_levels(
     });
     let (proved, level1, built_beside, purge, at_base) = result;
     times.peak_reset = peak_reset;
+    times.purges[3] = purge_at_start;
+    if let Some(card) = at_start {
+        times.card.push(("start".to_string(), card));
+    }
     times.purges[0] = purge;
     if let Some(r) = at_base {
         times.resident.push(("base end", r));
@@ -1139,15 +1265,24 @@ pub fn prove_block_levels(
     // Level 1's build: its stacks committed on the card at the base's end
     // (prepared beside phase B under `build_beside`), or prepared and
     // committed now.
-    let (first, prepare, cells, committed) = match built_beside {
+    let (first, prepare, cells, committed, cards) = match built_beside {
         Some(built) => built?,
         None => {
             let pre = prepare_level(&program, family, level_rounds(&plan))?;
             let (prepare, cells) = (pre.secs(), pre.prepared_cells());
+            let settled = card_settle("base end");
+            take_levels_pad()?;
             let build = commit_level(pre, 1)?;
-            (build, prepare, cells, now())
+            let committed = card_settle("level 1 committed");
+            (build, prepare, cells, now(), [settled, committed])
         }
     };
+    times.card_pad = levels_pad_held();
+    for (at, card) in ["base end", "level 1 committed"].into_iter().zip(cards) {
+        if let Some(card) = card {
+            times.card.push((at.to_string(), card));
+        }
+    }
     times.built = committed;
     times.builds.push(LevelBuild {
         place: first.place(),
@@ -1186,6 +1321,10 @@ pub fn prove_block_levels(
             lean,
         );
         let fill = t.elapsed().as_secs_f64();
+        release_program(&mut levels[0].program, &mut times.sizes);
+        // What the execution and the program held, back to the OS on a
+        // thread of its own beside the prove.
+        let purge_filled = scope.spawn(crate::alloc_purge::purge_now);
         times.lean_prefilled = filled.lean_prefilled();
         times.fill_split = super::proof::take_fill_split().unwrap_or_default();
         times.lean_parts = super::proof::take_lean_parts().unwrap_or_default();
@@ -1213,7 +1352,11 @@ pub fn prove_block_levels(
         times
             .stamps
             .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());
-        release_proved(&mut levels[0], &mut times.sizes);
+        levels[0].build.release_prover_half();
+        times.purges[2] = purge_filled.join().ok().flatten();
+        if let Some(card) = card_settle("level 1 proved") {
+            times.card.push(("level 1 proved".to_string(), card));
+        }
         if let Some(r) = resident_now() {
             times.resident.push(("level 1 proved", r));
         }
@@ -1225,16 +1368,30 @@ pub fn prove_block_levels(
             let execute_from = now();
             let (prepare, cells) = (pre.secs(), pre.prepared_cells());
             // Its stacks on the card while its execution runs on the host.
-            let committer =
-                scope.spawn(move || commit_level(pre, k + 1).map(|build| (build, now())));
+            let committer = scope.spawn(move || {
+                commit_level(pre, k + 1).map(|build| {
+                    (
+                        build,
+                        now(),
+                        card_settle(&format!("level {} committed", k + 1)),
+                    )
+                })
+            });
             let child = child_of(&plan, &levels[k - 1]);
             let arena = wlfm_leg_arena(&child, &proofs[k - 1])?;
             let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
             let filled = super::wlfm::execute_and_fill_unmerged(&program, &[arena], hasher)?;
             let executed = now();
-            let (build, committed) = committer
+            let mut program = program;
+            release_program(&mut program, &mut times.sizes);
+            let (build, committed, card) = committer
                 .join()
                 .map_err(|_| format!("level {}'s commit panicked", k + 1))??;
+            if let Some(card) = card {
+                times
+                    .card
+                    .push((format!("level {} committed", k + 1), card));
+            }
             times.builds.push(LevelBuild {
                 place: build.place(),
                 prepare,
@@ -1265,7 +1422,10 @@ pub fn prove_block_levels(
                 .stamps
                 .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());
             levels.push(Level { program, build });
-            release_proved(&mut levels[k], &mut times.sizes);
+            levels[k].build.release_prover_half();
+            if let Some(card) = card_settle(&format!("level {} proved", k + 1)) {
+                times.card.push((format!("level {} proved", k + 1), card));
+            }
             k += 1;
         }
         Ok(())

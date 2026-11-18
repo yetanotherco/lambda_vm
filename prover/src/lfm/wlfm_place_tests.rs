@@ -215,3 +215,38 @@ fn a_prebuilds_chip_prefixes_are_the_builds() {
         );
     }
 }
+
+/// The levels' card pad knob: unset or empty is no pad, a whole number of
+/// MiB is that many bytes, anything else is refused.
+#[test]
+fn the_card_pad_knob_reads_mib_and_refuses_nonsense() {
+    use super::levels::parse_card_pad;
+    assert_eq!(parse_card_pad(None), Ok(0));
+    assert_eq!(parse_card_pad(Some(" ")), Ok(0));
+    assert_eq!(parse_card_pad(Some("0")), Ok(0));
+    assert_eq!(parse_card_pad(Some("3072")), Ok(3072u64 << 20));
+    assert!(parse_card_pad(Some("3G")).is_err());
+    assert!(parse_card_pad(Some("-1")).is_err());
+}
+
+/// A prove over retired prepared stacks opens each group alone (its revive
+/// gets the room the next group's argue would hold beside it); over held or
+/// host stacks the groups open beside the next argue. The bytes are the same
+/// (the place tests above, and the stark block's retired-stacks test under
+/// both overlaps).
+#[test]
+fn a_retired_build_opens_each_group_alone() {
+    use stark::multilinear_block::PhaseBOverlap;
+    let program = super::b3l_wlfm_tests::honest();
+    for (place, want) in [
+        (StackPlace::Card, PhaseBOverlap::On),
+        (StackPlace::Host, PhaseBOverlap::On),
+        (StackPlace::CardRetired, PhaseBOverlap::Off),
+    ] {
+        let build = placed(&program, super::wlfm_tests::HASHER, WlfmFamily::B3, place);
+        assert!(
+            build.phase_b_overlap() == want,
+            "{place:?}: phase B's overlap"
+        );
+    }
+}

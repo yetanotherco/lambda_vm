@@ -806,7 +806,12 @@ fn rta_one_run(
         beside,
         build_beside,
     )
-    .unwrap_or_else(|e| panic!("{e}"));
+    .unwrap_or_else(|e| {
+        // The driver refused the block: said on its own line, then the test
+        // fails with it.
+        println!("RTA REFUSED: {e}");
+        panic!("{e}")
+    });
     let t = &run.times;
     let s = &run.base_stamps;
     println!(
@@ -918,11 +923,36 @@ fn rta_one_run(
     let (rss, hwm) = rss_gib();
     println!(
         "RTA MEMORY: peak reset {} · VmRSS {} · purge at the base's end {} · purge after the \
-         levels {} · now VmRSS {rss:.2} GiB · VmHWM {hwm:.2} GiB",
+         levels {} · purge after level 1's fill {} · purge at the start {} · now VmRSS {rss:.2} GiB · \
+         VmHWM {hwm:.2} GiB",
         t.peak_reset,
         points.join(" · "),
         purge(&t.purges[0]),
         purge(&t.purges[1]),
+        purge(&t.purges[2]),
+        purge(&t.purges[3]),
+    );
+    let cards: Vec<String> = t
+        .card
+        .iter()
+        .map(|(at, c)| {
+            format!(
+                "{at}: pool {:.2} GiB (peak before {:.2}) · free {:.2} of {:.2} GiB",
+                gib(c.pool_used),
+                gib(c.pool_peak),
+                gib(c.free),
+                gib(c.total)
+            )
+        })
+        .collect();
+    println!(
+        "RTA CARD: levels pad {:.2} GiB · {}",
+        gib(t.card_pad),
+        if cards.is_empty() {
+            "no card".to_string()
+        } else {
+            cards.join(" · ")
+        }
     );
     let end = t.levels.last().map_or(t.base, |l| l.end);
     println!(

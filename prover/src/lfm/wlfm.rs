@@ -1128,6 +1128,14 @@ impl WlfmBuild {
         (self, done)
     }
 
+    /// Phase B's overlap a streamed prove of this build takes.
+    pub(crate) fn phase_b_overlap(&self) -> multilinear_block::PhaseBOverlap {
+        match &self.stacks {
+            WlfmStacks::P1(s) => phase_b_overlap(s),
+            WlfmStacks::B3(s) => phase_b_overlap(s),
+        }
+    }
+
     /// The build with table `t`'s held prefix replaced: a test's forgery.
     pub(crate) fn with_chip_prefix(
         mut self,
@@ -1992,6 +2000,24 @@ pub(crate) fn prove_wlfm_traces_as(
     }
 }
 
+/// Phase B's overlap for a prove over `stacks`: each group's openings beside
+/// the next group's argue, unless a prepared stack is retired. A retired
+/// stack is revived inside its group's openings, and the ledger plans an
+/// opening beside an argue without it: at a real median's first group the
+/// argue and the opening held 23.9 of 25.09 GiB and the revive's encode was
+/// refused. Alone, a group's openings have the argue's room too. The same
+/// proof either way (the overlap moves no byte).
+fn phase_b_overlap<H: WhirHash>(stacks: &[WlfmPrepared<H>]) -> multilinear_block::PhaseBOverlap {
+    if stacks
+        .iter()
+        .any(|p| matches!(p.hold, PreparedHold::Retired(_)))
+    {
+        multilinear_block::PhaseBOverlap::Off
+    } else {
+        multilinear_block::PhaseBOverlap::On
+    }
+}
+
 /// [`prove_wlfm_traces_as`] under the build's hash `H`.
 /// What one W-LFM prove spent, by phase and by group: the host's table
 /// preparation, phase A (every group committed) and phase B (argued and
@@ -2253,7 +2279,7 @@ fn prove_traces_under<H: WhirHash>(
                 options.narrow,
                 options.upload_ahead,
             )
-            .map(|b| b.with_phase_b_overlap(multilinear_block::PhaseBOverlap::On))
+            .map(|b| b.with_phase_b_overlap(phase_b_overlap(stacks)))
         }
     }
     .map_err(|e| format!("{e:?}"))?;

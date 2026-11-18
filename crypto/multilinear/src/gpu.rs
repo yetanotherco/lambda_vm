@@ -243,10 +243,16 @@ fn note_device_error(counter: &AtomicU64, kind: &str, describe: impl FnOnce() ->
 /// counts it too).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn note_commit_error(what: &str, log_evals: usize, log_blowup: usize, err: &dyn core::fmt::Debug) {
+    // The ledger's reading beside the error: an encode whose promise the
+    // ledger refuses reports the same out-of-memory as a card that is full.
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let (reserved, budget) = (ledger_reserved(), reserve_budget());
     note_device_error(&COMMIT_ERRORS, "commit errors", || {
         format!(
             "device commit ({what}) of 2^{log_evals} evaluations at blowup 2^{log_blowup} \
-             failed: {err:?}; encoding on the host"
+             failed: {err:?}; encoding on the host (ledger {:.2} of {:.2} GiB promised)",
+            gib(reserved),
+            gib(budget)
         )
     });
 }
@@ -1068,6 +1074,26 @@ pub fn set_up_device() {
 
 #[cfg(not(feature = "cuda"))]
 pub fn set_up_device() {}
+
+/// The card settled: every stream's pending frees landed and the memory
+/// pool's unused blocks handed back (`math_cuda::device::drain_and_trim`),
+/// then `(pool bytes in use, the pool's peak since the last call, the
+/// device's free bytes, its total)`, the peak started again. `None` without
+/// a device.
+#[cfg(feature = "cuda")]
+pub fn settle_card() -> Option<(u64, u64, u64, u64)> {
+    let be = math_cuda::device::backend().ok()?;
+    let _ = math_cuda::device::drain_and_trim();
+    let (used, peak) = math_cuda::device::pool_used_bytes().ok()?;
+    let _ = math_cuda::device::reset_pool_high_water();
+    let (free, total) = be.device_mem_info()?;
+    Some((used, peak, free, total))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn settle_card() -> Option<(u64, u64, u64, u64)> {
+    None
+}
 
 /// What the ledger may promise in all; 0 without a device.
 #[cfg(feature = "cuda")]

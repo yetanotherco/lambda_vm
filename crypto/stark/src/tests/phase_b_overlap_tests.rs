@@ -33,6 +33,7 @@ use crate::multilinear_air::Uniforms;
 use crate::multilinear_block::{
     self, ArgueDeviation, BlockCommitted, BlockPrepared, BlockPreparedCheck, BlockProved,
     GroupOpened, GroupStamps, Narrowing, OverlapFaults, PhaseBOverlap, PhaseBReorder,
+    PreparedCommitment,
 };
 use crate::multilinear_table::{
     CommittedTable, TableLayout, TableStatement, batched::VerifierChecks, global_layout,
@@ -217,22 +218,50 @@ fn prove_block_reordered(
     fault: &dyn Fn(&mut BlockCommitted<'_, Fp, Ext>),
     reorder: Option<&PhaseBReorder<'_>>,
 ) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
+    prove_block_placed(config, overlap, order, faults, fault, reorder, false)
+}
+
+/// [`prove_block_reordered`] with the prepared stacks held (as committed) or,
+/// when `retired`, committed and let go ([`PreparedCommitment::Retired`]):
+/// each revived at its group's opening, after the group's own codewords have
+/// gone.
+fn prove_block_placed(
+    config: &ChainConfig,
+    overlap: PhaseBOverlap,
+    order: &[usize],
+    faults: OverlapFaults,
+    fault: &dyn Fn(&mut BlockCommitted<'_, Fp, Ext>),
+    reorder: Option<&PhaseBReorder<'_>>,
+    retired: bool,
+) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
     let airs = airs();
     let config = *config;
     let columns = prepared_columns();
-    let commitments = prepared_commitments(&columns, &config);
+    let mut commitments = prepared_commitments(&columns, &config);
+    let retired_stacks: Vec<multilinear::stacked_eval::RetiredStack<Fp>> = if retired {
+        commitments
+            .drain(..)
+            .map(|c| c.retire(TreeDrop::uniform(1), &config).expect("retires"))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let borrowed: Vec<Vec<&Mle<Fp>>> = columns
         .iter()
         .map(|c| multilinear::stacking::borrow(c))
         .collect();
     let prepared: Vec<BlockPrepared<'_, Fp, H>> = PREPARED
         .iter()
-        .zip(&commitments)
+        .enumerate()
         .zip(&borrowed)
-        .map(|(((group, tables), commitment), columns)| BlockPrepared {
+        .map(|((k, (group, tables)), columns)| BlockPrepared {
             group: *group,
             tables: tables.to_vec(),
-            commitment: commitment.into(),
+            commitment: if retired {
+                PreparedCommitment::Retired(&retired_stacks[k])
+            } else {
+                (&commitments[k]).into()
+            },
             columns,
         })
         .collect();
@@ -458,6 +487,45 @@ fn the_overlap_proves_the_bytes_of_one_group_at_a_time() {
                 s[order[0]].transition_reserved, 0,
                 "{argue:?} {what}: the first argue ran alone"
             );
+        }
+    }
+}
+
+/// ★ Retired prepared stacks move no byte: committed and let go, each revived
+/// at its group's opening after the group's own codewords have gone, the
+/// block proves the held stacks' proof (the bytes of [`BEFORE_THE_OVERLAP`])
+/// under either argue format, alone and beside the next group's argue, in
+/// group order and reversed, and it verifies; every group with a prepared
+/// stack stamps its revive.
+#[test]
+fn retired_prepared_stacks_prove_the_held_stacks_bytes() {
+    let n = SIZES.len();
+    let reversed: Vec<usize> = (0..n).rev().collect();
+    for (argue, before) in ARGUES.into_iter().zip(BEFORE_THE_OVERLAP) {
+        for (what, order, overlap) in [
+            ("alone", in_order(), PhaseBOverlap::Off),
+            ("beside, in order", in_order(), PhaseBOverlap::On),
+            ("beside, reversed", reversed.clone(), PhaseBOverlap::On),
+        ] {
+            let (proved, _) = prove_block_placed(
+                &config(argue),
+                overlap,
+                &order,
+                OverlapFaults::default(),
+                &|_| {},
+                None,
+                true,
+            );
+            let proved = proved.unwrap_or_else(|e| panic!("{argue:?} {what}: {e:?}"));
+            assert_eq!(digest(&proved), before, "{argue:?} {what}: the held bytes");
+            verify(argue, &proved).unwrap_or_else(|e| panic!("{argue:?} {what}: {e:?}"));
+            let s = stamps(&proved);
+            for (group, _) in PREPARED {
+                assert!(
+                    s[group].prepared_revive > 0.0,
+                    "{argue:?} {what}: group {group} revived its stack"
+                );
+            }
         }
     }
 }
