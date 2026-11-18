@@ -207,12 +207,17 @@ pub struct GroupStamps {
     /// Under the revive beside ([`BlockCommitted::with_prepared_revive_beside`]):
     /// the group's retired prepared stack came back beside its upload and
     /// argue, the revive's own seconds there, and of them the seconds the
-    /// driver waited for after the argue ended; or the plan (or a failed
-    /// revive) sent it back into the group's openings.
+    /// driver waited for after the argue ended; or the plan kept it in the
+    /// group's openings (`revive_planned_out`, with the plan's bytes: what it
+    /// needed, and what the budget had free), or a revive beside that failed
+    /// sent it back there (`revive_fell_back`).
     pub revive_beside: bool,
     pub revive_beside_secs: f64,
     pub revive_paid: f64,
+    pub revive_planned_out: bool,
     pub revive_fell_back: bool,
+    pub revive_plan_need: u64,
+    pub revive_plan_free: u64,
     /// Under [`PhaseBOverlap::On`], the group's openings ran alone because an
     /// earlier transition saw the card refuse a promise.
     pub serial_after_refusal: bool,
@@ -2936,34 +2941,50 @@ where
     draws: (u64, u64),
 }
 
-/// Under the revive beside, the most card bytes a group's argue is planned to
-/// promise a committed cell of the group, its columns' upload included: the
-/// W-LFM levels' real median peaked at 41 (level 1's group 1: 17.81 GiB
-/// promised through the argue for 465.7 M cells) and the others at 23–27.
-const REVIVE_BESIDE_ARGUE_BYTES_PER_CELL: u64 = 48;
+/// Under the revive beside, a group's argue is planned to promise at most this
+/// share (numerator, denominator) of the ledger's peak through the same group's
+/// phase-A commit (`GroupStamps::commit_reserved`): on the W-LFM levels' real
+/// median the argue's peak was 0.69–1.15 of it (level 1's group 1: 17.81 GiB
+/// against 15.47), so 5/4.
+const REVIVE_BESIDE_ARGUE_OVER_COMMIT: (u64, u64) = (5, 4);
+
+/// Under the revive beside, and at least this a committed cell of the group
+/// (the median's argues promised 21–41 bytes a cell).
+const REVIVE_BESIDE_ARGUE_BYTES_PER_CELL: u64 = 24;
 
 /// Under the revive beside, the card kept free beside the plan.
 const REVIVE_BESIDE_MARGIN_BYTES: u64 = 1 << 30;
 
-/// Whether the card holds `retired`'s revive beside the argue of a group of
-/// `cells` committed cells: what the ledger holds now, the revive's planned
-/// bytes ([`RetiredStack::revive_card_bytes`]), the argue's planned bound and
-/// a margin, within the ledger's budget. Without a card (no budget) the revive
-/// is the host's and always fits.
-fn revive_beside_fits<F>(retired: &RetiredStack<F>, config: &ChainConfig, cells: usize) -> bool
+/// Whether the card holds `retired`'s revive beside the argue of a group
+/// stamped `stamp` (its committed cells and its phase-A commit's peak), and the
+/// plan's bytes `(need, free)`: the revive's planned bytes
+/// ([`RetiredStack::revive_card_bytes`]), the argue's planned bound (the larger
+/// of [`REVIVE_BESIDE_ARGUE_OVER_COMMIT`] of the commit's peak and
+/// [`REVIVE_BESIDE_ARGUE_BYTES_PER_CELL`] a cell) and a margin, against what
+/// the ledger's budget has free now. Without a card (no budget) the revive is
+/// the host's and always fits.
+fn revive_beside_fits<F>(
+    retired: &RetiredStack<F>,
+    config: &ChainConfig,
+    stamp: &GroupStamps,
+) -> (bool, u64, u64)
 where
     F: IsFFTField + IsPrimeField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
 {
     let budget = multilinear::gpu::reserve_budget();
     if budget == 0 {
-        return true;
+        return (true, 0, 0);
     }
+    let (num, den) = REVIVE_BESIDE_ARGUE_OVER_COMMIT;
+    let argue = (stamp.commit_reserved.saturating_mul(num) / den)
+        .max((stamp.cells as u64).saturating_mul(REVIVE_BESIDE_ARGUE_BYTES_PER_CELL));
     let need = retired
         .revive_card_bytes(config)
-        .saturating_add((cells as u64).saturating_mul(REVIVE_BESIDE_ARGUE_BYTES_PER_CELL))
+        .saturating_add(argue)
         .saturating_add(REVIVE_BESIDE_MARGIN_BYTES);
-    multilinear::gpu::ledger_reserved().saturating_add(need) <= budget
+    let free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
+    (need <= free, need, free)
 }
 
 /// Whether `group`'s prepared stack was committed and let go: it is revived
@@ -3517,9 +3538,11 @@ where
                 None
             };
         let revive_from = revive_from.filter(|&(_, r)| {
-            let fits = overlap_faults.revive_refused_at != Some(p)
-                && revive_beside_fits(r, config, stamps[g].cells);
-            stamps[g].revive_fell_back |= !fits;
+            let (fits, need, free) = revive_beside_fits(r, config, &stamps[g]);
+            let fits = fits && overlap_faults.revive_refused_at != Some(p);
+            stamps[g].revive_planned_out = !fits;
+            stamps[g].revive_plan_need = need;
+            stamps[g].revive_plan_free = free;
             fits
         });
         let refusals_before_revive = revive_from.map(|_| phase_b_refusals());

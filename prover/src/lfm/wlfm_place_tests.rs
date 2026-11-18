@@ -346,8 +346,10 @@ fn a_prepared_stack_revived_beside_the_argue_proves_the_same_bytes_in_every_plac
                 );
                 let beside = groups.iter().filter(|s| s.revive_beside).count();
                 assert!(
-                    groups.iter().all(|s| !s.revive_fell_back),
-                    "{family:?} {place:?} {on}: nothing fell back"
+                    groups
+                        .iter()
+                        .all(|s| !s.revive_fell_back && !s.revive_planned_out),
+                    "{family:?} {place:?} {on}: nothing fell back or was planned out"
                 );
                 if on && place == StackPlace::CardRetired {
                     assert!(beside > 0, "{family:?}: a retired stack revived beside");
@@ -394,13 +396,14 @@ fn a_refused_or_failed_revive_beside_falls_back_to_the_same_bytes() {
         "two groups revived beside, so the latch has a later one ({revived:?})"
     );
     let first = revived[0];
-    for (what, faults) in [
+    for (what, faults, planned) in [
         (
             "the plan refuses",
             OverlapFaults {
                 revive_refused_at: Some(first),
                 ..Default::default()
             },
+            true,
         ),
         (
             "the revive fails",
@@ -408,13 +411,16 @@ fn a_refused_or_failed_revive_beside_falls_back_to_the_same_bytes() {
                 revive_fails_at: Some(first),
                 ..Default::default()
             },
+            false,
         ),
     ] {
         let (got, groups) = streamed_with(&program, &build, &arenas, true, faults)
             .unwrap_or_else(|e| panic!("{what}: {e}"));
         assert!(got == want, "{what}: the same bytes");
         assert!(
-            groups[first].revive_fell_back && !groups[first].revive_beside,
+            !groups[first].revive_beside
+                && groups[first].revive_planned_out == planned
+                && groups[first].revive_fell_back != planned,
             "{what}: group {first} revived in its openings"
         );
     }
