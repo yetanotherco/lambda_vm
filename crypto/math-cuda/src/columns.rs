@@ -141,6 +141,13 @@ impl TableUpload<'_> {
     }
 }
 
+/// A test's fault in [`DeviceColumns::upload_row_major`]: column 0, row 0
+/// moved by one after the transpose, so a check that the card's columns are
+/// the host's can be shown to see it. The production prover never sets it.
+#[doc(hidden)]
+pub static ROW_MAJOR_FAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The columns themselves, laid end to end in one allocation.
 pub struct DeviceColumns {
     stream: Arc<CudaStream>,
@@ -184,6 +191,96 @@ impl DeviceColumns {
             spans,
             _room: room,
         })
+    }
+
+    /// Tables held row-major on the host (`(words, width, rows)`, `rows ×
+    /// width` words each), put on the card as their columns: each table
+    /// crosses the bus as it is held, into a staging buffer, and is transposed
+    /// there into the run its columns take — the same words, at the same
+    /// offsets, as its columns uploaded one by one. `None` as for
+    /// [`Self::upload`], or when a table's words are not `rows × width`.
+    pub fn upload_row_major(tables: &[(&[u64], usize, usize)]) -> Option<Self> {
+        if tables.is_empty()
+            || tables
+                .iter()
+                .any(|&(words, width, rows)| width == 0 || rows == 0 || words.len() != width * rows)
+        {
+            return None;
+        }
+        let total: usize = tables.iter().map(|t| t.0.len()).sum();
+        let staging = tables.iter().map(|t| t.0.len()).max().unwrap_or(0);
+        let be = backend().ok()?;
+        let Some(room) = be.reserve(total as u64 * 8) else {
+            crate::device::note_device_fallback();
+            return None;
+        };
+        let Some(_staging_room) = be.reserve(staging as u64 * 8) else {
+            crate::device::note_device_fallback();
+            return None;
+        };
+        crate::argue_probe::note_device(crate::argue_probe::Surface::Columns, total as u64 * 8);
+        let stream = be.next_stream();
+        // SAFETY: every element is written by the transposes below.
+        let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, total) }.ok()?;
+        // SAFETY: each table's words are copied in before they are read.
+        let mut rows_in = unsafe { alloc_or_trim::<u64>(&stream, staging) }.ok()?;
+        // The transpose kernel's grid covers this many rows a launch.
+        const ROWS_A_LAUNCH: usize = 65535 * 32;
+        let mut spans = Vec::with_capacity(tables.iter().map(|t| t.1).sum());
+        let mut at = 0usize;
+        for &(words, width, rows) in tables {
+            let mut slab = rows_in.slice_mut(0..words.len());
+            crate::pinned::note_upload(words.as_ptr().cast(), words.len() * 8);
+            stream.memcpy_htod(words, &mut slab).ok()?;
+            let mut first = 0usize;
+            while first < rows {
+                let n = (rows - first).min(ROWS_A_LAUNCH);
+                let src = rows_in.slice(first * width..(first + n) * width);
+                let end = at + (width - 1) * rows + first + n;
+                let mut dst = buffer.slice_mut(at + first..end);
+                crate::lde::launch_transpose_tiles(
+                    &stream,
+                    be,
+                    &src,
+                    &mut dst,
+                    n,
+                    width,
+                    rows as u64,
+                )
+                .ok()?;
+                first += n;
+            }
+            spans.extend((0..width).map(|c| (at + c * rows, rows)));
+            at += words.len();
+        }
+        if ROW_MAJOR_FAULT.load(std::sync::atomic::Ordering::Relaxed) {
+            // A test's fault: column 0, row 0 moved by one after the transpose.
+            let mut one = [0u64; 1];
+            stream.memcpy_dtoh(&buffer.slice(0..1), &mut one).ok()?;
+            one[0] = one[0].wrapping_add(1);
+            stream.memcpy_htod(&one, &mut buffer.slice_mut(0..1)).ok()?;
+        }
+        stream.synchronize().ok()?;
+        drop(rows_in);
+        Some(Self {
+            stream,
+            buffer: Arc::new(buffer),
+            spans,
+            _room: room,
+        })
+    }
+
+    /// Every column back on the host, each in its own vector, in upload order:
+    /// what a prover that keeps the host's copy after a card-side transpose
+    /// reads ([`Self::upload_row_major`]).
+    pub fn download_columns(&self) -> Result<Vec<Vec<u64>>> {
+        let columns = self
+            .spans
+            .iter()
+            .map(|&(at, len)| self.stream.clone_dtoh(&self.buffer.slice(at..at + len)))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.stream.synchronize()?;
+        Ok(columns)
     }
 
     /// A new store of `columns` of `src` (copied on the card, in that order)

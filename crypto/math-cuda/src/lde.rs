@@ -401,7 +401,7 @@ fn launch_keccak_base_row_major_row_pair_range(
 /// contiguous row-major elements; `dst` must reach `(cols - 1) * out_stride +
 /// rows`. No synchronize — callers on the same stream are ordered; other
 /// streams must synchronize themselves.
-fn launch_transpose_tiles(
+pub(crate) fn launch_transpose_tiles(
     stream: &CudaStream,
     be: &Backend,
     src: &CudaView<'_, u64>,

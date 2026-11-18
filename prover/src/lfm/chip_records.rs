@@ -425,6 +425,43 @@ pub(crate) fn host_columns(
 /// A table's prefix packed narrow from its columns (every one the table's
 /// height): canonical words, each column at the bytes its largest word needs,
 /// the columns in parallel. `None` when the columns are not one height.
+/// [`pack_prefix`] of a table held row-major (`group`, the compiler's
+/// layout): each column read where it lies, every `width`-th word. The same
+/// packed prefix as the table's columns gathered and packed.
+pub(crate) fn pack_prefix_rows(group: &super::compiler::ColumnGroup) -> Option<NarrowColumns> {
+    let (width, rows) = (group.width, group.padded_rows);
+    if group.data.len() != width * rows {
+        return None;
+    }
+    let pack_one = |column: usize| -> (u8, Vec<u8>) {
+        let words: Vec<u64> = (0..rows)
+            .map(|r| group.data[r * width + column].canonical())
+            .collect();
+        let max = words.iter().copied().max().unwrap_or(0);
+        let w = multilinear_width(max);
+        let mut bytes = Vec::with_capacity(rows * w as usize);
+        for word in &words {
+            bytes.extend_from_slice(&word.to_le_bytes()[..w as usize]);
+        }
+        (w, bytes)
+    };
+    #[cfg(feature = "parallel")]
+    let packed: Vec<(u8, Vec<u8>)> = {
+        use rayon::prelude::*;
+        (0..width).into_par_iter().map(pack_one).collect()
+    };
+    #[cfg(not(feature = "parallel"))]
+    let packed: Vec<(u8, Vec<u8>)> = (0..width).map(pack_one).collect();
+    let total: usize = packed.iter().map(|(_, b)| b.len()).sum();
+    let mut data = multilinear::pinned::with_pinned(total, || Vec::with_capacity(total));
+    let mut widths = Vec::with_capacity(packed.len());
+    for (w, bytes) in packed {
+        widths.push(w);
+        data.extend_from_slice(&bytes);
+    }
+    NarrowColumns::from_parts(rows, widths, data)
+}
+
 pub(crate) fn pack_prefix(columns: &[&[FE]]) -> Option<NarrowColumns> {
     let rows = columns.first().map_or(0, |c| c.len());
     if columns.iter().any(|c| c.len() != rows) {

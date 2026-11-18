@@ -226,6 +226,8 @@ mod p1w16_proof_tests;
 mod p1w16_socket_tests;
 #[cfg(test)]
 mod per_table_aggregator_tests;
+#[cfg(all(test, feature = "parallel"))]
+mod prepare_card_tests;
 #[cfg(test)]
 mod preprocessed_tests;
 #[cfg(all(test, feature = "parallel"))]

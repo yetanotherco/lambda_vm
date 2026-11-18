@@ -836,6 +836,11 @@ pub struct WlfmBuild {
     chip_prefixes: Vec<Option<std::sync::Arc<multilinear::narrow::NarrowColumns>>>,
     /// The seconds [`Self::hold_chip_prefixes`] took.
     chip_prefix_secs: f64,
+    /// Under [`prepare_on_card`], the commit's card-side transpose: the
+    /// seconds the tables took to cross the bus and transpose, and the
+    /// columns to come back to the host. `None` when the stacks were
+    /// gathered on the host.
+    card_transpose: Option<(f64, f64)>,
 }
 
 /// The prover's prepared stacks, under the build's family.
@@ -984,6 +989,192 @@ fn commit_under<H: WhirHash>(
         .collect()
 }
 
+/// A prebuild's stacks as they reach the commit: their columns gathered on
+/// the host, or their tables row-major for the card to transpose.
+enum Prepared {
+    Columns(Vec<GroupStack>),
+    Rows(Vec<RowStack>),
+}
+
+/// [`commit_under`] for either form of the stacks; `transposed` gets the
+/// card-side transpose's seconds when row-major stacks went that way
+/// ([`commit_rows_under`]).
+fn commit_prepared<H: WhirHash>(
+    stacks: Prepared,
+    config: &ChainConfig,
+    place: StackPlace,
+    transposed: &mut Option<(f64, f64)>,
+) -> Result<Vec<WlfmPrepared<H>>, String> {
+    match stacks {
+        Prepared::Columns(stacks) => commit_under::<H>(stacks, config, place),
+        Prepared::Rows(rows) => commit_rows_under::<H>(rows, config, place, transposed),
+    }
+}
+
+/// [`commit_under`] for stacks held row-major. On the host place, or when the
+/// card declines a stack's tables, the stack's columns are gathered on the
+/// host as [`prepare_wlfm`] gathers them otherwise; on a card place its tables
+/// cross the bus row-major and are transposed on the card
+/// ([`multilinear::gpu::upload_row_major`]), the stack commits from the card's
+/// columns ([`crate::block_whir::commit_group_resident`]), and the host keeps
+/// those columns read back. The same columns either way, so the same roots,
+/// prefixes and proofs.
+fn commit_rows_under<H: WhirHash>(
+    rows: Vec<RowStack>,
+    config: &ChainConfig,
+    place: StackPlace,
+    transposed: &mut Option<(f64, f64)>,
+) -> Result<Vec<WlfmPrepared<H>>, String> {
+    if place == StackPlace::Host {
+        let stacks = rows.into_iter().map(RowStack::gathered).collect();
+        return commit_under::<H>(stacks, config, place);
+    }
+    // ⛔ THE CARD, as `commit_under` holds it.
+    let _card = super::device_permit::hold_labeled("build_artifacts");
+    let drop = crate::block_whir::BlockOptions::production().drop_levels;
+    let (mut up, mut down) = (0.0f64, 0.0f64);
+    let mut on_card = false;
+    let mut prepared = Vec::with_capacity(rows.len());
+    for stack in rows {
+        let t = std::time::Instant::now();
+        let tables: Vec<(&[FieldElement<F>], usize, usize)> = stack
+            .row_major
+            .iter()
+            .map(|g| (g.data.as_slice(), g.width, g.padded_rows))
+            .collect();
+        let store = multilinear::gpu::upload_row_major(&tables);
+        up += t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let host = store
+            .as_ref()
+            .and_then(|store| store.download_columns::<F>());
+        down += t.elapsed().as_secs_f64();
+        let p = match (store, host) {
+            (Some(store), Some(columns)) => {
+                on_card = true;
+                let (group, tables) = (stack.group, stack.tables);
+                let stack = GroupStack {
+                    group,
+                    tables,
+                    columns,
+                };
+                crate::block_whir::commit_group_resident::<H>(stack, config, &store)
+            }
+            _ => commit_group::<H>(stack.gathered(), config),
+        }
+        .map_err(|e| format!("{e:?}"))?;
+        prepared.push(match place {
+            StackPlace::CardRetired => WlfmPrepared::retired(p, drop, config)?,
+            _ => WlfmPrepared::held(p),
+        });
+    }
+    if on_card {
+        *transposed = Some((up, down));
+    }
+    Ok(prepared)
+}
+
+/// A prepared stack whose tables are held row-major, as the compiler left
+/// them ([`prepare_on_card`]): the stack the card transposes at the commit.
+pub(crate) struct RowStack {
+    group: usize,
+    /// As [`GroupStack`]'s: `(position, AIR index, prefix length)`.
+    tables: Vec<(usize, usize, usize)>,
+    /// Each table's columns, row-major, in the stack's table order.
+    row_major: Vec<ColumnGroup>,
+}
+
+impl RowStack {
+    /// Table `table`'s row-major group, if the stack holds it.
+    fn table(&self, table: usize) -> Option<&ColumnGroup> {
+        self.tables
+            .iter()
+            .position(|&(position, _, _)| position == table)
+            .map(|i| &self.row_major[i])
+    }
+
+    /// The stack with its columns gathered on the host, as [`prepare_wlfm`]
+    /// gathers them otherwise.
+    fn gathered(self) -> GroupStack {
+        GroupStack {
+            group: self.group,
+            tables: self.tables,
+            columns: self.row_major.iter().flat_map(group_columns).collect(),
+        }
+    }
+}
+
+/// [`crate::block_whir::group_stacks`] for tables held row-major: the same
+/// groups, in the same table order.
+fn row_stacks(
+    tables: Vec<(usize, ColumnGroup)>,
+    groups: &[Vec<u32>],
+) -> Result<Vec<RowStack>, String> {
+    let mut by_table: Vec<Option<ColumnGroup>> = Vec::new();
+    for (table, group) in tables {
+        if by_table.len() <= table {
+            by_table.resize_with(table + 1, || None);
+        }
+        by_table[table] = Some(group);
+    }
+    let mut stacks = Vec::new();
+    let mut position = 0usize;
+    for (g, group) in groups.iter().enumerate() {
+        let mut stack = RowStack {
+            group: g,
+            tables: Vec::new(),
+            row_major: Vec::new(),
+        };
+        for &table in group {
+            let table = table as usize;
+            if let Some(rows) = by_table.get_mut(table).and_then(Option::take) {
+                stack.tables.push((position, table, rows.width));
+                stack.row_major.push(rows);
+            }
+            position += 1;
+        }
+        if !stack.tables.is_empty() {
+            stacks.push(stack);
+        }
+    }
+    if let Some(table) = by_table.iter().position(Option::is_some) {
+        return Err(format!("prepared table {table} is in no group"));
+    }
+    Ok(stacks)
+}
+
+/// `LAMBDA_VM_LEVELS_PREPARE_ON_CARD=1`: a W-LFM build's host part keeps its
+/// tables row-major, as the compiler left them, where it otherwise gathers
+/// them into columns; the commit puts them on the card as they are, the card
+/// transposes them into the columns it commits, and the host keeps those
+/// columns read back ([`commit_rows_under`]). The same columns, so the same
+/// roots, prefixes and proofs. Off by default (and for any word but `1`); read
+/// once a process.
+pub const PREPARE_ON_CARD_ENV: &str = "LAMBDA_VM_LEVELS_PREPARE_ON_CARD";
+
+std::thread_local! {
+    /// A test's [`prepare_on_card`] on this thread.
+    static PREPARE_ON_CARD_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`prepare_on_card`] forced on or off on this thread (`None`
+/// restores the knob).
+#[doc(hidden)]
+pub fn set_prepare_on_card_for_test(on: Option<bool>) {
+    PREPARE_ON_CARD_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`PREPARE_ON_CARD_ENV`] is on (or this thread's test override).
+pub fn prepare_on_card() -> bool {
+    if let Some(on) = PREPARE_ON_CARD_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(PREPARE_ON_CARD_ENV).ok().as_deref())
+    })
+}
+
 /// What a build keeps of each prepared commitment, under any hash.
 fn stack_of<H: WhirHash>(p: &WlfmPrepared<H>) -> WlfmStack {
     WlfmStack {
@@ -1004,6 +1195,20 @@ impl WlfmBuild {
         self.stacks.clear();
         self.chip_prefixes.clear();
         self
+    }
+
+    /// Every prepared stack's columns on the host, in stack order.
+    pub(crate) fn prepared_columns(&self) -> Vec<Vec<FieldElement<F>>> {
+        fn of<H: WhirHash>(stacks: &[WlfmPrepared<H>]) -> Vec<Vec<FieldElement<F>>> {
+            stacks
+                .iter()
+                .flat_map(|p| p.columns.iter().map(|c| c.evals().to_vec()))
+                .collect()
+        }
+        match &self.stacks {
+            WlfmStacks::P1(s) => of(s),
+            WlfmStacks::B3(s) => of(s),
+        }
     }
 
     /// The prefixes [`Self::hold_chip_prefixes`] packed, by table position.
@@ -1099,6 +1304,13 @@ impl WlfmBuild {
     /// The seconds [`Self::hold_chip_prefixes`] took (0 before it ran).
     pub fn chip_prefix_secs(&self) -> f64 {
         self.chip_prefix_secs
+    }
+
+    /// Under [`prepare_on_card`], the commit's card-side transpose seconds:
+    /// `(up and transposed, back on the host)`; `None` when the stacks were
+    /// gathered on the host.
+    pub fn card_transpose(&self) -> Option<(f64, f64)> {
+        self.card_transpose
     }
 
     /// The prover's half let go: the prepared stacks (their columns and
@@ -1292,6 +1504,10 @@ pub struct WlfmPrebuild {
     artifacts: WlfmArtifacts,
     /// Under [`WlfmPrep::Stacked`], the stacks to commit; `None` otherwise.
     stacks: Option<Vec<GroupStack>>,
+    /// Under [`prepare_on_card`], the stacks to commit as their tables are
+    /// held, row-major, for the card to transpose at the commit; `stacks` is
+    /// `None` then.
+    row_stacks: Option<Vec<RowStack>>,
     secs: f64,
     /// [`prepare_wlfm`]'s seconds by part: the tables' row-major groups, their
     /// columns, the stacks.
@@ -1311,11 +1527,20 @@ impl WlfmPrebuild {
     /// The prepared cells the commit takes: every stack's columns at their
     /// heights.
     pub fn prepared_cells(&self) -> u64 {
-        self.stacks
+        let columns: u64 = self
+            .stacks
             .iter()
             .flatten()
             .map(|s| s.columns.iter().map(|c| c.len() as u64).sum::<u64>())
-            .sum()
+            .sum();
+        let rows: u64 = self
+            .row_stacks
+            .iter()
+            .flatten()
+            .flat_map(|s| &s.row_major)
+            .map(|g| (g.width * g.padded_rows) as u64)
+            .sum();
+        columns + rows
     }
 
     /// The seconds [`prepare_wlfm`] took.
@@ -1333,6 +1558,18 @@ impl WlfmPrebuild {
         let mut prefixes = vec![None; refs.len()];
         for (table, air) in refs.iter().enumerate() {
             if super::chip_records::ChipKind::of_air(air.name()).is_none() {
+                continue;
+            }
+            if let Some(rows) = &self.row_stacks {
+                let group = rows
+                    .iter()
+                    .find_map(|stack| stack.table(table))
+                    .ok_or_else(|| {
+                        format!("{}: no prefix columns for table {table}", air.name())
+                    })?;
+                let packed = super::chip_records::pack_prefix_rows(group)
+                    .ok_or_else(|| format!("{}: a prefix not one height", air.name()))?;
+                prefixes[table] = Some(std::sync::Arc::new(packed));
                 continue;
             }
             let columns: Option<Vec<&[FieldElement<F>]>> = match &self.stacks {
@@ -1379,23 +1616,34 @@ impl WlfmPrebuild {
         let WlfmPrebuild {
             mut artifacts,
             stacks,
+            row_stacks,
             secs,
             split: _,
             chip_prefixes,
             chip_prefix_secs,
         } = self;
         let family = artifacts.family;
+        let mut card_transpose = None;
+        let stacks = match (stacks, row_stacks) {
+            (Some(stacks), _) => Some(Prepared::Columns(stacks)),
+            (None, Some(rows)) => Some(Prepared::Rows(rows)),
+            (None, None) => None,
+        };
         let committed = match stacks {
             None => WlfmStacks::empty(family),
             Some(stacks) => {
                 let committed = match family {
-                    WlfmFamily::P1 => {
-                        WlfmStacks::P1(commit_under::<WlfmHash>(stacks, &artifacts.config, place)?)
-                    }
-                    WlfmFamily::B3 => WlfmStacks::B3(commit_under::<WlfmB3Hash>(
+                    WlfmFamily::P1 => WlfmStacks::P1(commit_prepared::<WlfmHash>(
                         stacks,
                         &artifacts.config,
                         place,
+                        &mut card_transpose,
+                    )?),
+                    WlfmFamily::B3 => WlfmStacks::B3(commit_prepared::<WlfmB3Hash>(
+                        stacks,
+                        &artifacts.config,
+                        place,
+                        &mut card_transpose,
                     )?),
                 };
                 let views: Vec<WlfmStack> = match &committed {
@@ -1420,6 +1668,7 @@ impl WlfmPrebuild {
             released: false,
             chip_prefixes,
             chip_prefix_secs,
+            card_transpose,
         })
     }
 }
@@ -1534,7 +1783,10 @@ pub fn prepare_wlfm(
             .collect()
     };
     let columns_from = std::time::Instant::now();
-    let columns: Vec<PreparedColumns> = if prepare_par() {
+    let rows_kept = prep != WlfmPrep::Evaluated && prepare_on_card();
+    let columns: Vec<PreparedColumns> = if rows_kept {
+        Vec::new()
+    } else if prepare_par() {
         use rayon::prelude::*;
         groups
             .par_iter()
@@ -1585,6 +1837,7 @@ pub fn prepare_wlfm(
         return Ok(WlfmPrebuild {
             artifacts,
             stacks: None,
+            row_stacks: None,
             secs: t.elapsed().as_secs_f64(),
             split: [groups_secs, columns_secs, 0.0],
             chip_prefixes: Vec::new(),
@@ -1592,7 +1845,23 @@ pub fn prepare_wlfm(
         });
     }
     let stacks_from = std::time::Instant::now();
-    let stacks = group_stacks(columns, &group_lists).map_err(|e| format!("{e:?}"))?;
+    let (stacks, row_stacks) = if rows_kept {
+        // Each table's group as the compiler left it (a chunk or a BLAKE3
+        // round group already owned, a whole chip's copied once).
+        let tables: Vec<(usize, ColumnGroup)> = groups
+            .into_iter()
+            .zip(&counts)
+            .enumerate()
+            .filter(|&(_, (_, &count))| count > 0)
+            .map(|(table, (group, _))| (table, group.into_owned()))
+            .collect();
+        (None, Some(row_stacks(tables, &group_lists)?))
+    } else {
+        (
+            Some(group_stacks(columns, &group_lists).map_err(|e| format!("{e:?}"))?),
+            None,
+        )
+    };
     let stacks_secs = stacks_from.elapsed().as_secs_f64();
     let artifacts = WlfmArtifacts {
         rate,
@@ -1616,7 +1885,8 @@ pub fn prepare_wlfm(
     };
     Ok(WlfmPrebuild {
         artifacts,
-        stacks: Some(stacks),
+        stacks,
+        row_stacks,
         secs: t.elapsed().as_secs_f64(),
         split: [groups_secs, columns_secs, stacks_secs],
         chip_prefixes: Vec::new(),

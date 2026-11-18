@@ -4515,6 +4515,51 @@ impl ResidentColumns {
     pub fn download(&self) -> Option<Vec<Vec<u64>>> {
         self.0.download().ok()
     }
+
+    /// Every column back on the host as Goldilocks words, each in its own
+    /// vector, in upload order: the host's copy of a store transposed on the
+    /// card ([`upload_row_major`]).
+    pub fn download_columns<F>(&self) -> Option<Vec<Vec<math::field::element::FieldElement<F>>>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        use math::field::goldilocks::GoldilocksField;
+
+        if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
+            return None;
+        }
+        let columns = self.0.download_columns().ok()?;
+        Some(
+            columns
+                .into_iter()
+                .map(|mut words| {
+                    let (ptr, len, cap) = (words.as_mut_ptr(), words.len(), words.capacity());
+                    std::mem::forget(words);
+                    // SAFETY: `F == GoldilocksField`, a transparent wrapper over
+                    // `u64`: the same size and alignment, so the allocation is
+                    // the vector's own.
+                    unsafe {
+                        Vec::from_raw_parts(
+                            ptr as *mut math::field::element::FieldElement<F>,
+                            len,
+                            cap,
+                        )
+                    }
+                })
+                .collect(),
+        )
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl ResidentColumns {
+    /// Never: there is no store without a device.
+    pub fn download_columns<F>(&self) -> Option<Vec<Vec<math::field::element::FieldElement<F>>>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
 }
 
 impl std::fmt::Debug for ResidentColumns {
@@ -4557,6 +4602,57 @@ where
     F: math::field::traits::IsField + 'static,
 {
     None
+}
+
+/// Tables held row-major (`(words, width, rows)`, `rows × width` words each)
+/// put on the card as their columns, transposed there
+/// (`math_cuda::columns::DeviceColumns::upload_row_major`): the store
+/// [`upload_columns`] makes of the same tables' columns. `None` when there is
+/// no device, the field is not Goldilocks, or the card will not promise the
+/// room.
+#[cfg(feature = "cuda")]
+pub fn upload_row_major<F>(
+    tables: &[(&[math::field::element::FieldElement<F>], usize, usize)],
+) -> Option<ResidentColumns>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    use math::field::goldilocks::GoldilocksField;
+
+    if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
+    let raw: Vec<(&[u64], usize, usize)> = tables
+        .iter()
+        .map(|&(words, width, rows)| {
+            let words =
+                unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u64, words.len()) };
+            (words, width, rows)
+        })
+        .collect();
+    math_cuda::columns::DeviceColumns::upload_row_major(&raw).map(ResidentColumns)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn upload_row_major<F>(
+    _tables: &[(&[math::field::element::FieldElement<F>], usize, usize)],
+) -> Option<ResidentColumns>
+where
+    F: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+/// Tests only: [`upload_row_major`]'s transposed column 0 moved by one at row
+/// 0, so a check that the card's columns are the host's can be shown to see
+/// it. Process-wide: a test that sets it holds its suite's lock.
+#[doc(hidden)]
+pub fn fault_row_major_for_tests(on: bool) {
+    #[cfg(feature = "cuda")]
+    math_cuda::columns::ROW_MAJOR_FAULT.store(on, Ordering::Relaxed);
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
 }
 
 /// A table's columns as they go to the card: field elements, packed narrow

@@ -3816,7 +3816,18 @@ pub(crate) fn commit_group<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, false)
+    commit_group_where::<H>(stack, config, false, None)
+}
+
+/// [`commit_group`] over columns the card already holds, in the stack's
+/// column order (`store`, from its first column), beside the host's copy of
+/// them in `stack`: the same roots, with no upload of its own.
+pub(crate) fn commit_group_resident<H: multilinear::whir_hash::WhirHash>(
+    stack: GroupStack,
+    config: &multilinear::whir_chain::ChainConfig,
+    store: &multilinear::gpu::ResidentColumns,
+) -> Result<GroupPrepared<H>, Error> {
+    commit_group_where::<H>(stack, config, false, Some(store))
 }
 
 /// [`commit_group`] on the host, whatever a card would do
@@ -3826,13 +3837,14 @@ pub(crate) fn commit_group_on_host<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
-    commit_group_where::<H>(stack, config, true)
+    commit_group_where::<H>(stack, config, true, None)
 }
 
 fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
     on_host: bool,
+    store: Option<&multilinear::gpu::ResidentColumns>,
 ) -> Result<GroupPrepared<H>, Error> {
     let shapes = stack.shapes();
     let group = stack.group;
@@ -3850,7 +3862,10 @@ fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
         )
     } else {
         multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
-            layout, &borrowed, None, config,
+            layout,
+            &borrowed,
+            store.map(|store| (store, 0)),
+            config,
         )
     }
     .map_err(|e| Error::Prover(format!("group {group}: {e:?}")))?;
