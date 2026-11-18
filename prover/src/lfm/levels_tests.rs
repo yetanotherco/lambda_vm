@@ -865,7 +865,7 @@ fn rta_one_run(
     let list = |xs: Vec<String>| xs.join(" ");
     println!(
         "RTA LEVEL1 LANDING: setup {:.3}s · front at {:.3}s (wave {:.3}s) · base end {:.3}s · arrivals {} · \
-         landed {}",
+         landed {} · bucketed waves {}",
         landing.setup,
         landing.front.0,
         landing.front.1,
@@ -884,6 +884,7 @@ fn rta_one_run(
                 .map(|(i, at, secs)| format!("{i}@{at:.3}+{secs:.3}"))
                 .collect()
         ),
+        super::levels::bucket_waves(),
     );
     let (lean, lean_wait) = t.lean_beside.unwrap_or_default();
     println!(

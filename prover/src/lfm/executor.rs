@@ -1660,6 +1660,87 @@ pub struct StreamedExecution<'p, 'a, H: LfmHasher + Sync> {
     /// compression's record as its wave writes it, with its record row, until
     /// [`Self::take_lean_tap`] takes them; `None` otherwise.
     lean_tap: Option<Vec<(u32, B3lValues)>>,
+    /// Under [`Self::new_pieced_bucketed`], the instructions sorted by the
+    /// groups they wait for ([`WaveBuckets`]): a wave walks the buckets its
+    /// landing completes, not the whole program. `None`: every wave filters
+    /// every instruction.
+    buckets: Option<WaveBuckets>,
+}
+
+/// A streamed execution's instructions bucketed by their `need` — the set of
+/// groups each waits for — kept as positions into the schedule's per-level
+/// lists, in level order and, within a level, in the level's own order. A
+/// wave runs exactly the buckets whose set has just landed whole, merged back
+/// into each level's order: the instructions `keep` would pick, in the order
+/// it would pick them.
+struct WaveBuckets {
+    /// Each bucket's set of groups.
+    masks: Vec<u64>,
+    /// Per bucket: its hash rows as `(level, start, len)` runs into `hash_pos`,
+    /// and their positions within `hashes_at(level)`.
+    hash_runs: Vec<Vec<(u32, u32, u32)>>,
+    hash_pos: Vec<Vec<u32>>,
+    /// Per bucket: the same for its other instructions (`others_at(level)`).
+    other_runs: Vec<Vec<(u32, u32, u32)>>,
+    other_pos: Vec<Vec<u32>>,
+}
+
+impl WaveBuckets {
+    fn build(levels: &LevelSchedule, need: &[u64]) -> Self {
+        let mut index: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+        let mut b = Self {
+            masks: Vec::new(),
+            hash_runs: Vec::new(),
+            hash_pos: Vec::new(),
+            other_runs: Vec::new(),
+            other_pos: Vec::new(),
+        };
+        let bucket =
+            |b: &mut Self, index: &mut std::collections::BTreeMap<u64, usize>, mask: u64| {
+                *index.entry(mask).or_insert_with(|| {
+                    b.masks.push(mask);
+                    b.hash_runs.push(Vec::new());
+                    b.hash_pos.push(Vec::new());
+                    b.other_runs.push(Vec::new());
+                    b.other_pos.push(Vec::new());
+                    b.masks.len() - 1
+                })
+            };
+        let push = |runs: &mut Vec<(u32, u32, u32)>, pos: &mut Vec<u32>, d: u32, p: u32| {
+            match runs.last_mut() {
+                Some(run) if run.0 == d => run.2 += 1,
+                _ => runs.push((d, pos.len() as u32, 1)),
+            }
+            pos.push(p);
+        };
+        for d in 0..levels.levels() {
+            for (p, &row) in levels.hashes_at(d).iter().enumerate() {
+                let k = bucket(&mut b, &mut index, need[levels.instr_of_row(row)]);
+                push(&mut b.hash_runs[k], &mut b.hash_pos[k], d as u32, p as u32);
+            }
+            for (p, &i) in levels.others_at(d).iter().enumerate() {
+                let k = bucket(&mut b, &mut index, need[i as usize]);
+                push(
+                    &mut b.other_runs[k],
+                    &mut b.other_pos[k],
+                    d as u32,
+                    p as u32,
+                );
+            }
+        }
+        b
+    }
+
+    /// The buckets a wave runs: every group of theirs landed, and (after the
+    /// first wave) one of them only now.
+    fn picked(&self, landed: u64, before: Option<u64>) -> Vec<usize> {
+        (0..self.masks.len())
+            .filter(|&k| {
+                let n = self.masks[k];
+                n & !landed == 0 && before.is_none_or(|b| n & !b != 0)
+            })
+            .collect()
+    }
 }
 
 impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
@@ -1689,7 +1770,16 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             |arena: ArenaId, _index: u32| group_of.get(arena as usize).map_or(0, |&g| 1u64 << g);
         let need = Self::need_of(program, hint_group);
         let groups = group_of.iter().fold(0u64, |a, &g| a | (1u64 << g));
-        Self::start(program, hasher, need, group_of, Vec::new(), groups, false)
+        Self::start(
+            program,
+            hasher,
+            need,
+            group_of,
+            Vec::new(),
+            groups,
+            false,
+            false,
+        )
     }
 
     /// A streamed execution of `program` whose arenas land in PIECES: each
@@ -1710,6 +1800,20 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         Self::new_pieced_tapped(program, pieces, hasher, false)
     }
 
+    /// [`Self::new_pieced_tapped`] whose waves walk only the instructions the
+    /// landing completes (`bucketed`, [`WaveBuckets`]) instead of filtering
+    /// the whole program each time: the same instructions in the same order
+    /// each wave, so the same execution.
+    pub fn new_pieced_bucketed(
+        program: &'p LfmProgram,
+        pieces: Vec<ArenaPiece>,
+        hasher: &'p H,
+        lean_tap: bool,
+        bucketed: bool,
+    ) -> Result<Self, LfmExecError> {
+        Self::pieced_with(program, pieces, hasher, lean_tap, bucketed)
+    }
+
     /// [`Self::new_pieced`] with, when `lean_tap`, a copy of every lean BLAKE3
     /// compression's record kept as its wave writes it ([`Self::take_lean_tap`]),
     /// so a fill can start on a wave's compressions while the next groups are
@@ -1719,6 +1823,16 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         pieces: Vec<ArenaPiece>,
         hasher: &'p H,
         lean_tap: bool,
+    ) -> Result<Self, LfmExecError> {
+        Self::pieced_with(program, pieces, hasher, lean_tap, false)
+    }
+
+    fn pieced_with(
+        program: &'p LfmProgram,
+        pieces: Vec<ArenaPiece>,
+        hasher: &'p H,
+        lean_tap: bool,
+        bucketed: bool,
     ) -> Result<Self, LfmExecError> {
         let schema = &program.arena_schema.lens;
         let mut sorted = pieces.clone();
@@ -1775,8 +1889,16 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             }
         };
         let need = Self::need_of_pieced(program, group_at);
-        let mut streamed =
-            Self::start(program, hasher, need, Vec::new(), sorted, groups, lean_tap)?;
+        let mut streamed = Self::start(
+            program,
+            hasher,
+            need,
+            Vec::new(),
+            sorted,
+            groups,
+            lean_tap,
+            bucketed,
+        )?;
         streamed.m.pieces = by_arena
             .iter()
             .map(|ps| {
@@ -1837,6 +1959,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         need
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start(
         program: &'p LfmProgram,
         hasher: &'p H,
@@ -1845,10 +1968,14 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         pieces: Vec<ArenaPiece>,
         groups: u64,
         lean_tap: bool,
+        bucketed: bool,
     ) -> Result<Self, LfmExecError> {
         let schema = &program.arena_schema.lens;
         let t = Instant::now();
         let levels = exec_schedule::build_with_merge(program, 1);
+        let buckets = bucketed.then(|| WaveBuckets::build(&levels, &need));
+        // Bucketed, the waves read the buckets' sets, never `need` again.
+        let need = if bucketed { Vec::new() } else { need };
         let mut split = ExecSplit {
             depth_pass: t.elapsed().as_secs_f64(),
             levels: levels.levels(),
@@ -1880,6 +2007,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             public_words,
             split,
             lean_tap: lean_tap.then(Vec::new),
+            buckets,
         };
         streamed.wave(None)?;
         Ok(streamed)
@@ -1958,6 +2086,9 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
     /// Runs the instructions whose groups have all landed and had not all
     /// landed `before` (every instruction that reads no arena, at `None`).
     fn wave(&mut self, before: Option<u64>) -> Result<(), LfmExecError> {
+        if self.buckets.is_some() {
+            return self.wave_bucketed(before);
+        }
         let (need, landed) = (&self.need, self.landed);
         let keep = |i: usize| {
             let n = need[i];
@@ -1975,6 +2106,83 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             Some(&keep),
             self.lean_tap.as_mut(),
         )?;
+        Ok(())
+    }
+
+    /// [`Self::wave`] over the buckets ([`WaveBuckets`]): the picked buckets'
+    /// rows and instructions merged back, level by level, into each level's
+    /// own order, then run as `run_levels` runs a level.
+    fn wave_bucketed(&mut self, before: Option<u64>) -> Result<(), LfmExecError> {
+        let Some(b) = self.buckets.as_ref() else {
+            return Err(LfmExecError::Internal("a bucketed wave without buckets"));
+        };
+        let picked = b.picked(self.landed, before);
+        // Each picked bucket's next hash run and next other run.
+        let mut hash_at = vec![0usize; picked.len()];
+        let mut other_at = vec![0usize; picked.len()];
+        let (mut pos, mut rows, mut others): (Vec<u32>, Vec<u32>, Vec<u32>) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut computed: Vec<Result<HashOut, LfmExecError>> = Vec::new();
+        let mut ran = 0usize;
+        loop {
+            // The lowest level any picked bucket still holds.
+            let mut next = u32::MAX;
+            for (j, &k) in picked.iter().enumerate() {
+                if let Some(run) = b.hash_runs[k].get(hash_at[j]) {
+                    next = next.min(run.0);
+                }
+                if let Some(run) = b.other_runs[k].get(other_at[j]) {
+                    next = next.min(run.0);
+                }
+            }
+            if next == u32::MAX {
+                break;
+            }
+            let d = next as usize;
+            // That level's rows and instructions from every picked bucket, in
+            // the level's own order (positions are distinct across buckets).
+            pos.clear();
+            for (j, &k) in picked.iter().enumerate() {
+                if let Some(&(level, start, len)) = b.hash_runs[k].get(hash_at[j])
+                    && level == next
+                {
+                    pos.extend_from_slice(&b.hash_pos[k][start as usize..(start + len) as usize]);
+                    hash_at[j] += 1;
+                }
+            }
+            pos.sort_unstable();
+            let level_rows = self.levels.hashes_at(d);
+            rows.clear();
+            rows.extend(pos.iter().map(|&p| level_rows[p as usize]));
+            pos.clear();
+            for (j, &k) in picked.iter().enumerate() {
+                if let Some(&(level, start, len)) = b.other_runs[k].get(other_at[j])
+                    && level == next
+                {
+                    pos.extend_from_slice(&b.other_pos[k][start as usize..(start + len) as usize]);
+                    other_at[j] += 1;
+                }
+            }
+            pos.sort_unstable();
+            let level_others = self.levels.others_at(d);
+            others.clear();
+            others.extend(pos.iter().map(|&p| level_others[p as usize]));
+            ran += run_level(
+                self.program,
+                &self.levels,
+                self.hasher,
+                PRODUCTION_COALESCE_BELOW,
+                &mut self.m,
+                &mut self.records,
+                &mut self.public_words,
+                &mut self.split,
+                &rows,
+                &others,
+                &mut computed,
+                self.lean_tap.as_mut(),
+            )?;
+        }
+        self.ran += ran;
         Ok(())
     }
 
@@ -2091,80 +2299,6 @@ fn run_levels(
                 &kept_rows
             }
         };
-        ran += rows.len();
-
-        let t = Instant::now();
-        if rows.len() < coalesce_below {
-            // Narrow: a fork/join for a handful of permutations costs more than
-            // it saves, and on a box up to four sibling proofs are sharing this
-            // pool. 79% of a wrap's levels come through here holding 1.1% of its
-            // hashes.
-            computed.clear();
-            for &row in rows {
-                let instr = &program.instrs[levels.instr_of_row(row)];
-                computed.push(hash_one(&m.memory, hasher, instr));
-            }
-            // ★ The same permutation, on this thread, with no pool in the path —
-            // so the ratio of this to the parallel phase is the width the pool
-            // actually gave, measured in the same process on the same box under
-            // the same load. Free: this work runs either way, and it is 1.1% of
-            // the hashes.
-            split.serial_hashes += rows.len();
-            split.serial_hash_secs += t.elapsed().as_secs_f64();
-        } else {
-            compute_level(&m.memory, hasher, program, levels, rows, &mut computed);
-            split.parallel_levels += 1;
-            split.parallel_hashes += rows.len();
-        }
-        split.hash_phase += t.elapsed().as_secs_f64();
-
-        // ⓘ The FIRST failure by row number, not whichever worker finished
-        // first: the same program must report the same address on every run, or
-        // the mutation gate below it is flaky and the campaign's error messages
-        // stop being comparable between arms.
-        let t = Instant::now();
-        for (&row, out) in rows.iter().zip(&computed) {
-            let row_value = match out {
-                Ok(r) => r,
-                Err(e) => return Err(e.clone()),
-            };
-            let index = levels.instr_of_row(row);
-            let instr = &program.instrs[index];
-            let slot = levels.record_row(index);
-            // The hash chip's row goes through the same slot write as every
-            // other chip's: the vector's length is zero until `commit_slots`.
-            match (instr, row_value) {
-                // Each entry's slot is its own chip's record row: a level holds
-                // the hash chip's rows and the lean compressions' together, so
-                // an entry's position among them is neither chip's row.
-                (Instr::Hash { mode, outs, .. }, HashOut::Narrow(r)) => {
-                    hash_apply(&mut m.memory, *mode, outs, r)?;
-                    Sink::Slot(slot).put(&mut records.hash, r.clone());
-                }
-                (Instr::Hash16(h), HashOut::Wide(r)) => {
-                    hash16_apply(&mut m.memory, &h.outs, r)?;
-                    Sink::Slot(slot).put(&mut records.hash16, (**r).clone());
-                }
-                (Instr::B3l(op), HashOut::Lean(values, digest)) => {
-                    b3l_apply(&mut m.memory, op, digest)?;
-                    if let Some(tap) = lean_tap.as_deref_mut() {
-                        tap.push((slot, *values));
-                    }
-                    Sink::Slot(slot).put(&mut records.b3l, *values);
-                }
-                _ => {
-                    return Err(LfmExecError::Internal(
-                        "the schedule listed a non-hash instruction as a hash row",
-                    ));
-                }
-            }
-        }
-        split.apply += t.elapsed().as_secs_f64();
-
-        // The level's non-hash work. It may read this level's hashes and each
-        // other, so it stays serial and in program order — which is a
-        // topological order, so that is enough.
-        let t = Instant::now();
         let others = match keep {
             None => levels.others_at(d),
             Some(keep) => {
@@ -2173,20 +2307,129 @@ fn run_levels(
                 &kept_others
             }
         };
-        ran += others.len();
-        for &i in others {
-            let i = i as usize;
-            step(
-                m,
-                records,
-                public_words,
-                &program.instrs[i],
-                hasher,
-                Sink::Slot(levels.record_row(i)),
-            )?;
-        }
-        split.residue += t.elapsed().as_secs_f64();
+        ran += run_level(
+            program,
+            levels,
+            hasher,
+            coalesce_below,
+            m,
+            records,
+            public_words,
+            split,
+            rows,
+            others,
+            &mut computed,
+            lean_tap.as_deref_mut(),
+        )?;
     }
+    Ok(ran)
+}
+
+/// One level's share of a wave: its hash `rows` (rows of the level, in the
+/// level's order) computed and applied, then its `others` (instructions of
+/// the level, in program order) stepped. Returns how many ran.
+#[allow(clippy::too_many_arguments)]
+fn run_level(
+    program: &LfmProgram,
+    levels: &LevelSchedule,
+    hasher: &(impl LfmHasher + Sync),
+    coalesce_below: usize,
+    m: &mut Machine<'_>,
+    records: &mut LfmRecords,
+    public_words: &mut Vec<(u32, LfmWord)>,
+    split: &mut ExecSplit,
+    rows: &[u32],
+    others: &[u32],
+    computed: &mut Vec<Result<HashOut, LfmExecError>>,
+    mut lean_tap: Option<&mut Vec<(u32, B3lValues)>>,
+) -> Result<usize, LfmExecError> {
+    let mut ran = rows.len();
+
+    let t = Instant::now();
+    if rows.len() < coalesce_below {
+        // Narrow: a fork/join for a handful of permutations costs more than
+        // it saves, and on a box up to four sibling proofs are sharing this
+        // pool. 79% of a wrap's levels come through here holding 1.1% of its
+        // hashes.
+        computed.clear();
+        for &row in rows {
+            let instr = &program.instrs[levels.instr_of_row(row)];
+            computed.push(hash_one(&m.memory, hasher, instr));
+        }
+        // ★ The same permutation, on this thread, with no pool in the path —
+        // so the ratio of this to the parallel phase is the width the pool
+        // actually gave, measured in the same process on the same box under
+        // the same load. Free: this work runs either way, and it is 1.1% of
+        // the hashes.
+        split.serial_hashes += rows.len();
+        split.serial_hash_secs += t.elapsed().as_secs_f64();
+    } else {
+        compute_level(&m.memory, hasher, program, levels, rows, computed);
+        split.parallel_levels += 1;
+        split.parallel_hashes += rows.len();
+    }
+    split.hash_phase += t.elapsed().as_secs_f64();
+
+    // ⓘ The FIRST failure by row number, not whichever worker finished
+    // first: the same program must report the same address on every run, or
+    // the mutation gate below it is flaky and the campaign's error messages
+    // stop being comparable between arms.
+    let t = Instant::now();
+    for (&row, out) in rows.iter().zip(computed.iter()) {
+        let row_value = match out {
+            Ok(r) => r,
+            Err(e) => return Err(e.clone()),
+        };
+        let index = levels.instr_of_row(row);
+        let instr = &program.instrs[index];
+        let slot = levels.record_row(index);
+        // The hash chip's row goes through the same slot write as every
+        // other chip's: the vector's length is zero until `commit_slots`.
+        match (instr, row_value) {
+            // Each entry's slot is its own chip's record row: a level holds
+            // the hash chip's rows and the lean compressions' together, so
+            // an entry's position among them is neither chip's row.
+            (Instr::Hash { mode, outs, .. }, HashOut::Narrow(r)) => {
+                hash_apply(&mut m.memory, *mode, outs, r)?;
+                Sink::Slot(slot).put(&mut records.hash, r.clone());
+            }
+            (Instr::Hash16(h), HashOut::Wide(r)) => {
+                hash16_apply(&mut m.memory, &h.outs, r)?;
+                Sink::Slot(slot).put(&mut records.hash16, (**r).clone());
+            }
+            (Instr::B3l(op), HashOut::Lean(values, digest)) => {
+                b3l_apply(&mut m.memory, op, digest)?;
+                if let Some(tap) = lean_tap.as_deref_mut() {
+                    tap.push((slot, *values));
+                }
+                Sink::Slot(slot).put(&mut records.b3l, *values);
+            }
+            _ => {
+                return Err(LfmExecError::Internal(
+                    "the schedule listed a non-hash instruction as a hash row",
+                ));
+            }
+        }
+    }
+    split.apply += t.elapsed().as_secs_f64();
+
+    // The level's non-hash work. It may read this level's hashes and each
+    // other, so it stays serial and in program order — which is a
+    // topological order, so that is enough.
+    let t = Instant::now();
+    ran += others.len();
+    for &i in others {
+        let i = i as usize;
+        step(
+            m,
+            records,
+            public_words,
+            &program.instrs[i],
+            hasher,
+            Sink::Slot(levels.record_row(i)),
+        )?;
+    }
+    split.residue += t.elapsed().as_secs_f64();
     Ok(ran)
 }
 
