@@ -996,3 +996,93 @@ fn level_cells_by_table_under_each_form() {
         }
     }
 }
+
+/// ★ Route A's card path under the round form: a small BLAKE3 block under
+/// the WORD memory format and the round form (first fold 4, then 6), driven
+/// with every level's prepared stacks committed on the card and let go
+/// (revived at each group's opening, each group opened alone), proves each
+/// level's bytes as [`prove_levels`] does over the same base with the stacks
+/// held; every level is the round form's, and the block's verifier accepts
+/// the last. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity
+/// check.
+///
+/// [`prove_levels`]: super::levels::prove_levels
+#[test]
+#[ignore = "proves two small BLAKE3 words blocks and their levels twice; box tier, deterministic grind"]
+fn the_round_form_driver_with_retired_stacks_proves_the_held_levels_bytes() {
+    use super::levels::{
+        LevelStop, derive_levels, prove_block_levels, prove_levels, set_stacks_for_test,
+        verify_levels,
+    };
+    use super::wlfm::StackPlace;
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let first6 = WhirFolds::First(multilinear::whir_chain::FirstFold::new(6).expect("a fold"));
+    for folds in [WhirFolds::Uniform, first6] {
+        let format = BlockFormat {
+            zf: crate::zf_format::ZfFormat {
+                whir_folds: folds,
+                ..words_format(B3Rounds::WHIR3).zf
+            },
+            ..words_format(B3Rounds::WHIR3)
+        };
+        let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+        let opts = ProofOptions::default_test_options();
+        let run = {
+            let _retired = set_stacks_for_test(Some(StackPlace::CardRetired));
+            prove_block_levels(
+                &elf,
+                &[],
+                &opts,
+                &format,
+                &words_options(),
+                WlfmFamily::B3,
+                LevelStop::DEFAULT,
+                true,
+                true,
+            )
+            .expect("the round-form block proves to its last level")
+        };
+        assert!(
+            run.times
+                .builds
+                .iter()
+                .all(|b| b.place == StackPlace::CardRetired || b.place == StackPlace::Host),
+            "{folds:?}: every level's stacks retired (or on the host without a card): {:?}",
+            run.times.builds
+        );
+        let held = {
+            let _held = set_stacks_for_test(Some(StackPlace::Card));
+            derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive")
+        };
+        for (k, level) in held.iter().enumerate() {
+            assert_eq!(
+                level.build.artifacts.rounds,
+                Some(3),
+                "{folds:?} level {}: the round form",
+                k + 1
+            );
+        }
+        let (proofs, _) =
+            prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+        assert_eq!(proofs.len(), run.proofs.len());
+        for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+            let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+            let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+            assert!(
+                a[..] == b[..],
+                "{folds:?} level {}: the held stacks' proof bytes",
+                k + 1
+            );
+            println!(
+                "ROUND FORM RETIRED IDENTITY {folds:?} level {}: {} B equal",
+                k + 1,
+                a.len()
+            );
+        }
+        let last = run.proofs.last().expect("a last level");
+        verify_levels(&run.plan, WlfmFamily::B3, last).expect("the block's verifier accepts");
+    }
+}
