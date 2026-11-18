@@ -2202,3 +2202,66 @@ fn the_keccak_w_split_is_on_by_default_and_cuts_eight_parts() {
         vec![0, 2 * KECCAK_W_SPLIT_MIN_ROWS - 1]
     );
 }
+
+/// A probe, never a gate: what counting KECCAK's BITWISE lookups costs a
+/// permutation, by part — the rounds replayed with every lookup made and
+/// dropped, and the same with each lookup bumped into a histogram — over
+/// `n` permute rows of random states (ns a lookup, best of three).
+#[test]
+#[ignore = "a timing probe"]
+fn keccak_bitwise_count_seconds_by_part() {
+    use super::super::bitwise::BitwiseHistogram;
+    use crate::tables::keccak::KeccakOperation;
+    use crate::tables::keccak_rnd::KeccakRndForm;
+    let mut s = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let n = 20_000usize;
+    let ops: Vec<KeccakOperation> = (0..n)
+        .map(|i| KeccakOperation {
+            timestamp: i as u64 * 4,
+            state_addr: 0x4000_0000 + 200 * i as u64,
+            input: std::array::from_fn(|_| next()),
+            output: [0; 25],
+            sponge: None,
+        })
+        .collect();
+    let best = |f: &mut dyn FnMut() -> u64| {
+        let mut out = (f64::MAX, 0u64);
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let k = f();
+            out = (out.0.min(t.elapsed().as_secs_f64()), k);
+        }
+        out
+    };
+    for form in [KeccakRndForm::Lean, KeccakRndForm::Full] {
+        let (made, lookups) = best(&mut || {
+            let mut k = 0u64;
+            super::super::for_each_keccak_lookup(&ops, form, |op| {
+                k += 1;
+                std::hint::black_box(op);
+            });
+            k
+        });
+        let (bumped, _) = best(&mut || {
+            let mut h = BitwiseHistogram::new();
+            super::super::count_bitwise_from_keccak_for(&ops, form, &mut h);
+            std::hint::black_box(&h);
+            0
+        });
+        println!(
+            "KECCAK COUNT PROBE {form:?}: {n} permutations · {} lookups a permutation · replayed and made {:.2} ns a \
+             lookup ({:.1} µs a permutation) · bumped {:.2} ns a lookup ({:.1} µs a permutation)",
+            lookups / n as u64,
+            made / lookups as f64 * 1e9,
+            made / n as f64 * 1e6,
+            bumped / lookups as f64 * 1e9,
+            bumped / n as f64 * 1e6,
+        );
+    }
+}
