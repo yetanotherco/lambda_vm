@@ -897,6 +897,7 @@ where
                 )
         };
         let handed_before = multilinear::gpu::handed_back_by_preference();
+        let build_trims_before = multilinear::gpu::build_trims();
         let pending: Vec<Pending<E>> = multilinear::gpu::prefer_hand_back(hand_back, || {
             members
                 .iter()
@@ -1016,6 +1017,10 @@ where
             .collect::<Result<_, MlError>>()?;
         split.trees += started.elapsed().as_secs_f64();
         split.ledger_trees = split.ledger_trees.max(multilinear::gpu::ledger_reserved());
+        split.build_trims += multilinear::gpu::build_trims() - build_trims_before;
+        split.pool_high_trees = split
+            .pool_high_trees
+            .max(multilinear::gpu::pool_reserved_high());
         let hosts: Vec<Option<gkr_lockstep::HostLayers<'_, E>>> = trees
             .iter()
             .map(|tree| match tree {
@@ -1073,6 +1078,9 @@ where
         split.rewrite_trims += multilinear::gpu::rewrite_trims() - trims_before;
         split.ladders += started.elapsed().as_secs_f64();
         split.ledger_ladder = split.ledger_ladder.max(multilinear::gpu::ledger_reserved());
+        split.pool_high_ladder = split
+            .pool_high_ladder
+            .max(multilinear::gpu::pool_reserved_high());
         let inputs: Vec<GkrClaim<E>> = inputs;
         let mut at_tree = 0;
         for &t in bin {
@@ -1320,7 +1328,8 @@ where
         eprintln!(
             "BATCHED ARGUE TREES: tables {} · trees {} · cut {} · tree log2 cells {:.2} · built on the card \
              {} · on the host {} (after a queued build {}) · ledger GiB: at the start {:.2} · the bin's trees \
-             built {:.2} · after its ladder {:.2} · zerocheck set up {:.2} · handed back {} trees in {} bins · pool trimmed before {} rewrites",
+             built {:.2} · after its ladder {:.2} · zerocheck set up {:.2} · handed back {} trees in {} bins · pool trimmed before {} rewrites · pool trimmed before {} \
+             builds · pool reserved high GiB: the bin's trees built {:.2} · after its ladder {:.2}",
             tables.len(),
             plan.trees(),
             plan.chunks.iter().filter(|c| c.count > 1).count(),
@@ -1337,7 +1346,10 @@ where
             gib(split.ledger_zc),
             split.trees_handed_back,
             split.bins_handed_back,
-            split.rewrite_trims
+            split.rewrite_trims,
+            split.build_trims,
+            gib(split.pool_high_trees),
+            gib(split.pool_high_ladder)
         );
     }
     Ok((
@@ -1429,6 +1441,12 @@ struct ArgueSplit {
     /// Input layers written again after the pool handed its unused blocks
     /// back (`multilinear::gpu::rewrite_trims`).
     rewrite_trims: u64,
+    /// Trees built after the pool handed its unused blocks back
+    /// (`multilinear::gpu::build_trims`), and the pool's reserved high-water
+    /// mark (bytes) once a bin's trees were built and after its ladder.
+    build_trims: u64,
+    pool_high_trees: u64,
+    pool_high_ladder: u64,
     ladders: f64,
     zc_setup: f64,
     zc_rounds: f64,

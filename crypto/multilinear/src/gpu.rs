@@ -1101,6 +1101,20 @@ pub fn card_window_end() -> Option<CardWindow> {
     })
 }
 
+/// The pool's reserved high-water mark since the last [`card_window_start`]
+/// (or what it reserves now, if more); 0 without a device. A report.
+#[cfg(feature = "cuda")]
+pub fn pool_reserved_high() -> u64 {
+    math_cuda::device::pool_reserved_bytes()
+        .map(|(now, high)| high.max(now))
+        .unwrap_or(0)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn pool_reserved_high() -> u64 {
+    0
+}
+
 #[cfg(not(feature = "cuda"))]
 pub fn card_window_start() {}
 
@@ -1550,6 +1564,15 @@ fn input_rewrite_faulted() -> bool {
 /// Input layers written again after the pool handed its unused blocks back
 /// (`DeviceTree::rewrite_input`).
 static REWRITE_TRIMS: AtomicU64 = AtomicU64::new(0);
+
+/// Trees built under [`prefer_hand_back`] after the pool handed its unused
+/// blocks back (`input_layer_tree_impl`).
+static BUILD_TRIMS: AtomicU64 = AtomicU64::new(0);
+
+/// See [`BUILD_TRIMS`].
+pub fn build_trims() -> u64 {
+    BUILD_TRIMS.load(Ordering::Relaxed)
+}
 
 /// See [`REWRITE_TRIMS`].
 pub fn rewrite_trims() -> u64 {
@@ -5708,6 +5731,15 @@ fn input_layer_tree_impl(
 ) -> Option<DeviceTree> {
     use crate::gkr_input_real::{self as input_real, InputReal};
 
+    // A bin that hands its trees back builds them one after another on
+    // different streams; a tree's freed input layer is not the next one's to
+    // reuse until its stream has reached the free, so without a wait the pool
+    // reserves a fresh layer a tree while the live set does not grow. Each
+    // such tree first lands every pending free and has the pool hand its
+    // unused blocks back.
+    if hand_back_preferred() && math_cuda::device::drain_and_trim().is_ok() {
+        BUILD_TRIMS.fetch_add(1, Ordering::Relaxed);
+    }
     let full = interactions.next_power_of_two() * rows;
     let real = interactions * rows;
     let padded = real < full;
