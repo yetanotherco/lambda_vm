@@ -2381,6 +2381,7 @@ fn page_direct_from(value: Option<&str>) -> bool {
 /// out during the windows (`LAMBDA_VM_STREAM_KECCAK_RND`) the median and the
 /// large block's phase A end 0.23 / 0.27 s sooner; alone it adds 0.07 s to the
 /// large's, so the two are on together.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn keccak_w_split() -> bool {
     #[cfg(test)]
     if let Some(on) = keccak_w_split_test::on() {
@@ -2397,6 +2398,7 @@ pub(crate) fn keccak_w_split() -> bool {
 }
 
 /// [`keccak_w_split`]'s reading of `LAMBDA_VM_FINISH_KECCAK_W_SPLIT`.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 fn keccak_w_split_from(value: Option<&str>) -> bool {
     value.is_none_or(|v| v.trim() != "0")
 }
@@ -2404,10 +2406,12 @@ fn keccak_w_split_from(value: Option<&str>) -> bool {
 /// The fewest rows a part of a split KECCAK_W fill holds: a table of 2^17 rows
 /// (`BLOCK_KECCAK_ROWS_LOG2`) is eight parts. A row is 1,031 cells, so a part
 /// is ≈ 17 M cells, a fill of tens of milliseconds.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) const KECCAK_W_SPLIT_MIN_ROWS: usize = 1 << 14;
 
 /// The row ranges a KECCAK_W table of `rows` rows is filled by under
 /// [`keccak_w_split`] ([`crate::tables::gpack::row_bounds_at`]).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 fn keccak_w_bounds(rows: usize) -> Vec<usize> {
     #[cfg(test)]
     if let Some(min_rows) = keccak_w_split_test::min_rows() {
