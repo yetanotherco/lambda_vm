@@ -831,6 +831,26 @@ fn rta_one_run(
         "RTA BASE: end {:.3}s · execute {:.3}s · build {:.3}s · phase A {:.3}s · phase B {:.3}s",
         t.base, s.execute, s.build, s.phase_a, s.phase_b
     );
+    // The base's groups, in the order phase B proves them: each its index,
+    // table count and first table's name, so a late group can be named.
+    let names = run.plan.table_names();
+    println!(
+        "RTA BASE GROUPS: {}",
+        run.base_proof
+            .statement()
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(g, tables)| {
+                let first = tables
+                    .first()
+                    .and_then(|&t| names.get(t as usize))
+                    .map_or("-", String::as_str);
+                format!("{g}:{}:{first}", tables.len())
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     let l1_prove_from = t.built + t.levels.first().map_or(0.0, |l| l.fill);
     println!(
         "RTA LEVEL1 STREAM: planned {:.3}s · emitted {:.3}s · pieces {} · waves before the base \
