@@ -74,6 +74,31 @@ fn dump(label: &str, prog: &ConstraintProgram<Gl, Ext3>) {
         }
     }
 
+    // Each node's degree in the trace's columns (a variable 1, a uniform 0,
+    // a product the sum, a sum the larger): the roots' largest is the program's
+    // degree before its row selector.
+    let mut deg = vec![0usize; n];
+    for (i, op) in prog.nodes.iter().enumerate() {
+        deg[i] = match *op {
+            Op::Var { .. } => 1,
+            Op::Mul(a, b) => deg[a as usize] + deg[b as usize],
+            Op::Add(a, b) | Op::Sub(a, b) => deg[a as usize].max(deg[b as usize]),
+            Op::Neg(a) | Op::Embed(a) => deg[a as usize],
+            _ => 0,
+        };
+    }
+    let degree = prog
+        .roots
+        .iter()
+        .map(|&r| deg[r as usize])
+        .max()
+        .unwrap_or(0);
+    let mut by_degree = [0usize; 8];
+    for &r in &prog.roots {
+        by_degree[deg[r as usize].min(7)] += 1;
+    }
+    println!("{label:12} degree={degree} roots by degree (0..7+)={by_degree:?}");
+
     // Lowered slot footprint: old scratch was nodes×24B per thread; new is
     // base_slots×8 + ext_slots×24.
     let dev = DeviceProgram::lower(prog);
