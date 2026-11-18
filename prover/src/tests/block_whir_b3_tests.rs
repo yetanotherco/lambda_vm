@@ -458,6 +458,217 @@ fn the_blake3_base_rounds_knob_reads_its_words_and_refuses_the_rest() {
     );
 }
 
+/// The BLAKE3 base's GKR ladder knob reads `0`/`single` and `1`/`double`
+/// (any case, trimmed) and refuses every other word; no test sets it, so
+/// neither the pinned verifier's format nor a production format without it
+/// steps two layers.
+#[test]
+fn the_blake3_base_gkr_knob_reads_its_words_and_refuses_the_rest() {
+    use crate::block_whir::{b3_base_gkr, b3_base_gkr_setting, gkr_ladder_tag_word};
+    use multilinear::whir_chain::GkrLadder;
+    for (word, want) in [
+        (None, GkrLadder::Single),
+        (Some("0"), GkrLadder::Single),
+        (Some("single"), GkrLadder::Single),
+        (Some(" SINGLE "), GkrLadder::Single),
+        (Some("1"), GkrLadder::Double),
+        (Some("double"), GkrLadder::Double),
+        (Some(" Double\n"), GkrLadder::Double),
+    ] {
+        assert_eq!(b3_base_gkr_setting(word), Ok(want), "{word:?}");
+    }
+    for word in [
+        "", "2", "on", "off", "true", "yes", "l2", "two", "doubles", "0x1", "-1",
+    ] {
+        assert!(b3_base_gkr_setting(Some(word)).is_err(), "{word:?}");
+    }
+    assert_eq!(b3_base_gkr(), GkrLadder::Single, "no test sets the knob");
+    assert_eq!(BlockFormat::pinned().argue.ladder(), GkrLadder::Single);
+    assert_eq!(BlockFormat::production().argue.ladder(), GkrLadder::Single);
+    assert_eq!(
+        BlockFormat::production().argue,
+        multilinear::whir_chain::ArgueFormat::BATCHED,
+        "the production argue is today's"
+    );
+    assert_eq!(gkr_ladder_tag_word(GkrLadder::Single), "");
+    assert_eq!(gkr_ladder_tag_word(GkrLadder::Double), "/L2");
+}
+
+/// ★ The two-layer ladder is a format of its own: the statement tag ends
+/// `/L2` where today's ends without it (after the round form's word, under
+/// any base), the chains' config carries the ladder into the argue, and
+/// the packing a caller names keeps it. Under today's ladder no tag moves.
+#[test]
+fn the_two_layer_ladder_is_named_in_the_tag_and_carried_by_the_format() {
+    use crate::block_whir::{B3Rounds, block_format_tag};
+    use multilinear::whir_chain::{ArgueFormat, GkrLadder, GkrPack};
+    let b3 = BlockFormat {
+        zf: ZfFormat::DEFAULT.with_base(BaseFormat::B3_WHIR),
+        group_polys: 4,
+        ..BlockFormat::pinned()
+    };
+    let double = BlockFormat {
+        argue: ArgueFormat::BATCHED.with_ladder(GkrLadder::Double),
+        ..b3
+    };
+    let mut today = block_statement_tag(&BaseFormat::B3_WHIR);
+    today.extend_from_slice(b"/G4");
+    assert_eq!(block_format_tag(&b3), today, "today's tag is unmoved");
+    let mut want = today.clone();
+    want.extend_from_slice(b"/L2");
+    assert_eq!(block_format_tag(&double), want);
+    // After the round form's word.
+    let w = BlockFormat {
+        b3_rounds: B3Rounds::WHIR3,
+        ..double
+    };
+    let mut want_w = today.clone();
+    want_w.extend_from_slice(b"/W3/Cq/L2");
+    assert_eq!(block_format_tag(&w), want_w);
+    // Under another base too, should a format there name it.
+    let p1 = BlockFormat::pinned();
+    let p1_double = BlockFormat {
+        argue: ArgueFormat::BATCHED.with_ladder(GkrLadder::Double),
+        ..p1
+    };
+    let mut p1_want = block_format_tag(&p1);
+    assert_eq!(p1_want, block_statement_tag(&p1.zf.base));
+    p1_want.extend_from_slice(b"/L2");
+    assert_eq!(block_format_tag(&p1_double), p1_want);
+    // The chains' config and a named packing carry the ladder.
+    let shapes = production_shapes();
+    assert_eq!(
+        double.chain_config(&shapes).format.argue.ladder(),
+        GkrLadder::Double
+    );
+    assert_eq!(
+        b3.chain_config(&shapes).format.argue.ladder(),
+        GkrLadder::Single
+    );
+    for pack in [GkrPack::Off, GkrPack::PRODUCTION] {
+        assert_eq!(double.with_pack(pack).argue.ladder(), GkrLadder::Double);
+        assert_eq!(b3.with_pack(pack).argue.ladder(), GkrLadder::Single);
+    }
+    // A per-table argue has no ladder to step.
+    assert_eq!(
+        ArgueFormat::PerTable.with_ladder(GkrLadder::Double),
+        ArgueFormat::PerTable
+    );
+}
+
+/// ★ A BLAKE3 base whose groups argue on the two-layer GKR ladder proves and
+/// verifies on the host, its ladders over trees of both parities (a ladder
+/// whose tallest tree is odd ends on a one-layer step); each ladder's
+/// verifier refuses the other's proof; the tag is bound (a proof is refused
+/// by a verifier whose tag leaves `/L2` out, and one made and verified that
+/// way is accepted, so the tag is all the mutation moves); and its ladder's
+/// tampers are refused.
+#[test]
+fn a_blake3_base_on_the_two_layer_ladder_proves_and_each_ladder_refuses_the_other() {
+    use crate::block_whir::LADDER_TAG_OMITTED;
+    use multilinear::whir_chain::{ArgueFormat, GkrLadder};
+    let elf = asm_elf_bytes("all_instructions_64");
+    let single = BlockFormat {
+        argue: ArgueFormat::BATCHED,
+        ..many_groups(BaseFormat::B3_WHIR)
+    };
+    let double = BlockFormat {
+        argue: ArgueFormat::BATCHED.with_ladder(GkrLadder::Double),
+        ..single
+    };
+    crate::base_only::with_permit(|| {
+        let two = prove(&elf, &double, 3);
+        let one = prove(&elf, &single, 3);
+        assert_eq!(refusal(&two, &elf, &double), None, "two layers a step");
+        assert_eq!(refusal(&one, &elf, &single), None, "one layer a step");
+        assert!(
+            !verify(&two, &elf, &single),
+            "a two-layer proof, one-layer verifier"
+        );
+        assert!(
+            !verify(&one, &elf, &double),
+            "a one-layer proof, two-layer verifier"
+        );
+
+        // Both parities: a ladder ending on a degree-5 step (its tallest tree
+        // even) and one ending on a degree-3 step with rounds (odd).
+        let (mut even, mut odd, mut ladders) = (0, 0, 0);
+        for argue in &two.argues {
+            for ladder in &argue.gkr {
+                ladders += 1;
+                let Some(last) = ladder.layers.last() else {
+                    continue;
+                };
+                match last.sumcheck.rounds.first().map(|r| r.evaluations.len()) {
+                    Some(5) => even += 1,
+                    Some(3) => odd += 1,
+                    _ => {}
+                }
+            }
+        }
+        println!("B3 TWO-LAYER LADDERS: {ladders} · tallest even {even} · tallest odd {odd}");
+        assert!(even > 0 && odd > 0, "ladders of both parities");
+        assert!(
+            two.argues.iter().zip(&one.argues).all(|(a, b)| a
+                .gkr
+                .iter()
+                .zip(&b.gkr)
+                .all(|(x, y)| 2 * x.layers.len() >= y.layers.len()
+                    && x.layers.len() < y.layers.len().max(2))),
+            "about half the steps"
+        );
+
+        // The tag is bound.
+        LADDER_TAG_OMITTED.with(|omitted| omitted.set(true));
+        let refused = !verify(&two, &elf, &double);
+        let untagged = prove(&elf, &double, 3);
+        let both_untagged = verify(&untagged, &elf, &double);
+        LADDER_TAG_OMITTED.with(|omitted| omitted.set(false));
+        assert!(
+            refused,
+            "a two-layer proof verified under the tag without /L2"
+        );
+        assert!(both_untagged, "the mutation is the tag alone");
+        assert!(
+            !verify(&untagged, &elf, &double),
+            "a proof without /L2 under the tag"
+        );
+
+        // Its ladder's tampers.
+        let tampered = |name: &str, edit: &dyn Fn(&mut BlockWhirProof)| {
+            let mut proof = two.clone();
+            edit(&mut proof);
+            let why = refusal(&proof, &elf, &double);
+            println!("B3 TWO-LAYER TAMPER {name}: {why:?}");
+            assert!(why.is_some(), "{name}: accepted");
+        };
+        let (g, b) = two
+            .argues
+            .iter()
+            .enumerate()
+            .find_map(|(g, a)| {
+                a.gkr
+                    .iter()
+                    .position(|l| l.layers.len() > 1 && l.layers[1].halves.len() > 1)
+                    .map(|b| (g, b))
+            })
+            .expect("a ladder of two steps or more");
+        tampered("a half's value at step 1", &|p| {
+            p.argues[g].gkr[b].layers[1].halves[1].q_lo += FieldElement::<E>::one();
+        });
+        tampered("two halves swapped at step 0", &|p| {
+            p.argues[g].gkr[b].layers[0].halves.swap(0, 1);
+        });
+        tampered("a degree-5 round value", &|p| {
+            p.argues[g].gkr[b].layers[1].sumcheck.rounds[0].evaluations[4] +=
+                FieldElement::<E>::one();
+        });
+        tampered("a half missing", &|p| {
+            p.argues[g].gkr[b].layers[0].halves.pop();
+        });
+    });
+}
+
 /// Shapes whose stack is the production `2^27` (one table of 2^21 rows and
 /// 64 columns, beside a narrow one).
 fn production_shapes() -> Vec<(usize, usize)> {

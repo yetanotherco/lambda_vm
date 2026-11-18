@@ -63,3 +63,41 @@ fn the_default_wlfm_program_id_is_unmoved() {
         .format;
     assert_eq!(super::wlfm::format_identity_text(&whir), text);
 }
+
+/// ★ The chain format's identity text under a batched argue on today's
+/// one-layer GKR ladder is the text it was before the ladder existed (the
+/// literal below, printed by the format's `Debug` then, less its round form);
+/// a two-layer ladder names itself in the text, so it moves the identity.
+#[test]
+fn the_identity_text_of_a_one_layer_ladder_is_unmoved() {
+    use multilinear::whir_chain::{ArgueFormat, ChainFormat, GkrLadder, GkrPack};
+    let format = |argue: ArgueFormat| ChainFormat {
+        argue,
+        ..ChainFormat::DEFAULT
+    };
+    assert_eq!(
+        super::wlfm::format_identity_text(&format(ArgueFormat::BATCHED)),
+        "ChainFormat { cap: Off, folds: Uniform, stack: StackVars(25), nonces: Three, argue: \
+         Batched { bin_log_cells: 26, pack: Chunks { tree_log_cells: 22 } }, arity4_cap: Off, \
+         group: PerPoly, leaves: Natural, round0: Each, final_poly: Off }"
+    );
+    let off = ArgueFormat::Batched {
+        bin_log_cells: 25,
+        pack: GkrPack::Off,
+        ladder: GkrLadder::Single,
+    };
+    assert_eq!(
+        super::wlfm::format_identity_text(&format(off)),
+        "ChainFormat { cap: Off, folds: Uniform, stack: StackVars(25), nonces: Three, argue: \
+         Batched { bin_log_cells: 25, pack: Off }, arity4_cap: Off, group: PerPoly, leaves: \
+         Natural, round0: Each, final_poly: Off }"
+    );
+    let double = super::wlfm::format_identity_text(&format(
+        ArgueFormat::BATCHED.with_ladder(GkrLadder::Double),
+    ));
+    assert!(double.contains("ladder: Double"), "{double}");
+    assert_ne!(
+        double,
+        super::wlfm::format_identity_text(&format(ArgueFormat::BATCHED))
+    );
+}
