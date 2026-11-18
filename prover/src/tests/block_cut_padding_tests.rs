@@ -424,8 +424,20 @@ fn a_streamed_block_counts_the_tables_of_the_rule_in_effect() {
             ..options(MaxRowsConfig::small(), Some(3), layout_workers)
         };
         let (proof, stamps) =
-            prove_block_whir_with(&elf, &[], &opts, &format, &o, &Deviations::default())
-                .unwrap_or_else(|e| panic!("{padding:?}, {what}: {e:?}"));
+            // KECCAK_RND built at the finish, so the rest's regenerator has
+            // its tables to drop and build again.
+            prove_block_whir_with(
+                &elf,
+                &[],
+                &opts,
+                &format,
+                &o,
+                &Deviations {
+                    stream_keccak_rnd: Some(false),
+                    ..Deviations::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{padding:?}, {what}: {e:?}"));
         assert_eq!(
             cut_counts(&proof),
             [1, tables, 0, 0],

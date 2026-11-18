@@ -2372,11 +2372,15 @@ fn page_direct_from(value: Option<&str>) -> bool {
     value.is_none_or(|v| v.trim() != "0")
 }
 
-/// `LAMBDA_VM_FINISH_KECCAK_W_SPLIT=1`: the sliding finish fills each KECCAK_W
-/// table as up to [`crate::tables::gpack::SPLIT_MAX_PARTS`] row ranges at once
-/// ([`keccak_w_bounds`]), on the pool it runs on; unset or any other word, one
-/// fill a table (today's). A KECCAK_W row reads its own operation alone, so the
-/// tables are the same, word for word and packed byte for byte.
+/// `LAMBDA_VM_FINISH_KECCAK_W_SPLIT`: unset or any word but `0` (the default),
+/// the sliding finish fills each KECCAK_W table as up to
+/// [`crate::tables::gpack::SPLIT_MAX_PARTS`] row ranges at once
+/// ([`keccak_w_bounds`]), on the pool it runs on; `0`, one fill a table (the
+/// rollback). A KECCAK_W row reads its own operation alone, so the tables are
+/// the same, word for word and packed byte for byte. With KECCAK_RND handed
+/// out during the windows (`LAMBDA_VM_STREAM_KECCAK_RND`) the median and the
+/// large block's phase A end 0.23 / 0.27 s sooner; alone it adds 0.07 s to the
+/// large's, so the two are on together.
 pub(crate) fn keccak_w_split() -> bool {
     #[cfg(test)]
     if let Some(on) = keccak_w_split_test::on() {
@@ -2394,7 +2398,7 @@ pub(crate) fn keccak_w_split() -> bool {
 
 /// [`keccak_w_split`]'s reading of `LAMBDA_VM_FINISH_KECCAK_W_SPLIT`.
 fn keccak_w_split_from(value: Option<&str>) -> bool {
-    value.is_some_and(|v| v.trim() == "1")
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 /// The fewest rows a part of a split KECCAK_W fill holds: a table of 2^17 rows
