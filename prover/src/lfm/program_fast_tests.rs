@@ -167,3 +167,41 @@ fn a_twice_written_address_compiles_in_parallel_to_a_refused_program() {
     assert!(super::validator::validate(&program).is_err());
     assert!(verdict(&program).is_err());
 }
+
+/// The beside-nice knob's name; only `1` turns it on, and it is off by
+/// default.
+#[test]
+fn the_beside_nice_knob_is_named_and_off_by_default() {
+    use super::levels::{BESIDE_NICE_ENV, beside_nice};
+    use super::wlfm_knobs::knob_word_on;
+    assert_eq!(BESIDE_NICE_ENV, "LAMBDA_VM_LEVELS_BESIDE_NICE");
+    assert!(knob_word_on(Some("1")) && !knob_word_on(Some("0")) && !knob_word_on(None));
+    if std::env::var_os(BESIDE_NICE_ENV).is_none() {
+        assert!(!beside_nice());
+    }
+}
+
+/// Level 1's stacks prepared on the beside pool are the prepare's on the
+/// prover's pool: the same identity, the same prepared cells, the same chip
+/// prefixes, committed.
+#[test]
+fn the_beside_pool_prepares_the_same_level() {
+    use super::levels::{prepare_level, prepare_level_beside, set_beside_nice_for_test};
+    use super::wlfm::{StackPlace, WlfmFamily};
+    let program = super::b3l_wlfm_tests::honest();
+    // Today's chains and the round form's.
+    for rounds in [None, Some(3)] {
+        let plain = prepare_level(&program, WlfmFamily::B3, rounds).expect("prepares");
+        let beside = {
+            let _nice = set_beside_nice_for_test(true);
+            prepare_level_beside(&program, WlfmFamily::B3, rounds)
+                .expect("prepares on the beside pool")
+        };
+        assert_eq!(plain.prepared_cells(), beside.prepared_cells());
+        let plain = plain.commit(StackPlace::Host).expect("commits");
+        let beside = beside.commit(StackPlace::Host).expect("commits");
+        assert_eq!(beside.artifacts.rounds, rounds);
+        assert_eq!(beside.artifacts.program_id, plain.artifacts.program_id);
+        assert!(beside.chip_prefixes() == plain.chip_prefixes());
+    }
+}

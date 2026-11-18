@@ -795,17 +795,30 @@ fn rta_one_run(
     use super::levels::prove_block_levels;
     let (elf, input) = (elf.to_vec(), input.to_vec());
     let opts = opts.clone();
-    let run = prove_block_levels(
-        &elf,
-        &input,
-        &opts,
-        &cfg.format,
-        &cfg.options,
-        family,
-        LevelStop::Levels(levels),
-        beside,
-        build_beside,
-    )
+    // A panic anywhere under the driver (a card that ran out where a path
+    // has no fallback, say) is a refused block on its own line too, never a
+    // run that just stops.
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prove_block_levels(
+            &elf,
+            &input,
+            &opts,
+            &cfg.format,
+            &cfg.options,
+            family,
+            LevelStop::Levels(levels),
+            beside,
+            build_beside,
+        )
+    }))
+    .unwrap_or_else(|panic| {
+        let what = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        Err(format!("the prover panicked: {what}"))
+    })
     .unwrap_or_else(|e| {
         // The driver refused the block: said on its own line, then the test
         // fails with it.
@@ -833,11 +846,12 @@ fn rta_one_run(
     );
     println!(
         "RTA LEVEL1 EMIT: program fast {} · walk {:.3}s · compile {:.3}s · validate before the \
-         execution {:.3}s",
+         execution {:.3}s · beside nice {}",
         t.validated_beside.is_some(),
         t.emit_split.0,
         t.emit_split.1,
-        t.emit_split.2
+        t.emit_split.2,
+        super::levels::beside_nice()
     );
     match t.validated_beside {
         Some((secs, at)) => println!(
@@ -847,6 +861,30 @@ fn rta_one_run(
         ),
         None => println!("RTA LEVEL1 VALIDATE: beside off"),
     }
+    let landing = &t.landing;
+    let list = |xs: Vec<String>| xs.join(" ");
+    println!(
+        "RTA LEVEL1 LANDING: setup {:.3}s · front at {:.3}s (wave {:.3}s) · base end {:.3}s · arrivals {} · \
+         landed {}",
+        landing.setup,
+        landing.front.0,
+        landing.front.1,
+        t.base,
+        list(
+            landing
+                .arrivals
+                .iter()
+                .map(|(g, at)| format!("{g}@{at:.3}"))
+                .collect()
+        ),
+        list(
+            landing
+                .landed
+                .iter()
+                .map(|(i, at, secs)| format!("{i}@{at:.3}+{secs:.3}"))
+                .collect()
+        ),
+    );
     let (lean, lean_wait) = t.lean_beside.unwrap_or_default();
     // Level 1's thread ends once its execution and the lean fill beside it
     // have: what of that is after the base is in series.
@@ -1136,7 +1174,7 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
             "{tag} GROUP {g}: tables {} · polys {} · cells {} · wait A {:.3}s · up A {:.3}s (paid \
              {:.3}) · commit {:.3}s · retire {:.3}s · up B {:.3}s · argue {:.3}s · encode {:.3}s · \
              open {:.3}s · prepared revive {:.3}s · open paid {:.3}s · overlapped {} · columns gone \
-             before revive {} · turn {:.3}-{:.3}s · GiB promised: commit {:.2}/{:.2} · argue {:.2}/{:.2} · open {:.2}",
+             before revive {} · turn {:.3}-{:.3}s · GiB promised: commit {:.2}/{:.2} · argue {:.2}/{:.2} · open {:.2}{}",
             s.tables,
             s.polys,
             s.cells,
@@ -1160,6 +1198,19 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
             gib(s.argue_base),
             gib(s.argue_reserved),
             gib(s.open_reserved),
+            match s.argue_card {
+                Some(c) => format!(
+                    " · card at the argue: real peak {:.2} of {:.2} GiB (pool reserved peak {:.2}, used \
+                     peak {:.2}; free at its end {:.2}) · margin {:.2} GiB",
+                    gib(c.real_peak()),
+                    gib(c.total),
+                    gib(c.reserved_peak),
+                    gib(c.used_peak),
+                    gib(c.free_now),
+                    gib(c.total.saturating_sub(c.real_peak())),
+                ),
+                None => String::new(),
+            },
         );
     }
 }

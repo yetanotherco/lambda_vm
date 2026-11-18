@@ -190,8 +190,9 @@ pub struct Backend {
     /// Free-list of pre-created events for [`Backend::take_event`].
     event_pool: Mutex<Vec<cudarc::driver::CudaEvent>>,
     /// VRAM budget (bytes) for admission control. See
-    /// [`detect_vram_budget_bytes`].
-    vram_budget_bytes: u64,
+    /// [`detect_vram_budget_bytes`]; a caller may move it for a phase of its
+    /// own ([`Backend::set_vram_budget_bytes`]).
+    vram_budget_bytes: AtomicU64,
     /// Device bytes promised to structures that are still alive. See
     /// [`Backend::reserve`].
     reserved: AtomicU64,
@@ -593,7 +594,7 @@ impl DeviceReservation {
         let Ok(be) = backend() else { return false };
         let mut held = be.reserved.load(Ordering::Relaxed);
         loop {
-            if held.saturating_add(extra) > be.vram_budget_bytes {
+            if held.saturating_add(extra) > be.vram_budget_bytes() {
                 return false;
             }
             match be.reserved.compare_exchange_weak(
@@ -722,6 +723,54 @@ pub fn pool_used_bytes() -> Result<(u64, u64)> {
         read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
         read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH)?,
     ))
+}
+
+/// The default pool's bytes reserved from the device, `(now, high-water)`:
+/// what the pool holds of the card, used or not.
+pub fn pool_reserved_bytes() -> Result<(u64, u64)> {
+    use cudarc::driver::sys;
+    let be = backend()?;
+    let read = |attribute| -> Result<u64> {
+        let mut value = 0u64;
+        // SAFETY: as in `pool_used_bytes`.
+        unsafe {
+            let pool = default_mempool(&be.ctx).ok_or(cudarc::driver::DriverError(
+                sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+            ))?;
+            sys::cuMemPoolGetAttribute(
+                pool,
+                attribute,
+                &mut value as *mut u64 as *mut core::ffi::c_void,
+            )
+            .result()?;
+        }
+        Ok(value)
+    };
+    Ok((
+        read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
+        read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH)?,
+    ))
+}
+
+/// Restarts [`pool_reserved_bytes`]'s high-water mark (as
+/// [`reset_pool_high_water`] does the used one's).
+pub fn reset_pool_reserved_high_water() -> Result<()> {
+    use cudarc::driver::sys;
+    let be = backend()?;
+    let zero = 0u64;
+    // SAFETY: as in `reset_pool_high_water`.
+    unsafe {
+        let pool = default_mempool(&be.ctx).ok_or(cudarc::driver::DriverError(
+            sys::CUresult::CUDA_ERROR_NOT_SUPPORTED,
+        ))?;
+        sys::cuMemPoolSetAttribute(
+            pool,
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+            &zero as *const u64 as *mut core::ffi::c_void,
+        )
+        .result()?;
+    }
+    Ok(())
 }
 
 /// Restarts [`pool_used_bytes`]'s high-water mark. The driver only resets it
@@ -1372,7 +1421,7 @@ impl Backend {
             staging_pairs: StagingPool::default(),
             event_pool,
             util_stream,
-            vram_budget_bytes,
+            vram_budget_bytes: AtomicU64::new(vram_budget_bytes),
             reserved: AtomicU64::new(0),
         })
     }
@@ -1380,7 +1429,16 @@ impl Backend {
     /// VRAM budget in bytes for admission control. `u64::MAX`
     /// when budgeting is disabled (query failed). See the field docs.
     pub fn vram_budget_bytes(&self) -> u64 {
-        self.vram_budget_bytes
+        self.vram_budget_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Moves the budget to `bytes` and returns the one it replaces. Promises
+    /// already made stay made; only later ones are checked against the new
+    /// budget. For a phase that knows its own card room better than the
+    /// detected default (the recursion levels after the base), which puts the
+    /// old budget back when it ends.
+    pub fn set_vram_budget_bytes(&self, bytes: u64) -> u64 {
+        self.vram_budget_bytes.swap(bytes, Ordering::Relaxed)
     }
 
     /// Live `(free, total)` device memory in bytes, for diagnostics — the
@@ -1460,7 +1518,7 @@ impl Backend {
         let mut evicted = !evict;
         let mut held = self.reserved.load(Ordering::Relaxed);
         loop {
-            if held.saturating_add(bytes) > self.vram_budget_bytes {
+            if held.saturating_add(bytes) > self.vram_budget_bytes() {
                 // ★ Before giving up, ask the retention for spare bytes ONCE. The
                 // retention holds only genuinely-spare leaf layers and gives them
                 // back here, so a real caller (argue) is never displaced by a
@@ -1473,7 +1531,9 @@ impl Backend {
                 // as it would after evicting them.
                 if !evicted {
                     evicted = true;
-                    let deficit = held.saturating_add(bytes) - self.vram_budget_bytes;
+                    let deficit = held
+                        .saturating_add(bytes)
+                        .saturating_sub(self.vram_budget_bytes());
                     if try_evict_retained(deficit) > 0 {
                         held = self.reserved.load(Ordering::Relaxed);
                         continue;

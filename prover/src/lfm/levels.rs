@@ -298,6 +298,110 @@ pub fn program_fast() -> bool {
 #[cfg(test)]
 static PROGRAM_FAST_FOR_TEST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 
+/// `LAMBDA_VM_LEVELS_BESIDE_NICE=1`: the host work the driver runs beside the
+/// base's phase B that level 1's execution does not wait for (its stacks'
+/// columns prepared on the host, [`prepare_level`], and the validator beside
+/// the execution) runs below the prover's threads: the prepare on a pool of
+/// its own whose threads are lowered to [`BESIDE_NICE`] (Linux), the
+/// validator's thread lowered too. Phase B's host work is then scheduled
+/// first and the prepare takes the cycles it leaves; on a real median the
+/// prepare had ≈ 2.2 s to spare before level 1's prove needed its stacks and
+/// the validator ≈ 4.3 s before the execution's end, while the two cost the
+/// base's phase B ≈ 1 s on the prover's pool. Off by default (and for any word
+/// but `1`). The order of the work changes, never its result.
+pub const BESIDE_NICE_ENV: &str = "LAMBDA_VM_LEVELS_BESIDE_NICE";
+
+/// The nice value [`BESIDE_NICE_ENV`]'s threads run at on Linux.
+pub const BESIDE_NICE: i32 = 10;
+
+/// How level 1's streamed execution met the base's groups, on the driver's
+/// clock: what it ran before any group (its setup and first wave), when the
+/// front landed and its wave, when each group's share arrived from phase B,
+/// and when each piece landed with its wave's seconds. A report: nothing reads
+/// it but the harness.
+#[derive(Clone, Debug, Default)]
+pub struct Level1Landing {
+    /// Seconds from the execution's start to its setup's end (the first wave,
+    /// the instructions that read no arena, included).
+    pub setup: f64,
+    /// When the front landed, and its wave's seconds.
+    pub front: (f64, f64),
+    /// When each group's share arrived, in arrival order: `(group, at)`.
+    pub arrivals: Vec<(usize, f64)>,
+    /// When each piece landed, in landing order: `(piece, at, wave seconds)`.
+    pub landed: Vec<(usize, f64, f64)>,
+}
+
+/// Whether the driver lowers its beside work ([`BESIDE_NICE_ENV`]), or a
+/// test's override.
+pub fn beside_nice() -> bool {
+    #[cfg(test)]
+    if let Some(on) = *BESIDE_NICE_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(BESIDE_NICE_ENV).ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+static BESIDE_NICE_FOR_TEST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// A test's [`beside_nice`] for every thread until the guard drops.
+#[cfg(test)]
+pub(crate) fn set_beside_nice_for_test(on: bool) -> BesideNiceForTest {
+    let before = BESIDE_NICE_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(on);
+    BesideNiceForTest(before)
+}
+
+#[cfg(test)]
+pub(crate) struct BesideNiceForTest(Option<bool>);
+
+#[cfg(test)]
+impl Drop for BesideNiceForTest {
+    fn drop(&mut self) {
+        *BESIDE_NICE_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = self.0;
+    }
+}
+
+/// The beside work's own pool ([`BESIDE_NICE_ENV`]): as many threads as the
+/// prover's pool, each lowered to [`BESIDE_NICE`]. Built once a process;
+/// `None` if it cannot be (the work then runs on the prover's pool).
+fn beside_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads())
+            .thread_name(|i| format!("levels-beside-{i}"))
+            .start_handler(|_| super::whir_block_tree::lower_this_threads_priority(BESIDE_NICE))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// [`prepare_level`] as the driver runs it beside the base: on the beside pool
+/// under [`beside_nice`], on the prover's pool otherwise. The same prebuild.
+pub(crate) fn prepare_level_beside(
+    program: &LfmProgram,
+    family: WlfmFamily,
+    rounds: Option<u8>,
+) -> Result<WlfmPrebuild, String> {
+    match beside_nice().then(beside_pool).flatten() {
+        Some(pool) => pool.install(|| prepare_level(program, family, rounds)),
+        None => prepare_level(program, family, rounds),
+    }
+}
+
 /// A test's [`program_fast`] for every thread until the guard drops.
 #[cfg(test)]
 pub(crate) fn set_program_fast_for_test(on: bool) -> ProgramFastForTest {
@@ -327,6 +431,9 @@ pub(crate) fn spawn_validation<'scope, 'env>(
     program: &'env LfmProgram,
 ) -> std::thread::ScopedJoinHandle<'scope, Result<f64, String>> {
     scope.spawn(move || {
+        if beside_nice() {
+            super::whir_block_tree::lower_this_threads_priority(BESIDE_NICE);
+        }
         let t = std::time::Instant::now();
         super::validator::validate(program)
             .map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
@@ -454,6 +561,99 @@ struct PadRelease;
 impl Drop for PadRelease {
     fn drop(&mut self) {
         release_levels_pad();
+    }
+}
+
+/// `LAMBDA_VM_LEVELS_CARD_BUDGET_PCT=<percent>`: from the base's end to the
+/// driver's return, the card ledger's budget is this share of the card's
+/// memory instead of the base's (80 %, or `LAMBDA_VM_VRAM_BUDGET_MB`); the
+/// base's comes back when the driver returns, by any path. The base runs
+/// beside its own pools, staging and caches; after it the driver settles the
+/// card (every stream drained, the pool trimmed), and the levels' one table
+/// of 2^29 cells on a large block needs its GKR trees on the card at once: at
+/// 80 % its argue was refused a 1.73 GiB tree with 0.86 GiB of room and built
+/// on the host (13.4 s). At 85 % the card's real peak through every argue is
+/// read beside the ledger (`card at the argue`, phase B's card windows).
+/// Unset or empty: [`LEVELS_CARD_BUDGET_DEFAULT_PCT`]. A whole number from 50
+/// to 95 overrides it (80 gives the levels the base's default share);
+/// anything else is refused. A prover's choice, never the proof's: a refused
+/// promise has a host path.
+pub const CARD_BUDGET_ENV: &str = "LAMBDA_VM_LEVELS_CARD_BUDGET_PCT";
+
+/// The levels' share of the card when [`CARD_BUDGET_ENV`] says nothing.
+pub const LEVELS_CARD_BUDGET_DEFAULT_PCT: u64 = 85;
+
+/// What [`CARD_BUDGET_ENV`] says: the percent ([`LEVELS_CARD_BUDGET_DEFAULT_PCT`]
+/// when unset or empty).
+pub fn parse_card_budget(value: Option<&str>) -> Result<Option<u64>, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(Some(LEVELS_CARD_BUDGET_DEFAULT_PCT)),
+        Some(v) => match v.parse::<u64>() {
+            Ok(pct) if (50..=95).contains(&pct) => Ok(Some(pct)),
+            _ => Err(format!(
+                "{CARD_BUDGET_ENV} must be a whole percent from 50 to 95, got `{v}`"
+            )),
+        },
+    }
+}
+
+/// The levels' share of the card: [`CARD_BUDGET_ENV`], or its default; `None`
+/// (the base's budget kept) when the knob says nothing and the process set
+/// its whole card budget itself (`LAMBDA_VM_VRAM_BUDGET_MB`, a test's
+/// throttle).
+fn card_budget_pct() -> Result<Option<u64>, String> {
+    static PCT: std::sync::OnceLock<Result<Option<u64>, String>> = std::sync::OnceLock::new();
+    PCT.get_or_init(|| {
+        let word = std::env::var(CARD_BUDGET_ENV).ok();
+        let silent = word.as_deref().is_none_or(|w| w.trim().is_empty());
+        if silent && std::env::var_os("LAMBDA_VM_VRAM_BUDGET_MB").is_some() {
+            return Ok(None);
+        }
+        parse_card_budget(word.as_deref())
+    })
+    .clone()
+}
+
+/// The base's budget while the levels' own is in force ([`CARD_BUDGET_ENV`]).
+static BASE_BUDGET: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// Puts the levels' budget in force ([`CARD_BUDGET_ENV`], 85 % by default) on
+/// a card of `total` bytes: the budget now (unchanged without a card, or when
+/// the process set its own card budget and the knob says nothing).
+fn take_levels_budget(total: Option<u64>) -> Result<u64, String> {
+    let (Some(pct), Some(total)) = (card_budget_pct()?, total) else {
+        return Ok(multilinear::gpu::reserve_budget());
+    };
+    let bytes = total / 100 * pct;
+    let base = multilinear::gpu::set_reserve_budget(bytes);
+    let mut held = BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_none() {
+        *held = Some(base);
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    eprintln!(
+        "LEVELS CARD budget: {:.2} GiB ({pct} % of {:.2}) for the levels, the base's {:.2} GiB back at \
+         the driver's return",
+        gib(bytes),
+        gib(total),
+        gib(held.unwrap_or(base))
+    );
+    Ok(bytes)
+}
+
+/// Puts the base's budget back, if the levels' was in force.
+fn release_levels_budget() {
+    if let Some(base) = BASE_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        multilinear::gpu::set_reserve_budget(base);
+    }
+}
+
+/// Puts the base's budget back when the driver returns, by any path.
+struct BudgetRelease;
+
+impl Drop for BudgetRelease {
+    fn drop(&mut self) {
+        release_levels_budget();
     }
 }
 
@@ -734,6 +934,8 @@ pub struct LevelsTimes {
     pub pieces: usize,
     pub waves_before_base: usize,
     pub wave_secs_before_base: f64,
+    /// How level 1's pieces landed ([`Level1Landing`]).
+    pub landing: Level1Landing,
     pub execute_tail: f64,
     /// Under [`PROGRAM_FAST_ENV`] (the default), level 1's validator beside
     /// its execution: its seconds, and when the execution's end found it done
@@ -901,7 +1103,9 @@ pub fn prove_block_levels(
     // reads starts from what is live, not from pages the allocator keeps.
     let purge_at_start = crate::alloc_purge::purge_now();
     card_pad_bytes()?;
+    card_budget_pct()?;
     let _pad = PadRelease;
+    let _budget = BudgetRelease;
     let peak_reset = reset_peak_rss();
     // What an earlier block left in the card's pool goes back too.
     let at_start = card_settle("start");
@@ -978,6 +1182,7 @@ pub fn prove_block_levels(
         Option<LeanBeside>,
         Option<(f64, f64)>,
         (f64, f64, f64),
+        Level1Landing,
     );
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
@@ -999,7 +1204,7 @@ pub fn prove_block_levels(
                     .map_err(|_| "level 1's program was never emitted")?;
                 let program = program_ref.get().ok_or("the program is set")?;
                 let plan = plan_ref.get().ok_or("the plan is set")?;
-                prepare_level(program, family, level_rounds(plan))
+                prepare_level_beside(program, family, level_rounds(plan))
             })
         });
         // Level 1's thread: the plan, the program, then its execute, a piece
@@ -1054,6 +1259,10 @@ pub fn prove_block_levels(
             let mut ex =
                 StreamedExecution::new_pieced_tapped(program, arena_pieces, &hasher, lean_beside)
                     .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
+            let mut landing = Level1Landing {
+                setup: now() - execute_from,
+                ..Level1Landing::default()
+            };
             // Under the knob, each wave's compressions go to a thread of their
             // own that makes the round records and counts as they come.
             let (lean_tx, lean_fill) = if lean_beside {
@@ -1081,6 +1290,7 @@ pub fn prove_block_levels(
                 Box::new(prx.iter().collect::<Vec<_>>().into_iter())
             };
             for (g, roots, answers, tables, argue, opening, prepared) in parts {
+                landing.arrivals.push((g, now()));
                 if !landed[0] {
                     let front = super::whir_block::leaf_arena_under(
                         &roots,
@@ -1092,8 +1302,10 @@ pub fn prove_block_levels(
                     .next()
                     .ok_or("no front")?;
                     held[0].set(front).map_err(|_| "the front landed twice")?;
+                    let at = now();
                     ex.land_piece(0, held[0].get().ok_or("the front")?)
                         .map_err(|e| format!("level 1's front: {e:?}"))?;
+                    landing.front = (at, now() - at);
                     hand_on_lean(&mut ex, lean_tx.as_ref());
                     landed[0] = true;
                 }
@@ -1125,6 +1337,8 @@ pub fn prove_block_levels(
                         waves_before += 1;
                         wave_secs_before += t.elapsed().as_secs_f64();
                     }
+                    let secs = t.elapsed().as_secs_f64();
+                    landing.landed.push((i, now() - secs, secs));
                     landed[i] = true;
                 }
             }
@@ -1161,6 +1375,7 @@ pub fn prove_block_levels(
                 lean,
                 validated,
                 emit_split,
+                landing,
             ))
         });
         let prove_base = || {
@@ -1204,6 +1419,7 @@ pub fn prove_block_levels(
                         return Err("the base did not prove".to_string());
                     }
                     let settled = card_settle("base end");
+                    take_levels_budget(settled.map(|c| c.total))?;
                     take_levels_pad()?;
                     let build = commit_level(pre, 1)?;
                     let committed = card_settle("level 1 committed");
@@ -1240,7 +1456,9 @@ pub fn prove_block_levels(
         lean,
         validated,
         emit_split,
+        landing,
     ) = level1.map_err(|_| "level 1's thread panicked")??;
+    times.landing = landing;
     times.validated_beside = validated;
     times.emit_split = emit_split;
     // A lean fill beside that was fed a compression twice, or missed one, is
@@ -1271,6 +1489,7 @@ pub fn prove_block_levels(
             let pre = prepare_level(&program, family, level_rounds(&plan))?;
             let (prepare, cells) = (pre.secs(), pre.prepared_cells());
             let settled = card_settle("base end");
+            take_levels_budget(settled.map(|c| c.total))?;
             take_levels_pad()?;
             let build = commit_level(pre, 1)?;
             let committed = card_settle("level 1 committed");
