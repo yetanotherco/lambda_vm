@@ -2694,6 +2694,9 @@ pub struct LayoutStamps {
     pub workers: usize,
     pub marks: Vec<(&'static str, f64)>,
     pub closed_at: Vec<f64>,
+    /// The packer closed its open group ahead of BITWISE
+    /// ([`close_before_bitwise`]).
+    pub closed_before_bitwise: bool,
     pub blocked: f64,
     pub chunks: f64,
     /// The rest's five slowest tables to lay out and its first in AIR order.
@@ -5051,6 +5054,10 @@ pub(crate) struct Deviations {
     /// first table (`Some(false)`), instead of the knob
     /// ([`rest_airs_beside`]).
     pub rest_airs_beside: Option<bool>,
+    /// The packer closes its open group ahead of BITWISE when BITWISE would
+    /// not fit it (`Some(true)`), or at BITWISE's arrival (`Some(false)`),
+    /// instead of the knob ([`close_before_bitwise`]).
+    pub close_before_bitwise: Option<bool>,
     /// KECCAK_RND's tables handed out during the windows (`Some(true)`) or
     /// built at the finish (`Some(false)`), instead of the knob
     /// ([`stream_keccak_rnd_records`]).
@@ -6569,6 +6576,66 @@ impl RestOrder {
         }
         Ok(())
     }
+
+    /// Whether the only table still due is the one at `position`.
+    fn only_due(&self, position: usize) -> bool {
+        self.due.get(self.next..) == Some(&[position][..])
+    }
+}
+
+/// The packer told, ahead of BITWISE (handed last), that only BITWISE is left
+/// and what shape it has ([`close_before_bitwise`]): the rest's message after
+/// which BITWISE is the only table due, and its shape; and whether the packer
+/// closed its open group then.
+#[derive(Default)]
+pub(crate) struct CloseAhead {
+    last: std::sync::OnceLock<(usize, (usize, usize))>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// The knob of [`close_before_bitwise`].
+const CLOSE_BEFORE_BITWISE_ENV: &str = "LAMBDA_VM_CLOSE_BEFORE_BITWISE";
+
+/// Whether the packer closes its open group as soon as BITWISE (handed last,
+/// its shape known) is the only table left and would not fit it, rather than
+/// when BITWISE arrives: a deviation's choice, else
+/// `LAMBDA_VM_CLOSE_BEFORE_BITWISE` (off by default). The group would close at
+/// BITWISE's arrival all the same, so the groups and the proof's bytes are the
+/// same; the group's commit runs beside BITWISE's build instead of after it.
+fn close_before_bitwise(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => parse_close_before_bitwise(std::env::var(CLOSE_BEFORE_BITWISE_ENV).ok().as_deref()),
+    }
+}
+
+/// `LAMBDA_VM_CLOSE_BEFORE_BITWISE`: unset, empty or `0` (the default) closes
+/// at BITWISE's arrival; `1` closes ahead of it. Anything else refuses the
+/// prove.
+fn parse_close_before_bitwise(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{CLOSE_BEFORE_BITWISE_ENV}={v}: 0 (the default: at BITWISE's arrival) or 1 (ahead of it)"
+        ))),
+    }
+}
+
+/// Whether `open` and then `next` would take a group past `max_polys` under
+/// `cap`: the rule [`Packer::place`] closes a group by.
+fn past_budget(
+    open: &[(usize, usize)],
+    next: (usize, usize),
+    cap: multilinear::whir_chain::StackVars,
+    max_polys: usize,
+) -> Result<bool, Error> {
+    let mut shapes = open.to_vec();
+    shapes.push(next);
+    Ok(stark::multilinear_table::global_layout(&shapes, cap)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?
+        .num_polys()
+        > max_polys)
 }
 
 /// The rest's positions of KECCAK_RND's tables, the order the finish hands them
@@ -6628,6 +6695,8 @@ struct Packer<'a> {
     /// KECCAK_RND's streamed chunks' own open group, when they are packed
     /// apart (`None`: packed with the others).
     own: Option<OwnGroups<'a>>,
+    /// Told ahead of BITWISE ([`close_before_bitwise`]).
+    close_ahead: Option<std::sync::Arc<CloseAhead>>,
 }
 
 /// KECCAK_RND's streamed chunks packed apart from the other streamed chunks
@@ -6723,6 +6792,33 @@ impl<'a> Packer<'a> {
         self.open_keys.push(key);
         if let Some(own) = self.own.as_mut() {
             own.main_places.push(place);
+        }
+        Ok(())
+    }
+
+    /// After the rest's message `k`: when the packer was told that only
+    /// BITWISE follows it and BITWISE's shape would take the open group past
+    /// its budget, the group closes now, as it would at BITWISE's arrival.
+    fn close_ahead_of_bitwise(&mut self, k: usize) -> Result<(), Error> {
+        let Some(ahead) = self.close_ahead.clone() else {
+            return Ok(());
+        };
+        let Some(&(after, shape)) = ahead.last.get() else {
+            return Ok(());
+        };
+        if after != k || self.open.is_empty() {
+            return Ok(());
+        }
+        if past_budget(&self.open_shapes, shape, self.cap, self.max_polys)? {
+            eprintln!(
+                "BLOCK PACKER: the open group ({} tables) closed before BITWISE, which would not fit it",
+                self.open.len()
+            );
+            self.open_shapes.clear();
+            self.close()?;
+            ahead
+                .closed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }
@@ -7129,7 +7225,20 @@ fn stream_pipelined<'a, R>(
                 while let Some(laid) = waiting.remove(&next) {
                     let (i, shape, table) = laid?;
                     placed.push((i, shape));
+                    if let Some(ahead) = &packer.close_ahead
+                        && let Some(&(after, told)) = ahead.last.get()
+                        && after + 1 == next
+                        && told != shape
+                    {
+                        // Told wrong, the groups may differ from the
+                        // packer's own rule's (any partition proves; the
+                        // bytes are then not the knob-off ones).
+                        eprintln!(
+                            "BLOCK PACKER: BITWISE's shape {shape:?} is not the {told:?} it was told"
+                        );
+                    }
                     packer.place(Key::Air(i), shape, table)?;
+                    packer.close_ahead_of_bitwise(next)?;
                     if let Some(gate) = gate {
                         gate.release(next);
                     }
@@ -7532,6 +7641,7 @@ fn lay_out_rest_streamed<'a>(
     memory: crate::tables::fused_memory::MemoryFormat,
     ecdas: crate::tables::ecdas::EcdasForm,
     page_run_log2: u8,
+    close_ahead: Option<std::sync::Arc<CloseAhead>>,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
@@ -7756,13 +7866,33 @@ fn lay_out_rest_streamed<'a>(
             same_air(air, *run)?;
         }
     }
+    // The rest's messages sent so far (each table laid out is one).
+    let mut sent = before
+        .iter()
+        .filter(|(_, width, _)| width.is_some())
+        .count();
+    // BITWISE's shape, a fixed table's: its AIR's columns, 2^20 rows.
+    let bitwise_shape = (
+        refs.first().map_or(0, |air| air.trace_layout().0),
+        crate::tables::bitwise::NUM_ROWS.trailing_zeros() as usize,
+    );
     for crate::tables::trace_builder::Emitted { position, table } in held.into_iter().chain(tables)
     {
         order.admit(position, table.as_ref().map(|t| t.main_table.width))?;
         let Some(trace) = table else {
             continue;
         };
+        // BITWISE handed last and the only table left once this one is laid
+        // out: the packer is told before this table reaches it.
+        if let Some(ahead) = &close_ahead
+            && header.bitwise_last
+            && position != 0
+            && order.only_due(0)
+        {
+            let _ = ahead.last.set((sent, bitwise_shape));
+        }
         lay_one(refs[position], position, trace, &mut marks);
+        sent += 1;
     }
     order.finish()?;
     marks.push(("rest laid out", at()));
@@ -8155,6 +8285,16 @@ fn prove_streamed(
             }
         );
         let airs_beside = rest_airs_beside(deviations.rest_airs_beside)?;
+        let close_ahead = close_before_bitwise(deviations.close_before_bitwise)?
+            .then(|| std::sync::Arc::new(CloseAhead::default()));
+        eprintln!(
+            "★ BLOCK CLOSE BEFORE BITWISE: {} ({CLOSE_BEFORE_BITWISE_ENV})",
+            if close_ahead.is_some() {
+                "on (the open group closes as soon as BITWISE alone is left and would not fit it)"
+            } else {
+                "off (the default; at BITWISE's arrival)"
+            }
+        );
         #[cfg(test)]
         let misnamed = deviations.rest_airs_beside_misnamed;
         #[cfg(not(test))]
@@ -8962,6 +9102,7 @@ fn prove_streamed(
                         placed: 0,
                         recorder,
                     }),
+                    close_ahead: close_ahead.clone(),
                 };
                 // Off the inline path, the prepared columns wait until the
                 // groups are sent.
@@ -8999,6 +9140,7 @@ fn prove_streamed(
                         format.memory,
                         format.ecdas,
                         format.page_runs(),
+                        close_ahead.clone(),
                     ),
                 };
                 let (streamed, rest) = if inline {
@@ -9147,6 +9289,9 @@ fn prove_streamed(
                         workers: options.layout_workers,
                         marks,
                         closed_at,
+                        closed_before_bitwise: close_ahead.as_ref().is_some_and(|ahead| {
+                            ahead.closed.load(std::sync::atomic::Ordering::Relaxed)
+                        }),
                         blocked,
                         chunks,
                         slowest,
@@ -12364,6 +12509,7 @@ mod packer_tests {
                 ledger: None,
                 open_bytes: 0,
                 own: None,
+                close_ahead: None,
             };
             for (index, &ops) in heights.iter().enumerate() {
                 let ops: Vec<LtOperation> = (0..ops as u64)
@@ -13398,5 +13544,34 @@ mod phase_b_many_first_tests {
         assert_eq!(group_of_most_tables(&[]), None);
         let order = put_first(&[3], (0..5).collect()).expect("a permutation");
         assert_eq!(order, vec![3, 0, 1, 2, 4]);
+    }
+}
+
+#[cfg(test)]
+mod close_before_bitwise_tests {
+    use super::{parse_close_before_bitwise, past_budget};
+
+    /// The knob is off unless it says `1`; other words refuse the prove.
+    #[test]
+    fn the_close_before_bitwise_knob_is_off_by_default_and_refuses_other_words() {
+        for off in [None, Some(""), Some("0"), Some(" 0\n")] {
+            assert!(!parse_close_before_bitwise(off).expect("off"), "{off:?}");
+        }
+        assert!(parse_close_before_bitwise(Some("1")).expect("on"));
+        for bad in ["2", "on", "true", "yes"] {
+            assert!(parse_close_before_bitwise(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// The close-ahead rule is the packer's own: a group past its budget with
+    /// the next shape added would close, one within it would not.
+    #[test]
+    fn the_close_ahead_rule_is_the_packers_budget() {
+        let cap = multilinear::whir_chain::StackVars::new(10).expect("a stack");
+        let small = (4usize, 10usize);
+        let bitwise = (11usize, 20usize);
+        assert!(!past_budget(&[small], small, cap, 8).expect("a layout"));
+        assert!(past_budget(&[small], bitwise, cap, 8).expect("a layout"));
+        assert!(past_budget(&[small, small], small, cap, 1).expect("a layout"));
     }
 }
