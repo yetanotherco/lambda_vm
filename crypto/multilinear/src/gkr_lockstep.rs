@@ -560,6 +560,15 @@ where
         }))
     }
 
+    /// The two-layer step over nine factors, `eq` first, then `h₀`'s and
+    /// `h₁`'s `p_lo, p_hi, q_lo, q_hi`.
+    fn double(polys: Vec<Mle<F>>, weights: &[FieldElement<F>; 2]) -> Self {
+        Self(HostRelation::Double(DoubleRelation {
+            polys,
+            weights: weights.to_vec(),
+        }))
+    }
+
     /// The two-layer step over `grandchild`, layer `ℓ + 2` at `point`
     /// (`ℓ` coordinates): its quarters `b = 2b₁ + b₂` at offset `b·2^ℓ`,
     /// laid out `h₀ = (q₀₀, q₁₀)`, `h₁ = (q₀₁, q₁₁)` for `p` and `q` alike.
@@ -1027,6 +1036,28 @@ impl<F: IsField + 'static> GruenCard<F> for crate::gpu::GruenSession {
     }
 }
 
+impl<F: IsField + 'static> GruenCard<F> for crate::gpu::Gruen2Session {
+    fn rounds(&self) -> usize {
+        crate::gpu::Gruen2Session::rounds(self)
+    }
+
+    fn enqueue(&mut self, previous: Option<&FieldElement<F>>, want_h0: bool) -> Result<(), Error> {
+        crate::gpu::Gruen2Session::enqueue(self, previous, want_h0)
+    }
+
+    fn sums(
+        &mut self,
+        previous: Option<&FieldElement<F>>,
+        want_h0: bool,
+    ) -> Result<Vec<FieldElement<F>>, Error> {
+        crate::gpu::Gruen2Session::sums(self, previous, want_h0)
+    }
+
+    fn finish(&mut self, previous: Option<&FieldElement<F>>) -> Result<Vec<Mle<F>>, Error> {
+        crate::gpu::Gruen2Session::finish(self, previous)
+    }
+}
+
 /// The step over a device layer on Gruen's rounds ([`crate::gkr_gruen`], on
 /// with `gkr_gruen::argue_gkr_gruen` as today's per-table layers are): the
 /// tree's relation is `w_p·eq·(p_lo q_hi + p_hi q_lo + λ'·q_lo q_hi)` with
@@ -1037,6 +1068,10 @@ impl<F: IsField + 'static> GruenCard<F> for crate::gpu::GruenSession {
 /// factors, `eq` included, and steps on there.
 struct GruenStep<F: IsField, C> {
     session: Option<C>,
+    /// Whether the session is a two-layer step's: its card sums `H(1)..H(4)`
+    /// of a quartic and hands back eight factors, and the chain's messages
+    /// are of degree 5.
+    double: bool,
     chain: crate::gkr_gruen::Chain<F>,
     /// The layer's point `u`, one coordinate a round.
     point: Vec<FieldElement<F>>,
@@ -1082,6 +1117,30 @@ where
     }
 }
 
+impl<F: IsField + 'static> GruenStep<F, crate::gpu::Gruen2Session>
+where
+    FieldElement<F>: Send + Sync,
+{
+    /// The two-layer step over layer `layer`'s quarters on the card, or
+    /// `None` — before anything moves — when it cannot run this way.
+    fn open_double(
+        device: &crate::gpu::DeviceTree,
+        layer: usize,
+        point: &[FieldElement<F>],
+        weights: &[FieldElement<F>; 2],
+        claim: &(FieldElement<F>, FieldElement<F>),
+    ) -> Result<Option<Self>, Error> {
+        let Some(lambda) = gruen_lambda(weights) else {
+            return Ok(None);
+        };
+        let tail = crate::gkr_gruen::gkr_gruen_tail();
+        let Some(session) = device.gruen2_session(layer, point, &lambda, tail) else {
+            return Ok(None);
+        };
+        Self::over_double(session, point, weights, claim)
+    }
+}
+
 impl<F: IsField + 'static, C: GruenCard<F>> GruenStep<F, C>
 where
     FieldElement<F>: Send + Sync,
@@ -1093,6 +1152,26 @@ where
         weights: &[FieldElement<F>; 2],
         claim: &(FieldElement<F>, FieldElement<F>),
     ) -> Result<Option<Self>, Error> {
+        Self::over_kind(session, point, weights, claim, false)
+    }
+
+    /// The two-layer step over `session`, opened under `λ'` at `point`.
+    fn over_double(
+        session: C,
+        point: &[FieldElement<F>],
+        weights: &[FieldElement<F>; 2],
+        claim: &(FieldElement<F>, FieldElement<F>),
+    ) -> Result<Option<Self>, Error> {
+        Self::over_kind(session, point, weights, claim, true)
+    }
+
+    fn over_kind(
+        session: C,
+        point: &[FieldElement<F>],
+        weights: &[FieldElement<F>; 2],
+        claim: &(FieldElement<F>, FieldElement<F>),
+        double: bool,
+    ) -> Result<Option<Self>, Error> {
         let Some(lambda) = gruen_lambda(weights) else {
             return Ok(None);
         };
@@ -1102,6 +1181,7 @@ where
         let lefts = crate::gkr_gruen::inverse_lefts(&point[..session.rounds()]);
         let mut step = Self {
             session: Some(session),
+            double,
             chain,
             point: point.to_vec(),
             lefts,
@@ -1129,16 +1209,22 @@ where
             .iter()
             .map(|v| self.chain.kappa() * v)
             .collect();
-        let mut polys = Vec::with_capacity(5);
+        let factors = if self.double { 9 } else { 5 };
+        let mut polys = Vec::with_capacity(factors);
         polys.push(Mle::new(eq)?);
         polys.extend(halves);
-        if polys.len() != 5 {
+        if polys.len() != factors {
             return Err(Error::DeviceFailed {
                 stage: "layer factors",
             });
         }
         crate::gkr_gruen::note_layer(rounds as u64, false);
-        self.host = Some(HostStep::single(polys, &self.weights));
+        self.host = Some(if self.double {
+            crate::gkr_gruen::note_two_layer();
+            HostStep::double(polys, &self.weights)
+        } else {
+            HostStep::single(polys, &self.weights)
+        });
         Ok(())
     }
 }
@@ -1156,18 +1242,30 @@ where
         if left.is_none() {
             crate::gkr_gruen::note_direct_h0();
         }
-        let message = self
-            .chain
-            .message(
+        let message = if self.double {
+            if sums.len() < 4 {
+                return Err(Error::DeviceFailed {
+                    stage: "gruen message",
+                });
+            }
+            self.chain.message_quartic(
+                &self.point[self.round],
+                left,
+                [&sums[0], &sums[1], &sums[2], &sums[3]],
+                sums.get(4).filter(|_| left.is_none()),
+            )
+        } else {
+            self.chain.message(
                 &self.point[self.round],
                 left,
                 &sums[0],
                 &sums[1],
                 sums.get(2).filter(|_| left.is_none()),
             )
-            .ok_or(Error::DeviceFailed {
-                stage: "gruen message",
-            })?;
+        }
+        .ok_or(Error::DeviceFailed {
+            stage: "gruen message",
+        })?;
         let sent = message.sent.iter().map(|v| v * &self.weights[0]).collect();
         self.message = Some(message);
         Ok(sent)
@@ -1293,17 +1391,20 @@ where
         }))
     }
 
-    /// The two-layer step: on the host, over layer `layer` brought here
-    /// whole when the card holds it. A layer the card cannot hand over (an
-    /// input layer the tree keeps apart from its levels) fails here, and the
-    /// caller that can write it on the host does
+    /// The two-layer step: on the card's Gruen rounds over layer `layer`'s
+    /// quarters ([`crate::gpu::Gruen2Session`]) when the card holds the tree;
+    /// on the host over a level near the output (the one-layer step's prefix
+    /// rule: never the input layer), or wherever the card declines, over the
+    /// layer brought here whole. A layer the card can neither step nor hand
+    /// over (an input layer the tree keeps apart from its levels) fails here,
+    /// and the caller that can write it on the host does
     /// (`stark::multilinear_table::batched`'s input-on-host tree).
     fn step_double(
         &self,
         layer: usize,
         point: &[FieldElement<F>],
         weights: [FieldElement<F>; 2],
-        _claim: &(FieldElement<F>, FieldElement<F>),
+        claim: &(FieldElement<F>, FieldElement<F>),
     ) -> Result<Box<dyn TreeStep<F> + '_>, Error> {
         let Some(device) = self.device() else {
             return Ok(Box::new(HostStep::over_double(
@@ -1312,6 +1413,14 @@ where
                 weights,
             )?));
         };
+        let prefix = crate::HOST_CUBE_DIRECT.trailing_zeros() as usize + 1;
+        let near_the_output = layer <= prefix && layer + 1 < self.num_layers();
+        if !near_the_output
+            && crate::gkr_gruen::argue_gkr_gruen()
+            && let Some(step) = GruenStep::open_double(device, layer, point, &weights, claim)?
+        {
+            return Ok(Box::new(step));
+        }
         let (p, q) = device
             .layer_to_host::<F>(layer)
             .ok_or(Error::DeviceFailed {
@@ -2352,8 +2461,123 @@ mod tests {
         }
     }
 
+    /// The card's two-layer Gruen rounds on the host, value for value: the
+    /// eight factors (`h₀`'s `p_lo, p_hi, q_lo, q_hi`, then `h₁`'s) folded by
+    /// the previous challenge on the way in, `H(1)..H(4)` (and `H(0)`) of
+    /// `N + λQ` summed under the split weight. The relation is written out
+    /// by the two folds, as the card's reference composes it, not by the
+    /// card's algebra.
+    struct HostGruen2 {
+        f: Vec<Vec<FE>>,
+        m: usize,
+        low: usize,
+        e_lo: Vec<FE>,
+        e_hi: Vec<Vec<FE>>,
+        lambda: FE,
+        done: usize,
+        pending: Option<Vec<FE>>,
+    }
+
+    impl HostGruen2 {
+        fn new(grandchild: &FractionLayer<F>, point: &[FE], lambda: FE, low: usize) -> Self {
+            let quarter = grandchild.p.len() / 4;
+            let (p, q) = (grandchild.p.evals(), grandchild.q.evals());
+            let cells = |m: &[FE], b: usize| m[b * quarter..(b + 1) * quarter].to_vec();
+            let f = (0..2)
+                .flat_map(|b2| {
+                    [
+                        cells(p, b2),
+                        cells(p, b2 + 2),
+                        cells(q, b2),
+                        cells(q, b2 + 2),
+                    ]
+                })
+                .collect();
+            let m = point.len();
+            let low = low.min(m);
+            let rounds = m - low;
+            Self {
+                f,
+                m,
+                low,
+                e_lo: crate::eq::eq_evals(&point[rounds..]),
+                e_hi: (0..rounds)
+                    .map(|j| crate::eq::eq_evals(&point[j + 1..rounds]))
+                    .collect(),
+                lambda,
+                done: 0,
+                pending: None,
+            }
+        }
+
+        fn fold(&mut self, previous: Option<&FE>, width: usize) {
+            if let Some(s) = previous {
+                for g in self.f.iter_mut() {
+                    for x in 0..width {
+                        g[x] = g[x] + s * &(g[x + width] - g[x]);
+                    }
+                }
+            }
+        }
+
+        /// `N + λQ` at one node from the eight factors' values there.
+        fn parent(&self, v: &[FE]) -> FE {
+            let (n, d) = double_fraction(v);
+            n + self.lambda * d
+        }
+    }
+
+    impl GruenCard<F> for HostGruen2 {
+        fn rounds(&self) -> usize {
+            self.m - self.low
+        }
+
+        fn enqueue(&mut self, previous: Option<&FE>, want_h0: bool) -> Result<(), Error> {
+            if self.pending.is_some() {
+                return Ok(());
+            }
+            let j = self.done;
+            let quarter = 1usize << (self.m - j - 1);
+            self.fold(previous, 2 * quarter);
+            let mut sums = vec![FE::zero(); if want_h0 { 5 } else { 4 }];
+            for x in 0..quarter {
+                let w = self.e_hi[j][x >> self.low] * self.e_lo[x & ((1 << self.low) - 1)];
+                for t in 0..5u64 {
+                    if t == 0 && !want_h0 {
+                        continue;
+                    }
+                    let node = FE::from(t);
+                    let v: Vec<FE> = self
+                        .f
+                        .iter()
+                        .map(|g| g[x] + node * (g[x + quarter] - g[x]))
+                        .collect();
+                    let row = if t == 0 { 4 } else { t as usize - 1 };
+                    sums[row] += w * self.parent(&v);
+                }
+            }
+            self.pending = Some(sums);
+            self.done += 1;
+            Ok(())
+        }
+
+        fn sums(&mut self, previous: Option<&FE>, want_h0: bool) -> Result<Vec<FE>, Error> {
+            self.enqueue(previous, want_h0)?;
+            self.pending.take().ok_or(Error::NoVariablesLeft)
+        }
+
+        fn finish(&mut self, previous: Option<&FE>) -> Result<Vec<Mle<F>>, Error> {
+            let cells = 1usize << self.low;
+            self.fold(previous, cells);
+            self.f
+                .iter()
+                .map(|g| Mle::new(g[..cells].to_vec()))
+                .collect()
+        }
+    }
+
     /// A host tree whose steps run Gruen's rounds down to a cube of `2^low`,
-    /// as a device tree's steps do on the card.
+    /// as a device tree's steps do on the card — its two-layer steps too.
     struct GruenHostTree<'a> {
         layers: &'a [FractionLayer<F>],
         low: usize,
@@ -2387,13 +2611,12 @@ mod tests {
             layer: usize,
             point: &[FE],
             weights: [FE; 2],
-            _claim: &(FE, FE),
+            claim: &(FE, FE),
         ) -> Result<Box<dyn TreeStep<F> + '_>, Error> {
-            Ok(Box::new(HostStep::over_double(
-                &self.layers[layer],
-                point,
-                weights,
-            )?))
+            let lambda = gruen_lambda(&weights).expect("μ ≠ 0 in these runs");
+            let card = HostGruen2::new(&self.layers[layer], point, lambda, self.low);
+            let step = GruenStep::over_double(card, point, &weights, claim)?.expect("a Gruen step");
+            Ok(Box::new(step))
         }
     }
 
@@ -2742,6 +2965,82 @@ mod tests {
             }
         }
         force_argue_host_parallel(None);
+    }
+
+    /// ★ The two-layer ladder's Gruen steps send the host reference's bytes:
+    /// every tree at every step, two-layer steps on the quartic chain and the
+    /// odd trees' one-layer steps beside them, from tails of one cell up to
+    /// the whole layer, and through the rounds that sum `H(0)` instead of
+    /// deriving it — and the steps did run on the two-layer rounds.
+    #[test]
+    fn double_gruen_steps_send_the_host_references_bytes() {
+        let heights = [6usize, 3, 0, 6, 4, 1, 7, 2];
+        let trees = trees_of(&heights, 811);
+        let refs: Vec<&[FractionLayer<F>]> = trees.iter().map(|t| t.as_slice()).collect();
+        let mut host = transcript();
+        let (want, want_claims) = prove(&refs, GkrLadder::Double, &mut host).unwrap();
+        for direct_h0 in [false, true] {
+            crate::gkr_gruen::force_gkr_gruen_direct_h0(direct_h0);
+            for low in [0usize, 1, 2, 6] {
+                let gruen: Vec<GruenHostTree<'_>> = trees
+                    .iter()
+                    .map(|layers| GruenHostTree { layers, low })
+                    .collect();
+                let dyns: Vec<&dyn LadderTree<F>> =
+                    gruen.iter().map(|t| t as &dyn LadderTree<F>).collect();
+                let before = crate::gkr_gruen::gruen2_layers();
+                let mut prover = transcript();
+                let (got, claims) = prove_trees(&dyns, GkrLadder::Double, &mut prover).unwrap();
+                assert!(
+                    got == want && claims == want_claims,
+                    "low {low}, direct H(0) {direct_h0}: the two-layer Gruen ladder moved a byte"
+                );
+                assert_eq!(prover.state(), host.state());
+                assert!(
+                    crate::gkr_gruen::gruen2_layers() > before,
+                    "low {low}: no step ran the two-layer rounds"
+                );
+            }
+        }
+        crate::gkr_gruen::force_gkr_gruen_direct_h0(false);
+    }
+
+    /// The quartic chain's message is the host's own round: from a step's
+    /// `H(1)..H(4)` (and its claim, or `H(0)`), `s(1..5)` equal the
+    /// two-layer relation's round evaluations, every round of a layer.
+    #[test]
+    fn the_quartic_chains_messages_are_the_host_rounds() {
+        let grandchild = random_layer(7, 12);
+        let point: Vec<FE> = (0..5).map(|i| FE::from(211 + 13 * i as u64)).collect();
+        let weights = [FE::from(5u64), FE::from(17u64)];
+        let lambda = gruen_lambda(&weights).unwrap();
+        for direct_h0 in [false, true] {
+            crate::gkr_gruen::force_gkr_gruen_direct_h0(direct_h0);
+            let mut host = HostStep::over_double(&grandchild, &point, weights).unwrap();
+            let claim = match &host.0 {
+                HostRelation::Double(relation) => relation.sum_over_hypercube(),
+                HostRelation::Single(_) => unreachable!(),
+            };
+            let card = HostGruen2::new(&grandchild, &point, lambda, 0);
+            let mut step = GruenStep::over_double(
+                card,
+                &point,
+                &weights,
+                &(claim * weights[0].inv().unwrap(), FE::zero()),
+            )
+            .unwrap()
+            .unwrap();
+            for round in 0..point.len() {
+                let want = host.round().unwrap();
+                let got = step.round().unwrap();
+                assert_eq!(got, want, "round {round}, direct H(0) {direct_h0}");
+                let r = FE::from(9_000 + round as u64);
+                host.bind(&r).unwrap();
+                step.bind(&r).unwrap();
+            }
+            assert_eq!(step.halves().unwrap(), host.halves().unwrap());
+        }
+        crate::gkr_gruen::force_gkr_gruen_direct_h0(false);
     }
 
     /// Two runs of the two-layer ladder are the same bytes.

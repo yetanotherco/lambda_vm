@@ -408,6 +408,17 @@ pub struct Backend {
     // (`crate::round_slot`).
     pub gkr_round_gruen_slot: CudaFunction,
     pub gkr_round_gruen_real_slot: CudaFunction,
+    // A GKR step over two tree layers (`crate::gkr::Gruen2Layer`): the round
+    // (whole layer, kept input layer, each with and without a slot), its
+    // `H(0)` pass and its finish.
+    pub gkr2_round: CudaFunction,
+    pub gkr2_round_real: CudaFunction,
+    pub gkr2_round_slot: CudaFunction,
+    pub gkr2_round_real_slot: CudaFunction,
+    pub gkr2_round_h0: CudaFunction,
+    pub gkr2_round_h0_real: CudaFunction,
+    pub gkr2_finish: CudaFunction,
+    pub gkr2_finish_real: CudaFunction,
     // D-BATCH M1-2's input layer from the base columns (`crate::gkr::input_from_columns`).
     pub gkr_input_from_columns: CudaFunction,
     pub sumcheck_fold_ext3: CudaFunction,
@@ -1385,6 +1396,14 @@ impl Backend {
             gkr_gruen_finish_real: sumcheck.load_function("gkr_gruen_finish_real")?,
             gkr_round_gruen_slot: sumcheck.load_function("gkr_round_gruen_slot")?,
             gkr_round_gruen_real_slot: sumcheck.load_function("gkr_round_gruen_real_slot")?,
+            gkr2_round: sumcheck.load_function("gkr2_round")?,
+            gkr2_round_real: sumcheck.load_function("gkr2_round_real")?,
+            gkr2_round_slot: sumcheck.load_function("gkr2_round_slot")?,
+            gkr2_round_real_slot: sumcheck.load_function("gkr2_round_real_slot")?,
+            gkr2_round_h0: sumcheck.load_function("gkr2_round_h0")?,
+            gkr2_round_h0_real: sumcheck.load_function("gkr2_round_h0_real")?,
+            gkr2_finish: sumcheck.load_function("gkr2_finish")?,
+            gkr2_finish_real: sumcheck.load_function("gkr2_finish_real")?,
             gkr_input_from_columns: sumcheck.load_function("gkr_input_from_columns")?,
             sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
             mle_fold_base_ext3: sumcheck.load_function("mle_fold_base_ext3")?,
