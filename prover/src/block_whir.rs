@@ -4743,6 +4743,10 @@ pub(crate) struct Deviations {
     /// the prove's own ([`multilinear_block::block_prove_in_order`]): every
     /// order proves the same bytes.
     pub phase_b_order: Option<fn(usize) -> Vec<usize>>,
+    /// Phase B takes the group of the most tables first (`Some(true)`) or
+    /// keeps its own order (`Some(false)`), instead of the knob
+    /// ([`phase_b_many_first`]).
+    pub phase_b_many_first: Option<bool>,
     /// Live regeneration's faults ([`regen::LiveFaults`]): a regenerator that
     /// dies or deposits wrong columns, which phase B must refuse, never prove
     /// over.
@@ -9201,6 +9205,38 @@ fn prove_streamed(
             Some(order) => order(laid.groups.len()),
             None => led_order(&classes, &group_cells, regen_lead),
         };
+        // The group of the most tables first, under the knob, where phase B
+        // rebuilds nothing (each rebuilt class goes in group order) and no
+        // test's order is set; a measurement's list below still wins.
+        let many_first = phase_b_many_first(deviations.phase_b_many_first)?;
+        let order = match group_of_most_tables(&laid.groups) {
+            Some(g)
+                if many_first
+                    && deviations.phase_b_order.is_none()
+                    && classes.iter().all(Option::is_none) =>
+            {
+                eprintln!(
+                    "BLOCK PHASE-B MANY FIRST: on ({PHASE_B_MANY_FIRST_ENV}) · group {g} of {} ({} tables) \
+                     first",
+                    laid.groups.len(),
+                    laid.groups[g].len()
+                );
+                put_first(&[g], order).map_err(Error::Prover)?
+            }
+            _ => {
+                eprintln!(
+                    "BLOCK PHASE-B MANY FIRST: {} ({PHASE_B_MANY_FIRST_ENV})",
+                    if !many_first {
+                        "off (the default)"
+                    } else if deviations.phase_b_order.is_some() {
+                        "on, but a test's order is set: not applied"
+                    } else {
+                        "on, but phase B rebuilds groups: not applied"
+                    }
+                );
+                order
+            }
+        };
         // `W3_PROBE_FIRST_GROUPS`, a measurement's: these groups first.
         let probe_first = probe_first_groups()?;
         // A measurement's or a test's order wins over the recursion's lead.
@@ -10641,6 +10677,47 @@ mod memory_target_tests {
             assert!(parse_tree_drop(Some(bad)).is_err(), "{bad} must be refused");
         }
     }
+}
+
+/// The knob of [`phase_b_many_first`].
+const PHASE_B_MANY_FIRST_ENV: &str = "LAMBDA_VM_PHASE_B_MANY_FIRST";
+
+/// Whether phase B takes the group of the most tables first: a deviation's
+/// choice, else `LAMBDA_VM_PHASE_B_MANY_FIRST` (off by default). Every order
+/// proves the same bytes ([`multilinear_block::block_prove_in_order`]); what
+/// moves is when each group's parts reach a level proved beside phase B. The
+/// group of the most tables (the page tables', hundreds of them) is the one a
+/// level takes longest to land; taken first, it lands while phase B still
+/// runs instead of after it ends.
+fn phase_b_many_first(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => parse_phase_b_many_first(std::env::var(PHASE_B_MANY_FIRST_ENV).ok().as_deref()),
+    }
+}
+
+/// `LAMBDA_VM_PHASE_B_MANY_FIRST`: unset, empty or `0` (the default) keeps
+/// phase B's own order; `1` takes the group of the most tables first.
+/// Anything else refuses the prove.
+fn parse_phase_b_many_first(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{PHASE_B_MANY_FIRST_ENV}={v}: 0 (the default: phase B's own order) or 1 (the group of \
+             the most tables first)"
+        ))),
+    }
+}
+
+/// The group of the most tables (the first such, by index), or `None` with
+/// no group.
+fn group_of_most_tables(groups: &[Vec<u32>]) -> Option<usize> {
+    groups
+        .iter()
+        .enumerate()
+        .max_by(|(i, a), (j, b)| a.len().cmp(&b.len()).then(j.cmp(i)))
+        .map(|(g, _)| g)
 }
 
 /// `W3_PROBE_FIRST_GROUPS=g,g,…`, a measurement knob unset in production:
@@ -12909,5 +12986,39 @@ mod rest_airs_probe {
             }
         });
         let _ = MemoryFormat::Words;
+    }
+}
+
+#[cfg(test)]
+mod phase_b_many_first_tests {
+    use super::{group_of_most_tables, parse_phase_b_many_first, put_first};
+
+    /// The knob is off unless it says `1`; other words refuse the prove.
+    #[test]
+    fn the_many_first_knob_is_off_by_default_and_refuses_other_words() {
+        for off in [None, Some(""), Some("0"), Some(" 0\n")] {
+            assert!(!parse_phase_b_many_first(off).expect("off"), "{off:?}");
+        }
+        assert!(parse_phase_b_many_first(Some("1")).expect("on"));
+        for bad in ["2", "on", "true", "yes"] {
+            assert!(parse_phase_b_many_first(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// The group of the most tables, the first by index on a tie; none of no
+    /// groups; and put first, the order stays a permutation.
+    #[test]
+    fn the_group_of_the_most_tables_goes_first() {
+        let groups = vec![
+            vec![0u32],
+            vec![1, 2, 3],
+            vec![4],
+            vec![5, 6, 7],
+            vec![8, 9],
+        ];
+        assert_eq!(group_of_most_tables(&groups), Some(1));
+        assert_eq!(group_of_most_tables(&[]), None);
+        let order = put_first(&[3], (0..5).collect()).expect("a permutation");
+        assert_eq!(order, vec![3, 0, 1, 2, 4]);
     }
 }
