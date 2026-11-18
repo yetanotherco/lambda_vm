@@ -471,11 +471,6 @@ impl LfmFilled {
     /// The claimed words, for a test that proves a FALSE claim over an
     /// honest trace (the forger's statement).
     #[cfg(test)]
-    /// The words the execution published, in emission order.
-    pub(crate) fn public_words(&self) -> &[(u32, LfmWord)] {
-        &self.public_words
-    }
-
     pub(crate) fn public_words_mut(&mut self) -> &mut Vec<(u32, LfmWord)> {
         &mut self.public_words
     }
@@ -490,6 +485,13 @@ impl LfmFilled {
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn take_chips(&mut self) -> Option<super::chip_records::LfmChipValues> {
         self.chips.take()
+    }
+
+    /// The words the execution published, in emission order: what the next
+    /// level's arena starts with.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn public_words(&self) -> &[(u32, LfmWord)] {
+        &self.public_words
     }
 
     /// The chips held as their records, for a test that reads or forges them.

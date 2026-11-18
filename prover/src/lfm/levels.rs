@@ -34,6 +34,7 @@
 //! plan's hash, the base's and the levels' are one ([`level_plan`],
 //! [`check_base`]) — one hash end to end.
 
+use super::LfmWord;
 use super::compiler::LfmProgram;
 use super::edsl::WrapHash;
 use super::whir_block::{WhirBlockPlan, block_leaf_arena, top_claims};
@@ -41,10 +42,13 @@ use super::wlfm::{
     StackPlace, WlfmBuild, WlfmFamily, WlfmLevers, WlfmPrebuild, WlfmProof, WlfmProving, WlfmRate,
     prepare_wlfm_rounds, prove_wlfm_traces_as, verify_wlfm,
 };
-use super::wlfm_leg::{WlfmChild, wlfm_leg_arena, wlfm_leg_program, wlfm_wrap_hash};
+use super::wlfm_leg::{
+    WlfmChild, wlfm_leg_arena, wlfm_leg_program, wlfm_leg_program_marked, wlfm_wrap_hash,
+};
 use crate::block_whir::BlockWhirProof;
 use crate::hash_pin::{BlockFamily, ProofFamily};
 use stark::proof::options::BaseFormat;
+use std::sync::mpsc;
 
 /// The rate every level proves at: the base's, blowup 2.
 pub const LEVEL_RATE: WlfmRate = WlfmRate::Two;
@@ -586,15 +590,71 @@ fn level_more(stop: LevelStop, count: usize, last: &WlfmBuild) -> bool {
 }
 
 /// The level after `child`'s, prepared on the host: its program (the W-leg
-/// over `child`) and its stacks' columns, uncommitted, its chains under the
+/// over `child`), where its arena's pieces end (the front, then each of the
+/// child's groups), and its stacks' columns, uncommitted, its chains under the
 /// child's round form (every level's is the base's, [`level_rounds`]).
-fn prepare_next(
-    child: WlfmChild,
-    family: WlfmFamily,
-) -> Result<(LfmProgram, WlfmPrebuild), String> {
-    let program = wlfm_leg_program(&child)?;
+fn prepare_next(child: WlfmChild, family: WlfmFamily) -> Result<PreparedNext, String> {
+    let (program, marks) = wlfm_leg_program_marked(&child)?;
     let pre = prepare_level(&program, family, child.artifacts.rounds)?;
-    Ok((program, pre))
+    Ok((program, pre, marks))
+}
+
+/// [`prepare_next`]'s level: its program, its prebuild and its arena's marks.
+type PreparedNext = (LfmProgram, WlfmPrebuild, Vec<u32>);
+
+/// `LAMBDA_VM_LEVELS_STREAM_NEXT=1`: level 2's execution streams over level 1's
+/// prove, beside it: the arena's front lands as soon as level 1 has opened its
+/// first group, each group's words as level 1 opens that group
+/// ([`super::wlfm::prove_wlfm_traces_observed`],
+/// [`super::wlfm_leg::wlfm_leg_group`]), each running the instructions that
+/// read it; level 2 fills at its last piece. Without it, level 2 executes over
+/// the arena written from level 1's whole proof once that proof is done. The
+/// same words, so the same execution and proofs. Off by default (and for any
+/// word but `1`); read once a process.
+pub const STREAM_NEXT_ENV: &str = "LAMBDA_VM_LEVELS_STREAM_NEXT";
+
+std::thread_local! {
+    /// A test's [`stream_next`] on this thread.
+    static STREAM_NEXT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`stream_next`] forced on this thread (`None` restores the
+/// knob). The driver reads it on its own thread.
+#[doc(hidden)]
+pub fn set_stream_next_for_test(on: Option<bool>) {
+    STREAM_NEXT_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`STREAM_NEXT_ENV`] is on (or this thread's test override).
+pub fn stream_next() -> bool {
+    if let Some(on) = STREAM_NEXT_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(STREAM_NEXT_ENV).ok().as_deref())
+    })
+}
+
+/// Level 2's program and prebuild, and its execution filled beside level 1's
+/// prove when it streamed ([`stream_next`]).
+type StreamedNext = (
+    LfmProgram,
+    WlfmPrebuild,
+    Option<(super::proof::LfmFilled, NextStream)>,
+);
+
+/// When level 2's streamed execution ran (the driver's clock): its start, its
+/// first and last pieces' landing, its end, and its fill's seconds; and its
+/// pieces.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NextStream {
+    pub pieces: usize,
+    pub from: f64,
+    pub first: f64,
+    pub last: f64,
+    pub executed: f64,
+    pub fill: f64,
 }
 
 /// Starts this process's peak resident set again from its current resident
@@ -875,6 +935,123 @@ pub(crate) fn build_level(
 }
 
 /// Level `k + 1`'s view of level `k`: its artifacts and the top's word count.
+/// The most pieces a streamed execution lands (one bit a piece).
+const MAX_STREAM_PIECES: usize = 64;
+
+/// Level 2 beside level 1's prove ([`stream_next`]): its program and prebuild
+/// from `prepared` (joined here), and its execution streamed over the pieces
+/// `pieces` hands on ([`stream_level_over_pieces`]); `None` for the execution
+/// when its arena has more pieces than a streamed execution lands (level 2
+/// then executes after level 1's prove, as without the knob).
+fn stream_next_level(
+    prepared: std::thread::ScopedJoinHandle<'_, Result<PreparedNext, String>>,
+    pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
+    t0: std::time::Instant,
+) -> Result<StreamedNext, String> {
+    let (program, pre, marks) = prepared
+        .join()
+        .map_err(|_| "level 2's preparation panicked".to_string())??;
+    if marks.len() > MAX_STREAM_PIECES {
+        return Ok((program, pre, None));
+    }
+    let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+    let streamed = stream_level_over_pieces(&program, &marks, hasher, pieces, t0)?;
+    Ok((program, pre, Some(streamed)))
+}
+
+/// `program`'s execution over one arena cut at `marks` (each piece's end:
+/// the front is piece 0, a child's group `g` is piece `g + 1`), each piece
+/// landed as `pieces` hands it on, in any order, and filled once the last has
+/// landed: [`super::wlfm::execute_and_fill_unmerged`]'s traces over the
+/// pieces joined. The channel closing before every piece came refuses.
+pub(super) fn stream_level_over_pieces(
+    program: &LfmProgram,
+    marks: &[u32],
+    hasher: super::HasherKind,
+    pieces: mpsc::Receiver<(usize, Vec<LfmWord>)>,
+    t0: std::time::Instant,
+) -> Result<(super::proof::LfmFilled, NextStream), String> {
+    use super::executor::{ArenaPiece, StreamedExecution};
+    let now = || t0.elapsed().as_secs_f64();
+    if marks.is_empty() || marks.len() > MAX_STREAM_PIECES {
+        return Err(format!("{} pieces do not stream", marks.len()));
+    }
+    let from = now();
+    let mut start = 0u32;
+    let mut arena_pieces = Vec::with_capacity(marks.len());
+    for (group, &end) in marks.iter().enumerate() {
+        let len = end
+            .checked_sub(start)
+            .ok_or("the arena's marks go backwards")?;
+        arena_pieces.push(ArenaPiece {
+            arena: 0,
+            start,
+            len,
+            group,
+        });
+        start = end;
+    }
+    let npieces = arena_pieces.len();
+    let held: Vec<std::cell::OnceCell<Vec<LfmWord>>> =
+        (0..npieces).map(|_| std::cell::OnceCell::new()).collect();
+    let mut times = NextStream {
+        pieces: npieces,
+        from,
+        ..NextStream::default()
+    };
+    let execution = {
+        let mut ex = StreamedExecution::new_pieced_setup(
+            program,
+            arena_pieces,
+            &hasher,
+            false,
+            bucket_waves(),
+            setup_fast(),
+        )
+        .map_err(|e| format!("the streamed execution: {e:?}"))?;
+        let mut landed = 0usize;
+        for (i, words) in pieces {
+            let slot = held.get(i).ok_or("a piece the arena does not have")?;
+            slot.set(words)
+                .map_err(|_| "a piece landed twice".to_string())?;
+            let words = slot.get().ok_or("the piece")?;
+            let want = marks[i] - if i == 0 { 0 } else { marks[i - 1] };
+            if words.len() != want as usize {
+                return Err(format!(
+                    "piece {i} has {} words, its mark {want}",
+                    words.len()
+                ));
+            }
+            ex.land_piece(i, words)
+                .map_err(|e| format!("piece {i}: {e:?}"))?;
+            landed += 1;
+            if landed == 1 {
+                times.first = now();
+            }
+            times.last = now();
+            if landed == npieces {
+                break;
+            }
+        }
+        if landed != npieces {
+            return Err(format!("the pieces stopped at {landed} of {npieces}"));
+        }
+        ex.finish().map_err(|e| format!("the execution: {e:?}"))?
+    };
+    times.executed = now();
+    let t = std::time::Instant::now();
+    let filled = super::proof::lfm_fill_executed_holding(
+        program,
+        execution,
+        hasher,
+        times.executed - from,
+        &Vec::new(),
+        super::wlfm::chip_records(),
+    );
+    times.fill = t.elapsed().as_secs_f64();
+    Ok((filled, times))
+}
+
 pub fn child_of(plan: &WhirBlockPlan, level: &Level) -> WlfmChild {
     child_of_build(plan, &level.build)
 }
@@ -1065,6 +1242,9 @@ pub struct LevelsTimes {
     pub lean_prefilled: bool,
     pub fill_split: (f64, f64),
     pub lean_parts: (f64, f64),
+    /// Under [`STREAM_NEXT_ENV`], level 2's execution streamed over level 1's
+    /// prove; `None` when it ran after it.
+    pub next_stream: Option<NextStream>,
     /// Under [`FILL_BESIDE_ENV`], level 1's fill on its own thread beside the
     /// stacks' commit: its seconds and when it ended (the driver's clock).
     /// `None` when the driver filled after the commit.
@@ -1201,7 +1381,6 @@ pub fn prove_block_levels(
 ) -> Result<LevelsRun, String> {
     use super::executor::{ArenaPiece, StreamedExecution};
     use super::word::LfmWord;
-    use std::sync::mpsc;
 
     crate::base_only::refuse_recursion()?;
     check_base(&format.zf.base, family)?;
@@ -1731,6 +1910,8 @@ pub fn prove_block_levels(
     // program and columns prepared while the one below proves, its stacks
     // committed on the card while its own execution runs.
     let mut proofs: Vec<WlfmProof> = Vec::with_capacity(2);
+    // Read on the driver's thread (a test's override is that thread's).
+    let stream_next_on = stream_next();
     std::thread::scope(|scope| -> Result<(), String> {
         let spawn_next = |build: &WlfmBuild, count: usize| {
             let child = child_of_build(&plan, build);
@@ -1765,23 +1946,93 @@ pub fn prove_block_levels(
             times.resident.push(("level 1 filled", r));
         }
         let _ = super::wlfm::take_wlfm_stamps();
+        // Under the knob, level 2 executes beside level 1's prove, its arena
+        // landing piece by piece as level 1 opens its groups.
+        let mut streamed: Option<std::thread::ScopedJoinHandle<'_, Result<StreamedNext, String>>> =
+            None;
+        let (piece_tx, piece_rx) = mpsc::channel::<(usize, Vec<LfmWord>)>();
+        if stream_next_on && let Some(prepared) = next.take() {
+            streamed = Some(scope.spawn(move || stream_next_level(prepared, piece_rx, t0)));
+        } else {
+            drop(piece_rx);
+        }
+        let streaming = streamed.is_some();
+        let child = child_of(&plan, &levels[0]);
+        let public = filled.public_words().to_vec();
+        let front_sent = std::sync::atomic::AtomicBool::new(false);
+        let observe_failed: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let observe = |opened: stark::multilinear_block::GroupOpened<'_, _, _>| {
+            if !streaming {
+                return;
+            }
+            let pieces = (|| -> Result<Vec<(usize, Vec<LfmWord>)>, String> {
+                let mut out = Vec::with_capacity(2);
+                if !front_sent.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let front = super::wlfm_leg::wlfm_leg_front(
+                        &child,
+                        &public,
+                        opened.roots,
+                        opened.commit_ood,
+                    )?;
+                    out.push((0, front));
+                }
+                let argue = opened.argue.ok_or("level 1 argues batched")?;
+                let words = super::wlfm_leg::wlfm_leg_group(
+                    &child,
+                    opened.group,
+                    argue,
+                    opened.opening,
+                    opened.prepared,
+                )?;
+                out.push((opened.group + 1, words));
+                Ok(out)
+            })();
+            match pieces {
+                Ok(pieces) => {
+                    for piece in pieces {
+                        let _ = piece_tx.send(piece);
+                    }
+                }
+                Err(e) => {
+                    let mut failed = observe_failed.lock().unwrap_or_else(|e| e.into_inner());
+                    failed.get_or_insert(e);
+                }
+            }
+        };
         let t = std::time::Instant::now();
-        proofs.push(
-            super::wlfm::prove_wlfm_traces_as(
-                &levels[0].build,
-                filled,
-                prefix_check(),
-                WlfmProving::Streamed,
-            )
-            .map_err(|e| format!("level 1: {e}"))?,
-        );
+        let proved = super::wlfm::prove_wlfm_traces_observed(
+            &levels[0].build,
+            filled,
+            prefix_check(),
+            WlfmProving::Streamed,
+            &observe,
+        )
+        .map_err(|e| format!("level 1: {e}"));
+        let level1_proved = now();
+        drop(piece_tx);
+        proofs.push(proved?);
         times.levels.push(LevelClock {
             execute_from,
             executed,
             fill,
             prove: t.elapsed().as_secs_f64(),
-            end: now(),
+            end: level1_proved,
         });
+        if let Some(e) = observe_failed
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return Err(format!("level 2's arena from level 1's groups: {e}"));
+        }
+        let mut streamed_next = match streamed {
+            Some(handle) => Some(
+                handle
+                    .join()
+                    .map_err(|_| "level 2's streamed execution panicked".to_string())?
+                    .map_err(|e| format!("level 2 streamed: {e}"))?,
+            ),
+            None => None,
+        };
         times
             .stamps
             .push(super::wlfm::take_wlfm_stamps().unwrap_or_default());
@@ -1794,11 +2045,18 @@ pub fn prove_block_levels(
             times.resident.push(("level 1 proved", r));
         }
         let mut k = 1usize;
-        while let Some(handle) = next.take() {
-            let (program, pre) = handle
-                .join()
-                .map_err(|_| format!("level {}'s preparation panicked", k + 1))??;
-            let execute_from = now();
+        loop {
+            let (program, pre, done) = match (streamed_next.take(), next.take()) {
+                (Some((program, pre, done)), _) => (program, pre, done),
+                (None, Some(handle)) => {
+                    let (program, pre, _marks) = handle
+                        .join()
+                        .map_err(|_| format!("level {}'s preparation panicked", k + 1))??;
+                    (program, pre, None)
+                }
+                (None, None) => break,
+            };
+            let execute_from = done.as_ref().map_or_else(now, |(_, t)| t.from);
             let (prepare, prepare_split, cells) =
                 (pre.secs(), pre.prepare_split(), pre.prepared_cells());
             // Its stacks on the card while its execution runs on the host.
@@ -1811,11 +2069,20 @@ pub fn prove_block_levels(
                     )
                 })
             });
-            let child = child_of(&plan, &levels[k - 1]);
-            let arena = wlfm_leg_arena(&child, &proofs[k - 1])?;
-            let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
-            let filled = super::wlfm::execute_and_fill_unmerged(&program, &[arena], hasher)?;
-            let executed = now();
+            let (filled, executed, fill) = match done {
+                Some((filled, stream)) => {
+                    times.next_stream = Some(stream);
+                    (filled, stream.executed, stream.fill)
+                }
+                None => {
+                    let child = child_of(&plan, &levels[k - 1]);
+                    let arena = wlfm_leg_arena(&child, &proofs[k - 1])?;
+                    let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+                    let filled =
+                        super::wlfm::execute_and_fill_unmerged(&program, &[arena], hasher)?;
+                    (filled, now(), 0.0)
+                }
+            };
             let mut program = program;
             release_program(&mut program, &mut times.sizes);
             let (build, committed, card) = committer
@@ -1849,7 +2116,7 @@ pub fn prove_block_levels(
             times.levels.push(LevelClock {
                 execute_from,
                 executed,
-                fill: 0.0,
+                fill,
                 prove: t.elapsed().as_secs_f64(),
                 end: now(),
             });
