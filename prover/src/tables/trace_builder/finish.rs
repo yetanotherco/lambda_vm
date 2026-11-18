@@ -288,6 +288,61 @@ fn lt_count_merge(skip: &StreamSkip) -> bool {
 /// PAGE's BITWISE lookups, from the initial image and the memory state.
 type PageCount<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Send + Sync + 'a>;
 
+static P4_BALANCED_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether phase 4's side count (on its own threads, beside the rest's builds)
+/// hands its units out one at a time to its threads, KECCAK's slices last, and
+/// adds the threads' histograms in pairs side by side
+/// (`LAMBDA_VM_P4_BALANCED=1`; off by default: units dealt round-robin to the
+/// threads and the histograms added one after another). The counts are the
+/// same. Read once, with a banner.
+pub(crate) fn p4_balanced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match P4_BALANCED_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => *ON.get_or_init(|| {
+            let on = p4_balanced_from(std::env::var("LAMBDA_VM_P4_BALANCED").ok().as_deref());
+            eprintln!(
+                "★ BLOCK P4 BALANCED: {} (LAMBDA_VM_P4_BALANCED)",
+                if on {
+                    "on (the side count's units handed out in turn, the histograms added in pairs)"
+                } else {
+                    "off (the default; units dealt round-robin, histograms added in turn)"
+                }
+            );
+            on
+        }),
+    }
+}
+
+/// How many side counts ran balanced in this process (for a test that one did).
+static P4_BALANCED_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn p4_balanced_runs() -> usize {
+    P4_BALANCED_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The knob's word: on for `1` only.
+fn p4_balanced_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// Overrides `LAMBDA_VM_P4_BALANCED` for the whole process — for a test that
+/// counts both ways in one binary. `None` restores the environment's.
+#[cfg(test)]
+pub(crate) fn force_p4_balanced(on: Option<bool>) {
+    P4_BALANCED_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Phase 4: the BITWISE histogram of every source, the in-walk lookups
 /// (`bitwise_ops`) and PAGE's (`page`) with them, on top of what the windows
 /// counted (`pre`). With `own_threads`, the buckets run on threads of their
@@ -677,10 +732,22 @@ fn count_bitwise(
             units.push((name, unit));
         }
 
+        // Balanced (`p4_balanced`, on the buckets' own threads): every unit
+        // in one list the threads take from in turn, KECCAK's many small
+        // slices last so they fill what the larger units leave.
+        let balanced = own_threads && p4_balanced();
         let mut buckets: Vec<Vec<(&'static str, Collector)>> =
             (0..cap).map(|_| Vec::new()).collect();
-        for (i, unit) in units.into_iter().enumerate() {
-            buckets[i % cap].push(unit);
+        let mut queue: Vec<(&'static str, Collector)> = Vec::new();
+        if balanced {
+            let (keccak, others): (Vec<_>, Vec<_>) =
+                units.into_iter().partition(|(name, _)| *name == "KECCAK");
+            queue.extend(others);
+            queue.extend(keccak);
+        } else {
+            for (i, unit) in units.into_iter().enumerate() {
+                buckets[i % cap].push(unit);
+            }
         }
         // The row counts on the pool beside the buckets; the line says how
         // long the buckets took beside them, and what each source cost.
@@ -711,11 +778,64 @@ fn count_bitwise(
         };
         let run_bucket = &run_bucket;
         let buckets = &buckets;
+        let queue = &queue;
+        let merge_runs = &merge_runs;
+        // `cap` threads taking the queue's units in turn, each into its own
+        // histogram, then the histograms added in pairs side by side.
+        let run_queue = || -> Option<Run> {
+            P4_BALANCED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let next = &next;
+            std::thread::scope(|scope| {
+                let running: Vec<_> = (0..cap)
+                    .map(|_| {
+                        scope.spawn(move || -> Run {
+                            let begun = std::time::Instant::now();
+                            let mut h = bitwise::BitwiseHistogram::new();
+                            let mut by: Vec<(&'static str, f64)> = Vec::new();
+                            while let Some((name, f)) =
+                                queue.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                            {
+                                let t = std::time::Instant::now();
+                                f(&mut h);
+                                add_source_seconds(&mut by, name, t.elapsed().as_secs_f64());
+                            }
+                            let wall = begun.elapsed().as_secs_f64();
+                            (h, by, wall, wall)
+                        })
+                    })
+                    .collect();
+                let mut runs: Vec<Run> = running
+                    .into_iter()
+                    .map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                    .collect();
+                while runs.len() > 1 {
+                    let mut pairs = Vec::with_capacity(runs.len().div_ceil(2));
+                    let mut drained = runs.into_iter();
+                    while let Some(a) = drained.next() {
+                        pairs.push((a, drained.next()));
+                    }
+                    runs = pairs
+                        .into_iter()
+                        .map(|(a, b)| match b {
+                            Some(b) => scope.spawn(move || merge_runs(a, b)),
+                            None => scope.spawn(move || a),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                        .collect();
+                }
+                runs.pop()
+            })
+        };
         // On the pool, or beside the rest's builds on threads of their own, so
         // the pool's queue of builds cannot hold the buckets back.
         let run_buckets = |own: bool| {
             let started = std::time::Instant::now();
-            let reduced = if own {
+            let reduced = if own && balanced {
+                run_queue()
+            } else if own {
                 std::thread::scope(|scope| {
                     let running: Vec<_> = buckets
                         .iter()

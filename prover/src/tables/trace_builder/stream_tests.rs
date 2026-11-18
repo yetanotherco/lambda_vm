@@ -2024,6 +2024,61 @@ fn keccak_rnd_streamed_as_records_are_the_finishs_tables() {
     assert!(streamed_any > 0, "no KECCAK_RND table streamed");
 }
 
+/// ★ Phase 4's side count balanced ([`super::p4_balanced`]: its units handed
+/// out in turn to its threads, the histograms added in pairs) builds the
+/// finish's tables of the round-robin count, table for table, BITWISE's
+/// multiplicities included, under both padding rules and windows of 7 and
+/// 1000 cycles; and the balanced count did run. The knob's words: on for `1`
+/// only.
+#[test]
+fn the_balanced_side_count_builds_the_same_tables() {
+    assert!(super::p4_balanced_from(Some("1")));
+    for off in [None, Some(""), Some("0"), Some("yes")] {
+        assert!(!super::p4_balanced_from(off), "{off:?}");
+    }
+    let max_rows = MaxRowsConfig::small();
+    let before = super::p4_balanced_runs();
+    for name in ["test_keccak_multi", "all_instructions_64"] {
+        let (program, logs) = run(name);
+        for padding in [CutPadding::LastTable, CutPadding::WholeRun] {
+            for window in [7, 1000] {
+                let what = format!("{name} {padding:?} window {window}");
+                let configure = move |b| cut(b, padding).rest_bitwise_last().slide_rest();
+                let built = |balanced: bool| {
+                    super::force_p4_balanced(Some(balanced));
+                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &configure);
+                    let (got, _) = streamed_keeping(builder, last, false);
+                    super::force_p4_balanced(None);
+                    got
+                };
+                let want = built(false);
+                let got = built(true);
+                assert_eq!(got.len(), want.len(), "{what}: the tables");
+                for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(g.position, w.position, "{what}: position {k}");
+                    let (Some(g), Some(w)) = (&g.table, &w.table) else {
+                        assert!(g.table.is_none() && w.table.is_none(), "{what}: slot {k}");
+                        continue;
+                    };
+                    assert_eq!(
+                        first_difference(&packed_bytes(g), &packed_bytes(w)),
+                        None,
+                        "{what}: table {k}"
+                    );
+                    assert!(
+                        shape_and_words(g) == shape_and_words(w),
+                        "{what}: table {k}'s words"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        super::p4_balanced_runs() > before || !cfg!(feature = "parallel"),
+        "the balanced side count never ran"
+    );
+}
+
 /// The records fault a block test plants ([`WindowedTraceBuilder::card_fill_records_fault`])
 /// moves the records themselves: every KECCAK_RND table with a real row is
 /// then another table than the finish builds without it, however it is
