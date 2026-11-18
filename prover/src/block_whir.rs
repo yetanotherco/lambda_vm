@@ -12188,6 +12188,132 @@ mod rest_airs_beside_tests {
         }
     }
 
+    /// A probe, never a gate: what building a block's AIR set costs, by
+    /// part, for the guest at `LAMBDA_VM_PROBE_ELF` (skipped without it) at a
+    /// large block's table counts, and what DECODE's precomputed columns cost
+    /// (the layout's check regenerates them). Best of three, ms.
+    #[test]
+    #[ignore = "a timing probe"]
+    fn rest_air_set_seconds_by_part() {
+        let Ok(path) = std::env::var("LAMBDA_VM_PROBE_ELF") else {
+            eprintln!("LAMBDA_VM_PROBE_ELF unset: skipped");
+            return;
+        };
+        let opts = ProofOptions::default_test_options();
+        let elf = std::fs::read(&path).expect("the ELF");
+        let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+        let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+            &program,
+            &[],
+            0,
+            1 << 20,
+        )
+        .expect("pages");
+        let counts = crate::TableCounts {
+            cpu: 116,
+            lt: 6,
+            memw: 1,
+            memw_aligned: 1,
+            load: 1,
+            mul: 2,
+            dvrm: 1,
+            shift: 8,
+            branch: 11,
+            memw_register: 1,
+            eq: 9,
+            bytewise: 7,
+            store: 1,
+            cpu32: 1,
+            keccak: 2,
+            keccak_rnd: 66,
+            ecsm: 1,
+            ecdas: 4,
+            hint: 1,
+            copy: 8,
+            blake3: 1,
+            is_wh: 1,
+            ecrec: 1,
+        };
+        let best = |f: &mut dyn FnMut()| {
+            (0..3)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    f();
+                    t.elapsed().as_secs_f64() * 1e3
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let inputs = crate::BlockAirInputs::new(&opts, &program, vec![1 << 21; 116], &[])
+            .expect("the AIR inputs");
+        let set = || {
+            crate::block_airs(
+                &program,
+                &opts,
+                &pages,
+                &counts,
+                &inputs,
+                KeccakRndForm::Lean,
+                crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+                crate::tables::register::RegisterFormat::InRow,
+            )
+        };
+        let cold_page = {
+            let t = std::time::Instant::now();
+            for config in &pages {
+                drop(crate::test_utils::create_page_w_air(&opts, config).expect("PAGE_W"));
+            }
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        let cold = {
+            let t = std::time::Instant::now();
+            let mut airs = set();
+            airs.with_fused_memory(&opts, [1, 1]);
+            airs.with_word_memory(&opts, [22, 16, 6, 1, 2, 1, 8], &pages)
+                .expect("words");
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        println!(
+            "REST AIR SET PROBE (cold, first in the process): PAGE_W {cold_page:.1} ms · the whole set {cold:.1} ms"
+        );
+        let whole = best(&mut || drop(set()));
+        let words = best(&mut || {
+            let mut airs = set();
+            airs.with_fused_memory(&opts, [1, 1]);
+            airs.with_word_memory(&opts, [22, 16, 6, 1, 2, 1, 8], &pages)
+                .expect("words");
+        });
+        let page = best(&mut || {
+            for config in &pages {
+                drop(crate::test_utils::create_page_w_air(&opts, config).expect("PAGE_W"));
+            }
+        });
+        let airs = set();
+        let refs = airs.air_refs();
+        let decode = refs
+            .iter()
+            .find(|air| air.name() == "DECODE")
+            .expect("DECODE");
+        let columns = best(&mut || drop(decode.precomputed_columns()));
+        let rows = decode.precomputed_columns().first().map_or(0, Vec::len);
+        let mut by_name: Vec<(String, f64)> = Vec::new();
+        for air in &refs {
+            if air.num_precomputed_columns() > 0 {
+                let t = std::time::Instant::now();
+                drop(air.precomputed_columns());
+                by_name.push((air.name().to_string(), t.elapsed().as_secs_f64() * 1e3));
+            }
+        }
+        by_name.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!(
+            "REST AIR SET PROBE: {} tables, {} pages · block_airs {whole:.1} ms · with fused + words {words:.1} ms \
+             · PAGE_W alone {page:.1} ms · DECODE's precomputed columns {columns:.1} ms ({rows} rows) · \
+             slowest precomputed: {:?}",
+            refs.len(),
+            pages.len(),
+            &by_name[..by_name.len().min(5)]
+        );
+    }
+
     /// ★ The early KECCAK_RND AIRs, built as the streamed rest builds them,
     /// are the run's set's at KECCAK_RND's places under either form, and
     /// [`same_air`] refuses another name, another form, or another table's
