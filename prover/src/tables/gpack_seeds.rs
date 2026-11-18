@@ -216,12 +216,30 @@ fn seed_hint(name: &str, hint: &'static WidthHint) -> &'static WidthHint {
     }
 }
 
+/// Whether the finish seeds ECDAS's limb-form widths: on unless
+/// `LAMBDA_VM_FINISH_SEED_ECDAS_HALVES=0` (the rollback, for measurement: the
+/// unseeded first tables are built at 8 bytes a cell and packed after), read
+/// once a process. The packed bytes are the same either way.
+pub(crate) fn seed_ecdas_halves_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        seed_widths_from(
+            std::env::var("LAMBDA_VM_FINISH_SEED_ECDAS_HALVES")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
 /// Seeds every kind's hint that has none yet, once a process; the kinds seeded.
 pub(crate) fn seed_finish_widths() -> usize {
     static SEEDED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SEEDED.get_or_init(|| {
         let mut seeded = 0;
         for &(name, cols, hint, widths) in seeds(seed_words_on()) {
+            if name == "ECDAS~halves" && !seed_ecdas_halves_on() {
+                continue;
+            }
             let hint = seed_hint(name, hint);
             if let Some(widths) = parse(widths).filter(|w| w.len() == cols)
                 && !hint.known(cols)
