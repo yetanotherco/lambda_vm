@@ -52,7 +52,7 @@ use multilinear::stacking::StackedLayout;
 use multilinear::whir_chain::{ChainConfig, FinalPoly};
 
 use crate::multilinear_prove::stacks;
-use crate::tables::types::{FEE, GoldilocksField};
+use crate::tables::types::{FEE, GoldilocksExtension, GoldilocksField};
 
 use super::builder::{Cell, Ext, LfmBuilder};
 use super::compiler::LfmProgram;
@@ -182,6 +182,17 @@ pub fn emit_wlfm_leg(
     child: &WlfmChild,
     arena: ArenaId,
 ) -> Result<LegCells, String> {
+    emit_wlfm_leg_marked(b, child, arena, None)
+}
+
+/// [`emit_wlfm_leg`], pushing onto `marks` the arena's position where its
+/// front ends and then where each group's words end.
+pub fn emit_wlfm_leg_marked(
+    b: &mut LfmBuilder,
+    child: &WlfmChild,
+    arena: ArenaId,
+    mut marks: Option<&mut Vec<u32>>,
+) -> Result<LegCells, String> {
     let a = &child.artifacts;
     // ⛔ The in-guest walk replays the child's family's hash and no other: a
     // builder under another hash is refused, never walked under the wrong one.
@@ -237,6 +248,9 @@ pub fn emit_wlfm_leg(
             cell.as_ext()
         })
         .collect();
+    if let Some(m) = marks.as_deref_mut() {
+        m.push(at);
+    }
 
     // ---- 2. the statement (the id a constant, the words their lanes), the
     // roots block, the answers, then (z, α, β).
@@ -479,6 +493,9 @@ pub fn emit_wlfm_leg(
         outputs.extend(walk.outputs.iter().copied());
         root_at += group_trees.len();
         answer_at += polys;
+        if let Some(m) = marks.as_deref_mut() {
+            m.push(at);
+        }
     }
 
     // ---- 4. the closure, against the PUBLIC balance of the hinted words.
@@ -576,6 +593,126 @@ pub fn wlfm_leg_arena(child: &WlfmChild, proof: &WlfmProof) -> Result<Vec<LfmWor
         }
     }
     Ok(words)
+}
+
+/// The front of [`wlfm_leg_arena`]: the child's public words, every root
+/// (each as its commitment's words), every answer, from the parts the child's
+/// prove has after its phase A. Refuses parts whose counts are not the child's.
+pub fn wlfm_leg_front(
+    child: &WlfmChild,
+    public_words: &[(u32, LfmWord)],
+    roots: &[multilinear::whir_commit::Commitment],
+    answers: &[FEE],
+) -> Result<Vec<LfmWord>, String> {
+    let a = &child.artifacts;
+    let airs = a.airs();
+    let shapes = a.shapes(&airs);
+    let (layouts, _) = child_frame(a, &shapes)?;
+    if public_words.len() != child.num_public_words {
+        return Err(format!(
+            "the proof publishes {} words and the child {}",
+            public_words.len(),
+            child.num_public_words
+        ));
+    }
+    let num_roots: usize = layouts.iter().map(|l| trees(l, &a.config).len()).sum();
+    let num_answers: usize = layouts.iter().map(StackedLayout::num_polys).sum();
+    if roots.len() != num_roots || answers.len() != num_answers {
+        return Err(format!(
+            "the proof carries {} roots and {} answers for {num_roots} trees and {num_answers} \
+             polynomials",
+            roots.len(),
+            answers.len()
+        ));
+    }
+    let mut words: Vec<LfmWord> = public_words.iter().map(|(_, w)| *w).collect();
+    let wrap = wlfm_wrap_hash(a.family);
+    words.extend(
+        roots
+            .iter()
+            .flat_map(|root| super::proof_arena::commitment_words_for(root, wrap)),
+    );
+    words.extend(answers.iter().map(ext_word));
+    Ok(words)
+}
+
+/// Group `g`'s words of [`wlfm_leg_arena`]: its batched argue, its opening's
+/// chains, then its prepared stack's opening's, from the parts the child's
+/// prove has once it has opened the group. Refuses parts whose shapes are not
+/// the child's.
+pub fn wlfm_leg_group(
+    child: &WlfmChild,
+    g: usize,
+    argue: &stark::multilinear_table::BatchedArgue<GoldilocksExtension>,
+    opening: &multilinear::stacked_eval::StackedProof<GoldilocksField, GoldilocksExtension>,
+    prepared: Option<
+        &multilinear::stacked_eval::StackedProof<GoldilocksField, GoldilocksExtension>,
+    >,
+) -> Result<Vec<LfmWord>, String> {
+    let a = &child.artifacts;
+    let airs = a.airs();
+    let refs = airs.air_refs();
+    let shapes = a.shapes(&airs);
+    let (layouts, _) = child_frame(a, &shapes)?;
+    let cap = batched_cap(&a.config)?.ok_or("a W-LFM child argues batched")?;
+    let tables = a
+        .groups()
+        .get(g)
+        .cloned()
+        .ok_or_else(|| format!("the child has no group {g}"))?;
+    let owned = Shapes::build(&refs, &shapes, &tables)?;
+    let table_shapes = owned.table_shapes();
+    let mut words = Vec::new();
+    super::whir_batch::push_batched_words(&mut words, argue);
+    let expected = super::whir_batch::batched_words(&table_shapes, &owned.argue_plan(cap));
+    if words.len() != expected {
+        return Err(format!(
+            "group {g}'s batched argue carries {} words, its shapes {expected}",
+            words.len()
+        ));
+    }
+    let layout = &layouts[g];
+    let chain = wlfm_chain_shape_for(a.family, &a.config, layout.n_stack());
+    push_chains(&mut words, opening, layout.num_polys(), &chain)?;
+    let mut planned = a.stacks.iter().filter(|s| s.group == g);
+    match (planned.next(), prepared) {
+        (Some(stack), Some(opening)) => {
+            let shape = wlfm_chain_shape_for(a.family, &a.config, stack.layout.n_stack());
+            push_chains(&mut words, opening, stack.layout.num_polys(), &shape)?;
+        }
+        (Some(_), None) => return Err(format!("group {g}'s prepared opening is missing")),
+        (None, Some(_)) => return Err(format!("a prepared opening for group {g}, which has none")),
+        (None, None) => {}
+    }
+    if planned.next().is_some() {
+        return Err(format!("group {g} has more than one prepared stack"));
+    }
+    Ok(words)
+}
+
+/// [`wlfm_leg_program`] with where its arena's parts end: the front, then each
+/// group's words in group order ([`wlfm_leg_front`], [`wlfm_leg_group`]), so a
+/// caller can land them as the child's prove opens its groups. The last mark is
+/// the arena's length.
+pub fn wlfm_leg_program_marked(child: &WlfmChild) -> Result<(LfmProgram, Vec<u32>), String> {
+    let mut b = wlfm_leg_builder(child.artifacts.family);
+    let arena = b.declare_arena(0);
+    let mut marks = Vec::new();
+    let leg = emit_wlfm_leg_marked(&mut b, child, arena, Some(&mut marks))?;
+    for word in &leg.publics {
+        let packed = b.pack_word([word.lanes[0], word.lanes[1], word.lanes[2], word.lanes[3]]);
+        b.public(packed);
+    }
+    let program = finish_program(b)?;
+    if marks.len() != child.artifacts.sizes.len() + 1
+        || marks.last().copied() != program.arena_schema.lens.first().copied()
+    {
+        return Err(format!(
+            "the leg's arena marks {marks:?} are not its front, its groups and its length {:?}",
+            program.arena_schema.lens
+        ));
+    }
+    Ok((program, marks))
 }
 
 /// A program that runs one W-leg and republishes the child's words in order,
