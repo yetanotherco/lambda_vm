@@ -843,7 +843,10 @@ where
             Some((target, -(rest * &outputs[target].1)))
         }
     };
-    let mut split = ArgueSplit::default();
+    let mut split = ArgueSplit {
+        ledger_start: multilinear::gpu::ledger_reserved(),
+        ..ArgueSplit::default()
+    };
     let gruen_layers = multilinear::gkr_gruen::gruen_layers();
     // ── G: a ladder per bin, its outputs absorbed just before it ──────────
     let mut bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>> = vec![None; plan.trees()];
@@ -984,6 +987,7 @@ where
             })
             .collect::<Result<_, MlError>>()?;
         split.trees += started.elapsed().as_secs_f64();
+        split.ledger_trees = split.ledger_trees.max(multilinear::gpu::ledger_reserved());
         let hosts: Vec<Option<gkr_lockstep::HostLayers<'_, E>>> = trees
             .iter()
             .map(|tree| match tree {
@@ -1014,6 +1018,7 @@ where
         let started = std::time::Instant::now();
         let (ladder, inputs) = gkr_lockstep::prove_trees(&refs, transcript)?;
         split.ladders += started.elapsed().as_secs_f64();
+        split.ledger_ladder = split.ledger_ladder.max(multilinear::gpu::ledger_reserved());
         let inputs: Vec<GkrClaim<E>> = inputs;
         let mut at_tree = 0;
         for &t in bin {
@@ -1127,6 +1132,7 @@ where
         )?);
     }
     split.zc_setup += started.elapsed().as_secs_f64();
+    split.ledger_zc = multilinear::gpu::ledger_reserved();
     // What an earlier argue on this thread left, so the line below is this one's.
     multilinear::gpu_fused::take_tail();
     let started = std::time::Instant::now();
@@ -1259,7 +1265,8 @@ where
         // The trees the ladders ran: one a table, or a cut table's chunks.
         eprintln!(
             "BATCHED ARGUE TREES: tables {} · trees {} · cut {} · tree log2 cells {:.2} · built on the card \
-             {} · on the host {} (after a queued build {})",
+             {} · on the host {} (after a queued build {}) · ledger GiB: at the start {:.2} · the bin's trees \
+             built {:.2} · after its ladder {:.2} · zerocheck set up {:.2}",
             tables.len(),
             plan.trees(),
             plan.chunks.iter().filter(|c| c.count > 1).count(),
@@ -1269,7 +1276,11 @@ where
                 .log2(),
             split.trees_card - split.trees_host_late,
             split.trees_host + split.trees_host_late,
-            split.trees_host_late
+            split.trees_host_late,
+            gib(split.ledger_start),
+            gib(split.ledger_trees),
+            gib(split.ledger_ladder),
+            gib(split.ledger_zc)
         );
     }
     Ok((
@@ -1284,6 +1295,10 @@ where
     ))
 }
 
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
 /// Where a batched argue's time goes, printed under `LAMBDA_VM_BASE_SPLIT=1`.
 #[derive(Default)]
 struct ArgueSplit {
@@ -1294,6 +1309,13 @@ struct ArgueSplit {
     trees_card: usize,
     trees_host: usize,
     trees_host_late: usize,
+    /// The device ledger's promise (bytes): when the argue began, the most
+    /// any bin's trees held once built, the most after a bin's ladder (its
+    /// trees still held), and once the zerocheck was set up.
+    ledger_start: u64,
+    ledger_trees: u64,
+    ledger_ladder: u64,
+    ledger_zc: u64,
     ladders: f64,
     zc_setup: f64,
     zc_rounds: f64,
