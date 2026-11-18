@@ -384,3 +384,157 @@ GKR2_V3(gkr2_round_v3_h0, true, __launch_bounds__(256, 2))
 // V3b: the same pair kernel at three blocks an SM (≤ 85 registers). Information only.
 GKR2_V3(gkr2_round_v3b, false, __launch_bounds__(256, 3))
 GKR2_V3(gkr2_round_v3b_h0, true, __launch_bounds__(256, 3))
+
+// ── Spill-free attempts at the pair kernel ──────────────────────────────────────────────────────
+//
+// V3 under (256, 2) used its 128 registers and spilled 140–232 B. These two take state out of the
+// registers in two different ways; both leave `H(0)` to its own pass (`gkr2_round_h0_pass`), so the
+// round kernel never carries a fifth accumulator. `H(0)` is wanted only where `1 − u_j = 0`.
+
+// The block's rows by warp shuffles as `b2_block_rows`, its per-warp sums at `scratch` in shared
+// memory, written to `d_partials` from row `first`.
+__device__ __forceinline__ void b2_block_rows_at(const Fe3 *acc, int rows, int first,
+                                                 uint64_t *scratch,
+                                                 uint64_t *__restrict__ d_partials) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+#pragma unroll
+    for (int row = 0; row < 4; row++) {
+        if (row >= rows) break;
+        Fe3 v = acc[row];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v = ext3::add(v, b2_shfl(v, (int)(lane ^ off)));
+        if (lane == 0) b2_store(scratch + ((uint64_t)row * warps + warp) * 3, v);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int row = 0; row < 4; row++) {
+            if (row >= rows) break;
+            Fe3 sum = ext3::zero();
+            for (unsigned w = 0; w < warps; w++)
+                sum = ext3::add(sum, b2_load(scratch + ((uint64_t)row * warps + w) * 3));
+            b2_store(d_partials + ((uint64_t)(first + row) * gridDim.x + blockIdx.x) * 3, sum);
+        }
+    }
+}
+
+// ── V4: the pair kernel with its accumulators in shared memory ──────────────────────────────────
+//
+// V3's body without `H(0)`, but each lane's four row sums live in shared memory (limb-major, one
+// `volatile` load and store a limb a point a cube index) instead of 24 registers across the loop.
+// Shared memory: `12·blockDim` u64 of sums, then the reduction's `4·warps·3`.
+__device__ __forceinline__ void gkr2_v4_body(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint32_t fault, uint64_t *__restrict__ d_partials) {
+    extern __shared__ uint64_t shared[];
+    volatile uint64_t *sacc = shared;
+    const unsigned nb = blockDim.x, tid = threadIdx.x;
+    Fe3 s = ext3::make(s0, s1, s2);
+    const unsigned lane = tid & 31u;
+    const uint32_t r = lane & 1u;
+    Fe3 lambda_r = r == 0 ? ext3::make(l0, l1, l2) : ext3::zero();
+    const int partner = (int)(lane ^ (fault == 2 ? 2u : 1u));
+    uint64_t mask = ((uint64_t)1 << low) - 1;
+    uint64_t lanes = 2 * quarter;
+    uint64_t *pa = p + (uint64_t)r * stride * 3, *pb = p + (uint64_t)(r + 2) * stride * 3;
+    uint64_t *qa = q + (uint64_t)r * stride * 3, *qb = q + (uint64_t)(r + 2) * stride * 3;
+#pragma unroll
+    for (int k = 0; k < 12; k++) sacc[k * nb + tid] = 0;
+    for (uint64_t base = (uint64_t)blockIdx.x * nb + (tid & ~31u); base < lanes;
+         base += (uint64_t)gridDim.x * nb) {
+        uint64_t g = base + lane;
+        bool live = g < lanes;
+        uint64_t x = g >> 1;
+        Fe3 a_lo = ext3::zero(), a_hi = ext3::zero(), b_lo = ext3::zero(), b_hi = ext3::zero();
+        Fe3 c_lo = ext3::zero(), c_hi = ext3::zero(), d_lo = ext3::zero(), d_hi = ext3::zero();
+        Fe3 w = ext3::zero();
+        if (live) {
+            b2_factor(pa, x, quarter, fold, s, false, a_lo, a_hi);
+            b2_factor(pb, x, quarter, fold, s, false, b_lo, b_hi);
+            b2_factor(qa, x, quarter, fold, s, false, c_lo, c_hi);
+            b2_factor(qb, x, quarter, fold, s, fault == 1 && r == 1, d_lo, d_hi);
+            w = ext3::mul(b2_load(e_hi + (x >> low) * 3), b2_load(e_lo + (x & mask) * 3));
+        }
+        B2Quad X = b2_qadd(b2_prod(a_lo, a_hi, d_lo, d_hi), b2_prod(b_lo, b_hi, c_lo, c_hi));
+        B2Quad Y = b2_prod(c_lo, c_hi, d_lo, d_hi);
+        B2Quad Z = b2_qscale(w, b2_qadd(X, b2_qscale(lambda_r, Y)));
+        B2Quad W;
+        W.v0 = b2_shfl(Y.v0, partner);
+        W.v1 = b2_shfl(Y.v1, partner);
+        W.c2 = b2_shfl(Y.c2, partner);
+        B2Walk z = b2_walk(Z), u = b2_walk(W);
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+            if (t > 0) {
+                b2_step(z);
+                b2_step(u);
+            }
+            Fe3 m = ext3::mul(z.val, u.val);
+            volatile uint64_t *at = sacc + (uint64_t)(t * 3) * nb + tid;
+            at[0] = goldilocks::add(at[0], m.a);
+            at[nb] = goldilocks::add(at[nb], m.b);
+            at[2 * nb] = goldilocks::add(at[2 * nb], m.c);
+        }
+    }
+    Fe3 acc[4];
+#pragma unroll
+    for (int t = 0; t < 4; t++)
+        acc[t] = ext3::make(sacc[(t * 3) * nb + tid], sacc[(t * 3 + 1) * nb + tid],
+                            sacc[(t * 3 + 2) * nb + tid]);
+    b2_block_rows_at(acc, 4, 0, shared + 12 * (uint64_t)nb, d_partials);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void gkr2_round_v4(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint32_t fault, uint64_t *__restrict__ d_partials) {
+    gkr2_v4_body(p, q, stride, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi, e_lo, low, fault,
+                 d_partials);
+}
+
+// ── V5: the pair kernel at 128-thread blocks, three an SM ───────────────────────────────────────
+//
+// V3's body without `H(0)` under `__launch_bounds__(128, 3)`: up to 170 registers a thread, 12 warps
+// an SM where V3 had 16. Launched with blocks of at most 128 lanes.
+GKR2_V3(gkr2_round_v5, false, __launch_bounds__(128, 3))
+
+// ── H(0) in its own pass, for V4 and V5 ─────────────────────────────────────────────────────────
+//
+// Run after the round kernel on the same stream, grid and block: it reads the cells the round
+// left at `t = 0` (the folded `lo` halves after a fold, the layer's own before one), one thread a
+// cube index, and writes row 4 (`H(0)`) of the same partials. `fault` 1 reads the last quarter's
+// lower cell one off in a round without a fold, as the round kernels do.
+__device__ __forceinline__ void gkr2_h0_pass_body(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,
+    uint32_t fold, uint64_t l0, uint64_t l1, uint64_t l2, const uint64_t *__restrict__ e_hi,
+    const uint64_t *__restrict__ e_lo, uint32_t low, uint32_t fault,
+    uint64_t *__restrict__ d_partials) {
+    extern __shared__ uint64_t shared[];
+    Fe3 lambda = ext3::make(l0, l1, l2);
+    uint64_t mask = ((uint64_t)1 << low) - 1;
+    Fe3 acc[1] = {ext3::zero()};
+    for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < quarter;
+         x += (uint64_t)gridDim.x * blockDim.x) {
+        Fe3 v[8];
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const uint64_t *f = (k < 4 ? p : q) + (uint64_t)(k & 3) * stride * 3;
+            uint64_t at = (!fold && fault == 1 && k == 7) ? ((x + 1) & (quarter - 1)) : x;
+            v[k] = b2_load(f + at * 3);
+        }
+        Fe3 w = ext3::mul(b2_load(e_hi + (x >> low) * 3), b2_load(e_lo + (x & mask) * 3));
+        acc[0] = ext3::add(acc[0], ext3::mul(w, b2_h(v, lambda)));
+    }
+    b2_block_rows_at(acc, 1, 4, shared, d_partials);
+}
+
+extern "C" __global__ __launch_bounds__(256) void gkr2_round_h0_pass(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,
+    uint32_t fold, uint64_t l0, uint64_t l1, uint64_t l2, const uint64_t *__restrict__ e_hi,
+    const uint64_t *__restrict__ e_lo, uint32_t low, uint32_t fault,
+    uint64_t *__restrict__ d_partials) {
+    gkr2_h0_pass_body(p, q, stride, quarter, fold, l0, l1, l2, e_hi, e_lo, low, fault, d_partials);
+}

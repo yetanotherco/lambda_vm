@@ -1,6 +1,8 @@
 // Known-answer tests for the bench's double-step GKR round kernels (`kernels/gkr4_bench.cu`: the
 // value form `gkr4_round_gruen` and `gkr4_round_gruen_lb2`, the one-thread coefficient form
-// `gkr2_round_v2{,_h0}`, the thread-pair form `gkr2_round_v3{,_h0}` and `gkr2_round_v3b{,_h0}`),
+// `gkr2_round_v2{,_h0}`, the thread-pair form `gkr2_round_v3{,_h0}` and `gkr2_round_v3b{,_h0}`, and
+// the pair form's spill-free attempts `gkr2_round_v4` and `gkr2_round_v5` with `H(0)` from
+// `gkr2_round_h0_pass`),
 // run on the host through `cuda_host_simt_shim.h`: every thread of a block a real thread, so the
 // pair kernel's exchange and the warp-shuffle block reduction run as written. No GPU, no nvcc.
 //
@@ -32,7 +34,7 @@
 #define __shared__
 #define __launch_bounds__(...)
 extern "C" {
-uint64_t shared[3 * 1024 + 8];
+uint64_t shared[4096];
 }
 
 #include "gkr4_bench.cu"
@@ -116,7 +118,7 @@ E composed(const E *v, const E &lambda) {
     return eadd(p, emul(lambda, q));
 }
 
-enum Kind { V0, V1, V2, V3, V3B };
+enum Kind { V0, V1, V2, V3, V3B, V4, V5 };
 const char *kind_name(Kind k) {
     switch (k) {
         case V0: return "gkr4_round_gruen";
@@ -124,10 +126,13 @@ const char *kind_name(Kind k) {
         case V2: return "gkr2_round_v2";
         case V3: return "gkr2_round_v3";
         case V3B: return "gkr2_round_v3b";
+        case V4: return "gkr2_round_v4";
+        case V5: return "gkr2_round_v5";
     }
     return "?";
 }
-bool is_pair(Kind k) { return k == V3 || k == V3B; }
+bool is_pair(Kind k) { return k == V3 || k == V3B || k == V4 || k == V5; }
+bool split_h0(Kind k) { return k == V4 || k == V5; }
 
 // The rows of one launch, at the driver's shape for `lanes` lanes, at most `max_grid` blocks.
 std::vector<E> launch(Kind kind, bool h0, uint32_t fault, uint64_t *p, uint64_t *q, uint64_t stride,
@@ -136,7 +141,8 @@ std::vector<E> launch(Kind kind, bool h0, uint32_t fault, uint64_t *p, uint64_t 
     uint64_t lanes = is_pair(kind) ? 2 * quarter : quarter;
     uint64_t bl = 1;
     while (bl < lanes) bl <<= 1;
-    unsigned block = (unsigned)(bl < 32 ? 32 : bl > 256 ? 256 : bl);
+    uint64_t max_block = kind == V5 ? 128 : 256;
+    unsigned block = (unsigned)(bl < 32 ? 32 : bl > max_block ? max_block : bl);
     uint64_t g = (lanes + block - 1) / block;
     unsigned grid = (unsigned)(g < 1 ? 1 : g > max_grid ? max_grid : g);
     unsigned rows = h0 ? 5 : 4;
@@ -168,8 +174,23 @@ std::vector<E> launch(Kind kind, bool h0, uint32_t fault, uint64_t *p, uint64_t 
                                                          s[2], lam[0], lam[1], lam[2], e_hi, e_lo,
                                                          low, fault, partials.data());
                 break;
+            case V4:
+                gkr2_round_v4(p, q, stride, quarter, f, s[0], s[1], s[2], lam[0], lam[1], lam[2],
+                              e_hi, e_lo, low, fault, partials.data());
+                break;
+            case V5:
+                gkr2_round_v5(p, q, stride, quarter, f, s[0], s[1], s[2], lam[0], lam[1], lam[2],
+                              e_hi, e_lo, low, fault, partials.data());
+                break;
         }
     });
+    if (h0 && split_h0(kind)) {
+        // Row 4 from its own pass, over the same grid and blocks.
+        simt_launch(grid, block, [&] {
+            gkr2_round_h0_pass(p, q, stride, quarter, f, lam[0], lam[1], lam[2], e_hi, e_lo, low,
+                               fault, partials.data());
+        });
+    }
     std::vector<E> out(rows, ezero());
     for (unsigned r = 0; r < rows; ++r)
         for (unsigned b = 0; b < grid; ++b)
@@ -282,7 +303,7 @@ void run_fault(Kind kind, uint32_t fault, const Layer &L) {
 }  // namespace
 
 int main() {
-    const Kind kinds[] = {V0, V1, V2, V3, V3B};
+    const Kind kinds[] = {V0, V1, V2, V3, V3B, V4, V5};
     for (unsigned m : {8u, 10u}) {
         Layer L = make_layer(m);
         for (Kind k : kinds) {
@@ -295,6 +316,8 @@ int main() {
             for (Kind k : kinds) run_fault(k, 1, L);
             run_fault(V3, 2, L);
             run_fault(V3B, 2, L);
+            run_fault(V4, 2, L);
+            run_fault(V5, 2, L);
         }
     }
     printf("gkr2 bench host KAT: %d checks, %d failures\n", checks, failures);

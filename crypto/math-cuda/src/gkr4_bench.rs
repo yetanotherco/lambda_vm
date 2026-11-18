@@ -46,15 +46,23 @@ pub enum Variant {
     V3,
     /// V3 at three blocks an SM. Information only.
     V3b,
+    /// The pair kernel with its row sums in shared memory, two blocks an SM;
+    /// `H(0)` in its own pass.
+    V4,
+    /// The pair kernel at 128-lane blocks, three an SM (up to 170
+    /// registers); `H(0)` in its own pass.
+    V5,
 }
 
 impl Variant {
-    pub const ALL: [Variant; 5] = [
+    pub const ALL: [Variant; 7] = [
         Variant::V0,
         Variant::V1,
         Variant::V2,
         Variant::V3,
         Variant::V3b,
+        Variant::V4,
+        Variant::V5,
     ];
 
     /// The name the bench prints.
@@ -65,15 +73,30 @@ impl Variant {
             Variant::V2 => "v2",
             Variant::V3 => "v3",
             Variant::V3b => "v3b",
+            Variant::V4 => "v4",
+            Variant::V5 => "v5",
         }
     }
 
     /// Lanes a cube index.
     fn lanes(self) -> u64 {
         match self {
-            Variant::V3 | Variant::V3b => 2,
+            Variant::V3 | Variant::V3b | Variant::V4 | Variant::V5 => 2,
             _ => 1,
         }
+    }
+
+    /// The most lanes a block.
+    fn max_block(self) -> u64 {
+        match self {
+            Variant::V5 => 128,
+            _ => 256,
+        }
+    }
+
+    /// `H(0)` comes from its own pass after the round kernel.
+    fn split_h0(self) -> bool {
+        matches!(self, Variant::V4 | Variant::V5)
     }
 
     /// The value form takes `want_h0` as an argument; the others have an
@@ -90,6 +113,9 @@ struct Module {
     v2: [CudaFunction; 2],
     v3: [CudaFunction; 2],
     v3b: [CudaFunction; 2],
+    v4: CudaFunction,
+    v5: CudaFunction,
+    h0_pass: CudaFunction,
 }
 
 impl Module {
@@ -101,6 +127,8 @@ impl Module {
             Variant::V2 => &self.v2[h0],
             Variant::V3 => &self.v3[h0],
             Variant::V3b => &self.v3b[h0],
+            Variant::V4 => &self.v4,
+            Variant::V5 => &self.v5,
         }
     }
 }
@@ -124,6 +152,9 @@ fn module() -> Result<&'static Module> {
         v2: pair("gkr2_round_v2")?,
         v3: pair("gkr2_round_v3")?,
         v3b: pair("gkr2_round_v3b")?,
+        v4: module.load_function("gkr2_round_v4")?,
+        v5: module.load_function("gkr2_round_v5")?,
+        h0_pass: module.load_function("gkr2_round_h0_pass")?,
         _module: module,
     };
     Ok(MODULE.get_or_init(|| m))
@@ -151,11 +182,11 @@ pub fn force_fault(fault: Fault) {
     FAULT.store(fault as u32, Ordering::Relaxed);
 }
 
-/// Today's launch shape for a Gruen round over `lanes` lanes: 256-thread
-/// blocks for a wide cube, down to a warp for a narrow one, at most
-/// [`MAX_GRID`] blocks.
-fn shape(lanes: u64) -> (u32, u32) {
-    let block = lanes.next_power_of_two().clamp(32, 256) as u32;
+/// Today's launch shape for a Gruen round over `lanes` lanes: blocks of
+/// `max_block` threads for a wide cube, down to a warp for a narrow one, at
+/// most [`MAX_GRID`] blocks.
+fn shape(lanes: u64, max_block: u64) -> (u32, u32) {
+    let block = lanes.next_power_of_two().clamp(32, max_block) as u32;
     let grid = lanes.div_ceil(block as u64).clamp(1, MAX_GRID as u64) as u32;
     (grid, block)
 }
@@ -279,7 +310,7 @@ impl DoubleStep {
         let be = backend()?;
         let m = self.stride.trailing_zeros() as usize;
         let quarter = 1u64 << (m - self.done - 1);
-        let (grid, block) = shape(quarter * variant.lanes());
+        let (grid, block) = shape(quarter * variant.lanes(), variant.max_block());
         let rows = if want_h0 { 5u32 } else { 4 };
         let s = fold_by.copied().unwrap_or([0; 3]);
         let fold = u32::from(fold_by.is_some());
@@ -295,11 +326,12 @@ impl DoubleStep {
         let fault = FAULT.load(Ordering::Relaxed);
         let function = module()?.function(variant, want_h0);
         // The value form reduces through a 256-row tree in shared memory; the
-        // others through warp shuffles, one ext3 a warp and row.
-        let shared_mem_bytes = if variant.value_form() {
-            block * 3 * 8
-        } else {
-            (block / 32) * rows * 3 * 8
+        // others through warp shuffles, one ext3 a warp and row; V4 also
+        // keeps every lane's four row sums there.
+        let shared_mem_bytes = match variant {
+            Variant::V0 | Variant::V1 => block * 3 * 8,
+            Variant::V4 => (12 * block + (block / 32) * 4 * 3) * 8,
+            _ => (block / 32) * rows * 3 * 8,
         };
         // The value form knows one fault, the cell; the others both.
         let value_fault = u32::from(fault == Fault::OneCell as u32);
@@ -330,6 +362,29 @@ impl DoubleStep {
                 block_dim: (block, 1, 1),
                 shared_mem_bytes,
             })?;
+            if want_h0 && variant.split_h0() {
+                // Row 4 of the same partials, over the same grid and blocks.
+                self.stream
+                    .launch_builder(&module()?.h0_pass)
+                    .arg(&self.p_at)
+                    .arg(&self.q_at)
+                    .arg(&stride)
+                    .arg(&quarter)
+                    .arg(&fold)
+                    .arg(&lambda[0])
+                    .arg(&lambda[1])
+                    .arg(&lambda[2])
+                    .arg(&e_hi)
+                    .arg(&e_lo)
+                    .arg(&low)
+                    .arg(&fault)
+                    .arg(&mut self.partials)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: (block / 32) * 3 * 8,
+                    })?;
+            }
             self.stream
                 .launch_builder(&be.sum_partials_ext3)
                 .arg(&self.partials)
@@ -759,6 +814,18 @@ mod tests {
     #[ignore = "a card; flips a process-global fault: run alone, --ignored --test-threads=1"]
     fn equal_gate_v3b() {
         equal_gate(Variant::V3b);
+    }
+
+    #[test]
+    #[ignore = "a card; flips a process-global fault: run alone, --ignored --test-threads=1"]
+    fn equal_gate_v4() {
+        equal_gate(Variant::V4);
+    }
+
+    #[test]
+    #[ignore = "a card; flips a process-global fault: run alone, --ignored --test-threads=1"]
+    fn equal_gate_v5() {
+        equal_gate(Variant::V5);
     }
 
     /// Bytes a round moves by the kernels' own reads and writes: `factors`
