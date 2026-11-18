@@ -333,20 +333,20 @@ pub fn bucket_waves() -> bool {
     })
 }
 
-/// `LAMBDA_VM_LEVELS_SETUP_FAST=1`: level 1's streamed execution makes its
+/// `LAMBDA_VM_LEVELS_SETUP_FAST`: level 1's streamed execution makes its
 /// setup the fast way ([`super::executor::StreamedExecution::new_pieced_setup`]):
 /// the level schedule on a thread of its own beside the need pass, and the
 /// wave buckets found from each instruction's neighbour when they share
 /// their groups. On a real median the setup took ≈ 2.5 s after the program,
 /// and level 1's waves wait for it. The same schedule, needs and buckets:
-/// the same execution and proofs. Off by default (and for any word but `1`).
+/// the same execution and proofs. On by default; only `0` turns it off.
 pub const SETUP_FAST_ENV: &str = "LAMBDA_VM_LEVELS_SETUP_FAST";
 
 /// Whether level 1's execution makes its setup the fast way ([`SETUP_FAST_ENV`]).
 pub fn setup_fast() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        super::wlfm_knobs::knob_word_on(std::env::var(SETUP_FAST_ENV).ok().as_deref())
+        !super::wlfm_knobs::knob_word_off(std::env::var(SETUP_FAST_ENV).ok().as_deref())
     })
 }
 

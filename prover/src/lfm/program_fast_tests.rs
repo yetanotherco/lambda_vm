@@ -206,15 +206,19 @@ fn the_beside_pool_prepares_the_same_level() {
     }
 }
 
-/// The setup-fast knob's name; only `1` turns it on, and it is off by
-/// default.
+/// The setup-fast knob's name; it is on by default, and only `0` turns it
+/// off.
 #[test]
-fn the_setup_fast_knob_is_named_and_off_by_default() {
+fn the_setup_fast_knob_is_named_and_on_by_default() {
     use super::levels::{SETUP_FAST_ENV, setup_fast};
+    use super::wlfm_knobs::knob_word_off;
     assert_eq!(SETUP_FAST_ENV, "LAMBDA_VM_LEVELS_SETUP_FAST");
     if std::env::var_os(SETUP_FAST_ENV).is_none() {
-        assert!(!setup_fast());
+        assert!(setup_fast());
     }
+    assert!(knob_word_off(Some("0")));
+    assert!(!knob_word_off(Some("1")));
+    assert!(!knob_word_off(None));
 }
 
 /// The bucket-waves knob's name; it is on by default, and only `0` turns it
