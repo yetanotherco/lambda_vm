@@ -480,34 +480,39 @@ pub fn shift_claim_tiled_batches() -> u64 {
 /// outputs), rather than host-built tables and one ext3 product a term
 /// (`add_eq_tensor_ext3`). The same weight, value for value; a prover's
 /// choice, no proof byte moves; points of any other shape keep today's
-/// kernel. `1` on; unset or anything else off (today's), or a test's override
-/// ([`force_claims_tiled`]).
+/// kernel. `1` on; unset or anything else off (today's). Test builds (this
+/// crate's tests, or the `test-faults` feature) may override it for the whole
+/// process; no production build compiles the override.
 pub fn claims_tiled() -> bool {
+    #[cfg(any(test, feature = "test-faults"))]
     match CLAIMS_TILED_FORCED.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var("LAMBDA_VM_CLAIMS_TILED").as_deref() == Ok("1"))
-        }
+        1 => return true,
+        2 => return false,
+        _ => {}
     }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_CLAIMS_TILED").as_deref() == Ok("1"))
 }
 
+#[cfg(any(test, feature = "test-faults"))]
 static CLAIMS_TILED_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Test only: the card-halves path drops one point before its kernels (the
 /// mutant a card parity test must catch).
+#[cfg(any(test, feature = "test-faults"))]
 static CLAIMS_TILED_DROPS_A_POINT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Arms [`CLAIMS_TILED_DROPS_A_POINT`]. Not for production callers.
+/// Arms [`CLAIMS_TILED_DROPS_A_POINT`]. Test builds only.
+#[cfg(any(test, feature = "test-faults"))]
 #[doc(hidden)]
 pub fn force_claims_tiled_drops_a_point(on: bool) {
     CLAIMS_TILED_DROPS_A_POINT.store(on, Ordering::Relaxed);
 }
 
 /// Overrides [`claims_tiled`] for the whole process. `None` restores the
-/// knob's reading. Not for production callers.
+/// knob's reading. Test builds only.
+#[cfg(any(test, feature = "test-faults"))]
 #[doc(hidden)]
 pub fn force_claims_tiled(on: Option<bool>) {
     CLAIMS_TILED_FORCED.store(
@@ -6413,17 +6418,22 @@ impl OpeningFactors {
             None
         };
         match pow_ys {
-            Some(mut ys) => {
+            Some(ys) => {
                 let mut raw_scales = Vec::with_capacity(scales.len() * 3);
                 for scale in scales {
                     raw_scales.extend_from_slice(
                         &ext3_raw(scale).ok_or_else(|| failed("shift claims' scales"))?,
                     );
                 }
-                if CLAIMS_TILED_DROPS_A_POINT.load(Ordering::Relaxed) && !ys.is_empty() {
-                    ys.pop();
-                    raw_scales.truncate(ys.len() * 3);
-                }
+                #[cfg(any(test, feature = "test-faults"))]
+                let ys = {
+                    let mut ys = ys;
+                    if CLAIMS_TILED_DROPS_A_POINT.load(Ordering::Relaxed) && !ys.is_empty() {
+                        ys.pop();
+                        raw_scales.truncate(ys.len() * 3);
+                    }
+                    ys
+                };
                 let lo_bits = session.num_vars() - session.num_vars() / 2;
                 session
                     .add_eq_tensor_pow(&ys, &raw_scales, lo_bits, 8)
