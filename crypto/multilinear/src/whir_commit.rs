@@ -1150,8 +1150,10 @@ where
     /// leaves hashed there (`gpu::CosetSource::joint_openings`), each block's
     /// root checked against its kept node; the queried values, every block end
     /// to end, kept on the first source for the opening that asked. A plan the
-    /// kernels do not take, or a card that declines, re-encodes every codeword
-    /// from its stack (counted) and re-hashes over them.
+    /// kernels do not take, or a card that declines, re-encodes the codewords
+    /// from their stacks one at a time (counted; each waits a bounded while
+    /// for the card's room), gathers the queried blocks' leaves from each, and
+    /// re-hashes the joint leaves on the host.
     fn joint_source_top_paths(
         &self,
         top: &TreeTop,
@@ -1194,32 +1196,53 @@ where
             sources[0].keep(wanted.into_iter().zip(opened.values).collect());
             return Ok(paths);
         }
-        let devices = stacks
+        // ★ The fallback re-encodes ONE codeword at a time: each stack's
+        // codeword is encoded on the card (waiting a bounded while for room
+        // when the card's budget is short), every leaf of the queried blocks
+        // is gathered from it, and it is let go before the next; the joint
+        // leaves are then hashed on the host. The card holds one codeword's
+        // worth at a time, not the run's (a run of four at once missed the
+        // budget by 2 GiB on a card whose openings were beside an argue), and
+        // the paths are the same, byte for byte.
+        let span = 1usize << block_bits;
+        let mut blocks: Vec<usize> = indices.iter().map(|index| index >> block_bits).collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        let leaves: Vec<usize> = blocks
             .iter()
-            .map(|stack| stack.encode())
-            .collect::<Option<Vec<_>>>()
-            .ok_or(Error::DeviceFailed {
-                stage: "re-encoding a joint round-0 tree's codewords from their stacks",
-            })?;
-        let borrowed: Vec<&crate::gpu::DeviceCodeword> = devices.iter().collect();
-        let paths = self
-            .joint_card_top_paths_over(&borrowed, top, indices)
-            .ok_or(Error::DeviceFailed {
-                stage: "re-hashing a joint tree's re-encoded codewords",
-            })??;
+            .flat_map(|block| (block << block_bits)..((block + 1) << block_bits))
+            .collect();
+        let at = self.positions(&leaves).into_owned();
         let block = 1usize << self.log_folding;
-        let mut values: Vec<Vec<FieldElement<F>>> = vec![Vec::new(); wanted.len()];
-        for device in &devices {
-            let blocks = device
-                .cosets::<F>(&wanted, self.num_leaves(), block)
-                .ok_or(Error::DeviceFailed {
-                    stage: "gathering a joint tree's re-encoded codewords",
-                })?;
-            for (row, b) in values.iter_mut().zip(blocks) {
+        let mut values: Vec<Vec<FieldElement<F>>> = vec![Vec::new(); at.len()];
+        for stack in &stacks {
+            let device = crate::gpu::CosetSource::encode_waiting(stack).ok_or(
+                Error::DeviceFailed {
+                    stage: "re-encoding a joint round-0 tree's codewords from their stacks",
+                },
+            )?;
+            let gathered =
+                device
+                    .cosets::<F>(&at, self.num_leaves(), block)
+                    .ok_or(Error::DeviceFailed {
+                        stage: "gathering a joint tree's re-encoded codewords",
+                    })?;
+            for (row, b) in values.iter_mut().zip(gathered) {
                 row.extend(b);
             }
         }
-        sources[0].keep(wanted.into_iter().zip(values).collect());
+        let paths = self.rehashed_paths(top, indices, &blocks, &values)?;
+        let kept: Vec<(usize, Vec<FieldElement<F>>)> = indices
+            .iter()
+            .zip(wanted)
+            .map(|(&index, leaf)| {
+                let k = blocks
+                    .binary_search(&(index >> block_bits))
+                    .expect("every queried block was gathered");
+                (leaf, values[(k << block_bits) + (index & (span - 1))].clone())
+            })
+            .collect();
+        sources[0].keep(kept);
         Ok(paths)
     }
 
@@ -1401,9 +1424,10 @@ where
             source.keep(wanted.into_iter().zip(opened.values).collect());
             return Ok(paths);
         }
-        let device = source.source.encode().ok_or(Error::DeviceFailed {
-            stage: "re-encoding a round-0 codeword from its stack",
-        })?;
+        let device =
+            crate::gpu::CosetSource::encode_waiting(&source.source).ok_or(Error::DeviceFailed {
+                stage: "re-encoding a round-0 codeword from its stack",
+            })?;
         let paths =
             self.card_top_paths_over(&device, top, indices)
                 .ok_or(Error::DeviceFailed {
@@ -1425,15 +1449,9 @@ where
         top: &TreeTop,
         indices: &[usize],
     ) -> Result<Vec<Proof<Commitment>>, Error> {
-        let num_leaves = self.num_leaves();
-        // A block is the `span` leaves under one kept frontier node: `2^d` at
-        // arity 2, `4^d` at arity 4.
-        let block_bits = if Self::arity() == 4 {
-            2 * top.dropped
-        } else {
-            top.dropped
-        };
-        let span = 1usize << block_bits;
+        // A block is the `2^block_bits` leaves under one kept frontier node:
+        // `2^d` at arity 2, `4^d` at arity 4.
+        let block_bits = self.block_bits(top);
         let mut blocks: Vec<usize> = indices.iter().map(|index| index >> block_bits).collect();
         blocks.sort_unstable();
         blocks.dedup();
@@ -1448,9 +1466,30 @@ where
             gathering.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.rehashed_paths(top, indices, &blocks, &values)
+    }
+
+    /// The paths of tree positions `indices` from the leaves of their blocks:
+    /// `blocks` the queried blocks in position order, `values` every leaf of
+    /// them, block after block, in tree position order. Each block is
+    /// re-hashed here, its root checked against the kept node, and each path
+    /// continues through the kept levels.
+    fn rehashed_paths(
+        &self,
+        top: &TreeTop,
+        indices: &[usize],
+        blocks: &[usize],
+        values: &[Vec<FieldElement<F>>],
+    ) -> Result<Vec<Proof<Commitment>>, Error> {
+        let num_leaves = self.num_leaves();
+        let block_bits = self.block_bits(top);
+        let span = 1usize << block_bits;
+        if values.len() != blocks.len() << block_bits {
+            return Err(Error::RecomputedCodewordMismatch { block: 0 });
+        }
         let rehashing = std::time::Instant::now();
         TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        TOP_LEAVES_REHASHED.fetch_add(leaves.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        TOP_LEAVES_REHASHED.fetch_add(values.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let frontier = self.frontier(top);
         // Each queried block's subtree depends on its own leaves alone, so the
         // blocks are re-hashed in parallel; the subtrees stay in block order

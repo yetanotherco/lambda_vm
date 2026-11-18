@@ -304,11 +304,20 @@ fn a_blake3_joint_run_on_the_card_proves_the_hosts_bytes() {
         let label = format!("{}, revived at drop 4, the stack path off", stack.name);
         gpu::force_coset_openings(Some(false));
         let from_stack = gpu::coset_openings();
+        let fell_back = gpu::coset_fallbacks();
         let reencoded = stack.try_prove(&cfg, Some(4));
         let moved = gpu::coset_openings() - from_stack;
+        let reencodes = gpu::coset_fallbacks() - fell_back;
         gpu::force_coset_openings(None);
         let (_, reencoded) = reencoded.unwrap_or_else(|e| panic!("{label}: {e:?}"));
         assert_eq!(moved, 0, "{label}: no tree from its stack");
+        // The fallback re-encodes the run's codewords one at a time: at
+        // least one re-encode a tree, the paths re-hashed on the host.
+        assert!(
+            reencodes >= stack.trees(&cfg),
+            "{label}: {reencodes} re-encodes for {} trees",
+            stack.trees(&cfg)
+        );
         assert!(
             bytes(&reencoded) == bytes(&host_proof),
             "{label}: the host's bytes"

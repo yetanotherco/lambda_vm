@@ -435,6 +435,71 @@ fn note_coset_fallback() {
     COSET_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Waits a re-encode of a retired round-0 codeword took for the card's room
+/// ([`with_room_waits`]).
+static COSET_REENCODE_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// [`COSET_REENCODE_WAITS`].
+pub fn coset_reencode_waits() -> u64 {
+    COSET_REENCODE_WAITS.load(Ordering::Relaxed)
+}
+
+/// The pause between two tries of a re-encode the card had no room for.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const REENCODE_WAIT_STEP: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Tries of a re-encode before it is refused: ≈ 2 s of waits at
+/// [`REENCODE_WAIT_STEP`], several groups' openings beside an argue.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const REENCODE_TRIES: usize = 100;
+
+/// `attempt` until it gives a value, at most `tries` times, `step` apart
+/// (each pause counted in [`COSET_REENCODE_WAITS`]): a card short of room
+/// for a re-encode often has it once a neighbouring opening or argue lets
+/// its buffers go. `None` after the last try.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn with_room_waits<T>(
+    step: std::time::Duration,
+    tries: usize,
+    mut attempt: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    for t in 0..tries {
+        if let Some(value) = attempt() {
+            return Some(value);
+        }
+        if t + 1 < tries {
+            COSET_REENCODE_WAITS.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(step);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod room_wait_tests {
+    use super::with_room_waits;
+
+    /// A re-encode the card has room for on its fourth try is taken then; one
+    /// it never has room for is refused after its last try, not sooner and
+    /// not later.
+    #[test]
+    fn a_reencode_waits_for_room_a_bounded_while() {
+        let step = std::time::Duration::from_millis(1);
+        let mut tries = 0;
+        let got = with_room_waits(step, 10, || {
+            tries += 1;
+            (tries == 4).then_some(tries)
+        });
+        assert_eq!((got, tries), (Some(4), 4));
+        let mut tries = 0;
+        let got: Option<()> = with_room_waits(step, 10, || {
+            tries += 1;
+            None
+        });
+        assert_eq!((got, tries), (None, 10));
+    }
+}
+
 /// [`COSET_HOST_ENCODES`].
 pub fn coset_host_encodes() -> u64 {
     COSET_HOST_ENCODES.load(Ordering::Relaxed)
@@ -786,6 +851,7 @@ pub fn reset_call_counters() {
     ENCODE_DECLINES.store(0, Ordering::Relaxed);
     COSET_OPENINGS.store(0, Ordering::Relaxed);
     COSET_FALLBACKS.store(0, Ordering::Relaxed);
+    COSET_REENCODE_WAITS.store(0, Ordering::Relaxed);
     COSET_HOST_ENCODES.store(0, Ordering::Relaxed);
     ROUND_FORM_HOST_ENCODES.store(0, Ordering::Relaxed);
     SHIFT_CLAIM_BATCHES.store(0, Ordering::Relaxed);
@@ -7340,10 +7406,14 @@ impl CosetSource {
         })
     }
 
-    /// The whole codeword, re-encoded: the fallback. Counted.
-    pub(crate) fn encode(&self) -> Option<DeviceCodeword> {
+    /// The whole codeword, re-encoded: the fallback. Counted. A card short of
+    /// room is waited for a bounded while ([`with_room_waits`]) before the
+    /// re-encode is refused.
+    pub(crate) fn encode_waiting(&self) -> Option<DeviceCodeword> {
         note_coset_fallback();
-        self.0.encode(false).ok().map(DeviceCodeword)
+        with_room_waits(REENCODE_WAIT_STEP, REENCODE_TRIES, || {
+            self.0.encode(false).ok().map(DeviceCodeword)
+        })
     }
 }
 
@@ -7375,7 +7445,7 @@ impl CosetSource {
         match self.0 {}
     }
 
-    pub(crate) fn encode(&self) -> Option<DeviceCodeword> {
+    pub(crate) fn encode_waiting(&self) -> Option<DeviceCodeword> {
         match self.0 {}
     }
 }
