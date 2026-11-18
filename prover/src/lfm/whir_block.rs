@@ -1255,6 +1255,18 @@ impl WhirBlockPlan {
         self.groups.len()
     }
 
+    /// Test only: each table's AIR name, in the statement's table order (the
+    /// indices a group lists).
+    #[cfg(test)]
+    pub(crate) fn table_names(&self) -> Vec<String> {
+        self.frame
+            .airs
+            .air_refs()
+            .iter()
+            .map(|air| air.name().to_string())
+            .collect()
+    }
+
     /// The prepared tables, in the proof's table order.
     pub fn prepared(&self) -> &[PlannedPrepared] {
         &self.prepared
