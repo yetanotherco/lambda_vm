@@ -915,3 +915,84 @@ fn a_level_round_form_the_host_refuses_is_never_built_or_emitted() {
     println!("SHORT UNION, COUNT RESIZED: {why}");
     assert!(why.contains("RoundFormUnion"), "{why}");
 }
+
+/// Where a level's prepared and group cells go under each form: level 1 and
+/// level 2 over a small BLAKE3 block under today's form (first fold 6), the
+/// round form at first fold 4 and at first fold 6. Printed per level: every
+/// table's real and padded rows, width and preprocessed count; the sums of
+/// real and padded instruction rows, prepared cells (padded rows times
+/// preprocessed columns) and main cells (padded rows times width), and the
+/// share of each the lean BLAKE3 tables take.
+#[test]
+#[ignore = "probe: proves three small BLAKE3 bases; run by name"]
+fn level_cells_by_table_under_each_form() {
+    use super::levels::derive_levels;
+    let first6 = WhirFolds::First(multilinear::whir_chain::FirstFold::new(6).expect("a fold"));
+    for (arm, rounds, folds) in [
+        ("C", B3Rounds::Fri, first6),
+        ("W", B3Rounds::WHIR3, WhirFolds::Uniform),
+        ("W6", B3Rounds::WHIR3, first6),
+    ] {
+        let format = format(rounds, folds);
+        let (elf, proof) = base("test_commit_4", &format);
+        let plan = plan(&elf, &proof, &format);
+        let levels = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
+        for (k, level) in levels.iter().enumerate() {
+            let a = &level.build.artifacts;
+            let airs = a.airs();
+            let refs = airs.air_refs();
+            let shapes = a.shapes(&airs);
+            let mut real: Vec<usize> = Vec::new();
+            for g in super::wlfm::program_prep_groups(&level.program) {
+                let chunks = super::wlfm::chip_chunk_rows(g.real_rows, g.padded_rows, 22);
+                let mut left = g.real_rows;
+                for rows in chunks {
+                    real.push(left.min(rows));
+                    left = left.saturating_sub(rows);
+                }
+            }
+            real.extend(
+                super::b3l_tables::b3l_prep_groups(&level.program)
+                    .iter()
+                    .map(|g| g.real_rows),
+            );
+            let (mut real_sum, mut padded_sum, mut prep, mut main) =
+                (0usize, 0usize, 0usize, 0usize);
+            let (mut lean_prep, mut lean_main) = (0usize, 0usize);
+            for (t, (air, &(width, nv))) in refs.iter().zip(&shapes).enumerate() {
+                let padded = 1usize << nv;
+                let count = a.counts[t];
+                let r = real.get(t).copied().unwrap_or(0);
+                real_sum += r;
+                padded_sum += padded;
+                prep += padded * count;
+                main += padded * width;
+                let lean = air.name().starts_with("B3l") || air.name().contains("b3l");
+                if lean {
+                    lean_prep += padded * count;
+                    lean_main += padded * width;
+                }
+                println!(
+                    "CELLS {arm} L{}: table {t} {} · real {r} · padded 2^{nv} · fill {:.2} · width {width} \
+                     · prepared {count}",
+                    k + 1,
+                    air.name(),
+                    r as f64 / padded as f64
+                );
+            }
+            println!(
+                "CELLS {arm} L{} SUM: tables {} · instructions {} · lean compressions {} · real rows \
+                 {real_sum} · padded rows {padded_sum} · fill {:.3} · prepared cells {prep} (lean {:.3}) \
+                 · main cells {main} (lean {:.3}) · groups {}",
+                k + 1,
+                refs.len(),
+                level.program.instrs.len(),
+                level.program.groups.b3l.real_rows,
+                real_sum as f64 / padded_sum as f64,
+                lean_prep as f64 / prep.max(1) as f64,
+                lean_main as f64 / main.max(1) as f64,
+                a.sizes.len()
+            );
+        }
+    }
+}
