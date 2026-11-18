@@ -63,3 +63,32 @@ fn the_default_wlfm_program_id_is_unmoved() {
         .format;
     assert_eq!(super::wlfm::format_identity_text(&whir), text);
 }
+
+/// ★ The identity moves with every field of the round form: the fixture's
+/// artifacts under today's form, under the round form, and under the round
+/// form with each of its fields moved once (shrink, target, union, cap rule)
+/// give six distinct identities; today's is the pinned one.
+#[test]
+fn every_field_of_the_round_form_moves_the_wlfm_identity() {
+    use multilinear::whir_chain::{RoundForm, WhirRounds};
+    let program = honest();
+    let build = build(&program, WlfmRate::Two);
+    let base = build.artifacts.clone();
+    let id_under = |rounds: RoundForm| {
+        let mut artifacts = base.clone();
+        artifacts.config.format.rounds = rounds;
+        hex(&super::wlfm::wlfm_program_id(&artifacts))
+    };
+    let w = |shrink: usize, bits: u8, union: usize| WhirRounds::new(shrink, bits, union).unwrap();
+    let ids = [
+        id_under(RoundForm::Fri),
+        id_under(RoundForm::Whir(w(3, 128, 7).with_caps_by_queries())),
+        id_under(RoundForm::Whir(w(2, 128, 7).with_caps_by_queries())),
+        id_under(RoundForm::Whir(w(3, 127, 7).with_caps_by_queries())),
+        id_under(RoundForm::Whir(w(3, 128, 6).with_caps_by_queries())),
+        id_under(RoundForm::Whir(w(3, 128, 7))),
+    ];
+    assert_eq!(ids[0], hex(&build.artifacts.program_id), "today's is the fixture's own");
+    let distinct: std::collections::BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(distinct.len(), ids.len(), "{ids:?}");
+}

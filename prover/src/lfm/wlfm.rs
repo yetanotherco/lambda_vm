@@ -1257,16 +1257,12 @@ pub fn wlfm_program_id(a: &WlfmArtifacts) -> Commitment {
     }
     // The rest of the format, whole: a lever added later moves the identity.
     h.update(format_identity_text(&c.format).as_bytes());
-    // The WHIR round form, when a chain takes it, explicitly: its shrink,
-    // target, union bound and cap rule. Today's form adds nothing here.
-    if let multilinear::whir_chain::RoundForm::Whir(w) = c.format.rounds {
+    // The WHIR round form, when a chain takes it: its whole derived text, so
+    // every field it has or gains moves the identity by itself. Today's form
+    // adds nothing here.
+    if let multilinear::whir_chain::RoundForm::Whir(_) = c.format.rounds {
         h.update(b"ROUND FORM");
-        h.update([
-            w.shrink() as u8,
-            w.security_bits(),
-            w.union_rounds() as u8,
-            u8::from(w.caps_by_queries()),
-        ]);
+        h.update(format!("{:?}", c.format.rounds).as_bytes());
     }
     // The chips' cut, when any chip is cut: each chip's table count (their
     // heights are in the table list above). A program with no cut chip folds
