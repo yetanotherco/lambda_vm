@@ -352,6 +352,7 @@ pub fn generate_keccak_w_rows_as(
 /// [`generate_keccak_w_rows_as`] with its rows filled as the row ranges
 /// `bounds(num_rows)` at once ([`super::gpack::generate_main_rows`]): the same
 /// trace, word for word and packed byte for byte.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn generate_keccak_w_rows_split_as(
     ops: &[KeccakOperation],
     num_rows: usize,

@@ -108,11 +108,13 @@ impl VmTable for NarrowRows<'_> {
 }
 
 /// The most parts a split fill cuts a table into ([`row_bounds_at`]).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) const SPLIT_MAX_PARTS: usize = 8;
 
 /// The row ranges a fill of `rows` rows is split into, `[b[i], b[i + 1])`: one
 /// range when the table has fewer than two parts' rows, else up to
 /// `max_parts` near-equal ranges of at least `min_rows` rows.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn row_bounds_at(rows: usize, min_rows: usize, max_parts: usize) -> Vec<usize> {
     let min_rows = min_rows.max(1);
     if rows < 2 * min_rows || max_parts < 2 {
