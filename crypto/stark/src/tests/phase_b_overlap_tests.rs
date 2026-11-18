@@ -491,6 +491,52 @@ fn the_overlap_proves_the_bytes_of_one_group_at_a_time() {
     }
 }
 
+/// ★ A block whose groups argue on the two-layer GKR ladder proves and
+/// verifies, one group at a time and with the overlap in any order (the same
+/// bytes), and differs from the one-layer block; neither ladder's verifier
+/// takes the other's block.
+#[test]
+fn a_block_on_the_two_layer_ladder_proves_the_same_bytes_in_any_order() {
+    use multilinear::whir_chain::GkrLadder;
+    let double = ArgueFormat::BATCHED.with_ladder(GkrLadder::Double);
+    let reversed: Vec<usize> = (0..SIZES.len()).rev().collect();
+    let (serial, _) = prove(
+        double,
+        PhaseBOverlap::Off,
+        &in_order(),
+        OverlapFaults::default(),
+    );
+    let serial = serial.expect("one group at a time");
+    verify(double, &serial).expect("the two-layer block verifies");
+    for (what, order, overlap) in [
+        ("in order", in_order(), PhaseBOverlap::On),
+        ("reversed", reversed, PhaseBOverlap::On),
+    ] {
+        let (proved, _) = prove(double, overlap, &order, OverlapFaults::default());
+        let proved = proved.unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        assert!(bytes(&proved) == bytes(&serial), "{what}: the proof");
+    }
+    let (single, _) = prove(
+        ArgueFormat::BATCHED,
+        PhaseBOverlap::Off,
+        &in_order(),
+        OverlapFaults::default(),
+    );
+    let single = single.expect("one layer a step");
+    assert!(
+        bytes(&single) != bytes(&serial),
+        "the ladders' bytes differ"
+    );
+    assert!(
+        verify(ArgueFormat::BATCHED, &serial).is_err(),
+        "a two-layer block under the one-layer verifier"
+    );
+    assert!(
+        verify(double, &single).is_err(),
+        "a one-layer block under the two-layer verifier"
+    );
+}
+
 /// ★ Retired prepared stacks move no byte: committed and let go, each revived
 /// at its group's opening after the group's own codewords have gone, the
 /// block proves the held stacks' proof (the bytes of [`BEFORE_THE_OVERLAP`])
