@@ -1677,7 +1677,7 @@ fn early_pool(threads: usize) -> Result<Option<std::sync::Arc<rayon::ThreadPool>
 
 /// This thread at `nice` (Linux; elsewhere nothing). A refusal leaves it as
 /// it was: the order of work changes, never its result.
-fn lower_this_threads_priority(nice: i32) {
+pub(crate) fn lower_this_threads_priority(nice: i32) {
     #[cfg(target_os = "linux")]
     // SAFETY: setpriority on this thread's own id; no memory is touched.
     unsafe {
