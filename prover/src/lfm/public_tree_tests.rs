@@ -132,7 +132,7 @@ fn trees(shifted: bool) -> (FractionTree<Ext3>, FractionTree<Ext3>) {
     multilinear::logup::fault_public_selector_shift(shifted);
     let card = multilinear::logup::resident_tree_with_public(&chunk, &trace);
     multilinear::logup::fault_public_selector_shift(false);
-    let card = card.expect("the card builds the public-reading tree");
+    let card = card.unwrap_or_else(|why| panic!("the card builds the public-reading tree: {why}"));
     assert!(card.device().is_some(), "the tree lives on the card");
     (card, host)
 }

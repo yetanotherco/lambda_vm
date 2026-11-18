@@ -900,6 +900,7 @@ where
                 let started = std::time::Instant::now();
                 let mut resident_seen = None;
                 let mut public_tried = false;
+                let mut public_why: Option<String> = None;
                 let on_card = (multilinear::gpu::argue_no_lift()
                     && trace.device_factors().is_none())
                 .then(columns_tree)
@@ -913,6 +914,8 @@ where
                         .then(|| {
                             public_tried = true;
                             logup::resident_tree_with_public(interactions, trace)
+                                .map_err(|why| public_why = Some(why))
+                                .ok()
                         })
                         .flatten()
                         .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
@@ -937,15 +940,17 @@ where
                     None => {
                         split.trees_host += 1;
                         let why = match (public_tried, resident_seen) {
-                            (true, _) => {
-                                "its public-columns card build was declined (no room, no resident \
-                                 columns, or a selector that is not base-valued)"
+                            (true, _) => format!(
+                                "its public-columns card build was declined: {}",
+                                public_why.as_deref().unwrap_or("no reason given")
+                            ),
+                            (false, Some(false)) => {
+                                "no resident columns or factors for its table".to_string()
                             }
-                            (false, Some(false)) => "no resident columns or factors for its table",
-                            _ => "the card declined the build",
+                            _ => "the card declined the build".to_string(),
                         };
                         multilinear::gpu::note_gkr_tree_host_built(
-                            why,
+                            &why,
                             t,
                             interactions.len().next_power_of_two() << trace.num_vars(),
                         );
