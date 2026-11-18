@@ -260,6 +260,17 @@ LT, MIN and CMIN are all on the fork's. This file's channel has one consumer,
 the fork's balance carries the `N * count` bound, and its `consistentUpTo` shows
 the channel is consistent under the fork's `BalancedUpTo N`. Nothing else uses it.
 
+Moving LT onto the counted channel has one structural cost: **LT cannot share an
+ensemble with EQ or SHIFT.** `Channel.counted` keeps the base channel's name
+(`name := channel.name`), so `Bitwise.IsHalf.counted 255`, which `Tables/Lt.lean`
+pulls, and `Bitwise.IsHalf.toRaw`, which `Tables/Eq.lean` and `Tables/Shift.lean`
+pull through `pullIf`, are two different `RawChannel`s both called `IS_HALF`, and
+`Ensemble.unique_channel_names` rejects a `tables` list holding both. `MSB16` is
+the same. A combined ensemble would have to put EQ and SHIFT on the counted
+channel too, at `N = 1`; the pinned fork has no lemma collapsing `Channel.counted
+1` to the plain channel, so that is a proof obligation, not a rename. No ensemble
+here needs it yet: `LtStaged` and `CountedSameBus` hold LT and its toy MIN only.
+
 ## What is intentionally not proven
 
 Scope limits, not bugs. Each is also noted where it applies.
