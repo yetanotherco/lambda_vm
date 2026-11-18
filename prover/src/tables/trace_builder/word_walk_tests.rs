@@ -151,6 +151,7 @@ fn left(
         format.keccak_rnd,
         format.memw_aligned,
         registers,
+        format.ecdas,
     );
     airs.with_fused_memory(&options, build.fused_counts());
     airs.with_word_memory(&options, build.word_counts(), &build.page_configs)

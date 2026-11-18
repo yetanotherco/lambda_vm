@@ -351,6 +351,7 @@ pub fn prove_with_options_and_inputs(
         crate::tables::keccak_rnd::KeccakRndForm::Full,
         crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         crate::tables::register::RegisterFormat::Tokens32,
+        crate::tables::ecdas::EcdasForm::Bytes,
     );
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
@@ -557,6 +558,7 @@ pub fn verify_with_options(
         crate::tables::keccak_rnd::KeccakRndForm::Full,
         crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         crate::tables::register::RegisterFormat::Tokens32,
+        crate::tables::ecdas::EcdasForm::Bytes,
     );
     // The CPU heights were read at `cpu_proof_start`: the tables must be there.
     airs.check_cpu_position(&proof.table_counts)?;

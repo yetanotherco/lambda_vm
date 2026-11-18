@@ -926,6 +926,7 @@ fn every_is_half_sender_of_the_in_row_airs_weighs_a_bit() {
         crate::block_whir::BlockFormat::production().keccak_rnd,
         crate::block_whir::BlockFormat::production().memw_aligned,
         RegisterFormat::InRow,
+        crate::block_whir::BlockFormat::production().ecdas,
     );
     let halfword = u64::from(BusId::IsHalfword);
     let mut cpu_slots = 0;
@@ -1051,6 +1052,7 @@ fn reg_paths(program: &Elf, traces: &mut Traces) -> BTreeMap<u64, Vec<(u64, [u32
         crate::block_whir::BlockFormat::production().keccak_rnd,
         crate::block_whir::BlockFormat::production().memw_aligned,
         RegisterFormat::InRow,
+        crate::block_whir::BlockFormat::production().ecdas,
     );
     let reg_bus = u64::from(BusId::Reg);
     type Token = (u64, [u32; 2]);

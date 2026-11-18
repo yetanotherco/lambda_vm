@@ -360,6 +360,14 @@ pub struct BlockFormat {
     /// verifier). The block's tables, so its buses and the recursion's
     /// programs, follow it.
     pub memory: crate::tables::fused_memory::MemoryFormat,
+    /// Which relations ECDAS proves its steps with
+    /// ([`EcdasForm`](crate::tables::ecdas::EcdasForm)): at byte positions
+    /// ([`Bytes`](crate::tables::ecdas::EcdasForm::Bytes), the production and
+    /// pinned constant), or the same relations at 16-bit limb positions
+    /// ([`Halves`](crate::tables::ecdas::EcdasForm::Halves), the variant a
+    /// caller names). Its columns, constraints and interactions, so its GKR
+    /// trees and the recursion's programs, follow it.
+    pub ecdas: crate::tables::ecdas::EcdasForm,
 }
 
 /// The most groups a block statement may declare: a verifier constant, never in
@@ -832,6 +840,7 @@ impl BlockFormat {
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
             registers: crate::tables::register::RegisterFormat::InRow,
             memory: crate::tables::fused_memory::MemoryFormat::Fused,
+            ecdas: crate::tables::ecdas::EcdasForm::Bytes,
         }
     }
 
@@ -873,6 +882,7 @@ impl BlockFormat {
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
             registers: crate::tables::register::RegisterFormat::InRow,
             memory: crate::tables::fused_memory::MemoryFormat::Split,
+            ecdas: crate::tables::ecdas::EcdasForm::Bytes,
         }
     }
 
@@ -891,6 +901,13 @@ impl BlockFormat {
     /// the verifier of one block both take, never read from a proof.
     pub fn with_keccak_rnd(self, keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm) -> Self {
         Self { keccak_rnd, ..self }
+    }
+
+    /// This format with ECDAS's relations in `ecdas`' form: a named constant
+    /// the prover and the verifier of one block both take, never read from a
+    /// proof.
+    pub fn with_ecdas(self, ecdas: crate::tables::ecdas::EcdasForm) -> Self {
+        Self { ecdas, ..self }
     }
 
     /// This format with MEMW_A's timestamp order in `memw_aligned`'s form: a
@@ -5459,6 +5476,13 @@ fn prove_block_whir_body(
             format.memw_aligned
         )));
     }
+    // And ECDAS in today's form alone.
+    if format.ecdas != crate::tables::ecdas::EcdasForm::Bytes {
+        return Err(Error::Prover(format!(
+            "ECDAS's {:?} relations need the windowed build (`window_log2`)",
+            format.ecdas
+        )));
+    }
     // And the registers in today's format alone.
     if format.registers != crate::tables::register::RegisterFormat::Tokens32 {
         return Err(Error::Prover(format!(
@@ -5497,7 +5521,7 @@ fn prove_block_whir_body(
         padding,
         format.keccak_rnd,
     )?;
-    split_ecdas(&mut traces, options.ecdas_rows_log2, padding);
+    split_ecdas(&mut traces, options.ecdas_rows_log2, padding, format.ecdas);
     split_keccak(
         &mut traces,
         options.keccak_rows_log2,
@@ -5563,9 +5587,14 @@ pub(crate) fn split_keccak_rnd(
 /// as `padding` keeps ([`split_cut`]): a cut may fall inside one scalar
 /// multiplication, whose steps chain through the Ecdas bus alone
 /// ([`BLOCK_ECDAS_ROWS_LOG2`]).
-pub(crate) fn split_ecdas(traces: &mut Traces, rows_log2: usize, padding: CutPadding) {
+pub(crate) fn split_ecdas(
+    traces: &mut Traces,
+    rows_log2: usize,
+    padding: CutPadding,
+    form: crate::tables::ecdas::EcdasForm,
+) {
     let rows = 1usize << rows_log2;
-    let mu = crate::tables::ecdas::cols::MU;
+    let mu = form.mu();
     traces.ecdases = std::mem::take(&mut traces.ecdases)
         .into_iter()
         .flat_map(|table| split_cut(table, rows, mu, padding))
@@ -5677,6 +5706,7 @@ pub(crate) fn prove_traces(
         format.keccak_rnd,
         format.memw_aligned,
         format.registers,
+        format.ecdas,
     );
     airs.with_fused_memory(proof_options, fused);
     if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
@@ -6912,6 +6942,7 @@ fn lay_out_rest<'a>(
             format.keccak_rnd,
             format.memw_aligned,
             format.registers,
+            format.ecdas,
         );
         airs.with_fused_memory(opts, fused);
         if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
@@ -7152,6 +7183,7 @@ fn lay_out_rest_streamed<'a>(
     memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
     registers: crate::tables::register::RegisterFormat,
     memory: crate::tables::fused_memory::MemoryFormat,
+    ecdas: crate::tables::ecdas::EcdasForm,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
@@ -7190,6 +7222,7 @@ fn lay_out_rest_streamed<'a>(
                 keccak_rnd,
                 memw_aligned,
                 registers,
+                ecdas,
             );
             airs.with_fused_memory(opts, fused);
             if memory == crate::tables::fused_memory::MemoryFormat::Words {
@@ -8071,6 +8104,7 @@ fn prove_streamed(
                 }
                 builder = builder.slide_rest();
                 builder = builder.keccak_rnd_form(format.keccak_rnd);
+                builder = builder.ecdas_form(format.ecdas);
                 builder = builder.memw_aligned_order(format.memw_aligned)?;
                 builder = builder.register_format(format.registers)?;
                 builder = builder.memory_format(format.memory)?;
@@ -8485,7 +8519,7 @@ fn prove_streamed(
                 // Cut at the finish already, and held packed: a packed table
                 // has no rows for `split_rows` to copy.
                 if !options.finish_cuts {
-                    split_ecdas(&mut rest, options.ecdas_rows_log2, padding);
+                    split_ecdas(&mut rest, options.ecdas_rows_log2, padding, format.ecdas);
                     split_keccak(&mut rest, options.keccak_rows_log2, padding, format.memory);
                     split_ecsm(&mut rest, options.ecsm_rows_log2, padding);
                     split_copy(&mut rest, options.copy_rows_log2, padding, format.memory);
@@ -8581,6 +8615,7 @@ fn prove_streamed(
                         format.memw_aligned,
                         format.registers,
                         format.memory,
+                        format.ecdas,
                     ),
                 };
                 let (streamed, rest) = if inline {
@@ -9779,6 +9814,7 @@ pub(crate) fn block_frame(
         format.keccak_rnd,
         format.memw_aligned,
         format.registers,
+        format.ecdas,
     );
     airs.with_fused_memory(proof_options, fused);
     if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
@@ -11754,6 +11790,7 @@ mod packer_tests {
                 format.keccak_rnd,
                 format.memw_aligned,
                 registers,
+                format.ecdas,
             );
             // The fused memory format's families, as a fused block holds them.
             airs.with_fused_memory(&opts, [2, 2]);
@@ -12584,6 +12621,7 @@ mod rest_airs_beside_tests {
                 form,
                 crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
                 crate::tables::register::RegisterFormat::InRow,
+                crate::tables::ecdas::EcdasForm::Bytes,
             );
             let refs = airs.air_refs();
             let early = |i: usize, form: KeccakRndForm| {
@@ -12712,6 +12750,7 @@ mod rest_airs_probe {
             KeccakRndForm::Lean,
             MemwAlignedOrder::Limbs,
             RegisterFormat::InRow,
+            crate::tables::ecdas::EcdasForm::Bytes,
         );
         let block_ms = ms(t);
         let t = Instant::now();

@@ -956,6 +956,11 @@ fn cmd_prove_block(
         eprintln!("BLOCK_WHIR_MEMW_A is the harness's knob: the CLI proves the verifier's form");
         return ExitCode::FAILURE;
     }
+    // So is ECDAS's.
+    if std::env::var_os("BLOCK_WHIR_ECDAS").is_some() {
+        eprintln!("BLOCK_WHIR_ECDAS is the harness's knob: the CLI proves the verifier's form");
+        return ExitCode::FAILURE;
+    }
     // So is the register format.
     if std::env::var_os("BLOCK_WHIR_REGISTERS").is_some() {
         eprintln!("BLOCK_WHIR_REGISTERS is the harness's knob: the CLI proves the verifier's form");
@@ -1103,9 +1108,9 @@ fn cmd_prove_block(
     // the one `verify-block` derives: harness arms, not a production proof.
     if !cfg.at_presets() {
         eprintln!(
-            "W3_LEAVES, W3_FAN_IN, BLOCK_WHIR_ARGUE, BLOCK_WHIR_KECCAK_RND and BLOCK_WHIR_MEMW_A \
-             make another tree than the block verifier derives: unset them to prove a block the \
-             CLI can verify"
+            "W3_LEAVES, W3_FAN_IN, BLOCK_WHIR_ARGUE, BLOCK_WHIR_KECCAK_RND, BLOCK_WHIR_MEMW_A and \
+             BLOCK_WHIR_ECDAS make another tree than the block verifier derives: unset them to \
+             prove a block the CLI can verify"
         );
         return ExitCode::FAILURE;
     }

@@ -154,6 +154,7 @@ fn small_format() -> BlockFormat {
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
+        ecdas: crate::tables::ecdas::EcdasForm::Bytes,
     }
 }
 
@@ -245,12 +246,12 @@ fn the_frame_refuses_a_bitwise_table_off_its_fixed_height() {
 
 /// Format knobs a verifier's process could carry, each off the default: the
 /// WHIR blowup, grind bits and folds, the leaves' query check and scale, the
-/// leaves' share form, the GKR packing, the KECCAK_RND and MEMW_A forms, the
+/// leaves' share form, the GKR packing, the KECCAK_RND, MEMW_A and ECDAS forms, the
 /// register format and the memory format. The memory word is `split`, off the
 /// production format's fused tables; the parent also runs the child under
 /// `fused` ([`MEMORY_WORDS`]), off the verifier's pinned split format, so each
 /// side sees a word off its own default.
-const OFF_DEFAULT: [(&str, &str); 11] = [
+const OFF_DEFAULT: [(&str, &str); 12] = [
     (crate::zf_format::ENV_WHIR_BLOWUP, "4"),
     (crate::zf_format::ENV_WHIR_GRIND_BITS, "20"),
     (crate::zf_format::ENV_WHIR_FOLDS, "uniform4"),
@@ -260,6 +261,7 @@ const OFF_DEFAULT: [(&str, &str); 11] = [
     ("BLOCK_WHIR_ARGUE_PACK", "off"),
     ("BLOCK_WHIR_KECCAK_RND", "full"),
     ("BLOCK_WHIR_MEMW_A", "lt"),
+    ("BLOCK_WHIR_ECDAS", "halves"),
     ("BLOCK_WHIR_REGISTERS", "tokens32"),
     ("BLOCK_WHIR_MEMORY", "split"),
 ];
@@ -359,6 +361,16 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         "the prover's own production format reads no MEMW_A knob"
     );
     assert_eq!(
+        harness.format.ecdas,
+        crate::tables::ecdas::EcdasForm::Halves,
+        "the harness's ECDAS form follows its knob"
+    );
+    assert_eq!(
+        production.ecdas,
+        crate::tables::ecdas::EcdasForm::Bytes,
+        "the prover's own production format reads no ECDAS knob"
+    );
+    assert_eq!(
         harness.format.registers,
         crate::tables::register::RegisterFormat::Tokens32,
         "the harness's register format follows its knob"
@@ -404,6 +416,11 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         pinned.format.memw_aligned,
         crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
         "the verifier's MEMW_A form is its named constant, not the environment's"
+    );
+    assert_eq!(
+        pinned.format.ecdas,
+        crate::tables::ecdas::EcdasForm::Bytes,
+        "the verifier's ECDAS form is its named constant, not the environment's"
     );
     assert_eq!(
         pinned.format.registers,
