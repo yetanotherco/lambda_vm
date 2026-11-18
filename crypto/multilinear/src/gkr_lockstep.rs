@@ -3212,6 +3212,52 @@ mod tests {
         }
     }
 
+    /// A ladder's last step when all its trees descend one layer (the tallest
+    /// tree odd): each of its values one off is refused at that step, and so is
+    /// a round removed from or added to a mixed step, by name.
+    #[test]
+    fn a_final_one_layer_step_and_a_steps_round_count_are_refused() {
+        // [5, 4]: steps at ℓ = 0 (both two layers), 2 (both two layers, the
+        // second leaving) and 4 (the first, one layer, degree 3).
+        let heights = [5, 4];
+        let (_, outputs, proof) = outputs_and_proof(&heights, GkrLadder::Double);
+        let schedule = ladder_steps(&heights, GkrLadder::Double);
+        assert_eq!(schedule[2].relations, vec![(0, Relation::Single)]);
+        assert_eq!(schedule[2].degree, 3);
+        for value in 0..4 {
+            let mut bad = proof.clone();
+            let h = &mut bad.layers[2].halves[0];
+            *[&mut h.p_lo, &mut h.p_hi, &mut h.q_lo, &mut h.q_hi][value] += FE::one();
+            assert_eq!(
+                verify_double(&bad, &outputs, &heights).unwrap_err(),
+                Error::LayerRelationMismatch { layer: 2 },
+                "value {value}"
+            );
+        }
+        // [4, 3, 4]: step 1 (ℓ = 2) is mixed and runs two rounds.
+        let heights = [4, 3, 4];
+        let (_, outputs, proof) = outputs_and_proof(&heights, GkrLadder::Double);
+        let mut short = proof.clone();
+        short.layers[1].sumcheck.rounds.pop();
+        assert_eq!(
+            verify_double(&short, &outputs, &heights).unwrap_err(),
+            Error::RoundCountMismatch {
+                expected: 2,
+                got: 1
+            }
+        );
+        let mut long = proof.clone();
+        let extra = long.layers[1].sumcheck.rounds[0].clone();
+        long.layers[1].sumcheck.rounds.push(extra);
+        assert_eq!(
+            verify_double(&long, &outputs, &heights).unwrap_err(),
+            Error::RoundCountMismatch {
+                expected: 2,
+                got: 3
+            }
+        );
+    }
+
     /// The residual is load-bearing under the two-layer form too: made inert,
     /// the mid-step tamper above is no longer refused at its step.
     #[test]
