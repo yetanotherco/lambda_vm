@@ -2017,25 +2017,13 @@ impl<'a> FinishPlan<'a> {
                         ecdas::EcdasForm::Halves => ecdas::halves_rows_written_packed,
                     },
                     |rows, num_rows, form| {
-                        ecdas::generate_ecdas_rows_in(
-                            rows,
-                            num_rows,
-                            form,
-                            ecdas_form,
-                            ecdas::widen,
-                        )
+                        ecdas::generate_ecdas_rows_in(rows, num_rows, form, ecdas_form)
                     },
                 );
             }
             generate_optional(&ecdas_ops.whole(), |rows| {
                 let num_rows = rows.len().next_power_of_two().max(4);
-                ecdas::generate_ecdas_rows_in(
-                    rows,
-                    num_rows,
-                    TraceForm::Wide,
-                    ecdas_form,
-                    ecdas::widen,
-                )
+                ecdas::generate_ecdas_rows_in(rows, num_rows, TraceForm::Wide, ecdas_form)
             })
         };
         // HINT table. Absent entirely for programs that make no hint ecalls.
@@ -2975,7 +2963,7 @@ impl<'a> FinishPlan<'a> {
             pack,
             form,
             Arc::new(move |rows: &[ecdas::CompactEcdasOp], num_rows, form| {
-                ecdas::generate_ecdas_rows_in(rows, num_rows, form, ecdas_form, ecdas::widen)
+                ecdas::generate_ecdas_rows_in(rows, num_rows, form, ecdas_form)
             }),
             |ops| {
                 Box::new(move || {
@@ -2986,7 +2974,6 @@ impl<'a> FinishPlan<'a> {
                         num_rows,
                         TraceForm::Wide,
                         ecdas_form,
-                        ecdas::widen,
                     ))
                 })
             },

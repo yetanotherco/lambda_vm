@@ -28,9 +28,9 @@ use stark::traits::{AIR, TransitionEvaluationContext};
 
 use crate::tables::ecdas::{
     EcdasConstraints, EcdasForm, EcdasHalvesConstraints, EcdasOperation, HALVES_CARRIES,
-    HALVES_CARRY_OFFSET, HALVES_POSITIONS, HalvesLimbs, R_BYTES, bus_interactions_for, cols,
-    generate_ecdas_rows_in, halves_carries, halves_chain, halves_checked_bytes, halves_cols as h,
-    split_carry,
+    HALVES_CARRY_OFFSET, HALVES_POSITIONS, HalvesLimbs, R_BYTES, StepBytes, bus_interactions_for,
+    cols, generate_ecdas_rows_in, halves_carries, halves_chain, halves_checked_bytes,
+    halves_cols as h, split_carry,
 };
 use crate::tables::gpack::TraceForm;
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
@@ -402,9 +402,7 @@ fn assert_both_forms_hold(steps: &[EcdasStep], label: &str) {
     let rows = ops.len().next_power_of_two().max(4) + 4;
     let rows = rows.next_power_of_two();
     for form in [EcdasForm::Bytes, EcdasForm::Halves] {
-        let trace = generate_ecdas_rows_in(&ops, rows, TraceForm::Wide, form, |o| {
-            std::borrow::Cow::Borrowed(o)
-        });
+        let trace = generate_ecdas_rows_in(&ops, rows, TraceForm::Wide, form);
         let interactions = bus_interactions_for(form);
         for r in 0..trace.num_rows() {
             let row = row_of(&trace, r);
@@ -1335,6 +1333,85 @@ fn each_sampled_byte_check_is_load_bearing() {
     }
 }
 
+/// The tables' and BITWISE's carry path ([`StepBytes::terms`]: 32-bit
+/// products, the branch `op` names) computes the reference's terms
+/// ([`HalvesLimbs::terms`]) exactly: on real steps, and on 20,000 rows of
+/// random bytes (every op, including one no real row has).
+#[test]
+fn the_tables_terms_are_the_references() {
+    for k in [3u64, 0xABCD, u64::MAX] {
+        for s in steps_for(&k_le(k)) {
+            assert_eq!(StepBytes::of_step(&s).terms(), HalvesLimbs::of(&s).terms());
+        }
+    }
+    let mut rng = Rng(31);
+    for n in 0..20_000u64 {
+        let mut b32 = || -> [u8; 32] { std::array::from_fn(|_| rng.next() as u8) };
+        let (x_a, y_a, x_g, y_g, lambda, x_r, y_r) =
+            (b32(), b32(), b32(), b32(), b32(), b32(), b32());
+        let mut b33 = || -> [u8; 33] { std::array::from_fn(|_| rng.next() as u8) };
+        let (q0, q1, q2) = (b33(), b33(), b33());
+        let s = EcdasStep {
+            x_a,
+            y_a,
+            x_g,
+            y_g,
+            round: 1,
+            op: (n % 3) as u8,
+            next_op: 0,
+            lambda,
+            x_r,
+            y_r,
+            q0,
+            q1,
+            q2,
+            c0: [0; 64],
+            c1: [0; 64],
+            c2: [0; 64],
+        };
+        assert_eq!(
+            StepBytes::of_step(&s).terms(),
+            HalvesLimbs::of(&s).terms(),
+            "row {n}"
+        );
+    }
+}
+
+/// The limb form's width seed (`gpack_seeds`, `ECDAS~halves`) holds every
+/// cell of a real table, padding rows included: a seeded table is written
+/// packed once, never again for a word past its column.
+#[test]
+fn the_limb_forms_width_seed_holds_its_tables() {
+    let steps: Vec<EcdasOperation> = [3u64, 0xABCD, u64::MAX]
+        .iter()
+        .flat_map(|&k| steps_for(&k_le(k)))
+        .map(|step| EcdasOperation {
+            timestamp: (1 << 32) - 1,
+            step,
+        })
+        .collect();
+    let rows = (steps.len() + 1).next_power_of_two();
+    let trace = generate_ecdas_rows_in(&steps, rows, TraceForm::Wide, EcdasForm::Halves);
+    let seed = "4,1x260,2x31,1x64,2x31,1x64,2x31,1x33";
+    let widths: Vec<u32> = seed
+        .split(',')
+        .flat_map(|run| match run.split_once('x') {
+            Some((w, n)) => vec![w.parse().unwrap(); n.parse().unwrap()],
+            None => vec![run.parse().unwrap()],
+        })
+        .collect();
+    assert_eq!(widths.len(), h::NUM_COLUMNS);
+    for r in 0..rows {
+        for (c, &w) in widths.iter().enumerate() {
+            let v = trace.main_table.get(r, c).canonical();
+            assert!(
+                w >= 8 || v < 1u64 << (8 * w),
+                "row {r} column {c}: {v} past {w} bytes"
+            );
+        }
+    }
+}
+
 /// The limb form's table of real steps carries exactly the integer chains'
 /// carries, and its padding rows' are zero.
 #[test]
@@ -1349,9 +1426,7 @@ fn the_tables_carries_are_the_chains() {
         .collect();
     let rows = ops.len().next_power_of_two() * 2;
     for form in [TraceForm::Wide, TraceForm::Narrow, TraceForm::Narrow] {
-        let trace = generate_ecdas_rows_in(&ops, rows, form, EcdasForm::Halves, |o| {
-            std::borrow::Cow::Borrowed(o)
-        });
+        let trace = generate_ecdas_rows_in(&ops, rows, form, EcdasForm::Halves);
         let columns: Vec<Vec<FE>> = match trace.narrow_main() {
             Some(n) => (0..n.cols())
                 .map(|c| n.column(c).into_iter().map(FE::from).collect())

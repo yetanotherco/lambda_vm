@@ -352,6 +352,7 @@ impl CompactEcdasOp {
 }
 
 /// A [`CompactEcdasOp`] read as its op.
+#[cfg(test)]
 pub(crate) fn widen(row: &CompactEcdasOp) -> Cow<'_, EcdasOperation> {
     Cow::Owned(row.to_op())
 }
@@ -828,6 +829,7 @@ pub(crate) struct HalvesLimbs {
 
 impl HalvesLimbs {
     /// A real row's limbs (`μ = 1`).
+    #[cfg(test)]
     pub(crate) fn of(s: &EcdasStep) -> Self {
         let l16 = |b: &[u8; 32]| limbs_of::<16>(b).map(|v| v as i64);
         let l17 = |b: &[u8; 33]| limbs_of::<17>(b).map(|v| v as i64);
@@ -901,12 +903,231 @@ pub(crate) fn halves_chain(terms: &[i64; HALVES_POSITIONS]) -> ([i64; HALVES_CAR
 /// A step's carries under [`EcdasForm::Halves`], λ's, xR's and yR's, from its
 /// bytes (the byte form's carries are not read).
 pub fn halves_carries(s: &EcdasStep) -> [[i64; HALVES_CARRIES]; 3] {
-    let terms = HalvesLimbs::of(s).terms();
-    terms.map(|t| {
-        let (carries, exact) = halves_chain(&t);
-        debug_assert!(exact, "an ECDAS step whose relations do not hold");
-        carries
+    StepBytes::of_step(s).halves_carries()
+}
+
+/// The bytes of one ECDAS row, borrowed from the row however it is held: what
+/// the limb form's table and its BITWISE count read.
+#[derive(Clone, Copy)]
+pub(crate) struct StepBytes<'a> {
+    pub(crate) timestamp: u64,
+    pub(crate) x_g: &'a [u8; 32],
+    pub(crate) y_g: &'a [u8; 32],
+    pub(crate) x_a: &'a [u8; 32],
+    pub(crate) y_a: &'a [u8; 32],
+    pub(crate) x_r: &'a [u8; 32],
+    pub(crate) y_r: &'a [u8; 32],
+    pub(crate) lambda: &'a [u8; 32],
+    pub(crate) q: [&'a [u8; 33]; 3],
+    pub(crate) round: u8,
+    pub(crate) op: u8,
+    pub(crate) next_op: u8,
+}
+
+/// `Σ_j a_j·b_{k−j}` at each of the 31 positions of two 16-limb operands.
+/// Each product is below 2^32, so it is taken in 32 bits and summed in 64.
+#[inline]
+fn conv16(a: &[u32; 16], b: &[u32; 16]) -> [i64; 31] {
+    let mut out = [0u64; 31];
+    for (i, &x) in a.iter().enumerate() {
+        for (o, &y) in out[i..i + 16].iter_mut().zip(b) {
+            *o += u64::from(x * y);
+        }
+    }
+    out.map(|v| v as i64)
+}
+
+/// `P`'s limbs that are not `0xFFFF`, `(m, 0xFFFF − P_m)`: `q·P` is `0xFFFF`
+/// times a window sum of `q`'s limbs less these few products.
+const P_DEFICITS: [(usize, u64); 2] = {
+    let mut out = [(0usize, 0u64); 2];
+    let mut n = 0;
+    let mut m = 0;
+    while m < 16 {
+        if P_LIMBS[m] != 0xFFFF {
+            out[n] = (m, 0xFFFF - P_LIMBS[m]);
+            n += 1;
+        }
+        m += 1;
+    }
+    assert!(n == 2);
+    out
+};
+
+/// `Σ_j q_j·P_{k−j}` at each limb position, from `q`'s 17 limbs: `0xFFFF`
+/// times the window sum of `q` less the products of [`P_DEFICITS`].
+fn q_times_p(q: &[u8; 33]) -> [i64; HALVES_POSITIONS] {
+    let limb: [u64; 17] = std::array::from_fn(|j| {
+        if j < 16 {
+            u64::from(q[2 * j]) | u64::from(q[2 * j + 1]) << 8
+        } else {
+            u64::from(q[32])
+        }
+    });
+    // prefix[j] = Σ_{i<j} limb[i].
+    let mut prefix = [0u64; 18];
+    for j in 0..17 {
+        prefix[j + 1] = prefix[j] + limb[j];
+    }
+    std::array::from_fn(|k| {
+        let (lo, hi) = (k.saturating_sub(15), k.min(16));
+        let mut v = 0xFFFF * (prefix[hi + 1] - prefix[lo]);
+        for &(m, deficit) in &P_DEFICITS {
+            if k >= m && (lo..=hi).contains(&(k - m)) {
+                v -= deficit * limb[k - m];
+            }
+        }
+        v as i64
     })
+}
+
+impl<'a> StepBytes<'a> {
+    /// `s`'s bytes, at `timestamp` 0.
+    pub(crate) fn of_step(s: &'a EcdasStep) -> Self {
+        Self {
+            timestamp: 0,
+            x_g: &s.x_g,
+            y_g: &s.y_g,
+            x_a: &s.x_a,
+            y_a: &s.y_a,
+            x_r: &s.x_r,
+            y_r: &s.y_r,
+            lambda: &s.lambda,
+            q: [&s.q0, &s.q1, &s.q2],
+            round: s.round,
+            op: s.op,
+            next_op: s.next_op,
+        }
+    }
+
+    /// `op`'s bytes and timestamp.
+    pub(crate) fn of_op(op: &'a EcdasOperation) -> Self {
+        Self {
+            timestamp: op.timestamp,
+            ..Self::of_step(&op.step)
+        }
+    }
+
+    /// `S'_k` of each relation at each limb position, over the integers, as
+    /// [`HalvesLimbs::terms`] computes it on a real row (`μ = 1`): the same
+    /// sums, only the branch `op` names, products in 32 bits. An `op` other
+    /// than 0 or 1 (no real row has one) takes the general form.
+    pub(crate) fn terms(&self) -> [[i64; HALVES_POSITIONS]; 3] {
+        if self.op > 1 {
+            return self.limbs().terms();
+        }
+        let l16 = |b: &[u8; 32]| -> [u32; 16] {
+            std::array::from_fn(|i| u32::from(b[2 * i]) | u32::from(b[2 * i + 1]) << 8)
+        };
+        let (lam, xg, yg, xa, ya, xr, yr) = (
+            l16(self.lambda),
+            l16(self.x_g),
+            l16(self.y_g),
+            l16(self.x_a),
+            l16(self.y_a),
+            l16(self.x_r),
+            l16(self.y_r),
+        );
+        let at = |a: &[u32; 16], k: usize| if k < 16 { i64::from(a[k]) } else { 0 };
+        let at31 = |a: &[i64; 31], k: usize| if k < 31 { a[k] } else { 0 };
+        // μ·Σ R_j P_{k−j} − Σ q_j P_{k−j}, μ = 1.
+        let qp = self.q.map(q_times_p);
+        let rq = |r: usize, k: usize| -> i64 { RP_LIMBS[k] as i64 - qp[r][k] };
+        let lam_xa = conv16(&lam, &xa);
+        let lam_lam = conv16(&lam, &lam);
+        let lam_xr = conv16(&lam, &xr);
+        let (first, second) = if self.op == 1 {
+            (conv16(&lam, &xg), lam_xa)
+        } else {
+            (conv16(&lam, &ya), conv16(&xa, &xa))
+        };
+        let mut out = [[0i64; HALVES_POSITIONS]; 3];
+        #[allow(clippy::needless_range_loop)]
+        for k in 0..HALVES_POSITIONS {
+            out[0][k] = if self.op == 1 {
+                at31(&first, k) - at31(&second, k) + at(&ya, k) - at(&yg, k)
+            } else {
+                2 * at31(&first, k) - 3 * at31(&second, k)
+            } + rq(0, k);
+            let doubles = if self.op == 0 {
+                at(&xa, k) - at(&xg, k)
+            } else {
+                0
+            };
+            out[1][k] =
+                at31(&lam_lam, k) - at(&xa, k) - at(&xg, k) - at(&xr, k) - doubles + rq(1, k);
+            out[2][k] = at31(&lam_xa, k) - at31(&lam_xr, k) - at(&ya, k) - at(&yr, k) + rq(2, k);
+        }
+        out
+    }
+
+    /// The row's limbs ([`HalvesLimbs`], `μ = 1`).
+    pub(crate) fn limbs(&self) -> HalvesLimbs {
+        let l16 = |b: &[u8; 32]| limbs_of::<16>(b).map(|v| v as i64);
+        let l17 = |b: &[u8; 33]| limbs_of::<17>(b).map(|v| v as i64);
+        HalvesLimbs {
+            xg: l16(self.x_g),
+            yg: l16(self.y_g),
+            xa: l16(self.x_a),
+            ya: l16(self.y_a),
+            xr: l16(self.x_r),
+            yr: l16(self.y_r),
+            lambda: l16(self.lambda),
+            q: self.q.map(l17),
+            op: i64::from(self.op),
+            mu: 1,
+        }
+    }
+
+    /// The row's carries under [`EcdasForm::Halves`], λ's, xR's and yR's.
+    pub(crate) fn halves_carries(&self) -> [[i64; HALVES_CARRIES]; 3] {
+        self.terms().map(|t| {
+            let (carries, exact) = halves_chain(&t);
+            debug_assert!(exact, "an ECDAS step whose relations do not hold");
+            carries
+        })
+    }
+}
+
+/// A row as a builder holds it ([`EcdasOperation`] or [`CompactEcdasOp`]):
+/// the op it stands for (the byte form's table reads it) and its bytes (the
+/// limb form's), borrowed.
+pub(crate) trait EcdasRow {
+    fn as_op(&self) -> Cow<'_, EcdasOperation>;
+    fn step_bytes(&self) -> StepBytes<'_>;
+}
+
+impl EcdasRow for EcdasOperation {
+    fn as_op(&self) -> Cow<'_, EcdasOperation> {
+        Cow::Borrowed(self)
+    }
+
+    fn step_bytes(&self) -> StepBytes<'_> {
+        StepBytes::of_op(self)
+    }
+}
+
+impl EcdasRow for CompactEcdasOp {
+    fn as_op(&self) -> Cow<'_, EcdasOperation> {
+        Cow::Owned(self.to_op())
+    }
+
+    fn step_bytes(&self) -> StepBytes<'_> {
+        StepBytes {
+            timestamp: self.timestamp,
+            x_g: &self.x_g,
+            y_g: &self.y_g,
+            x_a: &self.x_a,
+            y_a: &self.y_a,
+            x_r: &self.x_r,
+            y_r: &self.y_r,
+            lambda: &self.lambda,
+            q: [&self.q0, &self.q1, &self.q2],
+            round: self.round,
+            op: self.op,
+            next_op: self.next_op,
+        }
+    }
 }
 
 /// A carry's `(LO, HI)`: `C + 2^23 = LO + 2^16·HI`, `LO` in `0..2^16`. A carry
@@ -939,54 +1160,53 @@ pub(crate) fn halves_rows_written_packed(form: TraceForm) -> bool {
     rows_written_packed_in(form, EcdasForm::Halves)
 }
 
-/// [`generate_ecdas_rows_of`] in `ecdas`'s form.
-pub(crate) fn generate_ecdas_rows_in<R: Sync>(
+/// [`generate_ecdas_rows_of`] in `ecdas`'s form, each row read as it is held
+/// ([`EcdasRow`]): the byte form widens it to its op, the limb form reads its
+/// bytes in place.
+pub(crate) fn generate_ecdas_rows_in<R: EcdasRow + Sync>(
     rows: &[R],
     num_rows: usize,
     form: TraceForm,
     ecdas: EcdasForm,
-    op: impl for<'r> Fn(&'r R) -> Cow<'r, EcdasOperation> + Sync,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     match ecdas {
-        EcdasForm::Bytes => generate_ecdas_rows_of(rows, num_rows, form, op),
-        EcdasForm::Halves => generate_halves_rows_of(rows, num_rows, form, op),
+        EcdasForm::Bytes => generate_ecdas_rows_of(rows, num_rows, form, EcdasRow::as_op),
+        EcdasForm::Halves => generate_halves_rows_of(rows, num_rows, form),
     }
 }
 
 /// An ECDAS table of `num_rows` rows under [`EcdasForm::Halves`]: `rows` (a
 /// step a row), then the padding rows, whose carries are zero (`LO = 0`,
 /// `HI = 2^23 / 2^16`).
-fn generate_halves_rows_of<R: Sync>(
+fn generate_halves_rows_of<R: EcdasRow + Sync>(
     rows: &[R],
     num_rows: usize,
     form: TraceForm,
-    op: impl for<'r> Fn(&'r R) -> Cow<'r, EcdasOperation> + Sync,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     use halves_cols as h;
     let n = rows.len();
     let (_, hi_zero) = split_carry(0);
     generate_main!(form, &WIDTHS_HALVES, num_rows, h::NUM_COLUMNS, |table| {
         for (row_idx, row) in rows.iter().enumerate() {
-            let op = op(row);
-            let s = &op.step;
+            let s = row.step_bytes();
             debug_assert_ne!(
                 s.op, DEFERRED_ECREC_OP,
                 "a deferred ECREC call's row reached the ECDAS table"
             );
-            table.set_dword_wl(row_idx, h::TIMESTAMP_0, op.timestamp);
-            table.set_bytes(row_idx, h::XG, &s.x_g);
-            table.set_bytes(row_idx, h::YG, &s.y_g);
-            table.set_bytes(row_idx, h::XA, &s.x_a);
-            table.set_bytes(row_idx, h::YA, &s.y_a);
+            table.set_dword_wl(row_idx, h::TIMESTAMP_0, s.timestamp);
+            table.set_bytes(row_idx, h::XG, s.x_g);
+            table.set_bytes(row_idx, h::YG, s.y_g);
+            table.set_bytes(row_idx, h::XA, s.x_a);
+            table.set_bytes(row_idx, h::YA, s.y_a);
             table.set_byte(row_idx, h::ROUND, s.round);
             table.set_byte(row_idx, h::OP, s.op);
-            table.set_bytes(row_idx, h::XR, &s.x_r);
-            table.set_bytes(row_idx, h::YR, &s.y_r);
-            table.set_bytes(row_idx, h::LAMBDA, &s.lambda);
-            table.set_bytes(row_idx, h::Q0, &s.q0);
-            table.set_bytes(row_idx, h::Q1, &s.q1);
-            table.set_bytes(row_idx, h::Q2, &s.q2);
-            for (carries, &(lo, hi, _)) in halves_carries(s).iter().zip(&h::RELATIONS) {
+            table.set_bytes(row_idx, h::XR, s.x_r);
+            table.set_bytes(row_idx, h::YR, s.y_r);
+            table.set_bytes(row_idx, h::LAMBDA, s.lambda);
+            table.set_bytes(row_idx, h::Q0, s.q[0]);
+            table.set_bytes(row_idx, h::Q1, s.q[1]);
+            table.set_bytes(row_idx, h::Q2, s.q[2]);
+            for (carries, &(lo, hi, _)) in s.halves_carries().iter().zip(&h::RELATIONS) {
                 for (k, &c) in carries.iter().enumerate() {
                     let (l, high) = split_carry(c);
                     debug_assert!((0..1 << 8).contains(&high), "carry {c} out of range");

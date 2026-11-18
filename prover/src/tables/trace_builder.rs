@@ -6746,7 +6746,9 @@ pub(crate) fn collect_bitwise_from_compact_ecdas_in(
     for row in rows {
         match form {
             ecdas::EcdasForm::Bytes => ecdas_lookups(&row.to_op(), &mut out),
-            ecdas::EcdasForm::Halves => ecdas_halves_lookups(&row.to_op(), &mut out),
+            ecdas::EcdasForm::Halves => {
+                ecdas_halves_lookups(&ecdas::EcdasRow::step_bytes(row), &mut out)
+            }
         }
     }
     out
@@ -6756,16 +6758,22 @@ pub(crate) fn collect_bitwise_from_compact_ecdas_in(
 /// appended to `out`, as `ecdas::bus_interactions_for` sends them: the
 /// checked bytes two to a lookup, then each relation's carries — `LO` to
 /// `IS_HALF`, the `HI`s two to a lookup (the last with 0).
-pub(crate) fn ecdas_halves_lookups(op: &ecdas::EcdasOperation, out: &mut Vec<BitwiseOperation>) {
-    let s = &op.step;
-    let mut bytes = Vec::with_capacity(196);
-    bytes.push(s.round);
-    bytes.extend_from_slice(&s.lambda);
-    bytes.extend_from_slice(&s.q0);
-    bytes.extend_from_slice(&s.x_r);
-    bytes.extend_from_slice(&s.q1);
-    bytes.extend_from_slice(&s.y_r);
-    bytes.extend_from_slice(&s.q2);
+pub(crate) fn ecdas_halves_lookups(s: &ecdas::StepBytes<'_>, out: &mut Vec<BitwiseOperation>) {
+    let mut bytes = [0u8; 196];
+    bytes[0] = s.round;
+    let mut at = 1;
+    for part in [
+        &s.lambda[..],
+        &s.q[0][..],
+        &s.x_r[..],
+        &s.q[1][..],
+        &s.y_r[..],
+        &s.q[2][..],
+    ] {
+        bytes[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
+    debug_assert_eq!(at, bytes.len());
     for pair in bytes.chunks(2) {
         out.push(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
@@ -6773,7 +6781,7 @@ pub(crate) fn ecdas_halves_lookups(op: &ecdas::EcdasOperation, out: &mut Vec<Bit
             pair[1],
         ));
     }
-    for carries in ecdas::halves_carries(s) {
+    for carries in s.halves_carries() {
         let split = carries.map(ecdas::split_carry);
         for &(lo, _) in &split {
             out.push(is_half_op(lo as u16));
