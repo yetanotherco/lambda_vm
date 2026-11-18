@@ -877,93 +877,121 @@ where
                 (0..plan.chunks[t].count).map(move |j| (t, first + j))
             })
             .collect();
-        let pending: Vec<Pending<E>> = members
-            .iter()
-            .map(|&(t, i)| -> Result<Pending<E>, MlError> {
-                let (trace, interactions) = (&tables[t].trace, &lists[i][..]);
-                if at == Where::Host {
-                    return Ok(Pending::Ready(BinTree::Host(host_tree(
-                        interactions,
-                        trace,
-                    )?)));
-                }
-                let columns_tree = || {
-                    if queue {
-                        logup::resident_tree_from_columns_deferred(interactions, trace)
-                            .map(Pending::Queued)
-                    } else {
-                        logup::resident_tree_from_columns(interactions, trace)
-                            .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
-                    }
-                };
-                // Where today's argue builds it: written from the base columns
-                // with no lift (`gpu::argue_no_lift`), else from the
-                // lifted factors on the card, else here — and a big host tree
-                // still folds on a device. The same tree every way.
-                let started = std::time::Instant::now();
-                let mut resident_seen = None;
-                let mut public_tried = false;
-                let mut public_why: Option<String> = None;
-                let on_card = (multilinear::gpu::argue_no_lift()
-                    && trace.device_factors().is_none())
-                .then(columns_tree)
-                .flatten()
-                .or_else(|| {
-                    // A chunk that reads a public factor (a selector) has no
-                    // plan over the table's columns: built on the card from
-                    // the columns it reads and its selectors
-                    // (`LAMBDA_VM_ARGUE_PUBLIC_COLUMNS`).
-                    (logup::public_columns() && trace.device_factors().is_none())
-                        .then(|| {
-                            public_tried = true;
-                            logup::resident_tree_with_public(interactions, trace)
-                                .map_err(|why| public_why = Some(why))
-                                .ok()
-                        })
-                        .flatten()
-                        .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
+        // A bin the card cannot carry whole hands its trees' input layers
+        // back (`LAMBDA_VM_ARGUE_BIN_HAND_BACK`): each promises less, so the
+        // bin's last trees are built on the card too. The same trees.
+        let hand_back = at != Where::Host && multilinear::gpu::bin_hand_back() && {
+            let carries: Vec<u64> = members
+                .iter()
+                .map(|&(t, i)| {
+                    multilinear::gpu::carry_bytes(
+                        lists[i].len().next_power_of_two() << tables[t].trace.num_vars(),
+                    )
                 })
-                .or_else(|| {
-                    let resident = trace.reside_from_columns();
-                    resident_seen = Some(resident.is_some());
-                    let from_columns = (multilinear::gpu::argue_gkr_input() && resident.is_some())
-                        .then(columns_tree)
-                        .flatten();
-                    from_columns.or_else(|| {
-                        resident
-                            .and_then(|resident| logup::resident_tree(interactions, resident))
+                .collect();
+            multilinear::gpu::bin_hand_back_forced()
+                || multilinear::gpu::bin_cannot_carry(
+                    multilinear::gpu::ledger_reserved(),
+                    multilinear::gpu::reserve_budget(),
+                    &carries,
+                )
+        };
+        let handed_before = multilinear::gpu::handed_back_by_preference();
+        let pending: Vec<Pending<E>> = multilinear::gpu::prefer_hand_back(hand_back, || {
+            members
+                .iter()
+                .map(|&(t, i)| -> Result<Pending<E>, MlError> {
+                    let (trace, interactions) = (&tables[t].trace, &lists[i][..]);
+                    if at == Where::Host {
+                        return Ok(Pending::Ready(BinTree::Host(host_tree(
+                            interactions,
+                            trace,
+                        )?)));
+                    }
+                    let columns_tree = || {
+                        if queue {
+                            logup::resident_tree_from_columns_deferred(interactions, trace)
+                                .map(Pending::Queued)
+                        } else {
+                            logup::resident_tree_from_columns(interactions, trace)
+                                .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
+                        }
+                    };
+                    // Where today's argue builds it: written from the base columns
+                    // with no lift (`gpu::argue_no_lift`), else from the
+                    // lifted factors on the card, else here — and a big host tree
+                    // still folds on a device. The same tree every way.
+                    let started = std::time::Instant::now();
+                    let mut resident_seen = None;
+                    let mut public_tried = false;
+                    let mut public_why: Option<String> = None;
+                    let on_card = (multilinear::gpu::argue_no_lift()
+                        && trace.device_factors().is_none())
+                    .then(columns_tree)
+                    .flatten()
+                    .or_else(|| {
+                        // A chunk that reads a public factor (a selector) has no
+                        // plan over the table's columns: built on the card from
+                        // the columns it reads and its selectors
+                        // (`LAMBDA_VM_ARGUE_PUBLIC_COLUMNS`).
+                        (logup::public_columns() && trace.device_factors().is_none())
+                            .then(|| {
+                                public_tried = true;
+                                logup::resident_tree_with_public(interactions, trace)
+                                    .map_err(|why| public_why = Some(why))
+                                    .ok()
+                            })
+                            .flatten()
                             .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
                     })
-                });
-                let tree = match on_card {
-                    Some(tree) => {
-                        split.trees_card += 1;
-                        tree
-                    }
-                    None => {
-                        split.trees_host += 1;
-                        let why = match (public_tried, resident_seen) {
-                            (true, _) => format!(
-                                "its public-columns card build was declined: {}",
-                                public_why.as_deref().unwrap_or("no reason given")
-                            ),
-                            (false, Some(false)) => {
-                                "no resident columns or factors for its table".to_string()
-                            }
-                            _ => "the card declined the build".to_string(),
-                        };
-                        multilinear::gpu::note_gkr_tree_host_built(
-                            &why,
-                            t,
-                            interactions.len().next_power_of_two() << trace.num_vars(),
-                        );
-                        Pending::Ready(host_built(t, interactions)?)
-                    }
-                };
-                split.trees += started.elapsed().as_secs_f64();
-                Ok(tree)
-            })
-            .collect::<Result<_, _>>()?;
+                    .or_else(|| {
+                        let resident = trace.reside_from_columns();
+                        resident_seen = Some(resident.is_some());
+                        let from_columns = (multilinear::gpu::argue_gkr_input()
+                            && resident.is_some())
+                        .then(columns_tree)
+                        .flatten();
+                        from_columns.or_else(|| {
+                            resident
+                                .and_then(|resident| logup::resident_tree(interactions, resident))
+                                .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
+                        })
+                    });
+                    let tree = match on_card {
+                        Some(tree) => {
+                            split.trees_card += 1;
+                            tree
+                        }
+                        None => {
+                            split.trees_host += 1;
+                            let why = match (public_tried, resident_seen) {
+                                (true, _) => format!(
+                                    "its public-columns card build was declined: {}",
+                                    public_why.as_deref().unwrap_or("no reason given")
+                                ),
+                                (false, Some(false)) => {
+                                    "no resident columns or factors for its table".to_string()
+                                }
+                                _ => "the card declined the build".to_string(),
+                            };
+                            multilinear::gpu::note_gkr_tree_host_built(
+                                &why,
+                                t,
+                                interactions.len().next_power_of_two() << trace.num_vars(),
+                            );
+                            Pending::Ready(host_built(t, interactions)?)
+                        }
+                    };
+                    split.trees += started.elapsed().as_secs_f64();
+                    Ok(tree)
+                })
+                .collect::<Result<_, _>>()
+        })?;
+        if hand_back {
+            split.bins_handed_back += 1;
+            split.trees_handed_back +=
+                multilinear::gpu::handed_back_by_preference() - handed_before;
+        }
         // The queued trees' outputs, now that the bin's every tree is queued;
         // one that cannot be read is built here, before anything is absorbed.
         let started = std::time::Instant::now();
@@ -1266,7 +1294,7 @@ where
         eprintln!(
             "BATCHED ARGUE TREES: tables {} · trees {} · cut {} · tree log2 cells {:.2} · built on the card \
              {} · on the host {} (after a queued build {}) · ledger GiB: at the start {:.2} · the bin's trees \
-             built {:.2} · after its ladder {:.2} · zerocheck set up {:.2}",
+             built {:.2} · after its ladder {:.2} · zerocheck set up {:.2} · handed back {} trees in {} bins",
             tables.len(),
             plan.trees(),
             plan.chunks.iter().filter(|c| c.count > 1).count(),
@@ -1280,7 +1308,9 @@ where
             gib(split.ledger_start),
             gib(split.ledger_trees),
             gib(split.ledger_ladder),
-            gib(split.ledger_zc)
+            gib(split.ledger_zc),
+            split.trees_handed_back,
+            split.bins_handed_back
         );
     }
     Ok((
@@ -1316,6 +1346,11 @@ struct ArgueSplit {
     ledger_trees: u64,
     ledger_ladder: u64,
     ledger_zc: u64,
+    /// Bins whose trees handed their input layers back because the card
+    /// could not carry them all (`LAMBDA_VM_ARGUE_BIN_HAND_BACK`), and the
+    /// trees that did.
+    bins_handed_back: usize,
+    trees_handed_back: u64,
     ladders: f64,
     zc_setup: f64,
     zc_rounds: f64,

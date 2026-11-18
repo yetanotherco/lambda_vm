@@ -717,6 +717,94 @@ fn the_card_proves_the_host_references_packed_bytes() {
     }
 }
 
+/// ★ A bin that hands its trees' input layers back
+/// (`LAMBDA_VM_ARGUE_BIN_HAND_BACK`, forced here on every bin) proves the
+/// bytes of the bin that carries them, with the transcript in the same state
+/// after: the fixture of the test above, every fan cut at τ = 12, in one bin
+/// and in bins of 2^14 cells. On a device the trees that handed back are
+/// counted, so the comparison is not of the carry with itself.
+///
+/// ```text
+/// cargo test --release -p stark --features cuda,multilinear/cuda --lib -- \
+///     multilinear_table::batched::tests::pack::a_bin_that_hands_back_proves_the_carried_bytes --exact --nocapture
+/// ```
+#[test]
+fn a_bin_that_hands_back_proves_the_carried_bytes() {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            multilinear::gpu::force_bin_hand_back_for_tests(false);
+        }
+    }
+    const TALL: [(usize, usize); 4] = [(5, 13), (7, 15), (9, 13), (11, 13)];
+    let _switches = card_switches();
+    let _restore = Restore;
+    a_present_card_is_reachable();
+    let airs = airs();
+    let fans: Vec<Air<EmptyConstraints>> = TALL.iter().map(|&(m, _)| fan_air(m)).collect();
+    let fan_cols: Vec<Vec<Vec<FE>>> = TALL
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, n))| fan_columns(n, i as u64 + 1))
+        .collect();
+    let cols = columns(12, 1);
+    for cap in [27u8, 14] {
+        let cfg = packed(cap, 12);
+        let run = |hand_back: bool| {
+            multilinear::gpu::force_bin_hand_back_for_tests(hand_back);
+            let mut all = tables(&airs, &cols, false);
+            for (air, cols) in fans.iter().zip(&fan_cols) {
+                all.push(table(air, cols));
+            }
+            let committed = commit(all, &cfg);
+            let handed = multilinear::gpu::handed_back_by_preference();
+            let mut transcript = DefaultTranscript::<Ext>::new(SEED);
+            let proof = prove_batched_on(
+                &committed,
+                &cfg,
+                &mut transcript,
+                None,
+                ProverFaults::default(),
+                Where::Device,
+            )
+            .unwrap_or_else(|e| panic!("hand back {hand_back}: {e:?}"));
+            multilinear::gpu::force_bin_hand_back_for_tests(false);
+            verify(&committed, &proof, &cfg)
+                .unwrap_or_else(|e| panic!("hand back {hand_back}: {e:?}"));
+            (
+                bincode::serialize(&proof).expect("bytes"),
+                transcript.state(),
+                transcript.sample_field_element(),
+                multilinear::gpu::handed_back_by_preference() - handed,
+            )
+        };
+        let carried = run(false);
+        let handed = run(true);
+        eprintln!(
+            "bin hand back cap={cap}: {} bytes, card {}, {} trees handed back",
+            carried.0.len(),
+            if a_device() {
+                "present"
+            } else {
+                "absent (host fallbacks)"
+            },
+            handed.3
+        );
+        assert_eq!(carried.3, 0, "cap={cap}: nothing hands back unasked");
+        if a_device() {
+            assert!(handed.3 > 0, "cap={cap}: trees handed back");
+        }
+        assert!(
+            carried.0 == handed.0,
+            "cap={cap}: the canonical bytes differ"
+        );
+        assert_eq!(carried.1, handed.1, "cap={cap}: the transcripts parted");
+        assert_eq!(carried.2, handed.2, "cap={cap}: the next challenge moved");
+    }
+}
+
 // ─── mass in a padding slot ──────────────────────────────────────────────
 
 /// ★ Padding is the verifier's to define: an unbalanced trace (FAN(7)'s odd

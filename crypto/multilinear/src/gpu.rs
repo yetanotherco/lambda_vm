@@ -1443,6 +1443,91 @@ pub fn force_hand_back_for_tests(on: bool) {
     HAND_BACK_FORCED.store(on, Ordering::Relaxed);
 }
 
+/// `LAMBDA_VM_ARGUE_BIN_HAND_BACK=1`: a batched argue's bin whose trees the
+/// card cannot all carry at once has its trees hand their input layers back
+/// ([`prefer_hand_back`]), so each promises `3·cells` where carrying it
+/// promises `4·cells` and the bin's every tree fits where today the last
+/// ones go to the host. The same trees, so the same proof. Off by default
+/// (and for any word but `1`); read once a process.
+pub const BIN_HAND_BACK_ENV: &str = "LAMBDA_VM_ARGUE_BIN_HAND_BACK";
+
+/// Whether [`BIN_HAND_BACK_ENV`] is on (or a test has made every bin hand
+/// back, [`force_bin_hand_back_for_tests`]).
+pub fn bin_hand_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    bin_hand_back_forced()
+        || *ON.get_or_init(|| std::env::var(BIN_HAND_BACK_ENV).is_ok_and(|v| v.trim() == "1"))
+}
+
+/// A test's switch: every bin hands back, whether or not it fits.
+static BIN_HAND_BACK_FORCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Tests only: every batched argue bin hands its trees' input layers back as
+/// one the card cannot carry would ([`BIN_HAND_BACK_ENV`]), so a test can
+/// reach that path on tables that fit. Process-wide: a test that sets it
+/// holds its suite's switch lock.
+#[doc(hidden)]
+pub fn force_bin_hand_back_for_tests(on: bool) {
+    BIN_HAND_BACK_FORCED.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`force_bin_hand_back_for_tests`] is on.
+pub fn bin_hand_back_forced() -> bool {
+    BIN_HAND_BACK_FORCED.load(Ordering::Relaxed)
+}
+
+/// The bytes a tree over `cells` input cells promises when it carries its
+/// input layer: the layer and every level above it, both sides, the levels
+/// summing to the layer again (`4·cells` extension elements of 24 bytes).
+pub fn carry_bytes(cells: usize) -> u64 {
+    (4 * cells) as u64 * 24
+}
+
+/// Whether a bin whose trees carry `carries` bytes each cannot carry them all
+/// at once on a ledger that has promised `held` of `budget`: then its trees
+/// hand their input layers back ([`BIN_HAND_BACK_ENV`]).
+pub fn bin_cannot_carry(held: u64, budget: u64, carries: &[u64]) -> bool {
+    let need = carries.iter().fold(0u64, |a, &b| a.saturating_add(b));
+    held.saturating_add(need) > budget
+}
+
+std::thread_local! {
+    /// Set while this thread builds a bin's trees under [`prefer_hand_back`].
+    static HAND_BACK_PREFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Trees that handed their input layer back because their bin preferred it.
+static HANDED_BACK_BY_PREFERENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Trees built on this thread inside `f` hand their input layer back and
+/// write it again for its last sumcheck when they would otherwise carry it:
+/// the whole-tree promise of today's handed-back tree
+/// (`math_cuda::gkr::padded_peak_bytes`) in place of the carry. A tree the
+/// card would write without its padding still is. The flag is this thread's
+/// and is restored when `f` returns or unwinds.
+pub fn prefer_hand_back<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HAND_BACK_PREFERRED.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(HAND_BACK_PREFERRED.with(|c| c.replace(on)));
+    f()
+}
+
+/// Whether this thread's tree builds prefer to hand their layer back.
+#[cfg(feature = "cuda")]
+fn hand_back_preferred() -> bool {
+    HAND_BACK_PREFERRED.with(std::cell::Cell::get)
+}
+
+/// Trees that handed their input layer back under [`prefer_hand_back`].
+pub fn handed_back_by_preference() -> u64 {
+    HANDED_BACK_BY_PREFERENCE.load(Ordering::Relaxed)
+}
+
 /// Cells — factors times rows — below which the host wins.
 ///
 /// The precompiles are short and very wide: a thousand factors over four
@@ -5673,11 +5758,18 @@ fn carried_or_handed_back(
     // that is what the card cannot do **and** the difference is worth the
     // second chance to fail — which is the widest precompiles, where it is
     // gigabytes, and nothing else.
-    let eager = (4 * full) as u64 * 24;
+    let eager = carry_bytes(full);
     let lazy = math_cuda::gkr::padded_peak_bytes(real, full);
-    let carried =
-        math_cuda::device::reserve(eager).filter(|_| !HAND_BACK_FORCED.load(Ordering::Relaxed));
-    let hand_back = HAND_BACK_FORCED.load(Ordering::Relaxed);
+    // A bin that cannot carry all its trees prefers each to hand back
+    // (`prefer_hand_back`): no carry is asked for, the promise below is.
+    let preferred = hand_back_preferred() && lazy < eager;
+    let forced = HAND_BACK_FORCED.load(Ordering::Relaxed);
+    let carried = if preferred {
+        None
+    } else {
+        math_cuda::device::reserve(eager).filter(|_| !forced)
+    };
+    let hand_back = forced || preferred;
     if !hand_back && (carried.is_some() || eager - lazy < worth_handing_back()) {
         drop(carried);
         let t = crate::whir_split::tick();
@@ -5728,6 +5820,9 @@ fn carried_or_handed_back(
         }
         return None;
     };
+    if preferred {
+        HANDED_BACK_BY_PREFERENCE.fetch_add(1, Ordering::Relaxed);
+    }
 
     let t = crate::whir_split::tick();
     let (p, q) = write(false)?;
@@ -8516,5 +8611,56 @@ mod tests {
              `note_gkr_tree_refusal`, and that called once, at the whole-tree \
              promise's refusal (found {bumps} bumps, {notes} calls)"
         );
+    }
+
+    /// A bin hands back exactly when the ledger cannot promise every tree's
+    /// carry on top of what it holds; a bin that fits carries as today.
+    #[test]
+    fn a_bin_hands_back_only_when_its_carries_do_not_fit() {
+        let gib = 1u64 << 30;
+        // 2^25 cells carry 3 GiB.
+        assert_eq!(carry_bytes(1 << 25), 3 * gib);
+        let nine = vec![carry_bytes(1 << 25); 9];
+        // A ledger holding 3.25 GiB of a 26.5 GiB budget cannot carry nine.
+        assert!(bin_cannot_carry(
+            3 * gib + gib / 4,
+            26 * gib + gib / 2,
+            &nine
+        ));
+        // Seven fit, as the card built them.
+        assert!(!bin_cannot_carry(
+            3 * gib + gib / 4,
+            26 * gib + gib / 2,
+            &nine[..7]
+        ));
+        // The boundary: exactly the budget fits.
+        assert!(!bin_cannot_carry(gib, 4 * gib, &[3 * gib]));
+        assert!(bin_cannot_carry(gib + 1, 4 * gib, &[3 * gib]));
+        // No overflow on absurd sizes.
+        assert!(bin_cannot_carry(
+            u64::MAX,
+            u64::MAX - 1,
+            &[u64::MAX, u64::MAX]
+        ));
+    }
+
+    /// The preference is this thread's, scoped to the call, and restored even
+    /// when the call unwinds.
+    #[test]
+    fn the_hand_back_preference_is_scoped_to_its_call() {
+        let get = || HAND_BACK_PREFERRED.with(std::cell::Cell::get);
+        assert!(!get());
+        prefer_hand_back(true, || {
+            assert!(get());
+            prefer_hand_back(false, || assert!(!get()));
+            assert!(get());
+            std::thread::spawn(move || assert!(!HAND_BACK_PREFERRED.with(std::cell::Cell::get)))
+                .join()
+                .unwrap();
+        });
+        assert!(!get());
+        let unwound = std::panic::catch_unwind(|| prefer_hand_back(true, || panic!("unwinds")));
+        assert!(unwound.is_err());
+        assert!(!get());
     }
 }
