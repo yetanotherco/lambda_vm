@@ -2193,6 +2193,12 @@ fn keccak_lookups_counted_directly_are_the_lookups_made() {
             let direct = count(true);
             super::super::force_keccak_count_direct(None);
             assert!(made == direct, "{n} rows, {form:?}: the counts differ");
+            let mut local = BitwiseHistogram::new();
+            super::super::count_bitwise_from_keccak_local(&rows, form, &mut local);
+            assert!(
+                made == local,
+                "{n} rows, {form:?}: the batch's lanes differ"
+            );
         }
     }
 }
@@ -2255,6 +2261,18 @@ fn keccak_bitwise_count_seconds_by_part() {
         };
         let bumped = bumped_by(false);
         let direct = bumped_by(true);
+        let (local, _) = best(&mut || {
+            let mut h = BitwiseHistogram::new();
+            super::super::count_bitwise_from_keccak_local(&ops, form, &mut h);
+            std::hint::black_box(&h);
+            0
+        });
+        println!(
+            "KECCAK COUNT PROBE {form:?}: the batch's 32-bit lanes {:.2} ns a lookup ({:.1} µs a permutation, ×{:.2})",
+            local / (n as f64 * 24222.0) * 1e9,
+            local / n as f64 * 1e6,
+            bumped / local
+        );
         println!(
             "KECCAK COUNT PROBE {form:?}: {n} permutations · {} lookups a permutation · replayed and made {:.2} ns a \
              lookup ({:.1} µs a permutation) · bumped {:.2} ns a lookup ({:.1} µs a permutation) · counted \

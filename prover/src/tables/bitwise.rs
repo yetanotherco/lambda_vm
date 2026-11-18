@@ -839,10 +839,10 @@ impl PartialEq for BitwiseHistogram {
 
 /// The byte-pair lanes of a [`BitwiseHistogram`]
 /// ([`BitwiseHistogram::byte_lanes_mut`]): each counter at `x + 256·y`.
-pub(crate) struct ByteLanes<'a> {
-    pub(crate) are_bytes: &'a mut [u64; 256 * 256],
-    pub(crate) and: &'a mut [u64; 256 * 256],
-    pub(crate) xor: &'a mut [u64; 256 * 256],
+pub(crate) struct ByteLanes<'a, T = u64> {
+    pub(crate) are_bytes: &'a mut [T; 256 * 256],
+    pub(crate) and: &'a mut [T; 256 * 256],
+    pub(crate) xor: &'a mut [T; 256 * 256],
 }
 
 impl BitwiseHistogram {

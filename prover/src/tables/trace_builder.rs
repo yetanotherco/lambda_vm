@@ -7031,7 +7031,7 @@ pub(crate) fn count_bitwise_from_keccak_for(
     histogram: &mut bitwise::BitwiseHistogram,
 ) {
     if keccak_count_direct() {
-        count_bitwise_from_keccak_direct(keccak_ops, form, histogram);
+        count_bitwise_from_keccak_local(keccak_ops, form, histogram);
     } else {
         for_each_keccak_lookup(keccak_ops, form, |op| histogram.bump(op));
     }
@@ -7040,9 +7040,10 @@ pub(crate) fn count_bitwise_from_keccak_for(
 static KECCAK_COUNT_DIRECT_FORCED: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
-/// Whether KECCAK's BITWISE lookups are counted straight into the
-/// histogram's byte-pair lanes ([`count_bitwise_from_keccak_direct`]) rather
-/// than made one by one and bumped (`LAMBDA_VM_KECCAK_COUNT_DIRECT=1`; off by
+/// Whether KECCAK's BITWISE round lookups are counted straight into a batch's
+/// 32-bit byte-pair lanes, added into the histogram per batch
+/// ([`count_bitwise_from_keccak_local`]), rather than made one by one and
+/// bumped (`LAMBDA_VM_KECCAK_COUNT_DIRECT=1`; off by
 /// default). The counts are the same. Read once, with a banner.
 pub(crate) fn keccak_count_direct() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -7058,7 +7059,7 @@ pub(crate) fn keccak_count_direct() -> bool {
             eprintln!(
                 "★ KECCAK COUNT DIRECT: {} (LAMBDA_VM_KECCAK_COUNT_DIRECT)",
                 if on {
-                    "on (the rounds' lookups counted straight into the byte-pair lanes)"
+                    "on (the rounds' lookups counted straight into a batch's byte-pair lanes)"
                 } else {
                     "off (the default; each lookup made and bumped)"
                 }
@@ -7089,27 +7090,37 @@ pub(crate) fn force_keccak_count_direct(on: Option<bool>) {
 }
 
 /// [`count_bitwise_from_keccak_for`] with each permutation's rounds counted
-/// straight into the histogram's byte-pair lanes ([`count_round_lookups_direct`]):
-/// the same lookups as [`for_each_keccak_lookup`], none of them made. A sponge
-/// row's and a permute row's own lookups (a few hundred) are made and bumped
-/// as before.
-fn count_bitwise_from_keccak_direct(
+/// straight into a batch's 32-bit byte-pair lanes ([`count_round_lookups_direct`],
+/// [`LocalLanes`]) and added into `histogram` every 4096 permutations (a
+/// permutation sends under 25 thousand lookups, so a lane stays below 2^27)
+/// and at the end: the same lookups as [`for_each_keccak_lookup`], none of the
+/// rounds' made. A sponge row's and a permute row's own lookups (a few
+/// hundred) are made and bumped as before.
+pub(crate) fn count_bitwise_from_keccak_local(
     keccak_ops: &[KeccakOperation],
     form: KeccakRndForm,
     histogram: &mut bitwise::BitwiseHistogram,
 ) {
-    for kop in keccak_ops {
-        {
-            let mut bump = |op| histogram.bump(op);
-            if let Some(sponge) = &kop.sponge {
-                emit_sponge_lookups(kop, sponge, &mut bump);
-            } else {
-                emit_permute_lookups(kop, &mut bump);
+    let mut local = LocalLanes::new();
+    for batch in keccak_ops.chunks(4096) {
+        for kop in batch {
+            {
+                let mut bump = |op| histogram.bump(op);
+                if let Some(sponge) = &kop.sponge {
+                    emit_sponge_lookups(kop, sponge, &mut bump);
+                } else {
+                    emit_permute_lookups(kop, &mut bump);
+                }
             }
+            count_round_lookups_direct(kop, form, &mut local.lanes());
         }
         match histogram.byte_lanes_mut() {
-            Some(mut lanes) => count_round_lookups_direct(kop, form, &mut lanes),
-            None => emit_round_lookups(kop, form, &mut |op| histogram.bump(op)),
+            Some(mut lanes) => local.flush_into(&mut lanes),
+            None => {
+                for kop in batch {
+                    emit_round_lookups(kop, form, &mut |op| histogram.bump(op));
+                }
+            }
         }
     }
 }
@@ -7117,11 +7128,78 @@ fn count_bitwise_from_keccak_direct(
 /// One byte-pair lookup per byte of the lanes `a` and `b`: byte `k` of each,
 /// `x = a_k`, `y = b_k`.
 #[inline(always)]
-fn count_pairs(lane: &mut [u64; 256 * 256], a: u64, b: u64) {
+fn count_pairs<T: LaneCount>(lane: &mut [T; 256 * 256], a: u64, b: u64) {
     for k in 0..8 {
         let x = (a >> (8 * k)) & 0xFF;
         let y = (b >> (8 * k)) & 0xFF;
-        lane[((x | (y << 8)) & 0xFFFF) as usize] += 1;
+        lane[((x | (y << 8)) & 0xFFFF) as usize].bump();
+    }
+}
+
+/// A byte-pair lane's counter: the histogram's own (`u64`), or a batch's
+/// local one (`u32`, [`LocalLanes`]) added in afterwards.
+pub(crate) trait LaneCount: Copy {
+    fn bump(&mut self);
+}
+
+impl LaneCount for u64 {
+    #[inline(always)]
+    fn bump(&mut self) {
+        *self += 1;
+    }
+}
+
+impl LaneCount for u32 {
+    #[inline(always)]
+    fn bump(&mut self) {
+        *self += 1;
+    }
+}
+
+/// A batch's own ARE_BYTES, AND and XOR byte-pair counters, 32 bits each (768 KiB
+/// against the histogram's 1.5 MiB of the same cells), added into a histogram
+/// at the batch's end ([`Self::flush_into`]).
+pub(crate) struct LocalLanes {
+    are_bytes: Box<[u32; 256 * 256]>,
+    and: Box<[u32; 256 * 256]>,
+    xor: Box<[u32; 256 * 256]>,
+}
+
+impl LocalLanes {
+    pub(crate) fn new() -> Self {
+        let lane = || -> Box<[u32; 256 * 256]> {
+            vec![0u32; 256 * 256]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| Box::new([0u32; 256 * 256]))
+        };
+        Self {
+            are_bytes: lane(),
+            and: lane(),
+            xor: lane(),
+        }
+    }
+
+    pub(crate) fn lanes(&mut self) -> bitwise::ByteLanes<'_, u32> {
+        bitwise::ByteLanes {
+            are_bytes: &mut self.are_bytes,
+            and: &mut self.and,
+            xor: &mut self.xor,
+        }
+    }
+
+    /// Adds these counts into `into` and zeroes them.
+    pub(crate) fn flush_into(&mut self, into: &mut bitwise::ByteLanes<'_>) {
+        for (local, lane) in [
+            (&mut self.are_bytes, &mut *into.are_bytes),
+            (&mut self.and, &mut *into.and),
+            (&mut self.xor, &mut *into.xor),
+        ] {
+            for (count, cell) in local.iter_mut().zip(lane.iter_mut()) {
+                *cell += u64::from(*count);
+                *count = 0;
+            }
+        }
     }
 }
 
@@ -7129,10 +7207,10 @@ fn count_pairs(lane: &mut [u64; 256 * 256], a: u64, b: u64) {
 /// shifted columns' ARE_BYTES (when `form` sends them), D and the final XOR,
 /// rho's ARE_BYTES, chi's AND and XOR, iota's XOR, round by round, on whole
 /// lanes. Every lookup is a byte pair (`z = 0`) of ARE_BYTES, AND or XOR.
-fn count_round_lookups_direct(
+fn count_round_lookups_direct<T: LaneCount>(
     kop: &KeccakOperation,
     form: KeccakRndForm,
-    lanes: &mut bitwise::ByteLanes<'_>,
+    lanes: &mut bitwise::ByteLanes<'_, T>,
 ) {
     use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
     let mut state = kop.input;
@@ -7155,7 +7233,7 @@ fn count_round_lookups_direct(
                 for hw in 0..4 {
                     let half = (cx >> (16 * hw)) & 0xFFFF;
                     let shifted = (half << 1) & 0xFFFF;
-                    lanes.are_bytes[shifted as usize] += 1;
+                    lanes.are_bytes[shifted as usize].bump();
                 }
             }
         }
@@ -7188,8 +7266,8 @@ fn count_round_lookups_direct(
                     } else {
                         ((half << r) & 0xFFFF, half >> (16 - r))
                     };
-                    lanes.are_bytes[((shifted & 0xFF) | ((carry & 0xFF) << 8)) as usize] += 1;
-                    lanes.are_bytes[((shifted >> 8) | ((carry >> 8) << 8)) as usize] += 1;
+                    lanes.are_bytes[((shifted & 0xFF) | ((carry & 0xFF) << 8)) as usize].bump();
+                    lanes.are_bytes[((shifted >> 8) | ((carry >> 8) << 8)) as usize].bump();
                 }
             }
         }
