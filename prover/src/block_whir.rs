@@ -212,7 +212,9 @@ pub fn tree_drop_from_env() -> multilinear::whir_commit::TreeDrop {
 /// group's stacks at most (`math_cuda::whir_coset::CosetPlan`: a 256-value
 /// tile, then one warp's lanes, 8 + 5). A coset spans `2^(k0 + dropped)`
 /// values, so a `2^n` stack needs `k0 + dropped ≥ n − 13`; past that the plan
-/// declines and the opening re-encodes every codeword of the run on the card.
+/// declines and the opening re-encodes the run's codewords on the card, one
+/// at a time, and re-hashes the queried blocks on the host (slower; the same
+/// proof).
 pub const CARD_COSET_FOLD_LEVELS: usize = 13;
 
 /// The levels a retired tree drops under `zf` when the knob is unset: the
@@ -705,8 +707,11 @@ impl B3Rounds {
 /// for ([`BlockFormat::chain_config`]): no chain of a block is taller — a
 /// group stacks at its cap ([`multilinear::whir_chain::StackVars::WIDEST`]
 /// at most) or at its tallest table ([`BLOCK_MAX_TABLE_VARS`] at most, a
-/// verifier constant), whichever is taller — and a chain that were is refused
-/// by the chains themselves (`check_round_form_union`).
+/// verifier constant), whichever is taller. What refuses a taller chain is
+/// those height caps ([`check_table_heights`] and the format's stack cap), not
+/// the chains' own `check_round_form_union`: that one counts rounds, and under
+/// a first fold of 6 a chain of 28 to 30 variables still has the 7 rounds a
+/// 27-variable one has (each variable past 27 costs its fold term a bit).
 pub const B3_ROUND_FORM_STACK_BOUND: usize = 27;
 const _: () = assert!(B3_ROUND_FORM_STACK_BOUND >= BLOCK_MAX_TABLE_VARS);
 const _: () = assert!(B3_ROUND_FORM_STACK_BOUND >= multilinear::whir_chain::StackVars::WIDEST);
@@ -954,14 +959,19 @@ impl BlockFormat {
         // round 0's among them, derived for the 128-bit target over ONE union
         // bound that reads no shape — the rounds of a chain over
         // [`B3_ROUND_FORM_STACK_BOUND`] variables, which no chain of a block
-        // exceeds (the chains themselves refuse one that does,
-        // `check_round_form_union`). So the config's format, and the fold word
+        // exceeds (the block's height caps refuse one that would; the chains'
+        // `check_round_form_union` refuses only a chain with more rounds than
+        // the union). So the config's format, and the fold word
         // every commit-time out-of-domain point absorbs, is the same whether
         // phase A builds it before the block's shapes are known or the
         // verifier builds it from the statement; and the chains'
         // `check_round_form` takes it on both sides. Round 0 queries what
-        // today's form queries over a `2^27` stack (229 at the default), never
-        // fewer. Then its cap rule.
+        // today's form queries for a chain of at most 7 rounds (229 at the
+        // default). Not for every statement: today's form charges a table's
+        // one-polynomial height uncapped (rows plus log2 of its width), so a
+        // statement with a 64-column table of 2^25 rows is charged 8 rounds
+        // and can query more today; the round form's 229 is what its own
+        // union of 7 rounds needs. Then its cap rule.
         if let (true, B3Rounds::Whir { shrink, caps_by_q }) =
             (self.zf.base == BaseFormat::B3_WHIR, self.b3_rounds)
         {

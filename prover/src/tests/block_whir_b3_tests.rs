@@ -554,6 +554,19 @@ fn the_blake3_round_form_is_named_in_the_tag_and_bound_by_the_fold_word() {
     // form's design pick), the calculator's counts and caps by Q.
     let (r, _) = cw.final_round(27).expect("a final polynomial");
     assert_eq!(&cw.round_queries(27)[..=r], &[229, 57, 46, 39]);
+    // The `/W3` format's config: the same round form, sized the same, without
+    // caps by Q — its fold word is the production word less bit 32, and each
+    // tree keeps the base's cap, where caps by Q lower the later trees'.
+    let cp = w_policy.chain_config(&shapes);
+    let RoundForm::Whir(policy_rounds) = cp.format.rounds else {
+        panic!("the round form: {:?}", cp.format.rounds)
+    };
+    assert!(!policy_rounds.caps_by_queries());
+    check_round_form(&cp).expect("round 0's count is the target's");
+    assert_eq!(cp.num_queries, cw.num_queries);
+    assert_eq!(cp.fold_word(), cw.fold_word() & !FOLD_WORD_WHIR_CAPS_BY_Q);
+    assert_eq!(&cp.tree_caps(27)[..=r], &[8, 8, 8, 8]);
+    assert_ne!(&cp.tree_caps(27)[..=r], &cw.tree_caps(27)[..=r]);
     let mut w4 = w;
     w4.zf.whir_folds = WhirFolds::Uniform;
     let cw4 = w4.chain_config(&shapes);
@@ -677,6 +690,16 @@ fn a_blake3_base_under_the_round_form_proves_and_each_form_refuses_the_other() {
             let round = &mut p.proof.columns[g].polys[c].rounds[0];
             let value = round.ood_value.as_mut().expect("round 0 has a successor");
             *value += FieldElement::<E>::one();
+        });
+        // A round's query nonce, and round 0's out-of-domain nonce: the round
+        // form's grinds are checked at its own rounds (a moved nonce fails the
+        // work but for a chance of 2^-bits; a nonce of a grind of no bits is
+        // refused as unspent).
+        tampered("a later round's query nonce", &|p| {
+            p.proof.columns[g].polys[c].rounds[r].nonces.query ^= 1;
+        });
+        tampered("round 0's out-of-domain nonce", &|p| {
+            p.proof.columns[g].polys[c].rounds[0].nonces.ood ^= 1;
         });
         tampered(
             "a successor block slipped in",
