@@ -314,6 +314,24 @@ pub const BESIDE_NICE_ENV: &str = "LAMBDA_VM_LEVELS_BESIDE_NICE";
 /// The nice value [`BESIDE_NICE_ENV`]'s threads run at on Linux.
 pub const BESIDE_NICE: i32 = 10;
 
+/// How level 1's streamed execution met the base's groups, on the driver's
+/// clock: what it ran before any group (its setup and first wave), when the
+/// front landed and its wave, when each group's share arrived from phase B,
+/// and when each piece landed with its wave's seconds. A report: nothing reads
+/// it but the harness.
+#[derive(Clone, Debug, Default)]
+pub struct Level1Landing {
+    /// Seconds from the execution's start to its setup's end (the first wave,
+    /// the instructions that read no arena, included).
+    pub setup: f64,
+    /// When the front landed, and its wave's seconds.
+    pub front: (f64, f64),
+    /// When each group's share arrived, in arrival order: `(group, at)`.
+    pub arrivals: Vec<(usize, f64)>,
+    /// When each piece landed, in landing order: `(piece, at, wave seconds)`.
+    pub landed: Vec<(usize, f64, f64)>,
+}
+
 /// Whether the driver lowers its beside work ([`BESIDE_NICE_ENV`]), or a
 /// test's override.
 pub fn beside_nice() -> bool {
@@ -823,6 +841,8 @@ pub struct LevelsTimes {
     pub pieces: usize,
     pub waves_before_base: usize,
     pub wave_secs_before_base: f64,
+    /// How level 1's pieces landed ([`Level1Landing`]).
+    pub landing: Level1Landing,
     pub execute_tail: f64,
     /// Under [`PROGRAM_FAST_ENV`] (the default), level 1's validator beside
     /// its execution: its seconds, and when the execution's end found it done
@@ -1067,6 +1087,7 @@ pub fn prove_block_levels(
         Option<LeanBeside>,
         Option<(f64, f64)>,
         (f64, f64, f64),
+        Level1Landing,
     );
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
@@ -1143,6 +1164,10 @@ pub fn prove_block_levels(
             let mut ex =
                 StreamedExecution::new_pieced_tapped(program, arena_pieces, &hasher, lean_beside)
                     .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
+            let mut landing = Level1Landing {
+                setup: now() - execute_from,
+                ..Level1Landing::default()
+            };
             // Under the knob, each wave's compressions go to a thread of their
             // own that makes the round records and counts as they come.
             let (lean_tx, lean_fill) = if lean_beside {
@@ -1170,6 +1195,7 @@ pub fn prove_block_levels(
                 Box::new(prx.iter().collect::<Vec<_>>().into_iter())
             };
             for (g, roots, answers, tables, argue, opening, prepared) in parts {
+                landing.arrivals.push((g, now()));
                 if !landed[0] {
                     let front = super::whir_block::leaf_arena_under(
                         &roots,
@@ -1181,8 +1207,10 @@ pub fn prove_block_levels(
                     .next()
                     .ok_or("no front")?;
                     held[0].set(front).map_err(|_| "the front landed twice")?;
+                    let at = now();
                     ex.land_piece(0, held[0].get().ok_or("the front")?)
                         .map_err(|e| format!("level 1's front: {e:?}"))?;
+                    landing.front = (at, now() - at);
                     hand_on_lean(&mut ex, lean_tx.as_ref());
                     landed[0] = true;
                 }
@@ -1214,6 +1242,8 @@ pub fn prove_block_levels(
                         waves_before += 1;
                         wave_secs_before += t.elapsed().as_secs_f64();
                     }
+                    let secs = t.elapsed().as_secs_f64();
+                    landing.landed.push((i, now() - secs, secs));
                     landed[i] = true;
                 }
             }
@@ -1250,6 +1280,7 @@ pub fn prove_block_levels(
                 lean,
                 validated,
                 emit_split,
+                landing,
             ))
         });
         let prove_base = || {
@@ -1329,7 +1360,9 @@ pub fn prove_block_levels(
         lean,
         validated,
         emit_split,
+        landing,
     ) = level1.map_err(|_| "level 1's thread panicked")??;
+    times.landing = landing;
     times.validated_beside = validated;
     times.emit_split = emit_split;
     // A lean fill beside that was fed a compression twice, or missed one, is
