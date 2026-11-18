@@ -311,10 +311,24 @@ where
                     Some(on_card) => {
                         on_card.bind(r)?;
                         if on_card.rounds_left() == 0 {
-                            let (factors, _) = stepper
+                            let (factors, times) = stepper
                                 .take()
                                 .ok_or(Error::DeviceFailed { stage: "fused" })?
                                 .into_factors()?;
+                            if crate::gpu_fused::argue_fused_times() {
+                                eprintln!(
+                                    "ARGUE FUSED TIMES: roots {} terms {} slots {} n={} · total {:.3} \
+                                     ms (grid {:.3} fold2 {:.3} rounds {:.3})",
+                                    times.roots,
+                                    times.terms,
+                                    times.slots,
+                                    times.vars,
+                                    times.total * 1e3,
+                                    times.grid * 1e3,
+                                    times.fold2 * 1e3,
+                                    times.rounds * 1e3,
+                                );
+                            }
                             batched.adopt(factors)?;
                         }
                         Ok(())
