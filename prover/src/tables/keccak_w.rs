@@ -345,64 +345,95 @@ pub fn generate_keccak_w_rows_as(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     debug_assert!(ops.len() <= num_rows);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
-        for (row, op) in ops.iter().enumerate() {
-            let sponge = op.sponge.as_ref().expect("a KECCAK_W row is a sponge row");
-            let words = sponge
-                .words
-                .as_deref()
-                .expect("a KECCAK_W row holds its words");
-            table.set_dword_wl(row, cols::TIMESTAMP_0, op.timestamp);
-            for lane in 0..25 {
-                table.set_dword_bl(row, cols::input_byte(8 * lane), op.input[lane]);
-                table.set_dword_bl(row, cols::output_byte(8 * lane), op.output[lane]);
-            }
-            table.set_fe(row, cols::MU, FE::one());
-            table.set_bool(row, cols::FIRST, sponge.first);
-            table.set_bool(row, cols::LAST, sponge.last);
-            table.set_u64(row, cols::COUNT, sponge.count);
-            table.set_dword_wl(row, cols::SRC_LO, sponge.src);
-            table.set_dword_wl(row, cols::OUT_LO, sponge.out);
-            let src_end = (sponge.src & 0xFFFF_FFFF) + 135;
-            table.set_u64(row, cols::SRC_END, src_end & 0xFFFF);
-            table.set_u64(row, cols::SRC_END + 1, src_end >> 16);
-            table.set_bytes(row, cols::PREV, &op.sponge_prev(sponge));
-            table.set_bytes(row, cols::MSG, &sponge.msg);
-            for lane in 0..RATE_LANES {
-                table.set_bool(row, cols::full(lane), sponge.full(lane));
-                for byte in 0..7 {
-                    table.set_bool(row, cols::part(lane, byte), sponge.part(lane, byte));
-                }
-            }
-            let o = words.offset;
-            table.set_bool(row, cols::off(usize::from(o)), true);
-            for (w, word) in words.words.iter().enumerate() {
-                table.set_bytes(row, cols::w(8 * w), &word.to_le_bytes());
-            }
-            for (w, read) in reads(&sponge.mask, o, sponge.first).into_iter().enumerate() {
-                table.set_bool(row, cols::read(w), read);
-            }
-            let key = (sponge.src & 0xFFFF_FFFF).wrapping_sub(u64::from(o));
-            table.set_half(row, cols::SRC_KEY, key as u16);
-            table.set_half(row, cols::SRC_KEY + 1, (key >> 16) as u16);
-            if let Some(d) = &words.digest {
-                let out_end = (sponge.out & 0xFFFF_FFFF) + 31;
-                table.set_u64(row, cols::OUT_END, out_end & 0xFFFF);
-                table.set_u64(row, cols::OUT_END + 1, out_end >> 16);
-                table.set_bool(row, cols::q(usize::from(d.q)), true);
-                let key = (sponge.out & 0xFFFF_FFFF).wrapping_sub(u64::from(d.q));
-                table.set_half(row, cols::OUT_KEY, key as u16);
-                table.set_half(row, cols::OUT_KEY + 1, (key >> 16) as u16);
-                table.set_bytes(row, cols::OLD0, &d.old0.to_le_bytes());
-                table.set_bytes(row, cols::OLD4, &d.old4.to_le_bytes());
-                let new = digest_words(&digest_of(&op.output), d.q, d.old0, d.old4);
-                for (v, word) in new.iter().enumerate() {
-                    table.set_word(row, cols::new(v, 0), *word as u32);
-                    table.set_word(row, cols::new(v, 1), (*word >> 32) as u32);
-                }
-                table.set_bool(row, cols::W4, d.q != 0);
+        fill_keccak_w_range(table, ops, 0..num_rows)
+    })
+}
+
+/// [`generate_keccak_w_rows_as`] with its rows filled as the row ranges
+/// `bounds(num_rows)` at once ([`super::gpack::generate_main_rows`]): the same
+/// trace, word for word and packed byte for byte.
+pub(crate) fn generate_keccak_w_rows_split_as(
+    ops: &[KeccakOperation],
+    num_rows: usize,
+    form: TraceForm,
+    bounds: &dyn Fn(usize) -> Vec<usize>,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    debug_assert!(ops.len() <= num_rows);
+    let bounds = bounds(num_rows);
+    super::gpack::generate_main_rows!(
+        form,
+        &WIDTHS,
+        num_rows,
+        cols::NUM_COLUMNS,
+        &bounds,
+        |table, rows| { fill_keccak_w_range(table, ops, rows) }
+    )
+}
+
+/// The rows `range` of a zeroed KECCAK_W table of `ops`: a row reads its own op
+/// alone, and the rows past the ops stay zero.
+pub(crate) fn fill_keccak_w_range<T: VmTable>(
+    table: &mut T,
+    ops: &[KeccakOperation],
+    range: std::ops::Range<usize>,
+) {
+    for (row, op) in super::gpack::items_in(&[ops], range) {
+        let sponge = op.sponge.as_ref().expect("a KECCAK_W row is a sponge row");
+        let words = sponge
+            .words
+            .as_deref()
+            .expect("a KECCAK_W row holds its words");
+        table.set_dword_wl(row, cols::TIMESTAMP_0, op.timestamp);
+        for lane in 0..25 {
+            table.set_dword_bl(row, cols::input_byte(8 * lane), op.input[lane]);
+            table.set_dword_bl(row, cols::output_byte(8 * lane), op.output[lane]);
+        }
+        table.set_fe(row, cols::MU, FE::one());
+        table.set_bool(row, cols::FIRST, sponge.first);
+        table.set_bool(row, cols::LAST, sponge.last);
+        table.set_u64(row, cols::COUNT, sponge.count);
+        table.set_dword_wl(row, cols::SRC_LO, sponge.src);
+        table.set_dword_wl(row, cols::OUT_LO, sponge.out);
+        let src_end = (sponge.src & 0xFFFF_FFFF) + 135;
+        table.set_u64(row, cols::SRC_END, src_end & 0xFFFF);
+        table.set_u64(row, cols::SRC_END + 1, src_end >> 16);
+        table.set_bytes(row, cols::PREV, &op.sponge_prev(sponge));
+        table.set_bytes(row, cols::MSG, &sponge.msg);
+        for lane in 0..RATE_LANES {
+            table.set_bool(row, cols::full(lane), sponge.full(lane));
+            for byte in 0..7 {
+                table.set_bool(row, cols::part(lane, byte), sponge.part(lane, byte));
             }
         }
-    })
+        let o = words.offset;
+        table.set_bool(row, cols::off(usize::from(o)), true);
+        for (w, word) in words.words.iter().enumerate() {
+            table.set_bytes(row, cols::w(8 * w), &word.to_le_bytes());
+        }
+        for (w, read) in reads(&sponge.mask, o, sponge.first).into_iter().enumerate() {
+            table.set_bool(row, cols::read(w), read);
+        }
+        let key = (sponge.src & 0xFFFF_FFFF).wrapping_sub(u64::from(o));
+        table.set_half(row, cols::SRC_KEY, key as u16);
+        table.set_half(row, cols::SRC_KEY + 1, (key >> 16) as u16);
+        if let Some(d) = &words.digest {
+            let out_end = (sponge.out & 0xFFFF_FFFF) + 31;
+            table.set_u64(row, cols::OUT_END, out_end & 0xFFFF);
+            table.set_u64(row, cols::OUT_END + 1, out_end >> 16);
+            table.set_bool(row, cols::q(usize::from(d.q)), true);
+            let key = (sponge.out & 0xFFFF_FFFF).wrapping_sub(u64::from(d.q));
+            table.set_half(row, cols::OUT_KEY, key as u16);
+            table.set_half(row, cols::OUT_KEY + 1, (key >> 16) as u16);
+            table.set_bytes(row, cols::OLD0, &d.old0.to_le_bytes());
+            table.set_bytes(row, cols::OLD4, &d.old4.to_le_bytes());
+            let new = digest_words(&digest_of(&op.output), d.q, d.old0, d.old4);
+            for (v, word) in new.iter().enumerate() {
+                table.set_word(row, cols::new(v, 0), *word as u32);
+                table.set_word(row, cols::new(v, 1), (*word >> 32) as u32);
+            }
+            table.set_bool(row, cols::W4, d.q != 0);
+        }
+    }
 }
 
 // =========================================================================

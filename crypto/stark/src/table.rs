@@ -248,6 +248,51 @@ impl<F: IsField> Table<F> {
         let idx = row * self.width + col;
         self.data[idx] = value;
     }
+
+    /// The table cut into the row ranges `[bounds[i], bounds[i + 1])`, each
+    /// writable on its own (a fill split by rows). `bounds` rises from 0 to the
+    /// height; a bound past the height is taken as the height.
+    pub fn split_rows_mut(&mut self, bounds: &[usize]) -> Vec<TableRowsMut<'_, F>> {
+        let width = self.width;
+        let mut rest: &mut [FieldElement<F>] = &mut self.data;
+        let mut parts = Vec::with_capacity(bounds.len().saturating_sub(1));
+        let mut at = bounds.first().copied().unwrap_or(0);
+        for &end in bounds.iter().skip(1) {
+            let end = end.clamp(at, self.height);
+            let (part, tail) = std::mem::take(&mut rest).split_at_mut((end - at) * width);
+            parts.push(TableRowsMut {
+                first_row: at,
+                width,
+                data: part,
+            });
+            rest = tail;
+            at = end;
+        }
+        parts
+    }
+}
+
+/// Rows `[first_row, first_row + rows)` of a [`Table`], writable on their own:
+/// one part of [`Table::split_rows_mut`]. Rows are the table's own indices.
+pub struct TableRowsMut<'a, F: IsField> {
+    first_row: usize,
+    width: usize,
+    data: &'a mut [FieldElement<F>],
+}
+
+impl<F: IsField> TableRowsMut<'_, F> {
+    /// The table's rows this part holds.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        let rows = self.data.len().checked_div(self.width).unwrap_or(0);
+        self.first_row..self.first_row + rows
+    }
+
+    /// Write `value` into `row` (a row of this part, by the table's index) of
+    /// column `col`.
+    #[inline]
+    pub fn set(&mut self, row: usize, col: usize, value: FieldElement<F>) {
+        self.data[(row - self.first_row) * self.width + col] = value;
+    }
 }
 
 /// A view of a contiguous subset of rows of a table.

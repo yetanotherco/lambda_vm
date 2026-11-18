@@ -1816,6 +1816,132 @@ fn held_as_records_the_finishs_keccak_rnd_tables_are_its_tables() {
     assert!(held > 0, "some KECCAK_RND table was held as records");
 }
 
+/// ★ KECCAK_RND handed out during the windows as its records
+/// ([`WindowedTraceBuilder::stream_keccak_rnd_records`]): each streamed chunk
+/// is held as the keccak operations its rows come from (208 bytes an op), and
+/// their host fill is the table the finish builds without streaming, packed
+/// byte for byte; the finish leaves those tables' slots and holds the rest of
+/// KECCAK_RND as records too; every other table is the same. Under both padding
+/// rules, at windows of 1, 7 and 1000 cycles; at one-cycle windows some
+/// stream. Without KECCAK_RND cut into chunks the option is refused.
+#[test]
+fn keccak_rnd_streamed_as_records_are_the_finishs_tables() {
+    use crate::tables::gpack::TraceForm;
+    let max_rows = MaxRowsConfig::small();
+    let (program, _) = run("test_keccak_multi");
+    assert!(
+        WindowedTraceBuilder::new(&program, &[], &max_rows)
+            .expect("the builder")
+            .stream_keccak_rnd_records()
+            .is_err(),
+        "records without chunks"
+    );
+    let mut streamed_any = 0usize;
+    for name in ["test_keccak_multi", "test_keccak"] {
+        let (program, logs) = run(name);
+        for padding in [CutPadding::LastTable, CutPadding::WholeRun] {
+            for window in [1, 7, 1000] {
+                let what = format!("{name} {padding:?} window {window}");
+                let host = move |b| cut(b, padding);
+                let (builder, last) = pushed(&program, &logs, &max_rows, window, &host);
+                let whole = builder.finish(last).expect("the monolithic finish");
+                let [kr, _] = regen_ranges(&whole);
+                let (builder, last) = pushed(&program, &logs, &max_rows, window, &host);
+                let (want, _) = streamed_keeping(builder, last, false);
+                let mut builder = cut(
+                    WindowedTraceBuilder::new(&program, &[], &max_rows).expect("the builder"),
+                    padding,
+                )
+                .keccak_rnd_chunks(32)
+                .expect("rows")
+                .card_fill_keccak_rnd()
+                .stream_keccak_rnd_records()
+                .expect("KECCAK_RND cut");
+                let body = logs.len() - 1;
+                let cut_at = body - body % window;
+                let mut chunks = Vec::new();
+                for w in logs[..cut_at].chunks(window) {
+                    chunks.extend(builder.push_jobs(w).expect("a window"));
+                }
+                let (got, _) = streamed_keeping(builder, &logs[cut_at..], false);
+                assert_eq!(got.len(), want.len(), "{what}: the tables");
+                let mut streamed: std::collections::BTreeMap<usize, Table> = chunks
+                    .into_iter()
+                    .filter(|c| c.table == StreamTable::KeccakRnd)
+                    .map(|c| {
+                        assert!(
+                            c.is_records(),
+                            "{what}: KECCAK_RND chunk {} not records",
+                            c.index
+                        );
+                        let chunk = c.generate_as(TraceForm::Narrow);
+                        (chunk.index, chunk.trace)
+                    })
+                    .collect();
+                streamed_any += streamed.len();
+                for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(g.position, w.position, "{what}: position {k}");
+                    // Another family's streamed chunk: a slot in both.
+                    let Some(w) = w.table.as_ref() else {
+                        assert!(
+                            !kr.contains(&k),
+                            "{what}: the reference streamed KECCAK_RND"
+                        );
+                        assert!(g.table.is_none(), "{what}: slot {k}");
+                        continue;
+                    };
+                    let g = match &g.table {
+                        Some(g) => g,
+                        None => {
+                            assert!(kr.contains(&k), "{what}: a slot at {k}, not KECCAK_RND's");
+                            streamed
+                                .get(&(k - kr.start))
+                                .unwrap_or_else(|| panic!("{what}: no streamed chunk for {k}"))
+                        }
+                    };
+                    if kr.contains(&k) {
+                        let records = g
+                            .records_main()
+                            .unwrap_or_else(|| panic!("{what}: KECCAK_RND at {k} not records"));
+                        let filled = records.host_fill().expect("the host fills it");
+                        let filled = Some((filled.widths().to_vec(), filled.data().to_vec()));
+                        assert_eq!(
+                            first_difference(&filled, &packed_bytes(w)),
+                            None,
+                            "{what}: KECCAK_RND at {k}, filled from its records"
+                        );
+                        assert_eq!(
+                            (g.main_table.width, g.main_table.height),
+                            (w.main_table.width, w.main_table.height),
+                            "{what}: KECCAK_RND at {k}'s shape"
+                        );
+                        if let multilinear::records::RecordsFill::KeccakRnd { ops, .. } =
+                            records.fill()
+                        {
+                            assert_eq!(records.bytes(), 208 * ops.len(), "{what}: 208 B an op");
+                        } else {
+                            panic!("{what}: KECCAK_RND at {k} held as other records");
+                        }
+                    } else {
+                        assert!(g.records_main().is_none(), "{what}: table {k} as records");
+                        assert_eq!(
+                            first_difference(&packed_bytes(g), &packed_bytes(w)),
+                            None,
+                            "{what}: table {k}"
+                        );
+                        assert!(
+                            shape_and_words(g) == shape_and_words(w),
+                            "{what}: table {k}'s words"
+                        );
+                    }
+                }
+                streamed.clear();
+            }
+        }
+    }
+    assert!(streamed_any > 0, "no KECCAK_RND table streamed");
+}
+
 /// The records fault a block test plants ([`WindowedTraceBuilder::card_fill_records_fault`])
 /// moves the records themselves: every KECCAK_RND table with a real row is
 /// then another table than the finish builds without it, however it is
@@ -1896,4 +2022,101 @@ fn with_the_knob_the_plan_leaves_the_count_to_bitwise() {
             "the knob {beside}"
         );
     }
+}
+
+/// ★ KECCAK_W filled by row ranges (`LAMBDA_VM_FINISH_KECCAK_W_SPLIT=1`,
+/// `tables::gpack::generate_main_rows`) streams the tables the sliding finish
+/// streams without it, at their AIR positions, word for word and, held
+/// packed, byte for byte: the word format with KECCAK cut at 8 and at 4 rows,
+/// windows of 7 and 1000 cycles, parts of at least 1 and 3 rows. The split
+/// did run.
+#[test]
+fn the_keccak_w_split_streams_the_same_tables() {
+    use super::keccak_w_split_test;
+    use crate::tables::gpack::split_fills;
+    fn words(b: WindowedTraceBuilder<'_>, keccak_rows: usize) -> WindowedTraceBuilder<'_> {
+        use crate::tables::fused_memory::MemoryFormat;
+        use crate::tables::memw_aligned::MemwAlignedOrder;
+        use crate::tables::register::RegisterFormat;
+        b.register_format(RegisterFormat::InRow)
+            .expect("before any window")
+            .memw_aligned_order(MemwAlignedOrder::Limbs)
+            .expect("before any window")
+            .memory_format(MemoryFormat::Words)
+            .expect("before any window")
+            .keccak_rnd_chunks_at_finish(32)
+            .expect("rows")
+            .cuts_at_finish(keccak_rows, 1, 16, 1)
+            .expect("rows")
+            .pack_finished_tables()
+            .generate_packed()
+            .drop_streamed_ops()
+            .expect("before any window")
+    }
+    let max_rows = MaxRowsConfig::small();
+    let (program, logs) = run("test_keccak256");
+    let mut fills = 0usize;
+    for keccak_rows in [8, 4] {
+        for window in [7, 1000] {
+            let emit = |on, min_rows| {
+                keccak_w_split_test::with(on, min_rows, || {
+                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                        words(b, keccak_rows).slide_rest()
+                    });
+                    streamed(builder, last, usize::MAX).1
+                })
+            };
+            let want = emit(false, 1);
+            for min_rows in [1, 3] {
+                let what = format!("KECCAK at {keccak_rows} window {window} parts of {min_rows}");
+                let before = split_fills();
+                let got = emit(true, min_rows);
+                fills += split_fills() - before;
+                assert_eq!(got.len(), want.len(), "{what}: tables");
+                for (g, w) in got.iter().zip(&want) {
+                    assert_eq!(g.position, w.position, "{what}");
+                    let (g, w) = (g.table.as_ref(), w.table.as_ref());
+                    assert_eq!(
+                        g.map(shape_and_words),
+                        w.map(shape_and_words),
+                        "{what}: words"
+                    );
+                    assert_eq!(
+                        g.and_then(packed_bytes),
+                        w.and_then(packed_bytes),
+                        "{what}: packed bytes"
+                    );
+                }
+            }
+        }
+    }
+    assert!(fills > 0, "no KECCAK_W table was split");
+}
+
+/// The KECCAK_W split's knob: on unless `0` (the rollback); its bounds cut a
+/// 2^17-row table into eight parts and keep a table under two parts' rows
+/// whole.
+#[test]
+fn the_keccak_w_split_is_on_by_default_and_cuts_eight_parts() {
+    use super::{KECCAK_W_SPLIT_MIN_ROWS, keccak_w_split_from};
+    assert!(keccak_w_split_from(None));
+    assert!(!keccak_w_split_from(Some("0")));
+    assert!(!keccak_w_split_from(Some(" 0\n")));
+    assert!(keccak_w_split_from(Some("1")));
+    assert!(keccak_w_split_from(Some(" 1\n")));
+    let b = crate::tables::gpack::row_bounds_at(
+        1 << 17,
+        KECCAK_W_SPLIT_MIN_ROWS,
+        crate::tables::gpack::SPLIT_MAX_PARTS,
+    );
+    assert_eq!(b.len(), 9);
+    assert_eq!((b[0], b[8]), (0, 1 << 17));
+    assert_eq!(
+        crate::tables::gpack::row_bounds_at(
+            2 * KECCAK_W_SPLIT_MIN_ROWS - 1,
+            KECCAK_W_SPLIT_MIN_ROWS,
+            8
+        ),
+        vec![0, 2 * KECCAK_W_SPLIT_MIN_ROWS - 1]
+    );
 }

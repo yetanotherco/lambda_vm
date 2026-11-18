@@ -1867,6 +1867,131 @@ fn keccak_rnd_first_or_default(deviation: Option<bool>) -> bool {
     deviation.unwrap_or(true)
 }
 
+/// A measurement's knob ([`parse_keccak_rnd_arrivals`]).
+const KECCAK_RND_ARRIVALS_ENV: &str = "LAMBDA_VM_KECCAK_RND_ARRIVALS";
+
+/// `LAMBDA_VM_KECCAK_RND_ARRIVALS`: `1` logs when each KECCAK_RND table's
+/// operations are all in as the windows are taken (`BLOCK KECCAK_RND
+/// ARRIVALS`); unset, empty or `0` (the default) does not. It moves no byte of
+/// the proof. Anything else refuses the prove.
+fn parse_keccak_rnd_arrivals(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{KECCAK_RND_ARRIVALS_ENV}={v}: 0 (the default) or 1 (log KECCAK_RND's arrivals)"
+        ))),
+    }
+}
+
+/// The knob of [`stream_keccak_rnd_records`].
+const STREAM_KECCAK_RND_ENV: &str = "LAMBDA_VM_STREAM_KECCAK_RND";
+
+/// Whether KECCAK_RND's tables are handed out during the windows, each once
+/// the keccak operations its rows come from are all in, held as those
+/// operations for the card to fill (where the card fills KECCAK_RND,
+/// [`CardFill::keccak_rnd`]), so their commits use phase A's idle card instead
+/// of running back to back after the finish's header: a deviation's choice,
+/// else `LAMBDA_VM_STREAM_KECCAK_RND` (on by default). `Some` when asked for
+/// (`Some(true)` refuses a build that cannot stream KECCAK_RND), `None` for
+/// the default, which streams where the build cuts KECCAK_RND into its tables
+/// and the card fills them from their records. The tables and their
+/// words are the same; their place in the hand-out, and so the groups (the
+/// prover's, bound in the statement), are not. With the KECCAK_W row-range
+/// fill (`LAMBDA_VM_FINISH_KECCAK_W_SPLIT`) the median and the large block's
+/// phase A end 0.23 / 0.27 s sooner; alone it adds 0.27 s to the large's
+/// prove, so the two are on together.
+fn stream_keccak_rnd_records(deviation: Option<bool>) -> Result<Option<bool>, Error> {
+    match deviation {
+        Some(on) => Ok(Some(on)),
+        None => parse_stream_keccak_rnd(std::env::var(STREAM_KECCAK_RND_ENV).ok().as_deref()),
+    }
+}
+
+/// `LAMBDA_VM_STREAM_KECCAK_RND`: unset or empty is the default (handed out
+/// during the windows where the card fills KECCAK_RND, `None`); `1` asks for it
+/// (`Some(true)`), `0` builds KECCAK_RND at the finish (the rollback,
+/// `Some(false)`). Anything else refuses the prove.
+fn parse_stream_keccak_rnd(value: Option<&str>) -> Result<Option<bool>, Error> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some("1") => Ok(Some(true)),
+        Some("0") => Ok(Some(false)),
+        Some(v) => Err(Error::Prover(format!(
+            "{STREAM_KECCAK_RND_ENV}={v}: 1 (the default: KECCAK_RND handed out during the \
+             windows) or 0 (built at the finish)"
+        ))),
+    }
+}
+
+/// The knob of [`own_keccak_rnd_groups`].
+const KECCAK_RND_OWN_GROUPS_ENV: &str = "LAMBDA_VM_KECCAK_RND_OWN_GROUPS";
+
+/// Whether KECCAK_RND's streamed tables are packed into groups of their own
+/// ([`OwnGroups`]) instead of among the other streamed chunks in arrival order:
+/// a deviation's choice, else `LAMBDA_VM_KECCAK_RND_OWN_GROUPS` (on by
+/// default). Among the 2^21-row chunks the 2^16-row tables stack worse than in
+/// groups of their own (four a group, as the finish's are packed), and each
+/// stacked polynomial more costs phase B its opening: on by default, the
+/// large block's phase B 0.21 s and its prove 0.26 s shorter (the median's
+/// prove 0.09 s), three stacked polynomials fewer. Only with KECCAK_RND
+/// streamed ([`stream_keccak_rnd_records`]). The tables and their words are the
+/// same; the groups (the prover's, bound in the statement) are not.
+fn own_keccak_rnd_groups(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => {
+            parse_own_keccak_rnd_groups(std::env::var(KECCAK_RND_OWN_GROUPS_ENV).ok().as_deref())
+        }
+    }
+}
+
+/// `LAMBDA_VM_KECCAK_RND_OWN_GROUPS`: unset, empty or `1` (the default) packs
+/// KECCAK_RND's streamed tables in groups of their own; `0` among the other
+/// streamed chunks (the rollback). Anything else refuses the prove.
+fn parse_own_keccak_rnd_groups(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(v) => Err(Error::Prover(format!(
+            "{KECCAK_RND_OWN_GROUPS_ENV}={v}: 1 (the default: KECCAK_RND's streamed tables in \
+             groups of their own) or 0 (among the streamed chunks)"
+        ))),
+    }
+}
+
+/// The knob of [`rest_airs_beside`].
+const REST_AIRS_BESIDE_ENV: &str = "LAMBDA_VM_REST_AIRS_BESIDE";
+
+/// Whether the streamed rest builds the run's AIR set on a thread of its own
+/// while the KECCAK_RND tables handed on first are laid out with their own
+/// AIRs ([`lay_out_rest_streamed`]), so they reach the packer as the finish
+/// hands them on rather than once the whole set exists: a deviation's choice,
+/// else `LAMBDA_VM_REST_AIRS_BESIDE` (on by default). The AIRs, the tables,
+/// their order and the proof's bytes are the same either way. On the large
+/// block it takes the AIR set's ≈ 0.4 s off the first KECCAK_RND table's way to
+/// the card: phase A −0.26 s, the median's unchanged.
+fn rest_airs_beside(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => parse_rest_airs_beside(std::env::var(REST_AIRS_BESIDE_ENV).ok().as_deref()),
+    }
+}
+
+/// `LAMBDA_VM_REST_AIRS_BESIDE`: unset, empty or `1` (the default) builds the
+/// AIR set beside the first KECCAK_RND tables; `0` builds it before the rest's
+/// first table (the rollback). Anything else refuses the prove.
+fn parse_rest_airs_beside(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(v) => Err(Error::Prover(format!(
+            "{REST_AIRS_BESIDE_ENV}={v}: 1 (the default: built beside the first KECCAK_RND \
+             tables) or 0 (the AIR set before the rest's first table)"
+        ))),
+    }
+}
+
 /// How the rest's layout bytes ([`BlockOptions::rest_layout_bytes`]) bound
 /// the rest, for the harnesses' `BLOCK REST LAYOUT CONFIG` line: waves of
 /// them where the rest is laid out in waves, and the streamed finish's gate
@@ -4605,6 +4730,24 @@ pub(crate) struct Deviations {
     /// order (`Some(false)`), instead of the default (`None`: first;
     /// [`keccak_rnd_first_or_default`]).
     pub keccak_rnd_first: Option<bool>,
+    /// The run's AIR set built on a thread of its own while the first
+    /// KECCAK_RND tables are laid out (`Some(true)`), or before the rest's
+    /// first table (`Some(false)`), instead of the knob
+    /// ([`rest_airs_beside`]).
+    pub rest_airs_beside: Option<bool>,
+    /// KECCAK_RND's tables handed out during the windows (`Some(true)`) or
+    /// built at the finish (`Some(false)`), instead of the knob
+    /// ([`stream_keccak_rnd_records`]).
+    pub stream_keccak_rnd: Option<bool>,
+    /// KECCAK_RND's streamed tables in groups of their own (`Some(true)`) or
+    /// among the other streamed chunks (`Some(false)`), instead of the knob
+    /// ([`own_keccak_rnd_groups`]).
+    pub keccak_rnd_own_groups: Option<bool>,
+    /// With the AIR set built beside them, each early KECCAK_RND table laid
+    /// out with the AIR named for the next table: an AIR the run's set does
+    /// not have at that place, which the prove must refuse.
+    #[cfg(test)]
+    pub rest_airs_beside_misnamed: bool,
     /// The hand-out's counting on a thread of its own (`Some(true)`) or on
     /// the accumulator's (`Some(false)`), instead of the default (`None`: a
     /// thread of its own; [`WindowedTraceBuilder::count_handout_on_thread`]).
@@ -6085,7 +6228,9 @@ enum Key {
 type Placed<'a> = (usize, (usize, usize), CommittedTable<'a, F, E>);
 
 /// Packs tables, in the order they come, into groups of at most `max_polys`
-/// stacked polynomials, and sends each group to phase A as it closes.
+/// stacked polynomials, and sends each group to phase A as it closes. With
+/// [`Self::own`], KECCAK_RND's streamed chunks are packed apart, in groups of
+/// their own ([`OwnGroups`]).
 struct Packer<'a> {
     open: Vec<CommittedTable<'a, F, E>>,
     open_shapes: Vec<(usize, usize)>,
@@ -6105,17 +6250,78 @@ struct Packer<'a> {
     /// A memory log, and the open group's bytes in it.
     ledger: Option<&'a memlog::Ledger>,
     open_bytes: usize,
+    /// KECCAK_RND's streamed chunks' own open group, when they are packed
+    /// apart (`None`: packed with the others).
+    own: Option<OwnGroups<'a>>,
+}
+
+/// KECCAK_RND's streamed chunks packed apart from the other streamed chunks
+/// ([`own_keccak_rnd_groups`]): its open group, the hand-out place of each
+/// table of either open group, and the regeneration recorder told each closed
+/// group's places, since the groups then close out of hand-out order.
+struct OwnGroups<'a> {
+    open: Vec<CommittedTable<'a, F, E>>,
+    shapes: Vec<(usize, usize)>,
+    keys: Vec<Key>,
+    places: Vec<Option<usize>>,
+    bytes: usize,
+    /// The other open group's tables' hand-out places.
+    main_places: Vec<Option<usize>>,
+    /// The streamed chunks placed so far: the next one's hand-out place.
+    placed: usize,
+    recorder: Option<&'a regen::Recorder>,
 }
 
 impl<'a> Packer<'a> {
     /// A group closes, and goes to the card, when the next table would take
-    /// it past its polynomial budget.
+    /// it past its polynomial budget. Under [`Self::own`] a KECCAK_RND chunk
+    /// joins its own open group, which closes by the same rule, and is closed
+    /// as it stands before the rest's first table.
     fn place(
         &mut self,
         key: Key,
         shape: (usize, usize),
         table: CommittedTable<'a, F, E>,
     ) -> Result<(), Error> {
+        let place = self.own.as_mut().and_then(|own| match key {
+            Key::Streamed(..) => {
+                own.placed += 1;
+                Some(own.placed - 1)
+            }
+            Key::Air(_) => None,
+        });
+        if let Some(own) = self.own.as_mut() {
+            if let Key::Streamed(StreamTable::KeccakRnd, _) = key {
+                own.shapes.push(shape);
+                let polys = stark::multilinear_table::global_layout(&own.shapes, self.cap)
+                    .map_err(|e| Error::Prover(format!("{e:?}")))?
+                    .num_polys();
+                if polys > self.max_polys && !own.open.is_empty() {
+                    self.close_own()?;
+                }
+                let own = self.own.as_mut().expect("packed apart");
+                if own.shapes.is_empty() {
+                    own.shapes.push(shape);
+                }
+                let bytes = self.ledger.map_or(0, |ledger| {
+                    let bytes = memlog::table_bytes(&table);
+                    ledger
+                        .open
+                        .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+                    bytes
+                });
+                own.bytes += bytes;
+                own.open.push(table);
+                own.keys.push(key);
+                own.places.push(place);
+                return Ok(());
+            }
+            // The rest begins: KECCAK_RND's open group goes first, so every
+            // streamed chunk is committed before the rest's first table.
+            if matches!(key, Key::Air(_)) && !own.open.is_empty() {
+                self.close_own()?;
+            }
+        }
         self.open_shapes.push(shape);
         let polys = stark::multilinear_table::global_layout(&self.open_shapes, self.cap)
             .map_err(|e| Error::Prover(format!("{e:?}")))?
@@ -6140,10 +6346,46 @@ impl<'a> Packer<'a> {
         }
         self.open.push(table);
         self.open_keys.push(key);
+        if let Some(own) = self.own.as_mut() {
+            own.main_places.push(place);
+        }
         Ok(())
     }
 
     fn close(&mut self) -> Result<(), Error> {
+        let tables = std::mem::take(&mut self.open);
+        let keys = std::mem::take(&mut self.open_keys);
+        let bytes = std::mem::take(&mut self.open_bytes);
+        let places = self
+            .own
+            .as_mut()
+            .map(|own| std::mem::take(&mut own.main_places));
+        self.send(tables, keys, bytes, places)
+    }
+
+    /// KECCAK_RND's own open group, closed and sent.
+    fn close_own(&mut self) -> Result<(), Error> {
+        let Some(own) = self.own.as_mut() else {
+            return Ok(());
+        };
+        let tables = std::mem::take(&mut own.open);
+        let keys = std::mem::take(&mut own.keys);
+        let bytes = std::mem::take(&mut own.bytes);
+        let places = std::mem::take(&mut own.places);
+        own.shapes.clear();
+        self.send(tables, keys, bytes, Some(places))
+    }
+
+    /// One group to phase A: its tables, keys and ledger bytes, and under
+    /// [`Self::own`] each table's hand-out place, told to the recorder before
+    /// phase A can take the group.
+    fn send(
+        &mut self,
+        tables: Vec<CommittedTable<'a, F, E>>,
+        keys: Vec<Key>,
+        bytes: usize,
+        places: Option<Vec<Option<usize>>>,
+    ) -> Result<(), Error> {
         // As its groups close the prover knows only how far the block got, not
         // its total: the refusal says so, so the index is not read as a count.
         let reached = self.group_keys.len() + 1;
@@ -6155,24 +6397,32 @@ impl<'a> Packer<'a> {
         }
         if let Some(ledger) = self.ledger {
             use std::sync::atomic::Ordering::Relaxed;
-            let bytes = std::mem::take(&mut self.open_bytes);
             ledger.open.fetch_sub(bytes, Relaxed);
             ledger.sent.fetch_add(bytes, Relaxed);
         }
-        self.group_keys.push(std::mem::take(&mut self.open_keys));
+        if let (Some(places), Some(recorder)) =
+            (places, self.own.as_ref().and_then(|own| own.recorder))
+        {
+            recorder.committed(&places);
+        }
+        self.group_keys.push(keys);
         self.closed_at.push(self.start.elapsed().as_secs_f64());
         let t = Instant::now();
         let sent = self
             .out
-            .send(std::mem::take(&mut self.open))
+            .send(tables)
             .map_err(|_| Error::Prover("phase A stopped".into()));
         self.blocked += t.elapsed().as_secs_f64();
         sent
     }
 
-    /// Sends the last group; hands back every group's tables, when each
-    /// closed and the seconds spent waiting on phase A.
+    /// Sends the last groups (KECCAK_RND's own first, if any is open); hands
+    /// back every group's tables, when each closed and the seconds spent
+    /// waiting on phase A.
     fn finish(mut self) -> Result<Packed, Error> {
+        if self.own.as_ref().is_some_and(|own| !own.open.is_empty()) {
+            self.close_own()?;
+        }
         if !self.open.is_empty() {
             self.close()?;
         }
@@ -6836,17 +7086,64 @@ fn lay_out_rest<'a>(
     })
 }
 
+/// The KECCAK_RND tables' own AIRs, for the streamed rest that lays them out
+/// while the run's set is built beside them ([`rest_airs_beside`]): built on
+/// first use as [`crate::block_airs`] builds that family, and checked against
+/// the run's set once it exists.
+#[derive(Clone, Copy)]
+struct EarlyAirs<'a> {
+    airs: &'a std::sync::OnceLock<Vec<crate::VmAir>>,
+    /// A test's fault: each AIR named for the next table.
+    misnamed: bool,
+}
+
+/// An AIR borrowed for `'a` (the run's set's, or a table's own).
+type AirRef<'a> = &'a dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
+
+/// KECCAK_RND's places in AIR order: its range among the chunked tables.
+fn keccak_rnd_range(counts: &TableCounts) -> Result<std::ops::Range<usize>, Error> {
+    chunked_table_ranges(counts)
+        .into_iter()
+        .find(|(name, ..)| *name == "KECCAK_RND")
+        .map(|(_, range, _)| range)
+        .ok_or_else(|| Error::Prover("no KECCAK_RND range among the chunked tables".into()))
+}
+
+/// Refuses an AIR a table was laid out with that is not the run's AIR at its
+/// place: its name, shape, constraint count and interactions.
+fn same_air(laid: AirRef<'_>, run: AirRef<'_>) -> Result<(), Error> {
+    if laid.name() != run.name()
+        || laid.trace_layout() != run.trace_layout()
+        || laid.num_transition_constraints() != run.num_transition_constraints()
+        || laid.bus_interactions() != run.bus_interactions()
+    {
+        return Err(Error::Prover(format!(
+            "a table laid out with {}, the run's AIR at its place is {}",
+            laid.name(),
+            run.name()
+        )));
+    }
+    Ok(())
+}
+
 /// The rest as the finish streams it ([`RestStream`]): each table laid out
 /// narrow as it comes (wide ones through [`table_of`]) and sent to the packer
 /// in AIR order (`sink`), every table checked against the run's AIRs built
 /// from the header ([`RestOrder`]). The prepared columns are left for after
 /// the packing, as on the pipelined path.
+///
+/// With `early` and KECCAK_RND handed on first, the run's AIR set is built on
+/// a thread of its own while the KECCAK_RND tables are laid out with their
+/// own AIRs ([`EarlyAirs`]) and sent on; the first table after them waits for
+/// the set, which then admits the early tables in their order and checks
+/// their AIRs against its own ([`same_air`]).
 #[allow(clippy::too_many_arguments)]
 fn lay_out_rest_streamed<'a>(
     stream: Box<RestStream>,
     program: &Elf,
     opts: &ProofOptions,
     run_airs: &'a std::sync::OnceLock<VmAirs>,
+    early: Option<EarlyAirs<'a>>,
     start: Instant,
     sink: Option<std::sync::mpsc::Sender<RestDone<'a>>>,
     ledger: Option<&memlog::Ledger>,
@@ -6875,31 +7172,148 @@ fn lay_out_rest_streamed<'a>(
         .iter()
         .filter(|c| c.is_private_input)
         .count();
-    let inputs = BlockAirInputs::new(
-        opts,
-        program,
-        header.cpu_heights.clone(),
-        &header.public_output_bytes,
-    )?;
-    let mut built = Ok(());
-    let airs = run_airs.get_or_init(|| {
-        let mut airs = block_airs(
-            program,
+    let build_airs = || -> Result<&'a VmAirs, Error> {
+        let inputs = BlockAirInputs::new(
             opts,
-            &header.page_configs,
-            &header.table_counts,
-            &inputs,
-            keccak_rnd,
-            memw_aligned,
-            registers,
-        );
-        airs.with_fused_memory(opts, fused);
-        if memory == crate::tables::fused_memory::MemoryFormat::Words {
-            built = airs.with_word_memory(opts, words, &header.page_configs);
+            program,
+            header.cpu_heights.clone(),
+            &header.public_output_bytes,
+        )?;
+        let mut built = Ok(());
+        let airs = run_airs.get_or_init(|| {
+            let mut airs = block_airs(
+                program,
+                opts,
+                &header.page_configs,
+                &header.table_counts,
+                &inputs,
+                keccak_rnd,
+                memw_aligned,
+                registers,
+            );
+            airs.with_fused_memory(opts, fused);
+            if memory == crate::tables::fused_memory::MemoryFormat::Words {
+                built = airs.with_word_memory(opts, words, &header.page_configs);
+            }
+            airs
+        });
+        built?;
+        Ok(airs)
+    };
+    let mut timed: Vec<(usize, f64)> = Vec::new();
+    let mut laid_at: Vec<(usize, f64)> = Vec::new();
+    let (mut narrow_tables, mut narrow_bytes) = (0usize, 0usize);
+    let (mut records_tables, mut records_bytes) = (0usize, 0usize);
+    let mut k = 0usize;
+    // One table laid out with `air` and sent to the packer.
+    let mut lay_one = |air: AirRef<'a>,
+                       position: usize,
+                       mut trace: TraceTable<F, E>,
+                       marks: &mut Vec<(&'static str, f64)>| {
+        if k == 0 {
+            marks.push(("rest first received", at()));
         }
-        airs
-    });
-    built?;
+        let t = Instant::now();
+        let shape = (
+            trace.main_table.width,
+            trace.main_table.height.trailing_zeros() as usize,
+        );
+        let rows = memlog::rows_bytes(&trace);
+        let laid = if let Some(records) = trace.records_main() {
+            // Never dropped, so never one phase B builds again.
+            records_tables += 1;
+            records_bytes += records.bytes();
+            table_of_records(air, &mut trace, shape)
+        } else if let Some(packed) = trace.narrow_main() {
+            narrow_tables += 1;
+            narrow_bytes += packed.data().len();
+            // A table phase B can build again from the kept lists (N3): its
+            // place among the rest's, before the packer places it.
+            if let (Some(recorder), Some((family, j))) = (
+                recorder,
+                crate::tables::trace_builder::RegenFamily::of_air(air.name()),
+            ) {
+                recorder.rest_tag(k, family, j);
+            }
+            table_of_narrow(air, &mut trace, shape)
+        } else {
+            table_of(air, &mut trace, shape, true)
+        };
+        let secs = t.elapsed().as_secs_f64();
+        timed.push((position, secs));
+        laid_at.push((position, at()));
+        if let (Some(ledger), Ok(table)) = (ledger, &laid) {
+            ledger.rest.fetch_sub(rows, Relaxed);
+            ledger
+                .rest_laid
+                .fetch_add(memlog::table_bytes(table), Relaxed);
+        }
+        // A packer that stopped has its own error to report.
+        let _ = sink.send((k, secs, laid.map(|table| (position, shape, table))));
+        k += 1;
+    };
+    let mut tables = tables.into_iter();
+    // The tables laid out before the AIR set was there, by position and
+    // width (`None`: not built here), with the AIR each was laid out with;
+    // the first table after them, held for the set.
+    let mut before: Vec<(usize, Option<usize>, Option<AirRef<'a>>)> = Vec::new();
+    let mut held = None;
+    let airs = match early.filter(|_| header.keccak_rnd_first) {
+        Some(early) => {
+            let range = keccak_rnd_range(&header.table_counts)?;
+            let own = early.airs.get_or_init(|| {
+                (0..range.len())
+                    .map(|i| {
+                        let i = if early.misnamed { i + 1 } else { i };
+                        Box::new(
+                            crate::test_utils::create_keccak_rnd_air_for(opts, keccak_rnd)
+                                .with_name(&format!("KECCAK_RND[{i}]")),
+                        ) as crate::VmAir
+                    })
+                    .collect()
+            });
+            marks.push(("rest airs beside", at()));
+            let (airs, ready) = std::thread::scope(|scope| -> Result<_, Error> {
+                let build = std::thread::Builder::new()
+                    .name("rest-airs".into())
+                    .spawn_scoped(scope, build_airs)
+                    .map_err(|e| Error::Prover(format!("the AIR set's thread: {e}")))?;
+                // The early tables laid out while the set was still building.
+                let mut ready = 0usize;
+                while before.len() < range.len() {
+                    let Some(emitted) = tables.next() else {
+                        break;
+                    };
+                    let crate::tables::trace_builder::Emitted { position, table } = emitted;
+                    if !range.contains(&position) {
+                        held = Some(crate::tables::trace_builder::Emitted { position, table });
+                        break;
+                    }
+                    let Some(trace) = table else {
+                        before.push((position, None, None));
+                        continue;
+                    };
+                    let air: AirRef<'a> = own[position - range.start].as_ref();
+                    before.push((position, Some(trace.main_table.width), Some(air)));
+                    if !build.is_finished() {
+                        ready += 1;
+                    }
+                    lay_one(air, position, trace, &mut marks);
+                }
+                let airs = build
+                    .join()
+                    .map_err(|_| Error::Prover("the AIR set's thread panicked".into()))??;
+                Ok((airs, ready))
+            })?;
+            eprintln!(
+                "BLOCK REST AIRS: beside · {} KECCAK_RND table(s) laid out before the rest's \
+                 next table, {ready} of them while the AIR set was building",
+                before.len()
+            );
+            airs
+        }
+        None => build_airs()?,
+    };
     marks.push(("airs", at()));
     let refs = airs.air_refs();
     let first = if header.keccak_rnd_first {
@@ -6929,57 +7343,24 @@ fn lay_out_rest_streamed<'a>(
                 .join(",")
         );
     }
-    let mut timed: Vec<(usize, f64)> = Vec::new();
-    let mut laid_at: Vec<(usize, f64)> = Vec::new();
-    let (mut narrow_tables, mut narrow_bytes) = (0usize, 0usize);
-    let (mut records_tables, mut records_bytes) = (0usize, 0usize);
-    let mut k = 0usize;
-    for crate::tables::trace_builder::Emitted { position, table } in tables {
+    // The tables laid out before the set: admitted in their order, each AIR
+    // the run's own.
+    for &(position, width, air) in &before {
+        order.admit(position, width)?;
+        if let Some(air) = air {
+            let run = refs
+                .get(position)
+                .ok_or_else(|| Error::Prover(format!("table {position} is past the AIR set")))?;
+            same_air(air, *run)?;
+        }
+    }
+    for crate::tables::trace_builder::Emitted { position, table } in held.into_iter().chain(tables)
+    {
         order.admit(position, table.as_ref().map(|t| t.main_table.width))?;
-        let Some(mut trace) = table else {
+        let Some(trace) = table else {
             continue;
         };
-        if k == 0 {
-            marks.push(("rest first received", at()));
-        }
-        let t = Instant::now();
-        let shape = (
-            trace.main_table.width,
-            trace.main_table.height.trailing_zeros() as usize,
-        );
-        let rows = memlog::rows_bytes(&trace);
-        let laid = if let Some(records) = trace.records_main() {
-            // Never dropped, so never one phase B builds again.
-            records_tables += 1;
-            records_bytes += records.bytes();
-            table_of_records(refs[position], &mut trace, shape)
-        } else if let Some(packed) = trace.narrow_main() {
-            narrow_tables += 1;
-            narrow_bytes += packed.data().len();
-            // A table phase B can build again from the kept lists (N3): its
-            // place among the rest's, before the packer places it.
-            if let (Some(recorder), Some((family, j))) = (
-                recorder,
-                crate::tables::trace_builder::RegenFamily::of_air(refs[position].name()),
-            ) {
-                recorder.rest_tag(k, family, j);
-            }
-            table_of_narrow(refs[position], &mut trace, shape)
-        } else {
-            table_of(refs[position], &mut trace, shape, true)
-        };
-        let secs = t.elapsed().as_secs_f64();
-        timed.push((position, secs));
-        laid_at.push((position, at()));
-        if let (Some(ledger), Ok(table)) = (ledger, &laid) {
-            ledger.rest.fetch_sub(rows, Relaxed);
-            ledger
-                .rest_laid
-                .fetch_add(memlog::table_bytes(table), Relaxed);
-        }
-        // A packer that stopped has its own error to report.
-        let _ = sink.send((k, secs, laid.map(|table| (position, shape, table))));
-        k += 1;
+        lay_one(refs[position], position, trace, &mut marks);
     }
     order.finish()?;
     marks.push(("rest laid out", at()));
@@ -7204,10 +7585,13 @@ fn prove_streamed(
             // Class 0: the streamed chunks (the replay); class 1: KECCAK_RND's
             // and LT's tables of the rest (the kept lists, N3).
             multilinear_block::BlockRegen::new(
+                // A streamed chunk's rank is its hand-out place, which is its
+                // block index unless phase A commits out of hand-out order
+                // (KECCAK_RND's own groups: [`Recorder::handout_place`]).
                 std::sync::Arc::new(move |t| {
                     recorder
-                        .chunk_at(t)
-                        .map(|_| (0, t as u64))
+                        .handout_place(t)
+                        .and_then(|r| recorder.chunk_at(r).map(|_| (0, r as u64)))
                         .or_else(|| recorder.rest_at(t).map(|_| (1, t as u64)))
                 }),
                 &match deviations.regen_windows {
@@ -7245,12 +7629,22 @@ fn prove_streamed(
     // its frontier, so the regenerator does not rebuild beside the finish.
     let early_paced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
+    // The KECCAK_RND tables' AIRs the streamed rest lays them out with while
+    // the run's set is built beside them ([`rest_airs_beside`]).
+    let rest_keccak_airs: std::sync::OnceLock<Vec<crate::VmAir>> = std::sync::OnceLock::new();
     // Phase A's commits read the blowup, the fold schedule and the format of
     // the config and nothing else; the full config (its query count reads every
     // shape) is built when the shapes are known, and must agree on those.
     let commit_config = format.chain_config(&[]);
     let cap = commit_config.format.stack;
     let start = Instant::now();
+    // A measurement ([`KECCAK_RND_ARRIVALS_ENV`]): when each KECCAK_RND table's
+    // operations are all in, as the windows are taken.
+    let arrivals =
+        parse_keccak_rnd_arrivals(std::env::var(KECCAK_RND_ARRIVALS_ENV).ok().as_deref())?;
+    if arrivals {
+        crate::tables::trace_builder::keccak_rnd_arrivals::arm(1 << options.keccak_rnd_rows_log2);
+    }
     head_log::begin(start, deviations.head_log.map_or_else(head_log::knob, Ok)?);
     set_up_card();
     // A memory log (`BlockOptions::memlog`): its sampler runs until the
@@ -7349,6 +7743,19 @@ fn prove_streamed(
         let walkers = block_walkers()?;
         let bitwise_last = deviations.rest_bitwise_last;
         let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
+        let airs_beside = rest_airs_beside(deviations.rest_airs_beside)?;
+        #[cfg(test)]
+        let misnamed = deviations.rest_airs_beside_misnamed;
+        #[cfg(not(test))]
+        let misnamed = false;
+        eprintln!(
+            "★ BLOCK REST AIRS: {} ({REST_AIRS_BESIDE_ENV})",
+            if airs_beside {
+                "built beside the first KECCAK_RND tables (the default)"
+            } else {
+                "built before the rest's first table"
+            }
+        );
         let from_tables = bitwise_from_tables_or_default(deviations.bitwise_from_tables);
         let mut card_fill = match (
             deviations.card_fill,
@@ -7372,6 +7779,48 @@ fn prove_streamed(
                 }
             }
         };
+        // KECCAK_RND handed out during the windows: by default where the build
+        // cuts it into its tables and the card fills it from its records (as
+        // the finish holds them: packed), so the streamed tables take no host
+        // layout; built at the finish otherwise; or as asked.
+        let can_stream = options.finish_keccak_rnd_chunks
+            && options.keccak_rnd_rows_log2 >= 5
+            && !deviations.omit_first_keccak_rnd;
+        let stream_keccak_rnd = match stream_keccak_rnd_records(deviations.stream_keccak_rnd)? {
+            None => can_stream && card_fill.keccak_rnd && options.pack_finished,
+            Some(false) => false,
+            Some(true) if can_stream => true,
+            Some(true) => {
+                return Err(Error::Prover(format!(
+                    "{STREAM_KECCAK_RND_ENV}=1 needs KECCAK_RND cut into its tables \
+                     (finish_keccak_rnd_chunks, at least 2^5 rows) and no first table \
+                     omitted (a streamed table lands by its index)"
+                )));
+            }
+        };
+        eprintln!(
+            "★ BLOCK KECCAK_RND STREAM: {} ({STREAM_KECCAK_RND_ENV})",
+            if stream_keccak_rnd {
+                "each table handed out during the windows once its operations are in"
+            } else {
+                "built at the finish"
+            }
+        );
+        let own_groups =
+            stream_keccak_rnd && own_keccak_rnd_groups(deviations.keccak_rnd_own_groups)?;
+        if stream_keccak_rnd {
+            eprintln!(
+                "★ BLOCK KECCAK_RND GROUPS: {} ({KECCAK_RND_OWN_GROUPS_ENV})",
+                if own_groups {
+                    "the streamed tables packed in groups of their own (the default)"
+                } else {
+                    "the streamed tables packed among the other chunks"
+                }
+            );
+        }
+        if let (true, Some(recorder)) = (own_groups, recorder) {
+            recorder.commits_out_of_order();
+        }
         // Under the in-row register format MEMW_R's slot holds the residual
         // register table, which the host builds (MEMW_R's kernel fills MEMW_R's
         // columns, never the residual table's): MEMW_R's records, its words and
@@ -7580,7 +8029,10 @@ fn prove_streamed(
                 }
                 let mut builder =
                     WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
-                if options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5 {
+                if stream_keccak_rnd {
+                    // Checked above: KECCAK_RND is cut into its tables.
+                    builder = builder.keccak_rnd_chunks(1usize << options.keccak_rnd_rows_log2)?;
+                } else if options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5 {
                     builder = builder
                         .keccak_rnd_chunks_at_finish(1usize << options.keccak_rnd_rows_log2)?;
                 }
@@ -7627,6 +8079,11 @@ fn prove_streamed(
                 }
                 if card_fill.keccak_rnd {
                     builder = builder.card_fill_keccak_rnd();
+                    // The finish holds its KECCAK_RND tables as records only
+                    // when it packs them; the streamed ones follow it.
+                    if stream_keccak_rnd && options.pack_finished {
+                        builder = builder.stream_keccak_rnd_records()?;
+                    }
                     #[cfg(test)]
                     if deviations.card_fill_records_fault > 0 {
                         builder =
@@ -8060,6 +8517,7 @@ fn prove_streamed(
             let (gtx, grx) = std::sync::mpsc::sync_channel::<Vec<CommittedTable<'_, F, E>>>(1);
             let stream_airs = &stream_airs;
             let run_airs = &run_airs;
+            let rest_keccak_airs = &rest_keccak_airs;
             let layout = scope.spawn(move || -> Result<Laid, Error> {
                 if let Some(ledger) = ledger {
                     ledger.thread("layout");
@@ -8078,6 +8536,16 @@ fn prove_streamed(
                     blocked: 0.0,
                     ledger,
                     open_bytes: 0,
+                    own: own_groups.then(|| OwnGroups {
+                        open: Vec::new(),
+                        shapes: Vec::new(),
+                        keys: Vec::new(),
+                        places: Vec::new(),
+                        bytes: 0,
+                        main_places: Vec::new(),
+                        placed: 0,
+                        recorder,
+                    }),
                 };
                 // Off the inline path, the prepared columns wait until the
                 // groups are sent.
@@ -8101,6 +8569,10 @@ fn prove_streamed(
                         program,
                         opts,
                         run_airs,
+                        airs_beside.then_some(EarlyAirs {
+                            airs: rest_keccak_airs,
+                            misnamed,
+                        }),
                         start,
                         sink,
                         ledger,
@@ -8316,17 +8788,70 @@ fn prove_streamed(
         for line in &stamps.head {
             eprintln!("{line}");
         }
+        if arrivals {
+            let (ops, at) = crate::tables::trace_builder::keccak_rnd_arrivals::take();
+            eprintln!(
+                "BLOCK KECCAK_RND ARRIVALS: tables of {} rows (24 an operation) · {ops} operations in the \
+                 windows · {} table(s) complete during the windows, at [{}] s since the prove began",
+                1usize << options.keccak_rnd_rows_log2,
+                at.len(),
+                at.iter()
+                    .map(|t| format!("{:.2}", t.duration_since(start).as_secs_f64()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         (stamps.execute, stamps.executor) =
             executed.map_err(|_| Error::Prover("the block's executor panicked".into()))??;
         // A thread's error names the cause; a commit that ran out of groups only
-        // says that it did.
-        let (windows_done, finished, streamed, window_stamps, finish_marks, rest_regen) =
-            built.map_err(|_| Error::Prover("the block's builder panicked".into()))??;
+        // says that it did. A builder that stopped because the layout thread
+        // stopped taking its tables names the layout's error, when it has one.
+        let built = built.map_err(|_| Error::Prover("the block's builder panicked".into()))?;
+        if let (Err(Error::Prover(message)), Ok(Err(cause))) = (&built, &laid)
+            && message.starts_with("the layout thread stopped")
+        {
+            return Err(Error::Prover(format!("{message}: {cause}")));
+        }
+        let (windows_done, finished, streamed, window_stamps, finish_marks, rest_regen) = built?;
         stamps.windows = window_stamps;
         stamps.build_marks = finish_marks;
         stamps.producer = waits.stamps();
         let laid =
             laid.map_err(|_| Error::Prover("the block's layout thread panicked".into()))??;
+        if stream_keccak_rnd {
+            // Where the streamed KECCAK_RND tables went: each group's count.
+            let mut groups: Vec<(usize, usize)> = Vec::new();
+            for &(table, _, air) in &laid.streamed_air {
+                if table != StreamTable::KeccakRnd {
+                    continue;
+                }
+                let g = laid
+                    .groups
+                    .iter()
+                    .position(|g| g.contains(&(air as u32)))
+                    .unwrap_or(usize::MAX);
+                match groups.last_mut() {
+                    Some((last, n)) if *last == g => *n += 1,
+                    _ => groups.push((g, 1)),
+                }
+            }
+            eprintln!(
+                "BLOCK KECCAK_RND STREAMED: {} table(s) handed out during the windows of {} \
+                 · records {} · group:tables [{}]",
+                groups.iter().map(|&(_, n)| n).sum::<usize>(),
+                laid.table_counts.keccak_rnd,
+                if card_fill.keccak_rnd && options.pack_finished {
+                    "on (the card fills them)"
+                } else {
+                    "off (laid out on the host)"
+                },
+                groups
+                    .iter()
+                    .map(|(g, n)| format!("{g}:{n}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
         let block = match block {
             Ok(block) => block,
             Err(drained) => {
@@ -11307,6 +11832,7 @@ mod packer_tests {
                 blocked: 0.0,
                 ledger: None,
                 open_bytes: 0,
+                own: None,
             };
             for (index, &ops) in heights.iter().enumerate() {
                 let ops: Vec<LtOperation> = (0..ops as u64)
@@ -11926,5 +12452,372 @@ mod records_layout_tests {
                 "KECCAK_RC, {wrong} declared: {refused:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rest_airs_beside_tests {
+    use super::{AirRef, keccak_rnd_range, parse_rest_airs_beside, same_air};
+    use crate::tables::keccak_rnd::KeccakRndForm;
+    use crate::test_utils::create_keccak_rnd_air_for;
+    use stark::proof::options::ProofOptions;
+
+    /// The streamed KECCAK_RND knob: the default unset or empty (`None`);
+    /// asked for at `1`; off at `0` (the rollback); any other word refuses.
+    #[test]
+    fn the_stream_keccak_rnd_knob_is_on_by_default_and_refuses_other_words() {
+        for unset in [None, Some(""), Some(" ")] {
+            assert_eq!(
+                super::parse_stream_keccak_rnd(unset).expect("the default"),
+                None
+            );
+        }
+        assert_eq!(
+            super::parse_stream_keccak_rnd(Some("1")).expect("on"),
+            Some(true)
+        );
+        assert_eq!(
+            super::parse_stream_keccak_rnd(Some(" 0\n")).expect("off"),
+            Some(false)
+        );
+        for bad in ["yes", "2", "on", "off"] {
+            assert!(super::parse_stream_keccak_rnd(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// KECCAK_RND's own groups knob: on unset, empty or `1` (the default);
+    /// off at `0` (the rollback); any other word refuses.
+    #[test]
+    fn the_keccak_rnd_own_groups_knob_is_on_by_default_and_refuses_other_words() {
+        for on in [None, Some(""), Some("1"), Some(" 1\n")] {
+            assert!(super::parse_own_keccak_rnd_groups(on).expect("a word it takes"));
+        }
+        assert!(!super::parse_own_keccak_rnd_groups(Some("0")).expect("off"));
+        for bad in ["yes", "2", "on"] {
+            assert!(
+                super::parse_own_keccak_rnd_groups(Some(bad)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// The arrivals measurement's knob: off unset, empty or `0`; on at `1`;
+    /// any other word refuses.
+    #[test]
+    fn the_arrivals_knob_is_off_by_default_and_refuses_other_words() {
+        for off in [None, Some(""), Some("0")] {
+            assert!(!super::parse_keccak_rnd_arrivals(off).expect("a word it takes"));
+        }
+        assert!(super::parse_keccak_rnd_arrivals(Some("1")).expect("on"));
+        assert!(super::parse_keccak_rnd_arrivals(Some("yes")).is_err());
+    }
+
+    /// The knob: on unset, empty or `1`; off at `0` (the rollback); any other
+    /// word refuses.
+    #[test]
+    fn the_rest_airs_knob_is_on_by_default_and_refuses_other_words() {
+        for on in [None, Some(""), Some("1"), Some(" 1 ")] {
+            assert!(
+                parse_rest_airs_beside(on).expect("a word it takes"),
+                "{on:?}"
+            );
+        }
+        assert!(!parse_rest_airs_beside(Some("0")).expect("off"));
+        assert!(!parse_rest_airs_beside(Some(" 0\n")).expect("off"));
+        for bad in ["2", "on", "true", "yes"] {
+            assert!(parse_rest_airs_beside(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// ★ The early KECCAK_RND AIRs, built as the streamed rest builds them,
+    /// are the run's set's at KECCAK_RND's places under either form, and
+    /// [`same_air`] refuses another name, another form, or another table's
+    /// AIR.
+    #[test]
+    fn the_early_keccak_rnd_airs_are_the_run_sets() {
+        let opts = ProofOptions::default_test_options();
+        let elf = crate::test_utils::asm_elf_bytes("test_keccak_multi");
+        let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+        let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+            &program,
+            &[],
+            0,
+            1 << 20,
+        )
+        .expect("pages");
+        let counts = crate::TableCounts {
+            cpu: 1,
+            lt: 1,
+            memw: 1,
+            memw_aligned: 1,
+            load: 1,
+            mul: 1,
+            dvrm: 1,
+            shift: 1,
+            branch: 1,
+            memw_register: 1,
+            eq: 1,
+            bytewise: 1,
+            store: 1,
+            cpu32: 1,
+            keccak: 1,
+            keccak_rnd: 3,
+            ecsm: 1,
+            ecdas: 1,
+            hint: 1,
+            copy: 2,
+            blake3: 1,
+            is_wh: 1,
+            ecrec: 1,
+        };
+        let inputs =
+            crate::BlockAirInputs::new(&opts, &program, vec![1 << 4], &[]).expect("the AIR inputs");
+        let range = keccak_rnd_range(&counts).expect("KECCAK_RND's range");
+        assert_eq!(range.len(), counts.keccak_rnd);
+        for form in [KeccakRndForm::Lean, KeccakRndForm::Full] {
+            let airs = crate::block_airs(
+                &program,
+                &opts,
+                &pages,
+                &counts,
+                &inputs,
+                form,
+                crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
+                crate::tables::register::RegisterFormat::InRow,
+            );
+            let refs = airs.air_refs();
+            let early = |i: usize, form: KeccakRndForm| {
+                Box::new(
+                    create_keccak_rnd_air_for(&opts, form).with_name(&format!("KECCAK_RND[{i}]")),
+                ) as crate::VmAir
+            };
+            for (i, position) in range.clone().enumerate() {
+                let own = early(i, form);
+                same_air(own.as_ref(), refs[position])
+                    .unwrap_or_else(|e| panic!("{form:?} KECCAK_RND[{i}]: {e:?}"));
+                // Named for another table, or of the other form: refused.
+                let misnamed = early(i + 1, form);
+                assert!(same_air(misnamed.as_ref(), refs[position]).is_err());
+                let other = match form {
+                    KeccakRndForm::Lean => KeccakRndForm::Full,
+                    KeccakRndForm::Full => KeccakRndForm::Lean,
+                };
+                assert!(
+                    same_air(early(i, other).as_ref(), refs[position]).is_err(),
+                    "{form:?}: the other form's AIR at {position}"
+                );
+            }
+            // Another table's AIR at a KECCAK_RND place.
+            let first: AirRef<'_> = refs[0];
+            assert!(same_air(first, refs[range.start]).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod rest_airs_probe {
+    use super::StreamAirs;
+    use crate::tables::gpack::TraceForm;
+    use crate::tables::trace_builder::StreamTable;
+    use std::time::Instant;
+
+    /// An instrument, never a gate: the run's AIR set for a large block's
+    /// table counts, built as the streamed rest builds it (the streamed
+    /// chunks' AIRs first), timed step by step; then each family's
+    /// constructors alone under options no AIR was built with yet.
+    /// `PROBE_ELF` names the guest.
+    #[test]
+    #[ignore = "an instrument: PROBE_ELF names the guest"]
+    fn rest_airs_build_seconds() {
+        use crate::tables::fused_memory::MemoryFormat;
+        use crate::tables::keccak_rnd::KeccakRndForm;
+        use crate::tables::memw_aligned::MemwAlignedOrder;
+        use crate::tables::register::RegisterFormat;
+        let path = std::env::var("PROBE_ELF").expect("PROBE_ELF");
+        let bytes = std::fs::read(path).expect("the guest");
+        let program = executor::elf::Elf::load(&bytes).expect("the ELF loads");
+        let opts = crate::lfm::proof::block_base_options();
+        let cpu_rows = 1usize << 21;
+        let mut heights = vec![cpu_rows; 116];
+        heights.push(1 << 20);
+        let mut pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+            &program,
+            &[],
+            0,
+            1 << 20,
+        )
+        .expect("pages");
+        let mut base = 0x4000_0000u64;
+        while pages.len() < 351 {
+            pages.push(crate::tables::page::PageConfig::zero_init(base));
+            base += 1 << 18;
+        }
+        let counts = crate::TableCounts {
+            cpu: heights.len(),
+            lt: 7,
+            memw: 0,
+            memw_aligned: 0,
+            load: 0,
+            mul: 2,
+            dvrm: 1,
+            shift: 9,
+            branch: 11,
+            memw_register: 2,
+            eq: 9,
+            bytewise: 7,
+            store: 0,
+            cpu32: 1,
+            keccak: 2,
+            keccak_rnd: 66,
+            ecsm: 0,
+            hint: 0,
+            ecdas: 4,
+            copy: 8,
+            blake3: 0,
+            is_wh: 0,
+            ecrec: 1,
+        };
+        let words = [23, 17, 7, 2, 3, 2, 9];
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+        // The streamed chunks' AIRs, as phase A builds them before the rest.
+        let t = Instant::now();
+        let stream = StreamAirs::new(
+            &opts,
+            TraceForm::Narrow,
+            cpu_rows,
+            KeccakRndForm::Lean,
+            MemwAlignedOrder::Limbs,
+            RegisterFormat::InRow,
+        );
+        for i in 0..116 {
+            stream
+                .of_chunk(StreamTable::Cpu, i, cpu_rows)
+                .expect("a CPU chunk's AIR");
+        }
+        eprintln!("PROBE stream AIRs {:.1} ms", ms(t));
+        // The rest's AIR set, step by step as `block_airs` and the streamed
+        // rest build it.
+        let t0 = Instant::now();
+        let t = Instant::now();
+        let inputs = crate::BlockAirInputs::new(&opts, &program, heights.clone(), &[])
+            .expect("the AIR inputs");
+        let inputs_ms = ms(t);
+        let t = Instant::now();
+        let mut airs = crate::block_airs(
+            &program,
+            &opts,
+            &pages,
+            &counts,
+            &inputs,
+            KeccakRndForm::Lean,
+            MemwAlignedOrder::Limbs,
+            RegisterFormat::InRow,
+        );
+        let block_ms = ms(t);
+        let t = Instant::now();
+        airs.with_fused_memory(&opts, [0, 0]);
+        airs.with_word_memory(&opts, words, &pages)
+            .expect("the word tables");
+        let words_ms = ms(t);
+        let t = Instant::now();
+        let refs = airs.air_refs();
+        let refs_ms = ms(t);
+        eprintln!(
+            "PROBE rest AIR set {:.1} ms: inputs {inputs_ms:.1} · block_airs {block_ms:.1} · \
+             words {words_ms:.1} · refs {refs_ms:.1} · {} AIRs",
+            ms(t0),
+            refs.len()
+        );
+        // Each family alone, under options whose cache keys are all new.
+        let mut cold = opts.clone();
+        cold.grinding_factor = cold.grinding_factor.wrapping_add(1);
+        let o = &cold;
+        let full = crate::tables::cpu::TIMESTAMP_STRIDE * cpu_rows as u64;
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            let t = Instant::now();
+            f();
+            eprintln!("PROBE cold {label} {:.1} ms", ms(t));
+        };
+        use crate::test_utils::*;
+        time("inputs (register files)", &mut || {
+            let _ = crate::BlockAirInputs::new(o, &program, heights.clone(), &[]);
+        });
+        time("decode instructions", &mut || {
+            let _ = crate::tables::decode::instructions_from_elf(&program);
+        });
+        time("zero page commitment", &mut || {
+            let _ = crate::tables::page::zero_init_preprocessed_commitment(o);
+        });
+        time("117 CPU (split)", &mut || {
+            for i in 0..117u64 {
+                let _ = create_cpu_air(o, i * full);
+            }
+        });
+        time("117 CPU (in-row)", &mut || {
+            for i in 0..117u64 {
+                let _ = create_cpu_air_inrow(o, i * full);
+            }
+        });
+        time("117 CPU (in-row) again", &mut || {
+            for i in 0..117u64 {
+                let _ = create_cpu_air_inrow(o, i * full);
+            }
+        });
+        time("66 KECCAK_RND full", &mut || {
+            for _ in 0..66 {
+                let _ = create_keccak_rnd_air_for(o, KeccakRndForm::Full);
+            }
+        });
+        time("66 KECCAK_RND lean", &mut || {
+            for _ in 0..66 {
+                let _ = create_keccak_rnd_air_for(o, KeccakRndForm::Lean);
+            }
+        });
+        time("351 PAGE", &mut || {
+            for p in &pages {
+                let _ = create_page_air(o, p.page_base);
+            }
+        });
+        time("351 PAGE_W", &mut || {
+            for p in &pages {
+                let _ = create_page_w_air(o, p).expect("PAGE_W");
+            }
+        });
+        time("351 PAGE_W again", &mut || {
+            for p in &pages {
+                let _ = create_page_w_air(o, p).expect("PAGE_W");
+            }
+        });
+        time("8 COPY + 8 COPY_W", &mut || {
+            for _ in 0..8 {
+                let _ = create_copy_air(o);
+                let _ = create_copy_w_air(o);
+            }
+        });
+        time("2 KECCAK + 2 KECCAK_W", &mut || {
+            for _ in 0..2 {
+                let _ = create_keccak_air(o);
+                let _ = create_keccak_w_air(o);
+            }
+        });
+        time("4 ECDAS + ECREC + ECREC_W", &mut || {
+            for _ in 0..4 {
+                let _ = create_ecdas_air(o);
+            }
+            let _ = create_ecrec_air(o);
+            let _ = create_ecrec_w_air(o);
+        });
+        time("the word families (64)", &mut || {
+            for _ in 0..9 {
+                let _ = create_mem_load8_air(o);
+                let _ = create_mem_store8_air(o);
+                let _ = create_mem_loadw_air(o);
+                let _ = create_mem_storew_air(o);
+                let _ = create_mem_load2w_air(o);
+                let _ = create_mem_store2w_air(o);
+                let _ = create_memw_w_air(o);
+            }
+        });
+        let _ = MemoryFormat::Words;
     }
 }

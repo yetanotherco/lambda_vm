@@ -874,6 +874,22 @@ impl<'a> WindowedTraceBuilder<'a> {
         Ok(self)
     }
 
+    /// With [`Self::keccak_rnd_chunks`]: each KECCAK_RND chunk handed out
+    /// during the windows holds the keccak operations its rows come from
+    /// (`keccak_rnd::KeccakRndRecords`, about 208 bytes an op), for the card to
+    /// fill its columns as its group uploads it, instead of columns built on
+    /// the layout's thread. The words are the same; such a chunk is never
+    /// dropped.
+    pub fn stream_keccak_rnd_records(mut self) -> Result<Self, Error> {
+        if self.emitted.keccak_rnd_rows == 0 {
+            return Err(Error::Prover(
+                "KECCAK_RND's streamed chunks as records need KECCAK_RND cut into chunks".into(),
+            ));
+        }
+        self.emitted.keccak_rnd_records = true;
+        Ok(self)
+    }
+
     /// `finish` builds KECCAK_RND as tables of `rows` rows — the tables the
     /// block's split makes of the whole one, each built from the ops that reach
     /// it — instead of one table, without handing any out during the windows
@@ -1063,6 +1079,8 @@ impl<'a> WindowedTraceBuilder<'a> {
     #[cfg(test)]
     pub(crate) fn card_fill_records_fault(mut self, rows: usize) -> Self {
         self.card_fill_fault = rows;
+        // The streamed chunks' records too ([`Self::stream_keccak_rnd_records`]).
+        self.emitted.card_fill_fault = rows;
         self
     }
 
@@ -2451,6 +2469,7 @@ impl Accumulator<'_> {
     /// lists now complete. Windows must come in run order.
     pub fn absorb(&mut self, mut window: WalkedWindow) -> Vec<ChunkJob> {
         let t = std::time::Instant::now();
+        keccak_rnd_arrivals::note(window.walk.keccak_ops.len());
         if self.stream_memw_lt {
             let walk = &mut window.walk;
             walk.lt_ops
@@ -2754,6 +2773,8 @@ fn chunk_jobs(
                     ops: gather(windows, list_keccak, first..end),
                     skip: index * rows - first * 24,
                     rows,
+                    records: e.keccak_rnd_records,
+                    fault: records_fault(e),
                 },
             });
             e.keccak_rnd += 1;
@@ -4396,6 +4417,8 @@ fn tail_jobs(
                     ops,
                     skip: index * rows - first * 24,
                     rows,
+                    records: e.keccak_rnd_records,
+                    fault: records_fault(e),
                 },
             });
             e.keccak_rnd += 1;
@@ -4637,6 +4660,17 @@ fn concatenate(
     (cpu, walk)
 }
 
+/// The rows a streamed KECCAK_RND chunk's records start late by: a test's
+/// fault ([`StreamSkip::card_fill_fault`]), 0 otherwise.
+fn records_fault(e: &StreamSkip) -> usize {
+    let _ = e;
+    #[cfg(test)]
+    let fault = e.card_fill_fault;
+    #[cfg(not(test))]
+    let fault = 0;
+    fault
+}
+
 /// A completed chunk not generated yet: which chunk it is, and its ops.
 /// [`generate`](Self::generate) builds the table a whole-run build puts in that
 /// slot, with the same function.
@@ -4679,6 +4713,10 @@ enum ChunkOps {
         ops: Vec<super::keccak::KeccakOperation>,
         skip: usize,
         rows: usize,
+        /// Held as its records ([`StreamSkip::keccak_rnd_records`]), the
+        /// first starting `fault` rows late (a test's fault, 0 otherwise).
+        records: bool,
+        fault: usize,
     },
     MemLoad(Segments<MemLoadRow>),
     MemStore(Segments<MemStoreRow>),
@@ -4867,7 +4905,34 @@ impl ChunkJob {
             ChunkOps::Lt(ops) => lt::generate_lt_trace_segments_as(&ops.slices(), form),
             ChunkOps::Shift(ops) => shift::generate_shift_trace_segments_as(&ops.slices(), form),
             ChunkOps::Store(ops) => store::generate_store_trace_as(&ops, form),
-            ChunkOps::KeccakRnd { ops, skip, rows } => {
+            ChunkOps::KeccakRnd {
+                ops,
+                skip,
+                rows,
+                records,
+                fault,
+            } => {
+                // Held as its records: the card fills its columns from them.
+                let held = records
+                    .then(|| {
+                        keccak_rnd::KeccakRndRecords::new(
+                            ops.iter().map(|op| multilinear::records::KeccakRndOp {
+                                timestamp: op.timestamp,
+                                input: op.input,
+                            }),
+                            skip + fault,
+                            rows,
+                        )
+                        .into_trace()
+                    })
+                    .flatten();
+                if let Some(table) = held {
+                    return StreamedChunk {
+                        table: self.table,
+                        index: self.index,
+                        trace: table,
+                    };
+                }
                 let ops: Vec<keccak_rnd::KeccakRoundOperation> = ops
                     .iter()
                     .map(|op| keccak_rnd::KeccakRoundOperation {
@@ -5000,7 +5065,10 @@ impl ChunkJob {
     pub fn is_records(&self) -> bool {
         matches!(
             self.ops,
-            ChunkOps::CpuRecords { .. } | ChunkOps::MemwRegisterRecords(_) | ChunkOps::Rows(_)
+            ChunkOps::CpuRecords { .. }
+                | ChunkOps::MemwRegisterRecords(_)
+                | ChunkOps::Rows(_)
+                | ChunkOps::KeccakRnd { records: true, .. }
         )
     }
 }
@@ -5659,5 +5727,67 @@ mod block_tests {
         assert_eq!(name, "ecsm");
         assert_eq!(bytes, rest.ecsm_ops.heap_bytes() + steps);
         assert_eq!(largest, rest.ecsm_ops.largest_bytes().max(steps));
+    }
+}
+
+/// A measurement, never a byte of the proof: when each KECCAK_RND table of the
+/// run's cut (`rows` rows, 24 an operation) has all its operations, as the
+/// accumulator takes the windows in run order. Armed by the block's prove
+/// under `LAMBDA_VM_KECCAK_RND_ARRIVALS=1`; off, [`note`] is one relaxed load.
+pub(crate) mod keccak_rnd_arrivals {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use std::time::Instant;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    /// The tables' rows, the operations seen, and each complete table's stamp.
+    static STATE: Mutex<(usize, usize, Vec<Instant>)> = Mutex::new((1, 0, Vec::new()));
+
+    /// The tables of `rows` rows that `ops` operations fill completely.
+    pub(crate) fn complete(rows: usize, ops: usize) -> usize {
+        ops.saturating_mul(24) / rows.max(1)
+    }
+
+    /// Start a run's record: tables of `rows` rows, none complete yet.
+    pub(crate) fn arm(rows: usize) {
+        *STATE.lock().unwrap_or_else(|e| e.into_inner()) = (rows.max(1), 0, Vec::new());
+        ON.store(true, Relaxed);
+    }
+
+    /// A window's `ops` KECCAK operations, taken in run order: each table they
+    /// complete is stamped now.
+    pub(crate) fn note(ops: usize) {
+        if !ON.load(Relaxed) || ops == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let (rows, seen, at) = &mut *state;
+        *seen += ops;
+        let done = complete(*rows, *seen);
+        at.resize(done.max(at.len()), now);
+    }
+
+    /// Stop recording; the operations seen and each complete table's stamp.
+    pub(crate) fn take() -> (usize, Vec<Instant>) {
+        ON.store(false, Relaxed);
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        (state.1, std::mem::take(&mut state.2))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// A table is complete once its rows are covered: 24 rows an
+        /// operation, so a table of 48 rows takes two and one of 2^16 rows
+        /// 2,731 (its last operation's rows run into the next table).
+        #[test]
+        fn a_table_is_complete_when_its_operations_are_in() {
+            assert_eq!(super::complete(48, 1), 0);
+            assert_eq!(super::complete(48, 2), 1);
+            assert_eq!(super::complete(48, 7), 3);
+            assert_eq!(super::complete(1 << 16, 2730), 0);
+            assert_eq!(super::complete(1 << 16, 2731), 1);
+            assert_eq!(super::complete(1 << 16, 5462), 2);
+        }
     }
 }

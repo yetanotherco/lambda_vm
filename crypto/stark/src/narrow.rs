@@ -376,6 +376,49 @@ pub struct NarrowWriter {
     data: Vec<u8>,
 }
 
+/// Rows `[first_row, first_row + rows)` of a [`NarrowWriter`], writable on their
+/// own: one part of [`NarrowWriter::split_rows`]. Rows are the writer's own
+/// indices; a word is stored as [`NarrowWriter::set`] stores it, and its bits
+/// are kept in this part's OR until [`NarrowWriter::absorb`] takes them.
+pub struct NarrowRows<'a> {
+    first_row: usize,
+    rows: usize,
+    columns: Vec<(&'a mut [u8], usize)>,
+    seen: Vec<u64>,
+}
+
+impl NarrowRows<'_> {
+    /// The writer's rows this part holds.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.first_row..self.first_row + self.rows
+    }
+
+    /// Write `word` into `row` (a row of this part, by the writer's index) of
+    /// column `col`, as [`NarrowWriter::set`] does.
+    #[inline]
+    pub fn set(&mut self, row: usize, col: usize, word: u64) {
+        debug_assert!(
+            self.range().contains(&row),
+            "NarrowRows: row {row} outside {:?}",
+            self.range()
+        );
+        self.seen[col] |= word;
+        let (data, width) = &mut self.columns[col];
+        let at = (row - self.first_row) * *width;
+        match *width {
+            1 => data[at] = word as u8,
+            2 => data[at..at + 2].copy_from_slice(&(word as u16).to_le_bytes()),
+            4 => data[at..at + 4].copy_from_slice(&(word as u32).to_le_bytes()),
+            _ => data[at..at + 8].copy_from_slice(&word.to_le_bytes()),
+        }
+    }
+
+    /// This part's OR of the words it wrote, a column each.
+    pub fn into_seen(self) -> Vec<u64> {
+        self.seen
+    }
+}
+
 /// A [`NarrowWriter`] column: where it starts in the data, its width, and the
 /// OR of every word written to it.
 #[derive(Clone, Copy)]
@@ -441,6 +484,57 @@ impl NarrowWriter {
             2 => self.data[at..at + 2].copy_from_slice(&(word as u16).to_le_bytes()),
             4 => self.data[at..at + 4].copy_from_slice(&(word as u32).to_le_bytes()),
             _ => self.data[at..at + 8].copy_from_slice(&word.to_le_bytes()),
+        }
+    }
+
+    /// The writer cut into the row ranges `[bounds[i], bounds[i + 1])`, each
+    /// writable on its own (a fill split by rows): each part holds its rows of
+    /// every column and its own OR of the words it writes, which
+    /// [`Self::absorb`] takes back once the parts are done. `bounds` rises from
+    /// 0 to the rows; a bound past the rows is taken as the rows.
+    pub fn split_rows(&mut self, bounds: &[usize]) -> Vec<NarrowRows<'_>> {
+        let rows = self.rows;
+        let starts: Vec<usize> = {
+            let mut at = bounds.first().copied().unwrap_or(0).min(rows);
+            let mut out = vec![at];
+            for &end in bounds.iter().skip(1) {
+                at = end.clamp(at, rows);
+                out.push(at);
+            }
+            out
+        };
+        let mut parts: Vec<NarrowRows<'_>> = starts
+            .windows(2)
+            .map(|w| NarrowRows {
+                first_row: w[0],
+                rows: w[1] - w[0],
+                columns: Vec::with_capacity(self.columns.len()),
+                seen: vec![0; self.columns.len()],
+            })
+            .collect();
+        // Columns lie one after another from offset 0 ([`Self::new`]): cut
+        // each off the front, then each column at the parts' rows.
+        let mut rest: &mut [u8] = &mut self.data;
+        let first = starts.first().copied().unwrap_or(0);
+        for column in &self.columns {
+            let (mut col, tail) = std::mem::take(&mut rest).split_at_mut(rows * column.width);
+            rest = tail;
+            col = &mut col[first * column.width..];
+            for part in &mut parts {
+                let (piece, after) =
+                    std::mem::take(&mut col).split_at_mut(part.rows * column.width);
+                part.columns.push((piece, column.width));
+                col = after;
+            }
+        }
+        parts
+    }
+
+    /// Take a part's OR of its words ([`NarrowRows::into_seen`]) into the
+    /// writer's, as if this writer had written them.
+    pub fn absorb(&mut self, seen: &[u64]) {
+        for (column, &s) in self.columns.iter_mut().zip(seen) {
+            column.seen |= s;
         }
     }
 
@@ -801,6 +895,81 @@ mod tests {
         assert_eq!(missed.as_ref().err(), Some(&exact));
         let again = write(&words, cols, &missed.unwrap_err(), true);
         assert_eq!(again.finish().ok(), Some(whole));
+    }
+
+    /// `words` written into a writer at `widths` by the row ranges `bounds`,
+    /// each part on its own, then each part's OR absorbed (all of them, or all
+    /// but `drop_part`'s).
+    fn write_split(
+        words: &[u64],
+        cols: usize,
+        widths: &[u8],
+        bounds: &[usize],
+        drop_part: Option<usize>,
+    ) -> NarrowWriter {
+        let rows = words.len() / cols;
+        let mut w = NarrowWriter::new(rows, widths);
+        let seen: Vec<Vec<u64>> = {
+            let mut parts = w.split_rows(bounds);
+            // Last part first: no part may lean on another's bytes.
+            for part in parts.iter_mut().rev() {
+                for r in part.range() {
+                    for c in 0..cols {
+                        if words[r * cols + c] != 0 {
+                            part.set(r, c, words[r * cols + c]);
+                        }
+                    }
+                }
+            }
+            parts.into_iter().map(NarrowRows::into_seen).collect()
+        };
+        for (p, s) in seen.iter().enumerate() {
+            if Some(p) != drop_part {
+                w.absorb(s);
+            }
+        }
+        w
+    }
+
+    /// ★ Written by row ranges — parts of unequal rows, one part, a part of no
+    /// rows, at the widths the columns need, at more bytes, and too narrow —
+    /// the writer finishes to the bytes of the same words written in one pass:
+    /// the parts' ORs, absorbed, are the one-pass OR. Leaving one part's OR
+    /// out narrows a column it alone set the top of, and the bytes change.
+    #[test]
+    fn a_trace_written_by_row_ranges_is_the_trace_written_in_one_pass() {
+        let rows = 3 * PACK_BLOCK_ROWS + 5;
+        let (words, cols) = words_for_the_writer(rows, rows - 7);
+        let whole = NarrowMain::pack(&words, cols);
+        let exact = whole.widths().to_vec();
+        let wide = vec![8u8; cols];
+        let mid = rows / 2;
+        let splits: [Vec<usize>; 5] = [
+            vec![0, rows],
+            vec![0, 1, rows],
+            vec![0, mid, mid, rows],
+            vec![0, 17, mid, mid + 3, rows - 1, rows],
+            vec![0, rows / 3, 2 * rows / 3, rows],
+        ];
+        for bounds in &splits {
+            for widths in [&exact, &wide] {
+                let split = write_split(&words, cols, widths, bounds, None);
+                assert_eq!(split.needed_widths(), exact, "{bounds:?}");
+                assert_eq!(
+                    split.finish().ok(),
+                    Some(whole.clone()),
+                    "{bounds:?} at {widths:?}"
+                );
+            }
+            let missed = write_split(&words, cols, &[1; 9], bounds, None).finish();
+            assert_eq!(missed.as_ref().err(), Some(&exact), "{bounds:?}");
+        }
+        // The row holding every column's top (`written / 2`) lies in the
+        // middle part of a three-way split: without its OR the columns narrow.
+        let bounds = [0, rows / 3, 2 * rows / 3, rows];
+        let dropped = write_split(&words, cols, &exact, &bounds, Some(1));
+        assert_ne!(dropped.needed_widths(), exact);
+        assert_ne!(dropped.finish().ok(), Some(whole));
     }
 
     /// A widths list that is not 1, 2, 4 or 8 is rounded up; a trace never

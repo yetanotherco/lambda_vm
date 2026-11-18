@@ -21,7 +21,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use multilinear::narrow::NarrowColumns;
-use stark::narrow::NarrowWriter;
+use stark::narrow::{NarrowRows, NarrowWriter};
+use stark::table::TableRowsMut;
 use stark::trace::TraceTable;
 
 use super::types::{FE, GoldilocksExtension, GoldilocksField, VmTable};
@@ -88,6 +89,129 @@ impl VmTable for NarrowWriter {
     fn set_fe(&mut self, row: usize, col: usize, value: FE) {
         self.set(row, col, *value.value());
     }
+}
+
+/// A part of a 64-bit table split by rows ([`generate_main_rows!`]).
+impl VmTable for TableRowsMut<'_, GoldilocksField> {
+    #[inline]
+    fn set_fe(&mut self, row: usize, col: usize, value: FE) {
+        self.set(row, col, value);
+    }
+}
+
+/// A part of a packed writer split by rows ([`generate_main_rows!`]).
+impl VmTable for NarrowRows<'_> {
+    #[inline]
+    fn set_fe(&mut self, row: usize, col: usize, value: FE) {
+        self.set(row, col, *value.value());
+    }
+}
+
+/// The most parts a split fill cuts a table into ([`row_bounds_at`]).
+pub(crate) const SPLIT_MAX_PARTS: usize = 8;
+
+/// The row ranges a fill of `rows` rows is split into, `[b[i], b[i + 1])`: one
+/// range when the table has fewer than two parts' rows, else up to
+/// `max_parts` near-equal ranges of at least `min_rows` rows.
+pub(crate) fn row_bounds_at(rows: usize, min_rows: usize, max_parts: usize) -> Vec<usize> {
+    let min_rows = min_rows.max(1);
+    if rows < 2 * min_rows || max_parts < 2 {
+        return vec![0, rows];
+    }
+    let parts = (rows / min_rows).min(max_parts);
+    (0..=parts).map(|p| rows * p / parts).collect()
+}
+
+/// Fills [`generate_main_rows!`] ran as more than one part, since the process
+/// began (a measurement, and the tests' proof that a split happened).
+static SPLIT_FILLS: AtomicUsize = AtomicUsize::new(0);
+
+/// [`SPLIT_FILLS`].
+pub fn split_fills() -> usize {
+    SPLIT_FILLS.load(Relaxed)
+}
+
+#[doc(hidden)]
+pub fn note_split(parts: usize) {
+    if parts > 1 {
+        SPLIT_FILLS.fetch_add(1, Relaxed);
+    }
+}
+
+/// `bounds` made a cover of the rows `[0, rows)`: rising, from 0 to `rows`, so
+/// a split fill leaves no row unwritten whatever bounds it is handed.
+#[doc(hidden)]
+pub fn covering(bounds: &[usize], rows: usize) -> Vec<usize> {
+    let mut out = Vec::with_capacity(bounds.len() + 2);
+    out.push(0);
+    for &b in bounds {
+        let b = b.min(rows);
+        if b > *out.last().unwrap_or(&0) {
+            out.push(b);
+        }
+    }
+    if out.last() != Some(&rows) {
+        out.push(rows);
+    }
+    out
+}
+
+/// A part of a split fill: the rows it holds.
+#[doc(hidden)]
+pub trait RowPart: VmTable + Send {
+    fn rows(&self) -> std::ops::Range<usize>;
+}
+
+impl RowPart for TableRowsMut<'_, GoldilocksField> {
+    fn rows(&self) -> std::ops::Range<usize> {
+        self.range()
+    }
+}
+
+impl RowPart for NarrowRows<'_> {
+    fn rows(&self) -> std::ops::Range<usize> {
+        self.range()
+    }
+}
+
+/// Run `fill` on every part, each over its own rows: on the pool the caller
+/// runs on (never `install`), or in turn without `parallel`.
+#[doc(hidden)]
+pub fn run_parts<P: RowPart>(
+    parts: &mut [P],
+    fill: impl Fn(&mut P, std::ops::Range<usize>) + Sync,
+) {
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        parts.par_iter_mut().for_each(|part| {
+            let rows = part.rows();
+            fill(part, rows);
+        });
+    }
+    #[cfg(not(feature = "parallel"))]
+    for part in parts.iter_mut() {
+        let rows = part.rows();
+        fill(part, rows);
+    }
+}
+
+/// `segments`' items at the flat indices `range` (the segments one after
+/// another), each with its index: a split fill's operations.
+pub(crate) fn items_in<'s, T>(
+    segments: &'s [&'s [T]],
+    range: std::ops::Range<usize>,
+) -> impl Iterator<Item = (usize, &'s T)> + 's {
+    let mut base = 0usize;
+    segments.iter().flat_map(move |segment| {
+        let (start, end) = (base, base + segment.len());
+        base = end;
+        let (a, b) = (range.start.clamp(start, end), range.end.clamp(start, end));
+        segment[a - start..b - start]
+            .iter()
+            .enumerate()
+            .map(move |(i, item)| (a + i, item))
+    })
 }
 
 /// How [`generate_main!`] builds one trace.
@@ -266,3 +390,98 @@ macro_rules! generate_main {
     }};
 }
 pub(crate) use generate_main;
+
+/// [`generate_main!`] with the fill split by rows: `fill`, an expression over
+/// `$t: &mut impl VmTable` and `$range: Range<usize>` that writes every
+/// non-zero cell of the rows `$range` once (and no other row), runs once a
+/// range of `bounds` ([`row_bounds_at`]) on that range's part of the writer the
+/// [`Plan`] picks, the parts at once ([`run_parts`]). A packed writer takes
+/// back each part's OR of its words before it finishes, so the trace — its
+/// widths, its narrowing, a second pass when a word missed its column — is
+/// the trace [`generate_main!`] writes from the same cells, byte for byte.
+///
+/// ```ignore
+/// generate_main_rows!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, &bounds, |t, rows| fill(t, ops, rows))
+/// ```
+macro_rules! generate_main_rows {
+    ($form:expr, $hint:expr, $rows:expr, $cols:expr, $bounds:expr, |$t:ident, $range:ident| $fill:expr) => {{
+        use $crate::tables::gpack::{Plan, packed, run_parts, wide_trace, written};
+        let (rows, cols, hint): (usize, usize, &$crate::tables::gpack::WidthHint) =
+            ($rows, $cols, $hint);
+        let bounds = $crate::tables::gpack::covering(&$bounds, rows);
+        let bounds = bounds.as_slice();
+        $crate::tables::gpack::note_split(bounds.len() - 1);
+        let wide = |then_pack: bool| {
+            let mut trace = wide_trace(rows, cols);
+            {
+                let mut parts = trace.main_table.split_rows_mut(bounds);
+                run_parts(&mut parts, |$t, $range| $fill);
+            }
+            if then_pack {
+                packed(trace, hint)
+            } else {
+                trace
+            }
+        };
+        let write = |widths: &[u8], again: bool| {
+            let mut writer = ::stark::narrow::NarrowWriter::new(rows, widths);
+            let seen: Vec<Vec<u64>> = {
+                let mut parts = writer.split_rows(bounds);
+                run_parts(&mut parts, |$t, $range| $fill);
+                parts
+                    .into_iter()
+                    .map(::stark::narrow::NarrowRows::into_seen)
+                    .collect()
+            };
+            for part in &seen {
+                writer.absorb(part);
+            }
+            written(writer, hint, again)
+        };
+        match Plan::new($form, hint, cols) {
+            Plan::Wide => wide(false),
+            Plan::WideThenPack => wide(true),
+            Plan::Write(widths) => match write(&widths, false) {
+                Ok(trace) => trace,
+                Err(need) if need.len() == cols => match write(&need, true) {
+                    Ok(trace) => trace,
+                    // Not reached: every word fits the widths of every word.
+                    Err(_) => wide(true),
+                },
+                Err(_) => wide(true),
+            },
+        }
+    }};
+}
+pub(crate) use generate_main_rows;
+
+#[cfg(test)]
+mod split_bounds_tests {
+    use super::{SPLIT_MAX_PARTS, covering, row_bounds_at};
+
+    /// A table under two parts' rows stays one range; at parts of 2^16 rows a
+    /// 2^17-row table is two, a 2^20-row table eight, never more.
+    #[test]
+    fn the_production_bounds_split_only_tall_tables() {
+        let min = 1 << 16;
+        let bounds = |rows| row_bounds_at(rows, min, SPLIT_MAX_PARTS);
+        assert_eq!(bounds((1 << 17) - 1), vec![0, (1 << 17) - 1]);
+        assert_eq!(bounds(1 << 17), vec![0, 1 << 16, 1 << 17]);
+        let b = bounds(1 << 20);
+        assert_eq!(b.len(), SPLIT_MAX_PARTS + 1);
+        assert!(b.windows(2).all(|w| w[1] - w[0] >= min));
+        assert_eq!((b[0], *b.last().unwrap()), (0, 1 << 20));
+        assert_eq!(row_bounds_at(10, 3, 8), vec![0, 3, 6, 10]);
+        assert_eq!(row_bounds_at(10, 0, 1), vec![0, 10]);
+    }
+
+    /// Any bounds become a rising cover of `[0, rows)`: no row is left out.
+    #[test]
+    fn any_bounds_cover_every_row() {
+        assert_eq!(covering(&[], 5), vec![0, 5]);
+        assert_eq!(covering(&[0, 5], 5), vec![0, 5]);
+        assert_eq!(covering(&[2, 3], 5), vec![0, 2, 3, 5]);
+        assert_eq!(covering(&[0, 3, 3, 1, 9], 5), vec![0, 3, 5]);
+        assert_eq!(covering(&[0, 0], 0), vec![0]);
+    }
+}
