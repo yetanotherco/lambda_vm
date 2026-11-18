@@ -1128,12 +1128,25 @@ fn halves_bus_interactions() -> Vec<BusInteraction> {
 pub struct EcdasHalvesConstraints;
 
 impl EcdasHalvesConstraints {
-    /// The body. The top carry `C_31` is zero (`top_columns` `None`, the
-    /// constraints'); a test's mutant reads relation `r`'s from column
-    /// `first + r` instead (`Some(first)`), a column of its own.
-    pub(crate) fn eval_with<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    /// A test's mutant of the body: relation `r`'s top carry `C_31` read from
+    /// column `first + r`, a column past the table, instead of zero. Test
+    /// builds alone: the constraints ([`ConstraintSet::eval`]) take no top
+    /// carry.
+    #[cfg(test)]
+    pub(crate) fn eval_with_top_columns<
+        B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+    >(
         b: &mut B,
-        top_columns: Option<usize>,
+        first: usize,
+    ) {
+        Self::body(b, |b: &B, r| Some(b.main(0, first + r)));
+    }
+
+    /// The body, relation `r`'s top carry `C_31` read as `top(b, r)`: `None`
+    /// (zero, no column) in the constraints.
+    fn body<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &mut B,
+        top: impl Fn(&B, usize) -> Option<B::Expr>,
     ) {
         use halves_cols as h;
         for (i, col) in [h::MU, h::OP, h::NEXT_OP].into_iter().enumerate() {
@@ -1276,7 +1289,7 @@ impl EcdasHalvesConstraints {
                 let c_k = if k < HALVES_CARRIES {
                     Some(carry(b, k))
                 } else {
-                    top_columns.map(|first| b.main(0, first + r))
+                    top(b, r)
                 };
                 let mut root = match &c_k {
                     Some(c) => shift.clone() * c.clone() - s.clone(),
@@ -1300,7 +1313,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcdasHalvesConstrai
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
-        Self::eval_with(b, None);
+        Self::body(b, |_: &B, _| None);
     }
 }
 
