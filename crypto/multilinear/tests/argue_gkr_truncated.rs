@@ -426,3 +426,113 @@ fn a_kept_tree_the_card_declines_builds_todays() {
     assert_eq!(bytes, today.0, "the proof is today's");
     assert_eq!(tr.state(), today.2, "the transcript is today's");
 }
+
+/// The table's tree built on the host from its columns: each factor lifted
+/// (a shifted view a cyclic shift by its offset), the input layer
+/// `logup::input_layer` writes, every level by host folds — the reference a
+/// card ladder is held to.
+fn host_layers(t: &Table) -> Vec<multilinear::gkr::FractionLayer<Ext>> {
+    let rows = t.rows();
+    let factors: Vec<Mle<Ext>> = t
+        .kinds
+        .iter()
+        .map(|kind| {
+            let source = kind.source().expect("a committed column");
+            let column = t.columns[source.column].evals();
+            Mle::new(
+                (0..rows)
+                    .map(|r| column[(r + source.offset) % rows].to_extension::<Ext>())
+                    .collect(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let input = logup::input_layer(&t.interactions, &factors).expect("the input layer");
+    let tree = FractionTree::build_on_host(input).expect("the host tree");
+    (0..tree.num_layers())
+        .map(|i| tree.layer(i).clone())
+        .collect()
+}
+
+/// ★ The two-layer ladder over every table at once on the card — the tables'
+/// trees whole and kept without their padding, each two-layer step on the
+/// card's two-layer rounds, each odd table's last step on today's — proves
+/// the host reference's bytes, input claims and transcript (the host's
+/// layers, the host's relation), and the verifier takes it.
+///
+/// ```text
+/// cargo test --release -p multilinear --features cuda,parallel --test argue_gkr_truncated -- \
+///     the_two_layer_ladder_on_the_card_proves_the_host_references_bytes --exact --nocapture
+/// ```
+#[test]
+fn the_two_layer_ladder_on_the_card_proves_the_host_references_bytes() {
+    let _restore = serial();
+    let form = lockstep::GkrLadder::Double;
+    let tables = tables();
+    let host: Vec<Vec<multilinear::gkr::FractionLayer<Ext>>> =
+        tables.iter().map(host_layers).collect();
+    let heights: Vec<usize> = host.iter().map(|layers| layers.len() - 1).collect();
+    assert!(
+        heights.iter().any(|k| k % 2 == 0) && heights.iter().any(|k| k % 2 == 1),
+        "premise: heights of both parities, {heights:?}"
+    );
+    let refs: Vec<&[multilinear::gkr::FractionLayer<Ext>]> =
+        host.iter().map(|t| t.as_slice()).collect();
+    let mut tr = transcript();
+    let (want, want_claims) = lockstep::prove(&refs, form, &mut tr).expect("the host ladder");
+    let want_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&want)
+        .unwrap()
+        .to_vec();
+    let want_state = tr.state();
+    for setting in [InputReal::Off, InputReal::On] {
+        input_real::force_argue_input_real(Some(setting));
+        let trees: Vec<FractionTree<Ext>> = tables.iter().map(device_tree).collect();
+        for (n, (tree, layers)) in trees.iter().zip(&host).enumerate() {
+            assert!(
+                tree.device().is_some(),
+                "{setting:?}: table {n} on the card"
+            );
+            assert_eq!(
+                tree.output(),
+                (layers[0].p.evals()[0], layers[0].q.evals()[0]),
+                "{setting:?}: table {n}'s output is the host tree's"
+            );
+        }
+        let ladder: Vec<&dyn LadderTree<Ext>> =
+            trees.iter().map(|t| t as &dyn LadderTree<Ext>).collect();
+        let before = multilinear::gkr_gruen::gruen2_layers();
+        let mut tr = transcript();
+        let (proof, claims) =
+            lockstep::prove_trees(&ladder, form, &mut tr).expect("the card ladder");
+        let ran = multilinear::gkr_gruen::gruen2_layers() - before;
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof)
+            .unwrap()
+            .to_vec();
+        assert!(bytes == want_bytes, "{setting:?}: the ladder's bytes");
+        assert_eq!(
+            claims.len(),
+            want_claims.len(),
+            "{setting:?}: the input claims"
+        );
+        for (t, (got, want)) in claims.iter().zip(&want_claims).enumerate() {
+            assert!(
+                got.point == want.point && got.p == want.p && got.q == want.q,
+                "{setting:?}: tree {t}'s input claim"
+            );
+        }
+        assert_eq!(tr.state(), want_state, "{setting:?}: the transcript");
+        let outputs: Vec<(EE, EE)> = trees.iter().map(|t| t.output()).collect();
+        lockstep::verify(&proof, &outputs, &heights, form, &mut transcript())
+            .expect("the verifier takes it");
+        assert!(
+            ran > 0,
+            "{setting:?}: no step ran the card's two-layer rounds"
+        );
+        eprintln!(
+            "argue gkr truncated: two-layer ladder of {} trees ({setting:?}, heights {heights:?}): \
+             the host's bytes ({} bytes), {ran} card two-layer steps",
+            tables.len(),
+            bytes.len()
+        );
+    }
+}
