@@ -908,8 +908,14 @@ where
                     })
                 });
                 let tree = match on_card {
-                    Some(tree) => tree,
-                    None => Pending::Ready(host_built(t, interactions)?),
+                    Some(tree) => {
+                        split.trees_card += 1;
+                        tree
+                    }
+                    None => {
+                        split.trees_host += 1;
+                        Pending::Ready(host_built(t, interactions)?)
+                    }
                 };
                 split.trees += started.elapsed().as_secs_f64();
                 Ok(tree)
@@ -925,7 +931,10 @@ where
                 Pending::Ready(tree) => Ok(tree),
                 Pending::Queued(queued) => match queued.into_tree() {
                     Some(tree) => Ok(BinTree::Built(Box::new(tree))),
-                    None => host_built(t, &lists[i]),
+                    None => {
+                        split.trees_host_late += 1;
+                        host_built(t, &lists[i])
+                    }
                 },
             })
             .collect::<Result<_, MlError>>()?;
@@ -1204,14 +1213,18 @@ where
         );
         // The trees the ladders ran: one a table, or a cut table's chunks.
         eprintln!(
-            "BATCHED ARGUE TREES: tables {} · trees {} · cut {} · tree log2 cells {:.2}",
+            "BATCHED ARGUE TREES: tables {} · trees {} · cut {} · tree log2 cells {:.2} · built on the card \
+             {} · on the host {} (after a queued build {})",
             tables.len(),
             plan.trees(),
             plan.chunks.iter().filter(|c| c.count > 1).count(),
             (0..tables.len())
                 .map(|t| plan.chunks[t].count as f64 * (plan.tree_vars(t) as f64).exp2())
                 .sum::<f64>()
-                .log2()
+                .log2(),
+            split.trees_card - split.trees_host_late,
+            split.trees_host + split.trees_host_late,
+            split.trees_host_late
         );
     }
     Ok((
@@ -1230,6 +1243,12 @@ where
 #[derive(Default)]
 struct ArgueSplit {
     trees: f64,
+    /// Trees built on the card (queued or at once), and built on the host
+    /// because the card path declined them (`host_built`): at once, or after
+    /// a queued build could not be read.
+    trees_card: usize,
+    trees_host: usize,
+    trees_host_late: usize,
     ladders: f64,
     zc_setup: f64,
     zc_rounds: f64,
