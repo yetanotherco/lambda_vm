@@ -865,7 +865,7 @@ fn rta_one_run(
     let list = |xs: Vec<String>| xs.join(" ");
     println!(
         "RTA LEVEL1 LANDING: setup {:.3}s · front at {:.3}s (wave {:.3}s) · base end {:.3}s · arrivals {} · \
-         landed {} · bucketed waves {}",
+         landed {} · bucketed waves {} · public columns {} · host tree lean {}",
         landing.setup,
         landing.front.0,
         landing.front.1,
@@ -885,6 +885,8 @@ fn rta_one_run(
                 .collect()
         ),
         super::levels::bucket_waves(),
+        multilinear::logup::public_columns(),
+        multilinear::logup::host_tree_lean(),
     );
     if let Some(x) = &t.level1_exec {
         println!(

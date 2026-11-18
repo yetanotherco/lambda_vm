@@ -899,6 +899,7 @@ where
                 // still folds on a device. The same tree every way.
                 let started = std::time::Instant::now();
                 let mut resident_seen = None;
+                let mut public_tried = false;
                 let on_card = (multilinear::gpu::argue_no_lift()
                     && trace.device_factors().is_none())
                 .then(columns_tree)
@@ -909,7 +910,10 @@ where
                     // the columns it reads and its selectors
                     // (`LAMBDA_VM_ARGUE_PUBLIC_COLUMNS`).
                     (logup::public_columns() && trace.device_factors().is_none())
-                        .then(|| logup::resident_tree_with_public(interactions, trace))
+                        .then(|| {
+                            public_tried = true;
+                            logup::resident_tree_with_public(interactions, trace)
+                        })
                         .flatten()
                         .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
                 })
@@ -932,8 +936,12 @@ where
                     }
                     None => {
                         split.trees_host += 1;
-                        let why = match resident_seen {
-                            Some(false) => "no resident columns or factors for its table",
+                        let why = match (public_tried, resident_seen) {
+                            (true, _) => {
+                                "its public-columns card build was declined (no room, no resident \
+                                 columns, or a selector that is not base-valued)"
+                            }
+                            (false, Some(false)) => "no resident columns or factors for its table",
                             _ => "the card declined the build",
                         };
                         multilinear::gpu::note_gkr_tree_host_built(
