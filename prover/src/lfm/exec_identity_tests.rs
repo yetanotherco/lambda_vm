@@ -813,6 +813,57 @@ fn bucketed_waves_are_the_pieced_execution_in_any_landing_order() {
     }
 }
 
+/// ★ Bucketed waves run each level's share in the level's own order: wave by
+/// wave and level by level, the bucketed execution runs the very rows and
+/// instructions, in the very order, the filtering waves do — on cases whose
+/// waves pick several buckets at once (a landing that completes more than one
+/// set of groups) with their rows interleaved within a level, where an order
+/// a bucket at a time would differ.
+#[test]
+fn bucketed_waves_run_each_level_in_the_levels_own_order() {
+    use super::executor::wave_trace;
+    let (leaf, halves) = one_arena_case();
+    let leaf_pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    let mut runs: Vec<(&Case, Vec<super::executor::ArenaPiece>, Vec<usize>)> = Vec::new();
+    for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0]] {
+        runs.push((&leaf, leaf_pieces.clone(), order.to_vec()));
+    }
+    let cases = cases();
+    for case in &cases {
+        let pieces = pieces_of(case, 3);
+        let n = pieces.len();
+        runs.push((case, pieces.clone(), (0..n).rev().collect()));
+        runs.push((
+            case,
+            pieces,
+            (0..n).step_by(2).chain((1..n).step_by(2)).collect(),
+        ));
+    }
+    let reordered_before = wave_trace::reordered();
+    for (case, pieces, order) in &runs {
+        let (_, filtered) = wave_trace::record(|| pieced(case, pieces, order));
+        let (_, bucketed) = wave_trace::record(|| pieced_bucketed(case, pieces, order));
+        assert!(
+            filtered == bucketed,
+            "{}: {order:?}: the bucketed waves ran another order",
+            case.name
+        );
+    }
+    // The cases put two buckets' rows interleaved in one level's share at
+    // least once, so the order above is a check, not a coincidence.
+    assert!(
+        wave_trace::reordered() > reordered_before,
+        "no wave merged two buckets out of a level's order: the test sees nothing"
+    );
+}
+
 /// ★ The pieced execution's gate: one arena landing in pieces, in any order,
 /// gives the serial reference's witness word for word — on the leaf-shaped
 /// case in all six orders (its `HintOn` reads the first and the last piece)
