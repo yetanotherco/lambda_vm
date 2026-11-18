@@ -1196,23 +1196,26 @@ fn page_block_columns_are_the_verifiers_at_proof_level() {
 }
 
 /// ★ The dense arm under page runs: with every page that has initial data
-/// settled by the prepared opening (on this thread), `page_runs` proves and
-/// verifies at runs of 16 pages, and its opening settles the same tables (by
-/// name) with the same columns as with runs off.
+/// settled by the prepared opening on both sides (on this thread, so the
+/// prover is the built traces' prove, which derives its prepared tables on the
+/// calling thread: the streamed prove derives them on its layout thread, where
+/// this thread's switch is off), `page_runs` proves and verifies with runs off
+/// and at runs of 16 pages, and its opening settles the same tables (by name,
+/// a page of data among them) with the same columns at both.
 #[test]
 fn a_word_block_with_page_runs_holds_its_dense_pages() {
     block_whir::DENSE_PAGES_FORCED.with(|c| c.set(true));
     let checked = std::panic::catch_unwind(|| {
         let opts = ProofOptions::default_test_options();
+        let elf = asm_elf_bytes("page_runs");
         let mut settled = Vec::new();
         for run_log2 in [0u8, 4] {
             let words = format(MemoryFormat::Words).with_page_run(run_log2);
-            let (elf, proof) = page_runs_block(&words);
+            let mut built = word_build_with(&elf, &words, &two_pages_of_input());
+            let proof = prove_built(&elf, &mut built, &words).expect("the built traces prove");
             assert!(!proof.prepared.is_empty(), "a prepared opening");
-            assert!(matches!(
-                verify_block_whir(&proof, &elf, &opts, &words),
-                Ok(true)
-            ));
+            let said = verify_block_whir(&proof, &elf, &opts, &words);
+            assert!(matches!(said, Ok(true)), "at 2^{run_log2}: {said:?}");
             let frame =
                 block_whir::block_frame(proof.statement(), &elf, &opts, &words).expect("frames");
             let refs = frame.airs.air_refs();
@@ -1222,7 +1225,12 @@ fn a_word_block_with_page_runs_holds_its_dense_pages() {
                     .into_iter()
                     .map(|(t, columns)| (refs[t].name().to_string(), columns))
                     .collect();
-            assert!(names.len() > 1, "DECODE and a page");
+            assert!(
+                names
+                    .iter()
+                    .any(|(n, _)| n.starts_with(crate::tables::page_w::NAME_PREFIX)),
+                "at 2^{run_log2}: a page of data settled by the opening"
+            );
             settled.push(names);
         }
         assert!(settled[0] == settled[1], "the same tables settled");
