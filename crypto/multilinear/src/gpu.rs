@@ -1011,6 +1011,21 @@ pub fn reserve_budget() -> u64 {
     0
 }
 
+/// Moves the device ledger's budget to `bytes` and returns the one it
+/// replaces (`0`, and nothing moved, without a device). Promises already made
+/// stay made.
+#[cfg(feature = "cuda")]
+pub fn set_reserve_budget(bytes: u64) -> u64 {
+    math_cuda::device::backend()
+        .map(|be| be.set_vram_budget_bytes(bytes))
+        .unwrap_or(0)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn set_reserve_budget(_bytes: u64) -> u64 {
+    0
+}
+
 /// While it lives, this thread's device calls draw their streams from the
 /// background pool ([`math_cuda::stream_class`]), when one exists; nothing
 /// without a device. It belongs to the thread that took it.
