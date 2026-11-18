@@ -1455,9 +1455,10 @@ fn cmd_prove_block_base(
             cfg.format.b3_rounds
         );
         let (from_stacks, reencoded) = prover::block_whir::coset_counts();
+        let waits = prover::block_whir::coset_reencode_waits();
         eprintln!(
             "BLOCK BASE COSET OPENINGS: from the stacks {from_stacks} · re-encoded {reencoded} \
-             (round-0 openings of coset-ordered trees)"
+             (round-0 openings of coset-ordered trees) · waits for room {waits}"
         );
     }
     {

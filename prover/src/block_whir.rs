@@ -1168,6 +1168,13 @@ pub fn coset_counts() -> (u64, u64) {
     )
 }
 
+/// The pauses the re-encodes of [`coset_counts`] took waiting for the card's
+/// room (`multilinear::gpu::coset_reencode_waits`): 20 ms each, at most 99
+/// a re-encode before it is refused.
+pub fn coset_reencode_waits() -> u64 {
+    multilinear::gpu::coset_reencode_waits()
+}
+
 /// The host's memory target, against which live regeneration's `auto` rule
 /// arms ([`drop_wanted`]): `LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB`
 /// ([`memory_target_knob`]; its old name refuses the prove,
