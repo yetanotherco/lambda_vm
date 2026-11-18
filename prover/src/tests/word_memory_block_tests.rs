@@ -282,6 +282,7 @@ fn word_build_with(
         .map(|b| b.keccak_rnd_form(format.keccak_rnd))
         .map(|b| b.ecdas_form(format.ecdas))
         .and_then(|b| b.memory_format(format.memory))
+        .and_then(|b| b.page_run_log2(format.page_run_log2))
         .expect("the builder");
     let window = 1000;
     let body = logs.len() - 1;
@@ -1040,5 +1041,194 @@ fn a_word_block_with_streamed_word_families_states_the_finish_built_block() {
             streamed.word_memory.iter().any(|&n| n > 1),
             "{name}: a family cut into several tables"
         );
+    }
+}
+
+/// The private input of [`page_runs_block`]: two pages' worth.
+fn two_pages_of_input() -> Vec<u8> {
+    (0..(crate::tables::page::DEFAULT_PAGE_SIZE as u32 + 300))
+        .map(|i| (i * 7 + 3) as u8)
+        .collect()
+}
+
+/// `page_runs` (runs of zero pages from pages 64 and 81, two private-input
+/// pages) proved by the prove's own walk under `format`.
+fn page_runs_block(format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
+    let elf = asm_elf_bytes("page_runs");
+    let options = super::block_whir_tests::streamed(MaxRowsConfig::small(), 3, 9);
+    let (proof, _) = prove_block_whir_with(
+        &elf,
+        &two_pages_of_input(),
+        &ProofOptions::default_test_options(),
+        format,
+        &options,
+        &Deviations::default(),
+    )
+    .expect("the prove's own walk proves");
+    (elf, proof)
+}
+
+/// ★ Completeness under page runs: `page_runs` proves and verifies with runs
+/// off and at runs of 2 and 16 pages, by the prove's own walk and from the
+/// built traces; its page tables are the rule's cut of the verifier's pages,
+/// zero and private blocks among them under runs; each proof is refused at
+/// the other runs, whose cuts differ.
+#[test]
+fn a_word_block_with_page_runs_proves_and_verifies() {
+    use crate::tables::page_w::{self, PageTableKind};
+    let opts = ProofOptions::default_test_options();
+    let runs = [0u8, 1, 4];
+    let mut proofs = Vec::new();
+    for run_log2 in runs {
+        let words = format(MemoryFormat::Words).with_page_run(run_log2);
+        let (elf, proof) = page_runs_block(&words);
+        assert!(
+            matches!(verify_block_whir(&proof, &elf, &opts, &words), Ok(true)),
+            "at 2^{run_log2}"
+        );
+        assert_eq!(proof.num_private_input_pages, 2);
+        let frame =
+            block_whir::block_frame(proof.statement(), &elf, &opts, &words).expect("frames");
+        assert_eq!(
+            frame.page_tables,
+            page_w::page_tables(&frame.page_configs, run_log2).expect("cut")
+        );
+        let blocks = |kind| {
+            frame
+                .page_tables
+                .iter()
+                .filter(|t| t.kind == kind && t.pages() > 1)
+                .count()
+        };
+        if run_log2 == 0 {
+            assert_eq!(frame.page_tables.len(), frame.page_configs.len());
+        } else {
+            assert!(
+                blocks(PageTableKind::Zero) > 0,
+                "at 2^{run_log2}: a zero block"
+            );
+            assert_eq!(blocks(PageTableKind::Private), 1, "at 2^{run_log2}");
+        }
+        // From the built traces: the finish cut the pages as the format.
+        let mut built = word_build_with(&elf, &words, &two_pages_of_input());
+        assert_eq!(
+            built.pages.len(),
+            frame.page_tables.len(),
+            "at 2^{run_log2}"
+        );
+        let again = prove_built(&elf, &mut built, &words).expect("the built traces prove");
+        assert!(matches!(
+            verify_block_whir(&again, &elf, &opts, &words),
+            Ok(true)
+        ));
+        proofs.push((run_log2, words, elf, proof, frame.page_tables.clone()));
+    }
+    for (r, _, elf, proof, cut) in &proofs {
+        for (s, theirs, _, _, their_cut) in &proofs {
+            if r != s {
+                assert_ne!(cut, their_cut, "the cuts at 2^{r} and 2^{s} differ");
+                assert!(
+                    !matches!(verify_block_whir(proof, elf, &opts, theirs), Ok(true)),
+                    "proved at 2^{r}, refused at 2^{s}"
+                );
+            }
+        }
+    }
+}
+
+/// The last row of page table `page` no access touched (final timestamp 0),
+/// not its last row: a zero block's timestamp is its fourth column.
+fn untouched_row(traces: &crate::tables::trace_builder::Traces, page: usize) -> usize {
+    use crate::tables::page_w::{cols as pw, zero_cols as zw};
+    let t = &traces.pages[page];
+    let ts = if t.main_table.width == zw::NUM_COLUMNS {
+        zw::TIMESTAMP
+    } else {
+        pw::TIMESTAMP
+    };
+    (1..t.num_rows() - 1)
+        .rev()
+        .find(|&r| t.get_main(r, ts).canonical_u64() == 0)
+        .expect("an untouched word")
+}
+
+/// ★ A page block's columns are the verifier's on a real proof, at runs of 16
+/// pages: a zero block's and a private block's untouched row's `OFFSET` moved
+/// (a key minted twice), proved by a forger: refused, and verifying with the
+/// preprocessed check off (the control); a private block's untouched row's
+/// initial half `2^16` more: refused, and verifying with the balance off.
+#[test]
+fn page_block_columns_are_the_verifiers_at_proof_level() {
+    use crate::tables::page_w::{self, PageTableKind};
+    let words = format(MemoryFormat::Words).with_page_run(4);
+    let elf = asm_elf_bytes("page_runs");
+    let input = two_pages_of_input();
+    let honest = word_build_with(&elf, &words, &input);
+    let tables = page_w::page_tables(&honest.page_configs, 4).expect("cut");
+    let block = |kind| {
+        tables
+            .iter()
+            .position(|t| t.kind == kind && t.pages() > 1)
+            .expect("a block of the class")
+    };
+    let off = |preprocessed: bool| VerifierChecks {
+        preprocessed: !preprocessed,
+        balance: preprocessed,
+        ..VerifierChecks::ALL
+    };
+    for (page, edit) in [
+        (block(PageTableKind::Zero), "offset"),
+        (block(PageTableKind::Private), "offset"),
+        (block(PageTableKind::Private), "half"),
+    ] {
+        let mut forged = word_build_with(&elf, &words, &input);
+        let row = untouched_row(&forged, page);
+        edit_page(&mut forged, page, row, edit);
+        let proof = prove_forged(&elf, &mut forged, &words).expect("the forger proves");
+        let all = verdict(&proof, &elf, &words, VerifierChecks::ALL);
+        assert!(refused(&all), "{page} {edit}: {all:?}");
+        let control = verdict(&proof, &elf, &words, off(edit == "offset"));
+        assert!(
+            matches!(control, Ok(Ok(()))),
+            "{page} {edit}: control: {control:?}"
+        );
+    }
+}
+
+/// ★ The dense arm under page runs: with every page that has initial data
+/// settled by the prepared opening (on this thread), `page_runs` proves and
+/// verifies at runs of 16 pages, and its opening settles the same tables (by
+/// name) with the same columns as with runs off.
+#[test]
+fn a_word_block_with_page_runs_holds_its_dense_pages() {
+    block_whir::DENSE_PAGES_FORCED.with(|c| c.set(true));
+    let checked = std::panic::catch_unwind(|| {
+        let opts = ProofOptions::default_test_options();
+        let mut settled = Vec::new();
+        for run_log2 in [0u8, 4] {
+            let words = format(MemoryFormat::Words).with_page_run(run_log2);
+            let (elf, proof) = page_runs_block(&words);
+            assert!(!proof.prepared.is_empty(), "a prepared opening");
+            assert!(matches!(
+                verify_block_whir(&proof, &elf, &opts, &words),
+                Ok(true)
+            ));
+            let frame =
+                block_whir::block_frame(proof.statement(), &elf, &opts, &words).expect("frames");
+            let refs = frame.airs.air_refs();
+            let names: Vec<(String, Vec<Vec<crate::tables::types::FE>>)> =
+                block_whir::prepared_tables(&frame.airs, &frame.page_configs, &words)
+                    .expect("prepared")
+                    .into_iter()
+                    .map(|(t, columns)| (refs[t].name().to_string(), columns))
+                    .collect();
+            assert!(names.len() > 1, "DECODE and a page");
+            settled.push(names);
+        }
+        assert!(settled[0] == settled[1], "the same tables settled");
+    });
+    block_whir::DENSE_PAGES_FORCED.with(|c| c.set(false));
+    if let Err(panic) = checked {
+        std::panic::resume_unwind(panic);
     }
 }
