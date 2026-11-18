@@ -1069,10 +1069,12 @@ fn failing(row: &[FE]) -> Vec<usize> {
 }
 
 /// ★ Every carry identity is load-bearing, one at a time: on honest rows (an
-/// add and a double), `LO_k + 1` of relation `r` (the carry `C_k` one more)
-/// breaks exactly the two identities that read `C_k` — `k`'s
-/// (`2^16·C_k − C_{k−1} − S'_k`) and `k + 1`'s — at `5 + 32r + k` and
-/// `5 + 32r + k + 1`. An identity emitted as zero would leave its index out.
+/// add and a double), `LO_k + 1` of relation `r`, and the carry `C_k` moved by
+/// ±1 and by ±2^22 (the gap between the honest range and the checks'),
+/// re-split so every check passes, each breaks exactly the two identities
+/// that read `C_k` — `k`'s (`2^16·C_k − C_{k−1} − S'_k`) and `k + 1`'s — at
+/// `5 + 32r + k` and `5 + 32r + k + 1`. So a carry in range but off its chain
+/// is refused, and an identity emitted as zero would leave its index out.
 #[test]
 fn each_carry_identity_reads_its_two_carries() {
     let mut rng = Rng(21);
@@ -1085,16 +1087,35 @@ fn each_carry_identity_reads_its_two_carries() {
         };
         let row = s.honest_row();
         assert!(failing(&row).is_empty(), "op {op}: the honest row");
-        for (r, &(lo, _, _)) in h::RELATIONS.iter().enumerate() {
+        let all = bus_interactions_for(EcdasForm::Halves);
+        let chains = s.limbs().terms().map(|t| halves_chain(&t).0);
+        for (r, &(lo, hi, _)) in h::RELATIONS.iter().enumerate() {
             for k in 0..HALVES_CARRIES {
+                let at = 5 + HALVES_POSITIONS * r + k;
+                // LO_k + 1, as it stands.
                 let mut bumped = row.clone();
                 bumped[lo + k] += FE::one();
-                let at = 5 + HALVES_POSITIONS * r + k;
                 assert_eq!(
                     failing(&bumped),
                     vec![at, at + 1],
-                    "op {op} relation {r} carry {k}"
+                    "op {op} relation {r} carry {k}: LO + 1"
                 );
+                // C_k moved by ±1 and by ±2^22 (into the gap between the
+                // honest range and the checks'), re-split: every check passes,
+                // and the two identities that read C_k alone refuse it.
+                for d in [1i64, -1, 1 << 22, -(1 << 22)] {
+                    let c = chains[r][k] + d;
+                    let (l, high) = split_carry(c);
+                    assert!((0..256).contains(&high), "carry {c} within the checks");
+                    let mut moved = row.clone();
+                    moved[lo + k] = FE::from(l);
+                    moved[hi + k] = fe(high);
+                    assert_eq!(
+                        refusal(EcdasForm::Halves, &all, &moved, None),
+                        Some(format!("constraints [{at}, {}]", at + 1)),
+                        "op {op} relation {r} carry {k}: C_k {d:+}"
+                    );
+                }
             }
         }
     }
@@ -1200,10 +1221,13 @@ fn the_offset_is_load_bearing_for_completeness() {
     );
 }
 
-/// ★ T5. A byte of 256: each sampled check is the only thing that refuses
-/// it. λ's third byte (λ_2 + 256, λ_3 − 1: the same limbs, so every
-/// constraint holds); `q0`'s 32nd byte (with the 33rd − 1); `ROUND`; and
-/// λ's last byte (λ + 2^256, a step whose relations hold for that `λ`).
+/// ★ T5. A byte of 256 or more: each sampled check is the only thing that
+/// refuses it. λ's third byte (λ_2 + 256, λ_3 − 1: the same limbs, so every
+/// constraint holds); `q0`'s 32nd byte (with the 33rd − 1); `ROUND`; λ's last
+/// byte (λ + 2^256, a step whose relations hold for that `λ`); the outputs
+/// xR_0, yR_0, yR_1 (across a limb) and xR + P (its top cell past 255);
+/// `q1_4`; `q2_0`. The pairs that straddle two arrays, (q1_32, yR_0) and
+/// (yR_31, q2_0), are among them.
 /// Each with all checks is refused; without its one pair (the control),
 /// accepted.
 #[test]
@@ -1211,7 +1235,16 @@ fn each_sampled_byte_check_is_load_bearing() {
     let mut rng = Rng(11);
     let base = loop {
         let s = random_step(&mut rng);
-        if s.op == 1 && s.lambda[3] > 0 && s.q[0][32] > 0 {
+        if s.op == 1
+            && s.lambda[3] > 0
+            && s.q[0][32] > 0
+            && s.xr[1] > 0
+            && s.yr[1] > 0
+            && s.yr[2] > 0
+            && s.q[1][5] > 0
+            && s.q[2][1] > 0
+            && big_of(&s.xr) + p_big() >= BigInt::one() << 256
+        {
             break s;
         }
     };
@@ -1246,6 +1279,47 @@ fn each_sampled_byte_check_is_load_bearing() {
         bytes,
     );
     cases.push(("λ_31", h::LAMBDA + 31, s.honest_row()));
+
+    // The outputs, which leave the row (to the next step and to memory): a
+    // byte of xR and of yR re-encoded within the same integer, yR across a limb
+    // boundary, and xR + P (q1 − 1, q2 − λ: the relations hold over the
+    // integers), a non-canonical output past 2^256 in its top cell.
+    let mut s = base.clone();
+    s.xr[0] += 256;
+    s.xr[1] -= 1;
+    cases.push(("xR_0", h::XR, s.honest_row()));
+    let mut s = base.clone();
+    s.yr[0] += 256;
+    s.yr[1] -= 1;
+    cases.push(("yR_0 (the pair q1_32, yR_0)", h::YR, s.honest_row()));
+    let mut s = base.clone();
+    s.yr[1] += 256;
+    s.yr[2] -= 1;
+    cases.push(("yR_1 (across a limb)", h::YR + 1, s.honest_row()));
+    let mut s = base.clone();
+    let xr = big_of(&s.xr) + p_big();
+    let low = bytes_of::<32>(&(&xr - ((&xr >> 248usize) << 248usize)));
+    s.xr = std::array::from_fn(|i| {
+        if i < 31 {
+            low[i]
+        } else {
+            u64::try_from(&xr >> 248usize).expect("a small top cell")
+        }
+    });
+    assert_eq!(big_of(&s.xr), xr);
+    s.q[1] = bytes_of(&(big_of(&s.q[1]) - 1));
+    s.q[2] = bytes_of(&(big_of(&s.q[2]) - big_of(&s.lambda)));
+    cases.push(("xR + P (top cell)", h::XR + 31, s.honest_row()));
+    // A quotient byte of xR's and of yR's relation, the latter in the pair
+    // (yR_31, q2_0) that straddles two arrays.
+    let mut s = base.clone();
+    s.q[1][4] += 256;
+    s.q[1][5] -= 1;
+    cases.push(("q1_4", h::Q1 + 4, s.honest_row()));
+    let mut s = base.clone();
+    s.q[2][0] += 256;
+    s.q[2][1] -= 1;
+    cases.push(("q2_0 (the pair yR_31, q2_0)", h::Q2, s.honest_row()));
 
     for (name, col, row) in cases {
         assert!(row[col].canonical() >= 256, "{name}");
