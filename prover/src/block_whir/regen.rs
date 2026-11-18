@@ -584,6 +584,12 @@ struct Recorded {
     /// the rest's laid-out tables, and the block index of the rest's first.
     rest: std::collections::HashMap<usize, (RegenFamily, usize)>,
     rest_base: Option<usize>,
+    /// When phase A commits the streamed chunks in another order than the
+    /// hand-out's (KECCAK_RND's own groups,
+    /// [`Recorder::commits_out_of_order`]): each block index's hand-out place
+    /// (`None`: not a streamed chunk), as its group closes. `None`: the same
+    /// order, so a block index is its hand-out place.
+    block_ranks: Option<Vec<Option<usize>>>,
 }
 
 impl Recorder {
@@ -646,6 +652,32 @@ impl Recorder {
     /// Whether the layout's threads digest each chunk ([`Self::packed`]).
     pub(crate) fn digests(&self) -> bool {
         self.digests
+    }
+
+    /// Phase A commits the streamed chunks in another order than the
+    /// hand-out's: each group's places are noted as it closes
+    /// ([`Self::committed`]) and [`Self::handout_place`] reads them.
+    pub(crate) fn commits_out_of_order(&self) {
+        self.lock().block_ranks.get_or_insert_with(Vec::new);
+    }
+
+    /// A closed group's tables, in order: each one's hand-out place, `None`
+    /// for a table that is not a streamed chunk. Groups in the order they
+    /// close (phase A's).
+    pub(crate) fn committed(&self, places: &[Option<usize>]) {
+        if let Some(ranks) = self.lock().block_ranks.as_mut() {
+            ranks.extend_from_slice(places);
+        }
+    }
+
+    /// The hand-out place of the table at block index `t`: `t` itself when
+    /// phase A commits the streamed chunks in hand-out order, else what its
+    /// group noted (`None`: not a streamed chunk, or not closed yet).
+    pub(crate) fn handout_place(&self, t: usize) -> Option<usize> {
+        match &self.lock().block_ranks {
+            None => Some(t),
+            Some(ranks) => ranks.get(t).copied().flatten(),
+        }
     }
 
     /// The chunk handed out `order`-th, when one was and phase B can rebuild
