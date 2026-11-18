@@ -663,8 +663,18 @@ fn a_blake3_base_on_the_two_layer_ladder_proves_and_each_ladder_refuses_the_othe
         tampered("a half's value at step 1", &|p| {
             p.argues[g].gkr[b].layers[1].halves[1].q_lo += FieldElement::<E>::one();
         });
-        tampered("two halves swapped at step 0", &|p| {
-            p.argues[g].gkr[b].layers[0].halves.swap(0, 1);
+        // Two adjacent halves that differ (an all-padding tree's halves are
+        // equal, and swapping those would change nothing).
+        let at = two.argues[g].gkr[b].layers[0]
+            .halves
+            .windows(2)
+            .position(|w| {
+                [&w[0].p_lo, &w[0].p_hi, &w[0].q_lo, &w[0].q_hi]
+                    != [&w[1].p_lo, &w[1].p_hi, &w[1].q_lo, &w[1].q_hi]
+            })
+            .expect("two halves that differ at step 0");
+        tampered("two differing halves swapped at step 0", &|p| {
+            p.argues[g].gkr[b].layers[0].halves.swap(at, at + 1);
         });
         tampered("a degree-5 round value", &|p| {
             p.argues[g].gkr[b].layers[1].sumcheck.rounds[0].evaluations[4] +=
