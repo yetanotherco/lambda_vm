@@ -2121,6 +2121,82 @@ fn the_keccak_w_split_is_on_by_default_and_cuts_eight_parts() {
     );
 }
 
+/// Random keccak rows for the counters' tests: permute rows and sponge rows
+/// (first, middle and last blocks, with partial reads), reproducible.
+fn random_keccak_rows(n: usize, seed: u64) -> Vec<crate::tables::keccak::KeccakOperation> {
+    use crate::tables::keccak::{KeccakOperation, SpongeRow};
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    (0..n)
+        .map(|i| {
+            let input: [u64; 25] = std::array::from_fn(|_| next());
+            let sponge = (i % 3 != 0).then(|| {
+                let taken = (next() % 137) as usize;
+                let last = i % 3 == 2;
+                SpongeRow {
+                    src: next() & 0xFFFF_FFFF,
+                    out: next() & 0xFFFF_FFFF,
+                    count: if last {
+                        taken as u64
+                    } else {
+                        136 + taken as u64
+                    },
+                    first: i % 6 == 1,
+                    last,
+                    msg: std::array::from_fn(|k| if !last || k < taken { next() as u8 } else { 0 }),
+                    mask: if last {
+                        SpongeRow::prefix(taken)
+                    } else {
+                        [true; 136]
+                    },
+                    words: None,
+                }
+            });
+            KeccakOperation {
+                timestamp: 4 * i as u64,
+                state_addr: if sponge.is_some() {
+                    0
+                } else {
+                    next() & 0xFFFF_FFF8
+                },
+                input,
+                output: [0; 25],
+                sponge,
+            }
+        })
+        .collect()
+}
+
+/// ★ KECCAK's BITWISE lookups counted straight into the byte-pair lanes
+/// ([`super::super::keccak_count_direct`]) are the counts of each lookup made
+/// and bumped, cell for cell: permute and sponge rows of random states, both
+/// KECCAK_RND forms, one row and many.
+#[test]
+fn keccak_lookups_counted_directly_are_the_lookups_made() {
+    use super::super::bitwise::BitwiseHistogram;
+    use crate::tables::keccak_rnd::KeccakRndForm;
+    for (n, seed) in [(1usize, 3u64), (2, 5), (300, 7)] {
+        let rows = random_keccak_rows(n, seed);
+        for form in [KeccakRndForm::Lean, KeccakRndForm::Full] {
+            let count = |direct: bool| {
+                super::super::force_keccak_count_direct(Some(direct));
+                let mut h = BitwiseHistogram::new();
+                super::super::count_bitwise_from_keccak_for(&rows, form, &mut h);
+                h
+            };
+            let made = count(false);
+            let direct = count(true);
+            super::super::force_keccak_count_direct(None);
+            assert!(made == direct, "{n} rows, {form:?}: the counts differ");
+        }
+    }
+}
+
 /// A probe, never a gate: what counting KECCAK's BITWISE lookups costs a
 /// permutation, by part — the rounds replayed with every lookup made and
 /// dropped, and the same with each lookup bumped into a histogram — over
@@ -2166,20 +2242,31 @@ fn keccak_bitwise_count_seconds_by_part() {
             });
             k
         });
-        let (bumped, _) = best(&mut || {
-            let mut h = BitwiseHistogram::new();
-            super::super::count_bitwise_from_keccak_for(&ops, form, &mut h);
-            std::hint::black_box(&h);
-            0
-        });
+        let bumped_by = |direct: bool| {
+            super::super::force_keccak_count_direct(Some(direct));
+            let (secs, _) = best(&mut || {
+                let mut h = BitwiseHistogram::new();
+                super::super::count_bitwise_from_keccak_for(&ops, form, &mut h);
+                std::hint::black_box(&h);
+                0
+            });
+            super::super::force_keccak_count_direct(None);
+            secs
+        };
+        let bumped = bumped_by(false);
+        let direct = bumped_by(true);
         println!(
             "KECCAK COUNT PROBE {form:?}: {n} permutations · {} lookups a permutation · replayed and made {:.2} ns a \
-             lookup ({:.1} µs a permutation) · bumped {:.2} ns a lookup ({:.1} µs a permutation)",
+             lookup ({:.1} µs a permutation) · bumped {:.2} ns a lookup ({:.1} µs a permutation) · counted \
+             directly {:.2} ns a lookup ({:.1} µs a permutation, ×{:.2})",
             lookups / n as u64,
             made / lookups as f64 * 1e9,
             made / n as f64 * 1e6,
             bumped / lookups as f64 * 1e9,
             bumped / n as f64 * 1e6,
+            direct / lookups as f64 * 1e9,
+            direct / n as f64 * 1e6,
+            bumped / direct,
         );
     }
 }
