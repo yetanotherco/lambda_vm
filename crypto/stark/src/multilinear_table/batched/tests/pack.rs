@@ -805,6 +805,103 @@ fn a_bin_that_hands_back_proves_the_carried_bytes() {
     }
 }
 
+/// ★ A card tree whose input layer cannot be written again for its last
+/// sumcheck (faulted here on every rewrite: the bins forced to hand back, and
+/// the padded chunks kept without their padding) has it written on the host
+/// and proves the bytes of the bin that carries it, with the transcript in the
+/// same state after. Without the host's write the argue would fail there. On
+/// a device the layers written on the host are counted, so the fault is seen
+/// to fire.
+///
+/// ```text
+/// cargo test --release -p stark --features cuda,multilinear/cuda --lib -- \
+///     multilinear_table::batched::tests::pack::a_failed_input_rewrite_is_written_on_the_host --exact --nocapture
+/// ```
+#[test]
+fn a_failed_input_rewrite_is_written_on_the_host() {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            multilinear::gpu::force_bin_hand_back_for_tests(false);
+            multilinear::gpu::fault_input_rewrites_for_tests(false);
+        }
+    }
+    const TALL: [(usize, usize); 4] = [(5, 13), (7, 15), (9, 13), (11, 13)];
+    let _switches = card_switches();
+    let _restore = Restore;
+    a_present_card_is_reachable();
+    let airs = airs();
+    let fans: Vec<Air<EmptyConstraints>> = TALL.iter().map(|&(m, _)| fan_air(m)).collect();
+    let fan_cols: Vec<Vec<Vec<FE>>> = TALL
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, n))| fan_columns(n, i as u64 + 1))
+        .collect();
+    let cols = columns(12, 1);
+    for cap in [27u8, 14] {
+        let cfg = packed(cap, 12);
+        let run = |faulted: bool| {
+            multilinear::gpu::force_bin_hand_back_for_tests(faulted);
+            multilinear::gpu::fault_input_rewrites_for_tests(faulted);
+            let mut all = tables(&airs, &cols, false);
+            for (air, cols) in fans.iter().zip(&fan_cols) {
+                all.push(table(air, cols));
+            }
+            let committed = commit(all, &cfg);
+            let written = multilinear::gpu::inputs_written_on_host();
+            let mut transcript = DefaultTranscript::<Ext>::new(SEED);
+            let proof = prove_batched_on(
+                &committed,
+                &cfg,
+                &mut transcript,
+                None,
+                ProverFaults::default(),
+                Where::Device,
+            )
+            .unwrap_or_else(|e| panic!("faulted {faulted}: {e:?}"));
+            multilinear::gpu::force_bin_hand_back_for_tests(false);
+            multilinear::gpu::fault_input_rewrites_for_tests(false);
+            verify(&committed, &proof, &cfg).unwrap_or_else(|e| panic!("faulted {faulted}: {e:?}"));
+            (
+                bincode::serialize(&proof).expect("bytes"),
+                transcript.state(),
+                transcript.sample_field_element(),
+                multilinear::gpu::inputs_written_on_host() - written,
+            )
+        };
+        let carried = run(false);
+        let faulted = run(true);
+        eprintln!(
+            "input rewrite on the host cap={cap}: {} bytes, card {}, {} input layers written on the host",
+            carried.0.len(),
+            if a_device() {
+                "present"
+            } else {
+                "absent (host fallbacks)"
+            },
+            faulted.3
+        );
+        assert_eq!(
+            carried.3, 0,
+            "cap={cap}: no layer is written on the host unfaulted"
+        );
+        if a_device() {
+            assert!(
+                faulted.3 > 0,
+                "cap={cap}: the faulted rewrites went to the host"
+            );
+        }
+        assert!(
+            carried.0 == faulted.0,
+            "cap={cap}: the canonical bytes differ"
+        );
+        assert_eq!(carried.1, faulted.1, "cap={cap}: the transcripts parted");
+        assert_eq!(carried.2, faulted.2, "cap={cap}: the next challenge moved");
+    }
+}
+
 // ─── mass in a padding slot ──────────────────────────────────────────────
 
 /// ★ Padding is the verifier's to define: an unbalanced trace (FAN(7)'s odd

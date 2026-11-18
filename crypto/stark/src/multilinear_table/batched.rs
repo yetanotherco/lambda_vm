@@ -1023,13 +1023,37 @@ where
                 BinTree::Built(_) => None,
             })
             .collect();
-        let refs: Vec<&dyn gkr_lockstep::LadderTree<E>> = trees
+        // A built tree whose input layer the card cannot write again for its
+        // last sumcheck has it written here instead (`InputOnHost`): the same
+        // layer, so the same rounds.
+        let writers: Vec<_> = members
+            .iter()
+            .map(|&(t, i)| {
+                let (list, trace) = (&lists[i][..], &tables[t].trace);
+                move || logup::input_layer_lean(list, trace)
+            })
+            .collect();
+        let built: Vec<Option<InputOnHost<'_, E>>> = trees
+            .iter()
+            .zip(&members)
+            .zip(&writers)
+            .map(|((tree, &(t, i)), write)| match tree {
+                BinTree::Built(tree) => Some(InputOnHost {
+                    tree,
+                    write,
+                    table: t,
+                    cells: lists[i].len().next_power_of_two() << tables[t].trace.num_vars(),
+                }),
+                BinTree::Host(_) => None,
+            })
+            .collect();
+        let refs: Vec<&dyn gkr_lockstep::LadderTree<E>> = built
             .iter()
             .zip(&hosts)
-            .map(|(tree, host)| match (tree, host) {
+            .map(|(built, host)| match (built, host) {
                 (_, Some(host)) => host as &dyn gkr_lockstep::LadderTree<E>,
-                (BinTree::Built(tree), None) => &**tree as &dyn gkr_lockstep::LadderTree<E>,
-                (BinTree::Host(_), None) => unreachable!("a host tree has its layers"),
+                (Some(built), None) => built as &dyn gkr_lockstep::LadderTree<E>,
+                (None, None) => unreachable!("a host tree has its layers"),
             })
             .collect();
         for (&(_, i), tree) in members.iter().zip(&refs) {
@@ -1323,6 +1347,54 @@ where
         },
         reduced,
     ))
+}
+
+/// A card-built tree in a bin's ladder whose input layer, when the card's step
+/// over it fails (its layer handed back or kept without its padding, and the
+/// card cannot write it again), is written here and stepped on the host: the
+/// same layer, so the same rounds and bytes, where today the argue fails. Any
+/// other layer's failure is the argue's, as before.
+struct InputOnHost<'a, E: IsField> {
+    tree: &'a multilinear::gkr::FractionTree<E>,
+    write: &'a dyn Fn() -> Result<FractionLayer<E>, MlError>,
+    table: usize,
+    cells: usize,
+}
+
+impl<E> gkr_lockstep::LadderTree<E> for InputOnHost<'_, E>
+where
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: Send + Sync,
+{
+    fn input_vars(&self) -> usize {
+        gkr_lockstep::LadderTree::input_vars(self.tree)
+    }
+
+    fn output(&self) -> (FieldElement<E>, FieldElement<E>) {
+        gkr_lockstep::LadderTree::output(self.tree)
+    }
+
+    fn step(
+        &self,
+        layer: usize,
+        point: &[FieldElement<E>],
+        weights: [FieldElement<E>; 2],
+        claim: &(FieldElement<E>, FieldElement<E>),
+    ) -> Result<Box<dyn gkr_lockstep::TreeStep<E> + '_>, MlError> {
+        match gkr_lockstep::LadderTree::step(self.tree, layer, point, weights.clone(), claim) {
+            Ok(step) => Ok(step),
+            Err(failed) if layer == gkr_lockstep::LadderTree::input_vars(self.tree) => {
+                let input = (self.write)()?;
+                multilinear::gpu::note_input_written_on_host(
+                    &format!("{failed:?}"),
+                    self.table,
+                    self.cells,
+                );
+                gkr_lockstep::host_step(&input, point, weights)
+            }
+            Err(failed) => Err(failed),
+        }
+    }
 }
 
 fn gib(bytes: u64) -> f64 {
