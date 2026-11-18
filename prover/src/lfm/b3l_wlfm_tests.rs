@@ -709,3 +709,145 @@ fn the_chips_narrow_pack_is_the_row_major_pack() {
         "more rows than the table"
     );
 }
+
+/// The W-leg's arena over `child`'s `proof` in pieces (its front, then each
+/// group's words, as a child's prove has them group by group) against the
+/// arena `wlfm_leg_arena` writes from the whole proof; the marked program
+/// against the leg's program, its marks against where the pieces end. Returns
+/// the child's group count.
+fn pieces_are_the_arena(
+    child: &super::wlfm_leg::WlfmChild,
+    proof: &WlfmProof,
+    what: &str,
+) -> usize {
+    use super::wlfm_leg::{
+        wlfm_leg_arena, wlfm_leg_front, wlfm_leg_group, wlfm_leg_program, wlfm_leg_program_marked,
+    };
+    let whole = wlfm_leg_arena(child, proof).expect("the leg's arena");
+    let mut pieces = vec![
+        wlfm_leg_front(
+            child,
+            &proof.public_words,
+            &proof.proof.roots,
+            &proof.commit_ood,
+        )
+        .expect("the front"),
+    ];
+    let groups = child.artifacts.sizes.len();
+    for g in 0..groups {
+        let prepared = child
+            .artifacts
+            .stacks
+            .iter()
+            .position(|s| s.group == g)
+            .map(|k| &proof.prepared[k]);
+        pieces.push(
+            wlfm_leg_group(
+                child,
+                g,
+                &proof.argues[g],
+                &proof.proof.columns[g],
+                prepared,
+            )
+            .unwrap_or_else(|e| panic!("{what}: group {g}: {e}")),
+        );
+    }
+    let joined: Vec<_> = pieces.iter().flatten().copied().collect();
+    assert!(joined == whole, "{what}: the pieces are the arena");
+    let (marked, marks) = wlfm_leg_program_marked(child).expect("the marked leg");
+    let plain = wlfm_leg_program(child).expect("the leg");
+    assert_eq!(
+        marked.instrs.len(),
+        plain.instrs.len(),
+        "{what}: the same program"
+    );
+    assert_eq!(
+        marked.arena_schema.lens, plain.arena_schema.lens,
+        "{what}: the same arena"
+    );
+    let mut at = 0u32;
+    let ends: Vec<u32> = pieces
+        .iter()
+        .map(|p| {
+            at += p.len() as u32;
+            at
+        })
+        .collect();
+    assert_eq!(marks, ends, "{what}: the marks are where the pieces end");
+    if groups > 1 {
+        // Another group's parts write other words, or are refused.
+        let swapped = wlfm_leg_group(child, 0, &proof.argues[1], &proof.proof.columns[1], None);
+        assert!(
+            swapped.map_or(true, |w| w != pieces[1]),
+            "{what}: a group's words are its own"
+        );
+    }
+    groups
+}
+
+/// ★ The W-leg's arena in pieces (`wlfm_leg_front`, then `wlfm_leg_group` for
+/// each group, as a child's prove has them group by group) is the arena
+/// `wlfm_leg_arena` writes from the whole proof, word for word: the lean
+/// fixture under both families and the field-chip fixture, one of them with
+/// several groups; the marked program is the leg's program, its marks where
+/// the pieces end.
+#[test]
+fn the_legs_arena_in_pieces_is_its_arena_under_both_families() {
+    use super::wlfm::WlfmFamily;
+    use super::wlfm_leg::WlfmChild;
+    let _fast = test_format::set(Some(2));
+    // One stacked polynomial a group: every fixture spans several groups.
+    let _groups = test_format::set_group_polys(1);
+    let child_of = |build: &WlfmBuild, proof: &WlfmProof| WlfmChild {
+        artifacts: build.artifacts.clone(),
+        num_public_words: proof.public_words.len(),
+    };
+    let mut most = 0;
+    let lean = honest();
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let build = build_under(&lean, family);
+        let proof = prove(&lean, &build);
+        most = most.max(pieces_are_the_arena(
+            &child_of(&build, &proof),
+            &proof,
+            &format!("lean {family:?}"),
+        ));
+    }
+    let field = super::wlfm_tests::honest();
+    let build = super::wlfm_tests::build(&field, WlfmRate::Two);
+    let proof = super::wlfm_tests::prove(&field, &build);
+    most = most.max(pieces_are_the_arena(
+        &child_of(&build, &proof),
+        &proof,
+        "field chips",
+    ));
+    // The level-shaped probe program: lean compressions over hinted leaves and
+    // paths, and extension multiply-adds, under both families.
+    let hasher = HasherKind::Poseidon1W16;
+    let (level, arenas) = super::levels_probe::level_program(4, 256);
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let build = super::wlfm::build_wlfm_under(
+            &level,
+            hasher,
+            WlfmRate::Two,
+            super::wlfm::WlfmLevers::with_family(family),
+            false,
+        )
+        .expect("builds");
+        let filled =
+            super::wlfm::execute_and_fill_unmerged(&level, &arenas, hasher).expect("executes");
+        let proof = super::wlfm::prove_wlfm_traces_as(
+            &build,
+            filled,
+            true,
+            super::wlfm::WlfmProving::Streamed,
+        )
+        .expect("proves");
+        most = most.max(pieces_are_the_arena(
+            &child_of(&build, &proof),
+            &proof,
+            &format!("level probe {family:?}"),
+        ));
+    }
+    assert!(most >= 2, "some fixture has several groups (most {most})");
+}
