@@ -1042,6 +1042,15 @@ impl WlfmBuild {
         }
     }
 
+    /// Whether a streamed prove of this build puts the next group's columns
+    /// on the card beside a group's commit (phase A) and its argue (phase B).
+    pub(crate) fn uploads_beside(&self) -> bool {
+        match &self.stacks {
+            WlfmStacks::P1(s) => uploads_beside(s),
+            WlfmStacks::B3(s) => uploads_beside(s),
+        }
+    }
+
     /// The build with table `t`'s held prefix replaced: a test's forgery.
     pub(crate) fn with_chip_prefix(
         mut self,
@@ -1869,14 +1878,30 @@ pub(crate) fn prove_wlfm_traces_as(
 /// refused. Alone, a group's openings have the argue's room too. The same
 /// proof either way (the overlap moves no byte).
 fn phase_b_overlap<H: WhirHash>(stacks: &[WlfmPrepared<H>]) -> multilinear_block::PhaseBOverlap {
-    if stacks
-        .iter()
-        .any(|p| matches!(p.hold, PreparedHold::Retired(_)))
-    {
+    if any_retired(stacks) {
         multilinear_block::PhaseBOverlap::Off
     } else {
         multilinear_block::PhaseBOverlap::On
     }
+}
+
+/// Whether the next group's columns go up beside a group's commit and its
+/// argue in a prove over `stacks`: not when a prepared stack is retired. Such
+/// a level's stacks did not fit beside its commits, and its widest group has
+/// no room to share: on a real large block a one-table group of 6.25 GiB of
+/// columns was refused an encode in its commit (the previous group's columns
+/// still held for their packing and the next group's beside it) and a GKR
+/// tree in its argue (0.63 GiB short, the next group's 2.76 GiB uploading
+/// beside it), each then done on the host (19.6 s and 11.4 s). Each group's
+/// upload is then paid at its own turn. The same proof either way.
+fn uploads_beside<H: WhirHash>(stacks: &[WlfmPrepared<H>]) -> bool {
+    !any_retired(stacks)
+}
+
+fn any_retired<H: WhirHash>(stacks: &[WlfmPrepared<H>]) -> bool {
+    stacks
+        .iter()
+        .any(|p| matches!(p.hold, PreparedHold::Retired(_)))
 }
 
 /// [`prove_wlfm_traces_as`] under the build's hash `H`.
@@ -2138,9 +2163,12 @@ fn prove_traces_under<H: WhirHash>(
                 config,
                 options.drop_levels,
                 options.narrow,
-                options.upload_ahead,
+                options.upload_ahead && uploads_beside(stacks),
             )
-            .map(|b| b.with_phase_b_overlap(phase_b_overlap(stacks)))
+            .map(|b| {
+                b.with_phase_b_overlap(phase_b_overlap(stacks))
+                    .with_phase_b_upload_beside(uploads_beside(stacks))
+            })
         }
     }
     .map_err(|e| format!("{e:?}"))?;
