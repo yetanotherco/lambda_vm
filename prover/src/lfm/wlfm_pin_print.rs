@@ -88,7 +88,11 @@ fn every_field_of_the_round_form_moves_the_wlfm_identity() {
         id_under(RoundForm::Whir(w(3, 128, 6).with_caps_by_queries())),
         id_under(RoundForm::Whir(w(3, 128, 7))),
     ];
-    assert_eq!(ids[0], hex(&build.artifacts.program_id), "today's is the fixture's own");
+    assert_eq!(
+        ids[0],
+        hex(&build.artifacts.program_id),
+        "today's is the fixture's own"
+    );
     let distinct: std::collections::BTreeSet<&String> = ids.iter().collect();
     assert_eq!(distinct.len(), ids.len(), "{ids:?}");
 }

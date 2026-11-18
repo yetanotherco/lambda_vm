@@ -1216,11 +1216,10 @@ where
         let block = 1usize << self.log_folding;
         let mut values: Vec<Vec<FieldElement<F>>> = vec![Vec::new(); at.len()];
         for stack in &stacks {
-            let device = crate::gpu::CosetSource::encode_waiting(stack).ok_or(
-                Error::DeviceFailed {
+            let device =
+                crate::gpu::CosetSource::encode_waiting(stack).ok_or(Error::DeviceFailed {
                     stage: "re-encoding a joint round-0 tree's codewords from their stacks",
-                },
-            )?;
+                })?;
             let gathered =
                 device
                     .cosets::<F>(&at, self.num_leaves(), block)
@@ -1239,7 +1238,10 @@ where
                 let k = blocks
                     .binary_search(&(index >> block_bits))
                     .expect("every queried block was gathered");
-                (leaf, values[(k << block_bits) + (index & (span - 1))].clone())
+                (
+                    leaf,
+                    values[(k << block_bits) + (index & (span - 1))].clone(),
+                )
             })
             .collect();
         sources[0].keep(kept);
