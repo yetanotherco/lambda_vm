@@ -639,6 +639,76 @@ fn the_blake3_driver_with_level_1_filled_beside_proves_the_same_level_bytes() {
     }
 }
 
+/// The BLAKE3 driver with level 2 executed beside level 1's prove
+/// (`LAMBDA_VM_LEVELS_STREAM_NEXT`, its arena landing piece by piece as level 1
+/// opens its groups) proves the same level bytes as [`prove_levels`] does over
+/// the same base, and the driver reports every piece landed. Needs
+/// `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_with_level_2_streamed_proves_the_same_level_bytes() {
+    use super::levels::{prove_block_levels, set_stream_next_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_stream_next_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = {
+        let _restore = Restore;
+        set_stream_next_for_test(Some(true));
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level")
+    };
+    assert!(run.proofs.len() >= 2, "a level 2 to stream");
+    let stream = run
+        .times
+        .next_stream
+        .expect("level 2 was executed beside level 1's prove");
+    assert!(stream.pieces >= 2 && stream.first <= stream.last && stream.last <= stream.executed);
+    let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
+        println!(
+            "LEVELS STREAM NEXT IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
+}
+
+/// The level-2 streaming knob's name; it is off by default, and only `1`
+/// turns it on.
+#[test]
+fn the_stream_next_knob_is_named_and_off_by_default() {
+    use super::levels::{STREAM_NEXT_ENV, stream_next};
+    assert_eq!(STREAM_NEXT_ENV, "LAMBDA_VM_LEVELS_STREAM_NEXT");
+    if std::env::var_os(STREAM_NEXT_ENV).is_none() {
+        assert!(!stream_next());
+    }
+}
+
 /// The fill-beside knob's name; it is on by default, and only `0` turns it
 /// off.
 #[test]
@@ -922,6 +992,37 @@ fn rta_one_run(
         t.built,
         l1_prove_from
     );
+    // Level 2 streamed beside level 1's prove (`LAMBDA_VM_LEVELS_STREAM_NEXT`):
+    // its pieces' landing against level 1's proved time, and level 1's own
+    // prove seconds (the stream must not slow it).
+    let l1 = t.levels.first().copied().unwrap_or_default();
+    let l2 = t.levels.get(1).copied().unwrap_or_default();
+    match t.next_stream {
+        Some(ns) => println!(
+            "RTA LEVEL2 STREAM: on true · pieces {} · from {:.3}s · first piece at {:.3}s · last piece at {:.3}s · \
+             executed at {:.3}s · fill {:.3}s · level 1 prove {:.3}s · level 1 proved at {:.3}s · \
+             executed after level 1 {:.3}s · level 2 prove {:.3}s",
+            ns.pieces,
+            ns.from,
+            ns.first,
+            ns.last,
+            ns.executed,
+            ns.fill,
+            l1.prove,
+            l1.end,
+            ns.executed + ns.fill - l1.end,
+            l2.prove
+        ),
+        None => println!(
+            "RTA LEVEL2 STREAM: on false · level 1 prove {:.3}s · level 1 proved at {:.3}s · \
+             level 2 executed at {:.3}s · executed after level 1 {:.3}s · level 2 prove {:.3}s",
+            l1.prove,
+            l1.end,
+            l2.executed,
+            l2.executed - l1.end,
+            l2.prove
+        ),
+    }
     println!(
         "RTA LEVEL1 STREAM: planned {:.3}s · emitted {:.3}s · pieces {} · waves before the base \
          ended {} ({:.3}s) · execute tail {:.3}s · built {:.3}s · card idle after the base {:.3}s",
