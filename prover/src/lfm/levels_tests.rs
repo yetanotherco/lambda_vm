@@ -580,6 +580,76 @@ fn the_blake3_driver_with_its_program_fast_proves_the_same_level_bytes() {
     }
 }
 
+/// ★ Level 1 filled on its own thread beside the stacks' commit
+/// (`LAMBDA_VM_LEVELS_FILL_BESIDE`) is the same fill and the same proofs: a
+/// small BLAKE3 block driven with the knob on proves each level's bytes as
+/// [`prove_levels`] does over the same base, and the driver reports the fill
+/// as done beside. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity
+/// check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_with_level_1_filled_beside_proves_the_same_level_bytes() {
+    use super::levels::{prove_block_levels, set_fill_beside_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_fill_beside_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = {
+        let _restore = Restore;
+        set_fill_beside_for_test(Some(true));
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level")
+    };
+    let (fill, done) = run
+        .times
+        .fill_beside
+        .expect("level 1 was filled beside the stacks' commit");
+    assert!(fill > 0.0 && done > 0.0);
+    let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
+        println!(
+            "LEVELS FILL BESIDE IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
+}
+
+/// The fill-beside knob's name; only `1` turns it on, and it is off by
+/// default.
+#[test]
+fn the_fill_beside_knob_is_named_and_off_by_default() {
+    use super::levels::{FILL_BESIDE_ENV, fill_beside};
+    assert_eq!(FILL_BESIDE_ENV, "LAMBDA_VM_LEVELS_FILL_BESIDE");
+    if std::env::var_os(FILL_BESIDE_ENV).is_none() {
+        assert!(!fill_beside());
+    }
+}
+
 /// The BLAKE3 driver with level 1's lean round tables filled beside its
 /// execution (`LAMBDA_VM_WLFM_LEAN_BESIDE`, the round chunks held as their
 /// records): level 1's fill took the prefill, which was fed every one of its
@@ -851,7 +921,25 @@ fn rta_one_run(
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let l1_prove_from = t.built + t.levels.first().map_or(0.0, |l| l.fill);
+    // Level 1's prove starts once its stacks are committed and its traces
+    // filled: after one another, or, filled beside the commit
+    // (`LAMBDA_VM_LEVELS_FILL_BESIDE`), at the later of the two.
+    let l1_prove_from = match t.fill_beside {
+        Some((_, done)) => t.built.max(done),
+        None => t.built + t.levels.first().map_or(0.0, |l| l.fill),
+    };
+    println!(
+        "RTA LEVEL1 FILL: beside {} · fill {:.3}s · executed at {:.3}s · filled at {} · built {:.3}s · prove from {:.3}s",
+        t.fill_beside.is_some(),
+        t.levels.first().map_or(0.0, |l| l.fill),
+        t.levels.first().map_or(0.0, |l| l.executed),
+        match t.fill_beside {
+            Some((_, done)) => format!("{done:.3}s"),
+            None => "after the build".to_string(),
+        },
+        t.built,
+        l1_prove_from
+    );
     println!(
         "RTA LEVEL1 STREAM: planned {:.3}s · emitted {:.3}s · pieces {} · waves before the base \
          ended {} ({:.3}s) · execute tail {:.3}s · built {:.3}s · card idle after the base {:.3}s",
