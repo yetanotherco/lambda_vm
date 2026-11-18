@@ -760,10 +760,11 @@ fn the_rest_is_cut_into_waves_within_the_budget() {
 /// the card (b2: BlockOptions::pack_finished) move no byte: the same tables,
 /// partition and statement as with all of them off, inline and on the worker
 /// layout, and the proof bytes equal under the deterministic grind. The rest is
-/// handed on in AIR order in every arm ([`Deviations::keccak_rnd_first`] off):
-/// with b1 on three workers the rest streams and slides, where KECCAK_RND's
-/// tables would otherwise go first, while with b1 off it is built whole in AIR
-/// order, so the partitions would differ by that order alone.
+/// handed on in AIR order in every arm ([`Deviations::keccak_rnd_first`] and
+/// [`Deviations::pages_first`] off): with b1 on three workers the rest streams
+/// and slides, where KECCAK_RND's and the page tables would otherwise go
+/// first, while with b1 off it is built whole in AIR order, so the partitions
+/// would differ by that order alone.
 #[test]
 fn the_rest_in_waves_and_the_finish_packed_move_no_byte() {
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -785,6 +786,7 @@ fn the_rest_in_waves_and_the_finish_packed_move_no_byte() {
                 &o,
                 &Deviations {
                     keccak_rnd_first: Some(false),
+                    pages_first: Some(false),
                     ..Deviations::default()
                 },
             )
@@ -2954,10 +2956,11 @@ fn bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies() {
 }
 
 /// ★ The page tables handed on right after KECCAK_RND's
-/// ([`Deviations::pages_first`], off by default): every page table is packed
-/// before DECODE, the first other table of the rest in AIR order, and by
-/// default every one after it. The partition moves, the tables and their
-/// counts do not, and both proofs verify under the unchanged verifier.
+/// ([`Deviations::pages_first`], the block's default; `Some(false)` rolls it
+/// back): every page table is packed before DECODE, the first other table of
+/// the rest in AIR order, and in the rollback every one after it. The
+/// partition moves, the tables and their counts do not, and both proofs
+/// verify under the unchanged verifier. The default is the knob on.
 #[test]
 fn pages_first_moves_the_partition_and_verifies() {
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -2980,6 +2983,7 @@ fn pages_first_moves_the_partition_and_verifies() {
     };
     let default = proved("the default", None);
     let first = proved("the pages next", Some(true));
+    let rollback = proved("the rollback", Some(false));
     let opts = ProofOptions::default_test_options();
     let frame = block_whir::block_frame(default.statement(), &elf, &opts, &format).expect("frame");
     let names: Vec<String> = frame
@@ -3004,17 +3008,26 @@ fn pages_first_moves_the_partition_and_verifies() {
         let d = at(&order, decode);
         pages.iter().filter(|&&t| at(&order, t) < d).count()
     };
-    assert_eq!(before_decode(&default), 0, "the default: AIR order");
+    assert_eq!(
+        before_decode(&default),
+        pages.len(),
+        "the default: the pages next"
+    );
     assert_eq!(before_decode(&first), pages.len(), "the pages next");
-    assert_ne!(first.groups, default.groups, "the partition did not move");
+    assert_eq!(before_decode(&rollback), 0, "the rollback: AIR order");
+    assert_eq!(default.groups, first.groups, "the default's partition");
+    assert_ne!(
+        rollback.groups, default.groups,
+        "the partition did not move"
+    );
     let sorted = |p: &BlockWhirProof| {
         let mut v = flat(p);
         v.sort_unstable();
         v
     };
-    assert_eq!(sorted(&first), sorted(&default), "the same tables");
+    assert_eq!(sorted(&rollback), sorted(&default), "the same tables");
     assert_eq!(
-        format!("{:?}", first.table_counts),
+        format!("{:?}", rollback.table_counts),
         format!("{:?}", default.table_counts)
     );
 }

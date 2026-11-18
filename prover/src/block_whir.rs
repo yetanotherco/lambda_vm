@@ -1441,7 +1441,7 @@ const PAGES_FIRST_ENV: &str = "LAMBDA_VM_PAGES_FIRST";
 
 /// Whether the streamed finish hands the page tables on right after
 /// KECCAK_RND's ([`WindowedTraceBuilder::pages_first`]) when it slides: a
-/// deviation's choice, else `LAMBDA_VM_PAGES_FIRST` (off by default). The
+/// deviation's choice, else `LAMBDA_VM_PAGES_FIRST` (on by default). The
 /// group the page tables fill (hundreds of them) is then committed and argued
 /// early instead of near the end, so a level proved beside phase B receives
 /// it while phase B still runs. The tables are the same; the groups, and so
@@ -1454,16 +1454,16 @@ fn pages_first(deviation: Option<bool>) -> Result<bool, Error> {
     }
 }
 
-/// `LAMBDA_VM_PAGES_FIRST`: unset, empty or `0` (the default) keeps AIR
-/// order after KECCAK_RND; `1` hands the page tables on next. Anything else
-/// refuses the prove.
+/// `LAMBDA_VM_PAGES_FIRST`: unset, empty or `1` (the default) hands the page
+/// tables on next; `0` keeps AIR order after KECCAK_RND (the rollback).
+/// Anything else refuses the prove.
 fn parse_pages_first(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
+        None | Some("" | "1") => Ok(true),
+        Some("0") => Ok(false),
         Some(v) => Err(Error::Prover(format!(
-            "{PAGES_FIRST_ENV}={v}: 0 (the default: AIR order after KECCAK_RND) or 1 (the page \
-             tables next)"
+            "{PAGES_FIRST_ENV}={v}: 1 (the default: the page tables next) or 0 (AIR order after \
+             KECCAK_RND)"
         ))),
     }
 }
@@ -7382,9 +7382,9 @@ fn prove_streamed(
         eprintln!(
             "★ BLOCK PAGES FIRST: {} ({PAGES_FIRST_ENV})",
             if pages_first {
-                "the page tables handed on right after KECCAK_RND's"
+                "the page tables handed on right after KECCAK_RND's (the default)"
             } else {
-                "AIR order after KECCAK_RND (the default)"
+                "AIR order after KECCAK_RND"
             }
         );
         let airs_beside = rest_airs_beside(deviations.rest_airs_beside)?;
@@ -12176,13 +12176,13 @@ mod rest_airs_beside_tests {
         }
     }
 
-    /// The page tables go next only when the knob says `1`.
+    /// The page tables go next unless the knob says `0`.
     #[test]
-    fn the_pages_first_knob_is_off_by_default_and_refuses_other_words() {
-        for off in [None, Some(""), Some("0"), Some(" 0\n")] {
-            assert!(!super::parse_pages_first(off).expect("off"), "{off:?}");
+    fn the_pages_first_knob_is_on_by_default_and_refuses_other_words() {
+        for on in [None, Some(""), Some("1"), Some(" 1\n")] {
+            assert!(super::parse_pages_first(on).expect("on"), "{on:?}");
         }
-        assert!(super::parse_pages_first(Some("1")).expect("on"));
+        assert!(!super::parse_pages_first(Some("0")).expect("off"));
         for bad in ["2", "on", "true", "yes"] {
             assert!(super::parse_pages_first(Some(bad)).is_err(), "{bad}");
         }
