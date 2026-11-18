@@ -1453,6 +1453,38 @@ fn parse_keccak_rnd_arrivals(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
+/// The knob of [`stream_keccak_rnd_records`].
+const STREAM_KECCAK_RND_ENV: &str = "LAMBDA_VM_STREAM_KECCAK_RND";
+
+/// Whether KECCAK_RND's tables are handed out during the windows, each once
+/// the keccak operations its rows come from are all in, held as those
+/// operations for the card to fill (where the card fills KECCAK_RND,
+/// [`CardFill::keccak_rnd`]), so their commits use phase A's idle card instead
+/// of running back to back after the finish's header: a deviation's choice,
+/// else `LAMBDA_VM_STREAM_KECCAK_RND` (off by default). The tables and their
+/// words are the same; their place in the hand-out, and so the groups (the
+/// prover's, bound in the statement), are not.
+fn stream_keccak_rnd_records(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => parse_stream_keccak_rnd(std::env::var(STREAM_KECCAK_RND_ENV).ok().as_deref()),
+    }
+}
+
+/// `LAMBDA_VM_STREAM_KECCAK_RND`: `1` hands KECCAK_RND's tables out during the
+/// windows; unset, empty or `0` (the default) builds them at the finish.
+/// Anything else refuses the prove.
+fn parse_stream_keccak_rnd(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{STREAM_KECCAK_RND_ENV}={v}: 0 (the default: KECCAK_RND built at the finish) or 1 \
+             (handed out during the windows)"
+        ))),
+    }
+}
+
 /// The knob of [`rest_airs_beside`].
 const REST_AIRS_BESIDE_ENV: &str = "LAMBDA_VM_REST_AIRS_BESIDE";
 
@@ -4228,6 +4260,10 @@ pub(crate) struct Deviations {
     /// first table (`Some(false)`), instead of the knob
     /// ([`rest_airs_beside`]).
     pub rest_airs_beside: Option<bool>,
+    /// KECCAK_RND's tables handed out during the windows (`Some(true)`) or
+    /// built at the finish (`Some(false)`), instead of the knob
+    /// ([`stream_keccak_rnd_records`]).
+    pub stream_keccak_rnd: Option<bool>,
     /// With the AIR set built beside them, each early KECCAK_RND table laid
     /// out with the AIR named for the next table: an AIR the run's set does
     /// not have at that place, which the prove must refuse.
@@ -7131,6 +7167,30 @@ fn prove_streamed(
                 "built before the rest's first table"
             }
         );
+        let stream_keccak_rnd = stream_keccak_rnd_records(deviations.stream_keccak_rnd)?;
+        if stream_keccak_rnd {
+            if !(options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5) {
+                return Err(Error::Prover(format!(
+                    "{STREAM_KECCAK_RND_ENV}=1 needs KECCAK_RND cut into its tables \
+                     (finish_keccak_rnd_chunks, at least 2^5 rows)"
+                )));
+            }
+            if deviations.omit_first_keccak_rnd {
+                return Err(Error::Prover(
+                    "omit_first_keccak_rnd is a deviation of KECCAK_RND built at the finish: a \
+                     streamed table lands by its index"
+                        .into(),
+                ));
+            }
+        }
+        eprintln!(
+            "★ BLOCK KECCAK_RND STREAM: {} ({STREAM_KECCAK_RND_ENV})",
+            if stream_keccak_rnd {
+                "each table handed out during the windows once its operations are in"
+            } else {
+                "built at the finish (the default)"
+            }
+        );
         let from_tables = bitwise_from_tables_or_default(deviations.bitwise_from_tables);
         let mut card_fill = match (
             deviations.card_fill,
@@ -7362,7 +7422,10 @@ fn prove_streamed(
                 }
                 let mut builder =
                     WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
-                if options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5 {
+                if stream_keccak_rnd {
+                    // Checked above: KECCAK_RND is cut into its tables.
+                    builder = builder.keccak_rnd_chunks(1usize << options.keccak_rnd_rows_log2)?;
+                } else if options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5 {
                     builder = builder
                         .keccak_rnd_chunks_at_finish(1usize << options.keccak_rnd_rows_log2)?;
                 }
@@ -7409,6 +7472,11 @@ fn prove_streamed(
                 }
                 if card_fill.keccak_rnd {
                     builder = builder.card_fill_keccak_rnd();
+                    // The finish holds its KECCAK_RND tables as records only
+                    // when it packs them; the streamed ones follow it.
+                    if stream_keccak_rnd && options.pack_finished {
+                        builder = builder.stream_keccak_rnd_records()?;
+                    }
                     #[cfg(test)]
                     if deviations.card_fill_records_fault > 0 {
                         builder =
@@ -8133,6 +8201,40 @@ fn prove_streamed(
         stamps.producer = waits.stamps();
         let laid =
             laid.map_err(|_| Error::Prover("the block's layout thread panicked".into()))??;
+        if stream_keccak_rnd {
+            // Where the streamed KECCAK_RND tables went: each group's count.
+            let mut groups: Vec<(usize, usize)> = Vec::new();
+            for &(table, _, air) in &laid.streamed_air {
+                if table != StreamTable::KeccakRnd {
+                    continue;
+                }
+                let g = laid
+                    .groups
+                    .iter()
+                    .position(|g| g.contains(&(air as u32)))
+                    .unwrap_or(usize::MAX);
+                match groups.last_mut() {
+                    Some((last, n)) if *last == g => *n += 1,
+                    _ => groups.push((g, 1)),
+                }
+            }
+            eprintln!(
+                "BLOCK KECCAK_RND STREAMED: {} table(s) handed out during the windows of {} \
+                 · records {} · group:tables [{}]",
+                groups.iter().map(|&(_, n)| n).sum::<usize>(),
+                laid.table_counts.keccak_rnd,
+                if card_fill.keccak_rnd && options.pack_finished {
+                    "on (the card fills them)"
+                } else {
+                    "off (laid out on the host)"
+                },
+                groups
+                    .iter()
+                    .map(|(g, n)| format!("{g}:{n}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
         let block = match block {
             Ok(block) => block,
             Err(drained) => {
@@ -11741,6 +11843,19 @@ mod rest_airs_beside_tests {
     use crate::tables::keccak_rnd::KeccakRndForm;
     use crate::test_utils::create_keccak_rnd_air_for;
     use stark::proof::options::ProofOptions;
+
+    /// The streamed KECCAK_RND knob: off unset, empty or `0` (the default);
+    /// on at `1`; any other word refuses.
+    #[test]
+    fn the_stream_keccak_rnd_knob_is_off_by_default_and_refuses_other_words() {
+        for off in [None, Some(""), Some("0"), Some(" 0\n")] {
+            assert!(!super::parse_stream_keccak_rnd(off).expect("a word it takes"));
+        }
+        assert!(super::parse_stream_keccak_rnd(Some("1")).expect("on"));
+        for bad in ["yes", "2", "on"] {
+            assert!(super::parse_stream_keccak_rnd(Some(bad)).is_err(), "{bad}");
+        }
+    }
 
     /// The arrivals measurement's knob: off unset, empty or `0`; on at `1`;
     /// any other word refuses.

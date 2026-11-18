@@ -5308,6 +5308,234 @@ fn a_wrong_records_table_is_refused_by_the_verifier() {
     );
 }
 
+/// ★ KECCAK_RND handed out during the windows ([`Deviations::stream_keccak_rnd`],
+/// the `LAMBDA_VM_STREAM_KECCAK_RND` knob): with the card filling KECCAK_RND,
+/// each table whose operations are all in before the run ends goes out as its
+/// records with the streamed chunks, the finish holds the others, and the
+/// proof verifies with the same tables and statement counts and a partition
+/// of its own (the prover's, bound in the statement). Off, unset and `false`
+/// prove the same partition; under the deterministic grind their bytes are
+/// equal, and the streamed arm's bytes are the same twice.
+#[test]
+fn keccak_rnd_streamed_during_the_windows_proves_and_verifies() {
+    let _fills = records_fill_lock();
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let proved = |stream: Option<bool>| {
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                card_fill: Some(true),
+                stream_keccak_rnd: stream,
+                ..Deviations::default()
+            },
+        )
+        .expect("prove");
+        assert!(verify(&proof, &elf, &format), "stream {stream:?}");
+        (proof, stamps)
+    };
+    let (unset, _) = proved(None);
+    let (off, off_stamps) = proved(Some(false));
+    let (on, on_stamps) = proved(Some(true));
+    let tables = on.table_counts.keccak_rnd;
+    assert!(tables > 1, "{tables} KECCAK_RND tables");
+    assert_eq!(
+        off_stamps.layout.records_rest.0, tables,
+        "off: every one at the finish"
+    );
+    let streamed = on_stamps.streamed.1 - off_stamps.streamed.1;
+    assert!(
+        streamed > 0 && streamed < tables,
+        "{streamed} of {tables} KECCAK_RND tables streamed"
+    );
+    assert_eq!(
+        on_stamps.layout.records_rest.0,
+        tables - streamed,
+        "the finish holds the ones not streamed"
+    );
+    assert_eq!(unset.groups, off.groups, "unset is off");
+    assert_eq!(on.table_num_vars, off.table_num_vars);
+    assert_eq!(
+        format!("{:?}", on.table_counts),
+        format!("{:?}", off.table_counts)
+    );
+    assert_ne!(
+        on.groups, off.groups,
+        "the streamed tables kept the partition"
+    );
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&unset), bytes(&off), "unset is off, byte for byte");
+        let (again, _) = proved(Some(true));
+        assert_eq!(bytes(&on), bytes(&again), "the streamed arm, twice");
+    }
+}
+
+/// ★ KECCAK_RND's streamed chunks keep the regenerators' ranks: with live
+/// regeneration dropping every streamed chunk it can, a KECCAK_RND chunk
+/// handed out among them (as records, or built on the host) keeps its place in
+/// the hand-out with no recipe, so every dropped chunk is the one its rank
+/// names, none is KECCAK_RND, and the proof is the one without regeneration.
+#[test]
+fn streamed_keccak_rnd_chunks_keep_the_regenerators_ranks() {
+    let _fills = records_fill_lock();
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    for card_fill in [false, true] {
+        let arm = |mode| {
+            regenerated(
+                &elf,
+                &format,
+                mode,
+                Deviations {
+                    card_fill: Some(card_fill),
+                    stream_keccak_rnd: Some(true),
+                    ..Deviations::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("card fill {card_fill}, {mode:?}: {e:?}"))
+        };
+        let (plain, plain_stamps) = arm(RegenMode::Off);
+        let (dropped, stamps) = arm(RegenMode::Always);
+        let what = format!("card fill {card_fill}");
+        let r = stamps.regen.as_ref().expect("live regeneration's readout");
+        assert_eq!((r.mismatches, r.failed), (0, 0), "{what}: {:?}", r.lines);
+        assert!(r.error.is_none(), "{what}: {:?}", r.lines);
+        assert!(
+            r.dropped > r.rest_dropped && r.regenerated >= r.dropped,
+            "{what}: no streamed chunk dropped and rebuilt: {:?}",
+            r.lines
+        );
+        assert_eq!(
+            stamps.streamed.1, plain_stamps.streamed.1,
+            "{what}: the hand-out"
+        );
+        assert!(
+            verify(&plain, &elf, &format),
+            "{what}: without regeneration"
+        );
+        assert!(verify(&dropped, &elf, &format), "{what}: regenerated");
+        assert_eq!(dropped.groups, plain.groups, "{what}: the partition");
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(&dropped), bytes(&plain), "{what}: the proof");
+        }
+    }
+}
+
+/// ★ A streamed KECCAK_RND proof refuses what the streamed tables could get
+/// wrong: a wrong table (its records starting a row late, the streamed chunks'
+/// and the finish's alike: the prover makes a proof the verifier refuses), and
+/// a partition tampered at a streamed KECCAK_RND table — moved to the next
+/// group (still a partition: the statement and the stacks move with it), named
+/// in two groups, or left out.
+#[test]
+fn a_streamed_keccak_rnd_proof_refuses_a_wrong_table_and_a_tampered_partition() {
+    let _fills = records_fill_lock();
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    let proved = |fault: usize| {
+        prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                card_fill: Some(true),
+                card_fill_records_fault: fault,
+                stream_keccak_rnd: Some(true),
+                ..Deviations::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("the prover refused ({e:?}): the verifier was never asked"))
+    };
+    let (wrong, stamps) = proved(1);
+    assert!(stamps.streamed.1 > 0, "nothing streamed");
+    assert!(
+        !verify(&wrong, &elf, &format),
+        "a proof over a wrong KECCAK_RND table verified"
+    );
+    let (proof, _) = proved(0);
+    assert!(verify(&proof, &elf, &format));
+    // A KECCAK_RND table in a group with a group after it.
+    let range = block_whir::chunked_table_ranges(&proof.table_counts)
+        .into_iter()
+        .find(|(name, ..)| *name == "KECCAK_RND")
+        .map(|(_, range, _)| range)
+        .expect("KECCAK_RND's range");
+    let (g, at) = proof
+        .groups
+        .iter()
+        .enumerate()
+        .take(proof.groups.len() - 1)
+        .find_map(|(g, tables)| {
+            tables
+                .iter()
+                .position(|&t| range.contains(&(t as usize)))
+                .map(|at| (g, at))
+        })
+        .expect("a KECCAK_RND table before the last group");
+    let table = proof.groups[g][at];
+    // Out of its group (the group gone if it held only this table).
+    let without = |p: &BlockWhirProof| {
+        let mut p = p.clone();
+        p.groups[g].remove(at);
+        let next = if p.groups[g].is_empty() {
+            p.groups.remove(g);
+            g
+        } else {
+            g + 1
+        };
+        (p, next)
+    };
+    let (mut moved, next) = without(&proof);
+    moved.groups[next].insert(0, table);
+    assert!(
+        block_whir::validate_groups(&moved.groups, proof.table_num_vars.len()).is_ok(),
+        "the move keeps a partition"
+    );
+    assert!(
+        !verify(&moved, &elf, &format),
+        "KECCAK_RND table {table} moved to the next group"
+    );
+    let mut twice = proof.clone();
+    twice.groups[g + 1].push(table);
+    let Err(crate::Error::InvalidTableCounts(why)) =
+        verify_block_whir(&twice, &elf, &ProofOptions::default_test_options(), &format)
+    else {
+        panic!("table {table} in two groups verified");
+    };
+    assert_eq!(why, format!("table {table} is in two groups"));
+    let (dropped, _) = without(&proof);
+    let Err(crate::Error::InvalidTableCounts(why)) = verify_block_whir(
+        &dropped,
+        &elf,
+        &ProofOptions::default_test_options(),
+        &format,
+    ) else {
+        panic!("table {table} left out verified");
+    };
+    assert!(why.starts_with("the groups cover"), "{why}");
+}
+
 /// The tests that hold tables as records, and the ones that count the fills,
 /// run one at a time: the fill count (`multilinear::records::fills`) is the
 /// process's, and each prove reads it across its own window, so a records table

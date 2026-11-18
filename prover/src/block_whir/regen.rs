@@ -525,7 +525,8 @@ impl Recipe {
 }
 
 /// A streamed table's place in the recorder's lists: [`StreamTable::ALL`]'s,
-/// KECCAK_RND aside (a build that streams it is never recorded).
+/// KECCAK_RND aside (its streamed chunks keep their place in the hand-out but
+/// are never recorded: [`Recorder::window`]).
 fn slot(table: StreamTable) -> Option<usize> {
     match table {
         StreamTable::Cpu => Some(0),
@@ -672,8 +673,10 @@ impl Recorder {
             r.ends[t].push(end);
         }
         for job in jobs {
-            // Held as its records and kept: in its place in the hand-out.
-            if job.is_records() && self.keep_records {
+            // Held as its records and kept, or a KECCAK_RND chunk (no
+            // regenerator cuts one; never dropped): in its place in the
+            // hand-out, with no recipe.
+            if (job.is_records() && self.keep_records) || job.table == StreamTable::KeccakRnd {
                 r.by_order.push(None);
                 continue;
             }

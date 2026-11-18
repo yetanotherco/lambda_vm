@@ -7692,6 +7692,14 @@ pub struct StreamSkip {
     pub keccak_rnd_rows: usize,
     /// KECCAK_RND chunks already handed out (with `keccak_rnd_rows`).
     pub keccak_rnd: usize,
+    /// Each KECCAK_RND chunk handed out during the windows holds the keccak
+    /// operations its rows come from (`keccak_rnd::KeccakRndRecords`), for the
+    /// card to fill, instead of its columns
+    /// ([`WindowedTraceBuilder::stream_keccak_rnd_records`]). The words are the
+    /// same. `false` everywhere else.
+    ///
+    /// [`WindowedTraceBuilder::stream_keccak_rnd_records`]: windowed::WindowedTraceBuilder::stream_keccak_rnd_records
+    pub keccak_rnd_records: bool,
     /// Rows per KECCAK, ECSM, ECDAS and COPY table when the build cuts them
     /// into the tables the block's split makes ([`cut_tables`], each packed as
     /// it is built with [`Self::pack`]); zero builds each whole, as every build
