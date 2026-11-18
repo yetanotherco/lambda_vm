@@ -639,6 +639,79 @@ fn the_blake3_driver_with_level_1_filled_beside_proves_the_same_level_bytes() {
     }
 }
 
+/// The BLAKE3 driver with every level's prepared stacks retired and revived
+/// beside their groups' argues (`LAMBDA_VM_LEVELS_REVIVE_BESIDE`) proves the
+/// same level bytes as [`prove_levels`] does over the same base with held
+/// stacks, and some group revived beside with none falling back. Needs
+/// `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_with_revive_beside_proves_the_same_level_bytes() {
+    use super::levels::{prove_block_levels, set_stacks_for_test};
+    use super::wlfm::{StackPlace, set_revive_beside_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_revive_beside_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = {
+        let _restore = Restore;
+        let _retired = set_stacks_for_test(Some(StackPlace::CardRetired));
+        set_revive_beside_for_test(Some(true));
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level")
+    };
+    let beside: usize = run
+        .times
+        .stamps
+        .iter()
+        .map(|st| st.groups.iter().filter(|g| g.revive_beside).count())
+        .sum();
+    let fell_back: usize = run
+        .times
+        .stamps
+        .iter()
+        .map(|st| st.groups.iter().filter(|g| g.revive_fell_back).count())
+        .sum();
+    println!("LEVELS REVIVE BESIDE: {beside} groups revived beside · {fell_back} fell back");
+    assert!(beside > 0, "some group revived beside its argue");
+    assert_eq!(fell_back, 0, "no revive beside fell back on a small block");
+    let held = {
+        let _held = set_stacks_for_test(Some(StackPlace::Card));
+        derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive")
+    };
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
+        println!(
+            "LEVELS REVIVE BESIDE IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
+}
+
 /// The fill-beside knob's name; it is on by default, and only `0` turns it
 /// off.
 #[test]
