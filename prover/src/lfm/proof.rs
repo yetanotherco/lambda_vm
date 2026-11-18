@@ -471,6 +471,11 @@ impl LfmFilled {
     /// The claimed words, for a test that proves a FALSE claim over an
     /// honest trace (the forger's statement).
     #[cfg(test)]
+    /// The words the execution published, in emission order.
+    pub(crate) fn public_words(&self) -> &[(u32, LfmWord)] {
+        &self.public_words
+    }
+
     pub(crate) fn public_words_mut(&mut self) -> &mut Vec<(u32, LfmWord)> {
         &mut self.public_words
     }

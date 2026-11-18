@@ -851,3 +851,83 @@ fn the_legs_arena_in_pieces_is_its_arena_under_both_families() {
     }
     assert!(most >= 2, "some fixture has several groups (most {most})");
 }
+
+/// ★ A W-LFM prove observed group by group (`prove_wlfm_traces_observed`)
+/// hands out, as it opens each group, the parts from which the next level's
+/// arena is written piece by piece: the front at the first group, each group's
+/// words at its own; together they are the arena `wlfm_leg_arena` writes from
+/// the finished proof, under both families, held and streamed. The observer
+/// reads: the proof is the unobserved prove's, byte for byte.
+#[test]
+fn an_observed_prove_hands_out_the_next_levels_arena_group_by_group() {
+    use super::wlfm::{WlfmFamily, WlfmProving};
+    use super::wlfm_leg::{WlfmChild, wlfm_leg_arena, wlfm_leg_front, wlfm_leg_group};
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let hasher = HasherKind::Poseidon1W16;
+    let (level, arenas) = super::levels_probe::level_program(4, 256);
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let build = super::wlfm::build_wlfm_under(
+            &level,
+            hasher,
+            WlfmRate::Two,
+            super::wlfm::WlfmLevers::with_family(family),
+            false,
+        )
+        .expect("builds");
+        for proving in [WlfmProving::Streamed, WlfmProving::Held] {
+            let filled = || {
+                super::wlfm::execute_and_fill_unmerged(&level, &arenas, hasher).expect("executes")
+            };
+            let first = filled();
+            let public = first.public_words().to_vec();
+            let child = WlfmChild {
+                artifacts: build.artifacts.clone(),
+                num_public_words: public.len(),
+            };
+            let groups = child.artifacts.sizes.len();
+            assert!(groups >= 2, "{family:?}: several groups");
+            let front: std::sync::Mutex<Option<Vec<super::word::LfmWord>>> =
+                std::sync::Mutex::new(None);
+            let pieces: std::sync::Mutex<Vec<Option<Vec<super::word::LfmWord>>>> =
+                std::sync::Mutex::new(vec![None; groups]);
+            let observed =
+                super::wlfm::prove_wlfm_traces_observed(&build, first, true, proving, &|opened| {
+                    let mut f = front.lock().unwrap();
+                    if f.is_none() {
+                        *f = Some(
+                            wlfm_leg_front(&child, &public, opened.roots, opened.commit_ood)
+                                .expect("the front"),
+                        );
+                    }
+                    let words = wlfm_leg_group(
+                        &child,
+                        opened.group,
+                        opened.argue.expect("a batched argue"),
+                        opened.opening,
+                        opened.prepared,
+                    )
+                    .expect("the group's words");
+                    let mut p = pieces.lock().unwrap();
+                    assert!(p[opened.group].is_none(), "a group opened twice");
+                    p[opened.group] = Some(words);
+                })
+                .expect("proves");
+            let plain =
+                super::wlfm::prove_wlfm_traces_as(&build, filled(), true, proving).expect("proves");
+            let bytes = |p: &WlfmProof| rkyv::to_bytes::<rkyv::rancor::Error>(p).expect("bytes");
+            assert!(
+                bytes(&observed)[..] == bytes(&plain)[..],
+                "{family:?} {proving:?}: the observer moves no byte"
+            );
+            let mut joined = front.into_inner().unwrap().expect("a front");
+            for (g, piece) in pieces.into_inner().unwrap().into_iter().enumerate() {
+                joined.extend(piece.unwrap_or_else(|| panic!("group {g} was never observed")));
+            }
+            assert!(
+                joined == wlfm_leg_arena(&child, &observed).expect("the arena"),
+                "{family:?} {proving:?}: the observed pieces are the next level's arena"
+            );
+        }
+    }
+}
