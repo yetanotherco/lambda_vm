@@ -196,6 +196,11 @@ pub trait TreeStep<F: IsField> {
     fn batchable(&self) -> bool {
         false
     }
+    /// Whether this step's next round runs on the card (for
+    /// [`ladder_times`]).
+    fn on_card(&self) -> bool {
+        false
+    }
     /// This round's polynomial from the sums a batch read back for the
     /// request [`Self::batch_request`] made: what [`Self::round`] returns.
     fn round_from_sums(
@@ -414,7 +419,16 @@ where
     }
 
     fn to_host(&mut self) -> Result<(), Error> {
-        self.hand_over()
+        let started = std::time::Instant::now();
+        let out = self.hand_over();
+        if ladder_times::on() {
+            ladder_times::add(ladder_times::CROSSOVER, started);
+        }
+        out
+    }
+
+    fn on_card(&self) -> bool {
+        self.session.is_some()
     }
 }
 
@@ -570,7 +584,12 @@ where
         let Some(mut session) = self.session.take() else {
             return Ok(());
         };
-        let halves = session.finish(self.previous.as_ref())?;
+        let started = std::time::Instant::now();
+        let halves = session.finish(self.previous.as_ref());
+        if ladder_times::on() {
+            ladder_times::add(ladder_times::FINISH, started);
+        }
+        let halves = halves?;
         let rounds = self.lefts.len();
         let eq: Vec<FieldElement<F>> = crate::eq::eq_evals(&self.point[rounds..])
             .iter()
@@ -624,6 +643,10 @@ where
                 .session
                 .as_ref()
                 .is_some_and(|session| session.batchable(self.previous.is_some()))
+    }
+
+    fn on_card(&self) -> bool {
+        self.session.is_some()
     }
 
     fn round_from_sums(
@@ -729,8 +752,14 @@ where
         weights: [FieldElement<F>; 2],
         claim: &(FieldElement<F>, FieldElement<F>),
     ) -> Result<Box<dyn TreeStep<F> + '_>, Error> {
+        let started = std::time::Instant::now();
+        let timed = ladder_times::on();
         let Some(device) = self.device() else {
-            return Ok(Box::new(HostStep::over(self.layer(layer), point, weights)?));
+            let step = HostStep::over(self.layer(layer), point, weights)?;
+            if timed {
+                ladder_times::add(ladder_times::OPEN_HOST, started);
+            }
+            return Ok(Box::new(step));
         };
         // A level near the output comes here whole, as today's prefix does:
         // its rounds are over cubes a core walks in microseconds. Never the
@@ -743,8 +772,40 @@ where
                     stage: "layer to host",
                 })?;
             let next = FractionLayer::new(p, q)?;
-            return Ok(Box::new(HostStep::over(&next, point, weights)?));
+            let step = HostStep::over(&next, point, weights)?;
+            if timed {
+                ladder_times::add(ladder_times::OPEN_HOST, started);
+            }
+            return Ok(Box::new(step));
         }
+        // A layer with no card round finishes as it opens: counted there.
+        let finished = ladder_times::seconds(ladder_times::FINISH);
+        let step = self.card_step(device, layer, point, weights, claim);
+        if timed {
+            ladder_times::add(ladder_times::OPEN_CARD, started);
+            ladder_times::take_back(
+                ladder_times::OPEN_CARD,
+                ladder_times::seconds(ladder_times::FINISH) - finished,
+            );
+        }
+        step
+    }
+}
+
+impl<F: IsField + 'static> crate::gkr::FractionTree<F>
+where
+    FieldElement<F>: Send + Sync,
+{
+    /// [`LadderTree::step`] over a level the card holds: Gruen's session, or
+    /// today's.
+    fn card_step(
+        &self,
+        device: &crate::gpu::DeviceTree,
+        layer: usize,
+        point: &[FieldElement<F>],
+        weights: [FieldElement<F>; 2],
+        claim: &(FieldElement<F>, FieldElement<F>),
+    ) -> Result<Box<dyn TreeStep<F> + '_>, Error> {
         if crate::gkr_gruen::argue_gkr_gruen()
             && let Some(step) = GruenStep::open(device, layer, point, &weights, claim)?
         {
@@ -762,6 +823,103 @@ where
             host: None,
             weights,
         }))
+    }
+}
+
+/// A measurement, never a byte of the proof (`LAMBDA_VM_ARGUE_LADDER_TIMES=1`):
+/// where a ladder's host thread spends its time, summed by kind over one
+/// [`prove_trees`] call and printed as one `LADDER TIMES` line at its end.
+pub mod ladder_times {
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    /// A step opened over layers the host holds: a host tree's, or a level
+    /// near the output brought here from the card (the prefix).
+    pub(crate) const OPEN_HOST: usize = 0;
+    /// A step opened on the card: its session (and its `eq` levels).
+    pub(crate) const OPEN_CARD: usize = 1;
+    /// Card rounds queued ahead of their read-back.
+    pub(crate) const QUEUE: usize = 2;
+    /// Card rounds run to their sums (the wait included).
+    pub(crate) const CARD_ROUND: usize = 3;
+    /// Card steps bound to a challenge, their finishes aside.
+    pub(crate) const CARD_BIND: usize = 4;
+    /// Host rounds and their binds.
+    pub(crate) const HOST_ROUND: usize = 5;
+    /// A card layer handed to the host at its last card round (its finish).
+    pub(crate) const FINISH: usize = 6;
+    /// The crossover's hand-overs.
+    pub(crate) const CROSSOVER: usize = 7;
+    /// Each step's halves read at its end.
+    pub(crate) const HALVES: usize = 8;
+    const KINDS: usize = 9;
+    const NAMES: [&str; KINDS] = [
+        "open host",
+        "open card",
+        "queue",
+        "card rounds",
+        "card binds",
+        "host rounds",
+        "finishes",
+        "crossover",
+        "halves",
+    ];
+
+    thread_local! {
+        static SPENT: RefCell<([f64; KINDS], [u64; KINDS])> =
+            const { RefCell::new(([0.0; KINDS], [0; KINDS])) };
+    }
+
+    /// Whether the times are kept (`LAMBDA_VM_ARGUE_LADDER_TIMES=1`). Read once.
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("LAMBDA_VM_ARGUE_LADDER_TIMES").is_ok_and(|v| v.trim() == "1")
+        })
+    }
+
+    /// The seconds since `since` to `kind`, and one more of it.
+    pub(crate) fn add(kind: usize, since: Instant) {
+        let secs = since.elapsed().as_secs_f64();
+        SPENT.with(|spent| {
+            let mut spent = spent.borrow_mut();
+            spent.0[kind] += secs;
+            spent.1[kind] += 1;
+        });
+    }
+
+    /// The seconds kept for `kind` so far on this thread.
+    pub(crate) fn seconds(kind: usize) -> f64 {
+        SPENT.with(|spent| spent.borrow().0[kind])
+    }
+
+    /// Takes `secs` back from `kind` (time a nested kind already counted).
+    pub(crate) fn take_back(kind: usize, secs: f64) {
+        SPENT.with(|spent| spent.borrow_mut().0[kind] -= secs);
+    }
+
+    /// Starts a ladder's tally.
+    pub(crate) fn begin() {
+        SPENT.with(|spent| *spent.borrow_mut() = ([0.0; KINDS], [0; KINDS]));
+    }
+
+    /// The ladder's line: `trees`, `steps`, its wall time since `started`,
+    /// each kind's milliseconds and count, and the rest.
+    pub(crate) fn line(trees: usize, steps: usize, started: Instant) -> String {
+        let total = started.elapsed().as_secs_f64();
+        SPENT.with(|spent| {
+            let spent = spent.borrow();
+            let parts: Vec<String> = (0..KINDS)
+                .map(|k| format!("{} {:.3} ms ({})", NAMES[k], spent.0[k] * 1e3, spent.1[k]))
+                .collect();
+            let other = total - spent.0.iter().sum::<f64>();
+            format!(
+                "LADDER TIMES: trees {trees} · steps {steps} · total {:.3} ms · {} · other {:.3} ms",
+                total * 1e3,
+                parts.join(" · "),
+                other * 1e3
+            )
+        })
     }
 }
 
@@ -846,6 +1004,11 @@ where
 {
     let input_vars: Vec<usize> = trees.iter().map(|t| t.input_vars()).collect();
     let steps = input_vars.iter().copied().max().unwrap_or(0);
+    let timed = ladder_times::on();
+    let started = std::time::Instant::now();
+    if timed {
+        ladder_times::begin();
+    }
 
     let mut claims: Vec<(FieldElement<F>, FieldElement<F>)> =
         trees.iter().map(|tree| tree.output()).collect();
@@ -900,7 +1063,11 @@ where
             };
             for (step, &joins) in stepping.iter_mut().zip(&joins) {
                 if !joins {
+                    let at = std::time::Instant::now();
                     step.prefetch()?;
+                    if timed && step.on_card() {
+                        ladder_times::add(ladder_times::QUEUE, at);
+                    }
                 }
             }
             let mut batched = batch_round(&mut stepping, &joins)?;
@@ -908,7 +1075,20 @@ where
             for (k, step) in stepping.iter_mut().enumerate() {
                 let own = match batched[k].take() {
                     Some(own) => own,
-                    None => step.round()?,
+                    None => {
+                        let at = std::time::Instant::now();
+                        let card = timed && step.on_card();
+                        let own = step.round()?;
+                        if timed {
+                            let kind = if card {
+                                ladder_times::CARD_ROUND
+                            } else {
+                                ladder_times::HOST_ROUND
+                            };
+                            ladder_times::add(kind, at);
+                        }
+                        own
+                    }
                 };
                 if own.len() != 3 {
                     return Err(Error::RoundDegreeMismatch {
@@ -926,7 +1106,24 @@ where
             }
             let r: FieldElement<F> = transcript.sample_field_element();
             for step in stepping.iter_mut() {
+                if !timed {
+                    step.bind(&r)?;
+                    continue;
+                }
+                // A card step's last bind finishes its layer: counted there.
+                let (at, card) = (std::time::Instant::now(), step.on_card());
+                let finished = ladder_times::seconds(ladder_times::FINISH);
                 step.bind(&r)?;
+                let kind = if card {
+                    ladder_times::CARD_BIND
+                } else {
+                    ladder_times::HOST_ROUND
+                };
+                ladder_times::add(kind, at);
+                ladder_times::take_back(
+                    kind,
+                    ladder_times::seconds(ladder_times::FINISH) - finished,
+                );
             }
             rounds.push(sumcheck::RoundProof { evaluations: sent });
             z.push(r);
@@ -934,7 +1131,11 @@ where
 
         let mut halves = Vec::with_capacity(active.len());
         for step in &stepping {
+            let at = std::time::Instant::now();
             let h = step.halves()?;
+            if timed {
+                ladder_times::add(ladder_times::HALVES, at);
+            }
             for v in [&h.p_lo, &h.p_hi, &h.q_lo, &h.q_hi] {
                 transcript.append_field_element(v);
             }
@@ -963,6 +1164,9 @@ where
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or(Error::NoVariablesLeft)?;
+    if timed {
+        eprintln!("{}", ladder_times::line(trees.len(), steps, started));
+    }
     Ok((LockstepProof { layers }, inputs))
 }
 
