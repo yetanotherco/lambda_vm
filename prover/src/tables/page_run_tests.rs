@@ -1169,14 +1169,67 @@ fn prepared_by_name(format: &BlockFormat) -> Vec<(String, Vec<Vec<FE>>)> {
         .collect()
 }
 
+/// The prepared tables of an AIR set over `pages` (any page list: the
+/// program's DECODE, chip-free counts) under `format`, each by its table's
+/// name.
+fn prepared_over(pages: &[PageConfig], format: &BlockFormat) -> Vec<(String, Vec<Vec<FE>>)> {
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let opts = ProofOptions::default_test_options();
+    let counts = chip_free_counts();
+    let inputs =
+        crate::BlockAirInputs::new(&opts, &program, vec![4; counts.cpu], &[]).expect("inputs");
+    let mut airs = crate::block_airs(
+        &program,
+        &opts,
+        pages,
+        &counts,
+        &inputs,
+        format.keccak_rnd,
+        format.memw_aligned,
+        format.registers,
+    );
+    airs.with_word_memory_at(
+        &opts,
+        CPU_WORD_TABLES.map(|n| n as usize),
+        pages,
+        format.page_run_log2,
+    )
+    .expect("the word tables");
+    let refs = airs.air_refs();
+    block_whir::prepared_tables(&airs, pages, format)
+        .expect("the prepared tables")
+        .into_iter()
+        .map(|(table, columns)| (refs[table].name().to_string(), columns))
+        .collect()
+}
+
 /// ★ The prepared opening settles the same pages at every run: the genesis
 /// rule reads the pages (its page count and each page's candidacy), never the
 /// tables, and a dense page is a page of data, a table of its own, so the
 /// opening's columns and the PAGE_W tables they settle (by name) are the same
-/// with runs off and on. As the program's pages fall (none dense: DECODE
-/// alone), and with every page of data dense (forced, on this thread).
+/// with runs off and on. On a frame's pages as the program's pages fall (none
+/// dense: DECODE alone) and with every page of data dense (forced, on this
+/// thread); and on a page list where pages of data follow blocks (so a page
+/// table's index is not its page's), forced dense.
 #[test]
 fn the_dense_pages_are_the_same_at_every_page_run() {
+    // Zero pages 64..68 (a block of four), a page of data at 68, zero pages
+    // 69..72, a page of data at 72, two private-input pages.
+    let data = |base| PageConfig::with_data(base, elf_data());
+    let mut pages = run(64 * PAGE, 4, PageConfig::zero_init);
+    pages.push(data(68 * PAGE));
+    pages.extend(run(69 * PAGE, 3, PageConfig::zero_init));
+    pages.push(data(72 * PAGE));
+    pages.extend(run(INPUT_BASE, 2, |b| private(b, true)));
+    let tables = page_tables(&pages, 4).expect("cut");
+    assert!(
+        tables
+            .iter()
+            .enumerate()
+            .any(|(i, t)| t.kind == PageTableKind::Page && t.first != i),
+        "a page of data whose table index is not its page's"
+    );
     for forced in [false, true] {
         block_whir::DENSE_PAGES_FORCED.with(|c| c.set(forced));
         let checked = std::panic::catch_unwind(|| {
@@ -1195,6 +1248,17 @@ fn the_dense_pages_are_the_same_at_every_page_run() {
                     prepared_by_name(&words().with_page_run(run_log2)) == today,
                     "forced {forced}: the opening at 2^{run_log2} is today's"
                 );
+            }
+            if forced {
+                let today = prepared_over(&pages, &words());
+                let settled: Vec<&str> = today.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(settled, ["DECODE", "PAGE_W:0x1100000", "PAGE_W:0x1200000"]);
+                for run_log2 in [1, 2, 4] {
+                    assert!(
+                        prepared_over(&pages, &words().with_page_run(run_log2)) == today,
+                        "the opening over blocks at 2^{run_log2} is today's"
+                    );
+                }
             }
         });
         block_whir::DENSE_PAGES_FORCED.with(|c| c.set(false));
