@@ -639,15 +639,17 @@ fn the_blake3_driver_with_level_1_filled_beside_proves_the_same_level_bytes() {
     }
 }
 
-/// The fill-beside knob's name; only `1` turns it on, and it is off by
-/// default.
+/// The fill-beside knob's name; it is on by default, and only `0` turns it
+/// off.
 #[test]
-fn the_fill_beside_knob_is_named_and_off_by_default() {
+fn the_fill_beside_knob_is_named_and_on_by_default() {
     use super::levels::{FILL_BESIDE_ENV, fill_beside};
+    use super::wlfm_knobs::knob_word_off;
     assert_eq!(FILL_BESIDE_ENV, "LAMBDA_VM_LEVELS_FILL_BESIDE");
     if std::env::var_os(FILL_BESIDE_ENV).is_none() {
-        assert!(!fill_beside());
+        assert!(fill_beside());
     }
+    assert!(knob_word_off(Some("0")) && !knob_word_off(Some("1")) && !knob_word_off(None));
 }
 
 /// The BLAKE3 driver with level 1's lean round tables filled beside its
