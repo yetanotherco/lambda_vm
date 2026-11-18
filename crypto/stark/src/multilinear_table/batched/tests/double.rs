@@ -250,6 +250,42 @@ fn a_wrong_round_is_refused_on_the_two_layer_ladder() {
     );
 }
 
+/// The fixture's last step (CPU alone, one layer, degree 3): each of its four
+/// values one off is refused at that step; a round removed from or added to
+/// the mixed step is refused by name.
+#[test]
+fn a_final_one_layer_step_and_a_steps_round_count_are_refused_on_the_argue() {
+    for value in 0..4 {
+        assert_eq!(
+            tampered_double(|p| {
+                let h = &mut p.argue.gkr[0].layers[2].halves[0];
+                *[&mut h.p_lo, &mut h.p_hi, &mut h.q_lo, &mut h.q_hi][value] += ExtE::one();
+            }),
+            Err(MlError::LayerRelationMismatch { layer: 2 }),
+            "value {value}"
+        );
+    }
+    assert_eq!(
+        tampered_double(|p| {
+            p.argue.gkr[0].layers[1].sumcheck.rounds.pop();
+        }),
+        Err(MlError::RoundCountMismatch {
+            expected: 2,
+            got: 1
+        })
+    );
+    assert_eq!(
+        tampered_double(|p| {
+            let extra = p.argue.gkr[0].layers[1].sumcheck.rounds[0].clone();
+            p.argue.gkr[0].layers[1].sumcheck.rounds.push(extra);
+        }),
+        Err(MlError::RoundCountMismatch {
+            expected: 2,
+            got: 3
+        })
+    );
+}
+
 // ─── negatives: provers that break the format ────────────────────────────
 
 /// ★ Every fault the one-layer ladder refuses, refused on the two-layer one:
