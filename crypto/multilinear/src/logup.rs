@@ -15,7 +15,10 @@
 //! the verifier computes, leaving a single affine combination of factors per
 //! side. Both rules are degree 2 once the row weight is counted.
 
-use math::field::{element::FieldElement, traits::IsField};
+use math::field::{
+    element::FieldElement,
+    traits::{IsField, IsSubFieldOf},
+};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -183,6 +186,62 @@ pub fn input_layer<E: IsField + 'static>(
     FractionLayer::new(Mle::new(p)?, Mle::new(q)?)
 }
 
+/// `LAMBDA_VM_ARGUE_HOST_TREE_LEAN=1`: a batched argue's tree that its card
+/// path declined is built on the host from only the factors its interactions
+/// read ([`input_layer_lean`]) instead of the table's whole lifted trace. The
+/// same tree. Off by default (and for any word but `1`); read once a process.
+pub const HOST_TREE_LEAN_ENV: &str = "LAMBDA_VM_ARGUE_HOST_TREE_LEAN";
+
+/// Whether [`HOST_TREE_LEAN_ENV`] is on.
+pub fn host_tree_lean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(HOST_TREE_LEAN_ENV).is_ok_and(|v| v.trim() == "1"))
+}
+
+/// [`input_layer`] of `interactions` over a table's factors, lifting only the
+/// factors the interactions read ([`crate::constraint_argument::TraceData::factors_at`])
+/// rather than the whole trace: the same layer, cell for cell. For a wide
+/// table whose interactions are cut into chunks, each reading a few of its
+/// columns.
+pub fn input_layer_lean<F, E>(
+    interactions: &[Interaction<E>],
+    trace: &crate::constraint_argument::TraceData<F, E>,
+) -> Result<FractionLayer<E>, Error>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+    FieldElement<E>: Send + Sync,
+    crate::constraint_argument::TraceData<F, E>: Sync,
+{
+    // The slots read, in order, with at least one so the layer has a size.
+    let mut slots: Vec<usize> = interactions
+        .iter()
+        .flat_map(|i| i.numerator.terms().iter().chain(i.denominator.terms()))
+        .map(|(slot, _)| *slot)
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    if slots.is_empty() {
+        slots.push(0);
+    }
+    let factors = trace.factors_at(&slots)?;
+    let at = |slot: usize| slots.binary_search(&slot).unwrap_or(0);
+    let remap = |side: &Affine<E>| {
+        Affine::new(
+            side.terms()
+                .iter()
+                .map(|(slot, c)| (at(*slot), c.clone()))
+                .collect(),
+            side.constant_term().clone(),
+        )
+    };
+    let remapped: Vec<Interaction<E>> = interactions
+        .iter()
+        .map(|i| Interaction::new(remap(&i.numerator), remap(&i.denominator)))
+        .collect();
+    input_layer(&remapped, &factors)
+}
+
 /// A table's input layer as a plan over its base columns (D-BATCH M1-2): for
 /// each interaction's two sides, its terms — where the column a factor reads
 /// starts in the table's run of columns (`column · rows`) and its shift, mod
@@ -264,6 +323,134 @@ pub fn resident_tree_from_columns<F: IsField + 'static, E: IsField + 'static>(
     let tree =
         crate::gpu::input_layer_tree_from_columns(store, first, trace.num_columns(), rows, &plan)?;
     crate::gkr::FractionTree::from_device(tree).ok()
+}
+
+/// `LAMBDA_VM_ARGUE_PUBLIC_COLUMNS=1`: a batched argue's tree whose
+/// interactions read a public factor ([`FactorKind::Public`], a selector) is
+/// built on the card from a small store of the committed columns it reads
+/// and its public factors as base columns ([`resident_tree_with_public`]),
+/// where today it has no plan and goes to the host. The same tree. Off by
+/// default (and for any word but `1`); read once a process.
+///
+/// [`FactorKind::Public`]: crate::constraint_argument::FactorKind::Public
+pub const PUBLIC_COLUMNS_ENV: &str = "LAMBDA_VM_ARGUE_PUBLIC_COLUMNS";
+
+/// Whether [`PUBLIC_COLUMNS_ENV`] is on.
+pub fn public_columns() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(PUBLIC_COLUMNS_ENV).is_ok_and(|v| v.trim() == "1"))
+}
+
+/// [`resident_tree_from_columns`] for interactions that read public factors:
+/// the committed columns they read are copied out of the table's resident
+/// store and its public factors added as base columns, into a store of their
+/// own, and the tree is written from it with its sources remapped. `None`
+/// when the table's columns are not on the card, a public factor read is not
+/// base-valued, or the card declines — the caller then takes today's path.
+pub fn resident_tree_with_public<F: IsField + 'static, E: IsField + 'static>(
+    interactions: &[Interaction<E>],
+    trace: &crate::constraint_argument::TraceData<F, E>,
+) -> Option<crate::gkr::FractionTree<E>> {
+    if interactions.is_empty() {
+        return None;
+    }
+    let (store, first) = trace.resident_shared()?;
+    let rows = 1usize << trace.num_vars();
+    let gathered = public_plan(interactions, trace.kinds(), trace.public_tables(), rows)?;
+    let store_columns: Vec<usize> = gathered.columns.iter().map(|c| first + c).collect();
+    let extra: Vec<&[u64]> = gathered.public.iter().map(Vec::as_slice).collect();
+    let small = crate::gpu::gather_resident(&store, &store_columns, &extra)?;
+    let width = store_columns.len() + extra.len();
+    let tree = crate::gpu::input_layer_tree_from_columns(
+        std::sync::Arc::new(small),
+        0,
+        width,
+        rows,
+        &gathered.plan,
+    )?;
+    crate::gkr::FractionTree::from_device(tree).ok()
+}
+
+/// What [`resident_tree_with_public`] gathers: the table's columns the
+/// interactions read (by their index among the table's columns), its public
+/// factors they read as base columns, and the plan over the small store that
+/// holds the first and then the second, in that order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicPlan {
+    pub columns: Vec<usize>,
+    pub public: Vec<Vec<u64>>,
+    pub plan: InputPlan,
+}
+
+/// [`PublicPlan`] for `interactions` over a table with factor `kinds` and
+/// `public` tables, `rows` high. `None` when a public factor read is not
+/// base-valued, or a slot is unknown.
+pub fn public_plan<E: IsField + 'static>(
+    interactions: &[Interaction<E>],
+    kinds: &[crate::constraint_argument::FactorKind],
+    public: &[Mle<E>],
+    rows: usize,
+) -> Option<PublicPlan> {
+    use crate::claim_reduce::FactorSource;
+    use crate::constraint_argument::FactorKind;
+    let mut slots: Vec<usize> = interactions
+        .iter()
+        .flat_map(|i| i.numerator.terms().iter().chain(i.denominator.terms()))
+        .map(|(slot, _)| *slot)
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    // Each public table's place among the public slots.
+    let public_at = |slot: usize| {
+        kinds[..slot]
+            .iter()
+            .filter(|k| k.source().is_none())
+            .count()
+    };
+    let mut columns: Vec<usize> = Vec::new();
+    let mut public_columns: Vec<Vec<u64>> = Vec::new();
+    let mut public_slots: Vec<usize> = Vec::new();
+    let mut sources: Vec<Option<FactorSource>> = vec![None; kinds.len()];
+    for &slot in &slots {
+        match kinds.get(slot)? {
+            FactorKind::Committed(src) => {
+                let at = match columns.iter().position(|&c| c == src.column) {
+                    Some(at) => at,
+                    None => {
+                        columns.push(src.column);
+                        columns.len() - 1
+                    }
+                };
+                sources[slot] = Some(FactorSource::shifted(at, src.offset));
+            }
+            FactorKind::Public => {
+                let table = public.get(public_at(slot))?;
+                if table.len() != rows {
+                    return None;
+                }
+                let mut column = Vec::with_capacity(rows);
+                for value in table.evals() {
+                    let [base, x, y] = crate::gpu::ext3_raw(value)?;
+                    if x != 0 || y != 0 {
+                        return None;
+                    }
+                    column.push(base);
+                }
+                public_columns.push(column);
+                public_slots.push(slot);
+            }
+        }
+    }
+    // The public columns follow the committed ones in the small store.
+    for (k, &slot) in public_slots.iter().enumerate() {
+        sources[slot] = Some(FactorSource::direct(columns.len() + k));
+    }
+    let plan = input_plan(interactions, &sources, rows)?;
+    Some(PublicPlan {
+        columns,
+        public: public_columns,
+        plan,
+    })
 }
 
 /// [`resident_tree_from_columns`] with its output fraction left unread
@@ -573,6 +760,174 @@ mod input_plan_tests {
             assert_eq!(p.len(), count * rows, "unpadded: the real cells only");
             assert_eq!(p[..], want.p.evals()[..count * rows]);
         }
+    }
+
+    /// ★ The lean host layer is the full-lift layer, cell for cell: a table of
+    /// eight columns with two shifted factors and two public ones, its
+    /// interactions cut into chunks that each read a few slots (one reads a
+    /// public factor, one only constants), every chunk's layer from only the
+    /// factors it reads equals the layer from every factor lifted.
+    #[test]
+    fn the_lean_host_layer_is_the_full_lift_layer() {
+        use crate::constraint_argument::{FactorKind, TraceData};
+        use crate::mle::Mle;
+        let rows = 16usize;
+        let width = 8usize;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let columns: Vec<Mle<Gl>> = (0..width)
+            .map(|_| {
+                Mle::new(
+                    (0..rows)
+                        .map(|_| FieldElement::<Gl>::from(next(&mut seed)))
+                        .collect(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut kinds: Vec<FactorKind> = (0..width).map(FactorKind::direct).collect();
+        kinds.push(FactorKind::shifted(2, 1)); // slot 8
+        kinds.push(FactorKind::Public); // slot 9
+        kinds.push(FactorKind::shifted(5, 3)); // slot 10
+        kinds.push(FactorKind::Public); // slot 11
+        let public: Vec<Mle<Ext3>> = (0..2)
+            .map(|k| {
+                Mle::new(
+                    (0..rows)
+                        .map(|r| EE::from(u64::from(r + k < rows - 1)))
+                        .collect(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let trace = TraceData::<Gl, Ext3>::new(columns, kinds, public).unwrap();
+        let coeff = |seed: &mut u64| EE::from(next(seed));
+        let all = trace.factors().unwrap();
+        let chunks: Vec<Vec<Interaction<Ext3>>> = vec![
+            vec![
+                Interaction::new(
+                    Affine::new(vec![(3, coeff(&mut seed))], coeff(&mut seed)),
+                    Affine::new(
+                        vec![(1, coeff(&mut seed)), (8, coeff(&mut seed))],
+                        coeff(&mut seed),
+                    ),
+                ),
+                Interaction::new(
+                    Affine::factor(7),
+                    Affine::new(vec![(10, coeff(&mut seed))], coeff(&mut seed)),
+                ),
+            ],
+            vec![Interaction::new(
+                Affine::factor(9),
+                Affine::new(
+                    vec![(11, coeff(&mut seed)), (4, coeff(&mut seed))],
+                    coeff(&mut seed),
+                ),
+            )],
+            vec![Interaction::new(
+                Affine::constant(coeff(&mut seed)),
+                Affine::constant(coeff(&mut seed)),
+            )],
+        ];
+        for (k, chunk) in chunks.iter().enumerate() {
+            let want = input_layer(chunk, &all).unwrap();
+            let got = input_layer_lean(chunk, &trace).unwrap();
+            assert_eq!(got.p.evals(), want.p.evals(), "chunk {k}: the numerators");
+            assert_eq!(got.q.evals(), want.q.evals(), "chunk {k}: the denominators");
+        }
+    }
+
+    /// ★ A chunk that reads public selectors gets a plan over a small store of
+    /// the committed columns it reads followed by its selectors as base
+    /// columns, and that plan writes the full-lift input layer, cell for cell:
+    /// shifted reads, a column read twice, two selectors, and a chunk with no
+    /// public read; a public table that is not base-valued has no such plan.
+    #[test]
+    fn a_public_plan_writes_the_full_lift_layer() {
+        use crate::constraint_argument::FactorKind;
+        let rows = 16usize;
+        let width = 6usize;
+        let mut seed = 0xC0FF_EE11_u64;
+        let columns: Vec<Vec<u64>> = (0..width)
+            .map(|_| {
+                (0..rows)
+                    .map(|_| next(&mut seed) % 0xFFFF_FFFF_0000_0001)
+                    .collect()
+            })
+            .collect();
+        let mut kinds: Vec<FactorKind> = (0..width).map(FactorKind::direct).collect();
+        kinds.push(FactorKind::Public); // slot 6
+        kinds.push(FactorKind::shifted(4, 2)); // slot 7
+        kinds.push(FactorKind::Public); // slot 8
+        let public: Vec<Mle<Ext3>> = (0..2u64)
+            .map(|k| {
+                Mle::new(
+                    (0..rows as u64)
+                        .map(|r| EE::from(u64::from(r + k < rows as u64 - 1)))
+                        .collect(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let factor = |slot: usize| -> Mle<Ext3> {
+            match kinds[slot] {
+                FactorKind::Committed(src) => Mle::new(
+                    (0..rows)
+                        .map(|r| {
+                            FieldElement::<Gl>::from(columns[src.column][(r + src.offset) % rows])
+                                .to_extension::<Ext3>()
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+                FactorKind::Public => public[kinds[..slot]
+                    .iter()
+                    .filter(|k| k.source().is_none())
+                    .count()]
+                .clone(),
+            }
+        };
+        let factors: Vec<Mle<Ext3>> = (0..kinds.len()).map(factor).collect();
+        let chunks: Vec<Vec<Interaction<Ext3>>> = vec![
+            vec![
+                Interaction::new(
+                    Affine::factor(6),
+                    Affine::new(
+                        vec![(1, ext(&mut seed)), (7, ext(&mut seed))],
+                        ext(&mut seed),
+                    ),
+                ),
+                Interaction::new(
+                    Affine::new(
+                        vec![(8, ext(&mut seed)), (1, ext(&mut seed))],
+                        ext(&mut seed),
+                    ),
+                    Affine::new(vec![(4, ext(&mut seed))], ext(&mut seed)),
+                ),
+            ],
+            vec![Interaction::new(
+                Affine::factor(3),
+                Affine::new(vec![(5, ext(&mut seed))], ext(&mut seed)),
+            )],
+        ];
+        for (k, chunk) in chunks.iter().enumerate() {
+            let gathered = public_plan(chunk, &kinds, &public, rows).expect("a public plan");
+            let mut flat: Vec<u64> = gathered
+                .columns
+                .iter()
+                .flat_map(|&c| columns[c].clone())
+                .collect();
+            for column in &gathered.public {
+                flat.extend_from_slice(column);
+            }
+            let want = input_layer(chunk, &factors).unwrap();
+            let (p, q) = run_plan(&gathered.plan, &flat, rows, true);
+            assert_eq!(p, want.p.evals(), "chunk {k}: the numerators");
+            assert_eq!(q, want.q.evals(), "chunk {k}: the denominators");
+        }
+        // A public table with an extension part is not a base column.
+        let mut odd = public.clone();
+        odd[0] = Mle::new((0..rows).map(|_| ext(&mut seed)).collect()).unwrap();
+        assert_eq!(public_plan(&chunks[0], &kinds, &odd, rows), None);
     }
 
     /// A side that reads a public factor has no plan: the caller keeps

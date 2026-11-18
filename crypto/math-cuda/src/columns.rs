@@ -186,6 +186,52 @@ impl DeviceColumns {
         })
     }
 
+    /// A new store of `columns` of `src` (copied on the card, in that order)
+    /// followed by `extra` (copied from the host): a small store for a reader
+    /// that needs a few of a store's columns beside columns of its own. `None`
+    /// as for [`Self::upload`].
+    pub fn gather(src: &DeviceColumns, columns: &[usize], extra: &[&[u64]]) -> Option<Self> {
+        if columns.is_empty() && extra.is_empty() {
+            return None;
+        }
+        if columns.iter().any(|&k| k >= src.spans.len()) {
+            return None;
+        }
+        let total: usize = columns.iter().map(|&k| src.spans[k].1).sum::<usize>()
+            + extra.iter().map(|c| c.len()).sum::<usize>();
+        let be = backend().ok()?;
+        let Some(room) = be.reserve(total as u64 * 8) else {
+            crate::device::note_device_fallback();
+            return None;
+        };
+        let stream = be.next_stream();
+        // SAFETY: every element is written by the copies below.
+        let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, total) }.ok()?;
+        let mut spans = Vec::with_capacity(columns.len() + extra.len());
+        let mut at = 0usize;
+        // The source's own uploads ended before it was shared (it is
+        // read-only after), so copies issued on this stream race with nothing.
+        for &k in columns {
+            let len = src.spans[k].1;
+            src.copy_into(k, &mut buffer, at, &stream).ok()?;
+            spans.push((at, len));
+            at += len;
+        }
+        for column in extra {
+            let mut slab = buffer.slice_mut(at..at + column.len());
+            stream.memcpy_htod(*column, &mut slab).ok()?;
+            spans.push((at, column.len()));
+            at += column.len();
+        }
+        stream.synchronize().ok()?;
+        Some(Self {
+            stream,
+            buffer: Arc::new(buffer),
+            spans,
+            _room: room,
+        })
+    }
+
     /// [`Self::upload`] of whole tables, each as it is held: a packed one
     /// crosses the bus at its packed bytes and is widened on the card, column
     /// by column, into the run its columns take — the same words, at the same

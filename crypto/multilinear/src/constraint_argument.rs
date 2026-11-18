@@ -570,6 +570,12 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         &self.kinds
     }
 
+    /// The public tables, in the order the [`FactorKind::Public`] slots take
+    /// them.
+    pub fn public_tables(&self) -> &[Mle<E>] {
+        &self.public
+    }
+
     pub fn num_vars(&self) -> usize {
         self.num_vars
     }
@@ -623,6 +629,60 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
             .map(std::sync::Arc::new);
         }
         slot.clone()
+    }
+
+    /// The factors at `slots` only, in that order: what [`Self::factors`]
+    /// holds at those slots, without lifting the rest of the trace. For a
+    /// caller that needs a few of a wide table's factors (one chunk's
+    /// interactions, say).
+    pub fn factors_at(&self, slots: &[usize]) -> Result<Vec<Mle<E>>, Error>
+    where
+        F: IsSubFieldOf<E>,
+        FieldElement<E>: Send + Sync,
+    {
+        let columns = self.columns();
+        let public_at: Vec<usize> = self
+            .kinds
+            .iter()
+            .scan(0usize, |seen, kind| {
+                let at = *seen;
+                if kind.source().is_none() {
+                    *seen += 1;
+                }
+                Some(at)
+            })
+            .collect();
+        let build = |&slot: &usize| -> Result<Mle<E>, Error> {
+            let kind = self.kinds.get(slot).ok_or(Error::UnknownPolynomial {
+                index: slot,
+                len: self.kinds.len(),
+            })?;
+            match kind {
+                FactorKind::Committed(s) => {
+                    let column = columns.get(s.column).ok_or(Error::UnknownPolynomial {
+                        index: s.column,
+                        len: columns.len(),
+                    })?;
+                    let shift = s.offset % column.len();
+                    let (wrapped, rest) = column.evals().split_at(shift);
+                    Mle::new(
+                        rest.iter()
+                            .chain(wrapped)
+                            .map(|v| v.clone().to_extension::<E>())
+                            .collect(),
+                    )
+                }
+                FactorKind::Public => self
+                    .public
+                    .get(public_at[slot])
+                    .cloned()
+                    .ok_or(Error::EmptyPolynomial),
+            }
+        };
+        #[cfg(feature = "parallel")]
+        return slots.par_iter().map(build).collect();
+        #[cfg(not(feature = "parallel"))]
+        return slots.iter().map(build).collect();
     }
 
     pub fn factors(&self) -> Result<Vec<Mle<E>>, Error>

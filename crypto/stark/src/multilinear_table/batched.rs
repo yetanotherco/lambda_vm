@@ -854,9 +854,15 @@ where
     let queue = multilinear::round_slot::argue_round_slot()
         != multilinear::round_slot::RoundSlotSetting::Off;
     let host_built = |t: usize, list: &[Interaction<E>]| -> Result<BinTree<E>, MlError> {
-        let factors = tables[t].trace.factors()?;
+        // Lean: only the factors this tree's interactions read are lifted
+        // (`LAMBDA_VM_ARGUE_HOST_TREE_LEAN`); the same layer either way.
+        let layer = if logup::host_tree_lean() {
+            logup::input_layer_lean(list, &tables[t].trace)?
+        } else {
+            logup::input_layer(list, &tables[t].trace.factors()?)?
+        };
         Ok(BinTree::Built(Box::new(
-            multilinear::gkr::FractionTree::build(logup::input_layer(list, &factors)?)?,
+            multilinear::gkr::FractionTree::build(layer)?,
         )))
     };
     for bin in &plan.bins {
@@ -897,6 +903,16 @@ where
                     && trace.device_factors().is_none())
                 .then(columns_tree)
                 .flatten()
+                .or_else(|| {
+                    // A chunk that reads a public factor (a selector) has no
+                    // plan over the table's columns: built on the card from
+                    // the columns it reads and its selectors
+                    // (`LAMBDA_VM_ARGUE_PUBLIC_COLUMNS`).
+                    (logup::public_columns() && trace.device_factors().is_none())
+                        .then(|| logup::resident_tree_with_public(interactions, trace))
+                        .flatten()
+                        .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
+                })
                 .or_else(|| {
                     let resident = trace.reside_from_columns();
                     resident_seen = Some(resident.is_some());
