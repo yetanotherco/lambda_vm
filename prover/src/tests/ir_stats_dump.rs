@@ -160,3 +160,202 @@ fn dump_ir_stats() {
     stats(&create_copy_w_air(&opts), "COPY_W");
     stats(&create_is_wh_air(&opts), "IS_WH");
 }
+
+/// The fused zerocheck's slot file a thread, by schedule (a probe, not a test):
+/// today's lowering (`lower_fused`, the step order as compiled), the same order
+/// with each variable and constant read where it is used (no slot held for
+/// them), and a greedy order that steps next whichever ready step frees the
+/// most slots. The grid pass keeps every slot of every thread in global
+/// memory, so a slot file past the card's L2 makes each step a trip to DRAM.
+#[test]
+#[ignore = "analysis dump, not a test"]
+fn dump_fused_slots_by_schedule() {
+    use multilinear::fused::Constraints;
+    use multilinear::program::Op as P;
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    let report = |air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+                  label: &str| {
+        let width = air.trace_layout().0;
+        let layout = crate::multilinear_prove::layout_of(air, width, 12).expect("a layout");
+        let shape = layout.shape();
+        let c = Constraints::<Gl>::from_extension(
+            &shape.steps_as_ops(),
+            shape.root_steps(),
+            shape.selector_of_root(),
+            shape.degree(),
+        )
+        .expect("base constraints");
+        let today = multilinear::gpu_fused::lower_fused(&c).map_or(0, |l| l.num_slots);
+        let steps = c.steps();
+        let n = steps.len();
+        let leaf = |s: usize| matches!(steps[s], P::Fixed(_) | P::Var(_));
+        let operands = |s: usize| -> Vec<usize> {
+            match steps[s] {
+                P::Neg(a) => vec![a as usize],
+                P::Add(a, b) | P::Sub(a, b) | P::Mul(a, b) => vec![a as usize, b as usize],
+                _ => Vec::new(),
+            }
+        };
+        // Readers of each step, roots read once more by their ACC.
+        let mut readers = vec![0usize; n];
+        for s in 0..n {
+            for o in operands(s) {
+                readers[o] += 1;
+            }
+        }
+        for &r in c.roots() {
+            readers[r as usize] += 1;
+        }
+        // Max live over an order of the non-leaf steps (leaves read at use).
+        let live_over = |order: &[usize]| -> usize {
+            let mut left = readers.clone();
+            let mut live = 0usize;
+            let mut most = 0usize;
+            let mut is_root = vec![0usize; n];
+            for &r in c.roots() {
+                is_root[r as usize] += 1;
+            }
+            for &s in order {
+                live += 1;
+                most = most.max(live);
+                for o in operands(s) {
+                    if !leaf(o) {
+                        left[o] -= 1;
+                        if left[o] == 0 {
+                            live -= 1;
+                        }
+                    }
+                }
+                // Its ACC, right after it.
+                if is_root[s] > 0 {
+                    left[s] -= is_root[s];
+                }
+                if left[s] == 0 {
+                    live -= 1;
+                }
+            }
+            most
+        };
+        let compiled: Vec<usize> = (0..n).filter(|&s| !leaf(s)).collect();
+        // Greedy: among ready steps, the one whose operands it ends most.
+        let mut done = vec![false; n];
+        for s in 0..n {
+            done[s] = leaf(s);
+        }
+        let mut left = readers.clone();
+        let mut users: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut waiting = vec![0usize; n];
+        for s in 0..n {
+            if leaf(s) {
+                continue;
+            }
+            for o in operands(s) {
+                if !leaf(o) {
+                    users[o].push(s);
+                    waiting[s] += 1;
+                }
+            }
+        }
+        let mut ready: std::collections::BTreeSet<usize> =
+            (0..n).filter(|&s| !leaf(s) && waiting[s] == 0).collect();
+        let mut greedy = Vec::with_capacity(compiled.len());
+        while !ready.is_empty() {
+            // Score: operands this step ends (a non-leaf with one reader left).
+            let pick = *ready
+                .iter()
+                .take(256)
+                .max_by_key(|&&s| {
+                    let ends = operands(s)
+                        .iter()
+                        .filter(|&&o| !leaf(o) && left[o] == 1)
+                        .count();
+                    (ends, std::cmp::Reverse(s))
+                })
+                .expect("a ready step");
+            ready.remove(&pick);
+            greedy.push(pick);
+            done[pick] = true;
+            for o in operands(pick) {
+                if !leaf(o) {
+                    left[o] -= 1;
+                }
+            }
+            for &u in &users[pick] {
+                waiting[u] -= 1;
+                if waiting[u] == 0 {
+                    ready.insert(u);
+                }
+            }
+        }
+        assert_eq!(
+            greedy.len(),
+            compiled.len(),
+            "{label}: every step scheduled"
+        );
+        // Depth first from each root in turn: a step's operands before it, the
+        // one needing more first, each step once.
+        let mut need = vec![0usize; n];
+        for s in 0..n {
+            if leaf(s) {
+                continue;
+            }
+            let mut ns: Vec<usize> = operands(s)
+                .iter()
+                .filter(|&&o| !leaf(o))
+                .map(|&o| need[o])
+                .collect();
+            ns.sort_unstable_by(|a, b| b.cmp(a));
+            need[s] = ns
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v + i)
+                .max()
+                .unwrap_or(0)
+                .max(1);
+        }
+        let mut emitted = vec![false; n];
+        let mut dfs = Vec::with_capacity(compiled.len());
+        for &root in c.roots() {
+            let mut stack = vec![(root as usize, false)];
+            while let Some((s, expanded)) = stack.pop() {
+                if leaf(s) || emitted[s] {
+                    continue;
+                }
+                if expanded {
+                    emitted[s] = true;
+                    dfs.push(s);
+                    continue;
+                }
+                stack.push((s, true));
+                let mut ops: Vec<usize> = operands(s)
+                    .into_iter()
+                    .filter(|&o| !leaf(o) && !emitted[o])
+                    .collect();
+                // The larger need is stepped first: pushed last.
+                ops.sort_unstable_by_key(|&o| need[o]);
+                for o in ops {
+                    stack.push((o, false));
+                }
+            }
+        }
+        // Steps no root reaches (none expected) go last, in order.
+        for s in 0..n {
+            if !leaf(s) && !emitted[s] {
+                dfs.push(s);
+            }
+        }
+        println!(
+            "FUSED SLOTS {label:<10} steps {n:6} roots {:5} · today {today:5} · leaves at use {:5} · greedy {:5} · depth first {:5}",
+            c.roots().len(),
+            live_over(&compiled),
+            live_over(&greedy),
+            live_over(&dfs),
+        );
+    };
+    report(&create_cpu_air(&opts, 0), "CPU");
+    report(&create_keccak_rnd_air(&opts), "KECCAK_RND");
+    report(&create_keccak_w_air(&opts), "KECCAK_W");
+    report(&create_ecdas_air(&opts), "ECDAS");
+    report(&create_ecrec_w_air(&opts), "ECREC_W");
+    report(&create_copy_w_air(&opts), "COPY_W");
+}
