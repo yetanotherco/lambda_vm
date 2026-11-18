@@ -934,7 +934,7 @@ fn rta_one_run(
         println!(
             "RTA LEVEL1 EXEC: schedule {:.3}s · need pass {:.3}s · buckets {:.3}s · first wave {:.3}s · setup {:.3}s · \
              levels {} (on the pool {}, {} hashes) · hashing {:.3}s (on the driver's thread {} hashes in {:.3}s) · apply \
-             {:.3}s · the rest {:.3}s",
+             {:.3}s · the rest {:.3}s · machine beside {:.3}s (waited {:.3}s; memory beside {}, prefault {})",
             x.depth_pass,
             x.need_pass,
             x.bucket_build,
@@ -947,7 +947,11 @@ fn rta_one_run(
             x.serial_hashes,
             x.serial_hash_secs,
             x.apply,
-            x.residue
+            x.residue,
+            x.state_beside,
+            x.state_wait,
+            super::executor::memory_beside(),
+            super::executor::prefault_beside(),
         );
     }
     let (lean, lean_wait) = t.lean_beside.unwrap_or_default();
@@ -988,7 +992,7 @@ fn rta_one_run(
             println!(
                 "RTA LEVEL {} BUILD: stacks {} · prepared cells {} · prepare {:.3}s · commit {:.3}s \
                  · prefix pack {:.3}s · committed at {:.3}s · prepare groups {:.3}s · columns {:.3}s · \
-                 stacks {:.3}s · columns on the pool {}",
+                 stacks {:.3}s · columns on the pool {} · on the card {}",
                 k + 1,
                 place_word(b.place),
                 b.cells,
@@ -1000,6 +1004,10 @@ fn rta_one_run(
                 b.prepare_split[1],
                 b.prepare_split[2],
                 super::wlfm::prepare_par(),
+                match b.card_transpose {
+                    Some((up, back)) => format!("up and transposed {up:.3}s · back {back:.3}s"),
+                    None => "no".to_string(),
+                },
             );
         }
         if let Some(st) = t.stamps.get(k) {

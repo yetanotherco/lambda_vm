@@ -274,6 +274,129 @@ impl LfmRecords {
 }
 
 impl LfmRecords {
+    /// Every vector's reserved room touched a page at a time
+    /// ([`prefault_room`]): the pages are the process's before the waves
+    /// write the slots. No slot is written and no length moves.
+    fn prefault(&mut self) {
+        prefault_room(&mut self.balu);
+        prefault_room(&mut self.xalu);
+        prefault_room(&mut self.select);
+        prefault_room(&mut self.bitdec);
+        prefault_room(&mut self.hash);
+        prefault_room(&mut self.hash16);
+        prefault_room(&mut self.keccak);
+        prefault_room(&mut self.blake3);
+        prefault_room(&mut self.lanes);
+        prefault_room(&mut self.hint);
+        prefault_room(&mut self.public);
+        prefault_room(&mut self.b3l);
+        prefault_room(&mut self.mux);
+        prefault_room(&mut self.cap);
+        prefault_room(&mut self.cap_read);
+    }
+}
+
+/// A vector's reserved room past its length touched once a page (one byte
+/// written each 4 KiB, and its last byte), so the first write of a slot there
+/// takes no page fault. The bytes written are uninitialised room the vector
+/// does not read; its length is unchanged.
+fn prefault_room<T>(v: &mut Vec<T>) {
+    const PAGE: usize = 4096;
+    let size = std::mem::size_of::<T>();
+    if size == 0 {
+        return;
+    }
+    let (from, to) = (v.len() * size, v.capacity() * size);
+    if from >= to {
+        return;
+    }
+    let base = v.as_mut_ptr().cast::<u8>();
+    let mut at = from;
+    while at < to {
+        // SAFETY: `at < to` lies inside the vector's allocation, past its
+        // length: room it owns and has not initialised, which a byte may be
+        // written into.
+        unsafe { base.add(at).write_volatile(0) };
+        at += PAGE;
+    }
+    // SAFETY: as above; the allocation's last byte.
+    unsafe { base.add(to - 1).write_volatile(0) };
+}
+
+/// What an execution writes into, made ahead: the machine's memory (unless
+/// left to the driver), the records' room and the public words' room.
+pub(crate) struct MachineState {
+    memory: Option<WriteOnceMemory>,
+    records: LfmRecords,
+    public_words: Vec<(u32, LfmWord)>,
+    /// The seconds it took, where it was made beside the driver.
+    secs: f64,
+}
+
+impl MachineState {
+    /// `program`'s state: its memory when `with_memory`, and its records' and
+    /// public words' room touched a page at a time when `prefault`.
+    fn new(program: &LfmProgram, with_memory: bool, prefault: bool) -> Self {
+        let memory = with_memory.then(|| WriteOnceMemory::new(program.num_addrs as usize));
+        let mut records = LfmRecords::with_capacity(&program.groups, program.hash16());
+        let mut public_words = Vec::with_capacity(program.groups.public.real_rows);
+        if prefault {
+            records.prefault();
+            prefault_room(&mut public_words);
+        }
+        MachineState {
+            memory,
+            records,
+            public_words,
+            secs: 0.0,
+        }
+    }
+}
+
+/// `LAMBDA_VM_LEVELS_MEMORY_BESIDE=1`: a pieced (level 1's) execution makes its
+/// machine's memory, a write of every word, on a thread of its own beside its
+/// setup, where the driver otherwise makes it after the setup: the memory's
+/// first touch of each page off the driver. The same memory. Off by default
+/// (and for any word but `1`); read once a process.
+pub const MEMORY_BESIDE_ENV: &str = "LAMBDA_VM_LEVELS_MEMORY_BESIDE";
+
+/// `LAMBDA_VM_LEVELS_PREFAULT=1`: a pieced execution touches its records' and
+/// public words' reserved room a page at a time on that beside thread, so the
+/// waves' writes into it take no page fault. The same records. Off by default
+/// (and for any word but `1`); read once a process.
+pub const PREFAULT_ENV: &str = "LAMBDA_VM_LEVELS_PREFAULT";
+
+std::thread_local! {
+    /// A test's `(memory beside, prefault)` on this thread.
+    static STATE_BESIDE_FOR_TEST: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`memory_beside`] and [`prefault_beside`] forced on this
+/// thread (`None` restores the knobs).
+#[doc(hidden)]
+pub fn set_state_beside_for_test(on: Option<(bool, bool)>) {
+    STATE_BESIDE_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`MEMORY_BESIDE_ENV`] is on (or this thread's test override).
+pub fn memory_beside() -> bool {
+    if let Some((memory, _)) = STATE_BESIDE_FOR_TEST.with(std::cell::Cell::get) {
+        return memory;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(MEMORY_BESIDE_ENV).is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether [`PREFAULT_ENV`] is on (or this thread's test override).
+pub fn prefault_beside() -> bool {
+    if let Some((_, prefault)) = STATE_BESIDE_FOR_TEST.with(std::cell::Cell::get) {
+        return prefault;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(PREFAULT_ENV).is_ok_and(|v| v.trim() == "1"))
+}
+
+impl LfmRecords {
     /// Publish every slot the level walk wrote.
     ///
     /// # Safety
@@ -1336,6 +1459,11 @@ pub struct ExecSplit {
     /// schedule is wrong", and those want opposite fixes.
     pub serial_hashes: usize,
     pub serial_hash_secs: f64,
+    /// Under [`memory_beside`] or [`prefault_beside`]: the beside thread's
+    /// seconds making the machine's memory and the records' room, and the
+    /// seconds the driver then waited for it.
+    pub state_beside: f64,
+    pub state_wait: f64,
     /// A streamed execution's own setup, by step: the forward pass that
     /// gives each instruction the groups it waits for, the wave buckets
     /// built from them ([`WaveBuckets`]; 0 unbucketed), and the first wave
@@ -1800,6 +1928,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             false,
             None,
             false,
+            None,
         )
     }
 
@@ -1927,10 +2056,23 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
                 _ => 0,
             }
         };
-        let (need, need_pass, prebuilt) = if setup_fast {
-            // The schedule on a thread of its own, beside the need pass: both
-            // read the program and nothing else.
-            std::thread::scope(|scope| {
+        let (memory_on, prefault_on) = (memory_beside(), prefault_beside());
+        let (need, need_pass, prebuilt, state) = std::thread::scope(|scope| {
+            // The machine's memory and the records' room made on a thread of
+            // their own beside the setup (`LAMBDA_VM_LEVELS_MEMORY_BESIDE`,
+            // `LAMBDA_VM_LEVELS_PREFAULT`): their first touch of every page
+            // off the driver.
+            let state = (memory_on || prefault_on).then(|| {
+                scope.spawn(move || {
+                    let t = Instant::now();
+                    let mut state = MachineState::new(program, memory_on, prefault_on);
+                    state.secs = t.elapsed().as_secs_f64();
+                    state
+                })
+            });
+            let (need, need_pass, prebuilt) = if setup_fast {
+                // The schedule on a thread of its own, beside the need pass:
+                // both read the program and nothing else.
                 let schedule = scope.spawn(|| {
                     let t = Instant::now();
                     let levels = exec_schedule::build_with_merge(program, 1);
@@ -1942,13 +2084,25 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
                 let prebuilt = schedule
                     .join()
                     .map_err(|_| LfmExecError::Internal("the schedule's thread panicked"))?;
-                Ok::<_, LfmExecError>((need, need_pass, Some(prebuilt)))
-            })?
-        } else {
+                (need, need_pass, Some(prebuilt))
+            } else {
+                let t = Instant::now();
+                let need = Self::need_of_pieced(program, group_at);
+                (need, t.elapsed().as_secs_f64(), None)
+            };
             let t = Instant::now();
-            let need = Self::need_of_pieced(program, group_at);
-            (need, t.elapsed().as_secs_f64(), None)
+            let state = state
+                .map(|h| h.join())
+                .transpose()
+                .map_err(|_| LfmExecError::Internal("the machine's beside thread panicked"))?
+                .map(|state| (state, t.elapsed().as_secs_f64()));
+            Ok::<_, LfmExecError>((need, need_pass, prebuilt, state))
+        })?;
+        let (state, state_wait) = match state {
+            Some((state, wait)) => (Some(state), wait),
+            None => (None, 0.0),
         };
+        let state_beside = state.as_ref().map_or(0.0, |s| s.secs);
         let mut streamed = Self::start(
             program,
             hasher,
@@ -1960,8 +2114,11 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             bucketed,
             prebuilt,
             setup_fast,
+            state,
         )?;
         streamed.split.need_pass = need_pass;
+        streamed.split.state_beside = state_beside;
+        streamed.split.state_wait = state_wait;
         streamed.m.pieces = by_arena
             .iter()
             .map(|ps| {
@@ -2034,6 +2191,7 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         bucketed: bool,
         prebuilt: Option<(LevelSchedule, f64)>,
         cached_buckets: bool,
+        state: Option<MachineState>,
     ) -> Result<Self, LfmExecError> {
         let schema = &program.arena_schema.lens;
         let t = Instant::now();
@@ -2056,14 +2214,18 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             ..ExecSplit::default()
         };
         let t = Instant::now();
+        let MachineState {
+            memory,
+            records,
+            public_words,
+            ..
+        } = state.unwrap_or_else(|| MachineState::new(program, true, false));
         let m = Machine {
-            memory: WriteOnceMemory::new(program.num_addrs as usize),
+            memory: memory.unwrap_or_else(|| WriteOnceMemory::new(program.num_addrs as usize)),
             arenas: vec![&[]; schema.len()],
             pieces: Vec::new(),
             caps: Vec::new(),
         };
-        let records = LfmRecords::with_capacity(&program.groups, program.hash16());
-        let public_words = Vec::with_capacity(program.groups.public.real_rows);
         split.setup = t.elapsed().as_secs_f64();
         split.record_bytes = LfmRecords::bytes(&program.groups, program.hash16());
         let mut streamed = Self {

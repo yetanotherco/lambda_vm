@@ -994,6 +994,9 @@ pub struct LevelBuild {
     pub prepare: f64,
     /// The prepare's seconds by part: `[groups, columns, stacks]`.
     pub prepare_split: [f64; 3],
+    /// Under `LAMBDA_VM_LEVELS_PREPARE_ON_CARD`, the commit's card-side
+    /// transpose: `(up and transposed, back on the host)` seconds.
+    pub card_transpose: Option<(f64, f64)>,
     pub commit: f64,
     pub prefix: f64,
     pub cells: u64,
@@ -1548,6 +1551,7 @@ pub fn prove_block_levels(
         place: first.place(),
         prepare: prepare.0,
         prepare_split: prepare.1,
+        card_transpose: first.card_transpose(),
         commit: first.secs().1,
         prefix: first.chip_prefix_secs(),
         cells,
@@ -1658,6 +1662,7 @@ pub fn prove_block_levels(
                 place: build.place(),
                 prepare,
                 prepare_split,
+                card_transpose: build.card_transpose(),
                 commit: build.secs().1,
                 prefix: build.chip_prefix_secs(),
                 cells,

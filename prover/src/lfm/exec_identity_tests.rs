@@ -1349,3 +1349,86 @@ fn lean_cap_reads_run_in_levels_identically() {
     assert!(c.split.parallel_levels > 0, "the candidate forked");
     assert_eq!((a.records.cap.len(), a.records.cap_read.len()), (24, 9));
 }
+
+/// ★ The machine made beside the setup (`LAMBDA_VM_LEVELS_MEMORY_BESIDE`) and
+/// the records' room touched ahead (`LAMBDA_VM_LEVELS_PREFAULT`), each alone
+/// and together, run the same rows and instructions in the same order and
+/// give the serial reference's witness: on the leaf case and every identity
+/// case, landing forwards and backwards.
+#[test]
+fn a_machine_made_beside_runs_the_same_execution() {
+    use super::executor::{StreamedExecution, set_state_beside_for_test, wave_trace};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_state_beside_for_test(None);
+        }
+    }
+    let _restore = Restore;
+    let run = |case: &Case,
+               pieces: &[super::executor::ArenaPiece],
+               order: &[usize],
+               state: (bool, bool)| {
+        set_state_beside_for_test(Some(state));
+        let mut ex = StreamedExecution::new_pieced_setup(
+            &case.program,
+            pieces.to_vec(),
+            &case.hasher,
+            false,
+            true,
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{}: starts: {e:?}", case.name));
+        set_state_beside_for_test(None);
+        if state != (false, false) {
+            assert!(ex.split().state_beside > 0.0, "{}: made beside", case.name);
+        }
+        for &i in order {
+            let p = pieces[i];
+            let words =
+                &case.arenas[p.arena as usize][p.start as usize..(p.start + p.len) as usize];
+            ex.land_piece(p.group, words)
+                .unwrap_or_else(|e| panic!("{}: piece {i} lands: {e:?}", case.name));
+        }
+        ex.finish()
+            .unwrap_or_else(|e| panic!("{}: finishes: {e:?}", case.name))
+    };
+    let (leaf, halves) = one_arena_case();
+    let leaf_pieces: Vec<_> = (0..3u32)
+        .map(|k| super::executor::ArenaPiece {
+            arena: 0,
+            start: k * halves,
+            len: halves,
+            group: k as usize,
+        })
+        .collect();
+    let mut runs: Vec<(&Case, Vec<super::executor::ArenaPiece>, Vec<usize>)> = vec![
+        (&leaf, leaf_pieces.clone(), vec![0, 1, 2]),
+        (&leaf, leaf_pieces, vec![2, 0, 1]),
+    ];
+    let cases = cases();
+    for case in &cases {
+        let pieces = pieces_of(case, 3);
+        let n = pieces.len();
+        runs.push((case, pieces.clone(), (0..n).collect()));
+        runs.push((case, pieces, (0..n).rev().collect()));
+    }
+    for (case, pieces, order) in &runs {
+        let (plain, plain_trace) = wave_trace::record(|| run(case, pieces, order, (false, false)));
+        for state in [(true, false), (false, true), (true, true)] {
+            let (beside, beside_trace) = wave_trace::record(|| run(case, pieces, order, state));
+            assert!(
+                plain_trace == beside_trace,
+                "{}: {order:?}: {state:?} ran another order",
+                case.name
+            );
+            assert_executions_identical(case.name, case.program.num_addrs, &plain, &beside);
+            assert_executions_identical(
+                case.name,
+                case.program.num_addrs,
+                &reference(case),
+                &beside,
+            );
+        }
+    }
+}
