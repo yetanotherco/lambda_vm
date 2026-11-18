@@ -230,8 +230,9 @@ fn the_card_pad_knob_reads_mib_and_refuses_nonsense() {
 }
 
 /// A prove over retired prepared stacks opens each group alone (its revive
-/// gets the room the next group's argue would hold beside it); over held or
-/// host stacks the groups open beside the next argue. The bytes are the same
+/// gets the room the next group's argue would hold beside it) and uploads no
+/// group's columns beside another's commit or argue; over held or host stacks
+/// the groups open beside the next argue and the next columns go up beside. The bytes are the same
 /// (the place tests above, and the stark block's retired-stacks test under
 /// both overlaps).
 #[test]
@@ -247,6 +248,11 @@ fn a_retired_build_opens_each_group_alone() {
         assert!(
             build.phase_b_overlap() == want,
             "{place:?}: phase B's overlap"
+        );
+        assert_eq!(
+            build.uploads_beside(),
+            want == PhaseBOverlap::On,
+            "{place:?}: the next group's columns beside a commit and an argue"
         );
     }
 }

@@ -542,6 +542,33 @@ fn retired_prepared_stacks_prove_the_held_stacks_bytes() {
     }
 }
 
+/// With the next group's columns uploaded at its own turn rather than beside
+/// the argue, phase B proves the same bytes: held or retired prepared stacks,
+/// under either argue format, alone and beside the next argue, and it
+/// verifies.
+#[test]
+fn uploads_at_each_groups_turn_prove_the_same_bytes() {
+    for (argue, before) in ARGUES.into_iter().zip(BEFORE_THE_OVERLAP) {
+        for retired in [false, true] {
+            for overlap in [PhaseBOverlap::Off, PhaseBOverlap::On] {
+                let (proved, _) = prove_block_placed(
+                    &config(argue),
+                    overlap,
+                    &in_order(),
+                    OverlapFaults::default(),
+                    &|block| block.set_phase_b_upload_beside(false),
+                    None,
+                    retired,
+                );
+                let what = format!("{argue:?} retired {retired} {overlap:?}");
+                let proved = proved.unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                assert_eq!(digest(&proved), before, "{what}: the bytes");
+                verify(argue, &proved).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            }
+        }
+    }
+}
+
 /// Off, phase B is one group at a time: no group opens beside an argue, none
 /// is counted serial after a refusal, and the driver pays every opening.
 #[test]

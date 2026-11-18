@@ -1686,6 +1686,9 @@ where
     /// in it.
     overlap: PhaseBOverlap,
     overlap_faults: OverlapFaults,
+    /// Phase B puts the next group's columns on the card beside this group's
+    /// argue ([`Self::with_phase_b_upload_beside`]); `true` unless set.
+    upload_beside: bool,
     /// Phase B stamps its driver thread's schedstat a group turn
     /// ([`Self::with_sched_stamps`]).
     sched: bool,
@@ -2115,6 +2118,7 @@ where
             spilled,
             overlap: PhaseBOverlap::Off,
             overlap_faults: OverlapFaults::default(),
+            upload_beside: true,
             sched: false,
             ood,
             ood_unbound: false,
@@ -2134,6 +2138,20 @@ where
     pub fn with_phase_b_overlap(mut self, overlap: PhaseBOverlap) -> Self {
         self.overlap = overlap;
         self
+    }
+
+    /// Phase B uploads the next group's columns beside this group's argue
+    /// (`true`, the default), or at the next group's own turn, after this
+    /// group's argue and openings (`false`): the argue then has the card's
+    /// room to itself. The proof is the same.
+    pub fn with_phase_b_upload_beside(mut self, beside: bool) -> Self {
+        self.set_phase_b_upload_beside(beside);
+        self
+    }
+
+    /// [`Self::with_phase_b_upload_beside`] in place.
+    pub fn set_phase_b_upload_beside(&mut self, beside: bool) {
+        self.upload_beside = beside;
     }
 
     /// A test's faults in phase B's overlap ([`OverlapFaults`]).
@@ -3269,6 +3287,7 @@ where
         mut spilled,
         overlap,
         overlap_faults,
+        upload_beside,
         sched,
         ood,
         ood_unbound,
@@ -3431,7 +3450,11 @@ where
         let mut batched_argue: Option<BatchedArgue<E>> = None;
         let all: &[CommittedTable<'_, F, E>] = &tables;
         let group_ref = &all[at..at + size];
-        let next = next_g.map(|next| &all[starts[next]..starts[next] + sizes[next]]);
+        // Under `upload_beside` off the next group's columns go up at its own
+        // turn instead (`pre_uploaded` stays empty).
+        let next = next_g
+            .filter(|_| upload_beside)
+            .map(|next| &all[starts[next]..starts[next] + sizes[next]]);
         let roots_ref = &roots;
         let answers_ref = &answers;
         let (argue_result, argue_end, next_store, joined, opened, open_paid) =
