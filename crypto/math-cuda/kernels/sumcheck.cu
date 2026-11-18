@@ -1549,6 +1549,340 @@ __device__ __forceinline__ void gkr_gruen_finish_body(uint64_t *__restrict__ p,
     }
 }
 
+// ── Two tree layers a round's step (`multilinear::gkr_lockstep`, the two-layer ladder) ─────────
+//
+// A step proves layer `ℓ` against layer `ℓ + 2`, whose four quarters `j = 0..3` hold index
+// `b = 2b₁ + b₂` at cell `j·stride` of `p` and of `q`. The middle layer's halves `r = b₂` are the
+// folds of quarters `r` (`b₁ = 0`) and `r + 2` (`b₁ = 1`):
+//
+//   N_r = p_r·q_{r+2} + p_{r+2}·q_r,   D_r = q_r·q_{r+2},
+//   N + λQ = N₀D₁ + N₁D₀ + λD₀D₁ = Σ_r (N_r + (λ/2)·D_r)·D_{1−r}.
+//
+// A thread PAIR a cube index: lanes `2i, 2i + 1` take index `x`, and lane `r = lane & 1` owns
+// quarters `r` and `r + 2` of `p` and `q` — four factors, loaded, folded by the previous challenge
+// and written back as one thread of `gkr_round_gruen` does. Each lane makes, with `w` the weight
+// `e_hi[x >> low]·e_lo[x mod 2^low]` and `h = λ/2`,
+//
+//   Y'_r = (w·q_r)·q_{r+2} = w·D_r,   Z_r = q_{r+2}·(p_r + h·q_r) + p_{r+2}·q_r = N_r + h·D_r,
+//
+// trades `Y'` with its partner (nine limbs) and sums `Z_r(t)·Y'_{1−r}(t)` at `t = 1..4`: the pair
+// adds `w·(N + λQ)`. Every factor is linear in the round's `t`, so each product of two of them is a
+// quadratic, held by its values at `t = 0, 1` and its `t²` coefficient (three multiplications), and
+// `t = 1..4` are walked by finite differences. Ext3 multiplications a lane: 8 folds, 1 weight,
+// 2 for `w·q_r`, 3 for `Y'`, 2 for `h·q_r`, 6 for `Z`, 4 points — 26 on a folding round, 18 on the
+// first (the bench's pair kernel spent 28 and 20).
+//
+// Each lane's four row sums live in shared memory (limb-major, `volatile`), not in registers
+// across the loop: `12·blockDim` u64, then the reduction's `4·warps·3`. The block's rows reduce by
+// warp shuffles, lane 0 of each warp to shared memory, thread 0 over the warps, into
+// `d_partials[(row·gridDim.x + block)·3]`, rows `H(1)..H(4)`. `H(0)` is its own pass
+// (`gkr2_round_h0`), run after the round on the same grid and block: it is wanted only where
+// `1 − u_j = 0`.
+//
+// The lane loop runs whole warps, so every lane reaches every shuffle; a lane past the cube runs
+// with zero values and a zero weight and adds nothing. `gkr2_round_real` is the same round over an
+// input layer kept without its padding: quarter `j ≥ 2` holds only its first `stored_j` cells (the
+// padding is the layer's tail, so quarters 0 and 1 are whole), and past them reads the padding's
+// `0/1` and writes nothing, as `gkr_cell` does for today's halves. No address past a stored run is
+// formed.
+
+template <bool REAL>
+__device__ __forceinline__ bool gkr2_stored(bool upper, uint64_t i, uint64_t stored) {
+    return !REAL || !upper || i < stored;
+}
+
+// Cell `i` of the quarter at cell offset `at` of `f`: stored, or the padding (`den`: `q`'s `1`).
+template <bool REAL>
+__device__ __forceinline__ Fe3 gkr2_cell(const uint64_t *f, uint64_t at, bool upper, bool den,
+                                         uint64_t i, uint64_t stored) {
+    if (gkr2_stored<REAL>(upper, i, stored)) return load_ext(f + (at + i) * 3);
+    return den ? ext3::one() : ext3::zero();
+}
+
+__device__ __forceinline__ void gkr2_store(uint64_t *f, uint64_t cell, const Fe3 &v) {
+    f[cell * 3 + 0] = v.a;
+    f[cell * 3 + 1] = v.b;
+    f[cell * 3 + 2] = v.c;
+}
+
+// One factor's values at `t = 0` (`lo`) and `t = 1` (`hi`) at cube index `x`: with `fold`, the
+// quarter still holds the previous round's cube of `4·quarter` cells, bound to `s` on the way in
+// (`f(x) + s·(f(x + 2Q) − f(x))` at `x` and `x + Q`) and written back where the next round reads it.
+template <bool REAL>
+__device__ __forceinline__ void gkr2_factor(uint64_t *f, uint64_t at, bool upper, bool den,
+                                            uint64_t x, uint64_t quarter, uint32_t fold,
+                                            const Fe3 &s, uint64_t stored, Fe3 &lo, Fe3 &hi) {
+    if (fold) {
+        Fe3 a = gkr2_cell<REAL>(f, at, upper, den, x, stored);
+        Fe3 b = gkr2_cell<REAL>(f, at, upper, den, x + quarter, stored);
+        Fe3 c = gkr2_cell<REAL>(f, at, upper, den, x + 2 * quarter, stored);
+        Fe3 d = gkr2_cell<REAL>(f, at, upper, den, x + 3 * quarter, stored);
+        lo = ext3::add(a, ext3::mul(s, ext3::sub(c, a)));
+        hi = ext3::add(b, ext3::mul(s, ext3::sub(d, b)));
+        if (gkr2_stored<REAL>(upper, x, stored)) gkr2_store(f, at + x, lo);
+        if (gkr2_stored<REAL>(upper, x + quarter, stored)) gkr2_store(f, at + x + quarter, hi);
+    } else {
+        lo = gkr2_cell<REAL>(f, at, upper, den, x, stored);
+        hi = gkr2_cell<REAL>(f, at, upper, den, x + quarter, stored);
+    }
+}
+
+// A quadratic in `t`: its values at 0 and 1 and its `t²` coefficient.
+struct Gkr2Quad {
+    Fe3 v0, v1, c2;
+};
+
+// The product of two linear factors given at `t = 0` and `t = 1`.
+__device__ __forceinline__ Gkr2Quad gkr2_prod(const Fe3 &lo_a, const Fe3 &hi_a, const Fe3 &lo_b,
+                                              const Fe3 &hi_b) {
+    Gkr2Quad r;
+    r.v0 = ext3::mul(lo_a, lo_b);
+    r.v1 = ext3::mul(hi_a, hi_b);
+    r.c2 = ext3::mul(ext3::sub(hi_a, lo_a), ext3::sub(hi_b, lo_b));
+    return r;
+}
+
+__device__ __forceinline__ Gkr2Quad gkr2_qadd(const Gkr2Quad &a, const Gkr2Quad &b) {
+    Gkr2Quad r;
+    r.v0 = ext3::add(a.v0, b.v0);
+    r.v1 = ext3::add(a.v1, b.v1);
+    r.c2 = ext3::add(a.c2, b.c2);
+    return r;
+}
+
+__device__ __forceinline__ Fe3 gkr2_shfl(const Fe3 &v, int src) {
+    return ext3::make(__shfl_sync(0xffffffffu, v.a, src), __shfl_sync(0xffffffffu, v.b, src),
+                      __shfl_sync(0xffffffffu, v.c, src));
+}
+
+// A block's `rows` sums (`acc`, one per lane) by warp shuffles: lane 0 of each warp puts its
+// warp's sums at `scratch` (`rows × warps` ext3) and thread 0 adds the warps' into `d_partials`
+// from row `first`. Every lane of the block must reach it.
+template <int ROWS>
+__device__ __forceinline__ void gkr2_block_rows(const Fe3 (&acc)[ROWS], int first,
+                                                uint64_t *scratch,
+                                                uint64_t *__restrict__ d_partials) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+#pragma unroll
+    for (int row = 0; row < ROWS; row++) {
+        Fe3 v = acc[row];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v = ext3::add(v, gkr2_shfl(v, (int)(lane ^ off)));
+        if (lane == 0) gkr2_store(scratch, (uint64_t)row * warps + warp, v);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int row = 0; row < ROWS; row++) {
+            Fe3 sum = ext3::zero();
+            for (unsigned w = 0; w < warps; w++)
+                sum = ext3::add(sum, load_ext(scratch + ((uint64_t)row * warps + w) * 3));
+            gkr2_store(d_partials, (uint64_t)(first + row) * gridDim.x + blockIdx.x, sum);
+        }
+    }
+}
+
+template <bool REAL, bool SLOT>
+__device__ __forceinline__ void gkr2_round_body(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t h0, uint64_t h1, uint64_t h2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint64_t stored2, uint64_t stored3, uint64_t *__restrict__ d_partials,
+    unsigned int *d_ticket, uint64_t *d_slot, uint64_t seq) {
+    extern __shared__ uint64_t shared[];
+    volatile uint64_t *sacc = shared;
+    const unsigned nb = blockDim.x, tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const uint32_t r = lane & 1u;
+    const int partner = (int)(lane ^ 1u);
+    const Fe3 s = ext3::make(s0, s1, s2);
+    const Fe3 h = ext3::make(h0, h1, h2);
+    const uint64_t mask = ((uint64_t)1 << low) - 1;
+    const uint64_t lanes = 2 * quarter;
+    const uint64_t lo_at = (uint64_t)r * stride, hi_at = (uint64_t)(r + 2) * stride;
+    const uint64_t stored = r == 0 ? stored2 : stored3;
+#pragma unroll
+    for (int k = 0; k < 12; k++) sacc[k * nb + tid] = 0;
+    for (uint64_t base = (uint64_t)blockIdx.x * nb + (tid & ~31u); base < lanes;
+         base += (uint64_t)gridDim.x * nb) {
+        const uint64_t g = base + lane;
+        const uint64_t x = g >> 1;
+        Fe3 pl_lo = ext3::zero(), pl_hi = ext3::zero(), ph_lo = ext3::zero(), ph_hi = ext3::zero();
+        Fe3 ql_lo = ext3::zero(), ql_hi = ext3::zero(), qh_lo = ext3::zero(), qh_hi = ext3::zero();
+        Fe3 w = ext3::zero();
+        if (g < lanes) {
+            gkr2_factor<REAL>(p, lo_at, false, false, x, quarter, fold, s, 0, pl_lo, pl_hi);
+            gkr2_factor<REAL>(p, hi_at, true, false, x, quarter, fold, s, stored, ph_lo, ph_hi);
+            gkr2_factor<REAL>(q, lo_at, false, true, x, quarter, fold, s, 0, ql_lo, ql_hi);
+            gkr2_factor<REAL>(q, hi_at, true, true, x, quarter, fold, s, stored, qh_lo, qh_hi);
+            w = ext3::mul(load_ext(e_hi + (x >> low) * 3), load_ext(e_lo + (x & mask) * 3));
+        }
+        // Y'_r = (w·q_r)·q_{r+2}, the partner's.
+        const Gkr2Quad y =
+            gkr2_prod(ext3::mul(w, ql_lo), ext3::mul(w, ql_hi), qh_lo, qh_hi);
+        // Z_r = q_{r+2}·(p_r + h·q_r) + p_{r+2}·q_r.
+        const Fe3 b_lo = ext3::add(pl_lo, ext3::mul(h, ql_lo));
+        const Fe3 b_hi = ext3::add(pl_hi, ext3::mul(h, ql_hi));
+        const Gkr2Quad z = gkr2_qadd(gkr2_prod(qh_lo, qh_hi, b_lo, b_hi),
+                                     gkr2_prod(ph_lo, ph_hi, ql_lo, ql_hi));
+        Gkr2Quad u;
+        u.v0 = gkr2_shfl(y.v0, partner);
+        u.v1 = gkr2_shfl(y.v1, partner);
+        u.c2 = gkr2_shfl(y.c2, partner);
+        // Walk both from t = 1: the value, its step to the next t, and the second difference.
+        Fe3 zv = z.v1, zdd = ext3::add(z.c2, z.c2);
+        Fe3 zd = ext3::add(ext3::sub(z.v1, z.v0), zdd);
+        Fe3 uv = u.v1, udd = ext3::add(u.c2, u.c2);
+        Fe3 ud = ext3::add(ext3::sub(u.v1, u.v0), udd);
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+            if (t > 0) {
+                zv = ext3::add(zv, zd);
+                zd = ext3::add(zd, zdd);
+                uv = ext3::add(uv, ud);
+                ud = ext3::add(ud, udd);
+            }
+            const Fe3 m = ext3::mul(zv, uv);
+            volatile uint64_t *at = sacc + (uint64_t)(t * 3) * nb + tid;
+            at[0] = goldilocks::add(at[0], m.a);
+            at[nb] = goldilocks::add(at[nb], m.b);
+            at[2 * nb] = goldilocks::add(at[2 * nb], m.c);
+        }
+    }
+    Fe3 acc[4];
+#pragma unroll
+    for (int t = 0; t < 4; t++)
+        acc[t] = ext3::make(sacc[(t * 3) * nb + tid], sacc[(t * 3 + 1) * nb + tid],
+                            sacc[(t * 3 + 2) * nb + tid]);
+    gkr2_block_rows<4>(acc, 0, shared + 12 * (uint64_t)nb, d_partials);
+    if (SLOT) slot_sums(d_partials, 4, d_ticket, d_slot, seq);
+}
+
+#define GKR2_ROUND(NAME, REAL)                                                                    \
+    extern "C" __global__ __launch_bounds__(256, 2) void NAME(                                    \
+        uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,    \
+        uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t h0, uint64_t h1,           \
+        uint64_t h2, const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo,        \
+        uint32_t low, uint64_t stored2, uint64_t stored3, uint64_t *__restrict__ d_partials) {    \
+        gkr2_round_body<REAL, false>(p, q, stride, quarter, fold, s0, s1, s2, h0, h1, h2, e_hi,  \
+                                     e_lo, low, stored2, stored3, d_partials, nullptr, nullptr,  \
+                                     0);                                                          \
+    }
+GKR2_ROUND(gkr2_round, false)
+GKR2_ROUND(gkr2_round_real, true)
+
+// The two rounds again with their sums through a slot (`slot_sums`): no second launch.
+#define GKR2_ROUND_SLOT(NAME, REAL)                                                               \
+    extern "C" __global__ __launch_bounds__(256, 2) void NAME(                                    \
+        uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t stride, uint64_t quarter,    \
+        uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t h0, uint64_t h1,           \
+        uint64_t h2, const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo,        \
+        uint32_t low, uint64_t stored2, uint64_t stored3, uint64_t *__restrict__ d_partials,      \
+        unsigned int *d_ticket, uint64_t *d_slot, uint64_t seq) {                                 \
+        gkr2_round_body<REAL, true>(p, q, stride, quarter, fold, s0, s1, s2, h0, h1, h2, e_hi,   \
+                                    e_lo, low, stored2, stored3, d_partials, d_ticket, d_slot,   \
+                                    seq);                                                         \
+    }
+GKR2_ROUND_SLOT(gkr2_round_slot, false)
+GKR2_ROUND_SLOT(gkr2_round_real_slot, true)
+
+// `H(0)` of a round, after it: one thread a cube index reads the eight factors' cells at `t = 0`
+// (the halves the round folded and wrote back, or the layer's own in a round without a fold) and
+// sums `w·(N + λQ)` there into row 4 of the round's partials. Launched on the round's grid and
+// block, so its partials sit where the round's would. `stored2`, `stored3` are the runs after the
+// round's fold.
+template <bool REAL>
+__device__ __forceinline__ void gkr2_round_h0_body(
+    const uint64_t *__restrict__ p, const uint64_t *__restrict__ q, uint64_t stride,
+    uint64_t quarter, uint64_t l0, uint64_t l1, uint64_t l2, const uint64_t *__restrict__ e_hi,
+    const uint64_t *__restrict__ e_lo, uint32_t low, uint64_t stored2, uint64_t stored3,
+    uint64_t *__restrict__ d_partials) {
+    extern __shared__ uint64_t shared[];
+    const Fe3 lambda = ext3::make(l0, l1, l2);
+    const uint64_t mask = ((uint64_t)1 << low) - 1;
+    Fe3 acc[1] = {ext3::zero()};
+    for (uint64_t x = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; x < quarter;
+         x += (uint64_t)gridDim.x * blockDim.x) {
+        Fe3 n[2], d[2];
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const uint64_t lo_at = (uint64_t)r * stride, hi_at = (uint64_t)(r + 2) * stride;
+            const uint64_t stored = r == 0 ? stored2 : stored3;
+            const Fe3 p_lo = gkr2_cell<REAL>(p, lo_at, false, false, x, 0);
+            const Fe3 p_hi = gkr2_cell<REAL>(p, hi_at, true, false, x, stored);
+            const Fe3 q_lo = gkr2_cell<REAL>(q, lo_at, false, true, x, 0);
+            const Fe3 q_hi = gkr2_cell<REAL>(q, hi_at, true, true, x, stored);
+            n[r] = ext3::add(ext3::mul(p_lo, q_hi), ext3::mul(p_hi, q_lo));
+            d[r] = ext3::mul(q_lo, q_hi);
+        }
+        const Fe3 dd = ext3::mul(d[0], d[1]);
+        const Fe3 v = ext3::add(ext3::add(ext3::mul(n[0], d[1]), ext3::mul(n[1], d[0])),
+                                ext3::mul(lambda, dd));
+        const Fe3 w = ext3::mul(load_ext(e_hi + (x >> low) * 3), load_ext(e_lo + (x & mask) * 3));
+        acc[0] = ext3::add(acc[0], ext3::mul(w, v));
+    }
+    gkr2_block_rows<1>(acc, 4, shared, d_partials);
+}
+
+#define GKR2_ROUND_H0(NAME, REAL)                                                                 \
+    extern "C" __global__ __launch_bounds__(256) void NAME(                                       \
+        const uint64_t *__restrict__ p, const uint64_t *__restrict__ q, uint64_t stride,          \
+        uint64_t quarter, uint64_t l0, uint64_t l1, uint64_t l2,                                  \
+        const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,       \
+        uint64_t stored2, uint64_t stored3, uint64_t *__restrict__ d_partials) {                  \
+        gkr2_round_h0_body<REAL>(p, q, stride, quarter, l0, l1, l2, e_hi, e_lo, low, stored2,    \
+                                 stored3, d_partials);                                            \
+    }
+GKR2_ROUND_H0(gkr2_round_h0, false)
+GKR2_ROUND_H0(gkr2_round_h0_real, true)
+
+// The rounds' end: each of the eight factors bound to the last challenge `s` (with `fold`) from
+// its `2·cells` cube down to `cells`, written to `out[(k·cells + y)·3]` in the order the proof lays
+// a step's two halves out — `k = 4b₂ + f`, `f` = `p` of quarter `b₂`, `p` of quarter `b₂ + 2`, `q`
+// of quarter `b₂`, `q` of quarter `b₂ + 2` (`h_{b₂}`'s `p_lo, p_hi, q_lo, q_hi`). Nothing is
+// written back. `gkr2_finish_real` is the same over a layer kept without its padding.
+template <bool REAL>
+__device__ __forceinline__ void gkr2_finish_body(const uint64_t *__restrict__ p,
+                                                 const uint64_t *__restrict__ q, uint64_t stride,
+                                                 uint64_t cells, uint32_t fold, uint64_t s0,
+                                                 uint64_t s1, uint64_t s2, uint64_t stored2,
+                                                 uint64_t stored3, uint64_t *__restrict__ out) {
+    const Fe3 s = ext3::make(s0, s1, s2);
+    const uint64_t total = 8 * cells;
+    for (uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; task < total;
+         task += (uint64_t)gridDim.x * blockDim.x) {
+        const uint64_t k = task / cells;
+        const uint64_t y = task - k * cells;
+        const uint64_t half = k >> 2, f = k & 3;
+        const bool upper = (f & 1) != 0, den = f >= 2;
+        const uint64_t quarter = half + (upper ? 2 : 0);
+        const uint64_t stored = quarter == 2 ? stored2 : stored3;
+        const uint64_t *base = den ? q : p;
+        const uint64_t at = quarter * stride;
+        Fe3 v = gkr2_cell<REAL>(base, at, upper, den, y, stored);
+        if (fold) {
+            const Fe3 hi = gkr2_cell<REAL>(base, at, upper, den, y + cells, stored);
+            v = ext3::add(v, ext3::mul(s, ext3::sub(hi, v)));
+        }
+        gkr2_store(out, task, v);
+    }
+}
+
+extern "C" __global__ void gkr2_finish(const uint64_t *__restrict__ p,
+                                       const uint64_t *__restrict__ q, uint64_t stride,
+                                       uint64_t cells, uint32_t fold, uint64_t s0, uint64_t s1,
+                                       uint64_t s2, uint64_t *__restrict__ out) {
+    gkr2_finish_body<false>(p, q, stride, cells, fold, s0, s1, s2, 0, 0, out);
+}
+
+extern "C" __global__ void gkr2_finish_real(const uint64_t *__restrict__ p,
+                                            const uint64_t *__restrict__ q, uint64_t stride,
+                                            uint64_t cells, uint32_t fold, uint64_t s0,
+                                            uint64_t s1, uint64_t s2, uint64_t stored2,
+                                            uint64_t stored3, uint64_t *__restrict__ out) {
+    gkr2_finish_body<true>(p, q, stride, cells, fold, s0, s1, s2, stored2, stored3, out);
+}
+
 // The fraction tree's input layer straight from the table's base columns (D-BATCH M1-2,
 // `crate::gkr::input_from_columns`): cell `(s, r)` of `p` and `q` for every interaction slot
 // `s < slots` and row `r`, both sides in one launch, where the old path lifts every column into

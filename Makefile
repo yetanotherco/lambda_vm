@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-eq-dot-host-kat test-round-slot-host-kat test-fill-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-gkr2-host-kat test-eq-dot-host-kat test-round-slot-host-kat test-fill-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -577,6 +577,7 @@ test: compile-programs test-syscalls test-ethrex-crypto
 	$(MAKE) test-ntt-cm-host-kat
 	$(MAKE) test-whir-host-kat
 	$(MAKE) test-gkr-host-kat
+	$(MAKE) test-gkr2-host-kat
 	$(MAKE) test-eq-dot-host-kat
 	$(MAKE) test-round-slot-host-kat
 
@@ -722,6 +723,18 @@ test-gkr-host-kat:
 	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
 	    -o target/host_kat/gkr_host_kat $(HOST_KAT_DIR)/gkr_host_kat.cpp
 	./target/host_kat/gkr_host_kat
+
+# Known-answer tests for the GKR rounds over two tree layers (`sumcheck.cu`'s
+# `gkr2_round*`, `gkr2_round_h0*`, `gkr2_finish*`), on the host through the
+# SIMT shim: every round and the finish against a written-out reference that
+# composes the two folds, the kept input layer's kernels raw-identical to the
+# whole layer's, the slot's sums, and two negative controls. Arithmetic,
+# indexing and the lane pairs' shuffles only; execution stays with the card.
+test-gkr2-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
+	    -o target/host_kat/gkr2_host_kat $(HOST_KAT_DIR)/gkr2_host_kat.cpp
+	./target/host_kat/gkr2_host_kat
 
 # Known-answer tests for the commit-time out-of-domain answers' column values
 # (`sumcheck.cu`'s `eq_dot_base_ext3_many` and the `sum_partials_ext3` over its
