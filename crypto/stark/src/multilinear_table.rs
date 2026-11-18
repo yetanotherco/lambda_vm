@@ -65,6 +65,7 @@ pub use batched::{
 /// Keeping the construction in one place is the point: if the two sides laid
 /// out factors separately they could assign a column a different slot, and
 /// every claim would then be about a different table than the one committed.
+#[derive(Clone)]
 pub struct TableLayout<'a, F, E>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
@@ -415,6 +416,16 @@ where
     /// Lets the device copy go; the host columns stay.
     pub(crate) fn clear_resident(&mut self) {
         self.trace.clear_resident();
+    }
+
+    /// ⛔ A MEASUREMENT'S VIEW of this table ([`TraceData::probe_view`]): its
+    /// layout, and its trace's view over the same device copy of its columns,
+    /// with a host copy of them only under `host_columns`.
+    pub(crate) fn probe_view(&self, host_columns: bool) -> Self {
+        Self {
+            layout: self.layout.clone(),
+            trace: self.trace.probe_view(host_columns),
+        }
     }
 
     /// The committed columns themselves, on the host — widened there if the
