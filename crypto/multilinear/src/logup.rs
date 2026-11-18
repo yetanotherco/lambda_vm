@@ -382,6 +382,20 @@ pub struct PublicPlan {
     pub plan: InputPlan,
 }
 
+std::thread_local! {
+    /// A test's fault in [`public_plan`] on this thread: each public column
+    /// it builds is moved one row (row `r` takes row `r + 1`'s value), so a
+    /// check that the card's tree is the host's can be shown to see a
+    /// selector one row off. The production prover never sets it.
+    static PUBLIC_SELECTOR_SHIFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`PUBLIC_SELECTOR_SHIFT`] on this thread (tests only).
+#[doc(hidden)]
+pub fn fault_public_selector_shift(on: bool) {
+    PUBLIC_SELECTOR_SHIFT.with(|c| c.set(on));
+}
+
 /// [`PublicPlan`] for `interactions` over a table with factor `kinds` and
 /// `public` tables, `rows` high. `None` when a public factor read is not
 /// base-valued, or a slot is unknown.
@@ -435,6 +449,9 @@ pub fn public_plan<E: IsField + 'static>(
                         return None;
                     }
                     column.push(base);
+                }
+                if PUBLIC_SELECTOR_SHIFT.with(std::cell::Cell::get) {
+                    column.rotate_left(1);
                 }
                 public_columns.push(column);
                 public_slots.push(slot);
@@ -924,6 +941,24 @@ mod input_plan_tests {
             assert_eq!(p, want.p.evals(), "chunk {k}: the numerators");
             assert_eq!(q, want.q.evals(), "chunk {k}: the denominators");
         }
+        // A selector one row off (a test's fault) writes another layer.
+        fault_public_selector_shift(true);
+        let shifted = public_plan(&chunks[0], &kinds, &public, rows).expect("a public plan");
+        fault_public_selector_shift(false);
+        let mut flat: Vec<u64> = shifted
+            .columns
+            .iter()
+            .flat_map(|&c| columns[c].clone())
+            .collect();
+        for column in &shifted.public {
+            flat.extend_from_slice(column);
+        }
+        let (p, q) = run_plan(&shifted.plan, &flat, rows, true);
+        let want = input_layer(&chunks[0], &factors).unwrap();
+        assert!(
+            p != want.p.evals() || q != want.q.evals(),
+            "a selector one row off went unseen"
+        );
         // A public table with an extension part is not a base column.
         let mut odd = public.clone();
         odd[0] = Mle::new((0..rows).map(|_| ext(&mut seed)).collect()).unwrap();

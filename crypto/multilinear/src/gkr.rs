@@ -144,6 +144,24 @@ impl<F: IsField + 'static> FractionTree<F> {
         &self.layers[i]
     }
 
+    /// Layer `i`'s halves on the host, wherever the tree holds them: copied
+    /// here, or brought back from the device (`None` for a layer the device
+    /// does not hold, such as an input layer it handed back). For checks
+    /// that a tree built one way is a tree built another.
+    #[doc(hidden)]
+    pub fn layer_copy(&self, i: usize) -> Option<FractionLayer<F>>
+    where
+        FieldElement<F>: Clone,
+    {
+        match self.device.as_ref() {
+            Some(device) => {
+                let (p, q) = device.layer_to_host::<F>(i)?;
+                FractionLayer::new(p, q).ok()
+            }
+            None => self.layers.get(i).cloned(),
+        }
+    }
+
     /// The device holding every layer, when one does.
     pub fn device(&self) -> Option<&crate::gpu::DeviceTree> {
         self.device.as_ref()

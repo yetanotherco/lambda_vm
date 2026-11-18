@@ -230,6 +230,8 @@ mod program_fast_tests;
 #[cfg(test)]
 mod program_shape_tests;
 #[cfg(all(test, feature = "parallel"))]
+mod public_tree_tests;
+#[cfg(all(test, feature = "parallel"))]
 mod round_form_level_tests;
 #[cfg(test)]
 mod rp1a_review_tests;
