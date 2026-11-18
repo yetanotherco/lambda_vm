@@ -366,6 +366,8 @@ pub struct Level1Landing {
     pub arrivals: Vec<(usize, f64)>,
     /// When each piece landed, in landing order: `(piece, at, wave seconds)`.
     pub landed: Vec<(usize, f64, f64)>,
+    /// Where the execution ran, under `LAMBDA_VM_LEVELS_PLACEMENT`.
+    pub placement: Option<super::placement::Placement>,
 }
 
 /// Whether the driver lowers its beside work ([`BESIDE_NICE_ENV`]), or a
@@ -1295,6 +1297,18 @@ pub fn prove_block_levels(
             let held: Vec<std::cell::OnceCell<Vec<LfmWord>>> =
                 (0..npieces).map(|_| std::cell::OnceCell::new()).collect();
             let mut by_group: Vec<Option<Vec<LfmWord>>> = vec![None; marks.len() - 1];
+            let placing = super::placement::placement();
+            let usage_from = placing.then(|| {
+                (
+                    super::placement::thread_usage(),
+                    super::placement::process_usage(),
+                )
+            });
+            if placing {
+                let _ = super::placement::take_jobs();
+                super::placement::count_jobs(true);
+            }
+            let mut placed = super::placement::Placement::default();
             let execute_from = now();
             let mut ex = StreamedExecution::new_pieced_setup(
                 program,
@@ -1375,6 +1389,10 @@ pub fn prove_block_levels(
                         .flat_map(|h| by_group[h].take().unwrap_or_default())
                         .collect();
                     held[i].set(words).map_err(|_| "a piece landed twice")?;
+                    let cpu = placing.then(super::placement::this_cpu).flatten();
+                    if placing {
+                        let _ = super::placement::take_jobs();
+                    }
                     let t = std::time::Instant::now();
                     ex.land_piece(i, held[i].get().ok_or("a piece")?)
                         .map_err(|e| format!("level 1's piece {i}: {e:?}"))?;
@@ -1384,6 +1402,9 @@ pub fn prove_block_levels(
                         wave_secs_before += t.elapsed().as_secs_f64();
                     }
                     let secs = t.elapsed().as_secs_f64();
+                    if placing {
+                        placed.waves.push((cpu, super::placement::take_jobs()));
+                    }
                     landing.landed.push((i, now() - secs, secs));
                     landed[i] = true;
                 }
@@ -1395,6 +1416,16 @@ pub fn prove_block_levels(
                 .finish()
                 .map_err(|e| format!("level 1's execution: {e:?}"))?;
             let executed = now();
+            if let Some((thread_from, process_from)) = usage_from {
+                super::placement::count_jobs(false);
+                placed.thread = thread_from
+                    .zip(super::placement::thread_usage())
+                    .map(|(a, b)| super::placement::usage_delta(a, b));
+                placed.process = process_from
+                    .zip(super::placement::process_usage())
+                    .map(|(a, b)| super::placement::usage_delta(a, b));
+                landing.placement = Some(placed);
+            }
             let validated = match checker {
                 Some(handle) => Some((joined_validation(handle)?, now())),
                 None => None,

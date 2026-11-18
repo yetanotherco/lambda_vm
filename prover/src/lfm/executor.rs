@@ -2571,6 +2571,16 @@ fn compute_level(
 ) {
     use rayon::prelude::*;
 
+    if super::placement::counting() {
+        // Report only (`LAMBDA_VM_LEVELS_PLACEMENT`): each job rayon splits
+        // off counts its L3 once; the rows and their order are the same.
+        rows.par_iter()
+            .map_init(super::placement::note_job, |_, &row| {
+                hash_one(memory, hasher, &program.instrs[levels.instr_of_row(row)])
+            })
+            .collect_into_vec(out);
+        return;
+    }
     rows.par_iter()
         .map(|&row| hash_one(memory, hasher, &program.instrs[levels.instr_of_row(row)]))
         .collect_into_vec(out);
