@@ -833,11 +833,12 @@ fn rta_one_run(
     );
     println!(
         "RTA LEVEL1 EMIT: program fast {} · walk {:.3}s · compile {:.3}s · validate before the \
-         execution {:.3}s",
+         execution {:.3}s · beside nice {}",
         t.validated_beside.is_some(),
         t.emit_split.0,
         t.emit_split.1,
-        t.emit_split.2
+        t.emit_split.2,
+        super::levels::beside_nice()
     );
     match t.validated_beside {
         Some((secs, at)) => println!(

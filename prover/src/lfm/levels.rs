@@ -298,6 +298,91 @@ pub fn program_fast() -> bool {
 #[cfg(test)]
 static PROGRAM_FAST_FOR_TEST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 
+/// `LAMBDA_VM_LEVELS_BESIDE_NICE=1`: the host work the driver runs beside the
+/// base's phase B that level 1's execution does not wait for (its stacks'
+/// columns prepared on the host, [`prepare_level`], and the validator beside
+/// the execution) runs below the prover's threads: the prepare on a pool of
+/// its own whose threads are lowered to [`BESIDE_NICE`] (Linux), the
+/// validator's thread lowered too. Phase B's host work is then scheduled
+/// first and the prepare takes the cycles it leaves; on a real median the
+/// prepare had ≈ 2.2 s to spare before level 1's prove needed its stacks and
+/// the validator ≈ 4.3 s before the execution's end, while the two cost the
+/// base's phase B ≈ 1 s on the prover's pool. Off by default (and for any word
+/// but `1`). The order of the work changes, never its result.
+pub const BESIDE_NICE_ENV: &str = "LAMBDA_VM_LEVELS_BESIDE_NICE";
+
+/// The nice value [`BESIDE_NICE_ENV`]'s threads run at on Linux.
+pub const BESIDE_NICE: i32 = 10;
+
+/// Whether the driver lowers its beside work ([`BESIDE_NICE_ENV`]), or a
+/// test's override.
+pub fn beside_nice() -> bool {
+    #[cfg(test)]
+    if let Some(on) = *BESIDE_NICE_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(BESIDE_NICE_ENV).ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+static BESIDE_NICE_FOR_TEST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// A test's [`beside_nice`] for every thread until the guard drops.
+#[cfg(test)]
+pub(crate) fn set_beside_nice_for_test(on: bool) -> BesideNiceForTest {
+    let before = BESIDE_NICE_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(on);
+    BesideNiceForTest(before)
+}
+
+#[cfg(test)]
+pub(crate) struct BesideNiceForTest(Option<bool>);
+
+#[cfg(test)]
+impl Drop for BesideNiceForTest {
+    fn drop(&mut self) {
+        *BESIDE_NICE_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = self.0;
+    }
+}
+
+/// The beside work's own pool ([`BESIDE_NICE_ENV`]): as many threads as the
+/// prover's pool, each lowered to [`BESIDE_NICE`]. Built once a process;
+/// `None` if it cannot be (the work then runs on the prover's pool).
+fn beside_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads())
+            .thread_name(|i| format!("levels-beside-{i}"))
+            .start_handler(|_| super::whir_block_tree::lower_this_threads_priority(BESIDE_NICE))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// [`prepare_level`] as the driver runs it beside the base: on the beside pool
+/// under [`beside_nice`], on the prover's pool otherwise. The same prebuild.
+pub(crate) fn prepare_level_beside(
+    program: &LfmProgram,
+    family: WlfmFamily,
+) -> Result<WlfmPrebuild, String> {
+    match beside_nice().then(beside_pool).flatten() {
+        Some(pool) => pool.install(|| prepare_level(program, family)),
+        None => prepare_level(program, family),
+    }
+}
+
 /// A test's [`program_fast`] for every thread until the guard drops.
 #[cfg(test)]
 pub(crate) fn set_program_fast_for_test(on: bool) -> ProgramFastForTest {
@@ -327,6 +412,9 @@ pub(crate) fn spawn_validation<'scope, 'env>(
     program: &'env LfmProgram,
 ) -> std::thread::ScopedJoinHandle<'scope, Result<f64, String>> {
     scope.spawn(move || {
+        if beside_nice() {
+            super::whir_block_tree::lower_this_threads_priority(BESIDE_NICE);
+        }
         let t = std::time::Instant::now();
         super::validator::validate(program)
             .map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
@@ -961,7 +1049,7 @@ pub fn prove_block_levels(
                 brx.recv()
                     .map_err(|_| "level 1's program was never emitted")?;
                 let program = program_ref.get().ok_or("the program is set")?;
-                prepare_level(program, family)
+                prepare_level_beside(program, family)
             })
         });
         // Level 1's thread: the plan, the program, then its execute, a piece
