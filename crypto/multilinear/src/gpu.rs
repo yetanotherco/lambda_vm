@@ -1457,12 +1457,12 @@ pub fn force_hand_back_for_tests(on: bool) {
     HAND_BACK_FORCED.store(on, Ordering::Relaxed);
 }
 
-/// `LAMBDA_VM_ARGUE_BIN_HAND_BACK=1`: a batched argue's bin whose trees the
+/// `LAMBDA_VM_ARGUE_BIN_HAND_BACK`: a batched argue's bin whose trees the
 /// card cannot all carry at once has its trees hand their input layers back
 /// ([`prefer_hand_back`]), so each promises `3·cells` where carrying it
 /// promises `4·cells` and the bin's every tree fits where today the last
-/// ones go to the host. The same trees, so the same proof. Off by default
-/// (and for any word but `1`); read once a process.
+/// ones go to the host. The same trees, so the same proof. On by default;
+/// only `0` turns it off. Read once a process.
 pub const BIN_HAND_BACK_ENV: &str = "LAMBDA_VM_ARGUE_BIN_HAND_BACK";
 
 /// Whether [`BIN_HAND_BACK_ENV`] is on (or a test has made every bin hand
@@ -1470,7 +1470,9 @@ pub const BIN_HAND_BACK_ENV: &str = "LAMBDA_VM_ARGUE_BIN_HAND_BACK";
 pub fn bin_hand_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     bin_hand_back_forced()
-        || *ON.get_or_init(|| std::env::var(BIN_HAND_BACK_ENV).is_ok_and(|v| v.trim() == "1"))
+        || *ON.get_or_init(|| {
+            crate::logup::knob_on_unless_zero(std::env::var(BIN_HAND_BACK_ENV).ok().as_deref())
+        })
 }
 
 /// A test's switch: every bin hands back, whether or not it fits.
@@ -8751,6 +8753,23 @@ mod tests {
             u64::MAX - 1,
             &[u64::MAX, u64::MAX]
         ));
+    }
+
+    /// The two argue knobs are on by default: only `0` turns either off.
+    #[test]
+    fn the_argue_knobs_are_on_unless_zero() {
+        use crate::logup::knob_on_unless_zero as on;
+        assert!(on(None));
+        assert!(on(Some("1")));
+        assert!(on(Some("")));
+        assert!(on(Some("yes")));
+        assert!(!on(Some("0")));
+        assert!(!on(Some(" 0 ")));
+        assert_eq!(BIN_HAND_BACK_ENV, "LAMBDA_VM_ARGUE_BIN_HAND_BACK");
+        assert_eq!(
+            crate::logup::PUBLIC_COLUMNS_ENV,
+            "LAMBDA_VM_ARGUE_PUBLIC_COLUMNS"
+        );
     }
 
     /// The preference is this thread's, scoped to the call, and restored even

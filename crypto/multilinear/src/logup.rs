@@ -325,12 +325,12 @@ pub fn resident_tree_from_columns<F: IsField + 'static, E: IsField + 'static>(
     crate::gkr::FractionTree::from_device(tree).ok()
 }
 
-/// `LAMBDA_VM_ARGUE_PUBLIC_COLUMNS=1`: a batched argue's tree whose
+/// `LAMBDA_VM_ARGUE_PUBLIC_COLUMNS`: a batched argue's tree whose
 /// interactions read a public factor ([`FactorKind::Public`], a selector) is
 /// built on the card from a small store of the committed columns it reads
 /// and its public factors as base columns ([`resident_tree_with_public`]),
-/// where today it has no plan and goes to the host. The same tree. Off by
-/// default (and for any word but `1`); read once a process.
+/// where it would otherwise have no plan and go to the host. The same tree.
+/// On by default; only `0` turns it off. Read once a process.
 ///
 /// [`FactorKind::Public`]: crate::constraint_argument::FactorKind::Public
 pub const PUBLIC_COLUMNS_ENV: &str = "LAMBDA_VM_ARGUE_PUBLIC_COLUMNS";
@@ -338,7 +338,12 @@ pub const PUBLIC_COLUMNS_ENV: &str = "LAMBDA_VM_ARGUE_PUBLIC_COLUMNS";
 /// Whether [`PUBLIC_COLUMNS_ENV`] is on.
 pub fn public_columns() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var(PUBLIC_COLUMNS_ENV).is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| knob_on_unless_zero(std::env::var(PUBLIC_COLUMNS_ENV).ok().as_deref()))
+}
+
+/// A default-on knob's reading of its word: on unless the word is `0`.
+pub fn knob_on_unless_zero(word: Option<&str>) -> bool {
+    word.is_none_or(|v| v.trim() != "0")
 }
 
 /// [`resident_tree_from_columns`] for interactions that read public factors:
