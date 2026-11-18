@@ -24,6 +24,7 @@ type E = crate::tables::types::GoldilocksExtension;
 const PACKED: ArgueFormat = ArgueFormat::Batched {
     bin_log_cells: 26,
     pack: GkrPack::Chunks { tree_log_cells: 8 },
+    ladder: multilinear::whir_chain::GkrLadder::Single,
 };
 
 fn format(argue: ArgueFormat) -> BlockFormat {
@@ -106,7 +107,8 @@ fn the_verifiers_packing_is_a_named_constant() {
         named.argue,
         ArgueFormat::Batched {
             bin_log_cells: 26,
-            pack
+            pack,
+            ladder: multilinear::whir_chain::GkrLadder::Single,
         }
     );
     assert_ne!(named.argue, BlockFormat::pinned().argue);
