@@ -5687,6 +5687,23 @@ pub(crate) fn check_memory_format(format: &BlockFormat) -> Result<(), Error> {
     }
 }
 
+/// The most pages a block statement of `num_tables` tables can list under
+/// `format`: a page table holds at most `2^page_run_log2` pages (one with page
+/// runs off), so a page list longer than this can never be cut into the
+/// statement's tables. It bounds the statement's runtime ranges before the
+/// page list is built ([`Traces::page_configs_from_elf_and_runtime`]); the
+/// exact table count is held once the list is cut ([`block_frame`]). A run
+/// past its cap is refused before ([`check_memory_format`]); the shift is
+/// clamped all the same.
+pub(crate) fn max_block_pages(num_tables: usize, format: &BlockFormat) -> usize {
+    let run = u32::from(
+        format
+            .page_run_log2
+            .min(crate::tables::page_w::MAX_PAGE_RUN_LOG2),
+    );
+    num_tables.saturating_mul(1usize << run)
+}
+
 /// The block's page tables under `format`
 /// ([`page_tables`](crate::tables::page_w::page_tables) of `page_configs` at
 /// the format's page runs, which only the word memory format takes: one table
@@ -10128,7 +10145,7 @@ pub(crate) fn block_frame(
         &program,
         statement.runtime_page_ranges,
         statement.num_private_input_pages,
-        num_tables,
+        max_block_pages(num_tables, format),
     )?;
     // The page tables: cut by the verifier from its own page list, at its own
     // page runs.
