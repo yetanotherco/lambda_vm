@@ -395,7 +395,14 @@ fn chip_constraints(row: &[FE]) -> Vec<FE> {
 
 /// Sets word `i` of `piece`'s chip row `row` to `(lo, hi)` (each up to 48
 /// bits: a forger's half past 32 bits sits in its high 16-bit column).
-fn set_chip_word(bench: &mut Bench, piece: &str, row: usize, i: usize, lo: u64, hi: u64) {
+pub(super) fn set_chip_word(
+    bench: &mut Bench,
+    piece: &str,
+    row: usize,
+    i: usize,
+    lo: u64,
+    hi: u64,
+) {
     for (k, half) in [lo & 0xFFFF, lo >> 16, hi & 0xFFFF, hi >> 16]
         .into_iter()
         .enumerate()
@@ -505,10 +512,10 @@ fn register_file_interactions() -> Vec<BusInteraction> {
 }
 
 #[derive(Clone, Copy)]
-struct ChipRow {
-    ptr: u64,
-    ts: u64,
-    words: [u64; 2],
+pub(super) struct ChipRow {
+    pub(super) ptr: u64,
+    pub(super) ts: u64,
+    pub(super) words: [u64; 2],
 }
 
 #[derive(Clone, Copy)]
@@ -538,19 +545,19 @@ pub(super) const STACK_BASE: u64 = 0xFFFF_FFFF_FFFC_0000;
 pub(super) const INPUT_BASE: u64 = executor::vm::memory::PRIVATE_INPUT_START_INDEX;
 
 /// Words in memory as the honest accesses leave them, and the rows they make.
-struct Model {
-    pages: Vec<PageConfig>,
-    words: FinalWordMap,
-    memw_w: Vec<MemwWordRow>,
+pub(super) struct Model {
+    pub(super) pages: Vec<PageConfig>,
+    pub(super) words: FinalWordMap,
+    pub(super) memw_w: Vec<MemwWordRow>,
     writers: Vec<ChipRow>,
-    readers: Vec<ChipRow>,
+    pub(super) readers: Vec<ChipRow>,
     regs: Vec<RegRow>,
     /// The calls' timestamps, as the clock has them.
     calls: Vec<u64>,
 }
 
 impl Model {
-    fn new(pages: Vec<PageConfig>) -> Self {
+    pub(super) fn new(pages: Vec<PageConfig>) -> Self {
         Self {
             pages,
             words: FinalWordMap::new(),
@@ -595,7 +602,7 @@ impl Model {
         );
     }
 
-    fn write(&mut self, ptr: u64, ts: u64, words: [u64; 2]) {
+    pub(super) fn write(&mut self, ptr: u64, ts: u64, words: [u64; 2]) {
         self.regs.push(RegRow {
             reg: CHIP_REG,
             value: ptr,
@@ -608,7 +615,7 @@ impl Model {
         self.calls.push(ts);
     }
 
-    fn read(&mut self, ptr: u64, ts: u64) -> [u64; 2] {
+    pub(super) fn read(&mut self, ptr: u64, ts: u64) -> [u64; 2] {
         self.regs.push(RegRow {
             reg: CHIP_REG,
             value: ptr,
@@ -623,11 +630,18 @@ impl Model {
         words
     }
 
-    fn bench(&self) -> Bench {
-        let mut pieces = Vec::new();
-        for config in &self.pages {
-            pieces.push(page_piece(config, &self.words));
-        }
+    pub(super) fn bench(&self) -> Bench {
+        self.bench_with(
+            self.pages
+                .iter()
+                .map(|config| page_piece(config, &self.words))
+                .collect(),
+        )
+    }
+
+    /// The bench with `pieces` as its page tables, the rest as [`Self::bench`]
+    /// lays it out.
+    pub(super) fn bench_with(&self, mut pieces: Vec<Piece>) -> Bench {
         pieces.push(Piece {
             name: "MEMW_W".into(),
             interactions: memw_w::bus_interactions(),
@@ -745,7 +759,7 @@ fn honest_model(between: impl Fn(&mut Model)) -> Model {
 }
 
 /// The MEMW_W row of the access to `address` at `ts`.
-fn memw_w_row(m: &Model, address: u64, ts: u64) -> usize {
+pub(super) fn memw_w_row(m: &Model, address: u64, ts: u64) -> usize {
     m.memw_w
         .iter()
         .position(|r| r.address() == address && r.timestamp() == ts)
@@ -3621,7 +3635,7 @@ fn words_counts() -> crate::TableCounts {
 /// [`words_counts`] with no chip's table: a word-format frame with no chip
 /// call (`block_whir::chip_tables_under` refuses IS_WH, BLAKE3, ECSM and
 /// HINT; the others are left out here too).
-fn chip_free_counts() -> crate::TableCounts {
+pub(super) fn chip_free_counts() -> crate::TableCounts {
     crate::TableCounts {
         keccak: 0,
         keccak_rnd: 0,
@@ -3637,7 +3651,7 @@ fn chip_free_counts() -> crate::TableCounts {
 }
 
 /// One table of each CPU word family and no MEMW_W.
-const CPU_WORD_TABLES: [u64; 7] = [1, 1, 1, 1, 1, 1, 0];
+pub(super) const CPU_WORD_TABLES: [u64; 7] = [1, 1, 1, 1, 1, 1, 0];
 
 /// [`frame_of`] with the word format's chip refusal taken out: the census
 /// reads every table a word-format set can hold, the chips' and MEMW_W's

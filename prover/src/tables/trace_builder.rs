@@ -7863,6 +7863,10 @@ pub struct StreamSkip {
     /// With [`Self::stream_words`], each word family's chunks already handed
     /// out ([`windowed::StreamTable::WORDS`]' order).
     pub words: [usize; 7],
+    /// Under the word memory format, the page runs the finish cuts its pages
+    /// at ([`super::page_w::page_tables`]; the block format's
+    /// `page_run_log2`): 0, the default, one PAGE_W table a page.
+    pub page_run_log2: u8,
 }
 
 /// How the tables a block cuts at a fixed number of rows (KECCAK_RND, KECCAK,

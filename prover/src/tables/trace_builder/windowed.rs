@@ -1057,6 +1057,20 @@ impl<'a> WindowedTraceBuilder<'a> {
         Ok(self)
     }
 
+    /// Under the word memory format, the page runs the finish cuts its pages
+    /// at ([`StreamSkip::page_run_log2`], the block format's): one PAGE_W
+    /// table a page at 0, the default. The finish refuses a nonzero value under
+    /// any other format. Before the first window only.
+    pub fn page_run_log2(mut self, page_run_log2: u8) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "page_run_log2 after a window was walked".to_string(),
+            ));
+        }
+        self.emitted.page_run_log2 = page_run_log2;
+        Ok(self)
+    }
+
     /// Under the word memory format, cuts the six CPU word families and
     /// MEMW_W into chunks as the walk fills them, handed out as MEM_LOAD's and
     /// MEM_STORE's are, so the finish builds only each family's tail

@@ -469,6 +469,24 @@ pub fn memory_setting(knob: Option<&str>, base_only: bool) -> Result<MemoryForma
     }
 }
 
+/// `BLOCK_WHIR_PAGE_RUN`'s reading: unset is the pinned preset's
+/// ([`BlockFormat::pinned`], 0: one PAGE_W table a page); a count `k` in
+/// `0..=`[`MAX_PAGE_RUN_LOG2`](crate::tables::page_w::MAX_PAGE_RUN_LOG2) cuts
+/// each run of zero or private-input pages into blocks of up to `2^k` pages
+/// ([`BlockFormat::page_run_log2`]), under the word memory format alone. A
+/// format value: the prover and the verifier of one proof take the same one.
+pub fn page_run_setting(knob: Option<&str>) -> Result<u8, String> {
+    use crate::tables::page_w::MAX_PAGE_RUN_LOG2;
+    match knob.map(str::trim) {
+        None => Ok(BlockFormat::pinned().page_run_log2),
+        Some(v) => v
+            .parse::<u8>()
+            .ok()
+            .filter(|k| *k <= MAX_PAGE_RUN_LOG2)
+            .ok_or_else(|| format!("BLOCK_WHIR_PAGE_RUN={v}: a count in 0..={MAX_PAGE_RUN_LOG2}")),
+    }
+}
+
 /// `argue` with its trees laid out per `pack`: only the batched argue has
 /// trees to pack.
 fn with_pack(argue: ArgueFormat, pack: GkrPack) -> Result<ArgueFormat, String> {
@@ -542,6 +560,7 @@ impl WhirTreeConfig {
                 std::env::var("BLOCK_WHIR_MEMORY").ok().as_deref(),
                 crate::base_only::declared(),
             )?,
+            page_run_log2: page_run_setting(std::env::var("BLOCK_WHIR_PAGE_RUN").ok().as_deref())?,
             ..BlockFormat::production_with(group_setting(
                 std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
             )?)
@@ -578,6 +597,12 @@ impl WhirTreeConfig {
                 MemoryFormat::Fused => "fused",
                 MemoryFormat::Words => "words",
             }
+        );
+        eprintln!(
+            "★ BLOCK PAGE RUN: {} (BLOCK_WHIR_PAGE_RUN; k > 0 cuts each run of zero or \
+             private-input pages into blocks of up to 2^k pages, a table each, under the word \
+             memory format)",
+            format.page_run_log2
         );
         let mut options = BlockOptions::production();
         // `BLOCK_WHIR_LAYOUT_WORKERS=n`: the streamed chunks laid out on n threads

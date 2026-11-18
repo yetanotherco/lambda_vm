@@ -44,6 +44,7 @@ fn many_groups(argue: ArgueFormat) -> BlockFormat {
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
+        page_run_log2: 0,
     }
 }
 
