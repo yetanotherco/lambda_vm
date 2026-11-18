@@ -119,20 +119,27 @@ fn streamed_setup_split() {
         compiled.hasher(<crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::SOCKET);
     let n = compiled.instrs.len();
     let ns = |s: f64| 1e9 * s / n as f64;
-    for bucketed in [false, true, true] {
+    for (bucketed, fast) in [
+        (false, false),
+        (true, false),
+        (true, false),
+        (true, true),
+        (true, true),
+    ] {
         let t = Instant::now();
-        let ex = StreamedExecution::new_pieced_bucketed(
+        let ex = StreamedExecution::new_pieced_setup(
             &compiled,
             pieces.clone(),
             &hasher,
             false,
             bucketed,
+            fast,
         )
         .expect("starts");
         let total = t.elapsed().as_secs_f64();
         let x = *ex.split();
         println!(
-            "STREAMED SETUP bucketed {bucketed}: {n} instructions · {} pieces · total {total:.3}s ({:.1} ns) · schedule \
+            "STREAMED SETUP bucketed {bucketed} fast {fast}: {n} instructions · {} pieces · total {total:.3}s ({:.1} ns) · schedule \
              {:.3}s ({:.1} ns) · need pass {:.3}s ({:.1} ns) · buckets {:.3}s ({:.1} ns) · first wave {:.3}s ({:.1} ns) · \
              machine {:.3}s ({:.1} ns) · first wave ran {}",
             pieces.len(),
