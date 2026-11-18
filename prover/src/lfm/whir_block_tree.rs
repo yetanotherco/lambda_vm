@@ -2652,17 +2652,31 @@ type Planned = (
     (Vec<EarlyLeaf>, Vec<String>),
 );
 
-/// Every compressed file's verifier checks it under the pinned memory format,
-/// so a tree of another memory format is refused before anything is proved
-/// when a compression step is planned, rather than its file at verify. The
-/// uncompressed file (the top's) is the way to prove another memory format.
-pub(crate) fn compressed_memory_check(memory: MemoryFormat, compress: bool) -> Result<(), String> {
-    let pinned = BlockFormat::pinned().memory;
-    if compress && memory != pinned {
+/// Every compressed file's verifier checks it under the pinned memory format
+/// and the pinned page runs, so a tree of another memory format or another
+/// page run is refused before anything is proved when a compression step is
+/// planned, rather than its file at verify. The uncompressed file (the top's)
+/// is the way to prove either.
+pub(crate) fn compressed_memory_check(
+    memory: MemoryFormat,
+    page_run_log2: u8,
+    compress: bool,
+) -> Result<(), String> {
+    let pinned = BlockFormat::pinned();
+    if compress && memory != pinned.memory {
         return Err(format!(
-            "a compressed block is proved at the {pinned:?} memory format alone, not {memory:?}: \
+            "a compressed block is proved at the {:?} memory format alone, not {memory:?}: \
              turn compression off (LAMBDA_VM_BLOCK_COMPRESS=0) and ship the top's uncompressed \
-             file to prove another memory format"
+             file to prove another memory format",
+            pinned.memory
+        ));
+    }
+    if compress && page_run_log2 != pinned.page_run_log2 {
+        return Err(format!(
+            "a compressed block is proved at page runs of 2^{} pages alone, not 2^{page_run_log2}: \
+             turn compression off (LAMBDA_VM_BLOCK_COMPRESS=0) and ship the top's uncompressed \
+             file to prove another page run",
+            pinned.page_run_log2
         ));
     }
     Ok(())
@@ -2704,7 +2718,7 @@ pub fn prove_whir_block_tree(
             format.registers
         ));
     }
-    compressed_memory_check(format.memory, cfg.compress.is_some())?;
+    compressed_memory_check(format.memory, format.page_run_log2, cfg.compress.is_some())?;
     sink.line(&posture_line());
     sink.line(&base_line(&format.zf.base));
     sink.line(&format!("W3 ARGUE: {argue:?}"));
