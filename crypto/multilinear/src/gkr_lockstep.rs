@@ -1706,6 +1706,124 @@ mod tests {
         );
     }
 
+    /// Every value of `proof`, in order, through a fresh transcript: its
+    /// state is a digest of the proof's bytes.
+    fn proof_digest(proof: &LockstepProof<Ext3>) -> String {
+        let mut t = DefaultTranscript::<Ext3>::new(b"lockstep-proof-digest");
+        for layer in &proof.layers {
+            t.append_bytes(&(layer.sumcheck.rounds.len() as u64).to_le_bytes());
+            for round in &layer.sumcheck.rounds {
+                t.append_bytes(&(round.evaluations.len() as u64).to_le_bytes());
+                for v in &round.evaluations {
+                    t.append_field_element(v);
+                }
+            }
+            t.append_bytes(&(layer.halves.len() as u64).to_le_bytes());
+            for h in &layer.halves {
+                for v in [&h.p_lo, &h.p_hi, &h.q_lo, &h.q_hi] {
+                    t.append_field_element(v);
+                }
+            }
+        }
+        hex(&t.state())
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The heights the byte pin below proves over.
+    const PINNED_HEIGHTS: [&[usize]; 7] = [
+        &[5, 2, 0, 5, 3],
+        &[6, 6],
+        &[4, 3, 4],
+        &[1],
+        &[0],
+        &[2, 2],
+        &[7, 8],
+    ];
+
+    /// The lockstep ladder's bytes over the cubic extension, host trees and
+    /// Gruen steps alike: the digest of each proof and of the prover's
+    /// transcript after it.
+    fn todays_ladder_digests() -> Vec<(String, String)> {
+        let lift = |layer: FractionLayer<F>| {
+            let up = |m: &Mle<F>| {
+                Mle::new(m.evals().iter().map(|v| v.to_extension::<Ext3>()).collect()).unwrap()
+            };
+            FractionLayer::new(up(&layer.p), up(&layer.q)).unwrap()
+        };
+        let mut out = Vec::new();
+        for (s, heights) in PINNED_HEIGHTS.iter().enumerate() {
+            let trees: Vec<Vec<FractionLayer<Ext3>>> = heights
+                .iter()
+                .enumerate()
+                .map(|(t, &k)| {
+                    let mut layers = vec![lift(random_layer(k, 1000 * s as u64 + t as u64))];
+                    while layers.last().unwrap().num_vars() > 0 {
+                        let next = layers.last().unwrap().fold().unwrap();
+                        layers.push(next);
+                    }
+                    layers.reverse();
+                    layers
+                })
+                .collect();
+            let refs: Vec<&[FractionLayer<Ext3>]> = trees.iter().map(|t| t.as_slice()).collect();
+            let mut prover = DefaultTranscript::<Ext3>::new(b"lockstep-pin");
+            let (proof, _) = prove(&refs, &mut prover).unwrap();
+            out.push((proof_digest(&proof), hex(&prover.state())));
+        }
+        out
+    }
+
+    /// The digests of [`todays_ladder_digests`], computed before the
+    /// two-layer step existed: (proof, transcript state) per height set.
+    const PINNED_DIGESTS: [(&str, &str); 7] = [
+        (
+            "b9c7d0e954a00b9f1e0de0cffd84e9199349a25a7f98a6442d411e4f9d405f62",
+            "da74881a6f34a81953c802abb882f5e15ffc907bbc7132da5fbb723a86b0a254",
+        ),
+        (
+            "6d4dd66000c3edf1fe72debb063db15e722085f9fb952b11f686add8907662d4",
+            "6b2a8b3a972d9360d570bf1c57b3a03b443858446ca9e4e40a7e51bf38256894",
+        ),
+        (
+            "caa48e655b44f89b81fe6e4ddb56a07dbe2730fe5ea6dc7f3c75da175dba5d36",
+            "edfb7a8ed3718849afd3f74d02191a1a4d17ee58a77293bccf3806ae482c62e5",
+        ),
+        (
+            "486f56bfdb955a30d219d99dfb000f9a119ab2f35f3f8dac82ac47822110b4d6",
+            "8c4f99c3d8beb5711ee90afabaa438b68394980400e5adac2c337aebcc1b9116",
+        ),
+        (
+            "134e5a9f4f8ebb347c1d5a9acb8c9a7bde9a8dfcd9c4fd1c1fa124468c42ec6a",
+            "c3ce8226ccba4d095005208bd3dbb9ae47aed90c352f4df76d532139ee7dab6d",
+        ),
+        (
+            "80dce121313b14048f27c17b110dedfee54df0c5ad15a5e822a1ab984f222773",
+            "60bbad644089d16c7ae81c808b9907eb369c7f8d0b44ef665bb202479521a2c6",
+        ),
+        (
+            "be6fd6c01e06a176fc4b56c0523b0230d255cd9c63105884706c2d857214d730",
+            "e61fbf0c0dc386e421196bd7e3f04fca76e05388ead318644c6e4b819dd76dc5",
+        ),
+    ];
+
+    /// ★ Today's ladder bytes: the proof and the transcript after it, for
+    /// every height set above, as they were before the two-layer step
+    /// existed.
+    #[test]
+    fn the_single_ladder_proves_todays_bytes() {
+        let got = todays_ladder_digests();
+        assert_eq!(got.len(), PINNED_DIGESTS.len());
+        for (((proof, state), (proof_pin, state_pin)), heights) in
+            got.iter().zip(PINNED_DIGESTS).zip(PINNED_HEIGHTS)
+        {
+            assert_eq!(proof, proof_pin, "{heights:?}: the proof's bytes");
+            assert_eq!(state, state_pin, "{heights:?}: the transcript");
+        }
+    }
+
     /// The knob is on by default and off for `0` only.
     #[test]
     fn the_host_parallel_knob_is_on_by_default_and_off_for_zero_only() {
