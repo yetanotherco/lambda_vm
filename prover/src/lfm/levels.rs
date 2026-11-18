@@ -314,6 +314,24 @@ pub const BESIDE_NICE_ENV: &str = "LAMBDA_VM_LEVELS_BESIDE_NICE";
 /// The nice value [`BESIDE_NICE_ENV`]'s threads run at on Linux.
 pub const BESIDE_NICE: i32 = 10;
 
+/// `LAMBDA_VM_LEVELS_BUCKET_WAVES=1`: level 1's streamed execution buckets its
+/// instructions by the groups each waits for, and each landed piece's wave
+/// walks only the buckets that landing completes
+/// ([`super::executor::StreamedExecution::new_pieced_bucketed`]). Today each
+/// wave filters the whole program: on a real median, 48 M instructions, ≈ 0.1 s
+/// a wave before its own work, 27 waves after the base's end. The same
+/// instructions run in the same order each wave: the same execution and the
+/// same proofs. Off by default (and for any word but `1`).
+pub const BUCKET_WAVES_ENV: &str = "LAMBDA_VM_LEVELS_BUCKET_WAVES";
+
+/// Whether level 1's execution buckets its waves ([`BUCKET_WAVES_ENV`]).
+pub fn bucket_waves() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(BUCKET_WAVES_ENV).ok().as_deref())
+    })
+}
+
 /// How level 1's streamed execution met the base's groups, on the driver's
 /// clock: what it ran before any group (its setup and first wave), when the
 /// front landed and its wave, when each group's share arrived from phase B,
@@ -1256,9 +1274,14 @@ pub fn prove_block_levels(
                 (0..npieces).map(|_| std::cell::OnceCell::new()).collect();
             let mut by_group: Vec<Option<Vec<LfmWord>>> = vec![None; marks.len() - 1];
             let execute_from = now();
-            let mut ex =
-                StreamedExecution::new_pieced_tapped(program, arena_pieces, &hasher, lean_beside)
-                    .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
+            let mut ex = StreamedExecution::new_pieced_bucketed(
+                program,
+                arena_pieces,
+                &hasher,
+                lean_beside,
+                bucket_waves(),
+            )
+            .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
             let mut landing = Level1Landing {
                 setup: now() - execute_from,
                 ..Level1Landing::default()
