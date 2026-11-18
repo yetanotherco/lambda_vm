@@ -35,6 +35,12 @@ pub fn knob_word_on(word: Option<&str>) -> bool {
     word.is_some_and(|v| v.trim() == "1")
 }
 
+/// Whether a default-on knob's word turns it off: `0` (spaces around it
+/// ignored), and nothing else; unset, empty or any other word leaves it on.
+pub fn knob_word_off(word: Option<&str>) -> bool {
+    word.is_some_and(|v| v.trim() == "0")
+}
+
 /// Whether the W-LFM prover holds the chips as their records:
 /// [`CHIP_RECORDS_ENV`], or a test's override.
 pub fn chip_records() -> bool {
