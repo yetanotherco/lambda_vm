@@ -720,16 +720,27 @@ fn blake3_round_form_leaves_execute_and_refuse_the_other_form() {
     }
 }
 
-/// ★ THE SAME LAYOUT UNDER ANOTHER STATEMENT. Two BLAKE3 round-form formats
+/// ★ THE SAME LAYOUT UNDER ANOTHER FORMAT. Two BLAKE3 round-form formats
 /// that differ in the cap rule alone (`/W3/Cq`, caps by Q, against `/W3`, the
 /// base's cap at every tree) over small blocks where the rule moves no cap:
 /// every chain has the same caps, counts and domains, so each leaf reads the
 /// same words in the same places and one form's proof lays out under the
-/// other's plan. A chain's own transcript absorbs no config word, so what
-/// tells them apart is the statement the leaf absorbs (the tag's cap-rule
-/// word and the fold word's bit), and it must: each form's leaves execute
-/// over their own proof and have NO EXECUTION over the other form's (its
-/// arena accepted as laid out), and the host refuses it too.
+/// other's plan. A chain's own transcript absorbs no config word; the cap
+/// rule reaches the transcripts at TWO places, each a program constant of the
+/// leaf and each enough alone:
+/// - the block statement the main transcript absorbs (`absorb_tagged`: the
+///   tag's cap-rule word and the fold word's caps-by-Q bit), before `(z, α,
+///   β)`;
+/// - every group's commit-time out-of-domain point
+///   (`multilinear_block::commit_ood_prefix`: the fold word again), whose
+///   answers the main transcript absorbs after the roots.
+///
+/// Each form's leaves execute over their own proof and have NO EXECUTION over
+/// the other form's (its arena accepted as laid out), and the host refuses it
+/// too. Before the executions the test prints which of the two bindings tell
+/// the formats apart (`B3 SAME LAYOUT BINDINGS`): with either one removed the
+/// refusal stands on the other, and only with both removed does the other
+/// form's proof execute (the box gate's mutant arms).
 ///
 /// Run alone under `LAMBDA_VM_B3_BASE_CAP=4`: at the base's cap of 8 the rule
 /// can move a later cap of a tall group's chain (a round of 114 queries pays
@@ -738,8 +749,9 @@ fn blake3_round_form_leaves_execute_and_refuse_the_other_form() {
 #[test]
 #[ignore = "proves small BLAKE3 blocks; box tier"]
 fn blake3_round_form_same_layout_other_statement_is_refused() {
-    use crate::block_whir::B3Rounds;
+    use crate::block_whir::{B3Rounds, block_format_tag, block_frame, block_statement_calls};
     use multilinear::whir_chain::WhirFolds;
+    use stark::multilinear_block::commit_ood_prefix;
     let mut fri = many_groups(BaseFormat::B3_WHIR);
     fri.group = GroupFold::Indexed;
     fri.zf.whir_trees = Round0Trees::One;
@@ -762,6 +774,43 @@ fn blake3_round_form_same_layout_other_statement_is_refused() {
         let plain_plan = b3_plan(&elf, &plain_proof, &plain, leaves);
         assert_ne!(cq_plan.id(), plain_plan.id(), "{name}: two statements");
         assert_eq!(cq_plan.num_groups(), plain_plan.num_groups());
+        // Which bindings tell the two formats apart: the statement the main
+        // transcript absorbs, and each group's commit-time prefix.
+        let opts = ProofOptions::default_test_options();
+        let absorbed = |proof: &BlockWhirProof, format: &BlockFormat| {
+            let frame = block_frame(proof.statement(), &elf, &opts, format).expect("the frame");
+            let calls = block_statement_calls(
+                proof.statement(),
+                &block_format_tag(format),
+                &elf,
+                &frame.config,
+                format.memory,
+            )
+            .expect("the statement calls")
+            .concat();
+            let prefixes: Vec<Vec<u8>> = (0..frame.stack_layouts.len())
+                .map(|g| commit_ood_prefix(g, &frame.stack_layouts[g], &frame.config))
+                .collect();
+            (calls, prefixes)
+        };
+        let (cq_calls, cq_prefixes) = absorbed(&cq_proof, &cq);
+        let (plain_calls, plain_prefixes) = absorbed(&plain_proof, &plain);
+        assert_eq!(cq_prefixes.len(), plain_prefixes.len());
+        let prefixes_differ = cq_prefixes
+            .iter()
+            .zip(&plain_prefixes)
+            .filter(|(a, b)| a != b)
+            .count();
+        println!(
+            "B3 SAME LAYOUT BINDINGS {name}: statement absorbed {} · commit-time prefixes differ in {}/{} groups",
+            if cq_calls == plain_calls {
+                "same"
+            } else {
+                "differs"
+            },
+            prefixes_differ,
+            cq_prefixes.len()
+        );
         for g in 0..cq_plan.num_groups() {
             let (_, n) = cq_plan.group_stack(g);
             let (a, b) = (cq_plan.chain_shape(n), plain_plan.chain_shape(n));
