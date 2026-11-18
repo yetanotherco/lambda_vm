@@ -447,6 +447,14 @@ enum Commands {
         /// proved at `split` alone (give `--tree-file` for another).
         #[arg(long, value_parser = ["split", "fused", "words"], default_value = "split")]
         memory: String,
+
+        /// How many pages a page table holds under `--memory words`: `0` (the
+        /// default: one table a page) or a count `k` in 1..=6, each run of
+        /// zero or private-input pages cut into aligned blocks of up to 2^k
+        /// pages, a table each. A format choice: `verify-block` must be given
+        /// the same one; the proof file does not carry it.
+        #[arg(long, value_parser = page_run_word, default_value = "0")]
+        page_run: String,
     },
 
     /// Verify a block proof produced by `prove-block`
@@ -513,6 +521,11 @@ enum Commands {
         /// from the proof.
         #[arg(long, value_parser = ["split", "fused", "words"], default_value = "split")]
         memory: String,
+
+        /// The page runs the block was proved with (`prove-block --page-run`,
+        /// default 0): the verifier's constant, never read from the proof.
+        #[arg(long, value_parser = page_run_word, default_value = "0")]
+        page_run: String,
     },
 
     /// Prove a block's WHIR BASE proof alone — no recursion over it — and
@@ -679,6 +692,7 @@ fn main() -> ExitCode {
             leaf_query,
             argue_pack,
             memory,
+            page_run,
         } => cmd_prove_block(
             elf,
             input,
@@ -695,6 +709,7 @@ fn main() -> ExitCode {
                 leaf_query: &leaf_query,
                 argue_pack: &argue_pack,
                 memory: &memory,
+                page_run: &page_run,
             },
         ),
         Commands::VerifyBlock {
@@ -710,6 +725,7 @@ fn main() -> ExitCode {
             leaf_query,
             argue_pack,
             memory,
+            page_run,
         } => cmd_verify_block(
             proof,
             elf,
@@ -724,6 +740,7 @@ fn main() -> ExitCode {
                 leaf_query: &leaf_query,
                 argue_pack: &argue_pack,
                 memory: &memory,
+                page_run: &page_run,
             },
         ),
         Commands::ProveBlockBase {
@@ -850,6 +867,7 @@ fn at_pinned_choices(c: &BlockChoices<'_>) -> bool {
         && c.leaf_query == "lean"
         && c.argue_pack == "22"
         && c.memory == "split"
+        && c.page_run == "0"
 }
 
 struct BlockChoices<'a> {
@@ -861,12 +879,26 @@ struct BlockChoices<'a> {
     leaf_query: &'a str,
     argue_pack: &'a str,
     memory: &'a str,
+    page_run: &'a str,
 }
 
 /// The memory format of `--memory`: the caller's, as the tree's harness
 /// knob (`BLOCK_WHIR_MEMORY`, refused by the block commands) would read it.
 fn block_memory(word: &str) -> Result<prover::tables::fused_memory::MemoryFormat, String> {
     prover::lfm::whir_block_tree::memory_setting(Some(word), false)
+}
+
+/// `--page-run`'s words: a count in 0..=6
+/// (`whir_block_tree::page_run_setting`).
+fn page_run_word(word: &str) -> Result<String, String> {
+    prover::lfm::whir_block_tree::page_run_setting(Some(word))?;
+    Ok(word.to_string())
+}
+
+/// The page runs of `--page-run`: the caller's, as the tree's harness knob
+/// (`BLOCK_WHIR_PAGE_RUN`, refused by the block commands) would read them.
+fn block_page_run(word: &str) -> Result<u8, String> {
+    prover::lfm::whir_block_tree::page_run_setting(Some(word))
 }
 
 /// `--argue-pack`'s words: `off` or a price in 0..=40
@@ -930,6 +962,7 @@ fn cmd_prove_block(
         leaf_query,
         argue_pack,
         memory,
+        page_run,
     } = choices;
 
     // The group opening is the caller's constant, given on the command line
@@ -969,6 +1002,11 @@ fn cmd_prove_block(
     // So is the memory format.
     if std::env::var_os("BLOCK_WHIR_MEMORY").is_some() {
         eprintln!("BLOCK_WHIR_MEMORY is the harness's knob: the CLI proves the verifier's form");
+        return ExitCode::FAILURE;
+    }
+    // So are the page runs.
+    if std::env::var_os("BLOCK_WHIR_PAGE_RUN").is_some() {
+        eprintln!("BLOCK_WHIR_PAGE_RUN is the harness's knob: give the CLI --page-run instead");
         return ExitCode::FAILURE;
     }
     let pack = match prover::lfm::whir_block_tree::pack_setting(Some(argue_pack)) {
@@ -1018,6 +1056,14 @@ fn cmd_prove_block(
         }
     };
     eprintln!("BLOCK MEMORY FORMAT: {memory:?}");
+    let page_run = match block_page_run(page_run) {
+        Ok(page_run) => page_run,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("BLOCK PAGE RUN: {page_run}");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
@@ -1050,6 +1096,7 @@ fn cmd_prove_block(
     cfg.format.leaf_scale = leaf_scale;
     cfg.format.leaf_query = leaf_query;
     cfg.format.memory = memory;
+    cfg.format.page_run_log2 = page_run;
     cfg.format = cfg.format.with_pack(pack);
     cfg.argue = cfg.format.argue;
     eprintln!("BLOCK ARGUE PACK: {argue_pack} ({pack:?})");
@@ -1185,6 +1232,7 @@ fn cmd_verify_block(
         leaf_query,
         argue_pack,
         memory,
+        page_run,
     } = choices;
 
     let fold = match group_setting(Some(group)) {
@@ -1222,6 +1270,13 @@ fn cmd_verify_block(
     };
     let memory = match block_memory(memory) {
         Ok(memory) => memory,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let page_run = match block_page_run(page_run) {
+        Ok(page_run) => page_run,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
@@ -1314,10 +1369,12 @@ fn cmd_verify_block(
     eprintln!("BLOCK LEAF QUERY: {leaf_query:?}");
     eprintln!("BLOCK ARGUE PACK: {argue_pack} ({pack:?})");
     eprintln!("BLOCK MEMORY FORMAT: {memory:?}");
+    eprintln!("BLOCK PAGE RUN: {page_run}");
     eprintln!("Verifying block proof...");
     let start = Instant::now();
     let result = verify_whir_block_tree_proof_at(
         &elf_data, &proof, fold, blowup, order, round0, leaf_scale, leaf_query, pack, memory,
+        page_run,
     );
     let verify_elapsed = start.elapsed();
     match result {
@@ -2966,10 +3023,54 @@ mod tests {
             leaf_query: "lean",
             argue_pack: "22",
             memory,
+            page_run: "0",
         };
         assert!(at_pinned_choices(&choices("split")));
         assert!(!at_pinned_choices(&choices("words")));
         assert!(!at_pinned_choices(&choices("fused")));
+    }
+
+    /// Both block commands take the page runs, 0 unless told otherwise, and
+    /// nothing but a count in 0..=6; each reads to the count it names, and
+    /// only 0 is at the pinned choices a compressed file is proved and
+    /// verified at.
+    #[test]
+    fn the_block_commands_take_the_page_runs() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let page_run = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(
+                    Commands::ProveBlock { page_run, .. } | Commands::VerifyBlock { page_run, .. },
+                ) => Some(page_run),
+                _ => None,
+            };
+            assert_eq!(page_run(cmd).as_deref(), Some("0"), "the default");
+            for k in 0..=6u8 {
+                let word = k.to_string();
+                let args = [cmd, &["--page-run", &word]].concat();
+                assert_eq!(page_run(&args), Some(word.clone()));
+                assert_eq!(block_page_run(&word), Ok(k), "{word} reads");
+            }
+            for word in ["7", "-1", "four", ""] {
+                let args = [cmd, &["--page-run", word]].concat();
+                assert!(parse(&args).is_err(), "--page-run {word:?} is refused");
+            }
+        }
+        let choices = |page_run| BlockChoices {
+            group: "indexed",
+            blowup: "2",
+            leaves: "coset",
+            trees: None,
+            leaf_double_from: "one-top",
+            leaf_query: "lean",
+            argue_pack: "22",
+            memory: "split",
+            page_run,
+        };
+        assert!(at_pinned_choices(&choices("0")));
+        assert!(!at_pinned_choices(&choices("4")));
     }
 
     /// Both block commands take the leaf scale, production's threshold of 10
