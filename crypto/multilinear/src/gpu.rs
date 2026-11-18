@@ -988,9 +988,94 @@ pub fn settle_card() -> Option<(u64, u64, u64, u64)> {
     let be = math_cuda::device::backend().ok()?;
     let _ = math_cuda::device::drain_and_trim();
     let (used, peak) = math_cuda::device::pool_used_bytes().ok()?;
+    // A card window ([`card_window_start`]) restarts the high-water mark; what
+    // it had seen since this reading's last one is kept and counted here.
+    let peak = peak.max(POOL_USED_PEAK_SEEN.swap(0, Ordering::Relaxed));
     let _ = math_cuda::device::reset_pool_high_water();
+    let _ = math_cuda::device::reset_pool_reserved_high_water();
+    POOL_RESERVED_PEAK_SEEN.store(0, Ordering::Relaxed);
     let (free, total) = be.device_mem_info()?;
     Some((used, peak, free, total))
+}
+
+/// The pool's used high-water marks a card window took over since the last
+/// [`settle_card`]; folded into its peak.
+#[cfg(feature = "cuda")]
+static POOL_USED_PEAK_SEEN: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "cuda")]
+static POOL_RESERVED_PEAK_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// The real card through a window of the prover ([`card_window_start`] …
+/// [`card_window_end`]), beside the ledger: the default pool's used and
+/// reserved high-water marks over the window, what the pool holds and the
+/// device has free at its end, and the device's total. The pool's reserved
+/// bytes are the card it holds; what else the process holds (the context,
+/// modules, allocations outside the pool) is `total − free − reserved_now`,
+/// so the card's real peak over the window is that plus `reserved_peak`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CardWindow {
+    pub used_peak: u64,
+    pub reserved_peak: u64,
+    pub reserved_now: u64,
+    pub free_now: u64,
+    pub total: u64,
+}
+
+impl CardWindow {
+    /// The card's real peak over the window: what the process held outside
+    /// the pool at its end, plus the pool's reserved peak.
+    pub fn real_peak(&self) -> u64 {
+        self.total
+            .saturating_sub(self.free_now)
+            .saturating_sub(self.reserved_now)
+            .saturating_add(self.reserved_peak)
+    }
+}
+
+/// Starts a card window: the pool's high-water marks restarted (what they
+/// held kept for [`settle_card`]). A report: nothing else moves.
+#[cfg(feature = "cuda")]
+pub fn card_window_start() {
+    if math_cuda::device::backend().is_err() {
+        return;
+    }
+    if let Ok((_, used_high)) = math_cuda::device::pool_used_bytes() {
+        POOL_USED_PEAK_SEEN.fetch_max(used_high, Ordering::Relaxed);
+    }
+    if let Ok((_, reserved_high)) = math_cuda::device::pool_reserved_bytes() {
+        POOL_RESERVED_PEAK_SEEN.fetch_max(reserved_high, Ordering::Relaxed);
+    }
+    let _ = math_cuda::device::reset_pool_high_water();
+    let _ = math_cuda::device::reset_pool_reserved_high_water();
+}
+
+/// Ends a card window ([`card_window_start`]): `None` without a card or when
+/// a reading fails.
+#[cfg(feature = "cuda")]
+pub fn card_window_end() -> Option<CardWindow> {
+    let be = math_cuda::device::backend().ok()?;
+    let (used_now, used_high) = math_cuda::device::pool_used_bytes().ok()?;
+    let (reserved_now, reserved_high) = math_cuda::device::pool_reserved_bytes().ok()?;
+    let (free_now, total) = be.device_mem_info()?;
+    POOL_USED_PEAK_SEEN.fetch_max(used_high, Ordering::Relaxed);
+    POOL_RESERVED_PEAK_SEEN.fetch_max(reserved_high, Ordering::Relaxed);
+    Some(CardWindow {
+        // The driver's high-water mark restarts at zero and rises with the
+        // next allocation: the larger of it and what is used now.
+        used_peak: used_high.max(used_now),
+        reserved_peak: reserved_high.max(reserved_now),
+        reserved_now,
+        free_now,
+        total,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn card_window_start() {}
+
+#[cfg(not(feature = "cuda"))]
+pub fn card_window_end() -> Option<CardWindow> {
+    None
 }
 
 #[cfg(not(feature = "cuda"))]

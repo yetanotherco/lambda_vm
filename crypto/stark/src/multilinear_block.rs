@@ -177,6 +177,11 @@ pub struct GroupStamps {
     /// [`PhaseBOverlap::On`] the previous group's openings beside it too
     /// (`transition_reserved`). Bytes; 0 without a device.
     pub argue_reserved: u64,
+    /// The real card through the group's argue (the same window as
+    /// `argue_reserved`): the memory pool's high-water marks and the device's
+    /// free bytes at its end ([`multilinear::gpu::CardWindow`]). `None`
+    /// without a device.
+    pub argue_card: Option<multilinear::gpu::CardWindow>,
     /// The ledger's promise just before the group's argue (its own columns
     /// on the card), and the ledger's peak through its revive and openings
     /// (the next group's columns, uploaded beside the argue, included), with
@@ -3443,6 +3448,7 @@ where
         let t = Instant::now();
         stamps[g].argue_base = multilinear::gpu::ledger_reserved();
         multilinear::gpu::reset_reserved_window();
+        multilinear::gpu::card_window_start();
         let refusals_before = prev.as_ref().map(|_| phase_b_refusals());
         let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
         let mut values: Vec<FieldElement<E>> = Vec::new();
@@ -3571,6 +3577,7 @@ where
         argue_result?;
         stamps[g].argue = argue_end.saturating_duration_since(t).as_secs_f64();
         stamps[g].argue_reserved = multilinear::gpu::reserved_window_peak();
+        stamps[g].argue_card = multilinear::gpu::card_window_end();
         if let (Some(next_store), Some(next)) = (next_store, next_g) {
             // The wait for the upload after the argument ended is the next
             // group's upload cost; the rest of it hid behind this argument.
