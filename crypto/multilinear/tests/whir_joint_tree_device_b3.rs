@@ -304,24 +304,68 @@ fn a_blake3_joint_run_on_the_card_proves_the_hosts_bytes() {
         let label = format!("{}, revived at drop 4, the stack path off", stack.name);
         gpu::force_coset_openings(Some(false));
         let from_stack = gpu::coset_openings();
-        let fell_back = gpu::coset_fallbacks();
         let reencoded = stack.try_prove(&cfg, Some(4));
         let moved = gpu::coset_openings() - from_stack;
-        let reencodes = gpu::coset_fallbacks() - fell_back;
         gpu::force_coset_openings(None);
         let (_, reencoded) = reencoded.unwrap_or_else(|e| panic!("{label}: {e:?}"));
         assert_eq!(moved, 0, "{label}: no tree from its stack");
-        // The fallback re-encodes the run's codewords one at a time: at
-        // least one re-encode a tree, the paths re-hashed on the host.
-        assert!(
-            reencodes >= stack.trees(&cfg),
-            "{label}: {reencodes} re-encodes for {} trees",
-            stack.trees(&cfg)
-        );
         assert!(
             bytes(&reencoded) == bytes(&host_proof),
             "{label}: the host's bytes"
         );
+    }
+}
+
+/// ★ A joint run held as its stacks whose coset plan declines (forced here;
+/// in a block, a card drop shallower than the plan needs, or a card that
+/// declines) re-encodes its codewords from their stacks one at a time,
+/// gathers the queried blocks' leaves from each and re-hashes the joint
+/// leaves on the host: every tree's opening counts its re-encodes, no tree
+/// opens from its stack, and the proof is the host's, byte for byte. With the
+/// stack path off the revive re-encodes up front instead, which is another
+/// path (the test above). Needs the `test-faults` feature.
+#[cfg(feature = "test-faults")]
+#[test]
+fn a_blake3_joint_run_whose_coset_plan_declines_re_encodes_to_the_hosts_bytes() {
+    let _serial = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            gpu::force_coset_plan_decline(false);
+        }
+    }
+    let cfg = config(Round0Trees::One);
+    for stack in [
+        Stack::run_of_three(),
+        Stack::runs_of_four_and_two(),
+        Stack::runs_of_four_and_one(),
+    ] {
+        let (host_roots, host_proof) = stack.on_the_host(&cfg);
+        for drop in [2, 4] {
+            let label = format!("{}, revived at drop {drop}, the plan declined", stack.name);
+            let from_stack = gpu::coset_openings();
+            let fell_back = gpu::coset_fallbacks();
+            let proved = {
+                let _restore = Restore;
+                gpu::force_coset_plan_decline(true);
+                stack.try_prove(&cfg, Some(drop))
+            };
+            let opened = gpu::coset_openings() - from_stack;
+            let reencodes = gpu::coset_fallbacks() - fell_back;
+            let (roots, proof) = proved.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            assert_eq!(opened, 0, "{label}: no tree from its stack");
+            assert!(
+                reencodes >= stack.trees(&cfg),
+                "{label}: {reencodes} re-encodes for {} trees",
+                stack.trees(&cfg)
+            );
+            assert_eq!(roots, host_roots, "{label}: roots");
+            stack.verify(&roots, &proof, &cfg, &label);
+            assert!(
+                bytes(&proof) == bytes(&host_proof),
+                "{label}: the host's bytes"
+            );
+        }
     }
 }
 

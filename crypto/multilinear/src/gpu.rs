@@ -646,6 +646,33 @@ pub fn force_coset_openings(on: Option<bool>) {
     );
 }
 
+/// Test only: every coset plan declines (the stack's openings return `None`),
+/// so a retired round-0 tree held as its stacks takes the re-encode fallback.
+#[cfg(any(test, feature = "test-faults"))]
+static COSET_PLAN_DECLINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arms [`COSET_PLAN_DECLINED`] for the whole process. Test builds only.
+#[cfg(any(test, feature = "test-faults"))]
+#[doc(hidden)]
+pub fn force_coset_plan_decline(on: bool) {
+    COSET_PLAN_DECLINED.store(on, Ordering::Relaxed);
+}
+
+/// Whether a test declined every coset plan.
+#[cfg(any(test, feature = "test-faults"))]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn coset_plan_declined() -> bool {
+    COSET_PLAN_DECLINED.load(Ordering::Relaxed)
+}
+
+/// Never in a production build.
+#[cfg(not(any(test, feature = "test-faults")))]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn coset_plan_declined() -> bool {
+    false
+}
+
 /// [`COSET_INPLACE_OPENS`].
 pub fn coset_inplace_opens() -> u64 {
     COSET_INPLACE_OPENS.load(Ordering::Relaxed)
@@ -7360,6 +7387,9 @@ impl CosetSource {
     where
         F: math::field::traits::IsField + 'static,
     {
+        if coset_plan_declined() {
+            return None;
+        }
         let raw: Vec<u64> = leaves.iter().map(|&leaf| leaf as u64).collect();
         let plan = math_cuda::whir_coset::CosetPlan::new(
             self.0.num_vars(),
@@ -8320,6 +8350,9 @@ impl CosetSource {
     where
         F: math::field::traits::IsField + 'static,
     {
+        if coset_plan_declined() {
+            return None;
+        }
         let first = sources.first()?;
         let raw: Vec<u64> = leaves.iter().map(|&leaf| leaf as u64).collect();
         let plan = math_cuda::whir_coset::CosetPlan::new(
