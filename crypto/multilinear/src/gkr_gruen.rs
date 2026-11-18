@@ -193,6 +193,7 @@ pub(crate) fn gkr_gruen_fault() -> bool {
 }
 
 static GRUEN_LAYERS: AtomicU64 = AtomicU64::new(0);
+static GRUEN2_LAYERS: AtomicU64 = AtomicU64::new(0);
 static GRUEN_ROUNDS: AtomicU64 = AtomicU64::new(0);
 static GRUEN_XCHECKED: AtomicU64 = AtomicU64::new(0);
 static GRUEN_XCHECK_SKIPPED: AtomicU64 = AtomicU64::new(0);
@@ -201,6 +202,12 @@ static GRUEN_DIRECT_H0: AtomicU64 = AtomicU64::new(0);
 /// Device GKR layers that ran Gruen's rounds.
 pub fn gruen_layers() -> u64 {
     GRUEN_LAYERS.load(Ordering::Relaxed)
+}
+
+/// Of [`gruen_layers`], the two-layer steps' (`gkr_lockstep`'s two-layer
+/// ladder): a step over the four quarters of a layer's grandchildren.
+pub fn gruen2_layers() -> u64 {
+    GRUEN2_LAYERS.load(Ordering::Relaxed)
 }
 
 /// Their card rounds.
@@ -231,6 +238,10 @@ pub(crate) fn note_layer(rounds: u64, xchecked: bool) {
     if xchecked {
         GRUEN_XCHECKED.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+pub(crate) fn note_two_layer() {
+    GRUEN2_LAYERS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn note_xcheck_skipped() {
@@ -303,7 +314,44 @@ impl<F: IsField> Chain<F> {
         })
     }
 
-    /// Past round `j`, whose challenge was `z`.
+    /// Round `j`'s message in a two-layer step, where `H` is a quartic: from
+    /// the card's `H(1)..H(4)` and, when there is no `1/(1 − u_j)`, `H(0)`.
+    /// `s(1) = E·u_j·H(1)`, `s(0) = claim − s(1)`, `E·H(0) = s(0)/(1 − u_j)`,
+    /// `H(5) = H(0) − 5H(1) + 10H(2) − 10H(3) + 5H(4)` (a quartic's fifth
+    /// difference is zero), then `s(t) = ℓ(t)·E·H(t)` for `t = 2..5`. `None`
+    /// when neither `H(0)` nor its inverse is given.
+    pub(crate) fn message_quartic(
+        &self,
+        rho: &FieldElement<F>,
+        inverse_left: Option<&FieldElement<F>>,
+        h: [&FieldElement<F>; 4],
+        h0: Option<&FieldElement<F>>,
+    ) -> Option<Message<F>> {
+        let one = FieldElement::<F>::one();
+        let big: [FieldElement<F>; 4] = std::array::from_fn(|t| &self.kappa * h[t]);
+        let s1 = rho * &big[0];
+        let s0 = &self.claim - &s1;
+        let big0 = match h0 {
+            Some(h0) => &self.kappa * h0,
+            None => &s0 * inverse_left?,
+        };
+        let five = FieldElement::<F>::from(5u64);
+        let ten = FieldElement::<F>::from(10u64);
+        let big5 = &big0 + &five * (&big[3] - &big[0]) + &ten * (&big[1] - &big[2]);
+        let step = rho + rho - &one;
+        let l2 = rho + &step;
+        let l3 = &l2 + &step;
+        let l4 = &l3 + &step;
+        let l5 = &l4 + &step;
+        Some(Message {
+            sent: vec![s1, &l2 * &big[1], &l3 * &big[2], &l4 * &big[3], &l5 * &big5],
+            s0,
+        })
+    }
+
+    /// Past round `j`, whose challenge was `z`: the next claim is the round's
+    /// polynomial at `z`, through `s(0)` and what it sent (a cubic, or the
+    /// quintic of a two-layer step).
     pub(crate) fn advance(
         &mut self,
         rho: &FieldElement<F>,
@@ -311,8 +359,14 @@ impl<F: IsField> Chain<F> {
         z: &FieldElement<F>,
     ) {
         let one = FieldElement::<F>::one();
-        let [s1, s2, s3] = [&message.sent[0], &message.sent[1], &message.sent[2]];
-        self.claim = self.cubic.at([&message.s0, s1, s2, s3], z);
+        if let [s1, s2, s3] = &message.sent[..] {
+            self.claim = self.cubic.at([&message.s0, s1, s2, s3], z);
+        } else {
+            let nodes: Vec<FieldElement<F>> = std::iter::once(message.s0.clone())
+                .chain(message.sent.iter().cloned())
+                .collect();
+            self.claim = crate::sumcheck::interpolate(&nodes, z);
+        }
         let step = rho + rho - &one;
         self.kappa = &self.kappa * ((&one - rho) + z * &step);
     }
