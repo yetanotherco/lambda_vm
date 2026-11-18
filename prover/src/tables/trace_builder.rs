@@ -10189,9 +10189,11 @@ impl Traces {
     /// is a prover-chosen field of `VmProof` with a free `u64` count, and this
     /// function is what turns it into allocations — so the cap must be enforced
     /// *before* the loop, not by the `expected_proof_count` check downstream, which
-    /// only runs once the `Vec` already exists. The verifier passes the sub-proof
-    /// count: a layout needing more pages than the proof has sub-proofs can never
-    /// verify, so this rejects nothing an honest prover could produce.
+    /// only runs once the `Vec` already exists. The verifier passes the most pages
+    /// its sub-proofs can hold (the sub-proof count with one table a page; times
+    /// a page table's most pages under the block format's page runs): a layout
+    /// needing more can never verify, so this rejects nothing an honest prover
+    /// could produce.
     pub fn page_configs_from_elf_and_runtime(
         elf: &Elf,
         runtime_page_ranges: &[crate::RuntimePageRange],
