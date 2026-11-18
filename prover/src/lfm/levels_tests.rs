@@ -886,6 +886,22 @@ fn rta_one_run(
         ),
         super::levels::bucket_waves(),
     );
+    if let Some(x) = &t.level1_exec {
+        println!(
+            "RTA LEVEL1 EXEC: schedule {:.3}s · setup {:.3}s · levels {} (on the pool {}, {} hashes) · hashing {:.3}s \
+             (on the driver's thread {} hashes in {:.3}s) · apply {:.3}s · the rest {:.3}s",
+            x.depth_pass,
+            x.setup,
+            x.levels,
+            x.parallel_levels,
+            x.parallel_hashes,
+            x.hash_phase,
+            x.serial_hashes,
+            x.serial_hash_secs,
+            x.apply,
+            x.residue
+        );
+    }
     let (lean, lean_wait) = t.lean_beside.unwrap_or_default();
     // Level 1's thread ends once its execution and the lean fill beside it
     // have: what of that is after the base is in series.
