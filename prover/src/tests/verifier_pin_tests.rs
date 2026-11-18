@@ -252,7 +252,7 @@ fn the_frame_refuses_a_bitwise_table_off_its_fixed_height() {
 /// production format's fused tables; the parent also runs the child under
 /// `fused` ([`MEMORY_WORDS`]), off the verifier's pinned split format, so each
 /// side sees a word off its own default.
-const OFF_DEFAULT: [(&str, &str); 12] = [
+const OFF_DEFAULT: [(&str, &str); 13] = [
     (crate::zf_format::ENV_WHIR_BLOWUP, "4"),
     (crate::zf_format::ENV_WHIR_GRIND_BITS, "20"),
     (crate::zf_format::ENV_WHIR_FOLDS, "uniform4"),
@@ -265,6 +265,7 @@ const OFF_DEFAULT: [(&str, &str); 12] = [
     ("BLOCK_WHIR_ECDAS", "bytes"),
     ("BLOCK_WHIR_REGISTERS", "tokens32"),
     ("BLOCK_WHIR_MEMORY", "split"),
+    ("BLOCK_WHIR_PAGE_RUN", "4"),
 ];
 
 /// The memory words the child runs under: `split`, off the production
@@ -396,6 +397,14 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         crate::tables::fused_memory::MemoryFormat::Fused,
         "the prover's own production format reads no memory knob"
     );
+    assert_eq!(
+        harness.format.page_run_log2, 4,
+        "the harness's page runs follow their knob"
+    );
+    assert_eq!(
+        production.page_run_log2, 0,
+        "the prover's own production format reads no page-run knob"
+    );
 
     // The verifier's is not.
     let debug = |o: &ProofOptions| format!("{o:?}");
@@ -433,6 +442,10 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         pinned.format.memory,
         crate::tables::fused_memory::MemoryFormat::Split,
         "the verifier's memory format is its named constant, not the environment's"
+    );
+    assert_eq!(
+        pinned.format.page_run_log2, 0,
+        "the verifier's page runs are its named constant, not the environment's"
     );
     assert!(pinned.share_inverse);
     assert_eq!(
