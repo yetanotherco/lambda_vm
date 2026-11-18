@@ -923,8 +923,8 @@ impl BlockAirInputs {
 /// A block's AIRs: every table of `table_counts`, HALT included, the CPU
 /// tables at `inputs`' heights, REGISTER's FINI pinned to the halted file,
 /// KECCAK_RND's byte checks as `keccak_rnd` sends them and MEMW_A's timestamp
-/// order in `memw_aligned`'s form and the registers in `registers`' (the
-/// block format's).
+/// order in `memw_aligned`'s form, the registers in `registers`' and ECDAS's
+/// relations in `ecdas`' (the block format's).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn block_airs(
     program: &Elf,
@@ -935,6 +935,7 @@ pub(crate) fn block_airs(
     keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
     memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
     registers: crate::tables::register::RegisterFormat,
+    ecdas: crate::tables::ecdas::EcdasForm,
 ) -> VmAirs {
     let mut airs = VmAirs::new(
         program,
@@ -970,6 +971,11 @@ pub(crate) fn block_airs(
     }
     if registers == crate::tables::register::RegisterFormat::InRow {
         airs.swap_in_row_registers(opts, inputs);
+    }
+    if ecdas != crate::tables::ecdas::EcdasForm::Bytes {
+        airs.ecdases = (0..airs.ecdases.len())
+            .map(|i| crate::test_utils::create_ecdas_air_for(opts, ecdas, &format!("ECDAS[{i}]")))
+            .collect();
     }
     airs
 }

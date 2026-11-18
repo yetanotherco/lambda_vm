@@ -54,6 +54,7 @@ pub(super) fn small_format() -> BlockFormat {
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
+        ecdas: crate::tables::ecdas::EcdasForm::Bytes,
     }
 }
 
@@ -487,6 +488,7 @@ fn dense_format() -> BlockFormat {
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
+        ecdas: crate::tables::ecdas::EcdasForm::Bytes,
     }
 }
 
@@ -1809,6 +1811,62 @@ fn the_leaf_query_is_the_verifiers_both_ways() {
     );
     verify(LeafQuery::V1, &top_v1).expect("the V1 tree under its own check");
     verify(LeafQuery::Lean, &top_lean).expect("the lean tree under its own check");
+}
+
+/// ★ ECDAS's limb form through the block's recursion, both ways:
+/// test_ecsm_multi with ECDAS in 16-row tables under the limb form (on the
+/// windowed build it needs) and under the byte form each prove to a top their
+/// own verifier accepts, and each verifier refuses the other's tree: the leaves
+/// interpret ECDAS's constraint program and interactions from the verifier's
+/// format.
+#[test]
+#[ignore = "proves two small blocks and their trees; box tier"]
+fn the_ecdas_form_is_the_trees_both_ways() {
+    use crate::tables::ecdas::EcdasForm;
+    let _permit = super::device_permit::serial_for_test();
+    let bytes = at_blowup_4(small_format());
+    assert_eq!(bytes.ecdas, EcdasForm::Bytes);
+    let halves = bytes.with_ecdas(EcdasForm::Halves);
+    let cut = |o: &mut BlockOptions| {
+        o.ecdas_rows_log2 = 4;
+        o.window_log2 = Some(3);
+    };
+    let (elf, by_bytes) = small_block_cut("test_ecsm_multi", &bytes, cut);
+    let (_, by_halves) = small_block_cut("test_ecsm_multi", &halves, cut);
+    assert_eq!(by_halves.table_counts.ecdas, 3, "three ECDAS tables");
+    let opts = ProofOptions::default_test_options();
+    let wrap = aggregation_wrap_options();
+    let (top_bytes, _) = compose(&plan_of(&elf, &by_bytes, &bytes, None), &by_bytes, "BYTES")
+        .expect("the byte form's tree proves");
+    let (top_halves, _) = compose(
+        &plan_of(&elf, &by_halves, &halves, None),
+        &by_halves,
+        "HALVES",
+    )
+    .expect("the limb form's tree proves");
+    let verify = |format: &BlockFormat, proof: &BlockWhirProof, top: &LfmProof| {
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            format,
+            proof.statement(),
+            None,
+            BLOCK_FAN_IN,
+            &wrap,
+            top,
+        )
+    };
+    verify(&bytes, &by_bytes, &top_bytes).expect("the byte form's tree under its own form");
+    verify(&halves, &by_halves, &top_halves).expect("the limb form's tree under its own form");
+    assert!(
+        verify(&halves, &by_bytes, &top_bytes).is_err(),
+        "the byte form's tree under the limb form"
+    );
+    assert!(
+        verify(&bytes, &by_halves, &top_halves).is_err(),
+        "the limb form's tree under the byte form"
+    );
+    println!("WHIR BLOCK TREE ECDAS FORMS: each form's tree accepted, each refused by the other");
 }
 
 /// ★ MEMW_A's timestamp order through the block's recursion, both ways: a

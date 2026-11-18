@@ -553,6 +553,7 @@ fn mix_statement(
         format.keccak_rnd,
         format.memw_aligned,
         format.registers,
+        format.ecdas,
     );
     if format.memory == MemoryFormat::Words {
         airs.with_word_memory(opts, words, &page_configs)

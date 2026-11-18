@@ -3688,6 +3688,7 @@ pub(super) fn words_statement(
         format.keccak_rnd,
         format.memw_aligned,
         format.registers,
+        format.ecdas,
     );
     if format.memory == MemoryFormat::Words {
         airs.with_word_memory(&opts, words.map(|n| n as usize), &pages)
@@ -4712,6 +4713,7 @@ fn the_split_and_fused_sets_carry_no_word_table() {
             pinned.keccak_rnd,
             pinned.memw_aligned,
             registers,
+            pinned.ecdas,
         );
         airs.with_fused_memory(&opts, fused);
         for air in airs.air_refs() {

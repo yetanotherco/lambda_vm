@@ -546,7 +546,12 @@ fn windowed_builds_the_cut_tables_as_the_split_whole_run_tables() {
                 crate::tables::fused_memory::MemoryFormat::Split,
             );
             split_ecsm(&mut want, log2, padding());
-            split_ecdas(&mut want, log2, padding());
+            split_ecdas(
+                &mut want,
+                log2,
+                padding(),
+                crate::tables::ecdas::EcdasForm::Bytes,
+            );
             split_copy(
                 &mut want,
                 log2,

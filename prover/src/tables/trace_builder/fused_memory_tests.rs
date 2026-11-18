@@ -1777,6 +1777,7 @@ fn the_verifier_frames_a_fused_statement_and_refuses_its_forgeries() {
         format.keccak_rnd,
         format.memw_aligned,
         format.registers,
+        format.ecdas,
     );
     let fused = build.fused_counts();
     airs.with_fused_memory(&options, fused);

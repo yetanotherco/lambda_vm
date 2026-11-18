@@ -257,6 +257,8 @@ struct P4Mode {
     from_tables: bool,
     /// Which byte checks KECCAK_RND sends ([`StreamSkip::keccak_rnd_form`]).
     keccak_rnd_form: keccak_rnd::KeccakRndForm,
+    /// Which relations ECDAS proves its steps with ([`StreamSkip::ecdas_form`]).
+    ecdas_form: ecdas::EcdasForm,
     /// LT's per-row lookups are counted from merged rows ([`lt_count_merge`]).
     lt_merge: bool,
 }
@@ -269,6 +271,7 @@ impl P4Mode {
             direct: skip.p4_direct,
             from_tables: false,
             keccak_rnd_form: skip.keccak_rnd_form,
+            ecdas_form: skip.ecdas_form,
             lt_merge: lt_count_merge(skip),
         }
     }
@@ -329,6 +332,7 @@ fn count_bitwise(
                 direct,
                 from_tables,
                 keccak_rnd_form,
+                ecdas_form,
                 lt_merge,
             },
     } = lists;
@@ -519,7 +523,7 @@ fn count_bitwise(
     let ecdas_slice = p4_slice_len(P4Source::Ecdas, mul_chunk, dvrm_chunk);
     for slice in ecdas_ops.parts().flat_map(|part| part.chunks(ecdas_slice)) {
         collectors.push(Box::new(move |h| {
-            h.add_ops(&collect_bitwise_from_compact_ecdas(slice))
+            h.add_ops(&collect_bitwise_from_compact_ecdas_in(slice, ecdas_form))
         }));
     }
     // COPY's rows are millions at a block's size: a collector a block of
@@ -2010,6 +2014,7 @@ impl<'a> FinishPlan<'a> {
             }
             generate_optional(&ecsm_ops.whole(), ecsm::generate_ecsm_trace)
         };
+        let ecdas_form = skip.ecdas_form;
         let gen_ecdases = || {
             if skip.ecdas_rows > 0 {
                 return cut_tables(
@@ -2018,15 +2023,30 @@ impl<'a> FinishPlan<'a> {
                     skip.cut_padding,
                     pack,
                     form,
-                    ecdas::rows_written_packed,
+                    match ecdas_form {
+                        ecdas::EcdasForm::Bytes => ecdas::rows_written_packed,
+                        ecdas::EcdasForm::Halves => ecdas::halves_rows_written_packed,
+                    },
                     |rows, num_rows, form| {
-                        ecdas::generate_ecdas_rows_of(rows, num_rows, form, ecdas::widen)
+                        ecdas::generate_ecdas_rows_in(
+                            rows,
+                            num_rows,
+                            form,
+                            ecdas_form,
+                            ecdas::widen,
+                        )
                     },
                 );
             }
             generate_optional(&ecdas_ops.whole(), |rows| {
                 let num_rows = rows.len().next_power_of_two().max(4);
-                ecdas::generate_ecdas_rows_of(rows, num_rows, TraceForm::Wide, ecdas::widen)
+                ecdas::generate_ecdas_rows_in(
+                    rows,
+                    num_rows,
+                    TraceForm::Wide,
+                    ecdas_form,
+                    ecdas::widen,
+                )
             })
         };
         // HINT table. Absent entirely for programs that make no hint ecalls.
@@ -2958,6 +2978,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         drop(ecsm_ops);
         let ecdas_ops = Arc::clone(&shared.ecdas_ops);
+        let ecdas_form = skip.ecdas_form;
         units.extend(cut_units(
             family("ECDAS"),
             &ecdas_ops,
@@ -2965,17 +2986,18 @@ impl<'a> FinishPlan<'a> {
             skip.cut_padding,
             pack,
             form,
-            Arc::new(|rows: &[ecdas::CompactEcdasOp], num_rows, form| {
-                ecdas::generate_ecdas_rows_of(rows, num_rows, form, ecdas::widen)
+            Arc::new(move |rows: &[ecdas::CompactEcdasOp], num_rows, form| {
+                ecdas::generate_ecdas_rows_in(rows, num_rows, form, ecdas_form, ecdas::widen)
             }),
             |ops| {
                 Box::new(move || {
                     let rows = ops.whole();
                     let num_rows = rows_of(rows.len());
-                    Ok(ecdas::generate_ecdas_rows_of(
+                    Ok(ecdas::generate_ecdas_rows_in(
                         &rows,
                         num_rows,
                         TraceForm::Wide,
+                        ecdas_form,
                         ecdas::widen,
                     ))
                 })

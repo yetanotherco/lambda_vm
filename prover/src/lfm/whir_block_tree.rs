@@ -23,6 +23,7 @@
 use multilinear::whir_chain::{ArgueFormat, GkrPack, GroupFold, LeafOrder, Round0Trees};
 
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
+use crate::tables::ecdas::EcdasForm;
 use crate::tables::fused_memory::MemoryFormat;
 use crate::tables::keccak_rnd::KeccakRndForm;
 use crate::tables::memw_aligned::MemwAlignedOrder;
@@ -436,6 +437,21 @@ pub fn memw_aligned_setting(knob: Option<&str>) -> Result<MemwAlignedOrder, Stri
     }
 }
 
+/// `BLOCK_WHIR_ECDAS`'s reading: unset is the pinned preset's form
+/// ([`BlockFormat::pinned`]), so the harness proves what `verify-block`
+/// verifies; `halves` names the relations at 16-bit limb positions
+/// ([`EcdasForm::Halves`]) and `bytes` today's byte positions
+/// ([`EcdasForm::Bytes`]). A format value: the prover and the verifier of one
+/// proof take the same one.
+pub fn ecdas_setting(knob: Option<&str>) -> Result<EcdasForm, String> {
+    match knob.map(str::trim) {
+        None => Ok(BlockFormat::pinned().ecdas),
+        Some("halves") => Ok(EcdasForm::Halves),
+        Some("bytes") => Ok(EcdasForm::Bytes),
+        Some(v) => Err(format!("BLOCK_WHIR_ECDAS={v}: halves or bytes")),
+    }
+}
+
 /// `BLOCK_WHIR_REGISTERS`'s reading: unset is the pinned preset's format
 /// ([`BlockFormat::pinned`], the registers checked in the CPU row);
 /// `tokens32` names the format before it, word tokens through MEMW_R (the
@@ -537,6 +553,7 @@ impl WhirTreeConfig {
             leaf_query,
             keccak_rnd: keccak_rnd_setting(std::env::var("BLOCK_WHIR_KECCAK_RND").ok().as_deref())?,
             memw_aligned: memw_aligned_setting(std::env::var("BLOCK_WHIR_MEMW_A").ok().as_deref())?,
+            ecdas: ecdas_setting(std::env::var("BLOCK_WHIR_ECDAS").ok().as_deref())?,
             registers: registers_setting(std::env::var("BLOCK_WHIR_REGISTERS").ok().as_deref())?,
             memory: memory_setting(
                 std::env::var("BLOCK_WHIR_MEMORY").ok().as_deref(),
@@ -560,6 +577,14 @@ impl WhirTreeConfig {
             match format.memw_aligned {
                 MemwAlignedOrder::Limbs => "limbs",
                 MemwAlignedOrder::Lt => "lt",
+            }
+        );
+        eprintln!(
+            "★ BLOCK ECDAS: {} (BLOCK_WHIR_ECDAS; halves proves each step's relations at 16-bit \
+             limb positions, bytes at byte positions)",
+            match format.ecdas {
+                EcdasForm::Halves => "halves",
+                EcdasForm::Bytes => "bytes",
             }
         );
         eprintln!(
@@ -648,7 +673,8 @@ impl WhirTreeConfig {
     /// [`BLOCK_FAN_IN`] and the production argue — with its GKR trees laid out
     /// as the format's packing says, a named constant the block verifier is
     /// given too ([`BlockFormat::with_pack`]) — and the verifier's preset
-    /// KECCAK_RND, MEMW_A and register forms, which the CLI has no flag for.
+    /// KECCAK_RND, MEMW_A, ECDAS and register forms, which the CLI has no flag
+    /// for.
     /// The memory format is a named constant the block verifier is given too
     /// (`--memory`), so any of the three is at the presets.
     pub fn at_presets(&self) -> bool {
@@ -662,6 +688,7 @@ impl WhirTreeConfig {
             && self.format.argue == self.argue
             && self.format.keccak_rnd == BlockFormat::pinned().keccak_rnd
             && self.format.memw_aligned == BlockFormat::pinned().memw_aligned
+            && self.format.ecdas == BlockFormat::pinned().ecdas
             && self.format.registers == BlockFormat::pinned().registers
     }
 }
@@ -6605,6 +6632,14 @@ mod tests {
         let mut c = production.clone();
         c.format = c.format.with_memw_aligned(other);
         assert!(!c.at_presets(), "the other MEMW_A form");
+        // Nor has ECDAS's.
+        let other = match BlockFormat::pinned().ecdas {
+            EcdasForm::Bytes => EcdasForm::Halves,
+            EcdasForm::Halves => EcdasForm::Bytes,
+        };
+        let mut c = production.clone();
+        c.format = c.format.with_ecdas(other);
+        assert!(!c.at_presets(), "the other ECDAS form");
         // The memory format is a named constant the block verifier is given
         // (`--memory`): each of the three is at the presets.
         for memory in [
