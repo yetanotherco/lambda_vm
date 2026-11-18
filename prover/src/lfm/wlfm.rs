@@ -149,6 +149,16 @@ macro_rules! with_wlfm_hash {
 /// base's groups take three (`block_whir::BLOCK_GROUP_POLYS`).
 pub const WLFM_GROUP_POLYS: usize = 4;
 
+/// [`WLFM_GROUP_POLYS`], or a test's own on this thread
+/// (`test_format::set_group_polys`), so a small fixture spans several groups.
+fn wlfm_group_polys() -> usize {
+    #[cfg(test)]
+    if let Some(n) = test_format::group_polys() {
+        return n;
+    }
+    WLFM_GROUP_POLYS
+}
+
 /// Queries a chain runs at [`WlfmRate::Four`]: the fewest that keep the unique-
 /// decoding figure at the base's 113.04 bits, `141 · log2(8/5) + 18 = 113.61`
 /// (140 would give 112.93). At blowup 2 the count is the base's own derivation.
@@ -1626,7 +1636,7 @@ pub fn prepare_wlfm_rounds(
     }
     let shapes = table_shapes(&refs, &table_num_vars);
     let config = wlfm_config_rounds(rate, final_poly, fold, grind, rounds, &shapes)?;
-    let sizes = multilinear_block::block_groups(&shapes, config.format.stack, WLFM_GROUP_POLYS)
+    let sizes = multilinear_block::block_groups(&shapes, config.format.stack, wlfm_group_polys())
         .map_err(|e| format!("{e:?}"))?;
     let group_lists: Vec<Vec<u32>> = {
         let mut at = 0u32;
@@ -2497,7 +2507,7 @@ fn verifier_frame(artifacts: &WlfmArtifacts, airs: &WlfmAirs) -> Result<Verifier
         return Err("the artifacts' config is not their rate's over their shapes".into());
     }
     let sizes =
-        multilinear_block::block_groups(&shapes, artifacts.config.format.stack, WLFM_GROUP_POLYS)
+        multilinear_block::block_groups(&shapes, artifacts.config.format.stack, wlfm_group_polys())
             .map_err(|e| format!("{e:?}"))?;
     if sizes != artifacts.sizes {
         return Err("the artifacts' groups are not their shapes'".into());
@@ -2822,6 +2832,25 @@ pub(crate) mod test_format {
         static NARROW_CHIPS: Cell<Option<bool>> = const { Cell::new(None) };
         static CHIP_RECORDS: Cell<Option<bool>> = const { Cell::new(None) };
         static LEAN_BESIDE: Cell<Option<bool>> = const { Cell::new(None) };
+        static GROUP_POLYS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Every W-LFM build and verify on this thread groups `polys` stacked
+    /// polynomials a group until the guard drops.
+    pub(crate) struct GroupPolysOverride(Option<usize>);
+
+    impl Drop for GroupPolysOverride {
+        fn drop(&mut self) {
+            GROUP_POLYS.with(|c| c.set(self.0));
+        }
+    }
+
+    pub(crate) fn set_group_polys(polys: usize) -> GroupPolysOverride {
+        GroupPolysOverride(GROUP_POLYS.with(|c| c.replace(Some(polys))))
+    }
+
+    pub(super) fn group_polys() -> Option<usize> {
+        GROUP_POLYS.with(Cell::get)
     }
 
     /// Every W-LFM build on this thread cuts its chips at `2^log` rows until
