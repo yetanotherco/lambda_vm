@@ -182,6 +182,13 @@ pub(crate) fn median_statement(
             .expect("the block's inputs");
         airs.swap_in_row_registers(opts, &inputs);
     }
+    if format.ecdas != crate::tables::ecdas::EcdasForm::Bytes {
+        airs.ecdases = (0..airs.ecdases.len())
+            .map(|i| {
+                crate::test_utils::create_ecdas_air_for(opts, format.ecdas, &format!("ECDAS[{i}]"))
+            })
+            .collect();
+    }
     // The fixed tables at their preprocessed columns' heights, so group 0
     // emits too (HALT, which has none, stays at the placeholder).
     for (i, air) in airs
@@ -1305,6 +1312,60 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         ),
         "MEMW_A's LT form"
     );
+}
+
+/// ★ The leaves that check the median mix's four ECDAS tables emit under
+/// each ECDAS form, from each form's own statement, and the two forms' leaves
+/// are other programs: a leaf evaluates ECDAS's constraint program and
+/// interactions as its verifier's format builds them. The leaf counts are the
+/// same. Prints `ECDAS LEAF` lines (the leaves' digests, re-taken when a form's
+/// program moves).
+#[test]
+fn the_ecdas_leaves_emit_under_each_form() {
+    use super::whir_chain_tests::program_digest;
+    use crate::tables::ecdas::EcdasForm;
+    let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let opts = super::proof::block_base_options();
+    let mut seen = Vec::new();
+    for form in [EcdasForm::Bytes, EcdasForm::Halves] {
+        let format = p1_format_at_blowup_2().with_ecdas(form);
+        let owned = median_statement(elf_bytes, &opts, &format);
+        let plan = WhirBlockPlan::derive(elf_bytes, &opts, &format, owned.view(), None)
+            .expect("the plan derives");
+        let (_, ecdas, _) = crate::block_whir::chunked_table_ranges(&owned.table_counts)
+            .into_iter()
+            .find(|(name, ..)| *name == "ECDAS")
+            .expect("the ECDAS range");
+        assert_eq!(ecdas.len(), 4, "the mix's four ECDAS tables");
+        let groups: Vec<usize> = owned
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.iter().any(|&t| ecdas.contains(&(t as usize))))
+            .map(|(i, _)| i)
+            .collect();
+        let partition = plan.partition();
+        let leaves: Vec<usize> = (0..partition.num_leaves())
+            .filter(|&k| partition.leaf(k).iter().any(|u| groups.contains(u)))
+            .collect();
+        assert!(!leaves.is_empty(), "{form:?}: a leaf checks ECDAS");
+        let digests: Vec<String> = leaves
+            .iter()
+            .map(|&k| program_digest(&plan.leaf_program(k).expect("the leaf emits")))
+            .collect();
+        println!(
+            "ECDAS LEAF {form:?}: {} leaves, ECDAS in groups {groups:?}, leaves {leaves:?}: {digests:?}",
+            partition.num_leaves()
+        );
+        seen.push((partition.num_leaves(), digests));
+    }
+    assert_eq!(seen[0].0, seen[1].0, "the same leaf count");
+    for d in &seen[1].1 {
+        assert!(
+            !seen[0].1.contains(d),
+            "a limb-form leaf is another program"
+        );
+    }
 }
 
 /// ★ The lean leaf's census on the median mix at blowup 2 (the production

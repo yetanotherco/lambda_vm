@@ -67,6 +67,11 @@ libc = "0.2"
 
 [dev-dependencies]
 env_logger = "*"
+# Test-only: ECDAS's relations checked over the integers (the same versions
+# `ecsm` builds its witness with).
+num-bigint = "0.4.6"
+num-integer = "0.1.46"
+num-traits = "0.2.19"
 # Test-only: tests that pin a guest guard on its ELF's sha256, because two
 # builds of the same guest from the same sources share a name and differ in
 # bytes.
