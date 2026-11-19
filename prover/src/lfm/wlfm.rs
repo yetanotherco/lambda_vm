@@ -2373,6 +2373,7 @@ fn prove_traces_under<H: WhirHash>(
                 b.with_phase_b_overlap(phase_b_overlap(stacks))
                     .with_phase_b_upload_beside(uploads_beside(stacks))
                     .with_phase_b_overlap_planned(overlap_planned())
+                    .with_prepared_upload_once(upload_once())
                     .with_overlap_faults(overlap_faults_for_test())
             })
         }
@@ -2829,6 +2830,40 @@ pub fn set_overlap_faults_for_test(faults: multilinear_block::OverlapFaults) {
 /// This thread's test faults: none outside a test that set them.
 fn overlap_faults_for_test() -> multilinear_block::OverlapFaults {
     OVERLAP_FAULTS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+/// `LAMBDA_VM_LEVELS_UPLOAD_ONCE=1`: a W-LFM prove whose prepared stacks are
+/// retired puts each one's columns on the card once, at its revive, and both
+/// the revive and the prepared opening read them there
+/// ([`multilinear_block::BlockCommitted::with_prepared_upload_once`]), where
+/// today the revive copies them in for its encode and the opening copies them
+/// in again for its message. Planned per group against the card's ledger, two
+/// copies where the plan or the card says no. The same proof. Only the W-LFM
+/// prover (the levels') reads it; the base's block prover never sets it. Off by
+/// default (and for any word but `1`); read once a process.
+pub const UPLOAD_ONCE_ENV: &str = "LAMBDA_VM_LEVELS_UPLOAD_ONCE";
+
+thread_local! {
+    /// A test's [`upload_once`] on this thread.
+    static UPLOAD_ONCE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`upload_once`] forced on this thread (`None` restores the
+/// knob).
+#[doc(hidden)]
+pub fn set_upload_once_for_test(on: Option<bool>) {
+    UPLOAD_ONCE_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`UPLOAD_ONCE_ENV`] is on (or this thread's test override).
+pub fn upload_once() -> bool {
+    if let Some(on) = UPLOAD_ONCE_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(UPLOAD_ONCE_ENV).ok().as_deref())
+    })
 }
 
 /// `LAMBDA_VM_LEVELS_PREPARE_PAR=1`: a W-LFM build's host part turns its

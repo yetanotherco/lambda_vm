@@ -780,6 +780,83 @@ fn the_blake3_driver_with_the_planned_overlap_proves_the_same_level_bytes() {
     }
 }
 
+/// The BLAKE3 driver with every level's prepared stacks retired and each
+/// retired stack's columns put on the card once (`LAMBDA_VM_LEVELS_UPLOAD_ONCE`)
+/// proves the same level bytes as [`prove_levels`] does over the same base with
+/// held stacks; on a card some group used its store and none was refused.
+/// Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_uploading_once_proves_the_same_level_bytes() {
+    use super::levels::{prove_block_levels, set_stacks_for_test};
+    use super::wlfm::{StackPlace, set_upload_once_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_upload_once_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = {
+        let _restore = Restore;
+        let _retired = set_stacks_for_test(Some(StackPlace::CardRetired));
+        set_upload_once_for_test(Some(true));
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level")
+    };
+    let stamps: Vec<_> = run
+        .times
+        .stamps
+        .iter()
+        .flat_map(|st| st.groups.iter().map(|g| g.upload_once))
+        .collect();
+    let used = stamps.iter().filter(|u| u.used).count();
+    let refused = stamps.iter().filter(|u| u.refused).count();
+    println!(
+        "LEVELS UPLOAD ONCE: {used} stores used · {refused} refused · {} planned out",
+        stamps.iter().filter(|u| u.planned_out).count()
+    );
+    assert_eq!(refused, 0, "no store refused by the card");
+    if multilinear::gpu::reserve_budget() > 0 {
+        assert!(
+            used > 0,
+            "on a card, some retired stack's columns went up once"
+        );
+    }
+    let held = {
+        let _held = set_stacks_for_test(Some(StackPlace::Card));
+        derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive")
+    };
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
+        println!(
+            "LEVELS UPLOAD ONCE IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
+}
+
 /// The fill-beside knob's name; it is on by default, and only `0` turns it
 /// off.
 #[test]
@@ -1562,7 +1639,8 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
             "{tag} GROUP {g}: tables {} · polys {} · cells {} · wait A {:.3}s · up A {:.3}s (paid \
              {:.3}) · commit {:.3}s · retire {:.3}s · up B {:.3}s · argue {:.3}s · encode {:.3}s · \
              open {:.3}s · prepared revive {:.3}s · open paid {:.3}s · overlapped {} · columns gone \
-             before revive {} · overlap planned out {} at {:.2} of {:.2} GiB · turn {:.3}-{:.3}s · GiB \
+             before revive {} · overlap planned out {} at {:.2} of {:.2} GiB · upload once used {} ({:.2} GB, \
+             ledger {:.2} GiB, planned out {} at {:.2} of {:.2} GiB, refused {}) · turn {:.3}-{:.3}s · GiB \
              promised: commit {:.2}/{:.2} · argue {:.2}/{:.2} · open {:.2}{}",
             s.tables,
             s.polys,
@@ -1583,6 +1661,13 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
             s.overlap_planned_out,
             gib(s.overlap_plan_need),
             gib(s.overlap_plan_free),
+            s.upload_once.used,
+            s.upload_once.bytes as f64 / 1e9,
+            gib(s.upload_once.after),
+            s.upload_once.planned_out,
+            gib(s.upload_once.need),
+            gib(s.upload_once.free),
+            s.upload_once.refused,
             s.start_b,
             s.end_b,
             gib(s.commit_base),
