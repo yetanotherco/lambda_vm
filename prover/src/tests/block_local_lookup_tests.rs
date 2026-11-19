@@ -11,7 +11,8 @@
 
 use crate::block_whir::{
     self, BlockFormat, BlockWhirProof, Deviations, LocalArgues, b3_base_local_setting,
-    block_format_tag, prove_block_whir_local_with, prove_block_whir_with, verify_block_whir,
+    block_format_tag, local_lane_setting, prove_block_whir_local_with, prove_block_whir_with,
+    verify_block_whir,
 };
 use crate::tables::keccak_rnd::KeccakRndForm;
 use crate::tables::local_bytes;
@@ -116,6 +117,20 @@ fn the_local_knob_reads_off_or_keccak() {
     assert!(!BlockFormat::pinned().local_lookups());
     assert!(local().local_lookups());
     assert!(!lean().local_lookups());
+}
+
+/// `LAMBDA_VM_LOCAL_LANE`: unset, empty or `1` is on (phase A's lane runs
+/// the local argues); `0` is off (phase B runs them); anything else is
+/// refused.
+#[test]
+fn the_local_lane_knob_reads_on_or_off() {
+    assert_eq!(local_lane_setting(None), Ok(true));
+    assert_eq!(local_lane_setting(Some("")), Ok(true));
+    assert_eq!(local_lane_setting(Some(" 1 ")), Ok(true));
+    assert_eq!(local_lane_setting(Some("0")), Ok(false));
+    for bad in ["on", "off", "2", "true", "lane", "01"] {
+        assert!(local_lane_setting(Some(bad)).is_err(), "{bad:?}");
+    }
 }
 
 /// The statement tag names local lookups (`/LL1`), and today's does not.
@@ -366,4 +381,80 @@ fn the_recursion_refuses_a_base_under_local_lookups() {
         None,
     );
     assert!(plan.is_err());
+}
+
+/// Phase A's lane moves no byte on a real block: the block proved with the
+/// lane on and with it off ([`Deviations::local_lane`]) is the same proof,
+/// and it verifies. Phase A takes every table's digest from its own layout,
+/// and the prove refuses digests that are not the verifier's from its AIRs,
+/// so both proves pin them. On a card the lane runs local bins beside the
+/// commits; on the host a group has no store on the card and every job is
+/// left to phase B. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1` (one grind
+/// nonce for both proves).
+#[test]
+#[ignore = "box tier: proves a real block twice, run with --ignored --test-threads=1 and \
+            LAMBDA_VM_DETERMINISTIC_GRIND=1"]
+fn the_local_lane_moves_no_byte_on_a_real_block() {
+    assert!(
+        crypto::grinding::deterministic(),
+        "export LAMBDA_VM_DETERMINISTIC_GRIND=1"
+    );
+    let elf = elf();
+    let prove_with = |lane: bool| {
+        let t = std::time::Instant::now();
+        let proved = prove_block_whir_local_with(
+            &elf,
+            &[],
+            &opts(),
+            &local(),
+            &block_options(),
+            &Deviations {
+                local_lane: Some(lane),
+                ..Deviations::default()
+            },
+        )
+        .expect("prove");
+        eprintln!(
+            "local prove, lane {lane}: {:.1}s\n{}",
+            t.elapsed().as_secs_f64(),
+            stark::multilinear_block::local_lane_lines(&proved.1.groups)
+        );
+        proved
+    };
+    let (on, on_stamps) = prove_with(true);
+    let (off, off_stamps) = prove_with(false);
+    let bytes = |proof: &BlockWhirProof<LocalArgues>| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(proof)
+            .expect("serialize")
+            .to_vec()
+    };
+    assert!(
+        bytes(&on) == bytes(&off),
+        "the lane moved the proof's bytes"
+    );
+    assert!(verify(&on, &elf, &local()), "the lane's proof verifies");
+    let local_groups = on.local.iter().filter(|argue| !argue.is_empty()).count();
+    assert!(local_groups > 0, "the block holds local groups");
+    // Lane off: no job, every local group's bins in phase B.
+    assert!(
+        off_stamps
+            .groups
+            .iter()
+            .all(|g| g.zc_lane.state == stark::multilinear_block::LaneState::Off)
+    );
+    assert_eq!(
+        off_stamps
+            .groups
+            .iter()
+            .filter(|g| !g.local_b.is_empty())
+            .count(),
+        local_groups
+    );
+    // Lane on: a job a local group; on a card, bins ran beside the commits.
+    let jobs = on_stamps.groups.iter().filter(|g| g.zc_lane.local).count();
+    assert_eq!(jobs, local_groups, "a lane job a local group");
+    let ran: usize = on_stamps.groups.iter().map(|g| g.zc_lane.bins_ran).sum();
+    if multilinear::gpu::reserve_budget() > 0 {
+        assert!(ran > 0, "on a card the lane ran local bins");
+    }
 }

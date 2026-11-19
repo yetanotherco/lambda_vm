@@ -78,6 +78,10 @@ where
     slot_of: Vec<usize>,
     kinds: Vec<FactorKind>,
     num_vars: usize,
+    /// The AIR's preprocessed count ([`Self::with_preprocessed_count`]); 0
+    /// unless set. Read only by a table's digest
+    /// (`multilinear_block::table_digest_of`), never by a statement.
+    preprocessed_count: usize,
 }
 
 impl<'a, F, E> TableLayout<'a, F, E>
@@ -137,7 +141,27 @@ where
             slot_of,
             kinds,
             num_vars,
+            preprocessed_count: 0,
         })
+    }
+
+    /// The layout with its AIR's preprocessed count `count` (its leading
+    /// columns the verifier fixes): what a table's digest reads
+    /// (`multilinear_block::table_digest_of`). Both sides' layouts from one
+    /// AIR carry the same count. No statement reads it.
+    pub fn with_preprocessed_count(mut self, count: usize) -> Self {
+        self.preprocessed_count = count;
+        self
+    }
+
+    /// The AIR's preprocessed count ([`Self::with_preprocessed_count`]).
+    pub fn preprocessed_count(&self) -> usize {
+        self.preprocessed_count
+    }
+
+    /// The table's bus interactions.
+    pub fn interactions(&self) -> &'a [BusInteraction] {
+        self.interactions
     }
 
     /// The statement this layout describes, with no preprocessed columns to

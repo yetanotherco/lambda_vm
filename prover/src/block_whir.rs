@@ -871,6 +871,27 @@ pub fn gkr_ladder_tag_word(ladder: GkrLadder) -> &'static str {
 /// [`KeccakRndForm::LeanLocal`]: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal
 pub const B3_BASE_LOCAL_ENV: &str = "LAMBDA_VM_B3_BASE_LOCAL";
 
+/// The knob that, under local lookups ([`B3_BASE_LOCAL_ENV`]), lets phase
+/// A's lane run each local group's local argue beside the commits, one bin
+/// at a time, the bins left running at the group's turn in phase B
+/// (`multilinear_block::LocalPhaseA::lane`). The proof is the same byte for
+/// byte either way: see [`local_lane_setting`].
+pub const LOCAL_LANE_ENV: &str = "LAMBDA_VM_LOCAL_LANE";
+
+/// [`LOCAL_LANE_ENV`]'s value: unset, empty or `1` is on (the lane runs the
+/// local argues); `0` is off (every local argue at its group's turn in phase
+/// B). Anything else is refused.
+pub fn local_lane_setting(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("" | "1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(other) => Err(format!(
+            "{LOCAL_LANE_ENV}={other:?}: expected 1 (the lane runs the local argues, the \
+             default) or 0 (phase B runs them)"
+        )),
+    }
+}
+
 /// [`B3_BASE_LOCAL_ENV`]'s value: unset, `0` or `off` is off (today's
 /// format); `keccak` argues KECCAK_RND's byte lookups per group. Anything
 /// else is refused.
@@ -3605,6 +3626,7 @@ impl BlockStamps {
         ));
         out.push_str(&multilinear_block::cs_probe_lines(&self.groups));
         out.push_str(&multilinear_block::zc_lane_lines(&self.groups));
+        out.push_str(&multilinear_block::local_lane_lines(&self.groups));
         out.push_str(&multilinear_block::merge_probe_lines(&self.groups));
         if let Some(p) = self.pinned {
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
@@ -5101,6 +5123,10 @@ pub(crate) struct Deviations {
     /// Under the batched argue: a group argued with faults, or every group
     /// argued on the host ([`multilinear_block::ArgueDeviation`]).
     pub argue: multilinear_block::ArgueDeviation,
+    /// Under local lookups: phase A's lane runs the local argues
+    /// (`Some(true)`) or leaves them to phase B (`Some(false)`), instead of
+    /// the knob ([`LOCAL_LANE_ENV`]). The proof is the same.
+    pub local_lane: Option<bool>,
     /// Faults in phase B's overlap ([`multilinear_block::OverlapFaults`]).
     pub overlap_faults: multilinear_block::OverlapFaults,
     /// Between the phases, the first narrow table's width map made wrong, so
@@ -6658,6 +6684,8 @@ where
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
 {
     let mut digests = Vec::new();
+    // Tables of one AIR and shape share a digest: hashed once.
+    let mut seen: Vec<((usize, usize, usize), [u8; 32])> = Vec::new();
     for group in groups {
         let airs: Vec<AirRef<'r>> = group
             .iter()
@@ -6681,12 +6709,21 @@ where
             } else {
                 0
             };
-            digests.push(multilinear_block::table_digest::<E, T>(
-                num_vars,
-                width,
-                preprocessed,
-                air.bus_interactions(),
-            ));
+            let key = (air.bus_interactions().as_ptr() as usize, num_vars, width);
+            let digest = match seen.iter().find(|(k, _)| *k == key) {
+                Some((_, digest)) => *digest,
+                None => {
+                    let digest = multilinear_block::table_digest::<E, T>(
+                        num_vars,
+                        width,
+                        preprocessed,
+                        air.bus_interactions(),
+                    );
+                    seen.push((key, digest));
+                    digest
+                }
+            };
+            digests.push(digest);
         }
     }
     Ok(digests)
@@ -8400,6 +8437,13 @@ fn prove_streamed(
     // The constraint-sumcheck probes: measurements, off unless asked (the
     // proof is the same); a word they do not take refuses the prove.
     let cs_probe = multilinear_block::CsProbe::from_env().map_err(Error::Prover)?;
+    // Under local lookups, whether phase A's lane runs the local argues: the
+    // proof is the same either way; a word it does not take refuses the prove.
+    let local_lane = match deviations.local_lane {
+        Some(lane) => lane,
+        None => local_lane_setting(std::env::var(LOCAL_LANE_ENV).ok().as_deref())
+            .map_err(Error::Prover)?,
+    };
     // Where the in-row side records are walked into: a word it does not take
     // refuses the prove.
     let sides_pinned = crate::tables::trace_builder::inrow_sides_pinned_setting(
@@ -9744,6 +9788,16 @@ fn prove_streamed(
                     spill.clone(),
                     // A measurement, off unless asked: the proof is the same.
                     cs_probe.clone(),
+                    // Under local lookups: each group's digests and local
+                    // challenges right after its commit, and the lane's local
+                    // argues when it is on.
+                    format
+                        .local_lookups()
+                        .then(|| multilinear_block::LocalPhaseA {
+                            buses: local_bytes::LOCAL_BUSES.to_vec(),
+                            lane: local_lane,
+                            binding: stark::multilinear_table::batched::LocalBinding::ALL,
+                        }),
                 ))
             };
             (block, builder.join(), layout.join(), executor.join())
@@ -10199,9 +10253,11 @@ fn prove_streamed(
         };
         let reorder: Option<&multilinear_block::PhaseBReorder<'_>> =
             lead.is_some().then_some(&lead_turn);
-        // Under local lookups: the format's local buses and each table's
-        // digest, for each group's local transcript.
-        let block = if format.local_lookups() {
+        // Under local lookups: the digests phase A absorbed, each from its
+        // table's own layout, must be the ones the verifier takes from its
+        // AIRs ([`local_digests`]); a difference is the prover's error here,
+        // not a proof the verifier refuses.
+        if format.local_lookups() {
             let refs = run_airs
                 .get()
                 .ok_or_else(|| Error::Prover("the run's AIR set was never built".into()))?
@@ -10216,13 +10272,12 @@ fn prove_streamed(
                         .or_else(|| (i < laid.shapes.len()).then_some(local_air))
                 },
             )?;
-            block.with_local_lookups(multilinear_block::BlockLocal {
-                buses: local_bytes::LOCAL_BUSES.to_vec(),
-                digests,
-            })
-        } else {
-            block
-        };
+            if block.local_digests() != Some(&digests[..]) {
+                return Err(Error::Prover(
+                    "local lookups: the digests taken at commit time are not the AIRs'".into(),
+                ));
+            }
+        }
         let (proof, argues, prepared_openings, groups, commit_ood, local_argues) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
                 block
