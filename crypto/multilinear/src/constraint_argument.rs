@@ -1441,6 +1441,12 @@ mod tests {
     #[derive(Debug)]
     struct HostFilled(NarrowColumns);
 
+    /// The host-fill count ([`crate::records::fills`]) is process-wide, and
+    /// libtest runs tests side by side: every test here that reads a
+    /// records-held table's columns on the host holds this lock, so a count
+    /// one of them takes never includes another's fill.
+    static HOST_FILLS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     impl crate::records::TableRecords for HostFilled {
         fn rows(&self) -> usize {
             self.0.rows()
@@ -1465,6 +1471,9 @@ mod tests {
     /// never packed, spilled or handed packed columns.
     #[test]
     fn a_trace_held_as_records_proves_the_same_bytes() {
+        let _fills = HOST_FILLS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let columns = satisfying(4);
         let wide = CommittedTrace::<F, F>::commit(columns.clone(), &config()).unwrap();
         let mut held = CommittedTrace::<F, F>::commit(columns.clone(), &config()).unwrap();
@@ -1508,6 +1517,9 @@ mod tests {
     /// from them install in their place.
     #[test]
     fn records_leave_for_the_spill_and_come_back() {
+        let _fills = HOST_FILLS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let columns = satisfying(4);
         let packed = || NarrowColumns::pack_columns(&columns).unwrap();
         let held = Records(std::sync::Arc::new(HostFilled(packed())));
