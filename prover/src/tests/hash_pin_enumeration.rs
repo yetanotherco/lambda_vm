@@ -252,6 +252,21 @@ const BLESSED: &[(&str, &str)] = &[
          `Blake3StarkHash`, which must keep flagging everywhere else.",
     ),
     (
+        "lfm/blake3_lean_probe.rs",
+        "The lean BLAKE3 chip's standalone probe, and it NAMES its hashes: \
+         each `Arm` spells its commitment configuration and its transcript \
+         (`B3Arm`: `Blake3StarkHash` with the STARK pipeline's BLAKE3 \
+         transcript, `DefaultStarkTranscript`; `P1Arm`: `p1_commit`'s \
+         `P1StarkHash` and `P1Transcript`), and every prove and verify is \
+         `GenericProver` / `GenericVerifier` at `A::S`, so no global is read \
+         and no default reaches a consumer by omission. ✓ REACHABILITY: the \
+         module is `#[cfg(test)]` (`lfm/mod.rs`) and no other file names it; \
+         its proofs, roots and traces stay inside its own tests, compared with \
+         each other and with the `blake3` crate, and nothing that follows the \
+         pin is handed them. Blessing the file excuses every flagged symbol in \
+         it, so it stays a test-only probe.",
+    ),
+    (
         "lfm/p1_commit.rs",
         "One mention: the re-export of `stark::config::P1StarkHashCapped`, the \
          Poseidon1 STARK configuration generic over its 4-ary cap, which this \
