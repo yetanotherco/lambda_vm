@@ -2997,17 +2997,35 @@ fn the_rest_regenerator_refuses_what_it_did_not_rebuild() {
     }
 }
 
+/// AIR order for the page tables, so a rest laid out inline and one streamed
+/// on workers hand their tables on in the same order: the streamed rest hands
+/// the page tables on right after KECCAK_RND's by default
+/// ([`Deviations::pages_first`]), while the inline rest is built whole and
+/// laid out in AIR order, so the partitions would differ by that order alone.
+fn page_tables_in_air_order() -> Deviations {
+    Deviations {
+        pages_first: Some(false),
+        ..Deviations::default()
+    }
+}
+
 /// The streamed chunks laid out on three threads are packed in the inline
 /// order all the same: the same groups and table counts as laid out on one
-/// thread, and the proof verifies.
+/// thread, and the proof verifies. The page tables in AIR order on both
+/// ([`page_tables_in_air_order`]).
 #[test]
 fn a_streamed_block_laid_out_on_three_threads_packs_the_same_groups() {
     let elf = asm_elf_bytes("all_instructions_64");
     let format = many_groups();
-    let inline = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+    let inline = prove_with(
+        &elf,
+        &format,
+        &streamed(MaxRowsConfig::small(), 16, 3),
+        &page_tables_in_air_order(),
+    );
     let mut o = streamed(MaxRowsConfig::small(), 16, 3);
     o.layout_workers = 3;
-    let proof = prove(&elf, &format, &o);
+    let proof = prove_with(&elf, &format, &o, &page_tables_in_air_order());
     assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
     assert_eq!(proof.groups, inline.groups);
     assert_eq!(
@@ -3329,12 +3347,18 @@ fn an_early_keccak_rnd_table_laid_out_with_another_air_is_refused() {
 
 /// The bounded layout (D-EXEC E3): with three workers and `layout_ahead =
 /// Some(k)`, at most `k + 1` streamed chunks are laid out (or in the making)
-/// and not yet packed at once, and the groups are the inline layout's.
+/// and not yet packed at once, and the groups are the inline layout's. The
+/// page tables in AIR order on both ([`page_tables_in_air_order`]).
 #[test]
 fn the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked() {
     let elf = asm_elf_bytes("all_instructions_64");
     let format = many_groups();
-    let inline = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
+    let inline = prove_with(
+        &elf,
+        &format,
+        &streamed(MaxRowsConfig::small(), 16, 3),
+        &page_tables_in_air_order(),
+    );
     for k in [0, 2] {
         let mut o = streamed(MaxRowsConfig::small(), 16, 3);
         o.layout_workers = 3;
@@ -3345,7 +3369,7 @@ fn the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked() {
             &ProofOptions::default_test_options(),
             &format,
             &o,
-            &Deviations::default(),
+            &page_tables_in_air_order(),
         )
         .expect("prove");
         let most = stamps.layout.ahead_most;
