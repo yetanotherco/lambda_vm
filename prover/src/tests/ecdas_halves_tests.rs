@@ -66,14 +66,16 @@ fn the_byte_forms_air_is_pinned() {
         program_digest(&*create_ecdas_air_for(&opts, EcdasForm::Bytes, "ECDAS")),
         "cdd4c4e6927f9f89b22c5e150e79499d7e2fe6ebf7a125f46913222c9619c4b4"
     );
+    // The type's default stays the byte form (every build outside the block
+    // format); the block presets take the limb form.
     assert_eq!(EcdasForm::default(), EcdasForm::Bytes);
     assert_eq!(
         crate::block_whir::BlockFormat::pinned().ecdas,
-        EcdasForm::Bytes
+        EcdasForm::Halves
     );
     assert_eq!(
         crate::block_whir::BlockFormat::production().ecdas,
-        EcdasForm::Bytes
+        EcdasForm::Halves
     );
 }
 

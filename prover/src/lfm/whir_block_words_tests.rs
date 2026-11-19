@@ -1295,6 +1295,7 @@ fn word_build(
         .and_then(|b| b.register_format(format.registers))
         .and_then(|b| b.memw_aligned_order(format.memw_aligned))
         .map(|b| b.keccak_rnd_form(format.keccak_rnd))
+        .map(|b| b.ecdas_form(format.ecdas))
         .and_then(|b| b.memory_format(format.memory))
         .expect("the builder");
     let window = 1000;

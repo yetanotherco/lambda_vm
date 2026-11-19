@@ -703,12 +703,15 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcdasConstraints {
 pub enum EcdasForm {
     /// The byte-position relations: 64 carries a relation, each checked as a
     /// 16-bit value, and one byte check a lookup (521 columns, 200
-    /// constraints, 388 interactions). Today's table.
+    /// constraints, 388 interactions). The form of every build outside the
+    /// block format (the per-table STARK, the whole-run build), and the block
+    /// format's before the limb form.
     #[default]
     Bytes,
     /// The same relations at 16-bit limb positions: 31 carries a relation,
     /// each a 16-bit and an 8-bit part, and two byte checks a lookup (515
-    /// columns, 101 constraints, 242 interactions).
+    /// columns, 101 constraints, 242 interactions). The block presets' form
+    /// (`BlockFormat::production` and `pinned`).
     Halves,
 }
 

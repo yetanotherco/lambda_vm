@@ -4106,8 +4106,8 @@ fn the_block_caps_the_chunked_tables_heights() {
 /// ★ Every chunked table's cap is the tallest power of two at which its
 /// columns fill at most one polynomial of the format's 2^27 stack: COPY
 /// 41 × 2^21, KECCAK 511 × 2^18, KECCAK_RND 1,480 × 2^16, ECSM 667 × 2^17,
-/// ECDAS 521 × 2^17. One doubling past a cap would stack the table into two
-/// polynomials.
+/// ECDAS 521 × 2^17 (515 × 2^17 in its limb form). One doubling past a cap
+/// would stack the table into two polynomials.
 ///
 /// Mutation (laptop): the KECCAK or the ECSM cap lifted, and this test fails
 /// (the caps test reads the constants, so it cannot see a lifted cap).
@@ -4142,6 +4142,17 @@ fn every_chunked_cap_is_the_tallest_table_one_stacked_polynomial_holds() {
             cap + 1
         );
     }
+    // ECDAS's limb form (the block presets'): 515 columns, the same cap.
+    let (_, _, cap) = block_whir::chunked_table_ranges(&chunked_counts())
+        .into_iter()
+        .find(|(name, ..)| *name == "ECDAS")
+        .expect("ECDAS's range");
+    let width = ecdas::halves_cols::NUM_COLUMNS;
+    assert!(width << cap <= 1 << stack, "the limb form at its cap");
+    assert!(
+        width << (cap + 1) > 1 << stack,
+        "the limb form one doubling past it"
+    );
 }
 
 /// ★ G2: no table may be stated taller than [`block_whir::BLOCK_MAX_TABLE_VARS`]
