@@ -855,6 +855,8 @@ pub fn reserve_without_eviction(bytes: u64) -> Option<DeviceReservation> {
 /// - `DeviceColumns::gather`'s room (a public-reading tree's small store) is
 ///   speculative too: its `None` takes the old path, which counts its own
 ///   refusal where its work moves to the host;
+/// - `DeviceColumns::upload_store`'s room (a retired prepared stack's store)
+///   moves nothing to the host: the reader copies twice on the card;
 /// - a kept input layer's tree (`truncated_tree`, `LAMBDA_VM_ARGUE_INPUT_REAL`)
 ///   is also speculative: its `None` builds today's tree instead;
 /// - `reserve_room`'s two callers keep the work on the device. `take_turn` opens
