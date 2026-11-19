@@ -303,6 +303,9 @@ pub struct GroupStamps {
     /// Phase B: each bin's seconds in the batched argue (its trees built and
     /// its ladder run), in plan order; empty under the per-table argue.
     pub bins_b: Vec<f64>,
+    /// Under local lookups, phase B: each local bin's seconds run at the
+    /// group's turn (the bins the lane left), in plan order.
+    pub local_b: Vec<f64>,
 }
 
 /// ⛔ A MEASUREMENT KNOB, never a proof's: phase A runs each group's
@@ -546,7 +549,8 @@ pub fn cs_probe_lines(stamps: &[GroupStamps]) -> String {
 mod zc_lane;
 #[doc(hidden)]
 pub use zc_lane::{
-    LaneDefer, LaneLimits, LaneState, MergeStamp, ZcLaneStamp, merge_probe_lines, zc_lane_lines,
+    LaneDefer, LaneLimits, LaneState, MergeStamp, ZcLaneStamp, local_lane_lines, merge_probe_lines,
+    zc_lane_lines,
 };
 
 /// The label that opens a group's probe transcript ([`CsProbe`]): no proof's
@@ -896,6 +900,28 @@ where
     transcript.state()
 }
 
+/// A table's digest ([`table_digest`]) from its own layout: its height, its
+/// committed width, its AIR's preprocessed count
+/// ([`TableLayout::with_preprocessed_count`]) and its interactions. The
+/// prover computes the digests it absorbs at commit time with this; the
+/// verifier computes its own from its AIRs, never from a proof.
+pub fn table_digest_of<F, E, T>(table: &CommittedTable<'_, F, E>) -> [u8; 32]
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    let layout = table.layout();
+    table_digest::<E, T>(
+        layout.num_vars(),
+        layout.slot_of().len(),
+        layout.preprocessed_count(),
+        layout.interactions(),
+    )
+}
+
 /// A packing's tag in [`table_digest`]: explicit, never its discriminant.
 fn packing_tag(packing: BusPacking) -> u64 {
     match packing {
@@ -919,6 +945,106 @@ fn packing_tag(packing: BusPacking) -> u64 {
 pub struct BlockLocal {
     pub buses: Vec<u64>,
     pub digests: Vec<[u8; 32]>,
+}
+
+/// Local lookups from phase A on ([`BlockCommitted::commit_groups_probed`]):
+/// the format's local buses, and whether the lane runs each local group's
+/// local argue beside the commits (`lane`; its bins left run at the group's
+/// turn in phase B either way). Each table's digest ([`table_digest_of`])
+/// and each local group's challenges ([`local_challenges`]) are taken right
+/// after the group's commit. The proof is the same whether the lane runs or
+/// not.
+#[derive(Clone, Debug)]
+pub struct LocalPhaseA {
+    pub buses: Vec<u64>,
+    pub lane: bool,
+    /// What each local transcript binds before its challenges:
+    /// [`LocalBinding::ALL`] but in a test's mutant phase A.
+    #[doc(hidden)]
+    pub binding: LocalBinding,
+}
+
+/// A local group's argue begun at commit time: `(z_g, α_g)` and the group's
+/// local transcript, drawn right after the group's commit
+/// ([`local_challenges`]), and its prover once the lane made it, with the
+/// bins it ran ([`batched::LocalProver`]). The transcript goes with the
+/// prover: together they resume where they stopped.
+struct LocalStarted<E: IsField, T> {
+    transcript: T,
+    z: FieldElement<E>,
+    alpha: FieldElement<E>,
+    prover: Option<batched::LocalProver<E>>,
+}
+
+/// Group `group`'s tables' digests ([`table_digest_of`]; zeros for a group
+/// with no local interaction, never read) and, for a local group, its local
+/// argue begun ([`LocalStarted`]), right after its commit `done`. A group
+/// whose challenges cannot be drawn begins nothing: phase B draws them again
+/// and meets the same refusal.
+fn begin_local<F, E, T>(
+    group: usize,
+    tables: &[CommittedTable<'_, F, E>],
+    done: &CommittedGroup<F, E>,
+    config: &ChainConfig,
+    local: &LocalPhaseA,
+) -> (Vec<[u8; 32]>, Option<Box<dyn std::any::Any + Send>>)
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+{
+    let statements: Vec<TableStatement<'_, F, E>> =
+        tables.iter().map(CommittedTable::statement).collect();
+    if !group_is_local(&statements, &local.buses) {
+        return (vec![[0u8; 32]; tables.len()], None);
+    }
+    // Tables of one AIR and shape share a digest: hashed once.
+    type Key = (usize, usize, usize, usize, usize);
+    let mut seen: Vec<(Key, [u8; 32])> = Vec::new();
+    let digests: Vec<[u8; 32]> = tables
+        .iter()
+        .map(|table| {
+            let layout = table.layout();
+            let key = (
+                layout.interactions().as_ptr() as usize,
+                layout.interactions().len(),
+                layout.num_vars(),
+                layout.slot_of().len(),
+                layout.preprocessed_count(),
+            );
+            match seen.iter().find(|(k, _)| *k == key) {
+                Some((_, digest)) => *digest,
+                None => {
+                    let digest = table_digest_of::<F, E, T>(table);
+                    seen.push((key, digest));
+                    digest
+                }
+            }
+        })
+        .collect();
+    let started = local_challenges::<E, T>(
+        group,
+        done.retired.layout(),
+        &done.roots,
+        &done.ood.answers,
+        &digests,
+        config,
+        // The group's roots and answers are in before the draw: the commit
+        // has ended (`done`).
+        local.binding,
+    )
+    .ok()
+    .map(|(z, alpha, transcript)| {
+        Box::new(LocalStarted {
+            transcript,
+            z,
+            alpha,
+            prover: None,
+        }) as Box<dyn std::any::Any + Send>
+    });
+    (digests, started)
 }
 
 /// Local lookups on the verifier's side ([`block_verify_with`]): the
@@ -2370,9 +2496,12 @@ where
     /// ([`CsProbe::merge`]), the host taking a table the card declines when
     /// `Some(true)`.
     merge_probe: Option<bool>,
-    /// Local lookups argued per group ([`Self::with_local_lookups`]), or
-    /// none: today's format.
+    /// Local lookups argued per group ([`Self::with_local_lookups`], or
+    /// from phase A on: [`LocalPhaseA`]), or none: today's format.
     local: Option<BlockLocal>,
+    /// Under [`LocalPhaseA`], by group: the local argue begun in phase A
+    /// ([`LocalStarted`]), for the group's turn to finish.
+    local_started: Vec<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 /// A test's fault in a block's commit-time answers
@@ -2412,7 +2541,7 @@ where
     ) -> Result<Self, MlError>
     where
         H: WhirHash,
-        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
     {
         if sizes.iter().sum::<usize>() != tables.len() {
             return Err(MlError::QueryCountMismatch {
@@ -2443,7 +2572,7 @@ where
     ) -> Result<Self, MlError>
     where
         H: WhirHash,
-        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
     {
         let block = Self::commit_groups::<H, T>(
             groups.into_iter().take(sizes.len()),
@@ -2480,7 +2609,7 @@ where
     ) -> Result<Self, MlError>
     where
         H: WhirHash,
-        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
     {
         Self::commit_groups_logged::<H, T>(
             groups,
@@ -2506,7 +2635,7 @@ where
     ) -> Result<Self, MlError>
     where
         H: WhirHash,
-        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
     {
         Self::commit_groups_probed::<H, T>(
             groups,
@@ -2517,6 +2646,7 @@ where
             mem,
             spill,
             CsProbe::default(),
+            None,
         )
     }
 
@@ -2527,6 +2657,14 @@ where
     ///
     /// Under [`CsProbeMode::Lane`] the lane's thread ([`zc_lane`]) runs beside
     /// the commits, and phase A ends once its job under way has.
+    ///
+    /// `local`: local lookups argued per group ([`LocalPhaseA`]), or none
+    /// (today's format). Each group's digests and, for a local group, its
+    /// local challenges are taken right after its commit; with
+    /// [`LocalPhaseA::lane`] and `upload_ahead` the lane runs the local
+    /// groups' bins beside the commits (its limits, and a test's host lane,
+    /// are `probe`'s), and phase B runs the bins left. The bytes are the same
+    /// either way.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_groups_probed<H, T>(
         groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
@@ -2537,13 +2675,19 @@ where
         mem: Option<Arc<BlockMem>>,
         spill: Option<BlockSpill>,
         probe: CsProbe,
+        local: Option<LocalPhaseA>,
     ) -> Result<Self, MlError>
     where
         H: WhirHash,
-        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
     {
-        let lane = (matches!(probe.mode, CsProbeMode::Lane(_)) && upload_ahead)
-            .then(|| zc_lane::ZcLane::<F, E>::new(&probe, config))
+        let local_lane = local
+            .as_ref()
+            .filter(|local| local.lane)
+            .map(|local| local.buses.clone());
+        let lane = ((matches!(probe.mode, CsProbeMode::Lane(_)) || local_lane.is_some())
+            && upload_ahead)
+            .then(|| zc_lane::ZcLane::<F, E>::new(&probe, config, local_lane))
             .flatten();
         let Some(lane) = lane else {
             return Self::commit_groups_with::<H, T>(
@@ -2556,6 +2700,7 @@ where
                 spill,
                 &probe,
                 None,
+                local.as_ref(),
             );
         };
         let (block, close_wait) = std::thread::scope(|scope| {
@@ -2570,6 +2715,7 @@ where
                 spill,
                 &probe,
                 Some(&lane),
+                local.as_ref(),
             );
             // Phase A's loop ended: the job under way finishes, the rest go.
             let closing = Instant::now();
@@ -2580,9 +2726,15 @@ where
             (block, closing.elapsed().as_secs_f64())
         });
         let mut block = block?;
-        for (g, stamp) in lane.into_stamps() {
+        let (stamps, started) = lane.into_parts();
+        for (g, stamp) in stamps {
             if let Some(stamps) = block.stamps.get_mut(g) {
                 stamps.zc_lane = stamp;
+            }
+        }
+        for (g, started) in started {
+            if let Some(slot) = block.local_started.get_mut(g) {
+                *slot = Some(started);
             }
         }
         if let Some(last) = block.stamps.last_mut() {
@@ -2604,10 +2756,11 @@ where
         spill: Option<BlockSpill>,
         probe: &CsProbe,
         lane: Option<&zc_lane::ZcLane<'a, F, E>>,
+        local: Option<&LocalPhaseA>,
     ) -> Result<Self, MlError>
     where
         H: WhirHash,
-        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
     {
         let batched = matches!(config.format.argue, ArgueFormat::Batched { .. });
         // The probe runs only where the next group is taken beside a commit,
@@ -2627,6 +2780,10 @@ where
         }
         let mut roots = Vec::new();
         let mut stamps = Vec::new();
+        // Under local lookups: every table's digest, and each group's local
+        // argue begun (when the lane did not take it).
+        let mut local_digests: Vec<[u8; 32]> = Vec::new();
+        let mut local_started: Vec<Option<Box<dyn std::any::Any + Send>>> = Vec::new();
         let mut incoming = groups.into_iter();
         let started = Instant::now();
         // The previous group's pack on the card, running beside this group's
@@ -2766,6 +2923,15 @@ where
                             &signal,
                         );
                         let commit_end = Instant::now();
+                        // Under local lookups: the group's digests, and its
+                        // local challenges drawn now, right after its roots
+                        // and answers.
+                        let (digests, mut started) = match (&committed, local) {
+                            (Ok(done), Some(local)) => {
+                                begin_local::<F, E, T>(group_index, group_ref, done, config, local)
+                            }
+                            _ => (Vec::new(), None),
+                        };
                         // The lane's job: the group's columns held for it.
                         if let Some(lane) = lane {
                             if let Ok(done) = &committed {
@@ -2775,6 +2941,11 @@ where
                                     &done.roots,
                                     probe_on_card,
                                     commit_end,
+                                    if lane.runs_local() {
+                                        started.take()
+                                    } else {
+                                        None
+                                    },
                                 );
                             }
                             lane.commit_ends();
@@ -2806,7 +2977,13 @@ where
                             }
                             _ => None,
                         };
-                        (committed, commit_end, probed, Instant::now())
+                        (
+                            committed,
+                            commit_end,
+                            probed,
+                            Instant::now(),
+                            (digests, started),
+                        )
                     });
                     // Beside the commit: the next group, then its columns once
                     // the commit has asked for its room (or ended).
@@ -2830,9 +3007,12 @@ where
                             Instant::now(),
                         )
                     });
-                    let (committed, commit_end, probe_stamp, probe_end) = committer
+                    let (committed, commit_end, probe_stamp, probe_end, begun) = committer
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    let (digests, begun_local) = begun;
+                    local_digests.extend(digests);
+                    local_started.push(begun_local);
                     // What the probe held back: the next commit once the next
                     // group's columns were up, or phase A's end once the
                     // producer had none.
@@ -2871,7 +3051,7 @@ where
                 ahead = next;
                 committed
             } else {
-                commit_and_retire::<F, E, H, T, _>(
+                let committed = commit_and_retire::<F, E, H, T, _>(
                     group_index,
                     layout,
                     &columns,
@@ -2879,7 +3059,14 @@ where
                     config,
                     drop_levels,
                     &|| {},
-                )
+                );
+                if let (Ok(done), Some(local)) = (&committed, local) {
+                    let (digests, started) =
+                        begin_local::<F, E, T>(group_index, &group, done, config, local);
+                    local_digests.extend(digests);
+                    local_started.push(started);
+                }
+                committed
             };
             let committed = committed?;
             drop(columns);
@@ -3021,7 +3208,11 @@ where
             ood,
             ood_unbound: false,
             merge_probe: (probe.merge && batched).then_some(probe.host),
-            local: None,
+            local: local.map(|local| BlockLocal {
+                buses: local.buses.clone(),
+                digests: local_digests,
+            }),
+            local_started,
         })
     }
 
@@ -3032,6 +3223,13 @@ where
     pub fn with_local_lookups(mut self, local: BlockLocal) -> Self {
         self.local = Some(local);
         self
+    }
+
+    /// Every table's digest under local lookups, taken in phase A
+    /// ([`LocalPhaseA`]) or set with [`Self::with_local_lookups`]; `None` in
+    /// today's format.
+    pub fn local_digests(&self) -> Option<&[[u8; 32]]> {
+        self.local.as_ref().map(|local| local.digests.as_slice())
     }
 
     /// Phase B reads its driver thread's CPU time and run-queue delay from
@@ -3549,7 +3747,8 @@ where
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone
         + Send
-        + Default,
+        + Default
+        + 'static,
 {
     // The batched argue's messages are not a `MultiProof`'s: its callers take
     // them from `block_prove_on_forks`.
@@ -3596,7 +3795,8 @@ where
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone
         + Send
-        + Default,
+        + Default
+        + 'static,
 {
     block_prove_on_forks_observed::<F, E, T, H>(
         committed,
@@ -3660,7 +3860,8 @@ where
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone
         + Send
-        + Default,
+        + Default
+        + 'static,
 {
     let order: Vec<usize> = (0..committed.sizes.len()).collect();
     block_prove_in_order::<F, E, T, H>(
@@ -4428,7 +4629,8 @@ where
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone
         + Send
-        + Default,
+        + Default
+        + 'static,
 {
     let BlockCommitted {
         mut tables,
@@ -4450,6 +4652,7 @@ where
         ood_unbound,
         merge_probe,
         local,
+        mut local_started,
     } = committed;
     let n = sizes.len();
     let mut seen = vec![false; n];
@@ -4634,6 +4837,9 @@ where
         let mut batched_argue: Option<BatchedArgue<E>> = None;
         let mut zc_b = 0.0f64;
         let mut bins_b: Vec<f64> = Vec::new();
+        let mut local_b: Vec<f64> = Vec::new();
+        // Its local argue begun in phase A, if any.
+        let mut started_local = local_started.get_mut(g).and_then(Option::take);
         let mut merged = MergeStamp::default();
         let mut local_argue: Option<LocalArgue<E>> = None;
         let all: &[CommittedTable<'_, F, E>] = &tables;
@@ -4737,29 +4943,78 @@ where
                                     // The local challenges and ladders on
                                     // the group's own transcript, then its
                                     // state into the fork before anything else.
-                                    let (z_g, alpha_g, mut own) = local_challenges::<E, T>(
-                                        g,
-                                        group_layout,
-                                        group_roots,
-                                        group_answers,
-                                        &local.digests[at..at + size],
-                                        config,
-                                        // A mutant binding is the format's,
-                                        // so every group's, as the verifier's.
-                                        argue.faults.local_binding.unwrap_or(LocalBinding::ALL),
-                                    )?;
-                                    let (local_proof, claims) = batched::prove_local(
-                                        group_ref,
-                                        &local.buses,
-                                        &z_g,
-                                        &alpha_g,
-                                        bin_log_cells,
-                                        pack,
-                                        ladder,
-                                        &mut own,
-                                        faults,
-                                        argue.at,
-                                    )?;
+                                    // Phase A drew the challenges right after
+                                    // the group's commit, and the lane may
+                                    // have run some bins: the rest run here
+                                    // on the same transcript. A faulted
+                                    // argue (or a mutant binding, which is
+                                    // every group's) starts over here.
+                                    let resumed = started_local
+                                        .take()
+                                        .filter(|_| {
+                                            faults.is_none() && argue.faults.local_binding.is_none()
+                                        })
+                                        .and_then(|started| {
+                                            started.downcast::<LocalStarted<E, T>>().ok()
+                                        });
+                                    let (mut own, prover) = match resumed {
+                                        Some(started) => {
+                                            let LocalStarted {
+                                                transcript,
+                                                z,
+                                                alpha,
+                                                prover,
+                                            } = *started;
+                                            let prover = match prover {
+                                                Some(prover) => prover,
+                                                None => batched::LocalProver::new(
+                                                    group_ref,
+                                                    &local.buses,
+                                                    &z,
+                                                    &alpha,
+                                                    bin_log_cells,
+                                                    pack,
+                                                    ladder,
+                                                    faults,
+                                                )?,
+                                            };
+                                            (transcript, prover)
+                                        }
+                                        None => {
+                                            let (z_g, alpha_g, own) = local_challenges::<E, T>(
+                                                g,
+                                                group_layout,
+                                                group_roots,
+                                                group_answers,
+                                                &local.digests[at..at + size],
+                                                config,
+                                                // A mutant binding is the format's,
+                                                // so every group's, as the verifier's.
+                                                argue
+                                                    .faults
+                                                    .local_binding
+                                                    .unwrap_or(LocalBinding::ALL),
+                                            )?;
+                                            let prover = batched::LocalProver::new(
+                                                group_ref,
+                                                &local.buses,
+                                                &z_g,
+                                                &alpha_g,
+                                                bin_log_cells,
+                                                pack,
+                                                ladder,
+                                                faults,
+                                            )?;
+                                            (own, prover)
+                                        }
+                                    };
+                                    let mut prover = prover;
+                                    let ran_before = prover.bins_run();
+                                    while !prover.done() {
+                                        prover.step(group_ref, &mut own, argue.at)?;
+                                    }
+                                    local_b = prover.bin_secs()[ran_before..].to_vec();
+                                    let (local_proof, claims) = prover.finish()?;
                                     fork.append_bytes(&own.state());
                                     local_argue = Some(local_proof);
                                     let global =
@@ -4839,6 +5094,7 @@ where
         argue_result?;
         stamps[g].zc_b = zc_b;
         stamps[g].bins_b = bins_b;
+        stamps[g].local_b = local_b;
         stamps[g].merge = merged;
         stamps[g].argue = argue_end.saturating_duration_since(t).as_secs_f64();
         stamps[g].argue_reserved = multilinear::gpu::reserved_window_peak();

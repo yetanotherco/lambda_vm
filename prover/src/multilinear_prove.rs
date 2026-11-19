@@ -441,6 +441,15 @@ pub(crate) fn layout_of<'a>(
         num_vars,
         Uniforms::default(),
     )
+    .map(|layout| {
+        // What a table's digest reads (local lookups): the AIR's count, as
+        // the verifier's digests take it.
+        layout.with_preprocessed_count(if air.is_preprocessed() {
+            air.num_precomputed_columns()
+        } else {
+            0
+        })
+    })
 }
 
 /// Each commitment group's stack and the domain it is committed over, rebuilt
