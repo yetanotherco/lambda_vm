@@ -878,6 +878,7 @@ impl Session<'_> {
                 claim_point: &self.claim_point,
                 r: &self.r,
                 columns: None,
+                second: None,
             }),
             &mut t,
         )
@@ -1471,4 +1472,200 @@ fn the_device_tail_takes_the_long_vm_programs() {
         long.join(", ")
     );
     assert!(long.len() >= 2, "{long:?}");
+}
+
+/// The five rules' factors, rules and weight points.
+#[cfg(feature = "cuda")]
+type TwoBuses<'a> = (Vec<Mle<Ext3>>, Vec<Rule<'a, Ext3>>, Vec<Vec<EE>>);
+
+/// A table's batch with a second bus at its own point (its local lookups:
+/// rules four and five at `λ³` and `λ⁴`, `eq(ρ')` the third weight), on the
+/// card through the fused session and on the host through today's rules, as
+/// the batched argue hands them to `front_loaded::TableRounds`.
+#[cfg(feature = "cuda")]
+impl Session<'_> {
+    /// The five rules over today's factors and the three weights, and the
+    /// second bus's claim point (its interactions are the table's own, at
+    /// another random point).
+    fn two_buses(&self, second_point: &[EE]) -> TwoBuses<'_> {
+        let table = self.table;
+        let (mut polys, mut rules) = self.todays();
+        let second = logup::claim_statements(
+            &table.interactions,
+            second_point,
+            self.num_vars(),
+            table.width() + 2,
+        )
+        .unwrap_or_else(|e| panic!("{}: {e:?}", table.label));
+        let rho = self.claim_point[self.claim_point.len() - self.num_vars()..].to_vec();
+        polys.push(eq_mle(&second.row_point).unwrap());
+        rules.push(second.numerator);
+        rules.push(second.denominator);
+        (polys, rules, vec![self.r.clone(), rho, second.row_point])
+    }
+
+    /// The batch's five rules run through `TableRounds`: on the card when
+    /// `card`, else on the host; the proof, the point and every factor's
+    /// value at it.
+    fn two_buses_proved(
+        &self,
+        second_point: &[EE],
+        lambda: &EE,
+        card: bool,
+    ) -> (SumcheckProof<Ext3>, Vec<EE>, Vec<EE>) {
+        use multilinear::front_loaded::{PaddingFault, RoundStepper, TableRounds};
+        let table = self.table;
+        let n = self.num_vars();
+        let (polys, rules, weights) = self.two_buses(second_point);
+        let lambdas = multilinear::challenge_powers(lambda, 5);
+        // The table's own claim, `Σ_k λ^k·claim_k` over the cube.
+        let mut scratch = Vec::new();
+        let claim = (0..polys[0].len()).fold(EE::zero(), |acc, i| {
+            let values: Vec<EE> = polys.iter().map(|p| p.evals()[i]).collect();
+            rules.iter().zip(&lambdas).fold(acc, |acc, (rule, l)| {
+                acc + l * rule.apply_in(&values, &mut scratch)
+            })
+        });
+        let lifted: Vec<Mle<Ext3>> = polys[..table.width()].to_vec();
+        let public: Vec<Mle<Ext3>> = table
+            .shape
+            .public_selectors()
+            .iter()
+            .map(|s| s.table::<Ext3>(n).unwrap())
+            .collect();
+        let device = card.then(|| {
+            multilinear::gpu::upload_factors_from_columns(
+                &self.columns,
+                &table.kinds,
+                &public,
+                None,
+            )
+            .unwrap_or_else(|| panic!("{}: the card takes the factors", table.label))
+        });
+        let points: Vec<&[EE]> = weights.iter().map(Vec::as_slice).collect();
+        let rho = &self.claim_point;
+        let degree = rules.iter().map(Rule::degree).max().unwrap_or(2).max(2);
+        let fused = card.then(|| multilinear::gpu_fused::FusedInput {
+            constraints: &table.constraints,
+            betas: &table.betas,
+            interactions: &table.interactions,
+            claim_point: rho,
+            r: &self.r,
+            columns: None,
+            second: Some(multilinear::gpu_fused::SecondInput {
+                interactions: &table.interactions,
+                claim_point: second_point,
+            }),
+        });
+        let mut rounds = vec![
+            TableRounds::new(
+                rules,
+                lambdas,
+                &claim,
+                &points,
+                n,
+                device.as_ref(),
+                None,
+                fused,
+                || Ok(lifted.clone()),
+            )
+            .unwrap_or_else(|e| panic!("{}: {e:?}", table.label)),
+        ];
+        assert_eq!(rounds[0].on_device(), card, "{}: where it ran", table.label);
+        let mut t = self.transcript();
+        let (proof, point) = multilinear::front_loaded::prove_with(
+            &mut rounds,
+            &[EE::one()],
+            degree,
+            &mut t,
+            PaddingFault { scaled: None },
+        )
+        .unwrap_or_else(|e| panic!("{}: {e:?}", table.label));
+        let _ = rounds[0].num_vars();
+        let bound: Vec<EE> = rounds[0]
+            .polys()
+            .iter()
+            .take(table.width())
+            .map(|p| p.evals()[0])
+            .collect();
+        (proof, point, bound)
+    }
+}
+
+/// The fused card session with a second bus (a table's local lookups at their
+/// own point) sends the host's messages: KECCAK_RND and CPU at 2^10 and 2^12
+/// on random columns, the corners summed, the card's rounds against the host's
+/// five-rule batch — the same messages, point and factor values. With the
+/// second bus's coefficient faulted the card parts from the host, so the
+/// comparison is load-bearing.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
+fn a_second_bus_on_the_card_sends_the_hosts_messages() {
+    use multilinear::gpu_fused::*;
+    let _switches = CardSwitches::set(
+        FusedFaults {
+            keep_corners: true,
+            ..FusedFaults::default()
+        },
+        false,
+    );
+    let vm = vm_airs();
+    let airs = every_air(&vm);
+    let mut checked = 0usize;
+    for label in THE_Q1_TABLES {
+        for n in [10usize, 12] {
+            let air = airs.iter().find(|(_, l)| l == label).unwrap().0;
+            let mut rng = Rng::new(0x5EC0 + n as u64);
+            let table = Table::from_air(air, label, n, &mut rng);
+            let session = table.session(table.random_columns(n, &mut rng), &mut rng);
+            let second_point = rng.exts(logup::input_layer_vars(table.interactions.len(), n));
+            let lambda = rng.ext();
+            let sessions = fused_sessions();
+            let card = session.two_buses_proved(&second_point, &lambda, true);
+            assert_eq!(
+                fused_sessions(),
+                sessions + 1,
+                "{label} n={n}: the card ran the fused rounds"
+            );
+            let host = session.two_buses_proved(&second_point, &lambda, false);
+            assert_eq!(card.0.rounds.len(), host.0.rounds.len(), "{label} n={n}");
+            for (round, (a, b)) in host.0.rounds.iter().zip(&card.0.rounds).enumerate() {
+                assert_eq!(a.evaluations, b.evaluations, "{label} n={n}: round {round}");
+            }
+            assert_eq!(card.1, host.1, "{label} n={n}: the point");
+            assert_eq!(card.2, host.2, "{label} n={n}: the factors at the point");
+            checked += 1;
+        }
+    }
+    // The negative control: the first bus's first coefficient off by one on
+    // the card (`FusedFaults::bus`) parts the card from the host.
+    {
+        let _faulted = CardSwitches::set(
+            FusedFaults {
+                keep_corners: true,
+                bus: true,
+                ..FusedFaults::default()
+            },
+            false,
+        );
+        let label = THE_Q1_TABLES[0];
+        let air = airs.iter().find(|(_, l)| *l == label).unwrap().0;
+        let mut rng = Rng::new(0x5EC0 + 10);
+        let table = Table::from_air(air, label, 10, &mut rng);
+        let session = table.session(table.random_columns(10, &mut rng), &mut rng);
+        let second_point = rng.exts(logup::input_layer_vars(table.interactions.len(), 10));
+        let lambda = rng.ext();
+        let card = session.two_buses_proved(&second_point, &lambda, true);
+        let host = session.two_buses_proved(&second_point, &lambda, false);
+        let messages = |p: &SumcheckProof<Ext3>| -> Vec<Vec<EE>> {
+            p.rounds.iter().map(|r| r.evaluations.clone()).collect()
+        };
+        assert_ne!(
+            messages(&card.0),
+            messages(&host.0),
+            "a faulted bus parts the card"
+        );
+    }
+    eprintln!("argue second bus: {checked} card runs sent the host's messages");
 }
