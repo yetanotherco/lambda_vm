@@ -2062,14 +2062,39 @@ where
     let first = config.schedule(num_vars).first().copied().unwrap_or(0);
     let domain = Domain::<F>::new(num_vars + config.log_blowup)?;
     let leaves = config.format.leaves;
+    let encode_one = |f: &Stacked<'_, F>| match &f.resident {
+        Some((store, parts)) => {
+            crate::gpu::encode_resident(store, parts, num_vars, config.log_blowup, transient)
+        }
+        None => crate::gpu::encode_parts(&f.parts, num_vars, config.log_blowup, transient),
+    };
+    // One codeword at a time into the joint leaves, when asked: the commit
+    // holds one of the run's codewords, not all of them. The same tree; the
+    // commitment keeps no codeword and is retired before it is opened. A card
+    // that declines any of it commits as below.
+    if crate::gpu::streamed_joint_leaves_here()
+        && let Some((tree, root)) = crate::gpu::commit_joint_streamed(
+            polys.len(),
+            num_vars + config.log_blowup,
+            first,
+            H::DEVICE,
+            leaves,
+            |k| polys.get(k).and_then(encode_one),
+        )
+    {
+        let commitment = CodewordCommitment::from_device_joint_streamed(
+            polys.len(),
+            domain.size(),
+            tree,
+            root,
+            first,
+            leaves,
+        )?;
+        return Ok((commitment, domain));
+    }
     let mut on_card = Vec::with_capacity(polys.len());
     for f in polys {
-        let encoded = match &f.resident {
-            Some((store, parts)) => {
-                crate::gpu::encode_resident(store, parts, num_vars, config.log_blowup, transient)
-            }
-            None => crate::gpu::encode_parts(&f.parts, num_vars, config.log_blowup, transient),
-        };
+        let encoded = encode_one(f);
         match encoded {
             // One encode at a time ([`crate::gpu::serial_encodes`]): its
             // coefficient buffer and scratch go back to the pool before the
@@ -3735,8 +3760,9 @@ where
                 &brought
             }
             // A fold is held somewhere; only a round-0 commitment revived over
-            // its stack holds none, and a grouped run is never revived so.
-            Codeword::Source(_) => {
+            // its stack holds none, and a grouped run is never revived so (nor
+            // folded from a streamed joint tree, which is retired first).
+            Codeword::Source(_) | Codeword::Streamed { .. } => {
                 return Err(Error::DeviceFailed {
                     stage: "a grouped round-0 fold of a codeword not held",
                 });
@@ -3772,7 +3798,7 @@ where
             CodewordCommitment::from_device(device, nodes, log_folding)
         }
         // A successor is always held.
-        Codeword::Source(_) => Err(Error::DeviceFailed {
+        Codeword::Source(_) | Codeword::Streamed { .. } => Err(Error::DeviceFailed {
             stage: "committing a successor held as a stack",
         }),
     }
@@ -3788,7 +3814,7 @@ where
         Codeword::Device(device) => device.first().ok_or(Error::DeviceFailed {
             stage: "final value",
         }),
-        Codeword::Source(_) => Err(Error::DeviceFailed {
+        Codeword::Source(_) | Codeword::Streamed { .. } => Err(Error::DeviceFailed {
             stage: "the final value of a codeword held as a stack",
         }),
     }
