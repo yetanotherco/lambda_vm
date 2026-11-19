@@ -165,8 +165,18 @@ enum Turn {
 /// run it allocate beside the codewords ([`crate::gpu::room_turns_for`]), or
 /// one base codeword whatever the turn under `gpu::room_resize`.
 fn room_bytes(layout: &StackedLayout, config: &ChainConfig, staged: bool, turn: Turn) -> u64 {
+    crate::gpu::note_room_sized(crate::gpu::room_resize());
+    room_bytes_unnoted(layout, config, staged, turn)
+}
+
+/// [`room_bytes`] without counting the sizing: a plan's read of it.
+fn room_bytes_unnoted(
+    layout: &StackedLayout,
+    config: &ChainConfig,
+    staged: bool,
+    turn: Turn,
+) -> u64 {
     let resize = crate::gpu::room_resize();
-    crate::gpu::note_room_sized(resize);
     if !resize {
         return (1u64 << (layout.n_stack() + config.log_blowup)) * 8;
     }
@@ -572,6 +582,28 @@ where
     /// Host bytes kept of the trees.
     pub fn tree_bytes(&self) -> usize {
         self.commitments.iter().map(|c| c.tree_bytes()).sum()
+    }
+
+    /// What [`Self::revive`] promises the card, at most, and so what an opening
+    /// over it holds: its openings' room and, unless its codewords are revived
+    /// over a resident stack as cosets (`resident`, a coset-ordered round 0 and
+    /// coset openings in effect, which hold no codeword of their own), every
+    /// codeword re-encoded. A plan's number, for a caller deciding what fits
+    /// beside other work; the revive takes its own promises as it always has.
+    pub fn revive_card_bytes(&self, config: &ChainConfig, resident: bool) -> u64 {
+        if self.commitments.is_empty() {
+            return 0;
+        }
+        let room = room_bytes_unnoted(&self.layout, config, !resident, Turn::Open);
+        let from_stack = resident
+            && config.format.leaves == crate::whir_commit::LeafOrder::Coset
+            && crate::gpu::coset_openings_in_effect();
+        if from_stack {
+            return room;
+        }
+        let codeword = (1u64 << (self.layout.n_stack() + config.log_blowup))
+            .saturating_mul(core::mem::size_of::<FieldElement<F>>() as u64);
+        room.saturating_add(codeword.saturating_mul(self.layout.num_polys() as u64))
     }
 
     /// The group openable again: every codeword recomputed from `columns` —

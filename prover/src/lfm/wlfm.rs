@@ -2365,6 +2365,8 @@ fn prove_traces_under<H: WhirHash>(
             .map(|b| {
                 b.with_phase_b_overlap(phase_b_overlap(stacks))
                     .with_phase_b_upload_beside(uploads_beside(stacks))
+                    .with_phase_b_overlap_planned(overlap_planned())
+                    .with_overlap_faults(overlap_faults_for_test())
             })
         }
     }
@@ -2771,6 +2773,53 @@ pub(crate) fn program_prep_groups(program: &LfmProgram) -> Vec<Cow<'_, ColumnGro
     out.push(Cow::Borrowed(&g.public));
     out.push(Cow::Owned(range_group()));
     out
+}
+
+/// `LAMBDA_VM_LEVELS_OVERLAP_PLANNED=1`: a W-LFM prove whose prepared stacks are
+/// retired (phase B's overlap otherwise off, [`phase_b_overlap`]) opens each
+/// group beside the next group's argue where the plan says the card holds both
+/// ([`multilinear_block::BlockCommitted::with_phase_b_overlap_planned`]), and
+/// alone where it does not. The overlap moves no byte. Only the W-LFM prover
+/// (the levels') reads it; the base's block prover never sets it. Off by
+/// default (and for any word but `1`); read once a process.
+pub const OVERLAP_PLANNED_ENV: &str = "LAMBDA_VM_LEVELS_OVERLAP_PLANNED";
+
+thread_local! {
+    /// A test's [`overlap_planned`] on this thread.
+    static OVERLAP_PLANNED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's phase-B faults on this thread's streamed proves.
+    static OVERLAP_FAULTS_FOR_TEST: std::cell::Cell<multilinear_block::OverlapFaults> =
+        std::cell::Cell::new(multilinear_block::OverlapFaults::default());
+}
+
+/// Tests only: [`overlap_planned`] forced on this thread (`None` restores the
+/// knob).
+#[doc(hidden)]
+pub fn set_overlap_planned_for_test(on: Option<bool>) {
+    OVERLAP_PLANNED_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`OVERLAP_PLANNED_ENV`] is on (or this thread's test override).
+pub fn overlap_planned() -> bool {
+    if let Some(on) = OVERLAP_PLANNED_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(OVERLAP_PLANNED_ENV).ok().as_deref())
+    })
+}
+
+/// Tests only: this thread's streamed W-LFM proves take `faults` in phase B
+/// (the default, none, restores them).
+#[doc(hidden)]
+pub fn set_overlap_faults_for_test(faults: multilinear_block::OverlapFaults) {
+    OVERLAP_FAULTS_FOR_TEST.with(|c| c.set(faults));
+}
+
+/// This thread's test faults: none outside a test that set them.
+fn overlap_faults_for_test() -> multilinear_block::OverlapFaults {
+    OVERLAP_FAULTS_FOR_TEST.with(std::cell::Cell::get)
 }
 
 /// `LAMBDA_VM_LEVELS_PREPARE_PAR=1`: a W-LFM build's host part turns its

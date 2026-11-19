@@ -204,6 +204,12 @@ pub struct GroupStamps {
     /// The group opened alone with a retired prepared stack, and its columns
     /// went off the card before that stack was revived.
     pub columns_gone_before_revive: bool,
+    /// Under the planned overlap ([`BlockCommitted::with_phase_b_overlap_planned`]):
+    /// the plan kept the group's openings alone, and the plan's bytes (what
+    /// it needed beside the next group's argue, and what the budget had free).
+    pub overlap_planned_out: bool,
+    pub overlap_plan_need: u64,
+    pub overlap_plan_free: u64,
     /// Under [`PhaseBOverlap::On`], the group's openings ran alone because an
     /// earlier transition saw the card refuse a promise.
     pub serial_after_refusal: bool,
@@ -1630,6 +1636,9 @@ pub struct OverlapFaults {
     /// The transition that argues the group at this place reads as one in
     /// which the card refused a promise.
     pub refusal_at: Option<usize>,
+    /// Under the planned overlap: the plan refuses to open the group at this
+    /// place beside the next group's argue (it opens alone).
+    pub overlap_refused_at: Option<usize>,
 }
 
 /// Every count of a promise the card refused, or of a wait on every stream at
@@ -1694,6 +1703,10 @@ where
     /// Phase B puts the next group's columns on the card beside this group's
     /// argue ([`Self::with_phase_b_upload_beside`]); `true` unless set.
     upload_beside: bool,
+    /// Under [`PhaseBOverlap::Off`], phase B still opens a group beside the
+    /// next group's argue where its plan says the card holds both
+    /// ([`Self::with_phase_b_overlap_planned`]); `false` unless set.
+    overlap_planned: bool,
     /// Phase B stamps its driver thread's schedstat a group turn
     /// ([`Self::with_sched_stamps`]).
     sched: bool,
@@ -2124,6 +2137,7 @@ where
             overlap: PhaseBOverlap::Off,
             overlap_faults: OverlapFaults::default(),
             upload_beside: true,
+            overlap_planned: false,
             sched: false,
             ood,
             ood_unbound: false,
@@ -2157,6 +2171,25 @@ where
     /// [`Self::with_phase_b_upload_beside`] in place.
     pub fn set_phase_b_upload_beside(&mut self, beside: bool) {
         self.upload_beside = beside;
+    }
+
+    /// Under [`PhaseBOverlap::Off`] (a prove with retired prepared stacks),
+    /// phase B opens a group beside the next group's argue anyway, transition
+    /// by transition, where the plan says the card holds both
+    /// ([`overlap_fits`]: what the ledger holds once the group has argued, the
+    /// group's openings' planned bytes, and the next group's argue bounded by
+    /// its own phase-A commit), and alone where it does not (`planned`, `false`
+    /// by default: every group alone, as before). A transition in which the card
+    /// refused a promise turns the rest of phase B serial, as under
+    /// [`PhaseBOverlap::On`]. The overlap moves no byte.
+    pub fn with_phase_b_overlap_planned(mut self, planned: bool) -> Self {
+        self.overlap_planned = planned;
+        self
+    }
+
+    /// [`Self::with_phase_b_overlap_planned`] in place.
+    pub fn set_phase_b_overlap_planned(&mut self, planned: bool) {
+        self.overlap_planned = planned;
     }
 
     /// A test's faults in phase B's overlap ([`OverlapFaults`]).
@@ -2902,6 +2935,68 @@ where
     draws: (u64, u64),
 }
 
+/// Under the planned overlap, a group's argue is planned to promise at most
+/// this share (numerator, denominator) of what the ledger grew by through the
+/// same group's phase-A commit (`commit_reserved − commit_base`): on the
+/// levels' real median the argue grew by 0.6–1.19 of it (level 1's group 1:
+/// 14.34 GiB against 12.0), so 5/4.
+const OVERLAP_ARGUE_OVER_COMMIT: (u64, u64) = (5, 4);
+
+/// Under the planned overlap, the card kept free beside the plan.
+const OVERLAP_MARGIN_BYTES: u64 = 1 << 30;
+
+/// Whether the card holds `argued`'s openings beside the argue of the group
+/// stamped `next`, and the plan's bytes `(need, free)`: the group's openings'
+/// planned bytes (the larger of its own stack's revive over its resident
+/// columns and its retired prepared stack's over the host's,
+/// [`RetiredStack::revive_card_bytes`]; the two run one after the other), the
+/// next group's argue bounded by [`OVERLAP_ARGUE_OVER_COMMIT`] of its phase-A
+/// commit's growth, and a margin, against what the ledger's budget has free
+/// now (the group's columns still on the card). Without a card (no budget) the
+/// openings are the host's and always fit.
+fn overlap_fits<F, E, T, H>(
+    argued: &Argued<F, E, T>,
+    prepared: &[BlockPrepared<'_, F, H>],
+    next: &GroupStamps,
+    config: &ChainConfig,
+) -> (bool, u64, u64)
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    E: IsField,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    let budget = multilinear::gpu::reserve_budget();
+    if budget == 0 {
+        return (true, 0, 0);
+    }
+    let own = argued
+        .retired
+        .as_ref()
+        .map_or(0, |r| r.revive_card_bytes(config, argued.store.is_some()));
+    let theirs = prepared
+        .iter()
+        .find_map(|q| match q.commitment {
+            PreparedCommitment::Retired(r) if q.group == argued.group => {
+                Some(r.revive_card_bytes(config, false))
+            }
+            _ => None,
+        })
+        .unwrap_or(0);
+    let (num, den) = OVERLAP_ARGUE_OVER_COMMIT;
+    let argue = next
+        .commit_reserved
+        .saturating_sub(next.commit_base)
+        .saturating_mul(num)
+        / den;
+    let need = own
+        .max(theirs)
+        .saturating_add(argue)
+        .saturating_add(OVERLAP_MARGIN_BYTES);
+    let free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
+    (need <= free, need, free)
+}
+
 /// Whether `group`'s prepared stack was committed and let go: it is revived
 /// at the group's opening ([`open_prepared`]).
 fn prepared_is_retired<F, H>(prepared: &[BlockPrepared<'_, F, H>], group: usize) -> bool
@@ -3293,6 +3388,7 @@ where
         overlap,
         overlap_faults,
         upload_beside,
+        overlap_planned,
         sched,
         ood,
         ood_unbound,
@@ -3645,7 +3741,20 @@ where
             })?)
             .filter(|_| !ood_unbound),
         };
-        if overlapping && !latched && next_g.is_some() {
+        // Under the planned overlap (retired stacks, the overlap otherwise off),
+        // each transition by its own plan.
+        let planned_beside = !overlapping
+            && overlap_planned
+            && !latched
+            && next_g.is_some_and(|next| {
+                let (fits, need, free) = overlap_fits(&argued, prepared, &stamps[next], config);
+                let fits = fits && overlap_faults.overlap_refused_at != Some(p);
+                stamps[g].overlap_planned_out = !fits;
+                stamps[g].overlap_plan_need = need;
+                stamps[g].overlap_plan_free = free;
+                fits
+            });
+        if (overlapping || planned_beside) && !latched && next_g.is_some() {
             // Opened beside the next group's argue.
             prev = Some(argued);
             continue;
