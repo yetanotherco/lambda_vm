@@ -1751,6 +1751,10 @@ where
     /// both its revive and its opening ([`Self::with_prepared_upload_once`]);
     /// `false` unless set.
     upload_once: bool,
+    /// Under [`Self::with_prepared_upload_once`], the planned overlap prices a
+    /// retired prepared stack's revive over its store
+    /// ([`Self::with_overlap_priced_resident`]); `false` unless set.
+    overlap_resident: bool,
     /// Phase B stamps its driver thread's schedstat a group turn
     /// ([`Self::with_sched_stamps`]).
     sched: bool,
@@ -2214,6 +2218,7 @@ where
             upload_beside: true,
             overlap_planned: false,
             upload_once: false,
+            overlap_resident: false,
             sched: false,
             ood,
             ood_unbound: false,
@@ -2272,6 +2277,19 @@ where
     /// group copies twice as before. The same columns read: the same proof.
     pub fn with_prepared_upload_once(mut self, on: bool) -> Self {
         self.upload_once = on;
+        self
+    }
+
+    /// Under [`Self::with_prepared_upload_once`], the planned overlap prices a
+    /// group's retired prepared stack as the upload once revives it: its store
+    /// (the columns' bytes) and the revive's promises over a resident stack
+    /// ([`RetiredStack::revive_card_bytes`] with `resident`; on coset leaves no
+    /// codeword), instead of a revive that copies the columns in and encodes
+    /// whole codewords (`false`, the default). Only the plan moves: where it
+    /// now fits, the group opens beside the next argue. Without the upload
+    /// once it changes nothing. The same proof.
+    pub fn with_overlap_priced_resident(mut self, on: bool) -> Self {
+        self.overlap_resident = on;
         self
     }
 
@@ -2956,6 +2974,9 @@ where
     upload_once: bool,
     upload_once_refused: bool,
     upload_once_margin: u64,
+    /// The planned overlap prices its prepared revive over the upload once's
+    /// store ([`BlockCommitted::with_overlap_priced_resident`]).
+    overlap_resident: bool,
 }
 
 /// A group's openings done: its opening, its prepared one when it has one,
@@ -3092,7 +3113,12 @@ where
         .iter()
         .find_map(|q| match q.commitment {
             PreparedCommitment::Retired(r) if q.group == argued.group => {
-                Some(r.revive_card_bytes(config, false))
+                Some(if argued.overlap_resident {
+                    prepared_store_bytes(q.columns)
+                        .saturating_add(r.revive_card_bytes(config, true))
+                } else {
+                    r.revive_card_bytes(config, false)
+                })
             }
             _ => None,
         })
@@ -3104,6 +3130,17 @@ where
         .saturating_add(OVERLAP_MARGIN_BYTES);
     let free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
     (need <= free, need, free)
+}
+
+/// The bytes the upload once's store of `columns` takes on the card.
+fn prepared_store_bytes<F>(columns: &[&multilinear::mle::Mle<F>]) -> u64
+where
+    F: IsField + 'static,
+{
+    columns
+        .iter()
+        .map(|c| (c.len() * core::mem::size_of::<FieldElement<F>>()) as u64)
+        .sum()
 }
 
 /// Under the upload once, the margin kept free beside a store's plan.
@@ -3136,10 +3173,7 @@ where
     if budget == 0 {
         return None;
     }
-    let bytes: u64 = columns
-        .iter()
-        .map(|c| (c.len() * core::mem::size_of::<FieldElement<F>>()) as u64)
-        .sum();
+    let bytes = prepared_store_bytes(columns);
     upload.need = bytes
         .saturating_add(retired.revive_card_bytes(config, true))
         .saturating_add(margin);
@@ -3572,6 +3606,7 @@ where
         upload_beside,
         overlap_planned,
         upload_once,
+        overlap_resident,
         sched,
         ood,
         ood_unbound,
@@ -3931,6 +3966,7 @@ where
             upload_once_margin: overlap_faults
                 .upload_once_margin
                 .unwrap_or(UPLOAD_ONCE_MARGIN_BYTES),
+            overlap_resident: upload_once && overlap_resident,
         };
         // Under the planned overlap (retired stacks, the overlap otherwise off),
         // each transition by its own plan.
