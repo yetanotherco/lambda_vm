@@ -1598,8 +1598,10 @@ fn the_shadow_stays_off_where_it_cannot_rebuild_the_chunks() {
 }
 
 /// ★ The packer's open group closed ahead of BITWISE
-/// ([`Deviations::close_before_bitwise`]): under groups of two polynomials
-/// BITWISE (2^20 rows) never fits an open group, so with the knob on the last
+/// ([`Deviations::close_before_bitwise`]): with the streamed chunks' ops
+/// dropped as handed out (BITWISE then handed last, as in the CLI's block)
+/// and under groups of two polynomials BITWISE (2^20 rows) never fits an open
+/// group, so with the knob on the last
 /// group before it closes as soon as BITWISE alone is left; the groups, and
 /// under the deterministic grind the proof's bytes, are the knob-off ones,
 /// and both proofs verify. Run alone for the bytes.
@@ -1609,6 +1611,11 @@ fn closing_ahead_of_bitwise_moves_no_byte() {
     let format = many_groups();
     let mut o = streamed(MaxRowsConfig::small(), 5, 3);
     o.layout_workers = 3;
+    // BITWISE is handed last only where the finish keeps just the streamed
+    // chunks' tails (its lookups then come from the tables), as the CLI's
+    // block does: without it the rest leads with BITWISE and there is nothing
+    // to close ahead of.
+    o.drop_streamed_ops = true;
     assert!(o.rest_streams(), "the rest streams");
     let proved = |on: bool| {
         let (proof, stamps) = prove_block_whir_with(
