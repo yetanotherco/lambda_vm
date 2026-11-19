@@ -1203,84 +1203,149 @@ fn the_two_layer_legs_words_are_its_own() {
 /// A one-value edit of a batched argue, named by its site.
 type ArgueTamper = Box<dyn Fn(&mut BatchedArgue<E>)>;
 
-/// ★ Every tamper the host refuses on the two-layer ladder, the leg refuses:
-/// each value of a two-layer tree's halves at a mid step, an odd tree's one
-/// half in a mixed step, each value of a degree-5 round, a bus output.
+/// The first step of `schedule` past step 0 that `pick` takes: its index,
+/// and where its relations' halves start, by relation kind (the first tree of
+/// each kind).
+fn step_sites(
+    schedule: &[multilinear::gkr_lockstep::LadderStep],
+    pick: impl Fn(&multilinear::gkr_lockstep::LadderStep) -> bool,
+) -> (usize, Option<usize>, Option<usize>) {
+    use multilinear::gkr_lockstep::Relation;
+    let (j, s) = schedule
+        .iter()
+        .enumerate()
+        .find(|(j, s)| *j > 0 && pick(s))
+        .expect("the step the test needs");
+    let mut at = 0;
+    let (mut double_half, mut single_half) = (None, None);
+    for &(_, relation) in &s.relations {
+        match relation {
+            Relation::Double => double_half.get_or_insert(at),
+            Relation::Single => single_half.get_or_insert(at),
+        };
+        at += relation.halves();
+    }
+    (j, double_half, single_half)
+}
+
+/// Each of the four values of `bin`'s step `step`'s half `half`, +1.
+fn half_sites(bin: usize, step: usize, half: usize, what: &str) -> Vec<(String, ArgueTamper)> {
+    (0..4)
+        .map(|value| {
+            (
+                format!("{what}: step {step} half {half} value {value}"),
+                Box::new(move |a: &mut BatchedArgue<E>| {
+                    let h = &mut a.gkr[bin].layers[step].halves[half];
+                    bump([&mut h.p_lo, &mut h.p_hi, &mut h.q_lo, &mut h.q_hi][value]);
+                }) as ArgueTamper,
+            )
+        })
+        .collect()
+}
+
+/// Each value of `bin`'s step `step`'s first round, +1.
+fn round_sites(bin: usize, step: usize, degree: usize, what: &str) -> Vec<(String, ArgueTamper)> {
+    (0..degree)
+        .map(|value| {
+            (
+                format!("{what}: step {step}'s first round value {value}"),
+                Box::new(move |a: &mut BatchedArgue<E>| {
+                    bump(&mut a.gkr[bin].layers[step].sumcheck.rounds[0].evaluations[value])
+                }) as ArgueTamper,
+            )
+        })
+        .collect()
+}
+
+/// ★ Every tamper the host refuses on the two-layer ladder, the leg refuses.
+/// In one bin: each value of a two-layer tree's two halves at a step where
+/// every tree descends two layers, and at the MIXED step (asserted mixed)
+/// each value of its two-layer tree's halves and of its odd tree's one half,
+/// each value of the mixed step's degree-5 first round, a bus output. Table 1
+/// alone (heights `[5]`): each value of its final step's one half, where the
+/// step is one layer for every tree (degree 3), and of that step's first round.
 #[test]
 fn the_two_layer_leg_refuses_what_the_host_rejects() {
-    with_run_on(
+    use multilinear::gkr_lockstep::Relation;
+    for cap in [27u8, 0] {
+        with_run_on(
+            Fixture::new().on(GkrLadder::Double),
+            cap,
+            |_| {},
+            |run| {
+                run.host
+                    .clone()
+                    .expect("the honest argue verifies on the host");
+                run.execute().expect("the honest argue executes");
+            },
+        );
+    }
+    // The sites, from the host's schedule.
+    let mut sites: Vec<(u8, String, ArgueTamper)> = Vec::new();
+    let bin_schedule = with_run_on(
         Fixture::new().on(GkrLadder::Double),
         27,
         |_| {},
-        |run| {
-            run.host
-                .clone()
-                .expect("the honest argue verifies on the host");
-            run.execute().expect("the honest argue executes");
-        },
+        |run| schedules(&run)[0].clone(),
     );
-    // The sites, from the schedule: a step past the first with rounds, a
-    // two-layer tree's halves there, and a one-layer tree's when the step is
-    // mixed.
-    let (step, double_half, single_half) = with_run_on(
+    let alone = with_run_on(
         Fixture::new().on(GkrLadder::Double),
-        27,
+        0,
         |_| {},
-        |run| {
-            let schedule = &schedules(&run)[0];
-            let (j, s) = schedule
-                .iter()
-                .enumerate()
-                .find(|(j, s)| *j > 0 && s.degree == 5)
-                .expect("a degree-5 step past the first");
-            let mut at = 0;
-            let (mut double_half, mut single_half) = (None, None);
-            for &(_, relation) in &s.relations {
-                match relation {
-                    multilinear::gkr_lockstep::Relation::Double => double_half.get_or_insert(at),
-                    multilinear::gkr_lockstep::Relation::Single => single_half.get_or_insert(at),
-                };
-                at += relation.halves();
-            }
-            (j, double_half.expect("a two-layer tree"), single_half)
-        },
+        |run| schedules(&run)[1].clone(),
     );
-    let mut sites: Vec<(String, ArgueTamper)> = Vec::new();
+    let (all_double, double_half, _) = step_sites(&bin_schedule, |s| {
+        s.relations.iter().all(|(_, r)| *r == Relation::Double)
+    });
+    let double_half = double_half.expect("a two-layer tree");
     for half in [double_half, double_half + 1] {
-        for value in 0..4 {
-            sites.push((
-                format!("step {step} half {half} value {value}"),
-                Box::new(move |a: &mut BatchedArgue<E>| {
-                    let h = &mut a.gkr[0].layers[step].halves[half];
-                    bump([&mut h.p_lo, &mut h.p_hi, &mut h.q_lo, &mut h.q_hi][value]);
-                }),
-            ));
+        for (name, tamper) in half_sites(0, all_double, half, "every tree two layers") {
+            sites.push((27, name, tamper));
         }
     }
-    if let Some(half) = single_half {
-        sites.push((
-            format!("an odd tree's half at the mixed step {step}"),
-            Box::new(move |a: &mut BatchedArgue<E>| {
-                bump(&mut a.gkr[0].layers[step].halves[half].q_hi)
-            }),
-        ));
+    let (mixed, double_half, single_half) = step_sites(&bin_schedule, |s| {
+        s.relations.iter().any(|(_, r)| *r == Relation::Double)
+            && s.relations.iter().any(|(_, r)| *r == Relation::Single)
+    });
+    assert_eq!(bin_schedule[mixed].degree, 5, "the mixed step is degree 5");
+    assert!(bin_schedule[mixed].parent > 0, "the mixed step has rounds");
+    let double_half = double_half.expect("the mixed step's two-layer tree");
+    let single_half = single_half.expect("the mixed step's one-layer tree");
+    for half in [double_half, double_half + 1, single_half] {
+        for (name, tamper) in half_sites(0, mixed, half, "the mixed step") {
+            sites.push((27, name, tamper));
+        }
     }
-    for value in 0..5 {
-        sites.push((
-            format!("step {step}'s degree-5 round value {value}"),
-            Box::new(move |a: &mut BatchedArgue<E>| {
-                bump(&mut a.gkr[0].layers[step].sumcheck.rounds[0].evaluations[value])
-            }),
-        ));
+    for (name, tamper) in round_sites(0, mixed, 5, "the mixed step") {
+        sites.push((27, name, tamper));
     }
     sites.push((
+        27,
         "a bus output".to_string(),
         Box::new(|a: &mut BatchedArgue<E>| bump(&mut a.bus_outputs[1].0)),
     ));
-    for (name, tamper) in &sites {
+    let last = alone.len() - 1;
+    assert!(
+        alone[last]
+            .relations
+            .iter()
+            .all(|(_, r)| *r == Relation::Single)
+            && alone[last].degree == 3
+            && alone[last].parent > 0,
+        "table 1 alone ends on a one-layer step with rounds: {:?}",
+        alone[last]
+    );
+    for (name, tamper) in half_sites(1, last, 0, "table 1's final one-layer step") {
+        sites.push((0, name, tamper));
+    }
+    for (name, tamper) in round_sites(1, last, 3, "table 1's final one-layer step") {
+        sites.push((0, name, tamper));
+    }
+    assert_eq!(sites.len(), 8 + 12 + 5 + 1 + 4 + 3, "every site is run");
+    for (cap, name, tamper) in &sites {
         with_run_on(
             Fixture::new().on(GkrLadder::Double),
-            27,
+            *cap,
             |a| tamper(a),
             |run| {
                 assert!(run.host.is_err(), "{name}: the HOST accepted it");
@@ -1308,7 +1373,7 @@ fn the_two_layer_leg_refuses_a_departing_step() {
         for t in 0..3 {
             ARGUE_FAULTS.with(|f| {
                 f.set(ProverFaults {
-                    ladder: Some((t, fault)),
+                    ladder: Some((t, fault, 2)),
                     ..ProverFaults::default()
                 })
             });
@@ -1458,5 +1523,96 @@ fn the_leg_draws_the_hosts_stream_on_both_ladders() {
                 );
             }
         }
+    }
+}
+
+/// The host's verdict and whether the machine executes, under a prover that
+/// departs from `table`'s ladder at its step over `layer` as `fault` says.
+fn departing_at(
+    ladder: GkrLadder,
+    cap: u8,
+    table: usize,
+    fault: multilinear::gkr_lockstep::StepFault,
+    layer: usize,
+) -> (Result<(), String>, bool) {
+    ARGUE_FAULTS.with(|f| {
+        f.set(ProverFaults {
+            ladder: Some((table, fault, layer)),
+            ..ProverFaults::default()
+        })
+    });
+    let out = with_run_on(
+        Fixture::new().on(ladder),
+        cap,
+        |_| {},
+        |run| (run.host.clone().map(|_| ()), run.execute().is_ok()),
+    );
+    ARGUE_FAULTS.with(|f| f.set(ProverFaults::default()));
+    out
+}
+
+/// ★ The residual is load-bearing past a ladder's second step: a prover that
+/// departs at a later step and steps honestly after passes that step's
+/// residual and is refused only by the next one — the mixed step (table 2 in
+/// one bin), a final step one layer for every tree (table 1 alone), and on
+/// the one-layer ladder the step over layer 4 (table 2, in one bin and
+/// alone). The host names that step; the machine refuses.
+#[test]
+fn a_departure_past_the_second_step_is_refused_by_the_next_residual() {
+    use multilinear::gkr_lockstep::StepFault;
+    let error = |layer| {
+        Err(format!(
+            "{:?}",
+            multilinear::Error::LayerRelationMismatch { layer }
+        ))
+    };
+    for (ladder, cap, table, fault, layer, refused_at, what) in [
+        (
+            GkrLadder::Double,
+            27u8,
+            2,
+            StepFault::SwapHalves,
+            4,
+            2,
+            "the mixed step",
+        ),
+        (
+            GkrLadder::Double,
+            0,
+            1,
+            StepFault::SwapHalves,
+            4,
+            2,
+            "a final one-layer step",
+        ),
+        (
+            GkrLadder::Single,
+            27,
+            2,
+            StepFault::SwapLoHi,
+            4,
+            4,
+            "the one-layer ladder's step 4",
+        ),
+        (
+            GkrLadder::Single,
+            0,
+            2,
+            StepFault::SwapLoHi,
+            4,
+            4,
+            "the one-layer ladder's step 4, alone",
+        ),
+    ] {
+        let (host, executes) = departing_at(ladder, cap, table, fault, layer);
+        assert!(
+            !executes,
+            "{what}: the machine executed a departure at layer {layer} of table {table}"
+        );
+        assert_eq!(
+            host,
+            error(refused_at),
+            "{what}: the host refuses at the next step"
+        );
     }
 }
