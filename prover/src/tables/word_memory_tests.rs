@@ -3770,7 +3770,9 @@ pub(super) fn frame_of(
 fn word_format_census(registers: crate::tables::register::RegisterFormat) -> Result<(), String> {
     let format = block_whir::BlockFormat {
         registers,
-        ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
+        ..block_whir::BlockFormat::pinned()
+            .with_memory(MemoryFormat::Words)
+            .with_page_run(0)
     };
     let statement = words_statement(&format, &words_counts(), [1; 7]);
     let frame = frame_with_chips(&statement, &format).map_err(|e| format!("the frame: {e:?}"))?;
@@ -3964,7 +3966,9 @@ fn chip_with_free_message_ts(kind: MessageKind) -> Vec<BusInteraction> {
 /// ([`the_word_format_refuses_every_chip_table`] holds that one).
 #[test]
 fn the_word_format_frame_holds_its_rules() {
-    let format = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
+    let format = block_whir::BlockFormat::pinned()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0);
     let counts = words_counts();
     // A chip-free statement frames as it is; the rest reads the whole set,
     // the chips' tables and MEMW_W included, with the chip refusal out.
@@ -4078,7 +4082,9 @@ fn the_word_format_frame_holds_its_rules() {
 /// reads nothing.
 #[test]
 fn the_word_format_refuses_every_chip_table() {
-    let format = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
+    let format = block_whir::BlockFormat::pinned()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0);
     let chip_free = chip_free_counts();
     frame_of(
         &words_statement(&format, &chip_free, CPU_WORD_TABLES),
@@ -4237,7 +4243,9 @@ fn the_cpu_dispatches_a_range_checked_address() {
     ] {
         let format = block_whir::BlockFormat {
             registers,
-            ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
+            ..block_whir::BlockFormat::pinned()
+                .with_memory(MemoryFormat::Words)
+                .with_page_run(0)
         };
         let frame = frame_of(
             &words_statement(&format, &chip_free_counts(), CPU_WORD_TABLES),
@@ -4524,11 +4532,15 @@ fn the_census_refuses_each_mutant() {
 fn the_word_format_is_proved_under_the_in_row_registers_alone() {
     let words = block_whir::BlockFormat {
         registers: crate::tables::register::RegisterFormat::Tokens32,
-        ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
+        ..block_whir::BlockFormat::pinned()
+            .with_memory(MemoryFormat::Words)
+            .with_page_run(0)
     };
     assert!(block_whir::check_memory_format(&words).is_ok());
     assert!(block_whir::refuse_unprovable(&words).is_err());
-    let in_row = block_whir::BlockFormat::production().with_memory(MemoryFormat::Words);
+    let in_row = block_whir::BlockFormat::production()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0);
     assert!(block_whir::check_memory_format(&in_row).is_ok());
     assert!(block_whir::refuse_unprovable(&in_row).is_ok());
     for memory in [MemoryFormat::Split, MemoryFormat::Fused] {
@@ -4869,7 +4881,9 @@ fn the_census_holds_a_stores_new_word_and_the_sets_byte_messages() {
 /// leaves would otherwise assert while emitting).
 #[test]
 fn the_block_tree_refuses_a_word_block_with_a_fixed_table_off_its_height() {
-    let format = block_whir::BlockFormat::production().with_memory(MemoryFormat::Words);
+    let format = block_whir::BlockFormat::production()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0);
     let statement = words_statement(&format, &chip_free_counts(), CPU_WORD_TABLES);
     frame_of(&statement, &format).expect("the verifier frames it");
     let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
@@ -5029,7 +5043,9 @@ fn the_chip_free_word_frame_has_one_syscall_receiver() {
     ] {
         let format = block_whir::BlockFormat {
             registers,
-            ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
+            ..block_whir::BlockFormat::pinned()
+                .with_memory(MemoryFormat::Words)
+                .with_page_run(0)
         };
         let frame = frame_of(
             &words_statement(&format, &chip_free_counts(), CPU_WORD_TABLES),
@@ -5168,7 +5184,9 @@ fn the_word_frame_puts_the_word_chips_in_their_chips_places() {
             .map(|(i, _)| i)
             .collect()
     };
-    let words = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
+    let words = block_whir::BlockFormat::pinned()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0);
     let mut counts = chip_free_counts();
     counts.copy = 2;
     counts.keccak = 1;
@@ -5217,7 +5235,9 @@ fn the_word_frame_puts_the_word_chips_in_their_chips_places() {
 /// refuses it at the frame.
 #[test]
 fn a_chip_statement_is_refused_across_the_word_format() {
-    let words = block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words);
+    let words = block_whir::BlockFormat::pinned()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0);
     let mut counts = chip_free_counts();
     counts.copy = 2;
     counts.keccak = 1;
@@ -5575,7 +5595,9 @@ fn the_word_frame_with_chips_has_their_receivers_and_no_ram_byte_sender() {
     ] {
         let format = block_whir::BlockFormat {
             registers,
-            ..block_whir::BlockFormat::pinned().with_memory(MemoryFormat::Words)
+            ..block_whir::BlockFormat::pinned()
+                .with_memory(MemoryFormat::Words)
+                .with_page_run(0)
         };
         let mut counts = chip_free_counts();
         counts.copy = 1;
