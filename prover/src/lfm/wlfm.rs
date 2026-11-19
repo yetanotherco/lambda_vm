@@ -2842,6 +2842,16 @@ fn overlap_faults_for_test() -> multilinear_block::OverlapFaults {
 /// copies where the plan or the card says no. The same proof. Only the W-LFM
 /// prover (the levels') reads it; the base's block prover never sets it. On by
 /// default; only `0` turns it off. Read once a process.
+/// [`UPLOAD_ONCE_ENV`]'s word: on unless it is `0`.
+pub fn upload_once_word(word: Option<&str>) -> bool {
+    !super::wlfm_knobs::knob_word_off(word)
+}
+
+/// [`OVERLAP_RESIDENT_ENV`]'s word: on only for `1`.
+pub fn overlap_resident_word(word: Option<&str>) -> bool {
+    super::wlfm_knobs::knob_word_on(word)
+}
+
 pub const UPLOAD_ONCE_ENV: &str = "LAMBDA_VM_LEVELS_UPLOAD_ONCE";
 
 thread_local! {
@@ -2863,12 +2873,10 @@ pub fn upload_once() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !super::wlfm_knobs::knob_word_off(super::wlfm_knobs::env_word(UPLOAD_ONCE_ENV).as_deref())
-    })
+    *ON.get_or_init(|| upload_once_word(super::wlfm_knobs::env_word(UPLOAD_ONCE_ENV).as_deref()))
 }
 
-/// `LAMBDA_VM_LEVELS_OVERLAP_RESIDENT` (on unless `0`): under [`UPLOAD_ONCE_ENV`], phase B's
+/// `LAMBDA_VM_LEVELS_OVERLAP_RESIDENT=1`: under [`UPLOAD_ONCE_ENV`], phase B's
 /// planned overlap prices a retired prepared stack's revive as the upload once
 /// makes it (its store and a revive over resident columns, no codeword on
 /// coset leaves) rather than as a revive that copies and encodes whole
@@ -2876,7 +2884,9 @@ pub fn upload_once() -> bool {
 /// ([`multilinear_block::BlockCommitted::with_overlap_priced_resident`]). Only
 /// the plan moves: a group whose openings now fit opens beside the next argue.
 /// Nothing without the upload once. The same proof. Only the W-LFM prover
-/// reads it. On by default; only `0` turns it off. Read once a process.
+/// reads it. Off by default (and for any word but `1`): the plan it tightens
+/// does not yet price the next group's columns, which go up beside the argue
+/// it plans for. Read once a process.
 pub const OVERLAP_RESIDENT_ENV: &str = "LAMBDA_VM_LEVELS_OVERLAP_RESIDENT";
 
 thread_local! {
@@ -2891,17 +2901,14 @@ pub fn set_overlap_resident_for_test(on: Option<bool>) {
     OVERLAP_RESIDENT_FOR_TEST.with(|c| c.set(on));
 }
 
-/// Whether [`OVERLAP_RESIDENT_ENV`] is on, as it is unless `0` (or this
-/// thread's test override).
+/// Whether [`OVERLAP_RESIDENT_ENV`] is on (or this thread's test override).
 pub fn overlap_resident() -> bool {
     if let Some(on) = OVERLAP_RESIDENT_FOR_TEST.with(std::cell::Cell::get) {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        !super::wlfm_knobs::knob_word_off(
-            super::wlfm_knobs::env_word(OVERLAP_RESIDENT_ENV).as_deref(),
-        )
+        overlap_resident_word(super::wlfm_knobs::env_word(OVERLAP_RESIDENT_ENV).as_deref())
     })
 }
 
