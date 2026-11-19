@@ -430,6 +430,49 @@ pub struct ProverFaults {
     pub local_binding: Option<LocalBinding>,
 }
 
+impl ProverFaults {
+    /// No fault and no measurement's stop armed: the honest argue. Every
+    /// field is named, so a new one is a compile error here.
+    pub fn is_none(&self) -> bool {
+        let Self {
+            suffix_xi,
+            wrong_weight,
+            tamper_claim,
+            scaled_padding,
+            bin_log_cells,
+            balance_with,
+            pack,
+            swap_chunks,
+            pad_mass,
+            ladder,
+            diagonal,
+            ladders_only,
+            only_bin,
+            local_tamper_claim,
+            local_swap_claims,
+            local_balance_with,
+            local_binding,
+        } = self;
+        suffix_xi.is_none()
+            && wrong_weight.is_none()
+            && tamper_claim.is_none()
+            && scaled_padding.is_none()
+            && bin_log_cells.is_none()
+            && balance_with.is_none()
+            && pack.is_none()
+            && swap_chunks.is_none()
+            && pad_mass.is_none()
+            && ladder.is_none()
+            && diagonal.is_none()
+            && !ladders_only
+            && only_bin.is_none()
+            && local_tamper_claim.is_none()
+            && local_swap_claims.is_none()
+            && local_balance_with.is_none()
+            && local_binding.is_none()
+    }
+}
+
 /// What a group's local transcript absorbs before its `(z_g, α_g)`. Every
 /// part in production ([`LocalBinding::ALL`]); a test drops one on both
 /// sides to show the forgery it lets through.
@@ -1662,9 +1705,107 @@ where
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
     // ── G: a ladder per bin, its outputs absorbed just before it ──────────
-    let mut bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>> = vec![None; plan.trees()];
-    let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; plan.shapes.len()];
-    let mut gkr = Vec::with_capacity(plan.bins.len());
+    let mut state = LadderState::new(plan);
+    for b in 0..plan.bins.len() {
+        if faults.only_bin.is_some_and(|only| only != b) {
+            continue;
+        }
+        prove_ladder_bin(
+            tables,
+            class,
+            plan,
+            lists,
+            fake_output,
+            faults,
+            ladder,
+            at,
+            transcript,
+            split,
+            b,
+            &mut state,
+        )?;
+    }
+    if faults.ladders_only {
+        drop(state);
+        for table in tables {
+            table.trace.release_device();
+        }
+        return Err(MlError::DeviceFailed {
+            stage: LADDERS_ONLY_DONE,
+        });
+    }
+    LAST_BIN_SECS.with(|cell| *cell.borrow_mut() = std::mem::take(&mut state.bin_secs));
+    state.finish()
+}
+
+/// What one class's ladders have left so far ([`prove_ladder_bin`]): every
+/// tree's bus output and every member's claim once its bin ran, one ladder a
+/// bin run, and each bin's seconds.
+struct LadderState<E: IsField> {
+    bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>>,
+    claims: Vec<Option<GkrClaim<E>>>,
+    gkr: Vec<LockstepProof<E>>,
+    bin_secs: Vec<f64>,
+}
+
+impl<E: IsField> LadderState<E> {
+    /// Nothing run yet under `plan`.
+    fn new(plan: &ArguePlan) -> Self {
+        Self {
+            bus_outputs: vec![None; plan.trees()],
+            claims: vec![None; plan.shapes.len()],
+            gkr: Vec::with_capacity(plan.bins.len()),
+            bin_secs: Vec::with_capacity(plan.bins.len()),
+        }
+    }
+
+    /// Every bin ran: the outputs, the ladders and the claims; a tree or a
+    /// member no bin reached is refused.
+    fn finish(self) -> Result<Laddered<E>, MlError> {
+        Ok(Laddered {
+            bus_outputs: self
+                .bus_outputs
+                .into_iter()
+                .collect::<Option<_>>()
+                .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?,
+            gkr: self.gkr,
+            claims: self
+                .claims
+                .into_iter()
+                .collect::<Option<_>>()
+                .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?,
+        })
+    }
+}
+
+/// Bin `b` of `plan` ([`prove_ladders`]): its trees built from `lists`,
+/// their outputs absorbed, then its lockstep ladder; each of its members'
+/// claims after it, all into `state`. A bin's transcript work depends on the
+/// bins before it only through `transcript`, so the bins may run one at a
+/// time, on any thread, with the same bytes.
+#[allow(clippy::too_many_arguments)]
+fn prove_ladder_bin<F, E, T>(
+    tables: &[CommittedTable<'_, F, E>],
+    class: &[usize],
+    plan: &ArguePlan,
+    lists: &[Cow<'_, [Interaction<E>]>],
+    fake_output: Option<&(usize, FieldElement<E>)>,
+    faults: &ProverFaults,
+    ladder: GkrLadder,
+    at: Where,
+    transcript: &mut T,
+    split: &mut ArgueSplit,
+    b: usize,
+    state: &mut LadderState<E>,
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    let bin = &plan.bins[b];
     // Under the round slot the columns' trees of a bin are queued one after
     // another and their outputs read once all are (each tree has its stream).
     let queue = multilinear::round_slot::argue_round_slot()
@@ -1681,289 +1822,262 @@ where
             multilinear::gkr::FractionTree::build(layer)?,
         )))
     };
-    let mut bin_secs: Vec<f64> = Vec::with_capacity(plan.bins.len());
-    for (b, bin) in plan.bins.iter().enumerate() {
-        if faults.only_bin.is_some_and(|only| only != b) {
-            continue;
-        }
-        let bin_started = std::time::Instant::now();
-        // The bin's trees: each table's chunks, in order.
-        let members: Vec<(usize, usize)> = bin
-            .iter()
-            .flat_map(|&t| {
-                let first = plan.first_tree(t);
-                (0..plan.chunks[t].count).map(move |j| (t, first + j))
-            })
-            .collect();
-        // A bin the card cannot carry whole hands its trees' input layers
-        // back (`LAMBDA_VM_ARGUE_BIN_HAND_BACK`): each promises less, so the
-        // bin's last trees are built on the card too. The same trees.
-        let hand_back = at != Where::Host && multilinear::gpu::bin_hand_back() && {
-            let carries: Vec<u64> = members
-                .iter()
-                .map(|&(t, i)| {
-                    multilinear::gpu::carry_bytes(
-                        lists[i].len().next_power_of_two() << tables[class[t]].trace.num_vars(),
-                    )
-                })
-                .collect();
-            multilinear::gpu::bin_hand_back_forced()
-                || multilinear::gpu::bin_cannot_carry(
-                    multilinear::gpu::ledger_reserved(),
-                    multilinear::gpu::reserve_budget(),
-                    &carries,
-                )
-        };
-        let handed_before = multilinear::gpu::handed_back_by_preference();
-        let build_trims_before = multilinear::gpu::build_trims();
-        let pending: Vec<Pending<E>> = multilinear::gpu::prefer_hand_back(hand_back, || {
-            members
-                .iter()
-                .map(|&(t, i)| -> Result<Pending<E>, MlError> {
-                    let (trace, interactions) = (&tables[class[t]].trace, &lists[i][..]);
-                    if at == Where::Host {
-                        return Ok(Pending::Ready(BinTree::Host(host_tree(
-                            interactions,
-                            trace,
-                        )?)));
-                    }
-                    let columns_tree = || {
-                        if queue {
-                            logup::resident_tree_from_columns_deferred(interactions, trace)
-                                .map(Pending::Queued)
-                        } else {
-                            logup::resident_tree_from_columns(interactions, trace)
-                                .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
-                        }
-                    };
-                    // Where today's argue builds it: written from the base columns
-                    // with no lift (`gpu::argue_no_lift`), else from the
-                    // lifted factors on the card, else here — and a big host tree
-                    // still folds on a device. The same tree every way.
-                    let started = std::time::Instant::now();
-                    let mut resident_seen = None;
-                    let mut public_tried = false;
-                    let mut public_why: Option<String> = None;
-                    let on_card = (multilinear::gpu::argue_no_lift()
-                        && trace.device_factors().is_none())
-                    .then(columns_tree)
-                    .flatten()
-                    .or_else(|| {
-                        // A chunk that reads a public factor (a selector) has no
-                        // plan over the table's columns: built on the card from
-                        // the columns it reads and its selectors
-                        // (`LAMBDA_VM_ARGUE_PUBLIC_COLUMNS`), in a bin that hands
-                        // its trees back. Elsewhere the table's factors are
-                        // lifted as before, which costs less where they fit.
-                        (logup::public_columns() && hand_back && trace.device_factors().is_none())
-                            .then(|| {
-                                public_tried = true;
-                                logup::resident_tree_with_public(interactions, trace)
-                                    .map_err(|why| public_why = Some(why))
-                                    .ok()
-                            })
-                            .flatten()
-                            .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
-                    })
-                    .or_else(|| {
-                        let resident = trace.reside_from_columns();
-                        resident_seen = Some(resident.is_some());
-                        let from_columns = (multilinear::gpu::argue_gkr_input()
-                            && resident.is_some())
-                        .then(columns_tree)
-                        .flatten();
-                        from_columns.or_else(|| {
-                            resident
-                                .and_then(|resident| logup::resident_tree(interactions, resident))
-                                .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
-                        })
-                    });
-                    let tree = match on_card {
-                        Some(tree) => {
-                            split.trees_card += 1;
-                            tree
-                        }
-                        None => {
-                            split.trees_host += 1;
-                            let why = match (public_tried, resident_seen) {
-                                (true, _) => format!(
-                                    "its public-columns card build was declined: {}",
-                                    public_why.as_deref().unwrap_or("no reason given")
-                                ),
-                                (false, Some(false)) => {
-                                    "no resident columns or factors for its table".to_string()
-                                }
-                                _ => "the card declined the build".to_string(),
-                            };
-                            multilinear::gpu::note_gkr_tree_host_built(
-                                &why,
-                                t,
-                                interactions.len().next_power_of_two() << trace.num_vars(),
-                            );
-                            Pending::Ready(host_built(t, interactions)?)
-                        }
-                    };
-                    split.trees += started.elapsed().as_secs_f64();
-                    Ok(tree)
-                })
-                .collect::<Result<_, _>>()
-        })?;
-        if hand_back {
-            split.bins_handed_back += 1;
-            split.trees_handed_back +=
-                multilinear::gpu::handed_back_by_preference() - handed_before;
-        }
-        // The queued trees' outputs, now that the bin's every tree is queued;
-        // one that cannot be read is built here, before anything is absorbed.
-        let started = std::time::Instant::now();
-        let trees: Vec<BinTree<E>> = pending
-            .into_iter()
-            .zip(&members)
-            .map(|(tree, &(t, i))| match tree {
-                Pending::Ready(tree) => Ok(tree),
-                Pending::Queued(queued) => match queued.into_tree() {
-                    Some(tree) => Ok(BinTree::Built(Box::new(tree))),
-                    None => {
-                        split.trees_host_late += 1;
-                        multilinear::gpu::note_gkr_tree_host_built(
-                            "its queued card build could not be read",
-                            t,
-                            lists[i].len().next_power_of_two() << tables[class[t]].trace.num_vars(),
-                        );
-                        host_built(t, &lists[i])
-                    }
-                },
-            })
-            .collect::<Result<_, MlError>>()?;
-        split.trees += started.elapsed().as_secs_f64();
-        split.ledger_trees = split.ledger_trees.max(multilinear::gpu::ledger_reserved());
-        split.build_trims += multilinear::gpu::build_trims() - build_trims_before;
-        split.pool_high_trees = split
-            .pool_high_trees
-            .max(multilinear::gpu::pool_reserved_high());
-        let hosts: Vec<Option<gkr_lockstep::HostLayers<'_, E>>> = trees
-            .iter()
-            .map(|tree| match tree {
-                BinTree::Host(layers) => Some(gkr_lockstep::HostLayers(layers)),
-                BinTree::Built(_) => None,
-            })
-            .collect();
-        // A built tree whose input layer the card cannot write again for its
-        // last sumcheck has it written here instead (`InputOnHost`): the same
-        // layer, so the same rounds.
-        let writers: Vec<_> = members
+
+    let bin_started = std::time::Instant::now();
+    // The bin's trees: each table's chunks, in order.
+    let members: Vec<(usize, usize)> = bin
+        .iter()
+        .flat_map(|&t| {
+            let first = plan.first_tree(t);
+            (0..plan.chunks[t].count).map(move |j| (t, first + j))
+        })
+        .collect();
+    // A bin the card cannot carry whole hands its trees' input layers
+    // back (`LAMBDA_VM_ARGUE_BIN_HAND_BACK`): each promises less, so the
+    // bin's last trees are built on the card too. The same trees.
+    let hand_back = at != Where::Host && multilinear::gpu::bin_hand_back() && {
+        let carries: Vec<u64> = members
             .iter()
             .map(|&(t, i)| {
-                let (list, trace) = (&lists[i][..], &tables[class[t]].trace);
-                move || logup::input_layer_lean(list, trace)
+                multilinear::gpu::carry_bytes(
+                    lists[i].len().next_power_of_two() << tables[class[t]].trace.num_vars(),
+                )
             })
             .collect();
-        let built: Vec<Option<InputOnHost<'_, E>>> = trees
+        multilinear::gpu::bin_hand_back_forced()
+            || multilinear::gpu::bin_cannot_carry(
+                multilinear::gpu::ledger_reserved(),
+                multilinear::gpu::reserve_budget(),
+                &carries,
+            )
+    };
+    let handed_before = multilinear::gpu::handed_back_by_preference();
+    let build_trims_before = multilinear::gpu::build_trims();
+    let pending: Vec<Pending<E>> = multilinear::gpu::prefer_hand_back(hand_back, || {
+        members
             .iter()
-            .zip(&members)
-            .zip(&writers)
-            .map(|((tree, &(t, i)), write)| match tree {
-                BinTree::Built(tree) => Some(InputOnHost {
-                    tree,
-                    write,
-                    table: t,
-                    cells: lists[i].len().next_power_of_two() << tables[class[t]].trace.num_vars(),
-                }),
-                BinTree::Host(_) => None,
-            })
-            .collect();
-        let refs: Vec<&dyn gkr_lockstep::LadderTree<E>> = built
-            .iter()
-            .zip(&hosts)
-            .map(|(built, host)| match (built, host) {
-                (_, Some(host)) => host as &dyn gkr_lockstep::LadderTree<E>,
-                (Some(built), None) => built as &dyn gkr_lockstep::LadderTree<E>,
-                (None, None) => unreachable!("a host tree has its layers"),
-            })
-            .collect();
-        // The faults `ladder` and `diagonal`: one tree of this bin departs
-        // from the ladder.
-        let armed: Option<(usize, gkr_lockstep::Faulted<'_, E>)> = faults
-            .ladder
-            .and_then(|(target, fault, layer)| {
-                let tree = plan.first_tree(target);
-                members
-                    .iter()
-                    .position(|&(_, i)| i == tree)
-                    .map(|k| (k, gkr_lockstep::Faulted::at(refs[k], fault, layer)))
-            })
-            .or_else(|| {
-                let (tree, fake) = fake_output.as_ref().filter(|_| faults.diagonal.is_some())?;
-                let k = members.iter().position(|&(_, i)| i == *tree)?;
-                let epsilon = fake - refs[k].output().0;
-                Some((k, gkr_lockstep::Faulted::diagonal(refs[k], epsilon)))
-            });
-        let refs: Vec<&dyn gkr_lockstep::LadderTree<E>> = match &armed {
-            Some((k, faulted)) => refs
-                .iter()
-                .enumerate()
-                .map(|(j, &tree)| {
-                    if j == *k {
-                        faulted as &dyn gkr_lockstep::LadderTree<E>
+            .map(|&(t, i)| -> Result<Pending<E>, MlError> {
+                let (trace, interactions) = (&tables[class[t]].trace, &lists[i][..]);
+                if at == Where::Host {
+                    return Ok(Pending::Ready(BinTree::Host(host_tree(
+                        interactions,
+                        trace,
+                    )?)));
+                }
+                let columns_tree = || {
+                    if queue {
+                        logup::resident_tree_from_columns_deferred(interactions, trace)
+                            .map(Pending::Queued)
                     } else {
+                        logup::resident_tree_from_columns(interactions, trace)
+                            .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
+                    }
+                };
+                // Where today's argue builds it: written from the base columns
+                // with no lift (`gpu::argue_no_lift`), else from the
+                // lifted factors on the card, else here — and a big host tree
+                // still folds on a device. The same tree every way.
+                let started = std::time::Instant::now();
+                let mut resident_seen = None;
+                let mut public_tried = false;
+                let mut public_why: Option<String> = None;
+                let on_card = (multilinear::gpu::argue_no_lift()
+                    && trace.device_factors().is_none())
+                .then(columns_tree)
+                .flatten()
+                .or_else(|| {
+                    // A chunk that reads a public factor (a selector) has no
+                    // plan over the table's columns: built on the card from
+                    // the columns it reads and its selectors
+                    // (`LAMBDA_VM_ARGUE_PUBLIC_COLUMNS`), in a bin that hands
+                    // its trees back. Elsewhere the table's factors are
+                    // lifted as before, which costs less where they fit.
+                    (logup::public_columns() && hand_back && trace.device_factors().is_none())
+                        .then(|| {
+                            public_tried = true;
+                            logup::resident_tree_with_public(interactions, trace)
+                                .map_err(|why| public_why = Some(why))
+                                .ok()
+                        })
+                        .flatten()
+                        .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
+                })
+                .or_else(|| {
+                    let resident = trace.reside_from_columns();
+                    resident_seen = Some(resident.is_some());
+                    let from_columns = (multilinear::gpu::argue_gkr_input() && resident.is_some())
+                        .then(columns_tree)
+                        .flatten();
+                    from_columns.or_else(|| {
+                        resident
+                            .and_then(|resident| logup::resident_tree(interactions, resident))
+                            .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
+                    })
+                });
+                let tree = match on_card {
+                    Some(tree) => {
+                        split.trees_card += 1;
                         tree
                     }
-                })
-                .collect(),
-            None => refs,
-        };
-        for (&(_, i), tree) in members.iter().zip(&refs) {
-            let mut output = tree.output();
-            if let Some((target, p)) = fake_output
-                && *target == i
-            {
-                output.0 = p.clone();
-            }
-            transcript.append_field_element(&output.0);
-            transcript.append_field_element(&output.1);
-            bus_outputs[i] = Some(output);
-        }
-        let started = std::time::Instant::now();
-        let trims_before = multilinear::gpu::rewrite_trims();
-        let (steps, inputs) = gkr_lockstep::prove_trees(&refs, ladder, transcript)?;
-        split.rewrite_trims += multilinear::gpu::rewrite_trims() - trims_before;
-        split.ladders += started.elapsed().as_secs_f64();
-        split.ledger_ladder = split.ledger_ladder.max(multilinear::gpu::ledger_reserved());
-        split.pool_high_ladder = split
-            .pool_high_ladder
-            .max(multilinear::gpu::pool_reserved_high());
-        let inputs: Vec<GkrClaim<E>> = inputs;
-        let mut at_tree = 0;
-        for &t in bin {
-            let count = plan.chunks[t].count;
-            let chunk_claims = &inputs[at_tree..at_tree + count];
-            at_tree += count;
-            claims[t] = Some(table_claim(chunk_claims, &plan.chunks[t], transcript)?);
-        }
-        gkr.push(steps);
-        bin_secs.push(bin_started.elapsed().as_secs_f64());
+                    None => {
+                        split.trees_host += 1;
+                        let why = match (public_tried, resident_seen) {
+                            (true, _) => format!(
+                                "its public-columns card build was declined: {}",
+                                public_why.as_deref().unwrap_or("no reason given")
+                            ),
+                            (false, Some(false)) => {
+                                "no resident columns or factors for its table".to_string()
+                            }
+                            _ => "the card declined the build".to_string(),
+                        };
+                        multilinear::gpu::note_gkr_tree_host_built(
+                            &why,
+                            t,
+                            interactions.len().next_power_of_two() << trace.num_vars(),
+                        );
+                        Pending::Ready(host_built(t, interactions)?)
+                    }
+                };
+                split.trees += started.elapsed().as_secs_f64();
+                Ok(tree)
+            })
+            .collect::<Result<_, _>>()
+    })?;
+    if hand_back {
+        split.bins_handed_back += 1;
+        split.trees_handed_back += multilinear::gpu::handed_back_by_preference() - handed_before;
     }
-    if faults.ladders_only {
-        drop(gkr);
-        for table in tables {
-            table.trace.release_device();
-        }
-        return Err(MlError::DeviceFailed {
-            stage: LADDERS_ONLY_DONE,
+    // The queued trees' outputs, now that the bin's every tree is queued;
+    // one that cannot be read is built here, before anything is absorbed.
+    let started = std::time::Instant::now();
+    let trees: Vec<BinTree<E>> = pending
+        .into_iter()
+        .zip(&members)
+        .map(|(tree, &(t, i))| match tree {
+            Pending::Ready(tree) => Ok(tree),
+            Pending::Queued(queued) => match queued.into_tree() {
+                Some(tree) => Ok(BinTree::Built(Box::new(tree))),
+                None => {
+                    split.trees_host_late += 1;
+                    multilinear::gpu::note_gkr_tree_host_built(
+                        "its queued card build could not be read",
+                        t,
+                        lists[i].len().next_power_of_two() << tables[class[t]].trace.num_vars(),
+                    );
+                    host_built(t, &lists[i])
+                }
+            },
+        })
+        .collect::<Result<_, MlError>>()?;
+    split.trees += started.elapsed().as_secs_f64();
+    split.ledger_trees = split.ledger_trees.max(multilinear::gpu::ledger_reserved());
+    split.build_trims += multilinear::gpu::build_trims() - build_trims_before;
+    split.pool_high_trees = split
+        .pool_high_trees
+        .max(multilinear::gpu::pool_reserved_high());
+    let hosts: Vec<Option<gkr_lockstep::HostLayers<'_, E>>> = trees
+        .iter()
+        .map(|tree| match tree {
+            BinTree::Host(layers) => Some(gkr_lockstep::HostLayers(layers)),
+            BinTree::Built(_) => None,
+        })
+        .collect();
+    // A built tree whose input layer the card cannot write again for its
+    // last sumcheck has it written here instead (`InputOnHost`): the same
+    // layer, so the same rounds.
+    let writers: Vec<_> = members
+        .iter()
+        .map(|&(t, i)| {
+            let (list, trace) = (&lists[i][..], &tables[class[t]].trace);
+            move || logup::input_layer_lean(list, trace)
+        })
+        .collect();
+    let built: Vec<Option<InputOnHost<'_, E>>> = trees
+        .iter()
+        .zip(&members)
+        .zip(&writers)
+        .map(|((tree, &(t, i)), write)| match tree {
+            BinTree::Built(tree) => Some(InputOnHost {
+                tree,
+                write,
+                table: t,
+                cells: lists[i].len().next_power_of_two() << tables[class[t]].trace.num_vars(),
+            }),
+            BinTree::Host(_) => None,
+        })
+        .collect();
+    let refs: Vec<&dyn gkr_lockstep::LadderTree<E>> = built
+        .iter()
+        .zip(&hosts)
+        .map(|(built, host)| match (built, host) {
+            (_, Some(host)) => host as &dyn gkr_lockstep::LadderTree<E>,
+            (Some(built), None) => built as &dyn gkr_lockstep::LadderTree<E>,
+            (None, None) => unreachable!("a host tree has its layers"),
+        })
+        .collect();
+    // The faults `ladder` and `diagonal`: one tree of this bin departs
+    // from the ladder.
+    let armed: Option<(usize, gkr_lockstep::Faulted<'_, E>)> = faults
+        .ladder
+        .and_then(|(target, fault, layer)| {
+            let tree = plan.first_tree(target);
+            members
+                .iter()
+                .position(|&(_, i)| i == tree)
+                .map(|k| (k, gkr_lockstep::Faulted::at(refs[k], fault, layer)))
+        })
+        .or_else(|| {
+            let (tree, fake) = fake_output.as_ref().filter(|_| faults.diagonal.is_some())?;
+            let k = members.iter().position(|&(_, i)| i == *tree)?;
+            let epsilon = fake - refs[k].output().0;
+            Some((k, gkr_lockstep::Faulted::diagonal(refs[k], epsilon)))
         });
+    let refs: Vec<&dyn gkr_lockstep::LadderTree<E>> = match &armed {
+        Some((k, faulted)) => refs
+            .iter()
+            .enumerate()
+            .map(|(j, &tree)| {
+                if j == *k {
+                    faulted as &dyn gkr_lockstep::LadderTree<E>
+                } else {
+                    tree
+                }
+            })
+            .collect(),
+        None => refs,
+    };
+    for (&(_, i), tree) in members.iter().zip(&refs) {
+        let mut output = tree.output();
+        if let Some((target, p)) = fake_output
+            && *target == i
+        {
+            output.0 = p.clone();
+        }
+        transcript.append_field_element(&output.0);
+        transcript.append_field_element(&output.1);
+        state.bus_outputs[i] = Some(output);
     }
-    LAST_BIN_SECS.with(|cell| *cell.borrow_mut() = bin_secs);
-    Ok(Laddered {
-        bus_outputs: bus_outputs
-            .into_iter()
-            .collect::<Option<_>>()
-            .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?,
-        gkr,
-        claims: claims
-            .into_iter()
-            .collect::<Option<_>>()
-            .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?,
-    })
+    let started = std::time::Instant::now();
+    let trims_before = multilinear::gpu::rewrite_trims();
+    let (steps, inputs) = gkr_lockstep::prove_trees(&refs, ladder, transcript)?;
+    split.rewrite_trims += multilinear::gpu::rewrite_trims() - trims_before;
+    split.ladders += started.elapsed().as_secs_f64();
+    split.ledger_ladder = split.ledger_ladder.max(multilinear::gpu::ledger_reserved());
+    split.pool_high_ladder = split
+        .pool_high_ladder
+        .max(multilinear::gpu::pool_reserved_high());
+    let inputs: Vec<GkrClaim<E>> = inputs;
+    let mut at_tree = 0;
+    for &t in bin {
+        let count = plan.chunks[t].count;
+        let chunk_claims = &inputs[at_tree..at_tree + count];
+        at_tree += count;
+        state.claims[t] = Some(table_claim(chunk_claims, &plan.chunks[t], transcript)?);
+    }
+    state.gkr.push(steps);
+    state.bin_secs.push(bin_started.elapsed().as_secs_f64());
+    Ok(())
 }
 
 /// A card-built tree in a bin's ladder whose input layer, when the card's step
@@ -2981,7 +3095,7 @@ where
 ///
 /// Where it runs (beside phase A's commits or at the group's turn in phase
 /// B) does not move a byte: its input is the group's columns and its
-/// transcript, nothing else.
+/// transcript, nothing else. [`LocalProver`] runs it one bin at a time.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn prove_local<F, E, T>(
@@ -3003,49 +3117,200 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
-    let statements: Vec<TableStatement<'_, F, E>> = tables.iter().map(|t| t.statement()).collect();
-    let class = ClassTables::split(&statements, local_buses, true);
-    let class_statements = class.statements(&statements)?;
-    let shapes: Vec<ArgueShape> = class_statements.iter().map(ArgueShape::of).collect();
-    let plan = argue_plan_packed(&shapes, bin_log_cells, pack);
-    let interactions = lower(&class_statements, z, alpha)?;
-    let lists: Vec<Cow<'_, [Interaction<E>]>> = plan
-        .chunks
+    let mut prover = LocalProver::new(
+        tables,
+        local_buses,
+        z,
+        alpha,
+        bin_log_cells,
+        pack,
+        ladder,
+        faults,
+    )?;
+    while !prover.done() {
+        prover.step(tables, transcript, at)?;
+    }
+    prover.finish()
+}
+
+/// A group's local argue ([`prove_local`]) that runs one bin of its plan a
+/// step: its plan and its interactions lowered under `(z_g, α_g)` are fixed
+/// when it is made, and each [`Self::step`] runs the next bin on the group's
+/// local transcript. A bin's transcript work depends on the bins before it
+/// only through that transcript, so a prover stopped after any bin and
+/// resumed later — on another thread, beside phase A's commits or at the
+/// group's turn in phase B — sends the bytes [`prove_local`] sends, as long
+/// as the same transcript goes with it.
+#[doc(hidden)]
+pub struct LocalProver<E: IsField> {
+    /// The group's tables in the local class (indices into the group).
+    members: Vec<usize>,
+    plan: ArguePlan,
+    /// Each member's local interactions lowered under `(z_g, α_g)`.
+    interactions: Vec<Vec<Interaction<E>>>,
+    fake_output: Option<(usize, FieldElement<E>)>,
+    faults: ProverFaults,
+    ladder: GkrLadder,
+    /// The group's table count.
+    tables: usize,
+    state: LadderState<E>,
+    /// The next bin to run, in plan order.
+    next: usize,
+}
+
+impl<E> LocalProver<E>
+where
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    /// The group `tables`' local argue under `(z, alpha)`, no bin run yet.
+    /// The fault `local_balance_with` is fixed here; the measurement stops
+    /// `only_bin` and `ladders_only` do not apply to a local argue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new<F>(
+        tables: &[CommittedTable<'_, F, E>],
+        local_buses: &[u64],
+        z: &FieldElement<E>,
+        alpha: &FieldElement<E>,
+        bin_log_cells: u8,
+        pack: GkrPack,
+        ladder: GkrLadder,
+        faults: ProverFaults,
+    ) -> Result<Self, MlError>
+    where
+        F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+    {
+        let statements: Vec<TableStatement<'_, F, E>> =
+            tables.iter().map(|t| t.statement()).collect();
+        let class = ClassTables::split(&statements, local_buses, true);
+        let class_statements = class.statements(&statements)?;
+        let shapes: Vec<ArgueShape> = class_statements.iter().map(ArgueShape::of).collect();
+        let plan = argue_plan_packed(&shapes, bin_log_cells, pack);
+        let interactions = lower(&class_statements, z, alpha)?;
+        let fake_output = match faults.local_balance_with {
+            Some(target) => {
+                let lists = chunked(&plan, &interactions);
+                Some(balancing_output(
+                    tables,
+                    &class.members,
+                    &plan,
+                    &lists,
+                    target,
+                )?)
+            }
+            None => None,
+        };
+        let state = LadderState::new(&plan);
+        Ok(Self {
+            members: class.members,
+            plan,
+            interactions,
+            fake_output,
+            faults: ProverFaults {
+                only_bin: None,
+                ladders_only: false,
+                ..faults
+            },
+            ladder,
+            tables: tables.len(),
+            state,
+            next: 0,
+        })
+    }
+
+    /// The bins of its plan.
+    pub fn bins(&self) -> usize {
+        self.plan.bins.len()
+    }
+
+    /// The bins run so far (the first ones, in plan order).
+    pub fn bins_run(&self) -> usize {
+        self.next
+    }
+
+    /// Every bin ran.
+    pub fn done(&self) -> bool {
+        self.next >= self.plan.bins.len()
+    }
+
+    /// Each bin's seconds, of the bins run so far.
+    pub fn bin_secs(&self) -> &[f64] {
+        &self.state.bin_secs
+    }
+
+    /// Runs the next bin over the group's `tables` (the ones it was made
+    /// from, or views of them) on `transcript`, the group's local transcript
+    /// as the last step left it. Refused once every bin ran. A step that
+    /// fails leaves the prover and its transcript partway through a bin:
+    /// neither may be used again.
+    pub fn step<F, T>(
+        &mut self,
+        tables: &[CommittedTable<'_, F, E>],
+        transcript: &mut T,
+        at: Where,
+    ) -> Result<(), MlError>
+    where
+        F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+    {
+        if self.done() || tables.len() != self.tables {
+            return Err(MlError::ArgueShapeMismatch { part: "local step" });
+        }
+        let lists = chunked(&self.plan, &self.interactions);
+        let mut split = ArgueSplit::default();
+        prove_ladder_bin(
+            tables,
+            &self.members,
+            &self.plan,
+            &lists,
+            self.fake_output.as_ref(),
+            &self.faults,
+            self.ladder,
+            at,
+            transcript,
+            &mut split,
+            self.next,
+            &mut self.state,
+        )?;
+        self.next += 1;
+        Ok(())
+    }
+
+    /// Every bin ran: the group's local argue and each table's local pair.
+    pub fn finish(self) -> Result<(LocalArgue<E>, LocalClaims<E>), MlError> {
+        if !self.done() {
+            return Err(MlError::ArgueShapeMismatch { part: "local bins" });
+        }
+        let Laddered {
+            bus_outputs,
+            gkr,
+            claims,
+        } = self.state.finish()?;
+        let mut local = LocalClaims {
+            interactions: (0..self.tables).map(|_| None).collect(),
+            claims: vec![None; self.tables],
+        };
+        for ((t, list), claim) in self.members.into_iter().zip(self.interactions).zip(claims) {
+            local.interactions[t] = Some(list);
+            local.claims[t] = Some(claim);
+        }
+        Ok((LocalArgue { bus_outputs, gkr }, local))
+    }
+}
+
+/// One list a tree under `plan`, from each member's interactions
+/// ([`chunk_lists`]).
+fn chunked<'a, E: IsField + 'static>(
+    plan: &ArguePlan,
+    interactions: &'a [Vec<Interaction<E>>],
+) -> Vec<Cow<'a, [Interaction<E>]>> {
+    plan.chunks
         .iter()
         .enumerate()
         .flat_map(|(t, chunks)| chunk_lists(&interactions[t], chunks))
-        .collect();
-    let fake_output = faults
-        .local_balance_with
-        .map(|target| balancing_output(tables, &class.members, &plan, &lists, target))
-        .transpose()?;
-    let mut split = ArgueSplit::default();
-    let Laddered {
-        bus_outputs,
-        gkr,
-        claims,
-    } = prove_ladders(
-        tables,
-        &class.members,
-        &plan,
-        &lists,
-        fake_output.as_ref(),
-        &faults,
-        ladder,
-        at,
-        transcript,
-        &mut split,
-    )?;
-    drop(lists);
-    let mut local = LocalClaims {
-        interactions: (0..tables.len()).map(|_| None).collect(),
-        claims: vec![None; tables.len()],
-    };
-    for ((&t, list), claim) in class.members.iter().zip(interactions).zip(claims) {
-        local.interactions[t] = Some(list);
-        local.claims[t] = Some(claim);
-    }
-    Ok((LocalArgue { bus_outputs, gkr }, local))
+        .collect()
 }
 
 /// A group's local argue checked (its ladders and the local balance), on the
