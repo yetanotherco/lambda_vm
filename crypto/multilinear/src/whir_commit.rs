@@ -383,6 +383,13 @@ pub enum Codeword<F: IsField> {
     Device(crate::gpu::DeviceCodeword),
     /// Not held: the stack it encodes ([`SourceCodeword`]).
     Source(SourceCodeword<F>),
+    /// Not held at all: a joint run's codeword the card encoded and absorbed
+    /// into the tree's leaves and let go (`crate::gpu::commit_joint_streamed`).
+    /// Its commitment is retired before it is opened; nothing reads its
+    /// values.
+    Streamed {
+        elements: usize,
+    },
 }
 
 /// A round-0 codeword not held at all: the stack it encodes, from which each
@@ -443,6 +450,7 @@ impl<F: IsField> Codeword<F> {
             Self::Host(values) => values.len(),
             Self::Device(device) => device.elements(),
             Self::Source(source) => source.source.elements(),
+            Self::Streamed { elements } => *elements,
         }
     }
 
@@ -468,14 +476,14 @@ impl<F: IsField> Codeword<F> {
     pub fn host(&self) -> Option<&[FieldElement<F>]> {
         match self {
             Self::Host(values) => Some(values),
-            Self::Device(_) | Self::Source(_) => None,
+            Self::Device(_) | Self::Source(_) | Self::Streamed { .. } => None,
         }
     }
 
     /// The device holding them, when one does.
     pub fn device(&self) -> Option<&crate::gpu::DeviceCodeword> {
         match self {
-            Self::Host(_) | Self::Source(_) => None,
+            Self::Host(_) | Self::Source(_) | Self::Streamed { .. } => None,
             Self::Device(device) => Some(device),
         }
     }
@@ -869,6 +877,49 @@ where
         })
     }
 
+    /// A JOINT round-0 tree the card built one codeword at a time over a run
+    /// of `blocks` codewords of `elements` values each
+    /// ([`crate::gpu::commit_joint_streamed`]): the tree is held as
+    /// [`Self::from_device_joint`]'s, and no codeword is
+    /// ([`Codeword::Streamed`]). Retire it before opening it.
+    pub fn from_device_joint_streamed(
+        blocks: usize,
+        elements: usize,
+        tree: crate::gpu::JointTree,
+        root: Commitment,
+        log_folding: usize,
+        leaves: LeafOrder,
+    ) -> Result<Self, Error> {
+        if !(2..=crate::whir_chain::MAX_INDEX_POLYS).contains(&blocks) {
+            return Err(Error::JointTreeWidth {
+                expected: 2,
+                got: blocks,
+            });
+        }
+        if !elements.is_power_of_two() {
+            return Err(Error::NotPowerOfTwo(elements));
+        }
+        let log_domain_size = elements.trailing_zeros() as usize;
+        if log_folding > log_domain_size {
+            return Err(Error::ColumnTallerThanStack {
+                column_vars: log_folding,
+                n_stack: log_domain_size,
+            });
+        }
+        Ok(Self {
+            tree: Tree::<F, H>::from_root(root),
+            codeword: Codeword::Streamed { elements },
+            log_folding,
+            log_domain_size,
+            leaves,
+            top: None,
+            others: (1..blocks)
+                .map(|_| Codeword::Streamed { elements })
+                .collect(),
+            joint_tree: Some(Box::new(tree)),
+        })
+    }
+
     /// Codeword blocks one leaf holds: 1, or a joint tree's run width.
     pub fn blocks(&self) -> usize {
         1 + self.others.len()
@@ -986,41 +1037,52 @@ where
         // The tallest cap the policy gives a tree this deep, whatever its
         // opening count (the height is monotone in it).
         let tallest_cap = tree_cap_height(cap, usize::MAX, depth, arity);
-        let on_device = matches!(self.codeword, Codeword::Device(_));
+        // A streamed joint codeword was on the card, and its tree still is.
+        let on_device = matches!(
+            self.codeword,
+            Codeword::Device(_) | Codeword::Streamed { .. }
+        );
         let dropped = drop.levels_at(on_device, depth, tallest_cap, arity);
         let keep = kept_top_nodes(self.num_leaves(), depth, dropped, arity);
-        let nodes =
-            match &self.codeword {
-                // A joint tree is the card's node buffer, not a codeword's.
-                Codeword::Device(_) if self.joint_tree.is_some() => self
-                    .joint_tree
-                    .as_ref()
-                    .and_then(|tree| tree.top_nodes(keep))
-                    .ok_or(Error::DeviceFailed {
-                        stage: "retiring a joint commitment",
-                    })?,
-                Codeword::Device(device) => device
+        let nodes = match &self.codeword {
+            // A joint tree is the card's node buffer, not a codeword's.
+            Codeword::Device(_) | Codeword::Streamed { .. } if self.joint_tree.is_some() => self
+                .joint_tree
+                .as_ref()
+                .and_then(|tree| tree.top_nodes(keep))
+                .ok_or(Error::DeviceFailed {
+                    stage: "retiring a joint commitment",
+                })?,
+            Codeword::Device(device) => {
+                device
                     .top_nodes(self.log_folding, keep, H::DEVICE)
                     .ok_or(Error::DeviceFailed {
                         stage: "retiring a commitment",
-                    })?,
-                Codeword::Host(_) => {
-                    let all = self.tree.nodes();
-                    if all.len() < keep {
-                        return Err(Error::DeviceFailed {
-                            stage: "retiring a commitment with no host tree",
-                        });
-                    }
-                    all[..keep].to_vec()
-                }
-                // Held as its stack only once revived, and a revived one
-                // returned its kept top above.
-                Codeword::Source(_) => {
+                    })?
+            }
+            Codeword::Host(_) => {
+                let all = self.tree.nodes();
+                if all.len() < keep {
                     return Err(Error::DeviceFailed {
-                        stage: "retiring a commitment held as its stack",
+                        stage: "retiring a commitment with no host tree",
                     });
                 }
-            };
+                all[..keep].to_vec()
+            }
+            // Held as its stack only once revived, and a revived one
+            // returned its kept top above.
+            Codeword::Source(_) => {
+                return Err(Error::DeviceFailed {
+                    stage: "retiring a commitment held as its stack",
+                });
+            }
+            // Streamed is only ever a joint tree's, which the arm above took.
+            Codeword::Streamed { .. } => {
+                return Err(Error::DeviceFailed {
+                    stage: "retiring a streamed joint commitment with no tree",
+                });
+            }
+        };
         if nodes.len() != keep || nodes.first() != Some(&self.tree.root) {
             return Err(Error::RecomputedCodewordMismatch { block: 0 });
         }
@@ -1600,6 +1662,9 @@ where
                 index: 0,
                 bound: num_leaves,
             }),
+            Codeword::Streamed { .. } => Err(Error::DeviceFailed {
+                stage: "a joint codeword streamed into its tree is not held: retire it first",
+            }),
         }
     }
 
@@ -1685,7 +1750,7 @@ where
         };
         match &self.codeword {
             // A joint tree the card built: its paths come from its own nodes.
-            Codeword::Device(_) if self.joint_tree.is_some() => {
+            Codeword::Device(_) | Codeword::Streamed { .. } if self.joint_tree.is_some() => {
                 if let Some(&bad) = indices.iter().find(|index| **index >= num_leaves) {
                     return Err(out_of_range(bad));
                 }
@@ -1732,6 +1797,9 @@ where
             // Held as its stack only once revived, with its kept top.
             Codeword::Source(_) => Err(Error::DeviceFailed {
                 stage: "a stack-held commitment with no kept top",
+            }),
+            Codeword::Streamed { .. } => Err(Error::DeviceFailed {
+                stage: "a streamed joint commitment with no tree",
             }),
         }
     }
@@ -1795,7 +1863,7 @@ where
             (self.top_paths(top, indices)?, Some(cap))
         } else if owner {
             match &self.codeword {
-                Codeword::Device(_) if self.joint_tree.is_some() => {
+                Codeword::Device(_) | Codeword::Streamed { .. } if self.joint_tree.is_some() => {
                     let num_leaves = self.num_leaves();
                     if let Some(&bad) = indices.iter().find(|index| **index >= num_leaves) {
                         return Err(Error::QueryOutOfRange {
@@ -1851,6 +1919,11 @@ where
                 Codeword::Source(_) => {
                     return Err(Error::DeviceFailed {
                         stage: "a stack-held commitment with no kept top",
+                    });
+                }
+                Codeword::Streamed { .. } => {
+                    return Err(Error::DeviceFailed {
+                        stage: "a streamed joint commitment with no tree",
                     });
                 }
             }
@@ -1924,6 +1997,11 @@ where
                     index,
                     bound: num_leaves,
                 })?,
+            Codeword::Streamed { .. } => {
+                return Err(Error::DeviceFailed {
+                    stage: "a joint codeword streamed into its tree is not held: retire it first",
+                });
+            }
         };
         Ok(CosetOpening { values, proof })
     }

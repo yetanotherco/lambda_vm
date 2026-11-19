@@ -8763,6 +8763,154 @@ pub(crate) fn commit_joint(
     }
 }
 
+/// [`commit_joint`] one codeword at a time
+/// ([`math_cuda::whir::commit_joint_streamed`]): `encode(k)` gives the run's
+/// codeword `k` of `blocks`, each `2^log_elements` values, and each goes
+/// before the next is encoded. `None` when the hash has no streamed joint
+/// leaf (BLAKE3 only), the fold block is under 8 values, or the card declines
+/// (an encode, or the tree): the caller commits as before.
+#[cfg(feature = "cuda")]
+pub(crate) fn commit_joint_streamed(
+    blocks: usize,
+    log_elements: usize,
+    log_folding: usize,
+    hash: crate::whir_hash::DeviceHashKey,
+    leaves: crate::whir_commit::LeafOrder,
+    mut encode: impl FnMut(usize) -> Option<DeviceCodeword>,
+) -> Option<(JointTree, [u8; 32])> {
+    let hash = hash.into_math_cuda();
+    if hash != math_cuda::DeviceHash::Blake3 || log_folding < 3 {
+        return None;
+    }
+    let mut declined = false;
+    let built = math_cuda::whir::commit_joint_streamed(
+        blocks,
+        1usize << log_elements,
+        log_folding,
+        hash,
+        placement(leaves),
+        |k| match encode(k) {
+            Some(codeword) => Some(codeword.0),
+            None => {
+                declined = true;
+                None
+            }
+        },
+    );
+    match built {
+        Ok((tree, root)) => {
+            COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+            Some((JointTree(tree), root))
+        }
+        Err(err) => {
+            // An encode that declined was counted where it declined.
+            if !declined {
+                note_commit_error("joint, streamed", log_elements, 0, &err);
+            }
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn commit_joint_streamed(
+    _blocks: usize,
+    _log_elements: usize,
+    _log_folding: usize,
+    _hash: crate::whir_hash::DeviceHashKey,
+    _leaves: crate::whir_commit::LeafOrder,
+    _encode: impl FnMut(usize) -> Option<DeviceCodeword>,
+) -> Option<(JointTree, [u8; 32])> {
+    None
+}
+
+/// Joint trees built one codeword at a time ([`commit_joint_streamed`]).
+#[cfg(feature = "cuda")]
+pub fn joint_streamed_builds() -> u64 {
+    math_cuda::whir::joint_streamed_builds()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn joint_streamed_builds() -> u64 {
+    0
+}
+
+/// The knob for [`streamed_joint_leaves`]: `1` turns it on.
+pub const STREAMED_LEAVES_ENV: &str = "LAMBDA_VM_COMMIT_STREAMED_LEAVES";
+
+/// Test override of [`streamed_joint_leaves`]: 0 none, 1 on, 2 off.
+static STREAMED_LEAVES_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether a grouped round-0 run's joint tree is built one codeword at a
+/// time ([`commit_joint_streamed`]): each codeword encoded, absorbed into the
+/// leaves' chains and let go before the next, so the commit holds one of the
+/// run's codewords instead of all of them. The same tree, root and proof;
+/// the commitment keeps no codeword ([`crate::whir_commit::Codeword::Streamed`]),
+/// so only a commit made inside [`retired_after_commit`] streams — what the
+/// block prover's phase A is. Off by default (`LAMBDA_VM_COMMIT_STREAMED_LEAVES=1`);
+/// read once.
+pub fn streamed_joint_leaves() -> bool {
+    match STREAMED_LEAVES_FORCED.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| streamed_leaves_setting(std::env::var(STREAMED_LEAVES_ENV).ok().as_deref()))
+}
+
+std::thread_local! {
+    /// Whether this thread's commits are retired before they are opened
+    /// ([`retired_after_commit`]).
+    static RETIRED_AFTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `commit` with this thread's commits marked as retired before they
+/// are opened — what the block prover does with every group — so a joint run
+/// may be streamed into its tree ([`streamed_joint_leaves`]); a commitment
+/// opened whole needs its codewords, and is never streamed.
+pub fn retired_after_commit<R>(commit: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RETIRED_AFTER.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(RETIRED_AFTER.with(|cell| cell.replace(true)));
+    commit()
+}
+
+/// Whether this thread's next grouped commit streams its joint run: the knob
+/// on, inside [`retired_after_commit`].
+pub(crate) fn streamed_joint_leaves_here() -> bool {
+    streamed_joint_leaves() && RETIRED_AFTER.with(std::cell::Cell::get)
+}
+
+/// [`streamed_joint_leaves`]' reading of its knob: only `1` turns it on.
+pub fn streamed_leaves_setting(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// Restores [`streamed_joint_leaves`]' previous override when dropped.
+#[doc(hidden)]
+#[must_use = "the override lasts while the guard lives"]
+pub struct StreamedLeavesGuard(u8);
+
+impl Drop for StreamedLeavesGuard {
+    fn drop(&mut self) {
+        STREAMED_LEAVES_FORCED.store(self.0, Ordering::Relaxed);
+    }
+}
+
+/// Test only, not for production callers: [`streamed_joint_leaves`] forced
+/// on or off until the guard drops. For a test that runs alone in its
+/// process.
+#[doc(hidden)]
+pub fn force_streamed_joint_leaves(on: bool) -> StreamedLeavesGuard {
+    let previous = STREAMED_LEAVES_FORCED.swap(if on { 1 } else { 2 }, Ordering::Relaxed);
+    StreamedLeavesGuard(previous)
+}
+
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn commit_joint(
     codewords: &[DeviceCodeword],

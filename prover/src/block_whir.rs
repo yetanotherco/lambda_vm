@@ -8277,6 +8277,15 @@ fn prove_streamed(
         let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
         let pages_first = pages_first(deviations.pages_first)?;
         eprintln!(
+            "★ BLOCK COMMIT LEAVES: {} ({})",
+            if multilinear::gpu::streamed_joint_leaves() {
+                "a joint run's codewords streamed into its leaves one at a time"
+            } else {
+                "a joint run's codewords all encoded, then its leaves (the default)"
+            },
+            multilinear::gpu::STREAMED_LEAVES_ENV
+        );
+        eprintln!(
             "★ BLOCK PAGES FIRST: {} ({PAGES_FIRST_ENV})",
             if pages_first {
                 "the page tables handed on right after KECCAK_RND's (the default)"

@@ -42,6 +42,10 @@ pub struct Kernels {
     /// The joint leaves of a grouped run's 2–4 base codewords
     /// (`crate::whir::launch_joint_leaves`).
     pub leaves_base_coset_joint: CudaFunction,
+    /// [`Self::leaves_base_coset_joint`] one codeword at a time, the chain
+    /// kept in the leaf's slot between steps
+    /// (`crate::whir::commit_joint_streamed`).
+    pub leaves_base_coset_joint_step: CudaFunction,
     /// The joint leaf's prefix midstate, for the host to check
     /// ([`joint_midstate`]).
     pub joint_midstate_probe: CudaFunction,
@@ -87,6 +91,7 @@ pub fn kernels() -> Result<&'static Kernels> {
         leaves_base_coset_rev: module.load_function("b3w_leaves_base_coset_rev")?,
         leaves_ext3_coset: module.load_function("b3w_leaves_ext3_coset")?,
         leaves_base_coset_joint: module.load_function("b3w_leaves_base_coset_joint")?,
+        leaves_base_coset_joint_step: module.load_function("b3w_leaves_base_coset_joint_step")?,
         joint_midstate_probe: module.load_function("b3w_joint_midstate_probe")?,
         merkle_level: module.load_function("blake3_merkle_level")?,
         merkle_tail: module.load_function("blake3_merkle_tail")?,

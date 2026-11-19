@@ -2342,14 +2342,18 @@ where
     // `find_work`: own deque, then stealing, then injected jobs), and the card
     // waits with it: at the median block one commit took 2.7–2.9 s against
     // 0.68 s off the pool.
+    // Retired right below, so a joint run may be streamed into its tree
+    // (`multilinear::gpu::streamed_joint_leaves`).
     let stacked = multilinear::stacked_eval::with_pairs_off_pool(true, || {
-        StackedCommitment::<F, H>::commit_signalled(
-            layout,
-            columns,
-            resident.map(|(store, first)| (store, ColumnsAt::From(first))),
-            config,
-            on_room,
-        )
+        multilinear::gpu::retired_after_commit(|| {
+            StackedCommitment::<F, H>::commit_signalled(
+                layout,
+                columns,
+                resident.map(|(store, first)| (store, ColumnsAt::From(first))),
+                config,
+                on_room,
+            )
+        })
     })?;
     let roots = stacked.roots();
     let commit = t.elapsed().as_secs_f64();
