@@ -639,6 +639,61 @@ fn the_blake3_driver_with_level_1_filled_beside_proves_the_same_level_bytes() {
     }
 }
 
+/// The BLAKE3 driver with level 1's admission check moved to the base's end
+/// (`LAMBDA_VM_LEVELS_VALIDATE_LATE`) proves the same level bytes as
+/// [`prove_levels`] does over the same base, and reports the check done before
+/// it returned. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity
+/// check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_validating_late_proves_the_same_level_bytes() {
+    use super::levels::{prove_block_levels, set_validate_late_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_validate_late_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = {
+        let _restore = Restore;
+        set_validate_late_for_test(Some(true));
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level")
+    };
+    let (secs, _) = run.times.validated_late.expect("level 1 validated late");
+    assert!(secs > 0.0 && run.times.validated_beside.is_none());
+    let held = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
+        println!(
+            "LEVELS VALIDATE LATE IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
+}
+
 /// The BLAKE3 driver with level 2 executed beside level 1's prove
 /// (`LAMBDA_VM_LEVELS_STREAM_NEXT`, its arena landing piece by piece as level 1
 /// opens its groups) proves the same level bytes as [`prove_levels`] does over
@@ -778,6 +833,44 @@ fn the_blake3_driver_with_the_planned_overlap_proves_the_same_level_bytes() {
             a.len()
         );
     }
+}
+
+/// The late-validation knob's name; it is off by default, and only `1` turns
+/// it on.
+#[test]
+fn the_validate_late_knob_is_named_and_off_by_default() {
+    use super::levels::{VALIDATE_LATE_ENV, validate_late};
+    assert_eq!(VALIDATE_LATE_ENV, "LAMBDA_VM_LEVELS_VALIDATE_LATE");
+    if std::env::var_os(VALIDATE_LATE_ENV).is_none() {
+        assert!(!validate_late());
+    }
+}
+
+/// ★ Every program the levels' verifier derives passes the admission
+/// validator on the way (`finish_program`, the end of both
+/// `WhirBlockPlan::closed_block_program` and `wlfm_leg_program`, which
+/// `derive_levels` builds every level from): a program hinting outside its
+/// arena is refused there, its in-bounds twin is admitted. What makes the
+/// prover's own check completeness-only.
+#[test]
+fn the_verifiers_derivation_refuses_an_inadmissible_program() {
+    use super::builder::LfmBuilder;
+    use super::whir_block::finish_program;
+    let program = |index: u32| {
+        let mut b = LfmBuilder::new();
+        let arena = b.declare_arena(2);
+        let x = b.hint_felt(arena, 0);
+        let y = b.hint_felt(arena, index);
+        let s = b.add(x, y);
+        b.public(s.as_cell());
+        finish_program(b)
+    };
+    assert!(program(1).is_ok(), "the in-bounds twin is admitted");
+    let refused = program(5).expect_err("a hint outside the arena is refused");
+    assert!(
+        refused.contains("not admissible") && refused.contains("ArenaOutOfBounds"),
+        "{refused}"
+    );
 }
 
 /// The fill-beside knob's name; it is on by default, and only `0` turns it
@@ -1177,7 +1270,13 @@ fn rta_one_run(
              {:.3}s",
             t.levels.first().map_or(0.0, |l| l.executed)
         ),
-        None => println!("RTA LEVEL1 VALIDATE: beside off"),
+        None => match t.validated_late {
+            Some((secs, at)) => println!(
+                "RTA LEVEL1 VALIDATE: late · {secs:.3}s · done by {at:.3}s · level 1 proved at {:.3}s",
+                t.levels.first().map_or(0.0, |l| l.end)
+            ),
+            None => println!("RTA LEVEL1 VALIDATE: beside off"),
+        },
     }
     let landing = &t.landing;
     let list = |xs: Vec<String>| xs.join(" ");

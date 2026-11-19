@@ -531,6 +531,40 @@ pub(crate) fn prepare_level_beside(
     }
 }
 
+/// `LAMBDA_VM_LEVELS_VALIDATE_LATE=1`: level 1's program is checked by the
+/// admission validator from the base's end, beside level 1's prove, instead of
+/// beside its execution (which runs beside the base's phase B, where the host's
+/// work slows the base). The driver returns no proof until the check has
+/// passed: an inadmissible program still refuses the block, only later. The
+/// verifier validates every level's program it derives either way
+/// ([`super::whir_block::finish_program`]). Under [`program_fast`] only (off
+/// it, the program is validated before its execution, as always). Off by
+/// default (and for any word but `1`); read once a process.
+pub const VALIDATE_LATE_ENV: &str = "LAMBDA_VM_LEVELS_VALIDATE_LATE";
+
+std::thread_local! {
+    /// A test's [`validate_late`] on this thread.
+    static VALIDATE_LATE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`validate_late`] forced on this thread (`None` restores the
+/// knob). The driver reads it on its own thread.
+#[doc(hidden)]
+pub fn set_validate_late_for_test(on: Option<bool>) {
+    VALIDATE_LATE_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`VALIDATE_LATE_ENV`] is on (or this thread's test override).
+pub fn validate_late() -> bool {
+    if let Some(on) = VALIDATE_LATE_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(VALIDATE_LATE_ENV).ok().as_deref())
+    })
+}
+
 /// A test's [`program_fast`] for every thread until the guard drops.
 #[cfg(test)]
 pub(crate) fn set_program_fast_for_test(on: bool) -> ProgramFastForTest {
@@ -1247,6 +1281,9 @@ pub struct LevelsTimes {
     /// its execution: its seconds, and when the execution's end found it done
     /// (the driver's clock). `None` when off.
     pub validated_beside: Option<(f64, f64)>,
+    /// Under [`VALIDATE_LATE_ENV`], level 1's validator from the base's end:
+    /// its seconds, and when level 1's proved prove found it done.
+    pub validated_late: Option<(f64, f64)>,
     /// Level 1's program: its walk's, its compile's and (off the knob) its
     /// validation's seconds before its execution could start.
     pub emit_split: (f64, f64, f64),
@@ -1510,6 +1547,8 @@ pub fn prove_block_levels(
         && super::b3l_tables::fill_hold() == super::b3l_tables::B3lHold::Records;
     let base_end: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     let base_end_ref = &base_end;
+    // Read on the driver's thread (a test's override is that thread's).
+    let validate_late_on = validate_late() && program_fast();
     // Level 1's program, emitted by its thread and read by the builder's.
     let program_cell: std::sync::OnceLock<LfmProgram> = std::sync::OnceLock::new();
     let program_ref = &program_cell;
@@ -1558,7 +1597,8 @@ pub fn prove_block_levels(
             let _ = btx.send(());
             // Under the knob, the admission validator runs beside the
             // execution; level 1 is refused at the execution's end if it fails.
-            let checker = beside_check.then(|| spawn_validation(scope, program));
+            let checker =
+                (beside_check && !validate_late_on).then(|| spawn_validation(scope, program));
             let pieces = level1_pieces(&marks);
             let npieces = pieces.len();
             let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
@@ -1967,7 +2007,28 @@ pub fn prove_block_levels(
             }
             Level1Ready::Filled(filled, fill) => (filled, fill),
         };
-        release_program(&mut levels[0].program, &mut times.sizes);
+        // Under the knob, the program goes to the admission validator, on a
+        // thread of its own beside level 1's prove, which lets it go once
+        // checked; otherwise it is let go here.
+        let late_check = if validate_late_on {
+            let p = &levels[0].program;
+            times.sizes.push((p.instrs.len(), p.groups.b3l.real_rows));
+            let program = std::mem::replace(
+                &mut levels[0].program,
+                super::compiler::compile(super::builder::LfmBuilder::new().finish()),
+            );
+            Some(scope.spawn(move || -> Result<f64, String> {
+                let t = std::time::Instant::now();
+                super::validator::validate(&program)
+                    .map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
+                let secs = t.elapsed().as_secs_f64();
+                drop(program);
+                Ok(secs)
+            }))
+        } else {
+            release_program(&mut levels[0].program, &mut times.sizes);
+            None
+        };
         // What the execution and the program held, back to the OS on a
         // thread of its own beside the prove.
         let purge_filled = scope.spawn(crate::alloc_purge::purge_now);
@@ -2039,6 +2100,13 @@ pub fn prove_block_levels(
         .map_err(|e| format!("level 1: {e}"));
         let level1_proved = now();
         drop(piece_tx);
+        // No proof leaves before the program it proves has passed admission.
+        if let Some(handle) = late_check {
+            let secs = handle
+                .join()
+                .map_err(|_| "level 1's validator panicked".to_string())??;
+            times.validated_late = Some((secs, now()));
+        }
         proofs.push(proved?);
         times.levels.push(LevelClock {
             execute_from,
