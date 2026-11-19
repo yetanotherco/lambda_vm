@@ -1391,6 +1391,50 @@ fn page_airs_built<T>(f: impl FnOnce() -> T) -> (usize, T) {
     )
 }
 
+/// ★ A statement states at most [`block_whir::BLOCK_MAX_TABLES`] tables, under
+/// every format: one more is refused by that rule before the frame loads the
+/// program (so before any AIR is built), whatever the program bytes; at the
+/// maximum the rule passes and the frame goes on (here to the program, which
+/// does not load). The prover's own AIR set is held to the same constant.
+#[test]
+fn a_statement_over_the_table_maximum_is_refused_before_its_program_loads() {
+    let (statement, _) = statement_at(&words());
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let opts = ProofOptions::default_test_options();
+    for format in [
+        words(),
+        words().with_page_run(4),
+        BlockFormat::pinned(),
+        BlockFormat::production(),
+    ] {
+        let mut over = statement.clone();
+        over.table_num_vars
+            .resize(block_whir::BLOCK_MAX_TABLES + 1, 15);
+        for program in [&elf[..], b"not a program"] {
+            let (built, framed) =
+                page_airs_built(|| block_whir::block_frame(over.view(), program, &opts, &format));
+            assert!(
+                matches!(&framed, Err(crate::Error::InvalidTableCounts(why))
+                    if why == "65537 tables — a block states at most 65536"),
+                "{:?}",
+                framed.err()
+            );
+            assert_eq!(built, 0, "no PAGE AIR before the refusal");
+        }
+        let mut at = statement.clone();
+        at.table_num_vars.resize(block_whir::BLOCK_MAX_TABLES, 15);
+        assert!(
+            matches!(
+                block_whir::block_frame(at.view(), b"not a program", &opts, &format),
+                Err(crate::Error::ElfLoad(_))
+            ),
+            "at the maximum the frame goes on to the program"
+        );
+    }
+    assert!(block_whir::check_table_count(block_whir::BLOCK_MAX_TABLES).is_ok());
+    assert!(block_whir::check_table_count(block_whir::BLOCK_MAX_TABLES + 1).is_err());
+}
+
 /// ★ Under the word memory format the frame builds no PAGE AIR a listed page:
 /// its page tables are built straight from the page list, one AIR each, at
 /// runs off and at runs of 16 and 64 pages, and they are the AIR set's page
@@ -1442,6 +1486,68 @@ fn the_word_frame_builds_no_page_air_a_page() {
         frame.page_configs.len(),
         "a PAGE AIR a page when asked"
     );
+}
+
+/// ★ A word statement whose one aligned range lists 2^20 zero pages costs one
+/// AIR a stated page table, never one a page. At runs of 16 pages its 2^16 page
+/// tables put it over the table maximum, refused before anything is built; at
+/// runs of 32 and 64 pages its 2^15 and 2^14 page tables, each at its stated
+/// height, are built and held, and the frame refuses the statement only at its
+/// groups, with no PAGE AIR built. The line it prints is each case's time.
+#[test]
+fn a_million_zero_pages_cost_one_air_a_page_table() {
+    const PAGES: u64 = 1 << 20;
+    const BASE: u64 = 1 << 40;
+    for run_log2 in [4u8, 5, 6] {
+        let format = words().with_page_run(run_log2);
+        let (statement, tables) = statement_at(&format);
+        let first = block_whir::first_page_index(
+            &super::word_memory_tests::frame_of(&statement, &format)
+                .expect("frames")
+                .airs,
+        )
+        .expect("the pages");
+        // The range's tables go before the stack's page, the list's last.
+        let at = first + tables.iter().filter(|t| t.base < BASE).count();
+        let added = (PAGES >> run_log2) as usize;
+        let full = (crate::tables::page_w::NUM_VARS + usize::from(run_log2)) as u8;
+        let mut big = statement.clone();
+        big.runtime_page_ranges.push(crate::RuntimePageRange {
+            base: BASE,
+            count: PAGES,
+        });
+        big.table_num_vars
+            .splice(at..at, std::iter::repeat_n(full, added));
+        let t = std::time::Instant::now();
+        let (built, framed) = page_airs_built(|| super::word_memory_tests::frame_of(&big, &format));
+        let secs = t.elapsed().as_secs_f64();
+        assert_eq!(built, 0, "runs of 2^{run_log2}: a PAGE AIR built a page");
+        let why = match framed {
+            Err(crate::Error::InvalidTableCounts(why)) => why,
+            other => panic!("runs of 2^{run_log2}: {:?}", other.err()),
+        };
+        let tables = big.table_num_vars.len();
+        if tables > block_whir::BLOCK_MAX_TABLES {
+            assert_eq!(
+                why,
+                format!("{tables} tables — a block states at most 65536"),
+                "runs of 2^{run_log2}"
+            );
+        } else {
+            assert_eq!(
+                why,
+                format!(
+                    "the groups cover {} of {tables} tables",
+                    statement.table_num_vars.len()
+                ),
+                "runs of 2^{run_log2}: held to the groups, after the page tables"
+            );
+        }
+        println!(
+            "MILLION ZERO PAGES 2^{run_log2}: {added} page tables · {tables} stated · refused in \
+             {secs:.2} s: {why}"
+        );
+    }
 }
 
 /// The prepared tables of `format`'s frame of [`statement_at`], each by its
