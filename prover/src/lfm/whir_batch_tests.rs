@@ -1088,8 +1088,15 @@ fn the_leg_is_its_closed_form(run: &RunView<'_>, what: &str) {
             unnamed.push(*value);
         }
     }
-    assert!(unnamed.is_empty(), "{what}: the form does not name {unnamed:?}");
-    assert_eq!(measured, cost.rows(), "{what}: emitted rows against the closed form");
+    assert!(
+        unnamed.is_empty(),
+        "{what}: the form does not name {unnamed:?}"
+    );
+    assert_eq!(
+        measured,
+        cost.rows(),
+        "{what}: emitted rows against the closed form"
+    );
     println!(
         "{what}: {measured} rows emitted and predicted, {} permutations",
         cost.perms()
@@ -1117,23 +1124,34 @@ fn schedules(run: &RunView<'_>) -> Vec<Vec<multilinear::gkr_lockstep::LadderStep
 /// for the odd trees, mixed steps among them.
 #[test]
 fn the_two_layer_leg_is_the_host_and_its_closed_form() {
-    for (name, fixture) in [("plain", Fixture::new as fn() -> Fixture), ("packed", Fixture::packed)] {
+    for (name, fixture) in [
+        ("plain", Fixture::new as fn() -> Fixture),
+        ("packed", Fixture::packed),
+    ] {
         for cap in [27u8, 0] {
-            with_run_on(fixture().on(GkrLadder::Double), cap, |_| {}, |run| {
-                let what = format!("two-layer {name} cap {cap}");
-                let steps: Vec<_> = schedules(&run).into_iter().flatten().collect();
-                assert!(steps.iter().any(|s| s.degree == 5), "{what}: a degree-5 step");
-                assert!(
-                    run.argue
-                        .gkr
-                        .iter()
-                        .flat_map(|l| &l.layers)
-                        .any(|l| l.sumcheck.rounds.iter().any(|r| r.evaluations.len() == 5)),
-                    "{what}: a degree-5 round in the proof"
-                );
-                the_leg_is_the_host(&run, &what);
-                the_leg_is_its_closed_form(&run, &what);
-            });
+            with_run_on(
+                fixture().on(GkrLadder::Double),
+                cap,
+                |_| {},
+                |run| {
+                    let what = format!("two-layer {name} cap {cap}");
+                    let steps: Vec<_> = schedules(&run).into_iter().flatten().collect();
+                    assert!(
+                        steps.iter().any(|s| s.degree == 5),
+                        "{what}: a degree-5 step"
+                    );
+                    assert!(
+                        run.argue.gkr.iter().flat_map(|l| &l.layers).any(|l| l
+                            .sumcheck
+                            .rounds
+                            .iter()
+                            .any(|r| r.evaluations.len() == 5)),
+                        "{what}: a degree-5 round in the proof"
+                    );
+                    the_leg_is_the_host(&run, &what);
+                    the_leg_is_its_closed_form(&run, &what);
+                },
+            );
         }
     }
 }
@@ -1148,37 +1166,55 @@ fn the_two_layer_legs_words_are_its_own() {
             GkrLadder::Single => GkrLadder::Double,
             GkrLadder::Double => GkrLadder::Single,
         };
-        with_run_on(Fixture::new().on(ladder), 27, |_| {}, |run| {
-            let mut words = Vec::new();
-            super::whir_batch::push_batched_words(&mut words, run.argue);
-            assert_eq!(
-                words.len(),
-                super::whir_batch::batched_words(run.shapes, run.plan, ladder),
-                "{ladder:?}: the proof's words are its ladder's count"
-            );
-            assert_ne!(
-                words.len(),
-                super::whir_batch::batched_words(run.shapes, run.plan, other),
-                "{ladder:?}: and not the other ladder's"
-            );
-        });
+        with_run_on(
+            Fixture::new().on(ladder),
+            27,
+            |_| {},
+            |run| {
+                let mut words = Vec::new();
+                super::whir_batch::push_batched_words(&mut words, run.argue);
+                assert_eq!(
+                    words.len(),
+                    super::whir_batch::batched_words(run.shapes, run.plan, ladder),
+                    "{ladder:?}: the proof's words are its ladder's count"
+                );
+                assert_ne!(
+                    words.len(),
+                    super::whir_batch::batched_words(run.shapes, run.plan, other),
+                    "{ladder:?}: and not the other ladder's"
+                );
+            },
+        );
     }
 }
+
+/// A one-value edit of a batched argue, named by its site.
+type ArgueTamper = Box<dyn Fn(&mut BatchedArgue<E>)>;
 
 /// ★ Every tamper the host refuses on the two-layer ladder, the leg refuses:
 /// each value of a two-layer tree's halves at a mid step, an odd tree's one
 /// half in a mixed step, each value of a degree-5 round, a bus output.
 #[test]
 fn the_two_layer_leg_refuses_what_the_host_rejects() {
-    with_run_on(Fixture::new().on(GkrLadder::Double), 27, |_| {}, |run| {
-        run.host.clone().expect("the honest argue verifies on the host");
-        run.execute().expect("the honest argue executes");
-    });
+    with_run_on(
+        Fixture::new().on(GkrLadder::Double),
+        27,
+        |_| {},
+        |run| {
+            run.host
+                .clone()
+                .expect("the honest argue verifies on the host");
+            run.execute().expect("the honest argue executes");
+        },
+    );
     // The sites, from the schedule: a step past the first with rounds, a
     // two-layer tree's halves there, and a one-layer tree's when the step is
     // mixed.
-    let (step, double_half, single_half) =
-        with_run_on(Fixture::new().on(GkrLadder::Double), 27, |_| {}, |run| {
+    let (step, double_half, single_half) = with_run_on(
+        Fixture::new().on(GkrLadder::Double),
+        27,
+        |_| {},
+        |run| {
             let schedule = &schedules(&run)[0];
             let (j, s) = schedule
                 .iter()
@@ -1195,8 +1231,9 @@ fn the_two_layer_leg_refuses_what_the_host_rejects() {
                 at += relation.halves();
             }
             (j, double_half.expect("a two-layer tree"), single_half)
-        });
-    let mut sites: Vec<(String, Box<dyn Fn(&mut BatchedArgue<E>)>)> = Vec::new();
+        },
+    );
+    let mut sites: Vec<(String, ArgueTamper)> = Vec::new();
     for half in [double_half, double_half + 1] {
         for value in 0..4 {
             sites.push((
@@ -1211,7 +1248,9 @@ fn the_two_layer_leg_refuses_what_the_host_rejects() {
     if let Some(half) = single_half {
         sites.push((
             format!("an odd tree's half at the mixed step {step}"),
-            Box::new(move |a: &mut BatchedArgue<E>| bump(&mut a.gkr[0].layers[step].halves[half].q_hi)),
+            Box::new(move |a: &mut BatchedArgue<E>| {
+                bump(&mut a.gkr[0].layers[step].halves[half].q_hi)
+            }),
         ));
     }
     for value in 0..5 {
@@ -1227,13 +1266,18 @@ fn the_two_layer_leg_refuses_what_the_host_rejects() {
         Box::new(|a: &mut BatchedArgue<E>| bump(&mut a.bus_outputs[1].0)),
     ));
     for (name, tamper) in &sites {
-        with_run_on(Fixture::new().on(GkrLadder::Double), 27, |a| tamper(a), |run| {
-            assert!(run.host.is_err(), "{name}: the HOST accepted it");
-            assert!(
-                run.execute().is_err(),
-                "{name}: the machine executed a forgery the host rejects"
-            );
-        });
+        with_run_on(
+            Fixture::new().on(GkrLadder::Double),
+            27,
+            |a| tamper(a),
+            |run| {
+                assert!(run.host.is_err(), "{name}: the HOST accepted it");
+                assert!(
+                    run.execute().is_err(),
+                    "{name}: the machine executed a forgery the host rejects"
+                );
+            },
+        );
     }
 }
 
@@ -1244,7 +1288,11 @@ fn the_two_layer_leg_refuses_what_the_host_rejects() {
 #[test]
 fn the_two_layer_leg_refuses_a_departing_step() {
     use multilinear::gkr_lockstep::StepFault;
-    for fault in [StepFault::SwapHalves, StepFault::SwapLoHi, StepFault::SwapPlane] {
+    for fault in [
+        StepFault::SwapHalves,
+        StepFault::SwapLoHi,
+        StepFault::SwapPlane,
+    ] {
         for t in 0..3 {
             ARGUE_FAULTS.with(|f| {
                 f.set(ProverFaults {
@@ -1259,7 +1307,10 @@ fn the_two_layer_leg_refuses_a_departing_step() {
                 |run| (run.host.clone().map(|_| ()), run.execute().is_ok()),
             );
             ARGUE_FAULTS.with(|f| f.set(ProverFaults::default()));
-            assert!(host.is_err(), "{fault:?} on table {t}: the HOST accepted it");
+            assert!(
+                host.is_err(),
+                "{fault:?} on table {t}: the HOST accepted it"
+            );
             assert!(!executes, "{fault:?} on table {t}: the machine executed it");
         }
     }
@@ -1376,18 +1427,23 @@ fn the_leg_draws_the_hosts_stream_on_both_ladders() {
             ("packed", Fixture::packed),
         ] {
             for cap in [27u8, 0] {
-                with_run_on(fixture().on(ladder), cap, |_| {}, |run| {
-                    let what = format!("{ladder:?} {name} cap {cap}");
-                    run.host.clone().expect("the host verifies its own argue");
-                    let published = run
-                        .execute_with(true)
-                        .unwrap_or_else(|e| panic!("{what}: the leg must execute: {e}"));
-                    let machine_next = *published.last().expect("the next draw");
-                    assert_eq!(
-                        machine_next, run.host_next,
-                        "{what}: the machine's next draw is the host's"
-                    );
-                });
+                with_run_on(
+                    fixture().on(ladder),
+                    cap,
+                    |_| {},
+                    |run| {
+                        let what = format!("{ladder:?} {name} cap {cap}");
+                        run.host.clone().expect("the host verifies its own argue");
+                        let published = run
+                            .execute_with(true)
+                            .unwrap_or_else(|e| panic!("{what}: the leg must execute: {e}"));
+                        let machine_next = *published.last().expect("the next draw");
+                        assert_eq!(
+                            machine_next, run.host_next,
+                            "{what}: the machine's next draw is the host's"
+                        );
+                    },
+                );
             }
         }
     }

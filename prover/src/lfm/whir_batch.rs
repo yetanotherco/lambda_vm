@@ -259,7 +259,11 @@ pub fn emit_batched_argue(
         // Every step's relations, degree and counts: the host's own schedule,
         // from the heights and the format alone.
         let schedule = ladder_steps(&heights, form);
-        assert_eq!(ladder.len(), schedule.len(), "the ladder runs to the tallest tree");
+        assert_eq!(
+            ladder.len(),
+            schedule.len(),
+            "the ladder runs to the tallest tree"
+        );
         let mut running: Vec<(Ext, Ext)> = members
             .iter()
             .map(|&(_, tree)| proof.bus_outputs[tree])
@@ -318,7 +322,8 @@ pub fn emit_batched_argue(
             let expected = b.emul(eq_at, relation);
             b.assert_eq_ext(expected, residual);
 
-            let single_point: Vec<Ext> = std::iter::once(c1).chain(rounds.iter().copied()).collect();
+            let single_point: Vec<Ext> =
+                std::iter::once(c1).chain(rounds.iter().copied()).collect();
             let double_point: Option<Vec<Ext>> =
                 c2.map(|c2| [c1, c2].into_iter().chain(rounds.iter().copied()).collect());
             let mut at = 0;
@@ -863,9 +868,7 @@ pub(crate) fn hint_batched_shaped(
             ladder_steps(&tree_heights(plan, bin), ladder)
                 .iter()
                 .map(|step| LadderStepWires {
-                    sumcheck: (0..step.parent)
-                        .map(|_| take(b, step.degree))
-                        .collect(),
+                    sumcheck: (0..step.parent).map(|_| take(b, step.degree)).collect(),
                     halves: (0..step.halves())
                         .map(|_| {
                             let h = take(b, 4);
