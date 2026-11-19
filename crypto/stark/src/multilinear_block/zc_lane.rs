@@ -42,6 +42,11 @@ pub struct LaneLimits {
     /// Room kept free beside the held stores, the next commit's growth and the
     /// ledger's promise: a job's own session on the card.
     pub margin: u64,
+    /// Room kept below the ledger's budget for what the card holds outside
+    /// the ledger: a commit's predicted peak (the ledger now, and the largest
+    /// growth a commit has made) with the held stores stays under
+    /// `budget − unledgered`, or the lane lets stores go before the commit.
+    pub unledgered: u64,
 }
 
 impl Default for LaneLimits {
@@ -50,6 +55,7 @@ impl Default for LaneLimits {
             hold: 3,
             hold_bytes: None,
             margin: 5 << 29,
+            unledgered: 5 << 29,
         }
     }
 }
@@ -64,6 +70,8 @@ pub enum LaneDefer {
     Memory,
     /// Still queued when phase A's loop ended.
     Tail,
+    /// Let go before a commit whose predicted peak left no room for it.
+    Shed,
     /// No store on the card, and the host may not take it.
     NoStore,
 }
@@ -93,6 +101,7 @@ impl LaneState {
             Self::Deferred(LaneDefer::Hold) => "hold",
             Self::Deferred(LaneDefer::Memory) => "memory",
             Self::Deferred(LaneDefer::Tail) => "tail",
+            Self::Deferred(LaneDefer::Shed) => "shed",
             Self::Deferred(LaneDefer::NoStore) => "nostore",
             Self::Declined => "declined",
             Self::Failed => "failed",
@@ -122,6 +131,15 @@ pub struct ZcLaneStamp {
     /// On the last group only: what phase A's end waited for the lane (the
     /// job under way finishing).
     pub close_wait: f64,
+    /// Its constraint sumcheck ran to its end.
+    pub zc_ran: bool,
+    /// Its bins in the argue's plan, those whose ladders ran (the first ones,
+    /// in plan order), and their seconds on the lane.
+    pub bins: usize,
+    pub bins_ran: usize,
+    pub ladders: f64,
+    /// What this group's commit waited for the lane's unit under way.
+    pub commit_wait: f64,
 }
 
 /// A group's merge probe in phase B ([`CsProbe::merge`]).
@@ -168,8 +186,16 @@ where
     jobs: VecDeque<LaneJob<'a, F, E>>,
     /// The store bytes of the job under way.
     running: Option<u64>,
+    /// A unit of the job under way (a bin's ladder, or the constraint
+    /// sumcheck) is on the card: no commit starts until it ends.
+    unit: bool,
+    /// A commit asked the job under way to let its store go at its next unit
+    /// boundary.
+    shed: bool,
     closing: bool,
     stamps: Vec<(usize, ZcLaneStamp)>,
+    /// What each group's commit waited for a unit, by group.
+    commit_waits: Vec<(usize, f64)>,
 }
 
 /// The lane ([`CsProbeMode::Lane`]): shared by phase A's committer, which
@@ -187,6 +213,9 @@ where
     decided: Option<Arc<AtomicUsize>>,
     bin_log_cells: u8,
     pack: GkrPack,
+    /// The argue's GKR ladder (one tree layer a step, or two).
+    ladder: multilinear::gkr_lockstep::GkrLadder,
+    work: LaneWork,
     /// A commit is in flight: no job starts.
     committing: AtomicBool,
     /// The most a commit has grown the ledger so far (bytes).
@@ -208,6 +237,7 @@ where
         let ArgueFormat::Batched {
             bin_log_cells,
             pack,
+            ladder,
         } = config.format.argue
         else {
             return None;
@@ -219,13 +249,21 @@ where
             decided: probe.decided.clone(),
             bin_log_cells,
             pack,
+            ladder,
+            work: match probe.mode {
+                CsProbeMode::Lane(work) => work,
+                _ => LaneWork::Zc,
+            },
             committing: AtomicBool::new(false),
             max_growth: AtomicU64::new(0),
             queue: Mutex::new(LaneQueue {
                 jobs: VecDeque::new(),
                 running: None,
+                unit: false,
+                shed: false,
                 closing: false,
                 stamps: Vec::new(),
+                commit_waits: Vec::new(),
             }),
             wake: Condvar::new(),
         })
@@ -245,10 +283,58 @@ where
         }
     }
 
-    /// A commit begins: no job starts until it ends.
-    pub(super) fn commit_begins(&self) {
+    /// Whether a commit starting now, with the ledger at `reserved`, would
+    /// pass `budget − unledgered` at its predicted peak.
+    fn over(&self, reserved: u64) -> bool {
+        let budget = multilinear::gpu::reserve_budget();
+        budget > 0
+            && reserved + self.max_growth.load(std::sync::atomic::Ordering::Relaxed)
+                > budget.saturating_sub(self.limits.unledgered)
+    }
+
+    /// Group `group`'s commit begins: no unit starts until it ends. It waits
+    /// for the unit under way, and before it lets queued stores go, oldest
+    /// first, while its predicted peak would pass `budget − unledgered`; if
+    /// that is not enough, the job under way lets its store go at its unit
+    /// boundary, and the commit waits for that too.
+    pub(super) fn commit_begins(&self, group: usize) {
+        let waited = Instant::now();
+        let mut queue = self.lock();
         self.committing
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        while queue.unit {
+            queue = self
+                .wake
+                .wait_timeout(queue, Duration::from_millis(1))
+                .map(|(guard, _)| guard)
+                .unwrap_or_else(|e| e.into_inner().0);
+        }
+        while self.over(multilinear::gpu::ledger_reserved()) {
+            let Some(job) = queue.jobs.pop_front() else {
+                break;
+            };
+            let mut stamp = job.stamp;
+            stamp.state = LaneState::Deferred(LaneDefer::Shed);
+            queue.stamps.push((job.group, stamp));
+            // Its store goes now, before the ledger is read again.
+            drop(job.tables);
+            self.decide();
+        }
+        if queue.running.is_some() && self.over(multilinear::gpu::ledger_reserved()) {
+            queue.shed = true;
+            self.wake.notify_all();
+            while queue.running.is_some() {
+                queue = self
+                    .wake
+                    .wait_timeout(queue, Duration::from_millis(1))
+                    .map(|(guard, _)| guard)
+                    .unwrap_or_else(|e| e.into_inner().0);
+            }
+        }
+        queue.shed = false;
+        queue
+            .commit_waits
+            .push((group, waited.elapsed().as_secs_f64()));
     }
 
     /// The commit ended.
@@ -300,7 +386,7 @@ where
                 && multilinear::gpu::ledger_reserved()
                     + self.max_growth.load(std::sync::atomic::Ordering::Relaxed)
                     + self.limits.margin
-                    > budget)
+                    > budget.saturating_sub(self.limits.unledgered))
         {
             Some(LaneDefer::Memory)
         } else {
@@ -366,6 +452,7 @@ where
             queue.running = None;
             queue.stamps.push((group, stamp));
             drop(queue);
+            self.wake.notify_all();
             self.decide();
         }
         // What was still queued at phase A's end: dropped, its stores with it.
@@ -377,6 +464,52 @@ where
             drop(job.tables);
             self.decide();
         }
+    }
+
+    /// Starts a unit of the job under way once no commit is in flight:
+    /// `Ok(())`, or why the job stops here — phase A's loop ended
+    /// ([`LaneDefer::Tail`]), or a commit asked for the job's store
+    /// ([`LaneDefer::Shed`]).
+    fn begin_unit(&self) -> Result<(), LaneDefer> {
+        let mut queue = self.lock();
+        loop {
+            if queue.closing {
+                return Err(LaneDefer::Tail);
+            }
+            if queue.shed {
+                return Err(LaneDefer::Shed);
+            }
+            if !self.committing.load(std::sync::atomic::Ordering::SeqCst) {
+                queue.unit = true;
+                return Ok(());
+            }
+            queue = self
+                .wake
+                .wait_timeout(queue, Duration::from_millis(1))
+                .map(|(guard, _)| guard)
+                .unwrap_or_else(|e| e.into_inner().0);
+        }
+    }
+
+    /// The unit under way ended: a waiting commit may start.
+    fn end_unit(&self) {
+        self.lock().unit = false;
+        self.wake.notify_all();
+    }
+
+    /// A throwaway transcript for group `group`'s part `part` of a job.
+    fn transcript<T>(group: usize, part: u64, roots: &[Commitment]) -> T
+    where
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+    {
+        let mut transcript = T::default();
+        transcript.append_bytes(LANE_LABEL);
+        transcript.append_bytes(&(group as u64).to_le_bytes());
+        transcript.append_bytes(&part.to_le_bytes());
+        for root in roots {
+            transcript.append_bytes(root);
+        }
+        transcript
     }
 
     fn run_job<T>(&self, job: LaneJob<'a, F, E>) -> (usize, ZcLaneStamp)
@@ -391,50 +524,129 @@ where
             mut stamp,
         } = job;
         stamp.started_at = self.secs(Instant::now());
-        let mut transcript = T::default();
-        transcript.append_bytes(LANE_LABEL);
-        transcript.append_bytes(&(group as u64).to_le_bytes());
-        for root in &roots {
-            transcript.append_bytes(root);
-        }
         let at = if on_card { Where::Device } else { Where::Host };
-        let probed = batched::probe_constraint_sumcheck(
-            &tables,
-            self.bin_log_cells,
-            self.pack,
-            at,
-            self.host,
-            true,
-            &mut transcript,
-        );
+        let mut state = LaneState::Ran;
+        if self.work.ladders() {
+            // One bin of the argue's plan at a time, on throwaway challenges;
+            // no bin starts while a commit is in flight, none after phase A.
+            stamp.bins = batched::argue_bins(&tables, self.bin_log_cells, self.pack);
+            for bin in 0..stamp.bins {
+                if let Err(why) = self.begin_unit() {
+                    state = LaneState::Deferred(why);
+                    break;
+                }
+                let mut transcript = Self::transcript::<T>(group, 1 + bin as u64, &roots);
+                let z: FieldElement<E> = transcript.sample_field_element();
+                let alpha: FieldElement<E> = transcript.sample_field_element();
+                let beta: FieldElement<E> = transcript.sample_field_element();
+                let tick = Instant::now();
+                let ran = batched::prove_argue(
+                    &tables,
+                    &z,
+                    &alpha,
+                    &beta,
+                    self.bin_log_cells,
+                    self.pack,
+                    self.ladder,
+                    &mut transcript,
+                    ProverFaults {
+                        ladders_only: true,
+                        only_bin: Some(bin),
+                        ..ProverFaults::default()
+                    },
+                    at,
+                );
+                self.end_unit();
+                match ran {
+                    Err(MlError::DeviceFailed {
+                        stage: batched::LADDERS_ONLY_DONE,
+                    }) => {
+                        stamp.bins_ran += 1;
+                        stamp.ladders += tick.elapsed().as_secs_f64();
+                    }
+                    other => {
+                        for table in &tables {
+                            table.trace().release_device();
+                        }
+                        static SAID: std::sync::Once = std::sync::Once::new();
+                        SAID.call_once(|| {
+                            eprintln!(
+                                "BLOCK ZC LANE: group {group} bin {bin}: ladders not run: {:?}",
+                                other.err()
+                            )
+                        });
+                        // Off the host, a tree the card would not build is the
+                        // format's to run in phase B: declined, not failed.
+                        state = if self.host {
+                            LaneState::Failed
+                        } else {
+                            LaneState::Declined
+                        };
+                        break;
+                    }
+                }
+            }
+        }
+        if self.work.zc() && state == LaneState::Ran {
+            if let Err(why) = self.begin_unit() {
+                state = LaneState::Deferred(why);
+            } else {
+                let mut transcript = Self::transcript::<T>(group, 0, &roots);
+                let probed = batched::probe_constraint_sumcheck(
+                    &tables,
+                    self.bin_log_cells,
+                    self.pack,
+                    at,
+                    self.host,
+                    true,
+                    &mut transcript,
+                );
+                self.end_unit();
+                state = match probed {
+                    Ok(probe) => {
+                        stamp.on_card = probe.on_card;
+                        stamp.setup = probe.setup;
+                        stamp.rounds = probe.rounds;
+                        stamp.host_tail = probe.host_tail;
+                        stamp.zc_ran = true;
+                        LaneState::Ran
+                    }
+                    Err(MlError::DeviceFailed {
+                        stage: batched::PROBE_DECLINED,
+                    }) => LaneState::Declined,
+                    Err(error) => {
+                        static SAID: std::sync::Once = std::sync::Once::new();
+                        SAID.call_once(|| {
+                            eprintln!("BLOCK ZC LANE: group {group} failed: {error:?}")
+                        });
+                        LaneState::Failed
+                    }
+                };
+            }
+        }
         drop(tables);
         stamp.ended_at = self.secs(Instant::now());
-        stamp.state = match probed {
-            Ok(probe) => {
-                stamp.on_card = probe.on_card;
-                stamp.setup = probe.setup;
-                stamp.rounds = probe.rounds;
-                stamp.host_tail = probe.host_tail;
-                LaneState::Ran
-            }
-            Err(MlError::DeviceFailed {
-                stage: batched::PROBE_DECLINED,
-            }) => LaneState::Declined,
-            Err(error) => {
-                static SAID: std::sync::Once = std::sync::Once::new();
-                SAID.call_once(|| eprintln!("BLOCK ZC LANE: group {group} failed: {error:?}"));
-                LaneState::Failed
-            }
-        };
+        stamp.state = state;
         (group, stamp)
     }
 
     /// Every group's stamp, once the lane's thread has ended.
     pub(super) fn into_stamps(self) -> Vec<(usize, ZcLaneStamp)> {
-        self.queue
-            .into_inner()
-            .unwrap_or_else(|e| e.into_inner())
-            .stamps
+        let queue = self.queue.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut stamps = queue.stamps;
+        for (group, wait) in queue.commit_waits {
+            match stamps.iter_mut().find(|(g, _)| *g == group) {
+                Some((_, stamp)) => stamp.commit_wait = wait,
+                None => stamps.push((
+                    group,
+                    ZcLaneStamp {
+                        commit_wait: wait,
+                        ..Default::default()
+                    },
+                )),
+            }
+        }
+        stamps
     }
 }
 
@@ -491,10 +703,12 @@ where
 /// The lane's lines for the block's readout ([`CsProbeMode::Lane`]): one a
 /// group, then the sum. Empty when the lane was off.
 ///
-/// The hidden credit is the sum, over the groups whose job ran to its end in
-/// phase A, of that group's own constraint sumcheck in phase B
-/// ([`GroupStamps::zc_b`]): what a format that ran it in phase A would no
-/// longer run in phase B.
+/// The hidden credit is the sum, over the groups whose constraint sumcheck
+/// ran to its end in phase A, of that group's own constraint sumcheck in
+/// phase B ([`GroupStamps::zc_b`]): what a format that ran it in phase A would
+/// no longer run in phase B. The ladders' hidden credit is the same for the
+/// ladders: over every bin whose ladder ran on the lane, that bin's own trees
+/// and ladder in phase B ([`GroupStamps::bins_b`]).
 #[doc(hidden)]
 pub fn zc_lane_lines(stamps: &[GroupStamps]) -> String {
     if stamps.iter().all(|g| g.zc_lane.state == LaneState::Off) {
@@ -507,7 +721,8 @@ pub fn zc_lane_lines(stamps: &[GroupStamps]) -> String {
         out.push_str(&format!(
             "BLOCK ZC LANE: group {g} · committed at {:.3}s · job {:.3}s to {:.3}s · card {:.3}s \
              (setup {:.3}, rounds {:.3}, host tail {:.3}) · {} · tables {} ({} on the card) · \
-             store {} MiB · held ahead {} · zc in phase B {:.3}s\n",
+             store {} MiB · held ahead {} · zc in phase B {:.3}s · bins {}/{} · ladders {:.3}s (phase B \
+             {:.3}s, of the bins run here {:.3}s)\n",
             l.committed_at,
             l.started_at,
             l.ended_at,
@@ -521,6 +736,11 @@ pub fn zc_lane_lines(stamps: &[GroupStamps]) -> String {
             mib(l.store_bytes),
             l.ahead,
             s.zc_b,
+            l.bins_ran,
+            l.bins,
+            l.ladders,
+            s.bins_b.iter().fold(0.0, |a, b| a + b),
+            ladders_credit(s),
         ));
     }
     let count = |state: LaneState| stamps.iter().filter(|g| g.zc_lane.state == state).count();
@@ -540,13 +760,20 @@ pub fn zc_lane_lines(stamps: &[GroupStamps]) -> String {
         .iter()
         .filter(|g| matches!(g.zc_lane.state, LaneState::Deferred(_)))
         .count();
-    let hidden = sum(&|g| g.zc_b, &ran);
+    let hidden = stamps
+        .iter()
+        .filter(|g| g.zc_lane.zc_ran)
+        .map(|g| g.zc_b)
+        .fold(0.0, |a, b| a + b);
+    let total = |f: &dyn Fn(&GroupStamps) -> f64| stamps.iter().map(f).fold(0.0, |a, b| a + b);
     let peak = stamps.iter().map(|g| g.commit_reserved).max().unwrap_or(0);
     out.push_str(&format!(
         "BLOCK ZC LANE SUM: groups {} · ran {} · deferred {} (hold {} · memory {} · tail {} · no store {}) · \
          declined {} · failed {} · hidden credit {:.3}s · lane card {:.3}s (setup {:.3}, rounds {:.3}, host tail \
          {:.3}) · zc in phase B {:.3}s (of groups not run {:.3}s) · last job ended at {:.3}s · phase A's end \
-         waited {:.3}s · phase-A ledger peak {} MiB · deferred groups [{}]\n",
+         waited {:.3}s · phase-A ledger peak {} MiB · deferred groups [{}] · ladders: bins {} of {} · lane \
+         ladders {:.3}s · ladders hidden credit {:.3}s · ladders in phase B {:.3}s · lane busy {:.3}s · shed {} · commits \
+         waited {:.3}s (most {:.3}s)\n",
         stamps.len(),
         ran.len(),
         deferred,
@@ -573,8 +800,27 @@ pub fn zc_lane_lines(stamps: &[GroupStamps]) -> String {
             .map(|(i, g)| format!("{i}:{}:{:.3}", g.zc_lane.state.word(), g.zc_b))
             .collect::<Vec<_>>()
             .join(" "),
+        stamps.iter().map(|g| g.zc_lane.bins_ran).sum::<usize>(),
+        stamps.iter().map(|g| g.zc_lane.bins).sum::<usize>(),
+        total(&|g| g.zc_lane.ladders),
+        total(&ladders_credit),
+        total(&|g| g.bins_b.iter().fold(0.0, |a, b| a + b)),
+        total(&|g| (g.zc_lane.ended_at - g.zc_lane.started_at).max(0.0)),
+        count(LaneState::Deferred(LaneDefer::Shed)),
+        total(&|g| g.zc_lane.commit_wait),
+        stamps.iter().map(|g| g.zc_lane.commit_wait).fold(0.0, f64::max),
     ));
     out
+}
+
+/// A group's ladders' hidden credit: its phase-B bins' own seconds over the
+/// bins whose ladders ran on the lane (the first ones, in plan order).
+fn ladders_credit(stamps: &GroupStamps) -> f64 {
+    stamps
+        .bins_b
+        .iter()
+        .take(stamps.zc_lane.bins_ran)
+        .fold(0.0, |a, b| a + b)
 }
 
 /// The merge probe's lines for the block's readout ([`CsProbe::merge`]): the
