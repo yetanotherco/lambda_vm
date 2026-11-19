@@ -4693,6 +4693,22 @@ pub(crate) fn first_page_index(airs: &VmAirs) -> Result<usize, Error> {
     }
 }
 
+/// The pages [`block_airs`] builds a PAGE AIR for under `memory`: under the
+/// word memory format none, its page tables
+/// ([`VmAirs::with_word_memory_at`]) built straight from the page list in
+/// their place, so a stated page table costs one AIR at any page run; under any
+/// other format every listed page.
+pub(crate) fn page_air_pages(
+    memory: crate::tables::fused_memory::MemoryFormat,
+    page_configs: &[crate::tables::page::PageConfig],
+) -> &[crate::tables::page::PageConfig] {
+    if memory == crate::tables::fused_memory::MemoryFormat::Words {
+        &[]
+    } else {
+        page_configs
+    }
+}
+
 /// The page traces a build made, `pages` of them, against the AIR set's page
 /// tables: one each, or the build cut its pages otherwise than the format.
 pub(crate) fn check_page_traces(airs: &VmAirs, pages: usize) -> Result<(), Error> {
@@ -6002,7 +6018,7 @@ pub(crate) fn prove_traces(
     let mut airs = block_airs(
         program,
         proof_options,
-        &traces.page_configs,
+        page_air_pages(format.memory, &traces.page_configs),
         &table_counts,
         &inputs,
         format.keccak_rnd,
@@ -7244,7 +7260,7 @@ fn lay_out_rest<'a>(
         let mut airs = block_airs(
             program,
             opts,
-            &traces.page_configs,
+            page_air_pages(format.memory, &traces.page_configs),
             &table_counts,
             &inputs,
             format.keccak_rnd,
@@ -7533,7 +7549,7 @@ fn lay_out_rest_streamed<'a>(
             let mut airs = block_airs(
                 program,
                 opts,
-                &header.page_configs,
+                page_air_pages(memory, &header.page_configs),
                 &header.table_counts,
                 &inputs,
                 keccak_rnd,
@@ -10202,10 +10218,12 @@ pub(crate) fn block_frame(
         cpu_heights,
         statement.public_output,
     )?;
+    // Under the word memory format no PAGE AIR a listed page: the page tables
+    // are built straight from the list.
     let mut airs = block_airs(
         &program,
         proof_options,
-        &page_configs,
+        page_air_pages(format.memory, &page_configs),
         statement.table_counts,
         &inputs,
         format.keccak_rnd,
