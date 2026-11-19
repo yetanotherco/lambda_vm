@@ -10463,7 +10463,7 @@ pub(crate) fn block_frame(
     })
 }
 
-/// ★ The frame's static check of local lookups, over the verifier's own AIR
+/// The frame's static check of local lookups, over the verifier's own AIR
 /// set: no table before `base` receives on a local bus, and every table from
 /// `base` on is a LOCAL_BYTES table of 2^16 rows. With the multilinear
 /// verifier's own check that every local receiver reads fixed columns only,
@@ -10505,7 +10505,7 @@ pub(crate) fn check_local_airs(
     Ok(())
 }
 
-/// ★ Where the LOCAL_BYTES tables sit: every group holding a local sender
+/// Where the LOCAL_BYTES tables sit: every group holding a local sender
 /// (`senders[i]`, table `i` sends a local lookup) ends with exactly one, the
 /// `j`-th such group with table `base + j`; no other group holds one; and
 /// there is one a group with a local sender, no more. So each group's local

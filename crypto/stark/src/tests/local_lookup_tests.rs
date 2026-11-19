@@ -600,7 +600,7 @@ fn false_tuple_received(fixed: bool) -> Block {
 
 // ── round trips ──────────────────────────────────────────────────────────
 
-/// ★ The block proves and verifies under local lookups, under every packing
+/// The block proves and verifies under local lookups, under every packing
 /// and a bin cap that puts every tree in one bin or each in its own; the
 /// groups with local interactions carry a local argue, the other an empty
 /// one.
@@ -643,7 +643,7 @@ fn the_device_prover_proves_the_host_bytes_under_local_lookups() {
     assert_eq!(bytes(&host), bytes(&device));
 }
 
-/// ★ Off is today: a block proved without local lookups carries no local
+/// Off is today: a block proved without local lookups carries no local
 /// argue; and under local lookups a group with no local interaction argues
 /// exactly as today (its fork, its weights, its bytes).
 #[test]
@@ -669,7 +669,7 @@ fn sample_layout() -> StackedLayout {
     StackedLayout::build(&[4, 4, 4], 5).unwrap()
 }
 
-/// ★ Steps L0–L5 spelled out by hand: the commit-time prefix, every root,
+/// The local transcript spelled out by hand: the commit-time prefix, every root,
 /// `z0`, every answer, the label, every digest, THEN `z_g` and `α_g`; `z0`
 /// is the commit-time point itself.
 #[test]
@@ -824,7 +824,7 @@ fn local_lookups_weight_table_t_by_lambda_to_the_five_t() {
 
 // ── forgeries ────────────────────────────────────────────────────────────
 
-/// ★ A false tuple with honest counts is refused by the group's local
+/// A false tuple with honest counts is refused by the group's local
 /// balance; with that check off (the mutant) it verifies: the local balance
 /// is what refuses it.
 #[test]
@@ -852,7 +852,7 @@ fn a_false_local_lookup_is_refused_by_the_local_balance() {
     .expect("the mutant without the local balance accepts the false tuple");
 }
 
-/// ★ A receiver of a local bus that reads committed columns (the verifier
+/// A receiver of a local bus that reads committed columns (the verifier
 /// fixes none of the RECV's) is refused by the static check before anything
 /// is read; with the check off (the mutant), a false tuple balanced through
 /// it verifies — so the check is soundness-bearing.
@@ -884,7 +884,7 @@ fn a_dynamic_local_receiver_is_refused_by_the_static_check() {
     .expect("the mutant without the static check accepts the false tuple");
 }
 
-/// ★ A RECV whose fixed column is wrong where a false tuple is received:
+/// A RECV whose fixed column is wrong where a false tuple is received:
 /// the local balance holds, `check_preprocessed` refuses it, and with that
 /// check off (the mutant) it verifies.
 #[test]
@@ -985,7 +985,7 @@ fn group_one_sum(columns: &[Vec<Vec<FE>>], z: &EE, alpha: &EE, constants: Option
     sum
 }
 
-/// ★ Draw `(z_g, α_g)` before the group's roots and answers (the mutant
+/// Draw `(z_g, α_g)` before the group's roots and answers (the mutant
 /// binding, on both sides) and a prover fixes its multiplicities after the
 /// draw: three RECV counts moved so a false tuple balances. The mutant
 /// verifier accepts it; the real one, whose challenges come after the roots
@@ -1069,7 +1069,7 @@ fn as_constant(x: FE) -> i64 {
     signed
 }
 
-/// ★ A statement constant a local lookup reads, left out of the digests (the
+/// A statement constant a local lookup reads, left out of the digests (the
 /// mutant, on both sides): the prover sees `(z_g, α_g)`, then picks the three
 /// constants that balance a false tuple. The mutant accepts; the real
 /// digests bind the constants, so the same proof — and the same block
@@ -1231,7 +1231,7 @@ fn the_local_pairs_in_the_constraint_phase_are_bound() {
     }
 }
 
-/// ★ Format confusion both ways: a local proof read by today's verifier, and
+/// Format confusion both ways: a local proof read by today's verifier, and
 /// today's proof read by a local verifier, are refused.
 #[test]
 fn local_and_todays_proofs_are_refused_by_the_other_format() {
@@ -1333,7 +1333,7 @@ fn a_local_argue_moved_to_another_group_is_refused() {
     assert!(verify_local(&airs, &block, &config, &proved).is_err());
 }
 
-/// Step B0 is on both sides: a verifier whose forks skip the local state
+/// The local state goes into each fork on both sides: a verifier whose forks skip the local state
 /// refuses an honest proof.
 #[test]
 fn each_groups_fork_absorbs_its_local_state_first() {
@@ -1358,7 +1358,7 @@ fn each_groups_fork_absorbs_its_local_state_first() {
     );
 }
 
-/// ★ A group's local receiver counting another group's sends: group 1's RECV
+/// A group's local receiver counting another group's sends: group 1's RECV
 /// counts nothing, group 2's counts group 1's sends too. Both groups'
 /// local balances refuse it (group 1 first), though the block as a whole
 /// balances.

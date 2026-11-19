@@ -345,23 +345,24 @@ where
     Ok((z0, transcript))
 }
 
-/// The label of a group's local lookups in its local transcript (step L4).
+/// The label of a group's local lookups in its local transcript, absorbed
+/// before its tables' digests.
 /// 32 bytes, so what follows starts on a felt boundary.
 pub const LOCAL_LOGUP_LABEL: &[u8; 32] = b"LAMBDAVM_WHIR_BLOCK_LOCAL_LOGUP1";
 
 /// The label that opens a table's digest ([`table_digest`]). 32 bytes.
 pub const TABLE_DIGEST_LABEL: &[u8; 32] = b"LAMBDAVM_WHIR_BLOCK_TABLE_DIGEST";
 
-/// ★★ WHERE GROUP `g`'s LOCAL CHALLENGES `(z_g, α_g)` COME FROM — the only
-/// place, called by the prover and the verifier (steps L0–L5).
+/// WHERE GROUP `g`'s LOCAL CHALLENGES `(z_g, α_g)` COME FROM — the only
+/// place, called by the prover and the verifier.
 ///
 /// The group's commit-time out-of-domain transcript ([`commit_ood_transcript`]:
 /// the prefix, its roots, `z0` drawn and refused inside the domain),
 /// continued: every commit-time answer of the group in polynomial order, then
 /// [`LOCAL_LOGUP_LABEL`] and every table's digest in the group's order
 /// ([`table_digest`]), then `z_g` and `α_g`. The transcript is returned for
-/// the group's local ladders (step L6), whose final state the group's fork
-/// absorbs before anything else (step B0).
+/// the group's local ladders, whose final state the group's fork absorbs
+/// before anything else.
 ///
 /// # Why the group's own challenges argue its local lookups
 ///
@@ -421,7 +422,7 @@ where
     Ok((z, alpha, transcript))
 }
 
-/// ★ A table's digest: everything a group's local lookups read of its
+/// A table's digest: everything a group's local lookups read of its
 /// definition, hashed with the block's transcript hash — [`TABLE_DIGEST_LABEL`],
 /// then as little-endian `u64` words its height in variables, its committed
 /// width, its preprocessed count and its interaction count, then per
@@ -3955,9 +3956,9 @@ where
                                     argue.at,
                                 )?,
                                 Some(local) => {
-                                    // Steps L0–L6 on the group's own
-                                    // transcript, then B0: its state into
-                                    // the fork before anything else.
+                                    // The local challenges and ladders on
+                                    // the group's own transcript, then its
+                                    // state into the fork before anything else.
                                     let (z_g, alpha_g, mut own) = local_challenges::<E, T>(
                                         g,
                                         group_layout,
@@ -4495,9 +4496,10 @@ where
                 let trees = stacked_eval::round0_trees(layout.num_polys(), config).len();
                 let reduced = match local {
                     Some(local) if group_is_local(group_statements, local.buses) => {
-                        // L0–L5 from the proof's roots and answers and the
-                        // verifier's own layout and digests; L6 and the local
-                        // balance; then B0 and the global class.
+                        // The local challenges from the proof's roots and
+                        // answers and the verifier's own layout and digests;
+                        // the local ladders and the local balance; then the
+                        // local state into the fork and the global class.
                         let (z_g, alpha_g, mut own) = local_challenges::<E, T>(
                             g,
                             layout,
