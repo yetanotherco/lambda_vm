@@ -398,6 +398,48 @@ fn a_balancing_output_is_refused_by_the_residual_alone_on_the_two_layer_ladder()
     );
 }
 
+/// ★ The diagonal forgery on the argue: a forged balance whose first
+/// two-layer step is shifted along the plane's diagonal, so step 0's residual
+/// holds for it and the plane at `c₂ = c₁` is the truth. A verifier that took
+/// `c₂ := c₁` would accept it; the second challenge refuses it at the next
+/// step — every table of the fixture goes on after step 0.
+#[test]
+fn the_diagonal_forgery_is_refused_on_the_argue() {
+    let airs = airs();
+    let cfg = double(27);
+    let mut cols = columns(3, 1);
+    cols[2][3][1] += FE::one();
+    let committed = commit(tables(&airs, &cols, false), &cfg);
+    for t in 0..3 {
+        let balanced = prove(
+            &committed,
+            &cfg,
+            ProverFaults {
+                balance_with: Some(t),
+                ..ProverFaults::default()
+            },
+        );
+        assert_eq!(
+            verify(&committed, &balanced, &cfg),
+            Err(MlError::LayerRelationMismatch { layer: 0 }),
+            "premise: table {t}'s forged balance alone fails step 0"
+        );
+        let forged = prove(
+            &committed,
+            &cfg,
+            ProverFaults {
+                diagonal: Some(t),
+                ..ProverFaults::default()
+            },
+        );
+        assert_eq!(
+            verify(&committed, &forged, &cfg),
+            Err(MlError::LayerRelationMismatch { layer: 1 }),
+            "table {t}: step 0 holds for the shifted halves, step 1 refuses them"
+        );
+    }
+}
+
 /// The packing's faults on the two-layer ladder: another packing, two chunks
 /// swapped, mass in a padding slot — each refused where the one-layer
 /// ladder refuses it.
