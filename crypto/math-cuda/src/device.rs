@@ -852,6 +852,8 @@ pub fn reserve_without_eviction(bytes: u64) -> Option<DeviceReservation> {
 /// - `input_layer_tree_impl`'s carry (`reserve(eager)`) is SPECULATIVE: its
 ///   `None` picks the lazy tree, still on the device;
 /// - a prefetch's (`input_layer_tree_deferred`) refusal only means no prefetch;
+/// - `DeviceColumns::upload_store`'s room (a retired prepared stack's store)
+///   moves nothing to the host: the reader copies twice on the card;
 /// - a kept input layer's tree (`truncated_tree`, `LAMBDA_VM_ARGUE_INPUT_REAL`)
 ///   is also speculative: its `None` builds today's tree instead;
 /// - `reserve_room`'s two callers keep the work on the device. `take_turn` opens

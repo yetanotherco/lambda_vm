@@ -156,16 +156,33 @@ impl DeviceColumns {
     /// `None` when the card will not promise the room, in which case every
     /// caller uploads its own copy as before.
     pub fn upload(columns: &[&[u64]]) -> Option<Self> {
+        Self::upload_on(columns, true)
+    }
+
+    /// [`Self::upload`] for a store off the argue surface (a retired prepared
+    /// stack's columns, for its revive and its opening): a refused room moves
+    /// no work to the host (the reader copies twice on the card instead), so
+    /// it is not a device fallback and is not counted as one, nor as argue
+    /// bytes.
+    pub fn upload_store(columns: &[&[u64]]) -> Option<Self> {
+        Self::upload_on(columns, false)
+    }
+
+    fn upload_on(columns: &[&[u64]], argue: bool) -> Option<Self> {
         if columns.is_empty() {
             return None;
         }
         let total: usize = columns.iter().map(|c| c.len()).sum();
         let be = backend().ok()?;
         let Some(room) = be.reserve(total as u64 * 8) else {
-            crate::device::note_device_fallback();
+            if argue {
+                crate::device::note_device_fallback();
+            }
             return None;
         };
-        crate::argue_probe::note_device(crate::argue_probe::Surface::Columns, total as u64 * 8);
+        if argue {
+            crate::argue_probe::note_device(crate::argue_probe::Surface::Columns, total as u64 * 8);
+        }
         let stream = be.next_stream();
         // SAFETY: every element is written by the copies below.
         let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, total) }.ok()?;
