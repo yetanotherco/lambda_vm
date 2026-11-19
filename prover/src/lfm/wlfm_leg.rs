@@ -662,7 +662,7 @@ pub fn wlfm_leg_group(
     let refs = airs.air_refs();
     let shapes = a.shapes(&airs);
     let (layouts, _) = child_frame(a, &shapes)?;
-    let cap = batched_cap(&a.config)?.ok_or("a W-LFM child argues batched")?;
+    let cap = child_planning(&a.config)?;
     let tables = a
         .groups()
         .get(g)
@@ -672,7 +672,8 @@ pub fn wlfm_leg_group(
     let table_shapes = owned.table_shapes();
     let mut words = Vec::new();
     super::whir_batch::push_batched_words(&mut words, argue);
-    let expected = super::whir_batch::batched_words(&table_shapes, &owned.argue_plan(cap));
+    let expected =
+        super::whir_batch::batched_words(&table_shapes, &owned.argue_plan(cap), cap.ladder());
     if words.len() != expected {
         return Err(format!(
             "group {g}'s batched argue carries {} words, its shapes {expected}",
