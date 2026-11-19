@@ -433,6 +433,7 @@ pub(super) fn verify_block(
         &mut transcript,
         false,
         checks,
+        None,
     )
 }
 
@@ -686,7 +687,7 @@ fn the_observer_hears_the_same_shares_in_order() {
         assert_eq!(groups, reversed, "{argue:?}: the order heard");
         assert_eq!(heard, heard_serial, "{argue:?}: the shares heard");
         // Each share as the proof carries it.
-        let (proof, argues, prepared, _, answers) = &serial;
+        let (proof, argues, prepared, _, answers, _) = &serial;
         let mut table = 0usize;
         let mut first_table = vec![0usize; n];
         for (g, &size) in SIZES.iter().enumerate() {

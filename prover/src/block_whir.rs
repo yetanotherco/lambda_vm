@@ -6231,7 +6231,7 @@ pub(crate) fn prove_traces(
         let phase_b_sched = phase_b_sched_from_env();
         stamps.phase_b_sched = phase_b_sched;
         let readbacks_before = multilinear::gpu::background_readbacks();
-        let (proof, argues, prepared_openings, groups, commit_ood) =
+        let (proof, argues, prepared_openings, groups, commit_ood, _) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block
                     .with_phase_b_overlap(phase_b_overlap(options))
@@ -9840,7 +9840,7 @@ fn prove_streamed(
         };
         let reorder: Option<&multilinear_block::PhaseBReorder<'_>> =
             lead.is_some().then_some(&lead_turn);
-        let (proof, argues, prepared_openings, groups, commit_ood) =
+        let (proof, argues, prepared_openings, groups, commit_ood, _) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
                 block
                     .with_phase_b_overlap(phase_b_overlap(options))
@@ -10734,6 +10734,7 @@ pub(crate) fn verify_block_whir_traced(
             &mut transcript,
             skip_prepared,
             argue_checks,
+            None,
         )
         .map_err(BlockRefusal::Proof)
     }))
