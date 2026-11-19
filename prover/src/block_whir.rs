@@ -3496,6 +3496,19 @@ impl BlockStamps {
             self.groups.iter().filter(|g| g.ahead_refused).count(),
             multilinear::gpu::room_commit_refusals(),
         ));
+        // The real card beside phase A's ledger: what the memory pool held
+        // before and after each group's commit (it keeps freed blocks, so the
+        // values only rise; a commit's growth is what it, and what ran beside
+        // it, took from the card beyond what the pool already held).
+        let pool: Vec<String> = self
+            .groups
+            .iter()
+            .map(|g| format!("{}/{}", mib(g.commit_pool_before), mib(g.commit_pool_after)))
+            .collect();
+        out.push_str(&format!(
+            "BLOCK PHASE-A POOL: per group reserved before/after its commit [{}] MiB\n",
+            pool.join(", "),
+        ));
         if let Some(p) = self.pinned {
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             out.push_str(&format!(
