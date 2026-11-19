@@ -222,7 +222,7 @@ pub fn count_keccak_rnd_rows<'i>(
     counts.bump_n(zero, n)
 }
 
-/// ★ THE REFERENCE COUNT: a table of `rows` rows whose main column `c` at row
+/// THE REFERENCE COUNT: a table of `rows` rows whose main column `c` at row
 /// `r` is `get(r, c)`, its local SENDS counted through their definitions:
 /// each send's multiplicity and tuple evaluated row by row, and the tuple's
 /// LOCAL_BYTES row bumped by the multiplicity. A tuple no row holds (a false
@@ -425,7 +425,7 @@ mod tests {
         assert!(!sends_local(&lean));
     }
 
-    /// ★ The counts from a table's records (its rounds replayed) are the
+    /// The counts from a table's records (its rounds replayed) are the
     /// counts from its columns through its interactions: a whole table, a
     /// chunk that starts and ends inside permutations, and a last chunk past
     /// the last permutation (its padding rows' `AreBytes[0, 0]`). The chunks
