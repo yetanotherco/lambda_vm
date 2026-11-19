@@ -3459,7 +3459,7 @@ impl BlockStamps {
                 .collect()
         };
         out.push_str(&format!(
-            "BLOCK PHASE-B LEDGER: budget {} MiB · per group base/argue/room/open [{}] MiB · open(g) beside argue(g+1) [{}] MiB{} · revive room refusals {} · turn refusals {} · GKR tree refusals {} · openings on the host {}\n",
+            "BLOCK PHASE-B LEDGER: budget {} MiB · per group base/argue/room/open [{}] MiB · open(g) beside argue(g+1) [{}] MiB{} · revive room refusals {} · turn refusals {} · GKR tree refusals {} · openings on the host {} · round-0 openings re-encoded on the host {} ({} stacks, {:.2} s)\n",
             mib(multilinear::gpu::reserve_budget()),
             per_group.join(", "),
             overlap.join(", "),
@@ -3468,6 +3468,9 @@ impl BlockStamps {
             multilinear::gpu::room_turn_refusals(),
             multilinear::gpu::gkr_tree_refusals(),
             multilinear::gpu::open_host_fallbacks(),
+            multilinear::gpu::open_host_reencodes().0,
+            multilinear::gpu::open_host_reencodes().1,
+            multilinear::gpu::open_host_reencodes().2,
         ));
         out.push_str(&self.overlap_line());
         if self.phase_b_sched {
