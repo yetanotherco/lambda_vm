@@ -135,6 +135,48 @@ extern "C" __global__ void b3w_leaves_base_coset_joint(
     h.finalize(out + at * 32);
 }
 
+// `b3w_leaves_base_coset_joint` one codeword at a time: step `k` of `blocks`
+// absorbs codeword `k`'s block `tid` into leaf `tid`'s chain, so the run's
+// codewords need not be alive together. The chain between steps is its 32-byte
+// chaining value, kept in the leaf's own node slot (`out` at `bitrev(tid)`, the
+// digest's place): step 0 starts from the prefix's midstate, a middle step
+// reads the slot and writes it back, the last step writes the digest over it.
+//
+// THE SAME BYTES as the one-launch kernel: a codeword's block is `2^log_block`
+// values of 8 bytes, a whole number of 64-byte blocks when `log_block >= 3`
+// (the host refuses less), so a codeword boundary is a block boundary. There
+// the one-launch chain holds a full pending block that the next value's push
+// compresses with no flags (it is not the last); a middle step compresses it
+// itself, with the same flags, and the next step resumes from the chaining
+// value with an empty block. The last block is finalized as before.
+extern "C" __global__ void b3w_leaves_base_coset_joint_step(
+    const uint64_t *__restrict__ cw, uint64_t blocks, uint64_t step, uint64_t num_leaves,
+    uint32_t log_block, uint32_t leaf_bits, uint8_t *__restrict__ out) {
+    __shared__ uint32_t midstate[8];
+    if (step == 0) {
+        if (threadIdx.x == 0) b3w_joint_midstate(blocks, log_block, midstate);
+        __syncthreads();
+    }
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    const uint64_t at = leaf_bits == 0 ? tid : (__brevll(tid) >> (64 - leaf_bits));
+    uint32_t *slot = reinterpret_cast<uint32_t *>(out + at * 32);
+    Blake3Chain h;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) h.cv[i] = step == 0 ? midstate[i] : slot[i];
+    h.block.init();
+    h.started = true;
+    const uint64_t per_block = 1ull << log_block;
+    for (uint64_t t = 0; t < per_block; ++t) h.push_felt(cw[tid + t * num_leaves]);
+    if (step + 1 < blocks) {
+        h.compress_pending();
+#pragma unroll
+        for (int i = 0; i < 8; ++i) slot[i] = h.cv[i];
+    } else {
+        h.finalize(out + at * 32);
+    }
+}
+
 // This module's joint-leaf midstate for `blocks` blocks of `2^log_block` base
 // values, as `b3w_leaves_base_coset_joint` computes it: the host checks it
 // against `joint_leaf_midstate` (tests/blake3_whir.rs).

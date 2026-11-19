@@ -3372,6 +3372,108 @@ pub fn commit_joint(
     ))
 }
 
+/// Streamed joint trees built ([`commit_joint_streamed`]), for tests.
+static JOINT_STREAMED_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many joint trees were built one codeword at a time.
+pub fn joint_streamed_builds() -> u64 {
+    JOINT_STREAMED_BUILDS.load(Ordering::Relaxed)
+}
+
+/// [`commit_joint`] one codeword at a time, under 7-round BLAKE3: codeword
+/// `k` of the run's `blocks` (2–4, each `elements` base values) comes from
+/// `encode(k)` (`None`: the encode declined, and so does this), is absorbed into every leaf's chain
+/// (`b3w_leaves_base_coset_joint_step`, the chain kept in the leaf's node
+/// slot) and is let go before codeword `k + 1` is encoded; then the inner
+/// levels. The same tree and root as [`commit_joint`] over the same codewords,
+/// with one codeword alive at a time instead of the run's. BLAKE3 only, and a
+/// fold block of at least 8 values (a codeword's block a whole number of
+/// 64-byte blocks).
+pub fn commit_joint_streamed(
+    blocks: usize,
+    elements: usize,
+    log_folding: usize,
+    hash: crate::DeviceHash,
+    placement: LeafPlacement,
+    mut encode: impl FnMut(usize) -> Option<DeviceCodeword>,
+) -> Result<(JointTree, [u8; 32])> {
+    ensure!(
+        hash == crate::DeviceHash::Blake3,
+        "a joint tree is streamed under 7-round BLAKE3 only"
+    );
+    ensure!((2..=4).contains(&blocks), "a joint tree is 2..=4 codewords");
+    ensure!(
+        log_folding >= 3,
+        "a streamed joint leaf needs blocks of at least 8 values"
+    );
+    ensure!(
+        elements.is_power_of_two() && elements >> log_folding >= 2,
+        "tree needs at least two leaves"
+    );
+    let num_leaves = elements >> log_folding;
+    let be = backend()?;
+    let stream = be.next_stream();
+    let total_nodes = crate::tree_nodes(hash, num_leaves);
+    // SAFETY: every leaf slot is written by step 0 before a later step reads
+    // it, and the inner nodes by the level loop after the last step.
+    let mut nodes = unsafe { alloc_or_trim::<u8>(&stream, total_nodes * 32) }?;
+    let leaves_offset = crate::leaves_offset(hash, num_leaves) * 32;
+    let leaf_bits = match placement {
+        LeafPlacement::Natural => 0,
+        LeafPlacement::Reversed => num_leaves.trailing_zeros(),
+    };
+    let kernel = &crate::blake3_whir::kernels()?.leaves_base_coset_joint_step;
+    let cfg = crate::blake3_whir::launch_cfg(num_leaves as u64);
+    let (blocks_u64, num_leaves_u64, log_block_u32) =
+        (blocks as u64, num_leaves as u64, log_folding as u32);
+    for k in 0..blocks {
+        let codeword = encode(k).ok_or_else(crate::invalid_value)?;
+        ensure!(
+            codeword.base && codeword.elements == elements,
+            "a joint tree's codewords are base and of one length"
+        );
+        // The codeword's encode, and the step before this one, are done
+        // before this step reads them.
+        codeword.stream.synchronize()?;
+        let step = k as u64;
+        {
+            let mut region = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
+            unsafe {
+                stream
+                    .launch_builder(kernel)
+                    .arg(codeword.buffer.as_ref())
+                    .arg(&blocks_u64)
+                    .arg(&step)
+                    .arg(&num_leaves_u64)
+                    .arg(&log_block_u32)
+                    .arg(&leaf_bits)
+                    .arg(&mut region)
+                    .launch(cfg)?;
+            }
+        }
+        // The step has read the codeword before it goes.
+        stream.synchronize()?;
+        drop(codeword);
+    }
+    LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
+    TREE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    JOINT_STREAMED_BUILDS.fetch_add(1, Ordering::Relaxed);
+    let head = crate::readback::clone_dtoh(&stream, &nodes.slice(0..32))?;
+    stream.synchronize()?;
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&head);
+    Ok((
+        JointTree {
+            nodes,
+            stream,
+            num_leaves,
+            hash,
+        },
+        root,
+    ))
+}
+
 /// [`DeviceCodeword::block_subtrees_placed`] of a joint tree over `codewords`:
 /// each block's `4^dropped` leaves gathered from every codeword, hashed as
 /// joint leaves and built into one tree over the gathered leaves (the blocks'
