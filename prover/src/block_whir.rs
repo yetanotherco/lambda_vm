@@ -34,7 +34,8 @@ use multilinear::whir_chain::{ArgueFormat, ChainConfig, FinalPoly, GkrLadder, Gr
 use rayon::prelude::*;
 use stark::multilinear_block::{self, BlockCommitted, GroupStamps, block_groups};
 use stark::multilinear_table::{
-    BatchedArgue, CommittedTable, MultiProof, TableLayout, TableStatement, batched::VerifierChecks,
+    BatchedArgue, CommittedTable, MultiProof, TableLayout, TableStatement,
+    batched::{LocalArgue, VerifierChecks},
 };
 use stark::table::Table;
 use stark::trace::TraceTable;
@@ -45,6 +46,7 @@ use crate::multilinear_prove::{
 };
 use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
 use crate::tables::gpack::{self, TraceForm};
+use crate::tables::local_bytes::{self, LocalCounts};
 use crate::tables::trace_builder::{
     ChunkJob, CutPadding, RowFamilies, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
     head_log, parallel,
@@ -861,6 +863,56 @@ pub fn gkr_ladder_tag_word(ladder: GkrLadder) -> &'static str {
     }
 }
 
+/// The knob that proves and verifies the BLAKE3 base with KECCAK_RND's byte
+/// lookups argued per group ([`KeccakRndForm::LeanLocal`]); both sides of one
+/// process read it, and the tag names it (`/LL1`): see
+/// [`b3_base_local_setting`]. The BLAKE3 base's alone.
+///
+/// [`KeccakRndForm::LeanLocal`]: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal
+pub const B3_BASE_LOCAL_ENV: &str = "LAMBDA_VM_B3_BASE_LOCAL";
+
+/// [`B3_BASE_LOCAL_ENV`]'s value: unset, `0` or `off` is off (today's
+/// format); `keccak` argues KECCAK_RND's byte lookups per group. Anything
+/// else is refused.
+pub fn b3_base_local_setting(value: Option<&str>) -> Result<bool, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(false),
+        Some(v) => match v.as_str() {
+            "0" | "off" => Ok(false),
+            "keccak" => Ok(true),
+            other => Err(format!(
+                "{B3_BASE_LOCAL_ENV}={other:?}: expected 0, off or keccak"
+            )),
+        },
+    }
+}
+
+/// The BLAKE3 base's local lookups in this process ([`b3_base_local_setting`]
+/// of [`B3_BASE_LOCAL_ENV`]), read once; a refused value aborts the process
+/// at its first read, as [`b3_base_rounds`] does.
+pub fn b3_base_local() -> bool {
+    static LOCAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LOCAL.get_or_init(|| {
+        let value = match std::env::var(B3_BASE_LOCAL_ENV) {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(v)) => {
+                eprintln!("{B3_BASE_LOCAL_ENV}={v:?}: expected 0, off or keccak");
+                std::process::abort()
+            }
+        };
+        b3_base_local_setting(value.as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::abort()
+        })
+    })
+}
+
+/// The statement tag's word for local lookups: `/LL1` when the format argues
+/// KECCAK_RND's byte lookups per group, nothing otherwise. Domain separation
+/// only: the format is each side's own.
+pub const LOCAL_LOOKUPS_TAG: &[u8] = b"/LL1";
+
 /// The statement tag of a block proved under `format`: [`block_statement_tag`]
 /// of its base, and under the 7-round BLAKE3 base its group size too
 /// (`/G<n>`, the format's [`BlockFormat::group_polys`]), so no two BLAKE3
@@ -885,6 +937,9 @@ pub fn block_format_tag(format: &BlockFormat) -> Vec<u8> {
         return tag;
     }
     tag.extend_from_slice(gkr_ladder_tag_word(format.argue.ladder()).as_bytes());
+    if format.local_lookups() {
+        tag.extend_from_slice(LOCAL_LOOKUPS_TAG);
+    }
     tag
 }
 
@@ -964,13 +1019,35 @@ impl BlockFormat {
                 },
             ),
             group: GroupFold::Indexed,
-            keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
+            // KECCAK_RND's byte lookups argued per group under the BLAKE3
+            // base's knob ([`b3_base_local`]); the knob on any other base is
+            // a configuration error.
+            keccak_rnd: match (zf.base == BaseFormat::B3_WHIR, b3_base_local()) {
+                (true, true) => crate::tables::keccak_rnd::KeccakRndForm::LeanLocal,
+                (_, false) => crate::tables::keccak_rnd::KeccakRndForm::Lean,
+                (false, true) => {
+                    eprintln!(
+                        "{B3_BASE_LOCAL_ENV} asks for local lookups: they are the BLAKE3 base's alone"
+                    );
+                    std::process::abort()
+                }
+            },
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
             registers: crate::tables::register::RegisterFormat::InRow,
             memory: crate::tables::fused_memory::MemoryFormat::Fused,
             ecdas: crate::tables::ecdas::EcdasForm::Halves,
             page_run_log2: BLOCK_PAGE_RUN_LOG2,
         }
+    }
+
+    /// Whether this format argues local lookups per group: KECCAK_RND's byte
+    /// lookups under [`KeccakRndForm::LeanLocal`], each group that holds a
+    /// KECCAK_RND table ending with its LOCAL_BYTES table
+    /// ([`crate::tables::local_bytes`]).
+    ///
+    /// [`KeccakRndForm::LeanLocal`]: crate::tables::keccak_rnd::KeccakRndForm::LeanLocal
+    pub fn local_lookups(&self) -> bool {
+        self.keccak_rnd.byte_lookups_local()
     }
 
     /// [`production`](Self::production) with each group's stacked polynomials
@@ -2547,8 +2624,14 @@ pub const BLOCK_LAYOUT_AHEAD: usize = 8;
 /// The statement is [`crate::multilinear_prove::MultilinearVmProof`]'s; the
 /// proof is read under the block's forked schedule, and only by
 /// [`verify_block_whir`].
+///
+/// `L` is what the proof carries for local lookups ([`LocalPart`]): nothing
+/// (`()`, today's format and type, archived byte for byte as before it), or
+/// every group's local argue ([`LocalArgues`], under
+/// [`BlockFormat::local_lookups`]). A verifier reads it under its own format,
+/// never the proof's: a proof of the other kind is refused.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct BlockWhirProof {
+pub struct BlockWhirProof<L = ()> {
     pub proof: MultiProof<F, E>,
     /// Each table's height in variables, in [`VmAirs::air_refs`] order.
     pub table_num_vars: Vec<u8>,
@@ -2593,6 +2676,33 @@ pub struct BlockWhirProof {
     /// ([`word_counts_under`]). The last field, so a split or fused proof
     /// archives as before it with these counts after.
     pub word_memory: [u64; 7],
+    /// Local lookups' messages ([`LocalPart`]): `()` in today's format, which
+    /// archives as nothing, so today's proof keeps its bytes.
+    pub local: L,
+}
+
+/// Every group's local argue, in group order (empty for a group with no
+/// local interaction): what a proof under [`BlockFormat::local_lookups`]
+/// carries in [`BlockWhirProof::local`].
+pub type LocalArgues = Vec<LocalArgue<E>>;
+
+/// What a [`BlockWhirProof`] carries for local lookups: nothing, or every
+/// group's local argue.
+pub trait LocalPart {
+    /// The local argues, or `None` for a proof of today's format.
+    fn local_argues(&self) -> Option<&[LocalArgue<E>]>;
+}
+
+impl LocalPart for () {
+    fn local_argues(&self) -> Option<&[LocalArgue<E>]> {
+        None
+    }
+}
+
+impl LocalPart for LocalArgues {
+    fn local_argues(&self) -> Option<&[LocalArgue<E>]> {
+        Some(self)
+    }
 }
 
 /// Where a block's prove spent its time, for the readout. Seconds.
@@ -5267,6 +5377,67 @@ pub(crate) fn prove_block_whir_with(
         &|_| {},
         None,
     )
+    .and_then(todays)
+}
+
+/// A proof of today's format, from the prove chain's: one under local
+/// lookups is [`prove_block_whir_local`]'s, never handed out as today's.
+fn todays(
+    (proof, stamps): (BlockWhirProof<LocalArgues>, BlockStamps),
+) -> Result<(BlockWhirProof, BlockStamps), Error> {
+    if !proof.local.is_empty() {
+        return Err(Error::Prover(
+            "a block under local lookups is proved by prove_block_whir_local".to_string(),
+        ));
+    }
+    Ok((proof.with_local(()), stamps))
+}
+
+/// [`prove_block_whir`] under a format that argues local lookups per group
+/// ([`BlockFormat::local_lookups`]): the proof carries every group's local
+/// argue. Refuses any other format.
+pub fn prove_block_whir_local(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+) -> Result<(BlockWhirProof<LocalArgues>, BlockStamps), Error> {
+    prove_block_whir_local_with(
+        elf_bytes,
+        private_inputs,
+        proof_options,
+        format,
+        options,
+        &Deviations::default(),
+    )
+}
+
+/// [`prove_block_whir_local`] with a test's deviations.
+pub(crate) fn prove_block_whir_local_with(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    deviations: &Deviations,
+) -> Result<(BlockWhirProof<LocalArgues>, BlockStamps), Error> {
+    if !format.local_lookups() {
+        return Err(Error::Prover(
+            "prove_block_whir_local proves a format with local lookups".to_string(),
+        ));
+    }
+    prove_block_whir_inner(
+        elf_bytes,
+        private_inputs,
+        proof_options,
+        format,
+        options,
+        deviations,
+        &|_, _| {},
+        &|_| {},
+        None,
+    )
 }
 
 /// What a caller is handed when the statement is final — after phase A,
@@ -5352,6 +5523,7 @@ pub fn prove_block_whir_observed_led(
         on_group,
         lead,
     )
+    .and_then(todays)
 }
 
 /// The recursion's leaves, offered to phase B while it runs (the early leaf first),
@@ -5734,6 +5906,7 @@ pub(crate) fn prove_block_whir_observed_with(
         &|_| {},
         None,
     )
+    .and_then(todays)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5747,7 +5920,7 @@ fn prove_block_whir_inner(
     on_statement: StatementObserver<'_>,
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
-) -> Result<(BlockWhirProof, BlockStamps), Error> {
+) -> Result<(BlockWhirProof<LocalArgues>, BlockStamps), Error> {
     // The page-locked pool (`LAMBDA_VM_PINNED_POOL_GIB`), locked once in the
     // process: a caller that locked it before its own clock (the block tree)
     // finds it locked; any other has it locked here, before the build.
@@ -5884,7 +6057,7 @@ fn prove_block_whir_body(
     on_statement: StatementObserver<'_>,
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
-) -> Result<(BlockWhirProof, BlockStamps), Error> {
+) -> Result<(BlockWhirProof<LocalArgues>, BlockStamps), Error> {
     let mut stamps = BlockStamps::default();
     check_memory_format(format)?;
     refuse_unprovable(format)?;
@@ -5994,7 +6167,7 @@ fn prove_block_whir_body(
         on_statement,
         &mut stamps,
     )?;
-    Ok((proof, stamps))
+    Ok((proof.with_local(Vec::new()), stamps))
 }
 
 /// Cuts every KECCAK_RND table into tables of at most `2^rows_log2` rows, as
@@ -6384,6 +6557,7 @@ pub(crate) fn prove_traces(
         commit_ood: proof.3,
         fused_memory,
         word_memory,
+        local: (),
     })
 }
 
@@ -6427,6 +6601,10 @@ struct StreamAirs {
     /// The word families' AIRs ([`StreamTable::WORDS`]' order), for their
     /// streamed chunks.
     words: [crate::VmAir; 7],
+    /// KECCAK_RND's form, and the LOCAL_BYTES AIR its local lookups' groups
+    /// end with ([`BlockFormat::local_lookups`]).
+    keccak_rnd_form: crate::tables::keccak_rnd::KeccakRndForm,
+    local_bytes: crate::VmAir,
 }
 
 type DynAir = dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
@@ -6477,7 +6655,16 @@ impl StreamAirs {
                 Box::new(crate::test_utils::create_mem_store2w_air(opts)),
                 Box::new(crate::test_utils::create_memw_w_air(opts)),
             ],
+            keccak_rnd_form: keccak_rnd,
+            local_bytes: Box::new(create_local_bytes_air(opts)),
         }
+    }
+
+    /// A laid-out table's local sends counted ([`local_bytes::local_counts_of`]),
+    /// on the thread that laid it out; `None` outside local lookups or for a
+    /// table with none.
+    fn local_counts(&self, table: &CommittedTable<'_, F, E>) -> Result<Option<LocalCounts>, Error> {
+        local_counts_under(self.keccak_rnd_form, table)
     }
 
     /// The AIR streamed chunk `index` of `table`, `height` rows, is laid out
@@ -6539,6 +6726,68 @@ impl StreamAirs {
             word => self.words[word.word_family()?].as_ref(),
         })
     }
+}
+
+/// A laid-out table's local sends counted under `form`
+/// ([`local_bytes::local_counts_of`]); `None` when `form` sends no local
+/// lookup or the table sends none.
+fn local_counts_under(
+    form: crate::tables::keccak_rnd::KeccakRndForm,
+    table: &CommittedTable<'_, F, E>,
+) -> Result<Option<LocalCounts>, Error> {
+    if !form.byte_lookups_local() {
+        return Ok(None);
+    }
+    local_bytes::local_counts_of(table, form).map_err(Error::Prover)
+}
+
+/// Each table's digest ([`multilinear_block::table_digest`]) in the block's
+/// table order (`groups` concatenated), for the groups that hold a local
+/// sender; every other table's is never read and stays zero. `air_of(i)` is
+/// table `i`'s AIR, `shapes[i]` its `(width, height in variables)`. One
+/// function for both sides: the preprocessed count is the AIR's, which the
+/// prover and the verifier share.
+pub(crate) fn local_digests<'r, T>(
+    groups: &[Vec<u32>],
+    shapes: &[(usize, usize)],
+    air_of: impl Fn(usize) -> Option<AirRef<'r>>,
+) -> Result<Vec<[u8; 32]>, Error>
+where
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    let mut digests = Vec::new();
+    for group in groups {
+        let airs: Vec<AirRef<'r>> = group
+            .iter()
+            .map(|&i| {
+                air_of(i as usize).ok_or_else(|| Error::Prover(format!("table {i} has no AIR")))
+            })
+            .collect::<Result<_, _>>()?;
+        let local = airs
+            .iter()
+            .any(|air| local_bytes::sends_local(air.bus_interactions()));
+        for (&i, air) in group.iter().zip(&airs) {
+            if !local {
+                digests.push([0u8; 32]);
+                continue;
+            }
+            let &(width, num_vars) = shapes
+                .get(i as usize)
+                .ok_or_else(|| Error::Prover(format!("table {i} has no shape")))?;
+            let preprocessed = if air.is_preprocessed() {
+                air.num_precomputed_columns()
+            } else {
+                0
+            };
+            digests.push(multilinear_block::table_digest::<E, T>(
+                num_vars,
+                width,
+                preprocessed,
+                air.bus_interactions(),
+            ));
+        }
+    }
+    Ok(digests)
 }
 
 /// The name the run's AIR set gives chunk `index` of a streamed table.
@@ -6765,10 +7014,19 @@ fn keccak_rnd_positions(counts: &TableCounts, names: &[&str]) -> Result<Vec<usiz
 enum Key {
     Streamed(StreamTable, usize),
     Air(usize),
+    /// The `j`-th LOCAL_BYTES table, which closes its group: index `N + j`,
+    /// `N` the run's other tables.
+    Local(usize),
 }
 
-/// A table of the final build, laid out: its AIR index, shape and table.
-type Placed<'a> = (usize, (usize, usize), CommittedTable<'a, F, E>);
+/// A table of the final build, laid out: its AIR index, shape and table, and
+/// its local sends' counts ([`local_counts_under`]).
+type Placed<'a> = (
+    usize,
+    (usize, usize),
+    CommittedTable<'a, F, E>,
+    Option<LocalCounts>,
+);
 
 /// Packs tables, in the order they come, into groups of at most `max_polys`
 /// stacked polynomials, and sends each group to phase A as it closes. With
@@ -6798,6 +7056,34 @@ struct Packer<'a> {
     own: Option<OwnGroups<'a>>,
     /// Told ahead of BITWISE ([`close_before_bitwise`]).
     close_ahead: Option<std::sync::Arc<CloseAhead>>,
+    /// Under local lookups: each group with a local sender closes with its
+    /// LOCAL_BYTES table, over the group's counts.
+    local: Option<LocalPack<'a>>,
+}
+
+/// The packer's local lookups ([`BlockFormat::local_lookups`]): the open
+/// groups' counts and the LOCAL_BYTES tables made so far.
+struct LocalPack<'a> {
+    air: AirRef<'a>,
+    /// The main open group's counts, and KECCAK_RND's own open group's.
+    open: Option<LocalCounts>,
+    own: Option<LocalCounts>,
+    /// LOCAL_BYTES tables made: the next one's `j`.
+    made: usize,
+}
+
+impl LocalPack<'_> {
+    /// `counts` added to an open group's (`own`: KECCAK_RND's own).
+    fn add(&mut self, own: bool, counts: LocalCounts) -> Result<(), Error> {
+        let slot = if own { &mut self.own } else { &mut self.open };
+        match slot {
+            Some(sum) => sum.add(&counts).map_err(Error::Prover),
+            None => {
+                *slot = Some(counts);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// KECCAK_RND's streamed chunks packed apart from the other streamed chunks
@@ -6827,13 +7113,19 @@ impl<'a> Packer<'a> {
         key: Key,
         shape: (usize, usize),
         table: CommittedTable<'a, F, E>,
+        counts: Option<LocalCounts>,
     ) -> Result<(), Error> {
+        if counts.is_some() && self.local.is_none() {
+            return Err(Error::Prover(
+                "a local sender outside the format's local lookups".into(),
+            ));
+        }
         let place = self.own.as_mut().and_then(|own| match key {
             Key::Streamed(..) => {
                 own.placed += 1;
                 Some(own.placed - 1)
             }
-            Key::Air(_) => None,
+            Key::Air(_) | Key::Local(_) => None,
         });
         if let Some(own) = self.own.as_mut() {
             if let Key::Streamed(StreamTable::KeccakRnd, _) = key {
@@ -6856,6 +7148,11 @@ impl<'a> Packer<'a> {
                     bytes
                 });
                 own.bytes += bytes;
+                // Its counts join the group it joins (after any close above).
+                if let (Some(counts), Some(local)) = (counts, self.local.as_mut()) {
+                    local.add(true, counts)?;
+                }
+                let own = self.own.as_mut().expect("packed apart");
                 own.open.push(table);
                 own.keys.push(key);
                 own.places.push(place);
@@ -6888,6 +7185,10 @@ impl<'a> Packer<'a> {
                 .open
                 .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
             self.open_bytes += bytes;
+        }
+        // Its counts join the group it joins (after any close above).
+        if let (Some(counts), Some(local)) = (counts, self.local.as_mut()) {
+            local.add(false, counts)?;
         }
         self.open.push(table);
         self.open_keys.push(key);
@@ -6925,14 +7226,52 @@ impl<'a> Packer<'a> {
     }
 
     fn close(&mut self) -> Result<(), Error> {
-        let tables = std::mem::take(&mut self.open);
-        let keys = std::mem::take(&mut self.open_keys);
-        let bytes = std::mem::take(&mut self.open_bytes);
-        let places = self
+        let mut tables = std::mem::take(&mut self.open);
+        let mut keys = std::mem::take(&mut self.open_keys);
+        let mut bytes = std::mem::take(&mut self.open_bytes);
+        let mut places = self
             .own
             .as_mut()
             .map(|own| std::mem::take(&mut own.main_places));
+        let counts = self.local.as_mut().and_then(|local| local.open.take());
+        self.close_local(counts, &mut tables, &mut keys, &mut bytes, places.as_mut())?;
         self.send(tables, keys, bytes, places)
+    }
+
+    /// A group with a local sender closed with its LOCAL_BYTES table over
+    /// `counts`, its last table (key [`Key::Local`]); nothing without counts.
+    fn close_local(
+        &mut self,
+        counts: Option<LocalCounts>,
+        tables: &mut Vec<CommittedTable<'a, F, E>>,
+        keys: &mut Vec<Key>,
+        bytes: &mut usize,
+        places: Option<&mut Vec<Option<usize>>>,
+    ) -> Result<(), Error> {
+        let (Some(counts), Some(local)) = (counts, self.local.as_mut()) else {
+            return Ok(());
+        };
+        let mut trace = counts.trace();
+        let table = table_of(
+            local.air,
+            &mut trace,
+            (local_bytes::cols::NUM_COLUMNS, local_bytes::LOG_ROWS),
+            true,
+        )?;
+        if let Some(ledger) = self.ledger {
+            let b = memlog::table_bytes(&table);
+            ledger
+                .open
+                .fetch_add(b, std::sync::atomic::Ordering::Relaxed);
+            *bytes += b;
+        }
+        tables.push(table);
+        keys.push(Key::Local(local.made));
+        local.made += 1;
+        if let Some(places) = places {
+            places.push(None);
+        }
+        Ok(())
     }
 
     /// KECCAK_RND's own open group, closed and sent.
@@ -6940,11 +7279,19 @@ impl<'a> Packer<'a> {
         let Some(own) = self.own.as_mut() else {
             return Ok(());
         };
-        let tables = std::mem::take(&mut own.open);
-        let keys = std::mem::take(&mut own.keys);
-        let bytes = std::mem::take(&mut own.bytes);
-        let places = std::mem::take(&mut own.places);
+        let mut tables = std::mem::take(&mut own.open);
+        let mut keys = std::mem::take(&mut own.keys);
+        let mut bytes = std::mem::take(&mut own.bytes);
+        let mut places = std::mem::take(&mut own.places);
         own.shapes.clear();
+        let counts = self.local.as_mut().and_then(|local| local.own.take());
+        self.close_local(
+            counts,
+            &mut tables,
+            &mut keys,
+            &mut bytes,
+            Some(&mut places),
+        )?;
         self.send(tables, keys, bytes, Some(places))
     }
 
@@ -7007,7 +7354,13 @@ impl<'a> Packer<'a> {
 type Packed = (Vec<Vec<Key>>, Vec<f64>, f64);
 
 /// A streamed chunk laid out: its table, its index, its shape and the table.
-type LaidChunk<'a> = (StreamTable, usize, (usize, usize), CommittedTable<'a, F, E>);
+type LaidChunk<'a> = (
+    StreamTable,
+    usize,
+    (usize, usize),
+    CommittedTable<'a, F, E>,
+    Option<LocalCounts>,
+);
 
 /// One streamed chunk generated and laid out; a regeneration recorder takes
 /// the digest of its packed columns, as committed.
@@ -7058,7 +7411,10 @@ fn lay_out_chunk<'a>(
     if let Some(ledger) = ledger {
         ledger.laying.fetch_sub(rows, Relaxed);
     }
-    Ok((chunk.table, chunk.index, shape, table?))
+    // Its local sends counted here, on the layout worker.
+    let table = table?;
+    let counts = airs.local_counts(&table)?;
+    Ok((chunk.table, chunk.index, shape, table, counts))
 }
 
 /// The streamed chunks, packed in arrival order: the packer, each chunk's
@@ -7096,11 +7452,12 @@ fn stream_inline<'a>(
             Built::Job(job) => {
                 let (seq, kind) = (shapes.len(), job.table);
                 let t = Instant::now();
-                let (table, index, shape, laid) = lay_out_chunk(airs, *job, ledger, recorder)?;
+                let (table, index, shape, laid, counts) =
+                    lay_out_chunk(airs, *job, ledger, recorder)?;
                 head_log::chunk_laid(seq, stream_base(kind), t);
                 chunks += t.elapsed().as_secs_f64();
                 shapes.push((table, index, shape));
-                packer.place(Key::Streamed(table, index), shape, laid)?;
+                packer.place(Key::Streamed(table, index), shape, laid, counts)?;
                 head_log::chunk_placed(seq);
             }
             Built::Stream(_) => {
@@ -7297,9 +7654,9 @@ fn stream_pipelined<'a, R>(
                 chunks += secs;
                 pending.insert(seq, laid);
                 while let Some(laid) = pending.remove(&next) {
-                    let (table, index, shape, laid) = laid?;
+                    let (table, index, shape, laid, counts) = laid?;
                     shapes.push((table, index, shape));
-                    packer.place(Key::Streamed(table, index), shape, laid)?;
+                    packer.place(Key::Streamed(table, index), shape, laid, counts)?;
                     head_log::chunk_placed(next);
                     if let Some(permits) = permits {
                         permits.give();
@@ -7324,7 +7681,7 @@ fn stream_pipelined<'a, R>(
             for (k, _, laid) in rrx {
                 waiting.insert(k, laid);
                 while let Some(laid) = waiting.remove(&next) {
-                    let (i, shape, table) = laid?;
+                    let (i, shape, table, counts) = laid?;
                     placed.push((i, shape));
                     if let Some(ahead) = &packer.close_ahead
                         && let Some(&(after, told)) = ahead.last.get()
@@ -7338,7 +7695,7 @@ fn stream_pipelined<'a, R>(
                             "BLOCK PACKER: BITWISE's shape {shape:?} is not the {told:?} it was told"
                         );
                     }
-                    packer.place(Key::Air(i), shape, table)?;
+                    packer.place(Key::Air(i), shape, table, counts)?;
                     packer.close_ahead_of_bitwise(next)?;
                     if let Some(gate) = gate {
                         gate.release(next);
@@ -7558,11 +7915,14 @@ fn lay_out_rest<'a>(
         } else {
             table_of(air, trace, shape, true)
         }
-        .map(|table| (i, shape, table));
+        .and_then(|table| {
+            let counts = local_counts_under(format.keccak_rnd, &table)?;
+            Ok((i, shape, table, counts))
+        });
         if let Ok(mut laid_at) = laid_at.lock() {
             laid_at.push((i, start.elapsed().as_secs_f64()));
         }
-        if let (Some(ledger), Ok((_, _, table))) = (ledger, &laid) {
+        if let (Some(ledger), Ok((_, _, table, _))) = (ledger, &laid) {
             use std::sync::atomic::Ordering::Relaxed;
             ledger.rest.fetch_sub(rows, Relaxed);
             ledger
@@ -7849,7 +8209,11 @@ fn lay_out_rest_streamed<'a>(
                 .fetch_add(memlog::table_bytes(table), Relaxed);
         }
         // A packer that stopped has its own error to report.
-        let _ = sink.send((k, secs, laid.map(|table| (position, shape, table))));
+        let laid = laid.and_then(|table| {
+            let counts = local_counts_under(keccak_rnd, &table)?;
+            Ok((position, shape, table, counts))
+        });
+        let _ = sink.send((k, secs, laid));
         k += 1;
     };
     let mut tables = tables.into_iter();
@@ -8102,7 +8466,7 @@ fn prove_streamed(
     on_group: GroupObserver<'_>,
     lead: Option<&PhaseBLead>,
     stamps: &mut BlockStamps,
-) -> Result<BlockWhirProof, Error> {
+) -> Result<BlockWhirProof<LocalArgues>, Error> {
     // G-pack writes the streamed chunks packed when the groups are held
     // narrow; they are then laid out narrow, as the finish's packed tables.
     let stream_form = if options.gpack && options.narrow != multilinear_block::Narrowing::Wide {
@@ -9225,6 +9589,12 @@ fn prove_streamed(
                         recorder,
                     }),
                     close_ahead: close_ahead.clone(),
+                    local: format.local_lookups().then(|| LocalPack {
+                        air: stream_airs.local_bytes.as_ref(),
+                        open: None,
+                        own: None,
+                        made: 0,
+                    }),
                 };
                 // Off the inline path, the prepared columns wait until the
                 // groups are sent.
@@ -9331,11 +9701,11 @@ fn prove_streamed(
                         return Err(Error::Prover(format!("table {i} built twice")));
                     }
                 }
-                for (i, shape, table) in rest_tables {
+                for (i, shape, table, counts) in rest_tables {
                     if shapes[i].replace(shape).is_some() {
                         return Err(Error::Prover(format!("table {i} built twice")));
                     }
-                    packer.place(Key::Air(i), shape, table)?;
+                    packer.place(Key::Air(i), shape, table, counts)?;
                 }
                 let (group_keys, closed_at, blocked) = packer.finish()?;
                 let mut marks = vec![("streamed placed", placed_at)];
@@ -9366,11 +9736,25 @@ fn prove_streamed(
                         )));
                     }
                 }
+                // Each LOCAL_BYTES after every other table, `j`-th at `N + j`,
+                // 2^16 rows.
+                let locals = group_keys
+                    .iter()
+                    .flatten()
+                    .filter(|key| matches!(key, Key::Local(_)))
+                    .count();
+                let base = shapes.len();
+                let mut shapes = shapes;
+                shapes.extend(std::iter::repeat_n(
+                    (local_bytes::cols::NUM_COLUMNS, local_bytes::LOG_ROWS),
+                    locals,
+                ));
                 let groups = group_keys
                     .into_iter()
                     .map(|keys| {
                         keys.into_iter()
                             .map(|key| match key {
+                                Key::Local(j) => Ok((base + j) as u32),
                                 Key::Air(i) => Ok(i as u32),
                                 Key::Streamed(table, index) => names
                                     .get(&stream_name(table, index))
@@ -9923,7 +10307,31 @@ fn prove_streamed(
         };
         let reorder: Option<&multilinear_block::PhaseBReorder<'_>> =
             lead.is_some().then_some(&lead_turn);
-        let (proof, argues, prepared_openings, groups, commit_ood, _) =
+        // Under local lookups: the format's local buses and each table's
+        // digest, for each group's local transcript.
+        let block = if format.local_lookups() {
+            let refs = run_airs
+                .get()
+                .ok_or_else(|| Error::Prover("the run's AIR set was never built".into()))?
+                .air_refs();
+            let local_air: AirRef<'_> = stream_airs.local_bytes.as_ref();
+            let digests = local_digests::<<H as multilinear::whir_hash::WhirHash>::Sponge>(
+                &laid.groups,
+                &laid.shapes,
+                |i| {
+                    refs.get(i)
+                        .copied()
+                        .or_else(|| (i < laid.shapes.len()).then_some(local_air))
+                },
+            )?;
+            block.with_local_lookups(multilinear_block::BlockLocal {
+                buses: local_bytes::LOCAL_BUSES.to_vec(),
+                digests,
+            })
+        } else {
+            block
+        };
+        let (proof, argues, prepared_openings, groups, commit_ood, local_argues) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
                 block
                     .with_phase_b_overlap(phase_b_overlap(options))
@@ -10209,6 +10617,7 @@ fn prove_streamed(
             commit_ood,
             fused_memory: laid.fused_memory,
             word_memory: laid.word_memory,
+            local: local_argues,
         })
     })
 }
@@ -10386,7 +10795,26 @@ impl BlockStatement<'_> {
     }
 }
 
-impl BlockWhirProof {
+impl<L> BlockWhirProof<L> {
+    /// The same proof carrying `local` for its local lookups.
+    pub fn with_local<M>(self, local: M) -> BlockWhirProof<M> {
+        BlockWhirProof {
+            proof: self.proof,
+            table_num_vars: self.table_num_vars,
+            runtime_page_ranges: self.runtime_page_ranges,
+            table_counts: self.table_counts,
+            public_output: self.public_output,
+            num_private_input_pages: self.num_private_input_pages,
+            groups: self.groups,
+            prepared: self.prepared,
+            argues: self.argues,
+            commit_ood: self.commit_ood,
+            fused_memory: self.fused_memory,
+            word_memory: self.word_memory,
+            local,
+        }
+    }
+
     /// The proof's statement.
     pub fn statement(&self) -> BlockStatement<'_> {
         BlockStatement {
@@ -10423,6 +10851,12 @@ pub(crate) struct BlockFrame {
     /// cap.
     pub(crate) stack_layouts: Vec<multilinear::stacking::StackedLayout>,
     pub(crate) domains: Vec<multilinear::whir::Domain<F>>,
+    /// Under local lookups ([`BlockFormat::local_lookups`]): the index of the
+    /// first LOCAL_BYTES table, after every other ([`check_local_groups`]).
+    /// Read by the tests today, and by the in-guest plan once it verifies
+    /// local argues.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) local_base: Option<usize>,
 }
 
 /// The statement's checks, and what they leave: the counts within bounds, the
@@ -10497,11 +10931,22 @@ pub(crate) fn block_frame(
             "the table counts do not sum to a usize".to_string(),
         ));
     };
-    if expected != num_tables {
+    // Under local lookups the LOCAL_BYTES tables come after every other: how
+    // many is the statement's, held below to one a group with a local
+    // sender.
+    let local_count = if format.local_lookups() {
+        num_tables.checked_sub(expected).ok_or_else(|| {
+            Error::InvalidTableCounts(format!(
+                "the statement implies {expected} tables and states {num_tables} heights",
+            ))
+        })?
+    } else if expected != num_tables {
         return Err(Error::InvalidTableCounts(format!(
             "the statement implies {expected} tables and states {num_tables} heights",
         )));
-    }
+    } else {
+        0
+    };
     check_table_heights(statement.table_num_vars)?;
     check_bitwise_height(statement.table_num_vars)?;
     check_chunked_heights(statement.table_counts, statement.table_num_vars)?;
@@ -10530,6 +10975,7 @@ pub(crate) fn block_frame(
     if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
         airs.with_word_memory_at(proof_options, words, &page_configs, format.page_runs())?;
     }
+    airs.with_local_bytes(proof_options, local_count);
     // The CPU heights were read at `cpu_proof_start`: the tables must be there.
     airs.check_cpu_position(statement.table_counts)?;
     let air_refs = airs.air_refs();
@@ -10590,6 +11036,12 @@ pub(crate) fn block_frame(
                 .map(|(_, &num_vars)| num_vars),
         )?;
     }
+    // Under local lookups: every receiver of a local bus is a LOCAL_BYTES
+    // table, and every LOCAL_BYTES table is 2^16 rows.
+    let local_base = format.local_lookups().then_some(expected);
+    if let Some(base) = local_base {
+        check_local_airs(&air_refs, statement.table_num_vars, base)?;
+    }
     // The width is the AIR's, never the proof's; only the height is stated.
     let shapes: Vec<(usize, usize)> = air_refs
         .iter()
@@ -10603,22 +11055,41 @@ pub(crate) fn block_frame(
     // shapes and the verifier's stack cap.
     check_group_count(statement.groups.len(), format.max_groups)?;
     let order = validate_groups(statement.groups, shapes.len())?;
+    if let Some(base) = local_base {
+        let senders: Vec<bool> = airs
+            .air_refs()
+            .iter()
+            .map(|air| local_bytes::sends_local(air.bus_interactions()))
+            .collect();
+        check_local_groups(statement.groups, &senders, base)?;
+    }
     let sizes: Vec<usize> = statement.groups.iter().map(Vec::len).collect();
     let group_shapes: Vec<(usize, usize)> = order.iter().map(|&i| shapes[i]).collect();
     let (stack_layouts, domains) = stacks(&group_shapes, &sizes, &config)?;
     // Every group within the stack budget — the verifier's constant, not the
     // prover's packing — except a table that alone needs more: it cannot be
-    // split, so it is a group of its own (the packing's rule too).
-    if let Some((g, layout)) = stack_layouts
-        .iter()
-        .enumerate()
-        .find(|(g, layout)| layout.num_polys() > format.group_polys && sizes[*g] > 1)
-    {
-        return Err(Error::InvalidTableCounts(format!(
-            "group {g} stacks into {} polynomials — a group takes at most {}",
-            layout.num_polys(),
-            format.group_polys
-        )));
+    // split, so it is a group of its own (the packing's rule too). A group's
+    // LOCAL_BYTES table, which closes it, is outside the budget.
+    for (g, (group, layout)) in statement.groups.iter().zip(&stack_layouts).enumerate() {
+        let own: Vec<(usize, usize)> = group
+            .iter()
+            .map(|&i| i as usize)
+            .filter(|&i| local_base.is_none_or(|base| i < base))
+            .map(|i| shapes[i])
+            .collect();
+        let polys = if own.len() == group.len() {
+            layout.num_polys()
+        } else {
+            stark::multilinear_table::global_layout(&own, config.format.stack)
+                .map_err(|e| Error::Prover(format!("{e:?}")))?
+                .num_polys()
+        };
+        if polys > format.group_polys && own.len() > 1 {
+            return Err(Error::InvalidTableCounts(format!(
+                "group {g} stacks into {polys} polynomials — a group takes at most {}",
+                format.group_polys
+            )));
+        }
     }
     Ok(BlockFrame {
         page_configs,
@@ -10630,13 +11101,108 @@ pub(crate) fn block_frame(
         sizes,
         stack_layouts,
         domains,
+        local_base,
     })
+}
+
+/// ★ The frame's static check of local lookups, over the verifier's own AIR
+/// set: no table before `base` receives on a local bus, and every table from
+/// `base` on is a LOCAL_BYTES table of 2^16 rows. With the multilinear
+/// verifier's own check that every local receiver reads fixed columns only,
+/// this is what makes each group's local argue a lookup into a table the
+/// verifier fixes.
+pub(crate) fn check_local_airs(
+    air_refs: &[AirRef<'_>],
+    table_num_vars: &[u8],
+    base: usize,
+) -> Result<(), Error> {
+    for (i, air) in air_refs.iter().enumerate() {
+        let local_receiver = air
+            .bus_interactions()
+            .iter()
+            .any(|b| !b.is_sender && local_bytes::LOCAL_BUSES.contains(&b.bus_id));
+        let is_local_bytes = air.name().starts_with("LOCAL_BYTES[");
+        if i < base && (local_receiver || is_local_bytes) {
+            return Err(Error::InvalidTableCounts(format!(
+                "{} (table {i}) receives a local bus: only LOCAL_BYTES does",
+                air.name()
+            )));
+        }
+        if i >= base {
+            if !is_local_bytes {
+                return Err(Error::InvalidTableCounts(format!(
+                    "table {i} after the run's tables is {}, not LOCAL_BYTES",
+                    air.name()
+                )));
+            }
+            if usize::from(table_num_vars[i]) != local_bytes::LOG_ROWS {
+                return Err(Error::InvalidTableCounts(format!(
+                    "LOCAL_BYTES (table {i}) states 2^{} rows — it has 2^{}",
+                    table_num_vars[i],
+                    local_bytes::LOG_ROWS
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ★ Where the LOCAL_BYTES tables sit: every group holding a local sender
+/// (`senders[i]`, table `i` sends a local lookup) ends with exactly one, the
+/// `j`-th such group with table `base + j`; no other group holds one; and
+/// there is one a group with a local sender, no more. So each group's local
+/// lookups balance against its own fixed table.
+pub(crate) fn check_local_groups(
+    groups: &[Vec<u32>],
+    senders: &[bool],
+    base: usize,
+) -> Result<(), Error> {
+    let mut j = 0usize;
+    for (g, group) in groups.iter().enumerate() {
+        let locals: Vec<usize> = group
+            .iter()
+            .map(|&i| i as usize)
+            .filter(|&i| i >= base)
+            .collect();
+        let sends = group
+            .iter()
+            .any(|&i| senders.get(i as usize).copied().unwrap_or(false));
+        match (sends, locals.as_slice()) {
+            (false, []) => {}
+            (true, &[local]) if group.last().map(|&i| i as usize) == Some(local) => {
+                if local != base + j {
+                    return Err(Error::InvalidTableCounts(format!(
+                        "group {g} ends with LOCAL_BYTES table {local}, not {}",
+                        base + j
+                    )));
+                }
+                j += 1;
+            }
+            (true, _) => {
+                return Err(Error::InvalidTableCounts(format!(
+                    "group {g} holds a local sender: it ends with exactly one LOCAL_BYTES table"
+                )));
+            }
+            (false, _) => {
+                return Err(Error::InvalidTableCounts(format!(
+                    "group {g} holds a LOCAL_BYTES table and no local sender"
+                )));
+            }
+        }
+    }
+    let stated = senders.len().saturating_sub(base);
+    if j != stated {
+        return Err(Error::InvalidTableCounts(format!(
+            "{stated} LOCAL_BYTES tables for {j} groups with a local sender"
+        )));
+    }
+    Ok(())
 }
 
 /// Verifies a proof from [`prove_block_whir`] under `format` — the verifier's
 /// own constants, never the proof's.
-pub fn verify_block_whir(
-    proof: &BlockWhirProof,
+pub fn verify_block_whir<L: LocalPart>(
+    proof: &BlockWhirProof<L>,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
     format: &BlockFormat,
@@ -10655,8 +11221,8 @@ pub fn verify_block_whir(
 /// `skip_prepared`, and the batched argue's checks and the bus balance switched
 /// by `argue_checks` — mutations, for the tests that show each check is what refuses
 /// its forgery.
-pub(crate) fn verify_block_whir_with(
-    proof: &BlockWhirProof,
+pub(crate) fn verify_block_whir_with<L: LocalPart>(
+    proof: &BlockWhirProof<L>,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
     format: &BlockFormat,
@@ -10689,14 +11255,28 @@ pub(crate) enum BlockRefusal {
 
 /// [`verify_block_whir_with`], a refusal carrying the check that refused: what
 /// a negative test asserts, so it cannot pass on another error.
-pub(crate) fn verify_block_whir_traced(
-    proof: &BlockWhirProof,
+pub(crate) fn verify_block_whir_traced<L: LocalPart>(
+    proof: &BlockWhirProof<L>,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
     format: &BlockFormat,
     skip_prepared: bool,
     argue_checks: VerifierChecks,
 ) -> Result<Result<(), BlockRefusal>, Error> {
+    // Local lookups by the verifier's format: a local argue a group under
+    // it, none in today's — the other kind of proof is refused.
+    let local_argues = match (format.local_lookups(), proof.local.local_argues()) {
+        (true, Some(argues)) if argues.len() == proof.groups.len() => Some(argues),
+        (false, None) => None,
+        (local, argues) => {
+            return Err(Error::InvalidTableCounts(format!(
+                "the proof carries {} local argues for {} groups; its format {} local lookups",
+                argues.map_or("no".to_string(), |a| a.len().to_string()),
+                proof.groups.len(),
+                if local { "argues" } else { "has no" },
+            )));
+        }
+    };
     // One argument per table, or one per group, by the verifier's format; the
     // other format's messages absent.
     let (tables, argues) = match format.argue {
@@ -10802,6 +11382,20 @@ pub(crate) fn verify_block_whir_traced(
         else {
             return Ok(Err(BlockRefusal::Owed));
         };
+        // Each table's digest, the verifier's own, from its AIR set.
+        let digests = match local_argues {
+            Some(_) => local_digests::<<H as multilinear::whir_hash::WhirHash>::Sponge>(
+                &proof.groups,
+                shapes,
+                |i| air_refs.get(i).copied(),
+            )?,
+            None => Vec::new(),
+        };
+        let local = local_argues.map(|argues| multilinear_block::BlockLocalCheck {
+            buses: &local_bytes::LOCAL_BUSES,
+            digests: &digests,
+            argues,
+        });
         multilinear_block::block_verify_with::<_, _, _, H>(
             &proof.proof,
             &proof.commit_ood,
@@ -10817,7 +11411,7 @@ pub(crate) fn verify_block_whir_traced(
             &mut transcript,
             skip_prepared,
             argue_checks,
-            None,
+            local,
         )
         .map_err(BlockRefusal::Proof)
     }))
@@ -12636,6 +13230,7 @@ mod packer_tests {
                 open_bytes: 0,
                 own: None,
                 close_ahead: None,
+                local: None,
             };
             for (index, &ops) in heights.iter().enumerate() {
                 let ops: Vec<LtOperation> = (0..ops as u64)
@@ -12648,7 +13243,7 @@ mod packer_tests {
                 );
                 let table = table_of(air, &mut trace, shape, true).expect("a table");
                 packer
-                    .place(Key::Streamed(StreamTable::Lt, index), shape, table)
+                    .place(Key::Streamed(StreamTable::Lt, index), shape, table, None)
                     .expect("phase A takes it");
             }
             let (groups, _, _) = packer.finish().expect("phase A takes the last");
@@ -12658,7 +13253,7 @@ mod packer_tests {
                     keys.into_iter()
                         .map(|key| match key {
                             Key::Streamed(_, index) => index,
-                            Key::Air(index) => index,
+                            Key::Air(index) | Key::Local(index) => index,
                         })
                         .collect()
                 })
