@@ -616,24 +616,32 @@ fn the_overlap_priced_resident_proves_the_same_bytes_in_every_place() {
     }
 }
 
-/// The resident-pricing knob's name; it is off by default, and only `1`
-/// turns it on.
+/// The resident-pricing knob's name; it is on by default, and only `0`
+/// turns it off.
 #[test]
-fn the_overlap_resident_knob_is_named_and_off_by_default() {
+fn the_overlap_resident_knob_is_named_and_on_by_default() {
     use super::wlfm::{OVERLAP_RESIDENT_ENV, overlap_resident};
     assert_eq!(OVERLAP_RESIDENT_ENV, "LAMBDA_VM_LEVELS_OVERLAP_RESIDENT");
     if std::env::var_os(OVERLAP_RESIDENT_ENV).is_none() {
-        assert!(!overlap_resident());
+        assert!(overlap_resident());
+    }
+    for (word, on) in [
+        (None, true),
+        (Some(""), true),
+        (Some("1"), true),
+        (Some(" 0 "), false),
+    ] {
+        assert_eq!(!super::wlfm_knobs::knob_word_off(word), on, "{word:?}");
     }
 }
 
-/// The upload-once knob's name; it is off by default, and only `1` turns it
-/// on.
+/// The upload-once knob's name; it is on by default, and only `0` turns it
+/// off.
 #[test]
-fn the_upload_once_knob_is_named_and_off_by_default() {
+fn the_upload_once_knob_is_named_and_on_by_default() {
     use super::wlfm::{UPLOAD_ONCE_ENV, upload_once};
     assert_eq!(UPLOAD_ONCE_ENV, "LAMBDA_VM_LEVELS_UPLOAD_ONCE");
     if std::env::var_os(UPLOAD_ONCE_ENV).is_none() {
-        assert!(!upload_once());
+        assert!(upload_once());
     }
 }
