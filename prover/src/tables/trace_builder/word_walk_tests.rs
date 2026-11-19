@@ -142,7 +142,9 @@ fn left(
     let heights = crate::cpu_heights_from_traces(build);
     let inputs = crate::BlockAirInputs::new(&options, program, heights, &build.public_output_bytes)
         .expect("the block's inputs");
-    let format = crate::block_whir::BlockFormat::production().with_memory(MemoryFormat::Words);
+    let format = crate::block_whir::BlockFormat::production()
+        .with_memory(MemoryFormat::Words)
+        .with_page_run(0);
     let mut airs = crate::block_airs(
         program,
         &options,
