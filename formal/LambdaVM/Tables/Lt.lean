@@ -200,8 +200,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     by_cases h0 : input_mu = 0
     · simp [h0]
     -- otherwise ARE_BYTES[μ, 0] makes μ a count of at most 255, so the pulls get their guarantees
-    have hcount : Channel.CountUpTo muMax input_mu :=
-      Channel.countUpTo_of_val h0 (by simp only [muMax]; omega)
+    have hcount : CountUpTo muMax input_mu :=
+      countUpTo_of_ne_zero_of_val_le h0 (by simp only [muMax]; omega)
     have hsb : IsBool input_signed := mul_one_sub_eq_zero_iff.mp h_s
     have hib : IsBool input_invert := mul_one_sub_eq_zero_iff.mp h_i
     have hs_2 := IsBool.val_lt_two hsb

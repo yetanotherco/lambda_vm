@@ -5,9 +5,15 @@ defaultTargets = ["LambdaVM", "LambdaVMExport"]
 autoImplicit = false
 relaxedAutoImplicit = false
 
-# Clean from the counted-pulls branch of the yetanotherco fork (on Clean main f3abad7c): pulls of
-# multiplicity up to N and soundness by finishing order, plus the four review fixes that answer
-# the audit of that branch. Mathlib and CompPoly come in through Clean's manifest.
+# Clean from `pr-base-upstream-main` of the yetanotherco fork: the same pulls of multiplicity up
+# to N and soundness by finishing order as before, now sitting on a newer upstream. This sha is
+# the merge that put that work onto the base branch, so it has two parents worth naming: the
+# upstream mirror `a985c76c` and the work itself, `e30c5c44` (`pr1-counted-pulls`). Mathlib and
+# CompPoly come in through Clean's manifest, both at the `v4.35.0` tag -- unchanged across this
+# move, which is why it does not rebuild them.
+#
+# `pr-base-upstream-main` is where the fork's PRs land, so it moves. Pin the sha, not the branch;
+# the name is here to say where the sha came from, not to track it.
 # Keep `rev` a sha. Clean's own `lakefile.lean` sets `preferReleaseBuild := true` with
 # `releaseRepo` pointing at `Verified-zkEVM/clean`, and its comment says a consumer that pins a
 # release tag downloads the prebuilt `Clean` library instead of compiling it -- from upstream,
@@ -16,7 +22,7 @@ relaxedAutoImplicit = false
 [[require]]
 name = "Clean"
 git = "https://github.com/yetanotherco/clean"
-rev = "73309694ae33279094597f7f3f819fb8a3439620"
+rev = "8552c7a10dac340de34bfff9e19a6967ed3b1bba"
 
 [[lean_lib]]
 name = "LambdaVM"

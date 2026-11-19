@@ -64,8 +64,8 @@ def circuit : GeneralFormalCircuit (F p) MinToy.Row unit where
     by_cases h0 : input_mu = 0
     · simp [h0]
     -- otherwise ARE_BYTES[μ, 0] makes μ a count of at most 255
-    have hcount : Channel.CountUpTo muMax input_mu :=
-      Channel.countUpTo_of_val h0 (by simp only [muMax]; omega)
+    have hcount : CountUpTo muMax input_mu :=
+      countUpTo_of_ne_zero_of_val_le h0 (by simp only [muMax]; omega)
     have h4 : (4 : F p).val = 4 := by simpa using MinToy.val_lit 4 (by norm_num)
     have h9 : (9 : F p).val = 9 := by simpa using MinToy.val_lit 9 (by norm_num)
     obtain ⟨hLT, -⟩ := h_pull hcount
@@ -256,29 +256,32 @@ lemma cmin_pull_requirement {table : Table (F p)} (h_comp : table.component = cm
   · simp [AbstractInteraction.eval, Channel.emittedUpTo] at h_pull
 
 theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
-  apply Ensemble.tableSoundness_of_stagedOn stages rfl
+  apply Ensemble.tableSoundness_of_stagedRequirementsOn stages rfl
   · intro s hs
     simp only [stages, List.mem_cons, List.not_mem_nil, or_false] at hs
     rcases hs with rfl | rfl | rfl <;> simp [ensemble]
-  · intro component h c hc msg
-    simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl | rfl
+  -- See the note on `LtStaged.tableSoundness_withMin`: `covered` hands over a table, so the
+  -- component equation is a projection that has to be rewritten rather than substituted, and
+  -- the message is an `Interaction` whose `.msg` the class tests.
+  · intro table hcomp c hc i _ _
+    simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at hcomp
+    rcases hcomp with hcomp | hcomp | hcomp | hcomp <;> rw [hcomp] at hc
     iterate 2 simp [providerComponent_guarantees, countedProviderComponent_guarantees] at hc
     · rw [cminComponent_guarantees] at hc
       simp only [List.mem_cons, List.not_mem_nil, or_false] at hc
       rcases hc with rfl | rfl
       · exact ⟨{ channel := Bitwise.AreBytes.toRaw }, by simp [stages], rfl, rfl⟩
-      · cases h : isMinMsg msg
+      · cases hm : isMinMsg i.msg
         · exact ⟨{ channel := AluC, cls := fun m => !isMinMsg m }, by simp [stages], rfl,
-            by simp [h]⟩
-        · exact ⟨{ channel := AluC, cls := isMinMsg }, by simp [stages], rfl, h⟩
+            by simp [hm]⟩
+        · exact ⟨{ channel := AluC, cls := isMinMsg }, by simp [stages], rfl, hm⟩
     · rw [aluConsumerComponent_guarantees] at hc
       simp only [List.mem_singleton] at hc
       subst hc
-      cases h : isMinMsg msg
+      cases hm : isMinMsg i.msg
       · exact ⟨{ channel := AluC, cls := fun m => !isMinMsg m }, by simp [stages], rfl,
-          by simp [h]⟩
-      · exact ⟨{ channel := AluC, cls := isMinMsg }, by simp [stages], rfl, h⟩
+          by simp [hm]⟩
+      · exact ⟨{ channel := AluC, cls := isMinMsg }, by simp [stages], rfl, hm⟩
   · intro s hs
     show s.channel.ConsistentUpTo muMax
     simp only [stages, List.mem_cons, List.not_mem_nil, or_false] at hs

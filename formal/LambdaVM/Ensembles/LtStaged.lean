@@ -179,10 +179,10 @@ def ensemble : Ensemble (F p) unit where
   verifier_channels := by simp [circuit_norm]
 
 /-- `μ` from `ARE_BYTES[μ, 0]` is an inactive or counted pull. -/
-lemma mu_count {x : F p} (h : x.val < 256) : x = 0 ∨ Channel.CountUpTo muMax x := by
+lemma mu_count {x : F p} (h : x.val < 256) : x = 0 ∨ CountUpTo muMax x := by
   by_cases h0 : x = 0
   · exact .inl h0
-  · exact .inr (Channel.countUpTo_of_val h0 (by simp only [muMax]; omega))
+  · exact .inr (countUpTo_of_ne_zero_of_val_le h0 (by simp only [muMax]; omega))
 
 /-- LT's requirements on its counted pulls follow from its guarantee on `ARE_BYTES`. -/
 theorem lt_requirementsAfter_counted {c : RawChannel (F p)} (hc : c = IsHalfC ∨ c = Msb16C)
@@ -209,7 +209,7 @@ theorem lt_requirementsAfter_counted {c : RawChannel (F p)} (hc : c = IsHalfC �
     simp [Channel.counted, Channel.toRaw] at this
 
 theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
-  apply Ensemble.tableSoundness_of_staged finished rfl (List.Subset.refl _)
+  apply Ensemble.tableSoundness_of_stagedRequirements finished rfl (List.Subset.refl _)
   · intro component h
     simp only [ensemble, List.mem_cons, List.not_mem_nil, or_false] at h
     rcases h with rfl | rfl | rfl | rfl | rfl <;>
@@ -375,30 +375,36 @@ lemma ne_alu {c : RawChannel (F p)}
       StaticLookupChannel.toChannel, Channel.counted, Channel.toRaw] at this
 
 theorem tableSoundness_withMin : ensembleMin.TableSoundness (Balance.logUpUpTo muMax) := by
-  apply Ensemble.tableSoundness_of_stagedOn stages rfl
+  apply Ensemble.tableSoundness_of_stagedRequirementsOn stages rfl
   · intro s hs
     simp only [stages, List.mem_cons, List.not_mem_nil, or_false] at hs
     rcases hs with rfl | rfl | rfl | rfl | rfl <;> simp [ensembleMin, finished]
-  · intro component h c hc msg
-    simp only [ensembleMin, List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl | rfl | rfl | rfl
+  -- `covered` ranges over a table and the pulls it actually makes, so the component arrives as
+  -- `table.component = ...`, which is a projection and not a variable: `rcases ... with rfl`
+  -- cannot substitute it, and the equation has to be rewritten into `hc` instead. The message
+  -- is an `Interaction` now, so the class is tested on its `.msg`. The two hypotheses this
+  -- weaker form adds -- that the interaction is one the table makes, and that it is a pull --
+  -- are not needed here: every stage in `stages` covers its whole channel.
+  · intro table hcomp c hc i _ _
+    simp only [ensembleMin, List.mem_cons, List.not_mem_nil, or_false] at hcomp
+    rcases hcomp with hcomp | hcomp | hcomp | hcomp | hcomp | hcomp <;> rw [hcomp] at hc
     iterate 3 simp [providerComponent_guarantees, countedProviderComponent_guarantees] at hc
     · rw [ltComponent_guarantees] at hc
       simp only [List.mem_cons, List.not_mem_nil, or_false] at hc
       rcases hc with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> simp [stages]
     · rw [minComponent_guarantees, List.mem_singleton] at hc
       subst hc
-      cases h : isMinMsg msg
+      cases hm : isMinMsg i.msg
       · exact ⟨{ channel := Alu.channel.toRaw, cls := fun m => !isMinMsg m }, by simp [stages],
-          rfl, by simp [h]⟩
-      · exact ⟨{ channel := Alu.channel.toRaw, cls := isMinMsg }, by simp [stages], rfl, h⟩
+          rfl, by simp [hm]⟩
+      · exact ⟨{ channel := Alu.channel.toRaw, cls := isMinMsg }, by simp [stages], rfl, hm⟩
     -- the consumer gains the guarantee on whichever class the message it pulls belongs to
     · rw [consumerComponent_guarantees, List.mem_singleton] at hc
       subst hc
-      cases h : isMinMsg msg
+      cases hm : isMinMsg i.msg
       · exact ⟨{ channel := Alu.channel.toRaw, cls := fun m => !isMinMsg m }, by simp [stages],
-          rfl, by simp [h]⟩
-      · exact ⟨{ channel := Alu.channel.toRaw, cls := isMinMsg }, by simp [stages], rfl, h⟩
+          rfl, by simp [hm]⟩
+      · exact ⟨{ channel := Alu.channel.toRaw, cls := isMinMsg }, by simp [stages], rfl, hm⟩
   · intro s hs
     show s.channel.ConsistentUpTo muMax
     simp only [stages, List.mem_cons, List.not_mem_nil, or_false] at hs
