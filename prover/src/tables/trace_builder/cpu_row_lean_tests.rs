@@ -1109,7 +1109,10 @@ fn air_values(
     // The row and a copy as the next one (a constraint reading the next row
     // sees the same cells), and the auxiliary columns at zero: only the
     // base-field constraints are read.
-    let aux = vec![FieldElement::<GoldilocksExtension>::zero(); air.trace_layout().1.max(air.num_auxiliary_rap_columns())];
+    let aux = vec![
+        FieldElement::<GoldilocksExtension>::zero();
+        air.trace_layout().1.max(air.num_auxiliary_rap_columns())
+    ];
     let step = || TableView::new(vec![row.to_vec()], vec![aux.clone()]);
     let frame = Frame::<GoldilocksField, GoldilocksExtension>::new(vec![step(), step()]);
     let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![FieldElement::zero(); 64];
@@ -1117,7 +1120,8 @@ fn air_values(
     let ctx =
         TransitionEvaluationContext::new_prover(frame.as_row_frame(), &no_e, &no_e, &offset_e);
     let mut base = vec![FE::zero(); air.num_base_transition_constraints()];
-    let mut ext = vec![FieldElement::<GoldilocksExtension>::zero(); air.num_transition_constraints()];
+    let mut ext =
+        vec![FieldElement::<GoldilocksExtension>::zero(); air.num_transition_constraints()];
     air.compute_transition_prover(&ctx, &mut base, &mut ext);
     base
 }
@@ -1200,7 +1204,11 @@ fn every_memory_receivers_flag_columns_are_bits() {
     let tag = format!("{:?}", BusValue::constant(ECALL_MEMORY_OP_TAG));
     let mut checked: BTreeMap<String, Vec<(usize, Vec<usize>)>> = BTreeMap::new();
     let mut missing = Vec::new();
-    for memory in [MemoryFormat::Split, MemoryFormat::Fused, MemoryFormat::Words] {
+    for memory in [
+        MemoryFormat::Split,
+        MemoryFormat::Fused,
+        MemoryFormat::Words,
+    ] {
         let mut airs = crate::block_airs(
             &program,
             &opts,
@@ -1279,7 +1287,13 @@ fn every_memory_receivers_flag_columns_are_bits() {
         "MEM_LOAD2W",
         "MEM_STORE2W",
     ] {
-        assert!(kinds.contains(&want), "{want} is a memory receiver of some format: {kinds:?}");
+        assert!(
+            kinds.contains(&want),
+            "{want} is a memory receiver of some format: {kinds:?}"
+        );
     }
-    assert!(missing.is_empty(), "flag columns with no bit constraint: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "flag columns with no bit constraint: {missing:?}"
+    );
 }
