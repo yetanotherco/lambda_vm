@@ -422,6 +422,86 @@ fn a_streamed_run_of_four_promises_three_codewords_less() {
     assert_eq!(roots, batched_roots, "roots");
 }
 
+/// What a group's streamed commit did not hold
+/// (`gpu::StreamedNotHeld::add_back`, the block's
+/// `commit_streamed_not_held`): for 2-, 4- and 7-polynomial groups (one run of
+/// two, one of four, a run of four and one of three) every joint run streams
+/// and the add-back is `(polys − 1)` codewords, and the streamed commit's
+/// ledger growth plus it is the batched commit's growth to within half a
+/// codeword: the planner reads the group's size, not how it was committed.
+#[test]
+fn a_streamed_groups_add_back_is_what_the_batched_commit_held() {
+    let _serial = serial();
+    let cfg = config(Round0Trees::One);
+    let codeword = (1u64 << (18 + cfg.log_blowup)) * 8;
+    for polys in [2usize, 4, 7] {
+        let stack = Stack::new("a group", &vec![18; polys], 18);
+        assert_eq!(stack.layout.num_polys(), polys, "{polys} polynomials");
+        let trees = round0_trees(polys, &cfg).len();
+        let refs: Vec<&Mle<F>> = stack.columns.iter().collect();
+        let store = gpu::upload_columns(&refs).expect("resident columns (a GPU)");
+        let commit = |on: bool| {
+            let _knob = gpu::force_streamed_joint_leaves(on);
+            let (refused, streamed, fallbacks) = (
+                gpu::room_commit_refusals(),
+                gpu::joint_streamed_builds(),
+                gpu::host_fallbacks(),
+            );
+            let not_held = gpu::streamed_not_held();
+            gpu::reset_reserved_window();
+            let base = gpu::ledger_reserved();
+            let committed = StackedCommitment::<F, H>::commit_to_retire(
+                stack.layout.clone(),
+                &borrow(&stack.columns),
+                Some((&store, ColumnsAt::From(0))),
+                &cfg,
+                &|| {},
+            )
+            .unwrap();
+            let grew = gpu::reserved_window_peak().saturating_sub(base);
+            assert_eq!(
+                gpu::room_commit_refusals(),
+                refused,
+                "{polys}: room promised"
+            );
+            assert_eq!(gpu::host_fallbacks(), fallbacks, "{polys}: no host commit");
+            let runs = gpu::joint_streamed_builds() - streamed;
+            let add_back = gpu::streamed_not_held()
+                .since(not_held)
+                .add_back(runs, trees);
+            (grew, runs, add_back, committed.roots())
+        };
+        let (batched, runs_off, add_back_off, batched_roots) = commit(false);
+        assert_eq!(
+            (runs_off, add_back_off),
+            (0, 0),
+            "{polys}: off, nothing streamed"
+        );
+        let (streamed, runs, add_back, roots) = commit(true);
+        eprintln!(
+            "STREAMED ADD-BACK: {polys} polynomials at 2^18, blowup 2^{}: the commit grew the ledger \
+             {:.1} MiB batched, {:.1} MiB streamed + {:.1} MiB added back (a codeword {:.1} MiB)",
+            cfg.log_blowup,
+            batched as f64 / (1u64 << 20) as f64,
+            streamed as f64 / (1u64 << 20) as f64,
+            add_back as f64 / (1u64 << 20) as f64,
+            codeword as f64 / (1u64 << 20) as f64,
+        );
+        assert_eq!(runs as usize, trees, "{polys}: every joint run streamed");
+        assert_eq!(
+            add_back,
+            (polys as u64 - 1) * codeword,
+            "{polys}: every codeword but one added back"
+        );
+        assert!(batched > 0, "{polys}: no ledger budget");
+        assert!(
+            (streamed + add_back).abs_diff(batched) <= codeword / 2,
+            "{polys}: streamed {streamed} B + added back {add_back} B against batched {batched} B"
+        );
+        assert_eq!(roots, batched_roots, "{polys}: roots");
+    }
+}
+
 /// A card that declines after the first codeword (the encode of codeword 1,
 /// 2 or 3 of a run of four refused): the partial tree is let go, nothing is
 /// streamed, the batched commit runs on the card (no host commit), and the

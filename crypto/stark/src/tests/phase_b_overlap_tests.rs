@@ -1077,3 +1077,32 @@ fn the_planned_overlaps_fallbacks_prove_the_same_bytes() {
         "a failed opening beside an argue is the prove's error"
     );
 }
+
+/// The planned argue reads a group's commit as the batched commit holds it: a
+/// streamed commit's ledger growth plus what it did not hold
+/// ([`GroupStamps::commit_streamed_not_held`]) plans the batched commit's
+/// argue, 5/4 of its growth. A group of seven polynomials, codewords of
+/// 2 GiB and 4 GiB of room: 18 GiB batched; 6 GiB streamed, plus
+/// the six codewords it did not hold.
+#[test]
+fn a_streamed_commit_plans_the_batched_commits_argue() {
+    const GIB: u64 = 1 << 30;
+    let batched = GroupStamps {
+        polys: 7,
+        commit_base: 3 * GIB,
+        commit_reserved: 21 * GIB,
+        ..Default::default()
+    };
+    let streamed = GroupStamps {
+        commit_reserved: 9 * GIB,
+        commit_streamed_not_held: 12 * GIB,
+        ..batched.clone()
+    };
+    let argue = multilinear_block::overlap_argue_bytes(&batched);
+    assert_eq!(argue, 18 * GIB * 5 / 4, "5/4 of the batched growth");
+    assert_eq!(
+        multilinear_block::overlap_argue_bytes(&streamed),
+        argue,
+        "streamed: the batched commit's argue"
+    );
+}

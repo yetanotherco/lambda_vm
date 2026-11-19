@@ -1988,6 +1988,13 @@ pub fn encode_codeword_parts(
     encode_from(Source::Parts { parts, log_evals }, log_blowup, transient)
 }
 
+/// What an encode promises the ledger, in codewords of its own length: its
+/// codeword, and when `transient` (its group's room refused) a working set of
+/// the same size beside it ([`encode_from`]). Held until the codeword drops.
+pub const fn codeword_promise(transient: bool) -> u64 {
+    if transient { 2 } else { 1 }
+}
+
 /// The Reed–Solomon codeword of `source`, on the card, reserved like a
 /// commit's: the codeword, plus its working set when `transient`.
 fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result<DeviceCodeword> {
@@ -2007,7 +2014,7 @@ fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result
     // at a time. A caller committing a group of polynomials promises that once
     // for all of them and passes `transient: false`; one committing alone
     // promises it here.
-    let promise = if transient { 2 } else { 1 };
+    let promise = codeword_promise(transient);
     let Some(room) = be.reserve(n as u64 * 8 * promise) else {
         return Err(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY,
