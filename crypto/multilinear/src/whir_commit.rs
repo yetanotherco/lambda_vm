@@ -1129,7 +1129,10 @@ where
         )?;
         let leaves = (blocks.len() << block_bits).next_power_of_two().max(2);
         if nodes.len() != Self::gathered_nodes(leaves) {
-            return None;
+            // The card answered, wrongly: an error, not a card that declined.
+            return Some(Err(Error::DeviceFailed {
+                stage: "a joint tree's block subtrees came back the wrong length",
+            }));
         }
         TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TOP_LEAVES_REHASHED.fetch_add(
@@ -1230,13 +1233,18 @@ where
 
     /// The queried paths and values of a round-0 tree held as its `stacks`
     /// (one, or a joint tree's run in slot order), every codeword re-encoded
-    /// on the host from its stack read back ([`crate::gpu::CosetSource::encode_on_host`])
-    /// and the queried blocks re-hashed there ([`Self::host_top_paths`]), each
+    /// on the host from its stack read back ([`crate::gpu::HostReencoder`])
+    /// and the queried blocks re-hashed there ([`Self::rehashed_paths`]), each
     /// block's root checked against its kept node. The fallback a prove takes
     /// when the card has room for neither the coset openings nor a re-encode:
-    /// slower (a host transform of every codeword), never refused for memory,
-    /// and the same paths and values, since the transform and the leaves are
-    /// the committed ones.
+    /// slower (a host transform of every codeword) and the same paths and
+    /// values, since the transform and the leaves are the committed ones.
+    ///
+    /// ⚠ It takes host memory a card-full prove may not have: one codeword and
+    /// the twiddles at a time (≈ 4 GiB at a `2^27` stack, blowup 2), since each
+    /// stack's opened blocks are kept and its codeword dropped before the next
+    /// is encoded. A host out of memory kills the process; it is not refused.
+    /// Counted and printed ([`crate::gpu::note_open_host_reencode`]).
     fn host_reencoded_top_paths(
         &self,
         stacks: &[&crate::gpu::CosetSource],
@@ -1244,30 +1252,38 @@ where
         indices: &[usize],
         wanted: &[usize],
     ) -> Result<PathsAndValues<F>, Error> {
-        let mut codewords = stacks
-            .iter()
-            .map(|stack| stack.encode_on_host::<F>().map(Codeword::Host))
-            .collect::<Option<Vec<_>>>()
-            .ok_or(Error::DeviceFailed {
-                stage: "reading a round-0 stack back to the host",
-            })?
-            .into_iter();
-        let codeword = codewords.next().ok_or(Error::JointTreeWidth {
-            expected: self.blocks(),
-            got: 0,
-        })?;
-        let host = Self {
-            tree: Tree::<F, H>::from_root(self.tree.root),
-            codeword,
-            log_folding: self.log_folding,
-            log_domain_size: self.log_domain_size,
-            leaves: self.leaves,
-            top: Some(top.clone()),
-            others: codewords.collect(),
-            joint_tree: None,
-        };
-        let paths = host.host_top_paths(top, indices)?;
-        let values = host.gather(wanted)?;
+        if stacks.len() != self.blocks() {
+            return Err(Error::JointTreeWidth {
+                expected: self.blocks(),
+                got: stacks.len(),
+            });
+        }
+        let started = std::time::Instant::now();
+        let encoder = crate::gpu::HostReencoder::for_stacks(stacks)?;
+        let (blocks, leaves) = self.queried_blocks(top, indices);
+        let positions = self.positions(&leaves);
+        // Every stack's blocks end to end: the joint leaf's bytes (one stack's
+        // alone for a tree of one).
+        let mut leaf_values: Vec<Vec<FieldElement<F>>> = vec![Vec::new(); positions.len()];
+        let mut values: Vec<Vec<FieldElement<F>>> = vec![Vec::new(); wanted.len()];
+        for stack in stacks {
+            let codeword = Codeword::Host(encoder.reencode::<F>(stack)?);
+            for (row, block) in leaf_values
+                .iter_mut()
+                .zip(self.gather_from(&codeword, &positions)?)
+            {
+                row.extend(block);
+            }
+            for (row, block) in values.iter_mut().zip(self.gather_from(&codeword, wanted)?) {
+                row.extend(block);
+            }
+        }
+        let paths = self.rehashed_paths(top, indices, &blocks, &leaf_values)?;
+        crate::gpu::note_open_host_reencode(
+            stacks.len(),
+            encoder.shape(),
+            started.elapsed().as_secs_f64(),
+        );
         Ok((paths, values))
     }
 
@@ -1289,7 +1305,10 @@ where
             device.block_subtrees(self.log_folding, &blocks, dropped, H::DEVICE, self.leaves)?;
         let leaves = (blocks.len() << block_bits).next_power_of_two().max(2);
         if nodes.len() != Self::gathered_nodes(leaves) {
-            return None;
+            // The card answered, wrongly: an error, not a card that declined.
+            return Some(Err(Error::DeviceFailed {
+                stage: "a tree's block subtrees came back the wrong length",
+            }));
         }
         TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TOP_LEAVES_REHASHED.fetch_add(
@@ -1476,22 +1495,7 @@ where
         top: &TreeTop,
         indices: &[usize],
     ) -> Result<Vec<Proof<Commitment>>, Error> {
-        let num_leaves = self.num_leaves();
-        // A block is the `span` leaves under one kept frontier node: `2^d` at
-        // arity 2, `4^d` at arity 4.
-        let block_bits = if Self::arity() == 4 {
-            2 * top.dropped
-        } else {
-            top.dropped
-        };
-        let span = 1usize << block_bits;
-        let mut blocks: Vec<usize> = indices.iter().map(|index| index >> block_bits).collect();
-        blocks.sort_unstable();
-        blocks.dedup();
-        let leaves: Vec<usize> = blocks
-            .iter()
-            .flat_map(|block| (block << block_bits)..((block + 1) << block_bits))
-            .collect();
+        let (blocks, leaves) = self.queried_blocks(top, indices);
         let gathering = std::time::Instant::now();
         // A position's leaf is the block the order puts there.
         let values = self.gather(&self.positions(&leaves))?;
@@ -1499,9 +1503,44 @@ where
             gathering.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.rehashed_paths(top, indices, &blocks, &values)
+    }
+
+    /// The kept blocks `indices` fall in (sorted, once each), and every leaf
+    /// position under them in tree order. A block is the `span` leaves under
+    /// one kept frontier node: `2^d` at arity 2, `4^d` at arity 4.
+    fn queried_blocks(&self, top: &TreeTop, indices: &[usize]) -> (Vec<usize>, Vec<usize>) {
+        let block_bits = self.block_bits(top);
+        let mut blocks: Vec<usize> = indices.iter().map(|index| index >> block_bits).collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        let leaves: Vec<usize> = blocks
+            .iter()
+            .flat_map(|block| (block << block_bits)..((block + 1) << block_bits))
+            .collect();
+        (blocks, leaves)
+    }
+
+    /// [`Self::host_top_paths`] from the leaves' values gathered
+    /// (`values[k·span..(k+1)·span]` under `blocks[k]`, in tree order): each
+    /// block's subtree re-hashed and its root checked against the kept node,
+    /// then each query's path, the kept siblings above it.
+    fn rehashed_paths(
+        &self,
+        top: &TreeTop,
+        indices: &[usize],
+        blocks: &[usize],
+        values: &[Vec<FieldElement<F>>],
+    ) -> Result<Vec<Proof<Commitment>>, Error> {
+        let num_leaves = self.num_leaves();
+        let block_bits = self.block_bits(top);
+        let span = 1usize << block_bits;
         let rehashing = std::time::Instant::now();
         TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        TOP_LEAVES_REHASHED.fetch_add(leaves.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        TOP_LEAVES_REHASHED.fetch_add(
+            (blocks.len() * span) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let frontier = self.frontier(top);
         // Each queried block's subtree depends on its own leaves alone, so the
         // blocks are re-hashed in parallel; the subtrees stay in block order

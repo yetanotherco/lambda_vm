@@ -938,14 +938,21 @@ impl StackSlices {
     }
 
     /// The stack's `2^num_vars` values on the host, zeros between the parts:
-    /// what a fallback with no card room re-encodes there. One device-to-host
-    /// copy a part; nothing is allocated on the card.
-    pub fn to_host(&self) -> Result<Vec<u64>> {
+    /// what a fallback with no card room re-encodes there. Each part copied
+    /// straight into its place (no vector of its own), in a vector of at least
+    /// `capacity` (a codeword's, so the encode grows it where it is); nothing
+    /// is allocated on the card.
+    pub fn to_host_with_capacity(&self, capacity: usize) -> Result<Vec<u64>> {
         let stream = backend()?.next_stream();
-        let mut out = vec![0u64; 1usize << self.num_vars];
-        for &(at, len, offset) in &self.parts {
-            let part = crate::readback::clone_dtoh(&stream, &self.buffer.slice(at..at + len))?;
-            out[offset..offset + len].copy_from_slice(&part);
+        let len = 1usize << self.num_vars;
+        let mut out = Vec::with_capacity(capacity.max(len));
+        out.resize(len, 0u64);
+        for &(at, part, offset) in &self.parts {
+            crate::readback::memcpy_dtoh(
+                &stream,
+                &self.buffer.slice(at..at + part),
+                &mut out[offset..offset + part],
+            )?;
         }
         stream.synchronize()?;
         Ok(out)
