@@ -1411,6 +1411,7 @@ pub fn create_keccak_rnd_air_for(
     let cached = match form {
         KeccakRndForm::Full => "KECCAK_RND",
         KeccakRndForm::Lean => "KECCAK_RND~lean",
+        KeccakRndForm::LeanLocal => "KECCAK_RND~local",
     };
     build_air(
         keccak_rnd_cols::NUM_COLUMNS,
@@ -1421,6 +1422,30 @@ pub fn create_keccak_rnd_air_for(
         cached,
     )
     .with_name("KECCAK_RND")
+}
+
+/// Create the LOCAL_BYTES AIR (`tables::local_bytes`): no constraint, its
+/// three local receivers, and its four leading columns preprocessed — the
+/// multilinear verifier checks them against
+/// [`crate::tables::local_bytes::preprocessed_columns`]. A block format table
+/// alone: no univariate proof commits it, so its univariate root is never
+/// read (a deferred zero root stands in).
+pub fn create_local_bytes_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    use crate::tables::local_bytes;
+    build_air(
+        local_bytes::cols::NUM_COLUMNS,
+        local_bytes::bus_interactions(),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "LOCAL_BYTES",
+    )
+    .with_name("LOCAL_BYTES")
+    .with_lazy_preprocessed_columns(
+        stark::lookup::LazyCommitment::deferred(|| [0u8; 32]),
+        local_bytes::NUM_PRECOMPUTED_COLS,
+        std::sync::Arc::new(local_bytes::preprocessed_columns),
+    )
 }
 
 /// Create KECCAK_RC AIR with bus interactions (preprocessed table).

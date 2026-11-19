@@ -59,6 +59,7 @@ pub mod keccak_w;
 #[cfg(test)]
 mod keccak_w_tests;
 pub mod load;
+pub mod local_bytes;
 pub mod local_to_global;
 pub mod lt;
 /// The fused memory tables' records as the card's fill reads them, as the
