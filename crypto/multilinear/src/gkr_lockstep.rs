@@ -709,6 +709,12 @@ pub enum StepFault {
     /// The step after it proved at its point with the first two coordinates
     /// traded, `(c₂, c₁, ρ)`: the plane read the other way round.
     SwapPlane,
+    /// The tree's output claimed `p + ε` by the caller ([`Faulted::diagonal`]
+    /// holds `ε`), and this two-layer step's halves sent `p₀₁ + δ`, `p₁₀ − δ`
+    /// (indices `b₁b₂`) with `δ = ε / (q₀₀·q₁₁·(q₁₀ − q₀₁))`: at the tree's
+    /// first step the residual holds for the false output, and the plane on
+    /// its diagonal `c₂ = c₁` is the truth. Only an independent `c₂` sees it.
+    Diagonal,
 }
 
 /// `tree` with a [`StepFault`] armed (negative tests only).
@@ -720,6 +726,9 @@ pub struct Faulted<'a, F: IsField> {
     pub layer: usize,
     /// Set once the departing step is open, until the next one opens.
     departed: std::cell::Cell<bool>,
+    /// What the caller added to the tree's output numerator, under
+    /// [`StepFault::Diagonal`]; zero otherwise.
+    epsilon: FieldElement<F>,
 }
 
 impl<'a, F: IsField> Faulted<'a, F> {
@@ -735,6 +744,17 @@ impl<'a, F: IsField> Faulted<'a, F> {
             fault,
             layer,
             departed: std::cell::Cell::new(false),
+            epsilon: FieldElement::zero(),
+        }
+    }
+
+    /// [`StepFault::Diagonal`] at the tree's first step, two layers to layer
+    /// 2, for a caller that claims the tree's output numerator `ε` above the
+    /// true one (the tree itself reports the true output).
+    pub fn diagonal(tree: &'a dyn LadderTree<F>, epsilon: FieldElement<F>) -> Self {
+        Self {
+            epsilon,
+            ..Self::at(tree, StepFault::Diagonal, 2)
         }
     }
 
@@ -759,7 +779,11 @@ impl<'a, F: IsField> Faulted<'a, F> {
         self.departed.set(true);
         match self.fault {
             StepFault::SwapPlane => step,
-            fault => Box::new(Departed { inner: step, fault }),
+            fault => Box::new(Departed {
+                inner: step,
+                fault,
+                epsilon: self.epsilon.clone(),
+            }),
         }
     }
 }
@@ -769,6 +793,7 @@ impl<'a, F: IsField> Faulted<'a, F> {
 struct Departed<'a, F: IsField> {
     inner: Box<dyn TreeStep<F> + 'a>,
     fault: StepFault,
+    epsilon: FieldElement<F>,
 }
 
 impl<F: IsField> TreeStep<F> for Departed<'_, F> {
@@ -791,6 +816,16 @@ impl<F: IsField> TreeStep<F> for Departed<'_, F> {
                 }
             }
             StepFault::SwapPlane => {}
+            StepFault::Diagonal => {
+                if let [h0, h1] = &mut halves[..]
+                    && let Ok(inverse) = (&h0.q_lo * &h1.q_hi * (&h0.q_hi - &h1.q_lo)).inv()
+                {
+                    // p₀₁ is h₁'s lo, p₁₀ is h₀'s hi.
+                    let delta = &self.epsilon * inverse;
+                    h1.p_lo = &h1.p_lo + &delta;
+                    h0.p_hi = &h0.p_hi - &delta;
+                }
+            }
         }
         Ok(halves)
     }
@@ -3685,6 +3720,55 @@ mod tests {
             claims_are_the_inputs(std::slice::from_ref(&short), &claims),
             vec![false]
         );
+    }
+
+    /// The hook a batched argue arms, [`Faulted::diagonal`], sends the
+    /// forger's values above: the same ladder, value for value, refused at
+    /// the next step for the claimed output `p + ε`.
+    #[test]
+    fn the_diagonal_hook_sends_the_forgers_values() {
+        let layers = layers(random_layer(4, 404));
+        let epsilon = FE::from(12345u64);
+        let forger = Diagonal {
+            layers: &layers,
+            epsilon,
+        };
+        let host = HostLayers(&layers);
+        let hooked = Faulted::diagonal(&host, epsilon);
+        let proved = |tree: &dyn LadderTree<F>| {
+            let mut prover = transcript();
+            prove_trees(&[tree], GkrLadder::Double, &mut prover)
+                .unwrap()
+                .0
+        };
+        let values = |proof: &LockstepProof<F>| -> Vec<FE> {
+            proof
+                .layers
+                .iter()
+                .flat_map(|step| {
+                    let rounds = step
+                        .sumcheck
+                        .rounds
+                        .iter()
+                        .flat_map(|r| r.evaluations.iter().copied());
+                    let halves = step
+                        .halves
+                        .iter()
+                        .flat_map(|h| [h.p_lo, h.p_hi, h.q_lo, h.q_hi]);
+                    rounds.chain(halves).collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let honest = proved(&host);
+        let hooked = proved(&hooked);
+        assert_eq!(values(&hooked), values(&proved(&forger)));
+        assert_ne!(values(&hooked), values(&honest), "the hook departs");
+        let (p, q) = host.output();
+        assert_eq!(
+            verify_double(&hooked, &[(p + epsilon, q)], &[4]).unwrap_err(),
+            Error::LayerRelationMismatch { layer: 1 }
+        );
+        assert!(verify_double(&honest, &[(p, q)], &[4]).is_ok());
     }
 
     fn layers_of_two() -> Vec<FractionLayer<F>> {

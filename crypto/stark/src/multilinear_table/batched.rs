@@ -334,6 +334,12 @@ pub struct ProverFaults {
     /// two-layer step, as [`gkr_lockstep::StepFault`] says, and steps
     /// honestly after.
     pub ladder: Option<(usize, gkr_lockstep::StepFault)>,
+    /// This table's bus output forged as under `balance_with`, and on a
+    /// two-layer ladder its first tree's first step shifted along the
+    /// diagonal ([`gkr_lockstep::StepFault::Diagonal`]) so that step's
+    /// residual holds for the forged output; every later step honest. Only
+    /// the plane's second, independent challenge refuses it.
+    pub diagonal: Option<usize>,
 }
 
 /// Which of the batched verifier's checks run. Every one, except in the
@@ -827,9 +833,10 @@ where
         );
     }
 
-    // The fault `balance_with`: the numerator that balances the bus, from every true
-    // output.
-    let fake_output: Option<(usize, FieldElement<E>)> = match faults.balance_with {
+    // The faults `balance_with` and `diagonal`: the numerator that balances
+    // the bus, from every true output, and how far it is from the true one.
+    let fake_output: Option<(usize, FieldElement<E>)> = match faults.balance_with.or(faults.diagonal)
+    {
         None => None,
         Some(target) => {
             let mut outputs = Vec::with_capacity(lists.len());
@@ -1072,14 +1079,22 @@ where
                 (None, None) => unreachable!("a host tree has its layers"),
             })
             .collect();
-        // The fault `ladder`: one tree of this bin departs from the ladder.
-        let armed: Option<(usize, gkr_lockstep::Faulted<'_, E>)> =
-            faults.ladder.and_then(|(target, fault)| {
+        // The faults `ladder` and `diagonal`: one tree of this bin departs
+        // from the ladder.
+        let armed: Option<(usize, gkr_lockstep::Faulted<'_, E>)> = faults
+            .ladder
+            .and_then(|(target, fault)| {
                 let tree = plan.first_tree(target);
                 members
                     .iter()
                     .position(|&(_, i)| i == tree)
                     .map(|k| (k, gkr_lockstep::Faulted::new(refs[k], fault)))
+            })
+            .or_else(|| {
+                let (tree, fake) = fake_output.as_ref().filter(|_| faults.diagonal.is_some())?;
+                let k = members.iter().position(|&(_, i)| i == *tree)?;
+                let epsilon = fake - refs[k].output().0;
+                Some((k, gkr_lockstep::Faulted::diagonal(refs[k], epsilon)))
             });
         let refs: Vec<&dyn gkr_lockstep::LadderTree<E>> = match &armed {
             Some((k, faulted)) => refs
