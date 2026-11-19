@@ -616,22 +616,24 @@ fn the_overlap_priced_resident_proves_the_same_bytes_in_every_place() {
     }
 }
 
-/// The resident-pricing knob's name; it is on by default, and only `0`
-/// turns it off.
+/// The resident-pricing knob's name; it is off by default, and only `1`
+/// turns it on.
 #[test]
-fn the_overlap_resident_knob_is_named_and_on_by_default() {
-    use super::wlfm::{OVERLAP_RESIDENT_ENV, overlap_resident};
+fn the_overlap_resident_knob_is_named_and_off_by_default() {
+    use super::wlfm::{OVERLAP_RESIDENT_ENV, overlap_resident, overlap_resident_word};
     assert_eq!(OVERLAP_RESIDENT_ENV, "LAMBDA_VM_LEVELS_OVERLAP_RESIDENT");
     if std::env::var_os(OVERLAP_RESIDENT_ENV).is_none() {
-        assert!(overlap_resident());
+        assert!(!overlap_resident());
     }
     for (word, on) in [
-        (None, true),
-        (Some(""), true),
+        (None, false),
+        (Some(""), false),
+        (Some("0"), false),
+        (Some("yes"), false),
         (Some("1"), true),
-        (Some(" 0 "), false),
+        (Some(" 1 "), true),
     ] {
-        assert_eq!(!super::wlfm_knobs::knob_word_off(word), on, "{word:?}");
+        assert_eq!(overlap_resident_word(word), on, "{word:?}");
     }
 }
 
@@ -639,9 +641,96 @@ fn the_overlap_resident_knob_is_named_and_on_by_default() {
 /// off.
 #[test]
 fn the_upload_once_knob_is_named_and_on_by_default() {
-    use super::wlfm::{UPLOAD_ONCE_ENV, upload_once};
+    use super::wlfm::{UPLOAD_ONCE_ENV, upload_once, upload_once_word};
     assert_eq!(UPLOAD_ONCE_ENV, "LAMBDA_VM_LEVELS_UPLOAD_ONCE");
     if std::env::var_os(UPLOAD_ONCE_ENV).is_none() {
         assert!(upload_once());
+    }
+    for (word, on) in [
+        (None, true),
+        (Some(""), true),
+        (Some("1"), true),
+        (Some("no"), true),
+        (Some("0"), false),
+        (Some(" 0 "), false),
+    ] {
+        assert_eq!(upload_once_word(word), on, "{word:?}");
+    }
+}
+
+/// A store the card refuses once its plan said yes leaves its group copying
+/// twice, with the same bytes: on a card that group is stamped refused (not
+/// planned out) and uses no store; without a card nothing reaches the plan.
+#[test]
+fn a_store_the_card_refuses_copies_twice_with_the_same_bytes() {
+    use stark::multilinear_block::OverlapFaults;
+    let _restore = UploadOnceRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let card = multilinear::gpu::reserve_budget() > 0;
+    let (program, arenas, build) = probe_placed(WlfmFamily::B3, StackPlace::CardRetired);
+    let (want, _) = streamed_once(&program, &build, &arenas, false, Default::default())
+        .expect("the retired build proves");
+    for place in 0..2 {
+        let (got, groups) = streamed_once(
+            &program,
+            &build,
+            &arenas,
+            true,
+            OverlapFaults {
+                upload_once_card_refuses_at: Some(place),
+                ..Default::default()
+            },
+        )
+        .expect("proves with the store refused by the card");
+        assert!(
+            got == want,
+            "group {place} refused by the card: the same bytes"
+        );
+        let u = &groups[place].upload_once;
+        assert!(!u.used && !u.planned_out, "group {place}: no store ({u:?})");
+        assert_eq!(
+            u.refused, card,
+            "group {place}: refused on a card only ({u:?})"
+        );
+    }
+}
+
+/// The opening of a retired prepared stack takes the store the upload once
+/// handed it: on a card, with the knob on, no opening stages its message from
+/// the host's columns (every group's own store and every prepared store hold
+/// them), and with it off the prepared openings do. Without a card no opening
+/// runs there and the count does not move.
+#[test]
+fn an_opening_handed_the_store_stages_nothing_from_the_host() {
+    let _restore = UploadOnceRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let card = multilinear::gpu::reserve_budget() > 0;
+    let (program, arenas, build) = probe_placed(WlfmFamily::B3, StackPlace::CardRetired);
+    let mut staged = [0u64; 2];
+    for (k, on) in [false, true].into_iter().enumerate() {
+        let before = multilinear::gpu::openings_staged_from_host();
+        let (_, groups) = streamed_once(&program, &build, &arenas, on, Default::default())
+            .expect("the retired build proves");
+        staged[k] = multilinear::gpu::openings_staged_from_host() - before;
+        if card && on {
+            assert!(
+                groups.iter().all(|s| s.upload_once.used),
+                "every retired stack's columns went up once"
+            );
+        }
+    }
+    if card {
+        assert!(
+            staged[0] > 0,
+            "without the store the prepared openings stage from the host"
+        );
+        assert_eq!(
+            staged[1], 0,
+            "with the store no opening stages from the host"
+        );
+    } else {
+        assert_eq!(staged, [0, 0], "no card, no card opening");
     }
 }

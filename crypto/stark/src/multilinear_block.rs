@@ -1665,6 +1665,9 @@ pub struct OverlapFaults {
     /// Under the upload once: the margin its plan keeps free, in place of
     /// 1 GiB (a test's way to make the real plan say no).
     pub upload_once_margin: Option<u64>,
+    /// Under the upload once: the card refuses the store of the group at this
+    /// place once its plan has said yes (on a card only: the plan is a card's).
+    pub upload_once_card_refuses_at: Option<usize>,
 }
 
 /// Every count of a promise the card refused, or of a wait on every stream at
@@ -2927,6 +2930,7 @@ where
     upload_once: bool,
     upload_once_refused: bool,
     upload_once_margin: u64,
+    upload_once_card_refuses: bool,
     /// The planned overlap prices its prepared revive over the upload once's
     /// store ([`BlockCommitted::with_overlap_priced_resident`]).
     overlap_resident: bool,
@@ -3020,8 +3024,10 @@ const OVERLAP_MARGIN_BYTES: u64 = 1 << 30;
 /// Whether the card holds `argued`'s openings beside the argue of the group
 /// stamped `next`, and the plan's bytes `(need, free)`: the group's openings'
 /// planned bytes (the larger of its own stack's revive over its resident
-/// columns and its retired prepared stack's over the host's,
-/// [`RetiredStack::revive_card_bytes`]; the two run one after the other), the
+/// columns and its retired prepared stack's revive, over the host's columns,
+/// or over the upload once's store and that store's bytes when the overlap is
+/// priced resident, [`RetiredStack::revive_card_bytes`]; the two run one after
+/// the other), the
 /// next group's argue bounded by [`OVERLAP_ARGUE_OVER_COMMIT`] of its phase-A
 /// commit's growth, and a margin, against what the ledger's budget has free
 /// now (the group's columns still on the card). Without a card (no budget) the
@@ -3074,6 +3080,13 @@ where
     (need <= free, need, free)
 }
 
+/// Whether the planned overlap prices a retired prepared stack's revive over
+/// its store: only with the upload once on, which is what makes the store
+/// ([`BlockCommitted::with_overlap_priced_resident`]).
+fn priced_resident(upload_once: bool, overlap_resident: bool) -> bool {
+    upload_once && overlap_resident
+}
+
 /// The bytes the upload once's store of `columns` takes on the card.
 fn prepared_store_bytes<F>(columns: &[&multilinear::mle::Mle<F>]) -> u64
 where
@@ -3101,6 +3114,7 @@ fn upload_once_store<F>(
     config: &ChainConfig,
     refused_by_test: bool,
     margin: u64,
+    card_refuses_by_test: bool,
     upload: &mut UploadOnce,
 ) -> Option<multilinear::gpu::ResidentColumns>
 where
@@ -3111,8 +3125,10 @@ where
         upload.planned_out = true;
         return None;
     }
+    // No card, or every column store kept off it (`LAMBDA_VM_NO_GPU_COLUMNS`):
+    // two copies, as without the knob, and nothing refused.
     let budget = multilinear::gpu::reserve_budget();
-    if budget == 0 {
+    if budget == 0 || multilinear::gpu::columns_disabled() {
         return None;
     }
     let bytes = prepared_store_bytes(columns);
@@ -3124,7 +3140,11 @@ where
         upload.planned_out = true;
         return None;
     }
-    match multilinear::gpu::upload_columns(columns) {
+    let store = match card_refuses_by_test {
+        true => None,
+        false => multilinear::gpu::upload_store_columns(columns),
+    };
+    match store {
         Some(store) => {
             upload.used = true;
             upload.bytes = bytes;
@@ -3227,7 +3247,9 @@ where
 
 /// [`open_group`]'s second half: the group's prepared stack, when it has one,
 /// opened on the same fork after its own opening (revived first when it is
-/// retired, over the prepared columns on the host). It reads the group's
+/// retired: over a store of the prepared columns put on the card once for the
+/// revive and the opening both, under the upload once, else over the host's
+/// columns, copied in by the revive and again by the opening). It reads the group's
 /// tables only for their column counts, so the caller may have let their
 /// columns go off the card between the halves.
 #[allow(clippy::type_complexity)]
@@ -3313,6 +3335,7 @@ where
                     config,
                     argued.upload_once_refused,
                     argued.upload_once_margin,
+                    argued.upload_once_card_refuses,
                     &mut upload,
                 ),
                 _ => None,
@@ -3908,7 +3931,8 @@ where
             upload_once_margin: overlap_faults
                 .upload_once_margin
                 .unwrap_or(UPLOAD_ONCE_MARGIN_BYTES),
-            overlap_resident: upload_once && overlap_resident,
+            upload_once_card_refuses: overlap_faults.upload_once_card_refuses_at == Some(p),
+            overlap_resident: priced_resident(upload_once, overlap_resident),
         };
         // Under the planned overlap (retired stacks, the overlap otherwise off),
         // each transition by its own plan.
@@ -3938,10 +3962,11 @@ where
             true,
             overlap_faults.open_fails == Some(p),
         )?;
-        // A retired prepared stack is revived next, over its own columns on
-        // the host: the group's columns go off the card first (nothing reads
-        // them after the group's own opening), so the revive has their room
-        // as well as its codewords'.
+        // A retired prepared stack is revived next, over its own columns (a
+        // store of them on the card under the upload once, else the host's):
+        // the group's columns go off the card first (nothing reads them after
+        // the group's own opening), so the revive has their room as well as
+        // its store's or its codewords'.
         if prepared_is_retired(prepared, g) {
             for table in tables[at..at + size].iter_mut() {
                 table.clear_resident();
@@ -5201,5 +5226,18 @@ mod spill_tests {
         );
         assert_eq!(super::rebuilt_last(&[false; 4]), vec![0, 1, 2, 3]);
         assert_eq!(super::rebuilt_last(&[true; 3]), vec![0, 1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod upload_once_rule_tests {
+    /// The planned overlap prices a prepared revive over the store only with
+    /// the upload once on: with it off there is no store to price.
+    #[test]
+    fn the_overlap_is_priced_resident_only_under_the_upload_once() {
+        assert!(super::priced_resident(true, true));
+        assert!(!super::priced_resident(false, true));
+        assert!(!super::priced_resident(true, false));
+        assert!(!super::priced_resident(false, false));
     }
 }
