@@ -497,13 +497,14 @@ mod tests {
     }
 
     /// The in-place encoder is `encode(lift_coefficients(·))` value for value,
-    /// over polynomials of several sizes onto several domains, one encoder
+    /// over polynomials of several sizes onto several domains (`2^12` reaches
+    /// the bit reversal's parallel branch, from 2,048 values), one encoder
     /// reused for all of a domain's codewords, and keeps a vector with the
     /// domain's capacity where it is.
     #[test]
     fn the_lift_encoder_is_encode_of_the_lift_in_place() {
         use math::field::goldilocks::GoldilocksField as Gl;
-        for log_size in [0usize, 1, 3, 6, 9] {
+        for log_size in [0usize, 1, 3, 6, 9, 12] {
             let encoder = LiftEncoder::<Gl>::new(log_size).unwrap();
             let domain = Domain::<Gl>::new(log_size).unwrap();
             for num_vars in 0..=log_size {
