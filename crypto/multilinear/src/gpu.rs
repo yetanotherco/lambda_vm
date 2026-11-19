@@ -270,6 +270,59 @@ fn note_tree_commit_error(log_len: u32, log_folding: usize, err: &dyn core::fmt:
     });
 }
 
+/// The knob for [`serial_encodes`]: `0` lets a group's encodes run side by
+/// side on their own streams (as before); unset, `1` or anything else, one at
+/// a time.
+pub const SERIAL_ENCODES_ENV: &str = "LAMBDA_VM_COMMIT_ENCODES_SERIAL";
+
+/// ★ Whether a grouped round-0 commit waits for each codeword's encode before
+/// it starts the next (the default). Each encode holds a coefficient buffer of
+/// the stack's size (and its transform's scratch) that the card's memory pool
+/// frees only when its stream reaches the free; four encodes queued on four
+/// streams hold four of them at once, beside the four codewords. The group's
+/// room promises all four (`room_turns_for`), so this is the card the commit
+/// really uses, not what the ledger counts: one at a time holds one, and the
+/// other three buffers' worth of the promise is card left free beside the
+/// commit. The codewords, the tree and the proof's bytes are the same; the
+/// encodes are bandwidth-bound, so running them one after another costs
+/// little. Read once.
+pub fn serial_encodes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| serial_encodes_setting(std::env::var(SERIAL_ENCODES_ENV).ok().as_deref()))
+}
+
+/// [`serial_encodes`]' reading of its knob: only `0` turns it off.
+pub fn serial_encodes_setting(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
+/// Grouped commits' encodes waited for one at a time ([`serial_encodes`]).
+static SERIAL_ENCODE_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// How many encodes a grouped commit waited for before the next.
+pub fn serial_encode_waits() -> u64 {
+    SERIAL_ENCODE_WAITS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn note_serial_encode_wait() {
+    SERIAL_ENCODE_WAITS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod serial_encodes_tests {
+    /// Only `0` lets a group's encodes run side by side.
+    #[test]
+    fn the_serial_encodes_knob_is_on_unless_its_word_is_zero() {
+        use super::serial_encodes_setting as s;
+        assert!(s(None));
+        assert!(s(Some("")));
+        assert!(s(Some("1")));
+        assert!(s(Some("yes")));
+        assert!(!s(Some("0")));
+        assert!(!s(Some(" 0 ")));
+    }
+}
+
 /// Called where a commit gives up on the device. Counts in non-cuda builds
 /// too, where every commit takes that path and the number is the commit count.
 pub(crate) fn note_host_fallback() {

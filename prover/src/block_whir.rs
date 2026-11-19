@@ -8280,6 +8280,15 @@ fn prove_streamed(
         let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
         let pages_first = pages_first(deviations.pages_first)?;
         eprintln!(
+            "★ BLOCK COMMIT ENCODES: {} ({})",
+            if multilinear::gpu::serial_encodes() {
+                "a group's round-0 encodes one at a time (the default)"
+            } else {
+                "a group's round-0 encodes side by side"
+            },
+            multilinear::gpu::SERIAL_ENCODES_ENV
+        );
+        eprintln!(
             "★ BLOCK PAGES FIRST: {} ({PAGES_FIRST_ENV})",
             if pages_first {
                 "the page tables handed on right after KECCAK_RND's (the default)"
