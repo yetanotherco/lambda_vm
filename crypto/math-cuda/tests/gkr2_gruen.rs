@@ -93,11 +93,10 @@ fn upload(stream: &Arc<CudaStream>, values: &[u64]) -> CudaSlice<u64> {
 fn eq_evals(u: &[E]) -> Vec<E> {
     let mut table = vec![E::one()];
     for coordinate in u {
+        // Each cell splits in two, the new variable below the ones before it.
         let mut next = Vec::with_capacity(table.len() * 2);
         for v in &table {
             next.push(v * (E::one() - coordinate));
-        }
-        for v in &table {
             next.push(v * coordinate);
         }
         table = next;
@@ -210,6 +209,62 @@ fn run_layer(
 fn raw(v: &E) -> [u64; 3] {
     let [a, b, c] = v.value();
     [a.canonical(), b.canonical(), c.canonical()]
+}
+
+/// `eq(u, x)` written out: a product over the bits of `x`, `u₀` against the
+/// high bit — the weight the card's split levels multiply to.
+fn eq_at(u: &[E], x: usize) -> E {
+    let bits = u.len();
+    u.iter().enumerate().fold(E::one(), |acc, (i, coordinate)| {
+        if (x >> (bits - 1 - i)) & 1 == 1 {
+            acc * coordinate
+        } else {
+            acc * (E::one() - coordinate)
+        }
+    })
+}
+
+/// The host reference itself, on the host (no card): its `eq` table puts `u₀`
+/// in the high bit, as the card's levels do, and each round's sums are the
+/// two folds composed under that weight, written out a second way — at
+/// shapes where the weight spans several variables.
+#[test]
+fn the_reference_weighs_by_eq_with_its_first_variable_high() {
+    let mut rng = Rng(0x0DD5);
+    for m in [1usize, 2, 4, 5] {
+        let point: Vec<E> = (0..m).map(|_| value(&rng.ext())).collect();
+        let table = eq_evals(&point);
+        for (x, v) in table.iter().enumerate() {
+            assert_eq!(*v, eq_at(&point, x), "m {m}, x {x}: eq's bit order");
+        }
+        let (p, q) = layer(m + 2, 1 << (m + 2), 0x77 + m as u64);
+        let lambda = value(&rng.ext());
+        let mut reference = Reference::new(&p, &q, &point, lambda, 0);
+        let stride = 1usize << m;
+        let cell = |side: &[u64], j: usize, x: usize| {
+            value(&side[(j * stride + x) * 3..(j * stride + x) * 3 + 3])
+        };
+        let sums = reference.round(0, None);
+        let quarter = stride / 2;
+        for (t, got) in sums.iter().enumerate() {
+            let node = E::from(t as u64);
+            let want = (0..quarter).fold(E::zero(), |acc, x| {
+                let at = |side: &[u64], j: usize| {
+                    let (lo, hi) = (cell(side, j, x), cell(side, j, x + quarter));
+                    &lo + &node * (hi - &lo)
+                };
+                let (n, d): (Vec<E>, Vec<E>) = (0..2)
+                    .map(|r| {
+                        let (pl, ph, ql, qh) = (at(&p, r), at(&p, r + 2), at(&q, r), at(&q, r + 2));
+                        (&pl * &qh + &ph * &ql, &ql * &qh)
+                    })
+                    .unzip();
+                let parent = &n[0] * &d[1] + &n[1] * &d[0] + &lambda * (&d[0] * &d[1]);
+                acc + eq_at(&point[1..], x) * parent
+            });
+            assert_eq!(*got, want, "m {m}: H({t}) of round 0");
+        }
+    }
 }
 
 /// ★ Every round's `H(1)..H(4)` (and `H(0)` where asked) and the finish's
