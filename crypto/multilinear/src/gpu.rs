@@ -9127,6 +9127,11 @@ pub(crate) fn commit_joint_streamed(
     match built {
         Ok((tree, root)) => {
             COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+            // The run's other codewords were never held beside the last.
+            STREAMED_NOT_HELD.fetch_add(
+                (blocks.saturating_sub(1) << log_elements) as u64 * 8,
+                Ordering::Relaxed,
+            );
             Some((JointTree(tree), root))
         }
         Err(err) => {
@@ -9188,6 +9193,17 @@ pub(crate) fn commit_joint_streamed(
     None
 }
 
+/// Codeword bytes a streamed joint commit did not hold beside the run's last
+/// codeword ([`commit_joint_streamed`]): `(run − 1) ×` a codeword's, summed. What
+/// a phase-A commit's ledger growth is short of the batched commit's, for a
+/// planner that reads that growth as a measure of the group's size.
+static STREAMED_NOT_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// [`STREAMED_NOT_HELD`] so far.
+pub fn streamed_not_held_bytes() -> u64 {
+    STREAMED_NOT_HELD.load(Ordering::Relaxed)
+}
+
 /// Joint trees built one codeword at a time ([`commit_joint_streamed`]).
 #[cfg(feature = "cuda")]
 pub fn joint_streamed_builds() -> u64 {
@@ -9199,7 +9215,7 @@ pub fn joint_streamed_builds() -> u64 {
     0
 }
 
-/// The knob for [`streamed_joint_leaves`]: `1` turns it on.
+/// The knob for [`streamed_joint_leaves`]: `0` turns it off.
 pub const STREAMED_LEAVES_ENV: &str = "LAMBDA_VM_COMMIT_STREAMED_LEAVES";
 
 /// Test override of [`streamed_joint_leaves`]: 0 none, 1 on, 2 off.
@@ -9212,8 +9228,8 @@ static STREAMED_LEAVES_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::
 /// the commitment keeps no codeword ([`crate::whir_commit::Codeword::Streamed`]),
 /// so only a group committed to be retired before it is opened streams
 /// (`crate::stacked_eval::StackedCommitment::commit_to_retire`, the block
-/// prover's phase A). Off by default (`LAMBDA_VM_COMMIT_STREAMED_LEAVES=1`);
-/// read once.
+/// prover's phase A). On by default (`LAMBDA_VM_COMMIT_STREAMED_LEAVES=0`
+/// commits a run's codewords all at once); read once.
 pub fn streamed_joint_leaves() -> bool {
     match STREAMED_LEAVES_FORCED.load(Ordering::Relaxed) {
         1 => return true,
@@ -9247,9 +9263,24 @@ pub fn joint_runs() -> (u64, u64, u64) {
     )
 }
 
-/// [`streamed_joint_leaves`]' reading of its knob: only `1` turns it on.
+/// [`streamed_joint_leaves`]' reading of its knob: only `0` turns it off.
 pub fn streamed_leaves_setting(value: Option<&str>) -> bool {
-    value.map(str::trim) == Some("1")
+    value.map(str::trim) != Some("0")
+}
+
+#[cfg(test)]
+mod streamed_leaves_knob_tests {
+    /// Streamed by default: only `0` commits a run's codewords all at once.
+    #[test]
+    fn the_streamed_leaves_knob_is_on_unless_its_word_is_zero() {
+        use super::streamed_leaves_setting as s;
+        assert!(s(None));
+        assert!(s(Some("")));
+        assert!(s(Some("1")));
+        assert!(s(Some("yes")));
+        assert!(!s(Some("0")));
+        assert!(!s(Some(" 0 ")));
+    }
 }
 
 /// Restores [`streamed_joint_leaves`]' previous override when dropped.

@@ -2058,7 +2058,7 @@ where
 /// on, the run is streamed into its leaves one codeword at a time and the
 /// commitment keeps no codeword. A commitment that may be opened whole
 /// (`retired` false) is never streamed.
-pub fn commit_joint_stacked_for<F, H>(
+pub(crate) fn commit_joint_stacked_for<F, H>(
     polys: &[Stacked<'_, F>],
     config: &ChainConfig,
     transient: bool,

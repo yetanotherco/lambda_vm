@@ -237,6 +237,13 @@ pub struct GroupStamps {
     /// (`multilinear::gpu::pool_reserved_now`). Bytes; 0 without a device.
     pub commit_pool_before: u64,
     pub commit_pool_after: u64,
+    /// The commit's joint runs: committed, of them committed to be retired,
+    /// of them streamed into their leaves (`multilinear::gpu::joint_runs`).
+    pub joint_runs: [u64; 3],
+    /// Codeword bytes the commit's streamed runs did not hold
+    /// (`multilinear::gpu::streamed_not_held_bytes`): with
+    /// `commit_reserved − commit_base`, the batched commit's growth.
+    pub commit_streamed_not_held: u64,
     /// The group's columns were to go up beside the previous group's commit
     /// and the ledger refused them; they went up after it.
     pub ahead_refused: bool,
@@ -1963,6 +1970,8 @@ where
             stamp.polys = layout.num_polys();
             stamp.commit_base = multilinear::gpu::ledger_reserved();
             stamp.commit_pool_before = multilinear::gpu::pool_reserved_now();
+            let runs_before = multilinear::gpu::joint_runs();
+            let not_held_before = multilinear::gpu::streamed_not_held_bytes();
             multilinear::gpu::reset_reserved_window();
             // Handles, not field elements: a table held narrow is read on the
             // host only by a host fallback.
@@ -2058,6 +2067,14 @@ where
             ood.push(committed.ood);
             stamp.commit_reserved = multilinear::gpu::reserved_window_peak();
             stamp.commit_pool_after = multilinear::gpu::pool_reserved_now();
+            let runs = multilinear::gpu::joint_runs();
+            stamp.joint_runs = [
+                runs.0.saturating_sub(runs_before.0),
+                runs.1.saturating_sub(runs_before.1),
+                runs.2.saturating_sub(runs_before.2),
+            ];
+            stamp.commit_streamed_not_held =
+                multilinear::gpu::streamed_not_held_bytes().saturating_sub(not_held_before);
             stamp.tree_bytes = retired.tree_bytes();
             stamp.committed_at = started.elapsed().as_secs_f64();
             if upload_ahead && let Some(packed) = packing.take() {
@@ -2955,9 +2972,12 @@ where
 
 /// Under the planned overlap, a group's argue is planned to promise at most
 /// this share (numerator, denominator) of what the ledger grew by through the
-/// same group's phase-A commit (`commit_reserved − commit_base`): on the
-/// levels' real median the argue grew by 0.6–1.19 of it (level 1's group 1:
-/// 14.34 GiB against 12.0), so 5/4.
+/// same group's phase-A commit as the batched commit holds it
+/// (`commit_reserved − commit_base`, plus the codewords a streamed run did not
+/// hold, `commit_streamed_not_held`): on the levels' real median the argue
+/// grew by 0.6–1.19 of it (level 1's group 1: 14.34 GiB against 12.0), so
+/// 5/4. The streamed bytes are added back so the plan reads the group's size,
+/// not how its commit held its codewords.
 const OVERLAP_ARGUE_OVER_COMMIT: (u64, u64) = (5, 4);
 
 /// Under the planned overlap, the card kept free beside the plan.
@@ -3005,6 +3025,7 @@ where
     let argue = next
         .commit_reserved
         .saturating_sub(next.commit_base)
+        .saturating_add(next.commit_streamed_not_held)
         .saturating_mul(num)
         / den;
     let need = own
