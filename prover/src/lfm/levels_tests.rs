@@ -639,6 +639,75 @@ fn the_blake3_driver_with_level_1_filled_beside_proves_the_same_level_bytes() {
     }
 }
 
+/// The BLAKE3 driver with every level's prepared stacks retired and each group
+/// opened beside the next group's argue where the plan fits
+/// (`LAMBDA_VM_LEVELS_OVERLAP_PLANNED`) proves the same level bytes as
+/// [`prove_levels`] does over the same base with held stacks; it reports how
+/// many groups opened beside and how many the plan kept alone. Needs
+/// `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels twice; box tier, deterministic grind"]
+fn the_blake3_driver_with_the_planned_overlap_proves_the_same_level_bytes() {
+    use super::levels::{prove_block_levels, set_stacks_for_test};
+    use super::wlfm::{StackPlace, set_overlap_planned_for_test};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_overlap_planned_for_test(None);
+        }
+    }
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    let run = {
+        let _restore = Restore;
+        let _retired = set_stacks_for_test(Some(StackPlace::CardRetired));
+        set_overlap_planned_for_test(Some(true));
+        prove_block_levels(
+            &elf,
+            &[],
+            &opts,
+            &format,
+            &streamed_options(),
+            WlfmFamily::B3,
+            LevelStop::DEFAULT,
+            true,
+            true,
+        )
+        .expect("the BLAKE3 block proves to its last level")
+    };
+    let count = |f: &dyn Fn(&stark::multilinear_block::GroupStamps) -> bool| -> usize {
+        run.times
+            .stamps
+            .iter()
+            .map(|st| st.groups.iter().filter(|g| f(g)).count())
+            .sum()
+    };
+    let beside = count(&|g| g.overlapped);
+    let planned_out = count(&|g| g.overlap_planned_out);
+    println!("LEVELS OVERLAP PLANNED: {beside} groups opened beside · {planned_out} planned out");
+    let held = {
+        let _held = set_stacks_for_test(Some(StackPlace::Card));
+        derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive")
+    };
+    let (proofs, _) = prove_levels(&run.plan, &held, &run.base_proof).expect("the levels prove");
+    assert_eq!(proofs.len(), run.proofs.len());
+    for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+        let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+        let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+        assert!(a[..] == b[..], "level {}: the same proof bytes", k + 1);
+        println!(
+            "LEVELS OVERLAP PLANNED IDENTITY level {}: {} B equal",
+            k + 1,
+            a.len()
+        );
+    }
+}
+
 /// The fill-beside knob's name; it is on by default, and only `0` turns it
 /// off.
 #[test]
@@ -1354,7 +1423,8 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
             "{tag} GROUP {g}: tables {} · polys {} · cells {} · wait A {:.3}s · up A {:.3}s (paid \
              {:.3}) · commit {:.3}s · retire {:.3}s · up B {:.3}s · argue {:.3}s · encode {:.3}s · \
              open {:.3}s · prepared revive {:.3}s · open paid {:.3}s · overlapped {} · columns gone \
-             before revive {} · turn {:.3}-{:.3}s · GiB promised: commit {:.2}/{:.2} · argue {:.2}/{:.2} · open {:.2}{}",
+             before revive {} · overlap planned out {} at {:.2} of {:.2} GiB · turn {:.3}-{:.3}s · GiB \
+             promised: commit {:.2}/{:.2} · argue {:.2}/{:.2} · open {:.2}{}",
             s.tables,
             s.polys,
             s.cells,
@@ -1371,6 +1441,9 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
             s.open_paid,
             s.overlapped,
             s.columns_gone_before_revive,
+            s.overlap_planned_out,
+            gib(s.overlap_plan_need),
+            gib(s.overlap_plan_free),
             s.start_b,
             s.end_b,
             gib(s.commit_base),

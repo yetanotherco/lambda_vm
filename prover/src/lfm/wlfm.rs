@@ -149,6 +149,16 @@ macro_rules! with_wlfm_hash {
 /// base's groups take three (`block_whir::BLOCK_GROUP_POLYS`).
 pub const WLFM_GROUP_POLYS: usize = 4;
 
+/// [`WLFM_GROUP_POLYS`], or a test's own on this thread
+/// (`test_format::set_group_polys`), so a small fixture spans several groups.
+fn wlfm_group_polys() -> usize {
+    #[cfg(test)]
+    if let Some(n) = test_format::group_polys() {
+        return n;
+    }
+    WLFM_GROUP_POLYS
+}
+
 /// Queries a chain runs at [`WlfmRate::Four`]: the fewest that keep the unique-
 /// decoding figure at the base's 113.04 bits, `141 · log2(8/5) + 18 = 113.61`
 /// (140 would give 112.93). At blowup 2 the count is the base's own derivation.
@@ -1626,7 +1636,7 @@ pub fn prepare_wlfm_rounds(
     }
     let shapes = table_shapes(&refs, &table_num_vars);
     let config = wlfm_config_rounds(rate, final_poly, fold, grind, rounds, &shapes)?;
-    let sizes = multilinear_block::block_groups(&shapes, config.format.stack, WLFM_GROUP_POLYS)
+    let sizes = multilinear_block::block_groups(&shapes, config.format.stack, wlfm_group_polys())
         .map_err(|e| format!("{e:?}"))?;
     let group_lists: Vec<Vec<u32>> = {
         let mut at = 0u32;
@@ -2334,6 +2344,8 @@ fn prove_traces_under<H: WhirHash>(
             .map(|b| {
                 b.with_phase_b_overlap(phase_b_overlap(stacks))
                     .with_phase_b_upload_beside(uploads_beside(stacks))
+                    .with_phase_b_overlap_planned(overlap_planned())
+                    .with_overlap_faults(overlap_faults_for_test())
             })
         }
     }
@@ -2497,7 +2509,7 @@ fn verifier_frame(artifacts: &WlfmArtifacts, airs: &WlfmAirs) -> Result<Verifier
         return Err("the artifacts' config is not their rate's over their shapes".into());
     }
     let sizes =
-        multilinear_block::block_groups(&shapes, artifacts.config.format.stack, WLFM_GROUP_POLYS)
+        multilinear_block::block_groups(&shapes, artifacts.config.format.stack, wlfm_group_polys())
             .map_err(|e| format!("{e:?}"))?;
     if sizes != artifacts.sizes {
         return Err("the artifacts' groups are not their shapes'".into());
@@ -2739,6 +2751,53 @@ pub(crate) fn program_prep_groups(program: &LfmProgram) -> Vec<Cow<'_, ColumnGro
     out
 }
 
+/// `LAMBDA_VM_LEVELS_OVERLAP_PLANNED=1`: a W-LFM prove whose prepared stacks are
+/// retired (phase B's overlap otherwise off, [`phase_b_overlap`]) opens each
+/// group beside the next group's argue where the plan says the card holds both
+/// ([`multilinear_block::BlockCommitted::with_phase_b_overlap_planned`]), and
+/// alone where it does not. The overlap moves no byte. Only the W-LFM prover
+/// (the levels') reads it; the base's block prover never sets it. Off by
+/// default (and for any word but `1`); read once a process.
+pub const OVERLAP_PLANNED_ENV: &str = "LAMBDA_VM_LEVELS_OVERLAP_PLANNED";
+
+thread_local! {
+    /// A test's [`overlap_planned`] on this thread.
+    static OVERLAP_PLANNED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's phase-B faults on this thread's streamed proves.
+    static OVERLAP_FAULTS_FOR_TEST: std::cell::Cell<multilinear_block::OverlapFaults> =
+        std::cell::Cell::new(multilinear_block::OverlapFaults::default());
+}
+
+/// Tests only: [`overlap_planned`] forced on this thread (`None` restores the
+/// knob).
+#[doc(hidden)]
+pub fn set_overlap_planned_for_test(on: Option<bool>) {
+    OVERLAP_PLANNED_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`OVERLAP_PLANNED_ENV`] is on (or this thread's test override).
+pub fn overlap_planned() -> bool {
+    if let Some(on) = OVERLAP_PLANNED_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(OVERLAP_PLANNED_ENV).ok().as_deref())
+    })
+}
+
+/// Tests only: this thread's streamed W-LFM proves take `faults` in phase B
+/// (the default, none, restores them).
+#[doc(hidden)]
+pub fn set_overlap_faults_for_test(faults: multilinear_block::OverlapFaults) {
+    OVERLAP_FAULTS_FOR_TEST.with(|c| c.set(faults));
+}
+
+/// This thread's test faults: none outside a test that set them.
+fn overlap_faults_for_test() -> multilinear_block::OverlapFaults {
+    OVERLAP_FAULTS_FOR_TEST.with(std::cell::Cell::get)
+}
+
 /// `LAMBDA_VM_LEVELS_PREPARE_PAR=1`: a W-LFM build's host part turns its
 /// tables' row-major groups into columns on the prover's pool
 /// ([`group_columns_par`]), every table at once, where it otherwise does one
@@ -2822,6 +2881,25 @@ pub(crate) mod test_format {
         static NARROW_CHIPS: Cell<Option<bool>> = const { Cell::new(None) };
         static CHIP_RECORDS: Cell<Option<bool>> = const { Cell::new(None) };
         static LEAN_BESIDE: Cell<Option<bool>> = const { Cell::new(None) };
+        static GROUP_POLYS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Every W-LFM build and verify on this thread groups `polys` stacked
+    /// polynomials a group until the guard drops.
+    pub(crate) struct GroupPolysOverride(Option<usize>);
+
+    impl Drop for GroupPolysOverride {
+        fn drop(&mut self) {
+            GROUP_POLYS.with(|c| c.set(self.0));
+        }
+    }
+
+    pub(crate) fn set_group_polys(polys: usize) -> GroupPolysOverride {
+        GroupPolysOverride(GROUP_POLYS.with(|c| c.replace(Some(polys))))
+    }
+
+    pub(super) fn group_polys() -> Option<usize> {
+        GROUP_POLYS.with(Cell::get)
     }
 
     /// Every W-LFM build on this thread cuts its chips at `2^log` rows until

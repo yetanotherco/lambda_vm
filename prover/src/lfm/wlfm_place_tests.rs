@@ -275,3 +275,160 @@ fn the_card_budget_knob_reads_a_percent_and_refuses_nonsense() {
         assert!(parse_card_budget(Some(bad)).is_err(), "{bad}");
     }
 }
+
+/// Restores this thread's planned-overlap knob and phase-B faults.
+struct OverlapRestore;
+
+impl Drop for OverlapRestore {
+    fn drop(&mut self) {
+        super::wlfm::set_overlap_planned_for_test(None);
+        super::wlfm::set_overlap_faults_for_test(Default::default());
+    }
+}
+
+/// `program`'s build streamed under the planned-overlap knob `on` and phase-B
+/// `faults`: its bytes and its groups' stamps; refused proofs and failed
+/// verifications are the error.
+fn streamed_planned(
+    program: &LfmProgram,
+    build: &WlfmBuild,
+    arenas: &[Vec<super::word::LfmWord>],
+    on: bool,
+    faults: stark::multilinear_block::OverlapFaults,
+) -> Result<(Vec<u8>, Vec<stark::multilinear_block::GroupStamps>), String> {
+    super::wlfm::set_overlap_planned_for_test(Some(on));
+    super::wlfm::set_overlap_faults_for_test(faults);
+    let _ = super::wlfm::take_wlfm_stamps();
+    let filled = super::wlfm::execute_and_fill_unmerged(program, arenas, build.artifacts.hasher)?;
+    let proof =
+        super::wlfm::prove_wlfm_traces_as(build, filled, true, super::wlfm::WlfmProving::Streamed)?;
+    verify_wlfm(&build.artifacts, &proof, &proof.public_words)?;
+    let groups = super::wlfm::take_wlfm_stamps()
+        .map(|s| s.groups)
+        .unwrap_or_default();
+    Ok((bytes(&proof), groups))
+}
+
+/// The level-shaped probe at one stacked polynomial a group (two groups, each
+/// with a prepared stack), its build in `place` under `family`.
+fn probe_placed(
+    family: WlfmFamily,
+    place: StackPlace,
+) -> (LfmProgram, Vec<Vec<super::word::LfmWord>>, WlfmBuild) {
+    let (program, arenas) = super::levels_probe::level_program(4, 256);
+    let build = placed(&program, super::wlfm_tests::HASHER, family, place);
+    (program, arenas, build)
+}
+
+/// ★ Phase B's planned overlap under retired stacks
+/// (`LAMBDA_VM_LEVELS_OVERLAP_PLANNED`) moves no byte in any place: under both
+/// families, the level-shaped probe (two groups) streamed with its retired
+/// build's groups opened beside the next group's argue proves the held build's
+/// bytes, and its stamps say every group but the last opened beside (no card:
+/// the plan always fits) with none planned out; held and host builds overlap
+/// as they always have, and the knob off leaves a retired build serial.
+#[test]
+fn the_planned_overlap_proves_the_same_bytes_in_every_place() {
+    let _restore = OverlapRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    for family in [WlfmFamily::P1, WlfmFamily::B3] {
+        let (program, arenas, held) = probe_placed(family, StackPlace::Card);
+        let (want, _) = streamed_planned(&program, &held, &arenas, false, Default::default())
+            .expect("the held build proves");
+        for place in [StackPlace::CardRetired, StackPlace::Card, StackPlace::Host] {
+            let (_, _, build) = probe_placed(family, place);
+            for on in [false, true] {
+                let (got, groups) =
+                    streamed_planned(&program, &build, &arenas, on, Default::default())
+                        .unwrap_or_else(|e| panic!("{family:?} {place:?} {on}: {e}"));
+                assert!(
+                    got == want,
+                    "{family:?} {place:?} planned {on}: the held bytes"
+                );
+                assert!(groups.len() >= 2, "{family:?}: several groups");
+                let beside = groups.iter().filter(|s| s.overlapped).count();
+                assert!(
+                    groups.iter().all(|s| !s.overlap_planned_out),
+                    "{family:?} {place:?} {on}: nothing planned out without a card"
+                );
+                if place == StackPlace::CardRetired && !on {
+                    assert_eq!(beside, 0, "{family:?}: retired and off, every group alone");
+                } else {
+                    assert_eq!(
+                        beside,
+                        groups.len() - 1,
+                        "{family:?} {place:?} {on}: every group but the last beside"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The planned overlap falls back to the same bytes in the W-LFM prover: a
+/// transition the plan refuses opens alone; an opening that fails beside an
+/// argue is the prove's error, not a panic; a moved prepared column is
+/// refused with the overlap on. (The refusal latch over several transitions:
+/// stark's `the_planned_overlaps_fallbacks_prove_the_same_bytes`.)
+#[test]
+fn a_refused_planned_overlap_falls_back_to_the_same_bytes() {
+    use stark::multilinear_block::OverlapFaults;
+    let _restore = OverlapRestore;
+    let _fast = test_format::set(Some(2));
+    let _groups = test_format::set_group_polys(1);
+    let (program, arenas, build) = probe_placed(WlfmFamily::B3, StackPlace::CardRetired);
+    let (want, groups) = streamed_planned(&program, &build, &arenas, true, Default::default())
+        .expect("the retired build proves with the planned overlap");
+    assert!(
+        groups.len() >= 2 && groups[0].overlapped,
+        "group 0 opened beside"
+    );
+    let (got, groups) = streamed_planned(
+        &program,
+        &build,
+        &arenas,
+        true,
+        OverlapFaults {
+            overlap_refused_at: Some(0),
+            ..Default::default()
+        },
+    )
+    .expect("proves with the transition planned out");
+    assert!(got == want, "a planned-out transition: the same bytes");
+    assert!(
+        groups[0].overlap_planned_out && !groups[0].overlapped,
+        "group 0 opened alone"
+    );
+    let failed = streamed_planned(
+        &program,
+        &build,
+        &arenas,
+        true,
+        OverlapFaults {
+            open_fails: Some(0),
+            ..Default::default()
+        },
+    );
+    assert!(
+        failed.is_err(),
+        "a failed opening beside an argue is the prove's error"
+    );
+    let (moved, done) = build.with_prepared_column_moved();
+    assert!(done, "the probe has a prepared column");
+    assert!(
+        streamed_planned(&program, &moved, &arenas, true, Default::default()).is_err(),
+        "a moved prepared column is refused with the planned overlap"
+    );
+}
+
+/// The planned-overlap knob's name; it is off by default, and only `1` turns
+/// it on.
+#[test]
+fn the_overlap_planned_knob_is_named_and_off_by_default() {
+    use super::wlfm::{OVERLAP_PLANNED_ENV, overlap_planned};
+    assert_eq!(OVERLAP_PLANNED_ENV, "LAMBDA_VM_LEVELS_OVERLAP_PLANNED");
+    if std::env::var_os(OVERLAP_PLANNED_ENV).is_none() {
+        assert!(!overlap_planned());
+    }
+}
