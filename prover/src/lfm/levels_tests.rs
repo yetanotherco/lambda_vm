@@ -945,6 +945,60 @@ fn the_verifiers_derivation_refuses_an_emitter_fault() {
         .expect("the unvalidated fast emit returns the program");
 }
 
+/// ★ The admitted derivation moves no byte: level 1's program from
+/// `closed_block_program_admitted` is the program the unvalidated emit compiles
+/// sequentially (instruction for instruction, once the validator admits it),
+/// and the level `derive_levels` builds from it has the same `program_id` and
+/// the same artifacts as a level built from that program directly; every
+/// derived level verifies its own level's identity.
+#[test]
+#[ignore = "proves a small block's base; box tier"]
+fn the_admitted_derivation_is_the_derivation_byte_for_byte() {
+    use super::levels::{build_level, level_rounds};
+    let format = b3_format();
+    let (elf, base) = b3_small_block("test_commit_4", &format);
+    let plan = b3_plan(&elf, &base, &format);
+    let admitted = plan
+        .closed_block_program_admitted()
+        .expect("the plan's program is admitted")
+        .into_program();
+    let (emitted, _, _) = plan
+        .closed_block_program_marked_timed(false)
+        .expect("the plan's program emits");
+    super::validator::validate(&emitted).expect("and is admissible");
+    // `Instr` has no `PartialEq`: compare each instruction's printed form.
+    let digest = |instrs: &[super::instr::Instr]| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for i in instrs {
+            format!("{i:?}").hash(&mut h);
+        }
+        (instrs.len(), h.finish())
+    };
+    assert_eq!(
+        digest(&admitted.instrs),
+        digest(&emitted.instrs),
+        "the admitted program is the emitted one, instruction for instruction"
+    );
+    let direct = build_level(admitted, WlfmFamily::B3, level_rounds(&plan), true)
+        .expect("a level built from the admitted program");
+    let derived = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");
+    let first = &derived[0].build.artifacts;
+    assert_eq!(
+        first.program_id, direct.build.artifacts.program_id,
+        "the derived level 1's program id"
+    );
+    assert_eq!(
+        format!("{first:?}"),
+        format!("{:?}", direct.build.artifacts),
+        "the derived level 1's artifacts"
+    );
+    println!(
+        "LEVELS ADMITTED DERIVATION: level 1 program id equal · artifacts equal · {} levels derived",
+        derived.len()
+    );
+}
+
 /// The fill-beside knob's name; it is on by default, and only `0` turns it
 /// off.
 #[test]
