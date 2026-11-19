@@ -1085,6 +1085,7 @@ impl WhirBlockPlan {
                 Some(planning) => super::whir_batch::batched_argue_cost(
                     &shapes,
                     &owned.argue_plan(planning),
+                    planning.ladder(),
                     entry,
                 )
                 .perms(),
@@ -2247,41 +2248,41 @@ impl<'a> Shapes<'a> {
 }
 
 /// The batched argue's planning constants when the block's format batches its
-/// groups: its bin cap and its GKR packing, both the format's. A ladder of
-/// two tree layers a step is refused by name: the leaf verifies one-layer
-/// ladders only.
+/// groups: its bin cap, its GKR packing and its GKR ladder, all the format's.
 pub(crate) fn batched_cap(
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<Option<BatchedPlanning>, String> {
-    use multilinear::whir_chain::{ArgueFormat, GkrLadder};
+    use multilinear::whir_chain::ArgueFormat;
     match config.format.argue {
-        ArgueFormat::Batched {
-            ladder: GkrLadder::Double,
-            ..
-        } => Err(
-            "the recursion's leaf verifies one tree layer a GKR ladder step: a base argued two \
-             layers a step has no leaf yet"
-                .to_string(),
-        ),
         ArgueFormat::Batched {
             bin_log_cells,
             pack,
-            ladder: GkrLadder::Single,
+            ladder,
         } => Ok(Some(BatchedPlanning {
             bin_log_cells,
             pack,
+            ladder,
         })),
         ArgueFormat::PerTable => Ok(None),
     }
 }
 
-/// What plans a batched group, the format's two constants: the bin cap and
+/// What plans a batched group, the format's three constants: the bin cap and
 /// how a table's interactions are laid into trees (the host's
-/// `argue_plan_packed`, called, never restated).
+/// `argue_plan_packed`, called, never restated), and how many tree layers a
+/// ladder step proves (the host's `ladder_steps`, called by the leg).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BatchedPlanning {
     bin_log_cells: u8,
     pack: multilinear::whir_chain::GkrPack,
+    ladder: multilinear::whir_chain::GkrLadder,
+}
+
+impl BatchedPlanning {
+    /// The format's GKR ladder.
+    pub(crate) fn ladder(&self) -> multilinear::whir_chain::GkrLadder {
+        self.ladder
+    }
 }
 
 /// How a table's preprocessed columns are discharged in a leaf: the epoch's
@@ -2883,14 +2884,21 @@ fn emit_leaf_over(
             // The group's tables in one batched argue, its bins the host's.
             Some(planning) => {
                 let argue_plan = owned.argue_plan(planning);
-                let store =
-                    super::whir_batch::hint_batched_shaped(b, arena, &mut at, &shapes, &argue_plan);
+                let store = super::whir_batch::hint_batched_shaped(
+                    b,
+                    arena,
+                    &mut at,
+                    &shapes,
+                    &argue_plan,
+                    planning.ladder(),
+                );
                 super::whir_batch::emit_batched_walk(
                     b,
                     &mut fork,
                     &store,
                     &shapes,
                     &argue_plan,
+                    planning.ladder(),
                     &plans,
                     &slots,
                     z,
@@ -3290,7 +3298,11 @@ pub fn group_arena_words(
         Some(planning) => {
             let argue = argue.ok_or("the proof is short of batched argues")?;
             let shapes = owned.table_shapes();
-            let expected = super::whir_batch::batched_words(&shapes, &owned.argue_plan(planning));
+            let expected = super::whir_batch::batched_words(
+                &shapes,
+                &owned.argue_plan(planning),
+                planning.ladder(),
+            );
             super::whir_batch::push_batched_words(&mut words, argue);
             if words.len() != expected {
                 return Err(format!(
@@ -3486,7 +3498,8 @@ mod pack_tests {
             production,
             Some(super::BatchedPlanning {
                 bin_log_cells: 26,
-                pack: GkrPack::PRODUCTION
+                pack: GkrPack::PRODUCTION,
+                ladder: multilinear::whir_chain::GkrLadder::Single,
             })
         );
         assert_eq!(super::batched_cap(&config(ArgueFormat::PerTable)), Ok(None));
@@ -3500,20 +3513,24 @@ mod pack_tests {
             super::batched_cap(&config(packed)),
             Ok(Some(super::BatchedPlanning {
                 bin_log_cells: 26,
-                pack
+                pack,
+                ladder: multilinear::whir_chain::GkrLadder::Single,
             }))
         );
     }
 
-    /// A batched group argued two tree layers a GKR step has no leaf yet:
-    /// the recursion refuses to plan it, by name, rather than verify it as
-    /// one layer a step.
+    /// The recursion plans a batched group by the format's GKR ladder too:
+    /// a two-layer ladder is carried to the leg, never read as one layer a
+    /// step.
     #[test]
-    fn the_recursion_refuses_a_two_layer_ladder() {
+    fn the_recursion_plans_by_the_formats_ladder() {
         use multilinear::whir_chain::GkrLadder;
-        let double = ArgueFormat::BATCHED.with_ladder(GkrLadder::Double);
-        let refused = super::batched_cap(&config(double)).expect_err("refused");
-        assert!(refused.contains("two"), "{refused}");
+        for ladder in [GkrLadder::Single, GkrLadder::Double] {
+            let planning = super::batched_cap(&config(ArgueFormat::BATCHED.with_ladder(ladder)))
+                .expect("batched")
+                .expect("a batched plan");
+            assert_eq!(planning.ladder(), ladder);
+        }
         assert_eq!(
             super::batched_cap(&config(ArgueFormat::BATCHED.with_ladder(GkrLadder::Single))),
             super::batched_cap(&config(ArgueFormat::BATCHED))

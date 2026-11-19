@@ -325,14 +325,21 @@ pub fn emit_wlfm_leg(
         let mut fork = transcript.clone();
         fork.absorb_const_bytes(&(g as u64).to_le_bytes());
         let argue_plan = owned.argue_plan(cap);
-        let store =
-            super::whir_batch::hint_batched_shaped(b, arena, &mut at, &table_shapes, &argue_plan);
+        let store = super::whir_batch::hint_batched_shaped(
+            b,
+            arena,
+            &mut at,
+            &table_shapes,
+            &argue_plan,
+            cap.ladder(),
+        );
         let walk = super::whir_batch::emit_batched_walk(
             b,
             &mut fork,
             &store,
             &table_shapes,
             &argue_plan,
+            cap.ladder(),
             &plans,
             &slots,
             z,
@@ -550,7 +557,8 @@ pub fn wlfm_leg_arena(child: &WlfmChild, proof: &WlfmProof) -> Result<Vec<LfmWor
         let table_shapes = owned.table_shapes();
         let before = words.len();
         super::whir_batch::push_batched_words(&mut words, &proof.argues[g]);
-        let expected = super::whir_batch::batched_words(&table_shapes, &owned.argue_plan(cap));
+        let expected =
+            super::whir_batch::batched_words(&table_shapes, &owned.argue_plan(cap), cap.ladder());
         if words.len() - before != expected {
             return Err(format!(
                 "group {g}'s batched argue carries {} words, its shapes {expected}",

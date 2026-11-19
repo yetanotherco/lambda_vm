@@ -18,6 +18,8 @@
 
 use multilinear::claim_reduce::FactorSource;
 use multilinear::constraint_argument::FactorKind;
+use multilinear::gkr_lockstep::{LadderStep, Relation, ladder_steps};
+use multilinear::whir_chain::GkrLadder;
 use stark::multilinear_table::{ArguePlan, weight_slots};
 
 use crate::tables::types::FEE;
@@ -28,7 +30,6 @@ use super::whir_air::{combine_rows, emit_combine};
 use super::whir_bus::{
     BusInputs, Cost, claim_statements_cost, emit_claim_statements, emit_eq_evals, eq_evals_cost,
 };
-use super::whir_gkr::GKR_SUMCHECK_DEGREE;
 use super::whir_poly::{
     challenge_powers_rows, emit_challenge_powers, emit_eq_eval, emit_sumcheck_rounds,
     eq_eval_rows_again, sumcheck_round_rows,
@@ -45,11 +46,14 @@ use super::whir_transcript::{
 /// Rows an `assert_eq_ext` lowers to (`builder.rs:289-292`).
 const ASSERT_ROWS: usize = 2;
 
-/// One ladder step as wires: the shared sumcheck's rounds (`i` of them at step
-/// `i`, three evaluations each) and every active tree's four halves.
+/// One ladder step as wires: the shared sumcheck's rounds (as many as the
+/// step's parent layer has variables, each of the step's degree in
+/// evaluations) and every active tree's halves — one under a one-layer
+/// relation, `h₀` then `h₁` under a two-layer one
+/// ([`multilinear::gkr_lockstep::ladder_steps`]).
 pub struct LadderStepWires {
     pub sumcheck: Vec<Vec<Ext>>,
-    /// `[p_lo, p_hi, q_lo, q_hi]` per active tree, in table order.
+    /// `[p_lo, p_hi, q_lo, q_hi]` per half, the active trees in table order.
     pub halves: Vec<[Ext; 4]>,
 }
 
@@ -77,15 +81,40 @@ pub struct BatchedVerdictWires {
     pub tables: Vec<(Vec<Ext>, Vec<Ext>)>,
 }
 
-/// `Σ_a w_{2a}·(p_lo q_hi + p_hi q_lo) + w_{2a+1}·q_lo q_hi` with `w_0` the
-/// literal one: `5|A| − 1` rows.
-fn emit_relation(b: &mut LfmBuilder, weights: &[Ext], halves: &[[Ext; 4]]) -> Ext {
+/// One half's fraction, `(p_lo q_hi + p_hi q_lo, q_lo q_hi)`: three rows.
+fn emit_fraction(b: &mut LfmBuilder, h: [Ext; 4]) -> (Ext, Ext) {
+    let [p_lo, p_hi, q_lo, q_hi] = h;
+    let cross = b.emul(p_lo, q_hi);
+    let numerator = b.emul_add(p_hi, q_lo, cross);
+    let denominator = b.emul(q_lo, q_hi);
+    (numerator, denominator)
+}
+
+/// `Σ_a w_{2a}·N_a + w_{2a+1}·Q_a` over a step's trees with `w_0` the literal
+/// one, `(N_a, Q_a)` a one-layer tree's half's fraction (3 rows) or a
+/// two-layer tree's `(N₀D₁ + N₁D₀, D₀D₁)` over its two halves (9 rows): the
+/// host's `step_relation`. Each tree adds two rows to fold, the first one.
+fn emit_relation(
+    b: &mut LfmBuilder,
+    weights: &[Ext],
+    relations: &[(usize, Relation)],
+    halves: &[[Ext; 4]],
+) -> Ext {
     let mut acc: Option<Ext> = None;
-    for (a, h) in halves.iter().enumerate() {
-        let [p_lo, p_hi, q_lo, q_hi] = *h;
-        let cross = b.emul(p_lo, q_hi);
-        let numerator = b.emul_add(p_hi, q_lo, cross);
-        let denominator = b.emul(q_lo, q_hi);
+    let mut at = 0;
+    for (a, &(_, relation)) in relations.iter().enumerate() {
+        let (numerator, denominator) = match relation {
+            Relation::Single => emit_fraction(b, halves[at]),
+            Relation::Double => {
+                let (n0, d0) = emit_fraction(b, halves[at]);
+                let (n1, d1) = emit_fraction(b, halves[at + 1]);
+                let cross = b.emul(n0, d1);
+                let numerator = b.emul_add(n1, d0, cross);
+                let denominator = b.emul(d0, d1);
+                (numerator, denominator)
+            }
+        };
+        at += relation.halves();
         let with_numerator = match acc {
             None => numerator,
             Some(running) => b.emul_add(weights[2 * a], numerator, running),
@@ -93,6 +122,31 @@ fn emit_relation(b: &mut LfmBuilder, weights: &[Ext], halves: &[[Ext; 4]]) -> Ex
         acc = Some(b.emul_add(weights[2 * a + 1], denominator, with_numerator));
     }
     acc.expect("a ladder step has an active tree")
+}
+
+/// Rows [`emit_relation`] emits for a step's relations.
+fn relation_rows(relations: &[(usize, Relation)]) -> usize {
+    relations
+        .iter()
+        .map(|&(_, relation)| match relation {
+            Relation::Single => 5,
+            Relation::Double => 11,
+        })
+        .sum::<usize>()
+        - 1
+}
+
+/// Rows the step's trees' next claims take: two lines a one-layer tree, six
+/// (the plane: two lines at `c₁` and one at `c₂`, for `p` and for `q`) a
+/// two-layer tree; two rows a line.
+fn descend_rows(relations: &[(usize, Relation)]) -> usize {
+    relations
+        .iter()
+        .map(|&(_, relation)| match relation {
+            Relation::Single => 4,
+            Relation::Double => 12,
+        })
+        .sum()
 }
 
 /// `lo + c·(hi − lo)`.
@@ -167,6 +221,7 @@ pub fn emit_batched_argue(
     proof: &BatchedArgueWires<'_>,
     shapes: &[TableShape<'_>],
     plan: &ArguePlan,
+    ladder: GkrLadder,
     z: Ext,
     alpha_powers: &[Ext],
     beta: Ext,
@@ -186,6 +241,7 @@ pub fn emit_batched_argue(
     // table's chunks combined ──
     let mut claims: Vec<Option<(Vec<Ext>, Ext, Ext)>> = vec![None; n];
     let mut outputs: Vec<Option<(Ext, Ext)>> = vec![None; n];
+    let form = ladder;
     for (bin, ladder) in plan.bins.iter().zip(proof.gkr) {
         // The bin's trees: each table's chunks, in order, as `(table, tree)`.
         let members: Vec<(usize, usize)> = bin
@@ -200,8 +256,10 @@ pub fn emit_batched_argue(
             transcript.absorb_ext(b, proof.bus_outputs[tree].1);
         }
         let heights: Vec<usize> = members.iter().map(|&(t, _)| plan.tree_vars(t)).collect();
-        let steps = heights.iter().copied().max().unwrap_or(0);
-        assert_eq!(ladder.len(), steps, "the ladder runs to the tallest tree");
+        // Every step's relations, degree and counts: the host's own schedule,
+        // from the heights and the format alone.
+        let schedule = ladder_steps(&heights, form);
+        assert_eq!(ladder.len(), schedule.len(), "the ladder runs to the tallest tree");
         let mut running: Vec<(Ext, Ext)> = members
             .iter()
             .map(|&(_, tree)| proof.bus_outputs[tree])
@@ -213,29 +271,39 @@ pub fn emit_batched_argue(
             }
         }
         let mut point: Vec<Ext> = Vec::new();
-        for (i, step) in ladder.iter().enumerate() {
-            let active: Vec<usize> = (0..members.len()).filter(|&a| heights[a] > i).collect();
-            assert_eq!(step.halves.len(), active.len(), "halves per active tree");
-            assert_eq!(step.sumcheck.len(), i, "step i's sumcheck has i rounds");
+        for (wires, step) in ladder.iter().zip(&schedule) {
+            let i = step.parent;
+            assert_eq!(
+                wires.halves.len(),
+                step.halves(),
+                "the step's halves, as its relations send them"
+            );
+            assert_eq!(wires.sumcheck.len(), i, "a step over layer i has i rounds");
             let mu = transcript.sample_ext(b);
             let mut rounds = Vec::with_capacity(i);
-            for evaluations in &step.sumcheck {
-                assert_eq!(evaluations.len(), GKR_SUMCHECK_DEGREE);
+            for evaluations in &wires.sumcheck {
+                assert_eq!(evaluations.len(), step.degree, "the step's degree");
                 for e in evaluations {
                     transcript.absorb_ext(b, *e);
                 }
                 rounds.push(transcript.sample_ext(b));
             }
-            for h in &step.halves {
+            for h in &wires.halves {
                 for v in h {
                     transcript.absorb_ext(b, *v);
                 }
             }
-            let c = transcript.sample_ext(b);
+            // `c₁`, then `c₂` — its own draw, never `c₁` again — when a tree
+            // of the step descends two layers: on the diagonal `c₂ = c₁` the
+            // plane cannot see `p₀₁ + δ, p₁₀ − δ`.
+            let c1 = transcript.sample_ext(b);
+            let c2 = step
+                .draws_second_challenge()
+                .then(|| transcript.sample_ext(b));
 
-            let weights = emit_challenge_powers(b, mu, 2 * active.len());
+            let weights = emit_challenge_powers(b, mu, 2 * step.relations.len());
             let mut claimed: Option<Ext> = None;
-            for (k, &a) in active.iter().enumerate() {
+            for (k, &(a, _)) in step.relations.iter().enumerate() {
                 let (p, q) = running[a];
                 let with_p = match claimed {
                     None => p,
@@ -244,20 +312,43 @@ pub fn emit_batched_argue(
                 claimed = Some(b.emul_add(weights[2 * k + 1], q, with_p));
             }
             let claimed = claimed.expect("a step has an active tree");
-            let residual = emit_sumcheck_rounds(b, claimed, &step.sumcheck, &rounds);
+            let residual = emit_sumcheck_rounds(b, claimed, &wires.sumcheck, &rounds);
             let eq_at = emit_eq_eval(b, &point, &rounds);
-            let relation = emit_relation(b, &weights, &step.halves);
+            let relation = emit_relation(b, &weights, &step.relations, &wires.halves);
             let expected = b.emul(eq_at, relation);
             b.assert_eq_ext(expected, residual);
 
-            point = std::iter::once(c).chain(rounds).collect();
-            for (k, &a) in active.iter().enumerate() {
-                let [p_lo, p_hi, q_lo, q_hi] = step.halves[k];
-                running[a] = (emit_line(b, p_lo, p_hi, c), emit_line(b, q_lo, q_hi, c));
-                if heights[a] == i + 1 {
-                    leaves[a] = Some((point.clone(), running[a].0, running[a].1));
+            let single_point: Vec<Ext> = std::iter::once(c1).chain(rounds.iter().copied()).collect();
+            let double_point: Option<Vec<Ext>> =
+                c2.map(|c2| [c1, c2].into_iter().chain(rounds.iter().copied()).collect());
+            let mut at = 0;
+            for &(a, relation) in &step.relations {
+                let reached = match relation {
+                    Relation::Single => {
+                        let [p_lo, p_hi, q_lo, q_hi] = wires.halves[at];
+                        running[a] = (emit_line(b, p_lo, p_hi, c1), emit_line(b, q_lo, q_hi, c1));
+                        &single_point
+                    }
+                    Relation::Double => {
+                        let c2 = c2.expect("a two-layer step draws c₂");
+                        let [p0_lo, p0_hi, q0_lo, q0_hi] = wires.halves[at];
+                        let [p1_lo, p1_hi, q1_lo, q1_hi] = wires.halves[at + 1];
+                        let p0 = emit_line(b, p0_lo, p0_hi, c1);
+                        let p1 = emit_line(b, p1_lo, p1_hi, c1);
+                        let p = emit_line(b, p0, p1, c2);
+                        let q0 = emit_line(b, q0_lo, q0_hi, c1);
+                        let q1 = emit_line(b, q1_lo, q1_hi, c1);
+                        let q = emit_line(b, q0, q1, c2);
+                        running[a] = (p, q);
+                        double_point.as_ref().expect("a two-layer step's point")
+                    }
+                };
+                at += relation.halves();
+                if heights[a] == i + relation.layers() {
+                    leaves[a] = Some((reached.clone(), running[a].0, running[a].1));
                 }
             }
+            point = double_point.unwrap_or(single_point);
         }
         // Each table's claim and output: its one tree's, or its chunks'
         // combined at `s'`, drawn after the bin's ladder (the host's
@@ -470,13 +561,17 @@ fn draw_ext(leg: &mut Cost, schedule: &mut SpongeSchedule, count: usize) {
 }
 
 /// ★ INSTRUCTIONS and permutations [`emit_batched_argue`] costs, from the
-/// shapes and the plan alone — every term by the emitter's own shape:
+/// shapes, the plan and the ladder alone — every term by the emitter's own
+/// shape:
 ///
-/// - G, per bin: two absorbs per table; per step `i` with `A` active trees, a
-///   draw, `i` rounds of three absorbs and a draw, `4A` absorbs and a draw;
-///   then `challenge_powers_rows(2A)`, `2A − 1` rows for the claim, `i` degree-3
-///   rounds, `eq` over `i`, `5A − 1` for the relation, one `Mul` by `eq`, the
-///   assert, and `4A` for the two lines per tree;
+/// - G, per bin: two absorbs per table; per step over layer `i` with `A`
+///   active trees sending `H` halves at degree `d` (the host's
+///   `ladder_steps`), a draw, `i` rounds of `d` absorbs and a draw, `4H`
+///   absorbs and a draw (two when a tree descends two layers); then
+///   `challenge_powers_rows(2A)`, `2A − 1` rows for the claim, `i` degree-`d`
+///   rounds, `eq` over `i`, the relation (5 rows a one-layer tree, 11 a
+///   two-layer one, less one), one `Mul` by `eq`, the assert, and the next
+///   claims (4 rows a one-layer tree, 12 a two-layer one);
 /// - C: `n_max` draws for `ξ`, `2|T|` absorbs, the `λ` draw, `n_max` rounds of
 ///   `D_max` absorbs and a draw; `λ²`, `λ³`, `challenge_powers_rows(|T|)`,
 ///   `3|T| − 1` rows for the claim, `n_max` degree-`D_max` rounds, the suffix
@@ -490,6 +585,7 @@ fn draw_ext(leg: &mut Cost, schedule: &mut SpongeSchedule, count: usize) {
 pub fn batched_argue_cost(
     shapes: &[TableShape<'_>],
     plan: &ArguePlan,
+    ladder: GkrLadder,
     entry: SpongeEntry,
 ) -> TableCost {
     let n = shapes.len();
@@ -503,30 +599,38 @@ pub fn batched_argue_cost(
     for bin in &plan.bins {
         let heights = tree_heights(plan, bin);
         absorb_ext(&mut leg, &mut schedule, 2 * heights.len());
-        let steps = heights.iter().copied().max().unwrap_or(0);
-        for i in 0..steps {
-            let active = heights.iter().filter(|&&h| h > i).count();
+        for step in ladder_steps(&heights, ladder) {
+            let LadderStep {
+                parent: i,
+                degree,
+                ref relations,
+            } = step;
+            let active = relations.len();
             draw_ext(&mut leg, &mut schedule, 1);
             for _ in 0..i {
-                absorb_ext(&mut leg, &mut schedule, GKR_SUMCHECK_DEGREE);
+                absorb_ext(&mut leg, &mut schedule, degree);
                 draw_ext(&mut leg, &mut schedule, 1);
             }
-            absorb_ext(&mut leg, &mut schedule, 4 * active);
-            draw_ext(&mut leg, &mut schedule, 1);
+            absorb_ext(&mut leg, &mut schedule, 4 * step.halves());
+            draw_ext(
+                &mut leg,
+                &mut schedule,
+                1 + usize::from(step.draws_second_challenge()),
+            );
 
             leg.constant(one);
             leg.ops(challenge_powers_rows(2 * active));
             leg.ops(2 * active - 1);
-            leg.ops(i * sumcheck_round_rows(GKR_SUMCHECK_DEGREE));
+            leg.ops(i * sumcheck_round_rows(degree));
             if i > 0 {
-                degrees.push(GKR_SUMCHECK_DEGREE);
+                degrees.push(degree);
             }
             leg.ops(eq_eval_rows_again(i));
-            leg.ops(5 * active - 1);
+            leg.ops(relation_rows(relations));
             leg.op();
             leg.ops(ASSERT_ROWS);
             leg.constant(zero);
-            leg.ops(4 * active);
+            leg.ops(descend_rows(relations));
         }
         // A cut table's `ℓ` draws, its eq table over them, the two sums and
         // the padding chunks' weights, and its outputs added as fractions.
@@ -697,7 +801,11 @@ impl BatchedStore {
 /// How many words a batched argue over `shapes` binned by `plan` takes, in
 /// [`hint_batched_shaped`]'s order: what [`push_batched_words`] must write.
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-pub(crate) fn batched_words(shapes: &[TableShape<'_>], plan: &ArguePlan) -> usize {
+pub(crate) fn batched_words(
+    shapes: &[TableShape<'_>],
+    plan: &ArguePlan,
+    ladder: GkrLadder,
+) -> usize {
     assert_eq!(
         plan.shapes.len(),
         shapes.len(),
@@ -705,11 +813,8 @@ pub(crate) fn batched_words(shapes: &[TableShape<'_>], plan: &ArguePlan) -> usiz
     );
     let mut words = 2 * plan.trees();
     for bin in &plan.bins {
-        let heights = tree_heights(plan, bin);
-        let steps = heights.iter().copied().max().unwrap_or(0);
-        for i in 0..steps {
-            let active = heights.iter().filter(|&&h| h > i).count();
-            words += i * GKR_SUMCHECK_DEGREE + 4 * active;
+        for step in ladder_steps(&tree_heights(plan, bin), ladder) {
+            words += step.parent * step.degree + 4 * step.halves();
         }
     }
     words += plan.num_vars * plan.degree;
@@ -734,6 +839,7 @@ pub(crate) fn hint_batched_shaped(
     at: &mut u32,
     shapes: &[TableShape<'_>],
     plan: &ArguePlan,
+    ladder: GkrLadder,
 ) -> BatchedStore {
     let mut take = |b: &mut LfmBuilder, count: usize| -> Vec<Ext> {
         (0..count)
@@ -754,20 +860,18 @@ pub(crate) fn hint_batched_shaped(
         .bins
         .iter()
         .map(|bin| {
-            let heights = tree_heights(plan, bin);
-            let steps = heights.iter().copied().max().unwrap_or(0);
-            (0..steps)
-                .map(|i| {
-                    let active = heights.iter().filter(|&&h| h > i).count();
-                    LadderStepWires {
-                        sumcheck: (0..i).map(|_| take(b, GKR_SUMCHECK_DEGREE)).collect(),
-                        halves: (0..active)
-                            .map(|_| {
-                                let h = take(b, 4);
-                                [h[0], h[1], h[2], h[3]]
-                            })
-                            .collect(),
-                    }
+            ladder_steps(&tree_heights(plan, bin), ladder)
+                .iter()
+                .map(|step| LadderStepWires {
+                    sumcheck: (0..step.parent)
+                        .map(|_| take(b, step.degree))
+                        .collect(),
+                    halves: (0..step.halves())
+                        .map(|_| {
+                            let h = take(b, 4);
+                            [h[0], h[1], h[2], h[3]]
+                        })
+                        .collect(),
                 })
                 .collect()
         })
@@ -841,6 +945,7 @@ pub(crate) fn emit_batched_walk(
     store: &BatchedStore,
     shapes: &[TableShape<'_>],
     plan: &ArguePlan,
+    ladder: GkrLadder,
     plans: &[super::whir_epoch::PreprocessedPlan<'_>],
     slots: &[&[usize]],
     z: Ext,
@@ -862,6 +967,7 @@ pub(crate) fn emit_batched_walk(
         },
         shapes,
         plan,
+        ladder,
         z,
         alpha_powers,
         beta,
