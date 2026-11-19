@@ -728,6 +728,15 @@ pub fn wlfm_leg_program_marked(child: &WlfmChild) -> Result<(LfmProgram, Vec<u32
 /// each as a whole word: the second compression step's body
 /// ([`super::compress`]), and what a test executes a child's arena against.
 pub fn wlfm_leg_program(child: &WlfmChild) -> Result<LfmProgram, String> {
+    wlfm_leg_program_admitted(child).map(super::validator::AdmittedProgram::into_program)
+}
+
+/// [`wlfm_leg_program`] keeping the validator's word: what the levels
+/// verifier derives every level above the first from
+/// (`levels::derive_levels_to`).
+pub fn wlfm_leg_program_admitted(
+    child: &WlfmChild,
+) -> Result<super::validator::AdmittedProgram, String> {
     let mut b = wlfm_leg_builder(child.artifacts.family);
     let arena = b.declare_arena(0);
     let leg = emit_wlfm_leg(&mut b, child, arena)?;
@@ -735,7 +744,8 @@ pub fn wlfm_leg_program(child: &WlfmChild) -> Result<LfmProgram, String> {
         let packed = b.pack_word([word.lanes[0], word.lanes[1], word.lanes[2], word.lanes[3]]);
         b.public(packed);
     }
-    finish_program(b)
+    super::whir_block::emitter_fault(&mut b);
+    super::whir_block::finish_program_admitted(b)
 }
 
 /// A W-LFM child's batched planning: its argue batched, its GKR ladder one

@@ -846,12 +846,13 @@ fn the_validate_late_knob_is_named_and_off_by_default() {
     }
 }
 
-/// ★ Every program the levels' verifier derives passes the admission
-/// validator on the way (`finish_program`, the end of both
-/// `WhirBlockPlan::closed_block_program` and `wlfm_leg_program`, which
-/// `derive_levels` builds every level from): a program hinting outside its
-/// arena is refused there, its in-bounds twin is admitted. What makes the
-/// prover's own check completeness-only.
+/// ★ The admission validator refuses a program hinting outside its arena at
+/// the end every level program's derivation shares (`finish`, behind
+/// `finish_program`), and admits its in-bounds twin. (The derivations
+/// themselves: `the_leg_derivation_refuses_an_emitter_fault` below, and the
+/// box-tier `the_verifiers_derivation_refuses_an_emitter_fault`; that the
+/// verifier cannot skip it: `derive_levels_to` takes only an
+/// `AdmittedProgram`, which only the validator makes.)
 #[test]
 fn the_verifiers_derivation_refuses_an_inadmissible_program() {
     use super::builder::LfmBuilder;
@@ -871,6 +872,77 @@ fn the_verifiers_derivation_refuses_an_inadmissible_program() {
         refused.contains("not admissible") && refused.contains("ArenaOutOfBounds"),
         "{refused}"
     );
+}
+
+/// Restores this thread's emitter fault.
+struct FaultRestore;
+
+impl Drop for FaultRestore {
+    fn drop(&mut self) {
+        super::whir_block::set_hint_past_arena_for_test(false);
+    }
+}
+
+/// ★ The derivation of every level above the first (`wlfm_leg_program`, which
+/// `derive_levels_to` reaches through `wlfm_leg_program_admitted`) refuses a
+/// program its emitter got wrong: with a test's fault (one hint past the
+/// arena) the leg over a real child is "not admissible" both ways; without it,
+/// the same leg is admitted.
+#[test]
+fn the_leg_derivation_refuses_an_emitter_fault() {
+    use super::wlfm_leg::{WlfmChild, wlfm_leg_program, wlfm_leg_program_admitted};
+    let _restore = FaultRestore;
+    let _fast = super::wlfm::test_format::set(Some(2));
+    let program = super::wlfm_tests::honest();
+    let build = super::wlfm_tests::build(&program, super::wlfm::WlfmRate::Two);
+    let proof = super::wlfm_tests::prove(&program, &build);
+    let child = WlfmChild {
+        artifacts: build.artifacts.clone(),
+        num_public_words: proof.public_words.len(),
+    };
+    wlfm_leg_program_admitted(&child).expect("the leg is admitted");
+    super::whir_block::set_hint_past_arena_for_test(true);
+    for (what, refused) in [
+        ("wlfm_leg_program", wlfm_leg_program(&child).err()),
+        (
+            "wlfm_leg_program_admitted",
+            wlfm_leg_program_admitted(&child).err(),
+        ),
+    ] {
+        let refused = refused.unwrap_or_else(|| panic!("{what} admitted a faulty leg"));
+        assert!(
+            refused.contains("not admissible") && refused.contains("ArenaOutOfBounds"),
+            "{what}: {refused}"
+        );
+    }
+}
+
+/// ★ The levels verifier's own derivation refuses a level-1 program its
+/// emitter got wrong: under a test's fault (one hint past the arena),
+/// `closed_block_program` and `derive_levels` (the verifier's path, through
+/// `closed_block_program_admitted`) are "not admissible", while the prover's
+/// unvalidated fast emit (`closed_block_program_marked_timed`) still returns
+/// the program — the one the driver's own check must then refuse.
+#[test]
+#[ignore = "proves a small block's base; box tier"]
+fn the_verifiers_derivation_refuses_an_emitter_fault() {
+    let _restore = FaultRestore;
+    let format = b3_format();
+    let (elf, base) = b3_small_block("test_commit_4", &format);
+    let plan = b3_plan(&elf, &base, &format);
+    plan.closed_block_program()
+        .expect("the plan's program is admitted");
+    super::whir_block::set_hint_past_arena_for_test(true);
+    let closed = plan
+        .closed_block_program()
+        .expect_err("a faulty closed program is refused");
+    assert!(closed.contains("not admissible"), "{closed}");
+    let derived = derive_levels(&plan, WlfmFamily::B3, true)
+        .err()
+        .expect("a derivation over a faulty program is refused");
+    assert!(derived.contains("not admissible"), "{derived}");
+    plan.closed_block_program_marked_timed(true)
+        .expect("the unvalidated fast emit returns the program");
 }
 
 /// The fill-beside knob's name; it is on by default, and only `0` turns it

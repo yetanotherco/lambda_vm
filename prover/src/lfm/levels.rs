@@ -42,9 +42,7 @@ use super::wlfm::{
     StackPlace, WlfmBuild, WlfmFamily, WlfmLevers, WlfmPrebuild, WlfmProof, WlfmProving, WlfmRate,
     prepare_wlfm_rounds, prove_wlfm_traces_as, verify_wlfm,
 };
-use super::wlfm_leg::{
-    WlfmChild, wlfm_leg_arena, wlfm_leg_program, wlfm_leg_program_marked, wlfm_wrap_hash,
-};
+use super::wlfm_leg::{WlfmChild, wlfm_leg_arena, wlfm_leg_program_marked, wlfm_wrap_hash};
 use crate::block_whir::BlockWhirProof;
 use crate::hash_pin::{BlockFamily, ProofFamily};
 use stark::proof::options::BaseFormat;
@@ -681,6 +679,18 @@ fn level_more(stop: LevelStop, count: usize, last: &WlfmBuild) -> bool {
     }
 }
 
+/// A level the verifier derives: built only from a program the admission
+/// validator passed ([`super::validator::AdmittedProgram`], which only the
+/// validator makes), so a derivation that skips the check does not compile.
+fn build_derived_level(
+    program: super::validator::AdmittedProgram,
+    family: WlfmFamily,
+    rounds: Option<u8>,
+    on_host: bool,
+) -> Result<Level, String> {
+    build_level(program.into_program(), family, rounds, on_host)
+}
+
 /// The level after `child`'s, prepared on the host: its program (the W-leg
 /// over `child`), where its arena's pieces end (the front, then each of the
 /// child's groups), and its stacks' columns, uncommitted, its chains under the
@@ -1194,8 +1204,8 @@ pub fn derive_levels_to(
         }
     };
     let rounds = level_rounds(plan);
-    let mut levels = vec![build_level(
-        plan.closed_block_program()?,
+    let mut levels = vec![build_derived_level(
+        plan.closed_block_program_admitted()?,
         family,
         rounds,
         on_host,
@@ -1203,8 +1213,8 @@ pub fn derive_levels_to(
     while more(&levels)? {
         let child = child_of(plan, levels.last().expect("a level"));
         let rounds = child.artifacts.rounds;
-        levels.push(build_level(
-            wlfm_leg_program(&child)?,
+        levels.push(build_derived_level(
+            super::wlfm_leg::wlfm_leg_program_admitted(&child)?,
             family,
             rounds,
             on_host,

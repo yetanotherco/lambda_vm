@@ -122,6 +122,31 @@ pub fn validate(program: &LfmProgram) -> Result<(), LfmViolation> {
     Ok(())
 }
 
+/// A program the admission validator passed. Only [`admit`] builds one, so a
+/// function that takes it (the levels verifier's derivation,
+/// `levels::derive_levels_to`) cannot be handed a program that skipped the
+/// check: a derivation that drops the validator does not compile.
+#[derive(Debug)]
+pub struct AdmittedProgram(LfmProgram);
+
+impl AdmittedProgram {
+    /// The admitted program.
+    pub fn program(&self) -> &LfmProgram {
+        &self.0
+    }
+
+    /// The admitted program, owned.
+    pub fn into_program(self) -> LfmProgram {
+        self.0
+    }
+}
+
+/// `program` admitted ([`validate`]), or why it is not.
+pub fn admit(program: LfmProgram) -> Result<AdmittedProgram, LfmViolation> {
+    validate(&program)?;
+    Ok(AdmittedProgram(program))
+}
+
 /// [`validate`]'s checks one by one, each with its seconds — an instrument
 /// (`node_emit_timing_tests`), test-only.
 #[cfg(test)]
