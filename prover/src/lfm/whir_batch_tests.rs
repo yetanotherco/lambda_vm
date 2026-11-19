@@ -9,7 +9,7 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
-use multilinear::whir_chain::{ArgueFormat, GkrPack};
+use multilinear::whir_chain::{ArgueFormat, GkrLadder, GkrPack};
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, RowDomain};
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
@@ -160,6 +160,7 @@ fn challenges() -> (FEE, FEE, FEE) {
 struct Fixture {
     airs: Vec<(Air, usize)>,
     pack: GkrPack,
+    ladder: GkrLadder,
 }
 
 /// The packed fixture's price: every fan below is cut.
@@ -172,7 +173,13 @@ impl Fixture {
         Self {
             airs: vec![(air(true), 3), (air(false), 4), (air(true), 5)],
             pack: GkrPack::Off,
+            ladder: GkrLadder::Single,
         }
+    }
+
+    /// This fixture with its ladders stepped per `ladder`.
+    fn on(self, ladder: GkrLadder) -> Self {
+        Self { ladder, ..self }
     }
 
     /// [`Self::new`]'s tables with three fans between them, packed at
@@ -190,6 +197,7 @@ impl Fixture {
                 (air(true), 5),
             ],
             pack: PACKED,
+            ladder: GkrLadder::Single,
         }
     }
 
@@ -261,7 +269,7 @@ impl Fixture {
             &beta,
             cap,
             self.pack,
-            multilinear::whir_chain::GkrLadder::Single,
+            self.ladder,
             &mut prover,
             ARGUE_FAULTS.with(std::cell::Cell::get),
             Where::Host,
@@ -341,6 +349,7 @@ fn batched_program(
     argue: &BatchedArgue<E>,
     shapes: &[TableShape<'_>],
     plan: &ArguePlan,
+    ladder: GkrLadder,
     alpha_count: usize,
     total: usize,
     leg: bool,
@@ -449,6 +458,7 @@ fn batched_program(
         },
         shapes,
         plan,
+        ladder,
         z,
         &alpha_powers,
         beta,
@@ -511,7 +521,7 @@ fn with_run_on<R>(
             &statements,
             cap,
             fixture.pack,
-            multilinear::whir_chain::GkrLadder::Single,
+            fixture.ladder,
             &z,
             &alpha,
             &beta,
@@ -524,6 +534,7 @@ fn with_run_on<R>(
         argue: &argue,
         shapes: &shapes,
         plan: &plan,
+        ladder: fixture.ladder,
         z,
         beta,
         alpha_powers: &alpha_powers,
@@ -535,6 +546,7 @@ struct RunView<'a> {
     argue: &'a BatchedArgue<E>,
     shapes: &'a [TableShape<'a>],
     plan: &'a ArguePlan,
+    ladder: GkrLadder,
     z: FEE,
     beta: FEE,
     alpha_powers: &'a [FEE],
@@ -551,6 +563,7 @@ impl RunView<'_> {
             self.argue,
             self.shapes,
             self.plan,
+            self.ladder,
             self.alpha_powers.len(),
             self.values().len(),
             leg,
@@ -645,7 +658,8 @@ fn the_batched_leg_emits_its_closed_form() {
                         .sum::<usize>();
                 let measured =
                     with.instrs.len() - without.instrs.len() - (published - 2) * PUBLISH_ROW;
-                let cost = batched_argue_cost(run.shapes, run.plan, SpongeEntry::fresh());
+                let cost =
+                    batched_argue_cost(run.shapes, run.plan, run.ladder, SpongeEntry::fresh());
                 let predicted = cost.leg.constant_values();
                 let mut unnamed: Vec<LfmWord> = Vec::new();
                 for instr in &with.instrs {
@@ -880,7 +894,8 @@ fn the_packed_leg_emits_its_closed_form() {
                         .sum::<usize>();
                 let measured =
                     with.instrs.len() - without.instrs.len() - (published - 2) * PUBLISH_ROW;
-                let cost = batched_argue_cost(run.shapes, run.plan, SpongeEntry::fresh());
+                let cost =
+                    batched_argue_cost(run.shapes, run.plan, run.ladder, SpongeEntry::fresh());
                 let predicted = cost.leg.constant_values();
                 let mut unnamed: Vec<LfmWord> = Vec::new();
                 for instr in &with.instrs {
@@ -1007,4 +1022,322 @@ fn the_packed_leg_refuses_a_forgery_only_the_residual_catches() {
         !executes,
         "the machine executed a forgery only the residual catches"
     );
+}
+
+// ─── The two-layer ladder (`GkrLadder::Double`), in-guest ───────────────────
+
+/// The run's verdict, the host's and the machine's, compared.
+fn the_leg_is_the_host(run: &RunView<'_>, what: &str) {
+    let host = run.host.clone().expect("the host verifies its own argue");
+    let got = run
+        .execute()
+        .unwrap_or_else(|e| panic!("{what}: the leg must execute: {e}"));
+    let mut want: Vec<FEE> = Vec::new();
+    for (p, q) in table_outputs(run) {
+        want.extend([p, q]);
+    }
+    for claim in &host {
+        want.extend(claim.point.iter().copied());
+        want.extend(claim.column_values.iter().copied());
+    }
+    assert_eq!(got, want, "{what}: the leg's verdict is the host's");
+}
+
+/// The program's marginal rows against the closed form, and every constant
+/// named.
+fn the_leg_is_its_closed_form(run: &RunView<'_>, what: &str) {
+    let with = run.program(true);
+    let without = run.program(false);
+    let published = 2 * run.shapes.len()
+        + run
+            .host
+            .as_ref()
+            .expect("host")
+            .iter()
+            .map(|c| c.point.len() + c.column_values.len())
+            .sum::<usize>();
+    let measured = with.instrs.len() - without.instrs.len() - (published - 2) * PUBLISH_ROW;
+    let cost = batched_argue_cost(run.shapes, run.plan, run.ladder, SpongeEntry::fresh());
+    let predicted = cost.leg.constant_values();
+    let mut unnamed: Vec<LfmWord> = Vec::new();
+    for instr in &with.instrs {
+        if let super::instr::Instr::Const { value, .. } = instr
+            && !predicted.contains(value)
+            && !unnamed.contains(value)
+        {
+            unnamed.push(*value);
+        }
+    }
+    assert!(unnamed.is_empty(), "{what}: the form does not name {unnamed:?}");
+    assert_eq!(measured, cost.rows(), "{what}: emitted rows against the closed form");
+    println!(
+        "{what}: {measured} rows emitted and predicted, {} permutations",
+        cost.perms()
+    );
+}
+
+/// The schedule each bin of a run's ladders follows: the host's own.
+fn schedules(run: &RunView<'_>) -> Vec<Vec<multilinear::gkr_lockstep::LadderStep>> {
+    run.plan
+        .bins
+        .iter()
+        .map(|bin| {
+            let heights: Vec<usize> = bin
+                .iter()
+                .flat_map(|&t| std::iter::repeat_n(run.plan.tree_vars(t), run.plan.chunks[t].count))
+                .collect();
+            multilinear::gkr_lockstep::ladder_steps(&heights, run.ladder)
+        })
+        .collect()
+}
+
+/// ★ On the two-layer ladder the leg computes what the host computes and
+/// costs what its closed form says — the three tables in one bin and each
+/// alone, and the packed fixture's cut tables — with steps of degree 5 and,
+/// for the odd trees, mixed steps among them.
+#[test]
+fn the_two_layer_leg_is_the_host_and_its_closed_form() {
+    for (name, fixture) in [("plain", Fixture::new as fn() -> Fixture), ("packed", Fixture::packed)] {
+        for cap in [27u8, 0] {
+            with_run_on(fixture().on(GkrLadder::Double), cap, |_| {}, |run| {
+                let what = format!("two-layer {name} cap {cap}");
+                let steps: Vec<_> = schedules(&run).into_iter().flatten().collect();
+                assert!(steps.iter().any(|s| s.degree == 5), "{what}: a degree-5 step");
+                assert!(
+                    run.argue
+                        .gkr
+                        .iter()
+                        .flat_map(|l| &l.layers)
+                        .any(|l| l.sumcheck.rounds.iter().any(|r| r.evaluations.len() == 5)),
+                    "{what}: a degree-5 round in the proof"
+                );
+                the_leg_is_the_host(&run, &what);
+                the_leg_is_its_closed_form(&run, &what);
+            });
+        }
+    }
+}
+
+/// The leg's words follow the ladder: a proof's words are its ladder's
+/// count and not the other ladder's, so an arena laid for one ladder cannot
+/// carry the other's proof (the leaf's hint count refuses it).
+#[test]
+fn the_two_layer_legs_words_are_its_own() {
+    for ladder in [GkrLadder::Single, GkrLadder::Double] {
+        let other = match ladder {
+            GkrLadder::Single => GkrLadder::Double,
+            GkrLadder::Double => GkrLadder::Single,
+        };
+        with_run_on(Fixture::new().on(ladder), 27, |_| {}, |run| {
+            let mut words = Vec::new();
+            super::whir_batch::push_batched_words(&mut words, run.argue);
+            assert_eq!(
+                words.len(),
+                super::whir_batch::batched_words(run.shapes, run.plan, ladder),
+                "{ladder:?}: the proof's words are its ladder's count"
+            );
+            assert_ne!(
+                words.len(),
+                super::whir_batch::batched_words(run.shapes, run.plan, other),
+                "{ladder:?}: and not the other ladder's"
+            );
+        });
+    }
+}
+
+/// ★ Every tamper the host refuses on the two-layer ladder, the leg refuses:
+/// each value of a two-layer tree's halves at a mid step, an odd tree's one
+/// half in a mixed step, each value of a degree-5 round, a bus output.
+#[test]
+fn the_two_layer_leg_refuses_what_the_host_rejects() {
+    with_run_on(Fixture::new().on(GkrLadder::Double), 27, |_| {}, |run| {
+        run.host.clone().expect("the honest argue verifies on the host");
+        run.execute().expect("the honest argue executes");
+    });
+    // The sites, from the schedule: a step past the first with rounds, a
+    // two-layer tree's halves there, and a one-layer tree's when the step is
+    // mixed.
+    let (step, double_half, single_half) =
+        with_run_on(Fixture::new().on(GkrLadder::Double), 27, |_| {}, |run| {
+            let schedule = &schedules(&run)[0];
+            let (j, s) = schedule
+                .iter()
+                .enumerate()
+                .find(|(j, s)| *j > 0 && s.degree == 5)
+                .expect("a degree-5 step past the first");
+            let mut at = 0;
+            let (mut double_half, mut single_half) = (None, None);
+            for &(_, relation) in &s.relations {
+                match relation {
+                    multilinear::gkr_lockstep::Relation::Double => double_half.get_or_insert(at),
+                    multilinear::gkr_lockstep::Relation::Single => single_half.get_or_insert(at),
+                };
+                at += relation.halves();
+            }
+            (j, double_half.expect("a two-layer tree"), single_half)
+        });
+    let mut sites: Vec<(String, Box<dyn Fn(&mut BatchedArgue<E>)>)> = Vec::new();
+    for half in [double_half, double_half + 1] {
+        for value in 0..4 {
+            sites.push((
+                format!("step {step} half {half} value {value}"),
+                Box::new(move |a: &mut BatchedArgue<E>| {
+                    let h = &mut a.gkr[0].layers[step].halves[half];
+                    bump([&mut h.p_lo, &mut h.p_hi, &mut h.q_lo, &mut h.q_hi][value]);
+                }),
+            ));
+        }
+    }
+    if let Some(half) = single_half {
+        sites.push((
+            format!("an odd tree's half at the mixed step {step}"),
+            Box::new(move |a: &mut BatchedArgue<E>| bump(&mut a.gkr[0].layers[step].halves[half].q_hi)),
+        ));
+    }
+    for value in 0..5 {
+        sites.push((
+            format!("step {step}'s degree-5 round value {value}"),
+            Box::new(move |a: &mut BatchedArgue<E>| {
+                bump(&mut a.gkr[0].layers[step].sumcheck.rounds[0].evaluations[value])
+            }),
+        ));
+    }
+    sites.push((
+        "a bus output".to_string(),
+        Box::new(|a: &mut BatchedArgue<E>| bump(&mut a.bus_outputs[1].0)),
+    ));
+    for (name, tamper) in &sites {
+        with_run_on(Fixture::new().on(GkrLadder::Double), 27, |a| tamper(a), |run| {
+            assert!(run.host.is_err(), "{name}: the HOST accepted it");
+            assert!(
+                run.execute().is_err(),
+                "{name}: the machine executed a forgery the host rejects"
+            );
+        });
+    }
+}
+
+/// ★ A prover that departs at a tree's first two-layer step and steps
+/// honestly after — its halves swapped, each half's lo and hi traded (both
+/// pass that step's symmetric residual), or the next step proved at the plane
+/// read the other way round — is refused by the host and by the machine.
+#[test]
+fn the_two_layer_leg_refuses_a_departing_step() {
+    use multilinear::gkr_lockstep::StepFault;
+    for fault in [StepFault::SwapHalves, StepFault::SwapLoHi, StepFault::SwapPlane] {
+        for t in 0..3 {
+            ARGUE_FAULTS.with(|f| {
+                f.set(ProverFaults {
+                    ladder: Some((t, fault)),
+                    ..ProverFaults::default()
+                })
+            });
+            let (host, executes) = with_run_on(
+                Fixture::new().on(GkrLadder::Double),
+                27,
+                |_| {},
+                |run| (run.host.clone().map(|_| ()), run.execute().is_ok()),
+            );
+            ARGUE_FAULTS.with(|f| f.set(ProverFaults::default()));
+            assert!(host.is_err(), "{fault:?} on table {t}: the HOST accepted it");
+            assert!(!executes, "{fault:?} on table {t}: the machine executed it");
+        }
+    }
+}
+
+/// A forged balance on table 1 (its ladder on the true tree) on the two-layer
+/// ladder: only the ladder residual refuses it on the host, and the machine
+/// must refuse it.
+#[test]
+fn the_two_layer_leg_refuses_a_forgery_only_the_residual_catches() {
+    ARGUE_FAULTS.with(|f| {
+        f.set(ProverFaults {
+            balance_with: Some(1),
+            ..ProverFaults::default()
+        })
+    });
+    let run_with = |checks: VerifierChecks| {
+        HOST_CHECKS.with(|c| c.set(checks));
+        let out = with_run_on(
+            Fixture::new().on(GkrLadder::Double),
+            27,
+            |_| {},
+            |run| (run.host.clone().map(|_| ()), run.execute().is_ok()),
+        );
+        HOST_CHECKS.with(|c| c.set(VerifierChecks::ALL));
+        out
+    };
+    let (all, executes) = run_with(VerifierChecks::ALL);
+    let (inert, _) = run_with(VerifierChecks {
+        residual: false,
+        ..VerifierChecks::ALL
+    });
+    ARGUE_FAULTS.with(|f| f.set(ProverFaults::default()));
+    assert!(all.is_err(), "the host refuses it");
+    assert_eq!(inert, Ok(()), "premise: only the residual refuses it");
+    assert!(
+        !executes,
+        "the machine executed a forgery only the residual catches"
+    );
+}
+
+/// ★ The guest twin of the diagonal forgery: table `t`'s output forged to
+/// balance the bus, and its first two-layer step's halves shifted along the
+/// plane's diagonal so that step's residual holds for the forgery and the
+/// plane at `c₂ = c₁` is the truth. A leg that took `c₂ := c₁` would carry the
+/// true claim on and execute it; the leg draws `c₂` on its own, and the next
+/// step refuses it — in the machine and on the host.
+#[test]
+fn the_two_layer_leg_refuses_the_diagonal_forgery() {
+    let step_zero = |run: &RunView<'_>| -> Vec<FEE> {
+        run.argue.gkr[0].layers[0]
+            .halves
+            .iter()
+            .flat_map(|h| [h.p_lo, h.p_hi, h.q_lo, h.q_hi])
+            .collect()
+    };
+    let run_with = |faults: ProverFaults| {
+        ARGUE_FAULTS.with(|f| f.set(faults));
+        let out = with_run_on(
+            Fixture::new().on(GkrLadder::Double),
+            27,
+            |_| {},
+            |run| {
+                (
+                    run.host.clone().map(|_| ()),
+                    run.execute().is_ok(),
+                    step_zero(&run),
+                )
+            },
+        );
+        ARGUE_FAULTS.with(|f| f.set(ProverFaults::default()));
+        out
+    };
+    let (honest, honest_executes, honest_values) = run_with(ProverFaults::default());
+    assert_eq!(honest, Ok(()), "the honest argue verifies on the host");
+    assert!(honest_executes, "the honest argue executes");
+    for t in 0..3 {
+        let (host, executes, values) = run_with(ProverFaults {
+            diagonal: Some(t),
+            ..ProverFaults::default()
+        });
+        let moved = values
+            .iter()
+            .zip(&honest_values)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(moved, 2, "table {t}: the forgery moves p₀₁ and p₁₀ only");
+        assert!(
+            !executes,
+            "table {t}: the machine executed the diagonal forgery"
+        );
+        assert_eq!(
+            host,
+            Err(format!(
+                "{:?}",
+                multilinear::Error::LayerRelationMismatch { layer: 1 }
+            )),
+            "table {t}: the host passes step 0 and refuses step 1"
+        );
+    }
 }
