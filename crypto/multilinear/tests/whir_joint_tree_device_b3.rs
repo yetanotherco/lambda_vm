@@ -316,40 +316,132 @@ fn a_blake3_joint_run_on_the_card_proves_the_hosts_bytes() {
     }
 }
 
-/// A round-0 opening the card can serve neither from its stacks nor by a
-/// re-encode — no room for either, as under card-memory pressure — falls back
-/// to the host: each stack read back, its codeword encoded there and the
-/// queried blocks re-hashed against the kept top. The proof is the host's
-/// bytes, for a joint tree a run and for one tree a polynomial, and the
-/// fallback is counted.
+/// A round-0 opening the card cannot serve from its stacks re-encodes on the
+/// card; one it can serve neither from its stacks nor by a re-encode — no
+/// room for either, as under card-memory pressure — falls back to the host:
+/// each stack read back, its codeword encoded there and the queried blocks
+/// re-hashed against the kept top. Either way the proof is the host's bytes,
+/// for a joint tree a run and for one tree a polynomial, and each rung is
+/// counted exactly: one card re-encode a stack, or one host re-encode a tree
+/// over all its stacks, and never a host commit.
 #[test]
 fn a_round0_opening_the_card_cannot_serve_falls_back_to_the_host_with_its_bytes() {
     let _serial = serial();
     for round0 in [Round0Trees::One, Round0Trees::Each] {
         let cfg = config(round0);
         for stack in [Stack::run_of_three(), Stack::runs_of_four_and_two()] {
-            let label = format!(
-                "{}, {round0:?}, revived at drop 4, the card declining",
-                stack.name
-            );
             let (host_roots, host_proof) = stack.on_the_host(&cfg);
-            let fallbacks = gpu::host_fallbacks();
-            gpu::force_coset_decline(true);
-            let declined = stack.try_prove(&cfg, Some(4));
-            gpu::force_coset_decline(false);
-            let (roots, proof) = declined.unwrap_or_else(|e| panic!("{label}: {e:?}"));
-            assert!(
-                gpu::host_fallbacks() > fallbacks,
-                "{label}: the host fallback counted"
-            );
-            assert_eq!(roots, host_roots, "{label}: roots");
-            stack.verify(&roots, &proof, &cfg, &label);
-            assert!(
-                bytes(&proof) == bytes(&host_proof),
-                "{label}: the host's bytes"
-            );
+            let trees = stack.trees(&cfg);
+            let polys = stack.layout.num_polys() as u64;
+            for mode in [gpu::CosetDecline::Openings, gpu::CosetDecline::Everything] {
+                let label = format!(
+                    "{}, {round0:?}, revived at drop 4, the card declining {mode:?}",
+                    stack.name
+                );
+                let fallbacks = gpu::host_fallbacks();
+                let reencoded = gpu::coset_fallbacks();
+                let (host_trees, host_stacks, _) = gpu::open_host_reencodes();
+                let declined = {
+                    let _decline = gpu::force_coset_decline(mode);
+                    stack.try_prove(&cfg, Some(4))
+                };
+                let (roots, proof) = declined.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                let (now_trees, now_stacks, _) = gpu::open_host_reencodes();
+                assert_eq!(gpu::host_fallbacks(), fallbacks, "{label}: no host commit");
+                let (card, host) = match mode {
+                    gpu::CosetDecline::Openings => (polys, (0, 0)),
+                    _ => (0, (trees, polys)),
+                };
+                assert_eq!(
+                    gpu::coset_fallbacks() - reencoded,
+                    card,
+                    "{label}: card re-encodes, one a stack"
+                );
+                assert_eq!(
+                    (now_trees - host_trees, now_stacks - host_stacks),
+                    host,
+                    "{label}: host re-encodes (trees, stacks)"
+                );
+                assert_eq!(roots, host_roots, "{label}: roots");
+                stack.verify(&roots, &proof, &cfg, &label);
+                assert!(
+                    bytes(&proof) == bytes(&host_proof),
+                    "{label}: the host's bytes"
+                );
+            }
         }
     }
+}
+
+/// The process's resident high-water mark in bytes, after `reset` restarts it
+/// at what is resident now (`/proc/self/clear_refs`, Linux).
+fn resident_peak(reset: bool) -> Option<u64> {
+    if reset {
+        std::fs::write("/proc/self/clear_refs", "5").ok()?;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// The host fallback at the production shape (a card box, minutes) — a run of three
+/// stacked polynomials of `2^27`, First6, blowup 2, retired at the card's
+/// production drop (8 levels) and revived over its stacks — with the card
+/// declining both rungs proves the bytes the card proves with nothing
+/// declined, re-encodes one tree of three stacks on the host, and prints its
+/// seconds and the process's resident peak beside the card prove's.
+#[test]
+fn a_production_shaped_round0_opening_on_the_host_reports_its_seconds_and_peak() {
+    let _serial = serial();
+    let cfg = ChainConfig {
+        log_blowup: 1,
+        ..config(Round0Trees::One)
+    };
+    let stack = Stack::new("the production shape", &[27; 3], 27);
+    assert_eq!(stack.trees(&cfg), 1, "one joint tree");
+    let gib = |b: Option<u64>| b.map_or(f64::NAN, |b| b as f64 / (1u64 << 30) as f64);
+    let before = gpu::open_host_reencodes();
+    let card_from = resident_peak(true);
+    let (card_roots, card_proof) = stack
+        .try_prove(&cfg, Some(8))
+        .unwrap_or_else(|e| panic!("the card prove: {e:?}"));
+    let card_peak = resident_peak(false);
+    let (trees, stacks, seconds) = gpu::open_host_reencodes();
+    assert_eq!(
+        (trees, stacks),
+        (before.0, before.1),
+        "the card prove re-encodes nothing on the host"
+    );
+    let host_from = resident_peak(true);
+    let declined = {
+        let _decline = gpu::force_coset_decline(gpu::CosetDecline::Everything);
+        stack.try_prove(&cfg, Some(8))
+    };
+    let host_peak = resident_peak(false);
+    let (roots, proof) = declined.unwrap_or_else(|e| panic!("the declined prove: {e:?}"));
+    let (now_trees, now_stacks, now_seconds) = gpu::open_host_reencodes();
+    eprintln!(
+        "ROUND-0 HOST RE-ENCODE AT THE PRODUCTION SHAPE: {} stack(s) of 2^27 at blowup 2 in {:.2} s · \
+         resident peak {:.2} GiB (from {:.2}) declined, {:.2} GiB (from {:.2}) on the card",
+        now_stacks - stacks,
+        now_seconds - seconds,
+        gib(host_peak),
+        gib(host_from),
+        gib(card_peak),
+        gib(card_from),
+    );
+    assert_eq!(
+        (now_trees - trees, now_stacks - stacks),
+        (1, 3),
+        "one tree of three stacks re-encoded on the host"
+    );
+    assert_eq!(roots, card_roots, "roots");
+    stack.verify(&roots, &proof, &cfg, "the production shape, declined");
+    assert!(
+        bytes(&proof) == bytes(&card_proof),
+        "the declined prove's bytes are the card's"
+    );
 }
 
 /// ★ At the production block's shape — a run of three stacked polynomials of

@@ -7660,7 +7660,7 @@ impl CosetSource {
     where
         F: math::field::traits::IsField + 'static,
     {
-        if declined_for_test() {
+        if coset_decline() != CosetDecline::Off {
             return None;
         }
         let raw: Vec<u64> = leaves.iter().map(|&leaf| leaf as u64).collect();
@@ -7709,60 +7709,224 @@ impl CosetSource {
         })
     }
 
-    /// The whole codeword, re-encoded: the fallback. Counted.
+    /// The whole codeword, re-encoded: the fallback. Counted. A card that
+    /// declines leaves its reason for the host fallback's line
+    /// ([`note_open_host_reencode`]).
     pub(crate) fn encode(&self) -> Option<DeviceCodeword> {
-        if declined_for_test() {
+        if coset_decline() == CosetDecline::Everything {
+            note_card_decline(|| "declined by a test".to_string());
             return None;
         }
         note_coset_fallback();
-        self.0.encode(false).ok().map(DeviceCodeword)
+        match self.0.encode(false) {
+            Ok(codeword) => Some(DeviceCodeword(codeword)),
+            Err(e) => {
+                note_card_decline(|| format!("{e:?}"));
+                None
+            }
+        }
+    }
+}
+
+/// The codewords of a round-0 tree's stacks encoded on the HOST: the last
+/// fallback of an opening, when the card has room neither for the coset
+/// openings nor for a re-encode. One encoder a tree: its stacks share a domain,
+/// so the twiddles are built once. The transform is the host commit's
+/// (`encode(lift_coefficients(·))`, [`crate::whir::LiftEncoder`]), so the
+/// values are the committed ones; each stack is read back into a vector the
+/// size of its codeword and encoded there, so a stack holds one codeword and
+/// the twiddles on the host (≈ 4 GiB at a `2^27` stack, blowup 2), and the
+/// caller keeps only the blocks it opens before the next stack.
+#[cfg(feature = "cuda")]
+pub(crate) struct HostReencoder {
+    encoder: crate::whir::LiftEncoder<math::field::goldilocks::GoldilocksField>,
+    num_vars: usize,
+    log_blowup: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl HostReencoder {
+    /// An encoder for `stacks`, which must share one shape.
+    pub(crate) fn for_stacks(stacks: &[&CosetSource]) -> Result<Self, crate::Error> {
+        let first = stacks.first().ok_or(crate::Error::DeviceFailed {
+            stage: "a round-0 host re-encode of no stacks",
+        })?;
+        let (num_vars, log_blowup) = (first.0.num_vars(), first.0.log_blowup());
+        if stacks
+            .iter()
+            .any(|s| s.0.num_vars() != num_vars || s.0.log_blowup() != log_blowup)
+        {
+            return Err(crate::Error::DeviceFailed {
+                stage: "a round-0 host re-encode over stacks of different shapes",
+            });
+        }
+        Ok(Self {
+            encoder: crate::whir::LiftEncoder::new(num_vars + log_blowup)?,
+            num_vars,
+            log_blowup,
+        })
     }
 
-    /// The whole codeword encoded on the host from the stack read back: the
-    /// last fallback, when the card has room neither for the coset openings
-    /// nor for a re-encode. The transform is the host commit's
-    /// (`encode(lift_coefficients(·))`), so the values are the committed ones.
-    /// Counted with the host fallbacks. `None` for a field other than
-    /// Goldilocks or a failed read.
-    pub(crate) fn encode_on_host<F>(&self) -> Option<Vec<math::field::element::FieldElement<F>>>
+    /// The stack's codeword, canonical, in `F` (Goldilocks only).
+    pub(crate) fn reencode<F>(
+        &self,
+        stack: &CosetSource,
+    ) -> Result<Vec<math::field::element::FieldElement<F>>, crate::Error>
     where
         F: math::field::traits::IsField + 'static,
     {
         use math::field::element::FieldElement;
         use math::field::goldilocks::GoldilocksField as Gl;
-        let raw = self.0.to_host().ok()?;
+        if std::any::TypeId::of::<F>() != std::any::TypeId::of::<Gl>() {
+            return Err(crate::Error::DeviceFailed {
+                stage: "a round-0 host re-encode of a field other than Goldilocks",
+            });
+        }
+        let raw = stack
+            .0
+            .to_host_with_capacity(self.encoder.size())
+            .map_err(|_| crate::Error::DeviceFailed {
+                stage: "reading a round-0 stack back to the host",
+            })?;
+        // In place: the limbs become field elements in the same allocation.
         let evals: Vec<FieldElement<Gl>> = raw
-            .iter()
-            .map(|&limb| FieldElement::<Gl>::from_raw(canonical_limb(limb)))
+            .into_iter()
+            .map(|limb| FieldElement::<Gl>::from_raw(canonical_limb(limb)))
             .collect();
-        let mle = crate::mle::Mle::new(evals).ok()?;
-        let domain =
-            crate::whir::Domain::<Gl>::new(self.0.num_vars() + self.0.log_blowup()).ok()?;
-        let codeword =
-            crate::whir::encode::<Gl, Gl>(&crate::whir::lift_coefficients(&mle), &domain).ok()?;
-        note_host_fallback();
-        let raw: Vec<u64> = codeword.iter().map(|value| *value.value()).collect();
-        values_from_raw::<F>(&raw, true)
+        let mut codeword = self.encoder.encode(evals)?;
+        for value in codeword.iter_mut() {
+            *value = FieldElement::<Gl>::from_raw(canonical_limb(*value.value()));
+        }
+        let any: Box<dyn std::any::Any> = Box::new(codeword);
+        any.downcast::<Vec<FieldElement<F>>>()
+            .map(|codeword| *codeword)
+            .map_err(|_| crate::Error::DeviceFailed {
+                stage: "a round-0 host re-encode of a field other than Goldilocks",
+            })
+    }
+
+    /// The stacks' `2^num_vars` and blowup, for the fallback's line.
+    pub(crate) fn shape(&self) -> (usize, usize) {
+        (self.num_vars, self.log_blowup)
     }
 }
 
-/// Test only: the card declines every coset opening and re-encode of a round-0
-/// stack in this process, so the openings take the host fallback.
-#[cfg(feature = "cuda")]
-static DECLINE_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether a test asked the card to decline ([`force_coset_decline`]).
-#[cfg(feature = "cuda")]
-fn declined_for_test() -> bool {
-    DECLINE_FOR_TEST.load(Ordering::Relaxed)
+/// Which round-0 rungs the card declines for a test ([`force_coset_decline`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CosetDecline {
+    /// None: the card serves what it can (production).
+    Off,
+    /// The coset openings: a retired tree's opening re-encodes on the card.
+    Openings,
+    /// The coset openings and the card re-encode: the host does it.
+    Everything,
 }
 
-/// Test only: makes the card decline every round-0 coset opening and
-/// re-encode (`on`), as a card with no room does, or restores it. For a test
-/// that runs alone in its process.
+/// Test only: [`CosetDecline`] as a `u8` (0 off, 1 openings, 2 everything).
 #[cfg(feature = "cuda")]
-pub fn force_coset_decline(on: bool) {
-    DECLINE_FOR_TEST.store(on, Ordering::Relaxed);
+static DECLINE_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// What a test asked the card to decline ([`force_coset_decline`]).
+#[cfg(feature = "cuda")]
+fn coset_decline() -> CosetDecline {
+    match DECLINE_FOR_TEST.load(Ordering::Relaxed) {
+        1 => CosetDecline::Openings,
+        2 => CosetDecline::Everything,
+        _ => CosetDecline::Off,
+    }
+}
+
+/// Puts the previous [`CosetDecline`] back when dropped, so a test that
+/// panics between arming and restoring leaves nothing armed for the next.
+#[doc(hidden)]
+#[must_use = "the decline lasts while the guard lives"]
+pub struct CosetDeclineGuard {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    previous: CosetDecline,
+}
+
+impl Drop for CosetDeclineGuard {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        store_coset_decline(self.previous);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn store_coset_decline(mode: CosetDecline) {
+    let raw = match mode {
+        CosetDecline::Off => 0,
+        CosetDecline::Openings => 1,
+        CosetDecline::Everything => 2,
+    };
+    DECLINE_FOR_TEST.store(raw, Ordering::Relaxed);
+}
+
+/// Test only, not for production callers: makes the card decline the round-0
+/// rungs `mode` names, as a card with no room does, until the returned guard
+/// drops. For a test that runs alone in its process.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_coset_decline(mode: CosetDecline) -> CosetDeclineGuard {
+    let previous = coset_decline();
+    store_coset_decline(mode);
+    CosetDeclineGuard { previous }
+}
+
+/// Round-0 openings whose codewords the host re-encoded
+/// ([`HostReencoder`]): the trees, the stacks and the seconds they took.
+static OPEN_HOST_REENCODE_TREES: AtomicU64 = AtomicU64::new(0);
+static OPEN_HOST_REENCODE_STACKS: AtomicU64 = AtomicU64::new(0);
+static OPEN_HOST_REENCODE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// `(trees, stacks, seconds)` of round-0 openings the host re-encoded.
+pub fn open_host_reencodes() -> (u64, u64, f64) {
+    (
+        OPEN_HOST_REENCODE_TREES.load(Ordering::Relaxed),
+        OPEN_HOST_REENCODE_STACKS.load(Ordering::Relaxed),
+        OPEN_HOST_REENCODE_NANOS.load(Ordering::Relaxed) as f64 * 1e-9,
+    )
+}
+
+/// Why the card last declined a round-0 re-encode, for the host fallback's
+/// line; taken by it.
+#[cfg(feature = "cuda")]
+static CARD_DECLINE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "cuda")]
+fn note_card_decline(reason: impl FnOnce() -> String) {
+    if let Ok(mut last) = CARD_DECLINE.lock() {
+        *last = Some(reason());
+    }
+}
+
+/// Counts a round-0 opening the host re-encoded and prints one line for it:
+/// how many stacks of what shape, the seconds, why the card declined and the
+/// ledger beside it — so a card fault does not read as a full card.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn note_open_host_reencode(stacks: usize, shape: (usize, usize), seconds: f64) {
+    let trees = OPEN_HOST_REENCODE_TREES.fetch_add(1, Ordering::Relaxed) + 1;
+    OPEN_HOST_REENCODE_STACKS.fetch_add(stacks as u64, Ordering::Relaxed);
+    OPEN_HOST_REENCODE_NANOS.fetch_add((seconds * 1e9) as u64, Ordering::Relaxed);
+    #[cfg(feature = "cuda")]
+    let reason = CARD_DECLINE
+        .lock()
+        .ok()
+        .and_then(|mut last| last.take())
+        .unwrap_or_else(|| "no reason recorded".to_string());
+    #[cfg(not(feature = "cuda"))]
+    let reason = "no card".to_string();
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    eprintln!(
+        "[whir] a round-0 opening re-encoded {stacks} stack(s) of 2^{} at blowup 2^{} on the HOST in \
+         {seconds:.2} s; the card declined: {reason} (ledger {:.2} of {:.2} GiB promised); round-0 \
+         openings re-encoded on the host {trees}",
+        shape.0,
+        shape.1,
+        gib(ledger_reserved()),
+        gib(reserve_budget()),
+    );
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -7796,11 +7960,34 @@ impl CosetSource {
     pub(crate) fn encode(&self) -> Option<DeviceCodeword> {
         match self.0 {}
     }
+}
 
-    pub(crate) fn encode_on_host<F>(&self) -> Option<Vec<math::field::element::FieldElement<F>>>
+/// No device: no stack to re-encode ([`CosetSource`] is uninhabited).
+#[cfg(not(feature = "cuda"))]
+pub(crate) struct HostReencoder(std::convert::Infallible);
+
+#[cfg(not(feature = "cuda"))]
+impl HostReencoder {
+    pub(crate) fn for_stacks(stacks: &[&CosetSource]) -> Result<Self, crate::Error> {
+        match stacks.first() {
+            Some(stack) => match stack.0 {},
+            None => Err(crate::Error::DeviceFailed {
+                stage: "a round-0 host re-encode of no stacks",
+            }),
+        }
+    }
+
+    pub(crate) fn reencode<F>(
+        &self,
+        _stack: &CosetSource,
+    ) -> Result<Vec<math::field::element::FieldElement<F>>, crate::Error>
     where
         F: math::field::traits::IsField + 'static,
     {
+        match self.0 {}
+    }
+
+    pub(crate) fn shape(&self) -> (usize, usize) {
         match self.0 {}
     }
 }
@@ -8675,7 +8862,7 @@ impl CosetSource {
     where
         F: math::field::traits::IsField + 'static,
     {
-        if declined_for_test() {
+        if coset_decline() != CosetDecline::Off {
             return None;
         }
         let first = sources.first()?;
