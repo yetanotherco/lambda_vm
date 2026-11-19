@@ -2374,6 +2374,7 @@ fn prove_traces_under<H: WhirHash>(
                     .with_phase_b_upload_beside(uploads_beside(stacks))
                     .with_phase_b_overlap_planned(overlap_planned())
                     .with_prepared_upload_once(upload_once())
+                    .with_overlap_priced_resident(overlap_resident())
                     .with_overlap_faults(overlap_faults_for_test())
             })
         }
@@ -2861,6 +2862,40 @@ pub fn upload_once() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         super::wlfm_knobs::knob_word_on(std::env::var(UPLOAD_ONCE_ENV).ok().as_deref())
+    })
+}
+
+/// `LAMBDA_VM_LEVELS_OVERLAP_RESIDENT=1`: under [`UPLOAD_ONCE_ENV`], phase B's
+/// planned overlap prices a retired prepared stack's revive as the upload once
+/// makes it (its store and a revive over resident columns, no codeword on
+/// coset leaves) rather than as a revive that copies and encodes whole
+/// codewords
+/// ([`multilinear_block::BlockCommitted::with_overlap_priced_resident`]). Only
+/// the plan moves: a group whose openings now fit opens beside the next argue.
+/// Nothing without the upload once. The same proof. Only the W-LFM prover
+/// reads it. Off by default (and for any word but `1`); read once a process.
+pub const OVERLAP_RESIDENT_ENV: &str = "LAMBDA_VM_LEVELS_OVERLAP_RESIDENT";
+
+thread_local! {
+    /// A test's [`overlap_resident`] on this thread.
+    static OVERLAP_RESIDENT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: [`overlap_resident`] forced on this thread (`None` restores
+/// the knob).
+#[doc(hidden)]
+pub fn set_overlap_resident_for_test(on: Option<bool>) {
+    OVERLAP_RESIDENT_FOR_TEST.with(|c| c.set(on));
+}
+
+/// Whether [`OVERLAP_RESIDENT_ENV`] is on (or this thread's test override).
+pub fn overlap_resident() -> bool {
+    if let Some(on) = OVERLAP_RESIDENT_FOR_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::wlfm_knobs::knob_word_on(std::env::var(OVERLAP_RESIDENT_ENV).ok().as_deref())
     })
 }
 
