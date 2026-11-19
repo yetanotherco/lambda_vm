@@ -775,6 +775,9 @@ where
     Ok((rules, powers, points))
 }
 
+/// A table's three rules and its bus's row point.
+type OneBusRules<'a, E> = (Vec<Rule<'a, E>>, Vec<FieldElement<E>>);
+
 /// A table's three rules with its one bus pair, as [`table_rules`] makes
 /// them: `(rules, row point)`. The phase-A probes' form.
 fn table_rules_one<'a, F, E>(
@@ -782,7 +785,7 @@ fn table_rules_one<'a, F, E>(
     interactions: &'a [Interaction<E>],
     claim_point: &'a [FieldElement<E>],
     beta: &FieldElement<E>,
-) -> Result<(Vec<Rule<'a, E>>, Vec<FieldElement<E>>), MlError>
+) -> Result<OneBusRules<'a, E>, MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
     E: IsField + 'static,
