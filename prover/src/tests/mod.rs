@@ -17,6 +17,9 @@ pub mod block_cut_padding_tests;
 pub mod block_keccak_lean_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
+pub mod block_local_lookup_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
 pub mod block_memw_limbs_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
