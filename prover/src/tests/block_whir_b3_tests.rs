@@ -459,21 +459,24 @@ fn the_blake3_base_rounds_knob_reads_its_words_and_refuses_the_rest() {
 }
 
 /// The BLAKE3 base's GKR ladder knob reads `0`/`single` and `1`/`double`
-/// (any case, trimmed) and refuses every other word; no test sets it, so
-/// neither the pinned verifier's format nor a production format without it
-/// steps two layers.
+/// (any case, trimmed), unset is the base's default, and every other word is
+/// refused. The BLAKE3 base's default is two tree layers a step; any other
+/// base's production format, and the pinned verifier's, argue one layer a
+/// step. No test sets the knob.
 #[test]
 fn the_blake3_base_gkr_knob_reads_its_words_and_refuses_the_rest() {
-    use crate::block_whir::{b3_base_gkr, b3_base_gkr_setting, gkr_ladder_tag_word};
+    use crate::block_whir::{
+        B3_BASE_GKR_DEFAULT, b3_base_gkr, b3_base_gkr_setting, gkr_ladder_tag_word,
+    };
     use multilinear::whir_chain::GkrLadder;
     for (word, want) in [
-        (None, GkrLadder::Single),
-        (Some("0"), GkrLadder::Single),
-        (Some("single"), GkrLadder::Single),
-        (Some(" SINGLE "), GkrLadder::Single),
-        (Some("1"), GkrLadder::Double),
-        (Some("double"), GkrLadder::Double),
-        (Some(" Double\n"), GkrLadder::Double),
+        (None, None),
+        (Some("0"), Some(GkrLadder::Single)),
+        (Some("single"), Some(GkrLadder::Single)),
+        (Some(" SINGLE "), Some(GkrLadder::Single)),
+        (Some("1"), Some(GkrLadder::Double)),
+        (Some("double"), Some(GkrLadder::Double)),
+        (Some(" Double\n"), Some(GkrLadder::Double)),
     ] {
         assert_eq!(b3_base_gkr_setting(word), Ok(want), "{word:?}");
     }
@@ -482,13 +485,22 @@ fn the_blake3_base_gkr_knob_reads_its_words_and_refuses_the_rest() {
     ] {
         assert!(b3_base_gkr_setting(Some(word)).is_err(), "{word:?}");
     }
-    assert_eq!(b3_base_gkr(), GkrLadder::Single, "no test sets the knob");
+    assert_eq!(b3_base_gkr(), None, "no test sets the knob");
+    assert_eq!(
+        B3_BASE_GKR_DEFAULT,
+        GkrLadder::Double,
+        "the BLAKE3 base's default"
+    );
     assert_eq!(BlockFormat::pinned().argue.ladder(), GkrLadder::Single);
-    assert_eq!(BlockFormat::production().argue.ladder(), GkrLadder::Single);
+    assert_ne!(
+        BlockFormat::production().zf.base,
+        stark::proof::options::BaseFormat::B3_WHIR,
+        "premise: the test process's base is not BLAKE3"
+    );
     assert_eq!(
         BlockFormat::production().argue,
         multilinear::whir_chain::ArgueFormat::BATCHED,
-        "the production argue is today's"
+        "another base's production argue is one layer a step"
     );
     assert_eq!(gkr_ladder_tag_word(GkrLadder::Single), "");
     assert_eq!(gkr_ladder_tag_word(GkrLadder::Double), "/L2");

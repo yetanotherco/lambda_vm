@@ -489,8 +489,8 @@ pub fn memory_setting(knob: Option<&str>, base_only: bool) -> Result<MemoryForma
 /// production argue; `batched` (at `cap`, `BLOCK_WHIR_ARGUE_CAP`, when given)
 /// with the production argue's GKR ladder, so the BLAKE3 base's ladder knob
 /// (`LAMBDA_VM_B3_BASE_GKR`) reaches it as it reaches the production argue;
-/// `per-table`, refused when the ladder knob asks for two layers a step, which
-/// a per-table argue has no ladder to take.
+/// `per-table`, refused when the production argue steps two layers (the
+/// BLAKE3 base's default), which a per-table argue has no ladder to take.
 fn argue_setting(
     word: Option<&str>,
     cap: Option<usize>,
@@ -510,7 +510,7 @@ fn argue_setting(
         }
         Some("per-table") if production.ladder() != GkrLadder::Single => Err(
             "BLOCK_WHIR_ARGUE=per-table has no GKR ladder to step two layers at a time \
-             (LAMBDA_VM_B3_BASE_GKR)"
+             (LAMBDA_VM_B3_BASE_GKR=single gives the BLAKE3 base one layer a step)"
                 .to_string(),
         ),
         Some("per-table") => Ok(ArgueFormat::PerTable),

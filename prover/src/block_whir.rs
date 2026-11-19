@@ -763,22 +763,28 @@ pub fn b3_base_rounds() -> B3Rounds {
     })
 }
 
-/// The knob that proves and verifies the BLAKE3 base's batched argues on the
-/// two-layer GKR ladder ([`GkrLadder::Double`]: each ladder step proves a
-/// tree layer against its grandchildren); both sides of one process read it,
-/// and the tag names it: see [`b3_base_gkr_setting`]. Read here, never by
-/// the format module (`zf_format`), whose knobs a pinned verifier refuses.
+/// The knob that chooses the GKR ladder of the BLAKE3 base's batched argues:
+/// one tree layer a step ([`GkrLadder::Single`]) or two
+/// ([`GkrLadder::Double`]: each step proves a tree layer against its
+/// grandchildren). Both sides of one process read it, and the tag names a
+/// two-layer ladder: see [`b3_base_gkr_setting`]. Read here, never by the
+/// format module (`zf_format`), whose knobs a pinned verifier refuses.
 pub const B3_BASE_GKR_ENV: &str = "LAMBDA_VM_B3_BASE_GKR";
 
-/// [`B3_BASE_GKR_ENV`]'s value: unset, `0` or `single` is
-/// [`GkrLadder::Single`] (today's); `1` or `double` is [`GkrLadder::Double`].
-/// Only these words are read: anything else is refused.
-pub fn b3_base_gkr_setting(value: Option<&str>) -> Result<GkrLadder, String> {
+/// The BLAKE3 base's GKR ladder when [`B3_BASE_GKR_ENV`] is unset: two tree
+/// layers a step. Any other base argues one layer a step.
+pub const B3_BASE_GKR_DEFAULT: GkrLadder = GkrLadder::Double;
+
+/// [`B3_BASE_GKR_ENV`]'s value: unset is `None` (the base's default,
+/// [`B3_BASE_GKR_DEFAULT`] under BLAKE3); `0` or `single` is
+/// [`GkrLadder::Single`]; `1` or `double` is [`GkrLadder::Double`]. Only these
+/// words are read: anything else is refused.
+pub fn b3_base_gkr_setting(value: Option<&str>) -> Result<Option<GkrLadder>, String> {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
-        None => Ok(GkrLadder::Single),
+        None => Ok(None),
         Some(v) => match v.as_str() {
-            "0" | "single" => Ok(GkrLadder::Single),
-            "1" | "double" => Ok(GkrLadder::Double),
+            "0" | "single" => Ok(Some(GkrLadder::Single)),
+            "1" | "double" => Ok(Some(GkrLadder::Double)),
             other => Err(format!(
                 "{B3_BASE_GKR_ENV}={other:?}: expected 0, single, 1 or double"
             )),
@@ -786,11 +792,11 @@ pub fn b3_base_gkr_setting(value: Option<&str>) -> Result<GkrLadder, String> {
     }
 }
 
-/// The BLAKE3 base's GKR ladder in this process ([`b3_base_gkr_setting`] of
-/// [`B3_BASE_GKR_ENV`]), read once; a refused value aborts the process at
-/// its first read, as [`b3_base_rounds`] does.
-pub fn b3_base_gkr() -> GkrLadder {
-    static LADDER: std::sync::OnceLock<GkrLadder> = std::sync::OnceLock::new();
+/// The GKR ladder [`B3_BASE_GKR_ENV`] names in this process
+/// ([`b3_base_gkr_setting`]), `None` when unset; read once; a refused value
+/// aborts the process at its first read, as [`b3_base_rounds`] does.
+pub fn b3_base_gkr() -> Option<GkrLadder> {
+    static LADDER: std::sync::OnceLock<Option<GkrLadder>> = std::sync::OnceLock::new();
     *LADDER.get_or_init(|| {
         let value = match std::env::var(B3_BASE_GKR_ENV) {
             Ok(v) => Some(v),
@@ -901,13 +907,15 @@ impl BlockFormat {
             prepared: true,
             leaf_scale: crate::lfm::whir_block::process_leaf_scale(),
             leaf_query: crate::lfm::whir_block::process_leaf_query(),
-            // The BLAKE3 base's GKR ladder ([`b3_base_gkr`]); the knob on any
-            // other base is a configuration error.
+            // The BLAKE3 base's GKR ladder ([`b3_base_gkr`]; unset, two layers
+            // a step, [`B3_BASE_GKR_DEFAULT`]); any other base argues one
+            // layer a step, and the knob asking it for two is a configuration
+            // error.
             argue: ArgueFormat::BATCHED.with_ladder(
                 match (zf.base == BaseFormat::B3_WHIR, b3_base_gkr()) {
-                    (true, ladder) => ladder,
-                    (false, GkrLadder::Single) => GkrLadder::Single,
-                    (false, ladder) => {
+                    (true, ladder) => ladder.unwrap_or(B3_BASE_GKR_DEFAULT),
+                    (false, None | Some(GkrLadder::Single)) => GkrLadder::Single,
+                    (false, Some(ladder)) => {
                         eprintln!(
                             "{B3_BASE_GKR_ENV} asks for {ladder:?}: the two-layer GKR ladder is \
                              the BLAKE3 base's alone"
