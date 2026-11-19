@@ -625,6 +625,7 @@ impl WhirTreeConfig {
             match format.keccak_rnd {
                 KeccakRndForm::Full => "full",
                 KeccakRndForm::Lean => "lean",
+                KeccakRndForm::LeanLocal => "lean, local",
             }
         );
         eprintln!(
@@ -6744,7 +6745,7 @@ mod tests {
         // verifier's preset does not name is not at the presets.
         let other = match BlockFormat::pinned().keccak_rnd {
             KeccakRndForm::Full => KeccakRndForm::Lean,
-            KeccakRndForm::Lean => KeccakRndForm::Full,
+            KeccakRndForm::Lean | KeccakRndForm::LeanLocal => KeccakRndForm::Full,
         };
         let mut c = production.clone();
         c.format = c.format.with_keccak_rnd(other);
