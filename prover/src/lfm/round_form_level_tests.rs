@@ -264,6 +264,44 @@ fn level_1_executes_over_a_round_form_blake3_base_and_refuses_its_tampers() {
     }
 }
 
+/// ★ Level 1 over a small BLAKE3 base whose GKR ladders step two tree layers
+/// (the round form, today's first fold): the base proves and verifies; level
+/// 1's closed program — the real leaf, its batched walk hinted by its own
+/// plan's shapes and its transcript BLAKE3, drawing `c₂` — executes over the
+/// base's witness and claims the block, and group 0's program publishes the
+/// host's bus sum; four one-value tampers of the two-layer ladder (a value of
+/// each of a step's two halves, a degree-5 round's value, step 0's first
+/// value) are refused in execution. The ordinary lib run's twin of the
+/// box-tier words test below.
+#[test]
+fn level_1_executes_over_a_two_layer_blake3_base_and_refuses_ladder_tampers() {
+    let name = "test_commit_4";
+    let mut double = format(
+        B3Rounds::WHIR3,
+        crate::zf_format::ZfFormat::DEFAULT.whir_folds,
+    );
+    double.argue = double.argue.with_ladder(GkrLadder::Double);
+    let (elf, proof) = base(name, &double);
+    let plan = plan(&elf, &proof, &double);
+    let census = level_1_executes(&plan, &proof);
+    println!(
+        "LEVEL 1 TWO-LAYER {name}: {} groups · instructions {} · lean compressions {}",
+        census.groups, census.instructions, census.compressions
+    );
+    let program = plan.closed_block_program().expect("emits");
+    let hasher = hasher(&program);
+    let tampers = ladder_tampers(&proof);
+    for (what, edit) in [0usize, 7, 8, 9].map(|k| &tampers[k]) {
+        let mut forged = proof.clone();
+        edit(&mut forged);
+        let arenas = block_leaf_arena(&plan, &forged, 0)
+            .unwrap_or_else(|e| panic!("{what}: the arena builds: {e}"));
+        let why = execute(&program, &arenas, &hasher);
+        println!("LEVEL 1 TWO-LAYER TAMPER {what}: {:?}", why.as_ref().err());
+        assert!(why.is_err(), "{what}: level 1 accepted it");
+    }
+}
+
 /// A streamed BLAKE3 base (`window_log2`, the production options' and the
 /// levels driver's) proved, and its host verifier's refusal if any.
 fn streamed(elf: &[u8], format: &BlockFormat) -> Result<Option<String>, String> {
@@ -1099,28 +1137,42 @@ fn words_ladder(ladder: GkrLadder) -> BlockFormat {
     f
 }
 
-/// One-value tampers of group 0's first bin's two-layer ladder: each of
-/// the eight values a two-layer tree sends at its first step past step 0,
-/// a value of that step's first degree-5 round, and step 0's first value.
+/// One-value tampers of the first bin's two-layer ladder that has a degree-5
+/// step with rounds (groups in order, then bins): each of the eight values of
+/// that step's first two halves, its first round's last value, and the bin's
+/// step 0's first value.
 fn ladder_tampers(proof: &BlockWhirProof) -> Vec<(String, Tamper)> {
-    let ladder = &proof.argues[0].gkr[0];
-    let step = ladder
-        .layers
+    let (g, bin, step) = proof
+        .argues
         .iter()
-        .position(|l| {
-            l.sumcheck
-                .rounds
-                .first()
-                .is_some_and(|r| r.evaluations.len() == 5)
+        .enumerate()
+        .flat_map(|(g, argue)| {
+            argue
+                .gkr
+                .iter()
+                .enumerate()
+                .filter_map(move |(bin, ladder)| {
+                    ladder
+                        .layers
+                        .iter()
+                        .position(|l| {
+                            l.sumcheck
+                                .rounds
+                                .first()
+                                .is_some_and(|r| r.evaluations.len() == 5)
+                        })
+                        .map(|step| (g, bin, step))
+                })
         })
-        .expect("a degree-5 step with rounds in group 0's first bin");
+        .next()
+        .expect("a degree-5 step with rounds in some bin");
     let mut tampers: Vec<(String, Tamper)> = Vec::new();
     for half in 0..2 {
         for value in 0..4 {
             tampers.push((
-                format!("step {step} half {half} value {value}"),
+                format!("group {g} bin {bin} step {step} half {half} value {value}"),
                 Box::new(move |p: &mut BlockWhirProof| {
-                    let h = &mut p.argues[0].gkr[0].layers[step].halves[half];
+                    let h = &mut p.argues[g].gkr[bin].layers[step].halves[half];
                     *[&mut h.p_lo, &mut h.p_hi, &mut h.q_lo, &mut h.q_hi][value] +=
                         FieldElement::<E>::one();
                 }),
@@ -1128,16 +1180,16 @@ fn ladder_tampers(proof: &BlockWhirProof) -> Vec<(String, Tamper)> {
         }
     }
     tampers.push((
-        format!("step {step}'s first round's last value"),
+        format!("group {g} bin {bin} step {step}'s first round's last value"),
         Box::new(move |p: &mut BlockWhirProof| {
-            p.argues[0].gkr[0].layers[step].sumcheck.rounds[0].evaluations[4] +=
+            p.argues[g].gkr[bin].layers[step].sumcheck.rounds[0].evaluations[4] +=
                 FieldElement::<E>::one();
         }),
     ));
     tampers.push((
-        "step 0's first value".to_string(),
-        Box::new(|p: &mut BlockWhirProof| {
-            p.argues[0].gkr[0].layers[0].halves[0].p_lo += FieldElement::<E>::one();
+        format!("group {g} bin {bin} step 0's first value"),
+        Box::new(move |p: &mut BlockWhirProof| {
+            p.argues[g].gkr[bin].layers[0].halves[0].p_lo += FieldElement::<E>::one();
         }),
     ));
     tampers
@@ -1181,8 +1233,10 @@ fn level_1_executes_over_a_two_layer_blake3_base_and_refuses_its_tampers() {
         c_one.first_compressions,
     );
 
-    // A plan under one ladder takes no proof of the other: its words are
-    // another count, or execution refuses them.
+    // A plan under one ladder takes no proof of the other. The arena builder
+    // (the prover's side) refuses another word count; in-guest the leaf reads
+    // every word by its own plan's shape, so another ladder's words are
+    // values its constraints refuse, whatever arena a prover writes.
     for (what, plan, proof) in [
         ("a two-layer plan over a one-layer proof", &two_plan, &one),
         ("a one-layer plan over a two-layer proof", &one_plan, &two),

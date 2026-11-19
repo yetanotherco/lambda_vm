@@ -1169,8 +1169,10 @@ fn the_two_layer_leg_is_the_host_and_its_closed_form() {
 }
 
 /// The leg's words follow the ladder: a proof's words are its ladder's
-/// count and not the other ladder's, so an arena laid for one ladder cannot
-/// carry the other's proof (the leaf's hint count refuses it).
+/// count and not the other ladder's, so the leaf's arena builder (the
+/// prover's side) refuses the other's proof by its count. In-guest it is the
+/// constraints that refuse it: the leg reads every word by its own plan's
+/// shape.
 #[test]
 fn the_two_layer_legs_words_are_its_own() {
     for ladder in [GkrLadder::Single, GkrLadder::Double] {
