@@ -1367,6 +1367,16 @@ pub struct LevelsTimes {
     pub card_pad: u64,
 }
 
+impl LevelsTimes {
+    /// Whether level 1's program was made the fast way: emitted without the
+    /// admission validator in front of its execution, the validator run
+    /// beside that execution or, under [`VALIDATE_LATE_ENV`], from the base's
+    /// end and joined after level 1's prove.
+    pub fn program_made_fast(&self) -> bool {
+        self.validated_beside.is_some() || self.validated_late.is_some()
+    }
+}
+
 /// One level's build, as the driver ran it.
 #[derive(Clone, Copy, Debug)]
 pub struct LevelBuild {

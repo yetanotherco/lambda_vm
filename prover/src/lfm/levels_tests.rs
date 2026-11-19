@@ -1010,6 +1010,26 @@ fn the_admitted_derivation_is_the_derivation_byte_for_byte() {
     );
 }
 
+/// Level 1's program counts as made the fast way when its validator ran
+/// beside the execution or late, after level 1's prove; with neither (the
+/// validator in front of the execution) it does not.
+#[test]
+fn a_late_validated_level_one_is_made_the_fast_way() {
+    use super::levels::LevelsTimes;
+    let none = LevelsTimes::default();
+    assert!(!none.program_made_fast());
+    let beside = LevelsTimes {
+        validated_beside: Some((1.8, 11.4)),
+        ..Default::default()
+    };
+    assert!(beside.program_made_fast());
+    let late = LevelsTimes {
+        validated_late: Some((1.8, 14.0)),
+        ..Default::default()
+    };
+    assert!(late.program_made_fast());
+}
+
 /// The fill-beside knob's name; it is on by default, and only `0` turns it
 /// off.
 #[test]
@@ -1359,7 +1379,7 @@ fn rta_one_run(
     println!(
         "RTA LEVEL1 EMIT: program fast {} · walk {:.3}s · compile {:.3}s · validate before the \
          execution {:.3}s · beside nice {}",
-        t.validated_beside.is_some(),
+        t.program_made_fast(),
         t.emit_split.0,
         t.emit_split.1,
         t.emit_split.2,
