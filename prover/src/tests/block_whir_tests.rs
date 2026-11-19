@@ -3254,17 +3254,15 @@ fn an_early_keccak_rnd_table_laid_out_with_another_air_is_refused() {
     let Err(e) = refused else {
         panic!("a table laid out with another AIR proved");
     };
-    // The layout thread refuses the table and stops; which thread reports
-    // first is a race. The builder names the layout's error when it found the
-    // layout gone as it handed a table on; when the packer (which stops with
-    // the layout) stopped the finish's byte gate first, the builder reports
-    // only that. Either way the prove is refused; the cause is checked where
-    // it is named.
+    // The layout thread refuses the table and stops; whether the builder then
+    // finds the layout gone as it hands a table on, or the finish's byte gate
+    // stopped by the packer going down with it, is a race. Either way the
+    // prove names the layout's cause.
     let message = format!("{e:?}");
-    let named =
-        message.contains("laid out with KECCAK_RND[1]") && message.contains("KECCAK_RND[0]");
-    let gate_stopped = message.contains("the finish's byte gate stopped: the packer stopped");
-    assert!(named || gate_stopped, "{message}");
+    assert!(
+        message.contains("laid out with KECCAK_RND[1]") && message.contains("KECCAK_RND[0]"),
+        "{message}"
+    );
 }
 
 /// The bounded layout (D-EXEC E3): with three workers and `layout_ahead =

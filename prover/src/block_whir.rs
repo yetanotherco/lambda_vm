@@ -8887,10 +8887,13 @@ fn prove_streamed(
             executed.map_err(|_| Error::Prover("the block's executor panicked".into()))??;
         // A thread's error names the cause; a commit that ran out of groups only
         // says that it did. A builder that stopped because the layout thread
-        // stopped taking its tables names the layout's error, when it has one.
+        // stopped taking its tables, or because its packer stopped the finish's
+        // byte gate as it went down with the layout, names the layout's error,
+        // when it has one: which of the two the builder meets first is a race.
         let built = built.map_err(|_| Error::Prover("the block's builder panicked".into()))?;
         if let (Err(Error::Prover(message)), Ok(Err(cause))) = (&built, &laid)
-            && message.starts_with("the layout thread stopped")
+            && (message.starts_with("the layout thread stopped")
+                || message.starts_with("the finish's byte gate stopped"))
         {
             return Err(Error::Prover(format!("{message}: {cause}")));
         }
