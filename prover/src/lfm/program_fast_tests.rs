@@ -8,7 +8,10 @@
 
 use super::compiler::{LfmProgram, compile, compile_parallel_sliced};
 use super::instr::Instr;
-use super::levels::{PROGRAM_FAST_ENV, joined_validation, spawn_validation};
+use super::levels::{
+    PROGRAM_FAST_ENV, joined_validation, joined_validation_owned, spawn_validation,
+    spawn_validation_owned, spawn_validation_owned_with,
+};
 
 fn verdict(program: &LfmProgram) -> Result<f64, String> {
     std::thread::scope(|scope| joined_validation(spawn_validation(scope, program)))
@@ -45,6 +48,59 @@ fn an_inadmissible_program_is_refused_by_the_beside_validator() {
     );
     let err = verdict(&program).expect_err("the beside verdict refuses it");
     assert!(err.contains("not admissible"), "{err}");
+}
+
+/// The late check (`LAMBDA_VM_LEVELS_VALIDATE_LATE`), which owns the program:
+/// it accepts what the validator accepts and hands the program back released
+/// with its heights kept, as the driver's other path leaves it.
+#[test]
+fn the_late_validator_admits_and_hands_the_program_back_released() {
+    for program in [super::wlfm_tests::honest(), super::b3l_wlfm_tests::honest()] {
+        let (instrs, rows) = (program.instrs.len(), program.groups.b3l.real_rows);
+        assert!(instrs > 0, "the fixture has instructions");
+        let (secs, back) = std::thread::scope(|scope| {
+            joined_validation_owned(spawn_validation_owned(scope, program))
+        })
+        .expect("an admissible program passes the late check");
+        assert!(secs >= 0.0);
+        assert!(back.instrs.is_empty(), "handed back released");
+        assert_eq!(back.groups.b3l.real_rows, rows, "with its heights kept");
+    }
+}
+
+/// The late check refuses an inadmissible program (a moved multiplicity, as a
+/// compiler bug would make), and a panic on its thread is a refusal too, never
+/// a resumed panic.
+#[test]
+fn the_late_validator_refuses_an_inadmissible_program_and_a_panic() {
+    let mut program = super::wlfm_tests::honest();
+    let moved = program.instrs.iter_mut().find_map(|i| match i {
+        Instr::BaseAlu { mult, .. } | Instr::Const { mult, .. } => {
+            *mult += 1;
+            Some(())
+        }
+        _ => None,
+    });
+    assert!(
+        moved.is_some(),
+        "the fixture has a base ALU or constant row"
+    );
+    let err =
+        std::thread::scope(|scope| joined_validation_owned(spawn_validation_owned(scope, program)))
+            .expect_err("the late check refuses it");
+    assert!(err.contains("not admissible"), "{err}");
+    fn panics(_: &LfmProgram) -> Result<(), super::validator::LfmViolation> {
+        panic!("a test's validator panics");
+    }
+    let err = std::thread::scope(|scope| {
+        joined_validation_owned(spawn_validation_owned_with(
+            scope,
+            super::wlfm_tests::honest(),
+            panics,
+        ))
+    })
+    .expect_err("a panicking validator refuses");
+    assert!(err.contains("panicked"), "{err}");
 }
 
 /// The knob's name; it is on by default, and only `0` turns it off.
