@@ -29,6 +29,13 @@ pub fn narrow_chips() -> bool {
 /// host's trace holds. Read once a process.
 pub const CHIP_RECORDS_ENV: &str = "LAMBDA_VM_WLFM_CHIP_RECORDS";
 
+/// The environment's word for knob `name` (`None` when unset or not
+/// unicode): the one place the W-LFM knobs read the environment, so the
+/// format module ([`super::wlfm`]) reads none.
+pub fn env_word(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
 /// Whether a knob's word turns it on: `1` (spaces around it ignored), and
 /// nothing else.
 pub fn knob_word_on(word: Option<&str>) -> bool {
