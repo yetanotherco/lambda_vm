@@ -8,6 +8,7 @@
 //! program's marginal rows against `batched_argue_cost`.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
 use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
 use multilinear::whir_chain::{ArgueFormat, GkrLadder, GkrPack};
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, RowDomain};
@@ -343,7 +344,8 @@ fn flatten(argue: &BatchedArgue<E>, z: FEE, alpha_powers: &[FEE], beta: FEE) -> 
 type ReduceParts = (Vec<Vec<Ext>>, Vec<Ext>);
 
 /// The assembled program over the hinted proof, or — with `leg` false — the
-/// same arena with no leg, so the difference is the leg.
+/// same arena with no leg, so the difference is the leg. With `stream`, the
+/// transcript's next draw after the leg is published last.
 #[allow(clippy::too_many_arguments)]
 fn batched_program(
     argue: &BatchedArgue<E>,
@@ -353,6 +355,7 @@ fn batched_program(
     alpha_count: usize,
     total: usize,
     leg: bool,
+    stream: bool,
 ) -> LfmProgram {
     let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
     let arena = b.declare_arena(total as u32);
@@ -472,6 +475,10 @@ fn batched_program(
             b.public(wire.as_cell());
         }
     }
+    if stream {
+        let next = transcript.sample_ext(&mut b);
+        b.public(next.as_cell());
+    }
     compile(b.finish())
 }
 
@@ -514,22 +521,21 @@ fn with_run_on<R>(
     let (z, alpha, beta) = challenges();
     let alpha_powers = alpha_ladder(&buses, alpha);
     let statements: Vec<_> = layouts.iter().map(|l| l.statement()).collect();
-    let host = {
-        let mut verifier = HostTranscript::new(&[]);
-        verify_argue(
-            &argue,
-            &statements,
-            cap,
-            fixture.pack,
-            fixture.ladder,
-            &z,
-            &alpha,
-            &beta,
-            &mut verifier,
-            HOST_CHECKS.with(std::cell::Cell::get),
-        )
-        .map_err(|e| format!("{e:?}"))
-    };
+    let mut verifier = HostTranscript::new(&[]);
+    let host = verify_argue(
+        &argue,
+        &statements,
+        cap,
+        fixture.pack,
+        fixture.ladder,
+        &z,
+        &alpha,
+        &beta,
+        &mut verifier,
+        HOST_CHECKS.with(std::cell::Cell::get),
+    )
+    .map_err(|e| format!("{e:?}"));
+    let host_next = verifier.sample_field_element();
     check(RunView {
         argue: &argue,
         shapes: &shapes,
@@ -539,6 +545,7 @@ fn with_run_on<R>(
         beta,
         alpha_powers: &alpha_powers,
         host,
+        host_next,
     })
 }
 
@@ -551,6 +558,8 @@ struct RunView<'a> {
     beta: FEE,
     alpha_powers: &'a [FEE],
     host: Result<Vec<multilinear::claim_reduce::ReducedClaim<E>>, String>,
+    /// The host verifier's transcript's next draw after `verify_argue`.
+    host_next: FEE,
 }
 
 impl RunView<'_> {
@@ -559,6 +568,10 @@ impl RunView<'_> {
     }
 
     fn program(&self, leg: bool) -> LfmProgram {
+        self.program_with(leg, false)
+    }
+
+    fn program_with(&self, leg: bool, stream: bool) -> LfmProgram {
         batched_program(
             self.argue,
             self.shapes,
@@ -567,11 +580,18 @@ impl RunView<'_> {
             self.alpha_powers.len(),
             self.values().len(),
             leg,
+            stream,
         )
     }
 
     fn execute(&self) -> Result<Vec<FEE>, String> {
-        let program = self.program(true);
+        self.execute_with(false)
+    }
+
+    /// The leg's published values, the transcript's next draw last with
+    /// `stream`.
+    fn execute_with(&self, stream: bool) -> Result<Vec<FEE>, String> {
+        let program = self.program_with(true, stream);
         validate(&program).map_err(|e| format!("invalid: {e:?}"))?;
         execute(
             &program,
@@ -1339,5 +1359,36 @@ fn the_two_layer_leg_refuses_the_diagonal_forgery() {
             )),
             "table {t}: the host passes step 0 and refuses step 1"
         );
+    }
+}
+
+/// ★ THE STREAM KAT for the ladders: after the leg, the machine's transcript
+/// draws what the host verifier's draws after `verify_argue`, so every absorb
+/// and every draw before it — each step's `μ`, its rounds' values and
+/// challenges, its halves, `c₁` and, when a tree descends two layers, `c₂` —
+/// is the host's, in the host's order. Both ladders, plain and packed, one
+/// bin and every table alone.
+#[test]
+fn the_leg_draws_the_hosts_stream_on_both_ladders() {
+    for ladder in [GkrLadder::Single, GkrLadder::Double] {
+        for (name, fixture) in [
+            ("plain", Fixture::new as fn() -> Fixture),
+            ("packed", Fixture::packed),
+        ] {
+            for cap in [27u8, 0] {
+                with_run_on(fixture().on(ladder), cap, |_| {}, |run| {
+                    let what = format!("{ladder:?} {name} cap {cap}");
+                    run.host.clone().expect("the host verifies its own argue");
+                    let published = run
+                        .execute_with(true)
+                        .unwrap_or_else(|e| panic!("{what}: the leg must execute: {e}"));
+                    let machine_next = *published.last().expect("the next draw");
+                    assert_eq!(
+                        machine_next, run.host_next,
+                        "{what}: the machine's next draw is the host's"
+                    );
+                });
+            }
+        }
     }
 }
