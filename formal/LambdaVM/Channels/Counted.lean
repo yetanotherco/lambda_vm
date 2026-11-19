@@ -25,7 +25,6 @@ its own, not `channel.toRaw`. With the bounded balance `BalancedUpTo N` of the m
 (the fork's `counted-pulls`, which `lakefile.toml` pins by sha at `73309694`), `consistentUpTo`
 closes the gap.
 
-
 This file's `counted` is **not** the fork's `Channel.counted`, which is what `Tables/Lt.lean`,
 `Tables/MinToy.lean` and `Ensembles/CountedSameBus.lean` pull on. On an out-of-range pull this
 file charges the guarantee, like a push; the fork forbids the multiplicity instead. Only
