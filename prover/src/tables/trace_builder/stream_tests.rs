@@ -1081,6 +1081,7 @@ fn with_pages_first_the_sliding_stream_hands_the_pages_on_next() {
                         crate::tables::keccak_rnd::KeccakRndForm::Full,
                         crate::tables::memw_aligned::MemwAlignedOrder::Lt,
                         crate::tables::register::RegisterFormat::Tokens32,
+                        crate::tables::ecdas::EcdasForm::Bytes,
                     );
                     let mut first: Vec<usize> =
                         crate::block_whir::chunked_table_ranges(&header.table_counts)
