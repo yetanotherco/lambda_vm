@@ -129,6 +129,23 @@ pub fn block_groups(
     Ok(sizes)
 }
 
+/// Under [`BlockCommitted::with_prepared_upload_once`], what happened to a
+/// group's retired prepared stack: its columns put on the card once (`used`,
+/// `bytes` of them, the ledger holding `after` once they were up: the copy the
+/// opening no longer makes), or the plan kept the two copies (`planned_out`,
+/// with what it `need`ed and what the budget had `free`), or the card refused
+/// the store (`refused`). All `false` / 0 without a retired stack or a card.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UploadOnce {
+    pub used: bool,
+    pub bytes: u64,
+    pub after: u64,
+    pub planned_out: bool,
+    pub refused: bool,
+    pub need: u64,
+    pub free: u64,
+}
+
 /// What a group cost, for the readout. Seconds of wall time on the prover's
 /// thread.
 #[derive(Clone, Debug, Default)]
@@ -210,6 +227,9 @@ pub struct GroupStamps {
     pub overlap_planned_out: bool,
     pub overlap_plan_need: u64,
     pub overlap_plan_free: u64,
+    /// Under [`BlockCommitted::with_prepared_upload_once`], the group's retired
+    /// prepared stack's store ([`UploadOnce`]).
+    pub upload_once: UploadOnce,
     /// Under [`PhaseBOverlap::On`], the group's openings ran alone because an
     /// earlier transition saw the card refuse a promise.
     pub serial_after_refusal: bool,
@@ -1639,6 +1659,9 @@ pub struct OverlapFaults {
     /// Under the planned overlap: the plan refuses to open the group at this
     /// place beside the next group's argue (it opens alone).
     pub overlap_refused_at: Option<usize>,
+    /// Under the upload once: the plan refuses the store of the group at this
+    /// place (it copies its prepared columns twice, as without the knob).
+    pub upload_once_refused_at: Option<usize>,
 }
 
 /// Every count of a promise the card refused, or of a wait on every stream at
@@ -1707,6 +1730,10 @@ where
     /// next group's argue where its plan says the card holds both
     /// ([`Self::with_phase_b_overlap_planned`]); `false` unless set.
     overlap_planned: bool,
+    /// Phase B puts a retired prepared stack's columns on the card once, for
+    /// both its revive and its opening ([`Self::with_prepared_upload_once`]);
+    /// `false` unless set.
+    upload_once: bool,
     /// Phase B stamps its driver thread's schedstat a group turn
     /// ([`Self::with_sched_stamps`]).
     sched: bool,
@@ -2138,6 +2165,7 @@ where
             overlap_faults: OverlapFaults::default(),
             upload_beside: true,
             overlap_planned: false,
+            upload_once: false,
             sched: false,
             ood,
             ood_unbound: false,
@@ -2184,6 +2212,18 @@ where
     /// [`PhaseBOverlap::On`]. The overlap moves no byte.
     pub fn with_phase_b_overlap_planned(mut self, planned: bool) -> Self {
         self.overlap_planned = planned;
+        self
+    }
+
+    /// Phase B puts each retired prepared stack's columns on the card ONCE, at
+    /// its revive, and both the revive and the prepared opening read them
+    /// there (`true`), instead of the revive copying them in for its encode and
+    /// the opening copying them in again for its message (`false`, the
+    /// default). Where the plan says the card does not hold the store beside
+    /// the opening's own promises ([`UploadOnce`]), or the card refuses it, the
+    /// group copies twice as before. The same columns read: the same proof.
+    pub fn with_prepared_upload_once(mut self, on: bool) -> Self {
+        self.upload_once = on;
         self
     }
 
@@ -2860,6 +2900,11 @@ where
     /// Its commit-time out-of-domain claims, batched into its opening
     /// (`None` only under a test's [`OodFault::FalseUnbound`]).
     ood: Option<OodClaims<E>>,
+    /// Its retired prepared stack's columns on the card once
+    /// ([`BlockCommitted::with_prepared_upload_once`]), and a test's refusal of
+    /// that store's plan.
+    upload_once: bool,
+    upload_once_refused: bool,
 }
 
 /// A group's openings done: its opening, its prepared one when it has one,
@@ -2871,6 +2916,8 @@ struct Opened<F: IsField, E: IsField> {
     open: f64,
     /// Of `open`, the seconds a retired prepared stack took to come back.
     prepared_revive: f64,
+    /// Its prepared stack's store under the upload once ([`UploadOnce`]).
+    upload_once: UploadOnce,
     /// What the revive added to the ledger, and the ledger's peak through the
     /// openings: read only when the openings had the ledger's window to
     /// themselves (0 and `None` otherwise).
@@ -2995,6 +3042,61 @@ where
         .saturating_add(OVERLAP_MARGIN_BYTES);
     let free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
     (need <= free, need, free)
+}
+
+/// Under the upload once, the margin kept free beside a store's plan.
+const UPLOAD_ONCE_MARGIN_BYTES: u64 = 1 << 30;
+
+/// Under the upload once, `columns` (a retired prepared stack's) put on the
+/// card for its revive and its opening, where the plan says the ledger holds
+/// them and the revive's own promises (the store's bytes,
+/// [`RetiredStack::revive_card_bytes`] over a resident stack, and a margin,
+/// against what the budget has free now); `None` (two copies, as without the
+/// knob) when the plan or the card says no, or there is no card, with `upload`
+/// saying which.
+fn upload_once_store<F>(
+    retired: &RetiredStack<F>,
+    columns: &[&multilinear::mle::Mle<F>],
+    config: &ChainConfig,
+    refused_by_test: bool,
+    upload: &mut UploadOnce,
+) -> Option<multilinear::gpu::ResidentColumns>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    if refused_by_test {
+        upload.planned_out = true;
+        return None;
+    }
+    let budget = multilinear::gpu::reserve_budget();
+    if budget == 0 {
+        return None;
+    }
+    let bytes: u64 = columns
+        .iter()
+        .map(|c| (c.len() * core::mem::size_of::<FieldElement<F>>()) as u64)
+        .sum();
+    upload.need = bytes
+        .saturating_add(retired.revive_card_bytes(config, true))
+        .saturating_add(UPLOAD_ONCE_MARGIN_BYTES);
+    upload.free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
+    if upload.need > upload.free {
+        upload.planned_out = true;
+        return None;
+    }
+    match multilinear::gpu::upload_columns(columns) {
+        Some(store) => {
+            upload.used = true;
+            upload.bytes = bytes;
+            upload.after = multilinear::gpu::ledger_reserved();
+            Some(store)
+        }
+        None => {
+            upload.refused = true;
+            None
+        }
+    }
 }
 
 /// Whether `group`'s prepared stack was committed and let go: it is revived
@@ -3128,6 +3230,7 @@ where
         })
         .collect();
     let mut prepared_revive = 0.0;
+    let mut upload = UploadOnce::default();
     let prepared_opening = match prepared.iter().position(|p| p.group == argued.group) {
         Some(k) => {
             let p = &prepared[k];
@@ -3162,11 +3265,25 @@ where
             // A retired stack comes back for this opening alone, and goes
             // when it ends.
             let t_revive = Instant::now();
+            // Under the upload once, the columns go up once, here, for the
+            // revive and the opening both.
+            let store = match &p.commitment {
+                PreparedCommitment::Retired(r) if argued.upload_once => upload_once_store(
+                    r,
+                    p.columns,
+                    config,
+                    argued.upload_once_refused,
+                    &mut upload,
+                ),
+                _ => None,
+            };
             let revived = match &p.commitment {
                 PreparedCommitment::Held(_) => None,
-                PreparedCommitment::Retired(r) => {
-                    Some((*r).clone().revive::<H, _>(p.columns, None, config)?)
-                }
+                PreparedCommitment::Retired(r) => Some((*r).clone().revive::<H, _>(
+                    p.columns,
+                    store.as_ref().map(|s| (s, ColumnsAt::From(0))),
+                    config,
+                )?),
             };
             prepared_revive = t_revive.elapsed().as_secs_f64();
             let commitment = match (&p.commitment, &revived) {
@@ -3181,7 +3298,7 @@ where
             Some(stacked_eval::prove::<F, E, T, H, _>(
                 commitment,
                 p.columns,
-                None,
+                store.as_ref().map(|s| (s, 0)),
                 &Claimed::PerColumn(&at_points),
                 &at_values,
                 config,
@@ -3200,6 +3317,7 @@ where
             encode,
             open,
             prepared_revive,
+            upload_once: upload,
             open_room,
             open_reserved,
             draws: (
@@ -3389,6 +3507,7 @@ where
         overlap_faults,
         upload_beside,
         overlap_planned,
+        upload_once,
         sched,
         ood,
         ood_unbound,
@@ -3693,6 +3812,7 @@ where
             let s = &mut stamps[h];
             s.encode = opened.encode;
             s.prepared_revive = opened.prepared_revive;
+            s.upload_once = opened.upload_once;
             s.open = opened.open;
             s.open_room = opened.open_room;
             s.open_reserved = window;
@@ -3742,6 +3862,8 @@ where
                 got: order.len(),
             })?)
             .filter(|_| !ood_unbound),
+            upload_once,
+            upload_once_refused: overlap_faults.upload_once_refused_at == Some(p),
         };
         // Under the planned overlap (retired stacks, the overlap otherwise off),
         // each transition by its own plan.
@@ -3793,6 +3915,7 @@ where
         )?;
         stamps[g].encode = opened.encode;
         stamps[g].prepared_revive = opened.prepared_revive;
+        stamps[g].upload_once = opened.upload_once;
         stamps[g].open_room = opened.open_room;
         stamps[g].open = opened.open;
         stamps[g].open_reserved = opened.open_reserved.unwrap_or(0);
