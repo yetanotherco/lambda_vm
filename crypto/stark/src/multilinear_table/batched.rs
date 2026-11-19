@@ -330,6 +330,38 @@ pub struct ProverFaults {
     /// honest over the lists so changed. The table's last chunk must hold a
     /// padding slot of its own (a short last chunk).
     pub pad_mass: Option<usize>,
+    /// ⛔ Not a fault — a MEASUREMENT's stop: the argue ends after its GKR
+    /// ladders, lets its tables' device factors go and returns the error
+    /// [`LADDERS_ONLY_DONE`] names. No proof comes of it.
+    pub ladders_only: bool,
+    /// ⛔ Not a fault — a MEASUREMENT's subset: only this bin of the plan
+    /// builds its trees and runs its ladder (with [`Self::ladders_only`]).
+    pub only_bin: Option<usize>,
+}
+
+/// The stage a [`ProverFaults::ladders_only`] argue returns once its ladders
+/// ran: the measurement's end, not a failure.
+#[doc(hidden)]
+pub const LADDERS_ONLY_DONE: &str = "a probe's ladders ran (no proof)";
+
+/// How many bins the batched argue plans over `tables` under `bin_log_cells`
+/// and `pack`: what a probe that runs one bin at a time
+/// ([`ProverFaults::only_bin`]) walks.
+#[doc(hidden)]
+pub fn argue_bins<F, E>(
+    tables: &[CommittedTable<'_, F, E>],
+    bin_log_cells: u8,
+    pack: GkrPack,
+) -> usize
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let statements: Vec<TableStatement<'_, F, E>> = tables.iter().map(|t| t.statement()).collect();
+    let shapes: Vec<ArgueShape> = statements.iter().map(ArgueShape::of).collect();
+    argue_plan_packed(&shapes, bin_log_cells, pack).bins.len()
 }
 
 /// Which of the batched verifier's checks run. Every one, except in the
@@ -868,7 +900,12 @@ where
             multilinear::gkr::FractionTree::build(layer)?,
         )))
     };
-    for bin in &plan.bins {
+    let mut bin_secs: Vec<f64> = Vec::with_capacity(plan.bins.len());
+    for (b, bin) in plan.bins.iter().enumerate() {
+        if faults.only_bin.is_some_and(|only| only != b) {
+            continue;
+        }
+        let bin_started = std::time::Instant::now();
         // The bin's trees: each table's chunks, in order.
         let members: Vec<(usize, usize)> = bin
             .iter()
@@ -1092,7 +1129,18 @@ where
             claims[t] = Some(table_claim(chunk_claims, &plan.chunks[t], transcript)?);
         }
         gkr.push(ladder);
+        bin_secs.push(bin_started.elapsed().as_secs_f64());
     }
+    if faults.ladders_only {
+        drop(gkr);
+        for table in tables {
+            table.trace.release_device();
+        }
+        return Err(MlError::DeviceFailed {
+            stage: LADDERS_ONLY_DONE,
+        });
+    }
+    LAST_BIN_SECS.with(|cell| *cell.borrow_mut() = bin_secs);
     let bus_outputs: Vec<(FieldElement<E>, FieldElement<E>)> = bus_outputs
         .into_iter()
         .collect::<Option<_>>()
@@ -1840,6 +1888,16 @@ thread_local! {
     /// The constraint sumcheck's seconds (set-up and rounds) of the last
     /// batched argue [`prove_argue`] ran on this thread.
     static LAST_ZC_SECS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// Each bin's seconds (its trees built and its ladder run), in plan
+    /// order, of the last batched argue [`prove_argue`] ran on this thread.
+    static LAST_BIN_SECS: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Each bin's seconds (its trees and its ladder), in plan order, of the last
+/// batched argue this thread ran, and none from then on. A report.
+#[doc(hidden)]
+pub fn take_last_bin_secs() -> Vec<f64> {
+    LAST_BIN_SECS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 /// The constraint sumcheck's seconds (phase C's set-up and rounds) of the last

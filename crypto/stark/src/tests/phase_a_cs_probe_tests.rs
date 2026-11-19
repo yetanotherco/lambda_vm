@@ -23,8 +23,8 @@ use super::phase_b_overlap_tests::{
 };
 use crate::multilinear_block::{
     BlockCommitted, CsProbe, CsProbeMode, CsProbeStamp, CsProbeState, GroupStamps, LaneDefer,
-    LaneLimits, LaneState, MergeStamp, OverlapFaults, PhaseBOverlap, ZcLaneStamp, cs_probe_lines,
-    merge_probe_lines, zc_lane_lines,
+    LaneLimits, LaneState, LaneWork, MergeStamp, OverlapFaults, PhaseBOverlap, ZcLaneStamp,
+    cs_probe_lines, merge_probe_lines, zc_lane_lines,
 };
 use crate::multilinear_table::CommittedTable;
 
@@ -203,13 +203,33 @@ fn the_knobs_read_their_words_and_refuse_the_rest() {
         read(Some(" 1 "), None),
         Ok((CsProbeMode::AfterCommit, false))
     );
-    assert_eq!(read(Some("queue"), None), Ok((CsProbeMode::Lane, false)));
+    assert_eq!(
+        read(Some("queue"), None),
+        Ok((CsProbeMode::Lane(LaneWork::Zc), false))
+    );
     assert_eq!(
         read(Some("queue"), Some("1")),
-        Ok((CsProbeMode::Lane, true))
+        Ok((CsProbeMode::Lane(LaneWork::Zc), true))
     );
     assert_eq!(read(None, Some("1")), Ok((CsProbeMode::Off, true)));
-    for bad in ["on", "2", "Queue", "lane", "true"] {
+    assert_eq!(
+        read(Some("ladders"), None),
+        Ok((CsProbeMode::Lane(LaneWork::Ladders), false))
+    );
+    assert_eq!(
+        read(Some("ladders+zc"), None),
+        Ok((CsProbeMode::Lane(LaneWork::LaddersZc), false))
+    );
+    for bad in [
+        "on",
+        "2",
+        "Queue",
+        "lane",
+        "true",
+        "ladder",
+        "zc+ladders",
+        "ladders zc",
+    ] {
         assert!(read(Some(bad), None).is_err(), "phase A {bad:?}");
         assert!(read(None, Some(bad)).is_err(), "merge {bad:?}");
     }
@@ -262,10 +282,20 @@ fn the_readout_counts_hidden_seconds_and_skips() {
 /// The lane's probe, gated so each group's job is decided before the next
 /// group is handed over.
 fn lane(merge: bool, host: bool, limits: LaneLimits) -> (CsProbe, Arc<AtomicUsize>) {
+    lane_doing(LaneWork::Zc, merge, host, limits)
+}
+
+/// [`lane`] with each job running `work`.
+fn lane_doing(
+    work: LaneWork,
+    merge: bool,
+    host: bool,
+    limits: LaneLimits,
+) -> (CsProbe, Arc<AtomicUsize>) {
     let decided = Arc::new(AtomicUsize::new(0));
     (
         CsProbe {
-            mode: CsProbeMode::Lane,
+            mode: CsProbeMode::Lane(work),
             host,
             decided: Some(decided.clone()),
             merge,
@@ -455,6 +485,7 @@ fn the_lane_readout_credits_only_the_groups_that_ran() {
         zc_b,
         zc_lane: ZcLaneStamp {
             state,
+            zc_ran: state == LaneState::Ran,
             tables: 2,
             setup: 0.125,
             rounds: 0.25,
@@ -476,7 +507,7 @@ fn the_lane_readout_credits_only_the_groups_that_ran() {
              · declined 1 · failed 0 · hidden credit 0.750s · lane card 0.750s (setup 0.250, rounds \
              0.500, host tail 0.000) · zc in phase B 2.500s (of groups not run 1.750s) · last job ended \
              at 1.500s · phase A's end waited 0.000s · phase-A ledger peak 5 MiB · deferred groups \
-             [1:tail:0.750 3:declined:1.000]\n"
+             [1:tail:0.750 3:declined:1.000] · ladders: bins 0 of 0 ·"
         ),
         "{lines}"
     );
@@ -502,5 +533,99 @@ fn the_lane_readout_credits_only_the_groups_that_ran() {
         "BLOCK MERGE PROBE: groups 2 · ran 1 · declined 1 · failed 0 · tables 3 (3 on the card) · \
          merge 0.500s (setup 0.250, rounds 0.250, host tail 0.000) · zc in phase B 2.000s\n\
          BLOCK MERGE PROBE GROUPS (group:state:s): 0:ran:0.5000 1:declined:0.0000\n"
+    );
+}
+
+/// ★ The lane's ladders (`ladders`, and `ladders+zc`) move no byte. On the
+/// host each group's job runs every bin of the batched argue's plan, one at a
+/// time, on throwaway challenges (and, with `+zc`, the constraint sumcheck
+/// after them); the proof is the pinned one and verifies. Phase B records each
+/// bin's own seconds, and the ladders' hidden credit is their sum over the bins
+/// the lane ran — here all of them.
+#[test]
+fn the_lane_runs_each_groups_ladders_and_moves_no_byte() {
+    for work in [LaneWork::Ladders, LaneWork::LaddersZc] {
+        let (probe, decided) = lane_doing(work, false, true, LaneLimits::default());
+        let proved = prove_probed(ArgueFormat::BATCHED, probe);
+        assert_eq!(
+            digest(&proved),
+            BEFORE_THE_OVERLAP[1],
+            "{work:?}: the bytes moved"
+        );
+        verify(ArgueFormat::BATCHED, &proved).unwrap_or_else(|e| panic!("{work:?}: {e:?}"));
+        assert_eq!(
+            decided.load(SeqCst),
+            SIZES.len(),
+            "{work:?}: every group decided"
+        );
+        let stamps = &proved.3;
+        for (g, s) in stamps.iter().enumerate() {
+            let job = &s.zc_lane;
+            assert_eq!(job.state, LaneState::Ran, "{work:?} group {g}: {job:?}");
+            assert!(
+                job.bins >= 1 && job.bins_ran == job.bins,
+                "{work:?} group {g}: {job:?}"
+            );
+            assert!(job.ladders > 0.0, "{work:?} group {g}: {job:?}");
+            assert_eq!(
+                s.bins_b.len(),
+                job.bins,
+                "{work:?} group {g}: phase B's bins"
+            );
+            assert_eq!(
+                job.zc_ran,
+                work == LaneWork::LaddersZc,
+                "{work:?} group {g}"
+            );
+            assert_eq!(
+                job.rounds > 0.0,
+                work == LaneWork::LaddersZc,
+                "{work:?} group {g}"
+            );
+        }
+        let credit: f64 = stamps.iter().flat_map(|s| s.bins_b.iter()).sum();
+        let bins: usize = stamps.iter().map(|s| s.zc_lane.bins).sum();
+        let hidden: f64 = if work == LaneWork::LaddersZc {
+            stamps.iter().map(|s| s.zc_b).sum()
+        } else {
+            0.0
+        };
+        let lines = zc_lane_lines(stamps);
+        assert!(
+            lines.contains(&format!("· hidden credit {hidden:.3}s ·"))
+                && lines.contains(&format!("· ladders: bins {bins} of {bins} · lane ladders "))
+                && lines.contains(&format!("· ladders hidden credit {credit:.3}s ·")),
+            "{work:?}: {lines}"
+        );
+    }
+}
+
+/// The ladders' credit counts the bins the lane ran and only those: the
+/// first `bins_ran` of a group's phase-B bins.
+#[test]
+fn the_ladders_credit_counts_only_the_bins_run() {
+    let stamp = |bins_ran, bins_b: Vec<f64>| GroupStamps {
+        bins_b,
+        zc_lane: ZcLaneStamp {
+            state: LaneState::Deferred(LaneDefer::Tail),
+            bins: 3,
+            bins_ran,
+            ladders: 0.5,
+            started_at: 1.0,
+            ended_at: 1.25,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let lines = zc_lane_lines(&[
+        stamp(2, vec![0.5, 0.25, 1.0]),
+        stamp(0, vec![2.0, 2.0, 2.0]),
+    ]);
+    assert!(
+        lines.contains(
+            "· ladders: bins 2 of 6 · lane ladders 1.000s · ladders hidden credit 0.750s · ladders in \
+             phase B 7.750s · lane busy 0.500s\n"
+        ),
+        "{lines}"
     );
 }
