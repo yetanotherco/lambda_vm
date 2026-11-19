@@ -7876,6 +7876,9 @@ impl CosetSource {
     where
         F: math::field::traits::IsField + 'static,
     {
+        if declined_for_test() {
+            return None;
+        }
         let raw: Vec<u64> = leaves.iter().map(|&leaf| leaf as u64).collect();
         let plan = math_cuda::whir_coset::CosetPlan::new(
             self.0.num_vars(),
@@ -7924,9 +7927,58 @@ impl CosetSource {
 
     /// The whole codeword, re-encoded: the fallback. Counted.
     pub(crate) fn encode(&self) -> Option<DeviceCodeword> {
+        if declined_for_test() {
+            return None;
+        }
         note_coset_fallback();
         self.0.encode(false).ok().map(DeviceCodeword)
     }
+
+    /// The whole codeword encoded on the host from the stack read back: the
+    /// last fallback, when the card has room neither for the coset openings
+    /// nor for a re-encode. The transform is the host commit's
+    /// (`encode(lift_coefficients(·))`), so the values are the committed ones.
+    /// Counted with the host fallbacks. `None` for a field other than
+    /// Goldilocks or a failed read.
+    pub(crate) fn encode_on_host<F>(&self) -> Option<Vec<math::field::element::FieldElement<F>>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        use math::field::element::FieldElement;
+        use math::field::goldilocks::GoldilocksField as Gl;
+        let raw = self.0.to_host().ok()?;
+        let evals: Vec<FieldElement<Gl>> = raw
+            .iter()
+            .map(|&limb| FieldElement::<Gl>::from_raw(canonical_limb(limb)))
+            .collect();
+        let mle = crate::mle::Mle::new(evals).ok()?;
+        let domain =
+            crate::whir::Domain::<Gl>::new(self.0.num_vars() + self.0.log_blowup()).ok()?;
+        let codeword =
+            crate::whir::encode::<Gl, Gl>(&crate::whir::lift_coefficients(&mle), &domain).ok()?;
+        note_host_fallback();
+        let raw: Vec<u64> = codeword.iter().map(|value| *value.value()).collect();
+        values_from_raw::<F>(&raw, true)
+    }
+}
+
+/// Test only: the card declines every coset opening and re-encode of a round-0
+/// stack in this process, so the openings take the host fallback.
+#[cfg(feature = "cuda")]
+static DECLINE_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a test asked the card to decline ([`force_coset_decline`]).
+#[cfg(feature = "cuda")]
+fn declined_for_test() -> bool {
+    DECLINE_FOR_TEST.load(Ordering::Relaxed)
+}
+
+/// Test only: makes the card decline every round-0 coset opening and
+/// re-encode (`on`), as a card with no room does, or restores it. For a test
+/// that runs alone in its process.
+#[cfg(feature = "cuda")]
+pub fn force_coset_decline(on: bool) {
+    DECLINE_FOR_TEST.store(on, Ordering::Relaxed);
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -7958,6 +8010,13 @@ impl CosetSource {
     }
 
     pub(crate) fn encode(&self) -> Option<DeviceCodeword> {
+        match self.0 {}
+    }
+
+    pub(crate) fn encode_on_host<F>(&self) -> Option<Vec<math::field::element::FieldElement<F>>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
         match self.0 {}
     }
 }
@@ -8832,6 +8891,9 @@ impl CosetSource {
     where
         F: math::field::traits::IsField + 'static,
     {
+        if declined_for_test() {
+            return None;
+        }
         let first = sources.first()?;
         let raw: Vec<u64> = leaves.iter().map(|&leaf| leaf as u64).collect();
         let plan = math_cuda::whir_coset::CosetPlan::new(
