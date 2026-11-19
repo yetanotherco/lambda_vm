@@ -2395,7 +2395,7 @@ fn prove_traces_under<H: WhirHash>(
         })
         .collect();
     let order: Vec<usize> = (0..artifacts.sizes.len()).collect();
-    let (proof, argues, prepared, group_stamps, commit_ood) = match proving {
+    let (proof, argues, prepared, group_stamps, commit_ood, _) = match proving {
         WlfmProving::Held => {
             multilinear_block::block_prove_on_forks_observed::<F, E, H::Sponge, H>(
                 block,
@@ -2705,6 +2705,7 @@ fn verify_block_under<H: WhirHash>(
         &mut transcript,
         skip_prepared,
         checks,
+        None,
     )
     .map_err(|e| format!("{e:?}"))
 }

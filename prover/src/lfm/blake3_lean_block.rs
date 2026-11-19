@@ -711,7 +711,7 @@ where
         + Send
         + Default,
 {
-    let (proof, argues, prepared, _, commit_ood) = proved;
+    let (proof, argues, prepared, _, commit_ood, _) = proved;
     let refs = airs.refs();
     let layouts: Vec<TableLayout<'_, F, E>> = refs
         .iter()
@@ -743,6 +743,7 @@ where
         &mut transcript,
         false,
         VerifierChecks::ALL,
+        None,
     )
     .map_err(|e| format!("{e:?}"))
 }
@@ -930,7 +931,7 @@ fn the_chunked_head_proves_and_verifies() {
 /// A block proof's bytes: the proof, the batched argues, the prepared
 /// openings and the commit-time answers, each serialized, in that order.
 fn proof_bytes(proved: &BlockProved<F, E>) -> Vec<u8> {
-    let (proof, argues, prepared, _, commit_ood) = proved;
+    let (proof, argues, prepared, _, commit_ood, _) = proved;
     let mut out = Vec::new();
     for part in [
         rkyv::to_bytes::<rkyv::rancor::Error>(proof).expect("the proof serializes"),

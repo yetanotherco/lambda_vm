@@ -17,6 +17,7 @@ pub mod fri_group_tests;
 pub mod fri_schedule_tests;
 pub mod fri_tests;
 pub mod grinding_tests;
+pub mod local_lookup_tests;
 pub mod log_read_only_program_tests;
 pub mod merkle_cap_tests;
 pub mod one_row_tests;

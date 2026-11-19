@@ -174,6 +174,15 @@ pub enum Error {
     UnspentNonce,
     #[error("the buses do not balance across the proof")]
     BusImbalance,
+    /// A group's local lookups (the buses argued under the group's own
+    /// challenges) do not sum to zero over the group.
+    #[error("group {group}: its local lookups do not balance")]
+    LocalImbalance { group: usize },
+    /// A table receives on a local bus from something other than its
+    /// verifier-fixed (preprocessed) columns: a local receiver must be a fixed
+    /// table, or the group's own challenges argue nothing.
+    #[error("table {table}: interaction {interaction} receives a local bus from committed columns")]
+    LocalReceiverNotFixed { table: usize, interaction: usize },
     #[error("the statements rebuilt from the factor values are not what the batch demands")]
     BatchMismatch,
     #[error("a shifted read is not the shift of the column it claims to shift")]
