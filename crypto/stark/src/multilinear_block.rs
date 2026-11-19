@@ -1662,6 +1662,9 @@ pub struct OverlapFaults {
     /// Under the upload once: the plan refuses the store of the group at this
     /// place (it copies its prepared columns twice, as without the knob).
     pub upload_once_refused_at: Option<usize>,
+    /// Under the upload once: the margin its plan keeps free, in place of
+    /// 1 GiB (a test's way to make the real plan say no).
+    pub upload_once_margin: Option<u64>,
 }
 
 /// Every count of a promise the card refused, or of a wait on every stream at
@@ -2905,6 +2908,7 @@ where
     /// that store's plan.
     upload_once: bool,
     upload_once_refused: bool,
+    upload_once_margin: u64,
 }
 
 /// A group's openings done: its opening, its prepared one when it has one,
@@ -3059,6 +3063,7 @@ fn upload_once_store<F>(
     columns: &[&multilinear::mle::Mle<F>],
     config: &ChainConfig,
     refused_by_test: bool,
+    margin: u64,
     upload: &mut UploadOnce,
 ) -> Option<multilinear::gpu::ResidentColumns>
 where
@@ -3079,7 +3084,7 @@ where
         .sum();
     upload.need = bytes
         .saturating_add(retired.revive_card_bytes(config, true))
-        .saturating_add(UPLOAD_ONCE_MARGIN_BYTES);
+        .saturating_add(margin);
     upload.free = budget.saturating_sub(multilinear::gpu::ledger_reserved());
     if upload.need > upload.free {
         upload.planned_out = true;
@@ -3273,6 +3278,7 @@ where
                     p.columns,
                     config,
                     argued.upload_once_refused,
+                    argued.upload_once_margin,
                     &mut upload,
                 ),
                 _ => None,
@@ -3862,6 +3868,9 @@ where
             .filter(|_| !ood_unbound),
             upload_once,
             upload_once_refused: overlap_faults.upload_once_refused_at == Some(p),
+            upload_once_margin: overlap_faults
+                .upload_once_margin
+                .unwrap_or(UPLOAD_ONCE_MARGIN_BYTES),
         };
         // Under the planned overlap (retired stacks, the overlap otherwise off),
         // each transition by its own plan.
