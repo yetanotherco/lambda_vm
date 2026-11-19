@@ -367,13 +367,10 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
     let mut rust_interacts_unmatched = ri;
     rust_interacts_unmatched.sort_unstable();
 
-    // Every Lean constraint vanishes on the honest trace, matched or not. This used to skip the
-    // unmatched ones, kept for a table that might land in Lean before its Rust side; that skip
-    // could never help. It runs while the report is still being built, and each caller then
-    // asserts that `lean_asserts_unmatched` is empty, so a Lean-only constraint fails the test
-    // either way -- the skip only moved the failure to a message that says less about it. There
-    // are none left in any case: LT's `μ·(1 − μ)` became a pull of `ARE_BYTES[μ, 0]`, as in
-    // `lt.rs`.
+    // On the honest trace every constraint must vanish: each Lean assert, matched or not, and
+    // each Rust constraint. The unmatched Lean asserts are checked here on purpose, rather than
+    // skipped: each caller asserts that list is empty, so one reaching this loop is a failure
+    // either way, and checking it names the row and the constraint instead of only the count.
     for (r, row) in honest_rows.iter().enumerate() {
         for (i, e) in lean.asserts.iter().enumerate() {
             assert_eq!(

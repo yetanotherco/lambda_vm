@@ -217,9 +217,9 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     have hs3 := h_s3 hcount
     -- values of the composite limbs
     have hval_lhsHi : (input_lhs1 + 65536 * input_lhs2).val = input_lhs1.val + 65536 * input_lhs2.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+      val_limb (by omega)
     have hval_rhsHi : (input_rhs1 + 65536 * input_rhs2).val = input_rhs1.val + 65536 * input_rhs2.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+      val_limb (by omega)
     -- the comparison bit, from the pulled guarantees and the SUB carries
     have key : ∀ s i : ℕ, input_signed.val = s → input_invert.val = i →
         input_lhs0.val < 2^32 → input_rhs0.val < 2^32 →
@@ -238,10 +238,10 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       -- the halves of lhs_sub_rhs as words
       have hval_subLo : (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1).val
           = input_lhsSubRhs0.val + 65536 * input_lhsSubRhs1.val :=
-        val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+        val_limb (by omega)
       have hval_subHi : (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3).val
           = input_lhsSubRhs2.val + 65536 * input_lhsSubRhs3.val :=
-        val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+        val_limb (by omega)
       -- the carry identities, on naturals
       obtain ⟨e0, e1⟩ := Add.carries_lift hr0 (by omega) (by omega) (by omega) hl0 (by omega)
         hc0 hc1 hc0b hc1b
@@ -303,15 +303,15 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     set R := input_rhs0.val + 2^32 * (input_rhs1.val + 65536 * input_rhs2.val) with hR
     -- the composite limbs as words
     have hval_lhsHi : (input_lhs1 + 65536 * input_lhs2).val = input_lhs1.val + 65536 * input_lhs2.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+      val_limb (by omega)
     have hval_rhsHi : (input_rhs1 + 65536 * input_rhs2).val = input_rhs1.val + 65536 * input_rhs2.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+      val_limb (by omega)
     have hval_subLo : (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1).val
         = input_lhsSubRhs0.val + 65536 * input_lhsSubRhs1.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+      val_limb (by omega)
     have hval_subHi : (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3).val
         = input_lhsSubRhs2.val + 65536 * input_lhsSubRhs3.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+      val_limb (by omega)
     -- the honest carries
     have hl1' : (input_rhs1 + 65536 * input_rhs2).val < 2^32 := by omega
     have hr0' : (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1).val < 2^32 := by omega

@@ -334,23 +334,32 @@ def stages : List (Stage (F p)) :=
    { channel := Alu.channel.toRaw, cls := fun m => !isMinMsg m },
    { channel := Msb16C }, { channel := IsHalfC }, { channel := Bitwise.AreBytes.toRaw }]
 
+/-- The LT ensemble with MIN: three providers, LT, MIN, and a consumer of the ALU bus. The
+consumer is there for the same reason as in `ensemble`, and that reason survives the split into
+message classes: without it nothing pulls what MIN pushes with `pushIf μ`, a balanced witness
+forces every MIN row's `μ` to zero, and the MIN stage only ever balances zero-multiplicity
+pushes. `MinToy.RowSpec` carries no `μ ≠ 0` guard, so the row conclusion holds either way; what
+the consumer buys is that the stage says something. -/
 def ensembleMin : Ensemble (F p) unit where
   tables := [providerComponent Bitwise.AreBytes, countedProviderComponent muMax Bitwise.IsHalf,
-    countedProviderComponent muMax Bitwise.Msb16, ltComponent, minComponent]
+    countedProviderComponent muMax Bitwise.Msb16, ltComponent, minComponent,
+    consumerComponent Alu.channel]
   unique_names := by
-    simp [providerComponent, countedProviderComponent, ltComponent, minComponent, provider,
-      countedProvider, LT.circuit, MinToy.circuit, Bitwise.AreBytes, Bitwise.IsHalf, Bitwise.Msb16,
+    simp [providerComponent, countedProviderComponent, ltComponent, minComponent,
+      consumerComponent, provider, countedProvider, consumer, LT.circuit, MinToy.circuit,
+      Alu.channel, Bitwise.AreBytes, Bitwise.IsHalf, Bitwise.Msb16,
       Bitwise.areBytesTable, Bitwise.isHalfTable, Bitwise.msb16Table, StaticLookupChannel.toChannel]
   channels := finished
   unique_channel_names := ensemble.unique_channel_names
   tables_channels := by
     intro table h
     simp only [List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl | rfl | rfl <;>
+    rcases h with rfl | rfl | rfl | rfl | rfl | rfl <;>
       simp only [GeneralFormalCircuit.channels, providerComponent_guarantees,
         providerComponent_requirements, countedProviderComponent_guarantees,
         countedProviderComponent_requirements, ltComponent_guarantees, ltComponent_requirements,
-        minComponent_guarantees, minComponent_requirements] <;>
+        minComponent_guarantees, minComponent_requirements, consumerComponent_guarantees,
+        consumerComponent_requirements] <;>
       simp [finished, IsHalfC, Msb16C]
   verifier_channels := by simp [circuit_norm]
 
@@ -372,12 +381,19 @@ theorem tableSoundness_withMin : ensembleMin.TableSoundness (Balance.logUpUpTo m
     rcases hs with rfl | rfl | rfl | rfl | rfl <;> simp [ensembleMin, finished]
   · intro component h c hc msg
     simp only [ensembleMin, List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl | rfl | rfl
+    rcases h with rfl | rfl | rfl | rfl | rfl | rfl
     iterate 3 simp [providerComponent_guarantees, countedProviderComponent_guarantees] at hc
     · rw [ltComponent_guarantees] at hc
       simp only [List.mem_cons, List.not_mem_nil, or_false] at hc
       rcases hc with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> simp [stages]
     · rw [minComponent_guarantees, List.mem_singleton] at hc
+      subst hc
+      cases h : isMinMsg msg
+      · exact ⟨{ channel := Alu.channel.toRaw, cls := fun m => !isMinMsg m }, by simp [stages],
+          rfl, by simp [h]⟩
+      · exact ⟨{ channel := Alu.channel.toRaw, cls := isMinMsg }, by simp [stages], rfl, h⟩
+    -- the consumer gains the guarantee on whichever class the message it pulls belongs to
+    · rw [consumerComponent_guarantees, List.mem_singleton] at hc
       subst hc
       cases h : isMinMsg msg
       · exact ⟨{ channel := Alu.channel.toRaw, cls := fun m => !isMinMsg m }, by simp [stages],
@@ -389,7 +405,7 @@ theorem tableSoundness_withMin : ensembleMin.TableSoundness (Balance.logUpUpTo m
     rcases hs with rfl | rfl | rfl | rfl | rfl <;> infer_instance
   · intro component h
     simp only [ensembleMin, List.mem_cons, List.not_mem_nil, or_false] at h
-    rcases h with rfl | rfl | rfl | rfl | rfl
+    rcases h with rfl | rfl | rfl | rfl | rfl | rfl
     -- the providers pull nothing
     iterate 3
       refine ⟨?_, ?_, ?_, ?_, ?_, trivial⟩ <;>
@@ -444,5 +460,9 @@ theorem tableSoundness_withMin : ensembleMin.TableSoundness (Balance.logUpUpTo m
         apply Component.requirementsAfterOn_of_not_mem
         rw [minComponent_requirements]
         exact ne_alu (by simp)
+    -- the consumer owes nothing: it only pulls
+    · refine ⟨?_, ?_, ?_, ?_, ?_, trivial⟩ <;>
+        apply Component.requirementsAfterOn_of_not_mem <;>
+        simp [consumerComponent_requirements]
 
 end LambdaVM.Ensembles.LtStaged

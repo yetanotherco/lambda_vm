@@ -529,9 +529,9 @@ theorem soundness :
       obtain ⟨rfl, rfl, rfl⟩ : input_wordInstr.val = w ∧ input_signed.val = s ∧
         input_direction.val = d := by omega
       have hv1 : (input_in0 + 65536 * input_in1).val = input_in0.val + 65536 * input_in1.val :=
-        val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+        val_limb (by omega)
       have hv2 : (input_in2 + 65536 * input_in3).val = input_in2.val + 65536 * input_in3.val :=
-        val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+        val_limb (by omega)
       have hin1 : dword (input_in0 + 65536 * input_in1) (input_in2 + 65536 * input_in3)
           = limbs input_in0.val input_in1.val input_in2.val input_in3.val := by
         simp only [dword, limbs, hv1, hv2]; omega
