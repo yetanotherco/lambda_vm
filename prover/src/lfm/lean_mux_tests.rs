@@ -192,3 +192,47 @@ fn the_blake3_w_leg_takes_its_muxes_as_mux_rows() {
     let arena = super::wlfm_leg::wlfm_leg_arena(&child, &proof).expect("the leg's arena");
     execute(&leg, &[arena], &leg.hasher(HASHER)).expect("the leg executes over the child");
 }
+
+/// ★ The BLAKE3 W-leg over the lean child, pinned by its program's digest.
+/// A W-leg plans its child's batched argue on the one-layer GKR ladder only
+/// (`child_planning`), so its program is the one it was before the recursion
+/// leaf learned the two-layer ladder (the digest is the one the same test
+/// gives at the head before it, built there and here, equal); a change to the
+/// leg's batched walk, its hints or its planning moves it. Not blind: with the
+/// leg's closure assert left out, the digest moves.
+#[test]
+fn the_blake3_w_leg_program_is_pinned() {
+    use super::wlfm::{WlfmFamily, WlfmLevers, build_wlfm_under};
+    const DIGEST: &str = "983a387d28f3aa482e7c4514850a621f6dade5edb91e51867d859854762050e7";
+    let _fast = test_format::set(Some(2));
+    let program = lean();
+    let child_build = build_wlfm_under(
+        &program,
+        HASHER,
+        WlfmRate::Two,
+        WlfmLevers::with_family(WlfmFamily::B3),
+        true,
+    )
+    .expect("the child builds");
+    let proof = prove_wlfm(&program, &child_build, &[]).expect("the child proves");
+    let child = super::wlfm_leg::WlfmChild {
+        artifacts: child_build.artifacts.clone(),
+        num_public_words: proof.public_words.len(),
+    };
+    let leg = super::wlfm_leg::wlfm_leg_program(&child).expect("the BLAKE3 leg emits");
+    let digest = super::whir_chain_tests::program_digest(&leg);
+    println!(
+        "W-LEG PIN: {} instructions · digest {digest}",
+        leg.instrs.len()
+    );
+    assert_eq!(digest, DIGEST, "the BLAKE3 W-leg's program");
+    use super::wlfm_leg::faults::{Fault, with};
+    let moved = with(Fault::SkipClosure, || {
+        super::wlfm_leg::wlfm_leg_program(&child).expect("the faulted leg emits")
+    });
+    assert_ne!(
+        super::whir_chain_tests::program_digest(&moved),
+        DIGEST,
+        "the pin sees the leg"
+    );
+}
