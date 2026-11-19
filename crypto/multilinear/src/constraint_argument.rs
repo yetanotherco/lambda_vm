@@ -226,13 +226,15 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         self.resident = Some((store, first));
     }
 
-    /// ⛔ A MEASUREMENT'S VIEW, never a prover's: this table's shape, factor
-    /// kinds and public tables, pointed at the same device copy of its columns
-    /// (when one is set), with no device factors of its own — and, with
+    /// A view of this table for phase A's lane: its shape, factor kinds and
+    /// public tables, pointed at the same device copy of its columns (when
+    /// one is set), with no device factors of its own — and, with
     /// `host_columns`, a copy of its columns on the host (a test without a
     /// card); without, no host columns at all, so a host reader of the view
-    /// gets none and is refused. A probe reads the view while the table goes
-    /// on to its packing, spilling and argument.
+    /// gets none and is refused. A lane job reads the view while the table
+    /// goes on to its packing, spilling and argument: a probe's throwaway
+    /// work, or a local argue's bins, whose bytes are the table's own (the
+    /// same columns).
     #[doc(hidden)]
     pub fn probe_view(&self, host_columns: bool) -> Self {
         Self {

@@ -177,7 +177,8 @@ pub trait WhirHash: Copy + Clone + Default + Send + Sync + 'static {
         + HasTranscriptHash<Hash = Self::Transcript>
         + Clone
         + Send
-        + Default;
+        + Default
+        + 'static;
 
     /// A fresh sponge: what a block proof's statement is absorbed into.
     fn sponge() -> Self::Sponge;
