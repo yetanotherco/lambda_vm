@@ -210,6 +210,10 @@ pub struct GroupStamps {
     pub overlap_planned_out: bool,
     pub overlap_plan_need: u64,
     pub overlap_plan_free: u64,
+    /// Under `LAMBDA_VM_ENCODE_SPLIT=1`, the retired prepared stack's revive:
+    /// copy seconds, transform seconds, bytes copied (zeros otherwise; a
+    /// measurement that synchronizes the card, never a production reading).
+    pub revive_split: (f64, f64, u64),
     /// Under [`PhaseBOverlap::On`], the group's openings ran alone because an
     /// earlier transition saw the card refuse a promise.
     pub serial_after_refusal: bool,
@@ -2871,6 +2875,9 @@ struct Opened<F: IsField, E: IsField> {
     open: f64,
     /// Of `open`, the seconds a retired prepared stack took to come back.
     prepared_revive: f64,
+    /// Under `LAMBDA_VM_ENCODE_SPLIT=1`, that revive's copy seconds, transform
+    /// seconds and bytes copied (zeros otherwise).
+    revive_split: (f64, f64, u64),
     /// What the revive added to the ledger, and the ledger's peak through the
     /// openings: read only when the openings had the ledger's window to
     /// themselves (0 and `None` otherwise).
@@ -3128,6 +3135,7 @@ where
         })
         .collect();
     let mut prepared_revive = 0.0;
+    let mut revive_split = (0.0, 0.0, 0u64);
     let prepared_opening = match prepared.iter().position(|p| p.group == argued.group) {
         Some(k) => {
             let p = &prepared[k];
@@ -3162,6 +3170,7 @@ where
             // A retired stack comes back for this opening alone, and goes
             // when it ends.
             let t_revive = Instant::now();
+            let split_before = multilinear::gpu::encode_split();
             let revived = match &p.commitment {
                 PreparedCommitment::Held(_) => None,
                 PreparedCommitment::Retired(r) => {
@@ -3169,6 +3178,12 @@ where
                 }
             };
             prepared_revive = t_revive.elapsed().as_secs_f64();
+            let split_after = multilinear::gpu::encode_split();
+            revive_split = (
+                split_after.0 - split_before.0,
+                split_after.1 - split_before.1,
+                split_after.2.saturating_sub(split_before.2),
+            );
             let commitment = match (&p.commitment, &revived) {
                 (_, Some(revived)) => revived,
                 (PreparedCommitment::Held(c), None) => *c,
@@ -3200,6 +3215,7 @@ where
             encode,
             open,
             prepared_revive,
+            revive_split,
             open_room,
             open_reserved,
             draws: (
@@ -3691,6 +3707,7 @@ where
             let s = &mut stamps[h];
             s.encode = opened.encode;
             s.prepared_revive = opened.prepared_revive;
+            s.revive_split = opened.revive_split;
             s.open = opened.open;
             s.open_room = opened.open_room;
             s.open_reserved = window;
@@ -3791,6 +3808,7 @@ where
         )?;
         stamps[g].encode = opened.encode;
         stamps[g].prepared_revive = opened.prepared_revive;
+        stamps[g].revive_split = opened.revive_split;
         stamps[g].open_room = opened.open_room;
         stamps[g].open = opened.open;
         stamps[g].open_reserved = opened.open_reserved.unwrap_or(0);

@@ -7971,6 +7971,21 @@ where
     }
 }
 
+/// Under `LAMBDA_VM_ENCODE_SPLIT=1`, the card's codeword encodes from host
+/// sources so far: `(copy seconds, transform seconds, bytes copied)`; zeros
+/// without a card or with the split off.
+#[cfg(feature = "cuda")]
+pub fn encode_split() -> (f64, f64, u64) {
+    let (copy, transform, bytes) = math_cuda::whir::encode_split();
+    (copy as f64 * 1e-9, transform as f64 * 1e-9, bytes)
+}
+
+/// See the cuda build's: zeros.
+#[cfg(not(feature = "cuda"))]
+pub fn encode_split() -> (f64, f64, u64) {
+    (0.0, 0.0, 0)
+}
+
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn encode_resident(
     _store: &ResidentColumns,

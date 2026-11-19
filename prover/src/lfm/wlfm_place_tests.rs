@@ -434,3 +434,31 @@ fn the_overlap_planned_knob_is_named_and_on_by_default() {
     }
     assert!(knob_word_off(Some("0")) && !knob_word_off(Some("1")) && !knob_word_off(None));
 }
+
+/// The encode split's prepared-bits reading counts every prepared column once,
+/// in one bucket, with all its cells: the buckets sum to the stacks' columns
+/// and cells.
+#[test]
+fn the_prepared_bits_reading_counts_every_prepared_column_once() {
+    let _fast = test_format::set(Some(2));
+    let program = super::b3l_wlfm_tests::honest();
+    let build = placed(
+        &program,
+        super::wlfm_tests::HASHER,
+        WlfmFamily::B3,
+        StackPlace::Card,
+    );
+    let [columns, cells] = super::wlfm::prepared_bits_of(&build);
+    assert!(
+        columns.iter().sum::<u64>() > 0,
+        "the fixture has prepared columns"
+    );
+    assert!(cells.iter().sum::<u64>() >= columns.iter().sum::<u64>());
+    assert!(
+        columns
+            .iter()
+            .zip(&cells)
+            .all(|(c, n)| (*c == 0) == (*n == 0)),
+        "a bucket's cells come with its columns"
+    );
+}

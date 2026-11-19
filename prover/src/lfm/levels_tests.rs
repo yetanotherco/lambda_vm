@@ -1521,12 +1521,31 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
         st.prep_parts[4],
         st.prep_parts[5],
     );
+    if let Some([columns, cells]) = st.prepared_bits {
+        let total: u64 = cells.iter().sum();
+        let pct = |c: u64| 100.0 * c as f64 / total.max(1) as f64;
+        println!(
+            "{tag} PREPARED BITS: columns {} (≤8 {} · ≤16 {} · ≤32 {} · >32 {}) · cells {} (≤8 {:.1}% · ≤16 \
+             {:.1}% · ≤32 {:.1}% · >32 {:.1}%)",
+            columns.iter().sum::<u64>(),
+            columns[0],
+            columns[1],
+            columns[2],
+            columns[3],
+            total,
+            pct(cells[0]),
+            pct(cells[1]),
+            pct(cells[2]),
+            pct(cells[3]),
+        );
+    }
     for (g, s) in st.groups.iter().enumerate() {
         println!(
             "{tag} GROUP {g}: tables {} · polys {} · cells {} · wait A {:.3}s · up A {:.3}s (paid \
              {:.3}) · commit {:.3}s · retire {:.3}s · up B {:.3}s · argue {:.3}s · encode {:.3}s · \
              open {:.3}s · prepared revive {:.3}s · open paid {:.3}s · overlapped {} · columns gone \
-             before revive {} · overlap planned out {} at {:.2} of {:.2} GiB · turn {:.3}-{:.3}s · GiB \
+             before revive {} · overlap planned out {} at {:.2} of {:.2} GiB · revive split copy {:.3}s \
+             transform {:.3}s bytes {} · turn {:.3}-{:.3}s · GiB \
              promised: commit {:.2}/{:.2} · argue {:.2}/{:.2} · open {:.2}{}",
             s.tables,
             s.polys,
@@ -1547,6 +1566,9 @@ fn print_level_stamps(tag: &str, st: &super::wlfm::WlfmStamps) {
             s.overlap_planned_out,
             gib(s.overlap_plan_need),
             gib(s.overlap_plan_free),
+            s.revive_split.0,
+            s.revive_split.1,
+            s.revive_split.2,
             s.start_b,
             s.end_b,
             gib(s.commit_base),

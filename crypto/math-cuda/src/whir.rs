@@ -1836,6 +1836,16 @@ impl Source<'_> {
         }
     }
 
+    /// The bytes [`Self::write`] copies from the host (0 for a source already
+    /// on the card).
+    fn host_bytes(&self) -> u64 {
+        match self {
+            Self::Whole(evals) => (evals.len() * 8) as u64,
+            Self::Parts { parts, .. } => parts.iter().map(|(c, _)| (c.len() * 8) as u64).sum(),
+            Self::Resident { .. } | Self::Slices { .. } => 0,
+        }
+    }
+
     /// Fills `coeffs`, which is `2^log_evals` elements long.
     fn write(&self, stream: &Arc<CudaStream>, coeffs: &mut CudaSlice<u64>) -> Result<()> {
         match self {
@@ -1988,6 +1998,28 @@ pub fn encode_codeword_parts(
     encode_from(Source::Parts { parts, log_evals }, log_blowup, transient)
 }
 
+/// `LAMBDA_VM_ENCODE_SPLIT=1` (a measurement, read once a process): every
+/// codeword encoded from a source copied in (not gathered on the card) is timed
+/// in two synchronized parts, the copy and the transform, summed with the
+/// copied bytes in [`encode_split`]. Off, nothing is timed or synchronized.
+pub fn encode_split_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_ENCODE_SPLIT").as_deref() == Ok("1"))
+}
+
+/// Under [`encode_split_enabled`]: nanoseconds copying, nanoseconds
+/// transforming, bytes copied, summed over the process.
+static ENCODE_SPLIT: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// [`ENCODE_SPLIT`]'s sums so far: `(copy ns, transform ns, bytes copied)`.
+pub fn encode_split() -> (u64, u64, u64) {
+    (
+        ENCODE_SPLIT[0].load(Ordering::Relaxed),
+        ENCODE_SPLIT[1].load(Ordering::Relaxed),
+        ENCODE_SPLIT[2].load(Ordering::Relaxed),
+    )
+}
+
 /// The Reed–Solomon codeword of `source`, on the card, reserved like a
 /// commit's: the codeword, plus its working set when `transient`.
 fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result<DeviceCodeword> {
@@ -2030,6 +2062,22 @@ fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result
             log_blowup,
             fused.unwrap_or(0),
         )?
+    } else if encode_split_enabled() {
+        // The split's own reading: the card idle before, the copy synchronized,
+        // then the transform synchronized. The same work in the same order.
+        stream.synchronize()?;
+        let t = std::time::Instant::now();
+        source.write(&stream, &mut coeffs)?;
+        stream.synchronize()?;
+        let upload = t.elapsed();
+        let t = std::time::Instant::now();
+        let x = encode_values(&stream, be, coeffs, log_evals, log_blowup)?;
+        stream.synchronize()?;
+        let transform = t.elapsed();
+        ENCODE_SPLIT[0].fetch_add(upload.as_nanos() as u64, Ordering::Relaxed);
+        ENCODE_SPLIT[1].fetch_add(transform.as_nanos() as u64, Ordering::Relaxed);
+        ENCODE_SPLIT[2].fetch_add(source.host_bytes(), Ordering::Relaxed);
+        x
     } else {
         source.write(&stream, &mut coeffs)?;
         encode_values(&stream, be, coeffs, log_evals, log_blowup)?

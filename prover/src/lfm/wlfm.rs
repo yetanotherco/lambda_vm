@@ -2127,6 +2127,10 @@ pub struct WlfmStamps {
     pub phase_a: f64,
     pub phase_b: f64,
     pub groups: Vec<multilinear_block::GroupStamps>,
+    /// Under `LAMBDA_VM_ENCODE_SPLIT=1` (a measurement), the prepared stacks'
+    /// columns by the bits their largest value needs: `[columns, cells]` in
+    /// the buckets ≤ 8, ≤ 16, ≤ 32, > 32 bits. `None` otherwise.
+    pub prepared_bits: Option<[[u64; 4]; 2]>,
     pub card_budget: u64,
     pub card_reserved_at_start: u64,
 }
@@ -2140,6 +2144,49 @@ thread_local! {
 /// `None` when nothing proved here since the last take.
 pub fn take_wlfm_stamps() -> Option<WlfmStamps> {
     LAST_WLFM_STAMPS.with(|c| c.borrow_mut().take())
+}
+
+/// Whether `LAMBDA_VM_ENCODE_SPLIT=1` (the encode split's measurement) is on.
+fn encode_split_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_ENCODE_SPLIT").as_deref() == Ok("1"))
+}
+
+/// The prepared stacks' columns by the bits their largest value needs:
+/// `[columns, cells]` in the buckets ≤ 8, ≤ 16, ≤ 32, > 32 bits.
+fn prepared_bits<H: WhirHash>(stacks: &[WlfmPrepared<H>]) -> [[u64; 4]; 2] {
+    use rayon::prelude::*;
+    let widths: Vec<(u32, u64)> = stacks
+        .iter()
+        .flat_map(|p| p.columns.iter())
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|column| {
+            let max = column.evals().iter().map(|v| *v.value()).max().unwrap_or(0);
+            (64 - max.leading_zeros(), column.evals().len() as u64)
+        })
+        .collect();
+    let mut out = [[0u64; 4]; 2];
+    for (bits, cells) in widths {
+        let bucket = match bits {
+            0..=8 => 0,
+            9..=16 => 1,
+            17..=32 => 2,
+            _ => 3,
+        };
+        out[0][bucket] += 1;
+        out[1][bucket] += cells;
+    }
+    out
+}
+
+/// Tests only: [`prepared_bits`] over `build`'s prepared stacks.
+#[cfg(test)]
+pub(crate) fn prepared_bits_of(build: &WlfmBuild) -> [[u64; 4]; 2] {
+    match &build.stacks {
+        WlfmStacks::P1(stacks) => prepared_bits(stacks),
+        WlfmStacks::B3(stacks) => prepared_bits(stacks),
+    }
 }
 
 fn prove_traces_under<H: WhirHash>(
@@ -2158,6 +2205,7 @@ fn prove_traces_under<H: WhirHash>(
             H::NAME
         ));
     }
+    let prepared_bits = encode_split_on().then(|| prepared_bits(stacks));
     let mut filled = filled;
     let t_prep = std::time::Instant::now();
     let mut parts = [0f64; 6];
@@ -2431,6 +2479,7 @@ fn prove_traces_under<H: WhirHash>(
             phase_a,
             phase_b,
             groups: group_stamps,
+            prepared_bits,
             card_budget,
             card_reserved_at_start,
         })
