@@ -589,9 +589,9 @@ pub(crate) fn spawn_validation<'scope, 'env>(
 
 /// The admission validator over `program`, which it OWNS, on a thread of
 /// `scope`'s ([`VALIDATE_LATE_ENV`]): once admitted, the program is let go as
-/// [`release_program`] lets it go (its heights kept), its freed pages handed
-/// back to the OS on that thread, and it comes back with the validator's
-/// seconds; or why it is not admissible.
+/// [`release_program`] lets it go (its heights kept) and comes back with the
+/// validator's seconds (the driver hands the freed pages back after the join,
+/// off the prove's path); or why it is not admissible.
 pub(crate) fn spawn_validation_owned<'scope>(
     scope: &'scope std::thread::Scope<'scope, '_>,
     program: LfmProgram,
@@ -611,7 +611,6 @@ pub(crate) fn spawn_validation_owned_with<'scope>(
         check(&program).map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
         let secs = t.elapsed().as_secs_f64();
         release_program_data(&mut program);
-        let _ = crate::alloc_purge::purge_now();
         Ok((secs, program))
     })
 }
@@ -662,18 +661,6 @@ fn level_more(stop: LevelStop, count: usize, last: &WlfmBuild) -> bool {
         LevelStop::Levels(n) => count < n.clamp(1, MAX_LEVELS),
         LevelStop::Groups(g) => count < MAX_LEVELS && last.artifacts.sizes.len() > g,
     }
-}
-
-/// A level the verifier derives: built only from a program the admission
-/// validator passed ([`super::validator::AdmittedProgram`], which only the
-/// validator makes), so a derivation that skips the check does not compile.
-fn build_derived_level(
-    program: super::validator::AdmittedProgram,
-    family: WlfmFamily,
-    rounds: Option<u8>,
-    on_host: bool,
-) -> Result<Level, String> {
-    build_level(program.into_program(), family, rounds, on_host)
 }
 
 /// The level after `child`'s, prepared on the host: its program (the W-leg
@@ -1007,15 +994,19 @@ pub fn level_rounds(plan: &WhirBlockPlan) -> Option<u8> {
     }
 }
 
-/// One level built from its program: under `family`'s levers at
-/// [`LEVEL_RATE`], its chains under `rounds` ([`level_rounds`]), its
-/// prepared stacks committed on the host when `on_host`.
+/// One level the verifier derives, built from its program: under `family`'s
+/// levers at [`LEVEL_RATE`], its chains under `rounds` ([`level_rounds`]),
+/// its prepared stacks committed on the host when `on_host`. It takes only a
+/// program the admission validator passed
+/// ([`super::validator::AdmittedProgram`], which only the validator makes),
+/// so a derivation that skips the check does not compile.
 pub(crate) fn build_level(
-    program: LfmProgram,
+    program: super::validator::AdmittedProgram,
     family: WlfmFamily,
     rounds: Option<u8>,
     on_host: bool,
 ) -> Result<Level, String> {
+    let program = program.into_program();
     let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
     let place = if on_host {
         StackPlace::Host
@@ -1189,7 +1180,7 @@ pub fn derive_levels_to(
         }
     };
     let rounds = level_rounds(plan);
-    let mut levels = vec![build_derived_level(
+    let mut levels = vec![build_level(
         plan.closed_block_program_admitted()?,
         family,
         rounds,
@@ -1198,7 +1189,7 @@ pub fn derive_levels_to(
     while more(&levels)? {
         let child = child_of(plan, levels.last().expect("a level"));
         let rounds = child.artifacts.rounds;
-        levels.push(build_derived_level(
+        levels.push(build_level(
             super::wlfm_leg::wlfm_leg_program_admitted(&child)?,
             family,
             rounds,
@@ -1322,8 +1313,11 @@ pub struct LevelsTimes {
     /// (the driver's clock). `None` when off.
     pub validated_beside: Option<(f64, f64)>,
     /// Under [`VALIDATE_LATE_ENV`], level 1's validator from the base's end:
-    /// its seconds, and when level 1's proved prove found it done.
+    /// its seconds, and when level 1's proved prove found it done; and the
+    /// purge that hands its program's pages back, on a thread of its own after
+    /// the join (its seconds and jemalloc's resident bytes before and after).
     pub validated_late: Option<(f64, f64)>,
+    pub late_purge: Option<crate::alloc_purge::Purge>,
     /// Level 1's program: its walk's, its compile's and (off the knob) its
     /// validation's seconds before its execution could start.
     pub emit_split: (f64, f64, f64),
@@ -2041,6 +2035,9 @@ pub fn prove_block_levels(
         // thread of its own beside level 1's prove, which lets it go once
         // checked (its pages back to the OS on that thread) and hands it back
         // at the join; otherwise it is let go here.
+        let mut late_purge: Option<
+            std::thread::ScopedJoinHandle<'_, Option<crate::alloc_purge::Purge>>,
+        > = None;
         let late_check = if validate_late_on {
             let p = &levels[0].program;
             times.sizes.push((p.instrs.len(), p.groups.b3l.real_rows));
@@ -2054,9 +2051,8 @@ pub fn prove_block_levels(
             None
         };
         // What the execution (and, off the late check, the program) held, back
-        // to the OS on a thread of its own beside the prove; the late check
-        // hands the program's pages back on its own thread once it has
-        // checked it.
+        // to the OS on a thread of its own beside the prove; under the late
+        // check, the program's pages go back after its join, on another.
         let purge_filled = scope.spawn(crate::alloc_purge::purge_now);
         if let Some(r) = resident_now() {
             times.resident.push(("level 1 filled", r));
@@ -2133,6 +2129,9 @@ pub fn prove_block_levels(
             let (secs, program) = joined_validation_owned(handle)?;
             levels[0].program = program;
             times.validated_late = Some((secs, now()));
+            // The program's freed pages back to the OS beside level 2, joined
+            // at the scope's end: the join never waits for it.
+            late_purge = Some(scope.spawn(crate::alloc_purge::purge_now));
         }
         proofs.push(proved?);
         times.levels.push(LevelClock {
@@ -2253,6 +2252,9 @@ pub fn prove_block_levels(
                 times.card.push((format!("level {} proved", k + 1), card));
             }
             k += 1;
+        }
+        if let Some(handle) = late_purge {
+            times.late_purge = handle.join().ok().flatten();
         }
         Ok(())
     })?;
