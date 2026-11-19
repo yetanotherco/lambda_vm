@@ -253,6 +253,9 @@ impl std::fmt::Display for TreeDrop {
     }
 }
 
+/// A round-0 opening's paths and the queried blocks' values, in query order.
+type PathsAndValues<F> = (Vec<Proof<Commitment>>, Vec<Vec<FieldElement<F>>>);
+
 /// What a retired commitment keeps of its tree: the heap prefix down to the
 /// level whose nodes each cover `2^dropped` leaves (`4^dropped` at arity 4,
 /// whose prefix is the arity-4 layout's top levels).
@@ -1194,33 +1197,78 @@ where
             sources[0].keep(wanted.into_iter().zip(opened.values).collect());
             return Ok(paths);
         }
-        let devices = stacks
-            .iter()
-            .map(|stack| stack.encode())
-            .collect::<Option<Vec<_>>>()
-            .ok_or(Error::DeviceFailed {
-                stage: "re-encoding a joint round-0 tree's codewords from their stacks",
-            })?;
-        let borrowed: Vec<&crate::gpu::DeviceCodeword> = devices.iter().collect();
-        let paths = self
-            .joint_card_top_paths_over(&borrowed, top, indices)
-            .ok_or(Error::DeviceFailed {
-                stage: "re-hashing a joint tree's re-encoded codewords",
-            })??;
-        let block = 1usize << self.log_folding;
-        let mut values: Vec<Vec<FieldElement<F>>> = vec![Vec::new(); wanted.len()];
-        for device in &devices {
-            let blocks = device
-                .cosets::<F>(&wanted, self.num_leaves(), block)
-                .ok_or(Error::DeviceFailed {
-                    stage: "gathering a joint tree's re-encoded codewords",
-                })?;
-            for (row, b) in values.iter_mut().zip(blocks) {
-                row.extend(b);
+        // The card re-encodes every codeword and re-hashes over them; with no
+        // room for that either, the host does it from the stacks read back.
+        // `None` is a card that declined; an error is a real one (a mismatch).
+        let on_card = || -> Option<Result<PathsAndValues<F>, Error>> {
+            let devices = stacks
+                .iter()
+                .map(|stack| stack.encode())
+                .collect::<Option<Vec<_>>>()?;
+            let borrowed: Vec<&crate::gpu::DeviceCodeword> = devices.iter().collect();
+            let paths = match self.joint_card_top_paths_over(&borrowed, top, indices)? {
+                Ok(paths) => paths,
+                Err(e) => return Some(Err(e)),
+            };
+            let block = 1usize << self.log_folding;
+            let mut values: Vec<Vec<FieldElement<F>>> = vec![Vec::new(); wanted.len()];
+            for device in &devices {
+                let blocks = device.cosets::<F>(&wanted, self.num_leaves(), block)?;
+                for (row, b) in values.iter_mut().zip(blocks) {
+                    row.extend(b);
+                }
             }
-        }
+            Some(Ok((paths, values)))
+        };
+        let (paths, values) = match on_card() {
+            Some(done) => done?,
+            None => self.host_reencoded_top_paths(&stacks, top, indices, &wanted)?,
+        };
         sources[0].keep(wanted.into_iter().zip(values).collect());
         Ok(paths)
+    }
+
+    /// The queried paths and values of a round-0 tree held as its `stacks`
+    /// (one, or a joint tree's run in slot order), every codeword re-encoded
+    /// on the host from its stack read back ([`crate::gpu::CosetSource::encode_on_host`])
+    /// and the queried blocks re-hashed there ([`Self::host_top_paths`]), each
+    /// block's root checked against its kept node. The fallback a prove takes
+    /// when the card has room for neither the coset openings nor a re-encode:
+    /// slower (a host transform of every codeword), never refused for memory,
+    /// and the same paths and values, since the transform and the leaves are
+    /// the committed ones.
+    fn host_reencoded_top_paths(
+        &self,
+        stacks: &[&crate::gpu::CosetSource],
+        top: &TreeTop,
+        indices: &[usize],
+        wanted: &[usize],
+    ) -> Result<PathsAndValues<F>, Error> {
+        let mut codewords = stacks
+            .iter()
+            .map(|stack| stack.encode_on_host::<F>().map(Codeword::Host))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(Error::DeviceFailed {
+                stage: "reading a round-0 stack back to the host",
+            })?
+            .into_iter();
+        let codeword = codewords.next().ok_or(Error::JointTreeWidth {
+            expected: self.blocks(),
+            got: 0,
+        })?;
+        let host = Self {
+            tree: Tree::<F, H>::from_root(self.tree.root),
+            codeword,
+            log_folding: self.log_folding,
+            log_domain_size: self.log_domain_size,
+            leaves: self.leaves,
+            top: Some(top.clone()),
+            others: codewords.collect(),
+            joint_tree: None,
+        };
+        let paths = host.host_top_paths(top, indices)?;
+        let values = host.gather(wanted)?;
+        Ok((paths, values))
     }
 
     /// [`Self::card_top_paths`] over `device`, this commitment's codeword
@@ -1401,19 +1449,22 @@ where
             source.keep(wanted.into_iter().zip(opened.values).collect());
             return Ok(paths);
         }
-        let device = source.source.encode().ok_or(Error::DeviceFailed {
-            stage: "re-encoding a round-0 codeword from its stack",
-        })?;
-        let paths =
-            self.card_top_paths_over(&device, top, indices)
-                .ok_or(Error::DeviceFailed {
-                    stage: "re-hashing a re-encoded round-0 codeword",
-                })??;
-        let values = device
-            .cosets::<F>(&wanted, self.num_leaves(), 1usize << self.log_folding)
-            .ok_or(Error::DeviceFailed {
-                stage: "gathering a re-encoded round-0 codeword",
-            })?;
+        // The card re-encodes the codeword; with no room for that either, the
+        // host does it from the stack read back ([`Self::host_reencoded_top_paths`]).
+        let on_card = || -> Option<Result<PathsAndValues<F>, Error>> {
+            let device = source.source.encode()?;
+            let paths = match self.card_top_paths_over(&device, top, indices)? {
+                Ok(paths) => paths,
+                Err(e) => return Some(Err(e)),
+            };
+            let values =
+                device.cosets::<F>(&wanted, self.num_leaves(), 1usize << self.log_folding)?;
+            Some(Ok((paths, values)))
+        };
+        let (paths, values) = match on_card() {
+            Some(done) => done?,
+            None => self.host_reencoded_top_paths(&[&source.source], top, indices, &wanted)?,
+        };
         source.keep(wanted.into_iter().zip(values).collect());
         Ok(paths)
     }

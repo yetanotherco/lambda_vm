@@ -937,6 +937,20 @@ impl StackSlices {
         StackParts::new(&self.parts, self.num_vars, self.buffer.len())
     }
 
+    /// The stack's `2^num_vars` values on the host, zeros between the parts:
+    /// what a fallback with no card room re-encodes there. One device-to-host
+    /// copy a part; nothing is allocated on the card.
+    pub fn to_host(&self) -> Result<Vec<u64>> {
+        let stream = backend()?.next_stream();
+        let mut out = vec![0u64; 1usize << self.num_vars];
+        for &(at, len, offset) in &self.parts {
+            let part = crate::readback::clone_dtoh(&stream, &self.buffer.slice(at..at + len))?;
+            out[offset..offset + len].copy_from_slice(&part);
+        }
+        stream.synchronize()?;
+        Ok(out)
+    }
+
     fn assemble(&self, stream: &Arc<CudaStream>) -> Result<CudaSlice<u64>> {
         // SAFETY: `copy_slices` writes every element (zeros, then the parts).
         let mut f = unsafe { alloc_or_trim::<u64>(stream, 1 << self.num_vars) }?;

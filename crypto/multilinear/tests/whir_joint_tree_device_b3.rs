@@ -316,6 +316,42 @@ fn a_blake3_joint_run_on_the_card_proves_the_hosts_bytes() {
     }
 }
 
+/// A round-0 opening the card can serve neither from its stacks nor by a
+/// re-encode — no room for either, as under card-memory pressure — falls back
+/// to the host: each stack read back, its codeword encoded there and the
+/// queried blocks re-hashed against the kept top. The proof is the host's
+/// bytes, for a joint tree a run and for one tree a polynomial, and the
+/// fallback is counted.
+#[test]
+fn a_round0_opening_the_card_cannot_serve_falls_back_to_the_host_with_its_bytes() {
+    let _serial = serial();
+    for round0 in [Round0Trees::One, Round0Trees::Each] {
+        let cfg = config(round0);
+        for stack in [Stack::run_of_three(), Stack::runs_of_four_and_two()] {
+            let label = format!(
+                "{}, {round0:?}, revived at drop 4, the card declining",
+                stack.name
+            );
+            let (host_roots, host_proof) = stack.on_the_host(&cfg);
+            let fallbacks = gpu::host_fallbacks();
+            gpu::force_coset_decline(true);
+            let declined = stack.try_prove(&cfg, Some(4));
+            gpu::force_coset_decline(false);
+            let (roots, proof) = declined.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            assert!(
+                gpu::host_fallbacks() > fallbacks,
+                "{label}: the host fallback counted"
+            );
+            assert_eq!(roots, host_roots, "{label}: roots");
+            stack.verify(&roots, &proof, &cfg, &label);
+            assert!(
+                bytes(&proof) == bytes(&host_proof),
+                "{label}: the host's bytes"
+            );
+        }
+    }
+}
+
 /// ★ At the production block's shape — a run of three stacked polynomials of
 /// `2^27`, First6, blowup 2, the coset order: `2^22` leaves a tree — a joint
 /// BLAKE3 run committed on the card has the host's root (the verifiers'
