@@ -9188,6 +9188,91 @@ pub(crate) fn commit_joint_streamed(
     None
 }
 
+/// What the streamed joint commits ([`commit_joint_streamed`]) promised the
+/// ledger one codeword at a time: every codeword of every streamed run, in
+/// bytes as promised ([`streamed_run_bytes`]), and how many codewords. A
+/// batched commit holds each of them until its group retires; a streamed one
+/// holds one at a time. Counted by the caller once the streamed commitment is
+/// built ([`note_streamed_not_held`]).
+static STREAMED_BYTES: AtomicU64 = AtomicU64::new(0);
+static STREAMED_CODEWORDS: AtomicU64 = AtomicU64::new(0);
+
+/// The streamed joint commits' counters ([`STREAMED_BYTES`]): a window's
+/// difference ([`Self::since`]) is one group's, and [`Self::add_back`] what
+/// that group's commit did not hold beside the batched commit's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamedNotHeld {
+    /// Bytes every streamed codeword promised, summed.
+    pub bytes: u64,
+    /// Streamed codewords.
+    pub codewords: u64,
+}
+
+impl StreamedNotHeld {
+    /// What was streamed between `before` and `self`.
+    pub fn since(self, before: Self) -> Self {
+        Self {
+            bytes: self.bytes.saturating_sub(before.bytes),
+            codewords: self.codewords.saturating_sub(before.codewords),
+        }
+    }
+
+    /// The codeword bytes a group's commit did not hold that the batched commit
+    /// would have, for a group of `trees` round-0 trees
+    /// (`crate::stacked_eval::round0_trees`) of which `streamed_runs` were
+    /// joint runs streamed into their leaves.
+    ///
+    /// The batched commit keeps every codeword of the group until it retires.
+    /// A streamed run keeps none once its tree is built, so every one of its
+    /// codewords counts; and when every tree of the group streamed, one
+    /// codeword was alive at the commit's peak, which the batched commit held
+    /// too: that one is taken back. Exact when every tree streamed, and when
+    /// the streamed runs come before the trees committed batched (a trailing
+    /// single polynomial is a tree of its own, never streamed); one codeword
+    /// over, the safe side, when a batched tree precedes a streamed run. Every codeword of a group has one length and one promise, so the
+    /// codeword taken back is `bytes / codewords`.
+    pub fn add_back(self, streamed_runs: u64, trees: usize) -> u64 {
+        let every_tree_streamed = streamed_runs > 0 && streamed_runs == trees as u64;
+        match self.bytes.checked_div(self.codewords) {
+            Some(one) if every_tree_streamed => self.bytes.saturating_sub(one),
+            _ => self.bytes,
+        }
+    }
+}
+
+/// [`StreamedNotHeld`] so far, process-wide.
+pub fn streamed_not_held() -> StreamedNotHeld {
+    StreamedNotHeld {
+        bytes: STREAMED_BYTES.load(Ordering::Relaxed),
+        codewords: STREAMED_CODEWORDS.load(Ordering::Relaxed),
+    }
+}
+
+/// The bytes a streamed run of `blocks` codewords of `2^log_elements` base
+/// values promised, each `promise` codewords' worth
+/// (`math_cuda::whir::codeword_promise`: 2 when its group's room was refused).
+pub fn streamed_run_bytes(blocks: usize, log_elements: usize, promise: u64) -> u64 {
+    ((blocks as u64) << log_elements)
+        .saturating_mul(8)
+        .saturating_mul(promise)
+}
+
+/// Called once a streamed joint run's commitment is built: its `blocks`
+/// codewords of `2^log_elements`, each encoded under `transient`.
+pub(crate) fn note_streamed_not_held(blocks: usize, log_elements: usize, transient: bool) {
+    #[cfg(feature = "cuda")]
+    {
+        let promise = math_cuda::whir::codeword_promise(transient);
+        STREAMED_BYTES.fetch_add(
+            streamed_run_bytes(blocks, log_elements, promise),
+            Ordering::Relaxed,
+        );
+        STREAMED_CODEWORDS.fetch_add(blocks as u64, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = (blocks, log_elements, transient);
+}
+
 /// Joint trees built one codeword at a time ([`commit_joint_streamed`]).
 #[cfg(feature = "cuda")]
 pub fn joint_streamed_builds() -> u64 {
@@ -9264,6 +9349,131 @@ mod streamed_leaves_knob_tests {
         assert!(s(Some("yes")));
         assert!(!s(Some("0")));
         assert!(!s(Some(" 0 ")));
+    }
+}
+
+#[cfg(test)]
+mod streamed_add_back_tests {
+    use super::{StreamedNotHeld, streamed_run_bytes};
+    use crate::stacked_eval::round0_trees;
+    use crate::whir_chain::{ChainConfig, ChainFormat, GroupFold, Round0Trees};
+
+    /// One tree a run of up to four, the format a joint run streams under.
+    fn config(round0: Round0Trees) -> ChainConfig {
+        ChainConfig {
+            log_blowup: 2,
+            log_folding: 4,
+            num_queries: 33,
+            grind: Default::default(),
+            format: ChainFormat {
+                group: GroupFold::Indexed,
+                round0,
+                ..ChainFormat::DEFAULT
+            },
+        }
+    }
+
+    /// The counters a group of `polys` polynomials leaves when its joint runs
+    /// stream (`streamed[i]` for the `i`-th joint run): what
+    /// `whir_chain::commit_joint_stacked_for` notes for each streamed run.
+    fn group(
+        polys: usize,
+        cfg: &ChainConfig,
+        streamed: &[bool],
+        log_elements: usize,
+        promise: u64,
+    ) -> (StreamedNotHeld, u64, usize) {
+        let trees = round0_trees(polys, cfg);
+        let mut counted = StreamedNotHeld::default();
+        let mut runs = 0;
+        let joint = trees.iter().filter(|t| t.len() >= 2);
+        for (run, &on) in joint.zip(streamed.iter().chain(std::iter::repeat(&true))) {
+            if on {
+                counted.bytes += streamed_run_bytes(run.len(), log_elements, promise);
+                counted.codewords += run.len() as u64;
+                runs += 1;
+            }
+        }
+        (counted, runs, trees.len())
+    }
+
+    /// The stamp's add-back for 2-, 4- and 7-polynomial groups, every joint
+    /// run streamed: `(polys − 1)` codewords, what the batched commit held
+    /// beyond the streamed one's single codeword. Two and four are one tree;
+    /// seven is a run of four and a run of three. Under a refused room each
+    /// codeword promised twice its bytes, and so does the add-back.
+    #[test]
+    fn a_streamed_groups_add_back_is_every_codeword_but_one() {
+        let cfg = config(Round0Trees::One);
+        let log = 20;
+        for promise in [1u64, 2] {
+            let codeword = (1u64 << log) * 8 * promise;
+            for (polys, trees) in [(2usize, 1usize), (4, 1), (7, 2)] {
+                let (counted, runs, n) = group(polys, &cfg, &[], log, promise);
+                assert_eq!((runs as usize, n), (trees, trees), "{polys} polynomials");
+                assert_eq!(
+                    counted.add_back(runs, n),
+                    (polys as u64 - 1) * codeword,
+                    "{polys} polynomials, promise {promise}"
+                );
+            }
+            // A run of four and a trailing single (a tree of its own, committed
+            // as before): the single's codeword is the only one held at the end.
+            let (counted, runs, n) = group(5, &cfg, &[], log, promise);
+            assert_eq!((runs, n), (1, 2));
+            assert_eq!(counted.add_back(runs, n), 4 * codeword, "4 + 1");
+            // The run of three declined (committed batched, all three held): the
+            // run of four's codewords, none taken back.
+            let (counted, runs, n) = group(7, &cfg, &[true, false], log, promise);
+            assert_eq!(
+                counted.add_back(runs, n),
+                4 * codeword,
+                "4 streamed + 3 batched"
+            );
+            // The run of four declined, the three streamed: one codeword over the
+            // true two (the safe side).
+            let (counted, runs, n) = group(7, &cfg, &[false, true], log, promise);
+            assert_eq!(
+                counted.add_back(runs, n),
+                3 * codeword,
+                "4 batched + 3 streamed"
+            );
+        }
+    }
+
+    /// Nothing streamed, nothing added back: under one tree a polynomial, and
+    /// with no streamed codeword counted (a host build, or the knob off).
+    #[test]
+    fn a_group_that_streamed_nothing_adds_nothing_back() {
+        for round0 in [Round0Trees::One, Round0Trees::Each] {
+            let cfg = config(round0);
+            for polys in [1usize, 2, 4, 7] {
+                let n = round0_trees(polys, &cfg).len();
+                assert_eq!(StreamedNotHeld::default().add_back(0, n), 0);
+            }
+        }
+        let (counted, _, n) = group(7, &config(Round0Trees::One), &[false, false], 20, 1);
+        assert_eq!(counted.add_back(0, n), 0);
+    }
+
+    /// A window's difference is that window's.
+    #[test]
+    fn a_window_of_the_counters_is_its_own() {
+        let before = StreamedNotHeld {
+            bytes: 10,
+            codewords: 2,
+        };
+        let after = StreamedNotHeld {
+            bytes: 34,
+            codewords: 5,
+        };
+        assert_eq!(
+            after.since(before),
+            StreamedNotHeld {
+                bytes: 24,
+                codewords: 3,
+            }
+        );
     }
 }
 

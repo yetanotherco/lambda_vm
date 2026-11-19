@@ -2058,7 +2058,7 @@ where
 /// on, the run is streamed into its leaves one codeword at a time and the
 /// commitment keeps no codeword. A commitment that may be opened whole
 /// (`retired` false) is never streamed.
-pub fn commit_joint_stacked_for<F, H>(
+pub(crate) fn commit_joint_stacked_for<F, H>(
     polys: &[Stacked<'_, F>],
     config: &ChainConfig,
     transient: bool,
@@ -2111,6 +2111,10 @@ where
             first,
             leaves,
         )?;
+        // Every codeword of the run went before its tree was built: what the
+        // batched commit would have held until the group retires, as each
+        // encode promised it (`transient`: its group's room refused, twice).
+        crate::gpu::note_streamed_not_held(polys.len(), num_vars + config.log_blowup, transient);
         return Ok((commitment, domain));
     }
     let mut on_card = Vec::with_capacity(polys.len());

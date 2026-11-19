@@ -3012,8 +3012,9 @@ fn page_tables_in_air_order() -> Deviations {
 /// Phase A commits every group to be retired before it is opened
 /// (`StackedCommitment::commit_to_retire`), so a joint run may be streamed
 /// into its leaves (`multilinear::gpu::streamed_joint_leaves`): a block under
-/// one tree a run commits joint runs, each of them to be retired. Run alone:
-/// the counters are the process's.
+/// one tree a run commits joint runs in phase A, each of them to be retired.
+/// Read from phase A's own group stamps, around each group's commit, so a
+/// prepared stack committed elsewhere (`commit`, opened whole) never counts.
 #[test]
 fn phase_a_commits_its_joint_runs_to_be_retired() {
     let elf = asm_elf_bytes("all_instructions_64");
@@ -3027,14 +3028,29 @@ fn phase_a_commits_its_joint_runs_to_be_retired() {
         multilinear::whir_chain::Round0Trees::One,
         "one tree a run"
     );
-    let (all, to_retire, _) = multilinear::gpu::joint_runs();
-    let proof = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
-    let (now_all, now_to_retire, _) = multilinear::gpu::joint_runs();
-    assert!(now_all > all, "no joint run committed");
+    let (proof, stamps) = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &format,
+        &streamed(MaxRowsConfig::small(), 16, 3),
+        &Deviations::default(),
+    )
+    .expect("prove");
+    let sum = |k: usize| stamps.groups.iter().map(|g| g.joint_runs[k]).sum::<u64>();
+    assert!(sum(0) > 0, "no joint run committed in phase A");
     assert_eq!(
-        now_to_retire - to_retire,
-        now_all - all,
-        "a joint run committed that may be opened whole"
+        sum(1),
+        sum(0),
+        "a joint run committed in phase A that may be opened whole"
+    );
+    assert!(
+        stamps
+            .groups
+            .iter()
+            .filter(|g| g.joint_runs[2] == 0)
+            .all(|g| g.commit_streamed_not_held == 0),
+        "a group that streamed nothing adds nothing back"
     );
     assert!(verify(&proof, &elf, &format));
 }
