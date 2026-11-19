@@ -273,6 +273,12 @@ pub enum KeccakRndForm {
     /// Without the 20 implied `Cxz_left` checks (1,011 interactions): the
     /// block format's presets.
     Lean,
+    /// [`Self::Lean`]'s checks with every byte lookup local: its 1,008
+    /// `AreBytes` and `ByteAlu` sends on `LocalAreBytes` and `LocalByteAlu`
+    /// (the same tuples, multiplicities and columns), received by its group's
+    /// LOCAL_BYTES table (`tables::local_bytes`) and argued under the group's
+    /// own challenges. The block format's local lookups.
+    LeanLocal,
 }
 
 impl KeccakRndForm {
@@ -281,13 +287,29 @@ impl KeccakRndForm {
     pub const fn are_bytes_per_row(self) -> usize {
         match self {
             Self::Full => ARE_BYTES_PER_ROW,
-            Self::Lean => 200,
+            Self::Lean | Self::LeanLocal => 200,
         }
     }
 
     /// Whether the 20 `Cxz_left` byte checks are sent.
     pub const fn checks_cxz_left(self) -> bool {
         matches!(self, Self::Full)
+    }
+
+    /// Whether the table's byte lookups are local ([`Self::LeanLocal`]): none
+    /// reaches BITWISE.
+    pub const fn byte_lookups_local(self) -> bool {
+        matches!(self, Self::LeanLocal)
+    }
+
+    /// `ARE_BYTES` sends per row that BITWISE receives: [`Self::are_bytes_per_row`],
+    /// or none when the byte lookups are local.
+    pub const fn bitwise_are_bytes_per_row(self) -> usize {
+        if self.byte_lookups_local() {
+            0
+        } else {
+            self.are_bytes_per_row()
+        }
     }
 }
 
@@ -643,9 +665,28 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 /// The table's interactions under `form`: [`bus_interactions`] without the 20
-/// `Cxz_left` byte checks under [`KeccakRndForm::Lean`].
-#[allow(clippy::needless_range_loop)]
+/// `Cxz_left` byte checks under [`KeccakRndForm::Lean`]; under
+/// [`KeccakRndForm::LeanLocal`] the lean list with each `AreBytes` send on
+/// `LocalAreBytes` and each `ByteAlu` send on `LocalByteAlu`, in place.
 pub fn bus_interactions_for(form: KeccakRndForm) -> Vec<BusInteraction> {
+    if !form.byte_lookups_local() {
+        return bus_interactions_of(form);
+    }
+    bus_interactions_of(KeccakRndForm::Lean)
+        .into_iter()
+        .map(|mut interaction| {
+            if interaction.bus_id == u64::from(BusId::AreBytes) {
+                interaction.bus_id = u64::from(BusId::LocalAreBytes);
+            } else if interaction.bus_id == u64::from(BusId::ByteAlu) {
+                interaction.bus_id = u64::from(BusId::LocalByteAlu);
+            }
+            interaction
+        })
+        .collect()
+}
+
+#[allow(clippy::needless_range_loop)]
+fn bus_interactions_of(form: KeccakRndForm) -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(1031);
 
     // --- IO group (3) ---
