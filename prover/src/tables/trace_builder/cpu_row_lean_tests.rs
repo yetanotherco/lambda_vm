@@ -1096,3 +1096,190 @@ fn the_prover_refuses_the_lean_row_where_it_cannot_hold() {
         "a take-back of a lookup never counted"
     );
 }
+
+/// The constraints of `air` on one row `row` (its base-field ones).
+fn air_values(
+    air: &dyn AIR<Field = GoldilocksField, FieldExtension = GoldilocksExtension, PublicInputs = ()>,
+    row: &[FE],
+) -> Vec<FE> {
+    use math::field::element::FieldElement;
+    use stark::frame::Frame;
+    use stark::table::TableView;
+    use stark::traits::TransitionEvaluationContext;
+    // The row and a copy as the next one (a constraint reading the next row
+    // sees the same cells), and the auxiliary columns at zero: only the
+    // base-field constraints are read.
+    let aux = vec![FieldElement::<GoldilocksExtension>::zero(); air.trace_layout().1.max(air.num_auxiliary_rap_columns())];
+    let step = || TableView::new(vec![row.to_vec()], vec![aux.clone()]);
+    let frame = Frame::<GoldilocksField, GoldilocksExtension>::new(vec![step(), step()]);
+    let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![FieldElement::zero(); 64];
+    let offset_e = FieldElement::<GoldilocksExtension>::zero();
+    let ctx =
+        TransitionEvaluationContext::new_prover(frame.as_row_frame(), &no_e, &no_e, &offset_e);
+    let mut base = vec![FE::zero(); air.num_base_transition_constraints()];
+    let mut ext = vec![FieldElement::<GoldilocksExtension>::zero(); air.num_transition_constraints()];
+    air.compute_transition_prover(&ctx, &mut base, &mut ext);
+    base
+}
+
+/// The constraints of `air` that hold `column` to a bit: on a random row each
+/// reads zero with the column at 0 and at 1 and not at 2, on two rows — a
+/// constraint `g·c·(c − 1)` for a gate `g` the random row leaves nonzero.
+fn bit_constraints(
+    air: &dyn AIR<Field = GoldilocksField, FieldExtension = GoldilocksExtension, PublicInputs = ()>,
+    column: usize,
+    seed: u64,
+) -> Vec<usize> {
+    let width = air.trace_layout().0;
+    let mut state = seed;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        FE::from(state >> 11)
+    };
+    let mut found: Option<Vec<usize>> = None;
+    for _ in 0..2 {
+        let mut row: Vec<FE> = (0..width).map(|_| next()).collect();
+        let at = |row: &mut Vec<FE>, v: u64| {
+            row[column] = FE::from(v);
+            air_values(air, row)
+        };
+        let (v0, v1, v2) = (at(&mut row, 0), at(&mut row, 1), at(&mut row, 2));
+        let here: Vec<usize> = (0..v0.len())
+            .filter(|&k| v0[k] == FE::zero() && v1[k] == FE::zero() && v2[k] != FE::zero())
+            .collect();
+        found = Some(match found {
+            None => here,
+            Some(before) => before.into_iter().filter(|k| here.contains(k)).collect(),
+        });
+    }
+    found.unwrap_or_default()
+}
+
+/// Every memory receiver's flag columns are bits. The tag argument (no memory
+/// receiver's flags element reaches 32) assumes it: each receiver on
+/// `MemoryOp` without the tag, in a set with one table of every family under
+/// each memory format, is found by its interactions, every column its flags
+/// element reads is collected, and each must carry a constraint that holds it
+/// to a bit. A receiver added later is enumerated the same way.
+#[test]
+fn every_memory_receivers_flag_columns_are_bits() {
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let opts = ProofOptions::default_test_options();
+    let counts = crate::TableCounts {
+        cpu: 1,
+        lt: 1,
+        memw: 1,
+        memw_aligned: 1,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 1,
+        memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        copy: 1,
+        blake3: 1,
+        is_wh: 1,
+        ecrec: 1,
+    };
+    let pages =
+        Traces::page_configs_from_elf_and_runtime(&program, &[], 0, 1 << 20).expect("pages");
+    let inputs = crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("inputs");
+    let pinned = crate::block_whir::BlockFormat::pinned();
+    let tag = format!("{:?}", BusValue::constant(ECALL_MEMORY_OP_TAG));
+    let mut checked: BTreeMap<String, Vec<(usize, Vec<usize>)>> = BTreeMap::new();
+    let mut missing = Vec::new();
+    for memory in [MemoryFormat::Split, MemoryFormat::Fused, MemoryFormat::Words] {
+        let mut airs = crate::block_airs(
+            &program,
+            &opts,
+            &pages,
+            &counts,
+            &inputs,
+            pinned.keccak_rnd,
+            pinned.memw_aligned,
+            pinned.registers,
+        );
+        match memory {
+            MemoryFormat::Split => {}
+            MemoryFormat::Fused => airs.with_fused_memory(&opts, [1, 1]),
+            MemoryFormat::Words => airs
+                .with_word_memory(&opts, [1; 7], &pages)
+                .expect("the word tables"),
+        }
+        airs.with_cpu_row(&opts, CpuRowForm::Lean, pinned.registers, memory, &inputs)
+            .expect("the set");
+        for air in airs.air_refs() {
+            let name = air.name().split('[').next().unwrap_or("").to_string();
+            for i in air.bus_interactions() {
+                if i.bus_id != BusId::MemoryOp as u64 || i.is_sender {
+                    continue;
+                }
+                if i.values.len() == 9 && format!("{:?}", i.values[6]) == tag {
+                    continue; // a syscall chip's receive: its flags are the constant tag
+                }
+                let mut at = 0;
+                let flags = i
+                    .values
+                    .iter()
+                    .find(|v| {
+                        let here = at;
+                        at += v.num_bus_elements();
+                        here == 6
+                    })
+                    .unwrap_or_else(|| panic!("{name}: a seventh element"));
+                let columns: Vec<usize> = match flags {
+                    BusValue::Linear(terms) => terms
+                        .iter()
+                        .filter_map(|t| match *t {
+                            LinearTerm::Column { column, .. }
+                            | LinearTerm::ColumnUnsigned { column, .. } => Some(column),
+                            LinearTerm::Constant(_) => None,
+                        })
+                        .collect(),
+                    BusValue::Packed { start_column, .. } => vec![*start_column],
+                };
+                // A constant flags element (an eight-byte table's) has no column
+                // to hold; the tag test bounds its constant.
+                checked.entry(name.clone()).or_default();
+                for c in columns {
+                    let found = bit_constraints(air, c, 0x5eed ^ c as u64);
+                    if found.is_empty() {
+                        missing.push(format!("{name} column {c}"));
+                    }
+                    checked.entry(name.clone()).or_default().push((c, found));
+                }
+            }
+        }
+    }
+    for (name, cols) in &checked {
+        println!("MEMORY RECEIVER {name}: flag columns and their bit constraints {cols:?}");
+    }
+    let kinds: Vec<&str> = checked.keys().map(String::as_str).collect();
+    for want in [
+        "LOAD",
+        "STORE",
+        "MEM_LOAD",
+        "MEM_STORE",
+        "MEM_LOAD8",
+        "MEM_STORE8",
+        "MEM_LOADW",
+        "MEM_STOREW",
+        "MEM_LOAD2W",
+        "MEM_STORE2W",
+    ] {
+        assert!(kinds.contains(&want), "{want} is a memory receiver of some format: {kinds:?}");
+    }
+    assert!(missing.is_empty(), "flag columns with no bit constraint: {missing:?}");
+}
