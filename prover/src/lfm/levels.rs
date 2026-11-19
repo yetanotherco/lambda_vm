@@ -518,6 +518,121 @@ fn beside_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
+/// `LAMBDA_VM_LEVELS_OWN_POOL`: where level 1's beside work runs while the base
+/// proves. Unset, empty, `0` or `off` (the default): on the prover's rayon
+/// pool, which the base's phase B shares. `nice`: on a pool of its own, as
+/// many threads as the prover's, each lowered to [`BESIDE_NICE`] (Linux).
+/// `plain`: that pool at the prover's priority. The work is the level-1
+/// thread's (the plan, the walk, the compile, the streamed execution), the
+/// builder's (the prepare) and the lean fill's; the same results in any pool.
+/// Anything else is refused. Read once a process; printed once a process.
+pub const OWN_POOL_ENV: &str = "LAMBDA_VM_LEVELS_OWN_POOL";
+
+/// What [`OWN_POOL_ENV`] says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnPool {
+    Off,
+    Nice,
+    Plain,
+}
+
+/// [`OWN_POOL_ENV`]'s word; nonsense is an error.
+pub fn parse_own_pool(value: Option<&str>) -> Result<OwnPool, String> {
+    match value.map(str::trim) {
+        None | Some("" | "0" | "off") => Ok(OwnPool::Off),
+        Some("nice") => Ok(OwnPool::Nice),
+        Some("plain") => Ok(OwnPool::Plain),
+        Some(v) => Err(format!(
+            "{OWN_POOL_ENV} must be off, nice or plain, got `{v}`"
+        )),
+    }
+}
+
+#[cfg(test)]
+static OWN_POOL_FOR_TEST: std::sync::Mutex<Option<OwnPool>> = std::sync::Mutex::new(None);
+
+/// Tests only: [`OWN_POOL_ENV`] as `mode` for every thread until the guard
+/// drops.
+#[cfg(test)]
+pub(crate) fn set_own_pool_for_test(mode: OwnPool) -> OwnPoolForTest {
+    let before = OWN_POOL_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(mode);
+    OwnPoolForTest(before)
+}
+
+#[cfg(test)]
+pub(crate) struct OwnPoolForTest(Option<OwnPool>);
+
+#[cfg(test)]
+impl Drop for OwnPoolForTest {
+    fn drop(&mut self) {
+        *OWN_POOL_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()) = self.0;
+    }
+}
+
+/// The pool [`OWN_POOL_ENV`] names for level 1's beside work: `None` for the
+/// prover's (off, or a pool that cannot be built, which is printed).
+fn own_pool() -> Result<Option<&'static rayon::ThreadPool>, String> {
+    #[cfg(test)]
+    if let Some(mode) = *OWN_POOL_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()) {
+        return Ok(own_pool_of(mode));
+    }
+    static MODE: std::sync::OnceLock<Result<OwnPool, String>> = std::sync::OnceLock::new();
+    let mode = MODE
+        .get_or_init(|| {
+            let mode = parse_own_pool(std::env::var(OWN_POOL_ENV).ok().as_deref());
+            if let Ok(mode) = mode {
+                eprintln!(
+                    "LEVELS OWN POOL: {mode:?} · {} threads",
+                    rayon::current_num_threads()
+                );
+            }
+            mode
+        })
+        .clone()?;
+    Ok(own_pool_of(mode))
+}
+
+/// The process's pool for `mode`, built once.
+fn own_pool_of(mode: OwnPool) -> Option<&'static rayon::ThreadPool> {
+    static NICE: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    static PLAIN: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    let (cell, nice) = match mode {
+        OwnPool::Off => return None,
+        OwnPool::Nice => (&NICE, true),
+        OwnPool::Plain => (&PLAIN, false),
+    };
+    cell.get_or_init(|| {
+        let built = rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads())
+            .thread_name(move |i| format!("levels-own-{}{i}", if nice { "n" } else { "p" }))
+            .start_handler(move |_| {
+                if nice {
+                    super::whir_block_tree::lower_this_threads_priority(BESIDE_NICE)
+                }
+            })
+            .build();
+        match built {
+            Ok(pool) => Some(pool),
+            Err(e) => {
+                eprintln!("LEVELS OWN POOL: not built ({e}); the prover's pool takes the work");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// `f` on `pool` when there is one, else here.
+fn on_own_pool<R: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> R + Send) -> R {
+    match pool {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
+
 /// [`prepare_level`] as the driver runs it beside the base: on the beside pool
 /// under [`beside_nice`], on the prover's pool otherwise. The same prebuild.
 pub(crate) fn prepare_level_beside(
@@ -1506,6 +1621,9 @@ pub fn prove_block_levels(
     let fill_beside_on = fill_beside();
     // Level 1's lean round tables filled beside its execution: under the
     // knob, and only where they are held as their records.
+    // Level 1's beside work (its walk, compile, streamed execution, fill and
+    // prepare) on a pool of its own ([`OWN_POOL_ENV`]), or the prover's.
+    let own_pool = own_pool()?;
     let lean_beside = super::wlfm::lean_beside()
         && super::b3l_tables::fill_hold() == super::b3l_tables::B3lHold::Records;
     let base_end: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -1519,253 +1637,259 @@ pub fn prove_block_levels(
         // on the host, as soon as its program exists. The card is the base's
         // until it ends: nothing is committed here.
         let builder = build_beside.then(|| {
-            scope.spawn(move || -> Result<WlfmPrebuild, String> {
-                brx.recv()
-                    .map_err(|_| "level 1's program was never emitted")?;
-                let program = program_ref.get().ok_or("the program is set")?;
-                let plan = plan_ref.get().ok_or("the plan is set")?;
-                prepare_level_beside(program, family, level_rounds(plan))
+            scope.spawn(move || {
+                on_own_pool(own_pool, move || -> Result<WlfmPrebuild, String> {
+                    brx.recv()
+                        .map_err(|_| "level 1's program was never emitted")?;
+                    let program = program_ref.get().ok_or("the program is set")?;
+                    let plan = plan_ref.get().ok_or("the plan is set")?;
+                    prepare_level_beside(program, family, level_rounds(plan))
+                })
             })
         });
         // Level 1's thread: the plan, the program, then its execute, a piece
         // landed as soon as phase B has finished its groups.
-        let level1 = scope.spawn(move || -> Result<Level1, String> {
-            let (statement, roots) = srx.recv().map_err(|_| "the prover never stated")?;
-            let plan = level_plan(
-                elf_ref,
-                opts_ref,
-                format_ref,
-                statement.view(),
-                family,
-                Some(&roots),
-            )?;
-            let planned = now();
-            let beside_check = program_fast();
-            let (program, marks, (walk, compiled)) =
-                plan.closed_block_program_marked_timed(beside_check)?;
-            // Off the knob, validated before the execution, as always.
-            let t = std::time::Instant::now();
-            if !beside_check {
-                super::validator::validate(&program)
-                    .map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
-            }
-            let emit_split = (walk, compiled, t.elapsed().as_secs_f64());
-            let emitted = now();
-            let _ = plan_ref.set(plan);
-            let plan = plan_ref.get().ok_or("the plan is set")?;
-            let _ = program_ref.set(program);
-            let program = program_ref.get().ok_or("the program is set")?;
-            let _ = btx.send(());
-            // Under the knob, the admission validator runs beside the
-            // execution; level 1 is refused at the execution's end if it fails.
-            let checker = beside_check.then(|| spawn_validation(scope, program));
-            let pieces = level1_pieces(&marks);
-            let npieces = pieces.len();
-            let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
-            let arena_pieces: Vec<ArenaPiece> = pieces
-                .iter()
-                .enumerate()
-                .map(|(i, (range, _))| ArenaPiece {
-                    arena: 0,
-                    start: range.start,
-                    len: range.end - range.start,
-                    group: i,
-                })
-                .collect();
-            let held: Vec<std::cell::OnceCell<Vec<LfmWord>>> =
-                (0..npieces).map(|_| std::cell::OnceCell::new()).collect();
-            let mut by_group: Vec<Option<Vec<LfmWord>>> = vec![None; marks.len() - 1];
-            let placing = super::placement::placement();
-            let usage_from = placing.then(|| {
-                (
-                    super::placement::thread_usage(),
-                    super::placement::process_usage(),
-                )
-            });
-            if placing {
-                let _ = super::placement::take_jobs();
-                super::placement::count_jobs(true);
-            }
-            let mut placed = super::placement::Placement::default();
-            let execute_from = now();
-            let mut ex = StreamedExecution::new_pieced_setup(
-                program,
-                arena_pieces,
-                &hasher,
-                lean_beside,
-                bucket_waves(),
-                setup_fast(),
-            )
-            .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
-            let mut landing = Level1Landing {
-                setup: now() - execute_from,
-                ..Level1Landing::default()
-            };
-            // Under the knob, each wave's compressions go to a thread of their
-            // own that makes the round records and counts as they come.
-            let (lean_tx, lean_fill) = if lean_beside {
-                let (tx, rx) = mpsc::channel::<Vec<(u32, super::b3l::B3lValues)>>();
-                let fill = scope.spawn(move || {
-                    let mut fill = super::b3l_tables::LeanFillBeside::new(program);
-                    for wave in rx {
-                        fill.feed(&wave);
-                    }
-                    let stats = fill.stats();
-                    (fill.finish(), stats)
-                });
-                (Some(tx), Some(fill))
-            } else {
-                (None, None)
-            };
-            hand_on_lean(&mut ex, lean_tx.as_ref());
-            let mut landed = vec![false; npieces];
-            let (mut waves_before, mut wave_secs_before) = (0usize, 0.0f64);
-            // Beside phase B, each group as it comes; otherwise (the control)
-            // every group once the base has ended.
-            let parts: Box<dyn Iterator<Item = Parts>> = if beside {
-                Box::new(prx.iter())
-            } else {
-                Box::new(prx.iter().collect::<Vec<_>>().into_iter())
-            };
-            for (g, roots, answers, tables, argue, opening, prepared) in parts {
-                landing.arrivals.push((g, now()));
-                if !landed[0] {
-                    let front = super::whir_block::leaf_arena_under(
-                        &roots,
-                        &answers,
-                        Vec::new(),
-                        plan.wrap_hash(),
-                    )
-                    .into_iter()
-                    .next()
-                    .ok_or("no front")?;
-                    held[0].set(front).map_err(|_| "the front landed twice")?;
-                    let at = now();
-                    ex.land_piece(0, held[0].get().ok_or("the front")?)
-                        .map_err(|e| format!("level 1's front: {e:?}"))?;
-                    landing.front = (at, now() - at);
-                    hand_on_lean(&mut ex, lean_tx.as_ref());
-                    landed[0] = true;
-                }
-                let words = super::whir_block::group_arena_words(
-                    plan,
-                    g,
-                    &tables,
-                    argue.as_ref(),
-                    &opening,
-                    prepared.as_ref(),
+        let level1 = scope.spawn(move || {
+            on_own_pool(own_pool, move || -> Result<Level1, String> {
+                let (statement, roots) = srx.recv().map_err(|_| "the prover never stated")?;
+                let plan = level_plan(
+                    elf_ref,
+                    opts_ref,
+                    format_ref,
+                    statement.view(),
+                    family,
+                    Some(&roots),
                 )?;
-                *by_group
-                    .get_mut(g)
-                    .ok_or("a group the plan does not hold")? = Some(words);
-                for (i, (_, groups)) in pieces.iter().enumerate().skip(1) {
-                    if landed[i] || !groups.clone().all(|h| by_group[h].is_some()) {
-                        continue;
-                    }
-                    let words: Vec<LfmWord> = groups
-                        .clone()
-                        .flat_map(|h| by_group[h].take().unwrap_or_default())
-                        .collect();
-                    held[i].set(words).map_err(|_| "a piece landed twice")?;
-                    let cpu = placing.then(super::placement::this_cpu).flatten();
-                    if placing {
-                        let _ = super::placement::take_jobs();
-                    }
-                    let t = std::time::Instant::now();
-                    ex.land_piece(i, held[i].get().ok_or("a piece")?)
-                        .map_err(|e| format!("level 1's piece {i}: {e:?}"))?;
-                    hand_on_lean(&mut ex, lean_tx.as_ref());
-                    if base_end_ref.get().is_none() {
-                        waves_before += 1;
-                        wave_secs_before += t.elapsed().as_secs_f64();
-                    }
-                    let secs = t.elapsed().as_secs_f64();
-                    if placing {
-                        placed.waves.push((cpu, super::placement::take_jobs()));
-                    }
-                    landing.landed.push((i, now() - secs, secs));
-                    landed[i] = true;
-                }
-            }
-            if !landed.iter().all(|&l| l) {
-                return Err("phase B ended before level 1 had every group".into());
-            }
-            let execution = ex
-                .finish()
-                .map_err(|e| format!("level 1's execution: {e:?}"))?;
-            let executed = now();
-            if let Some((thread_from, process_from)) = usage_from {
-                super::placement::count_jobs(false);
-                placed.thread = thread_from
-                    .zip(super::placement::thread_usage())
-                    .map(|(a, b)| super::placement::usage_delta(a, b));
-                placed.process = process_from
-                    .zip(super::placement::process_usage())
-                    .map(|(a, b)| super::placement::usage_delta(a, b));
-                landing.placement = Some(placed);
-            }
-            let validated = match checker {
-                Some(handle) => Some((joined_validation(handle)?, now())),
-                None => None,
-            };
-            drop(lean_tx);
-            let lean = match lean_fill {
-                Some(fill) => {
-                    let (prefilled, stats) = fill
-                        .join()
-                        .map_err(|_| "level 1's lean fill thread panicked")?;
-                    Some((prefilled, stats, now()))
-                }
-                None => None,
-            };
-            // Under the knob, level 1 filled here, beside the stacks' commit
-            // the driver makes at the base's end.
-            let execution = if fill_beside_on {
-                let split = execution.split;
-                let (prefilled, lean) = match lean {
-                    Some((prefilled, stats, done)) => (
-                        Some(prefilled.map_err(|e| format!("level 1: {e}"))?),
-                        Some((stats, done)),
-                    ),
-                    None => (None, None),
-                };
+                let planned = now();
+                let beside_check = program_fast();
+                let (program, marks, (walk, compiled)) =
+                    plan.closed_block_program_marked_timed(beside_check)?;
+                // Off the knob, validated before the execution, as always.
                 let t = std::time::Instant::now();
-                let filled = super::proof::lfm_fill_executed_prefilled(
-                    program,
-                    execution,
-                    hasher,
-                    executed - execute_from,
-                    &Vec::new(),
-                    super::wlfm::chip_records(),
-                    prefilled,
-                );
-                let fill = t.elapsed().as_secs_f64();
-                Level1Out::Filled {
-                    lean_prefilled: filled.lean_prefilled(),
-                    fill_split: super::proof::take_fill_split().unwrap_or_default(),
-                    lean_parts: super::proof::take_lean_parts().unwrap_or_default(),
-                    filled,
-                    split,
-                    lean,
-                    fill,
-                    done: now(),
+                if !beside_check {
+                    super::validator::validate(&program)
+                        .map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
                 }
-            } else {
-                Level1Out::Executed(execution, lean)
-            };
-            Ok((
-                planned,
-                emitted,
-                execution,
-                execute_from,
-                executed,
-                npieces,
-                waves_before,
-                wave_secs_before,
-                validated,
-                emit_split,
-                landing,
-            ))
+                let emit_split = (walk, compiled, t.elapsed().as_secs_f64());
+                let emitted = now();
+                let _ = plan_ref.set(plan);
+                let plan = plan_ref.get().ok_or("the plan is set")?;
+                let _ = program_ref.set(program);
+                let program = program_ref.get().ok_or("the program is set")?;
+                let _ = btx.send(());
+                // Under the knob, the admission validator runs beside the
+                // execution; level 1 is refused at the execution's end if it fails.
+                let checker = beside_check.then(|| spawn_validation(scope, program));
+                let pieces = level1_pieces(&marks);
+                let npieces = pieces.len();
+                let hasher = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+                let arena_pieces: Vec<ArenaPiece> = pieces
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (range, _))| ArenaPiece {
+                        arena: 0,
+                        start: range.start,
+                        len: range.end - range.start,
+                        group: i,
+                    })
+                    .collect();
+                let held: Vec<std::cell::OnceCell<Vec<LfmWord>>> =
+                    (0..npieces).map(|_| std::cell::OnceCell::new()).collect();
+                let mut by_group: Vec<Option<Vec<LfmWord>>> = vec![None; marks.len() - 1];
+                let placing = super::placement::placement();
+                let usage_from = placing.then(|| {
+                    (
+                        super::placement::thread_usage(),
+                        super::placement::process_usage(),
+                    )
+                });
+                if placing {
+                    let _ = super::placement::take_jobs();
+                    super::placement::count_jobs(true);
+                }
+                let mut placed = super::placement::Placement::default();
+                let execute_from = now();
+                let mut ex = StreamedExecution::new_pieced_setup(
+                    program,
+                    arena_pieces,
+                    &hasher,
+                    lean_beside,
+                    bucket_waves(),
+                    setup_fast(),
+                )
+                .map_err(|e| format!("level 1's streamed execution: {e:?}"))?;
+                let mut landing = Level1Landing {
+                    setup: now() - execute_from,
+                    ..Level1Landing::default()
+                };
+                // Under the knob, each wave's compressions go to a thread of their
+                // own that makes the round records and counts as they come.
+                let (lean_tx, lean_fill) = if lean_beside {
+                    let (tx, rx) = mpsc::channel::<Vec<(u32, super::b3l::B3lValues)>>();
+                    let fill = scope.spawn(move || {
+                        on_own_pool(own_pool, move || {
+                            let mut fill = super::b3l_tables::LeanFillBeside::new(program);
+                            for wave in rx {
+                                fill.feed(&wave);
+                            }
+                            let stats = fill.stats();
+                            (fill.finish(), stats)
+                        })
+                    });
+                    (Some(tx), Some(fill))
+                } else {
+                    (None, None)
+                };
+                hand_on_lean(&mut ex, lean_tx.as_ref());
+                let mut landed = vec![false; npieces];
+                let (mut waves_before, mut wave_secs_before) = (0usize, 0.0f64);
+                // Beside phase B, each group as it comes; otherwise (the control)
+                // every group once the base has ended.
+                let parts: Box<dyn Iterator<Item = Parts>> = if beside {
+                    Box::new(prx.iter())
+                } else {
+                    Box::new(prx.iter().collect::<Vec<_>>().into_iter())
+                };
+                for (g, roots, answers, tables, argue, opening, prepared) in parts {
+                    landing.arrivals.push((g, now()));
+                    if !landed[0] {
+                        let front = super::whir_block::leaf_arena_under(
+                            &roots,
+                            &answers,
+                            Vec::new(),
+                            plan.wrap_hash(),
+                        )
+                        .into_iter()
+                        .next()
+                        .ok_or("no front")?;
+                        held[0].set(front).map_err(|_| "the front landed twice")?;
+                        let at = now();
+                        ex.land_piece(0, held[0].get().ok_or("the front")?)
+                            .map_err(|e| format!("level 1's front: {e:?}"))?;
+                        landing.front = (at, now() - at);
+                        hand_on_lean(&mut ex, lean_tx.as_ref());
+                        landed[0] = true;
+                    }
+                    let words = super::whir_block::group_arena_words(
+                        plan,
+                        g,
+                        &tables,
+                        argue.as_ref(),
+                        &opening,
+                        prepared.as_ref(),
+                    )?;
+                    *by_group
+                        .get_mut(g)
+                        .ok_or("a group the plan does not hold")? = Some(words);
+                    for (i, (_, groups)) in pieces.iter().enumerate().skip(1) {
+                        if landed[i] || !groups.clone().all(|h| by_group[h].is_some()) {
+                            continue;
+                        }
+                        let words: Vec<LfmWord> = groups
+                            .clone()
+                            .flat_map(|h| by_group[h].take().unwrap_or_default())
+                            .collect();
+                        held[i].set(words).map_err(|_| "a piece landed twice")?;
+                        let cpu = placing.then(super::placement::this_cpu).flatten();
+                        if placing {
+                            let _ = super::placement::take_jobs();
+                        }
+                        let t = std::time::Instant::now();
+                        ex.land_piece(i, held[i].get().ok_or("a piece")?)
+                            .map_err(|e| format!("level 1's piece {i}: {e:?}"))?;
+                        hand_on_lean(&mut ex, lean_tx.as_ref());
+                        if base_end_ref.get().is_none() {
+                            waves_before += 1;
+                            wave_secs_before += t.elapsed().as_secs_f64();
+                        }
+                        let secs = t.elapsed().as_secs_f64();
+                        if placing {
+                            placed.waves.push((cpu, super::placement::take_jobs()));
+                        }
+                        landing.landed.push((i, now() - secs, secs));
+                        landed[i] = true;
+                    }
+                }
+                if !landed.iter().all(|&l| l) {
+                    return Err("phase B ended before level 1 had every group".into());
+                }
+                let execution = ex
+                    .finish()
+                    .map_err(|e| format!("level 1's execution: {e:?}"))?;
+                let executed = now();
+                if let Some((thread_from, process_from)) = usage_from {
+                    super::placement::count_jobs(false);
+                    placed.thread = thread_from
+                        .zip(super::placement::thread_usage())
+                        .map(|(a, b)| super::placement::usage_delta(a, b));
+                    placed.process = process_from
+                        .zip(super::placement::process_usage())
+                        .map(|(a, b)| super::placement::usage_delta(a, b));
+                    landing.placement = Some(placed);
+                }
+                let validated = match checker {
+                    Some(handle) => Some((joined_validation(handle)?, now())),
+                    None => None,
+                };
+                drop(lean_tx);
+                let lean = match lean_fill {
+                    Some(fill) => {
+                        let (prefilled, stats) = fill
+                            .join()
+                            .map_err(|_| "level 1's lean fill thread panicked")?;
+                        Some((prefilled, stats, now()))
+                    }
+                    None => None,
+                };
+                // Under the knob, level 1 filled here, beside the stacks' commit
+                // the driver makes at the base's end.
+                let execution = if fill_beside_on {
+                    let split = execution.split;
+                    let (prefilled, lean) = match lean {
+                        Some((prefilled, stats, done)) => (
+                            Some(prefilled.map_err(|e| format!("level 1: {e}"))?),
+                            Some((stats, done)),
+                        ),
+                        None => (None, None),
+                    };
+                    let t = std::time::Instant::now();
+                    let filled = super::proof::lfm_fill_executed_prefilled(
+                        program,
+                        execution,
+                        hasher,
+                        executed - execute_from,
+                        &Vec::new(),
+                        super::wlfm::chip_records(),
+                        prefilled,
+                    );
+                    let fill = t.elapsed().as_secs_f64();
+                    Level1Out::Filled {
+                        lean_prefilled: filled.lean_prefilled(),
+                        fill_split: super::proof::take_fill_split().unwrap_or_default(),
+                        lean_parts: super::proof::take_lean_parts().unwrap_or_default(),
+                        filled,
+                        split,
+                        lean,
+                        fill,
+                        done: now(),
+                    }
+                } else {
+                    Level1Out::Executed(execution, lean)
+                };
+                Ok((
+                    planned,
+                    emitted,
+                    execution,
+                    execute_from,
+                    executed,
+                    npieces,
+                    waves_before,
+                    wave_secs_before,
+                    validated,
+                    emit_split,
+                    landing,
+                ))
+            })
         });
         let prove_base = || {
             crate::block_whir::prove_block_whir_observed_groups(

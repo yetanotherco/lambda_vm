@@ -528,6 +528,75 @@ fn the_blake3_driver_with_retired_stacks_proves_the_held_levels_bytes() {
     }
 }
 
+/// ★ Level 1's beside work on a pool of its own (`LAMBDA_VM_LEVELS_OWN_POOL`,
+/// `nice` and `plain`) proves the same level bytes: a small BLAKE3 block driven
+/// under each proves each level's bytes as [`prove_levels`] does over the same
+/// base on the prover's pool. Needs `LAMBDA_VM_DETERMINISTIC_GRIND=1`; an
+/// untimed identity check.
+#[test]
+#[ignore = "proves a small BLAKE3 block and its levels three times; deterministic grind"]
+fn the_blake3_driver_on_its_own_pool_proves_the_same_level_bytes() {
+    use super::levels::{OwnPool, prove_block_levels, set_own_pool_for_test};
+    assert!(
+        std::env::var_os("LAMBDA_VM_DETERMINISTIC_GRIND").is_some(),
+        "the identity needs the deterministic grind"
+    );
+    let format = b3_format();
+    let elf = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let opts = ProofOptions::default_test_options();
+    for mode in [OwnPool::Nice, OwnPool::Plain] {
+        let run = {
+            let _pool = set_own_pool_for_test(mode);
+            prove_block_levels(
+                &elf,
+                &[],
+                &opts,
+                &format,
+                &streamed_options(),
+                WlfmFamily::B3,
+                LevelStop::DEFAULT,
+                true,
+                true,
+            )
+            .expect("the BLAKE3 block proves to its last level")
+        };
+        let derived = derive_levels(&run.plan, WlfmFamily::B3, false).expect("the levels derive");
+        let (proofs, _) =
+            prove_levels(&run.plan, &derived, &run.base_proof).expect("the levels prove");
+        assert_eq!(proofs.len(), run.proofs.len());
+        for (k, (a, b)) in run.proofs.iter().zip(&proofs).enumerate() {
+            let a = rkyv::to_bytes::<rkyv::rancor::Error>(a).expect("serializes");
+            let b = rkyv::to_bytes::<rkyv::rancor::Error>(b).expect("serializes");
+            assert!(
+                a[..] == b[..],
+                "{mode:?} level {}: the same proof bytes",
+                k + 1
+            );
+            println!(
+                "LEVELS OWN POOL IDENTITY {mode:?} level {}: {} B equal",
+                k + 1,
+                a.len()
+            );
+        }
+    }
+}
+
+/// The own-pool knob's name and words: off by default, `nice` and `plain`
+/// name the two pools, anything else is refused.
+#[test]
+fn the_own_pool_knob_is_named_and_off_by_default() {
+    use super::levels::{OWN_POOL_ENV, OwnPool, parse_own_pool};
+    assert_eq!(OWN_POOL_ENV, "LAMBDA_VM_LEVELS_OWN_POOL");
+    for off in [None, Some(""), Some("0"), Some("off"), Some(" off ")] {
+        assert_eq!(parse_own_pool(off), Ok(OwnPool::Off), "{off:?}");
+    }
+    assert_eq!(parse_own_pool(Some("nice")), Ok(OwnPool::Nice));
+    assert_eq!(parse_own_pool(Some("plain")), Ok(OwnPool::Plain));
+    for bad in ["1", "on", "Nice", "yes"] {
+        assert!(parse_own_pool(Some(bad)).is_err(), "{bad} is refused");
+    }
+}
+
 /// ★ Level 1's program compiled in parallel and validated beside its
 /// execution (`LAMBDA_VM_LEVELS_PROGRAM_FAST`) is the same program and the
 /// same proofs: a small BLAKE3 block driven with
