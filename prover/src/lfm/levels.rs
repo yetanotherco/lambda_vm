@@ -604,6 +604,45 @@ pub(crate) fn spawn_validation<'scope, 'env>(
     })
 }
 
+/// The admission validator over `program`, which it OWNS, on a thread of
+/// `scope`'s ([`VALIDATE_LATE_ENV`]): once admitted, the program is let go as
+/// [`release_program`] lets it go (its heights kept), its freed pages handed
+/// back to the OS on that thread, and it comes back with the validator's
+/// seconds; or why it is not admissible.
+pub(crate) fn spawn_validation_owned<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    program: LfmProgram,
+) -> std::thread::ScopedJoinHandle<'scope, Result<(f64, LfmProgram), String>> {
+    spawn_validation_owned_with(scope, program, super::validator::validate)
+}
+
+/// [`spawn_validation_owned`] with the check `check` (the validator; a test's
+/// own to reach the refusal and panic paths).
+pub(crate) fn spawn_validation_owned_with<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    mut program: LfmProgram,
+    check: fn(&LfmProgram) -> Result<(), super::validator::LfmViolation>,
+) -> std::thread::ScopedJoinHandle<'scope, Result<(f64, LfmProgram), String>> {
+    scope.spawn(move || {
+        let t = std::time::Instant::now();
+        check(&program).map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
+        let secs = t.elapsed().as_secs_f64();
+        release_program_data(&mut program);
+        let _ = crate::alloc_purge::purge_now();
+        Ok((secs, program))
+    })
+}
+
+/// [`spawn_validation_owned`]'s verdict: its seconds and the released
+/// program, or the refusal (a panic on its thread is one).
+pub(crate) fn joined_validation_owned(
+    handle: std::thread::ScopedJoinHandle<'_, Result<(f64, LfmProgram), String>>,
+) -> Result<(f64, LfmProgram), String> {
+    handle
+        .join()
+        .map_err(|_| "level 1's validator panicked".to_string())?
+}
+
 /// [`spawn_validation`]'s verdict: its seconds, or the refusal.
 pub(crate) fn joined_validation(
     handle: std::thread::ScopedJoinHandle<'_, Result<f64, String>>,
@@ -881,6 +920,12 @@ impl Drop for BudgetRelease {
 /// filled traces, never the program; the heights stay.
 fn release_program(p: &mut LfmProgram, sizes: &mut Vec<(usize, usize)>) {
     sizes.push((p.instrs.len(), p.groups.b3l.real_rows));
+    release_program_data(p);
+}
+
+/// [`release_program`]'s letting go, without counting: the instructions and the
+/// instruction columns' data; the heights stay.
+fn release_program_data(p: &mut LfmProgram) {
     p.instrs = Vec::new();
     let g = &mut p.groups;
     for group in [
@@ -2009,7 +2054,8 @@ pub fn prove_block_levels(
         };
         // Under the knob, the program goes to the admission validator, on a
         // thread of its own beside level 1's prove, which lets it go once
-        // checked; otherwise it is let go here.
+        // checked (its pages back to the OS on that thread) and hands it back
+        // at the join; otherwise it is let go here.
         let late_check = if validate_late_on {
             let p = &levels[0].program;
             times.sizes.push((p.instrs.len(), p.groups.b3l.real_rows));
@@ -2017,14 +2063,7 @@ pub fn prove_block_levels(
                 &mut levels[0].program,
                 super::compiler::compile(super::builder::LfmBuilder::new().finish()),
             );
-            Some(scope.spawn(move || -> Result<f64, String> {
-                let t = std::time::Instant::now();
-                super::validator::validate(&program)
-                    .map_err(|e| format!("level 1's program is not admissible: {e:?}"))?;
-                let secs = t.elapsed().as_secs_f64();
-                drop(program);
-                Ok(secs)
-            }))
+            Some(spawn_validation_owned(scope, program))
         } else {
             release_program(&mut levels[0].program, &mut times.sizes);
             None
@@ -2102,9 +2141,10 @@ pub fn prove_block_levels(
         drop(piece_tx);
         // No proof leaves before the program it proves has passed admission.
         if let Some(handle) = late_check {
-            let secs = handle
-                .join()
-                .map_err(|_| "level 1's validator panicked".to_string())??;
+            // The released program back in its level: the run holds the same
+            // program (its heights) whichever the knob.
+            let (secs, program) = joined_validation_owned(handle)?;
+            levels[0].program = program;
             times.validated_late = Some((secs, now()));
         }
         proofs.push(proved?);
