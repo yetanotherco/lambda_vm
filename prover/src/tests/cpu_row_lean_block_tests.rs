@@ -49,7 +49,7 @@ const PROGRAMS: [&str; 7] = [
     "test_ecrec",
 ];
 
-/// ★ A block proved under the lean row verifies under it, and a block proved
+/// A block proved under the lean row verifies under it, and a block proved
 /// under either row is refused under the other: the two rows' AIRs, DECODE's
 /// columns and statement tags differ, and a verifier takes its row from its
 /// own format, never from the proof.

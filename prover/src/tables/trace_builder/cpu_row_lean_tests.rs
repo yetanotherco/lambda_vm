@@ -1,4 +1,4 @@
-//! ★ The lean CPU row ([`CpuRowForm::Lean`]) on the windowed builder's
+//! The lean CPU row ([`CpuRowForm::Lean`]) on the windowed builder's
 //! traces, with no proof: every bus the tables close among themselves balances
 //! under it, DECODE's included, and each check it rests on refuses the forgery
 //! it is there for, beside a control mutant without that check that lets the
@@ -197,7 +197,7 @@ fn set(t: &mut Table, row: usize, col: usize, value: FE) {
     t.main_table.set(row, col, value);
 }
 
-/// ★ Completeness, and the control for every forgery below: under each form
+/// Completeness, and the control for every forgery below: under each form
 /// every inner bus balances on each program's build — the lean row's DECODE
 /// with its byte elements, BITWISE without the byte checks the lean rows no
 /// longer send, `MemoryOp` with the ECALLs on it — and under the lean row
@@ -397,14 +397,14 @@ fn the_lean_row_sends_twenty_and_every_syscall_chip_takes_the_tag() {
     );
 }
 
-/// ★ F7, the tag: no memory receiver's flags element reaches 32 under any
+/// The tag: no memory receiver's flags element reaches 32 under any
 /// assignment of its flag bits (LOAD, STORE, MEM_LOAD, MEM_STORE and the six
 /// word families, so every memory format's), so a syscall chip's tagged
 /// receive never matches a load or a store, nor a dispatch of a memory row a
 /// syscall chip's. The control: without the tag a memory receiver's flags do
 /// reach the ECALL's untagged 0 (an LBU), the collision the tag rules out.
 #[test]
-fn f7_no_memory_receiver_reaches_the_ecall_tag() {
+fn no_memory_receiver_reaches_the_ecall_tag() {
     let options = ProofOptions::default_test_options();
     use crate::test_utils as tu;
     let receivers: Vec<(&str, Vec<BusInteraction>)> = vec![
@@ -565,7 +565,7 @@ fn shift(
     set(table, row, col_down, b);
 }
 
-/// The control mutant of F1–F4: the lean row with today's packed DECODE
+/// The control mutant of the decode-byte forgeries: the lean row with today's packed DECODE
 /// element in place of its split one, on DECODE's receiver and on the CPU's
 /// and CPU32's sends — the lean row without the change that replaced the byte
 /// checks. Every other interaction is the lean row's.
@@ -602,15 +602,14 @@ fn packed_decode_mutant(name: &str, list: &[BusInteraction]) -> Option<Vec<BusIn
     )
 }
 
-/// ★ F1–F4, the decode bytes: a byte raised by one and paid for by another
-/// field (the packed element unchanged), on a row where the payer is unused —
-/// rd paid by rs2 on an ADDI (F1), rs1 paid by rd on a store (F2), rd paid by
-/// alu_flags on an ADDI (F3), and a word row's half length paid by rd on
-/// CPU32 (F4). The lean row's DECODE refuses each; its control mutant with
+/// The decode bytes: a byte raised by one and paid for by another field (the
+/// packed element unchanged), on a row where the payer is unused — rd paid by
+/// rs2 on an ADDI, rs1 paid by rd on a store, rd paid by alu_flags on an ADDI,
+/// and a word row's half length paid by rd on CPU32. The lean row's DECODE refuses each; its control mutant with
 /// today's packed element takes each on DECODE's bus, and today's row refuses
 /// each on its byte checks alone.
 #[test]
-fn f1_to_f4_a_byte_moved_between_decode_fields_is_refused() {
+fn a_byte_moved_between_decode_fields_is_refused() {
     use crate::tables::types::packed_decode_shrunk as pd;
     fn addi(t: &Table, r: usize) -> bool {
         get(t, r, cpu_cols::ADD) == 1
@@ -632,13 +631,13 @@ fn f1_to_f4_a_byte_moved_between_decode_fields_is_refused() {
         let (t, row) = cpu_row(traces, pick);
         shift(&mut traces.cpus[t], row, up, down);
     }
-    fn f1(tr: &mut Traces) {
+    fn rd_paid_by_rs2(tr: &mut Traces) {
         on_cpu(tr, &addi, (cpu_cols::RD, pd::RD), (cpu_cols::RS2, pd::RS2));
     }
-    fn f2(tr: &mut Traces) {
+    fn rs1_paid_by_rd(tr: &mut Traces) {
         on_cpu(tr, &store, (cpu_cols::RS1, pd::RS1), (cpu_cols::RD, pd::RD));
     }
-    fn f3(tr: &mut Traces) {
+    fn rd_paid_by_alu_flags(tr: &mut Traces) {
         on_cpu(
             tr,
             &addi,
@@ -646,7 +645,7 @@ fn f1_to_f4_a_byte_moved_between_decode_fields_is_refused() {
             (cpu_cols::ALU_FLAGS, pd::ALU_FLAGS),
         );
     }
-    fn f4(tr: &mut Traces) {
+    fn half_length_paid_by_rd(tr: &mut Traces) {
         let (t, row) = tr
             .cpu32s
             .iter()
@@ -665,10 +664,18 @@ fn f1_to_f4_a_byte_moved_between_decode_fields_is_refused() {
         );
     }
     let cases: [Case<'_>; 4] = [
-        ("F1 rd paid by rs2", "all_instructions_64", f1),
-        ("F2 rs1 paid by rd", "all_loadstore_32", f2),
-        ("F3 rd paid by alu_flags", "all_instructions_64", f3),
-        ("F4 half length paid by rd", "test_wsuffix_64bit", f4),
+        ("rd paid by rs2", "all_instructions_64", rd_paid_by_rs2),
+        ("rs1 paid by rd", "all_loadstore_32", rs1_paid_by_rd),
+        (
+            "rd paid by alu_flags",
+            "all_instructions_64",
+            rd_paid_by_alu_flags,
+        ),
+        (
+            "half length paid by rd",
+            "test_wsuffix_64bit",
+            half_length_paid_by_rd,
+        ),
     ];
     let decode = u64::from(BusId::Decode);
     let bytes = u64::from(BusId::AreBytes);
@@ -744,13 +751,13 @@ fn ecall_row(name: &str) -> Vec<FE> {
         .collect()
 }
 
-/// ★ F8, the syscall number: an ECALL row whose `res` (and `rvd = res`) is
+/// The syscall number: an ECALL row whose `res` (and `rvd = res`) is
 /// another number than `a7` (`rv1`), so another syscall chip would take its
 /// dispatch. Under the lean row the ECALL's entry sets ADD, and the ADD fast
 /// path's pair refuses it; the control mutant, the same row without the ADD
 /// flag (today's ECALL entry), satisfies every lean constraint.
 #[test]
-fn f8_an_ecall_rows_dispatch_carries_a7() {
+fn an_ecall_rows_dispatch_carries_a7() {
     use crate::constraints::cpu::CpuLeanConstraints;
     let honest = ecall_row("test_commit_4");
     assert_eq!(
@@ -785,10 +792,10 @@ fn f8_an_ecall_rows_dispatch_carries_a7() {
     );
 }
 
-/// ★ F9, the dispatch's multiplicity: MEMORY and ECALL both set on one row
+/// The dispatch's multiplicity: MEMORY and ECALL both set on one row
 /// (multiplicity 2). The lean constraints refuse it at `MEMORY·ECALL`.
 #[test]
-fn f9_memory_and_ecall_on_one_row_is_refused() {
+fn memory_and_ecall_on_one_row_is_refused() {
     use crate::constraints::cpu::{CpuLeanConstraints, NUM_CPU_CONSTRAINTS};
     let mut forged = ecall_row("test_commit_4");
     forged[cpu_cols::MEMORY] = FE::one();
