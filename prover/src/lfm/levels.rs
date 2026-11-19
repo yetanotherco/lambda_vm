@@ -518,6 +518,25 @@ fn beside_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
+/// `LAMBDA_VM_LEVELS_AFTER_BASE=1`: a measurement's control. Level 1's thread
+/// waits for the base's end before it plans, walks, compiles, executes or
+/// prepares anything, so nothing of level 1 runs beside the base's phase B
+/// (the base's statement and pieces queue for it meanwhile). The base, the
+/// levels and their proofs are the same; only when level 1's work runs
+/// moves. Off by default (and for any word but `1`); read once a process,
+/// printed once a process.
+pub const AFTER_BASE_ENV: &str = "LAMBDA_VM_LEVELS_AFTER_BASE";
+
+/// Whether [`AFTER_BASE_ENV`] is on.
+pub fn after_base() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = super::wlfm_knobs::knob_word_on(std::env::var(AFTER_BASE_ENV).ok().as_deref());
+        eprintln!("LEVELS AFTER BASE: {on}");
+        on
+    })
+}
+
 /// [`prepare_level`] as the driver runs it beside the base: on the beside pool
 /// under [`beside_nice`], on the prover's pool otherwise. The same prebuild.
 pub(crate) fn prepare_level_beside(
@@ -1510,6 +1529,9 @@ pub fn prove_block_levels(
         && super::b3l_tables::fill_hold() == super::b3l_tables::B3lHold::Records;
     let base_end: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     let base_end_ref = &base_end;
+    // A measurement's control (`AFTER_BASE_ENV`): level 1 starts once the base
+    // has ended, so nothing of it runs beside the base's phase B.
+    let after_base = after_base();
     // Level 1's program, emitted by its thread and read by the builder's.
     let program_cell: std::sync::OnceLock<LfmProgram> = std::sync::OnceLock::new();
     let program_ref = &program_cell;
@@ -1531,6 +1553,9 @@ pub fn prove_block_levels(
         // landed as soon as phase B has finished its groups.
         let level1 = scope.spawn(move || -> Result<Level1, String> {
             let (statement, roots) = srx.recv().map_err(|_| "the prover never stated")?;
+            while after_base && base_end_ref.get().is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             let plan = level_plan(
                 elf_ref,
                 opts_ref,

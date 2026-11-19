@@ -2000,6 +2000,52 @@ pub(crate) fn phase_b_sched_from_env() -> bool {
     phase_b_sched_from(std::env::var("LAMBDA_VM_BLOCK_SCHEDSTAT").ok().as_deref())
 }
 
+/// The process's own counters (`/proc/self/stat`, `/proc/self/status`):
+/// faults, CPU seconds and context switches, summed over its threads. A
+/// measurement under [`phase_b_sched_from_env`], never a byte of a proof.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcSample {
+    pub minor_faults: u64,
+    pub major_faults: u64,
+    pub user: f64,
+    pub system: f64,
+    pub voluntary: u64,
+    pub involuntary: u64,
+}
+
+impl ProcSample {
+    /// Now (Linux; `None` elsewhere or on a parse miss).
+    pub fn now() -> Option<Self> {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        Self::parse(&stat, &status)
+    }
+
+    /// From the two files' texts. `sysconf(_SC_CLK_TCK)` is 100 on the boxes'
+    /// Linux.
+    pub fn parse(stat: &str, status: &str) -> Option<Self> {
+        // The fields after the command's closing parenthesis, from field 3 on.
+        let rest = stat.get(stat.rfind(')')? + 2..)?;
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let num = |k: usize| f.get(k - 3)?.parse::<u64>().ok();
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        let tick = 100.0;
+        Some(Self {
+            minor_faults: num(10)?,
+            major_faults: num(12)?,
+            user: num(14)? as f64 / tick,
+            system: num(15)? as f64 / tick,
+            voluntary: field("voluntary_ctxt_switches:")?,
+            involuntary: field("nonvoluntary_ctxt_switches:")?,
+        })
+    }
+}
+
 /// [`phase_b_sched_from_env`]'s reading: `1` on, anything else off.
 pub(crate) fn phase_b_sched_from(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
@@ -2683,6 +2729,11 @@ pub struct BlockStamps {
     /// Phase B stamped its driver thread's schedstat a group turn
     /// ([`phase_b_sched_from_env`]; each group's [`GroupStamps::sched_b`]).
     pub phase_b_sched: bool,
+    /// Under [`phase_b_sched_from_env`], the process's counters at phase B's
+    /// start and end ([`ProcSample`]): what the whole process (the base and
+    /// anything beside it) faulted, spent in the kernel and switched while
+    /// phase B ran.
+    pub phase_b_proc: Option<(ProcSample, ProcSample)>,
     /// The page-locked pool at phase A's end, when it is asked for
     /// ([`multilinear::pinned`]).
     pub pinned: Option<multilinear::pinned::Stats>,
@@ -3475,6 +3526,19 @@ impl BlockStamps {
         out.push_str(&self.overlap_line());
         if self.phase_b_sched {
             out.push_str(&self.sched_line());
+            out.push_str(&match self.phase_b_proc {
+                Some((a, b)) => format!(
+                    "BLOCK PHASE-B PROC: minor faults {} · major faults {} · user {:.2}s · system {:.2}s · \
+                     voluntary switches {} · involuntary switches {} (the whole process, phase B's span)\n",
+                    b.minor_faults.saturating_sub(a.minor_faults),
+                    b.major_faults.saturating_sub(a.major_faults),
+                    b.user - a.user,
+                    b.system - a.system,
+                    b.voluntary.saturating_sub(a.voluntary),
+                    b.involuntary.saturating_sub(a.involuntary),
+                ),
+                None => "BLOCK PHASE-B PROC: unavailable (/proc/self did not read)\n".to_string(),
+            });
         }
         // Phase A's ledger and its upload: what each group's upload took, what
         // the committer paid of it, and what the commit promised beside it.
@@ -9796,6 +9860,7 @@ fn prove_streamed(
         stamps.phase_b_pinned = options.phase_b_overlap == multilinear_block::PhaseBOverlap::Pinned;
         let phase_b_sched = phase_b_sched_from_env();
         stamps.phase_b_sched = phase_b_sched;
+        let proc_before = phase_b_sched.then(ProcSample::now).flatten();
         let readbacks_before = multilinear::gpu::background_readbacks();
         // The recursion's lead (the early leaf first): once the tree offers its
         // leaves, the groups of the one phase B can finish soonest go next.
@@ -9848,6 +9913,7 @@ fn prove_streamed(
         };
         stamps.phase_b_order = order.clone();
         stamps.phase_b_unix = Some((phase_b_unix, stark::prove_split::epoch_secs()));
+        stamps.phase_b_proc = proc_before.zip(phase_b_sched.then(ProcSample::now).flatten());
         let readbacks_after = multilinear::gpu::background_readbacks();
         stamps.background_readbacks = (
             readbacks_after.0 - readbacks_before.0,
@@ -13598,5 +13664,25 @@ mod close_before_bitwise_tests {
         assert!(!past_budget(&[small], small, cap, 8).expect("a layout"));
         assert!(past_budget(&[small], bitwise, cap, 8).expect("a layout"));
         assert!(past_budget(&[small, small], small, cap, 1).expect("a layout"));
+    }
+}
+
+#[cfg(test)]
+mod proc_sample_tests {
+    use super::ProcSample;
+
+    /// The process counters read from `/proc/self/stat` and `/proc/self/status`
+    /// texts: a command name with spaces and parentheses, the faults, the CPU
+    /// ticks and the switch counts; a short or unparsable text reads `None`.
+    #[test]
+    fn a_proc_sample_reads_its_fields() {
+        let stat = "4242 (cargo (test) x) S 1 2 3 4 5 6 700 8 9 10 1234 56 0 0 20 0 1 0";
+        let status = "Name:\tx\nvoluntary_ctxt_switches:\t77\nnonvoluntary_ctxt_switches:\t5\n";
+        let s = ProcSample::parse(stat, status).expect("parses");
+        assert_eq!((s.minor_faults, s.major_faults), (700, 9));
+        assert!((s.user - 12.34).abs() < 1e-9 && (s.system - 0.56).abs() < 1e-9);
+        assert_eq!((s.voluntary, s.involuntary), (77, 5));
+        assert!(ProcSample::parse("4242 (x) S 1 2", status).is_none());
+        assert!(ProcSample::parse(stat, "Name:\tx\n").is_none());
     }
 }
