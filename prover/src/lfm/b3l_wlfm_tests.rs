@@ -756,6 +756,17 @@ fn pieces_are_the_arena(
     assert!(joined == whole, "{what}: the pieces are the arena");
     let (marked, marks) = wlfm_leg_program_marked(child).expect("the marked leg");
     let plain = wlfm_leg_program(child).expect("the leg");
+    // The prover's marked leg (what the driver's next level is built from) is
+    // the verifier's admitted leg byte for byte: instructions, schema and every
+    // instruction column's values.
+    let admitted = super::wlfm_leg::wlfm_leg_program_admitted(child)
+        .expect("the admitted leg")
+        .into_program();
+    for (whom, other) in [("the leg", &plain), ("the admitted leg", &admitted)] {
+        if let Some(d) = marked.first_difference(other) {
+            panic!("{what}: the marked leg differs from {whom} in {d}");
+        }
+    }
     assert_eq!(
         marked.instrs.len(),
         plain.instrs.len(),
