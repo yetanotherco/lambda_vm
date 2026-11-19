@@ -5,6 +5,9 @@
 //! verifier refuses the other's proof; today's proof archives as it did
 //! before the local field; and the frame refuses LOCAL_BYTES tables out of
 //! place or at another height.
+//!
+//! Every test that proves a block is `#[ignore]`d (box tier): run them with
+//! `--ignored --test-threads=1`, which shares one proof per format.
 
 use crate::block_whir::{
     self, BlockFormat, BlockWhirProof, Deviations, LocalArgues, b3_base_local_setting,
@@ -125,12 +128,13 @@ fn the_tag_names_local_lookups() {
     assert_eq!(&with[..without.len()], &without[..]);
 }
 
-/// ★ A block with KECCAK_RND proves and verifies under local lookups: each
+/// A block with KECCAK_RND proves and verifies under local lookups: each
 /// group with a KECCAK_RND table ends with its LOCAL_BYTES table, the `j`-th
 /// such group with table `N + j`, at 2^16 rows, and carries a non-empty
 /// local argue; every other group an empty one. BITWISE no longer counts
 /// KECCAK_RND's rounds, or the global bus would not balance.
 #[test]
+#[ignore = "proves a real block: box tier, run with --ignored --test-threads=1"]
 fn a_block_with_local_lookups_proves_and_verifies() {
     let elf = elf();
     let proof = prove_local(&elf);
@@ -177,10 +181,11 @@ fn a_block_with_local_lookups_proves_and_verifies() {
     );
 }
 
-/// ★ Format confusion both ways: today's verifier refuses a local proof (as
+/// Format confusion both ways: today's verifier refuses a local proof (as
 /// today's type, and carrying local argues), and the local verifier refuses
 /// today's proof.
 #[test]
+#[ignore = "proves a real block: box tier, run with --ignored --test-threads=1"]
 fn each_formats_verifier_refuses_the_others_proof() {
     let elf = elf();
     let local_proof = prove_local(&elf);
@@ -227,9 +232,10 @@ struct BeforeLocal {
     word_memory: [u64; 7],
 }
 
-/// ★ Today's proof (`local: ()`) archives byte for byte as the proof before
+/// Today's proof (`local: ()`) archives byte for byte as the proof before
 /// the local field did.
 #[test]
+#[ignore = "proves a real block: box tier, run with --ignored --test-threads=1"]
 fn todays_proof_archives_as_before_the_local_field() {
     let elf = elf();
     let todays = prove_lean(&elf);
@@ -257,6 +263,7 @@ fn todays_proof_archives_as_before_the_local_field() {
 /// with no local sender, one at another height, and a LOCAL_BYTES too many
 /// or too few.
 #[test]
+#[ignore = "proves a real block: box tier, run with --ignored --test-threads=1"]
 fn the_frame_refuses_local_bytes_out_of_place() {
     let elf = elf();
     let honest = prove_local(&elf);
@@ -347,6 +354,7 @@ fn the_frame_refuses_local_bytes_out_of_place() {
 /// The recursion's plan refuses a base under local lookups (its leaf
 /// verifies no local argue).
 #[test]
+#[ignore = "proves a real block: box tier, run with --ignored --test-threads=1"]
 fn the_recursion_refuses_a_base_under_local_lookups() {
     let elf = elf();
     let proof = prove_local(&elf);
