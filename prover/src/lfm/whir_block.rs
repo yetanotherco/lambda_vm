@@ -988,6 +988,14 @@ impl WhirBlockPlan {
         share_inverse: bool,
         wrap_hash: super::edsl::WrapHash,
     ) -> Result<Self, String> {
+        // The leaves verify today's CPU row: the lean row's DECODE byte
+        // columns and its tagged memory dispatch have no plan here yet.
+        if format.cpu_row != crate::tables::cpu::CpuRowForm::Full {
+            return Err(format!(
+                "the recursion verifies today's CPU row alone, not {:?}",
+                format.cpu_row
+            ));
+        }
         let base = &format.zf.base;
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;

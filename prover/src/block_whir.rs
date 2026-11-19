@@ -360,6 +360,14 @@ pub struct BlockFormat {
     /// verifier). The block's tables, so its buses and the recursion's
     /// programs, follow it.
     pub memory: crate::tables::fused_memory::MemoryFormat,
+    /// Which lookups the CPU row sends
+    /// ([`CpuRowForm`](crate::tables::cpu::CpuRowForm)): today's 24
+    /// ([`Full`](crate::tables::cpu::CpuRowForm::Full), every preset's), or 20
+    /// with the decode bytes as DECODE elements and MEMORY + ECALL on one bus
+    /// ([`Lean`](crate::tables::cpu::CpuRowForm::Lean), a variant a caller
+    /// names). The CPU, DECODE, CPU32 and the syscall chips, so their buses and
+    /// GKR trees, follow it, and the statement tag names it (`/Rl`).
+    pub cpu_row: crate::tables::cpu::CpuRowForm,
 }
 
 /// The most groups a block statement may declare: a verifier constant, never in
@@ -773,6 +781,11 @@ pub fn block_format_tag(format: &BlockFormat) -> Vec<u8> {
         tag.extend_from_slice(format!("/G{}", format.group_polys).as_bytes());
         tag.extend_from_slice(format.b3_rounds.tag_word().as_bytes());
     }
+    // The lean CPU row names itself; today's row adds nothing, so its tags are
+    // the ones before the form existed.
+    if format.cpu_row == crate::tables::cpu::CpuRowForm::Lean {
+        tag.extend_from_slice(b"/Rl");
+    }
     tag
 }
 
@@ -832,6 +845,7 @@ impl BlockFormat {
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
             registers: crate::tables::register::RegisterFormat::InRow,
             memory: crate::tables::fused_memory::MemoryFormat::Fused,
+            cpu_row: crate::tables::cpu::CpuRowForm::Full,
         }
     }
 
@@ -873,6 +887,7 @@ impl BlockFormat {
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
             registers: crate::tables::register::RegisterFormat::InRow,
             memory: crate::tables::fused_memory::MemoryFormat::Split,
+            cpu_row: crate::tables::cpu::CpuRowForm::Full,
         }
     }
 
@@ -884,6 +899,13 @@ impl BlockFormat {
             group,
             ..Self::pinned()
         }
+    }
+
+    /// This format with the CPU row's lookups in `cpu_row`'s form: a named
+    /// constant the prover and the verifier of one block both take, never read
+    /// from a proof.
+    pub fn with_cpu_row(self, cpu_row: crate::tables::cpu::CpuRowForm) -> Self {
+        Self { cpu_row, ..self }
     }
 
     /// This format with KECCAK_RND's byte checks as `keccak_rnd` sends them:
@@ -5530,6 +5552,13 @@ fn prove_block_whir_body(
             format.memory
         )));
     }
+    // And the CPU row in today's form alone.
+    if format.cpu_row != crate::tables::cpu::CpuRowForm::Full {
+        return Err(Error::Prover(format!(
+            "the {:?} CPU row needs the windowed build (`window_log2`)",
+            format.cpu_row
+        )));
+    }
 
     let t = Instant::now();
     let result = Executor::new(&program, private_inputs.to_vec())
@@ -5739,6 +5768,13 @@ pub(crate) fn prove_traces(
     if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
         airs.with_word_memory(proof_options, words, &traces.page_configs)?;
     }
+    airs.with_cpu_row(
+        proof_options,
+        format.cpu_row,
+        format.registers,
+        format.memory,
+        &inputs,
+    );
 
     let prepared_columns = prepared_tables(&airs, &traces.page_configs, format)?;
     let pairs = airs.air_trace_pairs(traces);
@@ -5986,6 +6022,10 @@ struct StreamAirs {
     /// with the residual register table's, as [`crate::block_airs`] builds
     /// them for the verifier.
     registers: crate::tables::register::RegisterFormat,
+    /// The CPU row's form ([`BlockFormat::cpu_row`]): a CPU chunk is laid out
+    /// with its AIR, as [`crate::VmAirs::with_cpu_row`] builds it for the
+    /// verifier.
+    cpu_row: crate::tables::cpu::CpuRowForm,
     opts: ProofOptions,
     memw_register: crate::VmAir,
     memw_aligned: crate::VmAir,
@@ -6016,6 +6056,7 @@ impl StreamAirs {
         keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
         registers: crate::tables::register::RegisterFormat,
+        cpu_row: crate::tables::cpu::CpuRowForm,
     ) -> Self {
         use crate::tables::register::RegisterFormat;
         use crate::test_utils::*;
@@ -6028,6 +6069,7 @@ impl StreamAirs {
                 .collect(),
             cpu_rows,
             registers,
+            cpu_row,
             opts: opts.clone(),
             memw_register: match registers {
                 RegisterFormat::Tokens32 => Box::new(create_memw_register_air(opts)),
@@ -6071,26 +6113,14 @@ impl StreamAirs {
         Ok(page[index % CPU_AIR_PAGE]
             .get_or_init(|| {
                 let ts_base = crate::tables::cpu::TIMESTAMP_STRIDE * (index * self.cpu_rows) as u64;
-                let opts = &self.opts;
-                let name = format!("CPU[{index}]");
-                let commitment = crate::tables::cpu::lazy_timestamp_commitment(opts, height);
-                let columns: std::sync::Arc<
-                    dyn Fn() -> Vec<Vec<crate::tables::types::FE>> + Send + Sync,
-                > = std::sync::Arc::new(move || vec![crate::tables::cpu::timestamp_column(height)]);
-                let cols = crate::tables::cpu::NUM_PRECOMPUTED_COLS;
-                match self.registers {
-                    crate::tables::register::RegisterFormat::Tokens32 => Box::new(
-                        crate::test_utils::create_cpu_air(opts, ts_base)
-                            .with_name(&name)
-                            .with_lazy_preprocessed_columns(commitment, cols, columns),
-                    )
-                        as crate::VmAir,
-                    crate::tables::register::RegisterFormat::InRow => Box::new(
-                        crate::test_utils::create_cpu_air_inrow(opts, ts_base)
-                            .with_name(&name)
-                            .with_lazy_preprocessed_columns(commitment, cols, columns),
-                    ),
-                }
+                crate::cpu_air_under(
+                    &self.opts,
+                    ts_base,
+                    height,
+                    index,
+                    self.registers,
+                    self.cpu_row,
+                )
             })
             .as_ref())
     }
@@ -6974,6 +7004,13 @@ fn lay_out_rest<'a>(
         if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
             built = airs.with_word_memory(opts, words, &traces.page_configs);
         }
+        airs.with_cpu_row(
+            opts,
+            format.cpu_row,
+            format.registers,
+            format.memory,
+            &inputs,
+        );
         airs
     });
     built?;
@@ -7209,6 +7246,7 @@ fn lay_out_rest_streamed<'a>(
     memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder,
     registers: crate::tables::register::RegisterFormat,
     memory: crate::tables::fused_memory::MemoryFormat,
+    cpu_row: crate::tables::cpu::CpuRowForm,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
@@ -7252,6 +7290,7 @@ fn lay_out_rest_streamed<'a>(
             if memory == crate::tables::fused_memory::MemoryFormat::Words {
                 built = airs.with_word_memory(opts, words, &header.page_configs);
             }
+            airs.with_cpu_row(opts, cpu_row, registers, memory, &inputs);
             airs
         });
         built?;
@@ -7561,6 +7600,7 @@ fn prove_streamed(
         format.keccak_rnd,
         format.memw_aligned,
         format.registers,
+        format.cpu_row,
     );
     // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
     // it — its chunks generated packed. The disk store's knob, which used to
@@ -8107,7 +8147,8 @@ fn prove_streamed(
                     ledger.thread("builder");
                 }
                 let mut builder =
-                    WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
+                    WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?
+                        .cpu_row_form(format.cpu_row)?;
                 if stream_keccak_rnd {
                     // Checked above: KECCAK_RND is cut into its tables.
                     builder = builder.keccak_rnd_chunks(1usize << options.keccak_rnd_rows_log2)?;
@@ -8459,6 +8500,7 @@ fn prove_streamed(
                                     order: format.memw_aligned,
                                     registers: format.registers,
                                     memory: format.memory,
+                                    cpu_row: format.cpu_row,
                                     faults: deviations.regen_faults,
                                     policy: deviations.regen_windows.map_or_else(
                                         regen::ahead_policy,
@@ -8663,6 +8705,7 @@ fn prove_streamed(
                         format.memw_aligned,
                         format.registers,
                         format.memory,
+                        format.cpu_row,
                     ),
                 };
                 let (streamed, rest) = if inline {
@@ -8988,6 +9031,7 @@ fn prove_streamed(
                 format.memw_aligned,
                 format.registers,
                 format.memory,
+                format.cpu_row,
                 deviations.regen_drop_one_op,
             )
         });
@@ -9105,6 +9149,7 @@ fn prove_streamed(
                                 format.memw_aligned,
                                 format.registers,
                                 format.memory,
+                                format.cpu_row,
                                 deviations.regen_faults,
                                 deviations
                                     .regen_windows
@@ -9901,6 +9946,13 @@ pub(crate) fn block_frame(
     if format.memory == crate::tables::fused_memory::MemoryFormat::Words {
         airs.with_word_memory(proof_options, words, &page_configs)?;
     }
+    airs.with_cpu_row(
+        proof_options,
+        format.cpu_row,
+        format.registers,
+        format.memory,
+        &inputs,
+    );
     // The CPU heights were read at `cpu_proof_start`: the tables must be there.
     airs.check_cpu_position(statement.table_counts)?;
     let air_refs = airs.air_refs();
@@ -11922,6 +11974,7 @@ mod packer_tests {
                 format.keccak_rnd,
                 format.memw_aligned,
                 registers,
+                crate::tables::cpu::CpuRowForm::Full,
             );
             for (i, &height) in heights.iter().enumerate() {
                 let laid = stream
@@ -11971,6 +12024,7 @@ mod packer_tests {
             crate::tables::keccak_rnd::KeccakRndForm::Full,
             crate::tables::memw_aligned::MemwAlignedOrder::Lt,
             crate::tables::register::RegisterFormat::Tokens32,
+            crate::tables::cpu::CpuRowForm::Full,
         );
         let air = airs.of(StreamTable::Lt).expect("LT's AIR is the family's");
         // Tables of 4, 8 and 16 rows, in an order that makes uneven groups.
@@ -12858,6 +12912,7 @@ mod rest_airs_probe {
             KeccakRndForm::Lean,
             MemwAlignedOrder::Limbs,
             RegisterFormat::InRow,
+            crate::tables::cpu::CpuRowForm::Full,
         );
         for i in 0..116 {
             stream

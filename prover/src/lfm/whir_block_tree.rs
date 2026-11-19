@@ -421,6 +421,30 @@ pub fn keccak_rnd_setting(knob: Option<&str>) -> Result<KeccakRndForm, String> {
     }
 }
 
+/// `BLOCK_WHIR_CPU_ROW`'s reading: unset or `full` is the pinned preset's row
+/// ([`BlockFormat::pinned`], [`CpuRowForm::Full`](crate::tables::cpu::CpuRowForm::Full));
+/// `lean` names the 20-lookup row
+/// ([`CpuRowForm::Lean`](crate::tables::cpu::CpuRowForm::Lean)). The recursion
+/// verifies today's row alone, so `lean` is taken only by a base-only run
+/// (`base_only`); a format value the prover and the verifier of one proof take.
+pub fn cpu_row_setting(
+    knob: Option<&str>,
+    base_only: bool,
+) -> Result<crate::tables::cpu::CpuRowForm, String> {
+    use crate::tables::cpu::CpuRowForm;
+    match knob.map(str::trim) {
+        None => Ok(BlockFormat::pinned().cpu_row),
+        Some("full") => Ok(CpuRowForm::Full),
+        Some("lean") if base_only => Ok(CpuRowForm::Lean),
+        Some("lean") => Err(
+            "BLOCK_WHIR_CPU_ROW=lean: the recursion takes today's CPU row alone; lean is a \
+             base-only run's"
+                .into(),
+        ),
+        Some(v) => Err(format!("BLOCK_WHIR_CPU_ROW={v}: full or lean")),
+    }
+}
+
 /// `BLOCK_WHIR_MEMW_A`'s reading: unset is the pinned preset's form
 /// ([`BlockFormat::pinned`]), so the harness proves what `verify-block`
 /// verifies; `limbs` names the step's two 16-bit limbs in the row
@@ -542,6 +566,10 @@ impl WhirTreeConfig {
                 std::env::var("BLOCK_WHIR_MEMORY").ok().as_deref(),
                 crate::base_only::declared(),
             )?,
+            cpu_row: cpu_row_setting(
+                std::env::var("BLOCK_WHIR_CPU_ROW").ok().as_deref(),
+                crate::base_only::declared(),
+            )?,
             ..BlockFormat::production_with(group_setting(
                 std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
             )?)
@@ -577,6 +605,14 @@ impl WhirTreeConfig {
                 MemoryFormat::Split => "split",
                 MemoryFormat::Fused => "fused",
                 MemoryFormat::Words => "words",
+            }
+        );
+        eprintln!(
+            "★ BLOCK CPU ROW: {} (BLOCK_WHIR_CPU_ROW; lean sends the decode bytes as DECODE \
+             elements and MEMORY + ECALL on one bus, 20 lookups a row)",
+            match format.cpu_row {
+                crate::tables::cpu::CpuRowForm::Full => "full",
+                crate::tables::cpu::CpuRowForm::Lean => "lean",
             }
         );
         let mut options = BlockOptions::production();
@@ -663,6 +699,7 @@ impl WhirTreeConfig {
             && self.format.keccak_rnd == BlockFormat::pinned().keccak_rnd
             && self.format.memw_aligned == BlockFormat::pinned().memw_aligned
             && self.format.registers == BlockFormat::pinned().registers
+            && self.format.cpu_row == BlockFormat::pinned().cpu_row
     }
 }
 

@@ -1169,6 +1169,7 @@ impl ShadowRun {
         order: MemwAlignedOrder,
         registers: crate::tables::register::RegisterFormat,
         memory: crate::tables::fused_memory::MemoryFormat,
+        cpu_row: crate::tables::cpu::CpuRowForm,
         drop_one_op: Option<StreamTable>,
     ) -> Self {
         let started = Instant::now();
@@ -1193,6 +1194,7 @@ impl ShadowRun {
                     .and_then(|b| b.memw_aligned_order(order))
                     .and_then(|b| b.register_format(registers))
                     .and_then(|b| b.memory_format(memory))
+                    .and_then(|b| b.cpu_row_form(cpu_row))
                 {
                     Ok(builder) => {
                         #[cfg(test)]
@@ -2006,6 +2008,7 @@ impl LiveRun {
         order: MemwAlignedOrder,
         registers: crate::tables::register::RegisterFormat,
         memory: crate::tables::fused_memory::MemoryFormat,
+        cpu_row: crate::tables::cpu::CpuRowForm,
         faults: LiveFaults,
         policy: AheadPolicy,
         gate: Option<Arc<AtomicBool>>,
@@ -2055,6 +2058,7 @@ impl LiveRun {
                     .and_then(|b| b.memw_aligned_order(order))
                     .and_then(|b| b.register_format(registers))
                     .and_then(|b| b.memory_format(memory))
+                    .and_then(|b| b.cpu_row_form(cpu_row))
                     .and_then(|b| if cpu_logs { b.keep_cpu_logs() } else { Ok(b) })
                 {
                     Ok(builder) => {
@@ -2543,6 +2547,8 @@ pub(crate) struct LiveArgs {
     pub(crate) registers: crate::tables::register::RegisterFormat,
     /// The run's memory format (phase A's).
     pub(crate) memory: crate::tables::fused_memory::MemoryFormat,
+    /// The run's CPU row form (phase A's).
+    pub(crate) cpu_row: crate::tables::cpu::CpuRowForm,
     pub(crate) faults: LiveFaults,
     pub(crate) policy: AheadPolicy,
 }
@@ -2652,6 +2658,7 @@ impl EarlyStart {
                                 live.order,
                                 live.registers,
                                 live.memory,
+                                live.cpu_row,
                                 live.faults,
                                 live.policy,
                                 Some(gate),

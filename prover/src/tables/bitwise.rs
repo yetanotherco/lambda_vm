@@ -868,6 +868,20 @@ impl BitwiseHistogram {
         self.counters[idx] += n;
     }
 
+    /// Take `n` occurrences of one lookup back out: `false`, and nothing
+    /// changed, when fewer were counted — a count that would go below zero
+    /// is a lookup that was never counted, which a caller refuses.
+    pub(crate) fn take_n(&mut self, op: BitwiseOperation, n: u64) -> bool {
+        let idx = lookup_type_index(op.lookup_type) * NUM_ROWS + row_index(op.x, op.y, op.z);
+        match self.counters[idx].checked_sub(n) {
+            Some(left) => {
+                self.counters[idx] = left;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The bytes its counters take on the heap.
     pub(crate) fn heap_bytes(&self) -> usize {
         std::mem::size_of_val(&*self.counters)

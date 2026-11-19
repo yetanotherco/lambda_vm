@@ -7836,6 +7836,11 @@ pub struct StreamSkip {
     /// format's): BITWISE counts those and no others. The default is today's
     /// table.
     pub keccak_rnd_form: KeccakRndForm,
+    /// Which lookups the CPU row sends ([`CpuRowForm`](super::cpu::CpuRowForm),
+    /// the block format's): under the lean row DECODE is laid out with its
+    /// byte columns and BITWISE takes back the byte checks the CPU and CPU32
+    /// rows no longer send. The default is today's row.
+    pub cpu_row_form: super::cpu::CpuRowForm,
     /// How MEMW_A proves its timestamp order ([`MemwAlignedOrder`], the block
     /// format's): what the walk routes by and lays each aligned row out in, so
     /// what BITWISE and LT count of it. The default is the per-table STARK's.

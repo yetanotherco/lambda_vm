@@ -377,3 +377,30 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CpuConstraints {
         debug_assert_eq!(idx, NUM_CPU_CONSTRAINTS);
     }
 }
+
+/// The lean CPU row's constraints ([`crate::tables::cpu::CpuRowForm::Lean`]):
+/// [`CpuConstraints`]' 38, then `MEMORY · ECALL = 0` (idx 38, degree 2), so the
+/// merged memory dispatch's multiplicity `MEMORY + ECALL` is a bit on every row
+/// whatever the DECODE table holds ([`NUM_CPU_LEAN_CONSTRAINTS`] = 39).
+///
+/// An ECALL row's `res` needs no constraint of its own here: under the lean row
+/// an ECALL's DECODE entry sets ADD ([`crate::tables::decode::entry_under`]),
+/// and the ADD fast path's `rv1 + arg2 = res` with `arg2 = rv2 + imm = 0` pins
+/// `res` (and so `rvd = res`) to `a7`.
+#[derive(Clone, Copy)]
+pub struct CpuLeanConstraints;
+
+/// [`CpuLeanConstraints`]' count: [`NUM_CPU_CONSTRAINTS`] and one.
+pub const NUM_CPU_LEAN_CONSTRAINTS: usize = NUM_CPU_CONSTRAINTS + 1;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CpuLeanConstraints {
+    fn max_degree(&self) -> usize {
+        3
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        CpuConstraints.eval(b);
+        // idx 38: MEMORY · ECALL = 0.
+        emit_product_zero(b, NUM_CPU_CONSTRAINTS, cols::MEMORY, cols::ECALL);
+    }
+}

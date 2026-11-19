@@ -60,6 +60,7 @@ fn format_at(
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
+        cpu_row: crate::tables::cpu::CpuRowForm::Full,
     }
 }
 
@@ -79,6 +80,7 @@ fn production(group: GroupFold) -> BlockFormat {
         memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Lt,
         registers: crate::tables::register::RegisterFormat::Tokens32,
         memory: crate::tables::fused_memory::MemoryFormat::Split,
+        cpu_row: crate::tables::cpu::CpuRowForm::Full,
     }
 }
 

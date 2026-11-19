@@ -860,6 +860,209 @@ pub fn create_halt_air_inrow(proof_options: &ProofOptions) -> ConcreteVmAir<Empt
     )
 }
 
+/// The CPU AIR under the lean row
+/// ([`crate::tables::cpu::CpuRowForm::Lean`]) and today's 32-bit register
+/// tokens: [`create_cpu_air`]'s columns, the lean interactions, the lean
+/// constraints.
+pub fn create_cpu_air_lean(
+    proof_options: &ProofOptions,
+    ts_base: u64,
+) -> ConcreteVmAir<crate::constraints::cpu::CpuLeanConstraints> {
+    let full_table = crate::tables::cpu::TIMESTAMP_STRIDE * crate::tables::max_rows::CPU as u64;
+    build_air_maybe_cached(
+        cpu_cols::NUM_COLUMNS,
+        crate::tables::cpu::bus_interactions_for(ts_base, crate::tables::cpu::CpuRowForm::Lean),
+        proof_options,
+        1,
+        crate::constraints::cpu::CpuLeanConstraints,
+        &format!("CPU~lean@{ts_base}"),
+        ts_base.is_multiple_of(full_table),
+    )
+}
+
+/// [`create_cpu_air_inrow`] under the lean row: its 42 columns, the lean
+/// in-row interactions (20), the lean constraints.
+pub fn create_cpu_air_inrow_lean(
+    proof_options: &ProofOptions,
+    ts_base: u64,
+) -> ConcreteVmAir<crate::constraints::cpu::CpuLeanConstraints> {
+    let full_table = crate::tables::cpu::TIMESTAMP_STRIDE * crate::tables::max_rows::CPU as u64;
+    build_air_maybe_cached(
+        crate::tables::cpu::inrow_cols::NUM_COLUMNS_INROW,
+        crate::tables::cpu::bus_interactions_inrow_for(
+            ts_base,
+            crate::tables::cpu::CpuRowForm::Lean,
+        ),
+        proof_options,
+        1,
+        crate::constraints::cpu::CpuLeanConstraints,
+        &format!("CPU~inrow~lean@{ts_base}"),
+        ts_base.is_multiple_of(full_table),
+    )
+}
+
+/// The DECODE AIR under the CPU row's `form` ([`crate::tables::decode::lean_cols`]
+/// under the lean row).
+pub fn create_decode_air_for(
+    proof_options: &ProofOptions,
+    form: crate::tables::cpu::CpuRowForm,
+) -> ConcreteVmAir<EmptyConstraints> {
+    if form == crate::tables::cpu::CpuRowForm::Full {
+        return create_decode_air(proof_options);
+    }
+    build_air(
+        crate::tables::decode::num_columns(form),
+        crate::tables::decode::bus_interactions_for(form),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "DECODE~lean",
+    )
+}
+
+/// The CPU32 AIR under the CPU row's `form`.
+pub fn create_cpu32_air_for(
+    proof_options: &ProofOptions,
+    form: crate::tables::cpu::CpuRowForm,
+) -> ConcreteVmAir<Cpu32Constraints> {
+    if form == crate::tables::cpu::CpuRowForm::Full {
+        return create_cpu32_air(proof_options);
+    }
+    build_air(
+        cpu32_cols::NUM_COLUMNS,
+        crate::tables::cpu32::bus_interactions_for(form),
+        proof_options,
+        1,
+        Cpu32Constraints,
+        "CPU32~lean",
+    )
+}
+
+/// A syscall chip's AIR under the CPU row's `form`: `air`'s columns,
+/// constraints and name, its ECALL receiver moved onto `MemoryOp` under the
+/// lean row ([`crate::tables::cpu::receivers_under`]).
+macro_rules! syscall_air_for {
+    ($name:ident, $full:ident, $cols:expr, $interactions:expr, $constraints:expr, $label:expr, $cs:ty) => {
+        #[doc = concat!("[`", stringify!($full), "`] under the CPU row's `form`: its ECALL receiver on `MemoryOp` under the lean row.")]
+        pub fn $name(
+            proof_options: &ProofOptions,
+            form: crate::tables::cpu::CpuRowForm,
+        ) -> ConcreteVmAir<$cs> {
+            if form == crate::tables::cpu::CpuRowForm::Full {
+                return $full(proof_options);
+            }
+            build_air(
+                $cols,
+                crate::tables::cpu::receivers_under(form, $interactions),
+                proof_options,
+                1,
+                $constraints,
+                &format!("{}~lean", $label),
+            )
+        }
+    };
+}
+
+syscall_air_for!(
+    create_halt_air_for,
+    create_halt_air,
+    halt_cols::NUM_COLUMNS,
+    halt_bus_interactions(),
+    EmptyConstraints,
+    "HALT",
+    EmptyConstraints
+);
+syscall_air_for!(
+    create_halt_air_inrow_for,
+    create_halt_air_inrow,
+    halt_cols::NUM_COLUMNS,
+    crate::tables::halt::bus_interactions_inrow(),
+    EmptyConstraints,
+    "HALT~inrow",
+    EmptyConstraints
+);
+syscall_air_for!(
+    create_copy_air_for,
+    create_copy_air,
+    crate::tables::copy::cols::NUM_COLUMNS,
+    crate::tables::copy::bus_interactions(),
+    crate::tables::copy::CopyConstraints,
+    "COPY",
+    crate::tables::copy::CopyConstraints
+);
+syscall_air_for!(
+    create_copy_w_air_for,
+    create_copy_w_air,
+    crate::tables::copy_w::cols::NUM_COLUMNS,
+    crate::tables::copy_w::bus_interactions(),
+    crate::tables::copy_w::CopyWordConstraints,
+    crate::tables::copy_w::NAME,
+    crate::tables::copy_w::CopyWordConstraints
+);
+syscall_air_for!(
+    create_keccak_air_for,
+    create_keccak_air,
+    keccak_cols::NUM_COLUMNS,
+    keccak_bus_interactions(),
+    KeccakConstraints,
+    "KECCAK",
+    KeccakConstraints
+);
+syscall_air_for!(
+    create_keccak_w_air_for,
+    create_keccak_w_air,
+    crate::tables::keccak_w::cols::NUM_COLUMNS,
+    crate::tables::keccak_w::bus_interactions(),
+    crate::tables::keccak_w::KeccakWordConstraints,
+    crate::tables::keccak_w::NAME,
+    crate::tables::keccak_w::KeccakWordConstraints
+);
+syscall_air_for!(
+    create_ecrec_air_for,
+    create_ecrec_air,
+    ecrec_cols::NUM_COLUMNS,
+    ecrec_bus_interactions(),
+    EcrecConstraints,
+    "ECREC",
+    EcrecConstraints
+);
+syscall_air_for!(
+    create_ecrec_w_air_for,
+    create_ecrec_w_air,
+    crate::tables::ecrec_w::cols::NUM_COLUMNS,
+    crate::tables::ecrec_w::bus_interactions(),
+    crate::tables::ecrec_w::EcrecWordConstraints,
+    crate::tables::ecrec_w::NAME,
+    crate::tables::ecrec_w::EcrecWordConstraints
+);
+syscall_air_for!(
+    create_ecsm_air_for,
+    create_ecsm_air,
+    ecsm_cols::NUM_COLUMNS,
+    ecsm_bus_interactions(),
+    EcsmConstraints,
+    "ECSM",
+    EcsmConstraints
+);
+syscall_air_for!(
+    create_hint_air_for,
+    create_hint_air,
+    hint_cols::NUM_COLUMNS,
+    hint_bus_interactions(),
+    HintConstraints,
+    "HINT",
+    HintConstraints
+);
+syscall_air_for!(
+    create_blake3_air_for,
+    create_blake3_air,
+    blake3_cols::NUM_COLUMNS,
+    blake3_bus_interactions(),
+    Blake3Constraints,
+    "BLAKE3",
+    Blake3Constraints
+);
+
 /// Create Bitwise AIR with bus interactions.
 pub fn create_bitwise_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
     build_air(

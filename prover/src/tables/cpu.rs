@@ -59,6 +59,112 @@ pub const NUM_PRECOMPUTED_COLS: usize = 1;
 /// Timestamp slots per CPU row (spec `memory.typ`, granularity aside).
 pub const TIMESTAMP_STRIDE: u64 = 4;
 
+/// Which lookups the CPU row sends: a format value the prover and the verifier
+/// of one block both hold, never read from a proof.
+///
+/// [`Lean`](Self::Lean) makes two changes, 24 interactions → 20 under the in-row
+/// register format:
+/// - **DECODE takes the six decode bytes as tuple elements of their own**
+///   (`rs1`, `rs2`, `rd`, `half_instruction_length`, `alu_flags`, `mem_flags`),
+///   beside the ten flag bits, still packed. DECODE's precomputed byte columns
+///   are bytes by construction, so every row that sends DECODE has its six bytes
+///   range-bound by the lookup itself, and the three `ARE_BYTES` pairs that kept
+///   the packed element unique go. Word rows send no DECODE: there the six
+///   bytes are unread except `half_instruction_length`, which the CPU32 send
+///   carries to CPU32, whose own DECODE lookup binds it (CPU32 drops its five
+///   byte checks the same way).
+/// - **MEMORY and ECALL share the `MemoryOp` bus.** The memory dispatch is sent
+///   at multiplicity `MEMORY + ECALL` (`MEMORY·ECALL = 0` is a constraint), and
+///   its flags element carries the tag `+32·ECALL`. An ECALL's DECODE entry
+///   sets ADD under this form ([`super::decode::entry_under`]), so the ADD fast
+///   path's `rv1 + arg2 = res` pins the row's `res` to `rv1 = a7` (`arg2` is
+///   `rv2 + imm`, both zero on an ECALL), and `rvd = res`. On an ECALL row the
+///   dispatch is `[ts, 0, a7, 0, 0, 32, a7]` (address = `res`, value = `rv2`,
+///   flags = the entry's `mem_flags = 0` plus the tag, result = `rvd`); every
+///   syscall chip receives that tuple ([`ecall_receiver_onto_memory_op`]). No
+///   memory receiver's flags element reaches 32, so the tag keeps the two
+///   classes apart.
+///
+/// [`Full`](Self::Full) is the type's `Default` and every preset's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CpuRowForm {
+    /// Today's row: the packed DECODE element with its three byte-pair checks,
+    /// and ECALL on its own bus.
+    #[default]
+    Full,
+    /// The decode bytes as DECODE elements, and MEMORY + ECALL on one bus.
+    Lean,
+}
+
+impl CpuRowForm {
+    /// Whether the syscall chips receive on `MemoryOp` with the tag.
+    pub const fn ecall_on_memory_op(self) -> bool {
+        matches!(self, Self::Lean)
+    }
+
+    /// Whether DECODE carries the decode bytes as elements of their own.
+    pub const fn decode_bytes_apart(self) -> bool {
+        matches!(self, Self::Lean)
+    }
+}
+
+/// The tag an ECALL's dispatch carries in `MemoryOp`'s flags element under
+/// [`CpuRowForm::Lean`]. Every memory receiver's flags element stays below it
+/// (LOAD's and the word loads' at most 30, the stores' at most 29), and the
+/// syscall chips receive it as a constant.
+pub const ECALL_MEMORY_OP_TAG: u64 = 32;
+
+/// An ECALL receiver `[ts_lo, ts_hi, syscall_lo, syscall_hi]` as the syscall
+/// chips take it under [`CpuRowForm::Lean`]: on `MemoryOp`, the dispatch an
+/// ECALL row sends, `[ts_lo, ts_hi, s_lo, s_hi, 0, 0, 32, s_lo, s_hi]`, at the
+/// same multiplicity. Every other interaction is returned as it is.
+///
+/// # Panics
+/// On an ECALL receiver whose tuple is not four one-element values: every
+/// syscall chip's is, and another shape would mean the CPU's ECALL send changed
+/// under it.
+pub fn ecall_receiver_onto_memory_op(interaction: BusInteraction) -> BusInteraction {
+    if interaction.bus_id != BusId::Ecall as u64 || interaction.is_sender {
+        return interaction;
+    }
+    assert!(
+        interaction.values.iter().all(|v| v.num_bus_elements() == 1),
+        "an ECALL receiver's values are one element each"
+    );
+    let [ts_lo, ts_hi, s_lo, s_hi]: [BusValue; 4] = interaction
+        .values
+        .try_into()
+        .expect("an ECALL receiver is [ts_lo, ts_hi, syscall_lo, syscall_hi]");
+    BusInteraction::receiver(
+        BusId::MemoryOp,
+        interaction.multiplicity,
+        vec![
+            ts_lo,
+            ts_hi,
+            s_lo.clone(),
+            s_hi.clone(),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(ECALL_MEMORY_OP_TAG),
+            s_lo,
+            s_hi,
+        ],
+    )
+}
+
+/// A table's interactions under `form`: the syscall chips' ECALL receivers
+/// onto `MemoryOp` ([`ecall_receiver_onto_memory_op`]) under
+/// [`CpuRowForm::Lean`], unchanged under [`CpuRowForm::Full`].
+pub fn receivers_under(form: CpuRowForm, interactions: Vec<BusInteraction>) -> Vec<BusInteraction> {
+    if !form.ecall_on_memory_op() {
+        return interactions;
+    }
+    interactions
+        .into_iter()
+        .map(ecall_receiver_onto_memory_op)
+        .collect()
+}
+
 /// Maximum number of CPU rows (padding included) in an epoch or a monolithic
 /// proof. The last row's accesses reach `4·N + 2`, which must stay below the
 /// HALT timestamp `2^32 - 1` (spec `streaming.typ`: an epoch should not exceed
@@ -1107,12 +1213,25 @@ fn timestamp_slot(ts_base: u64, offset: i64) -> BusValue {
 /// `rs1 = x255` (AUIPC, JAL) reads the PC's token through slot 1 at `ts`, which
 /// is where `pc_double_read` moves the PC's own consume.
 pub fn bus_interactions_inrow(ts_base: u64) -> Vec<BusInteraction> {
+    bus_interactions_inrow_for(ts_base, CpuRowForm::Full)
+}
+
+/// [`bus_interactions_inrow`] under `form`: 24 interactions under
+/// [`CpuRowForm::Full`], 20 under [`CpuRowForm::Lean`] (its 9 that are not
+/// register or PC tokens, then the same eleven tokens).
+pub fn bus_interactions_inrow_for(ts_base: u64, form: CpuRowForm) -> Vec<BusInteraction> {
     use inrow_cols::*;
-    let mut interactions: Vec<BusInteraction> = bus_interactions(ts_base)
+    let mut interactions: Vec<BusInteraction> = bus_interactions_for(ts_base, form)
         .into_iter()
         .filter(|i| i.bus_id != BusId::Memw as u64 && i.bus_id != BusId::Memory as u64)
         .collect();
-    debug_assert_eq!(interactions.len(), 13);
+    debug_assert_eq!(
+        interactions.len(),
+        match form {
+            CpuRowForm::Full => 13,
+            CpuRowForm::Lean => 9,
+        }
+    );
     let column = |c: usize| BusValue::Packed {
         start_column: c,
         packing: Packing::Direct,
@@ -1204,6 +1323,25 @@ pub fn bus_interactions_inrow(ts_base: u64) -> Vec<BusInteraction> {
 /// Returns the bus interactions for a CPU table whose timestamps start at
 /// `ts_base` (`4·S_k` for table `k`, see [`timestamp_bases`]).
 pub fn bus_interactions(ts_base: u64) -> Vec<BusInteraction> {
+    bus_interactions_for(ts_base, CpuRowForm::Full)
+}
+
+/// The decode bytes in the order DECODE takes them as elements of their own
+/// under [`CpuRowForm::Lean`] (`tables::decode::lean_cols`), as CPU columns.
+pub const DECODE_BYTE_COLUMNS: [usize; 6] = [
+    cols::RS1,
+    cols::RS2,
+    cols::RD,
+    cols::HALF_INSTRUCTION_LENGTH,
+    cols::ALU_FLAGS,
+    cols::MEM_FLAGS,
+];
+
+/// [`bus_interactions`] under `form`: [`CpuRowForm::Full`]'s 24 (today's, in
+/// today's order), or [`CpuRowForm::Lean`]'s 20 — DECODE with the decode bytes
+/// as elements, no `ARE_BYTES` pairs, and the ECALL send folded into the
+/// memory dispatch.
+pub fn bus_interactions_for(ts_base: u64, form: CpuRowForm) -> Vec<BusInteraction> {
     use super::types::packed_decode_shrunk as pd;
 
     let mut interactions = Vec::with_capacity(24);
@@ -1211,37 +1349,52 @@ pub fn bus_interactions(ts_base: u64) -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // DECODE: instruction fetch (mult = 1 - word_instr; word rows go to CPU32).
     // -------------------------------------------------------------------------
+    let flags = vec![
+        pow2_term(pd::READ_REG1, cols::READ_REGISTER1),
+        pow2_term(pd::READ_REG2, cols::READ_REGISTER2),
+        pow2_term(pd::WRITE_REG, cols::WRITE_REGISTER),
+        pow2_term(pd::WORD_INSTR, cols::WORD_INSTR),
+        pow2_term(pd::ALU, cols::ALU),
+        pow2_term(pd::ADD, cols::ADD),
+        pow2_term(pd::SUB, cols::SUB),
+        pow2_term(pd::MEMORY, cols::MEMORY),
+        pow2_term(pd::BRANCH, cols::BRANCH),
+        pow2_term(pd::ECALL, cols::ECALL),
+    ];
+    let mut decode = vec![
+        BusValue::Packed {
+            start_column: cols::PC_0,
+            packing: Packing::DWordWL,
+        },
+        BusValue::Packed {
+            start_column: cols::IMM_0,
+            packing: Packing::DWordWL,
+        },
+    ];
+    if form.decode_bytes_apart() {
+        // The ten flags packed (each IS_BIT, so the element is canonical), then
+        // each byte on its own, equal to DECODE's precomputed byte.
+        decode.push(BusValue::linear(flags));
+        decode.extend(DECODE_BYTE_COLUMNS.iter().map(|&c| BusValue::Packed {
+            start_column: c,
+            packing: Packing::Direct,
+        }));
+    } else {
+        let mut packed = flags;
+        packed.extend([
+            pow2_term(pd::RS1, cols::RS1),
+            pow2_term(pd::RS2, cols::RS2),
+            pow2_term(pd::RD, cols::RD),
+            pow2_term(pd::HALF_INSTRUCTION_LENGTH, cols::HALF_INSTRUCTION_LENGTH),
+            pow2_term(pd::ALU_FLAGS, cols::ALU_FLAGS),
+            pow2_term(pd::MEM_FLAGS, cols::MEM_FLAGS),
+        ]);
+        decode.push(BusValue::linear(packed));
+    }
     interactions.push(BusInteraction::sender(
         BusId::Decode,
         Multiplicity::Negated(cols::WORD_INSTR),
-        vec![
-            BusValue::Packed {
-                start_column: cols::PC_0,
-                packing: Packing::DWordWL,
-            },
-            BusValue::Packed {
-                start_column: cols::IMM_0,
-                packing: Packing::DWordWL,
-            },
-            BusValue::linear(vec![
-                pow2_term(pd::READ_REG1, cols::READ_REGISTER1),
-                pow2_term(pd::READ_REG2, cols::READ_REGISTER2),
-                pow2_term(pd::WRITE_REG, cols::WRITE_REGISTER),
-                pow2_term(pd::WORD_INSTR, cols::WORD_INSTR),
-                pow2_term(pd::ALU, cols::ALU),
-                pow2_term(pd::ADD, cols::ADD),
-                pow2_term(pd::SUB, cols::SUB),
-                pow2_term(pd::MEMORY, cols::MEMORY),
-                pow2_term(pd::BRANCH, cols::BRANCH),
-                pow2_term(pd::ECALL, cols::ECALL),
-                pow2_term(pd::RS1, cols::RS1),
-                pow2_term(pd::RS2, cols::RS2),
-                pow2_term(pd::RD, cols::RD),
-                pow2_term(pd::HALF_INSTRUCTION_LENGTH, cols::HALF_INSTRUCTION_LENGTH),
-                pow2_term(pd::ALU_FLAGS, cols::ALU_FLAGS),
-                pow2_term(pd::MEM_FLAGS, cols::MEM_FLAGS),
-            ]),
-        ],
+        decode,
     ));
 
     // -------------------------------------------------------------------------
@@ -1342,10 +1495,35 @@ pub fn bus_interactions(ts_base: u64) -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // MEMORY: high-level LOAD/STORE dispatch (mult = MEMORY).
     // MEMORY[timestamp, cast(res, WL) = address, rv2, mem_flags] -> rvd.
+    // Under the lean row the ECALL rides it too: mult = MEMORY + ECALL, and the
+    // flags element is `mem_flags + 32·ECALL`.
     // -------------------------------------------------------------------------
+    let (memory_mult, memory_flags) = if form.ecall_on_memory_op() {
+        (
+            Multiplicity::Sum(cols::MEMORY, cols::ECALL),
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::MEM_FLAGS,
+                },
+                LinearTerm::Column {
+                    coefficient: ECALL_MEMORY_OP_TAG as i64,
+                    column: cols::ECALL,
+                },
+            ]),
+        )
+    } else {
+        (
+            Multiplicity::Column(cols::MEMORY),
+            BusValue::Packed {
+                start_column: cols::MEM_FLAGS,
+                packing: Packing::Direct,
+            },
+        )
+    };
     interactions.push(BusInteraction::sender(
         BusId::MemoryOp,
-        Multiplicity::Column(cols::MEMORY),
+        memory_mult,
         vec![
             timestamp_slot(ts_base, 0),
             BusValue::constant(0), // timestamp_hi
@@ -1354,10 +1532,7 @@ pub fn bus_interactions(ts_base: u64) -> Vec<BusInteraction> {
                 start_column: cols::RV2_0,
                 packing: Packing::DWordWL,
             }, // value to store (2 words)
-            BusValue::Packed {
-                start_column: cols::MEM_FLAGS,
-                packing: Packing::Direct,
-            },
+            memory_flags,
             BusValue::Packed {
                 start_column: cols::RVD_0,
                 packing: Packing::DWordWL,
@@ -1478,12 +1653,18 @@ pub fn bus_interactions(ts_base: u64) -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // Range checks: ARE_BYTES (rs1/rs2, rd/half_instruction_length, alu_flags/mem_flags)
     // and IS_HALF on each `res` half. Every row sends (incl. padding: all 0).
+    // The lean row has no ARE_BYTES: DECODE's elements bind the bytes.
     // -------------------------------------------------------------------------
-    for (a, b) in [
-        (cols::RS1, cols::RS2),
-        (cols::RD, cols::HALF_INSTRUCTION_LENGTH),
-        (cols::ALU_FLAGS, cols::MEM_FLAGS),
-    ] {
+    let byte_pairs: &[(usize, usize)] = if form.decode_bytes_apart() {
+        &[]
+    } else {
+        &[
+            (cols::RS1, cols::RS2),
+            (cols::RD, cols::HALF_INSTRUCTION_LENGTH),
+            (cols::ALU_FLAGS, cols::MEM_FLAGS),
+        ]
+    };
+    for &(a, b) in byte_pairs {
         interactions.push(BusInteraction::sender(
             BusId::AreBytes,
             Multiplicity::One,
@@ -1512,20 +1693,22 @@ pub fn bus_interactions(ts_base: u64) -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // ECALL: system-call bus (HALT/COPY/KECCAK/ECSM/HINT receive). mult = ECALL.
-    // ECALL[timestamp, rv1].
+    // ECALL[timestamp, rv1]. The lean row sends it through the memory dispatch.
     // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::Ecall,
-        Multiplicity::Column(cols::ECALL),
-        vec![
-            timestamp_slot(ts_base, 0),
-            BusValue::constant(0),
-            BusValue::Packed {
-                start_column: cols::RV1_0,
-                packing: Packing::DWordWL,
-            },
-        ],
-    ));
+    if !form.ecall_on_memory_op() {
+        interactions.push(BusInteraction::sender(
+            BusId::Ecall,
+            Multiplicity::Column(cols::ECALL),
+            vec![
+                timestamp_slot(ts_base, 0),
+                BusValue::constant(0),
+                BusValue::Packed {
+                    start_column: cols::RV1_0,
+                    packing: Packing::DWordWL,
+                },
+            ],
+        ));
+    }
 
     interactions
 }

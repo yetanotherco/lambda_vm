@@ -185,7 +185,16 @@ pub struct TableCounts {
     /// puts a send on the Ecall bus whose tuple only the BLAKE3 table can match. Omit the
     /// table and that send has no receiver: the global LogUp sum is non-zero,
     /// and `multi_verify` rejects on bus balance before any constraint is
-    /// evaluated. A prover claiming `blake3: 0` for an epoch that used BLAKE3
+    /// evaluated.
+    ///
+    /// Under the lean CPU row (`tables::cpu::CpuRowForm::Lean`) the same
+    /// argument runs on [`tables::types::BusId::MemoryOp`]: the CPU is that
+    /// bus's sole sender too, an ECALL's send is its memory dispatch tagged
+    /// `32` in the flags element with the syscall number as its address and
+    /// result (`res = rv1` by the ADD fast path its entry sets), and each
+    /// syscall table's receive carries the tag and its number as constants.
+    /// No memory receiver's flags element reaches the tag, so again only the
+    /// BLAKE3 table matches a BLAKE3 syscall's send. A prover claiming `blake3: 0` for an epoch that used BLAKE3
     /// is therefore not saving work — it is producing a proof that cannot
     /// verify. The count is a size hint the bus already enforces, not a
     /// permission the verifier grants.
@@ -814,6 +823,11 @@ pub(crate) struct VmAirs {
     /// a family in [`crate::tables::word_cpu::WORD_TABLES`]' order; none under any
     /// other format, and none in any proof but a block's.
     pub word_tables: [Vec<VmAir>; 7],
+    /// The program's instructions DECODE was built from, kept so the lean CPU
+    /// row's DECODE ([`Self::with_cpu_row`]) is built from the same map.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub decode_instructions:
+        Arc<executor::vm::memory::U64HashMap<executor::vm::instruction::decoding::Instruction>>,
 }
 
 /// What REGISTER is preprocessed against: the commitment **and** the two public
@@ -972,6 +986,48 @@ pub(crate) fn block_airs(
         airs.swap_in_row_registers(opts, inputs);
     }
     airs
+}
+
+/// CPU table `index`'s AIR, `height` rows from `ts_base`, under `registers`'
+/// form and the CPU row's `form`, named `CPU[index]`, with its TIMESTAMP column.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn cpu_air_under(
+    opts: &ProofOptions,
+    ts_base: u64,
+    height: usize,
+    index: usize,
+    registers: tables::register::RegisterFormat,
+    form: tables::cpu::CpuRowForm,
+) -> VmAir {
+    use crate::test_utils as tu;
+    use tables::{cpu, cpu::CpuRowForm, register::RegisterFormat};
+    let name = format!("CPU[{index}]");
+    let commitment = cpu::lazy_timestamp_commitment(opts, height);
+    let columns: Arc<dyn Fn() -> Vec<Vec<tables::types::FE>> + Send + Sync> =
+        Arc::new(move || vec![cpu::timestamp_column(height)]);
+    let cols = cpu::NUM_PRECOMPUTED_COLS;
+    match (registers, form) {
+        (RegisterFormat::Tokens32, CpuRowForm::Full) => Box::new(
+            tu::create_cpu_air(opts, ts_base)
+                .with_name(&name)
+                .with_lazy_preprocessed_columns(commitment, cols, columns),
+        ),
+        (RegisterFormat::InRow, CpuRowForm::Full) => Box::new(
+            tu::create_cpu_air_inrow(opts, ts_base)
+                .with_name(&name)
+                .with_lazy_preprocessed_columns(commitment, cols, columns),
+        ),
+        (RegisterFormat::Tokens32, CpuRowForm::Lean) => Box::new(
+            tu::create_cpu_air_lean(opts, ts_base)
+                .with_name(&name)
+                .with_lazy_preprocessed_columns(commitment, cols, columns),
+        ),
+        (RegisterFormat::InRow, CpuRowForm::Lean) => Box::new(
+            tu::create_cpu_air_inrow_lean(opts, ts_base)
+                .with_name(&name)
+                .with_lazy_preprocessed_columns(commitment, cols, columns),
+        ),
+    }
 }
 
 impl VmAirs {
@@ -1470,12 +1526,13 @@ impl VmAirs {
                 Box::new(create_load_air(proof_options).with_name(&format!("LOAD[{}]", i))) as VmAir
             })
             .collect();
+        // The instruction map, decoded once here rather than on every call:
+        // only the multilinear verifier asks, but it asks per proof.
+        let decode_instructions = Arc::new(
+            decode::instructions_from_elf(elf).expect("the ELF decodes into instructions"),
+        );
         let decode: VmAir = {
-            // The instruction map, decoded once here rather than on every call:
-            // only the multilinear verifier asks, but it asks per proof.
-            let instructions = Arc::new(
-                decode::instructions_from_elf(elf).expect("the ELF decodes into instructions"),
-            );
+            let instructions = decode_instructions.clone();
             // Deferred: the commitment is an LDE and a Merkle tree over the
             // program's whole instruction table, and only the univariate path
             // compares it — the multilinear one checks the columns instead.
@@ -1717,7 +1774,115 @@ impl VmAirs {
             mem_loads: Vec::new(),
             mem_stores: Vec::new(),
             word_tables: std::array::from_fn(|_| Vec::new()),
+            decode_instructions,
         }
+    }
+
+    /// The CPU row's `form` in this set
+    /// ([`tables::cpu::CpuRowForm`]): a no-op under
+    /// [`Full`](tables::cpu::CpuRowForm::Full); under
+    /// [`Lean`](tables::cpu::CpuRowForm::Lean) the CPU tables (in `registers`'
+    /// form, at `inputs`' heights), DECODE, CPU32 and every syscall chip — HALT,
+    /// COPY or COPY_W, KECCAK or KECCAK_W, ECREC or ECREC_W (as `memory` has
+    /// them), ECSM, HINT, BLAKE3 — rebuilt under it, each under its own name.
+    /// Called after the memory format's swaps ([`Self::with_word_memory`]).
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn with_cpu_row(
+        &mut self,
+        opts: &ProofOptions,
+        form: tables::cpu::CpuRowForm,
+        registers: tables::register::RegisterFormat,
+        memory: tables::fused_memory::MemoryFormat,
+        inputs: &BlockAirInputs,
+    ) {
+        use crate::test_utils as tu;
+        use tables::{cpu, decode};
+        if form == cpu::CpuRowForm::Full {
+            return;
+        }
+        let heights = &inputs.cpu_heights;
+        self.cpus = heights
+            .iter()
+            .zip(cpu::timestamp_bases(heights))
+            .enumerate()
+            .map(|(i, (&height, ts_base))| cpu_air_under(opts, ts_base, height, i, registers, form))
+            .collect();
+        let instructions = self.decode_instructions.clone();
+        self.decode = Box::new(
+            tu::create_decode_air_for(opts, form)
+                .with_name("DECODE")
+                .with_lazy_preprocessed_columns(
+                    decode::lazy_commitment_for(instructions.clone(), opts, None, form),
+                    decode::num_precomputed_cols(form),
+                    Arc::new(move || decode::preprocessed_columns_for(&instructions, form)),
+                ),
+        );
+        self.cpu32s = (0..self.cpu32s.len())
+            .map(|i| {
+                Box::new(tu::create_cpu32_air_for(opts, form).with_name(&format!("CPU32[{i}]")))
+                    as VmAir
+            })
+            .collect();
+        self.halt = match registers {
+            tables::register::RegisterFormat::InRow => {
+                Box::new(tu::create_halt_air_inrow_for(opts, form).with_name("HALT"))
+            }
+            tables::register::RegisterFormat::Tokens32 => {
+                Box::new(tu::create_halt_air_for(opts, form).with_name("HALT"))
+            }
+        };
+        let words = memory == tables::fused_memory::MemoryFormat::Words;
+        self.copies = (0..self.copies.len())
+            .map(|i| -> VmAir {
+                if words {
+                    Box::new(
+                        tu::create_copy_w_air_for(opts, form)
+                            .with_name(&format!("{}[{i}]", tables::copy_w::NAME)),
+                    )
+                } else {
+                    Box::new(tu::create_copy_air_for(opts, form).with_name(&format!("COPY[{i}]")))
+                }
+            })
+            .collect();
+        self.keccaks = (0..self.keccaks.len())
+            .map(|i| -> VmAir {
+                if words {
+                    Box::new(
+                        tu::create_keccak_w_air_for(opts, form)
+                            .with_name(&format!("{}[{i}]", tables::keccak_w::NAME)),
+                    )
+                } else {
+                    Box::new(
+                        tu::create_keccak_air_for(opts, form).with_name(&format!("KECCAK[{i}]")),
+                    )
+                }
+            })
+            .collect();
+        self.ecrecs = (0..self.ecrecs.len())
+            .map(|i| -> VmAir {
+                if words {
+                    Box::new(
+                        tu::create_ecrec_w_air_for(opts, form)
+                            .with_name(&format!("{}[{i}]", tables::ecrec_w::NAME)),
+                    )
+                } else {
+                    Box::new(tu::create_ecrec_air_for(opts, form).with_name(&format!("ECREC[{i}]")))
+                }
+            })
+            .collect();
+        self.ecsms = (0..self.ecsms.len())
+            .map(|i| {
+                Box::new(tu::create_ecsm_air_for(opts, form).with_name(&format!("ECSM[{i}]")))
+                    as VmAir
+            })
+            .collect();
+        self.hints = (0..self.hints.len())
+            .map(|i| {
+                Box::new(tu::create_hint_air_for(opts, form).with_name(&format!("HINT[{i}]")))
+                    as VmAir
+            })
+            .collect();
+        self.blake3 = Box::new(tu::create_blake3_air_for(opts, form).with_name("BLAKE3"));
     }
 
     /// The fused memory format's tables in this set: `counts[0]` MEM_LOAD and

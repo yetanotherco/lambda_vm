@@ -362,14 +362,24 @@ fn reg_write(
 
 /// All bus interactions for the CPU32 table.
 pub fn bus_interactions() -> Vec<BusInteraction> {
+    bus_interactions_for(crate::tables::cpu::CpuRowForm::Full)
+}
+
+/// [`bus_interactions`] under the CPU row's `form`: under
+/// [`CpuRowForm::Lean`](crate::tables::cpu::CpuRowForm::Lean) the DECODE send
+/// carries the ten flags packed and the six decode bytes as elements of their
+/// own (`mem_flags` the constant 0, as the packed element implies today), and
+/// the five `ARE_BYTES` checks on the bytes go: the DECODE lookup, at the same
+/// multiplicity μ, binds each to a precomputed byte.
+pub fn bus_interactions_for(form: crate::tables::cpu::CpuRowForm) -> Vec<BusInteraction> {
     use packed_decode_shrunk as pd;
     let mut interactions = Vec::new();
 
-    // DECODE[pc, imm, packed_decode] (sender, mult μ); word_instr is constant 1,
-    // and there are no MEMORY/BRANCH/ECALL/mem_flags terms (CPU32 is ALU-only).
-    interactions.push(BusInteraction::sender(
-        BusId::Decode,
-        Multiplicity::Column(cols::MU),
+    let column = |c: usize| BusValue::Packed {
+        start_column: c,
+        packing: Packing::Direct,
+    };
+    let pc_imm = || {
         vec![
             BusValue::Packed {
                 start_column: cols::PC_0,
@@ -379,64 +389,122 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::IMM_0,
                 packing: Packing::DWordWL,
             },
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1 << pd::READ_REG1,
-                    column: cols::READ_REGISTER1,
-                },
-                LinearTerm::Column {
-                    coefficient: 1 << pd::READ_REG2,
-                    column: cols::READ_REGISTER2,
-                },
-                LinearTerm::Column {
-                    coefficient: 1 << pd::WRITE_REG,
-                    column: cols::WRITE_REGISTER,
-                },
-                LinearTerm::Constant(1 << pd::WORD_INSTR), // word_instr = 1
-                LinearTerm::Column {
-                    coefficient: 1 << pd::ALU,
-                    column: cols::ALU,
-                },
-                LinearTerm::Column {
-                    coefficient: 1 << pd::ADD,
-                    column: cols::ADD,
-                },
-                LinearTerm::Column {
-                    coefficient: 1 << pd::SUB,
-                    column: cols::SUB,
-                },
-                LinearTerm::Column {
-                    coefficient: 1 << pd::RS1,
-                    column: cols::RS1,
-                },
-                LinearTerm::Column {
-                    coefficient: 1 << pd::RS2,
-                    column: cols::RS2,
-                },
-                LinearTerm::Column {
-                    coefficient: 1 << pd::RD,
-                    column: cols::RD,
-                },
-                LinearTerm::Column {
-                    coefficient: 1 << pd::HALF_INSTRUCTION_LENGTH,
-                    column: cols::HALF_INSTRUCTION_LENGTH,
-                },
-                LinearTerm::Column {
-                    coefficient: 1 << pd::ALU_FLAGS,
-                    column: cols::ALU_FLAGS,
-                },
-            ]),
-        ],
-    ));
+        ]
+    };
+    if form.decode_bytes_apart() {
+        let mut values = pc_imm();
+        values.push(BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1 << pd::READ_REG1,
+                column: cols::READ_REGISTER1,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::READ_REG2,
+                column: cols::READ_REGISTER2,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::WRITE_REG,
+                column: cols::WRITE_REGISTER,
+            },
+            LinearTerm::Constant(1 << pd::WORD_INSTR), // word_instr = 1
+            LinearTerm::Column {
+                coefficient: 1 << pd::ALU,
+                column: cols::ALU,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::ADD,
+                column: cols::ADD,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::SUB,
+                column: cols::SUB,
+            },
+        ]));
+        values.extend([
+            column(cols::RS1),
+            column(cols::RS2),
+            column(cols::RD),
+            column(cols::HALF_INSTRUCTION_LENGTH),
+            column(cols::ALU_FLAGS),
+            BusValue::constant(0), // mem_flags
+        ]);
+        interactions.push(BusInteraction::sender(
+            BusId::Decode,
+            Multiplicity::Column(cols::MU),
+            values,
+        ));
+    }
 
-    // Byte range checks: ARE_BYTES[x, 0].
-    for col in [
-        cols::HALF_INSTRUCTION_LENGTH,
-        cols::ALU_FLAGS,
-        cols::RS1,
-        cols::RS2,
-        cols::RD,
-    ] {
+    // DECODE[pc, imm, packed_decode] (sender, mult μ); word_instr is constant 1,
+    // and there are no MEMORY/BRANCH/ECALL/mem_flags terms (CPU32 is ALU-only).
+    let full_decode = || {
+        let mut values = pc_imm();
+        values.push(BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1 << pd::READ_REG1,
+                column: cols::READ_REGISTER1,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::READ_REG2,
+                column: cols::READ_REGISTER2,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::WRITE_REG,
+                column: cols::WRITE_REGISTER,
+            },
+            LinearTerm::Constant(1 << pd::WORD_INSTR), // word_instr = 1
+            LinearTerm::Column {
+                coefficient: 1 << pd::ALU,
+                column: cols::ALU,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::ADD,
+                column: cols::ADD,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::SUB,
+                column: cols::SUB,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::RS1,
+                column: cols::RS1,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::RS2,
+                column: cols::RS2,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::RD,
+                column: cols::RD,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::HALF_INSTRUCTION_LENGTH,
+                column: cols::HALF_INSTRUCTION_LENGTH,
+            },
+            LinearTerm::Column {
+                coefficient: 1 << pd::ALU_FLAGS,
+                column: cols::ALU_FLAGS,
+            },
+        ]));
+        BusInteraction::sender(BusId::Decode, Multiplicity::Column(cols::MU), values)
+    };
+    if !form.decode_bytes_apart() {
+        interactions.push(full_decode());
+    }
+
+    // Byte range checks: ARE_BYTES[x, 0] (none under the lean row).
+    let byte_checks: &[usize] = if form.decode_bytes_apart() {
+        &[]
+    } else {
+        &[
+            cols::HALF_INSTRUCTION_LENGTH,
+            cols::ALU_FLAGS,
+            cols::RS1,
+            cols::RS2,
+            cols::RD,
+        ]
+    };
+    for &col in byte_checks {
         interactions.push(BusInteraction::sender(
             BusId::AreBytes,
             Multiplicity::Column(cols::MU),

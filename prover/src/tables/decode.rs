@@ -81,6 +81,105 @@ pub mod cols {
 /// The remaining column (MU) is the multiplicity column that varies per execution.
 pub const NUM_PRECOMPUTED_COLS: usize = 5;
 
+/// The DECODE table under the lean CPU row
+/// ([`CpuRowForm::Lean`](super::cpu::CpuRowForm::Lean)): [`cols`]' five
+/// precomputed columns, unchanged, then the six decode bytes, each its own
+/// precomputed column, then `MU`. The receiver's flags element is
+/// `PACKED_DECODE` less the six bytes at their offsets — the ten flag bits.
+pub mod lean_cols {
+    pub use super::cols::{IMM_0, IMM_1, PACKED_DECODE, PC_0, PC_1};
+    /// `rs1`, then `rs2`, `rd`, `half_instruction_length`, `alu_flags` and
+    /// `mem_flags` at the next five columns (the CPU's
+    /// [`DECODE_BYTE_COLUMNS`](crate::tables::cpu::DECODE_BYTE_COLUMNS) order).
+    pub const RS1: usize = 5;
+    pub const RS2: usize = 6;
+    pub const RD: usize = 7;
+    pub const HALF_INSTRUCTION_LENGTH: usize = 8;
+    pub const ALU_FLAGS: usize = 9;
+    pub const MEM_FLAGS: usize = 10;
+    /// μ: multiplicity.
+    pub const MU: usize = 11;
+    pub const NUM_COLUMNS: usize = 12;
+}
+
+/// [`lean_cols`]' precomputed columns: all but `MU`.
+pub const NUM_PRECOMPUTED_COLS_LEAN: usize = 11;
+
+/// The decode bytes' offsets in `PACKED_DECODE`, in [`lean_cols`]' order.
+const BYTE_OFFSETS: [u32; 6] = {
+    use super::types::packed_decode_shrunk as pd;
+    [
+        pd::RS1,
+        pd::RS2,
+        pd::RD,
+        pd::HALF_INSTRUCTION_LENGTH,
+        pd::ALU_FLAGS,
+        pd::MEM_FLAGS,
+    ]
+};
+
+/// DECODE's columns under `form`.
+pub const fn num_columns(form: super::cpu::CpuRowForm) -> usize {
+    if form.decode_bytes_apart() {
+        lean_cols::NUM_COLUMNS
+    } else {
+        cols::NUM_COLUMNS
+    }
+}
+
+/// DECODE's precomputed columns under `form`.
+pub const fn num_precomputed_cols(form: super::cpu::CpuRowForm) -> usize {
+    if form.decode_bytes_apart() {
+        NUM_PRECOMPUTED_COLS_LEAN
+    } else {
+        NUM_PRECOMPUTED_COLS
+    }
+}
+
+/// A DECODE trace in [`cols`]' layout, its counts made, in `form`'s: itself
+/// under [`CpuRowForm::Full`](super::cpu::CpuRowForm::Full), and under
+/// [`CpuRowForm::Lean`](super::cpu::CpuRowForm::Lean) each row's entry as the
+/// lean row holds it ([`entry_under`]: an ECALL's with its ADD flag) and the
+/// six decode bytes, read off its `PACKED_DECODE`, inserted before `MU`.
+///
+/// # Panics
+/// On a trace that is not [`cols`]' width.
+pub fn trace_under(
+    trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    form: super::cpu::CpuRowForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    if !form.decode_bytes_apart() {
+        return trace;
+    }
+    let num_rows = trace.num_rows();
+    assert_eq!(
+        trace.main_table.width,
+        cols::NUM_COLUMNS,
+        "a DECODE trace in today's layout"
+    );
+    let mut lean = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * lean_cols::NUM_COLUMNS),
+        lean_cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut lean.main_table;
+    for row in 0..num_rows {
+        for col in 0..NUM_PRECOMPUTED_COLS {
+            table.set_fe(row, col, *trace.main_table.get(row, col));
+        }
+        let packed = packed_under(
+            trace.main_table.get(row, cols::PACKED_DECODE).canonical(),
+            form,
+        );
+        table.set_u64(row, lean_cols::PACKED_DECODE, packed);
+        for (k, offset) in BYTE_OFFSETS.iter().enumerate() {
+            table.set_u64(row, lean_cols::RS1 + k, (packed >> offset) & 0xFF);
+        }
+        table.set_fe(row, lean_cols::MU, *trace.main_table.get(row, cols::MU));
+    }
+    lean
+}
+
 // =========================================================================
 // Trace generation
 // =========================================================================
@@ -225,7 +324,45 @@ impl DecodeTable {
     }
 }
 
+/// `entry` as DECODE holds it under the CPU row's `form`: under
+/// [`CpuRowForm::Lean`](super::cpu::CpuRowForm::Lean) an ECALL's entry sets
+/// the ADD flag too, so its row's `res = rv1 + arg2 = a7` — `arg2` is
+/// `rv2 + imm`, both zero on an ECALL (no `rs2` read, no immediate) — and
+/// `rvd = res`: the merged memory dispatch carries the syscall number as its
+/// address and result, pinned by the ADD fast path's identity. Every other
+/// entry, and every entry under today's row, is unchanged.
+pub fn entry_under(mut entry: DecodeEntry, form: super::cpu::CpuRowForm) -> DecodeEntry {
+    if form.ecall_on_memory_op() && entry.fields.ecall {
+        entry.fields.add = true;
+    }
+    entry
+}
+
+/// A `PACKED_DECODE` word under the CPU row's `form` ([`entry_under`]): the
+/// ADD bit set on an ECALL's under the lean row.
+fn packed_under(packed: u64, form: super::cpu::CpuRowForm) -> u64 {
+    use super::types::packed_decode_shrunk as pd;
+    if form.ecall_on_memory_op() && (packed >> pd::ECALL) & 1 == 1 {
+        packed | (1 << pd::ADD)
+    } else {
+        packed
+    }
+}
+
 impl DecodeTable {
+    /// This table under the CPU row's `form` ([`entry_under`] of each entry;
+    /// the rows and runs are the same).
+    pub fn under(&self, form: super::cpu::CpuRowForm) -> Self {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .map(|e| entry_under(e.clone(), form))
+                .collect(),
+            runs: self.runs.clone(),
+        }
+    }
+
     /// The table of `instructions`, each decoded as the DECODE trace decodes
     /// it (length 4).
     ///
@@ -323,6 +460,86 @@ impl DecodeTable {
     }
 }
 
+/// The BITWISE lookups today's CPU row and CPU32 send and the lean row
+/// ([`CpuRowForm::Lean`](super::cpu::CpuRowForm::Lean)) does not, for DECODE
+/// counts `counts` (row `r` of `table` looked up `counts[r]` times, the CPU
+/// padding row included): each with its total.
+///
+/// They follow from DECODE's counts alone. Every CPU operation looks DECODE up
+/// once — through the CPU row, or through its CPU32 row on a word instruction
+/// — and every CPU padding row once, at the padding entry; and the checks that
+/// go read only the entry's bytes:
+/// - a row that is not a word instruction (the padding row too):
+///   `ARE_BYTES[rs1, rs2]`, `ARE_BYTES[rd, half_instruction_length]`,
+///   `ARE_BYTES[alu_flags, mem_flags]`;
+/// - a word instruction: its CPU row's `ARE_BYTES[0, 0]` twice and
+///   `ARE_BYTES[0, half_instruction_length]` (the CPU zeroes the other bytes
+///   there, [`super::cpu::CpuOp::collect_bitwise_ops`]), and its CPU32 row's
+///   `ARE_BYTES[x, 0]` on `half_instruction_length`, `alu_flags`, `rs1`, `rs2`
+///   and `rd`.
+pub(crate) fn lean_removed_bitwise(
+    table: &DecodeTable,
+    counts: &[u64],
+) -> Vec<(super::bitwise::BitwiseOperation, u64)> {
+    use super::bitwise::{BitwiseOperation, BitwiseOperationType::AreBytes};
+    let padding = DecodeEntry {
+        pc: super::cpu::CPU_PADDING_PC,
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    for (row, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let entry = if row == table.padding_row() {
+            &padding
+        } else {
+            table.entry(row as u32)
+        };
+        let f = &entry.fields;
+        if f.word_instr {
+            out.push((BitwiseOperation::byte_op(AreBytes, 0, 0), 2 * count));
+            out.push((
+                BitwiseOperation::byte_op(AreBytes, 0, f.half_instruction_length),
+                count,
+            ));
+            for byte in [f.half_instruction_length, f.alu_flags, f.rs1, f.rs2, f.rd] {
+                out.push((BitwiseOperation::single_byte(AreBytes, byte), count));
+            }
+        } else {
+            out.push((BitwiseOperation::byte_op(AreBytes, f.rs1, f.rs2), count));
+            out.push((
+                BitwiseOperation::byte_op(AreBytes, f.rd, f.half_instruction_length),
+                count,
+            ));
+            out.push((
+                BitwiseOperation::byte_op(AreBytes, f.alu_flags, f.mem_flags),
+                count,
+            ));
+        }
+    }
+    out
+}
+
+/// DECODE's counts so far in `trace`'s `MU` column ([`cols`]' layout), plus
+/// one for each of `rows` and `num_padding_rows` at the CPU padding row: the
+/// counts [`count_rows`] would leave, read without writing them.
+pub(crate) fn counts_with(
+    trace: &TraceTable<GoldilocksField, GoldilocksExtension>,
+    table: &DecodeTable,
+    rows: impl IntoIterator<Item = usize>,
+    num_padding_rows: usize,
+) -> Vec<u64> {
+    let mut counts: Vec<u64> = (0..trace.num_rows())
+        .map(|row| trace.main_table.get(row, cols::MU).canonical())
+        .collect();
+    for row in rows {
+        counts[row] += 1;
+    }
+    counts[table.padding_row()] += num_padding_rows as u64;
+    counts
+}
+
 /// Counts one DECODE lookup per row of `rows` into the MU column (rows a
 /// [`DecodeTable`] gives).
 pub fn count_rows(
@@ -385,6 +602,47 @@ pub fn update_multiplicities(
 /// The DECODE table is a **receiver** that accepts lookups from the CPU table.
 /// Per spec (cpu.toml): input = ["pc", "imm", "packed_decode"]
 pub fn bus_interactions() -> Vec<BusInteraction> {
+    bus_interactions_for(super::cpu::CpuRowForm::Full)
+}
+
+/// [`bus_interactions`] under `form`: under
+/// [`CpuRowForm::Lean`](super::cpu::CpuRowForm::Lean)
+/// `DECODE[pc, imm, flags, rs1, rs2, rd, half_instruction_length, alu_flags,
+/// mem_flags]` at [`lean_cols`], `flags` being `PACKED_DECODE` less the six
+/// bytes at their offsets.
+pub fn bus_interactions_for(form: super::cpu::CpuRowForm) -> Vec<BusInteraction> {
+    if form.decode_bytes_apart() {
+        let mut flags = vec![stark::lookup::LinearTerm::Column {
+            coefficient: 1,
+            column: lean_cols::PACKED_DECODE,
+        }];
+        flags.extend(BYTE_OFFSETS.iter().enumerate().map(|(k, &offset)| {
+            stark::lookup::LinearTerm::Column {
+                coefficient: -(1i64 << offset),
+                column: lean_cols::RS1 + k,
+            }
+        }));
+        let mut values = vec![
+            BusValue::Packed {
+                start_column: lean_cols::PC_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::Packed {
+                start_column: lean_cols::IMM_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::linear(flags),
+        ];
+        values.extend((0..BYTE_OFFSETS.len()).map(|k| BusValue::Packed {
+            start_column: lean_cols::RS1 + k,
+            packing: Packing::Direct,
+        }));
+        return vec![BusInteraction::receiver(
+            BusId::Decode,
+            Multiplicity::Column(lean_cols::MU),
+            values,
+        )];
+    }
     vec![
         // DECODE[pc, imm, packed_decode] - receiver from CPU
         BusInteraction::receiver(
@@ -422,10 +680,19 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// of comparing a commitment, so it needs the values and not just their root.
 /// This is what binds a proof to the program it claims to run.
 pub fn preprocessed_columns(instructions: &U64HashMap<Instruction>) -> Vec<Vec<FE>> {
+    preprocessed_columns_for(instructions, super::cpu::CpuRowForm::Full)
+}
+
+/// [`preprocessed_columns`] under `form` ([`num_precomputed_cols`] of them).
+pub fn preprocessed_columns_for(
+    instructions: &U64HashMap<Instruction>,
+    form: super::cpu::CpuRowForm,
+) -> Vec<Vec<FE>> {
     // MU=0: only the precomputed columns are wanted.
     let (trace, _pc_to_row) = generate_decode_trace(instructions);
+    let trace = trace_under(trace, form);
     let num_rows = trace.num_rows();
-    (0..NUM_PRECOMPUTED_COLS)
+    (0..num_precomputed_cols(form))
         .map(|col_idx| {
             (0..num_rows)
                 .map(|row_idx| *trace.main_table.get(row_idx, col_idx))
@@ -476,7 +743,22 @@ pub fn compute_precomputed_commitment_with(
     options: &ProofOptions,
     layout: LeafLayout,
 ) -> Commitment {
-    let columns = preprocessed_columns(instructions);
+    compute_precomputed_commitment_under(
+        instructions,
+        options,
+        layout,
+        super::cpu::CpuRowForm::Full,
+    )
+}
+
+/// [`compute_precomputed_commitment_with`] over `form`'s precomputed columns.
+pub fn compute_precomputed_commitment_under(
+    instructions: &U64HashMap<Instruction>,
+    options: &ProofOptions,
+    layout: LeafLayout,
+    form: super::cpu::CpuRowForm,
+) -> Commitment {
+    let columns = preprocessed_columns_for(instructions, form);
     let num_rows = columns[0].len();
 
     // Interpolate each column to a polynomial
@@ -531,6 +813,35 @@ pub fn lazy_commitment(
             &instructions,
             &options,
             LeafLayout::Row,
+        ))
+    })
+}
+
+/// [`lazy_commitment`] over `form`'s precomputed columns. A supplied root is
+/// [`CpuRowForm::Full`](super::cpu::CpuRowForm::Full)'s, so under the lean
+/// form both roots are computed on first use.
+pub fn lazy_commitment_for(
+    instructions: std::sync::Arc<U64HashMap<Instruction>>,
+    options: &ProofOptions,
+    supplied: Option<Commitment>,
+    form: super::cpu::CpuRowForm,
+) -> stark::lookup::LazyCommitment {
+    if !form.decode_bytes_apart() {
+        return lazy_commitment(instructions, options, supplied);
+    }
+    let base = {
+        let (instructions, options) = (instructions.clone(), options.clone());
+        stark::lookup::LazyCommitment::deferred(move || {
+            compute_precomputed_commitment_under(&instructions, &options, LeafLayout::RowPair, form)
+        })
+    };
+    let options = options.clone();
+    base.with_one_row(move || {
+        Some(compute_precomputed_commitment_under(
+            &instructions,
+            &options,
+            LeafLayout::Row,
+            form,
         ))
     })
 }

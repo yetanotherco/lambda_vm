@@ -991,6 +991,23 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// The CPU row's lookups in `form` (the block format's
+    /// [`CpuRowForm`](crate::tables::cpu::CpuRowForm)): the walk decodes by
+    /// its DECODE table ([`decode::entry_under`]: an ECALL's with its ADD flag
+    /// under the lean row), and DECODE's columns and BITWISE's counts follow
+    /// it. The default is today's row. Before the first window, and before the
+    /// card takes the CPU chunks' decode ([`Self::card_fill_streamed`]).
+    pub fn cpu_row_form(mut self, form: crate::tables::cpu::CpuRowForm) -> Result<Self, Error> {
+        if self.cycles > 0 || self.card_fill_streamed.is_some() {
+            return Err(Error::Prover(
+                "cpu_row_form after a window was walked or the card took the decode".to_string(),
+            ));
+        }
+        self.decode = Arc::new(self.decode.under(form));
+        self.emitted.cpu_row_form = form;
+        Ok(self)
+    }
+
     /// KECCAK_RND's byte checks as `form` sends them (the block format's
     /// [`KeccakRndForm`](crate::tables::keccak_rnd::KeccakRndForm)): BITWISE
     /// counts those and no others. The default is today's table.
@@ -5338,6 +5355,19 @@ impl RegenBuilder {
 
     /// [`WindowedTraceBuilder::memory_format`], for the chunks this
     /// regenerates. Before the first window only.
+    /// The CPU row's form (phase A's, [`WindowedTraceBuilder::cpu_row_form`]):
+    /// the walk decodes by its DECODE table. Before the first window and
+    /// before [`Self::keep_cpu_logs`].
+    pub fn cpu_row_form(mut self, form: crate::tables::cpu::CpuRowForm) -> Result<Self, Error> {
+        if self.cycles > 0 || self.logs.is_some() {
+            return Err(Error::Prover(
+                "cpu_row_form after a window was walked or the CPU logs were kept".to_string(),
+            ));
+        }
+        self.decode = Arc::new(self.decode.under(form));
+        Ok(self)
+    }
+
     pub fn memory_format(mut self, format: MemoryFormat) -> Result<Self, Error> {
         if self.cycles > 0 {
             return Err(Error::Prover(

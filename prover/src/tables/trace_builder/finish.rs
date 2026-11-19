@@ -880,6 +880,40 @@ impl P4Pending<'_> {
     }
 }
 
+/// Under the lean CPU row ([`StreamSkip::cpu_row_form`]) the BITWISE lookups
+/// the CPU and CPU32 rows no longer send ([`decode::lean_removed_bitwise`]),
+/// from DECODE's counts: those `decode_trace` holds and those of `rows` and
+/// the padding rows to come ([`decode::counts_with`]). `None` under today's row.
+fn lean_removed_bitwise(
+    skip: &StreamSkip,
+    decode_trace: &TraceTable<GoldilocksField, GoldilocksExtension>,
+    decode_table: &DecodeTable,
+    rows: impl IntoIterator<Item = usize>,
+    num_padding_rows: usize,
+) -> Option<Vec<(bitwise::BitwiseOperation, u64)>> {
+    skip.cpu_row_form.decode_bytes_apart().then(|| {
+        let counts = decode::counts_with(decode_trace, decode_table, rows, num_padding_rows);
+        decode::lean_removed_bitwise(decode_table, &counts)
+    })
+}
+
+/// `histogram` without `removed` ([`lean_removed_bitwise`]): a lookup taken
+/// back that was never counted refuses the build, since the counts and the
+/// rows would then disagree.
+fn without_removed(
+    mut histogram: bitwise::BitwiseHistogram,
+    removed: Option<&[(bitwise::BitwiseOperation, u64)]>,
+) -> Result<bitwise::BitwiseHistogram, Error> {
+    for &(op, n) in removed.unwrap_or_default() {
+        if !histogram.take_n(op, n) {
+            return Err(Error::Prover(format!(
+                "BITWISE counted fewer than the {n} {op:?} the lean CPU row takes back"
+            )));
+        }
+    }
+    Ok(histogram)
+}
+
 /// The byte checks SHIFT's and KECCAK_RND's padding rows send: the tables of
 /// the lists here ([`list_chunks`]) and, with only the tails kept, SHIFT's
 /// streamed chunks' full tables.
@@ -1629,6 +1663,16 @@ impl<'a> FinishPlan<'a> {
         // they all run in one rayon scope. Disk-spill stays sequential: its
         // generate→spill order keeps trace memory bounded.
         let cpu_ops_ref = &cpu_ops;
+        let lean_removed = lean_removed_bitwise(
+            &skip,
+            &decode_trace,
+            decode_table,
+            cpu_ops_ref[cpu_decoded.min(cpu_ops_ref.len())..]
+                .iter()
+                .map(|op| op.decode_row as usize),
+            num_padding_rows,
+        );
+        let bitwise_histogram = without_removed(bitwise_histogram, lean_removed.as_deref())?;
         let pack = skip.pack;
         // A packing build writes each table packed as it generates it where the
         // generator can (G-pack, `StreamSkip::gpack`); `packed_by` then finds it
@@ -1850,7 +1894,7 @@ impl<'a> FinishPlan<'a> {
                 .map(|op| op.decode_row as usize);
             let padding = std::iter::repeat_n(decode_table.padding_row(), num_padding_rows);
             decode::count_rows(&mut decode, rows.chain(padding));
-            packed_if(pack, decode)
+            packed_if(pack, decode::trace_under(decode, skip.cpu_row_form))
         };
         // Under the word memory format COPY's tables are COPY_W's, from the
         // word rows.
@@ -2712,6 +2756,15 @@ impl<'a> FinishPlan<'a> {
         }
         let byte_checks = padding_byte_checks(shift_ops.len(), keccak_ops.len(), max_rows, &skip);
         let p4_mode = P4Mode::of(&skip);
+        let lean_removed = lean_removed_bitwise(
+            &skip,
+            &decode_trace,
+            decode_table,
+            cpu_ops[cpu_decoded.min(cpu_ops.len())..]
+                .iter()
+                .map(|op| op.decode_row as usize),
+            num_padding_rows,
+        );
         // BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables as each
         // is built, the other sources counted beside the rest's builds.
         let from_tables = (header.bitwise_from_tables
@@ -2808,6 +2861,7 @@ impl<'a> FinishPlan<'a> {
                         histogram
                     }
                 };
+                let histogram = without_removed(histogram, lean_removed.as_deref())?;
                 note_bitwise(&histogram, from);
                 if direct_bitwise && form == TraceForm::Narrow {
                     return Ok(histogram.trace_as(form));
@@ -2829,7 +2883,10 @@ impl<'a> FinishPlan<'a> {
                         .map(|op| op.decode_row as usize);
                     let padding = std::iter::repeat_n(decode_table.padding_row(), num_padding_rows);
                     decode::count_rows(&mut decode, rows.chain(padding));
-                    Ok(packed_if(pack, decode))
+                    Ok(packed_if(
+                        pack,
+                        decode::trace_under(decode, skip.cpu_row_form),
+                    ))
                 }),
             });
         }
