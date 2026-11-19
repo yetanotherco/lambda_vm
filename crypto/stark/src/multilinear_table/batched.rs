@@ -1335,19 +1335,30 @@ where
             .collect();
         let claim = pairs.claimed(&lambda_powers, claims[t].as_ref(), local_claims[t].as_ref());
         let betas = multilinear_air::beta_powers(&beta, table.shape().num_roots());
-        // The fused rounds take one bus at one point: the table's only pair.
-        let fused_bus = match (&pairs.global, &pairs.local) {
-            (Some(bus), None) | (None, Some(bus)) => Some(*bus),
-            _ => None,
+        // The fused rounds take the table's bus pairs as its rules come: one
+        // bus (the global, or a purely local table's local) at `λ, λ²` with
+        // three lambdas, or the global then the local at `λ³, λ⁴` with five.
+        let fused_buses = match (&pairs.global, &pairs.local) {
+            (Some(bus), None) | (None, Some(bus)) => Some((*bus, None)),
+            (Some(global), Some(local)) => Some((*global, Some(*local))),
+            (None, None) => None,
         };
-        let fused = constraints[t].as_ref().zip(fused_bus).map(
-            |(constraints, (interactions, claim_point))| multilinear::gpu_fused::FusedInput {
-                constraints,
-                betas: &betas,
-                interactions,
-                claim_point,
-                r: xi_t,
-                columns: columns[t].as_ref(),
+        let fused = constraints[t].as_ref().zip(fused_buses).map(
+            |(constraints, ((interactions, claim_point), second))| {
+                multilinear::gpu_fused::FusedInput {
+                    constraints,
+                    betas: &betas,
+                    interactions,
+                    claim_point,
+                    r: xi_t,
+                    columns: columns[t].as_ref(),
+                    second: second.map(|(interactions, claim_point)| {
+                        multilinear::gpu_fused::SecondInput {
+                            interactions,
+                            claim_point,
+                        }
+                    }),
+                }
             },
         );
         let mut weight_points: Vec<&[FieldElement<E>]> = vec![xi_t];

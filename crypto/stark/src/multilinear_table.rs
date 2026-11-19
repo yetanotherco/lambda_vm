@@ -1353,6 +1353,7 @@ where
             claim_point: &gkr_out.claim.point,
             r: &r,
             columns: column_factors.as_ref(),
+            second: None,
         });
     lap(&split::REST_SETUP, t);
     let t = tick();
