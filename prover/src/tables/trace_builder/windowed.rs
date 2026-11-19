@@ -1306,6 +1306,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// The rest's header handed to the streamed finish's taker as soon as the
+    /// plan has every count, before phase 4 and the rest's builds
+    /// ([`StreamSkip::early_rest_header`]). The header is the same.
+    pub fn early_rest_header(mut self) -> Self {
+        self.emitted.early_rest_header = true;
+        self
+    }
+
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables counted
     /// from each table's rows as it is built, phase 4 beside the rest's builds
     /// and BITWISE handed on last ([`StreamSkip::bitwise_from_tables`]), when
@@ -1503,7 +1511,30 @@ impl<'a> WindowedTraceBuilder<'a> {
         let from_tables =
             skip.bitwise_from_tables && skip.tails && slide && cfg!(feature = "parallel");
         skip.p4_beside |= from_tables;
-        let mut plan = super::finish::FinishPlan::new(
+        let parallel_slide = slide && cfg!(feature = "parallel");
+        let bitwise_last = (skip.bitwise_last || from_tables) && parallel_slide;
+        let keccak_rnd_first = skip.keccak_rnd_first && parallel_slide;
+        let pages_first = skip.pages_first && parallel_slide;
+        // Under `early_rest_header`, the header goes to its taker as soon as
+        // the plan has every count, before phase 4 and the rest's builds.
+        let mut on_header = Some(on_header);
+        let mut early_sent: Option<(super::RestHeader, Result<_, Error>)> = None;
+        let mut take_early = |header: super::RestHeader| {
+            if let Some(on_header) = on_header.take() {
+                let send = on_header(header.clone());
+                early_sent = Some((header, send));
+            }
+        };
+        let early = skip
+            .early_rest_header
+            .then_some(super::finish::EarlyHeader {
+                bitwise_last,
+                bitwise_from_tables: from_tables,
+                keccak_rnd_first,
+                pages_first,
+                send: &mut take_early,
+            });
+        let planned = super::finish::FinishPlan::new_early(
             ops,
             Some(&image),
             &memory_state,
@@ -1517,25 +1548,51 @@ impl<'a> WindowedTraceBuilder<'a> {
             false,
             &skip,
             Some(pre),
-        )?;
+            early,
+        );
+        let mut plan = match planned {
+            Ok(plan) => plan,
+            Err(e) => {
+                if early_sent.is_some() {
+                    gate.stop("the plan failed after its header went early");
+                }
+                return Err(e);
+            }
+        };
         if let Some(line) = plan.cut_line() {
             eprintln!("{line}");
         }
         // Without the `parallel` feature the finish takes the waves, in AIR
         // order.
-        if (skip.bitwise_last || from_tables) && slide && cfg!(feature = "parallel") {
+        if bitwise_last {
             plan.hand_bitwise_last();
         }
         if from_tables {
             plan.count_bitwise_from_tables();
         }
-        if skip.keccak_rnd_first && slide && cfg!(feature = "parallel") {
+        if keccak_rnd_first {
             plan.hand_keccak_rnd_first();
         }
-        if skip.pages_first && slide && cfg!(feature = "parallel") {
+        if pages_first {
             plan.hand_pages_first();
         }
-        let mut send = match on_header(plan.header().clone()) {
+        let sent = match early_sent {
+            // The early header must be the one the plan holds now.
+            Some((early, sent)) => {
+                if format!("{early:?}") != format!("{:?}", plan.header()) {
+                    gate.stop("the early header is not the plan's");
+                    return Err(Error::Prover(
+                        "the rest's header sent early is not the plan's".into(),
+                    ));
+                }
+                sent
+            }
+            None => match on_header.take() {
+                Some(on_header) => on_header(plan.header().clone()),
+                None => Err(Error::Prover("the rest's header had no taker".into())),
+            },
+        };
+        let mut send = match sent {
             Ok(send) => send,
             Err(e) => {
                 gate.stop("the header found no taker");

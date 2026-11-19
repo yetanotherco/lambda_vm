@@ -1436,6 +1436,36 @@ fn keccak_rnd_first_or_default(deviation: Option<bool>) -> bool {
     deviation.unwrap_or(true)
 }
 
+/// The knob of [`early_rest_header`].
+const EARLY_REST_HEADER_ENV: &str = "LAMBDA_VM_EARLY_REST_HEADER";
+
+/// Whether the streamed finish hands the rest's header on as soon as its plan
+/// has every count, before phase 4 and the rest's builds
+/// ([`WindowedTraceBuilder::early_rest_header`]), so the layout builds the
+/// run's AIR set while they run instead of after: a deviation's choice, else
+/// `LAMBDA_VM_EARLY_REST_HEADER` (off by default). The header, the tables and
+/// the proof's bytes are the same; the finish refuses a header that moved.
+fn early_rest_header(deviation: Option<bool>) -> Result<bool, Error> {
+    match deviation {
+        Some(on) => Ok(on),
+        None => parse_early_rest_header(std::env::var(EARLY_REST_HEADER_ENV).ok().as_deref()),
+    }
+}
+
+/// `LAMBDA_VM_EARLY_REST_HEADER`: unset, empty or `0` (the default) hands the
+/// header on after the plan; `1` as soon as it has every count. Anything else
+/// refuses the prove.
+fn parse_early_rest_header(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "{EARLY_REST_HEADER_ENV}={v}: 0 (the default: after the plan) or 1 (as soon as it has \
+             every count)"
+        ))),
+    }
+}
+
 /// The knob of [`pages_first`].
 const PAGES_FIRST_ENV: &str = "LAMBDA_VM_PAGES_FIRST";
 
@@ -4352,6 +4382,10 @@ pub(crate) struct Deviations {
     /// The page tables handed on right after KECCAK_RND's (`Some(true)`) or
     /// in AIR order (`Some(false)`), instead of the knob ([`pages_first`]).
     pub pages_first: Option<bool>,
+    /// The rest's header handed on as soon as the plan has every count
+    /// (`Some(true)`) or after it (`Some(false)`), instead of the knob
+    /// ([`early_rest_header`]).
+    pub early_rest_header: Option<bool>,
     /// The run's AIR set built on a thread of its own while the first
     /// KECCAK_RND tables are laid out (`Some(true)`), or before the rest's
     /// first table (`Some(false)`), instead of the knob
@@ -7379,6 +7413,15 @@ fn prove_streamed(
         let bitwise_last = deviations.rest_bitwise_last;
         let keccak_rnd_first = keccak_rnd_first_or_default(deviations.keccak_rnd_first);
         let pages_first = pages_first(deviations.pages_first)?;
+        let early_header = early_rest_header(deviations.early_rest_header)?;
+        eprintln!(
+            "★ BLOCK EARLY REST HEADER: {} ({EARLY_REST_HEADER_ENV})",
+            if early_header {
+                "on (the rest's header handed on as soon as the plan has every count)"
+            } else {
+                "off (the default; after the plan)"
+            }
+        );
         eprintln!(
             "★ BLOCK PAGES FIRST: {} ({PAGES_FIRST_ENV})",
             if pages_first {
@@ -7715,6 +7758,9 @@ fn prove_streamed(
                 }
                 if pages_first {
                     builder = builder.pages_first();
+                }
+                if early_header {
+                    builder = builder.early_rest_header();
                 }
                 builder = builder.slide_rest();
                 builder = builder.keccak_rnd_form(format.keccak_rnd);
@@ -12173,6 +12219,21 @@ mod rest_airs_beside_tests {
         assert!(!parse_rest_airs_beside(Some(" 0\n")).expect("off"));
         for bad in ["2", "on", "true", "yes"] {
             assert!(parse_rest_airs_beside(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// The early header is off unless the knob says `1`.
+    #[test]
+    fn the_early_rest_header_knob_is_off_by_default_and_refuses_other_words() {
+        for off in [None, Some(""), Some("0"), Some(" 0\n")] {
+            assert!(
+                !super::parse_early_rest_header(off).expect("off"),
+                "{off:?}"
+            );
+        }
+        assert!(super::parse_early_rest_header(Some("1")).expect("on"));
+        for bad in ["2", "on", "true", "yes"] {
+            assert!(super::parse_early_rest_header(Some(bad)).is_err(), "{bad}");
         }
     }
 

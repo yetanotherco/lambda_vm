@@ -2024,6 +2024,56 @@ fn keccak_rnd_streamed_as_records_are_the_finishs_tables() {
     assert!(streamed_any > 0, "no KECCAK_RND table streamed");
 }
 
+/// ★ The rest's header handed on as soon as the plan has every count
+/// ([`WindowedTraceBuilder::early_rest_header`]) is the header handed on after
+/// the plan, and the finish hands on the same tables, word for word, in the
+/// same order: KECCAK_RND first, the pages next and BITWISE last, under both
+/// padding rules and windows of 7 and 1000 cycles; and the header did go early.
+#[test]
+fn the_early_rest_header_is_the_plans_and_moves_no_table() {
+    let max_rows = MaxRowsConfig::small();
+    let before = super::early_headers();
+    for name in ["test_keccak_multi", "all_instructions_64"] {
+        let (program, logs) = run(name);
+        for padding in [CutPadding::LastTable, CutPadding::WholeRun] {
+            for window in [7, 1000] {
+                let what = format!("{name} {padding:?} window {window}");
+                let built = |early: bool| {
+                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &move |b| {
+                        let b = cut(b, padding)
+                            .rest_bitwise_last()
+                            .keccak_rnd_first()
+                            .pages_first()
+                            .slide_rest();
+                        if early { b.early_rest_header() } else { b }
+                    });
+                    streamed_capped(builder, last, usize::MAX, None)
+                };
+                let (want_header, want, _) = built(false);
+                let (got_header, got, _) = built(true);
+                assert_eq!(
+                    format!("{got_header:?}"),
+                    format!("{want_header:?}"),
+                    "{what}: the header"
+                );
+                assert_eq!(got.len(), want.len(), "{what}: the tables");
+                for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(g.position, w.position, "{what}: position {k}");
+                    assert!(
+                        g.table.as_ref().map(shape_and_words)
+                            == w.table.as_ref().map(shape_and_words),
+                        "{what}: table {k}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        super::early_headers() > before || !cfg!(feature = "parallel"),
+        "no header went early"
+    );
+}
+
 /// ★ Phase 4's side count balanced ([`super::p4_balanced`]: its units handed
 /// out in turn to its threads, the histograms added in pairs) builds the
 /// finish's tables of the round-robin count, table for table, BITWISE's

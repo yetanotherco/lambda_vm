@@ -7814,6 +7814,11 @@ pub struct StreamSkip {
     /// the groups, and so the proof's bytes, are not. In waves it changes
     /// nothing.
     pub pages_first: bool,
+    /// The streamed finish hands the rest's header on as soon as its plan has
+    /// every count, before phase 4 and the rest's builds, so the layout can
+    /// build the run's AIR set while they run. The header is the same; only
+    /// when it leaves moves.
+    pub early_rest_header: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table
     /// phase's counts, its

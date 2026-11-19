@@ -11,8 +11,27 @@
 
 use super::*;
 
+/// How many headers went early in this process (for a test that one did).
+static EARLY_HEADERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn early_headers() -> usize {
+    EARLY_HEADERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The header's early taker ([`FinishPlan::new_early`]): the hand-on order's
+/// flags the finish will set after the plan (so the early header is the one
+/// it then holds), and where the header goes.
+pub(super) struct EarlyHeader<'s> {
+    pub(super) bitwise_last: bool,
+    pub(super) bitwise_from_tables: bool,
+    pub(super) keccak_rnd_first: bool,
+    pub(super) pages_first: bool,
+    pub(super) send: &'s mut dyn FnMut(RestHeader),
+}
+
 /// What a statement reads off a build before any of its tables exists.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct RestHeader {
     /// How many tables each counted chip makes ([`Traces::table_counts`] of the
     /// tables the plan builds).
@@ -288,6 +307,7 @@ fn lt_count_merge(skip: &StreamSkip) -> bool {
 /// PAGE's BITWISE lookups, from the initial image and the memory state.
 type PageCount<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Send + Sync + 'a>;
 
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 static P4_BALANCED_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Whether phase 4's side count (on its own threads, beside the rest's builds)
@@ -296,6 +316,7 @@ static P4_BALANCED_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::Atom
 /// (`LAMBDA_VM_P4_BALANCED=1`; off by default: units dealt round-robin to the
 /// threads and the histograms added one after another). The counts are the
 /// same. Read once, with a banner.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn p4_balanced() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     match P4_BALANCED_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -317,6 +338,7 @@ pub(crate) fn p4_balanced() -> bool {
 }
 
 /// How many side counts ran balanced in this process (for a test that one did).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 static P4_BALANCED_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
@@ -325,6 +347,7 @@ pub(crate) fn p4_balanced_runs() -> usize {
 }
 
 /// The knob's word: on for `1` only.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 fn p4_balanced_from(value: Option<&str>) -> bool {
     value.is_some_and(|v| v.trim() == "1")
 }
@@ -1107,6 +1130,42 @@ impl<'a> FinishPlan<'a> {
         register_init: &'a [u32],
         decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
         decode_table: &'a DecodeTable,
+        register_state: RegisterState,
+        max_rows: &'a crate::tables::MaxRowsConfig,
+        private_input: &[u8],
+        is_final: bool,
+        l2g_memory_bookend: bool,
+        skip: &StreamSkip,
+        pre: Option<PreCounted>,
+    ) -> Result<Self, Error> {
+        Self::new_early(
+            ops,
+            initial_image,
+            memory_state,
+            register_init,
+            decode_trace,
+            decode_table,
+            register_state,
+            max_rows,
+            private_input,
+            is_final,
+            l2g_memory_bookend,
+            skip,
+            pre,
+            None,
+        )
+    }
+
+    /// [`Self::new`], handing the header to `early` as soon as every count is
+    /// known, before phase 4 and the rest's builds ([`EarlyHeader`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_early<I: ImageSource + Sync>(
+        ops: CollectedOps,
+        initial_image: Option<&'a I>,
+        memory_state: &'a MemoryState,
+        register_init: &'a [u32],
+        decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+        decode_table: &'a DecodeTable,
         mut register_state: RegisterState,
         max_rows: &'a crate::tables::MaxRowsConfig,
         private_input: &[u8],
@@ -1114,6 +1173,7 @@ impl<'a> FinishPlan<'a> {
         l2g_memory_bookend: bool,
         skip: &StreamSkip,
         mut pre: Option<PreCounted>,
+        early: Option<EarlyHeader<'_>>,
     ) -> Result<Self, Error> {
         let CollectedOps {
             cpu_ops,
@@ -1265,109 +1325,6 @@ impl<'a> FinishPlan<'a> {
         // KECCAK's state pointers), deduplicated once and shared by its BITWISE
         // lookups and its table, so the two read the same rows by construction.
         let is_wh_rows = is_wh::dedup_is_wh_rows(keccak_ops.parts().flat_map(keccak::is_wh_keys));
-        // PAGE's lookups, from the initial image (a continuation epoch's L2G
-        // table owns them).
-        // Under the word memory format PAGE_W's: `IS_HALF` on each initial
-        // half of a private-input page's words, none on any other page.
-        let page = initial_image
-            .filter(|_| !l2g_memory_bookend)
-            .map(|image| -> PageCount<'a> {
-                if words {
-                    let private: Vec<PageConfig> =
-                        page_configs_of(image, memory_state, private_input)
-                            .into_iter()
-                            .filter(|config| config.is_private_input)
-                            .collect();
-                    return Box::new(move |h: &mut bitwise::BitwiseHistogram| {
-                        for config in &private {
-                            for op in super::super::page_w::bitwise_ops(config) {
-                                h.bump(op);
-                            }
-                        }
-                    });
-                }
-                Box::new(move |h: &mut bitwise::BitwiseHistogram| {
-                    collect_bitwise_from_page(image, memory_state, l2g_memory_bookend, h)
-                })
-            });
-        let bitwise = if skip.p4_beside {
-            // Counted by BITWISE's own table, beside the rest's builds: the
-            // in-walk lookups wait for it.
-            BitwiseCount::Beside(Box::new(P4Pending {
-                bitwise_ops,
-                page,
-                pre,
-            }))
-        } else {
-            let lists = P4Lists {
-                lt: &lt,
-                shift_ops: &shift_ops,
-                store_ops: &store_ops,
-                memw_aligned_ops: &memw_aligned_ops,
-                memw_register_rows: &memw_register_rows,
-                branch_ops: &branch_ops,
-                mul_ops: &mul_ops,
-                dvrm_ops: &dvrm_ops,
-                eq_ops: &eq_ops,
-                bytewise_ops: &bytewise_ops,
-                keccak_ops: &keccak_ops,
-                ecdas_ops: &ecdas_ops,
-                copy_ops: &copy_ops,
-                blake3_ops: &blake3_ops,
-                blake3_absorb_ops: &blake3_absorb_ops,
-                ecsm_ops: &ecsm_ops,
-                hint_ops: &hint_ops,
-                ecrec_ops: &ecrec_ops,
-                is_wh_rows: &is_wh_rows,
-                max_rows,
-                num_padding_rows,
-                padding_byte_checks: padding_byte_checks(
-                    shift_ops.len(),
-                    keccak_ops.len(),
-                    max_rows,
-                    skip,
-                ),
-                mode: P4Mode::of(skip),
-            };
-            let page = page.as_deref().map(|p| p as _);
-            let histogram = count_bitwise(lists, &bitwise_ops, page, pre, false);
-            // The in-walk lookups have been counted into the histogram; free them now.
-            drop(bitwise_ops);
-            BitwiseCount::Counted(histogram)
-        };
-        #[cfg(feature = "instruments")]
-        drop(__sp);
-        build_stamps::mark("p4 bitwise");
-
-        // A monolithic run or the final continuation epoch terminates on the program's
-        // halt ECALL. Intermediate continuation epochs do not halt, so fall back to the
-        // last cycle's timestamp and skip HALT-based PC finalization — the PC is carried
-        // to the next epoch via the register snapshot, and HALT is excluded from the
-        // proof (`include_halt = false`) so `halt_trace` is unused there.
-        let (halt_timestamp, halt_next_pc) = if is_final {
-            let (halt_timestamp, halt_next_pc) = cpu_ops
-                .iter()
-                .rev()
-                .find(|op| decode_table.entry(op.decode_row).fields.ecall)
-                .map(|op| (op.timestamp, op.next_pc))
-                .or(streamed_last_ecall)
-                .ok_or(Error::MissingHaltEcall)?;
-            // Finalize the PC (x255) on the REGISTER table. The CPU padding rows carry
-            // pc=1 and chain the inline-PC `memory` tokens with a +4 timestamp cadence
-            // starting from the HALT chip's emit_pc at `halt_timestamp + 1`; the last
-            // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
-            // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
-            // must match that last write to balance the memory argument.
-            let final_pc = super::clock::final_pc_timestamp(halt_timestamp, num_padding_rows);
-            super::clock::check_clock(final_pc, "the CPU's last padding row")?;
-            register_state.write_pc(1, final_pc);
-            (halt_timestamp, halt_next_pc)
-        } else {
-            (cpu_ops.last().map(|op| op.timestamp).unwrap_or(0), 0)
-        };
-
-        let register_final_state = register_state.to_final_state_map();
-
         // The PAGE layout: none in a continuation epoch (the L2G table owns every
         // touched cell's Memory init/fini there) or without an image.
         let page_configs = match initial_image {
@@ -1549,6 +1506,130 @@ impl<'a> FinishPlan<'a> {
                 cut.join(" · "),
             )
         });
+
+        // The header, once every count is known: to the early taker, when
+        // there is one ([`EarlyHeader`]), before phase 4 and the rest's builds.
+        if let Some(early) = early {
+            let header = RestHeader {
+                table_counts: table_counts.clone(),
+                page_configs: page_configs.clone(),
+                public_output_bytes: public_output_bytes.clone(),
+                num_blake3_ops,
+                cpu_heights: cpu_heights.clone(),
+                bitwise_last: early.bitwise_last,
+                bitwise_from_tables: early.bitwise_from_tables,
+                keccak_rnd_first: early.keccak_rnd_first,
+                pages_first: early.pages_first,
+                fused_counts,
+                word_counts,
+            };
+            build_stamps::mark("p4 header early");
+            EARLY_HEADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (early.send)(header);
+        }
+
+        // PAGE's lookups, from the initial image (a continuation epoch's L2G
+        // table owns them).
+        // Under the word memory format PAGE_W's: `IS_HALF` on each initial
+        // half of a private-input page's words, none on any other page.
+        let page = initial_image
+            .filter(|_| !l2g_memory_bookend)
+            .map(|image| -> PageCount<'a> {
+                if words {
+                    let private: Vec<PageConfig> = page_configs
+                        .iter()
+                        .filter(|config| config.is_private_input)
+                        .cloned()
+                        .collect();
+                    return Box::new(move |h: &mut bitwise::BitwiseHistogram| {
+                        for config in &private {
+                            for op in super::super::page_w::bitwise_ops(config) {
+                                h.bump(op);
+                            }
+                        }
+                    });
+                }
+                Box::new(move |h: &mut bitwise::BitwiseHistogram| {
+                    collect_bitwise_from_page(image, memory_state, l2g_memory_bookend, h)
+                })
+            });
+        let bitwise = if skip.p4_beside {
+            // Counted by BITWISE's own table, beside the rest's builds: the
+            // in-walk lookups wait for it.
+            BitwiseCount::Beside(Box::new(P4Pending {
+                bitwise_ops,
+                page,
+                pre,
+            }))
+        } else {
+            let lists = P4Lists {
+                lt: &lt,
+                shift_ops: &shift_ops,
+                store_ops: &store_ops,
+                memw_aligned_ops: &memw_aligned_ops,
+                memw_register_rows: &memw_register_rows,
+                branch_ops: &branch_ops,
+                mul_ops: &mul_ops,
+                dvrm_ops: &dvrm_ops,
+                eq_ops: &eq_ops,
+                bytewise_ops: &bytewise_ops,
+                keccak_ops: &keccak_ops,
+                ecdas_ops: &ecdas_ops,
+                copy_ops: &copy_ops,
+                blake3_ops: &blake3_ops,
+                blake3_absorb_ops: &blake3_absorb_ops,
+                ecsm_ops: &ecsm_ops,
+                hint_ops: &hint_ops,
+                ecrec_ops: &ecrec_ops,
+                is_wh_rows: &is_wh_rows,
+                max_rows,
+                num_padding_rows,
+                padding_byte_checks: padding_byte_checks(
+                    shift_ops.len(),
+                    keccak_ops.len(),
+                    max_rows,
+                    skip,
+                ),
+                mode: P4Mode::of(skip),
+            };
+            let page = page.as_deref().map(|p| p as _);
+            let histogram = count_bitwise(lists, &bitwise_ops, page, pre, false);
+            // The in-walk lookups have been counted into the histogram; free them now.
+            drop(bitwise_ops);
+            BitwiseCount::Counted(histogram)
+        };
+        #[cfg(feature = "instruments")]
+        drop(__sp);
+        build_stamps::mark("p4 bitwise");
+
+        // A monolithic run or the final continuation epoch terminates on the program's
+        // halt ECALL. Intermediate continuation epochs do not halt, so fall back to the
+        // last cycle's timestamp and skip HALT-based PC finalization — the PC is carried
+        // to the next epoch via the register snapshot, and HALT is excluded from the
+        // proof (`include_halt = false`) so `halt_trace` is unused there.
+        let (halt_timestamp, halt_next_pc) = if is_final {
+            let (halt_timestamp, halt_next_pc) = cpu_ops
+                .iter()
+                .rev()
+                .find(|op| decode_table.entry(op.decode_row).fields.ecall)
+                .map(|op| (op.timestamp, op.next_pc))
+                .or(streamed_last_ecall)
+                .ok_or(Error::MissingHaltEcall)?;
+            // Finalize the PC (x255) on the REGISTER table. The CPU padding rows carry
+            // pc=1 and chain the inline-PC `memory` tokens with a +4 timestamp cadence
+            // starting from the HALT chip's emit_pc at `halt_timestamp + 1`; the last
+            // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
+            // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
+            // must match that last write to balance the memory argument.
+            let final_pc = super::clock::final_pc_timestamp(halt_timestamp, num_padding_rows);
+            super::clock::check_clock(final_pc, "the CPU's last padding row")?;
+            register_state.write_pc(1, final_pc);
+            (halt_timestamp, halt_next_pc)
+        } else {
+            (cpu_ops.last().map(|op| op.timestamp).unwrap_or(0), 0)
+        };
+
+        let register_final_state = register_state.to_final_state_map();
 
         Ok(Self {
             memory_state,
