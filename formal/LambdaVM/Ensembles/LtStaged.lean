@@ -269,7 +269,10 @@ def minComponent : Component (F p) where
 @[circuit_norm] lemma minComponent_requirements :
     minComponent.circuit.channelsWithRequirements = [Alu.channel.toRaw] := rfl
 
-/-- The ALU messages of MIN: read as an ALU message, the flag field is `opsel(MIN)`. -/
+/-- The ALU messages of MIN: read as an ALU message, the flag field is `opsel(MIN)`.
+
+The `9` is `Alu.opselMIN` written as a literal, for the reason given on
+`MinToy.opsel_literals`, which pins the two names to their values so this cannot drift. -/
 def isMinMsg (msg : Array (F p)) : Bool :=
   if h : msg.size = size Alu.Msg then
     decide ((fromElements (⟨msg, h⟩ : Vector (F p) (size Alu.Msg)) : Alu.Msg (F p)).flags = 9)
