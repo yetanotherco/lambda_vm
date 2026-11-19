@@ -200,10 +200,10 @@ impl DeviceColumns {
         let total: usize = columns.iter().map(|&k| src.spans[k].1).sum::<usize>()
             + extra.iter().map(|c| c.len()).sum::<usize>();
         let be = backend().ok()?;
-        let Some(room) = be.reserve(total as u64 * 8) else {
-            crate::device::note_device_fallback();
-            return None;
-        };
+        // Not a device fallback: a refusal here takes the reader's old path,
+        // which counts its own refusal where its work moves to the host
+        // ([`crate::device::note_device_fallback`]'s site list).
+        let room = be.reserve(total as u64 * 8)?;
         let stream = be.next_stream();
         // SAFETY: every element is written by the copies below.
         let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, total) }.ok()?;
