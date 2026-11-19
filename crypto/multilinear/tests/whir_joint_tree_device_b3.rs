@@ -260,9 +260,17 @@ fn a_blake3_joint_run_on_the_card_proves_the_hosts_bytes() {
         );
 
         let fallbacks = gpu::host_fallbacks();
+        let waits = gpu::serial_encode_waits();
         let (roots, whole) = stack
             .try_prove(&cfg, None)
             .unwrap_or_else(|e| panic!("{}, whole: {e:?}", stack.name));
+        // A group's encodes one at a time (the default): each waited for.
+        assert_eq!(
+            gpu::serial_encode_waits() > waits,
+            gpu::serial_encodes(),
+            "{}: the encodes waited for one at a time",
+            stack.name
+        );
         assert_eq!(
             gpu::host_fallbacks(),
             fallbacks,

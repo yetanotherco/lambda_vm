@@ -2016,6 +2016,17 @@ where
             None => crate::gpu::encode_parts(&f.parts, num_vars, config.log_blowup, transient),
         };
         match encoded {
+            // One encode at a time ([`crate::gpu::serial_encodes`]): its
+            // coefficient buffer and scratch go back to the pool before the
+            // next encode takes its own. A stream that fails to finish is a
+            // card that declined.
+            Some(codeword) if crate::gpu::serial_encodes() => {
+                if !codeword.synchronize() {
+                    break;
+                }
+                crate::gpu::note_serial_encode_wait();
+                on_card.push(codeword);
+            }
             Some(codeword) => on_card.push(codeword),
             None => break,
         }
