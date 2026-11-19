@@ -330,10 +330,10 @@ pub struct ProverFaults {
     /// honest over the lists so changed. The table's last chunk must hold a
     /// padding slot of its own (a short last chunk).
     pub pad_mass: Option<usize>,
-    /// This table's first tree departs from a two-layer ladder at its first
-    /// two-layer step, as [`gkr_lockstep::StepFault`] says, and steps
-    /// honestly after.
-    pub ladder: Option<(usize, gkr_lockstep::StepFault)>,
+    /// `(table, fault, layer)`: this table's first tree departs at its ladder
+    /// step over `layer` (2 is its first two-layer step), as
+    /// [`gkr_lockstep::StepFault`] says, and steps honestly after.
+    pub ladder: Option<(usize, gkr_lockstep::StepFault, usize)>,
     /// This table's bus output forged as under `balance_with`, and on a
     /// two-layer ladder its first tree's first step shifted along the
     /// diagonal ([`gkr_lockstep::StepFault::Diagonal`]) so that step's
@@ -1083,12 +1083,12 @@ where
         // from the ladder.
         let armed: Option<(usize, gkr_lockstep::Faulted<'_, E>)> = faults
             .ladder
-            .and_then(|(target, fault)| {
+            .and_then(|(target, fault, layer)| {
                 let tree = plan.first_tree(target);
                 members
                     .iter()
                     .position(|&(_, i)| i == tree)
-                    .map(|k| (k, gkr_lockstep::Faulted::new(refs[k], fault)))
+                    .map(|k| (k, gkr_lockstep::Faulted::at(refs[k], fault, layer)))
             })
             .or_else(|| {
                 let (tree, fake) = fake_output.as_ref().filter(|_| faults.diagonal.is_some())?;
