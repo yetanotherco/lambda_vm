@@ -9127,6 +9127,11 @@ pub(crate) fn commit_joint_streamed(
     match built {
         Ok((tree, root)) => {
             COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+            // The run's other codewords were never held beside the last.
+            STREAMED_NOT_HELD.fetch_add(
+                (blocks.saturating_sub(1) << log_elements) as u64 * 8,
+                Ordering::Relaxed,
+            );
             Some((JointTree(tree), root))
         }
         Err(err) => {
@@ -9186,6 +9191,17 @@ pub(crate) fn commit_joint_streamed(
     _encode: impl FnMut(usize) -> Option<DeviceCodeword>,
 ) -> Option<(JointTree, [u8; 32])> {
     None
+}
+
+/// Codeword bytes a streamed joint commit did not hold beside the run's last
+/// codeword ([`commit_joint_streamed`]): `(run − 1) ×` a codeword's, summed. What
+/// a phase-A commit's ledger growth is short of the batched commit's, for a
+/// planner that reads that growth as a measure of the group's size.
+static STREAMED_NOT_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// [`STREAMED_NOT_HELD`] so far.
+pub fn streamed_not_held_bytes() -> u64 {
+    STREAMED_NOT_HELD.load(Ordering::Relaxed)
 }
 
 /// Joint trees built one codeword at a time ([`commit_joint_streamed`]).
