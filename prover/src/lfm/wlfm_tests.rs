@@ -447,6 +447,7 @@ fn count_zero_verify(build: &WlfmBuild, proof: &WlfmProof) -> Result<(), String>
         &mut transcript,
         false,
         VerifierChecks::ALL,
+        None,
     )
     .map_err(|e| format!("{e:?}"))
 }

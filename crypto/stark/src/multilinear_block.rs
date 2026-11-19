@@ -97,9 +97,13 @@ use multilinear::{
 
 use crate::regen::{RegenError, RegenProducer, RegenSlot, RegenWindow};
 
+use crate::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing as BusPacking};
 use crate::multilinear_table::{
     CommittedTable, MultiProof, TableProof, TableStatement, absorb_roots,
-    batched::{self, BatchedArgue, ProverFaults, VerifierChecks, Where},
+    batched::{
+        self, BatchedArgue, ClassTables, LocalArgue, LocalBinding, ProverFaults, VerifierChecks,
+        Where,
+    },
     check_preprocessed, contribution, global_layout, prove, verify,
 };
 
@@ -703,6 +707,21 @@ where
     E: IsField + 'static,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
 {
+    commit_ood_transcript::<E, T>(group, layout, roots, config).map(|(z0, _)| z0)
+}
+
+/// [`commit_ood_point`] and the transcript it was drawn from, which a group's
+/// local transcript continues ([`local_challenges`]).
+pub fn commit_ood_transcript<E, T>(
+    group: usize,
+    layout: &StackedLayout,
+    roots: &[Commitment],
+    config: &ChainConfig,
+) -> Result<(FieldElement<E>, T), MlError>
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
     // One root a round-0 tree: a polynomial's, or a joint run's.
     let trees = stacked_eval::round0_trees(layout.num_polys(), config).len();
     if roots.len() != trees {
@@ -721,7 +740,245 @@ where
         &z0,
         layout.n_stack() + config.log_blowup,
     )?;
-    Ok(z0)
+    Ok((z0, transcript))
+}
+
+/// The label of a group's local lookups in its local transcript (step L4).
+/// 32 bytes, so what follows starts on a felt boundary.
+pub const LOCAL_LOGUP_LABEL: &[u8; 32] = b"LAMBDAVM_WHIR_BLOCK_LOCAL_LOGUP1";
+
+/// The label that opens a table's digest ([`table_digest`]). 32 bytes.
+pub const TABLE_DIGEST_LABEL: &[u8; 32] = b"LAMBDAVM_WHIR_BLOCK_TABLE_DIGEST";
+
+/// ★★ WHERE GROUP `g`'s LOCAL CHALLENGES `(z_g, α_g)` COME FROM — the only
+/// place, called by the prover and the verifier (steps L0–L5).
+///
+/// The group's commit-time out-of-domain transcript ([`commit_ood_transcript`]:
+/// the prefix, its roots, `z0` drawn and refused inside the domain),
+/// continued: every commit-time answer of the group in polynomial order, then
+/// [`LOCAL_LOGUP_LABEL`] and every table's digest in the group's order
+/// ([`table_digest`]), then `z_g` and `α_g`. The transcript is returned for
+/// the group's local ladders (step L6), whose final state the group's fork
+/// absorbs before anything else (step B0).
+///
+/// # Why the group's own challenges argue its local lookups
+///
+/// A local lookup is an equation over the group's columns and the table
+/// definitions it reads, and nothing else: every column it reads is in the
+/// group's stack (the roots), each committed word stands for one codeword
+/// (the answers, as W-10's binding of the main transcript), and every
+/// definition it reads — tuples, multiplicities, constants, heights, widths
+/// — is in a digest. Everything that spans groups (the global buses, every
+/// statement-dependent expected value) is still drawn from the main
+/// transcript after the statement.
+///
+/// `binding` is [`LocalBinding::ALL`] but in the tests that drop one part on
+/// both sides to show what it refuses.
+#[allow(clippy::too_many_arguments)]
+pub fn local_challenges<E, T>(
+    group: usize,
+    layout: &StackedLayout,
+    roots: &[Commitment],
+    answers: &[FieldElement<E>],
+    digests: &[[u8; 32]],
+    config: &ChainConfig,
+    binding: LocalBinding,
+) -> Result<(FieldElement<E>, FieldElement<E>, T), MlError>
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    if answers.len() != layout.num_polys() {
+        return Err(MlError::CommitOodCount {
+            expected: layout.num_polys(),
+            got: answers.len(),
+        });
+    }
+    let mut transcript = if binding.roots {
+        commit_ood_transcript::<E, T>(group, layout, roots, config)?.1
+    } else {
+        // A mutant's transcript: the prefix, no roots, the draw made.
+        let mut transcript = T::default();
+        transcript.append_bytes(&commit_ood_prefix(group, layout, config));
+        let _: FieldElement<E> = transcript.sample_field_element();
+        transcript
+    };
+    if binding.answers {
+        for answer in answers {
+            transcript.append_field_element(answer);
+        }
+    }
+    if binding.digests {
+        transcript.append_bytes(LOCAL_LOGUP_LABEL);
+        for digest in digests {
+            transcript.append_bytes(digest);
+        }
+    }
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    Ok((z, alpha, transcript))
+}
+
+/// ★ A table's digest: everything a group's local lookups read of its
+/// definition, hashed with the block's transcript hash — [`TABLE_DIGEST_LABEL`],
+/// then as little-endian `u64` words its height in variables, its committed
+/// width, its preprocessed count and its interaction count, then per
+/// interaction its bus id, its side (1 a sender), its multiplicity and its
+/// values, each enum by an explicit tag (an exhaustive match: a new variant
+/// is a compile error here).
+///
+/// Computed by each side from its own tables, never read from a proof.
+pub fn table_digest<E, T>(
+    num_vars: usize,
+    width: usize,
+    num_preprocessed: usize,
+    interactions: &[BusInteraction],
+) -> [u8; 32]
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    table_digest_with::<E, T>(num_vars, width, num_preprocessed, interactions, true)
+}
+
+/// [`table_digest`], with every constant of every interaction left out when
+/// `constants` is false: a mutant digest that lets a prover choose a constant
+/// after the group's challenges, for the test that shows the real one does
+/// not.
+#[doc(hidden)]
+pub fn table_digest_with<E, T>(
+    num_vars: usize,
+    width: usize,
+    num_preprocessed: usize,
+    interactions: &[BusInteraction],
+    constants: bool,
+) -> [u8; 32]
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    let mut words: Vec<u64> = vec![
+        num_vars as u64,
+        width as u64,
+        num_preprocessed as u64,
+        interactions.len() as u64,
+    ];
+    let term = |words: &mut Vec<u64>, term: &LinearTerm| match term {
+        LinearTerm::Column {
+            coefficient,
+            column,
+        } => words.extend([0, *coefficient as u64, *column as u64]),
+        LinearTerm::ColumnUnsigned {
+            coefficient,
+            column,
+        } => words.extend([1, *coefficient, *column as u64]),
+        LinearTerm::Constant(value) => words.extend([2, if constants { *value as u64 } else { 0 }]),
+    };
+    for interaction in interactions {
+        let BusInteraction {
+            bus_id,
+            multiplicity,
+            values,
+            is_sender,
+        } = interaction;
+        words.extend([*bus_id, u64::from(*is_sender)]);
+        match multiplicity {
+            Multiplicity::One => words.push(0),
+            Multiplicity::Column(a) => words.extend([1, *a as u64]),
+            Multiplicity::Sum(a, b) => words.extend([2, *a as u64, *b as u64]),
+            Multiplicity::Negated(a) => words.extend([3, *a as u64]),
+            Multiplicity::Diff(a, b) => words.extend([4, *a as u64, *b as u64]),
+            Multiplicity::Sum3(a, b, c) => words.extend([5, *a as u64, *b as u64, *c as u64]),
+            Multiplicity::Linear(terms) => {
+                words.extend([6, terms.len() as u64]);
+                for t in terms {
+                    term(&mut words, t);
+                }
+            }
+        }
+        words.push(values.len() as u64);
+        for value in values {
+            match value {
+                BusValue::Packed {
+                    start_column,
+                    packing,
+                } => words.extend([0, *start_column as u64, packing_tag(*packing)]),
+                BusValue::Linear(terms) => {
+                    words.extend([1, terms.len() as u64]);
+                    for t in terms {
+                        term(&mut words, t);
+                    }
+                }
+            }
+        }
+    }
+    let mut bytes = TABLE_DIGEST_LABEL.to_vec();
+    for word in words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut transcript = T::default();
+    transcript.append_bytes(&bytes);
+    transcript.state()
+}
+
+/// A packing's tag in [`table_digest`]: explicit, never its discriminant.
+fn packing_tag(packing: BusPacking) -> u64 {
+    match packing {
+        BusPacking::Direct => 0,
+        BusPacking::Word2L => 1,
+        BusPacking::Word4L => 2,
+        BusPacking::DWordWL => 3,
+        BusPacking::DWordHHW => 4,
+        BusPacking::DWordWHH => 5,
+        BusPacking::DWordHL => 6,
+        BusPacking::DWordBL => 7,
+        BusPacking::QuadHL => 8,
+        BusPacking::QuadWL => 9,
+    }
+}
+
+/// Local lookups argued per group, on the prover's side
+/// ([`BlockCommitted::with_local_lookups`]): the format's local buses and
+/// every table's digest ([`table_digest`]), in table order.
+#[derive(Clone, Debug)]
+pub struct BlockLocal {
+    pub buses: Vec<u64>,
+    pub digests: Vec<[u8; 32]>,
+}
+
+/// Local lookups on the verifier's side ([`block_verify_with`]): the
+/// format's local buses and every table's digest — both the verifier's own
+/// — and the proof's local argues, one a group (empty for a group with no
+/// local interaction).
+pub struct BlockLocalCheck<'a, E: IsField> {
+    pub buses: &'a [u64],
+    pub digests: &'a [[u8; 32]],
+    pub argues: &'a [LocalArgue<E>],
+}
+
+/// Every field is a reference, so copying is free — spelled out rather than
+/// derived, which would demand `E: Copy` of the field marker.
+impl<E: IsField> Clone for BlockLocalCheck<'_, E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E: IsField> Copy for BlockLocalCheck<'_, E> {}
+
+/// Whether a group argues local lookups: any of its tables has an interaction
+/// on a local bus. One function for both sides, of the statements alone.
+pub fn group_is_local<F, E>(statements: &[TableStatement<'_, F, E>], buses: &[u64]) -> bool
+where
+    F: IsFFTField + IsPrimeField,
+    E: IsField,
+{
+    statements.iter().any(|statement| {
+        statement
+            .interactions
+            .iter()
+            .any(|interaction| buses.contains(&interaction.bus_id))
+    })
 }
 
 /// ★ The block's roots block: [`absorb_roots_and_answers`], then `(z, α, β)`.
@@ -2082,14 +2339,18 @@ fn phase_b_refusals() -> u64 {
 /// argue, none under the per-table one), the prepared openings in the
 /// `prepared` list's order, and every group's stamps.
 ///
-/// The last element is every carried polynomial's commit-time out-of-domain
-/// answer, in root order ([`commit_ood_point`]).
+/// The fifth element is every carried polynomial's commit-time out-of-domain
+/// answer, in root order ([`commit_ood_point`]); the last, under local
+/// lookups ([`BlockCommitted::with_local_lookups`]), every group's local argue
+/// in group order (empty for a group with no local interaction), and nothing
+/// otherwise.
 pub type BlockProved<F, E> = (
     MultiProof<F, E>,
     Vec<BatchedArgue<E>>,
     Vec<StackedProof<F, E>>,
     Vec<GroupStamps>,
     Vec<FieldElement<E>>,
+    Vec<LocalArgue<E>>,
 );
 
 /// The block after phase A: every table, the groups' roots and the tops of
@@ -2150,6 +2411,9 @@ where
     /// ([`CsProbe::merge`]), the host taking a table the card declines when
     /// `Some(true)`.
     merge_probe: Option<bool>,
+    /// Local lookups argued per group ([`Self::with_local_lookups`]), or
+    /// none: today's format.
+    local: Option<BlockLocal>,
 }
 
 /// A test's fault in a block's commit-time answers
@@ -2804,7 +3068,17 @@ where
             ood,
             ood_unbound: false,
             merge_probe: (probe.merge && batched).then_some(probe.host),
+            local: None,
         })
+    }
+
+    /// Phase B argues each group's local lookups on the group's own
+    /// transcript ([`local_challenges`], [`batched::prove_local`]) and its
+    /// global class on its fork, the local state absorbed first; `None`
+    /// unless set here (today's format, every byte). The batched argue only.
+    pub fn with_local_lookups(mut self, local: BlockLocal) -> Self {
+        self.local = Some(local);
+        self
     }
 
     /// Phase B reads its driver thread's CPU time and run-queue delay from
@@ -3355,14 +3629,15 @@ where
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone
-        + Send,
+        + Send
+        + Default,
 {
     // The batched argue's messages are not a `MultiProof`'s: its callers take
     // them from `block_prove_on_forks`.
     if config.format.argue != ArgueFormat::PerTable {
         return Err(MlError::ArgueFormatMismatch);
     }
-    let (proof, _, _, stamps, _) = block_prove_on_forks::<F, E, T, H>(
+    let (proof, _, _, stamps, _, _) = block_prove_on_forks::<F, E, T, H>(
         committed,
         config,
         transcript,
@@ -3401,7 +3676,8 @@ where
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone
-        + Send,
+        + Send
+        + Default,
 {
     block_prove_on_forks_observed::<F, E, T, H>(
         committed,
@@ -3428,6 +3704,9 @@ pub struct GroupOpened<'a, F: IsField, E: IsField> {
     pub commit_ood: &'a [FieldElement<E>],
     /// The group's batched argue (the batched format), or `None`.
     pub argue: Option<&'a BatchedArgue<E>>,
+    /// The group's local argue under local lookups (empty for a group with
+    /// no local interaction), or `None`.
+    pub local: Option<&'a LocalArgue<E>>,
     /// The group's tables' proofs, in table order (the per-table format;
     /// empty under the batched one).
     pub tables: &'a [TableProof<E>],
@@ -3461,7 +3740,8 @@ where
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone
-        + Send,
+        + Send
+        + Default,
 {
     let order: Vec<usize> = (0..committed.sizes.len()).collect();
     block_prove_in_order::<F, E, T, H>(
@@ -3581,6 +3861,8 @@ where
     values: Vec<FieldElement<E>>,
     proofs: Vec<TableProof<E>>,
     argue: Option<BatchedArgue<E>>,
+    /// Its local argue under local lookups.
+    local: Option<LocalArgue<E>>,
     /// Its commit-time out-of-domain claims, batched into its opening
     /// (`None` only under a test's [`OodFault::FalseUnbound`]).
     ood: Option<OodClaims<E>>,
@@ -4446,7 +4728,8 @@ where
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
         + Clone
-        + Send,
+        + Send
+        + Default,
 {
     let BlockCommitted {
         mut tables,
@@ -4469,6 +4752,7 @@ where
         ood,
         ood_unbound,
         merge_probe,
+        local,
     } = committed;
     let n = sizes.len();
     let mut seen = vec![false; n];
@@ -4511,12 +4795,36 @@ where
         .collect();
     let (z, alpha, beta) =
         absorb_roots_answers_and_challenge::<E, T>(transcript, &roots, &derived, &answers);
+    // Under local lookups: the batched argue only, a digest a table, and
+    // where each group's roots and answers start.
+    if let Some(local) = &local {
+        if config.format.argue == ArgueFormat::PerTable {
+            return Err(MlError::ArgueFormatMismatch);
+        }
+        if local.digests.len() != tables.len() {
+            return Err(MlError::QueryCountMismatch {
+                expected: tables.len(),
+                got: local.digests.len(),
+            });
+        }
+    }
+    let mut root_ranges = Vec::with_capacity(n);
+    let mut answer_starts = Vec::with_capacity(n);
+    let (mut root_at, mut answer_at) = (0usize, 0usize);
+    for (stack, claims) in groups.iter().zip(&ood) {
+        let trees = stacked_eval::round0_trees(stack.layout().num_polys(), config).len();
+        root_ranges.push(root_at..root_at + trees);
+        answer_starts.push(answer_at);
+        root_at += trees;
+        answer_at += claims.answers.len();
+    }
     let mut ood: Vec<Option<OodClaims<E>>> = ood.into_iter().map(Some).collect();
 
     // Each group's share, by group, assembled in group order at the end.
     let mut retired: Vec<Option<RetiredStack<F>>> = groups.into_iter().map(Some).collect();
     let mut group_tables: Vec<Vec<TableProof<E>>> = (0..n).map(|_| Vec::new()).collect();
     let mut group_argue: Vec<Option<BatchedArgue<E>>> = (0..n).map(|_| None).collect();
+    let mut group_local: Vec<Option<LocalArgue<E>>> = (0..n).map(|_| None).collect();
     let mut group_opening: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
     let mut group_prepared: Vec<Option<StackedProof<F, E>>> = (0..n).map(|_| None).collect();
     // The next group's columns, uploaded during this group's argument — the
@@ -4630,7 +4938,16 @@ where
         let mut zc_b = 0.0f64;
         let mut bins_b: Vec<f64> = Vec::new();
         let mut merged = MergeStamp::default();
+        let mut local_argue: Option<LocalArgue<E>> = None;
         let all: &[CommittedTable<'_, F, E>] = &tables;
+        let group_layout = retired.layout();
+        let group_roots = roots
+            .get(root_ranges[g].clone())
+            .ok_or(MlError::QueryCountMismatch {
+                expected: root_ranges[g].end,
+                got: roots.len(),
+            })?;
+        let group_answers = &answers[answer_starts[g]..answer_starts[g] + group_layout.num_polys()];
         let group_ref = &all[at..at + size];
         // Under `upload_beside` off the next group's columns go up at its own
         // turn instead (`pre_uploaded` stays empty).
@@ -4664,6 +4981,7 @@ where
                             roots: roots_ref,
                             commit_ood: answers_ref,
                             argue: earlier.argue.as_ref(),
+                            local: earlier.local.as_ref(),
                             tables: &earlier.proofs,
                             opening: &opened.opening,
                             prepared: opened.prepared.as_ref(),
@@ -4700,18 +5018,71 @@ where
                                 Some(faulty) if faulty == g => argue.faults,
                                 _ => ProverFaults::default(),
                             };
-                            let (proof, reduced) = batched::prove_argue(
-                                group_ref,
-                                &z,
-                                &alpha,
-                                &beta,
-                                bin_log_cells,
-                                pack,
-                                ladder,
-                                &mut fork,
-                                faults,
-                                argue.at,
-                            )?;
+                            let statements: Vec<TableStatement<'_, F, E>> =
+                                group_ref.iter().map(CommittedTable::statement).collect();
+                            let local = local
+                                .as_ref()
+                                .filter(|local| group_is_local(&statements, &local.buses));
+                            let (proof, reduced) = match local {
+                                None => batched::prove_argue(
+                                    group_ref,
+                                    &z,
+                                    &alpha,
+                                    &beta,
+                                    bin_log_cells,
+                                    pack,
+                                    ladder,
+                                    &mut fork,
+                                    faults,
+                                    argue.at,
+                                )?,
+                                Some(local) => {
+                                    // The local challenges and ladders on
+                                    // the group's own transcript, then its
+                                    // state into the fork before anything else.
+                                    let (z_g, alpha_g, mut own) = local_challenges::<E, T>(
+                                        g,
+                                        group_layout,
+                                        group_roots,
+                                        group_answers,
+                                        &local.digests[at..at + size],
+                                        config,
+                                        // A mutant binding is the format's,
+                                        // so every group's, as the verifier's.
+                                        argue.faults.local_binding.unwrap_or(LocalBinding::ALL),
+                                    )?;
+                                    let (local_proof, claims) = batched::prove_local(
+                                        group_ref,
+                                        &local.buses,
+                                        &z_g,
+                                        &alpha_g,
+                                        bin_log_cells,
+                                        pack,
+                                        ladder,
+                                        &mut own,
+                                        faults,
+                                        argue.at,
+                                    )?;
+                                    fork.append_bytes(&own.state());
+                                    local_argue = Some(local_proof);
+                                    let global =
+                                        ClassTables::split(&statements, &local.buses, false);
+                                    batched::prove_argue_classed(
+                                        group_ref,
+                                        &global,
+                                        Some(&claims),
+                                        &z,
+                                        &alpha,
+                                        &beta,
+                                        bin_log_cells,
+                                        pack,
+                                        ladder,
+                                        &mut fork,
+                                        faults,
+                                        argue.at,
+                                    )?
+                                }
+                            };
                             zc_b = batched::take_last_zc_secs();
                             bins_b = batched::take_last_bin_secs();
                             if let Some(host) = merge_probe {
@@ -4801,6 +5172,7 @@ where
             s.open_draws = opened.draws;
             group_tables[h] = earlier.proofs;
             group_argue[h] = earlier.argue;
+            group_local[h] = earlier.local;
             group_opening[h] = Some(opened.opening);
             group_prepared[h] = opened.prepared;
             stamps[h].records_released = release_group(
@@ -4837,6 +5209,7 @@ where
             values,
             proofs,
             argue: batched_argue,
+            local: local_argue,
             ood: Some(ood[g].take().ok_or(MlError::QueryCountMismatch {
                 expected: n,
                 got: order.len(),
@@ -4947,12 +5320,14 @@ where
             roots: &roots,
             commit_ood: &answers,
             argue: argued.argue.as_ref(),
+            local: argued.local.as_ref(),
             tables: &argued.proofs,
             opening: &opened.opening,
             prepared: opened.prepared.as_ref(),
         });
         group_tables[g] = argued.proofs;
         group_argue[g] = argued.argue;
+        group_local[g] = argued.local;
         group_opening[g] = Some(opened.opening);
         group_prepared[g] = opened.prepared;
         drop(stacked);
@@ -4998,6 +5373,13 @@ where
         group_prepared.into_iter().flatten().collect(),
         stamps,
         answers,
+        match local {
+            Some(_) => group_local
+                .into_iter()
+                .map(Option::unwrap_or_default)
+                .collect(),
+            None => Vec::new(),
+        },
     ))
 }
 
@@ -5049,6 +5431,7 @@ where
         transcript,
         false,
         VerifierChecks::ALL,
+        None,
     )
 }
 
@@ -5069,6 +5452,17 @@ where
 /// chain against its group's point, which the verifier draws from the proof's
 /// roots and its own layout ([`commit_ood_point`]). There is no format without
 /// them.
+///
+/// `local` is the verifier's own local-lookups format ([`BlockLocalCheck`]: its
+/// local buses and every table's digest) with the proof's local argues, or
+/// `None` for today's format. Under it, before anything else every receiver
+/// on a local bus must read verifier-fixed columns only
+/// ([`batched::check_local_receivers`]); then each group with a local
+/// interaction rebuilds its local transcript ([`local_challenges`]), checks
+/// its local argue and local balance ([`batched::verify_local`]), absorbs the
+/// local state into its fork, and argues its global class with the local
+/// pairs ([`batched::verify_argue_classed`]); a group with none carries an
+/// empty local argue and argues as today.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn block_verify_with<F, E, T, H>(
@@ -5086,6 +5480,7 @@ pub fn block_verify_with<F, E, T, H>(
     transcript: &mut T,
     skip_prepared: bool,
     checks: VerifierChecks,
+    local: Option<BlockLocalCheck<'_, E>>,
 ) -> Result<(), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -5106,6 +5501,22 @@ where
     };
     if proof.tables.len() != table_proofs || argues.len() != group_argues {
         return Err(MlError::ArgueFormatMismatch);
+    }
+    // Local lookups: the batched argue only, one local argue a group, a
+    // digest a table, and every local receiver a fixed table.
+    if let Some(local) = &local {
+        if config.format.argue == ArgueFormat::PerTable || local.argues.len() != sizes.len() {
+            return Err(MlError::ArgueFormatMismatch);
+        }
+        if local.digests.len() != statements.len() {
+            return Err(MlError::QueryCountMismatch {
+                expected: statements.len(),
+                got: local.digests.len(),
+            });
+        }
+        if checks.local_receivers {
+            batched::check_local_receivers(statements, local.buses)?;
+        }
     }
     if layouts.len() != sizes.len()
         || domains.len() != sizes.len()
@@ -5230,18 +5641,76 @@ where
                 // The group's bins and trees come from its statements and the
                 // verifier's cap, packing and ladder, never from the proof.
                 let argue = &argues[g];
-                let reduced = batched::verify_argue(
-                    argue,
-                    group_statements,
-                    bin_log_cells,
-                    pack,
-                    ladder,
-                    &z,
-                    &alpha,
-                    &beta,
-                    &mut fork,
-                    checks,
-                )?;
+                let trees = stacked_eval::round0_trees(layout.num_polys(), config).len();
+                let reduced = match local {
+                    Some(local) if group_is_local(group_statements, local.buses) => {
+                        // The local challenges from the proof's roots and
+                        // answers and the verifier's own layout and digests;
+                        // the local ladders and the local balance; then the
+                        // local state into the fork and the global class.
+                        let (z_g, alpha_g, mut own) = local_challenges::<E, T>(
+                            g,
+                            layout,
+                            &proof.roots[root_at..root_at + trees],
+                            &commit_ood[answer_at..answer_at + layout.num_polys()],
+                            &local.digests[statement_at..statement_at + size],
+                            config,
+                            checks.local_binding,
+                        )?;
+                        let claims = batched::verify_local(
+                            &local.argues[g],
+                            group_statements,
+                            local.buses,
+                            &z_g,
+                            &alpha_g,
+                            bin_log_cells,
+                            pack,
+                            ladder,
+                            &mut own,
+                            checks,
+                            g,
+                        )?;
+                        if checks.local_state {
+                            fork.append_bytes(&own.state());
+                        }
+                        let global = ClassTables::split(group_statements, local.buses, false);
+                        batched::verify_argue_classed(
+                            argue,
+                            group_statements,
+                            &global,
+                            Some(&claims),
+                            bin_log_cells,
+                            pack,
+                            ladder,
+                            &z,
+                            &alpha,
+                            &beta,
+                            &mut fork,
+                            checks,
+                        )?
+                    }
+                    _ => {
+                        // A group with no local interaction carries no local
+                        // argue.
+                        if local.is_some_and(|local| !local.argues[g].is_empty()) {
+                            return Err(MlError::ArgueShapeMismatch {
+                                part: "local argue",
+                            });
+                        }
+                        batched::verify_argue(
+                            argue,
+                            group_statements,
+                            bin_log_cells,
+                            pack,
+                            ladder,
+                            &z,
+                            &alpha,
+                            &beta,
+                            &mut fork,
+                            checks,
+                        )?
+                    }
+                };
                 for output in &argue.bus_outputs {
                     balance += contribution(output).ok_or(MlError::BusImbalance)?;
                 }
