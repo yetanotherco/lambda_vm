@@ -1339,9 +1339,11 @@ impl WhirBlockPlan {
     /// validator, compiled in parallel when `parallel`
     /// ([`super::compiler::compile_parallel`], the same program row for row),
     /// with the seconds of its walk and its compile: for a prover that
-    /// validates the program itself, before or beside its execution, and
-    /// refuses before it proves (`levels::program_fast`). A verifier derives
-    /// it compiled and validated as before ([`Self::closed_block_program`]).
+    /// validates the program itself, before or beside its execution (or,
+    /// under `levels::VALIDATE_LATE_ENV`, beside its prove), and keeps no
+    /// proof of a program that fails (`levels::program_fast`). A verifier
+    /// derives it compiled and validated as before
+    /// ([`Self::closed_block_program_admitted`]).
     pub fn closed_block_program_marked_timed(
         &self,
         parallel: bool,

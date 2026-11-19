@@ -544,8 +544,9 @@ fn join_slices(slices: Vec<ColumnGroupBuilder>) -> ColumnGroup {
 /// validator: a source with an address written twice, or read and never
 /// written, compiles to a program [`super::validator::validate`] refuses,
 /// where [`compile`] panics. For a prover that validates the program anyway
-/// before it proves (the levels' driver, `levels::PROGRAM_FAST_ENV`); a
-/// verifier compiles with [`compile`].
+/// and keeps no proof of a program that fails (the levels' driver,
+/// `levels::PROGRAM_FAST_ENV`, `levels::VALIDATE_LATE_ENV`); a verifier
+/// compiles with [`compile`].
 #[cfg(feature = "parallel")]
 pub fn compile_parallel(source: LfmProgramSource) -> LfmProgram {
     compile_parallel_sliced(source, 1 << 20)
