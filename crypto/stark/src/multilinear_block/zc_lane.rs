@@ -1,6 +1,9 @@
-//! ⛔ MEASUREMENTS, never part of a proof: phase A's constraint-sumcheck lane
-//! ([`CsProbeMode::Lane`]), phase B's merge probe ([`CsProbe::merge`]), and
-//! their readout lines.
+//! Phase A's lane: a thread beside the commits that runs, under local
+//! lookups, each local group's local argue one bin at a time
+//! ([`batched::LocalProver`], on the group's own transcript: the proof's
+//! bytes, wherever the bins run); and ⛔ MEASUREMENTS, never part of a proof:
+//! the constraint-sumcheck lane ([`CsProbeMode::Lane`]), phase B's merge
+//! probe ([`CsProbe::merge`]), and their readout lines.
 //!
 //! The lane is a thread beside phase A. After each group's commit the
 //! committer hands it a job: the group's tables as views over the group's
@@ -12,7 +15,17 @@
 //! rules weighted 0) on a throwaway transcript, as a format that ran it in
 //! phase A would, and drops what it proved. Nothing it draws or sends reaches
 //! the block's transcript: the proof is the same byte for byte.
+//!
+//! A local job is the same kind of job with the group's local argue in it:
+//! the challenges and the transcript the committer drew right after the
+//! group's commit ([`super::LocalStarted`]). Each unit is one bin. A job that
+//! stops (phase A's end, a commit's shed, a hold or memory refusal) keeps its
+//! prover and transcript, and phase B runs the bins left at the group's turn;
+//! a job whose unit fails is dropped whole, and phase B argues the group
+//! from its challenges again. Either way the bytes are the ones phase B alone
+//! would send.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Condvar, Mutex};
@@ -21,6 +34,13 @@ use std::time::Duration;
 use multilinear::whir_chain::GkrPack;
 
 use super::*;
+
+/// A local argue the lane hands on ([`super::LocalStarted`], type-erased:
+/// the lane is not generic over the transcript).
+type LocalHandOff = Box<dyn Any + Send>;
+
+/// Every group's stamp and every local argue the lane let go of, by group.
+type LaneParts = (Vec<(usize, ZcLaneStamp)>, Vec<(usize, LocalHandOff)>);
 
 /// The label that opens a lane job's transcript: no proof's transcript opens
 /// with it.
@@ -47,6 +67,13 @@ pub struct LaneLimits {
     /// growth a commit has made) with the held stores stays under
     /// `budget − unledgered`, or the lane lets stores go before the commit.
     pub unledgered: u64,
+    /// A test's stop: each local job stops after this many bins
+    /// ([`LaneDefer::Stopped`]); `None` in production.
+    pub bins: Option<usize>,
+    /// ⛔ A test's fault: each local job's unit at this bin fails after it
+    /// ran, its transcript moved past what the bin sent — a failure that
+    /// leaves the job partway. `None` in production.
+    pub fail_bin: Option<usize>,
 }
 
 impl Default for LaneLimits {
@@ -56,6 +83,8 @@ impl Default for LaneLimits {
             hold_bytes: None,
             margin: 5 << 29,
             unledgered: 5 << 29,
+            bins: None,
+            fail_bin: None,
         }
     }
 }
@@ -74,6 +103,8 @@ pub enum LaneDefer {
     Shed,
     /// No store on the card, and the host may not take it.
     NoStore,
+    /// A local job stopped by a test after [`LaneLimits::bins`] bins.
+    Stopped,
 }
 
 /// What became of a group's lane job, or of its merge probe.
@@ -103,6 +134,7 @@ impl LaneState {
             Self::Deferred(LaneDefer::Tail) => "tail",
             Self::Deferred(LaneDefer::Shed) => "shed",
             Self::Deferred(LaneDefer::NoStore) => "nostore",
+            Self::Deferred(LaneDefer::Stopped) => "stopped",
             Self::Declined => "declined",
             Self::Failed => "failed",
         }
@@ -140,6 +172,9 @@ pub struct ZcLaneStamp {
     pub ladders: f64,
     /// What this group's commit waited for the lane's unit under way.
     pub commit_wait: f64,
+    /// A local job (local lookups): `bins`, `bins_ran` and `ladders` are its
+    /// local argue's.
+    pub local: bool,
 }
 
 /// A group's merge probe in phase B ([`CsProbe::merge`]).
@@ -174,6 +209,8 @@ where
     roots: Vec<Commitment>,
     on_card: bool,
     stamp: ZcLaneStamp,
+    /// A local job's argue begun at commit time ([`super::LocalStarted`]).
+    local: Option<Box<dyn Any + Send>>,
 }
 
 struct LaneQueue<'a, F, E>
@@ -196,6 +233,9 @@ where
     stamps: Vec<(usize, ZcLaneStamp)>,
     /// What each group's commit waited for a unit, by group.
     commit_waits: Vec<(usize, f64)>,
+    /// Every local argue the lane let go of, by group, for phase B to
+    /// finish.
+    local: Vec<(usize, Box<dyn Any + Send>)>,
 }
 
 /// The lane ([`CsProbeMode::Lane`]): shared by phase A's committer, which
@@ -215,7 +255,10 @@ where
     pack: GkrPack,
     /// The argue's GKR ladder (one tree layer a step, or two).
     ladder: multilinear::gkr_lockstep::GkrLadder,
-    work: LaneWork,
+    /// The measurement a group with no local job runs, if any.
+    work: Option<LaneWork>,
+    /// The format's local buses, when the lane runs local jobs.
+    local_buses: Option<Vec<u64>>,
     /// A commit is in flight: no job starts.
     committing: AtomicBool,
     /// The most a commit has grown the ledger so far (bytes).
@@ -231,9 +274,14 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    /// The lane for `probe` under `config`; `None` unless the argue is
-    /// batched.
-    pub(super) fn new(probe: &CsProbe, config: &ChainConfig) -> Option<Self> {
+    /// The lane for `probe` under `config`, running local jobs over
+    /// `local_buses` when they are given; `None` unless the argue is batched
+    /// and the lane has work (a lane probe or local jobs).
+    pub(super) fn new(
+        probe: &CsProbe,
+        config: &ChainConfig,
+        local_buses: Option<Vec<u64>>,
+    ) -> Option<Self> {
         let ArgueFormat::Batched {
             bin_log_cells,
             pack,
@@ -242,6 +290,13 @@ where
         else {
             return None;
         };
+        let work = match probe.mode {
+            CsProbeMode::Lane(work) => Some(work),
+            _ => None,
+        };
+        if work.is_none() && local_buses.is_none() {
+            return None;
+        }
         Some(Self {
             started: Instant::now(),
             host: probe.host,
@@ -250,10 +305,8 @@ where
             bin_log_cells,
             pack,
             ladder,
-            work: match probe.mode {
-                CsProbeMode::Lane(work) => work,
-                _ => LaneWork::Zc,
-            },
+            work,
+            local_buses,
             committing: AtomicBool::new(false),
             max_growth: AtomicU64::new(0),
             queue: Mutex::new(LaneQueue {
@@ -264,6 +317,7 @@ where
                 closing: false,
                 stamps: Vec::new(),
                 commit_waits: Vec::new(),
+                local: Vec::new(),
             }),
             wake: Condvar::new(),
         })
@@ -316,6 +370,9 @@ where
             let mut stamp = job.stamp;
             stamp.state = LaneState::Deferred(LaneDefer::Shed);
             queue.stamps.push((job.group, stamp));
+            if let Some(local) = job.local {
+                queue.local.push((job.group, local));
+            }
             // Its store goes now, before the ledger is read again.
             drop(job.tables);
             self.decide();
@@ -337,6 +394,11 @@ where
             .push((group, waited.elapsed().as_secs_f64()));
     }
 
+    /// Whether the lane runs local jobs.
+    pub(super) fn runs_local(&self) -> bool {
+        self.local_buses.is_some()
+    }
+
     /// The commit ended.
     pub(super) fn commit_ends(&self) {
         self.committing
@@ -352,7 +414,9 @@ where
 
     /// Group `group`, just committed: its job, held while the lane may hold it
     /// ([`LaneLimits`]), else stamped deferred. `on_card`: its tables point at
-    /// the group's store on the card.
+    /// the group's store on the card. `local`: its local argue begun at
+    /// commit time — a local job; a group with none runs the lane's probe, if
+    /// one is on, and nothing otherwise.
     pub(super) fn submit(
         &self,
         group: usize,
@@ -360,12 +424,19 @@ where
         roots: &[Commitment],
         on_card: bool,
         committed: Instant,
+        local: Option<Box<dyn Any + Send>>,
     ) {
+        if local.is_none() && self.work.is_none() {
+            // Nothing for the lane: decided at once.
+            self.decide();
+            return;
+        }
         let store_bytes: u64 = tables.iter().map(|t| wide_bytes(t) as u64).sum();
         let mut stamp = ZcLaneStamp {
             tables: tables.len(),
             committed_at: self.secs(committed),
             store_bytes,
+            local: local.is_some(),
             ..Default::default()
         };
         let mut queue = self.lock();
@@ -395,6 +466,9 @@ where
         if let Some(why) = defer {
             stamp.state = LaneState::Deferred(why);
             queue.stamps.push((group, stamp));
+            if let Some(local) = local {
+                queue.local.push((group, local));
+            }
             drop(queue);
             self.decide();
             return;
@@ -407,6 +481,7 @@ where
             roots: roots.to_vec(),
             on_card,
             stamp,
+            local,
         });
         drop(queue);
         self.wake.notify_all();
@@ -421,7 +496,7 @@ where
     /// The lane's thread: runs the jobs until [`Self::close`].
     pub(super) fn run<T>(&self)
     where
-        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
     {
         // Behind the commits: every stream this thread draws is a background one.
         let _background = multilinear::gpu::background_streams();
@@ -447,10 +522,13 @@ where
                 }
             };
             let Some(job) = job else { break };
-            let (group, stamp) = self.run_job::<T>(job);
+            let (group, stamp, local) = self.run_job::<T>(job);
             let mut queue = self.lock();
             queue.running = None;
             queue.stamps.push((group, stamp));
+            if let Some(local) = local {
+                queue.local.push((group, local));
+            }
             drop(queue);
             self.wake.notify_all();
             self.decide();
@@ -460,7 +538,12 @@ where
         for job in left {
             let mut stamp = job.stamp;
             stamp.state = LaneState::Deferred(LaneDefer::Tail);
-            self.lock().stamps.push((job.group, stamp));
+            let mut queue = self.lock();
+            queue.stamps.push((job.group, stamp));
+            if let Some(local) = job.local {
+                queue.local.push((job.group, local));
+            }
+            drop(queue);
             drop(job.tables);
             self.decide();
         }
@@ -512,9 +595,15 @@ where
         transcript
     }
 
-    fn run_job<T>(&self, job: LaneJob<'a, F, E>) -> (usize, ZcLaneStamp)
+    /// Runs `job`: its local argue's bins when it is a local job, else the
+    /// lane's probe. Returns the group, its stamp and the local argue to
+    /// hand on (none when a unit failed: phase B argues the group anew).
+    fn run_job<T>(
+        &self,
+        job: LaneJob<'a, F, E>,
+    ) -> (usize, ZcLaneStamp, Option<Box<dyn Any + Send>>)
     where
-        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
     {
         let LaneJob {
             group,
@@ -522,11 +611,22 @@ where
             roots,
             on_card,
             mut stamp,
+            local,
         } = job;
         stamp.started_at = self.secs(Instant::now());
         let at = if on_card { Where::Device } else { Where::Host };
+        if let Some(local) = local {
+            let local = self.run_local::<T>(group, &tables, local, at, &mut stamp);
+            drop(tables);
+            stamp.ended_at = self.secs(Instant::now());
+            return (group, stamp, local);
+        }
+        let Some(work) = self.work else {
+            drop(tables);
+            return (group, stamp, None);
+        };
         let mut state = LaneState::Ran;
-        if self.work.ladders() {
+        if work.ladders() {
             // One bin of the argue's plan at a time, on throwaway challenges;
             // no bin starts while a commit is in flight, none after phase A.
             stamp.bins = batched::argue_bins(&tables, self.bin_log_cells, self.pack);
@@ -587,7 +687,7 @@ where
                 }
             }
         }
-        if self.work.zc() && state == LaneState::Ran {
+        if work.zc() && state == LaneState::Ran {
             if let Err(why) = self.begin_unit() {
                 state = LaneState::Deferred(why);
             } else {
@@ -627,12 +727,113 @@ where
         drop(tables);
         stamp.ended_at = self.secs(Instant::now());
         stamp.state = state;
-        (group, stamp)
+        (group, stamp, None)
     }
 
-    /// Every group's stamp, once the lane's thread has ended.
-    pub(super) fn into_stamps(self) -> Vec<(usize, ZcLaneStamp)> {
+    /// A local job: its argue's bins, one a unit, from the first not yet
+    /// run, until every bin ran or the job must stop. Returns the argue to
+    /// hand on, or none when it is not this lane's (a transcript of another
+    /// kind) or a unit failed: a failed bin leaves its transcript partway.
+    fn run_local<T>(
+        &self,
+        group: usize,
+        tables: &[CommittedTable<'a, F, E>],
+        mut local: Box<dyn Any + Send>,
+        at: Where,
+        stamp: &mut ZcLaneStamp,
+    ) -> Option<Box<dyn Any + Send>>
+    where
+        T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default + Send + 'static,
+    {
+        let (Some(started), Some(buses)) = (
+            local.downcast_mut::<super::LocalStarted<E, T>>(),
+            self.local_buses.as_deref(),
+        ) else {
+            stamp.state = LaneState::Failed;
+            return None;
+        };
+        let super::LocalStarted {
+            transcript,
+            z,
+            alpha,
+            prover,
+        } = started;
+        if prover.is_none() {
+            match batched::LocalProver::new(
+                tables,
+                buses,
+                z,
+                alpha,
+                self.bin_log_cells,
+                self.pack,
+                self.ladder,
+                ProverFaults::default(),
+            ) {
+                Ok(made) => *prover = Some(made),
+                Err(error) => {
+                    note_local_failure(group, &error);
+                    stamp.state = LaneState::Failed;
+                    return None;
+                }
+            }
+        }
+        let Some(prover) = prover.as_mut() else {
+            stamp.state = LaneState::Failed;
+            return None;
+        };
+        stamp.bins = prover.bins();
+        let mut state = LaneState::Ran;
+        while !prover.done() {
+            if self.limits.bins.is_some_and(|stop| stamp.bins_ran >= stop) {
+                state = LaneState::Deferred(LaneDefer::Stopped);
+                break;
+            }
+            if let Err(why) = self.begin_unit() {
+                state = LaneState::Deferred(why);
+                break;
+            }
+            let tick = Instant::now();
+            let bin = prover.bins_run();
+            let ran = prover.step(tables, transcript, at).and_then(|()| {
+                if self.limits.fail_bin == Some(bin) {
+                    transcript.append_bytes(b"a test's failed unit");
+                    return Err(MlError::DeviceFailed {
+                        stage: "a test's failed local unit",
+                    });
+                }
+                Ok(())
+            });
+            self.end_unit();
+            match ran {
+                Ok(()) => {
+                    stamp.bins_ran += 1;
+                    stamp.ladders += tick.elapsed().as_secs_f64();
+                }
+                Err(error) => {
+                    for table in tables {
+                        table.trace().release_device();
+                    }
+                    note_local_failure(group, &error);
+                    // Off the host, a tree the card would not build is phase
+                    // B's to argue: declined, not failed.
+                    stamp.state = if self.host {
+                        LaneState::Failed
+                    } else {
+                        LaneState::Declined
+                    };
+                    return None;
+                }
+            }
+        }
+        stamp.state = state;
+        Some(local)
+    }
+
+    /// Every group's stamp and every local argue the lane let go of, once
+    /// the lane's thread has ended.
+    pub(super) fn into_parts(self) -> LaneParts {
         let queue = self.queue.into_inner().unwrap_or_else(|e| e.into_inner());
+        let local = queue.local;
         let mut stamps = queue.stamps;
         for (group, wait) in queue.commit_waits {
             match stamps.iter_mut().find(|(g, _)| *g == group) {
@@ -646,8 +847,15 @@ where
                 )),
             }
         }
-        stamps
+        (stamps, local)
     }
+}
+
+/// The first local job that fails, said once: the group's argue goes to
+/// phase B whole.
+fn note_local_failure(group: usize, error: &MlError) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| eprintln!("BLOCK LOCAL LANE: group {group}: left to phase B: {error:?}"));
 }
 
 /// Phase B's merge probe over a group's tables after its argue
@@ -711,7 +919,11 @@ where
 /// and ladder in phase B ([`GroupStamps::bins_b`]).
 #[doc(hidden)]
 pub fn zc_lane_lines(stamps: &[GroupStamps]) -> String {
-    if stamps.iter().all(|g| g.zc_lane.state == LaneState::Off) {
+    // The lane's local jobs have lines of their own (`local_lane_lines`).
+    if stamps
+        .iter()
+        .all(|g| g.zc_lane.state == LaneState::Off || g.zc_lane.local)
+    {
         return String::new();
     }
     let mib = |b: u64| b >> 20;
@@ -809,6 +1021,92 @@ pub fn zc_lane_lines(stamps: &[GroupStamps]) -> String {
         count(LaneState::Deferred(LaneDefer::Shed)),
         total(&|g| g.zc_lane.commit_wait),
         stamps.iter().map(|g| g.zc_lane.commit_wait).fold(0.0, f64::max),
+    ));
+    out
+}
+
+/// The local argues' lines for the block's readout (local lookups): one a
+/// local group, then the sum; empty when no group argued local lookups.
+///
+/// A group's line: what became of its lane job, its local bins run in phase
+/// A of its plan's, the lane's seconds over them, and each local bin's
+/// seconds at the group's turn in phase B (the bins the lane left, in plan
+/// order). With the lane off every bin runs in phase B, so a lane-off run's
+/// per-bin seconds price the bins a lane-on run of the same block ran.
+#[doc(hidden)]
+pub fn local_lane_lines(stamps: &[GroupStamps]) -> String {
+    let local: Vec<(usize, &GroupStamps)> = stamps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.zc_lane.local || !s.local_b.is_empty())
+        .collect();
+    if local.is_empty() {
+        return String::new();
+    }
+    let secs = |v: &[f64]| v.iter().fold(0.0, |a, b| a + b);
+    let mut out = String::new();
+    for (g, s) in &local {
+        let l = &s.zc_lane;
+        let bins = if l.local { l.bins } else { s.local_b.len() };
+        out.push_str(&format!(
+            "BLOCK LOCAL LANE: group {g} · {} · bins {} of {bins} in phase A · lane {:.3}s · \
+             store {} MiB · commit wait {:.3}s · phase B {:.3}s [{}]\n",
+            l.state.word(),
+            l.bins_ran,
+            l.ladders,
+            l.store_bytes >> 20,
+            l.commit_wait,
+            secs(&s.local_b),
+            s.local_b
+                .iter()
+                .map(|b| format!("{b:.4}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
+    }
+    let count = |state: LaneState| {
+        local
+            .iter()
+            .filter(|(_, s)| s.zc_lane.local && s.zc_lane.state == state)
+            .count()
+    };
+    let total =
+        |f: &dyn Fn(&GroupStamps) -> f64| local.iter().map(|(_, s)| f(s)).fold(0.0, |a, b| a + b);
+    out.push_str(&format!(
+        "BLOCK LOCAL LANE SUM: groups {} · lane jobs {} · bins {} of {} in phase A · ran {} · \
+         deferred hold {} · memory {} · tail {} · shed {} · no store {} · stopped {} · declined {} · \
+         failed {} · lane {:.3}s · phase B {:.3}s · commits waited {:.3}s (most {:.3}s) · last job \
+         ended at {:.3}s · phase A's end waited {:.3}s\n",
+        local.len(),
+        local.iter().filter(|(_, s)| s.zc_lane.local).count(),
+        local.iter().map(|(_, s)| s.zc_lane.bins_ran).sum::<usize>(),
+        local
+            .iter()
+            .map(|(_, s)| if s.zc_lane.local {
+                s.zc_lane.bins
+            } else {
+                s.local_b.len()
+            })
+            .sum::<usize>(),
+        count(LaneState::Ran),
+        count(LaneState::Deferred(LaneDefer::Hold)),
+        count(LaneState::Deferred(LaneDefer::Memory)),
+        count(LaneState::Deferred(LaneDefer::Tail)),
+        count(LaneState::Deferred(LaneDefer::Shed)),
+        count(LaneState::Deferred(LaneDefer::NoStore)),
+        count(LaneState::Deferred(LaneDefer::Stopped)),
+        count(LaneState::Declined),
+        count(LaneState::Failed),
+        total(&|s| s.zc_lane.ladders),
+        total(&|s| secs(&s.local_b)),
+        stamps.iter().map(|s| s.zc_lane.commit_wait).fold(0.0, |a, b| a + b),
+        stamps.iter().map(|s| s.zc_lane.commit_wait).fold(0.0, f64::max),
+        local
+            .iter()
+            .filter(|(_, s)| s.zc_lane.local)
+            .map(|(_, s)| s.zc_lane.ended_at)
+            .fold(0.0, f64::max),
+        stamps.iter().map(|s| s.zc_lane.close_wait).fold(0.0, f64::max),
     ));
     out
 }
