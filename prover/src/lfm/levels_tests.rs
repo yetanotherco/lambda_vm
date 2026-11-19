@@ -953,11 +953,10 @@ fn the_verifiers_derivation_refuses_an_emitter_fault() {
 }
 
 /// ★ The admitted derivation moves no byte: level 1's program from
-/// `closed_block_program_admitted` is the program the unvalidated emit compiles
-/// sequentially (instruction for instruction, once the validator admits it),
-/// and the level `derive_levels` builds from it has the same `program_id` and
-/// the same artifacts as a level built from that program directly; every
-/// derived level verifies its own level's identity.
+/// `closed_block_program_admitted` is the prover's fast emit (parallel and
+/// sequential) byte for byte, column values included, and the levels
+/// `derive_levels` builds (1 and 2) have the program ids and artifacts of
+/// levels built from the admitted programs directly.
 #[test]
 #[ignore = "proves a small block's base; box tier"]
 fn the_admitted_derivation_is_the_derivation_byte_for_byte() {
@@ -968,24 +967,17 @@ fn the_admitted_derivation_is_the_derivation_byte_for_byte() {
     let admitted = plan
         .closed_block_program_admitted()
         .expect("the plan's program is admitted");
-    let (emitted, _, _) = plan
-        .closed_block_program_marked_timed(false)
-        .expect("the plan's program emits");
-    super::validator::validate(&emitted).expect("and is admissible");
-    // `Instr` has no `PartialEq`: compare each instruction's printed form.
-    let digest = |instrs: &[super::instr::Instr]| {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        for i in instrs {
-            format!("{i:?}").hash(&mut h);
+    // The prover's fast emit (the parallel compile the driver proves level 1
+    // from) and the sequential one are the verifier's admitted program, byte
+    // for byte: instructions, schema and every instruction column's values.
+    for parallel in [true, false] {
+        let (emitted, _, _) = plan
+            .closed_block_program_marked_timed(parallel)
+            .expect("the plan's program emits");
+        if let Some(d) = admitted.program().first_difference(&emitted) {
+            panic!("the admitted program differs from the emit (parallel {parallel}) in {d}");
         }
-        (instrs.len(), h.finish())
-    };
-    assert_eq!(
-        digest(&admitted.program().instrs),
-        digest(&emitted.instrs),
-        "the admitted program is the emitted one, instruction for instruction"
-    );
+    }
     let direct = build_level(admitted, WlfmFamily::B3, level_rounds(&plan), true)
         .expect("a level built from the admitted program");
     let derived = derive_levels(&plan, WlfmFamily::B3, true).expect("the levels derive");

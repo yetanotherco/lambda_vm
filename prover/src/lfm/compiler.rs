@@ -183,6 +183,74 @@ pub struct LfmProgram {
 }
 
 impl LfmProgram {
+    /// Tests only: where `self` and `other` differ as programs, or `None` when
+    /// they are the same program byte for byte: every instruction (its printed
+    /// form), the address count, the arena schema, the public length, every
+    /// instruction column group (width, rows and every value), the chunkings
+    /// and the hash width.
+    #[cfg(test)]
+    pub(crate) fn first_difference(&self, other: &Self) -> Option<String> {
+        if self.instrs.len() != other.instrs.len() {
+            return Some(format!(
+                "{} against {} instructions",
+                self.instrs.len(),
+                other.instrs.len()
+            ));
+        }
+        if let Some(k) = (0..self.instrs.len())
+            .find(|&k| format!("{:?}", self.instrs[k]) != format!("{:?}", other.instrs[k]))
+        {
+            return Some(format!("instruction {k}"));
+        }
+        if self.num_addrs != other.num_addrs
+            || self.arena_schema.lens != other.arena_schema.lens
+            || self.public_len != other.public_len
+            || self.hash16 != other.hash16
+        {
+            return Some(
+                "the addresses, the arena schema, the public length or the hash width".into(),
+            );
+        }
+        if format!(
+            "{:?}",
+            (&self.chunking, &self.blake3_chunking, &self.hash_chunking)
+        ) != format!(
+            "{:?}",
+            (
+                &other.chunking,
+                &other.blake3_chunking,
+                &other.hash_chunking
+            )
+        ) {
+            return Some("the chunkings".into());
+        }
+        let (a, b) = (&self.groups, &other.groups);
+        let groups = [
+            ("const", &a.const_, &b.const_),
+            ("balu", &a.balu, &b.balu),
+            ("xalu", &a.xalu, &b.xalu),
+            ("select", &a.select, &b.select),
+            ("bitdec", &a.bitdec, &b.bitdec),
+            ("hash", &a.hash, &b.hash),
+            ("keccak", &a.keccak, &b.keccak),
+            ("blake3", &a.blake3, &b.blake3),
+            ("lanes", &a.lanes, &b.lanes),
+            ("hint", &a.hint, &b.hint),
+            ("public", &a.public, &b.public),
+            ("b3l", &a.b3l, &b.b3l),
+            ("mux", &a.mux, &b.mux),
+            ("cap", &a.cap, &b.cap),
+            ("cap_read", &a.cap_read, &b.cap_read),
+        ];
+        groups.into_iter().find_map(|(name, x, y)| {
+            (x.width != y.width
+                || x.real_rows != y.real_rows
+                || x.padded_rows != y.padded_rows
+                || x.data != y.data)
+                .then(|| format!("the {name} column group"))
+        })
+    }
+
     /// Whether this program's `LFM_HASH` rows are width-16 (`Instr::Hash16`).
     pub fn hash16(&self) -> bool {
         self.hash16
