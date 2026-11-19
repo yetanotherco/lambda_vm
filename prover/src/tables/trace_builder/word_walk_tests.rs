@@ -111,6 +111,7 @@ fn word_build(program: &Elf, logs: &[Log], registers: RegisterFormat, window: us
             .memw_aligned_order(MemwAlignedOrder::Limbs)
             .expect("before any window")
             .keccak_rnd_form(keccak_rnd)
+            .ecdas_form(crate::block_whir::BlockFormat::production().ecdas)
             .memory_format(MemoryFormat::Words)
             .expect("before any window")
     })
@@ -855,6 +856,7 @@ fn word_record_build_with(
         .register_format(RegisterFormat::InRow)?
         .memw_aligned_order(MemwAlignedOrder::Limbs)?
         .keccak_rnd_form(crate::block_whir::BlockFormat::production().keccak_rnd)
+        .ecdas_form(crate::block_whir::BlockFormat::production().ecdas)
         .memory_format(MemoryFormat::Words)?
         .drop_streamed_ops()?
         .light_walk(level)?;
@@ -1112,6 +1114,7 @@ fn streamed_word_build(
         .and_then(|b| b.register_format(RegisterFormat::InRow))
         .and_then(|b| b.memw_aligned_order(MemwAlignedOrder::Limbs))
         .map(|b| b.keccak_rnd_form(keccak_rnd))
+        .map(|b| b.ecdas_form(crate::block_whir::BlockFormat::production().ecdas))
         .and_then(|b| b.memory_format(MemoryFormat::Words))
         .expect("the builder");
     if stream {

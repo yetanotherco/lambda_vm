@@ -361,11 +361,11 @@ pub struct BlockFormat {
     /// programs, follow it.
     pub memory: crate::tables::fused_memory::MemoryFormat,
     /// Which relations ECDAS proves its steps with
-    /// ([`EcdasForm`](crate::tables::ecdas::EcdasForm)): at byte positions
-    /// ([`Bytes`](crate::tables::ecdas::EcdasForm::Bytes), the production and
-    /// pinned constant), or the same relations at 16-bit limb positions
-    /// ([`Halves`](crate::tables::ecdas::EcdasForm::Halves), the variant a
-    /// caller names). Its columns, constraints and interactions, so its GKR
+    /// ([`EcdasForm`](crate::tables::ecdas::EcdasForm)): at 16-bit limb
+    /// positions ([`Halves`](crate::tables::ecdas::EcdasForm::Halves), the
+    /// production and pinned constant), or at byte positions
+    /// ([`Bytes`](crate::tables::ecdas::EcdasForm::Bytes), the form before
+    /// it, a variant a caller names). Its columns, constraints and interactions, so its GKR
     /// trees and the recursion's programs, follow it.
     pub ecdas: crate::tables::ecdas::EcdasForm,
 }
@@ -840,7 +840,7 @@ impl BlockFormat {
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
             registers: crate::tables::register::RegisterFormat::InRow,
             memory: crate::tables::fused_memory::MemoryFormat::Fused,
-            ecdas: crate::tables::ecdas::EcdasForm::Bytes,
+            ecdas: crate::tables::ecdas::EcdasForm::Halves,
         }
     }
 
@@ -882,7 +882,7 @@ impl BlockFormat {
             memw_aligned: crate::tables::memw_aligned::MemwAlignedOrder::Limbs,
             registers: crate::tables::register::RegisterFormat::InRow,
             memory: crate::tables::fused_memory::MemoryFormat::Split,
-            ecdas: crate::tables::ecdas::EcdasForm::Bytes,
+            ecdas: crate::tables::ecdas::EcdasForm::Halves,
         }
     }
 
@@ -13009,9 +13009,9 @@ mod rest_airs_probe {
                 let _ = create_keccak_w_air(o);
             }
         });
-        time("4 ECDAS + ECREC + ECREC_W", &mut || {
+        time("4 ECDAS (limb form) + ECREC + ECREC_W", &mut || {
             for _ in 0..4 {
-                let _ = create_ecdas_air(o);
+                let _ = create_ecdas_halves_air(o);
             }
             let _ = create_ecrec_air(o);
             let _ = create_ecrec_w_air(o);

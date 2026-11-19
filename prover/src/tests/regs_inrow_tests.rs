@@ -276,6 +276,7 @@ fn in_row_build_as(
         .and_then(|b| b.register_format(RegisterFormat::InRow))
         .and_then(|b| b.memw_aligned_order(format.memw_aligned))
         .map(|b| b.keccak_rnd_form(format.keccak_rnd))
+        .map(|b| b.ecdas_form(format.ecdas))
         .expect("the builder");
     let window = 1000;
     let body = logs.len() - 1;
