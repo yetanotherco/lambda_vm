@@ -187,6 +187,91 @@ where
     Ok(values)
 }
 
+/// [`encode`]`(&`[`lift_coefficients`]`(&mle), domain)` over hypercube values
+/// the caller owns, in their own allocation: the Möbius transform and the
+/// index reversal in place, the vector grown to the domain, and the transform
+/// under twiddles built once for every codeword this encoder takes. The same
+/// values as the two calls, which hold three vectors of the polynomial's size
+/// beside the codeword and build the twiddles each time; this holds the
+/// codeword and the twiddles. Give it a vector with the domain's capacity and
+/// it never moves.
+pub struct LiftEncoder<F: IsFFTField + IsPrimeField> {
+    domain: Domain<F>,
+    twiddles: Option<LayerTwiddles<F>>,
+}
+
+impl<F> LiftEncoder<F>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    FieldElement<F>: Send + Sync,
+{
+    /// An encoder onto the domain of order `2^log_size`.
+    pub fn new(log_size: usize) -> Result<Self, Error> {
+        let domain = Domain::<F>::new(log_size)?;
+        let twiddles = if log_size == 0 {
+            None
+        } else {
+            Some(
+                LayerTwiddles::<F>::new(log_size as u64).ok_or(Error::SkipDomainUnavailable {
+                    l_skip: log_size,
+                    two_adicity: F::TWO_ADICITY as usize,
+                })?,
+            )
+        };
+        Ok(Self { domain, twiddles })
+    }
+
+    /// The domain's order, `2^log_size`.
+    pub fn size(&self) -> usize {
+        self.domain.size()
+    }
+
+    /// The codeword of the multilinear whose `2^n` hypercube values `values`
+    /// holds (`n` any, up to the domain), in `values`' allocation.
+    pub fn encode(&self, mut values: Vec<FieldElement<F>>) -> Result<Vec<FieldElement<F>>, Error> {
+        let n = values.len();
+        if !n.is_power_of_two() {
+            return Err(Error::NotPowerOfTwo(n));
+        }
+        if n > self.domain.size() {
+            return Err(Error::CodewordTooShort {
+                coefficients: n,
+                domain: self.domain.size(),
+            });
+        }
+        // `monomial_coefficients`, in place.
+        let mut stride = 1;
+        while stride < n {
+            let level = |chunk: &mut [FieldElement<F>]| {
+                let (lo, hi) = chunk.split_at_mut(stride);
+                for (h, l) in hi.iter_mut().zip(lo.iter()) {
+                    *h = &*h - l;
+                }
+            };
+            #[cfg(feature = "parallel")]
+            values.par_chunks_mut(stride * 2).for_each(level);
+            #[cfg(not(feature = "parallel"))]
+            values.chunks_mut(stride * 2).for_each(level);
+            stride *= 2;
+        }
+        // `lift_coefficients`' index reversal: an involution, so the gather
+        // `out[i] = coeffs[rev(i)]` is the swap in place.
+        in_place_bit_reverse_permute(&mut values);
+        values.resize(self.domain.size(), FieldElement::<F>::zero());
+        let Some(twiddles) = &self.twiddles else {
+            return Ok(values);
+        };
+        #[cfg(feature = "parallel")]
+        bowers_fft_opt_fused_parallel::<F, F>(&mut values, twiddles)
+            .map_err(|_| Error::NotPowerOfTwo(self.domain.size()))?;
+        #[cfg(not(feature = "parallel"))]
+        bowers_fft_opt_fused::<F, F>(&mut values, twiddles)
+            .map_err(|_| Error::NotPowerOfTwo(self.domain.size()))?;
+        in_place_bit_reverse_permute(&mut values);
+        Ok(values)
+    }
+}
+
 /// Folds a codeword once: `F_α = F₀ + α·F₁`, recovering the halves from `F(x)`
 /// and `F(−x)`. `−x` is half a period away, so `j` pairs with `j + N/2`.
 ///
@@ -408,6 +493,43 @@ mod tests {
         let half = d.size() / 2;
         for j in 0..half {
             assert_eq!(els[j + half], -&els[j], "j={j}");
+        }
+    }
+
+    /// The in-place encoder is `encode(lift_coefficients(·))` value for value,
+    /// over polynomials of several sizes onto several domains, one encoder
+    /// reused for all of a domain's codewords, and keeps a vector with the
+    /// domain's capacity where it is.
+    #[test]
+    fn the_lift_encoder_is_encode_of_the_lift_in_place() {
+        use math::field::goldilocks::GoldilocksField as Gl;
+        for log_size in [0usize, 1, 3, 6, 9] {
+            let encoder = LiftEncoder::<Gl>::new(log_size).unwrap();
+            let domain = Domain::<Gl>::new(log_size).unwrap();
+            for num_vars in 0..=log_size {
+                for seed in [3u64, 101] {
+                    let evals: Vec<FieldElement<Gl>> = (0..1u64 << num_vars)
+                        .map(|i| FieldElement::from(seed.wrapping_mul(i + 7).wrapping_add(i * i)))
+                        .collect();
+                    let want = encode::<Gl, Gl>(
+                        &lift_coefficients(&Mle::new(evals.clone()).unwrap()),
+                        &domain,
+                    )
+                    .unwrap();
+                    let mut owned = Vec::with_capacity(encoder.size());
+                    owned.extend(evals);
+                    let at = owned.as_ptr();
+                    let got = encoder.encode(owned).unwrap();
+                    assert_eq!(got, want, "2^{num_vars} onto 2^{log_size}");
+                    assert_eq!(got.as_ptr(), at, "2^{num_vars} onto 2^{log_size}: moved");
+                }
+            }
+            if log_size > 0 {
+                let three = vec![FieldElement::<Gl>::one(); 3];
+                assert!(encoder.encode(three).is_err(), "not a power of two");
+            }
+            let wide = vec![FieldElement::<Gl>::one(); 2usize << log_size];
+            assert!(encoder.encode(wide).is_err(), "wider than the domain");
         }
     }
 
