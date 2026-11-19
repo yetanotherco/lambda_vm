@@ -78,6 +78,13 @@ use crate::test_utils::{
     create_register_air, create_shift_air, create_store_air,
 };
 
+#[cfg(test)]
+thread_local! {
+    /// The PAGE AIRs [`VmAirs::new`] built on this thread, one a listed page:
+    /// a test reads it around a frame.
+    pub(crate) static PAGE_AIRS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
 // recursion guest): `Commitment` is carried in the guest's private input
 // (see `GuestInput`); the proof-options types name the parameters
@@ -1600,6 +1607,8 @@ impl VmAirs {
         // initialized), so this commitment is always used.
         let zero_init_commitment = page::zero_init_preprocessed_commitment(proof_options);
 
+        #[cfg(test)]
+        PAGE_AIRS_BUILT.with(|built| built.set(built.get() + page_configs.len()));
         let pages: Vec<VmAir> = page_configs
             .iter()
             .map(|config| -> VmAir {
@@ -1772,7 +1781,10 @@ impl VmAirs {
     /// [`Self::with_word_memory`] with the pages in page tables of runs of at
     /// most `2^page_run_log2` pages ([`crate::tables::page_w::page_tables`]),
     /// each table's AIR in PAGE's place, in the tables' order: one PAGE_W
-    /// table a page at 0. Refuses a page list or a run the rule refuses.
+    /// table a page at 0. The set holds a PAGE table for each of
+    /// `page_configs`, or none (the block's, built with no PAGE AIR to replace:
+    /// `block_whir::page_air_pages`). Refuses a page list or a run the rule
+    /// refuses.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn with_word_memory_at(
         &mut self,
@@ -1781,7 +1793,7 @@ impl VmAirs {
         page_configs: &[crate::tables::page::PageConfig],
         page_run_log2: u8,
     ) -> Result<(), Error> {
-        if page_configs.len() != self.pages.len() {
+        if !self.pages.is_empty() && page_configs.len() != self.pages.len() {
             return Err(Error::Prover(format!(
                 "{} page configs for {} page tables",
                 page_configs.len(),

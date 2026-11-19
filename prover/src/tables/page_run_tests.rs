@@ -1381,6 +1381,69 @@ fn a_huge_stated_page_list_is_capped_and_measured() {
     }
 }
 
+/// The PAGE AIRs built on this thread while `f` runs, with what it returned.
+fn page_airs_built<T>(f: impl FnOnce() -> T) -> (usize, T) {
+    let before = crate::PAGE_AIRS_BUILT.with(std::cell::Cell::get);
+    let out = f();
+    (
+        crate::PAGE_AIRS_BUILT.with(std::cell::Cell::get) - before,
+        out,
+    )
+}
+
+/// ★ Under the word memory format the frame builds no PAGE AIR a listed page:
+/// its page tables are built straight from the page list, one AIR each, at
+/// runs off and at runs of 16 and 64 pages, and they are the AIR set's page
+/// tables, in the cut's order.
+#[test]
+fn the_word_frame_builds_no_page_air_a_page() {
+    for run_log2 in [0u8, 4, 6] {
+        let format = words().with_page_run(run_log2);
+        let (statement, tables) = statement_at(&format);
+        let (built, frame) = page_airs_built(|| {
+            super::word_memory_tests::frame_of(&statement, &format).expect("frames")
+        });
+        assert_eq!(built, 0, "runs of 2^{run_log2}: a PAGE AIR built a page");
+        let names: Vec<String> = frame
+            .airs
+            .pages
+            .iter()
+            .map(|air| air.name().to_string())
+            .collect();
+        let want: Vec<String> = tables.iter().map(PageTable::name).collect();
+        assert_eq!(names, want, "runs of 2^{run_log2}: the page tables");
+        assert_eq!(frame.page_tables, tables);
+    }
+    // The count moves: the AIR set over the same pages with a PAGE AIR each.
+    let elf = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let opts = ProofOptions::default_test_options();
+    let frame =
+        super::word_memory_tests::frame_of(&statement_at(&words()).0, &words()).expect("frames");
+    let counts = chip_free_counts();
+    let inputs =
+        crate::BlockAirInputs::new(&opts, &program, vec![4; counts.cpu], &[]).expect("inputs");
+    let format = words();
+    let (built, _) = page_airs_built(|| {
+        crate::block_airs(
+            &program,
+            &opts,
+            &frame.page_configs,
+            &counts,
+            &inputs,
+            format.keccak_rnd,
+            format.memw_aligned,
+            format.registers,
+            format.ecdas,
+        )
+    });
+    assert_eq!(
+        built,
+        frame.page_configs.len(),
+        "a PAGE AIR a page when asked"
+    );
+}
+
 /// The prepared tables of `format`'s frame of [`statement_at`], each by its
 /// table's name: what the opening settles, and on which table.
 fn prepared_by_name(format: &BlockFormat) -> Vec<(String, Vec<Vec<FE>>)> {
