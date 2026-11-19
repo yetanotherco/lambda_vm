@@ -131,18 +131,20 @@ where
 {
     /// A table's rounds, on its device factors — or its base columns on the
     /// card, `columns`, when nothing was lifted — when the fused rounds take
-    /// them, else on the host over `factors()` and the two weights built from
-    /// their points.
+    /// them, else on the host over `factors()` and the weights built from
+    /// their points, one `eq` factor a point, in order.
     ///
     /// `claim` is the table's own `Σ λ^j·claim_j` — what the fused rounds
-    /// carry to reconstruct `A(1)`. The rules are `[zerocheck, numerator,
-    /// denominator]` and `lambdas` their `[1, λ, λ²]`, today's batch.
+    /// carry to reconstruct `A(1)`. Today's rules are `[zerocheck, numerator,
+    /// denominator]`, `lambdas` their `[1, λ, λ²]` and `weights` two points;
+    /// the fused rounds take exactly that shape (three rules, one bus) and
+    /// decline any other.
     #[allow(clippy::too_many_arguments)]
     pub fn new<B, P>(
         rules: Vec<crate::batch::Rule<'a, E>>,
         lambdas: Vec<FieldElement<E>>,
         claim: &FieldElement<E>,
-        weights: [&[FieldElement<E>]; 2],
+        weights: &[&[FieldElement<E>]],
         num_vars: usize,
         device: Option<&'a crate::gpu::DeviceFactors>,
         columns: Option<&'a crate::gpu::ColumnFactors>,
@@ -194,8 +196,9 @@ where
         }
         let _ = (device, columns, &fused, claim, num_vars);
         let mut polys = factors()?;
-        polys.push(crate::eq::eq_mle(weights[0])?);
-        polys.push(crate::eq::eq_mle(weights[1])?);
+        for weight in weights {
+            polys.push(crate::eq::eq_mle(weight)?);
+        }
         Ok(Self::Host(crate::batch::Batched::new(
             polys, rules, lambdas,
         )?))

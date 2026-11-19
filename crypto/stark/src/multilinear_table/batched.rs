@@ -38,6 +38,8 @@
 
 use super::*;
 
+use std::borrow::Cow;
+
 use multilinear::{
     front_loaded::{self, PaddingFault},
     gkr::{FractionLayer, GkrClaim},
@@ -274,6 +276,69 @@ pub struct BatchedArgue<E: IsField> {
     pub reduces: Vec<Option<claim_reduce::ReduceProof<E>>>,
 }
 
+/// ★ A group's local argue (local lookups argued per group): the local class's
+/// phase G on the group's own transcript, under the group's own `(z_g, α_g)`
+/// — every local tree's bus output, then one ladder a bin of the local plan.
+/// Its outputs must sum to zero over the group; its claims enter the
+/// group's C phase as each table's second bus pair ([`LocalClaims`]).
+///
+/// Empty for a group with no local interaction.
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
+pub struct LocalArgue<E: IsField> {
+    /// Every local tree's bus output, in member order, then chunk order.
+    pub bus_outputs: Vec<(FieldElement<E>, FieldElement<E>)>,
+    /// One ladder per bin of the local plan, in plan order.
+    pub gkr: Vec<LockstepProof<E>>,
+}
+
+impl<E: IsField> Default for LocalArgue<E> {
+    fn default() -> Self {
+        Self {
+            bus_outputs: Vec::new(),
+            gkr: Vec::new(),
+        }
+    }
+}
+
+impl<E: IsField> LocalArgue<E> {
+    /// No local tree: a group with no local interaction.
+    pub fn is_empty(&self) -> bool {
+        self.bus_outputs.is_empty() && self.gkr.is_empty()
+    }
+}
+
+/// What a group's local argue hands its C phase, per table of the group:
+/// its local interactions lowered under `(z_g, α_g)` and the claim its local
+/// trees left — `None` for a table with no local interaction.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct LocalClaims<E: IsField> {
+    pub interactions: Vec<Option<Vec<Interaction<E>>>>,
+    pub claims: Vec<Option<GkrClaim<E>>>,
+}
+
+impl<E: IsField> LocalClaims<E> {
+    /// One entry a table of a group of `tables`, both present or both absent.
+    fn fits(&self, tables: usize) -> bool {
+        self.interactions.len() == tables
+            && self.claims.len() == tables
+            && self
+                .interactions
+                .iter()
+                .zip(&self.claims)
+                .all(|(i, c)| i.is_some() == c.is_some())
+    }
+}
+
 /// A proof under the batched argue: [`MultiProof`] with the argue batched.
 ///
 /// ⚠ A TYPE OF ITS OWN, not a variant inside [`MultiProof`], so today's proofs
@@ -330,6 +395,44 @@ pub struct ProverFaults {
     /// honest over the lists so changed. The table's last chunk must hold a
     /// padding slot of its own (a short last chunk).
     pub pad_mass: Option<usize>,
+    /// Under local lookups: this table's local `p̃` is absorbed off by one in
+    /// the C phase.
+    pub local_tamper_claim: Option<usize>,
+    /// Under local lookups: these two tables' local claims trade places in
+    /// the C phase (absorbed, ruled and claimed so).
+    pub local_swap_claims: Option<(usize, usize)>,
+    /// Under local lookups: this local-class member's first local tree's
+    /// output numerator forged so the group's local outputs sum to zero,
+    /// absorbed and sent as if true, its ladder over the TRUE tree (as
+    /// `balance_with`, on the local class).
+    pub local_balance_with: Option<usize>,
+    /// Under local lookups: every group's local transcript binds only what
+    /// this says ([`LocalBinding`]) — a mutant format, so in a block it holds
+    /// for every group, not only the faulty one — for a forgery the
+    /// verifier's binding refuses and the same mutant binding accepts.
+    pub local_binding: Option<LocalBinding>,
+}
+
+/// What a group's local transcript absorbs before its `(z_g, α_g)`. Every
+/// part in production ([`LocalBinding::ALL`]); a test drops one on both
+/// sides to show the forgery it lets through.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalBinding {
+    /// The group's roots (step L1).
+    pub roots: bool,
+    /// The group's commit-time answers (step L3).
+    pub answers: bool,
+    /// The label and every table's digest (step L4).
+    pub digests: bool,
+}
+
+impl LocalBinding {
+    pub const ALL: Self = Self {
+        roots: true,
+        answers: true,
+        digests: true,
+    };
 }
 
 /// Which of the batched verifier's checks run. Every one, except in the
@@ -351,6 +454,16 @@ pub struct VerifierChecks {
     /// (`multilinear_block::commit_ood_point`); off, the answers are absorbed
     /// and counted but no chain carries them.
     pub commit_ood: bool,
+    /// Under local lookups: each group's local outputs sum to zero.
+    pub local_balance: bool,
+    /// Under local lookups: every receiver on a local bus reads its values
+    /// from verifier-fixed (preprocessed) columns only.
+    pub local_receivers: bool,
+    /// Under local lookups: what each group's local transcript binds.
+    pub local_binding: LocalBinding,
+    /// Under local lookups: each group's fork absorbs its local transcript's
+    /// state first (step B0).
+    pub local_state: bool,
 }
 
 impl VerifierChecks {
@@ -361,6 +474,10 @@ impl VerifierChecks {
         reduce_shape: true,
         preprocessed: true,
         commit_ood: true,
+        local_balance: true,
+        local_receivers: true,
+        local_binding: LocalBinding::ALL,
+        local_state: true,
     };
 }
 
@@ -391,8 +508,7 @@ where
 fn chunk_lists<'a, E: IsField + 'static>(
     interactions: &'a [Interaction<E>],
     chunks: &Chunking,
-) -> Vec<std::borrow::Cow<'a, [Interaction<E>]>> {
-    use std::borrow::Cow;
+) -> Vec<Cow<'a, [Interaction<E>]>> {
     if chunks.count == 1 {
         return vec![Cow::Borrowed(interactions)];
     }
@@ -546,36 +662,249 @@ fn direct_column_values<E: IsField>(
         })
 }
 
-/// A table's rules and its bus's row point.
-type TableRules<'a, E> = (Vec<Rule<'a, E>>, Vec<FieldElement<E>>);
+/// A table's bus pairs in the C phase: its global class's interactions and
+/// their claim point, and its local class's (under local lookups), each
+/// `None` for a class the table has no interaction in.
+struct TablePairs<'a, E: IsField> {
+    global: Option<BusPair<'a, E>>,
+    local: Option<BusPair<'a, E>>,
+}
 
-/// A table's three rules, today's: the zerocheck at `weight_r`, the bus's two
-/// at `weight_z`, the bus claimed at `claim_point`.
+/// A bus pair's interactions and the point its claim sits at.
+type BusPair<'a, E> = (&'a [Interaction<E>], &'a [FieldElement<E>]);
+
+impl<E: IsField> TablePairs<'_, E> {
+    /// The table's own claimed sum, `Σ_j λ^j·claim_j` over its rules: the
+    /// zerocheck's 0, `λ·p̃ + λ²·q̃` for the global pair and `λ³·p̃^L + λ⁴·q̃^L`
+    /// for the local one, each when present.
+    fn claimed(
+        &self,
+        powers: &[FieldElement<E>],
+        global: Option<&GkrClaim<E>>,
+        local: Option<&GkrClaim<E>>,
+    ) -> FieldElement<E> {
+        let mut claim = FieldElement::<E>::zero();
+        if let (Some(_), Some(c)) = (&self.global, global) {
+            claim += &powers[1] * &c.p + &powers[2] * &c.q;
+        }
+        if let (Some(_), Some(c)) = (&self.local, local) {
+            claim += &powers[3] * &c.p + &powers[4] * &c.q;
+        }
+        claim
+    }
+}
+
+/// A table's rules, `λ`'s power for each, and the row point of each bus pair
+/// (the `eq` weights after the zerocheck's, in order).
+type TableRules<'a, E> = (Vec<Rule<'a, E>>, Vec<usize>, Vec<Vec<FieldElement<E>>>);
+
+/// ★ A table's rules, one function for both sides: the zerocheck at `λ^0`
+/// over the weight slot `eq(ξ)`; then, when present, the global bus's two
+/// rules at `λ^1, λ^2` and the local bus's two at `λ^3, λ^4`, each pair at
+/// the next weight slot, its bus claimed at its claim point. Today's table
+/// has the global pair only: `[C, N, D]` at `[1, λ, λ²]`.
 fn table_rules<'a, F, E>(
     statement: &TableStatement<'_, F, E>,
-    interactions: &'a [Interaction<E>],
-    claim_point: &[FieldElement<E>],
+    pairs: &TablePairs<'a, E>,
     beta: &FieldElement<E>,
 ) -> Result<TableRules<'a, E>, MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
     E: IsField + 'static,
 {
-    let (weight_r, weight_z) = weight_slots(statement.kinds.len());
-    let bus = logup::claim_statements(interactions, claim_point, statement.num_vars, weight_z)?;
+    let (weight_r, mut weight_z) = weight_slots(statement.kinds.len());
     let shape = statement.shape;
     let betas = multilinear_air::beta_powers(beta, shape.num_roots());
     let zerocheck = Rule::compiled(shape.degree() + 1, shape.program(&betas, weight_r)?);
-    Ok((
-        vec![zerocheck, bus.numerator, bus.denominator],
-        bus.row_point,
-    ))
+    let mut rules = vec![zerocheck];
+    let mut powers = vec![0];
+    let mut points = Vec::new();
+    for (pair, first) in [(&pairs.global, 1), (&pairs.local, 3)] {
+        let Some((interactions, claim_point)) = pair else {
+            continue;
+        };
+        let bus = logup::claim_statements(interactions, claim_point, statement.num_vars, weight_z)?;
+        rules.push(bus.numerator);
+        rules.push(bus.denominator);
+        powers.extend([first, first + 1]);
+        points.push(bus.row_point);
+        weight_z += 1;
+    }
+    Ok((rules, powers, points))
 }
 
-/// `λ^{3t}` per table — table `t`'s share of the batch.
-fn table_weights<E: IsField>(lambda: &FieldElement<E>, tables: usize) -> Vec<FieldElement<E>> {
-    let cube = lambda * lambda * lambda;
-    multilinear::challenge_powers(&cube, tables)
+/// `λ^{s·t}` per table — table `t`'s share of the batch, `s` its rules'
+/// stride: 3 today, 5 under local lookups (two more rules a table).
+pub(crate) fn table_weights<E: IsField>(
+    lambda: &FieldElement<E>,
+    tables: usize,
+    stride: u32,
+) -> Vec<FieldElement<E>> {
+    let step = (0..stride).fold(FieldElement::<E>::one(), |acc, _| acc * lambda);
+    multilinear::challenge_powers(&step, tables)
+}
+
+/// One LogUp class of a group's tables: the tables that argue in it, in
+/// group order, and each one's interactions in it. A table with no
+/// interaction in a class has no tree in it.
+///
+/// ★ THE CLASS IS A PURE FUNCTION OF THE BUS ID ([`Self::split`]): a bus is
+/// wholly local or wholly global, so the two classes never share a bus and
+/// each balances on its own.
+#[doc(hidden)]
+pub struct ClassTables<'b> {
+    /// The group's tables in this class, ascending.
+    pub members: Vec<usize>,
+    /// Each member's interactions in the class, in its AIR's order.
+    pub buses: Vec<Cow<'b, [BusInteraction]>>,
+}
+
+impl<'b> ClassTables<'b> {
+    /// Every table and every interaction: today's one class.
+    pub fn all<F, E>(statements: &[TableStatement<'b, F, E>]) -> Self
+    where
+        F: IsFFTField + IsPrimeField,
+        E: IsField,
+    {
+        Self {
+            members: (0..statements.len()).collect(),
+            buses: statements
+                .iter()
+                .map(|s| Cow::Borrowed(s.interactions))
+                .collect(),
+        }
+    }
+
+    /// The local class of `local_buses` (`local`), or the global class (the
+    /// rest). A table is in the local class when it has an interaction on a
+    /// local bus; in the global class unless every one of its interactions is
+    /// local — so a table with none at all stays global, as today.
+    pub fn split<F, E>(
+        statements: &[TableStatement<'b, F, E>],
+        local_buses: &[u64],
+        local: bool,
+    ) -> Self
+    where
+        F: IsFFTField + IsPrimeField,
+        E: IsField,
+    {
+        let mut members = Vec::new();
+        let mut buses = Vec::new();
+        for (t, statement) in statements.iter().enumerate() {
+            let (on_local, rest) = split_by_class(statement.interactions, local_buses);
+            let (class, other) = if local {
+                (on_local, rest)
+            } else {
+                (rest, on_local)
+            };
+            if class.is_empty() && (local || !other.is_empty()) {
+                continue;
+            }
+            members.push(t);
+            buses.push(if other.is_empty() {
+                Cow::Borrowed(statement.interactions)
+            } else {
+                Cow::Owned(class)
+            });
+        }
+        Self { members, buses }
+    }
+
+    /// The members' statements, each with only its interactions in the
+    /// class.
+    pub fn statements<'s, F, E>(
+        &'s self,
+        statements: &[TableStatement<'s, F, E>],
+    ) -> Result<Vec<TableStatement<'s, F, E>>, MlError>
+    where
+        F: IsFFTField + IsPrimeField,
+        E: IsField,
+    {
+        self.members
+            .iter()
+            .zip(&self.buses)
+            .map(|(&t, buses)| {
+                let statement = statements
+                    .get(t)
+                    .ok_or(MlError::ArgueShapeMismatch { part: "class" })?;
+                Ok(TableStatement {
+                    interactions: buses,
+                    ..*statement
+                })
+            })
+            .collect()
+    }
+}
+
+/// A table's interactions split by class: `(on a local bus, the rest)`, each
+/// in its AIR's order.
+#[doc(hidden)]
+pub fn split_by_class(
+    interactions: &[BusInteraction],
+    local_buses: &[u64],
+) -> (Vec<BusInteraction>, Vec<BusInteraction>) {
+    interactions
+        .iter()
+        .cloned()
+        .partition(|interaction| local_buses.contains(&interaction.bus_id))
+}
+
+/// Every class member's interactions as signed fractions over `z −
+/// fingerprint`, under the class's challenges.
+fn lower<F, E>(
+    statements: &[TableStatement<'_, F, E>],
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+) -> Result<Vec<Vec<Interaction<E>>>, MlError>
+where
+    F: IsFFTField + IsPrimeField,
+    E: IsField + 'static,
+{
+    statements
+        .iter()
+        .map(|statement| {
+            multilinear_logup::interactions(
+                statement.interactions,
+                statement.slot_of.len(),
+                z,
+                alpha,
+                |col| slot(statement.slot_of, col),
+            )
+        })
+        .collect()
+}
+
+/// The fault `balance_with` over one class: plan entry `target`'s first tree
+/// and the numerator that brings the class's outputs to zero.
+fn balancing_output<F, E>(
+    tables: &[CommittedTable<'_, F, E>],
+    members: &[usize],
+    plan: &ArguePlan,
+    lists: &[Cow<'_, [Interaction<E>]>],
+    target: usize,
+) -> Result<(usize, FieldElement<E>), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    let mut outputs = Vec::with_capacity(lists.len());
+    for (i, list) in lists.iter().enumerate() {
+        let t = table_of_tree(plan, i);
+        let layers = host_tree(list, &tables[members[t]].trace)?;
+        outputs.push(gkr_lockstep::LadderTree::output(&gkr_lockstep::HostLayers(
+            &layers,
+        )));
+    }
+    let target = plan.first_tree(target);
+    let mut rest = FieldElement::<E>::zero();
+    for (i, (p, q)) in outputs.iter().enumerate() {
+        if i != target {
+            rest += p * q.inv().expect("q != 0");
+        }
+    }
+    Ok((target, -(rest * &outputs[target].1)))
 }
 
 /// Proves every table under the batched argue, against one commitment.
@@ -766,29 +1095,81 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
+    let statements: Vec<TableStatement<'_, F, E>> = tables.iter().map(|t| t.statement()).collect();
+    prove_argue_classed(
+        tables,
+        &ClassTables::all(&statements),
+        None,
+        z,
+        alpha,
+        beta,
+        bin_log_cells,
+        pack,
+        transcript,
+        faults,
+        at,
+    )
+}
+
+/// [`prove_argue`] over the global class `global` of the group's tables, and
+/// — under local lookups — with each table's local claim pair
+/// ([`LocalClaims`], from [`prove_local`]) as two more rules of its C phase.
+///
+/// Phase G runs over `global` alone: a table with no interaction in it has no
+/// tree. Phase C runs over every table: ξ, then every global claim (member
+/// order), then every local claim (table order), then λ, and one
+/// front-loaded sumcheck of `Σ_t λ^{s·t}·f_t` with `s = 5` when `local` is
+/// given (`f_t`'s rules `[C, N, D, N^L, D^L]` at `λ^0..λ^4`, a pair the
+/// table lacks omitted) and today's `s = 3` otherwise. With `global` every
+/// table and every interaction and no `local`, this is today's argue, byte
+/// for byte.
+///
+/// G's faults (`balance_with`, `pad_mass`, `swap_chunks`) name plan entries
+/// of `global` (tables, when it is every table); the C faults name tables.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn prove_argue_classed<F, E, T>(
+    tables: &[CommittedTable<'_, F, E>],
+    global: &ClassTables<'_>,
+    local: Option<&LocalClaims<E>>,
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+    beta: &FieldElement<E>,
+    bin_log_cells: u8,
+    pack: GkrPack,
+    transcript: &mut T,
+    faults: ProverFaults,
+    at: Where,
+) -> Result<(BatchedArgue<E>, Vec<claim_reduce::ReducedClaim<E>>), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
     let beta = beta.clone();
     let statements: Vec<TableStatement<'_, F, E>> = tables.iter().map(|t| t.statement()).collect();
-    let shapes: Vec<ArgueShape> = statements.iter().map(ArgueShape::of).collect();
+    if local.is_some_and(|local| !local.fits(tables.len())) {
+        return Err(MlError::ArgueShapeMismatch {
+            part: "local claims",
+        });
+    }
+    let members = &global.members;
+    let class_statements = global.statements(&statements)?;
+    let shapes: Vec<ArgueShape> = class_statements.iter().map(ArgueShape::of).collect();
     let plan = argue_plan_packed(
         &shapes,
         faults.bin_log_cells.unwrap_or(bin_log_cells),
         faults.pack.unwrap_or(pack),
     );
-    let interactions: Vec<Vec<Interaction<E>>> = tables
-        .iter()
-        .map(|table| {
-            multilinear_logup::interactions(
-                table.layout.interactions,
-                table.slot_of().len(),
-                z,
-                alpha,
-                |col| slot(table.slot_of(), col),
-            )
-        })
-        .collect::<Result<_, _>>()?;
-    // Each tree's interactions, table order then chunk order: a whole table's
+    // Every table's shape, for the C phase: its height, its rule's degree and
+    // whether it reads a shifted row do not depend on its interactions.
+    let full_shapes: Vec<ArgueShape> = statements.iter().map(ArgueShape::of).collect();
+    let interactions: Vec<Vec<Interaction<E>>> = lower(&class_statements, z, alpha)?;
+    // Each tree's interactions, member order then chunk order: a whole table's
     // own list, or a chunk of it.
-    let mut lists: Vec<std::borrow::Cow<'_, [Interaction<E>]>> = Vec::with_capacity(plan.trees());
+    let mut lists: Vec<Cow<'_, [Interaction<E>]>> = Vec::with_capacity(plan.trees());
     for (t, chunks) in plan.chunks.iter().enumerate() {
         let mut table_lists = chunk_lists(&interactions[t], chunks);
         if faults.swap_chunks == Some(t) && table_lists.len() > 1 {
@@ -801,7 +1182,7 @@ where
         let mut sum = FieldElement::<E>::zero();
         for (i, list) in lists.iter().enumerate() {
             let t = table_of_tree(&plan, i);
-            let layers = host_tree(list, &tables[t].trace)?;
+            let layers = host_tree(list, &tables[members[t]].trace)?;
             let (p, q) = gkr_lockstep::LadderTree::output(&gkr_lockstep::HostLayers(&layers));
             sum += p * q.inv().expect("q != 0");
         }
@@ -824,33 +1205,373 @@ where
     // output.
     let fake_output: Option<(usize, FieldElement<E>)> = match faults.balance_with {
         None => None,
-        Some(target) => {
-            let mut outputs = Vec::with_capacity(lists.len());
-            for (i, list) in lists.iter().enumerate() {
-                let t = table_of_tree(&plan, i);
-                let layers = host_tree(list, &tables[t].trace)?;
-                outputs.push(gkr_lockstep::LadderTree::output(&gkr_lockstep::HostLayers(
-                    &layers,
-                )));
-            }
-            let target = plan.first_tree(target);
-            let mut rest = FieldElement::<E>::zero();
-            for (i, (p, q)) in outputs.iter().enumerate() {
-                if i != target {
-                    rest += p * q.inv().expect("q != 0");
-                }
-            }
-            Some((target, -(rest * &outputs[target].1)))
-        }
+        Some(target) => Some(balancing_output(tables, members, &plan, &lists, target)?),
     };
     let mut split = ArgueSplit {
         ledger_start: multilinear::gpu::ledger_reserved(),
         ..ArgueSplit::default()
     };
     let gruen_layers = multilinear::gkr_gruen::gruen_layers();
+    let Laddered {
+        bus_outputs,
+        gkr,
+        claims: member_claims,
+    } = prove_ladders(
+        tables,
+        members,
+        &plan,
+        &lists,
+        fake_output.as_ref(),
+        at,
+        transcript,
+        &mut split,
+    )?;
+    // Each table's global claim and its interactions in the class, `None` for
+    // a table outside it.
+    let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; tables.len()];
+    let mut global_lists: Vec<Option<&[Interaction<E>]>> = vec![None; tables.len()];
+    for (k, claim) in member_claims.into_iter().enumerate() {
+        claims[members[k]] = Some(claim);
+        global_lists[members[k]] = Some(&interactions[k]);
+    }
+
+    // ── C: one front-loaded sumcheck over every table ────────────────────
+    let num_vars_max = full_shapes.iter().map(|s| s.num_vars).max().unwrap_or(0);
+    let degree_max = full_shapes.iter().map(|s| s.degree).max().unwrap_or(2);
+    let xi: Vec<FieldElement<E>> = (0..num_vars_max)
+        .map(|_| transcript.sample_field_element())
+        .collect();
+    for (t, claim) in claims.iter().enumerate() {
+        let Some(claim) = claim else { continue };
+        let mut p = claim.p.clone();
+        if faults.tamper_claim == Some(t) {
+            p += FieldElement::<E>::one();
+        }
+        transcript.append_field_element(&p);
+        transcript.append_field_element(&claim.q);
+    }
+    // The local claims as the C phase takes them (a fault may swap two).
+    let mut local_claims: Vec<Option<GkrClaim<E>>> = match local {
+        Some(local) => local.claims.clone(),
+        None => vec![None; tables.len()],
+    };
+    if let Some((a, b)) = faults.local_swap_claims {
+        local_claims.swap(a, b);
+    }
+    for (t, claim) in local_claims.iter().enumerate() {
+        let Some(claim) = claim else { continue };
+        let mut p = claim.p.clone();
+        if faults.local_tamper_claim == Some(t) {
+            p += FieldElement::<E>::one();
+        }
+        transcript.append_field_element(&p);
+        transcript.append_field_element(&claim.q);
+    }
+    let lambda: FieldElement<E> = transcript.sample_field_element();
+    let stride = if local.is_some() { 5 } else { 3 };
+    let mut weights = table_weights(&lambda, tables.len(), stride);
+    if let Some(t) = faults.wrong_weight {
+        weights[t] = &weights[t] * &lambda;
+    }
+    let lambda_powers = multilinear::challenge_powers(&lambda, 5);
+    let started = std::time::Instant::now();
+    // What each table's fused rounds read, held for as long as the rounds do:
+    // the base columns on the card with no lift (`gpu::argue_no_lift`), the
+    // lifted factors for a table they cannot read that way (lifted here, as the
+    // per-table argue lifts it), or nothing, on the host.
+    let mut constraints: Vec<Option<multilinear::fused::Constraints<F>>> =
+        Vec::with_capacity(tables.len());
+    let mut columns: Vec<Option<multilinear::gpu::ColumnFactors>> =
+        Vec::with_capacity(tables.len());
+    for table in tables {
+        let shape = table.shape();
+        let made = (at == Where::Device && multilinear::gpu_fused::argue_fused())
+            .then(|| {
+                multilinear::fused::Constraints::<F>::from_extension(
+                    &shape.steps_as_ops(),
+                    shape.root_steps(),
+                    shape.selector_of_root(),
+                    shape.degree(),
+                )
+                .ok()
+            })
+            .flatten();
+        let column = (at == Where::Device
+            && multilinear::gpu::argue_no_lift()
+            && table.trace.device_factors().is_none())
+        .then(|| made.as_ref().and_then(|_| table.trace.column_factors()))
+        .flatten();
+        if at == Where::Device && made.is_some() && column.is_none() {
+            let _ = table.trace.reside_from_columns();
+        }
+        constraints.push(made);
+        columns.push(column);
+    }
+    let device: Vec<Option<Arc<multilinear::gpu::DeviceFactors>>> = tables
+        .iter()
+        .map(|table| match at {
+            Where::Host => None,
+            Where::Device => table.trace.device_factors(),
+        })
+        .collect();
+    let mut polys = Vec::with_capacity(tables.len());
+    for (t, table) in tables.iter().enumerate() {
+        let n = table.num_vars();
+        let pairs = TablePairs {
+            global: global_lists[t].zip(claims[t].as_ref().map(|c| c.point.as_slice())),
+            local: local
+                .and_then(|local| local.interactions[t].as_deref())
+                .zip(local_claims[t].as_ref().map(|c| c.point.as_slice())),
+        };
+        let (rules, rule_powers, eq_points) = table_rules(&statements[t], &pairs, &beta)?;
+        let xi_t = if faults.suffix_xi == Some(t) {
+            &xi[num_vars_max - n..]
+        } else {
+            &xi[..n]
+        };
+        let lambdas: Vec<FieldElement<E>> = rule_powers
+            .iter()
+            .map(|&j| lambda_powers[j].clone())
+            .collect();
+        let claim = pairs.claimed(&lambda_powers, claims[t].as_ref(), local_claims[t].as_ref());
+        let betas = multilinear_air::beta_powers(&beta, table.shape().num_roots());
+        // The fused rounds take one bus at one point: the table's only pair.
+        let fused_bus = match (&pairs.global, &pairs.local) {
+            (Some(bus), None) | (None, Some(bus)) => Some(*bus),
+            _ => None,
+        };
+        let fused = constraints[t].as_ref().zip(fused_bus).map(
+            |(constraints, (interactions, claim_point))| multilinear::gpu_fused::FusedInput {
+                constraints,
+                betas: &betas,
+                interactions,
+                claim_point,
+                r: xi_t,
+                columns: columns[t].as_ref(),
+            },
+        );
+        let mut weight_points: Vec<&[FieldElement<E>]> = vec![xi_t];
+        weight_points.extend(eq_points.iter().map(Vec::as_slice));
+        polys.push(front_loaded::TableRounds::new(
+            rules,
+            lambdas,
+            &claim,
+            &weight_points,
+            n,
+            device[t].as_deref(),
+            columns[t].as_ref(),
+            fused,
+            || table.trace.factors(),
+        )?);
+    }
+    split.zc_setup += started.elapsed().as_secs_f64();
+    split.ledger_zc = multilinear::gpu::ledger_reserved();
+    // What an earlier argue on this thread left, so the line below is this one's.
+    multilinear::gpu_fused::take_tail();
+    let started = std::time::Instant::now();
+    let (constraint, point) = front_loaded::prove_with(
+        &mut polys,
+        &weights,
+        degree_max,
+        transcript,
+        PaddingFault {
+            scaled: faults.scaled_padding,
+        },
+    )?;
+    split.zc_rounds += started.elapsed().as_secs_f64();
+    let tail = multilinear::gpu_fused::take_tail();
+    let mut factor_values = Vec::with_capacity(tables.len());
+    for (table, poly) in tables.iter().zip(&polys) {
+        let values = table
+            .kinds()
+            .iter()
+            .zip(poly.polys())
+            .filter(|(kind, _)| kind.source().is_some())
+            .map(|(_, factor)| factor.as_constant().cloned())
+            .collect::<Option<Vec<_>>>()
+            .ok_or(MlError::NoVariablesLeft)?;
+        factor_values.push(values);
+    }
+    drop(polys);
+    drop(device);
+    drop(columns);
+    for table in tables {
+        table.trace.release_device();
+    }
+    for values in &factor_values {
+        for value in values {
+            transcript.append_field_element(value);
+        }
+    }
+
+    // ── Rd: a shifted table's reduction; the others read their columns ────
+    let started = std::time::Instant::now();
+    let mut reduces = Vec::with_capacity(tables.len());
+    let mut reduced = Vec::with_capacity(tables.len());
+    for (t, table) in tables.iter().enumerate() {
+        let at = &point[..table.num_vars()];
+        let (column_point, column_values, reduce) = if full_shapes[t].shifted {
+            let sources: Vec<claim_reduce::FactorSource> = table
+                .kinds()
+                .iter()
+                .filter_map(FactorKind::source)
+                .collect();
+            let (reduce, reduced_point) = claim_reduce::prove::<F, E, T, _>(
+                &table.trace,
+                &sources,
+                &factor_values[t],
+                at,
+                table.trace.resident(),
+                transcript,
+            )?;
+            (reduced_point, reduce.column_values.clone(), Some(reduce))
+        } else {
+            let column_values = direct_column_values(
+                table.kinds(),
+                &factor_values[t],
+                table.num_committed_columns(),
+            )?;
+            (at.to_vec(), column_values, None)
+        };
+        reduced.push(claim_reduce::ReducedClaim {
+            point: column_point,
+            column_values,
+        });
+        reduces.push(reduce);
+    }
+    split.reduce += started.elapsed().as_secs_f64();
+    if multilinear::whir_split::enabled() {
+        // The Gruen count is the process's: an argue running beside this one
+        // adds its layers too.
+        eprintln!(
+            "BATCHED ARGUE SPLIT: tables {} · bins {} · trees {:.3}s · ladders {:.3}s · zc setup \
+             {:.3}s · zc rounds {:.3}s · reduce {:.3}s · Gruen layers (process) +{}",
+            tables.len(),
+            plan.bins.len(),
+            split.trees,
+            split.ladders,
+            split.zc_setup,
+            split.zc_rounds,
+            split.reduce,
+            multilinear::gkr_gruen::gruen_layers() - gruen_layers
+        );
+        // The fused tables' later rounds by program length: the card's, and the
+        // host's over what the card folded.
+        eprintln!(
+            "BATCHED ARGUE ZC TAIL: long tables {} (past the crossover {}) · card rounds {:.3}s · \
+             host rounds {} in {:.3}s | short tables {} ({}) · card rounds {:.3}s · host rounds {} in {:.3}s",
+            tail.tables[1],
+            tail.on_card[1],
+            tail.device[1],
+            tail.host_rounds[1],
+            tail.host[1],
+            tail.tables[0],
+            tail.on_card[0],
+            tail.device[0],
+            tail.host_rounds[0],
+            tail.host[0],
+        );
+        // The inputs of D-BATCH §3.2's error terms, measured on this argue.
+        eprintln!(
+            "BATCHED ARGUE BITS INPUTS: tables {} · trees a bin max {} · log2 cells {:.2} · \
+             len_max {} · N_C max {} · D_max {} · n_max {}",
+            tables.len(),
+            plan.bins.iter().map(Vec::len).max().unwrap_or(0),
+            plan.shapes
+                .iter()
+                .map(|shape| (shape.input_vars as f64).exp2())
+                .sum::<f64>()
+                .log2(),
+            statements
+                .iter()
+                .flat_map(|s| s.interactions.iter().map(BusInteraction::num_bus_elements))
+                .max()
+                .unwrap_or(0),
+            statements
+                .iter()
+                .map(|s| s.shape.num_roots())
+                .max()
+                .unwrap_or(0),
+            degree_max,
+            num_vars_max
+        );
+        // The trees the ladders ran: one a table, or a cut table's chunks.
+        eprintln!(
+            "BATCHED ARGUE TREES: tables {} · trees {} · cut {} · tree log2 cells {:.2} · built on the card \
+             {} · on the host {} (after a queued build {}) · ledger GiB: at the start {:.2} · the bin's trees \
+             built {:.2} · after its ladder {:.2} · zerocheck set up {:.2} · handed back {} trees in {} bins · pool trimmed before {} rewrites · pool trimmed before {} \
+             builds · pool reserved high GiB: the bin's trees built {:.2} · after its ladder {:.2}",
+            tables.len(),
+            plan.trees(),
+            plan.chunks.iter().filter(|c| c.count > 1).count(),
+            (0..plan.chunks.len())
+                .map(|t| plan.chunks[t].count as f64 * (plan.tree_vars(t) as f64).exp2())
+                .sum::<f64>()
+                .log2(),
+            split.trees_card - split.trees_host_late,
+            split.trees_host + split.trees_host_late,
+            split.trees_host_late,
+            gib(split.ledger_start),
+            gib(split.ledger_trees),
+            gib(split.ledger_ladder),
+            gib(split.ledger_zc),
+            split.trees_handed_back,
+            split.bins_handed_back,
+            split.rewrite_trims,
+            split.build_trims,
+            gib(split.pool_high_trees),
+            gib(split.pool_high_ladder)
+        );
+    }
+    Ok((
+        BatchedArgue {
+            bus_outputs,
+            gkr,
+            constraint,
+            factor_values,
+            reduces,
+        },
+        reduced,
+    ))
+}
+
+/// What one class's ladders leave: every tree's bus output (member order,
+/// then chunk order), one ladder a bin in plan order, and each member's GKR
+/// claim.
+struct Laddered<E: IsField> {
+    bus_outputs: Vec<(FieldElement<E>, FieldElement<E>)>,
+    gkr: Vec<LockstepProof<E>>,
+    claims: Vec<GkrClaim<E>>,
+}
+
+/// ★ Phase G over one class: per bin of `plan` (over the class's members,
+/// `class[k]` the group's table behind plan entry `k`), its trees built
+/// from `lists` (one a tree), their outputs absorbed, then one lockstep
+/// ladder; each member's claim after its bin. The same code for the global
+/// class on the group's fork and for the local class on the group's own
+/// transcript. `fake_output` is the fault `balance_with` (a tree's forged
+/// output numerator).
+#[allow(clippy::too_many_arguments)]
+fn prove_ladders<F, E, T>(
+    tables: &[CommittedTable<'_, F, E>],
+    class: &[usize],
+    plan: &ArguePlan,
+    lists: &[Cow<'_, [Interaction<E>]>],
+    fake_output: Option<&(usize, FieldElement<E>)>,
+    at: Where,
+    transcript: &mut T,
+    split: &mut ArgueSplit,
+) -> Result<Laddered<E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
     // ── G: a ladder per bin, its outputs absorbed just before it ──────────
     let mut bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>> = vec![None; plan.trees()];
-    let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; tables.len()];
+    let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; plan.shapes.len()];
     let mut gkr = Vec::with_capacity(plan.bins.len());
     // Under the round slot the columns' trees of a bin are queued one after
     // another and their outputs read once all are (each tree has its stream).
@@ -860,9 +1581,9 @@ where
         // Lean: only the factors this tree's interactions read are lifted
         // (`LAMBDA_VM_ARGUE_HOST_TREE_LEAN`); the same layer either way.
         let layer = if logup::host_tree_lean() {
-            logup::input_layer_lean(list, &tables[t].trace)?
+            logup::input_layer_lean(list, &tables[class[t]].trace)?
         } else {
-            logup::input_layer(list, &tables[t].trace.factors()?)?
+            logup::input_layer(list, &tables[class[t]].trace.factors()?)?
         };
         Ok(BinTree::Built(Box::new(
             multilinear::gkr::FractionTree::build(layer)?,
@@ -885,7 +1606,7 @@ where
                 .iter()
                 .map(|&(t, i)| {
                     multilinear::gpu::carry_bytes(
-                        lists[i].len().next_power_of_two() << tables[t].trace.num_vars(),
+                        lists[i].len().next_power_of_two() << tables[class[t]].trace.num_vars(),
                     )
                 })
                 .collect();
@@ -902,7 +1623,7 @@ where
             members
                 .iter()
                 .map(|&(t, i)| -> Result<Pending<E>, MlError> {
-                    let (trace, interactions) = (&tables[t].trace, &lists[i][..]);
+                    let (trace, interactions) = (&tables[class[t]].trace, &lists[i][..]);
                     if at == Where::Host {
                         return Ok(Pending::Ready(BinTree::Host(host_tree(
                             interactions,
@@ -1010,7 +1731,7 @@ where
                         multilinear::gpu::note_gkr_tree_host_built(
                             "its queued card build could not be read",
                             t,
-                            lists[i].len().next_power_of_two() << tables[t].trace.num_vars(),
+                            lists[i].len().next_power_of_two() << tables[class[t]].trace.num_vars(),
                         );
                         host_built(t, &lists[i])
                     }
@@ -1036,7 +1757,7 @@ where
         let writers: Vec<_> = members
             .iter()
             .map(|&(t, i)| {
-                let (list, trace) = (&lists[i][..], &tables[t].trace);
+                let (list, trace) = (&lists[i][..], &tables[class[t]].trace);
                 move || logup::input_layer_lean(list, trace)
             })
             .collect();
@@ -1049,7 +1770,7 @@ where
                     tree,
                     write,
                     table: t,
-                    cells: lists[i].len().next_power_of_two() << tables[t].trace.num_vars(),
+                    cells: lists[i].len().next_power_of_two() << tables[class[t]].trace.num_vars(),
                 }),
                 BinTree::Host(_) => None,
             })
@@ -1065,7 +1786,7 @@ where
             .collect();
         for (&(_, i), tree) in members.iter().zip(&refs) {
             let mut output = tree.output();
-            if let Some((target, p)) = &fake_output
+            if let Some((target, p)) = fake_output
                 && *target == i
             {
                 output.0 = p.clone();
@@ -1093,277 +1814,17 @@ where
         }
         gkr.push(ladder);
     }
-    let bus_outputs: Vec<(FieldElement<E>, FieldElement<E>)> = bus_outputs
-        .into_iter()
-        .collect::<Option<_>>()
-        .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?;
-    let claims: Vec<GkrClaim<E>> = claims
-        .into_iter()
-        .collect::<Option<_>>()
-        .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?;
-
-    // ── C: one front-loaded sumcheck over every table ────────────────────
-    let xi: Vec<FieldElement<E>> = (0..plan.num_vars)
-        .map(|_| transcript.sample_field_element())
-        .collect();
-    for (t, claim) in claims.iter().enumerate() {
-        let mut p = claim.p.clone();
-        if faults.tamper_claim == Some(t) {
-            p += FieldElement::<E>::one();
-        }
-        transcript.append_field_element(&p);
-        transcript.append_field_element(&claim.q);
-    }
-    let lambda: FieldElement<E> = transcript.sample_field_element();
-    let mut weights = table_weights(&lambda, tables.len());
-    if let Some(t) = faults.wrong_weight {
-        weights[t] = &weights[t] * &lambda;
-    }
-    let lambdas = vec![FieldElement::one(), lambda.clone(), &lambda * &lambda];
-    let lambda2 = &lambda * &lambda;
-    let started = std::time::Instant::now();
-    // What each table's fused rounds read, held for as long as the rounds do:
-    // the base columns on the card with no lift (`gpu::argue_no_lift`), the
-    // lifted factors for a table they cannot read that way (lifted here, as the
-    // per-table argue lifts it), or nothing, on the host.
-    let mut constraints: Vec<Option<multilinear::fused::Constraints<F>>> =
-        Vec::with_capacity(tables.len());
-    let mut columns: Vec<Option<multilinear::gpu::ColumnFactors>> =
-        Vec::with_capacity(tables.len());
-    for table in tables {
-        let shape = table.shape();
-        let made = (at == Where::Device && multilinear::gpu_fused::argue_fused())
-            .then(|| {
-                multilinear::fused::Constraints::<F>::from_extension(
-                    &shape.steps_as_ops(),
-                    shape.root_steps(),
-                    shape.selector_of_root(),
-                    shape.degree(),
-                )
-                .ok()
-            })
-            .flatten();
-        let column = (at == Where::Device
-            && multilinear::gpu::argue_no_lift()
-            && table.trace.device_factors().is_none())
-        .then(|| made.as_ref().and_then(|_| table.trace.column_factors()))
-        .flatten();
-        if at == Where::Device && made.is_some() && column.is_none() {
-            let _ = table.trace.reside_from_columns();
-        }
-        constraints.push(made);
-        columns.push(column);
-    }
-    let device: Vec<Option<Arc<multilinear::gpu::DeviceFactors>>> = tables
-        .iter()
-        .map(|table| match at {
-            Where::Host => None,
-            Where::Device => table.trace.device_factors(),
-        })
-        .collect();
-    let mut polys = Vec::with_capacity(tables.len());
-    for (t, table) in tables.iter().enumerate() {
-        let n = table.num_vars();
-        let (rules, row_point) =
-            table_rules(&statements[t], &interactions[t], &claims[t].point, &beta)?;
-        let xi_t = if faults.suffix_xi == Some(t) {
-            &xi[plan.num_vars - n..]
-        } else {
-            &xi[..n]
-        };
-        let betas = multilinear_air::beta_powers(&beta, table.shape().num_roots());
-        let fused = constraints[t]
-            .as_ref()
-            .map(|constraints| multilinear::gpu_fused::FusedInput {
-                constraints,
-                betas: &betas,
-                interactions: &interactions[t],
-                claim_point: &claims[t].point,
-                r: xi_t,
-                columns: columns[t].as_ref(),
-            });
-        let claim = &lambda * &claims[t].p + &lambda2 * &claims[t].q;
-        polys.push(front_loaded::TableRounds::new(
-            rules,
-            lambdas.clone(),
-            &claim,
-            [xi_t, &row_point],
-            n,
-            device[t].as_deref(),
-            columns[t].as_ref(),
-            fused,
-            || table.trace.factors(),
-        )?);
-    }
-    split.zc_setup += started.elapsed().as_secs_f64();
-    split.ledger_zc = multilinear::gpu::ledger_reserved();
-    // What an earlier argue on this thread left, so the line below is this one's.
-    multilinear::gpu_fused::take_tail();
-    let started = std::time::Instant::now();
-    let (constraint, point) = front_loaded::prove_with(
-        &mut polys,
-        &weights,
-        plan.degree,
-        transcript,
-        PaddingFault {
-            scaled: faults.scaled_padding,
-        },
-    )?;
-    split.zc_rounds += started.elapsed().as_secs_f64();
-    let tail = multilinear::gpu_fused::take_tail();
-    let mut factor_values = Vec::with_capacity(tables.len());
-    for (table, poly) in tables.iter().zip(&polys) {
-        let values = table
-            .kinds()
-            .iter()
-            .zip(poly.polys())
-            .filter(|(kind, _)| kind.source().is_some())
-            .map(|(_, factor)| factor.as_constant().cloned())
-            .collect::<Option<Vec<_>>>()
-            .ok_or(MlError::NoVariablesLeft)?;
-        factor_values.push(values);
-    }
-    drop(polys);
-    drop(device);
-    drop(columns);
-    for table in tables {
-        table.trace.release_device();
-    }
-    for values in &factor_values {
-        for value in values {
-            transcript.append_field_element(value);
-        }
-    }
-
-    // ── Rd: a shifted table's reduction; the others read their columns ────
-    let started = std::time::Instant::now();
-    let mut reduces = Vec::with_capacity(tables.len());
-    let mut reduced = Vec::with_capacity(tables.len());
-    for (t, table) in tables.iter().enumerate() {
-        let at = &point[..table.num_vars()];
-        let (column_point, column_values, reduce) = if plan.shapes[t].shifted {
-            let sources: Vec<claim_reduce::FactorSource> = table
-                .kinds()
-                .iter()
-                .filter_map(FactorKind::source)
-                .collect();
-            let (reduce, reduced_point) = claim_reduce::prove::<F, E, T, _>(
-                &table.trace,
-                &sources,
-                &factor_values[t],
-                at,
-                table.trace.resident(),
-                transcript,
-            )?;
-            (reduced_point, reduce.column_values.clone(), Some(reduce))
-        } else {
-            let column_values = direct_column_values(
-                table.kinds(),
-                &factor_values[t],
-                table.num_committed_columns(),
-            )?;
-            (at.to_vec(), column_values, None)
-        };
-        reduced.push(claim_reduce::ReducedClaim {
-            point: column_point,
-            column_values,
-        });
-        reduces.push(reduce);
-    }
-    split.reduce += started.elapsed().as_secs_f64();
-    if multilinear::whir_split::enabled() {
-        // The Gruen count is the process's: an argue running beside this one
-        // adds its layers too.
-        eprintln!(
-            "BATCHED ARGUE SPLIT: tables {} · bins {} · trees {:.3}s · ladders {:.3}s · zc setup \
-             {:.3}s · zc rounds {:.3}s · reduce {:.3}s · Gruen layers (process) +{}",
-            tables.len(),
-            plan.bins.len(),
-            split.trees,
-            split.ladders,
-            split.zc_setup,
-            split.zc_rounds,
-            split.reduce,
-            multilinear::gkr_gruen::gruen_layers() - gruen_layers
-        );
-        // The fused tables' later rounds by program length: the card's, and the
-        // host's over what the card folded.
-        eprintln!(
-            "BATCHED ARGUE ZC TAIL: long tables {} (past the crossover {}) · card rounds {:.3}s · \
-             host rounds {} in {:.3}s | short tables {} ({}) · card rounds {:.3}s · host rounds {} in {:.3}s",
-            tail.tables[1],
-            tail.on_card[1],
-            tail.device[1],
-            tail.host_rounds[1],
-            tail.host[1],
-            tail.tables[0],
-            tail.on_card[0],
-            tail.device[0],
-            tail.host_rounds[0],
-            tail.host[0],
-        );
-        // The inputs of D-BATCH §3.2's error terms, measured on this argue.
-        eprintln!(
-            "BATCHED ARGUE BITS INPUTS: tables {} · trees a bin max {} · log2 cells {:.2} · \
-             len_max {} · N_C max {} · D_max {} · n_max {}",
-            tables.len(),
-            plan.bins.iter().map(Vec::len).max().unwrap_or(0),
-            plan.shapes
-                .iter()
-                .map(|shape| (shape.input_vars as f64).exp2())
-                .sum::<f64>()
-                .log2(),
-            statements
-                .iter()
-                .flat_map(|s| s.interactions.iter().map(BusInteraction::num_bus_elements))
-                .max()
-                .unwrap_or(0),
-            statements
-                .iter()
-                .map(|s| s.shape.num_roots())
-                .max()
-                .unwrap_or(0),
-            plan.degree,
-            plan.num_vars
-        );
-        // The trees the ladders ran: one a table, or a cut table's chunks.
-        eprintln!(
-            "BATCHED ARGUE TREES: tables {} · trees {} · cut {} · tree log2 cells {:.2} · built on the card \
-             {} · on the host {} (after a queued build {}) · ledger GiB: at the start {:.2} · the bin's trees \
-             built {:.2} · after its ladder {:.2} · zerocheck set up {:.2} · handed back {} trees in {} bins · pool trimmed before {} rewrites · pool trimmed before {} \
-             builds · pool reserved high GiB: the bin's trees built {:.2} · after its ladder {:.2}",
-            tables.len(),
-            plan.trees(),
-            plan.chunks.iter().filter(|c| c.count > 1).count(),
-            (0..tables.len())
-                .map(|t| plan.chunks[t].count as f64 * (plan.tree_vars(t) as f64).exp2())
-                .sum::<f64>()
-                .log2(),
-            split.trees_card - split.trees_host_late,
-            split.trees_host + split.trees_host_late,
-            split.trees_host_late,
-            gib(split.ledger_start),
-            gib(split.ledger_trees),
-            gib(split.ledger_ladder),
-            gib(split.ledger_zc),
-            split.trees_handed_back,
-            split.bins_handed_back,
-            split.rewrite_trims,
-            split.build_trims,
-            gib(split.pool_high_trees),
-            gib(split.pool_high_ladder)
-        );
-    }
-    Ok((
-        BatchedArgue {
-            bus_outputs,
-            gkr,
-            constraint,
-            factor_values,
-            reduces,
-        },
-        reduced,
-    ))
+    Ok(Laddered {
+        bus_outputs: bus_outputs
+            .into_iter()
+            .collect::<Option<_>>()
+            .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?,
+        gkr,
+        claims: claims
+            .into_iter()
+            .collect::<Option<_>>()
+            .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?,
+    })
 }
 
 /// A card-built tree in a bin's ladder whose input layer, when the card's step
@@ -1658,10 +2119,57 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
+    verify_argue_classed(
+        argue,
+        statements,
+        &ClassTables::all(statements),
+        None,
+        bin_log_cells,
+        pack,
+        z,
+        alpha,
+        beta,
+        transcript,
+        checks,
+    )
+}
+
+/// [`verify_argue`] over the global class `global`, with each table's local
+/// pair from [`verify_local`] when the group argues local lookups: the
+/// verifying half of [`prove_argue_classed`], the same order and weights.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn verify_argue_classed<F, E, T>(
+    argue: &BatchedArgue<E>,
+    statements: &[TableStatement<'_, F, E>],
+    global: &ClassTables<'_>,
+    local: Option<&LocalClaims<E>>,
+    bin_log_cells: u8,
+    pack: GkrPack,
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+    beta: &FieldElement<E>,
+    transcript: &mut T,
+    checks: VerifierChecks,
+) -> Result<Vec<claim_reduce::ReducedClaim<E>>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
     let n = statements.len();
     let beta = beta.clone();
-    let shapes: Vec<ArgueShape> = statements.iter().map(ArgueShape::of).collect();
+    if local.is_some_and(|local| !local.fits(n)) {
+        return Err(MlError::ArgueShapeMismatch {
+            part: "local claims",
+        });
+    }
+    let members = &global.members;
+    let class_statements = global.statements(statements)?;
+    let shapes: Vec<ArgueShape> = class_statements.iter().map(ArgueShape::of).collect();
     let plan = argue_plan_packed(&shapes, bin_log_cells, pack);
+    let full_shapes: Vec<ArgueShape> = statements.iter().map(ArgueShape::of).collect();
     // One bus output a tree: a table's, or each of a cut table's chunks'.
     if argue.bus_outputs.len() != plan.trees()
         || argue.factor_values.len() != n
@@ -1672,72 +2180,52 @@ where
     if argue.gkr.len() != plan.bins.len() {
         return Err(MlError::ArgueShapeMismatch { part: "bins" });
     }
-    let interactions: Vec<Vec<Interaction<E>>> = statements
-        .iter()
-        .map(|statement| {
-            multilinear_logup::interactions(
-                statement.interactions,
-                statement.slot_of.len(),
-                z,
-                alpha,
-                |col| slot(statement.slot_of, col),
-            )
-        })
-        .collect::<Result<_, _>>()?;
+    let interactions: Vec<Vec<Interaction<E>>> = lower(&class_statements, z, alpha)?;
 
     // ── G ─────────────────────────────────────────────────────────────────
+    let member_claims = verify_ladders(&argue.bus_outputs, &argue.gkr, &plan, transcript, checks)?;
     let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; n];
-    for (bin, ladder) in plan.bins.iter().zip(&argue.gkr) {
-        let mut outputs = Vec::with_capacity(bin.len());
-        let mut heights = Vec::with_capacity(bin.len());
-        for &t in bin {
-            let first = plan.first_tree(t);
-            for output in &argue.bus_outputs[first..first + plan.chunks[t].count] {
-                transcript.append_field_element(&output.0);
-                transcript.append_field_element(&output.1);
-                outputs.push(output.clone());
-                heights.push(plan.tree_vars(t));
-            }
-        }
-        let inputs =
-            gkr_lockstep::verify_with(ladder, &outputs, &heights, transcript, checks.residual)?;
-        let mut at_tree = 0;
-        for &t in bin {
-            let count = plan.chunks[t].count;
-            let chunk_claims = inputs
-                .get(at_tree..at_tree + count)
-                .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?;
-            at_tree += count;
-            claims[t] = Some(table_claim(chunk_claims, &plan.chunks[t], transcript)?);
-        }
+    let mut global_lists: Vec<Option<&[Interaction<E>]>> = vec![None; n];
+    for (k, claim) in member_claims.into_iter().enumerate() {
+        claims[members[k]] = Some(claim);
+        global_lists[members[k]] = Some(&interactions[k]);
     }
-    let claims: Vec<GkrClaim<E>> = claims
-        .into_iter()
-        .collect::<Option<_>>()
-        .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?;
+    let local_claims: Vec<Option<GkrClaim<E>>> = match local {
+        Some(local) => local.claims.clone(),
+        None => vec![None; n],
+    };
 
     // ── C ─────────────────────────────────────────────────────────────────
-    let xi: Vec<FieldElement<E>> = (0..plan.num_vars)
+    let num_vars_max = full_shapes.iter().map(|s| s.num_vars).max().unwrap_or(0);
+    let degree_max = full_shapes.iter().map(|s| s.degree).max().unwrap_or(2);
+    let xi: Vec<FieldElement<E>> = (0..num_vars_max)
         .map(|_| transcript.sample_field_element())
         .collect();
-    for claim in &claims {
+    for claim in claims.iter().chain(&local_claims).flatten() {
         transcript.append_field_element(&claim.p);
         transcript.append_field_element(&claim.q);
     }
     let lambda: FieldElement<E> = transcript.sample_field_element();
-    let weights = table_weights(&lambda, n);
-    let lambda2 = &lambda * &lambda;
-    let claimed = claims
-        .iter()
-        .zip(&weights)
-        .fold(FieldElement::<E>::zero(), |acc, (claim, w)| {
-            acc + w * (&lambda * &claim.p + &lambda2 * &claim.q)
-        });
+    let stride = if local.is_some() { 5 } else { 3 };
+    let weights = table_weights(&lambda, n, stride);
+    let lambda_powers = multilinear::challenge_powers(&lambda, 5);
+    let pairs: Vec<TablePairs<'_, E>> = (0..n)
+        .map(|t| TablePairs {
+            global: global_lists[t].zip(claims[t].as_ref().map(|c| c.point.as_slice())),
+            local: local
+                .and_then(|local| local.interactions[t].as_deref())
+                .zip(local_claims[t].as_ref().map(|c| c.point.as_slice())),
+        })
+        .collect();
+    let claimed = (0..n).fold(FieldElement::<E>::zero(), |acc, t| {
+        acc + &weights[t]
+            * pairs[t].claimed(&lambda_powers, claims[t].as_ref(), local_claims[t].as_ref())
+    });
     let sumcheck = sumcheck::verify(
         &argue.constraint,
         claimed,
-        plan.num_vars,
-        plan.degree,
+        num_vars_max,
+        degree_max,
         transcript,
     )?;
     let point = &sumcheck.point;
@@ -1745,14 +2233,19 @@ where
     for (t, statement) in statements.iter().enumerate() {
         let num_vars = statement.num_vars;
         let at = &point[..num_vars];
-        let (rules, row_point) = table_rules(statement, &interactions[t], &claims[t].point, &beta)?;
+        let (rules, powers, eq_points) = table_rules(statement, &pairs[t], &beta)?;
         let mut public = statement.shape.public_values(at)?;
         public.push(eq_eval(&xi[..num_vars], at)?);
-        public.push(eq_eval(&row_point, at)?);
+        for eq_point in &eq_points {
+            public.push(eq_eval(eq_point, at)?);
+        }
         let values = constraint_argument::weave(statement.kinds, &argue.factor_values[t], &public)?;
-        let value = rules[0].apply(&values)
-            + &lambda * rules[1].apply(&values)
-            + &lambda2 * rules[2].apply(&values);
+        let value = rules
+            .iter()
+            .zip(&powers)
+            .fold(FieldElement::<E>::zero(), |acc, (rule, &j)| {
+                acc + &lambda_powers[j] * rule.apply(&values)
+            });
         rebuilt += &weights[t] * value * front_loaded::padding_product(point, num_vars);
     }
     if checks.constraint && rebuilt != sumcheck.expected_evaluation {
@@ -1769,7 +2262,7 @@ where
     for (t, statement) in statements.iter().enumerate() {
         let at = &point[..statement.num_vars];
         let factor_values = &argue.factor_values[t];
-        let reduced = match (plan.shapes[t].shifted, &argue.reduces[t]) {
+        let reduced = match (full_shapes[t].shifted, &argue.reduces[t]) {
             (true, Some(reduce)) => {
                 let sources: Vec<claim_reduce::FactorSource> = statement
                     .kinds
@@ -1806,6 +2299,223 @@ where
         reduced_claims.push(reduced);
     }
     Ok(reduced_claims)
+}
+
+/// ★ Phase G's verifying half over one class: per bin of `plan`, its outputs
+/// absorbed, its ladder checked, each member's claim after its bin (a cut
+/// table's chunks combined at its `s'`).
+fn verify_ladders<E, T>(
+    bus_outputs: &[(FieldElement<E>, FieldElement<E>)],
+    gkr: &[LockstepProof<E>],
+    plan: &ArguePlan,
+    transcript: &mut T,
+    checks: VerifierChecks,
+) -> Result<Vec<GkrClaim<E>>, MlError>
+where
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    if bus_outputs.len() != plan.trees() || gkr.len() != plan.bins.len() {
+        return Err(MlError::ArgueShapeMismatch { part: "bins" });
+    }
+    let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; plan.shapes.len()];
+    for (bin, ladder) in plan.bins.iter().zip(gkr) {
+        let mut outputs = Vec::with_capacity(bin.len());
+        let mut heights = Vec::with_capacity(bin.len());
+        for &t in bin {
+            let first = plan.first_tree(t);
+            for output in &bus_outputs[first..first + plan.chunks[t].count] {
+                transcript.append_field_element(&output.0);
+                transcript.append_field_element(&output.1);
+                outputs.push(output.clone());
+                heights.push(plan.tree_vars(t));
+            }
+        }
+        let inputs =
+            gkr_lockstep::verify_with(ladder, &outputs, &heights, transcript, checks.residual)?;
+        let mut at_tree = 0;
+        for &t in bin {
+            let count = plan.chunks[t].count;
+            let chunk_claims = inputs
+                .get(at_tree..at_tree + count)
+                .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?;
+            at_tree += count;
+            claims[t] = Some(table_claim(chunk_claims, &plan.chunks[t], transcript)?);
+        }
+    }
+    claims
+        .into_iter()
+        .collect::<Option<_>>()
+        .ok_or(MlError::ArgueShapeMismatch { part: "bins" })
+}
+
+/// ★ A group's local argue (step L6), on the group's local transcript after
+/// its `(z_g, α_g)`: phase G over the local class of `local_buses` under
+/// those challenges, with the format's bin cap and packing — the same
+/// ladders as the global class's, on another sponge. Returns the argue and
+/// each table's local pair for the group's C phase.
+///
+/// Where it runs (beside phase A's commits or at the group's turn in phase
+/// B) does not move a byte: its input is the group's columns and its
+/// transcript, nothing else.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn prove_local<F, E, T>(
+    tables: &[CommittedTable<'_, F, E>],
+    local_buses: &[u64],
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+    bin_log_cells: u8,
+    pack: GkrPack,
+    transcript: &mut T,
+    faults: ProverFaults,
+    at: Where,
+) -> Result<(LocalArgue<E>, LocalClaims<E>), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    let statements: Vec<TableStatement<'_, F, E>> = tables.iter().map(|t| t.statement()).collect();
+    let class = ClassTables::split(&statements, local_buses, true);
+    let class_statements = class.statements(&statements)?;
+    let shapes: Vec<ArgueShape> = class_statements.iter().map(ArgueShape::of).collect();
+    let plan = argue_plan_packed(&shapes, bin_log_cells, pack);
+    let interactions = lower(&class_statements, z, alpha)?;
+    let lists: Vec<Cow<'_, [Interaction<E>]>> = plan
+        .chunks
+        .iter()
+        .enumerate()
+        .flat_map(|(t, chunks)| chunk_lists(&interactions[t], chunks))
+        .collect();
+    let fake_output = faults
+        .local_balance_with
+        .map(|target| balancing_output(tables, &class.members, &plan, &lists, target))
+        .transpose()?;
+    let mut split = ArgueSplit::default();
+    let Laddered {
+        bus_outputs,
+        gkr,
+        claims,
+    } = prove_ladders(
+        tables,
+        &class.members,
+        &plan,
+        &lists,
+        fake_output.as_ref(),
+        at,
+        transcript,
+        &mut split,
+    )?;
+    drop(lists);
+    let mut local = LocalClaims {
+        interactions: (0..tables.len()).map(|_| None).collect(),
+        claims: vec![None; tables.len()],
+    };
+    for ((&t, list), claim) in class.members.iter().zip(interactions).zip(claims) {
+        local.interactions[t] = Some(list);
+        local.claims[t] = Some(claim);
+    }
+    Ok((LocalArgue { bus_outputs, gkr }, local))
+}
+
+/// ★ A group's local argue checked (steps L6 and the local balance), on the
+/// group's local transcript after its `(z_g, α_g)`: the local plan derived
+/// from the statements, `local_buses` and the verifier's cap and packing —
+/// never the proof — every ladder verified, and the local outputs summed:
+/// they must be zero (`LocalImbalance` for `group` otherwise). Returns each
+/// table's local pair for the group's C phase.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn verify_local<F, E, T>(
+    argue: &LocalArgue<E>,
+    statements: &[TableStatement<'_, F, E>],
+    local_buses: &[u64],
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+    bin_log_cells: u8,
+    pack: GkrPack,
+    transcript: &mut T,
+    checks: VerifierChecks,
+    group: usize,
+) -> Result<LocalClaims<E>, MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    let class = ClassTables::split(statements, local_buses, true);
+    let class_statements = class.statements(statements)?;
+    let shapes: Vec<ArgueShape> = class_statements.iter().map(ArgueShape::of).collect();
+    let plan = argue_plan_packed(&shapes, bin_log_cells, pack);
+    if argue.bus_outputs.len() != plan.trees() {
+        return Err(MlError::ArgueShapeMismatch {
+            part: "local trees",
+        });
+    }
+    if argue.gkr.len() != plan.bins.len() {
+        return Err(MlError::ArgueShapeMismatch { part: "local bins" });
+    }
+    let interactions = lower(&class_statements, z, alpha)?;
+    let claims = verify_ladders(&argue.bus_outputs, &argue.gkr, &plan, transcript, checks)?;
+    let mut balance = FieldElement::<E>::zero();
+    for output in &argue.bus_outputs {
+        balance += contribution(output).ok_or(MlError::LocalImbalance { group })?;
+    }
+    if checks.local_balance && balance != FieldElement::<E>::zero() {
+        return Err(MlError::LocalImbalance { group });
+    }
+    let mut local = LocalClaims {
+        interactions: (0..statements.len()).map(|_| None).collect(),
+        claims: vec![None; statements.len()],
+    };
+    for ((&t, list), claim) in class.members.iter().zip(interactions).zip(claims) {
+        local.interactions[t] = Some(list);
+        local.claims[t] = Some(claim);
+    }
+    Ok(local)
+}
+
+/// ★★ THE SOUNDNESS-BEARING STATIC CHECK of local lookups: every receiver on
+/// a local bus reads its values from the table's preprocessed columns only
+/// (and constants), so the local class's receivers are a set the verifier
+/// fixes and checks (`check_preprocessed`), and a group's own challenges
+/// argue a lookup into it. A receiver on a committed column could absorb
+/// any false lookup its prover likes. Its multiplicity may read anything.
+///
+/// `statements` are the verifier's, whose `num_preprocessed` counts the
+/// columns it checks.
+#[doc(hidden)]
+pub fn check_local_receivers<F, E>(
+    statements: &[TableStatement<'_, F, E>],
+    local_buses: &[u64],
+) -> Result<(), MlError>
+where
+    F: IsFFTField + IsPrimeField,
+    E: IsField,
+{
+    for (table, statement) in statements.iter().enumerate() {
+        for (interaction, bus) in statement.interactions.iter().enumerate() {
+            if bus.is_sender || !local_buses.contains(&bus.bus_id) {
+                continue;
+            }
+            let mut read = Vec::new();
+            for value in &bus.values {
+                value.columns_read(&mut read);
+            }
+            if read
+                .iter()
+                .any(|&column| column >= statement.num_preprocessed)
+            {
+                return Err(MlError::LocalReceiverNotFixed { table, interaction });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

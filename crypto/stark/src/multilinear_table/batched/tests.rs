@@ -1184,7 +1184,7 @@ fn a_balancing_output_is_refused_by_the_residual_alone() {
 #[test]
 fn each_tables_share_is_weighted_lambda_cubed_to_its_index() {
     let lambda = ExtE::from(3u64) + ExtE::from(5u64) * ExtE::from(7u64);
-    let weights = table_weights(&lambda, 6);
+    let weights = table_weights(&lambda, 6, 3);
     assert_eq!(weights.len(), 6);
     let mut power = ExtE::one();
     for (t, weight) in weights.iter().enumerate() {
