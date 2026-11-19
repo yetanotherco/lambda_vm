@@ -530,7 +530,7 @@ fn a_departing_two_layer_step_is_refused() {
         for t in 0..3 {
             assert_eq!(
                 faulted_double(ProverFaults {
-                    ladder: Some((t, fault)),
+                    ladder: Some((t, fault, 2)),
                     ..Default::default()
                 }),
                 Err(MlError::LayerRelationMismatch { layer: 1 }),
@@ -569,7 +569,7 @@ fn a_swapped_step_that_reaches_the_input_is_refused_by_the_constraint_phase() {
                 &committed,
                 &cfg,
                 ProverFaults {
-                    ladder: Some((t, fault)),
+                    ladder: Some((t, fault, 2)),
                     ..Default::default()
                 },
             );
