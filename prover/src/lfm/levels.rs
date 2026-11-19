@@ -275,7 +275,8 @@ impl Drop for StacksForTest {
 /// row for row) and does not validate it before executing: the admission
 /// validator runs on a thread of its own beside the execution, and level 1
 /// is refused before anything is filled or proved when the program is not
-/// admissible. On by default; `0` (and only `0`) turns it off, and the
+/// admissible (under [`VALIDATE_LATE_ENV`], from level 1's fill beside its
+/// prove instead, and refused before any proof is kept). On by default; `0` (and only `0`) turns it off, and the
 /// program is then compiled and validated before the execution. The same
 /// program and the same proofs either way; a verifier derives its own copy,
 /// compiled and validated as before.
@@ -515,8 +516,11 @@ pub(crate) fn prepare_level_beside(
 /// beside its execution (which runs beside the base's phase B, where the host's
 /// work slows the base). The driver returns no proof until the check has
 /// passed: an inadmissible program still refuses the block, only later. The
-/// verifier validates every level's program it derives either way
-/// ([`super::whir_block::finish_program`]). Under [`program_fast`] only (off
+/// verifier validates every level's program it derives either way: its
+/// derivation (`derive_levels_to`) takes only an
+/// [`super::validator::AdmittedProgram`], which the validator alone makes
+/// (the end of `WhirBlockPlan::closed_block_program_admitted` and
+/// `wlfm_leg_program_admitted`). Under [`program_fast`] only (off
 /// it, the program is validated before its execution, as always). Off by
 /// default (and for any word but `1`); read once a process.
 pub const VALIDATE_LATE_ENV: &str = "LAMBDA_VM_LEVELS_VALIDATE_LATE";
@@ -2049,8 +2053,10 @@ pub fn prove_block_levels(
             release_program(&mut levels[0].program, &mut times.sizes);
             None
         };
-        // What the execution and the program held, back to the OS on a
-        // thread of its own beside the prove.
+        // What the execution (and, off the late check, the program) held, back
+        // to the OS on a thread of its own beside the prove; the late check
+        // hands the program's pages back on its own thread once it has
+        // checked it.
         let purge_filled = scope.spawn(crate::alloc_purge::purge_now);
         if let Some(r) = resident_now() {
             times.resident.push(("level 1 filled", r));
