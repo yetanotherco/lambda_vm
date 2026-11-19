@@ -296,6 +296,42 @@ pub fn serial_encodes_setting(value: Option<&str>) -> bool {
     value.map(str::trim) != Some("0")
 }
 
+/// The knob for [`serial_room`]: `1` sizes a group's commit room for one
+/// encode at a time; unset or anything else keeps the room a joint run's
+/// encodes all at once.
+pub const SERIAL_ROOM_ENV: &str = "LAMBDA_VM_COMMIT_ROOM_SERIAL";
+
+/// Whether a group's commit room promises one joint run encode's working set
+/// rather than one for every codeword of the run ([`commit_in_flight`]). Off
+/// by default. It takes effect only while [`serial_encodes`] holds the
+/// encodes to one at a time — the room it promises is then what the commit
+/// uses — and changes no byte of the proof, only what the ledger lets beside
+/// a commit. Read once.
+pub fn serial_room() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| serial_room_setting(std::env::var(SERIAL_ROOM_ENV).ok().as_deref()))
+}
+
+/// [`serial_room`]'s reading of its knob: only `1` turns it on.
+pub fn serial_room_setting(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// The commits a group's room promises working sets for: two in flight (as
+/// singles are committed), or under one tree a run the widest joint run's
+/// codewords at once — each encode holds its coefficients while the run's
+/// encodes share the card. With the encodes one at a time and the room sized
+/// for that (`one_encode`), a joint run holds one encode's coefficients and
+/// then its one tree, so it counts as one.
+pub fn commit_in_flight(polys: usize, widest_joint_run: usize, one_encode: bool) -> u64 {
+    let joint = if one_encode {
+        widest_joint_run.min(1)
+    } else {
+        widest_joint_run
+    };
+    polys.min(2).max(joint) as u64
+}
+
 /// Grouped commits' encodes waited for one at a time ([`serial_encodes`]).
 static SERIAL_ENCODE_WAITS: AtomicU64 = AtomicU64::new(0);
 
@@ -320,6 +356,34 @@ mod serial_encodes_tests {
         assert!(s(Some("yes")));
         assert!(!s(Some("0")));
         assert!(!s(Some(" 0 ")));
+    }
+
+    /// Only `1` sizes the room for one encode at a time.
+    #[test]
+    fn the_serial_room_knob_is_off_unless_its_word_is_one() {
+        use super::serial_room_setting as s;
+        assert!(!s(None));
+        assert!(!s(Some("")));
+        assert!(!s(Some("0")));
+        assert!(!s(Some("yes")));
+        assert!(s(Some("1")));
+        assert!(s(Some(" 1 ")));
+    }
+
+    /// Off, the count is today's: two singles in flight, or the widest joint
+    /// run whole. On, a joint run counts once and singles keep their two.
+    #[test]
+    fn a_room_for_one_encode_counts_a_joint_run_once() {
+        use super::commit_in_flight as f;
+        for polys in 1..=12 {
+            for run in [0, 2, 3, 4] {
+                assert_eq!(f(polys, run, false), polys.min(2).max(run) as u64);
+                assert_eq!(f(polys, run, true), polys.min(2).max(run.min(1)) as u64);
+            }
+        }
+        assert_eq!(f(8, 4, false), 4);
+        assert_eq!(f(8, 4, true), 2);
+        assert_eq!(f(1, 0, true), 1);
     }
 }
 
@@ -1492,7 +1556,7 @@ pub fn room_turns_for(
                 .unwrap_or(0)
         }
     };
-    let in_flight = layout.num_polys().min(2).max(joint) as u64;
+    let in_flight = commit_in_flight(layout.num_polys(), joint, serial_encodes() && serial_room());
     let commit =
         in_flight * math_cuda::whir::commit_transient_bytes(n, config.log_blowup, first_fold);
     // A share's `eq` halves are its point's high and low coordinates' tables,

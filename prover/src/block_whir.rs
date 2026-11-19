@@ -7870,6 +7870,15 @@ fn prove_streamed(
             multilinear::gpu::SERIAL_ENCODES_ENV
         );
         eprintln!(
+            "★ BLOCK COMMIT ROOM: {} ({})",
+            if multilinear::gpu::serial_encodes() && multilinear::gpu::serial_room() {
+                "a joint run's room for one encode at a time"
+            } else {
+                "a joint run's room for all its encodes at once (the default)"
+            },
+            multilinear::gpu::SERIAL_ROOM_ENV
+        );
+        eprintln!(
             "★ BLOCK PAGES FIRST: {} ({PAGES_FIRST_ENV})",
             if pages_first {
                 "the page tables handed on right after KECCAK_RND's (the default)"
